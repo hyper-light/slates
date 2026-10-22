@@ -285,10 +285,6 @@ fn the_supervised_child_inherits_the_held_nfs_listener() {
     geometry(),
   )
   .unwrap();
-  let exe = std::env::current_exe()
-    .unwrap()
-    .to_string_lossy()
-    .into_owned();
   let args = vec![
     "--ignored".to_owned(),
     "--exact".to_owned(),
@@ -300,7 +296,7 @@ fn the_supervised_child_inherits_the_held_nfs_listener() {
     window_ns: 60_000_000_000,
     max_restarts: 1,
   };
-  let mut supervisor = Supervisor::new(segment, &exe, &args, policy);
+  let mut supervisor = Supervisor::new(segment, &args, policy).unwrap();
   supervisor.hold_nfs_listener(fd);
   // SAFETY: the test is single-threaded at this point; the child reads it. The role is chosen by the
   // child's args, so a parallel test's child ignores this variable.
@@ -383,10 +379,6 @@ fn a_crashing_daemon_is_restarted_until_the_derived_bound_and_the_segment_says_s
     geometry(),
   )
   .unwrap();
-  let exe = std::env::current_exe()
-    .unwrap()
-    .to_string_lossy()
-    .into_owned();
   let args = vec![
     "--ignored".to_owned(),
     "--exact".to_owned(),
@@ -398,7 +390,7 @@ fn a_crashing_daemon_is_restarted_until_the_derived_bound_and_the_segment_says_s
     window_ns: 60_000_000_000,
     max_restarts: 3,
   };
-  let mut supervisor = Supervisor::new(segment, &exe, &args, policy);
+  let mut supervisor = Supervisor::new(segment, &args, policy).unwrap();
   // The child's environment rides on the test process's: the beats and the exit code.
   // SAFETY: the test is single-threaded at this point and the variables are read by the
   // child only.
@@ -446,10 +438,6 @@ fn a_crash_loop_is_restarted_after_a_doubling_backoff_never_given_up() {
     geometry(),
   )
   .unwrap();
-  let exe = std::env::current_exe()
-    .unwrap()
-    .to_string_lossy()
-    .into_owned();
   let args = vec![
     "--ignored".to_owned(),
     "--exact".to_owned(),
@@ -460,7 +448,7 @@ fn a_crash_loop_is_restarted_after_a_doubling_backoff_never_given_up() {
     window_ns: WINDOW_NS,
     max_restarts: 1,
   };
-  let mut supervisor = Supervisor::new(segment, &exe, &args, policy);
+  let mut supervisor = Supervisor::new(segment, &args, policy).unwrap();
   // The child beats and exits, as the bound's own test's does; the same values, since the variables are the
   // process's and that test's children read them in parallel (and neither test removes them for the same reason).
   // SAFETY: both tests set the same values before spawning, and the children only read them.
@@ -599,10 +587,6 @@ fn a_delayed_child_and_its_restart_beat_in_the_anchors_clock_domain() {
   const PARENT_AGE: Duration = Duration::from_millis(100);
   let name = format!("slates-anchor-clock-{}", std::process::id());
   let segment = AnchorSegment::create(&name, &identity(), geometry()).unwrap();
-  let exe = std::env::current_exe()
-    .unwrap()
-    .to_string_lossy()
-    .into_owned();
   let args = vec![
     "--ignored".into(),
     "--exact".into(),
@@ -610,7 +594,7 @@ fn a_delayed_child_and_its_restart_beat_in_the_anchors_clock_domain() {
   ];
   let budget_ns = CHILD_WAIT_MS * 1_000_000;
   let policy = RestartPolicy::derive(budget_ns, budget_ns).get();
-  let mut supervisor = Supervisor::new(segment, &exe, &args, policy);
+  let mut supervisor = Supervisor::new(segment, &args, policy).unwrap();
   let mut clock = HostClock::new();
   #[allow(clippy::disallowed_methods)]
   std::thread::sleep(PARENT_AGE);
@@ -769,10 +753,6 @@ fn wedged_stopping_child() {
 fn stop_through_the_protocol(child: &str, tag: &str) -> (Stopping, Duration, State) {
   use slates_vfs::clock::{Clock, HostClock};
   let segment = AnchorSegment::create(&unique_name(tag), &identity(), geometry()).unwrap();
-  let exe = std::env::current_exe()
-    .unwrap()
-    .to_string_lossy()
-    .into_owned();
   let args = vec![
     "--ignored".to_owned(),
     "--exact".to_owned(),
@@ -782,10 +762,10 @@ fn stop_through_the_protocol(child: &str, tag: &str) -> (Stopping, Duration, Sta
   let budget_ns = CHILD_WAIT_MS * 1_000_000;
   let mut supervisor = Supervisor::new(
     segment,
-    &exe,
     &args,
     RestartPolicy::derive(budget_ns, budget_ns).get(),
-  );
+  )
+  .unwrap();
   let mut clock = HostClock::new();
   supervisor.start(clock.monotonic_ns()).unwrap();
   let wait = Instant::now();
@@ -944,10 +924,6 @@ fn a_device_a_daemon_sent_is_held_across_its_restart_and_handed_to_its_successor
     geometry(),
   )
   .unwrap();
-  let exe = std::env::current_exe()
-    .unwrap()
-    .to_string_lossy()
-    .into_owned();
   let args = vec![
     "--ignored".to_owned(),
     "--exact".to_owned(),
@@ -959,7 +935,7 @@ fn a_device_a_daemon_sent_is_held_across_its_restart_and_handed_to_its_successor
     window_ns: 60_000_000_000,
     max_restarts: 3,
   };
-  let mut supervisor = Supervisor::new(segment, &exe, &args, policy);
+  let mut supervisor = Supervisor::new(segment, &args, policy).unwrap();
   // Shape: room for this test's one device.
   supervisor.hold_descriptors(4, 4).unwrap();
   // SAFETY: the test is single-threaded here; the role is chosen by the child's args, so a parallel test's child

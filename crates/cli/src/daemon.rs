@@ -88,8 +88,33 @@ fn published_profile() -> Result<Published, Failure> {
   }
 }
 
+/// Names this process after the basename of its `argv[0]` (Linux; A-145). Its anchor restarts it through the link to
+/// the running image (`/proc/self/exe`), and the kernel names a process after the path it was exec'd by, so the
+/// daemon would show as `exe` to `ps`, `top` and `pgrep NAME` (its `argv[0]`, and so `pgrep -f`, keep the real path).
+/// The kernel keeps the first 15 bytes. A name that cannot be set changes nothing the daemon does, so it is said and
+/// not refused.
+#[cfg(target_os = "linux")]
+fn name_this_process() {
+  use std::os::unix::ffi::OsStrExt;
+  let Some(argv0) = std::env::args_os().next() else {
+    return;
+  };
+  let Some(base) = std::path::Path::new(&argv0).file_name() else {
+    return;
+  };
+  let Ok(name) = std::ffi::CString::new(base.as_bytes()) else {
+    return;
+  };
+  if let Err(error) = rustix::thread::set_name(&name) {
+    eprintln!("slates daemon: its process name could not be set: {error}");
+  }
+}
+
 /// Runs the daemon.
 pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
+  // Before anything shows the process: its own name, not the kernel's `exe` from the anchor's restart (A-145).
+  #[cfg(target_os = "linux")]
+  name_this_process();
   // Before a volume holds a byte: no core dump may carry it (AUD-29-41).
   crate::dumps::exclude_from_dumps()?;
   signal::install().map_err(Failure::Failed)?;

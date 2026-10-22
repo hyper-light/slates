@@ -10636,7 +10636,27 @@ another: the kernel holds the written pages locked for the whole request, so two
 for the other's invalidation, would deadlock — the amendment's reason again. Owed: the design's answer for each source,
 and AC-3.3's text.
 
-### 2026-10-21: an anchor exited during its boot once in seven Linux CLI suite runs — open, unexplained (tripwire)
+### 2026-10-21: an anchor exited during its boot once in seven Linux CLI suite runs — mechanism shown and fixed 2026-10-22 (A-145); this event's trigger unshown
+
+**2026-10-22: the mechanism is real, and closed.** The supervisor restarted its daemon from a path. This record's
+message appears whenever that path is gone:
+- **On the box:** an anchor whose binary copy was deleted printed `slates: step: daemon spawn refused (code Some(2))`
+  at a restart and exited.
+- **With the path replaced instead**, the anchor restarted the replacement: a script, which fell into a crash loop.
+
+Since A-145 every start runs the anchor's own image:
+- Linux: `/proc/self/exe`;
+- macOS: the path, only while it is still the same file, refused `ExecutableReplaced` otherwise;
+- Windows: owed.
+
+So a rebuild under a running anchor, if that was this event's trigger, can no longer end it. Whether it was, is not
+shown: the 2026-10-21 attempts to replace the binary just before a start did not reproduce it. The test is
+`a_daemon_killed_after_its_anchors_executable_is_replaced_restarts_from_the_anchors_own_image`, and the record is
+`docs/bugs/2026-10-22-an-anchor-restarted-its-daemon-by-a-path-an-upgrade-can-replace.md`.
+
+**Owed:** the Windows check. A running executable there can be renamed aside, and std has no stable file identity.
+
+The original entry:
 
 In an arm64 Linux container (6 CPUs, 8 GB), the whole CLI suite at two threads: one start of
 `a_destroyed_volumes_mount_refuses_writes_and_never_lets_them_reach_the_disk_beneath` saw the anchor's stderr close

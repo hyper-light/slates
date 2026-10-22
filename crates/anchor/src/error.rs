@@ -47,6 +47,18 @@ pub enum AnchorError {
     /// The OS error code, when one exists.
     code: Option<i32>,
   },
+  /// The anchor could not tell which executable it runs, so it cannot restart that one (A-145).
+  OwnExecutable {
+    /// The OS error code, when one exists.
+    code: Option<i32>,
+  },
+  /// The executable the anchor was started from is gone or now another file, as after an upgrade in place, and the
+  /// platform has no link to the running image to restart instead (A-145). Restarting from the path would run another
+  /// build than the anchor's, so the restart is refused; restarting the anchor runs the new build.
+  ExecutableReplaced {
+    /// The path the anchor was started from.
+    path: String,
+  },
   /// The daemon failed more often inside the window than the policy allows; supervision
   /// stopped restarting it.
   CrashLoop {
@@ -80,6 +92,16 @@ impl fmt::Display for AnchorError {
         )
       }
       Self::Spawn { code } => write!(f, "daemon spawn refused (code {code:?})"),
+      Self::OwnExecutable { code } => {
+        write!(
+          f,
+          "the anchor's own executable cannot be read (code {code:?})"
+        )
+      }
+      Self::ExecutableReplaced { path } => write!(
+        f,
+        "the executable at {path} was replaced since the anchor started; restart the anchor to run the new build"
+      ),
       Self::CrashLoop {
         restarts,
         window_ns,

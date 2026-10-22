@@ -594,6 +594,18 @@ the measured wake cost before parking (the 2-competitive rule). The mount is nev
 > child generations reproduce the old bug (0.12 s) and pass with the common clock. Record:
 > `docs/bugs/2026-09-17-heartbeats-use-different-clock-origins.md`.
 
+> **The anchor starts and restarts its own image (2026-10-22, A-145).** The daemon is the anchor's own executable,
+> and every start runs the image the anchor runs, never whatever the path it was started from holds by then.
+> - **Linux** execs `/proc/self/exe`, with `argv[0]` kept as the path. The daemon renames itself, since the kernel
+>   would name it `exe`.
+> - **macOS** checks the file's device and inode at every start, and refuses `ExecutableReplaced` once an upgrade has
+>   changed them. Restarting the anchor runs the new build.
+> - **Windows:** the check is owed.
+>
+> Before, a daemon killed after an upgrade in place was restarted from the new file (a crash loop, when that was not
+> a daemon), or refused `ENOENT`, which ended the anchor and its instance. Record:
+> `docs/bugs/2026-10-22-an-anchor-restarted-its-daemon-by-a-path-an-upgrade-can-replace.md`.
+
 1. The anchor process starts (or is already running), maps or creates the shared segment, and
    loads or rebuilds the machine profile.
 2. The daemon starts, attaches the segment, and either replays the op logs into fresh in-memory
@@ -11925,6 +11937,37 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
+
+### A-145 — The anchor starts and restarts its own image, never a path (accepted 2026-10-22)
+Applied in the same change to:
+- §2.6 (status note);
+- `crates/anchor/src/supervise.rs` (`Supervisor::new` takes no program; `own_image`'s paired `identity` and `command`);
+- `crates/anchor/src/error.rs` (`OwnExecutable`, `ExecutableReplaced`);
+- `crates/cli/src/anchor.rs`;
+- `crates/cli/src/daemon.rs` (`name_this_process`);
+- the tests: `crates/anchor/tests/anchor.rs`, and the new
+  `a_daemon_killed_after_its_anchors_executable_is_replaced_restarts_from_the_anchors_own_image` in
+  `crates/cli/tests/cli.rs`;
+- GAPS (the 2026-10-21 tripwire);
+- `docs/bugs/2026-10-22-an-anchor-restarted-its-daemon-by-a-path-an-upgrade-can-replace.md`.
+
+- **What it answers.** The supervisor ran `Command::new(path)` at every start, the path taken once from
+  `current_exe()`. After an upgrade in place, a daemon killed or crashed was restarted from the new file, or refused
+  `ENOENT`.
+  - **By hand, on the box:** an anchor whose binary copy was deleted printed `daemon spawn refused (code Some(2))` at
+    the restart and exited, ending the instance.
+  - **The red test:** an anchor whose link was replaced by a script restarted the script into a crash loop, and no
+    daemon answered within 20 s.
+
+  This is the 2026-10-21 tripwire's message. Whether it was that event's trigger is not shown.
+- **The rule.** A supervisor's daemons run its own executable, and each start runs the image it runs.
+  - **Linux:** `/proc/self/exe`, with `argv[0]` the path, and the daemon renames itself, since the kernel would name it
+    `exe`.
+  - **The other Unix systems:** the path, only while its device and inode are the ones recorded when the supervisor
+    was made. Otherwise the start is refused `ExecutableReplaced`, and the anchor ends saying so. A replacement inside
+    the check-to-spawn window is not caught.
+  - **Windows:** owed. A running file there can only be renamed aside, and std has no stable file identity.
+- **Evidence:** the red test above, green after the change. Verification is in the bug record.
 
 ### A-144 — A READ through an `O_DIRECT` handle is ambiguous, and a write-back over what it left unknown is refused (accepted 2026-10-22)
 Applied in the same change to:

@@ -161,7 +161,16 @@ fn spawn_anchor(
   instance: &str,
   environment: &[(String, String)],
 ) -> (AnchorProcess, std::io::BufReader<std::process::ChildStderr>) {
-  let mut child = slates()
+  spawn_anchor_from(env!("CARGO_BIN_EXE_slates"), instance, environment)
+}
+
+/// [`spawn_anchor`] with the anchor run from `program`, a path to the built `slates`.
+fn spawn_anchor_from(
+  program: &str,
+  instance: &str,
+  environment: &[(String, String)],
+) -> (AnchorProcess, std::io::BufReader<std::process::ChildStderr>) {
+  let mut child = Command::new(program)
     .envs(environment.iter().cloned())
     .args([
       "--instance",
@@ -588,6 +597,160 @@ fn kill_the_daemon_and_await_its_successor(instance: &str) {
       .success()
   );
   await_daemon(instance, Some(killed), &[]);
+}
+
+/// Format: the anchor's refusal when the executable it was started from has been replaced (A-145; the text of
+/// `AnchorError::ExecutableReplaced`).
+#[cfg(all(unix, not(target_os = "linux")))]
+const EXECUTABLE_REPLACED_LINE: &str = "was replaced since the anchor started";
+
+/// A-145 (GAPS, the 2026-10-21 anchor tripwire;
+/// `docs/bugs/2026-10-22-an-anchor-restarted-its-daemon-by-a-path-an-upgrade-can-replace.md`). An upgrade replaces the
+/// binary an anchor was started from while the anchor runs, and the anchor must never restart its daemon from whatever
+/// that path holds then. Do: start an anchor from a hard link to the built `slates` (a link writes no data); once its
+/// daemon serves, replace the link with another executable (a script that exits 3) and `SIGKILL` the daemon. Expect,
+/// on Linux: a successor answers, and its executable is the built binary's own inode, so the anchor restarted the image
+/// it runs. On the other Unix systems, where a process has no link to its running image: the anchor refuses to restart
+/// from a replaced executable and ends saying so, never running the script. Before A-145 the anchor restarted whatever
+/// the path held: the script, which never serves, so neither happened.
+#[cfg(unix)]
+#[test]
+fn a_daemon_killed_after_its_anchors_executable_is_replaced_restarts_from_the_anchors_own_image() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the replaced-executable restart: set SLATES_TEST_CLI=1 to run it (starts daemons)"
+    );
+    return;
+  }
+  let instance = format!("cli-replaced-exe-{}", std::process::id());
+  let scratch = ScratchDir {
+    path: build_output_dir("slates-replaced-exe"),
+  };
+  let link = format!("{}/slates", scratch.path);
+  link_and_later_replace(&link, None);
+  let (mut anchor, mut stderr) = spawn_anchor_from(&link, &instance, &[]);
+  await_serving(&mut stderr, &instance, false);
+  let (lines, forwarding) = forward_lines(stderr);
+  anchor.drain = Some(forwarding);
+  await_stable_daemon(&instance, true);
+  link_and_later_replace(&link, Some(REPLACEMENT_SCRIPT));
+  let killed = daemon_pid(&instance).expect("the daemon answers");
+  assert!(
+    Command::new("kill")
+      .args(["-9", &killed.to_string()])
+      .status()
+      .unwrap()
+      .success()
+  );
+  expect_the_anchors_own_image(&instance, killed, &mut anchor, &lines);
+  drop(anchor);
+}
+
+/// Shape: what replaces the anchor's executable in the test above: another program, which exits at once.
+#[cfg(unix)]
+const REPLACEMENT_SCRIPT: &str = "#!/bin/sh\nexit 3\n";
+
+/// Format: the mode of the replacement, executable by its owner.
+#[cfg(unix)]
+const REPLACEMENT_MODE: u32 = 0o755;
+
+/// Hard-links the built `slates` at `path`, or, given `replacement`, removes `path` and writes that executable there
+/// instead, as an upgrade replaces a binary in place.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // the test's own scratch directory under the build output, removed after
+fn link_and_later_replace(path: &str, replacement: Option<&str>) {
+  use std::os::unix::fs::PermissionsExt;
+  match replacement {
+    None => std::fs::hard_link(env!("CARGO_BIN_EXE_slates"), path).unwrap(),
+    Some(script) => {
+      std::fs::remove_file(path).unwrap();
+      std::fs::write(path, script).unwrap();
+      std::fs::set_permissions(path, std::fs::Permissions::from_mode(REPLACEMENT_MODE)).unwrap();
+    }
+  }
+}
+
+/// Echoes the anchor's lines to this process's stderr, as [`echo_the_rest`] does, and hands each to the test too: the
+/// lines, and the thread, which ends with the anchor's stderr and is joined by the [`AnchorProcess`] that owns it.
+#[cfg(unix)]
+fn forward_lines(
+  stderr: std::io::BufReader<std::process::ChildStderr>,
+) -> (
+  std::sync::mpsc::Receiver<String>,
+  std::thread::JoinHandle<()>,
+) {
+  use std::io::BufRead;
+  let (sender, lines) = std::sync::mpsc::channel();
+  let forwarding = std::thread::spawn(move || {
+    for line in stderr.lines().map_while(Result::ok) {
+      eprintln!("{line}");
+      if sender.send(line).is_err() {
+        break;
+      }
+    }
+  });
+  (lines, forwarding)
+}
+
+/// Linux: a successor of `killed` answers, and its executable is the built binary's own inode.
+#[cfg(target_os = "linux")]
+fn expect_the_anchors_own_image(
+  instance: &str,
+  killed: u32,
+  _anchor: &mut AnchorProcess,
+  _lines: &std::sync::mpsc::Receiver<String>,
+) {
+  use std::os::unix::fs::MetadataExt;
+  let started = Instant::now();
+  let successor = loop {
+    if let Some(pid) = daemon_pid(instance).filter(|pid| *pid != killed) {
+      break pid;
+    }
+    assert!(
+      started.elapsed() < START_WAIT,
+      "a successor answered within {START_WAIT:?} after the anchor's executable was replaced"
+    );
+    pause();
+  };
+  let built = std::fs::metadata(env!("CARGO_BIN_EXE_slates")).unwrap();
+  let running = std::fs::metadata(format!("/proc/{successor}/exe")).unwrap();
+  assert_eq!(
+    (running.dev(), running.ino()),
+    (built.dev(), built.ino()),
+    "the successor runs the anchor's own image, not what the path holds now"
+  );
+  let name = std::fs::read_to_string(format!("/proc/{successor}/comm")).unwrap();
+  assert_eq!(
+    name.trim_end(),
+    "slates",
+    "the successor names itself, not `exe`, the link it was started through"
+  );
+}
+
+/// Elsewhere: the anchor ends, saying its executable was replaced, and never runs the replacement.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn expect_the_anchors_own_image(
+  _instance: &str,
+  _killed: u32,
+  anchor: &mut AnchorProcess,
+  lines: &std::sync::mpsc::Receiver<String>,
+) {
+  let started = Instant::now();
+  let mut refused = false;
+  while !refused {
+    let left = START_WAIT.saturating_sub(started.elapsed());
+    let line = lines
+      .recv_timeout(left)
+      .expect("the anchor said why it did not restart within the start wait");
+    refused = line.contains(EXECUTABLE_REPLACED_LINE);
+  }
+  while anchor.child.try_wait().unwrap().is_none() {
+    assert!(
+      started.elapsed() < START_WAIT,
+      "the anchor ended after refusing"
+    );
+    pause();
+  }
 }
 
 /// Writes `content` to `path` in volume `id` through a fresh write attachment.

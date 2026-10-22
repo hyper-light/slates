@@ -194,10 +194,6 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
   segment
     .publish(RegionKind::Profile, json.as_bytes())
     .map_err(|e| failed("publish", e))?;
-  let exe = std::env::current_exe()
-    .map_err(|e| failed("current_exe", e))?
-    .to_string_lossy()
-    .into_owned();
   let mut args = vec![
     "--instance".to_owned(),
     options.instance.clone(),
@@ -221,7 +217,10 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
   // Until a start is measured, the budget holds one start: a daemon that fails once
   // before it ever beat is restarted once.
   let policy = RestartPolicy::derive(RECOVERY_BUDGET_NS, RECOVERY_BUDGET_NS);
-  let mut supervisor = Supervisor::new(segment, &exe, &args, policy.get());
+  // The daemon is this very executable, restarted from the image the anchor runs (A-145), never from what its path holds
+  // after an upgrade in place.
+  let mut supervisor =
+    Supervisor::new(segment, &args, policy.get()).map_err(|e| failed("supervise", e))?;
   // Hold the NFS loopback listener in the anchor so its port survives a daemon restart (§4.6): bind
   // it once and hand it to every daemon the supervisor spawns; the daemon adopts it.
   #[cfg(unix)]

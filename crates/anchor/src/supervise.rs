@@ -12,7 +12,7 @@
 use std::collections::VecDeque;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::process::{Child, Command};
+use std::process::Child;
 
 use slates_machine::{Derived, derived};
 
@@ -124,7 +124,11 @@ pub enum Stopping {
 /// The supervisor.
 pub struct Supervisor {
   segment: AnchorSegment,
+  /// The path this process was started from: every daemon's `argv[0]`, so `ps` and `pgrep -f` show it as before, and
+  /// where there is no link to the running image, the file each start is checked against (A-145).
   program: String,
+  /// What each start checks the path against, where the platform needs it ([`own_image`]).
+  image: own_image::Identity,
   args: Vec<String>,
   policy: RestartPolicy,
   child: Option<Child>,
@@ -195,16 +199,26 @@ impl std::fmt::Debug for Supervisor {
 }
 
 impl Supervisor {
-  /// A supervisor over `segment` for the daemon command `program args`.
+  /// A supervisor over `segment` whose daemons run this process's own executable with `args` (A-145): each start runs
+  /// the image this process runs, never whatever the path it was started from holds by then, so an upgrade in place
+  /// neither kills the instance at its next restart nor restarts another build under this anchor. Refused when the
+  /// process cannot read its own executable's path, or, where a start is checked against the file, that file.
   pub fn new(
     segment: AnchorSegment,
-    program: &str,
     args: &[String],
     policy: RestartPolicy,
-  ) -> Supervisor {
-    Supervisor {
+  ) -> Result<Supervisor, AnchorError> {
+    let program = std::env::current_exe()
+      .map_err(|e| AnchorError::OwnExecutable {
+        code: e.raw_os_error(),
+      })?
+      .to_string_lossy()
+      .into_owned();
+    let image = own_image::identity(&program)?;
+    Ok(Supervisor {
       segment,
-      program: program.to_owned(),
+      program,
+      image,
       args: args.to_vec(),
       policy,
       child: None,
@@ -220,7 +234,7 @@ impl Supervisor {
       fleet_serve: None,
       #[cfg(unix)]
       devices: None,
-    }
+    })
   }
 
   /// Holds the FUSE devices (A-61) and NFS loopback connections (A-113) daemons send, at most `device_bound` and
@@ -432,7 +446,7 @@ impl Supervisor {
     #[cfg(unix)]
     env.extend(self.device_env());
     env.extend(self.environment.iter().cloned());
-    let child = Command::new(&self.program)
+    let child = own_image::command(&self.program, self.image)?
       .args(&self.args)
       .envs(env)
       .spawn()
@@ -742,6 +756,93 @@ mod lifetime {
     pub(super) fn tie(&mut self, _child: &Child) -> Result<(), AnchorError> {
       Ok(())
     }
+  }
+}
+
+/// How a supervisor runs its own image (A-145; `docs/bugs/2026-10-22-an-anchor-restarted-its-daemon-by-a-path-an-upgrade-can-replace.md`).
+/// A path names whatever file is there now, and an upgrade in place deletes or replaces the one an anchor was started
+/// from: measured 2026-10-22, a daemon killed after that was restarted from the new file (a crash loop, when that file
+/// was not a daemon) or refused `ENOENT` (the anchor then ended, the instance with it). One function per platform, one
+/// signature.
+mod own_image {
+  use std::process::Command;
+
+  use crate::error::AnchorError;
+
+  /// Format: the link Linux keeps from every process to the image it runs (`proc(5)`); exec through it reaches that
+  /// image even when the path it was started from is gone or holds another file.
+  #[cfg(target_os = "linux")]
+  const RUNNING_IMAGE: &str = "/proc/self/exe";
+
+  /// What each start is checked against: nothing on Linux, where the link reaches the running image itself.
+  #[cfg(target_os = "linux")]
+  #[derive(Clone, Copy, Debug)]
+  pub(super) struct Identity;
+
+  /// What each start is checked against on the other Unix systems: the device and inode of the file at the path when
+  /// the supervisor was made.
+  #[cfg(all(unix, not(target_os = "linux")))]
+  #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+  pub(super) struct Identity {
+    device: rustix::fs::Dev,
+    inode: u64,
+  }
+
+  /// Nothing yet on Windows: a running executable can be renamed aside there (not deleted or overwritten), and std
+  /// has no stable file identity to check against; the check is owed (GAPS).
+  #[cfg(windows)]
+  #[derive(Clone, Copy, Debug)]
+  pub(super) struct Identity;
+
+  #[cfg(target_os = "linux")]
+  pub(super) fn identity(_path: &str) -> Result<Identity, AnchorError> {
+    Ok(Identity)
+  }
+
+  #[cfg(all(unix, not(target_os = "linux")))]
+  pub(super) fn identity(path: &str) -> Result<Identity, AnchorError> {
+    let stat = rustix::fs::stat(path).map_err(|e| AnchorError::OwnExecutable {
+      code: Some(e.raw_os_error()),
+    })?;
+    Ok(Identity {
+      device: stat.st_dev,
+      inode: stat.st_ino,
+    })
+  }
+
+  #[cfg(windows)]
+  pub(super) fn identity(_path: &str) -> Result<Identity, AnchorError> {
+    Ok(Identity)
+  }
+
+  /// Linux: the running image, through its link, named `path` in the daemon's `argv[0]`.
+  #[cfg(target_os = "linux")]
+  pub(super) fn command(path: &str, _identity: Identity) -> Result<Command, AnchorError> {
+    use std::os::unix::process::CommandExt;
+    let mut command = Command::new(RUNNING_IMAGE);
+    command.arg0(path);
+    Ok(command)
+  }
+
+  /// The other Unix systems: `path`, while it is still the file the supervisor was made from; gone or another file, the
+  /// start is refused `ExecutableReplaced`, so another build is never run under this anchor. A replacement made between
+  /// this check and the spawn is not caught: no portable call spawns a file by its descriptor there.
+  #[cfg(all(unix, not(target_os = "linux")))]
+  pub(super) fn command(path: &str, identity: Identity) -> Result<Command, AnchorError> {
+    let replaced = || AnchorError::ExecutableReplaced {
+      path: path.to_owned(),
+    };
+    let now = rustix::fs::stat(path).map_err(|_| replaced())?;
+    if (now.st_dev, now.st_ino) != (identity.device, identity.inode) {
+      return Err(replaced());
+    }
+    Ok(Command::new(path))
+  }
+
+  /// Windows: `path`, unchecked (the check is owed, as [`Identity`] says).
+  #[cfg(windows)]
+  pub(super) fn command(path: &str, _identity: Identity) -> Result<Command, AnchorError> {
+    Ok(Command::new(path))
   }
 }
 
