@@ -2004,8 +2004,9 @@ Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 > A scoped mount wedged permanently, taking its shard with it
 > (`docs/bugs/2026-10-17-fuse-notify-deadlocks-the-serving-thread.md`). Neither `FUSE_EXPIRE_ONLY` (the kernel locks
 > the parent before it reads the flags) nor any ordering inside our own loop (the kernel holds the lock from the
-> moment it issues the request) avoids it. A round of invalidations is therefore written on a thread of its own,
-> owned and joined by the serve state that started it, while the serving thread stays free to answer — which is
+> moment it issues the request) avoids it. A round of invalidations is therefore written on the mount's notify
+> thread (one per mount since A-142; it was one per round), owned and joined by the serve state, while the serving
+> thread stays free to answer — which is
 > precisely what releases the lock the write waits on. One round is out at a time (the gather consumes what it
 > reports, so that is also its bound); the cursor advances only for a round that was handed off whole and is put
 > back if the kernel refuses the write, so nothing is dropped. The property `Invalidated` posture rests on —
@@ -11913,6 +11914,30 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
+
+### A-142 — One notify thread per FUSE mount, not one per invalidation round (accepted 2026-10-22)
+Applied in the same change to: §4.6 (the 2026-10-17 amendment's notify thread); `crates/bridge-fuse/src/channel.rs`
+(`Notifier` replaces `NotifyThread`; `Round`, `Outcome`, `write_round`; `ServeState::notifier`; `deliver_owed`; two
+tests); `crates/cli/examples/write_round_ab.rs` (new); `docs/wip/BENCHMARKS.md`.
+- **Changes the 2026-10-17 amendment.** A mount's invalidation rounds are still written off the serving thread, one
+  round at a time, with the cursor put back on a refused write. What changes is the thread. One is started with the
+  mount's first round and kept: rounds reach it over a channel of one, and outcomes come back over a channel of one.
+  Dropping the notifier closes the channel and joins the thread after the round in flight. It used to be a new
+  thread for every round, started on the owner's shard.
+- **Why.** Every change made through another path runs a round on each mount of the volume, so the shard paid a thread
+  start (p50 16–20 µs on the box) per change per mount, and the next request waited behind it. Through the
+  optimization hierarchy: the thread is needed; one per round is more than needed.
+- **Evidence (measured, `BENCHMARKS.md`).** The bare-metal box, interleaved builds differing in this file alone, 12
+  phases each: a mounted volume's SDK write p90 fell from a median of 23.3 µs to 15.1 µs, against 13.3 µs with no
+  mount. The p50 does not move, since the writer is answered before the round runs.
+- **Proven.**
+  - A round whose write blocks leaves the owner free, and a second round goes through the same thread. Red-checked:
+    joining the thread after each round fails the second hand-off, with `EIO`.
+  - A notifier dropped with a round out returns, its thread joined.
+  - Regression on the box: workspace clippy and the doc gate clean; `coherence_mount`, `owner_turn`, the CLI map,
+    truncation and eviction tests, `fuse_mount` (3 of 3) and recovery (41 of 41) green.
+- **Bounds.** One thread per mount, idle in its channel between rounds, and at most one round and one outcome in
+  flight: the same peak as before.
 
 ### A-141 — A mount that falls behind the journal is told everything, and drops what its kernel holds (accepted 2026-10-22)
 Applied in the same change to: §4.6 (cache posture); `crates/bridge-core` (`Invalidation::Everything`; the overrun

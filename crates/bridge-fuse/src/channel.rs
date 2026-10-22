@@ -208,7 +208,7 @@ impl FuseChannel {
   }
 
   /// A second descriptor over the same device, for the thread that writes a round of invalidations
-  /// ([`NotifyThread`]). The notification write blocks in the kernel, so it must never run on the thread that
+  /// ([`Notifier`]). The notification write blocks in the kernel, so it must never run on the thread that
   /// answers requests; it needs a descriptor that outlives the borrow and crosses threads.
   fn device_clone(&self) -> Result<OwnedFd, ChannelError> {
     self.device.try_clone().map_err(|e| ChannelError::Device {
@@ -224,7 +224,7 @@ const EVENTFD_WORD: usize = size_of::<u64>();
 /// Encodes one kernel invalidation as an unsolicited notification (§4.6 `notify`). `expire_only` says the kernel
 /// negotiated `FUSE_HAS_EXPIRE_ONLY`, so a live-source entry is expired rather than dropped. `None` for a name past
 /// the wire cap: the kernel cannot be holding it either, so there is nothing to drop. The flag says whether this is
-/// an **entry** invalidation, because the kernel's `ENOENT` means something different for one (see [`NotifyThread`]).
+/// an **entry** invalidation, because the kernel's `ENOENT` means something different for one (see [`Notifier`]).
 fn encode_invalidation(invalidation: &Invalidation, expire_only: bool) -> Option<(Vec<u8>, bool)> {
   let mut out = [0u8; NOTIFY_BYTES];
   let entry = matches!(invalidation, Invalidation::Entry { .. });
@@ -255,10 +255,11 @@ fn encode_invalidation(invalidation: &Invalidation, expire_only: bool) -> Option
   Some((out.get(..n)?.to_vec(), entry))
 }
 
-/// A round of kernel invalidations written **away from the serving thread** (§4.6 "Cache posture"), owned by the
-/// [`ServeState`] that started it: the thread writes each notification, sends the round's outcome over a channel of
-/// one and wakes the loop. Dropped before the outcome came (an unmount while a round is out), it joins the thread
-/// first, so no thread outlives its owner.
+/// The mount's notify thread (§4.6 "Cache posture"; A-142). It writes each round of kernel invalidations **away from the
+/// serving thread**, one round at a time, for the life of the mount. Rounds reach it over a channel of one, and each
+/// outcome comes back over a channel of one and wakes the loop. Owned by the [`ServeState`]: dropped, it closes the
+/// round channel and joins the thread, which first finishes or fails the round in flight (at an unmount the device
+/// write fails), so no thread outlives its owner.
 ///
 /// It exists because the write blocks. `fuse_reverse_inval_entry()` takes the parent directory's inode lock, which a
 /// concurrent lookup holds for the whole request — and the only thread that would answer that lookup is the serving
@@ -268,77 +269,84 @@ fn encode_invalidation(invalidation: &Invalidation, expire_only: bool) -> Option
 /// kernel locks the parent before it reads the flags), and nor does any ordering inside our own loop (the kernel
 /// holds the lock from the moment it issues the request, whenever we read it). This mirrors the landing barrier's
 /// thread (A-132, `slates-server` `landing.rs`), which exists for the same reason.
-struct NotifyThread {
-  /// The round's outcome: how many entry invalidations the kernel refused, or the device's own refusal.
-  outcome: std::sync::mpsc::Receiver<Result<u32, ChannelError>>,
+///
+/// One thread per mount, started with its first round and kept. It was one thread per round until 2026-10-22, which
+/// cost the owner's shard a thread start on every change another path made (`docs/wip/BENCHMARKS.md`, A-142).
+struct Notifier {
+  /// Rounds to write: a channel of one, since the loop starts a round only once the last one is back. `None` once
+  /// the owner has closed it.
+  rounds: Option<std::sync::mpsc::SyncSender<Round>>,
+  /// Each round's outcome.
+  outcomes: std::sync::mpsc::Receiver<Outcome>,
   thread: Option<std::thread::JoinHandle<()>>,
-  /// Where the cursor stood before the round, to put it back if the kernel refuses the write.
-  before: Option<slates_bridge_core::InvalidationCursor>,
+  /// The round out, if one is: where the cursor stood before it, to put it back if the kernel refuses the write.
+  out: Option<Option<slates_bridge_core::InvalidationCursor>>,
 }
 
-impl NotifyThread {
-  /// Starts the round on its own thread. `wake` is signalled once the outcome is sent, so the loop sees it without
-  /// waiting for the kernel's next request. Refused with the system's errno when no thread can start.
-  fn start(
-    device: OwnedFd,
-    messages: Vec<(Vec<u8>, bool)>,
-    before: Option<slates_bridge_core::InvalidationCursor>,
-    wake: Option<ChangeNotifier>,
-  ) -> Result<NotifyThread, ChannelError> {
-    let (send, outcome) = std::sync::mpsc::sync_channel(1);
+impl Notifier {
+  /// Starts the mount's notify thread on its own duplicate of the device. `wake` is signalled once each outcome is
+  /// sent, so the loop sees it without waiting for the kernel's next request. Refused with the system's errno when no
+  /// thread can start.
+  fn start(device: OwnedFd, wake: Option<ChangeNotifier>) -> Result<Notifier, ChannelError> {
+    let (rounds, inbox) = std::sync::mpsc::sync_channel::<Round>(1);
+    let (send, outcomes) = std::sync::mpsc::sync_channel(1);
     let thread = std::thread::Builder::new()
       .name("slates-fuse-notify".to_owned())
       .spawn(move || {
-        let mut round = Ok(0u32);
-        for (message, entry) in &messages {
-          // `ENOTEMPTY` is the kernel declining to drop a directory that is in use, and `ENOENT` on an *inode*
-          // invalidation is the kernel not holding that inode — neither is a fault of the mount. `ENOENT` on an
-          // **entry** invalidation is not benign and is counted, not discarded: on Linux 6.19 the kernel refuses it
-          // and goes on answering from the cached negative entry, so the name a neighbour created is never seen
-          // (`docs/bugs/2026-10-19-linux-6-19-refuses-the-entry-invalidation-slates-swallows.md`). It is counted
-          // rather than raised because the refusal is not retryable — the next round would be refused the same way,
-          // and a round kept for retry is an unbounded loop.
-          match rustix::io::write(&device, message) {
-            Ok(_) => {}
-            Err(rustix::io::Errno::NOENT) if *entry => {
-              if let Ok(refused) = round.as_mut() {
-                *refused = refused.saturating_add(1);
-              }
-            }
-            Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTEMPTY) => {}
-            Err(e) => {
-              round = Err(ChannelError::Device {
-                call: "notify",
-                code: Some(e.raw_os_error()),
-              });
-              break;
-            }
+        // Until the owner closes the round channel: each round written whole, its outcome sent and the loop woken.
+        while let Ok(messages) = inbox.recv() {
+          // The receiver outlives the thread (its owner joins before it drops), so the send cannot fail; were it to,
+          // nobody is left to tell.
+          if send.send(write_round(&device, &messages)).is_err() {
+            return;
           }
-        }
-        // The receiver outlives the thread (its owner joins before it drops), so the send cannot fail; were it to,
-        // nobody is left to tell.
-        if send.send(round).is_ok()
-          && let Some(wake) = wake
-        {
-          let _ = wake.notify();
+          if let Some(wake) = wake.as_ref() {
+            let _ = wake.notify();
+          }
         }
       })
       .map_err(|e| ChannelError::Device {
         call: "notify-thread",
         code: e.raw_os_error(),
       })?;
-    Ok(NotifyThread {
-      outcome,
+    Ok(Notifier {
+      rounds: Some(rounds),
+      outcomes,
       thread: Some(thread),
-      before,
+      out: None,
     })
   }
 
-  /// The round's outcome once it is back (its thread joined: it has only to exit), `None` while it is still being
-  /// written. A thread gone without an outcome (it cannot be: shipped code does not panic, and a panic aborts) reads
-  /// as the device refusing.
-  fn returned(&mut self) -> Option<Result<u32, ChannelError>> {
-    let round = match self.outcome.try_recv() {
+  /// Hands the thread a round, noting where the cursor stood `before` it. A thread that is gone reads as the device
+  /// refusing.
+  fn send(
+    &mut self,
+    messages: Round,
+    before: Option<slates_bridge_core::InvalidationCursor>,
+  ) -> Result<(), ChannelError> {
+    match self.rounds.as_ref().map(|rounds| rounds.try_send(messages)) {
+      Some(Ok(())) => {
+        self.out = Some(before);
+        Ok(())
+      }
+      _ => Err(ChannelError::Device {
+        call: "notify",
+        code: rustix::io::Errno::IO.raw_os_error().into(),
+      }),
+    }
+  }
+
+  /// Whether a round is out.
+  fn busy(&self) -> bool {
+    self.out.is_some()
+  }
+
+  /// The round's outcome once it is back, with where the cursor stood before it; `None` while it is still being
+  /// written, or when no round is out. A thread gone without an outcome (it cannot be: shipped code does not panic, and
+  /// a panic aborts) reads as the device refusing.
+  fn returned(&mut self) -> Option<(Outcome, Option<slates_bridge_core::InvalidationCursor>)> {
+    let before = self.out?;
+    let round = match self.outcomes.try_recv() {
       Ok(round) => round,
       Err(std::sync::mpsc::TryRecvError::Empty) => return None,
       Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(ChannelError::Device {
@@ -346,11 +354,15 @@ impl NotifyThread {
         code: rustix::io::Errno::IO.raw_os_error().into(),
       }),
     };
-    self.join();
-    Some(round)
+    self.out = None;
+    Some((round, before))
   }
+}
 
-  fn join(&mut self) {
+impl Drop for Notifier {
+  fn drop(&mut self) {
+    // Closing the round channel ends the thread's loop once any round in flight is written; then it is joined.
+    self.rounds = None;
     if let Some(thread) = self.thread.take()
       && thread.join().is_err()
     {
@@ -359,10 +371,37 @@ impl NotifyThread {
   }
 }
 
-impl Drop for NotifyThread {
-  fn drop(&mut self) {
-    self.join();
+/// One round of notifications: each message's bytes, and whether it is an entry invalidation, whose `ENOENT` is counted
+/// as a refusal ([`write_round`]).
+type Round = Vec<(Vec<u8>, bool)>;
+/// A round's outcome: how many entry invalidations the kernel refused, or the device's own refusal.
+type Outcome = Result<u32, ChannelError>;
+
+/// Writes one round's notifications to the device, in order, stopping at the first the device refuses: how many entry
+/// invalidations the kernel refused, or that refusal.
+fn write_round(device: &OwnedFd, messages: &[(Vec<u8>, bool)]) -> Outcome {
+  let mut refused = 0u32;
+  for (message, entry) in messages {
+    // `ENOTEMPTY` is the kernel declining to drop a directory that is in use, and `ENOENT` on an *inode* invalidation
+    // is the kernel not holding that inode — neither is a fault of the mount. `ENOENT` on an **entry** invalidation is
+    // not benign and is counted, not discarded: on Linux 6.19 the kernel refuses it and goes on answering from the
+    // cached negative entry, so the name a neighbour created is never seen
+    // (`docs/bugs/2026-10-19-linux-6-19-refuses-the-entry-invalidation-slates-swallows.md`). It is counted rather than
+    // raised because the refusal is not retryable — the next round would be refused the same way, and a round kept for
+    // retry is an unbounded loop.
+    match rustix::io::write(device, message) {
+      Ok(_) => {}
+      Err(rustix::io::Errno::NOENT) if *entry => refused = refused.saturating_add(1),
+      Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTEMPTY) => {}
+      Err(e) => {
+        return Err(ChannelError::Device {
+          call: "notify",
+          code: Some(e.raw_os_error()),
+        });
+      }
+    }
   }
+  Ok(refused)
 }
 
 /// A change signal (§4.6 "Cache posture"; AUD-02): the descriptor the serve loop waits on beside the
@@ -433,7 +472,7 @@ impl std::fmt::Debug for ChangeNotifier {
 
 impl ChangeNotifier {
   /// Another descriptor over the same counter, for a thread that must wake the loop when it finishes (the round of
-  /// invalidations in [`NotifyThread`]).
+  /// invalidations in [`Notifier`]).
   fn try_clone(&self) -> Result<ChangeNotifier, ChannelError> {
     let fd = self.fd.try_clone().map_err(|e| ChannelError::Device {
       call: "dup",
@@ -525,10 +564,11 @@ pub struct ServeState {
   /// A `FALLOCATE` still running (A-108), with where the kernel's cache stood before it began: stepped one slice
   /// per turn, and no other request is read until it is answered.
   allocating: Option<(Allocation, Option<slates_bridge_core::InvalidationCursor>)>,
-  /// A round of invalidations being written away from this thread ([`NotifyThread`]). At most one round is out at a
-  /// time: the gather consumes what it reports ([`slates_bridge_core::Bridge::invalidations`] takes the base plane's
-  /// stale entries), so a second round is never started while one is in flight — which is also its bound.
-  notifying: Option<NotifyThread>,
+  /// The mount's notify thread, which writes each round of invalidations away from this thread ([`Notifier`]); started
+  /// with the first round. At most one round is out at a time: the gather consumes what it reports
+  /// ([`slates_bridge_core::Bridge::invalidations`] takes the base plane's stale entries), so a second round is never
+  /// started while one is in flight — which is also its bound.
+  notifier: Option<Notifier>,
   /// Wakes this loop when a round finishes, so its outcome is seen and the next round started without waiting for
   /// the kernel's next request. Absent in a harness that drives the loop itself.
   notify_wake: Option<ChangeNotifier>,
@@ -582,7 +622,7 @@ impl ServeState {
       replay: None,
       coherence: Coherence::new(),
       allocating: None,
-      notifying: None,
+      notifier: None,
       notify_wake: None,
       entry_invalidations_refused: 0,
       own: OwnRecords::default(),
@@ -761,7 +801,7 @@ pub fn serve_step(
 }
 
 /// Delivers the round owed to the kernel: every invalidation since the cursor, written as an
-/// unsolicited notification **on a thread of its own** ([`NotifyThread`]) — never here, because the write blocks in
+/// unsolicited notification **on the mount's notify thread** ([`Notifier`]) — never here, because the write blocks in
 /// the kernel on a lock that only an answered request releases, and this is the thread that answers
 /// (`docs/bugs/2026-10-17-fuse-notify-deadlocks-the-serving-thread.md`).
 ///
@@ -775,16 +815,16 @@ fn deliver_owed(
   cx: &slates_bridge_core::OpContext,
   state: &mut ServeState,
 ) -> Result<Delivered, ChannelError> {
-  if let Some(round) = state.notifying.as_mut() {
-    let Some(outcome) = round.returned() else {
+  if let Some(notifier) = state.notifier.as_mut()
+    && notifier.busy()
+  {
+    let Some((outcome, before)) = notifier.returned() else {
       // Still being written: nothing new may be gathered (the gather consumes), and the cursor must not advance.
       return Ok(Delivered {
         written: 0,
         gather_refused: true,
       });
     };
-    let before = round.before;
-    state.notifying = None;
     match outcome {
       Err(refusal) => {
         state.coherence.rewind(before);
@@ -804,7 +844,7 @@ fn deliver_owed(
   // that outlived the name's creation).
   let root = bridge.root(cx).ok();
   let before = state.coherence.cursor();
-  let mut messages: Vec<(Vec<u8>, bool)> = Vec::new();
+  let mut messages: Round = Vec::new();
   let mut overran = false;
   let holds = &mut state.holds;
   let delivered = state
@@ -836,16 +876,18 @@ fn deliver_owed(
     feed_states(bridge, cx, state, since.journal_seq);
   }
   if !messages.is_empty() {
-    let wake = match state.notify_wake.as_ref() {
-      Some(notifier) => Some(notifier.try_clone()?),
-      None => None,
+    let notifier = match state.notifier.take() {
+      Some(notifier) => notifier,
+      None => {
+        let wake = match state.notify_wake.as_ref() {
+          Some(notifier) => Some(notifier.try_clone()?),
+          None => None,
+        };
+        Notifier::start(channel.device_clone()?, wake)?
+      }
     };
-    state.notifying = Some(NotifyThread::start(
-      channel.device_clone()?,
-      messages,
-      before,
-      wake,
-    )?);
+    let notifier = state.notifier.insert(notifier);
+    notifier.send(messages, before)?;
   }
   Ok(delivered)
 }
@@ -855,11 +897,7 @@ fn deliver_owed(
 /// busy directory is revalidated rather than torn down
 /// (`docs/bugs/2026-10-22-a-mount-that-falls-behind-the-journal-never-hears-of-the-changes-it-missed.md`). The kernel
 /// may have dropped some of these already, so its `ENOENT` for a name here is expected and is not counted as a refusal.
-fn everything_told(
-  holds: &mut KernelHolds,
-  expire_only: bool,
-  messages: &mut Vec<(Vec<u8>, bool)>,
-) {
+fn everything_told(holds: &mut KernelHolds, expire_only: bool, messages: &mut Round) {
   let (nodes, names) = holds.invalidate_everything();
   for ino in nodes
     .into_iter()
@@ -1631,48 +1669,90 @@ mod tests {
     );
   }
 
-  /// §4.6 Cache posture (`docs/bugs/2026-10-17-fuse-notify-deadlocks-the-serving-thread.md`). Do: start a round of
-  /// invalidations whose write cannot complete (its destination is full), then carry on as the serve loop does.
-  /// Expect: the owner is **not** blocked — it keeps running and sees the round still out — and once the
-  /// destination drains the round completes and its thread is joined. This is the invariant the deadlock broke: a
-  /// notification write must never hold the thread that answers requests, because answering is what unblocks it.
-  #[test]
-  fn a_round_whose_write_blocks_does_not_hold_its_owner() {
-    let (reader, writer) = rustix::pipe::pipe().expect("a pipe");
-    // Fill the pipe so the round's write has nowhere to go: non-blocking while filling, blocking for the round.
-    rustix::fs::fcntl_setfl(&writer, rustix::fs::OFlags::NONBLOCK).expect("non-blocking");
+  /// Shape: how long the drop test waits before closing the pipe's reader, so the notifier is dropped while its write
+  /// is still blocked.
+  const READER_CLOSES_AFTER: std::time::Duration = std::time::Duration::from_millis(50);
+
+  /// Fills the pipe behind `writer` so a write to it blocks until its reader drains it. The non-blocking flag belongs
+  /// to the open pipe, which the notifier's descriptor shares, so it is set only while the notifier waits for a round.
+  fn fill(writer: &OwnedFd) {
+    rustix::fs::fcntl_setfl(writer, rustix::fs::OFlags::NONBLOCK).expect("non-blocking");
     let block = [0u8; 4096];
-    let mut filled = 0usize;
-    while let Ok(n) = rustix::io::write(&writer, &block) {
-      filled = filled.saturating_add(n);
-      if n == 0 || filled > (1 << 22) {
+    while let Ok(n) = rustix::io::write(writer, &block) {
+      if n == 0 {
         break;
       }
     }
-    rustix::fs::fcntl_setfl(&writer, rustix::fs::OFlags::empty()).expect("blocking again");
+    rustix::fs::fcntl_setfl(writer, rustix::fs::OFlags::empty()).expect("blocking again");
+  }
 
-    let mut round = NotifyThread::start(writer, vec![(vec![7u8; 64], false)], None, None)
-      .expect("the round starts");
-    // The owner carries on: the round is out, and asking does not block.
-    assert!(
-      round.returned().is_none(),
-      "the owner is free while the round's write waits"
-    );
+  /// Drains `reader` until `notifier`'s round is back, and returns its outcome.
+  /// Shape: how long a drained round may take to come back — far above a thread's wake-up.
+  const DRAIN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-    // Drain, so the blocked write can land; the round then comes back and its thread is joined.
+  /// Drains `reader` until `notifier`'s round is back, within [`DRAIN_WAIT`], and returns its outcome. The reader is
+  /// non-blocking (its own open pipe end, so the notifier's write still blocks): a read of an empty pipe must not wait
+  /// for a write that has already landed, which a blocking read here once did, hanging the test.
+  fn drained(notifier: &mut Notifier, reader: &OwnedFd) -> Option<Outcome> {
+    rustix::fs::fcntl_setfl(reader, rustix::fs::OFlags::NONBLOCK).expect("a non-blocking reader");
     let mut sink = vec![0u8; 1 << 16];
-    let mut outcome = None;
-    for _ in 0..256 {
-      let _ = rustix::io::read(&reader, &mut sink);
-      if let Some(back) = round.returned() {
-        outcome = Some(back);
-        break;
+    let deadline = std::time::Instant::now() + DRAIN_WAIT;
+    while std::time::Instant::now() < deadline {
+      let _ = rustix::io::read(reader, &mut sink);
+      if let Some((outcome, _before)) = notifier.returned() {
+        return Some(outcome);
       }
+      std::thread::yield_now();
     }
-    assert!(
-      matches!(outcome, Some(Ok(0))),
-      "the round completed once its write could land, refusing nothing: {outcome:?}"
-    );
-    assert!(round.thread.is_none(), "its thread was joined");
+    None
+  }
+
+  /// §4.6 Cache posture (`docs/bugs/2026-10-17-fuse-notify-deadlocks-the-serving-thread.md`; A-142). Do: twice, fill
+  /// the device's pipe, hand the mount's notifier a round, check it as the serve loop does, then drain. Expect: the
+  /// owner is **not** blocked while either write waits, and each round completes once its write can land, refusing
+  /// nothing — the second through the same notifier, whose thread would be gone had it been joined after the first.
+  #[test]
+  fn a_round_whose_write_blocks_does_not_hold_its_owner_and_the_next_reuses_its_thread() {
+    let (reader, writer) = rustix::pipe::pipe().expect("a pipe");
+    let refill = rustix::io::dup(&writer).expect("a second descriptor on the pipe");
+    let mut notifier = Notifier::start(writer, None).expect("the notifier starts");
+    for round in 1..=2 {
+      fill(&refill);
+      notifier
+        .send(vec![(vec![7u8; 64], false)], None)
+        .expect("the round is handed to the mount's thread");
+      assert!(
+        notifier.returned().is_none(),
+        "round {round}: the owner is free while the round's write waits"
+      );
+      assert!(
+        matches!(drained(&mut notifier, &reader), Some(Ok(0))),
+        "round {round} completed once its write could land, refusing nothing"
+      );
+    }
+  }
+
+  /// A-142: a notifier dropped with a round out ends its thread. Do: fill the device's pipe, hand the notifier a round,
+  /// then drop the notifier while the write waits, the pipe's reader closing a moment later. Expect the drop to return:
+  /// the write fails once the reader is gone, the thread finds the round channel closed and ends, and is joined.
+  #[test]
+  fn a_notifier_dropped_with_a_round_out_joins_its_thread() {
+    let (reader, writer) = rustix::pipe::pipe().expect("a pipe");
+    let refill = rustix::io::dup(&writer).expect("a second descriptor on the pipe");
+    let mut notifier = Notifier::start(writer, None).expect("the notifier starts");
+    fill(&refill);
+    drop(refill);
+    notifier
+      .send(vec![(vec![7u8; 64], false)], None)
+      .expect("the round is handed over");
+    std::thread::scope(|scope| {
+      scope.spawn(move || {
+        // The test paces itself; shipped code parks on its driver (D-9).
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(READER_CLOSES_AFTER);
+        drop(reader);
+      });
+      drop(notifier);
+    });
   }
 }

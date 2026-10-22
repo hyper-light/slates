@@ -971,6 +971,19 @@ it was held in — the four are very different suspects (a daemon killed under o
 group stopped by signal, a cancelled call, an anchor killed for good) and the failure said nothing about
 which. Related prior work: `reply-park-lost-wake` (an unfenced reply-side park, fixed bc81da4).
 
+**And it has said it, twice, the same way** (2026-10-22, the ubuntu lane, commits touching only the FUSE coherence
+path):
+- run 39749075454 (`d7826c8b`): 0.147 s late against a 0.1 s bound plus 0.002 s of measured noise;
+- run 39797950813 (`c5f5a212`): 0.110 s late, with 0.001 s of noise.
+
+Both were held in phase **(1), "overflow, then a restart under the outstanding calls"**: the daemon is killed under
+outstanding calls and the anchor restarts it. The first also reports that across the gap the Python process burned
+**0.002 s of CPU**. So for about 145 ms the loop's thread was blocked in something other than computing, while the
+machine itself was not late. That points at a call made on the loop that waits during the reconnect (`CLAIM_WAIT_NS`
+is one second), and away from a slow machine or a busy loop. Still a hypothesis: the next step is a trace of the loop
+thread's system calls in phase (1). The Linux box can build the extension, but that needs Ada's go for installing
+`maturin` there.
+
 ### 8a-tsan-wait. The TSan lane declared itself 25× slow and one budget never listened (2026-10-20, closed)
 
 `a_client_maps_files_across_shards_and_always_gets_the_bytes` failed on the TSan lane (run 39527867650) with
@@ -10541,6 +10554,18 @@ stale page back, and the other write's bytes on it reverted: measured 4,095 of 4
   attribute or page, whose lifetimes are unbounded under the `Invalidated` posture. Delivery takes about 82 µs after
   the writer's reply (measured, above), so the window is a crash inside it. The same gap hides such a change from the
   write-back rule, above.
+  - **What a fix has to work with** (read 2026-10-22): recovery rebuilds every volume with an empty journal
+    (`OpLog::new`, `crates/vfs/src/volume.rs:877`), so the records the dead daemon had not delivered exist nowhere
+    after a takeover.
+  - **A-141 cannot be reused as it stands.** A restored mount's `KernelHolds` is empty, because the kernel's lookups
+    predate the new daemon.
+  - **What a restored mount could still do:** invalidate every inode its attachment references (the reference table is
+    recovered, A-61) and every name the volume has now. A name removed by another path in the window would still be
+    missed.
+  - **The other route:** carry the delivered cursor or the holdings across the takeover. That is anchor traffic on
+    every round.
+
+  Which way to go is Ada's call. Not yet reproduced.
 - **`O_DIRECT` reads** were found by reading Linux 6.12's source on 2026-10-22 and have not been reproduced. A direct
   READ looks like a cache READ on the wire, but it leaves the cached page in place. Counting it as a fetch can therefore
   clear a staleness the cached page still holds. The window is between a round's gather and the kernel's handling of

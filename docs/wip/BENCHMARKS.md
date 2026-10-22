@@ -6021,3 +6021,59 @@ answers with less can never look fast.
 **What this does not measure:** the copy arm's figures are a full paged read of the file and the zero-copy arm's
 are an `mmap`, so the ratio is a property of the file size as much as of the paths; only the single-chunk row is
 an apples-to-apples comparison, and it is the only one quoted. A quiesced re-run would sharpen all of it.
+
+## One notify thread per FUSE mount: what a mount costs other writers (A-142; 2026-10-22)
+
+**The question.** Every change made through another path runs an invalidation round on each FUSE mount of the volume,
+on the volume's owner shard. Until A-142 each round started a thread to write its notifications off the serving thread
+and joined it when the round came back. A thread start costs far more than the rest of the round.
+
+**The command.** `crates/cli/examples/write_round_ab.rs`: an in-process daemon, one volume, and an SDK client timing
+2,000 sequential 64-byte whole-file writes of one file per phase. Phases alternate between no mount and a mount made by
+the real `slates mount`, which reads the file first, four phases each way. The "before" and "after" binaries were built
+from one tree, differing only in `crates/bridge-fuse/src/channel.rs` (before: `c5f5a212`; binary hashes `00b2caa9`,
+`a67eb13a`). They ran interleaved, before then after, three times:
+`cargo build --release -p slates-cli --bin slates --example write_round_ab && target/release/examples/write_round_ab`.
+
+**The machine.** The bare-metal Linux box (x86_64, 32 cores, kernel 7.2.9, `fusermount3`), 2026-10-22 15:27–15:31 UTC,
+with a load average of 10–11 from other work.
+
+| run | arm | phase | no mount p50 | no mount p90 | mounted p50 | mounted p90 | load (1, 5, 15 min) |
+|---|---|---|---|---|---|---|---|
+| 1 | before | 0 | 10.2 | 15.6 | 9.8 | 30.5 | 10.89 9.44 8.79 |
+| 1 | before | 1 | 10.4 | 14.1 | 10.2 | 24.1 | 10.89 9.44 8.79 |
+| 1 | before | 2 | 10.0 | 13.0 | 10.3 | 24.8 | 10.89 9.44 8.79 |
+| 1 | before | 3 | 9.6 | 13.9 | 10.6 | 23.2 | 10.89 9.44 8.79 |
+| 1 | after | 0 | 10.1 | 13.6 | 10.3 | 17.6 | 10.89 9.44 8.79 |
+| 1 | after | 1 | 9.6 | 13.3 | 10.2 | 17.6 | 10.89 9.44 8.79 |
+| 1 | after | 2 | 9.6 | 13.3 | 10.4 | 14.8 | 10.89 9.44 8.79 |
+| 1 | after | 3 | 9.6 | 13.3 | 9.2 | 14.3 | 10.89 9.44 8.79 |
+| 2 | before | 0 | 10.6 | 29.7 | 10.1 | 22.9 | 10.89 9.44 8.79 |
+| 2 | before | 1 | 9.8 | 13.5 | 10.7 | 22.7 | 10.89 9.44 8.79 |
+| 2 | before | 2 | 9.3 | 14.4 | 9.1 | 29.7 | 11.06 9.50 8.81 |
+| 2 | before | 3 | 9.9 | 13.5 | 9.3 | 26.5 | 11.06 9.50 8.81 |
+| 2 | after | 0 | 8.4 | 11.9 | 9.1 | 16.4 | 11.06 9.50 8.81 |
+| 2 | after | 1 | 8.9 | 12.5 | 8.5 | 15.0 | 11.06 9.50 8.81 |
+| 2 | after | 2 | 9.1 | 13.4 | 9.3 | 15.3 | 11.06 9.50 8.81 |
+| 2 | after | 3 | 8.9 | 12.0 | 9.0 | 14.3 | 11.06 9.50 8.81 |
+| 3 | before | 0 | 8.2 | 10.6 | 8.7 | 20.2 | 11.06 9.50 8.81 |
+| 3 | before | 1 | 9.1 | 11.9 | 9.3 | 17.5 | 11.06 9.50 8.81 |
+| 3 | before | 2 | 8.8 | 11.9 | 9.5 | 21.3 | 11.06 9.50 8.81 |
+| 3 | before | 3 | 9.3 | 11.6 | 8.8 | 23.3 | 11.06 9.50 8.81 |
+| 3 | after | 0 | 9.2 | 13.3 | 9.6 | 16.4 | 11.06 9.50 8.81 |
+| 3 | after | 1 | 8.8 | 11.8 | 9.1 | 16.4 | 11.06 9.50 8.81 |
+| 3 | after | 2 | 8.2 | 11.3 | 9.2 | 14.2 | 11.06 9.50 8.81 |
+| 3 | after | 3 | 8.6 | 11.2 | 9.2 | 13.3 | 10.90 9.49 8.81 |
+
+A bare thread start and join, timed in the same runs: p50 16.2–19.8 µs, p90 26.4–29.7 µs.
+
+**What it shows.**
+- **The mounted p90 fell from a median of 23.3 µs (17.5–30.5) to 15.1 µs (13.3–17.6),** within about 2 µs of the
+  unmounted p90 (a median of 13.3 µs across both arms, and 12.9 µs in the after arm's own phases).
+- **The p50 does not move in either arm,** because the writer is answered before the round runs. What the old thread
+  start cost was the next write, waiting behind it on the shard. That fits the old mounted p90 sitting about one spawn
+  above the unmounted one.
+- **The p99s and means are this box's background load,** in both arms and both modes (0.3–1.5 ms), and are not read.
+
+**What remains**, about 2 µs at the p90, is the round itself: the gather, the encode and the hand-off over the
+notifier's channel.
