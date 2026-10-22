@@ -7,9 +7,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use slates_ipc::region::{ClientRegion, RegionGeometry};
+use slates_ipc::rendezvous::{ENV_RENDEZVOUS, HeldRendezvous};
 use slates_ipc::slot::Slot;
 use slates_ipc::{
   CLAIM_WAIT_NS, ClientEnd, DaemonEnd, IpcError, Listener, Prepared, begin_connect_as, connect,
@@ -20,6 +21,9 @@ const CHILD_ROLE: &str = "SLATES_IPC_TEST_CLIENT";
 /// Format: the environment variable naming the instance a re-invoked child connects to expecting the
 /// typed capacity refusal.
 const CHILD_REFUSED_ROLE: &str = "SLATES_RENDEZVOUS_REFUSED_CHILD";
+/// Format: the environment variable naming the instance whose held rendezvous a re-invoked child restarts a daemon
+/// under, with a claim crossing the restart.
+const CHILD_RESTART_ROLE: &str = "SLATES_RENDEZVOUS_RESTART_CHILD";
 /// Shape: how long the daemon side serves before giving up (milliseconds).
 const SERVE_MS: u64 = 5_000;
 /// Shape: slots per ring here.
@@ -288,8 +292,22 @@ fn poll_until_refused(mut claim: slates_ipc::Claim) -> (IpcError, u64, Longest) 
 /// Begins a claim and polls it while the daemon end serves, until it connects within the claim wait: the
 /// connection and the longest poll.
 fn poll_while_serving(listener: &mut Listener, instance: &str) -> (slates_ipc::Connected, Longest) {
+  let claim = begin_connect_as(instance, 0, slates_ipc::CLAIM_WAIT_NS).unwrap();
+  let (connected, longest, accepted) = serve_until_connected(listener, claim);
+  // The daemon's ends go with the test; the client's mapping keeps the region it opened.
+  drop(accepted);
+  (connected, longest)
+}
+
+/// Polls `claim`, already begun, while the daemon end `listener` serves, until it connects within the claim wait:
+/// the connection, the longest poll, and the daemon's side of each claim it accepted. The caller keeps that side for
+/// as long as the daemon is meant to live: on Linux the client's liveness is the peer of its control socket, which
+/// closes with it.
+fn serve_until_connected(
+  listener: &mut Listener,
+  mut claim: slates_ipc::Claim,
+) -> (slates_ipc::Connected, Longest, Vec<slates_ipc::Accepted>) {
   let pid = std::process::id();
-  let mut claim = begin_connect_as(instance, 0, slates_ipc::CLAIM_WAIT_NS).unwrap();
   let started = Instant::now();
   let mut longest = Longest::default();
   // The daemon's side of each accepted claim, kept: its region lives while the daemon holds it.
@@ -315,9 +333,7 @@ fn poll_while_serving(listener: &mut Listener, instance: &str) -> (slates_ipc::C
       slates_machine::bench::involuntary_switches_since(switches),
     );
     if let Some(connected) = polled {
-      // The daemon's ends go with the test; the client's mapping keeps the region it opened.
-      drop(accepted);
-      return (connected, longest);
+      return (connected, longest, accepted);
     }
     assert!(
       started.elapsed() < Duration::from_nanos(CLAIM_WAIT_NS),
@@ -342,4 +358,57 @@ fn a_claim_whose_daemon_died_before_answering_is_unavailable_not_refused() {
     matches!(refusal, IpcError::DaemonUnavailable { .. }),
     "{refusal:?}"
   );
+}
+
+/// The two daemons and the client of the restart test below, in one process under the parent's held rendezvous.
+/// Daemon A opens it; the client's claim begins while A is published; A is dropped unanswered; daemon B opens it and
+/// answers the claim. Exits 0 when the client judges B, the daemon that answered it, alive. Passes trivially when not
+/// the child.
+#[test]
+fn rendezvous_restart_child() {
+  let Ok(instance) = std::env::var(CHILD_RESTART_ROLE) else {
+    return;
+  };
+  let first = Listener::open(&instance).unwrap();
+  let first_opened = SystemTime::now();
+  let claim = begin_connect_as(&instance, 0, slates_ipc::CLAIM_WAIT_NS).unwrap();
+  // A daemon killed with the claim unanswered: nothing it published is taken back, its start stamp included.
+  drop(first);
+  // A daemon's start stamp is the wall clock when it opens. Wait until the clock has passed the first daemon's
+  // opening, so the second's stamp differs and the test cannot pass by the two coinciding.
+  while SystemTime::now() <= first_opened {
+    std::hint::spin_loop();
+  }
+  let mut second = Listener::open(&instance).unwrap();
+  // The second daemon lives on with its ends of what it accepted, as a running daemon does.
+  let (connected, _, _accepted) = serve_until_connected(&mut second, claim);
+  assert!(
+    !connected.liveness.daemon_gone(),
+    "the daemon that answered the claim is alive and published, and the client judged it gone"
+  );
+  std::process::exit(0);
+}
+
+/// GAPS §8a-sdk-stamp, A-143 (found 2026-10-22: on macOS an async SDK call to a stopped daemon, restarted once,
+/// ended `DaemonGone` where it must end `Stalled`). Do: hold the rendezvous as an anchor does, and run in a child
+/// under it: daemon A, a client's claim begun while A is published, A dropped unanswered (a killed daemon), then
+/// daemon B, which answers the claim. Expect: the client judges B alive. Before A-143 the client kept the start stamp
+/// it saw when its claim began, A's, while it watched B's process, and so judged the live B gone. Linux passes by
+/// construction: its liveness is the control socket's peer, the daemon that accepted the connection.
+#[test]
+fn a_claim_begun_before_a_restart_judges_the_daemon_that_answered_it_alive() {
+  let instance = format!("test-claim-restart-{}", std::process::id());
+  let held = HeldRendezvous::hold(&instance).unwrap();
+  let exe = std::env::current_exe().unwrap();
+  let status = Command::new(exe)
+    .args(["--exact", "rendezvous_restart_child", "--nocapture"])
+    .env(CHILD_RESTART_ROLE, &instance)
+    .env(ENV_RENDEZVOUS, held.env_value())
+    .status()
+    .unwrap();
+  assert!(
+    status.success(),
+    "the client judged the daemon that answered its claim alive: {status:?}"
+  );
+  drop(held);
 }

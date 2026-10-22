@@ -1444,7 +1444,8 @@ pub mod platform {
   /// loop; the loop drains them, so the table only covers one loop of arrivals.
   const SLOTS: usize = 64;
   /// Format: a claim slot: state (4), client pid (4), client id (4), padding (4), region
-  /// length (8), region name (40), padding to two cache lines.
+  /// length (8), region name (40), the answering daemon's start stamp (8) and process id (4),
+  /// padding to two cache lines.
   const SLOT_BYTES: usize = 128;
   /// Format: the state word's offset in a slot.
   const AT_STATE: usize = 0;
@@ -1458,6 +1459,13 @@ pub mod platform {
   const AT_NAME: usize = 24;
   /// Format: the region name's width.
   const NAME_BYTES: usize = 40;
+  /// Format: the offset in a slot of the answering daemon's start stamp (A-143), written with its answer. A client
+  /// judges its daemon by this stamp, not by the header's: the header names whichever daemon published last, and a
+  /// claim begun before a restart is answered by the next daemon (A-114).
+  const AT_ANSWERED_STAMP: usize = 64;
+  /// Format: the offset in a slot of the answering daemon's process id (A-143), written with its answer: the process
+  /// a client's exit watch is taken on.
+  const AT_ANSWERED_PID: usize = 72;
   /// Format: the slot states.
   const FREE: u32 = 0;
   /// Format: a client claimed the slot.
@@ -1526,10 +1534,11 @@ pub mod platform {
     }
   }
 
-  /// The client's liveness check: the daemon's process exited (its exit watch, taken when the claim was
-  /// answered), or the start stamp it saw differs from the one the bootstrap object holds now (none when
-  /// no daemon holds the object). The stamp alone cannot see a killed daemon nothing restarted, since the
-  /// object outlives it (AUD-29-20).
+  /// The client's liveness check: the daemon's process exited (its exit watch), or that daemon's start stamp
+  /// differs from the one the bootstrap object holds now (none when no daemon holds the object). Both the
+  /// process and the stamp are the ones the answering daemon wrote into its answer (A-143), never the
+  /// header's, which may already name a later daemon. The stamp alone cannot see a killed daemon nothing
+  /// restarted, since the object outlives it (AUD-29-20).
   pub struct Liveness {
     instance: String,
     generation: u64,
@@ -1582,6 +1591,8 @@ pub mod platform {
 
   pub(super) struct Listener {
     object: SharedObject,
+    /// The start stamp this daemon published in the header, written into each of its answers (A-143).
+    stamp: u64,
     /// Per claim slot, the state it was last seen in and since when: a slot left in a state only a live
     /// party moves on from is reclaimed past [`STALE_SLOT_NS`]. Bounded by the table.
     seen: Vec<Option<(u32, std::time::Instant)>>,
@@ -1749,6 +1760,32 @@ pub mod platform {
     Ok(())
   }
 
+  /// The answering daemon's identity, written into the slot at `at` with its answer while it holds the slot
+  /// `ANSWERING` (A-143): the start stamp it published and its process id.
+  fn write_answerer(
+    object: &mut SharedObject,
+    at: usize,
+    stamp: u64,
+    pid: u32,
+  ) -> Result<(), IpcError> {
+    object.write(at.saturating_add(AT_ANSWERED_STAMP), &stamp.to_le_bytes())?;
+    object.write(at.saturating_add(AT_ANSWERED_PID), &pid.to_le_bytes())?;
+    Ok(())
+  }
+
+  /// The identity of the daemon that answered the slot at `at` (A-143): its start stamp and process id. A stamp of
+  /// zero is an answer that names no daemon, written by a daemon of another version (`docs/publish.md`: one
+  /// version), and is refused.
+  fn read_answerer(object: &SharedObject, at: usize) -> Result<(u64, u32), IpcError> {
+    let stamp = read_u64(object, at.saturating_add(AT_ANSWERED_STAMP))?;
+    if stamp == 0 {
+      return Err(IpcError::Layout {
+        reason: "an answered claim does not name its daemon (a daemon of another version)",
+      });
+    }
+    Ok((stamp, read_u32(object, at.saturating_add(AT_ANSWERED_PID))?))
+  }
+
   /// A fresh bootstrap object for `instance`: the header's magic and slot count, every slot free, nothing published
   /// (the start stamp zero until a daemon writes it).
   fn fresh(instance: &str) -> Result<SharedObject, IpcError> {
@@ -1817,11 +1854,13 @@ pub mod platform {
       };
       object.write(AT_DAEMON_PID, &current_pid().to_le_bytes())?;
       // The start stamp last, with release: it publishes the header and the free table (never zero).
+      let stamp = stamp_now().max(1);
       object
         .atomic_u64(AT_GENERATION)?
-        .store(stamp_now().max(1), Ordering::Release);
+        .store(stamp, Ordering::Release);
       Ok(Listener {
         object,
+        stamp,
         seen: vec![None; SLOTS],
         #[cfg(windows)]
         ready_events: (0..SLOTS)
@@ -1972,6 +2011,7 @@ pub mod platform {
         }));
       }
       write_answer(&mut self.object, at, client_id, len, &name).map_err(lost)?;
+      write_answerer(&mut self.object, at, self.stamp, current_pid()).map_err(lost)?;
       self.publish(index, READY).map_err(lost)?;
       Ok(Accepted {
         client_id,
@@ -2035,8 +2075,9 @@ pub mod platform {
     std::process::id()
   }
 
-  /// The bootstrap object of `instance`, its handoff, and its published start stamp.
-  fn open_bootstrap(instance: &str) -> Result<(Handoff, SharedObject, u64), IpcError> {
+  /// The bootstrap object of `instance` and its handoff, refused unless a daemon has published it. Which daemon that
+  /// is does not bind the claim: the daemon that answers names itself in its answer (A-143).
+  fn open_bootstrap(instance: &str) -> Result<(Handoff, SharedObject), IpcError> {
     let unavailable = |why: &'static str| IpcError::DaemonUnavailable {
       endpoint: instance.to_owned(),
       why,
@@ -2047,9 +2088,9 @@ pub mod platform {
       })?;
     let object = SharedObject::open(&handoff, OBJECT_BYTES, bootstrap_words())
       .map_err(|_| unavailable("the rendezvous object is not there (no daemon has created it)"))?;
-    let generation = published(&object)?
+    published(&object)?
       .ok_or_else(|| unavailable("the daemon has not yet published its rendezvous object"))?;
-    Ok((handoff, object, generation))
+    Ok((handoff, object))
   }
 
   /// Claims a free slot: `FREE` → `CLAIMING`, the pid and the wanted id written, then `CLAIMED` with
@@ -2107,7 +2148,6 @@ pub mod platform {
     instance: String,
     object: SharedObject,
     index: usize,
-    generation: u64,
     /// The daemon-wide doorbell, rung at the claim and kept as the client's doorbell once connected;
     /// taken when the claim completes.
     bell: Option<Bell>,
@@ -2133,7 +2173,7 @@ pub mod platform {
     wanted: u32,
     restart_wait_ns: u64,
   ) -> Result<Claim, IpcError> {
-    let (handoff, mut object, generation) = open_bootstrap(instance)?;
+    let (handoff, mut object) = open_bootstrap(instance)?;
     // A live holding anchor means the daemon may be restarting: the claim waits out the restart (A-114).
     let anchor = read_u32(&object, AT_ANCHOR_PID)?;
     let wait_ns = if anchor != 0
@@ -2169,7 +2209,6 @@ pub mod platform {
       instance: instance.to_owned(),
       object,
       index,
-      generation,
       bell: Some(bell),
       #[cfg(windows)]
       ready_event,
@@ -2253,10 +2292,15 @@ pub mod platform {
         ));
       }
       let (name, len) = read_answer(&self.object, at)?;
+      // Read before the slot is finished, refused after: an answer that names no daemon still frees its slot.
+      let answerer = read_answerer(&self.object, at);
       finish(&self.object, self.index, READY, &self.instance)?;
+      let (stamp, daemon_pid) = answerer?;
       let region = ClientRegion::open(&Handoff::Name(name), len)?;
-      // The daemon answered, so it was alive: watch its process from here.
-      let watch = crate::exit_watch::ExitWatch::on(read_u32(&self.object, AT_DAEMON_PID)?)?;
+      // The daemon that answered was alive: watch its process from here, and judge it by its own stamp (A-143). The
+      // header names whichever daemon published last; a claim begun before a restart is answered by the next daemon
+      // (A-114), and one answered just before a restart is read after it.
+      let watch = crate::exit_watch::ExitWatch::on(daemon_pid)?;
       let bell = self.bell.take().ok_or(IpcError::Layout {
         reason: "the claim's doorbell was already taken",
       })?;
@@ -2266,7 +2310,7 @@ pub mod platform {
         liveness: super::Liveness {
           inner: Liveness {
             instance: self.instance.clone(),
-            generation: self.generation,
+            generation: stamp,
             watch,
           },
         },

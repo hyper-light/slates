@@ -1026,7 +1026,7 @@ Measured on Node v24.22.1:
 
 It is latent on CI so far. Its comment records an unattributed 106 ms hold on the macOS runner (2026-10-01).
 
-### 8a-sdk-stamp. A client that reconnects during a restart may judge the new daemon gone (macOS, Windows; 2026-10-22, OPEN)
+### 8a-sdk-stamp. A client that reconnects during a restart may judge the new daemon gone (macOS, Windows; 2026-10-22, closed 2026-10-22 by A-143)
 
 **Seen once.** macOS, 2026-10-22, load 14.5 from other sessions, while verifying §8a-sdk-loop's fix. Phase (2) of the
 async SDK test ended `DaemonGone { after_ns: 2000000000 }` instead of `Stalled`. It has not come back:
@@ -1057,6 +1057,27 @@ widens it.
 3. Stop the new daemon and call.
 
 If the hypothesis holds, the call ends `DaemonGone`.
+
+**Closed 2026-10-22 by A-143: the hypothesis held**
+(`docs/bugs/2026-10-22-a-client-whose-claim-crossed-a-restart-judged-the-live-daemon-gone.md`).
+
+The evidence:
+- **The reproduction above, by use on macOS:** `DaemonGone` 3 of 3, with exactly one restart and one reconnect each
+  time. The same steps without the anchor stop gave `Stalled` 3 of 3.
+- **Temporary log lines:** a claim that began on stamp `…213142448000` was answered while `…215559132000` was
+  published. Afterwards the client found the live daemon's exit watch quiet, and the stamps different.
+
+The fix: the answering daemon writes its own start stamp and process id into its answer, and the client judges those.
+- The same steps then gave `Stalled` 3 of 3.
+- `a_claim_begun_before_a_restart_judges_the_daemon_that_answered_it_alive` (`crates/ipc/tests/rendezvous.rs`) is red
+  on macOS before the fix and green after. It is green on Linux, which needs no change.
+
+Fixed with it: the mirror race on the process, where an answering daemon that died before its answer was read left
+the client watching its successor.
+
+**Flagged for removal, Ada's call (CLAUDE.md rule 7).** The header's daemon pid (`AT_DAEMON_PID`) is now written by
+every daemon and read only by clients built before A-143. That makes it a compatibility write. `docs/publish.md`
+ships one version, so removing it breaks only a pairing that is not shipped.
 
 ### 8a-tsan-wait. The TSan lane declared itself 25× slow and one budget never listened (2026-10-20, closed)
 

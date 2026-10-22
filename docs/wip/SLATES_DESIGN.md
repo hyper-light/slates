@@ -3336,7 +3336,8 @@ root-relative path as an explicit alternative; it does not report that the reque
 > tasks 3–6). As built, the failure matrix's client side: a client tells a dead daemon from a
 > slow one through `Liveness` (Linux: the control socket's peer end, closed by the kernel with
 > the daemon; macOS and Windows: a start stamp in the bootstrap object's header, rewritten by
-> a restarted daemon and unreachable after a dead one), asked only after a reply has stalled
+> a restarted daemon and unreachable after a dead one, compared with the stamp and process id
+> the answering daemon wrote into its answer, A-143), asked only after a reply has stalled
 > past the deadline; the rendezvous carries the id a reconnecting client wants (a 4-byte hello
 > on Linux; the claim slot's id field elsewhere) and the daemon honours it when no live client
 > holds it; a client's shard is its id's residue over the partitions, so a reconnect lands on
@@ -10997,7 +10998,9 @@ Status: built 2026-10-06 (Linux, macOS; Windows by the shared module, cross-lint
   address; macOS and Windows check the object's magic and slot count, return claims the dead daemon took and never
   answered to `CLAIMED`, and stamp the header. A daemon with no anchor makes its own, as before.
 - With nothing published (the anchor up, no daemon yet), a client is told "not yet published" at once, as with no
-  daemon; with a daemon restarting, its claim waits and the next daemon answers it.
+  daemon; with a daemon restarting, its claim waits and the next daemon answers it. (A-143, 2026-10-22: the client
+  then judges the daemon that answered, by the stamp and process id written into the answer. Until then it kept the
+  stamp it saw when the claim began, the dead daemon's, and judged the live one gone.)
 - Measured: a CLI verb started at the kill now succeeds in 14.5–17 ms (it failed after 1,014 ms).
 
 ### A-115 — An export bound to one identity (2026-10-08)
@@ -11914,6 +11917,44 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
+
+### A-143 — A client judges the daemon that answered its claim (accepted 2026-10-22)
+Applied in the same change to:
+- §4.7 (the liveness status) and A-114;
+- `crates/ipc/src/rendezvous.rs`, the macOS and Windows module:
+  - the claim slot's answering-daemon stamp and pid (`AT_ANSWERED_STAMP`, `AT_ANSWERED_PID`);
+  - `write_answerer` and `read_answerer`;
+  - `Listener::stamp`;
+  - `Claim` keeps no stamp;
+  - `open_bootstrap`;
+- `crates/ipc/tests/rendezvous.rs` (one test, and a child role);
+- GAPS §8a-sdk-stamp;
+- `docs/bugs/2026-10-22-a-client-whose-claim-crossed-a-restart-judged-the-live-daemon-gone.md`.
+
+- **What it answers.** On macOS and Windows a client tells a dead daemon from a slow one by the bootstrap header's
+  start stamp and the daemon's process. It recorded the stamp when its claim *began*, and took the process from the
+  header when the claim *completed*. Since A-114 a claim that begins during a restart is answered by the next daemon.
+  That client therefore held the dead daemon's stamp and the live daemon's process. The first reply that stalled
+  afterwards read "gone", so a call to a live, silent daemon ended `DaemonGone` after the reconnect budget instead
+  of `Stalled`.
+
+  The process had the mirror race. An answering daemon that died before its answer was read left the client
+  watching its successor's process while holding the dead daemon's region, so every call would have stalled and
+  the client would never have reconnected.
+- **The rule.** The daemon names itself in its answer: its start stamp and its process id, written into the claim
+  slot's spare bytes while it holds the slot `ANSWERING`, and published with `READY`. The client builds its
+  liveness from those, never from the header. An answer whose stamp is zero names no daemon (a daemon of another
+  version, against `docs/publish.md`'s one version), and it is refused `Layout` after its slot is freed.
+
+  Linux needs no change: its liveness is the peer of the connection the daemon accepted.
+- **Evidence.**
+  - **By use, on macOS.** The SDK over a real anchor and daemon. Stop the anchor, kill the daemon, call; resume the
+    anchor; then stop the new daemon and call again. Before: `DaemonGone` 3 of 3. After: `Stalled` 3 of 3. Without
+    the anchor stop the result was `Stalled` 3 of 3 both times.
+  - **Root cause, logged.** A claim that began on stamp `…213142448000` was answered while `…215559132000` was
+    published.
+  - **The red test.** `a_claim_begun_before_a_restart_judges_the_daemon_that_answered_it_alive` fails on macOS
+    before the change and passes after. It passes on Linux, whose code this change does not touch.
 
 ### A-142 — One notify thread per FUSE mount, not one per invalidation round (accepted 2026-10-22)
 Applied in the same change to: §4.6 (the 2026-10-17 amendment's notify thread); `crates/bridge-fuse/src/channel.rs`
