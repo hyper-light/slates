@@ -169,6 +169,39 @@ fn spin(stop: &AtomicBool) {
   }
 }
 
+/// Shape: the attacks a pressure test makes before it may stop — enough that a race in what they attack had many
+/// chances to open.
+const ATTACKS: u64 = 1000;
+/// Shape: how often a pressure test reads its attack count.
+const ATTACK_POLL: Duration = Duration::from_millis(20);
+
+/// Holds a pressure test's attack on for at least `window`, and on past it until `attempts` exceeds [`ATTACKS`].
+/// Returns `false` only when the count stopped moving for a whole `window`: the attackers made no progress at all,
+/// which is a failure of the thing under test. A busy machine makes them slower, never stopped, so it stretches the
+/// test instead of failing it. A fixed window with a fixed floor failed on four cores at 861 attacks (2026-10-22,
+/// `docs/wip/GAPS.md`), the spinners each test starts per core taking the CPU the attackers needed. The fleet tests'
+/// waits are charged to progress the same way (`tests/fleet.rs`, `poll_until`).
+fn hold_until_enough_attacks(attempts: &AtomicU64, window: Duration) -> bool {
+  let started = Instant::now();
+  let mut seen = attempts.load(Ordering::Relaxed);
+  let mut moved_at = Instant::now();
+  loop {
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(ATTACK_POLL);
+    let now = attempts.load(Ordering::Relaxed);
+    if now != seen {
+      seen = now;
+      moved_at = Instant::now();
+    }
+    if started.elapsed() >= window && now > ATTACKS {
+      return true;
+    }
+    if moved_at.elapsed() >= window {
+      return false;
+    }
+  }
+}
+
 /// What one flipped-handle read showed: refused (`None`), or answered, with the bit position flipped.
 type FlippedRead = Option<usize>;
 
@@ -1123,7 +1156,8 @@ fn a_symlink_target_naming_a_host_path_is_stored_opaque_and_a_nul_or_overlong_ta
 #[test]
 fn a_cross_tenant_craft_never_reads_through_under_contention_and_churn() {
   const SECRET: &[u8] = b"volume B's private bytes, never disclosed to another tenant under churn";
-  /// How long the pressure runs — bounded so the test stays CI-safe.
+  /// The shortest the pressure runs, and the longest its attackers may make no progress before the test fails
+  /// ([`hold_until_enough_attacks`]).
   const PRESSURE: Duration = Duration::from_secs(2);
   let (daemon, instance) = single_shard_daemon("cross-tenant-race");
   provision(&instance, "va");
@@ -1163,7 +1197,7 @@ fn a_cross_tenant_craft_never_reads_through_under_contention_and_churn() {
   let stop = AtomicBool::new(false);
   let attempts = AtomicU64::new(0);
   let leaks = AtomicU64::new(0);
-  std::thread::scope(|scope| {
+  let progressed = std::thread::scope(|scope| {
     for _ in 0..cores {
       scope.spawn(|| spin(&stop));
     }
@@ -1242,14 +1276,14 @@ fn a_cross_tenant_craft_never_reads_through_under_contention_and_churn() {
         }
       });
     }
-    #[allow(clippy::disallowed_methods)]
-    std::thread::sleep(PRESSURE);
+    let progressed = hold_until_enough_attacks(&attempts, PRESSURE);
     stop.store(true, Ordering::Relaxed);
+    progressed
   });
   let total = attempts.load(Ordering::Relaxed);
   assert!(
-    total > 1000,
-    "non-vacuity: the attackers hammered the crafts many times ({total})"
+    progressed && total > ATTACKS,
+    "non-vacuity: the attackers hammered the crafts many times and never stopped making progress ({total})"
   );
   assert_eq!(
     leaks.load(Ordering::Relaxed),
@@ -1272,7 +1306,8 @@ fn a_cross_tenant_craft_never_reads_through_under_contention_and_churn() {
 fn a_stale_handle_never_reads_a_reused_inode_under_churn() {
   const SECRET: &[u8] =
     b"the victim inode's secret, never served through a stale handle after inode reuse";
-  /// How long the pressure runs — bounded so the test stays CI-safe.
+  /// The shortest the pressure runs, and the longest its attackers may make no progress before the test fails
+  /// ([`hold_until_enough_attacks`]).
   const PRESSURE: Duration = Duration::from_secs(2);
   let (daemon, instance) = single_shard_daemon("stale-handle-race");
   provision(&instance, "sh");
@@ -1297,7 +1332,7 @@ fn a_stale_handle_never_reads_a_reused_inode_under_churn() {
   let attempts = AtomicU64::new(0);
   let resolved = AtomicU64::new(0); // the stale handle returned status-0 (resolved to a reused inode) — a bug
   let secret_leaks = AtomicU64::new(0); // ... and the bytes were the victim's secret
-  std::thread::scope(|scope| {
+  let progressed = std::thread::scope(|scope| {
     for _ in 0..cores {
       scope.spawn(|| spin(&stop));
     }
@@ -1362,14 +1397,14 @@ fn a_stale_handle_never_reads_a_reused_inode_under_churn() {
         }
       });
     }
-    #[allow(clippy::disallowed_methods)]
-    std::thread::sleep(PRESSURE);
+    let progressed = hold_until_enough_attacks(&attempts, PRESSURE);
     stop.store(true, Ordering::Relaxed);
+    progressed
   });
   let total = attempts.load(Ordering::Relaxed);
   assert!(
-    total > 1000,
-    "non-vacuity: the attackers hammered the stale handle many times ({total})"
+    progressed && total > ATTACKS,
+    "non-vacuity: the attackers hammered the stale handle many times and never stopped making progress ({total})"
   );
   assert_eq!(
     secret_leaks.load(Ordering::Relaxed),

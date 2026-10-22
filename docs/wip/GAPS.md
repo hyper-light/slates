@@ -10801,3 +10801,45 @@ without a user namespace, which needs root.
 
   AC-3.3's residual applies to a guest as to any map: a store into bytes another path is changing, made between the
   page's fetch and the change's delivery, is kept back.
+
+### 2026-10-22: a CI daemon's boot was refused because one shard used no CPU for a whole second while it started — open, not reproduced
+
+CI run 39850734135 (commit `1e6d7253`, the Linux test lane) failed
+`the_mount_protocol_refuses_dump_and_export_so_no_tenant_enumerates_the_rest` (`crates/server/tests/nfs_hostile.rs`).
+Its daemon logged `client identity recovery refused on shard 5` and `the boot is refused; the heartbeat stops so the
+anchor restarts this daemon`, and the test found no daemon listening. The test runs no anchor, so the refusal was the
+end. Its two partitions logged their starts at 4.6 ms and 2,469,183 µs; shard 5 is a process-wide runtime slot,
+because sixteen daemons share the test process, and was the second partition.
+
+- **The rule that refused it** (2026-10-05, `retained_client_ids` in `crates/server/src/daemon.rs`). The control loop
+  asks each shard for its retained client ids, a liveness window (1 s) at a time. After a window with no answer the
+  wait goes on only if the shard's thread used CPU in that window. No "still starting" line was printed, so the second
+  partition's thread used no CPU in the first whole second of a start that took 2.47 s.
+- **What that implies, and what it does not.** A runnable thread on a four-vCPU runner is not starved of all CPU for a
+  second, so the thread was most likely blocked. What blocked it is not shown.
+- **Not A-145.** The test runs no anchor, and A-145 changed only the anchor's supervisor and the CLI.
+- **Not reproduced, 2026-10-22, on the box:** 0 boot refusals in 59 runs of `nfs_hostile`.
+  - 19 runs were pinned to four cores.
+  - 40 more ran with the refusal instrumented to print the shard thread's state, wait channel and schedstat, 20 on
+    four cores and 20 on two. The instrumentation was never reached.
+  - The binary's peak resident memory, 319 MiB, makes memory pressure on a 16 GB runner unlikely.
+- **What a fix has to decide.** A shard blocked in the kernel (state `D`) or runnable but starved (state `R`) is still
+  working; one asleep (state `S`) using no CPU may be stuck. The current check cannot tell these apart. A refusal costs
+  the start: in production the anchor restarts the daemon, with crash-loop backoff if it repeats (A-119).
+
+### 2026-10-22: two pressure tests failed on a busy machine, not on the property — fixed
+
+`a_stale_handle_never_reads_a_reused_inode_under_churn` and
+`a_cross_tenant_craft_never_reads_through_under_contention_and_churn` (`crates/server/tests/nfs_hostile.rs`) each ran
+their attack for a fixed 2 s, then required more than 1,000 attempts. Each also starts a spinner per core, so where few
+cores are free the attackers make fewer attempts. Found by the boot-refusal reproduction above:
+- the stale-handle test, at 861 attempts, in 1 of 19 runs on four pinned cores, and in 8 of the next 40 runs (2 of 20 on
+  four cores, 6 of 20 on two);
+- the cross-tenant test, at 900 attempts, in 1 of 3 runs of the two tests alone on two cores.
+
+The property under test never failed. `hold_until_enough_attacks` now keeps the attack on until the attempts pass
+1,000, and fails only when their count stops moving for a whole window, the progress rule the fleet tests' waits use.
+
+On the same two cores the fixed tests passed 6 of 6, against 1 of 3 failing before. The stale-handle attack ran past the
+window to reach the floor where it had to: 1,010–1,373 attempts in five runs and 2,708 in one. Each run took
+2.4–3.1 s, against 2.4–2.6 s before. Both properties held in every run: no leak, and no stale read resolved.
