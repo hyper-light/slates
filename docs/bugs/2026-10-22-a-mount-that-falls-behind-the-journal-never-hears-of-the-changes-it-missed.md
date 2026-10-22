@@ -103,6 +103,20 @@ target directory of its own.
   - **the overrun not reported:** the test's overrun count stays 0;
   - **the expansion without nodes:** the replaced file's page is still served after 10 s;
   - **the expansion without names:** the removed name is still visible after 10 s.
+- **A generated history over the real mount** (`coherence_mount.rs`,
+  `a_generated_history_with_overruns_leaves_the_mount_equal_to_the_volume`, added after the fix landed). Three fixed
+  seeds of 60 steps over four names:
+  - another attachment's replacements, removals and renames, queued;
+  - overruns, queued behind them;
+  - the mount's own reads, listings, writes, removals and renames.
+
+  After every round, the mount's listing and every name opened by name must equal the volume. It is green 3 runs of 3.
+  Each of the three mutations above fails it at seed `0x9e37…`, step 40. Without names in the expansion, the listing
+  is right, but a removed name opened directly still returns its old bytes.
+
+  Its first version let the loop run after every step and compared only a fresh listing. It passed under two of the
+  three mutations: an overrun then evicted only its own writes, and a stale name was never opened. That is why the
+  checks are what they are.
 - **The CLI test** (`a_change_reaches_the_mount_even_when_more_follow_than_the_journal_keeps`): green 40 runs of 40
   (30 before its refactor into a fixture, 10 after), against 2 failures in 33 before the fix.
 - **`KernelHolds` against a model** (2,000 generated histories of handed-out entries, forgets, own unlinks, renames and

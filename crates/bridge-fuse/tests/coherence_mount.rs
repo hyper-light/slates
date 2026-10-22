@@ -16,14 +16,17 @@
   clippy::unwrap_used,
   clippy::expect_used,
   clippy::panic,
-  clippy::unwrap_in_result
+  clippy::unwrap_in_result,
+  clippy::panic_in_result_fn
 )]
 
 use std::process::Command;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
-use slates_bridge_core::{Attachments, Bridge, ObjectId, Rights, SetAttr, View};
+use slates_bridge_core::{
+  Attachments, Bridge, ObjectId, OpContext, RenameFlags, Rights, SetAttr, View,
+};
 use slates_bridge_fuse::abi::Opcode;
 use slates_bridge_fuse::channel::{
   ChangeNotifier, ChangeSignal, ServeState, Step, serve_step, wait,
@@ -31,6 +34,8 @@ use slates_bridge_fuse::channel::{
 use slates_bridge_fuse::mount::{Mount, MountError, mount};
 use slates_bridge_fuse::volume_bridge::VolumeBridge;
 use slates_db::catalog::{Principal, VolumeId};
+use slates_vfs::error::VfsError;
+use slates_vfs::inode::Kind;
 
 mod common;
 use common::{FailingGather, JOURNAL_BYTES, store, volume_for_owner};
@@ -55,12 +60,16 @@ enum Ask {
   Truncate { name: String, size: u64 },
   /// Create `name` in the volume's root through the other attachment.
   Create { name: String },
-  /// Replace `name`'s bytes with `bytes` through the other attachment.
+  /// Replace `name`'s bytes with `bytes` through the other attachment, creating it if it is missing.
   Replace { name: String, bytes: Vec<u8> },
-  /// Remove `name` from the volume's root through the other attachment.
+  /// Remove `name` from the volume's root through the other attachment, if it is there.
   Remove { name: String },
-  /// Create `name` and write it `times` times through the other attachment, one journal record each.
+  /// Rename `from` to `to` in the volume's root through the other attachment, if `from` is there.
+  Rename { from: String, to: String },
+  /// Write `name` `times` times through the other attachment, one journal record each, creating it if it is missing.
   Churn { name: String, times: usize },
+  /// Send the volume's root files and their bytes, by name: the oracle a generated history is held to.
+  Snapshot,
   /// Refuse the next invalidation gather (the injected collection failure).
   RefuseNextGather,
   /// Report the loop's counters — answered after the step the ask woke, so a report is a barrier:
@@ -147,7 +156,7 @@ fn serve(
   mut mounted: Mount,
   signal: ChangeSignal,
   asks: Receiver<Ask>,
-  reports: Sender<Report>,
+  (reports, snapshots): (Sender<Report>, Sender<Files>),
 ) -> Result<(), slates_bridge_fuse::channel::ChannelError> {
   let mut store = store();
   let uid = rustix::process::getuid().as_raw();
@@ -220,8 +229,7 @@ fn serve(
         Ask::Replace { name, bytes } => {
           let cx = attachments.begin(other).unwrap();
           let root = bridge.root(&cx).unwrap();
-          let file = bridge.lookup(ObjectId::new(root, 0), &cx, &name).unwrap();
-          let object = ObjectId::new(file.ino, file.generation);
+          let object = file_named(&mut bridge, &cx, root, &name);
           bridge
             .setattr(
               object,
@@ -238,17 +246,36 @@ fn serve(
         Ask::Remove { name } => {
           let cx = attachments.begin(other).unwrap();
           let root = bridge.root(&cx).unwrap();
-          bridge.unlink(ObjectId::new(root, 0), &cx, &name).unwrap();
+          // A generated history may remove a name that is not there: the volume's refusal is the outcome.
+          let removed = bridge.unlink(ObjectId::new(root, 0), &cx, &name);
+          assert!(
+            matches!(removed, Ok(()) | Err(VfsError::NotFound)),
+            "{removed:?}"
+          );
+          attachments.end(other);
+        }
+        Ask::Rename { from, to } => {
+          let cx = attachments.begin(other).unwrap();
+          let root = ObjectId::new(bridge.root(&cx).unwrap(), 0);
+          let renamed = bridge.rename(root, root, &cx, &from, &to, RenameFlags::default());
+          assert!(
+            matches!(renamed, Ok(()) | Err(VfsError::NotFound)),
+            "{renamed:?}"
+          );
+          attachments.end(other);
+        }
+        Ask::Snapshot => {
+          let cx = attachments.begin(other).unwrap();
+          let root = bridge.root(&cx).unwrap();
+          snapshots
+            .send(volume_files(&mut bridge, &cx, root))
+            .unwrap();
           attachments.end(other);
         }
         Ask::Churn { name, times } => {
           let cx = attachments.begin(other).unwrap();
           let root = bridge.root(&cx).unwrap();
-          let (made, fh) = bridge
-            .create(ObjectId::new(root, 0), &cx, &name, 0o100644, 1)
-            .unwrap();
-          let object = ObjectId::new(made.ino, made.generation);
-          bridge.release(object, &cx, fh).unwrap();
+          let object = file_named(&mut bridge, &cx, root, &name);
           for round in 0..times {
             bridge.write(object, &cx, 0, &round.to_le_bytes()).unwrap();
           }
@@ -298,11 +325,81 @@ fn serve(
   }
 }
 
+/// A directory's regular files and their whole bytes, sorted by name.
+type Files = Vec<(String, Vec<u8>)>;
+
+/// Shape: the entries a snapshot asks for per directory page.
+const SNAPSHOT_PAGE: usize = 64;
+
+/// The file `name` in the root `root`, made empty if it is missing.
+fn file_named(bridge: &mut dyn Bridge, cx: &OpContext, root: u64, name: &str) -> ObjectId {
+  match bridge.lookup(ObjectId::new(root, 0), cx, name) {
+    Ok(found) => ObjectId::new(found.ino, found.generation),
+    Err(VfsError::NotFound) => {
+      let (made, fh) = bridge
+        .create(ObjectId::new(root, 0), cx, name, 0o100644, 1)
+        .unwrap();
+      let object = ObjectId::new(made.ino, made.generation);
+      bridge.release(object, cx, fh).unwrap();
+      object
+    }
+    Err(other) => panic!("lookup {name}: {other:?}"),
+  }
+}
+
+/// The volume root's regular files and their bytes, read through the seam: the oracle.
+fn volume_files(bridge: &mut dyn Bridge, cx: &OpContext, root: u64) -> Files {
+  let dir = ObjectId::new(root, 0);
+  let fh = bridge.opendir(dir, cx).unwrap();
+  let mut files = Files::new();
+  let mut cookie = 0;
+  loop {
+    let page = bridge.readdir(dir, cx, fh, cookie, SNAPSHOT_PAGE).unwrap();
+    let Some(last) = page.last() else {
+      break;
+    };
+    cookie = last.cookie;
+    for entry in page {
+      if entry.kind != Kind::File {
+        continue;
+      }
+      let object = ObjectId::new(entry.ino, 0);
+      let size = u32::try_from(bridge.getattr(object, cx).unwrap().size).unwrap();
+      let mut bytes = Vec::new();
+      bridge.read(object, cx, 0, size, &mut bytes).unwrap();
+      files.push((entry.name, bytes));
+    }
+  }
+  bridge.release(dir, cx, fh).unwrap();
+  files.sort();
+  files
+}
+
+/// The mount root's regular files and their bytes, read through the kernel. A name gone between the listing and its
+/// read is left out; the caller asks again.
+#[allow(clippy::disallowed_methods)] // the test's own reads through the slates mount: RAM, not disk
+fn mount_files(mount_point: &str) -> Files {
+  let mut files: Files = std::fs::read_dir(mount_point)
+    .unwrap()
+    .filter_map(|entry| {
+      let entry = entry.ok()?;
+      let name = entry.file_name().into_string().ok()?;
+      let bytes = (entry.file_type().ok()?.is_file())
+        .then(|| std::fs::read(entry.path()).ok())
+        .flatten()?;
+      Some((name, bytes))
+    })
+    .collect();
+  files.sort();
+  files
+}
+
 /// The test's side of the loop: asks, and waits for the answer.
 struct Loop {
   asks: Sender<Ask>,
   notifier: ChangeNotifier,
   reports: Receiver<Report>,
+  snapshots: Receiver<Files>,
 }
 
 impl Loop {
@@ -315,6 +412,24 @@ impl Loop {
   /// Sends `ask` without waking the loop: applied at its next wake, whatever wakes it.
   fn ask_quietly(&self, ask: Ask) {
     self.asks.send(ask).unwrap();
+  }
+
+  /// The volume's root files as the loop's seam reads them now: the oracle.
+  fn snapshot(&self) -> Files {
+    self.ask(Ask::Snapshot);
+    let deadline = Instant::now() + MOUNT_WAIT;
+    loop {
+      if let Ok(files) = self.snapshots.try_recv() {
+        return files;
+      }
+      assert!(
+        Instant::now() < deadline,
+        "the loop did not snapshot in time"
+      );
+      // The test harness paces its polls; shipped code parks on its driver (D-9).
+      #[allow(clippy::disallowed_methods)]
+      std::thread::sleep(Duration::from_millis(POLL_MS));
+    }
   }
 
   fn report(&self) -> Report {
@@ -355,11 +470,13 @@ fn with_mounted_loop(tag: &str, phases: impl FnOnce(&Loop, &str)) {
     let notifier = signal.notifier().unwrap();
     let (asks, ask_end) = channel();
     let (report_end, reports) = channel();
-    let server = scope.spawn(move || serve(mounted, signal, ask_end, report_end));
+    let (snapshot_end, snapshots) = channel();
+    let server = scope.spawn(move || serve(mounted, signal, ask_end, (report_end, snapshot_end)));
     let control = Loop {
       asks,
       notifier,
       reports,
+      snapshots,
     };
     let mount_point = scratch.mount_point.clone();
     phases(&control, &mount_point);
@@ -559,4 +676,172 @@ fn a_refused_gather_is_retried(control: &Loop, mount_point: &str, told: Report) 
     told.getattrs + 1,
     "the retried delivery forced exactly one more GETATTR"
   );
+}
+
+/// Shape: the steps of each generated history.
+const CHAOS_STEPS: usize = 60;
+/// Shape: the histories' seeds — fixed, so a failure is a reproducible sequence; three, so one lucky sequence cannot
+/// pass alone.
+const CHAOS_SEEDS: [u64; 3] = [
+  0x9e37_79b9_7f4a_7c15,
+  0x2545_f491_4f6c_dd1d,
+  0x6a09_e667_f3bc_c908,
+];
+/// Shape: the names a history plays over — few, so its steps collide on them.
+const CHAOS_NAMES: [&str; 4] = ["n0", "n1", "n2", "n3"];
+/// Shape: the longest file a history writes, in bytes.
+const CHAOS_BYTES: u64 = 64;
+
+/// The next value of a fixed-seed xorshift64 generator (Marsaglia, "Xorshift RNGs", 2003), as the CLI's chaos tests use.
+fn xorshift(state: &mut u64) -> u64 {
+  *state ^= *state << 13;
+  *state ^= *state >> 7;
+  *state ^= *state << 17;
+  *state
+}
+
+/// One of [`CHAOS_NAMES`], chosen by `roll`'s bits from `shift`.
+fn chaos_name(roll: u64, shift: u32) -> &'static str {
+  let len = u64::try_from(CHAOS_NAMES.len()).unwrap();
+  let at = usize::try_from((roll >> shift) % len).unwrap();
+  CHAOS_NAMES.get(at).copied().unwrap()
+}
+
+/// What a mount or the volume shows of a history's files: the listing, and each of [`CHAOS_NAMES`] and the churned
+/// file opened by name (`None` when absent). Opening by name matters: a name the kernel still holds stale is found that
+/// way even when a fresh listing leaves it out.
+type Shown = (Vec<String>, Vec<(String, Option<Vec<u8>>)>);
+
+/// Every name a history opens by name.
+fn chaos_names() -> impl Iterator<Item = &'static str> {
+  CHAOS_NAMES.into_iter().chain(std::iter::once(CHURNED))
+}
+
+/// Shape: the file each overrun writes past what the journal keeps.
+const CHURNED: &str = "churn";
+
+/// The volume's view, from its files read through the seam.
+fn volume_view(files: &Files) -> Shown {
+  let listing = files.iter().map(|(name, _)| name.clone()).collect();
+  let by_name = chaos_names()
+    .map(|name| {
+      let bytes = files
+        .iter()
+        .find(|(listed, _)| listed == name)
+        .map(|(_, bytes)| bytes.clone());
+      (name.to_owned(), bytes)
+    })
+    .collect();
+  (listing, by_name)
+}
+
+/// The mount's view, read through the kernel.
+#[allow(clippy::disallowed_methods)] // the test's own reads through the slates mount: RAM, not disk
+fn mount_view(mount_point: &str) -> Shown {
+  let listing = mount_files(mount_point)
+    .into_iter()
+    .map(|(name, _)| name)
+    .collect();
+  let by_name = chaos_names()
+    .map(|name| {
+      (
+        name.to_owned(),
+        std::fs::read(format!("{mount_point}/{name}")).ok(),
+      )
+    })
+    .collect();
+  (listing, by_name)
+}
+
+/// A-141 chaos over a real mount: what the kernel holds must follow the volume through any mix of other paths'
+/// changes, the mount's own changes, directory pages and overruns. Do, from each of [`CHAOS_SEEDS`], [`CHAOS_STEPS`]
+/// generated steps over a few names:
+/// - another attachment replaces, removes or renames a name, queued without letting the loop run;
+/// - an overrun: writes to another file past what the journal keeps, queued behind whatever is queued, so the loop's
+///   next round finds the queued changes' records gone;
+/// - the mount reads, lists, writes, removes or renames a name.
+///
+/// After each overrun and each step of the mount, let the loop run its round, then read the volume through the seam.
+/// Expect the mount's listing, and every name opened by name, to equal the volume's within [`DELIVERY_WAIT`]; and each
+/// history to overrun at least once.
+#[test]
+#[allow(clippy::disallowed_methods)] // the test's own calls through the slates mount: RAM, not disk
+fn a_generated_history_with_overruns_leaves_the_mount_equal_to_the_volume() {
+  with_mounted_loop("chaos", |control, mount_point| {
+    let path = |name: &str| format!("{mount_point}/{name}");
+    for seed in CHAOS_SEEDS {
+      let mut state = seed;
+      let overruns_before = control.report().overruns;
+      for step in 0..CHAOS_STEPS {
+        let roll = xorshift(&mut state);
+        let (name, other) = (chaos_name(roll, 8), chaos_name(roll, 16));
+        let byte = u8::try_from((roll >> 24) % 256).unwrap();
+        let bytes = vec![byte; usize::try_from(1 + (roll >> 32) % CHAOS_BYTES).unwrap()];
+        // A step may name a file that is not there; the refusal is part of the history, not a failure of it.
+        let (what, queued) = match roll % 10 {
+          0 | 1 => {
+            control.ask_quietly(Ask::Replace {
+              name: name.to_owned(),
+              bytes,
+            });
+            ("another path replaces", true)
+          }
+          2 => {
+            control.ask_quietly(Ask::Remove {
+              name: name.to_owned(),
+            });
+            ("another path removes", true)
+          }
+          3 => {
+            control.ask_quietly(Ask::Rename {
+              from: name.to_owned(),
+              to: other.to_owned(),
+            });
+            ("another path renames", true)
+          }
+          4 => {
+            control.ask_quietly(Ask::Churn {
+              name: CHURNED.to_owned(),
+              times: CHURN_WRITES,
+            });
+            ("an overrun behind what was queued", false)
+          }
+          5 => {
+            let _ = std::fs::read(path(name));
+            ("the mount reads", false)
+          }
+          6 => {
+            let _ = std::fs::read_dir(mount_point).map(Iterator::count);
+            ("the mount lists", false)
+          }
+          7 => {
+            let _ = std::fs::write(path(name), &bytes);
+            ("the mount writes", false)
+          }
+          8 => {
+            let _ = std::fs::remove_file(path(name));
+            ("the mount removes", false)
+          }
+          _ => {
+            let _ = std::fs::rename(path(name), path(other));
+            ("the mount renames", false)
+          }
+        };
+        if queued {
+          continue;
+        }
+        control.report();
+        let volume = volume_view(&control.snapshot());
+        assert!(
+          eventually(|| mount_view(mount_point) == volume),
+          "seed {seed:#x}, step {step} ({what} {name} / {other}): the mount shows {:?}, the volume holds {volume:?}",
+          mount_view(mount_point)
+        );
+      }
+      assert!(
+        control.report().overruns > overruns_before,
+        "seed {seed:#x}: the history overran the journal at least once"
+      );
+    }
+  });
 }
