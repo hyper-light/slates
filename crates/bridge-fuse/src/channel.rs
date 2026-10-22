@@ -604,6 +604,10 @@ pub struct ServeState {
   /// The journal's head when this mount served its first request: the point a file with no record here is judged
   /// from — one a restored mount's kernel opened before this daemon served it (A-61).
   started_at: Option<u64>,
+  /// Whether this mount was taken over from a daemon that died (A-61), so its kernel holds handles opened before this
+  /// daemon served it, which it never saw opened. A request naming one adopts its file into the byte states
+  /// ([`adopt_unseen_handle`]; A-147).
+  adopts_unseen_handles: bool,
   /// Bytes of cache write-backs kept back because another path changed them after the kernel's copy was fetched, since
   /// this was last read: the rule's non-vacuity count. Read and cleared by the owner that reports it.
   writeback_bytes_kept_back: u64,
@@ -645,6 +649,7 @@ impl ServeState {
       writable: WritableOpens::default(),
       states: PageStates::default(),
       started_at: None,
+      adopts_unseen_handles: false,
       writeback_bytes_kept_back: 0,
       writebacks_unknown: 0,
       holds: KernelHolds::default(),
@@ -684,12 +689,14 @@ impl ServeState {
   }
 
   /// The state of a device taken over from a previous daemon: what its connection negotiated, the reply that
-  /// daemon published and never delivered (if any), and nothing in the kernel's cache that this daemon knows of.
+  /// daemon published and never delivered (if any), and nothing in the kernel's cache that this daemon knows of. The
+  /// files its kernel holds open from before are adopted as requests name them (A-147).
   pub fn restored(session: Session, replay: Option<(u64, Vec<u8>)>) -> ServeState {
     ServeState {
       expire_only: session.expire_only,
       session: Some(session),
       replay,
+      adopts_unseen_handles: true,
       ..ServeState::new()
     }
   }
@@ -995,6 +1002,12 @@ fn dispatch_request(
 ) -> (usize, Vec<std::ops::Range<u64>>) {
   let before = bridge.seen(cx).journal_seq;
   let started_at = *state.started_at.get_or_insert(before);
+  // Before the write is judged or applied: a handle from before a takeover brings its file into the states (A-147).
+  if state.adopts_unseen_handles
+    && let Some((fh, ino)) = written_handle(request)
+  {
+    adopt_unseen_handle(fh, ino, started_at, bridge, cx, state);
+  }
   let served = match crate::bridge::cache_writeback(request) {
     Some(nodeid) => serve_writeback(request, nodeid, started_at, bridge, cx, state),
     None => (dispatch(request, bridge, cx, &mut state.reply), Vec::new()),
@@ -1012,8 +1025,9 @@ fn dispatch_request(
 ///   changes nothing ([`PageStates::fetched`]) — unless it was made through a handle that may bypass the page cache
 ///   (`O_DIRECT`), which fills nothing the mount can count on: its stale bytes become unknown
 ///   ([`PageStates::read_ambiguously`], A-144);
-/// - a `RELEASE` forgets its handle, and with the file's last writable handle its byte states (no write-back of it can
-///   follow, since a write-back holds its file open until it is answered).
+/// - a `RELEASE` forgets its handle (by value and file, since a restored mount's kernel can hold one value for two
+///   files, A-147), and with the file's last writable handle its byte states (no write-back of it can follow, since a
+///   write-back holds its file open until it is answered).
 fn note_opens_and_fetches(
   request: &[u8],
   len: usize,
@@ -1048,24 +1062,10 @@ fn note_opens_and_fetches(
         .reply
         .get(..len)
         .is_some_and(|reply| reply_error(reply) == 0);
-      let read = crate::request::ReadIn::parse(Opcode::Read.to_wire(), parsed.body);
-      if let (true, Ok(read)) = (answered && state.writable.holds(ino), read) {
-        let end = read.offset.saturating_add(u64::from(read.size));
-        let bound = bridge.journal_capacity(cx);
-        if may_bypass_the_cache(read.flags) {
-          let started_at = state.started_at.unwrap_or(before);
-          match pending_changes(ino, started_at, bridge, cx, state) {
-            Some(pending) => {
-              state
-                .states
-                .read_ambiguously(ino, read.offset..end, before, &pending, bound);
-            }
-            // As a round that finds the journal no longer reaching back loses every tracked file.
-            None => state.states.lose_all(),
-          }
-        } else {
-          state.states.fetched(ino, read.offset..end, before, bound);
-        }
+      if answered
+        && let Ok(read) = crate::request::ReadIn::parse(Opcode::Read.to_wire(), parsed.body)
+      {
+        note_read(&read, ino, before, bridge, cx, state);
       }
     }
     Some(Opcode::Release) => {
@@ -1074,12 +1074,90 @@ fn note_opens_and_fetches(
         .get(..size_of::<u64>())
         .and_then(|bytes| bytes.try_into().ok())
         .map(u64::from_le_bytes);
-      if let Some(file) = handle.and_then(|fh| state.writable.released(fh)) {
+      if let Some(file) = handle.and_then(|fh| state.writable.released(fh, ino)) {
         state.states.dropped(file);
       }
     }
     _ => {}
   }
+}
+
+/// An answered `READ` of `ino` through `read`'s handle, made at head `before` ([`note_opens_and_fetches`]). On a restored
+/// mount a handle from before the takeover first brings its file into the states ([`adopt_unseen_handle`]). For a file
+/// open for writing, the bytes returned become fresh as of `before`, since a read changes nothing
+/// ([`PageStates::fetched`]), unless the handle may bypass the page cache (`O_DIRECT`), whose stale bytes become unknown
+/// instead ([`PageStates::read_ambiguously`], A-144).
+fn note_read(
+  read: &crate::request::ReadIn,
+  ino: u64,
+  before: u64,
+  bridge: &mut dyn Bridge,
+  cx: &slates_bridge_core::OpContext,
+  state: &mut ServeState,
+) {
+  let started_at = state.started_at.unwrap_or(before);
+  adopt_unseen_handle(read.fh, ino, started_at, bridge, cx, state);
+  if !state.writable.holds(ino) {
+    return;
+  }
+  let end = read.offset.saturating_add(u64::from(read.size));
+  let bound = bridge.journal_capacity(cx);
+  if !may_bypass_the_cache(read.flags) {
+    state.states.fetched(ino, read.offset..end, before, bound);
+    return;
+  }
+  match pending_changes(ino, started_at, bridge, cx, state) {
+    Some(pending) => {
+      state
+        .states
+        .read_ambiguously(ino, read.offset..end, before, &pending, bound);
+    }
+    // As a round that finds the journal no longer reaching back loses every tracked file.
+    None => state.states.lose_all(),
+  }
+}
+
+/// The handle and file a `WRITE` names, when `request` is one: what [`adopt_unseen_handle`] takes before it is served.
+fn written_handle(request: &[u8]) -> Option<(u64, u64)> {
+  let parsed = Request::parse(request).ok()?;
+  if parsed.opcode != Some(Opcode::Write) {
+    return None;
+  }
+  let write = crate::request::WriteIn::parse(Opcode::Write.to_wire(), parsed.body).ok()?;
+  Some((write.fh, parsed.header.nodeid))
+}
+
+/// On a mount taken over from a daemon that died (A-61), a request naming handle `fh` of `ino` that this mount never saw
+/// opened adopts it (A-147). The kernel opened the handle before this daemon served it, maybe for writing, and a store
+/// through a map of it reaches this mount as a cache write-back. Its file is tracked from here on
+/// ([`PageStates::adopted`]): fresh as of the mount's start `started_at`, with the journal's changes to it since then.
+/// So a re-fetch is recorded, and a write-back is judged as on a mount that saw the open.
+///
+/// Before A-147 such a file stayed untracked, and each write-back of it was judged against every change since the
+/// mount's start. A store made after a re-fetch of bytes another path had changed was kept back, and lost
+/// (`docs/bugs/2026-10-22-a-mount-taken-over-by-a-restarted-daemon-dropped-a-store-made-after-a-refetch.md`). A handle
+/// opened for reading only is adopted too: its file's states cost a little until its release, and no write-back comes
+/// through it.
+fn adopt_unseen_handle(
+  fh: u64,
+  ino: u64,
+  started_at: u64,
+  bridge: &mut dyn Bridge,
+  cx: &slates_bridge_core::OpContext,
+  state: &mut ServeState,
+) {
+  if !state.adopts_unseen_handles || state.writable.knows(fh, ino) {
+    return;
+  }
+  state.writable.opened(fh, ino);
+  if state.states.tracks(ino) {
+    return;
+  }
+  let changes = pending_changes(ino, started_at, bridge, cx, state);
+  let bound = bridge.journal_capacity(cx);
+  state
+    .states
+    .adopted(ino, started_at, changes.as_deref(), bound);
 }
 
 /// Feeds what `request` made the kernel hold now that its reply of `len` bytes reached it — or at once, for a request
@@ -1096,12 +1174,14 @@ fn note_delivered(request: &[u8], len: usize, state: &mut ServeState) {
   });
 }
 
-/// Forgets the writable handle a lost `OPEN` or `CREATE` reply granted, when the server gives it back itself
-/// ([`crate::bridge::reclaim_unreported`]), and with the file's last such handle its byte states.
-fn forget_unreported_open(state: &mut ServeState, opcode: Option<Opcode>, len: usize) {
+/// Forgets the writable handle a lost `OPEN` or `CREATE` reply granted on node `nodeid`, when the server gives it back
+/// itself ([`crate::bridge::reclaim_unreported`]), and with the file's last such handle its byte states. The file is
+/// found as the open noted it: a `CREATE`'s new node, else the request's.
+fn forget_unreported_open(state: &mut ServeState, opcode: Option<Opcode>, nodeid: u64, len: usize) {
   let reply = state.reply.get(..len).unwrap_or(&[]);
+  let file = crate::bridge::created_node(opcode, reply).unwrap_or(nodeid);
   if let Some(file) =
-    crate::bridge::granted_handle(opcode, reply).and_then(|fh| state.writable.released(fh))
+    crate::bridge::granted_handle(opcode, reply).and_then(|fh| state.writable.released(fh, file))
   {
     state.states.dropped(file);
   }
@@ -1284,7 +1364,12 @@ fn serve_request(
       bridge,
       cx,
     );
-    forget_unreported_open(state, opcode, n);
+    forget_unreported_open(
+      state,
+      opcode,
+      parsed.as_ref().map_or(0, |parsed| parsed.header.nodeid),
+      n,
+    );
   } else {
     note_delivered(request, n, state);
   }
@@ -1628,7 +1713,7 @@ pub fn reclaim_dispatched(
     &cx,
   );
   attachments.end(attachment);
-  forget_unreported_open(state, dispatched.opcode, dispatched.len);
+  forget_unreported_open(state, dispatched.opcode, dispatched.nodeid, dispatched.len);
   reclaimed
 }
 

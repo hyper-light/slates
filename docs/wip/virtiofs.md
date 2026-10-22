@@ -324,6 +324,12 @@ box shared with two other builds — timings are not benchmarks)
    TimedOut { seen: 15 }", a guest byte having reverted it. It needs crosvm, a DAX-capable guest kernel and the probe
    named in the environment, and skips loudly without them, so CI's lanes skip it.
 
+   Two lifecycle tests run beside it. A daemon killed under the guest's live map is taken over and the history goes on
+   (`a_daemon_killed_under_a_guests_live_map_is_taken_over_and_the_guest_goes_on`); its first run found A-147, a store
+   made after a re-fetch lost by the restored mount, red 3 of 3 before the fix. A guest killed with unsynced stores
+   leaves them in the host's cache, where they are written back, and a second guest maps the same bytes
+   (`a_guest_killed_with_unsynced_stores_leaves_them_to_land_and_a_new_guest_reads_them`).
+
    Still owed: Shards' DAX window over the macOS mount, and Firecracker's disk-image form. crosvm has prior art for the
    latter: its experimental `--pmem-ext2` builds an ext2 file system in memory from a host directory and presents it to
    the guest on a pmem device (`crosvm run --help` and its `ext2` crate, read on the box 2026-10-22).

@@ -6090,6 +6090,58 @@ fn a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path() {
   );
 }
 
+/// The dirty-page write-back rule across a takeover (§4.6; A-61, A-140). A mount taken over by a restarted daemon must
+/// judge its files' write-backs as the dead daemon would have: a store made after the page was re-fetched is the later
+/// write, and must land. Do: map a file through a mount, its open made with the first daemon; `SIGKILL` the daemon and
+/// wait for the anchor's successor, which takes the mount over; write a page through a second mount; wait until the map
+/// reads it, the page re-fetched from the successor; store into that page through the map and sync it. Expect the
+/// volume to hold the store.
+///
+/// Before the fix the restored mount kept no byte states for a file opened before it started. It judged the write-back
+/// against every change since it started, called the stored bytes stale and kept them back: the store was lost, though
+/// its `msync` succeeded. Found by the guest test (`tests/guest_dax.rs`) on 2026-10-22; Linux only, and to a kernel that
+/// can resend (6.9+), where a mount survives its daemon.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_store_made_after_a_refetch_lands_through_a_mount_taken_over_by_a_restarted_daemon() {
+  if !live_mount_runs() {
+    return;
+  }
+  if !kernel_resends_fuse_requests() {
+    eprintln!("SKIP: before Linux 6.9 a FUSE mount does not survive its daemon (A-61)");
+    return;
+  }
+  let mut fixture = MappedThroughAMount::with_pages("maptakeover", b'A', 2);
+  let page = fixture.page;
+  assert!(
+    fixture.follows(b'A'),
+    "the map reads the file before the kill"
+  );
+  let killed = kill_the_daemon(&fixture.instance);
+  let restarted = await_daemon(&fixture.instance, Some(killed), &[]);
+  assert_ne!(restarted, killed, "a new daemon serves the mount");
+  let second = fixture.mount_again();
+  second.write_at(page, &vec![b'H'; page]);
+  let mut expected = vec![b'A'; fixture.length];
+  expected[page..].fill(b'H');
+  assert!(
+    fixture.follows_bytes(&expected),
+    "the map reads the other mount's write within {WAIT_FOR:?}, re-fetched from the successor"
+  );
+  let stored = page + 10..page + 14;
+  fixture.write_through_map(stored.start, b"gggg");
+  expected[stored].copy_from_slice(b"gggg");
+  let held = fixture.volume_bytes();
+  let lost: Vec<usize> = (0..fixture.length)
+    .filter(|at| held.get(*at) != expected.get(*at))
+    .collect();
+  assert!(
+    lost.is_empty(),
+    "the store made after the re-fetch is in the volume; bytes {lost:?} hold {:?}",
+    lost.iter().map(|at| held.get(*at)).collect::<Vec<_>>()
+  );
+}
+
 /// The dirty-page write-back rule past a truncation (§4.6; the bug record above). A store left dirty in a page that a
 /// later truncation through another path cut off must not grow the file back when the kernel writes the page back: a
 /// map cannot extend a file, so that write-back is the page's stale copy. Do: store a byte in page 1 of a two-page map

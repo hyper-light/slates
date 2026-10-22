@@ -2297,7 +2297,11 @@ applied except over the bytes another path changed after the kernel's copy of th
 since excepted. That is what one shared page cache would hold. For each byte of a file open for writing, the mount keeps
 the journal point its kernel's copy is as of and whether another path changed it since. These states are fed from the
 records its invalidation rounds already walk, so a copy fetched any time ago is judged. A file's first writable open on a
-mount drops the kernel's cached pages (no `FOPEN_KEEP_CACHE`), so every byte starts fresh. **A READ through a handle
+mount drops the kernel's cached pages (no `FOPEN_KEEP_CACHE`), so every byte starts fresh. **A mount taken over by a
+restarted daemon** (A-61) never saw the opens its kernel made before. A request naming such a handle adopts its file
+(A-147): fresh as of the mount's start, with the journal's changes to it since then applied, and judged from there like
+any other. Untracked, such a file was judged against every change since the mount's start. A store made after a
+re-fetch of bytes another path had changed was then kept back, and lost. **A READ through a handle
 opened `O_DIRECT` is ambiguous** (A-144). It is a direct read, which leaves the kernel's copy as it was, or a fill of
 that copy (a fault on a map of the handle, a buffered fallback), and FUSE carries nothing that tells them apart. So it
 leaves the bytes that are fresh either way as they are, and makes the others unknown. Counted as a fetch, one direct
@@ -11947,6 +11951,39 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
+
+### A-147 — A mount taken over by a restarted daemon adopts the files its kernel opened before (accepted 2026-10-22)
+Applied in the same change to:
+- §4.6 (the write-back rule);
+- `crates/bridge-fuse/src/coherence.rs` (`WritableOpens` keyed by handle and file; `PageStates::adopted`);
+- `crates/bridge-fuse/src/channel.rs` (`ServeState.adopts_unseen_handles`, `adopt_unseen_handle`, `note_read`,
+  `written_handle`; a release names its file);
+- the tests:
+  - `a_store_made_after_a_refetch_lands_through_a_mount_taken_over_by_a_restarted_daemon` (`crates/cli/tests/cli.rs`);
+  - the guest takeover test (`crates/cli/tests/guest_dax.rs`);
+  - three unit tests in `coherence.rs`;
+- GAPS;
+- `docs/bugs/2026-10-22-a-mount-taken-over-by-a-restarted-daemon-dropped-a-store-made-after-a-refetch.md`.
+
+- **What it answers.** A restored mount's byte states began only at writable opens it saw, so a file its kernel opened
+  before the takeover stayed untracked. Its re-fetches went unrecorded, and its write-backs were judged against every
+  change since the mount's start. A store made after a re-fetch of bytes another path had changed was kept back and
+  lost: its `msync` succeeded, and the map showed it. Found by the guest test with a daemon killed under a live DAX map,
+  and reproduced without a VM, each 3 of 3.
+- **The rule.** On a mount taken over from a daemon that died, a `READ` or `WRITE` that names a handle the mount never
+  saw opened adopts the handle and its file:
+  - every byte is fresh as of the mount's start;
+  - the journal's changes to the file since then are applied;
+  - the file is lost (write-backs refused) if the journal no longer reaches back.
+
+  From there the file is judged like one opened on this mount, and forgotten at its last release. A handle is known by
+  its value and its file together, since a successor's fresh handle store reissues its predecessor's values.
+- **What it leaves.** The start point is the fallback's, the journal head at the mount's first request, so the
+  successor's write-log replay (A-63) is not counted against the mount's own writes. Changes the dead daemon made and
+  never delivered remain the takeover gap (GAPS).
+- **Evidence.** The CLI test was red 3 of 3, is green 3 of 3, and goes red again with adoption turned off. The guest
+  takeover test is green across the kill. bridge-fuse's suites, the CLI suite (51 of 51) and the other guest tests stay
+  green.
 
 ### A-146 — A change drops from a mount's cache only the bytes it touched (accepted 2026-10-22)
 Applied in the same change to:

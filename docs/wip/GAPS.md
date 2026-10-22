@@ -10716,9 +10716,22 @@ stale page back, and the other write's bytes on it reverted: measured 4,095 of 4
   (`JOURNAL_SHARE_PERMILLE`, `crates/server/src/verbs.rs`). Its doc and its `derived!` anchor both cite a ratification
   in §5 of this ledger that §5 does not contain. Found 2026-10-22 while sizing the write-back rule's bound on it (about
   850 records, and so 850 ranges a file, for an 8 MiB volume).
-- **A restored mount's files.** A mount taken over across a daemon restart (A-61) has files whose writable opens predate
-  the daemon. They have no byte states, so their write-backs are judged from the mount's start against every record
-  since, and a long-lived one is refused `EIO` past the journal's retention.
+- **A restored mount's files — fixed 2026-10-22 (A-147).** A mount taken over across a daemon restart (A-61) has files
+  whose writable opens predate the daemon. They had no byte states, so their write-backs were judged from the mount's
+  start against every record since. Worse than the `EIO` this entry recorded: a store made after a re-fetch of bytes
+  another path had changed was kept back and lost, its `msync` succeeding.
+  - Found by the guest takeover test (`crates/cli/tests/guest_dax.rs`).
+  - Reproduced without a VM by `a_store_made_after_a_refetch_lands_through_a_mount_taken_over_by_a_restarted_daemon`
+    (`crates/cli/tests/cli.rs`), red 3 of 3.
+
+  A request naming a handle the mount never saw opened now adopts its file, fresh as of the mount's start with the
+  journal's changes since then applied, and from there it is judged like any other. The `EIO` remains only for a file
+  first named after the journal stopped reaching back to the mount's start.
+
+  A sibling, recorded in the bug, is not fixed. `VolumeBridge::release` resolves a handle by its value alone, and a
+  successor reissues its predecessor's values, so a pre-takeover handle's release can close a post-takeover handle of
+  another file. A failing test comes next
+  (`docs/bugs/2026-10-22-a-mount-taken-over-by-a-restarted-daemon-dropped-a-store-made-after-a-refetch.md`).
 - **A takeover sends the kernel no invalidation** (found reading `crates/server/src/fuse.rs` 2026-10-22, not
   reproduced). The coherence cursor is process-local, and a restored mount's first round starts at the new daemon's
   head. A change the dead daemon had not yet delivered is therefore never invalidated: its kernel keeps that name,
@@ -10805,6 +10818,13 @@ without a user namespace, which needs root.
 
   AC-3.3's residual applies to a guest as to any map: a store into bytes another path is changing, made between the
   page's fetch and the change's delivery, is kept back.
+- **Found by the guest takeover test: a restored mount lost a store made after a re-fetch — fixed (A-147).** With a
+  daemon killed under the guest's live map, a store the guest made after re-fetching another path's write was kept
+  back after the takeover, 3 of 3. The same holds for any process's map, without a VM. The entry "A restored mount's
+  files", above, has the details. The lifecycle tests now pass:
+  - `a_daemon_killed_under_a_guests_live_map_is_taken_over_and_the_guest_goes_on`;
+  - `a_guest_killed_with_unsynced_stores_leaves_them_to_land_and_a_new_guest_reads_them`. The dead VM's dirty pages
+    stay in the host's cache, and are written back under the write-back rule.
 
 ### 2026-10-22: a CI daemon's boot was refused because one shard used no CPU for a whole second while it started — open, not reproduced
 

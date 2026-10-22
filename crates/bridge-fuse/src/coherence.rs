@@ -162,12 +162,17 @@ impl OwnRecords {
 }
 
 /// The handles this mount's kernel holds open for writing (§4.6, the dirty-page write-back rule): only a writable open
-/// can dirty a page, so only its file needs byte states ([`PageStates`]). Bounded by the handles the bridge's handle
-/// store issues, since only a granted handle is recorded and each is forgotten at its release.
+/// can dirty a page, so only its file needs byte states ([`PageStates`]). Bounded by the handles the kernel holds, since
+/// each is forgotten at its release.
+///
+/// A handle is known by its value and its file together. A daemon that takes a mount over (A-61) starts a fresh handle
+/// store and reissues the values its predecessor issued, so the kernel can hold one value for a file it opened before
+/// the takeover and for another opened after (A-147). A `RELEASE` names its file as well as its handle, so each finds
+/// its own entry.
 #[derive(Debug, Default)]
 pub struct WritableOpens {
-  /// Handle → the inode it opens.
-  handles: std::collections::BTreeMap<u64, u64>,
+  /// The handles, each with the inode it opens.
+  handles: std::collections::BTreeSet<(u64, u64)>,
   /// Inode → how many writable handles it has.
   per_inode: std::collections::BTreeMap<u64, usize>,
 }
@@ -175,7 +180,7 @@ pub struct WritableOpens {
 impl WritableOpens {
   /// Notes handle `fh` granted for writing on `ino`; whether it is the inode's first writable handle on this mount.
   pub fn opened(&mut self, fh: u64, ino: u64) -> bool {
-    if self.handles.insert(fh, ino).is_some() {
+    if !self.handles.insert((fh, ino)) {
       return false;
     }
     let count = self.per_inode.entry(ino).or_insert(0);
@@ -183,9 +188,11 @@ impl WritableOpens {
     *count == 1
   }
 
-  /// Forgets handle `fh`: the inode it was the last writable handle of, if it was.
-  pub fn released(&mut self, fh: u64) -> Option<u64> {
-    let ino = self.handles.remove(&fh)?;
+  /// Forgets handle `fh` of `ino`: the inode, if that was its last writable handle.
+  pub fn released(&mut self, fh: u64, ino: u64) -> Option<u64> {
+    if !self.handles.remove(&(fh, ino)) {
+      return None;
+    }
     let count = self.per_inode.get_mut(&ino)?;
     *count = count.saturating_sub(1);
     if *count > 0 {
@@ -198,6 +205,11 @@ impl WritableOpens {
   /// Whether `ino` has a writable handle on this mount.
   pub fn holds(&self, ino: u64) -> bool {
     self.per_inode.contains_key(&ino)
+  }
+
+  /// Whether handle `fh` of `ino` is one this mount has noted.
+  pub fn knows(&self, fh: u64, ino: u64) -> bool {
+    self.handles.contains(&(fh, ino))
   }
 }
 
@@ -273,6 +285,39 @@ impl PageStates {
       .files
       .entry(ino)
       .or_insert_with(|| FileStates::fresh(point));
+  }
+
+  /// The file `ino` was open for writing in the kernel before this mount served it — a mount taken over from a daemon
+  /// that died (A-61) — and a request has just named it (A-147). It is tracked from here on: every byte fresh as of
+  /// `start`, the point the mount began serving, with the journal's `changes` to it since then applied in order, each
+  /// with whether it is the mount's own. Those changes were consumed while the file was untracked, so without them a
+  /// byte another path changed in between would read as fresh. `None` for the changes means the journal no longer
+  /// reaches back to `start`: the file is tracked as lost, and its write-backs are refused, as an untracked file's were.
+  /// A file already tracked keeps its states.
+  pub fn adopted(
+    &mut self,
+    ino: u64,
+    start: u64,
+    changes: Option<&[(std::ops::Range<u64>, u64, bool)]>,
+    bound: usize,
+  ) {
+    if self.files.contains_key(&ino) {
+      return;
+    }
+    let mut file = FileStates::fresh(start);
+    match changes {
+      Some(changes) => {
+        for (range, seq, own) in changes {
+          file.change(range.clone(), *seq, *own, bound);
+        }
+        file.touch(ino, &mut self.touched);
+      }
+      None => {
+        file.ranges.clear();
+        file.lost = true;
+      }
+    }
+    self.files.insert(ino, file);
   }
 
   /// Whether `ino` is tracked.
@@ -1016,6 +1061,98 @@ mod tests {
         states.stale_after(INO, 0..PAGES * PAGE, 0, &[]),
         Some(vec![changed])
       );
+    }
+
+    /// A-147: a file a restored mount adopts is judged as an untracked file was until the kernel re-fetches it, and
+    /// precisely after. Do: another path changes bytes 0..10 at 2 and the mount's own write changes 20..30 at 3, both
+    /// after the mount began at 1, while the file is untracked; the file is then adopted with those changes. Expect a
+    /// write-back over 0..40 to keep back exactly 0..10, as the untracked judgment does. Then the kernel re-fetches
+    /// 0..10 at 4. Expect nothing kept back, where the untracked judgment still keeps 0..10: a store made after the
+    /// re-fetch is the later write, and landing it is the fix.
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)] // a list of one stale range, not the numbers inside it
+    fn an_adopted_file_is_judged_as_untracked_until_a_refetch_and_precisely_after() {
+      /// Shape: ranges enough for every split below.
+      const BOUND: usize = 16;
+      /// Shape: where the mount began serving.
+      const STARTED_AT: u64 = 1;
+      let changes = vec![(0..10, 2, false), (20..30, 3, true)];
+      let untracked = PageStates::default();
+      let mut states = PageStates::default();
+      states.adopted(INO, STARTED_AT, Some(&changes), BOUND);
+      assert!(states.tracks(INO), "adopted");
+      assert_eq!(
+        states.stale_after(INO, 0..40, STARTED_AT, &[]),
+        untracked.stale_after(INO, 0..40, STARTED_AT, &changes),
+        "until a re-fetch, judged as the untracked file was"
+      );
+      assert_eq!(
+        states.stale_after(INO, 0..40, STARTED_AT, &[]),
+        Some(vec![0..10]),
+        "another path's bytes stale, the mount's own fresh"
+      );
+      states.fetched(INO, 0..10, 4, BOUND);
+      assert_eq!(
+        states.stale_after(INO, 0..40, STARTED_AT, &[]),
+        Some(vec![]),
+        "after the re-fetch, nothing over those bytes is kept back"
+      );
+      assert_eq!(
+        untracked.stale_after(INO, 0..40, STARTED_AT, &changes),
+        Some(vec![0..10]),
+        "where the untracked judgment kept them back: the lost store"
+      );
+    }
+
+    /// A-147: a file adopted after the journal stopped reaching back to the mount's start cannot be judged. Do: adopt
+    /// it without its changes. Expect its write-backs refused, as an untracked file's were then, and a second adoption
+    /// to keep it lost rather than make it fresh.
+    #[test]
+    fn a_file_adopted_past_the_journals_reach_is_lost_until_it_is_dropped() {
+      /// Shape: ranges enough for the file.
+      const BOUND: usize = 4;
+      let mut states = PageStates::default();
+      states.adopted(INO, OPENED_AT, None, BOUND);
+      assert_eq!(
+        states.stale_after(INO, 0..8, 0, &[]),
+        None,
+        "refused, not guessed"
+      );
+      states.adopted(INO, OPENED_AT, Some(&[]), BOUND);
+      assert_eq!(
+        states.stale_after(INO, 0..8, 0, &[]),
+        None,
+        "a later adoption keeps the states it found"
+      );
+      states.dropped(INO);
+      assert!(!states.tracks(INO), "dropped at its last release");
+    }
+  }
+
+  mod writable_opens {
+    use super::super::WritableOpens;
+
+    /// A-147: a daemon that takes a mount over reissues the handle values its predecessor issued, so the kernel can hold
+    /// one value for two files. Do: note handle 7 of file 1, and handle 7 of file 2; release handle 7 of file 1. Expect
+    /// file 1's last handle gone and file 2's still held, each release finding its own entry.
+    #[test]
+    fn a_reissued_handle_value_is_told_apart_by_its_file() {
+      let mut opens = WritableOpens::default();
+      assert!(opens.opened(7, 1), "file 1's first writable handle");
+      assert!(opens.opened(7, 2), "file 2's first, with the same value");
+      assert!(opens.knows(7, 1) && opens.knows(7, 2));
+      assert_eq!(opens.released(7, 1), Some(1), "file 1's last handle");
+      assert!(!opens.holds(1) && !opens.knows(7, 1));
+      assert!(
+        opens.holds(2) && opens.knows(7, 2),
+        "file 2's handle is untouched"
+      );
+      assert_eq!(
+        opens.released(7, 1),
+        None,
+        "a release of a handle already gone is nothing"
+      );
+      assert_eq!(opens.released(7, 2), Some(2));
     }
   }
 

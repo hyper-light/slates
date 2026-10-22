@@ -164,6 +164,14 @@ fn start_anchor(instance: &str) -> Anchor {
     .spawn()
     .unwrap();
   let anchor = Anchor { child };
+  await_steady(instance);
+  let (code, _, err) = run(instance, &["bootstrap", "root"]);
+  assert_eq!(code, 0, "explicit first-time bootstrap: {err}");
+  anchor
+}
+
+/// Waits until `instance`'s daemon answers [`STABLE_STREAK`] verbs in a row.
+fn await_steady(instance: &str) {
   let started = Instant::now();
   let mut streak = 0u32;
   while streak < STABLE_STREAK {
@@ -178,9 +186,6 @@ fn start_anchor(instance: &str) -> Anchor {
     };
     pause();
   }
-  let (code, _, err) = run(instance, &["bootstrap", "root"]);
-  assert_eq!(code, 0, "explicit first-time bootstrap: {err}");
-  anchor
 }
 
 /// A volume made for `instance`: its id.
@@ -595,29 +600,10 @@ struct Tally {
   slowest_arrival_micros: u64,
 }
 
-/// Holds the volume's bytes, read through slates itself past both mounts, and the guest's map to `expected`.
-fn check(instance: &str, volume: &str, file: &str, expected: &Expected, guest: &mut Guest) {
-  guest.done(&Ask::Sync);
-  let (code, held, err) = run(instance, &["read", volume, &format!("/{file}")]);
-  assert_eq!(code, 0, "slates read {volume} /{file}: {err}");
-  expected.assert_held_by(
-    &held,
-    &format!("the volume's {file}, read through slates"),
-    guest,
-  );
-  let len = u64::try_from(expected.bytes.len()).unwrap();
-  match guest.ask(&Ask::Read { at: 0, len }, REPLY_WAIT) {
-    Reply::Bytes(mapped) => {
-      expected.assert_held_by(&mapped, &format!("the guest's map of {file}"), guest)
-    }
-    other => panic!("read → {other:?}\n{}", guest.transcript()),
-  }
-}
-
-/// The other path writes `value` over `[at, at + run)`, and the guest waits until both ends show in its map, memory
-/// alone: the first and the last page of the write, since the kernel drops a written range's pages in order.
-fn other_path_writes(host_file: &str, (at, run): (u64, u64), value: u8, guest: &mut Guest) -> u64 {
-  write_at(host_file, at, &vec![value; usize::try_from(run).unwrap()]);
+/// Waits until both ends of the other path's write of `value` over `[at, at + run)` show in the guest's map, memory
+/// alone: the first and the last page of the write, since the kernel drops a written range's pages in order. The
+/// slower of the two waits, in microseconds.
+fn arrival_in_the_map((at, run): (u64, u64), value: u8, guest: &mut Guest) -> u64 {
   let mut slowest = 0;
   for end in [at, at.saturating_add(run).saturating_sub(1)] {
     match guest.ask(
@@ -639,72 +625,154 @@ fn other_path_writes(host_file: &str, (at, run): (u64, u64), value: u8, guest: &
   slowest
 }
 
-/// One generated history over `file`: the guest's unsynced stores, its syncs, the other path's writes (each waited for
-/// as memory), and checks of the volume and the map against the latest write to every byte.
-fn generated_history(
-  instance: &str,
-  volume: &str,
-  (guest_file, host_file): (&str, &str),
-  file: &str,
-  seed: u64,
-  guest: &mut Guest,
-) -> Tally {
-  let len = PAGES.saturating_mul(u64::try_from(rustix::param::page_size()).unwrap());
-  let mut expected = Expected {
-    bytes: vec![SEED_BYTE; usize::try_from(len).unwrap()],
-  };
-  write_whole(guest_file, &expected.bytes);
-  match guest.ask(
-    &Ask::Map {
-      path: file.to_owned(),
-      pages: PAGES,
-    },
-    REPLY_WAIT,
-  ) {
-    Reply::Mapped { dax: true } => {}
-    other => panic!(
-      "map {file} → {other:?}: DAX is what this test is for\n{}",
-      guest.transcript()
-    ),
+/// One generated history over one shared file: the model of what every byte must hold, the generator, and the tally.
+/// It can stop and go on around a daemon's death or a VM's.
+struct History<'r> {
+  rig: &'r Rig,
+  file: String,
+  guest_file: String,
+  host_file: String,
+  len: u64,
+  expected: Expected,
+  state: u64,
+  guest_counter: u8,
+  host_counter: u8,
+  tally: Tally,
+}
+
+impl<'r> History<'r> {
+  /// Writes `file` through the guest's mount, has `guest` map it with DAX, and seeds the generator.
+  fn start(rig: &'r Rig, file: &str, seed: u64, guest: &mut Guest) -> History<'r> {
+    let len = PAGES.saturating_mul(u64::try_from(rustix::param::page_size()).unwrap());
+    let history = History {
+      rig,
+      file: file.to_owned(),
+      guest_file: rig.guest_side.file(file),
+      host_file: rig.host_side.file(file),
+      len,
+      expected: Expected {
+        bytes: vec![SEED_BYTE; usize::try_from(len).unwrap()],
+      },
+      state: seed,
+      guest_counter: 0,
+      host_counter: 0,
+      tally: Tally::default(),
+    };
+    write_whole(&history.guest_file, &history.expected.bytes);
+    history.map(guest);
+    history
   }
-  let mut state = seed;
-  let (mut guest_counter, mut host_counter) = (0u8, 0u8);
-  let mut tally = Tally::default();
-  for _ in 0..STEPS {
-    let roll = xorshift(&mut state);
-    match roll % 10 {
-      0..=3 => {
-        let (at, run) = run_within(roll, len);
-        let value = next_value(&mut guest_counter, GUEST_FIRST, u16::from(HOST_FIRST));
-        guest.done(&Ask::Store {
-          at,
-          len: run,
-          byte: value,
-        });
-        expected.write(at, run, value);
-        tally.stores = tally.stores.saturating_add(1);
-      }
-      4..=6 => {
-        let (at, run) = run_within(roll, len);
-        let value = next_value(&mut host_counter, HOST_FIRST, 256);
-        let arrival = other_path_writes(host_file, (at, run), value, guest);
-        expected.write(at, run, value);
-        tally.writes = tally.writes.saturating_add(1);
-        tally.slowest_arrival_micros = tally.slowest_arrival_micros.max(arrival);
-      }
-      7 | 8 => {
-        guest.done(&Ask::Sync);
-        tally.syncs = tally.syncs.saturating_add(1);
-      }
-      _ => {
-        check(instance, volume, file, &expected, guest);
-        tally.checks = tally.checks.saturating_add(1);
+
+  /// Has `guest` map the file, which must be served through the DAX window.
+  fn map(&self, guest: &mut Guest) {
+    match guest.ask(
+      &Ask::Map {
+        path: self.file.clone(),
+        pages: PAGES,
+      },
+      REPLY_WAIT,
+    ) {
+      Reply::Mapped { dax: true } => {}
+      other => panic!(
+        "map {} → {other:?}: DAX is what this test is for\n{}",
+        self.file,
+        guest.transcript()
+      ),
+    }
+  }
+
+  /// A span of the file for a step chosen outside [`History::steps`].
+  fn span(&mut self) -> (u64, u64) {
+    let roll = xorshift(&mut self.state);
+    run_within(roll, self.len)
+  }
+
+  /// The guest stores a fresh value over `span`, unsynced.
+  fn guest_stores(&mut self, (at, run): (u64, u64), guest: &mut Guest) {
+    let value = next_value(&mut self.guest_counter, GUEST_FIRST, u16::from(HOST_FIRST));
+    guest.done(&Ask::Store {
+      at,
+      len: run,
+      byte: value,
+    });
+    self.expected.write(at, run, value);
+    self.tally.stores = self.tally.stores.saturating_add(1);
+  }
+
+  /// The other path writes a fresh value over `span`. With a live guest, the guest waits until the write shows in its
+  /// map ([`arrival_in_the_map`]).
+  fn other_path_writes(&mut self, (at, run): (u64, u64), guest: Option<&mut Guest>) {
+    let value = next_value(&mut self.host_counter, HOST_FIRST, 256);
+    write_at(
+      &self.host_file,
+      at,
+      &vec![value; usize::try_from(run).unwrap()],
+    );
+    if let Some(guest) = guest {
+      let arrival = arrival_in_the_map((at, run), value, guest);
+      self.tally.slowest_arrival_micros = self.tally.slowest_arrival_micros.max(arrival);
+    }
+    self.expected.write(at, run, value);
+    self.tally.writes = self.tally.writes.saturating_add(1);
+  }
+
+  /// `count` generated steps: the guest's unsynced stores, its syncs, the other path's writes, and checks.
+  fn steps(&mut self, count: usize, guest: &mut Guest) {
+    for _ in 0..count {
+      let roll = xorshift(&mut self.state);
+      let span = run_within(roll, self.len);
+      match roll % 10 {
+        0..=3 => self.guest_stores(span, guest),
+        4..=6 => self.other_path_writes(span, Some(guest)),
+        7 | 8 => {
+          guest.done(&Ask::Sync);
+          self.tally.syncs = self.tally.syncs.saturating_add(1);
+        }
+        _ => self.check(guest),
       }
     }
   }
-  check(instance, volume, file, &expected, guest);
-  tally.checks = tally.checks.saturating_add(1);
-  tally
+
+  /// Syncs the guest, then holds the volume, read through slates itself past both mounts, and the guest's map to the
+  /// latest write to every byte.
+  fn check(&mut self, guest: &mut Guest) {
+    guest.done(&Ask::Sync);
+    self.volume_holds_the_latest_writes(guest);
+    match guest.ask(
+      &Ask::Read {
+        at: 0,
+        len: self.len,
+      },
+      REPLY_WAIT,
+    ) {
+      Reply::Bytes(mapped) => {
+        self
+          .expected
+          .assert_held_by(&mapped, &format!("the guest's map of {}", self.file), guest)
+      }
+      other => panic!("read → {other:?}\n{}", guest.transcript()),
+    }
+    self.tally.checks = self.tally.checks.saturating_add(1);
+  }
+
+  /// Holds the volume's file, read through slates itself past both mounts, to the latest write to every byte; `guest`
+  /// only lends its console's transcript to a failure.
+  fn volume_holds_the_latest_writes(&self, guest: &Guest) {
+    let (code, held, err) = run(
+      &self.rig.instance,
+      &["read", &self.rig.shared, &format!("/{}", self.file)],
+    );
+    assert_eq!(
+      code, 0,
+      "slates read {} /{}: {err}",
+      self.rig.shared, self.file
+    );
+    self.expected.assert_held_by(
+      &held,
+      &format!("the volume's {}, read through slates", self.file),
+      guest,
+    );
+  }
 }
 
 /// The daemon's bytes kept back from cache write-backs so far, over every shard.
@@ -716,6 +784,124 @@ fn kept_back(instance: &str) -> u64 {
     .filter_map(|line| line.split_once(KEPT_BACK))
     .filter_map(|(_, count)| count.trim().parse::<u64>().ok())
     .sum()
+}
+
+/// What every guest test stands on: an anchor; the shared volume mounted twice, once to be shared into the VM and once
+/// as the host's other path; and a second volume holding the guest's initramfs. Fields drop in order, so the mounts go
+/// before the anchor.
+struct Rig {
+  instance: String,
+  shared: String,
+  guest_side: MountPoint,
+  host_side: MountPoint,
+  _boot_side: MountPoint,
+  initrd: String,
+  most_bytes: usize,
+  anchor: Anchor,
+}
+
+impl Rig {
+  /// Starts an anchor for an instance named after `tag`, makes and mounts the volumes, and writes the initramfs.
+  fn new(gate: &Gate, tag: &str) -> Rig {
+    let instance = format!("{tag}-{}", std::process::id());
+    let anchor = start_anchor(&instance);
+    let shared = created_volume(&instance, "shared");
+    let boot = created_volume(&instance, "boot");
+    let guest_side = MountPoint::of(&instance, &shared);
+    let host_side = MountPoint::of(&instance, &shared);
+    let boot_side = MountPoint::of(&instance, &boot);
+    #[allow(clippy::disallowed_methods)]
+    // reads the built probe binary: a test input, never written
+    let probe = std::fs::read(&gate.probe).unwrap_or_else(|e| panic!("read {}: {e}", gate.probe));
+    let initrd = boot_side.file("initramfs.cpio");
+    write_whole(&initrd, &initramfs(&probe));
+    let most_bytes = usize::try_from(PAGES)
+      .unwrap()
+      .saturating_mul(rustix::param::page_size());
+    Rig {
+      instance,
+      shared,
+      guest_side,
+      host_side,
+      _boot_side: boot_side,
+      initrd,
+      most_bytes,
+      anchor,
+    }
+  }
+
+  /// Boots a guest with the guest side of the shared volume shared in.
+  fn boot(&self, gate: &Gate) -> Guest {
+    Guest::boot(gate, &self.initrd, &self.guest_side.path, self.most_bytes)
+  }
+}
+
+/// Shape: the guest's stores left unsynced across a daemon's or a VM's death.
+const UNSYNCED_STORES: usize = 6;
+/// Shape: the other path's writes after a VM's death, over spans its unsynced stores may share.
+const WRITES_AFTER_THE_KILL: usize = 4;
+
+/// The anchor's daemon: the process whose parent is the anchor (`/proc/PID/stat`'s fourth field).
+fn daemon_of(anchor: &Anchor) -> Option<u32> {
+  let anchor_pid = anchor.child.id();
+  #[allow(clippy::disallowed_methods)] // reads the kernel's process table: a query, never a write
+  let processes = std::fs::read_dir("/proc").ok()?;
+  processes
+    .flatten()
+    .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+    .find(|pid| {
+      #[allow(clippy::disallowed_methods)] // the same query, one process at a time
+      let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+      let parent = stat
+        .rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().nth(1))
+        .and_then(|parent| parent.parse::<u32>().ok());
+      parent == Some(anchor_pid)
+    })
+}
+
+/// Kills the rig's daemon with `SIGKILL`, and waits until the anchor's successor answers verbs steadily: the two
+/// process ids.
+fn kill_the_daemon(rig: &Rig) -> (u32, u32) {
+  let old = daemon_of(&rig.anchor).expect("the anchor runs a daemon");
+  rustix::process::kill_process(
+    rustix::process::Pid::from_raw(i32::try_from(old).unwrap()).unwrap(),
+    rustix::process::Signal::KILL,
+  )
+  .unwrap();
+  let started = Instant::now();
+  let new = loop {
+    assert!(
+      started.elapsed() < START_WAIT,
+      "the anchor restarted its daemon within {START_WAIT:?}"
+    );
+    match daemon_of(&rig.anchor) {
+      Some(pid) if pid != old => break pid,
+      _ => pause(),
+    }
+  };
+  await_steady(&rig.instance);
+  (old, new)
+}
+
+/// Syncs `path` through its slates mount from the host, so what the host's page cache holds dirty is written back.
+#[allow(clippy::disallowed_methods)] // the test's own sync through a slates mount: RAM, not disk
+fn sync_through(path: &str) {
+  std::fs::File::open(path)
+    .and_then(|file| file.sync_all())
+    .unwrap_or_else(|e| panic!("fsync {path}: {e}"));
+}
+
+impl Guest {
+  /// Kills the VM and its device processes without warning, as a crashed VMM dies.
+  fn kill(&mut self) {
+    rustix::process::kill_process_group(
+      rustix::process::Pid::from_child(&self.vm),
+      rustix::process::Signal::KILL,
+    )
+    .unwrap();
+    let _ = self.vm.wait();
+  }
 }
 
 /// §4.6 (the mount route, A-139/A-140/A-146) through a real guest with DAX. Do: share a slates mount into a crosvm
@@ -734,33 +920,14 @@ fn a_guest_maps_a_slates_mount_with_dax_and_holds_the_latest_write_to_every_byte
   let Some(gate) = Gate::from_env() else {
     return;
   };
-  let instance = format!("guest-dax-{}", std::process::id());
-  let _anchor = start_anchor(&instance);
-  let shared = created_volume(&instance, "shared");
-  let boot = created_volume(&instance, "boot");
-  let guest_side = MountPoint::of(&instance, &shared);
-  let host_side = MountPoint::of(&instance, &shared);
-  let boot_side = MountPoint::of(&instance, &boot);
-  #[allow(clippy::disallowed_methods)] // reads the built probe binary: a test input, never written
-  let probe = std::fs::read(&gate.probe).unwrap_or_else(|e| panic!("read {}: {e}", gate.probe));
-  let initrd = boot_side.file("initramfs.cpio");
-  write_whole(&initrd, &initramfs(&probe));
-  let most_bytes = usize::try_from(PAGES)
-    .unwrap()
-    .saturating_mul(rustix::param::page_size());
-  let mut guest = Guest::boot(&gate, &initrd, &guest_side.path, most_bytes);
+  let rig = Rig::new(&gate, "guest-dax");
+  let mut guest = rig.boot(&gate);
   let mut tallies = Vec::new();
   for (index, seed) in SEEDS.into_iter().enumerate() {
-    let file = format!("history-{index}");
-    let files = (guest_side.file(&file), host_side.file(&file));
-    let tally = generated_history(
-      &instance,
-      &shared,
-      (&files.0, &files.1),
-      &file,
-      seed,
-      &mut guest,
-    );
+    let mut history = History::start(&rig, &format!("history-{index}"), seed, &mut guest);
+    history.steps(STEPS, &mut guest);
+    history.check(&mut guest);
+    let tally = std::mem::take(&mut history.tally);
     eprintln!(
       "history {index} (seed {seed:#x}): {} guest stores, {} other-path writes (slowest to reach the map: {} µs), \
        {} syncs, {} checks",
@@ -774,7 +941,7 @@ fn a_guest_maps_a_slates_mount_with_dax_and_holds_the_latest_write_to_every_byte
     "the VM powered off cleanly: {status}\n{}",
     guest.transcript()
   );
-  let kept = kept_back(&instance);
+  let kept = kept_back(&rig.instance);
   eprintln!("bytes kept back from the guest's write-backs: {kept}");
   assert!(
     kept > 0,
@@ -785,5 +952,93 @@ fn a_guest_maps_a_slates_mount_with_dax_and_holds_the_latest_write_to_every_byte
       .iter()
       .all(|tally| tally.writes > 0 && tally.stores > 0 && tally.checks > 1),
     "every history stored, wrote through the other path and checked more than once"
+  );
+}
+
+/// §4.6 with a takeover (A-61) under a real guest with DAX. Do: run half a generated history; leave several of the
+/// guest's stores unsynced in its map; kill the daemon with `SIGKILL` while the guest holds the live map; wait for the
+/// anchor's successor to answer; run the rest of the history on the same map.
+///
+/// Expect: the successor is a new process, and every check before and after holds every byte of the volume and of the
+/// map to its latest write, the stores left unsynced across the kill included. The restored mount judges the guest's
+/// write-backs without the dead daemon's byte states, against every record since it started (GAPS), which this history
+/// stays well inside.
+#[test]
+fn a_daemon_killed_under_a_guests_live_map_is_taken_over_and_the_guest_goes_on() {
+  let Some(gate) = Gate::from_env() else {
+    return;
+  };
+  let rig = Rig::new(&gate, "guest-takeover");
+  let mut guest = rig.boot(&gate);
+  let mut history = History::start(&rig, "takeover", SEEDS[0], &mut guest);
+  history.steps(STEPS / 2, &mut guest);
+  history.check(&mut guest);
+  for _ in 0..UNSYNCED_STORES {
+    let span = history.span();
+    history.guest_stores(span, &mut guest);
+  }
+  let (old, new) = kill_the_daemon(&rig);
+  assert_ne!(old, new, "the anchor's successor is a new daemon");
+  history.steps(STEPS / 2, &mut guest);
+  history.check(&mut guest);
+  let tally = &history.tally;
+  eprintln!(
+    "daemon {old} killed, successor {new}: {} guest stores, {} other-path writes (slowest to reach the map: {} µs), \
+     {} checks",
+    tally.stores, tally.writes, tally.slowest_arrival_micros, tally.checks
+  );
+  assert!(
+    tally.writes > 0 && tally.checks > 2,
+    "non-vacuous: the history wrote through the other path and checked after the takeover"
+  );
+  let status = guest.quit();
+  assert!(
+    status.success(),
+    "the VM powered off cleanly: {status}\n{}",
+    guest.transcript()
+  );
+}
+
+/// §4.6 through a real guest with DAX when the VM dies. Do: run half a generated history; have the guest store over
+/// several spans without syncing; kill the VM and its device processes without warning; write over some spans through
+/// the other path; then fsync the file through the guest's side of the mount from the host. Then boot a second guest
+/// on the same mount and map the file.
+///
+/// Expect: the volume holds the latest write to every byte, the dead guest's unsynced stores included wherever nothing
+/// later wrote over them, and the second guest's map holds the same. The host's page cache outlives the VM that
+/// dirtied it, so its stores are written back, judged by the write-back rule like any other (A-140).
+#[test]
+fn a_guest_killed_with_unsynced_stores_leaves_them_to_land_and_a_new_guest_reads_them() {
+  let Some(gate) = Gate::from_env() else {
+    return;
+  };
+  let rig = Rig::new(&gate, "guest-crash");
+  let mut first = rig.boot(&gate);
+  let mut history = History::start(&rig, "crash", SEEDS[1], &mut first);
+  history.steps(STEPS / 2, &mut first);
+  history.check(&mut first);
+  for _ in 0..UNSYNCED_STORES {
+    let span = history.span();
+    history.guest_stores(span, &mut first);
+  }
+  first.kill();
+  for _ in 0..WRITES_AFTER_THE_KILL {
+    let span = history.span();
+    history.other_path_writes(span, None);
+  }
+  sync_through(&history.guest_file);
+  history.volume_holds_the_latest_writes(&first);
+  let mut second = rig.boot(&gate);
+  history.map(&mut second);
+  history.check(&mut second);
+  eprintln!(
+    "the first VM killed with {UNSYNCED_STORES} unsynced stores, {WRITES_AFTER_THE_KILL} writes after it: the volume \
+     and a second guest's map hold the latest write to every byte"
+  );
+  let status = second.quit();
+  assert!(
+    status.success(),
+    "the second VM powered off cleanly: {status}\n{}",
+    second.transcript()
   );
 }
