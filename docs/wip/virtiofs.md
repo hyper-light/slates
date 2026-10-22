@@ -268,7 +268,11 @@ box shared with two other builds — timings are not benchmarks)
    generated sequence of sixteen replacements: the map read the new bytes 52–193 µs after the writer's reply, median
    82 µs (51 replacements, arm64 container). That is *after* the reply, not before it: a reader of the mount in that
    window sees the old bytes, which AC-3.3 as written does not allow (open in the ledger, with what can and cannot be
-   made to wait). **On macOS it does not and cannot, over NFS v3:** the client cannot be
+   made to wait). With three writers at once — a shared map through one mount (`msync`ed), writes at offsets through a
+   second mount of the same volume, and whole-file replacements through the SDK, 24 generated writes over four pages —
+   the map, the second mount and slates' own read agree after every write, on Linux (the map as memory alone, so each
+   FUSE mount is told of the other's writes) and on macOS (after a `stat`)
+   (`a_shared_map_a_second_mount_and_the_sdk_agree_with_the_volume_through_a_generated_history`). **On macOS it does not and cannot, over NFS v3:** the client cannot be
    told of a change, and a memory-only reader refreshes only when something makes the client revalidate (seen both
    never in 8 s and at 0.88 s); a `stat` of the file — what a guest's attribute request becomes on the host — makes it
    follow at once. So DAX through a mount on macOS sees host-side changes on the guest's next attribute refresh, not

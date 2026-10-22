@@ -5408,7 +5408,10 @@ fn slates_mount_subtree_presents_one_directory_of_the_volume() {
 /// have done exactly that. The map itself is unmapped in `Drop::drop`, which runs before any field drops.
 struct MappedThroughAMount {
   map: *mut u8,
+  /// The system's page size: the unit `msync` aligns to.
   page: usize,
+  /// The file's length and the map's: a whole number of pages.
+  length: usize,
   file: std::fs::File,
   /// Held for its `Drop`: unmounts while the daemon below still lives.
   _point: MountPoint,
@@ -5423,9 +5426,15 @@ struct MappedThroughAMount {
 }
 
 impl MappedThroughAMount {
-  /// Starts a daemon, writes `map.bin` through the fixture's SDK client, mounts the volume and maps the file shared.
-  #[allow(clippy::disallowed_methods)] // the test's own calls through the slates mount: RAM, not disk
+  /// Starts a daemon, writes a one-page `map.bin` through the fixture's SDK client, mounts the volume and maps the
+  /// file shared.
   fn new(tag: &str, seed: u8) -> MappedThroughAMount {
+    MappedThroughAMount::with_pages(tag, seed, 1)
+  }
+
+  /// As [`MappedThroughAMount::new`], with `map.bin` and its map `pages` pages long.
+  #[allow(clippy::disallowed_methods)] // the test's own calls through the slates mount: RAM, not disk
+  fn with_pages(tag: &str, seed: u8, pages: usize) -> MappedThroughAMount {
     use std::os::fd::AsFd;
     let instance = format!("cli-{tag}-{}", std::process::id());
     let anchor = start_anchor(&instance);
@@ -5447,11 +5456,12 @@ impl MappedThroughAMount {
       .unwrap()
       .attachment;
     let page = rustix::param::page_size();
+    let length = page.checked_mul(pages).unwrap();
     writer
       .fs_write(
         (volume, attachment),
         "map.bin",
-        &vec![seed; page],
+        &vec![seed; length],
         FILE_MODE,
       )
       .unwrap();
@@ -5465,12 +5475,12 @@ impl MappedThroughAMount {
       .write(true)
       .open(format!("{}/map.bin", point.path))
       .unwrap();
-    // SAFETY: a fresh shared map of `page` bytes of an open file this fixture holds, at an address the kernel
+    // SAFETY: a fresh shared map of `length` bytes of an open file this fixture holds, at an address the kernel
     // chooses; nothing else maps it, and `Drop` unmaps it before the file is closed and the mount removed.
     let map = unsafe {
       rustix::mm::mmap(
         std::ptr::null_mut(),
-        page,
+        length,
         rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE,
         rustix::mm::MapFlags::SHARED,
         file.as_fd(),
@@ -5482,6 +5492,7 @@ impl MappedThroughAMount {
     MappedThroughAMount {
       map,
       page,
+      length,
       file,
       _point: point,
       writer,
@@ -5493,37 +5504,134 @@ impl MappedThroughAMount {
     }
   }
 
-  /// The mapped page.
+  /// The mapped file.
   fn view(&mut self) -> &mut [u8] {
-    // SAFETY: `map` is `page` readable and writable bytes, mapped in `new` and unmapped only in `Drop`.
-    unsafe { std::slice::from_raw_parts_mut(self.map, self.page) }
+    // SAFETY: `map` is `length` readable and writable bytes, mapped in `with_pages` and unmapped only in `Drop`.
+    unsafe { std::slice::from_raw_parts_mut(self.map, self.length) }
   }
 
-  /// Replaces `map.bin` with a page of `fill` through slates itself — the fixture's SDK client, under another
-  /// attachment than the mount's.
+  /// Replaces `map.bin` with `fill` through slates itself — the fixture's SDK client, under another attachment than
+  /// the mount's.
   fn replace_through_slates(&mut self, fill: u8) {
-    let replaced = self.writer.fs_write(
-      (self.volume, self.attachment),
-      "map.bin",
-      &vec![fill; self.page],
-      FILE_MODE,
-    );
+    let whole = vec![fill; self.length];
+    self.replace_with(&whole);
+  }
+
+  /// Replaces `map.bin` with `bytes`, which must be the file's length, through the fixture's SDK client.
+  fn replace_with(&mut self, bytes: &[u8]) {
+    assert_eq!(bytes.len(), self.length, "a replacement keeps the length");
+    let replaced =
+      self
+        .writer
+        .fs_write((self.volume, self.attachment), "map.bin", bytes, FILE_MODE);
     assert!(
       replaced.is_ok(),
       "the replacement through another attachment: {replaced:?}"
     );
   }
 
-  /// Whether the map comes to read a page of `fill` within [`WAIT_FOR`]: **as memory alone on Linux**, with no request
-  /// on the mount, since slates tells the kernel of a change when it is made (§4.6); on macOS once the file is
-  /// `stat`ed, because an NFS v3 client cannot be told and revalidates only when asked.
+  /// Writes `bytes` at `offset` through the map and `msync`s the pages they touch, as a process sharing the map makes
+  /// its write durable.
+  fn write_through_map(&mut self, offset: usize, bytes: &[u8]) {
+    let end = offset.checked_add(bytes.len()).unwrap();
+    self.view()[offset..end].copy_from_slice(bytes);
+    let first = offset / self.page * self.page;
+    let last = end.div_ceil(self.page) * self.page;
+    // SAFETY: syncs whole pages of the live map: `first` is a page boundary at or below `offset`, and `last` a page
+    // boundary at or below the map's end, since `end` is within the map and the map is a whole number of pages.
+    let synced = unsafe {
+      rustix::mm::msync(
+        self.map.add(first).cast(),
+        last - first,
+        rustix::mm::MsyncFlags::SYNC,
+      )
+    };
+    assert!(synced.is_ok(), "the map's write is flushed: {synced:?}");
+  }
+
+  /// `map.bin` as slates itself holds it, read through the fixture's SDK client: no mount's cache in the way.
+  fn volume_bytes(&mut self) -> Vec<u8> {
+    self
+      .writer
+      .read(self.volume, "map.bin", slates_client::ReadAt::Head)
+      .unwrap()
+  }
+
+  /// Whether the map comes to read a whole file of `fill` within [`WAIT_FOR`] ([`MappedThroughAMount::follows_bytes`]).
   fn follows(&mut self, fill: u8) -> bool {
+    let whole = vec![fill; self.length];
+    self.follows_bytes(&whole)
+  }
+
+  /// Whether the map comes to read `expected` within [`WAIT_FOR`]: **as memory alone on Linux**, with no request on
+  /// the mount, since slates tells the kernel of a change when it is made (§4.6); on macOS once the file is `stat`ed,
+  /// because an NFS v3 client cannot be told and revalidates only when asked.
+  fn follows_bytes(&mut self, expected: &[u8]) -> bool {
     let started = Instant::now();
     while started.elapsed() < WAIT_FOR {
       if !cfg!(target_os = "linux") {
         let _ = rustix::fs::fstat(&self.file);
       }
-      if self.view().iter().all(|byte| *byte == fill) {
+      if self.view() == expected {
+        return true;
+      }
+      pause();
+    }
+    false
+  }
+
+  /// Mounts the fixture's volume a second time and opens `map.bin` through it ([`SecondMount`]).
+  #[allow(clippy::disallowed_methods)] // the test's own calls through the slates mount: RAM, not disk
+  fn mount_again(&self) -> SecondMount {
+    let point = MountPoint {
+      path: fresh_mount_point(),
+    };
+    let (code, _, err) = run(&self.instance, &["mount", &self.id, &point.path]);
+    assert_eq!(code, 0, "the second slates mount: {err}");
+    let file = std::fs::OpenOptions::new()
+      .read(true)
+      .write(true)
+      .open(format!("{}/map.bin", point.path))
+      .unwrap();
+    SecondMount {
+      file,
+      _point: point,
+    }
+  }
+}
+
+/// A second mount of a [`MappedThroughAMount`]'s volume with `map.bin` open through it: another kernel's cache of the
+/// same file, written at offsets as a process on that mount writes. **Declare it after the fixture it came from:**
+/// locals drop in reverse order, so it unmounts while the fixture's daemon still lives (the macOS hazard the fixture
+/// documents); its own fields close the file before the mount point unmounts.
+struct SecondMount {
+  file: std::fs::File,
+  /// Held for its `Drop`: unmounts.
+  _point: MountPoint,
+}
+
+impl SecondMount {
+  /// Writes `bytes` at `offset` through this mount and syncs them, so the write has reached slates when this returns.
+  fn write_at(&self, offset: usize, bytes: &[u8]) {
+    use std::os::unix::fs::FileExt;
+    self
+      .file
+      .write_all_at(bytes, u64::try_from(offset).unwrap())
+      .unwrap();
+    self.file.sync_data().unwrap();
+  }
+
+  /// Whether a read of the whole file through this mount comes to return `expected` within [`WAIT_FOR`] (on macOS
+  /// after a `stat`, as for the map).
+  fn follows(&self, expected: &[u8]) -> bool {
+    use std::os::unix::fs::FileExt;
+    let mut read = vec![0u8; expected.len()];
+    let started = Instant::now();
+    while started.elapsed() < WAIT_FOR {
+      if !cfg!(target_os = "linux") {
+        let _ = rustix::fs::fstat(&self.file);
+      }
+      if self.file.read_exact_at(&mut read, 0).is_ok() && read == expected {
         return true;
       }
       pause();
@@ -5534,9 +5642,9 @@ impl MappedThroughAMount {
 
 impl Drop for MappedThroughAMount {
   fn drop(&mut self) {
-    // SAFETY: unmaps exactly the map made in `new`; nothing reads it after this. The fields then drop in declaration
-    // order: the file, the mount point (unmounted while the daemon lives), and the anchor last.
-    let _ = unsafe { rustix::mm::munmap(self.map.cast(), self.page) };
+    // SAFETY: unmaps exactly the map made in `with_pages`; nothing reads it after this. The fields then drop in
+    // declaration order: the file, the mount point (unmounted while the daemon lives), the writer, and the anchor last.
+    let _ = unsafe { rustix::mm::munmap(self.map.cast(), self.length) };
   }
 }
 
@@ -5564,7 +5672,7 @@ fn a_shared_map_through_a_mount_writes_back_and_follows_another_paths_change() {
   let synced = unsafe {
     rustix::mm::msync(
       fixture.map.cast(),
-      fixture.page,
+      fixture.length,
       rustix::mm::MsyncFlags::SYNC,
     )
   };
@@ -5572,7 +5680,7 @@ fn a_shared_map_through_a_mount_writes_back_and_follows_another_paths_change() {
   let (code, read, err) = run_with_stdin(&fixture.instance, &["read", &fixture.id, "map.bin"], b"");
   assert_eq!(code, 0, "{err}");
   assert!(
-    read.len() == fixture.page && read.iter().all(|byte| *byte == b'B'),
+    read.len() == fixture.length && read.iter().all(|byte| *byte == b'B'),
     "the map's write reached the volume, read through slates itself"
   );
   fixture.replace_through_slates(b'C');
@@ -5609,14 +5717,12 @@ fn a_shared_map_through_a_mount_follows_every_change_in_a_generated_sequence() {
     return;
   }
   let mut fixture = MappedThroughAMount::new("mapchaos", 0);
-  // A fixed-seed xorshift, so a failure names a reproducible sequence.
   let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
   let mut missed = Vec::new();
   for change in 0..MAP_CHANGES {
-    state ^= state << 13;
-    state ^= state >> 7;
-    state ^= state << 17;
-    let fill = u8::try_from(state % 255).unwrap_or(0).saturating_add(1);
+    let fill = u8::try_from(xorshift(&mut state) % 255)
+      .unwrap_or(0)
+      .saturating_add(1);
     fixture.replace_through_slates(fill);
     if !fixture.follows(fill) {
       missed.push((change, fill));
@@ -5625,6 +5731,133 @@ fn a_shared_map_through_a_mount_follows_every_change_in_a_generated_sequence() {
   assert!(
     missed.is_empty(),
     "the map followed every replacement; missed (change, fill): {missed:?}"
+  );
+}
+
+/// The next value of a fixed-seed xorshift64 generator (Marsaglia, "Xorshift RNGs", 2003), so a failing generated
+/// history names a reproducible sequence.
+fn xorshift(state: &mut u64) -> u64 {
+  *state ^= *state << 13;
+  *state ^= *state >> 7;
+  *state ^= *state << 17;
+  *state
+}
+
+/// Shape: the pages of the three-writer history's file — several, so a write to one page that reaches another, or a
+/// whole page written back over a neighbour's newer bytes, shows; few enough that every step compares the whole file.
+const THREE_WRITER_PAGES: usize = 4;
+
+/// Shape: the steps of the three-writer history — enough that each writer follows each of the others several times,
+/// few enough that on macOS, where a step can wait out the NFS client's attribute timeout twice, it stays near a minute.
+const THREE_WRITER_STEPS: u32 = 24;
+
+/// One generated write of the three-writer history: which writer, where, and what.
+#[derive(Debug)]
+enum GeneratedWrite {
+  /// Bytes written through the shared map at an offset, then `msync`ed.
+  Map { offset: usize, bytes: Vec<u8> },
+  /// Bytes written at an offset through the second mount, then synced.
+  SecondMount { offset: usize, bytes: Vec<u8> },
+  /// The whole file replaced through the SDK.
+  Sdk { bytes: Vec<u8> },
+}
+
+impl GeneratedWrite {
+  /// The next write for a file of `length` bytes, drawn from `state`.
+  fn next(state: &mut u64, length: usize) -> GeneratedWrite {
+    let mut byte = || xorshift(state).to_le_bytes()[0];
+    let which = byte() % 3;
+    if which == 2 {
+      return GeneratedWrite::Sdk {
+        bytes: (0..length).map(|_| byte()).collect(),
+      };
+    }
+    let span = u64::try_from(length).unwrap();
+    let offset = usize::try_from(xorshift(state) % span).unwrap();
+    let room = u64::try_from(length - offset).unwrap();
+    let count = usize::try_from(xorshift(state) % room).unwrap() + 1;
+    let bytes: Vec<u8> = (0..count)
+      .map(|_| xorshift(state).to_le_bytes()[0])
+      .collect();
+    if which == 0 {
+      GeneratedWrite::Map { offset, bytes }
+    } else {
+      GeneratedWrite::SecondMount { offset, bytes }
+    }
+  }
+
+  /// The model after this write: `model` with its bytes applied.
+  fn apply_to(&self, model: &mut [u8]) {
+    match self {
+      GeneratedWrite::Map { offset, bytes } | GeneratedWrite::SecondMount { offset, bytes } => {
+        model[*offset..*offset + bytes.len()].copy_from_slice(bytes);
+      }
+      GeneratedWrite::Sdk { bytes } => model.copy_from_slice(bytes),
+    }
+  }
+
+  /// Which writer this is, for the record of a failure and the non-vacuity count.
+  fn writer(&self) -> usize {
+    match self {
+      GeneratedWrite::Map { .. } => 0,
+      GeneratedWrite::SecondMount { .. } => 1,
+      GeneratedWrite::Sdk { .. } => 2,
+    }
+  }
+}
+
+/// §4.6 cache posture and the mount route (`docs/wip/virtiofs.md` §8 item 7), chaos over three writers. A DAX sharer
+/// maps a file's windows `MAP_SHARED` and its guest writes through them while the same file changes by other paths,
+/// so one mount's map, another mount's cache and slates itself must agree after every write. Do: map a file of
+/// [`THREE_WRITER_PAGES`] pages through one mount, open it through a second mount of the same volume, and run
+/// [`THREE_WRITER_STEPS`] generated writes, each one of: bytes through the map, `msync`ed; bytes at an offset through
+/// the second mount, synced; the whole file through the SDK. Expect after every write: slates' own read equals a byte
+/// model at once, and the map and the second mount come to it within [`WAIT_FOR`] — on Linux the map as memory alone,
+/// so each FUSE mount must be told of the other mount's writes and the SDK's; on macOS after a `stat`, as NFS v3
+/// allows. Each writer must have acted (the non-vacuity count). The file's length never changes: a shrink under a
+/// live map would make touching it a `SIGBUS`.
+#[test]
+fn a_shared_map_a_second_mount_and_the_sdk_agree_with_the_volume_through_a_generated_history() {
+  if !live_mount_runs() {
+    return;
+  }
+  let mut fixture = MappedThroughAMount::with_pages("mapthree", 0, THREE_WRITER_PAGES);
+  let second = fixture.mount_again();
+  let mut model = vec![0u8; fixture.length];
+  let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+  let mut acted = [0u32; 3];
+  for step in 0..THREE_WRITER_STEPS {
+    let write = GeneratedWrite::next(&mut state, fixture.length);
+    match &write {
+      GeneratedWrite::Map { offset, bytes } => fixture.write_through_map(*offset, bytes),
+      GeneratedWrite::SecondMount { offset, bytes } => second.write_at(*offset, bytes),
+      GeneratedWrite::Sdk { bytes } => fixture.replace_with(bytes),
+    }
+    write.apply_to(&mut model);
+    acted[write.writer()] += 1;
+    let what = match &write {
+      GeneratedWrite::Map { offset, bytes } => format!("map write of {} at {offset}", bytes.len()),
+      GeneratedWrite::SecondMount { offset, bytes } => {
+        format!("second-mount write of {} at {offset}", bytes.len())
+      }
+      GeneratedWrite::Sdk { .. } => "SDK replacement".to_owned(),
+    };
+    assert!(
+      fixture.volume_bytes() == model,
+      "step {step}, {what}: slates' own read differs from the model"
+    );
+    assert!(
+      fixture.follows_bytes(&model),
+      "step {step}, {what}: the map did not come to the model within {WAIT_FOR:?}"
+    );
+    assert!(
+      second.follows(&model),
+      "step {step}, {what}: the second mount did not come to the model within {WAIT_FOR:?}"
+    );
+  }
+  assert!(
+    acted.iter().all(|count| *count > 0),
+    "every writer acted (map, second mount, SDK): {acted:?}"
   );
 }
 
