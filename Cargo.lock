@@ -1426,6 +1426,7 @@ dependencies = [
  "slates-bridge-oci",
  "slates-client",
  "slates-db",
+ "slates-guest-probe",
  "slates-ipc",
  "slates-machine",
  "slates-mcp",
@@ -1494,6 +1495,13 @@ dependencies = [
  "slates-rt",
  "slates-test-seeds",
  "slates-wire",
+]
+
+[[package]]
+name = "slates-guest-probe"
+version = "0.1.0"
+dependencies = [
+ "rustix",
 ]
 
 [[package]]

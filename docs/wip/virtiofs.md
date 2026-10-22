@@ -311,8 +311,18 @@ box shared with two other builds — timings are not benchmarks)
    Every page agreed at the end through the second mount and through slates itself. The run also found that every
    change dropped the whole file from the kernel's cache, and so from the guest's map: each one-byte change to a 128 MiB
    file made the guest's next scan take 356–382 ms against 0.2–0.3 ms warm. Fixed by A-146, which drops only the bytes a
-   change touched. The guest side was a static C `/init` and the host side a shell driver, kept outside the tree; a gated
-   test that runs them is owed (GAPS).
+   change touched.
+
+   **The run is now a gated test** (`crates/cli/tests/guest_dax.rs`,
+   `a_guest_maps_a_slates_mount_with_dax_and_holds_the_latest_write_to_every_byte`). The guest's `/init` is the static
+   `slates-guest-probe` (`crates/guest-probe`), which answers a line protocol over the serial console. The test writes
+   the initramfs into a second slates volume, so nothing touches disk. Over three fixed-seed files it runs a generated
+   history: the guest's unsynced stores and its syncs, and another mount's writes, each waited for in the guest's map as
+   memory alone. At each check, every byte of the volume, read through slates itself, and of the guest's map must hold
+   the latest write to it from either side. Green 4 of 4 on the box, 3.0–4.0 s each. With the write-back rule disabled
+   it fails: "the other path's write of 130 at [28033, 28033 + 4735) did not reach the guest's map at 28033:
+   TimedOut { seen: 15 }", a guest byte having reverted it. It needs crosvm, a DAX-capable guest kernel and the probe
+   named in the environment, and skips loudly without them, so CI's lanes skip it.
 
    Still owed: Shards' DAX window over the macOS mount, and Firecracker's disk-image form. crosvm has prior art for the
    latter: its experimental `--pmem-ext2` builds an ext2 file system in memory from a host directory and presents it to

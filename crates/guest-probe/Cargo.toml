@@ -1,0 +1,20 @@
+[package]
+name = "slates-guest-probe"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+publish = false
+description = "A Linux VM guest's /init for the mount-route tests: it mounts the slates volume a VMM shares in over virtio-fs, maps a file through the DAX window, and answers the host's commands over the serial console (docs/wip/virtiofs.md §8 item 7). Test infrastructure; never runs on a host and never ships."
+
+[[bin]]
+name = "slates-guest-probe"
+path = "src/main.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true, features = ["stdio", "termios"] }
+
+[lints]
+workspace = true

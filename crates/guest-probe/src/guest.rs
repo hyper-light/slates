@@ -1,0 +1,355 @@
+//! The guest's `/init` (Linux; `docs/wip/virtiofs.md` §8 item 7). It mounts what a kernel needs and takes the console
+//! as its standard streams in raw mode, so a command arrives as the host sent it and is never echoed into the replies.
+//! It mounts the virtio-fs tag the VMM shares in, with the DAX option the kernel command line asks for. Then it answers
+//! the host's commands ([`slates_guest_probe::protocol`]) one line at a time until told to quit, and powers the VM off.
+//!
+//! It never returns: as the first process, a return would panic the guest's kernel. A command it cannot carry out is
+//! answered [`Reply::Refused`]; when nothing can go on, it says [`Reply::Fatal`] and powers off.
+//!
+//! The map's bytes are read and written as volatile memory accesses, so each happens where the command says. A wait
+//! polls the map's memory alone (the vDSO's clock is no system call): seeing another path's write that way is what DAX
+//! through a mount has to provide.
+
+use std::ffi::{CStr, CString};
+use std::io::Write;
+use std::os::fd::OwnedFd;
+
+use rustix::fs::{AtFlags, Mode, OFlags, StatxAttributes, StatxFlags};
+use rustix::mm::{MapFlags, MsyncFlags, ProtFlags};
+use rustix::mount::{MountFlags, UnmountFlags};
+use rustix::system::RebootCommand;
+use rustix::termios::OptionalActions;
+use rustix::time::ClockId;
+use slates_guest_probe::protocol::{Command, LONGEST_COMMAND, Reply};
+
+/// Format: where the guest mounts the shared tag.
+const MOUNT_POINT: &str = "/mnt";
+/// Format: the console the kernel gives the first process.
+const CONSOLE: &str = "/dev/console";
+/// Format: the kernel command line's key naming the virtio-fs tag to mount.
+const TAG_KEY: &str = "slates.tag=";
+/// Format: the kernel command line's key naming the `dax=` mount option (`always`, `never`, `inode`).
+const DAX_KEY: &str = "slates.dax=";
+/// Format: the tag mounted when the command line names none.
+const DEFAULT_TAG: &str = "slates";
+/// Shape: the most of the kernel command line read: x86_64's own limit is 2,048 bytes.
+const LONGEST_CMDLINE: usize = 4096;
+/// Shape: the bytes the console is read in at a time.
+const CONSOLE_CHUNK: usize = 256;
+/// Format: microseconds in a millisecond.
+const MICROS_PER_MILLI: u64 = 1_000;
+/// Format: microseconds in a second.
+const MICROS_PER_SECOND: u64 = 1_000_000;
+/// Format: nanoseconds in a microsecond.
+const NANOS_PER_MICRO: u64 = 1_000;
+
+/// Runs the guest; never returns.
+pub(crate) fn run() -> ! {
+  if let Err(fatal) = serve() {
+    // The power-off below is the report if this line cannot be written either.
+    if say(&Reply::Fatal(fatal)).is_err() {
+      eprintln!("slates-guest-probe: the console is gone");
+    }
+  }
+  power_off()
+}
+
+/// Takes the console, mounts the tag, and answers commands until told to quit.
+fn serve() -> Result<(), String> {
+  attach_console()?;
+  mount_tag(&kernel_command_line()?)?;
+  say(&Reply::Ready)?;
+  let mut map: Option<SharedMap> = None;
+  let mut console = LineReader::default();
+  loop {
+    let line = console.next_line()?;
+    let reply = match Command::parse(&line) {
+      Ok(Command::Quit) => break,
+      Ok(command) => execute(command, &mut map),
+      Err(refusal) => Reply::Refused(refusal.to_string()),
+    };
+    say(&reply)?;
+  }
+  drop(map);
+  rustix::fs::sync();
+  rustix::mount::unmount(MOUNT_POINT, UnmountFlags::empty())
+    .map_err(|e| format!("unmount {MOUNT_POINT}: {e}"))?;
+  say(&Reply::Done)
+}
+
+/// One command, carried out against the map.
+fn execute(command: Command, map: &mut Option<SharedMap>) -> Reply {
+  match command {
+    Command::Map { path, pages } => match SharedMap::open(&path, pages) {
+      Ok((made, dax)) => {
+        *map = Some(made);
+        Reply::Mapped { dax }
+      }
+      Err(refusal) => Reply::Refused(refusal),
+    },
+    other => match map.as_ref() {
+      Some(mapped) => mapped.answer(other),
+      None => Reply::Refused("no map has been made".to_owned()),
+    },
+  }
+}
+
+/// Mounts a pseudo-filesystem the guest needs.
+fn mount_pseudo(source: &str, target: &str, kind: &str) -> Result<(), String> {
+  rustix::mount::mount(source, target, kind, MountFlags::empty(), None::<&CStr>)
+    .map_err(|e| format!("mount {kind} at {target}: {e}"))
+}
+
+/// Mounts `/dev`, makes the console the standard streams in raw mode, and mounts `/proc` and `/sys`.
+fn attach_console() -> Result<(), String> {
+  mount_pseudo("dev", "/dev", "devtmpfs")?;
+  // structural: allow — the guest's console device, opened for its two directions; this runs only in a VM guest.
+  let console = rustix::fs::open(CONSOLE, OFlags::RDWR | OFlags::NOCTTY, Mode::empty())
+    .map_err(|e| format!("open {CONSOLE}: {e}"))?;
+  rustix::stdio::dup2_stdin(&console).map_err(|e| format!("console as stdin: {e}"))?;
+  rustix::stdio::dup2_stdout(&console).map_err(|e| format!("console as stdout: {e}"))?;
+  rustix::stdio::dup2_stderr(&console).map_err(|e| format!("console as stderr: {e}"))?;
+  let mut terminal =
+    rustix::termios::tcgetattr(&console).map_err(|e| format!("console attributes: {e}"))?;
+  terminal.make_raw();
+  rustix::termios::tcsetattr(&console, OptionalActions::Now, &terminal)
+    .map_err(|e| format!("raw console: {e}"))?;
+  mount_pseudo("proc", "/proc", "proc")?;
+  mount_pseudo("sys", "/sys", "sysfs")
+}
+
+/// The kernel command line, up to [`LONGEST_CMDLINE`] bytes.
+fn kernel_command_line() -> Result<String, String> {
+  let file = rustix::fs::open("/proc/cmdline", OFlags::RDONLY, Mode::empty())
+    .map_err(|e| format!("open /proc/cmdline: {e}"))?;
+  let mut text = [0u8; LONGEST_CMDLINE];
+  let read = rustix::io::read(&file, &mut text).map_err(|e| format!("read /proc/cmdline: {e}"))?;
+  Ok(String::from_utf8_lossy(text.get(..read).unwrap_or_default()).into_owned())
+}
+
+/// The value of `key` on the kernel command line, if it is there.
+fn option<'c>(cmdline: &'c str, key: &str) -> Option<&'c str> {
+  cmdline
+    .split_whitespace()
+    .find_map(|word| word.strip_prefix(key))
+}
+
+/// Mounts the virtio-fs tag at [`MOUNT_POINT`], with the DAX option the command line names.
+fn mount_tag(cmdline: &str) -> Result<(), String> {
+  let tag = option(cmdline, TAG_KEY).unwrap_or(DEFAULT_TAG);
+  let data = option(cmdline, DAX_KEY)
+    .map(|mode| CString::new(format!("dax={mode}")))
+    .transpose()
+    .map_err(|e| format!("the dax option: {e}"))?;
+  rustix::mount::mount(
+    tag,
+    MOUNT_POINT,
+    "virtiofs",
+    MountFlags::empty(),
+    data.as_deref(),
+  )
+  .map_err(|e| format!("mount virtiofs tag {tag} at {MOUNT_POINT}: {e}"))
+}
+
+/// Writes one reply line to the console.
+fn say(reply: &Reply) -> Result<(), String> {
+  let mut out = std::io::stdout().lock();
+  writeln!(out, "{}", reply.encode())
+    .and_then(|()| out.flush())
+    .map_err(|e| format!("the console: {e}"))
+}
+
+/// The monotonic clock in microseconds (through the vDSO, so a wait's poll makes no system call).
+fn now_micros() -> u64 {
+  let now = rustix::time::clock_gettime(ClockId::Monotonic);
+  let seconds = u64::try_from(now.tv_sec).unwrap_or(0);
+  let nanos = u64::try_from(now.tv_nsec).unwrap_or(0);
+  seconds
+    .saturating_mul(MICROS_PER_SECOND)
+    .saturating_add(nanos / NANOS_PER_MICRO)
+}
+
+/// Syncs and powers the VM off. If the kernel refuses, the guest parks for good rather than return.
+fn power_off() -> ! {
+  rustix::fs::sync();
+  if let Err(refused) = rustix::system::reboot(RebootCommand::PowerOff) {
+    eprintln!("slates-guest-probe: power-off refused: {refused}");
+  }
+  loop {
+    std::thread::park();
+  }
+}
+
+/// The console's lines, read in chunks and split at either line ending.
+#[derive(Default)]
+struct LineReader {
+  pending: Vec<u8>,
+}
+
+impl LineReader {
+  /// The next non-empty line, without its line ending. A line longer than [`LONGEST_COMMAND`] is refused, as is a
+  /// console that closes.
+  fn next_line(&mut self) -> Result<String, String> {
+    loop {
+      if let Some(end) = self
+        .pending
+        .iter()
+        .position(|byte| *byte == b'\n' || *byte == b'\r')
+      {
+        let line: Vec<u8> = self.pending.drain(..=end).collect();
+        let text = String::from_utf8_lossy(line.get(..end).unwrap_or_default()).into_owned();
+        if !text.trim().is_empty() {
+          return Ok(text);
+        }
+        continue;
+      }
+      if self.pending.len() > LONGEST_COMMAND {
+        return Err(format!(
+          "a command line longer than {LONGEST_COMMAND} bytes"
+        ));
+      }
+      let mut chunk = [0u8; CONSOLE_CHUNK];
+      let read = rustix::io::read(rustix::stdio::stdin(), &mut chunk)
+        .map_err(|e| format!("the console: {e}"))?;
+      if read == 0 {
+        return Err("the console closed".to_owned());
+      }
+      self
+        .pending
+        .extend_from_slice(chunk.get(..read).unwrap_or_default());
+    }
+  }
+}
+
+/// A file of the shared tag, mapped shared for reading and writing; unmapped on drop, before the file closes.
+struct SharedMap {
+  base: *mut u8,
+  /// The bytes mapped: a whole number of pages.
+  len: usize,
+  /// Held so the map's file stays open; it closes after `Drop` unmaps.
+  _file: OwnedFd,
+}
+
+impl SharedMap {
+  /// Opens `path` under the mount and maps its first `pages` pages shared. Says whether the kernel serves the file's
+  /// inode in DAX mode.
+  fn open(path: &str, pages: u64) -> Result<(SharedMap, bool), String> {
+    let full = format!("{MOUNT_POINT}/{}", path.trim_start_matches('/'));
+    // structural: allow — a file of the slates volume a VMM shares into this guest; this binary never runs on a host.
+    let file = rustix::fs::open(full.as_str(), OFlags::RDWR | OFlags::CLOEXEC, Mode::empty())
+      .map_err(|e| format!("open {full}: {e}"))?;
+    let dax = rustix::fs::statx(&file, c"", AtFlags::EMPTY_PATH, StatxFlags::BASIC_STATS)
+      .map(|stat| stat.stx_attributes.contains(StatxAttributes::DAX))
+      .map_err(|e| format!("statx {full}: {e}"))?;
+    let len = usize::try_from(pages)
+      .ok()
+      .and_then(|pages| pages.checked_mul(rustix::param::page_size()))
+      .filter(|len| *len > 0)
+      .ok_or_else(|| format!("{pages} pages is no map this guest can make"))?;
+    // SAFETY: a fresh shared map of `len` bytes of the open `file`, at an address the kernel chooses; nothing else maps
+    // it here, and `Drop` unmaps it before `file` closes.
+    let base = unsafe {
+      rustix::mm::mmap(
+        std::ptr::null_mut(),
+        len,
+        ProtFlags::READ | ProtFlags::WRITE,
+        MapFlags::SHARED,
+        &file,
+        0,
+      )
+    }
+    .map_err(|e| format!("mmap {full}: {e}"))?;
+    Ok((
+      SharedMap {
+        base: base.cast::<u8>(),
+        len,
+        _file: file,
+      },
+      dax,
+    ))
+  }
+
+  /// The map's offsets `[at, at + len)`, refused unless they lie within it.
+  fn span(&self, at: u64, len: u64) -> Result<std::ops::Range<usize>, String> {
+    let start = usize::try_from(at).map_err(|_| format!("offset {at} is out of range"))?;
+    let len = usize::try_from(len).map_err(|_| format!("length {len} is out of range"))?;
+    let end = start
+      .checked_add(len)
+      .filter(|end| *end <= self.len)
+      .ok_or_else(|| {
+        format!(
+          "[{at}, {at} + {len}) is outside the {} mapped bytes",
+          self.len
+        )
+      })?;
+    Ok(start..end)
+  }
+
+  /// The byte at `offset`, which [`SharedMap::span`] has bounded.
+  fn byte_at(&self, offset: usize) -> u8 {
+    // SAFETY: `offset` is below `self.len` (bounded by `span`), so the byte lies inside the live map made in `open`; a
+    // volatile read, so it reads the page the kernel maps now.
+    unsafe { self.base.add(offset).read_volatile() }
+  }
+
+  /// A store, a sync, a read or a wait against the map.
+  fn answer(&self, command: Command) -> Reply {
+    let answered = match command {
+      Command::Store { at, len, byte } => self.store(at, len, byte),
+      Command::Sync => self.sync(),
+      Command::Read { at, len } => self
+        .span(at, len)
+        .map(|offsets| Reply::Bytes(offsets.map(|offset| self.byte_at(offset)).collect())),
+      Command::Wait { at, byte, millis } => self
+        .span(at, 1)
+        .map(|offsets| self.wait(offsets.start, byte, millis)),
+      Command::Map { .. } | Command::Quit => {
+        Err("a map or a quit is not asked of a map".to_owned())
+      }
+    };
+    answered.unwrap_or_else(Reply::Refused)
+  }
+
+  /// Stores `byte` into `[at, at + len)`, leaving the pages dirty.
+  fn store(&self, at: u64, len: u64, byte: u8) -> Result<Reply, String> {
+    for offset in self.span(at, len)? {
+      // SAFETY: `offset` is within `span`'s bounds, inside the live, writable map made in `open`; a volatile store, so
+      // it is made here, into the page the kernel maps.
+      unsafe { self.base.add(offset).write_volatile(byte) };
+    }
+    Ok(Reply::Done)
+  }
+
+  /// `msync`s the whole map: its dirty bytes are written back before this returns, or the refusal says why not.
+  fn sync(&self) -> Result<Reply, String> {
+    // SAFETY: syncs exactly the live map made in `open`.
+    unsafe { rustix::mm::msync(self.base.cast(), self.len, MsyncFlags::SYNC) }
+      .map(|()| Reply::Done)
+      .map_err(|e| format!("msync: {e}"))
+  }
+
+  /// Polls the byte at `offset`, memory alone, until it holds `byte` or `millis` pass.
+  fn wait(&self, offset: usize, byte: u8, millis: u64) -> Reply {
+    let started = now_micros();
+    let limit = millis.saturating_mul(MICROS_PER_MILLI);
+    loop {
+      let seen = self.byte_at(offset);
+      let elapsed = now_micros().saturating_sub(started);
+      if seen == byte {
+        return Reply::Waited { micros: elapsed };
+      }
+      if elapsed >= limit {
+        return Reply::TimedOut { seen };
+      }
+    }
+  }
+}
+
+impl Drop for SharedMap {
+  fn drop(&mut self) {
+    // SAFETY: unmaps exactly the map made in `open`, once; nothing reads it afterwards, and the file closes after.
+    if let Err(e) = unsafe { rustix::mm::munmap(self.base.cast(), self.len) } {
+      eprintln!("slates-guest-probe: munmap: {e}");
+    }
+  }
+}

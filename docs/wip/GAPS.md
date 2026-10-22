@@ -10792,9 +10792,13 @@ without a user namespace, which needs root.
 - **Measured, not explained.** With the host's writer making 4,096 single-byte writes to a page, 79,544 bytes were kept
   back from write-backs. With one write per range, exactly the 2,048 bytes the other path overwrote on a dirty page were
   kept back. The end state was right in both runs.
+- **The run is a gated test now** (`crates/cli/tests/guest_dax.rs`, with the guest's `/init` in `crates/guest-probe`).
+  A generated history of guest stores, guest syncs and another mount's writes, over three fixed-seed files, is held at
+  every check to the latest write to each byte, through slates and through the guest's map. Green 4 of 4 on the box;
+  red with the write-back rule disabled (`TimedOut { seen: 15 }`: a guest byte had reverted the other path's write).
+  CI does not run it: it needs crosvm, a DAX-capable guest kernel and the probe named in the environment, and skips
+  loudly without them.
 - **Owed:**
-  - a gated test that runs a guest over the mount (the run used a static C `/init` and a shell driver, kept in
-    `BENCHMARKS.md`);
   - Shards' DAX window over the macOS mount;
   - Firecracker's disk-image form. crosvm's experimental `--pmem-ext2` is prior art: it builds an ext2 file system in
     memory from a host directory and presents it on a pmem device.

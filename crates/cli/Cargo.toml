@@ -58,6 +58,8 @@ slates-archive = { workspace = true }
 rcgen = { workspace = true }
 # The RPC-with-TLS client a node's NFS client stands in for in the anchored export test (§4.6, AUD-29-75).
 rustls = { workspace = true }
+# The line protocol the guest's /init speaks, for the guest-over-the-mount test (`tests/guest_dax.rs`).
+slates-guest-probe = { workspace = true }
 
 [lints]
 workspace = true

@@ -344,3 +344,8 @@ slates-bridge-oci = 1
 slates-conformance = 0
 # slates-test-seeds (0): a proptest persistence over compiled seed text; no FFI, no I/O.
 slates-test-seeds = 0
+# slates-guest-probe (5): a VM guest's /init for the mount-route tests (2026-10-22; docs/wip/virtiofs.md §8 item 7),
+# which never runs on a host. Its shared map of a file the VMM shares in: the `mmap`, the `munmap` on drop, the
+# `msync`, and one volatile read and one volatile write of a byte the map's bounds check has placed inside it. rustix's
+# map calls are unsafe by signature, and DAX is reached only through the map; the protocol it speaks is pure.
+slates-guest-probe = 5
