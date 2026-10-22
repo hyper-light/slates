@@ -103,6 +103,15 @@ const RESENT: &str = "fuse.resent";
 /// reading; any movement means this mount's `Invalidated` posture is not being honoured by the kernel it is
 /// talking to (`docs/bugs/2026-10-19-linux-6-19-refuses-the-entry-invalidation-slates-swallows.md`).
 const ENTRY_INVALIDATION_REFUSED: &str = "fuse.entry_invalidation_refused";
+/// Format: bytes of cache write-backs kept back because another path changed them after the kernel last confirmed its
+/// cache — each a byte of a stale dirty page that would have undone a later write
+/// (`docs/bugs/2026-10-21-a-dirty-shared-map-page-overwrites-a-later-write-through-another-path.md`). The dirty-page
+/// write-back rule's non-vacuity count: it moves only when the rule protected a write.
+const WRITEBACK_BYTES_KEPT_BACK: &str = "fuse.writeback_bytes_kept_back";
+/// Format: cache write-backs refused `EIO` because the journal no longer held every change since the kernel's confirmed
+/// point, so which bytes were stale could not be told. Zero is the healthy reading; movement means a round stalled
+/// while more changes arrived than the journal retains.
+const WRITEBACKS_UNKNOWN: &str = "fuse.writebacks_unknown";
 /// Format: see [`MOUNT_REFUSED`] — resent requests answered from the reply their dead daemon published and never
 /// delivered (A-61); the exact replay's non-vacuity counter.
 const REPLAYED: &str = "fuse.replayed";
@@ -722,6 +731,10 @@ fn turn(s: &mut ShardState, attachment: u64, kind: TurnKind) -> Turned {
   // never silent — CLAUDE.md #9.
   let refused = mount.serve.take_entry_invalidations_refused();
   s.count(ENTRY_INVALIDATION_REFUSED, refused);
+  let kept_back = mount.serve.take_writeback_bytes_kept_back();
+  s.count(WRITEBACK_BYTES_KEPT_BACK, kept_back);
+  let unknown = mount.serve.take_writebacks_unknown();
+  s.count(WRITEBACKS_UNKNOWN, unknown);
   // What a delivering turn delivered is behind it — the owed round, and any change it made itself, which its own
   // kernel needs no notice of — so the task parks past the generation as it now stands. Any other path's change after
   // this point moves the generation again and wakes it.
@@ -842,7 +855,7 @@ fn reclaim(s: &mut ShardState, mount: &mut FuseMount, dispatched: &Dispatched) {
   );
   let mut scoped = None;
   let reclaimed = reclaim_dispatched(
-    &mount.serve,
+    &mut mount.serve,
     dispatched,
     scoped_or_whole(&mut bridge, &mut scoped, mount.scope),
     attachments,
@@ -910,13 +923,18 @@ fn log_write(s: &mut ShardState, dispatched: &Dispatched) {
   if dispatched.opcode != Some(slates_bridge_fuse::Opcode::Write) || dispatched.error != 0 {
     return;
   }
-  let Some((offset, data)) = dispatched.written() else {
-    return;
-  };
-  let appended = match (s.write_log.as_mut(), s.content.as_mut()) {
-    (Some(log), Some(object)) => log.append(object, dispatched.nodeid(), offset, data),
-    _ => return,
-  };
+  // What the write applied: the whole write, or for a cache write-back the parts outside the bytes another path had
+  // changed since (the dirty-page write-back rule), so a recovery never replays bytes the volume refused.
+  let mut appended = Ok(());
+  for (offset, data) in dispatched.written() {
+    appended = match (s.write_log.as_mut(), s.content.as_mut()) {
+      (Some(log), Some(object)) => log.append(object, dispatched.nodeid(), offset, data),
+      _ => return,
+    };
+    if appended.is_err() {
+      break;
+    }
+  }
   let logged = match appended {
     Ok(()) => true,
     Err(crate::write_log::Refused::Full) => {

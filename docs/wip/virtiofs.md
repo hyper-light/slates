@@ -273,11 +273,14 @@ box shared with two other builds — timings are not benchmarks)
    the map, the second mount and slates' own read agree after every write, on Linux (the map as memory alone, so each
    FUSE mount is told of the other's writes) and on macOS (after a `stat`)
    (`a_shared_map_a_second_mount_and_the_sdk_agree_with_the_volume_through_a_generated_history`). That history
-   `msync`s each map write before the next writer acts. **Without the sync it fails, on both platforms (open):** a
-   store left dirty in a mount's map — which is what a guest's DAX stores are on the host — is written back over a
-   later write through another path, and the other write's bytes on that page revert, including bytes the map never
-   touched (`docs/bugs/2026-10-21-a-dirty-shared-map-page-overwrites-a-later-write-through-another-path.md`). The fix
-   is a recall before the other path's write, which only NFSv4 delegations have today; it is Ada's call. **On macOS it does not and cannot, over NFS v3:** the client cannot be
+   `msync`s each map write before the next writer acts. Without the sync it first failed on both platforms: a store
+   left dirty in a mount's map, which is what a guest's DAX stores are on the host, was written back over a later write
+   through another path, and the other write's bytes on that page reverted, including bytes the map never touched.
+   **Fixed on Linux (A-139):** a cache write-back is applied except over bytes another path changed after the page was
+   fetched, and the history with the map's stores left unsynced for generated stretches now agrees at every sync point
+   (`unsynced_map_stores_a_second_mount_and_the_sdk_agree_at_every_sync_point`). **macOS stays open:** NFS v3 has no
+   write-back mark and no callback, so the server cannot tell a stale page from a new write. That is Ada's call
+   (`docs/bugs/2026-10-21-a-dirty-shared-map-page-overwrites-a-later-write-through-another-path.md`). **On macOS it does not and cannot, over NFS v3:** the client cannot be
    told of a change, and a memory-only reader refreshes only when something makes the client revalidate (seen both
    never in 8 s and at 0.88 s); a `stat` of the file — what a guest's attribute request becomes on the host — makes it
    follow at once. So DAX through a mount on macOS sees host-side changes on the guest's next attribute refresh, not

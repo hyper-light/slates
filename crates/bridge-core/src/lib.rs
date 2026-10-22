@@ -23,6 +23,7 @@
 pub mod access;
 pub mod appledouble;
 pub mod authority;
+pub mod changed;
 pub mod links;
 pub mod scoped;
 pub mod volume_bridge;
@@ -30,6 +31,7 @@ pub mod volume_bridge;
 pub use authority::{
   AttachmentId, Attachments, Barrier, CacheCoherence, ObjectId, OpContext, Rights, View,
 };
+pub use changed::{Changed, TO_THE_END};
 pub use volume_bridge::{LostWrites, VolumeBridge, new_handle_store};
 
 use slates_vfs::error::VfsError;
@@ -612,5 +614,25 @@ pub trait Bridge {
   /// nothing yet.
   fn seen(&mut self, _cx: &OpContext) -> InvalidationCursor {
     InvalidationCursor::default()
+  }
+  /// The bytes of `ino` that changed after journal sequence `since` other than through the transport named by `cx`,
+  /// whose own records' sequences lie in `own` (ascending, disjoint spans): where a page its kernel writes back from
+  /// cache is stale ([`changed`], §4.6 "Cache posture"). [`Changed::Unknown`] when the journal no longer holds every
+  /// record since `since`. The default reports nothing changed, as [`Bridge::invalidations`]' does, for a bridge that
+  /// changes only through its own transport.
+  fn changed_since(
+    &mut self,
+    _cx: &OpContext,
+    _since: u64,
+    _ino: u64,
+    _own: &[std::ops::Range<u64>],
+  ) -> Result<Changed, VfsError> {
+    Ok(Changed::Known(Vec::new()))
+  }
+  /// The most journal records the volume ever retains ([`slates_vfs::journal::OpLog::capacity`]): a transport that
+  /// keeps spans of its own records' sequences keeps no more than this, since more are more than the journal can still
+  /// be asked about. The default, zero, is a bridge with no journal.
+  fn journal_capacity(&mut self, _cx: &OpContext) -> usize {
+    0
   }
 }

@@ -13,5 +13,10 @@ slates-vfs = { workspace = true }
 slates-db = { workspace = true }
 slates-mem = { workspace = true }
 
+[dev-dependencies]
+# The dirty-page write-back walk's oracle (`src/changed.rs`): generated histories against a per-byte model.
+proptest = { workspace = true }
+slates-test-seeds = { workspace = true }
+
 [lints]
 workspace = true

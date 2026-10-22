@@ -5549,6 +5549,16 @@ impl MappedThroughAMount {
     assert!(synced.is_ok(), "the map's write is flushed: {synced:?}");
   }
 
+  /// `msync`s the whole map, so every page it dirtied is written back before this returns. Linux only, as the tests that
+  /// leave a map's stores unsynced are.
+  #[cfg(target_os = "linux")]
+  fn sync_map(&mut self) {
+    // SAFETY: syncs exactly the live map made in `with_pages`.
+    let synced =
+      unsafe { rustix::mm::msync(self.map.cast(), self.length, rustix::mm::MsyncFlags::SYNC) };
+    assert!(synced.is_ok(), "the map is flushed: {synced:?}");
+  }
+
   /// `map.bin` as slates itself holds it, read through the fixture's SDK client: no mount's cache in the way.
   fn volume_bytes(&mut self) -> Vec<u8> {
     self
@@ -5618,6 +5628,15 @@ impl SecondMount {
       .file
       .write_all_at(bytes, u64::try_from(offset).unwrap())
       .unwrap();
+    self.file.sync_data().unwrap();
+  }
+
+  /// Truncates (or extends) the file to `len` through this mount and syncs it, so the change has reached slates when
+  /// this returns. Linux only, as the test that uses it is.
+  #[cfg(target_os = "linux")]
+  #[allow(clippy::disallowed_methods)] // the test's own call through the slates mount: RAM, not disk
+  fn truncate(&self, len: u64) {
+    self.file.set_len(len).unwrap();
     self.file.sync_data().unwrap();
   }
 
@@ -5858,6 +5877,137 @@ fn a_shared_map_a_second_mount_and_the_sdk_agree_with_the_volume_through_a_gener
   assert!(
     acted.iter().all(|count| *count > 0),
     "every writer acted (map, second mount, SDK): {acted:?}"
+  );
+}
+
+/// §4.6 cache posture, the mount route's dirty pages
+/// (`docs/bugs/2026-10-21-a-dirty-shared-map-page-overwrites-a-later-write-through-another-path.md`). A store through a
+/// shared map leaves its page dirty in that mount's cache until the kernel writes it back — which is what a guest's DAX
+/// stores are on the host — and a write another path made meanwhile must not be undone by that write-back. Do: store a
+/// byte through the map and leave it unsynced; replace the whole file through the SDK; sync the map. Expect every byte
+/// the replacement's, in slates and in the map. Then store again, write other bytes of the same page through a second
+/// mount, sync. Expect both: the store and the second mount's bytes, as one shared page cache would hold them.
+///
+/// Linux only. An NFS v3 client cannot be told of the other write and its write-back carries no mark, so on macOS the
+/// later write is lost (measured; the bug record says what deciding it needs).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path() {
+  if !live_mount_runs() {
+    return;
+  }
+  let mut fixture = MappedThroughAMount::with_pages("mapdirty", b'A', 2);
+  let second = fixture.mount_again();
+  let length = fixture.length;
+  fixture.view()[10] = b'M';
+  fixture.replace_through_slates(b'S');
+  fixture.sync_map();
+  assert!(
+    fixture.volume_bytes() == vec![b'S'; length],
+    "the later replacement survives the dirty page's write-back"
+  );
+  assert!(
+    fixture.follows(b'S'),
+    "the map reads the replacement within {WAIT_FOR:?}"
+  );
+  fixture.view()[10] = b'M';
+  let written = 100..200;
+  second.write_at(written.start, &vec![b'R'; written.len()]);
+  fixture.sync_map();
+  let mut expected = vec![b'S'; length];
+  expected[10] = b'M';
+  expected[written.clone()].fill(b'R');
+  assert!(
+    fixture.volume_bytes() == expected,
+    "the store and the second mount's later bytes on the same page are both kept"
+  );
+  assert!(
+    fixture.follows_bytes(&expected),
+    "the map reads both within {WAIT_FOR:?}"
+  );
+}
+
+/// The dirty-page write-back rule past a truncation (§4.6; the bug record above). A store left dirty in a page that a
+/// later truncation through another path cut off must not grow the file back when the kernel writes the page back: a
+/// map cannot extend a file, so that write-back is the page's stale copy. Do: store a byte in page 1 of a two-page map
+/// and leave it unsynced; truncate the file to one page through a second mount; sync the map. Expect the file still one
+/// page long in slates, its bytes untouched. Linux only, as above.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_dirty_page_past_a_truncation_never_grows_the_file_back() {
+  if !live_mount_runs() {
+    return;
+  }
+  let mut fixture = MappedThroughAMount::with_pages("mapshrink", b'A', 2);
+  let second = fixture.mount_again();
+  let page = fixture.page;
+  fixture.view()[page + 10] = b'M';
+  second.truncate(u64::try_from(page).unwrap());
+  fixture.sync_map();
+  let held = fixture.volume_bytes();
+  assert_eq!(
+    held.len(),
+    page,
+    "the truncation holds against the dirty page's write-back"
+  );
+  assert!(
+    held.iter().all(|byte| *byte == b'A'),
+    "the page that remains is untouched"
+  );
+}
+
+/// §4.6 cache posture, chaos over the dirty-page write-back rule: the three-writer history with the map's stores left
+/// unsynced for generated stretches, so dirty pages meet the other writers' changes — and Linux's write-back from a
+/// temporary copy meets their invalidations — at every interleaving the generator reaches. Do: run
+/// [`THREE_WRITER_STEPS`] generated writes as the synced history does, but `msync` the map only at generated sync points.
+/// Expect after every write that the map reads the byte model (a store is its own at once, and the others' changes
+/// reach it as memory alone); and at every sync point, and at the end, that slates' own read and the second mount equal
+/// it too: no store lost, no later write undone. Linux only, as above.
+#[cfg(target_os = "linux")]
+#[test]
+fn unsynced_map_stores_a_second_mount_and_the_sdk_agree_at_every_sync_point() {
+  if !live_mount_runs() {
+    return;
+  }
+  let mut fixture = MappedThroughAMount::with_pages("mapdirtychaos", 0, THREE_WRITER_PAGES);
+  let second = fixture.mount_again();
+  let mut model = vec![0u8; fixture.length];
+  let mut state: u64 = 0x6a09_e667_f3bc_c908;
+  let mut syncs = 0u32;
+  for step in 0..=THREE_WRITER_STEPS {
+    let last = step == THREE_WRITER_STEPS;
+    if !last {
+      let write = GeneratedWrite::next(&mut state, fixture.length);
+      match &write {
+        GeneratedWrite::Map { offset, bytes } => {
+          let end = offset + bytes.len();
+          fixture.view()[*offset..end].copy_from_slice(bytes);
+        }
+        GeneratedWrite::SecondMount { offset, bytes } => second.write_at(*offset, bytes),
+        GeneratedWrite::Sdk { bytes } => fixture.replace_with(bytes),
+      }
+      write.apply_to(&mut model);
+      assert!(
+        fixture.follows_bytes(&model),
+        "step {step}, {write:?}: the map did not come to the model within {WAIT_FOR:?}"
+      );
+    }
+    if last || xorshift(&mut state).is_multiple_of(3) {
+      syncs += 1;
+      fixture.sync_map();
+      assert!(
+        fixture.volume_bytes() == model,
+        "step {step}: after the sync, slates' own read differs from the model"
+      );
+      assert!(
+        second.follows(&model),
+        "step {step}: after the sync, the second mount did not come to the model within {WAIT_FOR:?}"
+      );
+    }
+  }
+  assert!(
+    syncs > 1,
+    "the history reached sync points between writes, not only at its end"
   );
 }
 

@@ -21,6 +21,10 @@ rustix = { workspace = true }
 [dev-dependencies]
 slates-db = { workspace = true }
 slates-vfs = { workspace = true }
+# The dirty-page write-back rule's fetch-point oracle (`src/coherence.rs`): generated fetch histories against a
+# per-byte model.
+proptest = { workspace = true }
+slates-test-seeds = { workspace = true }
 
 [lints]
 workspace = true

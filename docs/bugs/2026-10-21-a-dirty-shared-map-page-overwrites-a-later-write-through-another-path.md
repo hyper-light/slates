@@ -1,7 +1,7 @@
 # A dirty page in a mount's shared map is written back over a later write through another path
 
-**Status:** open. Root cause confirmed by measurement on Linux and macOS; the fix is a design decision (a recall
-before another path's write), so it is not built.
+**Status:** fixed on Linux FUSE (A-139). Open on macOS, where NFS v3 cannot carry the fix (below). Root cause
+confirmed by measurement on both platforms and in the Linux 6.12 source.
 **Severity:** loss of an acknowledged write. Bytes another path wrote, including bytes the map never touched,
 revert to their earlier value.
 **Found:** 2026-10-21, adversarial testing of the mount route for DAX (`docs/wip/virtiofs.md` §8 item 7).
@@ -70,27 +70,98 @@ Not affected:
 - `write()` through a FUSE mount (write-through).
 - An NFSv4 client holding a delegation (the recall gate).
 
-## What a fix needs (a design decision, for Ada)
+## The fix (A-139): a write-back is judged by when its page was fetched
 
-- **Linux FUSE: a recall before the write.** Take a write from another path to a file a FUSE mount may hold dirty
-  pages of; an open for writing on that mount is the conservative test.
-  1. Park the write.
-  2. Send the mount an invalidation of the range. The kernel writes dirty pages back during it; those are the
-     earlier writes, and they are applied first.
-  3. When that round completes, apply the parked write and invalidate again.
+A cache write-back is marked: every page-cache write-back carries `FUSE_WRITE_CACHE` in its `write_flags`, whether
+it is periodic, an `msync`, or the launder inside an invalidation (`fs/fuse/file.c:2081`). Its bytes are the kernel's
+copy of the page as it was fetched, plus the process's stores since. So they are stale exactly where another path
+changed the file after the daemon served that page's fetch. The mount's own writes since are the exception, because
+its own `write(2)` refreshed those bytes in its kernel.
 
-  A store between the round and the apply would dirty the page again (its fault reads the bytes from before the
-  write). So the mount's reads of a range under a parked write must wait for the apply too. The machinery, writers
-  parked on a FUSE mount's delivery, is the same that the open AC-3.3 question needs (`docs/wip/GAPS.md`,
-  2026-10-21).
-- **macOS NFS v3: no server-side fix exists.** A v3 client cannot be called back. Either the macOS mount moves to
-  NFSv4 with delegations, where the recall gate already does this (A-32 keeps it on v3 today), or a writable shared
-  map of a file other paths also write is recorded as unsupported on macOS.
+The mount applies the write-back everywhere else and answers the whole size: the volume then holds what one shared page
+cache would. In the parts:
+- **Fetch points.** While a file is open for writing on a mount, each READ served records the journal's head as the
+  fetch point of the bytes it returned (`FetchPoints`, `crates/bridge-fuse/src/coherence.rs`).
+- **A clean start.** A file's first writable open on the mount clears `FOPEN_KEEP_CACHE` from its reply, so the kernel
+  drops its cached pages as it opens it (`fs/fuse/file.c:279`). Every page cached after that has a known fetch, or was
+  written whole by the mount.
+- **The walk.** What changed after a point is a walk over the volume's journal (`crates/bridge-core/src/changed.rs`,
+  `Bridge::changed_since`): another path's write, truncation or shift adds its bytes, and the mount's own records clear
+  theirs. The mount knows its own records by bracketing each request it serves with the journal's head (`OwnRecords`).
+- **The log.** The daemon's write log records only the parts applied (`Dispatched::written`), so a recovery never
+  replays a stale byte.
+- **Refusal.** Where the journal no longer holds every change since a page's fetch, the write-back is refused `EIO`
+  rather than guessed (counted as `fuse.writebacks_unknown`). The bytes kept back are counted as
+  `fuse.writeback_bytes_kept_back`.
+- **Lifetime.** A file's fetch points go with its last writable handle. A write-back holds its file open until it is
+  answered, so the file's `RELEASE` comes after every write-back through it.
+
+**Measured-and-rejected: judging by invalidation rounds (the approved revision 2).** The first built version masked a
+write-back over the changes made after the mount's last *completed* invalidation round. The bug's test still failed
+**9 of 10 runs**. A temporary trace of each link showed the stale write-back arriving after its round had ended, with
+an empty mask, and applied whole. The cause is in Linux 6.12: FUSE writes a page back from a temporary copy and ends
+the page's write-back at once (`fs/fuse/file.c:2092`, `fuse_writepage_locked`; the batched path likewise). An
+invalidation that comes next finds the page clean, drops it without laundering (`mm/truncate.c:645–656`), and returns,
+while the stale copy is still queued. A round's end says nothing about write-backs in flight. A page's fetch point does.
+The one passing run had passed by timing: the store's page was written back before the replacement.
+
+**What remains, stated in the design.** A store into the very bytes another path is changing, made after its page was
+fetched and before the change is delivered, is kept back too. That is two writers racing on the same bytes. For
+writers that hold no kernel lock it closes once they are answered after delivery (AC-3.3, open in the ledger).
+
+**macOS (open, Ada's decision).** NFS v3 has no write-back mark and no callback, so the server cannot tell a stale
+write-back from a new write. The options are NFSv4 with delegations, where the recall gate already does this (the Mac
+client is v4.0, which D-2 rejects), or recording such sharing as unsupported on the Mac.
+
+## Verification (Linux arm64 container, 6 CPUs, fuse3; 2026-10-21)
+
+- **The bug's test**, `a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path`:
+  - green 25 runs of 25 (20 alone, 5 with the other mount-route tests);
+  - red 5 of 5 with the rule disabled (write-backs applied whole);
+  - under revision 2, the round-based mask, 1 of 10.
+- **Shrink**, `a_dirty_page_past_a_truncation_never_grows_the_file_back`: 5 of 5.
+- **Chaos**, `unsynced_map_stores_a_second_mount_and_the_sdk_agree_at_every_sync_point`: 5 of 5, with the synced
+  three-writer history and the two earlier mount-route tests likewise.
+- **Oracles, each red-checked:**
+  - the walk (`crates/bridge-core/src/changed.rs`, 2,000 generated histories against a per-byte model) fails when own
+    writes stop clearing;
+  - fetch points (`crates/bridge-fuse/src/coherence.rs`, 2,000 histories) fail when neighbours of different points
+    merge;
+  - the by-use walk (`crates/bridge-core/tests/changed_since.rs`) fails when the eviction check goes.
+- **Regression:** the `bridge-core`, `bridge-fuse` and `vfs` suites, `slates-server --test fuse_mount` (3 of 3) and the
+  recovery oracle (41 of 41), all green on Linux; the three crates' suites and the mount-route tests on macOS.
+- **One run in the red-check lost its fixture's mount**, not to the rule: `fusermount3` did not answer within the
+  helper's 10 s deadline on the loaded host, and slates refused the mount. That deadline under load is a separate
+  observation.
+
+## Exact edits
+
+- `crates/vfs/src/journal.rs`: `OpLog::oldest_seq` and `OpLog::capacity`; `since` uses the former.
+- `crates/bridge-core`:
+  - `src/changed.rs`, new: `Changed`, `TO_THE_END`, `changed_ranges`, and its oracle.
+  - `src/lib.rs`: `Bridge::changed_since` and `Bridge::journal_capacity`, with defaults.
+  - `src/volume_bridge.rs`: the implementations, `Unknown` past eviction.
+  - `src/scoped.rs`: delegation behind the scope check.
+  - `tests/changed_since.rs`, new.
+- `crates/bridge-fuse`:
+  - `src/abi.rs`: `WRITE_CACHE`.
+  - `src/request.rs`: `WriteIn::write_flags`.
+  - `src/bridge.rs`: `cache_writeback`, `unmasked_segments`, `serve_cache_write`, `refuse_with_eio`,
+    `granted_handle`, `created_node`, `opens_for_writing` and `clear_keep_cache`.
+  - `src/coherence.rs`: `OwnRecords`, `WritableOpens` and `FetchPoints`, with their tests.
+  - `src/channel.rs`: `dispatch_request`, `note_opens_and_fetches`, `forget_unreported_open`, `note_own_records`,
+    `serve_writeback` and `stale_in_writeback`; `Dispatched::written` returns the applied parts; `reclaim_dispatched`
+    takes the state mutably.
+  - `tests/writeback.rs`, new; `tests/owner_turn.rs` follows `reclaim_dispatched`.
+- `crates/server/src/fuse.rs`: `log_write` logs the applied parts; `fuse.writeback_bytes_kept_back` and
+  `fuse.writebacks_unknown` are drained after each turn.
+- `crates/cli/tests/cli.rs`: the three tests above; `MappedThroughAMount::sync_map`; `SecondMount::truncate`.
 
 ## Reproduction
 
-Over the `MappedThroughAMount` fixture in `crates/cli/tests/cli.rs` (`0106c51f`), with `SLATES_TEST_CLI=1`. The
-probe was run and removed; it lands as the fix's failing test.
+The probe, as it was run and removed, over the `MappedThroughAMount` fixture in `crates/cli/tests/cli.rs` (`0106c51f`),
+with `SLATES_TEST_CLI=1`. It landed as the fix's failing test,
+`a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path`.
 
 ```rust
 let mut fixture = MappedThroughAMount::with_pages("mapdirty", b'A', 2);

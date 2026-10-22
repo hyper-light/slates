@@ -1362,6 +1362,34 @@ impl Bridge for VolumeBridge<'_> {
     }
   }
 
+  fn changed_since(
+    &mut self,
+    cx: &OpContext,
+    since: u64,
+    ino: u64,
+    own: &[std::ops::Range<u64>],
+  ) -> Result<crate::Changed, VfsError> {
+    self.authorize_read(cx)?;
+    // A pinned view never sees a head change (as `invalidations` holds), so nothing its kernel caches goes stale.
+    if !matches!(cx.view, View::Current) {
+      return Ok(crate::Changed::Known(Vec::new()));
+    }
+    let log = self.volume.op_log();
+    // A record after `since` that retention evicted is a change nobody can name any more: unknown, not "none".
+    if since.saturating_add(1) < log.oldest_seq() {
+      return Ok(crate::Changed::Unknown);
+    }
+    Ok(crate::Changed::Known(crate::changed::changed_ranges(
+      log.since(since),
+      InodeNo(ino),
+      own,
+    )))
+  }
+
+  fn journal_capacity(&mut self, _cx: &OpContext) -> usize {
+    self.volume.op_log().capacity()
+  }
+
   fn change_token(&mut self, object: ObjectId, cx: &OpContext) -> Result<u64, VfsError> {
     self.authorize_read(cx)?;
     // A view changes whenever its owner's attributes or working copy do; the owner's version moves

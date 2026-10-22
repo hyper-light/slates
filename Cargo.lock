@@ -1323,8 +1323,10 @@ dependencies = [
 name = "slates-bridge-core"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "slates-db",
  "slates-mem",
+ "slates-test-seeds",
  "slates-vfs",
 ]
 
@@ -1343,12 +1345,14 @@ dependencies = [
 name = "slates-bridge-fuse"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "rustix",
  "slates-base",
  "slates-bridge-core",
  "slates-db",
  "slates-machine",
  "slates-mem",
+ "slates-test-seeds",
  "slates-vfs",
 ]
 

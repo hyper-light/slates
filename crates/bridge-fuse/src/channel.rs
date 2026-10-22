@@ -37,7 +37,7 @@ use rustix::fs::{Mode, OFlags};
 use crate::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
 use crate::allocate::{Allocation, Begun};
 use crate::bridge::Bridge;
-use crate::coherence::{Coherence, Delivered};
+use crate::coherence::{Coherence, Delivered, FetchPoints, OwnRecords, WritableOpens};
 use crate::dispatch;
 use crate::error::FuseError;
 use crate::init::negotiate;
@@ -535,6 +535,22 @@ pub struct ServeState {
   /// mount losing coherence is visible instead of silent (CLAUDE.md #9); read and cleared by the owner that
   /// reports it.
   entry_invalidations_refused: u64,
+  /// The journal records this mount's own requests made: the bytes they wrote are fresh in its kernel, so a later cache
+  /// write-back is not held stale there (the dirty-page write-back rule, [`dispatch_request`]).
+  own: OwnRecords,
+  /// The handles this mount's kernel holds open for writing: only their files can have dirty pages.
+  writable: WritableOpens,
+  /// When each cached page of a file open for writing was fetched, which is what a cache write-back is judged by.
+  fetched: FetchPoints,
+  /// The journal's head when this mount served its first request: the point a file with no record here is judged
+  /// from — one a restored mount's kernel opened before this daemon served it (A-61).
+  started_at: Option<u64>,
+  /// Bytes of cache write-backs kept back because another path changed them after the kernel's confirmed point, since
+  /// this was last read: the rule's non-vacuity count. Read and cleared by the owner that reports it.
+  writeback_bytes_kept_back: u64,
+  /// Cache write-backs refused `EIO` because the journal no longer held every change since the confirmed point, since
+  /// this was last read. Read and cleared by the owner that reports it.
+  writebacks_unknown: u64,
 }
 
 impl std::fmt::Debug for ServeState {
@@ -559,7 +575,25 @@ impl ServeState {
       notifying: None,
       notify_wake: None,
       entry_invalidations_refused: 0,
+      own: OwnRecords::default(),
+      writable: WritableOpens::default(),
+      fetched: FetchPoints::default(),
+      started_at: None,
+      writeback_bytes_kept_back: 0,
+      writebacks_unknown: 0,
     }
+  }
+
+  /// The bytes of cache write-backs kept back since this was last asked, and zero afterwards
+  /// ([`dispatch_request`]).
+  pub fn take_writeback_bytes_kept_back(&mut self) -> u64 {
+    std::mem::take(&mut self.writeback_bytes_kept_back)
+  }
+
+  /// The cache write-backs refused `EIO` as unknown since this was last asked, and zero afterwards
+  /// ([`dispatch_request`]).
+  pub fn take_writebacks_unknown(&mut self) -> u64 {
+    std::mem::take(&mut self.writebacks_unknown)
   }
 
   /// The entry invalidations the kernel has refused since this was last asked, and zero afterwards. A non-zero
@@ -804,6 +838,185 @@ fn addressed_to_the_kernel(invalidation: &Invalidation, root: Option<u64>) -> In
   }
 }
 
+/// Dispatches one admitted request and notes the journal records it made as this mount's own. A **cache write-back**
+/// (a `WRITE` carrying [`crate::abi::WRITE_CACHE`]) goes by the dirty-page write-back rule ([`serve_writeback`]); any
+/// other request by the bridge's dispatch. Returns the reply's length and, for a write-back, the byte ranges it was
+/// kept back from, which its owner's log must leave out ([`Dispatched::written`]).
+///
+/// **The rule** (§4.6 "Cache posture";
+/// `docs/bugs/2026-10-21-a-dirty-shared-map-page-overwrites-a-later-write-through-another-path.md`). A page a process
+/// dirtied through a shared map stays in the kernel until the kernel writes it back, periodically, at `msync`, or while
+/// it launders the page inside one of this mount's own invalidations. That page is the kernel's copy from before every
+/// change it has not confirmed, so where another path changed the file since, its bytes are stale. Applied whole, it
+/// undid the later write (measured 2026-10-21: 4,095 of a page's 4,096 bytes reverted). Applied outside those ranges,
+/// the volume holds what one shared page cache would: the process's store, and the other path's newer bytes.
+fn dispatch_request(
+  request: &[u8],
+  bridge: &mut dyn Bridge,
+  cx: &slates_bridge_core::OpContext,
+  state: &mut ServeState,
+) -> (usize, Vec<std::ops::Range<u64>>) {
+  let before = bridge.seen(cx).journal_seq;
+  let started_at = *state.started_at.get_or_insert(before);
+  let served = match crate::bridge::cache_writeback(request) {
+    Some(nodeid) => serve_writeback(request, nodeid, started_at, bridge, cx, state),
+    None => (dispatch(request, bridge, cx, &mut state.reply), Vec::new()),
+  };
+  note_opens_and_fetches(request, served.0, before, bridge, cx, state);
+  note_own_records(bridge, cx, state, before);
+  served
+}
+
+/// What a served request tells the dirty-page write-back rule ([`dispatch_request`]):
+/// - a granted writable `OPEN` or `CREATE` is noted, and the file's first on this mount has its reply cleared of
+///   `FOPEN_KEEP_CACHE`, so the kernel drops the file's cached pages as it opens it and every page cached after was
+///   fetched after (or written whole by this mount);
+/// - a `READ` of a file open for writing records the journal's head as its pages' fetch point, since a read changes
+///   nothing;
+/// - a `RELEASE` forgets its handle, and with the file's last writable handle its fetch points (no write-back of it can
+///   follow, since a write-back holds its file open until it is answered).
+fn note_opens_and_fetches(
+  request: &[u8],
+  len: usize,
+  before: u64,
+  bridge: &mut dyn Bridge,
+  cx: &slates_bridge_core::OpContext,
+  state: &mut ServeState,
+) {
+  let Ok(parsed) = Request::parse(request) else {
+    return;
+  };
+  let ino = parsed.header.nodeid;
+  match parsed.opcode {
+    Some(Opcode::Open | Opcode::Create) => {
+      if crate::bridge::opens_for_writing(parsed.opcode, parsed.body) != Some(true) {
+        return;
+      }
+      let reply = state.reply.get(..len).unwrap_or(&[]);
+      let Some(fh) = crate::bridge::granted_handle(parsed.opcode, reply) else {
+        return;
+      };
+      let file = crate::bridge::created_node(parsed.opcode, reply).unwrap_or(ino);
+      if state.writable.opened(fh, file) {
+        if let Some(reply) = state.reply.get_mut(..len) {
+          crate::bridge::clear_keep_cache(parsed.opcode, reply);
+        }
+        state.fetched.opened(file, bridge.seen(cx).journal_seq);
+      }
+    }
+    Some(Opcode::Read) => {
+      let answered = state
+        .reply
+        .get(..len)
+        .is_some_and(|reply| reply_error(reply) == 0);
+      let read = crate::request::ReadIn::parse(Opcode::Read.to_wire(), parsed.body);
+      if let (true, Ok(read)) = (answered && state.writable.holds(ino), read) {
+        let end = read.offset.saturating_add(u64::from(read.size));
+        let bound = bridge.journal_capacity(cx);
+        state.fetched.fetched(ino, read.offset..end, before, bound);
+      }
+    }
+    Some(Opcode::Release) => {
+      let handle = parsed
+        .body
+        .get(..size_of::<u64>())
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u64::from_le_bytes);
+      if let Some(file) = handle.and_then(|fh| state.writable.released(fh)) {
+        state.fetched.dropped(file);
+      }
+    }
+    _ => {}
+  }
+}
+
+/// Forgets the writable handle a lost `OPEN` or `CREATE` reply granted, when the server gives it back itself
+/// ([`crate::bridge::reclaim_unreported`]), and with the file's last such handle its fetch points.
+fn forget_unreported_open(state: &mut ServeState, opcode: Option<Opcode>, len: usize) {
+  let reply = state.reply.get(..len).unwrap_or(&[]);
+  if let Some(file) =
+    crate::bridge::granted_handle(opcode, reply).and_then(|fh| state.writable.released(fh))
+  {
+    state.fetched.dropped(file);
+  }
+}
+
+/// Notes the journal records made since `before` as this mount's own ([`OwnRecords`], at most as many spans as the
+/// journal retains). Called around every request this mount serves, each served whole on the shard.
+fn note_own_records(
+  bridge: &mut dyn Bridge,
+  cx: &slates_bridge_core::OpContext,
+  state: &mut ServeState,
+  before: u64,
+) {
+  let after = bridge.seen(cx).journal_seq;
+  let capacity = bridge.journal_capacity(cx);
+  state.own.record(before, after, capacity);
+}
+
+/// Serves a cache write-back of node `nodeid` by the dirty-page write-back rule ([`dispatch_request`]): applied whole
+/// when nothing changed since the kernel's confirmed point, outside the changed ranges when some did, and refused `EIO`
+/// when the journal no longer holds every change since — then neither applying (which may revert an acknowledged
+/// write) nor dropping (which would discard data the process synced) is safe, and the process is told at its next
+/// `fsync` or `msync`.
+fn serve_writeback(
+  request: &[u8],
+  nodeid: u64,
+  started_at: u64,
+  bridge: &mut dyn Bridge,
+  cx: &slates_bridge_core::OpContext,
+  state: &mut ServeState,
+) -> (usize, Vec<std::ops::Range<u64>>) {
+  let Some(stale) = stale_in_writeback(request, nodeid, started_at, bridge, cx, state) else {
+    state.writebacks_unknown = state.writebacks_unknown.saturating_add(1);
+    return (
+      crate::bridge::refuse_with_eio(request, &mut state.reply),
+      Vec::new(),
+    );
+  };
+  if stale.is_empty() {
+    return (dispatch(request, bridge, cx, &mut state.reply), Vec::new());
+  }
+  let (len, kept_back) =
+    crate::bridge::serve_cache_write(request, bridge, cx, &stale, &mut state.reply);
+  state.writeback_bytes_kept_back = state.writeback_bytes_kept_back.saturating_add(kept_back);
+  (len, stale)
+}
+
+/// The bytes of a cache write-back of node `nodeid` that are stale: for each part of its range with the point that part
+/// was fetched at ([`FetchPoints::parts`]), what another path changed after that point, this mount's own writes since
+/// excepted ([`slates_bridge_core::Bridge::changed_since`]). Ascending and disjoint, since the parts are. `None` when it
+/// cannot be told: the file's fetch points were lost, the journal no longer holds every change since a part's point, or
+/// the write-back cannot be read.
+fn stale_in_writeback(
+  request: &[u8],
+  nodeid: u64,
+  started_at: u64,
+  bridge: &mut dyn Bridge,
+  cx: &slates_bridge_core::OpContext,
+  state: &ServeState,
+) -> Option<Vec<std::ops::Range<u64>>> {
+  let parsed = Request::parse(request).ok()?;
+  let write = crate::request::WriteIn::parse(Opcode::Write.to_wire(), parsed.body).ok()?;
+  let end = write
+    .offset
+    .saturating_add(u64::try_from(write.data.len()).unwrap_or(u64::MAX));
+  let mut stale = Vec::new();
+  for (part, point) in state.fetched.parts(nodeid, write.offset..end, started_at)? {
+    let slates_bridge_core::Changed::Known(changed) = bridge
+      .changed_since(cx, point, nodeid, state.own.spans())
+      .ok()?
+    else {
+      return None;
+    };
+    stale.extend(changed.into_iter().filter_map(|range| {
+      let (start, end) = (range.start.max(part.start), range.end.min(part.end));
+      (start < end).then_some(start..end)
+    }));
+  }
+  Some(stale)
+}
+
 /// Serves one admitted request: the owed round first, so the reply never coexists with a stale
 /// cached name or attribute (§4.6), then the dispatch and its reply; then the cursor moves past the
 /// request's own records — only when the round was delivered whole ([`Coherence::served_own_request`]).
@@ -815,18 +1028,20 @@ fn serve_request(
   state: &mut ServeState,
 ) -> Result<(Delivered, i32), ChannelError> {
   let delivered = deliver_owed(channel, bridge, cx, state)?;
-  let n = dispatch(request, bridge, cx, &mut state.reply);
+  let (n, _) = dispatch_request(request, bridge, cx, state);
   let reply = state.reply.get(..n).unwrap_or(&[]);
   let error = reply_error(reply);
   if n > 0 && channel.write_reply(reply)? == Sent::Unmatched {
     let parsed = Request::parse(request).ok();
+    let opcode = parsed.as_ref().and_then(|parsed| parsed.opcode);
     crate::bridge::reclaim_unreported(
-      parsed.as_ref().and_then(|parsed| parsed.opcode),
+      opcode,
       parsed.as_ref().map_or(0, |parsed| parsed.header.nodeid),
       reply,
       bridge,
       cx,
     );
+    forget_unreported_open(state, opcode, n);
   }
   state.coherence.served_own_request(bridge, cx, delivered);
   Ok((delivered, error))
@@ -861,6 +1076,9 @@ pub struct Dispatched {
   /// Where the kernel's cache stood just before the request was served: a refused reply rewinds to it, so the
   /// request's own applied change is delivered as an invalidation ([`redeliver_after_refusal`]).
   cursor_before: Option<slates_bridge_core::InvalidationCursor>,
+  /// For a cache write-back, the byte ranges it was not applied over (another path changed them after the kernel's
+  /// confirmed point); empty for every other request. What it applied, and so what its owner logs, excludes them.
+  kept_back: Vec<std::ops::Range<u64>>,
 }
 
 impl Dispatched {
@@ -874,14 +1092,23 @@ impl Dispatched {
     self.nodeid
   }
 
-  /// A `WRITE`'s offset and bytes, for the owner to log before the reply (A-63); `None` for any other request.
-  pub fn written(&self) -> Option<(u64, &[u8])> {
-    let parsed = Request::parse(&self.request).ok()?;
+  /// The parts of a `WRITE` that were applied, each as its offset and bytes, for the owner to log before the reply
+  /// (A-63); empty for any other request. A plain write is one part; a cache write-back is the parts outside what it
+  /// was kept back from ([`crate::bridge::unmasked_segments`]), so a recovery never replays bytes the volume refused.
+  pub fn written(&self) -> Vec<(u64, &[u8])> {
+    let Some(parsed) = Request::parse(&self.request).ok() else {
+      return Vec::new();
+    };
     if parsed.opcode != Some(Opcode::Write) {
-      return None;
+      return Vec::new();
     }
-    let write = crate::request::WriteIn::parse(Opcode::Write.to_wire(), parsed.body).ok()?;
-    Some((write.offset, write.data))
+    let Ok(write) = crate::request::WriteIn::parse(Opcode::Write.to_wire(), parsed.body) else {
+      return Vec::new();
+    };
+    crate::bridge::unmasked_segments(write.offset, write.data.len(), &self.kept_back)
+      .into_iter()
+      .filter_map(|(at, range)| write.data.get(range).map(|bytes| (at, bytes)))
+      .collect()
   }
 
   /// The request's unique id, without the kernel's resend bit: what a recorded reply is matched by (A-61).
@@ -979,7 +1206,9 @@ pub fn dispatch_ready(
   if let (Some(Opcode::Fallocate), Ok(delivered)) = (opcode, &delivered) {
     let delivered = *delivered;
     let cursor_before = state.coherence.cursor();
+    let began_at = bridge.seen(&cx).journal_seq;
     let begun = Allocation::begin(&request, bridge, &cx, &mut state.reply);
+    note_own_records(bridge, &cx, state, began_at);
     state.coherence.served_own_request(bridge, &cx, delivered);
     attachments.end(attachment);
     return match begun {
@@ -1003,13 +1232,14 @@ pub fn dispatch_ready(
           len,
           request,
           cursor_before,
+          kept_back: Vec::new(),
         }))
       }
     };
   }
   let dispatched = delivered.map(|delivered| {
     let cursor_before = state.coherence.cursor();
-    let len = dispatch(&request, bridge, &cx, &mut state.reply);
+    let (len, kept_back) = dispatch_request(&request, bridge, &cx, state);
     let error = state.reply.get(..len).map_or(0, reply_error);
     state.coherence.served_own_request(bridge, &cx, delivered);
     Dispatched {
@@ -1021,6 +1251,7 @@ pub fn dispatch_ready(
       len,
       request,
       cursor_before,
+      kept_back,
     }
   });
   attachments.end(attachment);
@@ -1049,7 +1280,9 @@ fn continue_allocation(
       return Err(e);
     }
   };
+  let stepped_at = bridge.seen(&cx).journal_seq;
   let answered = allocation.step(bridge, &cx, slice_bytes, &mut state.reply);
+  note_own_records(bridge, &cx, state, stepped_at);
   state.coherence.served_own_request(bridge, &cx, delivered);
   attachments.end(attachment);
   let Some(len) = answered else {
@@ -1068,6 +1301,7 @@ fn continue_allocation(
     len,
     request: allocation.into_request(),
     cursor_before,
+    kept_back: Vec::new(),
   }))
 }
 
@@ -1124,7 +1358,7 @@ pub fn redeliver_after_refusal(
 /// it), under `attachment` as the dispatch was. Call it while the reply is still in `state`: before
 /// [`send_reply`] refuses, or after it answers [`Sent::Unmatched`] (AUD-29-85).
 pub fn reclaim_dispatched(
-  state: &ServeState,
+  state: &mut ServeState,
   dispatched: &Dispatched,
   bridge: &mut dyn Bridge,
   attachments: &mut Attachments,
@@ -1142,6 +1376,7 @@ pub fn reclaim_dispatched(
     &cx,
   );
   attachments.end(attachment);
+  forget_unreported_open(state, dispatched.opcode, dispatched.len);
   reclaimed
 }
 

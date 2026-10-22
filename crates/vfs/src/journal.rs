@@ -202,10 +202,7 @@ impl OpLog {
   /// retained one: the cost is the records returned, not the log (A-96: a filter over the whole retained log was a
   /// quarter of a FUSE create's daemon time, since every reply asks for the changes since its cursor).
   pub fn since(&self, seq: u64) -> impl Iterator<Item = &OpRecord> {
-    let oldest = self
-      .records
-      .front()
-      .map_or(self.next_seq, |record| record.seq);
+    let oldest = self.oldest_seq();
     let skip = usize::try_from(seq.saturating_add(1).saturating_sub(oldest))
       .unwrap_or(usize::MAX)
       .min(self.records.len());
@@ -215,6 +212,27 @@ impl OpLog {
   /// The newest sequence assigned.
   pub fn head_seq(&self) -> u64 {
     self.next_seq.saturating_sub(1)
+  }
+
+  /// The oldest sequence still retained, or the next to be assigned when nothing is: every record from here to
+  /// [`OpLog::head_seq`] is held (sequences are contiguous and retention drops only the oldest), and any before it is
+  /// gone. A reader that needs every record since a point asks this to know whether it still can.
+  pub fn oldest_seq(&self) -> u64 {
+    self
+      .records
+      .front()
+      .map_or(self.next_seq, |record| record.seq)
+  }
+
+  /// The most records retention ever keeps: every record is charged at least its fixed size, so
+  /// `budget_bytes / size_of::<OpRecord>()`, and one when a single record is larger than the budget. A reader that
+  /// tracks sequences of its own bounds them by this: more than it are more than the log can still be asked about.
+  pub fn capacity(&self) -> usize {
+    self
+      .budget_bytes
+      .checked_div(std::mem::size_of::<OpRecord>())
+      .unwrap_or(0)
+      .max(1)
   }
 
   /// Records dropped by retention.

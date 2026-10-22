@@ -228,6 +228,13 @@ pub const ACCESS_MODE: u32 = 0o3;
 /// Format: `O_RDONLY`.
 pub const READ_ONLY: u32 = 0;
 
+/// Format: FUSE_WRITE_CACHE — bit 0 of a `WRITE`'s `write_flags` (`include/uapi/linux/fuse.h`, Linux 6.12 line 505):
+/// the write is the kernel writing a cached page back (`fs/fuse/file.c` `fuse_writepage_args_setup`), at its own
+/// pace, at `msync`, or while it launders a dirty page inside an invalidation — not a process's `write(2)`, which is
+/// write-through here. Such a page is the kernel's copy from before every change it has not confirmed
+/// (`crate::channel`, the dirty-page write-back rule).
+pub const WRITE_CACHE: u32 = 1 << 0;
+
 /// Format: FUSE_UNIQUE_RESEND — the top bit of a request's unique id marks a request the kernel resent after a
 /// `FUSE_NOTIFY_RESEND` (`include/uapi/linux/fuse.h`). A reply carries the unique exactly as the request did,
 /// bit included, since the kernel matches the whole word.

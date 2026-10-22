@@ -2268,7 +2268,14 @@ the mount happened to get a request — indefinitely for a shared map or DAX thr
 `docs/bugs/2026-10-21-a-fuse-mount-hears-of-another-paths-change-only-on-its-next-request.md`). "At once" is measured
 and is *after* the writer is answered: a shared map read the new bytes 52–193 µs after the reply, median 82 µs. AC-3.3's
 "invalidates before it is acknowledged" therefore does not hold for a change through another path; which writers can
-be made to wait for the mount, and which cannot without a deadlock, is open in the ledger. §4.15 supplies the source
+be made to wait for the mount, and which cannot without a deadlock, is open in the ledger. **A page the kernel writes
+back from its cache is judged by when it was fetched** (A-139): a `WRITE` carrying `FUSE_WRITE_CACHE` is applied
+except over the bytes another path changed after the daemon served that page's fetch, the mount's own writes since
+excepted. That is what one shared page cache would hold. A file's first writable open on a mount drops the kernel's
+cached pages (no `FOPEN_KEEP_CACHE`), so every page has a known fetch. Where the journal no longer holds every change
+since a page's fetch, the write-back is refused `EIO` rather than guessed. Invalidation rounds cannot judge it, because
+Linux writes a page back from a temporary copy and an invalidation passes the page meanwhile (measured; the
+amendment). §4.15 supplies the source
 validation rules; finite stale-data TTLs do not silently become exact live-source semantics. The
 launcher (`slates exec`) implements the chosen-path form with `CLONE_NEWUSER|CLONE_NEWNS`,
 recursive-private root, and a bind mount; on AppArmor-restricted hosts it reports the exact
@@ -11893,6 +11900,37 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
+
+### A-139 — A cache write-back is applied only where it is not stale, judged by its page's fetch (accepted 2026-10-21)
+Applied in the same change to: §4.6 (cache posture); `crates/bridge-core` (`changed.rs`, `Bridge::changed_since`,
+`Bridge::journal_capacity`); `crates/vfs/src/journal.rs` (`OpLog::oldest_seq`, `OpLog::capacity`); `crates/bridge-fuse`
+(`coherence.rs` `OwnRecords`/`WritableOpens`/`FetchPoints`, `channel.rs`, `bridge.rs`, `request.rs`, `abi.rs`);
+`crates/server/src/fuse.rs` (the write log's applied parts, two counters); `crates/cli/tests/cli.rs`; GAPS; the bug
+record.
+- **Changes §4.6.** A FUSE `WRITE` carrying `FUSE_WRITE_CACHE` is the kernel's cached copy of a page coming back. It is
+  applied except over the bytes another path changed after the page's fetch (the journal walked from the page's fetch
+  point, the mount's own records since excepted), and answered whole. A file's first writable open on a mount drops
+  the kernel's cache of it. Where the journal no longer holds the changes since a page's fetch, the write-back is
+  refused `EIO` and counted.
+- **Evidence.**
+  - The bug (`docs/bugs/2026-10-21-a-dirty-shared-map-page-overwrites-a-later-write-through-another-path.md`):
+    measured 2026-10-21, a dirty map page's write-back reverted 4,095 of 4,096 bytes of a later SDK replacement on
+    Linux, and 16,383 of 16,384 on macOS.
+  - The mechanism, in Linux 6.12's source: an invalidation launders dirty pages (`mm/truncate.c:651`,
+    `fs/fuse/file.c:2477`).
+  - Why rounds cannot judge it: FUSE writes back from a temporary copy and ends the page's write-back at once
+    (`fs/fuse/file.c:2092`), so a stale copy reaches the daemon after the round that should have covered it. The
+    round-based mask was built first and still failed 9 of 10 runs; it is kept on record as measured-and-rejected in
+    the bug record.
+- **Proven.** See the bug record's verification: the failing test red with the rule disabled and green with it, the
+  shrink test, the unsynced chaos history, the walk's and the fetch points' oracles (each red-checked), and by-use
+  tests of the walk (`Unknown` past eviction included) and of the FUSE side.
+- **What it does not change.** Invalidation delivery; `write(2)` through a FUSE mount, which is write-through and never
+  masked; and any other transport. macOS NFS v3 cannot carry it, since it has no write-back mark and no callback: open
+  in the ledger.
+- **Residual, stated.** A store into the very bytes another path is changing, made after its page's fetch and before
+  the change is delivered, is kept back: two writers racing on the same bytes. AC-3.3 would close it for writers that
+  hold no kernel lock.
 
 ### A-138 — A guest's DAX window is handed out as a descriptor covering only that window (accepted 2026-10-19)
 Applied in the same change to: §4.6 (DAX), `crates/bridge-virtiofs/src/udmabuf.rs` (new), `crates/bridge-virtiofs/src/device.rs`, `crates/mem/src/shared.rs`, `crates/bridge-virtiofs/tests/device.rs`, `unsafe-budget.toml`, GAPS (gate row 1), `docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md`.

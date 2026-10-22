@@ -327,6 +327,60 @@ fn release(
   }
 }
 
+/// The handle a success reply to an `OPEN` or a `CREATE` granted, read where [`reclaim_unreported`] reads it; `None` for
+/// any other reply.
+pub fn granted_handle(opcode: Option<Opcode>, reply: &[u8]) -> Option<u64> {
+  let body = success_body(reply)?;
+  match opcode? {
+    Opcode::Open => u64_at(body, 0),
+    Opcode::Create => u64_at(body, EntryOut::LEN),
+    _ => None,
+  }
+}
+
+/// The node a success reply to a `CREATE` made (its `fuse_entry_out`'s node id); `None` for any other reply.
+pub fn created_node(opcode: Option<Opcode>, reply: &[u8]) -> Option<u64> {
+  if opcode? != Opcode::Create {
+    return None;
+  }
+  u64_at(success_body(reply)?, 0)
+}
+
+/// Whether an `OPEN` or a `CREATE` asked for writing: its body's `flags` (the first word of `fuse_open_in` and of
+/// `fuse_create_in`) carry an access mode other than read-only. `None` for any other request.
+pub fn opens_for_writing(opcode: Option<Opcode>, body: &[u8]) -> Option<bool> {
+  if !matches!(opcode?, Opcode::Open | Opcode::Create) {
+    return None;
+  }
+  let flags = u32::from_le_bytes(body.get(..size_of::<u32>())?.try_into().ok()?);
+  Some(flags & crate::abi::ACCESS_MODE != crate::abi::READ_ONLY)
+}
+
+/// Clears `FOPEN_KEEP_CACHE` in a success reply to an `OPEN` or a `CREATE`, so the kernel drops the file's cached pages
+/// as it opens it (`fs/fuse/file.c`, `fuse_finish_open`): what a transport asks when it needs every page cached after the
+/// open to have been fetched after it (`crate::channel`, the dirty-page write-back rule). Any other reply is untouched.
+pub fn clear_keep_cache(opcode: Option<Opcode>, reply: &mut [u8]) {
+  /// Format: `fuse_open_out.open_flags`'s offset within it, after the 8-byte handle.
+  const OPEN_FLAGS_AT: usize = size_of::<u64>();
+  let open_out = match opcode {
+    Some(Opcode::Open) => OUT_HEADER_LEN,
+    Some(Opcode::Create) => OUT_HEADER_LEN.saturating_add(EntryOut::LEN),
+    _ => return,
+  };
+  if success_body(reply).is_none() {
+    return;
+  }
+  let at = open_out.saturating_add(OPEN_FLAGS_AT);
+  let Some(field) = reply.get_mut(at..at.saturating_add(size_of::<u32>())) else {
+    return;
+  };
+  let Ok(bytes) = <[u8; 4]>::try_from(&*field) else {
+    return;
+  };
+  let flags = u32::from_le_bytes(bytes) & !crate::abi::open::KEEP_CACHE;
+  field.copy_from_slice(&flags.to_le_bytes());
+}
+
 /// The body of a success reply: `None` for an error reply or one too short for its header.
 fn success_body(reply: &[u8]) -> Option<&[u8]> {
   /// Format: `fuse_out_header`: `len` (u32) then `error` (i32) — the errno field's offset.
@@ -822,6 +876,112 @@ fn serve_write(
     |o| o.to_bytes(),
     out,
   )
+}
+
+/// The node a message writes back from the kernel's page cache: `Some` for a `WRITE` carrying
+/// [`crate::abi::WRITE_CACHE`], `None` for any other message, a process's own `write(2)` included. A transport that
+/// tracks what its kernel holds stale routes these through [`serve_cache_write`] (`crate::channel`).
+pub fn cache_writeback(message: &[u8]) -> Option<u64> {
+  let request = Request::parse(message).ok()?;
+  if request.opcode != Some(Opcode::Write) {
+    return None;
+  }
+  let write = WriteIn::parse(Opcode::Write.to_wire(), request.body).ok()?;
+  (write.write_flags & crate::abi::WRITE_CACHE != 0).then_some(request.header.nodeid)
+}
+
+/// The parts of a write of `len` bytes at `offset` that lie outside `stale` (ascending, disjoint byte ranges), each as
+/// its file offset and its range within the write's data. A cache write-back applies exactly these, and the daemon logs
+/// exactly these for replay (A-63), so what is applied and what a recovery replays cannot disagree (§4.6, the
+/// dirty-page write-back rule in `crate::channel`).
+pub fn unmasked_segments(
+  offset: u64,
+  len: usize,
+  stale: &[std::ops::Range<u64>],
+) -> Vec<(u64, std::ops::Range<usize>)> {
+  let end = offset.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
+  let within = |at: u64| {
+    usize::try_from(at.saturating_sub(offset))
+      .unwrap_or(len)
+      .min(len)
+  };
+  let mut segments = Vec::new();
+  let mut cursor = offset;
+  for range in stale {
+    if range.end <= cursor {
+      continue;
+    }
+    if range.start >= end {
+      break;
+    }
+    if range.start > cursor {
+      segments.push((cursor, within(cursor)..within(range.start)));
+    }
+    cursor = range.end;
+    if cursor >= end {
+      break;
+    }
+  }
+  if cursor < end {
+    segments.push((cursor, within(cursor)..len));
+  }
+  segments
+}
+
+/// Serves a cache write-back whose file changed through another path since the kernel last confirmed it: applies only
+/// the parts outside `stale` ([`unmasked_segments`]) and answers the whole size, since the page then holds what one
+/// shared page cache would — the store the process made, and the other path's newer bytes where they differ
+/// (`crate::channel`, the dirty-page write-back rule). Returns the reply's length and the bytes kept back.
+pub fn serve_cache_write(
+  message: &[u8],
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  stale: &[std::ops::Range<u64>],
+  out: &mut [u8],
+) -> (usize, u64) {
+  let parsed = Request::parse(message).ok().and_then(|request| {
+    let write = WriteIn::parse(Opcode::Write.to_wire(), request.body).ok()?;
+    Some((request.header.unique, request.header.nodeid, write))
+  });
+  let Some((unique, nodeid, write)) = parsed else {
+    return (refuse_with_eio(message, out), 0);
+  };
+  let object = ObjectId {
+    inode: nodeid,
+    generation: 0,
+  };
+  let segments = unmasked_segments(write.offset, write.data.len(), stale);
+  let applied: usize = segments.iter().map(|(_, range)| range.len()).sum();
+  let kept_back = u64::try_from(write.data.len().saturating_sub(applied)).unwrap_or(u64::MAX);
+  // The bytes before a short or refused segment count as written — the kept-back ones included, since the page
+  // holds what it should there — so a short segment answers a short write from that point, as a short write does.
+  let mut answered = write.data.len();
+  for (at, range) in segments {
+    let Some(bytes) = write.data.get(range.clone()) else {
+      continue;
+    };
+    match bridge.write(object, cx, at, bytes) {
+      Ok(wrote) => {
+        let wrote = usize::try_from(wrote).unwrap_or(0);
+        if wrote < bytes.len() {
+          answered = range.start.saturating_add(wrote);
+          break;
+        }
+      }
+      Err(e) => return (reply_err(unique, e, out), kept_back),
+    }
+  }
+  let size = u32::try_from(answered).unwrap_or(u32::MAX);
+  let reply = reply(unique, Ok(WriteOut { size }), |o| o.to_bytes(), out);
+  (reply, kept_back)
+}
+
+/// Answers `message` with `EIO` alone, its unique id read from the header (nothing, for a message too short to name
+/// one): what a transport sends when it must refuse a request it cannot serve safely.
+pub fn refuse_with_eio(message: &[u8], out: &mut [u8]) -> usize {
+  recover_unique(message)
+    .map(|unique| write_or_drop(ReplyHeader::write_error(unique, EIO, out), out))
+    .unwrap_or(0)
 }
 
 /// Format: `EOVERFLOW` (Linux) — what a directory page answers when the entries sharing one cookie are more

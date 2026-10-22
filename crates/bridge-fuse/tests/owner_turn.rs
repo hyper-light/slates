@@ -210,7 +210,7 @@ fn serve(mut channel: FuseChannel, refuse: Receiver<()>, counts: Sender<Counts>)
         if refused {
           tally.refused += 1;
           let given_back = reclaim_dispatched(
-            &state,
+            &mut state,
             &dispatched,
             &mut bridge,
             &mut attachments,

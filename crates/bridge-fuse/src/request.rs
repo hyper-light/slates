@@ -355,14 +355,16 @@ pub struct WriteIn<'a> {
   pub fh: u64,
   /// The offset to write at.
   pub offset: u64,
+  /// The write's flags; [`crate::abi::WRITE_CACHE`] marks the kernel writing a cached page back.
+  pub write_flags: u32,
   /// The data.
   pub data: &'a [u8],
 }
 
 impl<'a> WriteIn<'a> {
-  /// Shape: the fields of `fuse_write_in` after `size` that slates skips (write_flags,
-  /// lock_owner, flags, padding: five 32-bit words).
-  const SKIP_AFTER_SIZE: usize = 20;
+  /// Shape: the fields of `fuse_write_in` after `write_flags` that slates skips (lock_owner, flags,
+  /// padding: four 32-bit words).
+  const SKIP_AFTER_FLAGS: usize = 16;
 
   /// Parses a write body; refuses one shorter than the header plus the declared data size.
   pub fn parse(opcode: u32, body: &'a [u8]) -> Result<WriteIn<'a>, FuseError> {
@@ -370,7 +372,8 @@ impl<'a> WriteIn<'a> {
     let fh = r.u64(opcode)?;
     let offset = r.u64(opcode)?;
     let size = usize::try_from(r.u32(opcode)?).unwrap_or(usize::MAX);
-    r.skip(Self::SKIP_AFTER_SIZE, opcode)?;
+    let write_flags = r.u32(opcode)?;
+    r.skip(Self::SKIP_AFTER_FLAGS, opcode)?;
     let Some(data) = r.rest().get(..size) else {
       return Err(FuseError::ShortBody {
         opcode,
@@ -380,7 +383,12 @@ impl<'a> WriteIn<'a> {
           .saturating_add(size.saturating_sub(r.remaining())),
       });
     };
-    Ok(WriteIn { fh, offset, data })
+    Ok(WriteIn {
+      fh,
+      offset,
+      write_flags,
+      data,
+    })
   }
 }
 
