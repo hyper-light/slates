@@ -10,6 +10,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { basename } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { Worker } from 'node:worker_threads';
 import { AsyncClient } from '../async.mjs';
@@ -246,18 +247,73 @@ function startNoise() {
   };
 }
 
-// Runs `program` without blocking the loop (the ticker must measure the SDK, not this harness's own
-// process spawns, which take tens of milliseconds on a loaded runner): its exit status and stdout.
-function runAsync(program, args) {
-  return new Promise((resolve) => {
+// The spawner's source, run on a worker thread: for each request it spawns the program on the worker's own loop and
+// answers the exit status, the stdout, and how long `spawn()` took to return, which is how long the child took to
+// exec. A program that cannot be run answers status -1, as `runAsync` always has; the main side takes the first
+// answer for each request.
+const SPAWNER_SOURCE = `
+  const { parentPort } = require('node:worker_threads');
+  const { spawn } = require('node:child_process');
+  parentPort.on('message', ({ id, program, args }) => {
+    const began = performance.now();
     const child = spawn(program, args, { stdio: ['ignore', 'pipe', 'ignore'] });
+    const execWait = performance.now() - began;
     let stdout = '';
     child.stdout.on('data', (chunk) => {
       stdout += chunk;
     });
-    child.on('close', (status) => resolve({ status, stdout }));
-    child.on('error', () => resolve({ status: -1, stdout }));
+    child.on('close', (status) => parentPort.postMessage({ id, status, stdout, execWait }));
+    child.on('error', () => parentPort.postMessage({ id, status: -1, stdout, execWait }));
+  });`;
+
+// The harness's process spawner, made on first use and stopped by the scenario's `finally`.
+let spawner = null;
+
+// One worker thread that runs the harness's process spawns, the requests it has yet to answer, and the slowest exec
+// wait it has seen for each program, in milliseconds. A worker that fails rejects every request it holds, so a
+// broken spawner fails the test instead of reading as a process that is gone.
+function startSpawner() {
+  const worker = new Worker(SPAWNER_SOURCE, { eval: true });
+  const pending = new Map();
+  const slowest = new Map();
+  let next = 0;
+  worker.on('message', ({ id, status, stdout, execWait }) => {
+    const waiting = pending.get(id);
+    if (!waiting) return;
+    pending.delete(id);
+    slowest.set(waiting.name, Math.max(slowest.get(waiting.name) ?? 0, execWait));
+    waiting.resolve({ status, stdout });
   });
+  const failAll = (error) => {
+    for (const waiting of pending.values()) waiting.reject(error);
+    pending.clear();
+  };
+  worker.on('error', failAll);
+  worker.on('exit', (code) => failAll(new Error(`the spawner thread exited (${code}) with requests unanswered`)));
+  return {
+    run(program, args) {
+      return new Promise((resolve, reject) => {
+        const id = next;
+        next += 1;
+        pending.set(id, { name: basename(program), resolve, reject });
+        worker.postMessage({ id, program, args });
+      });
+    },
+    slowest,
+    stop: () => worker.terminate(),
+  };
+}
+
+// Runs `program` on the spawner's thread, so the loop stays free: its exit status and stdout. The ticker must measure
+// the SDK, not this harness. `child_process.spawn` returns only once the child has exec'd (libuv waits for the exec on
+// the calling thread), so until 2026-10-22 this helper held the loop for as long as each child took to exec. Measured
+// on Node v24.22.1 with each exec delayed 150 ms, as a cold disk would delay it: `spawn()` returned after 153–159 ms
+// and a loop ticker was as late
+// (docs/bugs/2026-10-22-the-async-sdk-tests-own-process-spawns-held-the-loop-it-measures.md). On the spawner's
+// thread the same wait holds only that thread.
+function runAsync(program, args) {
+  spawner ??= startSpawner();
+  return spawner.run(program, args);
 }
 
 // The pids of the daemon an anchor for `instance` supervises (scoped by instance, never a bare name).
@@ -397,6 +453,10 @@ test('every async call ends across restart, silence, reader loss and death', asy
       assert.match(result.reason.message, /DaemonGone/);
     }
     const scheduling = await noise.stop();
+    const waits = [...(spawner?.slowest ?? new Map())]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([name, ms]) => `${name} ${ms.toFixed(1)} ms`);
+    console.error(`the harness's own process spawns, each off the loop: slowest exec wait ${waits.join(', ')}`);
     assert.ok(
       ticker.worst < TICK_BOUND_MS + scheduling,
       `the loop was never held: worst lateness ${ticker.worst} ms, bound ${TICK_BOUND_MS} ms plus the machine's own scheduling noise ${scheduling.toFixed(1)} ms`,
@@ -409,5 +469,7 @@ test('every async call ends across restart, silence, reader loss and death', asy
     } catch (_) {
       // already gone
     }
+    await spawner?.stop();
+    spawner = null;
   }
 });

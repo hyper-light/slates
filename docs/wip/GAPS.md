@@ -941,7 +941,7 @@ of the file does not. `lock_on_fault`'s two tests read the same counter and are 
 256 MiB, which this runner's memlock capacity refuses, so they take their own loud skip first — on a host
 that allowed the lock they would need the entry too.
 
-### 8a-sdk-loop. The async SDK test's own process spawns held the loop it measures (2026-10-20, closed 2026-10-22; Node sibling OPEN)
+### 8a-sdk-loop. The async SDK test's own process spawns held the loop it measures (2026-10-20, closed 2026-10-22; Node sibling closed 2026-10-22)
 
 Opened as "the async Python SDK held the event loop for 0.3 s, once in eight runs". It was the test's harness, not the
 SDK; the closing paragraph below has the evidence.
@@ -1015,16 +1015,42 @@ The fix runs the spawns on a worker thread (`asyncio.to_thread`). It also correc
 **Still a hypothesis:** that the runner's first exec is slow because its disk is cold. Each run now prints the
 slowest exec wait per command, so the lane's log will say.
 
-**Sibling, OPEN: the Node SDK's async test has the same defect.** `runAsync` in
-`crates/sdk-node/tests/sdk_async.test.mjs` uses `child_process.spawn`, which also returns only after the child's exec.
-Measured on Node v24.22.1:
+**Sibling, closed 2026-10-22: the Node SDK's async test had the same defect.** `runAsync` in
+`crates/sdk-node/tests/sdk_async.test.mjs` used `child_process.spawn`, which also returns only after the child's
+exec. Measured on Node v24.22.1:
 
 | | `spawn()` returned after | loop ticker late by |
 |---|---|---|
-| exec delayed 150 ms | 154–155 ms | 153–155 ms |
-| no delay | 0–1 ms | 2 ms |
+| exec delayed 150 ms | 153–159 ms | 153–159 ms |
+| no delay | 0–2 ms | 2 ms |
 
-It is latent on CI so far. Its comment records an unattributed 106 ms hold on the macOS runner (2026-10-01).
+The fix: one worker thread runs the harness's spawns on its own loop and reports each command's slowest exec wait,
+which the test prints. The red-check ran in a `node:24-trixie` container, with the shim extended to `execvp` and
+`execvpe`:
+
+| run | pre-fix file | fixed file |
+|---|---|---|
+| shim | failed 3 of 3: 154, 149 and 733 ms late | passed 2 of 3 (one 290 ms hold, below) |
+| shim, instrumented | — | passed 24 of 24, no loop gap over 50 ms |
+| plain | passed 2 of 2 | passed 2 of 2 |
+| starved (one CPU, four spinners) | — | passed 12 of 12 |
+
+In the starved runs, gaps of 50–87 ms showed up in every phase, with or without a spawn in flight, and the main thread
+burned at most 1.6 ms of CPU across each. The thread was waiting for a CPU, and the noise-adjusted bound absorbs that.
+
+On macOS, both Node suites passed 6 of 6 in each of 3 runs, at load 58–67.
+
+**Open observation (not dismissed).** In the first container session, while the Mac's load average was 58–67 from
+other sessions:
+- the fixed file was held **290 ms** once, while the same process's noise worker was late only 3.1 ms;
+- one pre-fix run was 733 ms late, far beyond its own 150 ms spawns.
+
+None of the 36 instrumented rounds since reproduced it (at host load 14–24, and starved in the guest). This VM
+accounts no steal time (0 ticks in every round), so host preemption of one vCPU, the leading hypothesis, cannot yet be
+seen.
+
+The Node test's failure message names no phase and no main-thread CPU. Its Python twin carries both, and adding them
+is the instrument for the next occurrence; that is proposed, not done.
 
 ### 8a-sdk-stamp. A client that reconnects during a restart may judge the new daemon gone (macOS, Windows; 2026-10-22, closed 2026-10-22 by A-143)
 

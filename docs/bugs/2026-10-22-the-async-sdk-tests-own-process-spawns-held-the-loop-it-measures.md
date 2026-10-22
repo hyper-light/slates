@@ -154,7 +154,16 @@ All in `crates/sdk-python/tests/test_sdk_async.py`:
   - no delay: 0–1 ms and 2 ms.
 
   It is latent on CI so far, though its comment records an unattributed 106 ms hold on the macOS runner (2026-10-01).
-  It is open in GAPS §8a-sdk-loop.
+
+  **Fixed 2026-10-22, the same way.** One worker thread runs the harness's spawns on its own loop, reports each
+  command's slowest exec wait, and the test prints it. The shim, extended to `execvp` and `execvpe` because libuv
+  reaches exec through them, made the pre-fix file fail 3 of 3 (154, 149 and 733 ms late). The fixed file passed:
+  - 26 of 27 under the shim;
+  - 12 of 12 starved;
+  - both suites, 6 of 6 in each of 3 runs, on macOS.
+
+  The one fixed failure, a 290 ms hold during a period of host load 58–67, is recorded in GAPS §8a-sdk-loop as an
+  open observation.
 - **The sibling-thread figure can read zero for a real hold.** `worst_thread` is `thread_late - thread_before`, a
   difference of running maxima. A hold shorter than one the sibling saw earlier therefore reads 0.000. It did not
   mislead here, because there was no earlier hold of that size, but it can.
