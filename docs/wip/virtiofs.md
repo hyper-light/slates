@@ -330,6 +330,45 @@ box shared with two other builds — timings are not benchmarks)
    leaves them in the host's cache, where they are written back, and a second guest maps the same bytes
    (`a_guest_killed_with_unsynced_stores_leaves_them_to_land_and_a_new_guest_reads_them`).
 
+   **A stated limit of DAX under KVM, measured 2026-10-22: a guest that touches the cut range of a file shrunk while
+   it maps the file hangs, whatever directory is shared.** The guest probe mapped an 8-page file with DAX and read it
+   whole. The file was then truncated to 2 pages. The guest still read the 2 pages, but its read of page 5 never
+   returned. The result was the same in all three placements of the truncate:
+   - through a second slates mount;
+   - through the shared mount itself;
+   - on a plain btrfs directory shared in slates' place, with no slates running.
+
+   KVM's own counters (`/sys/kernel/debug/kvm/<pid>-<fd>/`) over 2 s of each hang:
+   - faults taken: 56 227 to 65 582;
+   - faults injected into the guest: 55 195 to 67 445;
+   - faults fixed: 0 to 5;
+   - the vCPU thread was running throughout.
+
+   On the slates mounts, the FUSE connection had no request outstanding (`/sys/fs/fuse/connections/<n>/waiting` read
+   0). The daemon used 220 ticks per 2 s during the hang, against 200 when idle before the guest started.
+
+   The mechanism is KVM's. The host's fault of a page past the file's end fails. KVM faults asynchronously, so it
+   ignores the failure, tells the guest the page is ready, and the guest retries forever. Vivek Goyal reported this
+   very case, virtio-fs DAX under a host truncate, in "[RFC PATCH 0/4] kvm,x86,async_pf: Add capability to return page
+   fault error" (LKML, 2020-03-31). His later "kvm,x86: Exit to user space in case page fault error" (v4, reviewed into
+   October 2020) would have exited to the VMM instead of looping. On the box's 7.2.9 kernel the loop is unchanged.
+
+   The guest cannot step around it. Its page tables still point into the window, so its access never asks its kernel
+   for the size. crosvm's device (1c8d17a85) has nothing to tell it with: one high-priority queue plus the request
+   queues, and no notification feature.
+
+   slates cannot see a sharer's maps, and POSIX lets an open file be truncated, so slates refuses nothing here. On the
+   mount route with DAX, a file a guest maps must not be shrunk through any other path while the guest may touch the
+   cut range. A fix belongs to KVM (report the failed fault) or to a VMM that tells the guest.
+
+   Reproduced by hand: the probe commands `map f 8`, `read 0 32768`, a host `truncate` to 8192, `read 0 8192`, then
+   `read 20480 4096`, with the counters read twice 2 s apart while the last read hangs.
+
+   **crosvm offers DAX on x86_64 only.** Its device enables the window under `cfg!(target_arch = "x86_64")`, with the
+   TODO "Remove cfg! once DAX is supported on ARM" (b/176129399), read in `devices/device_virtio_fs/src/lib.rs` at
+   1c8d17a85. So on an arm64 host the mount route under crosvm serves the guest through its own page cache, without
+   DAX.
+
    Still owed: Shards' DAX window over the macOS mount, and Firecracker's disk-image form. crosvm has prior art for the
    latter: its experimental `--pmem-ext2` builds an ext2 file system in memory from a host directory and presents it to
    the guest on a pmem device (`crosvm run --help` and its `ext2` crate, read on the box 2026-10-22).

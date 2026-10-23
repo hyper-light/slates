@@ -10836,6 +10836,19 @@ without a user namespace, which needs root.
   - `a_daemon_killed_under_a_guests_live_map_is_taken_over_and_the_guest_goes_on`;
   - `a_guest_killed_with_unsynced_stores_leaves_them_to_land_and_a_new_guest_reads_them`. The dead VM's dirty pages
     stay in the host's cache, and are written back under the write-back rule.
+- **A stated limit of DAX under KVM: a guest that touches the cut range of a file shrunk under its map hangs**
+  (measured on the box, 2026-10-22; `virtiofs.md` §8 item 7). The guest mapped and read an 8-page file. After a
+  truncate to 2 pages, its read of page 5 never returned. The result was the same through a second slates mount,
+  through the shared mount itself, and on a plain btrfs directory with no slates.
+  - KVM's counters over 2 s: 56 227 to 65 582 faults taken, 55 195 to 67 445 injected into the guest, 0 to 5 fixed.
+  - No FUSE request was outstanding.
+
+  KVM's asynchronous fault ignores the host's failed fault and tells the guest to retry, forever. Vivek Goyal reported
+  this case for virtio-fs DAX in 2020 (LKML, 2020-03-31), and it is unchanged on 7.2.9. slates refuses nothing,
+  because POSIX allows truncating an open file. The rule for users: do not shrink a file a guest maps while the guest
+  may touch the cut range.
+- **crosvm offers DAX on x86_64 only** (`cfg!(target_arch = "x86_64")`, TODO b/176129399, at 1c8d17a85). On an arm64
+  host the mount route under crosvm runs without DAX.
 
 ### 2026-10-22: a CI daemon's boot was refused because one shard used no CPU for a whole second while it started — open, not reproduced
 
