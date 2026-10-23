@@ -1206,9 +1206,37 @@ fn a_hard_link_outlives_its_first_name_through(path: &str) {
   // the client deletes at the last close on its own schedule; the scratch volume goes with the test.
 }
 
+/// `slates unmount PATH` as a test that just closed its files needs it: tried again while the kernel answers that the
+/// mount is busy, until [`WAIT_FOR`]; any other failure returns at once.
+///
+/// The tests share one process. Every child a test spawns gets a copy of every descriptor open in the process, other
+/// tests' files on their mounts included, and holds them from the fork until its `exec` closes them (`O_CLOEXEC`).
+/// A sibling's child forked just before a test closed its files, and slow to reach `exec` under load, holds them when
+/// that test unmounts, and the kernel rightly refuses `EBUSY`. Measured on the box 2026-10-23, at load average 81 to
+/// 114:
+/// - one test's dead daemon received `FLUSH`es on its two files from a dozen processes named after other tests'
+///   threads;
+/// - at a refused unmount, no process held the mount and its FUSE connection had nothing waiting;
+/// - the retry 0.5 s later succeeded.
+///
+/// The bug record: `docs/bugs/2026-10-23-a-cli-tests-unmount-met-a-sibling-tests-child-holding-its-files.md`.
+///
+/// Such a child reaches `exec` long before ten liveness budgets end, while a real holder stays and still fails the
+/// test. The product's `slates unmount` stays one attempt, truthful at the instant it is asked, as `fusermount3` is.
+fn unmount_through_the_cli(instance: &str, path: &str) -> (i32, String, String) {
+  let deadline = Instant::now() + WAIT_FOR;
+  loop {
+    let (code, out, err) = run(instance, &["unmount", path]);
+    if code == 0 || !err.contains("Device or resource busy") || Instant::now() >= deadline {
+      return (code, out, err);
+    }
+    pause();
+  }
+}
+
 /// `slates unmount DIR` removes the mount (a pure `umount`, no daemon needed).
 fn unmount_and_check(instance: &str, id: &str, path: &str) {
-  let (code, _out, err) = run(instance, &["unmount", path]);
+  let (code, _out, err) = unmount_through_the_cli(instance, path);
   assert_eq!(code, 0, "slates unmount failed: {err}");
   assert!(
     !is_mounted(path),
@@ -3793,7 +3821,7 @@ fn a_container_source_swapped_for_another_mount_is_refused() {
   let (code, before, err) = oci_check(&instance, &binding);
   assert_eq!(code, 0, "the source is the mount verified: {before}{err}");
   detach_all(&instance, &[binding["attachment"].as_u64().unwrap()]);
-  let (code, _, err) = run(&instance, &["unmount", &path]);
+  let (code, _, err) = unmount_through_the_cli(&instance, &path);
   assert_eq!(code, 0, "the verified mount is taken away: {err}");
   // The swap: another volume, the same path, and nothing in the kernel's table to tell them apart.
   mount_shared(&attacker);
@@ -4349,7 +4377,7 @@ fn a_deleted_files_plaintext_leaves_the_daemons_memory() {
   assert!(Command::new("rm").arg(&file).status().unwrap().success());
   let gone = wait_for(|| plaintext_in_content(pid, MARKER.as_bytes()) == 0);
   let left = plaintext_in_content(pid, MARKER.as_bytes());
-  let (code, _, err) = run(&instance, &["unmount", &mount_point.path]);
+  let (code, _, err) = unmount_through_the_cli(&instance, &mount_point.path);
   assert_eq!(code, 0, "{err}");
   assert!(
     written > 0,
@@ -4402,7 +4430,7 @@ fn fill_through_a_writable_mount(instance: &str, id: &str, path: &str) -> String
     write_with_the_shell(&file, "kept").status.success(),
     "a write through the writable mount"
   );
-  let (code, _, err) = run(instance, &["unmount", path]);
+  let (code, _, err) = unmount_through_the_cli(instance, path);
   assert_eq!(code, 0, "{err}");
   assert!(
     wait_for(|| mountinfo_at(path).is_none()),
@@ -4428,7 +4456,7 @@ fn the_read_only_mount_refuses_writes_and_reads(instance: &str, id: &str, path: 
     "EROFS from the kernel: {message}"
   );
   assert_eq!(std::fs::read(file).unwrap(), b"kept");
-  let (code, _, err) = run(instance, &["unmount", path]);
+  let (code, _, err) = unmount_through_the_cli(instance, path);
   assert_eq!(code, 0, "{err}");
 }
 
@@ -4580,7 +4608,7 @@ fn a_setuid_root_binary_on_a_shared_mount_runs_as_its_caller(instance: &str, id:
     "a setuid-root binary on the volume runs as its caller, never root"
   );
   shell(&format!("rm {planted}"));
-  let (code, _, err) = run(instance, &["unmount", &path]);
+  let (code, _, err) = unmount_through_the_cli(instance, &path);
   assert_eq!(code, 0, "{err}");
   drop(point);
 }
@@ -4610,7 +4638,7 @@ fn slates_mount_on_linux_serves_a_fuse_mount_and_unmount_ends_it() {
   };
   fuse_mount_and_check(&instance, &id, &mount_point.path);
   roundtrip_a_file_through(&mount_point.path);
-  let (code, _, err) = run(&instance, &["unmount", &mount_point.path]);
+  let (code, _, err) = unmount_through_the_cli(&instance, &mount_point.path);
   assert_eq!(code, 0, "slates unmount: {err}");
   assert!(
     mountinfo_at(&mount_point.path).is_none(),
@@ -4874,7 +4902,7 @@ impl HeldMount {
   }
 
   fn unmount(mut self) {
-    let (code, _, err) = run(&self.instance, &["unmount", &self.mount_point.path]);
+    let (code, _, err) = unmount_through_the_cli(&self.instance, &self.mount_point.path);
     assert_eq!(code, 0, "slates unmount: {err}");
     assert!(
       wait_for(|| attachments_of(&self.instance, &self.id) == "0"),
@@ -5544,7 +5572,7 @@ fn slates_mount_subtree_presents_one_directory_of_the_volume() {
   assert_ne!(code, 0, "a file is no subtree");
   assert!(!is_mounted(&refused.path), "nothing was mounted");
   for point in [&scoped.path, &whole.path] {
-    let (code, _, err) = run(&instance, &["unmount", point]);
+    let (code, _, err) = unmount_through_the_cli(&instance, point);
     assert_eq!(code, 0, "slates unmount: {err}");
   }
   drop(refused);
@@ -7040,7 +7068,7 @@ fn an_unshared_mount_is_bound_and_reported_unshared(instance: &str, id: &str) {
   // It is a real attachment now, so it is given back before the mount goes.
   let (code, _, err) = run(instance, &["detach", &json_field(&out, "attachment")]);
   assert_eq!(code, 0, "detach: {err}");
-  let (code, _, err) = run(instance, &["unmount", &point.path]);
+  let (code, _, err) = unmount_through_the_cli(instance, &point.path);
   assert_eq!(code, 0, "{err}");
 }
 

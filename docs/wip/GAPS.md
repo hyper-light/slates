@@ -10977,7 +10977,13 @@ pre-A-150 tree under the same load is owed to prove that.
   - Busy-machine robustness (the norm, per the measurement rules) owes either a lease that allows for measured
     starvation, or a client that stages again on `NotFound`.
 - **`fusermount3` refused an unmount, "Device or resource busy"** (the takeover-with-open-files test, 3 of 8).
-  Unexplained. The box's KDE session, which probes every new mount, is a suspect.
+  **Explained and fixed in the tests, 2026-10-23.** Not the product, and not KDE (which does probe slates mounts, but
+  was not the holder). It was a sibling test's child: every child the one CLI test process spawns holds copies of
+  every test's open FUSE descriptors from the fork until its `exec`. Under load that window holds a mount a test has
+  just closed its files on. The request logs showed one test's files flushed by a dozen other tests' children, and the
+  refused unmount had no holder by the probes and succeeded on retry. The tests' unmount helper now retries the busy
+  answer within `WAIT_FOR`
+  (`docs/bugs/2026-10-23-a-cli-tests-unmount-met-a-sibling-tests-child-holding-its-files.md`).
 
 ### 2026-10-22: a base file opened before a takeover read the file an outsider put at its name — fixed (A-151)
 
