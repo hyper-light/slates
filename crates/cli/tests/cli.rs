@@ -5797,15 +5797,17 @@ impl MappedThroughAMount {
   }
 
   /// As [`MappedThroughAMount::new`], with `map.bin` and its map `pages` pages long.
-  #[allow(clippy::disallowed_methods)] // the test's own calls through the slates mount: RAM, not disk
   fn with_pages(tag: &str, seed: u8, pages: usize) -> MappedThroughAMount {
+    MappedThroughAMount::with_quota(tag, seed, pages, "8MiB")
+  }
+
+  /// As [`MappedThroughAMount::with_pages`], on a volume bounded to `quota` (as `volume create --bounded` takes it).
+  #[allow(clippy::disallowed_methods)] // the test's own calls through the slates mount: RAM, not disk
+  fn with_quota(tag: &str, seed: u8, pages: usize, quota: &str) -> MappedThroughAMount {
     use std::os::fd::AsFd;
     let instance = format!("cli-{tag}-{}", std::process::id());
     let anchor = start_anchor(&instance);
-    let (code, out, err) = run(
-      &instance,
-      &["volume", "create", "maps", "--bounded", "8MiB"],
-    );
+    let (code, out, err) = run(&instance, &["volume", "create", "maps", "--bounded", quota]);
     assert_eq!(code, 0, "{err}");
     let id = value_of(&out, "id");
     let deadlines = slates_client::Deadlines::derive(
@@ -6803,6 +6805,9 @@ fn a_long_lived_maps_write_back_survives_unrelated_activity_past_the_journal() {
 /// 10‰ share of it is under a page), so the journal keeps a page's worth of records: some 46 at 4 KiB.
 #[cfg(target_os = "linux")]
 const ONE_PAGE_JOURNAL_QUOTA: &str = "256KiB";
+/// Shape: [`ONE_PAGE_JOURNAL_QUOTA`] in bytes.
+#[cfg(target_os = "linux")]
+const ONE_PAGE_JOURNAL_QUOTA_BYTES: usize = 256 << 10;
 /// Shape: the replacements of another file sent in one batch after the change the mount must hear of. Each journals
 /// at least two records, so the batch alone holds more than a one-page journal keeps; with the first, one ring's
 /// worth of requests (32 slots, the daemon's boot log).
@@ -6949,6 +6954,138 @@ fn a_change_reaches_the_mount_even_when_more_follow_than_the_journal_keeps() {
   assert!(
     fixture.comes_to_read("a.bin", &[b'Z'; PIPELINED_FILE_BYTES]),
     "the mount still serves the old bytes after {WAIT_FOR:?}, not the replacement"
+  );
+}
+
+/// The metadata the daemon's shards have committed from their ledgers, summed from `slates status`
+/// (`shard N: ... committed_metadata=K ...`).
+#[cfg(target_os = "linux")]
+fn committed_metadata(instance: &str) -> u64 {
+  let (_, out, _) = run(instance, &["status"]);
+  out
+    .lines()
+    .filter_map(|line| {
+      line
+        .split_once(" committed_metadata=")
+        .map(|(_, rest)| rest)
+    })
+    .filter_map(|rest| rest.split_whitespace().next()?.parse::<u64>().ok())
+    .sum()
+}
+
+/// Step 2 of "Journal budget derived" (a mount's byte states charged to the shard's metadata ledger while it lives): do
+/// read the metadata the daemon's shards have committed, mount a volume through FUSE, write a file through it (its
+/// writable open gives the file byte states), then unmount; expect the committed metadata to have grown by the states'
+/// room while the mount lived, and to come back to where it was once the mount ended.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_fuse_mounts_byte_states_are_charged_while_it_lives_and_returned_when_it_ends() {
+  if !linux_fuse_mount_runs() {
+    return;
+  }
+  let instance = format!("cli-charged-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "chargedvol", "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let before = committed_metadata(&instance);
+  let point = MountPoint {
+    path: fresh_mount_point(),
+  };
+  fuse_mount_and_check(&instance, &id, &point.path);
+  assert!(
+    write_with_the_shell(&format!("{}/charged.txt", point.path), "x")
+      .status
+      .success(),
+    "a write through the mount"
+  );
+  let during = committed_metadata(&instance);
+  assert!(
+    during > before,
+    "the mount's byte states are charged: {during} committed, {before} before the mount"
+  );
+  let (code, _, err) = unmount_through_the_cli(&instance, &point.path);
+  assert_eq!(code, 0, "{err}");
+  let mut after = 0;
+  let returned = wait_for(|| {
+    after = committed_metadata(&instance);
+    after == before
+  });
+  assert!(
+    returned,
+    "the ended mount's charge came back: {after} committed, {before} before the mount, {during} while it lived"
+  );
+}
+
+/// Shape: single bytes the scattered-writes test writes through a second mount, each a run of stale bytes in the mapped
+/// file: with the fresh runs between and after them, 60 ranges, past the one-page journal's capacity (about 51 records
+/// at 4 KiB), and fewer records than that journal keeps (about 47), so no round can overrun whatever the rounds' pace.
+#[cfg(target_os = "linux")]
+const SCATTERED_WRITES: usize = 30;
+/// Shape: the distance between the scattered writes: four to a 4 KiB page, so they fill the file's first pages.
+#[cfg(target_os = "linux")]
+const SCATTERED_STRIDE: usize = 1024;
+/// Shape: the mapped file's pages in the scattered-writes test: the scattered writes' and an untouched last one.
+#[cfg(target_os = "linux")]
+const SCATTERED_PAGES: usize = 16;
+
+/// Step 2 of "Journal budget derived" (the byte states charged to the metadata ledger, not bounded by the journal's
+/// capacity). Do, on a 256 KiB volume (a one-page journal):
+/// - map a 16-page file through a FUSE mount and read it whole;
+/// - write 30 single bytes a kilobyte apart through a second mount, as another path;
+/// - store a byte through the map in the last page, which none of them touched, and msync.
+///
+/// Expect the msync to succeed, no round to have overrun, no file lost for want of room, and slates to hold the store and
+/// every single byte. Before, the file's states needed 60 ranges, past the one-page journal's capacity, so the file was
+/// lost and the msync answered `EIO`. Linux only, as the other FUSE map tests are.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_mapped_files_write_back_survives_more_scattered_changes_than_the_journal_holds_records() {
+  if !live_mount_runs() {
+    return;
+  }
+  let page = rustix::param::page_size();
+  if SCATTERED_PAGES.saturating_mul(page) * 2 > ONE_PAGE_JOURNAL_QUOTA_BYTES {
+    eprintln!(
+      "SKIP a_mapped_files_write_back_survives_more_scattered_changes: {SCATTERED_PAGES} pages of {page} bytes \
+       leave the {ONE_PAGE_JOURNAL_QUOTA} volume no room"
+    );
+    return;
+  }
+  let mut fixture =
+    MappedThroughAMount::with_quota("scattered", b'A', SCATTERED_PAGES, ONE_PAGE_JOURNAL_QUOTA);
+  let length = fixture.length;
+  assert!(
+    fixture.view().iter().all(|&byte| byte == b'A'),
+    "the map reads the file whole, every page fetched"
+  );
+  let second = fixture.mount_again();
+  for write in 0..SCATTERED_WRITES {
+    second.write_at(write * SCATTERED_STRIDE, b"z");
+  }
+  let stored_at = (SCATTERED_PAGES - 1) * fixture.page + 7;
+  fixture.write_through_map(stored_at, b"S");
+  assert_eq!(
+    counter_of(&fixture.instance, "fuse.journal_overruns"),
+    0,
+    "no round overran: the file's states, not the journal, are what this tests"
+  );
+  assert_eq!(
+    counter_of(&fixture.instance, "fuse.states_lost_for_room"),
+    0,
+    "no file was lost for want of room"
+  );
+  let mut expected = vec![b'A'; length];
+  for write in 0..SCATTERED_WRITES {
+    expected[write * SCATTERED_STRIDE] = b'z';
+  }
+  expected[stored_at] = b'S';
+  assert!(
+    fixture.volume_bytes() == expected,
+    "slates holds the store through the map and every single byte through the second mount"
   );
 }
 

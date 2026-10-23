@@ -110,10 +110,14 @@ const ENTRY_INVALIDATION_REFUSED: &str = "fuse.entry_invalidation_refused";
 /// write-back rule's non-vacuity count: it moves only when the rule protected a write.
 const WRITEBACK_BYTES_KEPT_BACK: &str = "fuse.writeback_bytes_kept_back";
 /// Format: cache write-backs refused `EIO` because which of their bytes were stale could not be told: the file's byte
-/// states were lost (more ranges than the journal's capacity, or the journal no longer held the records since the
+/// states were lost (the metadata ledger refused their room, or the journal no longer held the records since the
 /// mount last consumed it), or a file with no states was judged against records already gone. Zero is the healthy
 /// reading.
 const WRITEBACKS_UNKNOWN: &str = "fuse.writebacks_unknown";
+/// Format: files whose byte states were lost because the shard's metadata ledger refused to grow their mount's room
+/// (§4.2; the plan "Journal budget derived", step 2): their write-backs are refused `EIO` until their last writable
+/// release. Zero is the healthy reading; movement means the shard's metadata class is full.
+const STATES_LOST_FOR_ROOM: &str = "fuse.states_lost_for_room";
 /// Format: rounds that found a mount behind its volume journal's retention, so the changes it missed could no longer be
 /// named, and that invalidated everything its kernel held instead (A-141;
 /// `docs/bugs/2026-10-22-a-mount-that-falls-behind-the-journal-never-hears-of-the-changes-it-missed.md`). Zero is the
@@ -757,6 +761,8 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
   s.count(WRITEBACKS_UNKNOWN, unknown);
   let overruns = mount.serve.take_journal_overruns();
   s.count(JOURNAL_OVERRUNS, overruns);
+  let lost_for_room = mount.serve.take_states_lost_for_room();
+  s.count(STATES_LOST_FOR_ROOM, lost_for_room);
   // What a delivering turn delivered is behind it — the owed round, and any change it made itself, which its own
   // kernel needs no notice of — so the task parks past the generation as it now stands. Any other path's change after
   // this point moves the generation again and wakes it.
@@ -1102,6 +1108,7 @@ fn adopt_one(s: &mut ShardState, record: AttachmentRecord, held: crate::fuse_hol
 fn ended(s: &mut ShardState, attachment: u64) {
   if let Some(mount) = s.fuse_mounts.remove(&attachment) {
     close_journal_reader(s, &mount);
+    release_states(s, &mount);
     s.attachments.revoke(mount.registry);
     s.attachments.drain(mount.registry);
   }
@@ -1143,6 +1150,7 @@ pub(crate) fn drop_devices(s: &mut ShardState) {
   for attachment in attachments {
     if let Some(mount) = s.fuse_mounts.remove(&attachment) {
       close_journal_reader(s, &mount);
+      release_states(s, &mount);
     }
     let _ = crate::fuse_hold::release(attachment);
   }
@@ -1157,6 +1165,17 @@ fn open_journal_reader(s: &mut ShardState, volume: VolumeId, registry: Attachmen
     && let Ok(slot) = s.volumes.get_mut(handle)
   {
     slot.volume.open_journal_reader(registry.key());
+  }
+}
+
+/// Returns to the shard's metadata ledger what `mount`'s byte states were admitted (§4.2): charged while the mount
+/// lived, given back when it is removed for good (`ended`, `drop_devices`), the only places a mount ends.
+fn release_states(s: &mut ShardState, mount: &FuseMount) {
+  let bytes = mount.serve.states_charged();
+  if bytes > 0 {
+    s.store
+      .metadata
+      .release(slates_mem::budget::MetadataCredit { bytes });
   }
 }
 

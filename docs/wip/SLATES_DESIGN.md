@@ -2330,9 +2330,10 @@ re-fetch of bytes another path had changed was then kept back, and lost. **A REA
 opened `O_DIRECT` is ambiguous** (A-144). It is a direct read, which leaves the kernel's copy as it was, or a fill of
 that copy (a fault on a map of the handle, a buffered fallback), and FUSE carries nothing that tells them apart. So it
 leaves the bytes that are fresh either way as they are, and makes the others unknown. Counted as a fetch, one direct
-read once marked a stale cached page fresh, and that page's write-back undid another path's write. Where the states
-cannot tell, the write-back is refused `EIO` rather than guessed:
-- a file past its bound;
+read once marked a stale cached page fresh, and that page's write-back undid another path's write. The states are
+charged to the shard's metadata ledger while the mount lives, a range at a time and a page of ranges per reservation
+(A-155). Where the states cannot tell, the write-back is refused `EIO` rather than guessed:
+- a file whose states the ledger would not admit;
 - a mount fallen behind the journal's retention;
 - a write-back over an unknown byte.
 
@@ -11985,6 +11986,55 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
+
+### A-155 — A mount's byte states are charged to the metadata ledger, not bounded by the journal (accepted 2026-10-23)
+Applied in the same change to:
+- §4.6 (the write-back rule's refusals);
+- A-140's bound (superseded);
+- `crates/bridge-fuse/src/coherence.rs`: `PageStates` keeps the ranges it holds and the room the ledger admitted, a
+  file whose update would pass the room is lost (`take_lost_for_room`), and the per-call bound is gone;
+  `RANGE_BYTES`, `MOST_ADDED_BY_AN_UPDATE`, `most_added_by_an_ambiguous_read`;
+- `crates/bridge-fuse/src/channel.rs`: `make_room` before each update that can add ranges, a page of ranges per
+  reservation; `ServeState::states_charged`;
+- `crates/bridge-core`: `Bridge::admit_states` (`volume_bridge.rs` reserves from the shard's metadata ledger;
+  `scoped.rs`; the test bridge in `crates/bridge-fuse/tests`);
+- `crates/server/src/fuse.rs`: `release_states` in `ended` and `drop_devices`; the counter `fuse.states_lost_for_room`;
+- the tests:
+  - `coherence.rs`: the byte-state oracle now grows a just-sufficient room before each event and requires no
+    file lost; `a_full_room_loses_only_the_file_being_updated`;
+  - `crates/cli/tests/cli.rs`:
+    - `a_mapped_files_write_back_survives_more_scattered_changes_than_the_journal_holds_records`;
+    - `a_fuse_mounts_byte_states_are_charged_while_it_lives_and_returned_when_it_ends`;
+- GAPS.
+
+- **What it answers.** A-140 bounded each file's byte states by the journal's capacity: the budget over a record's
+  fixed size. The states are in no way the journal's records, and they were charged to no ledger (§4.2: "an
+  uncharged heap allocation cannot sit outside the bound"). The bound was only borrowed. The journal's budget is
+  becoming the measured product (the plan "Journal budget derived"), which on a quiet volume is the one-page floor.
+  A file would then be lost past about 51 ranges instead of the 850 an 8 MiB volume's share allowed. A file another
+  path changes in scattered places while a mount holds it open, mapped or for writing, needs more than that.
+- **The rule.** A mount's byte states are charged to the shard's metadata ledger at `RANGE_BYTES` a range, as the
+  journal charges a record its fixed size.
+  - Before an update that can add ranges, the mount grows the states' room by that update's most:
+    - two for an update of one range;
+    - one per run an ambiguous read covers.
+    The room grows a page of ranges at a time, so a mount asks the ledger once a page of states.
+  - An update that would take the ranges held past the room loses its file, as the old bound did, and is counted
+    (`fuse.states_lost_for_room`). So a file is lost only when the ledger refuses.
+  - The mount's owner returns the charge when the mount ends. The room never shrinks while the mount lives, as the
+    journal's budget will not.
+- **Why it is exact.** The oracle grows the room before each event by exactly the event's stated most, and no history
+  of 2000 loses the file. A stated most below an update's real growth would lose it and fail the comparison with the
+  per-byte model.
+- **What it costs.** One ledger reservation per page of ranges (128 at 4 KiB, 32 bytes each). The unused room stays
+  under a page per mount.
+- **Evidence.** On the box (Linux 7.2.9), with step 2's files restored to the previous commit:
+  - the scattered-changes test's `msync` answered `EIO` (30 single bytes a kilobyte apart through a second mount, on
+    a 256 KiB volume: 60 ranges, past the one-page journal's 51);
+  - the charge test read 89,902 bytes committed before the mount and while it lived.
+  With the change, both pass. The scattered-changes test asserts no overrun and no file lost for want of room, and the
+  charge test asserts the committed metadata back where it was once the mount ended. The full slates-cli suite passes
+  twice (61/61), and bridge-fuse passes 135 tests in 19 suites.
 
 ### A-154 — A release of an open a publication counted is published before its reply (accepted 2026-10-23)
 Applied in the same change to:

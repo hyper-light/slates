@@ -672,4 +672,11 @@ pub trait Bridge {
   fn journal_capacity(&mut self, _cx: &OpContext) -> usize {
     0
   }
+  /// Reserves `bytes` of the shard's metadata ledger (§4.2, the metadata dimension) for state the transport keeps on
+  /// this attachment's behalf: a FUSE mount's byte states. Whole or not at all; `true` when reserved. What a transport
+  /// was admitted is its owner's to return to the ledger when the attachment ends. The default, `false`, is a bridge
+  /// with no ledger.
+  fn admit_states(&mut self, _cx: &OpContext, _bytes: u64) -> bool {
+    false
+  }
 }

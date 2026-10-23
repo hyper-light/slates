@@ -37,7 +37,10 @@ use rustix::fs::{Mode, OFlags};
 use crate::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
 use crate::allocate::{Allocation, Begun};
 use crate::bridge::{Bridge, KernelChange};
-use crate::coherence::{Coherence, Delivered, KernelHolds, OwnRecords, PageStates, WritableOpens};
+use crate::coherence::{
+  Coherence, Delivered, KernelHolds, MOST_ADDED_BY_AN_UPDATE, OwnRecords, PageStates, RANGE_BYTES,
+  WritableOpens,
+};
 use crate::dispatch;
 use crate::error::FuseError;
 use crate::init::negotiate;
@@ -621,6 +624,9 @@ pub struct ServeState {
   /// Rounds that found this mount behind the journal's retention and invalidated everything its kernel holds, since
   /// this was last read. Read and cleared by the owner that reports it.
   journal_overruns: u64,
+  /// The bytes of the shard's metadata ledger admitted for this mount's byte states ([`make_room`]). Returned to the
+  /// ledger by the mount's owner when the mount ends ([`ServeState::states_charged`]).
+  states_charged: u64,
 }
 
 impl std::fmt::Debug for ServeState {
@@ -654,7 +660,20 @@ impl ServeState {
       writebacks_unknown: 0,
       holds: KernelHolds::default(),
       journal_overruns: 0,
+      states_charged: 0,
     }
+  }
+
+  /// The bytes of the shard's metadata ledger this mount's byte states were admitted ([`make_room`]): what its owner
+  /// returns to the ledger when the mount ends, so the mount's states are charged while it lives and not after.
+  pub fn states_charged(&self) -> u64 {
+    self.states_charged
+  }
+
+  /// The files whose byte states were lost for want of room since this was last asked, and zero afterwards: the ledger
+  /// refused to grow the room ([`PageStates::take_lost_for_room`]). Zero is the healthy reading.
+  pub fn take_states_lost_for_room(&mut self) -> u64 {
+    self.states.take_lost_for_room()
   }
 
   /// The bytes of cache write-backs kept back since this was last asked, and zero afterwards
@@ -1054,6 +1073,7 @@ fn note_opens_and_fetches(
         if let Some(reply) = state.reply.get_mut(..len) {
           crate::bridge::clear_keep_cache(parsed.opcode, reply);
         }
+        make_room(bridge, cx, state, 1);
         state.states.opened(file, bridge.seen(cx).journal_seq);
       }
     }
@@ -1101,16 +1121,20 @@ fn note_read(
     return;
   }
   let end = read.offset.saturating_add(u64::from(read.size));
-  let bound = bridge.journal_capacity(cx);
   if !may_bypass_the_cache(read.flags) {
-    state.states.fetched(ino, read.offset..end, before, bound);
+    make_room(bridge, cx, state, MOST_ADDED_BY_AN_UPDATE);
+    state.states.fetched(ino, read.offset..end, before);
     return;
   }
   match pending_changes(ino, started_at, bridge, cx, state) {
     Some(pending) => {
+      let most = state
+        .states
+        .most_added_by_an_ambiguous_read(ino, pending.len());
+      make_room(bridge, cx, state, most);
       state
         .states
-        .read_ambiguously(ino, read.offset..end, before, &pending, bound);
+        .read_ambiguously(ino, read.offset..end, before, &pending);
     }
     // As a round that finds the journal no longer reaching back loses every tracked file.
     None => state.states.lose_all(),
@@ -1154,10 +1178,13 @@ fn adopt_unseen_handle(
     return;
   }
   let changes = pending_changes(ino, started_at, bridge, cx, state);
-  let bound = bridge.journal_capacity(cx);
-  state
-    .states
-    .adopted(ino, started_at, changes.as_deref(), bound);
+  let most = changes
+    .as_ref()
+    .map_or(0, Vec::len)
+    .saturating_mul(MOST_ADDED_BY_AN_UPDATE)
+    .saturating_add(1);
+  make_room(bridge, cx, state, most);
+  state.states.adopted(ino, started_at, changes.as_deref());
 }
 
 /// Feeds what `request` made the kernel hold now that its reply of `len` bytes reached it — or at once, for a request
@@ -1206,14 +1233,57 @@ fn note_own_records(
   let mut changes = Vec::new();
   match bridge.data_changes(cx, before, &mut changes) {
     Ok(true) => {
+      make_room(
+        bridge,
+        cx,
+        state,
+        changes.len().saturating_mul(MOST_ADDED_BY_AN_UPDATE),
+      );
       for change in changes {
         state
           .states
-          .changed(change.ino, change.range, change.seq, true, capacity);
+          .changed(change.ino, change.range, change.seq, true);
       }
     }
     Ok(false) | Err(_) => state.states.lose_all(),
   }
+}
+
+/// Grows the byte states' room to hold `more` ranges beyond those they hold (§4.2, the metadata dimension): asked of the
+/// shard's metadata ledger through the bridge, a page of ranges at a time ([`ranges_per_page`]), so a mount asks the
+/// ledger once a page of states and its unused room stays under a page. The bytes admitted are charged to the mount
+/// until it ends ([`ServeState::states_charged`]). A refusal leaves the room as it is, and an update that would pass it
+/// loses its file, counted ([`ServeState::take_states_lost_for_room`]).
+fn make_room(
+  bridge: &mut dyn Bridge,
+  cx: &slates_bridge_core::OpContext,
+  state: &mut ServeState,
+  more: usize,
+) {
+  let short = state
+    .states
+    .held()
+    .saturating_add(more)
+    .saturating_sub(state.states.room());
+  if short == 0 {
+    return;
+  }
+  let per_page = ranges_per_page();
+  let ranges = short.div_ceil(per_page).saturating_mul(per_page);
+  let bytes = u64::try_from(ranges.saturating_mul(RANGE_BYTES)).unwrap_or(u64::MAX);
+  if bridge.admit_states(cx, bytes) {
+    state.states.grow_room(ranges);
+    state.states_charged = state.states_charged.saturating_add(bytes);
+  }
+}
+
+/// Derived: the byte-state ranges one page of the host's memory holds — the page size over [`RANGE_BYTES`], at least
+/// one — the granule the states' room grows by.
+fn ranges_per_page() -> usize {
+  rustix::param::page_size()
+    .checked_div(RANGE_BYTES)
+    .unwrap_or(1)
+    .max(1)
 }
 
 /// Feeds the journal's data changes after `since` to the byte states, each the mount's own or another path's by its
@@ -1235,12 +1305,17 @@ fn feed_states(
     state.states.lose_all();
     return;
   }
-  let capacity = bridge.journal_capacity(cx);
+  make_room(
+    bridge,
+    cx,
+    state,
+    changes.len().saturating_mul(MOST_ADDED_BY_AN_UPDATE),
+  );
   for change in changes {
     let own = state.own.took(change.seq);
     state
       .states
-      .changed(change.ino, change.range, change.seq, own, capacity);
+      .changed(change.ino, change.range, change.seq, own);
   }
   // The same synchronous turn as the walk: no record can have come between it and this reading of the head.
   state.states.consumed(bridge.seen(cx).journal_seq);

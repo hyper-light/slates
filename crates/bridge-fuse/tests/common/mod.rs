@@ -355,4 +355,8 @@ impl<B: Bridge> Bridge for FailingGather<B> {
   fn journal_capacity(&mut self, cx: &OpContext) -> usize {
     self.inner.journal_capacity(cx)
   }
+
+  fn admit_states(&mut self, cx: &OpContext, bytes: u64) -> bool {
+    self.inner.admit_states(cx, bytes)
+  }
 }

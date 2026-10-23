@@ -469,6 +469,10 @@ impl Bridge for ScopedBridge<'_> {
     self.inner.journal_capacity(cx)
   }
 
+  fn admit_states(&mut self, cx: &OpContext, bytes: u64) -> bool {
+    self.inner.admit_states(cx, bytes)
+  }
+
   fn invalidations(
     &mut self,
     cx: &OpContext,

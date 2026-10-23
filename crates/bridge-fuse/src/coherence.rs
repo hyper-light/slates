@@ -240,7 +240,14 @@ impl WritableOpens {
 /// Once the mount has consumed every record through its cursor ([`PageStates::consumed`]), the points at or below it can
 /// no longer be told apart by any record to come, so they are raised to it and their ranges merge. What remains is one
 /// range per run of stale or fresh bytes. Without the raise, a long-lived map faulted in a page at a time while the
-/// volume is busy keeps one range per page and passes the bound.
+/// volume is busy keeps one range per page.
+///
+/// The ranges are charged to the shard's metadata ledger (§4.2, the metadata dimension), [`RANGE_BYTES`] each, as the
+/// journal charges a record its fixed size: the owner grows the states' room before an update that can add ranges
+/// ([`PageStates::grow_room`]), and a file whose update would take the ranges held past the room is lost, and counted.
+/// So a file is lost only when the ledger refuses, and no range is held uncharged. Until 2026-10-23 each file's bound
+/// was the journal's capacity, which the journal's derived budget would have shrunk to about 46 ranges on a quiet
+/// volume.
 ///
 /// Two designs before this were measured and rejected (the bug record). Judged by invalidation rounds, a write-back
 /// failed 9 runs of 10, since Linux 6.12 writes back from a temporary copy an invalidation passes. Judged by walking the
@@ -252,7 +259,20 @@ pub struct PageStates {
   /// The files changed since the last [`PageStates::consumed`], each listed once: only their points can need raising.
   /// Bounded by the tracked files.
   touched: Vec<u64>,
+  /// The ranges every tracked file holds between them; a lost file holds none.
+  held: usize,
+  /// The ranges the shard's metadata ledger has admitted for these states ([`PageStates::grow_room`]).
+  room: usize,
+  /// Files lost because an update found no room, since this was last read ([`PageStates::take_lost_for_room`]).
+  lost_for_room: u64,
 }
+
+/// Format: what one byte-state range is charged against the shard's metadata ledger: its start and its end, point and
+/// state, as the journal charges a record its fixed size (`size_of::<OpRecord>()`).
+pub const RANGE_BYTES: usize = size_of::<u64>() + size_of::<(u64, u64, Byte)>();
+
+/// Shape: the most ranges one update of one range can add to a file: a split at each of its ends.
+pub const MOST_ADDED_BY_AN_UPDATE: usize = 2;
 
 /// What the mount knows of one byte of its kernel's cached copy, beside the point that copy is as of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,20 +291,68 @@ enum Byte {
 struct FileStates {
   /// Start → (end, point, state), disjoint and covering every byte; touching neighbours of one state are merged.
   ranges: std::collections::BTreeMap<u64, (u64, u64, Byte)>,
-  /// The file needed more ranges than the bound: what its kernel holds can no longer be told.
+  /// The file needed ranges the ledger would not admit, or the journal stopped reaching back for it: what its kernel
+  /// holds can no longer be told.
   lost: bool,
   /// Listed in [`PageStates::touched`].
   touched: bool,
 }
 
 impl PageStates {
+  /// The ranges every tracked file holds between them.
+  pub fn held(&self) -> usize {
+    self.held
+  }
+
+  /// The ranges the ledger has admitted for these states.
+  pub fn room(&self) -> usize {
+    self.room
+  }
+
+  /// The ledger has admitted `ranges` more ranges for these states.
+  pub fn grow_room(&mut self, ranges: usize) {
+    self.room = self.room.saturating_add(ranges);
+  }
+
+  /// The files lost for want of room since this was last asked, and zero afterwards. Zero is the healthy reading.
+  pub fn take_lost_for_room(&mut self) -> u64 {
+    std::mem::take(&mut self.lost_for_room)
+  }
+
+  /// The most ranges an ambiguous read of `ino` can add when `pending` changes are not yet consumed: one update per
+  /// run the read covers, and a run per range the file holds and per split the changes make, plus one.
+  pub fn most_added_by_an_ambiguous_read(&self, ino: u64, pending: usize) -> usize {
+    let held = self.files.get(&ino).map_or(0, |file| file.ranges.len());
+    held
+      .saturating_add(pending.saturating_mul(MOST_ADDED_BY_AN_UPDATE))
+      .saturating_add(1)
+      .saturating_mul(MOST_ADDED_BY_AN_UPDATE)
+  }
+
+  /// Charges the change in `ino`'s ranges from `before`, and loses the file if the ranges held then pass the room: the
+  /// ledger did not admit them. A lost file holds no ranges.
+  fn settle(&mut self, ino: u64, before: usize) {
+    let Some(file) = self.files.get_mut(&ino) else {
+      return;
+    };
+    let after = file.ranges.len();
+    self.held = self.held.saturating_sub(before).saturating_add(after);
+    if self.held > self.room {
+      self.held = self.held.saturating_sub(after);
+      file.ranges.clear();
+      file.lost = true;
+      self.lost_for_room = self.lost_for_room.saturating_add(1);
+    }
+  }
+
   /// The file `ino` is opened for writing for the first time on this mount, at journal point `point`, the kernel told
   /// to drop its cached pages: every byte is fresh as of `point`. A file already tracked keeps its states.
   pub fn opened(&mut self, ino: u64, point: u64) {
-    self
-      .files
-      .entry(ino)
-      .or_insert_with(|| FileStates::fresh(point));
+    if self.files.contains_key(&ino) {
+      return;
+    }
+    self.files.insert(ino, FileStates::fresh(point));
+    self.settle(ino, 0);
   }
 
   /// The file `ino` was open for writing in the kernel before this mount served it — a mount taken over from a daemon
@@ -299,7 +367,6 @@ impl PageStates {
     ino: u64,
     start: u64,
     changes: Option<&[(std::ops::Range<u64>, u64, bool)]>,
-    bound: usize,
   ) {
     if self.files.contains_key(&ino) {
       return;
@@ -308,7 +375,7 @@ impl PageStates {
     match changes {
       Some(changes) => {
         for (range, seq, own) in changes {
-          file.change(range.clone(), *seq, *own, bound);
+          file.change(range.clone(), *seq, *own);
         }
         file.touch(ino, &mut self.touched);
       }
@@ -318,6 +385,7 @@ impl PageStates {
       }
     }
     self.files.insert(ino, file);
+    self.settle(ino, 0);
   }
 
   /// Whether `ino` is tracked.
@@ -326,11 +394,14 @@ impl PageStates {
   }
 
   /// Bytes `range` of `ino` were fetched at head `point`: fresh as of it. Nothing for a file not tracked.
-  pub fn fetched(&mut self, ino: u64, range: std::ops::Range<u64>, point: u64, bound: usize) {
-    if let Some(file) = self.files.get_mut(&ino) {
-      file.update(range, bound, |_, _| (point, Byte::Fresh));
-      file.touch(ino, &mut self.touched);
-    }
+  pub fn fetched(&mut self, ino: u64, range: std::ops::Range<u64>, point: u64) {
+    let Some(file) = self.files.get_mut(&ino) else {
+      return;
+    };
+    let before = file.ranges.len();
+    file.update(range, |_, _| (point, Byte::Fresh));
+    file.touch(ino, &mut self.touched);
+    self.settle(ino, before);
   }
 
   /// Bytes `range` of `ino` were read at head `point` through a handle that may bypass the kernel's page cache
@@ -344,36 +415,33 @@ impl PageStates {
     range: std::ops::Range<u64>,
     point: u64,
     pending: &[(std::ops::Range<u64>, u64, bool)],
-    bound: usize,
   ) {
     let Some(file) = self.files.get_mut(&ino) else {
       return;
     };
+    let before = file.ranges.len();
     let mut scratch = file.clipped(range.clone());
     for (changed, seq, own) in pending {
-      scratch.change(changed.clone(), *seq, *own, usize::MAX);
+      scratch.change(changed.clone(), *seq, *own);
     }
     for part in scratch.not_fresh_within(range) {
-      file.update(part, bound, |_, _| (point, Byte::Unknown));
+      file.update(part, |_, _| (point, Byte::Unknown));
     }
     file.touch(ino, &mut self.touched);
+    self.settle(ino, before);
   }
 
   /// A journal change to `ino`'s bytes `range` at sequence `seq`: the mount's own (`own`), which refreshes the bytes
   /// fetched before it, or another path's, which leaves them stale. Nothing for a file not tracked. Applying one twice is
   /// harmless: a refresh only raises a point, and a byte already past `seq` is untouched.
-  pub fn changed(
-    &mut self,
-    ino: u64,
-    range: std::ops::Range<u64>,
-    seq: u64,
-    own: bool,
-    bound: usize,
-  ) {
-    if let Some(file) = self.files.get_mut(&ino) {
-      file.change(range, seq, own, bound);
-      file.touch(ino, &mut self.touched);
-    }
+  pub fn changed(&mut self, ino: u64, range: std::ops::Range<u64>, seq: u64, own: bool) {
+    let Some(file) = self.files.get_mut(&ino) else {
+      return;
+    };
+    let before = file.ranges.len();
+    file.change(range, seq, own);
+    file.touch(ino, &mut self.touched);
+    self.settle(ino, before);
   }
 
   /// The mount has consumed every journal record through `through`: each was applied with [`PageStates::changed`]. Any
@@ -381,11 +449,15 @@ impl PageStates {
   /// it, and the ranges they split merge. Only the files changed since the last call are walked, since the others hold
   /// one point already.
   pub fn consumed(&mut self, through: u64) {
-    for ino in self.touched.drain(..) {
-      if let Some(file) = self.files.get_mut(&ino) {
-        file.touched = false;
-        file.raise_points(through);
-      }
+    let touched = std::mem::take(&mut self.touched);
+    for ino in touched {
+      let Some(file) = self.files.get_mut(&ino) else {
+        continue;
+      };
+      let before = file.ranges.len();
+      file.touched = false;
+      file.raise_points(through);
+      self.settle(ino, before);
     }
   }
 
@@ -405,7 +477,7 @@ impl PageStates {
       None => FileStates::fresh(untracked).clipped(range.clone()),
     };
     for (changed, seq, own) in pending {
-      scratch.change(changed.clone(), *seq, *own, usize::MAX);
+      scratch.change(changed.clone(), *seq, *own);
     }
     scratch.known_stale_within(range)
   }
@@ -419,12 +491,17 @@ impl PageStates {
       file.touched = false;
     }
     self.touched.clear();
+    self.held = 0;
   }
 
   /// The file `ino` has no writable open left on this mount: its states go. No write-back of it can follow, since a
   /// write-back holds its file open until it is answered, so the file's release comes after.
   pub fn dropped(&mut self, ino: u64) {
-    if self.files.remove(&ino).is_some_and(|file| file.touched) {
+    let Some(file) = self.files.remove(&ino) else {
+      return;
+    };
+    self.held = self.held.saturating_sub(file.ranges.len());
+    if file.touched {
       self.touched.retain(|&listed| listed != ino);
     }
   }
@@ -479,8 +556,8 @@ impl FileStates {
   /// A journal change at `seq`: bytes in `range` with an older point are refreshed (`own`) or left stale. An unknown byte
   /// is either reading of it, and the change settles both alike: the mount's own write refreshed the kernel's copy, and
   /// another path's made it stale whether the ambiguous read had filled it or not.
-  fn change(&mut self, range: std::ops::Range<u64>, seq: u64, own: bool, bound: usize) {
-    self.update(range, bound, |point, byte| {
+  fn change(&mut self, range: std::ops::Range<u64>, seq: u64, own: bool) {
+    self.update(range, |point, byte| {
       if point >= seq {
         (point, byte)
       } else if own {
@@ -491,14 +568,9 @@ impl FileStates {
     });
   }
 
-  /// Gives every byte of `range` the state `f` makes of its current one, then merges touching neighbours of one state.
-  /// Past `bound` ranges the file is lost.
-  fn update(
-    &mut self,
-    range: std::ops::Range<u64>,
-    bound: usize,
-    f: impl Fn(u64, Byte) -> (u64, Byte),
-  ) {
+  /// Gives every byte of `range` the state `f` makes of its current one, then merges touching neighbours of one state:
+  /// at most [`MOST_ADDED_BY_AN_UPDATE`] ranges more. Its owner charges them ([`PageStates::settle`]).
+  fn update(&mut self, range: std::ops::Range<u64>, f: impl Fn(u64, Byte) -> (u64, Byte)) {
     if self.lost || range.start >= range.end {
       return;
     }
@@ -514,10 +586,6 @@ impl FileStates {
       self.ranges.insert(start, (end, point, byte));
     }
     self.merge_around(range);
-    if self.ranges.len() > bound {
-      self.ranges.clear();
-      self.lost = true;
-    }
   }
 
   /// Splits the range containing `at` so one starts there.
@@ -777,7 +845,16 @@ mod tests {
 
     use proptest::prelude::*;
 
-    use super::super::PageStates;
+    use super::super::{MOST_ADDED_BY_AN_UPDATE, PageStates};
+
+    /// Grows `states`' room to hold `more` ranges beyond those it holds, as the channel asks the ledger before an update.
+    fn make_room(states: &mut PageStates, more: usize) {
+      let short = states
+        .held()
+        .saturating_add(more)
+        .saturating_sub(states.room());
+      states.grow_room(short);
+    }
 
     /// Shape: the bytes of the one file the model tracks — past every generated offset and length.
     const MODEL_BYTES: u64 = 96;
@@ -844,7 +921,10 @@ mod tests {
       /// the bytes read before it when it is the mount's own and leaves them stale when it is another path's. The model
       /// never raises a point; the states raise them whenever the mount has consumed every record so far, which must
       /// change no answer. After any history, with the last few records held back as pending and applied to a scratch
-      /// copy, a range holding an unknown byte cannot be told, and any other range's stale bytes equal the model's.
+      /// copy, a range holding an unknown byte cannot be told, and any other range's stale bytes equal the model's. The
+      /// room is grown before each event by exactly the most that event can add, as the channel grows it from the
+      /// ledger, so a bound that understated an update's growth would lose the file and fail the comparison; no file is
+      /// lost for want of room.
       #[test]
       fn stale_bytes_follow_the_rule(
         events in prop::collection::vec(event(), 0..20),
@@ -852,6 +932,7 @@ mod tests {
         query in (0..MODEL_BYTES, 1..MODEL_BYTES),
       ) {
         let mut states = PageStates::default();
+        make_room(&mut states, 1);
         states.opened(INO, OPENED_AT);
         let mut model = vec![(OPENED_AT, Known::Fresh); usize::try_from(MODEL_BYTES).unwrap()];
         let mut head = OPENED_AT;
@@ -880,11 +961,19 @@ mod tests {
             *cell = rule(event, *cell, head);
           }
           match event {
-            Event::Fetch(..) => states.fetched(INO, from..to, head, usize::MAX),
+            Event::Fetch(..) => {
+              make_room(&mut states, MOST_ADDED_BY_AN_UPDATE);
+              states.fetched(INO, from..to, head);
+            }
             // An ambiguous read is judged with the records held back so far, as the mount judges it.
-            Event::Ambiguous(..) => states.read_ambiguously(INO, from..to, head, &pending, usize::MAX),
+            Event::Ambiguous(..) => {
+              let most = states.most_added_by_an_ambiguous_read(INO, pending.len());
+              make_room(&mut states, most);
+              states.read_ambiguously(INO, from..to, head, &pending);
+            }
             Event::Own(..) | Event::Other(..) if index < split => {
-              states.changed(INO, from..to, head, matches!(event, Event::Own(..)), usize::MAX);
+              make_room(&mut states, MOST_ADDED_BY_AN_UPDATE);
+              states.changed(INO, from..to, head, matches!(event, Event::Own(..)));
             }
             Event::Own(..) | Event::Other(..) => {
               pending.push((from..to, head, matches!(event, Event::Own(..))));
@@ -892,6 +981,7 @@ mod tests {
             Event::Consume => {}
           }
         }
+        prop_assert_eq!(states.take_lost_for_room(), 0, "no update passed the room it was given");
         // A read held back behind pending records would be out of order: reads are applied as they happen.
         let (from, len) = query;
         let to = (from + len).min(MODEL_BYTES);
@@ -927,12 +1017,13 @@ mod tests {
     #[test]
     #[allow(clippy::single_range_in_vec_init)] // a list of one stale range, not the numbers inside it
     fn an_ambiguous_read_makes_stale_bytes_unknown_until_a_fetch_or_a_change() {
-      /// Shape: ranges enough for every split below.
+      /// Shape: the room the ledger admits: ranges enough for every split below.
       const BOUND: usize = 16;
       let mut states = PageStates::default();
+      states.grow_room(BOUND);
       states.opened(INO, OPENED_AT);
-      states.changed(INO, 0..4, 5, false, BOUND);
-      states.read_ambiguously(INO, 2..8, 6, &[], BOUND);
+      states.changed(INO, 0..4, 5, false);
+      states.read_ambiguously(INO, 2..8, 6, &[]);
       assert_eq!(
         states.stale_after(INO, 0..2, 0, &[]),
         Some(vec![0..2]),
@@ -948,14 +1039,14 @@ mod tests {
         None,
         "a write-back over the unknown bytes cannot be told"
       );
-      states.fetched(INO, 2..4, 7, BOUND);
+      states.fetched(INO, 2..4, 7);
       assert_eq!(
         states.stale_after(INO, 0..8, 0, &[]),
         Some(vec![0..2]),
         "a fetch makes them known again"
       );
-      states.read_ambiguously(INO, 0..2, 8, &[], BOUND);
-      states.changed(INO, 0..1, 9, false, BOUND);
+      states.read_ambiguously(INO, 0..2, 8, &[]);
+      states.changed(INO, 0..1, 9, false);
       assert_eq!(
         states.stale_after(INO, 0..1, 0, &[]),
         Some(vec![0..1]),
@@ -967,7 +1058,7 @@ mod tests {
         "the byte it did not change stays unknown"
       );
       let pending = vec![(10..12, 10, false)];
-      states.read_ambiguously(INO, 8..16, 11, &pending, BOUND);
+      states.read_ambiguously(INO, 8..16, 11, &pending);
       assert_eq!(
         states.stale_after(INO, 8..16, 0, &pending),
         None,
@@ -980,15 +1071,16 @@ mod tests {
       );
     }
 
-    /// An untracked file is judged as fresh at the point the caller gives; a file whose ranges passed the bound is
+    /// An untracked file is judged as fresh at the point the caller gives; a file whose ranges passed the room is
     /// refused, not guessed, and consuming the journal does not bring it back; losing every file refuses them all; a
     /// dropped file is untracked again.
     #[test]
     #[allow(clippy::single_range_in_vec_init)] // a list of one stale range, not the numbers inside it
     fn untracked_lost_and_dropped_files() {
-      /// Shape: the most ranges the file may hold here.
+      /// Shape: the room the ledger admits: the most ranges the file may hold here.
       const BOUND: usize = 4;
       let mut states = PageStates::default();
+      states.grow_room(BOUND);
       let other = vec![(0..4, 10, false)];
       assert_eq!(
         states.stale_after(INO, 0..8, 5, &other),
@@ -997,17 +1089,17 @@ mod tests {
       );
       states.opened(INO, OPENED_AT);
       // Two fetches at their own heads leave four ranges: fetched, as opened, fetched, as opened.
-      states.fetched(INO, 0..4, 5, BOUND);
-      states.fetched(INO, 8..12, 6, BOUND);
+      states.fetched(INO, 0..4, 5);
+      states.fetched(INO, 8..12, 6);
       assert!(
         states.stale_after(INO, 0..12, 0, &[]).is_some(),
-        "four ranges: within the bound"
+        "four ranges: within the room"
       );
-      states.fetched(INO, 20..24, 7, BOUND);
+      states.fetched(INO, 20..24, 7);
       assert_eq!(
         states.stale_after(INO, 0..12, 0, &[]),
         None,
-        "six ranges: past the bound, lost"
+        "six ranges: past the room, lost"
       );
       states.consumed(7);
       assert_eq!(
@@ -1027,26 +1119,64 @@ mod tests {
       assert!(!states.tracks(INO), "dropped");
     }
 
+    /// Step 2 of "Journal budget derived" (the byte states charged to the metadata ledger): the room is the mount's,
+    /// shared by its files, and an update that would pass it loses only the file being updated. Do: open two files in a
+    /// room of exactly their two ranges, then let another path change bytes in the middle of the second (three ranges
+    /// where it had one); drop the first, then the lost second. Expect the second lost and counted once, the first still
+    /// judged meanwhile, a lost file holding no ranges, and nothing held once both are dropped.
+    #[test]
+    fn a_full_room_loses_only_the_file_being_updated() {
+      /// Shape: the second file.
+      const OTHER: u64 = INO + 1;
+      let mut states = PageStates::default();
+      states.grow_room(2);
+      states.opened(INO, OPENED_AT);
+      states.opened(OTHER, OPENED_AT);
+      assert_eq!(states.held(), 2, "one range a file at its open");
+      states.changed(OTHER, 10..20, OPENED_AT + 1, false);
+      assert_eq!(
+        states.take_lost_for_room(),
+        1,
+        "one file lost for want of room"
+      );
+      assert_eq!(states.take_lost_for_room(), 0, "and read once");
+      assert_eq!(
+        states.stale_after(OTHER, 0..30, 0, &[]),
+        None,
+        "the updated file is lost"
+      );
+      assert_eq!(
+        states.stale_after(INO, 0..30, 0, &[]),
+        Some(vec![]),
+        "the other file is still judged"
+      );
+      assert_eq!(states.held(), 1, "a lost file holds no ranges");
+      states.dropped(INO);
+      states.dropped(OTHER);
+      assert_eq!(states.held(), 0, "nothing held once both are dropped");
+    }
+
     /// A long-lived file faulted in a page at a time while the volume is busy, as a guest's DAX window is: each fetch at
-    /// a head of its own, another file's record moving the journal between them. Do: with a bound of eight ranges, fetch
+    /// a head of its own, another file's record moving the journal between them. Do: with a room of eight ranges, fetch
     /// eighty pages one by one, the mount consuming the journal after each as its rounds do; then another path changes
     /// ten bytes of page 40. Expect: the file is never lost, and exactly the ten bytes are stale. Without the raise each
     /// fetch keeps a range of its own and the file is lost by the eighth.
     #[test]
     #[allow(clippy::single_range_in_vec_init)] // a list of one stale range, not the numbers inside it
-    fn pages_fetched_one_by_one_under_activity_stay_within_the_bound() {
-      /// Shape: the most ranges the file may hold here.
+    fn pages_fetched_one_by_one_under_activity_stay_within_the_room() {
+      /// Shape: the room the ledger admits: the most ranges the file may hold here.
       const BOUND: usize = 8;
       /// Shape: a page.
       const PAGE: u64 = 4096;
-      /// Shape: ten times the bound's pages.
+      /// Shape: ten times the room's pages.
       const PAGES: u64 = 80;
       let mut states = PageStates::default();
+      states.grow_room(BOUND);
       states.opened(INO, OPENED_AT);
       let mut head = OPENED_AT;
       for page in 0..PAGES {
         head += 1;
-        states.fetched(INO, page * PAGE..(page + 1) * PAGE, head, BOUND);
+        states.fetched(INO, page * PAGE..(page + 1) * PAGE, head);
         states.consumed(head);
         assert!(
           states.stale_after(INO, 0..PAGES * PAGE, 0, &[]).is_some(),
@@ -1055,7 +1185,7 @@ mod tests {
       }
       head += 1;
       let changed = 40 * PAGE + 10..40 * PAGE + 20;
-      states.changed(INO, changed.clone(), head, false, BOUND);
+      states.changed(INO, changed.clone(), head, false);
       states.consumed(head);
       assert_eq!(
         states.stale_after(INO, 0..PAGES * PAGE, 0, &[]),
@@ -1072,14 +1202,15 @@ mod tests {
     #[test]
     #[allow(clippy::single_range_in_vec_init)] // a list of one stale range, not the numbers inside it
     fn an_adopted_file_is_judged_as_untracked_until_a_refetch_and_precisely_after() {
-      /// Shape: ranges enough for every split below.
+      /// Shape: the room the ledger admits: ranges enough for every split below.
       const BOUND: usize = 16;
       /// Shape: where the mount began serving.
       const STARTED_AT: u64 = 1;
       let changes = vec![(0..10, 2, false), (20..30, 3, true)];
       let untracked = PageStates::default();
       let mut states = PageStates::default();
-      states.adopted(INO, STARTED_AT, Some(&changes), BOUND);
+      states.grow_room(BOUND);
+      states.adopted(INO, STARTED_AT, Some(&changes));
       assert!(states.tracks(INO), "adopted");
       assert_eq!(
         states.stale_after(INO, 0..40, STARTED_AT, &[]),
@@ -1091,7 +1222,7 @@ mod tests {
         Some(vec![0..10]),
         "another path's bytes stale, the mount's own fresh"
       );
-      states.fetched(INO, 0..10, 4, BOUND);
+      states.fetched(INO, 0..10, 4);
       assert_eq!(
         states.stale_after(INO, 0..40, STARTED_AT, &[]),
         Some(vec![]),
@@ -1109,16 +1240,17 @@ mod tests {
     /// to keep it lost rather than make it fresh.
     #[test]
     fn a_file_adopted_past_the_journals_reach_is_lost_until_it_is_dropped() {
-      /// Shape: ranges enough for the file.
+      /// Shape: the room the ledger admits: ranges enough for the file.
       const BOUND: usize = 4;
       let mut states = PageStates::default();
-      states.adopted(INO, OPENED_AT, None, BOUND);
+      states.grow_room(BOUND);
+      states.adopted(INO, OPENED_AT, None);
       assert_eq!(
         states.stale_after(INO, 0..8, 0, &[]),
         None,
         "refused, not guessed"
       );
-      states.adopted(INO, OPENED_AT, Some(&[]), BOUND);
+      states.adopted(INO, OPENED_AT, Some(&[]));
       assert_eq!(
         states.stale_after(INO, 0..8, 0, &[]),
         None,
