@@ -537,9 +537,62 @@ mod tests {
       panic!("a timed park that waited learns its wake");
     };
     assert!(woken.kicked_ns.is_some(), "{woken:?}");
+    // A kick that lands before the wait's entry is this park's too, and is counted early rather than timed
+    // (`a_kick_landing_while_the_park_is_set_up_is_its_own_and_untimed`).
     assert!(
-      woken.latency_ns().is_some(),
+      !woken.stale() && (woken.early() || woken.latency_ns().is_some()),
       "the stamp is this park's, none left by the untimed one: {woken:?}"
+    );
+    assert_eq!(parking.kicks_skipped(), 0);
+  }
+
+  /// §4.3 (the shard's online wake estimate): a kick that lands after the park announced itself and before
+  /// it entered its wait is this park's kick, never stale, and the wait finds it already sent, so the park
+  /// times nothing (`Woken::early`; timing it would feed a wake that never happened into the estimate). The
+  /// park's re-check holds it in that window until the kick has been sent, so the interleaving is certain.
+  #[test]
+  #[cfg_attr(miri, ignore)] // a timed park reads the host's boot clock, which Miri does not model (EINVAL)
+  fn a_kick_landing_while_the_park_is_set_up_is_its_own_and_untimed() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let parking = Parking::new();
+    parking.time_wakes();
+    let kicked = AtomicBool::new(false);
+    let parked = std::thread::scope(|scope| {
+      let (tx, rx) = std::sync::mpsc::channel::<()>();
+      let (parking, kicked) = (&parking, &kicked);
+      scope.spawn(move || {
+        while !parking.parked() {
+          std::thread::yield_now();
+        }
+        parking.kick_if_parked(|| {
+          let _ = tx.send(());
+        });
+        kicked.store(true, Ordering::Release);
+      });
+      parking.park_unless_pending(
+        || {
+          while !kicked.load(Ordering::Acquire) {
+            std::thread::yield_now();
+          }
+          false
+        },
+        || {
+          let _ = rx.recv();
+        },
+      )
+    });
+    let Parked::Waited(Some(woken)) = parked else {
+      panic!("a timed park that waited learns its wake");
+    };
+    assert!(
+      woken.early(),
+      "the kick landed while the park was set up: {woken:?}"
+    );
+    assert!(!woken.stale(), "the stamp is this park's: {woken:?}");
+    assert_eq!(
+      woken.latency_ns(),
+      None,
+      "an early kick is never timed: {woken:?}"
     );
     assert_eq!(parking.kicks_skipped(), 0);
   }
