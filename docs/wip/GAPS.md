@@ -1068,6 +1068,22 @@ seen.
 The Node test's failure message names no phase and no main-thread CPU. Its Python twin carries both, and adding them
 is the instrument for the next occurrence; that is proposed, not done.
 
+**Recurred 2026-10-23 with the spawns off the loop: open.** CI run 39974152220 (`bff7f799`, ubuntu, Python 3.11.17)
+read 0.672 s late in phase **'connecting'**: 0.006 s of CPU, the sibling free, 0.000 s of noise, and the harness's
+slowest exec wait 54 ms (`pgrep`). By the rule above, its cause is elsewhere. What that phase runs on the loop's thread:
+- **the connect retries.** The extension never releases the GIL, and a block that keeps it reads the sibling held (a
+  200 ms one read 269–330 ms in 5 of 5 runs, 2026-10-23), so they do not fit the reading;
+- **the bootstrap command through `_run_async`.** Its `asyncio.to_thread` is the scenario's first use of the default
+  executor, and CPython 3.11's `Thread.start()` waits on the calling thread until the new thread has started. That is
+  the leading hypothesis, not confirmed;
+- **`outstanding_limit`.**
+
+It did not reproduce in 10 runs on an idle Fedora machine (Python 3.14.3).
+
+**The instrument.** The ticker now arms `faulthandler.dump_traceback_later` for one period plus the bound before each
+sleep, so a hold prints every thread's Python stack while it lasts; the watchdog that prints it needs no GIL. Checked on
+Linux with a 0.3 s hold of each kind, and each dump named its frame. The next failure names its call.
+
 ### 8a-sdk-stamp. A client that reconnects during a restart may judge the new daemon gone (macOS, Windows; 2026-10-22, closed 2026-10-22 by A-143)
 
 **Seen once.** macOS, 2026-10-22, load 14.5 from other sessions, while verifying §8a-sdk-loop's fix. Phase (2) of the

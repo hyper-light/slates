@@ -9,6 +9,7 @@ SLATES_DAEMON, and otherwise skips loudly (never fails on a machine without the 
 Run: `maturin develop && SLATES_DAEMON=target/debug/slates python3 -m unittest discover crates/sdk-python/tests`."""
 
 import asyncio
+import faulthandler
 import os
 import signal
 import subprocess
@@ -284,6 +285,13 @@ class Ticker:
         self._thread = threading.Thread(target=self._sibling, daemon=True)
         self._thread.start()
         self.task = asyncio.get_running_loop().create_task(self._run())
+        # Names the loop's thread in the hold dump `_run` arms: faulthandler prints each thread as
+        # "Thread 0x" and sixteen hex digits, the same number `threading.get_ident` returns.
+        print(
+            f"ticker: the loop runs on thread {threading.get_ident():#018x}; a hold past "
+            f"{TICK_SECS + TICK_BOUND_SECS:.3f} s prints every thread's Python stack",
+            file=sys.stderr,
+        )
 
     def _sibling(self):
         while not self._stop.is_set():
@@ -292,32 +300,52 @@ class Ticker:
             self.thread_late = max(self.thread_late, time.monotonic() - due)
 
     async def _run(self):
-        while True:
-            due = time.monotonic() + TICK_SECS
-            cpu = time.process_time()
-            thread_before = self.thread_late
-            await asyncio.sleep(TICK_SECS)
-            late = time.monotonic() - due
-            if late > self.worst:
-                self.worst, self.worst_phase = late, self.phase
-                # How much CPU this process burned across the gap, and whether a plain Python thread of
-                # its own was held over the same gap. Together they read three ways:
-                #
-                #   CPU burned                      code ran on the loop while holding the GIL
-                #   no CPU, sibling thread held     the OS kept this whole process off a core (the
-                #                                   separate noise sampler is usually late too), or a
-                #                                   blocking call kept the GIL (it is not)
-                #   no CPU, sibling thread free     a blocking call on the loop thread that releases
-                #                                   the GIL: what `park_timeout` in Rust looks like,
-                #                                   and what a process spawn waiting on its child's
-                #                                   exec looked like (`_run_async`, 2026-10-22)
-                #
-                # Measured 2026-10-20 to check neither probe is vacuous: a deliberate 200 ms busy GIL
-                # hold read 200.7 ms late / 195.6 ms CPU / 24.7 ms thread (the sibling gets the GIL back
-                # in switch-interval slices, so it reads less than the hold); a 200 ms GIL-releasing
-                # `time.sleep` read 272.3 ms late / 1.0 ms CPU / 0.2 ms thread.
-                self.worst_cpu = time.process_time() - cpu
-                self.worst_thread = self.thread_late - thread_before
+        try:
+            while True:
+                await self._tick()
+        finally:
+            faulthandler.cancel_dump_traceback_later()
+
+    async def _tick(self):
+        """One period: arms the hold dump, sleeps, disarms it, and records how late the loop came back.
+
+        The probes below say what kind of hold it was; the dump says where. Before each sleep, faulthandler's
+        watchdog is armed for one period plus the bound. If the loop is not back by then, the watchdog — a C
+        thread that needs no GIL — prints every thread's Python stack while the hold is still in progress, and
+        the loop thread's frames show the call that held it. Added after run 39974152220 (2026-10-23): 0.672 s
+        in phase 'connecting', no CPU and the sibling free, with the harness's own spawns already off the loop,
+        so the probes ruled out every suspect they could name."""
+        due = time.monotonic() + TICK_SECS
+        cpu = time.process_time()
+        thread_before = self.thread_late
+        faulthandler.dump_traceback_later(TICK_SECS + TICK_BOUND_SECS, file=sys.stderr)
+        await asyncio.sleep(TICK_SECS)
+        faulthandler.cancel_dump_traceback_later()
+        late = time.monotonic() - due
+        if late > self.worst:
+            self.worst, self.worst_phase = late, self.phase
+            # How much CPU this process burned across the gap, and whether a plain Python thread of
+            # its own was held over the same gap. Together they read three ways:
+            #
+            #   CPU burned                      code ran on the loop while holding the GIL
+            #   no CPU, sibling thread held     the OS kept this whole process off a core (the
+            #                                   separate noise sampler is usually late too), or a
+            #                                   blocking call kept the GIL (it is not)
+            #   no CPU, sibling thread free     a blocking call on the loop thread that releases
+            #                                   the GIL: what `park_timeout` in Rust looks like,
+            #                                   and what a process spawn waiting on its child's
+            #                                   exec looked like (`_run_async`, 2026-10-22)
+            #
+            # Measured 2026-10-20 to check neither probe is vacuous: a deliberate 200 ms busy GIL
+            # hold read 200.7 ms late / 195.6 ms CPU / 24.7 ms thread (the sibling gets the GIL back
+            # in switch-interval slices, so it reads less than the hold); a 200 ms GIL-releasing
+            # `time.sleep` read 272.3 ms late / 1.0 ms CPU / 0.2 ms thread. And 2026-10-23, so the
+            # middle row is measured too: a 200 ms native call that blocks while holding the GIL
+            # (`ctypes.PyDLL` usleep) read 334–362 ms late / 0.3–0.5 ms CPU / 269–330 ms thread, 5 of 5
+            # (Python 3.9.6, a loaded Mac): the loop's next `select` releases the GIL, and the sibling
+            # records its wait before the ticker reads it.
+            self.worst_cpu = time.process_time() - cpu
+            self.worst_thread = self.thread_late - thread_before
 
 
 # The slowest exec wait of each command the harness ran, in seconds, by program name: how long its `Popen`
