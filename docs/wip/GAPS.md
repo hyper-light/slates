@@ -10958,6 +10958,10 @@ file's number before the takeover, so its open counts and not the reuse are what
 a takeover, whose number was published, still counts as closed afterwards, so an outsider's replacement of its name
 is followed through the old handle. (Fixed by A-151 without publishing the counts: see the next section.)
 
+**CI found two misses in A-150 (2026-10-23), fixed:** `numbers_unreserved` was dead code on Windows (its callers are
+Unix-only), and a virtio-fs refusal test that runs only without `/dev/udmabuf` (CI and Docker, never the box) created
+its file with no committed publication, so its chain was held for one (the bug record's last section).
+
 **Observed in the A-150 verification, not caused by it as far as the evidence goes (the box, 2026-10-22).** These
 appeared in 5 of 8 full CLI-suite runs under extreme load from other sessions' builds (load average 80 to 139 on 32
 cores). Neither reproduced alone, and neither touches what A-150 changed. A run of the same suite against the

@@ -134,3 +134,17 @@ of 5 alone at load 93, and 2 of 2 on macOS.
 
 A-150 changes neither lease. A run of the same suite against the pre-A-150 tree under the same load is owed before
 that is called proven (GAPS).
+
+## After it landed: two misses CI found (2026-10-23)
+
+CI on `0179be5f` failed three jobs, on two misses this record's verification did not cover:
+- **Windows, both lanes:** `crates/server/src/verbs.rs` `numbers_unreserved` was dead code there. Its only callers,
+  the FUSE and NFS replies, are Unix-only, so `-D warnings` refused it. It is `#[cfg(unix)]` now.
+- **Ubuntu:** `crates/bridge-virtiofs/tests/device.rs`
+  `a_message_based_setupmapping_is_refused_where_the_window_cannot_be_confined` created its file with no committed
+  publication. So the file's number was unreserved, and the device held the chain for a barrier instead of refusing
+  the map outright ("the map was refused outright, not parked"). Its fixture now commits the publication, as the
+  others A-150 touched do.
+  - It runs only where `/dev/udmabuf` is absent: CI's runners and Docker's VM, not the box (which has it) and not the
+    Mac (Linux only). So no run here executed it.
+  - Verified in a native arm64 Linux container without `/dev/udmabuf`: the device suite, 42 of 42.

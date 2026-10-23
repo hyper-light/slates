@@ -4174,6 +4174,11 @@ fn a_message_based_setupmapping_is_refused_where_the_window_cannot_be_confined()
   let root = vol.root_inode(&store).unwrap();
   let no = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
   vol.write(&mut store, no, 0, &vec![0x5Au8; page]).unwrap();
+  // The create's publication, committed, as the daemon's verb barrier commits it (A-150): the file's number is
+  // reserved, so the guest's request is served at once rather than held for a publication. Until 2026-10-22 this test
+  // created the file with none, and since it runs only on hosts without `/dev/udmabuf` (CI's, not the box), the held
+  // chain showed first in CI.
+  vol.mark_published(&store);
   let nodeid = no.0;
 
   let (mut device, mut driver) = device_and_driver();

@@ -9364,7 +9364,9 @@ pub(crate) const COUNTERS_TOPPED_UP: &str = "publish.counters_topped_up";
 
 /// Whether volume `volume` has issued an inode number no committed publication reserves (A-150): a reply that would
 /// hand it out must wait for a publication (D-18), since the client keeps the number across a restart. `false` for a
-/// volume this shard does not hold.
+/// volume this shard does not hold. Unix only, as the transports that ask it are (the FUSE and NFS replies): Windows
+/// records no reserve, since no transport there hands a client a number it keeps.
+#[cfg(unix)]
 pub(crate) fn numbers_unreserved(state: &ShardState, volume: DbVolumeId) -> bool {
   state
     .by_id
