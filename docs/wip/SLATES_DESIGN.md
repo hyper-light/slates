@@ -3980,7 +3980,8 @@ anchor-owned RAM. Persist effect and completion as one recoverable publication; 
 retry must recover the same result and contents. Rebuilding a scratch volume from only a quota
 and id loses acknowledged data. Live directory handles require an anchor handoff or validated
 reacquisition of the same source identity; reopening a path alone cannot substitute another
-base. Missing resources return `RecoveryIncomplete`/`BaseUnavailable`, never empty success.
+base. The identity is the device, inode number and birth time (A-153): a change to a directory's
+entries is not a change of source, while a directory another replaced is. Missing resources return `RecoveryIncomplete`/`BaseUnavailable`, never empty success.
 The version-2 volume image now preserves overlay source paths and full directory fingerprints,
 witnesses, whiteouts, redirects, metadata copy-ups and private large-file ranges, including snapshots.
 Recovery validates no-follow source acquisition before reinstating lazy reads and invalidates caches.
@@ -11983,6 +11984,42 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
+
+### A-153 — A recovered base directory is judged by its identity, not its entries (accepted 2026-10-22)
+Applied in the same change to:
+- §4.8 ("Required persistence and protocol invariants");
+- `docs/wip/recovery.md`;
+- `crates/vfs/src/inode.rs` (`Fingerprint::same_object`) and `crates/vfs/src/base_recovery.rs` (`BasePlane::recover`);
+- the tests:
+  - `crates/vfs/tests/base.rs`: `an_overlay_recovers_after_an_outsider_changed_its_base_directories_since_its_image`, the
+    guard `an_overlay_whose_base_directory_another_replaced_is_refused`, the no-birth-time case, and
+    `an_unvisited_overlay_recovers_its_verified_source` (whose second half had asserted the refusal);
+  - `crates/cli/tests/cli.rs` `a_takeover_recovers_an_overlay_whose_base_directory_an_outsider_changed`;
+- GAPS;
+- `docs/bugs/2026-10-22-a-takeover-refused-an-overlay-whose-base-directory-an-outsider-had-changed.md`.
+
+- **What it answers.** Recovery reopened each base directory the image recorded and required its whole fingerprint to
+  match. That includes the times and size any change to the directory's entries moves. So an outsider's edit beneath a
+  loaded directory at any time since the last publication made a takeover refuse the whole volume. Reads publish
+  nothing, so that window can be hours. Measured on the box: "volume basechanged not rebuilt", and the held mount
+  answered nothing.
+- **The rule.** §4.8 asks for the same source identity, and a directory's identity is its device, inode number and
+  birth time (`Fingerprint::same_object`, the three fields A-151's `FileTag` digests).
+  - A directory whose entries changed is the same source, and recovers. Its listing is read again on first use, as
+    every recovered listing is. An untouched entry beneath is checked at that first listing (A-151), and a witnessed one
+    by its drift rule.
+  - A directory another directory replaced is not the same source, and is refused, as §4.8 says.
+- **Without birth times** the device and inode number decide. A directory replaced by one that took its number is then
+  taken for the recorded one, but serves no wrong bytes:
+  - its untouched entries are renumbered at the first listing (A-151);
+  - its witnessed files show drift;
+  - only a whiteout there could hide one of the new directory's names.
+
+  Refusing would cost the volume whole for what is otherwise an ordinary edit.
+- **Left open:** a loaded directory removed after the last publication still refuses the whole volume (`open_source`
+  fails). §4.8 allows `RecoveryIncomplete` there, but the failure matrix's runtime rule (`BaseUnavailable` for that
+  directory's untouched entries, overlay entries serving) is the robust form (GAPS).
+- **Evidence.** See the bug record's verification.
 
 ### A-152 — A handle a dead daemon issued gives back its open at its release (accepted 2026-10-22)
 Applied in the same change to:

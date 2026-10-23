@@ -79,8 +79,8 @@ pub struct BaseBody {
   pub file: FileTag,
 }
 
-/// Which disk file an untouched base inode was made from (A-151; §4.5): its device, inode number and birth time,
-/// digested to 56 bits. The birth time is what tells a file from one that took its number since: ext4 and XFS hand a
+/// Which disk file an untouched base inode was made from (A-151; §4.5): its device, inode number and birth time
+/// ([`Fingerprint::same_object`]'s three fields), digested to 56 bits. The birth time is what tells a file from one that took its number since: ext4 and XFS hand a
 /// freed inode number to the next file, so two editor saves in a row leave the name at the first file's number with
 /// other bytes. The tag sits in the seven bytes that alignment left unused beside [`BaseBody::lost`], so no inode grows
 /// (AC-1.5; `Inode` stays 168 bytes, `cargo run -p slates-vfs --example tree_heap`). Two different files at one name
@@ -164,6 +164,17 @@ pub struct Fingerprint {
   /// the device and inode number it tells a file from one that took its number since (A-151, [`FileTag`]). A host
   /// reports the same value for a file whether it lists it or opens it.
   pub birth_ns: i64,
+}
+
+impl Fingerprint {
+  /// Whether `other` describes the same disk object as this one: the same device, inode number and birth time (A-151,
+  /// A-153). A change to a file's bytes or a directory's entries moves its times and size but not these, so a directory
+  /// whose entries changed is still the same source, and one another directory replaced is not. On a filesystem that
+  /// records no birth time (both zero) the device and inode number alone decide. [`FileTag`] is a digest of the same
+  /// three fields.
+  pub fn same_object(&self, other: &Fingerprint) -> bool {
+    self.dev == other.dev && self.ino == other.ino && self.birth_ns == other.birth_ns
+  }
 }
 
 /// The body.

@@ -11003,13 +11003,14 @@ Goal item 3 of 2026-10-22, red on the box and confirmed by temporary logging.
   - **`StaleHandle` reached the FUSE kernel as `EIO`**, against A-61's text. It answers `ESTALE` now, and Linux
     repeats a path walk that meets it.
 - **Open, found while fixing it:**
-  - **Recovery refuses a whole overlay whose loaded base directory changed after the last publication.**
-    - `BasePlane::recover` compares each directory's full fingerprint, modification time included, with the image's,
-      where identity is what it checks.
-    - `an_unvisited_overlay_recovers_its_verified_source` (`crates/vfs/tests/base.rs`) asserts the refusal for a file
+  - **Recovery refused a whole overlay whose loaded base directory changed after the last publication — fixed
+    2026-10-22 (A-153).**
+    - `BasePlane::recover` compared each directory's full fingerprint, modification time included, with the image's,
+      where identity is what §4.8 asks for.
+    - `an_unvisited_overlay_recovers_its_verified_source` (`crates/vfs/tests/base.rs`) asserted the refusal for a file
       an outsider added to the root.
-    - So a daemon that dies after any outsider edit in a loaded base directory loses the volume across the takeover.
-    - Next, with its own bug record.
+    - So a daemon that died after any outsider edit in a loaded base directory lost the volume across the takeover. It
+      compares the device, inode number and birth time now (next section but one).
   - **A node id the volume no longer holds answers `ENOENT`, where `ESTALE` is honest.** This covers A-150's refusal,
     and an NFS handle of a replaced base file, which nothing referenced, so it was reclaimed.
   - **A pre-takeover handle that A-147 adopted is not counted open — narrowed by A-152.** Such handles' opens are now
@@ -11044,3 +11045,19 @@ Goal item 4 of 2026-10-22, the leak A-148 recorded.
   publication; the successor's own handle under a reissued value.
 - **Still open:** a pre-takeover handle opened after the last publication is not counted open by the successor (the
   A-151 sibling above). That is a refusal, never wrong bytes.
+
+### 2026-10-22: a takeover refused an overlay whose base directory an outsider had changed — fixed (A-153)
+
+Found while fixing A-151.
+- **What happened.** An outsider added a file to a loaded base directory after the last publication, and the daemon was
+  killed. The successor logged "volume basechanged not rebuilt" and "recovered 0 volumes from their images (1
+  refused)", and the held mount answered nothing (`crates/cli/tests/cli.rs`
+  `a_takeover_recovers_an_overlay_whose_base_directory_an_outsider_changed`, red on the box).
+- **Cause.** Recovery compared each reopened directory's whole fingerprint with the image's. A temporary log showed the
+  root refused with the same device and inode, only its times moved.
+- **The fix (A-153).** A directory's identity is its device, inode number and birth time (`Fingerprint::same_object`).
+  A directory whose entries changed recovers, and its listing is read again on first use. One another replaced is
+  still refused.
+- **Open, found here:** a loaded base directory **removed** after the last publication still refuses the whole volume,
+  since reopening it fails (`open_source`). §4.8 allows `RecoveryIncomplete` there. The failure matrix's runtime rule,
+  `BaseUnavailable` for that directory's untouched entries while overlay entries serve, is the robust form, and is owed.

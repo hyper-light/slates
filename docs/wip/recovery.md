@@ -333,7 +333,9 @@ volume.
   reacquisition"); until it exists, a recovered orphan is tracked and its bytes are held, ready for
   the reacquired handle.
 - **Other fidelity extensions.** Base-backed volumes (a live base restored only through retained
-  handles or validated source identity — "reopening a path alone cannot substitute another base");
+  handles or validated source identity — "reopening a path alone cannot substitute another base"; the identity is the
+  device, inode number and birth time, so a directory whose entries changed recovers and one another replaced does not,
+  A-153);
   the live pressure source of a dynamic quota is re-supplied on recovery like the clock (its counters
   and granted growth do travel, and the growth is re-acquired from the rebuilt budget).
 - **§4.2 reservation accounting.** BUG-2 (admit against usable arena capacity), BUG-1 (a strict

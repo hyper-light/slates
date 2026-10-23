@@ -84,8 +84,10 @@ fn populate(host: &mut SimHost, dirs: usize, files: usize) {
   }
 }
 
-/// AC-2.12 / T-2.14: retain an unvisited overlay, then read its source after recovery.
-/// Omitting the host refuses instead of publishing an apparently empty scratch volume.
+/// AC-2.12 / T-2.14: retain an unvisited overlay, then read its source after recovery. Omitting the host refuses
+/// instead of publishing an apparently empty scratch volume. A later recovery from the same image, after an outsider
+/// added a file to the source, recovers too and shows the file: the source is the same directory, whose entries changed
+/// (A-153; until 2026-10-22 this test asserted the refusal that lost such a volume).
 #[test]
 fn an_unvisited_overlay_recovers_its_verified_source() {
   let mut host = SimHost::new();
@@ -117,14 +119,147 @@ fn an_unvisited_overlay_recovers_its_verified_source() {
   host.replace_file("/other", b"changed directory");
   let mut again = common::surviving(&store);
   let claims = common::claims(&mut again, &[&image]);
+  let mut recovered_again = Volume::from_image(
+    &mut again,
+    &image,
+    &claims,
+    Box::new(StepClock::new(0, 1)),
+    1 << 20,
+    Some((&mut host, root)),
+  )
+  .expect("a source whose entries changed is the same source");
+  assert_eq!(
+    read_all(&mut recovered_again, &mut host, &mut again, "/other").unwrap(),
+    b"changed directory"
+  );
+  assert_eq!(
+    read_all(&mut recovered_again, &mut host, &mut again, "/unvisited").unwrap(),
+    b"must not disappear"
+  );
+}
+
+/// A-153 on a filesystem that records no birth time: a directory's identity is then its device and inode number, so an
+/// in-place change to its entries still recovers. Do: over such a disk, read a file so the root's listing is loaded,
+/// image the overlay, add a file at the root as an outsider, close every descriptor and recover. Expect the recovery
+/// to succeed and both files to read.
+#[test]
+fn without_birth_times_an_overlay_recovers_after_an_outsider_changed_its_base_directory() {
+  let mut host = SimHost::new().without_birth_times();
+  host.replace_file("/top.txt", b"at the root");
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  read_all(&mut vol, &mut host, &mut store, "/top.txt").unwrap();
+  let image = vol.to_image(&store, Some(&mut host)).unwrap();
+  host.advance_ns(10);
+  host.replace_file("/added.txt", b"added after the image");
+  host.close_files();
+  let root = host.root();
+  let mut after = common::surviving(&store);
+  let claims = common::claims(&mut after, &[&image]);
+  let mut recovered = Volume::from_image(
+    &mut after,
+    &image,
+    &claims,
+    Box::new(StepClock::new(0, 1)),
+    1 << 20,
+    Some((&mut host, root)),
+  )
+  .expect("without birth times, the device and inode number name the same directory");
+  assert_eq!(
+    read_all(&mut recovered, &mut host, &mut after, "/added.txt").unwrap(),
+    b"added after the image"
+  );
+  assert_eq!(
+    read_all(&mut recovered, &mut host, &mut after, "/top.txt").unwrap(),
+    b"at the root"
+  );
+}
+
+/// A takeover recovers an overlay whose base directories an outsider changed after its image (A-61, §4.5 recovery;
+/// `docs/bugs/2026-10-22-a-takeover-refused-an-overlay-whose-base-directory-an-outsider-had-changed.md`). A directory
+/// whose entries changed is still the directory the image recorded: recovery checks its identity, and its listing is
+/// read again on first use, as every recovered listing is. Do: read a file in the root and one in a subdirectory, so
+/// both listings are loaded, and image the overlay; then, as an outsider, replace the subdirectory's file, add a file
+/// there and add one at the root; close every descriptor (the daemon's death) and recover. Expect the recovery to
+/// succeed and every name to read the disk as it is now. Before the fix it refused `RecoveryIncomplete`, so a daemon
+/// that died after any outsider edit in a base directory since its last publication lost the volume.
+#[test]
+fn an_overlay_recovers_after_an_outsider_changed_its_base_directories_since_its_image() {
+  let mut host = SimHost::new();
+  host.mkdir("/src");
+  host.replace_file("/src/lib.rs", b"before the image");
+  host.replace_file("/top.txt", b"at the root");
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  assert_eq!(
+    read_all(&mut vol, &mut host, &mut store, "/src/lib.rs").unwrap(),
+    b"before the image"
+  );
+  assert_eq!(
+    read_all(&mut vol, &mut host, &mut store, "/top.txt").unwrap(),
+    b"at the root"
+  );
+  let image = vol.to_image(&store, Some(&mut host)).unwrap();
+  host.advance_ns(10);
+  host.replace_file("/src/lib.rs", b"replaced after the image");
+  host.replace_file("/src/new.rs", b"added after the image");
+  host.replace_file("/added.txt", b"added at the root");
+  host.close_files();
+  let root = host.root();
+  let mut after = common::surviving(&store);
+  let claims = common::claims(&mut after, &[&image]);
+  let mut recovered = Volume::from_image(
+    &mut after,
+    &image,
+    &claims,
+    Box::new(StepClock::new(0, 1)),
+    1 << 20,
+    Some((&mut host, root)),
+  )
+  .expect("an overlay whose base directories changed in place recovers");
+  for (path, bytes) in [
+    ("/src/lib.rs", &b"replaced after the image"[..]),
+    ("/src/new.rs", &b"added after the image"[..]),
+    ("/added.txt", &b"added at the root"[..]),
+    ("/top.txt", &b"at the root"[..]),
+  ] {
+    assert_eq!(
+      read_all(&mut recovered, &mut host, &mut after, path).unwrap(),
+      bytes,
+      "{path} reads the disk as it is now"
+    );
+  }
+}
+
+/// The guard beside it: a base directory another directory replaced is not the directory the image recorded, and
+/// reopening a path alone never substitutes another base (§4.5 recovery, "validated source identity"). Do: read a file
+/// in a subdirectory and image the overlay; then make another directory and rename it over the subdirectory; recover.
+/// Expect `RecoveryIncomplete`.
+#[test]
+fn an_overlay_whose_base_directory_another_replaced_is_refused() {
+  let mut host = SimHost::new();
+  host.mkdir("/src");
+  host.replace_file("/src/lib.rs", b"the recorded tree");
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  read_all(&mut vol, &mut host, &mut store, "/src/lib.rs").unwrap();
+  let image = vol.to_image(&store, Some(&mut host)).unwrap();
+  host.advance_ns(10);
+  host.mkdir("/elsewhere");
+  host.replace_file("/elsewhere/lib.rs", b"another tree");
+  host.rename("/elsewhere", "/src");
+  host.close_files();
+  let root = host.root();
+  let mut after = common::surviving(&store);
+  let claims = common::claims(&mut after, &[&image]);
   assert!(matches!(
     Volume::from_image(
-      &mut again,
+      &mut after,
       &image,
       &claims,
       Box::new(StepClock::new(0, 1)),
       1 << 20,
-      Some((&mut host, root))
+      Some((&mut host, root)),
     ),
     Err(VfsError::RecoveryIncomplete)
   ));

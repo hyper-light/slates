@@ -189,7 +189,15 @@ impl BasePlane {
         }
         let opened = open_source(host, root, &directory.source)?;
         let fingerprint = host.fingerprint_dir(opened).map_err(super::host_refusal);
-        if fingerprint.as_ref() != Ok(&directory.fingerprint) {
+        // The same source is the same directory, not the same entries (§4.8, A-153): a directory whose entries an
+        // outsider changed since the image is still the one recorded (its listing is read again on first use, and every
+        // entry beneath is checked then), while one another directory replaced is refused. Until 2026-10-22 the whole
+        // fingerprint had to match, so any change beneath a loaded directory since the last publication cost the volume
+        // (`docs/bugs/2026-10-22-a-takeover-refused-an-overlay-whose-base-directory-an-outsider-had-changed.md`).
+        if !fingerprint
+          .as_ref()
+          .is_ok_and(|now| now.same_object(&directory.fingerprint))
+        {
           if opened != root {
             host.close_dir(opened);
           }

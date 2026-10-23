@@ -6455,6 +6455,82 @@ fn the_handles_a_dead_daemon_issued_give_back_their_references_at_release() {
   drop(anchor);
 }
 
+/// A takeover recovers an overlay whose base directory an outsider changed after the last publication (§4.5 recovery,
+/// A-61; `docs/bugs/2026-10-22-a-takeover-refused-an-overlay-whose-base-directory-an-outsider-had-changed.md`). Do: create
+/// a volume over a base directory holding `notes.txt`, mount it, read the file (its directory's listing is loaded) and
+/// create a file through the mount (its barrier publishes); as an outsider, add a file to the base directory; `SIGKILL`
+/// the daemon and wait for the anchor's successor. Expect the mount to go on: the base file and the outsider's file both
+/// read through it, and the file the mount created is still there. Before the fix the successor refused the volume
+/// (`RecoveryIncomplete`), and the mount answered nothing. Linux only, to a kernel that can resend (6.9+), where a mount
+/// survives its daemon.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_takeover_recovers_an_overlay_whose_base_directory_an_outsider_changed() {
+  if !live_mount_runs() {
+    return;
+  }
+  if !kernel_resends_fuse_requests() {
+    eprintln!("SKIP: before Linux 6.9 a FUSE mount does not survive its daemon (A-61)");
+    return;
+  }
+  let instance = format!("cli-basechanged-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let base = build_output_dir("slates-basechanged-base");
+  shell(&format!(
+    "printf 'opened before the takeover\\n' > {base}/notes.txt"
+  ));
+  let created = [
+    "volume",
+    "create",
+    "basechanged",
+    "--bounded",
+    "8MiB",
+    "--base",
+    &base,
+  ];
+  let (code, out, err) = run(&instance, &created);
+  assert_eq!(code, 0, "a volume over the base: {err}");
+  let id = value_of(&out, "id");
+  let mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  fuse_mount_and_check(&instance, &id, &mount.path);
+  #[allow(clippy::disallowed_methods)] // reads and writes through the slates mount: RAM, not disk
+  {
+    assert_eq!(
+      std::fs::read(format!("{}/notes.txt", mount.path)).unwrap(),
+      OPENED_BYTES
+    );
+    std::fs::write(format!("{}/published.txt", mount.path), b"published").unwrap();
+  }
+  shell(&format!(
+    "printf 'an outsider put this file here\\n' > {base}/added.txt"
+  ));
+
+  let killed = kill_the_daemon(&instance);
+  let restarted = await_daemon(&instance, Some(killed), &[]);
+  assert_ne!(restarted, killed, "a new daemon serves the mount");
+  #[allow(clippy::disallowed_methods)] // reads through the slates mount
+  let read = |name: &str| std::fs::read(format!("{}/{name}", mount.path));
+  assert_eq!(
+    read("notes.txt").ok().as_deref(),
+    Some(OPENED_BYTES),
+    "the base file reads through the mount after the takeover"
+  );
+  assert_eq!(
+    read("added.txt").ok().as_deref(),
+    Some(OUTSIDER_BYTES),
+    "the file the outsider added reads through the mount"
+  );
+  assert_eq!(
+    read("published.txt").ok().as_deref(),
+    Some(&b"published"[..]),
+    "the mount's own file survived the takeover"
+  );
+  drop(mount);
+  drop(anchor);
+}
+
 /// The dirty-page write-back rule past a truncation (§4.6; the bug record above). A store left dirty in a page that a
 /// later truncation through another path cut off must not grow the file back when the kernel writes the page back: a
 /// map cannot extend a file, so that write-back is the page's stale copy. Do: store a byte in page 1 of a two-page map
