@@ -1779,7 +1779,10 @@ drift check `fstat`s.
   inter-arrival p50 of event bursts.
 - Inode numbers: `(volume prefix, monotonic counter)`; `gen` bumps on slot reuse; the bridge
   reports `(no, gen)`. Base-backed entries receive their inode number at first lookup, exactly as
-  EdenFS allocates them, and keep it for the volume's lifetime.
+  EdenFS allocates them, and keep it while the disk keeps the same file at the name. When the disk
+  gives the name to another file, the name becomes a new entry with a new number, and the old inode
+  stays with the file it was made from, as on a real filesystem (A-151). A number is never reused
+  within a volume (AC-1.6).
 - Journal: every mutation appends a declared operation `{seq, op, path(s), inode, epoch, at, len,
   prev_version}` to the volume's op log (a mount `write` is `Overwrite` or `Extend` with its
   offset and length; `truncate` records the new length; an SDK `edit` is `Insert` or `Delete`
@@ -1795,9 +1798,10 @@ which is APFS behaviour. Cut-over conversion mid-operation: Masked (conversion i
 current-epoch node). Seal hashing backlog under sustained writes: Degraded (dedup deferred; a
 counter exposes the backlog; hashing is skipped for volumes whose measured hit rate does not pay).
 Base listing unreadable: Refused (`BaseUnavailable`) for that directory's untouched entries;
-overlay entries in it still serve. Base file replaced on disk while the volume holds its
-descriptor: Masked for reads through the descriptor (the old inode's data is alive), reported as
-drift. Base file overwritten in place: Degraded (`BaseDrift` on reads of unpinned extents; `lost`
+overlay entries in it still serve. Untouched base file replaced on disk: the name serves the
+new file as a new inode (A-151); a handle on the old inode is Masked through the descriptor held
+for it (the old inode's data is alive), and Refused (`ESTALE`) when none is held, as after a
+takeover. Witnessed base file replaced on disk: reported as drift. Base file overwritten in place: Degraded (`BaseDrift` on reads of unpinned extents; `lost`
 set; pinned extents and the agent's writes intact). Watcher unavailable or overflowed: Masked
 (fingerprints; the full re-check scheduled; `status` says `watcher: overflowed`). Descriptor
 budget exhausted by large-class copy-ups: Degraded (further copy-ups pin whole files until
@@ -1826,6 +1830,19 @@ whiteout for `vendor` (not 40k whiteouts), and the landing issues one recursive 
 the verdict that every entry beneath still matches its listing fingerprint.
 
 **Laptop degenerate.** Identical.
+
+> **Status (2026-10-22, A-151).** An untouched base inode is bound to the disk file it was made from.
+> - **A replaced name is a new entry.** A relist that finds the name naming another file detaches the inode, open or
+>   not, and the name serves the disk's file as a new inode. Before, only an inode this process counted open was
+>   detached, so after a takeover the successor refreshed an open inode in place and its handle read the outsider's
+>   file; an NFS client met the same with no takeover, NFS keeping no opens.
+> - **The identity** is the device, the inode number and the birth time (`BaseBody::file`, carried in the image since
+>   layout 20). A descriptor opened by name must find that file, else it is refused `StaleHandle`, never bound to
+>   another.
+> - **On a filesystem that records no birth time**, a recovered volume's first listing of each directory gives its
+>   untouched entries new numbers, since a reused number cannot be ruled out.
+> - **Evidence.** Red then green: the CLI takeover test on the box, the vfs identity tests and the NFS test
+>   (`docs/bugs/2026-10-22-a-base-file-opened-before-a-takeover-read-the-file-an-outsider-put-at-its-name.md`).
 
 > **Status (2026-10-01, AUD-29-40; A-60).** A refused namespace verb changes nothing.
 > - **Reserve, then mutate.** Create, mknod, mkdir, symlink, link and rename count every slot they can take
@@ -9194,6 +9211,8 @@ Applied in the same change to: §4.6 "Linux" status, the failure matrix, T-3.5, 
     named again on its next use. If it is unlinked to no links after the restart before the kernel uses it
     again, it is reclaimed, and the kernel's next use is answered `ESTALE`: the stated limit of a handoff that
     does not publish on every lookup.
+    A base file such a handle opened is served while its name still names the file it was made from, and refused
+    `ESTALE` once not: the successor holds no descriptor for it, and the image carries the file's identity (A-151).
     A handle the restarted daemon never issued is released as a no-op. That takes knowing a handle by its value and
     its file together (A-148): the restarted daemon's handle store is fresh and reissues its predecessor's values, so
     a release frees a handle only when its file is the one the release names. A file unlinked while open survives in
@@ -11962,6 +11981,63 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
+
+### A-151 — An untouched base file is bound to the disk file it was made from (accepted 2026-10-22)
+Applied in the same change to:
+- §4.5 (the inode-number rule, the failure matrix, a status note) and A-61 ("What the kernel kept");
+- `crates/vfs/src/inode.rs` (`Fingerprint::birth_ns`; `BaseBody::file` and `FileTag`);
+- `crates/vfs/src/base.rs` (`prune_unloaded`, `names_another_file`, `release_detached`, `refresh_unloaded`,
+  `descriptor`; `Listing::restored`), `base_recovery.rs`, `recover.rs` (image layout 20), and `host/sim.rs` (birth
+  times, `replace_file_with_number`, `close_files`, `without_birth_times`);
+- `crates/base/src/unix.rs` (`statx` on Linux, `st_birthtime` on macOS) and `windows.rs` (the creation time);
+- `crates/bridge-fuse/src/bridge.rs` (`StaleHandle` answers `ESTALE`);
+- the tests:
+  - `crates/vfs/tests/base_identity.rs`;
+  - `crates/server/tests/nfs_mount.rs` `an_nfs_handle_of_a_base_file_an_outsider_replaced_never_reads_the_new_file`;
+  - `crates/cli/tests/cli.rs` (the takeover test, now refused `ESTALE`, and its control without a takeover);
+  - `crates/bridge-core/tests/invalidation.rs` (a replaced file is a new inode);
+- GAPS;
+- `docs/bugs/2026-10-22-a-base-file-opened-before-a-takeover-read-the-file-an-outsider-put-at-its-name.md`.
+
+- **What it answers.** A relist kept an untouched base inode on its file only when the inode was open in this process
+  and the descriptor it held named a file other than the listed one; otherwise the inode was refreshed in place onto
+  whatever file the name now named, and its next read opened the name with no check. Neither fact survives a daemon,
+  and the inode recorded nothing that does. Measured on the box: after a takeover, the successor's relist saw
+  `open=false held=false`, refreshed inode 281474976710658 from disk inode 50547211 onto 50547213, and the descriptor
+  opened before the takeover read the outsider's bytes. NFS keeps no open state, so its clients met the same refresh
+  with no takeover at all.
+- **The rule.** An untouched base inode is bound to the disk file it was made from. When the disk gives the name to
+  another file, the name becomes a new entry: the old inode leaves it, open or not, held by its references, and serves
+  the file it was made from only through a descriptor it holds; without one it is refused `StaleHandle` (`ESTALE`). A
+  replaced file gets a new number, as on a real filesystem; base symlinks have worked this way since 2026-10-08.
+  - **The identity** is the device, the inode number and the birth time, digested to 56 bits in seven bytes the base
+    body had as padding (`Inode` stays 168 bytes). The birth time is what tells a file from one that took its number:
+    ext4 and XFS hand a freed number to the next file, so two editor saves in a row put the first save's number back at
+    the name. A held descriptor still decides by device and number, since a number it holds cannot be reused.
+  - **A descriptor opened by name** must find the inode's file, else it is closed and refused. That also closes the
+    race between a lookup and an open across an outsider's replacement.
+  - **Descriptors.** A detached inode that no handle holds open has its descriptor closed at once: nothing reads it
+    without opening it again, and that open is refused. So a replaced file the kernel merely caches holds none of the
+    host's descriptors until its last reference goes.
+  - **A filesystem that records no birth time.** A recovered volume cannot rule out a reused number there, so the first
+    listing of each directory it restored gives its untouched entries new numbers, and until then none is opened by
+    name. ext4, XFS, btrfs and tmpfs on Linux, APFS and NTFS record one; the box's tmpfs and btrfs report it
+    (`stat -c %W`, 2026-10-22).
+- **`ESTALE` at the FUSE edge.** `StaleHandle` fell to `EIO` there, against A-61's text and the volume core's own name
+  for it. `ESTALE` is what an NFS server answers for a file that is gone, and Linux repeats a path walk that meets it
+  with revalidation, so a stale cached name finds the disk's file.
+- **Rejected:**
+  - publishing open counts with the references (the earlier GAPS note): an `OPEN` is answered before any publication,
+    so the count misses opens in that window unless every open is logged; once the descriptor is gone, a count still
+    cannot tell that the name was replaced; and NFS keeps no opens;
+  - the device and inode number alone: the two-saves reuse passes for the opened file
+    (`a_number_the_filesystem_reused_never_passes_for_the_file_a_recovered_handle_opened` is red without the birth
+    time);
+  - the change time in place of the birth time: an in-place edit, which keeps the file, would renumber it.
+- **What it leaves** (GAPS): a pre-takeover handle that A-147 adopted is not counted open; a node id the volume no
+  longer holds answers `ENOENT`; recovery refuses an overlay whose loaded base directory changed after its last
+  publication.
+- **Evidence.** See the bug record's verification.
 
 ### A-150 — An inode number goes out only under a published reservation (accepted 2026-10-22)
 Applied in the same change to:

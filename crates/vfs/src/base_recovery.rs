@@ -211,6 +211,7 @@ impl BasePlane {
             entries: None,
             read_at_ns: 0,
             watch: WatchState::Unavailable,
+            restored: true,
           },
         );
       }

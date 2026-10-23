@@ -10740,9 +10740,11 @@ stale page back, and the other write's bytes on it reverted: measured 4,095 of 4
     a publication captured it, so the successor cannot tell whether it restored it. Dropping one it did not restore
     would take a lookup reference and could reclaim a file the kernel still holds, so it drops none. The reference stays
     until the mount ends. Closing it needs open references made durable, or recorded in the session the anchor holds.
-  - **Open counts are not durable — open.** `Volume::attachment_opens` starts empty after recovery. A base file opened
-    before a takeover counts as closed afterwards, so an outsider's replacement of its name could be followed through
-    the old handle. Not reproduced.
+  - **Open counts are not durable — fixed another way, 2026-10-22 (A-151).** `Volume::attachment_opens` starts empty
+    after recovery, so a base file opened before a takeover counted as closed afterwards, and an outsider's replacement
+    of its name was followed through the old handle (reproduced on the box). The fix does not need the counts: an
+    untouched base inode is bound to the disk file it was made from, by an identity the image carries (below,
+    "a base file opened before a takeover read the file an outsider put at its name").
 - **A takeover sends the kernel no invalidation** (found reading `crates/server/src/fuse.rs` 2026-10-22, not
   reproduced). The coherence cursor is process-local, and a restored mount's first round starts at the new daemon's
   head. A change the dead daemon had not yet delivered is therefore never invalidated: its kernel keeps that name,
@@ -10954,8 +10956,7 @@ a deeper reason: the successor issues again the inode numbers the dead daemon ha
 Item 3 of the 2026-10-22 goal, re-scoped. With numbers no longer reused, the open-count gap's own test must publish the
 file's number before the takeover, so its open counts and not the reuse are what is tested. A base file opened before
 a takeover, whose number was published, still counts as closed afterwards, so an outsider's replacement of its name
-is followed through the old handle. That is fixed by publishing open counts with the references (goal items 3 and 4,
-next).
+is followed through the old handle. (Fixed by A-151 without publishing the counts: see the next section.)
 
 **Observed in the A-150 verification, not caused by it as far as the evidence goes (the box, 2026-10-22).** These
 appeared in 5 of 8 full CLI-suite runs under extreme load from other sessions' builds (load average 80 to 139 on 32
@@ -10971,3 +10972,44 @@ pre-A-150 tree under the same load is owed to prove that.
     starvation, or a client that stages again on `NotFound`.
 - **`fusermount3` refused an unmount, "Device or resource busy"** (the takeover-with-open-files test, 3 of 8).
   Unexplained. The box's KDE session, which probes every new mount, is a suspect.
+
+### 2026-10-22: a base file opened before a takeover read the file an outsider put at its name — fixed (A-151)
+
+Goal item 3 of 2026-10-22, red on the box and confirmed by temporary logging.
+- **What happened.** A base file was opened, its number published, the daemon killed, and another file renamed over its
+  name on the disk. A read through the descriptor opened before the takeover returned the outsider's bytes.
+  - The successor's relist saw `open=false held=false`.
+  - It refreshed inode 281474976710658 from disk inode 50547211 onto 50547213.
+  - The control without the kill passes.
+- **Cause.** A relist kept an untouched base inode on its file only when it was open in this process and its held
+  descriptor named another file. Neither fact survives a daemon, and the inode recorded no identity of its file.
+- **The fix (A-151).** An untouched base inode is bound to the disk file it was made from, by device, inode number and
+  birth time.
+  - A name the disk gives another file becomes a new entry, whether or not the old inode is open.
+  - The old inode serves its file only through a descriptor it holds, and is refused `ESTALE` without one.
+  - A descriptor opened by name must find the inode's file.
+  - On a filesystem that records no birth time, a recovered volume renumbers its untouched entries once.
+- **Siblings closed by the same rule**, each red first:
+  - **NFS.** NFS keeps no opens, so a client's handle read the new file after an outsider's replacement, with no
+    takeover (`an_nfs_handle_of_a_base_file_an_outsider_replaced_never_reads_the_new_file`, red on macOS).
+  - **An open racing a replacement** took a descriptor on the new file under the first file's inode and attributes
+    (`an_open_racing_a_replacement_is_refused_never_bound_to_the_new_file`).
+  - **`StaleHandle` reached the FUSE kernel as `EIO`**, against A-61's text. It answers `ESTALE` now, and Linux
+    repeats a path walk that meets it.
+- **Open, found while fixing it:**
+  - **Recovery refuses a whole overlay whose loaded base directory changed after the last publication.**
+    - `BasePlane::recover` compares each directory's full fingerprint, modification time included, with the image's,
+      where identity is what it checks.
+    - `an_unvisited_overlay_recovers_its_verified_source` (`crates/vfs/tests/base.rs`) asserts the refusal for a file
+      an outsider added to the root.
+    - So a daemon that dies after any outsider edit in a loaded base directory loses the volume across the takeover.
+    - Next, with its own bug record.
+  - **A node id the volume no longer holds answers `ENOENT`, where `ESTALE` is honest.** This covers A-150's refusal,
+    and an NFS handle of a replaced base file, which nothing referenced, so it was reclaimed.
+  - **A pre-takeover handle that A-147 adopted is not counted open.** So the successor closes a detached inode's
+    descriptor that such a handle could still have read, and the handle is refused. That is a refusal, never wrong
+    bytes; it belongs with goal item 4, the pre-takeover release.
+  - **ReFS:** the 64-bit file index Windows reports may not be unique there (`FILE_ID_INFO` carries 128 bits).
+- **Goal item 4, re-scoped.** Open counts are no longer what a takeover needs for base files. The pre-takeover release
+  leak stands as recorded above (its open's reference stays until the mount ends). So does the adopted-handle refusal
+  just above. Both want the handles a takeover inherits made exact.

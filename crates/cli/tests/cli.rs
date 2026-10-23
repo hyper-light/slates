@@ -6223,14 +6223,79 @@ const OPENED_BYTES: &[u8] = b"opened before the takeover\n";
 #[cfg(target_os = "linux")]
 const OUTSIDER_BYTES: &[u8] = b"an outsider put this file here\n";
 
-/// Open-file semantics for a base file across a takeover (§4.5, §4.6; A-61). A base file opened before a takeover
-/// keeps the file it opened when an outsider then puts another file at its name, as it does without a takeover
-/// (`prune_unloaded`, since 2026-09-30): the opener never reads bytes it did not open. Do: create a volume over a base
-/// directory, mount it, open a base file and read it; `SIGKILL` the daemon and wait for the anchor's successor, which
-/// takes the mount over; on the disk, write another file beside it and rename it over its name, as an editor saves;
-/// drop the kernel's cached pages of the open file, so its next read reaches slates; read through the descriptor
-/// opened before. Expect the bytes it opened, or a refusal, never the outsider's file. Linux only, to a kernel that can
-/// resend (6.9+), where a mount survives its daemon.
+/// Open-file semantics for a base file with no takeover (§4.5; `prune_unloaded`, since 2026-09-30), the control for the
+/// takeover test below: the same steps with the daemon left alive. Do: open a base file through a mount and read it,
+/// create another file through the mount, put another file at the open file's name on the disk, drop the open file's
+/// cached pages, and read through its descriptor. Expect exactly the bytes it opened: the daemon holds the opened file's
+/// descriptor, and the name serves the new file as a new inode. Linux only.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_base_file_kept_open_reads_the_file_it_opened_after_an_outsider_replaces_its_name() {
+  use std::os::unix::fs::FileExt;
+  if !live_mount_runs() {
+    return;
+  }
+  let instance = format!("cli-baseopen-alive-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let base = build_output_dir("slates-baseopen-alive-base");
+  shell(&format!(
+    "printf 'opened before the takeover\\n' > {base}/notes.txt"
+  ));
+  let created = [
+    "volume",
+    "create",
+    "baseopenalive",
+    "--bounded",
+    "8MiB",
+    "--base",
+    &base,
+  ];
+  let (code, out, err) = run(&instance, &created);
+  assert_eq!(code, 0, "a volume over the base: {err}");
+  let id = value_of(&out, "id");
+  let mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  fuse_mount_and_check(&instance, &id, &mount.path);
+  let file = std::fs::File::open(format!("{}/notes.txt", mount.path)).unwrap();
+  let mut before = vec![0u8; OUTSIDER_BYTES.len() * 2];
+  let read = file.read_at(&mut before, 0).unwrap();
+  assert_eq!(
+    &before[..read],
+    OPENED_BYTES,
+    "the base file reads through the mount"
+  );
+  #[allow(clippy::disallowed_methods)]
+  // the test's own write through the slates mount: RAM, not disk
+  std::fs::write(format!("{}/published.txt", mount.path), b"published").unwrap();
+  shell(&format!(
+    "printf 'an outsider put this file here\\n' > {base}/.notes.new && mv {base}/.notes.new {base}/notes.txt"
+  ));
+  let _ = std::fs::metadata(format!("{}/notes.txt", mount.path));
+  rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::DontNeed).unwrap();
+  let mut after = vec![0u8; OUTSIDER_BYTES.len() * 2];
+  let read = file.read_at(&mut after, 0).unwrap();
+  assert_eq!(
+    &after[..read],
+    OPENED_BYTES,
+    "the descriptor reads the file it opened, not the one an outsider put at its name"
+  );
+  drop(file);
+  drop(mount);
+  drop(anchor);
+}
+
+/// Open-file semantics for a base file across a takeover (§4.5, §4.6; A-61, A-151; AC-3.4). A base file opened before
+/// a takeover never reads the file an outsider then puts at its name: its inode is bound to the file it was made from,
+/// by device, inode number and birth time, which the image carries. Do: create a volume over a base directory, mount
+/// it, open a base file and read it; create another file through the mount, whose barrier publishes the open file's
+/// inode and the mount's references to it, so the successor knows the number (A-150); `SIGKILL` the daemon and wait for
+/// the anchor's successor, which takes the mount over; on the disk, write another file beside the open one and rename
+/// it over its name, as an editor saves; drop the kernel's cached pages of the open file, so its next read reaches
+/// slates; read through the descriptor opened before. Expect `ESTALE`: the file it opened died with the dead daemon's
+/// descriptor, and the name serves the outsider's file as a new inode. Before A-151 the successor refreshed the inode
+/// in place and the descriptor read the outsider's bytes. Linux only, to a kernel that can resend (6.9+), where a mount
+/// survives its daemon.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_base_file_opened_before_a_takeover_never_reads_the_file_an_outsider_put_at_its_name() {
@@ -6272,6 +6337,9 @@ fn a_base_file_opened_before_a_takeover_never_reads_the_file_an_outsider_put_at_
     OPENED_BYTES,
     "the base file reads through the mount"
   );
+  #[allow(clippy::disallowed_methods)]
+  // the test's own write through the slates mount: RAM, not disk
+  std::fs::write(format!("{}/published.txt", mount.path), b"published").unwrap();
 
   let killed = kill_the_daemon(&instance);
   let restarted = await_daemon(&instance, Some(killed), &[]);
@@ -6284,13 +6352,16 @@ fn a_base_file_opened_before_a_takeover_never_reads_the_file_an_outsider_put_at_
   rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::DontNeed).unwrap();
   let mut after = vec![0u8; OUTSIDER_BYTES.len() * 2];
   match file.read_at(&mut after, 0) {
-    Ok(read) => assert_ne!(
-      &after[..read],
-      OUTSIDER_BYTES,
-      "the descriptor opened before the takeover read the file an outsider put at its name"
+    Ok(read) => panic!(
+      "the descriptor opened before the takeover read {:?}, though the file it opened died with the daemon's descriptor",
+      String::from_utf8_lossy(&after[..read])
     ),
-    // The file it opened is gone with the dead daemon's descriptor: a refusal is honest.
-    Err(refused) => eprintln!("the read through the old descriptor was refused: {refused}"),
+    // The file it opened is gone with the dead daemon's descriptor: a stale handle, as an NFS server answers (A-151).
+    Err(refused) => assert_eq!(
+      refused.raw_os_error(),
+      Some(rustix::io::Errno::STALE.raw_os_error()),
+      "the read through the old descriptor is refused as a stale handle: {refused}"
+    ),
   }
   drop(file);
   drop(mount);

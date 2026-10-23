@@ -207,6 +207,7 @@ mod tests {
       mode: 0o100_644,
       uid: 0,
       gid: 0,
+      birth_ns: 1,
     }
   }
 

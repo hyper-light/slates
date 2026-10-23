@@ -73,10 +73,12 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// 18 (A-127, 2026-10-09) the call records a barrier publishes with the effects their calls made, so a compound the
 /// dead daemon applied is answered on its client's retry, never run again. 19 (A-128, 2026-10-09) the replies an NFSv3
 /// barrier publishes for a connection the anchor holds, so a request the dead daemon applied and never answered is
-/// answered on the same socket by its successor, never applied twice.
+/// answered on the same socket by its successor, never applied twice. 20 (A-151, 2026-10-22) an untouched base file's
+/// body carries the disk file it was made from, and every fingerprint the file's birth time, so a successor never takes
+/// the file now at a name for the one an old handle opened.
 /// Format: the image layout version, bumped with any change to the types below or to the held replicas'
 /// image they carry.
-const IMAGE_VERSION: u16 = 19;
+const IMAGE_VERSION: u16 = 20;
 
 /// A recorded attachment's references in an image (A-61): its durable id and its share by inode.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
@@ -224,6 +226,9 @@ pub enum BodyImage {
     base_len: u64,
     /// Unpinned reads already lost their source witness.
     lost: bool,
+    /// The disk file the inode was made from ([`crate::inode::FileTag::word`], A-151): its successor tells by it whether
+    /// a name still names that file.
+    file: u64,
   },
   /// A symlink's target.
   Symlink {
@@ -1686,6 +1691,7 @@ impl Volume {
         pinned,
         base_len: base.base_len,
         lost: base.lost,
+        file: base.file.word(),
       }
     } else {
       match inode.kind {
@@ -2861,11 +2867,13 @@ fn file_body_from_image(claims: &Claims, body: &BodyImage, size: u64) -> Result<
       pinned,
       base_len,
       lost,
+      file,
     } => Ok(Body::Base(crate::inode::BaseBody {
       witness: witness.map(Box::new),
       pinned: extents_from_image(claims, pinned, size)?,
       base_len: *base_len,
       lost: *lost,
+      file: crate::inode::FileTag::from_word(*file),
     })),
     BodyImage::Directory { .. } | BodyImage::Symlink { .. } | BodyImage::BaseLink { .. } => {
       Err(VfsError::RecoveryIncomplete)

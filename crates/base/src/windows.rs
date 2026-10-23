@@ -392,6 +392,12 @@ fn fingerprint_of_handle(
     // Windows has no POSIX owner; a base entry reports the root's, as the WinFsp bridge maps every file.
     uid: 0,
     gid: 0,
+    // The creation time, which a rename keeps (A-151). NTFS may give a file made at a name within seconds of another's
+    // removal that file's creation time ("tunneling"), but its file index differs, so the identity still tells them apart.
+    birth_ns: filetime_ns(
+      info.ftCreationTime.dwHighDateTime,
+      info.ftCreationTime.dwLowDateTime,
+    ),
   })
 }
 

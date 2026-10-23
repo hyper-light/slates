@@ -185,6 +185,62 @@ fn the_daemon_serves_a_provisioned_volume_over_nfs() {
   drop(daemon);
 }
 
+/// A-151 (§4.5; §4.6 NFS): NFS keeps no open state, so the handle a client holds names the file its inode was made
+/// from, and an outsider's replacement of that file on the disk never reaches it. Do: provision a volume over a base
+/// directory holding `notes.txt`, look it up and read it over NFS, rename another file over it on the disk (an editor's
+/// save), read through the handle the client already holds, then look the name up again. Expect the held handle
+/// refused, never answered with the outsider's bytes, and the fresh handle reading the outsider's file. Before A-151 a
+/// relist refreshed the inode in place, so the held handle read the new file, where a real NFS server answers `ESTALE`
+/// (`docs/bugs/2026-10-22-a-base-file-opened-before-a-takeover-read-the-file-an-outsider-put-at-its-name.md`).
+#[test]
+fn an_nfs_handle_of_a_base_file_an_outsider_replaced_never_reads_the_new_file() {
+  let (daemon, instance) = single_shard_daemon("nfsbaseswap");
+  let mut client = Client::connect(&instance);
+  let base = common::target::target_dir();
+  base.seed("notes.txt", b"the file the handle names");
+  let ReplyBody::Created { .. } = client.call(&RequestBody::Create {
+    name: "over".into(),
+    size: SizeClass::Bounded { limit: 1 << 20 },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: Some(base.path.clone()),
+  }) else {
+    panic!("the overlay volume was not created");
+  };
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root_fh = mount(&mut stream, &capability_path(&daemon, "over"), 1);
+  let held = lookup(&mut stream, &root_fh, "notes.txt", 2);
+  assert_eq!(read(&mut stream, &held, 3), b"the file the handle names");
+
+  base.seed(".notes.new", b"an outsider put this file here");
+  #[allow(clippy::disallowed_methods)]
+  // the outsider's save-by-rename, in the test's own base directory
+  std::fs::rename(
+    format!("{}/.notes.new", base.path),
+    format!("{}/notes.txt", base.path),
+  )
+  .unwrap();
+  let through_held = common::nfs::read_bytes_status(&mut stream, &held, 4);
+  assert!(
+    through_held.is_err(),
+    "the held handle is refused, never served the file an outsider put at its name: {through_held:?}"
+  );
+  let fresh = lookup(&mut stream, &root_fh, "notes.txt", 5);
+  assert_ne!(
+    fresh, held,
+    "the name serves the outsider's file under a new handle"
+  );
+  assert_eq!(
+    read(&mut stream, &fresh, 6),
+    b"an outsider put this file here"
+  );
+
+  drop(stream);
+  drop(client);
+  drop(daemon);
+}
+
 /// §4.14: status counts the NFS calls each shard served, by procedure (`ShardReport::nfs_calls`), so the round trips
 /// a client operation cost are read from the daemon, not from a machine-wide client counter. Do: mount a volume
 /// through the protocol, create a file and write it once. Expect: the daemon's status counts one CREATE and one

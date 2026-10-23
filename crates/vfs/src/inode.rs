@@ -74,6 +74,57 @@ pub struct BaseBody {
   pub base_len: u64,
   /// Set when a drift check failed: reads of unpinned ranges refuse with `BaseDrift`.
   pub lost: bool,
+  /// The disk file the inode was made from (A-151), recorded when the listing named it and never changed after: a name
+  /// the disk gives another file becomes a new entry, and a descriptor opened by name must find this file.
+  pub file: FileTag,
+}
+
+/// Which disk file an untouched base inode was made from (A-151; §4.5): its device, inode number and birth time,
+/// digested to 56 bits. The birth time is what tells a file from one that took its number since: ext4 and XFS hand a
+/// freed inode number to the next file, so two editor saves in a row leave the name at the first file's number with
+/// other bytes. The tag sits in the seven bytes that alignment left unused beside [`BaseBody::lost`], so no inode grows
+/// (AC-1.5; `Inode` stays 168 bytes, `cargo run -p slates-vfs --example tree_heap`). Two different files at one name
+/// share a tag with odds of about one in 2^56.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct FileTag([u8; FILE_TAG_BYTES]);
+
+/// Format: the bytes a [`FileTag`] keeps, the seven an inode's base body had as padding beside `lost`.
+pub const FILE_TAG_BYTES: usize = 7;
+/// Format: splitmix64's first multiplier (Steele, Lea and Flood, "Fast Splittable Pseudorandom Number Generators",
+/// OOPSLA 2014; Vigna's reference `splitmix64.c`).
+const SPLITMIX_FIRST: u64 = 0xbf58_476d_1ce4_e5b9;
+/// Format: splitmix64's second multiplier (the same sources).
+const SPLITMIX_SECOND: u64 = 0x94d0_49bb_1331_11eb;
+
+/// The splitmix64 finalizer: a bijection on 64-bit words that spreads every input bit across the output.
+const fn splitmix(word: u64) -> u64 {
+  let word = (word ^ (word >> 30)).wrapping_mul(SPLITMIX_FIRST);
+  let word = (word ^ (word >> 27)).wrapping_mul(SPLITMIX_SECOND);
+  word ^ (word >> 31)
+}
+
+impl FileTag {
+  /// The tag of the file `fingerprint` describes: its device, inode number and birth time, each folded through the
+  /// splitmix64 finalizer and the result cut to 56 bits. A filesystem that records no birth time gives zero, so its tag
+  /// is the device and number alone ([`Fingerprint::birth_ns`]).
+  pub fn of(fingerprint: &Fingerprint) -> FileTag {
+    let born = u64::from_le_bytes(fingerprint.birth_ns.to_le_bytes());
+    let mixed = splitmix(splitmix(splitmix(fingerprint.dev) ^ fingerprint.ino) ^ born);
+    let [a, b, c, d, e, f, g, _] = mixed.to_le_bytes();
+    FileTag([a, b, c, d, e, f, g])
+  }
+
+  /// The tag as a word, as an image carries it: the 56 bits in the low bytes, the top byte zero.
+  pub fn word(self) -> u64 {
+    let [a, b, c, d, e, f, g] = self.0;
+    u64::from_le_bytes([a, b, c, d, e, f, g, 0])
+  }
+
+  /// The tag `word` holds ([`FileTag::word`]); a top byte is ignored.
+  pub fn from_word(word: u64) -> FileTag {
+    let [a, b, c, d, e, f, g, _] = word.to_le_bytes();
+    FileTag([a, b, c, d, e, f, g])
+  }
 }
 
 /// A witnessed base: the fingerprint and content identity the agent's edit was based on.
@@ -108,6 +159,11 @@ pub struct Fingerprint {
   pub uid: u32,
   /// The owner's group id (`st_gid`).
   pub gid: u32,
+  /// The file's birth time, ns, as the filesystem records it (`statx`'s `stx_btime` on Linux, `st_birthtime` on macOS,
+  /// the creation time on Windows), zero where it records none. A rename keeps it and a replacement does not, so with
+  /// the device and inode number it tells a file from one that took its number since (A-151, [`FileTag`]). A host
+  /// reports the same value for a file whether it lists it or opens it.
+  pub birth_ns: i64,
 }
 
 /// The body.

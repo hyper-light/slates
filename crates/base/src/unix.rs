@@ -1,11 +1,16 @@
-//! The Unix host: descriptors from rustix, bulk listings from `getdents` with one `statat` per
-//! entry, and hints from inotify (Linux) or `EVFILT_VNODE` on a kqueue (macOS, BSD).
+//! The Unix host: descriptors from rustix, bulk listings from `getdents` with one stat per entry (`statx` on Linux,
+//! the only call that reports a file's birth time there; `statat` on macOS, whose `st_birthtime` carries it: A-151),
+//! and hints from inotify (Linux) or `EVFILT_VNODE` on a kqueue (macOS, BSD).
 
 use std::collections::BTreeMap;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 
-use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, Stat};
+#[cfg(not(target_os = "linux"))]
+use rustix::fs::Stat;
+use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
+#[cfg(target_os = "linux")]
+use rustix::fs::{Statx, StatxFlags};
 use slates_vfs::host::{
   BaseEntry, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, HostKind, WatchState,
 };
@@ -42,8 +47,9 @@ fn refusal(e: rustix::io::Errno) -> HostError {
   }
 }
 
-/// The fingerprint of a `stat` result: device, inode, size, both timestamps in nanoseconds,
-/// the mode, and the owner.
+/// The fingerprint of a `stat` result (macOS): device, inode, size, both timestamps in nanoseconds, the mode, the
+/// owner, and the birth time `st_birthtime` (A-151).
+#[cfg(not(target_os = "linux"))]
 fn fingerprint(st: &Stat) -> Fingerprint {
   Fingerprint {
     dev: u64::try_from(i128::from(st.st_dev)).unwrap_or(0),
@@ -54,10 +60,72 @@ fn fingerprint(st: &Stat) -> Fingerprint {
     mode: mode_word(st.st_mode),
     uid: st.st_uid,
     gid: st.st_gid,
+    birth_ns: stamp_ns(widen(st.st_birthtime), widen(st.st_birthtime_nsec)),
   }
 }
 
-/// A `stat` mode as `u32`, whatever width the platform gives it (`u16` on macOS).
+/// The fingerprint of a `statx` result (Linux): what `stat` gives elsewhere, and the birth time, which only `statx`
+/// reports there; zero when the filesystem records none (`STATX_BTIME` unset in the answer's mask) (A-151). The device
+/// is `makedev` of its two halves, as `stat`'s `st_dev` packs them.
+#[cfg(target_os = "linux")]
+fn fingerprint(st: &Statx) -> Fingerprint {
+  let born = StatxFlags::from_bits_retain(st.stx_mask).contains(StatxFlags::BTIME);
+  Fingerprint {
+    dev: rustix::fs::makedev(st.stx_dev_major, st.stx_dev_minor),
+    ino: st.stx_ino,
+    size: st.stx_size,
+    mtime_ns: stamp_ns(st.stx_mtime.tv_sec, widen(st.stx_mtime.tv_nsec)),
+    ctime_ns: stamp_ns(st.stx_ctime.tv_sec, widen(st.stx_ctime.tv_nsec)),
+    mode: u32::from(st.stx_mode),
+    uid: st.stx_uid,
+    gid: st.stx_gid,
+    birth_ns: if born {
+      stamp_ns(st.stx_btime.tv_sec, widen(st.stx_btime.tv_nsec))
+    } else {
+      0
+    },
+  }
+}
+
+/// What every Linux fingerprint asks `statx` for: the fields `stat` gives, and the birth time (A-151).
+#[cfg(target_os = "linux")]
+const FINGERPRINT_FIELDS: StatxFlags = StatxFlags::BASIC_STATS.union(StatxFlags::BTIME);
+
+/// The fingerprint of the entry `name` under `dir` itself, never following a symlink: `statx` on Linux, which alone
+/// reports the birth time there (A-151).
+#[cfg(target_os = "linux")]
+fn fingerprint_at<P: rustix::path::Arg>(
+  dir: BorrowedFd<'_>,
+  name: P,
+) -> rustix::io::Result<Fingerprint> {
+  rustix::fs::statx(dir, name, AtFlags::SYMLINK_NOFOLLOW, FINGERPRINT_FIELDS)
+    .map(|st| fingerprint(&st))
+}
+
+/// The fingerprint of the entry `name` under `dir` itself, never following a symlink (`statat`).
+#[cfg(not(target_os = "linux"))]
+fn fingerprint_at<P: rustix::path::Arg>(
+  dir: BorrowedFd<'_>,
+  name: P,
+) -> rustix::io::Result<Fingerprint> {
+  rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW).map(|st| fingerprint(&st))
+}
+
+/// The fingerprint of an open descriptor: `statx` of the descriptor itself on Linux (A-151).
+#[cfg(target_os = "linux")]
+fn fingerprint_of(fd: BorrowedFd<'_>) -> rustix::io::Result<Fingerprint> {
+  rustix::fs::statx(fd, c"", AtFlags::EMPTY_PATH, FINGERPRINT_FIELDS).map(|st| fingerprint(&st))
+}
+
+/// The fingerprint of an open descriptor (`fstat`).
+#[cfg(not(target_os = "linux"))]
+fn fingerprint_of(fd: BorrowedFd<'_>) -> rustix::io::Result<Fingerprint> {
+  rustix::fs::fstat(fd).map(|st| fingerprint(&st))
+}
+
+/// A `stat` mode as `u32`, whatever width the platform gives it (`u16` on macOS). Linux's `statx` gives a `u16`
+/// mode, widened where it is read.
+#[cfg(not(target_os = "linux"))]
 fn mode_word<T: Into<u32>>(mode: T) -> u32 {
   mode.into()
 }
@@ -147,9 +215,7 @@ impl OsHost {
   /// [`HostFs::list`]'s own per-entry `statat`.
   pub fn entry_fingerprint(&self, dir: HostDir, name: &str) -> Result<Fingerprint, HostError> {
     let name = one_entry(name, UNIX_NAME_BREAKS)?;
-    let st =
-      rustix::fs::statat(self.dir(dir)?, name, AtFlags::SYMLINK_NOFOLLOW).map_err(refusal)?;
-    Ok(fingerprint(&st))
+    fingerprint_at(self.dir(dir)?.as_fd(), name).map_err(refusal)
   }
 
   /// Takes ownership of a directory descriptor the caller opened (with containment); refused `EMFILE` once
@@ -185,10 +251,7 @@ impl HostFs for OsHost {
   }
 
   fn fingerprint_dir(&mut self, dir: HostDir) -> Result<Fingerprint, HostError> {
-    let fd = self.dir(dir)?;
-    rustix::fs::fstat(fd)
-      .map(|st| fingerprint(&st))
-      .map_err(refusal)
+    fingerprint_of(self.dir(dir)?.as_fd()).map_err(refusal)
   }
 
   fn list(&mut self, dir: HostDir) -> Result<Vec<BaseEntry>, HostError> {
@@ -210,8 +273,8 @@ impl HostFs for OsHost {
         });
         continue;
       };
-      let st = match rustix::fs::statat(fd, raw, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(st) => st,
+      let fingerprint = match fingerprint_at(fd.as_fd(), raw) {
+        Ok(fingerprint) => fingerprint,
         // Gone between the listing and the stat: the disk is the truth, it is not there.
         Err(rustix::io::Errno::NOENT) => continue,
         Err(e) => return Err(refusal(e)),
@@ -219,7 +282,7 @@ impl HostFs for OsHost {
       out.push(BaseEntry {
         name: name.into(),
         kind: kind_of(entry.file_type()),
-        fingerprint: fingerprint(&st),
+        fingerprint,
       });
     }
     Ok(out)
@@ -260,10 +323,7 @@ impl HostFs for OsHost {
   }
 
   fn fstat(&mut self, file: HostFile) -> Result<Fingerprint, HostError> {
-    let fd = self.file(file)?;
-    rustix::fs::fstat(fd)
-      .map(|st| fingerprint(&st))
-      .map_err(refusal)
+    fingerprint_of(self.file(file)?.as_fd()).map_err(refusal)
   }
 
   fn read_at(&mut self, file: HostFile, off: u64, buf: &mut [u8]) -> Result<usize, HostError> {

@@ -182,6 +182,13 @@ fn inode(ino: u64, data: CachedBytes) -> Invalidation {
   Invalidation::Inode { ino, data }
 }
 
+/// Fails unless `owed` holds every invalidation in `expected`.
+fn assert_owes_each(owed: &[Invalidation], expected: &[Invalidation]) {
+  for one in expected {
+    assert!(owed.contains(one), "{one:?} missing from {owed:?}");
+  }
+}
+
 /// A change through the SDK path — a write, a truncate, an unlink and a rename applied to the
 /// volume directly, outside the bridge — owes the attached transport an invalidation for each
 /// affected kernel entry, drawn from the journal since the transport's cursor; the transport's
@@ -416,8 +423,9 @@ fn a_transport_behind_the_journals_retention_is_told_everything() {
 /// A watcher hint on a base directory (an outsider replaced a file beneath it) owes the transport
 /// an expire-only invalidation for every live entry the kernel may hold under that directory and
 /// an inode invalidation for each, plus the directory's own; the next lookup then re-lists (the
-/// host-call counter moves against a steady lookup) and reports the outsider's new size. A
-/// second request with nothing new owes nothing.
+/// host-call counter moves against a steady lookup) and serves the outsider's file as a new inode with
+/// its size, since the disk gave the name another file (A-151); the old number, which no reference held,
+/// is gone. A second request with nothing new owes nothing.
 #[test]
 fn a_watcher_hint_expires_the_directorys_live_entries_and_the_next_lookup_relists() {
   let mut host = SimHost::new();
@@ -446,24 +454,29 @@ fn a_watcher_hint_expires_the_directorys_live_entries_and_the_next_lookup_relist
   let (owed, relisted_lib) = f.lookup(src, "lib.rs");
   let relist = f.host.calls() - before;
   // The directory itself, an expire for each live name beneath it, and each name's attributes.
-  for expected in [
-    inode(src, CachedBytes::ALL),
-    entry(src, "lib.rs", true),
-    entry(src, "main.rs", true),
-    inode(lib, CachedBytes::ALL),
-    inode(main, CachedBytes::ALL),
-  ] {
-    assert!(
-      owed.contains(&expected),
-      "{expected:?} missing from {owed:?}"
-    );
-  }
+  assert_owes_each(
+    &owed,
+    &[
+      inode(src, CachedBytes::ALL),
+      entry(src, "lib.rs", true),
+      entry(src, "main.rs", true),
+      inode(lib, CachedBytes::ALL),
+      inode(main, CachedBytes::ALL),
+    ],
+  );
   assert!(
     relist > steady,
     "the hinted directory was re-listed ({relist} calls against {steady})"
   );
-  assert_eq!(relisted_lib, lib, "the same inode number (D-4), refreshed");
-  assert_eq!(f.size_of(lib), 31, "the outsider's size shows");
+  assert_ne!(
+    relisted_lib, lib,
+    "the name the disk gave another file is a new inode (A-151)"
+  );
+  assert_eq!(f.size_of(relisted_lib), 31, "the outsider's size shows");
+  assert!(
+    f.serve(|b, cx| b.getattr(oid(lib), cx)).1.is_err(),
+    "the old number, which no reference held, is gone"
+  );
 
   // Nothing new: the next request owes nothing.
   let (owed, _) = f.lookup(src, "main.rs");

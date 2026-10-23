@@ -82,6 +82,9 @@ const ENOTEMPTY: i32 = 39;
 const ENAMETOOLONG: i32 = 36;
 /// Format: EMFILE, too many open files (the bridge's handle table is full).
 const EMFILE: i32 = 24;
+/// Format: Linux ESTALE, a stale file handle: the node names a file no longer reachable (A-151: a base file that left
+/// its name with no descriptor held). A kernel's path walk that meets it looks the name up again.
+const ESTALE: i32 = 116;
 /// Format: the block unit `fuse_attr.blocks` counts in (512-byte blocks, the stat convention).
 const BYTES_PER_BLOCK: u64 = 512;
 /// Shape: the block size reported to the kernel: one page, the volume core's chunk unit.
@@ -640,6 +643,8 @@ pub(crate) fn errno(e: VfsError) -> i32 {
     VfsError::PublishNeeded => EAGAIN,
     // The file is delegated to an NFSv4 client; its recall was asked for (A-79).
     VfsError::Delegated => EAGAIN,
+    // Until A-151 (2026-10-22) this fell to `EIO`, against A-61's text and the volume core's own name for it.
+    VfsError::StaleHandle => ESTALE,
     _ => EIO,
   }
 }

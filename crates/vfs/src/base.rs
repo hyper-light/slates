@@ -39,7 +39,7 @@ use crate::host::{
   BaseEntry, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, HostKind, WatchState,
 };
 use crate::ids::{Epoch, InodeNo, SnapshotId};
-use crate::inode::{BaseBody, Body, Fingerprint, Home, Inode, Kind, Witness};
+use crate::inode::{BaseBody, Body, FileTag, Fingerprint, Home, Inode, Kind, Witness};
 use crate::journal::Op;
 use crate::volume::{DirRow, Located, Store, Volume, VolumeConfig};
 
@@ -134,6 +134,10 @@ pub(crate) struct Listing {
   /// between two readings of the filesystem's clock.
   read_at_ns: i64,
   watch: WatchState,
+  /// Reopened by a recovery and not yet listed by this daemon (A-151): the untouched entries beneath were numbered by a
+  /// daemon that died. On a filesystem that records no birth time their files cannot be told from files that took their
+  /// numbers since, so the first listing gives each one a new number, and until then none is opened by its name.
+  restored: bool,
 }
 
 /// What changed on disk beneath a witnessed entry.
@@ -457,6 +461,7 @@ impl BasePlane {
         entries: None,
         read_at_ns: 0,
         watch: WatchState::Unavailable,
+        restored: false,
       },
     );
     Self {
@@ -1068,10 +1073,20 @@ impl Overlay<'_> {
       (policy.hash(&a.name), policy.fold(&a.name))
         .cmp(&(policy.hash(&b.name), policy.fold(&b.name)))
     });
+    let restored = listing.restored;
     listing.fingerprint = Some(fingerprint);
     listing.read_at_ns = now;
     listing.entries = Some(entries);
-    self.prune_unloaded(store, dir)?;
+    self.prune_unloaded(store, dir, restored)?;
+    if restored
+      && let Some(listing) = self
+        .vol
+        .base
+        .as_mut()
+        .and_then(|plane| plane.listings.get_mut(&dir_no))
+    {
+      listing.restored = false;
+    }
     self.refresh_dir_nlink(store, dir)
   }
 
@@ -1119,17 +1134,24 @@ impl Overlay<'_> {
     Ok(())
   }
 
-  /// Brings a node's unwitnessed base entries in line with the fresh listing: an untouched
-  /// entry shows the live disk, so one the disk no longer has leaves the node, and one the
-  /// disk changed drops its descriptor and takes the listing's attributes.
-  fn prune_unloaded(&mut self, store: &mut Store, dir: Handle<DirNode>) -> Result<(), VfsError> {
+  /// Brings a node's unwitnessed base entries in line with the fresh listing: an untouched entry shows the live disk,
+  /// so one the disk no longer has leaves the node, one whose name the disk gave another file leaves it too (A-151), and
+  /// one the disk changed in place takes the listing's attributes. `restored` says this is the first listing since a
+  /// recovery reopened the directory ([`Listing::restored`]).
+  fn prune_unloaded(
+    &mut self,
+    store: &mut Store,
+    dir: Handle<DirNode>,
+    restored: bool,
+  ) -> Result<(), VfsError> {
     let (mut gone, changed) = self.stale_entries(store, dir)?;
     for (no, fp, name) in changed {
-      // An open file whose name now names another file keeps the file it opened (POSIX): its inode leaves
-      // the name, held by its references and its descriptor, and the name serves the new file as a new
-      // inode on its next lookup. Until 2026-09-30 the open inode took the new file's fingerprint and
-      // descriptor, and the opener read bytes it never opened.
-      if self.vol.is_open(no) && self.names_another_file(no, fp) {
+      // A name the disk gave another file is a new entry (A-151): the inode leaves the name, open or not, held by its
+      // references, and the name serves the disk's file as a new inode on its next lookup. Until 2026-09-30 every inode
+      // was refreshed in place onto the new file, so an opener read bytes it never opened; until A-151 (2026-10-22) one
+      // this process did not count open still was, so a handle opened before a takeover read the outsider's file.
+      if self.names_another_file(store, no, fp) || (restored && self.unprovable(no, fp)) {
+        self.release_detached(no);
         gone.push(name);
         continue;
       }
@@ -1203,21 +1225,89 @@ impl Overlay<'_> {
       })
   }
 
-  /// Whether the descriptor inode `no` holds names a file other than `fp`'s (the listed name was replaced
-  /// on the disk); `false` when it holds none — then nothing opened is kept.
-  fn names_another_file(&mut self, no: InodeNo, fp: Fingerprint) -> bool {
-    let Some(held) = self
+  /// Whether the disk's file at an untouched entry's name, listed as `fp`, is not the file inode `no` was made from
+  /// (A-151). The descriptor the inode holds decides when it holds one, by device and inode number: a number a
+  /// descriptor holds is never reused, and an `fstat` that fails proves nothing, so it counts as another file. Without
+  /// one the file the inode recorded decides ([`BaseBody::file`]: the device, the number and the birth time).
+  fn names_another_file(&mut self, store: &Store, no: InodeNo, fp: Fingerprint) -> bool {
+    if let Some(held) = self
       .vol
       .base
       .as_ref()
       .and_then(|plane| plane.descriptors.get(&no).copied())
+    {
+      return !self
+        .host
+        .fstat(held)
+        .is_ok_and(|now| now.dev == fp.dev && now.ino == fp.ino);
+    }
+    !self
+      .made_from(store, no)
+      .is_some_and(|file| file == FileTag::of(&fp))
+  }
+
+  /// Whether an entry a recovery restored cannot be proven the file its inode was made from (A-151): it holds no
+  /// descriptor and the filesystem records no birth time (`fp`'s is zero), so a number reused since the inode was made
+  /// cannot be ruled out.
+  fn unprovable(&self, no: InodeNo, fp: Fingerprint) -> bool {
+    fp.birth_ns == 0
+      && !self
+        .vol
+        .base
+        .as_ref()
+        .is_some_and(|plane| plane.descriptors.contains_key(&no))
+  }
+
+  /// The descriptor of an inode that left its name (A-151): kept while a handle holds the inode open, since the opener
+  /// reads the file it opened through it (POSIX); closed at once otherwise, since nothing reads the inode without
+  /// opening it again, and that open is refused ([`Self::descriptor`]). So a replaced file the kernel merely caches
+  /// holds none of the host's descriptors until its last reference goes.
+  fn release_detached(&mut self, no: InodeNo) {
+    if self.vol.is_open(no) {
+      return;
+    }
+    if let Some(plane) = self.vol.base.as_mut()
+      && let Some(file) = plane.descriptors.remove(&no)
+    {
+      self.host.close_file(file);
+    }
+  }
+
+  /// The disk file an untouched base inode was made from ([`BaseBody::file`], A-151); `None` for any other inode, a
+  /// witnessed one included, whose disk bytes its witness judges instead.
+  fn made_from(&self, store: &Store, no: InodeNo) -> Option<FileTag> {
+    if self
+      .vol
+      .base
+      .as_ref()
+      .is_some_and(|plane| plane.is_witnessed(no))
+    {
+      return None;
+    }
+    match &self.vol.inode(store, no).ok()?.body {
+      Body::Base(body) => Some(body.file),
+      _ => None,
+    }
+  }
+
+  /// Whether the directory holding inode `no` was reopened by a recovery and not yet listed since
+  /// ([`Listing::restored`]).
+  fn in_restored_listing(&self, store: &Store, no: InodeNo) -> bool {
+    let Some(parent) = self
+      .vol
+      .inode(store, no)
+      .ok()
+      .and_then(|inode| inode.home)
+      .map(|home| home.parent())
     else {
       return false;
     };
     self
-      .host
-      .fstat(held)
-      .is_ok_and(|now| now.dev != fp.dev || now.ino != fp.ino)
+      .vol
+      .base
+      .as_ref()
+      .and_then(|plane| plane.listings.get(&parent))
+      .is_some_and(|listing| listing.restored)
   }
 
   /// Whether an inode is an untouched base entry (unwitnessed, base-backed or a base symlink,
@@ -1285,28 +1375,18 @@ impl Overlay<'_> {
     Ok(())
   }
 
-  /// An unwitnessed base inode follows the disk: the descriptor it held is closed (the disk
-  /// may hold another inode at the name now) and its attributes take the listing's.
+  /// An unwitnessed base inode whose name still names the file it was made from follows the disk: its attributes take
+  /// the listing's, so an in-place edit shows through.
   fn refresh_unloaded(
     &mut self,
     store: &mut Store,
     no: InodeNo,
     fp: Fingerprint,
   ) -> Result<(), VfsError> {
-    // A held descriptor stays while the listed name still names the file it holds (the same `(dev,
-    // ino)`; an in-place edit shows through its `fstat`), so an opener keeps the file it opened across a
-    // relist; it is closed only when the name now names another file (a replacement). Until 2026-09-30
-    // every relist closed it, and a file opened, then unlinked through the mount after a relist, lost its
-    // bytes: the reopen by name found the name gone (AUD-29-16 sibling, found by the racy listing rule).
-    if let Some(held) = self.plane()?.descriptors.get(&no).copied() {
-      let same_file = self
-        .host
-        .fstat(held)
-        .is_ok_and(|now| now.dev == fp.dev && now.ino == fp.ino);
-      if !same_file && let Some(f) = self.plane()?.descriptors.remove(&no) {
-        self.host.close_file(f);
-      }
-    }
+    // A held descriptor stays: the name still names the file it holds (`names_another_file`), and an in-place edit
+    // shows through its `fstat`. Until 2026-09-30 every relist closed it, and a file opened, then unlinked through the
+    // mount after a relist, lost its bytes: the reopen by name found the name gone (AUD-29-16 sibling, found by the
+    // racy listing rule).
     // A relist refreshes every untouched entry, changed or not; a kept digest is stale knowledge
     // only when the listing's fingerprint no longer matches the one it was verified under.
     let moved = self
@@ -1445,6 +1525,7 @@ impl Overlay<'_> {
           fp.mode,
           Body::Base(BaseBody {
             base_len: fp.size,
+            file: FileTag::of(&fp),
             ..BaseBody::default()
           }),
         );
@@ -1507,6 +1588,7 @@ impl Overlay<'_> {
             entries: None,
             read_at_ns: 0,
             watch: WatchState::Unavailable,
+            restored: false,
           },
         );
         Child::Dir(child)
@@ -2160,13 +2242,36 @@ impl Overlay<'_> {
     self.vol.chmod(store, no, mode)
   }
 
-  /// The open descriptor of a base-backed inode, opened through its home if needed.
+  /// The open descriptor of a base-backed inode, opened through its home if needed. An untouched inode's must name the
+  /// file the inode was made from (A-151): one that left its name, one whose name now names another file, and one a
+  /// recovery restored on a filesystem that records no birth time (its file cannot be proven) are refused
+  /// `StaleHandle`, never served another file's bytes. A kernel's path walk that meets `ESTALE` looks the name up
+  /// again, and finds the disk's file as a new inode.
   fn descriptor(&mut self, store: &Store, no: InodeNo) -> Result<HostFile, VfsError> {
     if let Some(f) = self.vol.base.as_ref().and_then(|b| b.descriptors.get(&no)) {
       return Ok(*f);
     }
-    let (dir, name) = self.home_of(store, no)?;
-    let file = self.host.open_file(dir, &name).map_err(host_refusal)?;
+    let made_from = self.made_from(store, no);
+    let (dir, name) = match self.home_of(store, no) {
+      Ok(home) => home,
+      Err(VfsError::NotFound) if made_from.is_some() => return Err(VfsError::StaleHandle),
+      Err(refused) => return Err(refused),
+    };
+    let file = match self.host.open_file(dir, &name) {
+      Ok(file) => file,
+      Err(HostError::NotFound) if made_from.is_some() => return Err(VfsError::StaleHandle),
+      Err(refused) => return Err(host_refusal(refused)),
+    };
+    if let Some(made_from) = made_from {
+      let unproven = self.in_restored_listing(store, no);
+      match self.host.fstat(file) {
+        Ok(opened) if FileTag::of(&opened) == made_from && !(unproven && opened.birth_ns == 0) => {}
+        verdict => {
+          self.host.close_file(file);
+          return Err(verdict.err().map_or(VfsError::StaleHandle, host_refusal));
+        }
+      }
+    }
     self.plane()?.descriptors.insert(no, file);
     Ok(file)
   }
@@ -3341,6 +3446,7 @@ impl Overlay<'_> {
                 entries: None,
                 read_at_ns: 0,
                 watch: WatchState::Unavailable,
+                restored: false,
               },
             );
           }

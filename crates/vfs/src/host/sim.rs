@@ -44,11 +44,14 @@ struct SimNode {
   target: Box<str>,
   mtime_ns: i64,
   ctime_ns: i64,
+  /// When the node was made, on the simulated clock: its birth time, which a rename keeps (A-151).
+  birth_ns: i64,
   children: BTreeMap<Box<str>, SimNode>,
 }
 
 impl SimNode {
-  fn fingerprint(&self) -> Fingerprint {
+  /// The fingerprint a host reports for this node, with its birth time when the filesystem records one.
+  fn fingerprint_as(&self, birth_times: bool) -> Fingerprint {
     Fingerprint {
       dev: SIM_DEV,
       ino: self.ino,
@@ -62,6 +65,7 @@ impl SimNode {
       mode: self.mode,
       uid: self.uid,
       gid: self.gid,
+      birth_ns: if birth_times { self.birth_ns } else { 0 },
     }
   }
 }
@@ -136,6 +140,9 @@ pub struct SimHost {
   interfered: Vec<Interfered>,
   /// Failures a test armed ([`SimHost::fail`]). A test arms a handful.
   faults: Vec<Fault>,
+  /// Whether the simulated filesystem records birth times (ext4, XFS, btrfs, tmpfs, APFS and NTFS do; some older and
+  /// network filesystems do not, [`SimHost::without_birth_times`]).
+  birth_times: bool,
 }
 
 /// A seam verb a test can make fail ([`SimHost::fail`]).
@@ -224,6 +231,7 @@ impl SimHost {
         target: "".into(),
         mtime_ns: 0,
         ctime_ns: 0,
+        birth_ns: 0,
         children: BTreeMap::new(),
       },
       next_ino: 2,
@@ -249,7 +257,15 @@ impl SimHost {
       armed: Vec::new(),
       interfered: Vec::new(),
       faults: Vec::new(),
+      birth_times: true,
     }
+  }
+
+  /// This disk as a filesystem that records no birth time: every fingerprint reports zero there (A-151), so a reused
+  /// inode number cannot be told from the file that held it before.
+  pub fn without_birth_times(mut self) -> Self {
+    self.birth_times = false;
+    self
   }
 
   /// Seam calls so far.
@@ -508,6 +524,9 @@ impl SimHost {
       target: "".into(),
       mtime_ns: self.now_ns,
       ctime_ns: self.now_ns,
+      // A filesystem never stamps a birth time of zero, which hosts report for "none recorded"
+      // ([`Fingerprint::birth_ns`]); the simulated clock starts at zero, so a file made then is stamped one nanosecond.
+      birth_ns: self.now_ns.max(1),
       children: BTreeMap::new(),
     }
   }
@@ -589,6 +608,45 @@ impl SimHost {
     }
     self.touch_parent(&parent);
     done
+  }
+
+  /// Puts a new file at `path` under inode number `ino`, a number the filesystem freed, displacing whatever the path
+  /// held: what ext4 and XFS do when they hand a freed inode number to the next file, so two editor saves in a row
+  /// can leave the name at the first file's number with other bytes (A-151). The new file is born now. A number a
+  /// descriptor holds or a file still carries is not free on any filesystem, so then nothing changes and the answer
+  /// is `false`.
+  pub fn replace_file_with_number(&mut self, path: &str, bytes: &[u8], ino: u64) -> bool {
+    let held = self
+      .opens
+      .values()
+      .any(|open| matches!(open, Open::File { ino: held, .. } if *held == ino));
+    if held || self.find_ino(ino).is_some() {
+      return false;
+    }
+    let parts = Self::split(path);
+    let (name, parent) = parts
+      .split_last()
+      .map(|(n, p)| (n.clone(), p.to_vec()))
+      .unwrap_or_default();
+    let mut node = self.fresh(HostKind::File);
+    node.ino = ino;
+    node.bytes = bytes.to_vec();
+    self.retired.remove(&ino);
+    if let Some(p) = self.node_mut(&parent)
+      && let Some(old) = p.children.insert(name, node)
+    {
+      self.retired.insert(old.ino, old);
+    }
+    self.touch_parent(&parent);
+    true
+  }
+
+  /// Closes every descriptor this host handed out, files and directories alike, as the death of the process holding
+  /// them does: a file replaced or unlinked meanwhile is then gone, as on a real disk, and a recovered volume opens
+  /// what it needs again (A-61's takeover, A-151).
+  pub fn close_files(&mut self) {
+    self.opens.clear();
+    self.watched.clear();
   }
 
   /// Overwrites a file in place, same inode, timestamps advanced by `dt_ns` (zero keeps them,
@@ -696,7 +754,9 @@ impl SimHost {
 
   /// The fingerprint of an entry as the disk holds it.
   pub fn fingerprint(&self, path: &str) -> Option<Fingerprint> {
-    self.node(&Self::split(path)).map(SimNode::fingerprint)
+    self
+      .node(&Self::split(path))
+      .map(|node| node.fingerprint_as(self.birth_times))
   }
 
   /// Every path on the disk with its kind, sorted.
@@ -755,7 +815,7 @@ impl HostFs for SimHost {
     let parts = self.dir_parts(dir)?;
     self
       .node(&parts)
-      .map(SimNode::fingerprint)
+      .map(|node| node.fingerprint_as(self.birth_times))
       .ok_or(HostError::NotFound)
   }
 
@@ -773,7 +833,7 @@ impl HostFs for SimHost {
         .map(|(name, child)| BaseEntry {
           name: name.clone(),
           kind: child.kind,
-          fingerprint: child.fingerprint(),
+          fingerprint: child.fingerprint_as(self.birth_times),
         })
         .collect(),
     )
@@ -835,9 +895,9 @@ impl HostFs for SimHost {
         })
         .or_else(|| self.find_ino(ino))
         .unwrap_or_else(|| node.clone());
-      return Ok(live.fingerprint());
+      return Ok(live.fingerprint_as(self.birth_times));
     }
-    Ok(self.live_node(file)?.fingerprint())
+    Ok(self.live_node(file)?.fingerprint_as(self.birth_times))
   }
 
   fn read_at(&mut self, file: HostFile, off: u64, buf: &mut [u8]) -> Result<usize, HostError> {
@@ -1220,7 +1280,7 @@ impl LandFs for SimHost {
     let parts = self.entry_parts(dir, name)?;
     self
       .node(&parts)
-      .map(SimNode::fingerprint)
+      .map(|node| node.fingerprint_as(self.birth_times))
       .ok_or(HostError::NotFound)
   }
 
