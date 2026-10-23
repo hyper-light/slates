@@ -613,10 +613,6 @@ fn extract_landed(body: ReplyBody) -> Result<Landing, ClientError> {
   }
 }
 
-/// The capability the harness delivered to this process, if it was spawned as a consumer (§4.13;
-/// `slates_ipc::delivery`): none when the delivery variable is absent — the process is the account's
-/// own client — and a typed refusal when it is present but unusable, so a broken delivery never
-/// degrades into the account's ambient authority.
 /// A connect in flight for an event loop ([`Client::begin_connect`]; AUD-29-19): the rendezvous claim
 /// made, its answer read by [`poll`](Self::poll) whenever the loop looks, so a slow, stopped or dead
 /// daemon never holds the loop. Dropped unanswered, the claim is given back.
@@ -674,6 +670,10 @@ impl Connecting {
   }
 }
 
+/// The capability the harness delivered to this process, if it was spawned as a consumer (§4.13;
+/// `slates_ipc::delivery`): none when the delivery variable is absent — the process is the account's
+/// own client — and a typed refusal when it is present but unusable, so a broken delivery never
+/// degrades into the account's ambient authority.
 fn delivered_capability() -> Result<Option<Delivered>, ClientError> {
   match slates_ipc::delivery::delivered() {
     Ok(delivered) => Ok(Some(delivered.clone())),
