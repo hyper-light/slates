@@ -9,13 +9,13 @@ SLATES_DAEMON, and otherwise skips loudly (never fails on a machine without the 
 Run: `maturin develop && SLATES_DAEMON=target/debug/slates python3 -m unittest discover crates/sdk-python/tests`."""
 
 import asyncio
-import faulthandler
 import os
 import signal
 import subprocess
 import sys
 import threading
 import time
+import traceback
 import unittest
 
 import slates
@@ -274,6 +274,12 @@ class Ticker:
         self.worst_cpu = 0.0
         self.worst_thread = 0.0
         self.thread_late = 0.0
+        # When the loop last ran this ticker, and the thread it runs on: the sibling reads both to name a hold
+        # while it lasts (`_name_a_hold`). `_named` is the heartbeat the last named hold began at, so each hold
+        # is named once.
+        self.heartbeat = time.monotonic()
+        self._loop_ident = threading.get_ident()
+        self._named = None
         self._stop = threading.Event()
         # A sibling probe *inside this process*, on a thread of its own. The separate-process sampler
         # answers "was the machine scheduling anyone", which is not the same question: a process that
@@ -285,43 +291,66 @@ class Ticker:
         self._thread = threading.Thread(target=self._sibling, daemon=True)
         self._thread.start()
         self.task = asyncio.get_running_loop().create_task(self._run())
-        # Names the loop's thread in the hold dump `_run` arms: faulthandler prints each thread as
-        # "Thread 0x" and sixteen hex digits, the same number `threading.get_ident` returns.
-        print(
-            f"ticker: the loop runs on thread {threading.get_ident():#018x}; a hold past "
-            f"{TICK_SECS + TICK_BOUND_SECS:.3f} s prints every thread's Python stack",
-            file=sys.stderr,
-        )
+
+    def stop(self):
+        """Ends the measurement: the ticker's task and the sibling together, so the scenario's own teardown is
+        neither measured nor named as a hold."""
+        self.task.cancel()
+        self._stop.set()
 
     def _sibling(self):
         while not self._stop.is_set():
             due = time.monotonic() + TICK_SECS
             time.sleep(TICK_SECS)
-            self.thread_late = max(self.thread_late, time.monotonic() - due)
+            now = time.monotonic()
+            self.thread_late = max(self.thread_late, now - due)
+            self._name_a_hold(now)
+
+    def _name_a_hold(self, now):
+        """Prints the loop thread's Python stack, once per hold, while the hold lasts: when the loop has not
+        run the ticker for one period plus the bound. The probes in `_tick` say what kind of hold it was; this
+        says where. Added after run 39974152220 (2026-10-23): 0.672 s in phase 'connecting', no CPU and the
+        sibling free, with the harness's own spawns already off the loop, so the probes ruled out every suspect
+        they could name.
+
+        It runs on the sibling. A hold that releases the GIL, the kind that run had, is named while it lasts. A
+        hold that keeps the GIL keeps the sibling off until it ends, and is named at once after: the interpreter
+        hands the GIL to a thread that has waited a switch interval at the holder's next instruction, so the
+        loop's frame is still the holding call's. Measured 2026-10-23 (CPython 3.9.6, macOS) with 0.3 s holds,
+        5 runs of each: a `time.sleep` was named 0.117–0.153 s in and a `ctypes.PyDLL` usleep 0.352–0.382 s in,
+        each once and each at the holding line.
+
+        Measured and rejected, 2026-10-23: `faulthandler.dump_traceback_later`, armed before each tick's sleep
+        and cancelled after. Every arm starts a new watchdog thread and every cancel waits for the old one to
+        exit while holding the GIL (CPython 3.11 `Modules/faulthandler.c`, lines 657, 771 and 787), and both
+        fell inside the interval the ticker measures. At load average 14 to 17 on macOS the pair cost a 1.1 ms
+        median, 19.7 ms at p99, 64.9 ms at p999 and 74.7 ms at worst over 2000 ticks, and the test failed 2 of
+        5 there with no hold dumped."""
+        heartbeat = self.heartbeat
+        silent = now - heartbeat
+        if silent <= TICK_SECS + TICK_BOUND_SECS or self._named == heartbeat or self._stop.is_set():
+            return
+        self._named = heartbeat
+        frame = sys._current_frames().get(self._loop_ident)
+        stack = "".join(traceback.format_stack(frame)) if frame is not None else "  (no Python frame)\n"
+        print(
+            f"ticker: the loop has not run for {silent:.3f} s, in phase {self.phase!r}; its thread is at:\n{stack}",
+            file=sys.stderr,
+        )
 
     async def _run(self):
-        try:
-            while True:
-                await self._tick()
-        finally:
-            faulthandler.cancel_dump_traceback_later()
+        while True:
+            await self._tick()
 
     async def _tick(self):
-        """One period: arms the hold dump, sleeps, disarms it, and records how late the loop came back.
-
-        The probes below say what kind of hold it was; the dump says where. Before each sleep, faulthandler's
-        watchdog is armed for one period plus the bound. If the loop is not back by then, the watchdog — a C
-        thread that needs no GIL — prints every thread's Python stack while the hold is still in progress, and
-        the loop thread's frames show the call that held it. Added after run 39974152220 (2026-10-23): 0.672 s
-        in phase 'connecting', no CPU and the sibling free, with the harness's own spawns already off the loop,
-        so the probes ruled out every suspect they could name."""
+        """One period: sleeps, records that the loop ran (`heartbeat`), and how late it came back."""
         due = time.monotonic() + TICK_SECS
         cpu = time.process_time()
         thread_before = self.thread_late
-        faulthandler.dump_traceback_later(TICK_SECS + TICK_BOUND_SECS, file=sys.stderr)
         await asyncio.sleep(TICK_SECS)
-        faulthandler.cancel_dump_traceback_later()
-        late = time.monotonic() - due
+        now = time.monotonic()
+        self.heartbeat = now
+        late = now - due
         if late > self.worst:
             self.worst, self.worst_phase = late, self.phase
             # How much CPU this process burned across the gap, and whether a plain Python thread of
@@ -373,7 +402,9 @@ async def _run_async(*argv):
     loop until 2026-10-22. With the child's exec delayed 150 ms, as a cold disk would delay it, the test
     failed in phase (1) exactly as the ubuntu lane had: 0.150 s late, 0.002 s of CPU, a sibling thread
     free (docs/bugs/2026-10-22-the-async-sdk-tests-own-process-spawns-held-the-loop-it-measures.md). On a
-    worker thread the same wait holds only that thread."""
+    worker thread the same wait holds only that thread. The hand-off itself costs the loop something once: the
+    first call imports the executor's module on the calling thread, so the scenario makes its first hand-off
+    before the ticker starts (docs/bugs/2026-10-23-the-async-sdk-tests-first-thread-handoff-imported-a-module-on-the-loop.md)."""
     status, stdout, exec_wait = await asyncio.to_thread(_spawn_and_wait, argv)
     name = os.path.basename(argv[0])
     _exec_waits[name] = max(_exec_waits.get(name, 0.0), exec_wait)
@@ -483,6 +514,13 @@ class SlatesAsyncEveryCallEnds(unittest.TestCase):
             start_new_session=True,
         )
         noise = Noise()
+        # The harness's first hand-off to a worker thread, before anything is measured. That first call makes
+        # `run_in_executor` create the default executor, and `concurrent.futures` imports its thread module
+        # (`queue` with it) lazily, on the calling thread, which is the loop's. An import reads from disk with
+        # the GIL released, so on a slow disk it held the loop 0.672 s in 'connecting' (run 39974152220), and a
+        # 0.3 s delay in that import failed this test 5 of 5 on macOS and 3 of 3 on Linux
+        # (docs/bugs/2026-10-23-the-async-sdk-tests-first-thread-handoff-imported-a-module-on-the-loop.md).
+        await asyncio.to_thread(lambda: None)
         ticker = Ticker()
         try:
             client = await _connect_when_ready(instance)
@@ -557,7 +595,7 @@ class SlatesAsyncEveryCallEnds(unittest.TestCase):
             # `scheduling` cannot account for it either. Measured on an idle machine 2026-10-20:
             # `communicate()` blocked 3–11 ms and the loop's lateness tracked it almost exactly
             # (10.9 ms blocked → 10.6 ms recorded), while the sampler reported a flat ~8 ms.
-            ticker.task.cancel()
+            ticker.stop()
             worst, worst_phase = ticker.worst, ticker.worst_phase
             scheduling = noise.stop()
             print(
@@ -578,8 +616,7 @@ class SlatesAsyncEveryCallEnds(unittest.TestCase):
             )
         finally:
             noise.stop()
-            ticker.task.cancel()
-            ticker._stop.set()
+            ticker.stop()
             try:
                 os.killpg(os.getpgid(anchor.pid), signal.SIGKILL)
             except ProcessLookupError:

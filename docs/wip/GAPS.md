@@ -1068,21 +1068,40 @@ seen.
 The Node test's failure message names no phase and no main-thread CPU. Its Python twin carries both, and adding them
 is the instrument for the next occurrence; that is proposed, not done.
 
-**Recurred 2026-10-23 with the spawns off the loop: open.** CI run 39974152220 (`bff7f799`, ubuntu, Python 3.11.17)
+**Recurred 2026-10-23 with the spawns off the loop; closed the same day.** CI run 39974152220 (`bff7f799`, ubuntu, Python 3.11.17)
 read 0.672 s late in phase **'connecting'**: 0.006 s of CPU, the sibling free, 0.000 s of noise, and the harness's
 slowest exec wait 54 ms (`pgrep`). By the rule above, its cause is elsewhere. What that phase runs on the loop's thread:
 - **the connect retries.** The extension never releases the GIL, and a block that keeps it reads the sibling held (a
   200 ms one read 269–330 ms in 5 of 5 runs, 2026-10-23), so they do not fit the reading;
 - **the bootstrap command through `_run_async`.** Its `asyncio.to_thread` is the scenario's first use of the default
-  executor, and CPython 3.11's `Thread.start()` waits on the calling thread until the new thread has started. That is
-  the leading hypothesis, not confirmed;
+  executor;
 - **`outstanding_limit`.**
 
-It did not reproduce in 10 runs on an idle Fedora machine (Python 3.14.3).
+It did not reproduce in 10 runs on an idle Fedora machine (Python 3.14.3), nor in 20 on the box under load.
 
-**The instrument.** The ticker now arms `faulthandler.dump_traceback_later` for one period plus the bound before each
-sleep, so a hold prints every thread's Python stack while it lasts; the watchdog that prints it needs no GIL. Checked on
-Linux with a 0.3 s hold of each kind, and each dump named its frame. The next failure names its call.
+**Cause identified 2026-10-23** (`docs/bugs/2026-10-23-the-async-sdk-tests-first-thread-handoff-imported-a-module-on-the-loop.md`).
+The first `asyncio.to_thread` imports `concurrent.futures.thread` and `queue` on the loop's thread: `concurrent.futures`
+imports its thread module lazily, on first use. An import's disk reads release the GIL, so a slow disk gives exactly
+CI's reading, and that run's `pgrep` exec took 54 ms where healthy runs take 1–2 ms. Making that import sleep 0.3 s
+failed the test 3 of 3 on Linux and 5 of 5 on macOS with the same reading. The dump named
+`concurrent/futures/__init__.py __getattr__` under `_run_async` every time. CI's own hold was not caught in a dump.
+
+**The fix, in the harness only:** its first hand-off to a worker thread happens before the ticker starts.
+- **Under the hook:** the no-warm-up copy failed 3 of 3 on fedora; the fixed file passed 5 of 5 there and 5 of 5 on
+  macOS at load 16–53.
+- **Without it:** 10 of 10 on fedora, and the whole Python suite on macOS.
+
+**The instrument, corrected the same day.**
+- **The first one perturbed what it measured.** It armed `faulthandler.dump_traceback_later` before each tick and
+  cancelled it after, but every arm starts an OS thread and every cancel joins it with the GIL held, inside the measured
+  interval. At load 14–17 on macOS that cost 19.7 ms at p99 and 74.7 ms at worst.
+- **The replacement.** The sibling thread watches a heartbeat the ticker writes and prints the loop thread's stack once
+  per hold. It named 0.3 s holds that release the GIL while they lasted, and holds that keep it the moment they ended,
+  5 of 5 each.
+
+**Open observation.** With the first instrument in place, the fixed test failed 2 of 5 on the Mac at load about 20, in
+phases (4) and (1), with no CPU and no hold dumped. Neither instrument failed in 6 interleaved runs each at load 11–47.
+The cause is not established.
 
 ### 8a-sdk-stamp. A client that reconnects during a restart may judge the new daemon gone (macOS, Windows; 2026-10-22, closed 2026-10-22 by A-143)
 
