@@ -6260,3 +6260,75 @@ done
 for _ in $(seq 1 3000); do grep -q "COST-END\|FAILED" "$R/crosvm.log" && break; sleep 0.1; done
 grep -aE "COST|FAILED" "$R/crosvm.log"
 ```
+
+## The journal's fixed share against what its rounds measured (§4.5; 2026-10-23)
+
+**The question.** §4.5 sizes a volume's journal as the mutation rate times the longest subscriber lag times the record
+size. The daemon holds a fixed 10‰ of the quota instead (`JOURNAL_SHARE_PERMILLE`; GAPS, "the journal's budget is a
+fixed share"). Since `534b16b3`, every mount round records what waited for it. By Little's law that backlog is the
+formula's product, measured directly. This records the product on real workloads beside the share, before the budget
+is derived from it.
+
+**The command.** `crates/cli/examples/journal_bench.rs`. It starts an in-process daemon and gives each workload a fresh
+1 GiB bounded volume, mounted by the real `slates mount`. A mount's own changes are behind its cursor, so each workload
+changes the volume through one path while a second mount of it watches:
+- `git_clone`: `git clone --depth 1 file://<checkout>` into a writer mount (3,791 files, 113 MiB checked out);
+- `cargo_build`: `cargo build --offline --locked` of `slates-wire-derive` (three dependencies and a build script), its
+  target directory in a writer mount;
+- `sdk_ring`: the SDK client sending 64,000 whole-file 64-byte replacements of 64 files, a ring's worth at a time
+  without waiting, as A-141's reproduction does, over files the watcher has read.
+
+After each workload the bench waits for the watcher's rounds to settle and reads the volume's journal report. Runs
+interleave the workloads, and every run is shown:
+`CARGO_TARGET_DIR=$HOME/.cache/slates-journal-target cargo build --release -p slates-cli --bin slates --example
+journal_bench && $CARGO_TARGET_DIR/release/examples/journal_bench`, from the checkout at `534b16b3` with this bench
+(binary hashes `5a6f60d5` for the bench, `b4da6204` for `slates`).
+
+**The machine.** The bare-metal Linux box: an AMD Ryzen 9 9950X3D2 (16 cores, 32 threads), 124 GiB, kernel
+7.2.9-2-cachyos, `fusermount3` 3.18.3, git 2.56.0, cargo 1.98.0. The run was 2026-10-23 22:10:58–22:11:11 UTC, with a
+load average of 66–76 from other work, CI jobs among it: no core idle.
+
+The budget is 10,737,418 bytes in every row: the share of the 1 GiB quota. The two waits are how long the oldest record
+in the largest backlog had waited, and the longest any round's oldest record had waited.
+
+| run | workload | seconds | appended | dropped | rounds | overruns | largest backlog: records | bytes | its wait (ms) | longest wait (ms) | mean charge (bytes) | budget ÷ largest | load (1, 5, 15 min) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | git_clone | 0.929 | 18,682 | 0 | 73,433 | 0 | 118 | 12,986 | 1.57 | 1.57 | 103 | 827× | 76.41 64.45 52.90 |
+| 1 | cargo_build | 1.775 | 1,799 | 0 | 7,091 | 0 | 35 | 6,286 | 0.50 | 1.72 | 111 | 1,708× | 71.57 63.65 52.70 |
+| 1 | sdk_ring | 0.625 | 128,193 | 6,177 | 7,615 | 0 | 72 | 6,519 | 1.35 | 1.96 | 88 | 1,647× | 71.57 63.65 52.70 |
+| 2 | git_clone | 0.892 | 18,682 | 0 | 73,722 | 0 | 106 | 12,519 | 1.45 | 1.60 | 103 | 858× | 71.57 63.65 52.70 |
+| 2 | cargo_build | 1.672 | 1,815 | 0 | 7,367 | 0 | 42 | 4,485 | 1.42 | 1.48 | 111 | 2,394× | 67.20 62.88 52.51 |
+| 2 | sdk_ring | 0.757 | 128,193 | 6,177 | 7,847 | 0 | 84 | 7,392 | 0.27 | 2.30 | 88 | 1,453× | 67.20 62.88 52.51 |
+| 3 | git_clone | 0.960 | 18,682 | 0 | 74,583 | 0 | 92 | 10,783 | 1.41 | 2.35 | 103 | 996× | 67.20 62.88 52.51 |
+| 3 | cargo_build | 2.112 | 1,838 | 0 | 7,420 | 0 | 24 | 2,433 | 1.02 | 1.49 | 111 | 4,413× | 65.98 62.69 52.51 |
+| 3 | sdk_ring | 0.740 | 128,193 | 6,177 | 7,259 | 0 | 448 | 39,424 | 2.33 | 2.60 | 88 | 272× | 65.98 62.69 52.51 |
+
+**An attempt before these runs** (22:06:49–22:08:05 UTC, load 61–63) printed two rows, then stopped. Its SDK ring sent
+its requests with `begin`, which carries no periodic acknowledgement, and the daemon refused past its 64 retained
+completion records (`AcknowledgementOwed`, AC-2.3). The bench now acknowledges after each ring. Its rows:
+- `git_clone`: 3.134 s; 18,682 appended; 74,421 rounds; no overrun; largest backlog 61 records, 5,368 bytes, whose
+  oldest record waited 2.27 ms; longest wait 15.26 ms.
+- `cargo_build`: 3.113 s; 1,852 appended; 7,244 rounds; no overrun; largest backlog 7 records, 901 bytes, 0.56 ms;
+  longest wait 2.52 ms.
+
+That longest wait, 15.26 ms on the first workload of a fresh process, is the longest of the eleven rows.
+
+**What it shows.**
+- **The largest product any round measured was 39,424 bytes (448 records)**, the SDK ring's third run. The share holds
+  272 times that. Every other row's largest backlog was 2,433–12,986 bytes, which the share holds 827–4,413 times over.
+- **No round overran.** The SDK ring appended 128,193 records, more than the share keeps at 88 bytes each (about
+  122,000), so its 6,177 oldest were dropped. Every cursor was already past them.
+- **The share scales with the quota; the product does not.** Its size here was set by the 1 GiB quota, not by
+  anything that waited. Below a quota of about 3.76 MiB (39,424 × 1,000 ÷ 10 bytes), the share is smaller than the
+  largest backlog measured, so a round behind that backlog overruns, and its mount drops its whole cache
+  (`Invalidation::Everything`, A-141). The A-141 volume's 256 KiB quota (a one-page journal, about 46 records) is one
+  of those.
+- **The oldest record of a largest backlog had waited 0.27–2.33 ms.** The longest any round's oldest record waited was
+  1.48–2.60 ms in these runs, and 15.26 ms once, in the attempt before them. The load was 61–76 on 32 threads.
+- **Rounds outnumber records** for the writer-mount workloads: about four per record for the clone. Each change wakes
+  both mounts, and most rounds find nothing waiting. The SDK ring ran one round per 16–18 records on average, the ring's
+  batching.
+
+This is the evidence the derived budget starts from. The design's formula, with the lag measured, asks for tens of
+kilobytes on these workloads. The fixed share gives a 1 GiB volume 10.7 MB, and a volume under 3.76 MiB less than the
+largest backlog measured.
