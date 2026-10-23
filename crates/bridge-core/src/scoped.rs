@@ -78,8 +78,8 @@ impl<'b> ScopedBridge<'b> {
 }
 
 impl Bridge for ScopedBridge<'_> {
-  fn numbers_unreserved(&self) -> bool {
-    self.inner.numbers_unreserved()
+  fn awaits_publication(&self) -> bool {
+    self.inner.awaits_publication()
   }
 
   fn root(&mut self, _cx: &OpContext) -> Result<u64, VfsError> {

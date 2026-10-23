@@ -309,3 +309,108 @@ fn a_reissued_handle_value_on_the_same_file_balances_across_the_takeover() {
     "reclaimed at the forget: both opens given back"
   );
 }
+
+/// Goal item 4, the window's other edge (A-154): a handle released after the last publication. The kernel never resends a
+/// release its daemon answered, so the release must be published before its reply, or the image would keep its open and
+/// a successor restore it with nothing ever to give it back. Do: through the dead daemon, create a file and open it
+/// twice more, unlink it, and publish (committed); release the first handle through the same daemon. Expect the volume
+/// to await a publication (the reply waits for the barrier). Then take the publication that wait runs, take over from
+/// it, release the other two through the successor and forget. Expect the file reclaimed at the forget.
+#[test]
+fn a_handle_released_after_the_last_publication_leaves_no_open_behind() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let cx = recorded_cx();
+  let mut dead = slates_bridge_core::new_handle_store();
+  let (f, handles) = {
+    let mut bridge = VolumeBridge::attached(
+      VolumeId { bytes: [0; 16] },
+      &mut vol,
+      &mut store,
+      &mut dead,
+      None,
+    );
+    let root = bridge.root(&cx).unwrap();
+    let (attr, created) = bridge.create(oid(root), &cx, "f", 0o644, 0).unwrap();
+    bridge.reference(oid(attr.ino), &cx).unwrap();
+    bridge.write(oid(attr.ino), &cx, 0, BYTES).unwrap();
+    let first = bridge.open(oid(attr.ino), &cx, 0).unwrap();
+    let second = bridge.open(oid(attr.ino), &cx, 0).unwrap();
+    bridge.unlink(oid(root), &cx, "f").unwrap();
+    (attr.ino, [created, first, second])
+  };
+  vol.to_image(&store, None).unwrap();
+  vol.mark_published(&store);
+  {
+    let mut bridge = VolumeBridge::attached(
+      VolumeId { bytes: [0; 16] },
+      &mut vol,
+      &mut store,
+      &mut dead,
+      None,
+    );
+    bridge.release(oid(f), &cx, handles[0]).unwrap();
+    assert!(
+      bridge.awaits_publication(),
+      "the release of an open the committed publication counts waits for the next publication"
+    );
+  }
+  let image = vol.to_image(&store, None).unwrap();
+  vol.mark_published(&store);
+  let (mut after, mut recovered) = taken_over(&store, &image);
+  let mut successor = slates_bridge_core::new_handle_store();
+  let mut bridge = VolumeBridge::attached(
+    VolumeId { bytes: [0; 16] },
+    &mut recovered,
+    &mut after,
+    &mut successor,
+    None,
+  );
+  for fh in &handles[1..] {
+    bridge.release(oid(f), &cx, *fh).unwrap();
+  }
+  bridge.forget(oid(f), &cx, 1);
+  assert!(
+    bridge.getattr(oid(f), &cx).is_err(),
+    "reclaimed at the forget: the release the dead daemon answered left no open behind"
+  );
+}
+
+/// A-154, the common case costs nothing: an open and its release both after the last publication were never published,
+/// so the release waits for no barrier. Do: create a file and publish (committed); open it and release that handle.
+/// Expect the volume not to await a publication.
+#[test]
+fn a_release_of_an_open_no_publication_counted_waits_for_nothing() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let cx = recorded_cx();
+  let mut handles = slates_bridge_core::new_handle_store();
+  let f = {
+    let mut bridge = VolumeBridge::attached(
+      VolumeId { bytes: [0; 16] },
+      &mut vol,
+      &mut store,
+      &mut handles,
+      None,
+    );
+    let root = bridge.root(&cx).unwrap();
+    let (attr, created) = bridge.create(oid(root), &cx, "f", 0o644, 0).unwrap();
+    bridge.release(oid(attr.ino), &cx, created).unwrap();
+    attr.ino
+  };
+  vol.to_image(&store, None).unwrap();
+  vol.mark_published(&store);
+  let mut bridge = VolumeBridge::attached(
+    VolumeId { bytes: [0; 16] },
+    &mut vol,
+    &mut store,
+    &mut handles,
+    None,
+  );
+  let opened = bridge.open(oid(f), &cx, 0).unwrap();
+  bridge.release(oid(f), &cx, opened).unwrap();
+  assert!(
+    !bridge.awaits_publication(),
+    "an open and release since the last publication wait for nothing"
+  );
+}

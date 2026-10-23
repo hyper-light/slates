@@ -86,7 +86,7 @@ impl Model {
       .create_file_no(&mut self.store, root, &name, FILE_MODE)
       .unwrap()
       .counter();
-    if self.volume.unreserved() {
+    if self.volume.awaits_publication() {
       self.waiting.push(counter);
     } else {
       self.handed_out.push(counter);
@@ -103,7 +103,7 @@ impl Model {
     }
     self.volume.mark_published(&self.store);
     assert!(
-      !self.volume.unreserved(),
+      !self.volume.awaits_publication(),
       "a committed publication reserves every number issued before it"
     );
     self.handed_out.append(&mut self.waiting);
@@ -111,10 +111,10 @@ impl Model {
 
   /// A refused publication: imaged, never committed, so nothing is reserved and nothing is sent.
   fn abandon(&mut self) {
-    let before = self.volume.unreserved();
+    let before = self.volume.awaits_publication();
     let _ = streamed_publication(&mut self.volume, &self.store);
     assert_eq!(
-      self.volume.unreserved(),
+      self.volume.awaits_publication(),
       before,
       "an abandoned publication reserves nothing"
     );

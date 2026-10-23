@@ -610,8 +610,8 @@ fn unpack_handle(word: u64) -> Handle<u64> {
 }
 
 impl Bridge for VolumeBridge<'_> {
-  fn numbers_unreserved(&self) -> bool {
-    self.volume.unreserved()
+  fn awaits_publication(&self) -> bool {
+    self.volume.awaits_publication()
   }
 
   fn root(&mut self, cx: &OpContext) -> Result<u64, VfsError> {

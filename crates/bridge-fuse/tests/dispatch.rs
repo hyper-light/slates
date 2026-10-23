@@ -85,7 +85,7 @@ impl Bridge for Mock {
     Ok(1)
   }
   // A mock with no volume issues no inode numbers, so it holds none unreserved (A-150).
-  fn numbers_unreserved(&self) -> bool {
+  fn awaits_publication(&self) -> bool {
     false
   }
   fn lookup(

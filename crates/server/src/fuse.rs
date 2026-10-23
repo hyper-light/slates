@@ -788,11 +788,12 @@ fn reply(
   if flush_logged {
     s.count(FLUSH_LOGGED, 1);
   }
-  // A reply that hands out an inode number no committed publication reserves waits for the publication that does
-  // (A-150): the kernel keeps the number across a restart, so a successor must never issue it again. The top-up before
-  // each unit of work (`relieve_deferred`) keeps this rare.
-  let unreserved = crate::verbs::numbers_unreserved(s, mount.volume);
-  let refuse = if (dispatched.needs_barrier() && !flush_logged) || unreserved {
+  // A reply after which the kernel keeps an effect across a restart waits for the publication that makes it durable
+  // (D-18): an inode number no committed publication reserves (A-150; the top-up before each unit of work,
+  // `relieve_deferred`, keeps this rare), or a release of an open the committed publication counts (A-154; the kernel
+  // never resends a release its daemon answered).
+  let awaits_publication = crate::verbs::awaits_publication(s, mount.volume);
+  let refuse = if (dispatched.needs_barrier() && !flush_logged) || awaits_publication {
     // The reply rides the publication with its effect (A-61), so a daemon that dies before writing it leaves its
     // successor the answer for the request the kernel resends, never a second application.
     s.pending_replies.insert(

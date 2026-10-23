@@ -460,6 +460,7 @@ impl Volume {
     // The publication recorded this ceiling (`roots`, `to_image`), unchanged since: numbers below it are now reserved
     // (A-150). Raised before the roots are kept, so the kept roots carry the same counter.
     self.counter_ceiling = self.recorded_counter(store);
+    self.commit_opens();
     self.dirty.clear_recorded();
     self.dirty.changed = false;
     self.dirty.shared_diverged = false;
@@ -467,6 +468,37 @@ impl Volume {
     self.dirty.published_shape = self.shape();
     self.dirty.published_roots = self.roots(store).ok();
     self.dirty.published_base_token = self.base_change_token();
+  }
+
+  /// The open counts the committed publication carries become the committed ones (A-154), and no release waits any more.
+  /// After a delta, only the changed reference records' counts can have moved; a volume's first publication is whole,
+  /// recorded nothing, and carries every recorded attachment's opens.
+  fn commit_opens(&mut self) {
+    if self.dirty.recording() {
+      for &(attachment, inode) in &self.dirty.references {
+        let owner = crate::ids::RefOwner::Attachment(attachment);
+        let no = crate::ids::InodeNo(inode);
+        let live = self
+          .attachment_opens
+          .get(&owner)
+          .and_then(|inodes| inodes.get(&no))
+          .copied()
+          .unwrap_or(0);
+        if live == 0 {
+          self.committed_opens.remove(&(owner, no));
+        } else {
+          self.committed_opens.insert((owner, no), live);
+        }
+      }
+    } else {
+      self.committed_opens = self
+        .attachment_opens
+        .iter()
+        .filter(|(owner, _)| matches!(owner, crate::ids::RefOwner::Attachment(_)))
+        .flat_map(|(owner, inodes)| inodes.iter().map(|(no, count)| ((*owner, *no), *count)))
+        .collect();
+    }
+    self.releases_unpublished = false;
   }
 
   /// This volume's roots now.

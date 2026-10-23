@@ -84,8 +84,8 @@ impl<B: Bridge> Bridge for FailingGather<B> {
     self.inner.root(cx)
   }
 
-  fn numbers_unreserved(&self) -> bool {
-    self.inner.numbers_unreserved()
+  fn awaits_publication(&self) -> bool {
+    self.inner.awaits_publication()
   }
 
   fn lookup(&mut self, parent: ObjectId, cx: &OpContext, name: &str) -> Result<NodeAttr, VfsError> {

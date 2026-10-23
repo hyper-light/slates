@@ -276,10 +276,9 @@ pub trait Bridge {
   /// The root directory's inode number, under `cx` (the attachment's volume must be this bridge's).
   /// FUSE resolves node id 1 to it; NFS mints the export's root file handle from it.
   fn root(&mut self, cx: &OpContext) -> Result<u64, VfsError>;
-  /// Whether the volume has issued an inode number no committed publication reserves (A-150): a transport's reply
-  /// that would hand one out waits for the owner's barrier (D-18), since the client keeps the number across a restart
-  /// and a successor must never issue it again.
-  fn numbers_unreserved(&self) -> bool;
+  /// Whether an effect a client keeps across a restart waits for the volume's next publication
+  /// ([`slates_vfs::volume::Volume::awaits_publication`]): a transport's reply then waits for the owner's barrier (D-18).
+  fn awaits_publication(&self) -> bool;
   /// Look `name` up in directory `parent` under `cx`; the child's attributes.
   fn lookup(&mut self, parent: ObjectId, cx: &OpContext, name: &str) -> Result<NodeAttr, VfsError>;
   /// The attributes of `object` under `cx`.

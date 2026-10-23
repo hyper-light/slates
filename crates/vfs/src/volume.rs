@@ -399,7 +399,7 @@ pub struct Volume {
   pub(crate) next_counter: u64,
   /// The counter the last committed publication recorded for this volume (A-150): every number below it is covered by a
   /// reservation a successor honours, so a reply may hand it out with no barrier. A number at or past it is
-  /// unreserved ([`Volume::unreserved`]) until a publication covers it.
+  /// unreserved ([`Volume::awaits_publication`]) until a publication covers it.
   pub(crate) counter_ceiling: u64,
   pub(crate) snapshots: Slab<Snapshot>,
   pub(crate) last_snapshot: Option<SnapshotId>,
@@ -493,6 +493,14 @@ pub struct Volume {
   /// ([`Volume::release_restored_open`]). Each is also counted in [`Volume::attachment_opens`] and its references, so the
   /// map is bounded by the restored references, and it empties as those handles are released or their owner swept.
   pub(crate) restored_opens: BTreeMap<(RefOwner, InodeNo), u32>,
+  /// The open counts of recorded attachments as the last committed publication, or the image a recovery rebuilt from,
+  /// holds them (A-154): what a successor would restore. Kept in step with each publication's changed reference
+  /// records at its commit (`mark_published`). Bounded by the recorded attachments' opens.
+  pub(crate) committed_opens: BTreeMap<(RefOwner, InodeNo), u32>,
+  /// Whether a release has left an attachment's live opens of a file below the committed count since the last commit
+  /// (A-154): the kernel never resends a release its daemon answered, so the reply waits for the publication that
+  /// makes it durable ([`Volume::awaits_publication`]).
+  pub(crate) releases_unpublished: bool,
   /// Inodes that have left the namespace (`nlink == 0`) while still referenced, awaiting
   /// reclamation at their last `unreference`, each with the retention bytes the unlink secured for
   /// its content (§4.2: charged when the name went, because the last close cannot refuse; consumed
@@ -740,6 +748,8 @@ impl Volume {
       attachment_opens: BTreeMap::new(),
       opens: BTreeMap::new(),
       restored_opens: BTreeMap::new(),
+      committed_opens: BTreeMap::new(),
+      releases_unpublished: false,
       orphans: BTreeMap::new(),
       dirty: crate::delta::Dirty::default(),
       live_inodes: 1,
@@ -826,6 +836,8 @@ impl Volume {
       attachment_opens: BTreeMap::new(),
       opens: BTreeMap::new(),
       restored_opens: BTreeMap::new(),
+      committed_opens: BTreeMap::new(),
+      releases_unpublished: false,
       orphans: BTreeMap::new(),
       dirty: crate::delta::Dirty::default(),
       live_inodes: origin.live_inodes,
@@ -931,6 +943,8 @@ impl Volume {
       attachment_opens: BTreeMap::new(),
       opens: BTreeMap::new(),
       restored_opens: BTreeMap::new(),
+      committed_opens: BTreeMap::new(),
+      releases_unpublished: false,
       orphans: BTreeMap::new(),
       dirty: crate::delta::Dirty::default(),
       live_inodes: 1,
@@ -3896,10 +3910,12 @@ impl Volume {
       .max(self.counter_ceiling)
   }
 
-  /// Whether this volume has issued an inode number no committed publication reserves (A-150): a reply that would
-  /// hand one out waits for a publication (D-18), since the client keeps the number across a restart.
-  pub fn unreserved(&self) -> bool {
-    self.next_counter > self.counter_ceiling
+  /// Whether an effect a client keeps across a restart waits for this volume's next publication (D-18), so a
+  /// transport's reply must wait for the owner's barrier: an inode number issued past the committed ceiling (A-150),
+  /// which the client keeps, so a successor must never issue it again; or a release of an open the committed
+  /// publication still counts (A-154), which the client never sends again.
+  pub fn awaits_publication(&self) -> bool {
+    self.next_counter > self.counter_ceiling || self.releases_unpublished
   }
 
   /// Admits a namespace verb's volume allowances before anything changes (§4.2; AUD-29-40): a fresh
@@ -5403,6 +5419,10 @@ impl Volume {
     self
       .restored_opens
       .retain(|(owner, _), _| *owner != attachment);
+    // A swept attachment's kernel is gone: none of its releases will come, so none waits.
+    self
+      .committed_opens
+      .retain(|(owner, _), _| *owner != attachment);
     let Some(owned) = self.attachment_refs.remove(&attachment) else {
       return Ok(());
     };
@@ -5540,6 +5560,9 @@ impl Volume {
       *global = global.saturating_add(opens);
       let restored = self.restored_opens.entry((holder, no)).or_insert(0);
       *restored = restored.saturating_add(opens);
+      // The image is what a further successor would restore until this daemon publishes (A-154).
+      let committed = self.committed_opens.entry((holder, no)).or_insert(0);
+      *committed = committed.saturating_add(opens);
     }
     Ok(())
   }
@@ -5600,13 +5623,25 @@ impl Volume {
       return;
     };
     *count = count.saturating_sub(1);
-    if *count == 0 {
+    let live = *count;
+    if live == 0 {
       inodes.remove(&no);
     }
     if inodes.is_empty() {
       self.attachment_opens.remove(&attachment);
     }
     self.unpin_open(no, 1);
+    // A release that leaves fewer opens than the committed publication counts waits for the next publication before
+    // its reply (A-154): the kernel never resends a release its daemon answered, so a daemon that died before
+    // publishing would leave a successor restoring an open nothing ever gives back. An open and release both since the
+    // last publication leave the count where it was, and wait for nothing.
+    if self
+      .committed_opens
+      .get(&(attachment, no))
+      .is_some_and(|committed| live < *committed)
+    {
+      self.releases_unpublished = true;
+    }
   }
 
   /// Whether any handle holds inode `no` open.

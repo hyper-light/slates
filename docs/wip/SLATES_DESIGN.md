@@ -9216,7 +9216,8 @@ Applied in the same change to: §4.6 "Linux" status, the failure matrix, T-3.5, 
     `ESTALE` once not: the successor holds no descriptor for it, and the image carries the file's identity (A-151).
     A handle the restarted daemon never issued gives back, at its release, one open the recovery restored for its
     file and attachment, while one is left (A-152); until 2026-10-22 it gave back nothing, and an unlinked file stayed
-    until the mount ended. That takes knowing a handle by its value and its file together (A-148): the restarted
+    until the mount ended. A release that closes an open the committed publication counts is published before its
+    reply (A-154), so no daemon dies leaving a restored open the kernel will never release. That takes knowing a handle by its value and its file together (A-148): the restarted
     daemon's handle store is fresh and reissues its predecessor's values, so a release frees a handle only when its
     file is the one the release names, and any other is taken for one the dead daemon issued. A file unlinked while open survives in
     the recovery image's orphan tracking; the restored mount takes one reference on each recovered orphan,
@@ -11984,6 +11985,50 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
+
+### A-154 — A release of an open a publication counted is published before its reply (accepted 2026-10-23)
+Applied in the same change to:
+- A-61 ("What the kernel kept") and A-152;
+- `crates/vfs/src/volume.rs`:
+  - `committed_opens` and `releases_unpublished`;
+  - `close_for` sets the flag;
+  - `restore_references` and `sweep_attachment` keep `committed_opens` in step;
+  - `unreserved` became `awaits_publication`;
+- `crates/vfs/src/delta.rs`: `mark_published` commits the open counts (`commit_opens`);
+- the hook renamed from `numbers_unreserved` to `awaits_publication`:
+  - `crates/bridge-core` (`Bridge::awaits_publication`, `volume_bridge.rs`, `scoped.rs`);
+  - `crates/bridge-virtiofs/src/device.rs`;
+  - `crates/server/src/verbs.rs`, `fuse.rs` and `nfs.rs`;
+  - the test bridges in `crates/bridge-fuse/tests`;
+- the tests: `crates/bridge-core/tests/takeover_release.rs` (`a_handle_released_after_the_last_publication_leaves_no_open_behind`,
+  `a_release_of_an_open_no_publication_counted_waits_for_nothing`);
+- GAPS;
+- `docs/bugs/2026-10-23-a-release-the-dead-daemon-answered-after-the-last-publication-came-back-as-an-open.md`.
+
+- **What it answers.** A-152 restores the opens an image counted and gives one back at each release of a handle the
+  successor never issued. It covered a handle opened after the last publication, but not one released after it. The
+  kernel never resends a release its daemon answered, so a daemon that answered one and died before publishing left
+  the image counting an open that nothing would ever give back. A-152's own end-to-end test found it under load on
+  the box, about one full-suite run in five. The kernel's background `RELEASE` of a `CREATE` handle had queued behind
+  the file's write-back, and the `UNLINK`'s barrier published three opens where two handles were left.
+- **The rule (D-18).** After every reply, each recorded attachment's live opens of a file are at least the opens the
+  committed publication counted.
+  - A release that leaves fewer marks the volume as awaiting a publication (`Volume::awaits_publication`, the hook
+    A-150 made for unreserved inode numbers).
+  - The transport's reply then waits for the owner's barrier.
+  - A crash before that reply leaves the `RELEASE` unanswered: the kernel resends it, and it consumes the restored
+    open.
+- **Why the bound holds.** A successor restores the committed count, and the kernel's later releases consume restored
+  opens while any are left. So the opens nothing will give back number max(0, committed − live), which the rule keeps
+  at zero.
+- **What it costs.** Only a release of an open a publication counted waits. The kernel sends a regular file's
+  `RELEASE` after `close()` has returned, so the wait costs the daemon one publication and the application nothing. An
+  open and release both since the last publication leave the count where it was, and wait for nothing
+  (`a_release_of_an_open_no_publication_counted_waits_for_nothing`).
+- **Left open:** a `FORGET` processed after the last publication leaves its lookup reference counted in the image, and
+  the kernel never resends a `FORGET` either. It has no reply to wait behind; it stays under A-61's stated limits, as
+  a bounded leak (GAPS).
+- **Evidence.** See the bug record's verification.
 
 ### A-153 — A recovered base directory is judged by its identity, not its entries (accepted 2026-10-22)
 Applied in the same change to:

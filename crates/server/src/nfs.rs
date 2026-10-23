@@ -1118,11 +1118,11 @@ fn record_and_publish(
   }
   // A reply that hands out an inode number no committed publication reserves (a file handle from a LOOKUP, a READDIRPLUS
   // entry) waits for the publication that does (A-150): the client keeps the handle across a restart.
-  let unreserved = target_volume(program, procedure, args)
-    .and_then(|volume| state::with_state(|s| crate::verbs::numbers_unreserved(s, volume)))
+  let awaits_publication = target_volume(program, procedure, args)
+    .and_then(|volume| state::with_state(|s| crate::verbs::awaits_publication(s, volume)))
     .unwrap_or(false);
   if !matches!(served.0, AcceptStatus::Success)
-    || !(needs_barrier(program, procedure, args, &served.1) || unreserved)
+    || !(needs_barrier(program, procedure, args, &served.1) || awaits_publication)
   {
     return served;
   }

@@ -9362,17 +9362,17 @@ pub(crate) fn relieve_deferred(state: &mut ShardState) {
 /// of work that might hand one out.
 pub(crate) const COUNTERS_TOPPED_UP: &str = "publish.counters_topped_up";
 
-/// Whether volume `volume` has issued an inode number no committed publication reserves (A-150): a reply that would
-/// hand it out must wait for a publication (D-18), since the client keeps the number across a restart. `false` for a
-/// volume this shard does not hold. Unix only, as the transports that ask it are (the FUSE and NFS replies): Windows
-/// records no reserve, since no transport there hands a client a number it keeps.
+/// Whether an effect a client keeps across a restart waits for volume `volume`'s next publication
+/// (`Volume::awaits_publication`: an unreserved inode number, A-150; a release the committed publication still counts
+/// as an open, A-154): the reply must wait for the barrier (D-18). `false` for a volume this shard does not hold. Unix
+/// only, as the transports that ask it are (the FUSE and NFS replies).
 #[cfg(unix)]
-pub(crate) fn numbers_unreserved(state: &ShardState, volume: DbVolumeId) -> bool {
+pub(crate) fn awaits_publication(state: &ShardState, volume: DbVolumeId) -> bool {
   state
     .by_id
     .get(&volume)
     .and_then(|handle| state.volumes.get(*handle).ok())
-    .is_some_and(|slot| slot.volume.unreserved())
+    .is_some_and(|slot| slot.volume.awaits_publication())
 }
 
 /// Returns a recovered volume's byte reservation and re-grown dynamic hold to the shard budget, for

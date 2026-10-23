@@ -11045,6 +11045,8 @@ Goal item 4 of 2026-10-22, the leak A-148 recorded.
   publication; the successor's own handle under a reissued value.
 - **Still open:** a pre-takeover handle opened after the last publication is not counted open by the successor (the
   A-151 sibling above). That is a refusal, never wrong bytes.
+- **Found under load afterwards, fixed by A-154 (next section but two):** a handle released after the last publication
+  left its open in the image, and nothing ever gave it back.
 
 ### 2026-10-22: a takeover refused an overlay whose base directory an outsider had changed — fixed (A-153)
 
@@ -11061,3 +11063,22 @@ Found while fixing A-151.
 - **Open, found here:** a loaded base directory **removed** after the last publication still refuses the whole volume,
   since reopening it fails (`open_source`). §4.8 allows `RecoveryIncomplete` there. The failure matrix's runtime rule,
   `BaseUnavailable` for that directory's untouched entries while overlay entries serve, is the robust form, and is owed.
+
+### 2026-10-23: a release the dead daemon answered after the last publication came back as an open — fixed (A-154)
+
+Found by A-152's own end-to-end test
+(`the_handles_a_dead_daemon_issued_give_back_their_references_at_release`). It failed about once in five full CLI-suite
+runs on the box at load average 74 to 93, and never alone.
+- **What the logs showed.**
+  - The dead daemon released the `CREATE` handle after the unlink's barrier had published.
+  - The successor restored three opens where two handles were left, and the file was never reclaimed.
+  - The kernel's background `RELEASE` had queued behind the 1 MiB file's write-back while the `UNLINK` went first.
+- **Cause.** The kernel never resends a release its daemon answered. A-152 covered handles opened after the last
+  publication, not handles released after it.
+- **The fix (A-154).** A release that leaves an attachment's live opens of a file below the committed publication's
+  count waits for the owner's barrier before its reply (`Volume::awaits_publication`, A-150's hook, renamed). The
+  application never waits: a regular file's `RELEASE` comes after `close()` returned. An open and release both since
+  the last publication wait for nothing.
+- **Open, a sibling:** a `FORGET` processed after the last publication leaves its lookup reference in the image, and the
+  kernel never resends a `FORGET`. It has no reply to wait behind, so it is a bounded leak under A-61's stated limits,
+  owed (a forget could be logged to anchor RAM as A-63 logs writes).
