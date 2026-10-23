@@ -38,6 +38,7 @@ pub mod control;
 pub mod driver;
 pub mod error;
 pub mod futures;
+mod interest;
 mod netsys;
 pub mod parking;
 pub mod queue;

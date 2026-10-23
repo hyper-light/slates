@@ -77,6 +77,12 @@ pub enum RtError {
     /// The call.
     call: &'static str,
   },
+  /// The shard has issued every readiness registration token it may (2^64 − 1 of them): refused, never reused,
+  /// since a reused token could let an old future forget a live registration (A-149).
+  InterestsExhausted {
+    /// The shard.
+    shard: u16,
+  },
 }
 
 impl fmt::Display for RtError {
@@ -101,6 +107,12 @@ impl fmt::Display for RtError {
       ),
       Self::WorkerFailed { shard } => write!(f, "shard {shard}'s worker ended without a result"),
       Self::WouldBlock { call } => write!(f, "{call} would block: the OS has no room for it now"),
+      Self::InterestsExhausted { shard } => {
+        write!(
+          f,
+          "shard {shard} has issued every readiness registration it may"
+        )
+      }
     }
   }
 }

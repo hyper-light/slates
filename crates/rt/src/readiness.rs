@@ -1,68 +1,86 @@
-//! Awaiting a socket's readiness through the shard's driver (§4.10a, §4.6): a future registers
-//! one-shot interest — readable, or writable — with the current shard's driver on its first poll and
-//! yields; the driver's completion (or the simulation fabric's wake) re-queues the task, and the next
-//! poll returns ready so the caller retries its non-blocking syscall. One path serves both sockets:
-//! the UDP datagram socket awaits readability (a real fd, or a simulated fabric port), and the TCP
-//! stream awaits readability for `read`/`accept` and writability for a `write` whose send buffer
+//! Awaiting a descriptor's readiness through the shard's driver (§4.10a, §4.6). On its first poll a future
+//! registers one-shot interest — readable, or writable — and yields. The driver's completion (or the simulation
+//! fabric's wake) names that registration, and the shard marks it fired and re-queues the task
+//! ([`crate::interest`], A-149). The future answers ready only when *its own* descriptor fired, so the caller
+//! retries its non-blocking syscall exactly when that descriptor became ready.
+//!
+//! One path serves every descriptor. The UDP datagram socket awaits readability (a real fd, or a simulated fabric
+//! port). The TCP stream awaits readability for `read`/`accept`, and writability for a `write` whose send buffer
 //! filled. The driver decides how the edge is watched (kqueue `EVFILT_READ`/`EVFILT_WRITE`, epoll
-//! `EPOLLIN`/`EPOLLOUT`); the future is the same either way, which is why it lives here and not in the
-//! socket modules. [`readable`] is public because a bridge queue's doorbell is the same edge: the
-//! virtio-fs device (`slates-bridge-virtiofs`, §4.6) awaits the kick descriptor its VMM handed it —
-//! an eventfd or a pipe — through the shard's driver exactly as a socket is awaited, and drains it
-//! itself; the driver seam's doc names "the bridge queues" as a user of `wait` for this reason.
+//! `EPOLLIN`/`EPOLLOUT`, IOCP's AFD poll); the future is the same either way, which is why it lives here and not in
+//! the socket modules. [`readable`] is public because a bridge queue's doorbell is the same edge: the virtio-fs
+//! device (`slates-bridge-virtiofs`, §4.6) awaits the kick descriptor its VMM handed it (an eventfd or a pipe)
+//! through the shard's driver exactly as a socket is awaited, and drains it itself. The FUSE serve loop races its
+//! device against its change signal the same way.
+//!
+//! **A task can race several waits.** Until A-149 a registered future answered ready on any wake of its task. A
+//! completion carried only the task's word, so a wake from another source was taken for the descriptor's own:
+//! - a daemon serving two FUSE mounts of a volume spun a core after one write, because the change signal's wake
+//!   was read as the device's and the signal never drained;
+//! - a deadline raced against a bare readiness wait (`futures::within`) could never be reported.
+//!
+//! (`docs/bugs/2026-10-22-a-readiness-wait-took-any-wake-of-its-task-for-its-own.md`.) A ready answer can still find
+//! nothing to do — another reader took the data first, or the drivers' level and edge semantics differ — so callers
+//! keep retrying their syscall on `EAGAIN` and awaiting again.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use crate::error::RtError;
+use crate::interest::{Direction, Taken};
 use crate::registry;
 use crate::waker::polling_task;
 
-/// Which readiness edge a caller awaits.
-#[derive(Clone, Copy)]
-enum Interest {
-  /// The socket has data to read, or a listener has a connection to accept.
-  Readable,
-  /// The socket has send-buffer space for a write (or connect) that returned `EAGAIN`/`EINPROGRESS`: a TCP
-  /// write, or a UDP send the kernel had no room for (every platform's driver arms it: kqueue
-  /// `EVFILT_WRITE`, epoll `EPOLLOUT`, IOCP's AFD send poll).
-  Writable,
-}
-
-/// Awaits one readiness edge on `raw` through the shard's driver: it registers one-shot interest on
-/// the first poll and yields; the driver's completion re-queues the task, and the next poll is ready
-/// so the caller retries the non-blocking syscall (a spurious wake just retries).
+/// Awaits one readiness edge on `raw` through the shard's driver. It registers one-shot interest on the first
+/// poll and yields. Once the driver reports that very registration fired, the next poll is ready, and the caller
+/// retries the non-blocking syscall. A wake from anywhere else leaves it pending.
 struct Ready {
   raw: i32,
-  interest: Interest,
-  armed: bool,
+  direction: Direction,
+  /// The token of the registration this future holds, from its first poll until it answers or is dropped.
+  token: Option<u64>,
 }
 
 impl Future for Ready {
   type Output = Result<(), RtError>;
 
   fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), RtError>> {
-    if self.armed {
-      // The driver woke us; let the caller retry the syscall.
-      return Poll::Ready(Ok(()));
+    let (raw, direction) = (self.raw, self.direction);
+    if let Some(token) = self.token {
+      match registry::with_current(|ctx| ctx.take_interest(raw, direction, token)) {
+        Some(Taken::Fired) => {
+          self.token = None;
+          return Poll::Ready(Ok(()));
+        }
+        // Another source woke the task; this registration stands and wakes it when its descriptor fires.
+        Some(Taken::Waiting) => return Poll::Pending,
+        // A later registration of the same descriptor and direction replaced this one: register again.
+        Some(Taken::Lost) => self.token = None,
+        None => return Poll::Ready(Err(RtError::NotOnShardThread)),
+      }
     }
     let Some(word) = polling_task(cx.waker()) else {
-      // A foreign waker cannot be armed on the driver; degrade to a retry (the caller's loop copes).
+      // A foreign waker cannot be registered on the driver; degrade to a retry (the caller's loop copes).
       return Poll::Ready(Ok(()));
     };
-    let (raw, interest) = (self.raw, self.interest);
-    let registered = registry::with_current(|ctx| match interest {
-      Interest::Readable => ctx.register_readable(raw, word.word()),
-      Interest::Writable => ctx.register_writable(raw, word.word()),
-    });
-    match registered {
-      Some(Ok(())) => {
-        self.armed = true;
+    match registry::with_current(|ctx| ctx.register_interest(raw, direction, word.word())) {
+      Some(Ok(token)) => {
+        self.token = Some(token);
         Poll::Pending
       }
       Some(Err(e)) => Poll::Ready(Err(e)),
       None => Poll::Ready(Err(RtError::NotOnShardThread)),
+    }
+  }
+}
+
+impl Drop for Ready {
+  fn drop(&mut self) {
+    if let Some(token) = self.token.take() {
+      // Off the shard thread (a runtime dropping its tasks as it ends) there is no table to forget it from: the
+      // shard's table ends with its context.
+      let _ = registry::with_current(|ctx| ctx.forget_interest(self.raw, self.direction, token));
     }
   }
 }
@@ -72,8 +90,8 @@ impl Future for Ready {
 pub async fn readable(raw: i32) -> Result<(), RtError> {
   Ready {
     raw,
-    interest: Interest::Readable,
-    armed: false,
+    direction: Direction::Readable,
+    token: None,
   }
   .await
 }
@@ -82,8 +100,8 @@ pub async fn readable(raw: i32) -> Result<(), RtError> {
 pub(crate) async fn writable(raw: i32) -> Result<(), RtError> {
   Ready {
     raw,
-    interest: Interest::Writable,
-    armed: false,
+    direction: Direction::Writable,
+    token: None,
   }
   .await
 }

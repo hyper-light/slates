@@ -10891,3 +10891,42 @@ The property under test never failed. `hold_until_enough_attacks` now keeps the 
 On the same two cores the fixed tests passed 6 of 6, against 1 of 3 failing before. The stale-handle attack ran past the
 window to reach the floor where it had to: 1,010–1,373 attempts in five runs and 2,708 in one. Each run took
 2.4–3.1 s, against 2.4–2.6 s before. Both properties held in every run: no leak, and no stale read resolved.
+
+### 2026-10-22: a daemon serving two FUSE mounts of a volume spun a core after one write — fixed (A-149)
+
+Found on the box while measuring the truncate-under-DAX hang: the daemon used 129 to 200 clock ticks per 2 s when it
+should have been idle. With zero, one and two FUSE mounts of one volume and a write through the first, one shard of the
+two-mount daemon used 397 of 400 ticks over 4 s; with zero or one mount the daemon used 1 tick.
+
+- **Cause:** a readiness future answered ready on any wake of its task, since a driver's completion carried only the
+  task's word. The FUSE serve loop races its device against its change signal. The signal's wake was read as the
+  device's, so the loop read `EAGAIN`, never drained the signal, and was woken again at once (`perf trace`: 92,529
+  `epoll_pwait` and 92,510 refused `read`s in 2 s).
+- **Sibling, same cause:** a deadline raced against a bare readiness wait could never be reported. The production
+  callers that race a socket read survive it, at one wasted syscall and registration per deadline.
+- **The fix (A-149):** a registration hands the driver an interest word naming its descriptor, and the shard's table
+  maps it to the waiting task, so a readiness future answers only for its own descriptor.
+- **What leaned on the old behaviour, found by sweeping every readiness consumer and every stored waker:** the
+  virtio-fs device loop. A revoke (a `detach`, a destroy) or a drain kick (a `snapshot` recall) interrupted its
+  doorbell wait only because the request's wake passed for a doorbell kick. With the runtime fix alone, a loop parked
+  on an idle guest's doorbell kept serving a detached device. The new test
+  `a_revoke_request_ends_a_loop_parked_on_an_idle_guests_doorbell` was red until the wait raced the shard's requests
+  explicitly.
+- **Proven:**
+  - the runtime race tests: red before on kqueue and epoll, green after, and red again under the old behaviour;
+  - `fuse_idle`: 86 of 100 ticks before, green after;
+  - the virtio-fs revoke test;
+  - Miri clean;
+  - the runtime, memory, virtio-fs, client, NFS, FUSE, CLI and guest suites green on the box.
+
+Still open, observed in the same runs and not caused by this bug:
+- **Probes from the box's desktop session.** After the fix, one two-mount run showed 81 ticks over 4 s on the busier
+  shard, another 2 ticks in all. The trace of the first showed the second mount's kernel sending two `LOOKUP`s about a
+  second apart, answered `ENOENT`, after which the shard spun out its idle window (A-42) and parked. Their sizes match
+  `.Trash` and `.Trash-1000`, and the box runs a KDE Plasma session that probes new mounts. That identification is
+  inferred from the sizes, not read from the requests.
+- **The idle window's length after one lone request is unmeasured.** How long the shard spins after such a probe, and
+  so what an idle desktop's probes cost a laptop's battery, is owed a measurement.
+- **A parked DAX map-ack wait is not interruptible.** `drive_dax_acks` waits for the front end's reply-ack on its own
+  descriptor, so a revoke during it is taken only after the ack arrives. That is unchanged by A-149: the old behaviour
+  only looped back into the same wait.

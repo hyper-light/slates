@@ -155,8 +155,45 @@ fn unregister(id: DeviceId) {
   });
 }
 
-/// A future that records the loop's current waker in its control entry, so a revoke request can
-/// interrupt the loop's wait on the doorbell.
+/// Whether the shard has asked something of loop `id` that it has not taken yet: a revoke, or a kick to drain.
+fn request_pending(id: DeviceId) -> bool {
+  CONTROL.with(|control| {
+    control
+      .borrow()
+      .get(&id.0)
+      .is_some_and(|e| e.revoke || e.drain)
+  })
+}
+
+/// What ended a loop's wait on its doorbell.
+enum Woke {
+  /// The guest kicked the doorbell (or hung it up: the drain tells which).
+  Doorbell,
+  /// The shard asked for a revoke or a drain ([`request_revoke`], [`kick`]).
+  Request,
+}
+
+/// Waits until the guest kicks the doorbell or the shard asks something of the loop. A request wakes the waker
+/// [`RegisterWaker`] recorded (this task's), and is seen on the poll that follows. The doorbell's readiness answers
+/// only for the doorbell, so a request is never taken for a guest kick, nor a kick for a request (A-149). Before
+/// A-149 a readiness wait answered on any wake of its task, and the request's wake passed for a doorbell kick: the
+/// loop relied on that to be interrupted, which is why the race is explicit now.
+async fn doorbell_or_request(id: DeviceId, raw: i32) -> Result<Woke, slates_rt::RtError> {
+  let mut doorbell = std::pin::pin!(readable(raw));
+  std::future::poll_fn(|cx| {
+    if request_pending(id) {
+      return Poll::Ready(Ok(Woke::Request));
+    }
+    doorbell
+      .as_mut()
+      .poll(cx)
+      .map(|ready| ready.map(|()| Woke::Doorbell))
+  })
+  .await
+}
+
+/// A future that records the loop's current waker in its control entry, so a revoke request or a drain kick can
+/// interrupt the loop's wait on the doorbell ([`doorbell_or_request`]).
 struct RegisterWaker {
   id: DeviceId,
 }
@@ -389,8 +426,12 @@ async fn serve_round<S: VmmSeam, B: BridgeAccess>(
     Doorbell::InProcess => return Some(EndReason::NoDoorbell),
     Doorbell::Descriptor(raw) => raw,
   };
-  if let Err(error) = readable(raw).await {
-    return Some(EndReason::DoorbellLost(error));
+  match doorbell_or_request(id, raw).await {
+    Err(error) => return Some(EndReason::DoorbellLost(error)),
+    // The shard asked something of the loop while it waited: the next round takes it at its top (a revoke ends
+    // the loop, a kick drains its pending DAX revokes), with no guest kick needed.
+    Ok(Woke::Request) => return None,
+    Ok(Woke::Doorbell) => {}
   }
   counters.wakes = counters.wakes.saturating_add(1);
   if revoke_requested(id) {

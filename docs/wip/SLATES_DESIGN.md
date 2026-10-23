@@ -1326,6 +1326,14 @@ cluster.
 > by use on the readiness-native driver: `crates/rt/tests/tcp.rs` runs an accept→read→write→read round
 > trip with both ends on the runtime's own sockets, `tests/udp.rs` the datagram path.
 >
+> **Status (2026-10-22, A-149: a readiness wait names its own descriptor).** A registration hands the driver an
+> interest word naming its descriptor and direction, and the shard's table (`crates/rt/src/interest.rs`) maps it to the
+> waiting task, so a readiness future answers ready only when its own descriptor fired. Before, a completion carried
+> the task's word and a registered future answered on any wake of its task. A daemon serving two FUSE mounts of one
+> volume spun a core after one write, and a deadline raced against a bare readiness wait could never be reported. The
+> virtio-fs device loop had leaned on the old behaviour for its revoke and drain wakes, and now races them explicitly.
+> Record: `docs/bugs/2026-10-22-a-readiness-wait-took-any-wake-of-its-task-for-its-own.md`.
+>
 > **Status (2026-10-01, AUD-29-61: local send pressure).** A non-blocking UDP send the OS has no room for is
 > typed `RtError::WouldBlock`, never a socket failure; `UdpSocket::try_send_to` answers `None` with nothing
 > sent, `writable` awaits write readiness through every driver (`Interest::Writable` on all platforms), and
@@ -11953,6 +11961,64 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
+
+### A-149 — A readiness wait names its own descriptor (accepted 2026-10-22)
+Applied in the same change to:
+- §4.3 ("Drivers": the readiness seam's status);
+- `crates/mem/src/handle.rs` (the interest word beside `Encoded`'s layout; `pack` refuses the marked slots);
+- `crates/rt/src/interest.rs` (new: the shard's readiness registrations), `shard.rs` (`register_interest`,
+  `take_interest`, `forget_interest`, and one `deliver` for every path that turns a word into a wake; the arena bound),
+  `registry.rs` (a same-shard wake delivers), `readiness.rs` (`Ready` answers only for its own registration);
+- `crates/bridge-virtiofs/src/serve.rs` (the doorbell wait races the shard's requests explicitly);
+- the tests:
+  - `crates/rt/tests/readiness.rs` (two descriptors raced on the OS driver and on the simulation; a deadline
+    raced against a readiness wait);
+  - `crates/server/tests/fuse_idle.rs`;
+  - `a_revoke_request_ends_a_loop_parked_on_an_idle_guests_doorbell` (`crates/bridge-virtiofs/tests/serve.rs`);
+  - the interest table's and the layout's unit tests;
+- CI (the Miri step runs the simulated race);
+- GAPS;
+- `docs/bugs/2026-10-22-a-readiness-wait-took-any-wake-of-its-task-for-its-own.md`.
+
+- **What it answers.** A driver's completion carried the waking task's word and nothing else, so a readiness future,
+  once registered, answered ready on any wake of its task.
+  - The FUSE serve loop races its device against its change signal. A change made through another mount fired the
+    signal; its wake was read as the device's, and the loop read nothing, never drained the signal, and was woken
+    again at once. A daemon serving two FUSE mounts of a volume used a whole core from the first write on (397 of
+    400 ticks over 4 s, about 92,000 empty wakes every 2 s, measured on Linux 7.2.9).
+  - A deadline raced against a bare readiness wait (`futures::within`) could never be reported: the deadline's own
+    wake was taken for readiness.
+- **The rule.**
+  - A registration hands the driver an interest word instead of the task's: the owning shard in the shard field,
+    the slot field's top 15 bits marked, then the direction and the descriptor. No task's slot reaches the marked
+    range.
+  - The shard keeps one record per descriptor and direction: the task waiting, its own token, and whether its
+    descriptor fired. A later registration of the key replaces the earlier, as the drivers themselves do, so the
+    table never holds more than twice the descriptors the process may open.
+  - Every path that turns a word into a wake decodes interest words: both completion harvests, a same-shard wake (the
+    simulation's fabric wakes through the registry), and a word from another shard. A readiness future answers ready
+    only when its own record fired; a wake from anywhere else leaves it pending.
+  - A ready answer that finds nothing to read is still possible (another reader took the data first), so callers
+    keep retrying their syscall and awaiting again.
+- **What leaned on the old behaviour.** The virtio-fs device loop's doorbell wait was interrupted by a revoke (a
+  `detach`, a destroy) or a drain kick (a `snapshot` recall) only because the request's wake passed for a doorbell
+  kick. Its wait now races the shard's requests explicitly. Without that, a loop parked on an idle guest's doorbell
+  kept serving a detached device until the guest kicked again. The sweep of every other consumer and every stored
+  waker found no other: the transport's loops, the deadline races, the rendezvous accept loop and the landing's
+  barrier wait each wait on their own state.
+- **Rejected:** probing the descriptor with a zero-timeout `poll(2)` on each wake. It attributes as exactly, at one
+  syscall per wake on every socket and device; the interest word costs a map lookup.
+- **Evidence.**
+  - The two OS-driver tests were red before the fix on macOS (kqueue) and Linux (epoll), with `left: Quiet`,
+    `right: Signalled`. With a registration counted as fired on any wake (the old behaviour), all three go red again,
+    the simulated race included.
+  - `fuse_idle` was red ("86 of 100 clock ticks in the 1s after the mounts had served the write") and is green. After
+    a write through one of two mounts, the busier shard had used 2 clock ticks in all, over a 6 s trace in which no
+    request arrived.
+  - The virtio-fs revoke test was red with the runtime fix alone and is green with the explicit race.
+  - Miri is clean on the memory and runtime tests CI runs, and on the simulated race.
+  - On the box, these suites stay green: the runtime, memory, virtio-fs, client, NFS, FUSE, CLI (51 of 51) and guest
+    (3 of 3) suites.
 
 ### A-148 — A release frees a handle only of the file it names (accepted 2026-10-22)
 Applied in the same change to:

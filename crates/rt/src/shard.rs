@@ -32,6 +32,7 @@ use crate::attribution::{self, Attribution, Tracker};
 use crate::control::Control;
 use crate::driver::{Completion, Driver, DriverKind, DriverSeed, Kick};
 use crate::error::RtError;
+use crate::interest::{Direction, Interests, Taken};
 use crate::parking::{Parked, Woken};
 use crate::queue::LocalQueue;
 use crate::registry::{self, Entry, MAX_SHARDS};
@@ -148,6 +149,9 @@ pub struct Counters {
   /// scheduler puts it: a fault on Linux and Windows, where the placement names only cores the process
   /// owns (`slates_machine::placement`); on macOS the affinity hint Apple silicon refuses by design.
   pub pin_refused: u64,
+  /// Readiness completions that found no registration waiting on their descriptor, because its future was
+  /// dropped before the descriptor fired (A-149). Such a completion wakes no one.
+  pub interests_unclaimed: u64,
 }
 
 /// Shape: the exponential-forgetting shift of the measured scheduler overrun — a wait's overrun that
@@ -186,6 +190,16 @@ impl ShardSeed {
     driver: DriverSeed,
     kick: registry::RegisterKick,
   ) -> Result<ShardSeed, RtError> {
+    // A task's slot is packed into its wake word, whose slot field carries an interest word's mark above
+    // `Encoded::MAX_TASK_SLOT` (A-149): an arena past that would issue slots no wake could name. Refused before
+    // anything is claimed.
+    if u32::try_from(config.tasks_per_shard).map_or(true, |tasks| {
+      tasks > Encoded::MAX_TASK_SLOT.saturating_add(1)
+    }) {
+      return Err(RtError::BadConfig {
+        what: "tasks_per_shard: more task slots than a wake word can name",
+      });
+    }
     let (id, control) = registry::register_slot(config.ring_entries, config.tasks_per_shard, kick)?;
     let kick = registry::with_entry(id, |entry| entry.kick).unwrap_or(Kick::None);
     Ok(ShardSeed {
@@ -280,6 +294,11 @@ pub struct ShardContext {
   activity_ns: Cell<Option<u64>>,
   pair_full_events: Cell<u64>,
   nested_borrows: Cell<u64>,
+  /// The shard's readiness registrations, by descriptor and direction: which task waits on each, and whether
+  /// its descriptor fired (A-149, `crate::interest`). Kept apart from `inner`, because a wake can arrive while
+  /// `inner` is borrowed: the simulation wakes from inside the driver's registration when a datagram already
+  /// waits.
+  interests: RefCell<Interests>,
   /// The absolute deadline the shard last waited for — parked in its driver, or idle-spinning — and
   /// has not stepped since; the next [`step`](Self::step) takes it and measures how late it runs
   /// against it ([`Self::scheduler_overrun_ns`]). `None` while running, or after an unbounded wait.
@@ -465,6 +484,7 @@ impl ShardContext {
       activity_ns: Cell::new(None),
       pair_full_events: Cell::new(0),
       nested_borrows: Cell::new(0),
+      interests: RefCell::new(Interests::default()),
       waited_for_ns: Cell::new(None),
       scheduler_overrun_ns: Cell::new(0),
       wake: Cell::new(
@@ -616,6 +636,10 @@ impl ShardContext {
     let mut c = self.with_inner(|inner| inner.counters).unwrap_or_default();
     c.nested_borrows = self.nested_borrows.get();
     c.scheduler_overrun_ns = self.scheduler_overrun_ns.get();
+    c.interests_unclaimed = self
+      .interests
+      .try_borrow()
+      .map_or(0, |interests| interests.unclaimed());
     c.wake_cost_ns = self.wake_cost_ns();
     c
   }
@@ -843,22 +867,95 @@ impl ShardContext {
       .ok_or(RtError::NotOnShardThread)?
   }
 
-  /// Registers one-shot interest in a socket's readability with the shard's driver (§4.10a): when it
-  /// next becomes readable, the driver wakes the task whose `word` this is. The path a UDP recv future
+  /// Registers one-shot interest in a descriptor's readiness with the shard's driver (§4.10a, §4.6). The
+  /// driver is handed the registration's interest word ([`Encoded::interest`]) rather than the task's. So when
+  /// the descriptor is next ready its completion names the descriptor, and [`Self::deliver`] marks this
+  /// registration fired and wakes `word`'s task (A-149). Returns the registration's token, which the waiting
+  /// future passes to [`Self::take_interest`] and [`Self::forget_interest`]. The path every readiness future
   /// takes; mirrors [`Self::arm_timer`], but on the driver rather than the wheel.
-  pub fn register_readable(&self, raw: i32, word: u64) -> Result<(), RtError> {
-    self
-      .with_inner(|inner| inner.driver.register_readable(raw, word))
+  pub(crate) fn register_interest(
+    &self,
+    raw: i32,
+    direction: Direction,
+    word: u64,
+  ) -> Result<u64, RtError> {
+    // The table is released before the driver is called: the simulation wakes from inside its registration
+    // when a datagram already waits, and that wake reaches the table through `deliver`.
+    let token = self
+      .with_interests(|interests| interests.register(raw, direction, word))
       .ok_or(RtError::NotOnShardThread)?
+      .ok_or(RtError::InterestsExhausted { shard: self.id })?;
+    let interest = Encoded::interest(self.id, raw.cast_unsigned(), direction.writable()).word();
+    let registered = self
+      .with_inner(|inner| match direction {
+        Direction::Readable => inner.driver.register_readable(raw, interest),
+        Direction::Writable => inner.driver.register_writable(raw, interest),
+      })
+      .unwrap_or(Err(RtError::NotOnShardThread));
+    if registered.is_err() {
+      self.forget_interest(raw, direction, token);
+    }
+    registered.map(|()| token)
   }
 
-  /// Registers one-shot interest in a socket's writability with the shard's driver (§4.6): when it
-  /// next has send-buffer space, the driver wakes the task whose `word` this is. The path a TCP
-  /// `write_all` takes when the send buffer filled; mirrors [`ShardContext::register_readable`].
-  pub fn register_writable(&self, raw: i32, word: u64) -> Result<(), RtError> {
+  /// Registers one-shot interest in `raw`'s readability for the task whose word is `word` (§4.10a): the
+  /// registration [`Self::register_interest`] makes, for a caller that names a descriptor directly rather than
+  /// through a readiness future (the runtime's retirement test arms many listeners this way). Returns the
+  /// registration's token.
+  pub fn register_readable(&self, raw: i32, word: u64) -> Result<u64, RtError> {
+    self.register_interest(raw, Direction::Readable, word)
+  }
+
+  /// What registration `token` of `raw`'s `direction` finds: fired (and taken), still waiting, or lost to a
+  /// later registration of the same descriptor and direction.
+  pub(crate) fn take_interest(&self, raw: i32, direction: Direction, token: u64) -> Taken {
+    // A refused nested borrow (counted) leaves the registration as it is: still waiting, its record kept for
+    // the next poll.
     self
-      .with_inner(|inner| inner.driver.register_writable(raw, word))
-      .ok_or(RtError::NotOnShardThread)?
+      .with_interests(|interests| interests.take(raw, direction, token))
+      .unwrap_or(Taken::Waiting)
+  }
+
+  /// Forgets registration `token` of `raw`'s `direction`, because its future was dropped: a completion that
+  /// arrives for it later wakes no one (counted, `Counters::interests_unclaimed`).
+  pub(crate) fn forget_interest(&self, raw: i32, direction: Direction, token: u64) {
+    self.with_interests(|interests| interests.forget(raw, direction, token));
+  }
+
+  /// Wakes the task a word names (§4.3). An interest word marks its registration fired and wakes the task
+  /// waiting on it (A-149); any other word is a task's own and wakes its slot. Every path that turns a word
+  /// into a wake goes through here, so an interest word is never taken for a task's. Those paths are the
+  /// driver's completions, a same-shard wake, and a word from another shard.
+  pub(crate) fn deliver(&self, word: u64) {
+    let word = Encoded::from_word(word);
+    match word.as_interest() {
+      Some((raw, writable)) => {
+        let task = self
+          .with_interests(|interests| {
+            interests.fire(raw.cast_signed(), Direction::from_writable(writable))
+          })
+          .flatten();
+        if let Some(task) = task {
+          self.local.push(Encoded::from_word(task).slot());
+        }
+      }
+      None => self.local.push(word.slot()),
+    }
+  }
+
+  /// Runs `f` with the readiness registrations, or refuses a nested borrow (counted, as [`Self::with_inner`]
+  /// counts its own). None of the table's users calls out while it holds the borrow, so a refusal is a bug
+  /// signal.
+  fn with_interests<R>(&self, f: impl FnOnce(&mut Interests) -> R) -> Option<R> {
+    match self.interests.try_borrow_mut() {
+      Ok(mut interests) => Some(f(&mut interests)),
+      Err(_) => {
+        self
+          .nested_borrows
+          .set(self.nested_borrows.get().saturating_add(1));
+        None
+      }
+    }
   }
 
   /// Whether this shard runs the simulation driver (so a `UdpSocket` uses the in-memory fabric).
@@ -1005,7 +1102,7 @@ impl ShardContext {
         let harvested = !completions.is_empty();
         for c in completions.drain(..) {
           inner.counters.completions = inner.counters.completions.saturating_add(1);
-          self.local.push(Encoded::from_word(c.user_data).slot());
+          self.deliver(c.user_data);
         }
         inner.completions = completions;
         if matches!(result, Err(RtError::DriverLost)) {
@@ -1343,7 +1440,7 @@ impl ShardContext {
         let result = inner.driver.wait(timeout, &mut completions);
         for c in completions.drain(..) {
           inner.counters.completions = inner.counters.completions.saturating_add(1);
-          self.local.push(Encoded::from_word(c.user_data).slot());
+          self.deliver(c.user_data);
         }
         inner.completions = completions;
         match result {
@@ -1485,6 +1582,12 @@ impl ShardContext {
   }
 
   fn handle_wake(&self, inner: &mut ShardInner, word: Encoded) {
+    // An interest word from another shard (the simulation's fabric wakes through the registry) names a
+    // readiness registration, not a task: it is delivered through the table (A-149).
+    if word.as_interest().is_some() {
+      self.deliver(word.word());
+      return;
+    }
     // A slot-only word (a 32-bit target's waker) wakes the slot's current occupant, as a same-shard wake
     // does; a full word wakes only the task it names.
     if inner

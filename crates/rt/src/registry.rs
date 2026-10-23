@@ -701,7 +701,9 @@ pub fn wake(word: Encoded) {
   let target = word.shard();
   let handled = with_current(|ctx| {
     if ctx.id == target {
-      ctx.local.push(word.slot());
+      // An interest word (the simulation's fabric wakes through here) is delivered through the shard's
+      // readiness table, so it wakes the task waiting on its descriptor (A-149).
+      ctx.deliver(word.word());
       return true;
     }
     match ctx.send_to(target, word.word()) {

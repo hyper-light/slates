@@ -458,6 +458,60 @@ fn a_revoke_request_wakes_the_loop_and_reclaims() {
   rt.shutdown().unwrap();
 }
 
+/// Shape: how long the guest stays idle after its round trip before the shard asks for revocation, so the loop
+/// has finished its pass and parked on its doorbell. The pass takes microseconds; this is far past it.
+const SETTLE_NS: u64 = 20_000_000;
+
+/// A-149 (`docs/bugs/2026-10-22-a-readiness-wait-took-any-wake-of-its-task-for-its-own.md`). A revoke request (a
+/// `detach`, or the volume's destroy) reaches a loop parked on an idle guest's doorbell, with no guest kick to come.
+/// Do: serve one guest round trip, let the loop park on its doorbell, then request revocation and kick nothing,
+/// holding the guest's ends open so no hang-up can end the loop instead. Expect: the loop ends, revoked, through its
+/// terminal step. The loop's doorbell wait was interrupted by the revoke's wake only while a readiness wait took
+/// any wake of its task for its own; once it named its own descriptor, such a loop kept serving a detached device
+/// until the guest kicked again.
+#[test]
+fn a_revoke_request_ends_a_loop_parked_on_an_idle_guests_doorbell() {
+  let rt = Runtime::start(&config()).unwrap();
+  let shard = rt.shard_ids()[0];
+  let (end_tx, end_rx) = channel::<ServeEnd>();
+  let (guest_tx, guest_rx) = channel::<(i32, bool)>();
+  rt.spawn_on(shard, async move {
+    let mut owned = OwnedVolume::fresh();
+    let (admitted, kick_write, call_read) = admitted_over_pipes(&mut owned.registry);
+    let id = register(DEVICE_BOUND).unwrap();
+    let device_task = futures::spawn(async move {
+      let end = serve_loop(id, admitted, owned).await;
+      let _ = end_tx.send(end);
+    })
+    .unwrap();
+    let _ = futures::detach(device_task);
+    let guest_task = futures::spawn(async move {
+      let error = guest_round_trip(1, &kick_write, &call_read).await;
+      // The guest goes idle, and the loop finishes its pass and parks on the doorbell.
+      let _ = futures::sleep(SETTLE_NS).await;
+      let asked = request_revoke(id);
+      let _ = guest_tx.send((error, asked));
+      // The guest's ends stay open until the runtime's shutdown cancels this task, so only the revoke can end the
+      // loop: a closed kick would end it as a hang-up (and a hold of the test's own wait raced it, 2026-10-22).
+      futures::idle().await;
+      drop((kick_write, call_read));
+    })
+    .unwrap();
+    let _ = futures::detach(guest_task);
+  })
+  .unwrap();
+
+  let (error, asked) = guest_rx.recv_timeout(WAIT).expect("the guest finished");
+  assert_eq!(error, 0);
+  assert!(asked, "the loop was running when revocation was requested");
+  let end = end_rx
+    .recv_timeout(WAIT)
+    .expect("the revoke ended the loop parked on its doorbell, with no guest kick");
+  assert_eq!(end.why, EndReason::Revoked);
+  assert!(end.reclaimed.is_ok());
+  rt.shutdown().unwrap();
+}
+
 /// An in-process seam has no doorbell for a loop to wait on: the loop ends at once, naming it, and
 /// still runs the terminal step (the in-process VMM drives service directly instead).
 #[test]
