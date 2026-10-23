@@ -452,7 +452,7 @@ impl Volume {
     /// attribute is decided on its owner (the bridge checks the owner's mode); these bits only
     /// keep the attribute inode from ever reading as world-accessible.
     const ATTRIBUTE_MODE: u32 = 0o600;
-    let fresh = self.next_no()?;
+    let fresh = self.next_no(store)?;
     let now = self.clock.wall_ns();
     let mut inode = Inode::new(
       fresh,

@@ -6142,6 +6142,161 @@ fn a_store_made_after_a_refetch_lands_through_a_mount_taken_over_by_a_restarted_
   );
 }
 
+/// Inode numbers are never reused within a volume (AC-1.6, D-4), across a takeover too (A-61). A FUSE node id is the
+/// inode number, with generation 0, so a number the dead daemon handed the kernel and its successor issues again
+/// would point the kernel's handle at another file. Do: over a base directory of two files, mount the volume, open the
+/// first file and read it; `SIGKILL` the daemon and wait for the anchor's successor; look the *second* file up first,
+/// then drop the first file's cached pages and read through its old descriptor. Expect the first file's bytes, or a
+/// refusal, never the second file's. Linux only, to a kernel that can resend (6.9+).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_node_id_handed_out_before_a_takeover_never_names_another_file_after_it() {
+  use std::os::unix::fs::FileExt;
+  if !live_mount_runs() {
+    return;
+  }
+  if !kernel_resends_fuse_requests() {
+    eprintln!("SKIP: before Linux 6.9 a FUSE mount does not survive its daemon (A-61)");
+    return;
+  }
+  let instance = format!("cli-nodereuse-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let base = build_output_dir("slates-nodereuse-base");
+  shell(&format!(
+    "printf 'the first file\\n' > {base}/first.txt && printf 'the second file\\n' > {base}/second.txt"
+  ));
+  let created = [
+    "volume",
+    "create",
+    "nodereuse",
+    "--bounded",
+    "8MiB",
+    "--base",
+    &base,
+  ];
+  let (code, out, err) = run(&instance, &created);
+  assert_eq!(code, 0, "a volume over the base: {err}");
+  let id = value_of(&out, "id");
+  let mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  fuse_mount_and_check(&instance, &id, &mount.path);
+  let first = std::fs::File::open(format!("{}/first.txt", mount.path)).unwrap();
+  let mut before = vec![0u8; 64];
+  let read = first.read_at(&mut before, 0).unwrap();
+  assert_eq!(&before[..read], b"the first file\n");
+  let first_number = std::os::unix::fs::MetadataExt::ino(&first.metadata().unwrap());
+
+  let killed = kill_the_daemon(&instance);
+  let restarted = await_daemon(&instance, Some(killed), &[]);
+  assert_ne!(restarted, killed, "a new daemon serves the mount");
+  // The successor's first new inode is the second file's.
+  let second_path = format!("{}/second.txt", mount.path);
+  let second = std::fs::read(&second_path).unwrap();
+  assert_eq!(second, b"the second file\n");
+  let second_number =
+    std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&second_path).unwrap());
+  assert_ne!(
+    second_number, first_number,
+    "the successor issued the second file inode number {second_number}, which the dead daemon had handed the kernel \
+     for the first file"
+  );
+  rustix::fs::fadvise(&first, 0, None, rustix::fs::Advice::DontNeed).unwrap();
+  let mut after = vec![0u8; 64];
+  match first.read_at(&mut after, 0) {
+    Ok(read) => assert_ne!(
+      &after[..read],
+      b"the second file\n",
+      "the first file's descriptor, opened before the takeover, read the second file"
+    ),
+    Err(refused) => eprintln!("the read through the old descriptor was refused: {refused}"),
+  }
+  drop(first);
+  drop(mount);
+  drop(anchor);
+}
+
+/// Shape: what the base file holds when it is opened, and what an outsider then puts at its name.
+#[cfg(target_os = "linux")]
+const OPENED_BYTES: &[u8] = b"opened before the takeover\n";
+/// Shape: the file an outsider puts at the opened file's name.
+#[cfg(target_os = "linux")]
+const OUTSIDER_BYTES: &[u8] = b"an outsider put this file here\n";
+
+/// Open-file semantics for a base file across a takeover (§4.5, §4.6; A-61). A base file opened before a takeover
+/// keeps the file it opened when an outsider then puts another file at its name, as it does without a takeover
+/// (`prune_unloaded`, since 2026-09-30): the opener never reads bytes it did not open. Do: create a volume over a base
+/// directory, mount it, open a base file and read it; `SIGKILL` the daemon and wait for the anchor's successor, which
+/// takes the mount over; on the disk, write another file beside it and rename it over its name, as an editor saves;
+/// drop the kernel's cached pages of the open file, so its next read reaches slates; read through the descriptor
+/// opened before. Expect the bytes it opened, or a refusal, never the outsider's file. Linux only, to a kernel that can
+/// resend (6.9+), where a mount survives its daemon.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_base_file_opened_before_a_takeover_never_reads_the_file_an_outsider_put_at_its_name() {
+  use std::os::unix::fs::FileExt;
+  if !live_mount_runs() {
+    return;
+  }
+  if !kernel_resends_fuse_requests() {
+    eprintln!("SKIP: before Linux 6.9 a FUSE mount does not survive its daemon (A-61)");
+    return;
+  }
+  let instance = format!("cli-baseopen-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let base = build_output_dir("slates-baseopen-base");
+  shell(&format!(
+    "printf 'opened before the takeover\\n' > {base}/notes.txt"
+  ));
+  let created = [
+    "volume",
+    "create",
+    "baseopen",
+    "--bounded",
+    "8MiB",
+    "--base",
+    &base,
+  ];
+  let (code, out, err) = run(&instance, &created);
+  assert_eq!(code, 0, "a volume over the base: {err}");
+  let id = value_of(&out, "id");
+  let mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  fuse_mount_and_check(&instance, &id, &mount.path);
+  let file = std::fs::File::open(format!("{}/notes.txt", mount.path)).unwrap();
+  let mut before = vec![0u8; OUTSIDER_BYTES.len() * 2];
+  let read = file.read_at(&mut before, 0).unwrap();
+  assert_eq!(
+    &before[..read],
+    OPENED_BYTES,
+    "the base file reads through the mount"
+  );
+
+  let killed = kill_the_daemon(&instance);
+  let restarted = await_daemon(&instance, Some(killed), &[]);
+  assert_ne!(restarted, killed, "a new daemon serves the mount");
+  shell(&format!(
+    "printf 'an outsider put this file here\\n' > {base}/.notes.new && mv {base}/.notes.new {base}/notes.txt"
+  ));
+  // The successor looks the name up again, so it sees the disk's new file at it.
+  let _ = std::fs::metadata(format!("{}/notes.txt", mount.path));
+  rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::DontNeed).unwrap();
+  let mut after = vec![0u8; OUTSIDER_BYTES.len() * 2];
+  match file.read_at(&mut after, 0) {
+    Ok(read) => assert_ne!(
+      &after[..read],
+      OUTSIDER_BYTES,
+      "the descriptor opened before the takeover read the file an outsider put at its name"
+    ),
+    // The file it opened is gone with the dead daemon's descriptor: a refusal is honest.
+    Err(refused) => eprintln!("the read through the old descriptor was refused: {refused}"),
+  }
+  drop(file);
+  drop(mount);
+  drop(anchor);
+}
+
 /// The dirty-page write-back rule past a truncation (§4.6; the bug record above). A store left dirty in a page that a
 /// later truncation through another path cut off must not grow the file back when the kernel writes the page back: a
 /// map cannot extend a file, so that write-back is the page's stale copy. Do: store a byte in page 1 of a two-page map

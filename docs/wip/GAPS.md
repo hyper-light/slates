@@ -10930,3 +10930,44 @@ Still open, observed in the same runs and not caused by this bug:
 - **A parked DAX map-ack wait is not interruptible.** `drive_dax_acks` waits for the front end's reply-ack on its own
   descriptor, so a revoke during it is taken only after the ack arrives. That is unchanged by A-149: the old behaviour
   only looped back into the same wait.
+
+### 2026-10-22: a takeover reissued inode numbers the kernel still held — fixed (A-150)
+
+Found while reproducing the open-count gap after a takeover (A-147's siblings, above). The test of that gap failed for
+a deeper reason: the successor issues again the inode numbers the dead daemon handed out after its last publication.
+- **Shown directly by `a_node_id_handed_out_before_a_takeover_never_names_another_file_after_it`** on the box. The
+  dead daemon gave `first.txt` 3659174697238530; the successor gave `second.txt` the same number; the first file's old
+  descriptor read the second file.
+- **Reach:** a FUSE node id and an NFS file handle both carry the inode number with generation 0, so the reuse reaches
+  every client kept across a restart. Through a write it is cross-file corruption. It breaks AC-1.6 and D-4.
+- **Cause:** the counter was durable only in a publication, and `LOOKUP`, `READDIRPLUS` and `OPEN` number entries
+  without one.
+- **The fix (A-150):** a number goes out only under a published reservation.
+  - A publication records the counter plus a derived reserve (262,144 on the box), raised at commit.
+  - A reply carrying a number past the committed ceiling runs the barrier first.
+  - The per-work hook tops the reserve up before it runs low.
+  - A successor restores the counter at the recorded ceiling.
+- **A finding inside the fix:** the daemon publishes through the streamed encoders, which at first still wrote the live
+  counter. The vfs fixtures' zero reserve hid it from the model oracle. Temporary logging on the box showed the image
+  recording 2. The model oracle now runs with a reserve and fails on either encoder's old line.
+
+Item 3 of the 2026-10-22 goal, re-scoped. With numbers no longer reused, the open-count gap's own test must publish the
+file's number before the takeover, so its open counts and not the reuse are what is tested. A base file opened before
+a takeover, whose number was published, still counts as closed afterwards, so an outsider's replacement of its name
+is followed through the old handle. That is fixed by publishing open counts with the references (goal items 3 and 4,
+next).
+
+**Observed in the A-150 verification, not caused by it as far as the evidence goes (the box, 2026-10-22).** These
+appeared in 5 of 8 full CLI-suite runs under extreme load from other sessions' builds (load average 80 to 139 on 32
+cores). Neither reproduced alone, and neither touches what A-150 changed. A run of the same suite against the
+pre-A-150 tree under the same load is owed to prove that.
+- **A staged write refused `NotFound`, and once a `detach`** (the anchor-supervision test, 2 of 8), with no daemon
+  restart in either.
+  - A staging buffer expires one lease after its last use (`failover_slo_ns`, the 10 s failover SLO;
+    `crates/server/src/staging.rs`). A put or apply after that answers `NotFound`, and the CLI does not stage again.
+  - Under 4× oversubscription a single CLI process can stall past 10 s between staged requests.
+  - The `detach` is suspected to be the attachment's lease lapsing the same way (not verified).
+  - Busy-machine robustness (the norm, per the measurement rules) owes either a lease that allows for measured
+    starvation, or a client that stages again on `NotFound`.
+- **`fusermount3` refused an unmount, "Device or resource busy"** (the takeover-with-open-files test, 3 of 8).
+  Unexplained. The box's KDE session, which probes every new mount, is a suspect.

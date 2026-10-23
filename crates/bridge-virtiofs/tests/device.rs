@@ -821,6 +821,11 @@ fn a_mutations_used_element_waits_for_the_owners_barrier() {
       .try_into()
       .unwrap(),
   );
+  // The captured barrier stood for a committed publication: it reserved the CREATE's inode number (A-150), as the
+  // daemon's commit marks the volume published. Without it the number would stay unreserved and hold the next reply.
+  drop(bridge);
+  vol.mark_published(&store);
+  let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
   driver.submit(
     rq,
     &message(

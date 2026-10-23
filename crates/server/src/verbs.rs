@@ -8807,6 +8807,9 @@ pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::Vf
   let outcome = publish_captured(state);
   match outcome {
     Ok(_) => {
+      // Every volume the publication recorded has its ceiling raised (`Volume::mark_published`, A-150); a volume still
+      // short sets the flag again at its next number.
+      state.store.counters_low = false;
       state.store.content.arena_mut().commit_capture();
       // The committed image names no block of a wholly free extent, and no deferred free holds one: it goes back to
       // the pool for any shard to claim (A-98).
@@ -9333,6 +9336,14 @@ pub(crate) const STATE_RETENTION_REFUSED: &str = "state.retention_refused";
 /// bound on in-flight copy-ups the budget already keeps free, §4.2) never meets `PublishNeeded`. Costs two loads
 /// when nothing is deferred or the arena has room. A refused publication is counted where it is refused.
 pub(crate) fn relieve_deferred(state: &mut ShardState) {
+  // A volume's reserve of inode numbers ran low (A-150): the publication tops it up before this unit of work hands
+  // one out, so the unit's replies need no barrier of their own. It relieves the arena's deferred frees too.
+  if state.store.counters_low {
+    if publish_shard(state).is_ok() {
+      state.count(COUNTERS_TOPPED_UP, 1);
+    }
+    return;
+  }
   let arena = state.store.content.arena();
   if arena.deferred_bytes() == 0 {
     return;
@@ -9345,6 +9356,21 @@ pub(crate) fn relieve_deferred(state: &mut ShardState) {
     let relieved = state.refusals.entry(DEFERRED_RELIEVED).or_insert(0);
     *relieved = relieved.saturating_add(1);
   }
+}
+
+/// Format: the status counter of publications run to top up a volume's reserve of inode numbers (A-150), before a unit
+/// of work that might hand one out.
+pub(crate) const COUNTERS_TOPPED_UP: &str = "publish.counters_topped_up";
+
+/// Whether volume `volume` has issued an inode number no committed publication reserves (A-150): a reply that would
+/// hand it out must wait for a publication (D-18), since the client keeps the number across a restart. `false` for a
+/// volume this shard does not hold.
+pub(crate) fn numbers_unreserved(state: &ShardState, volume: DbVolumeId) -> bool {
+  state
+    .by_id
+    .get(&volume)
+    .and_then(|handle| state.volumes.get(*handle).ok())
+    .is_some_and(|slot| slot.volume.unreserved())
 }
 
 /// Returns a recovered volume's byte reservation and re-grown dynamic hold to the shard budget, for

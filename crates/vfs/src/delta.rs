@@ -455,6 +455,9 @@ impl Volume {
   /// Records that this volume's last [`Volume::publication`] was published and committed: the changes it carried are
   /// forgotten, and the next record may be a delta over it.
   pub fn mark_published(&mut self, store: &Store) {
+    // The publication recorded this ceiling (`roots`, `to_image`), unchanged since: numbers below it are now reserved
+    // (A-150). Raised before the roots are kept, so the kept roots carry the same counter.
+    self.counter_ceiling = self.recorded_counter(store);
     self.dirty.clear_recorded();
     self.dirty.changed = false;
     self.dirty.shared_diverged = false;
@@ -473,7 +476,9 @@ impl Volume {
       .inode;
     Ok(Roots {
       epoch: self.epoch.0,
-      next_counter: self.next_counter,
+      // The reserved ceiling, not the live counter (A-150): a successor starts past every number handed out before the
+      // next publication.
+      next_counter: self.recorded_counter(store),
       quota: crate::recover::quota_image(&self.quota),
       root_no: root_no.0,
       last_snapshot: self.last_snapshot.map(crate::recover::snap_ref),
@@ -578,7 +583,8 @@ impl Volume {
       .map_err(|_| VfsError::StaleHandle)?
       .inode;
     self.epoch.0.encode(out);
-    self.next_counter.encode(out);
+    // The reserved ceiling, as `roots` records it (A-150): this stream is the publication the daemon writes.
+    self.recorded_counter(store).encode(out);
     crate::recover::quota_image(&self.quota).encode(out);
     root_no.0.encode(out);
     self.last_snapshot.map(crate::recover::snap_ref).encode(out);

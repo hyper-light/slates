@@ -691,6 +691,9 @@ fn a_service_pass_drains_a_pending_dax_revoke_and_tears_the_window_down() {
   vol
     .write(&mut store, no, 0, &vec![0x5A; page_bytes])
     .unwrap();
+  // The setup stands for an SDK verb, whose publication commits before the guest's first request: the file's inode
+  // number is reserved (A-150), so the guest's replies need no barrier for it.
+  vol.mark_published(&store);
   let nodeid = no.0;
 
   let mut registry = Attachments::new();
@@ -802,6 +805,9 @@ fn a_snapshot_recall_tears_the_writable_window_and_keeps_the_read_only_through_a
   vol
     .write(&mut store, no, 0, &vec![0x5A; page_bytes])
     .unwrap();
+  // The setup stands for an SDK verb, whose publication commits before the guest's first request: the file's inode
+  // number is reserved (A-150), so the guest's replies need no barrier for it.
+  vol.mark_published(&store);
   let nodeid = no.0;
 
   let mut registry = Attachments::new();

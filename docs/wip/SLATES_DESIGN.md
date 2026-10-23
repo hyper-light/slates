@@ -6574,7 +6574,8 @@ None`), bridges, IPC, database replication.
 - AC-1.5 Memory per file and per directory entry stays within the derived budget (a formula from
   struct sizes and the cut-over), verified on the scale trees (catches: bloat).
 - AC-1.6 Inode numbers are never reused within a volume and survive snapshot/clone/re-open of the
-  same volume (catches: build-cache breakage).
+  same volume (catches: build-cache breakage). Across a daemon takeover too since A-150 (2026-10-22): a number is handed
+  out only under a published reservation, so a successor starts past every number a client may hold.
 - AC-1.7 `referenced_bytes` and `unique_bytes` equal the model's exact values after every
   operation (catches: accounting drift).
 - AC-1.8 Destroy of a 10^6-file volume runs in bounded slices without stalling other volumes on
@@ -11961,6 +11962,64 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
+
+### A-150 — An inode number goes out only under a published reservation (accepted 2026-10-22)
+Applied in the same change to:
+- AC-1.6 (its status) and D-4's realized form (§4.5);
+- `crates/vfs/src/volume.rs`:
+  - `Store::inode_reserve`, `Store::counters_low` and `RESERVE_TOP_UP_SHARE`;
+  - `Volume::counter_ceiling`, `recorded_counter` and `unreserved`;
+  - `next_no` takes the store;
+- `crates/vfs/src/delta.rs` (the delta's roots and its streamed encoding record the ceiling; `mark_published` raises
+  it), `recover.rs` (the image and its streamed encoding record it; a rebuild asks for a top-up), `base.rs` and
+  `xattr.rs`;
+- `crates/bridge-core` (`Bridge::numbers_unreserved`);
+- `crates/bridge-virtiofs/src/device.rs` (a chain waits for the barrier while numbers are unreserved);
+- `crates/server/src/config.rs` (`inode_reserve`, derived), `daemon.rs`, `verbs.rs` (`relieve_deferred` tops up;
+  `publish_shard` clears the flag; `numbers_unreserved`), `fuse.rs` and `nfs.rs` (the reply's barrier);
+- the tests:
+  - `crates/vfs/tests/counter_reserve.rs`;
+  - `crates/cli/tests/cli.rs` `a_node_id_handed_out_before_a_takeover_never_names_another_file_after_it`;
+  - the vfs model oracle, run with a nonzero reserve;
+  - the virtio-fs fixtures model a committed publication;
+- GAPS;
+- `docs/bugs/2026-10-22-a-takeover-reissued-inode-numbers-the-kernel-still-held.md`.
+
+- **What it answers.** A volume's counter was durable only in a publication, and a successor restored it from the
+  last one. `LOOKUP`, `READDIRPLUS` and `OPEN` number base entries and publish nothing, and nothing publishes
+  periodically. So the kernel learned numbers no publication recorded, and a successor issued them again.
+
+  A FUSE node id is the inode number with generation 0, as is an NFS file handle's. So a handle opened before a
+  takeover named whatever the successor numbered next. Measured on the box: the dead daemon gave `first.txt`
+  3659174697238530, the successor gave `second.txt` the same number, and the first file's old descriptor read the
+  second file.
+- **The rule.** Handing out an inode number is an effect a client keeps across a restart, so it follows D-18: a reply
+  that carries a number the committed publication does not reserve waits for the publication that does.
+  - A publication records the counter plus the store's reserve, never below the last ceiling. The live ceiling rises
+    to that value only when the publication commits (`mark_published`, the bracket A-64's arena capture uses).
+  - A number at or past the live ceiling is unreserved. The FUSE reply, the NFS reply and a guest's chain then run the
+    owner's barrier first.
+  - The per-work hook (`relieve_deferred`) publishes before a unit of work once a volume's reserve falls under half,
+    so those barriers are rare. A rebuilt volume asks for that top-up before its first unit of work.
+  - A successor restores the counter at the recorded ceiling: it skips at most one reserve of numbers and reuses none.
+- **The reserve (R3).** It is derived, and the boot log names it. It is the most numbers one unit of work can issue,
+  times the top-up share, so a top-up at half leaves a whole unit reserved. The most is a directory listing filling the
+  largest reply a transport serves with its smallest entries: the guest's reply cap over the smallest `fuse_dirent`, or
+  the NFS message cap over the smallest `entry3`. That is 262,144 on the box, against 2^47 numbers per volume.
+
+  Windows records no reserve. No transport there hands a client a number it keeps across a restart: there is no host
+  mount, and the SDK names files by path.
+- **What the first build missed.** The daemon publishes through the streamed encoders (`encode_publication`), not the
+  struct builders, and only the builders recorded the ceiling at first. The vfs fixtures run with a reserve of zero,
+  where the two counters coincide, so the model oracle's streamed-equals-built check passed. Temporary logging on the
+  box showed the successor rebuilding from an image that recorded 2.
+
+  Now both encoders record the ceiling. The model oracle runs with a nonzero reserve and fails when either encoder
+  writes the live counter. The reservation model publishes through the streamed path.
+- **Rejected:**
+  - a barrier on every reply that hands out a number: a publication per `LOOKUP`;
+  - refusing past the ceiling: a FUSE `LOOKUP` answered `EAGAIN` reaches the application.
+- **Evidence.** See the bug record's verification.
 
 ### A-149 — A readiness wait names its own descriptor (accepted 2026-10-22)
 Applied in the same change to:

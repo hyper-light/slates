@@ -128,6 +128,13 @@ Every test is written as "do X, expect Y" and names the acceptance criterion or 
     interrupt (a revoke, a drain kick, a volume change) races that source explicitly beside its readiness wait
     (`crates/bridge-virtiofs/src/serve.rs` `doorbell_or_request`, `crates/server/src/fuse.rs` `wait_for_work`). A
     readiness future no longer answers on another source's wake, and the virtio-fs loop had leaned on it.
+  - A publication's two encodings and the oracle that holds them equal: the struct builders (`to_image` in
+    `crates/vfs/src/recover.rs`, the delta's `roots` in `crates/vfs/src/delta.rs`) and the streamed encoders the daemon
+    actually writes (`encode_image_into`, `encode_delta`), compared byte for byte after every step by
+    `check_publication` in `crates/vfs/tests/model.rs`. Gotcha: an oracle run at a degenerate parameter certifies
+    nothing about it. With the inode reserve at zero the live and recorded counters coincide, and the streamed encoders
+    shipped writing the live one while the builders wrote the reserved ceiling (A-150), so the model now runs with a
+    nonzero reserve.
   - A liveness question asked on a cold path only: `crates/ipc/src/rendezvous.rs` (`Liveness`: the socket's peer on Linux, the bootstrap header's start stamp elsewhere) consulted by `crates/client/src/client.rs` after a reply has stalled past the derived deadline, never per request.
   - Property-test persistence without a disk: `crates/test-seeds` (`seeded(config, include_str!("<file>.proptest-regressions"))` or `unseeded(config)` in every `proptest!` block and hand-built `TestRunner`; `cargo xtask check` refuses one that bypasses it). A new failing seed is printed on stderr in the seed file's line format; review it and add it to the seed file. Gotcha: a test proving "nothing was written" must set `source_file`, or even proptest's default writes nothing and the test is vacuous.
   - A real VM as the test: `crates/cli/tests/guest_dax.rs` with `crates/guest-probe` (crosvm shares a `slates mount`

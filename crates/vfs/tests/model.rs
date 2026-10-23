@@ -1025,7 +1025,14 @@ fn run(steps: Vec<Step>, quota: u64) {
   );
 }
 
+/// Shape: the inode numbers the model's store reserves ahead of a volume's counter (A-150). Nonzero, so a publication
+/// records a counter apart from the live one, and the streamed-equals-built oracle in [`check_publication`] compares
+/// the counter the daemon actually writes: with no reserve the two counters coincide, and the streamed encoders once
+/// wrote the live counter while the built ones wrote the reserved ceiling, unseen.
+const MODEL_INODE_RESERVE: u64 = 3;
+
 fn run_on(mut store: Store, steps: Vec<Step>, quota: u64) {
+  store.inode_reserve = MODEL_INODE_RESERVE;
   let mut vol = volume(&mut store, quota);
   let mut published = None;
   let mut model = Model::new(

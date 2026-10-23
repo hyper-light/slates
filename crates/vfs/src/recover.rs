@@ -1323,7 +1323,9 @@ impl Volume {
       prefix: self.prefix,
       policy: policy_image(self.policy),
       epoch: self.epoch.0,
-      next_counter: self.next_counter,
+      // The reserved ceiling, not the live counter (A-150): a successor starts past every number handed out before the
+      // next publication.
+      next_counter: self.recorded_counter(store),
       origin_epoch: self.origin_epoch.map(|e| e.0),
       quota: quota_image(&self.quota),
       root_no: root_no.0,
@@ -1392,7 +1394,8 @@ impl Volume {
     self.prefix.encode(fields);
     policy_image(self.policy).encode(fields);
     self.epoch.0.encode(fields);
-    self.next_counter.encode(fields);
+    // The reserved ceiling, as `to_image` records it (A-150): this stream is the checkpoint the daemon writes.
+    self.recorded_counter(store).encode(fields);
     self.origin_epoch.map(|e| e.0).encode(fields);
     quota_image(&self.quota).encode(fields);
     root_no.0.encode(fields);
@@ -2175,6 +2178,11 @@ impl Volume {
       origin_epoch: image.origin_epoch.map(Epoch),
       quota,
     };
+    // A rebuilt volume has no reserve beyond its recorded ceiling (A-150): the owner tops it up with a publication
+    // before its first unit of work, rather than barrier the first reply that hands out a number.
+    if store.inode_reserve > 0 {
+      store.counters_low = true;
+    }
     let mut vol = match origin {
       None => Volume::recovery_shell(store, seed, clock, journal_bytes)?,
       Some(from) => Volume::shell_over(

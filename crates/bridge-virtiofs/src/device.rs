@@ -876,7 +876,9 @@ impl Device {
         }
         Err(refusal) => return Err(self.record_fault(refusal)),
       };
-      if let Some(awaiting) = self.awaits_barrier(queue, &chain, written) {
+      if let Some(awaiting) =
+        self.awaits_barrier(queue, &chain, written, bridge.numbers_unreserved())
+      {
         // The reply is in the guest's buffers, but the guest learns of it only from the used element,
         // which waits for the owner's barrier (§4.8, D-18).
         self.awaiting = Some(awaiting);
@@ -947,13 +949,15 @@ impl Device {
   }
 
   /// The held form of a chain just served, when its request changed what survives a restart and succeeded
-  /// ([`needs_barrier`]); `None` for every other chain (reads, unstable writes, refusals, the
-  /// high-priority queue's FORGETs).
+  /// ([`needs_barrier`]), or when the volume has handed out an inode number no committed publication reserves
+  /// (`unreserved`, A-150: the guest keeps the number across a restart); `None` for every other chain (reads, unstable
+  /// writes, refusals, the high-priority queue's FORGETs).
   fn awaits_barrier(
     &self,
     queue: u16,
     chain: &DescriptorChain,
     written: u32,
+    unreserved: bool,
   ) -> Option<AwaitingBarrier> {
     let header = InHeader::parse(&self.request).ok()?;
     let opcode = Opcode::from_wire(header.opcode);
@@ -961,7 +965,7 @@ impl Device {
       .reply
       .get(..usize::try_from(written).ok()?)
       .unwrap_or(&[]);
-    needs_barrier(opcode, reply_errno(reply)).then(|| AwaitingBarrier {
+    (needs_barrier(opcode, reply_errno(reply)) || unreserved).then(|| AwaitingBarrier {
       queue,
       chain: chain.clone(),
       written,

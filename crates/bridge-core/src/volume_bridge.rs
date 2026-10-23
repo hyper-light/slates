@@ -606,6 +606,10 @@ fn unpack_handle(word: u64) -> Handle<u64> {
 }
 
 impl Bridge for VolumeBridge<'_> {
+  fn numbers_unreserved(&self) -> bool {
+    self.volume.unreserved()
+  }
+
   fn root(&mut self, cx: &OpContext) -> Result<u64, VfsError> {
     self.authorize_read(cx)?;
     self.volume.root_inode(self.store).map(|no| no.0)

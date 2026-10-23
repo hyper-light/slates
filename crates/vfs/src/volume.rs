@@ -144,7 +144,21 @@ pub struct Store {
   /// The shard's §4.6 L1 sandboxes, one per volume whose writable DAX content has been shifted, and the
   /// generator the shift's placement is drawn from.
   pub dax_zones: crate::daxzone::DaxZones,
+  /// The inode numbers each publication reserves ahead of a volume's counter (A-150): a publication records the counter
+  /// plus this ([`Volume::recorded_counter`]), so a reply may hand out any number below the recorded value with no
+  /// barrier of its own, and a successor starts past every number its dead predecessor could have handed out. Set by
+  /// the owner from its derived value; zero until then, so a fixture records exactly what it issued.
+  pub inode_reserve: u64,
+  /// Whether some volume's reserve fell under [`RESERVE_TOP_UP_SHARE`] of [`Store::inode_reserve`] (A-150): the owner
+  /// publishes before its next unit of work, which tops the reserve up. Set by [`Volume::next_no`] and at recovery,
+  /// cleared by the owner when a publication commits.
+  pub counters_low: bool,
 }
+
+/// Shape: the share of [`Store::inode_reserve`] under which a volume's reserve is topped up (A-150): a half. The reserve
+/// is twice the most numbers one unit of work can issue (the owner's derivation), so a top-up at half leaves a whole
+/// unit's numbers reserved before the unit runs.
+pub const RESERVE_TOP_UP_SHARE: u64 = 2;
 
 impl std::fmt::Debug for Store {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -226,6 +240,8 @@ impl Store {
       // mappings it can hold at once — the registry's bound, not a tunable.
       dax: crate::dax::DaxRegistry::new(config.max_chunks),
       dax_zones: crate::daxzone::DaxZones::new(),
+      inode_reserve: 0,
+      counters_low: false,
     }
   }
 
@@ -381,6 +397,10 @@ pub struct Volume {
   pub(crate) root: Handle<DirNode>,
   pub(crate) inode_root: Handle<TrieNode>,
   pub(crate) next_counter: u64,
+  /// The counter the last committed publication recorded for this volume (A-150): every number below it is covered by a
+  /// reservation a successor honours, so a reply may hand it out with no barrier. A number at or past it is
+  /// unreserved ([`Volume::unreserved`]) until a publication covers it.
+  pub(crate) counter_ceiling: u64,
   pub(crate) snapshots: Slab<Snapshot>,
   pub(crate) last_snapshot: Option<SnapshotId>,
   pub(crate) origin_epoch: Option<Epoch>,
@@ -681,6 +701,9 @@ impl Volume {
       root,
       inode_root,
       next_counter: 2,
+      // Its own root is reserved by the create's publication, which precedes every client's first sight of the
+      // volume (a verb publishes before its completion), so only numbers issued after it can be unreserved.
+      counter_ceiling: 2,
       snapshots: Slab::new(
         crate::snapshot::initial_capacity(store.content.page()).get(),
         SNAPSHOT_SLOT_CAP,
@@ -760,6 +783,9 @@ impl Volume {
       root,
       inode_root,
       next_counter: origin.next_counter,
+      // The numbers it starts with are reserved by the clone's publication, which precedes every client's first sight
+      // of it.
+      counter_ceiling: origin.next_counter,
       snapshots: Slab::new(
         crate::snapshot::initial_capacity(store.content.page()).get(),
         SNAPSHOT_SLOT_CAP,
@@ -865,6 +891,8 @@ impl Volume {
       root,
       inode_root,
       next_counter: seed.next_counter,
+      // The recorded counter is a committed publication's ceiling: every number below it may have been handed out.
+      counter_ceiling: seed.next_counter,
       snapshots: Slab::new(
         crate::snapshot::initial_capacity(store.content.page()).get(),
         SNAPSHOT_SLOT_CAP,
@@ -1852,7 +1880,7 @@ impl Volume {
     // nothing), the inode installed, then the name published.
     let dir = self.make_current_dir(store, dir)?;
     let parent = store.dirs.get(dir)?.inode;
-    let no = self.next_no()?;
+    let no = self.next_no(store)?;
     let now = self.clock.wall_ns();
     let body = if kind.is_special() {
       Body::None
@@ -1908,7 +1936,7 @@ impl Volume {
     self.admit_needs(store, &needs)?;
     let dir = self.make_current_dir(store, dir)?;
     let parent_no = store.dirs.get(dir)?.inode;
-    let no = self.next_no()?;
+    let no = self.next_no(store)?;
     let now = self.clock.wall_ns();
     let child = match store
       .dirs
@@ -1974,7 +2002,7 @@ impl Volume {
     self.admit_needs(store, &needs)?;
     let dir = self.make_current_dir(store, dir)?;
     let parent = store.dirs.get(dir)?.inode;
-    let no = self.next_no()?;
+    let no = self.next_no(store)?;
     let now = self.clock.wall_ns();
     let mut inode = Inode::new(
       no,
@@ -3833,7 +3861,7 @@ impl Volume {
   /// vector). Refuses `NoSpace` when the volume already holds its allowance of live inodes, so no
   /// number of empty files can exhaust the shard's inode capacity. The single number-issuing site,
   /// so the live count and the bound are maintained in one place.
-  pub(crate) fn next_no(&mut self) -> Result<InodeNo, VfsError> {
+  pub(crate) fn next_no(&mut self, store: &mut Store) -> Result<InodeNo, VfsError> {
     // The counter never reaches the derived half (`InodeNo::DERIVED_BIT`), so a transport's derived
     // number cannot name a real inode.
     if self.live_inodes >= self.inode_allowance || self.next_counter >= InodeNo::DERIVED_BIT {
@@ -3842,7 +3870,28 @@ impl Volume {
     let no = InodeNo::compose(self.prefix, self.next_counter);
     self.next_counter = self.next_counter.saturating_add(1);
     self.live_inodes = self.live_inodes.saturating_add(1);
+    // Under the top-up share of its reserve, the owner publishes before its next unit of work (A-150).
+    let left = self.counter_ceiling.saturating_sub(self.next_counter);
+    if left < store.inode_reserve / RESERVE_TOP_UP_SHARE {
+      store.counters_low = true;
+    }
     Ok(no)
+  }
+
+  /// The counter a publication records for this volume (A-150): its counter plus the store's reserve, never below the
+  /// ceiling a committed publication already recorded. A successor starts there, past every number this volume can
+  /// hand out before its next publication commits.
+  pub fn recorded_counter(&self, store: &Store) -> u64 {
+    self
+      .next_counter
+      .saturating_add(store.inode_reserve)
+      .max(self.counter_ceiling)
+  }
+
+  /// Whether this volume has issued an inode number no committed publication reserves (A-150): a reply that would
+  /// hand one out waits for a publication (D-18), since the client keeps the number across a restart.
+  pub fn unreserved(&self) -> bool {
+    self.next_counter > self.counter_ceiling
   }
 
   /// Admits a namespace verb's volume allowances before anything changes (§4.2; AUD-29-40): a fresh

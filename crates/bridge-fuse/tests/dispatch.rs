@@ -84,6 +84,10 @@ impl Bridge for Mock {
   fn root(&mut self, _cx: &OpContext) -> Result<u64, VfsError> {
     Ok(1)
   }
+  // A mock with no volume issues no inode numbers, so it holds none unreserved (A-150).
+  fn numbers_unreserved(&self) -> bool {
+    false
+  }
   fn lookup(
     &mut self,
     parent: ObjectId,

@@ -2988,6 +2988,9 @@ fn init_shard(
     arena,
     headroom.get(),
   );
+  // Inode numbers are handed out under a published reservation (A-150): set before recovery, so a rebuilt volume asks
+  // for its top-up.
+  store.inode_reserve = config.inode_reserve;
   // The metadata class (§4.2 metadata dimension): the slabs' maximum footprint comes off the top and
   // the remainder is the ledger every volume's records are reserved from; a layout whose slabs alone
   // exceed the class is refused here, before serving, rather than admitting records it cannot back.

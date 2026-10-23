@@ -347,6 +347,9 @@ pub struct DaemonConfig {
   /// Derived: the NFSv4 listener's table bounds (§4.6 A-35). Unix only, as the NFS transport is.
   #[cfg(unix)]
   pub nfs_v4: NfsV4Caps,
+  /// Derived (A-150): the inode numbers each publication reserves ahead of a volume's counter, so a reply may hand one
+  /// out with no barrier of its own while a successor still starts past it ([`inode_reserve`]).
+  pub inode_reserve: u64,
   /// Every derivation, for the boot log.
   pub derivations: Vec<String>,
 }
@@ -824,6 +827,7 @@ impl DaemonConfig {
     }
     #[cfg(unix)]
     let guest_credits = guest_credits(profile, admission.get(), &mut derivations);
+    let inode_reserve = inode_reserve(&mut derivations);
     #[cfg(unix)]
     let nfs_v4 = nfs_v4_caps(
       reserve.get(),
@@ -871,6 +875,7 @@ impl DaemonConfig {
       guest_credits,
       #[cfg(unix)]
       nfs_v4,
+      inode_reserve,
       derivations,
     }
   }
@@ -1239,6 +1244,59 @@ fn codec_policy(profile: &MachineProfile) -> slates_archive::CodecPolicy {
     }
   }
   policy
+}
+
+/// Format: the smallest `fuse_dirent` a directory listing carries (Linux `include/uapi/linux/fuse.h`): `ino`, `off`,
+/// `namelen` and `type`, 24 bytes, then a name of at least one byte, the record padded to `FUSE_DIRENT_ALIGN`, 8. That is
+/// 32 bytes, each record naming an inode.
+#[cfg(unix)]
+const SMALLEST_FUSE_DIRENT: u64 = 32;
+/// Format: the smallest NFSv3 `entry3` a `READDIR` reply carries (RFC 1813 §3.3.16): the file id (8), the name's length
+/// (4) and one padded word of name (4), the cookie (8), and the next entry's flag (4). That is 28 bytes, each entry
+/// naming an inode.
+#[cfg(unix)]
+const SMALLEST_NFS_ENTRY: u64 = 28;
+
+/// Derived (A-150): the inode numbers each publication reserves ahead of a volume's counter. A reply may hand out a
+/// number below the reserved ceiling with no barrier of its own; past it, the reply waits for a publication (D-18), so a
+/// successor never issues a number a client still holds. The reserve is the most numbers one unit of work can issue,
+/// times [`slates_vfs::volume::RESERVE_TOP_UP_SHARE`], so the top-up the owner runs at that share leaves a whole unit's
+/// numbers reserved before the unit runs. The most is a directory listing filling the largest reply a transport serves
+/// with its smallest entries, each naming an inode: a guest's reply cap over the smallest `fuse_dirent`, or the NFS
+/// message cap over the smallest `entry3`, whichever is more. A successor skips at most this many numbers per takeover,
+/// against a counter space of 2^47 per volume.
+#[cfg(unix)]
+fn inode_reserve(derivations: &mut Vec<String>) -> u64 {
+  let guest = slates_bridge_virtiofs::device::writable_cap()
+    .get()
+    .checked_div(SMALLEST_FUSE_DIRENT)
+    .unwrap_or(0);
+  let nfs = u64::try_from(slates_bridge_nfs::rpc::MAX_MESSAGE)
+    .unwrap_or(u64::MAX)
+    .checked_div(SMALLEST_NFS_ENTRY)
+    .unwrap_or(0);
+  let reserve: Derived<u64> = derived!(
+    guest
+      .max(nfs)
+      .saturating_mul(slates_vfs::volume::RESERVE_TOP_UP_SHARE),
+    "max(guest writable cap / smallest fuse_dirent, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE",
+    ["guest.writable_cap", "nfs.max_message"]
+  );
+  derivations.push(note("inode_reserve", &reserve));
+  reserve.get()
+}
+
+/// Derived (A-150): no reserve. No transport on this platform hands an inode number to a client that keeps it across a
+/// restart: there is no host mount, and the SDK names files by path, so every number may be recorded exactly as issued.
+#[cfg(not(unix))]
+fn inode_reserve(derivations: &mut Vec<String>) -> u64 {
+  let reserve: Derived<u64> = derived!(
+    0,
+    "none: no transport here hands out an inode number a client keeps across a restart",
+    []
+  );
+  derivations.push(note("inode_reserve", &reserve));
+  reserve.get()
 }
 
 fn note<T: std::fmt::Debug>(name: &str, d: &Derived<T>) -> String {
