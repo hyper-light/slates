@@ -75,10 +75,11 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// barrier publishes for a connection the anchor holds, so a request the dead daemon applied and never answered is
 /// answered on the same socket by its successor, never applied twice. 20 (A-151, 2026-10-22) an untouched base file's
 /// body carries the disk file it was made from, and every fingerprint the file's birth time, so a successor never takes
-/// the file now at a name for the one an old handle opened.
+/// the file now at a name for the one an old handle opened. 21 (A-152, 2026-10-22) each attachment's references carry how
+/// many of them are open handles, so a successor gives back the open of a handle the dead daemon issued at its release.
 /// Format: the image layout version, bumped with any change to the types below or to the held replicas'
 /// image they carry.
-const IMAGE_VERSION: u16 = 20;
+const IMAGE_VERSION: u16 = 21;
 
 /// A recorded attachment's references in an image (A-61): its durable id and its share by inode.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
@@ -96,6 +97,9 @@ pub struct InodeReferences {
   pub inode: u64,
   /// The references held.
   pub count: u32,
+  /// How many of them are open handles (A-152), at most `count`: given back after a restart as opens the dead daemon
+  /// issued, which only releases of handles the successor never issued give back.
+  pub opens: u32,
 }
 
 /// The name-equivalence policy in an image (§4.4 [`NameEquivalence`]).
@@ -1340,17 +1344,7 @@ impl Volume {
       orphans: self.orphans.keys().map(|no| no.0).collect(),
       origin_shared,
       base,
-      references: self
-        .attachment_references()
-        .into_iter()
-        .map(|(attachment, inodes)| AttachmentReferences {
-          attachment,
-          inodes: inodes
-            .into_iter()
-            .map(|(no, count)| InodeReferences { inode: no.0, count })
-            .collect(),
-        })
-        .collect(),
+      references: self.attachment_references(),
     })
   }
 
@@ -1416,18 +1410,7 @@ impl Volume {
       .collect::<Vec<u64>>()
       .encode(out);
     base.encode(out);
-    self
-      .attachment_references()
-      .into_iter()
-      .map(|(attachment, inodes)| AttachmentReferences {
-        attachment,
-        inodes: inodes
-          .into_iter()
-          .map(|(no, count)| InodeReferences { inode: no.0, count })
-          .collect(),
-      })
-      .collect::<Vec<AttachmentReferences>>()
-      .encode(out);
+    self.attachment_references().encode(out);
     Ok(())
   }
 
@@ -2263,7 +2246,13 @@ impl Volume {
       for owner in &image.references {
         for held in &owner.inodes {
           vol
-            .restore_references(store, owner.attachment, InodeNo(held.inode), held.count)
+            .restore_references(
+              store,
+              owner.attachment,
+              InodeNo(held.inode),
+              held.count,
+              held.opens,
+            )
             .map_err(|_| VfsError::RecoveryIncomplete)?;
         }
       }

@@ -10736,10 +10736,12 @@ stale page back, and the other write's bytes on it reverted: measured 4,095 of 4
     now frees a handle only of the file it names, and the FUSE edge resolves node id 1 as the open did. Red seam tests
     are green, and a root-release test guards the resolve (`EMFILE` at the third open without it)
     (`docs/bugs/2026-10-22-after-a-takeover-a-reissued-handle-value-closed-another-files-handle.md`).
-  - **A pre-takeover handle's release frees nothing — open, a bounded leak.** Its open's reference is durable only once
-    a publication captured it, so the successor cannot tell whether it restored it. Dropping one it did not restore
-    would take a lookup reference and could reclaim a file the kernel still holds, so it drops none. The reference stays
-    until the mount ends. Closing it needs open references made durable, or recorded in the session the anchor holds.
+  - **A pre-takeover handle's release freed nothing — fixed 2026-10-22 (A-152).** Its open's reference is durable only
+    once a publication captured it, so the successor could not tell whether it restored it. Dropping one it did not
+    restore would have taken a lookup reference and could have reclaimed a file the kernel still held, so it dropped
+    none, and the reference stayed until the mount ended. The image now carries each attachment's open count beside its
+    references, and such a release gives back one restored open (below, "a handle opened before a takeover gave back
+    nothing at its release").
   - **Open counts are not durable — fixed another way, 2026-10-22 (A-151).** `Volume::attachment_opens` starts empty
     after recovery, so a base file opened before a takeover counted as closed afterwards, and an outsider's replacement
     of its name was followed through the old handle (reproduced on the box). The fix does not need the counts: an
@@ -11010,10 +11012,35 @@ Goal item 3 of 2026-10-22, red on the box and confirmed by temporary logging.
     - Next, with its own bug record.
   - **A node id the volume no longer holds answers `ENOENT`, where `ESTALE` is honest.** This covers A-150's refusal,
     and an NFS handle of a replaced base file, which nothing referenced, so it was reclaimed.
-  - **A pre-takeover handle that A-147 adopted is not counted open.** So the successor closes a detached inode's
-    descriptor that such a handle could still have read, and the handle is refused. That is a refusal, never wrong
-    bytes; it belongs with goal item 4, the pre-takeover release.
+  - **A pre-takeover handle that A-147 adopted is not counted open — narrowed by A-152.** Such handles' opens are now
+    restored when a publication captured them, so they count toward `is_open`. One opened after the last publication
+    still is not counted: the successor closes a detached inode's descriptor such a handle could still have read, and
+    the handle is refused (never wrong bytes).
   - **ReFS:** the 64-bit file index Windows reports may not be unique there (`FILE_ID_INFO` carries 128 bits).
 - **Goal item 4, re-scoped.** Open counts are no longer what a takeover needs for base files. The pre-takeover release
-  leak stands as recorded above (its open's reference stays until the mount ends). So does the adopted-handle refusal
-  just above. Both want the handles a takeover inherits made exact.
+  leak stood as recorded above, and the adopted-handle refusal just above. Fixed by A-152 (next section), except that
+  refusal for opens no publication captured.
+
+### 2026-10-22: a handle opened before a takeover gave back nothing at its release — fixed (A-152)
+
+Goal item 4 of 2026-10-22, the leak A-148 recorded.
+- **What happened.** After a takeover, the successor serves the releases of handles the dead daemon issued, from a
+  fresh handle store, and gave back nothing for them. Every such handle's open reference stayed until the mount ended,
+  and a file unlinked while open was never reclaimed.
+  - Measured on the box, against the old code: an unlinked 1 MiB file, both descriptors closed, still had 1,048,576
+    bytes referenced after a 10 s wait.
+  - Four seam tests were red at their last assertion (`crates/bridge-core/tests/takeover_release.rs`).
+- **Cause.** The image counted an attachment's lookups and opens together, so the successor could not tell an open's
+  reference from a lookup's. Only `OPEN` counted an open at all: a created file's and a directory's handles counted
+  none.
+- **The fix (A-152):**
+  - every handle is counted open;
+  - the image and the delta carry each attachment's open count beside its references (layout 21);
+  - a recovery restores them as restored opens;
+  - the release of a handle the successor never issued gives back one restored open of its file, while one is left.
+  It never reclaims a file the kernel still holds: a publication that captured an open of a file captured a lookup
+  reference too, and that holds the file until the kernel's forget.
+- **Covered by the tests:** one handle; three handles and a release repeated; a handle opened after the last
+  publication; the successor's own handle under a reissued value.
+- **Still open:** a pre-takeover handle opened after the last publication is not counted open by the successor (the
+  A-151 sibling above). That is a refusal, never wrong bytes.

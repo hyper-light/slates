@@ -411,6 +411,10 @@ impl<'v> VolumeBridge<'v> {
         if let Some(lost) = self.lost.as_deref_mut() {
           lost.issued(fh, inode);
         }
+        // Every handle is counted open, a file's, a created file's and a directory's alike, so the image carries each
+        // one's open beside its reference and a successor gives it back at the handle's release (A-152). Until
+        // 2026-10-22 only `open` counted one, so a created file's or a directory's handle left nothing to give back.
+        self.volume.open_for(InodeNo(inode), attachment);
         Ok(fh)
       }
       Err(e) => {
@@ -678,11 +682,9 @@ impl Bridge for VolumeBridge<'_> {
         .with_host(host)
         .open_base(self.store, InodeNo(object.inode))?;
     }
-    let handle = self.open_handle(object.inode, cx.owner)?;
-    // The open pins the file it opened: a base file replaced on the disk meanwhile keeps serving this
-    // handle what it opened (POSIX), released at `release` or the attachment's teardown sweep.
-    self.volume.open_for(InodeNo(object.inode), cx.owner);
-    Ok(handle)
+    // The open pins the file it opened (`open_handle` counts it): a base file replaced on the disk meanwhile keeps
+    // serving this handle what it opened (POSIX), released at `release` or the attachment's teardown sweep.
+    self.open_handle(object.inode, cx.owner)
   }
 
   fn read(
@@ -966,10 +968,7 @@ impl Bridge for VolumeBridge<'_> {
     //
     // A release names its file, and only a handle of that file is released (A-148). A daemon that takes a mount over
     // (A-61) issues from a fresh store the values its predecessor issued, so the kernel can release a handle it opened
-    // before the takeover whose value this bridge has since given to another file. That handle is not this one: its
-    // release touches nothing here, as an unknown value's does. (Its open's reference stays: references are durable
-    // only once published, so this daemon cannot tell whether it restored it, and dropping one it never restored would
-    // take a lookup reference instead.)
+    // before the takeover whose value this bridge has since given to another file. That handle is not this one.
     let unpacked = unpack_handle(fh);
     if self.handles.get(unpacked).ok().copied() == Some(object.inode) {
       self.volume.close_for(InodeNo(object.inode), cx.owner);
@@ -977,6 +976,14 @@ impl Bridge for VolumeBridge<'_> {
         .volume
         .forget_for(self.store, InodeNo(object.inode), cx.owner, 1);
       let _ = self.handles.remove(unpacked);
+    } else {
+      // A handle this daemon never issued for this file: one a dead daemon issued before a takeover. It gives back an
+      // open the recovery restored for the file, while one is left (A-152); until 2026-10-22 it gave back nothing, and
+      // an unlinked file stayed until the mount ended
+      // (`docs/bugs/2026-10-22-a-handle-opened-before-a-takeover-gave-back-nothing-at-its-release.md`).
+      self
+        .volume
+        .release_restored_open(self.store, InodeNo(object.inode), cx.owner)?;
     }
     // A handle from before the takeover is forgotten by the lost-write record too, so it holds only handles alive.
     if let Some(lost) = self.lost.as_deref_mut() {

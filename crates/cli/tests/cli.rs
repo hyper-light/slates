@@ -6368,6 +6368,93 @@ fn a_base_file_opened_before_a_takeover_never_reads_the_file_an_outsider_put_at_
   drop(anchor);
 }
 
+/// Shape: the file the release test holds open across a takeover: large enough that its bytes stand clear of the
+/// volume's own metadata in `referenced_bytes`, small enough for the test volume's bound.
+#[cfg(target_os = "linux")]
+const HELD_FILE_BYTES: usize = 1 << 20;
+
+/// The handles a dead daemon issued give back their references at their release through its successor (goal item 4 of
+/// 2026-10-22; A-61, A-152; AC-3.4). Do: write a file through a mount and open it twice; unlink it through the mount,
+/// whose barrier publishes the open file with both opens; `SIGKILL` the daemon and wait for the anchor's successor;
+/// close one descriptor, drop the other's cached pages and read through it; then close it. Expect the file's bytes
+/// through the open descriptor, the volume's `referenced_bytes` still counting the file while either is open, and once
+/// both are closed `referenced_bytes` back where it was before the file. Before the fix the successor gave back nothing
+/// for a handle it never issued, so the file stayed referenced until the mount ended. Linux only, to a kernel that can
+/// resend (6.9+), where a mount survives its daemon.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_handles_a_dead_daemon_issued_give_back_their_references_at_release() {
+  use std::os::unix::fs::FileExt;
+  if !live_mount_runs() {
+    return;
+  }
+  if !kernel_resends_fuse_requests() {
+    eprintln!("SKIP: before Linux 6.9 a FUSE mount does not survive its daemon (A-61)");
+    return;
+  }
+  let instance = format!("cli-release-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "releases", "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "a volume: {err}");
+  let id = value_of(&out, "id");
+  let mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  fuse_mount_and_check(&instance, &id, &mount.path);
+  let referenced = || -> u64 {
+    let (code, out, err) = run(&instance, &["status", &id]);
+    assert_eq!(code, 0, "status: {err}");
+    value_of(&out, "referenced_bytes").parse().unwrap()
+  };
+  let before = referenced();
+  let path = format!("{}/held.bin", mount.path);
+  let bytes = vec![0x5Au8; HELD_FILE_BYTES];
+  #[allow(clippy::disallowed_methods)]
+  // the test's own file, written through the slates mount: RAM, not disk
+  std::fs::write(&path, &bytes).unwrap();
+  let first = std::fs::File::open(&path).unwrap();
+  let second = std::fs::File::open(&path).unwrap();
+  #[allow(clippy::disallowed_methods)] // unlinked through the slates mount
+  std::fs::remove_file(&path).unwrap();
+  let held = u64::try_from(HELD_FILE_BYTES).unwrap();
+  assert!(
+    referenced() >= before + held,
+    "the unlinked file is referenced while open"
+  );
+
+  let killed = kill_the_daemon(&instance);
+  let restarted = await_daemon(&instance, Some(killed), &[]);
+  assert_ne!(restarted, killed, "a new daemon serves the mount");
+  drop(first);
+  rustix::fs::fadvise(&second, 0, None, rustix::fs::Advice::DontNeed).unwrap();
+  let mut back = vec![0u8; HELD_FILE_BYTES];
+  second.read_exact_at(&mut back, 0).unwrap();
+  assert!(
+    back == bytes,
+    "the descriptor still open reads the file after the other's release"
+  );
+  assert!(
+    referenced() >= before + held,
+    "the file stays referenced while a descriptor holds it"
+  );
+  drop(second);
+  let deadline = Instant::now() + WAIT_FOR;
+  let mut now = referenced();
+  while now > before && Instant::now() < deadline {
+    pause();
+    now = referenced();
+  }
+  assert_eq!(
+    now, before,
+    "the file's bytes come back once both descriptors closed: their releases gave back the opens they held"
+  );
+  drop(mount);
+  drop(anchor);
+}
+
 /// The dirty-page write-back rule past a truncation (§4.6; the bug record above). A store left dirty in a page that a
 /// later truncation through another path cut off must not grow the file back when the kernel writes the page back: a
 /// map cannot extend a file, so that write-back is the page's stale copy. Do: store a byte in page 1 of a two-page map

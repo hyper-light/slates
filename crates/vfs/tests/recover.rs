@@ -1703,9 +1703,10 @@ fn a_surviving_attachments_references_are_restored_and_every_other_holders_relea
   );
 }
 
-/// A-61, hostile input. Do: rebuild from an image whose recorded references name an inode the image lacks, and
-/// from one recording a zero count. Expect: both refused `RecoveryIncomplete`, never a volume with a reference
-/// to nothing or an entry no forget can drop.
+/// A-61 and A-152, hostile input. Do: rebuild from an image whose recorded references name an inode the image lacks,
+/// from one recording a zero count, and from one recording more open handles than references. Expect: each refused
+/// `RecoveryIncomplete`, never a volume with a reference to nothing, an entry no forget can drop, or opens no
+/// reference backs.
 #[test]
 fn an_image_with_a_corrupt_reference_record_is_refused() {
   use slates_vfs::recover::{AttachmentReferences, InodeReferences};
@@ -1714,23 +1715,28 @@ fn an_image_with_a_corrupt_reference_record_is_refused() {
   let root = vol.root_inode(&src).unwrap();
   let f = vol.create_file_no(&mut src, root, "f", 0o644).unwrap();
   let image = vol.to_image(&src, None).unwrap();
-  let corrupt = |inode: u64, count: u32| {
+  let corrupt = |inode: u64, count: u32, opens: u32| {
     let mut image = image.clone();
     image.references = vec![AttachmentReferences {
       attachment: 1,
-      inodes: vec![InodeReferences { inode, count }],
+      inodes: vec![InodeReferences {
+        inode,
+        count,
+        opens,
+      }],
     }];
     image
   };
-  for (inode, count, what) in [
-    (f.0 + 1_000, 1, "an absent inode"),
-    (f.0, 0, "a zero count"),
+  for (inode, count, opens, what) in [
+    (f.0 + 1_000, 1, 0, "an absent inode"),
+    (f.0, 0, 0, "a zero count"),
+    (f.0, 1, 2, "more opens than references"),
   ] {
     let mut fresh = common::surviving(&src);
-    let claims = common::claims(&mut fresh, &[&corrupt(inode, count)]);
+    let claims = common::claims(&mut fresh, &[&corrupt(inode, count, opens)]);
     let rebuilt = Volume::from_image(
       &mut fresh,
-      &corrupt(inode, count),
+      &corrupt(inode, count, opens),
       &claims,
       Box::new(StepClock::new(0, 1)),
       1 << 16,
@@ -1741,6 +1747,61 @@ fn an_image_with_a_corrupt_reference_record_is_refused() {
       "{what} must be refused"
     );
   }
+}
+
+/// A-152 (with A-96's delta). Do: publish a volume whole, then open a file twice for a recorded attachment and release
+/// one of the handles, publishing after each step; replay every delta onto the last image. Expect each a delta, its
+/// streamed bytes decoding to the built record, and its replay equal to the volume's full image: the open counts travel
+/// beside the references, and one handle left is one reference that is an open.
+#[test]
+fn a_delta_carries_each_open_count_and_replays_to_the_full_image() {
+  use slates_vfs::delta::VolumeRecord;
+  use slates_vfs::ids::RefOwner;
+  use slates_wire::Wire;
+  let mut src = store();
+  let mut vol = volume(&mut src, 1 << 30);
+  let root = vol.root_inode(&src).unwrap();
+  let f = vol.create_file_no(&mut src, root, "f", 0o644).unwrap();
+  let mut image = vol.to_image(&src, None).unwrap();
+  vol.mark_published(&src);
+  let owner = RefOwner::Attachment(41);
+  let mut publish_and_replay = |vol: &mut Volume, src: &slates_vfs::volume::Store, step: &str| {
+    let record = vol.publication(src, None).unwrap();
+    let mut streamed = Vec::new();
+    vol.encode_publication(src, None, &mut streamed).unwrap();
+    assert_eq!(
+      VolumeRecord::decode(&mut streamed.as_slice()).unwrap(),
+      record,
+      "the streamed publication after {step}"
+    );
+    let VolumeRecord::Delta { delta } = record else {
+      panic!("{step} is published as a delta");
+    };
+    image.apply(&delta).unwrap();
+    assert_eq!(
+      image,
+      vol.to_image(src, None).unwrap(),
+      "the replay after {step} equals the full image"
+    );
+    vol.mark_published(src);
+  };
+  for step in ["the first open", "the second open"] {
+    vol.reference_for(&src, f, owner).unwrap();
+    vol.open_for(f, owner);
+    publish_and_replay(&mut vol, &src, step);
+  }
+  vol.close_for(f, owner);
+  vol.forget_for(&mut src, f, owner, 1).unwrap();
+  publish_and_replay(&mut vol, &src, "a release");
+  let held = vol.to_image(&src, None).unwrap().references;
+  assert_eq!(
+    held
+      .first()
+      .and_then(|owner| owner.inodes.first())
+      .map(|f| (f.count, f.opens)),
+    Some((1, 1)),
+    "one handle left: one reference, and it is an open"
+  );
 }
 
 /// A-61 (the exact replay's record). Do: a shard image carrying two barrier replies, given out of attachment order;

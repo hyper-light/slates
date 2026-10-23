@@ -255,6 +255,8 @@ pub struct ReferenceChange {
   pub inode: u64,
   /// The references the attachment holds on the inode now.
   pub count: u32,
+  /// How many of them are open handles now (A-152).
+  pub opens: u32,
 }
 
 /// One directory entry as a delta carries it: present (`entry`, a whiteout's child `None`) or gone.
@@ -540,6 +542,7 @@ impl Volume {
         attachment: *attachment,
         inode: *inode,
         count: self.attachment_reference_count(*attachment, crate::ids::InodeNo(*inode)),
+        opens: self.attachment_open_count(*attachment, crate::ids::InodeNo(*inode)),
       })
       .collect();
     Ok(VolumeDelta {
@@ -598,6 +601,9 @@ impl Volume {
       inode.encode(out);
       self
         .attachment_reference_count(*attachment, crate::ids::InodeNo(*inode))
+        .encode(out);
+      self
+        .attachment_open_count(*attachment, crate::ids::InodeNo(*inode))
         .encode(out);
     }
     self.encode_changed_inodes(store, out)?;
@@ -930,6 +936,7 @@ fn apply_reference(references: &mut Vec<AttachmentReferences>, change: &Referenc
   let reference = InodeReferences {
     inode: change.inode,
     count: change.count,
+    opens: change.opens,
   };
   match (
     owner

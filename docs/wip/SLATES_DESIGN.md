@@ -9213,9 +9213,11 @@ Applied in the same change to: §4.6 "Linux" status, the failure matrix, T-3.5, 
     does not publish on every lookup.
     A base file such a handle opened is served while its name still names the file it was made from, and refused
     `ESTALE` once not: the successor holds no descriptor for it, and the image carries the file's identity (A-151).
-    A handle the restarted daemon never issued is released as a no-op. That takes knowing a handle by its value and
-    its file together (A-148): the restarted daemon's handle store is fresh and reissues its predecessor's values, so
-    a release frees a handle only when its file is the one the release names. A file unlinked while open survives in
+    A handle the restarted daemon never issued gives back, at its release, one open the recovery restored for its
+    file and attachment, while one is left (A-152); until 2026-10-22 it gave back nothing, and an unlinked file stayed
+    until the mount ended. That takes knowing a handle by its value and its file together (A-148): the restarted
+    daemon's handle store is fresh and reissues its predecessor's values, so a release frees a handle only when its
+    file is the one the release names, and any other is taken for one the dead daemon issued. A file unlinked while open survives in
     the recovery image's orphan tracking; the restored mount takes one reference on each recovered orphan,
     dropped at the kernel's FORGET of the node, which the kernel sends only once every open of it has closed,
     or at the mount's teardown sweep. (Superseded in the same change by the carried references above, which
@@ -11981,6 +11983,56 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
+
+### A-152 — A handle a dead daemon issued gives back its open at its release (accepted 2026-10-22)
+Applied in the same change to:
+- A-61 ("What the kernel kept");
+- `crates/vfs/src/recover.rs` (`InodeReferences::opens`; image layout 21), `delta.rs` (`ReferenceChange::opens`, both
+  encoders and the applier), `volume.rs`:
+  - `restored_opens` and `release_restored_open`;
+  - `attachment_open_count`;
+  - `restore_references` takes the open count and refuses more opens than references;
+  - `open_for` and `close_for` record a changed reference;
+  - `sweep_attachment` drops the owner's restored opens;
+- `crates/bridge-core/src/volume_bridge.rs`: every handle `open_handle` issues is counted open (a created file's and a
+  directory's too), and a release of a handle this bridge never issued gives back a restored open;
+- the tests:
+  - `crates/bridge-core/tests/takeover_release.rs` (four);
+  - `crates/vfs/tests/recover.rs` (the open counts through a delta; more opens than references refused);
+  - `crates/cli/tests/cli.rs` `the_handles_a_dead_daemon_issued_give_back_their_references_at_release`;
+- GAPS;
+- `docs/bugs/2026-10-22-a-handle-opened-before-a-takeover-gave-back-nothing-at-its-release.md`.
+
+- **What it answers.** After a takeover the successor serves the releases of handles the dead daemon issued, from a
+  fresh handle store that never issued them. Such a release gave back nothing, by design: the image counted an
+  attachment's lookups and opens together, so the successor could not tell whether an open's reference had been
+  restored, and dropping one could take a lookup reference instead. So every pre-takeover handle's open reference
+  stayed until the mount ended. A file unlinked while open was never reclaimed, and its bytes stayed charged. Measured
+  on the box: 1,048,576 bytes still referenced 10 s after both descriptors of an unlinked 1 MiB file had closed.
+- **The rule.**
+  - Every handle is an open, whatever opened it: a file's `OPEN`, a `CREATE` and an `OPENDIR` alike. Until now only
+    `OPEN` counted one, so a created file's or a directory's handle left nothing to give back.
+  - The image and the delta carry each recorded attachment's open count beside its references. An open takes a
+    reference, so more opens than references is a corrupt image, refused.
+  - A recovery gives the opens back as restored opens. The release of a handle the successor never issued consumes
+    one restored open of its file and attachment, closing it and dropping its reference, while one is left. With none
+    left, nothing is given back.
+- **Why it never reclaims a file the kernel still holds.** The kernel cannot forget an inode it holds open, so a
+  publication that captured an open reference also captured a lookup reference, and that holds the file until the
+  kernel's `FORGET`, whichever handle's release consumes a restored open. Restored opens are counts, as references are,
+  so it does not matter which handle a release is taken for. That covers three cases:
+  - a handle opened after the last publication left nothing in the image, so its release consumes at most a sibling's
+    restored open, and all releases together never more than the image restored;
+  - the successor's own handle under a reissued value (A-148) balances the same way: two releases give back two opens;
+  - a release repeated gives back nothing more.
+- **A consequence for A-151.** Restored opens count toward `Volume::is_open`, so a detached base file keeps a descriptor
+  the successor reopened for a pre-takeover handle, where before it was closed and the handle refused.
+- **Rejected:**
+  - restoring the dead daemon's handle table exactly (by value, through anchor RAM): exact, but every `OPEN` and
+    `RELEASE` would then write anchor RAM, and nothing observable needs the values once opens are counted;
+  - tagging each daemon's handle values with an incarnation, so a successor never reissues one: it tells a reissued
+    value apart, but the counts already balance without it.
+- **Evidence.** See the bug record's verification.
 
 ### A-151 — An untouched base file is bound to the disk file it was made from (accepted 2026-10-22)
 Applied in the same change to:
