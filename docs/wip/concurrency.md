@@ -146,8 +146,13 @@ schedule (03:17 UTC).
 
 1. **The canary first.** `crates/mem/tests/race_canary.rs` races two threads' writes to one word, one after
    the other in time with nothing ordering them (the second waits on a relaxed flag), both threads alive
-   across both writes: reported 100 of 100 runs, and 50 of 50 at two CPUs (2026-10-03). Two earlier versions
-   missed it, once in three CI runs and once in twenty runs here. The test is `#[ignore]`d and deliberately undefined behaviour. The task
+   across both writes, and the first parked, not polling, until the second has written. ThreadSanitizer
+   reports a race only while the earlier access is still in its thread's trace (three parts of 32,763 events
+   by default) and otherwise drops it without a word. The shape measured on 2026-10-03 (100 of 100 runs, 50 of
+   50 at two CPUs) polled after its first write, and went unreported in 2 of 99 CI runs and in 120 of 120
+   runs on a loaded Mac; parked, it was reported in 90 of 90 (2026-10-23,
+   `docs/bugs/2026-10-23-the-tsan-canary-went-unreported-when-its-first-writer-polled.md`). Two shapes before
+   it missed too, once in three CI runs and once in twenty runs here. The test is `#[ignore]`d and deliberately undefined behaviour. The task
    requires ThreadSanitizer's `data race` report from it and a non-zero exit. Run uninstrumented, the same
    test passes with exit 0 and no report, so a toolchain or flag change that drops the instrumentation fails
    the lane instead of passing it vacuously.
