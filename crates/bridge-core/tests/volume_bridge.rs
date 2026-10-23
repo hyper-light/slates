@@ -1645,6 +1645,123 @@ fn a_lost_write_is_reported_once_to_each_handle_that_predates_the_takeover() {
   assert_eq!(bridge.fsync(oid(kept), &cx, OLD_HANDLES[1]), Ok(()));
 }
 
+/// The two halves of a takeover (A-61): the dead daemon's handle store, which issued the kernel's handles opened before
+/// it, and its successor's, fresh. A fresh store starts its generations at 0, so the successor reissues the dead
+/// daemon's values. Creates `old` under the first store and `new` under the second, and returns both inodes and
+/// handles, after checking the values are the same so a test built on them cannot pass vacuously.
+fn reissued_handle_fixture(
+  vol: &mut Volume,
+  store: &mut Store,
+  successor: &mut slates_mem::Slab<u64>,
+  cx: &OpContext,
+) -> ((u64, u64), (u64, u64)) {
+  let old = {
+    let mut dead = slates_bridge_core::new_handle_store();
+    let mut bridge =
+      VolumeBridge::attached(VolumeId { bytes: [0; 16] }, vol, store, &mut dead, None);
+    let root = bridge.root(cx).unwrap();
+    let (attr, fh) = bridge.create(oid(root), cx, "old", 0o644, 0).unwrap();
+    (attr.ino, fh)
+  };
+  let mut bridge = VolumeBridge::attached(VolumeId { bytes: [0; 16] }, vol, store, successor, None);
+  let root = bridge.root(cx).unwrap();
+  let (attr, fh) = bridge.create(oid(root), cx, "new", 0o644, 0).unwrap();
+  assert_eq!(
+    fh, old.1,
+    "non-vacuous: the successor's fresh store reissued the dead daemon's handle value"
+  );
+  (old, (attr.ino, fh))
+}
+
+/// A release names its file (A-61; `docs/bugs/2026-10-22-a-mount-taken-over-by-a-restarted-daemon-dropped-a-store-made-after-a-refetch.md`,
+/// sibling 2). Do: across a takeover whose successor reissued a handle value ([`reissued_handle_fixture`]), write
+/// `new`, unlink it while its handle is open, then release the dead daemon's handle of `old`, naming `old`, through the
+/// successor. Expect `new` still readable through its own handle, and reclaimed at its own release: the successor's
+/// handle for another file is not the one released.
+#[test]
+fn a_release_of_a_reissued_handle_value_never_closes_the_successors_handle_for_another_file() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut successor = slates_bridge_core::new_handle_store();
+  let cx = rw_cx();
+  let ((old, old_fh), (new, new_fh)) =
+    reissued_handle_fixture(&mut vol, &mut store, &mut successor, &cx);
+  let mut bridge = VolumeBridge::attached(
+    VolumeId { bytes: [0; 16] },
+    &mut vol,
+    &mut store,
+    &mut successor,
+    None,
+  );
+  let root = bridge.root(&cx).unwrap();
+  bridge.write(oid(new), &cx, 0, b"still mine").unwrap();
+  bridge.unlink(oid(root), &cx, "new").unwrap();
+  bridge.release(oid(old), &cx, old_fh).unwrap();
+  let mut out = Vec::new();
+  let read = bridge.read(oid(new), &cx, 0, 16, &mut out);
+  assert!(
+    read.is_ok() && out == b"still mine",
+    "the unlinked file is still open through its own handle: {read:?} {out:?}"
+  );
+  bridge.release(oid(new), &cx, new_fh).unwrap();
+  assert!(
+    bridge.getattr(oid(new), &cx).is_err(),
+    "reclaimed at its own release"
+  );
+}
+
+/// A lost write is reported to a handle from before the takeover however the successor numbers its own (A-61; the
+/// same bug record, sibling 2). Do: across a takeover whose successor reissued a handle value
+/// ([`reissued_handle_fixture`]), with `old` recorded as having lost writes, `fsync` the dead daemon's handle of `old`.
+/// Expect `EIO` (`RecoveryIncomplete`) once: the handle predates the takeover, though a handle the successor issued for
+/// `new` carries the same value.
+#[test]
+fn a_lost_write_reaches_a_pre_takeover_handle_whose_value_the_successor_reissued() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let cx = rw_cx();
+  let (old, old_fh) = {
+    let mut dead = slates_bridge_core::new_handle_store();
+    let mut bridge = VolumeBridge::attached(
+      VolumeId { bytes: [0; 16] },
+      &mut vol,
+      &mut store,
+      &mut dead,
+      None,
+    );
+    let root = bridge.root(&cx).unwrap();
+    let (attr, fh) = bridge.create(oid(root), &cx, "old", 0o644, 0).unwrap();
+    (attr.ino, fh)
+  };
+  let mut record =
+    slates_bridge_core::LostWrites::new(std::collections::BTreeSet::from([old]), false);
+  let mut successor = slates_bridge_core::new_handle_store();
+  let mut bridge = VolumeBridge::attached(
+    VolumeId { bytes: [0; 16] },
+    &mut vol,
+    &mut store,
+    &mut successor,
+    None,
+  )
+  .with_lost_writes(&mut record);
+  let root = bridge.root(&cx).unwrap();
+  let (attr, new_fh) = bridge.create(oid(root), &cx, "new", 0o644, 0).unwrap();
+  assert_eq!(
+    new_fh, old_fh,
+    "non-vacuous: the successor's fresh store reissued the dead daemon's handle value"
+  );
+  assert_eq!(
+    bridge.fsync(oid(old), &cx, old_fh),
+    Err(VfsError::RecoveryIncomplete),
+    "the pre-takeover handle is told its file lost writes"
+  );
+  assert_eq!(
+    bridge.fsync(oid(attr.ino), &cx, new_fh),
+    Ok(()),
+    "the successor's own handle, of a file that lost nothing, is not"
+  );
+}
+
 /// `.` and `..` through the bridge, whole and scoped (POSIX path resolution; NFSv3 LOOKUP, NFSv4 LOOKUPP). Do: make
 /// `shared/a`; look up `.` and `..` in `a`, in `shared` and at the root through the whole bridge, then `..` in `a` and
 /// in `shared` through a bridge scoped to `shared`, and `.` in a file. Expect: `.` is the directory itself; `..` is its

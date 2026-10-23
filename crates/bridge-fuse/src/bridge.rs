@@ -314,7 +314,8 @@ pub fn reclaim_unreported(
   reclaimed
 }
 
-/// Releases the handle `fh` on `nodeid`, counting it when the seam accepted the release.
+/// Releases the handle `fh` on `nodeid`, resolved as its open resolved it (node id 1 is the root; A-148), counting it
+/// when the seam accepted the release.
 fn release(
   bridge: &mut dyn Bridge,
   cx: &OpContext,
@@ -322,7 +323,10 @@ fn release(
   fh: u64,
   reclaimed: &mut Reclaimed,
 ) {
-  if bridge.release(ObjectId::new(nodeid, 0), cx, fh).is_ok() {
+  let Ok(object) = resolve(bridge, cx, nodeid) else {
+    return;
+  };
+  if bridge.release(object, cx, fh).is_ok() {
     reclaimed.handles = reclaimed.handles.saturating_add(1);
   }
 }
@@ -1362,8 +1366,12 @@ fn serve_release(
     .get(..size_of::<u64>())
     .map(|b| u64::from_le_bytes(b.try_into().unwrap_or_default()))
     .unwrap_or(0);
-  // A release is on an open file, never the root; the node id is the inode (generation zero).
-  let object = ObjectId::new(req.header.nodeid, 0);
+  // The release names the node its open resolved (A-148): a `RELEASEDIR` of the root comes on node id 1, which
+  // `serve_open` resolved to the volume's or the scope's root, and the bridge releases only a handle of the file named.
+  let object = match resolve(bridge, cx, req.header.nodeid) {
+    Ok(object) => object,
+    Err(e) => return reply_err(req.header.unique, e, out),
+  };
   reply(
     req.header.unique,
     bridge.release(object, cx, fh),

@@ -9185,7 +9185,9 @@ Applied in the same change to: §4.6 "Linux" status, the failure matrix, T-3.5, 
     named again on its next use. If it is unlinked to no links after the restart before the kernel uses it
     again, it is reclaimed, and the kernel's next use is answered `ESTALE`: the stated limit of a handoff that
     does not publish on every lookup.
-    A handle the restarted daemon never issued is released as a no-op. A file unlinked while open survives in
+    A handle the restarted daemon never issued is released as a no-op. That takes knowing a handle by its value and
+    its file together (A-148): the restarted daemon's handle store is fresh and reissues its predecessor's values, so
+    a release frees a handle only when its file is the one the release names. A file unlinked while open survives in
     the recovery image's orphan tracking; the restored mount takes one reference on each recovered orphan,
     dropped at the kernel's FORGET of the node, which the kernel sends only once every open of it has closed,
     or at the mount's teardown sweep. (Superseded in the same change by the carried references above, which
@@ -11951,6 +11953,38 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
+
+### A-148 — A release frees a handle only of the file it names (accepted 2026-10-22)
+Applied in the same change to:
+- §4.6 ("What the kernel kept" across a takeover);
+- `crates/bridge-core/src/volume_bridge.rs` (`release` checks the handle's file; `LostWrites` keys issued handles by
+  value and file);
+- `crates/bridge-fuse/src/bridge.rs` (`serve_release` and the lost-reply reclaim resolve the node as the open did);
+- the tests:
+  - `a_release_of_a_reissued_handle_value_never_closes_the_successors_handle_for_another_file`;
+  - `a_lost_write_reaches_a_pre_takeover_handle_whose_value_the_successor_reissued`
+    (`crates/bridge-core/tests/volume_bridge.rs`);
+  - `releasing_the_root_directory_frees_its_handle_round_after_round` (`crates/bridge-fuse/tests/volume_bridge.rs`);
+- GAPS;
+- `docs/bugs/2026-10-22-after-a-takeover-a-reissued-handle-value-closed-another-files-handle.md`.
+
+- **What it answers.** A mount taken over (A-61) is served with a fresh handle store, which starts at generation 0 as
+  its predecessor's did, so it reissues the values its predecessor issued. A release of a handle the kernel opened
+  before the takeover could find a handle the successor had since issued for another file, under the same value. It
+  closed that one: an unlinked file still open was reclaimed under its handle, and its read answered `NotFound`. The
+  same reuse hid a pre-takeover handle's lost-write report, its `fsync` answering success.
+- **The rule.** A release frees a handle only when the handle's file is the file the release names; any other value
+  is a handle this daemon never issued for that file, released as a no-op, as §4.6 already said. So a release must
+  name the node its open resolved: a `RELEASEDIR` of the root (node id 1) names the root's inode. The lost-write record
+  knows the successor's handles by value and file.
+- **What it leaves.** A pre-takeover handle's release still frees nothing. Its open's reference is durable only once
+  published, so the successor cannot tell whether it restored it, and dropping one it did not restore would take a
+  lookup reference instead. That is a bounded leak until the mount ends (GAPS).
+- **Evidence.**
+  - The two seam tests were red (`Err(NotFound)`; `Ok(())` for the report) and are green. The first goes red again
+    without the file check.
+  - The root-release test is red without the resolve (`EMFILE` at the third open) and green with it.
+  - The bridge, NFS, CLI (51 of 51) and guest suites stay green.
 
 ### A-147 — A mount taken over by a restarted daemon adopts the files its kernel opened before (accepted 2026-10-22)
 Applied in the same change to:

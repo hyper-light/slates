@@ -660,3 +660,53 @@ fn a_page_too_small_for_a_shared_cookie_answers_eoverflow() {
     -EOVERFLOW
   );
 }
+
+/// Shape: the handle bound of the root-release test's store, small so a release that freed nothing shows within a few
+/// rounds; and the rounds, past it.
+const FEW_HANDLES: usize = 2;
+/// Shape: see [`FEW_HANDLES`].
+const ROOT_ROUNDS: u64 = 8;
+/// Format: the bytes of a `fuse_release_in`: fh (8), flags (4), release flags (4), lock owner (8).
+const RELEASE_IN_LEN: usize = 24;
+
+/// A-148: a `RELEASEDIR` of the root frees its handle. The kernel names the root node id 1, which `OPENDIR` resolves to
+/// the volume's root inode, and the bridge releases only a handle of the file a release names, so the release must
+/// resolve the node the same way. Do: with a handle store bounded at two, open and release the root directory eight
+/// times through the dispatch. Expect every open granted and every release accepted: a release that freed nothing
+/// would refuse the third open (`EMFILE`, the store's bound).
+#[test]
+fn releasing_the_root_directory_frees_its_handle_round_after_round() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut handles = slates_mem::Slab::new(FEW_HANDLES, FEW_HANDLES);
+  let mut bridge = VolumeBridge::attached(
+    VolumeId { bytes: [0; 16] },
+    &mut vol,
+    &mut store,
+    &mut handles,
+    None,
+  );
+  let mut out = [0u8; 512];
+  for round in 0..ROOT_ROUNDS {
+    let unique = round * 2 + 1;
+    dispatch(
+      &message(Opcode::OpenDir.to_wire(), unique, 1, &[0u8; 8]),
+      &mut bridge,
+      &mut out,
+    );
+    assert!(
+      ok(&out),
+      "round {round}: the root opens (error {})",
+      i32::from_le_bytes(out[4..8].try_into().unwrap())
+    );
+    let fh = u64::from_le_bytes(out[OUT_HEADER_LEN..OUT_HEADER_LEN + 8].try_into().unwrap());
+    let mut release_in = fh.to_le_bytes().to_vec();
+    release_in.resize(RELEASE_IN_LEN, 0);
+    dispatch(
+      &message(Opcode::ReleaseDir.to_wire(), unique + 1, 1, &release_in),
+      &mut bridge,
+      &mut out,
+    );
+    assert!(ok(&out), "round {round}: the root releases");
+  }
+}

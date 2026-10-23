@@ -10728,10 +10728,21 @@ stale page back, and the other write's bytes on it reverted: measured 4,095 of 4
   journal's changes since then applied, and from there it is judged like any other. The `EIO` remains only for a file
   first named after the journal stopped reaching back to the mount's start.
 
-  A sibling, recorded in the bug, is not fixed. `VolumeBridge::release` resolves a handle by its value alone, and a
-  successor reissues its predecessor's values, so a pre-takeover handle's release can close a post-takeover handle of
-  another file. A failing test comes next
-  (`docs/bugs/2026-10-22-a-mount-taken-over-by-a-restarted-daemon-dropped-a-store-made-after-a-refetch.md`).
+  **Its siblings across a takeover:**
+  - **A release closed another file's handle — fixed 2026-10-22 (A-148).** `VolumeBridge::release` resolved a handle by
+    its value alone, and a successor reissues its predecessor's values. So a pre-takeover handle's release closed the
+    successor's handle of another file, under the same value, and reclaimed it if unlinked while open
+    (`Err(NotFound)` through its own handle). The same reuse hid a pre-takeover handle's lost-write report. A release
+    now frees a handle only of the file it names, and the FUSE edge resolves node id 1 as the open did. Red seam tests
+    are green, and a root-release test guards the resolve (`EMFILE` at the third open without it)
+    (`docs/bugs/2026-10-22-after-a-takeover-a-reissued-handle-value-closed-another-files-handle.md`).
+  - **A pre-takeover handle's release frees nothing — open, a bounded leak.** Its open's reference is durable only once
+    a publication captured it, so the successor cannot tell whether it restored it. Dropping one it did not restore
+    would take a lookup reference and could reclaim a file the kernel still holds, so it drops none. The reference stays
+    until the mount ends. Closing it needs open references made durable, or recorded in the session the anchor holds.
+  - **Open counts are not durable — open.** `Volume::attachment_opens` starts empty after recovery. A base file opened
+    before a takeover counts as closed afterwards, so an outsider's replacement of its name could be followed through
+    the old handle. Not reproduced.
 - **A takeover sends the kernel no invalidation** (found reading `crates/server/src/fuse.rs` 2026-10-22, not
   reproduced). The coherence cursor is process-local, and a restored mount's first round starts at the new daemon's
   head. A change the dead daemon had not yet delivered is therefore never invalidated: its kernel keeps that name,

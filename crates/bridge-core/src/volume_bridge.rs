@@ -102,7 +102,9 @@ pub struct VolumeBridge<'v> {
 pub struct LostWrites {
   inodes: std::collections::BTreeSet<u64>,
   everything: bool,
-  issued: std::collections::BTreeSet<u64>,
+  /// The handles this daemon issued, each with its file: a successor reissues its predecessor's values, so a value
+  /// alone cannot tell a handle from before the takeover from one issued since (A-148).
+  issued: std::collections::BTreeSet<(u64, u64)>,
   told: std::collections::BTreeSet<(u64, u64)>,
 }
 
@@ -122,21 +124,21 @@ impl LostWrites {
     self.inodes.is_empty() && !self.everything
   }
 
-  fn issued(&mut self, fh: u64) {
+  fn issued(&mut self, fh: u64, inode: u64) {
     if !self.is_empty() {
-      self.issued.insert(fh);
+      self.issued.insert((fh, inode));
     }
   }
 
-  fn released(&mut self, fh: u64) {
-    self.issued.remove(&fh);
-    self.told.retain(|(_, handle)| *handle != fh);
+  fn released(&mut self, fh: u64, inode: u64) {
+    self.issued.remove(&(fh, inode));
+    self.told.remove(&(inode, fh));
   }
 
   /// Whether a `flush` or `fsync` of `inode` through `fh` is answered `EIO`: the handle predates the takeover, the
   /// file lost writes, and no `fsync` through this handle has been told yet.
   fn reports(&self, inode: u64, fh: u64) -> bool {
-    !self.issued.contains(&fh)
+    !self.issued.contains(&(fh, inode))
       && (self.everything || self.inodes.contains(&inode))
       && !self.told.contains(&(inode, fh))
   }
@@ -407,7 +409,7 @@ impl<'v> VolumeBridge<'v> {
       Ok(handle) => {
         let fh = pack_handle(handle);
         if let Some(lost) = self.lost.as_deref_mut() {
-          lost.issued(fh);
+          lost.issued(fh, inode);
         }
         Ok(fh)
       }
@@ -952,20 +954,29 @@ impl Bridge for VolumeBridge<'_> {
     Ok((entry, fh))
   }
 
-  fn release(&mut self, _object: ObjectId, cx: &OpContext, fh: u64) -> Result<(), VfsError> {
+  fn release(&mut self, object: ObjectId, cx: &OpContext, fh: u64) -> Result<(), VfsError> {
     self.authorize_volume(cx)?;
     // Drop the open reference the handle held (attributed to this attachment), then free the slot
     // for reuse. An unknown or already-freed handle is a no-op (the kernel may release one the
     // bridge already dropped).
-    if let Ok(inode) = self.handles.get(unpack_handle(fh)).copied() {
-      self.volume.close_for(InodeNo(inode), cx.owner);
+    //
+    // A release names its file, and only a handle of that file is released (A-148). A daemon that takes a mount over
+    // (A-61) issues from a fresh store the values its predecessor issued, so the kernel can release a handle it opened
+    // before the takeover whose value this bridge has since given to another file. That handle is not this one: its
+    // release touches nothing here, as an unknown value's does. (Its open's reference stays: references are durable
+    // only once published, so this daemon cannot tell whether it restored it, and dropping one it never restored would
+    // take a lookup reference instead.)
+    let unpacked = unpack_handle(fh);
+    if self.handles.get(unpacked).ok().copied() == Some(object.inode) {
+      self.volume.close_for(InodeNo(object.inode), cx.owner);
       let _ = self
         .volume
-        .forget_for(self.store, InodeNo(inode), cx.owner, 1);
+        .forget_for(self.store, InodeNo(object.inode), cx.owner, 1);
+      let _ = self.handles.remove(unpacked);
     }
-    let _ = self.handles.remove(unpack_handle(fh));
+    // A handle from before the takeover is forgotten by the lost-write record too, so it holds only handles alive.
     if let Some(lost) = self.lost.as_deref_mut() {
-      lost.released(fh);
+      lost.released(fh, object.inode);
     }
     Ok(())
   }
