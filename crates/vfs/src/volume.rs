@@ -1043,11 +1043,25 @@ impl Volume {
     &self.journal
   }
 
-  /// Records what a consuming round whose cursor is `cursor` finds waiting in the journal, timed on the clock the
-  /// records were stamped with (§4.5, the budget's inputs: [`OpLog::note_round`]).
-  pub fn note_journal_round(&mut self, cursor: u64) -> crate::journal::Backlog {
+  /// Records what a consuming round of journal reader `reader` whose cursor is `cursor` finds waiting in the journal,
+  /// timed on the clock the records were stamped with, and moves an open reader's point to the cursor (§4.5, the
+  /// budget's inputs and its readers: [`OpLog::note_round`]).
+  pub fn note_journal_round(&mut self, reader: u64, cursor: u64) -> crate::journal::Backlog {
     let now = self.clock.monotonic_ns();
-    self.journal.note_round(cursor, now)
+    self.journal.note_round(reader, cursor, now)
+  }
+
+  /// Opens a journal reader for transport attachment `key` (§4.5): a FUSE mount that consumes the journal from the
+  /// moment it serves, so the records after the head now are the first it may read. Its owner closes it when the
+  /// mount ends ([`Volume::close_journal_reader`]).
+  pub fn open_journal_reader(&mut self, key: u64) {
+    let head = self.journal.head_seq();
+    self.journal.open_reader(key, head);
+  }
+
+  /// Closes the journal reader of transport attachment `key`; a key with no reader open is left alone.
+  pub fn close_journal_reader(&mut self, key: u64) {
+    self.journal.close_reader(key);
   }
 
   /// The number of live snapshots.

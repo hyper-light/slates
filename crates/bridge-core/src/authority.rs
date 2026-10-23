@@ -212,6 +212,12 @@ impl Attachments {
     self.epoch
   }
 
+  /// The registry's occupied slots: attachments admitted and not yet drained, live or revoked. Every transport's
+  /// attachments share the [`MAX_ATTACHMENTS`] slots, so one that is never drained is a slot no later attach can take.
+  pub fn live(&self) -> usize {
+    self.registry.len()
+  }
+
   /// Admits an attachment for the enrolled `subject` on `volume`/`view` with `rights`, under the
   /// current owner epoch. The `subject` is established by trusted enrollment (the daemon's
   /// authenticated connection), not declared per request. Refuses at the registry bound.

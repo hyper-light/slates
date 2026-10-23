@@ -1537,6 +1537,8 @@ pub fn status_json(r: &StatusReport) -> Value {
       "largest_bytes": r.journal.largest_bytes,
       "largest_lag_ns": r.journal.largest_lag_ns,
       "longest_lag_ns": r.journal.longest_lag_ns,
+      "readers": r.journal.readers,
+      "slowest_reader_behind": r.journal.slowest_reader_behind,
     },
   })
 }
@@ -2116,6 +2118,7 @@ fn shard_json(s: &ShardReport, telemetry: Option<&TelemetryReport>) -> Value {
     "landings_in_flight": s.landings_in_flight,
     "target_leases": s.target_leases,
     "nfs_calls": s.nfs_calls,
+    "registry_attachments": s.registry_attachments,
     "telemetry": telemetry.map(telemetry_json),
   })
 }

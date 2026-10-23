@@ -2917,6 +2917,7 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     served_sessions: state.served_sessions.values().cloned().collect(),
     detector_pool: detector_pool_report(state),
     detector_relays: detector_relay_report(state),
+    registry_attachments: u64::try_from(state.attachments.live()).unwrap_or(u64::MAX),
   }
 }
 
@@ -6964,6 +6965,10 @@ fn journal_report(volume: &Volume) -> slates_ipc::protocol::JournalReport {
     largest_bytes: measure.largest.bytes,
     largest_lag_ns: measure.largest.lag_ns,
     longest_lag_ns: measure.longest_lag_ns,
+    readers: wide(log.readers()),
+    slowest_reader_behind: log
+      .slowest_reader()
+      .map_or(0, |point| log.head_seq().saturating_sub(point)),
   }
 }
 

@@ -1651,7 +1651,7 @@ fn journal_text(journal: &slates_client::JournalReport) -> String {
   format!(
     "journal_budget_bytes: {}\njournal_retained: {} records, {} bytes ({} a record)\njournal_appended: {} (dropped {})\n\
      journal_rounds: {} (overruns {})\njournal_largest_backlog: {} records, {} bytes, oldest waited {} ns\n\
-     journal_longest_lag_ns: {}\n",
+     journal_longest_lag_ns: {}\njournal_readers: {} (slowest {} records behind)\n",
     journal.budget_bytes,
     journal.retained_records,
     journal.retained_bytes,
@@ -1663,7 +1663,9 @@ fn journal_text(journal: &slates_client::JournalReport) -> String {
     journal.largest_records,
     journal.largest_bytes,
     journal.largest_lag_ns,
-    journal.longest_lag_ns
+    journal.longest_lag_ns,
+    journal.readers,
+    journal.slowest_reader_behind
   )
 }
 
@@ -1955,6 +1957,10 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
     out.push_str(&format!(
       "shard {} telemetry: spans_held={} spans_dropped={}\n",
       shard.partition, shard.spans_held, shard.spans_dropped
+    ));
+    out.push_str(&format!(
+      "shard {} registry_attachments: {}\n",
+      shard.partition, shard.registry_attachments
     ));
     if let Some(batch) = telemetry
       .iter()

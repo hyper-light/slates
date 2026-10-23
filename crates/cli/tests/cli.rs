@@ -4533,6 +4533,106 @@ fn status_reports_what_a_mounts_rounds_found_waiting_in_the_journal() {
   }
 }
 
+/// §4.5 (the journal's readers): do mount a volume twice through FUSE, unmount one, kill the daemon so the anchor's
+/// successor takes the other mount over, then unmount that one, reading `slates status` after each step; expect the
+/// journal to report 2 readers, then 1, then 1 again (the restored mount is a reader of the new daemon), then 0: every
+/// mount is a reader from the moment it serves until it ends, and none outlives its mount. Gated as the held mounts
+/// are (a kernel that resends, 6.9+).
+#[cfg(target_os = "linux")]
+#[test]
+fn every_fuse_mount_is_a_journal_reader_from_its_start_to_its_end() {
+  let Some(held) = HeldMount::start("readers") else {
+    return;
+  };
+  let readers_come_to = |expected: u64| {
+    let mut last = String::new();
+    let reached = wait_for(|| {
+      let (code, out, _) = run(&held.instance, &["status", &held.id]);
+      let shown = code == 0 && leading_number(&value_of(&out, "journal_readers")) == expected;
+      last = out;
+      shown
+    });
+    assert!(reached, "the journal reports {expected} readers: {last}");
+  };
+  readers_come_to(1);
+  let second = MountPoint {
+    path: fresh_mount_point(),
+  };
+  let (code, _, err) = run(&held.instance, &["mount", &held.id, &second.path]);
+  assert_eq!(code, 0, "the second mount: {err}");
+  readers_come_to(2);
+  let (code, _, err) = unmount_through_the_cli(&held.instance, &second.path);
+  assert_eq!(code, 0, "{err}");
+  readers_come_to(1);
+  let killed = kill_the_daemon(&held.instance);
+  let restarted = await_daemon(&held.instance, Some(killed), &[]);
+  assert_ne!(restarted, killed, "a new daemon serves the mount");
+  readers_come_to(1);
+  assert!(
+    counter_of(&held.instance, "fuse.adopted") >= 1,
+    "the reader is the restored mount's"
+  );
+  let (code, _, err) = unmount_through_the_cli(&held.instance, &held.mount_point.path);
+  assert_eq!(code, 0, "{err}");
+  readers_come_to(0);
+}
+
+/// The attachments the daemon's registries hold, summed over its shards from `slates status`
+/// (`shard N registry_attachments: K`).
+#[cfg(target_os = "linux")]
+fn registry_attachments(instance: &str) -> u64 {
+  let (_, out, _) = run(instance, &["status"]);
+  out
+    .lines()
+    .filter_map(|line| {
+      line
+        .split_once(" registry_attachments: ")
+        .map(|(_, count)| count)
+    })
+    .filter_map(|count| count.trim().parse::<u64>().ok())
+    .sum()
+}
+
+/// The bug record of 2026-10-23 (a FUSE mount that ends in its turn keeps its registry attachment): do read the
+/// attachments the daemon's registries hold, mount a volume through FUSE, unmount it, then read them again; expect them
+/// back where they were, so the unmount freed its slot. Before the fix each unmount left one more for good, and a shard
+/// refused every attach once 4096 had piled up.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_fuse_mounts_unmount_frees_its_registry_attachment() {
+  if !linux_fuse_mount_runs() {
+    return;
+  }
+  let instance = format!("cli-registry-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "registryvol", "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let before = registry_attachments(&instance);
+  let point = MountPoint {
+    path: fresh_mount_point(),
+  };
+  fuse_mount_and_check(&instance, &id, &point.path);
+  assert!(
+    registry_attachments(&instance) > before,
+    "the mount rides a registry attachment"
+  );
+  let (code, _, err) = unmount_through_the_cli(&instance, &point.path);
+  assert_eq!(code, 0, "{err}");
+  let mut held = 0;
+  let freed = wait_for(|| {
+    held = registry_attachments(&instance);
+    held == before
+  });
+  assert!(
+    freed,
+    "the unmount freed its registry attachment: {held} held, {before} before the mount"
+  );
+}
+
 /// The kernel's mount table entry at `path` (Linux `mountinfo`): its filesystem type and source.
 #[cfg(target_os = "linux")]
 fn mountinfo_at(path: &str) -> Option<(String, String)> {

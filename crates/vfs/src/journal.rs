@@ -9,7 +9,7 @@
 //! pattern. So each round records its backlog in records and bytes, and how long its oldest record had waited. The
 //! log keeps the maxima since it was made; they are window-free, so the measurement adds no tuning constant (R3).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use crate::ids::{Epoch, InodeNo};
 
@@ -164,6 +164,10 @@ pub struct OpLog {
   next_seq: u64,
   dropped: u64,
   measure: JournalMeasure,
+  /// The readers that consume the log, by key, each with the point it may still read every record after
+  /// ([`OpLog::open_reader`]). One entry per open reader; its owner opens one only for a live transport attachment
+  /// and closes it when the attachment ends, so the attachment registry's capacity bounds the map.
+  readers: BTreeMap<u64, u64>,
 }
 
 impl OpLog {
@@ -176,12 +180,40 @@ impl OpLog {
       next_seq: 1,
       dropped: 0,
       measure: JournalMeasure::default(),
+      readers: BTreeMap::new(),
     }
   }
 
-  /// Records what a consuming round finds waiting after `cursor` at monotonic time `now_ns`, on the same clock the
-  /// records were stamped with, and returns it. Costs the records after the cursor, which the round walks anyway.
-  pub fn note_round(&mut self, cursor: u64, now_ns: u64) -> Backlog {
+  /// Opens reader `key` at `point`: until it closes, the reader may read every record after `point`, and each of its
+  /// rounds moves `point` to the round's start ([`OpLog::note_round`]). Opening a key already open moves its point.
+  pub fn open_reader(&mut self, key: u64, point: u64) {
+    self.readers.insert(key, point);
+  }
+
+  /// Closes reader `key`; a key that is not open is left alone.
+  pub fn close_reader(&mut self, key: u64) {
+    self.readers.remove(&key);
+  }
+
+  /// The readers open.
+  pub fn readers(&self) -> usize {
+    self.readers.len()
+  }
+
+  /// The earliest point an open reader may still read after, or `None` when no reader is open.
+  pub fn slowest_reader(&self) -> Option<u64> {
+    self.readers.values().min().copied()
+  }
+
+  /// Records what a consuming round of `reader` finds waiting after `cursor` at monotonic time `now_ns`, on the same
+  /// clock the records were stamped with, and returns it. An open reader's point moves to `cursor`: a round never
+  /// reads before its own start again, since a refused round is gathered again from that start and nothing new is
+  /// gathered while one is in flight (§4.5). A reader that is not open is measured and not registered, so no round
+  /// opens a reader its owner would have to close. Costs the records after the cursor, which the round walks anyway.
+  pub fn note_round(&mut self, reader: u64, cursor: u64, now_ns: u64) -> Backlog {
+    if let Some(point) = self.readers.get_mut(&reader) {
+      *point = cursor;
+    }
     let backlog = self.backlog_after(cursor, now_ns);
     let measure = &mut self.measure;
     measure.rounds = measure.rounds.saturating_add(1);
@@ -405,6 +437,41 @@ mod tests {
     charge(std::mem::size_of::<OpRecord>())
   }
 
+  /// Shape: a reader key no test opens, for rounds measured without a reader.
+  const UNOPENED: u64 = 0;
+
+  /// §4.5 (the journal's readers): do open two readers at different points, run a round of one, a round of a key
+  /// never opened, then close them; expect each round to move only its own reader's point to the round's start, the
+  /// slowest point to be the least open one, the unopened key to register nothing, and closing to forget a reader
+  /// (twice is harmless).
+  #[test]
+  fn a_round_moves_only_its_own_readers_point_and_only_an_opened_reader_is_kept() {
+    let mut log = OpLog::new(64 * std::mem::size_of::<OpRecord>());
+    for i in 0..6u64 {
+      log.append(Op::Create, "", Some(InodeNo(i)), Epoch(0), i, 0);
+    }
+    log.open_reader(7, 2);
+    log.open_reader(9, 4);
+    assert_eq!((log.readers(), log.slowest_reader()), (2, Some(2)));
+    log.note_round(7, 5, 10);
+    assert_eq!(
+      log.slowest_reader(),
+      Some(4),
+      "reader 7 moved to its round's start"
+    );
+    log.note_round(UNOPENED, 1, 10);
+    assert_eq!(
+      log.readers(),
+      2,
+      "a round of a reader never opened registers none"
+    );
+    log.close_reader(9);
+    assert_eq!((log.readers(), log.slowest_reader()), (1, Some(5)));
+    log.close_reader(9);
+    log.close_reader(7);
+    assert_eq!((log.readers(), log.slowest_reader()), (0, None));
+  }
+
   /// §4.5 (the budget's inputs): do append five records with known path lengths and times, then run a round from the
   /// second; expect a backlog of the three after it with their exact charges, and the wait of the oldest of them.
   #[test]
@@ -414,7 +481,7 @@ mod tests {
       let path = "x".repeat(usize::try_from(i).unwrap());
       log.append(Op::Create, path, Some(InodeNo(i)), Epoch(0), 100 * i, 0);
     }
-    let backlog = log.note_round(2, 1_000);
+    let backlog = log.note_round(UNOPENED, 2, 1_000);
     assert_eq!(
       backlog,
       Backlog {
@@ -439,7 +506,7 @@ mod tests {
       log.append(Op::Create, "", Some(InodeNo(i)), Epoch(0), 100 * i, 0);
     }
     assert_eq!(log.oldest_seq(), 8, "three retained");
-    let backlog = log.note_round(1, 2_000);
+    let backlog = log.note_round(UNOPENED, 1, 2_000);
     assert_eq!(
       backlog,
       Backlog {
@@ -457,12 +524,16 @@ mod tests {
   #[test]
   fn rounds_keep_the_largest_backlog_and_the_longest_lag() {
     let mut log = OpLog::new(64 * std::mem::size_of::<OpRecord>());
-    assert_eq!(log.note_round(0, 5), Backlog::default(), "nothing appended");
+    assert_eq!(
+      log.note_round(UNOPENED, 0, 5),
+      Backlog::default(),
+      "nothing appended"
+    );
     for i in 0..6u64 {
       log.append(Op::Create, "", Some(InodeNo(i)), Epoch(0), 10 * i, 0);
     }
-    let large = log.note_round(0, 100);
-    let small = log.note_round(5, 1_000);
+    let large = log.note_round(UNOPENED, 0, 100);
+    let small = log.note_round(UNOPENED, 5, 1_000);
     assert_eq!(large.records, 6);
     assert_eq!(small.records, 1);
     let measure = log.measure();
@@ -575,7 +646,7 @@ mod tests {
           Step::Round { behind, after_ns } => {
             now += after_ns;
             let cursor = log.head_seq().saturating_sub(behind);
-            proptest::prop_assert_eq!(log.note_round(cursor, now), model.round(cursor, now));
+            proptest::prop_assert_eq!(log.note_round(UNOPENED, cursor, now), model.round(cursor, now));
             proptest::prop_assert_eq!(log.measure(), model.measure);
           }
         }

@@ -1058,6 +1058,9 @@ pub struct ShardReport {
   pub detector_pool: DetectorPoolReport,
   /// This shard's detector's relay-stage timer: live on the control shard, empty elsewhere. Appended.
   pub detector_relays: DetectorRelayReport,
+  /// The attachments this shard's registry holds: admitted and not yet drained, by every transport. One that outlives
+  /// its transport is a slot no later attach can take. Appended.
+  pub registry_attachments: u64,
 }
 
 /// The daemon's place in its fleet (§4.8; §2.6 boot step 6), as the verbs' placement authority sees it.
@@ -1738,6 +1741,11 @@ pub struct JournalReport {
   pub largest_lag_ns: u64,
   /// The longest any round's oldest record had waited, in nanoseconds.
   pub longest_lag_ns: u64,
+  /// The readers open: the volume's FUSE mounts that consume the journal. Appended.
+  pub readers: u64,
+  /// How many records the slowest open reader may still read: the head less its point. Zero with no reader open.
+  /// Appended.
+  pub slowest_reader_behind: u64,
 }
 
 /// One host mount of a volume, bound to its mount point (§4.4 `Bound`).

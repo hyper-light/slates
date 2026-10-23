@@ -442,6 +442,7 @@ fn established(s: &mut ShardState, pending: PendingAttach, mount: Mount) -> Repl
     s.attachments.drain(registry);
     return refuse(s, &mount_point, Refusal::Overloaded { shard: s.shard });
   }
+  open_journal_reader(s, volume, registry);
   ReplyBody::Attached {
     attachment,
     lease_epoch: pending.lease_epoch,
@@ -623,10 +624,23 @@ async fn serve(attachment: u64) {
 /// One turn over a transient bridge on the volume's slot, under the mount's one gating (the volume present, the
 /// live-tree fence, the scope). A request turn dispatches one request, runs its barrier when it changed what survives a
 /// restart and writes its reply (or `EIO`); a change turn delivers the owed round alone, reading no request.
+///
+/// The mount is taken out of the shard's map for the turn and always put back, whatever the turn decided: a mount that
+/// ended is torn down by `ended`, which the serve task calls next, and nowhere else. Until 2026-10-23 four exits that
+/// ended the mount dropped it here, so `ended` found nothing, and the mount's registry attachment was never revoked or
+/// drained (one slot of the shard's 4096 per unmount, for good) and its journal reader never closed
+/// (`docs/bugs/2026-10-23-a-fuse-mount-that-ends-in-its-turn-keeps-its-registry-attachment.md`).
 fn turn(s: &mut ShardState, attachment: u64, kind: TurnKind) -> Turned {
   let Some(mut mount) = s.fuse_mounts.remove(&attachment) else {
     return Turned::Ended;
   };
+  let turned = turn_with(s, attachment, &mut mount, kind);
+  s.fuse_mounts.insert(attachment, mount);
+  turned
+}
+
+/// One turn of `mount`, lent by [`turn`] and out of the shard's map while it runs.
+fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: TurnKind) -> Turned {
   // The volume is gone (destroyed): the mount ends without an unmount. Its device dropped and the anchor's copy
   // released (`ended`), the kernel answers every later call `ENOTCONN` until the mount's user unmounts it, so no write
   // by path falls through to the disk beneath (conditions 3 and 4).
@@ -636,7 +650,6 @@ fn turn(s: &mut ShardState, attachment: u64, kind: TurnKind) -> Turned {
   // The live-tree fence the NFS mount applies before every procedure (§4.8 "Leases and reads"; AUD-29-83):
   // while the owner's lease does not hold, no request is read, so none is answered from a stale view.
   if crate::verbs::live_tree_fenced(s, mount.volume) {
-    s.fuse_mounts.insert(attachment, mount);
     return Turned::Fenced;
   }
   crate::verbs::relieve_deferred(s);
@@ -701,7 +714,7 @@ fn turn(s: &mut ShardState, attachment: u64, kind: TurnKind) -> Turned {
       }
     }
   };
-  hand_over_session(s, attachment, &mut mount);
+  hand_over_session(s, attachment, mount);
   // Whether this turn delivered the owed round: a change turn always does; a request turn only when it dispatched a
   // request, since `dispatch_ready` delivers just before dispatching and returns before it when nothing waits. An idle
   // turn delivered nothing, so it must not move `seen` past a change it never told the kernel of — the first version
@@ -725,7 +738,7 @@ fn turn(s: &mut ShardState, attachment: u64, kind: TurnKind) -> Turned {
         let count = s.refusals.entry(RESENT).or_insert(0);
         *count = count.saturating_add(1);
       }
-      reply(s, attachment, &mut mount, &dispatched)
+      reply(s, attachment, mount, &dispatched)
     }
     Err(_) => {
       // Ended without an unmount: the mount answers `ENOTCONN` until its user unmounts it (see `turn`).
@@ -753,7 +766,6 @@ fn turn(s: &mut ShardState, attachment: u64, kind: TurnKind) -> Turned {
       .get(handle)
       .map_or(mount.seen, |slot| slot.volume.change_generation());
   }
-  s.fuse_mounts.insert(attachment, mount);
   turned
 }
 
@@ -1080,6 +1092,7 @@ fn adopt_one(s: &mut ShardState, record: AttachmentRecord, held: crate::fuse_hol
     s.attachments.drain(registry);
     return end(s);
   }
+  open_journal_reader(s, record.volume, registry);
   let count = s.refusals.entry(ADOPTED).or_insert(0);
   *count = count.saturating_add(1);
 }
@@ -1088,6 +1101,7 @@ fn adopt_one(s: &mut ShardState, record: AttachmentRecord, held: crate::fuse_hol
 /// attachment ended as a recorded operation (unless a `detach` or destroy already ended it).
 fn ended(s: &mut ShardState, attachment: u64) {
   if let Some(mount) = s.fuse_mounts.remove(&attachment) {
+    close_journal_reader(s, &mount);
     s.attachments.revoke(mount.registry);
     s.attachments.drain(mount.registry);
   }
@@ -1127,8 +1141,31 @@ pub(crate) fn end_all(s: &mut ShardState) {
 pub(crate) fn drop_devices(s: &mut ShardState) {
   let attachments: Vec<u64> = s.fuse_mounts.keys().copied().collect();
   for attachment in attachments {
-    s.fuse_mounts.remove(&attachment);
+    if let Some(mount) = s.fuse_mounts.remove(&attachment) {
+      close_journal_reader(s, &mount);
+    }
     let _ = crate::fuse_hold::release(attachment);
+  }
+}
+
+/// Opens the journal reader of a mount that now serves `volume` under registry attachment `registry` (§4.5): from here
+/// the volume keeps the records after the head for it, and each of its rounds moves its point. Opened once the serve
+/// task is spawned, so a mount that never served leaves no reader, and closed wherever the mount is removed for good
+/// ([`close_journal_reader`]: `ended`, `drop_devices`).
+fn open_journal_reader(s: &mut ShardState, volume: VolumeId, registry: AttachmentId) {
+  if let Some(&handle) = s.by_id.get(&volume)
+    && let Ok(slot) = s.volumes.get_mut(handle)
+  {
+    slot.volume.open_journal_reader(registry.key());
+  }
+}
+
+/// Closes the journal reader of `mount`, removed for good. A volume already gone took its readers with it.
+fn close_journal_reader(s: &mut ShardState, mount: &FuseMount) {
+  if let Some(&handle) = s.by_id.get(&mount.volume)
+    && let Ok(slot) = s.volumes.get_mut(handle)
+  {
+    slot.volume.close_journal_reader(mount.registry.key());
   }
 }
 

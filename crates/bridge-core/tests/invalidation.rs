@@ -486,6 +486,72 @@ fn each_current_round_records_what_waited_for_it_and_a_pinned_round_records_noth
   );
 }
 
+/// §4.5 (the journal's readers): do open a reader for a current attachment and one for a pinned view, change the
+/// volume, run each attachment's round from the new head, then close the readers; expect the current reader's point to
+/// move to its round's start, the pinned view's reader to stay where it opened (a pinned view never reads the journal),
+/// and nothing left once both close. Both contexts come from one registry, so their keys differ.
+#[test]
+fn a_current_round_moves_its_readers_point_and_a_pinned_round_moves_none() {
+  fn bridge<'v>(
+    vol: &'v mut Volume,
+    store: &'v mut Store,
+    handles: &'v mut Slab<u64>,
+  ) -> VolumeBridge<'v> {
+    VolumeBridge::attached(VolumeId { bytes: [0; 16] }, vol, store, handles, None)
+  }
+  let mut store = store();
+  let mut vol = Volume::create(&mut store, config(5)).unwrap();
+  let mut handles = new_handle_store();
+  let root = vol.root();
+  let mut attachments = Attachments::new();
+  let mut context = |view: View, write: bool| {
+    let id = attachments
+      .attach(
+        VolumeId { bytes: [0; 16] },
+        view,
+        Principal::Uid { uid: 0 },
+        Rights { read: true, write },
+      )
+      .unwrap();
+    attachments.set_coherence(id, slates_bridge_core::CacheCoherence::Invalidated);
+    attachments.context(id).unwrap()
+  };
+  let current = context(View::Current, true);
+  let pinned = context(View::Version(1), false);
+  vol.open_journal_reader(current.attachment.key());
+  vol.open_journal_reader(pinned.attachment.key());
+  let opened_at = vol.op_log().head_seq();
+  assert_eq!(
+    (vol.op_log().readers(), vol.op_log().slowest_reader()),
+    (2, Some(opened_at))
+  );
+
+  let a = vol.create_file(&mut store, root, "a", 0o644).unwrap();
+  vol.write(&mut store, a, 0, b"new").unwrap();
+  let cursor = bridge(&mut vol, &mut store, &mut handles).seen(&current);
+  assert!(cursor.journal_seq > opened_at, "the changes were journaled");
+  let mut owed = Vec::new();
+  bridge(&mut vol, &mut store, &mut handles)
+    .invalidations(&current, cursor, &mut owed)
+    .unwrap();
+  bridge(&mut vol, &mut store, &mut handles)
+    .invalidations(&pinned, cursor, &mut owed)
+    .unwrap();
+  assert_eq!(
+    vol.op_log().slowest_reader(),
+    Some(opened_at),
+    "the pinned view's reader did not move"
+  );
+  vol.close_journal_reader(pinned.attachment.key());
+  assert_eq!(
+    (vol.op_log().readers(), vol.op_log().slowest_reader()),
+    (1, Some(cursor.journal_seq)),
+    "the current reader moved to its round's start"
+  );
+  vol.close_journal_reader(current.attachment.key());
+  assert_eq!(vol.op_log().readers(), 0);
+}
+
 /// A watcher hint on a base directory (an outsider replaced a file beneath it) owes the transport
 /// an expire-only invalidation for every live entry the kernel may hold under that directory and
 /// an inode invalidation for each, plus the directory's own; the next lookup then re-lists (the
