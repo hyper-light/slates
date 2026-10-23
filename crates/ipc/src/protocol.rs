@@ -1705,6 +1705,39 @@ pub struct StatusReport {
   pub mounts: Vec<MountReport>,
   /// Bound mounts the budget did not carry. Appended.
   pub mounts_elided: u32,
+  /// The volume's journal: its budget, and what its consuming rounds found waiting (§4.5). Appended.
+  pub journal: JournalReport,
+}
+
+/// A volume's journal as its consuming rounds measured it (§4.5 "Journal"). The budget's formula is the mutation rate
+/// times the longest subscriber lag times the record size, and a round's backlog is that product measured directly:
+/// the records that waited for it. Maxima since the journal was made.
+#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
+pub struct JournalReport {
+  /// The bytes of records the journal may retain.
+  pub budget_bytes: u64,
+  /// The bytes the retained records are charged.
+  pub retained_bytes: u64,
+  /// Records retained.
+  pub retained_records: u64,
+  /// The mean charge of a retained record, in bytes (a record's fixed size when none is retained).
+  pub mean_record_bytes: u64,
+  /// Records appended since the journal was made.
+  pub appended: u64,
+  /// Records retention has dropped.
+  pub dropped: u64,
+  /// Consuming rounds measured.
+  pub rounds: u64,
+  /// Rounds that found their cursor behind retention (A-141's overruns).
+  pub overruns: u64,
+  /// The largest backlog a round found, in records.
+  pub largest_records: u64,
+  /// The largest backlog a round found, in bytes: the formula's product, measured.
+  pub largest_bytes: u64,
+  /// How long the oldest record of that largest backlog had waited, in nanoseconds.
+  pub largest_lag_ns: u64,
+  /// The longest any round's oldest record had waited, in nanoseconds.
+  pub longest_lag_ns: u64,
 }
 
 /// One host mount of a volume, bound to its mount point (§4.4 `Bound`).

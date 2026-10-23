@@ -1641,7 +1641,30 @@ fn status_text(report: &StatusReport) -> String {
     option_text(report.placed.mirror_age_ns),
     report.placed.host_epoch
   ) + &mounts_text(report)
+    + &journal_text(&report.journal)
     + &transports_text(&report.transports)
+}
+
+/// The volume's journal (§4.5): its budget and retention, and what its consuming rounds found waiting (the budget's
+/// formula, mutation rate × lag × record size, measured as each round's backlog).
+fn journal_text(journal: &slates_client::JournalReport) -> String {
+  format!(
+    "journal_budget_bytes: {}\njournal_retained: {} records, {} bytes ({} a record)\njournal_appended: {} (dropped {})\n\
+     journal_rounds: {} (overruns {})\njournal_largest_backlog: {} records, {} bytes, oldest waited {} ns\n\
+     journal_longest_lag_ns: {}\n",
+    journal.budget_bytes,
+    journal.retained_records,
+    journal.retained_bytes,
+    journal.mean_record_bytes,
+    journal.appended,
+    journal.dropped,
+    journal.rounds,
+    journal.overruns,
+    journal.largest_records,
+    journal.largest_bytes,
+    journal.largest_lag_ns,
+    journal.longest_lag_ns
+  )
 }
 
 /// The host's transport report as text (§4.6 A-9): the host facts, then one line per transport.

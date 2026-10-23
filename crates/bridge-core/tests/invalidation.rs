@@ -420,6 +420,72 @@ fn a_transport_behind_the_journals_retention_is_told_everything() {
   assert!(owed.is_empty(), "caught up: {owed:?}");
 }
 
+/// §4.5 (the journal budget's inputs: mutation rate × lag × record size, measured as what waited): do mutate the volume
+/// outside the transport, then run a current view's round and a pinned view's; expect the current round recorded with
+/// the records since its cursor, at least their fixed charges, and a wait on the volume's clock, and the pinned round
+/// recording nothing, since a pinned view never reads the journal.
+#[test]
+fn each_current_round_records_what_waited_for_it_and_a_pinned_round_records_nothing() {
+  fn bridge<'v>(
+    vol: &'v mut Volume,
+    store: &'v mut Store,
+    handles: &'v mut Slab<u64>,
+  ) -> VolumeBridge<'v> {
+    VolumeBridge::attached(VolumeId { bytes: [0; 16] }, vol, store, handles, None)
+  }
+  let mut store = store();
+  let mut vol = Volume::create(&mut store, config(5)).unwrap();
+  let mut handles = new_handle_store();
+  let cx = rw_cx();
+  let root = vol.root();
+  let cursor = bridge(&mut vol, &mut store, &mut handles).seen(&cx);
+  let a = vol.create_file(&mut store, root, "a", 0o644).unwrap();
+  vol.write(&mut store, a, 0, b"new").unwrap();
+  let waiting = vol.op_log().head_seq() - cursor.journal_seq;
+  assert!(
+    waiting >= 2,
+    "the create and the write were journaled: {waiting}"
+  );
+
+  let mut owed = Vec::new();
+  bridge(&mut vol, &mut store, &mut handles)
+    .invalidations(&cx, cursor, &mut owed)
+    .unwrap();
+  let measure = vol.op_log().measure();
+  assert_eq!(measure.rounds, 1, "one current round, one measurement");
+  assert_eq!(measure.largest.records, waiting);
+  let fixed = u64::try_from(std::mem::size_of::<slates_vfs::journal::OpRecord>()).unwrap();
+  assert!(measure.largest.bytes >= waiting * fixed, "{measure:?}");
+  assert!(
+    measure.largest.lag_ns > 0,
+    "the volume's clock moved between the appends and the round: {measure:?}"
+  );
+  assert!(!measure.largest.overrun);
+
+  let mut attachments = Attachments::new();
+  let pinned_id = attachments
+    .attach(
+      VolumeId { bytes: [0; 16] },
+      View::Version(1),
+      Principal::Uid { uid: 0 },
+      Rights {
+        read: true,
+        write: false,
+      },
+    )
+    .unwrap();
+  attachments.set_coherence(pinned_id, slates_bridge_core::CacheCoherence::Invalidated);
+  let pinned = attachments.context(pinned_id).unwrap();
+  bridge(&mut vol, &mut store, &mut handles)
+    .invalidations(&pinned, cursor, &mut owed)
+    .unwrap();
+  assert_eq!(
+    vol.op_log().measure().rounds,
+    1,
+    "a pinned view's round records nothing"
+  );
+}
+
 /// A watcher hint on a base directory (an outsider replaced a file beneath it) owes the transport
 /// an expire-only invalidation for every live entry the kernel may hold under that directory and
 /// an inode invalidation for each, plus the directory's own; the next lookup then re-lists (the

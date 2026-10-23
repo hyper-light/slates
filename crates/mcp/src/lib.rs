@@ -1524,6 +1524,20 @@ pub fn status_json(r: &StatusReport) -> Value {
       "mirror_age_ns": r.placed.mirror_age_ns,
     },
     "transports": transport_report_json(&r.transports),
+    "journal": {
+      "budget_bytes": r.journal.budget_bytes,
+      "retained_bytes": r.journal.retained_bytes,
+      "retained_records": r.journal.retained_records,
+      "mean_record_bytes": r.journal.mean_record_bytes,
+      "appended": r.journal.appended,
+      "dropped": r.journal.dropped,
+      "rounds": r.journal.rounds,
+      "overruns": r.journal.overruns,
+      "largest_records": r.journal.largest_records,
+      "largest_bytes": r.journal.largest_bytes,
+      "largest_lag_ns": r.journal.largest_lag_ns,
+      "longest_lag_ns": r.journal.longest_lag_ns,
+    },
   })
 }
 

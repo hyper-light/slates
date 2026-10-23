@@ -4460,6 +4460,79 @@ fn the_read_only_mount_refuses_writes_and_reads(instance: &str, id: &str, path: 
   assert_eq!(code, 0, "{err}");
 }
 
+/// Shape: the files written through the first mount in the journal status test — enough that the second mount's rounds
+/// find records waiting, few enough to stay far inside any budget.
+#[cfg(target_os = "linux")]
+const JOURNAL_STATUS_FILES: usize = 8;
+
+/// The leading number of a status line's value (`3 (overruns 0)`, `5 records, 640 bytes, …`); 0 when there is none.
+#[cfg(target_os = "linux")]
+fn leading_number(value: &str) -> u64 {
+  value
+    .split_whitespace()
+    .next()
+    .and_then(|token| token.parse().ok())
+    .unwrap_or(0)
+}
+
+/// §4.5 (the journal budget's inputs: mutation rate × lag × record size, measured as what each round found waiting): do
+/// write files through one FUSE mount of a volume while a second mount of it serves its rounds, then ask `slates
+/// status`; expect the journal report to show the volume's budget, rounds measured, and a largest backlog of at least
+/// one record — what the second mount's rounds found waiting after the first mount's writes (a mount's own changes are
+/// behind its cursor, so only another path's show as backlog).
+#[cfg(target_os = "linux")]
+#[test]
+fn status_reports_what_a_mounts_rounds_found_waiting_in_the_journal() {
+  if !linux_fuse_mount_runs() {
+    return;
+  }
+  let instance = format!("cli-journal-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "journalvol", "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let watcher = MountPoint {
+    path: fresh_mount_point(),
+  };
+  fuse_mount_and_check(&instance, &id, &watcher.path);
+  let writer = MountPoint {
+    path: fresh_mount_point(),
+  };
+  let (code, _, err) = run(&instance, &["mount", &id, &writer.path]);
+  assert_eq!(code, 0, "the second mount: {err}");
+  for file in 0..JOURNAL_STATUS_FILES {
+    let path = format!("{}/f{file}.txt", writer.path);
+    assert!(
+      write_with_the_shell(&path, "x").status.success(),
+      "a write through the second mount"
+    );
+  }
+  let mut last = String::new();
+  let measured = wait_for(|| {
+    let (code, out, _) = run(&instance, &["status", &id]);
+    let shown = code == 0
+      && leading_number(&value_of(&out, "journal_rounds")) > 0
+      && leading_number(&value_of(&out, "journal_largest_backlog")) > 0;
+    last = out;
+    shown
+  });
+  assert!(
+    measured,
+    "the watching mount's rounds measured a backlog: {last}"
+  );
+  assert!(
+    leading_number(&value_of(&last, "journal_budget_bytes")) > 0,
+    "the journal's budget is reported: {last}"
+  );
+  for point in [&writer.path, &watcher.path] {
+    let (code, _, err) = unmount_through_the_cli(&instance, point);
+    assert_eq!(code, 0, "{err}");
+  }
+}
+
 /// The kernel's mount table entry at `path` (Linux `mountinfo`): its filesystem type and source.
 #[cfg(target_os = "linux")]
 fn mountinfo_at(path: &str) -> Option<(String, String)> {

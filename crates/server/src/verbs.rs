@@ -6896,6 +6896,7 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
     return refused(Refusal::NotFound);
   };
   let accounting = slot.volume.accounting();
+  let journal = journal_report(&slot.volume);
   let (drifted, watcher) = match slot.host.as_mut() {
     Some(host) => match slot.volume.with_host(host).status(&mut state.store) {
       Ok(s) => (
@@ -6940,7 +6941,29 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
       transports: Box::new(transports),
       mounts,
       mounts_elided,
+      journal,
     }),
+  }
+}
+
+/// A volume's journal for its status (§4.5): its budget and retention, and what its consuming rounds found waiting.
+fn journal_report(volume: &Volume) -> slates_ipc::protocol::JournalReport {
+  let log = volume.op_log();
+  let measure = log.measure();
+  let wide = |count: usize| u64::try_from(count).unwrap_or(u64::MAX);
+  slates_ipc::protocol::JournalReport {
+    budget_bytes: wide(log.budget_bytes()),
+    retained_bytes: wide(log.retained_bytes()),
+    retained_records: wide(log.len()),
+    mean_record_bytes: log.mean_record_bytes(),
+    appended: log.head_seq(),
+    dropped: log.dropped(),
+    rounds: measure.rounds,
+    overruns: measure.overruns,
+    largest_records: measure.largest.records,
+    largest_bytes: measure.largest.bytes,
+    largest_lag_ns: measure.largest.lag_ns,
+    longest_lag_ns: measure.longest_lag_ns,
   }
 }
 

@@ -1361,6 +1361,9 @@ impl Bridge for VolumeBridge<'_> {
     //    (`docs/bugs/2026-10-22-a-mount-that-falls-behind-the-journal-never-hears-of-the-changes-it-missed.md`).
     //    The transport is told that anything it holds may be stale instead, and resumes from the head.
     if matches!(cx.view, View::Current) {
+      // What waited for this round is the journal budget's input (§4.5: mutation rate × lag × record size, measured as
+      // the backlog itself). This is the journal's only consuming round in production.
+      self.volume.note_journal_round(cursor.journal_seq);
       let log = self.volume.op_log();
       if cursor.journal_seq.saturating_add(1) < log.oldest_seq() {
         out.push(Invalidation::Everything);

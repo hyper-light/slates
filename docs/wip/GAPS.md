@@ -10750,7 +10750,12 @@ stale page back, and the other write's bytes on it reverted: measured 4,095 of 4
   "journal budget = mutation rate × max subscriber lag × record size"; the code takes a fixed 10‰ of the quota
   (`JOURNAL_SHARE_PERMILLE`, `crates/server/src/verbs.rs`). Its doc and its `derived!` anchor both cite a ratification
   in §5 of this ledger that §5 does not contain. Found 2026-10-22 while sizing the write-back rule's bound on it (about
-  850 records, and so 850 ranges a file, for an 8 MiB volume).
+  850 records, and so 850 ranges a file, for an 8 MiB volume). **Measured since 2026-10-23:** every mount round now
+  records what waited for it (`OpLog::note_round`): the records after its cursor (exact after an overrun, since
+  sequences are contiguous), their charge, and the oldest one's wait. That is the formula's product measured
+  directly, by Little's law. `slates status` reports the volume's budget beside the largest backlog and longest lag
+  any round found. A mount's own changes are behind its cursor, so only another path's changes (the SDK, NFS, a
+  second mount) wait for it. Deriving the budget from the measurement is the next step.
 - **A restored mount's files — fixed 2026-10-22 (A-147).** A mount taken over across a daemon restart (A-61) has files
   whose writable opens predate the daemon. They had no byte states, so their write-backs were judged from the mount's
   start against every record since. Worse than the `EIO` this entry recorded: a store made after a re-fetch of bytes
