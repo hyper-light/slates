@@ -367,6 +367,8 @@ pub(crate) enum StoreVerb {
   Land,
   /// `destroy_snapshot`, `read_base`, `rewitness`, `pin`: the volume-core and base-plane verbs.
   Base,
+  /// `image_build`, `image_merge`: a disk image of a snapshot, and its merge into a clone (A-160).
+  Image,
 }
 
 /// The typed refusal a store-backed `verb` gets on a merge volume, or `None` for a plain volume
@@ -394,6 +396,9 @@ pub(crate) fn refuse_store_verb(
     },
     (_, StoreVerb::Base) => Refusal::Unsupported {
       feature: "the volume-core and base-plane verbs on a merge volume".to_owned(),
+    },
+    (_, StoreVerb::Image) => Refusal::Unsupported {
+      feature: "a disk image of a merge volume".to_owned(),
     },
   };
   Some(refused(refusal))

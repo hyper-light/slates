@@ -9846,7 +9846,7 @@ Three things worth keeping:
    and the host's ECC/TRR floor, so this is a bounded gap, not a hole — but the right fix is for the opt-in to
    wake the loop rather than for the loop to poll. **Owed.**
 3. **The slice is sized by the copy rate, not the hash rate.** A shift copies a content block, so
-   `dax_shift_slice_bytes` derives from the profile's measured memcpy throughput at its largest copy size, beside
+   `copy_slice_bytes` derives from the profile's measured memcpy throughput at its largest copy size, beside
    `archive_slice_bytes`'s BLAKE3 derivation. Using the hash rate would have been the wrong question asked of the
    right-looking number; `DaemonConfig` now stores `memcpy_bytes_per_second` for it.
 
@@ -10951,6 +10951,27 @@ without a user namespace, which needs root.
     outside it. A corrupt image also found an e2fsprogs bug: e2fsck 1.47.4 deadlocks on its own cache lock in pass 5
     when it would write a fix to an image opened read-only. So the differential bounds every e2fsprogs run
     (`timeout --kill-after`).
+
+    **The daemon's `image build` and `image merge` are built (2026-10-24, A-160).** Both run as deferred, sliced tasks.
+    The new volume, its publication and the completion record commit as one atom. An image volume pins its snapshot
+    through `BaseRecord::Image`, counted at recovery. The merge keeps the identity of every node the build wrote
+    (written number, build generation), so a renamed file is renamed and unchanged chunks stay shared. Evidence:
+    - the vfs merge oracle, 2,000 cases each;
+    - the client's by-use tests on macOS arm64 and Linux x86_64;
+    - the recovery test of the pin, red-checked;
+    - the CLI test through FUSE mounts on the box (e2fsck before and after `debugfs -w` edits, then merge), green 3 of
+      3.
+
+    The oracle found a removal-order bug in the new merge (a hard link in a later directory), fixed failing-seed-first.
+    Still owed: the real Firecracker run (a microVM boots, reads and writes the image, and its changes merge) and the
+    design and transport docs.
+  - **Open sibling (found 2026-10-24 by reading `reconcile_unpublished_effects`, not yet reproduced): a clone whose
+    transaction fails after it recorded its volume keeps its pin.**
+    When `Db::commit` fails after a clone verb recorded its volume (the log full or unpublishable), the rollback
+    removes the record and `reconcile_unpublished_effects` tears down the orphaned slot. Nothing releases the pin
+    `clone_of` put on the origin's snapshot, so that snapshot's destroy is refused `Pinned` until the next restart's
+    reconciliation. An image merge's clone shares the path. The fix: the reconciliation unpins the origin of every
+    orphan that carries one (the lineage the rolled-back record named must be read before the rollback).
 
   AC-3.3's residual applies to a guest as to any map: a store into bytes another path is changing, made between the
   page's fetch and the change's delivery, is kept back.

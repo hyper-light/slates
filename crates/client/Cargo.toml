@@ -35,6 +35,9 @@ rustix = { workspace = true }
 libc = { workspace = true }
 slates-mem = { workspace = true }
 slates-db = { workspace = true }
+# The image tests read a built image back and write a guest's edits into it (A-160), sized by the store's chunk.
+slates-image = { workspace = true }
+slates-vfs = { workspace = true }
 
 [lints]
 workspace = true

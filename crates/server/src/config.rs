@@ -48,10 +48,11 @@ const PERMILLE: u64 = 1000;
 /// so a seal in progress never takes the whole step from the clients (the share a cooperative destroy
 /// takes, `verbs::DESTROY_SLICE_PERMILLE`).
 const ARCHIVE_SLICE_PERMILLE: u64 = 500;
-/// Shape: the periodic DAX shift's slice as a share of the shard's step budget, parts per thousand — the same
-/// half the archive walk takes, and for the same reason: a shift in progress never takes the whole step from the
-/// clients. Both copy content under the shard's own quantum, so they are sized alike.
-const DAX_SHIFT_SLICE_PERMILLE: u64 = 500;
+/// Shape: a slice of copy-bound work (§4.6 L2's periodic DAX shift; an image's build and merge, A-160) as a share of
+/// the shard's step budget, parts per thousand — the same half the archive walk takes, and for the same reason: work
+/// in progress never takes the whole step from the clients. All of it moves content under the shard's own quantum,
+/// so it is sized alike.
+const COPY_SLICE_PERMILLE: u64 = 500;
 /// How often §4.6 L2's moving target shifts a writable DAX window. §4.6 states the interval directly — "the
 /// modern window is 16–32 ms and RowPress leaks across refresh windows, so the migration interval is derived
 /// from the lowest hammer threshold, not the classic 64 ms". Slower than the window is a shift an attacker can
@@ -291,7 +292,7 @@ pub struct DaemonConfig {
   pub blake3_bytes_per_second: u64,
   /// Measured: the machine's memcpy throughput at the largest copy size the boot profile measured, bytes per
   /// second. A §4.6 L2 shift is a block copy, so this is what sizes its slice against the shard's live step
-  /// quantum ([`DaemonConfig::dax_shift_slice_bytes`]) — the hash rate would be the wrong question for it.
+  /// quantum ([`DaemonConfig::copy_slice_bytes`]) — the hash rate would be the wrong question for it.
   pub memcpy_bytes_per_second: u64,
   /// Derived: the compress-or-not cost model each sealed chunk is stored under (§4.11, D-17): the boot
   /// profile's measured codec points (LZ4 and each zstd level's compress and decompress throughput and
@@ -618,12 +619,12 @@ impl DaemonConfig {
       ["memcpy"]
     );
     derivations.push(note("memcpy_bytes_per_second", &memcpy_bytes_per_second));
-    let dax_shift_slice_bytes: Derived<u64> = derived!(
-      dax_shift_slice_bytes(memcpy_bytes_per_second.get(), runtime.step_budget_ns),
-      "memcpy_bytes_per_second × step_quantum_ns / 1e9 × DAX_SHIFT_SLICE_PERMILLE / 1000",
+    let copy_slice_bytes: Derived<u64> = derived!(
+      copy_slice_bytes(memcpy_bytes_per_second.get(), runtime.step_budget_ns),
+      "memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000",
       ["memcpy", "rt.step_budget_ns"]
     );
-    derivations.push(note("dax_shift_slice_bytes", &dax_shift_slice_bytes));
+    derivations.push(note("copy_slice_bytes", &copy_slice_bytes));
     let codec = codec_policy(profile);
     derivations.push(format!(
       "codec = lz4 {}, zstd levels {:?}, byte worth {} scaled ns: the profile's measured codec points, a \
@@ -1057,12 +1058,12 @@ fn archive_slice_bytes(blake3_bytes_per_second: u64, quantum_ns: u64) -> u64 {
     / PERMILLE
 }
 
-/// The content bytes one slice of §4.6 L2's periodic shift may copy within `quantum_ns`: half the quantum at the
-/// machine's measured memcpy rate, so a shard with many mapped windows shifts them in bounded slices (§4.3) and
-/// keeps serving between them.
-fn dax_shift_slice_bytes(memcpy_bytes_per_second: u64, quantum_ns: u64) -> u64 {
+/// The content bytes one slice of copy-bound work may move within `quantum_ns`: half the quantum at the machine's
+/// measured memcpy rate. A shard with many mapped windows shifts them (§4.6 L2), and an image is built or merged
+/// (A-160), in bounded slices (§4.3), the shard serving between them.
+fn copy_slice_bytes(memcpy_bytes_per_second: u64, quantum_ns: u64) -> u64 {
   (memcpy_bytes_per_second.saturating_mul(quantum_ns) / NANOS_PER_SECOND)
-    .saturating_mul(DAX_SHIFT_SLICE_PERMILLE)
+    .saturating_mul(COPY_SLICE_PERMILLE)
     / PERMILLE
 }
 
@@ -1080,10 +1081,10 @@ impl DaemonConfig {
     archive_slice_bytes(self.blake3_bytes_per_second, self.step_quantum_ns())
   }
 
-  /// The content bytes one slice of §4.6 L2's periodic shift may copy on the calling shard now: half its live
-  /// step quantum at the machine's measured memcpy rate.
-  pub fn dax_shift_slice_bytes(&self) -> u64 {
-    dax_shift_slice_bytes(self.memcpy_bytes_per_second, self.step_quantum_ns())
+  /// The content bytes one slice of copy-bound work (§4.6 L2's periodic shift, an image's build or merge) may move on
+  /// the calling shard now: half its live step quantum at the machine's measured memcpy rate.
+  pub fn copy_slice_bytes(&self) -> u64 {
+    copy_slice_bytes(self.memcpy_bytes_per_second, self.step_quantum_ns())
   }
 
   /// This configuration with `fault` injected into a shard's start (the boot tests).

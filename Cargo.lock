@@ -1445,10 +1445,12 @@ dependencies = [
  "rustix",
  "slates-anchor",
  "slates-db",
+ "slates-image",
  "slates-ipc",
  "slates-machine",
  "slates-mem",
  "slates-server",
+ "slates-vfs",
  "slates-wire",
 ]
 
@@ -1651,6 +1653,7 @@ dependencies = [
  "slates-cluster",
  "slates-conformance",
  "slates-db",
+ "slates-image",
  "slates-ipc",
  "slates-land",
  "slates-machine",

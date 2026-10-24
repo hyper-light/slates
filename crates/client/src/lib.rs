@@ -34,8 +34,8 @@ pub mod driver;
 pub mod error;
 
 pub use client::{
-  Advanced, Attachment, Client, Connecting, CreateSpec, Deadlines, Digest, LAST_SEQUENCE, Landing,
-  Rebased, Session, Submitted, defers_reply,
+  Advanced, Attachment, Client, Connecting, CreateSpec, Deadlines, Digest, ImageBuilt,
+  LAST_SEQUENCE, Landing, Rebased, Session, Submitted, defers_reply,
 };
 pub use error::ClientError;
 /// The consumer capability and its delivery (§4.13): what `enroll` returns once, what a harness hands a
@@ -46,12 +46,12 @@ pub use slates_ipc::protocol::{
   CauseRecord, ChokepointReport, Conformance, DaemonReport, DeleteWhileOpen, DetectorPeerReport,
   DetectorPoolReport, DetectorRelayReport, DirEntry, EntryKind, Established, Filter, FleetReport,
   GrantScope, GrantSummary, GreenBase, GroupReport, HostAnswer, HostMountEvidence, HostPathReason,
-  Intent, JournalReport, KernelCache, LandingDegradation, LandingDurability, LandingOutcome,
-  LandingSummary, NamePolicy, OciBinding, PlacedState, Principal, ReadAt, ReadWritePolicy, Refusal,
-  RefusalCount, Residency, RetirementReport, Rights, Scope, SessionReport, ShardReport,
-  SharingSemantics, Signal, SizeClass, SnapshotBoundary, SnapshotCoverage, SnapshotId, SpanRecord,
-  StatusReport, TakeoverReport, TargetPathConstraint, TelemetryReport, TransportReport,
-  UnsupportedReason, VolumeId, VolumeSummary, WorkOp,
+  IMAGE_FILE, ImageMergeReport, Intent, JournalReport, KernelCache, LandingDegradation,
+  LandingDurability, LandingOutcome, LandingSummary, NamePolicy, OciBinding, PlacedState,
+  Principal, ReadAt, ReadWritePolicy, Refusal, RefusalCount, Residency, RetirementReport, Rights,
+  Scope, SessionReport, ShardReport, SharingSemantics, Signal, SizeClass, SnapshotBoundary,
+  SnapshotCoverage, SnapshotId, SpanRecord, StatusReport, TakeoverReport, TargetPathConstraint,
+  TelemetryReport, TransportReport, UnsupportedReason, VolumeId, VolumeSummary, WorkOp,
 };
 /// The request id [`Client::begin`] returns and [`Client::poll_reply`] matches on — the async
 /// caller holds it between the send and the reply the completion fd signals (§4.7, D-19).

@@ -9,8 +9,8 @@ use std::time::Instant;
 use slates_ipc::delivery::{Capability, Delivered, DeliveryFault, attest_proof};
 use slates_ipc::protocol::{
   AttachRequest, AttachmentCapability, AuditEntry, DaemonReport, Direction, Established, Filter,
-  GrantScope, GrantSummary, GreenBase, Intent, LandingOutcome, LandingSummary, MergeWindow,
-  NamePolicy, Principal, ReadAt, ReplyBody, RequestBody, Rights, Scope, SizeClass,
+  GrantScope, GrantSummary, GreenBase, ImageMergeReport, Intent, LandingOutcome, LandingSummary,
+  MergeWindow, NamePolicy, Principal, ReadAt, ReplyBody, RequestBody, Rights, Scope, SizeClass,
   SnapshotCoverage, SnapshotId, StatusReport, TelemetryReport, VolumeId, VolumeSummary, WorkOp,
   pack, unpack,
 };
@@ -40,6 +40,19 @@ pub enum Rebased {
   Rebased(u64),
   /// The pending operations conflict; the windows to resolve, then rebase again.
   Conflict(Vec<MergeWindow>),
+}
+
+/// A snapshot's disk image, built (§4.6, A-160).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageBuilt {
+  /// The image volume, whose root holds the image file.
+  pub id: VolumeId,
+  /// The image file's length in bytes.
+  pub image_bytes: u64,
+  /// The file system's blocks in use.
+  pub blocks_used: u64,
+  /// Its inodes in use.
+  pub inodes_used: u64,
 }
 
 /// The client's deadlines, every one a derivation.
@@ -82,6 +95,9 @@ pub fn defers_reply(body: &RequestBody) -> bool {
     || matches!(
       body,
       RequestBody::Land { grant: Some(_), .. }
+        // An image's build and merge run in slices on the owner shard, as long as the image takes (A-160).
+        | RequestBody::ImageBuild { .. }
+        | RequestBody::ImageMerge { .. }
         | RequestBody::Attach {
           form: AttachRequest::FuseMount { .. }
             | AttachRequest::ScopedFuseMount { .. }
@@ -2566,6 +2582,57 @@ impl Client {
     })? {
       ReplyBody::Cloned { id } => Ok(id),
       _ => Err(ClientError::UnexpectedReply { verb: "clone" }),
+    }
+  }
+
+  /// Builds `snapshot` of `volume` as a disk image (§4.6, A-160): a new volume `name` whose root holds
+  /// [`slates_ipc::protocol::IMAGE_FILE`], an ext2 file system of `capacity` bytes, for a VMM that shares no folder
+  /// with its guest to attach as a block device. Waits for the build, which the daemon runs in slices.
+  pub fn image_build(
+    &mut self,
+    volume: VolumeId,
+    snapshot: SnapshotId,
+    name: &str,
+    capacity: u64,
+  ) -> Result<ImageBuilt, ClientError> {
+    match self.call(&RequestBody::ImageBuild {
+      volume,
+      snapshot,
+      name: name.to_owned(),
+      capacity,
+    })? {
+      ReplyBody::ImageBuilt {
+        id,
+        image_bytes,
+        blocks_used,
+        inodes_used,
+      } => Ok(ImageBuilt {
+        id,
+        image_bytes,
+        blocks_used,
+        inodes_used,
+      }),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "image_build",
+      }),
+    }
+  }
+
+  /// Merges image volume `image`'s image into a new clone `name` of the snapshot it was built from (§4.6, A-160):
+  /// the clone's id and what the merge did. Waits for the merge, which the daemon runs in slices.
+  pub fn image_merge(
+    &mut self,
+    image: VolumeId,
+    name: &str,
+  ) -> Result<(VolumeId, ImageMergeReport), ClientError> {
+    match self.call(&RequestBody::ImageMerge {
+      image,
+      name: name.to_owned(),
+    })? {
+      ReplyBody::ImageMerged { id, report } => Ok((id, report)),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "image_merge",
+      }),
     }
   }
 

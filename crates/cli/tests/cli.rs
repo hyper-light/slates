@@ -9004,3 +9004,234 @@ fn a_full_profile_daemon_derives_an_archive_policy_with_codec_candidates() {
   );
   drop(anchor);
 }
+
+// ------------------------------------------------ a volume's disk image (A-160)
+
+/// Shape: the wall budget of one e2fsprogs run and the grace before it is killed (seconds). e2fsck 1.47.4 deadlocks
+/// when it would write a fix to an image opened read-only, and ignores the `SIGTERM` meant to stop it (A-160), so every
+/// run is bounded by `timeout --kill-after`.
+#[cfg(target_os = "linux")]
+const E2FS_BUDGET: (&str, &str) = ("120", "10");
+
+/// `program args` under [`E2FS_BUDGET`]: its exit code, stdout and stderr.
+#[cfg(target_os = "linux")]
+fn e2fs(program: &str, args: &[&str]) -> (i32, Vec<u8>, String) {
+  let output = Command::new("timeout")
+    .args(["--kill-after", E2FS_BUDGET.1, E2FS_BUDGET.0, program])
+    .args(args)
+    .output()
+    .unwrap();
+  (
+    output.status.code().unwrap_or(-1),
+    output.stdout,
+    String::from_utf8_lossy(&output.stderr).into_owned(),
+  )
+}
+
+/// Whether e2fsprogs' `e2fsck` and `debugfs` are on this host; a loud skip otherwise.
+#[cfg(target_os = "linux")]
+fn e2fsprogs_present() -> bool {
+  let present = Command::new("sh")
+    .args(["-c", "command -v e2fsck && command -v debugfs"])
+    .output()
+    .map(|o| o.status.success())
+    .unwrap_or(false);
+  if !present {
+    eprintln!("SKIP: no e2fsck or debugfs on this host; the image is checked by e2fsprogs");
+  }
+  present
+}
+
+/// A guest's change to an image, made by `debugfs -w` on the image file through its mount.
+#[cfg(target_os = "linux")]
+fn debugfs_write(image: &str, request: &str) {
+  let (code, out, err) = e2fs("debugfs", &["-w", "-R", request, image]);
+  assert_eq!(
+    code,
+    0,
+    "debugfs -w -R {request:?}: {}{err}",
+    String::from_utf8_lossy(&out)
+  );
+  assert!(
+    !err.lines().skip(1).any(|line| !line.trim().is_empty()),
+    "debugfs -w -R {request:?} complained: {err}"
+  );
+}
+
+/// `e2fsck -fn` on `image`, which must pass.
+#[cfg(target_os = "linux")]
+fn e2fsck_passes(image: &str, when: &str) {
+  let (code, out, err) = e2fs("e2fsck", &["-fn", image]);
+  assert_eq!(
+    code,
+    0,
+    "e2fsck -fn {when}: {}{err}",
+    String::from_utf8_lossy(&out)
+  );
+}
+
+/// The image test's source files: a small file, a pattern three chunks and more long, another small file, and one the
+/// guest deletes.
+#[cfg(target_os = "linux")]
+fn image_source_files(chunk: usize) -> Vec<(&'static str, Vec<u8>)> {
+  let large: Vec<u8> = (0..3 * chunk + 1_234)
+    .map(|at| u8::try_from(at % 251).unwrap())
+    .collect();
+  vec![
+    ("docs/a.txt", b"the first file".to_vec()),
+    ("docs/sub/b.bin", large),
+    ("c.txt", b"see".to_vec()),
+    ("gone.txt", b"deleted by the guest".to_vec()),
+  ]
+}
+
+/// Writes `files` into the volume mounted at `mount`, under `docs/` and `docs/sub/`.
+#[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)] // the test's own calls through the slates mount: RAM, not disk
+fn write_through_the_mount(mount: &str, files: &[(&str, Vec<u8>)]) {
+  for directory in ["docs", "docs/sub"] {
+    std::fs::create_dir(format!("{mount}/{directory}")).unwrap();
+  }
+  for (path, bytes) in files {
+    std::fs::write(format!("{mount}/{path}"), bytes).unwrap();
+  }
+}
+
+/// Writes `bytes` to `path` in a slates mount.
+#[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)] // the test's own call through the slates mount: RAM, not disk
+fn write_one_through_the_mount(path: &str, bytes: &[u8]) {
+  std::fs::write(path, bytes).unwrap();
+}
+
+/// The built image passes `e2fsck -fn`, and `debugfs` reads each of `files` from it as written.
+#[cfg(target_os = "linux")]
+fn the_built_image_holds(image_file: &str, files: &[(&str, Vec<u8>)]) {
+  e2fsck_passes(image_file, "of the built image");
+  for (path, bytes) in files {
+    let (code, out, err) = e2fs("debugfs", &["-R", &format!("cat /{path}"), image_file]);
+    assert_eq!(code, 0, "debugfs cat /{path}: {err}");
+    assert!(out == *bytes, "/{path} reads from the image as written");
+  }
+}
+
+/// A guest's edits with `debugfs -w` on the image through its mount: a rename (a link and an unlink, neither touching
+/// the link count), block 1 of `b.bin` rewritten in place (`zap_block`), a new file copied from `fresh`, a deletion,
+/// and a new directory; the image passes `e2fsck -fn` after them.
+///
+/// The order matters because debugfs is not a kernel. It gives the inode it allocates the first free number and leaves
+/// its generation zero, where a kernel draws a generation of its own (`ext2_new_inode`, A-160). A file made right after
+/// a deletion takes the freed number with the build's generation, and the merge takes it for the deleted node, renamed
+/// and rewritten. That is harmless, since the clone still ends as the image holds it (2026-10-24, the first run of this
+/// test: `moved 2, removed 0`), but it is not what this test means to count. So the new file is made first, at a fresh
+/// number. The directory made after the deletion takes the freed number and is a directory, which the deleted file was
+/// not, so it is new as well.
+#[cfg(target_os = "linux")]
+fn a_guest_edits(image_file: &str, fresh: &str) {
+  debugfs_write(image_file, "link /docs/a.txt /docs/renamed.txt");
+  debugfs_write(image_file, "unlink /docs/a.txt");
+  debugfs_write(image_file, "zap_block -f /docs/sub/b.bin -p 0x23 1");
+  debugfs_write(image_file, &format!("write {fresh} /new.txt"));
+  debugfs_write(image_file, "rm /gone.txt");
+  debugfs_write(image_file, "mkdir /made");
+  e2fsck_passes(image_file, "after the guest's edits");
+}
+
+/// The merged clone, read through its mount at `mount`, holds exactly the guest's edits of `files`.
+#[cfg(target_os = "linux")]
+fn the_clone_holds_the_edits(mount: &str, files: &[(&str, Vec<u8>)]) {
+  let at = |path: &str| format!("{mount}/{path}");
+  let mut rewritten = files[1].1.clone();
+  rewritten[4096..8192].fill(0x23);
+  assert_eq!(std::fs::read(at("docs/renamed.txt")).unwrap(), files[0].1);
+  assert!(std::fs::read(at("docs/sub/b.bin")).unwrap() == rewritten);
+  assert_eq!(std::fs::read(at("c.txt")).unwrap(), files[2].1);
+  assert_eq!(std::fs::read(at("new.txt")).unwrap(), b"made by the guest");
+  assert!(std::fs::metadata(at("made")).unwrap().is_dir());
+  for gone in ["docs/a.txt", "gone.txt", "fresh.src"] {
+    assert!(
+      std::fs::metadata(at(gone)).is_err(),
+      "{gone} is not in the clone"
+    );
+  }
+}
+
+/// A-160 by use, through the CLI and FUSE mounts (on the box: Linux 7.2.9, e2fsprogs 1.47.4). Do: write files into a
+/// volume through its mount, snapshot it and `slates image build` it; mount the image volume, run `e2fsck -fn` on the
+/// image file and `debugfs cat` every file; make a guest's edits with `debugfs -w` through the mount — a rename (a link
+/// and an unlink), one block of a file rewritten in place (`zap_block`), a deletion, a new file and a new directory —
+/// check the image again, and `slates image merge` it. Expect the image to pass e2fsck before and after the edits and
+/// to hold every file byte for byte; the merge to make two nodes, move one, remove one and write only the chunk the
+/// rewritten block lies in; and the clone, read through its own mount, to hold exactly the edited files.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_image_built_through_the_cli_passes_e2fsck_through_a_mount_and_merges_a_guests_edits() {
+  if !linux_fuse_mount_runs() || !e2fsprogs_present() {
+    return;
+  }
+  let instance = format!("cli-image-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let chunk = slates_vfs::content::chunk_bytes(rustix::param::page_size()).get();
+  let files = image_source_files(chunk);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "image-source", "--bounded", "64MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let source = value_of(&out, "id");
+  let source_mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  fuse_mount_and_check(&instance, &source, &source_mount.path);
+  write_through_the_mount(&source_mount.path, &files);
+  let (code, out, err) = run(&instance, &["volume", "snapshot", &source]);
+  assert_eq!(code, 0, "{err}");
+  let snapshot = value_of(&out, "snapshot");
+  // The guest's new file comes from a file made after the snapshot, so the image does not hold it.
+  let fresh = format!("{}/fresh.src", source_mount.path);
+  write_one_through_the_mount(&fresh, b"made by the guest");
+
+  let (code, out, err) = run(
+    &instance,
+    &[
+      "image",
+      "build",
+      &source,
+      &snapshot,
+      "image",
+      "--capacity",
+      "16MiB",
+    ],
+  );
+  assert_eq!(code, 0, "slates image build: {err}");
+  let image = value_of(&out, "id");
+  assert_eq!(value_of(&out, "file"), "image.ext2");
+  assert_eq!(value_of(&out, "image_bytes"), (16u64 << 20).to_string());
+  let image_mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  fuse_mount_and_check(&instance, &image, &image_mount.path);
+  let image_file = format!("{}/image.ext2", image_mount.path);
+  the_built_image_holds(&image_file, &files);
+  a_guest_edits(&image_file, &fresh);
+
+  let (code, out, err) = run(&instance, &["image", "merge", &image, "merged"]);
+  assert_eq!(code, 0, "slates image merge: {err}");
+  let count = |key: &str| value_of(&out, key).parse::<u64>().unwrap();
+  assert_eq!(
+    (count("created"), count("moved"), count("removed")),
+    (2, 1, 1),
+    "{out}"
+  );
+  // The new file's bytes and the one chunk the rewritten block lies in: the rest of the file stays shared.
+  assert_eq!(
+    count("bytes_written"),
+    u64::try_from(chunk).unwrap() + 17,
+    "{out}"
+  );
+  let merged_mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  fuse_mount_and_check(&instance, &value_of(&out, "id"), &merged_mount.path);
+  the_clone_holds_the_edits(&merged_mount.path, &files);
+}

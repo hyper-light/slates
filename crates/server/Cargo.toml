@@ -18,6 +18,8 @@ slates-mem = { workspace = true }
 slates-rt = { workspace = true }
 slates-wire = { workspace = true }
 slates-vfs = { workspace = true }
+# A volume's disk-image form (§4.6, A-160): the build and merge verbs plan and read ext2 images.
+slates-image = { workspace = true }
 slates-base = { workspace = true }
 slates-anchor = { workspace = true }
 slates-db = { workspace = true }

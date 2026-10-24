@@ -49,6 +49,8 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   base rewitness ID [PATH ...] [--json]
   base pin ID [PATH ...] [--json]
   land ID TARGET [--snapshot N] [--include P] [--exclude P] [--grant N] [--json]
+  image build ID SNAPSHOT NAME --capacity SIZE [--json]   a snapshot as an ext2 image file in a new volume
+  image merge IMAGE NAME [--json]                  merge an image's tree into a new clone of its snapshot
   grants [--json]
   grant LANDING MANIFEST [--session] [--term SECONDS] [--json]   approve a presented landing
   audit [--since N] [--json]
@@ -404,6 +406,24 @@ pub(crate) enum Verb {
     /// The paths, or the whole base.
     paths: Option<Vec<String>>,
   },
+  /// Build a snapshot's disk image (`image build`, A-160).
+  ImageBuild {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// The snapshot.
+    snapshot: slates_client::SnapshotId,
+    /// The image volume's name.
+    name: String,
+    /// The image's size in bytes.
+    capacity: u64,
+  },
+  /// Merge an image into a new clone of its snapshot (`image merge`, A-160).
+  ImageMerge {
+    /// The image volume.
+    image: slates_client::VolumeId,
+    /// The clone's name.
+    name: String,
+  },
   /// Land (`land`).
   Land {
     /// The volume.
@@ -553,6 +573,7 @@ pub(crate) struct OciCheck {
 
 /// Every flag that takes a value, across the verbs.
 const VALUES: &[&str] = &[
+  "--capacity",
   "--join-group",
   "--subtree",
   "--confirm",
@@ -1344,6 +1365,7 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
     }
     ["unmount"] => Err(ParseError::Missing("unmount PATH")),
     ["base", rest @ ..] => parse_base(&taken, rest),
+    ["image", rest @ ..] => parse_image(&taken, rest),
     ["land", id, target] => {
       taken.only(&Spec {
         values: &["--snapshot", "--grant", "--include", "--exclude"],
@@ -1637,6 +1659,47 @@ fn parse_volume(taken: &Taken, words: &[&str]) -> Result<Command, ParseError> {
       ))
     }
     [other, ..] => Err(ParseError::UnknownCommand(format!("volume {other}"))),
+  }
+}
+
+/// `image build ID SNAPSHOT NAME --capacity SIZE` and `image merge IMAGE NAME` (A-160).
+fn parse_image(taken: &Taken, words: &[&str]) -> Result<Command, ParseError> {
+  match words {
+    ["build", id, snap, name] => {
+      taken.only(&Spec {
+        values: &["--capacity"],
+        switches: &[],
+      })?;
+      let capacity = taken
+        .value("--capacity")
+        .ok_or(ParseError::Missing("--capacity SIZE"))?;
+      let capacity = parse_size(capacity).map_err(|reason| ParseError::BadValue {
+        what: "--capacity",
+        reason,
+      })?;
+      Ok(client(
+        taken,
+        Verb::ImageBuild {
+          volume: volume(id)?,
+          snapshot: snapshot(snap)?,
+          name: (*name).to_owned(),
+          capacity,
+        },
+      ))
+    }
+    ["build", ..] => Err(ParseError::Missing("ID SNAPSHOT NAME --capacity SIZE")),
+    ["merge", image, name] => {
+      taken.only(&NONE)?;
+      Ok(client(
+        taken,
+        Verb::ImageMerge {
+          image: volume(image)?,
+          name: (*name).to_owned(),
+        },
+      ))
+    }
+    ["merge", ..] => Err(ParseError::Missing("IMAGE NAME")),
+    _ => Err(ParseError::Missing("image (build | merge)")),
   }
 }
 

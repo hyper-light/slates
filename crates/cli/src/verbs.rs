@@ -825,6 +825,75 @@ fn emit_clone(
   Ok(())
 }
 
+/// `image build`: the image volume's id, the file a VMM is pointed at in it, and what the image holds, as text lines
+/// or JSON `{ "id", "file", "image_bytes", "blocks_used", "inodes_used" }`.
+fn emit_image_build(
+  client: &mut Client,
+  (volume, snapshot): (VolumeId, SnapshotId),
+  name: &str,
+  capacity: u64,
+  json: bool,
+) -> Result<(), ClientError> {
+  let built = client.image_build(volume, snapshot, name, capacity)?;
+  if json {
+    println!(
+      "{}",
+      serde_json::json!({
+        "id": volume_id_text(built.id),
+        "file": slates_client::IMAGE_FILE,
+        "image_bytes": built.image_bytes,
+        "blocks_used": built.blocks_used,
+        "inodes_used": built.inodes_used,
+      })
+    );
+  } else {
+    println!("id: {}", volume_id_text(built.id));
+    println!("file: {}", slates_client::IMAGE_FILE);
+    println!("image_bytes: {}", built.image_bytes);
+    println!("blocks_used: {}", built.blocks_used);
+    println!("inodes_used: {}", built.inodes_used);
+  }
+  Ok(())
+}
+
+/// `image merge`: the clone's id and what the merge did, as text lines or JSON `{ "id", "report": {...} }`.
+fn emit_image_merge(
+  client: &mut Client,
+  image: VolumeId,
+  name: &str,
+  json: bool,
+) -> Result<(), ClientError> {
+  let (id, report) = client.image_merge(image, name)?;
+  let counts = [
+    ("kept", report.kept),
+    ("created", report.created),
+    ("moved", report.moved),
+    ("linked", report.linked),
+    ("removed", report.removed),
+    ("names_removed", report.names_removed),
+    ("staged", report.staged),
+    ("bytes_compared", report.bytes_compared),
+    ("bytes_written", report.bytes_written),
+    ("attributes_set", report.attributes_set),
+  ];
+  if json {
+    let report: serde_json::Map<String, serde_json::Value> = counts
+      .iter()
+      .map(|(key, value)| ((*key).to_owned(), serde_json::Value::from(*value)))
+      .collect();
+    println!(
+      "{}",
+      serde_json::json!({ "id": volume_id_text(id), "report": report })
+    );
+  } else {
+    println!("id: {}", volume_id_text(id));
+    for (key, value) in counts {
+      println!("{key}: {value}");
+    }
+  }
+  Ok(())
+}
+
 /// `volume placed`: whether the scope is durable and the mirror's age, as two text lines or a JSON
 /// `{ "placed", "mirror_age_ns" }` (a null `mirror_age_ns` when there is no mirror).
 fn emit_placed(
@@ -1228,6 +1297,13 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
       snapshot,
       name,
     } => emit_clone(client, *volume, *snapshot, name, json)?,
+    Verb::ImageBuild {
+      volume,
+      snapshot,
+      name,
+      capacity,
+    } => emit_image_build(client, (*volume, *snapshot), name, *capacity, json)?,
+    Verb::ImageMerge { image, name } => emit_image_merge(client, *image, name, json)?,
     Verb::Resize { volume, size } => {
       client.resize(*volume, *size)?;
       emit_ok("ok", json);

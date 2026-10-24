@@ -272,6 +272,8 @@ slates mount ID PATH [--read-only] [--subtree DIR]
 slates unmount PATH
 slates export ID [--read-only] [--subtree DIR] [--uid UID]
 slates land ID TARGET [--snapshot N] [--include P] [--exclude P] [--grant N] [--json]
+slates image build ID SNAPSHOT NAME --capacity SIZE [--json]
+slates image merge IMAGE NAME [--json]
 slates grants [--json]
 slates grant LANDING MANIFEST [--session] [--term SECONDS] [--json]
 slates audit [--since N] [--json]
@@ -343,6 +345,22 @@ but its merge task: `edit`, a write `attach`, `volume snapshot` or `resize` on o
 the attached view never moves until `advance ATTACHMENT [VERSION]`, which prints the version now
 pinned and the paths it invalidated. `read VOLUME PATH` streams a file's raw bytes at the head,
 `--version N` at a green version, `--attachment A` at the version an attachment pins.
+
+A volume reaches a VMM that shares no folder with its guest (Firecracker) as a disk image (A-160).
+`slates image build ID SNAPSHOT NAME --capacity SIZE` renders the snapshot as an ext2 file system of
+`SIZE` bytes in a new volume `NAME`, as one file, `image.ext2`. It prints the image volume's `id`, its
+`file`, and the image's `image_bytes`, `blocks_used` and `inodes_used`. Mount the image volume and point
+the VMM's block device at `image.ext2`. The image carries names, kinds, permissions, owners, nanosecond
+times, symbolic links, hard links, FIFOs and sockets; it does not carry extended attributes or holes.
+The image volume pins its snapshot as a clone does: `volume destroy-snapshot` is refused until the image
+volume is destroyed. `slates image merge IMAGE NAME` reads the image as it is when the merge starts (an
+image the guest has not cleanly unmounted is refused). It makes a new clone `NAME` of the snapshot the
+image was built from hold the image's tree, and prints the clone's `id` and what the merge did: `kept`,
+`created`, `moved`, `linked`, `removed`, `names_removed`, `staged`, `bytes_compared`, `bytes_written`
+and `attributes_set`. A file the guest renamed keeps its identity in the clone, and an unchanged chunk
+stays shared. A name the volume cannot hold (not UTF-8), a device, or an image that is not ext2 as the
+build writes it is refused `ImageRefused`, naming why, and no clone is made. Both verbs run in slices on
+the volume's owner while the daemon serves, and wait for their result.
 
 A fleet whose deployment manifest declares a `durability` policy (`accepted_loss`, `coincident_failures`)
 refuses a volume create, clone, snapshot or merge submit with `DurabilityUnmet { coincident_loss,

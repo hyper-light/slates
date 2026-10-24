@@ -222,6 +222,15 @@ pub enum BaseRecord {
     /// The path.
     path: String,
   },
+  /// Nothing beneath: an image volume, holding the disk image of `volume`'s `snapshot` (§4.6, A-160). It pins the
+  /// snapshot, as a clone does, so the merge of its image can clone the snapshot it was built from; it shares no
+  /// record with it. Appended.
+  Image {
+    /// The volume imaged.
+    volume: VolumeId,
+    /// The snapshot imaged.
+    snapshot: SnapshotId,
+  },
 }
 
 /// The volume state machine (§4.4).

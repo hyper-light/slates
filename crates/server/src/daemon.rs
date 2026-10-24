@@ -3142,6 +3142,7 @@ fn init_shard(
     durability_shortfall,
     origin_anchor,
     landing: crate::landing::LandingState::default(),
+    image: crate::image::ImageState::default(),
     store,
     volumes: Slab::new(config.caps.segment_slots, config.caps.volumes),
     by_id: std::collections::BTreeMap::new(),
@@ -3624,7 +3625,7 @@ async fn dax_shift_loop() {
   }
 }
 
-/// One round of the periodic shift, in cooperative slices of `dax_shift_slice_bytes` with a yield between them,
+/// One round of the periodic shift, in cooperative slices of `copy_slice_bytes` with a yield between them,
 /// so a shard with many mapped windows keeps serving while they move (§4.3).
 ///
 /// The round takes one snapshot of each volume's live writable windows and works through *that*: a shift mints a
@@ -3655,7 +3656,7 @@ async fn shift_mapped_windows() {
     let mut at = 0usize;
     while at < due.len() {
       let turn = state::with_state(|s| {
-        let budget = s.config.dax_shift_slice_bytes().max(1);
+        let budget = s.config.copy_slice_bytes().max(1);
         let Ok(slot) = s.volumes.get_mut(handle) else {
           return None;
         };

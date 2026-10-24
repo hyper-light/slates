@@ -3103,7 +3103,7 @@ same-namespace host process is the first delivered case.
 >    asynchronous state in the device's most delicate path, bought for one guest fault per shift.
 >    **The trigger is built** (`daemon::dax_shift_loop`, 2026-10-19): once every hammer window — 16 ms, the lowest
 >    of §4.6's stated 16–32 ms range — the shard shifts every live writable DAX window onto a different physical
->    row of its tenant's sandbox, unconditionally, in cooperative slices of `dax_shift_slice_bytes` (half the
+>    row of its tenant's sandbox, unconditionally, in cooperative slices of `copy_slice_bytes` (half the
 >    shard's live step quantum at the machine's measured memcpy rate) with a yield between them. Unconditional is
 >    what the measurement affords: 242 ns per 4 KiB block, so a window moved every 16 ms costs under 0.01% of its
 >    own throughput and nothing has to *detect* a hammer first. The round takes one snapshot of each volume's
@@ -12026,7 +12026,13 @@ Applied in the same change to:
 - `crates/image` (new): `format.rs`, `tree.rs`, `layout.rs`, `write.rs`, `read.rs`, `error.rs`; the tests
   `round_trip.rs`, `layout.rs`, `hostile.rs`, `e2fsck.rs`;
 - the workspace manifest and `unsafe-budget.toml` (`slates-image = 0`);
-- GAPS (the owed item "Firecracker's disk-image form", now in progress).
+- GAPS (the owed item "Firecracker's disk-image form", now in progress);
+- (2026-10-24) `crates/vfs/src/image.rs` and `tests/image.rs`; `crates/server/src/image.rs`, the create and clone
+  verbs split into admission and recording (`verbs.rs`), `BaseRecord::Image` in `crates/db/src/catalog.rs`, the
+  pin reconciliation and the destroy's unpin; the protocol's `ImageBuild`, `ImageMerge`, `ImageBuilt`, `ImageMerged`
+  and `ImageRefused`; the client's `image_build` and `image_merge`; `slates image build` and `slates image merge`;
+  `docs/cli.md`; `DaemonConfig::copy_slice_bytes` (formerly `dax_shift_slice_bytes`, generalized to every
+  copy-bound slice).
 
 - **What it answers.** Firecracker shares no folder with its guest. It has no virtio-fs, only block and pmem devices
   backed by files (its v1.17.0 docs, read 2026-10-23), so a volume reaches a Firecracker guest only as an image file
@@ -12108,8 +12114,50 @@ Applied in the same change to:
   - **What the oracle found first:** the remove phase took nodes from the last walked down, and a file is numbered
     where it is first met. A hard link in a directory walked later was still there when that directory was removed,
     which was refused `NotEmpty`. The seed is kept in `image.proptest-regressions`, red before the fix and green after.
-- **Owed:** the daemon's `image build` and `image merge` verbs (sliced, deferred replies, durable records), and the
-  real Firecracker run.
+- **The daemon's verbs (2026-10-24; `crates/server/src/image.rs`).**
+  - `ImageBuild` makes a new volume whose root holds `image.ext2`, the snapshot's image. `ImageMerge` makes a new
+    clone of the snapshot an image volume was built from, holding the image's tree.
+  - Each verb checks the volume, the right (write, as a clone needs), the name and the snapshot at once. It then
+    defers its reply to a task of the volume's owner shard, as a granted landing does (AUD-29-03). The task steps the
+    work in slices of `copy_slice_bytes` (half the live step quantum at the measured memcpy rate), yielding between
+    them. A retry while it runs joins it.
+  - The new volume is outside the registry while it is made, so no client attaches a half-built image or a
+    half-merged clone. Its record, its publication and the request's completion record commit as one atom. A refusal,
+    or a task that ends early, discards the volume and gives back its credits and its pin.
+  - Pins: the image volume's catalog base, `BaseRecord::Image { volume, snapshot }`, pins the snapshot as a clone
+    pins its origin. Recovery counts it with the clones (`reconcile_clone_pins`), and the image volume's destroy
+    releases it. An image volume shares no record with its snapshot, so recovery rebuilds it as a scratch volume, not
+    a clone. The merge's clone carries a lineage edge, as every clone does.
+  - The merge reads the image file at a snapshot of the image volume taken when it starts, so a running guest cannot
+    change the image under it. The snapshot is recorded nowhere and destroyed when the merge ends; recovery trims
+    one a crash leaves. The image is trusted for identity only when its file system's UUID is the image volume's own
+    id, which the build gave it; any other image merges by names and bytes alone.
+  - The image volume takes the source's size class at the image's size, rounded up to whole chunks. A write is
+    charged its chunk window (§4.5), so a guest can fill every block; growing the file to the image's length costs
+    nothing until written.
+- **Evidence (2026-10-24).**
+  - `crates/client/tests/image.rs`, against a daemon in the test process, macOS arm64 (256 KiB chunks) and Linux
+    x86_64 (64 KiB chunks):
+    - an image is built, read back through the client as ext2 and found to hold every file;
+    - a guest's edits written into it (a rename, a chunk rewritten, a deletion, a new file at the freed inode number
+      under a new generation) merge with the report exact (7 kept, 1 made, 1 moved, 1 removed) and the bytes written
+      the new file's and the one changed chunk's;
+    - the refusals are typed and make no volume;
+    - the image volume pins its snapshot until it goes.
+  - `crates/server/tests/recovery.rs`: the pin survives a restart, and is red with image bases left out of the
+    reconciliation.
+  - `crates/cli/tests/cli.rs`, through FUSE mounts on the box (Linux 7.2.9, e2fsprogs 1.47.4), green 3 of 3:
+    - the daemon's image passes `e2fsck -fn` through the mount, and `debugfs` reads every file;
+    - `debugfs -w` edits through the mount (a rename, a block rewritten in place, a new file, a deletion, a new
+      directory) leave it passing `e2fsck`;
+    - `slates image merge` reports 2 made, 1 moved, 1 removed, with a chunk and 17 bytes written, and the clone's
+      mount holds exactly the edits.
+  - The first run of the CLI test found that debugfs leaves a new inode's generation zero. A file made right after a
+    deletion takes the freed number and is merged as the deleted file renamed and rewritten: harmless, since the clone
+    still holds the image's tree, and impossible under a kernel. The test makes its new file first.
+- **A sibling fixed on the way:** a clone refused for want of a fresh volume id discarded itself but kept its pin on
+  the origin's snapshot. The split clone verb releases the pin on every refusal (`publish_clone`).
+- **Owed:** the real Firecracker run.
 
 ### A-159 — The bootstrap header no longer carries the daemon's process id (accepted 2026-10-23)
 Applied in the same change to:

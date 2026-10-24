@@ -1806,6 +1806,63 @@ fn a_clone_pin_and_a_destroy_in_flight_reconcile_to_the_catalog_across_a_restart
   drop(segment);
 }
 
+/// A-160 (an image volume's pin across a restart): an image volume pins the snapshot it was built from through its
+/// catalog base, as a clone pins its origin. Do: build an image of a snapshot, restart the daemon, try to destroy the
+/// snapshot, read the image file, destroy the image volume and destroy the snapshot. Expect the recovered snapshot
+/// still pinned (`reconcile_clone_pins` counted the image volume's base), the image file recovered at its length, and
+/// the snapshot's destroy to succeed once the image volume is gone. Non-vacuous: without the image base among the
+/// counted pins the restart would have released the pin and the first destroy would succeed.
+#[test]
+fn an_image_volumes_pin_on_its_snapshot_reconciles_across_a_restart() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-image-pin-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let segment = anchor_segment("image-pin", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let kept = client.create(&scratch("kept")).unwrap();
+  let snapshot = client.snapshot(kept).unwrap();
+  let image_bytes = 1 << 20;
+  let built = client
+    .image_build(kept, snapshot, "kept-image", image_bytes)
+    .unwrap();
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  assert!(
+    matches!(
+      client.destroy_snapshot(kept, snapshot),
+      Err(ClientError::Refused(slates_ipc::protocol::Refusal::BadRequest { reason })) if reason == "Pinned"
+    ),
+    "the recovered snapshot is still pinned by the recovered image volume: {:?}",
+    client.destroy_snapshot(kept, snapshot)
+  );
+  let image = client
+    .read(
+      built.id,
+      &format!("/{}", slates_client::IMAGE_FILE),
+      slates_client::ReadAt::Head,
+    )
+    .unwrap();
+  assert_eq!(u64::try_from(image.len()).unwrap(), image_bytes);
+  client.destroy(built.id).unwrap();
+  let started = Instant::now();
+  loop {
+    match client.destroy_snapshot(kept, snapshot) {
+      Ok(()) => break,
+      Err(error) => assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the image volume's destroy releases its pin: {error}"
+      ),
+    }
+  }
+  second.stop();
+  drop(segment);
+}
+
 /// Rolls a partition's log ring back to just past the one record that begins at `from_tail`, dropping
 /// every later record. Reads that record's body length from its header (a `u32` at [`RECORD_LEN_AT`]
 /// in the 32-byte record header) to find its end — the records are unpadded, tail advancing by exactly

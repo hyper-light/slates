@@ -648,6 +648,57 @@ pub enum RequestBody {
     /// The view.
     at: ReadAt,
   },
+  /// Build a snapshot's disk image (§4.6, A-160): a new volume `name` holding one file, [`IMAGE_FILE`], an ext2 file
+  /// system of `capacity` bytes holding the snapshot's tree, for a VMM that shares no folder with its guest
+  /// (Firecracker) to attach as a block device. The image volume pins the snapshot, as a clone does, until it is
+  /// destroyed. The reply waits for the build, which runs in slices on the volume's owner shard. Appended.
+  ImageBuild {
+    /// The volume.
+    volume: VolumeId,
+    /// The snapshot imaged.
+    snapshot: SnapshotId,
+    /// The image volume's name.
+    name: String,
+    /// The image's size in bytes: the file system's, with the guest's room to write.
+    capacity: u64,
+  },
+  /// Merge an image volume's image into a new clone `name` of the snapshot it was built from (§4.6, A-160): the
+  /// clone holds the tree the image holds now, and each node the build wrote keeps its inode. The reply waits for
+  /// the merge, which runs in slices on the image volume's owner shard. Appended.
+  ImageMerge {
+    /// The image volume.
+    image: VolumeId,
+    /// The clone's name.
+    name: String,
+  },
+}
+
+/// Format: the name of the image file in an image volume's root (§4.6, A-160): what a VMM is pointed at.
+pub const IMAGE_FILE: &str = "image.ext2";
+
+/// What an image merge did (§4.6, A-160), counted.
+#[derive(Wire, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ImageMergeReport {
+  /// Image nodes that are the build's nodes, the root among them.
+  pub kept: u64,
+  /// Nodes made that the snapshot never had.
+  pub created: u64,
+  /// Names given to a build's node by renaming one of its old names.
+  pub moved: u64,
+  /// Names given as links.
+  pub linked: u64,
+  /// The snapshot's nodes the image no longer holds, removed.
+  pub removed: u64,
+  /// Old names removed.
+  pub names_removed: u64,
+  /// Entries moved aside to free a name the image gives to another node.
+  pub staged: u64,
+  /// File bytes compared with the image.
+  pub bytes_compared: u64,
+  /// File bytes written: the chunks that differed.
+  pub bytes_written: u64,
+  /// Nodes whose permissions, owner or times were set.
+  pub attributes_set: u64,
 }
 
 /// A concrete quorum-loss recovery proposal (§4.8). It identifies the retained copy and the
@@ -1166,7 +1217,9 @@ impl RequestBody {
       | RequestBody::FsRemove { volume, .. }
       | RequestBody::FsRename { volume, .. }
       | RequestBody::FsMkdir { volume, .. }
-      | RequestBody::Land { volume, .. } => Some(*volume),
+      | RequestBody::Land { volume, .. }
+      | RequestBody::ImageBuild { volume, .. }
+      | RequestBody::ImageMerge { image: volume, .. } => Some(*volume),
       // A green over a base is born on the base volume's owner shard, where the snapshot is walked.
       RequestBody::CreateGreen { base, .. } => base.map(|b| b.volume),
       RequestBody::Create { .. }
@@ -2618,6 +2671,14 @@ pub enum Refusal {
   /// client reads the file by its normal paged read instead. The bytes are identical; only the copy is paid, and the
   /// reply is never a single oversized `ReadBytes`. Appended.
   MapUnavailable,
+  /// An image could not be built or merged (§4.6, A-160): the image format refused the tree or the image (a name or a
+  /// time it cannot hold, a capacity too small, a corrupt or hostile image), or the image holds what a volume cannot
+  /// (a name or a symlink target not UTF-8, a device). The reason is the refusal in words, since the protocol carries
+  /// no dependency on the image format's types. Appended.
+  ImageRefused {
+    /// The reason, in words.
+    reason: String,
+  },
 }
 
 /// The writes a snapshot is known to include (§4.6 "Writeback and snapshot barrier"): every write the
@@ -2922,6 +2983,24 @@ pub enum ReplyBody {
     file_len: u64,
     /// The block's length (its buddy size).
     block_len: u64,
+  },
+  /// A snapshot's image was built (`ImageBuild`). Appended.
+  ImageBuilt {
+    /// The image volume.
+    id: VolumeId,
+    /// The image file's length in bytes.
+    image_bytes: u64,
+    /// The file system's blocks in use.
+    blocks_used: u64,
+    /// Its inodes in use.
+    inodes_used: u64,
+  },
+  /// An image was merged into a new clone of its snapshot (`ImageMerge`). Appended.
+  ImageMerged {
+    /// The clone.
+    id: VolumeId,
+    /// What the merge did.
+    report: ImageMergeReport,
   },
 }
 

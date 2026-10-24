@@ -55,6 +55,7 @@ mod fuse;
 mod fuse_hold;
 pub mod head;
 pub mod histogram;
+mod image;
 pub mod landing;
 pub mod lease;
 mod lease_wait;

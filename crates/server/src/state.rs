@@ -381,6 +381,8 @@ pub struct ShardState {
   /// The landing runtime: grants, leases and the audit log (§4.15), mirrored to the
   /// database's durable records.
   pub landing: crate::landing::LandingState,
+  /// The image builds and merges running on this shard (§4.6, A-160).
+  pub(crate) image: crate::image::ImageState,
   /// The store.
   pub store: Store,
   /// The volumes.
