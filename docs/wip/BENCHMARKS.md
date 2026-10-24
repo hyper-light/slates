@@ -6564,3 +6564,38 @@ step for a root of 256 directories.
   ring's doubling copied 2.75 MiB (16,384 records) in one image block's write, a 302 µs unit. Both now start at the
   daemon's floor. The doubling itself is open: a ring a lagging reader has grown copies its whole length in one append
   (GAPS, "the journal's ring grows by copying").
+
+## What a guest's FSYNC costs when its map is ingested (Shards part 3, step 3; 2026-10-24)
+
+**The question.** A Shards guest stores into a file's DAX object through its map. slates writes those stores back into
+the volume at the guest's FSYNC, FLUSH and RELEASE by comparing the object with the volume over the ranges the guest
+asked to write (`crates/server/src/shards/dax.rs`, `docs/wip/shards/dax-protocol.md`). There is no dirty bit across
+processes, so the comparison reads every byte of those ranges. This records what it costs per mapped MiB, run as the
+daemon runs it: one copy slice a turn (27,662 bytes on this Mac, half the step quantum at the measured memcpy rate).
+
+**The command.** `cargo test --release -p slates-server --test shards -- --ignored --nocapture ingest_cost`, run as two
+release binaries built from the same tree with and without the change, interleaved A B A B A B. Each run is five rounds
+on a fresh daemon, best reported and all five shown. A 16 MiB file is mapped writable in all 8 ranges. Each round times:
+- an FSYNC with nothing stored since the last (the comparison alone);
+- an FSYNC with one 8-byte store in each range (the comparison and 8 writes);
+- an FSYNC of a second 16 MiB file with no map (the baseline).
+
+**The machine.** Apple M5 Max, 18 cores, 128 GiB, macOS 26.4.1, 16:15–16:17 PDT, load average 6.8–7.5 from other
+sessions.
+
+| variant | compare only (best of 5, three runs) | compare + 8 writes | per mapped MiB |
+|---|---|---|---|
+| A: bytes compared one at a time, buffers made per slice | 19.44, 26.37, 26.36 ms | 20.58, 27.42, 26.62 ms | 1.21, 1.65, 1.65 ms |
+| B: 64-byte chunks compared whole first, buffers kept | 11.28, 18.33, 17.86 ms | 12.07, 17.97, 18.37 ms | 0.70, 1.14, 1.12 ms |
+
+The baseline FSYNC took 13.4–17.4 µs in every run.
+- **B is kept.** It is faster in every pair, by 30–42% (B over A: 0.58, 0.70, 0.68).
+- **Run-to-run spread is large.** Identical code ran 19.4 ms and 26.4 ms one after another, so only an interleaved
+  A/B can judge a change this size.
+
+What remains is about 18 µs per 27 KB slice: the object's bytes copied out through atomic words (no vectorized racy
+load exists), the volume's bytes read through the bridge, and a turn's own overhead. Comparing the object's words
+against the volume's bytes in place, without the copy, is the next measured candidate.
+
+**Measured and replaced.** Variant A, the first build. Its byte-at-a-time run finder walked every byte of a slice whose
+bytes were all equal.

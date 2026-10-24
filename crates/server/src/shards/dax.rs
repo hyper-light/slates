@@ -43,7 +43,7 @@
 //!
 //! An answered ask counts `shards.dax_answered`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use slates_bridge_core::{Bridge, DaxOffer, ObjectId, OpContext, VolumeBridge};
 use slates_bridge_fuse::bridge::errno;
@@ -538,6 +538,7 @@ pub(super) fn release(s: &mut ShardState, stream: &mut ShardsStream, inode: u64)
 /// Lets go of every backing on `stream`, and of its pending fill: the stream ended.
 pub(super) fn release_all(s: &mut ShardState, stream: &mut ShardsStream) {
   stream.pending = None;
+  stream.ingest = None;
   let charges: u64 = stream
     .backings
     .values()
@@ -545,6 +546,309 @@ pub(super) fn release_all(s: &mut ShardState, stream: &mut ShardsStream) {
     .fold(0, u64::saturating_add);
   stream.backings.clear();
   s.dax_filled = s.dax_filled.saturating_sub(charges);
+}
+
+/// Format: the refusal-ledger name of an ingest the bridge refused (the attachment revoked or its volume gone): that
+/// file's stores are not written.
+const INGEST_REFUSED: &str = "shards.dax_ingest_refused";
+/// Format: the ledger name of each run of bytes an ingest wrote into the volume.
+const INGESTED: &str = "shards.dax_ingested";
+
+/// An ingest under way (Shards part 3, step 3): the guest's stores through its maps of some of the stream's objects,
+/// compared with the volume over the ranges asked writable and written back where they differ, a slice a turn, before
+/// what asked for it goes on.
+pub(crate) struct Ingest {
+  /// The inodes still to ingest, the current one first.
+  inodes: VecDeque<u64>,
+  /// The current inode's ranges asked writable, as they stood when its ingest began.
+  ranges: Vec<u64>,
+  /// Which of them is being compared.
+  index: usize,
+  /// How far into it, in bytes.
+  progress: u64,
+  /// The current file's size when its ingest began: nothing past its end is written.
+  size: u64,
+  /// Whether the current inode's ingest has begun (its ranges and size taken).
+  begun: bool,
+  /// Whether anything was written: the change is then published before what asked for it goes on.
+  pub(super) wrote: bool,
+  /// What asked for it.
+  pub(super) then: Then,
+  /// The object's and the volume's bytes of the slice being compared: kept from one slice to the next, so a slice
+  /// allocates nothing (each at most one slice long).
+  stored: Vec<u8>,
+  held: Vec<u8>,
+}
+
+/// What an ingest was for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Then {
+  /// The held request of `total` bytes at the head of the stream is served next.
+  Serve {
+    /// The request's bytes, its length word included.
+    total: usize,
+  },
+  /// The stream ends next.
+  End,
+}
+
+/// The inodes of `nodes` whose backings hold ranges asked writable: what an ingest for them compares.
+fn worth_ingesting(stream: &ShardsStream, nodes: impl IntoIterator<Item = u64>) -> VecDeque<u64> {
+  let mut inodes: VecDeque<u64> = VecDeque::new();
+  for node in nodes {
+    if stream
+      .backings
+      .get(&node)
+      .is_some_and(|backing| !backing.writable.is_empty())
+      && !inodes.contains(&node)
+    {
+      inodes.push_back(node);
+    }
+  }
+  inodes
+}
+
+/// Holds the request of `total` bytes at the head of `stream` for an ingest, where it is one that asks for the guest's
+/// stores to reach the volume first: a `FSYNC`, `FLUSH` or `RELEASE` of a node with a writable backing, or a `FORGET` or
+/// `BATCH_FORGET` of such nodes. Whether it was held.
+pub(super) fn hold_for_ingest(stream: &mut ShardsStream, request: &[u8], total: usize) -> bool {
+  use slates_bridge_fuse::Opcode;
+  use slates_bridge_fuse::bridge::{KernelChange, kernel_changes};
+  if stream.backings.is_empty() {
+    return false;
+  }
+  let Ok(header) = slates_bridge_fuse::InHeader::parse(request) else {
+    return false;
+  };
+  let nodes: Vec<u64> = match Opcode::from_wire(header.opcode) {
+    Some(Opcode::FSync | Opcode::Flush | Opcode::Release) => vec![header.nodeid],
+    Some(Opcode::Forget | Opcode::BatchForget) => {
+      let mut forgotten = Vec::new();
+      kernel_changes(request, &[], &mut |change| {
+        if let KernelChange::Forgot { node, .. } = change {
+          forgotten.push(node);
+        }
+      });
+      forgotten
+    }
+    _ => return false,
+  };
+  let inodes = worth_ingesting(stream, nodes);
+  if inodes.is_empty() {
+    return false;
+  }
+  stream.ingest = Some(new_ingest(inodes, Then::Serve { total }));
+  true
+}
+
+/// Starts the ingest every backing with writable ranges takes before the stream ends. Whether there is one.
+pub(super) fn ingest_before_end(stream: &mut ShardsStream) -> bool {
+  let inodes = worth_ingesting(stream, stream.backings.keys().copied().collect::<Vec<_>>());
+  if inodes.is_empty() {
+    return false;
+  }
+  stream.ingest = Some(new_ingest(inodes, Then::End));
+  true
+}
+
+fn new_ingest(inodes: VecDeque<u64>, then: Then) -> Ingest {
+  Ingest {
+    inodes,
+    ranges: Vec::new(),
+    index: 0,
+    progress: 0,
+    size: 0,
+    begun: false,
+    wrote: false,
+    then,
+    stored: Vec::new(),
+    held: Vec::new(),
+  }
+}
+
+/// One slice of `stream`'s ingest: whether it is done (taken off the stream then, for the caller to go on with). An
+/// inode the bridge refuses (the attachment revoked, its volume gone, or one that may not write) is passed over,
+/// counted, its stores unwritten.
+pub(super) fn ingest_step(s: &mut ShardState, stream: &mut ShardsStream) -> Option<Ingest> {
+  let mut ingest = stream.ingest.take()?;
+  loop {
+    let Some(&inode) = ingest.inodes.front() else {
+      return Some(ingest);
+    };
+    if !ingest.begun {
+      match begin_inode(s, stream, inode) {
+        Ok((ranges, size)) => {
+          ingest.ranges = ranges;
+          ingest.size = size;
+          ingest.index = 0;
+          ingest.progress = 0;
+          ingest.begun = true;
+        }
+        Err(()) => {
+          s.count(INGEST_REFUSED, 1);
+          next_inode(&mut ingest);
+          continue;
+        }
+      }
+    }
+    let Some(&range) = ingest.ranges.get(ingest.index) else {
+      next_inode(&mut ingest);
+      continue;
+    };
+    let range_start = range.saturating_mul(DAX_RANGE_BYTES);
+    let range_bytes = ingest.size.saturating_sub(range_start).min(DAX_RANGE_BYTES);
+    if ingest.progress >= range_bytes {
+      ingest.index = ingest.index.saturating_add(1);
+      ingest.progress = 0;
+      continue;
+    }
+    let at = range_start.saturating_add(ingest.progress);
+    let want = range_bytes
+      .saturating_sub(ingest.progress)
+      .min(slice_bytes(s));
+    let (mut stored, mut held) = (
+      std::mem::take(&mut ingest.stored),
+      std::mem::take(&mut ingest.held),
+    );
+    let compared = compare_and_write(s, stream, inode, at, want, &mut stored, &mut held);
+    (ingest.stored, ingest.held) = (stored, held);
+    match compared {
+      Ok(wrote) => {
+        ingest.wrote |= wrote;
+        ingest.progress = ingest.progress.saturating_add(want);
+      }
+      Err(()) => {
+        s.count(INGEST_REFUSED, 1);
+        next_inode(&mut ingest);
+        continue;
+      }
+    }
+    stream.ingest = Some(ingest);
+    return None;
+  }
+}
+
+/// Moves the ingest on to its next inode.
+fn next_inode(ingest: &mut Ingest) {
+  ingest.inodes.pop_front();
+  ingest.begun = false;
+  ingest.ranges.clear();
+}
+
+/// Takes `inode`'s ingest: its ranges asked writable and the file's size now. Refused where the attachment may not
+/// write, or the bridge refuses the node.
+fn begin_inode(
+  s: &mut ShardState,
+  stream: &mut ShardsStream,
+  inode: u64,
+) -> Result<(Vec<u64>, u64), ()> {
+  let ranges: Vec<u64> = stream
+    .backings
+    .get(&inode)
+    .map(|backing| backing.writable.iter().copied().collect())
+    .unwrap_or_default();
+  let size = with_bridge(s, stream, |bridge, cx| {
+    if !cx.rights.write {
+      return Err(Refused::ReadOnly);
+    }
+    bridge
+      .getattr(ObjectId::new(inode, 0), cx)
+      .map(|attr| attr.size)
+      .map_err(|e| Refused::Unreachable(errno(e)))
+  })
+  .map_err(|_| ())?;
+  Ok((ranges, size))
+}
+
+/// Compares `len` bytes of `inode`'s object from `at` with the volume's, and writes each run that differs into the
+/// volume through the attachment's bridge: whether anything was written.
+fn compare_and_write(
+  s: &mut ShardState,
+  stream: &mut ShardsStream,
+  inode: u64,
+  at: u64,
+  len: u64,
+  stored: &mut Vec<u8>,
+  held: &mut Vec<u8>,
+) -> Result<bool, ()> {
+  stored.clear();
+  stored.resize(usize::try_from(len).map_err(|_| ())?, 0);
+  stream
+    .backings
+    .get_mut(&inode)
+    .ok_or(())?
+    .object
+    .load(at, stored)
+    .map_err(|_| ())?;
+  let runs = with_bridge(s, stream, |bridge, cx| {
+    let object = ObjectId::new(inode, 0);
+    held.clear();
+    bridge
+      .read(object, cx, at, u32::try_from(len).unwrap_or(u32::MAX), held)
+      .map_err(|_| Refused::Object)?;
+    // A volume shorter than the object's span here (the file cut since) is compared as far as it reaches.
+    let runs = differing_runs(stored, held);
+    for &(from, to) in &runs {
+      let bytes = stored.get(from..to).ok_or(Refused::Object)?;
+      let offset = at.saturating_add(u64::try_from(from).unwrap_or(u64::MAX));
+      bridge
+        .write(object, cx, offset, bytes)
+        .map_err(|_| Refused::Object)?;
+    }
+    Ok(runs.len())
+  })
+  .map_err(|_| ())?;
+  if runs > 0 {
+    s.count(INGESTED, u64::try_from(runs).unwrap_or(u64::MAX));
+  }
+  Ok(runs > 0)
+}
+
+/// Shape: the chunk the run finder compares whole before it looks at bytes: a cache line, so an unchanged chunk costs
+/// one vectorized comparison, and a store the guest made costs a scan of its line alone.
+const COMPARE_CHUNK: usize = 64;
+
+/// The runs, `(from, to)`, where `stored` differs from `held`, within the shorter of the two. Chunks that compare equal
+/// whole are passed over; only a chunk that differs is looked at byte by byte.
+fn differing_runs(stored: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
+  let len = stored.len().min(held.len());
+  let (stored, held) = (
+    stored.get(..len).unwrap_or(&[]),
+    held.get(..len).unwrap_or(&[]),
+  );
+  let mut runs = Vec::new();
+  if stored == held {
+    return runs;
+  }
+  let mut open: Option<usize> = None;
+  for (chunk, (mine, theirs)) in stored
+    .chunks(COMPARE_CHUNK)
+    .zip(held.chunks(COMPARE_CHUNK))
+    .enumerate()
+  {
+    let base = chunk.saturating_mul(COMPARE_CHUNK);
+    if mine == theirs {
+      if let Some(from) = open.take() {
+        runs.push((from, base));
+      }
+      continue;
+    }
+    for (offset, (a, b)) in mine.iter().zip(theirs.iter()).enumerate() {
+      let index = base.saturating_add(offset);
+      match (a == b, open) {
+        (false, None) => open = Some(index),
+        (true, Some(from)) => {
+          runs.push((from, index));
+          open = None;
+        }
+        _ => {}
+      }
+    }
+  }
+  if let Some(from) = open {
+    runs.push((from, len));
+  }
+  runs
 }
 
 #[cfg(test)]
@@ -570,5 +874,33 @@ mod tests {
     assert!(first > last, "a range past the end covers nothing");
     let (first, last) = covered(None, 0);
     assert!(first > last, "an empty file covers nothing");
+  }
+
+  /// Do: find where stored bytes differ from the volume's: none, one in the middle, runs at both ends, and a volume
+  /// shorter than the object's span. Expect each run whole, in order, within the shorter of the two. Serves Shards part
+  /// 3, step 3.
+  #[test]
+  fn differing_runs_are_found_whole_and_in_order() {
+    assert!(differing_runs(b"abcdef", b"abcdef").is_empty());
+    assert_eq!(differing_runs(b"abXXef", b"abcdef"), vec![(2, 4)]);
+    assert_eq!(differing_runs(b"XbcdeY", b"abcdef"), vec![(0, 1), (5, 6)]);
+    assert_eq!(
+      differing_runs(b"abcdXX", b"abcd"),
+      Vec::<(usize, usize)>::new()
+    );
+    assert_eq!(differing_runs(b"aXcdXX", b"abcd"), vec![(1, 2)]);
+    assert_eq!(differing_runs(b"abcXXX", b"abcdef"), vec![(3, 6)]);
+    let held = vec![0u8; 3 * COMPARE_CHUNK];
+    let mut stored = held.clone();
+    stored[COMPARE_CHUNK - 2..COMPARE_CHUNK + 3].fill(1);
+    stored[3 * COMPARE_CHUNK - 1] = 1;
+    assert_eq!(
+      differing_runs(&stored, &held),
+      vec![
+        (COMPARE_CHUNK - 2, COMPARE_CHUNK + 3),
+        (3 * COMPARE_CHUNK - 1, 3 * COMPARE_CHUNK)
+      ],
+      "a run across a chunk boundary is one run, and an equal chunk between runs parts them"
+    );
   }
 }

@@ -11126,6 +11126,18 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     is marked while the budget is full, the mark coming back after a FORGET. That last one is red-checked: always
     offering fails it.
   - **Owed in step 2:** CI's Linux run of the object and server tests.
+- **Part 3, step 3 built (2026-10-24): a guest's stores through its map reach the volume.**
+  - **When.** An FSYNC, FLUSH or RELEASE of a node with a writable backing, and a FORGET of one, is held while its
+    ingest runs, a copy slice a turn. So is the stream's end.
+  - **How.** The object is compared with the volume over the ranges asked writable, up to the file's end. Each run
+    that differs is written through the attachment's own bridge, and published before the held reply (or straight
+    after, for a FORGET or the end). A read-only attachment is never ingested.
+  - **Proven by use** (`crates/server/tests/shards.rs`, 3 tests, macOS arm64): stores reach the volume at FSYNC, not
+    before, and survive a daemon restart; they reach it at a close, at a FORGET and at the stream's end; a read-only
+    attachment's stores never do.
+  - **Red-checked:** holding nothing fails the FSYNC and close cases, and skipping the end's ingest fails the end case.
+  - **Measured** (BENCHMARKS, "What a guest's FSYNC costs when its map is ingested"): 0.70–1.14 ms per mapped MiB on
+    this Mac, after a chunked comparison replaced a byte-at-a-time one (30–42% faster, interleaved A/B).
   - **No revoke and no new frames are needed.** slates answers the existing DESCRIPTOR ask with one shared-memory
     object per attachment and file, sized once to `2^63 − 2 MiB` (sparse), and writes every change of the file into
     it before acknowledging the change. The guest's stores are ingested at its FSYNC, FLUSH and RELEASE, and at the

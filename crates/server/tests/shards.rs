@@ -383,6 +383,14 @@ impl Guest {
     }
   }
 
+  /// An `FSYNC` of `node` through handle `fh`: the errno.
+  fn fsync(&mut self, node: u64, fh: u64) -> i32 {
+    // `fuse_fsync_in`: fh, fsync_flags, padding.
+    let mut body = fh.to_le_bytes().to_vec();
+    body.extend_from_slice(&[0u8; 8]);
+    errno(&self.ask(Opcode::FSync, node, &body))
+  }
+
   /// A `close`: the flush every close sends, then the release.
   fn close(&mut self, node: u64, fh: u64) -> (i32, i32) {
     let mut flush = fh.to_le_bytes().to_vec();
@@ -1556,6 +1564,211 @@ fn a_fill_past_the_shards_budget_is_refused_and_a_forget_gives_its_charge_back()
     retried.is_ok(),
     "the first's forget gave its charge back: {retried:?}"
   );
+  drop(client);
+  drop(daemon);
+}
+
+// --- Shards part 3, step 3: a guest's stores through its map reach the volume. ---
+
+/// `len` bytes of file `name` at `offset`, read through a fresh read-only stream that holds no DAX object: the volume's
+/// own bytes, what slates' reads show.
+fn volume_bytes(daemon: &Daemon, id: VolumeId, name: &str, offset: u64, len: u32) -> Vec<u8> {
+  let mut reader = Guest::over(attach(daemon, id, None, Intent::Read).unwrap());
+  reader.init();
+  let node = reader.lookup(ROOT, name).unwrap();
+  let fh = reader.open(node, O_RDONLY).unwrap();
+  let bytes = reader.read(node, fh, offset, len).unwrap();
+  assert_eq!(reader.close(node, fh), (0, 0));
+  bytes
+}
+
+/// The guest writes a 3 MiB file `name`, opens it, and maps its first range writable as Shards' window would: its node,
+/// handle, the pattern it holds, and the mapping.
+fn mapped_file(
+  guest: &mut Guest,
+  name: &str,
+  seed: u8,
+) -> (u64, u64, Vec<u8>, WindowRange, OwnedFd) {
+  let content = patterned(3 << 20, seed);
+  let node = guest_writes_large(guest, name, &content);
+  let fh = guest.open(node, O_RDWR).unwrap();
+  let object = guest.descriptor(node, true, Some((0, DAX_RANGE))).unwrap();
+  let window = WindowRange::map(&object, 0);
+  (node, fh, content, window, object)
+}
+
+/// AC (Shards part 3, step 3), by use. Do: map a file's first range writable and store through the map at two offsets;
+/// read the volume; `FSYNC` the file; read again; restart the daemon and read once more. Expect the volume to show the
+/// old bytes before the `FSYNC`, the stored ones after it, counted as ingested, and the stored ones after the restart.
+#[test]
+fn a_guests_stores_through_its_map_reach_the_volume_at_fsync_and_survive_a_restart() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-shards-dax-ingest-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let segment = anchor_segment("shards-dax-ingest", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = Client::connect(&instance);
+  let id = create_volume(&mut client, "ingest", 8 << 20);
+  let mut guest = Guest::over(attach(&first, id, None, Intent::Write).unwrap());
+  guest.init();
+  let (node, fh, content, window, _object) = mapped_file(&mut guest, "mapped", 0x77);
+  let late = (1usize << 20) + 7;
+  window.store(100, b"stored at 100");
+  window.store(late, b"stored past a MiB");
+  assert_eq!(
+    volume_bytes(&first, id, "mapped", 100, 13),
+    &content[100..113],
+    "before the FSYNC the volume holds the old bytes"
+  );
+  assert_eq!(guest.fsync(node, fh), 0);
+  assert_eq!(
+    volume_bytes(&first, id, "mapped", 100, 13),
+    b"stored at 100"
+  );
+  assert_eq!(
+    volume_bytes(&first, id, "mapped", u64::try_from(late).unwrap(), 17),
+    b"stored past a MiB",
+    "after the FSYNC it holds what the guest stored through its map"
+  );
+  assert!(wait_for_count(&first, "shards.dax_ingested", 2) >= 2);
+  drop(client);
+  first.stop();
+  assert!(guest.ended(), "the stop ended the stream");
+
+  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  assert_eq!(
+    volume_bytes(&second, id, "mapped", u64::try_from(late).unwrap(), 17),
+    b"stored past a MiB",
+    "the ingested stores survived the restart"
+  );
+  second.stop();
+  drop(segment);
+}
+
+/// AC (Shards part 3, step 3), by use. Do: map three files' first ranges writable and store a marker through each; then
+/// close the first (its `FLUSH` and `RELEASE`), forget the second, and end the stream. Expect each marker in the volume
+/// after its file's close, its forget, and the stream's end respectively.
+#[test]
+fn a_guests_stores_reach_the_volume_at_close_forget_and_the_streams_end() {
+  let (daemon, client, id) = dax_provisioned("shards-dax-ends", 16 << 20, None);
+  let mut guest = Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
+  guest.init();
+  let (closed, closed_fh, _, closed_window, _closed_object) =
+    mapped_file(&mut guest, "closed", 0x81);
+  let (forgotten, forgotten_fh, _, forgotten_window, _forgotten_object) =
+    mapped_file(&mut guest, "forgotten", 0x82);
+  let (_ended, _ended_fh, _, ended_window, _ended_object) = mapped_file(&mut guest, "ended", 0x83);
+  closed_window.store(4096, b"closed marker");
+  forgotten_window.store(8192, b"forgotten marker");
+  ended_window.store(12288, b"ended marker");
+  assert_eq!(guest.close(closed, closed_fh), (0, 0));
+  assert_eq!(
+    volume_bytes(&daemon, id, "closed", 4096, 13),
+    b"closed marker"
+  );
+  assert_eq!(guest.close(forgotten, forgotten_fh), (0, 0));
+  guest.forget(forgotten, 1);
+  assert_eq!(
+    volume_bytes(&daemon, id, "forgotten", 8192, 16),
+    b"forgotten marker"
+  );
+  drop(guest);
+  wait_until("the stream's end ingested the third file's stores", || {
+    volume_bytes(&daemon, id, "ended", 12288, 12) == b"ended marker"
+  });
+  drop(client);
+  drop(daemon);
+}
+
+/// AC (Shards part 3, step 3), by use. Do: through a read-only attachment, map a file as a VMM would and store through
+/// the map (which the descriptor allows: it is a copy), then end the stream. Expect the volume unchanged: a read-only
+/// attachment's object is never ingested.
+#[test]
+fn a_read_only_attachments_object_is_never_ingested() {
+  let (daemon, client, id) = dax_provisioned("shards-dax-read-only", 8 << 20, None);
+  let mut writer = Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
+  writer.init();
+  let content = patterned(3 << 20, 0x91);
+  let node = guest_writes_large(&mut writer, "file", &content);
+  let mut reader = Guest::over(attach(&daemon, id, None, Intent::Read).unwrap());
+  reader.init();
+  assert_eq!(reader.lookup(ROOT, "file"), Ok(node));
+  let object = reader
+    .descriptor(node, false, Some((0, DAX_RANGE)))
+    .unwrap();
+  let window = WindowRange::map(&object, 0);
+  window.store(0, b"a hostile store through a read-only map");
+  drop(reader);
+  assert_eq!(wait_for_count(&daemon, "shards.dax_answered", 1), 1);
+  assert_eq!(
+    volume_bytes(&daemon, id, "file", 0, 39),
+    &content[..39],
+    "a read-only attachment's object is never ingested"
+  );
+  drop(client);
+  drop(daemon);
+}
+
+/// Measured, not a gate (Shards part 3, step 3): what an `FSYNC` costs a guest when it ingests a mapped file's writable
+/// ranges. A 16 MiB file is mapped writable in all its 8 ranges; each round times `FSYNC` round trips, best of 5 with all
+/// 5 printed:
+/// - with nothing stored since the last one (the comparison alone);
+/// - with one store in each range (the comparison and 8 writes);
+/// - for a second file of the same size with no mapping (the baseline).
+///
+/// Run: `cargo test --release -p slates-server --test shards -- --ignored --nocapture ingest_cost`.
+#[test]
+#[ignore = "a measurement, run by hand in release"]
+fn ingest_cost_per_mapped_mib() {
+  const ROUNDS: usize = 5;
+  const MIB: u64 = 16;
+  let (daemon, client, id) = dax_provisioned("shards-dax-ingest-cost", 40 << 20, None);
+  let mut guest = Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
+  guest.init();
+  let size = usize::try_from(MIB << 20).unwrap();
+  let mapped = guest_writes_large(&mut guest, "mapped", &patterned(size, 0xa1));
+  let plain = guest_writes_large(&mut guest, "plain", &patterned(size, 0xa2));
+  let mapped_fh = guest.open(mapped, O_RDWR).unwrap();
+  let plain_fh = guest.open(plain, O_RDWR).unwrap();
+  let object = guest.descriptor(mapped, true, None).unwrap();
+  let windows: Vec<WindowRange> = (0..MIB / 2)
+    .map(|range| WindowRange::map(&object, range))
+    .collect();
+  let time = |guest: &mut Guest, node: u64, fh: u64| {
+    let started = Instant::now();
+    assert_eq!(guest.fsync(node, fh), 0);
+    started.elapsed()
+  };
+  let mut quiet = Vec::new();
+  let mut stored = Vec::new();
+  let mut baseline = Vec::new();
+  for round in 0..ROUNDS {
+    quiet.push(time(&mut guest, mapped, mapped_fh));
+    for window in &windows {
+      window.store(round * 4096, &[u8::try_from(round).unwrap(); 8]);
+    }
+    stored.push(time(&mut guest, mapped, mapped_fh));
+    baseline.push(time(&mut guest, plain, plain_fh));
+  }
+  let best = |all: &[Duration]| *all.iter().min().unwrap();
+  println!("ingest cost, {MIB} MiB mapped writable (8 ranges):");
+  println!(
+    "  compare only:        best {:?} of {quiet:?}",
+    best(&quiet)
+  );
+  println!(
+    "  compare + 8 writes:  best {:?} of {stored:?}",
+    best(&stored)
+  );
+  println!(
+    "  baseline FSYNC:      best {:?} of {baseline:?}",
+    best(&baseline)
+  );
+  let per_mib = best(&quiet).saturating_sub(best(&baseline)) / u32::try_from(MIB).unwrap();
+  println!("  comparison per mapped MiB (compare only less baseline): {per_mib:?}");
   drop(client);
   drop(daemon);
 }
