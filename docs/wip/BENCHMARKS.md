@@ -6332,3 +6332,56 @@ That longest wait, 15.26 ms on the first workload of a fresh process, is the lon
 This is the evidence the derived budget starts from. The design's formula, with the lag measured, asks for tens of
 kilobytes on these workloads. The fixed share gives a 1 GiB volume 10.7 MB, and a volume under 3.76 MiB less than the
 largest backlog measured.
+
+## The derived journal budget on the same workloads (A-157; 2026-10-24 UTC)
+
+**The question.** Since A-157 the journal keeps what a live reader still owes. It starts at a one-page floor and grows
+from the shard's metadata ledger. This reruns the section above on the derived budget, to see:
+- whether any round overruns;
+- what budget each volume ends at;
+- what that budget holds against the 10‰ share each volume used to reserve.
+
+**The command.** The same bench, `crates/cli/examples/journal_bench.rs`, now printing the budget the volume ends at
+with the ledger's growth and refusals: `CARGO_TARGET_DIR=$HOME/.cache/slates-journal-target cargo build --release -p
+slates-cli --bin slates --example journal_bench && $CARGO_TARGET_DIR/release/examples/journal_bench`. It ran from the
+checkout at `1ac381a3`, with this bench's row change and step 5's test re-derivations in the working tree (binary
+hashes `e24d5e1c` for the bench, `76ee3d18` for `slates`).
+
+**The machine.** The same bare-metal box: Ryzen 9 9950X3D2, 32 threads, 124 GiB, kernel 7.2.9-2-cachyos. The run was
+2026-10-24 01:09:17–01:09:29 UTC (2026-10-23 on the box's local clock), with a load average of 23.5–24.7.
+
+Every volume is a 1 GiB bounded volume, whose share was 10,737,418 bytes. The budget is the one-page floor (4,096)
+plus the growth.
+
+| run | workload | seconds | appended | dropped | rounds | overruns | largest backlog: records | bytes | its wait (ms) | longest wait (ms) | budget | grown | refused | share ÷ budget | load (1 min) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | git_clone | 1.027 | 18,695 | 18,592 | 74,509 | 0 | 88 | 9,744 | 1.01 | 1.51 | 10,014 | 5,918 | 0 | 1,072× | 24.12 |
+| 1 | cargo_build | 1.828 | 1,807 | 1,768 | 7,217 | 0 | 66 | 5,808 | 1.03 | 1.13 | 5,896 | 1,800 | 0 | 1,821× | 24.12 |
+| 1 | sdk_ring | 0.724 | 128,193 | 128,071 | 7,957 | 0 | 80 | 7,040 | 0.26 | 1.92 | 10,736 | 6,640 | 0 | 1,000× | 24.12 |
+| 2 | git_clone | 0.885 | 18,695 | 18,591 | 74,079 | 0 | 89 | 9,968 | 1.35 | 1.92 | 10,056 | 5,960 | 0 | 1,068× | 23.47 |
+| 2 | cargo_build | 1.826 | 1,808 | 1,725 | 7,189 | 0 | 76 | 13,789 | 0.78 | 2.11 | 13,972 | 9,876 | 0 | 768× | 23.47 |
+| 2 | sdk_ring | 0.755 | 128,193 | 128,047 | 7,915 | 0 | 106 | 9,328 | 0.42 | 1.78 | 12,848 | 8,752 | 0 | 836× | 23.47 |
+| 3 | git_clone | 0.938 | 18,695 | 18,584 | 73,923 | 0 | 92 | 10,748 | 1.23 | 2.05 | 10,836 | 6,740 | 0 | 991× | 23.47 |
+| 3 | cargo_build | 1.872 | 1,806 | 1,777 | 7,279 | 0 | 24 | 2,433 | 0.73 | 1.14 | 4,096 | 0 | 0 | 2,621× | 24.71 |
+| 3 | sdk_ring | 0.739 | 128,193 | 128,001 | 7,362 | 0 | 130 | 11,440 | 0.58 | 2.88 | 16,896 | 12,800 | 0 | 636× | 24.71 |
+
+**What it shows.**
+- **No round overran, and no growth was refused.** Each budget grew only as its mount's backlog needed. The journals
+  ended at 4,096–16,896 bytes, where the share reserved 10,737,418 for each volume: 636–2,621 times less.
+- **Records leave once read.** The workloads appended 1,806–128,193 records and the journals dropped all but the last
+  few dozen to a couple of hundred. Those were records the watching mount had already read. Under the share they
+  stayed, holding 10.7 MB a volume.
+- **The budget follows the backlog, within two rounds.** In 8 of 9 rows the budget is within a page of the largest
+  backlog, or the floor when the backlog was smaller. In the ninth (`sdk_ring`, run 3) it is 5,456 bytes above it.
+  - A reader's point is the start of its round in flight, since a refused round is gathered again from there (A-157,
+    from A-141).
+  - So the journal keeps that round's batch until the next round begins, and the budget can reach two consecutive
+    backlogs.
+  - Every row is within twice its largest backlog.
+  - Advancing the point when a round's delivery is confirmed would halve that. It is not taken: these budgets are tens
+    of kilobytes.
+- **The waits are as before.** The oldest record of a largest backlog had waited 0.26–1.35 ms, and the longest wait was
+  1.13–2.88 ms, at a load of 23–25. So the journal's new rule costs the rounds nothing they measured.
+
+The plan's step 5 predicted "at most a page above the largest backlog". That was wrong for one row of nine, and the
+measured bound, two consecutive backlogs, is the one the design states.

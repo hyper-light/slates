@@ -576,7 +576,9 @@ fn eventually(mut check: impl FnMut() -> bool) -> bool {
 /// Do: through the mount, write `kept` and `gone`, read `kept` and stat `gone`, and prove `kept`'s page cached (a second
 /// read sends no `READ`); then, in the loop's one wake, replace `kept` and remove `gone` through another attachment and
 /// write a third file [`CHURN_WRITES`] times, past what the journal keeps. Expect the round to count an overrun, `kept`
-/// to read the replacement, and `gone` to be absent through the mount.
+/// to read the replacement, and `gone` to be absent through the mount. This loop opens no journal reader, so retention
+/// drops at the budget, as it does in the daemon for a reader past its patience or under a growth the ledger refused
+/// (A-157): the overrun's delivery through a real mount is what this proves.
 #[test]
 fn a_mount_behind_the_journal_drops_everything_its_kernel_holds() {
   with_mounted_loop("overrun", |control, mount_point| {

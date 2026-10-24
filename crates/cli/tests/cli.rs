@@ -6874,7 +6874,8 @@ fn a_dirty_page_past_a_truncation_never_grows_the_file_back() {
 }
 
 /// Shape: unrelated writes the long-lived map test makes — each SDK write journals at least two records, so this is
-/// well past the journal a test volume keeps (its quota × 10‰ over a record's size, some 850 records for 8 MiB).
+/// far past what the journal keeps once its mount has read them: its one-page floor, about 46 records at 4 KiB (A-157;
+/// it kept the quota's 10‰, some 850 records for 8 MiB, before).
 #[cfg(target_os = "linux")]
 const UNRELATED_WRITES: u32 = 2000;
 
@@ -6909,18 +6910,34 @@ fn a_long_lived_maps_write_back_survives_unrelated_activity_past_the_journal() {
     fixture.volume_bytes() == expected,
     "the store survived unrelated activity past the journal's retention"
   );
+  let (_, status, _) = run(&fixture.instance, &["status", &fixture.id]);
+  let dropped: u64 = value_of(&status, "journal_appended")
+    .split_once("dropped ")
+    .map(|(_, count)| {
+      count
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+    })
+    .and_then(|digits| digits.parse().ok())
+    .unwrap_or(0);
+  assert!(
+    dropped > 0,
+    "the journal dropped records the mount had read, so the store outlived them: {status}"
+  );
 }
 
-/// Shape: the quota of the eviction test's volume, small enough that its journal is the one-page floor (the daemon's
-/// 10‰ share of it is under a page), so the journal keeps a page's worth of records: some 46 at 4 KiB.
+/// Shape: the quota of the small-volume tests, so their files fill little of it. Every volume's journal starts at a
+/// one-page floor (A-157), about 46 records at 4 KiB until a live reader needs more; under the 10‰ share it took
+/// before, this quota's journal was that page too.
 #[cfg(target_os = "linux")]
 const ONE_PAGE_JOURNAL_QUOTA: &str = "256KiB";
 /// Shape: [`ONE_PAGE_JOURNAL_QUOTA`] in bytes.
 #[cfg(target_os = "linux")]
 const ONE_PAGE_JOURNAL_QUOTA_BYTES: usize = 256 << 10;
 /// Shape: the replacements of another file sent in one batch after the change the mount must hear of. Each journals
-/// at least two records, so the batch alone holds more than a one-page journal keeps; with the first, one ring's
-/// worth of requests (32 slots, the daemon's boot log).
+/// at least two records, so the batch alone holds more than the journal's one-page floor keeps; with the first, one
+/// ring's worth of requests (32 slots, the daemon's boot log).
 #[cfg(target_os = "linux")]
 const PIPELINED_REPLACEMENTS: usize = 31;
 /// Shape: the eviction test's file length: small enough that a whole replacement fits one ring slot, which a page does
@@ -6937,6 +6954,9 @@ struct OnePageJournal {
   volume: slates_client::VolumeId,
   attachment: u64,
   point: MountPoint,
+  /// The daemon's instance and the volume's id, for its status.
+  instance: String,
+  id: String,
   _anchor: AnchorProcess,
 }
 
@@ -6980,6 +7000,8 @@ impl OnePageJournal {
       volume,
       attachment,
       point,
+      instance,
+      id,
       _anchor: anchor,
     }
   }
@@ -7037,13 +7059,17 @@ impl OnePageJournal {
   }
 }
 
-/// §4.6 cache posture: a change must reach a mount's kernel even when more changes follow it than the journal keeps
-/// before the mount's next round, or the kernel serves its cached copy for as long as it holds it (A-141). Do: on a
-/// volume whose journal holds one page of records, cache `a.bin` through a FUSE mount; send, without waiting, a
-/// replacement of `a.bin` and then [`PIPELINED_REPLACEMENTS`] replacements of `b.bin` through the SDK; collect every
-/// reply; read `a.bin` through the mount. Expect the replacement's bytes within [`WAIT_FOR`]. Linux only, as the other
-/// FUSE coherence tests are. The overrun this needs depends on the mount not running between the two writes, so it
-/// failed 2 runs of 33 before the fix; `coherence_mount.rs` in `slates-bridge-fuse` makes it every time.
+/// §4.6 cache posture: a change must reach a mount's kernel even when more changes follow it than the journal's floor
+/// keeps before the mount's next round, or the kernel serves its cached copy for as long as it holds it (A-141, A-157).
+/// Do: cache `a.bin` through a FUSE mount; send, without waiting, a replacement of `a.bin` and then
+/// [`PIPELINED_REPLACEMENTS`] replacements of `b.bin` through the SDK; collect every reply; read `a.bin` through the
+/// mount. Expect the replacement's bytes within [`WAIT_FOR`], the batch to have appended more records than the journal's
+/// one-page floor holds, and no round to have overrun: the journal keeps what the live mount still owes (A-157).
+///
+/// Until A-157 those records were dropped and the mount overran, told everything (A-141), which failed 2 runs of 33
+/// before that fix. The overrun is now reached only by a growth the ledger refuses or a reader past its patience: the
+/// bridge proves both (`crates/bridge-core/tests/invalidation.rs`), and `coherence_mount.rs` in `slates-bridge-fuse`
+/// proves its delivery through a real mount. Linux only, as the other FUSE coherence tests are.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_change_reaches_the_mount_even_when_more_follow_than_the_journal_keeps() {
@@ -7055,6 +7081,11 @@ fn a_change_reaches_the_mount_even_when_more_follow_than_the_journal_keeps() {
     fixture.read_through_mount("a.bin") == vec![b'A'; PIPELINED_FILE_BYTES],
     "a.bin is cached through the mount"
   );
+  let appended = |fixture: &OnePageJournal| {
+    let (_, status, _) = run(&fixture.instance, &["status", &fixture.id]);
+    leading_number(&value_of(&status, "journal_appended"))
+  };
+  let before = appended(&fixture);
   let mut batch = vec![fixture.replacement("a.bin", b'Z')];
   for round in 0..PIPELINED_REPLACEMENTS {
     let fill = b'a' + u8::try_from(round % 26).unwrap();
@@ -7064,6 +7095,18 @@ fn a_change_reaches_the_mount_even_when_more_follow_than_the_journal_keeps() {
   assert!(
     fixture.comes_to_read("a.bin", &[b'Z'; PIPELINED_FILE_BYTES]),
     "the mount still serves the old bytes after {WAIT_FOR:?}, not the replacement"
+  );
+  let floor_records =
+    rustix::param::page_size() / std::mem::size_of::<slates_vfs::journal::OpRecord>();
+  let batch_records = appended(&fixture).saturating_sub(before);
+  assert!(
+    usize::try_from(batch_records).unwrap() > floor_records,
+    "the batch appended {batch_records} records, more than the floor's {floor_records}"
+  );
+  assert_eq!(
+    counter_of(&fixture.instance, "fuse.journal_overruns"),
+    0,
+    "no round overran: the journal kept what the live mount owed"
   );
 }
 
@@ -7202,23 +7245,37 @@ fn a_mapped_files_write_back_survives_more_scattered_changes_than_the_journal_ho
 /// Shape: the quota `MappedThroughAMount` gives its volume (`--bounded 8MiB`).
 #[cfg(target_os = "linux")]
 const MAP_VOLUME_QUOTA: usize = 8 << 20;
-/// Shape: the most records that volume's journal holds — the daemon's 10‰ share of the quota (`JOURNAL_SHARE_PERMILLE`
-/// in `slates-server`) over a record's fixed size, which is also the bound on a file's byte-state ranges.
+/// Derived: the byte-state ranges a mount's room grows by at a time — one page of them (the page over
+/// `slates_bridge_fuse::coherence::RANGE_BYTES`; A-155).
 #[cfg(target_os = "linux")]
-const MAP_JOURNAL_RECORDS: usize =
-  MAP_VOLUME_QUOTA / 100 / std::mem::size_of::<slates_vfs::journal::OpRecord>();
-/// Shape: the pages the page-at-a-time test fetches, a quarter more than the journal holds records, so one range per
-/// fetch would pass the bound.
+fn ranges_per_page() -> usize {
+  rustix::param::page_size() / slates_bridge_fuse::coherence::RANGE_BYTES
+}
+
+/// Derived: the pages the page-at-a-time test fetches, a quarter more than a page of ranges, so one range per fetch
+/// would make the mount's room grow a second page.
 #[cfg(target_os = "linux")]
-const FETCHED_PAGES: usize = MAP_JOURNAL_RECORDS + MAP_JOURNAL_RECORDS / 4;
+fn fetched_pages() -> usize {
+  ranges_per_page() + ranges_per_page() / 4
+}
+
+/// The shard metadata the daemon has committed beyond `id`'s journal growth: the volumes' records, and the byte
+/// states' rooms (A-155, A-157).
+#[cfg(target_os = "linux")]
+fn metadata_beyond_the_journal(instance: &str, id: &str) -> u64 {
+  let (_, status, _) = run(instance, &["status", id]);
+  committed_metadata(instance)
+    .saturating_sub(leading_number(&value_of(&status, "journal_grown_bytes")))
+}
 
 /// The dirty-page write-back rule over a map its kernel fetched a page at a time while the volume was busy, as a guest's
 /// DAX window is faulted in (§4.6; the bug record above). Each fetch is at a journal head of its own, so the mount must
-/// raise the points it has consumed past, or the file's states keep one range per page and are lost past the bound.
-/// Do: map a [`FETCHED_PAGES`]-page file; tell its kernel to read it a page at a time (`POSIX_FADV_RANDOM`, which
-/// forgoes readahead); read every page through the mount, writing another file through the SDK between reads; store a
-/// byte in a middle page and in the last through the map; sync. Expect the sync to succeed and slates to hold both
-/// stores, every other byte as it was. Linux only, as above.
+/// raise the points it has consumed past, or the file's states keep one range per page. Do: map a file of
+/// [`fetched_pages`] pages; tell its kernel to read it a page at a time (`POSIX_FADV_RANDOM`, which forgoes readahead);
+/// read every page through the mount, writing another file through the SDK between reads; store a byte in a middle page
+/// and in the last through the map; sync. Expect the sync to succeed and slates to hold both stores, every other byte as
+/// it was; and the shard's metadata beyond the journal's growth not to have moved past the file's open, so the states
+/// never needed a second page of room (A-155): without the raise, one range a fetch would have. Linux only, as above.
 #[cfg(target_os = "linux")]
 #[test]
 #[allow(clippy::disallowed_methods)] // the test's own reads through the slates mount: RAM, not disk
@@ -7228,18 +7285,20 @@ fn a_map_fetched_a_page_at_a_time_under_activity_keeps_its_write_backs() {
     return;
   }
   let page = rustix::param::page_size();
-  if FETCHED_PAGES.saturating_mul(page) > MAP_VOLUME_QUOTA * 3 / 4 {
+  let fetched = fetched_pages();
+  if fetched.saturating_mul(page) > MAP_VOLUME_QUOTA * 3 / 4 {
     eprintln!(
-      "SKIP a_map_fetched_a_page_at_a_time: {FETCHED_PAGES} pages of {page} bytes leave the {MAP_VOLUME_QUOTA}-byte quota no room"
+      "SKIP a_map_fetched_a_page_at_a_time: {fetched} pages of {page} bytes leave the {MAP_VOLUME_QUOTA}-byte quota no room"
     );
     return;
   }
-  let mut fixture = MappedThroughAMount::with_pages("mapfetched", b'A', FETCHED_PAGES);
+  let mut fixture = MappedThroughAMount::with_pages("mapfetched", b'A', fetched);
   let length = fixture.length;
+  let opened = metadata_beyond_the_journal(&fixture.instance, &fixture.id);
   let fadvised = rustix::fs::fadvise(&fixture.file, 0, None, rustix::fs::Advice::Random);
   assert!(fadvised.is_ok(), "page-at-a-time reads: {fadvised:?}");
   let mut bytes = vec![0u8; page];
-  for index in 0..FETCHED_PAGES {
+  for index in 0..fetched {
     let at = u64::try_from(index * page).unwrap();
     let read = fixture.file.read_exact_at(&mut bytes, at);
     assert!(read.is_ok(), "page {index} through the mount: {read:?}");
@@ -7251,7 +7310,7 @@ fn a_map_fetched_a_page_at_a_time_under_activity_keeps_its_write_backs() {
     );
     assert!(wrote.is_ok(), "unrelated write {index}: {wrote:?}");
   }
-  let middle = FETCHED_PAGES / 2 * page + 10;
+  let middle = fetched / 2 * page + 10;
   let last = length - page + 10;
   fixture.view()[middle] = b'M';
   fixture.view()[last] = b'L';
@@ -7261,7 +7320,12 @@ fn a_map_fetched_a_page_at_a_time_under_activity_keeps_its_write_backs() {
   expected[last] = b'L';
   assert!(
     fixture.volume_bytes() == expected,
-    "both stores reached slates after {FETCHED_PAGES} fetches at heads of their own"
+    "both stores reached slates after {fetched} fetches at heads of their own"
+  );
+  assert_eq!(
+    metadata_beyond_the_journal(&fixture.instance, &fixture.id),
+    opened,
+    "the states kept within the room the file's open reserved: the raise merged the fetches' points"
   );
 }
 

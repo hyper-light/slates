@@ -12043,6 +12043,15 @@ Applied in the same change to:
   The journal holds exactly those, and grows to the largest such backlog a live reader ever had. So the budget is the
   product, measured at the moment of need rather than estimated. The Disruptor's producers track their consumers'
   sequences so the ring never wraps past an unread entry. This ring grows instead of making its producers wait.
+- **How close it follows.** A reader's point is the start of its round in flight, since a refused round is gathered
+  again from there (A-141). So the journal keeps that round's batch until the next round begins, and the budget is at
+  most two consecutive backlogs, or the floor. Measured on the box (BENCHMARKS, 2026-10-24):
+  - git clone, cargo build and the SDK ring each ended at 4,096–16,896 bytes, every one within twice its largest
+    backlog and 8 of 9 within a page of it;
+  - no overrun and no refused growth;
+  - the share would have reserved 10,737,418 bytes for each of those 1 GiB volumes.
+  Advancing the point when a round's delivery is confirmed would halve the worst case. It is not taken at tens of
+  kilobytes.
 - **Why first the borrowers.** Two things leaned on the journal's depth:
   - the byte states, whose bound was its capacity: charged to the ledger since A-155;
   - a restored mount's lazy adoption, which read it back to the mount's start: tracked from the start since A-156.

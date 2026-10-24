@@ -1,10 +1,11 @@
-//! What a volume's journal is asked to hold against what it holds (§4.5 "Journal"; GAPS, "the journal's budget is a
-//! fixed share"). The design sizes the journal as the mutation rate times the longest subscriber lag times the record
-//! size; the daemon holds a fixed 10‰ of the quota instead. Every mount round records what waited for it
-//! (`OpLog::note_round`), and by Little's law that backlog is the formula's product, measured. This bench runs real
-//! workloads against FUSE mounts and reads the volume's journal report after each: the largest backlog any round found
-//! (records, bytes, and how long its oldest record waited), the longest wait, the mean record charge, the records
-//! appended and dropped, and the overruns, beside the budget the volume holds.
+//! What a volume's journal is asked to hold against what it holds (§4.5 "Journal"; A-157). The design sizes the journal
+//! as the mutation rate times the longest subscriber lag times the record size. Every mount round records what waited
+//! for it (`OpLog::note_round`), and by Little's law that backlog is the formula's product, measured. Since A-157 the
+//! journal holds exactly that: it keeps what a live reader still owes, from a one-page floor, growing from the shard's
+//! metadata ledger. Until then it held a fixed 10‰ of the quota. This bench runs real workloads against FUSE mounts and
+//! reads the volume's journal report after each: the largest backlog any round found (records, bytes, and how long its
+//! oldest record waited), the longest wait, the mean record charge, the records appended and dropped, the overruns, and
+//! the budget the volume ends at with the ledger's growth and refusals in it.
 //!
 //! A mount's own changes are behind its cursor, so its rounds find only another path's changes waiting. Each workload
 //! therefore changes the volume through one path while a second mount of it watches:
@@ -16,7 +17,8 @@
 //!   of A-141's reproduction, over files the watcher has read.
 //!
 //! Rows are `journal\t<workload>\t<run>\t<seconds>\t<appended>\t<dropped>\t<rounds>\t<overruns>\t<largest_records>\t`
-//! `<largest_bytes>\t<largest_lag_ns>\t<longest_lag_ns>\t<mean_record_bytes>\t<budget_bytes>\t<load>`. Runs interleave
+//! `<largest_bytes>\t<largest_lag_ns>\t<longest_lag_ns>\t<mean_record_bytes>\t<budget_bytes>\t<grown_bytes>\t`
+//! `<growth_refused>\t<load>`. Runs interleave
 //! the workloads, so drift in the machine's load falls on all three, and every run is printed, never a best one.
 //! Nothing here gates; `docs/wip/BENCHMARKS.md` records the runs.
 //!
@@ -65,7 +67,8 @@ mod linux {
   const RING_WRITES: usize = 64_000;
   /// Shape: the files the SDK workload replaces in turn, each read through the watcher first, as a reader would.
   const RING_FILES: usize = 64;
-  /// Shape: each replacement's length — small enough that a whole replacement fits one ring slot (A-141's reproduction).
+  /// Shape: each replacement's length — small enough that a whole replacement fits one ring slot (A-141's
+  /// reproduction).
   const RING_FILE_BYTES: usize = 64;
   /// Format: a regular file's permission bits, owner read-write and everyone else read.
   const FILE_MODE: u32 = 0o644;
@@ -153,7 +156,7 @@ mod linux {
   /// One row: the workload, the run, how long the workload took, the journal report and the machine's load.
   fn row(workload: Workload, run: usize, elapsed: Duration, journal: &JournalReport) -> String {
     format!(
-      "journal\t{}\t{run}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+      "journal\t{}\t{run}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
       workload.name(),
       elapsed.as_secs_f64(),
       journal.appended,
@@ -166,6 +169,8 @@ mod linux {
       journal.longest_lag_ns,
       journal.mean_record_bytes,
       journal.budget_bytes,
+      journal.grown_bytes,
+      journal.growth_refused,
       load()
     )
   }
@@ -442,7 +447,7 @@ mod linux {
     };
     println!(
       "journal\tworkload\trun\tseconds\tappended\tdropped\trounds\toverruns\tlargest_records\tlargest_bytes\t\
-       largest_lag_ns\tlongest_lag_ns\tmean_record_bytes\tbudget_bytes\tload"
+       largest_lag_ns\tlongest_lag_ns\tmean_record_bytes\tbudget_bytes\tgrown_bytes\tgrowth_refused\tload"
     );
     for run in 0..RUNS {
       for workload in [Workload::GitClone, Workload::CargoBuild, Workload::SdkRing] {
