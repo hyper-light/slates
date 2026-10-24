@@ -1746,6 +1746,12 @@ pub struct JournalReport {
   /// How many records the slowest open reader may still read: the head less its point. Zero with no reader open.
   /// Appended.
   pub slowest_reader_behind: u64,
+  /// The bytes the shard's metadata ledger granted the budget beyond its one-page floor, as a live reader needed them
+  /// (A-157). Appended.
+  pub grown_bytes: u64,
+  /// Growths the ledger refused, each overrunning the reader that still owed the record dropped. Zero is the healthy
+  /// reading. Appended.
+  pub growth_refused: u64,
 }
 
 /// One host mount of a volume, bound to its mount point (§4.4 `Bound`).

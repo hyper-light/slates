@@ -15,9 +15,10 @@
 //! already held.
 //!
 //! **Why consumed, not walked back.** A first version walked the journal back from each page's fetch point at
-//! write-back. The journal keeps a share of the quota (10‰: some 850 records for an 8 MiB volume), so a long-lived map
-//! — exactly DAX — outlived its records and its write-backs were refused: measured 2026-10-21, 2 runs of 3. Consumed as
-//! they arrive, as the transport already consumes the journal for its invalidations, a fetch of any age is judged.
+//! write-back. The journal keeps only what its live readers have yet to read (A-157; it then kept 10‰ of the quota,
+//! some 850 records for an 8 MiB volume), so a long-lived map — exactly DAX — outlived its records and its write-backs
+//! were refused: measured 2026-10-21, 2 runs of 3. Consumed as they arrive, as the transport already consumes the
+//! journal for its invalidations, a fetch of any age is judged.
 
 use std::ops::Range;
 

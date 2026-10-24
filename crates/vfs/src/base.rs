@@ -1973,6 +1973,7 @@ impl Overlay<'_> {
         }
         let to_path = self.vol.path_of(store, to_dir, to_name);
         self.vol.record(
+          &mut store.metadata,
           Op::Redirect { from: from.into() },
           to_path,
           Some(moved.inode),
@@ -2325,7 +2326,9 @@ impl Overlay<'_> {
       let prev = store.inodes.get(handle)?.version;
       store.inodes.get_mut(handle)?.body = Body::Symlink(target);
       let path = self.vol.path_of_inode(store, no).unwrap_or_default();
-      self.vol.record(Op::Witness, path, Some(no), prev);
+      self
+        .vol
+        .record(&mut store.metadata, Op::Witness, path, Some(no), prev);
       return Ok(());
     }
     let is_base = matches!(self.vol.inode(store, no)?.body, Body::Base(_));
@@ -2417,7 +2420,9 @@ impl Overlay<'_> {
       self.plane()?.descriptors.insert(no, file);
     }
     let path = self.vol.path_of_inode(store, no).unwrap_or_default();
-    self.vol.record(Op::Witness, path, Some(no), prev);
+    self
+      .vol
+      .record(&mut store.metadata, Op::Witness, path, Some(no), prev);
     Ok(())
   }
 
@@ -2941,7 +2946,9 @@ impl Overlay<'_> {
     });
     if fresh {
       let path = self.vol.path_of_inode(store, no).unwrap_or_default();
-      self.vol.record(Op::Drift, path, Some(no), 0);
+      self
+        .vol
+        .record(&mut store.metadata, Op::Drift, path, Some(no), 0);
     }
   }
 
@@ -3582,7 +3589,13 @@ impl Overlay<'_> {
         self.host.close_file(file);
       }
       let path = self.vol.path_of_inode(store, no).unwrap_or_default();
-      self.vol.record(Op::Witness, path.as_str(), Some(no), prev);
+      self.vol.record(
+        &mut store.metadata,
+        Op::Witness,
+        path.as_str(),
+        Some(no),
+        prev,
+      );
       done.push(path);
     }
     Ok(done)

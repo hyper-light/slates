@@ -1791,7 +1791,10 @@ drift check `fstat`s.
   extents); the bridge's change-notification path, the SDK's watch stream and the deriver of
   §4.16 read it; witness, whiteout,
   redirect and drift records are journaled the same way; retention is bounded by a memory budget
-  derived from the volume's measured mutation rate and the longest subscriber lag.
+  derived from the volume's measured mutation rate and the longest subscriber lag (A-157). The
+  journal keeps what a live reader still owes. It starts at a one-page floor and grows from the
+  shard's metadata ledger when a record a reader has not read would otherwise leave. A reader
+  silent past its transport's liveness pins nothing, and a refused growth is counted.
 
 **Failure matrix.** Hash collision on equivalence (two names fold equal): Refused (`EEXIST`),
 which is APFS behaviour. Cut-over conversion mid-operation: Masked (conversion is a copy of a
@@ -1813,7 +1816,8 @@ curves; starting point one SIMD group of hashes); ordered node fanout = entries 
 lines; small chunk = smallest page multiple ≥ p90 sealed size; large chunk = memcpy-curve knee;
 content granule (the block unit, A-69) = the host page, but at most the smallest target page (4 KiB);
 CDC threshold = size above which measured dedup gain per hashed byte exceeds hashing cost; journal
-budget = mutation rate × max subscriber lag × record size; copy-up class boundary = the CDC
+budget = mutation rate × max subscriber lag × record size, realized as the largest backlog a live reader had, from a
+one-page floor (A-157); copy-up class boundary = the CDC
 threshold; racy window = the base filesystem's timestamp granularity (from a cited per-filesystem
 table keyed by the type `statfs` reports) plus the measured clock resolution; watcher coalescing
 window = measured p50 inter-arrival of event bursts; descriptor budget for large-class copy-ups =
@@ -2345,9 +2349,10 @@ Two other ways were measured and rejected:
 - Walking the journal back from each fetch cannot either, because a long-lived map outlives the journal's retention
   (A-140).
 
-**A mount that falls behind the journal is told everything** (A-141). The journal keeps a bounded share of the quota.
-When more changes land between two of a mount's rounds than it keeps, the gather reports an overrun instead of walking
-from the oldest record still held, which silently skipped the rest. The mount then invalidates every node and name its
+**A mount that falls behind the journal is told everything** (A-141). The journal keeps what its live readers still
+owe (A-157), so a mount falls behind it only when the shard's metadata ledger refuses the journal's growth, or when the
+mount has been silent past its liveness. Then the gather reports an overrun instead of walking from the oldest record
+still held, which silently skipped the rest. The mount then invalidates every node and name its
 kernel holds, which it knows by following the FUSE lookup protocol as each reply reaches the kernel. Writers never wait
 on a mount that falls behind; an overrun costs a cold cache instead, counted as `fuse.journal_overruns`.
 
@@ -11988,6 +11993,68 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
+
+### A-157 — The journal keeps what a live reader still needs, growing from the metadata ledger (accepted 2026-10-23)
+Applied in the same change to:
+- §4.5 (Journal retention; the derived constants);
+- §4.6 (a mount that falls behind the journal);
+- A-141 (an overrun now needs a refused growth or a reader silent past its liveness);
+- `crates/vfs/src/journal.rs`:
+  - readers carry a patience;
+  - `OpLog::append` takes the shard's metadata ledger and grows the budget for a record a live reader still owes;
+  - `grown` and `growth_refused`;
+- `crates/vfs/src/volume.rs`:
+  - `Volume::record` takes the ledger, at all 24 of its call sites (`volume.rs`, `base.rs`, `xattr.rs`);
+  - `open_journal_reader` takes the patience;
+  - `journal_grown`;
+- `crates/server/src/verbs.rs`:
+  - `JOURNAL_SHARE_PERMILLE` and `journal_bytes_for` replaced by `journal_floor_bytes` (one page) at creation and
+    recovery;
+  - `release_slot_credits` returns the growth;
+  - the journal report gains `grown_bytes` and `growth_refused`;
+- `crates/server/src/fuse.rs`: a FUSE mount's reader is opened with the daemon's liveness budget as its patience;
+- `crates/ipc/src/protocol.rs`, `crates/cli/src/verbs.rs`, `crates/mcp/src/lib.rs`: the report's two fields;
+- the tests:
+  - `crates/vfs/src/journal.rs`: `retention_keeps_what_a_live_reader_needs_as_the_model_does`;
+  - `crates/bridge-core/tests/invalidation.rs`:
+    - `a_live_readers_records_are_kept_by_growing_from_the_ledger`;
+    - `a_reader_past_its_patience_pins_nothing_and_overruns`;
+    - `a_growth_the_ledger_refuses_overruns_its_reader_and_is_counted`;
+- the module docs of `crates/bridge-core/src/changed.rs` and `crates/vfs/examples/create_heap.rs`;
+- GAPS.
+
+- **What it answers.** §4.5 derives the journal's budget as the mutation rate times the longest subscriber lag times
+  the record size. The code took a fixed 10‰ of the quota instead, citing a ratification the ledger never held
+  (R3). Measured on real workloads, the largest backlog any round found was 39,424 bytes, where a 1 GiB volume's share
+  was 10,737,418 (BENCHMARKS, 2026-10-23). And a volume under 3.76 MiB held less than that backlog.
+- **The rule.**
+  - The journal's budget starts at a one-page floor, reserved with the volume's records.
+  - While an incoming record does not fit, the oldest record leaves only if every open reader has read past it, or if
+    it has waited longer than the patience of the reader still owing it.
+  - Otherwise, once an append, the budget grows by the shortfall, reserved from the shard's metadata ledger.
+  - A refused growth keeps the budget, drops the oldest record, and is counted. The reader that owed it overruns
+    (A-141).
+  - A FUSE mount's patience is the daemon's liveness budget: a reader silent that long is not keeping up with a live
+    daemon, and is presumed gone.
+  - The budget never shrinks while the volume lives. Its growth is returned at teardown, as a dynamic volume's byte
+    growth is. A rebuilt journal starts at the floor.
+  - Writers never wait.
+- **Why it is the formula.** By Little's law, the records a reader has yet to read are the mutation rate times its lag.
+  The journal holds exactly those, and grows to the largest such backlog a live reader ever had. So the budget is the
+  product, measured at the moment of need rather than estimated. The Disruptor's producers track their consumers'
+  sequences so the ring never wraps past an unread entry. This ring grows instead of making its producers wait.
+- **Why first the borrowers.** Two things leaned on the journal's depth:
+  - the byte states, whose bound was its capacity: charged to the ledger since A-155;
+  - a restored mount's lazy adoption, which read it back to the mount's start: tracked from the start since A-156.
+  With both moved off it first, a smaller journal costs neither.
+- **Proven.**
+  - The oracle compares retention, budget, growth and refusals with an independent model after every step of 2000
+    histories, with the ledger's commitment equal to the growth. While nothing was refused, it checks directly that no
+    record a live reader owes within its patience has left. With growth disabled it fails at a shrunk two-record case.
+  - The bridge tests show:
+    - a live reader's records kept by growing, with no overrun;
+    - a reader past its patience overrunning;
+    - a refused growth counted and overrunning.
 
 ### A-156 — A restored mount tracks the files the last publication counted open from its start (accepted 2026-10-23)
 Applied in the same change to:

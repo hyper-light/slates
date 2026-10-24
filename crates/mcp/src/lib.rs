@@ -1539,6 +1539,8 @@ pub fn status_json(r: &StatusReport) -> Value {
       "longest_lag_ns": r.journal.longest_lag_ns,
       "readers": r.journal.readers,
       "slowest_reader_behind": r.journal.slowest_reader_behind,
+      "grown_bytes": r.journal.grown_bytes,
+      "growth_refused": r.journal.growth_refused,
     },
   })
 }

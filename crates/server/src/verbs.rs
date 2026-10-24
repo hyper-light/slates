@@ -43,9 +43,6 @@ use slates_wire::request::{RequestId, Seen};
 use crate::error::{refusal_of_db, refusal_of_vfs};
 use crate::state::{ClientSlot, Deferred, PendingForward, ShardState, VolumeSlot};
 
-/// Shape: the share of a volume's quota its journal may take, parts per thousand (ratified
-/// GAPS §5: the op log of a bounded volume stays a small fraction of its bytes).
-const JOURNAL_SHARE_PERMILLE: u64 = 10;
 /// Format: parts per thousand.
 const PERMILLE: u64 = 1000;
 /// Shape: the destroy slice's budget as a share of the shard's step budget, parts per
@@ -3950,16 +3947,18 @@ pub(crate) fn find(
   Ok((handle, record))
 }
 
-/// The journal retention budget for a volume of the given quota: a per-mille share of the quota,
-/// at least one page (§4.16 journal). Shared by fresh creation and recovery so a rebuilt volume's
-/// journal is sized as its original was.
-fn journal_bytes_for(state: &ShardState, quota: &Quota) -> usize {
+/// The journal's floor (§4.5, A-157): one page, reserved with the volume's records at admission. Above it the
+/// journal grows from the shard's metadata ledger, as far as a live reader's backlog needs and no further, so its
+/// budget is the formula's product measured at the moment of need: the mutation rate times a reader's lag times the
+/// record size. Until 2026-10-23 every volume reserved a fixed 10‰ of its quota here, whatever it needed. Shared by
+/// creation and recovery: a rebuilt journal starts empty, at the floor.
+fn journal_floor_bytes(state: &ShardState) -> usize {
   derived!(
-    usize::try_from(quota.limit().saturating_mul(JOURNAL_SHARE_PERMILLE) / PERMILLE)
-      .unwrap_or(usize::MAX)
-      .max(usize::try_from(state.config.geometry.page).unwrap_or(1)),
-    "quota × JOURNAL_SHARE_PERMILLE / 1000, at least one page",
-    ["quota", "GAPS §5 journal share"]
+    usize::try_from(state.config.geometry.page)
+      .unwrap_or(1)
+      .max(1),
+    "one page: the journal's floor, which it grows from as a live reader needs",
+    ["page"]
   )
   .get()
 }
@@ -4042,7 +4041,7 @@ pub(crate) fn volume_config(
 ) -> VolumeConfig {
   let prefix = state.next_prefix;
   state.next_prefix = state.next_prefix.wrapping_add(1).max(1);
-  let journal_bytes = journal_bytes_for(state, &quota);
+  let journal_bytes = journal_floor_bytes(state);
   VolumeConfig {
     prefix,
     names: match names {
@@ -4162,7 +4161,7 @@ fn create(
   // reserved against the shard's metadata ledger before anything is allocated (§4.2 metadata
   // dimension: "an uncharged heap allocation cannot sit outside the bound").
   let quota = quota_for(size);
-  let journal_bytes = journal_bytes_for(state, &quota);
+  let journal_bytes = journal_floor_bytes(state);
   let metadata_credit = match reserve_metadata(state, journal_bytes) {
     Ok(credit) => Some(credit),
     Err(refusal) => return give_back(state, reservation, version_credit, None, refusal),
@@ -6877,6 +6876,14 @@ fn release_slot_credits(state: &mut ShardState, slot: &VolumeSlot) {
       .budget
       .release(slates_mem::budget::Reservation { bytes: held });
   }
+  // The journal's growth beyond its floor, granted from the metadata ledger as a live reader needed it (A-157).
+  let grown = slot.volume.journal_grown();
+  if grown > 0 {
+    state
+      .store
+      .metadata
+      .release(slates_mem::budget::MetadataCredit { bytes: grown });
+  }
 }
 
 fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> ReplyBody {
@@ -6969,6 +6976,8 @@ fn journal_report(volume: &Volume) -> slates_ipc::protocol::JournalReport {
     slowest_reader_behind: log
       .slowest_reader()
       .map_or(0, |point| log.head_seq().saturating_sub(point)),
+    grown_bytes: log.grown(),
+    growth_refused: log.growth_refused(),
   }
 }
 
@@ -9540,7 +9549,7 @@ fn rebuild_volume(
     };
   // Re-acquire the records' metadata reservation (§4.2 accounting through recovery), giving every
   // other credit and the rebuilt volume back if the ledger cannot back it.
-  let journal_bytes = journal_bytes_for(state, &quota_for(size));
+  let journal_bytes = journal_floor_bytes(state);
   let metadata_credit = match reserve_metadata(state, journal_bytes) {
     Ok(credit) => Some(credit),
     Err(refusal) => {
@@ -9586,7 +9595,7 @@ fn build_recovered_volume(
   let image =
     image.ok_or_else(|| "RecoveryIncomplete: no content image for the volume".to_owned())?;
   let quota = quota_for(size);
-  let journal = journal_bytes_for(state, &quota);
+  let journal = journal_floor_bytes(state);
   let mut opened = match &record.base {
     BaseRecord::Scratch => None,
     BaseRecord::Path { path } => Some(

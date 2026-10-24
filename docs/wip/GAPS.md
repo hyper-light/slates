@@ -10764,7 +10764,10 @@ stale page back, and the other write's bytes on it reverted: measured 4,095 of 4
   each file's bound: they are charged to the shard's metadata ledger while the mount lives, so a smaller journal cannot
   shrink them. Since A-156 (2026-10-23) a restored mount tracks every file the last publication counted open for it from
   its start, so no adoption of those reads the journal back (a handle opened after that publication still adopts lazily,
-  as A-147 did). Next: retention keeps what a live reader needs, growing from the ledger (step 4).
+  as A-147 did). Since A-157 (2026-10-23) retention keeps what a live reader still owes: the budget starts at one page
+  and grows from the shard's metadata ledger when a record a reader has not read would otherwise leave; a reader silent
+  past the daemon's liveness pins nothing; a refused growth is counted; `JOURNAL_SHARE_PERMILLE` is gone. Next: real
+  mounts on the box with the bench rerun (step 5), then this entry closes with the recorded results.
 - **A restored mount's files — fixed 2026-10-22 (A-147).** A mount taken over across a daemon restart (A-61) has files
   whose writable opens predate the daemon. They had no byte states, so their write-backs were judged from the mount's
   start against every record since. Worse than the `EIO` this entry recorded: a store made after a re-fetch of bytes

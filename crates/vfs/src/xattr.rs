@@ -221,7 +221,13 @@ impl Volume {
       inode.fold_counter(folded);
     }
     inode.stamp_change(now);
-    self.record(Op::RemoveXattr { name: name.into() }, "", Some(no), prev);
+    self.record(
+      &mut store.metadata,
+      Op::RemoveXattr { name: name.into() },
+      "",
+      Some(no),
+      prev,
+    );
     for old in std::iter::once(removed).chain(dropped) {
       self.drop_link(store, old)?;
     }
@@ -256,7 +262,13 @@ impl Volume {
     let inode = store.inodes.get_mut(handle)?;
     let prev = inode.version;
     inode.stamp_change(now);
-    self.record(Op::SetXattr { name: name.into() }, "", Some(no), prev);
+    self.record(
+      &mut store.metadata,
+      Op::SetXattr { name: name.into() },
+      "",
+      Some(no),
+      prev,
+    );
     self.attribute_writes_in_place = self.attribute_writes_in_place.saturating_add(1);
     Ok(())
   }
@@ -506,7 +518,13 @@ impl Volume {
       inode.fold_counter(folded);
     }
     inode.stamp_change(now);
-    self.record(Op::SetXattr { name: name.into() }, "", Some(owner), prev);
+    self.record(
+      &mut store.metadata,
+      Op::SetXattr { name: name.into() },
+      "",
+      Some(owner),
+      prev,
+    );
     Ok((replaced, dropped))
   }
 

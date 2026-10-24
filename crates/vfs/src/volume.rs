@@ -1052,11 +1052,18 @@ impl Volume {
   }
 
   /// Opens a journal reader for transport attachment `key` (§4.5): a FUSE mount that consumes the journal from the
-  /// moment it serves, so the records after the head now are the first it may read. Its owner closes it when the
+  /// moment it serves, so the records after the head now are the first it may read. A record it has not read holds the
+  /// journal's budget until it has waited `patience_ns`, the transport's liveness (A-157). Its owner closes it when the
   /// mount ends ([`Volume::close_journal_reader`]).
-  pub fn open_journal_reader(&mut self, key: u64) {
+  pub fn open_journal_reader(&mut self, key: u64, patience_ns: u64) {
     let head = self.journal.head_seq();
-    self.journal.open_reader(key, head);
+    self.journal.open_reader(key, head, patience_ns);
+  }
+
+  /// The bytes the shard's metadata ledger granted the journal beyond its floor (A-157): what the volume's owner
+  /// returns to the ledger at its teardown, as it returns a dynamic volume's byte growth.
+  pub fn journal_grown(&self) -> u64 {
+    self.journal.grown()
   }
 
   /// Closes the journal reader of transport attachment `key`; a key with no reader open is left alone.
@@ -1946,6 +1953,7 @@ impl Volume {
     self.touch_dir(store, dir, now)?;
     let path = self.path_of(store, dir, name);
     self.record(
+      &mut store.metadata,
       if kind.is_special() {
         Op::Mknod
       } else {
@@ -2008,7 +2016,7 @@ impl Volume {
     self.touch_dir(store, dir, now)?;
     self.adjust_nlink(store, store.dirs.get(dir)?.inode, 1)?;
     let path = self.path_of(store, dir, name);
-    self.record(Op::Mkdir, path, Some(no), 0);
+    self.record(&mut store.metadata, Op::Mkdir, path, Some(no), 0);
     Ok(child)
   }
 
@@ -2063,7 +2071,7 @@ impl Volume {
     }
     self.touch_dir(store, dir, now)?;
     let path = self.path_of(store, dir, name);
-    self.record(Op::Symlink, path, Some(no), 0);
+    self.record(&mut store.metadata, Op::Symlink, path, Some(no), 0);
     Ok(no)
   }
 
@@ -2131,7 +2139,7 @@ impl Volume {
     self.touch_dir(store, dir, now)?;
     let path = self.path_of(store, dir, name);
     let prev = self.inode(store, target)?.version;
-    self.record(Op::Link, path, Some(target), prev);
+    self.record(&mut store.metadata, Op::Link, path, Some(target), prev);
     // An orphan named again (an `O_TMPFILE` given a name by `linkat`) is in the namespace once more: it leaves the
     // orphan record, and the retention its unlink secured for a reclaim that will not happen now goes back (§4.2).
     if let Some(secured) = self.orphans.remove(&target) {
@@ -2179,7 +2187,13 @@ impl Volume {
     self.dir_remove(store, dir, name)?;
     self.drop_link(store, located.inode)?;
     self.touch_dir(store, dir, now)?;
-    self.record(Op::Unlink, path.as_str(), Some(located.inode), 0);
+    self.record(
+      &mut store.metadata,
+      Op::Unlink,
+      path.as_str(),
+      Some(located.inode),
+      0,
+    );
     self.record_whiteout(store, dir, name, &path)?;
     Ok(())
   }
@@ -2211,7 +2225,13 @@ impl Volume {
     self.drop_link(store, located.inode)?;
     self.adjust_nlink(store, store.dirs.get(dir)?.inode, -1)?;
     self.touch_dir(store, dir, now)?;
-    self.record(Op::Rmdir, path.as_str(), Some(located.inode), 0);
+    self.record(
+      &mut store.metadata,
+      Op::Rmdir,
+      path.as_str(),
+      Some(located.inode),
+      0,
+    );
     self.record_whiteout(store, dir, name, &path)?;
     Ok(())
   }
@@ -2457,6 +2477,7 @@ impl Volume {
     self.touch_dir(store, to_dir, now)?;
     let to_path = self.path_of(store, to_dir, to_name);
     self.record(
+      &mut store.metadata,
       Op::Rename {
         from: from_path.into(),
       },
@@ -2625,7 +2646,7 @@ impl Volume {
       }
     };
     if recorded == Recorded::Yes {
-      self.record(op, "", Some(no), prev_version);
+      self.record(&mut store.metadata, op, "", Some(no), prev_version);
     }
     Ok(written)
   }
@@ -2811,7 +2832,13 @@ impl Volume {
     inode.attrs.mtime = now;
     inode.stamp_change(now);
     if recorded == Recorded::Yes {
-      self.record(Op::Truncate { len }, "", Some(no), prev_version);
+      self.record(
+        &mut store.metadata,
+        Op::Truncate { len },
+        "",
+        Some(no),
+        prev_version,
+      );
     }
     Ok(())
   }
@@ -2826,7 +2853,7 @@ impl Volume {
     let prev = inode.version;
     inode.attrs.mode = mode;
     inode.stamp_change(now);
-    self.record(Op::Setattr, "", Some(no), prev);
+    self.record(&mut store.metadata, Op::Setattr, "", Some(no), prev);
     // A mode where some class cannot write lets a write delegation launder that class's forbidden truncate:
     // recall the file's write delegations so the next truncate is re-checked as the acting user, not the
     // holder (the NFSv4 escape; RFC 8881 §10.4.4 recall-on-need).
@@ -2856,7 +2883,7 @@ impl Volume {
     inode.attrs.gid = gid;
     inode.stamp_change(now);
     let write_restricted = inode.attrs.mode & ALL_WRITE_BITS != ALL_WRITE_BITS;
-    self.record(Op::Setattr, "", Some(no), prev);
+    self.record(&mut store.metadata, Op::Setattr, "", Some(no), prev);
     // A chown re-sorts the file's users across the mode's classes; if some class cannot write, a still-held write
     // delegation could launder a truncate for a user that class forbids, so recall them (as `chmod` does).
     if write_restricted {
@@ -2907,7 +2934,7 @@ impl Volume {
       inode.attrs.btime = btime;
     }
     inode.stamp_change(ctime.unwrap_or(now));
-    self.record(Op::Setattr, "", Some(no), prev);
+    self.record(&mut store.metadata, Op::Setattr, "", Some(no), prev);
     Ok(())
   }
 
@@ -2945,7 +2972,7 @@ impl Volume {
     }
     self.last_snapshot = Some(id);
     self.epoch = self.epoch.next();
-    self.record(Op::Snapshot, "", None, 0);
+    self.record(&mut store.metadata, Op::Snapshot, "", None, 0);
     Ok(id)
   }
 
@@ -3352,6 +3379,7 @@ impl Volume {
     inode.stamp_change(now);
     if delete_len > 0 {
       self.record(
+        &mut store.metadata,
         Op::Delete {
           at,
           len: delete_len,
@@ -3362,7 +3390,13 @@ impl Volume {
       );
     }
     if inserted > 0 {
-      self.record(Op::Insert { at, len: inserted }, "", Some(no), prev_version);
+      self.record(
+        &mut store.metadata,
+        Op::Insert { at, len: inserted },
+        "",
+        Some(no),
+        prev_version,
+      );
     }
     Ok(())
   }
@@ -5123,7 +5157,7 @@ impl Volume {
   /// Journals a whiteout when the removal of `name` left one (a base name, §4.5).
   fn record_whiteout(
     &mut self,
-    store: &Store,
+    store: &mut Store,
     dir: Handle<DirNode>,
     name: &str,
     path: &str,
@@ -5135,7 +5169,7 @@ impl Volume {
       .lookup(&store.blocks, self.policy, name)
       .is_some_and(|e| e.child == Child::Whiteout);
     if left {
-      self.record(Op::Whiteout, path, None, 0);
+      self.record(&mut store.metadata, Op::Whiteout, path, None, 0);
     }
     Ok(())
   }
@@ -6242,8 +6276,11 @@ impl Volume {
     Ok(false)
   }
 
+  /// Journals a mutation (§4.5): the journal may grow its budget from `ledger`, the shard's metadata ledger, to keep a
+  /// record a live reader still owes (A-157).
   pub(crate) fn record(
     &mut self,
+    ledger: &mut slates_mem::budget::MetadataBudget,
     op: Op,
     path: impl Into<Box<str>>,
     inode: Option<InodeNo>,
@@ -6252,7 +6289,7 @@ impl Volume {
     let at = self.clock.monotonic_ns();
     self
       .journal
-      .append(op, path, inode, self.epoch, at, prev_version);
+      .append(ledger, op, path, inode, self.epoch, at, prev_version);
     self.change.changed();
   }
 

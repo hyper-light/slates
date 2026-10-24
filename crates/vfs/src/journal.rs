@@ -1,7 +1,16 @@
 //! The op log (§4.5, "Journal"): every mutation appends a declared operation with its path(s),
 //! inode, epoch, offset, length and the inode's version before it; bytes never enter the journal.
-//! Retention is a byte budget derived from the measured mutation rate and the longest subscriber
-//! lag; the oldest records leave first and the log says how many it dropped.
+//!
+//! Retention keeps what a live reader still needs (A-157). The budget starts at the floor its owner gives it (a
+//! page), and the oldest records leave first while it is full. A record leaves only if every open reader has read past
+//! it ([`OpLog::open_reader`]), or if it has waited longer than the patience of the reader still owing it: that reader
+//! is presumed gone, and overruns if it returns. Otherwise the budget grows by what the incoming record needs, reserved
+//! from the shard's metadata ledger. A refused growth keeps the budget, drops the oldest, and is counted. Writers never
+//! wait. The budget never shrinks while the log lives; its growth is returned at the volume's teardown ([`OpLog::grown`]).
+//! So the budget is the design's formula realized at the moment of need: the largest backlog a live reader ever had,
+//! which by Little's law is the mutation rate times that reader's lag times the record size. The Disruptor's producers
+//! track their consumers' sequences so the ring never wraps past an unread entry; this ring grows instead, since §4.5's
+//! writers never wait on a mount (A-141). Until 2026-10-23 the budget was a fixed 10‰ of the quota.
 //!
 //! The log measures what its consumers find waiting ([`OpLog::note_round`]). §4.5 derives the budget as the mutation
 //! rate times the longest subscriber lag times the record size. A round's backlog is that product measured directly:
@@ -10,6 +19,8 @@
 //! log keeps the maxima since it was made; they are window-free, so the measurement adds no tuning constant (R3).
 
 use std::collections::{BTreeMap, VecDeque};
+
+use slates_mem::budget::MetadataBudget;
 
 use crate::ids::{Epoch, InodeNo};
 
@@ -155,6 +166,16 @@ pub struct JournalMeasure {
   pub longest_lag_ns: u64,
 }
 
+/// An open reader of the log ([`OpLog::open_reader`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Reader {
+  /// The point it may still read every record after.
+  point: u64,
+  /// How long a record may wait for it before it is presumed gone, so the record no longer holds the log's budget
+  /// ([`OpLog::append`]).
+  patience_ns: u64,
+}
+
 /// The log.
 #[derive(Debug)]
 pub struct OpLog {
@@ -164,10 +185,15 @@ pub struct OpLog {
   next_seq: u64,
   dropped: u64,
   measure: JournalMeasure,
-  /// The readers that consume the log, by key, each with the point it may still read every record after
-  /// ([`OpLog::open_reader`]). One entry per open reader; its owner opens one only for a live transport attachment
-  /// and closes it when the attachment ends, so the attachment registry's capacity bounds the map.
-  readers: BTreeMap<u64, u64>,
+  /// The readers that consume the log, by key ([`OpLog::open_reader`]). One entry per open reader; its owner opens one
+  /// only for a live transport attachment and closes it when the attachment ends, so the attachment registry's
+  /// capacity bounds the map.
+  readers: BTreeMap<u64, Reader>,
+  /// The bytes the shard's metadata ledger granted the budget beyond its floor: returned by the volume's owner at its
+  /// teardown.
+  grown: u64,
+  /// Growths the ledger refused, each overrunning the reader that still owed the record dropped.
+  growth_refused: u64,
 }
 
 impl OpLog {
@@ -181,13 +207,16 @@ impl OpLog {
       dropped: 0,
       measure: JournalMeasure::default(),
       readers: BTreeMap::new(),
+      grown: 0,
+      growth_refused: 0,
     }
   }
 
-  /// Opens reader `key` at `point`: until it closes, the reader may read every record after `point`, and each of its
-  /// rounds moves `point` to the round's start ([`OpLog::note_round`]). Opening a key already open moves its point.
-  pub fn open_reader(&mut self, key: u64, point: u64) {
-    self.readers.insert(key, point);
+  /// Opens reader `key` at `point` with `patience_ns`: until it closes, the reader may read every record after `point`,
+  /// and each of its rounds moves `point` to the round's start ([`OpLog::note_round`]). A record it has not read holds
+  /// the log's budget until it has waited `patience_ns` ([`OpLog::append`]). Opening a key already open moves its point.
+  pub fn open_reader(&mut self, key: u64, point: u64, patience_ns: u64) {
+    self.readers.insert(key, Reader { point, patience_ns });
   }
 
   /// Closes reader `key`; a key that is not open is left alone.
@@ -202,7 +231,27 @@ impl OpLog {
 
   /// The earliest point an open reader may still read after, or `None` when no reader is open.
   pub fn slowest_reader(&self) -> Option<u64> {
-    self.readers.values().min().copied()
+    self.readers.values().map(|reader| reader.point).min()
+  }
+
+  /// Whether record `seq`, which has waited `waited_ns`, is still owed to an open reader that is not yet presumed gone:
+  /// one that has not read past it, and whose patience the record has not outlasted.
+  fn owed(&self, seq: u64, waited_ns: u64) -> bool {
+    self
+      .readers
+      .values()
+      .any(|reader| reader.point < seq && waited_ns < reader.patience_ns)
+  }
+
+  /// The bytes the shard's metadata ledger granted the budget beyond its floor, which the volume's owner returns at its
+  /// teardown.
+  pub fn grown(&self) -> u64 {
+    self.grown
+  }
+
+  /// Growths the ledger refused: each dropped a record a live reader still owed, which that reader overran.
+  pub fn growth_refused(&self) -> u64 {
+    self.growth_refused
   }
 
   /// Records what a consuming round of `reader` finds waiting after `cursor` at monotonic time `now_ns`, on the same
@@ -211,8 +260,8 @@ impl OpLog {
   /// gathered while one is in flight (§4.5). A reader that is not open is measured and not registered, so no round
   /// opens a reader its owner would have to close. Costs the records after the cursor, which the round walks anyway.
   pub fn note_round(&mut self, reader: u64, cursor: u64, now_ns: u64) -> Backlog {
-    if let Some(point) = self.readers.get_mut(&reader) {
-      *point = cursor;
+    if let Some(open) = self.readers.get_mut(&reader) {
+      open.point = cursor;
     }
     let backlog = self.backlog_after(cursor, now_ns);
     let measure = &mut self.measure;
@@ -270,9 +319,14 @@ impl OpLog {
     self.bytes
   }
 
-  /// Appends a record, evicting the oldest past the budget; returns the sequence assigned.
+  /// Appends a record and returns the sequence assigned. While the budget is full the oldest leaves, unless a live
+  /// reader still owes it ([`OpLog::open_reader`]): then the budget grows by what the incoming record needs, reserved
+  /// from `ledger`, the shard's metadata ledger. A refused growth keeps the budget and drops the oldest, counted once an
+  /// append ([`OpLog::growth_refused`]).
+  #[allow(clippy::too_many_arguments)] // every field of the record it makes, and the ledger it may grow from
   pub fn append(
     &mut self,
+    ledger: &mut MetadataBudget,
     op: Op,
     path: impl Into<Box<str>>,
     inode: Option<InodeNo>,
@@ -293,7 +347,24 @@ impl OpLog {
     };
     let incoming = record.bytes();
     // The oldest leave before the newest lands, so the ring never holds more than the budget (the newest always stays).
+    let mut asked = false;
     while self.bytes.saturating_add(incoming) > self.budget_bytes {
+      let Some(oldest) = self.records.front() else {
+        break;
+      };
+      if !asked && self.owed(oldest.seq, at.saturating_sub(oldest.at)) {
+        asked = true;
+        let short = self
+          .bytes
+          .saturating_add(incoming)
+          .saturating_sub(self.budget_bytes);
+        if ledger.reserve(charge(short)).is_ok() {
+          self.budget_bytes = self.budget_bytes.saturating_add(short);
+          self.grown = self.grown.saturating_add(charge(short));
+          continue;
+        }
+        self.growth_refused = self.growth_refused.saturating_add(1);
+      }
       let Some(old) = self.records.pop_front() else {
         break;
       };
@@ -388,11 +459,17 @@ fn charge(bytes: usize) -> u64 {
 mod tests {
   use super::*;
 
+  /// A ledger that admits every growth: for the tests of what retention keeps with no reader to grow it for.
+  fn unbounded() -> MetadataBudget {
+    MetadataBudget::new(u64::MAX)
+  }
+
   #[test]
   fn records_are_sequenced_and_the_oldest_leave_at_the_budget() {
     let mut log = OpLog::new(3 * std::mem::size_of::<OpRecord>() + 30);
     for i in 0..5u64 {
       log.append(
+        &mut unbounded(),
         Op::Create,
         format!("f{i}"),
         Some(InodeNo(i)),
@@ -416,7 +493,15 @@ mod tests {
   fn records_since_any_sequence_are_the_retained_ones_after_it() {
     let mut log = OpLog::new(40 * std::mem::size_of::<OpRecord>());
     for i in 0..200u64 {
-      log.append(Op::Create, "", Some(InodeNo(i)), Epoch(0), i, 0);
+      log.append(
+        &mut unbounded(),
+        Op::Create,
+        "",
+        Some(InodeNo(i)),
+        Epoch(0),
+        i,
+        0,
+      );
     }
     assert!(log.dropped() > 0, "the oldest left");
     for seq in 0..=log.head_seq() + 2 {
@@ -448,10 +533,18 @@ mod tests {
   fn a_round_moves_only_its_own_readers_point_and_only_an_opened_reader_is_kept() {
     let mut log = OpLog::new(64 * std::mem::size_of::<OpRecord>());
     for i in 0..6u64 {
-      log.append(Op::Create, "", Some(InodeNo(i)), Epoch(0), i, 0);
+      log.append(
+        &mut unbounded(),
+        Op::Create,
+        "",
+        Some(InodeNo(i)),
+        Epoch(0),
+        i,
+        0,
+      );
     }
-    log.open_reader(7, 2);
-    log.open_reader(9, 4);
+    log.open_reader(7, 2, u64::MAX);
+    log.open_reader(9, 4, u64::MAX);
     assert_eq!((log.readers(), log.slowest_reader()), (2, Some(2)));
     log.note_round(7, 5, 10);
     assert_eq!(
@@ -479,7 +572,15 @@ mod tests {
     let mut log = OpLog::new(64 * std::mem::size_of::<OpRecord>());
     for i in 0..5u64 {
       let path = "x".repeat(usize::try_from(i).unwrap());
-      log.append(Op::Create, path, Some(InodeNo(i)), Epoch(0), 100 * i, 0);
+      log.append(
+        &mut unbounded(),
+        Op::Create,
+        path,
+        Some(InodeNo(i)),
+        Epoch(0),
+        100 * i,
+        0,
+      );
     }
     let backlog = log.note_round(UNOPENED, 2, 1_000);
     assert_eq!(
@@ -503,7 +604,15 @@ mod tests {
   fn a_round_behind_retention_records_the_whole_backlog_and_marks_the_overrun() {
     let mut log = OpLog::new(3 * std::mem::size_of::<OpRecord>());
     for i in 0..10u64 {
-      log.append(Op::Create, "", Some(InodeNo(i)), Epoch(0), 100 * i, 0);
+      log.append(
+        &mut unbounded(),
+        Op::Create,
+        "",
+        Some(InodeNo(i)),
+        Epoch(0),
+        100 * i,
+        0,
+      );
     }
     assert_eq!(log.oldest_seq(), 8, "three retained");
     let backlog = log.note_round(UNOPENED, 1, 2_000);
@@ -530,7 +639,15 @@ mod tests {
       "nothing appended"
     );
     for i in 0..6u64 {
-      log.append(Op::Create, "", Some(InodeNo(i)), Epoch(0), 10 * i, 0);
+      log.append(
+        &mut unbounded(),
+        Op::Create,
+        "",
+        Some(InodeNo(i)),
+        Epoch(0),
+        10 * i,
+        0,
+      );
     }
     let large = log.note_round(UNOPENED, 0, 100);
     let small = log.note_round(UNOPENED, 5, 1_000);
@@ -637,7 +754,7 @@ mod tests {
         match step {
           Step::Append { path, after_ns } => {
             now += after_ns;
-            log.append(Op::Create, "p".repeat(path), None, Epoch(0), now, 0);
+            log.append(&mut unbounded(), Op::Create, "p".repeat(path), None, Epoch(0), now, 0);
             model.append(now, fixed() + charge(path));
             proptest::prop_assert_eq!(log.len(), model.all.len() - model.oldest);
             proptest::prop_assert_eq!(log.oldest_seq(), model.all.get(model.oldest).map_or(charge(model.all.len()) + 1, |r| r.0));
@@ -654,6 +771,175 @@ mod tests {
     }
   }
 
+  /// One step of a generated retention history (A-157): an append with its path length after some time, a reader opened
+  /// some records behind the head with a patience, a reader's round moving its point forward, or a reader closed.
+  #[derive(Clone, Debug)]
+  enum Retain {
+    Append {
+      path: usize,
+      after_ns: u64,
+    },
+    Open {
+      key: u64,
+      behind: u64,
+      patience_ns: u64,
+    },
+    Round {
+      key: u64,
+      forward: u64,
+    },
+    Close {
+      key: u64,
+    },
+  }
+
+  #[allow(clippy::disallowed_types)] // proptest's `prop_oneof!` holds its arms in an `Arc` (D-8's test-harness exception).
+  fn retain() -> impl proptest::strategy::Strategy<Value = Retain> {
+    use proptest::prelude::*;
+    prop_oneof![
+      6 => (0..48usize, 0..400u64).prop_map(|(path, after_ns)| Retain::Append { path, after_ns }),
+      1 => (0..3u64, 0..6u64, 1..4_000u64).prop_map(|(key, behind, patience_ns)| Retain::Open { key, behind, patience_ns }),
+      2 => (0..3u64, 0..12u64).prop_map(|(key, forward)| Retain::Round { key, forward }),
+      1 => (0..3u64).prop_map(|key| Retain::Close { key }),
+    ]
+  }
+
+  /// A-157's retention rule, kept apart from [`OpLog`]: records (sequence, time, charge) in order; readers by key with
+  /// their point and patience; a budget, and a ledger's room. While the incoming record does not fit, the oldest leaves,
+  /// unless an open reader that has not read past it is still within its patience of it: then, once an append, the
+  /// budget grows by the shortfall if the room holds it, and a refusal is counted.
+  struct RetentionModel {
+    retained: VecDeque<(u64, u64, u64)>,
+    /// Every record appended, (sequence, time), retained or not: what the direct check walks.
+    all: Vec<(u64, u64)>,
+    next: u64,
+    bytes: u64,
+    budget: u64,
+    room: u64,
+    grown: u64,
+    refused: u64,
+    /// Key → (point, patience, the oldest record retained when it opened): records before that had left already.
+    readers: BTreeMap<u64, (u64, u64, u64)>,
+  }
+
+  impl RetentionModel {
+    fn append(&mut self, at: u64, cost: u64) {
+      let seq = self.next;
+      self.next += 1;
+      let mut asked = false;
+      while self.bytes + cost > self.budget {
+        let Some(&(oldest, oldest_at, oldest_cost)) = self.retained.front() else {
+          break;
+        };
+        let owed = self
+          .readers
+          .values()
+          .any(|&(point, patience, _)| point < oldest && at - oldest_at < patience);
+        if !asked && owed {
+          asked = true;
+          let short = self.bytes + cost - self.budget;
+          if short <= self.room {
+            self.room -= short;
+            self.budget += short;
+            self.grown += short;
+            continue;
+          }
+          self.refused += 1;
+        }
+        self.retained.pop_front();
+        self.bytes -= oldest_cost;
+      }
+      self.bytes += cost;
+      self.retained.push_back((seq, at, cost));
+      self.all.push((seq, at));
+    }
+
+    fn head(&self) -> u64 {
+      self.next - 1
+    }
+  }
+
+  proptest::proptest! {
+    #![proptest_config(slates_test_seeds::unseeded(proptest::prelude::ProptestConfig { cases: slates_test_seeds::cases(2000), .. proptest::prelude::ProptestConfig::default() }))]
+
+    /// A-157 (the journal keeps what a live reader still needs, growing from the ledger), oracle: do any history of
+    /// appends, readers opened, advanced and closed, over any floor and any ledger room; expect after every step the
+    /// retained records, the budget, the growth and the refusals to equal the model's, and the ledger's committed bytes
+    /// to equal the growth. While no growth was refused, no record an open reader has not read and is within its
+    /// patience of is gone. Returning the growth at the end leaves the ledger as it began.
+    #[test]
+    fn retention_keeps_what_a_live_reader_needs_as_the_model_does(
+      floor_records in 1..4usize,
+      room_records in 0..24u64,
+      steps in proptest::collection::vec(retain(), 1..160),
+    ) {
+      let fixed_size = std::mem::size_of::<OpRecord>();
+      let floor = floor_records * fixed_size;
+      let room = room_records * fixed();
+      let mut ledger = MetadataBudget::new(room);
+      let mut log = OpLog::new(floor);
+      let mut model = RetentionModel {
+        retained: VecDeque::new(),
+        all: Vec::new(),
+        next: 1,
+        bytes: 0,
+        budget: charge(floor),
+        room,
+        grown: 0,
+        refused: 0,
+        readers: BTreeMap::new(),
+      };
+      let mut now = 0u64;
+      for step in steps {
+        match step {
+          Retain::Append { path, after_ns } => {
+            now += after_ns;
+            log.append(&mut ledger, Op::Create, "p".repeat(path), None, Epoch(0), now, 0);
+            model.append(now, fixed() + charge(path));
+          }
+          Retain::Open { key, behind, patience_ns } => {
+            let point = log.head_seq().saturating_sub(behind);
+            log.open_reader(key, point, patience_ns);
+            model.readers.insert(key, (point, patience_ns, log.oldest_seq()));
+          }
+          // A reader's point only moves forward, as a mount's does: a refused round is gathered again from its start.
+          Retain::Round { key, forward } => {
+            if let Some(&(point, patience, floor)) = model.readers.get(&key) {
+              let cursor = (point + forward).min(model.head());
+              log.note_round(key, cursor, now);
+              model.readers.insert(key, (cursor, patience, floor));
+            }
+          }
+          Retain::Close { key } => {
+            log.close_reader(key);
+            model.readers.remove(&key);
+          }
+        }
+        let retained: Vec<u64> = log.since(0).map(|record| record.seq).collect();
+        let expected: Vec<u64> = model.retained.iter().map(|record| record.0).collect();
+        proptest::prop_assert_eq!(retained, expected);
+        proptest::prop_assert_eq!(charge(log.budget_bytes()), model.budget);
+        proptest::prop_assert_eq!(log.grown(), model.grown);
+        proptest::prop_assert_eq!(log.growth_refused(), model.refused);
+        proptest::prop_assert_eq!(ledger.committed(), model.grown);
+        // The rule's promise, checked apart from the model: with every growth admitted, no record an open reader has not
+        // read, appended while it was open (at or after its floor) and still within its patience, has left. A record within
+        // a reader's patience now was within it at every earlier append, and a reader's point only moves forward.
+        if model.refused == 0 {
+          let oldest = log.oldest_seq();
+          for &(point, patience, floor) in model.readers.values() {
+            for &(seq, at) in &model.all {
+              let owed = seq > point && seq >= floor && now - at < patience;
+              proptest::prop_assert!(!owed || seq >= oldest, "record {} owed to a reader at {} has left", seq, point);
+            }
+          }
+        }
+      }
+      ledger.release(slates_mem::budget::MetadataCredit { bytes: log.grown() });
+      proptest::prop_assert_eq!(ledger.committed(), 0);
+    }
+  }
+
   /// §4.2: do append far past the budget; expect the ring's allocation never to exceed the records the budget holds
   /// (doubling would reach twice that), with retention as before.
   #[test]
@@ -661,7 +947,15 @@ mod tests {
     let budget = 1000 * std::mem::size_of::<OpRecord>();
     let mut log = OpLog::new(budget);
     for i in 0..10_000u64 {
-      log.append(Op::Create, "", Some(InodeNo(i)), Epoch(0), i, 0);
+      log.append(
+        &mut unbounded(),
+        Op::Create,
+        "",
+        Some(InodeNo(i)),
+        Epoch(0),
+        i,
+        0,
+      );
       assert!(
         log.records.capacity() <= 1000,
         "capacity {} past the budget's 1000 records",

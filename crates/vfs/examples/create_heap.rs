@@ -54,7 +54,8 @@ const REGION_BYTES: usize = 1 << 31;
 const CAP: usize = 1 << 19;
 /// Shape: the volume's quota.
 const QUOTA: u64 = 1 << 31;
-/// Shape: the op log's byte budget: a 1 GiB volume's share in the daemon (`JOURNAL_SHARE_PERMILLE` 10).
+/// Shape: the op log's byte budget for this run: 10 MiB, what a 1 GiB volume's journal reserved under the fixed share
+/// the daemon took until A-157, kept so the heap this bench measures stays comparable across its history.
 const JOURNAL_BYTES: usize = 10 << 20;
 /// Format: the cache line.
 const CACHE_LINE: usize = 64;

@@ -1164,7 +1164,9 @@ fn open_journal_reader(s: &mut ShardState, volume: VolumeId, registry: Attachmen
   if let Some(&handle) = s.by_id.get(&volume)
     && let Ok(slot) = s.volumes.get_mut(handle)
   {
-    slot.volume.open_journal_reader(registry.key());
+    slot
+      .volume
+      .open_journal_reader(registry.key(), crate::daemon::LIVENESS_BUDGET_NS);
   }
 }
 

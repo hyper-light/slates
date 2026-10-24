@@ -518,8 +518,8 @@ fn a_current_round_moves_its_readers_point_and_a_pinned_round_moves_none() {
   };
   let current = context(View::Current, true);
   let pinned = context(View::Version(1), false);
-  vol.open_journal_reader(current.attachment.key());
-  vol.open_journal_reader(pinned.attachment.key());
+  vol.open_journal_reader(current.attachment.key(), u64::MAX);
+  vol.open_journal_reader(pinned.attachment.key(), u64::MAX);
   let opened_at = vol.op_log().head_seq();
   assert_eq!(
     (vol.op_log().readers(), vol.op_log().slowest_reader()),
@@ -550,6 +550,153 @@ fn a_current_round_moves_its_readers_point_and_a_pinned_round_moves_none() {
   );
   vol.close_journal_reader(current.attachment.key());
   assert_eq!(vol.op_log().readers(), 0);
+}
+
+/// Shape: the journal floor the retention tests give their volume: two records of the fixed size, so a handful of
+/// creates passes it.
+const TWO_RECORDS: usize = 2 * std::mem::size_of::<slates_vfs::journal::OpRecord>();
+/// Shape: the files the retention tests create without a round: each create journals a record, far past the floor.
+const CREATES: usize = 12;
+
+/// A volume with a two-record journal floor, a current attachment's context and its reader open with `patience_ns`,
+/// and the round's cursor before any change.
+fn reading_volume(store: &mut Store, patience_ns: u64) -> (Volume, OpContext, InvalidationCursor) {
+  let mut volume = Volume::create(
+    store,
+    VolumeConfig {
+      journal_bytes: TWO_RECORDS,
+      ..config(5)
+    },
+  )
+  .unwrap();
+  let cx = rw_cx();
+  volume.open_journal_reader(cx.attachment.key(), patience_ns);
+  let mut handles = new_handle_store();
+  let cursor = VolumeBridge::attached(
+    VolumeId { bytes: [0; 16] },
+    &mut volume,
+    store,
+    &mut handles,
+    None,
+  )
+  .seen(&cx);
+  (volume, cx, cursor)
+}
+
+/// The invalidations a round of `cx` owes from `cursor`.
+fn round(
+  volume: &mut Volume,
+  store: &mut Store,
+  cx: &OpContext,
+  cursor: InvalidationCursor,
+) -> Vec<Invalidation> {
+  let mut handles = new_handle_store();
+  let mut owed = Vec::new();
+  VolumeBridge::attached(
+    VolumeId { bytes: [0; 16] },
+    volume,
+    store,
+    &mut handles,
+    None,
+  )
+  .invalidations(cx, cursor, &mut owed)
+  .unwrap();
+  owed
+}
+
+/// A-157 (the journal keeps what a live reader still needs, growing from the ledger). Do: give a volume a two-record
+/// journal floor and a reader whose patience outlasts the test; create files far past the floor before the reader's
+/// round. Expect no overrun (the round names the changes, not Everything), the budget grown past the floor by exactly
+/// what the shard's metadata ledger committed, and no growth refused.
+#[test]
+fn a_live_readers_records_are_kept_by_growing_from_the_ledger() {
+  let mut store = store();
+  let (mut volume, cx, cursor) = reading_volume(&mut store, u64::MAX);
+  let root = volume.root();
+  for file in 0..CREATES {
+    volume
+      .create_file(&mut store, root, &format!("f{file}"), 0o644)
+      .unwrap();
+  }
+  let owed = round(&mut volume, &mut store, &cx, cursor);
+  assert!(
+    !owed.contains(&Invalidation::Everything),
+    "no overrun: {owed:?}"
+  );
+  let log = volume.op_log();
+  assert_eq!(log.measure().overruns, 0);
+  assert!(log.budget_bytes() > TWO_RECORDS, "the budget grew");
+  assert_eq!(
+    u64::try_from(log.budget_bytes() - TWO_RECORDS).unwrap(),
+    log.grown()
+  );
+  assert_eq!(
+    store.metadata.committed(),
+    log.grown(),
+    "the ledger holds the growth"
+  );
+  assert_eq!(log.growth_refused(), 0);
+}
+
+/// A-157: a reader that has not read a record for longer than its patience is presumed gone, and pins nothing. Do: as
+/// above with a patience of a few clock steps (the test clock steps 1 µs a reading); create files far past the floor
+/// before the reader's round. Expect the records it owed to have left once they outwaited it: the round owes
+/// Everything and counts an overrun, with no growth refused.
+#[test]
+fn a_reader_past_its_patience_pins_nothing_and_overruns() {
+  /// Shape: a patience of five steps of the test clock.
+  const PATIENCE_NS: u64 = 5_000;
+  let mut store = store();
+  let (mut volume, cx, cursor) = reading_volume(&mut store, PATIENCE_NS);
+  let root = volume.root();
+  for file in 0..CREATES {
+    volume
+      .create_file(&mut store, root, &format!("f{file}"), 0o644)
+      .unwrap();
+  }
+  let owed = round(&mut volume, &mut store, &cx, cursor);
+  assert!(
+    owed.contains(&Invalidation::Everything),
+    "the reader overran: {owed:?}"
+  );
+  assert_eq!(volume.op_log().measure().overruns, 1);
+  assert_eq!(
+    volume.op_log().growth_refused(),
+    0,
+    "nothing was asked of the ledger in vain"
+  );
+}
+
+/// A-157: a growth the ledger refuses keeps the budget and drops the record a live reader still owed. Do: as above with a
+/// patience that outlasts the test, on a shard whose metadata ledger has no room; create files past the floor before the
+/// reader's round. Expect the refusals counted, the budget still the floor, and the round owing Everything (an overrun).
+#[test]
+fn a_growth_the_ledger_refuses_overruns_its_reader_and_is_counted() {
+  let mut store = store();
+  store.metadata = slates_mem::budget::MetadataBudget::new(0);
+  let (mut volume, cx, cursor) = reading_volume(&mut store, u64::MAX);
+  let root = volume.root();
+  for file in 0..CREATES {
+    volume
+      .create_file(&mut store, root, &format!("f{file}"), 0o644)
+      .unwrap();
+  }
+  assert!(
+    volume.op_log().growth_refused() > 0,
+    "the full ledger refused the growth"
+  );
+  assert_eq!(
+    volume.op_log().budget_bytes(),
+    TWO_RECORDS,
+    "the budget kept its floor"
+  );
+  assert_eq!(volume.op_log().grown(), 0);
+  let owed = round(&mut volume, &mut store, &cx, cursor);
+  assert!(
+    owed.contains(&Invalidation::Everything),
+    "the reader overran: {owed:?}"
+  );
+  assert_eq!(volume.op_log().measure().overruns, 1);
 }
 
 /// A watcher hint on a base directory (an outsider replaced a file beneath it) owes the transport
