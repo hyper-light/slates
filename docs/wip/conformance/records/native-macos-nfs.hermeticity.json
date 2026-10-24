@@ -3,35 +3,38 @@
   "suite": "hermeticity",
   "transport": "native-macos-nfs",
   "host": {
-    "os": "macOS 26.4.1 (25E253)",
-    "kernel": "Darwin 25.4.0",
+    "os": "macOS 26.6.2 (25G83)",
+    "kernel": "Darwin 25.6.0",
     "arch": "arm64",
     "privilege": "unprivileged"
   },
-  "date": "2026-09-26",
+  "date": "2026-10-24",
   "command": "sudo eslogger open close create write truncate rename unlink link clone copyfile exchangedata setextattr deleteextattr setmode setowner setflags utimes setattrlist setacl (events of the slates binary); slates anchor/volume create/mount, `sh -c 'printf 'one\\n' > f1 && mkdir d && printf 'two\\n' > d/f2 && ln -s f3 link && mv f1 f3 && chmod u=rw,go=r f3 && printf 'gone\\n' > tmp && rm tmp'`, snapshot, land, grant, land --grant",
   "bound": "one lifecycle: one volume, one mount; known workload bytes/kinds and the entire mounted tree, including client metadata, landed and verified",
   "outcome": {
     "kind": "ran",
     "counts": {
       "suite": "hermeticity",
-      "write_calls": 204,
-      "inside_target": 60,
-      "ram_only": 49,
-      "standard_streams": 95,
+      "write_calls": 61,
+      "inside_target": 23,
+      "ram_only": 35,
+      "standard_streams": 0,
+      "socket_node": 3,
       "unresolved": 0,
       "outside": 0,
-      "written_matched": 12,
+      "written_matched": 6,
       "written_unmatched": 0
     }
   },
   "expected_failure_list": null,
-  "duration_ms": 6222,
+  "duration_ms": 4034,
   "notes": [
-    "tracer: sudo eslogger open close create write truncate rename unlink link clone copyfile exchangedata setextattr deleteextattr setmode setowner setflags utimes setattrlist setacl (kept: events of the slates binary); 204 events parsed from 1092 log lines; landing reported 12 written; 8 hidden siblings (.slates-*) seen inside the target",
-    "the granted target: /Users/adalundhe/slates-herm/scratch3/land-target",
+    "tracer: sudo eslogger open close create write truncate rename unlink link clone copyfile exchangedata setextattr deleteextattr setmode setowner setflags utimes setattrlist setacl (kept: events of the slates binary); 61 events parsed from 640 log lines; landing reported 6 written; 2 hidden siblings (.slates-*) seen inside the target",
+    "0 calls by an OS mount broker (/usr/bin/fusermount3, /bin/fusermount3, /usr/bin/mount, /bin/mount) set aside, not judged (R10; macOS's eslogger leg keeps only the slates executable's): []",
+    "the granted target: /Users/runner/work/slates/slates/target/conformance-scratch/native-macos-nfs/land-target",
+    "the granted landing 0000000000000001: the daemon's traced thread ids [87531] (its live threads at the landing, grown by the trace's clone/clone3 with any it spawned for the landing), 1792867417426678000 ns to 1792867417455493000 ns (wall clock); hidden names: Ok(2)",
     "volume quota: 131072 bytes, derived from 8 peak workload entries × 16384-byte host page",
-    "landing completeness: 12/12 entries reported; disk verification: Ok(())",
-    "eslogger: 1092 slates events kept, 0 dropped (global_seq_num continuous); stopped after a drain marker"
+    "landing completeness: 6/6 entries reported; disk verification: Ok(())",
+    "eslogger: 640 slates events kept, 0 dropped (global_seq_num continuous); stopped after a drain marker"
   ]
 }

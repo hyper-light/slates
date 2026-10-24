@@ -11074,6 +11074,7 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   prepares or carries nothing, refused by clippy's `let_unit_value` and `unit_arg`; neither branch linted before the
   push), and **the macOS hermeticity run counted the route's socket node outside** (run 40104138955). The tracer now
   knows the daemon's own socket node as a class of its own: its making, mode and removal by the daemon, and nothing else.
+  The next macOS run (40118981721) judged 3 calls on the node and 0 outside of 61; its record is the tracked one.
 - **Step 5 in part (2026-10-24):** the one-file example server and its blocking helpers are removed; the bridge-fuse
   tests and the bench drive `split_frame` and `answer`, the daemon's path (re-measured in BENCHMARKS: no dearer than
   the function it replaced).

@@ -12270,7 +12270,8 @@ Applied in the same change to:
     `unlink`, all by the daemon). The tracer now knows the daemon's own socket node as a class of its own, named by the
     route's path function and allowed only its making, mode and removal by the daemon
     (`only_the_daemons_making_mode_and_removal_of_its_socket_node_are_allowed`, which fails with the call-kind check
-    removed).
+    removed). CI's next macOS run (40118981721, `105b8b4d`) judged 61 write-capable calls: 23 inside the granted
+    target, 35 on RAM-only objects, 3 on the socket node, 0 outside — the route writes no other file.
 - **Step 5, in part (2026-10-24).** The one-file example server and the blocking `serve`, `serve_one`,
   `read_shards_frame` and `write_shards_frame` it ran on are removed: nothing in the daemon used them, and `serve_one`
   dispatched without `answer`'s reply framing and read ceiling. `crates/bridge-fuse/tests/shards_fs.rs` now drives a
