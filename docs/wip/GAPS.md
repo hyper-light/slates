@@ -1348,8 +1348,9 @@ tag `shards0` and reading `/hello` back byte for byte. So a guest kernel's own v
 slates volume and reads it, with no host mount and no DAX window: the achievable integration where the
 VMM offers no DAX cache window. The DAX-window route stays as recorded in `8a-dax-confine`.
 
-2026-10-24: that run's server, the one-file example, is gone. The daemon serves the route (A-161) and
-`slates shards` hands the spawner its end, so the boot is owed again against the daemon (Shards part 2).
+2026-10-24: that run's server, the one-file example, is gone. The daemon serves the route (A-161), and
+`slates shards` replaces itself with the spawner, holding the end. The boot ran again the same day against the daemon
+and passed 3 of 3 (Shards part 2, below).
 
 ### 8a-deep-sweep. Every property suite run deep, twice over what any of them had seen (2026-10-20)
 
@@ -11086,8 +11087,17 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   through `slates shards`, it is owed (part 2).
 - **Part 1 complete (2026-10-24):** CI run 40123120384 at `50d6ef80`, 19 of 19 jobs green on macOS, Linux and Windows,
   the code complete (the exec included); `105b8b4d` before it, 19 of 19 (run 40118981721).
-- **Owed, in order:** Shards' `--slates-fs-fd` on its current branch and a real boot
-  (part 2); a DAX window over a backing that authorizes only the attachment's bytes (part 3). Until part 3 a slates
+- **Part 2 proven (2026-10-24): a real Shards microVM on this Mac mounts, reads and writes a volume the daemon
+  serves.** Shards' `--slates-fs-fd` and its boot test were ported onto Shards' `gpu` (`b12ec23d`) as a patch series
+  the Shards owner applies (`~/.cache/slates-scratch/shards-part2-patches/`, sent to its session).
+  - The test starts `slates anchor`, writes `hello`, and boots the testguest under
+    `slates shards ID --fd 3 -- shards run … --slates-fs-fd 3`. The guest mounts `shards0`, reads `/hello`, then writes,
+    syncs and reads back `/from-guest`; the host reads the guest's file through `slates read`.
+  - 3 of 3 passed (54.7 s with the guest's build and kernel fetch, then 1.36 s and 1.22 s; the VM ran 50.8 ms and
+    printed `SHARDS-TEST PASS`).
+  - With `--read-only` the guest's create is refused and the test fails.
+  - Not run: a native Linux clippy of the testguest (no Linux host free); Shards' CI covers it.
+- **Owed, in order:** Shards applying the series to its repository (its owner's queue); a DAX window over a backing that authorizes only the attachment's bytes (part 3). Until part 3 a slates
   share is launched without a DAX window: a descriptor ask is refused `EOPNOTSUPP`.
 - **Open, found by the new tests: a read-only attachment is not a read-only file system to its client.** On every FUSE
   transport (the shared bridge) an open for writing is granted and each write through it refused `EPERM`; NFS answers

@@ -3358,8 +3358,9 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 > daemon's socket route, an exchange keyed by HKDF-SHA256 and sealed with AES-256-GCM (`slates_ipc::route`,
 > `crates/server/src/shards_route.rs`). `Client::attach_shards` takes either; Windows refuses the form
 > `DescriptorRouteNotBuilt`. `slates shards ID --fd N -- CMD` replaces itself with a program holding the end at
-> descriptor `N`, so the attachment ends when the program's end closes. Not yet: a real Shards boot against the daemon, and DAX.
-> The details and the evidence are A-161's.
+> descriptor `N`, so the attachment ends when the program's end closes. A real Shards microVM on this Mac mounts, reads and
+> writes a volume the daemon serves this way (part 2: 3 of 3 boots, Shards' patch sent to its owner). Not yet: DAX. The
+> details and the evidence are A-161's.
 
 **Writeback and snapshot barrier.** Kernel/guest cache negotiation changes when writes reach
 the owner. `snapshot`, `submit`, `advance`, clean `detach`, migration and archive must identify
@@ -12289,8 +12290,24 @@ Applied in the same change to:
   Windows (the Linux `cargo test --workspace` and CLI flow with the exec, TSan over `stream_exec` and the churn test, the
   macOS hermeticity run with the socket-node class); the state before the exec, `105b8b4d`, was 19 of 19 too (run
   40118981721).
-- **Owed:** Shards' own `--slates-fs-fd` on its current branch and a real boot (part 2), and a DAX window over a backing
-  that authorizes only the attachment's bytes (part 3).
+- **Part 2: a real Shards microVM over the daemon (2026-10-24).** Shards' `--slates-fs-fd` and its boot test, ported
+  from their old base onto Shards' `gpu` (`b12ec23d`) as a patch series the Shards owner applies (they asked for a
+  patch; slates writes nothing to their repository):
+  - `--slates-fs-fd` takes `Slot::attach`'s answer;
+  - the testguest writes, syncs and reads back a file after reading one;
+  - the boot test drives the slates daemon. It starts `slates anchor`, writes `hello`, runs
+    `slates shards ID --fd 3 -- shards run … --slates-fs-fd 3 …`, and reads the guest's file back through `slates read`.
+
+  On this Mac (HVF, arm64) the test passed 3 of 3:
+  - 54.7 s on the first run, which built the musl testguest and fetched the kernel; then 1.36 s and 1.22 s;
+  - the console of one run showed the VM running 50.8 ms and the guest printing `SHARDS-TEST PASS`, with the host reading
+    back what the guest wrote.
+
+  Red-checked: with `--read-only` the guest's create is refused (`EPERM`) and the test fails, so the writes go through
+  the attachment and its rights. The series is `~/.cache/slates-scratch/shards-part2-patches/` on this Mac, sent to
+  the Shards session.
+- **Owed:** Shards applying the series to its repository, and a DAX window over a backing that authorizes only the
+  attachment's bytes (part 3).
 
 ### A-160 — A volume's disk-image form: ext2, written in bounded steps, read back as hostile input (accepted 2026-10-23)
 Applied in the same change to:

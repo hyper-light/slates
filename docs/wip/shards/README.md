@@ -13,9 +13,10 @@ model (the guest's `mount` is refused without `CAP_SYS_ADMIN`).
 > descriptor ask `EOPNOTSUPP`). The other end is the attachment's capability. Proven by use against a real daemon
 > (`crates/server/tests/shards.rs`). Over the wire the end reaches a client by Linux's control socket or macOS's
 > encrypted socket route (`Client::attach_shards`), and `slates shards ID --fd N -- CMD` replaces itself with a spawner
-> holding it at descriptor `N`, so the recipe below no longer needs the one-file example, which is gone. Not yet: a real boot against
-> the daemon (Shards part 2). Until a DAX backing scoped to one attachment exists (part 3), launch a slates share with no
-> DAX window.
+> holding it at descriptor `N`, so the recipe below no longer needs the one-file example, which is gone. A real boot
+> against the daemon passed 3 of 3 on this Mac (Shards part 2, 2026-10-24): the guest mounts, reads and writes. The
+> series for Shards' `gpu` is in `~/.cache/slates-scratch/shards-part2-patches/`, sent to its owner. Until a DAX backing
+> scoped to one attachment exists (part 3), launch a slates share with no DAX window.
 >
 > **The Shards half, checked 2026-10-24 (read-only, from this checkout's remote refs; no fetch):** `slates-fs-native`
 > (08066b27) has been on origin since 2026-10-22; `origin/gpu` (1f82788c, 2026-10-24) still contains none of it.
@@ -73,8 +74,8 @@ id=$(slates volume create agent --bounded 1GiB --json | jq -r .id)
 slates shards "$id" --fd 3 -- shards run --kernel … --slates-fs-fd 3
 ```
 
-Not yet run against a real VM: `slates shards` is proven with a test program that mounts and reads through the end it
-is handed (`crates/cli/tests/cli.rs`), and Shards' `--slates-fs-fd` is on `slates-fs-native`, not `gpu` (part 2).
+Run against a real VM on 2026-10-24: Shards' boot test (`tests/slates_fs.rs` in the series for its `gpu`) does exactly
+this and passed 3 of 3. Until Shards applies the series, `--slates-fs-fd` is on its `slates-fs-native` branch only.
 
 ## DAX compatibility
 
