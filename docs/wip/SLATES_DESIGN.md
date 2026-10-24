@@ -3352,9 +3352,11 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 
 > **Status (2026-10-24).** Built and proven by use, in-process: `crates/server/src/shards.rs` (the serve task),
 > `crates/ipc/src/stream.rs` (the pair), `crates/bridge-fuse/src/shards_fs.rs` (the frames and their answers),
-> `Daemon::attach_shards_stream`, with seven tests against a real daemon (`crates/server/tests/shards.rs`). Not yet: the
-> stream's delivery over the wire (Linux's control socket, the macOS socket route), the client and the CLI, a real
-> Shards boot against the daemon, and DAX. The details and the evidence are A-161's.
+> `Daemon::attach_shards_stream`, with seven tests against a real daemon (`crates/server/tests/shards.rs`). Over the
+> wire on Linux: `attach` with `AttachRequest::ShardsFs` sends the end over the client's control socket just before the
+> reply, from either shard (`Client::attach_shards`, `crates/client/tests/shards.rs`); elsewhere the form is refused
+> `DescriptorRouteNotBuilt`. Not yet: the macOS socket route, the CLI, a real Shards boot against the daemon, and DAX.
+> The details and the evidence are A-161's.
 
 **Writeback and snapshot barrier.** Kernel/guest cache negotiation changes when writes reach
 the owner. `snapshot`, `submit`, `advance`, clean `detach`, migration and archive must identify
@@ -12081,6 +12083,12 @@ Applied in the same change to:
 - `crates/server`: `shards.rs` (new), `state.rs`, `daemon.rs` (`EndStreams`), `verbs.rs` (`end_attachment` ends a
   stream; `scoped_or_whole` and `release_unrecorded_lease` shared with the FUSE mount), `virtiofs.rs` (`owner_shard`
   shared), `Cargo.toml` (the FUSE codec a Unix dependency); the test `tests/shards.rs` (new);
+- (step 2) `crates/ipc`: `protocol.rs` (`AttachRequest::ShardsFs`, `AttachTransport::ShardsFs`,
+  `UnsupportedReason::DescriptorRouteNotBuilt`, `Conformance::SimulatedShardsDevice`, appended), `rendezvous.rs` (the
+  delivery envelope, `Control::send_stream`, `Liveness::recv_delivery`, `ControlDelivery`), `endpoint.rs`;
+  `crates/server`: `shards.rs` (`attach_verb`, the handoffs, the destroy and rollback hooks), `verbs.rs` (the attach
+  form, `send_reply`, `send_forward`, the destroy's wait), `transports.rs` (the report's entry); `crates/client`
+  (`attach_shards`, `ShardsStream`, deliveries matched by what the reply names) and `tests/shards.rs` (new);
 - §4.6, GAPS.
 
 - **What it answers.** Shards' fs device forwards each guest FUSE request to a backend over a Unix stream it is handed
@@ -12142,10 +12150,33 @@ Applied in the same change to:
   each write `EPERM` on every FUSE transport, and NFS answers `PERM`, where a read-only file system answers `EROFS` at
   the open; `INIT`'s page count follows the host's page, so a 4 KiB-page guest of a 16 KiB-page Mac is told 16 pages,
   64 KiB a request, a quarter of the largest write.
-- **Owed:** the stream's delivery over the wire (Linux's control socket by `SCM_RIGHTS`; macOS's socket route, its
-  exchange encrypted and authenticated), the client's and the CLI's attach, a Windows refusal, Shards' own
-  `--slates-fs-fd` on its current branch and a real boot (part 2), and a DAX window over a backing that authorizes only
-  the attachment's bytes (part 3). The one-file example and its blocking helpers go once the CLI hands a stream out.
+- **Over the wire on Linux (2026-10-24, part 1 step 2).** `attach` takes `AttachRequest::ShardsFs { subtree }`. On the
+  volume's owner shard, inside the verb's transaction, the stream is made and served as above and its end kept under
+  the request's word (`ShardState::stream_handoffs`, bounded by the requests a shard's clients may have in flight). The
+  end goes to the client over its retained control socket by `SCM_RIGHTS`, just before the reply is written
+  (`verbs::send_reply`, the one place every reply is written), and only with the `Attached` reply that names it: a
+  rolled-back verb's refusal drops it, and the stream, seeing its peer gone, ends its attachment. A forwarded attach
+  carries the end home to the client's shard with the reply (`verbs::send_forward`); an attach is never forwarded across
+  nodes (a volume homed elsewhere is refused `HomedElsewhere`), so a descriptor never leaves its machine.
+  - Every control-socket delivery now opens with a kind word (`ControlDelivery`: a content map, A-135, or a stream end),
+    so neither is taken for the other. The client takes the delivery its reply names (a map's id, a stream's
+    attachment) and drops any other, closing its descriptor: before, a map delivered for a request whose caller had
+    given up could answer the next map read.
+  - The destroy ends a volume's streams and its teardown waits for them, as for its guest devices, so each sweeps its
+    references while the volume is whole; a rolled-back attach's stream is ended and its end dropped
+    (`reconcile_unpublished_effects`).
+  - The transport report carries the form (`AttachTransport::ShardsFs`): offered on Linux, its evidence the simulated
+    device (`Conformance::SimulatedShardsDevice`), refused `DescriptorRouteNotBuilt` on macOS and Windows.
+  - Evidence: `crates/client/tests/shards.rs` on a two-shard daemon, a volume on each shard, so one end is made where
+    the client is and the other comes home with a forwarded reply; the history checked through slates' own reads and
+    writes; two scoped ends of one volume each reaching only its own directory, the read-only one changing nothing; a
+    detach ending the stream; on macOS, the refusal by kind with nothing left behind. The control socket's envelope is
+    tested in `crates/ipc/src/rendezvous.rs`: three deliveries of two kinds in order, and a delivery of an unknown kind
+    or the wrong length refused with its descriptor closed.
+- **Owed:** macOS's socket route (its exchange encrypted and authenticated), the CLI's attach and a Windows refusal by
+  kind, Shards' own `--slates-fs-fd` on its current branch and a real boot (part 2), and a DAX window over a backing
+  that authorizes only the attachment's bytes (part 3). The one-file example and its blocking helpers go once the CLI
+  hands a stream out.
 
 ### A-160 — A volume's disk-image form: ext2, written in bounded steps, read back as hostile input (accepted 2026-10-23)
 Applied in the same change to:

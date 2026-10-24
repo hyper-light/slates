@@ -38,6 +38,8 @@ slates-db = { workspace = true }
 # The image tests read a built image back and write a guest's edits into it (A-160), sized by the store's chunk.
 slates-image = { workspace = true }
 slates-vfs = { workspace = true }
+# The Shards stream test speaks FUSE through the end it is handed (A-161), with the codec's ABI constants.
+slates-bridge-fuse = { workspace = true }
 
 [lints]
 workspace = true

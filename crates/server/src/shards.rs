@@ -88,6 +88,12 @@ const RECORD_END_REFUSED: &str = "shards.record_end_refused";
 /// Format: the refusal-ledger name of a stream the daemon could not end ([`end_stream`]): its task ends at its next
 /// turn regardless, as the stream is marked ending first.
 const END_REFUSED: &str = "shards.end_refused";
+/// Format: the refusal-ledger name of a stream end that could not be sent to its client (no control socket, the
+/// client gone, a refused send): the end closes, so the stream ends and its attachment with it.
+const DELIVERY_REFUSED: &str = "shards.delivery_refused";
+/// Format: the refusal-ledger name of a stream end dropped because its request's reply was not the attach that made
+/// it (a rolled-back verb answered a refusal): the end closes, so the stream ends with it.
+const HANDOFF_DROPPED: &str = "shards.handoff_dropped";
 /// Format: Linux `EOPNOTSUPP`, the errno a refused descriptor ask carries to the guest's mapping; the guest is a Linux
 /// kernel whatever the host, so the number is Linux's.
 const EOPNOTSUPP: i32 = 95;
@@ -142,6 +148,29 @@ impl std::fmt::Debug for ShardsStream {
 
 /// The shard's Shards streams, by attachment id.
 pub(crate) type ShardsStreams = BTreeMap<u64, ShardsStream>;
+
+/// A stream end owed to the client whose attach made it (A-161): kept on the client's shard under the attach's
+/// request word until the attach's reply is written (`verbs::send_reply`), and sent over the client's control socket
+/// just before it, only with that reply. Made on the volume's owner shard; a forwarded attach carries it back to the
+/// client's shard with the reply (`verbs::send_forward`).
+pub(crate) struct Handoff {
+  /// The attachment the daemon serves on the stream's other end.
+  pub(crate) attachment: u64,
+  /// The end to hand the client.
+  pub(crate) stream: OwnedFd,
+}
+
+/// The shard's stream ends owed to clients, by the request word of the attach that made each. Bounded by the
+/// requests the shard's clients may have in flight ([`handoff_bound`]): an attach past it is refused `Overloaded`.
+pub(crate) type Handoffs = BTreeMap<u64, Handoff>;
+
+/// Derived: the stream ends a shard may owe at once: one per request its clients may have in flight
+/// (`clients_per_shard × ring slots`), the bound `verbs::remember_forwarded_ring` keeps for forwarded requests.
+fn handoff_bound(s: &ShardState) -> usize {
+  s.config
+    .clients_per_shard
+    .saturating_mul(usize::try_from(s.config.region.slots).unwrap_or(1))
+}
 
 /// What an attach with the Shards form returns: its record's id, the write lease's epoch for a write intent, and the
 /// stream end that is the attachment's capability.
@@ -276,6 +305,159 @@ pub(crate) fn attach(s: &mut ShardState, ask: ShardsAsk) -> Result<ShardsAttache
     lease_epoch,
     stream: handed,
   })
+}
+
+/// The attach verb's Shards form (§4.4, §4.6; A-161), on the volume's owner shard inside the verb's transaction: the
+/// attachment made and served as [`attach`] makes it, and its stream end kept for the client under the request's word,
+/// sent just before the reply this returns. Linux only: the end reaches a client over its control socket, which the
+/// other platforms do not have (refused `DescriptorRouteNotBuilt`, before any effect). A snapshot is not presented
+/// over a stream yet (refused `Unsupported`).
+pub(crate) fn attach_verb(
+  s: &mut ShardState,
+  principal: &Principal,
+  volume: slates_ipc::protocol::VolumeId,
+  snapshot: Option<slates_ipc::protocol::SnapshotId>,
+  (intent, subtree): (Intent, Option<String>),
+) -> slates_ipc::protocol::ReplyBody {
+  let refused = |refusal| slates_ipc::protocol::ReplyBody::Refused { refusal };
+  if !cfg!(target_os = "linux") {
+    return refused(Refusal::AttachmentUnsupported {
+      transport: slates_ipc::protocol::AttachTransport::ShardsFs,
+      reason: slates_ipc::protocol::UnsupportedReason::DescriptorRouteNotBuilt,
+    });
+  }
+  if snapshot.is_some() {
+    return refused(Refusal::Unsupported {
+      feature: "a snapshot presented over a Shards stream".to_owned(),
+    });
+  }
+  let Some((_, id)) = s.current_request else {
+    return refused(Refusal::BadRequest {
+      reason: "a Shards stream is attached by a recorded request".to_owned(),
+    });
+  };
+  if s.stream_handoffs.len() >= handoff_bound(s) {
+    return refused(Refusal::Overloaded { shard: s.shard });
+  }
+  let attached = match attach(
+    s,
+    ShardsAsk {
+      principal: principal.clone(),
+      volume,
+      subtree,
+      intent,
+    },
+  ) {
+    Ok(attached) => attached,
+    Err(refusal) => return refused(refusal),
+  };
+  let ShardsAttached {
+    attachment,
+    lease_epoch,
+    stream,
+  } = attached;
+  s.stream_handoffs
+    .insert(id.word(), Handoff { attachment, stream });
+  let rights = s
+    .db
+    .partition()
+    .attachment(attachment)
+    .map(|record| record.rights)
+    .unwrap_or_default();
+  let mut capability = crate::transports::shards_fs(&crate::transports::situation(s, &rights));
+  capability.read_write = if rights.write {
+    slates_ipc::protocol::ReadWritePolicy::ReadWrite
+  } else {
+    slates_ipc::protocol::ReadWritePolicy::ReadOnly
+  };
+  slates_ipc::protocol::ReplyBody::Attached {
+    attachment,
+    lease_epoch,
+    path: None,
+    version: None,
+    established: slates_ipc::protocol::Established::Record,
+    capability,
+    // A stream presents no mount capability: the end is the capability.
+    token: None,
+  }
+}
+
+/// Sends the stream end owed for `request`, if the shard holds one, over the control socket of the client at
+/// `client_index`, just before `reply` is written into its ring: run by `verbs::send_reply` for every reply, so the
+/// end is taken out exactly once whatever the reply's fate. Sent only with the attach that made it; any other reply
+/// for the request (the verb rolled back and answered a refusal) drops it, counted. A client gone, retiring, or
+/// without a control socket, or a refused send, drops it too, counted: the end closes, so the stream sees its peer's
+/// close and ends its attachment. The end is sent before the ring's reply, so the client finds it waiting.
+pub(crate) fn deliver_handoff(
+  s: &mut ShardState,
+  client_index: u32,
+  request: u64,
+  reply: &slates_ipc::protocol::ReplyBody,
+) {
+  let Some(handoff) = s.stream_handoffs.remove(&request) else {
+    return;
+  };
+  let ours = matches!(
+    reply,
+    slates_ipc::protocol::ReplyBody::Attached { attachment, .. } if *attachment == handoff.attachment
+  );
+  if !ours {
+    s.count(HANDOFF_DROPPED, 1);
+    return;
+  }
+  let client = slates_wire::request::RequestId::from_word(request).client;
+  let sent = s
+    .clients
+    .generation_at(client_index)
+    .and_then(|generation| {
+      s.clients
+        .get(slates_mem::Handle::from_raw(client_index, generation))
+        .ok()
+    })
+    .filter(|slot| !slot.retiring && slot.client_id == client)
+    .and_then(|slot| slot.control.as_ref())
+    .is_some_and(|control| {
+      control
+        .send_stream(handoff.stream.as_fd(), request, handoff.attachment)
+        .is_ok()
+    });
+  if !sent {
+    s.count(DELIVERY_REFUSED, 1);
+  }
+}
+
+/// Ends every stream serving `volume` (its destroy): each marked ending and ended both ways, so its task sweeps its
+/// guest's references through the volume, still whole, and removes its record. The streams still serving, which the
+/// destroy's teardown waits for, as it waits for the volume's guest devices.
+pub(crate) fn end_volume_streams(s: &mut ShardState, volume: VolumeId) -> usize {
+  let serving: Vec<u64> = s
+    .shards_streams
+    .iter()
+    .filter(|(_, stream)| stream.volume == volume)
+    .map(|(attachment, _)| *attachment)
+    .collect();
+  for attachment in &serving {
+    end_stream(s, *attachment);
+  }
+  serving.len()
+}
+
+/// After a rolled-back verb (`verbs::reconcile_unpublished_effects`): every stream whose attachment record the
+/// rollback removed is ended as any other end ends it ([`end_stream`]), and the end owed for it dropped, so a verb
+/// that failed to commit leaves nothing serving and hands out nothing. Its task wakes on the stream's end and releases
+/// the rest ([`ended`], which finds no record to remove).
+pub(crate) fn reconcile_unrecorded(s: &mut ShardState) {
+  let unrecorded: Vec<u64> = s
+    .shards_streams
+    .keys()
+    .copied()
+    .filter(|attachment| s.db.partition().attachment(*attachment).is_none())
+    .collect();
+  for attachment in unrecorded {
+    end_stream(s, attachment);
+    s.stream_handoffs
+      .retain(|_, handoff| handoff.attachment != attachment);
+  }
 }
 
 /// What one turn did.
@@ -681,7 +863,7 @@ pub(crate) fn end_stream(s: &mut ShardState, attachment: u64) {
 }
 
 /// Ends every stream the shard serves (the daemon's stop): each attachment's references swept, its registry entry
-/// released and its record removed. Run by the end of the shard's serve loop (`daemon::EndTransports`): on a stop
+/// released and its record removed. Run by the end of the shard's serve loop (`daemon::EndStreams`): on a stop
 /// nothing else runs on the shard.
 pub(crate) fn end_all(s: &mut ShardState) {
   let attachments: Vec<u64> = s.shards_streams.keys().copied().collect();

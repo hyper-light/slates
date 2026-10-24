@@ -1844,6 +1844,9 @@ pub enum AttachTransport {
   /// The virtio-fs guest device over inherited descriptors (vhost-user): the seam models it; the
   /// binding is not built.
   VirtioFsInheritedDescriptor,
+  /// A Shards microVM's fs device over an anonymous stream the daemon hands the attaching client (§4.6, the Shards
+  /// route; A-161). Appended.
+  ShardsFs,
 }
 
 /// Where a transport puts the volume (§4.6 A-9 "target-path constraints").
@@ -1965,6 +1968,10 @@ pub enum Conformance {
   /// A live Linux guest under a real VMM mounted the tag and ran the conformance roster's workloads, each
   /// identical on the volume and on the guest's RAM (AC-9.7; `crates/server/tests/virtiofs.rs`). Appended.
   LiveGuestWorkloads,
+  /// A test plays Shards' fs device over the stream end against a real daemon, each change checked through
+  /// another transport (`crates/server/tests/shards.rs`, `crates/client/tests/shards.rs`); no Shards microVM has
+  /// run against the daemon (AC-9.7). Appended.
+  SimulatedShardsDevice,
 }
 
 /// Why a transport is not offered here: the `reason` of [`Refusal::AttachmentUnsupported`] and of a
@@ -2009,6 +2016,9 @@ pub enum UnsupportedReason {
   /// A container bind on Linux binds a mount other users' processes can reach; the source is a FUSE mount the
   /// daemon made for its user alone. Mount it with `slates mount --shared`. Appended.
   MountNotShared,
+  /// The form hands the client a descriptor, and this platform's route for one is not built: Linux sends it over
+  /// the client's control socket; the macOS socket route and a Windows handle route are owed (A-161). Appended.
+  DescriptorRouteNotBuilt,
 }
 
 /// One transport's report (§4.6 A-9: "supported transport, target-path constraints, read/write policy,
@@ -2116,6 +2126,14 @@ pub enum AttachRequest {
     /// The directory presented, as a path from the volume's root; the whole volume when absent.
     subtree: Option<String>,
   },
+  /// A Shards microVM's fs device served over an anonymous stream (§4.6, the Shards route; A-161): the daemon makes a
+  /// socket pair, serves the attachment on its end, and hands the other end to the client, which passes it to the
+  /// VMM. The end reaches the client over its control socket on Linux; the reply names the attachment. Optionally
+  /// one directory. Appended.
+  ShardsFs {
+    /// The directory presented, as a path from the volume's root; the whole volume when absent.
+    subtree: Option<String>,
+  },
 }
 
 impl AttachRequest {
@@ -2133,9 +2151,9 @@ impl AttachRequest {
   pub fn subtree(&self) -> Option<&str> {
     match self {
       Self::ScopedHostMount { subtree } | Self::ScopedFuseMount { subtree, .. } => Some(subtree),
-      Self::SharedFuseMount { subtree, .. } | Self::BoundHostMount { subtree, .. } => {
-        subtree.as_deref()
-      }
+      Self::SharedFuseMount { subtree, .. }
+      | Self::BoundHostMount { subtree, .. }
+      | Self::ShardsFs { subtree } => subtree.as_deref(),
       _ => None,
     }
   }

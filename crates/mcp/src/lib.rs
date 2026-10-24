@@ -1556,6 +1556,7 @@ pub fn transport_name(transport: AttachTransport) -> &'static str {
     AttachTransport::Oci => "oci",
     AttachTransport::VirtioFsInProcess => "virtiofs_in_process",
     AttachTransport::VirtioFsInheritedDescriptor => "virtiofs_inherited_descriptor",
+    AttachTransport::ShardsFs => "shards_fs",
   }
 }
 
@@ -1576,6 +1577,7 @@ pub fn unsupported_reason_name(reason: UnsupportedReason) -> &'static str {
     UnsupportedReason::ContainerWorkloadUnproven => "container_workload_unproven",
     UnsupportedReason::AllowOtherNotGranted => "allow_other_not_granted",
     UnsupportedReason::MountNotShared => "mount_not_shared",
+    UnsupportedReason::DescriptorRouteNotBuilt => "descriptor_route_not_built",
   }
 }
 
@@ -1668,6 +1670,7 @@ pub fn conformance_name(conformance: Conformance) -> &'static str {
     Conformance::VerifiedSourceExport => "verified_source_export",
     Conformance::SimulatedGuestDriver => "simulated_guest_driver",
     Conformance::LiveGuestWorkloads => "live_guest_workloads",
+    Conformance::SimulatedShardsDevice => "simulated_shards_device",
   }
 }
 

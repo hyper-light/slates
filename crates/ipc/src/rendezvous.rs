@@ -443,6 +443,39 @@ pub struct MappingDelivery {
   pub block_len: u64,
 }
 
+/// The other end of a Shards fs stream the daemon delivered to the client that attached it (§4.6, A-161): the
+/// attachment's capability, which the client hands to the VMM. The daemon serves that one attachment on its own end.
+#[cfg(unix)]
+pub struct StreamDelivery {
+  /// The stream's other end.
+  pub stream: std::os::fd::OwnedFd,
+  /// The request this delivery answers (the attach's id).
+  pub request_id: u64,
+  /// The attachment the daemon serves on the stream.
+  pub attachment: u64,
+}
+
+/// A descriptor the daemon delivered over the control socket, with what it is for: a content map (A-135) or a
+/// stream end (A-161). Each names the request it answers, so a client takes only its own.
+#[cfg(unix)]
+pub enum ControlDelivery {
+  /// A read-only content map.
+  Mapping(MappingDelivery),
+  /// A Shards fs stream's other end.
+  Stream(StreamDelivery),
+}
+
+#[cfg(unix)]
+impl ControlDelivery {
+  /// The request the delivery answers.
+  pub fn request_id(&self) -> u64 {
+    match self {
+      Self::Mapping(mapping) => mapping.request_id,
+      Self::Stream(stream) => stream.request_id,
+    }
+  }
+}
+
 impl Liveness {
   /// Whether the daemon the client connected to is gone (dead, or restarted since). A cold
   /// path: asked only after a reply has stalled past the client's deadline.
@@ -450,12 +483,13 @@ impl Liveness {
     self.inner.daemon_gone()
   }
 
-  /// Receives a content-map delivery the daemon sent over the control socket (§4.6, A-135), or
-  /// `None` when none is waiting. Non-blocking. A platform without a control socket (macOS,
-  /// Windows) never delivers one, so a same-kernel client there reads through the copy path.
+  /// Receives a descriptor the daemon sent over the control socket (§4.6: a content map, A-135; a stream end,
+  /// A-161), or `None` when none is waiting. Non-blocking. A platform without a control socket (macOS, Windows)
+  /// never delivers one: a same-kernel client there reads through the copy path, and a stream end comes by the
+  /// platform's own route.
   #[cfg(unix)]
-  pub fn recv_mapping(&self) -> Result<Option<MappingDelivery>, IpcError> {
-    self.inner.recv_mapping()
+  pub fn recv_delivery(&self) -> Result<Option<ControlDelivery>, IpcError> {
+    self.inner.recv_delivery()
   }
 }
 
@@ -581,11 +615,18 @@ pub mod platform {
   /// reason.
   const REFUSED_CLIENT: u32 = 0;
 
-  /// Format: a mapping delivery's body (§4.6, A-135): request id (8), mapping id (8), the block's
+  /// Format: a delivery's kind word, its first eight bytes, so deliveries of every kind share the socket and none is
+  /// taken for another's: a content map (§4.6, A-135) or a stream end (A-161).
+  const KIND_BYTES: usize = 8;
+  /// Format: the kind of a content-map delivery.
+  const KIND_MAPPING: u64 = 1;
+  /// Format: the kind of a stream-end delivery.
+  const KIND_STREAM: u64 = 2;
+  /// Format: a mapping delivery's body after its kind (§4.6, A-135): request id (8), mapping id (8), the block's
   /// offset in its backing object (8), the file's authorized length (8), the block length (8).
   const MAPPING_MSG_BYTES: usize = 40;
-  /// Format: the request id's offset in a mapping delivery.
-  const MAPPING_AT_REQUEST: usize = 0;
+  /// Format: the request id's offset in a delivery's body, the same for every kind.
+  const AT_REQUEST: usize = 0;
   /// Format: the mapping id's offset.
   const MAPPING_AT_ID: usize = 8;
   /// Format: the block offset's offset.
@@ -594,8 +635,14 @@ pub mod platform {
   const MAPPING_AT_FILE_LEN: usize = 24;
   /// Format: the block length's offset.
   const MAPPING_AT_BLOCK_LEN: usize = 32;
-  /// Format: the one descriptor a mapping delivery carries — the arena block's backing object.
-  const MAPPING_FDS: usize = 1;
+  /// Format: a stream delivery's body after its kind (A-161): request id (8), attachment id (8).
+  const STREAM_MSG_BYTES: usize = 16;
+  /// Format: the attachment id's offset in a stream delivery.
+  const STREAM_AT_ATTACHMENT: usize = 8;
+  /// Derived: the longest delivery, a kind word and a mapping's body; every receive reads into this much.
+  const DELIVERY_MAX_BYTES: usize = KIND_BYTES + MAPPING_MSG_BYTES;
+  /// Format: the one descriptor every delivery carries: an arena block's backing object, or a stream end.
+  const DELIVERY_FDS: usize = 1;
 
   /// Sends the typed refusal handoff to `peer`: client [`REFUSED_CLIENT`], `limit` in the length word,
   /// no descriptors.
@@ -669,37 +716,92 @@ pub mod platform {
       block_len: u64,
     ) -> Result<(), IpcError> {
       confined_for_a_peer(block, region_off, block_len)?;
-      let mut body = [0u8; MAPPING_MSG_BYTES];
-      let fields = [
-        (MAPPING_AT_REQUEST, request_id.to_le_bytes()),
-        (MAPPING_AT_ID, mapping_id.to_le_bytes()),
-        (MAPPING_AT_OFF, region_off.to_le_bytes()),
-        (MAPPING_AT_FILE_LEN, file_len.to_le_bytes()),
-        (MAPPING_AT_BLOCK_LEN, block_len.to_le_bytes()),
-      ];
-      for (at, bytes) in fields {
-        if let Some(field) = body.get_mut(at..at.saturating_add(bytes.len())) {
-          field.copy_from_slice(&bytes);
-        }
-      }
-      let fds = [block];
+      let mut body = [0u8; KIND_BYTES + MAPPING_MSG_BYTES];
+      put_words(
+        &mut body,
+        &[
+          (0, KIND_MAPPING),
+          (KIND_BYTES + AT_REQUEST, request_id),
+          (KIND_BYTES + MAPPING_AT_ID, mapping_id),
+          (KIND_BYTES + MAPPING_AT_OFF, region_off),
+          (KIND_BYTES + MAPPING_AT_FILE_LEN, file_len),
+          (KIND_BYTES + MAPPING_AT_BLOCK_LEN, block_len),
+        ],
+      );
+      self.send_delivery(&body, block, "sendmsg mapping")
+    }
+
+    /// Sends the client that attached a Shards fs stream the stream's other end (§4.6, A-161), by `SCM_RIGHTS` with
+    /// the request it answers and the attachment it serves. Sent before the attach's reply on the ring, so the
+    /// client finds it waiting when it reads the reply.
+    ///
+    /// **No confinement check, by construction.** A memory object's descriptor carries the whole object
+    /// ([`Self::send_mapping`]); a stream end carries only the conversation the daemon answers on the other end, and
+    /// the daemon answers one attachment there, with the rights and the directory its record holds. Whoever holds
+    /// the end reaches that attachment and nothing else, which is what the attach granted.
+    pub fn send_stream(
+      &self,
+      stream: std::os::fd::BorrowedFd<'_>,
+      request_id: u64,
+      attachment: u64,
+    ) -> Result<(), IpcError> {
+      let mut body = [0u8; KIND_BYTES + STREAM_MSG_BYTES];
+      put_words(
+        &mut body,
+        &[
+          (0, KIND_STREAM),
+          (KIND_BYTES + AT_REQUEST, request_id),
+          (KIND_BYTES + STREAM_AT_ATTACHMENT, attachment),
+        ],
+      );
+      self.send_delivery(&body, stream, "sendmsg stream")
+    }
+
+    /// One delivery, `body` with `descriptor` by `SCM_RIGHTS`, in one `sendmsg`, so the descriptor arrives with its
+    /// body and a receive never runs past it into the next delivery.
+    fn send_delivery(
+      &self,
+      body: &[u8],
+      descriptor: std::os::fd::BorrowedFd<'_>,
+      call: &'static str,
+    ) -> Result<(), IpcError> {
+      let fds = [descriptor];
       let mut space =
-        [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(MAPPING_FDS))];
+        [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(DELIVERY_FDS))];
       let mut control = SendAncillaryBuffer::new(&mut space);
       if !control.push(SendAncillaryMessage::ScmRights(&fds)) {
         return Err(IpcError::Layout {
-          reason: "the mapping descriptor did not fit the ancillary buffer",
+          reason: "a delivery's descriptor did not fit the ancillary buffer",
         });
       }
       rustix::net::sendmsg(
         &self.socket,
-        &[IoSlice::new(&body)],
+        &[IoSlice::new(body)],
         &mut control,
         SendFlags::empty(),
       )
-      .map_err(|e| refused("sendmsg mapping", e))?;
+      .map_err(|e| refused(call, e))?;
       Ok(())
     }
+  }
+
+  /// Writes each `(offset, word)` little-endian into `body`.
+  fn put_words(body: &mut [u8], words: &[(usize, u64)]) {
+    for &(at, word) in words {
+      let bytes = word.to_le_bytes();
+      if let Some(field) = body.get_mut(at..at.saturating_add(bytes.len())) {
+        field.copy_from_slice(&bytes);
+      }
+    }
+  }
+
+  /// The little-endian word at `at` in `body`; zero past its end (a length checked by the caller first).
+  fn word_at(body: &[u8], at: usize) -> u64 {
+    let mut raw = [0u8; size_of::<u64>()];
+    if let Some(field) = body.get(at..at.saturating_add(size_of::<u64>())) {
+      raw.copy_from_slice(field);
+    }
+    u64::from_le_bytes(raw)
   }
 
   impl ClientControl {
@@ -731,13 +833,15 @@ pub mod platform {
       }
     }
 
-    /// Receives a content-map delivery from the daemon over the control socket (§4.6, A-135), or
-    /// `None` when none is waiting. Non-blocking; the descriptor arrives by `SCM_RIGHTS`
-    /// (close-on-exec), the metadata in the body.
-    pub(super) fn recv_mapping(&self) -> Result<Option<super::MappingDelivery>, IpcError> {
-      let mut body = [0u8; MAPPING_MSG_BYTES];
+    /// Receives a delivery from the daemon over the control socket (§4.6: a content map, A-135; a stream end,
+    /// A-161), or `None` when none is waiting. Non-blocking; the descriptor arrives by `SCM_RIGHTS`
+    /// (close-on-exec), what it is for in the body after its kind. A body of the wrong length for its kind, an
+    /// unknown kind, or a descriptor count other than one is refused `Layout`, and every descriptor that came with
+    /// it is closed: nothing a refused delivery carried stays open in the client.
+    pub(super) fn recv_delivery(&self) -> Result<Option<super::ControlDelivery>, IpcError> {
+      let mut body = [0u8; DELIVERY_MAX_BYTES];
       let mut space =
-        [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(MAPPING_FDS))];
+        [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(DELIVERY_FDS))];
       let mut control = RecvAncillaryBuffer::new(&mut space);
       let received = match rustix::net::recvmsg(
         &self.socket,
@@ -748,45 +852,57 @@ pub mod platform {
         Ok(received) => received.bytes,
         // Nothing waiting yet.
         Err(rustix::io::Errno::AGAIN) => return Ok(None),
-        Err(e) => return Err(refused("recvmsg mapping", e)),
+        Err(e) => return Err(refused("recvmsg delivery", e)),
       };
-      // The peer closed: no delivery (the daemon is gone; `daemon_gone` reports it).
-      if received == 0 {
-        return Ok(None);
-      }
-      if received != MAPPING_MSG_BYTES {
-        return Err(IpcError::Layout {
-          reason: "a mapping delivery was the wrong length",
-        });
-      }
       let mut descriptors: Vec<OwnedFd> = Vec::new();
       for message in control.drain() {
         if let RecvAncillaryMessage::ScmRights(iter) = message {
           descriptors.extend(iter);
         }
       }
-      if descriptors.len() != MAPPING_FDS {
+      // The peer closed: no delivery (the daemon is gone; `daemon_gone` reports it).
+      if received == 0 {
+        return Ok(None);
+      }
+      let kind = word_at(&body, 0);
+      let expected = match kind {
+        KIND_MAPPING => KIND_BYTES + MAPPING_MSG_BYTES,
+        KIND_STREAM => KIND_BYTES + STREAM_MSG_BYTES,
+        _ => {
+          return Err(IpcError::Layout {
+            reason: "a delivery of an unknown kind",
+          });
+        }
+      };
+      if received != expected {
         return Err(IpcError::Layout {
-          reason: "a mapping delivery carried the wrong number of descriptors",
+          reason: "a delivery was the wrong length for its kind",
         });
       }
-      let block = descriptors.pop().ok_or(IpcError::Layout {
-        reason: "a mapping delivery carried no block descriptor",
+      if descriptors.len() != DELIVERY_FDS {
+        return Err(IpcError::Layout {
+          reason: "a delivery carried the wrong number of descriptors",
+        });
+      }
+      let descriptor = descriptors.pop().ok_or(IpcError::Layout {
+        reason: "a delivery carried no descriptor",
       })?;
-      let word = |at: usize| -> u64 {
-        let mut raw = [0u8; size_of::<u64>()];
-        if let Some(field) = body.get(at..at.saturating_add(size_of::<u64>())) {
-          raw.copy_from_slice(field);
-        }
-        u64::from_le_bytes(raw)
-      };
-      Ok(Some(super::MappingDelivery {
-        block,
-        request_id: word(MAPPING_AT_REQUEST),
-        mapping_id: word(MAPPING_AT_ID),
-        region_off: word(MAPPING_AT_OFF),
-        file_len: word(MAPPING_AT_FILE_LEN),
-        block_len: word(MAPPING_AT_BLOCK_LEN),
+      let field = |at: usize| word_at(&body, KIND_BYTES.saturating_add(at));
+      Ok(Some(if kind == KIND_STREAM {
+        super::ControlDelivery::Stream(super::StreamDelivery {
+          stream: descriptor,
+          request_id: field(AT_REQUEST),
+          attachment: field(STREAM_AT_ATTACHMENT),
+        })
+      } else {
+        super::ControlDelivery::Mapping(super::MappingDelivery {
+          block: descriptor,
+          request_id: field(AT_REQUEST),
+          mapping_id: field(MAPPING_AT_ID),
+          region_off: field(MAPPING_AT_OFF),
+          file_len: field(MAPPING_AT_FILE_LEN),
+          block_len: field(MAPPING_AT_BLOCK_LEN),
+        })
       }))
     }
   }
@@ -1211,7 +1327,7 @@ pub mod platform {
 
     /// A-135: the daemon sends a read-only content-map descriptor with its metadata over the
     /// control socket, and the client receives that exact descriptor — the file's bytes read back
-    /// through it. Drives the real `send_mapping`/`recv_mapping` over a real `AF_UNIX`/`SOCK_STREAM`
+    /// through it. Drives the real `send_mapping`/`recv_delivery` over a real `AF_UNIX`/`SOCK_STREAM`
     /// pair (the kind the rendezvous retains), with a real `memfd` standing in for an arena block
     /// whose file is shorter than the block (so the metadata's file length is exercised). A failing
     /// check returns a typed error rather than panicking (the lint wall forbids a panic in a
@@ -1266,7 +1382,7 @@ pub mod platform {
       .map_err(|e| super::refused("add seals", e))?;
 
       // Nothing waiting yet: a non-blocking recv returns None.
-      if liveness.recv_mapping()?.is_some() {
+      if liveness.recv_delivery()?.is_some() {
         return Err(IpcError::Layout {
           reason: "a delivery arrived before one was sent",
         });
@@ -1274,9 +1390,7 @@ pub mod platform {
 
       control.send_mapping(mem.as_fd(), 7, 42, 0, file_len, block_len)?;
 
-      let delivery = liveness.recv_mapping()?.ok_or(IpcError::Layout {
-        reason: "a delivery was waiting but recv returned None",
-      })?;
+      let delivery = mapping_of(liveness.recv_delivery()?)?;
       let metadata_ok = delivery.request_id == 7
         && delivery.mapping_id == 42
         && delivery.region_off == 0
@@ -1371,14 +1485,12 @@ pub mod platform {
         ),
         (unsealed.as_fd(), 0, window, "a window the peer could write"),
       ];
-      // Nothing crossed: the peer has no delivery waiting. Proved non-vacuously — a `recv_mapping` that could
+      // Nothing crossed: the peer has no delivery waiting. Proved non-vacuously — a `recv_delivery` that could
       // receive nothing at all would satisfy that however `send_mapping` behaved — by sending one hand-off
       // that *does* meet the rule and taking it off the socket first. So the peer's side is known to work, and
       // the emptiness after the three refusals is a fact about the refusals.
       control.send_mapping(sealed.as_fd(), 9, 11, 0, object_bytes, object_bytes)?;
-      let good = liveness.recv_mapping()?.ok_or(IpcError::Layout {
-        reason: "a confined, sealed hand-off did not reach the peer, so this test proves nothing",
-      })?;
+      let good = mapping_of(liveness.recv_delivery()?)?;
       if good.mapping_id != 11 {
         return Err(IpcError::Layout {
           reason: "the confined hand-off arrived with the wrong metadata",
@@ -1396,10 +1508,159 @@ pub mod platform {
           Err(other) => return Err(other),
         }
       }
-      if liveness.recv_mapping()?.is_some() {
+      if liveness.recv_delivery()?.is_some() {
         return Err(IpcError::Layout {
           reason: "a refused hand-off still reached the peer",
         });
+      }
+      Ok(())
+    }
+
+    /// The mapping a delivery holds, or a typed error for none or another kind.
+    fn mapping_of(
+      delivery: Option<super::super::ControlDelivery>,
+    ) -> Result<super::super::MappingDelivery, IpcError> {
+      match delivery {
+        Some(super::super::ControlDelivery::Mapping(mapping)) => Ok(mapping),
+        Some(super::super::ControlDelivery::Stream(_)) => Err(IpcError::Layout {
+          reason: "a stream end arrived where a mapping was sent",
+        }),
+        None => Err(IpcError::Layout {
+          reason: "a delivery was waiting but recv returned None",
+        }),
+      }
+    }
+
+    /// A control socket's two ends: the daemon's `Control` and the client's `Liveness`.
+    fn channel() -> Result<(Control, Liveness), IpcError> {
+      let (daemon_socket, client_socket) = rustix::net::socketpair(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC,
+        None,
+      )
+      .map_err(|e| super::refused("socketpair", e))?;
+      let completion = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)
+        .map_err(|e| super::refused("eventfd", e))?;
+      Ok((
+        Control {
+          socket: daemon_socket,
+          completion,
+        },
+        Liveness {
+          socket: client_socket,
+        },
+      ))
+    }
+
+    /// A-161: the daemon sends a stream end with the attach it answers, and the client receives that very end. Do:
+    /// send a stream end, then a content map, then a second stream end, back to back, before the client reads any.
+    /// Expect: three deliveries in order, each its own kind with its own request and attachment, and the stream end
+    /// carrying bytes between the two sides (it is the pair's other end, not a copy).
+    #[test]
+    fn a_stream_delivery_hands_the_client_its_end_and_kinds_never_mix() -> Result<(), IpcError> {
+      let (control, liveness) = channel()?;
+      let (daemon_end, handed) = crate::stream::pair()?;
+      let (_other_daemon_end, other_handed) = crate::stream::pair()?;
+      let block = memfd_create(
+        "slates-a161-block",
+        MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
+      )
+      .map_err(|e| super::refused("memfd_create", e))?;
+      #[allow(clippy::disallowed_methods)] // sizing a memory object: RAM, not a host path (R1).
+      rustix::fs::ftruncate(&block, 4096).map_err(|e| super::refused("ftruncate", e))?;
+      rustix::fs::fcntl_add_seals(
+        &block,
+        rustix::fs::SealFlags::WRITE | rustix::fs::SealFlags::SHRINK | rustix::fs::SealFlags::GROW,
+      )
+      .map_err(|e| super::refused("add seals", e))?;
+
+      control.send_stream(handed.as_fd(), 5, 501)?;
+      control.send_mapping(block.as_fd(), 6, 12, 0, 4096, 4096)?;
+      control.send_stream(other_handed.as_fd(), 7, 502)?;
+      drop(handed);
+
+      let first = match liveness.recv_delivery()? {
+        Some(super::super::ControlDelivery::Stream(stream)) => stream,
+        _ => {
+          return Err(IpcError::Layout {
+            reason: "the first delivery was not the stream end sent first",
+          });
+        }
+      };
+      let mapping = mapping_of(liveness.recv_delivery()?)?;
+      let third = match liveness.recv_delivery()? {
+        Some(super::super::ControlDelivery::Stream(stream)) => stream,
+        _ => {
+          return Err(IpcError::Layout {
+            reason: "the third delivery was not the second stream end",
+          });
+        }
+      };
+      if (first.request_id, first.attachment) != (5, 501)
+        || (mapping.request_id, mapping.mapping_id) != (6, 12)
+        || (third.request_id, third.attachment) != (7, 502)
+      {
+        return Err(IpcError::Layout {
+          reason: "a delivery's request or attachment did not survive the wire",
+        });
+      }
+      rustix::io::write(&first.stream, b"ping").map_err(|e| super::refused("write", e))?;
+      let mut got = [0u8; 4];
+      let read =
+        crate::stream::recv(daemon_end.as_fd(), &mut got).map_err(|e| super::refused("recv", e))?;
+      if got.get(..read) != Some(&b"ping"[..]) {
+        return Err(IpcError::Layout {
+          reason: "the delivered end is not the daemon's pair",
+        });
+      }
+      if liveness.recv_delivery()?.is_some() {
+        return Err(IpcError::Layout {
+          reason: "a fourth delivery appeared from nowhere",
+        });
+      }
+      Ok(())
+    }
+
+    /// Hostile input on the client's side: a delivery of an unknown kind, and one of a known kind but the wrong
+    /// length, are refused `Layout`, and the descriptor each carried is closed in the client (its peer sees the end).
+    #[test]
+    fn an_unknown_or_misshapen_delivery_is_refused_and_its_descriptor_closed()
+    -> Result<(), IpcError> {
+      use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
+      let (control, liveness) = channel()?;
+      for (kind, length) in [(99u64, 24usize), (super::KIND_STREAM, 20)] {
+        let (daemon_end, handed) = crate::stream::pair()?;
+        let mut body = vec![0u8; length];
+        super::put_words(&mut body, &[(0, kind)]);
+        let fds = [handed.as_fd()];
+        let mut space = [std::mem::MaybeUninit::<u8>::uninit();
+          rustix::cmsg_space!(ScmRights(super::DELIVERY_FDS))];
+        let mut ancillary = SendAncillaryBuffer::new(&mut space);
+        if !ancillary.push(SendAncillaryMessage::ScmRights(&fds)) {
+          return Err(IpcError::Layout {
+            reason: "the hostile delivery's descriptor did not fit",
+          });
+        }
+        rustix::net::sendmsg(
+          &control.socket,
+          &[std::io::IoSlice::new(&body)],
+          &mut ancillary,
+          SendFlags::empty(),
+        )
+        .map_err(|e| super::refused("sendmsg", e))?;
+        drop(handed);
+        if !matches!(liveness.recv_delivery(), Err(IpcError::Layout { .. })) {
+          return Err(IpcError::Layout {
+            reason: "a hostile delivery was taken",
+          });
+        }
+        let mut probe = [0u8; 1];
+        if crate::stream::recv(daemon_end.as_fd(), &mut probe) != Ok(0) {
+          return Err(IpcError::Layout {
+            reason: "a refused delivery's descriptor stayed open in the client",
+          });
+        }
       }
       Ok(())
     }
@@ -1522,6 +1783,18 @@ pub mod platform {
         feature: "same-kernel direct map (macOS control socket owed)",
       })
     }
+
+    /// No control socket here (A-161): a stream end reaches a macOS client by the socket route instead.
+    pub fn send_stream(
+      &self,
+      _stream: std::os::fd::BorrowedFd<'_>,
+      _request_id: u64,
+      _attachment: u64,
+    ) -> Result<(), IpcError> {
+      Err(IpcError::Unsupported {
+        feature: "a stream end over the control socket (macOS has the socket route)",
+      })
+    }
   }
 
   #[cfg(unix)]
@@ -1548,10 +1821,10 @@ pub mod platform {
       self.watch.exited() || generation_of(&self.instance).is_none_or(|now| now != self.generation)
     }
 
-    /// No control socket here yet (§4.6, A-135), so no descriptor is ever delivered; a same-kernel
-    /// client on this platform reads by copy.
+    /// No control socket here yet (§4.6, A-135), so no descriptor is ever delivered over one: a same-kernel client on
+    /// this platform reads by copy, and a stream end comes by the platform's own route (A-161).
     #[cfg(unix)]
-    pub(super) fn recv_mapping(&self) -> Result<Option<super::MappingDelivery>, IpcError> {
+    pub(super) fn recv_delivery(&self) -> Result<Option<super::ControlDelivery>, IpcError> {
       Ok(None)
     }
   }

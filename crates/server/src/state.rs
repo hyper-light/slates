@@ -442,6 +442,11 @@ pub struct ShardState {
   /// by the shard's client seats (`clients_per_shard`): an attach past them is refused `Overloaded`.
   #[cfg(unix)]
   pub(crate) shards_streams: crate::shards::ShardsStreams,
+  /// The Shards stream ends owed to this shard's clients, by the request word of the attach that made each (A-161;
+  /// `crate::shards::Handoff`): sent over the client's control socket just before the attach's reply. Bounded by the
+  /// requests the shard's clients may have in flight: an attach past it is refused `Overloaded`.
+  #[cfg(unix)]
+  pub(crate) stream_handoffs: crate::shards::Handoffs,
   /// The clock.
   pub clock: slates_vfs::clock::HostClock,
   /// Requests served.

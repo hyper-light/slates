@@ -1444,6 +1444,7 @@ dependencies = [
  "libc",
  "rustix",
  "slates-anchor",
+ "slates-bridge-fuse",
  "slates-db",
  "slates-image",
  "slates-ipc",

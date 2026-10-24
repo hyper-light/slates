@@ -33,6 +33,8 @@ pub mod client;
 pub mod driver;
 pub mod error;
 
+#[cfg(unix)]
+pub use client::ShardsStream;
 pub use client::{
   Advanced, Attachment, Client, Connecting, CreateSpec, Deadlines, Digest, ImageBuilt,
   LAST_SEQUENCE, Landing, Rebased, Session, Submitted, defers_reply,

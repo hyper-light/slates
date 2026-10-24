@@ -14,6 +14,8 @@ use slates_ipc::protocol::{
   SnapshotCoverage, SnapshotId, StatusReport, TelemetryReport, VolumeId, VolumeSummary, WorkOp,
   pack, unpack,
 };
+#[cfg(unix)]
+use slates_ipc::rendezvous::ControlDelivery;
 use slates_ipc::{
   CLAIM_WAIT_NS, Claim, ClientEnd, Connected, IpcError, begin_connect_as, connect_as,
 };
@@ -123,6 +125,17 @@ pub struct Session {
   pub client_id: u32,
   /// The next sequence.
   pub next_sequence: u32,
+}
+
+/// What `attach_shards` returns (§4.6, the Shards route; A-161): the attachment, and the stream end to hand a Shards
+/// VMM, which reaches that attachment and nothing else.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct ShardsStream {
+  /// The attachment the daemon serves on the stream's other end.
+  pub attachment: Attachment,
+  /// The stream's end, close-on-exec: move it to the descriptor number the VMM expects before spawning it.
+  pub stream: std::os::fd::OwnedFd,
 }
 
 /// What `create` takes.
@@ -915,27 +928,77 @@ impl Client {
     };
     match reply {
       ReplyBody::Mapped {
+        mapping_id,
         region_off,
         file_len,
         ..
       } => {
-        let delivery = self.recv_delivery()?;
-        MappedRead::map(delivery, region_off, file_len)
+        let delivered = self.recv_delivery(|delivery| {
+          matches!(delivery, ControlDelivery::Mapping(mapping) if mapping.mapping_id == mapping_id)
+        })?;
+        let ControlDelivery::Mapping(mapping) = delivered else {
+          return Err(ClientError::UnexpectedReply { verb: "map_read" });
+        };
+        MappedRead::map(mapping, region_off, file_len)
       }
       _ => Err(ClientError::UnexpectedReply { verb: "map_read" }),
     }
   }
 
-  /// Receives the arena block's descriptor the daemon sent over the control socket for a `MapRead`
-  /// (§4.6, A-135). The daemon sends it before the ring reply just read, so it is already waiting; the
-  /// loop only covers a kernel that makes the socket readable a scheduling tick after the ring slot,
-  /// bounded by the client's existing reply deadline (no new timeout).
+  /// Attaches `volume` to a Shards microVM's fs device over an anonymous stream (§4.6, the Shards route; A-161): the
+  /// daemon serves the attachment on its end of a socket pair, on the volume's owner shard, and hands this client the
+  /// other end, to pass to the VMM. With `subtree`, only that directory; with `Intent::Read`, every change refused.
+  /// The attachment ends when the stream's other end closes (or a `detach`, a revocation, the volume's destroy).
+  /// Linux receives the end over the control socket; other platforms are refused
+  /// `AttachmentUnsupported{ShardsFs, DescriptorRouteNotBuilt}` until their route is built.
   #[cfg(unix)]
-  fn recv_delivery(&self) -> Result<slates_ipc::rendezvous::MappingDelivery, ClientError> {
+  pub fn attach_shards(
+    &mut self,
+    volume: VolumeId,
+    intent: Intent,
+    subtree: Option<&str>,
+  ) -> Result<ShardsStream, ClientError> {
+    let attachment = self.attach_with(
+      volume,
+      None,
+      intent,
+      AttachRequest::ShardsFs {
+        subtree: subtree.map(str::to_owned),
+      },
+    )?;
+    let id = attachment.attachment;
+    let delivered = self.recv_delivery(
+      |delivery| matches!(delivery, ControlDelivery::Stream(stream) if stream.attachment == id),
+    )?;
+    let ControlDelivery::Stream(delivered) = delivered else {
+      return Err(ClientError::UnexpectedReply {
+        verb: "attach_shards",
+      });
+    };
+    Ok(ShardsStream {
+      attachment,
+      stream: delivered.stream,
+    })
+  }
+
+  /// Receives the descriptor the daemon sent over the control socket for the reply just read (§4.6: a content map,
+  /// A-135; a stream end, A-161), the one `ours` recognises by what the reply named. The daemon sends it before the
+  /// ring reply, so it is already waiting; the loop only covers a kernel that makes the socket readable a scheduling
+  /// tick after the ring slot, bounded by the client's existing reply deadline (no new timeout). A delivery for an
+  /// earlier request whose caller stopped waiting is dropped here, its descriptor closed, so it never answers a later
+  /// call.
+  #[cfg(unix)]
+  fn recv_delivery(
+    &self,
+    ours: impl Fn(&ControlDelivery) -> bool,
+  ) -> Result<ControlDelivery, ClientError> {
     let start = Instant::now();
     loop {
-      if let Some(delivery) = self.end.recv_mapping().map_err(ClientError::Ipc)? {
-        return Ok(delivery);
+      if let Some(delivery) = self.end.recv_delivery().map_err(ClientError::Ipc)? {
+        if ours(&delivery) {
+          return Ok(delivery);
+        }
+        continue;
       }
       if elapsed_ns(start) > self.deadlines.reply_ns {
         return Err(ClientError::Ipc(IpcError::DeadlineExceeded));

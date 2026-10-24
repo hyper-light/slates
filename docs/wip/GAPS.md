@@ -11035,11 +11035,16 @@ guest's (`AttachForm::ShardsFs`) and serves its end on the volume's owner shard 
 seven tests (`crates/server/tests/shards.rs`) green on macOS arm64 and Linux x86_64, each change checked through the
 daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 and A-161 have the details.
 
-- **Owed, in order:** the stream's delivery over the wire (Linux's control socket by `SCM_RIGHTS`; macOS's socket
-  route with an encrypted, authenticated exchange), the client's and the CLI's attach with a Windows refusal, docs and
-  CI (part 1's steps 2–5); Shards' `--slates-fs-fd` on its current branch and a real boot (part 2); a DAX window over a
-  backing that authorizes only the attachment's bytes (part 3). Until part 3 a slates share is launched without a DAX
-  window: a descriptor ask is refused `EOPNOTSUPP`.
+- **Step 2 built (Linux, 2026-10-24):** `attach` with the Shards form hands the client the end over its control
+  socket just before the reply, from the client's shard or, carried home with a forwarded reply, from another
+  (`Client::attach_shards`, `crates/client/tests/shards.rs`). Control-socket deliveries now carry a kind, and the client
+  takes only the one its reply names: before, a content map delivered for a request whose caller had given up could
+  answer the next map read (found by reading the delivery code while adding the second kind; not reproduced as a
+  failure).
+- **Owed, in order:** macOS's socket route with an encrypted, authenticated exchange (step 3); the CLI's attach and a
+  Windows refusal by kind (step 4); docs and CI (step 5); Shards' `--slates-fs-fd` on its current branch and a real boot
+  (part 2); a DAX window over a backing that authorizes only the attachment's bytes (part 3). Until part 3 a slates
+  share is launched without a DAX window: a descriptor ask is refused `EOPNOTSUPP`.
 - **Open, found by the new tests: a read-only attachment is not a read-only file system to its client.** On every FUSE
   transport (the shared bridge) an open for writing is granted and each write through it refused `EPERM`; NFS answers
   `PERM`. A read-only file system answers `EROFS`, at the open for an open. Every change is refused and nothing lands,

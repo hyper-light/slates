@@ -3165,6 +3165,8 @@ fn init_shard(
     guest_devices: Vec::new(),
     #[cfg(unix)]
     shards_streams: std::collections::BTreeMap::new(),
+    #[cfg(unix)]
+    stream_handoffs: std::collections::BTreeMap::new(),
     clock,
     served: 0,
     refusals: std::collections::BTreeMap::new(),

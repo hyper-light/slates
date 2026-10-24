@@ -2378,6 +2378,7 @@ fn send_forward(
     Box::pin(async move {
       let id = RequestId::from_word(request);
       let mut elsewhere = None;
+      let mut carried = None;
       let reply = crate::state::with_state(|s| {
         s.last_work_ns = s.clock.monotonic_ns();
         // A volume another host of this region owns goes to it (§4.8 "Lookup"), before any completion is
@@ -2401,7 +2402,9 @@ fn send_forward(
         // A same-node cross-shard forward serves a local client, so its completion keys on this node's stable
         // cert-anchor (the same id the local `serve` path uses — task #22), not the ephemeral member id.
         let origin = s.origin_anchor.0;
-        run_forwarded(s, origin, id, client_id, &principal, body, cause)
+        let reply = run_forwarded(s, origin, id, client_id, &principal, body, cause);
+        carried = Some(take_carried(s, request));
+        reply
       })
       .unwrap_or_else(|| Some(refused(Refusal::NotFound)));
       if let Some((region, volume, control, request_bytes)) = elsewhere {
@@ -2422,6 +2425,11 @@ fn send_forward(
       };
       let back = SpawnRequest::new(
         Box::pin(async move {
+          // What the verb owes its client besides the reply (a stream end, A-161) goes home with it, for `send_reply`
+          // to hand over first. A shard whose state is out of reach drops it, counted, and the stream then ends.
+          if let Some(carried) = carried {
+            let _ = crate::state::with_state_counted(|s| keep_carried(s, request, carried));
+          }
           crate::state::deliver(client_index, request, reply, true);
         }),
         None,
@@ -6012,6 +6020,9 @@ fn attach(
     Ok(record) => record,
     Err(r) => return *r,
   };
+  if let Some(reply) = shards_form(state, principal, &record, (volume, snapshot, intent), &form) {
+    return reply;
+  }
   if matches!(record.policy.role, Role::Green { .. }) {
     return crate::merge_service::attach_green(state, client_id, principal, &record, intent, &form);
   }
@@ -6114,6 +6125,92 @@ fn attach(
     token: (!borrows_mount).then_some(token),
   }
 }
+
+/// The attach verb's answer when `form` is the Shards form (A-161), which its own module makes and serves, its end handed
+/// to the client with the reply; `None` for every other form. A green is not presented over a stream (it pins a
+/// version, which a stream's view does not hold yet).
+fn shards_form(
+  state: &mut ShardState,
+  principal: &Principal,
+  record: &VolumeRecord,
+  (volume, snapshot, intent): (VolumeId, Option<SnapshotId>, Intent),
+  form: &AttachRequest,
+) -> Option<ReplyBody> {
+  let AttachRequest::ShardsFs { subtree } = form else {
+    return None;
+  };
+  if matches!(record.policy.role, Role::Green { .. }) {
+    return Some(refused(Refusal::Unsupported {
+      feature: "a green presented over a Shards stream".to_owned(),
+    }));
+  }
+  Some(shards_attach(
+    state,
+    principal,
+    volume,
+    snapshot,
+    (intent, subtree.clone()),
+  ))
+}
+
+/// The attach verb's Shards form (A-161): served on Unix by `crate::shards`, which refuses it where the platform has no
+/// route to hand the client a descriptor.
+#[cfg(unix)]
+fn shards_attach(
+  state: &mut ShardState,
+  principal: &Principal,
+  volume: VolumeId,
+  snapshot: Option<SnapshotId>,
+  ask: (Intent, Option<String>),
+) -> ReplyBody {
+  crate::shards::attach_verb(state, principal, volume, snapshot, ask)
+}
+
+/// The attach verb's Shards form has no stream to serve here (no Unix descriptor readiness): refused before any effect.
+#[cfg(not(unix))]
+fn shards_attach(
+  _state: &mut ShardState,
+  _principal: &Principal,
+  _volume: VolumeId,
+  _snapshot: Option<SnapshotId>,
+  _ask: (Intent, Option<String>),
+) -> ReplyBody {
+  refused(Refusal::AttachmentUnsupported {
+    transport: slates_ipc::protocol::AttachTransport::ShardsFs,
+    reason: slates_ipc::protocol::UnsupportedReason::DescriptorRouteNotBuilt,
+  })
+}
+
+/// What a verb run on its volume's owner shard carries back to its client's shard besides its reply: the Shards stream
+/// end owed for it, if it made one (A-161). Nothing on a platform with no stream.
+#[cfg(unix)]
+type Carried = Option<crate::shards::Handoff>;
+/// See the Unix arm: no stream, so nothing is carried.
+#[cfg(not(unix))]
+type Carried = ();
+
+/// Takes what request `request`'s verb, just run here, owes its client besides its reply.
+#[cfg(unix)]
+fn take_carried(state: &mut ShardState, request: u64) -> Carried {
+  state.stream_handoffs.remove(&request)
+}
+
+/// See the Unix arm.
+#[cfg(not(unix))]
+fn take_carried(_state: &mut ShardState, _request: u64) -> Carried {}
+
+/// Keeps on the client's shard what request `request`'s verb carried back, for `send_reply` to hand over with the
+/// reply.
+#[cfg(unix)]
+fn keep_carried(state: &mut ShardState, request: u64, carried: Carried) {
+  if let Some(handoff) = carried {
+    state.stream_handoffs.insert(request, handoff);
+  }
+}
+
+/// See the Unix arm.
+#[cfg(not(unix))]
+fn keep_carried(_state: &mut ShardState, _request: u64, _carried: Carried) {}
 
 /// Commits an attachment record. A host mount of a snapshot opens its read-only view first (AUD-29-76), so a
 /// refusal changes nothing, and closes it again if the record does not commit.
@@ -6318,6 +6415,18 @@ fn read_write_of(intent: Intent) -> ReadWritePolicy {
   }
 }
 
+/// The refusal for a form `establish_form` does not establish: a guest device over the ring (its seam is handed in
+/// in-process), and a Shards stream, which `attach` hands to `crate::shards` before this is reached, so a caller that
+/// gets here has no stream to establish. Either is refused before any effect.
+fn not_established_here(situation: &crate::transports::Situation, form: &AttachRequest) -> Refusal {
+  match form {
+    AttachRequest::Guest { transport } => guest_over_the_ring(situation, *transport),
+    _ => Refusal::BadRequest {
+      reason: "a Shards stream is attached by its own path".to_owned(),
+    },
+  }
+}
+
 /// Hands a FUSE attach to its deferred establishment (`crate::fuse`): the mount is made without blocking the
 /// shard, and the attachment recorded with the reply once the device is held (§4.6 "Linux"; AUD-29-64).
 #[cfg(target_os = "linux")]
@@ -6396,6 +6505,8 @@ pub(crate) fn consumer_of(form: &AttachRequest, client_id: u32) -> Result<Consum
       transport: *transport,
       reason: UnsupportedReason::SeamNotOnWire,
     }),
+    // A Shards stream is a guest's: it ends with the stream, and recovery ends a dead daemon's (A-161).
+    AttachRequest::ShardsFs { .. } => Ok(Consumer::Guest),
   }
 }
 
@@ -6470,7 +6581,9 @@ fn establish_form(
       check_fuse_mount_point(form, principal)?;
       return Ok(None);
     }
-    AttachRequest::Guest { transport } => return Err(guest_over_the_ring(situation, *transport)),
+    AttachRequest::Guest { .. } | AttachRequest::ShardsFs { .. } => {
+      return Err(not_established_here(situation, form));
+    }
     AttachRequest::Oci {
       source,
       destination,
@@ -6906,8 +7019,10 @@ fn destroy(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> R
   // The volume's guest devices are revoked first (AUD-29-68): each ends at its next pass boundary, its terminal
   // step sweeping its references through its volume or view while they still exist. The teardown waits for
   // them (`step_destroys` starts it once none serves the volume); with none, it starts now.
+  // Its Shards streams end the same way, each sweeping its guest's references before the teardown (A-161).
   #[cfg(unix)]
-  let devices_serving = crate::virtiofs::revoke_volume_devices(state, record.id);
+  let devices_serving = crate::virtiofs::revoke_volume_devices(state, record.id)
+    .saturating_add(crate::shards::end_volume_streams(state, record.id));
   #[cfg(not(unix))]
   let devices_serving = 0;
   if devices_serving == 0
@@ -6969,6 +7084,9 @@ pub(crate) fn reconcile_unpublished_effects(state: &mut ShardState) -> usize {
     keep
   });
   crate::work_charge::release(state, released);
+  // A Shards stream whose attachment the rollback removed serves nothing, and its end is handed to no one (A-161).
+  #[cfg(unix)]
+  crate::shards::reconcile_unrecorded(state);
   orphans.len()
 }
 
@@ -7001,7 +7119,9 @@ fn teardown_started(
     return true;
   }
   #[cfg(unix)]
-  if crate::virtiofs::revoke_volume_devices(state, volume) > 0 {
+  if crate::virtiofs::revoke_volume_devices(state, volume) > 0
+    || crate::shards::end_volume_streams(state, volume) > 0
+  {
     return false;
   }
   if let Err(e) = start_teardown(state, handle, volume) {
@@ -8307,6 +8427,10 @@ fn send_reply(
   request: u64,
   reply: &mut ReplyBody,
 ) -> bool {
+  // A stream end owed for this request goes first, over the client's control socket, so the client finds it waiting
+  // when it reads the reply (A-161); it is taken out here whatever becomes of the reply.
+  #[cfg(unix)]
+  crate::shards::deliver_handoff(state, client_index, request, reply);
   let Some(generation) = state.clients.generation_at(client_index) else {
     return true;
   };
