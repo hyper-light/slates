@@ -20,8 +20,9 @@
 //! formulas live next to their values as `Derived` (§4.2, "Derived constants").
 //!
 //! Modules: [`handle`], [`segmented`], [`slab`], [`buddy`], [`region`], [`lock`], [`prefault`],
-//! [`arena`], [`ring`], [`mpsc`], [`budget`], [`error`]; under `--cfg loom`, `loom_bounds` holds
-//! the exploration bounds every loom model in the workspace checks through (AC-0.7).
+//! [`arena`], [`ring`], [`mpsc`], [`budget`], [`error`], [`shared`], and [`dax_object`] (the memory a VMM
+//! maps one file's DAX ranges from, §4.6); under `--cfg loom`, `loom_bounds` holds the exploration bounds
+//! every loom model in the workspace checks through (AC-0.7).
 
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
 // are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
@@ -31,6 +32,7 @@
 pub mod arena;
 pub mod buddy;
 pub mod budget;
+pub mod dax_object;
 pub mod error;
 pub mod handle;
 pub mod lock;
@@ -47,6 +49,7 @@ pub mod slab;
 pub mod words;
 
 pub use arena::{ChunkArena, Extent};
+pub use dax_object::{DAX_OBJECT_BYTES, DAX_RANGE_BYTES, DaxObject};
 pub use error::{ExtentRefusal, LayoutRefusal, MemError};
 pub use handle::{Encoded, Handle};
 pub use mpsc::MpscRing;

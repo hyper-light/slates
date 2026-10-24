@@ -40,6 +40,10 @@ use std::sync::atomic::{AtomicU32, AtomicU64};
 use crate::error::{LayoutRefusal, MemError};
 use crate::words::{Layout, RunId, SpanId, SpanRun, Width, WordRun, Words, refused};
 
+/// One range of a memory object mapped on its own, for the DAX object's views (`crate::dax_object`).
+#[cfg(unix)]
+pub(crate) use platform::RangeView;
+
 /// How an object is handed to another process.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Handoff {
@@ -1091,6 +1095,35 @@ mod platform {
   /// The offset granule of a mapping: the base page.
   pub(super) fn mapping_granule() -> Result<usize, MemError> {
     Ok(rustix::param::page_size())
+  }
+
+  /// One range of a memory object, mapped on its own by the placed `mmap` every object here uses: a DAX object's views
+  /// (`crate::dax_object`), which cannot map their object whole. The mapping is unmapped when the view drops. No
+  /// reference to its bytes leaves this crate: the DAX object reaches them through atomics at [`RangeView::base`], and
+  /// lends [`RangeView::pages_mut`] to a page-giving `madvise` alone, which reads and writes no byte through it.
+  pub(crate) struct RangeView(Mapped);
+
+  impl RangeView {
+    /// Maps `len` bytes of the object behind `fd` from `offset`, read and write, shared.
+    pub(crate) fn map(fd: &OwnedFd, offset: usize, len: usize) -> Result<RangeView, MemError> {
+      map(fd, offset, len).map(RangeView)
+    }
+
+    /// The view's first byte, as the raw address the mapping returned (no reference to its bytes is formed).
+    pub(crate) fn base(&self) -> *mut u8 {
+      std::ptr::with_exposed_provenance_mut(self.0.window)
+    }
+
+    /// The view's length in bytes.
+    pub(crate) fn len(&self) -> usize {
+      self.0.len
+    }
+
+    /// The view's pages, for an `madvise` that gives them back (Linux's hole punch), and nothing else.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn pages_mut(&mut self) -> &mut [u8] {
+      &mut self.0
+    }
   }
 
   /// A sparse object is the same object here: a `memfd` or `shm_open` page is backed on first touch.

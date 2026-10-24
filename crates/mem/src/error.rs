@@ -111,6 +111,12 @@ pub enum MemError {
     /// The bytes still allocated in it.
     allocated: usize,
   },
+  /// A DAX object already maps as many ranges as its owner allows at once (`crate::dax_object`): nothing was mapped,
+  /// read or written. Its owner releases a view, or refuses what needed the range.
+  ViewsExhausted {
+    /// The most views the owner allows.
+    most: usize,
+  },
 }
 
 /// Why a shared object's layout or access was refused (AUD-29-09).
@@ -222,6 +228,12 @@ impl fmt::Display for MemError {
       }
       Self::GenerationExhausted { index } => {
         write!(f, "generations of index {index} are spent; it is retired")
+      }
+      Self::ViewsExhausted { most } => {
+        write!(
+          f,
+          "a DAX object already maps the {most} ranges its owner allows"
+        )
       }
     }
   }
