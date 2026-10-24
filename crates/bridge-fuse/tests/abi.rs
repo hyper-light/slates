@@ -337,8 +337,62 @@ fn the_init_reply_offers_its_page_count_in_the_word_at_twenty_eight() {
   assert_eq!(
     word >> 16,
     0,
-    "map_alignment is the high half, and slates asks for no alignment"
+    "map_alignment is the high half, and slates asks for no alignment without a DAX offer"
   );
+}
+
+/// Do: negotiate an `INIT` offering every flag, through a transport offering per-inode DAX (the Shards route, part 3),
+/// and again from a kernel that offers neither DAX flag. Expect the first reply to keep `FUSE_MAP_ALIGNMENT` (bit 26 of
+/// `flags`) and `FUSE_HAS_INODE_DAX` (bit 1 of `flags2`) and to name log2 of the host's page as the alignment, in the
+/// high half of the word at 28; and the second to keep neither and name none. Serves Shards part 3, step 2.
+#[test]
+fn an_init_through_a_dax_offering_transport_keeps_the_dax_flags_and_names_the_alignment() {
+  let offer = slates_bridge_core::DaxOffer::PerInode {
+    smallest: 2 << 20,
+    new_files: true,
+  };
+  let mut body = vec![0u8; 64];
+  put_u32(&mut body, 0, 7);
+  put_u32(&mut body, 4, 46);
+  put_u32(&mut body, 8, 1 << 20);
+  put_u32(&mut body, 12, u32::MAX);
+  put_u32(&mut body, 16, u32::MAX);
+  let reply = slates_bridge_fuse::init::negotiate_offering(
+    &body,
+    slates_bridge_core::CacheCoherence::Revalidated,
+    offer,
+  )
+  .unwrap()
+  .to_bytes();
+  assert_ne!(u32_at(&reply, 12) & (1 << 26), 0, "FUSE_MAP_ALIGNMENT kept");
+  assert_ne!(u32_at(&reply, 32) & (1 << 1), 0, "FUSE_HAS_INODE_DAX kept");
+  // The host's page, as the codec sees it: the largest write is `max_pages` of them.
+  let page = slates_bridge_fuse::init::MAX_WRITE / u32::from(slates_bridge_fuse::init::max_pages());
+  assert_eq!(
+    u32_at(&reply, 28) >> 16,
+    page.trailing_zeros(),
+    "the host's page as the alignment"
+  );
+  put_u32(&mut body, 12, !(1 << 26));
+  put_u32(&mut body, 16, !(1 << 1));
+  let reply = slates_bridge_fuse::init::negotiate_offering(
+    &body,
+    slates_bridge_core::CacheCoherence::Revalidated,
+    offer,
+  )
+  .unwrap()
+  .to_bytes();
+  assert_eq!(
+    u32_at(&reply, 12) & (1 << 26),
+    0,
+    "no alignment the kernel did not offer"
+  );
+  assert_eq!(
+    u32_at(&reply, 32) & (1 << 1),
+    0,
+    "no per-inode DAX the kernel did not offer"
+  );
+  assert_eq!(u32_at(&reply, 28) >> 16, 0, "and no alignment named");
 }
 
 /// The `FATTR_*` bits and the `renameat2` flags carry the headers' values.
@@ -565,6 +619,7 @@ fn entry_out_is_written_at_the_headers_offsets() {
       uid: 501,
       gid: 20,
       blksize: 4096,
+      dax: false,
     },
   };
   let b = entry.to_bytes();
@@ -754,4 +809,25 @@ fn entry_and_delete_notifications_are_written_at_the_headers_offsets() {
     "FUSE_NOTIFY_DELETE; parent, child, namelen"
   );
   assert_eq!(&out[40..45], b"gone\0");
+}
+
+/// Do: encode one file's attributes twice, marked for DAX and not. Expect `fuse_attr.flags`, its last word, to be
+/// `FUSE_ATTR_DAX` (`1 << 1`, `include/uapi/linux/fuse.h`) when marked and zero when not, every other byte the same.
+/// Serves Shards part 3, step 2 (the DAX offer).
+#[test]
+fn an_attribute_marked_for_dax_carries_fuse_attr_dax_in_its_flags() {
+  let plain = Attr {
+    ino: 9,
+    size: 3 << 20,
+    mode: 0o100_644,
+    nlink: 1,
+    ..Attr::default()
+  };
+  let marked = Attr { dax: true, ..plain };
+  let (plain, marked) = (plain.to_bytes(), marked.to_bytes());
+  assert_eq!(plain.len(), Attr::LEN);
+  let flags_at = Attr::LEN - 4;
+  assert_eq!(plain[flags_at..], [0, 0, 0, 0]);
+  assert_eq!(marked[flags_at..], [2, 0, 0, 0]);
+  assert_eq!(plain[..flags_at], marked[..flags_at]);
 }

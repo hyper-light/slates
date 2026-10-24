@@ -73,7 +73,14 @@ pub struct Attr {
   pub gid: u32,
   /// The preferred block size.
   pub blksize: u32,
+  /// Whether the guest is told to map the file with DAX (`FUSE_ATTR_DAX` in `flags`): only where the transport offers
+  /// per-inode DAX (the Shards route, part 3).
+  pub dax: bool,
 }
+
+/// Format: `fuse_attr.flags`' `FUSE_ATTR_DAX`: the guest maps this file with DAX, under `dax=inode`
+/// (`include/uapi/linux/fuse.h`).
+const ATTR_DAX: u32 = 1 << 1;
 
 impl Attr {
   /// Format: the wire size of `fuse_attr`.
@@ -96,7 +103,7 @@ impl Attr {
     w.u32(self.gid);
     w.u32(0); // rdev
     w.u32(self.blksize);
-    w.u32(0); // flags
+    w.u32(if self.dax { ATTR_DAX } else { 0 }); // flags
   }
 
   /// The attributes as a byte block.

@@ -827,6 +827,7 @@ fn owe(stream: &mut ShardsStream, bytes: &[u8]) {
 /// be served (its registry entry or its volume gone): the stream ends.
 fn serve_request(s: &mut ShardState, stream: &mut ShardsStream, total: usize) -> bool {
   crate::verbs::relieve_deferred(s);
+  let dax_offer = dax::offer(s);
   let Some(&handle) = s.by_id.get(&stream.volume) else {
     return false;
   };
@@ -850,7 +851,8 @@ fn serve_request(s: &mut ShardState, stream: &mut ShardsStream, total: usize) ->
       store,
       &mut stream.handles,
       slot.host.as_mut().map(|host| host as &mut dyn HostFs),
-    );
+    )
+    .offering_dax(dax_offer);
     let mut scoped = None;
     let served = crate::verbs::scoped_or_whole(&mut bridge, &mut scoped, stream.scope);
     let request = stream.inbound.get(LENGTH_BYTES..total).unwrap_or(&[]);

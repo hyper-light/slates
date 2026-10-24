@@ -182,6 +182,13 @@ pub mod flags {
   pub const BIG_WRITES: u64 = 1 << 5;
   /// Format: FUSE_INIT_EXT — the second 32 bits of the flags word (`flags2`) are present.
   pub const INIT_EXT: u64 = 1 << 30;
+  /// Format: FUSE_MAP_ALIGNMENT — the reply's `map_alignment` (log2 of the alignment a DAX mapping's offsets keep) is
+  /// read. Kept only where the transport offers per-inode DAX (`slates_bridge_core::DaxOffer`; the Shards route, part
+  /// 3), as Shards' own server does (`crates/vmm/src/devices/virtio/fs/server.rs`).
+  pub const MAP_ALIGNMENT: u64 = 1 << 26;
+  /// Format: FUSE_HAS_INODE_DAX — the server says which files the guest maps with DAX, by `FUSE_ATTR_DAX` in their
+  /// attributes: bit 1 of `flags2`, so bit 33 of the whole word (Linux `fs/fuse/inode.c` sets `inode_dax` from it).
+  pub const HAS_INODE_DAX: u64 = 1 << 33;
   /// Format: FUSE_MAX_PAGES — the reply's `max_pages` field is read, so one request may carry more than the
   /// kernel's default of 32 pages (`FUSE_DEFAULT_MAX_PAGES_PER_REQ`, `fs/fuse/fuse_i.h`).
   ///

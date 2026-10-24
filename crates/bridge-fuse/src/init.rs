@@ -6,7 +6,7 @@
 use crate::abi::{FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION, Opcode, flags};
 use crate::error::FuseError;
 use crate::wire::{Reader, Writer};
-use slates_bridge_core::CacheCoherence;
+use slates_bridge_core::{CacheCoherence, DaxOffer};
 
 /// The maximum write the daemon accepts in one request; public because it is the anchor of the
 /// virtio-fs device's readable-bytes cap (`slates-bridge-virtiofs`): the largest request a guest
@@ -93,6 +93,9 @@ pub struct InitNegotiation {
   /// answered, which a restarted daemon serving a held device asks for (§4.6 "restore from the anchor's held
   /// fd"). Advertised by the kernel only, so it is kept apart from the flags the reply echoes.
   pub kernel_resends: bool,
+  /// The reply's `map_alignment`: log2 of the host's page, which a DAX mapping's offsets keep, where the connection
+  /// kept [`flags::MAP_ALIGNMENT`]; zero otherwise.
+  pub map_alignment: u16,
 }
 
 /// The flags slates asks for (the connection keeps whatever the kernel also offers). Each is a
@@ -126,8 +129,27 @@ fn wanted(coherence: CacheCoherence) -> u64 {
 }
 
 /// Negotiates from a `fuse_init_in` body (major, minor, max_readahead, flags, then flags2 and
-/// padding when the kernel set `INIT_EXT`). A body shorter than the fixed part is refused.
+/// padding when the kernel set `INIT_EXT`). A body shorter than the fixed part is refused. No DAX is offered.
 pub fn negotiate(body: &[u8], coherence: CacheCoherence) -> Result<InitNegotiation, FuseError> {
+  negotiate_offering(body, coherence, DaxOffer::Withheld)
+}
+
+/// The DAX flags a transport offering per-inode DAX asks for ([`DaxOffer::PerInode`]): the alignment its mappings keep
+/// and the per-file choice; none where it offers none.
+fn dax_wanted(dax: DaxOffer) -> u64 {
+  match dax {
+    DaxOffer::Withheld => 0,
+    DaxOffer::PerInode { .. } => flags::MAP_ALIGNMENT | flags::HAS_INODE_DAX,
+  }
+}
+
+/// [`negotiate`], keeping the kernel's DAX flags where the transport offers per-inode DAX as `dax` says (the Shards
+/// route, part 3): `FUSE_HAS_INODE_DAX`, and `FUSE_MAP_ALIGNMENT` with the host's page as the alignment.
+pub fn negotiate_offering(
+  body: &[u8],
+  coherence: CacheCoherence,
+  dax: DaxOffer,
+) -> Result<InitNegotiation, FuseError> {
   let opcode = Opcode::Init.to_wire();
   let mut r = Reader::new(body);
   let major = r.u32(opcode)?;
@@ -157,13 +179,15 @@ pub fn negotiate(body: &[u8], coherence: CacheCoherence) -> Result<InitNegotiati
       max_readahead: MAX_READAHEAD,
       version_mismatch: true,
       kernel_resends: false,
+      map_alignment: 0,
     });
   }
+  let kept = (wanted(coherence) | dax_wanted(dax)) & kernel_flags;
   Ok(InitNegotiation {
     major: FUSE_KERNEL_VERSION,
     minor: minor.min(FUSE_KERNEL_MINOR_VERSION),
     kernel_minor: minor,
-    flags: wanted(coherence) & kernel_flags,
+    flags: kept,
     max_write: MAX_WRITE,
     // Only meaningful when the intersection kept the flag: a kernel that did not offer it ignores the field.
     max_pages: if wanted(coherence) & kernel_flags & flags::MAX_PAGES != 0 {
@@ -174,6 +198,11 @@ pub fn negotiate(body: &[u8], coherence: CacheCoherence) -> Result<InitNegotiati
     max_readahead: kernel_readahead.min(MAX_READAHEAD),
     version_mismatch: false,
     kernel_resends: kernel_flags & flags::HAS_RESEND != 0,
+    map_alignment: if kept & flags::MAP_ALIGNMENT != 0 {
+      u16::try_from(host_page_bytes().max(1).trailing_zeros()).unwrap_or(0)
+    } else {
+      0
+    },
   })
 }
 
@@ -196,8 +225,10 @@ impl InitNegotiation {
     w.u32(0); // max_background + congestion_threshold (two u16, both zero: kernel defaults)
     w.u32(self.max_write);
     w.u32(TIME_GRAN_NS);
-    // max_pages (low u16) + map_alignment (high u16, zero: slates asks for no alignment).
-    w.u32(u32::from(self.max_pages));
+    // max_pages (low u16) + map_alignment (high u16: log2 of the alignment a DAX mapping keeps, zero without DAX).
+    // Format: the shift that puts `map_alignment` in the word's high half.
+    const HIGH_U16_SHIFT: u32 = 16;
+    w.u32(u32::from(self.max_pages) | (u32::from(self.map_alignment) << HIGH_U16_SHIFT));
     w.u32(high); // flags2
     w.pad(RESERVED_WORDS);
     w.into_bytes()

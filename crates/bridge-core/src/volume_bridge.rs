@@ -84,6 +84,9 @@ pub struct VolumeBridge<'v> {
   /// For a mount taken over from a daemon that died (A-61), the files whose acknowledged writes the death lost:
   /// a `flush` or `fsync` of one through a handle the dead daemon issued answers `EIO` once ([`LostWrites`]).
   lost: Option<&'v mut LostWrites>,
+  /// Whether the transport serving through this bridge offers its guest per-inode DAX ([`crate::DaxOffer`]): withheld
+  /// unless the Shards route's serve task says otherwise ([`VolumeBridge::offering_dax`]).
+  dax: crate::DaxOffer,
 }
 
 /// The files whose acknowledged writes a daemon's death lost, for a mount the anchor held across it (A-61;
@@ -287,6 +290,7 @@ impl<'v> VolumeBridge<'v> {
       handles: HandleStore::Owned(Slab::new(HANDLE_SEGMENT, MAX_OPEN_HANDLES)),
       max_read: MAX_READ,
       lost: None,
+      dax: crate::DaxOffer::Withheld,
     }
   }
 
@@ -307,6 +311,7 @@ impl<'v> VolumeBridge<'v> {
       handles: HandleStore::Owned(Slab::new(HANDLE_SEGMENT, MAX_OPEN_HANDLES)),
       max_read: MAX_READ,
       lost: None,
+      dax: crate::DaxOffer::Withheld,
     }
   }
 
@@ -333,6 +338,7 @@ impl<'v> VolumeBridge<'v> {
       handles: HandleStore::Borrowed(handles),
       max_read: MAX_READ,
       lost: None,
+      dax: crate::DaxOffer::Withheld,
     }
   }
 
@@ -340,6 +346,13 @@ impl<'v> VolumeBridge<'v> {
   #[must_use]
   pub fn with_lost_writes(mut self, lost: &'v mut LostWrites) -> VolumeBridge<'v> {
     self.lost = Some(lost);
+    self
+  }
+
+  /// This bridge, its transport offering its guest per-inode DAX as `dax` says (the Shards route, part 3).
+  #[must_use]
+  pub fn offering_dax(mut self, dax: crate::DaxOffer) -> VolumeBridge<'v> {
+    self.dax = dax;
     self
   }
 
@@ -1314,6 +1327,10 @@ impl Bridge for VolumeBridge<'_> {
 
   fn now(&mut self) -> i64 {
     self.volume.wall_ns()
+  }
+
+  fn dax_offer(&mut self) -> crate::DaxOffer {
+    self.dax
   }
 
   fn cache_lifetime(&mut self, object: ObjectId, cx: &OpContext) -> CacheLifetime {

@@ -45,7 +45,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use slates_bridge_core::{Bridge, ObjectId, OpContext, VolumeBridge};
+use slates_bridge_core::{Bridge, DaxOffer, ObjectId, OpContext, VolumeBridge};
 use slates_bridge_fuse::bridge::errno;
 use slates_bridge_fuse::shards_fs::{
   DescriptorAsk, descriptor_answer, descriptor_ask, descriptor_refusal,
@@ -178,6 +178,16 @@ fn fill_budget(s: &ShardState) -> u64 {
 /// Derived: the views of its object a backing may hold at once: the fill budget in ranges, the most it can fill.
 fn most_views(s: &ShardState) -> usize {
   usize::try_from(fill_budget(s).checked_div(DAX_RANGE_BYTES).unwrap_or(0)).unwrap_or(usize::MAX)
+}
+
+/// The DAX offer a stream's requests are answered under (`slates_bridge_core::DaxOffer`): per-inode DAX for regular files
+/// of a range or more, marked while the shard's fill budget has room for another backing (the one range each counts at
+/// least), so files stop being offered DAX before a fill would be refused.
+pub(super) fn offer(s: &ShardState) -> DaxOffer {
+  DaxOffer::PerInode {
+    smallest: DAX_RANGE_BYTES,
+    new_files: s.dax_filled.saturating_add(DAX_RANGE_BYTES) <= fill_budget(s),
+  }
 }
 
 /// Counts `bytes` more against the shard's fill budget, or refuses with nothing counted.

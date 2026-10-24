@@ -444,6 +444,10 @@ impl Bridge for ScopedBridge<'_> {
     self.inner.cache_lifetime(object, cx)
   }
 
+  fn dax_offer(&mut self) -> crate::DaxOffer {
+    self.inner.dax_offer()
+  }
+
   fn data_changes(
     &mut self,
     cx: &OpContext,

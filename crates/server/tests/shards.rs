@@ -50,6 +50,17 @@ const CONTROL: u32 = 1 << 31;
 const ASK_SAVE: u8 = 1;
 const ASK_RESTORE: u8 = 2;
 const ASK_DESCRIPTOR: u8 = 3;
+/// Format: `FUSE_MAP_ALIGNMENT` and `FUSE_INIT_EXT` in `fuse_init_in.flags`, and `FUSE_HAS_INODE_DAX` in its `flags2`
+/// (`include/uapi/linux/fuse.h`).
+const INIT_MAP_ALIGNMENT: u32 = 1 << 26;
+const INIT_EXT: u32 = 1 << 30;
+const INIT2_HAS_INODE_DAX: u32 = 1 << 1;
+/// Format: `FUSE_ATTR_DAX` in `fuse_attr.flags`.
+const ATTR_DAX: u32 = 1 << 1;
+/// Format: where `fuse_attr.flags` lies in a LOOKUP reply (`fuse_entry_out`: 40 bytes before its `fuse_attr`, whose
+/// last word is `flags`, at 84) and in a GETATTR reply (`fuse_attr_out`: 16 bytes before its `fuse_attr`).
+const ENTRY_ATTR_FLAGS_AT: usize = OUT_HEADER_LEN + 40 + 84;
+const ATTR_OUT_FLAGS_AT: usize = OUT_HEADER_LEN + 16 + 84;
 /// Format: the range a guest maps a file in, and a DAX object's view (`FUSE_DAX_SZ`).
 const DAX_RANGE: u64 = slates_mem::DAX_RANGE_BYTES;
 /// Format: an opcode no FUSE kernel defines (`include/uapi/linux/fuse.h` ends in the low hundreds).
@@ -264,6 +275,31 @@ impl Guest {
     let reply = self.ask(Opcode::Init, 0, &body);
     assert_eq!(errno(&reply), 0, "INIT answered");
     reply
+  }
+
+  /// An `INIT` offering the DAX flags a `dax=inode` guest offers: `FUSE_MAP_ALIGNMENT`, and `FUSE_HAS_INODE_DAX` in the
+  /// second flags word, which `FUSE_INIT_EXT` announces. The reply.
+  fn init_offering_dax(&mut self) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&MAJOR.to_le_bytes());
+    body.extend_from_slice(&MINOR.to_le_bytes());
+    body.extend_from_slice(&(128u32 << 10).to_le_bytes());
+    body.extend_from_slice(&(INIT_MAP_ALIGNMENT | INIT_EXT).to_le_bytes());
+    body.extend_from_slice(&INIT2_HAS_INODE_DAX.to_le_bytes());
+    body.extend_from_slice(&[0u8; 44]);
+    let reply = self.ask(Opcode::Init, 0, &body);
+    assert_eq!(errno(&reply), 0, "INIT answered");
+    reply
+  }
+
+  /// A LOOKUP's whole reply.
+  fn lookup_reply(&mut self, parent: u64, name: &str) -> Vec<u8> {
+    self.ask(Opcode::Lookup, parent, &named(name))
+  }
+
+  /// A GETATTR's whole reply.
+  fn getattr_reply(&mut self, node: u64) -> Vec<u8> {
+    self.ask(Opcode::GetAttr, node, &[0u8; 16])
   }
 
   fn lookup(&mut self, parent: u64, name: &str) -> Result<u64, i32> {
@@ -1422,11 +1458,67 @@ fn a_read_only_attachment_may_not_ask_to_write(daemon: &Daemon, id: VolumeId, fi
   );
 }
 
+/// Whether a reply's `fuse_attr.flags`, at `at`, carries `FUSE_ATTR_DAX`.
+fn marked_dax(reply: &[u8], at: usize) -> bool {
+  assert_eq!(errno(reply), 0, "the reply is a success");
+  u32::from_le_bytes(reply[at..at + 4].try_into().unwrap()) & ATTR_DAX != 0
+}
+
+/// AC (Shards part 3, step 2), the DAX offer. Do: `INIT` a guest over the stream offering the flags a `dax=inode` guest
+/// offers; look up a 3 MiB file, a small file and a directory, and get the large file's attributes. Expect the `INIT`
+/// reply to keep `FUSE_MAP_ALIGNMENT` and `FUSE_HAS_INODE_DAX` and to name the host's page as the alignment, and
+/// `FUSE_ATTR_DAX` on the large file's entry and attributes and on neither the small file's nor the directory's.
+#[test]
+fn the_stream_offers_per_inode_dax_for_files_of_a_range_or_more() {
+  let (daemon, client, id) = dax_provisioned("shards-dax-offer", 8 << 20, None);
+  let mut guest = Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
+  let init = guest.init_offering_dax();
+  let word = |at: usize| {
+    u32::from_le_bytes(
+      init[OUT_HEADER_LEN + at..OUT_HEADER_LEN + at + 4]
+        .try_into()
+        .unwrap(),
+    )
+  };
+  assert_ne!(word(12) & INIT_MAP_ALIGNMENT, 0, "FUSE_MAP_ALIGNMENT kept");
+  assert_ne!(word(32) & INIT2_HAS_INODE_DAX, 0, "FUSE_HAS_INODE_DAX kept");
+  let page = u32::try_from(rustix::param::page_size()).unwrap();
+  assert_eq!(
+    word(28) >> 16,
+    page.trailing_zeros(),
+    "the host's page as the alignment"
+  );
+  guest_writes_large(&mut guest, "large", &patterned(3 << 20, 0x66));
+  guest_writes(&mut guest, ROOT, "small", b"a few bytes");
+  guest.mkdir(ROOT, "directory").unwrap();
+  let large = guest.lookup_reply(ROOT, "large");
+  assert!(
+    marked_dax(&large, ENTRY_ATTR_FLAGS_AT),
+    "a file of a range or more is marked"
+  );
+  let node = u64_at(&large, OUT_HEADER_LEN);
+  assert!(
+    marked_dax(&guest.getattr_reply(node), ATTR_OUT_FLAGS_AT),
+    "and its attributes say so"
+  );
+  assert!(
+    !marked_dax(&guest.lookup_reply(ROOT, "small"), ENTRY_ATTR_FLAGS_AT),
+    "a small file is not"
+  );
+  assert!(
+    !marked_dax(&guest.lookup_reply(ROOT, "directory"), ENTRY_ATTR_FLAGS_AT),
+    "nor a directory"
+  );
+  drop(client);
+  drop(daemon);
+}
+
 /// AC (Shards part 3, step 2), the budget. Do: on a daemon whose shard reserve, and so its fill budget, is 16 MiB (of
 /// which a bounded volume may take 6 MiB, the rest the shard's operation headroom), write a 5.5 MiB file and have
 /// three attachments each ask for the whole of it; then have the first forget its node and the third ask again. Expect
 /// the first two answered (11 MiB of copies), the third refused `ENOMEM` and counted, since its copy would take the
-/// fills to 16.5 MiB, and answered once the first's forget gave its 5.5 MiB back.
+/// fills to 16.5 MiB; no file offered DAX while the budget is full; and the offer back, and the third answered, once
+/// the first's forget gave its 5.5 MiB back.
 #[test]
 fn a_fill_past_the_shards_budget_is_refused_and_a_forget_gives_its_charge_back() {
   let reserve = 16 << 20;
@@ -1450,7 +1542,15 @@ fn a_fill_past_the_shards_budget_is_refused_and_a_forget_gives_its_charge_back()
     "a third copy passes the budget"
   );
   assert_eq!(wait_for_count(&daemon, "shards.dax_budget", 1), 1);
+  assert!(
+    !marked_dax(&second.lookup_reply(ROOT, "file"), ENTRY_ATTR_FLAGS_AT),
+    "with the budget full, no file is offered DAX"
+  );
   first.forget(file, 1);
+  assert!(
+    marked_dax(&second.lookup_reply(ROOT, "file"), ENTRY_ATTR_FLAGS_AT),
+    "with room again, it is"
+  );
   let retried = third.descriptor(file, false, None);
   assert!(
     retried.is_ok(),

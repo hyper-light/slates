@@ -11,14 +11,14 @@
 //! `ENOSYS` without reaching the bridge.
 
 use crate::abi::{OUT_HEADER_LEN, Opcode};
-use crate::init::negotiate;
+use crate::init::negotiate_offering;
 use crate::reply::{Attr, AttrOut, DirBuffer, EntryOut, OpenOut, ReplyHeader, StatfsOut, WriteOut};
 use crate::request::{ReadIn, RenameIn, Request, SetAttrIn, WriteIn, parse_name};
 
 pub use slates_bridge_core::{Bridge, DirEntry};
 use slates_bridge_core::{
-  CacheCoherence, CacheLifetime, FsStat, NodeAttr, ObjectId, OpContext, RenameFlags, SetAttr,
-  whole_cookie_groups,
+  CacheCoherence, CacheLifetime, DaxOffer, FsStat, NodeAttr, ObjectId, OpContext, RenameFlags,
+  SetAttr, whole_cookie_groups,
 };
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::Kind;
@@ -130,7 +130,7 @@ pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, cx: &OpContext, out: &m
     cx
   };
   match opcode {
-    Opcode::Init => serve_init(request.body, unique, cx.coherence, out),
+    Opcode::Init => serve_init(request.body, unique, cx.coherence, bridge.dax_offer(), out),
     Opcode::Lookup => serve_lookup(bridge, &request, cx, out),
     Opcode::GetAttr => serve_getattr(bridge, &request, cx, out),
     Opcode::Open => serve_open(bridge, &request, cx, Opcode::Open, out),
@@ -691,8 +691,9 @@ fn split_ns(ns: i64) -> (u64, u32) {
 /// name. (Until the GAP-A9-3 sweep of 2026-09-14 the wire change time was taken from the
 /// modification time, so a `stat` through a FUSE mount reported `ctime == mtime` — a chmod, which
 /// moves only the change time, was invisible to a tool watching it.)
-fn fuse_attr(node: &NodeAttr) -> Attr {
+fn fuse_attr(node: &NodeAttr, dax: bool) -> Attr {
   Attr {
+    dax,
     ino: node.ino,
     size: node.size,
     blocks: node.size.div_ceil(BYTES_PER_BLOCK),
@@ -786,8 +787,22 @@ fn valid_for(bridge: &mut dyn Bridge, cx: &OpContext, ino: u64) -> (u64, u32) {
   }
 }
 
+/// Whether `node`'s attributes tell the guest to map the file with DAX (`FUSE_ATTR_DAX`): the bridge's transport offers
+/// per-inode DAX and has room for another file, and the node is a regular file of at least the offer's smallest size,
+/// as Shards' own server decides it (`server.rs` `dax_of`). Decided at every reply, so a file that grows into the size,
+/// or shrinks out of it, follows; the guest takes the change at the inode's next load.
+fn dax_for(bridge: &mut dyn Bridge, node: &NodeAttr) -> bool {
+  match bridge.dax_offer() {
+    DaxOffer::Withheld => false,
+    DaxOffer::PerInode {
+      smallest,
+      new_files,
+    } => new_files && node.kind == Kind::File && node.size >= smallest,
+  }
+}
+
 /// A FUSE `fuse_entry_out` from neutral attributes with the object's cache lifetime.
-fn entry_out(node: &NodeAttr, valid: (u64, u32)) -> EntryOut {
+fn entry_out(node: &NodeAttr, valid: (u64, u32), dax: bool) -> EntryOut {
   EntryOut {
     nodeid: node.ino,
     generation: node.generation,
@@ -795,7 +810,7 @@ fn entry_out(node: &NodeAttr, valid: (u64, u32)) -> EntryOut {
     attr_valid: valid.0,
     entry_valid_nsec: valid.1,
     attr_valid_nsec: valid.1,
-    attr: fuse_attr(node),
+    attr: fuse_attr(node, dax),
   }
 }
 
@@ -808,7 +823,8 @@ fn entry_reply(
 ) -> Result<EntryOut, VfsError> {
   let node = result?;
   let valid = valid_for(bridge, cx, node.ino);
-  Ok(entry_out(&node, valid))
+  let dax = dax_for(bridge, &node);
+  Ok(entry_out(&node, valid, dax))
 }
 
 /// An attribute reply (`GETATTR`/`SETATTR`) with the object's cache lifetime.
@@ -819,10 +835,11 @@ fn attr_reply(
 ) -> Result<AttrOut, VfsError> {
   let node = result?;
   let (attr_valid, attr_valid_nsec) = valid_for(bridge, cx, node.ino);
+  let dax = dax_for(bridge, &node);
   Ok(AttrOut {
     attr_valid,
     attr_valid_nsec,
-    attr: fuse_attr(&node),
+    attr: fuse_attr(&node, dax),
   })
 }
 
@@ -857,8 +874,14 @@ fn recover_unique(message: &[u8]) -> Option<u64> {
     .map(|b| u64::from_le_bytes(b.try_into().unwrap_or_default()))
 }
 
-fn serve_init(body: &[u8], unique: u64, coherence: CacheCoherence, out: &mut [u8]) -> usize {
-  match negotiate(body, coherence) {
+fn serve_init(
+  body: &[u8],
+  unique: u64,
+  coherence: CacheCoherence,
+  dax: DaxOffer,
+  out: &mut [u8],
+) -> usize {
+  match negotiate_offering(body, coherence, dax) {
     Ok(n) => write_or_drop(ReplyHeader::write_ok(unique, &n.to_bytes(), out), out),
     Err(_) => write_or_drop(ReplyHeader::write_error(unique, EIO, out), out),
   }
@@ -1266,8 +1289,9 @@ fn serve_readdirplus(
       break;
     }
     let valid = valid_for(bridge, cx, entry.ino);
+    let dax = dax_for(bridge, &node);
     if !dir.push_plus(
-      &entry_out(&node, valid),
+      &entry_out(&node, valid, dax),
       entry.cookie,
       dtype(entry.kind),
       &entry.name,
@@ -1317,8 +1341,9 @@ fn serve_create(
         return reply_err(req.header.unique, e, out);
       }
       let valid = valid_for(bridge, cx, node.ino);
+      let dax = dax_for(bridge, &node);
       let open_flags = open_flags_for(bridge, cx, ObjectId::new(node.ino, 0), false, flags);
-      let mut body = entry_out(&node, valid).to_bytes();
+      let mut body = entry_out(&node, valid, dax).to_bytes();
       body.extend_from_slice(&OpenOut { fh, open_flags }.to_bytes());
       write_or_drop(ReplyHeader::write_ok(req.header.unique, &body, out), out)
     }
@@ -1371,8 +1396,9 @@ fn serve_tmpfile(
     return reply_err(unique, e, out);
   }
   let valid = valid_for(bridge, cx, node.ino);
+  let dax = dax_for(bridge, &node);
   let open_flags = open_flags_for(bridge, cx, ObjectId::new(node.ino, 0), false, flags);
-  let mut body = entry_out(&node, valid).to_bytes();
+  let mut body = entry_out(&node, valid, dax).to_bytes();
   body.extend_from_slice(&OpenOut { fh, open_flags }.to_bytes());
   write_or_drop(ReplyHeader::write_ok(unique, &body, out), out)
 }

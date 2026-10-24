@@ -187,6 +187,25 @@ pub enum CacheLifetime {
   },
 }
 
+/// Whether a transport offers its guest per-inode DAX (§4.6; the Shards route, part 3, `docs/wip/shards/dax-protocol.md`):
+/// what its `FUSE_INIT` reply keeps of the kernel's DAX flags, and which files' attributes say `FUSE_ATTR_DAX`.
+/// Withheld everywhere but the Shards route, whose daemon answers a DAX window's descriptor ask with a confined object.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DaxOffer {
+  /// No DAX: the `INIT` reply keeps neither `FUSE_HAS_INODE_DAX` nor `FUSE_MAP_ALIGNMENT`, and no file is marked.
+  #[default]
+  Withheld,
+  /// Per-inode DAX: the `INIT` reply keeps `FUSE_HAS_INODE_DAX` and `FUSE_MAP_ALIGNMENT` where the kernel offers them,
+  /// and a regular file of at least `smallest` bytes is marked `FUSE_ATTR_DAX` while `new_files` holds (the daemon's
+  /// backing budget has room for another file).
+  PerInode {
+    /// The smallest file marked: one of the ranges a guest maps a file in (`FUSE_DAX_SZ`).
+    smallest: u64,
+    /// Whether files are marked now.
+    new_files: bool,
+  },
+}
+
 /// One kernel cache entry a transport must drop or expire (§4.6 `notify`): the seam produces
 /// these for every change the transport did not make itself — a mutation through the SDK or
 /// another attachment (from the volume's journal) or an outsider's change beneath a base
@@ -634,6 +653,11 @@ pub trait Bridge {
   /// entry and attribute reply with it. The default is forever, for a bridge with no live source.
   fn cache_lifetime(&mut self, _object: ObjectId, _cx: &OpContext) -> CacheLifetime {
     CacheLifetime::Forever
+  }
+  /// Whether this bridge's transport offers its guest per-inode DAX ([`DaxOffer`]): withheld by default, offered only by
+  /// the Shards route's serve task.
+  fn dax_offer(&mut self) -> DaxOffer {
+    DaxOffer::Withheld
   }
   /// Appends to `out` every kernel invalidation owed since `cursor` — changes the transport
   /// named by `cx` did not make itself — and returns the cursor to pass next time. Bounded by the
