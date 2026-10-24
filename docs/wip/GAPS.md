@@ -11099,6 +11099,19 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   - Not run: a native Linux clippy of the testguest (no Linux host free); Shards' CI covers it.
 - **Owed, in order:** Shards applying the series to its repository (its owner's queue); a DAX window over a backing that authorizes only the attachment's bytes (part 3). Until part 3 a slates
   share is launched without a DAX window: a descriptor ask is refused `EOPNOTSUPP`.
+- **Part 3's protocol proposed (2026-10-24), awaiting the Shards owner's answer** (`docs/wip/shards/dax-protocol.md`,
+  sent to its session).
+  - **No revoke and no new frames are needed.** slates answers the existing DESCRIPTOR ask with one shared-memory
+    object per attachment and file, sized once to `2^63 − 2 MiB` (sparse), and writes every change of the file into
+    it before acknowledging the change. The guest's stores are ingested at its FSYNC, FLUSH and RELEASE, and at the
+    backing's end. Shards' window already treats a host file's page cache this way, and a size that never changes
+    leaves its follow machinery nothing to do.
+  - **Measured on this Mac (macOS 26.4.1):** sizes to `2^63 − 2 MiB` accepted, the last 2 MiB mapping; a 64 GiB
+    object's footprint flat until touched; touched pages charged to the toucher (259 MB in the child, 13 MB in the
+    creator).
+  - **Proposed as an option:** the ask carrying its range (26 bytes), so fills and ingests follow what the guest maps.
+  - **Replaced in the plan:** the revoke protocol (a doorbell, REVOKES/REVOKED, a stage-2 unmap and remap), which
+    would have made every writer wait on a VM.
 - **Open, found by the new tests: a read-only attachment is not a read-only file system to its client.** On every FUSE
   transport (the shared bridge) an open for writing is granted and each write through it refused `EPERM`; NFS answers
   `PERM`. A read-only file system answers `EROFS`, at the open for an open. Every change is refused and nothing lands,

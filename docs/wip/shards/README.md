@@ -16,7 +16,10 @@ model (the guest's `mount` is refused without `CAP_SYS_ADMIN`).
 > holding it at descriptor `N`, so the recipe below no longer needs the one-file example, which is gone. A real boot
 > against the daemon passed 3 of 3 on this Mac (Shards part 2, 2026-10-24): the guest mounts, reads and writes. The
 > series for Shards' `gpu` is in `~/.cache/slates-scratch/shards-part2-patches/`, sent to its owner. Until a DAX backing
-> scoped to one attachment exists (part 3), launch a slates share with no DAX window.
+> scoped to one attachment exists (part 3), launch a slates share with no DAX window. Part 3's protocol is proposed in
+> [`dax-protocol.md`](dax-protocol.md) (2026-10-24, awaiting the Shards owner): no revoke and no new frames. slates
+> writes every change into one fixed-size shared object per attachment and file, and ingests the guest's stores at its
+> syncs.
 >
 > **The Shards half, checked 2026-10-24 (read-only, from this checkout's remote refs; no fetch):** `slates-fs-native`
 > (08066b27) has been on origin since 2026-10-22; `origin/gpu` (1f82788c, 2026-10-24) still contains none of it.
