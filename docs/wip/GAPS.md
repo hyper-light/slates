@@ -10746,31 +10746,40 @@ stale page back, and the other write's bytes on it reverted: measured 4,095 of 4
   reported, when the expansion leaves out the nodes, or when it leaves out the names. Record:
   `docs/bugs/2026-10-22-a-mount-that-falls-behind-the-journal-never-hears-of-the-changes-it-missed.md`. The journal's
   budget, below, still decides how often an overrun happens.
-- **The journal's budget is not the design's formula, and its ratification is not recorded.** §4.5's derived constants
-  say "journal budget = mutation rate × max subscriber lag × record size"; the code takes a fixed 10‰ of the quota
-  (`JOURNAL_SHARE_PERMILLE`, `crates/server/src/verbs.rs`). Its doc and its `derived!` anchor both cite a ratification
-  in §5 of this ledger that §5 does not contain. Found 2026-10-22 while sizing the write-back rule's bound on it (about
-  850 records, and so 850 ranges a file, for an 8 MiB volume). **Measured since 2026-10-23:** every mount round now
-  records what waited for it (`OpLog::note_round`): the records after its cursor (exact after an overrun, since
-  sequences are contiguous), their charge, and the oldest one's wait. That is the formula's product measured directly,
-  by Little's law. `slates status` reports the volume's budget beside the largest backlog and longest lag any round
-  found. A mount's own changes are behind its cursor, so only another path's changes (the SDK, NFS, a second mount) wait
-  for it. Since 2026-10-23 every FUSE mount is a journal reader of its volume, from the moment it serves until it ends,
-  and its rounds move its point (`Volume::open_journal_reader`; status reports `journal_readers`): the first step of
-  deriving the budget. On a git clone, a cargo build and A-141's SDK ring, each watched by a second mount on the loaded
-  box, the largest backlog any round found was 39,424 bytes (448 records). A 1 GiB volume's share is 10,737,418 bytes,
-  272 times that, and a volume under 3.76 MiB holds less than it (BENCHMARKS, "The journal's fixed share against what
-  its rounds measured", 2026-10-23). Since A-155 (2026-10-23) the byte states no longer borrow the journal's capacity as
-  each file's bound: they are charged to the shard's metadata ledger while the mount lives, so a smaller journal cannot
-  shrink them. Since A-156 (2026-10-23) a restored mount tracks every file the last publication counted open for it from
-  its start, so no adoption of those reads the journal back (a handle opened after that publication still adopts lazily,
-  as A-147 did). Since A-157 (2026-10-23) retention keeps what a live reader still owes: the budget starts at one page
-  and grows from the shard's metadata ledger when a record a reader has not read would otherwise leave; a reader silent
-  past the daemon's liveness pins nothing; a refused growth is counted; `JOURNAL_SHARE_PERMILLE` is gone. On the same
-  workloads rerun (BENCHMARKS, "The derived journal budget", 2026-10-24): no overrun, no refused growth, journals ending
-  at 4,096–16,896 bytes where the share reserved 10,737,418 (636–2,621 times less), each within two consecutive
-  backlogs. The CLI tests that borrowed the share are re-derived with non-vacuity checks. Closing this entry is the last
-  step.
+- **The journal's budget is the design's formula — closed 2026-10-23 (A-155, A-156, A-157).** §4.5's derived
+  constants say "journal budget = mutation rate × max subscriber lag × record size"; the code took a fixed 10‰ of the
+  quota (`JOURNAL_SHARE_PERMILLE`), citing a ratification §5 of this ledger never held. Found 2026-10-22.
+  - **Measured first:** every mount round records what waited for it (`OpLog::note_round`; `slates status` reports
+    it). On a git clone, a cargo build and A-141's SDK ring, the largest backlog was 39,424 bytes, where a 1 GiB
+    volume's share was 10,737,418 (BENCHMARKS, 2026-10-23).
+  - **The borrowers moved off first:**
+    - the FUSE byte states are charged to the shard's metadata ledger, not bounded by the journal's capacity (A-155);
+    - a restored mount tracks the files the last publication counted open from its start (A-156).
+  - **The rule (A-157):**
+    - The journal keeps what a live reader still owes: from a one-page floor, it grows from the shard's metadata
+      ledger.
+    - A FUSE mount's patience is the daemon's liveness budget: past it, the mount pins nothing.
+    - A refused growth is counted.
+    - Growth returns at teardown.
+    - `JOURNAL_SHARE_PERMILLE` is gone.
+  - **Proven:**
+    - an oracle over 2000 histories against an independent model, mutation-checked;
+    - bridge tests for growth, patience and refusal;
+    - on the same workloads (BENCHMARKS, 2026-10-24), no overrun and no refused growth, with journals ending at
+      4,096–16,896 bytes (636–2,621 times less than the share), each within two consecutive backlogs.
+  - **Found on the way, fixed:** a FUSE mount that ended in its serve turn kept its registry attachment, one of the
+    shard's 4096 slots per unmount; the bug record is
+    `docs/bugs/2026-10-23-a-fuse-mount-that-ends-in-its-turn-keeps-its-registry-attachment.md`.
+  - **Left, stated:**
+    - a handle opened after the last publication still adopts lazily on a restored mount (A-156);
+    - the budget may reach two consecutive backlogs; advancing a reader's point at a confirmed delivery would halve
+      it, and is not taken (A-157).
+- **The deriver reads the journal with no completeness check (open, 2026-10-23; latent).** `Volume::records_since`
+  returns the records retained after a snapshot's sequence. When retention has dropped some of them, the ops document
+  (§4.16) is derived from part of the work without a word. No production path calls the deriver yet (tests only). A
+  journal that keeps only what live readers owe (A-157) makes the gap wider. A snapshot is not a reader, so its records
+  leave at the floor. Before the deriver is wired, it needs `oldest_seq() <= snapshot.seq + 1` as a typed refusal, or
+  the snapshot held as a reader for as long as a derivation may need it.
 - **A restored mount's files — fixed 2026-10-22 (A-147).** A mount taken over across a daemon restart (A-61) has files
   whose writable opens predate the daemon. They had no byte states, so their write-backs were judged from the mount's
   start against every record since. Worse than the `EIO` this entry recorded: a store made after a re-fetch of bytes
