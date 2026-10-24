@@ -363,4 +363,13 @@ impl<B: Bridge> Bridge for FailingGather<B> {
   fn restored_open_files(&mut self, cx: &OpContext) -> Vec<u64> {
     self.inner.restored_open_files(cx)
   }
+
+  fn takeover_inodes(
+    &mut self,
+    cx: &OpContext,
+    after: Option<u64>,
+    visit: &mut dyn FnMut(u64) -> std::ops::ControlFlow<()>,
+  ) -> bool {
+    self.inner.takeover_inodes(cx, after, visit)
+  }
 }

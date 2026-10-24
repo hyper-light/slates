@@ -493,6 +493,11 @@ pub struct Volume {
   /// ([`Volume::release_restored_open`]). Each is also counted in [`Volume::attachment_opens`] and its references, so the
   /// map is bounded by the restored references, and it empties as those handles are released or their owner swept.
   pub(crate) restored_opens: BTreeMap<(RefOwner, InodeNo), u32>,
+  /// The inodes a recovery's write-log replay wrote into this volume (A-63, A-158): FUSE writes logged after the last
+  /// publication, which a mount taken over by this daemon may hold older pages of without its references showing it
+  /// (a lookup made after the last publication is in no image). Read by [`Volume::visit_takeover_inodes`]. Filled
+  /// only by the replay, once per process, so it is bounded by the write log's records and by the volume's inodes.
+  pub(crate) replayed: std::collections::BTreeSet<InodeNo>,
   /// The open counts of recorded attachments as the last committed publication, or the image a recovery rebuilt from,
   /// holds them (A-154): what a successor would restore. Kept in step with each publication's changed reference
   /// records at its commit (`mark_published`). Bounded by the recorded attachments' opens.
@@ -748,6 +753,7 @@ impl Volume {
       attachment_opens: BTreeMap::new(),
       opens: BTreeMap::new(),
       restored_opens: BTreeMap::new(),
+      replayed: std::collections::BTreeSet::new(),
       committed_opens: BTreeMap::new(),
       releases_unpublished: false,
       orphans: BTreeMap::new(),
@@ -836,6 +842,7 @@ impl Volume {
       attachment_opens: BTreeMap::new(),
       opens: BTreeMap::new(),
       restored_opens: BTreeMap::new(),
+      replayed: std::collections::BTreeSet::new(),
       committed_opens: BTreeMap::new(),
       releases_unpublished: false,
       orphans: BTreeMap::new(),
@@ -943,6 +950,7 @@ impl Volume {
       attachment_opens: BTreeMap::new(),
       opens: BTreeMap::new(),
       restored_opens: BTreeMap::new(),
+      replayed: std::collections::BTreeSet::new(),
       committed_opens: BTreeMap::new(),
       releases_unpublished: false,
       orphans: BTreeMap::new(),
@@ -5632,6 +5640,70 @@ impl Volume {
       .filter(|(holder, _)| *holder == owner)
       .map(|(_, no)| no.0)
       .collect()
+  }
+
+  /// Notes that a recovery's write-log replay wrote inode `no` (A-63): a write the dead daemon acknowledged after its
+  /// last publication, which [`Volume::visit_takeover_inodes`] names to every mount taken over by this daemon.
+  pub fn mark_replayed(&mut self, no: InodeNo) {
+    self.replayed.insert(no);
+  }
+
+  /// Visits the inodes whose cached state the kernel of `owner`'s mount, taken over by this daemon, may hold older than
+  /// the volume's (A-158), in inode order and each once, starting after inode `after`, until `visit` breaks. Returns
+  /// whether every one was visited; an inode `visit` breaks on was visited. The set is every inode the recovery gave
+  /// back a reference of to `owner`, with any it has taken since, and every inode the write-log replay wrote.
+  ///
+  /// Why these and no others: every change acknowledged before a crash is durable, a mutation's by the publication its
+  /// reply waits for and a FUSE write's in the write log (A-63). A kernel can hold state of an inode older than a
+  /// change only if it looked the inode up before the change, and the change's publication then recorded that
+  /// reference, which the recovery gave back (A-61). A logged write is in no publication, so the replay's inodes are
+  /// named as well. The walk resumes from `after` so a transport can send the set in bounded slices; each slice costs
+  /// what it visits and the depth of the two ordered maps.
+  pub fn visit_takeover_inodes(
+    &self,
+    owner: RefOwner,
+    after: Option<u64>,
+    visit: &mut dyn FnMut(u64) -> std::ops::ControlFlow<()>,
+  ) -> bool {
+    use std::ops::Bound;
+    let start = after.map_or(Bound::Unbounded, |after| Bound::Excluded(InodeNo(after)));
+    let mut referenced = self
+      .attachment_refs
+      .get(&owner)
+      .into_iter()
+      .flat_map(|inodes| inodes.range((start, Bound::Unbounded)).map(|(no, _)| no.0))
+      .peekable();
+    let mut replayed = self
+      .replayed
+      .range((start, Bound::Unbounded))
+      .map(|no| no.0)
+      .peekable();
+    loop {
+      // The two ordered sources merged: the lesser next, both when they name the same inode.
+      let next = match (referenced.peek().copied(), replayed.peek().copied()) {
+        (None, None) => return true,
+        (Some(from_refs), Some(from_replay)) if from_refs == from_replay => {
+          referenced.next();
+          replayed.next();
+          from_refs
+        }
+        (Some(from_refs), Some(from_replay)) if from_refs < from_replay => {
+          referenced.next();
+          from_refs
+        }
+        (_, Some(from_replay)) => {
+          replayed.next();
+          from_replay
+        }
+        (Some(from_refs), None) => {
+          referenced.next();
+          from_refs
+        }
+      };
+      if visit(next).is_break() {
+        return false;
+      }
+    }
   }
 
   /// Gives back one open the recovery restored for `owner` on inode `no` (goal item 4, A-152): the release of a handle

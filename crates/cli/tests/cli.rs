@@ -4964,6 +4964,382 @@ fn a_fuse_mount_survives_its_daemons_kill_with_its_open_files_usable() {
   held.unmount();
 }
 
+/// Shape: the kill cycles each restart-gap test runs. A cycle makes one change through the SDK and kills the daemon one
+/// syscall after the change's reply, which usually lands before the mount's round has told its kernel (about 82 µs,
+/// A-142's measurement). Before the fix any cycle that caught the window failed; after it, every cycle must pass.
+#[cfg(target_os = "linux")]
+const RESTART_GAP_CYCLES: usize = 5;
+/// Shape: the length of every version of the restart-gap file, so a replacement changes no size the kernel could
+/// notice without an invalidation.
+#[cfg(target_os = "linux")]
+const RESTART_GAP_BYTES: usize = 8;
+
+/// An SDK client of `held`'s daemon, with a write attachment on its volume. The attachment dies with the daemon, by
+/// design ("the SDK's client attaches again"), so a cycle attaches again after each takeover.
+#[cfg(target_os = "linux")]
+fn writer_of(held: &HeldMount) -> (slates_client::Client, slates_client::VolumeId, u64) {
+  let deadlines = slates_client::Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get();
+  let mut client = slates_client::Client::connect(&held.instance, deadlines).unwrap();
+  let volume = volume_id_of(&held.id);
+  let attachment = client
+    .attach(volume, None, slates_client::Intent::Write)
+    .unwrap()
+    .attachment;
+  (client, volume, attachment)
+}
+
+/// Waits until `held`'s mount has told its kernel of every change made so far: its journal reader, the mount's only one,
+/// is no record behind. A reader's point is the start of its last round, and a round is gathered only once the one
+/// before has come back from the kernel (§4.5), so a reader at the head has delivered everything before it. A test that
+/// caches a name or a page through the mount first waits for this, or a late invalidation of the change that made the
+/// file can drop what it cached — measured 2026-10-23 under the full suite: two lookups of a just-created file forgotten
+/// by the kernel before the test's first cycle, so it held nothing a takeover could leave stale.
+#[cfg(target_os = "linux")]
+fn wait_until_the_mount_has_told_its_kernel_everything(held: &HeldMount) {
+  let mut last = String::new();
+  let caught_up = wait_for(|| {
+    let (code, out, _) = run(&held.instance, &["status", &held.id]);
+    let readers = if code == 0 {
+      value_of(&out, "journal_readers")
+    } else {
+      String::new()
+    };
+    last = out;
+    readers == "1 (slowest 0 records behind)"
+  });
+  assert!(
+    caught_up,
+    "the mount's journal reader reaches the head: {last}"
+  );
+}
+
+/// The restart gap (GAPS, "a takeover sends the kernel no invalidation"): a change the dead daemon made and never told a
+/// mount's kernel must not outlive the takeover. Do:
+/// - once the mount has told its kernel of the file's creation, open `f.txt` through a held FUSE mount and read it, so
+///   its pages and attributes are cached and its inode is held for every cycle;
+/// - then each cycle, replace it through the SDK with bytes of the same length, and kill the daemon one syscall after
+///   the reply;
+/// - wait for the anchor's successor, and read `f.txt` through the descriptor held from before every takeover (the
+///   inode's cached pages, no lookup) and by its path.
+///
+/// Expect the replacement both ways within [`WAIT_FOR`] every cycle, and the successor's takeover round to have
+/// invalidated the root and the file (`fuse.takeover_invalidated`). Before the fix (A-158), a cycle whose kill landed
+/// before the mount's round kept serving the old bytes for as long as the kernel cached them. Linux only, to a kernel
+/// that can resend (6.9+).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_replacement_the_dead_daemon_never_delivered_does_not_outlive_the_takeover() {
+  use std::os::unix::fs::FileExt;
+  let Some(held) = HeldMount::start("gapbytes") else {
+    return;
+  };
+  let (mut client, volume, mut attachment) = writer_of(&held);
+  let first = vec![b'0'; RESTART_GAP_BYTES];
+  client
+    .fs_write((volume, attachment), "f.txt", &first, FILE_MODE)
+    .unwrap();
+  wait_until_the_mount_has_told_its_kernel_everything(&held);
+  let path = format!("{}/f.txt", held.mount_point.path);
+  let kept = std::fs::File::open(&path).unwrap();
+  let read_kept = || {
+    let mut bytes = vec![0; RESTART_GAP_BYTES];
+    kept
+      .read_at(&mut bytes, 0)
+      .map(|n| bytes.get(..n).unwrap_or_default().to_vec())
+  };
+  assert!(
+    wait_for(|| read_kept().is_ok_and(|bytes| bytes == first)),
+    "f.txt reads through the mount, and is cached"
+  );
+  for cycle in 1..=RESTART_GAP_CYCLES {
+    let pid = daemon_pid(&held.instance).expect("the daemon answers");
+    let bytes = format!("{cycle:0width$}", width = RESTART_GAP_BYTES).into_bytes();
+    client
+      .fs_write((volume, attachment), "f.txt", &bytes, FILE_MODE)
+      .unwrap();
+    signal_kill(pid);
+    await_daemon(&held.instance, Some(pid), &[]);
+    let (mut through_kept, mut by_path) = (Vec::new(), Vec::new());
+    let fresh = wait_for(|| {
+      through_kept = read_kept().unwrap_or_default();
+      by_path = std::fs::read(&path).unwrap_or_default();
+      through_kept == bytes && by_path == bytes
+    });
+    assert!(
+      fresh,
+      "cycle {cycle}: the mount serves {:?} through the kept descriptor and {:?} by path after the takeover, not the \
+       replacement {:?} its dead daemon never told it of",
+      String::from_utf8_lossy(&through_kept),
+      String::from_utf8_lossy(&by_path),
+      String::from_utf8_lossy(&bytes)
+    );
+    // Non-vacuity: the successor's takeover round named the root and at least the file the kernel had looked up, so the
+    // fresh read is the round's doing, not a kill that happened to land after the dead daemon's own round.
+    let mut invalidated = 0;
+    assert!(
+      wait_for(|| {
+        invalidated = counter_of(&held.instance, "fuse.takeover_invalidated");
+        invalidated >= 2
+      }),
+      "cycle {cycle}: the takeover round invalidated the root and f.txt, not {invalidated} inodes"
+    );
+    eprintln!("cycle {cycle}: the takeover round invalidated {invalidated} inodes");
+    attachment = client
+      .attach(volume, None, slates_client::Intent::Write)
+      .unwrap()
+      .attachment;
+  }
+  drop(kept);
+}
+
+/// The restart gap for names: a rename the dead daemon made and never told a mount's kernel must not leave the old
+/// name served after the takeover. Do:
+/// - once the mount has told its kernel of the file's creation, stat `n0.txt` through a held FUSE mount, so its name is
+///   cached;
+/// - then each cycle, rename it through the SDK to the next name, and kill the daemon one syscall after the reply;
+/// - wait for the anchor's successor, and stat both names through the mount.
+///
+/// Expect the successor to bump the kernel's dentry epoch (`fuse.epoch_bumped`), and the old name gone and the new one
+/// there within [`WAIT_FOR`] every cycle. A kernel that cannot bump its dentry epoch (FUSE before 7.44) is reported by
+/// the successor (`fuse.epoch_unsupported`), and the test skips loudly there. Linux only, to a kernel that can resend
+/// (6.9+).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_rename_the_dead_daemon_never_delivered_does_not_outlive_the_takeover() {
+  let Some(held) = HeldMount::start("gapnames") else {
+    return;
+  };
+  let (mut client, volume, mut attachment) = writer_of(&held);
+  client
+    .fs_write((volume, attachment), "n0.txt", b"named", FILE_MODE)
+    .unwrap();
+  wait_until_the_mount_has_told_its_kernel_everything(&held);
+  let named = |name: &str| std::fs::metadata(format!("{}/{name}", held.mount_point.path)).is_ok();
+  assert!(
+    wait_for(|| named("n0.txt")),
+    "n0.txt is named through the mount"
+  );
+  for cycle in 1..=RESTART_GAP_CYCLES {
+    let (from, to) = (format!("n{}.txt", cycle - 1), format!("n{cycle}.txt"));
+    let pid = daemon_pid(&held.instance).expect("the daemon answers");
+    client.fs_rename((volume, attachment), &from, &to).unwrap();
+    signal_kill(pid);
+    await_daemon(&held.instance, Some(pid), &[]);
+    let renamed = wait_for(|| !named(&from) && named(&to));
+    // The successor's takeover round says whether the kernel took the epoch bump. It is also the non-vacuity check: the
+    // name gone is the bump's doing, not a kill that landed after the dead daemon's own round.
+    let (mut bumped, mut unsupported) = (0, 0);
+    let told = wait_for(|| {
+      bumped = counter_of(&held.instance, "fuse.epoch_bumped");
+      unsupported = counter_of(&held.instance, "fuse.epoch_unsupported");
+      bumped.saturating_add(unsupported) > 0
+    });
+    if unsupported > 0 {
+      eprintln!(
+        "SKIP: this kernel cannot bump its dentry epoch (FUSE before 7.44), so a restored mount cannot drop old names"
+      );
+      return;
+    }
+    assert!(
+      renamed,
+      "cycle {cycle}: after the takeover the mount still names {from} (or not yet {to}), a rename its dead daemon never told it of"
+    );
+    assert!(
+      told,
+      "cycle {cycle}: the successor's takeover round bumped the kernel's dentry epoch"
+    );
+    eprintln!("cycle {cycle}: takeover rounds that bumped the epoch: {bumped}");
+    attachment = client
+      .attach(volume, None, slates_client::Intent::Write)
+      .unwrap()
+      .attachment;
+  }
+}
+
+/// Shape: the files the restart-gap chaos test holds open through the mount: enough that a takeover round names a
+/// dozen inodes besides the root, few enough that every check reads them all within [`WAIT_FOR`].
+#[cfg(target_os = "linux")]
+const CHAOS_FILES: usize = 12;
+/// Shape: the restart-gap chaos test's seeds, fixed so a failure is a sequence that replays, two so one lucky sequence
+/// cannot pass alone; and the kill cycles each seed runs, and the most changes a cycle makes before its kill.
+#[cfg(target_os = "linux")]
+const CHAOS_SEEDS: [u64; 2] = [0x9e37_79b9_7f4a_7c15, 0xd1b5_4a32_d192_ed03];
+/// Shape: see [`CHAOS_SEEDS`].
+#[cfg(target_os = "linux")]
+const CHAOS_CYCLES_PER_SEED: usize = 4;
+/// Shape: see [`CHAOS_SEEDS`].
+#[cfg(target_os = "linux")]
+const CHAOS_CHANGES_PER_CYCLE: u64 = 3;
+
+/// What the chaos test's files are, by the model: each file's name and bytes, and the names renames retired.
+#[cfg(target_os = "linux")]
+struct ChaosFiles {
+  names: Vec<String>,
+  contents: Vec<Vec<u8>>,
+  retired: Vec<String>,
+}
+
+#[cfg(target_os = "linux")]
+impl ChaosFiles {
+  /// Makes one generated change through the SDK, a replacement with bytes of the same length or a rename to a name
+  /// never used before, and keeps the model in step.
+  fn change(
+    &mut self,
+    client: &mut slates_client::Client,
+    target: (slates_client::VolumeId, u64),
+    state: &mut u64,
+    stamp: usize,
+  ) {
+    let file = usize::try_from(xorshift(state) % u64::try_from(CHAOS_FILES).unwrap()).unwrap();
+    if xorshift(state).is_multiple_of(2) {
+      self.contents[file] = format!("{file:02}v{stamp:05}").into_bytes();
+      client
+        .fs_write(target, &self.names[file], &self.contents[file], FILE_MODE)
+        .unwrap();
+    } else {
+      let to = format!("c{file}-{stamp}.txt");
+      client.fs_rename(target, &self.names[file], &to).unwrap();
+      self
+        .retired
+        .push(std::mem::replace(&mut self.names[file], to));
+    }
+  }
+
+  /// Every way the mount's view differs from the model: a file read through the descriptor kept since before every
+  /// takeover or by its current name with other bytes, or a retired name still there.
+  fn differences(&self, held: &HeldMount, kept: &[std::fs::File]) -> Vec<String> {
+    use std::os::unix::fs::FileExt;
+    let path = |name: &str| format!("{}/{name}", held.mount_point.path);
+    let lossy = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+    let mut differences = Vec::new();
+    for (file, kept) in kept.iter().enumerate() {
+      let mut through_kept = vec![0; RESTART_GAP_BYTES];
+      let read = kept.read_at(&mut through_kept, 0).unwrap_or(0);
+      through_kept.truncate(read);
+      let by_name = std::fs::read(path(&self.names[file])).unwrap_or_default();
+      if through_kept != self.contents[file] || by_name != self.contents[file] {
+        differences.push(format!(
+          "{}: {:?} through the kept descriptor, {:?} by name, not {:?}",
+          self.names[file],
+          lossy(&through_kept),
+          lossy(&by_name),
+          lossy(&self.contents[file])
+        ));
+      }
+    }
+    for name in &self.retired {
+      if std::fs::metadata(path(name)).is_ok() {
+        differences.push(format!("{name}: still named after its rename"));
+      }
+    }
+    differences
+  }
+}
+
+/// The restart gap under chaos (A-158): a generated history of changes, each batch ended by a kill, never leaves a held
+/// mount serving what its dead daemon never told it of. Do:
+/// - create 12 files through the SDK and, once the mount has told its kernel of them, open each through a held FUSE
+///   mount and read it, so each is cached and its inode held;
+/// - for each of two fixed seeds, run 4 cycles: up to 3 generated changes through the SDK (a replacement with bytes of
+///   the same length, or a rename to a new name), then a kill one syscall after the last reply;
+/// - after each takeover, compare the mount with the model.
+///
+/// Expect, every cycle: each file's bytes through the descriptor held since before every takeover and by its current
+/// name, every retired name gone, and a takeover round that bumped the epoch and invalidated the root and all 12
+/// files. A kernel that cannot bump its epoch is skipped loudly, as in the names test. Linux only, to a kernel that can
+/// resend (6.9+).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_generated_history_of_changes_and_kills_leaves_the_mount_seeing_what_the_volume_holds() {
+  use std::os::unix::fs::FileExt;
+  let Some(held) = HeldMount::start("gapchaos") else {
+    return;
+  };
+  let (mut client, volume, mut attachment) = writer_of(&held);
+  let mut files = ChaosFiles {
+    names: (0..CHAOS_FILES)
+      .map(|file| format!("c{file}.txt"))
+      .collect(),
+    contents: (0..CHAOS_FILES)
+      .map(|file| format!("{file:02}v{:05}", 0).into_bytes())
+      .collect(),
+    retired: Vec::new(),
+  };
+  for (name, bytes) in files.names.iter().zip(&files.contents) {
+    client
+      .fs_write((volume, attachment), name, bytes, FILE_MODE)
+      .unwrap();
+  }
+  wait_until_the_mount_has_told_its_kernel_everything(&held);
+  let kept: Vec<std::fs::File> = files
+    .names
+    .iter()
+    .map(|name| std::fs::File::open(format!("{}/{name}", held.mount_point.path)).unwrap())
+    .collect();
+  for file in &kept {
+    let mut cached = vec![0; RESTART_GAP_BYTES];
+    file.read_at(&mut cached, 0).unwrap();
+  }
+  assert!(
+    wait_for(|| files.differences(&held, &kept).is_empty()),
+    "every file reads through the mount, and is cached"
+  );
+  let mut stamp = 0;
+  for seed in CHAOS_SEEDS {
+    let mut state = seed;
+    for cycle in 1..=CHAOS_CYCLES_PER_SEED {
+      let pid = daemon_pid(&held.instance).expect("the daemon answers");
+      for _ in 0..=xorshift(&mut state) % CHAOS_CHANGES_PER_CYCLE {
+        stamp += 1;
+        files.change(&mut client, (volume, attachment), &mut state, stamp);
+      }
+      signal_kill(pid);
+      await_daemon(&held.instance, Some(pid), &[]);
+      let mut differences = Vec::new();
+      let seen = wait_for(|| {
+        differences = files.differences(&held, &kept);
+        differences.is_empty()
+      });
+      let (mut bumped, mut unsupported, mut invalidated) = (0, 0, 0);
+      let told = wait_for(|| {
+        bumped = counter_of(&held.instance, "fuse.epoch_bumped");
+        unsupported = counter_of(&held.instance, "fuse.epoch_unsupported");
+        invalidated = counter_of(&held.instance, "fuse.takeover_invalidated");
+        bumped.saturating_add(unsupported) > 0 && invalidated > u64::try_from(CHAOS_FILES).unwrap()
+      });
+      if unsupported > 0 {
+        eprintln!(
+          "SKIP: this kernel cannot bump its dentry epoch (FUSE before 7.44), so a restored mount cannot drop old names"
+        );
+        return;
+      }
+      assert!(
+        seen,
+        "seed {seed:#x}, cycle {cycle}: after the takeover the mount serves what its dead daemon never told it of: \
+         {differences:?}"
+      );
+      assert!(
+        told,
+        "seed {seed:#x}, cycle {cycle}: the takeover round bumped the epoch ({bumped}) and invalidated the root and \
+         every held file ({invalidated} inodes)"
+      );
+      eprintln!(
+        "seed {seed:#x}, cycle {cycle}: {} changes so far, the takeover round invalidated {invalidated} inodes",
+        stamp
+      );
+      attachment = client
+        .attach(volume, None, slates_client::Intent::Write)
+        .unwrap()
+        .attachment;
+    }
+  }
+  drop(kept);
+}
+
 /// A-63 (a write survives its daemon from the log alone). Do: through a held FUSE mount, write a file and close it
 /// (the close's `flush` publishes nothing when the write log holds every write: `fuse.flush_logged`); `SIGKILL` the
 /// daemon and wait for the anchor's restarted one; read the file. Expect: the fast path was taken (the counter moved),

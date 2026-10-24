@@ -1703,6 +1703,171 @@ fn a_surviving_attachments_references_are_restored_and_every_other_holders_relea
   );
 }
 
+/// The takeover set of `owner` on `vol`, walked whole ([`Volume::visit_takeover_inodes`]).
+fn takeover_of(vol: &Volume, owner: slates_vfs::ids::RefOwner) -> Vec<u64> {
+  let mut seen = Vec::new();
+  let whole = vol.visit_takeover_inodes(owner, None, &mut |ino| {
+    seen.push(ino);
+    std::ops::ControlFlow::Continue(())
+  });
+  assert!(whole, "a walk that never breaks visits the whole set");
+  seen
+}
+
+/// A-158 (the takeover set). Do: reference two files for attachment 41 and one for attachment 42, publish, rebuild
+/// from the image, then note a fourth file as written by the write-log replay; after that, attachment 41 looks a fifth
+/// file up. One of 41's files is noted as replayed too. Expect 41's takeover inodes to be its two restored files, the one
+/// it took since and the replayed one, in inode order with no repeat; 42's to be its own file and the replayed ones,
+/// never a file only 41 references; and an attachment the image never recorded to be named only the replayed files.
+#[test]
+fn a_takeover_names_the_owners_references_and_the_replays_inodes_and_nothing_of_another_owner() {
+  use slates_vfs::ids::RefOwner;
+  let mut src = store();
+  let mut vol = volume(&mut src, 1 << 30);
+  let root = vol.root_inode(&src).unwrap();
+  let mut files = Vec::new();
+  for name in ["a", "b", "c", "replayed", "later"] {
+    files.push(vol.create_file_no(&mut src, root, name, 0o644).unwrap());
+  }
+  let [a, b, c, replayed, later] = files[..] else {
+    panic!("five files");
+  };
+  for (no, owner) in [(a, 41), (b, 41), (b, 41), (c, 42)] {
+    vol
+      .reference_for(&src, no, RefOwner::Attachment(owner))
+      .unwrap();
+  }
+  let image = vol.to_image(&src, None).unwrap();
+  let mut fresh = common::surviving(&src);
+  let claims = common::claims(&mut fresh, &[&image]);
+  let mut recovered = Volume::from_image(
+    &mut fresh,
+    &image,
+    &claims,
+    Box::new(StepClock::new(0, 1)),
+    1 << 16,
+    None,
+  )
+  .unwrap();
+  recovered.mark_replayed(replayed);
+  recovered.mark_replayed(b);
+  recovered
+    .reference_for(&fresh, later, RefOwner::Attachment(41))
+    .unwrap();
+  let sorted = |mut inodes: Vec<u64>| {
+    inodes.sort_unstable();
+    inodes
+  };
+  assert_eq!(
+    takeover_of(&recovered, RefOwner::Attachment(41)),
+    sorted(vec![a.0, b.0, replayed.0, later.0]),
+    "41: its restored references, one it took since, and the replay's inodes, each once"
+  );
+  assert_eq!(
+    takeover_of(&recovered, RefOwner::Attachment(42)),
+    sorted(vec![b.0, c.0, replayed.0]),
+    "42: its own reference and the replay's inodes, and neither of the files only 41 references"
+  );
+  assert_eq!(
+    takeover_of(&recovered, RefOwner::Attachment(43)),
+    sorted(vec![b.0, replayed.0]),
+    "an owner the image never recorded: the replay's inodes alone"
+  );
+}
+
+/// The takeover set of `owner` on `vol`, walked in slices that each break after `per_slice` inodes and resume after the
+/// last inode the slice before visited, joined.
+fn takeover_in_slices(
+  vol: &Volume,
+  owner: slates_vfs::ids::RefOwner,
+  per_slice: usize,
+) -> Vec<u64> {
+  let mut joined = Vec::new();
+  let mut after = None;
+  loop {
+    let mut taken = 0;
+    let finished = vol.visit_takeover_inodes(owner, after, &mut |ino| {
+      joined.push(ino);
+      after = Some(ino);
+      taken += 1;
+      if taken == per_slice {
+        std::ops::ControlFlow::Break(())
+      } else {
+        std::ops::ControlFlow::Continue(())
+      }
+    });
+    if finished {
+      return joined;
+    }
+    assert!(joined.len() <= 1 << 16, "the walk ends");
+  }
+}
+
+/// A-158 (the takeover round in slices). Do: reference 64 files for one attachment and note every third of them, and 8
+/// files no one references, as replayed; walk the owner's takeover set in slices that break after k inodes for every k
+/// from 1 to 9, each slice resuming after the last inode the one before visited. Expect the slices, joined, to be the
+/// whole walk every time: every inode once, in order, none skipped where a slice ended. Also expect a slice that breaks
+/// on the last inode to report the walk unfinished, and the next to visit nothing and report it whole.
+#[test]
+fn the_takeover_set_walked_in_slices_is_the_whole_set_in_order_each_once() {
+  use slates_vfs::ids::RefOwner;
+  let owner = RefOwner::Attachment(7);
+  let mut src = store();
+  let mut vol = volume(&mut src, 1 << 30);
+  let root = vol.root_inode(&src).unwrap();
+  for n in 0..64 {
+    let no = vol
+      .create_file_no(&mut src, root, &format!("r{n}"), 0o644)
+      .unwrap();
+    vol.reference_for(&src, no, owner).unwrap();
+    if n % 3 == 0 {
+      vol.mark_replayed(no);
+    }
+  }
+  for n in 0..8 {
+    let no = vol
+      .create_file_no(&mut src, root, &format!("w{n}"), 0o644)
+      .unwrap();
+    vol.mark_replayed(no);
+  }
+  let whole = takeover_of(&vol, owner);
+  assert_eq!(
+    whole.len(),
+    64 + 8,
+    "every referenced and every replayed inode, once"
+  );
+  assert!(
+    whole.windows(2).all(|pair| pair[0] < pair[1]),
+    "in inode order"
+  );
+  for per_slice in 1..=9 {
+    assert_eq!(
+      takeover_in_slices(&vol, owner, per_slice),
+      whole,
+      "slices of {per_slice} join to the whole set"
+    );
+  }
+  let last = *whole.last().unwrap();
+  let before_last = whole.get(whole.len() - 2).copied();
+  let mut visited = Vec::new();
+  let finished = vol.visit_takeover_inodes(owner, before_last, &mut |ino| {
+    visited.push(ino);
+    std::ops::ControlFlow::Break(())
+  });
+  assert_eq!(
+    (visited, finished),
+    (vec![last], false),
+    "a break on the last inode leaves the walk unfinished"
+  );
+  let finished = vol.visit_takeover_inodes(owner, Some(last), &mut |_| {
+    panic!("nothing is left after the last inode")
+  });
+  assert!(
+    finished,
+    "the next slice finds nothing and reports the walk whole"
+  );
+}
+
 /// A-61 and A-152, hostile input. Do: rebuild from an image whose recorded references name an inode the image lacks,
 /// from one recording a zero count, and from one recording more open handles than references. Expect: each refused
 /// `RecoveryIncomplete`, never a volume with a reference to nothing, an entry no forget can drop, or opens no

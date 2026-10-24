@@ -685,4 +685,18 @@ pub trait Bridge {
   fn restored_open_files(&mut self, _cx: &OpContext) -> Vec<u64> {
     Vec::new()
   }
+  /// Visits the inodes whose cached state this attachment's kernel may hold older than the volume's after a takeover
+  /// (A-158), in inode order and each once, starting after `after`, until `visit` breaks; whether every one was
+  /// visited. The set is the references the recovery gave back to the attachment, with any taken since, and the inodes
+  /// the write-log replay wrote. A mount taken over by this daemon invalidates them in slices from its first turn, so
+  /// nothing the dead daemon changed and never told the kernel of outlives the takeover. The default, none, is a bridge
+  /// with nothing restored.
+  fn takeover_inodes(
+    &mut self,
+    _cx: &OpContext,
+    _after: Option<u64>,
+    _visit: &mut dyn FnMut(u64) -> std::ops::ControlFlow<()>,
+  ) -> bool {
+    true
+  }
 }

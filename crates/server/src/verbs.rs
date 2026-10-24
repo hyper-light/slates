@@ -9814,12 +9814,15 @@ fn replay_one(
     .find(|(_, slot)| slot.volume.prefix() == prefix)
     .map(|(handle, _)| handle)?;
   let slot = state.volumes.get_mut(handle).ok()?;
-  Some(slot.volume.write(
-    &mut state.store,
-    slates_vfs::ids::InodeNo(record.inode),
-    record.offset,
-    &record.bytes,
-  ))
+  let inode = slates_vfs::ids::InodeNo(record.inode);
+  let written = slot
+    .volume
+    .write(&mut state.store, inode, record.offset, &record.bytes);
+  // A mount taken over by this daemon may hold pages of this inode that differ from the volume with no reference of it
+  // recorded, so its takeover round names it (A-158): older ones when the write landed, and the refused write's own
+  // bytes, which its writer's kernel cached, when it did not.
+  slot.volume.mark_replayed(inode);
+  Some(written)
 }
 
 /// Empties the write log under the committed image's generation and appends `remaining` to it, so the records a

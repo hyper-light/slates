@@ -2356,6 +2356,24 @@ still held, which silently skipped the rest. The mount then invalidates every no
 kernel holds, which it knows by following the FUSE lookup protocol as each reply reaches the kernel. Writers never wait
 on a mount that falls behind; an overrun costs a cold cache instead, counted as `fuse.journal_overruns`.
 
+**A mount taken over by a restarted daemon is told what its predecessor may not have told it** (A-158). A daemon that
+dies in the ~82 µs between a change's reply and the mount's round has made the change durable without telling the
+kernel, and its successor's journal starts empty. The successor knows where such a change can be:
+- every acknowledged change is durable before its reply: a mutation's in the publication its reply waits for, a FUSE
+  write in the write log (A-63);
+- a kernel holds state older than a change only for an inode it looked up before the change, and the change's
+  publication recorded that reference (A-61);
+- a logged write is in no publication, so the write-log replay notes the inodes it wrote.
+
+So a restored mount's rounds open with a takeover round. First comes `FUSE_NOTIFY_INC_EPOCH`, to a kernel that offered
+FUSE 7.44 or later: every cached name is looked up again at its next use, which reaches the names no inode set can.
+Then comes `FUSE_NOTIFY_INVAL_INODE` with all data for the root and for every inode its owner's restored references and
+the replay name. A directory's invalidation also drops its cached listing, which kernels before Linux 7.2 keep past an
+epoch bump. The set is as large as what the kernel had looked up, so the round is sent in slices of half the shard's
+live step quantum, walked in inode order from where the last slice ended. The mount turns at once while a slice is owed
+and no round is out, since a kernel serving from its cache sends no request. A kernel before 7.44 cannot drop a
+renamed-away name this way, which is counted (`fuse.epoch_unsupported`).
+
 §4.15 supplies the source
 validation rules; finite stale-data TTLs do not silently become exact live-source semantics. The
 launcher (`slates exec`) implements the chosen-path form with `CLONE_NEWUSER|CLONE_NEWNS`,
@@ -2411,6 +2429,15 @@ before the report is published, so a tool never reads attributes newer than the 
 > barrier's publication to its reply's write, is microseconds wide, too narrow for a kill to target, so no
 > end-to-end test reaches it. Per-shard channels were measured and rejected (A-62). Every acknowledged write now
 > survives (A-63).
+> **The takeover round is built (2026-10-23, A-158).** A restored mount tells its kernel what its predecessor may not
+> have: the epoch bump and an invalidation of the root and of every restored reference and replayed inode, in slices.
+> Proven on Linux 7.2.9 through the real binary, each test red with the change's files at the previous commit:
+> - `a_replacement_the_dead_daemon_never_delivered_does_not_outlive_the_takeover` and
+>   `a_rename_the_dead_daemon_never_delivered_does_not_outlive_the_takeover`: an SDK change, then a kill one syscall
+>   after its reply; the old bytes and the old name are gone after every takeover (3 of 3 runs, 5 takeovers each);
+> - `a_generated_history_of_changes_and_kills_leaves_the_mount_seeing_what_the_volume_holds`: 12 held-open files,
+>   generated replacements and renames, 8 kills (3 of 3 runs, 13 inodes in every round).
+> The slices are checked over a socket pair standing in for the device (`crates/bridge-fuse/tests/takeover_round.rs`).
 
 **macOS 26+ (FSKit module, primary).** The macOS artifact is an app
 bundle (`Slates.app`) containing the daemon, the `slates` command, and an FSKit app extension;
@@ -11993,6 +12020,64 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
+
+### A-158 — A restored mount tells its kernel what its predecessor may not have (accepted 2026-10-23)
+Applied in the same change to:
+- §4.6 (a mount taken over by a restarted daemon; the held device's status);
+- `crates/bridge-fuse`:
+  - `src/init.rs`: `InitNegotiation::kernel_minor`;
+  - `src/session.rs`: `Session::kernel_bumps_epoch`, bit `1 << 2` of format 1, `EPOCH_MINOR`;
+  - `src/notify.rs`: `Notify::IncEpoch`, `inc_epoch`;
+  - `src/channel.rs`: the takeover round (`takeover_told`, `Takeover`, `TakeoverSlice`), `ServeState::slices_within`,
+    `owes_takeover_round`, `take_takeover_counts`;
+- `crates/vfs/src/volume.rs`: `Volume::replayed`, `mark_replayed`, `visit_takeover_inodes`;
+- `crates/bridge-core`: `Bridge::takeover_inodes` (`lib.rs`, `volume_bridge.rs`, `scoped.rs`, and the test bridge in
+  `crates/bridge-fuse/tests`);
+- `crates/server/src/fuse.rs`: the wake while a slice is owed, the slice budget (`TAKEOVER_SLICE_PERMILLE`), and the
+  counters `fuse.epoch_bumped`, `fuse.epoch_unsupported`, `fuse.takeover_invalidated`;
+- `crates/server/src/verbs.rs`: `replay_one` marks the inodes the replay names;
+- the tests:
+  - `crates/bridge-fuse/src/session.rs`: the 8 golden sessions, and a kernel offering 7.44 recorded as able to bump;
+  - `crates/bridge-fuse/tests/abi.rs`: `the_epoch_notification_is_a_bare_header`, and the code in the header table;
+  - `crates/bridge-fuse/tests/takeover_round.rs`: the whole set in slices, each inode once; a kernel before 7.44;
+  - `crates/vfs/tests/recover.rs`: the set names the owner's references and the replay's inodes and nothing of another
+    owner; walked in slices it is the whole set;
+  - `crates/cli/tests/cli.rs`: the replacement, rename and chaos tests across kills;
+- GAPS and `docs/bugs/2026-10-23-a-change-a-dead-daemon-never-delivered-outlives-the-takeover.md`.
+
+- **What it answers.** A change reaches a mount's kernel about 82 µs after its writer's reply (A-142's measurement). A
+  daemon that died in between had made the change durable and never told the kernel, and the successor's journal starts
+  empty, so nothing named it. Under the `Invalidated` posture the kernel's names, attributes and pages live until
+  invalidated, so the old bytes and names were served indefinitely. Reproduced 4 of 4 on Linux 7.2.9.
+- **Why this set.** Every acknowledged change is durable before its reply. A kernel holds state older than a change
+  only for an inode it looked up before it, and that change's publication recorded the reference, which the recovery
+  gives back. A logged FUSE write is in no publication, so the replay notes its inodes, landed or refused. The set is
+  therefore the owner's restored references (and any taken since) and the replayed inodes. The route that would carry
+  the delivered cursor or the kernel's holdings across the takeover was not taken: it is anchor traffic on every round.
+- **Names.** A name renamed or removed away belongs to no inode the successor can list. `FUSE_NOTIFY_INC_EPOCH` (FUSE
+  7.44, Linux 6.16) bumps the connection's epoch, so every dentry stamped before fails its next revalidation. The
+  kernel answers a notification by its own version, not the agreed one (it took `FUSE_NOTIFY_RESEND` on connections
+  agreed at 7.31), so the session records the minor the kernel offered. A kernel before 7.44 would answer the code
+  `EINVAL`, which the notify thread takes for a device refusal, so it is not sent there and is counted instead.
+- **Slices.** The set can be tens of thousands of inodes, and each message is built on the serving thread. So a slice
+  takes at most half the shard's live step quantum and at least one inode, walked in inode order from where the last
+  ended; each costs only what it visits. An inode looked up after the takeover, below where the walk stands, is fresh,
+  and one forgotten needs nothing, so a set that changes between slices loses nothing. The mount turns at once while a
+  slice is owed and no round is out, and the round's return wakes it otherwise, so a takeover never spins its shard.
+- **Evidence.** On the box, with load 15–82 from other sessions:
+  - the two kill-in-window tests are red on their final text with the change's files at the previous commit, and
+    green 3 of 3 runs, every takeover bumping the epoch once and invalidating 2 inodes;
+  - the chaos test is green 3 of 3 runs, 13 inodes in every round, and red at its first cycle without the change;
+  - the socket-pair test gives each inode once, in 40 slices at a zero budget. Resuming the walk at its cursor rather
+    than after it re-sends the last inode forever; an unbounded slice sends all 41 at once. Both turn it red.
+- **A test premise.** Under load the mount's round for another path's create reached the kernel after the test had
+  looked the new file up. It dropped that name, and the kernel evicted the unused inode. So the kernel held nothing to
+  leave stale, and the set rightly named only the root. The tests now wait until the mount's journal reader is at the
+  head before caching, and hold the file open.
+- **Not in this change.** A dirty pre-takeover page is still judged fresh as of the mount's start (A-156). An effect
+  served before its publication can outlive a crash in a kernel. An outsider's base change in the gap stays in a kernel
+  that looked the file up after the last publication. Kernels before 7.44 keep renamed-away names. Each is a GAPS
+  entry.
 
 ### A-157 — The journal keeps what a live reader still needs, growing from the metadata ledger (accepted 2026-10-23)
 Applied in the same change to:

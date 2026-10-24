@@ -10811,24 +10811,66 @@ stale page back, and the other write's bytes on it reverted: measured 4,095 of 4
     of its name was followed through the old handle (reproduced on the box). The fix does not need the counts: an
     untouched base inode is bound to the disk file it was made from, by an identity the image carries (below,
     "a base file opened before a takeover read the file an outsider put at its name").
-- **A takeover sends the kernel no invalidation** (found reading `crates/server/src/fuse.rs` 2026-10-22, not
-  reproduced). The coherence cursor is process-local, and a restored mount's first round starts at the new daemon's
-  head. A change the dead daemon had not yet delivered is therefore never invalidated: its kernel keeps that name,
-  attribute or page, whose lifetimes are unbounded under the `Invalidated` posture. Delivery takes about 82 µs after
-  the writer's reply (measured, above), so the window is a crash inside it. The same gap hides such a change from the
-  write-back rule, above.
-  - **What a fix has to work with** (read 2026-10-22): recovery rebuilds every volume with an empty journal
-    (`OpLog::new`, `crates/vfs/src/volume.rs:877`), so the records the dead daemon had not delivered exist nowhere
-    after a takeover.
-  - **A-141 cannot be reused as it stands.** A restored mount's `KernelHolds` is empty, because the kernel's lookups
-    predate the new daemon.
-  - **What a restored mount could still do:** invalidate every inode its attachment references (the reference table is
-    recovered, A-61) and every name the volume has now. A name removed by another path in the window would still be
-    missed.
-  - **The other route:** carry the delivered cursor or the holdings across the takeover. That is anchor traffic on
-    every round.
-
-  Which way to go is Ada's call. Not yet reproduced.
+- **A takeover sent the kernel no invalidation — fixed 2026-10-23 (A-158).** Found reading `crates/server/src/fuse.rs`
+  (2026-10-22), then reproduced on the box (Linux 7.2.9), 4 runs of 4. A change is told to a mount's kernel about 82 µs
+  after its writer's reply, and a successor's coherence cursor and journal start empty, so a change the dead daemon had
+  not delivered was never invalidated. Two kill-in-window tests caught it: a replacement through the SDK left the mount
+  serving the old bytes, and a rename left the old name served, both for as long as the kernel cached them
+  (`docs/bugs/2026-10-23-a-change-a-dead-daemon-never-delivered-outlives-the-takeover.md`).
+  - **The route** (decided from the analysis, not by carrying the cursor across the takeover, which would be anchor
+    traffic on every round). Every acknowledged change is durable before its reply. A kernel holds state older than a
+    change only for an inode it looked up before it, and the change's publication recorded that reference. A logged
+    write is in no publication, so the replay notes its inodes. So a restored mount's rounds open with a takeover round:
+    `FUSE_NOTIFY_INC_EPOCH` for names, where the kernel offered FUSE 7.44, then an all-data invalidation of the root and
+    of every inode in its owner's restored references and the replay. It is sliced to half the shard's live quantum, and
+    the mount turns at once while a slice is owed and no round is out.
+  - **Evidence.** Red on the final test text with the change's files at `HEAD`; green 3 of 3 runs (5 takeovers each,
+    every takeover bumping the epoch and invalidating 2 inodes). A chaos test of 12 held-open files, with generated
+    replacements and renames over 2 seeds × 4 kill cycles, is green 3 of 3 with 13 inodes per round, and red without the
+    fix at its first cycle. A socket-pair test of the slices passes and is mutation-checked. The crosvm guest DAX tests
+    passed 2 of 2. The full CLI suite passed 40 of 42 runs at load 15–82; the 2 failures were in two older tests, from
+    the CLI attachment race opened below, which a 2.5 s pause reproduces every time.
+  - **Siblings, opened below:** a dirty pre-takeover page judged fresh; an effect served before its publication; an
+    outsider's base change during the gap; kernels before FUSE 7.44 keep renamed-away names; A-141's and the journal
+    gather's unsliced rounds; a create's redundant entry invalidation.
+- **A dirty page from before a takeover is judged fresh (open, from A-158).** A restored mount's byte states start
+  fresh as of its start (A-156), so a dirty shared-map page the kernel held across the takeover is applied whole when
+  written back, including bytes a change the dead daemon never delivered had made stale. The takeover round's
+  invalidation launders such a page at once; the kernel would have written it back later anyway, so the outcome is the
+  same. The precise fix marks as stale, in adopted files' states, the ranges the last publications and the replayed
+  writes changed. Refusing every pre-takeover write-back would answer `EIO` to every map that crossed a takeover. Not
+  reproduced.
+- **An effect served before its publication (open, from A-158).** A mutation is applied, then published before its
+  reply. A mount that reads the new bytes in between, followed by the daemon dying before the publication, holds bytes
+  the successor never had. If its kernel looked the inode up after the last publication, no restored reference names it,
+  and the takeover round leaves it cached. The change was never acknowledged, so this is a dirty read surviving a crash,
+  not a lost acknowledgement. Not reproduced.
+- **An outsider's change beneath a base during a takeover's gap (open, from A-158).** A base file the kernel looked up
+  after the last publication is in no restored reference, and the successor's watcher did not run while no daemon did.
+  Its names and attributes revalidate within the base's timestamp granularity, but its cached pages stay. Not
+  reproduced.
+- **Kernels before FUSE 7.44 keep renamed-away names across a takeover (open, from A-158).** They take no
+  `FUSE_NOTIFY_INC_EPOCH`, and no inode set reaches a name. Counted: `fuse.epoch_unsupported`. The same holds for a
+  mount whose session a daemon before A-158 recorded, until it is mounted again. Linux 6.9–6.15 resend requests but
+  cannot bump the epoch.
+- **Two rounds are built whole in one turn (open, from A-158).** A-141's `everything_told` and the journal gather each
+  build a round over everything they name on the serving thread, against the bounded-work rule the takeover round now
+  follows. Not measured.
+- **A CLI attachment dies about a second after its `attach` exits (open, found 2026-10-23).** A dead client's
+  attachments are removed everywhere by design (§4.7, A-28). `slates attach` is a process that prints the id and
+  exits, so its attachment is reaped once the reaper sees the client silent past the liveness budget (1 s, seen
+  within two). `docs/cli.md`'s flow of `attach`, then `write ID ATTACHMENT` or `detach ATTACHMENT` from later
+  processes, works only when they follow within that window. With a 2.5 s pause injected after `attach`,
+  `the_anchor_supervises_a_daemon_the_verbs_answer_and_the_daemon_leaves_with_the_anchor` failed `write notes.txt:
+  refused: NotFound` 3 of 3. Under the full suite at load 57 it and
+  `a_locked_volume_locks_only_its_own_content_across_a_restart_or_is_refused_with_nothing_locked` failed that way in 2
+  of 4 runs; 16 interleaved runs at load 51–76 passed, 8 with the A-158 chaos test and 8 without. Which lifetime a CLI
+  attachment should have (until `detach`, or a term) is a design question: an attachment no live client owns needs its
+  own bound.
+- **A create's entry invalidation is redundant (open, from A-158).** Since A-137 no lookup miss is cached, so the entry
+  invalidation that follows another path's create can drop only a positive name the kernel looked up after the create.
+  The kernel then evicts the unused inode and looks it up again. Traced 2026-10-23: two lookups of a just-created file,
+  then two forgets, before a test's first kill cycle.
 - **`O_DIRECT` reads — fixed 2026-10-22 (A-144).** It was found by reading Linux 6.12's source, then reproduced on the
   box (kernel 7.2.9) by `a_direct_read_does_not_make_a_cached_page_fresh`. A shared map's page is faulted in, another
   attachment replaces the file while the mount's rounds are held, one `O_DIRECT` read is made, and a store goes into

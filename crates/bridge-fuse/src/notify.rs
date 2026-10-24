@@ -28,6 +28,9 @@ pub enum Notify {
   /// Format: FUSE_NOTIFY_RESEND — put every request a daemon read but never answered back on the device, each
   /// marked with [`crate::abi::UNIQUE_RESEND`] (7.40, Linux 6.9+).
   Resend = 7,
+  /// Format: FUSE_NOTIFY_INC_EPOCH — bump the connection's dentry epoch, so every name the kernel cached before is
+  /// looked up again at its next use (7.44, Linux 6.16+).
+  IncEpoch = 8,
 }
 
 impl Notify {
@@ -114,6 +117,16 @@ pub fn delete(parent: u64, child: u64, name: &str, out: &mut [u8]) -> Result<usi
 /// handler reads none (`fs/fuse/dev.c` `fuse_notify_resend`).
 pub fn resend(out: &mut [u8]) -> Result<usize, FuseError> {
   write_notification(Notify::Resend.code(), &[], out)
+}
+
+/// Encodes a `FUSE_NOTIFY_INC_EPOCH`: the kernel bumps the connection's epoch, and every dentry stamped with an older
+/// one fails its next revalidation, so its name is looked up again (`fs/fuse/dir.c` `fuse_dentry_revalidate`). A
+/// daemon taking over a held mount sends it so no name its predecessor changed and never told the kernel of outlives
+/// the takeover (A-158). No body: the kernel's handler reads none (`fs/fuse/dev.c` `fuse_notify_inc_epoch`). A kernel
+/// before 7.44 refuses the code `EINVAL`, so it is sent only to one that offered 7.44
+/// ([`crate::session::Session::kernel_bumps_epoch`]).
+pub fn inc_epoch(out: &mut [u8]) -> Result<usize, FuseError> {
+  write_notification(Notify::IncEpoch.code(), &[], out)
 }
 
 #[cfg(test)]

@@ -1447,6 +1447,15 @@ impl Bridge for VolumeBridge<'_> {
     self.volume.restored_open_files(cx.owner)
   }
 
+  fn takeover_inodes(
+    &mut self,
+    cx: &OpContext,
+    after: Option<u64>,
+    visit: &mut dyn FnMut(u64) -> std::ops::ControlFlow<()>,
+  ) -> bool {
+    self.volume.visit_takeover_inodes(cx.owner, after, visit)
+  }
+
   fn change_token(&mut self, object: ObjectId, cx: &OpContext) -> Result<u64, VfsError> {
     self.authorize_read(cx)?;
     // A view changes whenever its owner's attributes or working copy do; the owner's version moves

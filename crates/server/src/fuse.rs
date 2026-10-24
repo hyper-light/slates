@@ -126,6 +126,22 @@ const JOURNAL_OVERRUNS: &str = "fuse.journal_overruns";
 /// Format: see [`MOUNT_REFUSED`] — resent requests answered from the reply their dead daemon published and never
 /// delivered (A-61); the exact replay's non-vacuity counter.
 const REPLAYED: &str = "fuse.replayed";
+/// Format: takeover rounds that bumped the kernel's dentry epoch (A-158), so no name the dead daemon changed and never
+/// told the kernel of outlives the takeover; the non-vacuity counter of the names half.
+const EPOCH_BUMPED: &str = "fuse.epoch_bumped";
+/// Format: takeover rounds sent to a kernel that cannot bump its epoch (FUSE before 7.44, or a mount whose session a
+/// daemon before A-158 recorded). Zero is the healthy reading; movement means a name the dead daemon renamed or removed
+/// and never told the kernel of may outlive the takeover on that mount.
+const EPOCH_UNSUPPORTED: &str = "fuse.epoch_unsupported";
+/// Format: inode invalidations sent in takeover rounds (A-158): the root and every inode a taken-over mount's kernel may
+/// hold older than the volume. The non-vacuity counter of the bytes and attributes half.
+const TAKEOVER_INVALIDATED: &str = "fuse.takeover_invalidated";
+/// Shape: the share of the shard's step quantum one slice of a takeover round may take, in permille: half, as a landing
+/// slice and a destroy slice take, so a mount taken over with a large kernel cache leaves the rest of each step to the
+/// shard's other clients (§4.3).
+const TAKEOVER_SLICE_PERMILLE: u64 = 500;
+/// Format: parts per thousand.
+const PERMILLE: u64 = 1_000;
 
 /// A mounted volume being served: its device, the serve loop's state, the open-handle map that persists
 /// across requests, the registry attachment its requests are admitted under, and where it is mounted.
@@ -539,6 +555,13 @@ fn volume_changed(s: &mut ShardState, attachment: u64, waker: &std::task::Waker)
     .is_ok_and(|slot| slot.volume.wait_for_change(seen, waker))
 }
 
+/// Whether mount `attachment`, taken over from a daemon that died, has yet to send its takeover round (A-158).
+fn owes_takeover_round(s: &ShardState, attachment: u64) -> bool {
+  s.fuse_mounts
+    .get(&attachment)
+    .is_some_and(|mount| mount.serve.owes_takeover_round())
+}
+
 /// Waits until mount `attachment` has work (§4.6 cache posture): a request on its device, a finished round of
 /// notifications on its signal, or a change to its volume made through any other path. Until 2026-10-21 the device
 /// was the only source, so a change made elsewhere reached the kernel's cache only at its next request — never, on an
@@ -560,6 +583,11 @@ async fn wait_for_work(
       return std::task::Poll::Ready(ready.map(|()| Woke::Change));
     }
     if state::with_state(|s| volume_changed(s, attachment, cx.waker())).unwrap_or(false) {
+      return std::task::Poll::Ready(Ok(Woke::Change));
+    }
+    // A mount taken over from a dead daemon turns at once until its takeover round is out (A-158): a kernel serving
+    // from its stale cache sends no request, and nothing may change again for a long time.
+    if state::with_state(|s| owes_takeover_round(s, attachment)).unwrap_or(false) {
       return std::task::Poll::Ready(Ok(Woke::Change));
     }
     std::task::Poll::Pending
@@ -671,6 +699,13 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
     .unwrap_or(0)
     .max(1)
     .saturating_mul(chunk);
+  // A takeover round runs a slice per turn too (A-158), timed against the shard's live quantum.
+  mount.serve.slices_within(
+    s.config
+      .step_quantum_ns()
+      .saturating_mul(TAKEOVER_SLICE_PERMILLE)
+      / PERMILLE,
+  );
   let dispatched = {
     let ShardState {
       store,
@@ -763,6 +798,10 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
   s.count(JOURNAL_OVERRUNS, overruns);
   let lost_for_room = mount.serve.take_states_lost_for_room();
   s.count(STATES_LOST_FOR_ROOM, lost_for_room);
+  let (bumped, unsupported, invalidated) = mount.serve.take_takeover_counts();
+  s.count(EPOCH_BUMPED, bumped);
+  s.count(EPOCH_UNSUPPORTED, unsupported);
+  s.count(TAKEOVER_INVALIDATED, invalidated);
   // What a delivering turn delivered is behind it — the owed round, and any change it made itself, which its own
   // kernel needs no notice of — so the task parks past the generation as it now stands. Any other path's change after
   // this point moves the generation again and wakes it.

@@ -361,6 +361,8 @@ fn notify_codes_carry_the_headers_values() {
   // FUSE_NOTIFY_RESEND = 7, and FUSE_UNIQUE_RESEND (1ULL << 63), from the 7.41 header on 2026-10-03.
   assert_eq!(Notify::Resend.code(), 7);
   assert_eq!(slates_bridge_fuse::abi::UNIQUE_RESEND, 1 << 63);
+  // FUSE_NOTIFY_INC_EPOCH = 8, from the 7.45 header on the Linux 7.2.9 box (2026-10-23).
+  assert_eq!(Notify::IncEpoch.code(), 8);
 }
 
 /// `FUSE_NOTIFY_RESEND` is the bare `fuse_out_header`: len 16, the code 7 in `error`, a zero unique, and no body
@@ -377,6 +379,29 @@ fn the_resend_notification_is_a_bare_header() {
   );
   assert!(
     slates_bridge_fuse::notify::resend(&mut [0u8; 15]).is_err(),
+    "a buffer shorter than the header is refused, never overrun"
+  );
+}
+
+/// A-158: `FUSE_NOTIFY_INC_EPOCH` is the bare `fuse_out_header`, byte for byte: len 16, the code 8 in `error`, a zero
+/// unique, and no body (the kernel's `fuse_notify_inc_epoch` reads none). Do: encode it into a larger buffer filled with
+/// a marker. Expect exactly these 16 bytes, the marker untouched past them, and a refusal for a buffer of 15.
+#[test]
+fn the_epoch_notification_is_a_bare_header() {
+  let mut out = [0xA5u8; 32];
+  let n = slates_bridge_fuse::notify::inc_epoch(&mut out).unwrap();
+  assert_eq!(n, OUT_HEADER_LEN);
+  assert_eq!(
+    out[..n],
+    [16, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    "len 16, FUSE_NOTIFY_INC_EPOCH in error, a zero unique"
+  );
+  assert!(
+    out[n..].iter().all(|byte| *byte == 0xA5),
+    "nothing past the header"
+  );
+  assert!(
+    slates_bridge_fuse::notify::inc_epoch(&mut [0u8; 15]).is_err(),
     "a buffer shorter than the header is refused, never overrun"
   );
 }

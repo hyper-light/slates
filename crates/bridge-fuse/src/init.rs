@@ -72,6 +72,11 @@ pub struct InitNegotiation {
   pub major: u32,
   /// The minor version: the lesser of the kernel's and slates'.
   pub minor: u32,
+  /// The minor version the kernel offered, before it was lowered to slates' own: what the kernel can be sent outside
+  /// the agreed version's messages. A kernel answers a notification by its own version, not the agreed one (it took
+  /// `FUSE_NOTIFY_RESEND`, 7.40, on connections agreed at 7.31 since A-61), so this is what says whether it knows a
+  /// newer one, such as `FUSE_NOTIFY_INC_EPOCH` (7.44; [`crate::session::Session::kernel_bumps_epoch`]).
+  pub kernel_minor: u32,
   /// The flags the connection keeps (the intersection of wanted and offered).
   pub flags: u64,
   /// The maximum write per request.
@@ -144,6 +149,8 @@ pub fn negotiate(body: &[u8], coherence: CacheCoherence) -> Result<InitNegotiati
     return Ok(InitNegotiation {
       major: FUSE_KERNEL_VERSION,
       minor: FUSE_KERNEL_MINOR_VERSION,
+      // A minor of an older major names none of this major's messages.
+      kernel_minor: 0,
       flags: 0,
       max_write: MAX_WRITE,
       max_pages: 0,
@@ -155,6 +162,7 @@ pub fn negotiate(body: &[u8], coherence: CacheCoherence) -> Result<InitNegotiati
   Ok(InitNegotiation {
     major: FUSE_KERNEL_VERSION,
     minor: minor.min(FUSE_KERNEL_MINOR_VERSION),
+    kernel_minor: minor,
     flags: wanted(coherence) & kernel_flags,
     max_write: MAX_WRITE,
     // Only meaningful when the intersection kept the flag: a kernel that did not offer it ignores the field.

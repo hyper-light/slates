@@ -44,7 +44,7 @@ use crate::coherence::{
 use crate::dispatch;
 use crate::error::FuseError;
 use crate::init::negotiate;
-use crate::notify::{EXPIRE_ONLY, inval_entry, inval_inode};
+use crate::notify::{EXPIRE_ONLY, inc_epoch, inval_entry, inval_inode};
 use crate::reply::ReplyHeader;
 use crate::request::Request;
 use crate::session::Session;
@@ -614,6 +614,21 @@ pub struct ServeState {
   /// Whether this restored mount has yet to track the files the volume restored opens of for it, which it does once, at
   /// its first turn ([`adopt_restored`]).
   adopt_restored: bool,
+  /// Where this mount's takeover round stands (A-158): the epoch bump and the invalidations of everything its kernel may
+  /// hold older than the volume ([`takeover_told`]), sent in slices from a restored mount's first turn.
+  takeover: Takeover,
+  /// The time one slice of the takeover round may take on the serving thread, set by the owner before each turn from its
+  /// shard's live step quantum ([`ServeState::slices_within`]). Zero sends one inode a slice.
+  slice_ns: u64,
+  /// Takeover rounds that bumped the kernel's dentry epoch, since this was last read: the non-vacuity count of the
+  /// names half of A-158. Read and cleared by the owner that reports it.
+  epochs_bumped: u64,
+  /// Takeover rounds sent to a kernel that cannot bump its epoch (FUSE before 7.44), since this was last read: names its
+  /// predecessor changed and never told it of may outlive the takeover there. Read and cleared by the owner.
+  epochs_unsupported: u64,
+  /// Inode invalidations sent in takeover rounds, since this was last read: the non-vacuity count of the bytes and
+  /// attributes half of A-158. Read and cleared by the owner that reports it.
+  takeover_invalidated: u64,
   /// Bytes of cache write-backs kept back because another path changed them after the kernel's copy was fetched, since
   /// this was last read: the rule's non-vacuity count. Read and cleared by the owner that reports it.
   writeback_bytes_kept_back: u64,
@@ -660,6 +675,11 @@ impl ServeState {
       started_at: None,
       adopts_unseen_handles: false,
       adopt_restored: false,
+      takeover: Takeover::Told,
+      slice_ns: 0,
+      epochs_bumped: 0,
+      epochs_unsupported: 0,
+      takeover_invalidated: 0,
       writeback_bytes_kept_back: 0,
       writebacks_unknown: 0,
       holds: KernelHolds::default(),
@@ -698,6 +718,30 @@ impl ServeState {
     std::mem::take(&mut self.journal_overruns)
   }
 
+  /// Whether this mount, taken over from a daemon that died, has a slice of its takeover round to send now (A-158): some
+  /// is owed and no round is out. Its owner turns it at once while this holds, rather than waiting for a request or a
+  /// change: a kernel serving from its cache sends neither, and the round is what tells it its cache is stale. While a
+  /// round is out this is false, and the round's return wakes the owner, so a takeover never spins its owner's shard.
+  pub fn owes_takeover_round(&self) -> bool {
+    self.takeover != Takeover::Told && !self.notifier.as_ref().is_some_and(Notifier::busy)
+  }
+
+  /// Bounds each slice of the takeover round to `ns` of the serving thread (A-158): the owner's share of its shard's live
+  /// step quantum, set before each turn so the slices follow the quantum the shard keeps (§4.3).
+  pub fn slices_within(&mut self, ns: u64) {
+    self.slice_ns = ns;
+  }
+
+  /// The takeover rounds sent since this was last asked, and zero afterwards, as `(epoch bumped, epoch unsupported,
+  /// inodes invalidated)` (A-158; [`takeover_told`]).
+  pub fn take_takeover_counts(&mut self) -> (u64, u64, u64) {
+    (
+      std::mem::take(&mut self.epochs_bumped),
+      std::mem::take(&mut self.epochs_unsupported),
+      std::mem::take(&mut self.takeover_invalidated),
+    )
+  }
+
   /// The entry invalidations the kernel has refused since this was last asked, and zero afterwards: names it was handed
   /// that it says it does not hold. A non-zero answer means the kernel dropped such names on its own, or is still
   /// serving names this mount has tried to invalidate.
@@ -713,7 +757,8 @@ impl ServeState {
 
   /// The state of a device taken over from a previous daemon: what its connection negotiated, the reply that
   /// daemon published and never delivered (if any), and nothing in the kernel's cache that this daemon knows of. The
-  /// files its kernel holds open from before are adopted as requests name them (A-147).
+  /// files its kernel holds open from before are adopted as requests name them (A-147), and its first round tells the
+  /// kernel what it may hold stale (A-158).
   pub fn restored(session: Session, replay: Option<(u64, Vec<u8>)>) -> ServeState {
     ServeState {
       expire_only: session.expire_only,
@@ -721,6 +766,7 @@ impl ServeState {
       replay,
       adopts_unseen_handles: true,
       adopt_restored: true,
+      takeover: Takeover::Owed,
       ..ServeState::new()
     }
   }
@@ -894,6 +940,10 @@ fn deliver_owed(
   let root = bridge.root(cx).ok();
   let before = state.coherence.cursor();
   let mut messages: Round = Vec::new();
+  // A restored mount's rounds open with a slice of its takeover round until it is sent whole (A-158). A slice counts as
+  // sent only once its round reaches the notify thread, so a turn refused before then sends it again.
+  let takeover = (state.takeover != Takeover::Told)
+    .then(|| takeover_told(bridge, cx, state, root, &mut messages));
   let mut overran = false;
   let holds = &mut state.holds;
   let delivered = state
@@ -944,7 +994,126 @@ fn deliver_owed(
     let notifier = state.notifier.insert(notifier);
     notifier.send(messages, before)?;
   }
+  if let Some(slice) = takeover {
+    if state.takeover == Takeover::Owed {
+      if slice.bumped {
+        state.epochs_bumped = state.epochs_bumped.saturating_add(1);
+      } else {
+        state.epochs_unsupported = state.epochs_unsupported.saturating_add(1);
+      }
+    }
+    state.takeover = slice.next;
+    state.takeover_invalidated = state.takeover_invalidated.saturating_add(slice.invalidated);
+  }
   Ok(delivered)
+}
+
+/// Where a mount's takeover round stands (A-158; [`takeover_told`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Takeover {
+  /// Nothing is owed: a mount this daemon started, or a round sent whole.
+  Told,
+  /// Owed, and none of it sent: its first slice carries the epoch bump and the root.
+  Owed,
+  /// Sent through inode `after` (the volume's numbering, in which the takeover set is walked); the rest is owed.
+  SentThrough {
+    /// The last inode a slice sent.
+    after: u64,
+  },
+}
+
+/// One slice of a takeover round, pushed onto a round's messages ([`takeover_told`]).
+struct TakeoverSlice {
+  /// Whether it bumps the kernel's epoch (only a first slice can).
+  bumped: bool,
+  /// The inode invalidations it carries.
+  invalidated: u64,
+  /// Where the round stands once the slice is sent.
+  next: Takeover,
+}
+
+/// The next slice of the takeover round of a mount taken over from a daemon that died (A-158), pushed onto `messages`.
+///
+/// The dead daemon may have made changes it never told this kernel of: a change reaches a mount's kernel about 82 µs
+/// after the writer's reply (A-142), and this daemon's journal starts empty, so nothing names them. The round tells the
+/// kernel everything such a change can have left stale:
+/// - **names:** `FUSE_NOTIFY_INC_EPOCH`, after which the kernel looks every cached name up again at its next use, where
+///   the kernel offered FUSE 7.44 ([`Session::kernel_bumps_epoch`]). A name is the one thing no inode set reaches: a
+///   name renamed or removed away belongs to no inode this daemon can list.
+/// - **attributes, bytes and listings:** `FUSE_NOTIFY_INVAL_INODE` with all data for the root (the kernel's node 1) and
+///   every inode the bridge says the kernel may hold older than the volume ([`Bridge::takeover_inodes`]). A directory's
+///   invalidation drops its cached listing too, which kernels before Linux 7.2 keep past an epoch bump.
+///
+/// **Slices.** The set is as large as what the kernel had looked up, tens of thousands of inodes for a tree a build or
+/// `git status` walked, and each message is built on the serving thread. So a slice takes at most the owner's budget
+/// ([`ServeState::slices_within`]) and at least one inode, walked in inode order from where the last slice ended. The
+/// first slice carries the epoch bump and the root, so names are right from the first round. An inode looked up after
+/// the takeover below where the walk stands is fresh in the kernel, and one the kernel forgot needs nothing, so a set
+/// that changes between slices loses nothing.
+///
+/// Neither message takes a lock the serving thread's answer releases, but dropping a file's pages waits for any page
+/// a pending `READ` holds, so the round goes through the notify thread like every other ([`Notifier`]).
+fn takeover_told(
+  bridge: &mut dyn Bridge,
+  cx: &slates_bridge_core::OpContext,
+  state: &ServeState,
+  root: Option<u64>,
+  messages: &mut Round,
+) -> TakeoverSlice {
+  let began = std::time::Instant::now();
+  let budget = std::time::Duration::from_nanos(state.slice_ns);
+  let first = state.takeover == Takeover::Owed;
+  let bumped = first
+    && state
+      .session
+      .is_some_and(|session| session.kernel_bumps_epoch);
+  let mut invalidated: u64 = 0;
+  let mut invalidate = |ino: u64, messages: &mut Round| {
+    let invalidation = Invalidation::Inode {
+      ino,
+      data: CachedBytes::ALL,
+    };
+    if let Some(message) = encode_invalidation(&invalidation, state.expire_only) {
+      messages.push(message);
+      invalidated = invalidated.saturating_add(1);
+    }
+  };
+  if bumped {
+    let mut out = [0u8; OUT_HEADER_LEN];
+    if let Some(message) = inc_epoch(&mut out).ok().and_then(|len| out.get(..len)) {
+      messages.push((message.to_vec(), false));
+    }
+  }
+  // The kernel names the root node 1 whatever the volume's root inode is (see [`addressed_to_the_kernel`]), and holds
+  // the root whether or not any reference names it; the walk skips the root inode for that reason.
+  if first {
+    invalidate(crate::bridge::FUSE_ROOT_ID, messages);
+  }
+  let after = match state.takeover {
+    Takeover::SentThrough { after } => Some(after),
+    Takeover::Owed | Takeover::Told => None,
+  };
+  let mut last = after;
+  let whole = bridge.takeover_inodes(cx, after, &mut |ino| {
+    last = Some(ino);
+    if Some(ino) != root {
+      invalidate(ino, messages);
+    }
+    if began.elapsed() >= budget {
+      std::ops::ControlFlow::Break(())
+    } else {
+      std::ops::ControlFlow::Continue(())
+    }
+  });
+  let next = match (whole, last) {
+    (false, Some(after)) => Takeover::SentThrough { after },
+    _ => Takeover::Told,
+  };
+  TakeoverSlice {
+    bumped,
+    invalidated,
+    next,
+  }
 }
 
 /// The messages an `Everything` becomes (A-141): an attribute-and-data invalidation of every node the kernel references
@@ -1900,6 +2069,7 @@ mod tests {
     let session = Session {
       expire_only: true,
       kernel_resends: true,
+      kernel_bumps_epoch: true,
     };
     ServeState::restored(session, Some((41, RECORDED.to_vec())))
   }
