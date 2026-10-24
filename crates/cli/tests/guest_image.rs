@@ -31,11 +31,20 @@ use std::process::Command;
 
 use slates_guest_probe::protocol::{Command as Ask, EntryKind, Reply, digest};
 use vm::{
-  Guest, MountPoint, REPLY_WAIT, created_volume, initramfs, run, start_anchor, write_whole,
+  Guest, MountPoint, QUIT_WAIT, REPLY_WAIT, created_volume, initramfs, run, start_anchor,
+  write_whole,
 };
 
 /// Shape: the image's capacity: the source's files and the guest's room to write.
 const CAPACITY: &str = "32MiB";
+/// Format: Firecracker's exit code for a VM stopped by an error (`FcExitCode::GenericError`, as its log names it:
+/// "Firecracker exiting with error. exit_code=1").
+const FIRECRACKER_ERROR_EXIT: i32 = 1;
+/// Format: the guest kernel's line as it restarts the machine (`kernel/reboot.c`).
+const GUEST_RESTARTS: &str = "reboot: Restarting system";
+/// Format: Firecracker's line for a vCPU's KVM shutdown exit, which it leaves unhandled (v1.17.0,
+/// `EmulationError::UnhandledKvmExit("Shutdown")`).
+const VCPU_SHUT_DOWN: &str = "Unexpected exit reason on vcpu run: Shutdown";
 /// Shape: the guest's memory, MiB, and processors.
 const GUEST_MEMORY_MIB: u32 = 256;
 /// See [`GUEST_MEMORY_MIB`].
@@ -270,6 +279,30 @@ fn firecracker_config(gate: &Gate, initrd: &str, image: &str) -> String {
   )
 }
 
+/// Quits the guest and holds the VM's end to the guest's own restart. The guest ends the VM by restarting
+/// (`reboot=k`): the kernel pulses the keyboard controller's reset, which Firecracker takes as the VM's end, ten times
+/// over about a millisecond, then falls through to the BIOS restart and a triple fault (arch/x86/kernel/reboot.c,
+/// `native_machine_emergency_restart`). Firecracker stops the vCPU from its main thread; when that thread is later than
+/// the millisecond, the vCPU meets the fallback first, a KVM shutdown exit Firecracker leaves unhandled and exits 1 for.
+/// Measured on the box at load 46-53 (2026-10-24): 1 run of 18. Either way the guest ended the VM by its own restart,
+/// after its flush; the merge that follows holds the bytes to it.
+fn the_guest_ends_the_vm_by_its_restart(guest: &mut Guest) {
+  let status = guest.quit();
+  if !status.success() {
+    guest.drain(QUIT_WAIT);
+  }
+  let restarted = status.success()
+    || (status.code() == Some(FIRECRACKER_ERROR_EXIT)
+      && guest.said(GUEST_RESTARTS)
+      && guest.said(VCPU_SHUT_DOWN));
+  assert!(
+    restarted,
+    "Firecracker exited {status}, not by the guest's restart\n{}",
+    guest.transcript()
+  );
+  eprintln!("Firecracker ended by the guest's restart: {status}");
+}
+
 /// Every node of the volume mounted at `mount`, as a guest would list it.
 #[allow(clippy::disallowed_methods)] // reads through the slates mount: RAM, not disk
 fn volume_listing(mount: &MountPoint) -> Vec<Reply> {
@@ -393,12 +426,7 @@ fn a_firecracker_guest_reads_and_writes_a_volume_through_its_image() {
     "the guest reads its own changes\n{}",
     guest.transcript()
   );
-  let status = guest.quit();
-  assert!(
-    status.success(),
-    "Firecracker exited {status}\n{}",
-    guest.transcript()
-  );
+  the_guest_ends_the_vm_by_its_restart(&mut guest);
 
   let (code, out, err) = run(&instance, &["image", "merge", &image, "merged"]);
   assert_eq!(code, 0, "image merge: {err}");

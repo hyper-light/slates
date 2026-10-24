@@ -13,7 +13,7 @@
 use slates_mem::Handle;
 use slates_mem::slab::Slab;
 
-use crate::dirtree::{DirBlock, Retired, Tree};
+use crate::dirtree::{DirBlock, Retired, Tree, TreeCursor};
 use crate::error::VfsError;
 use crate::ids::{Epoch, InodeNo};
 use crate::names::NameEquivalence;
@@ -43,6 +43,15 @@ pub const SMALL_NAME_BYTES: usize = SMALL_ENTRIES * MEASURED_NAME_BYTES;
 /// most `NAME_MAX` bytes: `(2 + 1) × 24 + 98 + 255 = 425` bytes, inside one 1,024-byte block, so
 /// the fresh tree never splits (`a_small_directory_moves_to_a_tree_in_one_block` checks it).
 pub const SMALL_TO_TREE_BLOCKS: usize = 1;
+
+/// Where a reading of a directory's entries stands, held apart from the directory ([`DirNode::next_entry`]).
+#[derive(Clone, Debug)]
+pub enum DirCursor {
+  /// The next entry of the inline form.
+  Small(usize),
+  /// The walk of the indexed form (boxed: a tree's whole stack, a few hundred bytes, made once a directory).
+  Indexed(Box<TreeCursor>),
+}
 
 /// What an entry points to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -588,6 +597,45 @@ impl DirNode {
             .map(|(hash, name, child)| EntryRef { hash, name, child }),
         )
       }
+    }
+  }
+
+  /// A cursor at the first entry in canonical order, for [`DirNode::next_entry`].
+  pub fn cursor(&self, blocks: &Slab<DirBlock>) -> DirCursor {
+    match &self.entries {
+      DirEntries::Small(_) => DirCursor::Small(0),
+      DirEntries::Indexed(t) => DirCursor::Indexed(Box::new(t.iter(blocks).cursor())),
+    }
+  }
+
+  /// The entry at `cursor`, in canonical order, the cursor moved past it; `None` once every entry is read, or when the
+  /// cursor is not this node's form. Each call costs one entry (an indexed form's step to its next leaf among it),
+  /// whatever the directory holds, so a caller holding the store a step at a time reads a directory of any size in
+  /// bounded steps (§4.3; A-160). The cursor must come from this node unchanged since: a snapshot's node, which
+  /// nothing changes while the snapshot lives. A reader that must not miss an entry counts what it read against
+  /// [`DirNode::len`], since a block that can no longer be read ends the walk.
+  pub fn next_entry<'a>(
+    &'a self,
+    blocks: &'a Slab<DirBlock>,
+    cursor: &mut DirCursor,
+  ) -> Option<EntryRef<'a>> {
+    match (&self.entries, cursor) {
+      (DirEntries::Small(s), DirCursor::Small(next)) => {
+        let e = *s.entries().get(*next)?;
+        *next = next.saturating_add(1);
+        Some(EntryRef {
+          hash: e.hash,
+          name: s.name(e),
+          child: e.child,
+        })
+      }
+      (DirEntries::Indexed(_), DirCursor::Indexed(at)) => {
+        let mut walk = at.resume(blocks);
+        let (hash, name, child) = walk.next()?;
+        **at = walk.cursor();
+        Some(EntryRef { hash, name, child })
+      }
+      _ => None,
     }
   }
 

@@ -10,11 +10,19 @@
 //! whole-tree check at the end (§4.3, bounded work). [`TreeBuilder`] takes a whole tree at once and grows it from the
 //! root. Each directory's entries are kept in name order, so one tree always writes the same image (the determinism
 //! gate).
+//!
+//! No call costs what a directory or the tree holds (A-160): the arrays grow and shrink a segment at a time
+//! ([`Segments`]), a directory's entries move into the tree one a [`TreeGrower::close`] call, and a tree is released a
+//! piece a [`Tree::shed`] call. Every directory's entries lie in one array, each directory's together, so a tree is a
+//! handful of segmented arrays and a release frees what it built a name at a time. Before (2026-10-24, `image_bench`'s
+//! least time of each unit over five rounds, Apple M5 Max): a close moved a directory of 100,000 entries in one call
+//! of 540 µs, and a finished merge's two trees and its builder's were freed in one drop of 4.5–15 ms.
 
 use std::collections::BTreeMap;
 
 use crate::error::ImageRefusal;
 use crate::format::{LINK_MAX, NAME_MAX};
+use crate::segments::Segments;
 
 /// A time: seconds since the Unix epoch and nanoseconds within the second.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -89,23 +97,53 @@ impl NodeId {
   }
 }
 
-/// A validated tree: every node reachable from the root, every directory named once, every directory's entries in
-/// name order.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Tree {
-  nodes: Vec<Node>,
-  /// For each node, its entries (name, child) in name order; empty for a node that is not a directory.
-  children: Vec<Vec<(Vec<u8>, NodeId)>>,
-  /// For each node, the entries that name it (its link count, before a directory's own).
-  named: Vec<u64>,
-  /// For each directory, its parent; the root is its own parent.
-  parents: Vec<NodeId>,
+/// Where a directory's entries lie among a tree's: the first's index and their count (none for a node that is not a
+/// directory).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Run {
+  start: usize,
+  len: usize,
 }
 
+/// A validated tree: every node reachable from the root, every directory named once, every directory's entries in
+/// name order.
+#[derive(Clone, Debug, Default)]
+pub struct Tree {
+  nodes: Segments<Node>,
+  /// Every directory's entries (name, child), each directory's together and in name order, where its run says.
+  entries: Segments<(Vec<u8>, NodeId)>,
+  /// For each node, where its entries lie in `entries`.
+  runs: Segments<Run>,
+  /// For each node, the entries that name it (its link count, before a directory's own).
+  named: Segments<u64>,
+  /// For each directory, its parent; the root is its own parent.
+  parents: Segments<NodeId>,
+  /// For each directory, its subdirectories: its links past its own entry and its `.`.
+  subdirectories: Segments<u64>,
+}
+
+/// Two trees are equal when they hold the same nodes and every directory the same entries, wherever in the tree's
+/// entry array its run lies: a walk and a batch build fill directories in different orders.
+impl PartialEq for Tree {
+  fn eq(&self, other: &Tree) -> bool {
+    self.nodes == other.nodes
+      && self.named == other.named
+      && self.parents == other.parents
+      && self.ids().all(|id| self.entries(id).eq(other.entries(id)))
+  }
+}
+
+impl Eq for Tree {}
+
 impl Tree {
+  /// The nodes held, the root among them.
+  pub fn node_count(&self) -> usize {
+    self.nodes.len()
+  }
+
   /// The nodes, the root first.
-  pub fn nodes(&self) -> &[Node] {
-    &self.nodes
+  pub fn nodes(&self) -> impl Iterator<Item = &Node> {
+    self.nodes.iter()
   }
 
   /// The node `id` names, if the tree holds it.
@@ -113,9 +151,58 @@ impl Tree {
     self.nodes.get(id.0)
   }
 
-  /// The entries of directory `id`, in name order (none for a node that is not a directory).
-  pub fn children(&self, id: NodeId) -> &[(Vec<u8>, NodeId)] {
-    self.children.get(id.0).map_or(&[], Vec::as_slice)
+  /// The run of directory `id`'s entries (empty for a node that is not a directory).
+  fn run(&self, id: NodeId) -> Run {
+    self.runs.get(id.0).copied().unwrap_or_default()
+  }
+
+  /// The entries directory `id` holds (none for a node that is not a directory).
+  pub fn entry_count(&self, id: NodeId) -> usize {
+    self.run(id).len
+  }
+
+  /// Entry `index` of directory `id`, in name order: its name and its child.
+  pub fn entry(&self, id: NodeId, index: usize) -> Option<(&[u8], NodeId)> {
+    let run = self.run(id);
+    if index >= run.len {
+      return None;
+    }
+    self
+      .entries
+      .get(run.start.checked_add(index)?)
+      .map(|(name, child)| (name.as_slice(), *child))
+  }
+
+  /// The entries of directory `id`, in name order.
+  pub fn entries(&self, id: NodeId) -> impl Iterator<Item = (&[u8], NodeId)> {
+    (0..self.run(id).len).filter_map(move |index| self.entry(id, index))
+  }
+
+  /// Where directory `id`'s entries start among all the tree's ([`Tree::total_entries`]): entry `index` of `id` is the
+  /// tree's entry `first_entry(id) + index`, for a table kept per entry.
+  pub fn first_entry(&self, id: NodeId) -> usize {
+    self.run(id).start
+  }
+
+  /// The entries of every directory together.
+  pub fn total_entries(&self) -> usize {
+    self.entries.len()
+  }
+
+  /// The entry of directory `id` named exactly `name`: its index in name order and its child. A binary search, so its
+  /// cost is the logarithm of the directory's entries.
+  pub fn find(&self, id: NodeId, name: &[u8]) -> Option<(usize, NodeId)> {
+    let (mut low, mut high) = (0usize, self.entry_count(id));
+    while low < high {
+      let middle = low.saturating_add(high.saturating_sub(low) / 2);
+      let (held, child) = self.entry(id, middle)?;
+      match held.cmp(name) {
+        std::cmp::Ordering::Less => low = middle.saturating_add(1),
+        std::cmp::Ordering::Greater => high = middle,
+        std::cmp::Ordering::Equal => return Some((middle, child)),
+      }
+    }
+    None
   }
 
   /// The entries that name node `id`.
@@ -143,15 +230,7 @@ impl Tree {
   pub fn links(&self, id: NodeId) -> u64 {
     match self.node(id).map(|node| &node.kind) {
       Some(Kind::Directory) => {
-        let subdirectories = self
-          .children(id)
-          .iter()
-          .filter(|(_, child)| {
-            self
-              .node(*child)
-              .is_some_and(|node| node.kind == Kind::Directory)
-          })
-          .count();
+        let subdirectories = self.subdirectories.get(id.0).copied().unwrap_or(0);
         // The root has no entry naming it, but its `..` names itself: two links before its subdirectories, as any
         // directory has (its entry and its `.`).
         let named = if id == NodeId::ROOT {
@@ -159,13 +238,33 @@ impl Tree {
         } else {
           self.named(id)
         };
-        named
-          .saturating_add(1)
-          .saturating_add(u64::try_from(subdirectories).unwrap_or(u64::MAX))
+        named.saturating_add(1).saturating_add(subdirectories)
       }
       Some(_) => self.named(id),
       None => 0,
     }
+  }
+
+  /// Releases one piece of the tree — an entry, a node, or a segment of one of its plain tables ([`Segments::shed`]) —
+  /// and says whether there was one: a tree of any size is released in bounded calls, never in one drop (A-160; §4.3).
+  /// A tree being shed is garbage: its tables no longer agree.
+  pub fn shed(&mut self) -> bool {
+    self.entries.shed()
+      || self.nodes.shed()
+      || self.runs.shed()
+      || self.named.shed()
+      || self.parents.shed()
+      || self.subdirectories.shed()
+  }
+
+  /// Adds `node` with no entries, named by none, its parent the root until an entry names it.
+  fn push_node(&mut self, node: Node) -> NodeId {
+    self.nodes.push(node);
+    self.runs.push(Run::default());
+    self.named.push(0);
+    self.parents.push(NodeId::ROOT);
+    self.subdirectories.push(0);
+    NodeId(self.nodes.len().saturating_sub(1))
   }
 }
 
@@ -192,23 +291,28 @@ enum Fill {
 /// [`TreeGrower::finish`]. Every check is made when its entry comes: the name, the repeat (each open directory's
 /// entries are kept by name), the directory named twice, the links. A directory can be opened only once named, so
 /// every directory filled hangs from the root by one chain of entries; [`TreeGrower::finish`] then needs only two
-/// counts, the nodes no entry named and the directories named but not filled, to know the tree is whole. Each step
-/// costs at most its directory's entries (`close` moves them into the tree in name order), never the whole tree.
+/// counts, the nodes no entry named and the directories named but not filled, to know the tree is whole. No call
+/// costs what a directory holds: an entry is kept by name as it comes (an ordered map, a logarithm of the directory),
+/// and [`TreeGrower::close`] moves the entries into the tree one a call, in name order.
 #[derive(Debug)]
 pub struct TreeGrower {
-  nodes: Vec<Node>,
-  children: Vec<Vec<(Vec<u8>, NodeId)>>,
-  named: Vec<u64>,
-  parents: Vec<NodeId>,
-  fill: Vec<Fill>,
-  /// For each directory, its subdirectories so far: its links past its own entry and its `.`.
-  subdirectories: Vec<u64>,
-  /// The directory being filled, and its entries so far by name.
-  open: Option<(NodeId, BTreeMap<Vec<u8>, NodeId>)>,
+  tree: Tree,
+  fill: Segments<Fill>,
+  /// The directory being filled.
+  open: Option<Open>,
   /// Nodes added that no entry names yet.
   unnamed: u64,
   /// Directories named, or the root, not yet filled.
   unfilled: u64,
+}
+
+/// The directory a [`TreeGrower`] is filling: its entries so far by name, and whether its close has begun (its entries
+/// moving into the tree).
+#[derive(Debug)]
+struct Open {
+  directory: NodeId,
+  entries: BTreeMap<Vec<u8>, NodeId>,
+  closing: bool,
 }
 
 impl TreeGrower {
@@ -218,13 +322,13 @@ impl TreeGrower {
       return Err(ImageRefusal::RootNotDirectory);
     }
     check_node(&root)?;
+    let mut tree = Tree::default();
+    tree.push_node(root);
+    let mut fill = Segments::new();
+    fill.push(Fill::Awaiting);
     Ok(TreeGrower {
-      nodes: vec![root],
-      children: vec![Vec::new()],
-      named: vec![0],
-      parents: vec![NodeId::ROOT],
-      fill: vec![Fill::Awaiting],
-      subdirectories: vec![0],
+      tree,
+      fill,
       open: None,
       unnamed: 0,
       unfilled: 1,
@@ -239,24 +343,19 @@ impl TreeGrower {
     } else {
       Fill::Leaf
     };
-    self.nodes.push(node);
-    self.children.push(Vec::new());
-    self.named.push(0);
-    self.parents.push(NodeId::ROOT);
     self.fill.push(fill);
-    self.subdirectories.push(0);
     self.unnamed = self.unnamed.saturating_add(1);
-    Ok(NodeId(self.nodes.len().saturating_sub(1)))
+    Ok(self.tree.push_node(node))
   }
 
   /// The node `id` names, if it was added.
   pub fn node(&self, id: NodeId) -> Option<&Node> {
-    self.nodes.get(id.0)
+    self.tree.node(id)
   }
 
   /// The nodes added, the root among them.
   pub fn node_count(&self) -> usize {
-    self.nodes.len()
+    self.tree.node_count()
   }
 
   /// Whether directory `id` is named, or is the root, and waits to be filled.
@@ -287,18 +386,32 @@ impl TreeGrower {
       }
     }
     *fill = Fill::Open;
-    self.open = Some((directory, BTreeMap::new()));
+    self.open = Some(Open {
+      directory,
+      entries: BTreeMap::new(),
+      closing: false,
+    });
     Ok(())
   }
 
   /// Names `child` `name` in the open directory.
   pub fn add_entry(&mut self, name: Vec<u8>, child: NodeId) -> Result<(), ImageRefusal> {
     check_name(&name)?;
-    let Some((directory, entries)) = self.open.as_mut() else {
+    let Some(Open {
+      directory,
+      entries,
+      closing,
+    }) = self.open.as_mut()
+    else {
       return Err(ImageRefusal::GrowthOutOfOrder {
         reason: "an entry with no directory open",
       });
     };
+    if *closing {
+      return Err(ImageRefusal::GrowthOutOfOrder {
+        reason: "an entry after its directory's close began",
+      });
+    }
     let directory = *directory;
     let child_fill = *self
       .fill
@@ -314,6 +427,7 @@ impl TreeGrower {
       return Err(ImageRefusal::NameRepeated);
     }
     let named = self
+      .tree
       .named
       .get_mut(child.0)
       .ok_or(ImageRefusal::NodeUnknown { node: child.0 })?;
@@ -329,6 +443,7 @@ impl TreeGrower {
       // The open directory gains a link: its subdirectory's `..`. Its own entry and its `.` are its other two, the
       // root's `..` standing in for the entry it lacks.
       let subdirectories = self
+        .tree
         .subdirectories
         .get_mut(directory.0)
         .ok_or(ImageRefusal::NodeUnknown { node: directory.0 })?;
@@ -340,7 +455,7 @@ impl TreeGrower {
       if let Some(fill) = self.fill.get_mut(child.0) {
         *fill = Fill::Awaiting;
       }
-      if let Some(parent) = self.parents.get_mut(child.0) {
+      if let Some(parent) = self.tree.parents.get_mut(child.0) {
         *parent = directory;
       }
       self.unfilled = self.unfilled.saturating_add(1);
@@ -353,23 +468,53 @@ impl TreeGrower {
     Ok(())
   }
 
-  /// Closes the open directory: its entries move into the tree in name order.
-  pub fn close(&mut self) -> Result<(), ImageRefusal> {
-    let Some((directory, entries)) = self.open.take() else {
+  /// Closes the open directory a step at a time: each call moves its next entry, in name order, into the tree, the
+  /// first call ending its filling; `true` once every entry is moved and the directory is closed. A directory of any
+  /// size closes a call an entry, so no call costs what the directory holds.
+  #[must_use = "a close moves one entry a call: call it until it answers true"]
+  pub fn close(&mut self) -> Result<bool, ImageRefusal> {
+    let Some(open) = self.open.as_mut() else {
       return Err(ImageRefusal::GrowthOutOfOrder {
         reason: "a close with no directory open",
       });
     };
-    let slot = self
-      .children
-      .get_mut(directory.0)
-      .ok_or(ImageRefusal::NodeUnknown { node: directory.0 })?;
-    *slot = entries.into_iter().collect();
+    let directory = open.directory;
+    if !open.closing {
+      open.closing = true;
+      let start = self.tree.entries.len();
+      let run = self
+        .tree
+        .runs
+        .get_mut(directory.0)
+        .ok_or(ImageRefusal::NodeUnknown { node: directory.0 })?;
+      *run = Run { start, len: 0 };
+    }
+    if let Some(entry) = open.entries.pop_first() {
+      self.tree.entries.push(entry);
+      if let Some(run) = self.tree.runs.get_mut(directory.0) {
+        run.len = run.len.saturating_add(1);
+      }
+      return Ok(false);
+    }
+    self.open = None;
     if let Some(fill) = self.fill.get_mut(directory.0) {
       *fill = Fill::Filled;
     }
     self.unfilled = self.unfilled.saturating_sub(1);
-    Ok(())
+    Ok(true)
+  }
+
+  /// Releases one piece of what the grower holds — the open directory's next entry, then the tree's — and says
+  /// whether anything is left: a walk refused or abandoned part way is released a piece a call, as a tree is.
+  pub fn shed(&mut self) -> bool {
+    if let Some(open) = self.open.as_mut() {
+      if open.entries.pop_first().is_some() {
+        return true;
+      }
+      self.open = None;
+      return true;
+    }
+    self.tree.shed() || self.fill.shed()
   }
 
   /// The first node no entry names, if any: found only when one is missing, so a whole tree costs no scan.
@@ -378,6 +523,7 @@ impl TreeGrower {
       return None;
     }
     self
+      .tree
       .named
       .iter()
       .skip(1)
@@ -385,8 +531,14 @@ impl TreeGrower {
       .map(|index| index.saturating_add(1))
   }
 
-  /// The tree, once every node is named and every directory named is filled.
-  pub fn finish(self) -> Result<Tree, ImageRefusal> {
+  /// The tree, once every node is named and every directory named is filled. The grower keeps what it used to check the
+  /// tree, for [`TreeGrower::shed`] to release a piece a call; a second finish is refused.
+  pub fn finish(&mut self) -> Result<Tree, ImageRefusal> {
+    if self.tree.node_count() == 0 {
+      return Err(ImageRefusal::GrowthOutOfOrder {
+        reason: "a tree finished twice",
+      });
+    }
     if self.open.is_some() {
       return Err(ImageRefusal::GrowthOutOfOrder {
         reason: "a directory still open",
@@ -400,12 +552,7 @@ impl TreeGrower {
         reason: "a directory named and never filled",
       });
     }
-    Ok(Tree {
-      nodes: self.nodes,
-      children: self.children,
-      named: self.named,
-      parents: self.parents,
-    })
+    Ok(std::mem::take(&mut self.tree))
   }
 }
 
@@ -476,7 +623,7 @@ impl TreeBuilder {
           reached.push(child);
         }
       }
-      grower.close()?;
+      while !grower.close()? {}
     }
     if let Some(node) = grower.first_unnamed() {
       // A directory the root never reached, though an entry names it, is named only from unreached directories: it

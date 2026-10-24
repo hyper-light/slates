@@ -189,21 +189,22 @@ pub(crate) fn canonical(
   let mut stack: Vec<(Vec<u8>, NodeId)> = vec![(Vec::new(), NodeId::ROOT)];
   while let Some((prefix, directory)) = stack.pop() {
     // Children in reverse so the depth-first walk visits them in name order.
-    for (name, child) in tree.children(directory).iter().rev() {
+    let entries: Vec<(&[u8], NodeId)> = tree.entries(directory).collect();
+    for (name, child) in entries.into_iter().rev() {
       let mut path = prefix.clone();
       path.push(b'/');
       path.extend_from_slice(name);
-      let node = tree.node(*child).unwrap().clone();
+      let node = tree.node(child).unwrap().clone();
       let linked_to = first_path.get(&child.index()).cloned();
       if linked_to.is_none() {
         first_path.insert(child.index(), path.clone());
       }
       let bytes = match node.kind {
-        Kind::File { size } if linked_to.is_none() => content(*child, size),
+        Kind::File { size } if linked_to.is_none() => content(child, size),
         _ => Vec::new(),
       };
       if node.kind == Kind::Directory {
-        stack.push((path.clone(), *child));
+        stack.push((path.clone(), child));
       }
       out.push(Canonical {
         path,

@@ -1093,7 +1093,39 @@ pub struct TreeIter<'b> {
   height: usize,
 }
 
+/// Where a [`TreeIter`] stands, held apart from the blocks it walks, so a caller that holds the store a step at a time
+/// can read a directory an entry a step: [`TreeCursor::resume`] over the same blocks goes on from there. The blocks a
+/// snapshot reaches never change while it lives (copy-on-write, §4.5), so a cursor over a snapshot's directory stays
+/// good from one step to the next; a block that can no longer be read ends the walk, as it ends an iterator's.
+#[derive(Clone, Copy, Debug)]
+pub struct TreeCursor {
+  stack: [(Handle<DirBlock>, usize); MAX_HEIGHT],
+  depth: usize,
+  height: usize,
+}
+
+impl TreeCursor {
+  /// The walk this cursor marks, over `blocks`.
+  pub fn resume(self, blocks: &Slab<DirBlock>) -> TreeIter<'_> {
+    TreeIter {
+      blocks,
+      stack: self.stack,
+      depth: self.depth,
+      height: self.height,
+    }
+  }
+}
+
 impl<'b> TreeIter<'b> {
+  /// Where this walk stands, to [`TreeCursor::resume`] it later over the same blocks.
+  pub fn cursor(&self) -> TreeCursor {
+    TreeCursor {
+      stack: self.stack,
+      depth: self.depth,
+      height: self.height,
+    }
+  }
+
   /// The block and slot on top of the stack.
   fn top(&self) -> Option<(Handle<DirBlock>, usize)> {
     self

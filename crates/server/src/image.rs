@@ -6,9 +6,15 @@
 //! reply to a task of the volume's owner shard, as a granted landing does (AUD-29-03). The task steps the work a slice
 //! at a time, yielding between slices, so the shard serves its clients while an image of any size is built or merged
 //! (§4.3). A slice is bounded against the clock, half the live step quantum
-//! ([`crate::config::DaemonConfig::copy_slice_ns`]), one unit at a time — an entry walked, a block written, a chunk
+//! ([`crate::config::DaemonConfig::copy_slice_ns`]), one unit at a time — an entry walked, a block written, a page
 //! compared — since a unit's cost is not its bytes. Measured on 2026-10-24, slices bounded by 256 KiB of work ran
-//! 230 µs to 1.5 ms, ten to sixty times the box's 24 µs. A retry while it runs joins it.
+//! 230 µs to 1.5 ms, ten to sixty times the box's 24 µs. No unit's work follows a directory, a tree or a file (A-160),
+//! so a slice overruns by a small unit at most: the longest measured was 18.5 µs at 100,000 nodes on the box. A retry
+//! while it runs joins it.
+//!
+//! **Release.** After its reply, a job releases what it made — the walks' leftovers, the builder's tree, the merge's
+//! tables and trees — in slices, [`SHED_PIECES`] pieces a unit ([`shed_in_slices`]), never in one drop: a finished
+//! merge and its builder took one drop of 4.4–14.9 ms at 100,000 nodes before (2026-10-24).
 //!
 //! **One atom.** The new volume is not in the registry while it is made, so no client attaches a half-built image or
 //! a half-merged clone. Its record, its publication and the request's completion record commit together, and then
@@ -31,7 +37,7 @@ use slates_db::catalog::{
   BaseRecord, PolicyRecord, Principal, Role, SizeClass as DbSizeClass, SnapshotId as DbSnapshotId,
   VolumeId as DbVolumeId, VolumeRecord, VolumeState,
 };
-use slates_image::{Builder, Identity, Progress, Timestamp, Walk, Walked};
+use slates_image::{Builder, Identity, Progress, Segments, Timestamp, Walk, Walked};
 use slates_ipc::protocol::{
   IMAGE_FILE, ImageMergeReport, NamePolicy, Refusal, ReplyBody, SizeClass, SnapshotId, VolumeId,
 };
@@ -326,7 +332,7 @@ pub(crate) fn build_verb(
     capacity,
     pinned: None,
     walk: None,
-    inodes: Vec::new(),
+    inodes: Segments::new(),
     builder: None,
     admitted: None,
     file: InodeNo(0),
@@ -350,7 +356,7 @@ struct BuildJob {
   pinned: Option<Handle<VolumeSlot>>,
   walk: Option<SnapshotWalk>,
   /// For each node of the tree written, its inode in the snapshot.
-  inodes: Vec<InodeNo>,
+  inodes: Segments<InodeNo>,
   builder: Option<Builder>,
   /// The image volume, admitted and not yet recorded.
   admitted: Option<Admitted>,
@@ -565,6 +571,14 @@ impl BuildJob {
     })
   }
 
+  /// Releases one piece of the trees the build made — its builder's, its inode table, its walk's — and says whether
+  /// anything is left ([`shed_in_slices`]).
+  fn shed(&mut self) -> bool {
+    self.builder.as_mut().is_some_and(Builder::shed)
+      || self.inodes.shed()
+      || self.walk.as_mut().is_some_and(SnapshotWalk::shed)
+  }
+
   /// Gives back what the build holds: the image volume, discarded with its credits, and the snapshot's pin.
   fn release(&mut self, state: &mut ShardState) {
     if let Some(admitted) = self.admitted.take() {
@@ -576,7 +590,8 @@ impl BuildJob {
   }
 }
 
-/// Builds the image a slice at a time; then commits its volume, or the refusal, as one atom and delivers the reply.
+/// Builds the image a slice at a time; then commits its volume, or the refusal, as one atom and delivers the reply;
+/// then releases what the build made, in slices.
 async fn run_build(mut job: BuildJob) {
   let outcome = build_steps(&mut job).await;
   let request = job.request;
@@ -594,9 +609,36 @@ async fn run_build(mut job: BuildJob) {
   });
   if delivered.is_none() {
     // The shard's state was unreachable (its shutdown): no record committed, so the client's retry, on the shard that
-    // succeeds it, runs the verb again.
+    // succeeds it, runs the verb again; the job's drop frees what it made.
+    return;
+  }
+  shed_in_slices(|| job.shed()).await;
+}
+
+/// Releases what a finished build or merge made a piece a unit, in slices after its reply: its trees go back to the
+/// allocator a name or a node at a time, as they were made, never in one drop (A-160; §4.3). Before (2026-10-24,
+/// `image_bench`): a finished merge and its builder were freed in one drop of 4.5–15 ms at 100,000 nodes. With the
+/// shard's state unreachable (its shutdown), the job's drop frees the rest.
+async fn shed_in_slices(mut shed: impl FnMut() -> bool) {
+  loop {
+    let sliced = crate::state::with_state(|s| {
+      sliced(s, |_| {
+        let more = (0..SHED_PIECES).all(|_| shed());
+        Ok((!more).then_some(()))
+      })
+    });
+    if !matches!(sliced, Some(Ok(None))) {
+      return;
+    }
+    slates_rt::futures::yield_now().await;
   }
 }
+
+/// Shape: the pieces one unit of a finished job's release frees ([`shed_in_slices`]). A piece is one free (a name, a
+/// node, a segment of a plain table), about 60 ns with the unit's own overhead (`image_bench`'s release phase, 700,000
+/// pieces of a 100,000-node merge in 73 ms, Apple M5 Max, 2026-10-24), so 64 make a unit of about 4 µs, a sixth of the
+/// slice, and the clock reads around each unit fall to a sixty-fourth of the release's time.
+const SHED_PIECES: usize = 64;
 
 /// The build's slices: pin and walk the snapshot, plan the image and admit its volume, write it.
 async fn build_steps(job: &mut BuildJob) -> Result<slates_image::Written, Refusal> {
@@ -788,8 +830,8 @@ impl MergeJob {
     })?;
     match walked {
       Some(tree) => {
+        // The walk stays, for its leftovers to be released in slices at the end.
         self.base_tree = Some(tree);
-        self.base_walk = None;
         Ok(true)
       }
       None => Ok(false),
@@ -840,7 +882,7 @@ impl MergeJob {
         .map_err(|failed| refusal_of_image(failed.into()))?
       {
         Walked::More => Ok(None),
-        Walked::Done(tree) => Ok(Some(tree)),
+        Walked::Done(tree) => Ok(Some(*tree)),
       }
     })?;
     let Some(tree) = walked else {
@@ -853,7 +895,7 @@ impl MergeJob {
     let base = self.base_tree.take().ok_or_else(unreachable)?;
     let clone = self.clone.as_ref().ok_or_else(unreachable)?;
     self.merge = Some(Merge::new(base, tree, &clone.volume, &state.store, trusted));
-    self.image_walk = None;
+    // The walk stays, for its leftovers (the inodes it met) to be released in slices at the end.
     Ok(true)
   }
 
@@ -912,6 +954,16 @@ impl MergeJob {
     })
   }
 
+  /// Releases one piece of what the merge made — the merge's tables and trees, the base's tree, the walks' leftovers,
+  /// the reader's tables — and says whether anything is left ([`shed_in_slices`]).
+  fn shed(&mut self) -> bool {
+    self.merge.as_mut().is_some_and(Merge::shed)
+      || self.base_tree.as_mut().is_some_and(SnapshotTree::shed)
+      || self.base_walk.as_mut().is_some_and(SnapshotWalk::shed)
+      || self.image_walk.as_mut().is_some_and(Walk::shed)
+      || self.reader.as_mut().is_some_and(slates_image::Image::shed)
+  }
+
   /// Gives back what the merge holds: the clone, discarded with its credits and its pin on the base's snapshot, and
   /// the image volume's snapshot.
   fn release(&mut self, state: &mut ShardState) {
@@ -945,7 +997,8 @@ impl MergeJob {
 /// Counter: an image merge's snapshot of its image volume that could not be destroyed when the merge ended.
 const IMAGE_SNAPSHOT_KEPT: &str = "image.snapshot_kept";
 
-/// Merges the image a slice at a time; then commits the clone, or the refusal, as one atom and delivers the reply.
+/// Merges the image a slice at a time; then commits the clone, or the refusal, as one atom and delivers the reply; then
+/// releases what the merge made, in slices.
 async fn run_merge(mut job: MergeJob) {
   let outcome = merge_steps(&mut job).await;
   let request = job.request;
@@ -964,8 +1017,10 @@ async fn run_merge(mut job: MergeJob) {
   });
   if delivered.is_none() {
     // The shard's state was unreachable (its shutdown): no record committed, so the client's retry, on the shard that
-    // succeeds it, runs the verb again.
+    // succeeds it, runs the verb again; the job's drop frees what it made.
+    return;
   }
+  shed_in_slices(|| job.shed()).await;
 }
 
 /// The merge's slices: snapshot the image and admit the clone, walk the base, open and walk the image, merge.

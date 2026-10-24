@@ -3,8 +3,8 @@
 //! its trees, feeds its writer, reads its images out of volume files, and merges an image's tree into a clone.
 //!
 //! **Build.** [`SnapshotWalk`] walks a snapshot into the tree the writer takes: depth first, each directory's entries
-//! in name order, so one snapshot always walks to the same tree, node for node. That is what lets a merge find the
-//! build's nodes again. [`BuildIo`] hands the writer each file's bytes, read at the snapshot, and writes the image's
+//! in the directory's canonical order (its folded names' hashes, §4.5: a function of the names alone), so one snapshot
+//! always walks to the same tree, node for node. That is what lets a merge find the build's nodes again. [`BuildIo`] hands the writer each file's bytes, read at the snapshot, and writes the image's
 //! blocks into a file of the image volume. A volume over a host directory is refused: its snapshot may still read
 //! the disk, and an image of it would freeze whatever the disk held while the walk ran.
 //!
@@ -19,14 +19,16 @@
 //! bytes, since every one of those is compared and set.
 //!
 //! The merge runs in phases, each an item a step:
-//! 1. **identify** each image node with the build's node, where it is one;
+//! 1. **prepare** its tables, a slot of each a step, and **identify** each image node with the build's node, where it
+//!    is one; under folded names, **index** the image's entries by folded name, an entry a step;
 //! 2. **plan**: walk the base's entries; an entry the image keeps (the same name in the same directory, naming the
 //!    same node) stays; one whose name the image gives to another node is moved aside, into a staging directory made
-//!    in the clone's root under a name neither tree's root uses, to free the name; every other one is noted where it
-//!    is;
-//! 3. **attach**: walk the image's tree from the root, breadth first, so every directory is in its place before its
-//!    entries are; an entry not kept is made by renaming one of its node's noted names (a directory has one), by
-//!    linking a node that has none left, or by creating a node the base never had;
+//!    in the clone's root under a name neither tree's root uses (sought a counter a step), to free the name; every
+//!    other one is noted where it is; then the folded index is released, an entry a step;
+//! 3. **attach**: walk the image's tree from the root, depth first, a directory's own entry attached before its
+//!    entries, so every directory is in its place before its entries are; an entry not kept is made by renaming one of
+//!    its node's noted names (a directory has one), by linking a node that has none left, or by creating a node the
+//!    base never had;
 //! 4. **remove** every noted name left: every name of a node that is not a directory first, then the directories,
 //!    from the last walked down, so each directory is empty when it goes. (A file is walked where an entry first names
 //!    it, so its other names may lie in directories walked after it: taken node by node from the last down, a removed
@@ -42,23 +44,25 @@
 //! step, and writes only the pages that differ; a chunk none of whose pages differs is never written, and stays
 //! shared. The page is the unit, not the chunk, so a step stays small: comparing a whole 256 KiB chunk took about
 //! 40 µs on macOS arm64 (2026-10-24, `examples/image_bench.rs`), longer than a daemon's slice. The namespace work is
-//! proportional to the entries, each a step.
+//! proportional to the entries, each a step, and no step costs what a directory or a tree holds: what a walk, a build
+//! or a merge holds is released a piece a step (`shed`), never in one drop. `tests/image_cost.rs` holds every step of
+//! a build and a merge, through the release, to the allocator traffic of a tree eight times smaller.
 //!
 //! Evidence: `tests/image.rs` builds images of generated volumes and reads them back equal, merges generated guest
 //! histories (renames, rewrites, hard links, swaps, kind changes, moves of whole directories) into clones held to the
 //! image's tree and to every build node's inode, and merges images whose inodes were all renumbered (identity
 //! misplaced throughout) to the same tree.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 
 use slates_image::format::{BUILT_GENERATION, FIRST_INO};
 use slates_image::{
-  Failed, ImageIo, ImageRefusal, ImageSource, ImageTree, Kind as ImageKind, Node, NodeId,
+  Failed, ImageIo, ImageRefusal, ImageSource, ImageTree, Kind as ImageKind, Node, NodeId, Segments,
   Timestamp, Tree, TreeGrower,
 };
 use slates_mem::Handle;
 
-use crate::dir::{Child, DirNode};
+use crate::dir::{Child, DirCursor, DirNode};
 use crate::error::VfsError;
 use crate::ids::{InodeNo, SnapshotId};
 use crate::inode::{Attrs, Kind};
@@ -137,7 +141,14 @@ pub struct SnapshotTree {
   /// The tree.
   pub tree: Tree,
   /// For each node, by index, its inode in the volume.
-  pub inodes: Vec<InodeNo>,
+  pub inodes: Segments<InodeNo>,
+}
+
+impl SnapshotTree {
+  /// Releases one piece — a node's inode, then the tree's pieces — and says whether anything is left (A-160; §4.3).
+  pub fn shed(&mut self) -> bool {
+    self.inodes.shed() || self.tree.shed()
+  }
 }
 
 /// One entry of the directory a [`SnapshotWalk`] is reading.
@@ -148,23 +159,37 @@ struct Row {
 }
 
 /// The walk of a snapshot into the tree the image writer takes, in steps a caller bounds. Directories come in the order
-/// a depth-first walk meets them and each one's entries in name order, so one snapshot always walks to the same tree,
-/// node for node. A file with more than one link is one node, named by each entry.
+/// a depth-first walk meets them and each one's entries in its canonical order, so one snapshot always walks to the
+/// same tree, node for node. A file with more than one link is one node, named by each entry. No step costs what a
+/// directory holds: a directory is read an entry a step through a cursor into the snapshot's own directory, which
+/// nothing changes while the snapshot lives, and closed an entry a step. Before (2026-10-24, `image_bench`'s least time
+/// of each unit over five rounds, Apple M5 Max): a directory of 100,000 entries was read whole, every name copied and
+/// sorted, in one step of 12,035 µs.
 #[derive(Debug)]
 pub struct SnapshotWalk {
   snapshot: SnapshotId,
   /// The tree so far; taken when the walk ends.
   grower: Option<TreeGrower>,
-  inodes: Vec<InodeNo>,
+  inodes: Segments<InodeNo>,
   /// The node each inode with more than one link became.
   linked: BTreeMap<InodeNo, NodeId>,
   /// Directories named and still to read.
-  pending: Vec<(Handle<DirNode>, NodeId)>,
-  /// The entries of the directory being read, still to add.
-  reading: Option<VecDeque<Row>>,
+  pending: Segments<(Handle<DirNode>, NodeId)>,
+  /// The directory being read.
+  reading: Option<Reading>,
   /// The entries read so far, held to `most`.
   entries: usize,
   most: usize,
+}
+
+/// The directory a [`SnapshotWalk`] is reading: its node in the snapshot, where the reading stands, the entries read
+/// (whiteouts among them, so the count can be held to the directory's), and whether its close has begun.
+#[derive(Debug)]
+struct Reading {
+  directory: Handle<DirNode>,
+  cursor: DirCursor,
+  read: usize,
+  closing: bool,
 }
 
 impl SnapshotWalk {
@@ -186,12 +211,15 @@ impl SnapshotWalk {
       .inode;
     let attrs = volume.stat_in(store, snapshot, root_no)?;
     let grower = TreeGrower::new(node_of(ImageKind::Directory, &attrs))?;
+    let (mut inodes, mut pending) = (Segments::new(), Segments::new());
+    inodes.push(root_no);
+    pending.push((root, NodeId::ROOT));
     Ok(SnapshotWalk {
       snapshot,
       grower: Some(grower),
-      inodes: vec![root_no],
+      inodes,
       linked: BTreeMap::new(),
-      pending: vec![(root, NodeId::ROOT)],
+      pending,
       reading: None,
       entries: 0,
       most,
@@ -199,7 +227,7 @@ impl SnapshotWalk {
   }
 
   /// Walks until at least `budget` bytes are handled (names read, attributes and targets copied) or the tree is
-  /// whole: at least one entry, or one directory opened or closed, a step. The tree once whole.
+  /// whole: at least one entry read, or one directory opened or one of its entries closed, a step. The tree once whole.
   pub fn step(
     &mut self,
     volume: &Volume,
@@ -220,9 +248,20 @@ impl SnapshotWalk {
     }
   }
 
-  /// The tree, once every directory is read.
+  /// Releases one piece of what the walk holds — the tree so far, then its tables — and says whether anything is
+  /// left: a walk refused or abandoned part way is released a piece a call (A-160; §4.3).
+  pub fn shed(&mut self) -> bool {
+    self.reading = None;
+    if self.grower.as_mut().is_some_and(TreeGrower::shed) {
+      return true;
+    }
+    self.pending.shed() || self.inodes.shed() || self.linked.pop_first().is_some()
+  }
+
+  /// The tree, once every directory is read. The walk keeps the rest (its grower's checks, the linked inodes) for
+  /// [`SnapshotWalk::shed`] to release a piece a call.
   fn finish(&mut self) -> Result<SnapshotTree, ImageError> {
-    let grower = self.grower.take().ok_or(ImageRefusal::GrowthOutOfOrder {
+    let grower = self.grower.as_mut().ok_or(ImageRefusal::GrowthOutOfOrder {
       reason: "a walk stepped after its end",
     })?;
     Ok(SnapshotTree {
@@ -231,43 +270,61 @@ impl SnapshotWalk {
     })
   }
 
-  /// One unit: an entry of the directory being read, its close, or the next directory's open. Its cost in bytes, or
-  /// `None` once nothing is left.
+  /// One unit: an entry of the directory being read, an entry of its close, or the next directory's open. Its cost in
+  /// bytes, or `None` once nothing is left.
   fn advance(&mut self, volume: &Volume, store: &Store) -> Result<Option<u64>, ImageError> {
     let grower = self.grower.as_mut().ok_or(ImageRefusal::GrowthOutOfOrder {
       reason: "a walk stepped after its end",
     })?;
-    if let Some(rows) = self.reading.as_mut() {
-      if let Some(row) = rows.pop_front() {
-        return self.add_entry(volume, store, row).map(Some);
+    if let Some(reading) = self.reading.as_mut() {
+      if reading.closing {
+        if grower.close()? {
+          self.reading = None;
+        }
+        return Ok(Some(0));
       }
-      grower.close()?;
-      self.reading = None;
-      return Ok(Some(0));
+      let node = store
+        .dirs
+        .get(reading.directory)
+        .map_err(|_| VfsError::StaleHandle)?;
+      let Some(entry) = node.next_entry(&store.blocks, &mut reading.cursor) else {
+        // Every entry of the snapshot's directory is read, or the reading ended short: a block the snapshot reaches
+        // could not be read. A short directory would make the image miss names and a merge remove them, so it is
+        // refused.
+        if reading.read != node.len() {
+          return Err(ImageError::Inconsistent {
+            reason: "a directory read short of its entries",
+          });
+        }
+        reading.closing = true;
+        if grower.close()? {
+          self.reading = None;
+        }
+        return Ok(Some(0));
+      };
+      reading.read = reading.read.saturating_add(1);
+      let row = Row {
+        name: entry.name.to_owned(),
+        child: entry.child,
+      };
+      return self.add_entry(volume, store, row).map(Some);
     }
     let Some((directory, id)) = self.pending.pop() else {
       return Ok(None);
     };
     grower.open(id)?;
-    let node = store
+    let cursor = store
       .dirs
       .get(directory)
-      .map_err(|_| VfsError::StaleHandle)?;
-    let mut rows: Vec<Row> = node
-      .iter(&store.blocks)
-      .filter(|entry| !matches!(entry.child, Child::Whiteout))
-      .map(|entry| Row {
-        name: entry.name.to_owned(),
-        child: entry.child,
-      })
-      .collect();
-    rows.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
-    let cost = rows
-      .iter()
-      .map(|row| u64::try_from(row.name.len()).unwrap_or(u64::MAX))
-      .fold(0u64, u64::saturating_add);
-    self.reading = Some(rows.into());
-    Ok(Some(cost))
+      .map_err(|_| VfsError::StaleHandle)?
+      .cursor(&store.blocks);
+    self.reading = Some(Reading {
+      directory,
+      cursor,
+      read: 0,
+      closing: false,
+    });
+    Ok(Some(0))
   }
 
   /// Adds the entry `row` to the directory being read, making its node the first time an entry names it. Its cost: the
@@ -369,7 +426,7 @@ pub struct BuildIo<'a> {
   /// The snapshot walked.
   pub snapshot: SnapshotId,
   /// For each node of the tree being written, its inode in `source` ([`SnapshotTree::inodes`]).
-  pub inodes: &'a [InodeNo],
+  pub inodes: &'a Segments<InodeNo>,
   /// The volume the image is written into.
   pub image: &'a mut Volume,
   /// The image file in `image`, already sized to the image.
@@ -498,15 +555,27 @@ pub struct MergeReport {
 /// Where a merge is.
 #[derive(Debug)]
 enum Phase {
+  /// Sizing the tables, a slot of each a unit, until each holds one for every node or entry it is kept for; `trusted`
+  /// says whether the build's nodes are identified after.
+  Prepare { trusted: bool },
   /// Identifying image node `node` with the build's node.
   Identify { node: usize },
+  /// Under folded names, indexing image node `node`'s entry `entry` by its folded name.
+  Index { node: usize, entry: usize },
   /// Planning base directory `node`'s entry `entry`.
   Plan { node: usize, entry: usize },
-  /// Attaching the image's entries: the directories still to visit, and the one being visited with its next entry.
-  Attach {
-    queue: VecDeque<usize>,
-    current: Option<(usize, usize)>,
+  /// Trying the staging name with counter `counter`; then planning base directory `node`'s entry `entry` again.
+  Stage {
+    counter: u64,
+    node: usize,
+    entry: usize,
   },
+  /// Releasing the folded index, an entry a unit.
+  Unindex,
+  /// Attaching the image's entries depth first: each frame a directory and its next entry, the deepest on top. A
+  /// directory's own entry is attached before its frame is pushed, so every directory is in its place before its
+  /// entries are, whatever the tree's numbering; the stack is as deep as the tree and empty at the end.
+  Attach { stack: Segments<(usize, usize)> },
   /// Removing base node `node`'s noted names: every node's that is not a directory, `node` counting up; then the
   /// directories', `node` counting down from one past the last.
   Remove { node: usize, directories: bool },
@@ -519,28 +588,31 @@ enum Phase {
 }
 
 /// The merge of an image's tree into a clone of the snapshot it was built from, in steps a caller bounds (the module
-/// doc states the phases). The clone is the caller's, untouched by anything else while the merge runs.
+/// doc states the phases). The clone is the caller's, untouched by anything else while the merge runs. No step costs
+/// what the trees hold: the tables grow a slot a step, a folded index is built and released an entry a step, a
+/// staging name is sought a counter a step, and what the merge holds is released a piece a [`Merge::shed`]. Before
+/// (2026-10-24, `tests/image_cost.rs`): the tables were made whole in one call, and a directory's folded lookup was
+/// built whole, a name copied for each entry, in the step that first needed it.
 pub struct Merge {
   base: SnapshotTree,
   target: ImageTree,
   /// For each image node, the base node it is, if it is the build's.
-  identity: Vec<Option<usize>>,
+  identity: Segments<Option<usize>>,
   /// For each base node, the image node that is it.
-  image_of: Vec<Option<usize>>,
+  image_of: Segments<Option<usize>>,
   /// For each image node, its inode in the clone, once known.
-  inode: Vec<Option<InodeNo>>,
+  inode: Segments<Option<InodeNo>>,
   /// For each base node, its names the image does not keep, where they are now: a directory's inode and a name.
-  old_names: Vec<Vec<(InodeNo, String)>>,
-  /// For each image node, where its entries start in `kept`.
-  entry_start: Vec<usize>,
-  /// For each image entry, whether the base holds it already.
-  kept: Vec<bool>,
+  old_names: Segments<Vec<(InodeNo, String)>>,
+  /// For each image entry, by its index among all the image tree's entries ([`Tree::first_entry`]), whether the base
+  /// holds it already.
+  kept: Segments<bool>,
+  /// Under folded names, each image directory's entries by folded name: the entry's index in its directory.
+  folded: BTreeMap<(usize, String), usize>,
   /// The staging directory, once made: its inode and its name in the clone's root.
   staging: Option<(InodeNo, String)>,
   /// The names moved aside so far, which numbers the next.
   staged_names: u64,
-  /// The image directory being planned against, by base directory, and its entries' lookup when names fold.
-  folded: Option<(usize, Vec<(String, usize)>)>,
   policy: NameEquivalence,
   /// The bytes compared, and written when they differ, a step: the store's granule.
   unit: u64,
@@ -568,25 +640,18 @@ impl Merge {
     store: &Store,
     trusted: bool,
   ) -> Merge {
-    let base_nodes = base.tree.nodes().len();
-    let image_nodes = target.tree.nodes().len();
     Merge {
-      identity: vec![None; image_nodes],
-      image_of: vec![None; base_nodes],
-      inode: vec![None; image_nodes],
-      old_names: vec![Vec::new(); base_nodes],
-      entry_start: vec![0; image_nodes],
-      kept: Vec::new(),
+      identity: Segments::new(),
+      image_of: Segments::new(),
+      inode: Segments::new(),
+      old_names: Segments::new(),
+      kept: Segments::new(),
+      folded: BTreeMap::new(),
       staging: None,
       staged_names: 0,
-      folded: None,
       policy: clone.policy,
       unit: u64::try_from(store.content.granule().max(1)).unwrap_or(u64::MAX),
-      phase: if trusted {
-        Phase::Identify { node: 0 }
-      } else {
-        Phase::Identify { node: usize::MAX }
-      },
+      phase: Phase::Prepare { trusted },
       base,
       target,
       report: MergeReport::default(),
@@ -620,6 +685,29 @@ impl Merge {
     }
   }
 
+  /// Releases one piece of what the merge holds — the folded index, the tables, then the two trees — and says whether
+  /// anything is left: a merge of any size, finished or refused part way, is released a piece a call, never in one
+  /// drop (A-160; §4.3). Once shedding begins the merge is over: a step after it answers the report so far.
+  pub fn shed(&mut self) -> bool {
+    self.phase = Phase::Done;
+    if self.folded.pop_first().is_some() || self.kept.shed() {
+      return true;
+    }
+    if self
+      .old_names
+      .last_mut()
+      .is_some_and(|names| names.pop().is_some())
+    {
+      return true;
+    }
+    self.old_names.shed()
+      || self.inode.shed()
+      || self.image_of.shed()
+      || self.identity.shed()
+      || self.target.shed()
+      || self.base.shed()
+  }
+
   /// One item of the phase the merge is in; its cost in bytes.
   fn advance(
     &mut self,
@@ -628,9 +716,17 @@ impl Merge {
     content: &mut dyn MergeContent,
   ) -> Result<u64, ImageError> {
     match std::mem::replace(&mut self.phase, Phase::Done) {
+      Phase::Prepare { trusted } => Ok(self.prepare(trusted)),
       Phase::Identify { node } => self.identify(clone, store, node),
+      Phase::Index { node, entry } => Ok(self.index(node, entry)),
       Phase::Plan { node, entry } => self.plan(clone, store, node, entry),
-      Phase::Attach { queue, current } => self.attach(clone, store, queue, current),
+      Phase::Stage {
+        counter,
+        node,
+        entry,
+      } => self.stage(clone, store, counter, node, entry),
+      Phase::Unindex => Ok(self.unindex()),
+      Phase::Attach { stack } => self.attach(clone, store, stack),
       Phase::Remove { node, directories } => self.remove(clone, store, node, directories),
       Phase::Unstage => self.unstage(clone, store),
       Phase::Settle { node, offset } => self.settle(clone, store, content, node, offset),
@@ -638,28 +734,51 @@ impl Merge {
     }
   }
 
-  /// Identifies image node `node` with the build's node; after the last node, the roots with each other, where each
-  /// node's entries start, and the plan. An untrusted image (`node` past every node) identifies only the roots.
+  /// Adds a slot to every table not yet whole — the identity and the clone inode per image node, the image node and
+  /// the old names per base node, the kept flag per image entry; once all are whole, identification begins (an image
+  /// that is not the build's identifies only the roots). Each unit grows each table by one at most.
+  fn prepare(&mut self, trusted: bool) -> u64 {
+    let mut grew = false;
+    if self.identity.len() < self.target.tree.node_count() {
+      self.identity.push(None);
+      self.inode.push(None);
+      grew = true;
+    }
+    if self.image_of.len() < self.base.tree.node_count() {
+      self.image_of.push(None);
+      self.old_names.push(Vec::new());
+      grew = true;
+    }
+    if self.kept.len() < self.target.tree.total_entries() {
+      self.kept.push(false);
+      grew = true;
+    }
+    self.phase = match (grew, trusted) {
+      (true, _) => Phase::Prepare { trusted },
+      (false, true) => Phase::Identify { node: 0 },
+      (false, false) => Phase::Identify { node: usize::MAX },
+    };
+    1
+  }
+
+  /// Identifies image node `node` with the build's node; after the last node, the roots with each other, and then the
+  /// folded index or the plan. An untrusted image (`node` past every node) identifies only the roots.
   fn identify(&mut self, clone: &Volume, store: &Store, node: usize) -> Result<u64, ImageError> {
-    let count = self.target.tree.nodes().len();
-    if node >= count {
-      // The roots are one another whatever the image is; the entries' offsets are counted for every node.
-      if let (Some(slot), Some(back)) = (self.identity.first_mut(), self.image_of.first_mut()) {
+    if node >= self.target.tree.node_count() {
+      // The roots are one another whatever the image is.
+      if let (Some(slot), Some(back)) = (self.identity.get_mut(0), self.image_of.get_mut(0)) {
         *slot = Some(0);
         *back = Some(0);
         self.report.kept = self.report.kept.saturating_add(1);
       }
-      let mut start = 0usize;
-      for (id, offset) in self.target.tree.ids().zip(self.entry_start.iter_mut()) {
-        *offset = start;
-        start = start.saturating_add(self.target.tree.children(id).len());
-      }
-      self.kept = vec![false; start];
-      if let Some(root) = self.inode.first_mut() {
+      if let Some(root) = self.inode.get_mut(0) {
         *root = Some(clone.root_inode(store)?);
       }
-      self.phase = Phase::Plan { node: 0, entry: 0 };
-      return Ok(u64::try_from(count).unwrap_or(u64::MAX));
+      self.phase = match self.policy {
+        NameEquivalence::Fold => Phase::Index { node: 0, entry: 0 },
+        NameEquivalence::Exact => Phase::Plan { node: 0, entry: 0 },
+      };
+      return Ok(1);
     }
     if let Some(base) = self.build_node_of(node) {
       if let Some(slot) = self.identity.get_mut(node) {
@@ -703,49 +822,46 @@ impl Merge {
     same.then_some(base)
   }
 
-  /// The staging directory, made in the clone's root under the first name neither root holds the first time an entry
-  /// is moved aside.
-  fn staging(&mut self, clone: &mut Volume, store: &mut Store) -> Result<InodeNo, ImageError> {
-    if let Some((directory, _)) = &self.staging {
-      return Ok(*directory);
-    }
-    let root = clone.root_inode(store)?;
-    let policy = self.policy;
-    let taken = |name: &str| {
-      let in_base = self
-        .base
-        .tree
-        .children(NodeId::ROOT)
-        .iter()
-        .any(|(held, _)| std::str::from_utf8(held).is_ok_and(|held| policy.same(held, name)));
-      let in_image = self
-        .target
-        .tree
-        .children(NodeId::ROOT)
-        .iter()
-        .any(|(held, _)| std::str::from_utf8(held).is_ok_and(|held| policy.same(held, name)));
-      in_base || in_image
+  /// Indexes image node `node`'s entry `entry` by its folded name; then the next entry, the next node's, or the plan.
+  /// A name that is not UTF-8 is left out (no volume name matches it, and the attach refuses it by its path); of two
+  /// names one under folding the first in name order is kept, as the volume holds one of them only.
+  fn index(&mut self, node: usize, entry: usize) -> u64 {
+    let Some(id) = self.target.tree.id(node) else {
+      self.phase = Phase::Plan { node: 0, entry: 0 };
+      return 0;
     };
-    // Each name either root holds rules out one counter, so the first free one is within one past their entries.
-    let most = self
-      .base
-      .tree
-      .children(NodeId::ROOT)
-      .len()
-      .saturating_add(self.target.tree.children(NodeId::ROOT).len())
-      .saturating_add(1);
-    let name = (0..most)
-      .map(|counter| format!("{STAGING_PREFIX}{counter}"))
-      .find(|name| !taken(name))
-      .ok_or(ImageError::Inconsistent {
-        reason: "no staging name free",
-      })?;
-    let directory = clone.mkdir_no(store, root, &name, STAGING_PERMISSIONS)?;
-    self.staging = Some((directory, name));
-    Ok(directory)
+    let Some((name, _)) = self.target.tree.entry(id, entry) else {
+      self.phase = Phase::Index {
+        node: node.saturating_add(1),
+        entry: 0,
+      };
+      return 0;
+    };
+    let cost = u64::try_from(name.len()).unwrap_or(u64::MAX);
+    if let Ok(name) = std::str::from_utf8(name) {
+      let folded = self.policy.fold(name).into_owned();
+      self.folded.entry((node, folded)).or_insert(entry);
+    }
+    self.phase = Phase::Index {
+      node,
+      entry: entry.saturating_add(1),
+    };
+    cost
   }
 
-  /// Plans base directory `node`'s entry `entry` against the image: kept, moved aside to free its name, or noted.
+  /// Releases the folded index an entry a unit; then the attach.
+  fn unindex(&mut self) -> u64 {
+    if self.folded.pop_first().is_some() {
+      self.phase = Phase::Unindex;
+      return 1;
+    }
+    self.phase = attach_from_root();
+    0
+  }
+
+  /// Plans base directory `node`'s entry `entry` against the image: kept, moved aside to free its name, or noted. An
+  /// entry to move aside before the staging directory exists waits for it: the staging name is sought first, and the
+  /// entry planned again.
   fn plan(
     &mut self,
     clone: &mut Volume,
@@ -754,51 +870,61 @@ impl Merge {
     entry: usize,
   ) -> Result<u64, ImageError> {
     let Some(base_id) = self.base.tree.id(node) else {
-      self.phase = Phase::Attach {
-        queue: VecDeque::from([0]),
-        current: None,
+      self.phase = if self.folded.is_empty() {
+        attach_from_root()
+      } else {
+        Phase::Unindex
       };
       return Ok(0);
     };
-    let Some((name, child)) = self.base.tree.children(base_id).get(entry).cloned() else {
-      self.folded = None;
+    let Some((name, child)) = self.base.tree.entry(base_id, entry) else {
       self.phase = Phase::Plan {
         node: node.saturating_add(1),
         entry: 0,
       };
       return Ok(0);
     };
-    self.phase = Phase::Plan {
-      node,
-      entry: entry.saturating_add(1),
-    };
-    let name = String::from_utf8(name).map_err(|_| ImageError::Inconsistent {
-      reason: "a volume name not UTF-8",
-    })?;
+    let name = std::str::from_utf8(name)
+      .map_err(|_| ImageError::Inconsistent {
+        reason: "a volume name not UTF-8",
+      })?
+      .to_owned();
     let cost = u64::try_from(name.len()).unwrap_or(u64::MAX);
     let parent = *self.base.inodes.get(node).ok_or(ImageError::Inconsistent {
       reason: "a base node without an inode",
     })?;
+    let next = Phase::Plan {
+      node,
+      entry: entry.saturating_add(1),
+    };
     let Some(image_dir) = self.image_of.get(node).copied().flatten() else {
       // A directory the image no longer holds: every entry of it is noted, to be moved out or removed.
       self.note(child.index(), parent, name)?;
+      self.phase = next;
       return Ok(cost);
     };
-    match self.image_entry(node, image_dir, &name) {
+    match self.image_entry(image_dir, &name) {
       Some((index, image_child)) => {
         if self.identity.get(image_child).copied().flatten() == Some(child.index()) {
           let slot = self
-            .entry_start
-            .get(image_dir)
-            .copied()
-            .unwrap_or(0)
+            .target
+            .tree
+            .id(image_dir)
+            .map_or(0, |id| self.target.tree.first_entry(id))
             .saturating_add(index);
           if let Some(kept) = self.kept.get_mut(slot) {
             *kept = true;
           }
         } else {
           // The image gives this name to another node: the entry moves aside, freeing the name.
-          let staging = self.staging(clone, store)?;
+          let Some(staging) = self.staging.as_ref().map(|(directory, _)| *directory) else {
+            self.phase = Phase::Stage {
+              counter: 0,
+              node,
+              entry,
+            };
+            return Ok(cost);
+          };
           let aside = format!("{STAGED_PREFIX}{}", self.staged_names);
           self.staged_names = self.staged_names.saturating_add(1);
           clone.rename_no(store, parent, &name, staging, &aside)?;
@@ -808,6 +934,53 @@ impl Merge {
       }
       None => self.note(child.index(), parent, name)?,
     }
+    self.phase = next;
+    Ok(cost)
+  }
+
+  /// Tries the staging name with counter `counter`. Held by either root — the clone's, which holds the base's entries
+  /// until the staging directory exists, under the volume's rules, or the image's — the next counter comes in the next
+  /// unit; free, the staging directory is made under it, and base directory `node`'s entry `entry` is planned again. A
+  /// counter a unit, each a lookup, so no unit costs what the roots hold; each name a root holds rules out one counter
+  /// at most, so a free one comes within one past their entries.
+  fn stage(
+    &mut self,
+    clone: &mut Volume,
+    store: &mut Store,
+    counter: u64,
+    node: usize,
+    entry: usize,
+  ) -> Result<u64, ImageError> {
+    let most = self
+      .base
+      .tree
+      .entry_count(NodeId::ROOT)
+      .saturating_add(self.target.tree.entry_count(NodeId::ROOT))
+      .saturating_add(1);
+    if counter > u64::try_from(most).unwrap_or(u64::MAX) {
+      return Err(ImageError::Inconsistent {
+        reason: "no staging name free",
+      });
+    }
+    let name = format!("{STAGING_PREFIX}{counter}");
+    let cost = u64::try_from(name.len()).unwrap_or(u64::MAX);
+    let root = clone.root_inode(store)?;
+    let in_base = match clone.lookup_no(store, root, &name) {
+      Ok(_) => true,
+      Err(VfsError::NotFound) => false,
+      Err(error) => return Err(error.into()),
+    };
+    if in_base || self.image_entry(0, &name).is_some() {
+      self.phase = Phase::Stage {
+        counter: counter.saturating_add(1),
+        node,
+        entry,
+      };
+      return Ok(cost);
+    }
+    let directory = clone.mkdir_no(store, root, &name, STAGING_PERMISSIONS)?;
+    self.staging = Some((directory, name));
+    self.phase = Phase::Plan { node, entry };
     Ok(cost)
   }
 
@@ -824,55 +997,33 @@ impl Merge {
   }
 
   /// The entry of image directory `image_dir` holding name `name` under the clone's names' rules: its index among the
-  /// directory's entries and its child. Under folding, the directory's lookup is made once, when base directory
-  /// `base_dir` is first planned against it.
-  fn image_entry(
-    &mut self,
-    base_dir: usize,
-    image_dir: usize,
-    name: &str,
-  ) -> Option<(usize, usize)> {
+  /// directory's entries and its child. A binary search of the directory under exact names; a lookup of the folded
+  /// index under folded ones.
+  fn image_entry(&self, image_dir: usize, name: &str) -> Option<(usize, usize)> {
     let id = self.target.tree.id(image_dir)?;
-    let children = self.target.tree.children(id);
     match self.policy {
-      NameEquivalence::Exact => children
-        .binary_search_by(|(held, _)| held.as_slice().cmp(name.as_bytes()))
-        .ok()
-        .and_then(|index| Some((index, children.get(index)?.1.index()))),
+      NameEquivalence::Exact => self
+        .target
+        .tree
+        .find(id, name.as_bytes())
+        .map(|(index, child)| (index, child.index())),
       NameEquivalence::Fold => {
-        if self.folded.as_ref().is_none_or(|(dir, _)| *dir != base_dir) {
-          let mut lookup: Vec<(String, usize)> = children
-            .iter()
-            .enumerate()
-            .filter_map(|(index, (held, _))| {
-              let held = std::str::from_utf8(held).ok()?;
-              Some((self.policy.fold(held).into_owned(), index))
-            })
-            .collect();
-          lookup.sort();
-          self.folded = Some((base_dir, lookup));
-        }
-        let folded = self.policy.fold(name);
-        let (_, lookup) = self.folded.as_ref()?;
-        let at = lookup
-          .binary_search_by(|(held, _)| held.as_str().cmp(folded.as_ref()))
-          .ok()?;
-        let index = lookup.get(at)?.1;
-        Some((index, children.get(index)?.1.index()))
+        let key = (image_dir, self.policy.fold(name).into_owned());
+        let index = *self.folded.get(&key)?;
+        Some((index, self.target.tree.entry(id, index)?.1.index()))
       }
     }
   }
 
-  /// Attaches the next image entry: the image's directories visited from the root, breadth first.
+  /// Attaches the next entry of the directory on top of `stack`, pushing a frame for it when it is a directory; or,
+  /// that directory's entries all attached, pops its frame; or, the stack empty, moves on to the removal.
   fn attach(
     &mut self,
     clone: &mut Volume,
     store: &mut Store,
-    mut queue: VecDeque<usize>,
-    current: Option<(usize, usize)>,
+    mut stack: Segments<(usize, usize)>,
   ) -> Result<u64, ImageError> {
-    let Some((directory, entry)) = current.or_else(|| queue.pop_front().map(|next| (next, 0)))
-    else {
+    let Some((directory, entry)) = stack.last().copied() else {
       self.phase = Phase::Remove {
         node: 0,
         directories: false,
@@ -886,29 +1037,19 @@ impl Merge {
       .ok_or(ImageError::Inconsistent {
         reason: "an image directory out of range",
       })?;
-    let Some((name, child)) = self.target.tree.children(id).get(entry).cloned() else {
-      self.phase = Phase::Attach {
-        queue,
-        current: None,
-      };
+    let Some((name, child)) = self.target.tree.entry(id, entry) else {
+      stack.pop();
+      self.phase = Phase::Attach { stack };
       return Ok(0);
     };
+    let name = name.to_vec();
     let cost = u64::try_from(name.len()).unwrap_or(u64::MAX);
-    let child = child.index();
     let is_directory = matches!(
-      self
-        .target
-        .tree
-        .node(id_of(&self.target.tree, child)?)
-        .map(|node| &node.kind),
+      self.target.tree.node(child).map(|node| &node.kind),
       Some(ImageKind::Directory)
     );
-    let slot = self
-      .entry_start
-      .get(directory)
-      .copied()
-      .unwrap_or(0)
-      .saturating_add(entry);
+    let child = child.index();
+    let slot = self.target.tree.first_entry(id).saturating_add(entry);
     if self.kept.get(slot).copied().unwrap_or(false) {
       let base = self
         .identity
@@ -925,13 +1066,13 @@ impl Merge {
     } else {
       self.attach_entry(clone, store, directory, &name, child)?;
     }
-    if is_directory {
-      queue.push_back(child);
+    if let Some(top) = stack.last_mut() {
+      top.1 = entry.saturating_add(1);
     }
-    self.phase = Phase::Attach {
-      queue,
-      current: Some((directory, entry.saturating_add(1))),
-    };
+    if is_directory {
+      stack.push((child, 0));
+    }
+    self.phase = Phase::Attach { stack };
     Ok(cost)
   }
 
@@ -1033,8 +1174,8 @@ impl Merge {
   fn path_of(&self, directory: usize, name: &[u8]) -> String {
     let mut parts: Vec<Vec<u8>> = vec![name.to_vec()];
     let mut at = self.target.tree.id(directory);
-    // A tree's depth is below its node count, so the walk up ends.
-    for _ in 0..self.target.tree.nodes().len() {
+    // A tree's depth is below its node count, so the walk up ends. A refusal's words, made once as the merge stops.
+    for _ in 0..self.target.tree.node_count() {
       let Some(id) = at.filter(|id| *id != NodeId::ROOT) else {
         break;
       };
@@ -1042,11 +1183,10 @@ impl Merge {
       if let Some((held, _)) = self
         .target
         .tree
-        .children(parent)
-        .iter()
+        .entries(parent)
         .find(|(_, child)| *child == id)
       {
-        parts.push(held.clone());
+        parts.push(held.to_vec());
       }
       at = Some(parent);
     }
@@ -1077,9 +1217,9 @@ impl Merge {
       };
       index
     } else {
-      if node >= self.base.tree.nodes().len() {
+      if node >= self.base.tree.node_count() {
         self.phase = Phase::Remove {
-          node: self.base.tree.nodes().len(),
+          node: self.base.tree.node_count(),
           directories: true,
         };
         return Ok(0);
@@ -1285,6 +1425,13 @@ impl Merge {
     }
     Ok(())
   }
+}
+
+/// The attach's first phase: the root's frame alone on the stack.
+fn attach_from_root() -> Phase {
+  let mut stack = Segments::new();
+  stack.push((0, 0));
+  Phase::Attach { stack }
 }
 
 /// The id of node `index` of `tree`, refused when out of range.

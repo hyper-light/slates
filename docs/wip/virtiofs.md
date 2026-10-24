@@ -252,7 +252,7 @@ box shared with two other builds — timings are not benchmarks)
    | OCI (Docker, Kubernetes on runc) | the host mount bound into the container (A-28, proven 2026-10-19) | not applicable: no VM, the host kernel serves reads |
    | Shards | the host mount shared with `VOLUME … FOR` | Shards' DAX window (D189, `crates/vmm/src/devices/virtio/fs/mod.rs` on `gpu`, read 2026-10-21) maps the host file |
    | QEMU, crosvm, Kubernetes on VM runtimes (Kata) | the host mount shared by virtio-fs (virtiofsd or the VMM's own device) | the sharer's DAX window maps the host file |
-   | Firecracker | **no folder sharing at all** — no virtio-fs (its README, read 2026-10-21) | only a file-backed block or pmem device; a volume must be presented as a disk-image file |
+   | Firecracker | **no folder sharing at all** — no virtio-fs (its README, read 2026-10-21) — so a volume reaches it as a disk-image file: `slates image build` writes a snapshot as ext2 into an image volume, the guest's drive is that file through a slates mount, and `slates image merge` reads the guest's image back into a clone (A-160; built and proven by a real Firecracker v1.17.0 run, 2026-10-24) | pmem would map the image file; not yet run (the proven drive is virtio-blk) |
 
    **What the mount route costs, stated so it is weighed honestly:** every uncached operation crosses two
    filesystems on the host instead of one; DAX maps the host kernel's cached copy of a file rather than slates'
@@ -369,15 +369,32 @@ box shared with two other builds — timings are not benchmarks)
    1c8d17a85. So on an arm64 host the mount route under crosvm serves the guest through its own page cache, without
    DAX.
 
-   Still owed: Shards' DAX window over the macOS mount, and Firecracker's disk-image form. crosvm has prior art for the
-   latter: its experimental `--pmem-ext2` builds an ext2 file system in memory from a host directory and presents it to
-   the guest on a pmem device (`crosvm run --help` and its `ext2` crate, read on the box 2026-10-22).
+   **Firecracker's disk-image form (A-160; built and proven 2026-10-24).** crosvm's experimental `--pmem-ext2` is prior
+   art: it builds an ext2 file system in memory from a host directory and presents it to the guest on a pmem device
+   (`crosvm run --help` and its `ext2` crate, read on the box 2026-10-22). slates' form is a session like any other:
+   - `slates image build ID SNAPSHOT NAME --capacity SIZE` makes a volume whose root holds `image.ext2`, the
+     snapshot's tree as ext2 revision 1 (4 KiB blocks, 256-byte inodes, `filetype`, `sparse_super`, `large_file`). The
+     image volume pins the snapshot.
+   - The guest's drive is that file read through a slates mount (FUSE on Linux), writable, its flushes written through
+     (`cache_type: Writeback`).
+   - `slates image merge IMAGE NAME` reads the image at a snapshot of the image volume and makes a new clone of the
+     build's snapshot hold its tree. A node the build wrote keeps its inode, so a renamed file is renamed and an
+     unchanged file's chunks stay shared. The merge is not an inferred one (D-27): nothing else writes the clone.
+   - Every unit of the build and the merge is bounded: none passed 18.5 µs on the box at 100,000 nodes or entries
+     (BENCHMARKS, 2026-10-24).
+
+   Proven by `crates/cli/tests/guest_image.rs` on the box (gated): Firecracker v1.17.0, the box's 7.2.9 kernel, an
+   initramfs held in a slates volume, the guest reading every node as the volume holds it, then patching, renaming,
+   removing, writing, making a directory and flushing; the merge held the clone to exactly the guest's tree. Its exit
+   on the guest's restart is a race between the keyboard-controller reset and the kernel's triple-fault fallback, which
+   the test takes in either form (GAPS). Still owed: Shards' DAX window over the macOS mount, and a pmem drive (DAX on
+   the image file) under Firecracker.
 
    **What has to be proven, per target, by real runs** (the goal's bar: adversarial and chaos testing at each
    step): the guest or container reads and writes the volume; DAX works where the platform has it, which needs a
    slates mount's files to accept a shared `mmap` from the sharer; changes on either side reach the other; a
    session's writes stay inside its own volume or clone; and nothing breaks when the daemon or the guest goes away.
-   Firecracker needs a new piece — a volume, or a snapshot of one, presented as a disk-image file.
+   Firecracker's piece, a snapshot presented as a disk-image file and merged back, is built (above).
 
    **slates' direct connection** (the VM's virtio-fs device talking to slates itself, built in-process as
    `attach_vhost_user_device` and `shards_fs::serve`) is kept as a later optimization: it removes the host's

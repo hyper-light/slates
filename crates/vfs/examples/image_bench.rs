@@ -1,8 +1,8 @@
 //! The costs of a volume's disk image (A-160; §4.6): what `slates image build` and `slates image merge` spend, phase
-//! by phase, on trees of small, medium and large files. Each phase runs as the daemon runs it: in slices bounded
-//! against the clock ([`SLICE_NS`], half a step quantum; `DaemonConfig::copy_slice_ns`), one unit of work a call. The
-//! longest slice and the longest unit are reported beside the total: the evidence that no step of an image's build or
-//! merge holds its shard past a slice and one unit (§4.3).
+//! by phase, on trees of small, medium and large files, and on the extremes a directory and a tree reach. Each phase
+//! runs as the daemon runs it: in slices bounded against the clock ([`SLICE_NS`], half a step quantum;
+//! `DaemonConfig::copy_slice_ns`), one unit of work a call. The longest unit is reported beside the total: the evidence
+//! that no step of an image's build or merge holds its shard past a slice and one small unit (§4.3).
 //!
 //! The phases:
 //! - **walk**: the snapshot walked into the tree the writer takes (`SnapshotWalk`);
@@ -10,15 +10,23 @@
 //! - **read**: the image opened and its tree walked back out of that file (`Image::open`, `Walk` over
 //!   `SnapshotFile`);
 //! - **merge**: the unchanged image merged into a clone of the snapshot (`Merge` over `ImageContent`), every byte
-//!   compared, none written.
+//!   compared, none written;
+//! - **release**: what the walks, the build and the merge made, released a piece a unit (`shed`), as the daemon
+//!   releases a finished job's after its reply.
 //!
 //! `cargo run --release -p slates-vfs --example image_bench` prints one row per case and phase: the best of
-//! [`ROUNDS`] totals with every round shown, the rate, and the longest slice of the best round that the scheduler left
-//! alone. A slice during which the process was switched out involuntarily (`getrusage`'s count moved) is not judged
-//! by its wall time, as `vfs_bench`'s `destroy_rows` judges: on a loaded machine the scheduler's own quantum would
-//! read as the work's. Those slices are counted, with the longest of them, so none is hidden. **Failures** (the
-//! process exits non-zero): an image that reads back with another node count, or a merge of an unchanged image that
-//! writes a byte or compares fewer bytes than the files hold.
+//! [`ROUNDS`] totals with every round shown, the rate, the best round's slices and the longest of them the machine left
+//! alone, and the units' work. **A unit's work is its least time over the rounds** ([`work_units`]): every round runs
+//! the same units in the same order, so interference must strike one unit in every round to survive the minimum, while
+//! what a unit itself costs — its own allocations' faults among it — is in every round. The units' p50, p99 and longest
+//! work are reported, the longest with its index, beside the longest unit any round saw (the raw). A slice's wall time
+//! cannot tell a unit's cost from the machine's: setting aside slices the process was switched out in or faulted in
+//! (`getrusage`) hid exactly the units that allocate, which were the units that grew with a directory (2026-10-24);
+//! those slices are still counted, with the longest of them. A noise row per case runs trivial units the same way: its
+//! work stays near 0.1 µs while its raw longest meets the machine's interference. The region is faulted in before each
+//! round, as a daemon's arena is (§4.2, D-12). **Failures** (the process exits non-zero): an image that reads back with
+//! another node count, a merge of an unchanged image that writes a byte or compares fewer bytes than the files hold,
+//! or rounds that ran different units.
 
 // A benchmark harness: an unwrap here is a failed run, which is what it should be.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -27,6 +35,7 @@ use std::time::{Duration, Instant};
 
 use slates_image::{Builder, Identity, Image, Progress, Timestamp, Walk, Walked};
 use slates_mem::arena::ChunkArena;
+use slates_mem::prefault::{PreFault, Progress as Faulted};
 use slates_mem::region::Region;
 use slates_vfs::clock::StepClock;
 use slates_vfs::ids::SnapshotId;
@@ -42,16 +51,24 @@ const ROUNDS: usize = 5;
 const SLICE_NS: u64 = 23_700;
 /// Format: the byte budget each unit's call is given: one, so every call does exactly one unit.
 const ONE_UNIT: u64 = 1;
-/// Shape: the cases — a name, the files, each file's bytes, and the files per directory.
-const CASES: [(&str, usize, usize, usize); 3] = [
-  ("10,000 files of 4 KiB", 10_000, 4 << 10, 250),
-  ("1,000 files of 64 KiB", 1_000, 64 << 10, 100),
+/// Shape: the pieces a release unit frees, as the daemon's (`slates-server`'s `SHED_PIECES`).
+const SHED_PIECES: usize = 64;
+/// Shape: the cases — a name, the files, each file's bytes, and the files per directory. The first three are trees of
+/// small, medium and large files; the last three the extremes, a directory of 20,000 and of 100,000 entries and a tree of
+/// 100,000 nodes, where any unit whose work grows with a directory or a tree shows.
+const CASES: [(&str, usize, usize, usize); 6] = [
+  ("10k files of 4 KiB", 10_000, 4 << 10, 250),
+  ("1k files of 64 KiB", 1_000, 64 << 10, 100),
   ("64 files of 1 MiB", 64, 1 << 20, 64),
+  ("20k files of 64 B in one directory", 20_000, 64, 20_000),
+  ("100k empty files in one directory", 100_000, 0, 100_000),
+  ("100k empty files in 100 directories", 100_000, 0, 1_000),
 ];
 /// Format: the page size (the store's granule).
 const PAGE: usize = 4096;
-/// Shape: the RAM region the store maps (address space; only what is written is touched).
-const REGION_BYTES: usize = 1 << 31;
+/// Shape: the RAM region the store maps, every page faulted in before a round (as a daemon's arena is, by its
+/// pre-fault scheduler, §4.2, D-12): room for the largest case's source and image several times over.
+const REGION_BYTES: usize = 1 << 29;
 /// Shape: the store's inode and directory caps, above the largest case's population in its three volumes.
 const MAX_INODES: usize = 1 << 17;
 /// Shape: the store's directory-node and block caps.
@@ -60,8 +77,11 @@ const MAX_DIRS: usize = 1 << 15;
 const MAX_CHUNKS: usize = 1 << 17;
 /// Shape: each volume's quota, far above what any case writes.
 const QUOTA: u64 = 1 << 30;
-/// Shape: the journal's bytes, so the largest case's operations stay recorded.
-const JOURNAL_BYTES: usize = 1 << 26;
+/// Shape: the journal's starting budget, the daemon's floor of one page (`journal_floor_bytes`, §4.5, A-157): with no
+/// reader open, the oldest record leaves as the newest lands, so a volume no mount reads keeps a page of records. A
+/// larger start measures a ring the daemon never grows: its doublings copied the whole log in one write (2.75 MiB at
+/// 16,384 records, a 302 µs unit, 2026-10-24).
+const JOURNAL_BYTES: usize = PAGE;
 /// Format: the cache line.
 const CACHE_LINE: usize = 64;
 /// Shape: the small-directory cut-over, the store's measured default range.
@@ -79,11 +99,15 @@ const IDENTITY: Identity = Identity {
 /// Format: the nanoseconds a clock starts at, a thousand seconds past the epoch, inside the image format's range.
 const CLOCK_START_NS: u64 = 1_000 * 1_000_000_000;
 
+/// A store over one region, its pages faulted in first. A daemon's arena is pre-faulted on its idle time (§4.2, D-12)
+/// and never faults on a write; a raw region's first touch would charge the kernel's fault to the image's work (on the
+/// box, with transparent huge pages, one fault zeroing 2 MiB in 80–112 µs every 512 blocks written, 2026-10-24).
 fn store() -> Store {
+  let mut region = Region::map(REGION_BYTES, PAGE, false).unwrap();
+  let mut prefault = PreFault::new(u64::MAX, 1);
+  while prefault.step(&mut region) != Faulted::Done {}
   let mut arena = ChunkArena::new(PAGE);
-  arena
-    .add_region(Region::map(REGION_BYTES, PAGE, false).unwrap())
-    .unwrap();
+  arena.add_region(region).unwrap();
   Store::new(
     &StoreConfig {
       page: PAGE,
@@ -136,47 +160,82 @@ fn source(
   (volume, snapshot)
 }
 
-/// One phase's time: its total and slices, its longest slice the scheduler left alone and its longest unit, and the
-/// slices it did not leave alone.
+/// One phase's time in one round: its total and slices, its longest slice the machine left alone, the slices it did
+/// not, and every unit's time in the order the units ran.
 #[derive(Clone, Default)]
 struct Timed {
   total: Duration,
   slices: usize,
   longest: Duration,
-  longest_unit: Duration,
-  preempted: usize,
-  longest_preempted: Duration,
-  /// Every unit's time in the slices the scheduler left alone, for the units' percentiles.
+  disturbed: usize,
+  longest_disturbed: Duration,
+  /// Every unit's time, in order. Every round runs the same units in the same order (one snapshot, one layout, one
+  /// merge), so a unit's least time over the rounds is its work's ([`work_units`]).
   units: Vec<Duration>,
 }
 
+/// The process's context switches (involuntary and voluntary: preempted, or made to wait in the kernel) and minor page
+/// faults so far.
+fn disturbances() -> (i64, i64) {
+  let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+  // SAFETY: `getrusage` fills the `rusage` the pointer names and returns zero on success; the buffer is ours, fully
+  // sized and zeroed before the call, and read only once it succeeded.
+  let usage = unsafe {
+    if libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) != 0 {
+      return (0, 0);
+    }
+    usage.assume_init()
+  };
+  (
+    usage.ru_nivcsw.saturating_add(usage.ru_nvcsw),
+    usage.ru_minflt,
+  )
+}
+
 impl Timed {
-  /// Counts a slice of `took` whose longest unit took `unit`, begun when the involuntary-switch count read `before`.
-  fn slice(&mut self, took: Duration, before: Option<u64>, units: &[Duration]) {
+  /// Counts a slice of `took` whose units took `units`, begun when the disturbances read `before`.
+  fn slice(&mut self, took: Duration, before: (i64, i64), units: &[Duration]) {
     self.total += took;
     self.slices += 1;
-    // A preempted slice's units are not judged either: the switch may have fallen inside any of them.
-    if slates_machine::bench::involuntary_switches_since(before)
-      .is_some_and(|switches| switches > 0)
-    {
-      self.preempted += 1;
-      self.longest_preempted = self.longest_preempted.max(took);
+    self.units.extend_from_slice(units);
+    let (switches, faults) = disturbances();
+    if switches > before.0 || faults > before.1 {
+      self.disturbed += 1;
+      self.longest_disturbed = self.longest_disturbed.max(took);
     } else {
       self.longest = self.longest.max(took);
-      for unit in units {
-        self.longest_unit = self.longest_unit.max(*unit);
-      }
-      self.units.extend_from_slice(units);
     }
   }
+}
 
-  /// The units' time at quantile `per_mille`, in the slices the scheduler left alone.
-  fn unit_quantile(&self, per_mille: usize) -> Duration {
-    let mut sorted = self.units.clone();
-    sorted.sort_unstable();
-    let at = (sorted.len().saturating_sub(1) * per_mille) / 1_000;
-    sorted.get(at).copied().unwrap_or_default()
-  }
+/// Each unit's work: its least time over the rounds. Interference has to strike the same unit in every round to
+/// survive the minimum, while what the unit itself costs — the faults its own allocations take among it — is in every
+/// round's time. A slice's wall time cannot tell the two apart: a unit that allocates is a disturbed slice by its own
+/// doing, and setting such slices aside hid exactly the units that grow with a directory (2026-10-24).
+fn work_units(rounds: &[&Timed]) -> Vec<Duration> {
+  let count = rounds.first().map_or(0, |timed| timed.units.len());
+  assert!(
+    rounds.iter().all(|timed| timed.units.len() == count),
+    "every round runs the same units"
+  );
+  (0..count)
+    .map(|index| {
+      rounds
+        .iter()
+        .filter_map(|timed| timed.units.get(index))
+        .min()
+        .copied()
+        .unwrap_or_default()
+    })
+    .collect()
+}
+
+/// The time at quantile `per_mille` of `units`.
+fn quantile(units: &[Duration], per_mille: usize) -> Duration {
+  let mut sorted = units.to_vec();
+  sorted.sort_unstable();
+  let at = (sorted.len().saturating_sub(1) * per_mille) / 1_000;
+  sorted.get(at).copied().unwrap_or_default()
 }
 
 /// Runs `unit` — one unit of a phase, `Some` once the phase is whole — in slices of [`SLICE_NS`], as the daemon's
@@ -184,10 +243,7 @@ impl Timed {
 fn sliced<T>(timed: &mut Timed, mut unit: impl FnMut() -> Option<T>) -> T {
   let budget = Duration::from_nanos(SLICE_NS);
   loop {
-    let (started, before) = (
-      Instant::now(),
-      slates_machine::bench::involuntary_switches(),
-    );
+    let (started, before) = (Instant::now(), disturbances());
     let mut units = Vec::new();
     let done = loop {
       let unit_started = Instant::now();
@@ -204,13 +260,14 @@ fn sliced<T>(timed: &mut Timed, mut unit: impl FnMut() -> Option<T>) -> T {
   }
 }
 
-/// One round's four phases.
+/// One round's five phases.
 #[derive(Clone, Default)]
 struct Round {
   walk: Timed,
   write: Timed,
   read: Timed,
   merge: Timed,
+  release: Timed,
 }
 
 /// What a round measured besides its times: the nodes, the image's bytes in use (what was written: the file system's
@@ -237,7 +294,12 @@ fn round(case: (usize, usize, usize)) -> (Round, Sizes) {
   });
 
   let (files, size, _) = case;
-  let capacity = u64::try_from(files.saturating_mul(size)).unwrap() + IMAGE_ROOM;
+  let blocks = u64::try_from(size).unwrap().div_ceil(IMAGE_BLOCK_BYTES);
+  let by_blocks = u64::try_from(files).unwrap() * blocks * IMAGE_BLOCK_BYTES + IMAGE_ROOM;
+  // Groups enough for every node's inode, one group's inodes past the files for the directories and reserved ones.
+  let groups = u64::try_from(files).unwrap() / slates_image::layout::MAX_INODES_PER_GROUP + 2;
+  let by_inodes = groups * slates_image::layout::BLOCKS_PER_GROUP * IMAGE_BLOCK_BYTES;
+  let capacity = by_blocks.max(by_inodes);
   let mut image_volume = Volume::create(&mut store, config(11)).unwrap();
   let root = image_volume.root_inode(&store).unwrap();
   let file = image_volume
@@ -279,11 +341,11 @@ fn round(case: (usize, usize, usize)) -> (Round, Sizes) {
       .unwrap()
     {
       Walked::More => None,
-      Walked::Done(tree) => Some(tree),
+      Walked::Done(tree) => Some(*tree),
     }
   });
-  let nodes = tree.tree.nodes().len();
-  assert_eq!(nodes, base.tree.nodes().len(), "the image reads back whole");
+  let nodes = tree.tree.node_count();
+  assert_eq!(nodes, base.tree.node_count(), "the image reads back whole");
 
   let mut clone = Volume::clone_of(&store, &mut volume, snapshot, config(9)).unwrap();
   let mut merge = Merge::new(base, tree, &clone, &store, true);
@@ -300,6 +362,11 @@ fn round(case: (usize, usize, usize)) -> (Round, Sizes) {
       .unwrap()
   });
   let bytes = u64::try_from(files.saturating_mul(size)).unwrap();
+  sliced(&mut times.release, || {
+    let more = (0..SHED_PIECES)
+      .all(|_| merge.shed() || builder.shed() || walk.shed() || image_walk.shed() || image.shed());
+    (!more).then_some(())
+  });
   assert_eq!(report.bytes_written, 0, "an unchanged image writes nothing");
   assert_eq!(report.bytes_compared, bytes, "every byte is compared");
   (
@@ -312,6 +379,46 @@ fn round(case: (usize, usize, usize)) -> (Round, Sizes) {
   )
 }
 
+/// Shape: how long the noise probe runs its trivial units: about one of the longer phases, so it meets as much of
+/// the machine's interference as a phase does.
+const NOISE_PROBE: Duration = Duration::from_millis(40);
+/// Shape: the arithmetic one trivial unit of the noise probe does: well under a microsecond, so any unit that takes
+/// longer was held by the machine, not by its work.
+const NOISE_UNIT_STEPS: u64 = 64;
+
+/// One round of the noise probe: trivial units in [`SLICE_NS`] slices until `done` says so, given the units run and the
+/// time spent.
+fn noise_round(done: impl Fn(usize, Duration) -> bool) -> Timed {
+  let mut timed = Timed::default();
+  let started = Instant::now();
+  let (mut state, mut ran) = (0u64, 0usize);
+  sliced(&mut timed, || {
+    // Format: Knuth's MMIX multiplier, any odd constant serving: the work only has to be real and tiny.
+    for step in 0..NOISE_UNIT_STEPS {
+      state = std::hint::black_box(
+        state
+          .wrapping_mul(6_364_136_223_846_793_005)
+          .wrapping_add(step),
+      );
+    }
+    ran += 1;
+    done(ran, started.elapsed()).then_some(())
+  });
+  timed
+}
+
+/// The machine's own interference, measured in-process before the phases are judged (as `vfs_bench`'s `destroy_rows`
+/// measures its jitter): [`ROUNDS`] rounds of trivial units in [`SLICE_NS`] slices, the first for [`NOISE_PROBE`] and
+/// the rest for as many units as it ran, so the rounds' units align as a phase's do. Its raw longest unit is the
+/// interference a single round meets; its longest work unit, near its p50, shows the minimum over rounds removes it.
+fn noise_floor() -> Vec<Timed> {
+  let first = noise_round(|_, spent| spent >= NOISE_PROBE);
+  let units = first.units.len();
+  std::iter::once(first)
+    .chain((1..ROUNDS).map(|_| noise_round(|ran, _| ran >= units)))
+    .collect()
+}
+
 /// A phase as the report names it: its name, how a round's time for it is found, and what its rate is of.
 type Phase = (&'static str, fn(&Round) -> &Timed, String);
 
@@ -320,14 +427,61 @@ fn ms(duration: Duration) -> String {
   format!("{:.3}", duration.as_secs_f64() * 1_000.0)
 }
 
+/// Microseconds, to one place.
+fn us(duration: Duration) -> String {
+  format!("{:.1}", duration.as_secs_f64() * 1e6)
+}
+
+/// One row: the best round's total with every round's shown, the rate, the best round's slices, and the units' work
+/// (their least times over the rounds) beside the longest unit any round saw.
+fn row(name: &str, phase: &str, rounds: &[&Timed], rate: &str) {
+  let Some(best) = rounds.iter().min_by_key(|timed| timed.total) else {
+    return;
+  };
+  let all: Vec<String> = rounds.iter().map(|timed| ms(timed.total)).collect();
+  let work = work_units(rounds);
+  let (longest_at, longest) = work
+    .iter()
+    .enumerate()
+    .max_by_key(|(_, unit)| **unit)
+    .map(|(at, unit)| (at, *unit))
+    .unwrap_or_default();
+  let raw = rounds
+    .iter()
+    .flat_map(|timed| timed.units.iter())
+    .max()
+    .copied()
+    .unwrap_or_default();
+  println!(
+    "{name},{phase},{},{},{rate},{},{},{},{},{},{},{},{longest_at},{}",
+    ms(best.total),
+    all.join(" "),
+    best.slices,
+    us(best.longest),
+    best.disturbed,
+    us(best.longest_disturbed),
+    us(quantile(&work, 500)),
+    us(quantile(&work, 990)),
+    us(longest),
+    us(raw)
+  );
+}
+
 fn main() {
   println!(
-    "case,phase,best_ms,rounds_ms,rate,slices,longest_slice_us,unit_p50_us,unit_p99_us,longest_unit_us,preempted_slices,longest_preempted_us"
+    "case,phase,best_ms,rounds_ms,rate,slices,longest_slice_us,disturbed_slices,longest_disturbed_us,unit_p50_us,unit_p99_us,longest_unit_us,longest_unit_at,longest_raw_unit_us"
   );
   for (name, files, size, per_dir) in CASES {
+    let noise = noise_floor();
+    row(
+      name,
+      "noise",
+      &noise.iter().collect::<Vec<_>>(),
+      "trivial units",
+    );
     let rounds: Vec<(Round, Sizes)> = (0..ROUNDS).map(|_| round((files, size, per_dir))).collect();
     let sizes = rounds.first().map(|(_, sizes)| *sizes).unwrap_or_default();
-    let phases: [Phase; 4] = [
+    let phases: [Phase; 5] = [
       (
         "walk",
         |round| &round.walk,
@@ -348,20 +502,20 @@ fn main() {
         |round| &round.merge,
         format!("{} bytes compared", sizes.compared),
       ),
+      (
+        "release",
+        |round| &round.release,
+        format!("{} entries", sizes.nodes),
+      ),
     ];
     for (phase, of, unit) in phases {
-      let Some(best) = rounds
+      let timed: Vec<&Timed> = rounds.iter().map(|(round, _)| of(round)).collect();
+      let best = timed
         .iter()
-        .map(|(round, _)| of(round))
-        .min_by_key(|timed| timed.total)
-      else {
-        continue;
-      };
-      let all: Vec<String> = rounds
-        .iter()
-        .map(|(round, _)| ms(of(round).total))
-        .collect();
-      let seconds = best.total.as_secs_f64().max(f64::MIN_POSITIVE);
+        .map(|timed| timed.total)
+        .min()
+        .unwrap_or_default();
+      let seconds = best.as_secs_f64().max(f64::MIN_POSITIVE);
       let rate = match phase {
         "write" => format!(
           "{:.0} MB/s of {unit}",
@@ -376,18 +530,7 @@ fn main() {
           sizes.nodes as f64 / seconds / 1e3
         ),
       };
-      println!(
-        "{name},{phase},{},{},{rate},{},{:.1},{:.1},{:.1},{:.1},{},{:.1}",
-        ms(best.total),
-        all.join(" "),
-        best.slices,
-        best.longest.as_secs_f64() * 1e6,
-        best.unit_quantile(500).as_secs_f64() * 1e6,
-        best.unit_quantile(990).as_secs_f64() * 1e6,
-        best.longest_unit.as_secs_f64() * 1e6,
-        best.preempted,
-        best.longest_preempted.as_secs_f64() * 1e6
-      );
+      row(name, phase, &timed, &rate);
     }
   }
 }

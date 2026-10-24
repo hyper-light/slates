@@ -10776,6 +10776,14 @@ stale page back, and the other write's bytes on it reverted: measured 4,095 of 4
     - a handle opened after the last publication still adopts lazily on a restored mount (A-156);
     - the budget may reach two consecutive backlogs; advancing a reader's point at a confirmed delivery would halve
       it, and is not taken (A-157).
+- **The journal's ring grows by copying (open, 2026-10-24).** The op log's ring (`OpLog::records`, a `VecDeque`) grows
+  by doubling within its budget (`reserve_within_budget`), and a doubling copies every retained record in the one
+  append that needs it. A ring a lagging reader has grown (A-157) is the case. Measured with a journal started at
+  16 MiB: one append copied 2.75 MiB (16,384 records of 176 bytes; `crates/vfs/tests/image_cost.rs`, whose trace named
+  `OpLog::append` → `reserve_within_budget` → `VecDeque::reserve_exact`), a 302 µs unit in `image_bench`. The
+  daemon's journals start at a page and ended at 4,096–16,896 bytes on the measured workloads (BENCHMARKS, A-157), so
+  the copy is small there. A reader lagging by 100,000 records would make one append copy 17.6 MB. The fix is a ring
+  that grows a segment at a time, the shape of `slates_image::Segments` with a front that pops.
 - **The deriver reads the journal with no completeness check (open, 2026-10-23; latent).** `Volume::records_since`
   returns the records retained after a snapshot's sequence. When retention has dropped some of them, the ops document
   (§4.16) is derived from part of the work without a word. No production path calls the deriver yet (tests only). A
@@ -10936,10 +10944,11 @@ without a user namespace, which needs root.
   loudly without them.
 - **Owed:**
   - Shards' DAX window over the macOS mount;
-  - Firecracker's disk-image form. crosvm's experimental `--pmem-ext2` is prior art: it builds an ext2 file system in
-    memory from a host directory and presents it on a pmem device. **In progress (A-160).** The format is built:
-    `crates/image` writes a tree as an ext2 image and reads one back, hostile-input safe. The daemon's `image build`
-    and `image merge` and the real Firecracker run are owed. Evidence so far, 2026-10-23:
+  - Firecracker's disk-image form — **built and proven, 2026-10-24 (A-160).** crosvm's experimental `--pmem-ext2` is
+    prior art: it builds an ext2 file system in memory from a host directory and presents it on a pmem device.
+    `crates/image` writes a tree as an ext2 image and reads one back, hostile-input safe; the daemon's `image build` and
+    `image merge` make the image volume and merge a guest's image into a clone; a real Firecracker microVM read and
+    wrote a volume through it. The format's evidence, 2026-10-23:
     - generated trees round-trip exactly, at the format's precision (96 cases a run);
     - the block-map arithmetic is checked through the triple-indirect level;
     - one tree writes the same bytes in any steps, the same on macOS arm64 and Linux x86_64 (a golden digest);
@@ -10971,7 +10980,22 @@ without a user namespace, which needs root.
     1 removed and one chunk plus 27 bytes written, and the clone held exactly the guest's tree. Green 3 of 3 on the box,
     red with the merge's chunk writes disabled.
 
-    Still owed: §4.6 and `virtiofs.md` §8 item 7 updated for the route, and the costs of build and merge measured.
+    **Every unit bounded, the costs measured (2026-10-24).** The bench's cases of 20,000 and 100,000 entries found
+    units whose work followed a directory or a tree: a directory's open in the snapshot walk took 12,035 µs at 100,000
+    entries, a node vector's doubling 271 µs at 16,384 nodes, and the release of a finished merge one drop of
+    4.4–14.9 ms. Now no unit's least time over five rounds passes 18.5 µs on the box or 22.9 µs on the loaded Mac, and
+    what a job made is released 64 pieces a unit after its reply. `crates/vfs/tests/image_cost.rs` holds every step,
+    the release among them, to a tree eight times smaller by allocator count; it failed in every phase before the
+    change. The costs are in BENCHMARKS (2026-10-24): on the box the write runs 3.1–4.0 GB/s of image in use, and the
+    merge of an unchanged image compares 2.4–4.2 GB/s. §4.6 and `virtiofs.md` §8 item 7 describe the route.
+
+    **Firecracker's exit on the guest's restart is a race, and the test takes both forms.** The guest ends the VM with
+    `reboot=k`: the kernel pulses the keyboard controller's reset for about a millisecond, then falls through to a
+    triple fault (`native_machine_emergency_restart`). Firecracker stops the vCPU from its main thread; when that thread
+    is later, the vCPU meets the fallback, a KVM shutdown exit Firecracker v1.17.0 leaves unhandled, and it exits 1:
+    1 run of 18 at load 46–53 on the box, the guest's work done and flushed. The test accepts exit 1 only when the
+    console shows the guest's restart and Firecracker's `Shutdown` line. Forced with `reboot=t`, that branch passed, and
+    the merge after it held the guest's tree. 40 more runs at load 16 all exited 0.
   - **Open sibling (found 2026-10-24 by reading `reconcile_unpublished_effects`, not yet reproduced): a clone whose
     transaction fails after it recorded its volume keeps its pin.**
     When `Db::commit` fails after a clone verb recorded its volume (the log full or unpublishable), the rollback

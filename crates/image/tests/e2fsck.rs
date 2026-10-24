@@ -158,20 +158,19 @@ fn check(what: &str, tree: &Tree, contents: &Contents, capacity: u64) {
       prefix.clone()
     };
     let expected: Vec<Listed> = tree
-      .children(directory)
-      .iter()
-      .map(|(name, child)| expected_listing(tree, name, *child))
+      .entries(directory)
+      .map(|(name, child)| expected_listing(tree, name, child))
       .collect();
     assert_eq!(
       listing(&path, &at),
       expected,
       "{what}: {at} lists as written"
     );
-    for (name, child) in tree.children(directory) {
-      let child_at = format!("{prefix}/{}", String::from_utf8(name.clone()).unwrap());
-      match &tree.node(*child).unwrap().kind {
-        Kind::Directory => stack.push((child_at, *child)),
-        Kind::File { .. } => files.push((child_at, *child)),
+    for (name, child) in tree.entries(directory) {
+      let child_at = format!("{prefix}/{}", String::from_utf8(name.to_vec()).unwrap());
+      match &tree.node(child).unwrap().kind {
+        Kind::Directory => stack.push((child_at, child)),
+        Kind::File { .. } => files.push((child_at, child)),
         _ => {}
       }
     }

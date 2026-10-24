@@ -52,7 +52,7 @@ fn every_map_fills_its_slots_once_with_each_indirect_block_before_what_it_maps()
     for index in 0..n {
       seen[usize::try_from(Map::data_slot(index)).unwrap()] += 1;
     }
-    let indirect = map.indirect();
+    let indirect: Vec<Indirect> = (0..).map_while(|index| map.indirect_at(index)).collect();
     let mut by_slot: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
     for block in &indirect {
       let (slot, children) = match block {

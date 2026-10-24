@@ -24,8 +24,8 @@ use slates_client::{
 use slates_image::format::{BUILT_GENERATION, inode as inode_field};
 use slates_image::layout::BLOCK_BYTES;
 use slates_image::{
-  Builder, Identity, Image, ImageIo, ImageSource, Kind, NodeId, Progress, Timestamp, Tree,
-  TreeBuilder,
+  Builder, Identity, Image, ImageIo, ImageSource, Kind, NodeId, Progress, Segments, Timestamp,
+  Tree, TreeBuilder,
 };
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
 use slates_server::daemon::LIVENESS_BUDGET_NS;
@@ -164,21 +164,21 @@ impl ImageSource<Infallible> for Memory {
 /// A tree's files by path, with their bytes read from `image`.
 fn files_of(
   tree: &Tree,
-  inodes: &[u32],
+  inodes: &Segments<u32>,
   image: &mut Image,
   memory: &mut Memory,
 ) -> BTreeMap<String, Vec<u8>> {
   let mut found = BTreeMap::new();
   let mut stack = vec![(String::new(), NodeId::ROOT)];
   while let Some((prefix, directory)) = stack.pop() {
-    for (name, child) in tree.children(directory) {
+    for (name, child) in tree.entries(directory) {
       let path = format!("{prefix}/{}", String::from_utf8_lossy(name));
-      match tree.node(*child).unwrap().kind {
-        Kind::Directory => stack.push((path, *child)),
+      match tree.node(child).unwrap().kind {
+        Kind::Directory => stack.push((path, child)),
         Kind::File { size } => {
           let mut bytes = vec![0u8; usize::try_from(size).unwrap()];
           image
-            .read(memory, inodes[child.index()], 0, &mut bytes)
+            .read(memory, *inodes.get(child.index()).unwrap(), 0, &mut bytes)
             .unwrap();
           found.insert(path, bytes);
         }
@@ -224,17 +224,19 @@ fn volume_files(client: &mut Client, volume: VolumeId) -> BTreeMap<String, Vec<u
 fn deleted_node(read: &Tree) -> NodeId {
   read
     .ids()
-    .flat_map(|directory| read.children(directory).iter())
-    .find(|(name, _)| name == b"delete-me")
-    .map(|(_, child)| *child)
+    .flat_map(|directory| read.entries(directory))
+    .find(|(name, _)| *name == b"delete-me")
+    .map(|(_, child)| child)
     .unwrap()
 }
 
 /// The guest's tree: `read` with `/docs/a.txt` renamed `/docs/renamed.txt`, `/docs/sub/b.bin` rewritten in its second
-/// chunk, and the deleted file's node replaced by `/new.txt`, so every other node keeps its index (and so its inode
-/// number) and the new file takes the deleted one's. Its files' bytes by node.
+/// chunk, and the deleted file's node replaced by `/new.txt`. The nodes are added in the order of the inode numbers
+/// they were read from (`inodes`), so the writer, which puts node `n` at inode `10 + n`, puts every other node back at
+/// its number and the new file at the deleted one's. Its files' bytes by node.
 fn guest_tree(
   read: &Tree,
+  inodes: &Segments<u32>,
   contents: &BTreeMap<usize, Vec<u8>>,
   chunk: usize,
 ) -> (Tree, BTreeMap<usize, Vec<u8>>) {
@@ -242,7 +244,9 @@ fn guest_tree(
   let mut builder = TreeBuilder::new(read.node(NodeId::ROOT).unwrap().clone());
   let mut ids = BTreeMap::from([(0usize, NodeId::ROOT)]);
   let mut by_node: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
-  for id in read.ids().skip(1) {
+  let mut by_number: Vec<NodeId> = read.ids().skip(1).collect();
+  by_number.sort_by_key(|id| *inodes.get(id.index()).unwrap());
+  for id in by_number {
     let (mut node, mut bytes) = (
       read.node(id).unwrap().clone(),
       contents.get(&id.index()).cloned(),
@@ -263,11 +267,11 @@ fn guest_tree(
     }
   }
   for id in read.ids() {
-    for (name, child) in read.children(id) {
-      let (parent, name) = match name.as_slice() {
-        _ if *child == deleted => (NodeId::ROOT, b"new.txt".to_vec()),
+    for (name, child) in read.entries(id) {
+      let (parent, name) = match name {
+        _ if child == deleted => (NodeId::ROOT, b"new.txt".to_vec()),
         b"a.txt" => (ids[&id.index()], b"renamed.txt".to_vec()),
-        _ => (ids[&id.index()], name.clone()),
+        _ => (ids[&id.index()], name.to_vec()),
       };
       builder.add_entry(parent, name, ids[&child.index()]);
     }
@@ -330,21 +334,27 @@ fn written(tree: Tree, files: &BTreeMap<usize, Vec<u8>>, uuid: [u8; 16]) -> Memo
 /// own, as a kernel gives the inode it allocates.
 fn edited_image(
   read: &Tree,
-  inodes: &[u32],
+  inodes: &Segments<u32>,
   contents: &BTreeMap<usize, Vec<u8>>,
   (uuid, chunk): ([u8; 16], usize),
 ) -> Vec<u8> {
-  // Every node the build wrote is at inode 10 + its index, so a tree that keeps each node at its index keeps each at
-  // its written number; the new file takes the deleted one's index, and so its number.
-  for id in read.ids().skip(1) {
-    assert_eq!(
-      usize::try_from(inodes[id.index()]).unwrap(),
-      id.index() + 10
-    );
-  }
-  let (tree, files) = guest_tree(read, contents, chunk);
+  // The build wrote its nodes at inodes 11 up, one each: the numbers read back are exactly those, so a tree whose nodes
+  // come in the order of their numbers keeps each at its written number, and the new file takes the deleted one's.
+  let mut numbers: Vec<u32> = read
+    .ids()
+    .skip(1)
+    .map(|id| *inodes.get(id.index()).unwrap())
+    .collect();
+  numbers.sort_unstable();
+  assert!(
+    numbers
+      .iter()
+      .zip(11u32..)
+      .all(|(number, expected)| *number == expected)
+  );
+  let (tree, files) = guest_tree(read, inodes, contents, chunk);
   let mut memory = written(tree, &files, uuid);
-  let new_ino = inodes[deleted_node(read).index()];
+  let new_ino = *inodes.get(deleted_node(read).index()).unwrap();
   let descriptor = usize::try_from(BLOCK_BYTES).unwrap();
   let table = u32::from_le_bytes(
     memory.bytes[descriptor + 8..descriptor + 12]
@@ -373,7 +383,7 @@ fn contents_by_node(
     if let Kind::File { size } = read.tree.node(id).unwrap().kind {
       let mut bytes = vec![0u8; usize::try_from(size).unwrap()];
       image
-        .read(memory, read.inodes[id.index()], 0, &mut bytes)
+        .read(memory, *read.inodes.get(id.index()).unwrap(), 0, &mut bytes)
         .unwrap();
       contents.insert(id.index(), bytes);
     }
@@ -440,7 +450,7 @@ fn an_image_is_built_read_back_edited_and_merged_into_a_clone() {
     .unwrap();
   client.detach(attachment).unwrap();
   let (clone, report) = client.image_merge(built.id, "merged").unwrap();
-  let nodes = u64::try_from(read.tree.nodes().len()).unwrap();
+  let nodes = u64::try_from(read.tree.node_count()).unwrap();
   assert_eq!(
     (report.kept, report.created, report.removed, report.moved),
     (nodes - 1, 1, 1, 1),

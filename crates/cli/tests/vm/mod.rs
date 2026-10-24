@@ -378,6 +378,23 @@ impl Guest {
     );
   }
 
+  /// Takes the VM's remaining console lines into the transcript until its readers end or `within` passes: a VMM's last
+  /// words, written as it exits, arrive after its exit is seen.
+  pub(crate) fn drain(&mut self, within: Duration) {
+    let deadline = Instant::now().checked_add(within).unwrap();
+    while let Ok(line) = self
+      .lines
+      .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+    {
+      self.keep(line);
+    }
+  }
+
+  /// Whether a line the transcript keeps holds `words`.
+  pub(crate) fn said(&self, words: &str) -> bool {
+    self.transcript.iter().any(|line| line.contains(words))
+  }
+
   /// Tells the guest to quit, and waits for the VM to power off: its exit status.
   pub(crate) fn quit(&mut self) -> std::process::ExitStatus {
     self.done(&Ask::Quit);

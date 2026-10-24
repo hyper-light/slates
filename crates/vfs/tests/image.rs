@@ -187,15 +187,15 @@ fn tree_entries(tree: &Tree, content: &mut dyn FnMut(NodeId) -> Vec<u8>) -> Vec<
   )];
   let mut stack = vec![(Vec::new(), NodeId::ROOT)];
   while let Some((prefix, directory)) = stack.pop() {
-    for (name, child) in tree.children(directory) {
+    for (name, child) in tree.entries(directory) {
       let mut path = prefix.clone();
       path.push(b'/');
       path.extend_from_slice(name);
-      let node = tree.node(*child).unwrap().clone();
+      let node = tree.node(child).unwrap().clone();
       let bytes = match node.kind {
-        ImageKind::File { .. } => content(*child),
+        ImageKind::File { .. } => content(child),
         ImageKind::Directory => {
-          stack.push((path.clone(), *child));
+          stack.push((path.clone(), child));
           Vec::new()
         }
         _ => Vec::new(),
@@ -468,11 +468,11 @@ proptest! {
     let read = tree_entries(&tree.tree, &mut |id| {
       let ImageKind::File { size } = tree.tree.node(id).unwrap().kind else { panic!() };
       let mut bytes = vec![0u8; usize::try_from(size).unwrap()];
-      image.read(&mut file, tree.inodes[id.index()], 0, &mut bytes).unwrap();
+      image.read(&mut file, *tree.inodes.get(id.index()).unwrap(), 0, &mut bytes).unwrap();
       bytes
     });
     prop_assert_eq!(read, volume_entries(&source, &store));
-    prop_assert!(built.walk_steps > built.base.tree.nodes().len(), "{} steps", built.walk_steps);
+    prop_assert!(built.walk_steps > built.base.tree.node_count(), "{} steps", built.walk_steps);
   }
 
   /// A-160 (an image no one changed). Do: build a generated volume's image, read it out of its file, and merge it into
@@ -487,11 +487,10 @@ proptest! {
     let snapshot = source.snapshot(&mut store).unwrap();
     let built = build(&mut store, &source, snapshot);
     let (tree, mut image) = read_image(&store, &built);
-    let nodes = u64::try_from(tree.tree.nodes().len()).unwrap();
+    let nodes = u64::try_from(tree.tree.node_count()).unwrap();
     let bytes: u64 = tree
       .tree
       .nodes()
-      .iter()
       .map(|node| match node.kind { ImageKind::File { size } => size, _ => 0 })
       .sum();
     let mut clone = Volume::clone_of(&store, &mut source, snapshot, config(9, NameEquivalence::Exact)).unwrap();
@@ -567,12 +566,12 @@ impl Model {
         uid: node.uid,
         gid: node.gid,
         times: [node.atime, node.mtime, node.ctime],
-        ino: tree.inodes[id.index()],
-        generation: tree.generations[id.index()],
+        ino: *tree.inodes.get(id.index()).unwrap(),
+        generation: *tree.generations.get(id.index()).unwrap(),
         built: true,
       });
-      for (name, child) in tree.tree.children(id) {
-        entries.insert((id.index(), name.clone()), child.index());
+      for (name, child) in tree.tree.entries(id) {
+        entries.insert((id.index(), name.to_vec()), child.index());
       }
     }
     let next_ino = tree.inodes.iter().copied().max().unwrap_or(0) + 1;
@@ -951,14 +950,14 @@ proptest! {
     let mut model = Model::of(&written, &mut |id| {
       let ImageKind::File { size } = written.tree.node(id).unwrap().kind else { panic!() };
       let mut bytes = vec![0u8; usize::try_from(size).unwrap()];
-      image.read(&mut file, written.inodes[id.index()], 0, &mut bytes).unwrap();
+      image.read(&mut file, *written.inodes.get(id.index()).unwrap(), 0, &mut bytes).unwrap();
       bytes
     });
     for edit in history {
       apply(&mut model, edit);
     }
     let (edited, files, order) = model.tree();
-    let expected = tree_entries(&edited.tree, &mut |id| files[&edited.inodes[id.index()]].clone());
+    let expected = tree_entries(&edited.tree, &mut |id| files[edited.inodes.get(id.index()).unwrap()].clone());
     let mut clone = Volume::clone_of(&store, &mut source, snapshot, config(9, NameEquivalence::Exact)).unwrap();
     let mut merge = Merge::new(built.base.clone(), edited.clone(), &clone, &store, true);
     let report = run(&mut merge, &mut clone, &mut store, &mut MapContent { files }).unwrap();
@@ -971,15 +970,15 @@ proptest! {
       let held = inode_at(&clone, &store, &path);
       if model.nodes[index].built {
         let base = if index == 0 { 0 } else { usize::try_from(model.nodes[index].ino).unwrap() - 10 };
-        prop_assert_eq!(held, built.base.inodes[base], "{:?}", String::from_utf8_lossy(&path));
+        prop_assert_eq!(held, *built.base.inodes.get(base).unwrap(), "{:?}", String::from_utf8_lossy(&path));
         kept_identity.insert(base);
       } else {
         prop_assert!(!base_inodes.contains(&held), "a new node at a base inode: {:?}", path);
       }
     }
     let kept = u64::try_from(kept_identity.len()).unwrap();
-    let base_nodes = u64::try_from(built.base.tree.nodes().len()).unwrap();
-    let image_nodes = u64::try_from(edited.tree.nodes().len()).unwrap();
+    let base_nodes = u64::try_from(built.base.tree.node_count()).unwrap();
+    let image_nodes = u64::try_from(edited.tree.node_count()).unwrap();
     prop_assert_eq!(report.kept, kept);
     prop_assert_eq!(report.created, image_nodes - kept);
     prop_assert_eq!(report.removed, base_nodes - kept);
@@ -991,14 +990,14 @@ fn paths(tree: &Tree) -> Vec<(Vec<u8>, NodeId)> {
   let mut found = vec![(Vec::new(), NodeId::ROOT)];
   let mut stack = vec![(Vec::new(), NodeId::ROOT)];
   while let Some((prefix, directory)) = stack.pop() {
-    for (name, child) in tree.children(directory) {
+    for (name, child) in tree.entries(directory) {
       let mut path = prefix.clone();
       path.push(b'/');
       path.extend_from_slice(name);
-      if tree.node(*child).unwrap().kind == ImageKind::Directory {
-        stack.push((path.clone(), *child));
+      if tree.node(child).unwrap().kind == ImageKind::Directory {
+        stack.push((path.clone(), child));
       }
-      found.push((path, *child));
+      found.push((path, child));
     }
   }
   found
@@ -1061,14 +1060,19 @@ fn scenario(change: &dyn Fn(&mut Model)) -> MergeReport {
     };
     let mut bytes = vec![0u8; usize::try_from(size).unwrap()];
     image
-      .read(&mut file, written.inodes[id.index()], 0, &mut bytes)
+      .read(
+        &mut file,
+        *written.inodes.get(id.index()).unwrap(),
+        0,
+        &mut bytes,
+      )
       .unwrap();
     bytes
   });
   change(&mut model);
   let (edited, files, _) = model.tree();
   let expected = tree_entries(&edited.tree, &mut |id| {
-    files[&edited.inodes[id.index()]].clone()
+    files[edited.inodes.get(id.index()).unwrap()].clone()
   });
   let mut clone = Volume::clone_of(
     &store,
@@ -1280,18 +1284,18 @@ proptest! {
     let mut model = Model::of(&written, &mut |id| {
       let ImageKind::File { size } = written.tree.node(id).unwrap().kind else { panic!() };
       let mut bytes = vec![0u8; usize::try_from(size).unwrap()];
-      image.read(&mut file, written.inodes[id.index()], 0, &mut bytes).unwrap();
+      image.read(&mut file, *written.inodes.get(id.index()).unwrap(), 0, &mut bytes).unwrap();
       bytes
     });
     for edit in history {
       apply(&mut model, edit);
     }
     let (edited, files, _) = model.tree();
-    let expected = tree_entries(&edited.tree, &mut |id| files[&edited.inodes[id.index()]].clone());
+    let expected = tree_entries(&edited.tree, &mut |id| files[edited.inodes.get(id.index()).unwrap()].clone());
     let by_node: BTreeMap<usize, Vec<u8>> = edited
       .tree
       .ids()
-      .filter_map(|id| Some((id.index(), files.get(&edited.inodes[id.index()])?.clone())))
+      .filter_map(|id| Some((id.index(), files.get(edited.inodes.get(id.index()).unwrap())?.clone())))
       .collect();
     let mut builder = Builder::new(edited.tree.clone(), CAPACITY, IDENTITY).unwrap();
     let mut memory = Memory { bytes: vec![0; usize::try_from(builder.image_bytes()).unwrap()] };
@@ -1311,7 +1315,7 @@ proptest! {
       prop_assert_eq!(volume_entries(&clone, &store), expected.clone());
       if !trusted {
         prop_assert_eq!(report.kept, 1);
-        prop_assert_eq!(report.created, u64::try_from(tree.tree.nodes().len()).unwrap() - 1);
+        prop_assert_eq!(report.created, u64::try_from(tree.tree.node_count()).unwrap() - 1);
       }
     }
   }
@@ -1330,8 +1334,8 @@ fn refusal_of(name: Vec<u8>, node: Node) -> ImageError {
   builder.add_entry(NodeId::ROOT, name, child);
   let target = ImageTree {
     tree: builder.build().unwrap(),
-    inodes: vec![2, 500],
-    generations: vec![0, 77],
+    inodes: [2, 500].into_iter().collect(),
+    generations: [0, 77].into_iter().collect(),
   };
   let mut clone = Volume::clone_of(
     &store,

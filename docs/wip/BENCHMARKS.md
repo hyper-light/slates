@@ -6385,3 +6385,166 @@ plus the growth.
 
 The plan's step 5 predicted "at most a page above the largest backlog". That was wrong for one row of nine, and the
 measured bound, two consecutive backlogs, is the one the design states.
+
+## A volume's disk image: what build and merge cost, and the longest unit a shard waits behind (A-160; 2026-10-24 UTC)
+
+**The question.** `slates image build` writes a snapshot's tree as an ext2 image. `slates image merge` reads a guest's
+image back into a clone. This records what each phase costs on trees of small, medium and large files and at the
+extremes of a directory and a tree. It also asks whether any one unit of work holds the shard past a slice. The daemon
+runs each phase one unit a call, until half its step quantum has passed (A-160, "Slices bounded by the clock"), so a
+slice overruns by its last unit at most. A unit whose cost follows a directory or a tree overruns by that much.
+
+**The command.** `cargo build --release -p slates-vfs --example image_bench && ./target/release/examples/image_bench`
+(on the box with `CARGO_TARGET_DIR=$HOME/.cache/slates-mutation-target`), from the checkout at `e4c1d2d8` with this
+change in the working tree. Each case is five rounds; the best total is reported and every round is shown. In each
+round:
+- **walk:** the snapshot walked into the writer's tree;
+- **write:** the image laid out and written into a file of another volume;
+- **read:** the image opened and its tree walked back out of that file;
+- **merge:** the unchanged image merged into a clone of the snapshot, every byte compared and none written;
+- **release:** what the walks, the build and the merge made, released 64 pieces a unit, as the daemon releases a
+  finished job's after its reply (`SHED_PIECES`).
+
+How it measures:
+- Every phase runs in slices of 23.7 µs, half the box's step quantum as its daemon derived it, one unit a call.
+- The store's region is faulted in before each round, as a daemon's arena is (§4.2, D-12).
+- Each journal starts at the daemon's one-page floor (`journal_floor_bytes`, A-157).
+- **A unit's work is its least time over the five rounds.** Every round runs the same units in the same order, so
+  interference must strike one unit in all five rounds to survive the minimum. What a unit itself costs, the faults its
+  own allocations take among it, is in every round. The noise row checks this: trivial units run the same way show
+  0.1 µs of work while their raw longest is 9–188 µs on the box and 4.9–10.1 ms on the loaded Mac.
+
+**The machines.**
+- **The box:** bare metal, AMD Ryzen 9 9950X3D2 (16 cores, 32 threads), 124 GiB, Linux 7.2.9-2-cachyos. Run
+  10:38:55–10:39:02 UTC, load average 46–51.
+- **The Mac:** Apple M5 Max, 18 cores, 128 GiB, macOS 26.4.1. Run 10:39–10:40 UTC, load average 55–67 from other
+  sessions. Its totals are up to twice an earlier, quieter run's (10k × 4 KiB: write 19.0 ms at load 34).
+
+The box:
+
+| case | phase | best (ms) | the five rounds (ms) | rate | unit p99 (µs) | longest unit (µs) |
+|---|---|---|---|---|---|---|
+| 10k files of 4 KiB | walk | 3.721 | 3.953 3.901 3.721 4.174 3.864 | 2,698 entries/ms of 10,041 | 0.3 | 2.2 |
+| 10k files of 4 KiB | write | 14.654 | 15.526 16.684 14.654 16.030 15.629 | 3,095 MB/s of 45,355,008 bytes in use | 2.5 | 4.7 |
+| 10k files of 4 KiB | read | 5.155 | 5.499 5.604 5.155 5.347 5.327 | 1,948 entries/ms | 0.5 | 1.9 |
+| 10k files of 4 KiB | merge | 17.339 | 18.150 18.222 17.339 18.561 20.337 | 2,362 MB/s of 40,960,000 bytes compared | 0.9 | 3.1 |
+| 10k files of 4 KiB | release | 1.668 | 1.800 1.778 2.041 1.668 1.731 | 6,020 entries/ms | 2.4 | 6.2 |
+| 1k files of 64 KiB | walk | 0.363 | 0.363 0.365 0.407 0.383 0.370 | 2,783 entries/ms of 1,011 | 0.4 | 2.0 |
+| 1k files of 64 KiB | write | 18.768 | 21.196 18.768 20.375 20.290 20.425 | 3,938 MB/s of 73,904,128 bytes in use | 2.7 | 5.5 |
+| 1k files of 64 KiB | read | 0.509 | 0.851 0.539 0.545 0.651 0.509 | 1,985 entries/ms | 0.5 | 1.8 |
+| 1k files of 64 KiB | merge | 15.835 | 19.375 16.203 16.771 20.269 15.835 | 4,139 MB/s of 65,536,000 bytes compared | 1.2 | 2.8 |
+| 1k files of 64 KiB | release | 0.175 | 0.187 0.177 0.239 0.227 0.175 | 5,766 entries/ms | 2.7 | 3.8 |
+| 64 files of 1 MiB | walk | 0.033 | 0.035 0.035 0.034 0.048 0.033 | 1,982 entries/ms of 66 | 0.6 | 1.5 |
+| 64 files of 1 MiB | write | 17.712 | 20.326 18.192 17.712 18.283 18.197 | 4,043 MB/s of 71,606,272 bytes in use | 2.6 | 10.4 |
+| 64 files of 1 MiB | read | 0.044 | 0.047 0.063 0.049 0.045 0.044 | 1,484 entries/ms | 1.1 | 1.4 |
+| 64 files of 1 MiB | merge | 15.819 | 16.356 16.057 15.819 15.836 16.701 | 4,242 MB/s of 67,108,864 bytes compared | 1.0 | 2.8 |
+| 64 files of 1 MiB | release | 0.026 | 0.036 0.026 0.031 0.029 0.031 | 2,492 entries/ms | 3.4 | 4.1 |
+| 20k files of 64 B, one directory | walk | 8.762 | 8.762 10.403 8.861 9.998 11.383 | 2,283 entries/ms of 20,002 | 0.4 | 1.8 |
+| 20k files of 64 B, one directory | write | 25.660 | 25.660 27.604 27.805 35.162 46.601 | 3,407 MB/s of 87,412,736 bytes in use | 2.4 | 7.4 |
+| 20k files of 64 B, one directory | read | 12.510 | 12.510 14.118 13.491 12.631 13.268 | 1,599 entries/ms | 0.6 | 2.4 |
+| 20k files of 64 B, one directory | merge | 28.638 | 28.638 30.484 29.779 29.673 29.295 | 45 MB/s of 1,280,000 bytes compared | 0.5 | 3.6 |
+| 20k files of 64 B, one directory | release | 3.815 | 4.049 4.493 4.605 4.588 3.815 | 5,243 entries/ms | 2.8 | 5.1 |
+| 100k empty files, one directory | walk | 47.181 | 47.834 50.450 47.607 47.181 48.012 | 2,120 entries/ms of 100,002 | 0.5 | 1.6 |
+| 100k empty files, one directory | write | 29.268 | 30.358 30.109 29.354 29.268 30.185 | 933 MB/s of 27,295,744 bytes in use | 1.2 | 10.6 |
+| 100k empty files, one directory | read | 64.779 | 70.786 66.333 66.608 66.989 64.779 | 1,544 entries/ms | 0.6 | 2.6 |
+| 100k empty files, one directory | merge | 88.821 | 91.878 90.002 88.821 91.722 88.972 | 1,126 entries/ms | 0.2 | 2.8 |
+| 100k empty files, one directory | release | 22.032 | 23.401 23.880 23.484 23.851 22.032 | 4,539 entries/ms | 3.4 | 16.5 |
+| 100k empty files, 100 directories | walk | 41.206 | 41.206 41.207 41.730 41.310 41.926 | 2,429 entries/ms of 100,101 | 0.4 | 3.0 |
+| 100k empty files, 100 directories | write | 28.794 | 31.089 29.049 30.185 30.140 28.794 | 950 MB/s of 27,348,992 bytes in use | 1.2 | 12.0 |
+| 100k empty files, 100 directories | read | 55.651 | 57.505 55.651 57.085 60.221 57.360 | 1,799 entries/ms | 0.5 | 2.3 |
+| 100k empty files, 100 directories | merge | 81.705 | 87.126 83.063 81.705 84.495 88.767 | 1,225 entries/ms | 0.2 | 2.6 |
+| 100k empty files, 100 directories | release | 17.555 | 18.837 17.774 18.058 18.009 17.555 | 5,702 entries/ms | 3.4 | 18.5 |
+
+The Mac, loaded:
+
+| case | phase | best (ms) | the five rounds (ms) | rate | unit p99 (µs) | longest unit (µs) |
+|---|---|---|---|---|---|---|
+| 10k files of 4 KiB | walk | 4.594 | 5.434 10.681 4.594 9.251 7.282 | 2,186 entries/ms | 0.4 | 2.4 |
+| 10k files of 4 KiB | write | 31.090 | 44.314 42.796 42.955 31.090 40.525 | 1,459 MB/s | 4.1 | 7.8 |
+| 10k files of 4 KiB | read | 10.676 | 14.168 10.676 15.235 11.176 19.214 | 941 entries/ms | 0.7 | 4.2 |
+| 10k files of 4 KiB | merge | 36.193 | 38.250 41.710 37.406 36.193 41.246 | 1,132 MB/s | 1.4 | 4.8 |
+| 10k files of 4 KiB | release | 1.875 | 9.890 1.875 7.076 1.905 2.344 | 5,356 entries/ms | 3.4 | 6.9 |
+| 1k files of 64 KiB | walk | 0.382 | 0.382 0.483 0.451 0.444 0.478 | 2,648 entries/ms | 0.4 | 1.8 |
+| 1k files of 64 KiB | write | 41.501 | 51.573 60.661 59.933 62.193 41.501 | 1,781 MB/s | 5.4 | 10.0 |
+| 1k files of 64 KiB | read | 0.718 | 0.852 0.733 0.942 0.857 0.718 | 1,408 entries/ms | 0.7 | 3.2 |
+| 1k files of 64 KiB | merge | 28.506 | 38.715 33.601 28.507 43.625 28.506 | 2,299 MB/s | 1.6 | 3.9 |
+| 1k files of 64 KiB | release | 0.169 | 0.201 0.201 0.201 0.170 0.169 | 5,996 entries/ms | 3.1 | 5.4 |
+| 64 files of 1 MiB | walk | 0.034 | 0.042 0.034 0.040 0.047 0.034 | 1,944 entries/ms | 0.6 | 1.1 |
+| 64 files of 1 MiB | write | 33.243 | 33.243 52.376 40.872 42.146 34.319 | 2,154 MB/s | 3.9 | 15.0 |
+| 64 files of 1 MiB | read | 0.046 | 0.058 0.046 0.059 0.059 0.059 | 1,424 entries/ms | 1.2 | 2.1 |
+| 64 files of 1 MiB | merge | 29.588 | 36.884 29.588 30.089 47.112 34.037 | 2,268 MB/s | 1.2 | 3.4 |
+| 64 files of 1 MiB | release | 0.025 | 0.027 0.025 0.026 0.030 0.029 | 2,614 entries/ms | 2.7 | 6.0 |
+| 20k files of 64 B, one directory | walk | 11.773 | 11.773 13.726 11.887 17.222 21.726 | 1,699 entries/ms | 0.5 | 2.7 |
+| 20k files of 64 B, one directory | write | 48.396 | 67.901 52.919 48.396 54.677 57.668 | 1,806 MB/s | 3.2 | 10.8 |
+| 20k files of 64 B, one directory | read | 14.844 | 19.886 18.335 14.844 18.231 27.593 | 1,347 entries/ms | 0.7 | 3.9 |
+| 20k files of 64 B, one directory | merge | 45.937 | 48.135 48.491 50.561 47.090 45.937 | 28 MB/s | 0.6 | 4.1 |
+| 20k files of 64 B, one directory | release | 3.826 | 8.676 6.307 4.226 3.826 4.365 | 5,228 entries/ms | 2.9 | 5.6 |
+| 100k empty files, one directory | walk | 80.147 | 84.599 92.640 91.203 84.406 80.147 | 1,248 entries/ms | 0.5 | 4.1 |
+| 100k empty files, one directory | write | 59.820 | 82.667 65.987 79.129 68.887 59.820 | 456 MB/s | 1.8 | 12.8 |
+| 100k empty files, one directory | read | 138.557 | 168.645 153.608 151.483 138.557 145.674 | 722 entries/ms | 0.9 | 4.6 |
+| 100k empty files, one directory | merge | 139.115 | 159.033 153.339 158.531 158.815 139.115 | 719 entries/ms | 0.1 | 2.8 |
+| 100k empty files, one directory | release | 25.005 | 30.003 28.055 25.005 31.607 28.226 | 3,999 entries/ms | 3.2 | 6.0 |
+| 100k empty files, 100 directories | walk | 52.758 | 54.588 57.478 52.758 57.176 78.918 | 1,897 entries/ms | 0.4 | 7.5 |
+| 100k empty files, 100 directories | write | 48.211 | 48.211 51.746 53.328 79.733 90.857 | 567 MB/s | 1.7 | 22.9 |
+| 100k empty files, 100 directories | read | 88.590 | 98.552 96.545 88.590 178.859 141.726 | 1,130 entries/ms | 0.6 | 4.5 |
+| 100k empty files, 100 directories | merge | 110.003 | 110.003 116.045 116.743 173.261 178.100 | 910 entries/ms | 0.1 | 4.0 |
+| 100k empty files, 100 directories | release | 20.989 | 23.703 21.210 20.989 32.672 36.204 | 4,769 entries/ms | 2.8 | 5.5 |
+
+(A merge of empty files compares no bytes; its rate is given in entries.)
+
+**What it shows.**
+- **No unit holds the shard past a slice.** The longest unit of work in any phase was 18.5 µs on the box (a release
+  unit of 64 pieces at 100,000 nodes) and 22.9 µs on the loaded Mac (a write unit at 100,000 nodes, 19.1–21.2 µs in
+  each of four earlier runs). Every p99 unit was 0.1–5.4 µs. On a tree of 100,000 nodes, or a single directory of
+  100,000 entries, the walk's and the read's longest units were 1.6–7.5 µs, of the order they are at 1,000 files
+  (1.8–3.2 µs).
+- **The write runs at 3.1–4.0 GB/s of image in use on the box.** The image of 10,000 files of 4 KiB, 45 MB in use,
+  was written in 14.7 ms, and the 72 MB image of 64 files of 1 MiB in 17.7 ms. An image of 100,000 empty files is
+  27 MB of inodes and directory blocks, written in 28.8–29.3 ms.
+- **The merge of an unchanged image compares 2.4–4.2 GB/s on the box**, a page a unit, writing nothing. With empty
+  files its time is its entries, 1,126–1,225 entries/ms; with 20,000 files of 64 bytes, 698 entries/ms, a page compared
+  each.
+- **The release costs a tenth to a quarter of the walk and the write it frees.** The box released 10,041 nodes in
+  1.7 ms (a tenth of 18.4 ms) and 100,000 empty files in 17.6–22.0 ms (a quarter of 70–76 ms), 4,500–6,000 entries/ms.
+  On the Mac it released 10,041 nodes in 1.6 ms at load 33, where the one drop it replaces took 0.48–0.57 ms: about
+  three times the CPU. But the drop ran as one unit of 4,447–14,890 µs at 100,000 nodes, and the release's longest
+  unit is 18.5 µs.
+- **Not measured here:** the daemon's own steps around the phases. Those are admitting the new volume and recording
+  it, and its publication inside the completion's one atom (§4.8). The publication path's cost belongs to that path.
+
+**What the extreme cases found, and what changed.** The cases of 20,000 and 100,000 entries were added to find units
+whose work follows a directory or a tree. The least time of each unit over five rounds, on the Mac at load 32–38,
+before the change:
+
+| unit | longest (µs) | where | what it cost | now |
+|---|---|---|---|---|
+| the snapshot walk's open of a directory | 12,034.8 | unit 3, 100,000 entries in one directory | every name copied and sorted | an entry a unit, by a cursor into the snapshot's directory (`DirNode::next_entry`) |
+| the tree grower's close of a directory | 539.6 | 100,000 entries | a map turned into a list in one call | an entry a unit (`TreeGrower::close`) |
+| a node vector's doubling | 271.1 at 16,384 nodes (read: 315.2) | 100 directories of 1,000 | the vector copied whole, its new pages faulted | segmented arrays that never move (`slates_image::Segments`) |
+| measuring a directory | 175.4 | 100,000 entries | its packing computed whole | a block of entries a unit |
+| the merge's step from identifying to planning | 69.5 | 100,000 nodes | each node's entry offset counted, a table made whole | the offsets are the tree's own; tables grow a slot a unit |
+| a bitmap block | 42–60 | every case | 32,768 bits set one at a time | whole bytes filled, the partial ones masked |
+| releasing a finished merge and its builder | 4,447–14,890 | 100,000 nodes, one drop | every name and node freed at once | 64 pieces a unit, after the reply |
+
+The image bytes are unchanged: the golden digest in `crates/image/tests/round_trip.rs` held through the change. The
+allocator-count test `crates/vfs/tests/image_cost.rs` holds every phase's worst step, the release among them, at
+16,384 files to the worst step at 2,048 files, plus a fixed slack for the segment lists' doubling. Before the change it
+failed in every phase: the write's packing of a directory block allocated each entry's record, 268 allocations in one
+step for a root of 256 directories.
+
+**Measured and rejected.**
+- **Slices of 256 KiB of charged work** (the first daemon slicing, `copy_slice_bytes`) ran 230 µs–1.5 ms when the
+  scheduler left them alone, against a 24 µs slice: a unit's cost is not its bytes. Replaced by slices bounded by the
+  clock (A-160).
+- **Judging units by the slices the machine left alone** (`getrusage` showing no switch and no fault) hid exactly the
+  units that grew: an open that allocates 20,000 names takes its own page faults, so its 1.67 ms slice was set aside as
+  disturbed, and the longest "undisturbed" walk unit read 118 µs. Replaced by the least time of each unit over the
+  rounds.
+- **Releasing an element a unit** took 11.8 ms for 10,041 nodes on the Mac: about 150,000 one-element pops, most of
+  plain values that free nothing. Shedding a plain table a segment at a time made it 6.1 ms, and the daemon's 64 pieces
+  a unit 1.6 ms.
+- **A journal started at 16–64 MiB** in the bench and the test, so that every operation stayed recorded, measured a
+  ring the daemon never grows. With no reader open, the daemon's journal stays at its one-page floor. In the bench, the
+  ring's doubling copied 2.75 MiB (16,384 records) in one image block's write, a 302 µs unit. Both now start at the
+  daemon's floor. The doubling itself is open: a ring a lagging reader has grown copies its whole length in one append
+  (GAPS, "the journal's ring grows by copying").

@@ -50,15 +50,15 @@ fn read_whole(image: &mut Memory) -> Result<usize, ImageRefusal> {
   };
   let mut opened = Image::open(image).map_err(refusal)?;
   let read = opened.tree(image, MOST).map_err(refusal)?;
-  for (index, node) in read.tree.nodes().iter().enumerate() {
+  for (index, node) in read.tree.nodes().enumerate() {
     if let Kind::File { size } = node.kind {
       let mut bytes = vec![0u8; usize::try_from(size.min(1 << 20)).unwrap_or(0)];
       opened
-        .read(image, read.inodes[index], 0, &mut bytes)
+        .read(image, *read.inodes.get(index).unwrap(), 0, &mut bytes)
         .map_err(refusal)?;
     }
   }
-  Ok(read.tree.nodes().len())
+  Ok(read.tree.node_count())
 }
 
 fn put16(image: &mut Memory, at: usize, value: u16) {

@@ -75,7 +75,7 @@ fn walk_in_smallest_steps(image: &mut Memory) -> (ImageTree, usize) {
       counting.read
     );
     if let Walked::Done(tree) = walked {
-      return (tree, steps);
+      return (*tree, steps);
     }
   }
 }
@@ -92,15 +92,15 @@ fn read_back(image: &mut Memory) -> Vec<Canonical> {
   );
   // Non-vacuity: every entry was a step of its own, and every directory's open and close one each.
   assert!(
-    steps > read.tree.nodes().len(),
+    steps > read.tree.node_count(),
     "{steps} steps for {} nodes",
-    read.tree.nodes().len()
+    read.tree.node_count()
   );
   let inodes = read.inodes.clone();
   canonical(&read.tree, &mut |id: NodeId, size| {
     let mut bytes = vec![0u8; usize::try_from(size).unwrap()];
     let got = opened
-      .read(image, inodes[id.index()], 0, &mut bytes)
+      .read(image, *inodes.get(id.index()).unwrap(), 0, &mut bytes)
       .unwrap();
     assert_eq!(got, bytes.len(), "a file reads back whole");
     bytes

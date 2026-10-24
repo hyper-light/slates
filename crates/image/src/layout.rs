@@ -18,6 +18,7 @@
 
 use crate::error::ImageRefusal;
 use crate::format::{DIRECT_BLOCKS, EPOCH_BITS, EPOCH_MASK, GROUP_DESC_BYTES, SECTOR_BYTES};
+use crate::segments::Segments;
 use crate::tree::Timestamp;
 
 /// Shape: the block size the writer uses: 4096 bytes, `mke2fs.conf`'s default, and the page size of x86_64 and of
@@ -252,44 +253,51 @@ impl<'g> Allocator<'g> {
     self.next
   }
 
-  /// `count` blocks, as runs in slot order from slot 0.
-  pub fn take(&mut self, count: u64) -> Result<Vec<Run>, ImageRefusal> {
-    let mut runs = Vec::new();
-    let mut slot = 0u64;
-    let mut left = count;
-    while left > 0 {
-      let group = self.next / BLOCKS_PER_GROUP;
-      if group >= self.geometry.groups {
-        return Err(ImageRefusal::TooSmall {
-          need: self.geometry.blocks.saturating_add(left),
-          have: self.geometry.blocks,
-        });
-      }
-      let start = self.next.max(self.geometry.data_start(group));
-      let end = self
-        .geometry
-        .group_start(group)
-        .saturating_add(self.geometry.group_blocks(group));
-      if start >= end {
-        self.next = self.geometry.group_start(group.saturating_add(1));
-        continue;
-      }
-      let len = left.min(end.saturating_sub(start));
-      runs.push(Run { slot, start, len });
-      slot = slot.saturating_add(len);
-      left = left.saturating_sub(len);
-      self.next = start.saturating_add(len);
+  /// The next run of at most `left` blocks for the slots from `slot` on: the rest of the cursor's group's data area,
+  /// or the next group's when this one's is used up. One run a call, so a node spanning many groups is placed a group a
+  /// step (A-160; §4.3). Every group has room past its structures (the geometry drops a last group that has none), so a
+  /// call passes one used-up group at most.
+  pub fn take_run(&mut self, slot: u64, left: u64) -> Result<Run, ImageRefusal> {
+    let mut group = self.next.checked_div(BLOCKS_PER_GROUP).unwrap_or(u64::MAX);
+    let mut start = self.next.max(self.geometry.data_start(group));
+    if start >= self.group_end(group) {
+      group = group.saturating_add(1);
+      start = self.geometry.data_start(group);
     }
-    Ok(runs)
+    let end = self.group_end(group);
+    if group >= self.geometry.groups || start >= end {
+      return Err(ImageRefusal::TooSmall {
+        need: self.geometry.blocks.saturating_add(left),
+        have: self.geometry.blocks,
+      });
+    }
+    let len = left.min(end.saturating_sub(start));
+    self.next = start.saturating_add(len);
+    Ok(Run { slot, start, len })
+  }
+
+  /// One past group `group`'s last block.
+  fn group_end(&self, group: u64) -> u64 {
+    self
+      .geometry
+      .group_start(group)
+      .saturating_add(self.geometry.group_blocks(group))
   }
 }
 
 /// The block `slot` of a node whose blocks are `runs`, if it has one.
-pub fn physical(runs: &[Run], slot: u64) -> Option<u64> {
-  let index = runs
-    .partition_point(|run| run.slot <= slot)
-    .checked_sub(1)?;
-  let run = runs.get(index)?;
+pub fn physical(runs: &Segments<Run>, slot: u64) -> Option<u64> {
+  // The first run starting past `slot`, by binary search over the runs in slot order; the run before it holds `slot`.
+  let (mut low, mut high) = (0usize, runs.len());
+  while low < high {
+    let middle = low.saturating_add(high.saturating_sub(low) / 2);
+    if runs.get(middle)?.slot <= slot {
+      low = middle.saturating_add(1);
+    } else {
+      high = middle;
+    }
+  }
+  let run = runs.get(low.checked_sub(1)?)?;
   let offset = slot.checked_sub(run.slot)?;
   (offset < run.len).then(|| run.start.saturating_add(offset))
 }
@@ -415,73 +423,102 @@ impl Map {
     slots
   }
 
-  /// The indirect blocks, in slot order.
-  pub fn indirect(&self) -> Vec<Indirect> {
-    let mut blocks = Vec::new();
-    if self.data > SINGLE_FIRST {
-      blocks.push(Indirect::Data {
+  /// Whether the map has an indirect block: past the twelve direct blocks.
+  pub fn has_indirect(&self) -> bool {
+    self.data > SINGLE_FIRST
+  }
+
+  /// Indirect block `index` of the map in slot order — the single block; the double block and each single block under
+  /// it; the triple block and, for each double block under it, that block and its single blocks — or `None` past the
+  /// last. Computed from the index alone, so a writer asks for one indirect block a step whatever the file's size, never
+  /// for the whole list (A-160; §4.3): a block of pointers names at most [`POINTERS`] children.
+  pub fn indirect_at(&self, index: u64) -> Option<Indirect> {
+    if !self.has_indirect() {
+      return None;
+    }
+    if index == 0 {
+      return Some(Indirect::Data {
         slot: DIRECT_BLOCKS,
         first: SINGLE_FIRST,
         count: self.data.min(DOUBLE_FIRST).saturating_sub(SINGLE_FIRST),
       });
     }
-    if self.data > DOUBLE_FIRST {
-      let mapped = self.data.min(TRIPLE_FIRST).saturating_sub(DOUBLE_FIRST);
-      let singles = mapped.div_ceil(POINTERS);
-      blocks.push(Indirect::Blocks {
+    if self.data <= DOUBLE_FIRST {
+      return None;
+    }
+    let mut at = index.saturating_sub(1);
+    let singles = self
+      .data
+      .min(TRIPLE_FIRST)
+      .saturating_sub(DOUBLE_FIRST)
+      .div_ceil(POINTERS);
+    if at == 0 {
+      return Some(Indirect::Blocks {
         slot: DOUBLE_SLOT,
         children: (0..singles).map(Map::double_single_slot).collect(),
       });
-      for single in 0..singles {
-        let first = DOUBLE_FIRST.saturating_add(single.saturating_mul(POINTERS));
-        blocks.push(Indirect::Data {
-          slot: Map::double_single_slot(single),
-          first,
-          count: self
-            .data
-            .min(first.saturating_add(POINTERS))
-            .saturating_sub(first),
-        });
-      }
     }
-    if self.data > TRIPLE_FIRST {
-      self.push_triple(&mut blocks);
+    at = at.saturating_sub(1);
+    if at < singles {
+      let first = DOUBLE_FIRST.saturating_add(at.saturating_mul(POINTERS));
+      return Some(self.data_block(Map::double_single_slot(at), first));
     }
-    blocks
+    at = at.saturating_sub(singles);
+    if self.data <= TRIPLE_FIRST {
+      return None;
+    }
+    self.triple_at(at)
   }
 
-  /// The triple indirect block and its subtree, in slot order.
-  fn push_triple(&self, blocks: &mut Vec<Indirect>) {
-    let mapped = self.data.saturating_sub(TRIPLE_FIRST);
-    let doubles = mapped.div_ceil(POINTERS * POINTERS);
-    blocks.push(Indirect::Blocks {
-      slot: TRIPLE_SLOT,
-      children: (0..doubles).map(Map::triple_double_slot).collect(),
-    });
-    for double in 0..doubles {
-      let double_first = TRIPLE_FIRST.saturating_add(double.saturating_mul(POINTERS * POINTERS));
-      let under = self
-        .data
-        .min(double_first.saturating_add(POINTERS * POINTERS))
-        .saturating_sub(double_first);
-      let singles = under.div_ceil(POINTERS);
-      blocks.push(Indirect::Blocks {
+  /// Indirect block `at` of the triple level: the triple block, then for each double block under it that block and its
+  /// single blocks. Every double block but the last maps all [`POINTERS`] squared of its data blocks, so it and its
+  /// single blocks are `1 + POINTERS` entries, and the double block `at` falls under is found by division.
+  fn triple_at(&self, at: u64) -> Option<Indirect> {
+    let span = POINTERS.saturating_mul(POINTERS);
+    let doubles = self.data.saturating_sub(TRIPLE_FIRST).div_ceil(span);
+    if at == 0 {
+      return Some(Indirect::Blocks {
+        slot: TRIPLE_SLOT,
+        children: (0..doubles).map(Map::triple_double_slot).collect(),
+      });
+    }
+    let within_triple = at.saturating_sub(1);
+    let entries = POINTERS.saturating_add(1);
+    let double = within_triple.checked_div(entries)?;
+    if double >= doubles {
+      return None;
+    }
+    let double_first = TRIPLE_FIRST.saturating_add(double.saturating_mul(span));
+    let singles = self
+      .data
+      .min(double_first.saturating_add(span))
+      .saturating_sub(double_first)
+      .div_ceil(POINTERS);
+    match within_triple.checked_rem(entries)?.checked_sub(1) {
+      None => Some(Indirect::Blocks {
         slot: Map::triple_double_slot(double),
         children: (0..singles)
           .map(|single| Map::triple_single_slot(double, single))
           .collect(),
-      });
-      for single in 0..singles {
+      }),
+      Some(single) if single < singles => {
         let first = double_first.saturating_add(single.saturating_mul(POINTERS));
-        blocks.push(Indirect::Data {
-          slot: Map::triple_single_slot(double, single),
-          first,
-          count: self
-            .data
-            .min(first.saturating_add(POINTERS))
-            .saturating_sub(first),
-        });
+        Some(self.data_block(Map::triple_single_slot(double, single), first))
       }
+      Some(_) => None,
+    }
+  }
+
+  /// The indirect block at `slot` holding pointers to data blocks from `first`: up to [`POINTERS`] of them, as many as
+  /// the map has.
+  fn data_block(&self, slot: u64, first: u64) -> Indirect {
+    Indirect::Data {
+      slot,
+      first,
+      count: self
+        .data
+        .min(first.saturating_add(POINTERS))
+        .saturating_sub(first),
     }
   }
 }

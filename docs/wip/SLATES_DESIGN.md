@@ -3307,6 +3307,30 @@ same-namespace host process is the first delivered case.
 > `BindingNotBuilt`. Owed: the bind on Linux once the daemon serves the FUSE mount; a live guest for
 > AC-9.7. Record: `docs/wip/oci-handoff.md`.
 
+**A VMM with no folder sharing: the disk-image form (A-160).** A volume reaches a VM as a host mount shared in by the
+VMM (`docs/wip/virtiofs.md` §8 item 7). Firecracker shares no folder: it has only block and pmem devices backed by
+files. So a volume reaches it as an image file, and the guest's writes come back as a session's do, by a merge into a
+clone:
+- `slates image build ID SNAPSHOT NAME --capacity SIZE` writes the snapshot's tree as ext2 revision 1 into the file
+  `image.ext2` of a new volume, which pins the snapshot (`BaseRecord::Image`);
+- the guest's drive is that file read through a slates mount, writable;
+- `slates image merge IMAGE NAME` reads the image at a snapshot of the image volume, as hostile input, and makes a new
+  clone of the build's snapshot hold its tree. A node the build wrote, still at its number with the build's
+  generation, keeps its inode, so a renamed file is renamed and an unchanged file's chunks stay shared. It is not an
+  inferred merge (D-27): nothing else writes the clone, and the image's tree becomes its state.
+
+Both verbs defer their reply to a task of the owner shard, which runs the work one unit a call in slices bounded by the
+clock and releases what it made in slices after the reply. No unit's work follows a directory, a tree or a file: a
+directory is read, measured and closed an entry or a block at a time, arrays grow a segment at a time, a file's
+indirect blocks are computed one at a time, and the longest unit measured was 18.5 µs at 100,000 nodes on the box
+(BENCHMARKS, 2026-10-24).
+
+> **Status (2026-10-24).** Built and proven: `crates/image` (the format), `crates/vfs/src/image.rs` (the walk, the
+> I/O and the merge), `crates/server/src/image.rs` (the verbs), `slates image`. A real Firecracker v1.17.0 microVM on
+> the box read every node of a volume through its image, changed it, and the merge held a clone to exactly its tree
+> (`crates/cli/tests/guest_image.rs`, gated). Not carried: extended attributes, birth times, holes. Not yet run: a pmem
+> drive (DAX on the image file). The details and the evidence are A-160's.
+
 **Writeback and snapshot barrier.** Kernel/guest cache negotiation changes when writes reach
 the owner. `snapshot`, `submit`, `advance`, clean `detach`, migration and archive must identify
 the set of contributing writable attachments, stop admission into the closing generation,
@@ -12035,7 +12059,16 @@ Applied in the same change to:
   pin reconciliation and the destroy's unpin; the protocol's `ImageBuild`, `ImageMerge`, `ImageBuilt`, `ImageMerged`
   and `ImageRefused`; the client's `image_build` and `image_merge`; `slates image build` and `slates image merge`;
   `docs/cli.md`; `DaemonConfig::copy_slice_bytes` (formerly `dax_shift_slice_bytes`, generalized to every
-  copy-bound slice).
+  copy-bound slice);
+- (2026-10-24, every unit bounded) `crates/image`: `segments.rs` (new), `tree.rs` (segmented tables, entries in one
+  array, a stepped close and release), `write.rs` (a directory measured a block a unit, groups counted a group a unit,
+  nodes without data passed a node a unit, a file placed a group's run a unit, records packed in place, bitmaps by
+  bytes), `layout.rs` (`Map::indirect_at`, `Allocator::take_run`), `read.rs` (descriptors read on first use, records
+  read an entry a unit); `crates/vfs`: `dir.rs` and `dirtree.rs` (`DirNode::next_entry`, `TreeCursor`), `image.rs`
+  (the walk through the cursor, the merge's phases); `crates/server/src/image.rs` (the release in slices after the
+  reply); the tests `crates/vfs/tests/image_cost.rs` (new) and those the API changes touched;
+  `crates/vfs/examples/image_bench.rs`; `docs/wip/BENCHMARKS.md`, `docs/wip/GAPS.md`, `docs/wip/virtiofs.md` §8 item
+  7, and §4.6.
 
 - **What it answers.** Firecracker shares no folder with its guest. It has no virtio-fs, only block and pmem devices
   backed by files (its v1.17.0 docs, read 2026-10-23), so a volume reaches a Firecracker guest only as an image file
@@ -12092,18 +12125,20 @@ Applied in the same change to:
   number with generation 0 is, but for a 1 in 2³² chance, the node the writer put there. A merge keeps that node's
   identity through renames and rewrites.
 - **The volume's side (2026-10-24; `crates/vfs/src/image.rs`).**
-  - The build walks a snapshot depth first, each directory's entries in name order, so one snapshot always walks to
-    the same tree, node for node. It writes the image into a file of another volume. A volume over a host directory
-    is refused, since its snapshot may still read the disk.
+  - The build walks a snapshot depth first, each directory's entries in its canonical order (its folded names'
+    hashes, §4.5, a function of the names alone; name order until the 2026-10-24 change below), so one snapshot always
+    walks to the same tree, node for node. It writes the image into a file of another volume, each directory's
+    entries in name order. A volume over a host directory is refused, since its snapshot may still read the disk.
   - The merge makes a clone of the build's snapshot equal to the tree the image holds. It is not an inferred merge
     (D-27): the clone starts at the image's base, nothing else writes it, and the image's tree becomes its state. A
     node at its written number with the build's generation keeps its inode in the clone. A renamed file is renamed,
     not copied, and an unchanged file's chunks stay shared. Identity is a hint only: every name, attribute and byte is
     compared and set, so a node taken for the wrong one still ends as the image holds it.
-  - The phases, an item a step: identify; plan (an entry kept stays; one whose name the image gives to another node
-    is moved aside into a staging directory, made only when needed); attach, breadth first from the root (rename an
-    old name, link, or create); remove what is left (files first, then directories from the last walked down); unstage;
-    settle each node's size, differing chunks, permissions, owner and times (the change time set from the image).
+  - The phases, an item a step: prepare the tables and identify; under folded names, index the image's entries; plan
+    (an entry kept stays; one whose name the image gives to another node is moved aside into a staging directory,
+    made only when needed under a name sought a counter a step); attach, depth first from the root (rename an old
+    name, link, or create); remove what is left (files first, then directories from the last walked down); unstage;
+    settle each node's size, differing pages, permissions, owner and times (the change time set from the image).
     A merge of an unchanged image changes nothing.
   - Tests (`crates/vfs/tests/image.rs`, 2,000 cases each on 2026-10-24, green):
     - generated volumes round-trip through their images;
@@ -12177,6 +12212,12 @@ Applied in the same change to:
     64 KiB chunk and the new file's 27 bytes. The clone, read through its own mount, held exactly the guest's tree.
   - The guest booted to its probe's ready in 191–207 ms. The test ran green 3 of 3, and was red with the merge's chunk
     writes disabled. The crosvm guest tests share its harness (`tests/vm`) and stayed green, 3 of 3.
+  - Later runs found Firecracker's exit on the guest's restart a race: 1 of 18 at load 46–53 exited 1. The kernel's
+    `reboot=k` pulses the keyboard controller's reset for about a millisecond, then falls through to a triple fault
+    (`native_machine_emergency_restart`). When Firecracker's main thread stops the vCPU later than that, the vCPU's KVM
+    shutdown exit is one Firecracker v1.17.0 leaves unhandled (`UnhandledKvmExit("Shutdown")` → `GenericError`). The
+    test accepts that exit only when the console shows the guest's restart and Firecracker's `Shutdown` line, read
+    after the VM's last output is drained. Forced with `reboot=t` it passed, the merge after it intact.
 - **Slices bounded by the clock (2026-10-24).** The daemon first bounded each slice by 256 KiB of charged work
   (`copy_slice_bytes`). Measured with `crates/vfs/examples/image_bench.rs`, those slices ran 230 µs to 1.5 ms when
   the scheduler left them alone, ten to sixty times the box's 24 µs (half its 47.5 µs step quantum). A unit's cost
@@ -12188,8 +12229,42 @@ Applied in the same change to:
     arm64, longer than a slice. A page compares and writes in about 1 µs at p99, and only differing pages are
     written, so a chunk with no differing page is still never written.
   - The tests' byte counts follow: one page and the new file's bytes.
-- **Owed:** the design's §4.6 and `virtiofs.md` §8 item 7 updated for the disk-image route, and the costs of build
-  and merge recorded in `docs/wip/BENCHMARKS.md`.
+- **Every unit bounded (2026-10-24).** `image_bench` gained the extremes, a directory of 20,000 and of 100,000 entries
+  and a tree of 100,000 nodes, and reports each unit's least time over five rounds. A slice's wall time could not tell
+  a unit's cost from the machine's: setting aside slices the process was switched out or faulted in hid exactly the
+  units that allocate. On the Mac at load 32–38, before:
+  - the snapshot walk opened a 100,000-entry directory in one unit of 12,035 µs, every name copied and sorted;
+  - the tree grower closed it in one of 540 µs, and measuring it for the image took one of 175 µs;
+  - a node vector's doubling took 271 µs at 16,384 nodes;
+  - the merge's step from identifying to planning took 70 µs at 100,000 nodes, its tables made whole;
+  - a bitmap block, set a bit at a time, took 42–60 µs;
+  - releasing a finished merge and its builder was one drop of 4.4–14.9 ms at 100,000 nodes.
+
+  Now:
+  - the walk reads a snapshot's directory an entry a unit through a cursor into the directory itself
+    (`DirNode::next_entry`, `TreeCursor`), which nothing changes while the snapshot lives. A reading that ends short
+    of the directory's count is refused, since a missing entry would make the merge remove it;
+  - a directory closes an entry a unit, every directory's entries in one array, each directory's together;
+  - every table grows a segment at a time and never moves (`slates_image::Segments`);
+  - a directory is measured a block of entries a unit, the groups' blocks in use counted a group a unit, a file placed
+    a group's run a unit and its indirect blocks computed one at a time (`Map::indirect_at`); a directory block's
+    records are written in place, and a bitmap's bytes filled whole;
+  - the reader checks a group's descriptor when an inode of the group is first read, not every group at the open;
+  - the merge sizes its tables a slot a unit, takes each entry's offset from the tree, indexes folded names an entry a
+    unit, seeks a staging name a counter a unit, and attaches depth first from the root with a stack as deep as the
+    tree;
+  - a finished build's or merge's trees, tables and walks are released in slices after the reply, 64 pieces a unit
+    (`shed_in_slices`), a plain table a segment at a time.
+
+  The image bytes are unchanged (the golden digest held). `crates/vfs/tests/image_cost.rs` holds every phase's worst
+  step at 16,384 files to its worst at 2,048 by allocator count, through the release; it failed in every phase before.
+  The longest unit after: 18.5 µs on the box (a release unit at 100,000 nodes) and 22.9 µs on the Mac at load 55–67
+  (BENCHMARKS, 2026-10-24). The walk's new order changes which inode each node takes, not what a merge keeps:
+  identity is the written number, read back from the image. The client test now orders its guest's tree by the
+  numbers it read.
+- **Owed:** a pmem drive under Firecracker (DAX on the image file). Two costs are not a unit's and are recorded as
+  such: the refusal message of a merge names its path by scanning each parent's entries (once, as the merge stops),
+  and the new volume's publication inside the completion atom is the publication path's cost (§4.8), not the image's.
 
 ### A-159 — The bootstrap header no longer carries the daemon's process id (accepted 2026-10-23)
 Applied in the same change to:

@@ -16,7 +16,8 @@
 //! using it, and walks its tree in bounded steps ([`read::Walk`]), returning each node's inode, from which a merge
 //! reads the bytes, and its generation, by which a merge knows the nodes the writer wrote. Every tree, written or
 //! read, is checked in one place, a directory at a time ([`tree::TreeGrower`]), so no step of the daemon's pays for a
-//! whole tree.
+//! whole tree; and no step pays for a whole directory either: arrays grow a segment at a time ([`segments::Segments`]),
+//! a directory is measured and closed in steps, and what a build made is released a piece a step (§4.3; A-160).
 //!
 //! **Evidence.** Each image is held to e2fsprogs: the round-trip oracle (`tests/round_trip.rs`) writes generated
 //! trees and reads them back equal, at the format's precision; the differential (`tests/e2fsck.rs`) runs
@@ -39,10 +40,12 @@ pub mod error;
 pub mod format;
 pub mod layout;
 pub mod read;
+pub mod segments;
 pub mod tree;
 pub mod write;
 
 pub use error::{Failed, ImageRefusal};
 pub use read::{Image, ImageSource, ImageTree, Inode, Walk, Walked};
+pub use segments::Segments;
 pub use tree::{Kind, Node, NodeId, Timestamp, Tree, TreeBuilder, TreeGrower};
 pub use write::{Builder, Identity, ImageIo, Progress, Written};

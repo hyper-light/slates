@@ -30,6 +30,11 @@ fn out_of_order(refusal: ImageRefusal) -> bool {
   matches!(refusal, ImageRefusal::GrowthOutOfOrder { .. })
 }
 
+/// Closes `grower`'s open directory whole: a close moves one entry a call.
+fn close_whole(grower: &mut TreeGrower) {
+  while !grower.close().unwrap() {}
+}
+
 /// A-160 (growth out of order). Do: grow a tree out of order — an entry with no directory open, a directory opened
 /// before an entry names it, a directory opened while another is, a directory opened again once filled — and name the
 /// root, a directory twice, and one name twice in a directory. Expect each refused by its own kind.
@@ -63,7 +68,7 @@ fn growing_a_tree_out_of_order_is_refused_by_kind() {
     grower.add_entry(b"pipe".to_vec(), fifo).unwrap_err(),
     ImageRefusal::NameRepeated
   );
-  grower.close().unwrap();
+  close_whole(&mut grower);
   assert!(out_of_order(grower.open(NodeId::ROOT).unwrap_err()));
 }
 
@@ -78,12 +83,12 @@ fn a_tree_finished_before_it_is_whole_is_refused_by_kind() {
   let directory = unfilled.add_node(node(Kind::Directory)).unwrap();
   unfilled.open(NodeId::ROOT).unwrap();
   unfilled.add_entry(b"dir".to_vec(), directory).unwrap();
-  unfilled.close().unwrap();
+  close_whole(&mut unfilled);
   assert!(out_of_order(unfilled.finish().unwrap_err()));
   let mut unnamed = TreeGrower::new(node(Kind::Directory)).unwrap();
   unnamed.add_node(node(Kind::Fifo)).unwrap();
   unnamed.open(NodeId::ROOT).unwrap();
-  unnamed.close().unwrap();
+  close_whole(&mut unnamed);
   assert_eq!(
     unnamed.finish().unwrap_err(),
     ImageRefusal::Unreachable { node: 1 }
@@ -100,10 +105,10 @@ fn a_grown_tree_is_the_tree_the_batch_builder_makes() {
   whole.open(NodeId::ROOT).unwrap();
   whole.add_entry(b"pipe".to_vec(), fifo).unwrap();
   whole.add_entry(b"dir".to_vec(), directory).unwrap();
-  whole.close().unwrap();
+  close_whole(&mut whole);
   whole.open(directory).unwrap();
   whole.add_entry(b"link".to_vec(), fifo).unwrap();
-  whole.close().unwrap();
+  close_whole(&mut whole);
   let mut builder = TreeBuilder::new(node(Kind::Directory));
   let fifo = builder.add_node(node(Kind::Fifo));
   let directory = builder.add_node(node(Kind::Directory));
@@ -202,7 +207,7 @@ fn a_builder_lays_its_tree_out_a_node_a_step_before_it_writes() {
   }
   let mut opened = Image::open(&mut image).unwrap();
   let read = opened.tree(&mut image, MOST).unwrap();
-  assert_eq!(read.tree.children(NodeId::ROOT).len(), fifos);
+  assert_eq!(read.tree.entry_count(NodeId::ROOT), fifos);
 }
 
 /// The byte offset of inode `ino` in `image` (group 0): its group descriptor's inode table, then the inode's place.
@@ -239,17 +244,18 @@ fn every_written_inode_carries_the_built_generation_and_a_new_one_reads_back() {
     .ids()
     .find(|id| matches!(read.tree.node(*id).unwrap().kind, Kind::File { .. }))
     .unwrap();
-  let ino = read.inodes[file.index()];
+  let ino = *read.inodes.get(file.index()).unwrap();
   let at = inode_at(&image, ino) + inode::GENERATION;
   image.bytes[at..at + 4].copy_from_slice(&0x5eed_0001_u32.to_le_bytes());
   let mut opened = Image::open(&mut image).unwrap();
   let again = opened.tree(&mut image, MOST).unwrap();
   for (index, generation) in again.generations.iter().enumerate() {
-    let expected = if again.inodes[index] == ino {
+    let held = *again.inodes.get(index).unwrap();
+    let expected = if held == ino {
       0x5eed_0001
     } else {
       BUILT_GENERATION
     };
-    assert_eq!(*generation, expected, "inode {}", again.inodes[index]);
+    assert_eq!(*generation, expected, "inode {held}");
   }
 }
