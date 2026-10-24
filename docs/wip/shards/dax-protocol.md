@@ -1,8 +1,11 @@
 # Shards DAX over a slates backing: the protocol (Shards part 3; Shards D189, slates A-135)
 
-Status: **proposed 2026-10-24, awaiting the Shards owner's answer.** This note is what both sides agree to before either
-builds the DAX half of the Shards route. It says what crosses the stream, what each side guarantees, what a guest sees,
-and why the design is what it is. The evidence is listed at the end.
+Status: **agreed 2026-10-24.** The Shards owner (the `g121` session, `gpu`'s owner) checked the five window behaviours
+below against `gpu` at `f5dcff24`, whose fs device is unchanged since `b12ec23d`, and confirmed each. They accepted the
+range on the ask and will write the device side of it. They asked for the testguest routine as a patch series on
+`gpu` rebased on its tip, linted with `scripts/lint` on all 8 targets, never pushed by slates. They added two points,
+recorded below: shmem budgets (D188) and VM saves (D176). This note is what both sides build to: what crosses the
+stream, what each side guarantees, what a guest sees, and why. The evidence is listed at the end.
 
 ## The decision in one paragraph
 
@@ -89,16 +92,17 @@ server does (`answer` reads `1..9` and `9`).
      even for a mapping the guest asks to read only. The guest's stores reach only this copy; ingest (guarantee 5) is
      what gives them effect, and it runs only for an attachment that may write.
 3. **Before answering an ask, the object holds the file's current bytes over the asked range.**
-   - The range is filled from the volume on its first ask. A hole needs no fill, because untouched pages read as
-     zeros.
+   - The range is filled from the volume on its first ask, through slates' own mapping of the object, never by
+     `write(2)` (see (e) below). A hole needs no fill, because untouched pages read as zeros.
    - Without the range, the whole file is filled at the first ask.
 4. **Every change of the file through any path reaches the object before it is acknowledged** (write-through), over the
    ranges filled so far. An unfilled range gets the latest bytes when it is first asked for.
    - **Bytes past the file's end stay zero.** A truncate zeroes what it cuts. An extension zeroes the hole it opens,
      so a store the guest made past the old end is never taken for data.
    - On macOS only pages that hold something are zeroed: `mincore` says resident (`MINCORE_INCORE`) or paged out
-     (`MINCORE_PAGED_OUT`, a compressed or swapped page still holds its bytes). On Linux the hole is punched. Either
-     way slates never commits fresh memory to zero headroom.
+     (`MINCORE_PAGED_OUT`, a compressed or swapped page still holds its bytes). On Linux the hole is punched through
+     slates' own mapping (`MADV_REMOVE`; `fallocate` is a file write, allowed only in `slates-land`, R1). Either way
+     slates never commits fresh memory to zero headroom.
 5. **The guest's stores reach the volume at its sync points**, in an attachment that may write; a read-only
    attachment's object is never compared. At FUSE_FSYNC, FUSE_FLUSH and FUSE_RELEASE of a node with a backing, and when
    the backing ends:
@@ -123,18 +127,43 @@ server does (`answer` reads `1..9` and `9`).
      budget is reached, and a fill past it is refused `ENOMEM`, typed and counted.
    - A guest mounted `dax=always` maps every file whatever the server says (Linux `fs/fuse/dax.c:1298-1318`).
      `dax=inode` is the mode slates' choices steer; under `dax=always` the budget can only refuse.
+   - **Whose budget a page lands in (Shards D188), from the Shards owner.** On Linux a memfd's pages are shmem,
+     which nothing reclaims without swap, charged to the memory cgroup of whoever touches each first. slates' fills
+     land in slates' own cgroup. A guest's first store into a page slates never filled (a hole, or past the file's
+     end) lands in the run's cgroup, which Shards' daemon counts as no room, since its budget test pins shmem as not
+     room. A budgeted run therefore holds its stores to holes until slates lets the object go, when the node is
+     forgotten or the stream ends. Shards will record this in D188 and D189 when this lands.
 
 ## What Shards' device does
 
-**Nothing new is required.** The design rests on behaviour the device already has. Please confirm each:
-- (a) a descriptor is asked for at every FUSE_SETUPMAPPING (`mod.rs:719-725`);
-- (b) each range is mapped from its own ask's descriptor, and the first descriptor is kept as the file's
-  (`window.rs:142-150`, `:560`);
-- (c) a mapped range is changed again only to follow the file's size (`reconcile`, the watch, `memory_fault`);
-- (d) nothing maps a new range of a file without asking;
-- (e) the Linux watch (`Watch::watch`) tolerates a memfd's descriptor, which it will never see cut short.
+**Nothing new is required.** The design rests on behaviour the device already has, each confirmed by its owner on
+2026-10-24:
+- **(a)** A descriptor is asked for at every FUSE_SETUPMAPPING (`mod.rs:719-725`).
+- **(b)** Each range is mapped from its own ask's descriptor. The node keeps the first descriptor, or the first
+  writable one, for reconcile, the watch and the record of written ranges (`window.rs:142-150`, `:560`).
+- **(c)** A mapped range changes again only by:
+  - following its file's size: `reconcile`, the daemon's watch saying it was cut (`daemon/cuts.rs`), or
+    `memory_fault`;
+  - the guest mapping over it again, which includes upgrading a read-only range to writable and asks again;
+  - FUSE_REMOVEMAPPING;
+  - the device's reset, which unmaps everything;
+  - a restore (D176), where `Slot::attach` asks again for every saved mapping and maps zeros where an ask is refused.
+- **(d)** Nothing maps a new range of a file without asking. SETUPMAPPING and attach are the only two paths that map,
+  and both ask.
+- **(e)** The Linux watch tolerates a memfd, with a cost. The daemon watches each mapped node's descriptor with
+  inotify `IN_MODIFY` on its `/proc/self/fd` path (`cuts.rs`, `watch_writes`). For a memfd that is its shmem inode.
+  - A size that never shrinks never tells a cut.
+  - Every `write(2)`, `pwrite` or `fallocate` on the object fires `IN_MODIFY` and wakes the daemon to `fstat` it.
+  - Stores through a mapping fire nothing.
 
-**Optional, and proposed:** append the range to the ask, as above.
+  So slates fills and writes through **its own mapping only, never by `write(2)`**, which costs the watch nothing.
+  Linux's hole punch (guarantee 4) is a `madvise(MADV_REMOVE)`, which the kernel carries out as a `vfs_fallocate`
+  that fires the event (`mm/madvise.c:1052-1053`, `fs/open.c:340-348`). That is one wakeup per truncate or
+  extension of a mapped file. macOS has no such watch.
+
+**The range on the ask: agreed.** The Shards owner writes the device side: `descriptor_on` takes the range,
+`mapping()` passes the request's, and attach passes each saved mapping's. A test will show their own server ignores
+the extra bytes.
 
 ## What a guest sees
 
@@ -149,6 +178,11 @@ The same as through the mount route, measured there in `docs/wip/virtiofs.md`:
   The guest's unsynced stores in its maps are lost, and its next sync fails, so it knows.
 - **A detached or revoked attachment:** the stream ends after a final ingest, and slates writes through no longer. The
   VM keeps the bytes it already maps, which it was allowed to read, and its writes reach nothing.
+- **A saved VM (Shards D176), from the Shards owner.** slates refuses SAVE and RESTORE today, so no snapshot of a VM
+  holding a slates share exists. If they are served one day, the window's memory is not in the snapshot. Stores made
+  after the save and before the stream ends are ingested, so a VM restored from that snapshot sees them, as a host
+  file under DAX keeps the writes made after a save. That is consistent, and stated here so nobody expects
+  otherwise.
 
 ## What a misbehaving peer can do
 
@@ -194,6 +228,16 @@ the volume per attachment, counted against the derived budget of guarantee 9.
 - **Zero copy, handing slates' content itself.** Refused by A-135: a descriptor authorizes its whole object, and the
   content arena holds every volume. A per-file content object would end block sharing across files and volumes
   (clones, snapshots). That is what zero copy would need, recorded here.
+- **A Linux udmabuf over the file's blocks in the arena.** This is zero copy and confined, and slates' in-process
+  device uses it to hand out one window
+  (`docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md`, option 4). It does not fit
+  this route, for four reasons:
+  - Shards' window maps any range of a file at its file offset from one descriptor per file, which it also `fstat`s
+    for the file's size. A udmabuf covers a run of arena pages, not a file's layout.
+  - A copy-on-write write moves the file's bytes to new blocks, so the pinned pages go stale and a revoke would be
+    back.
+  - macOS has no counterpart.
+  - `/dev/udmabuf` access depends on the host's configuration, and each buffer is limited to 64 MB by default.
 
 ## Evidence
 
@@ -227,6 +271,12 @@ the volume per attachment, counted against the derived budget of guarantee 9.
   slates.
 - macOS SDK `sys/mman.h:226-233`: `mincore` marks a page resident (`MINCORE_INCORE`) or paged out
   (`MINCORE_PAGED_OUT`).
+- Linux master `mm/madvise.c:1052-1053` and `fs/open.c:340-348` (fetched from kernel.org 2026-10-24; sha256
+  `e9df6ee4…`, `a5c3fa10…`): `MADV_REMOVE` is carried out as `vfs_fallocate(PUNCH_HOLE | KEEP_SIZE)`, which fires
+  a modify event on success even when the size is unchanged.
+
+**The Shards owner's answer** (the `g121` session, 2026-10-24, by message). It confirmed (a)–(e) against `gpu`
+`f5dcff24`, gave the cost of (e), accepted the range, asked for the testguest series, and added D188 and D176.
 
 **Measured on this Mac** (Apple silicon, macOS 26.4.1, 2026-10-24). Each probe is a `python3 -I` script in
 `~/.cache/slates-scratch/probes/`, RAM only, which unlinks its object's name at once.

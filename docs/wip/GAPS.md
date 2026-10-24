@@ -11099,8 +11099,11 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   - Not run: a native Linux clippy of the testguest (no Linux host free); Shards' CI covers it.
 - **Owed, in order:** Shards applying the series to its repository (its owner's queue); a DAX window over a backing that authorizes only the attachment's bytes (part 3). Until part 3 a slates
   share is launched without a DAX window: a descriptor ask is refused `EOPNOTSUPP`.
-- **Part 3's protocol proposed (2026-10-24), awaiting the Shards owner's answer** (`docs/wip/shards/dax-protocol.md`,
-  sent to its session).
+- **Part 3's protocol agreed with the Shards owner (2026-10-24)** (`docs/wip/shards/dax-protocol.md`).
+  - The owner confirmed the five window behaviours the design rests on, against `gpu` `f5dcff24`.
+  - They accepted the range on the ask, and write its device side themselves.
+  - They want the testguest routine as a patch series rebased on `gpu`, linted on all 8 targets.
+  - They added the shmem budget rule (D188) and the VM-save rule (D176), both recorded in the note.
   - **No revoke and no new frames are needed.** slates answers the existing DESCRIPTOR ask with one shared-memory
     object per attachment and file, sized once to `2^63 − 2 MiB` (sparse), and writes every change of the file into
     it before acknowledging the change. The guest's stores are ingested at its FSYNC, FLUSH and RELEASE, and at the
