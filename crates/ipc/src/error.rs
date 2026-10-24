@@ -97,6 +97,57 @@ pub enum IpcError {
     /// The fault.
     fault: DeliveryFault,
   },
+  /// The Shards stream's socket route refused (§4.6, A-161): the daemon's answer to a claim, or the route's own
+  /// place on this host.
+  RouteRefused {
+    /// Why.
+    refusal: RouteRefusal,
+  },
+}
+
+/// Why the Shards stream's socket route refused (A-161; `crate::route`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteRefusal {
+  /// The daemon holds no offer for the attachment: none was made, it was claimed already, or its time ran out.
+  NoOffer,
+  /// The claim's proof did not open under the offer's secret.
+  Proof,
+  /// A message of the exchange was not the protocol's: cut short, too long, or of another version.
+  Malformed,
+  /// The daemon was serving its bound of exchanges at once.
+  Busy,
+  /// The daemon's confirmation did not open under the offer's secret: whoever answered did not make the offer.
+  Confirmation,
+  /// The end arrived flushed: the kernel emptied its receive buffer while it was in flight (XNU's collector of
+  /// descriptors in flight), so its reads would answer end of file. The daemon keeps its copy until the client has its
+  /// own, which prevents this; a flushed end is refused rather than handed to a VMM whose share would fail at once.
+  Flushed,
+  /// The directory the socket lives in is not the user's alone.
+  SharedDirectory,
+  /// The socket's path is longer than a Unix socket's address holds.
+  PathTooLong,
+  /// A daemon of this instance already answers at the socket.
+  InUse,
+}
+
+impl fmt::Display for RouteRefusal {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.write_str(match self {
+      Self::NoOffer => {
+        "the daemon holds no offer for the attachment (none made, claimed, or expired)"
+      }
+      Self::Proof => "the claim's proof did not open under the offer's secret",
+      Self::Malformed => "a message of the exchange was not the protocol's",
+      Self::Busy => "the daemon was serving its bound of exchanges",
+      Self::Confirmation => {
+        "the confirmation did not open: whoever answered did not make the offer"
+      }
+      Self::Flushed => "the end arrived flushed by the kernel in flight; attach again",
+      Self::SharedDirectory => "the socket's directory is not the user's alone",
+      Self::PathTooLong => "the socket's path is longer than an address holds",
+      Self::InUse => "a daemon of this instance already answers at the socket",
+    })
+  }
 }
 
 impl fmt::Display for IpcError {
@@ -142,6 +193,7 @@ impl fmt::Display for IpcError {
       Self::CapabilityNotDelivered { fault } => {
         write!(f, "consumer capability not delivered: {fault}")
       }
+      Self::RouteRefused { refusal } => write!(f, "the stream route refused: {refusal}"),
     }
   }
 }

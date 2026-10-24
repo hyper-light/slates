@@ -255,7 +255,7 @@ pub fn owner_of_name(name: &str, partitions: usize) -> u16 {
 }
 
 /// The runtime shard a partition lives on in this process.
-fn shard_of_partition(state: &ShardState, partition: u16) -> Option<u16> {
+pub(crate) fn shard_of_partition(state: &ShardState, partition: u16) -> Option<u16> {
   state.shards.get(usize::from(partition)).copied()
 }
 

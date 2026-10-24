@@ -980,3 +980,333 @@ fn hostile_frames_are_refused_and_end_only_their_own_stream() {
   drop(client);
   drop(daemon);
 }
+
+/// macOS: the socket route that hands a client its stream end (A-161, part 1 step 3), driven by hand on the wire so
+/// every hostile exchange can be made.
+#[cfg(target_os = "macos")]
+mod route {
+  use slates_ipc::route::{
+    Exchange, HELLO_BYTES, Hello, KIND_CHALLENGE, KIND_MALFORMED, KIND_PROOF, NONCE_BYTES,
+    SEALED_BYTES,
+  };
+
+  use super::*;
+
+  /// Shape: how long past an offer's life the expiry test waits before it claims: the offer's two liveness budgets
+  /// (`OFFER_LIFE_NS`), and half a budget for the timer's own wake on a loaded machine.
+  const PAST_EXPIRY: Duration = Duration::from_millis(2_500);
+
+  /// Attaches `id` in the Shards form over the ring: the attachment and the secret its offer is claimed with.
+  fn offer(client: &mut Client, id: VolumeId) -> (u64, [u8; 32]) {
+    match client.call(&RequestBody::Attach {
+      volume: id,
+      snapshot: None,
+      intent: Intent::Write,
+      form: slates_ipc::protocol::AttachRequest::ShardsFs { subtree: None },
+    }) {
+      ReplyBody::ShardsOffered {
+        attachment, secret, ..
+      } => (attachment, secret),
+      other => panic!("the Shards form was not offered: {other:?}"),
+    }
+  }
+
+  /// A connection to the route of `instance`, its reads bounded.
+  fn connect_route(instance: &str) -> UnixStream {
+    let stream = UnixStream::connect(slates_ipc::route::path(instance).unwrap()).unwrap();
+    stream.set_read_timeout(Some(CREDIT_WAIT)).unwrap();
+    stream
+  }
+
+  /// Sends a hello for `attachment` with `client_nonce` and reads the daemon's challenge: its nonce.
+  fn challenged(
+    stream: &mut UnixStream,
+    attachment: u64,
+    client_nonce: [u8; NONCE_BYTES],
+  ) -> [u8; NONCE_BYTES] {
+    let hello = Hello {
+      attachment,
+      client_nonce,
+    };
+    stream.write_all(&hello.encode()).unwrap();
+    let mut challenge = [0u8; 1 + NONCE_BYTES];
+    stream.read_exact(&mut challenge).unwrap();
+    assert_eq!(challenge[0], KIND_CHALLENGE);
+    challenge[1..].try_into().unwrap()
+  }
+
+  /// Reads the daemon's refusal: its kind byte, then the end; no descriptor came with it (a plain read takes none).
+  fn refused_with(stream: &mut UnixStream, kind: u8) {
+    let mut byte = [0u8; 1];
+    stream.read_exact(&mut byte).unwrap();
+    assert_eq!(byte[0], kind, "the refusal's kind");
+    assert_eq!(
+      stream.read(&mut byte).unwrap(),
+      0,
+      "the end follows the refusal"
+    );
+  }
+
+  /// The proof of a claim of `attachment` under `secret` with both nonces.
+  fn proof(
+    secret: &[u8; 32],
+    attachment: u64,
+    client: [u8; NONCE_BYTES],
+    daemon: [u8; NONCE_BYTES],
+  ) -> [u8; SEALED_BYTES] {
+    Exchange::new(secret, attachment, &client, &daemon)
+      .unwrap()
+      .proof()
+      .unwrap()
+  }
+
+  /// The ledger count of `kind` on every shard.
+  fn counted(daemon: &Daemon, kind: &str) -> u64 {
+    daemon
+      .refusals_on_every_shard()
+      .unwrap()
+      .get(kind)
+      .copied()
+      .unwrap_or(0)
+  }
+
+  /// A-161 step 3, hostile exchanges: a wrong secret, a proof replayed from another connection, a message cut short, a
+  /// claim with bytes after its proof, a hello of another version and a stranger who says nothing all get no
+  /// descriptor and a typed, counted refusal, and leave the offer to its honest claim, which then succeeds once; a
+  /// second claim with the same secret finds no offer. The listener serves every honest claim throughout.
+  #[test]
+  fn hostile_claims_get_no_descriptor_and_the_honest_claim_succeeds_once() {
+    let (daemon, instance) = single_shard_daemon("shards-route");
+    let mut client = Client::connect(&instance);
+    let ReplyBody::Created { id } = client.call(&scratch("shared")) else {
+      panic!("the volume was not created");
+    };
+    let (attachment, secret) = offer(&mut client, id);
+
+    // A stranger with the attachment but another secret.
+    let mut stranger = connect_route(&instance);
+    let client_nonce = [1u8; NONCE_BYTES];
+    let daemon_nonce = challenged(&mut stranger, attachment, client_nonce);
+    stranger
+      .write_all(&proof(&[0xa5; 32], attachment, client_nonce, daemon_nonce))
+      .unwrap();
+    refused_with(&mut stranger, KIND_PROOF);
+
+    // A proof made for one connection's nonce, replayed on another: the second daemon nonce differs.
+    let mut first = connect_route(&instance);
+    let first_nonce = challenged(&mut first, attachment, client_nonce);
+    let recorded = proof(&secret, attachment, client_nonce, first_nonce);
+    let mut replay = connect_route(&instance);
+    let _second_nonce = challenged(&mut replay, attachment, client_nonce);
+    replay.write_all(&recorded).unwrap();
+    refused_with(&mut replay, KIND_PROOF);
+    drop(first);
+
+    // A hello cut short by the client's close; a hello of another version; a right proof with bytes after it.
+    let mut short = connect_route(&instance);
+    short.write_all(&[1, 2, 3]).unwrap();
+    short.shutdown(std::net::Shutdown::Write).unwrap();
+    refused_with(&mut short, KIND_MALFORMED);
+    let mut other_version = connect_route(&instance);
+    let mut hello = Hello {
+      attachment,
+      client_nonce,
+    }
+    .encode();
+    hello[0] ^= 0xff;
+    other_version.write_all(&hello).unwrap();
+    refused_with(&mut other_version, KIND_MALFORMED);
+    let mut long = connect_route(&instance);
+    let long_nonce = challenged(&mut long, attachment, client_nonce);
+    let mut oversized = proof(&secret, attachment, client_nonce, long_nonce).to_vec();
+    oversized.extend_from_slice(&[0u8; HELLO_BYTES]);
+    long.write_all(&oversized).unwrap();
+    refused_with(&mut long, KIND_MALFORMED);
+
+    // A stranger who connects and says nothing is dropped at the exchange's deadline, counted.
+    let silent = connect_route(&instance);
+    let started = Instant::now();
+    while counted(&daemon, "shards.route_timed_out") == 0 {
+      assert!(
+        started.elapsed() < CREDIT_WAIT,
+        "a silent connection held its seat"
+      );
+      // The test thread polls the daemon's answer; no runtime wheel serves this thread (D-9 allows a test).
+      #[allow(clippy::disallowed_methods)]
+      std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(silent);
+
+    // The honest claim, after all of it, succeeds; a second with the same secret finds no offer.
+    let stream = slates_ipc::route::claim(&instance, attachment, &secret, CREDIT_WAIT).unwrap();
+    let mut guest = Guest::over(ShardsAttached {
+      attachment,
+      lease_epoch: None,
+      stream,
+    });
+    guest.init();
+    assert_eq!(guest.lookup(ROOT, "nothing"), Err(ENOENT));
+    assert!(matches!(
+      slates_ipc::route::claim(&instance, attachment, &secret, CREDIT_WAIT),
+      Err(IpcError::RouteRefused {
+        refusal: slates_ipc::error::RouteRefusal::NoOffer
+      })
+    ));
+    for (kind, at_least) in [
+      ("shards.route_proof", 2),
+      ("shards.route_malformed", 3),
+      ("shards.route_timed_out", 1),
+      ("shards.route_no_offer", 1),
+      ("shards.route_claimed", 1),
+    ] {
+      assert!(counted(&daemon, kind) >= at_least, "{kind}");
+    }
+    assert_eq!(counted(&daemon, "shards.route_claimed"), 1);
+    drop(guest);
+    drop(client);
+    drop(daemon);
+  }
+
+  /// Shape: the claims the in-flight test makes: enough that, before the daemon kept its copy of each end until the
+  /// client had its own, several ends arrived flushed (2026-10-24: 4 of 20 runs of the hostile test at load 35-46 gave
+  /// one; this test's churn makes it likelier per claim).
+  const CLAIMS_UNDER_CHURN: usize = 48;
+
+  /// A-161 step 3, by use (`docs/bugs/2026-10-24-a-stream-end-arrived-flushed-by-the-kernel-in-flight.md`): every
+  /// stream end handed over on the route arrives live while another thread opens and closes Unix sockets, each close
+  /// a chance for XNU's collector of descriptors in flight to run. Do: claim many ends under that churn, and on each
+  /// read its receive buffer and run `INIT` through it. Expect every end live: its receive buffer the kernel's
+  /// default, never the zero a flush leaves, and its `INIT` answered.
+  #[test]
+  fn every_end_handed_over_arrives_live_while_sockets_churn() {
+    let (daemon, instance) = single_shard_daemon("shards-route-churn");
+    let mut client = Client::connect(&instance);
+    let ReplyBody::Created { id } = client.call(&scratch("shared")) else {
+      panic!("the volume was not created");
+    };
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let flushed = std::thread::scope(|scope| {
+      scope.spawn(|| {
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+          drop(UnixStream::pair().unwrap());
+        }
+      });
+      // The churn stops however the claims end, a failed assertion included: the scope waits for its threads, so a
+      // churn left running would hold a failed test forever.
+      let _stop = StopOnDrop(&stop);
+      claims_under_churn(&mut client, id, &instance)
+    });
+    assert_eq!(
+      flushed, 0,
+      "{flushed} of {CLAIMS_UNDER_CHURN} ends arrived flushed"
+    );
+    assert_eq!(
+      counted(&daemon, "shards.route_claimed"),
+      u64::try_from(CLAIMS_UNDER_CHURN).unwrap()
+    );
+    drop(client);
+    drop(daemon);
+  }
+
+  /// Sets its flag when dropped: the churn's stop, on the claims' every exit.
+  struct StopOnDrop<'a>(&'a std::sync::atomic::AtomicBool);
+
+  impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+      self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+  }
+
+  /// Makes [`CLAIMS_UNDER_CHURN`] offers of `id` and claims each, running `INIT` through every live end: the ends that
+  /// arrived flushed, refused by the client (`Flushed`) or, were that check gone, reading a zero receive buffer.
+  fn claims_under_churn(client: &mut Client, id: VolumeId, instance: &str) -> usize {
+    let mut flushed = 0usize;
+    for _ in 0..CLAIMS_UNDER_CHURN {
+      let (attachment, secret) = offer(client, id);
+      let stream = match slates_ipc::route::claim(instance, attachment, &secret, CREDIT_WAIT) {
+        Ok(stream) => stream,
+        Err(IpcError::RouteRefused {
+          refusal: slates_ipc::error::RouteRefusal::Flushed,
+        }) => {
+          flushed += 1;
+          continue;
+        }
+        Err(other) => panic!("a claim failed: {other}"),
+      };
+      if rustix::net::sockopt::socket_recv_buffer_size(&stream).unwrap() == 0 {
+        flushed += 1;
+        continue;
+      }
+      let mut guest = Guest::over(ShardsAttached {
+        attachment,
+        lease_epoch: None,
+        stream,
+      });
+      guest.init();
+    }
+    flushed
+  }
+
+  /// A-161 step 3: an offer unclaimed past its life is dropped by its timer, so a claim then finds no offer, and the
+  /// end it held closes, which ends the stream's attachment.
+  #[test]
+  fn an_unclaimed_offer_expires_and_its_attachment_ends() {
+    let (daemon, instance) = single_shard_daemon("shards-route-expiry");
+    let mut client = Client::connect(&instance);
+    let ReplyBody::Created { id } = client.call(&scratch("shared")) else {
+      panic!("the volume was not created");
+    };
+    let before = status(&mut client, id).attachments;
+    let (attachment, secret) = offer(&mut client, id);
+    assert_eq!(status(&mut client, id).attachments, before + 1);
+    // The test thread waits out the offer's life; no runtime wheel serves this thread (D-9 allows a test).
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(PAST_EXPIRY);
+    assert!(matches!(
+      slates_ipc::route::claim(&instance, attachment, &secret, CREDIT_WAIT),
+      Err(IpcError::RouteRefused {
+        refusal: slates_ipc::error::RouteRefusal::NoOffer
+      })
+    ));
+    assert_eq!(counted(&daemon, "shards.route_expired"), 1);
+    wait_until("the expired offer's attachment outlived it", || {
+      status(&mut client, id).attachments == before
+    });
+    drop(client);
+    drop(daemon);
+  }
+
+  /// A-161 step 3: the route's socket exists only while its daemon runs, is a socket the user alone may use, in the
+  /// user's own temporary directory, and is the only thing there named for the instance.
+  #[test]
+  fn the_route_socket_lives_with_its_daemon_and_is_the_users_alone() {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+    let (daemon, instance) = single_shard_daemon("shards-route-node");
+    let path = slates_ipc::route::path(&instance).unwrap();
+    let metadata = std::fs::symlink_metadata(&path).unwrap();
+    assert!(metadata.file_type().is_socket());
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    assert_eq!(metadata.uid(), my_uid());
+    let directory = path.parent().unwrap();
+    assert_eq!(
+      std::fs::metadata(directory).unwrap().permissions().mode() & 0o077,
+      0
+    );
+    let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+    let named: Vec<_> = std::fs::read_dir(directory)
+      .unwrap()
+      .filter_map(Result::ok)
+      .filter(|entry| entry.file_name().to_string_lossy().starts_with(&stem))
+      .collect();
+    assert_eq!(
+      named.len(),
+      1,
+      "only the socket is named for the instance: {named:?}"
+    );
+    daemon.stop();
+    assert!(
+      std::fs::symlink_metadata(&path).is_err(),
+      "the socket went with its daemon"
+    );
+  }
+}

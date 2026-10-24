@@ -3020,6 +3020,19 @@ pub enum ReplyBody {
     /// What the merge did.
     report: ImageMergeReport,
   },
+  /// A Shards stream was attached and its end is offered on the daemon's socket route (§4.6, A-161; macOS, where no
+  /// control socket carries a descriptor): the client claims it once, with `secret`, within the offer's life. The
+  /// secret authorizes that one claim and nothing else. Appended.
+  ShardsOffered {
+    /// The attachment the daemon serves on the stream.
+    attachment: u64,
+    /// The lease epoch, for a write intent.
+    lease_epoch: Option<u64>,
+    /// The transport's report for this attachment.
+    capability: AttachmentCapability,
+    /// The single-use secret the claim's exchange is keyed from (256 bits).
+    secret: [u8; 32],
+  },
 }
 
 /// One entry of a directory listing (`ReadDir`).

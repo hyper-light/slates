@@ -464,6 +464,12 @@ pub static CLIENTS_REAPED: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// a process-global word (like the health signals) so a verb handler on any shard can report it to a
 /// client — `slates mount` reads it to run `mount_nfs localhost:PORT`.
 pub static NFS_PORT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Whether the daemon's Shards stream route bound its socket (macOS, A-161; `start_shards_route`), so a Shards attach can
+/// hand its client the stream end: process-global, as [`NFS_PORT`] is, since a production process runs one daemon. Set
+/// once its listener binds; never set elsewhere.
+pub static SHARDS_ROUTE_BOUND: std::sync::atomic::AtomicBool =
+  std::sync::atomic::AtomicBool::new(false);
 /// Configuration changes whose installed configuration **breached** the operator's declared durability bound
 /// (§4.8 "the copyset count check at every configuration change"; D-14). A health signal, surfaced not
 /// silently over-scattered: a breach is a recovery-vs-durability conflict for the operator to resolve. Zero
@@ -751,6 +757,8 @@ impl Daemon {
     }
     #[cfg(unix)]
     let nfs_port = start_nfs_transport(&runtime, control, &config, handed_connections)?;
+    #[cfg(target_os = "macos")]
+    start_shards_route(&runtime, control, &config)?;
     // No NFS transport on Windows: NFS is the macOS/Linux mount path (Windows mounts through WinFsp),
     // so a Windows daemon serves IPC clients and lands, but publishes no mount port.
     #[cfg(windows)]
@@ -3167,6 +3175,10 @@ fn init_shard(
     shards_streams: std::collections::BTreeMap::new(),
     #[cfg(unix)]
     stream_handoffs: std::collections::BTreeMap::new(),
+    #[cfg(target_os = "macos")]
+    stream_offers: std::collections::BTreeMap::new(),
+    #[cfg(target_os = "macos")]
+    route_exchanges: 0,
     clock,
     served: 0,
     refusals: std::collections::BTreeMap::new(),
@@ -4595,6 +4607,44 @@ fn start_nfs_transport(
   })?;
   Ok(Some(port))
 }
+
+/// The Shards stream's socket route (§4.6, A-161; macOS): its listener bound at its path in the user's own temporary
+/// directory and served on the `control` shard, where each connection's exchange runs (`crate::shards_route`). A route
+/// that cannot bind (a shared directory, another daemon of this instance answering there) is reported, and the Shards
+/// form is then refused `ListenerNotBound`; the daemon serves everything else.
+#[cfg(target_os = "macos")]
+fn start_shards_route(
+  runtime: &Runtime,
+  control: ShardId,
+  config: &DaemonConfig,
+) -> Result<(), RtError> {
+  let listener = match slates_ipc::route::Listener::bind(&config.instance) {
+    Ok(listener) => listener,
+    Err(error) => {
+      eprintln!(
+        "slates-server: the Shards stream route did not bind ({error}); a Shards attach is refused"
+      );
+      crate::fleet::count_refusal(SHARDS_ROUTE_UNBOUND);
+      return Ok(());
+    }
+  };
+  SHARDS_ROUTE_BOUND.store(true, Ordering::Release);
+  runtime.spawn_on(control, async move {
+    match futures::spawn(crate::shards_route::serve(listener)) {
+      Ok(task) => {
+        let _ = futures::detach(task);
+      }
+      Err(_) => {
+        crate::fleet::count_refusal(LOOP_SPAWN_REFUSED);
+      }
+    }
+  })?;
+  Ok(())
+}
+
+/// Counter: the Shards stream route that did not bind its socket (macOS): the Shards form is refused while it stands.
+#[cfg(target_os = "macos")]
+const SHARDS_ROUTE_UNBOUND: &str = "shards.route_unbound";
 
 /// Releases and closes FUSE devices the anchor handed back to a daemon on a platform without FUSE: there is no mount to
 /// serve them, and an anchor that keeps them would hand them to every daemon after. Reported, since a device here means

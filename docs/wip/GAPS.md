@@ -11041,10 +11041,21 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   takes only the one its reply names: before, a content map delivered for a request whose caller had given up could
   answer the next map read (found by reading the delivery code while adding the second kind; not reproduced as a
   failure).
-- **Owed, in order:** macOS's socket route with an encrypted, authenticated exchange (step 3); the CLI's attach and a
-  Windows refusal by kind (step 4); docs and CI (step 5); Shards' `--slates-fs-fd` on its current branch and a real boot
-  (part 2); a DAX window over a backing that authorizes only the attachment's bytes (part 3). Until part 3 a slates
-  share is launched without a DAX window: a descriptor ask is refused `EOPNOTSUPP`.
+- **Step 3 built (macOS, 2026-10-24):** the socket route, one owner-only socket file in the user's own temporary
+  directory carrying an exchange keyed by HKDF-SHA256 from a single-use 256-bit secret and sealed with AES-256-GCM
+  (`slates_ipc::route`, `crates/server/src/shards_route.rs`). Hostile claims are refused by kind and counted; the
+  socket exists only while its daemon runs. **The macOS descriptor handoff is closed for this route.**
+- **Fixed on the way: a passed end could arrive flushed by the kernel**
+  (`docs/bugs/2026-10-24-a-stream-end-arrived-flushed-by-the-kernel-in-flight.md`): XNU's in-flight collector flushed
+  the end when the daemon closed its copy before the client's receive returned (4 of 20 claims at load 35-47; 16-40 of
+  48 under socket churn, none after the daemon kept its copy until the client closed the route).
+- **Open, unproven: Linux's control-socket handoff closes the daemon's copy right after the send**
+  (`shards::deliver_handoff`, and A-135's `send_mapping`). Linux's collector is a different design and is not known to
+  flush a socket in flight, and no Linux run has failed so; a churn test like the macOS one is owed on Linux.
+- **Owed, in order:** the CLI's attach and a Windows refusal by kind (step 4); docs and CI (step 5); Shards'
+  `--slates-fs-fd` on its current branch and a real boot (part 2); a DAX window over a backing that authorizes only the
+  attachment's bytes (part 3). Until part 3 a slates share is launched without a DAX window: a descriptor ask is refused
+  `EOPNOTSUPP`.
 - **Open, found by the new tests: a read-only attachment is not a read-only file system to its client.** On every FUSE
   transport (the shared bridge) an open for writing is granted and each write through it refused `EPERM`; NFS answers
   `PERM`. A read-only file system answers `EROFS`, at the open for an open. Every change is refused and nothing lands,

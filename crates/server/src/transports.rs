@@ -76,6 +76,9 @@ pub(crate) struct Situation {
   /// Whether this host offers an unprivileged FUSE mount (Linux: `/dev/fuse` and the OS's `fusermount3`),
   /// read once per process.
   pub(crate) fuse_available: bool,
+  /// Whether the daemon's Shards stream route bound its socket (macOS, A-161): whether a stream end can reach a
+  /// client there.
+  pub(crate) stream_route_bound: bool,
 }
 
 /// The situation of this daemon, on this host, for a caller with `rights` on a volume.
@@ -85,6 +88,8 @@ pub(crate) fn situation(_state: &ShardState, rights: &Rights) -> Situation {
     nfs_listener_bound: crate::daemon::NFS_PORT.load(std::sync::atomic::Ordering::Acquire) != 0,
     may_write: rights.write,
     fuse_available: host_facts_once().fuse_available,
+    stream_route_bound: crate::daemon::SHARDS_ROUTE_BOUND
+      .load(std::sync::atomic::Ordering::Acquire),
   }
 }
 
@@ -473,10 +478,10 @@ fn guest_entries(situation: &Situation) -> Vec<AttachmentCapability> {
 
 /// The Shards fs stream (§4.6, the Shards route; A-161): the daemon serves an attachment on one end of an anonymous
 /// socket pair and hands the attaching client the other, for a Shards VMM. Offered where the daemon can hand a client
-/// a descriptor: Linux, over the client's control socket (`crate::shards`); the macOS socket route and a Windows
-/// handle route are owed. The guest's kernel negotiates no write-back cache and has no invalidation path, so it
-/// revalidates, and its pages are its own; DAX is not offered (a descriptor ask is refused). The evidence is a test
-/// playing Shards' device against a real daemon, not yet a Shards microVM.
+/// a descriptor: Linux, over the client's control socket (`crate::shards`), and macOS, on the socket route when its
+/// listener bound (`crate::shards_route`); a Windows handle route is owed. The guest's kernel negotiates no write-back
+/// cache and has no invalidation path, so it revalidates, and its pages are its own; DAX is not offered (a descriptor
+/// ask is refused). The evidence is a test playing Shards' device against a real daemon, not yet a Shards microVM.
 pub(crate) fn shards_fs(situation: &Situation) -> AttachmentCapability {
   let sharing = sharing(
     true,
@@ -489,18 +494,21 @@ pub(crate) fn shards_fs(situation: &Situation) -> AttachmentCapability {
   let residency = Residency::DaemonRamAndGuestPageCache { dax_mapped: false };
   let target = TargetPathConstraint::GuestTag;
   let reason = match situation.platform {
-    Platform::Linux => {
-      return offered(
-        AttachTransport::ShardsFs,
-        situation,
-        target,
-        sharing,
-        residency,
-        Conformance::SimulatedShardsDevice,
-      );
-    }
-    Platform::MacOs | Platform::Windows => UnsupportedReason::DescriptorRouteNotBuilt,
-    Platform::Other => UnsupportedReason::HostPlatform,
+    Platform::Linux => None,
+    Platform::MacOs if situation.stream_route_bound => None,
+    Platform::MacOs => Some(UnsupportedReason::ListenerNotBound),
+    Platform::Windows => Some(UnsupportedReason::DescriptorRouteNotBuilt),
+    Platform::Other => Some(UnsupportedReason::HostPlatform),
+  };
+  let Some(reason) = reason else {
+    return offered(
+      AttachTransport::ShardsFs,
+      situation,
+      target,
+      sharing,
+      residency,
+      Conformance::SimulatedShardsDevice,
+    );
   };
   refused(
     AttachTransport::ShardsFs,
@@ -635,12 +643,14 @@ pub(crate) fn report(situation: &Situation) -> TransportReport {
 mod tests {
   use super::*;
 
+  /// A situation on `platform` whose listeners (the NFS export's, the Shards stream route's) bound or did not.
   fn on(platform: Platform, nfs_listener_bound: bool) -> Situation {
     Situation {
       platform,
       nfs_listener_bound,
       may_write: true,
       fuse_available: false,
+      stream_route_bound: nfs_listener_bound,
     }
   }
 
@@ -806,32 +816,39 @@ mod tests {
     }
   }
 
-  /// The Shards stream (A-161) is offered where the daemon hands a client a descriptor, Linux, as a tag-like target
-  /// with the guest's own page cache, no DAX and the simulated device as its evidence; macOS and Windows name the
-  /// owed descriptor route, and any other platform has none.
+  /// The Shards stream (A-161) is offered where the daemon hands a client a descriptor, as a tag-like target with the
+  /// guest's own page cache, no DAX and the simulated device as its evidence: on Linux always, on macOS when the
+  /// socket route bound (refused `ListenerNotBound` when it did not); Windows names the owed descriptor route, and any
+  /// other platform has none.
   #[test]
   fn the_shards_stream_is_offered_where_a_descriptor_reaches_the_client() {
-    let linux = entry(&on(Platform::Linux, true), AttachTransport::ShardsFs);
-    assert!(linux.supported);
-    assert_eq!(linux.conformance, Conformance::SimulatedShardsDevice);
-    assert_eq!(linux.target_path, TargetPathConstraint::GuestTag);
-    assert_eq!(
-      linux.residency,
-      Residency::DaemonRamAndGuestPageCache { dax_mapped: false }
-    );
-    for platform in [Platform::MacOs, Platform::Windows] {
-      let refused = entry(&on(platform, true), AttachTransport::ShardsFs);
+    for (platform, bound) in [
+      (Platform::Linux, false),
+      (Platform::Linux, true),
+      (Platform::MacOs, true),
+    ] {
+      let offered = entry(&on(platform, bound), AttachTransport::ShardsFs);
+      assert!(offered.supported, "{platform:?}");
+      assert_eq!(offered.conformance, Conformance::SimulatedShardsDevice);
+      assert_eq!(offered.target_path, TargetPathConstraint::GuestTag);
       assert_eq!(
-        refused.unsupported_reason,
-        Some(UnsupportedReason::DescriptorRouteNotBuilt),
-        "{platform:?}"
+        offered.residency,
+        Residency::DaemonRamAndGuestPageCache { dax_mapped: false }
       );
+    }
+    for (platform, bound, reason) in [
+      (Platform::MacOs, false, UnsupportedReason::ListenerNotBound),
+      (
+        Platform::Windows,
+        true,
+        UnsupportedReason::DescriptorRouteNotBuilt,
+      ),
+      (Platform::Other, true, UnsupportedReason::HostPlatform),
+    ] {
+      let refused = entry(&on(platform, bound), AttachTransport::ShardsFs);
+      assert_eq!(refused.unsupported_reason, Some(reason), "{platform:?}");
       assert_eq!(refused.conformance, Conformance::None);
     }
-    assert_eq!(
-      entry(&on(Platform::Other, true), AttachTransport::ShardsFs).unsupported_reason,
-      Some(UnsupportedReason::HostPlatform)
-    );
   }
 
   /// The read/write policy is the caller's ceiling: a reader sees read-only everywhere.

@@ -447,6 +447,14 @@ pub struct ShardState {
   /// requests the shard's clients may have in flight: an attach past it is refused `Overloaded`.
   #[cfg(unix)]
   pub(crate) stream_handoffs: crate::shards::Handoffs,
+  /// The Shards stream ends offered on the socket route, by attachment (A-161, macOS; `crate::shards_route`): each
+  /// claimable once with its secret until it expires. Bounded with the handoffs.
+  #[cfg(target_os = "macos")]
+  pub(crate) stream_offers: crate::shards_route::Offers,
+  /// The socket route's exchanges running on this shard (the control shard serves them). Bounded by the shard's
+  /// client seats: a connection past them is refused `Busy`.
+  #[cfg(target_os = "macos")]
+  pub(crate) route_exchanges: usize,
   /// The clock.
   pub clock: slates_vfs::clock::HostClock,
   /// Requests served.

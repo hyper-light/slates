@@ -1,10 +1,11 @@
 //! A-161 by use (§4.6, the Shards route): a client attaches a volume in the Shards form and receives the stream end the
 //! daemon serves the attachment on, as a Shards spawner would before handing it to its VMM. On Linux the end comes
-//! over the client's control socket, sent just before the attach's reply; the test then speaks FUSE through it in
-//! Shards' framing (a little-endian length, then the request; one reply frame back) and checks every change through
-//! slates' own reads and writes. The daemon has two shards and the test attaches a volume on each, so one attach is
-//! served on the client's own shard and the other on another shard, whose end comes home with the forwarded reply.
-//! Elsewhere the form is refused typed, leaving nothing behind.
+//! over the client's control socket, sent just before the attach's reply; on macOS the client claims it on the
+//! daemon's socket route with the secret the reply carries. The test then speaks FUSE through it in Shards' framing
+//! (a little-endian length, then the request; one reply frame back) and checks every change through slates' own reads
+//! and writes. The daemon has two shards and the test attaches a volume on each, so one attach is served on the
+//! client's own shard and the other on another shard, whose end comes home with the forwarded reply (Linux) or is
+//! taken from the owner shard by the route's exchange (macOS).
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(
   clippy::unwrap_used,
@@ -97,9 +98,9 @@ fn volume(client: &mut Client, name: &str) -> VolumeId {
     .unwrap()
 }
 
-/// Linux: the end comes over the control socket, and FUSE runs through it.
-#[cfg(target_os = "linux")]
-mod linux {
+/// Linux and macOS: the end comes by the platform's route, and FUSE runs through it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod delivered {
   use std::io::{ErrorKind, Read, Write};
   use std::os::unix::net::UnixStream;
 
@@ -415,23 +416,4 @@ mod linux {
     drop(client);
     drop(daemon);
   }
-}
-
-/// Every platform but Linux, A-161 step 2: the form is refused typed, before any effect, and no attachment is left.
-#[cfg(not(target_os = "linux"))]
-#[test]
-fn the_shards_form_is_refused_typed_where_no_descriptor_route_is_built() {
-  let (daemon, mut client) = start("refused");
-  let volume = volume(&mut client, "refused");
-  let before = client.status(volume).unwrap().attachments;
-  match client.attach_shards(volume, Intent::Write, None) {
-    Err(ClientError::Refused(slates_client::Refusal::AttachmentUnsupported {
-      transport: slates_client::AttachTransport::ShardsFs,
-      reason: slates_client::UnsupportedReason::DescriptorRouteNotBuilt,
-    })) => {}
-    other => panic!("the Shards form was not refused by kind: {other:?}"),
-  }
-  assert_eq!(client.status(volume).unwrap().attachments, before);
-  drop(client);
-  drop(daemon);
 }

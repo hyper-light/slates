@@ -365,7 +365,7 @@ mod structural {
     ),
     (
       "slates-ipc",
-      "the per-OS rendezvous, which creates no filesystem entry (§4.7)",
+      "the per-OS rendezvous, which creates no filesystem entry (§4.7); on macOS the Shards stream's socket route, one owner-only socket node in the user's own temporary directory, removed with its daemon (A-161; socket files authorized by Ada 2026-10-22 when what crosses them is encrypted)",
     ),
     (
       "slates-mcp",

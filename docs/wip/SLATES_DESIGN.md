@@ -144,7 +144,7 @@ the two equal):
 | `slates-machine` | reads the kernel's pseudo-files (/proc, /sys) as queries; never writes |
 | `slates-base` | read-only access to the directories overlay volumes sit on (§4.15) |
 | `slates-land` | the only writer of host paths, under a grant (§4.15) |
-| `slates-ipc` | the per-OS rendezvous, which creates no filesystem entry (§4.7) |
+| `slates-ipc` | the per-OS rendezvous, which creates no filesystem entry (§4.7); on macOS the Shards stream's socket route, one owner-only socket node in the user's own temporary directory, removed with its daemon (A-161; socket files authorized by Ada 2026-10-22 when what crosses them is encrypted) |
 | `slates-mcp` | the loopback MCP Streamable HTTP transport (§4.12); authorized by Ada 2026-09-06 |
 | `slates-bridge-fuse` | the mount and its device file (§4.6) |
 | `slates-bridge-nfs` | the mount point and loopback socket (§4.6) |
@@ -3353,10 +3353,12 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 > **Status (2026-10-24).** Built and proven by use, in-process: `crates/server/src/shards.rs` (the serve task),
 > `crates/ipc/src/stream.rs` (the pair), `crates/bridge-fuse/src/shards_fs.rs` (the frames and their answers),
 > `Daemon::attach_shards_stream`, with seven tests against a real daemon (`crates/server/tests/shards.rs`). Over the
-> wire on Linux: `attach` with `AttachRequest::ShardsFs` sends the end over the client's control socket just before the
-> reply, from either shard (`Client::attach_shards`, `crates/client/tests/shards.rs`); elsewhere the form is refused
-> `DescriptorRouteNotBuilt`. Not yet: the macOS socket route, the CLI, a real Shards boot against the daemon, and DAX.
-> The details and the evidence are A-161's.
+> wire: on Linux `attach` with `AttachRequest::ShardsFs` sends the end over the client's control socket just before the
+> reply, from either shard; on macOS the reply carries a single-use secret and the client claims the end on the
+> daemon's socket route, an exchange keyed by HKDF-SHA256 and sealed with AES-256-GCM (`slates_ipc::route`,
+> `crates/server/src/shards_route.rs`). `Client::attach_shards` takes either; Windows refuses the form
+> `DescriptorRouteNotBuilt`. Not yet: the CLI, a real Shards boot against the daemon, and DAX. The details and the
+> evidence are A-161's.
 
 **Writeback and snapshot barrier.** Kernel/guest cache negotiation changes when writes reach
 the owner. `snapshot`, `submit`, `advance`, clean `detach`, migration and archive must identify
@@ -12089,6 +12091,12 @@ Applied in the same change to:
   `crates/server`: `shards.rs` (`attach_verb`, the handoffs, the destroy and rollback hooks), `verbs.rs` (the attach
   form, `send_reply`, `send_forward`, the destroy's wait), `transports.rs` (the report's entry); `crates/client`
   (`attach_shards`, `ShardsStream`, deliveries matched by what the reply names) and `tests/shards.rs` (new);
+- (step 3) `crates/ipc`: `route.rs` (new, macOS), `error.rs` (`RouteRefused`, `RouteRefusal`), `protocol.rs`
+  (`ReplyBody::ShardsOffered`, appended), `Cargo.toml` (aws-lc-rs on macOS); `crates/server`: `shards_route.rs` (new),
+  `shards.rs` (the platform's hand-out), `daemon.rs` (`start_shards_route`, `SHARDS_ROUTE_BOUND`), `transports.rs` (the
+  route's fact), `state.rs`; `crates/client` (`attach_shards` claims an offer); the tests; `unsafe-budget.toml`
+  (`slates-ipc` 47 → 48, the `confstr` call); `xtask` (the route's socket node in `slates-ipc`'s host-path reason);
+  `docs/bugs/2026-10-24-a-stream-end-arrived-flushed-by-the-kernel-in-flight.md`;
 - §4.6, GAPS.
 
 - **What it answers.** Shards' fs device forwards each guest FUSE request to a backend over a Unix stream it is handed
@@ -12173,10 +12181,45 @@ Applied in the same change to:
     detach ending the stream; on macOS, the refusal by kind with nothing left behind. The control socket's envelope is
     tested in `crates/ipc/src/rendezvous.rs`: three deliveries of two kinds in order, and a delivery of an unknown kind
     or the wrong length refused with its descriptor closed.
-- **Owed:** macOS's socket route (its exchange encrypted and authenticated), the CLI's attach and a Windows refusal by
-  kind, Shards' own `--slates-fs-fd` on its current branch and a real boot (part 2), and a DAX window over a backing
-  that authorizes only the attachment's bytes (part 3). The one-file example and its blocking helpers go once the CLI
-  hands a stream out.
+- **macOS: the socket route (2026-10-24, part 1 step 3).** macOS has no control socket, and a descriptor reaches an
+  unrelated process there only through a Unix socket with a name, so the daemon listens on one socket file: in the
+  user's own temporary directory (`confstr(_CS_DARWIN_USER_TEMP_DIR)`, checked to be the user's alone, never `/tmp`),
+  named by a hash of the instance, made owner-only, removed when the daemon stops, and a node a dead daemon left found
+  unanswered and replaced. Socket files are authorized for this when what crosses them is encrypted end to end (Ada,
+  2026-10-22).
+  - The attach keeps the end as an offer on the volume's owner shard with a fresh 256-bit secret, expiring after two
+    liveness budgets (the client's reply deadline, then the claim), and replies `ShardsOffered` with the secret.
+  - The claim: the client's hello (version, attachment, its nonce), the daemon's nonce, then per-direction keys by
+    HKDF-SHA256 from the secret salted with both nonces, the client's proof and the daemon's confirmation each the
+    attachment sealed with AES-256-GCM (the transcript as additional data, each key sealing one message at nonce
+    zero). The owner shard checks the proof and retires the offer, so the secret never leaves it; the end goes by
+    `SCM_RIGHTS` with the confirmation, which the client opens before it trusts the end.
+  - Bounds: a shard's exchanges at its client seats (`Busy` past them), each within one liveness budget; every
+    refusal is one byte naming its kind and every ending is counted (`shards.route_*`, `shards.route_claimed` the
+    route's non-vacuity counter). The crypto is aws-lc-rs's, a dependency of `slates-ipc` on macOS only, so the
+    crate's cross-lint targets keep no C dependency.
+  - **Found by the hostile test: a passed end could arrive flushed by the kernel**
+    (`docs/bugs/2026-10-24-a-stream-end-arrived-flushed-by-the-kernel-in-flight.md`). XNU's collector of descriptors in
+    flight flushes a socket whose every reference is in a message (`unp_gc` → `sorflush`); the daemon closed its copy
+    right after the send, so 4 of 20 claims at load 35-47 received an end whose reads answered end of file and whose
+    `SO_RCVBUF` read 0. Now the daemon keeps its copy until the client closes the route after its receive, and the
+    client refuses a flushed end `Flushed`. `every_end_handed_over_arrives_live_while_sockets_churn` claims 48 ends
+    while another thread opens and closes sockets: 16–40 of 48 flushed before the fix, none after; the route tests
+    passed 30 of 30 at load 49–55.
+  - Evidence: `crates/client/tests/shards.rs` (the history from both shards, two scoped ends, a detach) passes on macOS
+    through the route; `crates/server/tests/shards.rs` drives the wire by hand: a wrong secret, a proof replayed from
+    another connection, a message cut short, one of another version, bytes after the proof, a silent stranger, each
+    refused by kind and counted with the offer left to its honest claim, which succeeds once; a second claim and an
+    expired offer find none, the expired offer's attachment ending; the socket exists only while its daemon runs,
+    owner-only, the only entry named for the instance. The protocol's unit tests (`route.rs`): an exchange holds only
+    under its own secret, nonces and attachment, every tampered byte fails, a hostile hello is refused.
+  - What it does not change: the secret is as private as the client's ring, which on macOS a same-user process could
+    open by name (GAP-A9-9), and that process could read the ring's file contents as well.
+- **Owed:** the CLI's attach and a Windows refusal by kind (step 4), Shards' own `--slates-fs-fd` on its current branch
+  and a real boot (part 2), and a DAX window over a backing that authorizes only the attachment's bytes (part 3). The
+  one-file example and its blocking helpers go once the CLI hands a stream out. Linux's control-socket handoff still
+  closes the daemon's copy right after the send; Linux's collector is a different design and is not known to flush, but
+  it is not proven either.
 
 ### A-160 — A volume's disk-image form: ext2, written in bounded steps, read back as hostile input (accepted 2026-10-23)
 Applied in the same change to:

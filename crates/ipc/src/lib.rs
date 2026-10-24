@@ -44,6 +44,8 @@ pub mod park;
 pub mod protocol;
 pub mod region;
 pub mod rendezvous;
+#[cfg(target_os = "macos")]
+pub mod route;
 
 pub mod slot;
 pub mod status;

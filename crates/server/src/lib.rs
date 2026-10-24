@@ -97,6 +97,9 @@ mod snapshot_view;
 // virtio-fs transport.
 #[cfg(unix)]
 pub mod shards;
+// The Shards stream's socket route (A-161): macOS hands a client its stream end through it, having no control socket.
+#[cfg(target_os = "macos")]
+mod shards_route;
 pub mod state;
 mod status_pages;
 pub mod takeover;

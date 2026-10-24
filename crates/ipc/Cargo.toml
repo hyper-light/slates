@@ -26,6 +26,12 @@ loom = "0.7"
 rustix = { workspace = true }
 libc = { workspace = true }
 
+# The Shards stream's socket route (`route`, A-161): its exchange is keyed by HKDF-SHA256 from a single-use secret and
+# sealed with AES-256-GCM, from the one crypto library. macOS only, the one platform that needs the route, so the crate
+# keeps no C dependency on the targets it is cross-linted for.
+[target.'cfg(target_os = "macos")'.dependencies]
+aws-lc-rs = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
 

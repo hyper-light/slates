@@ -308,10 +308,11 @@ pub(crate) fn attach(s: &mut ShardState, ask: ShardsAsk) -> Result<ShardsAttache
 }
 
 /// The attach verb's Shards form (§4.4, §4.6; A-161), on the volume's owner shard inside the verb's transaction: the
-/// attachment made and served as [`attach`] makes it, and its stream end kept for the client under the request's word,
-/// sent just before the reply this returns. Linux only: the end reaches a client over its control socket, which the
-/// other platforms do not have (refused `DescriptorRouteNotBuilt`, before any effect). A snapshot is not presented
-/// over a stream yet (refused `Unsupported`).
+/// attachment made and served as [`attach`] makes it, and its end handed out by the platform's route ([`hand_out`]):
+/// Linux keeps it for the client's control socket, sent just before the reply this returns; macOS offers it on the
+/// socket route, the reply carrying the claim's secret. Where the transport report refuses the form (no route here,
+/// or the route's listener unbound) it is refused by the report's reason before any effect. A snapshot is not
+/// presented over a stream yet (refused `Unsupported`).
 pub(crate) fn attach_verb(
   s: &mut ShardState,
   principal: &Principal,
@@ -320,10 +321,14 @@ pub(crate) fn attach_verb(
   (intent, subtree): (Intent, Option<String>),
 ) -> slates_ipc::protocol::ReplyBody {
   let refused = |refusal| slates_ipc::protocol::ReplyBody::Refused { refusal };
-  if !cfg!(target_os = "linux") {
+  let report = crate::transports::shards_fs(&crate::transports::situation(
+    s,
+    &slates_db::catalog::Rights::default(),
+  ));
+  if let Some(reason) = report.unsupported_reason {
     return refused(Refusal::AttachmentUnsupported {
       transport: slates_ipc::protocol::AttachTransport::ShardsFs,
-      reason: slates_ipc::protocol::UnsupportedReason::DescriptorRouteNotBuilt,
+      reason,
     });
   }
   if snapshot.is_some() {
@@ -336,9 +341,13 @@ pub(crate) fn attach_verb(
       reason: "a Shards stream is attached by a recorded request".to_owned(),
     });
   };
-  if s.stream_handoffs.len() >= handoff_bound(s) {
+  if pending_ends(s) >= handoff_bound(s) {
     return refused(Refusal::Overloaded { shard: s.shard });
   }
+  let prepared = match prepare() {
+    Ok(prepared) => prepared,
+    Err(refusal) => return refused(refusal),
+  };
   let attached = match attach(
     s,
     ShardsAsk {
@@ -351,25 +360,71 @@ pub(crate) fn attach_verb(
     Ok(attached) => attached,
     Err(refusal) => return refused(refusal),
   };
+  let rights = s
+    .db
+    .partition()
+    .attachment(attached.attachment)
+    .map(|record| record.rights)
+    .unwrap_or_default();
+  let mut capability = report;
+  capability.read_write = if rights.write {
+    slates_ipc::protocol::ReadWritePolicy::ReadWrite
+  } else {
+    slates_ipc::protocol::ReadWritePolicy::ReadOnly
+  };
+  hand_out(s, id.word(), attached, capability, prepared)
+}
+
+/// The stream ends this shard holds for clients: kept for a control socket, or offered on the socket route.
+fn pending_ends(s: &ShardState) -> usize {
+  #[cfg(target_os = "macos")]
+  let offered = s.stream_offers.len();
+  #[cfg(not(target_os = "macos"))]
+  let offered = 0usize;
+  s.stream_handoffs.len().saturating_add(offered)
+}
+
+/// What a hand-out needs made before the attach, so nothing it can refuse comes after one: on macOS the offer's secret,
+/// drawn now (a refused random source refuses the attach before any effect).
+#[cfg(target_os = "macos")]
+type Prepared = [u8; slates_ipc::route::SECRET_BYTES];
+/// See the macOS arm: Linux's hand-out needs nothing made first.
+#[cfg(not(target_os = "macos"))]
+type Prepared = ();
+
+/// Draws the offer's secret (macOS).
+#[cfg(target_os = "macos")]
+fn prepare() -> Result<Prepared, Refusal> {
+  slates_ipc::route::random::<{ slates_ipc::route::SECRET_BYTES }>().map_err(|_| {
+    Refusal::BadRequest {
+      reason: "secure random unavailable for the stream's secret".to_owned(),
+    }
+  })
+}
+
+/// See the macOS arm.
+#[cfg(not(target_os = "macos"))]
+fn prepare() -> Result<Prepared, Refusal> {
+  Ok(())
+}
+
+/// Linux: the end is kept under the request's word for the client's control socket (`deliver_handoff`), and the reply
+/// is the plain `Attached`.
+#[cfg(target_os = "linux")]
+fn hand_out(
+  s: &mut ShardState,
+  request: u64,
+  attached: ShardsAttached,
+  capability: slates_ipc::protocol::AttachmentCapability,
+  (): Prepared,
+) -> slates_ipc::protocol::ReplyBody {
   let ShardsAttached {
     attachment,
     lease_epoch,
     stream,
   } = attached;
   s.stream_handoffs
-    .insert(id.word(), Handoff { attachment, stream });
-  let rights = s
-    .db
-    .partition()
-    .attachment(attachment)
-    .map(|record| record.rights)
-    .unwrap_or_default();
-  let mut capability = crate::transports::shards_fs(&crate::transports::situation(s, &rights));
-  capability.read_write = if rights.write {
-    slates_ipc::protocol::ReadWritePolicy::ReadWrite
-  } else {
-    slates_ipc::protocol::ReadWritePolicy::ReadOnly
-  };
+    .insert(request, Handoff { attachment, stream });
   slates_ipc::protocol::ReplyBody::Attached {
     attachment,
     lease_epoch,
@@ -379,6 +434,53 @@ pub(crate) fn attach_verb(
     capability,
     // A stream presents no mount capability: the end is the capability.
     token: None,
+  }
+}
+
+/// macOS: the end is offered on the socket route under `secret` (`crate::shards_route`), and the reply carries the
+/// secret. An offer whose expiry could not be armed is dropped at once, closing the end, so the stream ends its
+/// attachment, and the attach is refused `Overloaded`.
+#[cfg(target_os = "macos")]
+fn hand_out(
+  s: &mut ShardState,
+  _request: u64,
+  attached: ShardsAttached,
+  capability: slates_ipc::protocol::AttachmentCapability,
+  secret: Prepared,
+) -> slates_ipc::protocol::ReplyBody {
+  let ShardsAttached {
+    attachment,
+    lease_epoch,
+    stream,
+  } = attached;
+  if !crate::shards_route::offer(s, attachment, secret, stream) {
+    return slates_ipc::protocol::ReplyBody::Refused {
+      refusal: Refusal::Overloaded { shard: s.shard },
+    };
+  }
+  slates_ipc::protocol::ReplyBody::ShardsOffered {
+    attachment,
+    lease_epoch,
+    capability,
+    secret,
+  }
+}
+
+/// Any other Unix: no route to hand a client the end, which the transport report refuses before this is reached; the
+/// end closes, so the stream ends its attachment.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn hand_out(
+  _s: &mut ShardState,
+  _request: u64,
+  _attached: ShardsAttached,
+  _capability: slates_ipc::protocol::AttachmentCapability,
+  (): Prepared,
+) -> slates_ipc::protocol::ReplyBody {
+  slates_ipc::protocol::ReplyBody::Refused {
+    refusal: Refusal::AttachmentUnsupported {
+      transport: slates_ipc::protocol::AttachTransport::ShardsFs,
+      reason: slates_ipc::protocol::UnsupportedReason::HostPlatform,
+    },
   }
 }
 

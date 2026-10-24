@@ -158,7 +158,9 @@
 #   there, `OpenProcess(SYNCHRONIZE)`, adopting its handle as an `OwnedHandle`, and
 #   `WaitForSingleObject` with a zero timeout (3). The anchor-held rendezvous (`rendezvous.rs` `adopt`, 2026-10-06,
 #   A-114): on Linux, borrowing the listening socket the anchor handed over by number to duplicate it close-on-exec,
-#   the shape the segment handoff already has (1). 46 → 47.
+#   the shape the segment handoff already has (1). 46 → 47. The Shards stream's socket route (`route.rs`, 2026-10-24,
+#   A-161, compiled only for macOS): `confstr(_CS_DARWIN_USER_TEMP_DIR)` naming the user's own temporary directory,
+#   which libc exposes without a safe wrapper, into a buffer whose length it is given (1). 47 → 48.
 # slates-server (5): the Windows liveness probe of a client's
 #   process (`peer.rs`, added 2026-09-05 with the dead-client reclaim): open, wait with a zero
 #   timeout, close (3), compiled only for Windows; and the daemon adopting the anchor's inherited
@@ -263,7 +265,7 @@ slates-vfs = 0
 slates-land = 4
 slates-anchor = 6
 slates-db = 0
-slates-ipc = 47
+slates-ipc = 48
 # 2026-09-19 (-1): Linux rendezvous awaits driver readiness; no raw-fd polling thread.
 # 2026-09-28 (+1): the inherited fleet serve sockets (`fleet.rs` `adopt_inherited`).
 #   Raised 5 → 6 on 2026-10-03 for A-64 (content resident once): `daemon::arena_region` maps the shard's arena range of

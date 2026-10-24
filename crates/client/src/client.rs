@@ -948,9 +948,9 @@ impl Client {
   /// Attaches `volume` to a Shards microVM's fs device over an anonymous stream (§4.6, the Shards route; A-161): the
   /// daemon serves the attachment on its end of a socket pair, on the volume's owner shard, and hands this client the
   /// other end, to pass to the VMM. With `subtree`, only that directory; with `Intent::Read`, every change refused.
-  /// The attachment ends when the stream's other end closes (or a `detach`, a revocation, the volume's destroy).
-  /// Linux receives the end over the control socket; other platforms are refused
-  /// `AttachmentUnsupported{ShardsFs, DescriptorRouteNotBuilt}` until their route is built.
+  /// The attachment ends when the stream's other end closes (or a `detach`, a revocation, the volume's destroy). Linux
+  /// receives the end over the control socket, sent before the reply; macOS claims it on the daemon's socket route
+  /// with the secret the reply carries (`slates_ipc::route`), each socket step bounded by the reply deadline.
   #[cfg(unix)]
   pub fn attach_shards(
     &mut self,
@@ -958,26 +958,95 @@ impl Client {
     intent: Intent,
     subtree: Option<&str>,
   ) -> Result<ShardsStream, ClientError> {
-    let attachment = self.attach_with(
+    let reply = self.call(&RequestBody::Attach {
       volume,
-      None,
+      snapshot: None,
       intent,
-      AttachRequest::ShardsFs {
+      form: AttachRequest::ShardsFs {
         subtree: subtree.map(str::to_owned),
       },
-    )?;
-    let id = attachment.attachment;
-    let delivered = self.recv_delivery(
-      |delivery| matches!(delivery, ControlDelivery::Stream(stream) if stream.attachment == id),
-    )?;
-    let ControlDelivery::Stream(delivered) = delivered else {
-      return Err(ClientError::UnexpectedReply {
+    })?;
+    match reply {
+      ReplyBody::Attached {
+        attachment,
+        lease_epoch,
+        path,
+        version,
+        established,
+        capability,
+        token,
+      } => {
+        let delivered = self.recv_delivery(|delivery| {
+          matches!(delivery, ControlDelivery::Stream(stream) if stream.attachment == attachment)
+        })?;
+        let ControlDelivery::Stream(delivered) = delivered else {
+          return Err(ClientError::UnexpectedReply {
+            verb: "attach_shards",
+          });
+        };
+        Ok(ShardsStream {
+          attachment: Attachment {
+            attachment,
+            lease_epoch,
+            path,
+            version,
+            established,
+            capability,
+            token,
+          },
+          stream: delivered.stream,
+        })
+      }
+      ReplyBody::ShardsOffered {
+        attachment,
+        lease_epoch,
+        capability,
+        secret,
+      } => Ok(ShardsStream {
+        stream: self.claim_offer(attachment, &secret)?,
+        attachment: Attachment {
+          attachment,
+          lease_epoch,
+          path: None,
+          version: None,
+          established: Established::Record,
+          capability,
+          token: None,
+        },
+      }),
+      _ => Err(ClientError::UnexpectedReply {
         verb: "attach_shards",
-      });
-    };
-    Ok(ShardsStream {
+      }),
+    }
+  }
+
+  /// Claims the stream end offered for `attachment` on the daemon's socket route with the offer's `secret` (macOS,
+  /// A-161), each socket step bounded by the client's reply deadline.
+  #[cfg(target_os = "macos")]
+  fn claim_offer(
+    &self,
+    attachment: u64,
+    secret: &[u8; 32],
+  ) -> Result<std::os::fd::OwnedFd, ClientError> {
+    slates_ipc::route::claim(
+      &self.instance,
       attachment,
-      stream: delivered.stream,
+      secret,
+      std::time::Duration::from_nanos(self.deadlines.reply_ns),
+    )
+    .map_err(ClientError::Ipc)
+  }
+
+  /// No socket route here: a daemon on this platform answers the Shards form with the end on the control socket, so an
+  /// offer is not one of its replies.
+  #[cfg(all(unix, not(target_os = "macos")))]
+  fn claim_offer(
+    &self,
+    _attachment: u64,
+    _secret: &[u8; 32],
+  ) -> Result<std::os::fd::OwnedFd, ClientError> {
+    Err(ClientError::UnexpectedReply {
+      verb: "attach_shards",
     })
   }
 

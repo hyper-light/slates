@@ -1521,6 +1521,7 @@ dependencies = [
 name = "slates-ipc"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "blake3",
  "libc",
  "loom",
