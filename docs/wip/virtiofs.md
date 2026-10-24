@@ -397,12 +397,15 @@ box shared with two other builds — timings are not benchmarks)
    Firecracker's piece, a snapshot presented as a disk-image file and merged back, is built (above).
 
    **slates' direct connection** (the VM's virtio-fs device talking to slates itself: `attach_vhost_user_device`
-   in-process, and since 2026-10-24 the daemon's Shards stream handed out by `slates shards`, A-161) is kept as a
-   later optimization: it removes the host's
-   filesystem layer and lets DAX map slates' own memory with no copy. It is not needed for any target to work.
-   Two designs for it were written and withdrawn on 2026-10-21: handing slates a socket from the launcher (which
-   had no answer on macOS), then a slates-owned listener (Ada asked why another socket was needed when NFS has
-   one, and why a mount would not do — it does).
+   in-process, and since 2026-10-24 the daemon's Shards stream handed out by `slates shards`, A-161) removes the
+   host's filesystem layer and lets DAX map slates' own memory with no copy. It is not needed for any target to
+   work: the mount serves every one. Two designs for it were written and withdrawn on 2026-10-21: handing slates a
+   socket from the launcher (which had no answer on macOS), then a slates-owned listener (Ada asked why another
+   socket was needed when NFS has one, and why a mount would not do — it does). **Superseded on 2026-10-22:** Ada's
+   goal update asks for DAX on every platform and environment by both routes, a host mount with the host's DAX and
+   the socket route (socket files allowed when what crosses them is encrypted end to end and at rest), so the
+   direct connection is built beside the mount, not after it (A-161 and its Shards parts). A consumer may still
+   choose either route.
 
 ## 9. For the integrator (docs this branch does not touch)
 
