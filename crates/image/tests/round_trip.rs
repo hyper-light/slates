@@ -9,15 +9,22 @@
   clippy::expect_used,
   clippy::panic,
   clippy::indexing_slicing,
-  clippy::disallowed_types
+  clippy::disallowed_types,
+  clippy::unwrap_in_result
 )]
 
 mod common;
 
+use std::convert::Infallible;
+
 use common::{Canonical, Contents, IDENTITY, Memory, canonical, node, sample, write};
 use proptest::prelude::*;
-use slates_image::layout::{BLOCK_BYTES, POINTERS};
-use slates_image::{Image, ImageRefusal, Kind, Node, NodeId, Timestamp, Tree, TreeBuilder};
+use slates_image::format::{DIRENT_HEADER_BYTES, INDIRECT_LEVELS, NAME_MAX};
+use slates_image::layout::{BLOCK_BYTES, INODE_BYTES, POINTERS};
+use slates_image::{
+  Failed, Image, ImageRefusal, ImageSource, ImageTree, Kind, Node, NodeId, Timestamp, Tree,
+  TreeBuilder, Walk, Walked,
+};
 
 /// Shape: the capacity of a generated tree's image: room for its files (each below 64 KiB here) many times over.
 const GENERATED_CAPACITY: u64 = 16 << 20;
@@ -28,14 +35,73 @@ const ONE_STEP: u64 = u64::MAX;
 /// Shape: the entries a test tree may hold when read back.
 const MOST_ENTRIES: usize = 1 << 20;
 
-/// The canonical form of the tree `image` holds, with its files' bytes read from it.
+/// Derived: the most bytes one unit of a walk reads from its source: an entry's record with the longest name, the
+/// inode it names and a slow symlink's block, the block reached through every level of indirect blocks.
+const MOST_A_UNIT_READS: u64 = (DIRENT_HEADER_BYTES + NAME_MAX) as u64
+  + INODE_BYTES
+  + BLOCK_BYTES * (1 + INDIRECT_LEVELS as u64);
+
+/// An image source that counts the bytes read from it.
+struct Counting<'m> {
+  image: &'m mut Memory,
+  read: u64,
+}
+
+impl ImageSource<Infallible> for Counting<'_> {
+  fn image_len(&self) -> u64 {
+    self.image.image_len()
+  }
+
+  fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), Infallible> {
+    self.read += u64::try_from(buf.len()).unwrap();
+    self.image.read_at(offset, buf)
+  }
+}
+
+/// The tree `image` holds, walked in the smallest steps: one unit each, none reading past [`MOST_A_UNIT_READS`].
+/// Returns the tree and the steps taken.
+fn walk_in_smallest_steps(image: &mut Memory) -> (ImageTree, usize) {
+  let mut counting = Counting { image, read: 0 };
+  let mut opened = Image::open(&mut counting).unwrap();
+  let mut walk = Walk::new(&mut opened, &mut counting, MOST_ENTRIES).unwrap();
+  let mut steps = 0;
+  loop {
+    steps += 1;
+    counting.read = 0;
+    let walked = walk.step(&mut opened, &mut counting, 1).unwrap();
+    assert!(
+      counting.read <= MOST_A_UNIT_READS,
+      "a step of one unit read {} bytes",
+      counting.read
+    );
+    if let Walked::Done(tree) = walked {
+      return (tree, steps);
+    }
+  }
+}
+
+/// The canonical form of the tree `image` holds, with its files' bytes read from it. The tree is walked whole and in
+/// the smallest steps, and both walks must read the same tree, inode for inode.
 fn read_back(image: &mut Memory) -> Vec<Canonical> {
+  let (stepped, steps) = walk_in_smallest_steps(image);
   let mut opened = Image::open(image).unwrap();
-  let read = opened.tree(MOST_ENTRIES).unwrap();
+  let read = opened.tree(image, MOST_ENTRIES).unwrap();
+  assert_eq!(
+    stepped, read,
+    "a walk in steps reads the tree a whole walk reads"
+  );
+  // Non-vacuity: every entry was a step of its own, and every directory's open and close one each.
+  assert!(
+    steps > read.tree.nodes().len(),
+    "{steps} steps for {} nodes",
+    read.tree.nodes().len()
+  );
   let inodes = read.inodes.clone();
   canonical(&read.tree, &mut |id: NodeId, size| {
     let mut bytes = vec![0u8; usize::try_from(size).unwrap()];
-    let got = opened.read(inodes[id.index()], 0, &mut bytes).unwrap();
+    let got = opened
+      .read(image, inodes[id.index()], 0, &mut bytes)
+      .unwrap();
     assert_eq!(got, bytes.len(), "a file reads back whole");
     bytes
   })
@@ -246,12 +312,7 @@ fn one_tree_writes_the_same_bytes_in_any_steps() {
     uuid: [1; 16],
     ..IDENTITY
   };
-  let mut builder = slates_image::Builder::new(&tree, GENERATED_CAPACITY, other).unwrap();
-  let mut image = Memory {
-    bytes: vec![0; usize::try_from(builder.image_bytes()).unwrap()],
-  };
-  let mut source = contents.clone();
-  while builder.step(&mut source, &mut image, ONE_STEP).unwrap() == slates_image::Progress::More {}
+  let (image, _, _) = common::write_with(&tree, &contents, GENERATED_CAPACITY, ONE_STEP, other);
   assert!(image.bytes != once.bytes, "the identity is in the bytes");
 }
 
@@ -343,10 +404,12 @@ fn a_tree_the_format_cannot_hold_is_refused_by_kind() {
     refusal_of_node(node(Kind::Symlink { target: Vec::new() })),
     ImageRefusal::SymlinkInvalid { len: 0 }
   );
-  let (tree, _) = sample();
-  let too_small = slates_image::Builder::new(&tree, 8 * BLOCK_BYTES, IDENTITY).unwrap_err();
+  let (tree, contents) = sample();
+  let too_small = common::try_write(&tree, &contents, 8 * BLOCK_BYTES, ONE_STEP, IDENTITY)
+    .map(|_| ())
+    .unwrap_err();
   assert!(
-    matches!(too_small, ImageRefusal::TooSmall { .. }),
+    matches!(too_small, Failed::Image(ImageRefusal::TooSmall { .. })),
     "{too_small:?}"
   );
 }

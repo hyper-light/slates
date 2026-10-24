@@ -1,9 +1,11 @@
-//! Writing a tree as an ext2 image, in steps a caller bounds (§4.3: bounded work everywhere). A [`Builder`] lays the
-//! whole image out when it is made: the geometry, every node's blocks and inode number. Each [`Builder::step`] then
-//! writes until a byte budget is spent: the superblock and the group descriptors (with their `sparse_super` copies),
-//! each group's bitmaps, the inode-table blocks that hold an inode in use, then each node's blocks in order, its data
-//! first and its indirect blocks after. The caller sizes the image before the first step ([`Builder::image_bytes`]);
-//! every byte not written is a zero, so free space, unused inodes and a file's zero blocks cost the sink nothing.
+//! Writing a tree as an ext2 image, in steps a caller bounds (§4.3: bounded work everywhere). A [`Builder`] plans the
+//! geometry when it is made, from the capacity and the node count alone. Each [`Builder::step`] then works until a
+//! byte budget is spent: first the layout, a node at a time — each node's blocks measured, the total held to the
+//! capacity, then each node's blocks placed — and then the writing: the superblock and the group descriptors (with
+//! their `sparse_super` copies), each group's bitmaps, the inode-table blocks that hold an inode in use, then each
+//! node's blocks in order, its data first and its indirect blocks after. The caller sizes the image before the first
+//! step ([`Builder::image_bytes`]); every byte not written is a zero, so free space, unused inodes and a file's zero
+//! blocks cost the sink nothing.
 //!
 //! Inode numbers follow node order: the root is inode 2, and node `n` is inode `10 + n`, so the inodes in use are
 //! exactly the reserved ones and a prefix after them. A file system's identity (its UUID and creation time) is the
@@ -22,18 +24,15 @@ use crate::layout::{
 };
 use crate::tree::{Kind, NodeId, Timestamp, Tree};
 
-/// Where a file's bytes come from while its image is written.
-pub trait ContentSource<E> {
+/// Where a file's bytes come from and the image's bytes go while an image is written: one object, since a caller's
+/// files and its image usually live in the same store and are borrowed together.
+pub trait ImageIo<E> {
   /// Fills `buf` with node `node`'s bytes from `offset`, returning how many it filled; fewer than asked only at the
   /// file's end.
-  fn read(&mut self, node: NodeId, offset: u64, buf: &mut [u8]) -> Result<usize, E>;
-}
-
-/// Where an image's bytes go.
-pub trait ImageSink<E> {
+  fn read_content(&mut self, node: NodeId, offset: u64, buf: &mut [u8]) -> Result<usize, E>;
   /// Writes `bytes` at `offset` of the image. The image is [`Builder::image_bytes`] long before the first write, and
   /// every byte never written reads as zero.
-  fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<(), E>;
+  fn write_image(&mut self, offset: u64, bytes: &[u8]) -> Result<(), E>;
 }
 
 /// A file system's identity: what makes two images of one tree tell themselves apart, and what keeps one tree's image
@@ -73,9 +72,13 @@ struct Placement {
   runs: Vec<Run>,
 }
 
-/// Where a builder is in its writing.
+/// Where a builder is in its layout and its writing.
 #[derive(Clone, Debug)]
 enum Cursor {
+  /// Measuring node `node`'s blocks.
+  Measure { node: usize },
+  /// Placing node `node`'s blocks.
+  Place { node: usize },
   /// The superblock copy of group `group`, the first group with a copy at or after it.
   Superblock { group: u64 },
   /// Block `block` of group `group`'s copy of the group descriptor table.
@@ -100,82 +103,51 @@ enum Cursor {
   Done,
 }
 
-/// An image being written: laid out at construction, written in [`Builder::step`]s.
+/// An image being written: its geometry planned at construction, laid out and written in [`Builder::step`]s.
 #[derive(Debug)]
-pub struct Builder<'t> {
-  tree: &'t Tree,
+pub struct Builder {
+  tree: Tree,
   geometry: Geometry,
   identity: Identity,
+  /// Each node's block map, measured.
+  maps: Vec<Map>,
+  /// The slots of the nodes measured so far.
+  slots: u64,
   placements: Vec<Placement>,
-  /// The allocator's cursor after every node: each group's data blocks before it are in use, none after.
+  /// The allocator's cursor after the nodes placed so far: each group's data blocks before it are in use, none after.
   allocated: u64,
   /// The directories whose inodes are in each group (`bg_used_dirs_count`).
   directories: Vec<u64>,
   cursor: Cursor,
 }
 
-impl<'t> Builder<'t> {
-  /// Lays `tree` out in an image of `capacity` bytes with `identity`, or says why it cannot.
-  pub fn new(
-    tree: &'t Tree,
-    capacity: u64,
-    identity: Identity,
-  ) -> Result<Builder<'t>, ImageRefusal> {
+impl Builder {
+  /// Plans `tree`'s image of `capacity` bytes with `identity`, or says why the capacity cannot hold its inodes. Whether
+  /// it holds the tree's blocks is known once they are measured, in the first steps.
+  pub fn new(tree: Tree, capacity: u64, identity: Identity) -> Result<Builder, ImageRefusal> {
     let nodes = u64::try_from(tree.nodes().len()).unwrap_or(u64::MAX);
     // The reserved inodes (the root among them), then one per node after the root.
     let inodes_needed = u64::from(FIRST_INO)
       .saturating_sub(1)
       .saturating_add(nodes.saturating_sub(1));
     let geometry = Geometry::plan(capacity, inodes_needed)?;
-    let mut maps = Vec::with_capacity(tree.nodes().len());
-    let mut slots = 0u64;
-    for id in tree.ids() {
-      let map = Map::new(data_blocks(tree, id))?;
-      slots = slots.saturating_add(map.slots());
-      maps.push(map);
-    }
-    let need = geometry.meta_total().saturating_add(slots);
-    if need > geometry.blocks {
-      return Err(ImageRefusal::TooSmall {
-        need,
-        have: geometry.blocks,
-      });
-    }
-    let mut allocator = Allocator::new(&geometry);
-    let mut placements = Vec::with_capacity(maps.len());
-    for map in maps {
-      let runs = allocator.take(map.slots())?;
-      placements.push(Placement { map, runs });
-    }
-    let allocated = allocator.next();
-    let mut directories = vec![0u64; usize::try_from(geometry.groups).unwrap_or(0)];
-    let per_group = geometry.inodes_per_group.max(1);
-    for id in tree.ids() {
-      if tree
-        .node(id)
-        .is_some_and(|node| node.kind == Kind::Directory)
-      {
-        let group = u64::from(ino_of(id))
-          .saturating_sub(1)
-          .checked_div(per_group)
-          .unwrap_or(u64::MAX);
-        if let Some(count) = usize::try_from(group)
-          .ok()
-          .and_then(|group| directories.get_mut(group))
-        {
-          *count = count.saturating_add(1);
-        }
-      }
-    }
+    let count = tree.nodes().len();
     Ok(Builder {
+      directories: vec![0u64; usize::try_from(geometry.groups).unwrap_or(0)],
+      allocated: geometry.data_start(0),
       tree,
       geometry,
       identity,
-      placements,
-      allocated,
-      directories,
-      cursor: Cursor::Superblock { group: 0 },
+      maps: Vec::with_capacity(count),
+      slots: 0,
+      placements: Vec::with_capacity(count),
+      cursor: Cursor::Measure { node: 0 },
     })
+  }
+
+  /// The tree being written.
+  pub fn tree(&self) -> &Tree {
+    &self.tree
   }
 
   /// The image's length: what the caller sizes it to before the first step.
@@ -190,18 +162,13 @@ impl<'t> Builder<'t> {
 
   /// Writes until at least `budget` bytes are written or the image is whole: at least one structure or block a step,
   /// so every step makes progress.
-  pub fn step<E>(
-    &mut self,
-    content: &mut dyn ContentSource<E>,
-    sink: &mut dyn ImageSink<E>,
-    budget: u64,
-  ) -> Result<Progress, Failed<E>> {
+  pub fn step<E>(&mut self, io: &mut dyn ImageIo<E>, budget: u64) -> Result<Progress, Failed<E>> {
     let mut spent = 0u64;
     loop {
       if matches!(self.cursor, Cursor::Done) {
         return Ok(Progress::Done(self.written()));
       }
-      spent = spent.saturating_add(self.advance(content, sink)?);
+      spent = spent.saturating_add(self.advance(io)?);
       if spent >= budget {
         return Ok(if matches!(self.cursor, Cursor::Done) {
           Progress::Done(self.written())
@@ -223,33 +190,87 @@ impl<'t> Builder<'t> {
     }
   }
 
-  /// Writes the structure or block the cursor names and moves it on; returns the bytes written.
-  fn advance<E>(
-    &mut self,
-    content: &mut dyn ContentSource<E>,
-    sink: &mut dyn ImageSink<E>,
-  ) -> Result<u64, Failed<E>> {
+  /// Lays out or writes what the cursor names and moves it on; returns the bytes it cost.
+  fn advance<E>(&mut self, io: &mut dyn ImageIo<E>) -> Result<u64, Failed<E>> {
     match std::mem::replace(&mut self.cursor, Cursor::Done) {
-      Cursor::Superblock { group } => self.write_superblock(group, sink),
-      Cursor::Descriptors { group, block } => self.write_descriptors(group, block, sink),
-      Cursor::Bitmap { group, inodes } => self.write_bitmap(group, inodes, sink),
-      Cursor::InodeTable { group, block } => self.write_inode_block(group, block, sink),
-      Cursor::Data { node, index, entry } => self.write_data(node, index, entry, content, sink),
+      Cursor::Measure { node } => self.measure(node).map_err(Failed::Image),
+      Cursor::Place { node } => self.place(node).map_err(Failed::Image),
+      Cursor::Superblock { group } => self.write_superblock(group, io),
+      Cursor::Descriptors { group, block } => self.write_descriptors(group, block, io),
+      Cursor::Bitmap { group, inodes } => self.write_bitmap(group, inodes, io),
+      Cursor::InodeTable { group, block } => self.write_inode_block(group, block, io),
+      Cursor::Data { node, index, entry } => self.write_data(node, index, entry, io),
       Cursor::Indirect {
         node,
         index,
         blocks,
-      } => self.write_indirect(node, index, blocks, sink),
+      } => self.write_indirect(node, index, blocks, io),
       Cursor::Done => Ok(0),
     }
   }
 
+  /// Measures node `node`'s blocks, and counts it among its group's directories if it is one; after the last node,
+  /// holds the whole to the capacity. A node's layout is charged its inode's bytes and, for a directory, the bytes its
+  /// entries pack into: the work of measuring it.
+  fn measure(&mut self, node: usize) -> Result<u64, ImageRefusal> {
+    let Some(id) = self.tree.id(node) else {
+      let need = self.geometry.meta_total().saturating_add(self.slots);
+      if need > self.geometry.blocks {
+        return Err(ImageRefusal::TooSmall {
+          need,
+          have: self.geometry.blocks,
+        });
+      }
+      self.cursor = Cursor::Place { node: 0 };
+      return Ok(0);
+    };
+    let blocks = data_blocks(&self.tree, id);
+    let map = Map::new(blocks)?;
+    self.slots = self.slots.saturating_add(map.slots());
+    self.maps.push(map);
+    let directory = self
+      .tree
+      .node(id)
+      .is_some_and(|node| node.kind == Kind::Directory);
+    let mut cost = INODE_BYTES;
+    if directory {
+      cost = cost.saturating_add(blocks.saturating_mul(BLOCK_BYTES));
+      let group = u64::from(ino_of(id))
+        .saturating_sub(1)
+        .checked_div(self.geometry.inodes_per_group.max(1))
+        .unwrap_or(u64::MAX);
+      if let Some(count) = usize::try_from(group)
+        .ok()
+        .and_then(|group| self.directories.get_mut(group))
+      {
+        *count = count.saturating_add(1);
+      }
+    }
+    self.cursor = Cursor::Measure {
+      node: node.saturating_add(1),
+    };
+    Ok(cost)
+  }
+
+  /// Places node `node`'s blocks at the allocator's cursor; after the last node, the writing begins. Charged the
+  /// node's inode's bytes.
+  fn place(&mut self, node: usize) -> Result<u64, ImageRefusal> {
+    let Some(map) = self.maps.get(node).copied() else {
+      self.cursor = Cursor::Superblock { group: 0 };
+      return Ok(0);
+    };
+    let mut allocator = Allocator::at(&self.geometry, self.allocated);
+    let runs = allocator.take(map.slots())?;
+    self.allocated = allocator.next();
+    self.placements.push(Placement { map, runs });
+    self.cursor = Cursor::Place {
+      node: node.saturating_add(1),
+    };
+    Ok(INODE_BYTES)
+  }
+
   /// The superblock copy of the first group at or after `group` that carries one; then its descriptor table.
-  fn write_superblock<E>(
-    &mut self,
-    group: u64,
-    sink: &mut dyn ImageSink<E>,
-  ) -> Result<u64, Failed<E>> {
+  fn write_superblock<E>(&mut self, group: u64, io: &mut dyn ImageIo<E>) -> Result<u64, Failed<E>> {
     let Some(group) = (group..self.geometry.groups).find(|group| Geometry::has_super(*group))
     else {
       self.cursor = Cursor::Bitmap {
@@ -264,7 +285,7 @@ impl<'t> Builder<'t> {
       self.block_offset(self.geometry.group_start(group))?
     };
     let bytes = self.superblock(group)?;
-    sink.write_at(at, &bytes).map_err(Failed::Source)?;
+    io.write_image(at, &bytes).map_err(Failed::Source)?;
     self.cursor = Cursor::Descriptors { group, block: 0 };
     Ok(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
   }
@@ -274,7 +295,7 @@ impl<'t> Builder<'t> {
     &mut self,
     group: u64,
     block: u64,
-    sink: &mut dyn ImageSink<E>,
+    io: &mut dyn ImageIo<E>,
   ) -> Result<u64, Failed<E>> {
     let first = self
       .geometry
@@ -282,8 +303,7 @@ impl<'t> Builder<'t> {
       .saturating_add(1)
       .saturating_add(block);
     let bytes = self.descriptor_block(block);
-    sink
-      .write_at(self.block_offset(first)?, &bytes)
+    io.write_image(self.block_offset(first)?, &bytes)
       .map_err(Failed::Source)?;
     let next = block.saturating_add(1);
     self.cursor = if next < self.geometry.gdt_blocks {
@@ -301,15 +321,14 @@ impl<'t> Builder<'t> {
     &mut self,
     group: u64,
     inodes: bool,
-    sink: &mut dyn ImageSink<E>,
+    io: &mut dyn ImageIo<E>,
   ) -> Result<u64, Failed<E>> {
     let (block, bits) = if inodes {
       (self.geometry.inode_bitmap(group), self.inode_bitmap(group))
     } else {
       (self.geometry.block_bitmap(group), self.block_bitmap(group))
     };
-    sink
-      .write_at(self.block_offset(block)?, &bits)
+    io.write_image(self.block_offset(block)?, &bits)
       .map_err(Failed::Source)?;
     self.cursor = match (inodes, group.saturating_add(1) < self.geometry.groups) {
       (false, _) => Cursor::Bitmap {
@@ -331,7 +350,7 @@ impl<'t> Builder<'t> {
     &mut self,
     group: u64,
     block: u64,
-    sink: &mut dyn ImageSink<E>,
+    io: &mut dyn ImageIo<E>,
   ) -> Result<u64, Failed<E>> {
     let used = self.inodes_used_in(group);
     if block.saturating_mul(INODES_PER_BLOCK) >= used {
@@ -355,8 +374,7 @@ impl<'t> Builder<'t> {
       bytes.extend_from_slice(&self.inode(ino)?);
     }
     let at = self.geometry.inode_table(group).saturating_add(block);
-    sink
-      .write_at(self.block_offset(at)?, &bytes)
+    io.write_image(self.block_offset(at)?, &bytes)
       .map_err(Failed::Source)?;
     self.cursor = Cursor::InodeTable {
       group,
@@ -388,8 +406,7 @@ impl<'t> Builder<'t> {
     node: usize,
     index: u64,
     entry: usize,
-    content: &mut dyn ContentSource<E>,
-    sink: &mut dyn ImageSink<E>,
+    io: &mut dyn ImageIo<E>,
   ) -> Result<u64, Failed<E>> {
     let placement = self
       .placements
@@ -413,7 +430,7 @@ impl<'t> Builder<'t> {
           head.copy_from_slice(&target);
         }
       }
-      Kind::File { size } => fill_file(content, id, index, size, &mut bytes)?,
+      Kind::File { size } => fill_file(io, id, index, size, &mut bytes)?,
       Kind::CharDevice { .. } | Kind::BlockDevice { .. } | Kind::Fifo | Kind::Socket => {}
     }
     // A zero block of a file is left unwritten: the image reads it as zero, and a sparse source stays cheap.
@@ -422,8 +439,7 @@ impl<'t> Builder<'t> {
       Some(Kind::File { .. })
     ) && bytes.iter().all(|byte| *byte == 0);
     if !skip {
-      sink
-        .write_at(self.block_offset(block)?, &bytes)
+      io.write_image(self.block_offset(block)?, &bytes)
         .map_err(Failed::Source)?;
     }
     let next = index.saturating_add(1);
@@ -463,7 +479,7 @@ impl<'t> Builder<'t> {
     node: usize,
     index: usize,
     blocks: Vec<Indirect>,
-    sink: &mut dyn ImageSink<E>,
+    io: &mut dyn ImageIo<E>,
   ) -> Result<u64, Failed<E>> {
     let placement = self
       .placements
@@ -490,8 +506,7 @@ impl<'t> Builder<'t> {
     };
     let at = layout::physical(&placement.runs, slot).ok_or(ImageRefusal::NodeUnknown { node })?;
     let bytes = fields.finish(usize::try_from(BLOCK_BYTES).unwrap_or(0));
-    sink
-      .write_at(self.block_offset(at)?, &bytes)
+    io.write_image(self.block_offset(at)?, &bytes)
       .map_err(Failed::Source)?;
     let next = index.saturating_add(1);
     self.cursor = if next < blocks.len() {
@@ -518,13 +533,13 @@ impl<'t> Builder<'t> {
     let mut last: Option<usize> = None;
     let mut next = entry;
     let block_bytes = usize::try_from(BLOCK_BYTES).unwrap_or(0);
-    while let Some((name, child)) = directory_entry(self.tree, id, next) {
+    while let Some((name, child)) = directory_entry(&self.tree, id, next) {
       let length = record_length(name.len());
       if offset.saturating_add(length) > block_bytes {
         break;
       }
       let ino = ino_of(child);
-      let file_type = file_type(self.tree, child);
+      let file_type = file_type(&self.tree, child);
       let mut fields = Fields::with_capacity(length);
       fields
         .u32(ino)
@@ -794,7 +809,7 @@ impl<'t> Builder<'t> {
       .u32(0) // i_flags
       .u32(0) // osd1
       .bytes(&self.block_pointers(id, &node.kind, placement)?)
-      .u32(0) // i_generation
+      .u32(format::BUILT_GENERATION)
       .u32(0) // i_file_acl
       .u32(if matches!(node.kind, Kind::File { .. }) {
         high32(size)
@@ -931,7 +946,7 @@ fn file_type(tree: &Tree, id: NodeId) -> u8 {
 
 /// Fills `block` with data block `index` of file `id` of `size` bytes from `content`, zero past the file's end.
 fn fill_file<E>(
-  content: &mut dyn ContentSource<E>,
+  io: &mut dyn ImageIo<E>,
   id: NodeId,
   index: u64,
   size: u64,
@@ -945,7 +960,7 @@ fn fill_file<E>(
       .get_mut(filled..want)
       .ok_or(ImageRefusal::NodeUnknown { node: id.index() })?;
     let offset = start.saturating_add(u64::try_from(filled).unwrap_or(u64::MAX));
-    let read = content.read(id, offset, into).map_err(Failed::Source)?;
+    let read = io.read_content(id, offset, into).map_err(Failed::Source)?;
     if read == 0 {
       return Err(Failed::Image(ImageRefusal::ContentShort {
         node: id.index(),

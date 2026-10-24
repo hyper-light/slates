@@ -9,10 +9,15 @@
 //! - the walk of the tree refuses a directory named twice (which is what a cycle comes to) and holds the entries it
 //!   reads to the caller's bound, so a hostile image cannot make it loop or grow without end.
 //!
+//! The walk runs in steps a caller bounds ([`Walk::step`]; §4.3): it reads a directory a block at a time, checks each
+//! entry as it comes ([`TreeGrower`]) and keeps its place between steps, so the daemon reads a guest's image in
+//! slices. An [`Image`] keeps no hold on its source: each read is handed it, so a caller whose source is borrowed a
+//! slice at a time keeps the image between slices.
+//!
 //! A hole (a zero block pointer) reads as zeros, as the kernel reads it. Hard links come back as one node named by
 //! several entries.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, VecDeque};
 
 use crate::error::{Failed, ImageRefusal};
 use crate::format::{
@@ -25,7 +30,7 @@ use crate::format::{
 use crate::layout::{
   self, BLOCK_BYTES, BLOCKS_PER_GROUP, INODE_BYTES, INODES_PER_BLOCK, LOG_BLOCK_SIZE, Path,
 };
-use crate::tree::{Kind, Node, NodeId, Timestamp, Tree, TreeBuilder};
+use crate::tree::{Kind, Node, NodeId, Timestamp, Tree, TreeGrower};
 
 /// Where an image's bytes are read from.
 pub trait ImageSource<E> {
@@ -52,6 +57,8 @@ pub struct Inode {
   pub links: u16,
   /// Its sectors in use (`i_blocks`).
   pub sectors: u32,
+  /// Its generation ([`format::BUILT_GENERATION`] for an inode the writer wrote).
+  pub generation: u32,
   /// Its access, modification and change times.
   pub times: [Timestamp; 3],
   /// Its block pointers (or a fast symlink's target, or a device's number).
@@ -79,11 +86,14 @@ pub struct ImageTree {
   pub tree: Tree,
   /// For each node, by index, the inode it was read from.
   pub inodes: Vec<u32>,
+  /// For each node, by index, its inode's generation.
+  pub generations: Vec<u32>,
 }
 
-/// An image opened for reading: its superblock and group descriptors checked.
-pub struct Image<'s, E> {
-  source: &'s mut dyn ImageSource<E>,
+/// An image opened for reading: its superblock and group descriptors checked. Every read is handed the source the
+/// image was opened from.
+#[derive(Debug)]
+pub struct Image {
   len: u64,
   blocks: u64,
   inodes: u64,
@@ -94,19 +104,9 @@ pub struct Image<'s, E> {
   cached: Option<(u64, Vec<u8>)>,
 }
 
-impl<E> std::fmt::Debug for Image<'_, E> {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.debug_struct("Image")
-      .field("len", &self.len)
-      .field("blocks", &self.blocks)
-      .field("inodes", &self.inodes)
-      .finish()
-  }
-}
-
-impl<'s, E> Image<'s, E> {
+impl Image {
   /// Opens the image `source` holds, or says why it cannot be trusted.
-  pub fn open(source: &'s mut dyn ImageSource<E>) -> Result<Image<'s, E>, Failed<E>> {
+  pub fn open<E>(source: &mut dyn ImageSource<E>) -> Result<Image, Failed<E>> {
     let len = source.image_len();
     let mut superblock = vec![0u8; SUPERBLOCK_BYTES];
     read_exact(source, len, SUPERBLOCK_OFFSET, &mut superblock)?;
@@ -165,7 +165,6 @@ impl<'s, E> Image<'s, E> {
     }
     let tables = read_tables(source, len, blocks, groups, inodes_per_group)?;
     Ok(Image {
-      source,
       len,
       blocks,
       inodes,
@@ -175,8 +174,13 @@ impl<'s, E> Image<'s, E> {
     })
   }
 
+  /// The inodes the file system holds.
+  pub fn inode_count(&self) -> u64 {
+    self.inodes
+  }
+
   /// Inode `ino`, read and checked.
-  pub fn inode(&mut self, ino: u32) -> Result<Inode, Failed<E>> {
+  pub fn inode<E>(&self, source: &mut dyn ImageSource<E>, ino: u32) -> Result<Inode, Failed<E>> {
     let number = u64::from(ino);
     if number == 0 || number > self.inodes {
       return Err(Failed::Image(ImageRefusal::InodeOutOfRange { ino: number }));
@@ -195,24 +199,36 @@ impl<'s, E> Image<'s, E> {
         .saturating_mul(INODE_BYTES),
     );
     let mut raw = vec![0u8; usize::try_from(INODE_BYTES).unwrap_or(0)];
-    read_exact(self.source, self.len, offset, &mut raw)?;
+    read_exact(source, self.len, offset, &mut raw)?;
     parse_inode(ino, &raw).map_err(Failed::Image)
   }
 
   /// Reads regular file `ino`'s bytes from `offset` into `buf`; how many it read (fewer only at the end).
-  pub fn read(&mut self, ino: u32, offset: u64, buf: &mut [u8]) -> Result<usize, Failed<E>> {
-    let inode = self.inode(ino)?;
+  pub fn read<E>(
+    &mut self,
+    source: &mut dyn ImageSource<E>,
+    ino: u32,
+    offset: u64,
+    buf: &mut [u8],
+  ) -> Result<usize, Failed<E>> {
+    let inode = self.inode(source, ino)?;
     if inode.type_bits() != format::S_IFREG {
       return Err(Failed::Image(ImageRefusal::InodeUnsupported {
         ino,
         reason: "not a regular file",
       }));
     }
-    self.read_inode(&inode, offset, buf)
+    self.read_inode(source, &inode, offset, buf)
   }
 
   /// Reads `inode`'s bytes from `offset` into `buf`, holes as zeros.
-  fn read_inode(&mut self, inode: &Inode, offset: u64, buf: &mut [u8]) -> Result<usize, Failed<E>> {
+  fn read_inode<E>(
+    &mut self,
+    source: &mut dyn ImageSource<E>,
+    inode: &Inode,
+    offset: u64,
+    buf: &mut [u8],
+  ) -> Result<usize, Failed<E>> {
     let available = inode.size.saturating_sub(offset);
     let want =
       usize::try_from(available.min(u64::try_from(buf.len()).unwrap_or(u64::MAX))).unwrap_or(0);
@@ -232,10 +248,10 @@ impl<'s, E> Image<'s, E> {
           need: at,
           have: self.len,
         })?;
-      match self.block_of(inode, index)? {
+      match self.block_of(source, inode, index)? {
         Some(block) => {
           let from = block.saturating_mul(BLOCK_BYTES).saturating_add(within);
-          read_exact(self.source, self.len, from, into)?;
+          read_exact(source, self.len, from, into)?;
         }
         None => into.fill(0),
       }
@@ -244,98 +260,56 @@ impl<'s, E> Image<'s, E> {
     Ok(want)
   }
 
-  /// The tree the image holds, its entries held to `most`.
-  pub fn tree(&mut self, most: usize) -> Result<ImageTree, Failed<E>> {
-    let root = self.inode(ROOT_INO)?;
-    if !root.is_directory() {
-      return Err(Failed::Image(ImageRefusal::RootNotDirectory));
-    }
-    let mut builder = TreeBuilder::new(self.node(&root)?);
-    let mut inodes = vec![ROOT_INO];
-    let mut linked: BTreeMap<u32, NodeId> = BTreeMap::new();
-    let mut directories: BTreeSet<u32> = BTreeSet::from([ROOT_INO]);
-    let mut stack = vec![(root, NodeId::ROOT)];
-    let mut read = 0usize;
-    while let Some((directory, id)) = stack.pop() {
-      for (name, child_ino) in self.entries(&directory, most, &mut read)? {
-        if child_ino == ROOT_INO {
-          return Err(Failed::Image(ImageRefusal::DirectoryLinkedTwice {
-            node: u64::from(ROOT_INO),
-          }));
-        }
-        let child = match linked.get(&child_ino) {
-          Some(known) => *known,
-          None => {
-            let inode = self.inode(child_ino)?;
-            let node = builder.add_node(self.node(&inode)?);
-            inodes.push(child_ino);
-            if inode.is_directory() {
-              if !directories.insert(child_ino) {
-                return Err(Failed::Image(ImageRefusal::DirectoryLinkedTwice {
-                  node: u64::from(child_ino),
-                }));
-              }
-              stack.push((inode, node));
-            }
-            linked.insert(child_ino, node);
-            node
-          }
-        };
-        builder.add_entry(id, name, child);
+  /// The tree the image holds, its entries held to `most`: a [`Walk`] run to its end.
+  pub fn tree<E>(
+    &mut self,
+    source: &mut dyn ImageSource<E>,
+    most: usize,
+  ) -> Result<ImageTree, Failed<E>> {
+    let mut walk = Walk::new(self, source, most)?;
+    loop {
+      if let Walked::Done(tree) = walk.step(self, source, u64::MAX)? {
+        return Ok(tree);
       }
     }
-    let tree = builder.build().map_err(Failed::Image)?;
-    Ok(ImageTree { tree, inodes })
   }
 
-  /// The entries of `directory` (without `.` and `..`), each counted against `most`.
-  fn entries(
+  /// The entries of block `index` of `directory` (without `.` and `..`), checked.
+  fn directory_block<E>(
     &mut self,
+    source: &mut dyn ImageSource<E>,
     directory: &Inode,
-    most: usize,
-    read: &mut usize,
+    index: u64,
   ) -> Result<Vec<(Vec<u8>, u32)>, Failed<E>> {
     let ino = directory.ino;
-    if !directory.size.is_multiple_of(BLOCK_BYTES) {
+    let Some(physical) = self.block_of(source, directory, index)? else {
       return Err(Failed::Image(ImageRefusal::DirectoryCorrupt {
         ino,
-        reason: "size not whole blocks",
+        reason: "a hole",
       }));
-    }
-    let mut entries = Vec::new();
+    };
     let mut block = vec![0u8; usize::try_from(BLOCK_BYTES).unwrap_or(0)];
-    for index in 0..directory.size / BLOCK_BYTES {
-      let Some(physical) = self.block_of(directory, index)? else {
-        return Err(Failed::Image(ImageRefusal::DirectoryCorrupt {
-          ino,
-          reason: "a hole",
-        }));
-      };
-      read_exact(
-        self.source,
-        self.len,
-        physical.saturating_mul(BLOCK_BYTES),
-        &mut block,
-      )?;
-      for entry in parse_directory_block(ino, &block, self.inodes)? {
-        *read = read.saturating_add(1);
-        if *read > most {
-          return Err(Failed::Image(ImageRefusal::TreeTooLarge { most }));
-        }
-        entries.push(entry);
-      }
-    }
-    Ok(entries)
+    read_exact(
+      source,
+      self.len,
+      physical.saturating_mul(BLOCK_BYTES),
+      &mut block,
+    )?;
+    parse_directory_block(ino, &block, self.inodes).map_err(Failed::Image)
   }
 
   /// The node `inode` is: its kind (a symlink's target and a device's number read here) and attributes.
-  fn node(&mut self, inode: &Inode) -> Result<Node, Failed<E>> {
+  pub fn node<E>(
+    &mut self,
+    source: &mut dyn ImageSource<E>,
+    inode: &Inode,
+  ) -> Result<Node, Failed<E>> {
     let ino = inode.ino;
     let kind = match inode.type_bits() {
       format::S_IFDIR => Kind::Directory,
       format::S_IFREG => Kind::File { size: inode.size },
       format::S_IFLNK => Kind::Symlink {
-        target: self.link_target(inode)?,
+        target: self.link_target(source, inode)?,
       },
       format::S_IFCHR | format::S_IFBLK => {
         let rdev = layout::decode_rdev(inode.pointers[0], inode.pointers[1]).ok_or(
@@ -372,7 +346,11 @@ impl<'s, E> Image<'s, E> {
   }
 
   /// A symlink's target: in the inode when it has no blocks (a fast symlink), else in its first block.
-  fn link_target(&mut self, inode: &Inode) -> Result<Vec<u8>, Failed<E>> {
+  fn link_target<E>(
+    &mut self,
+    source: &mut dyn ImageSource<E>,
+    inode: &Inode,
+  ) -> Result<Vec<u8>, Failed<E>> {
     let ino = inode.ino;
     let length = usize::try_from(inode.size).unwrap_or(usize::MAX);
     let bad = ImageRefusal::InodeUnsupported {
@@ -391,12 +369,17 @@ impl<'s, E> Image<'s, E> {
         .ok_or(Failed::Image(bad));
     }
     let mut target = vec![0u8; length];
-    self.read_inode(inode, 0, &mut target)?;
+    self.read_inode(source, inode, 0, &mut target)?;
     Ok(target)
   }
 
   /// The block holding logical block `index` of `inode`, or `None` for a hole.
-  fn block_of(&mut self, inode: &Inode, index: u64) -> Result<Option<u64>, Failed<E>> {
+  fn block_of<E>(
+    &mut self,
+    source: &mut dyn ImageSource<E>,
+    inode: &Inode,
+    index: u64,
+  ) -> Result<Option<u64>, Failed<E>> {
     let path = layout::path(index).ok_or(ImageRefusal::InodeUnsupported {
       ino: inode.ino,
       reason: "beyond what an inode maps",
@@ -423,7 +406,7 @@ impl<'s, E> Image<'s, E> {
         return Ok(None);
       }
       let checked = self.checked_block(block)?;
-      block = self.pointer_in(checked, index)?;
+      block = self.pointer_in(source, checked, index)?;
     }
     if block == 0 {
       return Ok(None);
@@ -432,7 +415,7 @@ impl<'s, E> Image<'s, E> {
   }
 
   /// Block `block`, refused outside the file system.
-  fn checked_block(&self, block: u32) -> Result<u64, Failed<E>> {
+  fn checked_block<E>(&self, block: u32) -> Result<u64, Failed<E>> {
     let block = u64::from(block);
     if block >= self.blocks {
       return Err(Failed::Image(ImageRefusal::BlockOutOfRange { block }));
@@ -441,12 +424,17 @@ impl<'s, E> Image<'s, E> {
   }
 
   /// Pointer `index` of indirect block `block`.
-  fn pointer_in(&mut self, block: u64, index: u64) -> Result<u32, Failed<E>> {
+  fn pointer_in<E>(
+    &mut self,
+    source: &mut dyn ImageSource<E>,
+    block: u64,
+    index: u64,
+  ) -> Result<u32, Failed<E>> {
     let fresh = !matches!(&self.cached, Some((cached, _)) if *cached == block);
     if fresh {
       let mut bytes = vec![0u8; usize::try_from(BLOCK_BYTES).unwrap_or(0)];
       read_exact(
-        self.source,
+        source,
         self.len,
         block.saturating_mul(BLOCK_BYTES),
         &mut bytes,
@@ -460,6 +448,197 @@ impl<'s, E> Image<'s, E> {
       .as_ref()
       .and_then(|(_, bytes)| u32_at(bytes, at))
       .ok_or(Failed::Image(ImageRefusal::BlockOutOfRange { block }))
+  }
+}
+
+/// Where a [`Walk`] stands after a step.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Walked {
+  /// More remains: step again.
+  More,
+  /// The tree is read whole.
+  Done(ImageTree),
+}
+
+/// The directory a [`Walk`] is reading: its inode, the next of its blocks to read, and the entries of the block read
+/// last still to add.
+#[derive(Debug)]
+struct Reading {
+  directory: Inode,
+  next_block: u64,
+  entries: VecDeque<(Vec<u8>, u32)>,
+}
+
+/// A walk of an image's tree in steps a caller bounds (§4.3). Each [`Walk::step`] reads until a byte budget is spent:
+/// a directory a block at a time, and each entry of the block, reading the inode it names the first time one does.
+/// The directories come in the order a depth-first walk meets them, so one image always walks to the same tree. A
+/// second entry naming an inode already met is a hard link, or a directory named twice, which the tree refuses.
+#[derive(Debug)]
+pub struct Walk {
+  /// The tree so far; taken when the walk ends.
+  grower: Option<TreeGrower>,
+  inodes: Vec<u32>,
+  generations: Vec<u32>,
+  /// The node each inode met so far became.
+  met: BTreeMap<u32, NodeId>,
+  /// Directories named and still to read.
+  pending: Vec<(Inode, NodeId)>,
+  /// The directory being read.
+  reading: Option<Reading>,
+  /// The entries read so far, held to `most`.
+  read: usize,
+  most: usize,
+}
+
+impl Walk {
+  /// A walk of the tree `image` holds, its entries held to `most`: the root's inode read and checked.
+  pub fn new<E>(
+    image: &mut Image,
+    source: &mut dyn ImageSource<E>,
+    most: usize,
+  ) -> Result<Walk, Failed<E>> {
+    let root = image.inode(source, ROOT_INO)?;
+    if !root.is_directory() {
+      return Err(Failed::Image(ImageRefusal::RootNotDirectory));
+    }
+    let grower = TreeGrower::new(image.node(source, &root)?).map_err(Failed::Image)?;
+    let generation = root.generation;
+    Ok(Walk {
+      grower: Some(grower),
+      inodes: vec![ROOT_INO],
+      generations: vec![generation],
+      met: BTreeMap::from([(ROOT_INO, NodeId::ROOT)]),
+      pending: vec![(root, NodeId::ROOT)],
+      reading: None,
+      read: 0,
+      most,
+    })
+  }
+
+  /// Reads until at least `budget` bytes are read or the tree is whole: at least one directory block or entry a step,
+  /// so every step makes progress. A step after the end is refused.
+  pub fn step<E>(
+    &mut self,
+    image: &mut Image,
+    source: &mut dyn ImageSource<E>,
+    budget: u64,
+  ) -> Result<Walked, Failed<E>> {
+    let mut spent = 0u64;
+    loop {
+      match self.advance(image, source)? {
+        Some(cost) => {
+          spent = spent.saturating_add(cost.max(1));
+          if spent >= budget {
+            return Ok(Walked::More);
+          }
+        }
+        None => return self.finish().map(Walked::Done),
+      }
+    }
+  }
+
+  /// The tree, once every directory is read.
+  fn finish<E>(&mut self) -> Result<ImageTree, Failed<E>> {
+    let grower = self.grower.take().ok_or(ImageRefusal::GrowthOutOfOrder {
+      reason: "a walk stepped after its end",
+    })?;
+    Ok(ImageTree {
+      tree: grower.finish()?,
+      inodes: std::mem::take(&mut self.inodes),
+      generations: std::mem::take(&mut self.generations),
+    })
+  }
+
+  /// One unit of the walk: an entry of the block read last, the directory's next block, its close, or the next
+  /// directory's open. Returns its cost in bytes read, or `None` once nothing is left.
+  fn advance<E>(
+    &mut self,
+    image: &mut Image,
+    source: &mut dyn ImageSource<E>,
+  ) -> Result<Option<u64>, Failed<E>> {
+    let grower = self.grower.as_mut().ok_or(ImageRefusal::GrowthOutOfOrder {
+      reason: "a walk stepped after its end",
+    })?;
+    if let Some(reading) = self.reading.as_mut() {
+      if let Some((name, child)) = reading.entries.pop_front() {
+        return self.add_entry(image, source, name, child).map(Some);
+      }
+      if reading.next_block < reading.directory.size / BLOCK_BYTES {
+        let entries = image.directory_block(source, &reading.directory, reading.next_block)?;
+        reading.next_block = reading.next_block.saturating_add(1);
+        reading.entries = entries.into();
+        return Ok(Some(BLOCK_BYTES));
+      }
+      grower.close()?;
+      self.reading = None;
+      return Ok(Some(0));
+    }
+    let Some((directory, id)) = self.pending.pop() else {
+      return Ok(None);
+    };
+    if !directory.size.is_multiple_of(BLOCK_BYTES) {
+      return Err(Failed::Image(ImageRefusal::DirectoryCorrupt {
+        ino: directory.ino,
+        reason: "size not whole blocks",
+      }));
+    }
+    grower.open(id)?;
+    self.reading = Some(Reading {
+      directory,
+      next_block: 0,
+      entries: VecDeque::new(),
+    });
+    Ok(Some(0))
+  }
+
+  /// Adds the entry naming inode `child` `name` to the directory being read, reading the inode the first time an
+  /// entry names it. Returns the bytes read: the entry's record, and the inode and a slow symlink's block when read.
+  fn add_entry<E>(
+    &mut self,
+    image: &mut Image,
+    source: &mut dyn ImageSource<E>,
+    name: Vec<u8>,
+    child: u32,
+  ) -> Result<u64, Failed<E>> {
+    self.read = self.read.saturating_add(1);
+    if self.read > self.most {
+      return Err(Failed::Image(ImageRefusal::TreeTooLarge {
+        most: self.most,
+      }));
+    }
+    let mut cost =
+      u64::try_from(DIRENT_HEADER_BYTES.saturating_add(name.len())).unwrap_or(u64::MAX);
+    let grower = self.grower.as_mut().ok_or(ImageRefusal::GrowthOutOfOrder {
+      reason: "a walk stepped after its end",
+    })?;
+    let id = match self.met.get(&child) {
+      Some(known) => *known,
+      None => {
+        let inode = image.inode(source, child)?;
+        cost = cost.saturating_add(INODE_BYTES);
+        if inode.type_bits() == format::S_IFLNK && inode.sectors > 0 {
+          cost = cost.saturating_add(BLOCK_BYTES);
+        }
+        let id = grower.add_node(image.node(source, &inode)?)?;
+        self.inodes.push(child);
+        self.generations.push(inode.generation);
+        self.met.insert(child, id);
+        if inode.is_directory() {
+          self.pending.push((inode, id));
+        }
+        id
+      }
+    };
+    // The tree names a directory by its node; a reader names it by its inode, as the image does.
+    grower
+      .add_entry(name, id)
+      .map_err(|refusal| match refusal {
+        ImageRefusal::DirectoryLinkedTwice { .. } => ImageRefusal::DirectoryLinkedTwice {
+          node: u64::from(child),
+        },
+        other => other,
+      })?;
+    Ok(cost)
   }
 }
 
@@ -611,6 +790,7 @@ fn parse_inode(ino: u32, raw: &[u8]) -> Result<Inode, ImageRefusal> {
     size,
     links,
     sectors: field32(at::BLOCKS),
+    generation: field32(at::GENERATION),
     times,
     pointers,
     raw_pointers,

@@ -12065,6 +12065,23 @@ Applied in the same change to:
     stop it. Each e2fsprogs run is bounded with `timeout --kill-after`.
 - **Not carried:** extended attributes, birth times (the change time stands in), and holes (a sparse file takes its
   length; its zero blocks are left unwritten). Times outside 1901–2446 are refused.
+- **Bounded steps for the daemon (2026-10-23).** Every piece of work is a step a caller bounds by bytes:
+  - the builder plans only the geometry when made; it measures each node's blocks, holds the total to the capacity
+    and places them a node a step before it writes a byte;
+  - the reader keeps no hold on its source (each read is handed it), and its walk reads a directory a block a step and
+    an entry a step;
+  - one checker grows every tree a directory at a time (`TreeGrower`), so no step pays for a whole tree; the batch
+    `TreeBuilder` grows its tree through it.
+
+  Tests: walking in the smallest steps reads the same tree as a whole walk, every round trip, with no step reading
+  past one unit's bytes; 2,000 FIFOs take at least two layout steps each before the first write.
+- **The build's generation.** Every written inode carries `i_generation` 0. A guest's kernel gives an inode it
+  allocates a generation of its own. Linux's ext2 counts up from a random start per mount: `ext2_new_inode` sets
+  `inode->i_generation = sbi->s_next_generation++`, and `ext2_fill_super` sets
+  `sbi->s_next_generation = get_random_u32()`. Its ext4 driver draws one at random: `__ext4_new_inode` sets
+  `inode->i_generation = get_random_u32()` (torvalds/linux master, read 2026-10-24). So an inode at its written
+  number with generation 0 is, but for a 1 in 2³² chance, the node the writer put there. A merge keeps that node's
+  identity through renames and rewrites.
 - **Owed:** the daemon's `image build` and `image merge` (sliced, into a clone), and the real Firecracker run.
 
 ### A-159 — The bootstrap header no longer carries the daemon's process id (accepted 2026-10-23)

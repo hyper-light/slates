@@ -241,6 +241,12 @@ impl<'g> Allocator<'g> {
     }
   }
 
+  /// A cursor resumed at block `next`, where an earlier cursor over `geometry` stopped: an allocation in steps keeps
+  /// only the block number between them.
+  pub fn at(geometry: &'g Geometry, next: u64) -> Allocator<'g> {
+    Allocator { geometry, next }
+  }
+
   /// The next block the cursor would hand out: every data block before it is in use.
   pub fn next(&self) -> u64 {
     self.next

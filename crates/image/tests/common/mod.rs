@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 
 use slates_image::{
-  Builder, ContentSource, Identity, ImageSink, ImageSource, Kind, Node, NodeId, Progress,
-  Timestamp, Tree, Written,
+  Builder, Failed, Identity, ImageIo, ImageSource, Kind, Node, NodeId, Progress, Timestamp, Tree,
+  Written,
 };
 
 /// An image held in memory.
@@ -18,8 +18,9 @@ pub(crate) struct Memory {
   pub(crate) bytes: Vec<u8>,
 }
 
-impl ImageSink<Infallible> for Memory {
-  fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Infallible> {
+impl Memory {
+  /// Writes `bytes` at `offset`, inside the image's length.
+  fn write_at(&mut self, offset: u64, bytes: &[u8]) {
     let start = usize::try_from(offset).unwrap();
     let end = start + bytes.len();
     assert!(
@@ -28,7 +29,6 @@ impl ImageSink<Infallible> for Memory {
       self.bytes.len()
     );
     self.bytes[start..end].copy_from_slice(bytes);
-    Ok(())
   }
 }
 
@@ -50,13 +50,33 @@ pub(crate) struct Contents {
   pub(crate) files: BTreeMap<usize, Vec<u8>>,
 }
 
-impl ContentSource<Infallible> for Contents {
-  fn read(&mut self, node: NodeId, offset: u64, buf: &mut [u8]) -> Result<usize, Infallible> {
-    let bytes = self.files.get(&node.index()).map_or(&[][..], Vec::as_slice);
+/// A writer's input and output at once: the files' contents, and the image they are written into.
+struct Writing<'a> {
+  contents: &'a Contents,
+  image: &'a mut Memory,
+}
+
+impl ImageIo<Infallible> for Writing<'_> {
+  fn read_content(
+    &mut self,
+    node: NodeId,
+    offset: u64,
+    buf: &mut [u8],
+  ) -> Result<usize, Infallible> {
+    let bytes = self
+      .contents
+      .files
+      .get(&node.index())
+      .map_or(&[][..], Vec::as_slice);
     let start = usize::try_from(offset).unwrap().min(bytes.len());
     let take = buf.len().min(bytes.len() - start);
     buf[..take].copy_from_slice(&bytes[start..start + take]);
     Ok(take)
+  }
+
+  fn write_image(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Infallible> {
+    self.image.write_at(offset, bytes);
+    Ok(())
   }
 }
 
@@ -78,17 +98,42 @@ pub(crate) fn write(
   capacity: u64,
   budget: u64,
 ) -> (Memory, Written, usize) {
-  let mut builder = Builder::new(tree, capacity, IDENTITY).unwrap();
+  write_with(tree, contents, capacity, budget, IDENTITY)
+}
+
+/// [`write`] with an identity of the caller's.
+pub(crate) fn write_with(
+  tree: &Tree,
+  contents: &Contents,
+  capacity: u64,
+  budget: u64,
+  identity: Identity,
+) -> (Memory, Written, usize) {
+  try_write(tree, contents, capacity, budget, identity).unwrap()
+}
+
+/// [`write_with`], or the refusal a step met.
+pub(crate) fn try_write(
+  tree: &Tree,
+  contents: &Contents,
+  capacity: u64,
+  budget: u64,
+  identity: Identity,
+) -> Result<(Memory, Written, usize), Failed<Infallible>> {
+  let mut builder = Builder::new(tree.clone(), capacity, identity)?;
   let mut image = Memory {
     bytes: vec![0; usize::try_from(builder.image_bytes()).unwrap()],
   };
-  let mut source = contents.clone();
   let mut steps = 0;
   loop {
     steps += 1;
-    match builder.step(&mut source, &mut image, budget).unwrap() {
+    let mut io = Writing {
+      contents,
+      image: &mut image,
+    };
+    match builder.step(&mut io, budget)? {
       Progress::More => {}
-      Progress::Done(written) => return (image, written, steps),
+      Progress::Done(written) => return Ok((image, written, steps)),
     }
   }
 }

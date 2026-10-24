@@ -10,11 +10,13 @@
 //! a journal, extents or checksums, and each would be more for the reader to distrust; over a format of its own
 //! because the guest's kernel must mount it with no driver slates ships.
 //!
-//! **Writing** ([`write::Builder`]) lays a [`tree::Tree`] out whole, then writes it in steps a caller bounds, asking a
-//! [`write::ContentSource`] for file bytes and handing blocks to an [`write::ImageSink`]. One tree and one
-//! [`write::Identity`] always make the same bytes. **Reading** ([`read::Image`]) checks every structure of an image
-//! a guest has written before using it, and returns its tree with each node's inode, from which a merge reads the
-//! bytes.
+//! **Writing** ([`write::Builder`]) lays a [`tree::Tree`] out and writes it, both in steps a caller bounds, asking an
+//! [`write::ImageIo`] for file bytes and handing it the image's blocks. One tree and one [`write::Identity`] always
+//! make the same bytes. **Reading** ([`read::Image`]) checks every structure of an image a guest has written before
+//! using it, and walks its tree in bounded steps ([`read::Walk`]), returning each node's inode, from which a merge
+//! reads the bytes, and its generation, by which a merge knows the nodes the writer wrote. Every tree, written or
+//! read, is checked in one place, a directory at a time ([`tree::TreeGrower`]), so no step of the daemon's pays for a
+//! whole tree.
 //!
 //! **Evidence.** Each image is held to e2fsprogs: the round-trip oracle (`tests/round_trip.rs`) writes generated
 //! trees and reads them back equal, at the format's precision; the differential (`tests/e2fsck.rs`) runs
@@ -41,6 +43,6 @@ pub mod tree;
 pub mod write;
 
 pub use error::{Failed, ImageRefusal};
-pub use read::{Image, ImageSource, ImageTree, Inode};
-pub use tree::{Kind, Node, NodeId, Timestamp, Tree, TreeBuilder};
-pub use write::{Builder, ContentSource, Identity, ImageSink, Progress, Written};
+pub use read::{Image, ImageSource, ImageTree, Inode, Walk, Walked};
+pub use tree::{Kind, Node, NodeId, Timestamp, Tree, TreeBuilder, TreeGrower};
+pub use write::{Builder, Identity, ImageIo, Progress, Written};

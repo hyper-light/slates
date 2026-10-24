@@ -128,6 +128,12 @@ pub const EPOCH_MASK: u32 = (1 << EPOCH_BITS) - 1;
 /// access times' extra words, the creation time and its extra word, the high version and the project id. The
 /// reference image's `s_min_extra_isize` and `s_want_extra_isize` are this.
 pub const EXTRA_ISIZE: u16 = 32;
+/// Format: the `i_generation` every inode the writer writes carries. A guest's kernel gives each inode it allocates a
+/// generation of its own: Linux's ext2 driver from a per-mount counter that starts at a random value
+/// (`ext2_new_inode`, `ext2_fill_super`), its ext4 driver at random. So an inode that still carries this generation
+/// at its written number is, but for a chance of one in 2³², the node the writer put there, renamed or rewritten
+/// perhaps: what a merge keeps the node's identity by (A-160).
+pub const BUILT_GENERATION: u32 = 0;
 
 /// Superblock field offsets and widths, from `struct ext2_super_block`.
 pub mod superblock {
@@ -201,6 +207,8 @@ pub mod inode {
   pub const FLAGS: usize = 0x20;
   /// Format: `i_block`, the 15 block pointers.
   pub const BLOCK: usize = 0x28;
+  /// Format: `i_generation`, the inode's version for file handles.
+  pub const GENERATION: usize = 0x64;
   /// Format: `i_size_high`.
   pub const SIZE_HIGH: usize = 0x6C;
   /// Format: `l_i_uid_high`.

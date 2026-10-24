@@ -141,6 +141,13 @@ pub enum ImageRefusal {
     /// The entries allowed.
     most: usize,
   },
+  /// A tree was grown out of order ([`crate::tree::TreeGrower`]): an entry with no directory open, a directory opened
+  /// while another was, opened twice, or named and never filled. A defect of the caller's walk, refused rather than
+  /// guessed around.
+  GrowthOutOfOrder {
+    /// What was out of order, in words.
+    reason: &'static str,
+  },
 }
 
 /// A step of writing or reading that failed: refused by this crate, or by the caller's source or sink.

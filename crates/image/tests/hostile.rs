@@ -49,12 +49,12 @@ fn read_whole(image: &mut Memory) -> Result<usize, ImageRefusal> {
     Failed::Source(never) => match never {},
   };
   let mut opened = Image::open(image).map_err(refusal)?;
-  let read = opened.tree(MOST).map_err(refusal)?;
+  let read = opened.tree(image, MOST).map_err(refusal)?;
   for (index, node) in read.tree.nodes().iter().enumerate() {
     if let Kind::File { size } = node.kind {
       let mut bytes = vec![0u8; usize::try_from(size.min(1 << 20)).unwrap_or(0)];
       opened
-        .read(read.inodes[index], 0, &mut bytes)
+        .read(image, read.inodes[index], 0, &mut bytes)
         .map_err(refusal)?;
     }
   }
@@ -328,7 +328,7 @@ fn each_broken_structure_is_refused_by_kind() {
   let mut bounded = clean.clone();
   let mut opened = Image::open(&mut bounded).unwrap();
   assert_eq!(
-    opened.tree(2).unwrap_err(),
+    opened.tree(&mut bounded, 2).unwrap_err(),
     Failed::Image(ImageRefusal::TreeTooLarge { most: 2 })
   );
 }
