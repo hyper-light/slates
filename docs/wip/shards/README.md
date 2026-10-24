@@ -27,6 +27,9 @@ model (the guest's `mount` is refused without `CAP_SYS_ADMIN`).
 > (`--slates-fs-fd`) is on shards branch `slates-fs-native` (`08066b27`, 2026-10-14), which is on **no remote**;
 > shards' `origin/gpu` (`0aa00196`, 2026-10-21), the branch kiln vendors, contains none of it. "Proven" below
 > means a real HVF VM **connected** to the example server; a guest kernel mounting and reading has never run.
+> *(Corrected 2026-10-24: wrong. Shards' boot test, which passes only after the guest mounts `shards0` and reads
+> `/hello` byte for byte, passed on 2026-10-14, 36.45 s, and 2026-10-20, 48.7 s, against the example; GAPS
+> `8a-shards-boot`.)*
 
 **slates side** (on main; updated 2026-10-24):
 - `crates/bridge-fuse/src/shards_fs.rs` — the byte work: `split_frame` takes a frame (a little-endian `u32` length,
@@ -106,8 +109,9 @@ the same backend serves `SETUPMAPPING` and the guest reaches the block through i
    shards' `VOLUME … FOR` (D109) may serve. The **binding** happens at launch: the runner asks the slates daemon
    for a descriptor for one attachment and passes it as `--slates-fs-fd`. This supersedes the earlier proposal,
    `SLATES ${SLATES_SOCK} shards0 /slates`, which put the socket in the Agentfile.
-2. The **guest-kernel mount+read** proof (`SHARDS-TEST PASS`): one more boot of `tests/slates_fs.rs`, deferred here
-   only because the auto-mode classifier denied it as shared-machine workload interference.
+2. The **guest-kernel mount+read** proof (`SHARDS-TEST PASS`): passed against the one-file example on 2026-10-14 and
+   2026-10-20 (GAPS `8a-shards-boot`); owed again against the daemon, through `slates shards` (Shards part 2), now that
+   the example is gone.
 3. The **Windows runtime** (HANDLE-passing + a named-pipe/`AF_UNIX` slates server) and, for DAX, a guest-physical
    **cache window** in shards' fs device.
 

@@ -11053,9 +11053,12 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   (`docs/bugs/2026-10-24-a-stream-end-arrived-flushed-by-the-kernel-in-flight.md`): XNU's in-flight collector flushed
   the end when the daemon closed its copy before the client's receive returned (4 of 20 claims at load 35-47; 16-40 of
   48 under socket churn, none after the daemon kept its copy until the client closed the route).
-- **Open, unproven: Linux's control-socket handoff closes the daemon's copy right after the send**
-  (`shards::deliver_handoff`, and A-135's `send_mapping`). Linux's collector is a different design and is not known to
-  flush a socket in flight, and no Linux run has failed so; a churn test like the macOS one is owed on Linux.
+- **Measured, not affected: Linux's control-socket handoff closes the daemon's copy right after the send**
+  (`shards::deliver_handoff`, and A-135's `send_mapping` the same way). `every_end_delivered_arrives_live_while_the_
+  kernel_collects_descriptors_in_flight` (`crates/client/tests/shards.rs`) attaches 48 times while another thread drops
+  unreachable cycles of descriptors in flight, each release scheduling Linux's collector: 10 of 10 runs on Linux
+  7.2.9 (adacachy, load 49, 2026-10-24) delivered every end live, 8,192–12,976 cycles dropped during each. It is
+  evidence of absence under that stress, not a proof; the mapping path shares the mechanism but was not the one driven.
 - **Step 4 built (2026-10-24):** `slates shards ID [--subtree DIR] [--read-only] --fd N -- CMD` runs a program with the
   end at descriptor `N`, keeping no copy, so the attachment ends when the program's end closes; the program's exit code
   is the command's. A reader re-invoked under it mounts and reads a file byte-equal through descriptor 7, and a program
@@ -11073,10 +11076,12 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
 - **Step 5 in part (2026-10-24):** the one-file example server and its blocking helpers are removed; the bridge-fuse
   tests and the bench drive `split_frame` and `answer`, the daemon's path (re-measured in BENCHMARKS: no dearer than
   the function it replaced).
-- **The docs disagree on whether a guest kernel has mounted and read through slates.** `8a-shards-boot` records a pass
-  on 2026-10-20 (48.7 s, `SHARDS-TEST PASS`, against the one-file example); the Shards README's 2026-10-21 status says
-  a guest kernel's mount and read had never run. Neither can be re-checked now, since the example is gone; part 2's
-  real boot against the daemon settles it for the product path.
+- **Corrected: a guest kernel has mounted and read through slates.** The Shards README's 2026-10-21 status said a
+  guest's mount and read had never run. The record says otherwise: Shards' `a_microvm_mounts_and_reads_a_slates_volume_
+  over_virtiofs`, which passes only after the guest prints `SHARDS-TEST PASS` (tag `shards0` mounted, `/hello` read
+  byte for byte), passed on 2026-10-14 (36.45 s, the run Ada approved) and on 2026-10-20 (48.7 s, no skip line;
+  `8a-shards-boot`), both against the one-file example on this Mac (HVF). The README is corrected. Against the daemon,
+  through `slates shards`, it is owed (part 2).
 - **Owed, in order:** CI green on every lane (step 5); Shards' `--slates-fs-fd` on its current branch and a real boot
   (part 2); a DAX window over a backing that authorizes only the attachment's bytes (part 3). Until part 3 a slates
   share is launched without a DAX window: a descriptor ask is refused `EOPNOTSUPP`.

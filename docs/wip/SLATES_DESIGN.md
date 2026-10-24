@@ -12275,10 +12275,15 @@ Applied in the same change to:
   guest's mount and read, and the hostile lengths (a literal `u32::MAX` among them), through `split_frame` and `answer`
   on every platform; `examples/shards_fs_bench.rs` times them (BENCHMARKS, 2026-10-24: GETATTR 125 ns, READ 4 KiB
   250 ns, CREATE p50 291 ns at best, no dearer than before).
+- **Linux's handoff under its collector, measured (2026-10-24).** The daemon still closes its copy of an end right after
+  the send. `every_end_delivered_arrives_live_while_the_kernel_collects_descriptors_in_flight` attaches 48 times while
+  another thread drops unreachable cycles of descriptors in flight, each release scheduling Linux's collector: 10 of
+  10 runs on Linux 7.2.9 (load 49) delivered every end live, 8,192–12,976 cycles dropped during each. Why, from memory
+  of `net/unix/garbage.c` and not re-read for this: Linux's collector keeps a descriptor that sits in the queue of a
+  socket something outside the messages still holds, as the client holds its control socket; XNU's flushed one in the
+  same window. Evidence of absence under that stress, not a proof.
 - **Owed:** Shards' own `--slates-fs-fd` on its current branch and a real boot (part 2), and a DAX window over a backing
-  that authorizes only the attachment's bytes (part 3). Linux's control-socket handoff still closes the daemon's copy
-  right after the send; Linux's collector is a different design and is not known to flush, but it is not proven
-  either.
+  that authorizes only the attachment's bytes (part 3).
 
 ### A-160 — A volume's disk-image form: ext2, written in bounded steps, read back as hostile input (accepted 2026-10-23)
 Applied in the same change to:

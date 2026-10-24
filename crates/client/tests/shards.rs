@@ -416,6 +416,92 @@ mod delivered {
     drop(client);
     drop(daemon);
   }
+
+  /// Shape: the ends the in-flight test receives, as many as macOS's route test claims under its churn
+  /// (`crates/server/tests/shards.rs`, `CLAIMS_UNDER_CHURN`), where 16 to 40 of 48 arrived flushed before its fix.
+  #[cfg(target_os = "linux")]
+  const ENDS_UNDER_CHURN: usize = 48;
+
+  /// A-161 step 2 (Linux), the counterpart of macOS's `every_end_handed_over_arrives_live_while_sockets_churn`
+  /// (`docs/bugs/2026-10-24-a-stream-end-arrived-flushed-by-the-kernel-in-flight.md`). The daemon closes its copy of an
+  /// end right after sending it over the control socket, so until the client's receive returns, the message holds the
+  /// end's only reference: the window in which XNU's collector flushed an end. Do: attach the Shards form many times
+  /// while another thread makes and drops unreachable cycles of descriptors in flight, each drop a run of Linux's
+  /// collector (`unix_gc`, which a released socket with descriptors in flight starts). Expect every end live: its
+  /// receive buffer not the zero a flush leaves, and `INIT` answered through it; and the churn to have run throughout.
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn every_end_delivered_arrives_live_while_the_kernel_collects_descriptors_in_flight() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let (daemon, mut client) = start("churn");
+    let volume = volume(&mut client, "churn");
+    let stop = AtomicBool::new(false);
+    let cycles = AtomicUsize::new(0);
+    let (dead, during) = std::thread::scope(|scope| {
+      scope.spawn(|| {
+        while !stop.load(Ordering::Relaxed) {
+          drop_an_unreachable_cycle();
+          cycles.fetch_add(1, Ordering::Relaxed);
+        }
+      });
+      // The churn stops however the attaches end, a failed assertion included: the scope waits for its threads.
+      let _stop = StopOnDrop(&stop);
+      let before = cycles.load(Ordering::Relaxed);
+      let mut dead = 0usize;
+      for _ in 0..ENDS_UNDER_CHURN {
+        let shards = client.attach_shards(volume, Intent::Write, None).unwrap();
+        if rustix::net::sockopt::socket_recv_buffer_size(&shards.stream).unwrap() == 0 {
+          dead += 1;
+          continue;
+        }
+        drop(Guest::over(shards));
+      }
+      (dead, cycles.load(Ordering::Relaxed) - before)
+    });
+    eprintln!(
+      "{ENDS_UNDER_CHURN} ends delivered, {dead} flushed, {during} unreachable cycles dropped meanwhile"
+    );
+    assert_eq!(dead, 0, "{dead} of {ENDS_UNDER_CHURN} ends arrived flushed");
+    assert!(
+      during >= ENDS_UNDER_CHURN,
+      "the collector was started only {during} times while {ENDS_UNDER_CHURN} ends were in flight"
+    );
+    drop(client);
+    drop(daemon);
+  }
+
+  /// Sets its flag when dropped: the churn's stop, on the attaches' every exit.
+  #[cfg(target_os = "linux")]
+  struct StopOnDrop<'a>(&'a std::sync::atomic::AtomicBool);
+
+  #[cfg(target_os = "linux")]
+  impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+      self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+  }
+
+  /// One socket pair's end sent over the pair itself and never received, then both closed: a cycle only the message
+  /// still holds, which Linux's collector of descriptors in flight finds and frees when the release starts it.
+  #[cfg(target_os = "linux")]
+  fn drop_an_unreachable_cycle() {
+    use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
+    use std::os::fd::AsFd;
+    let (near, far) = UnixStream::pair().unwrap();
+    let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut control = SendAncillaryBuffer::new(&mut space);
+    let carried = [far.as_fd()];
+    assert!(control.push(SendAncillaryMessage::ScmRights(&carried)));
+    rustix::net::sendmsg(
+      &near,
+      &[std::io::IoSlice::new(b"x")],
+      &mut control,
+      SendFlags::empty(),
+    )
+    .unwrap();
+    drop(near);
+    drop(far);
+  }
 }
 
 /// Windows: no route hands a client a handle yet, so the daemon refuses the form by kind.

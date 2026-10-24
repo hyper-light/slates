@@ -36,8 +36,10 @@ No Apple source or advisory was found.
 A client's Shards stream end could be dead on arrival, about one claim in five under load, and up to 40 of 48 claims
 with another thread opening and closing Unix sockets. The guest's share would fail at its first request with nothing
 to say why. Nothing shipped: the route was being built. The Linux route, the control socket, also closes the daemon's
-copy after the send (`shards::deliver_handoff`); it is not known to be affected (Linux's collector is a different
-design) and its tests run on CI.
+copy after the send (`shards::deliver_handoff`). Measured since (2026-10-24): not affected under the same kind of
+stress. `every_end_delivered_arrives_live_while_the_kernel_collects_descriptors_in_flight` delivered 48 of 48 ends
+live in each of 10 runs on Linux 7.2.9 while another thread dropped 8,192–12,976 unreachable cycles of descriptors in
+flight, each release scheduling Linux's collector.
 
 ## The fix
 
