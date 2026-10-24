@@ -44,6 +44,7 @@ pub mod error;
 pub mod export;
 pub mod host;
 pub mod ids;
+pub mod image;
 pub mod inode;
 pub mod journal;
 pub mod names;

@@ -94,6 +94,7 @@ pub struct ImageTree {
 /// image was opened from.
 #[derive(Debug)]
 pub struct Image {
+  uuid: [u8; sb::UUID_BYTES],
   len: u64,
   blocks: u64,
   inodes: u64,
@@ -164,7 +165,12 @@ impl Image {
       }));
     }
     let tables = read_tables(source, len, blocks, groups, inodes_per_group)?;
+    let mut uuid = [0u8; sb::UUID_BYTES];
+    if let Some(field) = superblock.get(sb::UUID..sb::UUID.saturating_add(sb::UUID_BYTES)) {
+      uuid.copy_from_slice(field);
+    }
     Ok(Image {
+      uuid,
       len,
       blocks,
       inodes,
@@ -172,6 +178,11 @@ impl Image {
       tables,
       cached: None,
     })
+  }
+
+  /// The file system's identity (`s_uuid`): the [`crate::write::Identity`]'s UUID for an image the writer wrote.
+  pub fn uuid(&self) -> [u8; 16] {
+    self.uuid
   }
 
   /// The inodes the file system holds.

@@ -12082,7 +12082,34 @@ Applied in the same change to:
   `inode->i_generation = get_random_u32()` (torvalds/linux master, read 2026-10-24). So an inode at its written
   number with generation 0 is, but for a 1 in 2³² chance, the node the writer put there. A merge keeps that node's
   identity through renames and rewrites.
-- **Owed:** the daemon's `image build` and `image merge` (sliced, into a clone), and the real Firecracker run.
+- **The volume's side (2026-10-24; `crates/vfs/src/image.rs`).**
+  - The build walks a snapshot depth first, each directory's entries in name order, so one snapshot always walks to
+    the same tree, node for node. It writes the image into a file of another volume. A volume over a host directory
+    is refused, since its snapshot may still read the disk.
+  - The merge makes a clone of the build's snapshot equal to the tree the image holds. It is not an inferred merge
+    (D-27): the clone starts at the image's base, nothing else writes it, and the image's tree becomes its state. A
+    node at its written number with the build's generation keeps its inode in the clone. A renamed file is renamed,
+    not copied, and an unchanged file's chunks stay shared. Identity is a hint only: every name, attribute and byte is
+    compared and set, so a node taken for the wrong one still ends as the image holds it.
+  - The phases, an item a step: identify; plan (an entry kept stays; one whose name the image gives to another node
+    is moved aside into a staging directory, made only when needed); attach, breadth first from the root (rename an
+    old name, link, or create); remove what is left (files first, then directories from the last walked down); unstage;
+    settle each node's size, differing chunks, permissions, owner and times (the change time set from the image).
+    A merge of an unchanged image changes nothing.
+  - Tests (`crates/vfs/tests/image.rs`, 2,000 cases each on 2026-10-24, green):
+    - generated volumes round-trip through their images;
+    - an unchanged image merges as no change, every byte compared;
+    - generated guest histories merge to the edited tree with every build node at its inode, the report exact;
+    - images renumbered throughout merge to their tree;
+    - each kind of change takes its own path;
+    - what a volume cannot hold is refused by kind.
+
+    Turning identity off fails the three identity tests.
+  - **What the oracle found first:** the remove phase took nodes from the last walked down, and a file is numbered
+    where it is first met. A hard link in a directory walked later was still there when that directory was removed,
+    which was refused `NotEmpty`. The seed is kept in `image.proptest-regressions`, red before the fix and green after.
+- **Owed:** the daemon's `image build` and `image merge` verbs (sliced, deferred replies, durable records), and the
+  real Firecracker run.
 
 ### A-159 — The bootstrap header no longer carries the daemon's process id (accepted 2026-10-23)
 Applied in the same change to:

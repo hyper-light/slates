@@ -15,6 +15,8 @@ slates-mem = { workspace = true }
 slates-wire = { workspace = true }
 # The archive format a snapshot exports to (§4.10 replication, §4.11): pure bytes, no I/O.
 slates-archive = { workspace = true }
+# A volume's disk-image form (§4.6, A-160): ext2, pure bytes, no I/O.
+slates-image = { workspace = true }
 unicode-normalization = { workspace = true }
 
 [dev-dependencies]

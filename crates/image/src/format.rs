@@ -181,6 +181,8 @@ pub mod superblock {
   pub const FEATURE_INCOMPAT: usize = 0x60;
   /// Format: `s_feature_ro_compat`.
   pub const FEATURE_RO_COMPAT: usize = 0x64;
+  /// Format: `s_uuid`, the file system's identity.
+  pub const UUID: usize = 0x68;
 }
 
 /// Inode field offsets, from `struct ext2_inode_large`.

@@ -1695,6 +1695,7 @@ dependencies = [
  "rustix",
  "shuttle",
  "slates-archive",
+ "slates-image",
  "slates-machine",
  "slates-mem",
  "slates-test-seeds",
