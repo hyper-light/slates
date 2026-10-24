@@ -161,12 +161,14 @@ fn under_mount(path: &str) -> Result<std::path::PathBuf, String> {
 /// Makes `path` hold exactly `bytes`.
 #[allow(clippy::disallowed_methods)] // the guest's own file system, in a VM: this binary never runs on a host
 fn write_file(path: &str, bytes: &[u8]) -> Result<(), String> {
+  // structural: allow — the guest's own file system, in a VM: this binary never runs on a host.
   std::fs::write(under_mount(path)?, bytes).map_err(|e| format!("write {path}: {e}"))
 }
 
 /// Writes `bytes` into `path` at `at`.
 fn patch_file(path: &str, at: u64, bytes: &[u8]) -> Result<(), String> {
   use std::os::unix::fs::FileExt;
+  // structural: allow — the guest's own file system, in a VM: this binary never runs on a host.
   std::fs::OpenOptions::new()
     .write(true)
     .open(under_mount(path)?)
@@ -177,6 +179,7 @@ fn patch_file(path: &str, at: u64, bytes: &[u8]) -> Result<(), String> {
 /// Renames `from` to `to`.
 #[allow(clippy::disallowed_methods)] // the guest's own file system, in a VM: this binary never runs on a host
 fn rename(from: &str, to: &str) -> Result<(), String> {
+  // structural: allow — the guest's own file system, in a VM: this binary never runs on a host.
   std::fs::rename(under_mount(from)?, under_mount(to)?)
     .map_err(|e| format!("rename {from} {to}: {e}"))
 }
@@ -185,12 +188,15 @@ fn rename(from: &str, to: &str) -> Result<(), String> {
 #[allow(clippy::disallowed_methods)] // the guest's own file system, in a VM: this binary never runs on a host
 fn remove(path: &str) -> Result<(), String> {
   let full = under_mount(path)?;
+  // structural: allow — the guest's own file system, in a VM: this binary never runs on a host.
   let directory = std::fs::symlink_metadata(&full)
     .map_err(|e| format!("stat {path}: {e}"))?
     .is_dir();
   if directory {
+    // structural: allow — the guest's own file system, in a VM: this binary never runs on a host.
     std::fs::remove_dir(&full)
   } else {
+    // structural: allow — the guest's own file system, in a VM: this binary never runs on a host.
     std::fs::remove_file(&full)
   }
   .map_err(|e| format!("remove {path}: {e}"))
@@ -199,6 +205,7 @@ fn remove(path: &str) -> Result<(), String> {
 /// Makes the directory `path`.
 #[allow(clippy::disallowed_methods)] // the guest's own file system, in a VM: this binary never runs on a host
 fn make_directory(path: &str) -> Result<(), String> {
+  // structural: allow — the guest's own file system, in a VM: this binary never runs on a host.
   std::fs::create_dir(under_mount(path)?).map_err(|e| format!("mkdir {path}: {e}"))
 }
 
@@ -209,6 +216,7 @@ fn list() -> Result<(), String> {
   let mut pending = vec![String::new()];
   while let Some(directory) = pending.pop() {
     let full = format!("{MOUNT_POINT}/{directory}");
+    // structural: allow — the guest's own file system, in a VM: this binary never runs on a host.
     let read = std::fs::read_dir(&full).map_err(|e| format!("list {full}: {e}"))?;
     for entry in read {
       let entry = entry.map_err(|e| format!("list {full}: {e}"))?;
@@ -243,12 +251,15 @@ fn list() -> Result<(), String> {
 /// A node's kind, size and digest: a file's length and the digest of its bytes, a link's target's, zero otherwise.
 fn described(full: &std::path::Path, path: &str) -> Result<(EntryKind, u64, u64), String> {
   use std::os::unix::fs::FileTypeExt;
+  // structural: allow — the guest's own file system, in a VM: this binary never runs on a host.
   let metadata = std::fs::symlink_metadata(full).map_err(|e| format!("stat {path}: {e}"))?;
   let kind = metadata.file_type();
   Ok(if kind.is_file() {
+    // structural: allow — the guest's own file system, in a VM: this binary never runs on a host.
     let bytes = std::fs::read(full).map_err(|e| format!("read {path}: {e}"))?;
     (EntryKind::File, metadata.len(), digest(&bytes))
   } else if kind.is_symlink() {
+    // structural: allow — the guest's own file system, in a VM: this binary never runs on a host.
     let target = std::fs::read_link(full).map_err(|e| format!("readlink {path}: {e}"))?;
     let target = target.as_os_str().as_encoded_bytes().to_vec();
     (

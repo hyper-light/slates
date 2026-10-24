@@ -65,13 +65,17 @@ fn profile() -> MachineProfile {
     .expect("the machine profile measures")
 }
 
-/// A daemon in this process named `tag`, with its consensus group made, a client of it, and the daemon's chunk: the
-/// copy-on-write unit a merge compares and writes in (sixteen host pages, `slates_vfs::content::chunk_bytes`).
-fn start(tag: &str) -> (Daemon, Client, usize) {
+/// A daemon in this process named `tag`, with its consensus group made, a client of it, and the daemon's chunk and
+/// page: the copy-on-write unit the test's large file spans several of (sixteen host pages,
+/// `slates_vfs::content::chunk_bytes`), and the unit a merge compares and writes in (the content granule).
+fn start(tag: &str) -> (Daemon, Client, (usize, usize)) {
   let profile = profile();
   let instance = format!("img-{tag}-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let chunk = slates_vfs::content::chunk_bytes(config.page).get();
+  let units = (
+    slates_vfs::content::chunk_bytes(config.page).get(),
+    config.content_granule(),
+  );
   let daemon = Daemon::start(
     &profile,
     config,
@@ -97,7 +101,7 @@ fn start(tag: &str) -> (Daemon, Client, usize) {
       Err(e) => panic!("{e}"),
     }
   };
-  (daemon, client, chunk)
+  (daemon, client, units)
 }
 
 /// The source volume's files: `/docs/a.txt`, `/docs/sub/b.bin` (a pattern three chunks and more long), `/c.txt`, and
@@ -384,13 +388,13 @@ fn rewrite(bytes: &mut [u8], chunk: usize) {
 }
 
 /// A-160 by use. Do: build a volume's snapshot as an image, read the image file back through the client and parse
-/// it; write a guest's edits into the image (a rename, a rewrite of one chunk, a deletion, a new file at the freed
+/// it; write a guest's edits into the image (a rename, a rewrite inside one page, a deletion, a new file at the freed
 /// inode number) and merge it. Expect the image to hold the volume's files byte for byte; the merge to keep every
 /// build node but the deleted one, make one, remove one, move one and write only the rewritten chunk's bytes; and the
 /// clone to hold exactly the edited files.
 #[test]
 fn an_image_is_built_read_back_edited_and_merged_into_a_clone() {
-  let (daemon, mut client, chunk) = start("merge");
+  let (daemon, mut client, (chunk, page)) = start("merge");
   let (volume, snapshot) = source(&mut client, chunk);
   let built = client
     .image_build(volume, snapshot, "image", CAPACITY)
@@ -442,10 +446,10 @@ fn an_image_is_built_read_back_edited_and_merged_into_a_clone() {
     (nodes - 1, 1, 1, 1),
     "{report:?}"
   );
-  // The new file's nine bytes, and the one chunk of the rewritten file whose bytes differ: the rest stays shared.
+  // The new file's nine bytes, and the one page of the rewritten file whose bytes differ: the rest stays shared.
   assert_eq!(
     report.bytes_written,
-    9 + u64::try_from(chunk).unwrap(),
+    9 + u64::try_from(page).unwrap(),
     "{report:?}"
   );
   let mut expected = written;
@@ -465,7 +469,7 @@ fn an_image_is_built_read_back_edited_and_merged_into_a_clone() {
 /// kind, and no volume made by any of them.
 #[test]
 fn image_verbs_refuse_by_kind_and_make_nothing() {
-  let (daemon, mut client, chunk) = start("refuse");
+  let (daemon, mut client, (chunk, _)) = start("refuse");
   let (volume, snapshot) = source(&mut client, chunk);
   let image_refused = |result: Result<_, ClientError>| {
     matches!(
@@ -527,7 +531,7 @@ fn image_verbs_refuse_by_kind_and_make_nothing() {
 /// is gone.
 #[test]
 fn an_image_volume_pins_its_snapshot_until_it_goes() {
-  let (daemon, mut client, chunk) = start("pin");
+  let (daemon, mut client, (chunk, _)) = start("pin");
   let (volume, snapshot) = source(&mut client, chunk);
   let built = client
     .image_build(volume, snapshot, "image", CAPACITY)

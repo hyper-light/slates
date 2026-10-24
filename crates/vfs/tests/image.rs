@@ -1093,7 +1093,7 @@ fn scenario(change: &dyn Fn(&mut Model)) -> MergeReport {
 /// directory, a directory moved with what it holds, a hard link added and one dropped, a file rewritten, a file
 /// deleted and made again at its inode number, a name given to a node of another kind, and a directory deleted with
 /// a file inside it that moved out first. Expect each clone to hold the changed tree, and each change to take its own
-/// path: names moved aside only for the swap and the kind change, renames for moves, links for links, chunks written
+/// path: names moved aside only for the swap and the kind change, renames for moves, links for links, pages written
 /// for rewrites, nodes removed for deletions.
 #[test]
 fn each_kind_of_guest_change_takes_its_own_path() {

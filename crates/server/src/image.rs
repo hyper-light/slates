@@ -3,9 +3,12 @@
 //! the image a guest has written merged into a new clone of the snapshot it was built from.
 //!
 //! **Running.** Each verb checks what it can at once — the volume, the right, the name, the snapshot — and defers its
-//! reply to a task of the volume's owner shard, as a granted landing does (AUD-29-03). The task steps the work a
-//! slice at a time ([`crate::config::DaemonConfig::copy_slice_bytes`] a slice), yielding between slices, so the shard
-//! serves its clients while an image of any size is built or merged (§4.3). A retry while it runs joins it.
+//! reply to a task of the volume's owner shard, as a granted landing does (AUD-29-03). The task steps the work a slice
+//! at a time, yielding between slices, so the shard serves its clients while an image of any size is built or merged
+//! (§4.3). A slice is bounded against the clock, half the live step quantum
+//! ([`crate::config::DaemonConfig::copy_slice_ns`]), one unit at a time — an entry walked, a block written, a chunk
+//! compared — since a unit's cost is not its bytes. Measured on 2026-10-24, slices bounded by 256 KiB of work ran
+//! 230 µs to 1.5 ms, ten to sixty times the box's 24 µs. A retry while it runs joins it.
 //!
 //! **One atom.** The new volume is not in the registry while it is made, so no client attaches a half-built image or
 //! a half-merged clone. Its record, its publication and the request's completion record commit together, and then
@@ -54,6 +57,34 @@ const NANOS_PER_SECOND: i64 = 1_000_000_000;
 /// Counter: an image task's reply that could not be handed to its client's shard; the client's retry reads its
 /// completion record.
 const REPLY_UNDELIVERED: &str = "image.reply_undelivered";
+/// Counter: a unit of image work (a directory opened, an entry, a block written, a chunk compared) that alone took
+/// longer than a whole slice: a directory or a chunk past what one step should carry, the signal of a unit to split.
+const UNITS_PAST_BUDGET: &str = "image.units_past_budget";
+/// Format: the byte budget each unit's call is given: one, so every call does exactly one unit, and [`sliced`]
+/// decides against the clock when the slice ends.
+const ONE_UNIT: u64 = 1;
+
+/// Runs `unit` — one unit of a phase, `Some` once the phase is whole — until the phase is whole or the slice's time is
+/// spent: [`crate::config::DaemonConfig::copy_slice_ns`], half the live step quantum, as a granted landing's slice. The
+/// clock is read after every unit, so a slice overruns its budget by its last unit at most.
+fn sliced<T>(
+  state: &mut ShardState,
+  mut unit: impl FnMut(&mut ShardState) -> Result<Option<T>, Refusal>,
+) -> Result<Option<T>, Refusal> {
+  let budget = state.config.copy_slice_ns().max(1);
+  let began = state.clock.monotonic_ns();
+  loop {
+    let unit_began = state.clock.monotonic_ns();
+    let done = unit(state)?;
+    let now = state.clock.monotonic_ns();
+    if now.saturating_sub(unit_began) > budget {
+      state.count(UNITS_PAST_BUDGET, 1);
+    }
+    if done.is_some() || now.saturating_sub(began) >= budget {
+      return Ok(done);
+    }
+  }
+}
 
 /// The image builds and merges running on this shard (§4.6, A-160).
 #[derive(Default)]
@@ -375,13 +406,15 @@ impl BuildJob {
 
   /// One slice of the walk; the tree once whole.
   fn walk_step(&mut self, state: &mut ShardState) -> Result<Option<SnapshotTree>, Refusal> {
-    let budget = state.config.copy_slice_bytes().max(1);
-    let handle = slot_of(state, self.source)?;
-    let slot = state.volumes.get(handle).map_err(|_| Refusal::NotFound)?;
+    let source = self.source;
     let walk = self.walk.as_mut().ok_or_else(unreachable)?;
-    walk
-      .step(&slot.volume, &state.store, budget)
-      .map_err(refusal_of_image)
+    sliced(state, |s| {
+      let handle = slot_of(s, source)?;
+      let slot = s.volumes.get(handle).map_err(|_| Refusal::NotFound)?;
+      walk
+        .step(&slot.volume, &s.store, ONE_UNIT)
+        .map_err(refusal_of_image)
+    })
   }
 
   /// Plans the image of `tree` and admits its volume, sized to hold the image whole: its bytes rounded up to whole
@@ -439,27 +472,30 @@ impl BuildJob {
     &mut self,
     state: &mut ShardState,
   ) -> Result<Option<slates_image::Written>, Refusal> {
-    let budget = state.config.copy_slice_bytes().max(1);
-    let handle = slot_of(state, self.source)?;
-    let ShardState { volumes, store, .. } = state;
-    let slot = volumes.get(handle).map_err(|_| Refusal::NotFound)?;
+    let (source, snapshot, file) = (self.source, core_snapshot(self.snapshot), self.file);
     let admitted = self.admitted.as_mut().ok_or_else(unreachable)?;
     let builder = self.builder.as_mut().ok_or_else(unreachable)?;
-    let mut io = BuildIo {
-      store,
-      source: &slot.volume,
-      snapshot: core_snapshot(self.snapshot),
-      inodes: &self.inodes,
-      image: &mut admitted.volume,
-      file: self.file,
-    };
-    match builder
-      .step(&mut io, budget)
-      .map_err(|failed| refusal_of_image(failed.into()))?
-    {
-      Progress::More => Ok(None),
-      Progress::Done(written) => Ok(Some(written)),
-    }
+    let inodes = &self.inodes;
+    sliced(state, |s| {
+      let handle = slot_of(s, source)?;
+      let ShardState { volumes, store, .. } = s;
+      let slot = volumes.get(handle).map_err(|_| Refusal::NotFound)?;
+      let mut io = BuildIo {
+        store,
+        source: &slot.volume,
+        snapshot,
+        inodes,
+        image: &mut admitted.volume,
+        file,
+      };
+      match builder
+        .step(&mut io, ONE_UNIT)
+        .map_err(|failed| refusal_of_image(failed.into()))?
+      {
+        Progress::More => Ok(None),
+        Progress::Done(written) => Ok(Some(written)),
+      }
+    })
   }
 
   /// Records the image volume — its record naming the snapshot as its base, which keeps the build's pin — moves it
@@ -741,13 +777,15 @@ impl MergeJob {
 
   /// One slice of the base's walk; whether it is whole.
   fn base_step(&mut self, state: &mut ShardState) -> Result<bool, Refusal> {
-    let budget = state.config.copy_slice_bytes().max(1);
-    let origin = slot_of(state, self.base)?;
-    let slot = state.volumes.get(origin).map_err(|_| Refusal::NotFound)?;
+    let base = self.base;
     let walk = self.base_walk.as_mut().ok_or_else(unreachable)?;
-    let walked = walk
-      .step(&slot.volume, &state.store, budget)
-      .map_err(refusal_of_image)?;
+    let walked = sliced(state, |s| {
+      let origin = slot_of(s, base)?;
+      let slot = s.volumes.get(origin).map_err(|_| Refusal::NotFound)?;
+      walk
+        .step(&slot.volume, &s.store, ONE_UNIT)
+        .map_err(refusal_of_image)
+    })?;
     match walked {
       Some(tree) => {
         self.base_tree = Some(tree);
@@ -781,25 +819,34 @@ impl MergeJob {
 
   /// One slice of the image's walk; once whole, the merge planned over both trees.
   fn image_step(&mut self, state: &mut ShardState) -> Result<bool, Refusal> {
-    let budget = state.config.copy_slice_bytes().max(1);
-    let image = slot_of(state, self.image)?;
-    let slot = state.volumes.get(image).map_err(|_| Refusal::NotFound)?;
+    let (image, file, len) = (self.image, self.file, self.len);
     let snapshot = self.image_snapshot.ok_or_else(unreachable)?;
-    let mut source = SnapshotFile {
-      volume: &slot.volume,
-      store: &state.store,
-      snapshot,
-      file: self.file,
-      len: self.len,
-    };
     let reader = self.reader.as_mut().ok_or_else(unreachable)?;
     let walk = self.image_walk.as_mut().ok_or_else(unreachable)?;
-    let Walked::Done(tree) = walk
-      .step(reader, &mut source, budget)
-      .map_err(|failed| refusal_of_image(failed.into()))?
-    else {
+    let walked = sliced(state, |s| {
+      let slot = s
+        .volumes
+        .get(slot_of(s, image)?)
+        .map_err(|_| Refusal::NotFound)?;
+      let mut source = SnapshotFile {
+        volume: &slot.volume,
+        store: &s.store,
+        snapshot,
+        file,
+        len,
+      };
+      match walk
+        .step(reader, &mut source, ONE_UNIT)
+        .map_err(|failed| refusal_of_image(failed.into()))?
+      {
+        Walked::More => Ok(None),
+        Walked::Done(tree) => Ok(Some(tree)),
+      }
+    })?;
+    let Some(tree) = walked else {
       return Ok(false);
     };
+    let reader = self.reader.as_ref().ok_or_else(unreachable)?;
     // The image is the build's when its file system's identity is the image volume's own id, which the build gave
     // it; any other image is merged by names and bytes alone.
     let trusted = reader.uuid() == self.image.bytes;
@@ -812,24 +859,26 @@ impl MergeJob {
 
   /// One slice of the merge; its report once the clone holds the image's tree.
   fn merge_step(&mut self, state: &mut ShardState) -> Result<Option<MergeReport>, Refusal> {
-    let budget = state.config.copy_slice_bytes().max(1);
-    let image = slot_of(state, self.image)?;
+    let (image, file, len) = (self.image, self.file, self.len);
     let snapshot = self.image_snapshot.ok_or_else(unreachable)?;
-    let ShardState { volumes, store, .. } = state;
-    let slot = volumes.get(image).map_err(|_| Refusal::NotFound)?;
     let reader = self.reader.as_mut().ok_or_else(unreachable)?;
     let clone = self.clone.as_mut().ok_or_else(unreachable)?;
     let merge = self.merge.as_mut().ok_or_else(unreachable)?;
-    let mut content = ImageContent {
-      image: reader,
-      volume: &slot.volume,
-      snapshot,
-      file: self.file,
-      len: self.len,
-    };
-    merge
-      .step(&mut clone.volume, store, &mut content, budget)
-      .map_err(refusal_of_image)
+    sliced(state, |s| {
+      let handle = slot_of(s, image)?;
+      let ShardState { volumes, store, .. } = s;
+      let slot = volumes.get(handle).map_err(|_| Refusal::NotFound)?;
+      let mut content = ImageContent {
+        image: reader,
+        volume: &slot.volume,
+        snapshot,
+        file,
+        len,
+      };
+      merge
+        .step(&mut clone.volume, store, &mut content, ONE_UNIT)
+        .map_err(refusal_of_image)
+    })
   }
 
   /// Records the clone — its record and its lineage to the base's snapshot — moves it into the registry and publishes

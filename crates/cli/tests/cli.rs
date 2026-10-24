@@ -9161,8 +9161,8 @@ fn the_clone_holds_the_edits(mount: &str, files: &[(&str, Vec<u8>)]) {
 /// image file and `debugfs cat` every file; make a guest's edits with `debugfs -w` through the mount — a rename (a link
 /// and an unlink), one block of a file rewritten in place (`zap_block`), a deletion, a new file and a new directory —
 /// check the image again, and `slates image merge` it. Expect the image to pass e2fsck before and after the edits and
-/// to hold every file byte for byte; the merge to make two nodes, move one, remove one and write only the chunk the
-/// rewritten block lies in; and the clone, read through its own mount, to hold exactly the edited files.
+/// to hold every file byte for byte; the merge to make two nodes, move one, remove one and write only the page the
+/// rewritten block is; and the clone, read through its own mount, to hold exactly the edited files.
 #[cfg(target_os = "linux")]
 #[test]
 fn an_image_built_through_the_cli_passes_e2fsck_through_a_mount_and_merges_a_guests_edits() {
@@ -9172,6 +9172,7 @@ fn an_image_built_through_the_cli_passes_e2fsck_through_a_mount_and_merges_a_gue
   let instance = format!("cli-image-{}", std::process::id());
   let _anchor = start_anchor(&instance);
   let chunk = slates_vfs::content::chunk_bytes(rustix::param::page_size()).get();
+  let page = slates_server::config::content_granule(rustix::param::page_size());
   let files = image_source_files(chunk);
   let (code, out, err) = run(
     &instance,
@@ -9223,10 +9224,10 @@ fn an_image_built_through_the_cli_passes_e2fsck_through_a_mount_and_merges_a_gue
     (2, 1, 1),
     "{out}"
   );
-  // The new file's bytes and the one chunk the rewritten block lies in: the rest of the file stays shared.
+  // The new file's bytes and the one page the rewritten block is: the rest of the file stays shared.
   assert_eq!(
     count("bytes_written"),
-    u64::try_from(chunk).unwrap() + 17,
+    u64::try_from(page).unwrap() + 17,
     "{out}"
   );
   let merged_mount = MountPoint {

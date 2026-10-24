@@ -86,6 +86,8 @@ impl Gate {
 /// to it, a file the guest removes, and a symbolic link.
 struct Source {
   chunk: usize,
+  /// The unit a merge compares and writes in: the daemon's content granule.
+  page: usize,
   files: Vec<(&'static str, Vec<u8>)>,
 }
 
@@ -97,6 +99,7 @@ impl Source {
       .collect();
     Source {
       chunk,
+      page: slates_server::config::content_granule(rustix::param::page_size()),
       files: vec![
         ("docs/a.txt", b"the first file".to_vec()),
         ("docs/sub/b.bin", large),
@@ -312,7 +315,7 @@ fn count(out: &str, key: &str) -> u64 {
 /// second chunk, rename one into another directory, remove one, write a new file and make a directory, list again, flush
 /// and end the VM; `slates image merge` the image and read the clone through its mount. Expect the guest to read every
 /// node as the volume holds it (kind, size and digest), and its changes in its second listing; Firecracker to exit
-/// cleanly; the merge to make two nodes, move one and remove one, and to write the new file's bytes and the one chunk
+/// cleanly; the merge to make two nodes, move one and remove one, and to write the new file's bytes and the one page
 /// the patch lies in; and the clone to hold exactly what the guest left.
 #[test]
 fn a_firecracker_guest_reads_and_writes_a_volume_through_its_image() {
@@ -412,7 +415,7 @@ fn a_firecracker_guest_reads_and_writes_a_volume_through_its_image() {
   );
   assert_eq!(
     count(&out, "bytes_written"),
-    u64::try_from(source.chunk + NEW_FILE.len()).unwrap(),
+    u64::try_from(source.page + NEW_FILE.len()).unwrap(),
     "{out}"
   );
   let merged = out

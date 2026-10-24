@@ -12177,8 +12177,19 @@ Applied in the same change to:
     64 KiB chunk and the new file's 27 bytes. The clone, read through its own mount, held exactly the guest's tree.
   - The guest booted to its probe's ready in 191–207 ms. The test ran green 3 of 3, and was red with the merge's chunk
     writes disabled. The crosvm guest tests share its harness (`tests/vm`) and stayed green, 3 of 3.
+- **Slices bounded by the clock (2026-10-24).** The daemon first bounded each slice by 256 KiB of charged work
+  (`copy_slice_bytes`). Measured with `crates/vfs/examples/image_bench.rs`, those slices ran 230 µs to 1.5 ms when
+  the scheduler left them alone, ten to sixty times the box's 24 µs (half its 47.5 µs step quantum). A unit's cost
+  is not its bytes: a walked entry is charged about 80 bytes and costs about 450 ns.
+  - The daemon now runs each phase one unit a call, until half the live step quantum has passed
+    (`DaemonConfig::copy_slice_ns`, a granted landing's share), so a slice overruns by its last unit at most. A unit
+    longer than a whole slice is counted (`image.units_past_budget`).
+  - The merge's unit is the store's page, not its chunk. Comparing a whole 256 KiB chunk took about 40 µs on macOS
+    arm64, longer than a slice. A page compares and writes in about 1 µs at p99, and only differing pages are
+    written, so a chunk with no differing page is still never written.
+  - The tests' byte counts follow: one page and the new file's bytes.
 - **Owed:** the design's §4.6 and `virtiofs.md` §8 item 7 updated for the disk-image route, and the costs of build
-  and merge measured in `docs/wip/BENCHMARKS.md`.
+  and merge recorded in `docs/wip/BENCHMARKS.md`.
 
 ### A-159 — The bootstrap header no longer carries the daemon's process id (accepted 2026-10-23)
 Applied in the same change to:

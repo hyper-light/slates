@@ -49,9 +49,8 @@ const PERMILLE: u64 = 1000;
 /// takes, `verbs::DESTROY_SLICE_PERMILLE`).
 const ARCHIVE_SLICE_PERMILLE: u64 = 500;
 /// Shape: a slice of copy-bound work (§4.6 L2's periodic DAX shift; an image's build and merge, A-160) as a share of
-/// the shard's step budget, parts per thousand — the same half the archive walk takes, and for the same reason: work
-/// in progress never takes the whole step from the clients. All of it moves content under the shard's own quantum,
-/// so it is sized alike.
+/// the shard's step budget, parts per thousand — the same half the archive walk and a granted landing take, and for
+/// the same reason: work in progress never takes the whole step from the clients.
 const COPY_SLICE_PERMILLE: u64 = 500;
 /// How often §4.6 L2's moving target shifts a writable DAX window. §4.6 states the interval directly — "the
 /// modern window is 16–32 ms and RowPress leaks across refresh windows, so the migration interval is derived
@@ -1081,10 +1080,17 @@ impl DaemonConfig {
     archive_slice_bytes(self.blake3_bytes_per_second, self.step_quantum_ns())
   }
 
-  /// The content bytes one slice of copy-bound work (§4.6 L2's periodic shift, an image's build or merge) may move on
-  /// the calling shard now: half its live step quantum at the machine's measured memcpy rate.
+  /// The content bytes one slice of copy-bound work (§4.6 L2's periodic shift) may move on the calling shard now: half
+  /// its live step quantum at the machine's measured memcpy rate.
   pub fn copy_slice_bytes(&self) -> u64 {
     copy_slice_bytes(self.memcpy_bytes_per_second, self.step_quantum_ns())
+  }
+
+  /// The time one slice of such work may take on the calling shard now: half its live step quantum. Work whose units
+  /// are not bytes copied — an image's walk, layout, writing and merge (A-160), where an entry costs tens of times its
+  /// bytes — is bounded by it against the clock, one unit at a time.
+  pub fn copy_slice_ns(&self) -> u64 {
+    self.step_quantum_ns().saturating_mul(COPY_SLICE_PERMILLE) / PERMILLE
   }
 
   /// This configuration with `fault` injected into a shard's start (the boot tests).

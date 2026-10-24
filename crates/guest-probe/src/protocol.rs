@@ -23,6 +23,8 @@ const PATCH_ARGUMENTS: usize = 3;
 const ENTRY_WORDS: usize = 4;
 /// Format: the byte runs of no bytes at all, so an empty file's `write` keeps its argument.
 const NO_BYTES: &str = "-";
+/// Format: the radix of an entry's digest on the console: hexadecimal, as `{:016x}` writes it.
+const DIGEST_RADIX: u32 = 16;
 /// Format: the FNV-1a 64-bit offset basis and prime (Fowler, Noll, Vo), the digest an `entry` carries.
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 /// See [`FNV_OFFSET`].
@@ -432,7 +434,7 @@ fn entry_of(rest: &str) -> Result<Reply, ProtocolError> {
   Ok(Reply::Entry {
     kind: EntryKind::of(kind)?,
     size: number(size)?,
-    digest: u64::from_str_radix(digest, 16)
+    digest: u64::from_str_radix(digest, DIGEST_RADIX)
       .map_err(|_| ProtocolError::Number(digest.to_owned()))?,
     path: path.to_owned(),
   })

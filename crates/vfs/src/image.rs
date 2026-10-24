@@ -32,14 +32,17 @@
 //!    it, so its other names may lie in directories walked after it: taken node by node from the last down, a removed
 //!    directory still held such a link, and its removal was refused, 2026-10-24.)
 //! 5. **unstage**: remove the staging directory, if one was made, empty by then;
-//! 6. **settle** each node: a file's size and the chunks whose bytes differ, then its permissions, owner and times
+//! 6. **settle** each node: a file's size and the pages whose bytes differ, then its permissions, owner and times
 //!    (the change time set from the image), last, after every change that would move them.
 //!
 //! A merge of an image no one changed makes no change to the clone: every entry is kept, no staging directory is
-//! made, and every chunk and attribute compares equal.
+//! made, and every page and attribute compares equal.
 //!
-//! Cost: the merge reads every file of the image and its counterpart in the clone, a chunk a step, and writes only
-//! the chunks that differ; the namespace work is proportional to the entries, each a step.
+//! Cost: the merge reads every file of the image and its counterpart in the clone, a page (the store's granule) a
+//! step, and writes only the pages that differ; a chunk none of whose pages differs is never written, and stays
+//! shared. The page is the unit, not the chunk, so a step stays small: comparing a whole 256 KiB chunk took about
+//! 40 µs on macOS arm64 (2026-10-24, `examples/image_bench.rs`), longer than a daemon's slice. The namespace work is
+//! proportional to the entries, each a step.
 //!
 //! Evidence: `tests/image.rs` builds images of generated volumes and reads them back equal, merges generated guest
 //! histories (renames, rewrites, hard links, swaps, kind changes, moves of whole directories) into clones held to the
@@ -486,7 +489,7 @@ pub struct MergeReport {
   pub staged: u64,
   /// File bytes compared with the image.
   pub bytes_compared: u64,
-  /// File bytes written: the chunks that differed.
+  /// File bytes written: the pages that differed.
   pub bytes_written: u64,
   /// Nodes whose permissions, owner or times were set.
   pub attributes_set: u64,
@@ -509,7 +512,7 @@ enum Phase {
   Remove { node: usize, directories: bool },
   /// Removing the staging directory.
   Unstage,
-  /// Settling image node `node`: its file's chunk at `offset` (`None` before its size is set), then its attributes.
+  /// Settling image node `node`: its file's page at `offset` (`None` before its size is set), then its attributes.
   Settle { node: usize, offset: Option<u64> },
   /// Done.
   Done,
@@ -539,7 +542,8 @@ pub struct Merge {
   /// The image directory being planned against, by base directory, and its entries' lookup when names fold.
   folded: Option<(usize, Vec<(String, usize)>)>,
   policy: NameEquivalence,
-  chunk: u64,
+  /// The bytes compared, and written when they differ, a step: the store's granule.
+  unit: u64,
   phase: Phase,
   report: MergeReport,
 }
@@ -577,7 +581,7 @@ impl Merge {
       staged_names: 0,
       folded: None,
       policy: clone.policy,
-      chunk: u64::try_from(store.content.chunk_bytes().max(1)).unwrap_or(u64::MAX),
+      unit: u64::try_from(store.content.granule().max(1)).unwrap_or(u64::MAX),
       phase: if trusted {
         Phase::Identify { node: 0 }
       } else {
@@ -1136,7 +1140,7 @@ impl Merge {
     Ok(1)
   }
 
-  /// Settles image node `node`: a file's size, then its chunks one a step, then its attributes.
+  /// Settles image node `node`: a file's size, then its pages one a step, then its attributes.
   fn settle(
     &mut self,
     clone: &mut Volume,
@@ -1178,10 +1182,10 @@ impl Merge {
           return Ok(1);
         }
         Some(at) if at < size => {
-          let cost = self.settle_chunk(clone, store, content, node, no, at, size)?;
+          let cost = self.settle_page(clone, store, content, node, no, at, size)?;
           self.phase = Phase::Settle {
             node,
-            offset: Some(at.saturating_add(self.chunk)),
+            offset: Some(at.saturating_add(self.unit)),
           };
           return Ok(cost);
         }
@@ -1196,9 +1200,9 @@ impl Merge {
     Ok(1)
   }
 
-  /// Compares the chunk at `at` of image node `node` with clone inode `no`'s, and writes the image's when they differ.
+  /// Compares the page at `at` of image node `node` with clone inode `no`'s, and writes the image's when they differ.
   #[allow(clippy::too_many_arguments)]
-  fn settle_chunk(
+  fn settle_page(
     &mut self,
     clone: &mut Volume,
     store: &mut Store,
@@ -1215,9 +1219,9 @@ impl Merge {
       .ok_or(ImageError::Inconsistent {
         reason: "an image node without an inode",
       })?;
-    let length = usize::try_from(self.chunk.min(size.saturating_sub(at))).map_err(|_| {
+    let length = usize::try_from(self.unit.min(size.saturating_sub(at))).map_err(|_| {
       ImageError::Inconsistent {
-        reason: "a chunk past the address space",
+        reason: "a page past the address space",
       }
     })?;
     let mut wanted = vec![0u8; length];
