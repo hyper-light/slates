@@ -473,6 +473,10 @@ impl Bridge for ScopedBridge<'_> {
     self.inner.admit_states(cx, bytes)
   }
 
+  fn restored_open_files(&mut self, cx: &OpContext) -> Vec<u64> {
+    self.inner.restored_open_files(cx)
+  }
+
   fn invalidations(
     &mut self,
     cx: &OpContext,

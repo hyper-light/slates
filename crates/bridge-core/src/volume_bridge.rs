@@ -1443,6 +1443,10 @@ impl Bridge for VolumeBridge<'_> {
     self.store.metadata.reserve(bytes).is_ok()
   }
 
+  fn restored_open_files(&mut self, cx: &OpContext) -> Vec<u64> {
+    self.volume.restored_open_files(cx.owner)
+  }
+
   fn change_token(&mut self, object: ObjectId, cx: &OpContext) -> Result<u64, VfsError> {
     self.authorize_read(cx)?;
     // A view changes whenever its owner's attributes or working copy do; the owner's version moves

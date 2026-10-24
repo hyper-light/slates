@@ -2323,10 +2323,12 @@ since excepted. That is what one shared page cache would hold. For each byte of 
 the journal point its kernel's copy is as of and whether another path changed it since. These states are fed from the
 records its invalidation rounds already walk, so a copy fetched any time ago is judged. A file's first writable open on a
 mount drops the kernel's cached pages (no `FOPEN_KEEP_CACHE`), so every byte starts fresh. **A mount taken over by a
-restarted daemon** (A-61) never saw the opens its kernel made before. A request naming such a handle adopts its file
-(A-147): fresh as of the mount's start, with the journal's changes to it since then applied, and judged from there like
-any other. Untracked, such a file was judged against every change since the mount's start. A store made after a
-re-fetch of bytes another path had changed was then kept back, and lost. **A READ through a handle
+restarted daemon** (A-61) never saw the opens its kernel made before. At its first turn it tracks every file the last
+publication counted open for it, fresh as of its start, and its rounds feed them from there (A-156). A request naming a
+handle opened after that publication adopts its file (A-147): fresh as of the mount's start, with the journal's changes
+to it since then applied, and judged from there like any other. Untracked, such a file was judged against every change
+since the mount's start. A store made after a re-fetch of bytes another path had changed was then kept back, and
+lost. **A READ through a handle
 opened `O_DIRECT` is ambiguous** (A-144). It is a direct read, which leaves the kernel's copy as it was, or a fill of
 that copy (a fault on a map of the handle, a buffered fallback), and FUSE carries nothing that tells them apart. So it
 leaves the bytes that are fresh either way as they are, and makes the others unknown. Counted as a fetch, one direct
@@ -11986,6 +11988,45 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
+
+### A-156 — A restored mount tracks the files the last publication counted open from its start (accepted 2026-10-23)
+Applied in the same change to:
+- §4.6 (a mount taken over by a restarted daemon);
+- A-147 (lazy adoption kept only for opens no publication counted);
+- `crates/vfs/src/volume.rs`: `Volume::restored_open_files`;
+- `crates/bridge-core`: `Bridge::restored_open_files` (`volume_bridge.rs`, `scoped.rs`, the test bridge in
+  `crates/bridge-fuse/tests`);
+- `crates/bridge-fuse/src/coherence.rs`: `Coherence::begin_at`;
+- `crates/bridge-fuse/src/channel.rs`:
+  - `adopt_restored`, run once at a restored mount's first turn (`ServeState::adopt_restored`);
+  - `drop_released_restored`, at the release of a handle the mount never saw opened;
+- the tests:
+  - `crates/bridge-fuse/src/channel.rs`: `a_released_pre_takeover_files_states_go_once_nothing_of_it_is_open`;
+  - `crates/cli/tests/cli.rs`: `a_restored_mounts_counted_files_are_tracked_from_its_start_past_the_journals_reach`;
+- GAPS.
+
+- **What it answers.** A-147 adopted a restored mount's file only when a request named one of its handles. It read the
+  journal back to the mount's start for the changes the file had missed. Once the journal no longer reached back, the
+  file was lost and its write-backs were refused. With a journal that keeps only what a live reader needs (the plan
+  "Journal budget derived", step 4), that would be soon after any activity.
+- **The rule.** At a restored mount's first turn:
+  - it tracks every file the volume restored opens of for its owner (A-152's counts) as fresh as of that moment;
+  - it starts its rounds at the same head, so they feed each file every change after it.
+  The same assumption A-147 made of an adopted file, fresh as of the mount's start, is now made of every counted file
+  at once. No journal record from before is ever needed.
+- **What stays lazy.** A handle opened after the last publication is in no count. Its file is still adopted when a
+  request names it, from the journal's records since the start, as A-147 did. A publication that counts every open
+  promptly would close that window, at the cost of a publication per open (not taken).
+- **The release.** When a handle the mount never saw opened is released, and nothing of its file is open on the mount
+  any more, the file's states go. Otherwise they would outlive the handles, and a later open would inherit them (a lost
+  file's refusals among them), though that open dropped the kernel's cached pages.
+- **Evidence.** On the box (Linux 7.2.9), with this change's files restored to the previous commit:
+  - setup: a 256 KiB volume (a one-page journal), a mapped file, an unlink publishing its open, a `SIGKILL` and the
+    anchor's successor;
+  - then 50 SDK replacements of another file, each consumed by the mount's round, and a store through the map;
+  - before: `msync` answered `EIO`;
+  - with the change: it succeeds, with no overrun and no write-back refused as unknown, and slates holds the store.
+  The existing A-147 test passes unchanged.
 
 ### A-155 — A mount's byte states are charged to the metadata ledger, not bounded by the journal (accepted 2026-10-23)
 Applied in the same change to:

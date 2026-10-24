@@ -5588,6 +5588,18 @@ impl Volume {
     Ok(())
   }
 
+  /// The inodes the recovery restored opens of for `owner` that are not given back yet (A-152): the files a mount taken
+  /// over by this daemon holds open from before the takeover, as far as the last publication counted. The mount tracks
+  /// their byte states from its start ([`Volume::release_restored_open`] gives each back at its handle's release).
+  pub fn restored_open_files(&self, owner: RefOwner) -> Vec<u64> {
+    self
+      .restored_opens
+      .keys()
+      .filter(|(holder, _)| *holder == owner)
+      .map(|(_, no)| no.0)
+      .collect()
+  }
+
   /// Gives back one open the recovery restored for `owner` on inode `no` (goal item 4, A-152): the release of a handle
   /// this daemon never issued, which a dead daemon issued before a takeover. While a restored open of the pair is left,
   /// one is consumed, its open closed and its reference dropped (an unlinked file no reference holds any more is then

@@ -5777,8 +5777,10 @@ struct MappedThroughAMount {
   /// The file's length and the map's: a whole number of pages.
   length: usize,
   file: std::fs::File,
-  /// Held for its `Drop`: unmounts while the daemon below still lives.
-  _point: MountPoint,
+  /// The mount: held for its `Drop`, which unmounts while the daemon below still lives, and named for the Linux tests
+  /// that work beside the map through it (elsewhere it is only held, hence the platform's dead-code allowance).
+  #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+  point: MountPoint,
   /// The other path: an SDK client whose write attachment, `attachment`, lives while it does.
   writer: slates_client::Client,
   volume: slates_client::VolumeId,
@@ -5860,7 +5862,7 @@ impl MappedThroughAMount {
       page,
       length,
       file,
-      _point: point,
+      point,
       writer,
       volume,
       attachment,
@@ -6343,6 +6345,114 @@ fn a_store_made_after_a_refetch_lands_through_a_mount_taken_over_by_a_restarted_
     "the store made after the re-fetch is in the volume; bytes {lost:?} hold {:?}",
     lost.iter().map(|at| held.get(*at)).collect::<Vec<_>>()
   );
+}
+
+/// Shape: the whole-file SDK writes of another file the restored-start test makes after the takeover, each a truncate
+/// and a write: twice and more what the one-page journal keeps (about 46 records), so the journal no longer reaches
+/// back to the restored mount's start.
+#[cfg(target_os = "linux")]
+const WRITES_PAST_THE_START: usize = 50;
+
+/// The journal rounds a volume's mounts have run, from `slates status ID` (`journal_rounds: N (overruns M)`).
+#[cfg(target_os = "linux")]
+fn journal_rounds(instance: &str, id: &str) -> u64 {
+  let (_, out, _) = run(instance, &["status", id]);
+  leading_number(&value_of(&out, "journal_rounds"))
+}
+
+/// Unlinks a scratch file through `fixture`'s mount: the unlink's barrier publishes the volume, the map's open with it
+/// (A-152, A-154), so a takeover restores that open.
+#[cfg(target_os = "linux")]
+fn publish_the_maps_open(fixture: &MappedThroughAMount) {
+  let scratch = format!("{}/scratch.txt", fixture.point.path);
+  assert!(
+    write_with_the_shell(&scratch, "x").status.success(),
+    "a scratch file through the mount"
+  );
+  let removed = Command::new("rm").arg(&scratch).output().unwrap();
+  assert!(
+    removed.status.success(),
+    "its unlink, whose barrier publishes the map's open"
+  );
+}
+
+/// Replaces `other.bin` through the fixture's SDK client under write `attachment` [`WRITES_PAST_THE_START`] times, each
+/// consumed by a round of the volume's mounts before the next, so no round overruns.
+#[cfg(target_os = "linux")]
+fn replace_another_file_past_the_start(fixture: &mut MappedThroughAMount, attachment: u64) {
+  for write in 0..WRITES_PAST_THE_START {
+    let rounds = journal_rounds(&fixture.instance, &fixture.id);
+    let fill = u8::try_from(write % 26).unwrap() + b'a';
+    let wrote = fixture.writer.fs_write(
+      (fixture.volume, attachment),
+      "other.bin",
+      &[fill; PIPELINED_FILE_BYTES],
+      FILE_MODE,
+    );
+    assert!(
+      wrote.is_ok(),
+      "replacement {write} of another file: {wrote:?}"
+    );
+    assert!(
+      wait_for(|| journal_rounds(&fixture.instance, &fixture.id) > rounds),
+      "the mount's round consumed replacement {write}"
+    );
+  }
+}
+
+/// Step 3 of "Journal budget derived" (a restored mount tracks its pre-takeover files from its start; A-147, A-152).
+/// Do, on a 256 KiB volume (a one-page journal):
+/// - map a file through a FUSE mount, and unlink a scratch file through it, whose barrier publishes the map's open;
+/// - `SIGKILL` the daemon and wait for the anchor's successor, which takes the mount over;
+/// - attach the SDK client again (its attachment died with the daemon, by design) and replace another file through it
+///   [`WRITES_PAST_THE_START`] times, each consumed by the mount's round before the next, so no round overruns but the
+///   journal no longer reaches back to the mount's start;
+/// - store through the map, and msync.
+///
+/// Expect the msync to succeed, no overrun, no write-back refused as unknown, and slates to hold the store. Before, the
+/// restored mount adopted the map's file only when the store named its handle, from the journal's records since its
+/// start, which were gone, so the file was lost and the msync answered `EIO`. Linux only, and to a kernel that can
+/// resend (6.9+).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_restored_mounts_counted_files_are_tracked_from_its_start_past_the_journals_reach() {
+  if !live_mount_runs() {
+    return;
+  }
+  if !kernel_resends_fuse_requests() {
+    eprintln!("SKIP: before Linux 6.9 a FUSE mount does not survive its daemon (A-61)");
+    return;
+  }
+  let mut fixture =
+    MappedThroughAMount::with_quota("restoredstart", b'A', 1, ONE_PAGE_JOURNAL_QUOTA);
+  assert!(
+    fixture.follows(b'A'),
+    "the map reads the file before the kill"
+  );
+  publish_the_maps_open(&fixture);
+  let killed = kill_the_daemon(&fixture.instance);
+  let restarted = await_daemon(&fixture.instance, Some(killed), &[]);
+  assert_ne!(restarted, killed, "a new daemon serves the mount");
+  let attachment = fixture
+    .writer
+    .attach(fixture.volume, None, slates_client::Intent::Write)
+    .unwrap()
+    .attachment;
+  replace_another_file_past_the_start(&mut fixture, attachment);
+  fixture.write_through_map(10, b"S");
+  assert_eq!(
+    counter_of(&fixture.instance, "fuse.journal_overruns"),
+    0,
+    "no round overran"
+  );
+  assert_eq!(
+    counter_of(&fixture.instance, "fuse.writebacks_unknown"),
+    0,
+    "no write-back was refused as unknown"
+  );
+  let mut expected = vec![b'A'; fixture.length];
+  expected[10] = b'S';
+  assert!(fixture.volume_bytes() == expected, "slates holds the store");
 }
 
 /// Inode numbers are never reused within a volume (AC-1.6, D-4), across a takeover too (A-61). A FUSE node id is the

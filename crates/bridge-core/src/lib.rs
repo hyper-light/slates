@@ -679,4 +679,10 @@ pub trait Bridge {
   fn admit_states(&mut self, _cx: &OpContext, _bytes: u64) -> bool {
     false
   }
+  /// The files this attachment held open before a takeover, as far as the last publication counted, whose opens are
+  /// not given back yet (A-152): what a mount taken over by this daemon tracks from its start. The default, none, is a
+  /// bridge with nothing restored.
+  fn restored_open_files(&mut self, _cx: &OpContext) -> Vec<u64> {
+    Vec::new()
+  }
 }

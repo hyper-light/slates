@@ -111,6 +111,14 @@ impl Coherence {
     }
   }
 
+  /// Starts the rounds at `cursor` when none has run yet: what a restored mount's adoption read its files from, so the
+  /// first round feeds them every change after it ([`Coherence::deliver`]). A cursor already set is kept.
+  pub fn begin_at(&mut self, cursor: InvalidationCursor) {
+    if self.cursor.is_none() {
+      self.cursor = Some(cursor);
+    }
+  }
+
   /// Gathers the seam refused so far.
   pub fn gather_refusals(&self) -> u64 {
     self.gather_refusals

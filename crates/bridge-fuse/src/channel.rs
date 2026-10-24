@@ -611,6 +611,9 @@ pub struct ServeState {
   /// daemon served it, which it never saw opened. A request naming one adopts its file into the byte states
   /// ([`adopt_unseen_handle`]; A-147).
   adopts_unseen_handles: bool,
+  /// Whether this restored mount has yet to track the files the volume restored opens of for it, which it does once, at
+  /// its first turn ([`adopt_restored`]).
+  adopt_restored: bool,
   /// Bytes of cache write-backs kept back because another path changed them after the kernel's copy was fetched, since
   /// this was last read: the rule's non-vacuity count. Read and cleared by the owner that reports it.
   writeback_bytes_kept_back: u64,
@@ -656,6 +659,7 @@ impl ServeState {
       states: PageStates::default(),
       started_at: None,
       adopts_unseen_handles: false,
+      adopt_restored: false,
       writeback_bytes_kept_back: 0,
       writebacks_unknown: 0,
       holds: KernelHolds::default(),
@@ -716,6 +720,7 @@ impl ServeState {
       session: Some(session),
       replay,
       adopts_unseen_handles: true,
+      adopt_restored: true,
       ..ServeState::new()
     }
   }
@@ -858,6 +863,7 @@ fn deliver_owed(
   cx: &slates_bridge_core::OpContext,
   state: &mut ServeState,
 ) -> Result<Delivered, ChannelError> {
+  adopt_restored(bridge, cx, state);
   if let Some(notifier) = state.notifier.as_mut()
     && notifier.busy()
   {
@@ -1019,6 +1025,7 @@ fn dispatch_request(
   cx: &slates_bridge_core::OpContext,
   state: &mut ServeState,
 ) -> (usize, Vec<std::ops::Range<u64>>) {
+  adopt_restored(bridge, cx, state);
   let before = bridge.seen(cx).journal_seq;
   let started_at = *state.started_at.get_or_insert(before);
   // Before the write is judged or applied: a handle from before a takeover brings its file into the states (A-147).
@@ -1094,8 +1101,15 @@ fn note_opens_and_fetches(
         .get(..size_of::<u64>())
         .and_then(|bytes| bytes.try_into().ok())
         .map(u64::from_le_bytes);
-      if let Some(file) = handle.and_then(|fh| state.writable.released(fh, ino)) {
-        state.states.dropped(file);
+      match handle.map(|fh| state.writable.released(fh, ino)) {
+        Some(Some(file)) => state.states.dropped(file),
+        // A handle this mount never saw opened: one from before a takeover, whose release the bridge has just
+        // answered by giving back a restored open (A-152).
+        Some(None) if state.adopts_unseen_handles => {
+          let restored = bridge.restored_open_files(cx);
+          drop_released_restored(state, ino, &restored);
+        }
+        Some(None) | None => {}
       }
     }
     _ => {}
@@ -1149,6 +1163,41 @@ fn written_handle(request: &[u8]) -> Option<(u64, u64)> {
   }
   let write = crate::request::WriteIn::parse(Opcode::Write.to_wire(), parsed.body).ok()?;
   Some((write.fh, parsed.header.nodeid))
+}
+
+/// On a mount taken over from a daemon that died (A-61), at its first turn: tracks every file the volume restored opens
+/// of for this mount's owner (A-152) as fresh as of the mount's start, and starts the rounds there, so they feed each
+/// file every change after it and no write-back of it reads the journal back to the start. A request naming one of its
+/// handles then finds it tracked ([`adopt_unseen_handle`]). Until 2026-10-23 every such file was adopted only when a
+/// request named it, from the journal's records since the start, and lost once the journal no longer reached back. A
+/// handle opened after the last publication is in no count, so its file is still adopted when a request names it.
+fn adopt_restored(
+  bridge: &mut dyn Bridge,
+  cx: &slates_bridge_core::OpContext,
+  state: &mut ServeState,
+) {
+  if !state.adopt_restored {
+    return;
+  }
+  state.adopt_restored = false;
+  let seen = bridge.seen(cx);
+  state.coherence.begin_at(seen);
+  let start = *state.started_at.get_or_insert(seen.journal_seq);
+  let files = bridge.restored_open_files(cx);
+  make_room(bridge, cx, state, files.len());
+  for ino in files {
+    state.states.adopted(ino, start, Some(&[]));
+  }
+}
+
+/// The release of a handle of `ino` this restored mount never saw opened has been answered: the file's byte states go
+/// once nothing of it is open here any more — no handle this mount noted and no open left in `restored`, the files the
+/// volume still holds restored opens of for it. Kept otherwise, a file's states would outlive its handles, and a later
+/// open would inherit them (a lost file's refusals among them) though that open dropped the kernel's cached pages.
+fn drop_released_restored(state: &mut ServeState, ino: u64, restored: &[u64]) {
+  if state.states.tracks(ino) && !state.writable.holds(ino) && !restored.contains(&ino) {
+    state.states.dropped(ino);
+  }
 }
 
 /// On a mount taken over from a daemon that died (A-61), a request naming handle `fh` of `ino` that this mount never saw
@@ -1853,6 +1902,29 @@ mod tests {
       kernel_resends: true,
     };
     ServeState::restored(session, Some((41, RECORDED.to_vec())))
+  }
+
+  /// Step 3 of "Journal budget derived" (a restored mount tracks its pre-takeover files from its start): the release of a
+  /// handle the mount never saw opened drops its file's byte states once nothing of the file is open here. Do: track
+  /// files 7 and 8 from the mount's start; answer a release of 7 while the volume still holds a restored open of it,
+  /// then one with none left; then a release of 8 while a handle the mount noted still holds it. Expect 7 kept, then
+  /// dropped, and 8 kept.
+  #[test]
+  fn a_released_pre_takeover_files_states_go_once_nothing_of_it_is_open() {
+    let mut state = restored();
+    state.states.grow_room(2);
+    state.states.adopted(7, 1, Some(&[]));
+    state.states.adopted(8, 1, Some(&[]));
+    drop_released_restored(&mut state, 7, &[7]);
+    assert!(state.states.tracks(7), "a restored open of it is left");
+    drop_released_restored(&mut state, 7, &[]);
+    assert!(!state.states.tracks(7), "none left: its states go");
+    state.writable.opened(3, 8);
+    drop_released_restored(&mut state, 8, &[]);
+    assert!(
+      state.states.tracks(8),
+      "a handle the mount noted still holds it"
+    );
   }
 
   /// A-61 (the exact replay). Do: offer a restored state the resent request its dead daemon answered, then the same

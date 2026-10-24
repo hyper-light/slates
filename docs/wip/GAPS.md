@@ -10762,8 +10762,9 @@ stale page back, and the other write's bytes on it reverted: measured 4,095 of 4
   272 times that, and a volume under 3.76 MiB holds less than it (BENCHMARKS, "The journal's fixed share against what
   its rounds measured", 2026-10-23). Since A-155 (2026-10-23) the byte states no longer borrow the journal's capacity as
   each file's bound: they are charged to the shard's metadata ledger while the mount lives, so a smaller journal cannot
-  shrink them. Next: a restored mount tracks its pre-takeover files from its start (step 3), then retention keeps what a
-  live reader needs, growing from the ledger (step 4).
+  shrink them. Since A-156 (2026-10-23) a restored mount tracks every file the last publication counted open for it from
+  its start, so no adoption of those reads the journal back (a handle opened after that publication still adopts lazily,
+  as A-147 did). Next: retention keeps what a live reader needs, growing from the ledger (step 4).
 - **A restored mount's files — fixed 2026-10-22 (A-147).** A mount taken over across a daemon restart (A-61) has files
   whose writable opens predate the daemon. They had no byte states, so their write-backs were judged from the mount's
   start against every record since. Worse than the `EIO` this entry recorded: a store made after a re-fetch of bytes
