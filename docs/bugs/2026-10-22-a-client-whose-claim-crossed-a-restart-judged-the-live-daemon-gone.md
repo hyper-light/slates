@@ -137,9 +137,9 @@ Docs: `SLATES_DESIGN.md` §4.7 status, the A-114 note and A-143; GAPS §8a-sdk-s
 
 ## Siblings
 
-- **Flagged for removal, Ada's call.** The header's daemon pid (`AT_DAEMON_PID`) is now written by every daemon and
-  read by no client of this version; only clients built before A-143 read it. Under CLAUDE.md's rule 7 a write kept
-  for older versions is a compatibility shim. `docs/publish.md` ships one version, so removing it breaks only a
-  combination that is not shipped. It is left in place until Ada decides.
+- **Removed 2026-10-23 (A-159).** The header's daemon pid (`AT_DAEMON_PID`) was written by every daemon and read by
+  no client of this version; only clients built before A-143 read it. Under CLAUDE.md's rule 7 a write kept for older
+  versions is a compatibility shim. `docs/publish.md` ships one version, so removing it breaks only a combination that
+  is not shipped.
 - **The header stamp stays.** `begin` and `daemon_gone` read it as the instance's current daemon, which is what they
   mean.

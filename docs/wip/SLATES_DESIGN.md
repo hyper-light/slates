@@ -12021,6 +12021,23 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
 
+### A-159 — The bootstrap header no longer carries the daemon's process id (accepted 2026-10-23)
+Applied in the same change to:
+- `crates/ipc/src/rendezvous.rs` (macOS and Windows): `AT_DAEMON_PID` and its write in `Listener::open` removed; the
+  header's layout names those four bytes padding;
+- GAPS §8a-sdk-stamp and `docs/bugs/2026-10-22-a-client-whose-claim-crossed-a-restart-judged-the-live-daemon-gone.md`.
+
+- **What it answers.** Since A-143 a client judges the daemon that answered its claim by the stamp and process id in
+  the answer, never by the header. The header's copy of the pid was still written by every daemon and read only by
+  clients built before A-143: a write kept for older versions, which CLAUDE.md's rule 7 bans. `docs/publish.md` ships
+  one version, so no shipped pairing reads it.
+- **What stays.** The header's start stamp (a client's `begin` and `daemon_gone` read it as the instance's current
+  daemon) and the holding anchor's pid (A-114) are unchanged and keep their offsets; the removed field's bytes are
+  padding, so no other field moved.
+- **Evidence.** By use on macOS: `slates-ipc` 46 tests and `slates-client` 22 tests pass without the write, the A-143
+  restart test and the client's reconnect and reap histories among them. The arm64 Windows cross-lint of `slates-ipc`
+  is clean.
+
 ### A-158 — A restored mount tells its kernel what its predecessor may not have (accepted 2026-10-23)
 Applied in the same change to:
 - §4.6 (a mount taken over by a restarted daemon; the held device's status);

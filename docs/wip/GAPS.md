@@ -1152,9 +1152,11 @@ The fix: the answering daemon writes its own start stamp and process id into its
 Fixed with it: the mirror race on the process, where an answering daemon that died before its answer was read left
 the client watching its successor.
 
-**Flagged for removal, Ada's call (CLAUDE.md rule 7).** The header's daemon pid (`AT_DAEMON_PID`) is now written by
-every daemon and read only by clients built before A-143. That makes it a compatibility write. `docs/publish.md`
-ships one version, so removing it breaks only a pairing that is not shipped.
+**Removed 2026-10-23 (A-159; CLAUDE.md rule 7).** The header's daemon pid (`AT_DAEMON_PID`) was written by every
+daemon and read only by clients built before A-143: a compatibility write. `docs/publish.md` ships one version, so its
+removal breaks only a pairing that is not shipped. Its four bytes are padding now; no other header field moved. By use
+on macOS, `slates-ipc` (46 tests, the A-143 restart test among them) and `slates-client` (22 tests, the reconnect and
+reap histories among them) pass without it, and the arm64 Windows cross-lint of `slates-ipc` is clean.
 
 ### 8a-tsan-wait. The TSan lane declared itself 25× slow and one budget never listened (2026-10-20, closed)
 

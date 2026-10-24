@@ -1423,8 +1423,9 @@ pub mod platform {
   /// Format: the bootstrap object's magic, `SLBT` in little-endian ASCII.
   const MAGIC: u32 = 0x5442_4C53;
   /// Format: the bootstrap header: magic (4), slots (4), the daemon-wide doorbell word (4),
-  /// padding (4), the daemon's start stamp (8), the daemon's process id (4), the holding anchor's process id (4),
-  /// padding to a cache line.
+  /// padding (4), the daemon's start stamp (8), padding (4), the holding anchor's process id (4),
+  /// padding to a cache line. The padding after the stamp held the daemon's process id until A-159: a client judges the
+  /// daemon that answered its claim by the pid in the answer (A-143), so the header's copy had no reader left.
   const HEADER_BYTES: usize = 64;
   /// Format: the slot count's offset in the header (after the magic).
   const AT_SLOT_COUNT: usize = 4;
@@ -1434,9 +1435,6 @@ pub mod platform {
   /// daemon opened the object, so a client that remembers it tells a restarted daemon (a new
   /// stamp) from a slow one (the same stamp).
   const AT_GENERATION: usize = 16;
-  /// Format: the daemon's process id's offset in the header, written before the start stamp publishes
-  /// the header: the process a client's exit watch is taken on (`crate::exit_watch`, AUD-29-20).
-  const AT_DAEMON_PID: usize = 24;
   /// Format: the holding anchor's process id's offset in the header (A-114): written when the anchor creates the
   /// object, zero in an object a daemon made for itself. A claim made while this process lives may wait out a restart.
   const AT_ANCHOR_PID: usize = 28;
@@ -1847,12 +1845,11 @@ pub mod platform {
 
   impl Listener {
     pub(super) fn open(instance: &str) -> Result<Listener, IpcError> {
-      let mut object = if std::env::var_os(super::ENV_RENDEZVOUS).is_some() {
+      let object = if std::env::var_os(super::ENV_RENDEZVOUS).is_some() {
         adopt(instance)?
       } else {
         fresh(instance)?
       };
-      object.write(AT_DAEMON_PID, &current_pid().to_le_bytes())?;
       // The start stamp last, with release: it publishes the header and the free table (never zero).
       let stamp = stamp_now().max(1);
       object
