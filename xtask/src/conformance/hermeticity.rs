@@ -18,7 +18,7 @@ use slates_conformance::Suite;
 use slates_conformance::capability::HostOs;
 use slates_conformance::record::{Outcome, Transport};
 use slates_conformance::trace::{
-  Landing, Policy, eslogger_has_activity, judge, judge_hidden, parse_eslogger,
+  Landing, Policy, SocketNode, eslogger_has_activity, judge, judge_hidden, parse_eslogger,
   parse_strace_with_cwd, strace_unnamed_paths,
 };
 use slates_conformance::workload::Manifest;
@@ -45,6 +45,34 @@ const HIDDEN_PREFIX: &str = ".slates-";
 const LANDED_ENTRIES: &[&str] = &["d", "d/f2", "f3", "link"];
 /// Format: the workload driven through the mount: create, write, mkdir, symlink, rename, chmod, remove.
 const MOUNT_WORKLOAD: &str = "printf 'one\\n' > f1 && mkdir d && printf 'two\\n' > d/f2 && ln -s f3 link && mv f1 f3 && chmod u=rw,go=r f3 && printf 'gone\\n' > tmp && rm tmp";
+
+/// The daemon's own socket node for `instance` as the tracer prints it, on macOS: the Shards stream's socket route (A-161),
+/// named by the route's own path function, in the user's temporary directory, which eslogger names by its canonical
+/// path (`/private/var/…`, not `/var/…`). The node is gone once the daemon stops, so its directory is what is resolved.
+#[cfg(target_os = "macos")]
+fn socket_node_path(instance: &str) -> Result<Option<String>, Failure> {
+  let path = slates_ipc::route::path(instance)
+    .map_err(|e| Failure(format!("the route's socket path for {instance}: {e}")))?;
+  let (Some(directory), Some(name)) = (path.parent(), path.file_name()) else {
+    return Err(Failure(format!(
+      "the route's socket path {} names no directory and file",
+      path.display()
+    )));
+  };
+  Ok(Some(
+    std::fs::canonicalize(directory)?
+      .join(name)
+      .display()
+      .to_string(),
+  ))
+}
+
+/// No daemon socket node elsewhere: Linux hands a Shards stream's end over the client's control socket, which has no
+/// node, and Windows has no route yet.
+#[cfg(not(target_os = "macos"))]
+fn socket_node_path(_instance: &str) -> Result<Option<String>, Failure> {
+  Ok(None)
+}
 
 /// The tracer's command prefix for the anchor on Linux.
 pub(super) fn strace_prefix(log: &Path) -> Vec<String> {
@@ -778,6 +806,7 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let written = landed.written;
   let verified = verify_landing(&target, &work)
     .and_then(|()| verify_manifest(&mounted_tree, &manifest_of(&target)?));
+  let socket_node = socket_node_path(&session.instance)?;
   let Session { mount, anchor, .. } = session;
   let anchor_log = anchor.log_path().display().to_string();
   drop(mount);
@@ -834,6 +863,11 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
       until_ns: landed.until_ns,
     }),
     mounts: &mounts,
+    // The daemon that lands is the daemon that bound its socket node at start: one process, one lifecycle.
+    socket_node: socket_node.as_deref().map(|path| SocketNode {
+      path,
+      owners: &writers,
+    }),
   };
   let judged = judge(&events, &policy);
   // The anchor's log is the harness's own file: the slates processes write their stderr to a pipe the

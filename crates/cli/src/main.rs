@@ -70,6 +70,7 @@ fn main() -> ExitCode {
     Command::Client(request) => request.json,
     Command::Profile(options) => options.json,
     Command::Run(request) => request.json,
+    Command::Shards(request) => request.json,
     _ => false,
   };
   let outcome = match command {
@@ -80,6 +81,7 @@ fn main() -> ExitCode {
     Command::Client(request) => verbs::run(&request),
     Command::Exec(request) => run_exec(&request),
     Command::Run(request) => verbs::run_consumer(&request),
+    Command::Shards(request) => verbs::run_shards(&request),
     Command::OciCheck(check) => verbs::oci_check(&check),
     Command::OciRuntime(runtime) => run_oci_runtime(&runtime),
   };
@@ -185,7 +187,7 @@ pub(crate) enum Failure {
   },
   /// The command itself failed (the anchor or the daemon).
   Failed(String),
-  /// The workload `slates run` spawned ended with this code, which `run` exits with as it was.
+  /// The workload `slates run` or `slates shards` spawned ended with this code, which the command exits with as it was.
   ChildExited {
     /// The workload's exit code.
     code: i32,

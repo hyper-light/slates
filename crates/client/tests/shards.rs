@@ -5,7 +5,8 @@
 //! (a little-endian length, then the request; one reply frame back) and checks every change through slates' own reads
 //! and writes. The daemon has two shards and the test attaches a volume on each, so one attach is served on the
 //! client's own shard and the other on another shard, whose end comes home with the forwarded reply (Linux) or is
-//! taken from the owner shard by the route's exchange (macOS).
+//! taken from the owner shard by the route's exchange (macOS). On Windows, which has no route yet, the attach is
+//! refused by kind, the reason the daemon's own transport report gives.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(
   clippy::unwrap_used,
@@ -15,7 +16,6 @@
   clippy::unwrap_in_result,
   clippy::panic_in_result_fn
 )]
-#![cfg(unix)]
 
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -415,5 +415,53 @@ mod delivered {
     assert!(guest.ended(), "a detach ends the stream");
     drop(client);
     drop(daemon);
+  }
+}
+
+/// Windows: no route hands a client a handle yet, so the daemon refuses the form by kind.
+#[cfg(windows)]
+mod refused {
+  use slates_client::{AttachTransport, Refusal, UnsupportedReason};
+
+  use super::*;
+
+  /// A-161 (Shards part 1 step 4: "Windows compiles and refuses the form by kind"). Do: attach a volume in the Shards
+  /// form, for writing and for reading, whole and as a directory, and read the daemon's transport report. Expect every
+  /// attach refused `AttachmentUnsupported` for the Shards transport with `DescriptorRouteNotBuilt`, the reason the
+  /// report gives for the transport, and no attachment made.
+  #[test]
+  fn the_shards_form_is_refused_by_kind_where_no_route_hands_a_handle() {
+    let (_daemon, mut client) = start("refused");
+    let id = volume(&mut client, "refused");
+    let report = client.daemon_status().unwrap();
+    let shards_fs = report
+      .transports
+      .capabilities
+      .iter()
+      .find(|capability| capability.transport == AttachTransport::ShardsFs)
+      .expect("the report names the Shards transport");
+    assert!(!shards_fs.supported);
+    assert_eq!(
+      shards_fs.unsupported_reason,
+      Some(UnsupportedReason::DescriptorRouteNotBuilt)
+    );
+    for (intent, subtree) in [
+      (Intent::Write, None),
+      (Intent::Read, None),
+      (Intent::Write, Some("dir")),
+    ] {
+      match client.attach_shards(id, intent, subtree) {
+        Err(ClientError::Refused(Refusal::AttachmentUnsupported { transport, reason })) => {
+          assert_eq!(transport, AttachTransport::ShardsFs);
+          assert_eq!(reason, UnsupportedReason::DescriptorRouteNotBuilt);
+        }
+        other => panic!("{intent:?} {subtree:?}: {other:?}"),
+      }
+    }
+    assert_eq!(
+      client.status(id).unwrap().attachments,
+      0,
+      "a refused attach makes no attachment"
+    );
   }
 }

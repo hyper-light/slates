@@ -2341,6 +2341,7 @@ dependencies = [
  "serde_json",
  "slates-client",
  "slates-conformance",
+ "slates-ipc",
  "slates-machine",
  "slates-server",
  "slates-vfs",

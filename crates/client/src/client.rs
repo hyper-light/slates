@@ -129,14 +129,25 @@ pub struct Session {
 
 /// What `attach_shards` returns (§4.6, the Shards route; A-161): the attachment, and the stream end to hand a Shards
 /// VMM, which reaches that attachment and nothing else.
-#[cfg(unix)]
 #[derive(Debug)]
 pub struct ShardsStream {
   /// The attachment the daemon serves on the stream's other end.
   pub attachment: Attachment,
-  /// The stream's end, close-on-exec: move it to the descriptor number the VMM expects before spawning it.
-  pub stream: std::os::fd::OwnedFd,
+  /// The stream's end, close-on-exec: move it to the descriptor number the VMM expects before spawning it
+  /// (`slates_ipc::stream::spawn_with` does both).
+  pub stream: StreamEnd,
 }
+
+/// A Shards stream's end as this platform hands it to a client: a Unix descriptor.
+#[cfg(unix)]
+pub type StreamEnd = std::os::fd::OwnedFd;
+
+/// A Shards stream's end on Windows: there is none. No route hands a client a handle yet (A-161 owes it), and the daemon
+/// refuses the Shards form there by kind (`UnsupportedReason::DescriptorRouteNotBuilt`), so this type has no values and
+/// `attach_shards` can only answer that refusal.
+#[cfg(not(unix))]
+#[derive(Debug)]
+pub enum StreamEnd {}
 
 /// What `create` takes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -950,8 +961,9 @@ impl Client {
   /// other end, to pass to the VMM. With `subtree`, only that directory; with `Intent::Read`, every change refused.
   /// The attachment ends when the stream's other end closes (or a `detach`, a revocation, the volume's destroy). Linux
   /// receives the end over the control socket, sent before the reply; macOS claims it on the daemon's socket route
-  /// with the secret the reply carries (`slates_ipc::route`), each socket step bounded by the reply deadline.
-  #[cfg(unix)]
+  /// with the secret the reply carries (`slates_ipc::route`), each socket step bounded by the reply deadline. Windows
+  /// has no route yet: its daemon refuses the form, `Refusal::AttachmentUnsupported` with
+  /// `UnsupportedReason::DescriptorRouteNotBuilt`.
   pub fn attach_shards(
     &mut self,
     volume: VolumeId,
@@ -975,28 +987,18 @@ impl Client {
         established,
         capability,
         token,
-      } => {
-        let delivered = self.recv_delivery(|delivery| {
-          matches!(delivery, ControlDelivery::Stream(stream) if stream.attachment == attachment)
-        })?;
-        let ControlDelivery::Stream(delivered) = delivered else {
-          return Err(ClientError::UnexpectedReply {
-            verb: "attach_shards",
-          });
-        };
-        Ok(ShardsStream {
-          attachment: Attachment {
-            attachment,
-            lease_epoch,
-            path,
-            version,
-            established,
-            capability,
-            token,
-          },
-          stream: delivered.stream,
-        })
-      }
+      } => Ok(ShardsStream {
+        stream: self.delivered_stream(attachment)?,
+        attachment: Attachment {
+          attachment,
+          lease_epoch,
+          path,
+          version,
+          established,
+          capability,
+          token,
+        },
+      }),
       ReplyBody::ShardsOffered {
         attachment,
         lease_epoch,
@@ -1020,14 +1022,34 @@ impl Client {
     }
   }
 
+  /// Takes the stream end the daemon sent over the control socket for `attachment` just before its `Attached` reply
+  /// (Linux, A-161).
+  #[cfg(unix)]
+  fn delivered_stream(&self, attachment: u64) -> Result<StreamEnd, ClientError> {
+    let delivered = self.recv_delivery(|delivery| {
+      matches!(delivery, ControlDelivery::Stream(stream) if stream.attachment == attachment)
+    })?;
+    match delivered {
+      ControlDelivery::Stream(delivered) => Ok(delivered.stream),
+      ControlDelivery::Mapping(_) => Err(ClientError::UnexpectedReply {
+        verb: "attach_shards",
+      }),
+    }
+  }
+
+  /// No control socket carries a handle here: a Windows daemon refuses the Shards form, so `Attached` is not one of its
+  /// answers to it.
+  #[cfg(not(unix))]
+  fn delivered_stream(&self, _attachment: u64) -> Result<StreamEnd, ClientError> {
+    Err(ClientError::UnexpectedReply {
+      verb: "attach_shards",
+    })
+  }
+
   /// Claims the stream end offered for `attachment` on the daemon's socket route with the offer's `secret` (macOS,
   /// A-161), each socket step bounded by the client's reply deadline.
   #[cfg(target_os = "macos")]
-  fn claim_offer(
-    &self,
-    attachment: u64,
-    secret: &[u8; 32],
-  ) -> Result<std::os::fd::OwnedFd, ClientError> {
+  fn claim_offer(&self, attachment: u64, secret: &[u8; 32]) -> Result<StreamEnd, ClientError> {
     slates_ipc::route::claim(
       &self.instance,
       attachment,
@@ -1037,14 +1059,10 @@ impl Client {
     .map_err(ClientError::Ipc)
   }
 
-  /// No socket route here: a daemon on this platform answers the Shards form with the end on the control socket, so an
-  /// offer is not one of its replies.
-  #[cfg(all(unix, not(target_os = "macos")))]
-  fn claim_offer(
-    &self,
-    _attachment: u64,
-    _secret: &[u8; 32],
-  ) -> Result<std::os::fd::OwnedFd, ClientError> {
+  /// No socket route here: a Linux daemon answers the Shards form with the end on the control socket and a Windows
+  /// daemon refuses it, so an offer is not one of their replies.
+  #[cfg(not(target_os = "macos"))]
+  fn claim_offer(&self, _attachment: u64, _secret: &[u8; 32]) -> Result<StreamEnd, ClientError> {
     Err(ClientError::UnexpectedReply {
       verb: "attach_shards",
     })

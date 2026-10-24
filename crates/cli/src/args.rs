@@ -59,13 +59,15 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   share ID PRINCIPAL [--read] [--write] [--admin] [--json]   set a principal's rights on a volume
   run [--keep] [--json] -- CMD [ARG ...]           run CMD as a consumer enrolled for its lifetime
   exec --volume V --at PATH -- CMD [ARG ...]        run CMD with the volume at PATH
+  shards ID [--subtree DIR] [--read-only] --fd N [--json] -- CMD [ARG ...]
+            run CMD with a Shards fs stream of the volume at descriptor N (Linux, macOS)
 ";
 
 /// Format: the usage notes: the size grammar's examples, the instance's discovery, the exit codes.
 pub(crate) const USAGE_NOTES: &str =
   "SIZE is bytes with a binary unit: 512MiB, 4GiB (B, KiB, MiB, GiB, TiB).
 The instance is --instance, else SLATES_ENDPOINT, else `default`.
-Exit codes: 0 done, 1 refused, 2 usage, 3 no daemon, 4 failed; `run` exits as its command did.
+Exit codes: 0 done, 1 refused, 2 usage, 3 no daemon, 4 failed; `run` and `shards` exit as their command did.
 PRINCIPAL is uid:N, consumer:N (under your account) or consumer:ACCOUNT/N.
 --json emits machine-readable JSON on every client verb (the MCP schema), except `base read` which
 streams raw bytes. Ids come back as `{\"id\"}`, an outcome-only verb as `{\"ok\":true}`.";
@@ -535,6 +537,26 @@ pub(crate) struct RunRequest {
   pub command: Vec<String>,
 }
 
+/// A `slates shards` request (§4.6, the Shards route; A-161): attach a volume in the Shards form and run a command with
+/// the stream end at a descriptor number it names, the way a Shards spawner hands its VMM `--slates-fs-fd`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ShardsRequest {
+  /// The instance.
+  pub instance: String,
+  /// The volume.
+  pub volume: slates_client::VolumeId,
+  /// Only this directory of it, when given.
+  pub subtree: Option<String>,
+  /// Every change refused (`--read-only`); otherwise for writing, as `mount` attaches.
+  pub read_only: bool,
+  /// The descriptor number the command finds its end at.
+  pub fd: i32,
+  /// Announce the attachment as JSON.
+  pub json: bool,
+  /// The command and its arguments.
+  pub command: Vec<String>,
+}
+
 /// The parsed command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Command {
@@ -542,6 +564,8 @@ pub(crate) enum Command {
   Exec(ExecRequest),
   /// The harness verb.
   Run(RunRequest),
+  /// A command run with a Shards stream end.
+  Shards(ShardsRequest),
   /// The anchor.
   Anchor(ProcessOptions),
   /// The daemon.
@@ -600,6 +624,7 @@ const VALUES: &[&str] = &[
   "--attachment",
   "--account",
   "--uid",
+  "--fd",
 ];
 /// Every switch, across the verbs.
 const SWITCHES: &[&str] = &[
@@ -671,6 +696,53 @@ fn parse_exec(taken: &Taken, arguments: &[String]) -> Result<Command, ParseError
   Ok(Command::Exec(ExecRequest {
     volume,
     at,
+    command,
+  }))
+}
+
+/// Format: the lowest descriptor number `shards --fd` takes: standard input, output and error are 0, 1 and 2, which a
+/// program reads and writes as itself (`slates_ipc::stream::spawn_with` refuses below its `FIRST_HANDED_NUMBER`, the same
+/// number, too).
+const FIRST_HANDED_FD: i32 = 3;
+
+/// Parses `shards ID [--subtree DIR] [--read-only] --fd N [--json] -- CMD ...`: one volume and the flags before `--`, the
+/// command after it.
+fn parse_shards(taken: &Taken, arguments: &[String]) -> Result<Command, ParseError> {
+  let command = command_after(arguments)?;
+  taken.only(&Spec {
+    values: &["--subtree", "--fd"],
+    switches: &["--read-only"],
+  })?;
+  let id = match taken.words.as_slice() {
+    [_, id] => id,
+    [_, _, extra, ..] => return Err(ParseError::Extra(extra.clone())),
+    _ => return Err(ParseError::Missing("volume ID")),
+  };
+  let fd = taken
+    .value("--fd")
+    .ok_or(ParseError::Missing(
+      "--fd N (the descriptor number the command finds its stream end at)",
+    ))?
+    .parse::<i32>()
+    .map_err(|e| ParseError::BadValue {
+      what: "--fd",
+      reason: e.to_string(),
+    })?;
+  if fd < FIRST_HANDED_FD {
+    return Err(ParseError::BadValue {
+      what: "--fd",
+      reason: format!(
+        "{fd} is standard input, output or error, or no descriptor; {FIRST_HANDED_FD} is the lowest a command is handed its end at"
+      ),
+    });
+  }
+  Ok(Command::Shards(ShardsRequest {
+    instance: taken.instance(),
+    volume: volume(id)?,
+    subtree: taken.value("--subtree").map(str::to_owned),
+    read_only: taken.switch("--read-only"),
+    fd,
+    json: taken.json(),
     command,
   }))
 }
@@ -1121,6 +1193,7 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
   match words.first().copied() {
     Some("run") => return parse_run(&taken, arguments),
     Some("exec") => return parse_exec(&taken, arguments),
+    Some("shards") => return parse_shards(&taken, arguments),
     _ if boundary.is_some() => return Err(ParseError::UnknownFlag("--".to_owned())),
     _ => {}
   }
@@ -2322,5 +2395,80 @@ mod tests {
       parse(&args("exec --at /p -- cmd")),
       Err(ParseError::Missing("--volume"))
     ));
+  }
+
+  /// A-161 (Shards part 1 step 4). Do: parse `shards` with every flag and with the fewest. Expect the instance, the
+  /// volume, the subtree, the intent, the number, the JSON switch and the command after `--` untouched.
+  #[test]
+  fn shards_takes_one_volume_a_number_and_the_untouched_command() {
+    let id = "0123456789abcdef0123456789abcdef";
+    let Command::Shards(request) = parse(&args(&format!(
+      "--instance outer shards {id} --subtree work --read-only --fd 5 --json -- shards run --slates-fs-fd 5 --help"
+    )))
+    .unwrap() else {
+      panic!("shards");
+    };
+    assert_eq!(
+      (request.instance.as_str(), request.volume, request.fd),
+      ("outer", volume(id).unwrap(), 5)
+    );
+    assert_eq!(
+      (request.subtree.as_deref(), request.read_only, request.json),
+      (Some("work"), true, true)
+    );
+    assert_eq!(request.command, args("shards run --slates-fs-fd 5 --help"));
+    let Command::Shards(fewest) = parse(&args(&format!("shards {id} --fd 3 -- reader"))).unwrap()
+    else {
+      panic!("shards");
+    };
+    assert_eq!(
+      (fewest.subtree, fewest.read_only, fewest.json),
+      (None, false, false)
+    );
+  }
+
+  /// A-161. Do: parse `shards` with each thing wrong in turn. Expect each refused as usage, for its own reason: a number
+  /// below 3, negative or not a number; no number; no volume, or a malformed one; a second word; a foreign flag; no
+  /// command.
+  #[test]
+  fn shards_refuses_a_bad_number_volume_word_flag_or_command_as_usage() {
+    let id = "0123456789abcdef0123456789abcdef";
+    let refusal = |line: &str| match parse(&args(line)) {
+      Err(ParseError::BadValue { what, .. }) => format!("bad {what}"),
+      Err(e) => e.to_string(),
+      Ok(command) => format!("parsed {command:?}"),
+    };
+    for (line, expected) in [
+      (format!("shards {id} --fd 2 -- reader"), "bad --fd"),
+      (format!("shards {id} --fd -1 -- reader"), "bad --fd"),
+      (format!("shards {id} --fd five -- reader"), "bad --fd"),
+      (
+        format!("shards {id} -- reader"),
+        "missing --fd N (the descriptor number the command finds its stream end at)",
+      ),
+      ("shards --fd 5 -- reader".to_owned(), "missing volume ID"),
+      (
+        "shards not-an-id --fd 5 -- reader".to_owned(),
+        "bad volume ID",
+      ),
+      (
+        format!("shards {id} stray --fd 5 -- reader"),
+        "unexpected argument `stray`",
+      ),
+      (
+        format!("shards {id} --fd 5 --keep -- reader"),
+        "unknown flag `--keep`",
+      ),
+      (
+        format!("shards {id} --fd 5"),
+        "missing `--` then the command",
+      ),
+      (
+        format!("shards {id} --fd 5 --"),
+        "missing a command after `--`",
+      ),
+    ] {
+      assert_eq!(refusal(&line), expected, "{line}");
+    }
   }
 }

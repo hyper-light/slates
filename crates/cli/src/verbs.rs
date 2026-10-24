@@ -15,7 +15,7 @@ use slates_server::daemon::LIVENESS_BUDGET_NS;
 use slates_server::landing::{enroll_proof, revoke_proof};
 
 use crate::Failure;
-use crate::args::{ClientRequest, ProfileOptions, RunRequest, SharePrincipal, Verb};
+use crate::args::{ClientRequest, ProfileOptions, RunRequest, ShardsRequest, SharePrincipal, Verb};
 use crate::format::volume_id_text;
 
 fn failure_of(e: ClientError, instance: &str) -> Failure {
@@ -1561,6 +1561,83 @@ pub(crate) fn run_consumer(request: &RunRequest) -> Result<(), Failure> {
       ran.consumer
     ))),
   }
+}
+
+/// `shards ID [--subtree DIR] [--read-only] --fd N -- CMD [ARG ...]` (§4.6, the Shards route; A-161): attaches the
+/// volume in the Shards form, announces the attachment, and runs the command with the stream end at descriptor N, so a
+/// Shards spawner, or a test, is handed a working end without linking slates. The client is closed before the command
+/// starts and this process keeps no copy of the end, so the attachment lives exactly as long as the command's end: it
+/// ends when the command (and anything it handed the end to) closes it, whether or not this process still waits. The
+/// command's standard streams are this one's, and so is its exit code. Where the daemon has no route to hand a client
+/// the end (Windows), the attach is refused by kind and nothing runs.
+pub(crate) fn run_shards(request: &ShardsRequest) -> Result<(), Failure> {
+  let (program, args) = request
+    .command
+    .split_first()
+    .ok_or_else(|| Failure::Failed("shards needs a command".to_owned()))?;
+  let intent = if request.read_only {
+    Intent::Read
+  } else {
+    Intent::Write
+  };
+  let shards = connect(&request.instance)?
+    .attach_shards(request.volume, intent, request.subtree.as_deref())
+    .map_err(|e| failure_of(e, &request.instance))?;
+  announce_attachment(shards.attachment.attachment, request.json);
+  let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+  let mut child = spawn_handed(OsStr::new(program), &args, shards.stream, request.fd)?;
+  let status = child
+    .wait()
+    .map_err(|e| Failure::Failed(format!("shards: waiting for {program}: {e}")))?;
+  match status.code() {
+    Some(0) => Ok(()),
+    Some(code) => Err(Failure::ChildExited { code }),
+    None => Err(Failure::Failed(format!(
+      "shards: {program} (attachment {}) was ended by a signal",
+      shards.attachment.attachment
+    ))),
+  }
+}
+
+/// Prints the attachment a `shards` command runs under, before the command starts, so a human can find it in `status`
+/// or `detach` it: a JSON object or an `attachment:` line, flushed ahead of the command's own output on the same stream.
+fn announce_attachment(attachment: u64, json: bool) {
+  use std::io::Write;
+  if json {
+    println!("{}", serde_json::json!({ "attachment": attachment }));
+  } else {
+    println!("attachment: {attachment}");
+  }
+  let _ = std::io::stdout().flush();
+}
+
+/// Runs `program` with the stream end at descriptor number `at` (`slates_ipc::stream::spawn_with`). A spawn that fails
+/// drops the end, so the stream ends its attachment.
+#[cfg(unix)]
+fn spawn_handed(
+  program: &OsStr,
+  args: &[OsString],
+  stream: slates_client::StreamEnd,
+  at: i32,
+) -> Result<std::process::Child, Failure> {
+  slates_ipc::stream::spawn_with(program, args, stream, at).map_err(|e| {
+    Failure::Failed(format!(
+      "shards: running {} with its end at descriptor {at}: {e}",
+      program.to_string_lossy()
+    ))
+  })
+}
+
+/// No stream end exists here (`slates_client::StreamEnd` has no values off Unix: the daemon refuses the form by kind),
+/// so there is nothing to run.
+#[cfg(not(unix))]
+fn spawn_handed(
+  _program: &OsStr,
+  _args: &[OsString],
+  stream: slates_client::StreamEnd,
+  _at: i32,
+) -> Result<std::process::Child, Failure> {
+  match stream {}
 }
 
 /// `grant`: the human surface (§4.13 "Grants"). The command runs as the user who started the anchor and

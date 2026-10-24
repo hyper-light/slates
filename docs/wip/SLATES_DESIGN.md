@@ -3357,8 +3357,9 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 > reply, from either shard; on macOS the reply carries a single-use secret and the client claims the end on the
 > daemon's socket route, an exchange keyed by HKDF-SHA256 and sealed with AES-256-GCM (`slates_ipc::route`,
 > `crates/server/src/shards_route.rs`). `Client::attach_shards` takes either; Windows refuses the form
-> `DescriptorRouteNotBuilt`. Not yet: the CLI, a real Shards boot against the daemon, and DAX. The details and the
-> evidence are A-161's.
+> `DescriptorRouteNotBuilt`. `slates shards ID --fd N -- CMD` runs a program with the end at descriptor `N`, keeping no
+> copy, so the attachment ends when the program's end closes. Not yet: a real Shards boot against the daemon, and DAX.
+> The details and the evidence are A-161's.
 
 **Writeback and snapshot barrier.** Kernel/guest cache negotiation changes when writes reach
 the owner. `snapshot`, `submit`, `advance`, clean `detach`, migration and archive must identify
@@ -12097,6 +12098,14 @@ Applied in the same change to:
   route's fact), `state.rs`; `crates/client` (`attach_shards` claims an offer); the tests; `unsafe-budget.toml`
   (`slates-ipc` 47 → 48, the `confstr` call); `xtask` (the route's socket node in `slates-ipc`'s host-path reason);
   `docs/bugs/2026-10-24-a-stream-end-arrived-flushed-by-the-kernel-in-flight.md`;
+- (step 4) `crates/ipc`: `stream.rs` (`spawn_with`, `FIRST_HANDED_NUMBER`), `route.rs` (the received end made
+  close-on-exec), `tests/stream_spawn.rs` (new); `crates/client` (`attach_shards` on every platform, `StreamEnd`, the
+  delivery steps as paired functions; the Windows refusal in `tests/shards.rs`); `crates/cli` (`slates shards`:
+  `args.rs`, `verbs.rs`, `main.rs`; `tests/cli.rs`; the FUSE codec a Unix dev-dependency); `crates/server` (`shards.rs`,
+  `verbs.rs`: unit structs where a platform prepares or carries nothing); `crates/conformance` (`trace.rs`, `record.rs`,
+  `matrix.rs`: the daemon's socket node, a class of its own) and `xtask` (the hermeticity run names the route's node);
+  `.github/workflows/ci.yml` (the Windows refusal test on both Windows lanes); `unsafe-budget.toml` (`slates-ipc`
+  48 → 49, `spawn_with`'s `pre_exec`); `docs/cli.md`, `docs/wip/conformance.md`;
 - §4.6, GAPS.
 
 - **What it answers.** Shards' fs device forwards each guest FUSE request to a backend over a Unix stream it is handed
@@ -12215,11 +12224,52 @@ Applied in the same change to:
     under its own secret, nonces and attachment, every tampered byte fails, a hostile hello is refused.
   - What it does not change: the secret is as private as the client's ring, which on macOS a same-user process could
     open by name (GAP-A9-9), and that process could read the ring's file contents as well.
-- **Owed:** the CLI's attach and a Windows refusal by kind (step 4), Shards' own `--slates-fs-fd` on its current branch
-  and a real boot (part 2), and a DAX window over a backing that authorizes only the attachment's bytes (part 3). The
-  one-file example and its blocking helpers go once the CLI hands a stream out. Linux's control-socket handoff still
-  closes the daemon's copy right after the send; Linux's collector is a different design and is not known to flush, but
-  it is not proven either.
+- **The CLI (2026-10-24, part 1 step 4).** `slates shards ID [--subtree DIR] [--read-only] --fd N -- CMD` attaches the
+  volume in the Shards form, announces the attachment, and runs the command with the end at descriptor `N` (3 or
+  more), so a Shards spawner, or a test, gets a working end without linking slates (`shards run … --slates-fs-fd N`).
+  It closes its client before the command starts and keeps no copy of the end, so the attachment lasts exactly as long
+  as the command's end; the command's standard streams and exit code are its own.
+  - `slates_ipc::stream::spawn_with` places the end in the forked child (`dup2` in `pre_exec`, which clears
+    close-on-exec on the copy), so no child another thread spawns inherits it. **Found in review, test first:** the
+    standard library learns of a failed `exec` through a close-on-exec pipe whose ends take the lowest free numbers, so
+    a free `N` could be the pipe's write end, and the child's `dup2` would close it: the parent then reports a program
+    that never ran as spawned, and the failed exec writes its error into the stream.
+    `a_program_that_cannot_run_is_refused_whatever_number_it_is_handed_at` saw a missing program reported spawned at
+    the lowest free number plus one (6). `N` is now held open in the parent until the spawn returns.
+  - macOS has no `MSG_CMSG_CLOEXEC`, so the client makes the end it receives on the route close-on-exec at once.
+  - Windows: `attach_shards` compiles on every platform; off Unix the end's type (`StreamEnd`) has no values, the
+    delivery steps refuse as unexpected replies, and the daemon refuses the form by kind
+    (`AttachmentUnsupported`, `DescriptorRouteNotBuilt`), the reason its transport report gives. `slates shards` there
+    sends the attach and prints the refusal (exit 1). Both Windows CI lanes run
+    `the_shards_form_is_refused_by_kind_where_no_route_hands_a_handle`.
+  - Evidence: `slates_shards_hands_a_program_a_working_stream_end_and_the_attachment_ends_with_it`
+    (`crates/cli/tests/cli.rs`) runs a real anchor: a reader, the test binary re-invoked under `slates shards --fd 7`,
+    mounts the attachment over descriptor 7 (`INIT`, `LOOKUP`, `OPEN`, `READ`, `RELEASE`) and prints what it read,
+    byte-equal to the file; the attachment it ran under is gone once it exits; a program that exits 7 makes the command
+    exit 7; a program that closes its end and waits sees its attachment gone while it and the command still run; a
+    missing volume is refused (exit 1), a program that cannot run fails (exit 4) with its attachment ended, and
+    `--fd 2` is usage (exit 2). Passed on macOS arm64 (4.6–6.6 s, load 8.6) and Linux x86_64 (adacachy, 0.39 s, load
+    20–31). Red-checked on macOS: with `spawn_with` leaking the parent's copy, the attachment outlived the end that
+    closed (failed after `WAIT_FOR`, 10 s) while the reader's and the silent program's checks still passed, which is why
+    the waiting program is there.
+  - Step 2's evidence on Linux (adacachy, 2026-10-24): `crates/client/tests/shards.rs` 3 of 3, `crates/server/tests/
+    shards.rs` 7 of 7; with the control-socket send withheld in `deliver_handoff`, all three client tests failed at the
+    attach (`Ipc(DeadlineExceeded)`), and passed again restored.
+- **Found on the way (2026-10-24).**
+  - CI's Linux and Windows lanes stopped compiling at 285ce936 and 7dad728d: a platform with nothing to prepare or carry
+    used `()` (`shards::Prepared` on Linux, `verbs::Carried` on Windows), and clippy refuses binding or passing a unit
+    value (`let_unit_value`, `unit_arg`). Neither branch was linted before the push: `slates-server`'s C dependency
+    (aws-lc-sys) does not cross-build from the Mac, so its Linux branch lints on a Linux host and its Windows branch
+    only on Windows. Both are unit structs now; the Linux branch is linted clean on adacachy, the Windows one by CI.
+  - CI's macOS hermeticity run counted the route's socket node outside (run 40104138955: its `create`, `setmode` and
+    `unlink`, all by the daemon). The tracer now knows the daemon's own socket node as a class of its own, named by the
+    route's path function and allowed only its making, mode and removal by the daemon
+    (`only_the_daemons_making_mode_and_removal_of_its_socket_node_are_allowed`, which fails with the call-kind check
+    removed).
+- **Owed:** Shards' own `--slates-fs-fd` on its current branch and a real boot (part 2), and a DAX window over a backing
+  that authorizes only the attachment's bytes (part 3). The one-file example and its blocking helpers go now that the
+  CLI hands a stream out (step 5). Linux's control-socket handoff still closes the daemon's copy right after the send;
+  Linux's collector is a different design and is not known to flush, but it is not proven either.
 
 ### A-160 — A volume's disk-image form: ext2, written in bounded steps, read back as hostile input (accepted 2026-10-23)
 Applied in the same change to:

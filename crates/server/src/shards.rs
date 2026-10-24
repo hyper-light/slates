@@ -388,9 +388,11 @@ fn pending_ends(s: &ShardState) -> usize {
 /// drawn now (a refused random source refuses the attach before any effect).
 #[cfg(target_os = "macos")]
 type Prepared = [u8; slates_ipc::route::SECRET_BYTES];
-/// See the macOS arm: Linux's hand-out needs nothing made first.
+/// See the macOS arm: Linux's hand-out needs nothing made first. A unit struct rather than `()`, so the one code path
+/// binds and passes it on every platform without binding a unit value.
 #[cfg(not(target_os = "macos"))]
-type Prepared = ();
+#[derive(Clone, Copy, Debug)]
+struct Prepared;
 
 /// Draws the offer's secret (macOS).
 #[cfg(target_os = "macos")]
@@ -405,7 +407,7 @@ fn prepare() -> Result<Prepared, Refusal> {
 /// See the macOS arm.
 #[cfg(not(target_os = "macos"))]
 fn prepare() -> Result<Prepared, Refusal> {
-  Ok(())
+  Ok(Prepared)
 }
 
 /// Linux: the end is kept under the request's word for the client's control socket (`deliver_handoff`), and the reply
@@ -416,7 +418,7 @@ fn hand_out(
   request: u64,
   attached: ShardsAttached,
   capability: slates_ipc::protocol::AttachmentCapability,
-  (): Prepared,
+  _nothing: Prepared,
 ) -> slates_ipc::protocol::ReplyBody {
   let ShardsAttached {
     attachment,
@@ -474,7 +476,7 @@ fn hand_out(
   _request: u64,
   _attached: ShardsAttached,
   _capability: slates_ipc::protocol::AttachmentCapability,
-  (): Prepared,
+  _nothing: Prepared,
 ) -> slates_ipc::protocol::ReplyBody {
   slates_ipc::protocol::ReplyBody::Refused {
     refusal: Refusal::AttachmentUnsupported {

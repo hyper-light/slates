@@ -32,6 +32,10 @@ rcgen = { workspace = true }
 # The Linux grant path reopens the anchor's memfd handoff and makes it inheritable.
 rustix = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# The hermeticity tracer names the daemon's own socket node by the route's own path function (A-161).
+slates-ipc = { workspace = true }
+
 [dev-dependencies]
 # Exercise the harness's mount source against the real daemon without a privileged kernel mount.
 slates-server = { workspace = true }

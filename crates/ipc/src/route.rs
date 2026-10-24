@@ -620,6 +620,11 @@ fn receive_confirmation(socket: BorrowedFd<'_>) -> Result<([u8; SEALED_BYTES], O
     return Err(malformed);
   }
   let stream = descriptors.pop().ok_or(malformed.clone())?;
+  // macOS has no `MSG_CMSG_CLOEXEC`, so the received end is made close-on-exec here, as the client's promise to its
+  // caller says: no child the client spawns inherits it by accident. A child another of the client's threads forks
+  // between the receive and this call could still inherit it; a client that forks while it claims makes that window.
+  rustix::io::fcntl_setfd(&stream, rustix::io::FdFlags::CLOEXEC)
+    .map_err(|e| refused("fcntl_setfd received end", e))?;
   let confirmation = message
     .get(1..)
     .and_then(|body| <[u8; SEALED_BYTES]>::try_from(body).ok())

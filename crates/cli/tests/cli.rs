@@ -1858,6 +1858,351 @@ fn issuer_verbs_refuse_without_the_anchor(instance: &str) {
   assert!(err.contains("no anchor in this environment"), "{err}");
 }
 
+/// Format: the environment variables that make this test binary the program `slates shards` runs: the role, the
+/// descriptor number its stream end arrives at, and the file it reads through it.
+const SHARDS_ROLE: &str = "SLATES_CLI_TEST_SHARDS_ROLE";
+/// Format: see [`SHARDS_ROLE`].
+const SHARDS_ROLE_FD: &str = "SLATES_CLI_TEST_SHARDS_FD";
+/// Format: see [`SHARDS_ROLE`].
+const SHARDS_ROLE_PATH: &str = "SLATES_CLI_TEST_SHARDS_PATH";
+/// Format: this test's name, which the re-invoked binary is told to run (`--exact`), so the run plays the reader.
+const SHARDS_TEST: &str =
+  "slates_shards_hands_a_program_a_working_stream_end_and_the_attachment_ends_with_it";
+/// Shape: the descriptor number the reader is handed its end at: past the standard three, and not the lowest free
+/// number either, so the hand-off is seen to move the end.
+const HANDED_FD: &str = "7";
+/// Format: the tag the reader puts before the bytes it read, in hex: the re-invoked test binary prints libtest's banner
+/// on standard output first.
+const READ_TAG: &str = "shards-read: ";
+/// The file the reader reads through its end; long enough to be more than a header's worth.
+const SHARDS_FILE: &[u8] = b"read through the stream end slates shards handed this program\n";
+
+/// A-161 (Shards part 1 step 4): "the CLI hands a program a working descriptor, and the attachment ends when the
+/// program's end closes". Do: write a file into a volume, then run `slates shards ID --fd 7 -- <this test binary>`, the
+/// binary re-invoked as a reader that mounts the attachment over descriptor 7 as a Shards fs device would (INIT,
+/// LOOKUP, OPEN, READ, RELEASE) and prints what it read. Expect the bytes equal to the file, the command's exit code the
+/// reader's, the attachment it announced gone once the reader has exited (its count back to before, and `detach`
+/// finding nothing), and the same for a program that exits 7 without a word on its end. Then the refusals: a volume that
+/// does not exist (exit 1) and a program that cannot run (exit 4), each leaving no attachment behind; a number below 3
+/// is usage (exit 2).
+#[test]
+fn slates_shards_hands_a_program_a_working_stream_end_and_the_attachment_ends_with_it() {
+  if std::env::var_os(SHARDS_ROLE).is_some() {
+    shards_reader();
+    return;
+  }
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the shards hand-off: set SLATES_TEST_CLI=1 to run it (an anchor and its daemon)"
+    );
+    return;
+  }
+  let instance = format!("cli-shards-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let id = a_volume_with_the_file(&instance);
+  let before = attachments_of(&instance, &id);
+  a_reader_reads_the_file_through_its_end(&instance, &id, &before);
+  a_silent_program_exits_and_ends_its_attachment(&instance, &id, &before);
+  the_attachment_ends_when_the_end_closes_while_the_command_runs(&instance, &id, &before);
+  the_refusals_leave_no_attachment(&instance, &id, &before);
+}
+
+/// Format: the line the waiting program prints once it has closed its end.
+const CLOSED_LINE: &str = "end-closed";
+
+/// A child killed and reaped when dropped, so a failed assertion leaves no process behind.
+struct Running(Child);
+
+impl Drop for Running {
+  fn drop(&mut self) {
+    let _ = self.0.kill();
+    let _ = self.0.wait();
+  }
+}
+
+/// A program that closes its end and then waits on its standard input: its attachment is gone while it, and the
+/// `slates shards` waiting for it, still run, so nothing but the program's end held the attachment (not the command's
+/// own process, not a copy it kept); the command then exits with the program.
+fn the_attachment_ends_when_the_end_closes_while_the_command_runs(
+  instance: &str,
+  id: &str,
+  before: &str,
+) {
+  use std::io::BufRead;
+  let script = format!("exec {HANDED_FD}>&-; echo {CLOSED_LINE}; read held; exit 0");
+  let mut running = Running(
+    shards_command(instance, id)
+      .args(["/bin/sh", "-c", &script])
+      .stdin(Stdio::piped())
+      .stdout(Stdio::piped())
+      .spawn()
+      .unwrap(),
+  );
+  let mut lines = std::io::BufReader::new(running.0.stdout.take().unwrap()).lines();
+  let mut announced = String::new();
+  for line in lines.by_ref() {
+    let line = line.unwrap();
+    if line == CLOSED_LINE {
+      break;
+    }
+    announced.push_str(&line);
+    announced.push('\n');
+  }
+  let attachment = value_of(&announced, "attachment");
+  assert!(
+    wait_for(|| attachments_of(instance, id) == before),
+    "attachment {attachment} ended once the program closed its end"
+  );
+  assert!(
+    running.0.try_wait().unwrap().is_none(),
+    "`slates shards` still waits for its program"
+  );
+  drop(running.0.stdin.take());
+  assert_eq!(running.0.wait().unwrap().code(), Some(0));
+  let (code, _, err) = run(instance, &["detach", &attachment]);
+  assert_eq!(
+    code, 1,
+    "no attachment {attachment} remains to detach: {err}"
+  );
+}
+
+/// A volume holding `hello.txt` with [`SHARDS_FILE`], written through an attachment that is then detached.
+fn a_volume_with_the_file(instance: &str) -> String {
+  let (code, out, err) = run(
+    instance,
+    &["volume", "create", "shards", "--bounded", "4MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let (code, attached, err) = run(instance, &["attach", &id, "--write"]);
+  assert_eq!(code, 0, "{err}");
+  let writer = value_of(&attached, "attachment");
+  let (code, _, err) = run_with_stdin(instance, &["write", &id, &writer, "hello.txt"], SHARDS_FILE);
+  assert_eq!(code, 0, "{err}");
+  let (code, _, err) = run(instance, &["detach", &writer]);
+  assert_eq!(code, 0, "{err}");
+  id
+}
+
+/// The reader, run under `slates shards`, reads the file's bytes through its end; then its attachment is gone.
+fn a_reader_reads_the_file_through_its_end(instance: &str, id: &str, before: &str) {
+  let reader = shards_command(instance, id)
+    .arg(std::env::current_exe().unwrap())
+    .args(["--exact", SHARDS_TEST, "--nocapture"])
+    .env(SHARDS_ROLE, "reader")
+    .env(SHARDS_ROLE_FD, HANDED_FD)
+    .env(SHARDS_ROLE_PATH, "hello.txt")
+    .output()
+    .unwrap();
+  let stdout = String::from_utf8_lossy(&reader.stdout);
+  assert_eq!(
+    reader.status.code(),
+    Some(0),
+    "{stdout}{}",
+    String::from_utf8_lossy(&reader.stderr)
+  );
+  let read = stdout
+    .lines()
+    .find_map(|line| line.strip_prefix(READ_TAG))
+    .unwrap_or_else(|| panic!("the reader printed what it read: {stdout}"));
+  assert_eq!(
+    unhex(read),
+    SHARDS_FILE,
+    "the bytes read through the end are the file's"
+  );
+  the_attachment_ends(instance, id, before, &value_of(&stdout, "attachment"));
+}
+
+/// A program that never speaks on its end and exits 7: the command exits 7, and the attachment ends.
+fn a_silent_program_exits_and_ends_its_attachment(instance: &str, id: &str, before: &str) {
+  let silent = shards_command(instance, id)
+    .args(["/bin/sh", "-c", "exit 7"])
+    .output()
+    .unwrap();
+  assert_eq!(
+    silent.status.code(),
+    Some(7),
+    "the command's exit code is the program's"
+  );
+  the_attachment_ends(
+    instance,
+    id,
+    before,
+    &value_of(&String::from_utf8_lossy(&silent.stdout), "attachment"),
+  );
+}
+
+/// A volume that does not exist is refused (exit 1); a program that cannot run is a failure (exit 4) whose attachment
+/// ends with the end it never received; a number below 3 is usage (exit 2).
+fn the_refusals_leave_no_attachment(instance: &str, id: &str, before: &str) {
+  let missing = "0".repeat(32);
+  let (code, _, err) = run(
+    instance,
+    &[
+      "shards", &missing, "--fd", HANDED_FD, "--", "/bin/sh", "-c", "exit 0",
+    ],
+  );
+  assert_eq!(code, 1, "a volume that does not exist is refused: {err}");
+  let (code, _, err) = run(
+    instance,
+    &[
+      "shards",
+      id,
+      "--fd",
+      HANDED_FD,
+      "--",
+      "/nonexistent/slates-shards-program",
+    ],
+  );
+  assert_eq!(code, 4, "a program that cannot run is a failure: {err}");
+  assert!(
+    wait_for(|| attachments_of(instance, id) == before),
+    "the end of a program that never ran closed, ending its attachment"
+  );
+  let (code, _, err) = run(instance, &["shards", id, "--fd", "2", "--", "/bin/sh"]);
+  assert_eq!(
+    code, 2,
+    "standard error is not a number to hand an end at: {err}"
+  );
+}
+
+/// `slates --instance INSTANCE shards ID --fd HANDED_FD --`, the command still to follow.
+fn shards_command(instance: &str, id: &str) -> Command {
+  let mut command = slates();
+  command.args([
+    "--instance",
+    instance,
+    "shards",
+    id,
+    "--fd",
+    HANDED_FD,
+    "--",
+  ]);
+  command
+}
+
+/// The attachment `attachment` is gone: the volume's count back to `before` within the test's wait, and a `detach` of
+/// it refused.
+fn the_attachment_ends(instance: &str, id: &str, before: &str, attachment: &str) {
+  assert!(
+    wait_for(|| attachments_of(instance, id) == before),
+    "attachment {attachment} ended with its program's end: {} attachments, {before} before",
+    attachments_of(instance, id)
+  );
+  let (code, _, err) = run(instance, &["detach", attachment]);
+  assert_eq!(
+    code, 1,
+    "no attachment {attachment} remains to detach: {err}"
+  );
+}
+
+fn unhex(text: &str) -> Vec<u8> {
+  (0..text.len())
+    .step_by(2)
+    .map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap())
+    .collect()
+}
+
+/// The program `slates shards` runs in the test above: this test binary, re-invoked. It adopts the stream end at the
+/// number it was told, mounts the attachment over it as Shards' fs device does (each request a little-endian length,
+/// then the FUSE request; one reply frame back), reads the named file, and prints its bytes in hex after a tag.
+fn shards_reader() {
+  use std::os::fd::FromRawFd;
+  let number: i32 = std::env::var(SHARDS_ROLE_FD).unwrap().parse().unwrap();
+  let path = std::env::var(SHARDS_ROLE_PATH).unwrap();
+  // SAFETY: `slates shards` placed the stream end at this number before the exec; nothing in this process opened it,
+  // so this is its one owner.
+  let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(number) };
+  stream.set_read_timeout(Some(WAIT_FOR)).unwrap();
+  let mut device = ShardsDevice { stream, unique: 0 };
+  let bytes = device.mount_and_read(&path);
+  let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+  println!("{READ_TAG}{hex}");
+}
+
+/// Shards' fs device as the reader plays it.
+struct ShardsDevice {
+  stream: std::os::unix::net::UnixStream,
+  unique: u64,
+}
+
+/// Format: the FUSE protocol a guest kernel offers (7.31), the node id of the attachment's root, and `O_RDONLY`.
+const FUSE_MAJOR: u32 = 7;
+/// Format: see [`FUSE_MAJOR`].
+const FUSE_MINOR: u32 = 31;
+/// Format: see [`FUSE_MAJOR`].
+const ROOT_NODE: u64 = 1;
+/// Format: see [`FUSE_MAJOR`].
+const READ_ONLY: u32 = 0;
+/// Shape: the read-ahead the reader offers at INIT (128 KiB, a Linux guest's default), and the bytes one READ asks for
+/// (a page, more than the file).
+const READAHEAD: u32 = 128 << 10;
+/// Shape: see [`READAHEAD`].
+const READ_BYTES: u32 = 4096;
+
+impl ShardsDevice {
+  fn mount_and_read(&mut self, path: &str) -> Vec<u8> {
+    use slates_bridge_fuse::abi::{OUT_HEADER_LEN, Opcode};
+    let mut init = Vec::new();
+    for word in [FUSE_MAJOR, FUSE_MINOR, READAHEAD, 0] {
+      init.extend_from_slice(&word.to_le_bytes());
+    }
+    assert_eq!(errno(&self.ask(Opcode::Init, 0, &init)), 0, "INIT");
+    let mut name = path.as_bytes().to_vec();
+    name.push(0);
+    let found = self.ask(Opcode::Lookup, ROOT_NODE, &name);
+    assert_eq!(errno(&found), 0, "LOOKUP {path}");
+    let node = word_at(&found, OUT_HEADER_LEN);
+    let mut open = READ_ONLY.to_le_bytes().to_vec();
+    open.extend_from_slice(&0u32.to_le_bytes());
+    let opened = self.ask(Opcode::Open, node, &open);
+    assert_eq!(errno(&opened), 0, "OPEN {path}");
+    let handle = word_at(&opened, OUT_HEADER_LEN);
+    let mut read = handle.to_le_bytes().to_vec();
+    read.extend_from_slice(&0u64.to_le_bytes());
+    read.extend_from_slice(&READ_BYTES.to_le_bytes());
+    read.extend_from_slice(&[0u8; 20]);
+    let reply = self.ask(Opcode::Read, node, &read);
+    assert_eq!(errno(&reply), 0, "READ {path}");
+    let mut release = handle.to_le_bytes().to_vec();
+    release.extend_from_slice(&[0u8; 16]);
+    assert_eq!(
+      errno(&self.ask(Opcode::Release, node, &release)),
+      0,
+      "RELEASE"
+    );
+    reply[OUT_HEADER_LEN..].to_vec()
+  }
+
+  fn ask(&mut self, opcode: slates_bridge_fuse::abi::Opcode, node: u64, body: &[u8]) -> Vec<u8> {
+    use std::io::{Read, Write};
+    self.unique += 1;
+    let total = slates_bridge_fuse::abi::IN_HEADER_LEN + body.len();
+    let length = u32::try_from(total).unwrap().to_le_bytes();
+    let mut request = vec![0u8; total];
+    request[0..4].copy_from_slice(&length);
+    request[4..8].copy_from_slice(&opcode.to_wire().to_le_bytes());
+    request[8..16].copy_from_slice(&self.unique.to_le_bytes());
+    request[16..24].copy_from_slice(&node.to_le_bytes());
+    request[slates_bridge_fuse::abi::IN_HEADER_LEN..].copy_from_slice(body);
+    self.stream.write_all(&length).unwrap();
+    self.stream.write_all(&request).unwrap();
+    let mut word = [0u8; 4];
+    self.stream.read_exact(&mut word).unwrap();
+    let mut reply = vec![0u8; usize::try_from(u32::from_le_bytes(word)).unwrap()];
+    self.stream.read_exact(&mut reply).unwrap();
+    reply
+  }
+}
+
+fn errno(reply: &[u8]) -> i32 {
+  -i32::from_le_bytes(reply[4..8].try_into().unwrap())
+}
+
+fn word_at(bytes: &[u8], at: usize) -> u64 {
+  u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+}
+
 /// `slates profile --quick` prints the derived constants; `slates` alone prints the usage.
 #[test]
 fn the_profile_and_the_usage_print() {

@@ -6185,9 +6185,11 @@ fn shards_attach(
 /// end owed for it, if it made one (A-161). Nothing on a platform with no stream.
 #[cfg(unix)]
 type Carried = Option<crate::shards::Handoff>;
-/// See the Unix arm: no stream, so nothing is carried.
+/// See the Unix arm: no stream, so nothing is carried. A unit struct rather than `()`, so the one code path that carries
+/// it home binds and passes it on every platform without passing a unit value.
 #[cfg(not(unix))]
-type Carried = ();
+#[derive(Clone, Copy, Debug)]
+struct Carried;
 
 /// Takes what request `request`'s verb, just run here, owes its client besides its reply.
 #[cfg(unix)]
@@ -6197,7 +6199,9 @@ fn take_carried(state: &mut ShardState, request: u64) -> Carried {
 
 /// See the Unix arm.
 #[cfg(not(unix))]
-fn take_carried(_state: &mut ShardState, _request: u64) -> Carried {}
+fn take_carried(_state: &mut ShardState, _request: u64) -> Carried {
+  Carried
+}
 
 /// Keeps on the client's shard what request `request`'s verb carried back, for `send_reply` to hand over with the
 /// reply.

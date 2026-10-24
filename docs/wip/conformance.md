@@ -392,8 +392,19 @@ snapshot, `land` (presented), `slates grant` with the anchor handoff the daemon'
 inherited), `land --grant` — under a filesystem-write tracer, every write-capable call placed in a
 closed taxonomy: inside the granted target (matched to the landed entries and the engine's
 `.slates-` hidden siblings), a RAM-only kernel object (memfd, `shm_open`, socket, pipe, event
-descriptor, the FUSE device), the processes' own standard streams, unresolved (the tracer printed
-no path), or outside — a violation.
+descriptor, the FUSE device), the processes' own standard streams, the daemon's own socket node,
+unresolved (the tracer printed no path), or outside — a violation.
+
+Since 2026-10-24 (A-161): **the daemon's own socket node is a class of its own, not RAM.** On macOS the
+daemon binds one socket file, the Shards stream's socket route (`slates-<hash>.sock` in the user's
+temporary directory; socket files authorized by Ada 2026-10-22 when what crosses them is encrypted).
+The tracer names it by the route's own path function (`slates_ipc::route::path`, its directory resolved
+to the canonical `/private/var/…` eslogger prints) and allows three calls on it, all by the daemon's pid:
+its making (`create`, from `bind`), its owner-only mode (`setmode`) and its removal (`unlink`). Any other
+call on it, or any call by another process, is a violation with its reason; another node in the same
+directory is outside. Before the class existed, CI's run of `7dad728d` counted those three calls outside
+(run 40104138955, 2026-10-24). The matrix shows the count only where it is not zero, so records from
+before keep their text. Linux has no node: the end goes over the client's control socket.
 
 Since 2026-10-01 (AUD-29-42):
 - **A write inside the target counts only as the granted landing's:** made by the daemon's pid within the

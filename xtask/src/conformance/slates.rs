@@ -983,6 +983,7 @@ mod tests {
         working_directory: cwd,
         landing: None,
         mounts: &mounts,
+        socket_node: None,
       },
     );
     assert!(

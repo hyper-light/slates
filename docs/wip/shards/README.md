@@ -11,9 +11,14 @@ model (the guest's `mount` is refused without `CAP_SYS_ADMIN`).
 > or one directory, for reading or writing within the principal's rights), makes an anonymous socket pair and serves
 > one end in Shards' framing on the volume's owner shard, control asks included (refused in Shards' forms; a DAX
 > descriptor ask `EOPNOTSUPP`). The other end is the attachment's capability. Proven by use against a real daemon
-> (`crates/server/tests/shards.rs`). Not yet: handing that end to a client over the wire, the CLI, and a real boot
-> against the daemon, so the recipe below still uses the one-file example. Until a DAX backing scoped to one attachment
-> exists, launch a slates share with no DAX window.
+> (`crates/server/tests/shards.rs`). Over the wire the end reaches a client by Linux's control socket or macOS's
+> encrypted socket route (`Client::attach_shards`), and `slates shards ID --fd N -- CMD` runs a spawner with it at
+> descriptor `N`, so the recipe below no longer needs the one-file example, which goes. Not yet: a real boot against
+> the daemon (Shards part 2). Until a DAX backing scoped to one attachment exists (part 3), launch a slates share with no
+> DAX window.
+>
+> **The Shards half, checked 2026-10-24 (read-only, from this checkout's remote refs; no fetch):** `slates-fs-native`
+> (08066b27) has been on origin since 2026-10-22; `origin/gpu` (1f82788c, 2026-10-24) still contains none of it.
 >
 > **Status checked 2026-10-21, and two things below were overstated.** (1) The slates half is on **main**, but
 > **the daemon never calls `shards_fs::serve`** — no reference in `crates/server` or `crates/cli`. The only server
@@ -47,19 +52,22 @@ A shards VM process is App-Sandboxed from launch (D30), so it **cannot open a so
 daemon, or a test), which hands the VM the connected descriptor — exactly as shards hands `--warm`/`--grants`
 descriptors. This is the general shape for any slates↔shards-microVM wiring on macOS.
 
-## The working recipe (today)
+## The recipe
 
 ```sh
-# 1. Build the slates backend demon and run it on a short-path socket.
-cargo build -p slates-bridge-fuse --example shards_fs_serve
-SOCK="$(mktemp -d)/s"                       # keep it < 104 bytes (sockaddr_un, macOS)
-target/debug/examples/shards_fs_serve "$SOCK" &
+# 1. Run the daemon (under its anchor) and make a volume.
+slates anchor &
+id=$(slates volume create agent --bounded 1GiB --json | jq -r .id)
 
-# 2. Boot a shards microVM whose share is backed by that socket. The unsandboxed caller connects and passes the fd;
-#    the guest mounts tag `shards0` and reads the volume. (crates/shards/tests/slates_fs.rs automates this.)
-SLATES_FS_SERVE=.../target/debug/examples/shards_fs_serve \
-  cargo test -p shards --test slates_fs -- --nocapture
+# 2. Boot a shards microVM whose share is that volume. `slates shards` attaches it in the Shards form and runs the
+#    unsandboxed spawner with the stream end at descriptor 3, which hands it to the VM as `--slates-fs-fd 3`; the guest
+#    mounts tag `shards0`. The attachment ends when the VM's end closes. Add `--read-only` or `--subtree DIR` to narrow
+#    what the guest reaches.
+slates shards "$id" --fd 3 -- shards run --kernel … --slates-fs-fd 3
 ```
+
+Not yet run against a real VM: `slates shards` is proven with a test program that mounts and reads through the end it
+is handed (`crates/cli/tests/cli.rs`), and Shards' `--slates-fs-fd` is on `slates-fs-native`, not `gpu` (part 2).
 
 ## DAX compatibility
 

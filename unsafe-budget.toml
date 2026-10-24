@@ -122,7 +122,7 @@
 #   job object that ends the daemon with the anchor (`supervise.rs`, added 2026-09-05 with the
 #   CLI of Phase 2 task 5): create, the zeroed limit record, set the kill-on-close limit, assign
 #   the child, and the two closes (6), compiled only for Windows.
-# slates-ipc (46): the macOS wait-on-address and wake-by-address calls libc exposes without a
+# slates-ipc (49): the macOS wait-on-address and wake-by-address calls libc exposes without a
 #   safe wrapper (`wake.rs`), each on a live word of a shared mapping (2); the Linux rendezvous
 #   adopting the region descriptor it duplicated for the handoff before sending it (1) and
 #   borrowing the shard's leaked kick descriptor to duplicate it for the client (1); and the
@@ -160,7 +160,10 @@
 #   A-114): on Linux, borrowing the listening socket the anchor handed over by number to duplicate it close-on-exec,
 #   the shape the segment handoff already has (1). 46 → 47. The Shards stream's socket route (`route.rs`, 2026-10-24,
 #   A-161, compiled only for macOS): `confstr(_CS_DARWIN_USER_TEMP_DIR)` naming the user's own temporary directory,
-#   which libc exposes without a safe wrapper, into a buffer whose length it is given (1). 47 → 48.
+#   which libc exposes without a safe wrapper, into a buffer whose length it is given (1). 47 → 48. A client handing
+#   a Shards stream end to a program at the number it names (`stream.rs` `spawn_with`, 2026-10-24, A-161, Unix):
+#   `pre_exec` (unsafe by signature) whose closure makes one async-signal-safe `dup2` in the forked child, the shape
+#   of the delivery channel's `fcntl` above (1). 48 → 49.
 # slates-server (5): the Windows liveness probe of a client's
 #   process (`peer.rs`, added 2026-09-05 with the dead-client reclaim): open, wait with a zero
 #   timeout, close (3), compiled only for Windows; and the daemon adopting the anchor's inherited
@@ -265,7 +268,7 @@ slates-vfs = 0
 slates-land = 4
 slates-anchor = 6
 slates-db = 0
-slates-ipc = 48
+slates-ipc = 49
 # 2026-09-19 (-1): Linux rendezvous awaits driver readiness; no raw-fd polling thread.
 # 2026-09-28 (+1): the inherited fleet serve sockets (`fleet.rs` `adopt_inherited`).
 #   Raised 5 → 6 on 2026-10-03 for A-64 (content resident once): `daemon::arena_region` maps the shard's arena range of

@@ -322,6 +322,11 @@ pub enum Counts {
     ram_only: u64,
     /// Writes to the processes' own standard streams.
     standard_streams: u64,
+    /// Calls on the daemon's own socket node by the daemon — its making, its mode, its removal (the Shards
+    /// route on macOS, A-161). Zero in a record written before the class existed, which counted such calls
+    /// outside.
+    #[serde(default)]
+    socket_node: u64,
     /// Calls the tracer could not attribute to any path (fs_usage prints none for some fds).
     unresolved: u64,
     /// Calls on a path outside every allowed class — violations; must be zero.

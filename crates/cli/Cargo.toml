@@ -44,10 +44,11 @@ slates-rt = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
 
-[target.'cfg(target_os = "linux")'.dev-dependencies]
+[target.'cfg(unix)'.dev-dependencies]
 # `init::MAX_WRITE`: the in-flight resend test writes one page of it, the largest write the mount advertises, so the
-# daemon is serving one for as long as a single write can hold it when the kill lands (A-61 / T-3.5). Linux-only,
-# as the test is.
+# daemon is serving one for as long as a single write can hold it when the kill lands (A-61 / T-3.5; Linux, as that
+# test is). And the FUSE ABI's opcodes and header lengths for the reader `slates shards` hands a stream end (A-161),
+# on Linux and macOS.
 slates-bridge-fuse = { workspace = true }
 
 [dev-dependencies]

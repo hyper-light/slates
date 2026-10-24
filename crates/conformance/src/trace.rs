@@ -6,8 +6,10 @@
 //! dynamic half: every write-capable system call the traced slates processes made, read back from
 //! a tracer's log and placed in a closed taxonomy — inside the granted target, a RAM-only kernel
 //! object (a memfd, an `shm_open` object, a socket, a pipe, an event descriptor, the FUSE device),
-//! the process's own standard streams, unresolved (the tracer printed no path for the descriptor),
-//! or outside: a violation. An unclassified path is a violation, never silence.
+//! the process's own standard streams, the daemon's own socket node (the Shards route's on macOS,
+//! A-161: made, set owner-only and removed by the daemon, and nothing else), unresolved (the tracer
+//! printed no path for the descriptor), or outside: a violation. An unclassified path is a violation,
+//! never silence.
 //!
 //! Two log formats. **strace** (Linux; `strace -f -y -e trace=%file,...`): one call per line,
 //! `pid  name(args) = ret`, descriptors decorated `N<path>` (`strace(1)`, evidence B), with
@@ -57,6 +59,11 @@ pub enum Placement {
   /// The process's own standard output or error, on a pipe, terminal or null device. A regular file
   /// behind descriptor 1 or 2 is a file like any other.
   StandardStream,
+  /// The daemon's own socket node, made by its `bind`, set owner-only and removed when it stops: the one
+  /// filesystem entry a daemon makes outside a grant, the Shards stream's socket route on macOS (A-161;
+  /// socket files authorized by Ada 2026-10-22 when what crosses them is encrypted). A socket node holds
+  /// no bytes; any other call on it, or one by another process, is [`Placement::Unauthorized`].
+  SocketNode,
   /// A write inside the target that no granted landing accounts for; the reason says why (AUD-29-42).
   Unauthorized(&'static str),
   /// The tracer printed no path the parser could resolve.
@@ -79,7 +86,29 @@ pub struct Policy<'a> {
   /// write to a kernel control file (`/proc/self/coredump_filter`) is told from a disk write by what is
   /// mounted there, never by its spelling (audit §9.1). Empty where the tracer names no mounts (macOS).
   pub mounts: &'a [Mount<'a>],
+  /// The daemon's own socket node, where its platform makes one (the Shards route on macOS, A-161), and
+  /// the processes that may make it: `None` where the daemon makes none, and then a socket node is a
+  /// path like any other.
+  pub socket_node: Option<SocketNode<'a>>,
 }
+
+/// The daemon's own socket node as the judge needs it: its path as the tracer prints it (canonical, so
+/// macOS's `/var` is `/private/var`) and the processes that may make, chmod and remove it (the daemon).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SocketNode<'a> {
+  /// The node's canonical path.
+  pub path: &'a str,
+  /// The processes that own it.
+  pub owners: &'a [u32],
+}
+
+/// Format: the calls a daemon makes on its own socket node, as the tracers name them: its `bind` makes the
+/// node (eslogger's `create`; strace traces `bind` as a network call, not a file call), the owner-only
+/// mode is set on it (eslogger's `setmode`; strace's `chmod`, `fchmodat`), and it is removed when the
+/// daemon stops or a dead daemon's node is replaced (`unlink`, `unlinkat`).
+const SOCKET_NODE_CALLS: &[&str] = &[
+  "create", "setmode", "chmod", "fchmodat", "unlink", "unlinkat",
+];
 
 /// One mount of the tracer's namespace, as the judge needs it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -187,6 +216,8 @@ pub struct Hermeticity {
   pub ram_only: u64,
   /// Writes to standard streams.
   pub standard_streams: u64,
+  /// Calls on the daemon's own socket node by the daemon: its making, its mode, its removal.
+  pub socket_node: u64,
   /// Calls without a resolvable path.
   pub unresolved: u64,
   /// Violations.
@@ -207,6 +238,7 @@ impl Hermeticity {
       inside_target: self.inside_target,
       ram_only: self.ram_only,
       standard_streams: self.standard_streams,
+      socket_node: self.socket_node,
       unresolved: self.unresolved,
       outside: self.outside,
       written_matched,
@@ -302,6 +334,11 @@ pub fn classify(event: &WriteEvent, policy: &Policy<'_>) -> Placement {
   if let Some(class) = object {
     return Placement::RamOnly(class);
   }
+  if let Some(node) = policy.socket_node.as_ref()
+    && path == node.path
+  {
+    return on_socket_node(event, node);
+  }
   if on_kernel_virtual_mount(path, policy.mounts) {
     return Placement::RamOnly("a kernel control file (its mount is a kernel virtual filesystem)");
   }
@@ -309,6 +346,25 @@ pub fn classify(event: &WriteEvent, policy: &Policy<'_>) -> Placement {
     return Placement::Unresolved;
   }
   Placement::Outside
+}
+
+/// Places a call on the daemon's own socket node: its making, its mode or its removal, by the daemon; anything else
+/// on it is a violation with its reason.
+fn on_socket_node(event: &WriteEvent, node: &SocketNode<'_>) -> Placement {
+  if !SOCKET_NODE_CALLS.contains(&event.call.as_str()) {
+    return Placement::Unauthorized(
+      "on the daemon's socket node by a call other than its making, its mode or its removal",
+    );
+  }
+  match event.pid {
+    Some(pid) if node.owners.contains(&pid) => Placement::SocketNode,
+    Some(_) => {
+      Placement::Unauthorized("on the daemon's socket node by a process that is not the daemon")
+    }
+    None => {
+      Placement::Unauthorized("on the daemon's socket node by a process the tracer did not name")
+    }
+  }
 }
 
 /// Whether a call writes bytes to a descriptor (the calls a standard stream receives).
@@ -339,6 +395,7 @@ pub fn judge(events: &[WriteEvent], policy: &Policy<'_>) -> Hermeticity {
       }
       Placement::RamOnly(_) => out.ram_only = out.ram_only.saturating_add(1),
       Placement::StandardStream => out.standard_streams = out.standard_streams.saturating_add(1),
+      Placement::SocketNode => out.socket_node = out.socket_node.saturating_add(1),
       Placement::Unresolved => {
         out.unresolved = out.unresolved.saturating_add(1);
         keep_sample(&mut out.unresolved_sample, event);
@@ -1478,6 +1535,7 @@ mod tests {
       working_directory: "/scratch/cwd",
       landing: Some(landing()),
       mounts: &[],
+      socket_node: None,
     }
   }
 
@@ -1555,6 +1613,102 @@ mod tests {
     assert!(!eslogger_has_activity("not json\n{}\n"));
   }
 
+  /// R1, A-161: the daemon's own socket node (the Shards route on macOS). Do: judge eslogger events on the node — the
+  /// daemon's bind (`create`), its owner-only mode (`setmode`) and its removal (`unlink`); then a write-capable open of
+  /// the node, the same `create` by another process, a sibling node in the same directory, and the daemon's three
+  /// calls under a policy that names no node. Expect: only the daemon's three calls on that one path are the socket
+  /// node's; every other call is a violation with its reason, and with no node named the three are outside.
+  #[test]
+  fn only_the_daemons_making_mode_and_removal_of_its_socket_node_are_allowed() {
+    const NODE: &str = "/private/var/folders/xy/T/slates-753bbfdd99757041.sock";
+    const DAEMON: u32 = 86_174;
+    let file = |path: &str| format!(r#"{{"path":"{path}","path_truncated":false}}"#);
+    let line = |pid: u32, kind: &str, body: String| {
+      format!(
+        r#"{{"event_type":0,"time":"{ES_TIME}","event":{{"{kind}":{body}}},"process":{{"audit_token":{{"pid":{pid}}}}}}}"#
+      )
+    };
+    let create = |pid: u32, name: &str| {
+      line(
+        pid,
+        "create",
+        format!(
+          r#"{{"destination_type":1,"destination":{{"new_path":{{"dir":{},"filename":"{name}","mode":49536}}}}}}"#,
+          file("/private/var/folders/xy/T")
+        ),
+      )
+    };
+    let daemons_own = [
+      create(DAEMON, "slates-753bbfdd99757041.sock"),
+      line(
+        DAEMON,
+        "setmode",
+        format!(r#"{{"mode":384,"target":{}}}"#, file(NODE)),
+      ),
+      line(
+        DAEMON,
+        "unlink",
+        format!(
+          r#"{{"target":{},"parent_dir":{}}}"#,
+          file(NODE),
+          file("/private/var/folders/xy/T")
+        ),
+      ),
+    ]
+    .join("\n");
+    let others = [
+      line(
+        DAEMON,
+        "open",
+        format!(r#"{{"fflag":514,"file":{}}}"#, file(NODE)),
+      ),
+      create(4_242, "slates-753bbfdd99757041.sock"),
+      create(DAEMON, "slates-0000000000000000.sock"),
+    ]
+    .join("\n");
+    let owners = [DAEMON];
+    let naming = |node: Option<&'static str>| Policy {
+      socket_node: node.map(|path| SocketNode {
+        path,
+        owners: &owners,
+      }),
+      ..policy()
+    };
+
+    let judged = judge(&parse_eslogger(&daemons_own), &naming(Some(NODE)));
+    assert_eq!(
+      (judged.socket_node, judged.outside, judged.write_calls),
+      (3, 0, 3),
+      "{:?}",
+      judged.violations
+    );
+
+    let judged = judge(&parse_eslogger(&others), &naming(Some(NODE)));
+    assert_eq!(judged.socket_node, 0);
+    let reasons: Vec<(&str, &str)> = judged
+      .violations
+      .iter()
+      .map(|v| (v.event.call.as_str(), v.reason))
+      .collect();
+    assert_eq!(
+      reasons,
+      [
+        (
+          "open",
+          "on the daemon's socket node by a call other than its making, its mode or its removal"
+        ),
+        (
+          "create",
+          "on the daemon's socket node by a process that is not the daemon"
+        ),
+        ("create", "outside every allowed class"),
+      ]
+    );
+
+    let judged = judge(&parse_eslogger(&daemons_own), &naming(None));
+    assert_eq!((judged.socket_node, judged.outside), (0, 3));
+  }
+
   /// R1 / AUD-29-42: a thread the daemon spawns only for the landing is the landing's. strace names
   /// events by thread, and A-130's barrier `fdatasync`s a staged file on a scoped thread
   /// (`crates/land/src/os.rs`) whose id no post-landing `/proc/<pid>/task` snapshot kept.
@@ -1592,6 +1746,7 @@ mod tests {
           until_ns: WINDOW.1,
         }),
         mounts: &[],
+        socket_node: None,
       },
     );
     assert_eq!(
@@ -1731,6 +1886,7 @@ mod tests {
       working_directory: "/scratch",
       landing: Some(landing()),
       mounts: &[],
+      socket_node: None,
     };
     let judged = judge(&parse_strace(&stamped(log)), &policy);
     assert_eq!(judged.inside_target, 3);
@@ -1896,6 +2052,7 @@ not a row
         working_directory: "/scratch/cwd",
         landing,
         mounts: &[],
+        socket_node: None,
       };
       judge(&parse_strace(log), &policy)
     };
@@ -2105,6 +2262,7 @@ garbage without a separator
       working_directory: "/work",
       landing: None,
       mounts,
+      socket_node: None,
     };
     let control =
       Placement::RamOnly("a kernel control file (its mount is a kernel virtual filesystem)");

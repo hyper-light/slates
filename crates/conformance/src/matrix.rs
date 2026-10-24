@@ -155,6 +155,7 @@ pub fn summary(counts: &Counts) -> String {
       inside_target,
       ram_only,
       standard_streams,
+      socket_node,
       unresolved,
       outside,
       written_matched,
@@ -162,7 +163,14 @@ pub fn summary(counts: &Counts) -> String {
     } => format!(
       "{write_calls} write-capable calls: {inside_target} inside the granted target ({written_matched} \
        matched to Written, {written_unmatched} unmatched), {ram_only} RAM-only objects, {standard_streams} \
-       standard streams, {unresolved} unresolved, {outside} outside — {}",
+       standard streams{}, {unresolved} unresolved, {outside} outside — {}",
+      // Shown where the daemon made its socket node (the Shards route on macOS, A-161); a platform without one
+      // has nothing to say here, and records from before the class keep their text.
+      if *socket_node == 0 {
+        String::new()
+      } else {
+        format!(", {socket_node} on the daemon's socket node")
+      },
       if *outside == 0 {
         "no outside writes"
       } else {
