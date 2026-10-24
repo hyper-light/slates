@@ -426,14 +426,14 @@ mod refused {
   use super::*;
 
   /// A-161 (Shards part 1 step 4: "Windows compiles and refuses the form by kind"). Do: attach a volume in the Shards
-  /// form, for writing and for reading, whole and as a directory, and read the daemon's transport report. Expect every
+  /// form, for writing and for reading, whole and as a directory, and read the volume's transport report. Expect every
   /// attach refused `AttachmentUnsupported` for the Shards transport with `DescriptorRouteNotBuilt`, the reason the
   /// report gives for the transport, and no attachment made.
   #[test]
   fn the_shards_form_is_refused_by_kind_where_no_route_hands_a_handle() {
     let (_daemon, mut client) = start("refused");
     let id = volume(&mut client, "refused");
-    let report = client.daemon_status().unwrap();
+    let report = client.status(id).unwrap();
     let shards_fs = report
       .transports
       .capabilities

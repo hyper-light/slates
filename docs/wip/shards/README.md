@@ -28,14 +28,17 @@ model (the guest's `mount` is refused without `CAP_SYS_ADMIN`).
 > shards' `origin/gpu` (`0aa00196`, 2026-10-21), the branch kiln vendors, contains none of it. "Proven" below
 > means a real HVF VM **connected** to the example server; a guest kernel mounting and reading has never run.
 
-**slates side** (`crates/bridge-fuse`, now on main):
-- `shards_fs::serve` — the backend. Transport-agnostic (generic over `Read + Write`), so cross-platform. It speaks
-  shards' own framing: a little-endian `u32` length, then the FUSE request/reply bytes, one at a time — byte-for-byte
-  what shards' fs device drives (`Slot::ask`/`write_frame`/`read_frame`).
-- `examples/shards_fs_serve.rs` — a demo daemon: binds a socket, builds a one-file RAM volume, serves it.
-- `tests/shards_fs.rs` — proves the backend answers a guest's **full mount+read** (`INIT`→`LOOKUP`→`OPEN`→`READ`,
-  reading the file's bytes) over an in-memory duplex (**runs on every platform/arch**) and over a real `UnixStream`
-  (Unix). Both green.
+**slates side** (on main; updated 2026-10-24):
+- `crates/bridge-fuse/src/shards_fs.rs` — the byte work: `split_frame` takes a frame (a little-endian `u32` length,
+  then the FUSE request; the top bit marks Shards' control asks) from the bytes read, bounded before anything is
+  allocated; `answer` dispatches it through the FUSE bridge and writes the reply frame; the control asks are refused in
+  Shards' forms. `tests/shards_fs.rs` drives a guest's full mount and read through them on every platform.
+- `crates/server/src/shards.rs` — the daemon serves an attachment on one end of an anonymous socket pair, on the
+  volume's owner shard; `crates/server/tests/shards.rs` drives it as Shards' device would.
+- The end reaches a client by Linux's control socket or macOS's encrypted socket route (`Client::attach_shards`), and
+  `slates shards ID --fd N -- CMD` runs a spawner with it at descriptor `N` (`crates/cli/tests/cli.rs`).
+- The one-file example server (`examples/shards_fs_serve.rs`) and its blocking `serve` were removed on 2026-10-24:
+  the daemon serves the route now.
 
 **shards side** (`crates/shards`, branch `slates-fs-native`, off `wip-processes`, never pushed):
 - `run --kernel … --slates-fs-fd <N>` — fills a virtio-fs share slot from an inherited, already-connected descriptor.
@@ -88,7 +91,8 @@ the same backend serves `SETUPMAPPING` and the guest reaches the block through i
 
 ## Owed follow-ups (Ada's to direct)
 
-0. **slates side, and the largest gap: the daemon serving a real volume.** A daemon verb that attaches a volume
+0. **Done 2026-10-24 (A-161): the daemon serves a real volume, and `slates shards` hands the spawner its end.** What
+   was owed, kept for the reasoning: **slates side, and the largest gap: the daemon serving a real volume.** A daemon verb that attaches a volume
    (or creates a session's copy-on-write overlay) for a guest, with a scope and rights, and returns a **connected
    descriptor** that the real daemon serves in shards' framing. The descriptor is the capability: whoever holds it
    reaches exactly that attachment. It must be a descriptor, not a path, because the macOS App Sandbox stops the VM

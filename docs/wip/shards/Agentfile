@@ -1,10 +1,9 @@
 # syntax=ghcr.io/hyper-light/shards
 #
 # A shards microVM that applies a slates VFS over shards' NATIVE virtio-fs backend (§4.6, the slates integration).
-# The guest mounts a slates volume by its virtio-fs tag `shards0` — no kernel NFS, no host mount, no 9p. slates'
-# `bridge-fuse` `shards_fs::serve` is the backend; it speaks the same le32-length + FUSE framing shards' fs device
-# speaks (`Slot::ask`/`write_frame`/`read_frame`), so the device, pointed at a slates daemon's socket, reaches the
-# volume directly.
+# The guest mounts a slates volume by its virtio-fs tag `shards0` — no kernel NFS, no host mount, no 9p. The slates
+# daemon is the backend (A-161): it serves one attachment on a stream end in the same le32-length + FUSE framing
+# shards' fs device speaks, and `slates shards ID --fd N -- <spawner>` hands that end to the VM's spawner.
 #
 # DAX compatibility: the slates side IS DAX-capable (the device DAX window — FUSE SETUPMAPPING over a pinned
 # arena block — is built and hardened; see ../../wip/SLATES_DESIGN.md §4.6 and the [[dax-mapping-gate]] memory). The
@@ -17,9 +16,9 @@
 # state does not belong. The revised shape (README.md, "Owed follow-ups") splits the DECLARATION — the Agentfile says
 # where the agent mounts a slates volume and whether it may write, in shards' syntax — from the BINDING, done at
 # launch: the runner asks the slates daemon for a connected descriptor for ONE attachment and passes it as
-# `--slates-fs-fd`. Two facts as of 2026-10-21: `--slates-fs-fd` exists only on shards branch `slates-fs-native`
-# (on no remote; shards' `gpu` lacks it), and the slates daemon does not yet serve `shards_fs` at all — only the
-# one-file example `crates/bridge-fuse/examples/shards_fs_serve.rs` does.
+# `--slates-fs-fd`. As of 2026-10-24: `--slates-fs-fd` exists only on shards branch `slates-fs-native`, which is on
+# origin but not in `gpu`; the slates daemon serves the route and `slates shards` is the binding (A-161); the one-file
+# example server is gone.
 
 FROM alpine:3.22
 

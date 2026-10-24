@@ -12098,6 +12098,9 @@ Applied in the same change to:
   route's fact), `state.rs`; `crates/client` (`attach_shards` claims an offer); the tests; `unsafe-budget.toml`
   (`slates-ipc` 47 → 48, the `confstr` call); `xtask` (the route's socket node in `slates-ipc`'s host-path reason);
   `docs/bugs/2026-10-24-a-stream-end-arrived-flushed-by-the-kernel-in-flight.md`;
+- (step 5) `crates/bridge-fuse`: `shards_fs.rs` (the blocking helpers removed, the module doc rewritten),
+  `tests/shards_fs.rs` and `examples/shards_fs_bench.rs` (on `split_frame` and `answer`), `examples/shards_fs_serve.rs`
+  (removed); `docs/wip/BENCHMARKS.md`, `docs/wip/shards/`, `docs/wip/virtiofs.md`;
 - (step 4) `crates/ipc`: `stream.rs` (`spawn_with`, `FIRST_HANDED_NUMBER`), `route.rs` (the received end made
   close-on-exec), `tests/stream_spawn.rs` (new); `crates/client` (`attach_shards` on every platform, `StreamEnd`, the
   delivery steps as paired functions; the Windows refusal in `tests/shards.rs`); `crates/cli` (`slates shards`:
@@ -12266,10 +12269,16 @@ Applied in the same change to:
     route's path function and allowed only its making, mode and removal by the daemon
     (`only_the_daemons_making_mode_and_removal_of_its_socket_node_are_allowed`, which fails with the call-kind check
     removed).
+- **Step 5, in part (2026-10-24).** The one-file example server and the blocking `serve`, `serve_one`,
+  `read_shards_frame` and `write_shards_frame` it ran on are removed: nothing in the daemon used them, and `serve_one`
+  dispatched without `answer`'s reply framing and read ceiling. `crates/bridge-fuse/tests/shards_fs.rs` now drives a
+  guest's mount and read, and the hostile lengths (a literal `u32::MAX` among them), through `split_frame` and `answer`
+  on every platform; `examples/shards_fs_bench.rs` times them (BENCHMARKS, 2026-10-24: GETATTR 125 ns, READ 4 KiB
+  250 ns, CREATE p50 291 ns at best, no dearer than before).
 - **Owed:** Shards' own `--slates-fs-fd` on its current branch and a real boot (part 2), and a DAX window over a backing
-  that authorizes only the attachment's bytes (part 3). The one-file example and its blocking helpers go now that the
-  CLI hands a stream out (step 5). Linux's control-socket handoff still closes the daemon's copy right after the send;
-  Linux's collector is a different design and is not known to flush, but it is not proven either.
+  that authorizes only the attachment's bytes (part 3). Linux's control-socket handoff still closes the daemon's copy
+  right after the send; Linux's collector is a different design and is not known to flush, but it is not proven
+  either.
 
 ### A-160 — A volume's disk-image form: ext2, written in bounded steps, read back as hostile input (accepted 2026-10-23)
 Applied in the same change to:

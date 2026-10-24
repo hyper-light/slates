@@ -1348,6 +1348,9 @@ tag `shards0` and reading `/hello` back byte for byte. So a guest kernel's own v
 slates volume and reads it, with no host mount and no DAX window: the achievable integration where the
 VMM offers no DAX cache window. The DAX-window route stays as recorded in `8a-dax-confine`.
 
+2026-10-24: that run's server, the one-file example, is gone. The daemon serves the route (A-161) and
+`slates shards` hands the spawner its end, so the boot is owed again against the daemon (Shards part 2).
+
 ### 8a-deep-sweep. Every property suite run deep, twice over what any of them had seen (2026-10-20)
 
 The DAX properties only started exploring their own sandbox paths once the L1 defects were fixed, so the
@@ -11067,10 +11070,16 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   prepares or carries nothing, refused by clippy's `let_unit_value` and `unit_arg`; neither branch linted before the
   push), and **the macOS hermeticity run counted the route's socket node outside** (run 40104138955). The tracer now
   knows the daemon's own socket node as a class of its own: its making, mode and removal by the daemon, and nothing else.
-- **Owed, in order:** docs and CI (step 5, with the one-file example and its blocking helpers removed now that the CLI
-  hands a stream out); Shards' `--slates-fs-fd` on its current branch and a real boot (part 2); a DAX window over a
-  backing that authorizes only the attachment's bytes (part 3). Until part 3 a slates share is launched without a DAX
-  window: a descriptor ask is refused `EOPNOTSUPP`.
+- **Step 5 in part (2026-10-24):** the one-file example server and its blocking helpers are removed; the bridge-fuse
+  tests and the bench drive `split_frame` and `answer`, the daemon's path (re-measured in BENCHMARKS: no dearer than
+  the function it replaced).
+- **The docs disagree on whether a guest kernel has mounted and read through slates.** `8a-shards-boot` records a pass
+  on 2026-10-20 (48.7 s, `SHARDS-TEST PASS`, against the one-file example); the Shards README's 2026-10-21 status says
+  a guest kernel's mount and read had never run. Neither can be re-checked now, since the example is gone; part 2's
+  real boot against the daemon settles it for the product path.
+- **Owed, in order:** CI green on every lane (step 5); Shards' `--slates-fs-fd` on its current branch and a real boot
+  (part 2); a DAX window over a backing that authorizes only the attachment's bytes (part 3). Until part 3 a slates
+  share is launched without a DAX window: a descriptor ask is refused `EOPNOTSUPP`.
 - **Open, found by the new tests: a read-only attachment is not a read-only file system to its client.** On every FUSE
   transport (the shared bridge) an open for writing is granted and each write through it refused `EPERM`; NFS answers
   `PERM`. A read-only file system answers `EROFS`, at the open for an open. Every change is refused and nothing lands,

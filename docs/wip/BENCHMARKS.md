@@ -5423,6 +5423,22 @@ this measurement deliberately excludes overlay copy-up, base-plane lookups and p
 which a real create pays and this one does not. It also serves over an in-memory duplex rather than the
 production `/dev/fuse` channel and its serve loop. Different host and architecture again, as above.
 
+**Re-measured 2026-10-24, on the daemon's own path (A-161).** The bench drove the blocking `serve_one`, which
+dispatched without the reply framing and read ceiling of `answer`, and which nothing in the daemon ran; it is removed,
+and the bench now times what the daemon's Shards serve task does per frame: `split_frame`, then `answer`. Same command,
+`cargo run --release -p slates-bridge-fuse --example shards_fs_bench`, macOS aarch64 (this Mac; the timer ticks at
+41.7 ns, so every row is a whole number of ticks), load 14–16, three consecutive rounds, best of 20,000 per op:
+
+| op | round 1 | round 2 | round 3 |
+|---|---|---|---|
+| GETATTR / stat | 125 ns | 125 ns | 208 ns |
+| LOOKUP | 250 ns | 250 ns | 333 ns |
+| READ 4 KiB | 250 ns | 333 ns | 458 ns |
+| CREATE (2,000 files) p50 / p99 / max | 291 ns / 2.2 µs / 30.8 µs | 291 ns / 2.5 µs / 11.1 µs | 458 ns / 3.4 µs / 12.9 µs |
+
+So the product path is no dearer than the function it replaced (2026-10-18: 291, 541, 541 and 500 ns at load 19);
+the conclusion above, that the bridge is not where a mounted create's time goes, stands.
+
 **What is left to attribute, with four candidates already eliminated.** Measured away: the bridge dispatch
 (0.5 µs), the VFS create (~2 µs), and the transport floor (13.9 µs by the stat row). Read away, and worth
 recording so they are not re-chased:

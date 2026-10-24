@@ -1,24 +1,21 @@
-//! The shards virtio-fs backend (`slates_bridge_fuse::shards_fs`) serves a slates volume to a `shards` microVM over
-//! shards' own socket framing (a little-endian u32 length, then the FUSE bytes), so a shards guest's virtio-fs
-//! device — pointed at this socket — mounts a slates volume with no kernel NFS or 9p (§4.6; `docs/wip/shards/`). The
-//! non-DAX path: shards' frame carries a FUSE request, not a `FUSE_SETUPMAPPING`.
-//!
-//! The backend is transport-agnostic (generic over `Read + Write`), so these tests prove it two ways. The full
-//! guest mount+read (`INIT`→`LOOKUP`→`OPEN`→`READ`) is driven over an **in-memory duplex** — no socket, no OS types —
-//! so it compiles and runs on **every platform and architecture** (Linux, Windows, macOS; amd64, arm64), the CI
-//! matrix included. A second test, **Unix-only**, drives it over a real `UnixStream::pair` to prove the socket path
-//! shards actually connects (and that a closed socket ends serving at EOF, not an error). Windows reaches the same
-//! generic backend over a named pipe / `AF_UNIX`, which the in-memory test already exercises the logic of.
+//! The Shards fs backend's frames and answers (`slates_bridge_fuse::shards_fs`), driven the way the daemon drives them
+//! (§4.6, the Shards route; A-161): a guest's request arrives as a frame, a little-endian `u32` length then the FUSE
+//! request; [`split_frame`] takes it from the bytes read so far, bounded before anything is allocated for it, and
+//! [`answer`] dispatches it through the FUSE bridge and writes the reply frame. Here the frames are bytes in memory, no
+//! socket and no OS types, so the guest's whole mount and read runs on every platform and architecture, Windows
+//! included. The same functions over a real stream end, inside the daemon, are `crates/server/tests/shards.rs`, and a
+//! program handed that end by the CLI is `crates/cli/tests/cli.rs`.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
-
-use std::io::{Read, Write};
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::indexing_slicing,
+  clippy::panic
+)]
 
 use slates_bridge_core::{Attachments, OpContext, Rights, View};
 use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
-use slates_bridge_fuse::shards_fs::{read_shards_frame, serve_one, write_shards_frame};
+use slates_bridge_fuse::shards_fs::{FRAME_BYTES, Frame, LENGTH_BYTES, Split, answer, split_frame};
 use slates_bridge_fuse::volume_bridge::VolumeBridge;
 use slates_db::catalog::{Principal, VolumeId};
 use slates_mem::arena::ChunkArena;
@@ -84,60 +81,6 @@ fn errno(out: &[u8]) -> i32 {
   i32::from_le_bytes(out[4..8].try_into().unwrap())
 }
 
-/// §4.6 (the shards integration). Do: serve a slates volume over shards' fs framing on one end of a socket pair;
-/// from the other end, frame a guest GETATTR of the root as shards frames it, and read the framed reply; then close.
-/// Expect: the request is served (`serve_one` → true), the reply's errno is 0 and it carries the root's attributes
-/// (more than a bare header), and the closed socket ends serving at EOF (`serve_one` → false), never an error — so a
-/// shards microVM's virtio-fs device, pointed here, reaches a slates volume through the one FUSE bridge.
-#[cfg(unix)]
-#[test]
-fn a_shards_microvm_fs_frame_is_served_by_the_slates_bridge() {
-  let mut store = store();
-  let mut vol = Volume::create(
-    &mut store,
-    VolumeConfig {
-      prefix: 1,
-      names: NameEquivalence::Exact,
-      quota: Quota::Bounded { limit: 1 << 30 },
-      journal_bytes: 1 << 16,
-      clock: Box::new(HostClock::default()),
-    },
-  )
-  .unwrap();
-  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
-  let cx = test_cx();
-
-  let (mut client, mut server) = UnixStream::pair().unwrap();
-  let mut reply = vec![0u8; 1 << 16];
-
-  // A guest GETATTR of the root (nodeid 1), framed as shards' virtio-fs device frames it: le32 length, then the bytes.
-  let getattr = message(Opcode::GetAttr as u32, 1, 1, &[0u8; 16]);
-  write_shards_frame(&mut client, &getattr).unwrap();
-  assert!(
-    serve_one(&mut server, &mut bridge, &cx, &mut reply).unwrap(),
-    "a framed request is read, dispatched and answered"
-  );
-  let answered = read_shards_frame(&mut client, 1 << 16)
-    .unwrap()
-    .expect("a framed reply");
-  assert_eq!(
-    errno(&answered),
-    0,
-    "slates answered the guest's GETATTR over shards' le32 framing"
-  );
-  assert!(
-    answered.len() > OUT_HEADER_LEN,
-    "the reply carries the root's attributes, not a bare error header"
-  );
-
-  // The guest's fs device closes the socket: serving ends at EOF, cleanly.
-  drop(client);
-  assert!(
-    !serve_one(&mut server, &mut bridge, &cx, &mut reply).unwrap(),
-    "a closed socket ends serving at EOF, not an error"
-  );
-}
-
 /// The file bytes a guest reads back; distinctive so the READ reply can only be the file's own content.
 const HELLO: &[u8] = b"hello from slates over shards virtio-fs\n";
 
@@ -150,81 +93,35 @@ fn body_u64(reply: &[u8]) -> u64 {
   )
 }
 
-/// A single-threaded in-memory duplex: one `Read + Write` the backend serves on, with no OS socket — so the full
-/// mount+read runs identically on every platform and architecture. `serve_one` reads the next framed request from
-/// `inbox` (advancing `pos`) and appends the framed reply to `outbox`; `exchange` pushes a request and takes its reply.
-#[derive(Default)]
-struct MemDuplex {
-  inbox: Vec<u8>,
-  pos: usize,
-  outbox: Vec<u8>,
-  taken: usize,
-}
-
-impl Read for MemDuplex {
-  fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-    let avail = self.inbox.get(self.pos..).unwrap_or_default();
-    let n = avail.len().min(buf.len());
-    buf
-      .get_mut(..n)
-      .unwrap_or_default()
-      .copy_from_slice(avail.get(..n).unwrap_or_default());
-    self.pos += n;
-    Ok(n)
-  }
-}
-
-impl Write for MemDuplex {
-  fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-    self.outbox.extend_from_slice(buf);
-    Ok(buf.len())
-  }
-  fn flush(&mut self) -> std::io::Result<()> {
-    Ok(())
-  }
-}
-
-/// `request` framed as shards frames it (le32 length + bytes).
+/// `request` framed as Shards' device frames it: its length, little-endian, then its bytes.
 fn framed(request: &[u8]) -> Vec<u8> {
-  let mut v = Vec::new();
-  write_shards_frame(&mut v, request).unwrap();
-  v
+  let mut frame = u32::try_from(request.len()).unwrap().to_le_bytes().to_vec();
+  frame.extend_from_slice(request);
+  frame
 }
 
-/// Pushes a framed request, serves one, and returns the reply's bytes (unframed), over the in-memory duplex.
-fn exchange(
-  duplex: &mut MemDuplex,
-  bridge: &mut VolumeBridge<'_>,
-  cx: &OpContext,
-  request: &[u8],
-) -> Vec<u8> {
-  duplex.inbox.extend_from_slice(&framed(request));
-  let mut reply = vec![0u8; 1 << 16];
-  assert!(
-    serve_one(duplex, bridge, cx, &mut reply).unwrap(),
-    "the framed request was served"
-  );
-  // serve_one appended one reply frame (le32 len + bytes); take it from where the previous reply ended.
-  let frame = duplex.outbox.get(duplex.taken..).unwrap_or_default();
-  let len = u32::from_le_bytes(
-    frame
-      .get(0..4)
-      .unwrap_or(&[0; 4])
-      .try_into()
-      .unwrap_or([0; 4]),
-  ) as usize;
-  let reply = frame.get(4..4 + len).unwrap_or_default().to_vec();
-  duplex.taken += 4 + len;
+/// Frames `request`, takes it back with [`split_frame`] as the daemon reads a stream, answers it with [`answer`], and
+/// returns the reply without its length word, which must name exactly the reply's bytes.
+fn exchange(bridge: &mut VolumeBridge<'_>, cx: &OpContext, request: &[u8]) -> Vec<u8> {
+  let bytes = framed(request);
+  let Split::Whole(Frame::Request(taken), used) = split_frame(&bytes, FRAME_BYTES).unwrap() else {
+    panic!("a whole request frame");
+  };
+  assert_eq!((taken, used), (request, bytes.len()));
+  let mut frame = Vec::new();
+  let answered = answer(taken, bridge, cx, &mut frame);
+  let reply = answered.reply(&frame).to_vec();
+  let word = u32::from_le_bytes(frame[..LENGTH_BYTES].try_into().unwrap());
+  assert_eq!(usize::try_from(word).unwrap(), reply.len());
+  assert_eq!(answered.error, -errno(&reply));
   reply
 }
 
-/// §4.6 (the shards integration — the guest's own mount+read sequence, proven on every platform/arch, no socket).
-/// Do: put a one-file volume behind the slates `shards_fs` backend, then drive exactly what a guest kernel's
-/// virtio-fs client does to read a file — FUSE_INIT, LOOKUP of the name under the root, OPEN of the returned inode,
-/// READ of its bytes — each framed as shards' fs device frames it, over an in-memory duplex (no OS socket). Expect:
-/// every step is served with errno 0, and the READ returns the file's own bytes. So a shards microVM mounting tag
-/// `shards0` and reading `/hello` reaches slates through the one FUSE bridge, the same on Linux, Windows and macOS
-/// (the guest-kernel half is the `shards` E2E boot test `crates/shards/tests/slates_fs.rs`).
+/// §4.6, A-161 (the guest's own mount and read, on every platform and architecture, no socket). Do: put a one-file
+/// volume behind the bridge, then drive what a guest kernel's virtio-fs client does to read a file — `INIT`, `LOOKUP`
+/// of the name under the root, `OPEN` of the returned inode, `READ` of its bytes — each framed as Shards' device frames
+/// it, split and answered as the daemon does. Expect every step answered with errno 0, each reply frame's length word
+/// naming exactly its reply, and the `READ` returning the file's own bytes.
 #[test]
 fn the_slates_backend_answers_a_guests_full_mount_and_read_of_a_file() {
   let mut store = store();
@@ -247,7 +144,6 @@ fn the_slates_backend_answers_a_guests_full_mount_and_read_of_a_file() {
   vol.write(&mut store, hello, 0, HELLO).unwrap();
   let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
   let cx = test_cx();
-  let mut duplex = MemDuplex::default();
 
   // FUSE_INIT: major 7, minor 38, max_readahead 0, flags 0 — the codec reads what it needs.
   let mut init = Vec::new();
@@ -256,17 +152,11 @@ fn the_slates_backend_answers_a_guests_full_mount_and_read_of_a_file() {
   init.extend_from_slice(&0u32.to_le_bytes());
   init.extend_from_slice(&0u32.to_le_bytes());
   init.resize(64, 0);
-  let r = exchange(
-    &mut duplex,
-    &mut bridge,
-    &cx,
-    &message(Opcode::Init as u32, 1, 0, &init),
-  );
+  let r = exchange(&mut bridge, &cx, &message(Opcode::Init as u32, 1, 0, &init));
   assert_eq!(errno(&r), 0, "INIT served");
 
   // LOOKUP "hello" under the root (nodeid 1): the reply's body begins with the file's inode number.
   let r = exchange(
-    &mut duplex,
     &mut bridge,
     &cx,
     &message(Opcode::Lookup as u32, 2, 1, b"hello\0"),
@@ -279,7 +169,6 @@ fn the_slates_backend_answers_a_guests_full_mount_and_read_of_a_file() {
   let mut open_in = 0u32.to_le_bytes().to_vec();
   open_in.extend_from_slice(&[0u8; 4]);
   let r = exchange(
-    &mut duplex,
     &mut bridge,
     &cx,
     &message(Opcode::Open as u32, 3, nodeid, &open_in),
@@ -293,7 +182,6 @@ fn the_slates_backend_answers_a_guests_full_mount_and_read_of_a_file() {
   read_in[8..16].copy_from_slice(&0u64.to_le_bytes());
   read_in[16..20].copy_from_slice(&u32::try_from(HELLO.len()).unwrap().to_le_bytes());
   let r = exchange(
-    &mut duplex,
     &mut bridge,
     &cx,
     &message(Opcode::Read as u32, 4, nodeid, &read_in),
@@ -306,48 +194,34 @@ fn the_slates_backend_answers_a_guests_full_mount_and_read_of_a_file() {
   );
 }
 
-/// Hostile-input pass on the frame parser (every parser of external bytes gets one — CLAUDE.md Part 6). The frame
-/// length is attacker-controlled (the first four bytes off the socket), so a guest can claim a colossal or a
-/// truncated frame. Expect: a length past the caller's bound is refused `InvalidData` BEFORE any allocation (never
-/// a `u32::MAX`-byte `Vec`); a truncated frame errors rather than hanging or over-reading; and a clean EOF is
-/// `None`, not an error. Cross-platform: it drives the parser over byte slices, no socket.
+/// Hostile input on the frame parser (CLAUDE.md §4: every parser of external bytes): a frame's length is the first four
+/// bytes off the stream, the guest's to choose. Do: split a literal `u32::MAX` length, the largest length a request can
+/// name, one byte past the caller's bound, a frame that claims 100 bytes and brings 4, and no bytes at all. Expect the
+/// first three refused `InvalidData` from the length word alone, before anything is sized by it; the short frame and
+/// the empty input partial, naming the bytes they need in all (the daemon then waits for them, and a close before they
+/// come is counted as a frame cut short).
 #[test]
 fn a_hostile_or_truncated_shards_fs_frame_is_refused_before_allocating() {
   use std::io::ErrorKind;
-
-  // A u32::MAX length: refused by the bound before a vec is sized — no attempt to allocate ~4 GiB.
-  let colossal = u32::MAX.to_le_bytes();
-  let mut src = colossal.as_slice();
-  let err = read_shards_frame(&mut src, 1 << 16).unwrap_err();
-  assert_eq!(
-    err.kind(),
-    ErrorKind::InvalidData,
-    "a colossal frame length is refused, not allocated"
-  );
-
-  // One byte past the caller's bound (the reply buffer): the same refusal.
-  let over = 65_537u32.to_le_bytes();
-  let mut src = over.as_slice();
-  let err = read_shards_frame(&mut src, 1 << 16).unwrap_err();
-  assert_eq!(
-    err.kind(),
-    ErrorKind::InvalidData,
-    "a frame one byte past the bound is refused"
-  );
-
-  // A truncated frame: claims 100 bytes, supplies 4 — an error, never a hang or an over-read.
+  let bound = 1 << 16;
+  for word in [u32::MAX, u32::MAX >> 1, bound + 1] {
+    let bytes = word.to_le_bytes();
+    assert_eq!(
+      split_frame(&bytes, usize::try_from(bound).unwrap())
+        .unwrap_err()
+        .kind(),
+      ErrorKind::InvalidData,
+      "length word {word:#x}"
+    );
+  }
   let mut truncated = 100u32.to_le_bytes().to_vec();
   truncated.extend_from_slice(&[0xAB; 4]);
-  let mut src = truncated.as_slice();
-  assert!(
-    read_shards_frame(&mut src, 1 << 16).is_err(),
-    "a frame shorter than its declared length errors"
+  assert_eq!(
+    split_frame(&truncated, FRAME_BYTES).unwrap(),
+    Split::Partial(LENGTH_BYTES + 100)
   );
-
-  // A clean EOF before any length is a clean end (the guest closed the socket), not an error.
-  let mut src: &[u8] = &[];
-  assert!(
-    read_shards_frame(&mut src, 1 << 16).unwrap().is_none(),
-    "EOF before a length is a clean end"
+  assert_eq!(
+    split_frame(&[], FRAME_BYTES).unwrap(),
+    Split::Partial(LENGTH_BYTES)
   );
 }

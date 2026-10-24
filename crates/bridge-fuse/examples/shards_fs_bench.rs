@@ -1,19 +1,27 @@
-//! Profiling pass on the mediated (non-DAX) shards fs path (§4.6). Measures how long `shards_fs::serve_one` takes to
-//! read a framed FUSE request, dispatch it through the slates bridge, and write the framed reply — over an in-memory
-//! duplex (no socket), so the number is the framing + dispatch, not the OS. This is a shards microVM's non-DAX FS
-//! latency floor (DAX, once a shards cache window exists, replaces the per-op round-trip with a page-table access —
-//! `crates/vfs/examples/dax_bench.rs` measured that at tens of ns). Best-of-N per op.
+//! Profiling pass on the mediated (non-DAX) Shards fs path (§4.6, A-161). Measures the daemon's work for one frame:
+//! [`split_frame`] taking a framed FUSE request from the bytes read, then [`answer`] dispatching it through the slates
+//! bridge and writing the reply frame — over bytes in memory, no socket, so the number is the framing, the dispatch and
+//! the VFS, not the OS (the stream's reads and writes are the daemon's serve task's). This is a Shards microVM's non-DAX
+//! latency floor; DAX, once a window over an attachment's own backing exists, replaces the per-op round trip with a
+//! page-table access (`crates/vfs/examples/dax_bench.rs` measured that at tens of ns). Best-of-N per op.
+//!
+//! Until 2026-10-24 this measured the blocking `serve_one`, since removed, which dispatched without `answer`'s read
+//! ceiling and reply framing; the 2026-10-18 rows in `docs/wip/BENCHMARKS.md` were taken that way.
 //!
 //! Run (release, quiesced): `cargo run -p slates-bridge-fuse --example shards_fs_bench --release`
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::indexing_slicing,
+  clippy::panic
+)]
 
-use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
 use slates_bridge_core::{Attachments, OpContext, Rights, View};
 use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
-use slates_bridge_fuse::shards_fs::{serve_one, write_shards_frame};
+use slates_bridge_fuse::shards_fs::{FRAME_BYTES, Frame, LENGTH_BYTES, Split, answer, split_frame};
 use slates_bridge_fuse::volume_bridge::VolumeBridge;
 use slates_db::catalog::{Principal, VolumeId};
 use slates_mem::arena::ChunkArena;
@@ -37,47 +45,6 @@ const CREATES: usize = 2_000;
 /// `open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)` sends.
 const CREATE_FLAGS: u32 = 0o1 | 0o100 | 0o1000;
 
-/// A reusable in-memory duplex (see `tests/shards_fs.rs`): `serve_one` reads the request from `inbox` and appends the
-/// reply to `outbox`; `load` resets it with the next framed request so each timed call starts clean.
-#[derive(Default)]
-struct MemDuplex {
-  inbox: Vec<u8>,
-  pos: usize,
-  outbox: Vec<u8>,
-}
-
-impl MemDuplex {
-  fn load(&mut self, framed_request: &[u8]) {
-    self.inbox.clear();
-    self.inbox.extend_from_slice(framed_request);
-    self.pos = 0;
-    self.outbox.clear();
-  }
-}
-
-impl Read for MemDuplex {
-  fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-    let avail = self.inbox.get(self.pos..).unwrap_or_default();
-    let n = avail.len().min(buf.len());
-    buf
-      .get_mut(..n)
-      .unwrap_or_default()
-      .copy_from_slice(avail.get(..n).unwrap_or_default());
-    self.pos += n;
-    Ok(n)
-  }
-}
-
-impl Write for MemDuplex {
-  fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-    self.outbox.extend_from_slice(buf);
-    Ok(buf.len())
-  }
-  fn flush(&mut self) -> std::io::Result<()> {
-    Ok(())
-  }
-}
-
 fn message(opcode: u32, unique: u64, nodeid: u64, body: &[u8]) -> Vec<u8> {
   let total = IN_HEADER_LEN + body.len();
   let mut m = vec![0u8; total];
@@ -90,45 +57,48 @@ fn message(opcode: u32, unique: u64, nodeid: u64, body: &[u8]) -> Vec<u8> {
 }
 
 fn framed(request: &[u8]) -> Vec<u8> {
-  let mut v = Vec::new();
-  write_shards_frame(&mut v, request).unwrap();
-  v
+  let mut frame = u32::try_from(request.len()).unwrap().to_le_bytes().to_vec();
+  frame.extend_from_slice(request);
+  frame
 }
 
-/// Serves `request` once and returns the reply's bytes (unframed).
+/// One frame as the daemon serves it from the bytes it read: split, then answered into `frame`, the reply frame at its
+/// head. The reply frame's length, its length word included.
+fn serve(
+  framed_request: &[u8],
+  bridge: &mut VolumeBridge<'_>,
+  cx: &OpContext,
+  frame: &mut Vec<u8>,
+) -> usize {
+  let Ok(Split::Whole(Frame::Request(request), _)) = split_frame(framed_request, FRAME_BYTES)
+  else {
+    panic!("a whole request frame");
+  };
+  answer(request, bridge, cx, frame).frame
+}
+
+/// Serves `framed_request` once and returns the reply's bytes, without the length word.
 fn once(
-  duplex: &mut MemDuplex,
   bridge: &mut VolumeBridge<'_>,
   cx: &OpContext,
   framed_request: &[u8],
-  reply: &mut [u8],
+  frame: &mut Vec<u8>,
 ) -> Vec<u8> {
-  duplex.load(framed_request);
-  serve_one(duplex, bridge, cx, reply).unwrap();
-  let frame = &duplex.outbox;
-  let len = u32::from_le_bytes(
-    frame
-      .get(0..4)
-      .unwrap_or(&[0; 4])
-      .try_into()
-      .unwrap_or([0; 4]),
-  ) as usize;
-  frame.get(4..4 + len).unwrap_or_default().to_vec()
+  let used = serve(framed_request, bridge, cx, frame);
+  frame[LENGTH_BYTES..used].to_vec()
 }
 
 /// Best-of-N wall-clock of serving one framed request.
 fn best(
-  duplex: &mut MemDuplex,
   bridge: &mut VolumeBridge<'_>,
   cx: &OpContext,
   framed_request: &[u8],
-  reply: &mut [u8],
+  frame: &mut Vec<u8>,
 ) -> Duration {
   let mut best = Duration::MAX;
   for _ in 0..N {
-    duplex.load(framed_request);
     let start = Instant::now();
-    serve_one(duplex, bridge, cx, reply).unwrap();
+    serve(framed_request, bridge, cx, frame);
     best = best.min(start.elapsed());
   }
   best
@@ -187,7 +157,7 @@ fn main() {
     .unwrap();
   let cx: OpContext = attachments.context(id).unwrap();
 
-  let mut reply = vec![0u8; (1 << 20) + (1 << 16)];
+  let mut frame = Vec::new();
 
   // INIT once (negotiate), then LOOKUP + OPEN to get a nodeid and a file handle for the READ bench.
   let mut init = Vec::new();
@@ -196,30 +166,26 @@ fn main() {
   }
   init.resize(64, 0);
 
-  let mut duplex = MemDuplex::default();
   let _ = once(
-    &mut duplex,
     &mut bridge,
     &cx,
     &framed(&message(Opcode::Init as u32, 1, 0, &init)),
-    &mut reply,
+    &mut frame,
   );
   let look = once(
-    &mut duplex,
     &mut bridge,
     &cx,
     &framed(&message(Opcode::Lookup as u32, 2, 1, b"hello\0")),
-    &mut reply,
+    &mut frame,
   );
   let nodeid = u64::from_le_bytes(look[OUT_HEADER_LEN..OUT_HEADER_LEN + 8].try_into().unwrap());
   let mut open_in = 0u32.to_le_bytes().to_vec();
   open_in.extend_from_slice(&[0u8; 4]);
   let opened = once(
-    &mut duplex,
     &mut bridge,
     &cx,
     &framed(&message(Opcode::Open as u32, 3, nodeid, &open_in)),
-    &mut reply,
+    &mut frame,
   );
   let fh = u64::from_le_bytes(
     opened[OUT_HEADER_LEN..OUT_HEADER_LEN + 8]
@@ -235,19 +201,19 @@ fn main() {
   let read = framed(&message(Opcode::Read as u32, 12, nodeid, &read_in));
 
   println!(
-    "shards_fs mediated serve latency (best of {N}, in-memory duplex; framing + dispatch, no OS I/O):"
+    "shards_fs mediated serve latency (best of {N}, split_frame + answer over bytes in memory; no OS I/O):"
   );
   println!(
     "  GETATTR (root)      {:?}",
-    best(&mut duplex, &mut bridge, &cx, &getattr, &mut reply)
+    best(&mut bridge, &cx, &getattr, &mut frame)
   );
   println!(
     "  LOOKUP  (hello)     {:?}",
-    best(&mut duplex, &mut bridge, &cx, &lookup, &mut reply)
+    best(&mut bridge, &cx, &lookup, &mut frame)
   );
   println!(
     "  READ    ({FILE_BYTES} B)      {:?}",
-    best(&mut duplex, &mut bridge, &cx, &read, &mut reply)
+    best(&mut bridge, &cx, &read, &mut frame)
   );
 
   // CREATE is the write path's head and the slowest op a real mount shows (276.9 µs p50 through Linux FUSE,
@@ -272,9 +238,8 @@ fn main() {
     .collect();
   let mut took: Vec<Duration> = Vec::with_capacity(CREATES);
   for request in &creates {
-    duplex.load(request);
     let at = Instant::now();
-    serve_one(&mut duplex, &mut bridge, &cx, &mut reply).unwrap();
+    serve(request, &mut bridge, &cx, &mut frame);
     took.push(at.elapsed());
   }
   took.sort_unstable();

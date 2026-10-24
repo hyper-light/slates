@@ -396,8 +396,9 @@ box shared with two other builds — timings are not benchmarks)
    session's writes stay inside its own volume or clone; and nothing breaks when the daemon or the guest goes away.
    Firecracker's piece, a snapshot presented as a disk-image file and merged back, is built (above).
 
-   **slates' direct connection** (the VM's virtio-fs device talking to slates itself, built in-process as
-   `attach_vhost_user_device` and `shards_fs::serve`) is kept as a later optimization: it removes the host's
+   **slates' direct connection** (the VM's virtio-fs device talking to slates itself: `attach_vhost_user_device`
+   in-process, and since 2026-10-24 the daemon's Shards stream handed out by `slates shards`, A-161) is kept as a
+   later optimization: it removes the host's
    filesystem layer and lets DAX map slates' own memory with no copy. It is not needed for any target to work.
    Two designs for it were written and withdrawn on 2026-10-21: handing slates a socket from the launcher (which
    had no answer on macOS), then a slates-owned listener (Ada asked why another socket was needed when NFS has
