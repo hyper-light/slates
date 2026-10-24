@@ -11061,9 +11061,10 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   evidence of absence under that stress, not a proof; the mapping path shares the mechanism but was not the one driven.
 - **Step 4 built (2026-10-24):** `slates shards ID [--subtree DIR] [--read-only] --fd N -- CMD` runs a program with the
   end at descriptor `N`, keeping no copy, so the attachment ends when the program's end closes; the program's exit code
-  is the command's. A reader re-invoked under it mounts and reads a file byte-equal through descriptor 7, and a program
-  that closes its end sees its attachment gone while it still runs (`crates/cli/tests/cli.rs`; macOS arm64 and Linux
-  x86_64; red-checked by leaking the parent's copy). `Client::attach_shards` compiles everywhere and Windows refuses
+  is the command's. A reader re-invoked under it mounts and reads a file byte-equal through descriptor 7; a program
+  that closes its end sees its attachment gone while it still runs; and with `slates shards` killed (`SIGKILL`) while
+  its program waits, the attachment holds and the orphaned program still reads through its end
+  (`crates/cli/tests/cli.rs`; macOS arm64 and Linux x86_64; red-checked by leaking the parent's copy). `Client::attach_shards` compiles everywhere and Windows refuses
   the form by kind, `DescriptorRouteNotBuilt`, tested on both Windows CI lanes.
 - **Fixed on the way: a spawn could report a program that never ran** (`slates_ipc::stream::spawn_with`, before it
   shipped): the standard library's exec-error pipe could be given the number the end was asked at, and the child's

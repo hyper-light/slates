@@ -12249,9 +12249,10 @@ Applied in the same change to:
     (`crates/cli/tests/cli.rs`) runs a real anchor: a reader, the test binary re-invoked under `slates shards --fd 7`,
     mounts the attachment over descriptor 7 (`INIT`, `LOOKUP`, `OPEN`, `READ`, `RELEASE`) and prints what it read,
     byte-equal to the file; the attachment it ran under is gone once it exits; a program that exits 7 makes the command
-    exit 7; a program that closes its end and waits sees its attachment gone while it and the command still run; a
-    missing volume is refused (exit 1), a program that cannot run fails (exit 4) with its attachment ended, and
-    `--fd 2` is usage (exit 2). Passed on macOS arm64 (4.6–6.6 s, load 8.6) and Linux x86_64 (adacachy, 0.39 s, load
+    exit 7; a program that closes its end and waits sees its attachment gone while it and the command still run; with
+    `slates shards` killed (`SIGKILL`) while its program waits, the attachment holds and the orphaned program mounts and
+    reads the file through its end afterwards, its exit then ending the attachment; a missing volume is refused
+    (exit 1), a program that cannot run fails (exit 4) with its attachment ended, and `--fd 2` is usage (exit 2). Passed on macOS arm64 (4.6–6.6 s, load 8.6) and Linux x86_64 (adacachy, 0.39 s, load
     20–31). Red-checked on macOS: with `spawn_with` leaking the parent's copy, the attachment outlived the end that
     closed (failed after `WAIT_FOR`, 10 s) while the reader's and the silent program's checks still passed, which is why
     the waiting program is there.

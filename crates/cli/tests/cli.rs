@@ -1865,6 +1865,10 @@ const SHARDS_ROLE: &str = "SLATES_CLI_TEST_SHARDS_ROLE";
 const SHARDS_ROLE_FD: &str = "SLATES_CLI_TEST_SHARDS_FD";
 /// Format: see [`SHARDS_ROLE`].
 const SHARDS_ROLE_PATH: &str = "SLATES_CLI_TEST_SHARDS_PATH";
+/// Format: set, the reader prints its pid and waits for a line on its standard input before it reads (the chaos case).
+const SHARDS_ROLE_WAIT: &str = "SLATES_CLI_TEST_SHARDS_WAIT";
+/// Format: the tag before the waiting reader's pid, so a test whose `slates shards` it killed can still end the reader.
+const READER_PID_TAG: &str = "shards-reader-pid: ";
 /// Format: this test's name, which the re-invoked binary is told to run (`--exact`), so the run plays the reader.
 const SHARDS_TEST: &str =
   "slates_shards_hands_a_program_a_working_stream_end_and_the_attachment_ends_with_it";
@@ -1904,7 +1908,81 @@ fn slates_shards_hands_a_program_a_working_stream_end_and_the_attachment_ends_wi
   a_reader_reads_the_file_through_its_end(&instance, &id, &before);
   a_silent_program_exits_and_ends_its_attachment(&instance, &id, &before);
   the_attachment_ends_when_the_end_closes_while_the_command_runs(&instance, &id, &before);
+  a_reader_outlives_its_killed_command(&instance, &id, &before);
   the_refusals_leave_no_attachment(&instance, &id, &before);
+}
+
+/// The waiting reader, ended when dropped: its `slates shards` is killed, so nothing else would end it. Disarmed once
+/// the reader has printed what it read, after which it exits by itself, so its pid, free to be reused, is never
+/// signalled.
+struct Orphan(Option<u32>);
+
+impl Orphan {
+  fn disarm(&mut self) {
+    self.0 = None;
+  }
+}
+
+impl Drop for Orphan {
+  fn drop(&mut self) {
+    if let Some(pid) = self.0 {
+      let _ = rustix::process::kill_process(
+        rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap(),
+        rustix::process::Signal::KILL,
+      );
+    }
+  }
+}
+
+/// Chaos: `slates shards` is killed (`SIGKILL`) while its program waits, holding the end. Expect the attachment to hold,
+/// since the end alone is its capability and the command kept no copy, and the orphaned program to mount and read the
+/// file through its end afterwards, byte-equal; then its exit ends the attachment.
+fn a_reader_outlives_its_killed_command(instance: &str, id: &str, before: &str) {
+  use std::io::{BufRead, Write};
+  let mut command = Running(
+    shards_command(instance, id)
+      .arg(std::env::current_exe().unwrap())
+      .args(["--exact", SHARDS_TEST, "--nocapture"])
+      .env(SHARDS_ROLE, "reader")
+      .env(SHARDS_ROLE_FD, HANDED_FD)
+      .env(SHARDS_ROLE_PATH, "hello.txt")
+      .env(SHARDS_ROLE_WAIT, "1")
+      .stdin(Stdio::piped())
+      .stdout(Stdio::piped())
+      .spawn()
+      .unwrap(),
+  );
+  let mut input = command.0.stdin.take().unwrap();
+  let mut lines = std::io::BufReader::new(command.0.stdout.take().unwrap()).lines();
+  let (mut attachment, mut reader) = (None, None);
+  while reader.is_none() {
+    let line = lines.next().unwrap().unwrap();
+    if let Some(number) = line.strip_prefix("attachment: ") {
+      attachment = Some(number.to_owned());
+    }
+    reader = line
+      .strip_prefix(READER_PID_TAG)
+      .map(|pid| Orphan(Some(pid.parse().unwrap())));
+  }
+  let (attachment, mut reader) = (attachment.unwrap(), reader.unwrap());
+  command.0.kill().unwrap();
+  command.0.wait().unwrap();
+  assert_eq!(
+    attachments_of(instance, id),
+    (before.parse::<u32>().unwrap() + 1).to_string(),
+    "attachment {attachment} holds while its program holds the end, its command killed"
+  );
+  writeln!(input, "go").unwrap();
+  let read = lines
+    .find_map(|line| line.ok()?.strip_prefix(READ_TAG).map(str::to_owned))
+    .expect("the orphaned reader printed what it read");
+  reader.disarm();
+  assert_eq!(
+    unhex(&read),
+    SHARDS_FILE,
+    "the orphaned reader read the file's bytes through its end"
+  );
+  the_attachment_ends(instance, id, before, &attachment);
 }
 
 /// Format: the line the waiting program prints once it has closed its end.
@@ -2114,6 +2192,13 @@ fn shards_reader() {
   // so this is its one owner.
   let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(number) };
   stream.set_read_timeout(Some(WAIT_FOR)).unwrap();
+  if std::env::var_os(SHARDS_ROLE_WAIT).is_some() {
+    use std::io::Write;
+    println!("{READER_PID_TAG}{}", std::process::id());
+    std::io::stdout().flush().unwrap();
+    let mut go = String::new();
+    std::io::stdin().read_line(&mut go).unwrap();
+  }
   let mut device = ShardsDevice { stream, unique: 0 };
   let bytes = device.mount_and_read(&path);
   let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
