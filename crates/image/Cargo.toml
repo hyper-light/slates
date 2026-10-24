@@ -1,0 +1,23 @@
+[package]
+name = "slates-image"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "The disk-image form of a volume (§4.6, A-160): a snapshot's tree written as an ext2 image, which a VMM with no folder sharing (Firecracker) attaches as a block or pmem device, and an image read back for a merge, hostile-input safe. Pure: no I/O, never written to disk by slates."
+
+[dependencies]
+
+[dev-dependencies]
+slates-test-seeds = { workspace = true }
+proptest = { workspace = true }
+blake3 = { workspace = true }
+
+# The e2fsck differential hands e2fsprogs the image through a memory file, so nothing touches disk.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustix = { workspace = true }
+
+[lints]
+workspace = true

@@ -1505,6 +1505,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "slates-image"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "proptest",
+ "rustix",
+ "slates-test-seeds",
+]
+
+[[package]]
 name = "slates-ipc"
 version = "0.1.0"
 dependencies = [

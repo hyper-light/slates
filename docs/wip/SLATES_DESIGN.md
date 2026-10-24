@@ -12021,6 +12021,52 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
 
+### A-160 — A volume's disk-image form: ext2, written in bounded steps, read back as hostile input (accepted 2026-10-23)
+Applied in the same change to:
+- `crates/image` (new): `format.rs`, `tree.rs`, `layout.rs`, `write.rs`, `read.rs`, `error.rs`; the tests
+  `round_trip.rs`, `layout.rs`, `hostile.rs`, `e2fsck.rs`;
+- the workspace manifest and `unsafe-budget.toml` (`slates-image = 0`);
+- GAPS (the owed item "Firecracker's disk-image form", now in progress).
+
+- **What it answers.** Firecracker shares no folder with its guest. It has no virtio-fs, only block and pmem devices
+  backed by files (its v1.17.0 docs, read 2026-10-23), so a volume reaches a Firecracker guest only as an image file
+  holding a file system (`docs/wip/virtiofs.md` §8 item 7). The guest's writes come back by reading that file system
+  out of the image and merging what changed into a clone, slates' usual session.
+- **The format.** ext2 revision 1: 4 KiB blocks, 256-byte inodes, and only the `filetype`, `sparse_super` and
+  `large_file` features, the set `mkfs.ext2 -O ^resize_inode,^dir_index,^ext_attr` makes.
+  - Every Linux guest mounts it read-write, through the ext2 driver or the ext4 driver that serves ext2 on kernels
+    built with `CONFIG_EXT4_USE_FOR_EXT2`.
+  - Its large inodes carry nanosecond times, and its 4 KiB blocks are the page size DAX on a pmem device needs.
+  - ext4 was not chosen: nothing here needs a journal, extents or checksums, and each would be more for the reader to
+    distrust. A format of slates' own was not either: the guest's kernel must mount the image with no driver slates
+    ships.
+  - No `lost+found` is made: `e2fsck -fn` passes without one, so the guest sees exactly the volume.
+- **Writing** lays the whole image out first: the geometry, a single allocation cursor through the groups' data areas,
+  and each node's blocks in ext2's classic order (each indirect block before the data it maps). It then writes in
+  steps a caller bounds. One tree and one identity always make the same bytes.
+- **Reading** treats the image as hostile: the superblock must be what the writer writes and cleanly unmounted, each
+  group's structures must lie inside it, every block pointer inside the file system, and every directory record must
+  fit its block. The walk refuses a directory named twice (a cycle) and holds its entries to the caller's bound.
+- **Evidence (2026-10-23).**
+  - Generated trees round-trip exactly at the format's precision (proptest, 96 cases a run). The oracle is not
+    vacuous: dropping the high 16 bits of each uid fails it at once, shrunk to one directory owned by uid 65536.
+  - The block map fills its slots once each with every indirect block first, through the triple-indirect level.
+  - The determinism gate holds, and the golden digest is the same on macOS arm64 and Linux x86_64.
+  - 43,264 single-bit flips of the superblock, the first group descriptor, the root inode and the root directory block
+    each give a tree or a typed refusal; each targeted corruption is refused by its own kind.
+  - `e2fsck -fn` passes every written image, and `debugfs` lists every directory and reads files as written (e2fsprogs
+    1.47.4 on the box). Each link count raised by one fails it.
+- **What the differential found.**
+  - A writer bug: group descriptors ran 36 bytes, not 32, so every group past the first was misread. A round trip whose
+    inodes span groups was red before the fix and green after, and the reader now refuses a group's structures outside
+    it.
+  - An e2fsprogs bug: e2fsck 1.47.4 deadlocks in pass 5 (`pthread_mutex_lock` under `io_channel_set_options`, from
+    `ext2fs_rw_bitmaps`) when it would write a fix to an image opened read-only, and ignores the `SIGTERM` meant to
+    stop it. Each e2fsprogs run is bounded with `timeout --kill-after`.
+- **Not carried:** extended attributes, birth times (the change time stands in), and holes (a sparse file takes its
+  length; its zero blocks are left unwritten). Times outside 1901–2446 are refused.
+- **Owed:** the daemon's `image build` and `image merge` (sliced, into a clone), and the real Firecracker run.
+
 ### A-159 — The bootstrap header no longer carries the daemon's process id (accepted 2026-10-23)
 Applied in the same change to:
 - `crates/ipc/src/rendezvous.rs` (macOS and Windows): `AT_DAEMON_PID` and its write in `Listener::open` removed; the

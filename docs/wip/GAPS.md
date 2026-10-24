@@ -10937,7 +10937,20 @@ without a user namespace, which needs root.
 - **Owed:**
   - Shards' DAX window over the macOS mount;
   - Firecracker's disk-image form. crosvm's experimental `--pmem-ext2` is prior art: it builds an ext2 file system in
-    memory from a host directory and presents it on a pmem device.
+    memory from a host directory and presents it on a pmem device. **In progress (A-160).** The format is built:
+    `crates/image` writes a tree as an ext2 image and reads one back, hostile-input safe. The daemon's `image build`
+    and `image merge` and the real Firecracker run are owed. Evidence so far, 2026-10-23:
+    - generated trees round-trip exactly, at the format's precision (96 cases a run);
+    - the block-map arithmetic is checked through the triple-indirect level;
+    - one tree writes the same bytes in any steps, the same on macOS arm64 and Linux x86_64 (a golden digest);
+    - every single-bit flip of the structures a reader trusts first gives a tree or a typed refusal (43,264 flips);
+    - `e2fsck -fn` passes every written image and `debugfs` lists and reads them as written (e2fsprogs 1.47.4).
+
+    The differential found a writer bug the round trip had missed: each group descriptor was 36 bytes, not 32, so every
+    group past the first was misread. It was fixed failing-test-first, and the reader now refuses a group's structures
+    outside it. A corrupt image also found an e2fsprogs bug: e2fsck 1.47.4 deadlocks on its own cache lock in pass 5
+    when it would write a fix to an image opened read-only. So the differential bounds every e2fsprogs run
+    (`timeout --kill-after`).
 
   AC-3.3's residual applies to a guest as to any map: a store into bytes another path is changing, made between the
   page's fetch and the change's delivery, is kept back.

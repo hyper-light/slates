@@ -349,3 +349,6 @@ slates-test-seeds = 0
 # `msync`, and one volatile read and one volatile write of a byte the map's bounds check has placed inside it. rustix's
 # map calls are unsafe by signature, and DAX is reached only through the map; the protocol it speaks is pure.
 slates-guest-probe = 5
+# slates-image (0): the disk-image form of a volume (A-160) is byte buffers built field by field and read by checked
+# offset (`format.rs`), with every block pointer range-checked before use; no casts, no maps, no FFI.
+slates-image = 0
