@@ -175,31 +175,42 @@ struct Timed {
 }
 
 /// The process's context switches (involuntary and voluntary: preempted, or made to wait in the kernel) and minor page
-/// faults so far.
-fn disturbances() -> (i64, i64) {
+/// faults so far, as `getrusage` counts them; `None` if it refuses.
+#[cfg(unix)]
+fn disturbances() -> Option<(i64, i64)> {
   let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
   // SAFETY: `getrusage` fills the `rusage` the pointer names and returns zero on success; the buffer is ours, fully
   // sized and zeroed before the call, and read only once it succeeded.
   let usage = unsafe {
     if libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) != 0 {
-      return (0, 0);
+      return None;
     }
     usage.assume_init()
   };
-  (
+  Some((
     usage.ru_nivcsw.saturating_add(usage.ru_nvcsw),
     usage.ru_minflt,
-  )
+  ))
+}
+
+/// The Unix twin's counts, which Windows has no `getrusage` for: `None`, so no slice is set aside as disturbed there and
+/// the disturbed columns read zero. The work units, each one's least time over the rounds, do not use them.
+#[cfg(not(unix))]
+fn disturbances() -> Option<(i64, i64)> {
+  None
 }
 
 impl Timed {
   /// Counts a slice of `took` whose units took `units`, begun when the disturbances read `before`.
-  fn slice(&mut self, took: Duration, before: (i64, i64), units: &[Duration]) {
+  fn slice(&mut self, took: Duration, before: Option<(i64, i64)>, units: &[Duration]) {
     self.total += took;
     self.slices += 1;
     self.units.extend_from_slice(units);
-    let (switches, faults) = disturbances();
-    if switches > before.0 || faults > before.1 {
+    let disturbed = match (before, disturbances()) {
+      (Some(before), Some(after)) => after.0 > before.0 || after.1 > before.1,
+      _ => false,
+    };
+    if disturbed {
       self.disturbed += 1;
       self.longest_disturbed = self.longest_disturbed.max(took);
     } else {

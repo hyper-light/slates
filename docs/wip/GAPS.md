@@ -11027,6 +11027,16 @@ without a user namespace, which needs root.
 - **crosvm offers DAX on x86_64 only** (`cfg!(target_arch = "x86_64")`, TODO b/176129399, at 1c8d17a85). On an arm64
   host the mount route under crosvm runs without DAX.
 
+### 2026-10-24: a lease test assumes five takes finish inside a 20 ms term — open
+
+CI run 40077995650 (commit `6d993fdc`, the macOS lane) failed `landing::tests::a_take_releases_the_leases_whose_terms_
+have_ended` (`crates/server/src/landing.rs`): `left: 4, right: 5` at the count taken right after five leases of
+`SHORT_TERM_NS` (20 ms). One lease's term had ended before the count, so the five takes and the report took longer
+than 20 ms on the loaded runner; the next commit's run passed. The test's first count depends on the machine's speed:
+the property it states (a take releases leases whose terms have ended) needs only the count after the pause. Owed: a
+first count that cannot race the term (taken with a long term, or bounded by the measured time of the takes), failing
+test first with the clock stalled past the term between the takes.
+
 ### 2026-10-22: a CI daemon's boot was refused because one shard used no CPU for a whole second while it started — open, not reproduced
 
 CI run 39850734135 (commit `1e6d7253`, the Linux test lane) failed
