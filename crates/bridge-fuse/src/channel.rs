@@ -36,7 +36,7 @@ use rustix::fs::{Mode, OFlags};
 
 use crate::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
 use crate::allocate::{Allocation, Begun};
-use crate::bridge::{Bridge, KernelChange};
+use crate::bridge::{Bridge, KernelChange, reply_error};
 use crate::coherence::{
   Coherence, Delivered, KernelHolds, MOST_ADDED_BY_AN_UPDATE, OwnRecords, PageStates, RANGE_BYTES,
   WritableOpens,
@@ -1668,17 +1668,6 @@ fn serve_request(
   }
   state.coherence.served_own_request(bridge, cx, delivered);
   Ok((delivered, error))
-}
-
-/// The errno a reply carries (`fuse_out_header.error`, negated on the wire), as a positive number;
-/// zero for success or for no reply.
-fn reply_error(reply: &[u8]) -> i32 {
-  /// Format: `fuse_out_header`: `len` (u32) then `error` (i32) — the errno field's offset.
-  const ERROR_AT: usize = size_of::<u32>();
-  reply
-    .get(ERROR_AT..ERROR_AT.saturating_add(size_of::<i32>()))
-    .and_then(|bytes| bytes.try_into().ok())
-    .map_or(0, |bytes| i32::from_le_bytes(bytes).saturating_neg())
 }
 
 /// A request served by [`dispatch_ready`] whose reply waits for its owner: the opcode, the round delivered

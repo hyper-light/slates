@@ -554,7 +554,7 @@ pub(crate) fn revoke_attachment_device(s: &ShardState, attachment: u64) -> bool 
 
 impl Daemon {
   /// The runtime shard that owns `volume`, or the typed refusal when the partition has no shard.
-  fn owner_shard(&self, volume: VolumeId) -> Result<u16, ServerError> {
+  pub(crate) fn owner_shard(&self, volume: VolumeId) -> Result<u16, ServerError> {
     let partition = owner_of(volume);
     self
       .shards()

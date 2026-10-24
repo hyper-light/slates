@@ -96,8 +96,9 @@ pub async fn readable(raw: i32) -> Result<(), RtError> {
   .await
 }
 
-/// Awaits `raw`'s writability once (a real socket whose send buffer filled, or a connect in progress).
-pub(crate) async fn writable(raw: i32) -> Result<(), RtError> {
+/// Awaits `raw`'s writability once (a real socket whose send buffer filled, or a connect in progress; a Shards fs
+/// stream whose peer has not yet read a reply, `slates-server`'s `shards`).
+pub async fn writable(raw: i32) -> Result<(), RtError> {
   Ready {
     raw,
     direction: Direction::Writable,

@@ -251,6 +251,23 @@ pub fn needs_barrier(opcode: Option<Opcode>, error: i32) -> bool {
     )
 }
 
+/// The errno a reply carries (`fuse_out_header.error`, negated on the wire), as a positive number; zero for success
+/// or for no reply.
+pub fn reply_error(reply: &[u8]) -> i32 {
+  /// Format: `fuse_out_header`: `len` (u32) then `error` (i32) — the errno field's offset.
+  const ERROR_AT: usize = size_of::<u32>();
+  reply
+    .get(ERROR_AT..ERROR_AT.saturating_add(size_of::<i32>()))
+    .and_then(|bytes| bytes.try_into().ok())
+    .map_or(0, |bytes| i32::from_le_bytes(bytes).saturating_neg())
+}
+
+/// Whether a request of `opcode` is answered: every request but the forgets, which the kernel sends and never waits
+/// on (`include/uapi/linux/fuse.h`); an opcode this bridge does not know is answered too (`ENOSYS`).
+pub fn takes_reply(opcode: Option<Opcode>) -> bool {
+  !matches!(opcode, Some(Opcode::Forget | Opcode::BatchForget))
+}
+
 /// What [`reclaim_unreported`] gave back: the lookup references forgotten and the open handles released.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Reclaimed {

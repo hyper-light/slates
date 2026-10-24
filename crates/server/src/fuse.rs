@@ -43,9 +43,8 @@
 
 use std::collections::BTreeMap;
 
-use slates_bridge_core::scoped::ScopedBridge;
 use slates_bridge_core::volume_bridge::new_handle_store;
-use slates_bridge_core::{AttachmentId, Bridge, LostWrites, Rights, View, VolumeBridge};
+use slates_bridge_core::{AttachmentId, LostWrites, Rights, View, VolumeBridge};
 use slates_bridge_fuse::channel::{
   ChangeSignal, Dispatched, FuseChannel, Sent, ServeState, Step, Turn, Wake, dispatch_ready,
   reclaim_dispatched, redeliver_after_refusal, send_reply, serve_step,
@@ -476,29 +475,7 @@ fn established(s: &mut ShardState, pending: PendingAttach, mount: Mount) -> Repl
 
 /// A write intent's lease, taken before the mount, released when no attachment of the holder came of it.
 fn release_unmounted_lease(s: &mut ShardState, record: &AttachmentRecord) {
-  let holds_another = s
-    .db
-    .partition()
-    .attachments_of(record.volume)
-    .iter()
-    .any(|a| a.principal == record.principal);
-  let lease_is_ours = s
-    .db
-    .partition()
-    .volume(record.volume)
-    .and_then(|v| v.lease.as_ref())
-    .is_some_and(|l| l.holder == record.principal);
-  if !holds_another && lease_is_ours {
-    let now = s.clock.monotonic_ns();
-    let released = s.db.mutate(
-      &mut s.segment,
-      &Op::LeaseReleased {
-        volume: record.volume,
-      },
-      now,
-    );
-    crate::verbs::count_secondary(s, released);
-  }
+  crate::verbs::release_unrecorded_lease(s, record);
 }
 
 /// What one turn did.
@@ -725,7 +702,7 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
     )
     .with_lost_writes(&mut mount.lost);
     let mut scoped = None;
-    let served = scoped_or_whole(&mut bridge, &mut scoped, mount.scope);
+    let served = crate::verbs::scoped_or_whole(&mut bridge, &mut scoped, mount.scope);
     match kind {
       TurnKind::Request => dispatch_ready(
         &mut mount.channel,
@@ -812,19 +789,6 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
       .map_or(mount.seen, |slot| slot.volume.change_generation());
   }
   turned
-}
-
-/// The bridge a mount's requests are served through: held to `scope` when the mount presents one directory
-/// (AUD-29-76), else the volume's whole bridge. `scoped` is the caller's slot the scoped bridge lives in.
-fn scoped_or_whole<'a>(
-  bridge: &'a mut VolumeBridge<'_>,
-  scoped: &'a mut Option<ScopedBridge<'a>>,
-  scope: Option<u64>,
-) -> &'a mut dyn Bridge {
-  match scope {
-    Some(scope) => scoped.insert(ScopedBridge::new(bridge, scope)),
-    None => bridge,
-  }
 }
 
 /// Runs a dispatched request's barrier when it needs one, then writes its reply or `EIO`.
@@ -928,7 +892,7 @@ fn reclaim(s: &mut ShardState, mount: &mut FuseMount, dispatched: &Dispatched) {
   let reclaimed = reclaim_dispatched(
     &mut mount.serve,
     dispatched,
-    scoped_or_whole(&mut bridge, &mut scoped, mount.scope),
+    crate::verbs::scoped_or_whole(&mut bridge, &mut scoped, mount.scope),
     attachments,
     mount.registry,
   );
@@ -967,7 +931,7 @@ fn redeliver(s: &mut ShardState, mount: &mut FuseMount, dispatched: &Dispatched)
     &mount.channel,
     &mut mount.serve,
     dispatched,
-    scoped_or_whole(&mut bridge, &mut scoped, mount.scope),
+    crate::verbs::scoped_or_whole(&mut bridge, &mut scoped, mount.scope),
     attachments,
     mount.registry,
   );

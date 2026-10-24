@@ -92,6 +92,11 @@ pub mod peer;
 mod reap;
 pub mod seal_keys;
 mod snapshot_view;
+// The Shards fs transport (§4.6, the Shards route; A-161): a volume served to a Shards microVM over an anonymous
+// stream, on the volume's owning shard; it rides the runtime's Unix descriptor readiness, so it is gated like the
+// virtio-fs transport.
+#[cfg(unix)]
+pub mod shards;
 pub mod state;
 mod status_pages;
 pub mod takeover;

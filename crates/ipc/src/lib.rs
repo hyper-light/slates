@@ -47,6 +47,8 @@ pub mod rendezvous;
 
 pub mod slot;
 pub mod status;
+#[cfg(unix)]
+pub mod stream;
 pub mod wake;
 
 pub use delivery::{Capability, Delivered, Delivery, DeliveryFault};

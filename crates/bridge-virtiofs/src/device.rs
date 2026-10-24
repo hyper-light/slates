@@ -38,7 +38,7 @@ use std::fmt;
 use slates_bridge_core::{Bridge, OpContext};
 use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
 use slates_bridge_fuse::bridge::{
-  EIO, dispatch, needs_barrier, reclaim_unreported, success_reply_bytes,
+  EIO, dispatch, needs_barrier, reclaim_unreported, reply_error, success_reply_bytes, takes_reply,
 };
 use slates_bridge_fuse::init::{InitNegotiation, MAX_WRITE, negotiate};
 use slates_bridge_fuse::reply::ReplyHeader;
@@ -965,7 +965,7 @@ impl Device {
       .reply
       .get(..usize::try_from(written).ok()?)
       .unwrap_or(&[]);
-    (needs_barrier(opcode, reply_errno(reply)) || awaits_publication).then(|| AwaitingBarrier {
+    (needs_barrier(opcode, reply_error(reply)) || awaits_publication).then(|| AwaitingBarrier {
       queue,
       chain: chain.clone(),
       written,
@@ -1348,23 +1348,9 @@ impl Device {
   }
 }
 
-/// The errno a reply carries (`fuse_out_header.error`, negated on the wire), as a positive number; zero for
-/// success or for no reply.
-fn reply_errno(reply: &[u8]) -> i32 {
-  /// Format: `fuse_out_header`: `len` (u32) then `error` (i32) — the errno field's offset.
-  const ERROR_AT: usize = size_of::<u32>();
-  reply
-    .get(ERROR_AT..ERROR_AT.saturating_add(size_of::<i32>()))
-    .and_then(|bytes| bytes.try_into().ok())
-    .map_or(0, |bytes| i32::from_le_bytes(bytes).saturating_neg())
-}
-
-/// Whether a request of this header expects a reply: every opcode but the forgets.
+/// Whether a request of this header expects a reply: every opcode but the forgets ([`takes_reply`]).
 fn expects_reply(header: Option<&InHeader>) -> bool {
-  !matches!(
-    header.and_then(|h| Opcode::from_wire(h.opcode)),
-    Some(Opcode::Forget | Opcode::BatchForget)
-  )
+  takes_reply(header.and_then(|h| Opcode::from_wire(h.opcode)))
 }
 
 /// Copies the chain's readable ranges, in order, into one contiguous request buffer of `total`

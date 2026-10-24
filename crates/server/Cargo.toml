@@ -45,9 +45,9 @@ slates-bridge-virtiofs = { workspace = true }
 # The OCI attachment form (§4.6 A-9): a bind of the host mount (NFS loopback on macOS, FUSE on Linux)
 # verified against the kernel's mount table; there is no host mount on Windows to bind.
 slates-bridge-oci = { workspace = true }
-
-# The Linux FUSE transport the daemon serves (`crate::fuse`; §4.6 "Linux", AUD-29-64).
-[target.'cfg(target_os = "linux")'.dependencies]
+# The FUSE codec: the Linux FUSE transport the daemon serves (`crate::fuse`; §4.6 "Linux", AUD-29-64), and the
+# Shards fs transport (`crate::shards`; §4.6, A-161), which carries FUSE requests over a stream from a Linux or a
+# macOS host.
 slates-bridge-fuse = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]

@@ -6149,8 +6149,54 @@ fn commit_attachment(
   Ok(())
 }
 
+/// The bridge a transport's requests are served through: held to `scope` when the attachment presents one directory
+/// (AUD-29-76), else the volume's whole bridge. `scoped` is the caller's slot the scoped bridge lives in. Unix only: its
+/// callers are the FUSE mount and the Shards stream.
+#[cfg(unix)]
+pub(crate) fn scoped_or_whole<'a>(
+  bridge: &'a mut slates_bridge_core::VolumeBridge<'_>,
+  scoped: &'a mut Option<slates_bridge_core::scoped::ScopedBridge<'a>>,
+  scope: Option<u64>,
+) -> &'a mut dyn slates_bridge_core::Bridge {
+  match scope {
+    Some(scope) => scoped.insert(slates_bridge_core::scoped::ScopedBridge::new(bridge, scope)),
+    None => bridge,
+  }
+}
+
+/// Releases the write lease an attach took for `record` before the attachment it was for was recorded, when no other
+/// attachment of the holder came of it: the attach failed after its lease (a FUSE mount refused, a Shards stream that
+/// could not be served). A refused release is counted, never raised: the lease's own term ends it. Unix only, as its
+/// callers are.
+#[cfg(unix)]
+pub(crate) fn release_unrecorded_lease(state: &mut ShardState, record: &AttachmentRecord) {
+  let holds_another = state
+    .db
+    .partition()
+    .attachments_of(record.volume)
+    .iter()
+    .any(|a| a.principal == record.principal);
+  let lease_is_ours = state
+    .db
+    .partition()
+    .volume(record.volume)
+    .and_then(|v| v.lease.as_ref())
+    .is_some_and(|l| l.holder == record.principal);
+  if !holds_another && lease_is_ours {
+    let now = state.clock.monotonic_ns();
+    let released = state.db.mutate(
+      &mut state.segment,
+      &Op::LeaseReleased {
+        volume: record.volume,
+      },
+      now,
+    );
+    count_secondary(state, released);
+  }
+}
+
 /// Whether `rights` permit an attach with `intent`.
-fn permits(rights: Rights, intent: Intent) -> bool {
+pub(crate) fn permits(rights: Rights, intent: Intent) -> bool {
   match intent {
     Intent::Read => rights.read,
     Intent::Write => rights.write,
@@ -6159,7 +6205,7 @@ fn permits(rights: Rights, intent: Intent) -> bool {
 
 /// The write lease an attach with `intent` takes (D-16): none for a read, the volume's lease for a write
 /// (its epoch), or the refusal when another principal holds it unexpired.
-fn lease_for(
+pub(crate) fn lease_for(
   state: &mut ShardState,
   record: &VolumeRecord,
   principal: &Principal,
@@ -6358,7 +6404,7 @@ pub(crate) fn consumer_of(form: &AttachRequest, client_id: u32) -> Result<Consum
 /// capability presents a read-only view whatever the principal could otherwise do (the NFS edge maps
 /// the record's rights, never the principal's). `admin` is never an attachment's: the admin verbs act on
 /// the volume by principal, not through an attachment.
-fn granted_rights(rights: Rights, intent: Intent) -> Rights {
+pub(crate) fn granted_rights(rights: Rights, intent: Intent) -> Rights {
   Rights {
     read: rights.read,
     write: rights.write && intent == Intent::Write,
@@ -6645,6 +6691,10 @@ pub(crate) fn end_attachment(
   if !a_device_closes_the_view {
     crate::snapshot_view::end(state, record.id);
   }
+  // A Shards stream's record ends its stream: its task wakes on the stream's own end and sweeps what its guest held
+  // (`crate::shards`). Every end, not only a detach: nothing beneath the stream is exposed by ending it.
+  #[cfg(unix)]
+  crate::shards::end_stream(state, record.id);
   // A FUSE mount of the attachment is unmounted only when its user detached it; the kernel's disconnect then ends
   // its serve task. Any other end leaves the mount in place, its requests refused under the revoked registry
   // attachment below until its user unmounts it: an unmount nobody asked for lets the next write by path land on

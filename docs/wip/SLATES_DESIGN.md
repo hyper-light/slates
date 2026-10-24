@@ -3331,6 +3331,31 @@ indirect blocks are computed one at a time, and the longest unit measured was 18
 > (`crates/cli/tests/guest_image.rs`, gated). Not carried: extended attributes, birth times, holes. Not yet run: a pmem
 > drive (DAX on the image file). The details and the evidence are A-160's.
 
+**A Shards microVM: the fs stream form (A-161).** Shards' VMM forwards each guest FUSE request to a backend over a Unix
+stream it is handed: one request framed as a little-endian length, one reply frame back, and control asks of its own
+marked by the length word's top bit (its fs device). Its VM process is App-Sandboxed on macOS and cannot open a socket,
+so the backend's end reaches it as a descriptor. The daemon is that backend:
+- an attach with the Shards form (a directory or the whole volume, for reading or for writing within the principal's
+  rights, a write taking the lease) makes an anonymous socket pair, records the attachment (`AttachForm::ShardsFs`,
+  a guest's) and serves its end on the volume's owner shard; the other end is the attachment's capability, handed to
+  whoever attached;
+- a stream end may go to a VMM where a content object may not (A-135): the daemon answers nothing on it but the one
+  attachment;
+- requests are answered by the shared FUSE dispatch, a durable change published before its reply as a virtio-fs
+  guest's is, and the guest is revalidated, having no path for an invalidation;
+- a read is answered with every byte it asks, never cut to a buffer, since a short read is the file's end to the
+  guest's kernel;
+- control asks are refused in Shards' own forms, a DAX window's descriptor ask with `EOPNOTSUPP`, so a share is
+  launched without a window until a backing that authorizes only the attachment's bytes exists;
+- the peer's close, a hostile frame, a detach, a revocation, the volume's destroy and the daemon's stop end the
+  attachment one way: its references swept, its record removed. Nothing survives a restart.
+
+> **Status (2026-10-24).** Built and proven by use, in-process: `crates/server/src/shards.rs` (the serve task),
+> `crates/ipc/src/stream.rs` (the pair), `crates/bridge-fuse/src/shards_fs.rs` (the frames and their answers),
+> `Daemon::attach_shards_stream`, with seven tests against a real daemon (`crates/server/tests/shards.rs`). Not yet: the
+> stream's delivery over the wire (Linux's control socket, the macOS socket route), the client and the CLI, a real
+> Shards boot against the daemon, and DAX. The details and the evidence are A-161's.
+
 **Writeback and snapshot barrier.** Kernel/guest cache negotiation changes when writes reach
 the owner. `snapshot`, `submit`, `advance`, clean `detach`, migration and archive must identify
 the set of contributing writable attachments, stop admission into the closing generation,
@@ -12044,6 +12069,81 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
+
+### A-161 — A Shards microVM's fs device is served by the daemon over an anonymous stream (accepted 2026-10-24)
+Applied in the same change to:
+- `crates/ipc/src/stream.rs` (new): the anonymous pair, its send, receive and end;
+- `crates/bridge-fuse`: `shards_fs.rs` (the control frame and its asks, `split_frame`, `answer`, `refuse`,
+  `read_ceiling`, the refusals in Shards' forms), `bridge.rs` (`reply_error` and `takes_reply`, now shared by the FUSE
+  channel and the virtio-fs device, whose private copies are gone);
+- `crates/db/src/catalog.rs`: `AttachForm::ShardsFs`, appended;
+- `crates/rt/src/readiness.rs`: `writable` is public;
+- `crates/server`: `shards.rs` (new), `state.rs`, `daemon.rs` (`EndStreams`), `verbs.rs` (`end_attachment` ends a
+  stream; `scoped_or_whole` and `release_unrecorded_lease` shared with the FUSE mount), `virtiofs.rs` (`owner_shard`
+  shared), `Cargo.toml` (the FUSE codec a Unix dependency); the test `tests/shards.rs` (new);
+- §4.6, GAPS.
+
+- **What it answers.** Shards' fs device forwards each guest FUSE request to a backend over a Unix stream it is handed
+  (Shards' `gpu` branch at 0e8f2d6f, `crates/vmm/src/devices/virtio/fs/mod.rs`, read 2026-10-24):
+  - a request is a frame, a little-endian length then the request, and every request gets one reply frame back, an
+    empty one for a request that takes no reply;
+  - the device's own asks are control frames, the length word's top bit set: its backend's tables for a snapshot of
+    the VM and their restore (its D176), and a file's descriptor for a DAX window's mapping (its D189), answered as a
+    `shards_ipc` message;
+  - the VM process is App-Sandboxed on macOS, so an unsandboxed spawner connects and hands it the descriptor.
+
+  The daemon was not that backend: a one-file example served a volume outside it (2026-10-21). Now an attach with the
+  Shards form makes a socket pair with no name and nothing on disk (R1), records the attachment as a guest's, and
+  serves its end on the volume's owner shard until it ends.
+- **Why a stream end may go to a VMM.** A descriptor handed to a peer authorizes its whole object (A-135), so the
+  content object is never handed to a VMM. A stream end carries only the conversation the daemon answers on it, which
+  is one attachment's: the end is the attachment's capability, with the rights and the directory the attach recorded.
+- **How it is served.** Each frame's length is bounded by the largest frame (`MAX_WRITE` and a page of headers) before
+  anything is allocated for it. A request is answered through a transient `VolumeBridge` (a `ScopedBridge` for a
+  directory) under the attachment's registry entry, with its own open-handle map. A change that must survive a restart
+  publishes the shard before its reply, as a virtio-fs guest's does (AUD-29-82); a refused or uncaptured publication
+  answers `EIO`, and what the reply granted is given back. The guest is revalidated, having no invalidation path. A
+  reply the peer has not read waits for the end's writability before the next request is read, so a peer that never
+  reads holds one reply, never a queue. A shard serves at most its client seats of streams (`clients_per_shard`).
+- **A read is never cut short.** A short read is the file's end to a FUSE client, which then shrinks the size it
+  caches. A guest asks for up to its page count in its own pages, and `INIT`'s count follows the host's page, so a
+  guest with larger pages than its host asks more than the count suggests. The reply buffer grows to the read asked, up
+  to the most any guest can ask (`read_ceiling`: the count `INIT` names, or the kernel's default 32, in 64 KiB pages),
+  and falls back to one largest frame once the reply is out. A read past the ceiling is answered `EIO`.
+- **The control asks are refused in Shards' forms.** slates keeps no tables a VM's snapshot can carry, and a file's
+  descriptor would be the content object (A-135): a snapshot's or a restore's ask is answered with a control frame
+  whose first byte is not zero and its reason, a descriptor ask with a `shards_ipc` message of kind 1 carrying Linux's
+  `EOPNOTSUPP`. A share served by slates is launched without a DAX window until part 3's backing exists.
+- **How it ends.** The peer's close, a frame refused as hostile, a stream error, a detach, a revocation, the volume's
+  destroy and the daemon's stop all end it one way: the references the guest still holds are swept (a guest sends no
+  forget per reference at its end), the registry entry revoked and drained, the descriptor closed, the record removed.
+  Anything but the stream ends the stream first (`shutdown` on the daemon's end), so the task wakes on its own
+  readiness. A record a dead daemon left is ended by recovery, as every guest's is.
+- **Evidence, 2026-10-24.** `crates/server/tests/shards.rs` drives a real daemon over the end a VMM would be handed,
+  checking every change through the daemon's NFS port:
+  - a guest's history (`INIT`, `CREATE`, `WRITE`, close, `LOOKUP`, `OPEN`, `READ`, `FORGET`, `RENAME`, `UNLINK`) is
+    the volume the host sees, bytes crossing both ways;
+  - a read-only stream refuses every change and nothing lands;
+  - a scoped stream serves its directory as its root, and its `..` is itself;
+  - a closed end ends the attachment and releases the lease; a detach ends the stream;
+  - an acknowledged close survives a daemon restart, and the stream does not;
+  - a closed stream gives back the bytes of a removed file its guest still held;
+  - Shards' control asks are answered in its forms, and a frame past the bound or a control frame with no ask ends
+    only its own stream, while another on the volume keeps serving.
+
+  Seven of seven pass on macOS arm64 and on Linux x86_64 (the fedora runner, epoll), where a peer's write after the
+  daemon ends its side answers `EPIPE` at once and macOS takes it until the descriptor closes (both asserted in
+  `crates/ipc/src/stream.rs`). Red-checked on macOS: without the sweep the bytes stay referenced (262,144 → 262,144);
+  without the barrier the restarted daemon has no file; with the detach hook disabled the guest's read waits out its
+  five seconds.
+- **Found on the way, recorded in GAPS, not changed here:** a read-only attachment grants a write-mode open and answers
+  each write `EPERM` on every FUSE transport, and NFS answers `PERM`, where a read-only file system answers `EROFS` at
+  the open; `INIT`'s page count follows the host's page, so a 4 KiB-page guest of a 16 KiB-page Mac is told 16 pages,
+  64 KiB a request, a quarter of the largest write.
+- **Owed:** the stream's delivery over the wire (Linux's control socket by `SCM_RIGHTS`; macOS's socket route, its
+  exchange encrypted and authenticated), the client's and the CLI's attach, a Windows refusal, Shards' own
+  `--slates-fs-fd` on its current branch and a real boot (part 2), and a DAX window over a backing that authorizes only
+  the attachment's bytes (part 3). The one-file example and its blocking helpers go once the CLI hands a stream out.
 
 ### A-160 — A volume's disk-image form: ext2, written in bounded steps, read back as hostile input (accepted 2026-10-23)
 Applied in the same change to:

@@ -11027,6 +11027,38 @@ without a user namespace, which needs root.
 - **crosvm offers DAX on x86_64 only** (`cfg!(target_arch = "x86_64")`, TODO b/176129399, at 1c8d17a85). On an arm64
   host the mount route under crosvm runs without DAX.
 
+### 2026-10-24: the daemon serves a Shards microVM's fs device over a stream (A-161) — built; delivery owed
+
+Shards part 1, step 1. An attach with the Shards form makes an anonymous socket pair, records the attachment as a
+guest's (`AttachForm::ShardsFs`) and serves its end on the volume's owner shard in Shards' framing
+(`crates/server/src/shards.rs`); the other end is the attachment's capability. Proven by use against a real daemon,
+seven tests (`crates/server/tests/shards.rs`) green on macOS arm64 and Linux x86_64, each change checked through the
+daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 and A-161 have the details.
+
+- **Owed, in order:** the stream's delivery over the wire (Linux's control socket by `SCM_RIGHTS`; macOS's socket
+  route with an encrypted, authenticated exchange), the client's and the CLI's attach with a Windows refusal, docs and
+  CI (part 1's steps 2–5); Shards' `--slates-fs-fd` on its current branch and a real boot (part 2); a DAX window over a
+  backing that authorizes only the attachment's bytes (part 3). Until part 3 a slates share is launched without a DAX
+  window: a descriptor ask is refused `EOPNOTSUPP`.
+- **Open, found by the new tests: a read-only attachment is not a read-only file system to its client.** On every FUSE
+  transport (the shared bridge) an open for writing is granted and each write through it refused `EPERM`; NFS answers
+  `PERM`. A read-only file system answers `EROFS`, at the open for an open. Every change is refused and nothing lands,
+  so nothing is unsafe; a client's message and its retry logic differ. The decision spans every transport: the bridge's
+  `authorize_write` maps a read-only attachment to `NotPermitted`, which every edge maps to its permission error.
+- **Open, performance: `INIT`'s page count follows the host's page.** `init::max_pages` is `MAX_WRITE` in host pages,
+  so a 4 KiB-page guest of a 16 KiB-page Mac is told 16 pages: 64 KiB a request where a write may be 256 KiB. The
+  kernel mount needs the host's count (its channel buffer is fixed); a VM route could name 64. Not measured yet; owed
+  with part 2's real boot, where the request rate is measured.
+- **Unverified, from reading code and memory of the kernel's source (to check by test before any change):**
+  - a FUSE mount's end (`fuse::ended`) sweeps none of its kernel's references, and from memory of `fs/fuse/inode.c` a
+    plain `/dev/fuse` mount is never sent `DESTROY` (only `fuseblk` and virtio-fs set `fc->destroy`), so a removed file
+    a mount's kernel held would stay referenced until the next restart's recovery settles it. The test: unmount a FUSE
+    mount that holds a removed file and read the volume's referenced bytes, as `a_closed_stream_gives_back_what_its_
+    guest_held` does for a stream;
+  - the dispatch's comment on `SETUPMAPPING` says a guest falls back to ordinary reads and writes when it is declined;
+    from memory of `fs/fuse/dax.c`, a Linux guest's DAX read returns the error instead. Shards' device answers the
+    mapping itself, so a stream never meets this; a vhost-user guest without a window would.
+
 ### 2026-10-24: a lease test assumes five takes finish inside a 20 ms term — open
 
 CI run 40077995650 (commit `6d993fdc`, the macOS lane) failed `landing::tests::a_take_releases_the_leases_whose_terms_

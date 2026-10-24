@@ -438,6 +438,10 @@ pub struct ShardState {
     slates_db::catalog::Principal,
     u64,
   )>,
+  /// The Shards fs streams this shard serves, by attachment (§4.6, the Shards route; A-161; `crate::shards`). Bounded
+  /// by the shard's client seats (`clients_per_shard`): an attach past them is refused `Overloaded`.
+  #[cfg(unix)]
+  pub(crate) shards_streams: crate::shards::ShardsStreams,
   /// The clock.
   pub clock: slates_vfs::clock::HostClock,
   /// Requests served.
@@ -1016,11 +1020,11 @@ pub fn try_with_state<R>(f: impl FnOnce(&mut ShardState) -> R) -> Result<R, Stat
   })
 }
 
-/// Borrows the state for the shutdown's release of what the process holds in the kernel (a FUSE mount),
-/// whether or not the shard is fenced (§4.6 "Linux"; AUD-29-64): a fenced shard writes no record, but its
-/// mounts must not outlive it. Nothing may write a record through this borrow; the records of what it
+/// Borrows the state for the shutdown's release of what the process holds in the kernel (a FUSE mount, a Shards
+/// stream), whether or not the shard is fenced (§4.6 "Linux"; AUD-29-64): a fenced shard writes no record, but its
+/// mounts and streams must not outlive it. Nothing may write a record through this borrow; the records of what it
 /// releases end at the next start's recovery. `None` when the thread holds no state or it is borrowed.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(crate) fn with_state_at_shutdown<R>(f: impl FnOnce(&mut ShardState) -> R) -> Option<R> {
   STATE.with(|cell| {
     let mut guard = cell.try_borrow_mut().ok()?;

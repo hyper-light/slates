@@ -7,6 +7,14 @@ model (the guest's `mount` is refused without `CAP_SYS_ADMIN`).
 
 ## What's built, and proven
 
+> **2026-10-24: the daemon now serves a real volume (A-161).** `Daemon::attach_shards_stream` attaches a volume (whole
+> or one directory, for reading or writing within the principal's rights), makes an anonymous socket pair and serves
+> one end in Shards' framing on the volume's owner shard, control asks included (refused in Shards' forms; a DAX
+> descriptor ask `EOPNOTSUPP`). The other end is the attachment's capability. Proven by use against a real daemon
+> (`crates/server/tests/shards.rs`). Not yet: handing that end to a client over the wire, the CLI, and a real boot
+> against the daemon, so the recipe below still uses the one-file example. Until a DAX backing scoped to one attachment
+> exists, launch a slates share with no DAX window.
+>
 > **Status checked 2026-10-21, and two things below were overstated.** (1) The slates half is on **main**, but
 > **the daemon never calls `shards_fs::serve`** — no reference in `crates/server` or `crates/cli`. The only server
 > is `examples/shards_fs_serve.rs`, which serves a hard-coded one-file RAM volume, so a real volume (its

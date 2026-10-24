@@ -457,6 +457,14 @@ pub enum AttachForm {
     /// The mount point, once bound.
     mount_point: Option<String>,
   },
+  /// A Shards microVM's fs device served over an anonymous stream (§4.6, the Shards route): the daemon keeps one end
+  /// of a socket pair and serves the attachment on it, and the other end went to whoever attached. The stream is the
+  /// daemon process's own, so recovery ends the record as it ends a guest device's. Optionally one directory.
+  /// Appended.
+  ShardsFs {
+    /// The directory's inode number, when the stream presents one directory.
+    scope: Option<u64>,
+  },
 }
 
 impl AttachForm {
@@ -470,7 +478,7 @@ impl AttachForm {
       Self::ScopedMount { mount_point, .. } | Self::BoundMount { mount_point, .. } => {
         mount_point.as_deref()
       }
-      Self::Root | Self::Oci { .. } | Self::GuestTag { .. } => None,
+      Self::Root | Self::Oci { .. } | Self::GuestTag { .. } | Self::ShardsFs { .. } => None,
     }
   }
 
@@ -480,7 +488,8 @@ impl AttachForm {
       Self::ScopedMount { scope, .. } | Self::ScopedFuseMount { scope, .. } => Some(*scope),
       Self::GuestTag { scope, .. }
       | Self::SharedFuseMount { scope, .. }
-      | Self::BoundMount { scope, .. } => *scope,
+      | Self::BoundMount { scope, .. }
+      | Self::ShardsFs { scope } => *scope,
       _ => None,
     }
   }

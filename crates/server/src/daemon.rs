@@ -3163,6 +3163,8 @@ fn init_shard(
     snapshot_views: std::collections::BTreeMap::new(),
     #[cfg(unix)]
     guest_devices: Vec::new(),
+    #[cfg(unix)]
+    shards_streams: std::collections::BTreeMap::new(),
     clock,
     served: 0,
     refusals: std::collections::BTreeMap::new(),
@@ -4022,6 +4024,22 @@ impl Drop for EndMounts {
   }
 }
 
+/// Ends the shard's Shards streams when its serve loop ends (§4.6, the Shards route; A-161), as `EndMounts` ends its
+/// FUSE mounts and for the same reason: on the shard's own thread with its state installed, not by a question queued
+/// behind its work. Each attachment's references are swept and its record removed; a fenced shard only closes the
+/// streams, and their records end at the next start's recovery.
+#[cfg(unix)]
+struct EndStreams;
+
+#[cfg(unix)]
+impl Drop for EndStreams {
+  fn drop(&mut self) {
+    if state::with_state(crate::shards::end_all).is_none() {
+      let _ = state::with_state_at_shutdown(crate::shards::drop_all);
+    }
+  }
+}
+
 /// The shard's server loop: a poller of its clients' rings; serves while there is work, keeps
 /// polling for the idle window after its last work (§4.7 "Wake strategy": a shard polls while
 /// any client has activity within the window), and idles past it. The window is a multiple of what a
@@ -4030,6 +4048,8 @@ impl Drop for EndMounts {
 async fn serve_loop() {
   #[cfg(target_os = "linux")]
   let _end_mounts = EndMounts;
+  #[cfg(unix)]
+  let _end_streams = EndStreams;
   if let Some(task) = futures::current_task() {
     let _ =
       registry::with_current(|ctx| ctx.register_poller(task, Box::new(state::any_ring_ready)));
