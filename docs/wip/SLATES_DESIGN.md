@@ -12128,14 +12128,16 @@ Applied in the same change to:
   - a closed end ends the attachment and releases the lease; a detach ends the stream;
   - an acknowledged close survives a daemon restart, and the stream does not;
   - a closed stream gives back the bytes of a removed file its guest still held;
-  - Shards' control asks are answered in its forms, and a frame past the bound or a control frame with no ask ends
-    only its own stream, while another on the volume keeps serving.
+  - Shards' control asks are answered in its forms; a request with no header gets an empty frame, a body too short
+    for its opcode `EIO` and an unknown opcode `ENOSYS`; a length past the bound (`u32::MAX` among them), a control
+    frame with no ask, and a frame cut short by its peer's close end only their own stream, each counted by its kind
+    (`shards.frame_refused`, `shards.frame_truncated`), while another on the volume keeps serving.
 
   Seven of seven pass on macOS arm64 and on Linux x86_64 (the fedora runner, epoll), where a peer's write after the
   daemon ends its side answers `EPIPE` at once and macOS takes it until the descriptor closes (both asserted in
   `crates/ipc/src/stream.rs`). Red-checked on macOS: without the sweep the bytes stay referenced (262,144 → 262,144);
   without the barrier the restarted daemon has no file; with the detach hook disabled the guest's read waits out its
-  five seconds.
+  five seconds; with a close mid-frame taken for a clean one the truncated count stays 0.
 - **Found on the way, recorded in GAPS, not changed here:** a read-only attachment grants a write-mode open and answers
   each write `EPERM` on every FUSE transport, and NFS answers `PERM`, where a read-only file system answers `EROFS` at
   the open; `INIT`'s page count follows the host's page, so a 4 KiB-page guest of a 16 KiB-page Mac is told 16 pages,

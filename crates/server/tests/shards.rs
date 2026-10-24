@@ -49,7 +49,10 @@ const CONTROL: u32 = 1 << 31;
 const ASK_SAVE: u8 = 1;
 const ASK_RESTORE: u8 = 2;
 const ASK_DESCRIPTOR: u8 = 3;
+/// Format: an opcode no FUSE kernel defines (`include/uapi/linux/fuse.h` ends in the low hundreds).
+const UNKNOWN_OPCODE: u32 = 9_999;
 /// Format: Linux errnos a reply carries, negated.
+const ENOSYS: i32 = 38;
 const EPERM: i32 = 1;
 const ENOENT: i32 = 2;
 const EIO: i32 = 5;
@@ -908,11 +911,39 @@ fn a_refused_length_ends_its_stream(daemon: &Daemon, guest: &mut Guest, word: u3
   );
 }
 
+/// Writes `part` of a frame on `guest`'s stream and closes the stream's writing half: the daemon drops the part
+/// unanswered and ends the stream, counted as truncated.
+fn a_truncated_frame_ends_its_stream(
+  daemon: &Daemon,
+  guest: &mut Guest,
+  part: &[u8],
+  truncated: u64,
+) {
+  guest.stream.write_all(part).unwrap();
+  guest.stream.shutdown(std::net::Shutdown::Write).unwrap();
+  assert!(guest.ended(), "a truncated frame ends its stream");
+  assert_eq!(
+    wait_for_count(daemon, "shards.frame_truncated", truncated),
+    truncated
+  );
+}
+
+/// A request with a whole header and an opcode no FUSE kernel defines is answered `ENOSYS`, and the stream goes on.
+fn an_unknown_opcode_is_answered_enosys(guest: &mut Guest) {
+  guest.unique += 1;
+  let garbage = message(UNKNOWN_OPCODE, guest.unique, ROOT, &[0xa5; 64]);
+  guest.send_frame(0, &garbage);
+  let (_, reply) = guest.reply_frame().unwrap();
+  assert_eq!(errno(&reply), ENOSYS);
+  assert_eq!(guest.lookup(ROOT, "nothing"), Err(ENOENT));
+}
+
 /// AC (Shards part 1, step 1), hostile input: Shards' control asks are refused in the form its device reads (a
 /// control answer with a reason; a descriptor ask's `shards_ipc` errno) and the stream goes on; a request too short for
-/// a FUSE header gets an empty frame, and one too short for its opcode `EIO`; a length past the largest frame and a
-/// control frame with no ask end only their own stream, counted, while another stream on the volume keeps serving and
-/// the daemon never panics.
+/// a FUSE header gets an empty frame, one too short for its opcode `EIO`, and an unknown opcode `ENOSYS`; a length past
+/// the largest frame (`u32::MAX` among them), a control frame with no ask and a frame cut short by the peer's close end
+/// only their own stream, each counted by its kind, while another stream on the volume keeps serving and the daemon
+/// never panics.
 #[test]
 fn hostile_frames_are_refused_and_end_only_their_own_stream() {
   let (daemon, client, id) = provisioned("shards-hostile");
@@ -922,12 +953,23 @@ fn hostile_frames_are_refused_and_end_only_their_own_stream() {
   hostile.init();
   control_asks_are_refused_in_shards_forms(&mut hostile);
   malformed_requests_are_answered(&mut hostile);
-  // A length past the largest frame, refused before anything is allocated for it.
+  an_unknown_opcode_is_answered_enosys(&mut hostile);
+  // A length past the largest frame, refused before anything is allocated for it: a request's, then a control
+  // frame's (`u32::MAX`), then a control frame with no ask.
   a_refused_length_ends_its_stream(&daemon, &mut hostile, !CONTROL, 1);
-  let mut second = Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
-  second.init();
-  // A control frame with no ask.
-  a_refused_length_ends_its_stream(&daemon, &mut second, CONTROL, 2);
+  for (word, refused) in [(u32::MAX, 2), (CONTROL, 3)] {
+    let mut next = Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
+    next.init();
+    a_refused_length_ends_its_stream(&daemon, &mut next, word, refused);
+  }
+  // A frame cut short by the peer's close: inside its body, then inside its length word.
+  let mut cut = 64u32.to_le_bytes().to_vec();
+  cut.extend_from_slice(&[0u8; 10]);
+  for (part, truncated) in [(&cut[..], 1), (&cut[..2], 2)] {
+    let mut next = Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
+    next.init();
+    a_truncated_frame_ends_its_stream(&daemon, &mut next, part, truncated);
+  }
   assert_eq!(bystander.lookup(ROOT, "nothing"), Err(ENOENT));
   guest_writes(&mut bystander, ROOT, "still-served.txt", FROM_GUEST);
   assert!(

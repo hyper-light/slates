@@ -78,6 +78,9 @@ const REPLY_RECLAIMED: &str = "shards.reply_reclaimed";
 /// Format: the refusal-ledger name of a stream that failed (a read or write error other than its peer's close, or a
 /// readiness wait the runtime refused).
 const STREAM_FAILED: &str = "shards.stream_failed";
+/// Format: the refusal-ledger name of a stream whose peer closed it part-way through a frame (a truncated frame): the
+/// part is dropped unanswered and the stream ends, as at a clean close, but the kind is kept apart from one.
+const FRAME_TRUNCATED: &str = "shards.frame_truncated";
 /// Format: the refusal-ledger name of a sweep of an ended attachment's references that the volume refused.
 const SWEEP_REFUSED: &str = "shards.sweep_refused";
 /// Format: the refusal-ledger name of an ended attachment whose record could not be removed.
@@ -373,6 +376,10 @@ fn turn_with(s: &mut ShardState, stream: &mut ShardsStream) -> Turned {
     Took::Frame { control, total } => (control, total),
     Took::Waiting => return Turned::Waiting,
     Took::Closed => return Turned::Ended,
+    Took::Truncated => {
+      s.count(FRAME_TRUNCATED, 1);
+      return Turned::Ended;
+    }
     Took::Refused => {
       s.count(FRAME_REFUSED, 1);
       return Turned::Ended;
@@ -414,8 +421,10 @@ enum Took {
   },
   /// No whole frame, and nothing more to read now.
   Waiting,
-  /// The peer closed its end, or this end was ended.
+  /// The peer closed its end, or this end was ended, between frames.
   Closed,
+  /// The peer closed its end part-way through a frame.
+  Truncated,
   /// A frame the protocol refuses.
   Refused,
   /// The stream failed.
@@ -451,6 +460,7 @@ fn take_frame(stream: &mut ShardsStream) -> Took {
       return Took::Failed;
     };
     match slates_ipc::stream::recv(stream.stream.as_fd(), room) {
+      Ok(0) if stream.filled > 0 => return Took::Truncated,
       Ok(0) => return Took::Closed,
       Ok(read) => stream.filled = stream.filled.saturating_add(read),
       Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => return Took::Waiting,
