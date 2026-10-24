@@ -12,8 +12,8 @@ model (the guest's `mount` is refused without `CAP_SYS_ADMIN`).
 > one end in Shards' framing on the volume's owner shard, control asks included (refused in Shards' forms; a DAX
 > descriptor ask `EOPNOTSUPP`). The other end is the attachment's capability. Proven by use against a real daemon
 > (`crates/server/tests/shards.rs`). Over the wire the end reaches a client by Linux's control socket or macOS's
-> encrypted socket route (`Client::attach_shards`), and `slates shards ID --fd N -- CMD` runs a spawner with it at
-> descriptor `N`, so the recipe below no longer needs the one-file example, which goes. Not yet: a real boot against
+> encrypted socket route (`Client::attach_shards`), and `slates shards ID --fd N -- CMD` replaces itself with a spawner
+> holding it at descriptor `N`, so the recipe below no longer needs the one-file example, which is gone. Not yet: a real boot against
 > the daemon (Shards part 2). Until a DAX backing scoped to one attachment exists (part 3), launch a slates share with no
 > DAX window.
 >
@@ -39,7 +39,8 @@ model (the guest's `mount` is refused without `CAP_SYS_ADMIN`).
 - `crates/server/src/shards.rs` — the daemon serves an attachment on one end of an anonymous socket pair, on the
   volume's owner shard; `crates/server/tests/shards.rs` drives it as Shards' device would.
 - The end reaches a client by Linux's control socket or macOS's encrypted socket route (`Client::attach_shards`), and
-  `slates shards ID --fd N -- CMD` runs a spawner with it at descriptor `N` (`crates/cli/tests/cli.rs`).
+  `slates shards ID --fd N -- CMD` replaces itself with a spawner holding it at descriptor `N`, so the process a
+  launcher starts is the spawner and ending it ends the attachment (`crates/cli/tests/cli.rs`).
 - The one-file example server (`examples/shards_fs_serve.rs`) and its blocking `serve` were removed on 2026-10-24:
   the daemon serves the route now.
 
@@ -65,8 +66,8 @@ descriptors. This is the general shape for any slates↔shards-microVM wiring on
 slates anchor &
 id=$(slates volume create agent --bounded 1GiB --json | jq -r .id)
 
-# 2. Boot a shards microVM whose share is that volume. `slates shards` attaches it in the Shards form and runs the
-#    unsandboxed spawner with the stream end at descriptor 3, which hands it to the VM as `--slates-fs-fd 3`; the guest
+# 2. Boot a shards microVM whose share is that volume. `slates shards` attaches it in the Shards form and replaces
+#    itself with the unsandboxed spawner, the stream end at descriptor 3, which hands it to the VM as `--slates-fs-fd 3`; the guest
 #    mounts tag `shards0`. The attachment ends when the VM's end closes. Add `--read-only` or `--subtree DIR` to narrow
 #    what the guest reaches.
 slates shards "$id" --fd 3 -- shards run --kernel … --slates-fs-fd 3

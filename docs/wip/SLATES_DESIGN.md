@@ -12285,6 +12285,10 @@ Applied in the same change to:
   of `net/unix/garbage.c` and not re-read for this: Linux's collector keeps a descriptor that sits in the queue of a
   socket something outside the messages still holds, as the client holds its control socket; XNU's flushed one in the
   same window. Evidence of absence under that stress, not a proof.
+- **CI, part 1's code complete (2026-10-24):** run 40123120384 at `50d6ef80`, 19 of 19 jobs green on macOS, Linux and
+  Windows (the Linux `cargo test --workspace` and CLI flow with the exec, TSan over `stream_exec` and the churn test, the
+  macOS hermeticity run with the socket-node class); the state before the exec, `105b8b4d`, was 19 of 19 too (run
+  40118981721).
 - **Owed:** Shards' own `--slates-fs-fd` on its current branch and a real boot (part 2), and a DAX window over a backing
   that authorizes only the attachment's bytes (part 3).
 

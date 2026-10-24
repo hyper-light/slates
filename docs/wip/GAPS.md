@@ -11084,7 +11084,9 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   byte for byte), passed on 2026-10-14 (36.45 s, the run Ada approved) and on 2026-10-20 (48.7 s, no skip line;
   `8a-shards-boot`), both against the one-file example on this Mac (HVF). The README is corrected. Against the daemon,
   through `slates shards`, it is owed (part 2).
-- **Owed, in order:** CI green on every lane (step 5); Shards' `--slates-fs-fd` on its current branch and a real boot
+- **Part 1 complete (2026-10-24):** CI run 40123120384 at `50d6ef80`, 19 of 19 jobs green on macOS, Linux and Windows,
+  the code complete (the exec included); `105b8b4d` before it, 19 of 19 (run 40118981721).
+- **Owed, in order:** Shards' `--slates-fs-fd` on its current branch and a real boot
   (part 2); a DAX window over a backing that authorizes only the attachment's bytes (part 3). Until part 3 a slates
   share is launched without a DAX window: a descriptor ask is refused `EOPNOTSUPP`.
 - **Open, found by the new tests: a read-only attachment is not a read-only file system to its client.** On every FUSE
