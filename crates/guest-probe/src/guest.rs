@@ -9,6 +9,14 @@
 //! The map's bytes are read and written as volatile memory accesses, so each happens where the command says. A wait
 //! polls the map's memory alone (the vDSO's clock is no system call): seeing another path's write that way is what DAX
 //! through a mount has to provide.
+//!
+//! **The image guest (A-160).** With `slates.block=DEVICE` on its command line, the guest mounts that block device as
+//! ext2 instead of a virtio-fs tag: a Firecracker guest, which reaches a slates volume only as an image file the VMM
+//! presents as a virtio-blk disk. It then lists every node with the digest of its bytes, so the host can check the
+//! guest read every file as the volume holds it, and makes the changes the host asks for: writes, patches, renames,
+//! removals, directories, a flush. With `slates.end=reboot` it ends the VM by rebooting, which is how a Firecracker
+//! guest stops it (its command line's `reboot=k` resets the keyboard controller, and Firecracker exits); otherwise by
+//! powering off, as under crosvm.
 
 use std::ffi::{CStr, CString};
 use std::io::Write;
@@ -20,7 +28,7 @@ use rustix::mount::{MountFlags, UnmountFlags};
 use rustix::system::RebootCommand;
 use rustix::termios::OptionalActions;
 use rustix::time::ClockId;
-use slates_guest_probe::protocol::{Command, LONGEST_COMMAND, Reply};
+use slates_guest_probe::protocol::{Command, EntryKind, LONGEST_COMMAND, Reply, digest};
 
 /// Format: where the guest mounts the shared tag.
 const MOUNT_POINT: &str = "/mnt";
@@ -32,6 +40,15 @@ const TAG_KEY: &str = "slates.tag=";
 const DAX_KEY: &str = "slates.dax=";
 /// Format: the tag mounted when the command line names none.
 const DEFAULT_TAG: &str = "slates";
+/// Format: the kernel command line's key naming a block device to mount as ext2 in place of a virtio-fs tag.
+const BLOCK_KEY: &str = "slates.block=";
+/// Format: the kernel command line's key naming how the VM ends: `reboot`, or a power-off otherwise.
+const END_KEY: &str = "slates.end=";
+/// Format: the file system a block device holds: the image a slates volume is presented as (A-160). A kernel without
+/// the ext2 driver mounts it through ext4's (`CONFIG_EXT4_USE_FOR_EXT2`).
+const BLOCK_FILESYSTEM: &str = "ext2";
+/// Shape: the most bytes one `write` or `patch` may carry, expanded from its runs: a few chunks of a test file.
+const LONGEST_WRITE: usize = 16 << 20;
 /// Shape: the most of the kernel command line read: x86_64's own limit is 2,048 bytes.
 const LONGEST_CMDLINE: usize = 4096;
 /// Shape: the bytes the console is read in at a time.
@@ -43,28 +60,49 @@ const MICROS_PER_SECOND: u64 = 1_000_000;
 /// Format: nanoseconds in a microsecond.
 const NANOS_PER_MICRO: u64 = 1_000;
 
+/// How the VM ends.
+#[derive(Clone, Copy)]
+enum End {
+  /// A power-off (crosvm).
+  PowerOff,
+  /// A reboot, which Firecracker takes as the VM's end.
+  Reboot,
+}
+
 /// Runs the guest; never returns.
 pub(crate) fn run() -> ! {
-  if let Err(fatal) = serve() {
-    // The power-off below is the report if this line cannot be written either.
+  let mut end = End::PowerOff;
+  if let Err(fatal) = serve(&mut end) {
+    // The end below is the report if this line cannot be written either.
     if say(&Reply::Fatal(fatal)).is_err() {
       eprintln!("slates-guest-probe: the console is gone");
     }
   }
-  power_off()
+  power_off(end)
 }
 
-/// Takes the console, mounts the tag, and answers commands until told to quit.
-fn serve() -> Result<(), String> {
+/// Takes the console, mounts the tag or the block device, and answers commands until told to quit.
+fn serve(end: &mut End) -> Result<(), String> {
   attach_console()?;
-  mount_tag(&kernel_command_line()?)?;
+  let cmdline = kernel_command_line()?;
+  if option(&cmdline, END_KEY) == Some("reboot") {
+    *end = End::Reboot;
+  }
+  match option(&cmdline, BLOCK_KEY) {
+    Some(device) => mount_block(device)?,
+    None => mount_tag(&cmdline)?,
+  }
   say(&Reply::Ready)?;
   let mut map: Option<SharedMap> = None;
   let mut console = LineReader::default();
   loop {
     let line = console.next_line()?;
-    let reply = match Command::parse(&line) {
+    let reply = match Command::parse_within(&line, LONGEST_WRITE) {
       Ok(Command::Quit) => break,
+      Ok(Command::List) => {
+        list()?;
+        Reply::Done
+      }
       Ok(command) => execute(command, &mut map),
       Err(refusal) => Reply::Refused(refusal.to_string()),
     };
@@ -77,7 +115,7 @@ fn serve() -> Result<(), String> {
   say(&Reply::Done)
 }
 
-/// One command, carried out against the map.
+/// One command, carried out against the map or the mounted file system.
 fn execute(command: Command, map: &mut Option<SharedMap>) -> Reply {
   match command {
     Command::Map { path, pages } => match SharedMap::open(&path, pages) {
@@ -87,11 +125,158 @@ fn execute(command: Command, map: &mut Option<SharedMap>) -> Reply {
       }
       Err(refusal) => Reply::Refused(refusal),
     },
+    Command::Write { path, bytes } => done_or_refused(write_file(&path, &bytes)),
+    Command::Patch { path, at, bytes } => done_or_refused(patch_file(&path, at, &bytes)),
+    Command::Rename { from, to } => done_or_refused(rename(&from, &to)),
+    Command::Remove { path } => done_or_refused(remove(&path)),
+    Command::Mkdir { path } => done_or_refused(make_directory(&path)),
+    Command::Flush => {
+      rustix::fs::sync();
+      Reply::Done
+    }
     other => match map.as_ref() {
       Some(mapped) => mapped.answer(other),
       None => Reply::Refused("no map has been made".to_owned()),
     },
   }
+}
+
+/// [`Reply::Done`], or the refusal.
+fn done_or_refused(result: Result<(), String>) -> Reply {
+  result.map_or_else(Reply::Refused, |()| Reply::Done)
+}
+
+/// `path` under the mount, refused when it climbs out of it.
+fn under_mount(path: &str) -> Result<std::path::PathBuf, String> {
+  let relative = std::path::Path::new(path.trim_start_matches('/'));
+  if relative
+    .components()
+    .any(|part| !matches!(part, std::path::Component::Normal(_)))
+  {
+    return Err(format!("{path} is not a plain path under the mount"));
+  }
+  Ok(std::path::Path::new(MOUNT_POINT).join(relative))
+}
+
+/// Makes `path` hold exactly `bytes`.
+#[allow(clippy::disallowed_methods)] // the guest's own file system, in a VM: this binary never runs on a host
+fn write_file(path: &str, bytes: &[u8]) -> Result<(), String> {
+  std::fs::write(under_mount(path)?, bytes).map_err(|e| format!("write {path}: {e}"))
+}
+
+/// Writes `bytes` into `path` at `at`.
+fn patch_file(path: &str, at: u64, bytes: &[u8]) -> Result<(), String> {
+  use std::os::unix::fs::FileExt;
+  std::fs::OpenOptions::new()
+    .write(true)
+    .open(under_mount(path)?)
+    .and_then(|file| file.write_all_at(bytes, at))
+    .map_err(|e| format!("patch {path} at {at}: {e}"))
+}
+
+/// Renames `from` to `to`.
+#[allow(clippy::disallowed_methods)] // the guest's own file system, in a VM: this binary never runs on a host
+fn rename(from: &str, to: &str) -> Result<(), String> {
+  std::fs::rename(under_mount(from)?, under_mount(to)?)
+    .map_err(|e| format!("rename {from} {to}: {e}"))
+}
+
+/// Removes `path`: an empty directory, or a name of anything else.
+#[allow(clippy::disallowed_methods)] // the guest's own file system, in a VM: this binary never runs on a host
+fn remove(path: &str) -> Result<(), String> {
+  let full = under_mount(path)?;
+  let directory = std::fs::symlink_metadata(&full)
+    .map_err(|e| format!("stat {path}: {e}"))?
+    .is_dir();
+  if directory {
+    std::fs::remove_dir(&full)
+  } else {
+    std::fs::remove_file(&full)
+  }
+  .map_err(|e| format!("remove {path}: {e}"))
+}
+
+/// Makes the directory `path`.
+#[allow(clippy::disallowed_methods)] // the guest's own file system, in a VM: this binary never runs on a host
+fn make_directory(path: &str) -> Result<(), String> {
+  std::fs::create_dir(under_mount(path)?).map_err(|e| format!("mkdir {path}: {e}"))
+}
+
+/// Says every node under the mount, one [`Reply::Entry`] each, in path order. A directory the walk cannot read ends
+/// the guest, since its listing would be a lie by omission.
+fn list() -> Result<(), String> {
+  let mut entries = Vec::new();
+  let mut pending = vec![String::new()];
+  while let Some(directory) = pending.pop() {
+    let full = format!("{MOUNT_POINT}/{directory}");
+    let read = std::fs::read_dir(&full).map_err(|e| format!("list {full}: {e}"))?;
+    for entry in read {
+      let entry = entry.map_err(|e| format!("list {full}: {e}"))?;
+      let name = entry.file_name().to_string_lossy().into_owned();
+      let path = if directory.is_empty() {
+        name
+      } else {
+        format!("{directory}/{name}")
+      };
+      let (kind, size, sum) = described(&entry.path(), &path)?;
+      if kind == EntryKind::Dir {
+        pending.push(path.clone());
+      }
+      entries.push(Reply::Entry {
+        kind,
+        size,
+        digest: sum,
+        path,
+      });
+    }
+  }
+  entries.sort_by(|left, right| match (left, right) {
+    (Reply::Entry { path: left, .. }, Reply::Entry { path: right, .. }) => left.cmp(right),
+    _ => std::cmp::Ordering::Equal,
+  });
+  for entry in &entries {
+    say(entry)?;
+  }
+  Ok(())
+}
+
+/// A node's kind, size and digest: a file's length and the digest of its bytes, a link's target's, zero otherwise.
+fn described(full: &std::path::Path, path: &str) -> Result<(EntryKind, u64, u64), String> {
+  use std::os::unix::fs::FileTypeExt;
+  let metadata = std::fs::symlink_metadata(full).map_err(|e| format!("stat {path}: {e}"))?;
+  let kind = metadata.file_type();
+  Ok(if kind.is_file() {
+    let bytes = std::fs::read(full).map_err(|e| format!("read {path}: {e}"))?;
+    (EntryKind::File, metadata.len(), digest(&bytes))
+  } else if kind.is_symlink() {
+    let target = std::fs::read_link(full).map_err(|e| format!("readlink {path}: {e}"))?;
+    let target = target.as_os_str().as_encoded_bytes().to_vec();
+    (
+      EntryKind::Link,
+      u64::try_from(target.len()).unwrap_or(u64::MAX),
+      digest(&target),
+    )
+  } else if kind.is_dir() {
+    (EntryKind::Dir, 0, 0)
+  } else if kind.is_fifo() {
+    (EntryKind::Fifo, 0, 0)
+  } else if kind.is_socket() {
+    (EntryKind::Socket, 0, 0)
+  } else {
+    (EntryKind::Other, 0, 0)
+  })
+}
+
+/// Mounts block device `device` as ext2 at [`MOUNT_POINT`].
+fn mount_block(device: &str) -> Result<(), String> {
+  rustix::mount::mount(
+    device,
+    MOUNT_POINT,
+    BLOCK_FILESYSTEM,
+    MountFlags::empty(),
+    None::<&CStr>,
+  )
+  .map_err(|e| format!("mount {device} as {BLOCK_FILESYSTEM} at {MOUNT_POINT}: {e}"))
 }
 
 /// Mounts a pseudo-filesystem the guest needs.
@@ -169,11 +354,15 @@ fn now_micros() -> u64 {
     .saturating_add(nanos / NANOS_PER_MICRO)
 }
 
-/// Syncs and powers the VM off. If the kernel refuses, the guest parks for good rather than return.
-fn power_off() -> ! {
+/// Syncs and ends the VM as `end` says. If the kernel refuses, the guest parks for good rather than return.
+fn power_off(end: End) -> ! {
   rustix::fs::sync();
-  if let Err(refused) = rustix::system::reboot(RebootCommand::PowerOff) {
-    eprintln!("slates-guest-probe: power-off refused: {refused}");
+  let command = match end {
+    End::PowerOff => RebootCommand::PowerOff,
+    End::Reboot => RebootCommand::Restart,
+  };
+  if let Err(refused) = rustix::system::reboot(command) {
+    eprintln!("slates-guest-probe: the VM's end refused: {refused}");
   }
   loop {
     std::thread::park();
@@ -303,9 +492,15 @@ impl SharedMap {
       Command::Wait { at, byte, millis } => self
         .span(at, 1)
         .map(|offsets| self.wait(offsets.start, byte, millis)),
-      Command::Map { .. } | Command::Quit => {
-        Err("a map or a quit is not asked of a map".to_owned())
-      }
+      Command::Map { .. }
+      | Command::Quit
+      | Command::List
+      | Command::Write { .. }
+      | Command::Patch { .. }
+      | Command::Rename { .. }
+      | Command::Remove { .. }
+      | Command::Mkdir { .. }
+      | Command::Flush => Err("not a command a map answers".to_owned()),
     };
     answered.unwrap_or_else(Reply::Refused)
   }

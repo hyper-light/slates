@@ -12027,6 +12027,9 @@ Applied in the same change to:
   `round_trip.rs`, `layout.rs`, `hostile.rs`, `e2fsck.rs`;
 - the workspace manifest and `unsafe-budget.toml` (`slates-image = 0`);
 - GAPS (the owed item "Firecracker's disk-image form", now in progress);
+- (2026-10-24) `crates/guest-probe` (a block-device guest: list, write, patch, rename, remove, mkdir, flush; the VM
+  ended by reboot under Firecracker), `crates/cli/tests/guest_image.rs` and the real-VM harness both guest tests
+  share, `crates/cli/tests/vm`;
 - (2026-10-24) `crates/vfs/src/image.rs` and `tests/image.rs`; `crates/server/src/image.rs`, the create and clone
   verbs split into admission and recording (`verbs.rs`), `BaseRecord::Image` in `crates/db/src/catalog.rs`, the
   pin reconciliation and the destroy's unpin; the protocol's `ImageBuild`, `ImageMerge`, `ImageBuilt`, `ImageMerged`
@@ -12157,7 +12160,25 @@ Applied in the same change to:
     still holds the image's tree, and impossible under a kernel. The test makes its new file first.
 - **A sibling fixed on the way:** a clone refused for want of a fresh volume id discarded itself but kept its pin on
   the origin's snapshot. The split clone verb releases the pin on every refusal (`publish_clone`).
-- **Owed:** the real Firecracker run.
+- **A real Firecracker microVM (2026-10-24; `crates/cli/tests/guest_image.rs`).** Firecracker v1.17.0 ran on the box:
+  the release binary, its tarball's SHA-256 `06094a11…e558` matching the release's checksum file, and the binary
+  checked against `SHA256SUMS`.
+  - It booted the box's own 7.2.9 kernel, unpacked to ELF by `scripts/extract-vmlinux`. That kernel's virtio-mmio is a
+    module, so the guest's disk comes over virtio-pci (`--enable-pci`). It ran with `--no-api` (no socket) and its
+    configuration in a slates volume.
+  - The initramfs, the guest probe as `/init`, lived in a slates volume. The disk was the image file read through a
+    slates FUSE mount, as a writable virtio-blk drive whose flushes are written through (`cache_type: Writeback`).
+  - The guest mounted the disk as ext2 through its ext4 driver, and listed every node with an FNV-1a digest of its
+    bytes. It found the volume's tree exactly: directories, a file of three chunks and more, a hard link and a
+    symbolic link.
+  - It then patched a file inside its second chunk, renamed one into another directory, removed one, wrote a new
+    file, made a directory, flushed, listed its own changes and ended the VM by rebooting (`reboot=k`).
+  - `slates image merge` reported 7 kept, 2 made, 1 moved, 1 removed and 65,563 bytes written: the patch's one
+    64 KiB chunk and the new file's 27 bytes. The clone, read through its own mount, held exactly the guest's tree.
+  - The guest booted to its probe's ready in 191–207 ms. The test ran green 3 of 3, and was red with the merge's chunk
+    writes disabled. The crosvm guest tests share its harness (`tests/vm`) and stayed green, 3 of 3.
+- **Owed:** the design's §4.6 and `virtiofs.md` §8 item 7 updated for the disk-image route, and the costs of build
+  and merge measured in `docs/wip/BENCHMARKS.md`.
 
 ### A-159 — The bootstrap header no longer carries the daemon's process id (accepted 2026-10-23)
 Applied in the same change to:

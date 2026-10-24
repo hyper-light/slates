@@ -10963,8 +10963,15 @@ without a user namespace, which needs root.
       3.
 
     The oracle found a removal-order bug in the new merge (a hard link in a later directory), fixed failing-seed-first.
-    Still owed: the real Firecracker run (a microVM boots, reads and writes the image, and its changes merge) and the
-    design and transport docs.
+
+    **A real Firecracker microVM ran over it (2026-10-24; `crates/cli/tests/guest_image.rs`, gated).** Firecracker
+    v1.17.0 (its release binary, checksum verified) booted from an initramfs held in a slates volume. Its disk was the
+    image file through a slates FUSE mount, over virtio-pci. The guest read every node as the volume holds it, then
+    patched, renamed, removed, wrote, made a directory, flushed and rebooted. The merge reported 2 made, 1 moved,
+    1 removed and one chunk plus 27 bytes written, and the clone held exactly the guest's tree. Green 3 of 3 on the box,
+    red with the merge's chunk writes disabled.
+
+    Still owed: §4.6 and `virtiofs.md` §8 item 7 updated for the route, and the costs of build and merge measured.
   - **Open sibling (found 2026-10-24 by reading `reconcile_unpublished_effects`, not yet reproduced): a clone whose
     transaction fails after it recorded its volume keeps its pin.**
     When `Db::commit` fails after a clone verb recorded its volume (the log full or unpublishable), the rollback

@@ -17,6 +17,68 @@ pub const LONGEST_COMMAND: usize = 512;
 const STORE_ARGUMENTS: usize = 3;
 /// Format: the arguments `wait` takes: an offset, a byte and a time.
 const WAIT_ARGUMENTS: usize = 3;
+/// Format: the arguments `patch` takes: a path, an offset and the bytes.
+const PATCH_ARGUMENTS: usize = 3;
+/// Format: the words an `entry` reply carries after its verb: a kind, a size, a digest and a path.
+const ENTRY_WORDS: usize = 4;
+/// Format: the byte runs of no bytes at all, so an empty file's `write` keeps its argument.
+const NO_BYTES: &str = "-";
+/// Format: the FNV-1a 64-bit offset basis and prime (Fowler, Noll, Vo), the digest an `entry` carries.
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+/// See [`FNV_OFFSET`].
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// The digest an `entry` carries for `bytes` (a file's, or a symbolic link's target): FNV-1a over them. A check that
+/// the guest read what the host wrote, not a cryptographic one: nothing here is adversarial.
+pub fn digest(bytes: &[u8]) -> u64 {
+  bytes.iter().fold(FNV_OFFSET, |hash, byte| {
+    (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+  })
+}
+
+/// What a node a guest lists is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EntryKind {
+  /// A regular file.
+  File,
+  /// A directory.
+  Dir,
+  /// A symbolic link.
+  Link,
+  /// A named pipe.
+  Fifo,
+  /// A socket.
+  Socket,
+  /// Anything else (a device).
+  Other,
+}
+
+impl EntryKind {
+  /// The kind's word on the console.
+  fn word(self) -> &'static str {
+    match self {
+      EntryKind::File => "file",
+      EntryKind::Dir => "dir",
+      EntryKind::Link => "link",
+      EntryKind::Fifo => "fifo",
+      EntryKind::Socket => "socket",
+      EntryKind::Other => "other",
+    }
+  }
+
+  /// The kind a word names.
+  fn of(word: &str) -> Result<EntryKind, ProtocolError> {
+    Ok(match word {
+      "file" => EntryKind::File,
+      "dir" => EntryKind::Dir,
+      "link" => EntryKind::Link,
+      "fifo" => EntryKind::Fifo,
+      "socket" => EntryKind::Socket,
+      "other" => EntryKind::Other,
+      other => return Err(ProtocolError::UnknownVerb(other.to_owned())),
+    })
+  }
+}
 
 /// One command from the host's test to the guest.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,6 +118,43 @@ pub enum Command {
     /// The longest wait.
     millis: u64,
   },
+  /// Every node under the mount, one [`Reply::Entry`] each in path order, then [`Reply::Done`].
+  List,
+  /// Make `path` hold exactly `bytes`, creating it when absent.
+  Write {
+    /// The file, relative to the mount.
+    path: String,
+    /// Its whole new content.
+    bytes: Vec<u8>,
+  },
+  /// Write `bytes` into `path` at `at`, leaving the rest of it as it was.
+  Patch {
+    /// The file, relative to the mount.
+    path: String,
+    /// The first byte written.
+    at: u64,
+    /// The bytes.
+    bytes: Vec<u8>,
+  },
+  /// Rename `from` to `to`.
+  Rename {
+    /// The name moved.
+    from: String,
+    /// Its new name.
+    to: String,
+  },
+  /// Remove `path`: a file's name, or an empty directory.
+  Remove {
+    /// The name removed.
+    path: String,
+  },
+  /// Make the directory `path`.
+  Mkdir {
+    /// The directory, relative to the mount.
+    path: String,
+  },
+  /// Write every dirty block of the mounted file system out to its device (`sync`).
+  Flush,
   /// Unmap, unmount, sync and power the VM off.
   Quit,
 }
@@ -83,6 +182,18 @@ pub enum Reply {
   TimedOut {
     /// The value the byte held at the end.
     seen: u8,
+  },
+  /// One node of a [`Command::List`]: its kind, its size (a file's length, a link's target's), the [`digest`] of its
+  /// bytes or target (zero for anything else), and its path under the mount.
+  Entry {
+    /// What it is.
+    kind: EntryKind,
+    /// Its size in bytes.
+    size: u64,
+    /// The digest of its bytes.
+    digest: u64,
+    /// Its path, relative to the mount.
+    path: String,
   },
   /// The command was refused: what was refused, and why.
   Refused(String),
@@ -156,7 +267,66 @@ impl Command {
       Command::Sync => "sync".to_owned(),
       Command::Read { at, len } => format!("read {at} {len}"),
       Command::Wait { at, byte, millis } => format!("wait {at} {byte} {millis}"),
+      Command::List => "list".to_owned(),
+      Command::Write { path, bytes } => format!("write {path} {}", runs_or_none(bytes)),
+      Command::Patch { path, at, bytes } => {
+        format!("patch {path} {at} {}", runs_or_none(bytes))
+      }
+      Command::Rename { from, to } => format!("rename {from} {to}"),
+      Command::Remove { path } => format!("remove {path}"),
+      Command::Mkdir { path } => format!("mkdir {path}"),
+      Command::Flush => "flush".to_owned(),
       Command::Quit => "quit".to_owned(),
+    }
+  }
+
+  /// Parses one command line, a write's bytes held to `most_bytes`.
+  ///
+  /// # Errors
+  /// [`ProtocolError`] when the line names no command, or a command with the wrong arguments.
+  pub fn parse_within(line: &str, most_bytes: usize) -> Result<Command, ProtocolError> {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let Some((verb, arguments)) = words.split_first() else {
+      return Err(ProtocolError::Empty);
+    };
+    match *verb {
+      "list" => exactly::<0>("list", arguments).map(|[]| Command::List),
+      "write" => {
+        let [path, runs] = exactly::<2>("write", arguments)?;
+        Ok(Command::Write {
+          path: path.to_owned(),
+          bytes: bytes_or_none(runs, most_bytes)?,
+        })
+      }
+      "patch" => {
+        let [path, at, runs] = exactly::<PATCH_ARGUMENTS>("patch", arguments)?;
+        Ok(Command::Patch {
+          path: path.to_owned(),
+          at: number(at)?,
+          bytes: bytes_or_none(runs, most_bytes)?,
+        })
+      }
+      "rename" => {
+        let [from, to] = exactly::<2>("rename", arguments)?;
+        Ok(Command::Rename {
+          from: from.to_owned(),
+          to: to.to_owned(),
+        })
+      }
+      "remove" => {
+        let [path] = exactly::<1>("remove", arguments)?;
+        Ok(Command::Remove {
+          path: path.to_owned(),
+        })
+      }
+      "mkdir" => {
+        let [path] = exactly::<1>("mkdir", arguments)?;
+        Ok(Command::Mkdir {
+          path: path.to_owned(),
+        })
+      }
+      "flush" => exactly::<0>("flush", arguments).map(|[]| Command::Flush),
+      _ => Command::parse(line),
     }
   }
 
@@ -217,6 +387,12 @@ impl Reply {
       Reply::Bytes(bytes) => format!("bytes {}", runs_of(bytes)),
       Reply::Waited { micros } => format!("waited {micros}"),
       Reply::TimedOut { seen } => format!("timedout {seen}"),
+      Reply::Entry {
+        kind,
+        size,
+        digest,
+        path,
+      } => format!("entry {} {size} {digest:016x} {path}", kind.word()),
       Reply::Refused(why) => format!("refused {why}"),
       Reply::Fatal(why) => format!("fatal {why}"),
     };
@@ -241,10 +417,42 @@ impl Reply {
       "bytes" => bytes_of(rest, most_bytes).map(Reply::Bytes),
       "waited" => number(rest).map(|micros| Reply::Waited { micros }),
       "timedout" => number(rest).map(|seen| Reply::TimedOut { seen }),
+      "entry" => entry_of(rest),
       "refused" => Ok(Reply::Refused(rest.to_owned())),
       "fatal" => Ok(Reply::Fatal(rest.to_owned())),
       other => Err(ProtocolError::UnknownVerb(other.to_owned())),
     })
+  }
+}
+
+/// An `entry` reply's words after its verb: a kind, a size, a digest in hexadecimal and a path.
+fn entry_of(rest: &str) -> Result<Reply, ProtocolError> {
+  let words: Vec<&str> = rest.split_whitespace().collect();
+  let [kind, size, digest, path] = exactly::<ENTRY_WORDS>("entry", &words)?;
+  Ok(Reply::Entry {
+    kind: EntryKind::of(kind)?,
+    size: number(size)?,
+    digest: u64::from_str_radix(digest, 16)
+      .map_err(|_| ProtocolError::Number(digest.to_owned()))?,
+    path: path.to_owned(),
+  })
+}
+
+/// `bytes`' runs ([`runs_of`]), or [`NO_BYTES`] for none, so a command keeps its argument.
+fn runs_or_none(bytes: &[u8]) -> String {
+  if bytes.is_empty() {
+    NO_BYTES.to_owned()
+  } else {
+    runs_of(bytes)
+  }
+}
+
+/// The bytes `text` spells: none for [`NO_BYTES`], else its runs ([`bytes_of`]).
+fn bytes_or_none(text: &str, most_bytes: usize) -> Result<Vec<u8>, ProtocolError> {
+  if text == NO_BYTES {
+    Ok(Vec::new())
+  } else {
+    bytes_of(text, most_bytes)
   }
 }
 
@@ -318,6 +526,82 @@ mod tests {
     ] {
       assert_eq!(Command::parse(&command.encode()), Ok(command));
     }
+  }
+
+  /// Do: encode each of the image guest's commands — a write of runs and of no bytes, a patch, a rename, a removal, a
+  /// directory, a list and a flush — and parse it back. Expect the same command.
+  #[test]
+  fn every_image_command_reads_back_as_written() {
+    let mut runs = vec![35u8; 70_000];
+    runs.extend_from_slice(b"ab");
+    for command in [
+      Command::List,
+      Command::Write {
+        path: "docs/new.txt".to_owned(),
+        bytes: runs.clone(),
+      },
+      Command::Write {
+        path: "empty".to_owned(),
+        bytes: Vec::new(),
+      },
+      Command::Patch {
+        path: "docs/sub/b.bin".to_owned(),
+        at: 70_000,
+        bytes: runs,
+      },
+      Command::Rename {
+        from: "a".to_owned(),
+        to: "docs/b".to_owned(),
+      },
+      Command::Remove {
+        path: "gone".to_owned(),
+      },
+      Command::Mkdir {
+        path: "made".to_owned(),
+      },
+      Command::Flush,
+    ] {
+      assert_eq!(Command::parse_within(&command.encode(), ROOMY), Ok(command));
+    }
+  }
+
+  /// Do: encode each kind of entry and parse it back; parse entries with a bad kind, a bad digest and a word missing.
+  /// Expect the same entries, and each bad one refused.
+  #[test]
+  fn an_entry_reads_back_as_written_and_a_bad_one_is_refused() {
+    for kind in [
+      EntryKind::File,
+      EntryKind::Dir,
+      EntryKind::Link,
+      EntryKind::Fifo,
+      EntryKind::Socket,
+      EntryKind::Other,
+    ] {
+      let reply = Reply::Entry {
+        kind,
+        size: 196_609,
+        digest: digest(b"the first file"),
+        path: "docs/sub/b.bin".to_owned(),
+      };
+      assert_eq!(Reply::parse(&reply.encode(), ROOMY), Some(Ok(reply)));
+    }
+    for line in [
+      "PROBE entry block 1 00 a",
+      "PROBE entry file 1 xyz a",
+      "PROBE entry file 1 00",
+    ] {
+      assert!(
+        matches!(Reply::parse(line, ROOMY), Some(Err(_))),
+        "{line} is refused"
+      );
+    }
+  }
+
+  /// Do: digest nothing and a known string. Expect FNV-1a 64's published values (the offset basis, and `a`'s).
+  #[test]
+  fn the_digest_is_fnv1a_64() {
+    assert_eq!(digest(b""), 0xcbf2_9ce4_8422_2325);
+    assert_eq!(digest(b"a"), 0xaf63_dc4c_8601_ec8c);
   }
 
   /// Do: encode each reply and parse it back, a run-length byte reply among them. Expect the same reply.
