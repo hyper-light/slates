@@ -26,11 +26,13 @@
 //! never a queue. While the owner may not serve the volume's latest state (its lease not holding, AUD-29-83), nothing is
 //! read: the guest's requests wait in the stream, asked again each heartbeat.
 //!
-//! **Control asks.** Shards' device sends asks of its own: its backend's tables for a snapshot of the VM, and their
-//! restore (D176), and a file's descriptor for a DAX window's mapping (D189). slates keeps no tables a VM's snapshot can
-//! carry, and a file's descriptor would hand the VMM the volume's whole content object (A-135), so each is refused in
-//! the form Shards reads: a control answer with its reason, and for a descriptor an errno its guest's mapping returns. A
-//! share slates serves is therefore launched without a DAX window until the per-attachment backing exists.
+//! **Control asks.** Shards' device sends asks of its own:
+//! - its backend's tables for a snapshot of the VM, and their restore (D176). slates keeps no tables a VM's snapshot can
+//!   carry, so each is refused in the form Shards reads: a control answer with its reason.
+//! - a file's descriptor for a DAX window's mapping (D189), answered by the child module `dax` (Shards part 3;
+//!   `docs/wip/shards/dax-protocol.md`). The answer is a descriptor of the file's DAX object, one per attachment and
+//!   file, holding only that file's bytes, filled a slice a turn. A descriptor of slates' content itself would hand the
+//!   VMM the whole content object (A-135). A refusal is an errno its guest's mapping returns.
 //!
 //! **Teardown.** The peer closing its end, a frame refused as hostile, an error on the stream, a `detach`, a
 //! revocation, the volume's destroy and the daemon's stop all end the attachment the same way ([`ended`]): its
@@ -44,10 +46,12 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 
 use slates_bridge_core::volume_bridge::new_handle_store;
 use slates_bridge_core::{AttachmentId, Rights, View, VolumeBridge};
-use slates_bridge_fuse::bridge::{EIO, needs_barrier, reclaim_unreported};
+use slates_bridge_fuse::bridge::{
+  EIO, KernelChange, kernel_changes, needs_barrier, reclaim_unreported,
+};
 use slates_bridge_fuse::shards_fs::{
   ASK_DESCRIPTOR, ASK_RESTORE, ASK_SAVE, Answered, FRAME_BYTES, Frame, LENGTH_BYTES, Split, answer,
-  control_refusal, descriptor_refusal, refuse, split_frame,
+  control_refusal, refuse, split_frame,
 };
 use slates_db::Op;
 use slates_db::catalog::{AttachForm, AttachmentRecord, Consumer, Principal, VolumeId};
@@ -64,6 +68,8 @@ use slates_rt::task::SpawnRequest;
 use crate::daemon::Daemon;
 use crate::error::ServerError;
 use crate::state::{self, ShardState};
+
+mod dax;
 
 /// Format: the refusal-ledger name of a frame the protocol refuses (a length past the largest frame, a control frame
 /// with no ask): the stream that sent it is ended.
@@ -94,9 +100,6 @@ const DELIVERY_REFUSED: &str = "shards.delivery_refused";
 /// Format: the refusal-ledger name of a stream end dropped because its request's reply was not the attach that made
 /// it (a rolled-back verb answered a refusal): the end closes, so the stream ends with it.
 const HANDOFF_DROPPED: &str = "shards.handoff_dropped";
-/// Format: Linux `EOPNOTSUPP`, the errno a refused descriptor ask carries to the guest's mapping; the guest is a Linux
-/// kernel whatever the host, so the number is Linux's.
-const EOPNOTSUPP: i32 = 95;
 /// Format: the reason a refused snapshot ask carries to Shards, which reports it.
 const NO_TABLES: &str =
   "slates keeps no share tables a VM snapshot can carry; the share ends with the VM";
@@ -134,6 +137,12 @@ pub(crate) struct ShardsStream {
   /// Set when the attachment ends by anything but the stream (a detach, a revocation, a destroy): the task reads nothing
   /// more and ends it at its next turn.
   ending: bool,
+  /// The DAX backings of the files this attachment's guest maps, by inode (Shards part 3, [`dax`]).
+  backings: dax::Backings,
+  /// A descriptor ask being answered: its fill, a slice a turn, before anything more is read ([`dax::step`]).
+  pending: Option<dax::Pending>,
+  /// The descriptor the owed reply carries by `SCM_RIGHTS` on its first byte: sent with it, then closed.
+  owed_descriptor: Option<OwnedFd>,
 }
 
 impl std::fmt::Debug for ShardsStream {
@@ -291,6 +300,9 @@ pub(crate) fn attach(s: &mut ShardState, ask: ShardsAsk) -> Result<ShardsAttache
       owed: 0,
       sent: 0,
       ending: false,
+      backings: dax::Backings::new(),
+      pending: None,
+      owed_descriptor: None,
     },
   );
   if futures::spawn(serve(attachment))
@@ -658,6 +670,18 @@ fn turn_with(s: &mut ShardState, stream: &mut ShardsStream) -> Turned {
   if crate::verbs::live_tree_fenced(s, stream.volume) {
     return Turned::Fenced;
   }
+  // A descriptor ask's fill runs a slice a turn, its answer owed when the last is done; nothing more is read meanwhile,
+  // and the device sends nothing more, since it waits for that answer with its stream held.
+  if stream.pending.is_some() {
+    dax::step(s, stream);
+    return match flush(stream) {
+      Flushed::Done | Flushed::Blocked => Turned::Served,
+      Flushed::Failed => {
+        s.count(STREAM_FAILED, 1);
+        Turned::Ended
+      }
+    };
+  }
   let (control, total) = match take_frame(stream) {
     Took::Frame { control, total } => (control, total),
     Took::Waiting => return Turned::Waiting,
@@ -676,6 +700,13 @@ fn turn_with(s: &mut ShardState, stream: &mut ShardsStream) -> Turned {
     }
   };
   let served = match control {
+    Some(ASK_DESCRIPTOR) => {
+      // The ask's body follows its length word and its ask byte.
+      let body_at = LENGTH_BYTES.saturating_add(1);
+      let body = stream.inbound.get(body_at..total).unwrap_or(&[]).to_vec();
+      dax::begin(s, stream, &body);
+      true
+    }
     Some(ask) => {
       answer_control(stream, ask);
       s.count(CONTROL_REFUSED, 1);
@@ -771,7 +802,6 @@ fn consume(stream: &mut ShardsStream, total: usize) {
 /// Answers a control ask with its refusal, owed as the stream's reply (see the module doc).
 fn answer_control(stream: &mut ShardsStream, ask: u8) {
   let refusal = match ask {
-    ASK_DESCRIPTOR => descriptor_refusal(EOPNOTSUPP),
     ASK_SAVE => control_refusal(NO_TABLES),
     ASK_RESTORE => control_refusal(NO_RESTORE),
     _ => control_refusal(UNKNOWN_ASK),
@@ -827,6 +857,7 @@ fn serve_request(s: &mut ShardState, stream: &mut ShardsStream, total: usize) ->
     answer(request, served, &cx, &mut stream.outbound)
   };
   s.attachments.end(stream.registry);
+  release_forgotten(s, stream, total, &answered);
   stream.owed = answered.frame;
   stream.sent = 0;
   // A reply after which the guest keeps an effect across a restart waits for the publication that makes it durable
@@ -843,6 +874,30 @@ fn serve_request(s: &mut ShardState, stream: &mut ShardsStream, total: usize) ->
     }
   }
   true
+}
+
+/// Lets go of the backing of every node the request at the head of `stream` (`total` bytes) gave back: a guest's
+/// `FORGET` or `BATCH_FORGET`. A Linux guest has removed a DAX inode's mappings, by waited `FUSE_REMOVEMAPPING` requests,
+/// before it forgets the inode (`fs/fuse/inode.c`), so the device maps none of the object by then.
+fn release_forgotten(
+  s: &mut ShardState,
+  stream: &mut ShardsStream,
+  total: usize,
+  answered: &Answered,
+) {
+  if stream.backings.is_empty() {
+    return;
+  }
+  let mut forgotten = Vec::new();
+  let request = stream.inbound.get(LENGTH_BYTES..total).unwrap_or(&[]);
+  kernel_changes(request, answered.reply(&stream.outbound), &mut |change| {
+    if let KernelChange::Forgot { node, .. } = change {
+      forgotten.push(node);
+    }
+  });
+  for node in forgotten {
+    dax::release(s, stream, node);
+  }
 }
 
 /// Gives back what `answered`'s reply granted (its lookup references, its open handle), over a transient bridge, since
@@ -893,9 +948,19 @@ fn flush(stream: &mut ShardsStream) -> Flushed {
     let Some(rest) = stream.outbound.get(stream.sent..stream.owed) else {
       return Flushed::Failed;
     };
-    match slates_ipc::stream::send(stream.stream.as_fd(), rest) {
+    // A descriptor the reply carries rides its first byte; once any byte is out, the descriptor went with it.
+    let sent = match stream.owed_descriptor.as_ref() {
+      Some(descriptor) => {
+        slates_ipc::stream::send_with_descriptor(stream.stream.as_fd(), rest, descriptor.as_fd())
+      }
+      None => slates_ipc::stream::send(stream.stream.as_fd(), rest),
+    };
+    match sent {
       Ok(0) | Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => return Flushed::Blocked,
-      Ok(sent) => stream.sent = stream.sent.saturating_add(sent),
+      Ok(sent) => {
+        stream.owed_descriptor = None;
+        stream.sent = stream.sent.saturating_add(sent);
+      }
       Err(_) => return Flushed::Failed,
     }
   }
@@ -914,6 +979,7 @@ fn flush(stream: &mut ShardsStream) -> Flushed {
 /// already removed it). Idempotent.
 fn ended(s: &mut ShardState, attachment: u64) {
   if let Some(mut stream) = s.shards_streams.remove(&attachment) {
+    dax::release_all(s, &mut stream);
     sweep(s, &mut stream);
     s.attachments.revoke(stream.registry);
     s.attachments.drain(stream.registry);

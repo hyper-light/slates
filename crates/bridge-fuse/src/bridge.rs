@@ -637,8 +637,9 @@ pub(crate) fn resolve(
 }
 
 /// Maps a volume refusal to its POSIX errno. This is the FUSE edge's error vocabulary; each other
-/// transport maps the same [`VfsError`] to its own wire error.
-pub(crate) fn errno(e: VfsError) -> i32 {
+/// transport maps the same [`VfsError`] to its own wire error. Public for the Shards route's descriptor ask, whose
+/// refusal the device returns to the guest's FUSE mapping as this errno.
+pub fn errno(e: VfsError) -> i32 {
   match e {
     VfsError::NotFound => ENOENT,
     VfsError::AlreadyExists => EEXIST,

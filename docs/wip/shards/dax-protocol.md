@@ -7,6 +7,10 @@ range on the ask and will write the device side of it. They asked for the testgu
 recorded below: shmem budgets (D188) and VM saves (D176). This note is what both sides build to: what crosses the
 stream, what each side guarantees, what a guest sees, and why. The evidence is listed at the end.
 
+slates' side as built so far (2026-10-24): the object (`crates/mem/src/dax_object.rs`) and the descriptor answer, with
+its fill, bounds and refusals (`crates/server/src/shards/dax.rs`), are built and proven by use on macOS. Ingest (step
+3), write-through (step 4) and the DAX offer at INIT and in attributes are next.
+
 ## The decision in one paragraph
 
 slates answers Shards' existing DESCRIPTOR ask with a descriptor of **one shared-memory object per attachment and file**.

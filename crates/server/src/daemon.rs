@@ -3174,6 +3174,8 @@ fn init_shard(
     #[cfg(unix)]
     shards_streams: std::collections::BTreeMap::new(),
     #[cfg(unix)]
+    dax_filled: 0,
+    #[cfg(unix)]
     stream_handoffs: std::collections::BTreeMap::new(),
     #[cfg(target_os = "macos")]
     stream_offers: std::collections::BTreeMap::new(),

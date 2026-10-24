@@ -11104,6 +11104,23 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   - They accepted the range on the ask, and write its device side themselves.
   - They want the testguest routine as a patch series rebased on `gpu`, linted on all 8 targets.
   - They added the shmem budget rule (D188) and the VM-save rule (D176), both recorded in the note.
+- **Part 3, step 2 in part (2026-10-24): the daemon answers the descriptor ask with a confined DAX object.**
+  - **The object** is `slates_mem::DaxObject` (`crates/mem/src/dax_object.rs`, 1675dc0c). On Linux it is a memfd sealed
+    against growing, shrinking and further seals; on macOS a shm object whose random name is unlinked at once. It is
+    sized once to `2^63 − 2 MiB`, viewed a 2 MiB range at a time, and reached only through atomics. Its 8 tests by use
+    pass on macOS, and it is linted for Linux and Windows.
+  - **The answer** (`crates/server/src/shards/dax.rs`): the node is resolved and checked through the attachment's own
+    bridge (scope and rights). The node's one object is filled over the asked range, holes skipped, a copy slice a
+    turn, and a new descriptor of it goes back by `SCM_RIGHTS` on the answer's first byte.
+  - **Bounds.** Fills are counted page by page against the shard's reserve, each backing at least one range. A
+    backing is let go at the guest's FORGET or the stream's end, with its charge.
+  - **Proven by use** (`crates/server/tests/shards.rs`, 4 tests, macOS arm64): an object holds only its own file's
+    bytes; two asks answer one object; the VMM cannot resize it; hostile asks are refused by kind with no descriptor;
+    a third copy past a 16 MiB budget is refused `ENOMEM` until a FORGET gives a charge back.
+  - **Red-checked:** a fresh object per ask fails the one-object test; a FORGET that releases nothing fails the budget
+    test; fills stored into the wrong object fail the confinement test.
+  - **Owed in step 2:** the DAX offer itself (`FUSE_HAS_INODE_DAX` and `FUSE_MAP_ALIGNMENT` at INIT, `FUSE_ATTR_DAX`
+    on files of a range or more), and CI's Linux run of the object and server tests.
   - **No revoke and no new frames are needed.** slates answers the existing DESCRIPTOR ask with one shared-memory
     object per attachment and file, sized once to `2^63 − 2 MiB` (sparse), and writes every change of the file into
     it before acknowledging the change. The guest's stores are ingested at its FSYNC, FLUSH and RELEASE, and at the

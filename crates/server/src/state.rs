@@ -442,6 +442,11 @@ pub struct ShardState {
   /// by the shard's client seats (`clients_per_shard`): an attach past them is refused `Overloaded`.
   #[cfg(unix)]
   pub(crate) shards_streams: crate::shards::ShardsStreams,
+  /// The bytes this shard's Shards DAX backings count against its fill budget (Shards part 3; `crate::shards` `dax`):
+  /// each backing's stored pages, at least one range. Bounded by the budget, the shard's content reserve; a fill past it
+  /// is refused `ENOMEM`.
+  #[cfg(unix)]
+  pub(crate) dax_filled: u64,
   /// The Shards stream ends owed to this shard's clients, by the request word of the attach that made each (A-161;
   /// `crate::shards::Handoff`): sent over the client's control socket just before the attach's reply. Bounded by the
   /// requests the shard's clients may have in flight: an attach past it is refused `Overloaded`.

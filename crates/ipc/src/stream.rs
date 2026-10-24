@@ -53,6 +53,34 @@ pub fn send(end: BorrowedFd<'_>, bytes: &[u8]) -> Result<usize, Errno> {
   rustix::net::send(end, bytes, flags)
 }
 
+/// Format: the descriptors one send carries by `SCM_RIGHTS`: a DAX window's descriptor (Shards part 3).
+const SEND_DESCRIPTORS: usize = 1;
+
+/// Sends what of `bytes` the daemon's end takes now, with `descriptor` riding the first byte by `SCM_RIGHTS`, as [`send`]
+/// does otherwise: the bytes taken, at least one when it answers at all, so the descriptor went with them; `EAGAIN` when
+/// the buffer is full, and nothing went. The peer holds a duplicate once it reads the byte; the caller keeps its own
+/// descriptor and closes it when it will. A DAX object's descriptor is a memory object, not a socket, so the kernel's
+/// collector of sockets in flight never touches it (the macOS flush of A-161 took a passed socket).
+pub fn send_with_descriptor(
+  end: BorrowedFd<'_>,
+  bytes: &[u8],
+  descriptor: BorrowedFd<'_>,
+) -> Result<usize, Errno> {
+  use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage};
+  #[cfg(target_os = "linux")]
+  let flags = rustix::net::SendFlags::NOSIGNAL;
+  #[cfg(not(target_os = "linux"))]
+  let flags = rustix::net::SendFlags::empty();
+  let fds = [descriptor];
+  let mut space =
+    [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(SEND_DESCRIPTORS))];
+  let mut control = SendAncillaryBuffer::new(&mut space);
+  if !control.push(SendAncillaryMessage::ScmRights(&fds)) {
+    return Err(Errno::NOBUFS);
+  }
+  rustix::net::sendmsg(end, &[std::io::IoSlice::new(bytes)], &mut control, flags)
+}
+
 /// Reads what has arrived on the daemon's end into `into`: the bytes read, zero once the peer has closed its end or
 /// this end was [`end`]ed, `EAGAIN` when nothing waits.
 pub fn recv(end: BorrowedFd<'_>, into: &mut [u8]) -> Result<usize, Errno> {

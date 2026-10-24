@@ -19,6 +19,7 @@
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
+use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc::channel;
 use std::time::{Duration, Instant};
@@ -49,6 +50,8 @@ const CONTROL: u32 = 1 << 31;
 const ASK_SAVE: u8 = 1;
 const ASK_RESTORE: u8 = 2;
 const ASK_DESCRIPTOR: u8 = 3;
+/// Format: the range a guest maps a file in, and a DAX object's view (`FUSE_DAX_SZ`).
+const DAX_RANGE: u64 = slates_mem::DAX_RANGE_BYTES;
 /// Format: an opcode no FUSE kernel defines (`include/uapi/linux/fuse.h` ends in the low hundreds).
 const UNKNOWN_OPCODE: u32 = 9_999;
 /// Format: Linux errnos a reply carries, negated.
@@ -56,7 +59,12 @@ const ENOSYS: i32 = 38;
 const EPERM: i32 = 1;
 const ENOENT: i32 = 2;
 const EIO: i32 = 5;
-const EOPNOTSUPP: i32 = 95;
+/// Linux's `EISDIR`, a descriptor ask for a directory.
+const EISDIR: i32 = 21;
+/// Linux's `EINVAL`, a descriptor ask of no form the protocol has.
+const EINVAL: i32 = 22;
+/// Linux's `ENOMEM`, a fill past the shard's DAX budget.
+const ENOMEM: i32 = 12;
 /// Format: `FATTR_SIZE`, a SETATTR's bit for the size.
 const FATTR_SIZE: u32 = 1 << 3;
 /// Format: `O_RDWR`, an open's access mode.
@@ -386,6 +394,120 @@ impl Guest {
     let (control, reply) = self.reply_frame().expect("the daemon answered");
     assert!(!control);
     assert!(reply.is_empty(), "a FORGET takes no reply: an empty frame");
+  }
+
+  /// Asks for a DAX window's descriptor of `node`, as Shards' device does at a `FUSE_SETUPMAPPING`, with the mapping's
+  /// range in the agreed form where `range` names one, and reads the answer as its `shards_ipc::recv` does: the
+  /// descriptor, or the errno it was refused with. A refusal carrying a descriptor fails the test.
+  fn descriptor(
+    &mut self,
+    node: u64,
+    writable: bool,
+    range: Option<(u64, u64)>,
+  ) -> Result<OwnedFd, i32> {
+    let mut ask = vec![ASK_DESCRIPTOR];
+    ask.extend_from_slice(&node.to_le_bytes());
+    ask.push(u8::from(writable));
+    if let Some((offset, len)) = range {
+      ask.extend_from_slice(&offset.to_le_bytes());
+      ask.extend_from_slice(&len.to_le_bytes());
+    }
+    self.send_frame(CONTROL, &ask);
+    self.descriptor_answer()
+  }
+
+  /// Reads a descriptor ask's answer: a `shards_ipc` header (kind, big-endian length), any descriptor riding its first
+  /// byte, then the payload.
+  fn descriptor_answer(&mut self) -> Result<OwnedFd, i32> {
+    use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
+    let mut header = [0u8; 5];
+    let mut space = [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut control = RecvAncillaryBuffer::new(&mut space);
+    let received = rustix::net::recvmsg(
+      &self.stream,
+      &mut [std::io::IoSliceMut::new(&mut header)],
+      &mut control,
+      RecvFlags::empty(),
+    )
+    .unwrap();
+    let mut descriptors: Vec<OwnedFd> = Vec::new();
+    for message in control.drain() {
+      if let RecvAncillaryMessage::ScmRights(fds) = message {
+        descriptors.extend(fds);
+      }
+    }
+    self
+      .stream
+      .read_exact(&mut header[received.bytes..])
+      .unwrap();
+    let mut payload =
+      vec![0u8; usize::try_from(u32::from_be_bytes(header[1..5].try_into().unwrap())).unwrap()];
+    self.stream.read_exact(&mut payload).unwrap();
+    if header[0] == 0 {
+      assert!(payload.is_empty(), "an answered ask carries no payload");
+      assert_eq!(
+        descriptors.len(),
+        1,
+        "an answered ask carries one descriptor"
+      );
+      return Ok(descriptors.remove(0));
+    }
+    assert!(
+      descriptors.is_empty(),
+      "a refused ask carries no descriptor"
+    );
+    Err(i32::from_le_bytes(payload[..4].try_into().unwrap()))
+  }
+}
+
+/// One range of a DAX object, mapped from a descriptor the daemon answered, as Shards' window maps it: shared, read and
+/// write. Unmapped when dropped.
+struct WindowRange {
+  at: *mut u8,
+  len: usize,
+}
+
+impl WindowRange {
+  fn map(object: &OwnedFd, range: u64) -> WindowRange {
+    let len = usize::try_from(DAX_RANGE).unwrap();
+    // SAFETY: a fresh shared mapping of a range inside the object, which never shrinks (sealed on Linux, sized once on
+    // macOS); the test reads and writes it only through this struct, which unmaps it once.
+    let at = unsafe {
+      rustix::mm::mmap(
+        std::ptr::null_mut(),
+        len,
+        rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE,
+        rustix::mm::MapFlags::SHARED,
+        object,
+        range * DAX_RANGE,
+      )
+    }
+    .unwrap();
+    WindowRange { at: at.cast(), len }
+  }
+
+  /// The range's bytes, read as a guest reads its window: volatile loads.
+  fn bytes(&self) -> Vec<u8> {
+    // SAFETY: inside this live mapping.
+    (0..self.len)
+      .map(|index| unsafe { self.at.add(index).read_volatile() })
+      .collect()
+  }
+
+  /// A guest's store through its window: volatile writes.
+  fn store(&self, within: usize, bytes: &[u8]) {
+    assert!(within + bytes.len() <= self.len);
+    for (index, byte) in bytes.iter().enumerate() {
+      // SAFETY: inside this live mapping (asserted above).
+      unsafe { self.at.add(within + index).write_volatile(*byte) };
+    }
+  }
+}
+
+impl Drop for WindowRange {
+  fn drop(&mut self) {
+    // SAFETY: the mapping `map` made, unmapped once.
+    let _ = unsafe { rustix::mm::munmap(self.at.cast(), self.len) };
   }
 }
 
@@ -855,7 +977,7 @@ fn a_closed_stream_gives_back_what_its_guest_held() {
 
 /// Shards' control asks are answered in the forms its device reads, and the stream goes on: a snapshot's, a restore's
 /// and an unknown ask by a control frame whose first byte is not zero and whose rest is the reason; a DAX descriptor ask
-/// by a `shards_ipc` message of a nonzero kind carrying Linux's `EOPNOTSUPP`, little-endian.
+/// for the root, a directory, by a `shards_ipc` message of a nonzero kind carrying Linux's `EISDIR`, little-endian.
 fn control_asks_are_refused_in_shards_forms(hostile: &mut Guest) {
   for ask in [ASK_SAVE, ASK_RESTORE, 0x7f] {
     hostile.send_frame(CONTROL, &[ask, 1, 2, 3]);
@@ -877,7 +999,7 @@ fn control_asks_are_refused_in_shards_forms(hostile: &mut Guest) {
   assert_eq!(u32::from_be_bytes(message[1..5].try_into().unwrap()), 4);
   assert_eq!(
     i32::from_le_bytes(message[5..9].try_into().unwrap()),
-    EOPNOTSUPP
+    EISDIR
   );
 }
 
@@ -973,10 +1095,367 @@ fn hostile_frames_are_refused_and_end_only_their_own_stream() {
   assert_eq!(bystander.lookup(ROOT, "nothing"), Err(ENOENT));
   guest_writes(&mut bystander, ROOT, "still-served.txt", FROM_GUEST);
   assert!(
-    wait_for_count(&daemon, "shards.control_refused", 4) >= 4,
-    "each control ask is counted"
+    wait_for_count(&daemon, "shards.control_refused", 3) >= 3,
+    "each refused control ask is counted"
+  );
+  assert!(
+    wait_for_count(&daemon, "shards.dax_not_a_file", 1) >= 1,
+    "the descriptor ask for the root is counted by its kind"
   );
   drop(bystander);
+  drop(client);
+  drop(daemon);
+}
+
+// --- Shards part 3, step 2: the DAX object a descriptor ask is answered with. ---
+
+/// A single-shard daemon whose shard reserve is `reserve` bytes where one is given (the fill budget is the reserve),
+/// with a client and a volume of `bound` bytes named `name`.
+fn dax_provisioned(name: &str, bound: u64, reserve: Option<u64>) -> (Daemon, Client, VolumeId) {
+  let profile = common::machine_profile();
+  let instance = format!("srv-{name}-{}", std::process::id());
+  let mut config = DaemonConfig::derive(&profile, &instance, Some(1));
+  if let Some(reserve) = reserve {
+    config.reserve_per_shard = reserve;
+  }
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: format!("slates-seg-{name}"),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = Client::connect(&instance);
+  let id = create_volume(&mut client, "dax", bound);
+  (daemon, client, id)
+}
+
+/// Creates a volume of `bound` bytes named `name`.
+fn create_volume(client: &mut Client, name: &str, bound: u64) -> VolumeId {
+  let reply = client.call(&RequestBody::Create {
+    name: name.to_owned(),
+    size: SizeClass::Bounded { limit: bound },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  });
+  let ReplyBody::Created { id } = reply else {
+    panic!("the volume was not created: {reply:?}");
+  };
+  id
+}
+
+/// The guest creates `name` in the root and writes `bytes` in frames of the largest write, then closes it: its node.
+fn guest_writes_large(guest: &mut Guest, name: &str, bytes: &[u8]) -> u64 {
+  let (file, fh) = guest.create(ROOT, name).unwrap();
+  let piece = usize::try_from(slates_bridge_fuse::init::MAX_WRITE).unwrap();
+  for (index, chunk) in bytes.chunks(piece).enumerate() {
+    let offset = u64::try_from(index * piece).unwrap();
+    assert_eq!(
+      guest.write(file, fh, offset, chunk),
+      Ok(u32::try_from(chunk.len()).unwrap())
+    );
+  }
+  assert_eq!(guest.close(file, fh), (0, 0));
+  file
+}
+
+/// `len` bytes of a pattern no other file here repeats: a page index and the seed, so a misplaced page shows.
+fn patterned(len: usize, seed: u8) -> Vec<u8> {
+  (0..len)
+    .map(|at| u8::try_from(at / 4096 % 251).unwrap() ^ seed ^ u8::try_from(at % 7).unwrap())
+    .collect()
+}
+
+/// Whether `needle` occurs in `haystack`.
+fn holds(haystack: &[u8], needle: &[u8]) -> bool {
+  haystack
+    .windows(needle.len())
+    .any(|window| window == needle)
+}
+
+/// A marker the neighbouring file of the same volume holds, and one a file of another volume holds.
+const NEIGHBOUR_MARKER: &[u8] = b"<<a neighbour's bytes, never in another file's object>>";
+const FAR_MARKER: &[u8] = b"<<another volume's bytes, never in this volume's objects>>";
+
+/// Each `(descriptor, range)` maps to the file's bytes there, zeros past its end: the ranges' bytes, for a scan.
+fn asked_ranges_are_the_files(content: &[u8], asked: &[(&OwnedFd, u64)]) -> Vec<u8> {
+  let range_bytes = usize::try_from(DAX_RANGE).unwrap();
+  let mut scanned = Vec::new();
+  for (descriptor, range) in asked {
+    let mapped = WindowRange::map(descriptor, *range).bytes();
+    let start = usize::try_from(*range).unwrap() * range_bytes;
+    let file_part = &content[start.min(content.len())..(start + range_bytes).min(content.len())];
+    assert_eq!(
+      &mapped[..file_part.len()],
+      file_part,
+      "range {range} is the file's"
+    );
+    assert!(
+      mapped[file_part.len()..].iter().all(|byte| *byte == 0),
+      "range {range} is zeros past the file's end"
+    );
+    scanned.extend(mapped);
+  }
+  scanned
+}
+
+/// Neither marker is in `scanned`, and the same scan finds each in its own file's object (non-vacuous).
+fn no_marker_but_its_own(scanned: &[u8], neighbours_object: &OwnedFd, fars_object: &OwnedFd) {
+  for marker in [NEIGHBOUR_MARKER, FAR_MARKER] {
+    assert!(
+      !holds(scanned, marker),
+      "no other file's bytes are in the object"
+    );
+  }
+  let neighbours = WindowRange::map(neighbours_object, 0).bytes();
+  assert!(
+    holds(&neighbours, NEIGHBOUR_MARKER),
+    "the scan finds a marker in its own file's object"
+  );
+  let fars = WindowRange::map(fars_object, 0).bytes();
+  assert!(
+    holds(&fars, FAR_MARKER),
+    "the scan finds the other volume's marker in its own file's object"
+  );
+}
+
+/// The daemon counted no descriptor refusal of any kind.
+fn no_descriptor_refusal_counted(daemon: &Daemon) {
+  none_counted(
+    daemon,
+    &[
+      "shards.dax_malformed",
+      "shards.dax_unreachable",
+      "shards.dax_not_a_file",
+      "shards.dax_read_only",
+      "shards.dax_budget",
+      "shards.dax_object",
+    ],
+  );
+}
+
+/// AC (Shards part 3, step 2), by use. Do: write a 5 MiB file and a neighbouring file holding a marker into a volume,
+/// and a file holding another marker into a second volume; ask for the two marked files' descriptors first, then for
+/// the large file's for its first range and, in the agreed ranged form, for its third, and once in today's form with no
+/// range; map what comes back as Shards' window does. Expect each descriptor to be of an object of 2^63 − 2 MiB whose asked ranges equal the file there
+/// (zeros past its end), whose untouched range is zeros, and in which neither marker occurs. Non-vacuous: the same scan
+/// finds each marker in its own file's object.
+#[test]
+fn a_descriptor_answers_with_an_object_holding_only_its_files_bytes() {
+  let (daemon, mut client, id) = dax_provisioned("shards-dax-confined", 16 << 20, None);
+  let other = create_volume(&mut client, "other", 4 << 20);
+  let mut guest = Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
+  guest.init();
+  let size = (5 << 20) + 123;
+  let content = patterned(size, 0x5a);
+  let big = guest_writes_large(&mut guest, "big", &content);
+  let mut neighbour_bytes = patterned(64 << 10, 0x11);
+  neighbour_bytes[1000..1000 + NEIGHBOUR_MARKER.len()].copy_from_slice(NEIGHBOUR_MARKER);
+  let neighbour = guest_writes_large(&mut guest, "neighbour", &neighbour_bytes);
+  let mut far_guest = Guest::over(attach(&daemon, other, None, Intent::Write).unwrap());
+  far_guest.init();
+  let mut far_bytes = patterned(64 << 10, 0x22);
+  far_bytes[2000..2000 + FAR_MARKER.len()].copy_from_slice(FAR_MARKER);
+  let far = guest_writes_large(&mut far_guest, "far", &far_bytes);
+  // The other files' objects are filled first, so any of their bytes misplaced into the large file's object is there
+  // when it is scanned.
+  let neighbours_object = guest.descriptor(neighbour, false, None).unwrap();
+  let fars_object = far_guest.descriptor(far, false, None).unwrap();
+
+  let first = guest.descriptor(big, false, Some((0, DAX_RANGE))).unwrap();
+  let object_size = rustix::fs::fstat(&first).unwrap().st_size;
+  assert_eq!(
+    u64::try_from(object_size).unwrap(),
+    slates_mem::DAX_OBJECT_BYTES
+  );
+  let third = guest
+    .descriptor(big, false, Some((2 * DAX_RANGE, DAX_RANGE)))
+    .unwrap();
+  let whole = guest.descriptor(big, false, None).unwrap();
+  let scanned = asked_ranges_are_the_files(&content, &[(&first, 0), (&third, 2), (&whole, 1)]);
+  let untouched = WindowRange::map(&first, 1000).bytes();
+  assert!(
+    untouched.iter().all(|byte| *byte == 0),
+    "an untouched range is zeros"
+  );
+  no_marker_but_its_own(&scanned, &neighbours_object, &fars_object);
+  assert_eq!(wait_for_count(&daemon, "shards.dax_answered", 5), 5);
+  no_descriptor_refusal_counted(&daemon);
+  drop(client);
+  drop(daemon);
+}
+
+/// AC (Shards part 3, step 2), by use. Do: ask twice for one file's descriptor, map the same range from each answer,
+/// and store through the first mapping; then, as the VMM, try to resize the object through a descriptor it holds.
+/// Expect the store to be seen through the second mapping, so both asks were answered with one object, and every resize
+/// refused with the size unchanged; on Linux the object carries the grow, shrink and seal seals.
+#[test]
+fn two_asks_for_one_node_answer_one_object_the_peer_cannot_resize() {
+  let (daemon, client, id) = dax_provisioned("shards-dax-one", 8 << 20, None);
+  let mut guest = Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
+  guest.init();
+  let file = guest_writes_large(&mut guest, "file", &patterned(3 << 20, 0x33));
+  let one = guest.descriptor(file, true, Some((0, DAX_RANGE))).unwrap();
+  let two = guest.descriptor(file, true, Some((0, DAX_RANGE))).unwrap();
+  let through_one = WindowRange::map(&one, 0);
+  let through_two = WindowRange::map(&two, 0);
+  through_one.store(100, b"seen through the other answer");
+  assert_eq!(
+    &through_two.bytes()[100..100 + 29],
+    b"seen through the other answer",
+    "both asks were answered with one object"
+  );
+  #[allow(clippy::disallowed_methods)]
+  // the VMM's attempt on a memory object: RAM, not a host path (R1).
+  let shrink = rustix::fs::ftruncate(&one, DAX_RANGE);
+  assert!(shrink.is_err(), "the VMM cannot shrink the object");
+  #[allow(clippy::disallowed_methods)] // as above.
+  let grow = rustix::fs::ftruncate(&one, slates_mem::DAX_OBJECT_BYTES + DAX_RANGE);
+  assert!(grow.is_err(), "the VMM cannot grow the object");
+  let after = rustix::fs::fstat(&two).unwrap().st_size;
+  assert_eq!(u64::try_from(after).unwrap(), slates_mem::DAX_OBJECT_BYTES);
+  #[cfg(target_os = "linux")]
+  {
+    let seals = rustix::fs::fcntl_get_seals(&one).unwrap();
+    for seal in [
+      rustix::fs::SealFlags::GROW,
+      rustix::fs::SealFlags::SHRINK,
+      rustix::fs::SealFlags::SEAL,
+    ] {
+      assert!(seals.contains(seal), "{seal:?} in {seals:?}");
+    }
+  }
+  drop(client);
+  drop(daemon);
+}
+
+/// AC (Shards part 3, step 2), hostile input. Do: send descriptor asks cut short, with a range whose end overflows, with
+/// a range past the object, for the root directory, for a node that does not exist, for a node outside a scoped
+/// attachment's directory, and a writable ask of a read-only attachment. Expect each refused with its errno and no
+/// descriptor, counted by its kind, the stream serving on after each; and the read-only attachment's read-only ask
+/// answered.
+#[test]
+fn hostile_descriptor_asks_are_refused_with_an_errno_and_no_descriptor() {
+  let (daemon, client, id) = dax_provisioned("shards-dax-hostile", 8 << 20, None);
+  let mut guest = Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
+  guest.init();
+  guest.mkdir(ROOT, "inside").unwrap();
+  let outside = guest_writes_large(&mut guest, "outside", &patterned(3 << 20, 0x44));
+  malformed_asks_are_refused(&mut guest, outside);
+  asks_for_no_file_are_refused(&mut guest, outside);
+  a_scoped_attachment_reaches_no_node_outside(&daemon, id, outside);
+  a_read_only_attachment_may_not_ask_to_write(&daemon, id, outside);
+  assert_eq!(wait_for_count(&daemon, "shards.dax_malformed", 3), 3);
+  assert_eq!(wait_for_count(&daemon, "shards.dax_not_a_file", 1), 1);
+  assert_eq!(wait_for_count(&daemon, "shards.dax_unreachable", 2), 2);
+  assert_eq!(wait_for_count(&daemon, "shards.dax_read_only", 1), 1);
+  drop(client);
+  drop(daemon);
+}
+
+/// Asks cut short, with a range whose end overflows, and with a range past the object: each `EINVAL`.
+fn malformed_asks_are_refused(guest: &mut Guest, file: u64) {
+  guest.send_frame(CONTROL, &[ASK_DESCRIPTOR, 1, 2, 3, 4]);
+  assert_eq!(guest.descriptor_answer().err(), Some(EINVAL), "cut short");
+  assert_eq!(
+    guest
+      .descriptor(file, false, Some((u64::MAX - 1, 16)))
+      .err(),
+    Some(EINVAL),
+    "a range whose end overflows"
+  );
+  let past = Some((slates_mem::DAX_OBJECT_BYTES, DAX_RANGE));
+  assert_eq!(
+    guest.descriptor(file, false, past).err(),
+    Some(EINVAL),
+    "a range past the object"
+  );
+}
+
+/// Asks for the root directory and for a node that does not exist: `EISDIR` and `ENOENT`, the stream serving on.
+fn asks_for_no_file_are_refused(guest: &mut Guest, file: u64) {
+  assert_eq!(
+    guest.descriptor(ROOT, false, None).err(),
+    Some(EISDIR),
+    "a directory"
+  );
+  assert_eq!(
+    guest.descriptor(999_999, false, None).err(),
+    Some(ENOENT),
+    "no such node"
+  );
+  assert_eq!(
+    guest.lookup(ROOT, "outside"),
+    Ok(file),
+    "the stream serves on"
+  );
+}
+
+/// An attachment scoped to `inside` asks for `outside`: refused with an errno.
+fn a_scoped_attachment_reaches_no_node_outside(daemon: &Daemon, id: VolumeId, outside: u64) {
+  let mut scoped = Guest::over(attach(daemon, id, Some("inside"), Intent::Write).unwrap());
+  scoped.init();
+  let refused = scoped.descriptor(outside, false, None).err();
+  assert!(
+    refused.is_some_and(|errno| errno != 0),
+    "a node outside the scoped attachment's directory: {refused:?}"
+  );
+}
+
+/// A read-only attachment's writable ask is refused `EPERM`, and its read-only ask answered.
+fn a_read_only_attachment_may_not_ask_to_write(daemon: &Daemon, id: VolumeId, file: u64) {
+  let mut reader = Guest::over(attach(daemon, id, None, Intent::Read).unwrap());
+  reader.init();
+  assert_eq!(
+    reader.descriptor(file, true, Some((0, DAX_RANGE))).err(),
+    Some(EPERM),
+    "a writable ask of a read-only attachment"
+  );
+  assert!(
+    reader.descriptor(file, false, Some((0, DAX_RANGE))).is_ok(),
+    "its read-only ask is answered"
+  );
+}
+
+/// AC (Shards part 3, step 2), the budget. Do: on a daemon whose shard reserve, and so its fill budget, is 16 MiB (of
+/// which a bounded volume may take 6 MiB, the rest the shard's operation headroom), write a 5.5 MiB file and have
+/// three attachments each ask for the whole of it; then have the first forget its node and the third ask again. Expect
+/// the first two answered (11 MiB of copies), the third refused `ENOMEM` and counted, since its copy would take the
+/// fills to 16.5 MiB, and answered once the first's forget gave its 5.5 MiB back.
+#[test]
+fn a_fill_past_the_shards_budget_is_refused_and_a_forget_gives_its_charge_back() {
+  let reserve = 16 << 20;
+  let (daemon, client, id) = dax_provisioned("shards-dax-budget", 6 << 20, Some(reserve));
+  let mut first = Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
+  first.init();
+  let file = guest_writes_large(&mut first, "file", &patterned((11 << 20) / 2, 0x55));
+  let mut second = Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
+  second.init();
+  assert_eq!(second.lookup(ROOT, "file"), Ok(file));
+  let mut third = Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
+  third.init();
+  assert_eq!(third.lookup(ROOT, "file"), Ok(file));
+  for (which, guest) in [("first", &mut first), ("second", &mut second)] {
+    let answered = guest.descriptor(file, false, None);
+    assert!(answered.is_ok(), "the {which} copy fits: {answered:?}");
+  }
+  assert_eq!(
+    third.descriptor(file, false, None).err(),
+    Some(ENOMEM),
+    "a third copy passes the budget"
+  );
+  assert_eq!(wait_for_count(&daemon, "shards.dax_budget", 1), 1);
+  first.forget(file, 1);
+  let retried = third.descriptor(file, false, None);
+  assert!(
+    retried.is_ok(),
+    "the first's forget gave its charge back: {retried:?}"
+  );
   drop(client);
   drop(daemon);
 }

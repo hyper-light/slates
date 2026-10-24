@@ -5,16 +5,19 @@
 //! word's top bit set ([`CONTROL_FRAME`]). This module is the backend's byte work, which the daemon's serve task
 //! (`crates/server/src/shards.rs`) runs on the end it keeps: [`split_frame`] takes a frame from the bytes read so far,
 //! its length bounded before anything is allocated for it; [`answer`] dispatches a request through the bridge the kernel
-//! mount uses ([`crate::bridge::dispatch`], the one FUSE seam) and writes the reply frame; [`control_refusal`] and
-//! [`descriptor_refusal`] answer the asks slates does not serve, in Shards' forms.
+//! mount uses ([`crate::bridge::dispatch`], the one FUSE seam) and writes the reply frame; [`descriptor_ask`] reads a DAX
+//! window's descriptor ask and [`descriptor_answer`] heads the answer that carries the descriptor; [`control_refusal`]
+//! and [`descriptor_refusal`] answer what slates refuses, in Shards' forms.
 //!
 //! These are functions over bytes, holding no socket and no OS type, so they stay inside the lint wall's RAM-only rule
 //! (R1) and run on every platform; the stream, its readiness and its end are the daemon's. Every failure is a typed
 //! [`std::io::Error`] or a FUSE error reply, never a panic.
 //!
-//! The non-DAX path: a frame carries a FUSE request, and a DAX window's descriptor ask is refused `EOPNOTSUPP`, because a
-//! file's descriptor would carry its whole content object (A-135); a window over a backing that authorizes only one
-//! attachment's bytes is Shards part 3.
+//! The DAX path (Shards part 3; `docs/wip/shards/dax-protocol.md`, agreed with the Shards owner 2026-10-24): a descriptor
+//! ask is answered with a descriptor of the asked file's DAX object, one per attachment and file, which holds only that
+//! file's bytes (`slates_mem::DaxObject`). A descriptor of slates' content itself would carry its whole content object
+//! (A-135). The daemon makes, fills and bounds the object (`crates/server/src/shards_dax.rs`); this module reads the ask,
+//! in its 10-byte form or with the agreed range, and heads the answer.
 
 use std::io;
 
@@ -248,8 +251,67 @@ pub fn control_refusal(reason: &str) -> Vec<u8> {
   frame
 }
 
-/// The answer to a descriptor ask slates does not serve: a `shards_ipc` message of a kind other than zero, whose payload
-/// is the errno, little-endian, which Shards' device returns to the guest's mapping (its `descriptor_on`).
+/// Format: a DESCRIPTOR ask's body after its ask byte, as Shards' device sends it today: the node (le64) and the
+/// writable byte (`mod.rs` `descriptor_on`).
+pub const DESCRIPTOR_ASK_BODY: usize = 9;
+/// Format: a DESCRIPTOR ask's body with the mapping's range appended: its offset in the file and its length, `le64`
+/// each, the `fuse_setupmapping_in` fields of the mapping it is for (agreed with the Shards owner 2026-10-24,
+/// `docs/wip/shards/dax-protocol.md`).
+pub const DESCRIPTOR_ASK_RANGED_BODY: usize = 25;
+/// Format: the `shards_ipc` kind of a descriptor answer that carries the descriptor.
+const IPC_DESCRIPTOR: u8 = 0;
+
+/// A DAX window's descriptor ask (Shards D189): the node whose file the mapping maps, whether the guest asked to write
+/// it, and, from a device that names it, the mapping's range in the file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DescriptorAsk {
+  /// The node, as the guest's FUSE requests name it.
+  pub node: u64,
+  /// Whether the mapping is to be written (`FUSE_SETUPMAPPING_FLAG_WRITE`).
+  pub writable: bool,
+  /// The mapping's offset in the file and its length, `None` from a device that names no range.
+  pub range: Option<(u64, u64)>,
+}
+
+/// Parses a DESCRIPTOR ask's body after its ask byte: `None` for a body of neither length the protocol has, a range of
+/// no bytes, or one whose end overflows. The device's own kinds of ask are fixed lengths, so anything else is hostile or
+/// cut short, and the caller refuses it.
+pub fn descriptor_ask(body: &[u8]) -> Option<DescriptorAsk> {
+  let word = |at: usize| -> Option<u64> {
+    let bytes = body.get(at..at.checked_add(size_of::<u64>())?)?;
+    Some(u64::from_le_bytes(bytes.try_into().ok()?))
+  };
+  let node = word(0)?;
+  let writable = *body.get(size_of::<u64>())? != 0;
+  let range = match body.len() {
+    DESCRIPTOR_ASK_BODY => None,
+    DESCRIPTOR_ASK_RANGED_BODY => {
+      let (offset, len) = (
+        word(DESCRIPTOR_ASK_BODY)?,
+        word(DESCRIPTOR_ASK_BODY.checked_add(size_of::<u64>())?)?,
+      );
+      if len == 0 || offset.checked_add(len).is_none() {
+        return None;
+      }
+      Some((offset, len))
+    }
+    _ => return None,
+  };
+  Some(DescriptorAsk {
+    node,
+    writable,
+    range,
+  })
+}
+
+/// The answer that carries a descriptor: a `shards_ipc` header of kind zero and an empty payload. The descriptor rides
+/// its first byte by `SCM_RIGHTS`, which the daemon's send attaches; Shards' `shards_ipc::recv` takes it from there.
+pub fn descriptor_answer() -> [u8; IPC_HEADER_BYTES] {
+  [IPC_DESCRIPTOR, 0, 0, 0, 0]
+}
+
+/// The answer to a descriptor ask slates refuses: a `shards_ipc` message of a kind other than zero, whose payload is
+/// the errno, little-endian, which Shards' device returns to the guest's mapping (its `descriptor_on`).
 pub fn descriptor_refusal(errno: i32) -> Vec<u8> {
   let payload = errno.to_le_bytes();
   let mut message = Vec::with_capacity(IPC_HEADER_BYTES.saturating_add(payload.len()));
@@ -317,5 +379,54 @@ mod tests {
     );
     let message = descriptor_refusal(38);
     assert_eq!(message, [IPC_REFUSED, 0, 0, 0, 4, 38, 0, 0, 0]);
+  }
+
+  /// Do: parse a DESCRIPTOR ask as Shards' device sends it today (node and writable byte), the agreed ranged form, and
+  /// the forms the protocol does not have (cut short, a stray byte, a range of nothing, a range whose end overflows).
+  /// Expect the two real forms read field for field, and every other refused; and the descriptor answer's header to be
+  /// kind zero with an empty payload. Serves Shards part 3, step 2.
+  #[test]
+  fn descriptor_asks_parse_in_both_forms_and_hostile_ones_are_refused() {
+    let mut plain = 7u64.to_le_bytes().to_vec();
+    plain.push(1);
+    assert_eq!(
+      descriptor_ask(&plain),
+      Some(DescriptorAsk {
+        node: 7,
+        writable: true,
+        range: None
+      })
+    );
+    let mut ranged = 9u64.to_le_bytes().to_vec();
+    ranged.push(0);
+    ranged.extend_from_slice(&(4u64 << 20).to_le_bytes());
+    ranged.extend_from_slice(&(2u64 << 20).to_le_bytes());
+    assert_eq!(
+      descriptor_ask(&ranged),
+      Some(DescriptorAsk {
+        node: 9,
+        writable: false,
+        range: Some((4 << 20, 2 << 20))
+      })
+    );
+    assert_eq!(descriptor_ask(&plain[..8]), None, "cut short");
+    let mut stray = plain.clone();
+    stray.push(0);
+    assert_eq!(
+      descriptor_ask(&stray),
+      None,
+      "a length the protocol does not have"
+    );
+    let mut nothing = ranged.clone();
+    nothing.splice(17..25, 0u64.to_le_bytes());
+    assert_eq!(descriptor_ask(&nothing), None, "a range of no bytes");
+    let mut overflowing = ranged.clone();
+    overflowing.splice(9..17, (u64::MAX - 1).to_le_bytes());
+    assert_eq!(
+      descriptor_ask(&overflowing),
+      None,
+      "a range whose end overflows"
+    );
+    assert_eq!(descriptor_answer(), [0, 0, 0, 0, 0]);
   }
 }
