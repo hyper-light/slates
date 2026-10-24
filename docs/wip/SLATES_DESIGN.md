@@ -3357,8 +3357,8 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 > reply, from either shard; on macOS the reply carries a single-use secret and the client claims the end on the
 > daemon's socket route, an exchange keyed by HKDF-SHA256 and sealed with AES-256-GCM (`slates_ipc::route`,
 > `crates/server/src/shards_route.rs`). `Client::attach_shards` takes either; Windows refuses the form
-> `DescriptorRouteNotBuilt`. `slates shards ID --fd N -- CMD` runs a program with the end at descriptor `N`, keeping no
-> copy, so the attachment ends when the program's end closes. Not yet: a real Shards boot against the daemon, and DAX.
+> `DescriptorRouteNotBuilt`. `slates shards ID --fd N -- CMD` replaces itself with a program holding the end at
+> descriptor `N`, so the attachment ends when the program's end closes. Not yet: a real Shards boot against the daemon, and DAX.
 > The details and the evidence are A-161's.
 
 **Writeback and snapshot barrier.** Kernel/guest cache negotiation changes when writes reach
@@ -12101,14 +12101,14 @@ Applied in the same change to:
 - (step 5) `crates/bridge-fuse`: `shards_fs.rs` (the blocking helpers removed, the module doc rewritten),
   `tests/shards_fs.rs` and `examples/shards_fs_bench.rs` (on `split_frame` and `answer`), `examples/shards_fs_serve.rs`
   (removed); `docs/wip/BENCHMARKS.md`, `docs/wip/shards/`, `docs/wip/virtiofs.md`;
-- (step 4) `crates/ipc`: `stream.rs` (`spawn_with`, `FIRST_HANDED_NUMBER`), `route.rs` (the received end made
+- (step 4) `crates/ipc`: `stream.rs` (`exec_with`, `FIRST_HANDED_NUMBER`), `route.rs` (the received end made
   close-on-exec), `tests/stream_spawn.rs` (new); `crates/client` (`attach_shards` on every platform, `StreamEnd`, the
   delivery steps as paired functions; the Windows refusal in `tests/shards.rs`); `crates/cli` (`slates shards`:
   `args.rs`, `verbs.rs`, `main.rs`; `tests/cli.rs`; the FUSE codec a Unix dev-dependency); `crates/server` (`shards.rs`,
   `verbs.rs`: unit structs where a platform prepares or carries nothing); `crates/conformance` (`trace.rs`, `record.rs`,
   `matrix.rs`: the daemon's socket node, a class of its own) and `xtask` (the hermeticity run names the route's node);
   `.github/workflows/ci.yml` (the Windows refusal test on both Windows lanes); `unsafe-budget.toml` (`slates-ipc`
-  48 → 49, `spawn_with`'s `pre_exec`); `docs/cli.md`, `docs/wip/conformance.md`;
+  48 → 49, `exec_with`'s `pre_exec`); `docs/cli.md`, `docs/wip/conformance.md`; `tests/stream_exec.rs`;
 - §4.6, GAPS.
 
 - **What it answers.** Shards' fs device forwards each guest FUSE request to a backend over a Unix stream it is handed
@@ -12228,17 +12228,20 @@ Applied in the same change to:
   - What it does not change: the secret is as private as the client's ring, which on macOS a same-user process could
     open by name (GAP-A9-9), and that process could read the ring's file contents as well.
 - **The CLI (2026-10-24, part 1 step 4).** `slates shards ID [--subtree DIR] [--read-only] --fd N -- CMD` attaches the
-  volume in the Shards form, announces the attachment, and runs the command with the end at descriptor `N` (3 or
-  more), so a Shards spawner, or a test, gets a working end without linking slates (`shards run … --slates-fs-fd N`).
-  It closes its client before the command starts and keeps no copy of the end, so the attachment lasts exactly as long
-  as the command's end; the command's standard streams and exit code are its own.
-  - `slates_ipc::stream::spawn_with` places the end in the forked child (`dup2` in `pre_exec`, which clears
-    close-on-exec on the copy), so no child another thread spawns inherits it. **Found in review, test first:** the
-    standard library learns of a failed `exec` through a close-on-exec pipe whose ends take the lowest free numbers, so
-    a free `N` could be the pipe's write end, and the child's `dup2` would close it: the parent then reports a program
-    that never ran as spawned, and the failed exec writes its error into the stream.
-    `a_program_that_cannot_run_is_refused_whatever_number_it_is_handed_at` saw a missing program reported spawned at
-    the lowest free number plus one (6). `N` is now held open in the parent until the spawn returns.
+  volume in the Shards form, announces the attachment, and replaces itself with the command, the end at descriptor `N`
+  (3 or more), so a Shards spawner, or a test, gets a working end without linking slates (`shards run … --slates-fs-fd
+  N`). The client is closed first and only the copy at `N` goes into the command, so the attachment lasts exactly as
+  long as the command's end; and the process a launcher started is the command itself, its pid, signals and exit code
+  the command's, so a supervisor that ends it ends the attachment.
+  - `slates_ipc::stream::exec_with` makes its own copy of the end close-on-exec and places one at `N` with `dup2` in
+    `pre_exec`, just before `execvp`; a failed exec is refused (exit 4) and the end closes as the process exits.
+  - **Replaced the same day: the command first spawned the program and waited** (`spawn_with`). A launcher that killed
+    the process it started killed only `slates shards`, and the program kept its end and its attachment (kiln's Sandbox,
+    which launches and supervises VMs, described that shape on 2026-10-24). `a_killed_launch_ends_its_attachment`
+    failed on it: the process spawned was not the program (pid 14084, the reader 14086). It passes on the exec. Found
+    in `spawn_with`'s review before it was replaced, and moot now: the standard library learns of a failed spawned
+    `exec` through a pipe whose write end could take a free `N`, which the child's `dup2` then closed, so a missing
+    program was reported spawned (at the lowest free number plus one, 6). An exec makes no such pipe.
   - macOS has no `MSG_CMSG_CLOEXEC`, so the client makes the end it receives on the route close-on-exec at once.
   - Windows: `attach_shards` compiles on every platform; off Unix the end's type (`StreamEnd`) has no values, the
     delivery steps refuse as unexpected replies, and the daemon refuses the form by kind
@@ -12248,14 +12251,12 @@ Applied in the same change to:
   - Evidence: `slates_shards_hands_a_program_a_working_stream_end_and_the_attachment_ends_with_it`
     (`crates/cli/tests/cli.rs`) runs a real anchor: a reader, the test binary re-invoked under `slates shards --fd 7`,
     mounts the attachment over descriptor 7 (`INIT`, `LOOKUP`, `OPEN`, `READ`, `RELEASE`) and prints what it read,
-    byte-equal to the file; the attachment it ran under is gone once it exits; a program that exits 7 makes the command
-    exit 7; a program that closes its end and waits sees its attachment gone while it and the command still run; with
-    `slates shards` killed (`SIGKILL`) while its program waits, the attachment holds and the orphaned program mounts and
-    reads the file through its end afterwards, its exit then ending the attachment; a missing volume is refused
-    (exit 1), a program that cannot run fails (exit 4) with its attachment ended, and `--fd 2` is usage (exit 2). Passed on macOS arm64 (4.6–6.6 s, load 8.6) and Linux x86_64 (adacachy, 0.39 s, load
-    20–31). Red-checked on macOS: with `spawn_with` leaking the parent's copy, the attachment outlived the end that
-    closed (failed after `WAIT_FOR`, 10 s) while the reader's and the silent program's checks still passed, which is why
-    the waiting program is there.
+    byte-equal to the file; the attachment it ran under is gone once it exits; a program that exits 7 exits 7; a program
+    that closes its end and waits sees its attachment gone while it still runs; the process a launch spawned is the
+    program, and a `SIGKILL` of it ends the attachment; a missing volume is refused (exit 1), a program that cannot run
+    fails (exit 4) with its attachment ended, and `--fd 2` is usage (exit 2). `crates/ipc/tests/stream_exec.rs`: a
+    process replaced by `sh` hands it the end at 5, and the end closes while `sh` still runs once it closes its 5;
+    red-checked, without the close-on-exec of `exec_with`'s own copy the read waited out its 10 s.
   - Step 2's evidence on Linux (adacachy, 2026-10-24): `crates/client/tests/shards.rs` 3 of 3, `crates/server/tests/
     shards.rs` 7 of 7; with the control-socket send withheld in `deliver_handoff`, all three client tests failed at the
     attach (`Ipc(DeadlineExceeded)`), and passed again restored.

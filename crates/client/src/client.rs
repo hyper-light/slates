@@ -134,7 +134,7 @@ pub struct ShardsStream {
   /// The attachment the daemon serves on the stream's other end.
   pub attachment: Attachment,
   /// The stream's end, close-on-exec: move it to the descriptor number the VMM expects before spawning it
-  /// (`slates_ipc::stream::spawn_with` does both).
+  /// (`slates_ipc::stream::exec_with` does both, replacing the process with the VMM).
   pub stream: StreamEnd,
 }
 

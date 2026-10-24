@@ -1564,12 +1564,13 @@ pub(crate) fn run_consumer(request: &RunRequest) -> Result<(), Failure> {
 }
 
 /// `shards ID [--subtree DIR] [--read-only] --fd N -- CMD [ARG ...]` (§4.6, the Shards route; A-161): attaches the
-/// volume in the Shards form, announces the attachment, and runs the command with the stream end at descriptor N, so a
-/// Shards spawner, or a test, is handed a working end without linking slates. The client is closed before the command
-/// starts and this process keeps no copy of the end, so the attachment lives exactly as long as the command's end: it
-/// ends when the command (and anything it handed the end to) closes it, whether or not this process still waits. The
-/// command's standard streams are this one's, and so is its exit code. Where the daemon has no route to hand a client
-/// the end (Windows), the attach is refused by kind and nothing runs.
+/// volume in the Shards form, announces the attachment, and replaces this process with the command, the stream end at
+/// descriptor N, so a Shards spawner, or a test, is handed a working end without linking slates. The client is closed
+/// first and only the copy at N goes into the command, so the attachment lives exactly as long as the command's end; and
+/// the process its launcher started is the command itself, its pid, signals and exit code the command's, so a
+/// supervisor that ends it ends the attachment. Returns only when the command could not run (refused, exit 4, its end
+/// closing as this process exits). Where the daemon has no route to hand a client the end (Windows), the attach is
+/// refused by kind and nothing runs.
 pub(crate) fn run_shards(request: &ShardsRequest) -> Result<(), Failure> {
   let (program, args) = request
     .command
@@ -1585,18 +1586,12 @@ pub(crate) fn run_shards(request: &ShardsRequest) -> Result<(), Failure> {
     .map_err(|e| failure_of(e, &request.instance))?;
   announce_attachment(shards.attachment.attachment, request.json);
   let args: Vec<OsString> = args.iter().map(OsString::from).collect();
-  let mut child = spawn_handed(OsStr::new(program), &args, shards.stream, request.fd)?;
-  let status = child
-    .wait()
-    .map_err(|e| Failure::Failed(format!("shards: waiting for {program}: {e}")))?;
-  match status.code() {
-    Some(0) => Ok(()),
-    Some(code) => Err(Failure::ChildExited { code }),
-    None => Err(Failure::Failed(format!(
-      "shards: {program} (attachment {}) was ended by a signal",
-      shards.attachment.attachment
-    ))),
-  }
+  Err(exec_handed(
+    OsStr::new(program),
+    &args,
+    shards.stream,
+    request.fd,
+  ))
 }
 
 /// Prints the attachment a `shards` command runs under, before the command starts, so a human can find it in `status`
@@ -1611,32 +1606,31 @@ fn announce_attachment(attachment: u64, json: bool) {
   let _ = std::io::stdout().flush();
 }
 
-/// Runs `program` with the stream end at descriptor number `at` (`slates_ipc::stream::spawn_with`). A spawn that fails
-/// drops the end, so the stream ends its attachment.
+/// Replaces this process with `program`, the stream end at descriptor number `at` (`slates_ipc::stream::exec_with`);
+/// returns only the refusal of a command that could not run.
 #[cfg(unix)]
-fn spawn_handed(
+fn exec_handed(
   program: &OsStr,
   args: &[OsString],
   stream: slates_client::StreamEnd,
   at: i32,
-) -> Result<std::process::Child, Failure> {
-  slates_ipc::stream::spawn_with(program, args, stream, at).map_err(|e| {
-    Failure::Failed(format!(
-      "shards: running {} with its end at descriptor {at}: {e}",
-      program.to_string_lossy()
-    ))
-  })
+) -> Failure {
+  let error = slates_ipc::stream::exec_with(program, args, stream, at);
+  Failure::Failed(format!(
+    "shards: running {} with its end at descriptor {at}: {error}",
+    program.to_string_lossy()
+  ))
 }
 
 /// No stream end exists here (`slates_client::StreamEnd` has no values off Unix: the daemon refuses the form by kind),
 /// so there is nothing to run.
 #[cfg(not(unix))]
-fn spawn_handed(
+fn exec_handed(
   _program: &OsStr,
   _args: &[OsString],
   stream: slates_client::StreamEnd,
   _at: i32,
-) -> Result<std::process::Child, Failure> {
+) -> Failure {
   match stream {}
 }
 

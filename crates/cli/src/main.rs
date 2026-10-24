@@ -187,7 +187,7 @@ pub(crate) enum Failure {
   },
   /// The command itself failed (the anchor or the daemon).
   Failed(String),
-  /// The workload `slates run` or `slates shards` spawned ended with this code, which the command exits with as it was.
+  /// The workload `slates run` spawned ended with this code, which `run` exits with as it was.
   ChildExited {
     /// The workload's exit code.
     code: i32,

@@ -411,14 +411,14 @@ surface like `grant` and need its variables; `share` is the volume owner's.
 
 `slates shards ID [--subtree DIR] [--read-only] --fd N [--json] -- CMD [ARG ...]` hands a program a Shards
 microVM's filesystem device: it attaches the volume (or only `DIR` of it; for writing unless `--read-only`, as
-`mount` attaches), announces the attachment (`attachment: N`, or `{"attachment": N}` under `--json`), and runs
-`CMD` with one end of a socket pair at descriptor `N` — the end the daemon serves that attachment on, in Shards'
-framing, so a VMM given it (`shards run … --slates-fs-fd N`) mounts the volume as `shards0`. `N` is 3 or more.
-The end is the attachment's capability: whoever holds it reaches that attachment and nothing else. `slates shards`
-keeps no copy of it and closes its own client before the command starts, so the attachment lasts exactly as long
-as the command's end: it ends when the command, and anything the command handed the end to, closes it (or on
-`detach`, a revocation, the volume's destroy). The command's standard streams are this one's and `shards` exits as
-the command did; a command that cannot run is a failure (exit 4), its attachment ended with the end it never got.
+`mount` attaches), announces the attachment (`attachment: N`, or `{"attachment": N}` under `--json`), and
+replaces itself with `CMD`, one end of a socket pair at descriptor `N` — the end the daemon serves that attachment
+on, in Shards' framing, so a VMM given it (`shards run … --slates-fs-fd N`) mounts the volume as `shards0`. `N` is
+3 or more. The end is the attachment's capability: whoever holds it reaches that attachment and nothing else. Only
+the copy at `N` goes into the command, so the attachment lasts exactly as long as the command's end: it ends when the
+command, and anything the command handed the end to, closes it (or on `detach`, a revocation, the volume's destroy).
+The process you started is the command — its pid, its signals, its exit code — so ending it ends the attachment; a
+command that cannot run is a failure (exit 4), its attachment ended with the end it never got.
 Linux sends the end over the client's control socket; macOS claims it on the daemon's socket route, an encrypted
 exchange keyed by a single-use secret. Windows refuses the form by kind (`AttachmentUnsupported`,
 `DescriptorRouteNotBuilt`) until a route hands a client a handle.

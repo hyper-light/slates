@@ -11059,17 +11059,17 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   unreachable cycles of descriptors in flight, each release scheduling Linux's collector: 10 of 10 runs on Linux
   7.2.9 (adacachy, load 49, 2026-10-24) delivered every end live, 8,192–12,976 cycles dropped during each. It is
   evidence of absence under that stress, not a proof; the mapping path shares the mechanism but was not the one driven.
-- **Step 4 built (2026-10-24):** `slates shards ID [--subtree DIR] [--read-only] --fd N -- CMD` runs a program with the
-  end at descriptor `N`, keeping no copy, so the attachment ends when the program's end closes; the program's exit code
-  is the command's. A reader re-invoked under it mounts and reads a file byte-equal through descriptor 7; a program
-  that closes its end sees its attachment gone while it still runs; and with `slates shards` killed (`SIGKILL`) while
-  its program waits, the attachment holds and the orphaned program still reads through its end
-  (`crates/cli/tests/cli.rs`; macOS arm64 and Linux x86_64; red-checked by leaking the parent's copy). `Client::attach_shards` compiles everywhere and Windows refuses
-  the form by kind, `DescriptorRouteNotBuilt`, tested on both Windows CI lanes.
-- **Fixed on the way: a spawn could report a program that never ran** (`slates_ipc::stream::spawn_with`, before it
-  shipped): the standard library's exec-error pipe could be given the number the end was asked at, and the child's
-  `dup2` closed it; a missing program was reported spawned at the lowest free number plus one. The number is held open
-  in the parent until the spawn returns (`a_program_that_cannot_run_is_refused_whatever_number_it_is_handed_at`).
+- **Step 4 built (2026-10-24):** `slates shards ID [--subtree DIR] [--read-only] --fd N -- CMD` replaces itself with
+  the program, the end at descriptor `N`, so the process a launcher started is the program and the attachment ends when
+  its end closes; the program's exit code is the command's. A reader re-invoked under it mounts and reads a file
+  byte-equal through descriptor 7; a program that closes its end sees its attachment gone while it still runs; a
+  `SIGKILL` of the launch ends the attachment (`crates/cli/tests/cli.rs`; macOS arm64 and Linux x86_64).
+  `Client::attach_shards` compiles everywhere and Windows refuses the form by kind, `DescriptorRouteNotBuilt`, tested
+  on both Windows CI lanes.
+- **Replaced on the way: the command spawned the program and waited.** A launcher killing the process it started
+  killed only `slates shards`, leaving the program and its attachment running; `a_killed_launch_ends_its_attachment`
+  failed on it and passes on the exec. `spawn_with`, also found to report a missing program as spawned when the asked
+  number collided with the standard library's exec-error pipe, went with it.
 - **Fixed on the way: CI's Linux and Windows lanes stopped compiling** at 285ce936 and 7dad728d (`()` where a platform
   prepares or carries nothing, refused by clippy's `let_unit_value` and `unit_arg`; neither branch linted before the
   push), and **the macOS hermeticity run counted the route's socket node outside** (run 40104138955). The tracer now

@@ -1908,38 +1908,18 @@ fn slates_shards_hands_a_program_a_working_stream_end_and_the_attachment_ends_wi
   a_reader_reads_the_file_through_its_end(&instance, &id, &before);
   a_silent_program_exits_and_ends_its_attachment(&instance, &id, &before);
   the_attachment_ends_when_the_end_closes_while_the_command_runs(&instance, &id, &before);
-  a_reader_outlives_its_killed_command(&instance, &id, &before);
+  a_killed_launch_ends_its_attachment(&instance, &id, &before);
   the_refusals_leave_no_attachment(&instance, &id, &before);
 }
 
-/// The waiting reader, ended when dropped: its `slates shards` is killed, so nothing else would end it. Disarmed once
-/// the reader has printed what it read, after which it exits by itself, so its pid, free to be reused, is never
-/// signalled.
-struct Orphan(Option<u32>);
-
-impl Orphan {
-  fn disarm(&mut self) {
-    self.0 = None;
-  }
-}
-
-impl Drop for Orphan {
-  fn drop(&mut self) {
-    if let Some(pid) = self.0 {
-      let _ = rustix::process::kill_process(
-        rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap(),
-        rustix::process::Signal::KILL,
-      );
-    }
-  }
-}
-
-/// Chaos: `slates shards` is killed (`SIGKILL`) while its program waits, holding the end. Expect the attachment to hold,
-/// since the end alone is its capability and the command kept no copy, and the orphaned program to mount and read the
-/// file through its end afterwards, byte-equal; then its exit ends the attachment.
-fn a_reader_outlives_its_killed_command(instance: &str, id: &str, before: &str) {
-  use std::io::{BufRead, Write};
-  let mut command = Running(
+/// Chaos, the way a supervisor ends a run: `slates shards` replaces itself with its program, so the process a launcher
+/// spawned is the program, and killing it (`SIGKILL`) closes the end and ends the attachment. Do: launch the waiting
+/// reader, take the pid it prints, kill the process spawned. Expect the two pids the same, the launch ended by the
+/// signal, and the attachment gone; before it replaced itself, the kill ended only `slates shards`, and the orphaned
+/// reader kept the attachment alive.
+fn a_killed_launch_ends_its_attachment(instance: &str, id: &str, before: &str) {
+  use std::io::BufRead;
+  let mut launch = Running(
     shards_command(instance, id)
       .arg(std::env::current_exe().unwrap())
       .args(["--exact", SHARDS_TEST, "--nocapture"])
@@ -1952,8 +1932,7 @@ fn a_reader_outlives_its_killed_command(instance: &str, id: &str, before: &str) 
       .spawn()
       .unwrap(),
   );
-  let mut input = command.0.stdin.take().unwrap();
-  let mut lines = std::io::BufReader::new(command.0.stdout.take().unwrap()).lines();
+  let mut lines = std::io::BufReader::new(launch.0.stdout.take().unwrap()).lines();
   let (mut attachment, mut reader) = (None, None);
   while reader.is_none() {
     let line = lines.next().unwrap().unwrap();
@@ -1962,25 +1941,18 @@ fn a_reader_outlives_its_killed_command(instance: &str, id: &str, before: &str) 
     }
     reader = line
       .strip_prefix(READER_PID_TAG)
-      .map(|pid| Orphan(Some(pid.parse().unwrap())));
+      .map(|pid| pid.parse::<u32>().unwrap());
   }
-  let (attachment, mut reader) = (attachment.unwrap(), reader.unwrap());
-  command.0.kill().unwrap();
-  command.0.wait().unwrap();
+  let attachment = attachment.unwrap();
   assert_eq!(
-    attachments_of(instance, id),
-    (before.parse::<u32>().unwrap() + 1).to_string(),
-    "attachment {attachment} holds while its program holds the end, its command killed"
+    reader,
+    Some(launch.0.id()),
+    "the process spawned is the program, not a `slates shards` waiting on it"
   );
-  writeln!(input, "go").unwrap();
-  let read = lines
-    .find_map(|line| line.ok()?.strip_prefix(READ_TAG).map(str::to_owned))
-    .expect("the orphaned reader printed what it read");
-  reader.disarm();
+  launch.0.kill().unwrap();
   assert_eq!(
-    unhex(&read),
-    SHARDS_FILE,
-    "the orphaned reader read the file's bytes through its end"
+    std::os::unix::process::ExitStatusExt::signal(&launch.0.wait().unwrap()),
+    Some(9)
   );
   the_attachment_ends(instance, id, before, &attachment);
 }

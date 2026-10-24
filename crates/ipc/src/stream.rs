@@ -6,7 +6,8 @@
 //! descriptor carries its whole object, while a stream end carries only the conversation its peer will answer.
 //!
 //! Both ends are close-on-exec, so no child the daemon or a client spawns inherits one by accident; a client that hands
-//! its end to a child (a VMM spawner) does so on purpose, by moving it to the number the child expects ([`spawn_with`]).
+//! its end to a program (a VMM spawner) does so on purpose, by moving it to the number the program expects
+//! ([`exec_with`]).
 //! The daemon's
 //! end is non-blocking, since it is served from a shard that never waits in a read, and a write to it after its peer
 //! has gone answers `EPIPE` rather than raising the signal a write to a closed socket raises by default, which would end
@@ -66,55 +67,55 @@ pub fn end(end: BorrowedFd<'_>) -> Result<(), Errno> {
   rustix::net::shutdown(end, rustix::net::Shutdown::Both)
 }
 
-/// Format: the lowest descriptor number a child may be handed a stream end at: past standard input, output and error,
+/// Format: the lowest descriptor number a program may be handed a stream end at: past standard input, output and error,
 /// which a program reads and writes as itself.
 pub const FIRST_HANDED_NUMBER: i32 = 3;
 
-/// Spawns `program` with `args`, handing it `stream` at descriptor number `at` (§4.6, A-161: a Shards spawner, or a
-/// test, given its stream end without linking slates). Only the forked child places the end there (`dup2`, which also
-/// clears close-on-exec on the copy it makes), so no child another thread spawns meanwhile inherits it; the parent's
-/// copies are closed once the spawn returns, so the stream ends when the child's own copy closes. Refused before
-/// anything is spawned for a number below [`FIRST_HANDED_NUMBER`].
+/// Replaces this process with `program` and `args`, handing it `stream` at descriptor number `at` (§4.6, A-161): what
+/// `slates shards` does, so a Shards spawner, or a test, gets its stream end without linking slates. The process a
+/// launcher started becomes the program, its pid, its signals and its exit the program's, and when it ends its end
+/// closes and the stream ends its attachment. No process is left waiting on it: one would outlive a supervisor's kill
+/// of the program, and, killed itself, would leave the program and its attachment running (2026-10-24, the killed
+/// launch in `crates/cli/tests/cli.rs`, which `spawn_with`, this function's predecessor, failed).
 ///
-/// The number `at` is held open in the parent until the spawn returns. The standard library learns of a failed `exec`
-/// through a close-on-exec pipe whose write end the child keeps, and its two ends take the lowest free numbers; were
-/// `at` free, the write end could be given it, and the child's `dup2` would close the pipe, so the parent would report
-/// a program that never ran as spawned and the failed exec would write its error into the stream. Measured before
-/// this rule: `stream_spawn.rs` saw a missing program reported spawned at the lowest free number plus one. When `at` is
-/// another descriptor's, that descriptor holds it; one another thread closes during the spawn reopens the window, which
-/// a caller that spawns from one thread, as the CLI does, never meets.
-pub fn spawn_with(
+/// Exactly one copy of the end reaches the program, at `at`: `dup2` places it there with close-on-exec cleared, and the
+/// copy this function was given is made close-on-exec first. Returns only on failure: a number below
+/// [`FIRST_HANDED_NUMBER`] is refused before anything changes; a failed `exec` (the program missing or not executable)
+/// is refused after `dup2` has placed the end at `at`, so the caller should then exit, as the CLI does, rather than go
+/// on with that number taken.
+pub fn exec_with(
   program: &std::ffi::OsStr,
   args: &[std::ffi::OsString],
   stream: OwnedFd,
   at: i32,
-) -> Result<std::process::Child, IpcError> {
+) -> IpcError {
   use std::os::fd::AsRawFd;
   use std::os::unix::process::CommandExt;
   if at < FIRST_HANDED_NUMBER {
-    return Err(IpcError::Layout {
+    return IpcError::Layout {
       reason: "a stream end is handed past standard input, output and error",
-    });
+    };
   }
-  // A close-on-exec copy at the lowest free number from `at` up. Free, `at` itself: the copy holds it, and the end
-  // stays the child's source. Taken (by the end or another descriptor), a higher number: what took `at` holds it, and
-  // the copy is the source, so the child's `dup2` never copies a number onto itself, which would leave close-on-exec
-  // set.
-  let copy =
-    rustix::io::fcntl_dupfd_cloexec(&stream, at).map_err(|e| refused("fcntl_dupfd_cloexec", e))?;
-  let (holder, source) = if copy.as_raw_fd() == at {
-    (Some(copy), stream)
+  // `dup2` must copy from another number than `at`: a copy onto itself would leave close-on-exec set.
+  let source = if stream.as_raw_fd() == at {
+    match rustix::io::fcntl_dupfd_cloexec(&stream, FIRST_HANDED_NUMBER) {
+      Ok(copy) => copy,
+      Err(e) => return refused("fcntl_dupfd_cloexec", e),
+    }
   } else {
-    (None, copy)
+    stream
   };
+  if let Err(e) = rustix::io::fcntl_setfd(&source, rustix::io::FdFlags::CLOEXEC) {
+    return refused("fcntl_setfd", e);
+  }
   let from = source.as_raw_fd();
   let mut command = std::process::Command::new(program);
   command.args(args);
-  // SAFETY: the closure runs in the forked child between `fork` and `exec` and makes one async-signal-safe system
-  // call, `dup2(from, at)`, on numbers it copied, then reads errno on failure: no allocation, no lock, no other shared
-  // state, which is what `pre_exec` requires. `from` stays open in the parent until the spawn has returned, since
-  // `source` is dropped only after it, so the child's copy of it is open when the closure runs; `dup2` places a copy
-  // at `at`, replacing whatever the child had open there, with close-on-exec cleared, so `exec` keeps it.
+  // SAFETY: the closure runs in this process just before `execvp`, after the standard library has reset the signal state
+  // it changes, and makes one system call, `dup2(from, at)`, on numbers it copied, reading errno on failure: no
+  // allocation, no lock, no other state, which is what `pre_exec` asks. `from` is open until the exec returns, since
+  // `source` is dropped only after it; `dup2` places a copy at `at`, replacing whatever was open there, with
+  // close-on-exec cleared, so the exec keeps that copy while `from`, close-on-exec, closes.
   unsafe {
     command.pre_exec(move || {
       if libc::dup2(from, at) < 0 {
@@ -123,13 +124,12 @@ pub fn spawn_with(
       Ok(())
     });
   }
-  let child = command.spawn().map_err(|e| IpcError::OsRefused {
-    call: "spawn",
-    code: e.raw_os_error(),
-  });
+  let error = command.exec();
   drop(source);
-  drop(holder);
-  child
+  IpcError::OsRefused {
+    call: "exec",
+    code: error.raw_os_error(),
+  }
 }
 
 fn refused(call: &'static str, e: rustix::io::Errno) -> IpcError {

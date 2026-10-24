@@ -701,7 +701,7 @@ fn parse_exec(taken: &Taken, arguments: &[String]) -> Result<Command, ParseError
 }
 
 /// Format: the lowest descriptor number `shards --fd` takes: standard input, output and error are 0, 1 and 2, which a
-/// program reads and writes as itself (`slates_ipc::stream::spawn_with` refuses below its `FIRST_HANDED_NUMBER`, the same
+/// program reads and writes as itself (`slates_ipc::stream::exec_with` refuses below its `FIRST_HANDED_NUMBER`, the same
 /// number, too).
 const FIRST_HANDED_FD: i32 = 3;
 
