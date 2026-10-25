@@ -97,18 +97,19 @@ pub enum IpcError {
     /// The fault.
     fault: DeliveryFault,
   },
-  /// The Shards stream's socket route refused (§4.6, A-161): the daemon's answer to a claim, or the route's own
-  /// place on this host.
+  /// The daemon's socket route refused (§4.6; A-161, A-173): the daemon's answer to a claim of a stream end or a map's
+  /// copy, or the route's own place on this host.
   RouteRefused {
     /// Why.
     refusal: RouteRefusal,
   },
 }
 
-/// Why the Shards stream's socket route refused (A-161; `crate::route`).
+/// Why the daemon's socket route refused (A-161, A-173; `crate::route`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteRefusal {
-  /// The daemon holds no offer for the attachment: none was made, it was claimed already, or its time ran out.
+  /// The daemon holds no offer of that kind and id: none was made, it was claimed already, its time ran out, or (a
+  /// map's) its copy was let go first.
   NoOffer,
   /// The claim's proof did not open under the offer's secret.
   Proof,
@@ -134,7 +135,7 @@ impl fmt::Display for RouteRefusal {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.write_str(match self {
       Self::NoOffer => {
-        "the daemon holds no offer for the attachment (none made, claimed, or expired)"
+        "the daemon holds no such offer (none made, claimed, expired, or its copy let go)"
       }
       Self::Proof => "the claim's proof did not open under the offer's secret",
       Self::Malformed => "a message of the exchange was not the protocol's",
@@ -193,7 +194,7 @@ impl fmt::Display for IpcError {
       Self::CapabilityNotDelivered { fault } => {
         write!(f, "consumer capability not delivered: {fault}")
       }
-      Self::RouteRefused { refusal } => write!(f, "the stream route refused: {refusal}"),
+      Self::RouteRefused { refusal } => write!(f, "the socket route refused: {refusal}"),
     }
   }
 }

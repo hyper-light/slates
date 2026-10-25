@@ -1,8 +1,12 @@
-//! The daemon's side of the Shards stream's socket route on macOS (§4.6, the Shards route; A-161). The protocol, its
-//! keys and its evidence are `slates_ipc::route`'s; this module keeps the offers, listens, and runs the exchanges.
+//! The daemon's side of the socket route on macOS (§4.6; A-161, A-173). The protocol, its keys and its evidence are
+//! `slates_ipc::route`'s; this module keeps the offers, listens, and runs the exchanges.
 //!
 //! **Offers.** An attach in the Shards form on macOS keeps its stream end as an offer on the volume's owner shard, with
-//! a fresh 256-bit secret and an expiry, and replies `ShardsOffered` with the secret (`crate::shards::attach_verb`).
+//! a fresh 256-bit secret and an expiry, and replies `ShardsOffered` with the secret (`crate::shards::attach_verb`). A
+//! direct map keeps the read-only descriptor of its copy as an offer the same way and replies `MapOffered`
+//! (`crate::direct_map`). Each kind has its own table, so a mapping and an attachment never meet under one id, and a
+//! claim names its kind (a version-2 hello). Both ids carry their owner partition in their high 16 bits, which is how
+//! an exchange finds the shard that holds the offer.
 //! The offer is claimed once: an exchange asks the owner shard to check the claim's proof and hand over the end
 //! ([`take`]), so the secret never leaves the shard that made it. An offer unclaimed at its expiry is dropped by its
 //! timer, which closes the end: the stream then sees its peer gone and ends its attachment, as every stream does.
@@ -19,7 +23,8 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 
 use slates_ipc::error::RouteRefusal;
 use slates_ipc::route::{
-  Exchange, HELLO_BYTES, Hello, KIND_CHALLENGE, Listener, NONCE_BYTES, SEALED_BYTES, SECRET_BYTES,
+  Exchange, HELLO_BYTES, Hello, KIND_CHALLENGE, Listener, NONCE_BYTES, OfferKind, SEALED_BYTES,
+  SECRET_BYTES,
 };
 use slates_rt::futures;
 use slates_vfs::clock::Clock;
@@ -51,66 +56,81 @@ const FAILED: &str = "shards.route_failed";
 /// Format: the refusal-ledger name of an offer dropped unclaimed at its expiry.
 const EXPIRED: &str = "shards.route_expired";
 
-/// A stream end offered on the route: claimable once, with `secret`, until `expires_ns`.
+/// A descriptor offered on the route, a stream end or a map's copy: claimable once, with `secret`, until `expires_ns`.
 pub(crate) struct Offer {
   secret: [u8; SECRET_BYTES],
   expires_ns: u64,
-  stream: OwnedFd,
+  descriptor: OwnedFd,
 }
 
-/// A shard's offers, by attachment. Bounded with the shard's handoffs (`crate::shards::handoff_bound`): an attach past
-/// the bound is refused before an offer is made.
+/// A shard's offers of one kind, by id. Stream offers are bounded with the shard's handoffs
+/// (`crate::shards::handoff_bound`: an attach past the bound is refused before an offer is made); map offers by its
+/// clients' shares of the direct maps (`crate::direct_map`).
 pub(crate) type Offers = BTreeMap<u64, Offer>;
 
-/// Keeps `stream` as `attachment`'s offer, claimable with `secret` until its life ends, and arms the timer that drops
-/// it then. `false` when the timer could not be armed: the offer is dropped at once, closing the end, so the stream
-/// ends its attachment rather than wait forever for a claim.
+/// The shard's table of offers of `kind`.
+fn offers_of(s: &mut ShardState, kind: OfferKind) -> &mut Offers {
+  match kind {
+    OfferKind::Stream => &mut s.stream_offers,
+    OfferKind::Map => &mut s.map_offers,
+  }
+}
+
+/// Keeps `descriptor` as the `kind` offer `id`, claimable with `secret` until its life ends, and arms the timer that
+/// drops it then. `false` when the timer could not be armed: the offer is dropped at once, closing its descriptor (a
+/// stream then ends its attachment rather than wait forever for a claim; a map's client reads by copy).
 pub(crate) fn offer(
   s: &mut ShardState,
-  attachment: u64,
+  (kind, id): (OfferKind, u64),
   secret: [u8; SECRET_BYTES],
-  stream: OwnedFd,
+  descriptor: OwnedFd,
 ) -> bool {
   let expires_ns = s.clock.monotonic_ns().saturating_add(OFFER_LIFE_NS);
-  s.stream_offers.insert(
-    attachment,
+  offers_of(s, kind).insert(
+    id,
     Offer {
       secret,
       expires_ns,
-      stream,
+      descriptor,
     },
   );
-  if futures::spawn(expire_later(attachment, expires_ns))
+  if futures::spawn(expire_later(kind, id, expires_ns))
     .and_then(futures::detach)
     .is_err()
   {
-    s.stream_offers.remove(&attachment);
+    offers_of(s, kind).remove(&id);
     return false;
   }
   true
 }
 
-/// Drops `attachment`'s offer at its expiry if it is still the one made then. A refused sleep drops it now: an offer
+/// Withdraws the `kind` offer `id` if it is still unclaimed, its descriptor closed now rather than at its expiry: what a
+/// map's copy let go before its claim does, so no offer keeps an object alive past its copy. Whether there was one.
+pub(crate) fn withdraw(s: &mut ShardState, (kind, id): (OfferKind, u64)) -> bool {
+  offers_of(s, kind).remove(&id).is_some()
+}
+
+/// Drops the `kind` offer `id` at its expiry if it is still the one made then. A refused sleep drops it now: an offer
 /// is never kept past its life for want of a timer.
-async fn expire_later(attachment: u64, expires_ns: u64) {
+async fn expire_later(kind: OfferKind, id: u64, expires_ns: u64) {
   // Either the sleep ran its course or the runtime refused it; the offer goes now in both.
   let _slept = futures::sleep(OFFER_LIFE_NS).await;
   let _ = state::with_state_counted(|s| {
-    if s
-      .stream_offers
-      .get(&attachment)
+    let offers = offers_of(s, kind);
+    if offers
+      .get(&id)
       .is_some_and(|offer| offer.expires_ns == expires_ns)
     {
-      s.stream_offers.remove(&attachment);
+      offers.remove(&id);
       s.count(EXPIRED, 1);
     }
   });
 }
 
-/// Hands over `hello.attachment`'s stream end to the claim whose `proof` opens under the offer's secret with these
-/// nonces, retiring the offer, with the daemon's confirmation to send beside it; or the refusal: no offer (none made,
-/// claimed, or expired, the expired one dropped here), a proof that does not hold. Run on the volume's owner shard,
-/// where the offer and its secret are.
+/// Hands over the descriptor of the offer `hello` names to the claim whose `proof` opens under the offer's secret with
+/// these nonces, retiring the offer, with the daemon's confirmation to send beside it; or the refusal: no offer (none
+/// made, claimed, or expired, the expired one dropped here), a proof that does not hold. Run on the shard that holds the
+/// offer, where its secret is.
 pub(crate) fn take(
   s: &mut ShardState,
   hello: Hello,
@@ -118,16 +138,17 @@ pub(crate) fn take(
   proof: [u8; SEALED_BYTES],
 ) -> Result<([u8; SEALED_BYTES], OwnedFd), RouteRefusal> {
   let now = s.clock.monotonic_ns();
-  let Some(offer) = s.stream_offers.get(&hello.attachment) else {
+  let offers = offers_of(s, hello.kind);
+  let Some(offer) = offers.get(&hello.id) else {
     return Err(RouteRefusal::NoOffer);
   };
   if offer.expires_ns <= now {
-    s.stream_offers.remove(&hello.attachment);
+    offers.remove(&hello.id);
     return Err(RouteRefusal::NoOffer);
   }
   let exchange = Exchange::new(
     &offer.secret,
-    hello.attachment,
+    (hello.kind, hello.id),
     &hello.client_nonce,
     &daemon_nonce,
   )
@@ -138,11 +159,8 @@ pub(crate) fn take(
   let confirmation = exchange
     .confirmation()
     .map_err(|_| RouteRefusal::Malformed)?;
-  let offer = s
-    .stream_offers
-    .remove(&hello.attachment)
-    .ok_or(RouteRefusal::NoOffer)?;
-  Ok((confirmation, offer.stream))
+  let offer = offers.remove(&hello.id).ok_or(RouteRefusal::NoOffer)?;
+  Ok((confirmation, offer.descriptor))
 }
 
 /// Serves the route's listener on this shard (the control shard): each wake accepts every waiting connection and runs
@@ -292,7 +310,8 @@ async fn run(connection: BorrowedFd<'_>) -> Result<OwnedFd, Ended> {
     return Err(Ended::Refused(RouteRefusal::Malformed));
   }
   let route = state::with_state(|s| {
-    let partition = crate::verbs::owner_of_attachment(hello.attachment);
+    // An attachment and a mapping alike carry their owner partition in their high 16 bits.
+    let partition = crate::verbs::owner_of_attachment(hello.id);
     crate::verbs::shard_of_partition(s, partition).map(|owner| (s.shard, owner))
   })
   .flatten();
@@ -306,14 +325,14 @@ async fn run(connection: BorrowedFd<'_>) -> Result<OwnedFd, Ended> {
     EXCHANGE_NS,
   )
   .await;
-  let (confirmation, stream) = match taken {
+  let (confirmation, descriptor) = match taken {
     Some(Ok(taken)) => taken,
     Some(Err(refusal)) => return Err(Ended::Refused(refusal)),
     None => return Err(Ended::Failed),
   };
-  slates_ipc::route::send_confirmation(connection, &confirmation, stream.as_fd())
+  slates_ipc::route::send_confirmation(connection, &confirmation, descriptor.as_fd())
     .map_err(|_| Ended::Failed)?;
-  Ok(stream)
+  Ok(descriptor)
 }
 
 /// Fills `buffer` from the non-blocking `connection`, waiting on its readiness; the client's closing before it is full

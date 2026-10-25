@@ -248,7 +248,7 @@ box shared with two other builds — timings are not benchmarks)
 
    | target | how it reaches the volume | DAX |
    |---|---|---|
-   | bare metal | the host mount | slates' own: a read-only map of a sealed copy of the file handed to a program (A-171, proven on Linux) |
+   | bare metal | the host mount | slates' own: a read-only map of a copy of the file, kept equal to it, handed to a program (A-171: sealed, proven on Linux; A-173: read alone over the socket route, proven on macOS) |
    | OCI (Docker, Kubernetes on runc) | the host mount bound into the container (A-28, proven 2026-10-19) | a process in the container maps the file, through the bound mount or by A-135's direct map: the DAX matrix below (A-164) |
    | Shards | the host mount shared with `VOLUME … FOR`; or the daemon's own stream, handed out by `slates shards` (A-161) | over the mount, Shards' DAX window (D189, `crates/vmm/src/devices/virtio/fs/mod.rs` on `gpu`, read 2026-10-21) maps the host file; over the stream, it maps a per-attachment copy of the file that slates keeps equal to the volume (A-163, a real guest 3 of 3 on this Mac, 2026-10-24) |
    | QEMU, crosvm, Kubernetes on VM runtimes (Kata) | the host mount shared by virtio-fs (virtiofsd or the VMM's own device) | the sharer's DAX window maps the host file |
@@ -267,7 +267,7 @@ box shared with two other builds — timings are not benchmarks)
    |---|---|---|
    | Linux x86_64 | proven: `crates/cli/tests/cli.rs` `a_shared_map_through_a_mount_writes_back_and_follows_another_paths_change`, and the generated histories of `crates/bridge-fuse/tests/coherence_mount.rs` (CI's Linux lane) | proven (A-171, 2026-10-25, fedora): `crates/client/tests/client.rs` asserts the zero-copy path for one chunk, many chunks and every size from empty to 1 MiB (`a_same_kernel_client_maps_a_file_with_no_copy`, `a_map_read_returns_the_whole_file_at_every_size`), judges the handed descriptor as a hostile peer would (`a_direct_maps_descriptor_reads_one_file_and_changes_nothing`) and sees every change within the map as memory alone (`a_direct_map_follows_every_change_within_its_length_as_memory_alone`), red-checked four ways. The copy is the file's own sealed memfd, so the escape of `docs/bugs/2026-10-18-a-read-handed-the-peer-the-whole-content-arena.md` cannot recur through it. Before A-171 this cell said "proven" while every read was a copy (corrected 2026-10-25). |
    | Linux arm64 | owed: G-arm64-host | owed: G-arm64-host |
-   | macOS arm64 | owed: G-mount (read-only maps over NFS); writable shared maps: G-nfs-writable | owed: G-direct |
+   | macOS arm64 | owed: G-mount (read-only maps over NFS); writable shared maps: G-nfs-writable | proven (A-173, 2026-10-25, this Mac): the same tests over the daemon's socket route, where the client claims, with the reply's secret, a read-only descriptor of the file's copy (a shared-memory object whose name went at once); the zero-copy path asserted for one chunk, many chunks and every size from empty to 1 MiB, every change within the map seen as memory alone, and the handed descriptor judged as a hostile peer would (`a_direct_maps_descriptor_reads_one_file_and_changes_nothing`, macOS: read alone, exactly the mapped length, every way to write through it or resize it refused by XNU), red-checked with the read-write descriptor handed in its place. |
    | Windows x86_64 | owed: G-mount (WinFsp) | owed: G-direct (handle duplication) |
    | Windows arm64 | owed: G-mount (WinFsp) | owed: G-direct (handle duplication) |
 

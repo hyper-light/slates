@@ -3,12 +3,16 @@
 //!
 //! **What the client is handed.** A descriptor carries its whole object, read and write, to whoever holds it (A-135;
 //! the 2026-10-18 escape handed a peer the shard's whole content arena), so the object handed is one file's copy and
-//! nothing else: a [`slates_mem::PeerObject`], the file's page span, filled from the volume and sealed against every
-//! writer but the daemon's own view (`F_SEAL_FUTURE_WRITE`, `F_SEAL_SHRINK`, `F_SEAL_GROW`, `F_SEAL_SEAL`). The copy is
-//! kept in the store's backings ([`slates_vfs::shards_backing`]), so the volume's single write boundary writes every
-//! later change into it before the change returns: the client's map is a live view of the file within its length, as a
-//! shared map of a file is. Whether the descriptor may leave is judged where every descriptor leaves the process
-//! (`Control::send_mapping`, `confined_for_a_peer`): the object must be what is authorized, and sealed.
+//! nothing else: a [`slates_mem::PeerObject`], the file's page span, filled from the volume. On Linux it is a memfd
+//! sealed against every writer but the daemon's own view (`F_SEAL_FUTURE_WRITE`, `F_SEAL_SHRINK`, `F_SEAL_GROW`,
+//! `F_SEAL_SEAL`), and whether it may leave is judged where every descriptor leaves the process
+//! (`Control::send_mapping`, `confined_for_a_peer`): the object must be what is authorized, and sealed. macOS has no
+//! seals, so the client gets a second descriptor of an unlinked shared-memory object, opened read alone, which XNU
+//! refuses every way to write through or resize (A-173), judged before it is offered
+//! (`slates_ipc::route::confined_read_only`: read alone, and exactly the authorized length). The copy is kept in the
+//! store's backings ([`slates_vfs::shards_backing`]), so the volume's single write boundary writes every later change
+//! into it before the change returns: the client's map is a live view of the file within its length, as a shared map of
+//! a file is.
 //!
 //! **Running.** The verb checks what it can at once (the uid, the view, the volume, the right, the client's channel,
 //! the path), makes the copy, and defers its reply to a task of this shard, as an image build does (A-160). The task
@@ -16,23 +20,27 @@
 //! backing's fill, A-163), yielding between slices, so the shard serves its clients while a file of any size is copied.
 //! A range is marked filled before its slice reads the volume, so a change written meanwhile lands on it and the rest
 //! of the fill reads the volume as changed. Holes and pages of zeros are passed over: the new copy reads zero there
-//! already. The fill done, the descriptor goes over the client's control socket, then the reply goes on its ring, and
-//! the reply's completion is recorded as every verb's is.
+//! already. The fill done, the copy is handed: on Linux its descriptor goes over the client's control socket, then the
+//! reply goes on its ring; on macOS the descriptor is offered on the daemon's socket route (A-161) behind a fresh
+//! single-use secret that the reply carries, and the client claims it. The reply's completion is recorded as every
+//! verb's is.
 //!
 //! **What reads by copy instead** (`MapUnavailable`, which the client answers with its paged read): a peer of another
 //! uid, a view other than the head, a merge volume, an overlay (an untouched file follows the disk, which no write
 //! boundary sees), a client served by another shard (a descriptor does not cross shards yet), a platform with no route
-//! (macOS and Windows, each owed to its own step), and a copy the fill budget, the backings' capacity or the OS
-//! refuses.
+//! (Windows, owed to its own step), and a copy the fill budget, the backings' capacity or the OS refuses.
 //!
-//! **Lifetime.** The client's slot holds the copy's backing from the hand-off until the slot is reaped (`crate::reap`),
-//! and a volume's teardown lets go of its files' copies (`ShardsBackings::remove_volume_peers`). A copy whose hand-off
-//! did not happen (its client gone, its channel refusing, the task ended early) is let go at once.
+//! **Lifetime and bounds (A-172).** A copy is held on its client's slot from the moment it is made until the client
+//! releases it (`ReleaseMap`) or is reaped (`crate::reap`). Every way a copy goes is [`let_go`], which withdraws an
+//! unclaimed offer of it too (macOS), so an offer never outlives its copy. A volume's destroy or a file's last unlink
+//! only detaches its copies from the write-through index: the client's map keeps their pages, so they stay held and
+//! counted. A client maps within its share of the shard's capacity ([`share_of`], [`within_share`]). A copy whose
+//! hand-off did not happen (its client gone, its channel refusing, the task ended early) is let go at once.
 
 use std::collections::BTreeMap;
 
 use slates_ipc::protocol::{Refusal, ReplyBody};
-use slates_mem::Handle;
+use slates_mem::{Encoded, Handle};
 use slates_vfs::shards_backing::ShardsBacking;
 use slates_wire::request::RequestId;
 
@@ -40,34 +48,62 @@ use crate::merge_service::ReplyRoute;
 use crate::state::ShardState;
 use crate::verbs::refused;
 
-/// Format: the bits a copy's handle index is shifted by in its mapping id, above the handle's generation.
-const MAPPING_ID_INDEX_SHIFT: u32 = 32;
-
 /// Counter: a direct map its client released (`ReleaseMap`): the copy let go and its bytes given back.
 const RELEASED: &str = "dax.local_map_released";
+/// Counter: a copy's offer on the socket route withdrawn unclaimed because its copy was let go (macOS).
+#[cfg(target_os = "macos")]
+const OFFER_WITHDRAWN: &str = "dax.local_map_offer_withdrawn";
 
-/// The mapping id a client names a copy by: its backing's handle, index above generation. Process-local, like every
-/// handle, so a client's maps end with its daemon's process (a restarted daemon's client holds none). Linux alone hands
-/// copies today.
-#[cfg(target_os = "linux")]
-fn mapping_id_of(backing: Handle<ShardsBacking>) -> u64 {
-  (u64::from(backing.index()) << MAPPING_ID_INDEX_SHIFT) | u64::from(backing.generation())
+/// Lets go of a copy (§4.6, A-172): it leaves the store's backings, so it is written through no more and its bytes go
+/// back to the fill budget, and its offer on the socket route goes with it if still unclaimed (macOS), so no offer keeps
+/// an object alive outside its client's share. The one way a copy is let go: a release, a reap, a fill that ended
+/// without its hand-off. Whether the copy was still kept.
+pub(crate) fn let_go(state: &mut ShardState, backing: Handle<ShardsBacking>) -> bool {
+  withdraw_offer(state, backing);
+  state.store.shards_backings.remove(backing).is_some()
+}
+
+/// Withdraws the unclaimed offer of `backing`'s copy on the socket route, counted.
+#[cfg(target_os = "macos")]
+fn withdraw_offer(state: &mut ShardState, backing: Handle<ShardsBacking>) {
+  let Some(mapping_id) = mapping_id_of(state.partition, backing) else {
+    return;
+  };
+  if crate::shards_route::withdraw(state, (slates_ipc::route::OfferKind::Map, mapping_id)) {
+    state.count(OFFER_WITHDRAWN, 1);
+  }
+}
+
+/// Nothing to withdraw: only macOS offers a copy on a socket route (Linux sends it on the control socket before the
+/// reply).
+#[cfg(not(target_os = "macos"))]
+fn withdraw_offer(_state: &mut ShardState, _backing: Handle<ShardsBacking>) {}
+
+/// The mapping id a client names a copy by: its backing's handle packed with the shard's partition in the high 16 bits,
+/// as an attachment id carries it, so macOS's socket route finds the shard that holds the copy's offer
+/// (`crate::shards_route`). `None` where the handle does not fit the packing (a slot or a generation past 2^24): that
+/// copy is not handed. Process-local, like every handle, so a client's maps end with its daemon's process.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn mapping_id_of(partition: u16, backing: Handle<ShardsBacking>) -> Option<u64> {
+  backing.encode(partition).map(Encoded::word)
 }
 
 /// The backing a mapping id names; the slab refuses a stale one.
 fn backing_of(mapping_id: u64) -> Handle<ShardsBacking> {
-  let index = u32::try_from(mapping_id >> MAPPING_ID_INDEX_SHIFT).unwrap_or(u32::MAX);
-  let generation = u32::try_from(mapping_id & u64::from(u32::MAX)).unwrap_or(u32::MAX);
-  Handle::from_raw(index, generation)
+  let encoded = Encoded::from_word(mapping_id);
+  Handle::from_raw(encoded.slot(), encoded.generation())
 }
 
 /// A client's share of a shard's direct maps (§4.6, A-171): the shard's capacity — the copies it may hold and its fill
 /// budget's bytes — over the clients it serves now, so one client never takes every copy from the others. A lone
 /// client's share is the whole capacity; copies held already are never taken back, so a client that held more before
 /// others came maps nothing more until it is within its share again.
-// Pure, so tested on every host; only Linux hands a copy today (macOS's and Windows' routes are owed), so elsewhere
-// only the tests call it.
-#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+// Pure, so tested on every host; Linux and macOS hand copies (Windows' route is owed), so elsewhere only the tests call
+// it.
+#[cfg_attr(
+  not(any(target_os = "linux", target_os = "macos", test)),
+  allow(dead_code)
+)]
 pub(crate) fn share_of(
   (most_copies, budget_bytes): (usize, u64),
   clients_served: usize,
@@ -83,9 +119,12 @@ pub(crate) fn share_of(
 
 /// Whether a client holding `(maps, bytes)` may take one more copy of `object_bytes` within its `share`; refused
 /// `MapShareExhausted` with the counts if not.
-// Pure, so tested on every host; only Linux hands a copy today (macOS's and Windows' routes are owed), so elsewhere
-// only the tests call it.
-#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+// Pure, so tested on every host; Linux and macOS hand copies (Windows' route is owed), so elsewhere only the tests call
+// it.
+#[cfg_attr(
+  not(any(target_os = "linux", target_os = "macos", test)),
+  allow(dead_code)
+)]
 pub(crate) fn within_share(
   (held_maps, held_bytes): (usize, u64),
   object_bytes: u64,
@@ -108,8 +147,8 @@ pub(crate) fn within_share(
 /// restart.
 pub(crate) fn release_map(state: &mut ShardState, client_id: u32, mapping_id: u64) -> ReplyBody {
   let backing = backing_of(mapping_id);
-  let ShardState { clients, store, .. } = state;
-  let Some(client) = clients
+  let Some(client) = state
+    .clients
     .iter_mut_all()
     .map(|(_, client)| client)
     .find(|client| client.client_id == client_id && !client.retiring)
@@ -120,8 +159,7 @@ pub(crate) fn release_map(state: &mut ShardState, client_id: u32, mapping_id: u6
     return refused(Refusal::NotFound);
   };
   client.direct_maps.swap_remove(at);
-  let released = store.shards_backings.remove(backing).is_some();
-  if released {
+  if let_go(state, backing) {
     state.count(RELEASED, 1);
   }
   ReplyBody::MapReleased
@@ -152,10 +190,9 @@ pub(crate) fn join_in_flight(state: &mut ShardState, origin: u64, id: RequestId)
   true
 }
 
-/// `MapRead` where no route hands a client a descriptor of a sealed copy yet: macOS's (its descriptor over A-161's
-/// socket route) and Windows' (handle duplication) are owed to their own steps. The client reads by its paged path,
-/// which applies the rights.
-#[cfg(not(target_os = "linux"))]
+/// `MapRead` where no route hands a client a descriptor of a sealed copy yet: Windows' (handle duplication) is owed to
+/// its own step. The client reads by its paged path, which applies the rights.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn map_read(
   _state: &mut ShardState,
   _client_id: u32,
@@ -167,11 +204,13 @@ pub(crate) fn map_read(
   crate::verbs::refused(slates_ipc::protocol::Refusal::MapUnavailable)
 }
 
-#[cfg(target_os = "linux")]
-pub(crate) use linux::map_read;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use served::map_read;
 
-#[cfg(target_os = "linux")]
-mod linux {
+/// The platforms that hand a client its copy: Linux over the client's control socket, macOS over the socket route. The
+/// fill is one; the hand-off is a paired function.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod served {
   use slates_db::catalog::{Principal, Role};
   use slates_ipc::protocol::{ReadAt, Refusal, ReplyBody, VolumeId};
   use slates_mem::{Handle, PeerObject};
@@ -287,7 +326,7 @@ mod linux {
       if let Some(backing) = self.backing.take() {
         // A fill that ended without its hand-off: the copy goes back. With the state unreachable (a shutdown) it
         // cannot, and the process's end returns it.
-        let _released = crate::state::with_state(|s| s.store.shards_backings.remove(backing));
+        let _released = crate::state::with_state(|s| super::let_go(s, backing));
       }
     }
   }
@@ -320,7 +359,7 @@ mod linux {
         .iter_mut_all()
         .map(|(_, client)| client)
         .find(|client| {
-          client.client_id == client_id && !client.retiring && client.control.is_some()
+          client.client_id == client_id && !client.retiring && can_be_handed_a_descriptor(client)
         })
         .ok_or(Begun::Unavailable)?;
       let slot = volumes.get(volume).map_err(|_| Begun::Unavailable)?;
@@ -427,13 +466,15 @@ mod linux {
       Ok(self.next >= self.object_bytes)
     }
 
-    /// Hands the filled copy to its client: the descriptor over the client's control socket, then the backing kept on
-    /// the client's slot, so its reap lets it go. The reply; `MapUnavailable` (counted) where the volume, the file or
-    /// the client went, or the channel refused.
+    /// Hands the filled copy to its client over its control socket (Linux), the backing held on the client's slot since
+    /// the copy was made, so its reap lets it go. The reply; `MapUnavailable` (counted) where the volume, the file or
+    /// the client went, the mapping id does not fit, or the channel refused.
+    #[cfg(target_os = "linux")]
     fn hand_off(&mut self, state: &mut ShardState) -> ReplyBody {
       let Some(backing) = self.backing else {
         return refused(Refusal::MapUnavailable);
       };
+      let partition = state.partition;
       let ShardState {
         volumes,
         store,
@@ -449,9 +490,12 @@ mod linux {
         .iter_mut_all()
         .find(|(_, client)| client.client_id == self.client_id && !client.retiring)
         .map(|(_, client)| client);
-      let (Some(file_len), Some(client), Some(copy)) =
-        (size, client, store.shards_backings.get(backing))
-      else {
+      let (Some(file_len), Some(client), Some(copy), Some(mapping_id)) = (
+        size,
+        client,
+        store.shards_backings.get(backing),
+        super::mapping_id_of(partition, backing),
+      ) else {
         state.count(FELL_BACK, 1);
         return refused(Refusal::MapUnavailable);
       };
@@ -459,7 +503,6 @@ mod linux {
         state.count(FELL_BACK, 1);
         return refused(Refusal::MapUnavailable);
       };
-      let mapping_id = super::mapping_id_of(backing);
       match control.send_mapping(
         copy.object().descriptor(),
         mapping_id,
@@ -490,6 +533,84 @@ mod linux {
         }
       }
     }
+
+    /// Offers the filled copy's read-only descriptor on the socket route (macOS), judged first to authorize reading
+    /// the copy alone (`slates_ipc::route::confined_read_only`), behind a fresh single-use secret the reply carries; the
+    /// backing held on the client's slot since the copy was made. The reply; `MapUnavailable` (counted) where the
+    /// volume, the file or the copy went, the mapping id does not fit, the descriptor is unconfined, no secret can be
+    /// drawn or no offer kept.
+    #[cfg(target_os = "macos")]
+    fn hand_off(&mut self, state: &mut ShardState) -> ReplyBody {
+      use std::os::fd::AsFd;
+
+      let Some(backing) = self.backing else {
+        return refused(Refusal::MapUnavailable);
+      };
+      // An offer nobody will claim is not made: the client must still be served here.
+      let served = state
+        .clients
+        .iter_mut_all()
+        .any(|(_, client)| client.client_id == self.client_id && !client.retiring);
+      if !served {
+        state.count(FELL_BACK, 1);
+        return refused(Refusal::MapUnavailable);
+      }
+      let size = state
+        .volumes
+        .get(self.volume)
+        .ok()
+        .and_then(|slot| slot.volume.stat(&state.store, self.inode).ok())
+        .map(|attrs| attrs.size);
+      let descriptor = state
+        .store
+        .shards_backings
+        .get(backing)
+        .and_then(|copy| copy.object().descriptor().try_clone_to_owned().ok());
+      let (Some(file_len), Some(descriptor), Some(mapping_id)) = (
+        size,
+        descriptor,
+        super::mapping_id_of(state.partition, backing),
+      ) else {
+        state.count(FELL_BACK, 1);
+        return refused(Refusal::MapUnavailable);
+      };
+      if slates_ipc::route::confined_read_only(descriptor.as_fd(), self.object_bytes).is_err() {
+        state.count(UNCONFINED, 1);
+        state.count(FELL_BACK, 1);
+        return refused(Refusal::MapUnavailable);
+      }
+      let Ok(secret) = slates_ipc::route::random::<{ slates_ipc::route::SECRET_BYTES }>() else {
+        state.count(FELL_BACK, 1);
+        return refused(Refusal::MapUnavailable);
+      };
+      let key = (slates_ipc::route::OfferKind::Map, mapping_id);
+      if !crate::shards_route::offer(state, key, secret, descriptor) {
+        state.count(FELL_BACK, 1);
+        return refused(Refusal::MapUnavailable);
+      }
+      // Held on the client's slot since the copy was made: the fill lets go of it no more.
+      self.backing = None;
+      state.count(HANDED, 1);
+      ReplyBody::MapOffered {
+        mapping_id,
+        file_len,
+        block_len: self.object_bytes,
+        secret,
+      }
+    }
+  }
+
+  /// Whether `client` can be handed a copy's descriptor: on Linux, over its control socket, which it must hold.
+  #[cfg(target_os = "linux")]
+  fn can_be_handed_a_descriptor(client: &crate::state::ClientSlot) -> bool {
+    client.control.is_some()
+  }
+
+  /// Whether `client` can be handed a copy's descriptor: on macOS any client can, since it claims it on the socket
+  /// route, which needs no channel of its own.
+  #[cfg(target_os = "macos")]
+  fn can_be_handed_a_descriptor(_client: &crate::state::ClientSlot) -> bool {
+    true
   }
 
   /// What a client holds of the direct maps, `(maps, bytes)`: `held`, its copies handed or being filled, less those the
@@ -552,7 +673,7 @@ mod linux {
         // The task was dropped inside this borrow of the shard's state, where its fill cannot reach the store: the copy
         // goes back here.
         if let Some(backing) = backing {
-          let _released = state.store.shards_backings.remove(backing);
+          let _released = super::let_go(state, backing);
         }
         refused(Refusal::Overloaded { shard: state.shard })
       }

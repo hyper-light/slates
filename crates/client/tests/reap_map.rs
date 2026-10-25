@@ -9,7 +9,7 @@
   clippy::panic,
   clippy::string_slice
 )]
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};

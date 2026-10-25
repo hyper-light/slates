@@ -473,7 +473,12 @@ fn hand_out(
     lease_epoch,
     stream,
   } = attached;
-  if !crate::shards_route::offer(s, attachment, secret, stream) {
+  if !crate::shards_route::offer(
+    s,
+    (slates_ipc::route::OfferKind::Stream, attachment),
+    secret,
+    stream,
+  ) {
     return slates_ipc::protocol::ReplyBody::Refused {
       refusal: Refusal::Overloaded { shard: s.shard },
     };

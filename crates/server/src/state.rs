@@ -451,6 +451,10 @@ pub struct ShardState {
   /// claimable once with its secret until it expires. Bounded with the handoffs.
   #[cfg(target_os = "macos")]
   pub(crate) stream_offers: crate::shards_route::Offers,
+  /// The direct maps' copies offered on the socket route, by mapping (A-173, macOS; `crate::direct_map`): each read-only
+  /// descriptor claimable once with its secret until it expires. Bounded by the clients' shares of the direct maps.
+  #[cfg(target_os = "macos")]
+  pub(crate) map_offers: crate::shards_route::Offers,
   /// The socket route's exchanges running on this shard (the control shard serves them). Bounded by the shard's
   /// client seats: a connection past them is refused `Busy`.
   #[cfg(target_os = "macos")]

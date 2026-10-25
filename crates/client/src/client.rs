@@ -504,12 +504,12 @@ impl MappedRead {
   /// Maps the delivered copy whole, read alone: `block_len` bytes, the size the daemon made it, held under
   /// `mapping_id` on `volume`'s owner.
   fn map(
-    delivery: slates_ipc::rendezvous::MappingDelivery,
+    block: std::os::fd::OwnedFd,
     (volume, mapping_id): (VolumeId, u64),
     file_len: u64,
     block_len: u64,
   ) -> Result<MappedRead, ClientError> {
-    let view = slates_mem::PeerView::map(delivery.block, block_len).map_err(|error| {
+    let view = slates_mem::PeerView::map(block, block_len).map_err(|error| {
       ClientError::Ipc(IpcError::OsRefused {
         call: "mmap",
         code: match error {
@@ -1011,7 +1011,17 @@ impl Client {
         let ControlDelivery::Mapping(mapping) = delivered else {
           return Err(ClientError::UnexpectedReply { verb: "map_read" });
         };
-        MappedRead::map(mapping, (volume, mapping_id), file_len, block_len)
+        MappedRead::map(mapping.block, (volume, mapping_id), file_len, block_len)
+      }
+      // macOS: the copy's read-only descriptor waits on the daemon's socket route, claimed once with the reply's secret.
+      ReplyBody::MapOffered {
+        mapping_id,
+        file_len,
+        block_len,
+        secret,
+      } => {
+        let block = self.claim_map(mapping_id, &secret)?;
+        MappedRead::map(block, (volume, mapping_id), file_len, block_len)
       }
       _ => Err(ClientError::UnexpectedReply { verb: "map_read" }),
     }
@@ -1191,7 +1201,7 @@ impl Client {
   fn claim_offer(&self, attachment: u64, secret: &[u8; 32]) -> Result<StreamEnd, ClientError> {
     slates_ipc::route::claim(
       &self.instance,
-      attachment,
+      (slates_ipc::route::OfferKind::Stream, attachment),
       secret,
       std::time::Duration::from_nanos(self.deadlines.reply_ns),
     )
@@ -1205,6 +1215,34 @@ impl Client {
     Err(ClientError::UnexpectedReply {
       verb: "attach_shards",
     })
+  }
+
+  /// Claims a direct map's copy offered on the daemon's socket route (§4.6, A-173, macOS): its read-only descriptor,
+  /// within the reply deadline.
+  #[cfg(target_os = "macos")]
+  fn claim_map(
+    &self,
+    mapping_id: u64,
+    secret: &[u8; 32],
+  ) -> Result<std::os::fd::OwnedFd, ClientError> {
+    slates_ipc::route::claim(
+      &self.instance,
+      (slates_ipc::route::OfferKind::Map, mapping_id),
+      secret,
+      std::time::Duration::from_nanos(self.deadlines.reply_ns),
+    )
+    .map_err(ClientError::Ipc)
+  }
+
+  /// No socket route here: a Linux daemon hands a map's copy on the control socket, so an offer is not one of its
+  /// replies.
+  #[cfg(all(unix, not(target_os = "macos")))]
+  fn claim_map(
+    &self,
+    _mapping_id: u64,
+    _secret: &[u8; 32],
+  ) -> Result<std::os::fd::OwnedFd, ClientError> {
+    Err(ClientError::UnexpectedReply { verb: "map_read" })
   }
 
   /// Receives the descriptor the daemon sent over the control socket for the reply just read (§4.6: a content map,

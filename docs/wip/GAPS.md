@@ -11230,6 +11230,39 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     re-witness asks the host's clock as a copy-up does (A-162).
   - A racy witness never settles: after a re-hash past its tick confirms it, the fingerprint alone would do, but every
     drift check of it still hashes the whole file.
+- **The direct map on macOS (A-173, G-direct step 4, 2026-10-25): built, and proven on this Mac by a real client.**
+  - **What:** a `MapRead` on macOS is answered `MapOffered`. The file's copy is a shared-memory object whose name went
+    as soon as its two descriptors were open; the read-only one is offered on the daemon's socket route (A-161, now
+    version 2: the hello names the offer's kind, a stream end or a map's copy) behind a fresh single-use secret the
+    reply carries, and the client claims and maps it. macOS has no seals, so the descriptor's access mode is the
+    capability, judged before the offer (`confined_read_only`: read alone, exactly the authorized length).
+  - **Proven** on this Mac (arm64, Darwin 25.4.0): the client binary 21 of 21 and `reap_map.rs` 1 of 1 over a real
+    daemon (zero copy asserted at 20 KiB, 4 MiB and every size from empty to 1 MiB; every change within the map seen with
+    no request; the release, the share, a destroy, an unlink and a `SIGKILL`ed mapper's reap as on Linux); the handed
+    descriptor's shared writable map refused `EPERM`, a write `EBADF`, its read-only map turned writable `EACCES`, a
+    resize either way `EINVAL`, a private writable map `EINVAL`, a reopen read-write through `/dev/fd` `EBADF`; the
+    Shards suite 25 of 25 over route version 2; ipc, server unit; workspace clippy clean on macOS and on fedora, where
+    the client binary, `reap_map` and the server's unit tests pass unchanged.
+  - **Red-checked** in a scratch copy, each arm rebuilt: the read-write descriptor handed in the read-only one's place
+    was refused unconfined at the hand-off (the neighbour's map came by copy); with the judge bypassed too, the test
+    failed at the access mode; with that assertion lifted too, at the shared writable map, which was granted (as was
+    the turned map; the write answered `ESPIPE` and the resize `EINVAL`, so the write is held to `EBADF`, the access
+    mode's own refusal, and the resize to XNU's rule for every descriptor).
+  - **Fixed on the way, failing test first:** a copy released before its offer was claimed left the offer claimable,
+    a live object outside the client's share (`docs/bugs/2026-10-25-a-released-maps-offer-stayed-claimable.md`); every
+    copy let go now withdraws its offer (`direct_map::let_go`).
+  - **Open:**
+    - a test of the reap's withdrawal of its own: it shares the release's code, and a test would race the offer's own
+      expiry (both two liveness budgets), so it is owed rather than written flaky;
+    - **sibling found by the sweep:** a Shards stream offer outlives an attachment that ended before its claim, a dead
+      end held until it expires; counted against the shard's handoff bound meanwhile, so no bound breaks;
+    - this Mac's map arm of the break-even bench (step 3), now that the map is direct here;
+    - a hand-off that fails at the client after the copy was made (a claim refused on macOS — `Busy`, an expired offer,
+      a confirmation that does not open — or, on Linux since A-171, a delivery that never arrives) returns the error
+      and leaves the copy held on the client's slot, unreachable by `release_map` (which takes the map), until the
+      client is reaped: bounded by the client's share, but each such failure shrinks it. The client should release the
+      copy by its id on the failure; owed as the next piece.
+
 - **Copy-once-map-many against copy-per-read, measured (G-direct step 3, 2026-10-25).** BENCHMARKS, "Copy-once-map-many
   against copy-per-read". On the box (load 65–80, capped) and on fedora (load 13), two runs each, best of 15: a steady
   mapped read costs 3.7 % to 10.3 % of a copy read at 4 KiB, 1 MiB and 64 MiB alike; a map repays its setup after one
@@ -11313,7 +11346,8 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     client binary 15 on fedora; recovery 41 of 41 (see the sibling below for its first run); workspace clippy and the
     doc gate on fedora.
   - **Owed:**
-    - macOS (its descriptor over A-161's socket route) and Windows (handle duplication): G-direct steps 4 and 5;
+    - macOS (its descriptor over A-161's socket route) and Windows (handle duplication): G-direct steps 4 and 5; **macOS
+      done the same day, A-173** (the entry above);
     - the release, reap and cap behaviour as its own step (G-direct step 2): **done the same day, A-172** (the entry
       above this one);
     - the measurement of copy-once-map-many against copy-per-read, and of the cut's zeroing by stores (G-direct
@@ -11335,9 +11369,11 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
 - **The DAX matrix (A-164, 2026-10-24): every cell of "DAX everywhere" is proven, owed to a goal, or ruled out by its
   platform.** The matrix is in `virtiofs.md` §8: six environments, each platform a row, two routes, 52 cells, none left
   unknown. The research behind it is kiln 01a17143717a7556a52f40f1d5a0e1b2 (19 findings, graded from their sources).
-  - **Proven (6 cells):**
+  - **Proven (7 cells):**
     - bare-metal Linux x86_64 by the mount route: the FUSE mount's shared maps;
     - bare-metal Linux x86_64 by the socket route: the direct map's sealed copy (A-171, 2026-10-25; the entry below);
+    - bare-metal macOS arm64 by the socket route: the direct map's read-only copy over the daemon's socket route (A-173,
+      2026-10-25; the entry below);
     - crosvm on Linux x86_64 by both routes: over a slates mount, and over slates' own device (G-vhost, 2026-10-25:
       `crates/cli/tests/guest_vhost.rs`, the entries below);
     - a Shards guest on macOS arm64 by the socket route;
@@ -11351,7 +11387,7 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     - WSL2: 9P (unconfirmed);
     - Firecracker's socket route: it has no fs device.
   - **Owed, each to a kiln goal:**
-    - the direct map on macOS and Windows (G-direct steps 4 and 5). **Corrected 2026-10-25:** this entry and the matrix
+    - the direct map on Windows (G-direct step 5; macOS proven since 2026-10-25, A-173). **Corrected 2026-10-25:** this entry and the matrix
       had counted the A-135 direct map on Linux as proven while every run read by copy (its test reported the path
       and did not assert it); A-171 has proven it since, asserting the zero-copy path;
     - the mount route's maps on macOS, Windows and in containers and pods;

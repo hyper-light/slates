@@ -2256,7 +2256,7 @@ fn ingest_cost_per_mapped_mib() {
 mod route {
   use slates_ipc::route::{
     Exchange, HELLO_BYTES, Hello, KIND_CHALLENGE, KIND_MALFORMED, KIND_PROOF, NONCE_BYTES,
-    SEALED_BYTES,
+    OfferKind, SEALED_BYTES,
   };
 
   use super::*;
@@ -2294,7 +2294,8 @@ mod route {
     client_nonce: [u8; NONCE_BYTES],
   ) -> [u8; NONCE_BYTES] {
     let hello = Hello {
-      attachment,
+      kind: OfferKind::Stream,
+      id: attachment,
       client_nonce,
     };
     stream.write_all(&hello.encode()).unwrap();
@@ -2323,7 +2324,7 @@ mod route {
     client: [u8; NONCE_BYTES],
     daemon: [u8; NONCE_BYTES],
   ) -> [u8; SEALED_BYTES] {
-    Exchange::new(secret, attachment, &client, &daemon)
+    Exchange::new(secret, (OfferKind::Stream, attachment), &client, &daemon)
       .unwrap()
       .proof()
       .unwrap()
@@ -2378,7 +2379,8 @@ mod route {
     refused_with(&mut short, KIND_MALFORMED);
     let mut other_version = connect_route(&instance);
     let mut hello = Hello {
-      attachment,
+      kind: OfferKind::Stream,
+      id: attachment,
       client_nonce,
     }
     .encode();
@@ -2407,7 +2409,13 @@ mod route {
     drop(silent);
 
     // The honest claim, after all of it, succeeds; a second with the same secret finds no offer.
-    let stream = slates_ipc::route::claim(&instance, attachment, &secret, CREDIT_WAIT).unwrap();
+    let stream = slates_ipc::route::claim(
+      &instance,
+      (OfferKind::Stream, attachment),
+      &secret,
+      CREDIT_WAIT,
+    )
+    .unwrap();
     let mut guest = Guest::over(ShardsAttached {
       attachment,
       lease_epoch: None,
@@ -2416,7 +2424,12 @@ mod route {
     guest.init();
     assert_eq!(guest.lookup(ROOT, "nothing"), Err(ENOENT));
     assert!(matches!(
-      slates_ipc::route::claim(&instance, attachment, &secret, CREDIT_WAIT),
+      slates_ipc::route::claim(
+        &instance,
+        (OfferKind::Stream, attachment),
+        &secret,
+        CREDIT_WAIT
+      ),
       Err(IpcError::RouteRefused {
         refusal: slates_ipc::error::RouteRefusal::NoOffer
       })
@@ -2492,7 +2505,12 @@ mod route {
     let mut flushed = 0usize;
     for _ in 0..CLAIMS_UNDER_CHURN {
       let (attachment, secret) = offer(client, id);
-      let stream = match slates_ipc::route::claim(instance, attachment, &secret, CREDIT_WAIT) {
+      let stream = match slates_ipc::route::claim(
+        instance,
+        (OfferKind::Stream, attachment),
+        &secret,
+        CREDIT_WAIT,
+      ) {
         Ok(stream) => stream,
         Err(IpcError::RouteRefused {
           refusal: slates_ipc::error::RouteRefusal::Flushed,
@@ -2532,7 +2550,12 @@ mod route {
     #[allow(clippy::disallowed_methods)]
     std::thread::sleep(PAST_EXPIRY);
     assert!(matches!(
-      slates_ipc::route::claim(&instance, attachment, &secret, CREDIT_WAIT),
+      slates_ipc::route::claim(
+        &instance,
+        (OfferKind::Stream, attachment),
+        &secret,
+        CREDIT_WAIT
+      ),
       Err(IpcError::RouteRefused {
         refusal: slates_ipc::error::RouteRefusal::NoOffer
       })

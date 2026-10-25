@@ -3073,6 +3073,20 @@ pub enum ReplyBody {
   },
   /// A direct map was let go (`ReleaseMap`). Appended.
   MapReleased,
+  /// A same-kernel client's direct map is offered on the daemon's socket route (§4.6, A-173; macOS, where no control
+  /// socket carries a descriptor): the client claims the read-only descriptor of the daemon's copy once, with `secret`,
+  /// within the offer's life, then maps all `block_len` bytes of it. The secret authorizes that one claim and nothing
+  /// else. Appended.
+  MapOffered {
+    /// The daemon-minted mapping id: the offer's id on the route, and what `ReleaseMap` names.
+    mapping_id: u64,
+    /// The file's length when it was handed.
+    file_len: u64,
+    /// The object's whole length: the file's page span when it was mapped.
+    block_len: u64,
+    /// The single-use secret the claim's exchange is keyed from (256 bits).
+    secret: [u8; 32],
+  },
 }
 
 /// One entry of a directory listing (`ReadDir`).

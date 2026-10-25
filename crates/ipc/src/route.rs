@@ -1,7 +1,7 @@
-//! The Shards stream's socket route on macOS (§4.6, the Shards route; A-161): how a client that attached a volume in
-//! the Shards form receives the stream end the daemon serves the attachment on. Linux sends the end over the client's
-//! control socket (`rendezvous`); macOS has no such socket, and a descriptor reaches an unrelated process there only
-//! through a Unix socket with a name, so the daemon listens on one socket file and nothing else on disk.
+//! The daemon's socket route on macOS (§4.6; A-161, A-173): how a client receives a descriptor the daemon offers it, a
+//! Shards stream's end (A-161) or the read-only descriptor of a direct map's copy of a file (A-173). Linux sends both over
+//! the client's control socket (`rendezvous`); macOS has no such socket, and a descriptor reaches an unrelated process
+//! there only through a Unix socket with a name, so the daemon listens on one socket file and nothing else on disk.
 //!
 //! **Where.** The socket is `slates-<16 hex>.sock` in the user's own temporary directory, `confstr`'s
 //! `_CS_DARWIN_USER_TEMP_DIR` (`/var/folders/…/T/`, made by the system for the user alone, mode 0700), never `/tmp`;
@@ -10,19 +10,20 @@
 //! made owner-only (0600), and it is removed when the daemon stops; a node a dead daemon left is found unanswered and
 //! replaced. Socket files are authorized for this when what crosses them is encrypted end to end (Ada, 2026-10-22).
 //!
-//! **What crosses it.** Nothing a listener could use. The attach's reply on the client's ring carries the attachment
-//! and a fresh 256-bit secret that the daemon keeps with the stream end as one offer. On the socket:
-//! 1. the client sends a hello: the protocol's version, the attachment, and a fresh 32-byte nonce of its own;
+//! **What crosses it.** Nothing a listener could use. The reply on the client's ring (an attach's, a map's) carries the
+//! offer's kind, its id (the attachment, the mapping) and a fresh 256-bit secret that the daemon keeps with the
+//! descriptor as one offer. On the socket:
+//! 1. the client sends a hello: the protocol's version, the offer's kind and id, and a fresh 32-byte nonce of its own;
 //! 2. the daemon answers with a fresh 32-byte nonce of its own;
 //! 3. each side derives two keys by HKDF-SHA256 (RFC 5869) from the secret, salted with both nonces, one per
 //!    direction, so every exchange has keys no other exchange had and each key seals one message at a nonce of zero
 //!    (SP 800-38D §8.2.1 asks a nonce never repeat under a key; here a key never seals twice);
-//! 4. the client sends its proof, the attachment sealed with AES-256-GCM under its key, the transcript (the label,
-//!    the attachment and both nonces) as additional data;
-//! 5. the daemon opens it, retires the offer (a secret claims once), and sends its confirmation, the attachment sealed
-//!    under its own key, with the stream end by `SCM_RIGHTS` in the same message; the client opens the confirmation
-//!    before it trusts the end, and closes the route, which tells the daemon its receive has returned;
-//! 6. only then does the daemon close its own copy of the end. XNU flushes a Unix socket whose every reference is in a
+//! 4. the client sends its proof, the id sealed with AES-256-GCM under its key, the transcript (the label, the kind,
+//!    the id and both nonces) as additional data, so a proof made for one kind of offer never opens for the other;
+//! 5. the daemon opens it, retires the offer (a secret claims once), and sends its confirmation, the id sealed under its
+//!    own key, with the descriptor by `SCM_RIGHTS` in the same message; the client opens the confirmation before it
+//!    trusts the descriptor, and closes the route, which tells the daemon its receive has returned;
+//! 6. only then does the daemon close its own copy of the descriptor. XNU flushes a Unix socket whose every reference is in a
 //!    message in flight when its collector of such descriptors runs (`unp_gc`), so an end the daemon closed at once
 //!    could arrive with its receive buffer emptied and its reads answering end of file (measured 2026-10-24; the bug
 //!    record `docs/bugs/2026-10-24-a-stream-end-arrived-flushed-by-the-kernel-in-flight.md`). A client that still
@@ -56,22 +57,30 @@ use crate::error::{IpcError, RouteRefusal};
 pub const SECRET_BYTES: usize = 32;
 /// Format: the bytes of each side's nonce: 256 bits, drawn fresh for each exchange.
 pub const NONCE_BYTES: usize = 32;
-/// Format: the version of the exchange a hello opens with.
-const VERSION: u8 = 1;
+/// Format: the version of the exchange a hello opens with: 2 since the hello names the offer's kind (A-173).
+const VERSION: u8 = 2;
 /// Format: the bytes of a hello's version.
 const VERSION_BYTES: usize = 1;
-/// Format: the bytes of an attachment id (a little-endian `u64`).
-const ATTACHMENT_BYTES: usize = 8;
-/// Derived: where a hello's attachment starts, past its version.
-const HELLO_ATTACHMENT_AT: usize = VERSION_BYTES;
-/// Derived: where a hello's nonce starts, past its version and attachment.
-const HELLO_NONCE_AT: usize = VERSION_BYTES + ATTACHMENT_BYTES;
-/// Derived: a hello: the version, the attachment, the client's nonce.
+/// Format: the bytes of a hello's offer kind.
+const KIND_BYTES: usize = 1;
+/// Format: the bytes of an offer's id (a little-endian `u64`: an attachment, a mapping).
+const ID_BYTES: usize = 8;
+/// Derived: where a hello's offer kind is, past its version.
+const HELLO_KIND_AT: usize = VERSION_BYTES;
+/// Derived: where a hello's id starts, past its version and kind.
+const HELLO_ID_AT: usize = HELLO_KIND_AT + KIND_BYTES;
+/// Derived: where a hello's nonce starts, past its version, kind and id.
+const HELLO_NONCE_AT: usize = HELLO_ID_AT + ID_BYTES;
+/// Derived: a hello: the version, the offer's kind and id, the client's nonce.
 pub const HELLO_BYTES: usize = HELLO_NONCE_AT + NONCE_BYTES;
 /// Format: an AES-GCM tag.
 const TAG_BYTES: usize = 16;
-/// Derived: a sealed attachment, a proof's or a confirmation's: the attachment and its tag.
-pub const SEALED_BYTES: usize = ATTACHMENT_BYTES + TAG_BYTES;
+/// Derived: a sealed id, a proof's or a confirmation's: the id and its tag.
+pub const SEALED_BYTES: usize = ID_BYTES + TAG_BYTES;
+/// Format: the code of a Shards stream's end offered (A-161).
+const OFFER_STREAM: u8 = 1;
+/// Format: the code of a direct map's copy offered (A-173).
+const OFFER_MAP: u8 = 2;
 /// Format: the kind byte that opens every message the daemon sends: its nonce follows.
 pub const KIND_CHALLENGE: u8 = 0;
 /// Format: the kind of the daemon's confirmation, which carries the stream end.
@@ -85,13 +94,13 @@ pub const KIND_MALFORMED: u8 = 4;
 /// Format: the daemon at its bound of exchanges.
 pub const KIND_BUSY: u8 = 5;
 /// Format: the additional data's label, which the transcript opens with.
-const AAD_LABEL: &[u8] = b"slates shards route v1";
+const AAD_LABEL: &[u8] = b"slates route v2";
 /// Format: the HKDF info of the client's key.
-const CLIENT_KEY: &[u8] = b"slates shards route v1 client to daemon";
+const CLIENT_KEY: &[u8] = b"slates route v2 client to daemon";
 /// Format: the HKDF info of the daemon's key.
-const DAEMON_KEY: &[u8] = b"slates shards route v1 daemon to client";
-/// Derived: the transcript: the label, the attachment and both nonces.
-const TRANSCRIPT_BYTES: usize = AAD_LABEL.len() + ATTACHMENT_BYTES + 2 * NONCE_BYTES;
+const DAEMON_KEY: &[u8] = b"slates route v2 daemon to client";
+/// Derived: the transcript: the label, the offer's kind and id, and both nonces.
+const TRANSCRIPT_BYTES: usize = AAD_LABEL.len() + KIND_BYTES + ID_BYTES + 2 * NONCE_BYTES;
 /// Format: an AES-256 key.
 const KEY_BYTES: usize = 32;
 /// Format: the AES-GCM nonce each key seals its one message at.
@@ -111,11 +120,41 @@ const BACKLOG: i32 = 64;
 /// Format: the largest path `confstr` is asked to write (`PATH_MAX`).
 const PATH_MAX: usize = 1024;
 
+/// What an offer holds: the descriptor a client claims on the route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum OfferKind {
+  /// A Shards stream's end, offered for an attachment (A-161).
+  Stream,
+  /// The read-only descriptor of a direct map's copy of a file, offered for a mapping (A-173).
+  Map,
+}
+
+impl OfferKind {
+  /// Its code in a hello and in the transcript.
+  pub const fn code(self) -> u8 {
+    match self {
+      OfferKind::Stream => OFFER_STREAM,
+      OfferKind::Map => OFFER_MAP,
+    }
+  }
+
+  /// The kind `code` names, if any.
+  pub const fn of_code(code: u8) -> Option<OfferKind> {
+    match code {
+      OFFER_STREAM => Some(OfferKind::Stream),
+      OFFER_MAP => Some(OfferKind::Map),
+      _ => None,
+    }
+  }
+}
+
 /// A hello, the client's first message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Hello {
-  /// The attachment the client claims the end of.
-  pub attachment: u64,
+  /// What the client claims.
+  pub kind: OfferKind,
+  /// The offer's id: the attachment of a stream, the mapping of a map.
+  pub id: u64,
   /// The client's nonce.
   pub client_nonce: [u8; NONCE_BYTES],
 }
@@ -124,17 +163,20 @@ impl Hello {
   /// Its bytes.
   pub fn encode(&self) -> [u8; HELLO_BYTES] {
     let mut bytes = [0u8; HELLO_BYTES];
-    let (version, rest) = bytes.split_at_mut(VERSION_BYTES);
-    if let Some(byte) = version.first_mut() {
+    let (head, rest) = bytes.split_at_mut(HELLO_ID_AT);
+    if let Some(byte) = head.get_mut(..VERSION_BYTES).and_then(<[u8]>::first_mut) {
       *byte = VERSION;
     }
-    let (attachment, nonce) = rest.split_at_mut(ATTACHMENT_BYTES);
-    attachment.copy_from_slice(&self.attachment.to_le_bytes());
+    if let Some(byte) = head.get_mut(HELLO_KIND_AT) {
+      *byte = self.kind.code();
+    }
+    let (id, nonce) = rest.split_at_mut(ID_BYTES);
+    id.copy_from_slice(&self.id.to_le_bytes());
     nonce.copy_from_slice(&self.client_nonce);
     bytes
   }
 
-  /// The hello `bytes` hold: refused `Malformed` for another length or another version.
+  /// The hello `bytes` hold: refused `Malformed` for another length, another version or a kind no offer has.
   pub fn decode(bytes: &[u8]) -> Result<Hello, IpcError> {
     let malformed = IpcError::RouteRefused {
       refusal: RouteRefusal::Malformed,
@@ -142,9 +184,14 @@ impl Hello {
     if bytes.len() != HELLO_BYTES || bytes.first() != Some(&VERSION) {
       return Err(malformed);
     }
-    let attachment = bytes
-      .get(HELLO_ATTACHMENT_AT..HELLO_NONCE_AT)
-      .and_then(|word| <[u8; ATTACHMENT_BYTES]>::try_from(word).ok())
+    let kind = bytes
+      .get(HELLO_KIND_AT)
+      .copied()
+      .and_then(OfferKind::of_code)
+      .ok_or(malformed.clone())?;
+    let id = bytes
+      .get(HELLO_ID_AT..HELLO_NONCE_AT)
+      .and_then(|word| <[u8; ID_BYTES]>::try_from(word).ok())
       .map(u64::from_le_bytes)
       .ok_or(malformed.clone())?;
     let client_nonce = bytes
@@ -152,7 +199,8 @@ impl Hello {
       .and_then(|nonce| <[u8; NONCE_BYTES]>::try_from(nonce).ok())
       .ok_or(malformed)?;
     Ok(Hello {
-      attachment,
+      kind,
+      id,
       client_nonce,
     })
   }
@@ -163,15 +211,15 @@ pub struct Exchange {
   client: LessSafeKey,
   daemon: LessSafeKey,
   transcript: [u8; TRANSCRIPT_BYTES],
-  attachment: u64,
+  id: u64,
 }
 
 impl Exchange {
-  /// The keys of the exchange that claims `attachment`'s end under `secret`, with the client's and the daemon's
+  /// The keys of the exchange that claims the `kind` offer `id` under `secret`, with the client's and the daemon's
   /// nonces.
   pub fn new(
     secret: &[u8; SECRET_BYTES],
-    attachment: u64,
+    (kind, id): (OfferKind, u64),
     client_nonce: &[u8; NONCE_BYTES],
     daemon_nonce: &[u8; NONCE_BYTES],
   ) -> Result<Exchange, IpcError> {
@@ -182,40 +230,39 @@ impl Exchange {
     let mut transcript = [0u8; TRANSCRIPT_BYTES];
     let (label, rest) = transcript.split_at_mut(AAD_LABEL.len());
     label.copy_from_slice(AAD_LABEL);
-    let (word, nonces) = rest.split_at_mut(ATTACHMENT_BYTES);
-    word.copy_from_slice(&attachment.to_le_bytes());
+    let (kind_byte, rest) = rest.split_at_mut(KIND_BYTES);
+    if let Some(byte) = kind_byte.first_mut() {
+      *byte = kind.code();
+    }
+    let (word, nonces) = rest.split_at_mut(ID_BYTES);
+    word.copy_from_slice(&id.to_le_bytes());
     nonces.copy_from_slice(&salt);
     Ok(Exchange {
       client: key(secret, &salt, CLIENT_KEY)?,
       daemon: key(secret, &salt, DAEMON_KEY)?,
       transcript,
-      attachment,
+      id,
     })
   }
 
-  /// The client's proof: the attachment sealed under the client's key.
+  /// The client's proof: the id sealed under the client's key.
   pub fn proof(&self) -> Result<[u8; SEALED_BYTES], IpcError> {
-    seal(&self.client, &self.transcript, self.attachment)
+    seal(&self.client, &self.transcript, self.id)
   }
 
-  /// Whether `proof` opens under the client's key to this exchange's attachment.
+  /// Whether `proof` opens under the client's key to this exchange's id.
   pub fn proof_holds(&self, proof: &[u8]) -> bool {
-    opens(&self.client, &self.transcript, self.attachment, proof)
+    opens(&self.client, &self.transcript, self.id, proof)
   }
 
-  /// The daemon's confirmation: the attachment sealed under the daemon's key.
+  /// The daemon's confirmation: the id sealed under the daemon's key.
   pub fn confirmation(&self) -> Result<[u8; SEALED_BYTES], IpcError> {
-    seal(&self.daemon, &self.transcript, self.attachment)
+    seal(&self.daemon, &self.transcript, self.id)
   }
 
-  /// Whether `confirmation` opens under the daemon's key to this exchange's attachment.
+  /// Whether `confirmation` opens under the daemon's key to this exchange's id.
   pub fn confirmation_holds(&self, confirmation: &[u8]) -> bool {
-    opens(
-      &self.daemon,
-      &self.transcript,
-      self.attachment,
-      confirmation,
-    )
+    opens(&self.daemon, &self.transcript, self.id, confirmation)
   }
 }
 
@@ -247,15 +294,11 @@ fn key(secret: &[u8; SECRET_BYTES], salt: &[u8], info: &[u8]) -> Result<LessSafe
   Ok(LessSafeKey::new(unbound))
 }
 
-/// `attachment` sealed under `key` at the zero nonce, `transcript` as additional data: its bytes and tag.
-fn seal(
-  key: &LessSafeKey,
-  transcript: &[u8],
-  attachment: u64,
-) -> Result<[u8; SEALED_BYTES], IpcError> {
+/// `id` sealed under `key` at the zero nonce, `transcript` as additional data: its bytes and tag.
+fn seal(key: &LessSafeKey, transcript: &[u8], id: u64) -> Result<[u8; SEALED_BYTES], IpcError> {
   let mut sealed = [0u8; SEALED_BYTES];
-  let (body, tag_out) = sealed.split_at_mut(ATTACHMENT_BYTES);
-  body.copy_from_slice(&attachment.to_le_bytes());
+  let (body, tag_out) = sealed.split_at_mut(ID_BYTES);
+  body.copy_from_slice(&id.to_le_bytes());
   let tag = key
     .seal_in_place_separate_tag(
       Nonce::assume_unique_for_key(ZERO_NONCE),
@@ -270,8 +313,8 @@ fn seal(
   Ok(sealed)
 }
 
-/// Whether `sealed` opens under `key` with `transcript` to `attachment`.
-fn opens(key: &LessSafeKey, transcript: &[u8], attachment: u64, sealed: &[u8]) -> bool {
+/// Whether `sealed` opens under `key` with `transcript` to `id`.
+fn opens(key: &LessSafeKey, transcript: &[u8], id: u64, sealed: &[u8]) -> bool {
   if sealed.len() != SEALED_BYTES {
     return false;
   }
@@ -283,7 +326,7 @@ fn opens(key: &LessSafeKey, transcript: &[u8], attachment: u64, sealed: &[u8]) -
       Aad::from(transcript),
       &mut copy,
     )
-    .is_ok_and(|plain| plain == attachment.to_le_bytes().as_slice())
+    .is_ok_and(|plain| plain == id.to_le_bytes().as_slice())
 }
 
 /// `N` random bytes from the system's generator (a secret, a nonce).
@@ -471,7 +514,31 @@ fn answers(address: &SocketAddrUnix) -> bool {
   stream_socket().is_ok_and(|probe| rustix::net::connect(&probe, address).is_ok())
 }
 
-/// Sends the daemon's confirmation on `connection`, the stream end by `SCM_RIGHTS` in the same message, so the end
+/// Refuses a direct map's descriptor that would authorize a peer more than reading the copy it is offered for (§4.6,
+/// A-173, macOS). macOS has no seals, so the capability is the descriptor's own access: it must be open read alone
+/// (`F_GETFL`), which refuses the peer a writable shared map and a write of it (XNU refuses any second sizing of such an
+/// object whatever the mode), and its object must be exactly the `authorized` bytes (`fstat`), the copy and nothing
+/// more. An object reached by no name (the daemon unlinks it at
+/// once) cannot be opened read-write again; a read-only descriptor of one is a read-only capability (measured on macOS
+/// 26.4.1, `crates/mem/tests/peer_object.rs`). Refused `UnconfinedDescriptor` naming what it would have authorized.
+pub fn confined_read_only(descriptor: BorrowedFd<'_>, authorized: u64) -> Result<(), IpcError> {
+  let object_bytes = rustix::fs::fstat(descriptor)
+    .map(|stat| u64::try_from(stat.st_size).unwrap_or(u64::MAX))
+    .map_err(|e| refused("fstat offered map", e))?;
+  let access = rustix::fs::fcntl_getfl(descriptor).map_err(|e| refused("fcntl(F_GETFL)", e))?;
+  // structural: allow — the access modes `F_GETFL` answered, compared to refuse a writable descriptor; nothing is opened.
+  let writable = access.intersects(rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::RDWR);
+  if writable || object_bytes != authorized {
+    return Err(IpcError::UnconfinedDescriptor {
+      object_bytes,
+      authorized_bytes: authorized,
+      writable,
+    });
+  }
+  Ok(())
+}
+
+/// Sends the daemon's confirmation on `connection`, the offered descriptor by `SCM_RIGHTS` in the same message, so it
 /// arrives with the bytes that vouch for it.
 pub fn send_confirmation(
   connection: BorrowedFd<'_>,
@@ -532,13 +599,13 @@ fn refusal_of(kind: u8) -> RouteRefusal {
   }
 }
 
-/// Claims `attachment`'s stream end from the daemon of `instance` with the offer's `secret` (the client's side of the
-/// exchange in the module doc): the end, once the daemon's confirmation opens. Each socket read and write waits at
-/// most `within`; the daemon's refusals arrive typed (`RouteRefused`), and a confirmation that does not open is
-/// refused `Confirmation` with the end it carried closed.
+/// Claims the `kind` offer `id` from the daemon of `instance` with the offer's `secret` (the client's side of the
+/// exchange in the module doc): its descriptor, once the daemon's confirmation opens. Each socket read and write waits
+/// at most `within`; the daemon's refusals arrive typed (`RouteRefused`), and a confirmation that does not open is
+/// refused `Confirmation` with the descriptor it carried closed.
 pub fn claim(
   instance: &str,
-  attachment: u64,
+  (kind, id): (OfferKind, u64),
   secret: &[u8; SECRET_BYTES],
   within: Duration,
 ) -> Result<OwnedFd, IpcError> {
@@ -553,20 +620,21 @@ pub fn claim(
   }
   rustix::net::connect(&socket, &address).map_err(|e| refused("connect route", e))?;
   let hello = Hello {
-    attachment,
+    kind,
+    id,
     client_nonce: random()?,
   };
   write_all(socket.as_fd(), &hello.encode())?;
-  let mut kind = [0u8; 1];
-  read_exact(socket.as_fd(), &mut kind)?;
-  if kind != [KIND_CHALLENGE] {
+  let mut answer = [0u8; 1];
+  read_exact(socket.as_fd(), &mut answer)?;
+  if answer != [KIND_CHALLENGE] {
     return Err(IpcError::RouteRefused {
-      refusal: refusal_of(kind.first().copied().unwrap_or(KIND_MALFORMED)),
+      refusal: refusal_of(answer.first().copied().unwrap_or(KIND_MALFORMED)),
     });
   }
   let mut daemon_nonce = [0u8; NONCE_BYTES];
   read_exact(socket.as_fd(), &mut daemon_nonce)?;
-  let exchange = Exchange::new(secret, attachment, &hello.client_nonce, &daemon_nonce)?;
+  let exchange = Exchange::new(secret, (kind, id), &hello.client_nonce, &daemon_nonce)?;
   write_all(socket.as_fd(), &exchange.proof()?)?;
   let (confirmation, stream) = receive_confirmation(socket.as_fd())?;
   if !exchange.confirmation_holds(&confirmation) {
@@ -574,7 +642,8 @@ pub fn claim(
       refusal: RouteRefusal::Confirmation,
     });
   }
-  // A flush empties the receive buffer and zeroes its high-water mark; a live end's is the kernel's default.
+  // A flush empties a socket's receive buffer and zeroes its high-water mark; a live end's is the kernel's default. A
+  // descriptor that is not a socket (a map's copy) answers no such size, and is not judged by it.
   if rustix::net::sockopt::socket_recv_buffer_size(&stream).is_ok_and(|bytes| bytes == 0) {
     return Err(IpcError::RouteRefused {
       refusal: RouteRefusal::Flushed,
@@ -683,8 +752,8 @@ mod tests {
   fn an_exchange_holds_on_both_sides_and_its_directions_differ() {
     let secret = [7u8; SECRET_BYTES];
     let (client, daemon) = ([1u8; NONCE_BYTES], [2u8; NONCE_BYTES]);
-    let ours = Exchange::new(&secret, 42, &client, &daemon).unwrap();
-    let theirs = Exchange::new(&secret, 42, &client, &daemon).unwrap();
+    let ours = Exchange::new(&secret, (OfferKind::Stream, 42), &client, &daemon).unwrap();
+    let theirs = Exchange::new(&secret, (OfferKind::Stream, 42), &client, &daemon).unwrap();
     let proof = ours.proof().unwrap();
     let confirmation = ours.confirmation().unwrap();
     assert!(theirs.proof_holds(&proof));
@@ -696,20 +765,23 @@ mod tests {
     assert!(!theirs.proof_holds(&confirmation));
   }
 
-  /// Do: check one exchange's proof and confirmation against exchanges that differ in the secret, a nonce or the
-  /// attachment, then against the proof with each byte flipped and the proof cut short. Expect none to hold.
+  /// Do: check one exchange's proof and confirmation against exchanges that differ in the secret, a nonce, the id or
+  /// the offer's kind, then against the proof with each byte flipped and the proof cut short. Expect none to hold: a
+  /// proof made to claim a stream never claims a map with the same id and secret (A-173).
   #[test]
-  fn an_exchange_holds_only_under_its_own_secret_nonces_and_attachment() {
+  fn an_exchange_holds_only_under_its_own_secret_nonces_kind_and_id() {
     let secret = [7u8; SECRET_BYTES];
     let (client, daemon) = ([1u8; NONCE_BYTES], [2u8; NONCE_BYTES]);
-    let ours = Exchange::new(&secret, 42, &client, &daemon).unwrap();
+    let stream = (OfferKind::Stream, 42);
+    let ours = Exchange::new(&secret, stream, &client, &daemon).unwrap();
     let proof = ours.proof().unwrap();
     let confirmation = ours.confirmation().unwrap();
     for other in [
-      Exchange::new(&[8u8; SECRET_BYTES], 42, &client, &daemon).unwrap(),
-      Exchange::new(&secret, 43, &client, &daemon).unwrap(),
-      Exchange::new(&secret, 42, &[3u8; NONCE_BYTES], &daemon).unwrap(),
-      Exchange::new(&secret, 42, &client, &[4u8; NONCE_BYTES]).unwrap(),
+      Exchange::new(&[8u8; SECRET_BYTES], stream, &client, &daemon).unwrap(),
+      Exchange::new(&secret, (OfferKind::Stream, 43), &client, &daemon).unwrap(),
+      Exchange::new(&secret, (OfferKind::Map, 42), &client, &daemon).unwrap(),
+      Exchange::new(&secret, stream, &[3u8; NONCE_BYTES], &daemon).unwrap(),
+      Exchange::new(&secret, stream, &client, &[4u8; NONCE_BYTES]).unwrap(),
     ] {
       assert!(!other.proof_holds(&proof));
       assert!(!other.confirmation_holds(&confirmation));
@@ -722,16 +794,32 @@ mod tests {
     assert!(!ours.proof_holds(&proof[..SEALED_BYTES - 1]));
   }
 
-  /// Do: encode a hello and decode it, then decode one cut short, one too long and one of another version. Expect the
-  /// same hello back, and each hostile one refused `Malformed`.
+  /// Do: encode a hello of each kind and decode it, then decode one cut short, one too long, one of another version and
+  /// one naming a kind no offer has. Expect the same hello back, and each hostile one refused `Malformed`.
   #[test]
   fn a_hello_round_trips_and_hostile_ones_are_refused() {
+    for kind in [OfferKind::Stream, OfferKind::Map] {
+      let hello = Hello {
+        kind,
+        id: 0x0102_0304_0506_0708,
+        client_nonce: [9u8; NONCE_BYTES],
+      };
+      assert_eq!(Hello::decode(&hello.encode()).unwrap(), hello);
+    }
     let hello = Hello {
-      attachment: 0x0102_0304_0506_0708,
+      kind: OfferKind::Map,
+      id: 0x0102_0304_0506_0708,
       client_nonce: [9u8; NONCE_BYTES],
     };
     let bytes = hello.encode();
-    assert_eq!(Hello::decode(&bytes).unwrap(), hello);
+    let mut unknown_kind = bytes;
+    unknown_kind[HELLO_KIND_AT] = 0;
+    assert_eq!(
+      Hello::decode(&unknown_kind),
+      Err(IpcError::RouteRefused {
+        refusal: RouteRefusal::Malformed
+      })
+    );
     let malformed = Err(IpcError::RouteRefused {
       refusal: RouteRefusal::Malformed,
     });

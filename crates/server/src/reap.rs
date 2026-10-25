@@ -166,11 +166,12 @@ fn finish(state: &mut ShardState, handle: Handle<ClientSlot>, client_id: u32) ->
   client.status_pages.clear(&mut state.store.metadata);
   // Let go of the files' copies the client was handed by the direct map (§4.6, A-171): its map of each lives on in
   // its own process if the process does, no longer kept equal to the file, and each copy's bytes go back to the
-  // backings' budget rather than staying charged for a client that is gone.
+  // backings' budget rather than staying charged for a client that is gone; an offer of one it never claimed (macOS)
+  // is withdrawn with it.
   let reaped = client
     .direct_maps
     .drain(..)
-    .filter(|backing| state.store.shards_backings.remove(*backing).is_some())
+    .filter(|backing| crate::direct_map::let_go(state, *backing))
     .count();
   if reaped > 0 {
     state.count(

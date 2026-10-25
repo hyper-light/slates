@@ -2861,7 +2861,12 @@ later writer is refused and the daemon's earlier map keeps writing. It fills the
 time (the reply is deferred to that task, as an image build's is, A-160), then sends the copy's descriptor with the
 mapping id and the file length over the retained control socket by `SCM_RIGHTS` (the command ring cannot carry a
 descriptor; §4.7), then the reply. The client maps the copy whole, read alone, and reads it through atomics, since the
-daemon writes it at any moment. **The map is a live view of the file within its length.** The copy sits in the store's
+daemon writes it at any moment. macOS has neither seals nor a control socket (A-173): there the copy is a
+shared-memory object reached by two descriptors alone, its name removed as soon as both are open — the daemon's, read
+and write, and one opened read alone, which is offered on the daemon's socket route (A-161) behind a fresh single-use
+secret the reply carries. XNU refuses the holder of a read-only descriptor every way to write through it and sizes such
+an object once, so the descriptor's access mode is the capability, judged before the offer (`confined_read_only`: read
+alone, exactly the authorized length). **The map is a live view of the file within its length.** The copy sits in the store's
 backings beside the VMMs' (A-163), so the volume's single write boundary writes every later write, cut and growth into
 it before the change returns: the client sees them as memory alone, with no request, as a shared map of a file does. A
 change past the copy's length is not seen; the client maps again for it. This replaces A-135's pinned version, whose
@@ -2949,6 +2954,28 @@ same-namespace host process is the first delivered case.
 > with no removal on release, on reap, no share check, no detach, and a detach that releases, each test failed. The
 > counters: `dax.local_map_released`, `dax.local_map_reaped`, `dax.local_map_share_refused`; `Daemon::direct_map_copies`
 > observes what is held. A release on `MappedRead`'s own drop stays owed (a drop cannot reach its client).
+>
+> **Amended 2026-10-25 (A-173, G-direct step 4) — macOS, proven by a real client.** A `MapRead` on macOS is answered
+> `MapOffered`: the file's copy (`slates_mem::PeerObject`, a shared-memory object whose name went at once) is offered
+> read alone on the daemon's socket route, and the client claims it with the reply's secret and maps it
+> (`Client::map_read`, `claim_map`). The route's hello names the offer's kind since this change (version 2), so a
+> stream's secret never claims a map. Proven on this Mac (arm64, Darwin 25.4.0, 2026-10-25) by
+> `crates/client/tests/client.rs` over a real daemon, 21 of 21, and `reap_map.rs`, 1 of 1: zero copy asserted for a
+> 20 KiB and a 4 MiB file and at every size from empty to 1 MiB; every change within the map seen with no request; the
+> handed descriptor open read alone and exactly the mapped length, its shared writable map refused `EPERM`, a write
+> `EBADF`, its read-only map turned writable `EACCES`, a resize either way `EINVAL`, a private writable map `EINVAL`
+> and a reopen read-write through `/dev/fd` `EBADF`; another volume's marker in none of its bytes and found through
+> that volume's own descriptor; a release, the share, a destroy, an unlink and a `SIGKILL`ed mapper's reap as on
+> Linux. Red-checked: the read-write descriptor handed in the read-only one's place was refused unconfined at the
+> hand-off and the read came by copy; with the judge bypassed as well, the test failed at the access mode, and with that
+> assertion lifted, at the shared writable map, which was granted, as was the turned map, while the write answered
+> `ESPIPE` and the resize `EINVAL` — so the write is held to `EBADF`, the access mode's own refusal, and the resize is
+> XNU's rule for every descriptor, not the mode's. **Found and fixed, test first**
+> (`docs/bugs/2026-10-25-a-released-maps-offer-stayed-claimable.md`): a copy let go before its offer was claimed left
+> the offer claimable, holding a live object outside the client's share; now every copy let go withdraws its offer
+> (`direct_map::let_go`, `dax.local_map_offer_withdrawn`). **Owed:** Windows (G-direct step 5); this Mac's map arm of
+> the break-even bench (step 3); a test of the reap's withdrawal of its own (it shares the release's code; a test would
+> race the offer's own expiry, both two liveness budgets).
 
 > **Status (the DAX matrix, A-164, 2026-10-24).** What DAX means in each environment, and which of its 52 cells
 > (each environment on each platform, by the mount route and the socket route) are proven, owed or ruled out by the
@@ -2957,7 +2984,8 @@ same-namespace host process is the first delivered case.
 >   crosvm over slates' own device (Linux x86_64, A-168 and A-169, 2026-10-25); a Shards guest over the daemon's
 >   stream (macOS arm64, A-163); Firecracker by virtio-pmem over the image file through a slates mount (Linux x86_64,
 >   A-165); and, since 2026-10-25, the same-kernel direct map on Linux (A-171: a sealed copy of one file, asserted
->   zero-copy by a real client, red-checked). Six cells. **Corrected 2026-10-25:** the direct map had been listed
+>   zero-copy by a real client, red-checked) and on macOS (A-173: the copy's read-only descriptor over the socket route,
+>   asserted zero-copy by a real client, red-checked). Seven cells. **Corrected 2026-10-25:** the direct map had been listed
 >   here as proven before A-171, when its test reported which path ran without asserting it and every read was a copy.
 > - **Ruled out by the platforms:** QEMU's vhost-user-fs and Cloud Hypervisor have no DAX window, so neither has Kata;
 >   crosvm's window is x86_64-only; Apple's Virtualization framework and WSL2 document none (unconfirmed).
@@ -12199,6 +12227,15 @@ Applied in the same change to: §4.6 (the direct map's lifetime and bounds, its 
 - **Rejected: a share per client seat.** First derived as the shard's budget over `clients_per_shard`, it gave every client about four of its own ring regions (1,081,474 bytes on fedora, 2026-10-25), since `clients_per_shard` is itself the reserve over a region: too small to map the 4 MiB file step 1 maps, whatever the machine. The count per seat came out at 0 or 26.
 - **Proven** on fedora, 2026-10-25, and red-checked five ways (§4.6 status).
 
+### A-173 — macOS hands the direct map's copy read alone over the socket route (accepted 2026-10-25)
+Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its status, the DAX matrix status), A-161 (the route's version 2), GAPS, `docs/wip/virtiofs.md` §8, `crates/ipc` (`route.rs`: version 2, `OfferKind`, the hello's kind, `confined_read_only`; `protocol.rs`: `ReplyBody::MapOffered`, appended; `error.rs`: the route's refusals worded for both kinds), `crates/server` (`direct_map.rs`: the macOS hand-off, mapping ids that carry the partition, `let_go`; `shards_route.rs`: offers kept by kind, `withdraw`; `state.rs` and `daemon.rs`: `map_offers`; `shards.rs`; `reap.rs`), `crates/client` (`MappedRead::map`, `claim_map`, the offered arm of `map_read`; `tests/client.rs` and `tests/reap_map.rs` on macOS), `crates/server/tests/shards.rs` (each hello names its kind), `CLAUDE.md`, `docs/bugs/2026-10-25-a-released-maps-offer-stayed-claimable.md`.
+- **What macOS lacks, and what stands in for it.** Linux's copy is a memfd sealed against every writer but the daemon's own map (A-171); macOS has no seals and no control socket. Its copy is a POSIX shared-memory object (`slates_mem::PeerObject`): opened read and write, opened a second time read alone, its random name then removed, so the two descriptors are the only ways to it; sized once. The read-only descriptor is the capability. XNU refuses its holder every way to write (measured 2026-10-25, Darwin 25.4.0): a shared writable map `EPERM`, a write `EBADF`, a read-only map turned writable `EACCES` (the map's most protection is read), a private writable map `EINVAL` (XNU maps shared memory shared alone), a reopen read-write through `/dev/fd` `EBADF`; and a resize either way `EINVAL` whatever the descriptor's mode, since XNU sizes such an object once. The hand-off judges the descriptor before it offers it (`slates_ipc::route::confined_read_only`: open read alone, exactly the authorized length), counted `dax.local_map_unconfined` where it fails.
+- **How it reaches the client: A-161's socket route, version 2.** The reply is `MapOffered { mapping_id, file_len, block_len, secret }`; the owner shard keeps the descriptor as an offer, claimable once within two liveness budgets, as a Shards stream end is. The hello names the offer's kind (a stream end, a map's copy) beside its id, both bound into the exchange's additional data, and a shard keeps each kind's offers apart, so a secret or a proof for one never claims the other; the labels read `slates route v2`, and a hello of version 1 is refused `Malformed`. A mapping id carries its owner partition in its high 16 bits (`Handle::encode`), as an attachment id does, so the route finds the shard holding the offer.
+- **Decided: an offer never outlives its copy.** Found by its test first (`docs/bugs/2026-10-25-a-released-maps-offer-stayed-claimable.md`): a copy let go before its offer was claimed left the offer claimable, so a client could map, release and map again, each unclaimed offer keeping a live object outside its share and the fill budget for the offer's whole life. Now every way a copy goes (`direct_map::let_go`: a release, a reap, a fill that ended without its hand-off) withdraws its offer, counted `dax.local_map_offer_withdrawn`.
+- **Rejected: the read-write descriptor with only a read-only map made of it.** The descriptor is the capability, not the map: handed in the read-only one's place in the red-check, its shared writable map and its turned map were granted.
+- **Proven** on this Mac (arm64, Darwin 25.4.0, 2026-10-25) by `crates/client/tests/client.rs` and `reap_map.rs` over a real daemon, red-checked (§4.6 status); Linux unchanged, the route being macOS's alone, its suites passing on fedora.
+- **Owed:** Windows (G-direct step 5); this Mac's map arm of the break-even bench (step 3); a test of the reap's withdrawal of its own (it shares the release's code; a test would race the offer's own expiry, both two liveness budgets); and the sibling found by the sweep: a Shards stream offer outlives an attachment that ended before its claim, a dead end held until it expires, within the shard's handoff bound (GAPS).
+
 ### A-170 — A clone's copy-up copies an open extent its origin owns; only its own is sealed in place (accepted 2026-10-25)
 Applied in the same change to: `crates/vfs/src/volume.rs` (`Volume::make_current_inode`), `crates/vfs/src/content.rs`
 (`ChunkStore::copy_open`), `crates/vfs/tests/content_in_place.rs` and `crates/server/tests/recovery.rs` (the new tests
@@ -12741,6 +12778,10 @@ Applied in the same change to:
     under its own secret, nonces and attachment, every tampered byte fails, a hostile hello is refused.
   - What it does not change: the secret is as private as the client's ring, which on macOS a same-user process could
     open by name (GAP-A9-9), and that process could read the ring's file contents as well.
+  - **Version 2 (2026-10-25, A-173).** The route carries a direct map's copy too, so the hello names the offer's kind
+    (a stream end, a map's copy) beside its id, both bound into the additional data, and a shard keeps each kind's
+    offers apart: a secret or proof for one kind never claims the other. The labels read `slates route v2`; a version 1
+    hello is refused `Malformed`.
 - **The CLI (2026-10-24, part 1 step 4).** `slates shards ID [--subtree DIR] [--read-only] --fd N -- CMD` attaches the
   volume in the Shards form, announces the attachment, and replaces itself with the command, the end at descriptor `N`
   (3 or more), so a Shards spawner, or a test, gets a working end without linking slates (`shards run … --slates-fs-fd

@@ -3196,6 +3196,8 @@ fn init_shard(
     #[cfg(target_os = "macos")]
     stream_offers: std::collections::BTreeMap::new(),
     #[cfg(target_os = "macos")]
+    map_offers: std::collections::BTreeMap::new(),
+    #[cfg(target_os = "macos")]
     route_exchanges: 0,
     clock,
     served: 0,
