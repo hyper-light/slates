@@ -11271,10 +11271,19 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       binary passed 20 of 20 with no heartbeat past its budget at all. So these failures are oversubscription. Each
       in-process daemon sizes itself from the whole machine (`DaemonConfig::derive`), Windows charges a committed
       section and a large heap block against the commit limit when they are made (Linux and macOS back them only as
-      they are touched), and thirteen machine-sized daemons in one process meet that limit. Their first touches then
-      fault in pages concurrently, which the thread's CPU time counts. Owed: find the 873,462,528-byte allocation (one
-      daemon's, derived from this machine's RAM) and judge its size for one daemon; and size each daemon of a
-      many-daemon test from its share of the machine, or keep Windows CI one test at a time. The trace also showed a
+      they are touched), and thirteen machine-sized daemons in one process meet that limit. **The 873,462,528-byte
+      allocation, found the same day** (a scratch allocator that printed every allocation of 256 MiB or more with its
+      stack, over the client binary one test at a time on jupiter): it is each database partition's lease-expiry timer
+      wheel, `slates_rt::timer::Wheel::new` reserving its whole slab at once (`Slab::preallocated`, from
+      `slates_db::partition::Partition::new` in `init_shard`'s recovery). Its bound is the partition's volume bound
+      (`PartitionCaps::timers: volumes`), which this machine derives from total RAM as 18,197,136 timers of 48 bytes;
+      56 such reservations over the binary's 20 tests, some of 1,746,925,056 bytes. On this Mac the typed-verbs test
+      made no allocation of 256 MiB or more. A reservation the wheel never touches costs Linux and macOS nothing, and
+      the wheel reserves once so that arming a timer never allocates (2026-09-19). Windows commits a heap block when it
+      is made, so every partition charges its whole timer bound against the commit limit at start, empty or not.
+      Owed: on Windows, reserve the wheel's address space and commit it as the wheel fills, or bound the wheel by what
+      a partition can arm; size each daemon of a many-daemon test from its share of the machine, or keep Windows CI one
+      test at a time. Not yet found: what spends the long polls' CPU (the wheel's reservation touches no page). The trace also showed a
       runtime's shard ids handed out again after an earlier daemon's runtime ended (two daemons' shard 16 seated a
       client 43 ms apart), harmless here since every named object carries the instance or its daemon's key. CI runs
       the client binary one test at a time on Windows meanwhile;
