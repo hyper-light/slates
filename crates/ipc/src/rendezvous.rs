@@ -424,9 +424,9 @@ impl std::fmt::Debug for Liveness {
   }
 }
 
-/// A read-only content map the daemon delivered to a same-kernel client (§4.6, A-135): the arena
-/// block's backing descriptor and where the file's bytes sit within it. The client `mmap`s `block`
-/// read-only at `region_off` for the file's page span; the sub-file tail of the last page reads zero.
+/// A direct map the daemon delivered to a same-kernel client (§4.6, A-171): the descriptor of its copy of one file,
+/// sealed against every writer but the daemon, and where the file sits within it (offset zero). The client `mmap`s
+/// `block` read-only, all `block_len` bytes; past the file's end the copy reads zero.
 #[cfg(unix)]
 pub struct MappingDelivery {
   /// The arena block's backing object, to map read-only.
@@ -539,15 +539,17 @@ pub mod platform {
   use crate::error::IpcError;
   use crate::region::ClientRegion;
 
-  /// Refuses a descriptor that would authorize a peer more than the hand-off does (§4.6, A-135).
+  /// Refuses a descriptor that would authorize a peer more than the hand-off does (§4.6; A-135, A-171).
   ///
-  /// Two questions, both measured on the descriptor itself rather than taken from the caller:
+  /// What may cross is one file's copy, all of it authorized, sealed against writing and resizing: the
+  /// object the direct map makes for each file it hands (`slates_mem::PeerObject`). Two questions, both
+  /// measured on the descriptor itself rather than taken from the caller:
   ///
-  /// 1. **Does it reach past the window?** `fstat` gives the object's whole length, which is what the
-  ///    holder of the descriptor may map. The window starts at `region_off` and runs `authorized`
-  ///    bytes, so the descriptor is confined only when the window is the object: offset zero and equal
-  ///    lengths. A shared arena holding many volumes' blocks fails this by construction — which is the
-  ///    point, since that is what was being handed over before.
+  /// 1. **Does it reach past what is authorized?** `fstat` gives the object's whole length, which is what
+  ///    the holder of the descriptor may map. The authorized bytes start at `region_off` and run
+  ///    `authorized` bytes, so the descriptor passes only when they are the whole object: offset zero and
+  ///    equal lengths. One file's copy is that by construction; the shared content arena holding every
+  ///    volume's blocks never is, and it is what the 2026-10-18 escape handed over.
   /// 2. **Could the peer still write or resize it?** `F_GET_SEALS`. Writing must be sealed
   ///    (`F_SEAL_WRITE`, or `F_SEAL_FUTURE_WRITE` where the owner keeps its own earlier map) and both
   ///    `F_SEAL_SHRINK` and `F_SEAL_GROW` must be set, or a peer shrinks the object under the daemon's
@@ -687,18 +689,18 @@ pub mod platform {
       rustix::io::dup(&self.completion).ok()
     }
 
-    /// Sends a content-map delivery to the client over the control socket (§4.6, A-135): the block's
-    /// backing descriptor by `SCM_RIGHTS` with the mapping metadata. The client `mmap`s `block` at
-    /// `region_off` for the file's page span. One `sendmsg`, so the descriptor arrives with the body;
-    /// the command ring cannot carry a descriptor, this socket can.
+    /// Sends a direct-map delivery to the client over the control socket (§4.6, A-171): the descriptor of
+    /// the daemon's copy of one file by `SCM_RIGHTS` with the mapping metadata. The client `mmap`s `block`
+    /// whole, from `region_off` (zero). One `sendmsg`, so the descriptor arrives with the body; the command
+    /// ring cannot carry a descriptor, this socket can.
     ///
     /// **The descriptor is checked against what it authorizes before it is sent**, and that check is
     /// here — at the one place a descriptor leaves this process for a peer — so no caller can skip it.
     /// A descriptor carries its whole object, read and write; `region_off`, `file_len` and `block_len`
     /// scope the *request* and bind the peer to nothing. The peer is not trusted merely for sharing
     /// this uid: a §4.13 consumer is an untrusted process of exactly this uid holding exactly this
-    /// channel. So the object must be the window ([`IpcError::UnconfinedDescriptor`] otherwise), and it
-    /// must be sealed against writing and resizing.
+    /// channel. So the object must be all authorized, one file's copy and nothing more
+    /// ([`IpcError::UnconfinedDescriptor`] otherwise), and it must be sealed against writing and resizing.
     ///
     /// The seals are the measured mechanism rather than a chosen one (2026-10-18, kernel 7.2.9): a
     /// read-only duplicate of a memfd is **no** defence — the peer re-opens it `O_RDWR` through

@@ -84,7 +84,8 @@ impl Deadlines {
 }
 
 /// Whether the daemon defers `body`'s reply until long work ends — a granted landing, which runs in slices for
-/// as long as its tree takes; a FUSE mount, which waits on the OS's mount helper; and any verb the daemon may forward
+/// as long as its tree takes; an image's build or merge and a direct map's fill, which run in slices for as long as
+/// their data takes; a FUSE mount, which waits on the OS's mount helper; and any verb the daemon may forward
 /// to its volume's owner across the fleet (`RequestBody::may_be_forwarded`), under a location round and a forward
 /// the daemon bounds by the measured path — so a caller waits for it while the daemon lives rather than for one reply
 /// deadline.
@@ -100,6 +101,8 @@ pub fn defers_reply(body: &RequestBody) -> bool {
         // An image's build and merge run in slices on the owner shard, as long as the image takes (A-160).
         | RequestBody::ImageBuild { .. }
         | RequestBody::ImageMerge { .. }
+        // A direct map's copy is filled in slices on the owner shard, as long as the file takes (A-171).
+        | RequestBody::MapRead { .. }
         | RequestBody::Attach {
           form: AttachRequest::FuseMount { .. }
             | AttachRequest::ScopedFuseMount { .. }
@@ -376,11 +379,14 @@ struct EditChain {
   offset: usize,
 }
 
-/// A file's bytes delivered to a same-kernel client (§4.6, A-135): mapped directly from the daemon's
-/// arena with no copy where the daemon could (the common case), or the daemon's copy where it could not
-/// (a different trust domain, no shared-object backing, a cross-shard volume). Either way
-/// [`MappedRead::bytes`] is the file's authorized bytes. A direct mapping is unmapped when this value
-/// drops; the daemon keeps the version pinned until the client disconnects (an explicit release is owed).
+/// A file's bytes delivered to a same-kernel client (§4.6, A-171): mapped from the daemon's copy of the file with no
+/// copy per read where the daemon could hand it (the common case on Linux), or the daemon's copy read by the paged path
+/// where it could not (another trust domain, a platform with no route yet, a cross-shard volume, an overlay).
+///
+/// **A zero-copy map is live.** The daemon writes every later change of the file within the mapped length into the
+/// object this maps before the change returns, so two reads may differ: the bytes are loaded through atomics at each
+/// [`MappedRead::read_at`], never lent as a slice. A change past the mapped length is not seen; map again for it. The
+/// mapping ends when this value drops; the daemon keeps its copy equal to the file until the client goes.
 #[cfg(unix)]
 pub struct MappedRead {
   inner: Mapped,
@@ -388,95 +394,125 @@ pub struct MappedRead {
 
 #[cfg(unix)]
 enum Mapped {
-  /// Zero-copy: `ptr` maps `map_len` whole read-only pages of the arena block; the file is its first
-  /// `file_len` bytes. `_fd` keeps the backing object alive while the mapping lives.
+  /// Zero-copy: a read-only view of the daemon's whole copy; the file was `file_len` bytes when it was mapped.
   Zero {
-    ptr: *mut core::ffi::c_void,
-    map_len: usize,
-    file_len: usize,
-    _fd: std::os::fd::OwnedFd,
+    view: slates_mem::PeerView,
+    file_len: u64,
   },
-  /// The daemon's copy (the fallback).
+  /// The daemon's bytes, read by the paged path.
   Copied(Vec<u8>),
 }
 
 #[cfg(unix)]
 impl MappedRead {
-  /// The file's bytes — a borrow into the mapped arena block, or into the copied buffer.
+  /// The file's length when it was mapped, within what the map shows.
   #[must_use]
-  pub fn bytes(&self) -> &[u8] {
+  pub fn len(&self) -> u64 {
     match &self.inner {
-      Mapped::Zero { ptr, file_len, .. } => {
-        // SAFETY: `ptr` begins `map_len` ≥ `file_len` bytes the daemon mapped read-only from the arena
-        // block it authorized (§4.6, A-135). The bytes are immutable, pinned content and the backing
-        // descriptor is held in `_fd`, so the range stays valid and unchanging for this borrow.
-        unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), *file_len) }
-      }
-      Mapped::Copied(bytes) => bytes,
+      Mapped::Zero { view, file_len } => (*file_len).min(view.len()),
+      Mapped::Copied(bytes) => u64::try_from(bytes.len()).unwrap_or(u64::MAX),
     }
   }
 
-  /// Whether the bytes were mapped directly (zero-copy) rather than copied — a test's non-vacuity check.
+  /// Whether the file was empty when it was mapped.
+  #[must_use]
+  pub fn is_empty(&self) -> bool {
+    self.len() == 0
+  }
+
+  /// How many of the file's bytes the map shows: the file's page span when it was mapped for a zero-copy map, within
+  /// which a later change of the file is seen, and the bytes read for a copy.
+  #[must_use]
+  pub fn mapped_len(&self) -> u64 {
+    match &self.inner {
+      Mapped::Zero { view, .. } => view.len(),
+      Mapped::Copied(bytes) => u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+    }
+  }
+
+  /// Copies the file's bytes from `offset` into `into`, as many as the map shows from there; how many. A zero-copy map
+  /// reads the file as it is now (its bytes past the file's end read zero); a copy, as it was read.
+  pub fn read_at(&self, offset: u64, into: &mut [u8]) -> Result<usize, ClientError> {
+    let shown = self.mapped_len();
+    let take = shown
+      .saturating_sub(offset)
+      .min(u64::try_from(into.len()).unwrap_or(u64::MAX));
+    let count = usize::try_from(take).unwrap_or(0);
+    let Some(into) = into.get_mut(..count) else {
+      return Ok(0);
+    };
+    match &self.inner {
+      Mapped::Zero { view, .. } => view.load(offset, into).map_err(|error| {
+        ClientError::Ipc(IpcError::OsRefused {
+          call: "load a mapped read",
+          code: match error {
+            slates_mem::MemError::OsRefused { code, .. } => code,
+            _ => None,
+          },
+        })
+      })?,
+      Mapped::Copied(bytes) => {
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        let from = bytes
+          .get(start..start.saturating_add(count))
+          .unwrap_or_default();
+        if let Some(into) = into.get_mut(..from.len()) {
+          into.copy_from_slice(from);
+        }
+      }
+    }
+    Ok(count)
+  }
+
+  /// The file's first [`MappedRead::len`] bytes, copied out.
+  pub fn to_vec(&self) -> Result<Vec<u8>, ClientError> {
+    let mut bytes = vec![0u8; usize::try_from(self.len()).unwrap_or(0)];
+    let read = self.read_at(0, &mut bytes)?;
+    bytes.truncate(read);
+    Ok(bytes)
+  }
+
+  /// Whether the bytes were mapped directly (zero-copy) rather than copied: a test's non-vacuity check.
   #[must_use]
   pub fn is_zero_copy(&self) -> bool {
     matches!(self.inner, Mapped::Zero { .. })
   }
 
-  /// The copy fallback: the daemon served the bytes.
+  /// The descriptor of the daemon's copy a zero-copy map was handed, or `None` for a copy: what a peer holds and could
+  /// pass on, which authorizes reading this one file and nothing else.
+  #[must_use]
+  pub fn descriptor(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+    match &self.inner {
+      Mapped::Zero { view, .. } => Some(view.descriptor()),
+      Mapped::Copied(_) => None,
+    }
+  }
+
+  /// The copy path: the daemon's bytes, read by the paged path.
   fn copied(bytes: Vec<u8>) -> MappedRead {
     MappedRead {
       inner: Mapped::Copied(bytes),
     }
   }
 
-  /// Maps the delivered arena block read-only at its page-aligned offset, covering the file's pages.
+  /// Maps the delivered copy whole, read alone: `block_len` bytes, the size the daemon made it.
   fn map(
     delivery: slates_ipc::rendezvous::MappingDelivery,
-    region_off: u64,
     file_len: u64,
+    block_len: u64,
   ) -> Result<MappedRead, ClientError> {
-    let block = delivery.block;
-    let page = rustix::param::page_size().max(1);
-    let file_len = usize::try_from(file_len).unwrap_or(0);
-    let map_len = file_len.div_ceil(page).saturating_mul(page).max(page);
-    // SAFETY: a read-only, shared mapping of the daemon-provided backing object at the page-aligned
-    // block offset for `map_len` whole pages; the kernel validates the range against the object, and
-    // `block` is moved into the returned value so the mapping stays backed for its life.
-    let ptr = unsafe {
-      rustix::mm::mmap(
-        core::ptr::null_mut(),
-        map_len,
-        rustix::mm::ProtFlags::READ,
-        rustix::mm::MapFlags::SHARED,
-        &block,
-        region_off,
-      )
-    }
-    .map_err(|error| {
+    let view = slates_mem::PeerView::map(delivery.block, block_len).map_err(|error| {
       ClientError::Ipc(IpcError::OsRefused {
         call: "mmap",
-        code: Some(error.raw_os_error()),
+        code: match error {
+          slates_mem::MemError::OsRefused { code, .. } => code,
+          _ => None,
+        },
       })
     })?;
     Ok(MappedRead {
-      inner: Mapped::Zero {
-        ptr,
-        map_len,
-        file_len,
-        _fd: block,
-      },
+      inner: Mapped::Zero { view, file_len },
     })
-  }
-}
-
-#[cfg(unix)]
-impl Drop for MappedRead {
-  fn drop(&mut self) {
-    if let Mapped::Zero { ptr, map_len, .. } = &self.inner {
-      // SAFETY: `ptr`/`map_len` are exactly the region `map` mapped; unmapping releases this process's
-      // view. A failure is unrecoverable in a drop and leaves only this view behind.
-      let _unmapped = unsafe { rustix::mm::munmap(*ptr, *map_len) };
-    }
   }
 }
 
@@ -926,11 +962,11 @@ impl Client {
     self.call_plain(body)
   }
 
-  /// A-135: read a file's bytes with no copy where the daemon can map them for this same-kernel client,
-  /// else the daemon's copy — either way [`MappedRead::bytes`] is the file's bytes. The daemon mints a
-  /// read mapping and sends the arena block's descriptor over the control socket; this maps it. The
-  /// mapping is released when the returned `MappedRead` (Unix only) is dropped (the daemon pins the version until
-  /// the client disconnects; an explicit release is owed).
+  /// §4.6, A-171: maps a file's bytes with no copy per read where the daemon can hand this same-kernel client its copy
+  /// of the file, else reads them by the paged path; either way [`MappedRead::read_at`] reads the file's bytes. The
+  /// daemon fills a copy of the file, sealed against every writer but itself, and sends its descriptor over the control
+  /// socket before the reply; this maps it read alone. The daemon keeps the copy equal to the file until this client
+  /// goes, so the map is live within its length (an explicit release on drop is owed).
   #[cfg(unix)]
   pub fn map_read(&mut self, volume: VolumeId, path: &str) -> Result<MappedRead, ClientError> {
     let reply = match self.call(&RequestBody::MapRead {
@@ -951,9 +987,9 @@ impl Client {
     match reply {
       ReplyBody::Mapped {
         mapping_id,
-        region_off,
+        region_off: 0,
         file_len,
-        ..
+        block_len,
       } => {
         let delivered = self.recv_delivery(|delivery| {
           matches!(delivery, ControlDelivery::Mapping(mapping) if mapping.mapping_id == mapping_id)
@@ -961,7 +997,7 @@ impl Client {
         let ControlDelivery::Mapping(mapping) = delivered else {
           return Err(ClientError::UnexpectedReply { verb: "map_read" });
         };
-        MappedRead::map(mapping, region_off, file_len)
+        MappedRead::map(mapping, file_len, block_len)
       }
       _ => Err(ClientError::UnexpectedReply { verb: "map_read" }),
     }

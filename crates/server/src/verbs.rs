@@ -1882,6 +1882,7 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
       if crate::merge_service::join_awaiting(state, origin, id)
         || crate::landing::join_in_flight(state, origin, id)
         || crate::image::join_in_flight(state, origin, id)
+        || crate::direct_map::join_in_flight(state, origin, id)
         || crate::lease_wait::join(state, origin, id)
       {
         return Served::Forwarded;
@@ -2223,6 +2224,7 @@ fn run_forwarded(
       if crate::merge_service::join_awaiting(state, origin, id)
         || crate::landing::join_in_flight(state, origin, id)
         || crate::image::join_in_flight(state, origin, id)
+        || crate::direct_map::join_in_flight(state, origin, id)
         || crate::lease_wait::join(state, origin, id)
       {
         return None;
@@ -3421,7 +3423,7 @@ fn dispatch_inner(
       crate::merge_service::read(state, principal, volume, &path, at)
     }
     RequestBody::MapRead { volume, path, at } => {
-      crate::merge_service::map_read(state, client_id, principal, volume, &path, at)
+      crate::direct_map::map_read(state, client_id, principal, volume, &path, at)
     }
     RequestBody::ReadRange {
       volume,
@@ -7301,6 +7303,12 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
 /// over-offered), its records' metadata reservation, and the growth a dynamic volume acquired from
 /// the shard budget as it wrote.
 fn release_slot_credits(state: &mut ShardState, slot: &VolumeSlot) {
+  // The copies of its files the direct map handed out go too (§4.6, A-171): their charge comes back, and a prefix a
+  // new volume is given once the count wraps never writes into a map of a file it does not hold.
+  let _released = state
+    .store
+    .shards_backings
+    .remove_volume_peers(slot.volume.prefix());
   if let Some(r) = slot.reservation {
     state.store.budget.release(r);
   }

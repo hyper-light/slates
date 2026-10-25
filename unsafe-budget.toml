@@ -174,10 +174,12 @@
 #   number in `SLATES_ANCHOR_FLEET_SERVE`, one site called per plane (1, Unix only).
 # slates-db (0): records, indexes and the log are safe Rust over the segment's byte slices.
 # slates-merge (0): the verdict is a pure sweep over ranges and a memcmp; safe Rust throughout.
-# slates-client (3): the rings and the rendezvous are slates-ipc's. Raised 0 → 3 on 2026-10-15 for the
-#   same-kernel zero-copy read (§4.6, A-135): `MappedRead` maps the daemon's arena block into this process,
-#   so rustix `mmap` (1) and `munmap` (1) of the block's descriptor and `slice::from_raw_parts` (1) over the
-#   mapped read-only bytes, each with a SAFETY note; Unix only (the whole A-135 client path is `cfg(unix)`).
+# slates-client (0): the rings and the rendezvous are slates-ipc's. Raised 0 → 3 on 2026-10-15 for the
+#   same-kernel zero-copy read (§4.6, A-135): `MappedRead` mapped the daemon's arena block into this process
+#   (rustix `mmap`, `munmap`, and `slice::from_raw_parts` over the mapped bytes). Lowered 3 → 0 on 2026-10-25
+#   (A-171): the map is slates-mem's `PeerView` now, reusing the placed `mmap` and the atomic loads of the DAX
+#   object, so the racy-memory rule and its unsafe live in one crate; the slice was unsound once the daemon
+#   kept writing the copy.
 # slates-cli (4): the stop flag's handlers (`signal.rs`): `signal(2)` for SIGINT and SIGTERM on
 #   Unix (1), and on Windows the console control handler, an `unsafe extern` function by
 #   signature and its registration (2); the launcher's `unshare_unsafe` (`exec.rs`, Linux),
@@ -229,6 +231,9 @@ slates-machine = 51
 # (`proc_pid_rusage` into a buffer of its struct's size and the `assume_init` after it succeeded, 2), with which the
 # give-back's tests observe what macOS counts.
 slates-mem = 49
+# 2026-10-25 (+0, §4.6 A-171, the direct map's sealed copy): `PeerObject` and the client's read-only `PeerView` reuse the
+#   placed `mmap` (which now takes the mapping's access, read-write or read alone) and the two atomic views below, whose
+#   trait is split into loads and stores so a read-only view can only load. No new block.
 # 2026-10-24 (+4, §4.6 the Shards route's DAX object, `dax_object.rs`; `docs/wip/shards/dax-protocol.md`): one memory
 #   object per attachment and file that a VMM maps, sized once to 2^63 − 2 MiB and viewed a 2 MiB range at a time.
 #   Every byte of it is racy (the guest stores into it at any moment), so slates reaches it only through atomics:
@@ -283,7 +288,7 @@ slates-ipc = 49
 #   the anchor's content object through `ExclusiveObject::open_range`, whose promise (no other mapping reaches the
 #   range) the layout keeps: the daemon's copies reach only the write log and image slots.
 slates-server = 6
-slates-client = 3
+slates-client = 0
 slates-cli = 5
 slates-wire = 4
 # slates-bridge-core (0): the operation layer is the trait, neutral data structs and the

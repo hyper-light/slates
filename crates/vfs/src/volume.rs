@@ -1436,8 +1436,8 @@ impl Volume {
   /// Whether inode `no`'s open block is pinned by a live DAX mapping (§4.6 "DAX maps the open frontier"): the idle
   /// sweep must not seal such a block, since sealing encrypts it in place (A-92/A-99) and a live window would then
   /// read ciphertext under the guest's MMU. The block unpins when the last mapping of it is revoked, after which a
-  /// later sweep seals it. A no-op in production while DAX is unadvertised (no block is DAX-pinned), it also guards
-  /// the A-135 same-kernel local map, whose pinned block would otherwise be sealed under a live `mmap`.
+  /// later sweep seals it. A no-op in production while DAX is unadvertised (no block is DAX-pinned). The same-kernel
+  /// direct map pins nothing since A-171: it hands a copy of the file, which no seal touches.
   fn open_block_pinned(&self, store: &Store, no: InodeNo) -> bool {
     let Some(handle) = trie::get(&store.tries, self.inode_root, no) else {
       return false;

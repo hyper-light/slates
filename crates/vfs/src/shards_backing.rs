@@ -26,6 +26,13 @@
 //! ([`ShardsBackings::suppress`]). Writing those bytes back into it would overwrite any store the guest made after the
 //! ingest read them. A write-through the OS refuses is counted, the change itself standing.
 //!
+//! **A same-kernel client's copy** (§4.6, A-171). The direct map hands a client process one file's copy to map read
+//! alone ([`BackingObject::Peer`]). It is kept here beside the VMMs' backings, so the one write boundary keeps it equal
+//! to the file over its whole length, which is the file's page span when it was mapped: a write, a cut and a growth
+//! within it reach the client's map before the change returns. A change past that length reaches no one there; the
+//! client maps again to see it. The client cannot write the object, so nothing is ingested from it, and the server
+//! refuses the direct map beneath an overlay, so it is never marked stale.
+//!
 //! **Beneath an overlay** (D-25) the disk can change a file's bytes without any write: an untouched file follows the
 //! disk. The base plane marks the file's backings stale where it takes such a change ([`ShardsBackings::mark_stale`]):
 //! an outsider's edit adopted, another file now at the name, a `rewitness`. The server refills them before anything
@@ -41,17 +48,88 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use slates_mem::{DAX_RANGE_BYTES, DaxObject, Handle, MemError, Slab};
+use slates_mem::{
+  DAX_OBJECT_BYTES, DAX_RANGE_BYTES, DaxObject, Handle, MemError, PeerObject, Slab,
+};
 
 use crate::ids::InodeNo;
 
 /// Shape: the slots one segment of the backings slab holds; the slab grows a segment at a time, to its capacity.
 const SEGMENT_SLOTS: usize = 16;
 
-/// One file's DAX backing for one attachment: its object, the ranges filled from the volume, the ranges asked
-/// writable, and whether the disk has changed the file beneath it since.
+/// What a backing's bytes live in.
+pub enum BackingObject {
+  /// A VMM's: sized to the largest file a guest can have and viewed a range at a time (`slates_mem::DaxObject`).
+  Vmm(DaxObject),
+  /// A same-kernel client's direct map (A-171): sized to the file's page span when it was mapped, and sealed against
+  /// the client (`slates_mem::PeerObject`).
+  Peer(PeerObject),
+}
+
+impl std::fmt::Debug for BackingObject {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      BackingObject::Vmm(object) => object.fmt(f),
+      BackingObject::Peer(object) => object.fmt(f),
+    }
+  }
+}
+
+impl BackingObject {
+  /// The object's size in bytes, fixed at its creation: nothing is written through past it.
+  #[must_use]
+  pub fn len(&self) -> u64 {
+    match self {
+      BackingObject::Vmm(_) => DAX_OBJECT_BYTES,
+      BackingObject::Peer(object) => object.len(),
+    }
+  }
+
+  /// Never: every object holds at least a page. Here for the convention beside [`BackingObject::len`].
+  #[must_use]
+  pub fn is_empty(&self) -> bool {
+    self.len() == 0
+  }
+
+  /// Copies `from` into the object at `offset`, through atomics; refused as the object refuses it.
+  pub fn store(&mut self, offset: u64, from: &[u8]) -> Result<(), MemError> {
+    match self {
+      BackingObject::Vmm(object) => object.store(offset, from),
+      BackingObject::Peer(object) => object.store(offset, from),
+    }
+  }
+
+  /// Copies the object's bytes at `offset` into `into`, through atomics; refused as the object refuses it.
+  pub fn load(&mut self, offset: u64, into: &mut [u8]) -> Result<(), MemError> {
+    match self {
+      BackingObject::Vmm(object) => object.load(offset, into),
+      BackingObject::Peer(object) => object.load(offset, into),
+    }
+  }
+
+  /// Makes the object's bytes `offset .. offset + len` read zero; refused as the object refuses it.
+  pub fn zero(&mut self, offset: u64, len: u64) -> Result<(), MemError> {
+    match self {
+      BackingObject::Vmm(object) => object.zero(offset, len),
+      BackingObject::Peer(object) => object.zero(offset, len),
+    }
+  }
+
+  /// The descriptor a peer is handed for the object.
+  #[cfg(unix)]
+  #[must_use]
+  pub fn descriptor(&self) -> std::os::fd::BorrowedFd<'_> {
+    match self {
+      BackingObject::Vmm(object) => object.descriptor(),
+      BackingObject::Peer(object) => object.descriptor(),
+    }
+  }
+}
+
+/// One file's backing for one holder: its object, the ranges filled from the volume, the ranges asked writable, and
+/// whether the disk has changed the file beneath it since.
 pub struct ShardsBacking {
-  object: DaxObject,
+  object: BackingObject,
   /// The prefix of the volume whose file it backs: the attachment's volume's own.
   volume: u16,
   inode: InodeNo,
@@ -73,9 +151,21 @@ impl std::fmt::Debug for ShardsBacking {
 }
 
 impl ShardsBacking {
-  /// A backing of file `inode` of the volume of prefix `volume` over `object`, nothing filled or asked writable yet.
+  /// A VMM's backing of file `inode` of the volume of prefix `volume` over `object`, nothing filled or asked writable
+  /// yet.
   #[must_use]
   pub fn new(object: DaxObject, volume: u16, inode: InodeNo) -> ShardsBacking {
+    ShardsBacking::over(BackingObject::Vmm(object), volume, inode)
+  }
+
+  /// A same-kernel client's backing of file `inode` of the volume of prefix `volume` over `object` (A-171), nothing
+  /// filled yet. A client maps it read alone, so no range is ever asked writable and nothing is ingested from it.
+  #[must_use]
+  pub fn for_peer(object: PeerObject, volume: u16, inode: InodeNo) -> ShardsBacking {
+    ShardsBacking::over(BackingObject::Peer(object), volume, inode)
+  }
+
+  fn over(object: BackingObject, volume: u16, inode: InodeNo) -> ShardsBacking {
     ShardsBacking {
       object,
       volume,
@@ -100,12 +190,12 @@ impl ShardsBacking {
 
   /// Its object.
   #[must_use]
-  pub fn object(&self) -> &DaxObject {
+  pub fn object(&self) -> &BackingObject {
     &self.object
   }
 
   /// Its object, to fill, load or zero.
-  pub fn object_mut(&mut self) -> &mut DaxObject {
+  pub fn object_mut(&mut self) -> &mut BackingObject {
     &mut self.object
   }
 
@@ -146,6 +236,22 @@ impl ShardsBacking {
   pub fn take_stale(&mut self) -> bool {
     std::mem::take(&mut self.stale)
   }
+}
+
+/// Why a same-kernel client's backing was not kept ([`ShardsBackings::insert_peer`]); nothing was kept or counted.
+#[derive(Debug)]
+pub enum PeerRefusal {
+  /// The fill budget has no room for the object.
+  Budget {
+    /// The object's size.
+    object_bytes: u64,
+    /// What the backings counted already.
+    charged: u64,
+    /// The most they may count.
+    budget: u64,
+  },
+  /// The registry is at its capacity.
+  Full(MemError),
 }
 
 /// The shard's Shards DAX backings, by handle, and which backings each file has, by (volume prefix, inode).
@@ -240,9 +346,61 @@ impl ShardsBackings {
     Ok(handle)
   }
 
-  /// Lets go of the backing `handle` names, if it is live: it, its object's mappings in this process ending with it.
+  /// Keeps a same-kernel client's backing of file `inode` of the volume of prefix `volume` over `object` (A-171), and
+  /// counts the whole object against the budget: every byte of it is filled and every change within it written
+  /// through. Refused, with nothing kept or counted, when the budget has no room or the registry is full.
+  pub fn insert_peer(
+    &mut self,
+    object: PeerObject,
+    volume: u16,
+    inode: InodeNo,
+  ) -> Result<Handle<ShardsBacking>, PeerRefusal> {
+    let object_bytes = object.len();
+    if !self.charge(object_bytes) {
+      return Err(PeerRefusal::Budget {
+        object_bytes,
+        charged: self.charged,
+        budget: self.budget,
+      });
+    }
+    match self.insert(ShardsBacking::for_peer(object, volume, inode)) {
+      Ok(handle) => Ok(handle),
+      Err(full) => {
+        self.uncharge(object_bytes);
+        Err(PeerRefusal::Full(full))
+      }
+    }
+  }
+
+  /// Lets go of every same-kernel client's backing of a file of the volume of prefix `volume`, giving their objects'
+  /// bytes back to the budget: the volume's teardown. A prefix is handed to a new volume once its count wraps, and a
+  /// backing left behind would then take that volume's writes into a client's map of a file it never mapped. How many.
+  pub fn remove_volume_peers(&mut self, volume: u16) -> usize {
+    let peers: Vec<Handle<ShardsBacking>> = self
+      .by_file
+      .range((volume, InodeNo(0))..=(volume, InodeNo(u64::MAX)))
+      .flat_map(|(_, handles)| handles.iter().copied())
+      .filter(|handle| {
+        self
+          .slab
+          .get(*handle)
+          .is_ok_and(|backing| matches!(backing.object, BackingObject::Peer(_)))
+      })
+      .collect();
+    peers
+      .into_iter()
+      .filter(|handle| self.remove(*handle).is_some())
+      .count()
+  }
+
+  /// Lets go of the backing `handle` names, if it is live: it, its object's mappings in this process ending with it. A
+  /// same-kernel client's gives its object's bytes back to the budget, which [`ShardsBackings::insert_peer`] counted; a
+  /// VMM's charge is its session's to give back.
   pub fn remove(&mut self, handle: Handle<ShardsBacking>) -> Option<ShardsBacking> {
     let backing = self.slab.remove(handle).ok()?;
+    if let BackingObject::Peer(object) = &backing.object {
+      self.uncharge(object.len());
+    }
     let file = (backing.volume, backing.inode);
     if let Some(handles) = self.by_file.get_mut(&file) {
       handles.retain(|held| *held != handle);
@@ -390,13 +548,14 @@ impl ShardsBackings {
   }
 
   /// Runs `apply` on each backing of `file` (volume prefix, inode) but the suppressed one, for each part of `from .. to`
-  /// within a range it has filled, counting what it wrote and what the OS refused.
+  /// within a range it has filled and within its object, counting what it wrote and what the OS refused. A client's
+  /// object is the file's page span when it was mapped, so a change past it is nobody's to see there (A-171).
   fn each_filled_span(
     &mut self,
     file: (u16, InodeNo),
     from: u64,
     to: u64,
-    mut apply: impl FnMut(&mut DaxObject, u64, u64) -> bool,
+    mut apply: impl FnMut(&mut BackingObject, u64, u64) -> bool,
   ) {
     if to <= from {
       return;
@@ -426,10 +585,13 @@ impl ShardsBackings {
         continue;
       };
       let ShardsBacking { object, filled, .. } = backing;
+      let object_end = object.len();
       for &range in filled.range(first..=last) {
         let range_start = range.saturating_mul(DAX_RANGE_BYTES);
         let start = from.max(range_start);
-        let end = to.min(range_start.saturating_add(DAX_RANGE_BYTES));
+        let end = to
+          .min(range_start.saturating_add(DAX_RANGE_BYTES))
+          .min(object_end);
         if end <= start {
           continue;
         }

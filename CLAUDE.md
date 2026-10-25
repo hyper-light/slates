@@ -143,6 +143,14 @@ Every test is written as "do X, expect Y" and names the acceptance criterion or 
     device runs unprivileged only with its sandbox on (`--disable-sandbox` makes it pivot without a user namespace, which
     needs root); and the workspace's musl rustflags leave the C runtime dynamic for the cdylibs, so the probe is built
     with `RUSTFLAGS="-C target-feature=+crt-static"`.
+  - A copy handed to a same-kernel peer as its only capability, sealed and kept live: `crates/mem/src/dax_object.rs`
+    (`PeerObject`: the owner's writable map first, then `F_SEAL_FUTURE_WRITE | SHRINK | GROW | SEAL`; `PeerView`: the
+    peer's read-only view, loaded through atomics) with `crates/server/src/direct_map.rs` (a sliced fill under a
+    deferred reply; the hand-off judged at `confined_for_a_peer`) and `crates/client/tests/client.rs` (the hostile peer:
+    every write path refused with the seal's errno; the descriptor scan judged by inode, since the daemon runs in the
+    test and its own descriptor of the copy is new too). Gotchas: the write seal refuses the owner's own hole punch, so
+    zeroing is stores over `SEEK_DATA` runs; a read-only duplicate alone is no defence (`/proc/self/fd` reopens it
+    read-write); and a slice over memory another process writes is unsound, so it is read through atomics (A-171).
   - The write seam and its only real implementation: `crates/vfs/src/host/mod.rs` (`LandFs`) with `crates/land/src/os.rs`; every verb takes a handle, never a path, and the engine (`crates/land/src/engine.rs`) is written against the seam so the oracle runs it unchanged over `SimHost`.
   - A per-shard singleton shared by the shard's tasks: `crates/rt/src/shard.rs` (`ShardContext::keep`/`keep_with` return a `Kept<T>` handle; `Kept::with` lends inside a closure only while its own context runs) with `crates/transport/src/demux.rs` (`DemuxId` is the handle; its receive loop awaits readiness outside the borrow). Gotcha: a `&'static` into state an owner frees is unsound however "only tasks hold it" — the type must confine the lend; and in edition 2024 an `impl Future` returned from `&self` captures the borrow unless it says `use<>` (`UdpSocket::readable`).
   - A detector's non-vacuity canary: `crates/mem/tests/race_canary.rs` with `xtask/src/tsan.rs` (the lane requires ThreadSanitizer's report from a deliberate race before it trusts a clean run of the suites). Gotcha: ThreadSanitizer v3 reports a race only while the earlier access is still in its thread's trace (three parts of 32,763 events by default) and otherwise drops it without a word, so the canary's first writer parks rather than polls between the writes; a polling first writer went unreported 2 times in 99 CI runs and 120 in 120 on a loaded Mac. The same bound holds in the suites: a race whose earlier access is further back than that is never reported.

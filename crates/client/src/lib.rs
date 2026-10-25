@@ -33,6 +33,9 @@ pub mod client;
 pub mod driver;
 pub mod error;
 
+/// A file mapped for reading by the same-kernel direct map (§4.6, A-171), or copied where it cannot be.
+#[cfg(unix)]
+pub use client::MappedRead;
 pub use client::{
   Advanced, Attachment, Client, Connecting, CreateSpec, Deadlines, Digest, ImageBuilt,
   LAST_SEQUENCE, Landing, Rebased, Session, ShardsStream, StreamEnd, Submitted, VhostUserDevice,

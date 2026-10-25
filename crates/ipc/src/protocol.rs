@@ -636,10 +636,11 @@ pub enum RequestBody {
     /// The most bytes wanted.
     max: u64,
   },
-  /// Map a file's bytes read-only into a same-kernel client's address space, zero-copy (§4.6, A-135):
-  /// the daemon mints a read mapping and hands the arena block's descriptor over the control socket; the
-  /// client `mmap`s it. Offered only to a same-uid peer the platform can pass a descriptor to; any other
-  /// peer reads through `ReadRange` instead. A read; never recorded. Appended.
+  /// Map a file's bytes read-only into a same-kernel client's address space, with no copy per read (§4.6, A-171): the
+  /// daemon fills a copy of the file sealed against every writer but itself, keeps it equal to the file, and hands its
+  /// descriptor over the control socket before the reply; the client `mmap`s it whole. Offered only to a same-uid peer
+  /// the platform can pass a descriptor to; any other peer reads through `ReadRange` instead. The reply waits for the
+  /// copy's fill, which runs in slices on the owner shard. Appended.
   MapRead {
     /// The volume.
     volume: VolumeId,
@@ -2699,10 +2700,10 @@ pub enum Refusal {
     /// The region whose fleet the volume's owner was sought in.
     region: u64,
   },
-  /// A `MapRead` (§4.6, A-135) could not be served as a zero-copy same-kernel map — a different-uid or non-plain /
-  /// non-head request, content with no shared-object backing, or a volume not mappable on the serving shard — so the
-  /// client reads the file by its normal paged read instead. The bytes are identical; only the copy is paid, and the
-  /// reply is never a single oversized `ReadBytes`. Appended.
+  /// A `MapRead` (§4.6, A-171) could not be served as a direct map — a different-uid, non-plain or non-head request,
+  /// an overlay, a client served by another shard, a platform with no route yet, or a copy the daemon's budget or the
+  /// OS refused — so the client reads the file by its normal paged read instead. The bytes are identical; only the
+  /// copy per read is paid, and the reply is never a single oversized `ReadBytes`. Appended.
   MapUnavailable,
   /// An image could not be built or merged (§4.6, A-160): the image format refused the tree or the image (a name or a
   /// time it cannot hold, a capacity too small, a corrupt or hostile image), or the image holds what a volume cannot
@@ -3003,18 +3004,17 @@ pub enum ReplyBody {
     /// The changed object's size after the verb (a written file's length; 0 for a removal or a directory).
     size: u64,
   },
-  /// A read-only content map was established for a same-kernel client (§4.6, A-135): its metadata. The
-  /// arena block's descriptor arrives separately over the control socket; the client `mmap`s it at
-  /// `region_off` for the file's page span and reads `file_len` bytes (the sub-file tail reads zero).
-  /// Appended.
+  /// A same-kernel client's direct map was handed (§4.6, A-171): its metadata. The descriptor of the daemon's copy of
+  /// the file arrives over the control socket before this reply; the client `mmap`s all `block_len` bytes of it from
+  /// `region_off` (zero) and reads the file's bytes there, kept equal to the file within that length. Appended.
   Mapped {
-    /// The daemon-minted mapping id, named by the later release.
+    /// The daemon-minted mapping id, which the delivery carries too.
     mapping_id: u64,
-    /// The block's byte offset within its backing object.
+    /// Where the file starts in the object: zero, since the object is the file's copy.
     region_off: u64,
-    /// The file's authorized length.
+    /// The file's length when it was handed.
     file_len: u64,
-    /// The block's length (its buddy size).
+    /// The object's whole length: the file's page span when it was mapped.
     block_len: u64,
   },
   /// A snapshot's image was built (`ImageBuild`). Appended.

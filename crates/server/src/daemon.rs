@@ -3156,6 +3156,7 @@ fn init_shard(
     origin_anchor,
     landing: crate::landing::LandingState::default(),
     image: crate::image::ImageState::default(),
+    direct_map: crate::direct_map::DirectMapState::default(),
     store,
     volumes: Slab::new(config.caps.segment_slots, config.caps.volumes),
     by_id: std::collections::BTreeMap::new(),
@@ -4366,7 +4367,7 @@ async fn control_loop(
                 owner_route: None,
                 read_ahead: None,
                 read_ahead_pending: 0,
-                dax_maps: Vec::new(),
+                direct_maps: Vec::new(),
               }) {
                 Ok(_) => admission.seat(),
                 Err(e) => {

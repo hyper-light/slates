@@ -1,11 +1,10 @@
-//! What the confined-descriptor rule costs the local zero-copy read (§4.6, A-135).
+//! What a `MapRead` costs (§4.6, A-171), through the client API against a real one-shard daemon.
 //!
-//! Since 2026-10-18 the daemon refuses to hand a peer a descriptor that authorizes more than the read
-//! (`Control::send_mapping` → `confined_for_a_peer`; the escape it closes is in
-//! `docs/bugs/2026-10-18-a-read-handed-the-peer-the-whole-content-arena.md`). No backing satisfies the rule yet,
-//! so a `MapRead` takes its copy path. This prices that: the same reads, through the same client API, against a
-//! real one-shard daemon — one binary with the rule in force, one with it lifted — so the backing decision has a
-//! number rather than an intuition.
+//! On Linux a `MapRead` is answered with the daemon's sealed copy of the file, filled once and kept equal to the file
+//! by the write boundary, so the client then reads it as memory with no request and no copy per read; elsewhere it
+//! reads by the paged copy path. Each sample is one whole `MapRead`: the request, the daemon's fill of a new copy, the
+//! hand-off and the map. Before 2026-10-25 the daemon refused to hand any descriptor (the arena held every volume), so
+//! every sample took the copy path; this harness priced that.
 //!
 //! Command: `cargo run --release -p slates-client --example map_read_ab -- <file_kib> <samples>`
 //! (defaults 1024 and 200). Prints the path actually taken, so an arm that silently fell back is visible, and
@@ -138,8 +137,9 @@ fn main() {
   // interesting thing this can find — not a reason to abort before printing it.
   let warm = client.map_read(id, "/big.bin").unwrap();
   let zero_copy = warm.is_zero_copy();
-  let got = warm.bytes().len();
-  let equal = warm.bytes() == bytes.as_slice();
+  let read = warm.to_vec().unwrap();
+  let got = read.len();
+  let equal = read == bytes;
   println!(
     "warm read: path={} returned_bytes={got} file_bytes={} equal={equal}",
     if zero_copy { "zero-copy" } else { "copy" },
@@ -152,7 +152,9 @@ fn main() {
   for _ in 0..samples {
     let started = Instant::now();
     let mapped = client.map_read(id, "/big.bin").unwrap();
-    let first = mapped.bytes().first().copied().unwrap_or(0);
+    let mut first = [0u8; 1];
+    mapped.read_at(0, &mut first).unwrap();
+    let first = first[0];
     taken.push(started.elapsed().as_nanos());
     checksum = checksum.wrapping_add(u64::from(first));
     drop(mapped);

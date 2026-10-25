@@ -19,10 +19,10 @@ slates-machine = { workspace = true }
 slates-ipc = { workspace = true }
 slates-wire = { workspace = true }
 
-# The same-kernel zero-copy read (§4.6, A-135) maps the daemon's arena block into this process with
-# `mmap`; rustix is the sanctioned syscall wrapper (its `mm`/`param` features are the workspace pin).
+# The same-kernel direct map (§4.6, A-171) maps the daemon's sealed copy of a file read-only and loads it through
+# atomics: slates-mem's `PeerView` holds the map, so the racy-memory rule and its unsafe stay in that one crate.
 [target.'cfg(unix)'.dependencies]
-rustix = { workspace = true }
+slates-mem = { workspace = true }
 
 [dev-dependencies]
 slates-server = { workspace = true }

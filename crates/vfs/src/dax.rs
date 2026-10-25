@@ -834,8 +834,9 @@ impl Volume {
   }
 
   /// Maps inode `no`'s content from offset 0 — the whole single block of a single-block file, or an inline file —
-  /// read-only ([`Volume::dax_map_read_at`]). The same-kernel local map (A-135) and the single-block callers use
-  /// this; the device maps per `SETUPMAPPING` offset through [`Volume::dax_map_read_at`], so a multi-block file's
+  /// read-only ([`Volume::dax_map_read_at`]). The single-block callers use this (the same-kernel direct map no longer
+  /// does: it hands a copy of the file, A-171); the device maps per `SETUPMAPPING` offset through
+  /// [`Volume::dax_map_read_at`], so a multi-block file's
   /// open tail is reachable there while offset 0 (its sealed head) is refused to FUSE_READ.
   pub fn dax_map_read(&mut self, store: &mut Store, no: InodeNo) -> Result<Mapping, VfsError> {
     self.dax_map_read_at(store, no, 0)

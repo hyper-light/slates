@@ -2853,18 +2853,25 @@ duplicate does not qualify and must not — measured, a same-uid peer re-opens o
 A different-uid or
 sandboxed peer, a peer the platform cannot pass a descriptor to, and any backing that cannot meet that rule, read
 through the copy path (the bulk region, §4.7) or through virtio-fs DAX; the consumer always has a correct read, and
-the zero-copy upgrade is taken only where it is both safe and physically possible. Mechanism: the client requests a read-only map over the command ring; the
-daemon mints the read mapping (`Volume::dax_map_read` — the block pinned in the arena, the version pinned for the
-map's life, the sub-file tail scrubbed) and sends the arena block's descriptor (`Store::dax_backing`) with the mapping
-id, the block offset and the file length over the retained control socket by `SCM_RIGHTS` (the command ring cannot
-carry a descriptor; §4.7). The client maps the descriptor for the file's page span; the sub-file tail reads zero; no
-arena byte is copied (the bulk-region copy counter, a non-vacuity counter, stays zero on this path). Coherence differs
-from a guest in one way and is correct without trusting the peer: the daemon cannot force-unmap a local process as a
-VMM force-unmaps a guest window, so the version a live local map pins is held until the client drops the map — the
-immutable block it reads is never reused or scrubbed under it, so a stale read cannot occur; on
-`advance`/`write`/`truncate` the new bytes are a new version the client sees on its next lookup and re-maps (the
-ordinary semantics of a map that outlives a replaced file), the old version released when the last map drops (§4.6
-pin, D-26 retention). A writable local map, if ever offered, goes through the VFS write boundary exactly as the
+the zero-copy upgrade is taken only where it is both safe and physically possible. Mechanism (A-171, replacing
+A-135's arena hand-off): the client requests a map over the command ring; the daemon makes a copy of the file that is
+the unit of authorization — a sealable memfd the size of the file's page span, at least a page — takes its own
+writable map of all of it, then seals it `F_SEAL_FUTURE_WRITE | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`, so every
+later writer is refused and the daemon's earlier map keeps writing. It fills the copy from the volume a slice at a
+time (the reply is deferred to that task, as an image build's is, A-160), then sends the copy's descriptor with the
+mapping id and the file length over the retained control socket by `SCM_RIGHTS` (the command ring cannot carry a
+descriptor; §4.7), then the reply. The client maps the copy whole, read alone, and reads it through atomics, since the
+daemon writes it at any moment. **The map is a live view of the file within its length.** The copy sits in the store's
+backings beside the VMMs' (A-163), so the volume's single write boundary writes every later write, cut and growth into
+it before the change returns: the client sees them as memory alone, with no request, as a shared map of a file does. A
+change past the copy's length is not seen; the client maps again for it. This replaces A-135's pinned version, whose
+coherence was "the version a live local map pins is held until the client drops the map": no arena block can be handed
+(it holds every volume), so a pinned version would need a copy of its own anyway, and a copy kept equal by write-through
+costs the same copy once and gives the client the file as it is, where a pinned copy would grow stale with no signal.
+The price is a copy of each write into each mapped file's copy, and a cut that zeroes by stores over what holds bytes
+(the write seal refuses the daemon's own hole punch). The client's slot holds the copy until it is reaped, and a
+volume's teardown lets go of its files' copies (a volume prefix is handed out again once its count wraps).
+A writable local map, if ever offered, goes through the VFS write boundary exactly as the
 guest's opt-in writable DAX (§4.6 L0). Reaching a consumer in a *separate* namespace (an OCI container, a k8s pod)
 needs the descriptor-passing channel to cross that namespace — the pathname-rendezvous question recorded in GAPS; the
 same-namespace host process is the first delivered case.
@@ -2900,6 +2907,27 @@ same-namespace host process is the first delivered case.
 > toward the registry cap; a release on the client's own `MappedRead` drop would be prompter, and slates exposes no
 > dax-map count yet for a reap count-assertion test — both owed); and the macOS control socket (macOS carries
 > refusing `send_mapping`/`recv_mapping` stubs, so it reads by copy).
+>
+> **Amended 2026-10-25 (A-171) — built and proven on Linux by a real client.** A `MapRead` is answered with a sealed
+> copy of the file (`slates_mem::PeerObject`; `crates/server/src/direct_map.rs`), filled a slice at a time and kept
+> equal to the file by the write boundary (`ShardsBackings::insert_peer`, `BackingObject::Peer`); the client maps it
+> whole and reads it through atomics (`slates_mem::PeerView`; `MappedRead::read_at`, `to_vec`, `descriptor`, which
+> replace `bytes()`). The hand-off rule in `confined_for_a_peer` is unchanged in code and now met: one file's copy,
+> all of it authorized, write- and size-sealed. Proven on fedora (x86_64, Linux, 2026-10-25) by
+> `crates/client/tests/client.rs`, 5 of 5: zero copy asserted for a 20 KiB and a 4 MiB file and at every size from
+> empty to 1 MiB; the handed descriptor's shared writable map, `write`, shrink, growth and hole punch refused `EPERM`,
+> its read-only map turned writable refused `EACCES`, its reopen read-write through `/proc/self/fd` granted with that
+> reopen's writable map and `write` refused `EPERM`; another volume's marker in none of its bytes and no other object
+> arrived beside it; a write at 1 MiB, a cut to 1.5 MiB, a growth to 3 MiB and one past the map to 5 MiB each in the map
+> with no request of the mapping client. Red-checked: without the seals and the confinement check the shared writable
+> map was granted; without the seals alone the hand-off was refused unconfined and the read came by copy; without the
+> write-through the write at 1 MiB never reached the map; the old arena hand-off restored was refused unconfined.
+> `dax.local_map` counts each hand-off, `dax.local_map_fallback` each refused copy, `dax.local_map_unconfined` a copy
+> the rule refused (which must stay zero). **Owed:** macOS (its descriptor over A-161's socket route) and Windows
+> (handle duplication), each to its own step of G-direct; the cross-shard hand-off (a client served by another shard
+> reads by copy); overlays (an untouched file follows the disk, which no write boundary sees, so they read by copy); a
+> release on `MappedRead`'s drop (the copy lives until the client is reaped); and the measurement of copy-once-map-many
+> against copy-per-read.
 
 > **Status (the DAX matrix, A-164, 2026-10-24).** What DAX means in each environment, and which of its 52 cells
 > (each environment on each platform, by the mount route and the socket route) are proven, owed or ruled out by the
@@ -2907,9 +2935,9 @@ same-namespace host process is the first delivered case.
 > - **Proven:** a host process's shared map through the Linux FUSE mount; crosvm over a slates mount (Linux x86_64);
 >   crosvm over slates' own device (Linux x86_64, A-168 and A-169, 2026-10-25); a Shards guest over the daemon's
 >   stream (macOS arm64, A-163); Firecracker by virtio-pmem over the image file through a slates mount (Linux x86_64,
->   A-165). Five cells. **Corrected 2026-10-25:** the same-kernel direct map on Linux (A-135) was listed here as
->   proven. Its test reports which path ran without asserting it, and since the 2026-10-18 escape fix the hand-off is
->   refused and every read is a copy, until a backing authorizes only the window. It is owed to G-direct.
+>   A-165); and, since 2026-10-25, the same-kernel direct map on Linux (A-171: a sealed copy of one file, asserted
+>   zero-copy by a real client, red-checked). Six cells. **Corrected 2026-10-25:** the direct map had been listed
+>   here as proven before A-171, when its test reported which path ran without asserting it and every read was a copy.
 > - **Ruled out by the platforms:** QEMU's vhost-user-fs and Cloud Hypervisor have no DAX window, so neither has Kata;
 >   crosvm's window is x86_64-only; Apple's Virtualization framework and WSL2 document none (unconfirmed).
 > - **Owed:** every other cell, each to a named goal.
@@ -12132,6 +12160,15 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
+
+### A-171 — The same-kernel direct map hands a live, sealed copy of one file (accepted 2026-10-25)
+Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its status, the DAX matrix status), GAPS, `docs/wip/virtiofs.md` §8, `crates/mem` (`dax_object.rs`: `PeerObject`, `PeerView`, the racy accessors split into loads and stores; `shared.rs`: `ReadView`, a mapping's access), `crates/vfs` (`shards_backing.rs`: `BackingObject`, `insert_peer`, `remove_volume_peers`, write-through cut at an object's length; `dax.rs`, `volume.rs` docs), `crates/server` (`direct_map.rs`, replacing `merge_service::map_read`/`try_local_map`; `state.rs`, `reap.rs`, `verbs.rs`, `daemon.rs`), `crates/ipc` (protocol and rendezvous docs: the rule's wording), `crates/client` (`MappedRead`, `defers_reply`, the tests, `examples/map_read_ab.rs`, `Cargo.toml`), `unsafe-budget.toml` (slates-client 3 → 0), `CLAUDE.md`.
+- **Replaces A-135's mechanism.** A-135 handed the arena block's descriptor and pinned the version for the map's life; since 2026-10-18 the hand-off was refused (the arena holds every volume), so every `MapRead` read by copy. Now the daemon makes the unit of authorization per file: a sealable memfd of the file's page span (at least a page), its own writable map taken first, then `F_SEAL_FUTURE_WRITE | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`. It fills the copy a slice at a time in a task of the owner shard (the reply deferred, as A-160's are), hands the descriptor, then replies. `confined_for_a_peer` is unchanged in code: offset zero, the object's whole length authorized, write- and size-sealed; one file's copy meets it, the arena never does.
+- **Decided: a live view, not a pinned version.** The goal left the choice open. A pinned version would need a copy of its own (no arena block can be handed), so it costs the same copy and then shows the client a stale file with no signal. A copy kept in the store's backings (A-163) is written through at the single write boundary, so a write, a cut and a growth within its length reach the client's map before the change returns: the semantics of a shared map of a file. A change past the copy's length is not seen; the client maps again. The client reads through atomics (`slates_mem::PeerView`), never a slice, since the daemon writes the bytes at any moment; `MappedRead::bytes()` was unsound for a live view and is replaced by `read_at`, `to_vec` and `descriptor`.
+- **Price, stated.** Each write into a mapped file is copied again into its copy (A-163 measured the write-through at 117 µs per MiB per backing on 2026-10-24, BENCHMARKS "What write-through adds to a write of a mapped file"; the direct map's own numbers are owed to G-direct step 3). A cut zeroes by stores over what holds bytes, since the write seal refuses the daemon's own hole punch (`mm/shmem.c`); untouched pages are passed over (`SEEK_DATA`). The copy's whole size is charged to the backings' fill budget when it is made.
+- **Lifetime and bounds.** The client's slot holds the copy's backing until the slot is reaped; a volume's teardown lets go of its files' copies (`remove_volume_peers`), because a prefix is handed to a new volume once its count wraps and a copy left behind would take that volume's writes. A copy whose hand-off did not happen is let go at once. Bounded by the backings' capacity and the fill budget, refused as `MapUnavailable` (the client's paged read) at either.
+- **Not served, read by copy:** another uid, a non-head view, a merge volume, an overlay (an untouched file follows the disk, which no write boundary sees), a client of another shard, and macOS and Windows until their own steps.
+- **Proven** on fedora (x86_64 Linux, 2026-10-25), 5 of 5 by `crates/client/tests/client.rs` over a real daemon, and red-checked four ways (§4.6 status). `slates-mem`'s `peer_object.rs` holds the object alone, 6 of 6 on Linux and 5 of 5 on macOS.
 
 ### A-170 — A clone's copy-up copies an open extent its origin owns; only its own is sealed in place (accepted 2026-10-25)
 Applied in the same change to: `crates/vfs/src/volume.rs` (`Volume::make_current_inode`), `crates/vfs/src/content.rs`

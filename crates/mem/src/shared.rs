@@ -42,7 +42,7 @@ use crate::words::{Layout, RunId, SpanId, SpanRun, Width, WordRun, Words, refuse
 
 /// One range of a memory object mapped on its own, for the DAX object's views (`crate::dax_object`).
 #[cfg(unix)]
-pub(crate) use platform::RangeView;
+pub(crate) use platform::{RangeView, ReadView};
 
 /// How an object is handed to another process.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -798,7 +798,20 @@ mod platform {
     }
   }
 
-  fn map(fd: &OwnedFd, offset: usize, len: usize) -> Result<Mapped, MemError> {
+  /// What a mapping may do with its object's bytes.
+  #[derive(Clone, Copy)]
+  enum Access {
+    /// Read and write: every object this process owns, and every view of one.
+    ReadWrite,
+    /// Read alone: an object another process owns and has sealed against this one's writes ([`ReadView`]).
+    ReadOnly,
+  }
+
+  fn map(fd: &OwnedFd, offset: usize, len: usize, access: Access) -> Result<Mapped, MemError> {
+    let protection = match access {
+      Access::ReadWrite => rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE,
+      Access::ReadOnly => rustix::mm::ProtFlags::READ,
+    };
     let file_offset = u64::try_from(offset).map_err(|_| MemError::OsRefused {
       call: "mmap",
       code: None,
@@ -843,13 +856,14 @@ mod platform {
     // SAFETY: `window .. window + len` lies inside the reservation this call owns — `into` is less than one
     // grain and the reservation is `len + grain` long — so `MAP_FIXED` replaces this call's own `PROT_NONE`
     // slack and no other mapping. The object behind `fd` is a memory object this module created or opened by
-    // the handoff its creator gave; by this module's rule no process truncates it while a view lives, and every
-    // concurrent word is reached through the atomic views. The map borrows nothing that outlives it.
+    // the handoff its creator gave, or one a daemon handed this process sealed against resizing (`ReadView`); by
+    // this module's rule no process truncates it while a view lives, and every concurrent word is reached through
+    // the atomic views. The map borrows nothing that outlives it.
     let placed = unsafe {
       rustix::mm::mmap(
         std::ptr::with_exposed_provenance_mut::<std::ffi::c_void>(window),
         len,
-        rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE,
+        protection,
         rustix::mm::MapFlags::SHARED | rustix::mm::MapFlags::FIXED,
         fd,
         file_offset,
@@ -914,7 +928,7 @@ mod platform {
     #[allow(clippy::disallowed_methods)] // the memory object: RAM, not a host path (R1).
     // structural: allow — sizing the memory object just created (no filesystem entry; D-10).
     rustix::fs::ftruncate(&created.fd, size).map_err(|e| refused("ftruncate", e))?;
-    let map = map(&created.fd, 0, len)?;
+    let map = map(&created.fd, 0, len, Access::ReadWrite)?;
     Ok(Inner {
       map,
       fd: created.fd,
@@ -936,7 +950,7 @@ mod platform {
     len: usize,
   ) -> Result<Inner, MemError> {
     let fd = open_object(handoff)?;
-    let map = map(&fd, offset, len)?;
+    let map = map(&fd, offset, len, Access::ReadWrite)?;
     Ok(Inner {
       map,
       fd,
@@ -1107,7 +1121,7 @@ mod platform {
   impl RangeView {
     /// Maps `len` bytes of the object behind `fd` from `offset`, read and write, shared.
     pub(crate) fn map(fd: &OwnedFd, offset: usize, len: usize) -> Result<RangeView, MemError> {
-      map(fd, offset, len).map(RangeView)
+      map(fd, offset, len, Access::ReadWrite).map(RangeView)
     }
 
     /// The view's first byte, as the raw address the mapping returned (no reference to its bytes is formed).
@@ -1124,6 +1138,29 @@ mod platform {
     #[cfg(target_os = "linux")]
     pub(crate) fn pages_mut(&mut self) -> &mut [u8] {
       &mut self.0
+    }
+  }
+
+  /// An object another process owns, mapped whole and read alone: a same-kernel client's view of the copy of one file a
+  /// daemon handed it (`crate::dax_object::PeerView`, §4.6 A-171). Its owner writes the bytes at any moment, so, as for
+  /// [`RangeView`], no reference to them leaves this crate: they are loaded through atomics at [`ReadView::base`]. It
+  /// offers no store, and the kernel would fault one: the mapping is `PROT_READ`.
+  pub(crate) struct ReadView(Mapped);
+
+  impl ReadView {
+    /// Maps the first `len` bytes of the object behind `fd`, read alone, shared.
+    pub(crate) fn map(fd: &OwnedFd, len: usize) -> Result<ReadView, MemError> {
+      map(fd, 0, len, Access::ReadOnly).map(ReadView)
+    }
+
+    /// The view's first byte, as the raw address the mapping returned (no reference to its bytes is formed).
+    pub(crate) fn base(&self) -> *mut u8 {
+      std::ptr::with_exposed_provenance_mut(self.0.window)
+    }
+
+    /// The view's length in bytes.
+    pub(crate) fn len(&self) -> usize {
+      self.0.len
     }
   }
 

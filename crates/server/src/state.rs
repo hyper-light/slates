@@ -16,7 +16,6 @@ use slates_mem::Slab;
 use slates_mem::SparseObject;
 use slates_merge::engine::Green;
 use slates_merge::increment::VolumeOp;
-use slates_vfs::dax::Mapping;
 use slates_vfs::volume::{Store, Volume};
 
 use crate::config::DaemonConfig;
@@ -56,11 +55,10 @@ pub struct ClientSlot {
   /// to its window when a batch is delivered, and credited with the client when it goes — so a batch whose reply
   /// was never carried home (`crate::xshard::send_back`) holds its charge no longer than its client.
   pub(crate) read_ahead_pending: u64,
-  /// The same-kernel DAX maps (§4.6, A-135) this client holds, each pinning an immutable version until
-  /// the client goes: revoked when the client is reaped (`crate::reap`), so a dropped or dead client's
-  /// read maps do not accumulate in the arena's `DaxRegistry` toward its cap. Empty for a client that
-  /// never mapped; one `Mapping` is a few words, and the count is bounded by the registry cap.
-  pub(crate) dax_maps: Vec<Mapping>,
+  /// The files' copies this client was handed by the same-kernel direct map (§4.6, A-171), each kept equal to its file
+  /// by the store's write boundary until the client goes: let go when the client is reaped (`crate::reap`), their bytes
+  /// given back to the backings' budget. Empty for a client that never mapped; bounded by the backings' capacity.
+  pub(crate) direct_maps: Vec<slates_mem::Handle<slates_vfs::shards_backing::ShardsBacking>>,
 }
 
 impl std::fmt::Debug for ClientSlot {
@@ -383,6 +381,8 @@ pub struct ShardState {
   pub landing: crate::landing::LandingState,
   /// The image builds and merges running on this shard (§4.6, A-160).
   pub(crate) image: crate::image::ImageState,
+  /// The same-kernel direct maps being filled on this shard (§4.6, A-171).
+  pub(crate) direct_map: crate::direct_map::DirectMapState,
   /// The store.
   pub store: Store,
   /// The volumes.

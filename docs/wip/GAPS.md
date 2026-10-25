@@ -11230,11 +11230,75 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     re-witness asks the host's clock as a copy-up does (A-162).
   - A racy witness never settles: after a re-hash past its tick confirms it, the fingerprint alone would do, but every
     drift check of it still hashes the whole file.
+- **The three-daemon fleet test failed once on CI's macOS lane (2026-10-25, run 40196268300 on 2e1c1e59): open, not
+  reproduced.** `three_daemon_processes_deploy_a_fleet_from_one_manifest_and_survive_the_owners_death`
+  (`crates/cli/tests/cli.rs`) waited its full `FLEET_WAIT` (40 s) for two members after the owner's death and failed
+  `assert_retired`: one survivor's alive set held both survivors, the other's held only itself.
+  - **The two views at the end:** the first survivor counted `fleet.takeover.adopted: 2`,
+    `fleet.link.invalid.believed_dead: 1`, `fleet.seal.no_holder_session: 3`, `fleet.seal.pair_recipient_unknown: 5`;
+    the second, the one alone, counted `fleet.content.answered_empty: 231` and `fleet.learner.fetches: 4`. Both had
+    probed one peer.
+  - **Frequency:** 1 failure in 2 runs of that commit. The re-run of the failed job passed, and the job had passed on
+    the three commits before it. The commit changed only the content store's seal, which no fleet path reaches.
+  - **Owed:** a reproduction under load with the membership's transitions logged on both survivors. The test has
+    found real fleet bugs before (the 2026-09 records under `docs/bugs/` that name it), so a single failure is not
+    dismissed as noise.
+
+- **The same-kernel direct map hands a live, sealed copy of one file (A-171, G-direct step 1, 2026-10-25): built,
+  and proven on Linux by a real client.**
+  - **What:** a `MapRead` is answered with a copy of the file that is the unit of authorization: a sealable memfd of
+    the file's page span, the daemon's own writable map taken first, then sealed `F_SEAL_FUTURE_WRITE | F_SEAL_SHRINK
+    | F_SEAL_GROW | F_SEAL_SEAL`. It is filled a slice at a time in a task of the owner shard (`crates/server/src/
+    direct_map.rs`) and kept equal to the file by the write boundary (`ShardsBackings::insert_peer`), so the client's
+    read-only map is a live view within its length. The client reads it through atomics (`slates_mem::PeerView`);
+    `MappedRead::bytes()` is gone for `read_at`, `to_vec` and `descriptor`. Decided: a live view over A-135's pinned
+    version (the amendment says why).
+  - **Proven** on fedora (x86_64 Linux), 5 of 5, `crates/client/tests/client.rs`:
+    - zero copy asserted for 20 KiB and 4 MiB files and at every size from empty to 1 MiB, every byte equal;
+    - the handed descriptor, used as a hostile peer would: shared writable map, `write`, shrink, growth and hole punch
+      refused `EPERM`; a read-only map turned writable refused `EACCES`; its reopen read-write through
+      `/proc/self/fd` granted, and that reopen's writable map and `write` refused `EPERM`;
+    - another volume's marker (present in the arena, non-vacuity) in none of the copy's bytes, and no other object
+      arrived beside the copy (judged by inode: the daemon runs in the test, so its own descriptor of the copy is new
+      too);
+    - from a second client, a write at 1 MiB, a cut to 1.5 MiB, a growth to 3 MiB and one past the map to 5 MiB, each in
+      the map with no request of the mapping client;
+    - `slates-mem`'s `peer_object.rs`: 6 of 6 on Linux, 5 of 5 on macOS.
+  - **Red-checked** on fedora in a scratch copy with its own target dir, each mutant rebuilt (the harness lists the
+    crates it recompiled): without the seals and the confinement check, the shared writable map was granted; without the
+    seals alone, the hand-off was refused unconfined and the read came by copy; without the write-through, the write at
+    1 MiB never reached the map; with the old arena hand-off restored, it was refused unconfined. The restored tree
+    passed 5 of 5.
+  - **Regressions run:** vfs 43 binaries (397 tests), bridge-core 109, the client binary 13 and the server's virtio-fs
+    9 and Shards 25 suites on macOS; bridge-virtiofs 102, bridge-core 109, the server's virtio-fs 22, mem 132 and the
+    client binary 15 on fedora; recovery 41 of 41 (see the sibling below for its first run); workspace clippy and the
+    doc gate on fedora.
+  - **Owed:**
+    - macOS (its descriptor over A-161's socket route) and Windows (handle duplication): G-direct steps 4 and 5;
+    - the release, reap and cap behaviour as its own step (G-direct step 2): today the copy lives until its client is
+      reaped (no release on `MappedRead`'s drop), and a volume's teardown lets go of its files' copies;
+    - the measurement of copy-once-map-many against copy-per-read, and of the cut's zeroing by stores (G-direct
+      step 3);
+    - the cross-shard hand-off: a client served by another shard reads by copy;
+    - overlays: an untouched file follows the disk, which no write boundary sees, so an overlay reads by copy;
+    - a `MapRead` retried across a daemon restart meets its recorded `Mapped` reply with no descriptor behind it, and its
+      client's `recv_delivery` waits out the reply deadline. Pre-existing (the reply was recorded before A-171 too);
+      not reproduced.
+  - **Siblings found, not changed:**
+    - `image.rs` `defer`: a refused spawn drops the job inside the shard state's borrow, where its `Drop` cannot reach
+      the state (the nested `with_state` answers `None`), so what the job admitted may not be released. The direct map
+      releases its copy explicitly on that path. To check by test.
+    - `recovery.rs` `memory_others_take_from_a_roomy_host_is_held_only_where_it_eats_into_the_daemons_room` failed once
+      in the whole suite on this Mac at load 8–9 ("the daemon took its first sample": the sampler's first reading did
+      not come within `within_sampler_wait`), then passed 3 of 3 alone and 41 of 41 in the suite again. A wait that
+      does not hold under load: owed a look at its bound.
+
 - **The DAX matrix (A-164, 2026-10-24): every cell of "DAX everywhere" is proven, owed to a goal, or ruled out by its
   platform.** The matrix is in `virtiofs.md` §8: six environments, each platform a row, two routes, 52 cells, none left
   unknown. The research behind it is kiln 01a17143717a7556a52f40f1d5a0e1b2 (19 findings, graded from their sources).
-  - **Proven (5 cells):**
+  - **Proven (6 cells):**
     - bare-metal Linux x86_64 by the mount route: the FUSE mount's shared maps;
+    - bare-metal Linux x86_64 by the socket route: the direct map's sealed copy (A-171, 2026-10-25; the entry below);
     - crosvm on Linux x86_64 by both routes: over a slates mount, and over slates' own device (G-vhost, 2026-10-25:
       `crates/cli/tests/guest_vhost.rs`, the entries below);
     - a Shards guest on macOS arm64 by the socket route;
@@ -11248,10 +11312,9 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     - WSL2: 9P (unconfirmed);
     - Firecracker's socket route: it has no fs device.
   - **Owed, each to a kiln goal:**
-    - the direct map on Linux, macOS and Windows. **Corrected 2026-10-25:** this entry and the matrix counted the
-      A-135 direct map on Linux as proven. Its test, `a_same_kernel_client_maps_a_file_with_no_copy`, reports which
-      path ran and does not assert it. Since the 2026-10-18 escape fix every run reads by copy: the hand-off is
-      refused until a backing authorizes only the window (`docs/bugs/2026-10-18-a-read-handed-the-peer-the-whole-content-arena.md`);
+    - the direct map on macOS and Windows (G-direct steps 4 and 5). **Corrected 2026-10-25:** this entry and the matrix
+      had counted the A-135 direct map on Linux as proven while every run read by copy (its test reported the path
+      and did not assert it); A-171 has proven it since, asserting the zero-copy path;
     - the mount route's maps on macOS, Windows and in containers and pods;
     - Shards' own window over the macOS mount;
     - Shards on Linux KVM and on Windows;
