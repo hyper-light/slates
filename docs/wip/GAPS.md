@@ -11318,6 +11318,20 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       (this Mac); and a read is exact if the question follows the load, since no newer write is accepted until a new
       daemon has started.
 
+- **The Python async SDK's loop-hold test fails now and then on CI's macOS runner (open, found 2026-10-25).** In
+  `crates/sdk-python/tests/test_sdk_async.py` (`test_every_async_call_ends_across_restart_silence_cancellation_and_death`),
+  the macOS SDK packaging job failed twice in the seven runs after 21 straight passes:
+  - run 40227172048 (60ce0142, attempt 1): worst lateness 0.268 s in phase (2), a live daemon stopped by a signal,
+    against a bound of 0.234 s (0.1 s plus the runner's measured scheduling noise, 0.134 s); the process burned
+    0.002 s of CPU across the gap, and the test's own plain Python thread was held 0.079 s of it;
+  - run 40239373189 (becf5936): 0.286 s in phase (1), an overflow and then a restart under the outstanding calls,
+    against 0.250 s (noise 0.150 s); 0.005 s of CPU, the plain thread held 0.034 s.
+  Both passed on rerun. The second failure named the hold's frame: the event loop's own idle wait,
+  `selectors.KqueueSelector.select` in `kqueue.control(None, max_ev, timeout)`. So the loop was asleep in its
+  selector with a timeout due and woke late, with no SDK call on its stack. Leading suspect, unmeasured: macOS timer
+  coalescing for a process the runner schedules at low quality of service, which defers a sleeping thread's timer
+  past a busy runner's measured noise. Next: read the runner process's QoS and the selector's timeout against its
+  wake on a loaded Mac, before any change to the bound;
 - **A DAX copy slice past the bridge's 256 KiB read cap dropped a guest's stores (A-163, fixed 2026-10-25).** CI's
   ubuntu lane on `d71ce235` (run 40211222944) failed two Shards tests: a store through a guest's DAX map past the first
   256 KiB of a copy slice never reached the volume at `FSYNC`, which answered 0. Root cause, reproduced on fedora by
@@ -11477,13 +11491,22 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
 - **The DAX matrix (A-164, 2026-10-24): every cell of "DAX everywhere" is proven, owed to a goal, or ruled out by its
   platform.** The matrix is in `virtiofs.md` §8: six environments, each platform a row, two routes, 52 cells, none left
   unknown. The research behind it is kiln 01a17143717a7556a52f40f1d5a0e1b2 (19 findings, graded from their sources).
-  - **Proven (9 cells):**
+  - **Proven (10 cells):**
     - bare-metal Linux x86_64 by the mount route: the FUSE mount's shared maps, and since 2026-10-25 a read-only map
       too (`a_read_only_map_through_a_mount_follows_another_paths_change`, 16 replacements as memory alone, fedora);
     - bare-metal macOS arm64 by the mount route, for read-only maps (G-mount step 1, 2026-10-25): the same test maps a
       file read alone through the NFS mount and follows 16 replacements made through another attachment, each after a
       `stat`, in 20.2 s on this Mac; red-checked with the server's file times frozen in a scratch copy (all 16 missed);
       the plan and its research are kiln 01a1750c07637696b356e2e61103f2e2 (16 findings, graded);
+    - Docker and OCI containers on Linux x86_64 by the mount route (G-mount step 3, 2026-10-25): a program in the
+      container maps a file read alone through the host's FUSE mount bound in and follows a replacement made through
+      the SDK as memory alone. Docker binds a `--shared` mount through the OCI attachment's own entry (adacachy,
+      Linux 7.2.9: Docker 29.8.2 with runc inside a privileged Fedora 44 container that ran its own `dockerd` and
+      granted `user_allow_other` in its own `fuse.conf`, the host's unchanged; 1.01 s; red-checked with
+      `FUSE_NOTIFY_INVAL_INODE` never sent: "stale 65", failed in 12.59 s). Rootless podman binds it `-v …:ro` with no
+      `allow_other` (fedora: 0.99 s; red-checked the same way: "stale 65", failed in 14.84 s). The probe is the test
+      binary itself, run in `alpine:3.20` through its own loader and the libraries `ldd` names, so the lane adds no
+      tooling (CLAUDE.md §2 item 13);
     - bare-metal Linux x86_64 by the socket route: the direct map's sealed copy (A-171, 2026-10-25; the entry below);
     - bare-metal macOS arm64 by the socket route: the direct map's read-only copy over the daemon's socket route (A-173,
       2026-10-25; the entry below);
@@ -11506,8 +11529,8 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       **Corrected 2026-10-25:** this entry and the matrix
       had counted the A-135 direct map on Linux as proven while every run read by copy (its test reported the path
       and did not assert it); A-171 has proven it since, asserting the zero-copy path;
-    - the mount route's maps on Windows and in containers and pods (G-mount steps 2 to 5; macOS's read-only maps proven
-      2026-10-25);
+    - the mount route's maps on Windows, in Windows containers and in pods (G-mount steps 2, 4 and 5; macOS's read-only
+      maps and Linux containers proven 2026-10-25);
     - Shards' own window over the macOS mount;
     - Shards on Linux KVM and on Windows;
     - the direct map inside a Linux container;

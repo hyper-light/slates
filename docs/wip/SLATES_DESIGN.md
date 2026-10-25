@@ -3023,13 +3023,15 @@ same-namespace host process is the first delivered case.
 > platform, is the matrix in `docs/wip/virtiofs.md` §8.
 > - **Proven:** a host process's shared map through the Linux FUSE mount; a host process's read-only map through the
 >   macOS NFS mount, following another path's changes after a `stat` (G-mount step 1, 2026-10-25, red-checked with the
->   server's file times frozen); crosvm over a slates mount (Linux x86_64);
+>   server's file times frozen); a program in a Linux container mapping a file through the host's FUSE mount bound in
+>   (G-mount step 3, 2026-10-25, Docker and rootless podman, red-checked with the mount's invalidation off); crosvm over
+>   a slates mount (Linux x86_64);
 >   crosvm over slates' own device (Linux x86_64, A-168 and A-169, 2026-10-25); a Shards guest over the daemon's
 >   stream (macOS arm64, A-163); Firecracker by virtio-pmem over the image file through a slates mount (Linux x86_64,
 >   A-165); and, since 2026-10-25, the same-kernel direct map on Linux (A-171: a sealed copy of one file, asserted
 >   zero-copy by a real client, red-checked), on macOS (A-173: the copy's read-only descriptor over the socket route,
 >   asserted zero-copy by a real client, red-checked) and on Windows x86_64 (A-175: a read-only section handle
->   duplicated into the client, asserted zero-copy by a real client on a Windows machine, red-checked). Nine cells. **Corrected 2026-10-25:** the direct map had been listed
+>   duplicated into the client, asserted zero-copy by a real client on a Windows machine, red-checked). Ten cells. **Corrected 2026-10-25:** the direct map had been listed
 >   here as proven before A-171, when its test reported which path ran without asserting it and every read was a copy.
 > - **Ruled out by the platforms:** QEMU's vhost-user-fs and Cloud Hypervisor have no DAX window, so neither has Kata;
 >   crosvm's window is x86_64-only; Apple's Virtualization framework and WSL2 document none (unconfirmed).

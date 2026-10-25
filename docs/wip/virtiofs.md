@@ -303,7 +303,7 @@ box shared with two other builds — timings are not benchmarks)
 
    | platform | mount route (the host mount bound in) | socket route (A-135 from inside the container) |
    |---|---|---|
-   | Linux x86_64 | owed: G-mount (the bound mount reads and writes, A-28; a map inside the container not yet run) | owed: G-container-direct |
+   | Linux x86_64 | proven (G-mount step 3, 2026-10-25): a program in the container maps a file read alone through the host's FUSE mount bound in and follows another path's replacement as memory alone. `crates/cli/tests/cli.rs` `a_container_maps_a_file_through_the_bound_mount_and_follows_another_paths_change` (Docker, the OCI attachment's own bind of a `--shared` mount; Docker 29.8.2 with runc inside a privileged Fedora 44 container, Linux 7.2.9, 1.01 s) and `a_rootless_container_maps_a_file_through_the_mount_and_follows_another_paths_change` (rootless podman, no `allow_other`; fedora, 0.99 s); each red-checked with `FUSE_NOTIFY_INVAL_INODE` never sent (the map kept the first fill); the probe is the test binary itself, run through its own loader in `alpine:3.20`; CI's Linux lane runs both | owed: G-container-direct |
    | Linux arm64 | owed: G-arm64-host | owed: G-arm64-host |
    | macOS arm64 (Docker Desktop) | impossible (unconfirmed): VirtioFS on the Virtualization framework documents no window | impossible: the container runs in a VM, not on the daemon's kernel |
    | Windows (Docker Desktop on WSL2) | impossible (unconfirmed): 9P | impossible: the container runs in a VM |

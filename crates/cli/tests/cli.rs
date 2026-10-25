@@ -3646,20 +3646,9 @@ fn run_in_container_as(
   user: &str,
   groups: &[&str],
 ) -> Result<(i32, String, String), String> {
-  let source = entry["source"].as_str().unwrap();
   let destination = entry["destination"].as_str().unwrap();
-  let read_only = entry["options"]
-    .as_array()
-    .unwrap()
-    .iter()
-    .any(|o| o == "ro");
   let name = format!("slates-oci-{}-{tag}", std::process::id());
-  let mut bind = format!(
-    "type=bind,source={source},destination={destination},bind-recursive=disabled,bind-propagation=private"
-  );
-  if read_only {
-    bind.push_str(",readonly");
-  }
+  let bind = docker_bind(entry);
   let mut command = Command::new("docker");
   command.args(["run", "--rm", "--name", &name, "--user", user]);
   for group in groups {
@@ -3681,6 +3670,25 @@ fn run_in_container_as(
     let _ = Command::new("docker").args(["rm", "-f", &name]).output();
   }
   result
+}
+
+/// Docker's `--mount` form of the runtime entry the daemon returned: a non-recursive bind
+/// (`bind-recursive=disabled`) with private propagation, read-only when the entry says `ro`.
+fn docker_bind(entry: &serde_json::Value) -> String {
+  let source = entry["source"].as_str().unwrap();
+  let destination = entry["destination"].as_str().unwrap();
+  let read_only = entry["options"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .any(|o| o == "ro");
+  let mut bind = format!(
+    "type=bind,source={source},destination={destination},bind-recursive=disabled,bind-propagation=private"
+  );
+  if read_only {
+    bind.push_str(",readonly");
+  }
+  bind
 }
 
 /// The workload on the host path, through the shell (no `std::fs`, R1).
@@ -8638,6 +8646,451 @@ fn podman_run(source: &str, options: &str, argv: &[&str]) -> (i32, String, Strin
     String::from_utf8_lossy(&output.stdout).into_owned(),
     String::from_utf8_lossy(&output.stderr).into_owned(),
   )
+}
+
+/// Format: the environment variables that make this test binary the container's map probe ([`container_map_probe`])
+/// and tell it what to map: the file's path inside the container, its length, and the byte to wait for.
+#[cfg(target_os = "linux")]
+const MAP_PROBE_PATH: &str = "SLATES_CLI_MAP_PROBE_PATH";
+/// Format: see [`MAP_PROBE_PATH`].
+#[cfg(target_os = "linux")]
+const MAP_PROBE_LENGTH: &str = "SLATES_CLI_MAP_PROBE_LENGTH";
+/// Format: see [`MAP_PROBE_PATH`].
+#[cfg(target_os = "linux")]
+const MAP_PROBE_FILL: &str = "SLATES_CLI_MAP_PROBE_FILL";
+/// Format: the tag on every line the probe prints for the host, since libtest's own banner shares the stream.
+#[cfg(target_os = "linux")]
+const MAP_PROBE_TAG: &str = "map-probe:";
+/// Format: where the container sees this test binary.
+#[cfg(target_os = "linux")]
+const MAP_PROBE_BINARY: &str = "/probe/cli";
+/// Format: where the container sees the binary's dynamic loader (`ld.so`) and every library it links.
+#[cfg(target_os = "linux")]
+const MAP_PROBE_LIBRARIES: &str = "/probe/lib";
+
+/// The container side of the container map tests: this test binary re-invoked inside the container, where
+/// [`MAP_PROBE_PATH`] is set (a test that returns at once anywhere else). It maps the file `PROT_READ`, `MAP_SHARED`,
+/// reports the map's first byte, waits for the host's line on standard input saying the file was replaced, then reads
+/// the map with volatile loads until every byte is the fill or [`WAIT_FOR`] passes. From the map on it makes no system
+/// call on the file (no `stat`, no `read`), so what it sees is memory alone. A Rust probe, so the lane adds no other
+/// tooling (CLAUDE.md §2 item 13): the design is slates-5a's (2026-10-25).
+#[cfg(target_os = "linux")]
+#[test]
+#[allow(clippy::disallowed_methods)] // the container's own open of a file on the bound slates mount: RAM, not disk
+fn container_map_probe() {
+  use std::io::BufRead;
+  use std::os::fd::AsFd;
+  let Ok(path) = std::env::var(MAP_PROBE_PATH) else {
+    return;
+  };
+  let length: usize = std::env::var(MAP_PROBE_LENGTH).unwrap().parse().unwrap();
+  let fill: u8 = std::env::var(MAP_PROBE_FILL).unwrap().parse().unwrap();
+  let file = std::fs::File::open(&path).unwrap();
+  // SAFETY: a fresh read-only shared map of `length` bytes of a file this function holds open, at an address the
+  // kernel chooses; it is read only through volatile loads below and unmapped before the function returns.
+  let map = unsafe {
+    rustix::mm::mmap(
+      std::ptr::null_mut(),
+      length,
+      rustix::mm::ProtFlags::READ,
+      rustix::mm::MapFlags::SHARED,
+      file.as_fd(),
+      0,
+    )
+  }
+  .unwrap()
+  .cast::<u8>();
+  let seen = || -> Vec<u8> {
+    (0..length)
+      // SAFETY: `map` is `length` readable bytes until the `munmap` below, and `offset` is below `length`; a volatile
+      // load of one byte holds no reference across the kernel's page replacement.
+      .map(|offset| unsafe { std::ptr::read_volatile(map.add(offset)) })
+      .collect()
+  };
+  println!(
+    "{MAP_PROBE_TAG} mapped {}",
+    seen().first().copied().unwrap_or(0)
+  );
+  let mut line = String::new();
+  std::io::stdin().lock().read_line(&mut line).unwrap();
+  let started = Instant::now();
+  let verdict = loop {
+    let now = seen();
+    if now.iter().all(|byte| *byte == fill) {
+      break format!("followed {fill} after_us={}", started.elapsed().as_micros());
+    }
+    if started.elapsed() >= WAIT_FOR {
+      break format!("stale {}", now.first().copied().unwrap_or(0));
+    }
+    pause();
+  };
+  println!("{MAP_PROBE_TAG} {verdict}");
+  // SAFETY: unmaps exactly the map made above; nothing reads it after this.
+  let _ = unsafe { rustix::mm::munmap(map.cast(), length) };
+}
+
+/// This test binary, its dynamic loader and every library it links, as read-only `--mount`s: the binary at
+/// [`MAP_PROBE_BINARY`], the loader at `ld.so` and each library under its own name in [`MAP_PROBE_LIBRARIES`]. The
+/// container runs the binary through that loader with that directory as its only library path, so the probe runs in
+/// any image whatever its C library, and the lane pulls nothing but the small image it already names (slates-5a's
+/// design).
+#[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)] // resolves host paths (a read) for the binds
+fn probe_binaries() -> Vec<String> {
+  let binary = std::env::current_exe().unwrap();
+  let readonly_bind = |source: &std::path::Path, destination: &str| {
+    let real = std::fs::canonicalize(source).unwrap();
+    format!(
+      "type=bind,source={},destination={destination},readonly",
+      real.display()
+    )
+  };
+  let listed = Command::new("ldd").arg(&binary).output().unwrap();
+  assert!(
+    listed.status.success(),
+    "ldd {}: {}",
+    binary.display(),
+    String::from_utf8_lossy(&listed.stderr)
+  );
+  let mut mounts = vec![readonly_bind(&binary, MAP_PROBE_BINARY)];
+  for line in String::from_utf8_lossy(&listed.stdout).lines() {
+    // `libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x...)`, `/lib64/ld-linux-x86-64.so.2 (0x...)`, or the vDSO,
+    // which has no file.
+    let line = line.trim();
+    let (name, path) = match line.split_once(" => ") {
+      Some((name, rest)) => (name.to_owned(), rest.split(" (").next().unwrap_or(rest)),
+      None => {
+        let path = line.split(" (").next().unwrap_or(line);
+        if !path.starts_with('/') {
+          continue;
+        }
+        ("ld.so".to_owned(), path)
+      }
+    };
+    assert!(
+      path.starts_with('/'),
+      "ldd found no file for {name}: {line}"
+    );
+    mounts.push(readonly_bind(
+      std::path::Path::new(path),
+      &format!("{MAP_PROBE_LIBRARIES}/{name}"),
+    ));
+  }
+  mounts
+}
+
+/// G-mount step 3 (§4.6; the DAX matrix's Docker Linux x86_64 mount-route cell, `docs/wip/virtiofs.md` §8): a program
+/// in a container maps a file through the bound FUSE mount and sees another path's change as memory alone. Do: write a
+/// page of `A` into `map.bin` through the SDK, mount the volume `--shared`, bind the mount into a container read-only
+/// through the OCI attachment (the entry `attach --oci` returns, bound as [`run_in_container`] binds it), and there map
+/// the file with [`container_map_probe`]; once the probe has mapped it and read `A`, replace the file with `C` through
+/// the SDK under another attachment. Expect the probe's existing map to read `C` within [`WAIT_FOR`], polling memory
+/// alone: slates tells the host's FUSE mount of the change, and the container shares the host's kernel and its page
+/// cache. Gated on a live FUSE mount, `user_allow_other` and a reachable runtime; skips loudly.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_container_maps_a_file_through_the_bound_mount_and_follows_another_paths_change() {
+  let Some(server) = linux_container_gate() else {
+    return;
+  };
+  eprintln!("the map probe over {server}");
+  let instance = format!("cli-container-map-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "containermap", "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let deadlines = slates_client::Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get();
+  let mut writer = slates_client::Client::connect(&instance, deadlines).unwrap();
+  let volume = volume_id_of(&id);
+  let attachment = writer
+    .attach(volume, None, slates_client::Intent::Write)
+    .unwrap()
+    .attachment;
+  let length = rustix::param::page_size();
+  writer
+    .fs_write(
+      (volume, attachment),
+      "map.bin",
+      &vec![b'A'; length],
+      FILE_MODE,
+    )
+    .unwrap();
+  let point = MountPoint {
+    path: fresh_mount_point(),
+  };
+  let path = point.path.clone();
+  let (code, _, err) = run(&instance, &["mount", &id, &path, "--shared"]);
+  assert_eq!(code, 0, "slates mount --shared: {err}");
+  let reader = attach_oci(&instance, &id, &path, "--read");
+  let entry = reader["established"]["binding"]["mount"].clone();
+  let fill = b'C';
+  let bind = ProbeBind {
+    runtime: "docker",
+    args: vec![
+      "--user".to_owned(),
+      format!(
+        "{}:{}",
+        rustix::process::getuid().as_raw(),
+        rustix::process::getgid().as_raw()
+      ),
+      "--mount".to_owned(),
+      docker_bind(&entry),
+    ],
+    destination: entry["destination"].as_str().unwrap().to_owned(),
+  };
+  let probed = probe_map_in_container(&bind, length, fill, || {
+    writer
+      .fs_write(
+        (volume, attachment),
+        "map.bin",
+        &vec![fill; length],
+        FILE_MODE,
+      )
+      .unwrap();
+  });
+  detach_all(&instance, &[reader["attachment"].as_u64().unwrap()]);
+  drop(writer);
+  let _ = unmount_after_container(&instance, &path);
+  drop(point);
+  drop(anchor);
+  assert_probe_followed(probed, fill);
+}
+
+/// Asserts the probe first read `A` through its map and then saw the whole `fill` there, as memory alone.
+#[cfg(target_os = "linux")]
+fn assert_probe_followed(probed: Result<(String, String), String>, fill: u8) {
+  let (mapped, last) = probed.unwrap();
+  assert_eq!(
+    mapped,
+    format!("mapped {}", b'A'),
+    "the container's map first read the volume's bytes"
+  );
+  assert!(
+    last.starts_with(&format!("followed {fill} ")),
+    "the container's existing map came to the replacement within {WAIT_FOR:?}, as memory alone: {last}"
+  );
+}
+
+/// How [`probe_map_in_container`] reaches the mount: the runtime, the arguments that bind the mount (and choose the
+/// container's identity and its confinement), and where the container sees the volume.
+#[cfg(target_os = "linux")]
+struct ProbeBind {
+  runtime: &'static str,
+  args: Vec<String>,
+  destination: String,
+}
+
+/// Runs [`container_map_probe`] in a container bound as `bind` says, over `length` bytes of `map.bin`: waits for the
+/// probe to map the file and print its first byte, calls `change`, then tells the probe to watch for `fill`. The probe's
+/// two tagged lines (`mapped …`, then `followed …` or `stale …`), or why the run failed with everything else it printed;
+/// the container is removed either way, and the thread reading its output joined.
+#[cfg(target_os = "linux")]
+fn probe_map_in_container(
+  bind: &ProbeBind,
+  length: usize,
+  fill: u8,
+  change: impl FnOnce(),
+) -> Result<(String, String), String> {
+  use std::io::{BufRead, Write};
+  let name = format!("slates-map-probe-{}-{}", bind.runtime, std::process::id());
+  let mut command = Command::new(bind.runtime);
+  command
+    .args(["run", "-i", "--rm", "--name", &name])
+    .args(&bind.args);
+  for mount in probe_binaries() {
+    command.args(["--mount", &mount]);
+  }
+  let mut child = command
+    .args([
+      "-e",
+      &format!("{MAP_PROBE_PATH}={}/map.bin", bind.destination),
+      "-e",
+      &format!("{MAP_PROBE_LENGTH}={length}"),
+      "-e",
+      &format!("{MAP_PROBE_FILL}={fill}"),
+      CONTAINER_IMAGE,
+      &format!("{MAP_PROBE_LIBRARIES}/ld.so"),
+      "--library-path",
+      MAP_PROBE_LIBRARIES,
+      MAP_PROBE_BINARY,
+      "--exact",
+      "container_map_probe",
+      "--nocapture",
+      "--test-threads=1",
+    ])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .map_err(|e| format!("{} run: {e}", bind.runtime))?;
+  let stdout = child.stdout.take().ok_or("the probe's output")?;
+  let stderr = child.stderr.take().ok_or("the probe's errors")?;
+  let (lines_out, lines) = std::sync::mpsc::channel();
+  let reading = std::thread::spawn(move || {
+    let mut untagged = String::new();
+    for line in std::io::BufReader::new(stdout)
+      .lines()
+      .map_while(Result::ok)
+    {
+      // The tag may follow libtest's `test container_map_probe ... ` on the same line: libtest prints a test's name
+      // without ending the line, and the probe's first line comes straight after it.
+      match line.split_once(MAP_PROBE_TAG) {
+        Some((_, tagged)) => {
+          if lines_out.send(tagged.trim().to_owned()).is_err() {
+            break;
+          }
+        }
+        None => {
+          untagged.push_str(&line);
+          untagged.push('\n');
+        }
+      }
+    }
+    let mut errors = String::new();
+    if let Err(why) =
+      std::io::Read::read_to_string(&mut std::io::BufReader::new(stderr), &mut errors)
+    {
+      errors.push_str(&format!(
+        "(the probe's errors could not be read whole: {why})\n"
+      ));
+    }
+    untagged.push_str(&errors);
+    untagged
+  });
+  let talk = || -> Result<(String, String), String> {
+    let mapped = probe_line(&lines, "mapped ", CONTAINER_WAIT)?;
+    change();
+    child
+      .stdin
+      .as_mut()
+      .ok_or("the probe's input")?
+      .write_all(b"replaced\n")
+      .map_err(|e| format!("telling the probe: {e}"))?;
+    let last = probe_line(&lines, "", WAIT_FOR + WAIT_FOR)?;
+    Ok((mapped, last))
+  };
+  let outcome = talk();
+  let started = Instant::now();
+  while child.try_wait().ok().flatten().is_none() && started.elapsed() < CONTAINER_WAIT {
+    pause();
+  }
+  if child.try_wait().ok().flatten().is_none() {
+    let _ = Command::new(bind.runtime)
+      .args(["rm", "-f", &name])
+      .output();
+    let _ = child.kill();
+    let _ = child.wait();
+  }
+  let rest = reading.join().unwrap_or_default();
+  outcome.map_err(|why| format!("{why}; the container printed:\n{rest}"))
+}
+
+/// G-mount step 3, rootless (§4.6, R10): the probe of
+/// [`a_container_maps_a_file_through_the_bound_mount_and_follows_another_paths_change`] in a rootless podman container
+/// with the mount bound read-only by `-v`, where the container's root is the mounting user, so the FUSE mount needs no
+/// `allow_other` and the host no operator's grant. Do: write a page of `A` into `map.bin` through the SDK, mount the
+/// volume, map the file in the container; once the probe has read `A`, replace the file with `C` through the SDK under
+/// another attachment. Expect the probe's existing map to read `C` within [`WAIT_FOR`], polling memory alone. Gated on
+/// a live FUSE mount and podman; skips loudly.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_rootless_container_maps_a_file_through_the_mount_and_follows_another_paths_change() {
+  if !linux_fuse_mount_runs() {
+    return;
+  }
+  if !rootless_podman_available() {
+    eprintln!(
+      "SKIP: the rootless container map needs podman and /dev/fuse (Linux, rootless, only)"
+    );
+    return;
+  }
+  let instance = format!("cli-rootless-map-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "rootlessmap", "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let deadlines = slates_client::Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get();
+  let mut writer = slates_client::Client::connect(&instance, deadlines).unwrap();
+  let volume = volume_id_of(&id);
+  let attachment = writer
+    .attach(volume, None, slates_client::Intent::Write)
+    .unwrap()
+    .attachment;
+  let length = rustix::param::page_size();
+  writer
+    .fs_write(
+      (volume, attachment),
+      "map.bin",
+      &vec![b'A'; length],
+      FILE_MODE,
+    )
+    .unwrap();
+  let point = MountPoint {
+    path: fresh_mount_point(),
+  };
+  let path = point.path.clone();
+  let (code, _, err) = run(&instance, &["mount", &id, &path]);
+  assert_eq!(code, 0, "slates mount: {err}");
+  let fill = b'C';
+  // `label=disable`: on an SELinux host the probe's binary and libraries carry the host's labels, which a confined
+  // container may not read; switching the container's own confinement off changes nothing on the host (no relabel).
+  let bind = ProbeBind {
+    runtime: "podman",
+    args: vec![
+      "--security-opt".to_owned(),
+      "label=disable".to_owned(),
+      "-v".to_owned(),
+      format!("{path}:/vol:ro"),
+    ],
+    destination: "/vol".to_owned(),
+  };
+  let probed = probe_map_in_container(&bind, length, fill, || {
+    writer
+      .fs_write(
+        (volume, attachment),
+        "map.bin",
+        &vec![fill; length],
+        FILE_MODE,
+      )
+      .unwrap();
+  });
+  drop(writer);
+  let _ = unmount_after_container(&instance, &path);
+  drop(point);
+  drop(anchor);
+  assert_probe_followed(probed, fill);
+}
+
+/// The probe's next output line that starts with `prefix`, within `wait`.
+#[cfg(target_os = "linux")]
+fn probe_line(
+  lines: &std::sync::mpsc::Receiver<String>,
+  prefix: &str,
+  wait: Duration,
+) -> Result<String, String> {
+  let started = Instant::now();
+  loop {
+    let left = wait.saturating_sub(started.elapsed());
+    match lines.recv_timeout(left) {
+      Ok(line) if line.starts_with(prefix) => return Ok(line),
+      Ok(_) => {}
+      Err(e) => return Err(format!("waiting for {prefix:?}: {e}")),
+    }
+  }
 }
 
 /// §4.6 A-9 / RQ-20: **an OCI container consumes the same VFS** — the row of `docs/wip/CONSUMERS.md` that read
