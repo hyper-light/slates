@@ -1,4 +1,4 @@
-//! Copy-once-map-many against copy-per-read (§4.6, A-171; G-direct step 3), through the client API against a real
+//! Copy-once-map-many against copy-per-read (§4.6, A-171, A-173; G-direct step 3), through the client API against a real
 //! one-shard daemon.
 //!
 //! A direct map pays once: the request, the daemon's fill of a copy of the file, the hand-off and the `mmap` (its
@@ -11,8 +11,8 @@
 //!
 //! Command: `cargo run --release -p slates-client --example map_read_ab -- <sizes_kib> <samples>` (defaults
 //! `4,1024,65536` and 15). Prints every sample of every arm, the best of each, the break-even read count, the path
-//! the map took and the load. A map that read by copy (macOS and Windows until their routes land) is reported as such
-//! and never priced as a direct one.
+//! the map took and the load. A map that read by copy (Windows until its route lands) is reported as such and never
+//! priced as a direct one.
 // Bench harness code: an unwrap here is a failed run.
 #![allow(
   clippy::unwrap_used,

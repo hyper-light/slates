@@ -2975,8 +2975,10 @@ same-namespace host process is the first delivered case.
 > XNU's rule for every descriptor, not the mode's. **Found and fixed, test first**
 > (`docs/bugs/2026-10-25-a-released-maps-offer-stayed-claimable.md`): a copy let go before its offer was claimed left
 > the offer claimable, holding a live object outside the client's share; now every copy let go withdraws its offer
-> (`direct_map::let_go`, `dax.local_map_offer_withdrawn`). **Owed:** Windows (G-direct step 5); this Mac's map arm of
-> the break-even bench (step 3); a test of the reap's withdrawal of its own (it shares the release's code; a test would
+> (`direct_map::let_go`, `dax.local_map_offer_withdrawn`). **Measured the same day** (BENCHMARKS, "Copy-once-map-many
+> against copy-per-read", this Mac): a steady mapped read costs 1.1 % to 2.1 % of a copy read, and a map repays its
+> setup, the route's claim included, after 3 reads of a 4 KiB file and after one from 1 MiB up. **Owed:** Windows
+> (G-direct step 5); a test of the reap's withdrawal of its own (it shares the release's code; a test would
 > race the offer's own expiry, both two liveness budgets).
 >
 > **Amended 2026-10-25 (A-174) — a hand-off that fails in the client gives its copy back.** The daemon holds a copy for
@@ -12247,7 +12249,8 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
 - **Decided: an offer never outlives its copy.** Found by its test first (`docs/bugs/2026-10-25-a-released-maps-offer-stayed-claimable.md`): a copy let go before its offer was claimed left the offer claimable, so a client could map, release and map again, each unclaimed offer keeping a live object outside its share and the fill budget for the offer's whole life. Now every way a copy goes (`direct_map::let_go`: a release, a reap, a fill that ended without its hand-off) withdraws its offer, counted `dax.local_map_offer_withdrawn`.
 - **Rejected: the read-write descriptor with only a read-only map made of it.** The descriptor is the capability, not the map: handed in the read-only one's place in the red-check, its shared writable map and its turned map were granted.
 - **Proven** on this Mac (arm64, Darwin 25.4.0, 2026-10-25) by `crates/client/tests/client.rs` and `reap_map.rs` over a real daemon, red-checked (§4.6 status); Linux unchanged, the route being macOS's alone, its suites passing on fedora.
-- **Owed:** Windows (G-direct step 5); this Mac's map arm of the break-even bench (step 3); a test of the reap's withdrawal of its own (it shares the release's code; a test would race the offer's own expiry, both two liveness budgets); and the sibling found by the sweep: a Shards stream offer outlives an attachment that ended before its claim, a dead end held until it expires, within the shard's handoff bound (GAPS).
+- **Measured** the same day (BENCHMARKS, "Copy-once-map-many against copy-per-read", this Mac at load 15.5–19.6): a steady mapped read costs 1.1 % to 2.1 % of a copy read; the route's claim makes a 4 KiB map's setup 83–94 µs, repaid after 3 reads, and from 1 MiB the whole setup costs less than one copy read.
+- **Owed:** Windows (G-direct step 5); a test of the reap's withdrawal of its own (it shares the release's code; a test would race the offer's own expiry, both two liveness budgets); and the sibling found by the sweep: a Shards stream offer outlives an attachment that ended before its claim, a dead end held until it expires, within the shard's handoff bound (GAPS).
 
 ### A-174 — A direct map's hand-off that fails in the client gives its copy back (accepted 2026-10-25)
 Applied in the same change to: §4.6 (the direct map's lifetime, its status), GAPS, `crates/client` (`Client::map_read`, `kept_or_given_back`; `ClientError::HandOffUnreleased`, appended; `tests/reap_map.rs`: the starved client), `CLAUDE.md`.

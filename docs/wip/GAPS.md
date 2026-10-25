@@ -11256,7 +11256,8 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       expiry (both two liveness budgets), so it is owed rather than written flaky;
     - **sibling found by the sweep:** a Shards stream offer outlives an attachment that ended before its claim, a dead
       end held until it expires; counted against the shard's handoff bound meanwhile, so no bound breaks;
-    - this Mac's map arm of the break-even bench (step 3), now that the map is direct here;
+    - this Mac's map arm of the break-even bench (step 3), now that the map is direct here: **measured the same day**
+      (BENCHMARKS, the entry's Mac table);
     - a hand-off that fails at the client after the copy was made (a claim refused on macOS — `Busy`, an expired offer,
       a confirmation that does not open — or, on Linux since A-171, a delivery that never arrives) returned the error
       and left the copy held on the client's slot, unreachable by `release_map` (which takes the map), until the
@@ -11269,8 +11270,10 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   mapped read costs 3.7 % to 10.3 % of a copy read at 4 KiB, 1 MiB and 64 MiB alike; a map repays its setup after one
   read from 1 MiB up (its whole setup, the fill included, already costs less than one copy read: 64 MiB in 39–97 ms
   against 94–191 ms) and after 3 to 5 reads of a 4 KiB file. The two runs agree within their spread on each machine.
-  This Mac's map arm reads by copy until step 4, so it is recorded as the copy read's baseline only (64 MiB in 0.74 to
-  1.18 s best at load 36–58, 4 to 8 times the Linux machines'), for step 4 to price its direct map against.
+  This Mac's map arm read by copy until step 4, so it was first recorded as the copy read's baseline only. **Since step 4
+  (A-173), measured on this Mac too** (load 15.5–19.6, two runs): a steady mapped read costs 1.1 % to 2.1 % of a copy
+  read; the route's claim makes a 4 KiB map's setup 83–94 µs, repaid after 3 reads; from 1 MiB the whole setup costs
+  less than one copy read (64 MiB: 49–74 ms against 314–329 ms).
   - **Fixed on the way, CI's ubuntu lane (run 40209801720 on 604e0875):** the share test asked for a third map right
     after a second client connected and expected the share halved; on CI the shard had not yet taken the second client
     in (a client reaches its shard as a task after its connect returns), so the share was still two. The test now has

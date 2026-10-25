@@ -6001,7 +6001,7 @@ against the kernel attack surface and a `RLIMIT_MEMLOCK` boot failure. The drive
 than demoted — replace, do not layer. A quiesced re-run of this A/B is still owed as a record of the
 parked figure; it cannot change the decision, which rests on surface and on the spinning column.
 
-## Copy-once-map-many against copy-per-read: when a direct map repays its fill (A-171; G-direct step 3; 2026-10-25)
+## Copy-once-map-many against copy-per-read: when a direct map repays its fill (A-171, A-173; G-direct step 3; 2026-10-25)
 
 **The question.** A direct map (A-171) pays once: the request, the daemon's fill of a sealed copy of the file, the
 hand-off and the `mmap` (its setup), then the page faults of the first read through the map. After that a read is
@@ -6132,20 +6132,73 @@ fedora, run 2
   64 MiB read 9.6 to 33.5 ms); the bests are the honest floor, the spreads are the busy machine. Bimodal steady reads on
   fedora (161 or 276 µs a MiB) follow which of the i9's two core kinds the thread ran on.
 
-**This Mac: the copy read's baseline, the map arm not priced.** Apple M5 Max, 128 GiB, macOS 26.4.1, 16:14 UTC, load
-average 36 to 58 from other sessions. macOS hands no direct map until G-direct step 4, so every `MapRead` here was
-answered `MapUnavailable` and read by copy: the bench printed `map path=copy (not priced)`, its "map setup" is that
-refusal plus a paged read, and its "mapped reads" are copies out of the client's own buffer. Only the copy read is a
-finding, best of 15 (run 1 / run 2):
+**This Mac, the direct map over the socket route (A-173), best of 15 (run 1 / run 2).** Apple M5 Max (18 cores),
+128 GiB, macOS 26.4.1, release binary at `bf0b6d86`, 17:22 UTC, load average 15.5 to 19.6 from other sessions' builds.
+Every map took the direct path (`map path=direct`), so its setup here is the request, the daemon's fill of the copy, its
+offer, the client's claim on the route (a socket connection, the exchange's key derivation and seals, the descriptor by
+`SCM_RIGHTS`) and the client's map.
 
-| file | copy read | "map setup" (refused, then a copy read) |
-|---|---|---|
-| 4 KiB | 37.2 / 47.2 µs | 55.5 / 64.8 µs |
-| 1 MiB | 7,469.9 / 9,256.6 µs | 7,351.3 / 8,795.7 µs |
-| 64 MiB | 741.6 / 1,178.4 ms | 898.7 / 945.4 ms |
+| file | copy read | map setup | first mapped read | steady mapped read | steady / copy | repaid after |
+|---|---|---|---|---|---|---|
+| 4 KiB | 33.0 / 33.5 µs | 93.8 / 83.4 µs | 1.2 / 1.2 µs | 0.4 / 0.5 µs | 0.011 / 0.014 | 3 / 3 reads |
+| 1 MiB | 5,090.5 / 4,992.8 µs | 830.7 / 1,175.7 µs | 142.0 / 147.8 µs | 97.0 / 105.0 µs | 0.019 / 0.021 | 1 / 1 read |
+| 64 MiB | 328.8 / 314.0 ms | 49.5 / 73.9 ms | 10.2 / 10.1 ms | 6.55 / 6.44 ms | 0.020 / 0.021 | 1 / 1 read |
 
-The Mac's copy read is 4 to 8 times the Linux machines' at 1 MiB and 64 MiB under its load (64 MiB: 0.74 to 1.18 s best,
-up to 5.7 s); step 4 prices its direct map against these.
+```
+this Mac, run 1
+4 KiB    copy 40.5 53.1 38.2 33.0 36.3 55.3 42.6 35.5 33.1 34.0 33.0 34.8 37.0 38.0 33.2
+         setup 96.8 124.7 103.2 98.5 104.8 107.2 103.8 100.3 93.9 93.8 111.7 106.6 121.1 108.7 99.2
+         first 1.8 2.0 1.6 1.5 2.2 1.8 2.2 1.9 1.6 1.2 1.9 1.5 2.1 1.5 1.8
+         steady 0.5 0.5 0.5 0.5 0.5 0.4 0.5 0.4 0.4 0.4 0.4 0.5 0.7 0.5 0.6
+1 MiB    copy 5390.7 5116.8 5855.2 6066.8 5984.2 5266.0 5295.3 5353.0 5288.4 5313.8 6056.6 5601.8 5603.2 5237.4 5090.5
+         setup 975.8 987.3 1108.4 915.0 838.1 930.4 834.0 957.8 923.7 979.2 961.7 896.1 830.7 838.9 930.0
+         first 160.0 160.5 173.8 185.6 154.7 164.3 143.9 168.7 160.1 191.2 154.3 158.0 151.0 161.2 142.0
+         steady 127.3 102.8 133.0 122.3 127.5 109.0 101.1 102.6 104.4 132.0 105.4 124.5 97.0 127.2 106.5
+64 MiB   copy 344653.8 337640.9 344250.6 342916.2 367869.2 328788.5 335690.7 453891.8 335350.0 364633.2 394693.0
+              386176.8 388045.5 388744.0 358103.9
+         setup 51665.1 51733.8 68187.0 51812.8 50232.4 51047.9 50406.2 52282.3 52366.1 54616.2 53583.8 56753.0
+               56090.4 59337.7 49453.0
+         first 10677.8 10748.8 12848.2 10567.6 10856.6 10251.6 10156.2 10650.8 10254.5 12184.9 10604.9 10446.2
+               11263.6 11368.9 10450.6
+         steady 8008.2 7261.5 8757.8 7318.8 6545.8 7349.3 7392.5 7294.8 8206.2 8669.5 6897.0 7201.0 7484.3 7065.4
+                7859.0
+this Mac, run 2
+4 KiB    copy 43.3 58.7 34.7 34.8 36.5 49.2 39.2 38.5 35.6 34.2 33.6 33.5 35.0 34.8 33.8
+         setup 91.3 86.7 83.5 114.3 88.3 85.3 105.0 91.8 83.4 86.5 85.0 84.8 107.5 86.8 85.6
+         first 2.0 1.6 1.4 1.8 1.6 1.6 1.5 1.4 1.3 1.2 1.2 1.2 1.3 1.2 1.5
+         steady 0.5 0.5 0.5 0.6 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5
+1 MiB    copy 5207.2 5153.0 5229.0 5163.2 5285.8 5164.1 5195.6 5305.0 5169.5 5090.8 5030.3 4992.8 5093.9 5019.5 5102.0
+         setup 1325.3 1270.7 1265.2 1199.8 1230.2 1252.5 1191.8 1175.7 1209.9 1190.4 1230.7 1269.0 1522.8 1197.8 1250.0
+         first 155.5 156.6 154.7 159.2 164.9 161.8 174.8 159.6 158.9 172.8 155.0 154.6 147.8 158.9 152.9
+         steady 109.2 105.0 125.3 106.2 108.5 108.5 108.6 107.5 106.8 108.0 107.5 108.1 108.4 107.0 107.3
+64 MiB   copy 322457.6 321451.8 319245.4 314066.5 319226.4 313982.9 315879.5 418335.9 341552.4 375115.8 391436.3
+              441119.0 574906.2 504980.8 1224252.1
+         setup 77914.3 76337.3 76914.6 73853.5 76059.6 74324.6 76527.4 76067.6 110258.9 88844.0 83131.7 101487.1
+               121563.2 159591.7 346369.6
+         first 10321.2 10585.3 10448.4 10370.0 10382.8 10102.8 10283.7 10355.4 12796.9 10781.7 11153.2 10863.4
+               16225.4 23489.4 13860.2
+         steady 6443.1 6672.5 6666.5 6568.6 6597.7 7825.6 6798.1 6771.0 7855.6 7611.1 7048.2 7068.2 16681.1 16793.0
+                10977.7
+```
+
+**What the Mac adds.**
+- **A steady mapped read costs 1.1 % to 2.1 % of a copy read here**, a smaller fraction than on Linux because this
+  Mac's copy read is the slowest of the three machines (5.0 to 5.1 ms a MiB; 64 MiB in 314 to 329 ms) while its mapped
+  read is the fastest (64 MiB in 6.4 to 6.6 ms, about 10 GB/s through 8-byte atomic loads).
+- **The route's claim is the setup's fixed cost:** 83 to 94 µs at 4 KiB against Linux's 21 µs (the box) and 55 to 59 µs
+  (fedora), since a macOS hand-off is a socket connection, an exchange of keys and seals and a descriptor by
+  `SCM_RIGHTS`, where Linux sends the descriptor down a control socket the client already holds. A 4 KiB map still
+  repays itself after 3 reads; from 1 MiB, its whole setup costs less than one copy read (64 MiB: 49 to 74 ms against
+  314 to 329 ms).
+- **The two runs agree within their spread**: every best lies inside the other run's samples and the break-even counts
+  match at every size. Run 2's last 64 MiB samples met a burst of load (a copy read of 1.22 s, a steady read of
+  16.8 ms); the bests are the floor, the spreads the busy machine.
+
+*Superseded the same day, kept for what it measured:* before A-173, macOS answered every `MapRead` `MapUnavailable`,
+so the first Mac runs (16:14 UTC, load 36 to 58) priced only the copy read: 4 KiB 37.2 / 47.2 µs, 1 MiB 7,469.9 /
+9,256.6 µs, 64 MiB 741.6 / 1,178.4 ms best of 15, and the refused map plus its paged read 55.5 / 64.8 µs, 7,351.3 /
+8,795.7 µs and 898.7 / 945.4 ms. The copy read's best then was 2.2 to 3.8 times the later runs' at 64 MiB, which is
+the load (36 to 58 against 15.5 to 19.6), not the code: no change between them touched the copy read.
 
 ## 2026-10-18: what the confined-descriptor rule costs a local zero-copy read (A-135)
 
