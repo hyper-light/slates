@@ -6001,7 +6001,7 @@ against the kernel attack surface and a `RLIMIT_MEMLOCK` boot failure. The drive
 than demoted — replace, do not layer. A quiesced re-run of this A/B is still owed as a record of the
 parked figure; it cannot change the decision, which rests on surface and on the spinning column.
 
-## Copy-once-map-many against copy-per-read: when a direct map repays its fill (A-171, A-173; G-direct step 3; 2026-10-25)
+## Copy-once-map-many against copy-per-read: when a direct map repays its fill (A-171, A-173, A-175; G-direct step 3; 2026-10-25)
 
 **The question.** A direct map (A-171) pays once: the request, the daemon's fill of a sealed copy of the file, the
 hand-off and the `mmap` (its setup), then the page faults of the first read through the map. After that a read is
@@ -6193,6 +6193,65 @@ this Mac, run 2
 - **The two runs agree within their spread**: every best lies inside the other run's samples and the break-even counts
   match at every size. Run 2's last 64 MiB samples met a burst of load (a copy read of 1.22 s, a steady read of
   16.8 ms); the bests are the floor, the spreads the busy machine.
+
+**jupiter, Windows, the direct map by handle duplication (A-175), best of 15 (run 1 / run 2).** AMD Ryzen AI Max+ 395,
+128 GiB, Windows 10.0.26200, release binary of `fb965fd3`'s tree with the bench's gates opened to Windows, 19:38 UTC;
+Windows reports no load average, so the processor's load was read beside each run: 17 to 23 %. Every map took the direct
+path; its setup includes the daemon's judging of the handle and its duplication into this process.
+
+| file | copy read | map setup | first mapped read | steady mapped read | steady / copy | repaid after |
+|---|---|---|---|---|---|---|
+| 4 KiB | 19.8 / 20.9 µs | 55.9 / 28.2 µs | 1.0 / 1.0 µs | 0.4 / 0.3 µs | 0.020 / 0.014 | 3 / 2 reads |
+| 1 MiB | 3,485.8 / 3,308.9 µs | 964.6 / 969.3 µs | 348.2 / 331.0 µs | 84.9 / 84.6 µs | 0.024 / 0.026 | 1 / 1 read |
+| 64 MiB | 212.2 / 211.0 ms | 103.8 / 104.0 ms | 33.7 / 33.6 ms | 5.51 / 5.53 ms | 0.026 / 0.026 | 1 / 1 read |
+
+```
+jupiter, run 1
+4 KiB    copy 48.1 53.3 60.2 46.8 37.5 34.6 32.9 29.3 48.8 38.5 37.6 35.1 38.3 35.4 19.8
+         setup 75.8 73.8 81.6 83.3 62.4 56.5 66.5 129.0 131.9 108.3 105.6 92.1 74.7 62.9 55.9
+         first 2.5 2.1 1.6 2.4 1.5 1.0 1.5 4.6 1.5 2.0 1.9 1.8 1.3 2.6 1.2
+         steady 0.8 0.8 0.4 0.8 0.4 0.5 0.7 0.8 0.6 0.6 0.7 0.7 0.4 0.4 0.6
+1 MiB    copy 3502.6 3938.7 4068.7 3547.4 4334.4 3917.5 3815.4 4045.1 4021.1 3511.4 3670.7 3720.6 3598.9 3485.8 4002.3
+         setup 1014.2 1042.7 1048.0 967.0 992.8 976.3 965.3 979.9 964.6 990.2 1022.6 976.0 974.4 1133.3 1003.5
+         first 394.9 459.5 476.6 482.9 377.9 377.6 382.3 412.1 501.3 349.4 348.2 525.6 560.5 589.1 505.5
+         steady 86.0 146.2 148.1 85.2 84.9 144.4 84.9 144.9 145.0 85.4 86.0 144.5 146.9 147.5 85.9
+64 MiB   copy 223391.1 213113.4 221712.0 212189.8 216031.3 220237.2 417723.5 406262.6 373011.2 405315.2 386005.2
+              367375.8 392412.5 375568.6 366956.4
+         setup 103814.2 106558.4 104381.6 105725.6 104501.3 172996.8 171472.0 170520.6 170582.5 170311.3 176044.6
+               183761.4 178933.8 174109.0 176717.0
+         first 34301.9 34760.3 33743.7 33942.4 33865.5 43610.3 43819.2 44472.5 46445.2 44476.8 43997.7 44122.5
+               43704.1 43335.9 43119.1
+         steady 6682.5 5840.2 5807.5 5547.3 5513.3 9554.6 9589.6 13949.3 9545.1 9787.8 11661.4 9667.5 9460.2 9439.9
+                9441.9
+jupiter, run 2
+4 KiB    copy 81.4 52.4 28.5 25.0 29.6 63.1 25.9 22.3 22.4 28.7 29.4 26.5 26.5 24.3 20.9
+         setup 224.5 38.2 33.4 38.1 85.6 36.1 31.1 29.7 28.2 31.4 41.1 38.1 41.1 31.1 34.0
+         first 1.6 1.2 1.0 1.0 1.6 1.1 1.1 1.0 1.0 1.4 1.8 1.7 1.6 1.8 1.6
+         steady 0.4 0.4 0.4 0.4 0.4 0.5 0.6 0.3 0.3 0.4 0.8 0.6 0.7 0.5 0.7
+1 MiB    copy 3746.5 4306.5 3455.0 4455.8 4582.8 4631.5 5271.5 3371.5 3554.9 3838.1 3635.6 3809.9 4265.9 3816.8 3308.9
+         setup 1017.7 993.7 972.3 996.8 1448.8 1411.7 1280.5 982.4 1285.7 1011.6 1157.6 969.3 1000.7 1091.3 1432.4
+         first 336.8 344.1 375.0 521.9 515.1 346.1 382.8 490.8 519.4 335.7 362.3 345.9 338.5 331.0 342.4
+         steady 85.1 84.6 84.8 85.0 85.0 85.2 85.0 84.6 145.3 84.9 84.8 85.2 86.3 85.0 84.7
+64 MiB   copy 217217.7 215713.4 213766.8 215986.5 226591.9 210997.2 415824.7 392355.0 332412.8 316233.4 338140.7
+              317236.4 330785.1 296618.3 331782.9
+         setup 106783.5 104108.8 103974.7 104866.7 105961.2 169162.3 171520.1 187343.9 186246.4 170166.6 169291.8
+               172240.3 175295.7 185994.4 170514.7
+         first 33972.8 33752.2 33961.8 33754.2 33588.1 49537.7 43514.9 45495.8 49306.7 43684.1 43513.8 50049.1
+               48565.3 44493.0 50324.0
+         steady 5613.9 7248.4 5639.1 5533.1 5556.9 9936.5 9416.1 11281.7 10279.6 9781.6 9404.2 12391.3 11932.7 9728.5
+                9975.0
+```
+
+**What Windows adds.**
+- **A steady mapped read costs 1.4 % to 2.6 % of a copy read**, as on this Mac; a 64 MiB mapped read takes 5.5 ms, about
+  12 GB/s through 8-byte atomic loads, the fastest of the four machines.
+- **The hand-off's fixed cost is between the other platforms'**: 28 to 56 µs at 4 KiB (the judging's three refused
+  attempts, the token comparison and the duplication), repaid after 2 or 3 reads; from 1 MiB the whole setup costs less
+  than one copy read (64 MiB: 104 ms against 211 to 212 ms).
+- **Every 64 MiB arm steps to about 1.7 times slower after its sixth sample, in both runs** (copy 211–227 to 297–418 ms,
+  setup 104–106 to 169–188 ms, steady 5.5–7.2 to 9.4–14.0 ms), while the smaller sizes show nothing of the kind. Not
+  diagnosed: six maps of 64 MiB is where it begins each time, so the system's handling of the released sections' pages
+  is the first suspect. The bests are the floor; the step is on record.
 
 *Superseded the same day, kept for what it measured:* before A-173, macOS answered every `MapRead` `MapUnavailable`,
 so the first Mac runs (16:14 UTC, load 36 to 58) priced only the copy read: 4 KiB 37.2 / 47.2 µs, 1 MiB 7,469.9 /

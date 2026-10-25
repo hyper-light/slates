@@ -6,7 +6,8 @@
   (`ChunkArena::block_backing`)
 - **Status:** found by attacking; **the escape is closed in this change**. What it costs — A-135's
   zero-copy read now takes its copy path until a confined backing exists — is recorded below with the
-  measured mechanism that would restore it.
+  measured mechanism that would restore it. **Zero copy restored 2026-10-25** on Linux, macOS and Windows by a
+  confined copy per file (A-171, A-173, A-175), the escape still closed on each; see "Restoration".
 - **Class:** confinement failure across a trust boundary, read **and** write (CWE-668, CWE-732)
 
 ## Description
@@ -144,6 +145,36 @@ two findings now wait on one decision:
 
 Option 1 is the only one that keeps both zero-copy and confinement for both callers. It touches a
 decided layout, so it is Ada's call; the escape is closed either way.
+
+## Restoration (2026-10-25)
+
+Option 2, refined: **a copy of the file, made per map and kept equal to the file**, rather than a copy of one block
+pinned at its version. A pinned copy would cost the same one copy and then show the client a stale file with no
+signal; a copy in the store's backings (A-163) is written through at the volume's single write boundary before every
+change returns, so the client's map is a live view of the file within its length (A-171). It is the unit of
+authorization on each platform:
+
+- **Linux** (A-171): a sealable memfd of the file's page span; the daemon takes its own writable map, then seals it
+  `F_SEAL_FUTURE_WRITE | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`, and `confined_for_a_peer`, unchanged, now passes
+  it. The `/proc/self/fd` reopen this record measured is still granted, and its writable map and `write` are refused
+  `EPERM`.
+- **macOS** (A-173): a shared-memory object whose name goes as soon as its two descriptors are open; the client is
+  offered the one opened read alone, on the daemon's socket route, judged first (`confined_read_only`). XNU refuses
+  its holder a writable map (`EPERM`), a write (`EBADF`), a map turned writable (`EACCES`) and any second sizing.
+- **Windows** (A-175): a section under a security descriptor that grants no one any right (`D:P(A;;RC;;;OW)`); the
+  daemon duplicates a read-only handle into the client's process, judged first (`hand_section`). Under the default
+  descriptor a read-only handle's holder duplicated one that writes (measured); under this one it is refused
+  `ERROR_ACCESS_DENIED`.
+
+Each platform's hostile test plays this record's attacker against what the client receives: every write path refused
+with the confinement's own error, another volume's marker in none of the copy's bytes (found through that volume's
+own copy, so the scan is not vacuous), and red-checked by handing an unconfined object, which the hand-off refused,
+and with the judge bypassed, which the attack used. The copy's life and bounds are A-172's (released or reaped, within
+a share of the shard's capacity) and A-174's (a hand-off that fails in the client gives it back).
+
+What it buys back, measured (`docs/wip/BENCHMARKS.md`, "Copy-once-map-many against copy-per-read"): a steady mapped
+read costs 1.1 % to 10.3 % of a copy read at 4 KiB, 1 MiB and 64 MiB on two Linux machines, this Mac and a Windows
+machine, and a map repays its setup after one read from 1 MiB up and after 2 to 5 reads of a 4 KiB file.
 
 ## Tests
 

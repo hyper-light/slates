@@ -11250,10 +11250,16 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       13 tests that restart nothing, run at the default 32 test threads, ended 6 `Stalled { after_ns: 1000000000 }` (a
       reply past its 1 s deadline), and at 4 threads all 14 passed. **Corrected 2026-10-25:** this entry first said
       several daemons in one Windows process conflict, from a whole-binary run whose 18 failures mixed these stalls
-      with the restart tests' below. Whether the stall is load or a lost wake (as A-44's was) is not yet diagnosed; CI
-      runs the direct-map tests one at a time meanwhile;
+      with the restart tests' below. Not yet diagnosed; ruled out so far by measurement: slow shard starts (19 inits per
+      run, at most 515 ms, medians 48 and 53 ms, against the 1 s deadline, while 5 and 6 tests stalled) and name
+      collisions (every rendezvous object, Event and region name carries the test's own instance). The stalls fall on
+      each test's first request. Next: a log of the client's wait and of the shard's park and kick, to tell starvation
+      from a lost wake (A-44's protocol fences both sides). CI runs the direct-map tests one at a time meanwhile;
     - the client binary's restart tests fail on Windows (6 of them, never run there by CI): the restarted daemon meets
-      its predecessor's still-live named section, `CreateFileMappingW` refused `ERROR_ALREADY_EXISTS`; pre-existing;
+      its predecessor's still-live named section, `CreateFileMappingW` refused `ERROR_ALREADY_EXISTS`; pre-existing.
+      Likely the harness: a Windows section's name cannot be unlinked and lives while anything maps it (the test's
+      client still maps the old bootstrap object), and a daemon supervised by an anchor adopts the rendezvous the anchor
+      holds rather than creating it, which these tests' second daemon does not; to confirm;
     - on every platform, a client's direct map outlives its daemon: after a `kill -9` and restart the map keeps the file
       as it was when the daemon died and follows it no more, with no signal to the client (its object lives on in the
       client's process). A replayed map reply now fails rather than adopting such a copy (A-175's record rule; Linux's
