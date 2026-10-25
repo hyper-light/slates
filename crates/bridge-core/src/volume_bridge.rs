@@ -1344,6 +1344,14 @@ impl Bridge for VolumeBridge<'_> {
     self.dax
   }
 
+  fn dax_state(&mut self) -> Option<crate::DaxState<'_>> {
+    let store = &mut *self.store;
+    Some(crate::DaxState {
+      backings: &mut store.shards_backings,
+      registry: &store.dax,
+    })
+  }
+
   fn cache_lifetime(&mut self, object: ObjectId, cx: &OpContext) -> CacheLifetime {
     // A live base source — an untouched base entry, a merged directory — may change beneath the
     // volume without a hint, so the kernel may hold its name and attributes only for the base

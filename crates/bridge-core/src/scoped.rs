@@ -453,6 +453,12 @@ impl Bridge for ScopedBridge<'_> {
     self.inner.dax_offer()
   }
 
+  fn dax_state(&mut self) -> Option<crate::DaxState<'_>> {
+    // The backings are the shard's store's, not this scope's. A backed session resolves every node it backs through
+    // this scope first (its ask's `getattr`), so lending them widens nothing a scoped guest reaches.
+    self.inner.dax_state()
+  }
+
   fn data_changes(
     &mut self,
     cx: &OpContext,

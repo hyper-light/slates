@@ -141,22 +141,13 @@ pub(crate) struct ShardsStream {
   /// Set when the attachment ends by anything but the stream (a detach, a revocation, a destroy): the task reads nothing
   /// more and ends it at its next turn.
   ending: bool,
-  /// The DAX backings of the files this attachment's guest maps, by inode (Shards part 3, [`dax`]).
-  backings: dax::Backings,
-  /// A descriptor ask being answered: its fill, a slice a turn, before anything more is read ([`dax::step`]).
-  pending: Option<dax::Pending>,
+  /// The backed DAX session of the files this attachment's guest maps (Shards part 3, [`dax`]): their backings, and the
+  /// fill, ingest and refill under way, each a slice a turn.
+  dax: slates_bridge_core::dax_backing::DaxBackingSession,
   /// The descriptor the owed reply carries by `SCM_RIGHTS` on its first byte: sent with it, then closed.
   owed_descriptor: Option<OwnedFd>,
-  /// An ingest under way: the guest's stores through its maps written back, a slice a turn, before the request that
-  /// asked for it is served or the stream ends ([`dax::ingest_step`]).
-  ingest: Option<dax::Ingest>,
   /// Whether the ingest a stream takes before it ends has been started: once, whatever ends it.
   ingested_at_end: bool,
-  /// A refill under way: the objects of backings the disk changed beneath copied again, a slice a turn, before anything
-  /// more reaches the guest ([`dax::refill_step`]).
-  refill: Option<dax::Refill>,
-  /// The store's count of stale marks when this stream last found none of its backings stale.
-  stale_seen: u64,
 }
 
 impl std::fmt::Debug for ShardsStream {
@@ -314,13 +305,9 @@ pub(crate) fn attach(s: &mut ShardState, ask: ShardsAsk) -> Result<ShardsAttache
       owed: 0,
       sent: 0,
       ending: false,
-      backings: dax::Backings::new(),
-      pending: None,
+      dax: slates_bridge_core::dax_backing::DaxBackingSession::new(),
       owed_descriptor: None,
-      ingest: None,
       ingested_at_end: false,
-      refill: None,
-      stale_seen: 0,
     },
   );
   if futures::spawn(serve(attachment))
@@ -670,7 +657,7 @@ fn turn(s: &mut ShardState, attachment: u64) -> Turned {
 /// answered, its reply out as far as the stream takes it.
 fn turn_with(s: &mut ShardState, stream: &mut ShardsStream) -> Turned {
   // An ending stream first writes back its guest's stores through its maps (step 3), once, then ends.
-  if stream.ending && stream.ingest.is_none() && !begin_end_ingest(s, stream) {
+  if stream.ending && !stream.dax.ingesting() && !begin_end_ingest(s, stream) {
     return Turned::Ended;
   }
   // A map the disk changed beneath is refilled before anything more reaches its guest (step 4): an owed reply that may
@@ -699,12 +686,12 @@ fn turn_with(s: &mut ShardState, stream: &mut ShardsStream) -> Turned {
     return Turned::Served;
   }
   // An ingest runs a slice a turn; when it is done, the request it held is served, or the stream ends.
-  if stream.ingest.is_some() {
+  if stream.dax.ingesting() {
     return ingest_turn(s, stream);
   }
   // A descriptor ask's fill runs a slice a turn, its answer owed when the last is done; nothing more is read meanwhile,
   // and the device sends nothing more, since it waits for that answer with its stream held.
-  if stream.pending.is_some() {
+  if stream.dax.filling() {
     dax::step(s, stream);
     return flush_unless_refill_owed(s, stream);
   }
@@ -1011,7 +998,7 @@ fn release_forgotten(
   total: usize,
   answered: &Answered,
 ) {
-  if stream.backings.is_empty() {
+  if stream.dax.is_empty() {
     return;
   }
   let mut forgotten = Vec::new();

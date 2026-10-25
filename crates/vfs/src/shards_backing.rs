@@ -28,9 +28,10 @@
 //! write-back never takes an outsider's change for the guest's. `rewitness` refuses a file mapped to write
 //! ([`ShardsBackings::mapped_writable`]).
 //!
-//! Bounded by the slab's capacity: the shard's chunk count, as the in-process DAX registry's. A backing counts at least
-//! one range against the server's fill budget, a range is longer than a chunk, and so the budget refuses long before the
-//! slab is full.
+//! Bounded by the slab's capacity: the shard's chunk count, as the in-process DAX registry's. The registry also keeps
+//! its fill budget ([`ShardsBackings::set_budget`]), which the server sets from the shard's content reserve: a backing
+//! counts a range for each range it has filled, and at least one. A range is longer than a chunk, so the budget refuses
+//! long before the slab is full. Until the budget is set it is zero, and nothing is backed.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -143,6 +144,10 @@ pub struct ShardsBackings {
   refused: u64,
   /// Backings marked stale, monotone: the non-vacuity counter of the overlay's refill.
   marked_stale: u64,
+  /// The bytes the backings count against the budget: a range for each range each has filled, at least one each.
+  charged: u64,
+  /// The most they may count: the shard's content reserve, set by the server ([`ShardsBackings::set_budget`]).
+  budget: u64,
 }
 
 impl std::fmt::Debug for ShardsBackings {
@@ -152,6 +157,8 @@ impl std::fmt::Debug for ShardsBackings {
       .field("written", &self.written)
       .field("refused", &self.refused)
       .field("marked_stale", &self.marked_stale)
+      .field("charged", &self.charged)
+      .field("budget", &self.budget)
       .finish()
   }
 }
@@ -167,7 +174,46 @@ impl ShardsBackings {
       written: 0,
       refused: 0,
       marked_stale: 0,
+      charged: 0,
+      budget: 0,
     }
+  }
+
+  /// Sets the most the backings may count against the budget, in bytes.
+  pub fn set_budget(&mut self, budget: u64) {
+    self.budget = budget;
+  }
+
+  /// The most the backings may count, in bytes.
+  #[must_use]
+  pub fn budget(&self) -> u64 {
+    self.budget
+  }
+
+  /// What the backings count now, in bytes.
+  #[must_use]
+  pub fn charged(&self) -> u64 {
+    self.charged
+  }
+
+  /// Counts `bytes` more against the budget, if it has room: whether it did. Refused, nothing is counted.
+  pub fn charge(&mut self, bytes: u64) -> bool {
+    match self
+      .charged
+      .checked_add(bytes)
+      .filter(|after| *after <= self.budget)
+    {
+      Some(after) => {
+        self.charged = after;
+        true
+      }
+      None => false,
+    }
+  }
+
+  /// Gives `bytes` back to the budget.
+  pub fn uncharge(&mut self, bytes: u64) {
+    self.charged = self.charged.saturating_sub(bytes);
   }
 
   /// Keeps `backing`; its handle. Refused at the registry's capacity.

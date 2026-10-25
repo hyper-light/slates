@@ -12,6 +12,8 @@ description = "The one transport-independent VFS operation layer (the Bridge tra
 slates-vfs = { workspace = true }
 slates-db = { workspace = true }
 slates-mem = { workspace = true }
+# The host's page, the unit a DAX backing's fill skips pages of zeros in (`src/dax_backing.rs`).
+rustix = { workspace = true }
 
 [dev-dependencies]
 # The dirty-page write-back walk's oracle (`src/changed.rs`): generated histories against a per-byte model.

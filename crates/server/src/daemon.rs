@@ -2999,6 +2999,11 @@ fn init_shard(
   // Inode numbers are handed out under a published reservation (A-150): set before recovery, so a rebuilt volume asks
   // for its top-up.
   store.inode_reserve = config.inode_reserve;
+  // The DAX backings' fill budget (A-163): the shard's content reserve, one copy of everything the shard can hold, the
+  // cost the design measured for a copy (slope 1.0 over mapped bytes). Set before any attachment can ask for a backing.
+  store
+    .shards_backings
+    .set_budget(u64::try_from(config.shard_content_layout().arena.1).unwrap_or(u64::MAX));
   // The metadata class (§4.2 metadata dimension): the slabs' maximum footprint comes off the top and
   // the remainder is the ledger every volume's records are reserved from; a layout whose slabs alone
   // exceed the class is refused here, before serving, rather than admitting records it cannot back.
@@ -3173,8 +3178,6 @@ fn init_shard(
     guest_devices: Vec::new(),
     #[cfg(unix)]
     shards_streams: std::collections::BTreeMap::new(),
-    #[cfg(unix)]
-    dax_filled: 0,
     #[cfg(unix)]
     stream_handoffs: std::collections::BTreeMap::new(),
     #[cfg(target_os = "macos")]

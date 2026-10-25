@@ -24,6 +24,8 @@ pub mod access;
 pub mod appledouble;
 pub mod authority;
 pub mod changed;
+#[cfg(unix)]
+pub mod dax_backing;
 pub mod links;
 pub mod scoped;
 pub mod volume_bridge;
@@ -204,6 +206,14 @@ pub enum DaxOffer {
     /// Whether files are marked now.
     new_files: bool,
   },
+}
+
+/// The store's parts a backed DAX session works with, lent by a bridge that has a store ([`Bridge::dax_state`]).
+pub struct DaxState<'a> {
+  /// The store's DAX backings, which the volume's write boundary writes every change of a backed file through.
+  pub backings: &'a mut slates_vfs::shards_backing::ShardsBackings,
+  /// The in-process DAX registry: a file a guest maps writable there cannot also be backed.
+  pub registry: &'a slates_vfs::dax::DaxRegistry,
 }
 
 /// One kernel cache entry a transport must drop or expire (§4.6 `notify`): the seam produces
@@ -658,6 +668,12 @@ pub trait Bridge {
   /// the Shards route's serve task.
   fn dax_offer(&mut self) -> DaxOffer {
     DaxOffer::Withheld
+  }
+
+  /// The store's DAX backings and its in-process DAX registry, lent to a backed DAX session (`dax_backing`) that a
+  /// transport drives over this bridge. `None` for a bridge with no store.
+  fn dax_state(&mut self) -> Option<DaxState<'_>> {
+    None
   }
 
   /// Makes file `object` ready for a guest to map writable from a copy of its own (Shards part 3, step 4; §4.6 DAX

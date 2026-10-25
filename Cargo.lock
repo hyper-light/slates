@@ -1324,6 +1324,7 @@ name = "slates-bridge-core"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "rustix",
  "slates-db",
  "slates-mem",
  "slates-test-seeds",
