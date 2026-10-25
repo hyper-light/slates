@@ -2903,8 +2903,9 @@ same-namespace host process is the first delivered case.
 > (each environment on each platform, by the mount route and the socket route) are proven, owed or ruled out by the
 > platform, is the matrix in `docs/wip/virtiofs.md` §8.
 > - **Proven:** a host process's shared map through the Linux FUSE mount; the same-kernel direct map on Linux x86_64
->   (A-135); crosvm over a slates mount (Linux x86_64); a Shards guest over the daemon's stream (macOS arm64, A-163);
->   Firecracker by virtio-pmem over the image file through a slates mount (Linux x86_64, A-165).
+>   (A-135); crosvm over a slates mount (Linux x86_64); crosvm over slates' own device (Linux x86_64, A-168 and A-169,
+>   2026-10-25); a Shards guest over the daemon's stream (macOS arm64, A-163); Firecracker by virtio-pmem over the
+>   image file through a slates mount (Linux x86_64, A-165). Six cells.
 > - **Ruled out by the platforms:** QEMU's vhost-user-fs and Cloud Hypervisor have no DAX window, so neither has Kata;
 >   crosvm's window is x86_64-only; Apple's Virtualization framework and WSL2 document none (unconfirmed).
 > - **Owed:** every other cell, each to a named goal.
@@ -3189,8 +3190,10 @@ same-namespace host process is the first delivered case.
 > pass. Proven by eleven hermetic tests against a stand-in front end that maps what SHMEM_MAP sends
 > (`crates/bridge-virtiofs/tests/device.rs`) and two unit tests of the module's parsers, on Linux x86_64; the pre-fix
 > code fails the same checks (stale bytes, then the window torn), and eight mutations each fail their own test. The descriptor a VMM gets authorizes one file's bytes by
-> construction, so the `udmabuf` confinement (A-138) is gone with its device dependency. The real crosvm guest's proof
-> is goal G-vhost's step 3.
+> construction, so the `udmabuf` confinement (A-138) is gone with its device dependency. **Proven through a real
+> crosvm guest the same day** (G-vhost step 3, A-169's last bullet): `crates/cli/tests/guest_vhost.rs` boots crosvm
+> through `slates vhost-user` and holds the guest's map and the volume to a model byte for byte, 3 of 3 on the box. The
+> device adds what its windows do to the owner's status counters while it runs (`virtiofs.dax_*`, A-168).
 
 > **Status (DAX: live vhost-user binding, inline files, and the at-rest-sealing limit, 2026-10-16).** The device-seam
 > wiring above is now proven against a *real* VMM, inline files map, and the file-shape scope with its one hard limit
@@ -12172,6 +12175,27 @@ dispatch; `shards.rs` the end handoff shared), `crates/client` (`attach_vhost_us
 - **Also repaired (CI red on 1d86208e):** `DaemonConfig::copy_slice_page_bytes` takes the profile's base page
   (`DaemonConfig::page`) rather than rustix, which the server does not link on Windows; and the backed module's own
   doc is its only doc, so its intra-doc link resolves on Linux, the only platform that builds it.
+- **Proven through a real guest (G-vhost step 3, 2026-10-25):** `crates/cli/tests/guest_vhost.rs`, gated like
+  `guest_dax.rs`. `slates vhost-user SESSION --dax-window 8MiB -- crosvm run --vhost-user type=fs,socket={socket} ...`
+  boots a guest whose probe mounts the tag `dax=always` and maps a file of a session (a clone of a snapshot of an
+  origin; a guest's writes land in the session itself, so nothing is merged after). Each check holds the guest's map
+  (read as memory alone) and the session (read through slates) to a model of the design's rules, byte for byte:
+  - another path's change is in the map the moment its writer is answered: a `slates mount` write across a page, the
+    SDK's whole-file write, a growth past the end the guest knows on its last page, zeros over a cut (where the mount
+    route's guest hangs: virtiofs.md §8 item 7), and a growth past the last page once the guest maps again;
+  - the guest's stores reach the session at its `msync` and at its close without one; a store past the file's end
+    never does, and a later extension over it zeroes it in the session and in the guest's map (POSIX.1-2024 `mmap`:
+    "the system shall never write out any modified portions of the last page of an object which are beyond its end");
+  - the origin keeps its own bytes, and its later write never reaches the session's map (A-166);
+  - generated histories (three fixed seeds, 80 steps each) mix all of it: 73 stores, 11 of them past the end, 16
+    syncs, 52 mount writes opening 14 holes, 16 SDK writes, 12 size changes, 30 new maps and 44 checks.
+
+  Green 3 of 3 on adacachy (host and guest Linux 7.2.9-2-cachyos, crosvm 1c8d17a85) in a capped user unit, 1.63–4.79 s
+  a run at load 24–140; the histories' device counted one map sent, one upgrade answered with no message, 123 requests
+  held for ingests and 51 to 58 runs ingested across the rounds. Red-checked from a scratch copy, each mutation failing at its own check: no write-through (the map as the
+  mount's write is answered holds the seed); no ingest (the session by the sync's answer lacks the store); no window
+  (the guest's `dax=always` mount refused: `mount virtiofs tag slates at /mnt: Invalid argument (os error 22)`). The
+  red-check also found the probe cutting its last reply short, fixed (`docs/bugs/2026-10-25-the-guest-probes-last-reply-was-cut-short.md`).
 
 ### A-168 — Slates' own virtio-fs device maps per-file backings for an out-of-process VMM (accepted 2026-10-25)
 Applied in the same change to: §4.6 (a status block before the 2026-10-16 record), `crates/bridge-virtiofs`
@@ -12198,6 +12222,14 @@ Applied in the same change to: §4.6 (a status block before the 2026-10-16 recor
   DESTROY) is held, unserved, while they are written back, published before its reply, and answered the write-back's
   refusal where its asker reads one. The serve loop ingests every writable backing after its last pass and before the
   terminal step, waiting out a fence, and lets the backings go only then.
+- **Counted in the owner's status** (added 2026-10-25 with G-vhost step 3): after every pass, and once after the
+  terminal step, the serve loop adds what each count moved to the owner's status counters (`BridgeAccess::count`), so
+  `slates status` shows a guest's use of its window while the device runs: `virtiofs.dax_maps_sent`, `_maps_kept` (a
+  SETUPMAPPING answered with no message), `_unmaps_sent`, `_unmaps_refused`, `_ingests_held`, `_replies_held`,
+  `_backings_released`, `_asks_answered`, `_runs_ingested`, `_ingest_refused`, `_refilled`, `_refill_refused`,
+  `_refill_writable` (`backed.rs` `BackedCounts::named`). They are the real guest test's non-vacuity witnesses, and the
+  stand-in route test holds their exact values (one map, one upgrade with no message, one held FSYNC, one run, one
+  backing let go); removing the report fails it at the first.
 - **Beneath an overlay** a reply that could reveal the disk's change (the base plane marked a backing stale while
   serving it) is held until the backing is refilled. A snapshot device's advance marks its backings stale, so each is
   refilled from the new view; no window is torn.

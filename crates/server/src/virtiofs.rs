@@ -250,6 +250,12 @@ impl BridgeAccess for ShardBridge {
       .unwrap_or(false)
       .then_some(crate::daemon::HEARTBEAT_NS)
   }
+
+  /// Adds to the owner's status counters (the ledger `slates status` prints). Out of reach, the owner's state is gone
+  /// with its counters, so there is nothing to add to.
+  fn count(&mut self, name: &'static str, by: u64) {
+    let _counted = state::with_state(|s| s.count(name, by));
+  }
 }
 
 /// Format: the refusal-ledger name of a refused device's terminal step whose sweep could not run.

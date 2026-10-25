@@ -11032,7 +11032,9 @@ without a user namespace, which needs root.
   KVM's asynchronous fault ignores the host's failed fault and tells the guest to retry, forever. Vivek Goyal reported
   this case for virtio-fs DAX in 2020 (LKML, 2020-03-31), and it is unchanged on 7.2.9. slates refuses nothing,
   because POSIX allows truncating an open file. The rule for users: do not shrink a file a guest maps while the guest
-  may touch the cut range.
+  may touch the cut range. **Not so for slates' own device** (the socket route, A-168): its window maps a backing whose
+  size never changes, and a cut zeroes the cut range in it, so the guest reads zeros there; shown by a real guest on
+  2026-10-25 (`guest_vhost.rs`, G-vhost step 3).
 - **crosvm offers DAX on x86_64 only** (`cfg!(target_arch = "x86_64")`, TODO b/176129399, at 1c8d17a85). On an arm64
   host the mount route under crosvm runs without DAX.
 
@@ -11272,15 +11274,48 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     mount makes it clean, and adds a `lost+found` (root's, mode 0700) that the merge takes as a new directory. Recorded,
     not changed: e2fsck puts any orphans it recovers there, so the merge must not drop it. `docs/cli.md` says so.
   - **Owed:** the arm64 guest's pmem DAX (Firecracker's doc covers aarch64, with `CONFIG_ARM64_PMEM`): G-arm64-guest.
+- **Proven 2026-10-25 (G-vhost step 3): a real crosvm guest maps a session's file through slates' own device with
+  DAX.** `crates/cli/tests/guest_vhost.rs`, gated like `guest_dax.rs` (the box: KVM, crosvm 1c8d17a85, host and guest
+  Linux 7.2.9-2-cachyos). `slates vhost-user SESSION --dax-window 8MiB -- crosvm run --vhost-user
+  type=fs,socket={socket} ...`; the guest's probe mounts the tag `dax=always`. The session is a clone of a snapshot of
+  an origin: a guest's writes land in it directly, so no merge follows (the image route merges; this one need not).
+  Each check holds the guest's map, read as memory alone, and the session, read through slates, to a model, byte for
+  byte:
+  - another path's change shows in the map the moment its writer is answered, with no request of the guest's: a
+    `slates mount` write, the SDK's whole-file write, a growth past the end the guest knows, zeros over a cut (where
+    the mount route's guest hangs: "a stated limit of DAX under KVM", above), and a growth past the last page once the
+    guest maps again;
+  - the guest's stores reach the session at its `msync` and at its close without one; a store past the file's end
+    never does, and a later extension over it zeroes it in the session and in the guest's own map (POSIX.1-2024
+    `mmap`: "the system shall never write out any modified portions of the last page of an object which are beyond
+    its end");
+  - the origin keeps its own bytes, and its later write never reaches the session's map (A-166, by use);
+  - three generated histories of 80 steps mix it all (73 stores, 11 past the end; 52 mount writes opening 14 holes; 16
+    SDK writes; 12 size changes; 30 new maps; 44 checks).
+
+  **Green 3 of 3** (`cargo test -p slates-cli --test guest_vhost` in a `systemd --user` unit: `MemoryMax=20G`,
+  `CPUWeight=1`, `Nice=19`, the nvme IO caps; 1.63–4.79 s a run at load 24–140; one round before them, on the draft
+  that neither printed the counters nor drained the probe's console, passed too). **Red-checked** from a scratch copy
+  with its own target, each mutation failing at its own check: no write-through (the map as the mount's write is
+  answered holds the seed); no ingest (the session by the sync's answer lacks the guest's store); no window (the
+  guest's `dax=always` mount is refused). **Non-vacuity:** the device now adds its backed DAX counts to the owner's
+  status as it runs (`virtiofs.dax_*`, A-168); the histories counted one map sent, one upgrade answered with no message,
+  123 requests held for ingests, 51 to 58 runs ingested across the rounds, and the backing let go at the end. The stand-in route test holds
+  the counts' exact values; without the report it fails at the first.
+- **Fixed 2026-10-25: the guest probe cut its last reply short.** Found by the no-window red-check: the probe's fatal
+  reply arrived as `"mount virtiofs tag slates at /mn"`. The probe powered the VM off once the tty held its bytes, not
+  once the serial port had sent them. It now drains the console first (`tcdrain`); the same red-check then showed the
+  whole reply, `... at /mnt: Invalid argument (os error 22)`, and `guest_dax.rs` (3 of 3) and `guest_image.rs` (4 of 4)
+  pass with it. `docs/bugs/2026-10-25-the-guest-probes-last-reply-was-cut-short.md`.
 - **Built 2026-10-25 (A-169): an out-of-process VMM attaches slates' own virtio-fs device by the attach verb.**
   `AttachRequest::VhostUserFs` hands the client the device's socket end over its control socket; `slates vhost-user ID
   -- VMM ... {socket} ...` runs the VMM with it as `/proc/self/fd/N`. Linux only; elsewhere refused `BindingNotBuilt`.
   Proven by use with a stand-in front end on both shards, its refusals typed with nothing left behind, the whole DAX
   route through the daemon's real serve loop (map, another path's write in the window, the writable upgrade, the
-  guest's store at FSYNC), and the CLI with a real anchor. **Owed:** a real crosvm guest through the verb (G-vhost
-  step 3) and the VM and daemon kills (step 4).
-- **Fixed in the device 2026-10-25 (A-168); the real guest's proof is owed to G-vhost's step 3: slates' own DAX window
-  showed stale bytes, then zeros, after another path's write.**
+  guest's store at FSYNC), and the CLI with a real anchor; and through a real crosvm guest (G-vhost step 3, the entry
+  above). **Owed:** the VM and daemon kills (step 4).
+- **Fixed in the device 2026-10-25 (A-168), and proven through a real crosvm guest the same day (G-vhost step 3,
+  above): slates' own DAX window showed stale bytes, then zeros, after another path's write.**
   `docs/bugs/2026-10-24-slates-own-dax-window-shows-stale-bytes-then-zeros-after-another-paths-write.md`.
   - Found by a real crosvm run (2026-10-24): `A` for 40 s after an SDK write of `B`, then, once a guest request drove a
     pass, SHMEM_UNMAP left crosvm's zero pages and the map and `pread` read 0.

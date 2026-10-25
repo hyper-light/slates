@@ -248,6 +248,10 @@ impl BridgeAccess for OwnedVolume {
     self.barriers += 1;
     true
   }
+
+  /// These loops serve no backed DAX, so nothing is counted; the daemon's status test holds the counts by use
+  /// (`crates/server/tests/virtiofs.rs`).
+  fn count(&mut self, _name: &'static str, _by: u64) {}
 }
 
 fn credits() -> AttachmentCredits {

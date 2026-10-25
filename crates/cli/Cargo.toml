@@ -51,6 +51,11 @@ windows-sys = { workspace = true }
 # on Linux and macOS.
 slates-bridge-fuse = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# The names of the status counters slates' own virtio-fs device adds while a guest uses its DAX window, which the real
+# guest test holds non-vacuous (`tests/guest_vhost.rs`, A-168).
+slates-bridge-virtiofs = { workspace = true }
+
 [dev-dependencies]
 # The archive's codec decision, so the codec gate can ask the policy the daemon derived what it
 # would actually do with a compressible chunk rather than stopping at "a candidate exists".

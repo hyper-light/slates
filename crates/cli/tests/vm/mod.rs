@@ -1,6 +1,7 @@
-//! The harness the real-VM tests share (`tests/guest_dax.rs`, `tests/guest_image.rs`): an anchor and its daemon,
-//! volumes and their mounts, the guest's initramfs in the `newc` cpio format, and the VM, driven over its serial
-//! console with `slates-guest-probe`'s line protocol. A test names its VMM's command line; everything else is here.
+//! The harness the real-VM tests share (`tests/guest_dax.rs`, `tests/guest_image.rs`, `tests/guest_vhost.rs`): an
+//! anchor and its daemon, volumes and their mounts, the guest's initramfs in the `newc` cpio format, and the VM, driven
+//! over its serial console with `slates-guest-probe`'s line protocol. A test names its VMM's command line; everything
+//! else is here.
 //! Every mount point is in the build output, named with the process id and removed at the end, so the tests write
 //! nothing to disk but those.
 // Each test binary uses part of the harness.
@@ -352,6 +353,14 @@ impl Guest {
   /// Starts the VM `vmm` describes, in a process group of its own with its serial console on its standard streams, and
   /// waits until the guest says it is ready. `what` names the VMM in its stderr's lines; `most_bytes` bounds a read.
   pub(crate) fn spawn(vmm: &mut Command, what: &'static str, most_bytes: usize) -> Guest {
+    let (guest, first) = Guest::start(vmm, what, most_bytes);
+    assert_eq!(first, Reply::Ready, "{}", guest.transcript());
+    guest
+  }
+
+  /// Starts the VM as [`Guest::spawn`] does, and leaves its first reply to the caller: [`Reply::Ready`] once the guest
+  /// has mounted what it shares, else why it could not.
+  pub(crate) fn start(vmm: &mut Command, what: &'static str, most_bytes: usize) -> (Guest, Reply) {
     let mut vm = vmm
       .stdin(Stdio::piped())
       .stdout(Stdio::piped())
@@ -372,9 +381,8 @@ impl Guest {
       transcript: std::collections::VecDeque::new(),
       most_bytes,
     };
-    let ready = guest.next_reply(BOOT_WAIT);
-    assert_eq!(ready, Reply::Ready, "{}", guest.transcript());
-    guest
+    let first = guest.next_reply(BOOT_WAIT);
+    (guest, first)
   }
 
   fn keep(&mut self, line: String) {

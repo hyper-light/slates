@@ -120,7 +120,55 @@ pub struct BackedCounts {
   pub session: Counts,
 }
 
+/// Format: the owner's status counter of maps sent to the front end ([`BackedCounts::maps_sent`]).
+pub const MAPS_SENT: &str = "virtiofs.dax_maps_sent";
+/// Format: the owner's status counter of SETUPMAPPINGs answered with no message ([`BackedCounts::maps_kept`]).
+pub const MAPS_KEPT: &str = "virtiofs.dax_maps_kept";
+/// Format: the owner's status counter of unmaps sent to the front end ([`BackedCounts::unmaps_sent`]).
+pub const UNMAPS_SENT: &str = "virtiofs.dax_unmaps_sent";
+/// Format: the owner's status counter of unmaps the front end refused ([`BackedCounts::unmaps_refused`]).
+pub const UNMAPS_REFUSED: &str = "virtiofs.dax_unmaps_refused";
+/// Format: the owner's status counter of requests held for an ingest ([`BackedCounts::ingests_held`]).
+pub const INGESTS_HELD: &str = "virtiofs.dax_ingests_held";
+/// Format: the owner's status counter of replies held for a refill ([`BackedCounts::replies_held`]).
+pub const REPLIES_HELD: &str = "virtiofs.dax_replies_held";
+/// Format: the owner's status counter of backings let go ([`BackedCounts::released`]).
+pub const RELEASED: &str = "virtiofs.dax_backings_released";
+/// Format: the owner's status counter of asks answered with a descriptor ([`Counts::answered`]).
+pub const ANSWERED: &str = "virtiofs.dax_asks_answered";
+/// Format: the owner's status counter of runs of the guest's stores an ingest wrote into the volume
+/// ([`Counts::ingested`]).
+pub const INGESTED: &str = "virtiofs.dax_runs_ingested";
+/// Format: the owner's status counter of files whose write-back the volume refused ([`Counts::ingest_refused`]).
+pub const INGEST_REFUSED: &str = "virtiofs.dax_ingest_refused";
+/// Format: the owner's status counter of backings refilled after the disk changed their file ([`Counts::refilled`]).
+pub const REFILLED: &str = "virtiofs.dax_refilled";
+/// Format: the owner's status counter of ranges a refill could not read ([`Counts::refill_refused`]).
+pub const REFILL_REFUSED: &str = "virtiofs.dax_refill_refused";
+/// Format: the owner's status counter of writable ranges a refill passed over ([`Counts::refill_writable`]).
+pub const REFILL_WRITABLE: &str = "virtiofs.dax_refill_writable";
+
 impl BackedCounts {
+  /// Every count with the name of the owner's status counter it adds to, in one order, so the serve loop can add what
+  /// moved since its last report while the device runs (`serve.rs`).
+  pub fn named(&self) -> [(&'static str, u64); 13] {
+    [
+      (MAPS_SENT, self.maps_sent),
+      (MAPS_KEPT, self.maps_kept),
+      (UNMAPS_SENT, self.unmaps_sent),
+      (UNMAPS_REFUSED, self.unmaps_refused),
+      (INGESTS_HELD, self.ingests_held),
+      (REPLIES_HELD, self.replies_held),
+      (RELEASED, self.released),
+      (ANSWERED, self.session.answered),
+      (INGESTED, self.session.ingested),
+      (INGEST_REFUSED, self.session.ingest_refused),
+      (REFILLED, self.session.refilled),
+      (REFILL_REFUSED, self.session.refill_refused),
+      (REFILL_WRITABLE, self.session.refill_writable),
+    ]
+  }
+
   /// Adds the session's counts since it was last asked.
   pub(crate) fn add_session(&mut self, counts: Counts) {
     let summed = &mut self.session;

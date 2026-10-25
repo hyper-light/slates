@@ -464,6 +464,12 @@ fn now_micros() -> u64 {
 
 /// Syncs and ends the VM as `end` says. If the kernel refuses, the guest parks for good rather than return.
 fn power_off(end: End) -> ! {
+  // Every byte said reaches the host before the VM ends. A write returns once the tty holds the bytes, not once the
+  // serial port has sent them, and the VM's end drops what the port still holds: a fatal reply arrived cut short
+  // ("mount virtiofs tag slates at /mn", 2026-10-25).
+  if let Err(undrained) = rustix::termios::tcdrain(std::io::stdout()) {
+    eprintln!("slates-guest-probe: the console did not drain: {undrained}");
+  }
   rustix::fs::sync();
   let command = match end {
     End::PowerOff => RebootCommand::PowerOff,

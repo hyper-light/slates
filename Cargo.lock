@@ -1425,6 +1425,7 @@ dependencies = [
  "slates-bridge-fuse",
  "slates-bridge-nfs",
  "slates-bridge-oci",
+ "slates-bridge-virtiofs",
  "slates-client",
  "slates-db",
  "slates-guest-probe",

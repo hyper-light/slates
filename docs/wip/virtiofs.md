@@ -275,7 +275,7 @@ box shared with two other builds — timings are not benchmarks)
 
    | VMM, platform | mount route | socket route (slates' own device) |
    |---|---|---|
-   | crosvm, Linux x86_64 | proven: `crates/cli/tests/guest_dax.rs` (4 of 4 on the box, gated) | owed: G-vhost |
+   | crosvm, Linux x86_64 | proven: `crates/cli/tests/guest_dax.rs` (4 of 4 on the box, gated) | proven: `crates/cli/tests/guest_vhost.rs` (3 of 3 on the box, gated; G-vhost step 3) |
    | crosvm, Linux arm64 | impossible: crosvm offers DAX on x86_64 only (GAPS, 2026-10-22) | impossible: the same window |
    | QEMU, and Kata on QEMU, any platform | impossible: upstream `hw/virtio/vhost-user-fs.c` has no window property | impossible: the window is the front end's to offer |
    | Cloud Hypervisor, and Kata on it | impossible: "it is not available in Cloud Hypervisor" (its `docs/fs.md`) | impossible: the same |
@@ -494,7 +494,8 @@ box shared with two other builds — timings are not benchmarks)
    returns (A-163), and since 2026-10-25 slates' own device does the same for an out-of-process VMM over vhost-user
    (A-168): a VM's window holds what it mapped for as long as it holds it, so nothing else can keep it right. A cut
    through another path zeroes the cut range in the copy, whose size never changes, so a guest touching it reads zeros
-   rather than the hang the mount route meets below (to be shown by a real guest in G-vhost). A descriptor authorizes its whole object, so slates' own content, every volume's, cannot be handed
+   rather than the hang the mount route meets below, as a real crosvm guest showed (`crates/cli/tests/guest_vhost.rs`,
+   2026-10-25). A descriptor authorizes its whole object, so slates' own content, every volume's, cannot be handed
    to another process. It is not needed for any target to
    work: the mount serves every one. Two designs for it were written and withdrawn on 2026-10-21: handing slates a
    socket from the launcher (which had no answer on macOS), then a slates-owned listener (Ada asked why another

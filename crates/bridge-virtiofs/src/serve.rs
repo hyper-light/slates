@@ -280,6 +280,10 @@ pub trait BridgeAccess {
   /// owner's copy slice in whole pages (half the live step quantum at the measured memcpy rate), at least one page.
   /// Asked each pass, since the step quantum is live.
   fn copy_slice_bytes(&mut self) -> u64;
+
+  /// Adds `by` to the owner's status counter `name`: what the device's backed DAX did since the loop last reported it
+  /// (`BackedCounts::named`, Linux), so a guest's use of its window shows while the device runs.
+  fn count(&mut self, name: &'static str, by: u64);
 }
 
 /// Why the loop ended.
@@ -354,6 +358,8 @@ async fn serve_until_idle<S: VmmSeam, B: BridgeAccess>(
         if let Some(reason) = drive_dax_acks(admitted, bridge).await {
           return Some(reason);
         }
+        #[cfg(target_os = "linux")]
+        report_dax_counts(admitted, bridge, counters);
         if more {
           futures::yield_now().await;
         } else {
@@ -495,6 +501,27 @@ struct LoopCounters {
   wakes: u64,
   passes: u64,
   fenced_waits: u64,
+  /// The device's backed DAX counts as the loop last added them to the owner's status counters.
+  #[cfg(target_os = "linux")]
+  dax_reported: crate::backed::BackedCounts,
+}
+
+/// Adds what the device's backed DAX did since the loop's last report to the owner's status counters (A-168): after
+/// every pass, and once more after the terminal step, so its end ingest and its releases count too.
+#[cfg(target_os = "linux")]
+fn report_dax_counts<S: VmmSeam, B: BridgeAccess>(
+  admitted: &AdmittedDevice<S>,
+  bridge: &mut B,
+  counters: &mut LoopCounters,
+) {
+  let now = admitted.device().dax_backed_counts();
+  for ((name, total), (_, reported)) in now.named().into_iter().zip(counters.dax_reported.named()) {
+    let moved = total.saturating_sub(reported);
+    if moved > 0 {
+      bridge.count(name, moved);
+    }
+  }
+  counters.dax_reported = now;
 }
 
 /// One wait on the doorbell and the service it triggers; `Some(reason)` when the loop must end.
@@ -574,6 +601,8 @@ pub async fn serve_loop<S: VmmSeam, B: BridgeAccess>(
         .unwrap_or(Err(ReclaimError::Authority(gone)))
     }
   };
+  #[cfg(target_os = "linux")]
+  report_dax_counts(&admitted, &mut bridge, &mut counters);
   unregister(id);
   ServeEnd {
     why,

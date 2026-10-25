@@ -1189,6 +1189,7 @@ fn a_vhost_user_front_end_that_offers_unsealed_memory_or_leaves_is_refused() {
 /// plays the VMM's front end over that end. Linux only, where vhost-user is built.
 #[cfg(target_os = "linux")]
 mod vhost_form {
+  use slates_bridge_virtiofs::backed;
   use slates_client::{
     Client as Typed, ClientError, CreateSpec, Deadlines, Intent, ReadAt, Refusal, VolumeId,
   };
@@ -1488,7 +1489,8 @@ mod vhost_form {
   /// and FSYNC; close the front end. Expect: the SETUPMAPPING answered only after the ack, the window showing the file;
   /// the rewrite in the window with no guest request, the old tail zero; the upgrade answered with no message to the
   /// front end; the guest's store in the volume by the FSYNC's answer; the device's attachment gone once its end
-  /// closes.
+  /// closes. The daemon's status counters show each step while the device runs (a map sent, the upgrade answered with
+  /// no message, the FSYNC held for its ingest, a run ingested), and its backing let go once it ends.
   #[test]
   fn a_guests_dax_window_shows_another_paths_write_and_its_store_reaches_the_volume_at_fsync() {
     let (daemon, mut client) = daemon_and_client("vhost-dax");
@@ -1556,13 +1558,40 @@ mod vhost_form {
       b"STOREer path".to_vec(),
       "the guest's store is in the volume by the FSYNC's answer"
     );
+    for (name, what) in [
+      (backed::MAPS_SENT, "the map sent to the front end"),
+      (backed::MAPS_KEPT, "the upgrade answered with no message"),
+      (backed::INGESTS_HELD, "the FSYNC held for its ingest"),
+      (backed::INGESTED, "the guest's store ingested"),
+    ] {
+      assert_eq!(
+        counted(&daemon, name),
+        1,
+        "{what} shows in the daemon's status while the device runs ({name})"
+      );
+    }
     drop(window);
     drop(front);
     drop(backend);
     client.detach(own).unwrap();
     wait_for_attachments(&mut client, volume, 0);
+    assert_eq!(
+      counted(&daemon, backed::RELEASED),
+      1,
+      "the file's backing is let go when the device ends"
+    );
     drop(client);
     drop(daemon);
+  }
+
+  /// The daemon's status counter `name`, summed over its shards.
+  fn counted(daemon: &Daemon, name: &str) -> u64 {
+    daemon
+      .refusals_on_every_shard()
+      .unwrap()
+      .get(name)
+      .copied()
+      .unwrap_or(0)
   }
 
   /// A second client bound to a consumer the human surface enrolled under this process's account, with whom the owner
