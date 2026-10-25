@@ -1,8 +1,9 @@
 # A guest's DAX window onto slates' own device shows stale bytes, then zeros, after another path's write (§4.6, A-9)
 
 - **Date:** 2026-10-24
-- **Status:** fixed in the device 2026-10-25 (A-168), proven by hermetic tests against a stand-in front end; the
-  real crosvm guest's proof is goal G-vhost's step 3.
+- **Status:** fixed in the device 2026-10-25 (A-168), proven by hermetic tests against a stand-in front end and the
+  same day through a real crosvm guest (`crates/cli/tests/guest_vhost.rs`: another path's write in the map as its
+  writer is answered, 3 of 3 on the box; red-checked without write-through).
 - **Subsystem:** the DAX revoke of slates' own virtio-fs device over vhost-user:
   - `crates/vfs/src/dax.rs`, the registry's step-5 queue (`take_pending_revokes`);
   - `crates/bridge-virtiofs/src/admission.rs`, the drain at the end of a service pass;

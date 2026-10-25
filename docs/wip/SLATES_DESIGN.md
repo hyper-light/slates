@@ -3195,7 +3195,9 @@ same-namespace host process is the first delivered case.
 > construction, so the `udmabuf` confinement (A-138) is gone with its device dependency. **Proven through a real
 > crosvm guest the same day** (G-vhost step 3, A-169's last bullet): `crates/cli/tests/guest_vhost.rs` boots crosvm
 > through `slates vhost-user` and holds the guest's map and the volume to a model byte for byte, 3 of 3 on the box. The
-> device adds what its windows do to the owner's status counters while it runs (`virtiofs.dax_*`, A-168).
+> device adds what its windows do to the owner's status counters while it runs (`virtiofs.dax_*`, A-168). Killed under
+> the live map (step 4): a dead VM's unsynced stores land at the stream's end, and the daemon's death ends the VM with
+> nothing synced lost; the daemon kill found A-170.
 
 > **Status (DAX: live vhost-user binding, inline files, and the at-rest-sealing limit, 2026-10-16).** The device-seam
 > wiring above is now proven against a *real* VMM, inline files map, and the file-shape scope with its one hard limit
@@ -12262,6 +12264,18 @@ Applied in the same change to: §4.6 (a status block before the 2026-10-16 recor
   - writing in place into the mapped block fails because content moves (an open block that grows is copied to a larger
     one, an idle one is sealed) and one block never covers a guest's 2 MiB range;
   - a revoke-and-refault never refaults: a Linux guest keeps its mapped ranges and never asks again.
+- **The price of giving up zero copy.** The content-block window mapped slates' own bytes. A backed window maps a copy,
+  so:
+  - the file's bytes in every range a guest maps are copied once from the volume, a copy slice a turn, and nothing past
+    its end: a full 2 MiB range at the box's measured memcpy rate (the daemon's boot profile on adacachy, 2026-10-25:
+    19,337,055,392 and 11,966,135,495 bytes a second in two runs) is about 110 to 175 µs, in slices of 31,045 to
+    44,340 bytes;
+  - its bytes are resident twice while the guest maps them, once in the volume and once in the backing, bounded by the
+    shard's fill budget;
+  - every write is copied again into each backing that maps its range, before it returns;
+  - each ingest compares the ranges asked writable with the volume and writes back only the runs that differ.
+
+  It buys a window that never moves under a guest that never re-asks, with no message on any other path's change.
 - **Writable at the front end.** Every window is mapped writable when the attachment may write. A guest's upgrade of a
   read-only range is a SETUPMAPPING over the live window (`fuse_upgrade_dax_mapping`); it is answered with no message.
   The guest's page tables keep read-only mappings read-only, and an ingest compares only ranges asked writable.
@@ -12288,8 +12302,8 @@ Applied in the same change to: §4.6 (a status block before the 2026-10-16 recor
   hole it will not re-ask for, so before an in-process VMM ships it takes the backed route or is retired (GAPS).
 - **Proven** on Linux x86_64 (fedora, 2026-10-25) by eleven hermetic tests in `crates/bridge-virtiofs/tests/device.rs`
   against a stand-in front end that maps what SHMEM_MAP sends, and two unit tests in `backed.rs`. The rest of the
-  crate's suites, the server's virtiofs, shards and attach-form suites, and Linux clippy pass. The real crosvm guest is
-  G-vhost's step 3.
+  crate's suites, the server's virtiofs, shards and attach-form suites, and Linux clippy pass. A real crosvm guest
+  proved it the same day, killed under its live map included (A-169's last two bullets).
 - **Red-checked.**
   - The pre-fix code (411c243d, on adacachy with `/dev/udmabuf`) ran the coherence checks in the old API: its map
     covered 4,096 of the 2,097,152 bytes asked; a write after the file outgrew its block was not in the map
