@@ -6,9 +6,10 @@
 //! shared mapping of a content block's descriptor (`MAP_FIXED`). A REMOVEMAPPING — and the teardown half of a revoke —
 //! restores the inert reservation, so a guest's stale page table reaches a faulting hole, never a reused block. The
 //! block's descriptor is the content arena's shared object and the block is **pinned by the gate** while mapped
-//! ([`slates_vfs::dax`]), so its pages are stable. A message-based VMM (QEMU's vhost-user SHMEM_MAP) drives the same
-//! gate verbs over the wire instead; this module is the fd-sharing path a VMM like crosvm/libkrun uses, and the one the
-//! sim exercises end to end without a VMM.
+//! ([`slates_vfs::dax`]), so its pages are stable. This module is the fd-sharing path an in-process VMM (libkrun) uses,
+//! and the one the sim exercises end to end without a VMM. An out-of-process VMM (crosvm, over vhost-user SHMEM_MAP)
+//! maps per-file backings instead, which the write boundary keeps equal to the file, since nothing may change what its
+//! window maps while the guest holds it (`crate::backed`, Linux).
 //!
 //! Unix only (the DAX window is a Linux/vhost-user feature; the primitive is exercised on macOS over an `shm` object).
 #![cfg(unix)]
@@ -223,18 +224,16 @@ impl DaxCacheRegion {
 pub enum DaxPlacer {
   /// An **in-process / fd-sharing** VMM (libkrun, and the sim): the VMM shared the cache window as a memory object, so
   /// the device reserved it whole and overlays each content block itself with `MAP_FIXED` ([`DaxCacheRegion`]). A map
-  /// and an unmap complete synchronously on the placing call — there is no separate front-end process to await. The
-  /// **message-based** sibling (an out-of-process crosvm/QEMU/cloud-hypervisor, where the device sends
-  /// `VHOST_USER_BACKEND_SHMEM_MAP` over the back-end-request channel and the front end maps the block into the guest's
-  /// BAR, completing on the front end's acknowledgement) is added next (Piece C).
+  /// and an unmap complete synchronously on the placing call — there is no separate front-end process to await.
   Local(DaxCacheRegion),
-  /// An **out-of-process / message-based** VMM (crosvm, QEMU, cloud-hypervisor): the back end does not own the
-  /// window; it asks the front end to place each content block over the back-end-request channel and awaits the
-  /// reply-ack ([`crate::vhost_user::MessagePlacer`]). A SETUPMAPPING's guest reply waits for the front end's
-  /// map-ack (so the guest never faults an unmapped page); a teardown's unpin waits for the unmap-ack (§4.6 #1).
-  /// Linux only (the back-end-request channel is a Linux/vhost-user feature).
+  /// An **out-of-process / message-based** VMM (crosvm): the back end does not own the window; it asks the front end
+  /// to map a file's backing over the back-end-request channel and awaits the reply-ack
+  /// ([`crate::vhost_user::MessagePlacer`]). A SETUPMAPPING's guest reply waits for the backing's fill and the front
+  /// end's map-ack, so the guest never reads an unmapped page. A window maps the file's backing, never content, since
+  /// nothing may change what such a window maps while the guest holds it ([`crate::backed`]). Linux only (the
+  /// back-end-request channel is a Linux/vhost-user feature).
   #[cfg(target_os = "linux")]
-  Message(crate::vhost_user::MessagePlacer<crate::device::DaxWindowEntry>),
+  Message(crate::vhost_user::MessagePlacer<crate::backed::BackedWindow>),
 }
 
 impl DaxPlacer {

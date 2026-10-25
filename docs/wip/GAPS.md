@@ -753,6 +753,11 @@ pushed.
 
 ### 8a-dax-confine. The DAX window confinement's refusal had no test (2026-10-21)
 
+**Superseded 2026-10-25 (A-168).** The message placer no longer carves a `udmabuf`: it hands the VMM the file's own
+backing, which authorizes that file's bytes by construction, so no host device is needed and there is no refusal to
+test. Both tests below went with `udmabuf.rs`; `a_window_hands_the_vmm_one_files_bytes_and_nothing_else` holds the
+confinement now, on every Linux host. The record below is history.
+
 A guest's DAX window is handed to the front end as a `udmabuf` covering **only** that window. A host
 that cannot carve one must **refuse** the map: sending the wide descriptor instead is the escape of
 `docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md`, and
@@ -8441,7 +8446,7 @@ decisions or deployment work, and they are what the gate now waits on.
 
 | # | What | State |
 |---|---|---|
-| 1 | ~~**Descriptor confinement for the message-based placer.**~~ — **CLOSED 2026-10-19 (A-138)** by a fourth option the three on record had missed: the placer narrows the arena's descriptor to the authorized window with a Linux `udmabuf` before sending it. Confined by construction, zero-copy and writable, A-64 untouched, unprivileged. Red-checked in `tests/device.rs` (one byte past the window is unmappable; hand back the arena descriptor and it fails there). A host without `/dev/udmabuf` is refused, never widened. Owed: the live crosvm leg. `Store::dax_backing` hands the frontend the arena's *whole* shared object — measured 64× the authorized window, with another tenant's blocks inside it. `fd_offset`/`len` scope the request, never the descriptor. | **Ada's call** between a per-tenant sealed backing, a per-mapping copy, or advertising over fd-sharing only. `docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md` |
+| 1 | ~~**Descriptor confinement for the message-based placer.**~~ — **CLOSED 2026-10-19 (A-138); since 2026-10-25 by A-168, the file's own backing in place of a `udmabuf`** — first by a fourth option the three on record had missed: the placer narrows the arena's descriptor to the authorized window with a Linux `udmabuf` before sending it. Confined by construction, zero-copy and writable, A-64 untouched, unprivileged. Red-checked in `tests/device.rs` (one byte past the window is unmappable; hand back the arena descriptor and it fails there). A host without `/dev/udmabuf` is refused, never widened. Owed: the live crosvm leg. `Store::dax_backing` hands the frontend the arena's *whole* shared object — measured 64× the authorized window, with another tenant's blocks inside it. `fd_offset`/`len` scope the request, never the descriptor. | **Ada's call** between a per-tenant sealed backing, a per-mapping copy, or advertising over fd-sharing only. `docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md` |
 | 2 | **B2's wiring — half of it landed, and this row said otherwise until 2026-10-20.** "Nothing schedules a scrub" is **wrong**: the daemon sweeps every volume through `dax_scrub_slice` (`server/src/daemon.rs:3434`), sliced under the archive budget and instrumented with four counters (`DAX_SCRUB_CLEAN`/`HEALED`/`UNHEALABLE`/`DROPPED`), and it asks the volume whether a guard's mapping is still current so a heal cannot write a dead file's bytes over a live one's re-allocated block. What is still missing is the **opt-in**, and this row said "the guard" and named the wrong function on 2026-10-20 before being corrected the same day: `dax_guard` *is* called in production, from `guard_if_asked` on both read-map paths, and refusals are counted rather than returned so a shard with no room serves the window unguarded. What no production code calls is `Volume::enable_dax_integrity_guard`, the per-volume opt-in `guard_if_asked` checks first — so the flag is never set, `store.dax.guards()` is always zero, the sweep runs over an empty set every tick and those four counters cannot move. The daemon's own comment at `daemon.rs:3414` already said the sweep "finds an empty list and returns". (`enable_writable_dax` has no production caller either, so no volume opts into writable DAX at all — consistent with DAX being unadvertised, but worth knowing before reading the counters as evidence of anything.) | **Ada's call, unchanged:** what to guard (a guard pins a full clean copy, so guarding every read-only mapping doubles mapped-content RAM) and the scrub cadence (no anchor to derive from). The scheduler is no longer part of the ask — only the policy is. |
 | 3 | **L2's device half — what is missing is the *remap*, not the notification.** This row said the shift tells no device, and **that was wrong**: `dax_migrate` enqueues the inode on the registry's `pending_revokes` (deduped, `writable_only` for a shift, `false` superseding it for a write), a device service pass drains it, `teardown_dax_window` tears the window down under the two-phase revoke and unpins, and the guest re-faults onto the row the content moved to. It is proven end to end through a real device by `a_shift_tells_the_device_so_the_guests_window_follows_the_content`, which also checks a read-only window of the same inode survives — so the queue is the right one. I missed it because I read `shift_mapped_windows` in the daemon, saw only counters, and did not look inside `dax_migrate`, where the enqueue is. What remains true is the narrower, original claim: `dax_migrate`'s doc promised a daemon-initiated `MAP_FIXED`/`mremap` and there is none. | Owed, with L2's adaptive trigger, and **smaller than this row claimed**. The corrected cost is a **fault per shifted window**, not a stale guest: revoke-and-re-fault is correct, it just pays a round trip where a remap would not. The two earlier claims here — "a guest would keep using the old block" and "a leaked pin per shift" — were both consequences of the notification being absent, and it is not. |
 | 4 | ~~**L1.** Physically-contiguous hugetlb zones + guard rows — the deployment layer that makes L2's shift move real physical rows.~~ — **CLOSED 2026-10-20, and this row was wrong twice over.** It is not hugetlb and it needs **no privileged broker**: a hugetlb object would need an administrator to set `/proc/sys/vm/nr_hugepages`, which R10 refuses to require, so L1 is a **transparent** huge page asked for with `MADV_HUGEPAGE` and `MADV_COLLAPSE` and then *verified* (`daxzone.rs` opens with why). The zones and their guard rows (`GUARD_SLOTS`, one slot held at each end, so a hammer's blast radius stops inside the tenant's own page) were already built when this row was written. What was true is that they almost never formed: two defects fixed today — the mapping was not placed where a huge page can form, and the check asked `smaps` about the whole mapping instead of `MADV_COLLAPSE` about the span. | **Closed.** Measured on Linux 6.12.76 aarch64 and 7.2.9 x86_64: DAX loud skips 3,1,0,1,2 → **0 across six runs**, a sandbox reserved for 8 of 8 volumes over six consecutive runs where it had been 0-or-8 by address luck, and four tenants coming and going never land in each other's sandboxes (red-checked). `docs/bugs/2026-10-20-the-dax-sandbox-was-reserved-by-mmap-address-luck.md`, `…-the-sandbox-asked-the-mapping-not-the-span.md`. This does **not** open the gate on its own: rows 2 and 3 still stand, and L2's shift has no device half to remap a guest's window with. |
@@ -11267,15 +11272,24 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     mount makes it clean, and adds a `lost+found` (root's, mode 0700) that the merge takes as a new directory. Recorded,
     not changed: e2fsck puts any orphans it recovers there, so the merge must not drop it. `docs/cli.md` says so.
   - **Owed:** the arm64 guest's pmem DAX (Firecracker's doc covers aarch64, with `CONFIG_ARM64_PMEM`): G-arm64-guest.
-- **Open, found 2026-10-24 by a real crosvm run: slates' own DAX window shows stale bytes, then zeros, after another
-  path's write.** `docs/bugs/2026-10-24-slates-own-dax-window-shows-stale-bytes-then-zeros-after-another-paths-write.md`.
-  - The device drains the registry's revokes only at the end of a service pass, so a guest that just reads its map keeps
-    the old block (`A` for 40 s after an SDK write of `B`).
-  - When a guest request drives a pass, SHMEM_UNMAP leaves crosvm's anonymous read-only pages, so the map and `pread`
-    read 0.
-  - No production exposure: DAX on this device is unadvertised, and no guest device attaches over the ring.
-  - The fix (wake on the change; re-point the window rather than unmap it) is the core of goal G-vhost, failing test
-    first.
+- **Fixed in the device 2026-10-25 (A-168); the real guest's proof is owed to G-vhost's step 3: slates' own DAX window
+  showed stale bytes, then zeros, after another path's write.**
+  `docs/bugs/2026-10-24-slates-own-dax-window-shows-stale-bytes-then-zeros-after-another-paths-write.md`.
+  - Found by a real crosvm run (2026-10-24): `A` for 40 s after an SDK write of `B`, then, once a guest request drove a
+    pass, SHMEM_UNMAP left crosvm's zero pages and the map and `pread` read 0.
+  - The message placer's window now maps the file's backing (A-163's object), which the write boundary keeps equal to
+    the file, so nothing revokes it and no change reaches it as a message. Re-pointing the window was rejected: the
+    vhost-user specification forbids a map over a live one.
+  - Proven by eleven hermetic tests against a stand-in front end, on Linux x86_64. The pre-fix code fails the same
+    checks (stale bytes, then the window torn), and eight mutations each fail their own test (A-168).
+  - **Owed, decided in A-168:** the fd-sharing placer keeps pinned blocks for now (no in-process VMM is wired; the L1/L2
+    DAX defenses are built on them), but by the same sources its revoke leaves a guest at a `PROT_NONE` hole it will
+    not re-ask for. Before an in-process VMM ships, it takes the backed route or is retired.
+- **Observed 2026-10-25, not changed: the FUSE edge answers an exhausted arena `EIO`.** `bridge::errno` maps
+  `VfsError::Memory(MemError::ArenaExhausted)` to its catch-all `EIO`, on every path: a FUSE write, and now a DAX
+  write-back's FSYNC (`a_refused_write_back_fails_the_fsync_that_asked_for_it` asserts whatever the edge names it). The
+  arena calls the refusal retryable after growth, so `ENOSPC` or `EAGAIN` would tell a writer more. A mapping decision
+  across every transport, left for its own change.
 - **Fixed 2026-10-25 (A-166): a change of a clone reached a guest's DAX map of its origin.**
   `docs/bugs/2026-10-25-a-clones-change-reaches-its-origins-dax-backing.md`. The store kept DAX backings by inode number
   alone, and a clone (a snapshot a device presents is one) shares its origin's numbers, so either volume's write reached

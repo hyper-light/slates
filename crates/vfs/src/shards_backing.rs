@@ -313,6 +313,15 @@ impl ShardsBackings {
     }
   }
 
+  /// Marks the one backing `handle` names stale, if it is live: its guest's view moved to other content (a snapshot
+  /// device's advance), so its object is refilled before its guest sees anything more.
+  pub fn mark_backing_stale(&mut self, handle: Handle<ShardsBacking>) {
+    if let Ok(backing) = self.slab.get_mut(handle) {
+      backing.stale = true;
+      self.marked_stale = self.marked_stale.saturating_add(1);
+    }
+  }
+
   /// Whether a guest maps any part of file `inode` of the volume of prefix `volume` to write: a backing of it with a
   /// range asked writable.
   #[must_use]

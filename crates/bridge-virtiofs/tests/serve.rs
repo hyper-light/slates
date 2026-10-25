@@ -73,6 +73,8 @@ const DRAIN: usize = 64;
 const FENCE_WAIT_NS: u64 = 1_000_000;
 /// Shape: the fence intervals the guest lets pass before it checks its requests are still held.
 const HELD_INTERVALS: u64 = 5;
+/// Shape: the bytes a DAX backing's fill, ingest or refill slice copies here: one 4 KiB page, the smallest whole slice.
+const COPY_SLICE: u64 = 4096;
 
 thread_local! {
   /// Whether the test owner is fenced (AUD-29-83): its lease does not hold, so it may not serve latest
@@ -229,6 +231,17 @@ impl BridgeAccess for OwnedVolume {
 
   fn with_registry<R>(&mut self, f: impl FnOnce(&mut Attachments) -> R) -> Option<R> {
     Some(f(&mut self.registry))
+  }
+
+  fn with_backings<R>(
+    &mut self,
+    f: impl FnOnce(&mut slates_vfs::shards_backing::ShardsBackings) -> R,
+  ) -> Option<R> {
+    Some(f(&mut self.store.shards_backings))
+  }
+
+  fn copy_slice_bytes(&mut self) -> u64 {
+    COPY_SLICE
   }
 
   fn barrier(&mut self) -> bool {

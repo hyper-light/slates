@@ -1769,9 +1769,9 @@ impl<T: Copy> MessagePlacer<T> {
     pages.saturating_add(1)
   }
 
-  /// Validates `[moffset, moffset+len)` against the region and granule (defence in depth; the front end bounds it
-  /// against the BAR too).
-  fn check_range(&self, moffset: u64, len: u64) -> Result<(), MessagePlaceError> {
+  /// Checks a guest's window range `[moffset, moffset+len)` against the region and granule before anything is asked for
+  /// it: non-empty, whole granules, inside the region (defence in depth; the front end bounds it against the BAR too).
+  pub fn check_window(&self, moffset: u64, len: u64) -> Result<(), MessagePlaceError> {
     let page = self.page_bytes();
     if len == 0 || !moffset.is_multiple_of(page) || !len.is_multiple_of(page) {
       return Err(MessagePlaceError::BadRange);
@@ -1808,7 +1808,7 @@ impl<T: Copy> MessagePlacer<T> {
     writable: bool,
     token: T,
   ) -> Result<(), MessagePlaceError> {
-    self.check_range(moffset, len)?;
+    self.check_window(moffset, len)?;
     self.room()?;
     self
       .channel
@@ -1826,7 +1826,7 @@ impl<T: Copy> MessagePlacer<T> {
   /// [`DaxCompletion::Unmapped`], at which point the caller unpins it (§4.6 phase two). Send-before-record, as
   /// [`MessagePlacer::begin_map`].
   pub fn begin_unmap(&mut self, moffset: u64, len: u64, token: T) -> Result<(), MessagePlaceError> {
-    self.check_range(moffset, len)?;
+    self.check_window(moffset, len)?;
     self.room()?;
     self
       .channel

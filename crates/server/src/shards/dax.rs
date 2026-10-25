@@ -42,7 +42,7 @@ use slates_bridge_core::dax_backing::{
   Ask, Counts, DaxBackingSession, Failure, FillStep, Ingested, Refused,
 };
 use slates_bridge_core::{Bridge, DaxOffer, OpContext, VolumeBridge};
-use slates_bridge_fuse::bridge::errno;
+use slates_bridge_fuse::bridge::{dax_failure_errno, dax_refused_errno};
 use slates_bridge_fuse::shards_fs::{descriptor_answer, descriptor_ask, descriptor_refusal};
 use slates_vfs::error::VfsError;
 use slates_vfs::host::HostFs;
@@ -84,19 +84,6 @@ const REFILL_REFUSED: &str = "shards.dax_refill_refused";
 /// rather than lose the guest's stores: never expected, since a file is copied up before any writable ask of it.
 const REFILL_WRITABLE: &str = "shards.dax_refill_writable";
 
-/// Format: Linux's `EPERM`, which the device returns to the guest's mapping.
-const EPERM: i32 = 1;
-/// Format: Linux's `EIO`.
-const EIO: i32 = 5;
-/// Format: Linux's `ENOMEM`.
-const ENOMEM: i32 = 12;
-/// Format: Linux's `EBUSY`.
-const EBUSY: i32 = 16;
-/// Format: Linux's `EISDIR`.
-const EISDIR: i32 = 21;
-/// Format: Linux's `EINVAL`.
-const EINVAL: i32 = 22;
-
 /// What an ingest was for, on a stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Then {
@@ -120,20 +107,6 @@ pub(crate) struct Done {
   pub(super) refused: Option<i32>,
 }
 
-/// The errno the device returns to the guest's mapping for `refused`.
-fn refused_errno(refused: &Refused) -> i32 {
-  match refused {
-    Refused::Malformed => EINVAL,
-    Refused::Unreachable(e) | Refused::Witness(e) => errno(e.clone()),
-    Refused::NotAFile { directory: true } => EISDIR,
-    Refused::NotAFile { directory: false } => EINVAL,
-    Refused::ReadOnly => EPERM,
-    Refused::Budget => ENOMEM,
-    Refused::Object => EIO,
-    Refused::Busy => EBUSY,
-  }
-}
-
 /// The counter `refused` is recorded under.
 fn refused_counter(refused: &Refused) -> &'static str {
   match refused {
@@ -148,29 +121,15 @@ fn refused_counter(refused: &Refused) -> &'static str {
   }
 }
 
-/// The errno a request answers for a write-back that `failure` stopped.
-fn failure_errno(failure: &Failure) -> i32 {
-  match failure {
-    Failure::Object => EIO,
-    Failure::ReadOnly => EPERM,
-    Failure::Volume(e) => errno(e.clone()),
-  }
-}
-
 /// The DAX offer a stream's requests are answered under (`slates_bridge_core::dax_backing::offer`).
 pub(super) fn offer(s: &ShardState) -> DaxOffer {
   slates_bridge_core::dax_backing::offer(&s.store.shards_backings)
 }
 
-/// Derived: the bytes one fill, ingest or refill slice copies: the shard's copy slice, in whole pages, at least one.
+/// Derived: the bytes one fill, ingest or refill slice copies: the shard's copy slice, in whole pages, at least one
+/// ([`crate::config::DaemonConfig::copy_slice_page_bytes`]).
 fn slice_bytes(s: &ShardState) -> u64 {
-  let page = u64::try_from(rustix::param::page_size().max(1)).unwrap_or(u64::MAX);
-  let slice = s.config.copy_slice_bytes();
-  slice
-    .checked_div(page)
-    .and_then(|pages| pages.checked_mul(page))
-    .unwrap_or(page)
-    .max(page)
+  s.config.copy_slice_page_bytes()
 }
 
 /// Adds what `stream`'s session did since it was last asked to the shard's ledger.
@@ -279,7 +238,7 @@ pub(super) fn step(s: &mut ShardState, stream: &mut ShardsStream) {
 
 /// Answers the ask being taken or filled with `refused`, and counts it.
 fn refuse(s: &mut ShardState, stream: &mut ShardsStream, refused: &Refused) {
-  owe(stream, &descriptor_refusal(refused_errno(refused)));
+  owe(stream, &descriptor_refusal(dax_refused_errno(refused)));
   s.count(refused_counter(refused), 1);
 }
 
@@ -360,7 +319,7 @@ pub(super) fn ingest_step(s: &mut ShardState, stream: &mut ShardsStream) -> Opti
       slates_bridge_core::dax_backing::Then::End => Then::End,
     },
     wrote,
-    refused: refused.as_ref().map(failure_errno),
+    refused: refused.as_ref().map(dax_failure_errno),
   })
 }
 

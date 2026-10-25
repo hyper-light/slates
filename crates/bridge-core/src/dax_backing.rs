@@ -350,6 +350,12 @@ impl DaxBackingSession {
     self.backings.is_empty()
   }
 
+  /// How many files it backs.
+  #[must_use]
+  pub fn len(&self) -> usize {
+    self.backings.len()
+  }
+
   /// Whether it backs file `inode`.
   #[must_use]
   pub fn backs(&self, inode: u64) -> bool {
@@ -618,9 +624,23 @@ impl DaxBackingSession {
 
   /// Starts the ingest every backing with writable ranges takes before the attachment ends. Whether there is one.
   pub fn ingest_before_end(&mut self, backings: &ShardsBackings) -> bool {
+    self.begin_ingest_all(backings, Then::End)
+  }
+
+  /// Starts an ingest of every backing with writable ranges, for `then`: what a guest's unmount asks before it is served.
+  /// Whether there is one.
+  pub fn begin_ingest_all(&mut self, backings: &ShardsBackings, then: Then) -> bool {
     let nodes: Vec<u64> = self.backings.keys().copied().collect();
     let inodes = self.worth_ingesting(backings, nodes);
-    self.begin_ingest(inodes, Then::End)
+    self.begin_ingest(inodes, then)
+  }
+
+  /// Marks every backing of the session stale: the content its guest sees moved without a write (a snapshot device's
+  /// advance to another snapshot), so each is refilled from the view before the guest sees anything more.
+  pub fn mark_all_stale(&mut self, backings: &mut ShardsBackings) {
+    for &handle in self.backings.values() {
+      backings.mark_backing_stale(handle);
+    }
   }
 
   /// Ends the ingest under way as refused with `failure` (its attachment's bridge is gone): what it was for, to go on

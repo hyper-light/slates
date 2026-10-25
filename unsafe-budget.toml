@@ -331,11 +331,11 @@ slates-bridge-fskit = 9
 # descriptor. All are Win32/WinFsp FFI without a safe wrapper; there is no `unsafe impl Send`/`Sync`
 # (the volume is owned by one thread and shared only over channels, R2/D-7).
 slates-bridge-winfsp = 86
-# Raised 3 -> 5 on 2026-10-19 for `udmabuf.rs`, which confines a guest's DAX window to a descriptor covering
-# only that window (the escape in docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md):
-# the `UDMABUF_CREATE` ioctl, for which rustix has no wrapper (1), and adopting the descriptor the kernel returns
-# from it (1). rustix's typed `ioctl` cannot express one that *returns* a descriptor without an `unsafe impl
-# Ioctl` of our own, which is two unsafe sites where libc is one; there is no safe wrapper to reach for.
+# Raised 3 -> 5 on 2026-10-19 for `udmabuf.rs` (the `UDMABUF_CREATE` ioctl and the descriptor it returns), which
+# confined a guest's DAX window to a descriptor covering only that window
+# (docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md). Lowered 5 -> 3 on 2026-10-25
+# (A-168): the message placer now hands the VMM a file's own backing, which authorizes that file's bytes by
+# construction, so `udmabuf.rs` and both sites are gone.
 # slates-bridge-virtiofs (3): the virtqueue machine and the FUSE-over-virtio device read and write
 # guest memory only through the `GuestMemory` seam — bounded, checked copies into byte arrays, fields
 # decoded in order, never a cast or a pointer into the guest (the FUSE codec's discipline). The
@@ -346,7 +346,7 @@ slates-bridge-winfsp = 86
 # the two `MAP_FIXED` overlays — a pinned content block's descriptor (`map`) and the anonymous restore
 # (`unmap`). Each overlay stays strictly within the owned reservation, and the block it maps is pinned
 # by the gate, so its pages are stable — the invariants on each `// SAFETY:` line.
-slates-bridge-virtiofs = 5
+slates-bridge-virtiofs = 3
 # slates-bridge-oci (1): the macOS `getfsstat(MNT_NOWAIT)` pair — the count query and the fill of a
 # buffer sized for exactly that count, plus the `set_len` to what the kernel wrote — in one block
 # (added 2026-09-14 for the OCI attachment form, §4.6 A-9): rustix has no mount-table query, and a

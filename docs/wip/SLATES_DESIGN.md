@@ -3168,6 +3168,30 @@ same-namespace host process is the first delivered case.
 > of the last page reads zero by the map-time scrub, so the surface the host shares with a guest is the file's pages
 > and no more.
 
+> **Status (slates' own device maps per-file backings for an out-of-process VMM, 2026-10-25, A-168).** For the
+> message placer (crosvm over vhost-user), this supersedes the content-block windows the records below describe:
+> pinning, the two-phase revoke and `reopen`-on-map now serve the fd-sharing placer and the in-process maps only. A
+> real crosvm guest read stale bytes, then zeros, through the old windows after another path's write
+> (`docs/bugs/2026-10-24-slates-own-dax-window-shows-stale-bytes-then-zeros-after-another-paths-write.md`): a Linux guest
+> keeps the 2 MiB ranges it mapped and never asks again, the vhost-user specification forbids a map over a live one,
+> and crosvm's unmap leaves zero pages. A window now maps the file's backing (A-163's object, one per attachment and
+> file, never moved), kept equal to the file by the volume's single write boundary, so no change ever reaches the
+> window as a message:
+> - a SETUPMAPPING is held while the asked ranges are filled a copy slice a turn, then sent as one SHMEM_MAP of the
+>   backing (`fd_offset` the file offset), and answered on the front end's ack;
+> - the front end maps every window writable when the attachment may write, so a guest's writable upgrade of a live
+>   window is answered with no message;
+> - the guest's stores reach the volume at FSYNC, FLUSH, RELEASE, READ, FORGET, DESTROY and the device's end, a refused
+>   write-back failing the request that asked for it; beneath an overlay, a reply that could reveal the disk's change
+>   waits for the refill.
+>
+> Built in `crates/bridge-virtiofs/src/backed.rs` and `device.rs` (`Device::dax_turn`), driven by the serve loop each
+> pass. Proven by eleven hermetic tests against a stand-in front end that maps what SHMEM_MAP sends
+> (`crates/bridge-virtiofs/tests/device.rs`) and two unit tests of the module's parsers, on Linux x86_64; the pre-fix
+> code fails the same checks (stale bytes, then the window torn), and eight mutations each fail their own test. The descriptor a VMM gets authorizes one file's bytes by
+> construction, so the `udmabuf` confinement (A-138) is gone with its device dependency. The real crosvm guest's proof
+> is goal G-vhost's step 3.
+
 > **Status (DAX: live vhost-user binding, inline files, and the at-rest-sealing limit, 2026-10-16).** The device-seam
 > wiring above is now proven against a *real* VMM, inline files map, and the file-shape scope with its one hard limit
 > is settled. **The message-based vhost-user DAX binding is built and proven end to end on x86_64 Linux (KVM):** a
@@ -12098,6 +12122,55 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
+
+### A-168 — Slates' own virtio-fs device maps per-file backings for an out-of-process VMM (accepted 2026-10-25)
+Applied in the same change to: §4.6 (a status block before the 2026-10-16 record), `crates/bridge-virtiofs`
+(`src/backed.rs` new; `src/device.rs`, `src/admission.rs`, `src/serve.rs`, `src/dax.rs`, `src/vhost_user.rs`,
+`src/lib.rs`; `src/udmabuf.rs` removed; `tests/device.rs`, `tests/serve.rs`), `crates/bridge-core/src/dax_backing.rs`
+(`begin_ingest_all`, `mark_all_stale`, `len`), `crates/bridge-fuse/src/bridge.rs` (`dax_refused_errno`,
+`dax_failure_errno`, shared with the Shards route), `crates/vfs/src/shards_backing.rs` (`mark_backing_stale`),
+`crates/vfs/src/dax.rs` and `volume.rs` (the re-map claim corrected), `crates/server` (`virtiofs.rs`, `config.rs`
+`copy_slice_page_bytes`, `shards/dax.rs`), `unsafe-budget.toml`, GAPS, virtiofs.md §8, and the bug record above.
+- **Changes §4.6's message placer.** A SETUPMAPPING is no longer served by pinning the content blocks of its range and
+  sending a `udmabuf` of each. The file's backing (A-163) is filled over the asked range, a copy slice a turn, and sent
+  as one SHMEM_MAP with the file offset as its offset; the guest is answered on the ack. Nothing the daemon does to the
+  file reaches a window as a message: the write boundary keeps the backing equal before any change returns.
+- **Why not the alternatives** (kiln research 01a171bff4bd73c6bea625793fb5f821, 12 findings, each graded A):
+  - re-pointing a window onto the inode's new blocks needs a map over a live map, which the vhost-user specification
+    forbids, and unmap-then-map opens the zero-page gap a real guest read;
+  - writing in place into the mapped block fails because content moves (an open block that grows is copied to a larger
+    one, an idle one is sealed) and one block never covers a guest's 2 MiB range;
+  - a revoke-and-refault never refaults: a Linux guest keeps its mapped ranges and never asks again.
+- **Writable at the front end.** Every window is mapped writable when the attachment may write. A guest's upgrade of a
+  read-only range is a SETUPMAPPING over the live window (`fuse_upgrade_dax_mapping`); it is answered with no message.
+  The guest's page tables keep read-only mappings read-only, and an ingest compares only ranges asked writable.
+- **Durability** follows A-163: the request that asks for the guest's stores (FSYNC, FLUSH, RELEASE, READ, FORGET,
+  DESTROY) is held, unserved, while they are written back, published before its reply, and answered the write-back's
+  refusal where its asker reads one. The serve loop ingests every writable backing after its last pass and before the
+  terminal step, waiting out a fence, and lets the backings go only then.
+- **Beneath an overlay** a reply that could reveal the disk's change (the base plane marked a backing stale while
+  serving it) is held until the backing is refilled. A snapshot device's advance marks its backings stale, so each is
+  refilled from the new view; no window is torn.
+- **Bounds.** One request is held at a time (the device serves nothing past it); windows are bounded by the guest's
+  window; backings by the shard's fill budget; the outstanding ring by the region's pages plus one. A SETUPMAPPING's
+  window must be whole granules inside the region and its file range must start at a granule inside the object.
+- **The fd-sharing placer, decided in this change.** It keeps pinned blocks for now: no in-process VMM is wired, and
+  the L1/L2 DAX defenses are built on its pinned blocks. By the same sources its revoke leaves a guest at a `PROT_NONE`
+  hole it will not re-ask for, so before an in-process VMM ships it takes the backed route or is retired (GAPS).
+- **Proven** on Linux x86_64 (fedora, 2026-10-25) by eleven hermetic tests in `crates/bridge-virtiofs/tests/device.rs`
+  against a stand-in front end that maps what SHMEM_MAP sends, and two unit tests in `backed.rs`. The rest of the
+  crate's suites, the server's virtiofs, shards and attach-form suites, and Linux clippy pass. The real crosvm guest is
+  G-vhost's step 3.
+- **Red-checked.**
+  - The pre-fix code (411c243d, on adacachy with `/dev/udmabuf`) ran the coherence checks in the old API: its map
+    covered 4,096 of the 2,097,152 bytes asked; a write after the file outgrew its block was not in the map
+    ("AAAAAAAAAAAA"); and the next pass's revoke drain sent SHMEM_UNMAP for the range the guest held.
+  - Eight mutations of the new code, each failing its own test: no write-through; no ingest hold; no refused errno; no
+    refill hold in the service pass; none after the owner's barrier; the front end mapped writable only as asked; no
+    ingest at the end; no release at FORGET.
+- **Removed:** the message placer's `udmabuf` confinement (A-138) and its two unsafe sites, since a backing's descriptor
+  authorizes one file's bytes by construction; the tests premised on it, and on pinned windows under the message
+  placer, went with it.
 
 ### A-167 — A range a guest maps past a file's end is kept equal like any other (accepted 2026-10-25)
 Applied in the same change to: §4.6 (the Shards stream's DAX bullet), `crates/bridge-core/src/dax_backing.rs`

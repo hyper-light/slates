@@ -2589,8 +2589,9 @@ impl Volume {
       return Ok(0);
     }
     // A VFS write to a DAX-mapped file is a second write boundary onto content a guest holds mapped: revoke its
-    // mappings first so the one boundary stays single (§4.6, AC-4.12). The guest re-maps and gets the new block after
-    // its page faults. Empty on any file no guest maps (the common case), so this is a length check.
+    // mappings first so the one boundary stays single (§4.6, AC-4.12). Whether the guest re-maps after its fault is
+    // open (`crate::dax`'s header); a window over a backing never comes here, since the write reaches it below. Empty
+    // on any file no guest maps (the common case), so this is a length check.
     store.dax_revoke_inode(no);
     let charge = self.write_charge(store, no, off, end)?;
     // The windows this write reopens retain their old chunks (§4.2 retention): secure those bytes
@@ -2835,7 +2836,7 @@ impl Volume {
       return Err(VfsError::Invalid);
     }
     // A truncate changes the file's blocks under any DAX guest holding it mapped: revoke its mappings first (§4.6),
-    // the same single-write-boundary rule as a write. The guest re-maps after its fault.
+    // the same single-write-boundary rule as a write (whether the guest re-maps after is open, `crate::dax`).
     store.dax_revoke_inode(no);
     // The windows a truncate cuts away retain their chunks when a snapshot pins them (§4.2
     // retention): secured before anything changes.

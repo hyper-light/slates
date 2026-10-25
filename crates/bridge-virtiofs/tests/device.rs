@@ -47,11 +47,6 @@ const FUSE_MAP_ALIGNMENT: u64 = 1 << 26;
 /// Format: `ENOENT`, `EIO`.
 const ENOENT: i32 = 2;
 const EIO: i32 = 5;
-/// Linux's `EOPNOTSUPP`, the errno a map refuses with when the host cannot carve a confined descriptor
-/// (`device.rs`'s `dax_errno::EOPNOTSUPP`, which is private to that crate). Gated like the one test that
-/// reads it: an ungated constant used only from a `cfg(linux)` test is dead code on every other host.
-#[cfg(target_os = "linux")]
-const EOPNOTSUPP: i32 = 95;
 /// Format: `O_RDWR`.
 const O_RDWR: u32 = 2;
 /// Format: the FUSE node id of the root directory.
@@ -2029,151 +2024,6 @@ impl PinLedgerFixture {
   }
 }
 
-/// §4.6 #1 — a teardown whose SHMEM_UNMAP is refused **for a reason that is not a dead channel** must keep the
-/// block pinned. Only a gone channel means the guest can no longer reach the window; the other two refusals leave
-/// it mapped, so returning the block to the arena hands a live guest mapping's memory to the next tenant.
-///
-/// `begin_unmap` has three refusals and the teardown used to unpin on all of them. `Channel(..)` is the one the
-/// comment described — the front end is gone, so holding the pin would leak it. `TooManyOutstanding` means the
-/// back-end-request ring is at its bound: the channel is alive and the front end still has the window.
-/// `BadRange` means the unmap was never attempted at all.
-///
-/// **An `advance` reaches this without a hostile guest.** `revalidate_windows` tears every stale window in one
-/// pass and each `begin_unmap` takes an outstanding slot, so a volume whose stale windows outnumber the ring's
-/// bound overflows it partway through — and every window after that point was being unpinned while still mapped.
-///
-/// `TooManyOutstanding` itself is **not** covered here, and that is a limit rather than an oversight: the bound is
-/// `region_bytes / page + 1`, so a region never holds more distinct windows than its own bound, and reaching it
-/// needs maps already awaiting their acks — which needs `/dev/udmabuf`, which no machine this project can reach
-/// has. `BadRange` exercises the same branch of the same `match`.
-///
-/// Do: map a window near the end of a four-page region, install a message placer that declares a one-page window
-/// (so the live window's range is outside what `begin_unmap` will accept, refusing `BadRange` deterministically
-/// without exhausting a ring), then revoke the inode. Expect: the window is torn from the device and the block is
-/// **still pinned**.
-#[cfg(target_os = "linux")]
-#[test]
-fn a_teardown_refused_short_of_a_dead_channel_keeps_the_block_pinned() {
-  use slates_bridge_virtiofs::device::DaxWindowEntry;
-  use slates_bridge_virtiofs::vhost_user::{BackendReqChannel, MessagePlacer};
-
-  let mut f = pin_ledger_fixture("msgrefused");
-  let last = f.page_len.saturating_mul(3);
-  assert_eq!(
-    f.map(2, last),
-    0,
-    "the window maps over the region's last page"
-  );
-  let mapped = f.pinned();
-  assert!(
-    mapped > f.quiet,
-    "non-vacuity: mapping a window pins a block ({} -> {mapped})",
-    f.quiet
-  );
-
-  // A live channel whose placer declares a window too small to hold the mapped range: begin_unmap refuses
-  // `BadRange`, which is not a dead channel. `front` stays open for the whole test, so a `Channel` refusal —
-  // the one case that *should* unpin — cannot be what is being observed.
-  let (front, back) = rustix::net::socketpair(
-    rustix::net::AddressFamily::UNIX,
-    rustix::net::SocketType::STREAM,
-    rustix::net::SocketFlags::CLOEXEC,
-    None,
-  )
-  .unwrap();
-  let page = usize::try_from(f.page_len).unwrap_or(4096);
-  let placer: MessagePlacer<DaxWindowEntry> =
-    MessagePlacer::new(BackendReqChannel::adopt(back), page, f.page_len);
-  f.device.install_dax_message_placer(placer);
-
-  let torn = {
-    let mut bridge = VolumeBridge::new(vid(), &mut f.tenant, &mut f.store);
-    f.device.request_revoke_inode(f.no, &mut bridge, &f.cx)
-  };
-
-  assert_eq!(torn, 1, "the revoke tore the window from the device");
-  assert_eq!(
-    f.pinned(),
-    mapped,
-    "a refusal short of a dead channel keeps the block pinned: the front end still has the window, so the \
-     guest can still reach these pages"
-  );
-  assert_eq!(
-    f.store.release_refusals, 0,
-    "the release was not attempted, rather than attempted and refused"
-  );
-  drop(front);
-}
-
-/// §4.6 #1 — with an **out-of-process VMM**, tearing a window down must keep the block pinned until the front
-/// end acknowledges the unmap. The front end owns the guest's mapping there, so until it confirms removal the
-/// guest can still reach those pages; returning the block to the arena before then hands a live mapping's
-/// memory to whoever allocates next.
-///
-/// This had no test. `MessagePlacer::begin_unmap` — the whole deferred phase two — appears once in the product
-/// (`device.rs`, inside `teardown_dax_window`) and in no test at all, while both existing message-based tests
-/// cover SETUPMAPPING. That is the placer a real crosvm or QEMU uses.
-///
-/// It needs no `/dev/udmabuf`, which is why it can run where the map-side proof cannot (no machine this project
-/// reaches has that device): the window is established through the **local** placer, then handed to a message
-/// placer before the teardown, which is the only part under test.
-///
-/// Do: map a window, install a message placer over a live socketpair, revoke the inode. Expect: the window is
-/// torn from the device and the block is **still pinned**. The assertion discriminates by itself — if the
-/// channel were dead the code unpins deliberately (documented, so a lost guest cannot leak a pin), so "still
-/// pinned" can only mean the SHMEM_UNMAP went out and phase two is correctly waiting for its ack.
-#[cfg(target_os = "linux")]
-#[test]
-fn a_message_based_teardown_holds_the_block_until_the_front_end_acks_the_unmap() {
-  use slates_bridge_virtiofs::device::DaxWindowEntry;
-  use slates_bridge_virtiofs::vhost_user::{BackendReqChannel, MessagePlacer};
-
-  let mut f = pin_ledger_fixture("msgunmap");
-  assert_eq!(f.map(2, 0), 0, "the window maps");
-  let mapped = f.pinned();
-  assert!(
-    mapped > f.quiet,
-    "non-vacuity: mapping a window pins a block ({} -> {mapped})",
-    f.quiet
-  );
-
-  // The front end takes ownership of the window, so phase two of a revoke is now deferred to its ack. `front`
-  // is held open for the whole test: a closed peer makes `begin_unmap` fail, and the product then unpins at
-  // once by design, which would pass this test for precisely the wrong reason.
-  let (front, back) = rustix::net::socketpair(
-    rustix::net::AddressFamily::UNIX,
-    rustix::net::SocketType::STREAM,
-    rustix::net::SocketFlags::CLOEXEC,
-    None,
-  )
-  .unwrap();
-  let page = usize::try_from(f.page_len).unwrap_or(4096);
-  let placer: MessagePlacer<DaxWindowEntry> = MessagePlacer::new(
-    BackendReqChannel::adopt(back),
-    page,
-    f.page_len.saturating_mul(4),
-  );
-  f.device.install_dax_message_placer(placer);
-
-  let torn = {
-    let mut bridge = VolumeBridge::new(vid(), &mut f.tenant, &mut f.store);
-    f.device.request_revoke_inode(f.no, &mut bridge, &f.cx)
-  };
-
-  assert_eq!(torn, 1, "the revoke tore the window from the device");
-  assert_eq!(
-    f.pinned(),
-    mapped,
-    "the block stays pinned until the front end acks the unmap: it owns the guest's mapping, so the guest \
-     can still reach these pages"
-  );
-  assert_eq!(
-    f.store.release_refusals, 0,
-    "the release was deferred, not attempted and refused"
-  );
-  drop(front);
-}
-
 /// §4.6 "revoke on advance" — an advance that tears a stale window must also **balance its pin**: give the
 /// block back, and not before the window is gone.
 ///
@@ -2721,23 +2571,15 @@ enum ChaosEffect {
 proptest! {
   #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: slates_test_seeds::cases(80), .. ProptestConfig::default() }))]
 
-  /// §4.6 / AC-4.12 under chaos, at the device seam. `vfs/tests/dax.rs` plays this schedule against the gate;
-  /// this plays it against the half that owns the guest-visible window — SETUPMAPPING and REMOVEMAPPING over a
-  /// shared cache region, interleaved with the writes, truncates and idle sweeps that revoke underneath them.
-  /// Do: a random schedule over three files and several window slots. Expect, after **every** step: every byte
-  /// of the whole cache region is either zero or one of the fills this volume wrote. A byte that is neither came
-  /// from somewhere the guest has no business reaching — another volume's block, arena metadata, or memory never
-  /// initialised — which is exactly the class of leak a shared window makes possible and a per-access check
   /// §4.6 #1 (chaos over the two refusal arms) — under a random interleaving of clean and refused teardowns,
   /// a teardown whose unmap is refused must **never** return the block to the arena, and once one has been
   /// refused the block must stay pinned for the rest of the run however many clean teardowns follow.
   ///
-  /// The two arms each had one deterministic test
-  /// (`a_revoke_whose_unmap_is_refused_keeps_the_block_pinned`,
-  /// `a_teardown_refused_short_of_a_dead_channel_keeps_the_block_pinned`). Those prove the branch; they do not
-  /// prove it survives being interleaved with the clean path over a shared pin whose holder count moves up and
-  /// down underneath. A release that fired one step late — correct at the branch, wrong in sequence — passes
-  /// both and fails here.
+  /// The arm has a deterministic test (`a_revoke_whose_unmap_is_refused_keeps_the_block_pinned`; the message
+  /// placer's sibling arm went with G-vhost, since its windows map backings and pin nothing). That proves the
+  /// branch; it does not prove it survives being interleaved with the clean path over a shared pin whose holder
+  /// count moves up and down underneath. A release that fired one step late — correct at the branch, wrong in
+  /// sequence — passes it and fails here.
   ///
   /// Each step maps a window over the region's **last** page and then tears it down one of two ways: cleanly,
   /// or with the cache region shrunk to a single page first, so `DaxCacheRegion::unmap` refuses `BadRange`
@@ -2818,6 +2660,13 @@ proptest! {
     }
   }
 
+  /// §4.6 / AC-4.12 under chaos, at the device seam. `vfs/tests/dax.rs` plays this schedule against the gate;
+  /// this plays it against the half that owns the guest-visible window — SETUPMAPPING and REMOVEMAPPING over a
+  /// shared cache region, interleaved with the writes, truncates and idle sweeps that revoke underneath them.
+  /// Do: a random schedule over three files and several window slots. Expect, after **every** step: every byte
+  /// of the whole cache region is either zero or one of the fills this volume wrote. A byte that is neither came
+  /// from somewhere the guest has no business reaching — another volume's block, arena metadata, or memory never
+  /// initialised — which is exactly the class of leak a shared window makes possible and a per-access check
   /// cannot catch, since the guest reads these pages through its own page table.
   ///
   /// **What this schedule does NOT catch, measured rather than assumed:** a revoke that forgets to unmap.
@@ -4080,35 +3929,142 @@ fn an_advance_revalidate_tears_the_stale_window_and_keeps_the_current_one() {
   drop(cache);
 }
 
-/// Receives one `SHMEM_MAP` back-end request and its single descriptor the way a vhost-user front end would,
-/// asserting the request code; returns the descriptor so the caller can read the mapped block's bytes.
+// ---- The message placer over per-file backings (§4.6; `slates_bridge_virtiofs::backed`; goal G-vhost) ----
+
+/// Shape: the guest's DAX window in the message placer's tests, in 2 MiB ranges.
 #[cfg(target_os = "linux")]
-fn front_recv_shmem_map(socket: &std::os::fd::OwnedFd) -> std::os::fd::OwnedFd {
-  use slates_bridge_virtiofs::vhost_user::{HEADER_LEN, MAP_FDS, MMAP_LEN, backend_request};
+const WINDOW_RANGES: u64 = 4;
+/// Shape: the fill budget of those tests, in ranges: more than any of them fills.
+#[cfg(target_os = "linux")]
+const BUDGET_RANGES: u64 = 8;
+/// Shape: the passes a test drives before it judges the device stuck: far more than any fill or ingest here takes.
+#[cfg(target_os = "linux")]
+const TURNS: usize = 4096;
+/// Shape: the pages a fill, ingest or refill slice copies in these tests, so a fill of several pages takes turns.
+#[cfg(target_os = "linux")]
+const SLICE_PAGES: u64 = 2;
+/// Shape: the pages of the file whose write-back the arena cannot hold: twice the fixture's whole arena.
+#[cfg(target_os = "linux")]
+const PAST_THE_ARENA_PAGES: usize = 128;
+
+/// A SHMEM_MAP as the stand-in front end received it, with the backing's pages mapped as crosvm maps them into the
+/// guest's window (`MAP_SHARED`; here at an address the kernel chooses), writable when the map asked so.
+#[cfg(target_os = "linux")]
+struct FrontMap {
+  _descriptor: std::os::fd::OwnedFd,
+  fd_offset: u64,
+  shm_offset: u64,
+  len: usize,
+  writable: bool,
+  at: *mut std::ffi::c_void,
+}
+
+#[cfg(target_os = "linux")]
+impl FrontMap {
+  /// `len` bytes of the window from `at`, as the guest reads them through its map.
+  fn read(&self, at: usize, len: usize) -> Vec<u8> {
+    assert!(at + len <= self.len, "a read inside the window");
+    // SAFETY: `self.at` is this value's live mapping of `self.len` bytes, and `[at, at + len)` lies inside it.
+    unsafe { std::slice::from_raw_parts(self.at.cast::<u8>().add(at), len) }.to_vec()
+  }
+
+  /// Stores `bytes` at `at` of the window, as the guest stores through its map.
+  fn store(&mut self, at: usize, bytes: &[u8]) {
+    assert!(self.writable, "a store through a window mapped writable");
+    assert!(at + bytes.len() <= self.len, "a store inside the window");
+    // SAFETY: as `read`; the mapping is writable (`self.writable`), and nothing else borrows it during the copy.
+    unsafe {
+      std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.at.cast::<u8>().add(at), bytes.len());
+    }
+  }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for FrontMap {
+  fn drop(&mut self) {
+    // SAFETY: unmapping exactly the mapping this value made, with its own address and length.
+    unsafe { rustix::mm::munmap(self.at, self.len) }.unwrap();
+  }
+}
+
+/// Takes one back-end request the way a vhost-user front end would, without waiting: its request code, its
+/// `VhostUserMMap` body and its descriptor, if it carried one. `None` when nothing is pending.
+#[cfg(target_os = "linux")]
+fn front_take(
+  socket: &std::os::fd::OwnedFd,
+) -> Option<(
+  u32,
+  [u8; slates_bridge_virtiofs::vhost_user::MMAP_LEN],
+  Option<std::os::fd::OwnedFd>,
+)> {
+  use slates_bridge_virtiofs::vhost_user::{HEADER_LEN, MAP_FDS, MMAP_LEN};
   let mut buf = [0u8; HEADER_LEN + MMAP_LEN];
   let mut space = [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(MAP_FDS))];
   let mut control = rustix::net::RecvAncillaryBuffer::new(&mut space);
-  let got = rustix::net::recvmsg(
+  let got = match rustix::net::recvmsg(
     socket,
     &mut [std::io::IoSliceMut::new(&mut buf)],
     &mut control,
-    rustix::net::RecvFlags::empty(),
-  )
-  .unwrap();
-  assert_eq!(got.bytes, buf.len(), "a whole SHMEM_MAP message");
-  assert_eq!(
-    u32::from_le_bytes(buf[0..4].try_into().unwrap()),
-    backend_request::SHMEM_MAP,
-    "the back-end request is SHMEM_MAP"
-  );
+    rustix::net::RecvFlags::DONTWAIT,
+  ) {
+    Ok(got) => got,
+    Err(rustix::io::Errno::AGAIN) => return None,
+    Err(e) => panic!("the front end's socket: {e}"),
+  };
+  assert_eq!(got.bytes, buf.len(), "a whole back-end request");
   let mut fds: Vec<std::os::fd::OwnedFd> = Vec::new();
   for message in control.drain() {
     if let rustix::net::RecvAncillaryMessage::ScmRights(iter) = message {
       fds.extend(iter);
     }
   }
-  assert_eq!(fds.len(), 1, "SHMEM_MAP carries exactly one descriptor");
-  fds.into_iter().next().unwrap()
+  assert!(
+    fds.len() <= 1,
+    "a back-end request carries at most one descriptor"
+  );
+  let code = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+  let body: [u8; MMAP_LEN] = buf[HEADER_LEN..].try_into().unwrap();
+  Some((code, body, fds.into_iter().next()))
+}
+
+/// Maps a SHMEM_MAP's descriptor as the front end does: `len` bytes from `fd_offset`, shared, writable when its flags
+/// say so.
+#[cfg(target_os = "linux")]
+fn front_map(
+  body: &[u8; slates_bridge_virtiofs::vhost_user::MMAP_LEN],
+  descriptor: std::os::fd::OwnedFd,
+) -> FrontMap {
+  use slates_bridge_virtiofs::vhost_user::MMAP_FLAG_MAP_RW;
+  let field = |at: usize| u64::from_le_bytes(body[at..at + 8].try_into().unwrap());
+  let (fd_offset, shm_offset, len, flags) = (field(8), field(16), field(24), field(32));
+  let writable = flags & MMAP_FLAG_MAP_RW != 0;
+  let len = usize::try_from(len).unwrap();
+  let prot = if writable {
+    rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE
+  } else {
+    rustix::mm::ProtFlags::READ
+  };
+  // SAFETY: a fresh shared mapping at an address the kernel chooses, of `len` bytes of a descriptor this test owns,
+  // from a page-aligned offset; `FrontMap` unmaps it with the same address and length before the descriptor drops.
+  let at = unsafe {
+    rustix::mm::mmap(
+      std::ptr::null_mut(),
+      len,
+      prot,
+      rustix::mm::MapFlags::SHARED,
+      &descriptor,
+      fd_offset,
+    )
+  }
+  .expect("the front end maps what it was sent");
+  FrontMap {
+    _descriptor: descriptor,
+    fd_offset,
+    shm_offset,
+    len,
+    writable,
+    at,
+  }
 }
 
 /// Answers a back-end request with a reply-ack carrying `status` (zero for success), as a front end would.
@@ -4132,258 +4088,818 @@ fn front_send_ack(socket: &std::os::fd::OwnedFd, request: u32, status: u64) {
   .unwrap();
 }
 
-/// §4.6 — the other half of the message-based SETUPMAPPING proof above, and the half that runs on every host
-/// this project can reach. `udmabuf::confine` carves a descriptor covering **only** the guest's window; a host
-/// that cannot carve one must **refuse** the map, because sending the wide descriptor instead is the escape
-/// itself (`docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md`) and CLAUDE.md #7
-/// leaves no room for a fallback.
-///
-/// Do: on a host with no `/dev/udmabuf` — this laptop, Docker's linuxkit VM, and any runner without the
-/// module — install a message placer and ask for a SETUPMAPPING. Expect: the pass does **not** park waiting
-/// for a front-end acknowledgement, which is what a descriptor actually sent would do; the guest is answered
-/// `EOPNOTSUPP`; and no window is recorded.
-///
-/// Until this existed the refusal was asserted nowhere. `MessagePlacer` appeared only in the test above, which
-/// skips exactly when this condition holds, so a regression that sent the unconfined descriptor would have
-/// passed on every machine reachable from here. The two tests partition the hosts: one proves confinement
-/// where `/dev/udmabuf` exists, this one proves refusal where it does not, and each skips loudly on the other's
-/// host.
+/// The bridge one pass serves through, as the shard builds one per pass: the volume, the store, the open handles kept
+/// across passes, and the base host of an overlay.
 #[cfg(target_os = "linux")]
-#[test]
-fn a_message_based_setupmapping_is_refused_where_the_window_cannot_be_confined() {
-  use slates_bridge_virtiofs::device::DaxWindowEntry;
-  use slates_bridge_virtiofs::vhost_user::{BackendReqChannel, MessagePlacer};
-
-  if rustix::fs::open(
-    "/dev/udmabuf",
-    rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CLOEXEC,
-    rustix::fs::Mode::empty(),
+fn backed_bridge<'v>(
+  vol: &'v mut slates_vfs::volume::Volume,
+  store: &'v mut slates_vfs::volume::Store,
+  handles: &'v mut slates_mem::Slab<u64>,
+  host: &'v mut Option<slates_vfs::host::sim::SimHost>,
+) -> VolumeBridge<'v> {
+  VolumeBridge::attached(
+    vid(),
+    vol,
+    store,
+    handles,
+    host
+      .as_mut()
+      .map(|host| host as &mut dyn slates_vfs::host::HostFs),
   )
-  .is_ok()
-  {
-    eprintln!(
-      "skipping the refusal proof: this host has /dev/udmabuf, so the placer confines the window instead — \
-       which is what a_message_based_setupmapping_parks_until_the_front_end_acks_then_answers_the_guest proves"
-    );
-    return;
+}
+
+/// A device serving the message placer over a socketpair whose other end, `front`, is the stand-in front end; its
+/// volume, store (with a fill budget) and guest driver; INIT served. The passes run as the serve loop runs them.
+#[cfg(target_os = "linux")]
+struct BackedFixture {
+  store: slates_vfs::volume::Store,
+  vol: slates_vfs::volume::Volume,
+  host: Option<slates_vfs::host::sim::SimHost>,
+  handles: slates_mem::Slab<u64>,
+  device: Device,
+  driver: SimDriver,
+  front: std::os::fd::OwnedFd,
+  cx: OpContext,
+  page: usize,
+  unique: u64,
+  barriers: u32,
+}
+
+#[cfg(target_os = "linux")]
+impl BackedFixture {
+  /// Over a scratch volume.
+  fn scratch(tag: &str) -> BackedFixture {
+    let page = rustix::param::page_size().max(1);
+    let mut store = dax_shared_store(page, tag);
+    let vol = volume(&mut store);
+    BackedFixture::over(store, vol, None, context())
   }
 
-  let page = rustix::param::page_size().max(1);
-  let mut store = dax_shared_store(page, "msgrefuse");
-  let mut vol = volume(&mut store);
-  let root = vol.root_inode(&store).unwrap();
-  let no = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
-  vol.write(&mut store, no, 0, &vec![0x5Au8; page]).unwrap();
-  // The create's publication, committed, as the daemon's verb barrier commits it (A-150): the file's number is
-  // reserved, so the guest's request is served at once rather than held for a publication. Until 2026-10-22 this test
-  // created the file with none, and since it runs only on hosts without `/dev/udmabuf` (CI's, not the box), the held
-  // chain showed first in CI.
-  vol.mark_published(&store);
-  let nodeid = no.0;
+  /// Over an overlay of `host`'s root.
+  fn overlay(tag: &str, mut host: slates_vfs::host::sim::SimHost) -> BackedFixture {
+    use slates_vfs::host::HostFs as _;
+    let page = rustix::param::page_size().max(1);
+    let mut store = dax_shared_store(page, tag);
+    let root = host.root();
+    let facts = host.facts(root).unwrap();
+    let vol = slates_vfs::volume::Volume::create_overlay(
+      &mut store,
+      slates_vfs::volume::VolumeConfig {
+        prefix: 1,
+        names: slates_vfs::names::NameEquivalence::Exact,
+        quota: slates_vfs::quota::Quota::Bounded { limit: 1 << 30 },
+        journal_bytes: 1 << 16,
+        clock: Box::new(slates_vfs::clock::StepClock::new(1_000_000, 1_000)),
+      },
+      slates_vfs::base::BaseConfig {
+        root,
+        facts,
+        large_class_bytes: u64::try_from(page).unwrap(),
+      },
+    )
+    .unwrap();
+    BackedFixture::over(store, vol, Some(host), context())
+  }
 
-  let (mut device, mut driver) = device_and_driver();
-  let (_front, back) = rustix::net::socketpair(
-    rustix::net::AddressFamily::UNIX,
-    rustix::net::SocketType::STREAM,
-    rustix::net::SocketFlags::CLOEXEC,
-    None,
-  )
-  .unwrap();
-  let placer: MessagePlacer<DaxWindowEntry> =
-    MessagePlacer::new(BackendReqChannel::adopt(back), page, (page * 16) as u64);
-  device.install_dax_message_placer(placer);
-  assert!(device.dax_offered(), "the device serves message-based DAX");
+  fn over(
+    mut store: slates_vfs::volume::Store,
+    vol: slates_vfs::volume::Volume,
+    host: Option<slates_vfs::host::sim::SimHost>,
+    cx: OpContext,
+  ) -> BackedFixture {
+    use slates_bridge_virtiofs::vhost_user::{BackendReqChannel, MessagePlacer};
+    let page = rustix::param::page_size().max(1);
+    store
+      .shards_backings
+      .set_budget(BUDGET_RANGES * slates_mem::DAX_RANGE_BYTES);
+    let (mut device, driver) = device_and_driver();
+    let (front, back) = rustix::net::socketpair(
+      rustix::net::AddressFamily::UNIX,
+      rustix::net::SocketType::STREAM,
+      rustix::net::SocketFlags::CLOEXEC,
+      None,
+    )
+    .unwrap();
+    device.install_dax_message_placer(MessagePlacer::new(
+      BackendReqChannel::adopt(back),
+      page,
+      WINDOW_RANGES * slates_mem::DAX_RANGE_BYTES,
+    ));
+    let mut fixture = BackedFixture {
+      store,
+      vol,
+      host,
+      handles: slates_bridge_core::volume_bridge::new_handle_store(),
+      device,
+      driver,
+      front,
+      cx,
+      page,
+      unique: 0,
+      barriers: 0,
+    };
+    let init = fixture.submit(FIRST_REQUEST_QUEUE, Opcode::Init, ROOT, &dax_init_body());
+    assert_eq!(fixture.answer(FIRST_REQUEST_QUEUE, init), 0, "INIT served");
+    fixture
+  }
 
-  let cx = context();
-  let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
-  let init_reply = dax_exchange(
-    &mut device,
-    &mut driver,
-    &mut bridge,
-    &cx,
-    (Opcode::Init, 1, ROOT),
-    &dax_init_body(),
+  /// A file named `name` in the root holding `bytes`, its number reserved as the daemon's verb barrier reserves it
+  /// (A-150): its node id.
+  fn file(&mut self, name: &str, bytes: &[u8]) -> u64 {
+    let root = self.vol.root_inode(&self.store).unwrap();
+    let no = self
+      .vol
+      .create_file_no(&mut self.store, root, name, 0o644)
+      .unwrap();
+    self.vol.write(&mut self.store, no, 0, bytes).unwrap();
+    self.vol.mark_published(&self.store);
+    no.0
+  }
+
+  /// Puts one request on `queue`: its descriptor head.
+  fn submit(&mut self, queue: u16, opcode: Opcode, nodeid: u64, body: &[u8]) -> u16 {
+    self.unique += 1;
+    let request = message(opcode.to_wire(), self.unique, nodeid, body);
+    let capacity = if queue == HIPRIO_QUEUE { 0 } else { 4096 };
+    self
+      .driver
+      .submit(usize::from(queue), &request, capacity, 1)
+  }
+
+  /// One pass as the serve loop runs it (`serve.rs`, `one_pass`): the backed DAX's turn, then, unless it was busy, a
+  /// service pass of each queue. A reply held for the owner's barrier is completed as an owner whose barrier captures,
+  /// and counted.
+  fn pass(&mut self) -> slates_bridge_virtiofs::device::DaxTurned {
+    let slice = SLICE_PAGES * u64::try_from(self.page).unwrap();
+    let mut bridge = backed_bridge(
+      &mut self.vol,
+      &mut self.store,
+      &mut self.handles,
+      &mut self.host,
+    );
+    let turned = self
+      .device
+      .dax_turn(
+        &mut self.driver.memory,
+        &mut bridge,
+        &self.cx,
+        slice,
+        &mut Unlimited,
+      )
+      .unwrap();
+    if turned.barrier_owed {
+      self.barriers += 1;
+      self
+        .device
+        .complete_awaiting(
+          &mut self.driver.memory,
+          &mut bridge,
+          &self.cx,
+          true,
+          &mut Unlimited,
+        )
+        .unwrap();
+    }
+    if !turned.busy {
+      for queue in [HIPRIO_QUEUE, FIRST_REQUEST_QUEUE] {
+        let pass = self
+          .device
+          .service_queue(
+            queue,
+            &mut self.driver.memory,
+            &mut bridge,
+            &self.cx,
+            BATCH,
+            &mut Unlimited,
+          )
+          .unwrap();
+        if pass.barrier_owed {
+          self.barriers += 1;
+          self
+            .device
+            .complete_awaiting(
+              &mut self.driver.memory,
+              &mut bridge,
+              &self.cx,
+              true,
+              &mut Unlimited,
+            )
+            .unwrap();
+        }
+      }
+    }
+    turned
+  }
+
+  /// The errno of `head`'s reply on `queue` if its used element is published; `None` while it is held.
+  fn reply_now(&mut self, queue: u16, head: u16) -> Option<i32> {
+    let (id, len) = self.driver.reap(usize::from(queue))?;
+    assert_eq!(id, head, "the used element is the request's");
+    Some(reply_error(&self.driver.reply_of(
+      usize::from(queue),
+      head,
+      len,
+    )))
+  }
+
+  /// Passes until `head`'s reply on `queue` is published, with no back-end request meanwhile: its errno.
+  fn answer(&mut self, queue: u16, head: u16) -> i32 {
+    for _ in 0..TURNS {
+      self.pass();
+      if let Some(errno) = self.reply_now(queue, head) {
+        return errno;
+      }
+      assert!(
+        front_take(&self.front).is_none(),
+        "no back-end request while the request is answered"
+      );
+    }
+    panic!("the request was not answered within {TURNS} passes");
+  }
+
+  /// Passes until the held SETUPMAPPING `head` sends its map, with no reply published before: the map, mapped as the
+  /// front end maps it.
+  fn until_mapped(&mut self, head: u16) -> FrontMap {
+    use slates_bridge_virtiofs::vhost_user::backend_request;
+    for _ in 0..TURNS {
+      self.pass();
+      if let Some((code, body, descriptor)) = front_take(&self.front) {
+        assert_eq!(
+          code,
+          backend_request::SHMEM_MAP,
+          "the back-end request is SHMEM_MAP"
+        );
+        return front_map(
+          &body,
+          descriptor.expect("SHMEM_MAP carries the backing's descriptor"),
+        );
+      }
+      assert!(
+        self.reply_now(FIRST_REQUEST_QUEUE, head).is_none(),
+        "no answer before the front end has mapped the window"
+      );
+    }
+    panic!("the map was not sent within {TURNS} passes");
+  }
+
+  /// The front end acknowledges the map with `status`, and the device drains the ack: the SETUPMAPPING's errno.
+  fn ack(&mut self, head: u16, status: u64) -> i32 {
+    use slates_bridge_virtiofs::vhost_user::backend_request;
+    front_send_ack(&self.front, backend_request::SHMEM_MAP, status);
+    self
+      .device
+      .complete_dax_awaiting(&mut self.driver.memory, &mut Unlimited)
+      .unwrap();
+    self
+      .reply_now(FIRST_REQUEST_QUEUE, head)
+      .expect("the SETUPMAPPING is answered on the ack")
+  }
+
+  /// Maps `node`'s range `[foffset, foffset + len)` at window offset `moffset`, through the whole exchange: the map.
+  fn mapped(
+    &mut self,
+    node: u64,
+    (foffset, len): (u64, u64),
+    writable: bool,
+    moffset: u64,
+  ) -> FrontMap {
+    let head = self.submit(
+      FIRST_REQUEST_QUEUE,
+      Opcode::SetupMapping,
+      node,
+      &dax_setup_body(foffset, len, writable, moffset),
+    );
+    let map = self.until_mapped(head);
+    assert_eq!(
+      self.ack(head, 0),
+      0,
+      "SETUPMAPPING answered once the front end mapped it"
+    );
+    map
+  }
+
+  /// The volume's bytes of `node` from `at`, `len` of them at most.
+  fn volume_bytes(&mut self, node: u64, at: u64, len: usize) -> Vec<u8> {
+    let mut bytes = vec![0u8; len];
+    let mut bridge = backed_bridge(
+      &mut self.vol,
+      &mut self.store,
+      &mut self.handles,
+      &mut self.host,
+    );
+    let mut read = Vec::new();
+    bridge
+      .read(
+        ObjectId::new(node, 0),
+        &self.cx,
+        at,
+        u32::try_from(len).unwrap(),
+        &mut read,
+      )
+      .unwrap();
+    bytes.truncate(read.len());
+    bytes.copy_from_slice(&read);
+    bytes
+  }
+}
+
+/// §4.6 (goal G-vhost, step 1; `docs/bugs/2026-10-24-slates-own-dax-window-shows-stale-bytes-then-zeros-after-another-
+/// paths-write.md`). A window of slates' own device maps the file's backing, which the write boundary keeps equal to the
+/// file, so every other path's change shows in the guest's map with no message and no guest request. Do: map a page's
+/// file through a 2 MiB window; then, through the volume, overwrite bytes in place, write past the end inside the
+/// window, and cut the file; then revoke the inode as the daemon does and serve a GETATTR. Expect: the map is the
+/// backing's whole asked range, writable at the front end since the attachment may write; after each change the map
+/// shows the volume's bytes (the growth's hole and the cut's removal reading zero); and nothing reaches the front end
+/// after the map, no unmap above all, while the backing took every change (non-vacuity).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_window_over_a_backing_shows_every_other_paths_change_with_no_message() {
+  let mut f = BackedFixture::scratch("coherent");
+  let page = f.page;
+  let range = slates_mem::DAX_RANGE_BYTES;
+  let node = f.file("f", &vec![0x41; page]);
+  let map = f.mapped(node, (0, range), false, 0);
+  assert_eq!(
+    (map.fd_offset, map.shm_offset, map.len as u64, map.writable),
+    (0, 0, range, true),
+    "the whole asked range of the file's backing, writable at the front end"
   );
-  assert_eq!(reply_error(&init_reply), 0, "INIT served");
+  assert_eq!(
+    map.read(0, page),
+    vec![0x41; page],
+    "the window shows the file"
+  );
+  assert_eq!(f.device.dax_window_count(), 1, "the window is recorded");
+  other_paths_change_the_file_and_the_map_shows_each(&mut f, node, &map);
+  nothing_reaches_the_front_end_after_the_map(&mut f, node);
+  drop(map);
+}
 
-  let setup = dax_setup_body(0, (2 * 1024 * 1024) as u64, false, 0);
-  let request = message(Opcode::SetupMapping.to_wire(), 2, nodeid, &setup);
-  let queue = FIRST_REQUEST_QUEUE;
-  let head = driver.submit(usize::from(queue), &request, 4096, 1);
-  let pass = serve(&mut device, queue, &mut driver, &mut bridge, &cx, BATCH).unwrap();
+/// The other paths' changes of [`a_window_over_a_backing_shows_every_other_paths_change_with_no_message`]: an in-place
+/// write, a write past the old end inside the window, and a cut, each shown in the map at once.
+#[cfg(target_os = "linux")]
+fn other_paths_change_the_file_and_the_map_shows_each(
+  f: &mut BackedFixture,
+  node: u64,
+  map: &FrontMap,
+) {
+  let page = f.page;
+  let no = slates_vfs::ids::InodeNo(node);
+  f.vol.write(&mut f.store, no, 16, b"another path").unwrap();
+  assert_eq!(
+    map.read(16, 12),
+    b"another path".to_vec(),
+    "an in-place write shows in the map with no guest request"
+  );
+  let grown = 3 * page;
+  f.vol
+    .write(&mut f.store, no, u64::try_from(grown).unwrap(), b"grown")
+    .unwrap();
+  assert_eq!(
+    map.read(grown, 5),
+    b"grown".to_vec(),
+    "a write past the old end shows: the block moved in the volume, the backing did not"
+  );
+  assert_eq!(
+    map.read(page, page),
+    vec![0; page],
+    "the hole the growth opened reads zero"
+  );
+  f.vol.truncate(&mut f.store, no, 8).unwrap();
+  assert_eq!(map.read(0, 8), vec![0x41; 8], "what the cut kept stays");
+  assert_eq!(
+    map.read(8, page - 8),
+    vec![0; page - 8],
+    "what the cut removed reads zero"
+  );
+  assert_eq!(map.read(grown, 5), vec![0; 5]);
+}
 
+/// The quiet half of [`a_window_over_a_backing_shows_every_other_paths_change_with_no_message`]: the daemon's revoke of
+/// the inode and a GETATTR pass send the front end nothing, while the backing took every change.
+#[cfg(target_os = "linux")]
+fn nothing_reaches_the_front_end_after_the_map(f: &mut BackedFixture, node: u64) {
+  {
+    let mut bridge = backed_bridge(&mut f.vol, &mut f.store, &mut f.handles, &mut f.host);
+    assert_eq!(
+      f.device.request_revoke_inode(node, &mut bridge, &f.cx),
+      0,
+      "the daemon's revoke tears no window over a backing"
+    );
+  }
+  let getattr = f.submit(FIRST_REQUEST_QUEUE, Opcode::GetAttr, node, &[0u8; 16]);
+  assert_eq!(f.answer(FIRST_REQUEST_QUEUE, getattr), 0, "GETATTR served");
   assert!(
-    !pass.more_pending,
-    "the map was refused outright, not parked waiting for an acknowledgement of a descriptor it sent"
+    front_take(&f.front).is_none(),
+    "no SHMEM_UNMAP, nor any message: the window never left the guest"
   );
-  let (_, len) = driver
-    .reap(usize::from(queue))
-    .expect("the guest is answered rather than left waiting");
-  assert_eq!(
-    reply_error(&driver.reply_of(usize::from(queue), head, len)),
-    -EOPNOTSUPP,
-    "a window that cannot be confined is refused EOPNOTSUPP, never served wide"
-  );
-  assert_eq!(
-    device.dax_window_count(),
-    0,
-    "and no window is recorded for a map that never happened"
+  let counts = f.device.dax_backed_counts();
+  assert_eq!((counts.maps_sent, counts.unmaps_sent), (1, 0));
+  assert!(
+    f.store.shards_backings.written() > 0,
+    "non-vacuity: the changes went through the backing"
   );
 }
 
-/// §4.6 / A-9 / A-135 (message-based DAX, Piece C.2b, by use with no VMM): a guest FUSE_SETUPMAPPING over a
-/// message-based placer parks — its reply is withheld until the front end acknowledges the map — then completes.
-/// Do: on a real volume with a single-block file of known bytes, install a message placer over a socketpair,
-/// serve FUSE_INIT, then a guest SETUPMAPPING for a 2 MiB window chunk of the 1-page file. Expect: the service
-/// pass parks (no used element published, no window recorded yet); the placer sent a SHMEM_MAP carrying a
-/// descriptor **confined to the window** — its bytes read back by mapping it, and one byte past the window not
-/// mappable at all, which is the escape of 2026-10-18 closed; after the front end acknowledges, complete_dax_awaiting
-/// answers the guest SETUPMAPPING OK, records the one window, and releases the chain's charge — the async map-ack
-/// park, mirroring the owner's barrier, proven in-tree.
+/// §4.6 (G-vhost), a guest's stores reach the volume at its sync points (A-163's ingest). Do: map a file writable;
+/// store through the map; read the volume; send an FSYNC. Expect: the store is not in the volume before the FSYNC; the
+/// FSYNC is held, unanswered, while the store is written back; it is answered success once the store is in the volume,
+/// published first (an owner's barrier ran); the device counted the held request and the run it wrote.
 #[cfg(target_os = "linux")]
-#[allow(clippy::cognitive_complexity)]
 #[test]
-fn a_message_based_setupmapping_parks_until_the_front_end_acks_then_answers_the_guest() {
-  use slates_bridge_virtiofs::device::DaxWindowEntry;
-  use slates_bridge_virtiofs::vhost_user::{BackendReqChannel, MessagePlacer, backend_request};
-
-  // The message-based placer confines the descriptor it sends with a `udmabuf` (§4.6), so this proof needs
-  // `/dev/udmabuf`. Where the kernel or the container has none, the placer refuses the map by design — a
-  // different property, and not this test's — so it skips loudly rather than failing, as the suite's other
-  // environment gates do. Docker's linuxkit VM has no such device; a Fedora host does.
-  if rustix::fs::open(
-    "/dev/udmabuf",
-    rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CLOEXEC,
-    rustix::fs::Mode::empty(),
-  )
-  .is_err()
-  {
-    eprintln!(
-      "skipping the message-based SETUPMAPPING proof: /dev/udmabuf is unavailable, so the placer refuses \
-       the map rather than confining it"
-    );
-    return;
-  }
-  let page = rustix::param::page_size().max(1);
-  let mut store = dax_shared_store(page, "msgmap");
-  let mut vol = volume(&mut store);
-  let root = vol.root_inode(&store).unwrap();
-  let no = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
-  // One page of known bytes: above inline, within one chunk -> a single unsealed block the DAX gate maps.
-  vol.write(&mut store, no, 0, &vec![0x5Au8; page]).unwrap();
-  let nodeid = no.0;
-
-  let (mut device, mut driver) = device_and_driver();
-  let (front, back) = rustix::net::socketpair(
-    rustix::net::AddressFamily::UNIX,
-    rustix::net::SocketType::STREAM,
-    rustix::net::SocketFlags::CLOEXEC,
-    None,
-  )
-  .unwrap();
-  let placer: MessagePlacer<DaxWindowEntry> =
-    MessagePlacer::new(BackendReqChannel::adopt(back), page, (page * 16) as u64);
-  device.install_dax_message_placer(placer);
-  assert!(device.dax_offered(), "the device serves message-based DAX");
-
-  let cx = context();
-  let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
-
-  let init_reply = dax_exchange(
-    &mut device,
-    &mut driver,
-    &mut bridge,
-    &cx,
-    (Opcode::Init, 1, ROOT),
-    &dax_init_body(),
+fn a_guests_store_through_a_writable_window_reaches_the_volume_before_its_fsync_is_answered() {
+  let mut f = BackedFixture::scratch("ingest");
+  let page = f.page;
+  let node = f.file("f", &vec![0x41; page]);
+  let mut map = f.mapped(node, (0, slates_mem::DAX_RANGE_BYTES), true, 0);
+  map.store(100, b"the guest's store");
+  assert_eq!(
+    f.volume_bytes(node, 100, 17),
+    vec![0x41; 17],
+    "a store through the map is the guest's until it syncs"
   );
-  assert_eq!(reply_error(&init_reply), 0, "INIT served");
-
-  // SETUPMAPPING for a 2 MiB window chunk of the 1-page file (read): the placer caps the map to the file's page.
-  let setup = dax_setup_body(0, (2 * 1024 * 1024) as u64, false, 0);
-  let request = message(Opcode::SetupMapping.to_wire(), 2, nodeid, &setup);
-  let queue = FIRST_REQUEST_QUEUE;
-  let head = driver.submit(usize::from(queue), &request, 4096, 1);
-  let pass = serve(&mut device, queue, &mut driver, &mut bridge, &cx, BATCH).unwrap();
+  let barriers = f.barriers;
+  let fsync = f.submit(FIRST_REQUEST_QUEUE, Opcode::FSync, node, &[0u8; 16]);
+  f.pass();
   assert!(
-    pass.more_pending,
-    "the pass parked the map and asks to come back"
+    f.reply_now(FIRST_REQUEST_QUEUE, fsync).is_none(),
+    "the FSYNC is held while the store is written back"
+  );
+  assert_eq!(f.answer(FIRST_REQUEST_QUEUE, fsync), 0, "FSYNC answered");
+  assert_eq!(
+    f.volume_bytes(node, 100, 17),
+    b"the guest's store".to_vec(),
+    "the store is in the volume by the FSYNC's answer"
   );
   assert!(
-    driver.reap(usize::from(queue)).is_none(),
-    "no used element is published while the map is parked"
+    f.barriers > barriers,
+    "the write-back was published before the reply"
+  );
+  let counts = f.device.dax_backed_counts();
+  assert_eq!(counts.ingests_held, 1);
+  assert!(
+    counts.session.ingested >= 1,
+    "non-vacuity: a run was written"
+  );
+  drop(map);
+}
+
+/// §4.6 (G-vhost), a writable upgrade of a live window. A Linux guest upgrades a range from read-only to writable with
+/// a second SETUPMAPPING over the same window (`fuse_upgrade_dax_mapping`), and the vhost-user protocol forbids a map
+/// over a live one. Do: map a file read-only; ask the same window writable; store through the map and FSYNC. Expect:
+/// the upgrade is answered success with no second map and no unmap (the front end maps the window writable already);
+/// the store reaches the volume, since the upgrade marked the range writable.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_writable_upgrade_of_a_live_window_is_answered_with_no_message() {
+  let mut f = BackedFixture::scratch("upgrade");
+  let page = f.page;
+  let range = slates_mem::DAX_RANGE_BYTES;
+  let node = f.file("f", &vec![0x41; page]);
+  let mut map = f.mapped(node, (0, range), false, 0);
+  let upgrade = f.submit(
+    FIRST_REQUEST_QUEUE,
+    Opcode::SetupMapping,
+    node,
+    &dax_setup_body(0, range, true, 0),
   );
   assert_eq!(
-    device.dax_window_count(),
+    f.answer(FIRST_REQUEST_QUEUE, upgrade),
     0,
-    "the window is not recorded until the front end acknowledges"
+    "the upgrade is answered"
   );
-
-  // The front end receives the SHMEM_MAP and its descriptor. Since 2026-10-19 that descriptor is a `udmabuf`
-  // confined to the window (§4.6), so it is read by mapping it rather than with `pread` — a dmabuf has no read
-  // method — and the length it maps to is the point: the arena's object is far larger, and an unconfined
-  // descriptor let the front end map all of it, a neighbour's blocks included
-  // (`docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md`).
-  let got_fd = front_recv_shmem_map(&front);
-  // SAFETY: a fresh mapping at an address the kernel chooses, read-only and shared, of `page` bytes of a
-  // descriptor this test owns; it is unmapped below, with the same length, before the descriptor is dropped.
-  let window = unsafe {
-    rustix::mm::mmap(
-      std::ptr::null_mut(),
-      page,
-      rustix::mm::ProtFlags::READ,
-      rustix::mm::MapFlags::SHARED,
-      &got_fd,
-      0,
-    )
-  }
-  .expect("the front end maps the window it was sent");
-  // SAFETY: `window` is the mapping just made, of `page` bytes, and nothing else aliases it for this borrow.
-  let bytes = unsafe { std::slice::from_raw_parts(window.cast::<u8>(), page) };
+  let counts = f.device.dax_backed_counts();
   assert_eq!(
-    &bytes[..64],
-    &[0x5Au8; 64],
-    "the SHMEM_MAP carried the file's content block"
+    (counts.maps_sent, counts.maps_kept, counts.unmaps_sent),
+    (1, 1, 0),
+    "one map, the upgrade kept, nothing unmapped"
   );
-  // The confinement itself: one byte past the authorized window is not reachable through what was sent.
-  // SAFETY: the same call, expected to be refused; the result is never dereferenced, and is unmapped if the
-  // kernel surprises us by allowing it.
-  let past = unsafe {
-    rustix::mm::mmap(
-      std::ptr::null_mut(),
-      page.saturating_mul(2),
-      rustix::mm::ProtFlags::READ,
-      rustix::mm::MapFlags::SHARED,
-      &got_fd,
-      0,
-    )
+  assert_eq!(f.device.dax_window_count(), 1);
+  map.store(0, b"upgraded");
+  let fsync = f.submit(FIRST_REQUEST_QUEUE, Opcode::FSync, node, &[0u8; 16]);
+  assert_eq!(f.answer(FIRST_REQUEST_QUEUE, fsync), 0);
+  assert_eq!(f.volume_bytes(node, 0, 8), b"upgraded".to_vec());
+  drop(map);
+}
+
+/// §4.6 (G-vhost), a write-back the volume refuses fails the request that asked for it (A-163's rule;
+/// `docs/bugs/2026-10-24-a-refused-dax-write-back-answered-its-fsync-success.md`). Do: map a sparse file twice the
+/// arena's size writable, store into every page of it, and FSYNC; then write the same bytes through the volume. Expect:
+/// the FSYNC is answered exactly the errno the FUSE edge gives the volume's refusal of that write (the arena's
+/// exhaustion), never success; the refusal is counted.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_refused_write_back_fails_the_fsync_that_asked_for_it() {
+  let mut f = BackedFixture::scratch("refused");
+  let page = f.page;
+  let node = f.file("f", &[]);
+  let no = slates_vfs::ids::InodeNo(node);
+  let len = PAST_THE_ARENA_PAGES * page;
+  f.vol
+    .truncate(&mut f.store, no, u64::try_from(len).unwrap())
+    .unwrap();
+  let mut map = f.mapped(node, (0, slates_mem::DAX_RANGE_BYTES), true, 0);
+  map.store(0, &vec![0x5A; len]);
+  let fsync = f.submit(FIRST_REQUEST_QUEUE, Opcode::FSync, node, &[0u8; 16]);
+  let answered = f.answer(FIRST_REQUEST_QUEUE, fsync);
+  let refusal = f
+    .vol
+    .write(&mut f.store, no, 0, &vec![0x5A; len])
+    .expect_err("the arena still cannot hold the write-back");
+  let named = slates_bridge_fuse::bridge::errno(refusal.clone());
+  assert_ne!(named, 0);
+  assert_eq!(
+    answered, -named,
+    "the FSYNC carries the write-back's refusal as the FUSE edge names it ({refusal:?})"
+  );
+  assert!(f.device.dax_backed_counts().session.ingest_refused >= 1);
+  drop(map);
+}
+
+/// §4.6 (G-vhost), the device's end. Do: map a file writable, store through the map, then run the end's ingest as the
+/// serve loop runs it before the terminal step. Expect: the ingest wrote, and the store is in the volume.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_guests_unsynced_store_reaches_the_volume_when_the_device_ends() {
+  let mut f = BackedFixture::scratch("end");
+  let page = f.page;
+  let node = f.file("f", &vec![0x41; page]);
+  let mut map = f.mapped(node, (0, slates_mem::DAX_RANGE_BYTES), true, 0);
+  map.store(8, b"never synced");
+  let slice = SLICE_PAGES * u64::try_from(page).unwrap();
+  let mut bridge = backed_bridge(&mut f.vol, &mut f.store, &mut f.handles, &mut f.host);
+  assert!(
+    f.device.begin_end_ingest(&mut bridge),
+    "an ingest is owed at the end"
+  );
+  let wrote = (0..TURNS)
+    .find_map(|_| f.device.end_ingest_step(&mut bridge, &f.cx, slice))
+    .expect("the end's ingest completes");
+  assert!(wrote, "the end's ingest wrote");
+  drop(bridge);
+  assert_eq!(f.volume_bytes(node, 8, 12), b"never synced".to_vec());
+  drop(map);
+}
+
+/// §4.6 (G-vhost), what a window hands the VMM: one file's backing and nothing else, by construction, with no host
+/// device needed (`docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md`, closed by A-138
+/// with a udmabuf, now by the backing). Do: make two files of different bytes; map the first through a 2 MiB window and
+/// read the whole map. Expect: the first file's bytes, then zeros, and not one byte of the second file.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_window_hands_the_vmm_one_files_bytes_and_nothing_else() {
+  let mut f = BackedFixture::scratch("confined");
+  let page = f.page;
+  let first = f.file("first", &vec![0x41; page]);
+  let _second = f.file("second", &vec![0x42; page]);
+  let map = f.mapped(first, (0, slates_mem::DAX_RANGE_BYTES), false, 0);
+  let whole = map.read(0, map.len);
+  assert_eq!(
+    &whole[..page],
+    vec![0x41; page].as_slice(),
+    "the file's bytes"
+  );
+  assert!(
+    whole[page..].iter().all(|byte| *byte == 0),
+    "past the file the map reads zero"
+  );
+  assert!(
+    !whole.contains(&0x42),
+    "nothing of another file is reachable through the map"
+  );
+  drop(map);
+}
+
+/// §4.6 (G-vhost), hostile SETUPMAPPINGs. Do: ask a file range off a page, a window range off a page, a window past the
+/// guest's window, an empty range, and the root directory. Expect: each refused (`EINVAL`, `EISDIR` for the directory)
+/// with no window recorded and nothing sent to the front end.
+#[cfg(target_os = "linux")]
+#[test]
+fn hostile_setupmappings_are_refused_with_no_window_and_no_message() {
+  /// Format: Linux `EINVAL` and `EISDIR`.
+  const EINVAL: i32 = 22;
+  const EISDIR: i32 = 21;
+  let mut f = BackedFixture::scratch("hostile");
+  let page = u64::try_from(f.page).unwrap();
+  let range = slates_mem::DAX_RANGE_BYTES;
+  let node = f.file("f", &vec![0x41; f.page]);
+  let window = WINDOW_RANGES * range;
+  for (what, nodeid, body, want) in [
+    (
+      "a file range off a page",
+      node,
+      dax_setup_body(1, range, false, 0),
+      EINVAL,
+    ),
+    (
+      "a window range off a page",
+      node,
+      dax_setup_body(0, range, false, 1),
+      EINVAL,
+    ),
+    (
+      "a window past the guest's",
+      node,
+      dax_setup_body(0, range, false, window),
+      EINVAL,
+    ),
+    (
+      "an empty range",
+      node,
+      dax_setup_body(0, 0, false, 0),
+      EINVAL,
+    ),
+    (
+      "the root directory",
+      ROOT,
+      dax_setup_body(0, page, false, 0),
+      EISDIR,
+    ),
+  ] {
+    let head = f.submit(FIRST_REQUEST_QUEUE, Opcode::SetupMapping, nodeid, &body);
+    assert_eq!(f.answer(FIRST_REQUEST_QUEUE, head), -want, "{what}");
+  }
+  assert_eq!(f.device.dax_window_count(), 0, "no window recorded");
+  assert!(
+    front_take(&f.front).is_none(),
+    "nothing sent to the front end"
+  );
+}
+
+/// §4.6 (G-vhost), a forgotten node's backing is let go. Do: map a file, remove the mapping as a guest does before it
+/// forgets the inode, then FORGET it. Expect: the REMOVEMAPPING sends one unmap and leaves no window; once the FORGET is
+/// served the backing is gone from the store and counted released.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_forget_lets_the_nodes_backing_go_after_its_mapping_is_removed() {
+  use slates_bridge_virtiofs::vhost_user::backend_request;
+  let mut f = BackedFixture::scratch("forget");
+  let page = f.page;
+  let range = slates_mem::DAX_RANGE_BYTES;
+  let node = f.file("f", &vec![0x41; page]);
+  let map = f.mapped(node, (0, range), false, 0);
+  let mut remove = Vec::new();
+  remove.extend_from_slice(&1u32.to_le_bytes());
+  remove.extend_from_slice(&0u32.to_le_bytes());
+  remove.extend_from_slice(&0u64.to_le_bytes());
+  remove.extend_from_slice(&range.to_le_bytes());
+  let head = f.submit(FIRST_REQUEST_QUEUE, Opcode::RemoveMapping, node, &remove);
+  f.pass();
+  assert_eq!(
+    f.reply_now(FIRST_REQUEST_QUEUE, head),
+    Some(0),
+    "REMOVEMAPPING answered"
+  );
+  let (code, _, descriptor) = front_take(&f.front).expect("an unmap sent");
+  assert_eq!(code, backend_request::SHMEM_UNMAP);
+  assert!(descriptor.is_none(), "an unmap carries no descriptor");
+  assert_eq!(f.device.dax_window_count(), 0);
+  drop(map);
+  let backed = |f: &BackedFixture| {
+    f.store
+      .shards_backings
+      .backs(f.vol.prefix(), slates_vfs::ids::InodeNo(node))
   };
   assert!(
-    past.is_err(),
-    "the descriptor the front end holds covers the window and nothing past it"
+    backed(&f),
+    "the backing outlives its mapping until the node is forgotten"
   );
-  // SAFETY: unmapping exactly the mapping made above, with its own address and length.
-  unsafe { rustix::mm::munmap(window, page) }.expect("the window unmaps");
-  front_send_ack(&front, backend_request::SHMEM_MAP, 0);
+  let forget = f.submit(HIPRIO_QUEUE, Opcode::Forget, node, &1u64.to_le_bytes());
+  let _ = forget;
+  f.pass();
+  assert!(!backed(&f), "the FORGET let the backing go");
+  assert_eq!(f.device.dax_backed_counts().released, 1);
+}
 
-  // The device drains the ack, answers the guest, records the window, and releases the chain's charge.
-  let completed = device
-    .complete_dax_awaiting(&mut driver.memory, &mut bridge, &cx, &mut Unlimited)
-    .unwrap();
+/// §4.6 (G-vhost), a snapshot device's advance. Do: map a file; re-validate the device's windows as an advance does.
+/// Expect: no window torn and nothing sent; the next pass is busy with a refill of the backing (counted), and the map
+/// still shows the file.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_advance_refills_the_backings_and_tears_no_window() {
+  let mut f = BackedFixture::scratch("advance");
+  let page = f.page;
+  let node = f.file("f", &vec![0x41; page]);
+  let map = f.mapped(node, (0, slates_mem::DAX_RANGE_BYTES), false, 0);
+  {
+    let mut bridge = backed_bridge(&mut f.vol, &mut f.store, &mut f.handles, &mut f.host);
+    assert_eq!(
+      f.device.revalidate_windows(&mut bridge, &f.cx),
+      0,
+      "no window torn"
+    );
+  }
+  assert!(f.pass().busy, "the refill runs before anything more");
+  for _ in 0..TURNS {
+    if !f.pass().busy {
+      break;
+    }
+  }
   assert!(
-    completed.is_some(),
-    "the parked SETUPMAPPING completed on the ack"
+    f.device.dax_backed_counts().session.refilled >= 1,
+    "the backing was refilled"
   );
-  let (id, len) = driver
-    .reap(usize::from(queue))
-    .expect("the used element is published after the ack");
-  assert_eq!(id, head);
-  assert_eq!(
-    reply_error(&driver.reply_of(usize::from(queue), head, len)),
-    0,
-    "SETUPMAPPING is answered OK once the front end has mapped the window"
-  );
-  assert_eq!(device.dax_window_count(), 1, "the one window is recorded");
+  assert_eq!(map.read(0, page), vec![0x41; page]);
+  assert!(front_take(&f.front).is_none(), "nothing sent");
+  drop(map);
+}
 
-  drop(front);
+/// An overlay over a simulated host holding `/big`, an untouched base file of four pages of 0x21, mapped read-only
+/// through a 2 MiB window; its number reserved by a publication when `published`, so a later request of it waits for no
+/// barrier. The fixture, the node and the map.
+#[cfg(target_os = "linux")]
+fn overlay_with_mapped_big(tag: &str, published: bool) -> (BackedFixture, u64, FrontMap) {
+  let page = rustix::param::page_size().max(1);
+  let mut host = slates_vfs::host::sim::SimHost::new();
+  host.replace_file("/big", &vec![0x21; 4 * page]);
+  let mut f = BackedFixture::overlay(tag, host);
+  let node = {
+    let mut bridge = backed_bridge(&mut f.vol, &mut f.store, &mut f.handles, &mut f.host);
+    let root = bridge.root(&f.cx).unwrap();
+    bridge
+      .lookup(ObjectId::new(root, 0), &f.cx, "big")
+      .unwrap()
+      .ino
+  };
+  if published {
+    f.vol.mark_published(&f.store);
+  }
+  let map = f.mapped(node, (0, slates_mem::DAX_RANGE_BYTES), false, 0);
+  assert_eq!(map.read(0, page), vec![0x21; page]);
+  (f, node, map)
+}
+
+/// The disk's in-place edit of `/big` in [`overlay_with_mapped_big`]'s host, then a GETATTR of it through the device:
+/// its head, after the pass that served it.
+#[cfg(target_os = "linux")]
+fn edit_big_and_getattr(f: &mut BackedFixture, node: u64) -> u16 {
+  let page = f.page;
+  f.host
+    .as_mut()
+    .unwrap()
+    .write_in_place("/big", &vec![0x5C; 4 * page], 1_000);
+  let getattr = f.submit(FIRST_REQUEST_QUEUE, Opcode::GetAttr, node, &[0u8; 16]);
+  f.pass();
+  getattr
+}
+
+/// §4.6 (G-vhost), beneath an overlay (A-163's refill). An untouched base file follows the disk, so a change the disk
+/// makes reaches the guest's map when the base plane adopts it, and a reply that could reveal the change waits for the
+/// map to show it. Do: map an untouched base file read-only, its number published; edit it in place on the host; GETATTR
+/// it through the device. Expect: the GETATTR, which waits for no barrier, is held by the service pass that served it
+/// and adopted the edit; by the time it is published the map shows the disk's new bytes, and the refill was counted.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_reply_that_could_reveal_the_disks_change_waits_until_the_map_shows_it() {
+  let (mut f, node, map) = overlay_with_mapped_big("refill", true);
+  let barriers = f.barriers;
+  let getattr = edit_big_and_getattr(&mut f, node);
+  assert!(
+    f.reply_now(FIRST_REQUEST_QUEUE, getattr).is_none(),
+    "the reply that could reveal the change is held while the map is refilled"
+  );
+  assert_eq!(
+    f.answer(FIRST_REQUEST_QUEUE, getattr),
+    0,
+    "GETATTR answered"
+  );
+  assert_eq!(
+    f.barriers, barriers,
+    "the GETATTR waited for no barrier: the service pass held it"
+  );
+  assert_eq!(
+    map.read(0, f.page),
+    vec![0x5C; f.page],
+    "the map shows the disk's change by the reply"
+  );
+  let counts = f.device.dax_backed_counts();
+  assert!(counts.replies_held >= 1 && counts.session.refilled >= 1);
+  drop(map);
+}
+
+/// §4.6 (G-vhost), the same beneath an overlay, for a reply the owner's barrier holds first. Do: as above, with the
+/// file's number not yet reserved by a publication, so every request of it waits for the barrier (A-150). Expect: the
+/// GETATTR's used element is held after the barrier completes, until the map shows the disk's new bytes.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_reply_held_for_the_owners_barrier_waits_for_the_refill_too() {
+  let (mut f, node, map) = overlay_with_mapped_big("refillbarrier", false);
+  let barriers = f.barriers;
+  let getattr = edit_big_and_getattr(&mut f, node);
+  assert!(
+    f.barriers > barriers,
+    "the GETATTR waited for the owner's barrier first"
+  );
+  assert!(
+    f.reply_now(FIRST_REQUEST_QUEUE, getattr).is_none(),
+    "after the barrier, the reply is held while the map is refilled"
+  );
+  assert_eq!(
+    f.answer(FIRST_REQUEST_QUEUE, getattr),
+    0,
+    "GETATTR answered"
+  );
+  assert_eq!(map.read(0, f.page), vec![0x5C; f.page]);
+  assert!(f.device.dax_backed_counts().replies_held >= 1);
+  drop(map);
 }

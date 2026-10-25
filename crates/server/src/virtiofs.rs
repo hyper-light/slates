@@ -214,6 +214,21 @@ impl BridgeAccess for ShardBridge {
     state::with_state(|s| f(&mut s.attachments))
   }
 
+  /// The owner shard's DAX backings, reachable when the volume is not (A-163).
+  fn with_backings<R>(
+    &mut self,
+    f: impl FnOnce(&mut slates_vfs::shards_backing::ShardsBackings) -> R,
+  ) -> Option<R> {
+    state::with_state(|s| f(&mut s.store.shards_backings))
+  }
+
+  /// The owner's copy slice in whole pages (`DaemonConfig::copy_slice_page_bytes`); one page when the owner's state
+  /// is out of reach, where no slice runs anyway.
+  fn copy_slice_bytes(&mut self) -> u64 {
+    state::with_state(|s| s.config.copy_slice_page_bytes())
+      .unwrap_or_else(|| u64::try_from(rustix::param::page_size().max(1)).unwrap_or(u64::MAX))
+  }
+
   /// The live-tree fence the NFS mount applies (AUD-29-83): while it stands the guest's requests wait in its
   /// rings, asked again each heartbeat — the cadence at which the confirmations that restore the lease arrive.
   fn fenced(&mut self) -> Option<u64> {

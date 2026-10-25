@@ -242,6 +242,19 @@ pub trait BridgeAccess {
   /// the device), so the terminal step can still withdraw the device's attachment (AUD-29-70). `None` only
   /// when the owner's state is out of reach.
   fn with_registry<R>(&mut self, f: impl FnOnce(&mut Attachments) -> R) -> Option<R>;
+
+  /// Runs `f` with the store's DAX backings alone — reachable when the volume is not, so the terminal step of a device
+  /// whose volume is gone still lets its backings go and gives their charge back (A-163). `None` only when the owner's
+  /// state is out of reach.
+  fn with_backings<R>(
+    &mut self,
+    f: impl FnOnce(&mut slates_vfs::shards_backing::ShardsBackings) -> R,
+  ) -> Option<R>;
+
+  /// The bytes one slice of copy-bound DAX work (a backing's fill, ingest or refill) may copy on this shard now: the
+  /// owner's copy slice in whole pages (half the live step quantum at the measured memcpy rate), at least one page.
+  /// Asked each pass, since the step quantum is live.
+  fn copy_slice_bytes(&mut self) -> u64;
 }
 
 /// Why the loop ended.
@@ -332,12 +345,33 @@ async fn serve_until_idle<S: VmmSeam, B: BridgeAccess>(
 }
 
 /// One service pass and, when a mutation's reply waits for the owner's barrier, the barrier and the
-/// completion; whether more work is pending.
+/// completion; whether more work is pending. With the message placer (Linux), its backed DAX takes a step first
+/// (`AdmittedDevice::dax_turn`); a busy step serves no chain this pass.
 fn one_pass<S: VmmSeam, B: BridgeAccess>(
   admitted: &mut AdmittedDevice<S>,
   bridge: &mut B,
   counters: &mut LoopCounters,
 ) -> Result<bool, ServeError> {
+  #[cfg(target_os = "linux")]
+  {
+    let slice = bridge.copy_slice_bytes();
+    let turned = bridge
+      .with_bridge(|b, registry| admitted.dax_turn(b, registry, slice))
+      .map_err(ServeError::Authority)??;
+    if turned.barrier_owed {
+      // A request the step served changed what survives a restart, or its ingest wrote: publish before the guest
+      // learns its reply, as a mutation's pass does.
+      let captured = bridge.barrier();
+      bridge
+        .with_bridge(|b, registry| admitted.complete_barrier(b, registry, captured))
+        .map_err(ServeError::Authority)??;
+    }
+    if turned.busy {
+      counters.passes = counters.passes.saturating_add(1);
+      slates_rt::registry::with_current(|ctx| ctx.note_activity());
+      return Ok(true);
+    }
+  }
   let pass = bridge
     .with_bridge(|b, registry| admitted.service(b, registry))
     .map_err(ServeError::Authority)??;
@@ -373,20 +407,61 @@ async fn drive_dax_acks<S: VmmSeam, B: BridgeAccess>(
     if let Err(error) = readable(raw).await {
       return Some(EndReason::DoorbellLost(error));
     }
-    match bridge.with_bridge(|b, registry| admitted.complete_dax_map(b, registry)) {
+    match bridge.with_bridge(|_, registry| admitted.complete_dax_map(registry)) {
       Ok(Ok(_)) => {}
       Ok(Err(e)) => return Some(EndReason::Faulted(e)),
       Err(gone) => return Some(EndReason::VolumeGone(gone)),
     }
   }
-  // Opportunistically settle any arrived unmap-acks (deferred unpins) without blocking.
+  // Opportunistically settle any arrived unmap-acks without blocking, so the outstanding ring stays short.
   if admitted.dax_outstanding() {
-    match bridge.with_bridge(|b, registry| admitted.complete_dax_map(b, registry)) {
+    match bridge.with_bridge(|_, registry| admitted.complete_dax_map(registry)) {
       Ok(Ok(_)) | Err(_) => {}
       Ok(Err(e)) => return Some(EndReason::Faulted(e)),
     }
   }
   None
+}
+
+/// The ingest the guest's stores through its maps take before the device ends (§4.6, A-163): every backing with ranges
+/// asked writable is compared with the volume a slice at a time, yielding between slices, and what it wrote is published
+/// before the terminal step lets the backings go. It waits while the owner is fenced, as every pass does, and the
+/// guest's stores are lost, counted, only when the attachment's authority or its volume is gone. Linux only.
+#[cfg(target_os = "linux")]
+async fn drive_end_ingest<S: VmmSeam, B: BridgeAccess>(
+  admitted: &mut AdmittedDevice<S>,
+  bridge: &mut B,
+) {
+  if !bridge
+    .with_bridge(|b, _| admitted.begin_end_ingest(b))
+    .unwrap_or(false)
+  {
+    return;
+  }
+  loop {
+    if let Some(wait) = bridge.fenced() {
+      if futures::sleep(wait).await.is_err() {
+        admitted.abort_end_ingest();
+        return;
+      }
+      continue;
+    }
+    let slice = bridge.copy_slice_bytes();
+    match bridge.with_bridge(|b, registry| admitted.end_ingest_step(b, registry, slice)) {
+      Ok(Ok(None)) => futures::yield_now().await,
+      Ok(Ok(Some(wrote))) => {
+        if wrote {
+          // A refused publication is counted by the owner's barrier; the stores are in the volume either way.
+          let _captured = bridge.barrier();
+        }
+        return;
+      }
+      Ok(Err(_)) | Err(_) => {
+        admitted.abort_end_ingest();
+        return;
+      }
+    }
+  }
 }
 
 /// What the loop counted, reported in [`ServeEnd`].
@@ -459,13 +534,20 @@ pub async fn serve_loop<S: VmmSeam, B: BridgeAccess>(
       break reason;
     }
   };
+  // The guest's stores through its DAX maps reach the volume before anything of the attachment is let go.
+  #[cfg(target_os = "linux")]
+  drive_end_ingest(&mut admitted, &mut bridge).await;
   // The terminal step always runs to its end (AUD-29-70): through the bridge when the volume is there, else
-  // through the registry alone — the volume's references went with it.
+  // through the registry alone — the volume's references went with it — and the store's backings alone.
   let reclaimed = match bridge.with_bridge(|b, registry| admitted.reclaim(b, registry)) {
     Ok(reclaimed) => reclaimed,
-    Err(gone) => bridge
-      .with_registry(|registry| admitted.abandon(registry))
-      .unwrap_or(Err(ReclaimError::Authority(gone))),
+    Err(gone) => {
+      #[cfg(target_os = "linux")]
+      let _released = bridge.with_backings(|backings| admitted.release_backings(backings));
+      bridge
+        .with_registry(|registry| admitted.abandon(registry))
+        .unwrap_or(Err(ReclaimError::Authority(gone)))
+    }
   };
   unregister(id);
   ServeEnd {

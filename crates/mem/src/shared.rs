@@ -963,12 +963,12 @@ mod platform {
       rustix::fs::MemfdFlags::CLOEXEC | rustix::fs::MemfdFlags::ALLOW_SEALING,
     )
     .map_err(|e| refused("memfd_create", e))?;
-    // Sealed against shrinking, which costs nothing and buys the DAX window its confinement. Nothing in slates
-    // shrinks a memory object — the single `ftruncate` is the sizing one below, and a grow is unaffected by this
-    // seal — but `UDMABUF_CREATE` refuses a memfd without `F_SEAL_SHRINK`, and a udmabuf is how a guest's DAX
-    // window is handed out as a descriptor covering **only** that window instead of the whole arena
-    // (`docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md`). Sealing here rather
-    // than at the one call site keeps the property true of every object, so no caller has to remember it.
+    // Sealed against shrinking, which costs nothing: nothing in slates shrinks a memory object — the single
+    // `ftruncate` is the sizing one below, and a grow is unaffected by this seal — and the seal keeps any other holder
+    // of the descriptor (the anchor hands objects across processes) from cutting it under this process's mapping,
+    // which would make the next access a `SIGBUS`. It was added for `UDMABUF_CREATE`, which refuses a memfd without
+    // `F_SEAL_SHRINK` (A-138); since A-168 nothing carves a udmabuf, and the seal stays for the reason above. Sealing
+    // here rather than at a call site keeps the property true of every object, so no caller has to remember it.
     rustix::fs::fcntl_add_seals(&fd, rustix::fs::SealFlags::SHRINK)
       .map_err(|e| refused("fcntl_add_seals", e))?;
     Ok(Created { fd })

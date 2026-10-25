@@ -57,6 +57,10 @@ pub mod capability;
 pub mod credit;
 // The DAX cache region maps content blocks' pages into a guest's page table (`MAP_FIXED`), which is a Unix feature;
 // the primitive is exercised on macOS over an `shm` object, so it is `cfg(unix)`, not Linux-only.
+/// The message placer's DAX windows over per-file backings (§4.6, goal G-vhost): what an out-of-process VMM maps stays
+/// equal to the file with no message, and no window is torn down under a guest that holds it.
+#[cfg(target_os = "linux")]
+pub mod backed;
 #[cfg(unix)]
 pub mod dax;
 pub mod device;
@@ -68,10 +72,6 @@ pub mod serve;
 pub mod sim;
 // The inherited-descriptor binding (vhost-user): eventfds, epoll and `SO_PEERCRED` are Linux's, and so is the
 // VMM side that speaks it to a KVM guest.
-/// Confining a guest's DAX window to a descriptor covering only that window (§4.6): the Linux `udmabuf`
-/// carve-out the message-based placer narrows the arena's object with before sending it.
-#[cfg(target_os = "linux")]
-mod udmabuf;
 #[cfg(target_os = "linux")]
 pub mod vhost_user;
 pub mod virtqueue;

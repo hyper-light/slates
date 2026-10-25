@@ -82,6 +82,12 @@ const ENOTEMPTY: i32 = 39;
 const ENAMETOOLONG: i32 = 36;
 /// Format: EMFILE, too many open files (the bridge's handle table is full).
 const EMFILE: i32 = 24;
+/// Format: Linux ENOMEM, the answer to a DAX mapping past the shard's fill budget (A-163).
+#[cfg(unix)]
+const ENOMEM: i32 = 12;
+/// Format: Linux EBUSY, the answer to a DAX mapping of a file an in-process guest maps writable (A-163).
+#[cfg(unix)]
+const EBUSY: i32 = 16;
 /// Format: Linux ESTALE, a stale file handle: the node names a file no longer reachable (A-151: a base file that left
 /// its name with no descriptor held). A kernel's path walk that meets it looks the name up again.
 const ESTALE: i32 = 116;
@@ -664,6 +670,35 @@ pub fn errno(e: VfsError) -> i32 {
     // Until A-151 (2026-10-22) this fell to `EIO`, against A-61's text and the volume core's own name for it.
     VfsError::StaleHandle => ESTALE,
     _ => EIO,
+  }
+}
+
+/// The errno a guest's DAX mapping is answered for a backed session's refusal (§4.6, A-163): one mapping for every
+/// transport that hands a VMM a file's backing, the Shards route and slates' own virtio-fs device.
+#[cfg(unix)]
+pub fn dax_refused_errno(refused: &slates_bridge_core::dax_backing::Refused) -> i32 {
+  use slates_bridge_core::dax_backing::Refused;
+  match refused {
+    Refused::Malformed => EINVAL,
+    Refused::Unreachable(e) | Refused::Witness(e) => errno(e.clone()),
+    Refused::NotAFile { directory: true } => EISDIR,
+    Refused::NotAFile { directory: false } => EINVAL,
+    Refused::ReadOnly => EPERM,
+    Refused::Budget => ENOMEM,
+    Refused::Object => EIO,
+    Refused::Busy => EBUSY,
+  }
+}
+
+/// The errno a request that asked for a guest's stores answers when their write-back stopped at `failure` (§4.6,
+/// A-163), so the guest's fsync or close fails rather than claim bytes durable that are not.
+#[cfg(unix)]
+pub fn dax_failure_errno(failure: &slates_bridge_core::dax_backing::Failure) -> i32 {
+  use slates_bridge_core::dax_backing::Failure;
+  match failure {
+    Failure::Object => EIO,
+    Failure::ReadOnly => EPERM,
+    Failure::Volume(e) => errno(e.clone()),
   }
 }
 

@@ -1,6 +1,8 @@
 # A guest's DAX window onto slates' own device shows stale bytes, then zeros, after another path's write (§4.6, A-9)
 
 - **Date:** 2026-10-24
+- **Status:** fixed in the device 2026-10-25 (A-168), proven by hermetic tests against a stand-in front end; the
+  real crosvm guest's proof is goal G-vhost's step 3.
 - **Subsystem:** the DAX revoke of slates' own virtio-fs device over vhost-user:
   - `crates/vfs/src/dax.rs`, the registry's step-5 queue (`take_pending_revokes`);
   - `crates/bridge-virtiofs/src/admission.rs`, the drain at the end of a service pass;
@@ -51,22 +53,46 @@ Zeros, while the volume holds `B`.
    went away, so it never re-maps. `crates/vfs/src/dax.rs`'s "the guest re-maps after the fault" does not hold: a read
    of an anonymous page never faults.
 
-## Fix (owed to G-vhost, failing test first)
+## Fix (A-168, 2026-10-25)
 
-- Wake the device on the volume's change, as the FUSE mount's coherence round is woken (A-141, A-142), not only on a
-  guest request.
-- Re-point each window of the changed inode onto the blocks the inode holds now: SHMEM_MAP at the same offset, which
-  crosvm makes a `MAP_FIXED` replace with no gap. Unpin the old block after the front end's ack.
-- Never SHMEM_UNMAP a range a guest still believes mapped. The exception, beyond a file's new end after a truncate,
-  must be decided against what a real guest does there.
-- Tests:
-  - hermetic, with the stand-in front end in `crates/bridge-virtiofs/tests/device.rs`: another path's write reaches a
-    live window with no guest request, and the window shows the new bytes, never zeros;
-  - live: the crosvm test G-vhost requires.
+The fix first proposed here, re-pointing each window onto the inode's new blocks, was rejected on reading the sources
+(kiln research 01a171bff4bd73c6bea625793fb5f821):
+- the vhost-user specification forbids a SHMEM_MAP over a live mapping, and unmapping first opens the zeros gap;
+- the guest's mapped ranges are 2 MiB and permanent until it reclaims them, and it never asks again for one it holds;
+- slates' content moves (an open block that grows is copied to a larger one, an idle one is sealed), and no single block
+  covers a 2 MiB range.
 
-## Sibling sweep (to do with the fix)
+What was built instead: the message placer's window maps the file's backing (A-163's object, one per attachment and
+file, sized once and never moved), which the volume's write boundary keeps equal to the file before any change returns
+(`crates/bridge-virtiofs/src/backed.rs`, `crates/bridge-virtiofs/src/device.rs`).
+- A change through any path reaches the guest's map with no wake and no message; nothing revokes such a window.
+- Only the guest's REMOVEMAPPING, its FORGET or unmount, and the device's end unmap one.
+- The guest's stores reach the volume at its sync points (FSYNC, FLUSH, RELEASE, READ, FORGET, DESTROY) and at the
+  device's end, a write-back the volume refuses failing the request that asked for it.
+- Beneath an overlay, a reply that could reveal the disk's change waits until the map shows it.
+
+Tests, in `crates/bridge-virtiofs/tests/device.rs` against a stand-in front end that maps what SHMEM_MAP sends:
+- `a_window_over_a_backing_shows_every_other_paths_change_with_no_message`: an in-place write, a write past the old
+  block, and a cut, each in the map at once; the daemon's revoke and a GETATTR pass send nothing.
+- `a_guests_store_through_a_writable_window_reaches_the_volume_before_its_fsync_is_answered`,
+  `a_refused_write_back_fails_the_fsync_that_asked_for_it`, `a_writable_upgrade_of_a_live_window_is_answered_with_no_message`,
+  `a_guests_unsynced_store_reaches_the_volume_when_the_device_ends`, `a_window_hands_the_vmm_one_files_bytes_and_nothing_else`,
+  `hostile_setupmappings_are_refused_with_no_window_and_no_message`, `a_forget_lets_the_nodes_backing_go_after_its_mapping_is_removed`,
+  `an_advance_refills_the_backings_and_tears_no_window`, `a_reply_that_could_reveal_the_disks_change_waits_until_the_map_shows_it`,
+  `a_reply_held_for_the_owners_barrier_waits_for_the_refill_too`.
+
+Red-checked: the pre-fix code (411c243d, on adacachy) failed the same checks in the old API: "STALE: a write after
+the file outgrew its block is not in the map: "AAAAAAAAAAAA"", then "TORN: SHMEM_UNMAP sent for a range the guest still
+holds". Eight mutations of the fix each fail their own test (A-168).
+
+The live proof, a real crosvm guest seeing another path's write in its map, is G-vhost's step 3.
+
+## Sibling sweep
 
 - The snapshot teardown of writable windows (`request_revoke_writable_inode`) and the revoke on advance
-  (`revalidate_windows`) end in the same SHMEM_UNMAP, so a guest reading a revoked window would read zeros there too.
-- The local-cache placer's PROT_NONE overlay faults rather than reading zeros; whether a guest recovers from that fault
-  is the same question.
+  (`revalidate_windows`) ended in the same SHMEM_UNMAP. Fixed with the rest: neither touches a window over a backing.
+  An advance marks the device's backings stale, so each is refilled from the new view before the guest sees more.
+- The fd-sharing placer's `PROT_NONE` overlay faults rather than reading zeros. Whether a guest recovers from that
+  fault is the same question, and by the same sources it would not. That placer has no production user (no in-process
+  VMM is wired), and the L1/L2 DAX defenses are built on its pinned blocks. Decided in A-168: it keeps them for now, and
+  before an in-process VMM ships it takes the backed route or is retired. Recorded in GAPS.

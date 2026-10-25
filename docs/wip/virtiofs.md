@@ -491,7 +491,10 @@ box shared with two other builds — timings are not benchmarks)
    in-process, and since 2026-10-24 the daemon's Shards stream handed out by `slates shards`, A-161) removes the
    host's filesystem layer. In-process, DAX maps slates' own memory with no copy. Over the Shards stream it maps a copy
    of each file, one per attachment, that slates keeps equal to the volume by writing every change through before it
-   returns (A-163). A descriptor authorizes its whole object, so slates' own content, every volume's, cannot be handed
+   returns (A-163), and since 2026-10-25 slates' own device does the same for an out-of-process VMM over vhost-user
+   (A-168): a VM's window holds what it mapped for as long as it holds it, so nothing else can keep it right. A cut
+   through another path zeroes the cut range in the copy, whose size never changes, so a guest touching it reads zeros
+   rather than the hang the mount route meets below (to be shown by a real guest in G-vhost). A descriptor authorizes its whole object, so slates' own content, every volume's, cannot be handed
    to another process. It is not needed for any target to
    work: the mount serves every one. Two designs for it were written and withdrawn on 2026-10-21: handing slates a
    socket from the launcher (which had no answer on macOS), then a slates-owned listener (Ada asked why another

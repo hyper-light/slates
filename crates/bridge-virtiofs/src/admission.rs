@@ -401,18 +401,15 @@ fn unsupported(request: &GuestAttachRequest) -> Option<UnsupportedReason> {
   if request.transport == GuestTransport::InheritedDescriptor && !cfg!(target_os = "linux") {
     return Some(UnsupportedReason::BindingNotBuilt);
   }
-  // The DAX advertisement gate. **Before flipping this, read
-  // `docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md`:** the
-  // message-based placer sends the frontend the arena's WHOLE shared-object descriptor, not the
-  // authorized block — measured at 64× the window it may map, with another tenant's blocks inside it.
-  // `fd_offset`/`len` scope the request, never the descriptor, so with this gate open a VMM's
-  // confinement would rest on the frontend honouring them rather than on what slates handed it. The
-  // fd-sharing placer does not have this property (the backend maps; the VMM gets no descriptor).
+  // The DAX advertisement gate. The message placer once sent the frontend the arena's WHOLE shared-object descriptor
+  // (`docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md`), then a `udmabuf` narrowed to
+  // the window (A-138). Since G-vhost it sends neither: a window maps the file's own backing, one object per attachment
+  // and file holding only that file's bytes (A-163's rule), so what a VMM is handed authorizes that file and nothing
+  // else by construction, with no host device needed (`crate::backed`, Linux).
   //
-  // That was one of four blocking items, and **two of the four are now closed**: descriptor confinement (A-138,
-  // the `udmabuf`-narrowed descriptor, whose proof first ran on real hardware 2026-10-20) and L1's zones (closed
-  // 2026-10-20 — they are transparent huge pages needing no privileged broker, and the two defects that kept them
-  // from forming are fixed). **B2's wiring and L2's device-side remap still block.** The second is narrower
+  // The fd-sharing placer's items: L1's zones are closed (2026-10-20 — they are transparent huge pages needing no
+  // privileged broker, and the two defects that kept them from forming are fixed). **B2's wiring and L2's device-side
+  // remap still block it.** The second is narrower
   // than it sounds, and this comment overstated it on 2026-10-20 before being corrected the same day: a shift
   // *is* delivered to the device — `dax_migrate` enqueues the inode on `pending_revokes`, a service pass
   // drains it, the window is torn down under the two-phase revoke and the guest re-faults onto the row the
@@ -764,27 +761,27 @@ impl<S: VmmSeam> AdmittedDevice<S> {
     Ok(completed)
   }
 
-  /// Drains the message-based DAX placer's reply-acks (§4.6) under the attachment's authority: a parked
-  /// SETUPMAPPING's ack answers the guest and records the window; a teardown unmap's ack unpins the block (phase
-  /// two). The serve loop calls this after awaiting [`AdmittedDevice::dax_ack_raw_fd`]. Notifies the completed
-  /// chain's queue when its driver asks; `Ok(None)` when nothing completed or the device is not live. Linux only.
+  /// Drains the message placer's reply-acks (§4.6) under the attachment's authority: a held SETUPMAPPING's ack answers
+  /// the guest and records the window ([`Device::complete_dax_awaiting`]). The serve loop calls this after awaiting
+  /// [`AdmittedDevice::dax_ack_raw_fd`]. Notifies the completed chain's queue when its driver asks; `Ok(None)` when
+  /// nothing completed or the device is not live. Linux only.
   #[cfg(target_os = "linux")]
   pub fn complete_dax_map(
     &mut self,
-    bridge: &mut dyn Bridge,
     registry: &Attachments,
   ) -> Result<Option<Completed>, ServeError> {
     if self.state != AttachmentState::Live {
       return Ok(None);
     }
-    let cx = registry
+    // The attachment's authority is checked as for every step, though settling an ack reaches nothing through it.
+    registry
       .context(self.attachment)
       .map_err(ServeError::Authority)?;
     let completed = {
       let memory = self.seam.memory().map_err(ServeError::Seam)?;
       self
         .device
-        .complete_dax_awaiting(memory, bridge, &cx, &mut self.ledger)
+        .complete_dax_awaiting(memory, &mut self.ledger)
         .map_err(ServeError::Device)?
     };
     if let Some(done) = completed
@@ -799,12 +796,84 @@ impl<S: VmmSeam> AdmittedDevice<S> {
     Ok(completed)
   }
 
-  /// Whether a message-based SETUPMAPPING is parked for the front end's map-ack; the loop awaits the ack and
-  /// completes it before serving more. Linux only.
+  /// Whether a held SETUPMAPPING's map awaits the front end's ack; the loop awaits the ack and completes it before
+  /// serving more. Linux only.
   #[cfg(target_os = "linux")]
   #[must_use]
   pub fn dax_map_ack_owed(&self) -> bool {
     self.device.dax_map_ack_owed()
+  }
+
+  /// One step of the message placer's backed DAX under the attachment's authority, before the service pass
+  /// ([`Device::dax_turn`]): a refill, an ingest or a fill slice of at most `slice_bytes`, or a held chain answered,
+  /// whose queue is notified when its driver asks. The serve loop serves no chain on a busy turn. Refused typed, and
+  /// nothing touched, once the device is revoked. Linux only.
+  #[cfg(target_os = "linux")]
+  pub fn dax_turn(
+    &mut self,
+    bridge: &mut dyn Bridge,
+    registry: &Attachments,
+    slice_bytes: u64,
+  ) -> Result<crate::device::DaxTurned, ServeError> {
+    if self.state != AttachmentState::Live {
+      return Err(ServeError::Revoked);
+    }
+    let cx = registry
+      .context(self.attachment)
+      .map_err(ServeError::Authority)?;
+    let turned = {
+      let memory = self.seam.memory().map_err(ServeError::Seam)?;
+      self
+        .device
+        .dax_turn(memory, bridge, &cx, slice_bytes, &mut self.ledger)
+        .map_err(ServeError::Device)?
+    };
+    if let Some(done) = turned.completed
+      && done.interrupt_wanted
+    {
+      self
+        .seam
+        .notify_used(done.queue)
+        .map_err(ServeError::Seam)?;
+      self.counters.notifications = self.counters.notifications.saturating_add(1);
+    }
+    Ok(turned)
+  }
+
+  /// Starts the ingest the guest's stores through its maps take before the device ends ([`Device::begin_end_ingest`]):
+  /// whether there is one. The serve loop runs it after its last pass and before the terminal step. Linux only.
+  #[cfg(target_os = "linux")]
+  pub fn begin_end_ingest(&mut self, bridge: &mut dyn Bridge) -> bool {
+    self.device.begin_end_ingest(bridge)
+  }
+
+  /// One slice of the end's ingest under the attachment's authority, of at most `slice_bytes`: `Some(wrote)` when it
+  /// is done. Refused when the attachment's authority is gone (a revoked consumer's stores never land); the caller then
+  /// ends the ingest unwritten ([`AdmittedDevice::abort_end_ingest`]). Linux only.
+  #[cfg(target_os = "linux")]
+  pub fn end_ingest_step(
+    &mut self,
+    bridge: &mut dyn Bridge,
+    registry: &Attachments,
+    slice_bytes: u64,
+  ) -> Result<Option<bool>, ServeError> {
+    let cx = registry
+      .context(self.attachment)
+      .map_err(ServeError::Authority)?;
+    Ok(self.device.end_ingest_step(bridge, &cx, slice_bytes))
+  }
+
+  /// Ends the end's ingest unwritten, counted. Linux only.
+  #[cfg(target_os = "linux")]
+  pub fn abort_end_ingest(&mut self) {
+    self.device.abort_end_ingest();
+  }
+
+  /// Lets every backing of the message placer go through the store's registry alone: the terminal step of a device
+  /// whose volume is gone ([`AdmittedDevice::abandon`]), which has no bridge to reach them through. Linux only.
+  #[cfg(target_os = "linux")]
+  pub fn release_backings(&mut self, backings: &mut slates_vfs::shards_backing::ShardsBackings) {
+    self.device.release_backings(backings);
   }
 
   /// The raw descriptor the message-based placer's reply-acks arrive on, for the loop to await; `None` without a
@@ -855,7 +924,7 @@ impl<S: VmmSeam> AdmittedDevice<S> {
         // with no live window drains nothing here.
         self.device.release_dax(bridge, &cx);
         #[cfg(target_os = "linux")]
-        self.device.drain_dax_terminal(bridge, &cx);
+        self.device.drain_dax_terminal();
         bridge.sweep_attachment(&cx).map_err(ReclaimError::Sweep)
       }
       Err(e) => Err(ReclaimError::Authority(e)),

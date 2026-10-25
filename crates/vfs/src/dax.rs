@@ -12,8 +12,13 @@
 //!   mapping is revoked: it leaves the registry and its block is unpinned. A revoked mapping is dead — the guest's
 //!   page table no longer maps it, modeled here by [`Store::dax_read_raw`]/[`Store::dax_write_raw`] going inert for a
 //!   mapping the registry no longer holds (the MMU, not a daemon call, enforces this after an `munmap` of the guest
-//!   window). This closes the block-move lost update and the snapshot-share corruption: the guest re-maps after the
-//!   fault and gets a fresh private block.
+//!   window). This closes the block-move lost update and the snapshot-share corruption. That the guest re-maps after
+//!   its fault is **unproven**: a Linux guest keeps its own record of the ranges it mapped and never asks again for one
+//!   it holds (`fs/fuse/dax.c`), so whether it recovers from the fault on the fd-sharing placer's `PROT_NONE` hole is
+//!   open (GAPS). On the message placer it did not: crosvm's unmap leaves read-only zero pages, which a real guest read
+//!   as the file's bytes (`docs/bugs/2026-10-24-slates-own-dax-window-shows-stale-bytes-then-zeros-after-another-
+//!   paths-write.md`). That placer therefore maps per-file backings and never comes here; this gate serves the
+//!   fd-sharing placer and the in-process maps.
 //! - **Rights.** A writable mapping copies the file up first ([`Volume::dax_map_write`]) so the block the guest
 //!   writes is this version's alone — no writable mapping of immutable or snapshot-shared content.
 //!
@@ -1790,7 +1795,8 @@ impl Store {
   }
 
   /// Revokes every mapping of inode `no` (§4.6): a VFS mutation of a DAX-mapped file tears its mappings down, so the
-  /// one write boundary stays single (the guest re-maps after). Returns how many were revoked.
+  /// one write boundary stays single (whether the guest re-maps after is the open question this module's header
+  /// states). Returns how many were revoked.
   pub fn dax_revoke_inode(&mut self, no: InodeNo) -> usize {
     let victims: Vec<Mapping> = self
       .dax

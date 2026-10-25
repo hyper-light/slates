@@ -1086,6 +1086,18 @@ impl DaemonConfig {
     copy_slice_bytes(self.memcpy_bytes_per_second, self.step_quantum_ns())
   }
 
+  /// [`DaemonConfig::copy_slice_bytes`] in whole host pages, at least one: the slice a DAX backing's fill, ingest or
+  /// refill copies on the calling shard now (A-163), since a backing is stored and compared a page at a time.
+  pub fn copy_slice_page_bytes(&self) -> u64 {
+    let page = u64::try_from(rustix::param::page_size().max(1)).unwrap_or(u64::MAX);
+    self
+      .copy_slice_bytes()
+      .checked_div(page)
+      .and_then(|pages| pages.checked_mul(page))
+      .unwrap_or(page)
+      .max(page)
+  }
+
   /// The time one slice of such work may take on the calling shard now: half its live step quantum. Work whose units
   /// are not bytes copied — an image's walk, layout, writing and merge (A-160), where an entry costs tens of times its
   /// bytes — is bounded by it against the clock, one unit at a time.
