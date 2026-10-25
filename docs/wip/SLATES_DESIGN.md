@@ -12280,7 +12280,7 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
 - **Rejected: the read-write descriptor with only a read-only map made of it.** The descriptor is the capability, not the map: handed in the read-only one's place in the red-check, its shared writable map and its turned map were granted.
 - **Proven** on this Mac (arm64, Darwin 25.4.0, 2026-10-25) by `crates/client/tests/client.rs` and `reap_map.rs` over a real daemon, red-checked (§4.6 status); Linux unchanged, the route being macOS's alone, its suites passing on fedora.
 - **Measured** the same day (BENCHMARKS, "Copy-once-map-many against copy-per-read", this Mac at load 15.5–19.6): a steady mapped read costs 1.1 % to 2.1 % of a copy read; the route's claim makes a 4 KiB map's setup 83–94 µs, repaid after 3 reads, and from 1 MiB the whole setup costs less than one copy read.
-- **Owed:** Windows (G-direct step 5); a test of the reap's withdrawal of its own (it shares the release's code; a test would race the offer's own expiry, both two liveness budgets); and the sibling found by the sweep: a Shards stream offer outlives an attachment that ended before its claim, a dead end held until it expires, within the shard's handoff bound (GAPS).
+- **Owed:** Windows (G-direct step 5); a test of the reap's withdrawal of its own (it shares the release's code; a test would race the offer's own expiry, both two liveness budgets). The sibling found by the sweep, a Shards stream offer that outlived an attachment ended before its claim, was fixed the same day (A-161's route).
 
 ### A-174 — A direct map's hand-off that fails in the client gives its copy back (accepted 2026-10-25)
 Applied in the same change to: §4.6 (the direct map's lifetime, its status), GAPS, `crates/client` (`Client::map_read`, `kept_or_given_back`; `ClientError::HandOffUnreleased`, appended; `tests/reap_map.rs`: the starved client), `CLAUDE.md`.
@@ -12854,6 +12854,10 @@ Applied in the same change to:
     (a stream end, a map's copy) beside its id, both bound into the additional data, and a shard keeps each kind's
     offers apart: a secret or proof for one kind never claims the other. The labels read `slates route v2`; a version 1
     hello is refused `Malformed`.
+  - **An offer never outlives what it offers (2026-10-25).** An attachment that ends before its end is claimed (a
+    detach, a revocation, the volume's destroy) withdraws the offer as its stream ends, counted `shards.route_withdrawn`;
+    before, a later claim was handed an end whose other side was closed
+    (`docs/bugs/2026-10-25-an-ended-attachments-stream-offer-stayed-claimable.md`).
 - **The CLI (2026-10-24, part 1 step 4).** `slates shards ID [--subtree DIR] [--read-only] --fd N -- CMD` attaches the
   volume in the Shards form, announces the attachment, and replaces itself with the command, the end at descriptor `N`
   (3 or more), so a Shards spawner, or a test, gets a working end without linking slates (`shards run … --slates-fs-fd

@@ -2675,6 +2675,47 @@ mod route {
     drop(daemon);
   }
 
+  /// A-161 with A-173's rule that an offer never outlives what it offers: an attachment that ends before its stream end
+  /// is claimed takes the offer with it. Do: attach in the Shards form (the end offered, unclaimed), detach the
+  /// attachment, then claim the offer with its own secret. Expect: the claim refused `NoOffer` at once, counted
+  /// `shards.route_withdrawn`, not left to expire; before, the claim was handed an end whose other side the detach had
+  /// already closed.
+  #[test]
+  fn an_attachment_ended_before_its_claim_withdraws_its_offer() {
+    let (daemon, instance) = single_shard_daemon("shards-route-withdrawn");
+    let mut client = Client::connect(&instance);
+    let ReplyBody::Created { id } = client.call(&scratch("shared")) else {
+      panic!("the volume was not created");
+    };
+    let (attachment, secret) = offer(&mut client, id);
+    assert!(
+      matches!(
+        client.call(&RequestBody::Detach { attachment }),
+        ReplyBody::Detached
+      ),
+      "the detach"
+    );
+    let claimed = slates_ipc::route::claim(
+      &instance,
+      (OfferKind::Stream, attachment),
+      &secret,
+      CREDIT_WAIT,
+    );
+    assert!(
+      matches!(
+        claimed,
+        Err(IpcError::RouteRefused {
+          refusal: slates_ipc::error::RouteRefusal::NoOffer
+        })
+      ),
+      "the ended attachment's offer was still claimable: {claimed:?}"
+    );
+    assert_eq!(counted(&daemon, "shards.route_withdrawn"), 1);
+    assert_eq!(counted(&daemon, "shards.route_expired"), 0);
+    drop(client);
+    drop(daemon);
+  }
+
   /// A-161 step 3: the route's socket exists only while its daemon runs, is a socket the user alone may use, in the
   /// user's own temporary directory, and is the only thing there named for the instance.
   #[test]

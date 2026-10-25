@@ -11253,8 +11253,14 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     - on every platform, a client's direct map outlives its daemon: after a `kill -9` and restart the map keeps the file
       as it was when the daemon died and follows it no more, with no signal to the client (its object lives on in the
       client's process). A replayed map reply now fails rather than adopting such a copy (A-175's record rule; Linux's
-      and macOS's hand-offs fail as well), but a map made before the death goes stale silently. Owed: a decision on
-      how a client learns its map ended.
+      and macOS's hand-offs fail as well), but a map made before the death goes stale silently. The same holds while the
+      daemon lives when a `MappedRead` outlives its `Client`: the client is reaped and its copies let go, and the map
+      keeps the bytes as they were. Owed: a decision on how a client learns its map ended. Facts for it: the client's own
+      liveness question is one syscall (`ExitWatch::exited`: `kevent`, `poll` on a pidfd, or `WaitForSingleObject` with
+      no wait; Linux's control-socket peek), its cost not yet measured here (estimated, not measured, at about a
+      microsecond), against a steady mapped read of 0.4 to 1.1 µs at 4 KiB and a copy read of 4.8 µs (the box) to 33 µs
+      (this Mac); and a read is exact if the question follows the load, since no newer write is accepted until a new
+      daemon has started.
 
 - **A DAX copy slice past the bridge's 256 KiB read cap dropped a guest's stores (A-163, fixed 2026-10-25).** CI's
   ubuntu lane on `d71ce235` (run 40211222944) failed two Shards tests: a store through a guest's DAX map past the first
@@ -11295,8 +11301,9 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   - **Open:**
     - a test of the reap's withdrawal of its own: it shares the release's code, and a test would race the offer's own
       expiry (both two liveness budgets), so it is owed rather than written flaky;
-    - **sibling found by the sweep:** a Shards stream offer outlives an attachment that ended before its claim, a dead
-      end held until it expires; counted against the shard's handoff bound meanwhile, so no bound breaks;
+    - **sibling found by the sweep:** a Shards stream offer outlived an attachment that ended before its claim, a dead
+      end held until it expired. **Fixed the same day**, failing test first: an ended attachment withdraws its offer
+      (`docs/bugs/2026-10-25-an-ended-attachments-stream-offer-stayed-claimable.md`);
     - this Mac's map arm of the break-even bench (step 3), now that the map is direct here: **measured the same day**
       (BENCHMARKS, the entry's Mac table);
     - a hand-off that fails at the client after the copy was made (a claim refused on macOS — `Busy`, an expired offer,

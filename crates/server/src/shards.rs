@@ -98,6 +98,10 @@ const RECORD_END_REFUSED: &str = "shards.record_end_refused";
 /// Format: the refusal-ledger name of a stream the daemon could not end ([`end_stream`]): its task ends at its next
 /// turn regardless, as the stream is marked ending first.
 const END_REFUSED: &str = "shards.end_refused";
+/// Format: the refusal-ledger name of a stream end withdrawn unclaimed from the socket route because its attachment
+/// ended first (macOS): an ended attachment leaves no end for a claim to take (A-173's rule for offers).
+#[cfg(target_os = "macos")]
+const OFFER_WITHDRAWN: &str = "shards.route_withdrawn";
 /// Format: the refusal-ledger name of a stream end that could not be sent to its client (no control socket, the
 /// client gone, a refused send): the end closes, so the stream ends and its attachment with it.
 const DELIVERY_REFUSED: &str = "shards.delivery_refused";
@@ -1097,6 +1101,7 @@ fn flush(stream: &mut ShardsStream) -> Flushed {
 /// descriptor closed, and its record removed as a recorded operation (unless a `detach`, a revocation or a destroy
 /// already removed it). Idempotent.
 fn ended(s: &mut ShardState, attachment: u64) {
+  withdraw_offer(s, attachment);
   if let Some(mut stream) = s.shards_streams.remove(&attachment) {
     dax::release_all(s, &mut stream);
     sweep(s, &mut stream);
@@ -1109,6 +1114,21 @@ fn ended(s: &mut ShardState, attachment: u64) {
     s.count(RECORD_END_REFUSED, 1);
   }
 }
+
+/// Withdraws `attachment`'s stream end still offered on the socket route, counted: an attachment that ended leaves no
+/// end for a claim to take, as a direct map's copy let go leaves no offer (A-173). Before, a claim after the end took an
+/// end whose other side was already closed.
+#[cfg(target_os = "macos")]
+fn withdraw_offer(s: &mut ShardState, attachment: u64) {
+  if crate::shards_route::withdraw(s, (slates_ipc::route::OfferKind::Stream, attachment)) {
+    s.count(OFFER_WITHDRAWN, 1);
+  }
+}
+
+/// Nothing is offered here: Linux sends a stream end on the control socket before the attach's reply, and Windows
+/// refuses the form.
+#[cfg(not(target_os = "macos"))]
+fn withdraw_offer(_s: &mut ShardState, _attachment: u64) {}
 
 /// Releases every reference `stream`'s guest still holds (§3 the teardown sweep): a guest's end sends no forget per
 /// reference. A volume already gone took them with it.
@@ -1142,6 +1162,8 @@ fn sweep(s: &mut ShardState, stream: &mut ShardsStream) {
 /// stream's own (a detach, a revocation, the volume's destroy). The stream is marked ending, so its task reads nothing
 /// more, and ended both ways, so the task wakes on its own readiness and ends the rest ([`ended`]).
 pub(crate) fn end_stream(s: &mut ShardState, attachment: u64) {
+  // Withdrawn here, before the ending's reply, so no claim made after it can take the end.
+  withdraw_offer(s, attachment);
   let Some(stream) = s.shards_streams.get_mut(&attachment) else {
     return;
   };
