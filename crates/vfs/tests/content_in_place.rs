@@ -728,6 +728,78 @@ fn an_idle_file_smaller_than_a_chunk_is_sealed_by_the_second_sweep() {
   assert_eq!(read_all(&vol, &source, f, content.len()), content);
 }
 
+/// A sealing volume over a store whose chunk slab holds one record, so a second seal is refused for room.
+fn one_record_sealing_volume() -> (Store, Volume) {
+  let mut arena = slates_mem::arena::ChunkArena::new(common::PAGE);
+  arena
+    .add_region(
+      slates_mem::region::Region::map(common::PAGE * common::REGION_PAGES, common::PAGE, false)
+        .unwrap(),
+    )
+    .unwrap();
+  let mut store = Store::new(
+    &slates_vfs::volume::StoreConfig {
+      page: common::PAGE,
+      cache_line: 64,
+      max_dirs: 1 << 16,
+      max_inodes: 1 << 16,
+      max_chunks: 1,
+      max_dir_blocks: 1 << 16,
+      dir_cutover: 4,
+    },
+    arena,
+    0,
+  );
+  store.content.set_cipher(Box::new(StreamCipher));
+  let mut vol = volume(&mut store, 1 << 30);
+  vol.set_seal_key(Some(SEAL_KEY));
+  (store, vol)
+}
+
+/// A-64 with A-99 when the chunk slab is full (found by reading `ChunkStore::seal`, 2026-10-25). Do: in a sealing
+/// volume whose store holds one chunk record, write a file shorter than a chunk and commit a publication, so its open
+/// block is named by the image; fill the slab with a second file's sealed window; let the idle sweep seal the first
+/// file, which the slab refuses; commit another publication; write a third file. Expect: the refused seal leaves the
+/// arena as it was (no block allocated or freed for it), and the first file reads its own bytes after the third file
+/// took whatever the arena handed out.
+#[test]
+fn a_seal_the_chunk_slab_refuses_leaves_an_imaged_open_extent_whole() {
+  let (mut store, mut vol) = one_record_sealing_volume();
+  let root = vol.root_inode(&store).unwrap();
+  let chunk = store.content.chunk_bytes();
+  let f = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  let first = vec![b'f'; chunk / 2];
+  vol.write(&mut store, f, 0, &first).unwrap();
+  store.content.arena_mut().capture();
+  store.content.arena_mut().commit_capture();
+  let g = vol.create_file_no(&mut store, root, "g", 0o644).unwrap();
+  vol.write(&mut store, g, 0, &vec![b'g'; 2 * chunk]).unwrap();
+  assert_eq!(
+    store.content.chunk_room(),
+    0,
+    "the second file's sealed window fills the slab"
+  );
+
+  let allocated = store.content.allocated_bytes();
+  let _ = vol.seal_idle(&mut store, u64::MAX);
+  let swept = vol.seal_idle(&mut store, u64::MAX);
+  assert!(swept.refused > 0, "the slab refuses the seal: {swept:?}");
+  assert_eq!(
+    store.content.allocated_bytes(),
+    allocated,
+    "a refused seal allocates and frees nothing"
+  );
+
+  store.content.arena_mut().capture();
+  store.content.arena_mut().commit_capture();
+  let h = vol.create_file_no(&mut store, root, "h", 0o644).unwrap();
+  vol.write(&mut store, h, 0, &vec![b'h'; chunk / 2]).unwrap();
+  assert!(
+    read_all(&vol, &store, f, first.len()) == first,
+    "the first file reads its own bytes after the refused seal and the next publication"
+  );
+}
+
 /// A-99 (the idle sweep). Do: write a file, sweep, write it again, sweep, then sweep once more. Expect: the second
 /// sweep leaves it open (written since the sweep before), the third seals it, and it reads back with both writes.
 #[test]

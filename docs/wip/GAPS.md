@@ -11317,6 +11317,20 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     the copy credits it now, untested, and a test injecting the refusal is owed. The cold reseal
     (`Volume::reseal_inode`) changes shared chunk records with no ownership check and no dirty mark: reported, not
     changed, owed a recovery test first (the bug record has both).
+- **Fixed 2026-10-25, found sweeping A-170's siblings: a seal the chunk slab refused left the file on a freed block.**
+  `docs/bugs/2026-10-25-a-seal-the-chunk-slab-refused-left-the-file-on-a-freed-block.md`.
+  - **Cause:** under a cipher (A-99), sealing an open extent whose block the committed image names copies the bytes to a
+    new block. `seal_where_safe` freed the old block, deferred to the next commit, before the replacing chunk was
+    recorded. A refused record (the chunk slab full) then leaked the copy and put the file's open extent back on a block
+    already let go; after the next commit another file's write took it.
+  - **Fix:** the old block is freed only once the replacing chunk is recorded, and a refused record gives back the
+    seal's tags and the copy. The cold reseal (`ChunkStore::reseal`), whose failed seal left a record on the freed old
+    block, now frees a copy it cannot use.
+  - **Failing first:** `a_seal_the_chunk_slab_refuses_leaves_an_imaged_open_extent_whole` (a one-record slab). It found
+    32,768 bytes leaked and the file reading another's bytes after the next commit, and passes after.
+  - **Exposure:** a sealing daemon at its chunk slab's bound (the idle sweep and a write's window seal reach it). The
+    reseal twin was latent: the daemon runs `seal_pending`, not `seal_idle`, so it never reseals.
+  - **Owed:** a test of the reseal's failure after a copy.
 - **Repaired 2026-10-25: CI on ff9964df.** Both Windows jobs refused `slates-cli` for an unused import
   (`SOCKET_PLACEHOLDER`, used only by the Unix arm of `exec_vmm`); the constant is now named by its path there. The
   ubuntu gates job failed `a_linux_container_reaches_the_shared_mount_as_its_own_ids` because Docker Hub refused the

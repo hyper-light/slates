@@ -434,12 +434,9 @@ impl ChunkStore {
       self.seal_refusals = self.seal_refusals.saturating_add(1);
       return (block, None);
     };
-    let seal = self.seal_block(copy, len, key);
-    // The free is deferred: the image names the old block until the next commit.
-    let freed = self.arena.free(block);
-    self.count_free(freed);
-    self.moved_out_of_image = self.moved_out_of_image.saturating_add(1);
-    (copy, seal)
+    // The old block is let go by the caller once the chunk that replaces it is recorded (`ChunkStore::seal`), so a
+    // refused record leaves it as it was.
+    (copy, self.seal_block(copy, len, key))
   }
 
   /// A new block holding the first `len` bytes of `block`, or `None` when the arena or the allocator has no room.
@@ -728,12 +725,24 @@ impl ChunkStore {
     }
     let len = usize::try_from(record.len).map_err(|_| VfsError::Invalid)?;
     let (block, seal) = self.seal_where_safe(record.block, len, key);
+    let copied = block != record.block;
     match seal {
       Some(seal) => {
         let cm = self.chunks.get_mut(handle)?;
         cm.block = block;
         cm.seal = Some(seal);
+        if copied {
+          // The record holds the sealed bytes in the copy now: the old block goes, deferred while the committed image
+          // names it (A-64).
+          let freed = self.arena.free(record.block);
+          self.count_free(freed);
+          self.moved_out_of_image = self.moved_out_of_image.saturating_add(1);
+        }
         Ok(())
+      }
+      // A seal that failed leaves the record on its old block: a copy made for it goes back.
+      None if copied => {
+        Err(VfsError::NoSpace.after_undo(self.arena.free(block).map(drop).map_err(VfsError::from)))
       }
       None => Err(VfsError::NoSpace),
     }
@@ -1177,12 +1186,26 @@ impl ChunkStore {
     let chunk = match inserted {
       Ok(chunk) => chunk,
       Err(refusal) => {
-        if let Some(seal) = seal {
-          self.tags.free(seal.tags)?;
-        }
-        return Err(refusal.into());
+        // A refused record leaves the caller's open extent and its block exactly as they were: the seal's tags go
+        // back, and so does a block the seal copied the bytes into. Before 2026-10-25 the copy leaked and the open
+        // block was already let go, so the next publication freed a block the file still named, and another file's
+        // write took it (`a_seal_the_chunk_slab_refuses_leaves_an_imaged_open_extent_whole`).
+        let tags_back = seal.map_or(Ok(()), |seal| self.tags.free(seal.tags));
+        let copy_back = if block == open.block {
+          Ok(())
+        } else {
+          self.arena.free(block).map(drop).map_err(VfsError::from)
+        };
+        return Err(VfsError::from(refusal).after_undo(tags_back.and(copy_back)));
       }
     };
+    if block != open.block {
+      // The chunk now holds the bytes in a block of its own: the open block goes, deferred while the committed image
+      // names it (A-64).
+      let freed = self.arena.free(open.block);
+      self.count_free(freed);
+      self.moved_out_of_image = self.moved_out_of_image.saturating_add(1);
+    }
     self.trim_sealed(chunk, block, len, dirty);
     Ok(Some(Extent {
       off: open.off,
