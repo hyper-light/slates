@@ -5,7 +5,13 @@
 //!
 //! A backing is one file's DAX object for one attachment (`slates_mem::DaxObject`). It holds the file's bytes at the
 //! file's own offsets, filled from the volume a range at a time as a guest asks for them, and records the ranges the
-//! guest asked to write. The server's Shards serve task makes, fills and ingests backings and lets them go, holding
+//! guest asked to write.
+//!
+//! **A file is named by its volume and its inode number together.** A number names a file only within a volume: a clone
+//! shares its origin's nodes and their numbers, and a snapshot a device presents is such a clone, in the same store. So
+//! the registry keeps backings by (volume prefix, inode), where the prefix is the volume's own
+//! ([`crate::volume::Volume::prefix`]), never the one an inherited number carries. Keyed by the number alone, a clone's
+//! write reached its origin's guest's map (`docs/bugs/2026-10-25-a-clones-change-reaches-its-origins-dax-backing.md`). The server's Shards serve task makes, fills and ingests backings and lets them go, holding
 //! their handles. This module keeps them and writes changes through:
 //! - **A write's bytes** go into every backing of its file, over the ranges filled. So a guest reading its map
 //!   afterwards sees them. An unfilled range has them anyway: it is filled from the volume, which has them, when
@@ -46,6 +52,8 @@ const SEGMENT_SLOTS: usize = 16;
 /// writable, and whether the disk has changed the file beneath it since.
 pub struct ShardsBacking {
   object: DaxObject,
+  /// The prefix of the volume whose file it backs: the attachment's volume's own.
+  volume: u16,
   inode: InodeNo,
   filled: BTreeSet<u64>,
   writable: BTreeSet<u64>,
@@ -55,6 +63,7 @@ pub struct ShardsBacking {
 impl std::fmt::Debug for ShardsBacking {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_struct("ShardsBacking")
+      .field("volume", &self.volume)
       .field("inode", &self.inode)
       .field("filled", &self.filled.len())
       .field("writable", &self.writable.len())
@@ -64,11 +73,12 @@ impl std::fmt::Debug for ShardsBacking {
 }
 
 impl ShardsBacking {
-  /// A backing of file `inode` over `object`, nothing filled or asked writable yet.
+  /// A backing of file `inode` of the volume of prefix `volume` over `object`, nothing filled or asked writable yet.
   #[must_use]
-  pub fn new(object: DaxObject, inode: InodeNo) -> ShardsBacking {
+  pub fn new(object: DaxObject, volume: u16, inode: InodeNo) -> ShardsBacking {
     ShardsBacking {
       object,
+      volume,
       inode,
       filled: BTreeSet::new(),
       writable: BTreeSet::new(),
@@ -76,7 +86,13 @@ impl ShardsBacking {
     }
   }
 
-  /// The file it backs.
+  /// The prefix of the volume whose file it backs.
+  #[must_use]
+  pub fn volume(&self) -> u16 {
+    self.volume
+  }
+
+  /// The file it backs, within its volume.
   #[must_use]
   pub fn inode(&self) -> InodeNo {
     self.inode
@@ -132,10 +148,10 @@ impl ShardsBacking {
   }
 }
 
-/// The shard's Shards DAX backings, by handle, and which backings each file has.
+/// The shard's Shards DAX backings, by handle, and which backings each file has, by (volume prefix, inode).
 pub struct ShardsBackings {
   slab: Slab<ShardsBacking>,
-  by_inode: BTreeMap<InodeNo, Vec<Handle<ShardsBacking>>>,
+  by_file: BTreeMap<(u16, InodeNo), Vec<Handle<ShardsBacking>>>,
   /// The backing an ingest is writing from, which write-through passes over meanwhile.
   suppressed: Option<Handle<ShardsBacking>>,
   /// Bytes written through, monotone: the non-vacuity counter a test asserts moved.
@@ -153,7 +169,7 @@ pub struct ShardsBackings {
 impl std::fmt::Debug for ShardsBackings {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_struct("ShardsBackings")
-      .field("files", &self.by_inode.len())
+      .field("files", &self.by_file.len())
       .field("written", &self.written)
       .field("refused", &self.refused)
       .field("marked_stale", &self.marked_stale)
@@ -169,7 +185,7 @@ impl ShardsBackings {
   pub fn new(cap: usize) -> ShardsBackings {
     ShardsBackings {
       slab: Slab::new(SEGMENT_SLOTS, cap),
-      by_inode: BTreeMap::new(),
+      by_file: BTreeMap::new(),
       suppressed: None,
       written: 0,
       refused: 0,
@@ -218,19 +234,20 @@ impl ShardsBackings {
 
   /// Keeps `backing`; its handle. Refused at the registry's capacity.
   pub fn insert(&mut self, backing: ShardsBacking) -> Result<Handle<ShardsBacking>, MemError> {
-    let inode = backing.inode;
+    let file = (backing.volume, backing.inode);
     let handle = self.slab.insert(backing)?;
-    self.by_inode.entry(inode).or_default().push(handle);
+    self.by_file.entry(file).or_default().push(handle);
     Ok(handle)
   }
 
   /// Lets go of the backing `handle` names, if it is live: it, its object's mappings in this process ending with it.
   pub fn remove(&mut self, handle: Handle<ShardsBacking>) -> Option<ShardsBacking> {
     let backing = self.slab.remove(handle).ok()?;
-    if let Some(handles) = self.by_inode.get_mut(&backing.inode) {
+    let file = (backing.volume, backing.inode);
+    if let Some(handles) = self.by_file.get_mut(&file) {
       handles.retain(|held| *held != handle);
       if handles.is_empty() {
-        self.by_inode.remove(&backing.inode);
+        self.by_file.remove(&file);
       }
     }
     if self.suppressed == Some(handle) {
@@ -250,10 +267,11 @@ impl ShardsBackings {
     self.slab.get_mut(handle).ok()
   }
 
-  /// Whether file `inode` has any backing: the write boundary's one check, a map lookup, on files no guest maps.
+  /// Whether file `inode` of the volume of prefix `volume` has any backing: the write boundary's one check, a map
+  /// lookup, on files no guest maps.
   #[must_use]
-  pub fn backs(&self, inode: InodeNo) -> bool {
-    self.by_inode.contains_key(&inode)
+  pub fn backs(&self, volume: u16, inode: InodeNo) -> bool {
+    self.by_file.contains_key(&(volume, inode))
   }
 
   /// Has write-through pass over backing `handle` (an ingest writing the guest's stores from it into the volume), or
@@ -280,10 +298,11 @@ impl ShardsBackings {
     self.marked_stale
   }
 
-  /// Marks every backing of file `inode` stale: the disk changed its bytes without a write (an untouched file of an
-  /// overlay follows the disk), so their objects are refilled before their guests see anything more.
-  pub fn mark_stale(&mut self, inode: InodeNo) {
-    let Some(handles) = self.by_inode.get(&inode) else {
+  /// Marks every backing of file `inode` of the volume of prefix `volume` stale: the disk changed its bytes without a
+  /// write (an untouched file of an overlay follows the disk), so their objects are refilled before their guests see
+  /// anything more.
+  pub fn mark_stale(&mut self, volume: u16, inode: InodeNo) {
+    let Some(handles) = self.by_file.get(&(volume, inode)) else {
       return;
     };
     for &handle in handles {
@@ -294,10 +313,11 @@ impl ShardsBackings {
     }
   }
 
-  /// Whether a guest maps any part of file `inode` to write: a backing of it with a range asked writable.
+  /// Whether a guest maps any part of file `inode` of the volume of prefix `volume` to write: a backing of it with a
+  /// range asked writable.
   #[must_use]
-  pub fn mapped_writable(&self, inode: InodeNo) -> bool {
-    self.by_inode.get(&inode).is_some_and(|handles| {
+  pub fn mapped_writable(&self, volume: u16, inode: InodeNo) -> bool {
+    self.by_file.get(&(volume, inode)).is_some_and(|handles| {
       handles.iter().any(|handle| {
         self
           .slab
@@ -307,34 +327,46 @@ impl ShardsBackings {
     })
   }
 
-  /// Writes `bytes`, file `inode`'s from `at`, into each of its backings over the ranges they have filled.
-  pub fn write_through(&mut self, inode: InodeNo, at: u64, bytes: &[u8]) {
+  /// Writes `bytes`, file `inode`'s from `at`, of the volume of prefix `volume`, into each of its backings over the
+  /// ranges they have filled.
+  pub fn write_through(&mut self, volume: u16, inode: InodeNo, at: u64, bytes: &[u8]) {
     let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    self.each_filled_span(inode, at, at.saturating_add(len), |object, from, to| {
-      let start = usize::try_from(from.saturating_sub(at)).unwrap_or(usize::MAX);
-      let end = usize::try_from(to.saturating_sub(at)).unwrap_or(usize::MAX);
-      match bytes.get(start..end) {
-        Some(piece) => object.store(from, piece).is_ok(),
-        None => false,
-      }
-    });
+    self.each_filled_span(
+      (volume, inode),
+      at,
+      at.saturating_add(len),
+      |object, from, to| {
+        let start = usize::try_from(from.saturating_sub(at)).unwrap_or(usize::MAX);
+        let end = usize::try_from(to.saturating_sub(at)).unwrap_or(usize::MAX);
+        match bytes.get(start..end) {
+          Some(piece) => object.store(from, piece).is_ok(),
+          None => false,
+        }
+      },
+    );
   }
 
-  /// Zeroes file `inode`'s bytes `from .. to` in each of its backings over the ranges they have filled: what a size
-  /// change cuts or opens.
-  pub fn zero_through(&mut self, inode: InodeNo, from: u64, to: u64) {
-    self.each_filled_span(inode, from, to, |object, start, end| {
+  /// Zeroes the bytes `from .. to` of file `inode` of the volume of prefix `volume` in each of its backings over the
+  /// ranges they have filled: what a size change cuts or opens.
+  pub fn zero_through(&mut self, volume: u16, inode: InodeNo, from: u64, to: u64) {
+    self.each_filled_span((volume, inode), from, to, |object, start, end| {
       object.zero(start, end.saturating_sub(start)).is_ok()
     });
   }
 
-  /// The spans of file `inode`'s filled ranges from `from` on, across its backings, in order and each once: what the
-  /// volume copies again when a change shifts or replaces the file's bytes from `from`.
+  /// The spans of the filled ranges from `from` on of file `inode` of the volume of prefix `volume`, across its
+  /// backings, in order and each once: what the volume copies again when a change shifts or replaces the file's bytes
+  /// from `from`.
   #[must_use]
-  pub fn filled_spans_from(&self, inode: InodeNo, from: u64) -> Vec<(u64, u64)> {
+  pub fn filled_spans_from(&self, volume: u16, inode: InodeNo, from: u64) -> Vec<(u64, u64)> {
     let first = from.checked_div(DAX_RANGE_BYTES).unwrap_or(0);
     let mut ranges = BTreeSet::new();
-    for &handle in self.by_inode.get(&inode).map(Vec::as_slice).unwrap_or(&[]) {
+    for &handle in self
+      .by_file
+      .get(&(volume, inode))
+      .map(Vec::as_slice)
+      .unwrap_or(&[])
+    {
       if let Ok(backing) = self.slab.get(handle) {
         ranges.extend(backing.filled.range(first..).copied());
       }
@@ -348,11 +380,11 @@ impl ShardsBackings {
       .collect()
   }
 
-  /// Runs `apply` on each backing of `inode` but the suppressed one, for each part of `from .. to` within a range it has
-  /// filled, counting what it wrote and what the OS refused.
+  /// Runs `apply` on each backing of `file` (volume prefix, inode) but the suppressed one, for each part of `from .. to`
+  /// within a range it has filled, counting what it wrote and what the OS refused.
   fn each_filled_span(
     &mut self,
-    inode: InodeNo,
+    file: (u16, InodeNo),
     from: u64,
     to: u64,
     mut apply: impl FnMut(&mut DaxObject, u64, u64) -> bool,
@@ -363,13 +395,13 @@ impl ShardsBackings {
     // The fields are borrowed apart, so the walk allocates nothing on the write path.
     let ShardsBackings {
       slab,
-      by_inode,
+      by_file,
       suppressed,
       written,
       refused,
       ..
     } = self;
-    let Some(handles) = by_inode.get(&inode) else {
+    let Some(handles) = by_file.get(&file) else {
       return;
     };
     let first = from.checked_div(DAX_RANGE_BYTES).unwrap_or(0);

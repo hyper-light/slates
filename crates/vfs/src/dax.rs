@@ -976,7 +976,7 @@ impl Volume {
     // A Shards guest maps the file from an object of its own that the write boundary keeps equal to the volume (Shards
     // part 3, step 4). Stores into this block would bypass that boundary and leave the object behind, so the two routes
     // exclude each other: refused before any effect.
-    if store.shards_backings.backs(no) {
+    if store.shards_backings.backs(self.prefix, no) {
       return Err(VfsError::DaxMapped);
     }
     // As for a read window, and here it also saves the copy-up, which is the expensive half of this path.

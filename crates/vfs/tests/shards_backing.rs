@@ -204,7 +204,7 @@ fn backed_file(size: u64) -> (Store, Volume, InodeNo, Handle, Model) {
   let mut object = DaxObject::create(4).unwrap();
   let held = content.len().min(filled());
   object.store(0, &content[..held]).unwrap();
-  let mut backing = ShardsBacking::new(object, no);
+  let mut backing = ShardsBacking::new(object, volume.prefix(), no);
   backing.mark_filled(0);
   let handle = store.shards_backings.insert(backing).unwrap();
   let mut model_object = vec![0u8; filled()];
@@ -277,7 +277,7 @@ proptest! {
 #[test]
 fn a_suppressed_backing_is_passed_over_and_the_others_are_not() {
   let (mut store, mut volume, no, source, _model) = backed_file(1 << 20);
-  let mut other = ShardsBacking::new(DaxObject::create(4).unwrap(), no);
+  let mut other = ShardsBacking::new(DaxObject::create(4).unwrap(), volume.prefix(), no);
   other.mark_filled(0);
   let other = store.shards_backings.insert(other).unwrap();
   store.shards_backings.suppress(Some(source));
@@ -296,6 +296,38 @@ fn a_suppressed_backing_is_passed_over_and_the_others_are_not() {
   volume.write(&mut store, no, 200, b"after").unwrap();
   assert_eq!(&object_bytes(&mut store, source)[200..205], b"after");
   assert_eq!(&object_bytes(&mut store, other)[200..205], b"after");
+}
+
+/// A-163, the volume a change is of. A clone shares its origin's nodes, and so its inode numbers
+/// (`Volume::clone_of`); a snapshot a device presents is such a clone, in the same store. Do: back a file of the origin,
+/// as a guest of the origin maps it; clone a snapshot of the origin into the same store; write the clone's copy of the
+/// file, truncate it and extend it again. Expect the origin's backing untouched by all three, and still reached by a
+/// write of the origin's own file: a change of one volume never reaches a guest's map of another.
+#[test]
+fn a_change_of_a_clone_never_reaches_a_backing_of_its_origin() {
+  let (mut store, mut origin, no, handle, _model) = backed_file(1 << 20);
+  let snapshot = origin.snapshot(&mut store).unwrap();
+  let mut clone = Volume::clone_of(&store, &mut origin, snapshot, common::clone_config(8)).unwrap();
+  let before = object_bytes(&mut store, handle);
+  clone
+    .write(&mut store, no, 100, b"the clone's own bytes")
+    .unwrap();
+  assert!(
+    object_bytes(&mut store, handle) == before,
+    "a write of the clone's file reached the origin's map"
+  );
+  clone.truncate(&mut store, no, 4096).unwrap();
+  clone.truncate(&mut store, no, 1 << 20).unwrap();
+  assert!(
+    object_bytes(&mut store, handle) == before,
+    "a size change of the clone's file reached the origin's map"
+  );
+  origin.write(&mut store, no, 200, b"origin").unwrap();
+  assert_eq!(
+    &object_bytes(&mut store, handle)[200..206],
+    b"origin",
+    "non-vacuity: the origin's own write reaches its map"
+  );
 }
 
 /// AC (Shards part 3, step 4), the size bound. Do: on a backed file, write and truncate past the object's size; and on a
@@ -355,9 +387,10 @@ fn overlay(host: &mut slates_vfs::host::sim::SimHost, store: &mut Store) -> Volu
   .unwrap()
 }
 
-/// A backing of file `no` registered in the store, its first range filled: as a guest's read-only map leaves it.
-fn back(store: &mut Store, no: InodeNo) -> Handle {
-  let mut backing = ShardsBacking::new(DaxObject::create(4).unwrap(), no);
+/// A backing of file `no` of the volume of prefix `volume` registered in the store, its first range filled: as a guest's
+/// read-only map leaves it.
+fn back(store: &mut Store, volume: u16, no: InodeNo) -> Handle {
+  let mut backing = ShardsBacking::new(DaxObject::create(4).unwrap(), volume, no);
   backing.mark_filled(0);
   store.shards_backings.insert(backing).unwrap()
 }
@@ -391,7 +424,7 @@ fn overlay_with_big() -> (slates_vfs::host::sim::SimHost, Store, Volume, InodeNo
 #[test]
 fn an_outsiders_edit_adopted_marks_an_untouched_files_backings_stale_and_a_still_disk_does_not() {
   let (mut host, mut store, mut vol, no) = overlay_with_big();
-  let handle = back(&mut store, no);
+  let handle = back(&mut store, vol.prefix(), no);
   vol.with_host(&mut host).stat(&mut store, no).unwrap();
   assert!(
     !take_stale(&mut store, handle),
@@ -419,7 +452,7 @@ fn a_file_witnessed_for_a_writable_map_is_never_changed_beneath_it_by_the_disk()
     .with_host(&mut host)
     .witness_content(&mut store, no)
     .unwrap();
-  let handle = back(&mut store, no);
+  let handle = back(&mut store, vol.prefix(), no);
   host.write_in_place("/big", &pattern(1 << 20, 0x5c), 1_000);
   let mut o = vol.with_host(&mut host);
   o.stat(&mut store, no).unwrap();
@@ -448,7 +481,7 @@ fn rewitness_refuses_a_file_mapped_writable_and_marks_one_mapped_to_read() {
   host.write_in_place("/big", &pattern(1 << 20, 0x5c), 1_000);
   let mut buf = vec![0u8; 4096];
   let _ = vol.with_host(&mut host).read(&mut store, no, 0, &mut buf);
-  let mut writable = ShardsBacking::new(DaxObject::create(4).unwrap(), no);
+  let mut writable = ShardsBacking::new(DaxObject::create(4).unwrap(), vol.prefix(), no);
   writable.mark_filled(0);
   writable.mark_writable(0);
   let writable = store.shards_backings.insert(writable).unwrap();
@@ -466,7 +499,7 @@ fn rewitness_refuses_a_file_mapped_writable_and_marks_one_mapped_to_read() {
     "a refused rewitness changes nothing"
   );
   store.shards_backings.remove(writable);
-  let handle = back(&mut store, no);
+  let handle = back(&mut store, vol.prefix(), no);
   assert_eq!(
     vol
       .with_host(&mut host)
@@ -494,7 +527,7 @@ fn an_in_process_writable_map_and_a_shards_backing_exclude_each_other() {
   volume
     .write(&mut store, no, 0, &pattern(4096, 0x13))
     .unwrap();
-  let handle = back(&mut store, no);
+  let handle = back(&mut store, volume.prefix(), no);
   assert!(matches!(
     volume.dax_map_write(&mut store, no),
     Err(slates_vfs::error::VfsError::DaxMapped)
@@ -528,7 +561,7 @@ fn write_through_cost_per_mib() {
     .unwrap();
   volume.write(&mut store, plain, 0, &bytes).unwrap();
   volume.write(&mut store, backed, 0, &bytes).unwrap();
-  let mut backing = ShardsBacking::new(DaxObject::create(4).unwrap(), backed);
+  let mut backing = ShardsBacking::new(DaxObject::create(4).unwrap(), volume.prefix(), backed);
   backing.mark_filled(0);
   store.shards_backings.insert(backing).unwrap();
   let mut write_mib = |no: InodeNo, seed: u8| {

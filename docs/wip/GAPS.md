@@ -11276,6 +11276,20 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   - No production exposure: DAX on this device is unadvertised, and no guest device attaches over the ring.
   - The fix (wake on the change; re-point the window rather than unmap it) is the core of goal G-vhost, failing test
     first.
+- **Fixed 2026-10-25 (A-166): a change of a clone reached a guest's DAX map of its origin.**
+  `docs/bugs/2026-10-25-a-clones-change-reaches-its-origins-dax-backing.md`. The store kept DAX backings by inode number
+  alone, and a clone (a snapshot a device presents is one) shares its origin's numbers, so either volume's write reached
+  the other's guest's map. Exposure was the Shards route (A-163) on a volume with a clone in the same shard. Backings are
+  now keyed by the volume's own prefix and the number together; `a_change_of_a_clone_never_reaches_a_backing_of_its_
+  origin` failed before the fix and passes after, and the 25 Shards tests pass unchanged.
+- **Open, reported by A-166's sibling sweep (each from reading; each to be proven by a test before a change):**
+  - write-log replay (`verbs::replay_one`) routes a logged FUSE write by its inode number's prefix, which for a clone's
+    inherited file is its origin's: a replayed write would land in the origin;
+  - the in-process DAX gate's recall (`has_writable_of_prefix`, `writable_of_prefix`, `recalling(no.prefix())`) counts
+    a clone's writable windows on inherited files under the origin, so the clone's snapshot could freeze under one
+    (harness-only exposure: `writable_dax`, DAX unadvertised);
+  - `DaxRegistry::has_writable_of` keys by number alone: the backed session's `EBUSY` over-refuses across volumes;
+  - `volume_config` wraps `next_prefix` at 65,535 with no check against live volumes' prefixes.
 - **Open, found by the new tests: a read-only attachment is not a read-only file system to its client.** On every FUSE
   transport (the shared bridge) an open for writing is granted and each write through it refused `EPERM`; NFS answers
   `PERM`. A read-only file system answers `EROFS`, at the open for an open. Every change is refused and nothing lands,

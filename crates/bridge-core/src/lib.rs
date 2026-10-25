@@ -214,6 +214,9 @@ pub struct DaxState<'a> {
   pub backings: &'a mut slates_vfs::shards_backing::ShardsBackings,
   /// The in-process DAX registry: a file a guest maps writable there cannot also be backed.
   pub registry: &'a slates_vfs::dax::DaxRegistry,
+  /// The prefix of the volume the bridge serves ([`slates_vfs::volume::Volume::prefix`]): with an inode number, what
+  /// names a file in the store, since a clone shares its origin's numbers.
+  pub volume: u16,
 }
 
 /// One kernel cache entry a transport must drop or expire (§4.6 `notify`): the seam produces

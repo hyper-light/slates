@@ -406,7 +406,7 @@ impl DaxBackingSession {
         .and_then(|object| {
           state
             .backings
-            .insert(ShardsBacking::new(object, InodeNo(inode)))
+            .insert(ShardsBacking::new(object, state.volume, InodeNo(inode)))
             .map_err(|_| Refused::Object)
         });
       match made {

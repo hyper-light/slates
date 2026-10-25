@@ -1421,7 +1421,7 @@ impl Overlay<'_> {
       b.base_len = fp.size;
     }
     if changed {
-      store.shards_backings.mark_stale(no);
+      store.shards_backings.mark_stale(self.vol.prefix, no);
     }
     Ok(())
   }
@@ -1481,7 +1481,7 @@ impl Overlay<'_> {
     }
     // The disk's bytes changed beneath the file's Shards backings: they are refilled (Shards part 3, step 4).
     if changed {
-      store.shards_backings.mark_stale(no);
+      store.shards_backings.mark_stale(self.vol.prefix, no);
     }
     Ok(())
   }
@@ -2402,7 +2402,7 @@ impl Overlay<'_> {
     // The witness is the disk as it is now: a Shards backing filled before the disk changed is refilled to it (Shards
     // part 3, step 4).
     if changed {
-      store.shards_backings.mark_stale(no);
+      store.shards_backings.mark_stale(self.vol.prefix, no);
     }
     let at = self.vol.witness_clock();
     let home = home_parent.map(|home| (home, name.clone().into()));
@@ -2797,7 +2797,7 @@ impl Overlay<'_> {
       self.adopt_fingerprint(store, no, at_path)?;
       // Another file serves the entry now, whatever its attributes say: its Shards backings are refilled (Shards part
       // 3, step 4).
-      store.shards_backings.mark_stale(no);
+      store.shards_backings.mark_stale(self.vol.prefix, no);
       self.invalidate_listing_of(store, no);
       return Ok((fresh, at_path));
     }
@@ -3579,7 +3579,7 @@ impl Overlay<'_> {
     };
     if targets
       .iter()
-      .any(|no| store.shards_backings.mapped_writable(*no))
+      .any(|no| store.shards_backings.mapped_writable(self.vol.prefix, *no))
     {
       return Err(VfsError::DaxMapped);
     }
@@ -3621,7 +3621,7 @@ impl Overlay<'_> {
       };
       if keep_descriptor {
         self.plane()?.descriptors.insert(no, file);
-        store.shards_backings.mark_stale(no);
+        store.shards_backings.mark_stale(self.vol.prefix, no);
       } else {
         self.host.close_file(file);
       }

@@ -2563,7 +2563,7 @@ impl Volume {
       .checked_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
       .ok_or(VfsError::FileTooLarge)?;
     // A file a Shards guest maps has an object of a fixed size (Shards part 3): a change past it cannot reach the map.
-    if end > slates_mem::DAX_OBJECT_BYTES && store.shards_backings.backs(no) {
+    if end > slates_mem::DAX_OBJECT_BYTES && store.shards_backings.backs(self.prefix, no) {
       return Err(VfsError::FileTooLarge);
     }
     // A journaled write is a namespace write; an unjournaled one is an attribute value's.
@@ -2665,13 +2665,18 @@ impl Volume {
       self.record(&mut store.metadata, op, "", Some(no), prev_version);
       // Every Shards backing of the file takes the write before it returns (Shards part 3, step 4): a hole it opened
       // past the old end is zeroed in them, and the bytes written land over their filled ranges.
-      if store.shards_backings.backs(no) {
+      if store.shards_backings.backs(self.prefix, no) {
         if off > old_size {
-          store.shards_backings.zero_through(no, old_size, off);
+          store
+            .shards_backings
+            .zero_through(self.prefix, no, old_size, off);
         }
-        store
-          .shards_backings
-          .write_through(no, off, bytes.get(..written).unwrap_or(bytes));
+        store.shards_backings.write_through(
+          self.prefix,
+          no,
+          off,
+          bytes.get(..written).unwrap_or(bytes),
+        );
       }
     }
     Ok(written)
@@ -2850,7 +2855,7 @@ impl Volume {
     recorded: Recorded,
   ) -> Result<(), VfsError> {
     // A file a Shards guest maps has an object of a fixed size (Shards part 3): a size past it cannot reach the map.
-    if len > slates_mem::DAX_OBJECT_BYTES && store.shards_backings.backs(no) {
+    if len > slates_mem::DAX_OBJECT_BYTES && store.shards_backings.backs(self.prefix, no) {
       return Err(VfsError::FileTooLarge);
     }
     let old_size = self.inode(store, no)?.attrs.size;
@@ -2873,10 +2878,10 @@ impl Volume {
     }
     // What the truncate cut, or the hole it opened, reads zero in every Shards backing of the file (Shards part 3,
     // step 4), so a store a guest made past the old end is never taken for data.
-    if store.shards_backings.backs(no) {
+    if store.shards_backings.backs(self.prefix, no) {
       store
         .shards_backings
-        .zero_through(no, len.min(old_size), len.max(old_size));
+        .zero_through(self.prefix, no, len.min(old_size), len.max(old_size));
     }
     Ok(())
   }
@@ -3438,7 +3443,7 @@ impl Volume {
     }
     // The edit shifted every byte after `at`: each Shards backing of the file has its filled ranges from there copied
     // again (Shards part 3, step 4), at the cost of the tail the edit already rewrote.
-    if store.shards_backings.backs(no) {
+    if store.shards_backings.backs(self.prefix, no) {
       self.recopy_backings(store, no, at);
     }
     Ok(())
@@ -3450,15 +3455,20 @@ impl Volume {
   /// volume no longer serves.
   pub(crate) fn recopy_backings(&self, store: &mut Store, no: InodeNo, from: u64) {
     let size = self.inode(store, no).map_or(0, |inode| inode.attrs.size);
-    for (start, end) in store.shards_backings.filled_spans_from(no, from) {
+    for (start, end) in store
+      .shards_backings
+      .filled_spans_from(self.prefix, no, from)
+    {
       let stop = end.min(size).max(start);
       let mut bytes = vec![0u8; usize::try_from(stop.saturating_sub(start)).unwrap_or(0)];
       let read = self.read(store, no, start, &mut bytes).unwrap_or(0);
       let read_to = start.saturating_add(u64::try_from(read).unwrap_or(0));
       store
         .shards_backings
-        .write_through(no, start, bytes.get(..read).unwrap_or(&[]));
-      store.shards_backings.zero_through(no, read_to, end);
+        .write_through(self.prefix, no, start, bytes.get(..read).unwrap_or(&[]));
+      store
+        .shards_backings
+        .zero_through(self.prefix, no, read_to, end);
     }
   }
 

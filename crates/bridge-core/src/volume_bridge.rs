@@ -1345,10 +1345,12 @@ impl Bridge for VolumeBridge<'_> {
   }
 
   fn dax_state(&mut self) -> Option<crate::DaxState<'_>> {
+    let volume = self.volume.prefix();
     let store = &mut *self.store;
     Some(crate::DaxState {
       backings: &mut store.shards_backings,
       registry: &store.dax,
+      volume,
     })
   }
 

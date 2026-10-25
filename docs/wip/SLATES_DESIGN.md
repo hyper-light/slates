@@ -3359,7 +3359,9 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 - control asks for its tables (a VM's save and restore) are refused in Shards' own forms, since slates keeps no tables a
   VM's snapshot can carry;
 - a DAX window's descriptor ask is answered with a descriptor of one shared-memory object per attachment and file,
-  holding only that file's bytes (A-163): sized once to `2^63 − 2 MiB` and never resized, filled from the volume a
+  holding only that file's bytes (A-163). The store names the file by its volume's own prefix and its inode number
+  together, since a clone, and a snapshot a device presents, shares its origin's numbers (A-166). The object is sized
+  once to `2^63 − 2 MiB` and never resized, filled from the volume a
   range at a time as asked, every change of the file through any path written into it before the change returns, and
   the guest's stores written back at its FSYNC, FLUSH, RELEASE and FORGET and the stream's end. So there is no revoke
   and no message to the device; the stream offers per-inode DAX (`FUSE_HAS_INODE_DAX`, `FUSE_ATTR_DAX` on files of a
@@ -12095,6 +12097,25 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
+
+### A-166 — A DAX backing names its file by volume and inode number together (accepted 2026-10-25)
+Applied in the same change to: §4.6 (the Shards stream's DAX bullet), `crates/vfs/src/shards_backing.rs` (the registry
+keyed by volume prefix and inode; every query and write-through names both), `crates/vfs/src/volume.rs` and
+`crates/vfs/src/base.rs` (the write boundary and the base plane pass their own volume's prefix), `crates/vfs/src/dax.rs`
+(`dax_map_write`'s exclusion), `crates/bridge-core` (`DaxState::volume`, the backed session), the test
+`a_change_of_a_clone_never_reaches_a_backing_of_its_origin` in `crates/vfs/tests/shards_backing.rs`, GAPS,
+`docs/bugs/2026-10-25-a-clones-change-reaches-its-origins-dax-backing.md`.
+- Corrects A-163's "one object per attachment and file": an inode number names a file only within a volume. A clone
+  shares its origin's nodes and their numbers (`Volume::clone_of`), and a snapshot a device presents is such a clone in
+  the same store. The registry kept backings by number alone, so a write of either volume reached the other's guest's
+  map. Found while reusing the backings for slates' own virtio-fs device (goal G-vhost); proven by the test above,
+  which failed before the fix with the clone's bytes in the origin's backing.
+- The key is the volume's own prefix (`Volume::prefix`), never the one an inherited number carries: each volume and
+  each view in a shard is given its own (`verbs::volume_config`).
+- Unchanged: the protocol, the bounds, the write-through and the ingest; the 25 Shards tests pass as before.
+- Reported, not changed (the bug record's sibling sweep): write-log replay routes a record by its number's prefix; the
+  in-process gate's recall counts a clone's windows on inherited files under the origin; `has_writable_of` keys by
+  number alone (an over-refusal); prefix allocation wraps at 65,535 with no check against live volumes.
 
 ### A-165 — Firecracker maps a volume's image with DAX through virtio-pmem (accepted 2026-10-24)
 Applied in the same change to: `crates/guest-probe/src/guest.rs` (module loads, the device node's wait, the block
