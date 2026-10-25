@@ -230,7 +230,11 @@ fn a_guest_writes_a_file_into_a_daemon_volume_that_the_host_reads_back_over_nfs(
       .iter()
       .any(|c| c.transport == GuestTransport::InProcess && c.supported)
   );
-  assert!(capabilities.iter().all(|c| !c.dax.advertised));
+  assert!(
+    capabilities.iter().all(|c| c.dax.advertised
+      == (c.transport == GuestTransport::InheritedDescriptor && cfg!(target_os = "linux"))),
+    "DAX is offered by the vhost-user binding where it is built, and by nothing else"
+  );
 
   drop(stream);
   drop(client);
@@ -651,8 +655,8 @@ mod vhost_front_end {
     SendFlags, SocketFlags, SocketType,
   };
   use slates_bridge_virtiofs::vhost_user::{
-    FLAG_NEED_REPLY, GuestRegions, HEADER_LEN, MappedRegion, OFFERED_FEATURES,
-    OFFERED_PROTOCOL_FEATURES, RegionEntry, VERSION, request,
+    DAX_PROTOCOL_FEATURES, FLAG_NEED_REPLY, GuestRegions, HEADER_LEN, MappedRegion,
+    OFFERED_FEATURES, OFFERED_PROTOCOL_FEATURES, RegionEntry, VERSION, request,
   };
 
   use super::common::guest::{GUEST_RAM, Guest};
@@ -706,19 +710,24 @@ mod vhost_front_end {
       None,
     )
     .unwrap();
-    let eventfds = || {
-      (0..2)
-        .map(|_| eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK).unwrap())
-        .collect()
-    };
-    (
+    (FrontEnd::over(ours), theirs)
+  }
+
+  impl FrontEnd {
+    /// The front end over `socket`, an end whose other end the daemon's device serves: what a VMM holds when it was
+    /// handed the end (`slates vhost-user`), with fresh kick and call eventfds for its queues.
+    pub(crate) fn over(socket: OwnedFd) -> FrontEnd {
+      let eventfds = || {
+        (0..2)
+          .map(|_| eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK).unwrap())
+          .collect()
+      };
       FrontEnd {
-        socket: ours,
+        socket,
         kicks: eventfds(),
         calls: eventfds(),
-      },
-      theirs,
-    )
+      }
+    }
   }
 
   impl FrontEnd {
@@ -881,9 +890,70 @@ mod vhost_front_end {
       }
     }
 
-    /// Kicks `queue` and waits for its interrupt.
-    pub(crate) fn kick_and_wait(&self, queue: usize) {
+    /// Negotiates as [`FrontEnd::negotiate_memory`] does, for a device that offers a DAX window of `window` bytes: the
+    /// shared-memory and back-end-request features accepted, the window's size read (`GET_SHMEM_CONFIG`), and the
+    /// back-end-request channel handed over (`SET_BACKEND_REQ_FD`), as crosvm does. The front end's end of that channel,
+    /// on which the device asks it to map.
+    pub(crate) fn negotiate_dax(&self, ram: &OwnedFd, window: u64) -> OwnedFd {
+      assert_eq!(self.get(request::GET_FEATURES), OFFERED_FEATURES);
+      self.send(
+        request::SET_FEATURES,
+        0,
+        &OFFERED_FEATURES.to_le_bytes(),
+        &[],
+      );
+      let protocol = OFFERED_PROTOCOL_FEATURES | DAX_PROTOCOL_FEATURES;
+      assert_eq!(
+        self.get(request::GET_PROTOCOL_FEATURES),
+        protocol,
+        "a device with a window offers the shared-memory features"
+      );
+      self.send(
+        request::SET_PROTOCOL_FEATURES,
+        0,
+        &protocol.to_le_bytes(),
+        &[],
+      );
+      assert_eq!(self.get(request::GET_QUEUE_NUM), 2);
+      assert_eq!(self.set(request::SET_OWNER, &[], &[]), 0);
+      self.send(request::GET_SHMEM_CONFIG, 0, &[], &[]);
+      let config = self.reply().unwrap();
+      assert_eq!(
+        u32::from_le_bytes(config[0..4].try_into().unwrap()),
+        1,
+        "one shared-memory region: the window"
+      );
+      assert_eq!(
+        u64::from_le_bytes(config[8..16].try_into().unwrap()),
+        window,
+        "the window's size is the attach's"
+      );
+      let (ours, theirs) = rustix::net::socketpair(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC,
+        None,
+      )
+      .unwrap();
+      assert_eq!(
+        self.set(request::SET_BACKEND_REQ_FD, &[], &[theirs.as_fd()]),
+        0,
+        "the back-end-request channel is taken"
+      );
+      assert_eq!(
+        self.set(request::SET_MEM_TABLE, &memory_table(), &[ram.as_fd()]),
+        0
+      );
+      ours
+    }
+
+    /// Kicks `queue`.
+    pub(crate) fn kick(&self, queue: usize) {
       rustix::io::write(&self.kicks[queue], &1u64.to_le_bytes()).unwrap();
+    }
+
+    /// Waits for `queue`'s interrupt.
+    pub(crate) fn wait_call(&self, queue: usize) {
       let mut fds = [PollFd::new(&self.calls[queue], PollFlags::IN)];
       let timeout = Timespec {
         tv_sec: WAIT_NS / 1_000_000_000,
@@ -896,6 +966,12 @@ mod vhost_front_end {
       );
       let mut counter = [0u8; 8];
       rustix::io::read(&self.calls[queue], &mut counter).unwrap();
+    }
+
+    /// Kicks `queue` and waits for its interrupt.
+    pub(crate) fn kick_and_wait(&self, queue: usize) {
+      self.kick(queue);
+      self.wait_call(queue);
     }
 
     /// `GET_VRING_BASE` of `queue`: the ring stops; its position.
@@ -1104,6 +1180,654 @@ fn a_vhost_user_front_end_that_offers_unsealed_memory_or_leaves_is_refused() {
     ),
     "{outcome:?}"
   );
+  drop(client);
+  drop(daemon);
+}
+
+/// G-vhost, step 2: the attach verb's vhost-user form by use over the wire. A client attaches a volume in the form and
+/// receives the socket end the daemon's device serves, as `slates vhost-user` does before it runs a VMM, and the test
+/// plays the VMM's front end over that end. Linux only, where vhost-user is built.
+#[cfg(target_os = "linux")]
+mod vhost_form {
+  use slates_client::{
+    Client as Typed, ClientError, CreateSpec, Deadlines, Intent, ReadAt, Refusal, VolumeId,
+  };
+
+  use super::*;
+
+  /// Shape: shards of the test daemon: two, so a client's shard and a volume's owner may differ, and a forwarded
+  /// attach carries its end home.
+  const TEST_SHARDS: u16 = 2;
+  /// Shape: a volume's bounded quota.
+  const QUOTA: u64 = 4 << 20;
+  /// Shape: names tried before a volume lands on the other shard: the chance all of them land on one is 2^-63.
+  const MOST_NAMES: usize = 64;
+  /// Shape: how long the client retries the rendezvous while its daemon starts, and how long an attachment's end may
+  /// take to show.
+  const WAIT: Duration = Duration::from_secs(20);
+  /// Shape: a DAX window the form offers: four 2 MiB ranges, a power of two.
+  const WINDOW: u64 = 8 << 20;
+  /// Format: the longest tag the device publishes (`TAG_LEN`, virtio 1.2 §5.11.4), and one byte past it.
+  const PAST_THE_TAG: usize = slates_bridge_virtiofs::device::TAG_LEN + 1;
+
+  /// A daemon of [`TEST_SHARDS`] shards named `tag`, its consensus group made, and a typed client of it.
+  fn daemon_and_client(tag: &str) -> (Daemon, Typed) {
+    let profile = common::machine_profile();
+    let instance = format!("srv-{tag}-{}", std::process::id());
+    let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+    let daemon = Daemon::start(
+      &profile,
+      config,
+      SegmentSource::Create {
+        name: format!("slates-seg-{tag}"),
+      },
+    )
+    .unwrap();
+    daemon
+      .bootstrap(true)
+      .expect("the fixture explicitly creates its local consensus group");
+    let deadlines = Deadlines::derive(
+      slates_server::daemon::LIVENESS_BUDGET_NS,
+      slates_db::replay::RECOVERY_BUDGET_NS,
+    )
+    .get();
+    let started = Instant::now();
+    let client = loop {
+      match Typed::connect(&instance, deadlines) {
+        Ok(client) => break client,
+        Err(ClientError::Ipc(IpcError::DaemonUnavailable { .. })) if started.elapsed() < WAIT => {
+          std::thread::yield_now();
+        }
+        Err(e) => panic!("{e}"),
+      }
+    };
+    (daemon, client)
+  }
+
+  /// A scratch volume named `name`.
+  fn volume(client: &mut Typed, name: &str) -> VolumeId {
+    client
+      .create(&CreateSpec {
+        name: name.to_owned(),
+        size: SizeClass::Bounded { limit: QUOTA },
+        names: NamePolicy::Exact,
+        require_locked: false,
+        base: None,
+      })
+      .unwrap()
+  }
+
+  /// Two volumes, owned by different shards.
+  fn on_both_shards(client: &mut Typed) -> [VolumeId; 2] {
+    let first = volume(client, "vhost-0");
+    let owner = slates_server::verbs::owner_of(first);
+    for at in 1..MOST_NAMES {
+      let next = volume(client, &format!("vhost-{at}"));
+      if slates_server::verbs::owner_of(next) != owner {
+        return [first, next];
+      }
+    }
+    panic!("{MOST_NAMES} names all landed on shard {owner}");
+  }
+
+  /// Waits until `volume`'s status counts `count` attachments.
+  fn wait_for_attachments(client: &mut Typed, volume: VolumeId, count: u32) {
+    let started = Instant::now();
+    while client.status(volume).unwrap().attachments != count {
+      assert!(
+        started.elapsed() < WAIT,
+        "the attachments never came to {count}"
+      );
+      std::thread::yield_now();
+    }
+  }
+
+  /// Shape: the bytes of the file the guest maps in the DAX test: one 4 KiB page.
+  const MAPPED_FILE_BYTES: usize = 4096;
+  /// Format: Linux `FUSE_DAX_SZ`, the range a guest's SETUPMAPPING maps.
+  const DAX_RANGE: u64 = 2 << 20;
+
+  /// What the front end's back-end-request channel delivered for a SHMEM_MAP, mapped as crosvm maps it into the guest's
+  /// window (here at an address the kernel chooses): shared, writable when the map asked so.
+  struct WindowMap {
+    _object: std::os::fd::OwnedFd,
+    at: *mut std::ffi::c_void,
+    len: usize,
+  }
+
+  impl WindowMap {
+    /// `len` bytes from `at`, as the guest reads its window.
+    fn read(&self, at: usize, len: usize) -> Vec<u8> {
+      assert!(at + len <= self.len);
+      // SAFETY: `self.at` is this value's live mapping of `self.len` bytes, and `[at, at + len)` lies inside it.
+      unsafe { std::slice::from_raw_parts(self.at.cast::<u8>().add(at), len) }.to_vec()
+    }
+
+    /// Stores `bytes` at `at`, as the guest stores through its window.
+    fn store(&mut self, at: usize, bytes: &[u8]) {
+      assert!(at + bytes.len() <= self.len);
+      // SAFETY: as `read`, on a mapping made writable (the device maps every window writable for a writable
+      // attachment); nothing else borrows it during the copy.
+      unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.at.cast::<u8>().add(at), bytes.len())
+      };
+    }
+  }
+
+  impl Drop for WindowMap {
+    fn drop(&mut self) {
+      // SAFETY: unmapping exactly the mapping this value made, with its own address and length.
+      unsafe { rustix::mm::munmap(self.at, self.len) }.unwrap();
+    }
+  }
+
+  /// Takes one SHMEM_MAP on the back-end-request channel `backend` (waiting for it, bounded) and maps its descriptor as
+  /// the front end does; then acknowledges it, as a front end does once the window is placed.
+  fn take_and_place_map(backend: &std::os::fd::OwnedFd) -> WindowMap {
+    use slates_bridge_virtiofs::vhost_user::{
+      ACK_LEN, FLAG_REPLY, HEADER_AT_FLAGS, HEADER_AT_SIZE, HEADER_LEN, MAP_FDS, MMAP_FLAG_MAP_RW,
+      MMAP_LEN, VERSION, backend_request,
+    };
+    let mut fds = [rustix::event::PollFd::new(
+      backend,
+      rustix::event::PollFlags::IN,
+    )];
+    let wait = rustix::event::Timespec {
+      tv_sec: i64::try_from(WAIT.as_secs()).unwrap(),
+      tv_nsec: 0,
+    };
+    assert_eq!(
+      rustix::event::poll(&mut fds, Some(&wait)).unwrap(),
+      1,
+      "the device asks for its map in time"
+    );
+    let mut buf = [0u8; HEADER_LEN + MMAP_LEN];
+    let mut space =
+      [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(MAP_FDS))];
+    let mut control = rustix::net::RecvAncillaryBuffer::new(&mut space);
+    let got = rustix::net::recvmsg(
+      backend,
+      &mut [std::io::IoSliceMut::new(&mut buf)],
+      &mut control,
+      rustix::net::RecvFlags::CMSG_CLOEXEC,
+    )
+    .unwrap();
+    assert_eq!(got.bytes, buf.len(), "a whole SHMEM_MAP");
+    assert_eq!(
+      u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+      backend_request::SHMEM_MAP
+    );
+    let mut received: Vec<std::os::fd::OwnedFd> = Vec::new();
+    for message in control.drain() {
+      if let rustix::net::RecvAncillaryMessage::ScmRights(iter) = message {
+        received.extend(iter);
+      }
+    }
+    let object = received
+      .pop()
+      .expect("SHMEM_MAP carries the file's backing");
+    let field = |at: usize| {
+      u64::from_le_bytes(
+        buf[HEADER_LEN + at..HEADER_LEN + at + 8]
+          .try_into()
+          .unwrap(),
+      )
+    };
+    let (fd_offset, len, flags) = (field(8), field(24), field(32));
+    let len = usize::try_from(len).unwrap();
+    let prot = if flags & MMAP_FLAG_MAP_RW != 0 {
+      rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE
+    } else {
+      rustix::mm::ProtFlags::READ
+    };
+    // SAFETY: a fresh shared mapping at an address the kernel chooses, of `len` bytes of a descriptor this test owns, at
+    // a page-aligned offset; `WindowMap` unmaps it, with the same address and length, before the descriptor drops.
+    let at = unsafe {
+      rustix::mm::mmap(
+        std::ptr::null_mut(),
+        len,
+        prot,
+        rustix::mm::MapFlags::SHARED,
+        &object,
+        fd_offset,
+      )
+    }
+    .unwrap();
+    let mut ack = [0u8; HEADER_LEN + ACK_LEN];
+    ack[0..4].copy_from_slice(&backend_request::SHMEM_MAP.to_le_bytes());
+    ack[HEADER_AT_FLAGS..HEADER_AT_FLAGS + 4]
+      .copy_from_slice(&(VERSION | FLAG_REPLY).to_le_bytes());
+    ack[HEADER_AT_SIZE..HEADER_AT_SIZE + 4]
+      .copy_from_slice(&u32::try_from(ACK_LEN).unwrap().to_le_bytes());
+    rustix::net::sendmsg(
+      backend,
+      &[std::io::IoSlice::new(&ack)],
+      &mut rustix::net::SendAncillaryBuffer::default(),
+      rustix::net::SendFlags::NOSIGNAL,
+    )
+    .unwrap();
+    WindowMap {
+      _object: object,
+      at,
+      len,
+    }
+  }
+
+  /// A `fuse_setupmapping_in`: fh, the file offset, the length, the flags (write when `writable`), the window offset.
+  fn setup_body(foffset: u64, len: u64, writable: bool, moffset: u64) -> Vec<u8> {
+    let flags = if writable {
+      slates_bridge_fuse::request::SETUPMAPPING_FLAG_WRITE
+    } else {
+      0
+    };
+    let mut body = Vec::new();
+    for word in [0u64, foffset, len, flags, moffset] {
+      body.extend_from_slice(&word.to_le_bytes());
+    }
+    body
+  }
+
+  /// Whether the back-end-request channel `backend` holds a message now.
+  fn backend_pending(backend: &std::os::fd::OwnedFd) -> bool {
+    let mut fds = [rustix::event::PollFd::new(
+      backend,
+      rustix::event::PollFlags::IN,
+    )];
+    let now = rustix::event::Timespec {
+      tv_sec: 0,
+      tv_nsec: 0,
+    };
+    rustix::event::poll(&mut fds, Some(&now)).unwrap() > 0
+  }
+
+  /// The guest's lookup of `mapped.bin` and its read-only map of the file's first range at window offset zero, the map
+  /// placed and acknowledged as the front end does, the SETUPMAPPING answered only after the ack: the node and the
+  /// window, which shows the file.
+  fn map_the_file(
+    front: &vhost_front_end::FrontEnd,
+    guest: &mut common::guest::Guest<slates_bridge_virtiofs::vhost_user::GuestRegions>,
+    backend: &std::os::fd::OwnedFd,
+  ) -> (u64, WindowMap) {
+    let found = through_vhost(
+      front,
+      guest,
+      &message(Opcode::Lookup.to_wire(), 1, 1, b"mapped.bin\0"),
+    );
+    assert_eq!(reply_error(&found), 0, "the guest finds the file");
+    let node = u64_at(&found, OUT_HEADER_LEN);
+    let head = guest.submit(
+      &message(
+        Opcode::SetupMapping.to_wire(),
+        2,
+        node,
+        &setup_body(0, DAX_RANGE, false, 0),
+      ),
+      common::guest::REPLY_CAP,
+    );
+    front.kick(1);
+    let window = take_and_place_map(backend);
+    front.wait_call(1);
+    let (id, len) = guest
+      .reap()
+      .expect("the SETUPMAPPING is answered after the ack");
+    assert_eq!(id, head);
+    assert_eq!(reply_error(&guest.reply_of(head, len)), 0);
+    assert_eq!(
+      window.read(0, 16),
+      vec![0x41; 16],
+      "the window shows the file"
+    );
+    (node, window)
+  }
+
+  /// G-vhost, the route by use through the daemon's real serve loop, with no VM: the client attaches the vhost-user form
+  /// with a DAX window; as the VMM, the test negotiates the shared-memory features, reads the window's size, and hands
+  /// over the back-end-request channel; as the guest, it looks a file up and maps its first 2 MiB range for reading.
+  /// Do: place the map the device asks for and acknowledge it; read the window; rewrite the file through the client;
+  /// upgrade the range to writable as a guest's write fault does (`fuse_upgrade_dax_mapping`), store through the window
+  /// and FSYNC; close the front end. Expect: the SETUPMAPPING answered only after the ack, the window showing the file;
+  /// the rewrite in the window with no guest request, the old tail zero; the upgrade answered with no message to the
+  /// front end; the guest's store in the volume by the FSYNC's answer; the device's attachment gone once its end
+  /// closes.
+  #[test]
+  fn a_guests_dax_window_shows_another_paths_write_and_its_store_reaches_the_volume_at_fsync() {
+    let (daemon, mut client) = daemon_and_client("vhost-dax");
+    let volume = volume(&mut client, "dax");
+    let own = client
+      .attach(volume, None, Intent::Write)
+      .unwrap()
+      .attachment;
+    client
+      .fs_write(
+        (volume, own),
+        "/mapped.bin",
+        &vec![0x41; MAPPED_FILE_BYTES],
+        0o644,
+      )
+      .unwrap();
+    let device = client
+      .attach_vhost_user(volume, Intent::Write, ("slates", None), Some(WINDOW))
+      .unwrap();
+    let front = vhost_front_end::FrontEnd::over(device.end);
+    let ram = vhost_front_end::guest_ram(true);
+    let mut guest = vhost_front_end::guest_over(&ram);
+    let backend = front.negotiate_dax(&ram, WINDOW);
+    front.configure_queues(&guest);
+    let (node, mut window) = map_the_file(&front, &mut guest, &backend);
+    client
+      .fs_write((volume, own), "/mapped.bin", b"another path", 0o644)
+      .unwrap();
+    assert_eq!(
+      window.read(0, 12),
+      b"another path".to_vec(),
+      "the rewrite shows in the window with no guest request"
+    );
+    assert_eq!(window.read(12, 16), vec![0; 16], "the cut tail reads zero");
+    let upgraded = through_vhost(
+      &front,
+      &mut guest,
+      &message(
+        Opcode::SetupMapping.to_wire(),
+        3,
+        node,
+        &setup_body(0, DAX_RANGE, true, 0),
+      ),
+    );
+    assert_eq!(
+      reply_error(&upgraded),
+      0,
+      "the writable upgrade is answered"
+    );
+    assert!(
+      !backend_pending(&backend),
+      "the upgrade sent the front end nothing: it maps the window writable already"
+    );
+    window.store(0, b"STORE");
+    let mut fsync = 0u64.to_le_bytes().to_vec();
+    fsync.extend_from_slice(&[0u8; 8]);
+    let synced = through_vhost(
+      &front,
+      &mut guest,
+      &message(Opcode::FSync.to_wire(), 4, node, &fsync),
+    );
+    assert_eq!(reply_error(&synced), 0, "FSYNC answered");
+    assert_eq!(
+      client.read(volume, "/mapped.bin", ReadAt::Head).unwrap(),
+      b"STOREer path".to_vec(),
+      "the guest's store is in the volume by the FSYNC's answer"
+    );
+    drop(window);
+    drop(front);
+    drop(backend);
+    client.detach(own).unwrap();
+    wait_for_attachments(&mut client, volume, 0);
+    drop(client);
+    drop(daemon);
+  }
+
+  /// A second client bound to a consumer the human surface enrolled under this process's account, with whom the owner
+  /// shares `volume` for reading only (§4.13).
+  fn a_reader_of(daemon: &Daemon, owner: &mut Typed, volume: VolumeId) -> Typed {
+    let account = rustix::process::getuid().as_raw();
+    let secret = daemon.segment().issuer_secret().unwrap();
+    let (consumer, capability) = owner
+      .enroll(
+        account,
+        slates_server::landing::enroll_proof(&secret, account),
+      )
+      .unwrap();
+    owner
+      .share(
+        volume,
+        slates_client::Principal::Consumer { account, consumer },
+        slates_client::Rights {
+          read: true,
+          write: false,
+          admin: false,
+        },
+      )
+      .unwrap();
+    let deadlines = Deadlines::derive(
+      slates_server::daemon::LIVENESS_BUDGET_NS,
+      slates_db::replay::RECOVERY_BUDGET_NS,
+    )
+    .get();
+    let mut reader = Typed::connect(daemon.instance(), deadlines).unwrap();
+    reader.attest(consumer, &capability).unwrap();
+    reader
+  }
+
+  /// The guest's history through a negotiated front end: it creates, writes and releases a file named `name`.
+  fn guest_writes(front: &vhost_front_end::FrontEnd, ram: &std::os::fd::OwnedFd, name: &str) {
+    let mut guest = vhost_front_end::guest_over(ram);
+    assert_eq!(
+      front.negotiate_memory(ram),
+      0,
+      "the memory table is accepted"
+    );
+    front.configure_queues(&guest);
+    let created = through_vhost(
+      front,
+      &mut guest,
+      &message(Opcode::Create.to_wire(), 1, 1, &create_body(name)),
+    );
+    assert_eq!(reply_error(&created), 0);
+    let ino = u64_at(&created, OUT_HEADER_LEN);
+    let fh = u64_at(&created, OUT_HEADER_LEN + EntryOut::LEN);
+    let written = through_vhost(
+      front,
+      &mut guest,
+      &message(Opcode::Write.to_wire(), 2, ino, &write_body(fh, PAYLOAD)),
+    );
+    assert_eq!(reply_error(&written), 0);
+    let released = through_vhost(
+      front,
+      &mut guest,
+      &message(Opcode::Release.to_wire(), 3, ino, &release_body(fh)),
+    );
+    assert_eq!(reply_error(&released), 0);
+  }
+
+  /// G-vhost, step 2, by use: on each of two volumes, one on the client's shard and one on the other, the client
+  /// attaches the vhost-user form and receives the device's socket end over its control socket. Do: check the record
+  /// before any front end speaks; as the VMM, negotiate over the end; as the guest, write a file; read it through the
+  /// client; close the end. Expect: the attachment recorded at once, with the write lease; the guest's file read back;
+  /// the attachment gone once the end closes, a `detach` then finding nothing.
+  #[test]
+  fn the_vhost_user_form_hands_the_client_a_socket_end_that_drives_a_guest_on_either_shard() {
+    let (daemon, mut client) = daemon_and_client("vhost-form");
+    for volume in on_both_shards(&mut client) {
+      let device = client
+        .attach_vhost_user(volume, Intent::Write, ("slates", None), None)
+        .unwrap();
+      let attachment = device.attachment.attachment;
+      assert!(
+        device.attachment.lease_epoch.is_some(),
+        "the write lease is taken"
+      );
+      assert!(device.attachment.capability.supported);
+      assert_eq!(
+        client.status(volume).unwrap().attachments,
+        1,
+        "the device is recorded before its front end speaks"
+      );
+      let front = vhost_front_end::FrontEnd::over(device.end);
+      let ram = vhost_front_end::guest_ram(true);
+      guest_writes(&front, &ram, "from-the-verb.txt");
+      assert_eq!(
+        client
+          .read(volume, "/from-the-verb.txt", ReadAt::Head)
+          .unwrap(),
+        PAYLOAD,
+        "the client reads what the guest wrote through the device"
+      );
+      drop(front);
+      wait_for_attachments(&mut client, volume, 0);
+      assert!(matches!(
+        client.detach(attachment),
+        Err(ClientError::Refused(Refusal::NotFound))
+      ));
+    }
+    drop(client);
+    drop(daemon);
+  }
+
+  /// G-vhost, step 2, the device's end before its front end speaks. Do: attach the form, then detach it before any
+  /// message on the end; wait for the end. Expect: the attachment gone at once; the daemon's end closes (the front end
+  /// reads its end of file), so a VMM handed it fails its handshake rather than serving a detached volume; the volume
+  /// then attaches for writing again (the lease went with the record).
+  #[test]
+  fn a_vhost_user_device_detached_before_its_front_end_speaks_closes_its_end() {
+    let (daemon, mut client) = daemon_and_client("vhost-detach");
+    let volume = volume(&mut client, "detached");
+    let device = client
+      .attach_vhost_user(volume, Intent::Write, ("slates", None), None)
+      .unwrap();
+    client.detach(device.attachment.attachment).unwrap();
+    wait_for_attachments(&mut client, volume, 0);
+    let front = vhost_front_end::FrontEnd::over(device.end);
+    assert!(
+      front.reply().is_none(),
+      "the daemon's end closed with the detach"
+    );
+    let again = client
+      .attach_vhost_user(volume, Intent::Write, ("slates", None), None)
+      .unwrap();
+    assert!(again.attachment.lease_epoch.is_some());
+    drop(again);
+    wait_for_attachments(&mut client, volume, 0);
+    drop(client);
+    drop(daemon);
+  }
+
+  /// G-vhost, step 2, the form's refusals. Do: attach a volume that does not exist; with an empty tag and one a byte
+  /// past the field; with DAX windows below one range and not a power of two; a green; and, as a consumer the owner
+  /// shared the volume with for reading only, for writing. Then, as that consumer, attach for reading, and as the owner
+  /// for writing with a DAX window. Expect: each refused by its own kind (`NotFound`, `BadRequest`, `Unsupported` for the
+  /// green, `Forbidden` for the reader's write), the volume's attachments still none after them all; the reader's
+  /// attach answered read-only and with no lease; the owner's answered, its capability saying the window is offered;
+  /// each attachment gone once its end closes.
+  #[test]
+  fn the_vhost_user_forms_refusals_are_typed_and_leave_nothing_behind() {
+    let (daemon, mut client) = daemon_and_client("vhost-refusals");
+    let volume = volume(&mut client, "refusals");
+    let mut reader = a_reader_of(&daemon, &mut client, volume);
+    assert_eq!(
+      refused(&mut client, VolumeId { bytes: [0xEE; 16] }, "slates", None),
+      Refusal::NotFound
+    );
+    malformed_asks_are_bad_requests(&mut client, volume);
+    let green = a_green(&mut client);
+    assert!(matches!(
+      refused(&mut client, green, "slates", None),
+      Refusal::Unsupported { .. }
+    ));
+    assert!(matches!(
+      refused(&mut reader, volume, "slates", None),
+      Refusal::Forbidden { .. }
+    ));
+    assert_eq!(client.status(volume).unwrap().attachments, 0);
+    let read_only = reader
+      .attach_vhost_user(volume, Intent::Read, ("slates", None), None)
+      .unwrap();
+    assert_eq!(
+      read_only.attachment.capability.read_write,
+      slates_client::ReadWritePolicy::ReadOnly
+    );
+    assert!(
+      read_only.attachment.lease_epoch.is_none(),
+      "a reader takes no lease"
+    );
+    drop(read_only);
+    wait_for_attachments(&mut client, volume, 0);
+    let device = client
+      .attach_vhost_user(volume, Intent::Write, ("slates", None), Some(WINDOW))
+      .unwrap();
+    assert_eq!(
+      device.attachment.capability.residency,
+      slates_client::Residency::DaemonRamAndGuestPageCache { dax_mapped: true },
+      "the window is offered"
+    );
+    drop(device);
+    wait_for_attachments(&mut client, volume, 0);
+    drop(client);
+    drop(daemon);
+  }
+
+  /// The refusal of a write attach of `volume` in the form with `tag` and `window`; it attaching fails the test.
+  fn refused(client: &mut Typed, volume: VolumeId, tag: &str, window: Option<u64>) -> Refusal {
+    match client.attach_vhost_user(volume, Intent::Write, (tag, None), window) {
+      Err(ClientError::Refused(refusal)) => refusal,
+      Ok(device) => panic!("attached {}", device.attachment.attachment),
+      Err(e) => panic!("{e}"),
+    }
+  }
+
+  /// An empty tag, a tag a byte past the field, and DAX windows below one range and not a power of two: each a bad
+  /// request.
+  fn malformed_asks_are_bad_requests(client: &mut Typed, volume: VolumeId) {
+    let long_tag = "t".repeat(PAST_THE_TAG);
+    for (tag, window) in [
+      ("", None),
+      (long_tag.as_str(), None),
+      ("slates", Some(1 << 20)),
+      ("slates", Some(3 << 20)),
+    ] {
+      assert!(
+        matches!(
+          refused(client, volume, tag, window),
+          Refusal::BadRequest { .. }
+        ),
+        "tag {tag:?}, window {window:?}"
+      );
+    }
+  }
+
+  /// A green volume, made from scratch.
+  fn a_green(client: &mut Typed) -> VolumeId {
+    let started = client.create_green_begin("green", false).unwrap();
+    loop {
+      if let Some(id) = client.create_green_spin(started, DEADLINE_NS).unwrap() {
+        return id;
+      }
+    }
+  }
+}
+
+/// G-vhost, step 2, elsewhere: vhost-user is Linux's, so the form is refused by kind before any effect. Do: attach a
+/// volume in the form. Expect `AttachmentUnsupported` for the inherited-descriptor transport with `BindingNotBuilt`,
+/// and the volume's attachments still none.
+#[cfg(all(unix, not(target_os = "linux")))]
+#[test]
+fn the_vhost_user_form_is_refused_by_kind_where_vhost_user_is_not_built() {
+  let (daemon, instance) = single_shard_daemon("vhost-elsewhere");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("elsewhere")) else {
+    panic!("the volume was not created");
+  };
+  let reply = client.call(&RequestBody::Attach {
+    volume: id,
+    snapshot: None,
+    intent: slates_ipc::protocol::Intent::Write,
+    form: slates_ipc::protocol::AttachRequest::VhostUserFs {
+      tag: "slates".to_owned(),
+      subtree: None,
+      dax_window: None,
+    },
+  });
+  assert_eq!(
+    reply,
+    ReplyBody::Refused {
+      refusal: slates_ipc::protocol::Refusal::AttachmentUnsupported {
+        transport: slates_ipc::protocol::AttachTransport::VirtioFsInheritedDescriptor,
+        reason: slates_ipc::protocol::UnsupportedReason::BindingNotBuilt,
+      }
+    }
+  );
+  let ReplyBody::Status { report } = client.call(&RequestBody::Status { volume: id }) else {
+    panic!("status");
+  };
+  assert_eq!(report.attachments, 0);
   drop(client);
   drop(daemon);
 }

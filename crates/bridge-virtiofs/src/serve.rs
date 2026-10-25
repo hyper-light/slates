@@ -155,6 +155,31 @@ fn unregister(id: DeviceId) {
   });
 }
 
+/// Runs `work` for loop `id` until it completes or the shard asks the loop to revoke ([`request_revoke`]): its output,
+/// or `None` when the revoke came first. A device registered before it serves (a vhost-user front end still to
+/// negotiate, whose end a client holds) is ended by a `detach` this way; `work` is dropped with what it owns.
+pub async fn until_revoked<F: Future>(id: DeviceId, work: F) -> Option<F::Output> {
+  let mut work = std::pin::pin!(work);
+  std::future::poll_fn(|cx| {
+    CONTROL.with(|control| {
+      if let Some(entry) = control.borrow_mut().get_mut(&id.0) {
+        entry.waker = Some(cx.waker().clone());
+      }
+    });
+    if revoke_requested(id) {
+      return Poll::Ready(None);
+    }
+    work.as_mut().poll(cx).map(Some)
+  })
+  .await
+}
+
+/// Forgets loop `id`, which ends before its device was ever served (its front end never negotiated, or its admission
+/// was refused): [`serve_loop`] forgets the loops it ran.
+pub fn abandon(id: DeviceId) {
+  unregister(id);
+}
+
 /// Whether the shard has asked something of loop `id` that it has not taken yet: a revoke, or a kick to drain.
 fn request_pending(id: DeviceId) -> bool {
   CONTROL.with(|control| {

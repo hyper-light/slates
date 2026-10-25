@@ -6023,6 +6023,10 @@ fn attach(
   if let Some(reply) = shards_form(state, principal, &record, (volume, snapshot, intent), &form) {
     return reply;
   }
+  if let Some(reply) = vhost_user_form(state, principal, &record, (volume, snapshot, intent), &form)
+  {
+    return reply;
+  }
   if matches!(record.policy.role, Role::Green { .. }) {
     return crate::merge_service::attach_green(state, client_id, principal, &record, intent, &form);
   }
@@ -6151,6 +6155,73 @@ fn shards_form(
     snapshot,
     (intent, subtree.clone()),
   ))
+}
+
+/// The attach verb's answer when `form` is the vhost-user form (G-vhost): slates' own virtio-fs device served on a socket
+/// pair whose other end the client hands its VMM; `None` for every other form. A green is not presented to a device.
+fn vhost_user_form(
+  state: &mut ShardState,
+  principal: &Principal,
+  record: &VolumeRecord,
+  (volume, snapshot, intent): (VolumeId, Option<SnapshotId>, Intent),
+  form: &AttachRequest,
+) -> Option<ReplyBody> {
+  let AttachRequest::VhostUserFs {
+    tag,
+    subtree,
+    dax_window,
+  } = form
+  else {
+    return None;
+  };
+  if matches!(record.policy.role, Role::Green { .. }) {
+    return Some(refused(Refusal::Unsupported {
+      feature: "a green presented to a vhost-user device".to_owned(),
+    }));
+  }
+  Some(vhost_user_attach(
+    state,
+    principal,
+    (volume, snapshot),
+    (intent, tag.clone(), subtree.clone(), *dax_window),
+  ))
+}
+
+/// The attach verb's vhost-user form, served on Linux by `crate::virtiofs`.
+#[cfg(target_os = "linux")]
+fn vhost_user_attach(
+  state: &mut ShardState,
+  principal: &Principal,
+  (volume, snapshot): (VolumeId, Option<SnapshotId>),
+  (intent, tag, subtree, dax_window): (Intent, String, Option<String>, Option<u64>),
+) -> ReplyBody {
+  crate::virtiofs::attach_verb(
+    state,
+    principal,
+    volume,
+    snapshot,
+    crate::virtiofs::VhostUserAsk {
+      intent,
+      tag,
+      subtree,
+      dax_window,
+    },
+  )
+}
+
+/// vhost-user is Linux's (its eventfds and the KVM VMMs that speak it): the form is refused here before any effect,
+/// with the device's own reason.
+#[cfg(not(target_os = "linux"))]
+fn vhost_user_attach(
+  _state: &mut ShardState,
+  _principal: &Principal,
+  _volume: (VolumeId, Option<SnapshotId>),
+  _ask: (Intent, String, Option<String>, Option<u64>),
+) -> ReplyBody {
+  refused(Refusal::AttachmentUnsupported {
+    transport: AttachTransport::VirtioFsInheritedDescriptor,
+    reason: UnsupportedReason::BindingNotBuilt,
+  })
 }
 
 /// The attach verb's Shards form (A-161): served on Unix by `crate::shards`, which refuses it where the platform has no
@@ -6509,8 +6580,9 @@ pub(crate) fn consumer_of(form: &AttachRequest, client_id: u32) -> Result<Consum
       transport: *transport,
       reason: UnsupportedReason::SeamNotOnWire,
     }),
-    // A Shards stream is a guest's: it ends with the stream, and recovery ends a dead daemon's (A-161).
-    AttachRequest::ShardsFs { .. } => Ok(Consumer::Guest),
+    // A Shards stream is a guest's: it ends with the stream, and recovery ends a dead daemon's (A-161). So is a
+    // vhost-user device the verb hands out (G-vhost).
+    AttachRequest::ShardsFs { .. } | AttachRequest::VhostUserFs { .. } => Ok(Consumer::Guest),
   }
 }
 
@@ -6585,7 +6657,9 @@ fn establish_form(
       check_fuse_mount_point(form, principal)?;
       return Ok(None);
     }
-    AttachRequest::Guest { .. } | AttachRequest::ShardsFs { .. } => {
+    AttachRequest::Guest { .. }
+    | AttachRequest::ShardsFs { .. }
+    | AttachRequest::VhostUserFs { .. } => {
       return Err(not_established_here(situation, form));
     }
     AttachRequest::Oci {
@@ -7091,6 +7165,9 @@ pub(crate) fn reconcile_unpublished_effects(state: &mut ShardState) -> usize {
   // A Shards stream whose attachment the rollback removed serves nothing, and its end is handed to no one (A-161).
   #[cfg(unix)]
   crate::shards::reconcile_unrecorded(state);
+  // Nor does a vhost-user device the verb handed out (G-vhost).
+  #[cfg(target_os = "linux")]
+  crate::virtiofs::reconcile_unrecorded(state);
   orphans.len()
 }
 

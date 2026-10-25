@@ -3339,7 +3339,8 @@ same-namespace host process is the first delivered case.
 > in-container delete over the NFS mount is silly-renamed to `.nfs.*` by the macOS NFS client
 > (Appendix C), blocking `rmdir` and the plain unmount until the share lets go. A guest form requested
 > over the ring refuses `SeamNotOnWire` (the harness hands the VMM seam in-process) or the device's own
-> `BindingNotBuilt`. Owed: the bind on Linux once the daemon serves the FUSE mount; a live guest for
+> `BindingNotBuilt`; the vhost-user form (`AttachRequest::VhostUserFs`, A-169) is the exception, its
+> device's socket end handed to the client, which gives it to the VMM (`slates vhost-user`). Owed: the bind on Linux once the daemon serves the FUSE mount; a live guest for
 > AC-9.7. Record: `docs/wip/oci-handoff.md`.
 
 **A VMM with no folder sharing: the disk-image form (A-160).** A volume reaches a VM as a host mount shared in by the
@@ -12122,6 +12123,55 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
+
+### A-169 — An out-of-process VMM attaches slates' own virtio-fs device by the attach verb (accepted 2026-10-25)
+Applied in the same change to: §4.6 (the guest form over the ring), `crates/ipc/src/protocol.rs`
+(`AttachRequest::VhostUserFs`, appended), `crates/bridge-virtiofs` (`VhostUserSeam::adopt_for`; `serve::until_revoked`
+and `abandon`; the admission's DAX gate opened for the inherited-descriptor binding), `crates/server` (`virtiofs.rs`
+`attach_verb`, the handed device's task, `reconcile_unrecorded`, the per-inode DAX offer; `verbs.rs` the form's
+dispatch; `shards.rs` the end handoff shared), `crates/client` (`attach_vhost_user`, `VhostUserDevice`), `crates/cli`
+(`slates vhost-user`), the tests named below, GAPS, `docs/cli.md`.
+- **Adds the form.** `attach(volume, intent, VhostUserFs { tag, subtree, dax_window })` on Linux, on the volume's owner
+  shard inside the verb's transaction: the checks first (the transport offered, the rights for the intent, a snapshot
+  only for a read, the tag, the window a power of two of at least one 2 MiB range, room for the device and its end);
+  then a socket pair, the device's seam over this process's end, the view, the write lease, the record, the device's
+  loop slot and its task, each given back when a later one is refused. The other end goes to the client over its
+  control socket just before the reply, as A-161's Shards end does, and is the attachment's capability. macOS and
+  Windows refuse the form `AttachmentUnsupported`/`BindingNotBuilt` before any effect.
+- **The consumer is named, not read from the socket.** A pair this process made reports this process as its peer, so
+  the seam is adopted for the principal the verb authenticated (`VhostUserSeam::adopt_for`); the peer-credential
+  `adopt` stays for an in-process harness that hands in a socket its VMM already holds.
+- **No handshake bound.** The device is recorded and reachable by `detach` before its front end speaks
+  (`serve::until_revoked` races the negotiation against the loop's revoke), and it ends when the VMM's end closes: the
+  VM exited, never started, or closed it. A VM's boot is not slates' to bound (§4.6 "The harness owns VM and container
+  creation"), and a front end that never speaks holds only its own attachment, within the shard's device bound.
+- **DAX.** The window's size is the request's; the device offers per-inode DAX while the shard's fill budget has room,
+  and the admission's DAX gate is open for this binding, whose windows map per-file backings (A-168). The in-process
+  binding's gate stays closed.
+- **A rolled-back attach serves nothing:** a device whose record the rollback removed is revoked and its end dropped
+  (`virtiofs::reconcile_unrecorded`, beside A-161's).
+- **`slates vhost-user ID [--tag NAME] [--subtree DIR] [--read-only] [--dax-window SIZE] -- VMM ...`** replaces itself
+  with the VMM, the end kept at the descriptor it arrived at (so it displaces nothing the VMM was handed by its
+  caller) and named where `{socket}` stands, as `/proc/self/fd/N`, which crosvm takes as an inherited socket. No
+  socket file exists anywhere (R1). A VMM with no `{socket}` is usage.
+- **Proven** on Linux x86_64 (fedora, 2026-10-25): `crates/server/tests/virtiofs.rs`
+  (`the_vhost_user_form_hands_the_client_a_socket_end_that_drives_a_guest_on_either_shard`: a stand-in front end
+  negotiates over the delivered end and the guest's file reads back through the client, on both shards;
+  `a_vhost_user_device_detached_before_its_front_end_speaks_closes_its_end`;
+  `the_vhost_user_forms_refusals_are_typed_and_leave_nothing_behind`: `NotFound`, four `BadRequest`s, a green's
+  `Unsupported`, a read-only consumer's `Forbidden` and its read-only attach with no lease;
+  `a_guests_dax_window_shows_another_paths_write_and_its_store_reaches_the_volume_at_fsync`: the whole route through
+  the daemon's real serve loop with no VM — the front end negotiates the shared-memory features, reads the window's
+  size and hands over the back-end-request channel; the guest's SETUPMAPPING is answered only after the front end
+  places and acknowledges the map; the client's rewrite shows in the window, the cut tail zero; the guest's writable
+  upgrade is answered with no message; its store is in the volume by its FSYNC's answer); `crates/cli/tests/cli.rs`
+  (`slates_vhost_user_names_the_devices_socket_end_in_the_vmms_arguments_and_ends_with_it`, a real anchor); the CLI's
+  parse tests. macOS: `the_vhost_user_form_is_refused_by_kind_where_vhost_user_is_not_built`. Red-checked: negotiating
+  without the revoke race fails the detach test; the DAX gate left closed fails the route test. A real crosvm guest is
+  G-vhost's step 3.
+- **Also repaired (CI red on 1d86208e):** `DaemonConfig::copy_slice_page_bytes` takes the profile's base page
+  (`DaemonConfig::page`) rather than rustix, which the server does not link on Windows; and the backed module's own
+  doc is its only doc, so its intra-doc link resolves on Linux, the only platform that builds it.
 
 ### A-168 — Slates' own virtio-fs device maps per-file backings for an out-of-process VMM (accepted 2026-10-25)
 Applied in the same change to: §4.6 (a status block before the 2026-10-16 record), `crates/bridge-virtiofs`

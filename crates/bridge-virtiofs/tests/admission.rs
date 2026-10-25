@@ -556,6 +556,11 @@ fn the_host_report_names_where_the_binding_is_built() {
   let expected = (!cfg!(target_os = "linux")).then_some(UnsupportedReason::BindingNotBuilt);
   assert_eq!(host.supported, expected.is_none());
   assert_eq!(host.unsupported_reason, expected);
+  assert_eq!(
+    host.dax.advertised,
+    cfg!(target_os = "linux"),
+    "the vhost-user binding offers DAX where it is built, its windows over per-file backings (A-168)"
+  );
   let in_process = slates_bridge_virtiofs::capability::host_capability(GuestTransport::InProcess);
   assert!(in_process.supported);
   assert_eq!(in_process.target_path, TargetPath::GuestTagAssignedAtAttach);

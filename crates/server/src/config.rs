@@ -1089,7 +1089,7 @@ impl DaemonConfig {
   /// [`DaemonConfig::copy_slice_bytes`] in whole host pages, at least one: the slice a DAX backing's fill, ingest or
   /// refill copies on the calling shard now (A-163), since a backing is stored and compared a page at a time.
   pub fn copy_slice_page_bytes(&self) -> u64 {
-    let page = u64::try_from(rustix::param::page_size().max(1)).unwrap_or(u64::MAX);
+    let page = u64::try_from(self.page.max(1)).unwrap_or(u64::MAX);
     self
       .copy_slice_bytes()
       .checked_div(page)

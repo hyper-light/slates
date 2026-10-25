@@ -122,6 +122,9 @@ struct ShardBridge {
   attachment: u64,
   /// Whether the device presents a snapshot (through the view kept under `attachment`).
   presents_snapshot: bool,
+  /// Whether the device offers its guest a DAX window: its files are then offered per-inode DAX
+  /// (`FUSE_HAS_INODE_DAX`, `FUSE_ATTR_DAX`) while the shard's fill budget has room (A-163, A-168).
+  dax: bool,
 }
 
 /// Closes device `attachment`'s snapshot view, if it has one, and removes its record, if it has one (its loop's
@@ -146,12 +149,21 @@ impl BridgeAccess for ShardBridge {
     f: impl FnOnce(&mut dyn Bridge, &mut slates_bridge_core::Attachments) -> R,
   ) -> Result<R, VfsError> {
     let volume = self.volume;
-    let (scope, attachment, presents_snapshot) =
-      (self.scope, self.attachment, self.presents_snapshot);
+    let (scope, attachment, presents_snapshot, dax) = (
+      self.scope,
+      self.attachment,
+      self.presents_snapshot,
+      self.dax,
+    );
     let handles = &mut self.handles;
     state::with_state(|s| {
       let handle = *s.by_id.get(&volume)?;
       crate::verbs::relieve_deferred(s);
+      let offer = if dax {
+        slates_bridge_core::dax_backing::offer(&s.store.shards_backings)
+      } else {
+        slates_bridge_core::DaxOffer::Withheld
+      };
       let ShardState {
         store,
         volumes,
@@ -160,7 +172,7 @@ impl BridgeAccess for ShardBridge {
         ..
       } = s;
       // A snapshot device serves its read-only view (moved by `advance`); every other device, the head.
-      let mut bridge = if presents_snapshot {
+      let bridge = if presents_snapshot {
         let view = snapshot_views.get_mut(&attachment)?;
         VolumeBridge::attached(volume, &mut view.volume, store, handles, None)
       } else {
@@ -176,6 +188,7 @@ impl BridgeAccess for ShardBridge {
             .map(|host| host as &mut dyn slates_vfs::host::HostFs),
         )
       };
+      let mut bridge = bridge.offering_dax(offer);
       let mut scoped;
       let served: &mut dyn Bridge = match scope {
         Some(scope) => {
@@ -250,7 +263,7 @@ async fn serve_guest_device<S: VmmSeam + Send + 'static>(
   volume: DbVolumeId,
   tag: FsTag,
   view: GuestView,
-  (mut seam, transport): (S, GuestTransport),
+  (mut seam, transport, dax): (S, GuestTransport, bool),
   harness: GuestHarness,
 ) {
   let GuestHarness {
@@ -284,12 +297,13 @@ async fn serve_guest_device<S: VmmSeam + Send + 'static>(
     }
   };
   let attachment = bridge.attachment;
+  bridge.dax = dax;
   // A snapshot is immutable: its device is admitted with no write, whatever the access list grants.
   let writable = !bridge.presents_snapshot;
   let request = GuestAttachRequest {
     transport,
     volume,
-    dax: false,
+    dax,
     notification_queue: false,
   };
   // The volume's access list grants three rights (§4.13); the seam enforces the two a device can
@@ -393,8 +407,19 @@ fn record_guest(
   (bridge, view): (&ShardBridge, &GuestView),
   (tag, principal, writable): (FsTag, Principal, bool),
 ) -> Result<(), Refusal> {
+  let record = guest_record(volume, (bridge, view), (tag, principal, writable));
+  commit_record(s, record)
+}
+
+/// The device's attachment record: its consumer a guest, its form the tag and scope, its rights the principal's on the
+/// volume with write only when `writable`.
+fn guest_record(
+  volume: &slates_db::catalog::VolumeRecord,
+  (bridge, view): (&ShardBridge, &GuestView),
+  (tag, principal, writable): (FsTag, Principal, bool),
+) -> slates_db::catalog::AttachmentRecord {
   let granted = rights_of(volume, &principal);
-  let record = slates_db::catalog::AttachmentRecord {
+  slates_db::catalog::AttachmentRecord {
     id: bridge.attachment,
     volume: volume.id,
     consumer: slates_db::catalog::Consumer::Guest,
@@ -411,7 +436,14 @@ fn record_guest(
     },
     // A guest presents no mount capability: the zero token is refused by every edge that checks one.
     token: [0; 16],
-  };
+  }
+}
+
+/// Commits `record` as a recorded operation: refused typed.
+fn commit_record(
+  s: &mut ShardState,
+  record: slates_db::catalog::AttachmentRecord,
+) -> Result<(), Refusal> {
   let now = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
   s.db
     .mutate(
@@ -464,10 +496,350 @@ async fn serve_vhost_user_device(
     volume,
     tag,
     view,
-    (seam, GuestTransport::InheritedDescriptor),
+    (
+      seam,
+      GuestTransport::InheritedDescriptor,
+      dax_region.is_some(),
+    ),
     harness,
   )
   .await;
+}
+
+/// What an attach with the vhost-user form asks for (§4.6; goal G-vhost): the intent, the tag the guest mounts, the
+/// directory presented, and the DAX window offered to the front end.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+pub(crate) struct VhostUserAsk {
+  /// Reads only, or reads and writes (which takes the volume's write lease).
+  pub(crate) intent: slates_ipc::protocol::Intent,
+  /// The tag the guest mounts.
+  pub(crate) tag: String,
+  /// The directory presented, as a path from the volume's root.
+  pub(crate) subtree: Option<String>,
+  /// The DAX window offered to the front end, in bytes.
+  pub(crate) dax_window: Option<u64>,
+}
+
+/// Whether `bytes` may be offered as a guest's DAX window: a whole power of two of at least one 2 MiB range. A Linux
+/// guest maps its window in ranges of that size (`FUSE_DAX_SZ`), and the front end places the window as a PCI BAR,
+/// whose size is a power of two.
+#[cfg(target_os = "linux")]
+fn offerable_window(bytes: u64) -> bool {
+  bytes >= slates_mem::DAX_RANGE_BYTES && bytes.is_power_of_two()
+}
+
+/// The attach verb's vhost-user form (§4.4, §4.6; goal G-vhost), on the volume's owner shard inside the verb's
+/// transaction. Checked before any effect: the transport offered here, the rights for the intent (a snapshot only for a
+/// read), the tag, the DAX window, and room for the device and its end. Then, in the order that gives back what it took
+/// when a later step is refused ([`take_handed_device`]): the socket pair and the device's seam over this process's end,
+/// named for `principal`; the view and the attachment's id; the write lease; the record; the device's loop slot and its
+/// task. The other end is kept under the request's word for the client's control socket
+/// (`crate::shards::deliver_handoff`), sent just before the plain `Attached` this returns. The task negotiates the front
+/// end with no bound of its own: the device ends when the VMM's end closes (it exited, or never started) or the
+/// attachment is ended (a detach, a revocation, the volume's destroy, a rolled-back attach), whichever comes first.
+#[cfg(target_os = "linux")]
+pub(crate) fn attach_verb(
+  s: &mut ShardState,
+  principal: &Principal,
+  volume: VolumeId,
+  snapshot: Option<slates_ipc::protocol::SnapshotId>,
+  ask: VhostUserAsk,
+) -> slates_ipc::protocol::ReplyBody {
+  match attach_handed(s, principal, (volume, snapshot), &ask) {
+    Ok(reply) => reply,
+    Err(refusal) => slates_ipc::protocol::ReplyBody::Refused { refusal },
+  }
+}
+
+/// [`attach_verb`]'s checks and effects: the reply, or the refusal with nothing left behind.
+#[cfg(target_os = "linux")]
+fn attach_handed(
+  s: &mut ShardState,
+  principal: &Principal,
+  (volume, snapshot): (VolumeId, Option<slates_ipc::protocol::SnapshotId>),
+  ask: &VhostUserAsk,
+) -> Result<slates_ipc::protocol::ReplyBody, Refusal> {
+  use slates_ipc::protocol::{
+    AttachTransport, Intent, ReadWritePolicy, Residency, UnsupportedReason,
+  };
+  let transport = AttachTransport::VirtioFsInheritedDescriptor;
+  let situation = crate::transports::situation(s, &slates_db::catalog::Rights::default());
+  let mut capability =
+    crate::transports::guest(&situation, transport).ok_or_else(|| Refusal::BadRequest {
+      reason: "the vhost-user transport has no report".to_owned(),
+    })?;
+  if let Some(reason) = capability.unsupported_reason {
+    return Err(Refusal::AttachmentUnsupported { transport, reason });
+  }
+  let db_volume = DbVolumeId {
+    bytes: volume.bytes,
+  };
+  if !s.by_id.contains_key(&db_volume) {
+    return Err(Refusal::NotFound);
+  }
+  let record = s
+    .db
+    .partition()
+    .volume(db_volume)
+    .cloned()
+    .ok_or(Refusal::NotFound)?;
+  if !crate::verbs::permits(rights_of(&record, principal), ask.intent) {
+    return Err(Refusal::Forbidden {
+      verb: "attach".to_owned(),
+    });
+  }
+  // A snapshot is immutable: only a read presents one.
+  if snapshot.is_some() && ask.intent == Intent::Write {
+    return Err(Refusal::AttachmentUnsupported {
+      transport,
+      reason: UnsupportedReason::SnapshotNotPresentedByHostMount,
+    });
+  }
+  let tag = FsTag::new(&ask.tag).map_err(|e| Refusal::BadRequest {
+    reason: format!("the guest's tag: {e}"),
+  })?;
+  if let Some(window) = ask.dax_window
+    && !offerable_window(window)
+  {
+    return Err(Refusal::BadRequest {
+      reason: format!(
+        "a DAX window of {window} bytes: a power of two of at least {} is offered",
+        slates_mem::DAX_RANGE_BYTES
+      ),
+    });
+  }
+  let Some((_, request)) = s.current_request else {
+    return Err(Refusal::BadRequest {
+      reason: "a vhost-user device is attached by a recorded request".to_owned(),
+    });
+  };
+  if crate::shards::pending_ends(s) >= crate::shards::handoff_bound(s) {
+    return Err(Refusal::Overloaded { shard: s.shard });
+  }
+  let id =
+    register(s.config.clients_per_shard).map_err(|_| Refusal::Overloaded { shard: s.shard })?;
+  let writable = snapshot.is_none() && ask.intent == Intent::Write;
+  let taken = take_handed_device(
+    s,
+    id,
+    principal,
+    (db_volume, &record, snapshot),
+    (ask, tag, writable),
+  );
+  let (attachment, lease_epoch, end) = match taken {
+    Ok(taken) => taken,
+    Err(refusal) => {
+      slates_bridge_virtiofs::serve::abandon(id);
+      return Err(refusal);
+    }
+  };
+  s.stream_handoffs.insert(
+    request.word(),
+    crate::shards::Handoff {
+      attachment,
+      stream: end,
+    },
+  );
+  capability.read_write = if writable {
+    ReadWritePolicy::ReadWrite
+  } else {
+    ReadWritePolicy::ReadOnly
+  };
+  capability.residency = Residency::DaemonRamAndGuestPageCache {
+    dax_mapped: ask.dax_window.is_some(),
+  };
+  Ok(slates_ipc::protocol::ReplyBody::Attached {
+    attachment,
+    lease_epoch,
+    path: None,
+    version: None,
+    established: slates_ipc::protocol::Established::Record,
+    capability,
+    // A device presents no mount capability: the end is the capability.
+    token: None,
+  })
+}
+
+/// The vhost-user form's effects, each given back when a later one is refused: the socket pair and the seam over this
+/// process's end, the view and the attachment's id, the write lease, the record, the device's place among the shard's
+/// devices, and its task. The attachment's id, the lease's epoch and the end to hand the client.
+#[cfg(target_os = "linux")]
+fn take_handed_device(
+  s: &mut ShardState,
+  id: slates_bridge_virtiofs::serve::DeviceId,
+  principal: &Principal,
+  (volume, record, snapshot): (
+    DbVolumeId,
+    &slates_db::catalog::VolumeRecord,
+    Option<slates_ipc::protocol::SnapshotId>,
+  ),
+  (ask, tag, writable): (&VhostUserAsk, FsTag, bool),
+) -> Result<(u64, Option<u64>, std::os::fd::OwnedFd), Refusal> {
+  use slates_bridge_virtiofs::vhost_user::VhostUserSeam;
+  let overloaded = Refusal::Overloaded { shard: s.shard };
+  let (daemon_end, handed) = slates_ipc::stream::pair().map_err(|_| overloaded.clone())?;
+  let config = DeviceConfig::new(tag);
+  let mut seam = VhostUserSeam::adopt_for(daemon_end, &config, principal.clone())
+    .map_err(|_| overloaded.clone())?;
+  if let Some(window) = ask.dax_window {
+    seam.enable_dax(window);
+  }
+  let view = GuestView {
+    subtree: ask.subtree.clone(),
+    snapshot,
+  };
+  let mut bridge = open_view(s, volume, &view)?;
+  bridge.dax = ask.dax_window.is_some();
+  let attachment = bridge.attachment;
+  let now = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
+  let lease_epoch = match crate::verbs::lease_for(s, record, principal, ask.intent, now) {
+    Ok(epoch) => epoch,
+    Err(refusal) => {
+      crate::snapshot_view::end(s, attachment);
+      return Err(refusal);
+    }
+  };
+  let attachment_record =
+    guest_record(record, (&bridge, &view), (tag, principal.clone(), writable));
+  if let Err(refusal) = commit_record(s, attachment_record.clone()) {
+    crate::verbs::release_unrecorded_lease(s, &attachment_record);
+    crate::snapshot_view::end(s, attachment);
+    return Err(refusal);
+  }
+  s.guest_devices.push((id, principal.clone(), attachment));
+  let task = serve_handed_device(id, bridge, seam, (tag, ask.dax_window.is_some()), writable);
+  if slates_rt::futures::spawn(task)
+    .and_then(slates_rt::futures::detach)
+    .is_err()
+  {
+    s.guest_devices.retain(|(device, _, _)| *device != id);
+    if crate::verbs::end_attachment(s, &attachment_record, crate::verbs::Ending::Otherwise).is_err()
+    {
+      s.count(RECORD_END_REFUSED, 1);
+    }
+    crate::snapshot_view::end(s, attachment);
+    return Err(overloaded);
+  }
+  Ok((attachment, lease_epoch, handed))
+}
+
+/// Format: the ledger name of a vhost-user device whose front end closed its end, or whose attachment ended, before it
+/// negotiated: the VMM exited or never started, or the attachment was detached first.
+#[cfg(target_os = "linux")]
+const HANDSHAKE_ENDED: &str = "virtiofs.handshake_ended";
+/// Format: the refusal-ledger name of a vhost-user device whose admission was refused after its front end negotiated.
+#[cfg(target_os = "linux")]
+const HANDED_ADMISSION_REFUSED: &str = "virtiofs.handed_admission_refused";
+
+/// The task of a device the attach verb handed out (G-vhost), on the volume's owner shard: the front end negotiated
+/// until it configures the device, its end closes, or the attachment is ended ([`slates_bridge_virtiofs::serve::until_revoked`]);
+/// then the device admitted under the record's principal and rights, and served until its loop ends. Whatever ends it,
+/// it leaves the shard's devices and its record and view end with it.
+#[cfg(target_os = "linux")]
+async fn serve_handed_device(
+  id: slates_bridge_virtiofs::serve::DeviceId,
+  bridge: ShardBridge,
+  seam: slates_bridge_virtiofs::vhost_user::VhostUserSeam,
+  (tag, dax): (FsTag, bool),
+  writable: bool,
+) {
+  let attachment = bridge.attachment;
+  let volume = bridge.volume;
+  let negotiated = slates_bridge_virtiofs::serve::until_revoked(id, seam.negotiate()).await;
+  let Some(Ok(seam)) = negotiated else {
+    let _ = state::with_state_counted(|s| s.count(HANDSHAKE_ENDED, 1));
+    finish_handed(id, attachment);
+    return;
+  };
+  // A detach between the handshake's end and here removed the record: nothing is admitted for it.
+  let found = state::with_state(|s| {
+    s.db
+      .partition()
+      .attachment(attachment)
+      .is_some()
+      .then(|| s.db.partition().volume(volume).cloned())
+      .flatten()
+      .map(|record| (record, s.config.guest_credits))
+  })
+  .flatten();
+  let Some((record, credits)) = found else {
+    finish_handed(id, attachment);
+    return;
+  };
+  let request = GuestAttachRequest {
+    transport: GuestTransport::InheritedDescriptor,
+    volume,
+    dax,
+    notification_queue: false,
+  };
+  let rights = move |principal: &Principal| {
+    let granted = rights_of(&record, principal);
+    Rights {
+      read: granted.read,
+      write: granted.write && writable,
+    }
+  };
+  let mut seam_slot = Some(seam);
+  // A refused admission has released its seam already (`admit`), so only whether it was admitted is kept.
+  let admission = state::with_state(|s| {
+    seam_slot.take().map(|seam| {
+      admit(
+        request,
+        seam,
+        DeviceConfig::new(tag),
+        credits,
+        rights,
+        &mut s.attachments,
+      )
+      .ok()
+    })
+  })
+  .flatten();
+  let admitted = match admission {
+    Some(Some(admitted)) => admitted,
+    Some(None) => {
+      let _ = state::with_state_counted(|s| s.count(HANDED_ADMISSION_REFUSED, 1));
+      finish_handed(id, attachment);
+      return;
+    }
+    None => {
+      if let Some(mut seam) = seam_slot.take() {
+        seam.release();
+      }
+      finish_handed(id, attachment);
+      return;
+    }
+  };
+  let _end = serve_loop(id, admitted, bridge).await;
+  finish_handed(id, attachment);
+}
+
+/// A handed-out device's end, whatever ended it: it leaves the shard's devices and its loop slot, and its record and
+/// view end ([`close_device`]; a record a detach removed first is not there to end).
+#[cfg(target_os = "linux")]
+fn finish_handed(id: slates_bridge_virtiofs::serve::DeviceId, attachment: u64) {
+  let _ = state::with_state_counted(|s| s.guest_devices.retain(|(device, _, _)| *device != id));
+  slates_bridge_virtiofs::serve::abandon(id);
+  close_device(attachment);
+}
+
+/// After a rolled-back verb (`verbs::reconcile_unpublished_effects`): every device whose attachment record the rollback
+/// removed is asked to revoke, so a handed-out device whose attach failed to commit never serves, and the end owed for
+/// it is dropped, so nothing is handed out for it (G-vhost, as `crate::shards::reconcile_unrecorded` for a stream).
+#[cfg(target_os = "linux")]
+pub(crate) fn reconcile_unrecorded(s: &mut ShardState) {
+  let unrecorded: Vec<(slates_bridge_virtiofs::serve::DeviceId, u64)> = s
+    .guest_devices
+    .iter()
+    .filter(|(_, _, attachment)| s.db.partition().attachment(*attachment).is_none())
+    .map(|(device, _, attachment)| (*device, *attachment))
+    .collect();
+  for (device, attachment) in unrecorded {
+    slates_bridge_virtiofs::serve::request_revoke(device);
+    s.stream_handoffs
+      .retain(|_, handoff| handoff.attachment != attachment);
+  }
 }
 
 /// Resolves what a device presents, before admission: its attachment record's id (allocated now), the scope's
@@ -507,6 +879,7 @@ fn open_view(
     scope,
     attachment,
     presents_snapshot: view.snapshot.is_some(),
+    dax: false,
   })
 }
 
@@ -601,7 +974,7 @@ impl Daemon {
         device,
         tag,
         view,
-        (seam, GuestTransport::InProcess),
+        (seam, GuestTransport::InProcess, false),
         harness,
       )),
       None,

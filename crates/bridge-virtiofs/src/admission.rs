@@ -417,8 +417,9 @@ fn unsupported(request: &GuestAttachRequest) -> Option<UnsupportedReason> {
   // the `MAP_FIXED` remap `dax_migrate`'s doc promised, so the cost is a fault per shifted window, not a guest
   // left on a stale one.
   // The checklist is `docs/wip/GAPS.md` (2026-10-18, "what must be true before DAX is advertised"), kept current.
-  // Read it before flipping this, not just the record above.
-  if request.dax {
+  // Read it before flipping this, not just the record above. DAX over the inherited-descriptor binding is the message
+  // placer's over backings (A-168), established; over the in-process seam it is the fd-sharing placer's, which is not.
+  if request.dax && request.transport != GuestTransport::InheritedDescriptor {
     return Some(UnsupportedReason::DaxNotEstablished);
   }
   if request.notification_queue {
@@ -593,11 +594,15 @@ impl<S: VmmSeam> AdmittedDevice<S> {
 
   /// The capability report for this attachment (§4.6: what `attach` and `status` say).
   pub fn capability(&self) -> TransportCapability {
+    #[cfg(unix)]
+    let window = self.device.dax_offered();
+    #[cfg(not(unix))]
+    let window = false;
     attached_capability(
       self.transport,
       self.device.config().tag.as_str(),
       self.rights,
-      self.device.negotiated(),
+      (self.device.negotiated(), window),
     )
   }
 

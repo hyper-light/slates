@@ -61,6 +61,9 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   exec --volume V --at PATH -- CMD [ARG ...]        run CMD with the volume at PATH
   shards ID [--subtree DIR] [--read-only] --fd N [--json] -- CMD [ARG ...]
             run CMD with a Shards fs stream of the volume at descriptor N (Linux, macOS)
+  vhost-user ID [--tag NAME] [--subtree DIR] [--read-only] [--dax-window SIZE] [--json] -- VMM [ARG ...]
+            run VMM with slates' own virtio-fs device of the volume: {socket} in its arguments names the device's
+            socket end (/proc/self/fd/N), e.g. `crosvm run --vhost-user type=fs,socket={socket} ...` (Linux)
 ";
 
 /// Format: the usage notes: the size grammar's examples, the instance's discovery, the exit codes.
@@ -557,6 +560,28 @@ pub(crate) struct ShardsRequest {
   pub command: Vec<String>,
 }
 
+/// A `slates vhost-user` request (§4.6; goal G-vhost): attach a volume to slates' own virtio-fs device and run a VMM with
+/// the device's socket end, named in its arguments where `{socket}` stands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VhostUserRequest {
+  /// The instance.
+  pub instance: String,
+  /// The volume.
+  pub volume: slates_client::VolumeId,
+  /// The tag the guest mounts.
+  pub tag: String,
+  /// Only this directory of it, when given.
+  pub subtree: Option<String>,
+  /// Every change refused (`--read-only`); otherwise for writing, as `mount` attaches.
+  pub read_only: bool,
+  /// The DAX window offered to the VMM, in bytes, when given.
+  pub dax_window: Option<u64>,
+  /// Announce the attachment as JSON.
+  pub json: bool,
+  /// The VMM and its arguments, `{socket}` among them.
+  pub command: Vec<String>,
+}
+
 /// The parsed command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Command {
@@ -566,6 +591,8 @@ pub(crate) enum Command {
   Run(RunRequest),
   /// A command run with a Shards stream end.
   Shards(ShardsRequest),
+  /// A VMM run with slates' own virtio-fs device's socket end.
+  VhostUser(VhostUserRequest),
   /// The anchor.
   Anchor(ProcessOptions),
   /// The daemon.
@@ -625,6 +652,8 @@ const VALUES: &[&str] = &[
   "--account",
   "--uid",
   "--fd",
+  "--tag",
+  "--dax-window",
 ];
 /// Every switch, across the verbs.
 const SWITCHES: &[&str] = &[
@@ -742,6 +771,58 @@ fn parse_shards(taken: &Taken, arguments: &[String]) -> Result<Command, ParseErr
     subtree: taken.value("--subtree").map(str::to_owned),
     read_only: taken.switch("--read-only"),
     fd,
+    json: taken.json(),
+    command,
+  }))
+}
+
+/// Format: the tag a guest mounts when `vhost-user` names none: the product's name, which the guest probe and the
+/// crosvm harness mount (`mount -t virtiofs slates /mnt`).
+pub(crate) const DEFAULT_GUEST_TAG: &str = "slates";
+
+/// Format: where a `vhost-user` command's arguments name the device's socket end: each occurrence becomes
+/// `/proc/self/fd/N`, the end's descriptor in the VMM, which crosvm takes as an inherited socket.
+pub(crate) const SOCKET_PLACEHOLDER: &str = "{socket}";
+
+/// Parses `vhost-user ID [--tag NAME] [--subtree DIR] [--read-only] [--dax-window SIZE] [--json] -- VMM ...`: one volume
+/// and the flags before `--`, the VMM after it, `{socket}` in at least one of its arguments (the device is reached
+/// through it alone).
+fn parse_vhost_user(taken: &Taken, arguments: &[String]) -> Result<Command, ParseError> {
+  let command = command_after(arguments)?;
+  taken.only(&Spec {
+    values: &["--tag", "--subtree", "--dax-window"],
+    switches: &["--read-only"],
+  })?;
+  let id = match taken.words.as_slice() {
+    [_, id] => id,
+    [_, _, extra, ..] => return Err(ParseError::Extra(extra.clone())),
+    _ => return Err(ParseError::Missing("volume ID")),
+  };
+  if !command
+    .iter()
+    .skip(1)
+    .any(|argument| argument.contains(SOCKET_PLACEHOLDER))
+  {
+    return Err(ParseError::Missing(
+      "{socket} in the VMM's arguments, where the device's socket end goes (e.g. --vhost-user type=fs,socket={socket})",
+    ));
+  }
+  let dax_window = taken
+    .value("--dax-window")
+    .map(|size| {
+      parse_size(size).map_err(|reason| ParseError::BadValue {
+        what: "--dax-window",
+        reason,
+      })
+    })
+    .transpose()?;
+  Ok(Command::VhostUser(VhostUserRequest {
+    instance: taken.instance(),
+    volume: volume(id)?,
+    tag: taken.value("--tag").unwrap_or(DEFAULT_GUEST_TAG).to_owned(),
+    subtree: taken.value("--subtree").map(str::to_owned),
+    read_only: taken.switch("--read-only"),
+    dax_window,
     json: taken.json(),
     command,
   }))
@@ -1194,6 +1275,7 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
     Some("run") => return parse_run(&taken, arguments),
     Some("exec") => return parse_exec(&taken, arguments),
     Some("shards") => return parse_shards(&taken, arguments),
+    Some("vhost-user") => return parse_vhost_user(&taken, arguments),
     _ if boundary.is_some() => return Err(ParseError::UnknownFlag("--".to_owned())),
     _ => {}
   }
@@ -2425,6 +2507,92 @@ mod tests {
       (fewest.subtree, fewest.read_only, fewest.json),
       (None, false, false)
     );
+  }
+
+  /// G-vhost. Do: parse `vhost-user` with every flag and with the fewest. Expect the instance, the volume, the tag (the
+  /// default when none is named), the subtree, the intent, the DAX window in bytes, the JSON switch and the VMM after
+  /// `--` untouched, `{socket}` still in it.
+  #[test]
+  fn vhost_user_takes_one_volume_and_the_untouched_vmm_with_its_socket_placeholder() {
+    let id = "0123456789abcdef0123456789abcdef";
+    let Command::VhostUser(request) = parse(&args(&format!(
+      "--instance outer vhost-user {id} --tag work --subtree src --read-only --dax-window 8MiB --json -- \
+       crosvm run --vhost-user type=fs,socket={{socket}} vmlinuz"
+    )))
+    .unwrap() else {
+      panic!("vhost-user");
+    };
+    assert_eq!(
+      (
+        request.instance.as_str(),
+        request.volume,
+        request.tag.as_str()
+      ),
+      ("outer", volume(id).unwrap(), "work")
+    );
+    assert_eq!(
+      (
+        request.subtree.as_deref(),
+        request.read_only,
+        request.dax_window,
+        request.json
+      ),
+      (Some("src"), true, Some(8 << 20), true)
+    );
+    assert_eq!(
+      request.command,
+      args("crosvm run --vhost-user type=fs,socket={socket} vmlinuz")
+    );
+    let Command::VhostUser(fewest) = parse(&args(&format!(
+      "vhost-user {id} -- vmm --socket={{socket}}"
+    )))
+    .unwrap() else {
+      panic!("vhost-user");
+    };
+    assert_eq!(
+      (
+        fewest.tag.as_str(),
+        fewest.subtree,
+        fewest.read_only,
+        fewest.dax_window,
+        fewest.json
+      ),
+      (DEFAULT_GUEST_TAG, None, false, None, false)
+    );
+  }
+
+  /// G-vhost. Do: parse `vhost-user` with each thing wrong in turn. Expect each refused as usage, for its own reason: no
+  /// `{socket}` among the VMM's arguments (the VMM's own name does not count); a DAX window that is no size; no volume,
+  /// or a second word; a foreign flag; no VMM.
+  #[test]
+  fn vhost_user_refuses_a_missing_placeholder_bad_window_volume_flag_or_vmm_as_usage() {
+    let id = "0123456789abcdef0123456789abcdef";
+    let refusal = |line: &str| match parse(&args(line)) {
+      Err(ParseError::BadValue { what, .. }) => format!("bad {what}"),
+      Err(e) => e.to_string(),
+      Ok(command) => format!("parsed {command:?}"),
+    };
+    for (line, mentions) in [
+      (format!("vhost-user {id} -- crosvm run vmlinuz"), "{socket}"),
+      (format!("vhost-user {id} -- {{socket}} run"), "{socket}"),
+      (
+        format!("vhost-user {id} --dax-window lots -- vmm socket={{socket}}"),
+        "bad --dax-window",
+      ),
+      ("vhost-user -- vmm socket={socket}".to_owned(), "volume ID"),
+      (
+        format!("vhost-user {id} extra -- vmm socket={{socket}}"),
+        "unexpected argument `extra`",
+      ),
+      (
+        format!("vhost-user {id} --fd 3 -- vmm socket={{socket}}"),
+        "unknown flag `--fd`",
+      ),
+      (format!("vhost-user {id} --"), "a command after `--`"),
+    ] {
+      let refused = refusal(&line);
+      assert!(refused.contains(mentions), "{line}: {refused}");
+    }
   }
 
   /// A-161. Do: parse `shards` with each thing wrong in turn. Expect each refused as usage, for its own reason: a number

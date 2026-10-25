@@ -283,6 +283,7 @@ slates share ID PRINCIPAL [--read] [--write] [--admin] [--json]
 slates run [--keep] [--json] -- CMD [ARG ...]
 slates exec --volume V --at PATH -- CMD [ARG ...]
 slates shards ID [--subtree DIR] [--read-only] --fd N [--json] -- CMD [ARG ...]
+slates vhost-user ID [--tag NAME] [--subtree DIR] [--read-only] [--dax-window SIZE] [--json] -- VMM [ARG ...]
 slates attach ID [--read | --write] [--snapshot N] [--json]
 slates detach ATTACHMENT [--json]
 slates status [--json]
@@ -427,6 +428,25 @@ command that cannot run is a failure (exit 4), its attachment ended with the end
 Linux sends the end over the client's control socket; macOS claims it on the daemon's socket route, an encrypted
 exchange keyed by a single-use secret. Windows refuses the form by kind (`AttachmentUnsupported`,
 `DescriptorRouteNotBuilt`) until a route hands a client a handle.
+
+`slates vhost-user ID [--tag NAME] [--subtree DIR] [--read-only] [--dax-window SIZE] [--json] -- VMM [ARG ...]` runs a
+VM whose virtio-fs device is slates' own (Linux). It attaches the volume (or only `DIR` of it; for writing unless
+`--read-only`), announces the attachment like `shards`, and replaces itself with `VMM`, the device's socket end
+inherited at the descriptor it arrived at. Each `{socket}` in the VMM's arguments becomes `/proc/self/fd/N`, that
+descriptor, so for crosvm:
+
+```
+slates vhost-user ID --dax-window 8MiB -- crosvm run --vhost-user type=fs,socket={socket} ... vmlinuz
+```
+
+and the guest mounts `mount -t virtiofs slates /mnt -o dax=always` (`--tag` names another tag). No socket file exists
+anywhere. A VMM with no `{socket}` in its arguments is usage (exit 2): the device is reached through that end alone.
+`--dax-window SIZE` offers the guest a DAX window of that size (a power of two of at least 2MiB); through it the guest
+maps a copy of each file slates keeps equal to the volume, so every change by any path shows in its map, and its own
+stores reach the volume when it syncs, closes, or the VM ends. The attachment lasts as long as the VMM's end: it ends
+when the VM exits, never started, or closes it (or on `detach`, a revocation, the volume's destroy), and a VMM that
+cannot run is a failure (exit 4). macOS and Windows refuse the form by kind (`AttachmentUnsupported`,
+`BindingNotBuilt`).
 
 ## Planned interface corrections
 

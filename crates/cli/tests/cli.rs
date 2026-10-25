@@ -1912,6 +1912,95 @@ fn slates_shards_hands_a_program_a_working_stream_end_and_the_attachment_ends_wi
   the_refusals_leave_no_attachment(&instance, &id, &before);
 }
 
+/// Format: the line the program `slates vhost-user` runs in the test below prints, then the path it was handed.
+#[cfg(target_os = "linux")]
+const SOCKET_END_TAG: &str = "socket-end: ";
+
+/// G-vhost, step 2: "`slates vhost-user` substitutes the device's socket end for `{socket}` and execs the VMM with the end
+/// inherited". Do: make a volume; run `slates vhost-user ID -- /bin/sh -c SCRIPT sh socket={socket}`, the script checking
+/// that the path it was given is a socket in its own process and printing it; then a program that cannot run, a volume
+/// that does not exist, and a VMM with no `{socket}`. Expect: the script's exit 0, the path `/proc/self/fd/N` with N at
+/// least 3 and a socket in the program; the attachment it announced gone once the program exits; the program that
+/// cannot run a failure (exit 4) whose attachment ends; the missing volume refused (exit 1); no `{socket}` usage (exit
+/// 2); no attachment left by any of them. Linux only, where vhost-user is built; gated like the other process flows.
+#[cfg(target_os = "linux")]
+#[test]
+fn slates_vhost_user_names_the_devices_socket_end_in_the_vmms_arguments_and_ends_with_it() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the vhost-user hand-off: set SLATES_TEST_CLI=1 to run it (an anchor and its daemon)"
+    );
+    return;
+  }
+  let instance = format!("cli-vhost-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "vhosted", "--bounded", "4MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let before = attachments_of(&instance, &id);
+  let script = format!(r#"p="${{1#socket=}}"; test -S "$p" && echo "{SOCKET_END_TAG}$p""#);
+  let ran = slates()
+    .args([
+      "--instance",
+      &instance,
+      "vhost-user",
+      &id,
+      "--",
+      "/bin/sh",
+      "-c",
+      &script,
+      "sh",
+      "socket={socket}",
+    ])
+    .output()
+    .unwrap();
+  let stdout = String::from_utf8_lossy(&ran.stdout);
+  assert_eq!(
+    ran.status.code(),
+    Some(0),
+    "{stdout}{}",
+    String::from_utf8_lossy(&ran.stderr)
+  );
+  let end = stdout
+    .lines()
+    .find_map(|line| line.strip_prefix(SOCKET_END_TAG))
+    .unwrap_or_else(|| panic!("the program was handed a socket: {stdout}"));
+  let number: i32 = end
+    .strip_prefix("/proc/self/fd/")
+    .unwrap_or_else(|| panic!("the end is named by its descriptor: {end}"))
+    .parse()
+    .unwrap();
+  assert!(number >= 3, "the end is past standard error: {number}");
+  the_attachment_ends(&instance, &id, &before, &value_of(&stdout, "attachment"));
+  let (code, _, err) = run(
+    &instance,
+    &[
+      "vhost-user",
+      &id,
+      "--",
+      "/nonexistent/slates-vmm",
+      "socket={socket}",
+    ],
+  );
+  assert_eq!(code, 4, "a VMM that cannot run is a failure: {err}");
+  assert!(
+    wait_for(|| attachments_of(&instance, &id) == before),
+    "the end of a VMM that never ran closed, ending its attachment"
+  );
+  let missing = "0".repeat(32);
+  let (code, _, err) = run(
+    &instance,
+    &["vhost-user", &missing, "--", "/bin/true", "socket={socket}"],
+  );
+  assert_eq!(code, 1, "a volume that does not exist is refused: {err}");
+  let (code, _, err) = run(&instance, &["vhost-user", &id, "--", "/bin/true"]);
+  assert_eq!(code, 2, "a VMM with no {{socket}} is usage: {err}");
+  assert_eq!(attachments_of(&instance, &id), before);
+}
+
 /// Chaos, the way a supervisor ends a run: `slates shards` replaces itself with its program, so the process a launcher
 /// spawned is the program, and killing it (`SIGKILL`) closes the end and ends the attachment. Do: launch the waiting
 /// reader, take the pid it prints, kill the process spawned. Expect the two pids the same, the launch ended by the

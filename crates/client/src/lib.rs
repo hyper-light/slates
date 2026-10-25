@@ -35,7 +35,8 @@ pub mod error;
 
 pub use client::{
   Advanced, Attachment, Client, Connecting, CreateSpec, Deadlines, Digest, ImageBuilt,
-  LAST_SEQUENCE, Landing, Rebased, Session, ShardsStream, StreamEnd, Submitted, defers_reply,
+  LAST_SEQUENCE, Landing, Rebased, Session, ShardsStream, StreamEnd, Submitted, VhostUserDevice,
+  defers_reply,
 };
 pub use error::ClientError;
 /// The consumer capability and its delivery (§4.13): what `enroll` returns once, what a harness hands a

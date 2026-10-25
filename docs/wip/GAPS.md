@@ -11272,6 +11272,13 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     mount makes it clean, and adds a `lost+found` (root's, mode 0700) that the merge takes as a new directory. Recorded,
     not changed: e2fsck puts any orphans it recovers there, so the merge must not drop it. `docs/cli.md` says so.
   - **Owed:** the arm64 guest's pmem DAX (Firecracker's doc covers aarch64, with `CONFIG_ARM64_PMEM`): G-arm64-guest.
+- **Built 2026-10-25 (A-169): an out-of-process VMM attaches slates' own virtio-fs device by the attach verb.**
+  `AttachRequest::VhostUserFs` hands the client the device's socket end over its control socket; `slates vhost-user ID
+  -- VMM ... {socket} ...` runs the VMM with it as `/proc/self/fd/N`. Linux only; elsewhere refused `BindingNotBuilt`.
+  Proven by use with a stand-in front end on both shards, its refusals typed with nothing left behind, the whole DAX
+  route through the daemon's real serve loop (map, another path's write in the window, the writable upgrade, the
+  guest's store at FSYNC), and the CLI with a real anchor. **Owed:** a real crosvm guest through the verb (G-vhost
+  step 3) and the VM and daemon kills (step 4).
 - **Fixed in the device 2026-10-25 (A-168); the real guest's proof is owed to G-vhost's step 3: slates' own DAX window
   showed stale bytes, then zeros, after another path's write.**
   `docs/bugs/2026-10-24-slates-own-dax-window-shows-stale-bytes-then-zeros-after-another-paths-write.md`.

@@ -15,7 +15,10 @@ use slates_server::daemon::LIVENESS_BUDGET_NS;
 use slates_server::landing::{enroll_proof, revoke_proof};
 
 use crate::Failure;
-use crate::args::{ClientRequest, ProfileOptions, RunRequest, ShardsRequest, SharePrincipal, Verb};
+use crate::args::{
+  ClientRequest, ProfileOptions, RunRequest, SOCKET_PLACEHOLDER, ShardsRequest, SharePrincipal,
+  Verb, VhostUserRequest,
+};
 use crate::format::volume_id_text;
 
 fn failure_of(e: ClientError, instance: &str) -> Failure {
@@ -1592,6 +1595,60 @@ pub(crate) fn run_shards(request: &ShardsRequest) -> Result<(), Failure> {
     shards.stream,
     request.fd,
   ))
+}
+
+/// `vhost-user ID [--tag NAME] [--subtree DIR] [--read-only] [--dax-window SIZE] -- VMM [ARG ...]` (§4.6; goal G-vhost):
+/// attaches the volume to slates' own virtio-fs device, announces the attachment, and replaces this process with the
+/// VMM. The device's socket end stays at the descriptor number it arrived at, so it displaces nothing the VMM was handed
+/// by whoever ran this (a tap device's descriptor, say), and each `{socket}` in the VMM's arguments names it as
+/// `/proc/self/fd/N`, which crosvm takes as an inherited socket. No socket file exists anywhere (R1). As `shards`: the
+/// client is closed first and only the end goes into the VMM, so the attachment lives exactly as long as the VMM's end,
+/// and the process its launcher started is the VMM itself. Returns only when the VMM could not run (refused, exit 4).
+/// Where vhost-user is not built (every platform but Linux), the attach is refused by kind and nothing runs.
+pub(crate) fn run_vhost_user(request: &VhostUserRequest) -> Result<(), Failure> {
+  let (program, args) = request
+    .command
+    .split_first()
+    .ok_or_else(|| Failure::Failed("vhost-user needs a VMM".to_owned()))?;
+  let intent = if request.read_only {
+    Intent::Read
+  } else {
+    Intent::Write
+  };
+  let device = connect(&request.instance)?
+    .attach_vhost_user(
+      request.volume,
+      intent,
+      (&request.tag, request.subtree.as_deref()),
+      request.dax_window,
+    )
+    .map_err(|e| failure_of(e, &request.instance))?;
+  announce_attachment(device.attachment.attachment, request.json);
+  Err(exec_vmm(program, args, device.end))
+}
+
+/// Replaces this process with `program`, the device's socket end kept at its own descriptor number and named where
+/// `{socket}` stands in `args` (`slates_ipc::stream::exec_with`); returns only the refusal of a VMM that could not run.
+#[cfg(unix)]
+fn exec_vmm(program: &str, args: &[String], end: slates_client::StreamEnd) -> Failure {
+  use std::os::fd::AsRawFd;
+  let at = end.as_raw_fd();
+  let named = format!("/proc/self/fd/{at}");
+  let args: Vec<OsString> = args
+    .iter()
+    .map(|argument| OsString::from(argument.replace(SOCKET_PLACEHOLDER, &named)))
+    .collect();
+  let error = slates_ipc::stream::exec_with(OsStr::new(program), &args, end, at);
+  Failure::Failed(format!(
+    "vhost-user: running {program} with the device's socket at descriptor {at}: {error}"
+  ))
+}
+
+/// No socket end exists here (`slates_client::StreamEnd` has no values off Unix: the daemon refuses the form by kind), so
+/// there is nothing to run.
+#[cfg(not(unix))]
+fn exec_vmm(_program: &str, _args: &[String], end: slates_client::StreamEnd) -> Failure {
+  match end {}
 }
 
 /// Prints the attachment a `shards` command runs under, before the command starts, so a human can find it in `status`

@@ -138,6 +138,17 @@ pub struct ShardsStream {
   pub stream: StreamEnd,
 }
 
+/// What `attach_vhost_user` returns (§4.6; goal G-vhost): the attachment, and the socket end to hand the VMM as its
+/// vhost-user front end's socket, which reaches slates' own virtio-fs device serving that attachment and nothing else.
+#[derive(Debug)]
+pub struct VhostUserDevice {
+  /// The attachment the daemon's device serves.
+  pub attachment: Attachment,
+  /// The socket's end, close-on-exec: move it to the descriptor number the VMM is told before running it
+  /// (`slates_ipc::stream::exec_with` does both, replacing the process with the VMM).
+  pub end: StreamEnd,
+}
+
 /// A Shards stream's end as this platform hands it to a client: a Unix descriptor.
 #[cfg(unix)]
 pub type StreamEnd = std::os::fd::OwnedFd;
@@ -1022,8 +1033,60 @@ impl Client {
     }
   }
 
-  /// Takes the stream end the daemon sent over the control socket for `attachment` just before its `Attached` reply
-  /// (Linux, A-161).
+  /// Attaches `volume` to slates' own virtio-fs device for an out-of-process VMM over vhost-user (§4.6; goal G-vhost): the
+  /// daemon serves the device's back end on its end of a socket pair, on the volume's owner shard, and hands this client
+  /// the other end over the control socket, sent before the reply, to pass to the VMM as its front end's socket (crosvm
+  /// takes `socket=/proc/self/fd/N`). The guest mounts `tag`; with `subtree`, only that directory; with
+  /// `Intent::Read`, every change refused; with `dax_window`, a DAX window of that many bytes is offered to the front end
+  /// (a power of two of at least 2 MiB). The attachment ends when the VMM's end closes, or by a `detach`, a revocation
+  /// or the volume's destroy. Linux only: elsewhere the daemon refuses the form, `Refusal::AttachmentUnsupported` with
+  /// `UnsupportedReason::BindingNotBuilt`.
+  pub fn attach_vhost_user(
+    &mut self,
+    volume: VolumeId,
+    intent: Intent,
+    (tag, subtree): (&str, Option<&str>),
+    dax_window: Option<u64>,
+  ) -> Result<VhostUserDevice, ClientError> {
+    let reply = self.call(&RequestBody::Attach {
+      volume,
+      snapshot: None,
+      intent,
+      form: AttachRequest::VhostUserFs {
+        tag: tag.to_owned(),
+        subtree: subtree.map(str::to_owned),
+        dax_window,
+      },
+    })?;
+    match reply {
+      ReplyBody::Attached {
+        attachment,
+        lease_epoch,
+        path,
+        version,
+        established,
+        capability,
+        token,
+      } => Ok(VhostUserDevice {
+        end: self.delivered_stream(attachment)?,
+        attachment: Attachment {
+          attachment,
+          lease_epoch,
+          path,
+          version,
+          established,
+          capability,
+          token,
+        },
+      }),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "attach_vhost_user",
+      }),
+    }
+  }
+
+  /// Takes the socket end the daemon sent over the control socket for `attachment` just before its `Attached` reply
+  /// (Linux: a Shards stream, A-161; a vhost-user device's socket, G-vhost).
   #[cfg(unix)]
   fn delivered_stream(&self, attachment: u64) -> Result<StreamEnd, ClientError> {
     let delivered = self.recv_delivery(|delivery| {

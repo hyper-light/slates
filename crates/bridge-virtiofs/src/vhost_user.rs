@@ -611,6 +611,20 @@ impl VhostUserSeam {
   pub fn adopt(socket: OwnedFd, config: &DeviceConfig) -> Result<VhostUserSeam, VhostError> {
     let credentials =
       rustix::net::sockopt::socket_peercred(&socket).map_err(|_| VhostError::PeerUnverified)?;
+    let consumer = Principal::Uid {
+      uid: credentials.uid.as_raw(),
+    };
+    VhostUserSeam::adopt_for(socket, config, consumer)
+  }
+
+  /// Adopts `socket` as [`VhostUserSeam::adopt`] does, for a front end that holds the other end of a pair this process
+  /// made and handed out (the attach verb's form, G-vhost). The peer's credentials there are this process's own, so the
+  /// consumer is the one the caller authenticated before handing the end out, named here.
+  pub fn adopt_for(
+    socket: OwnedFd,
+    config: &DeviceConfig,
+    consumer: Principal,
+  ) -> Result<VhostUserSeam, VhostError> {
     rustix::io::ioctl_fionbio(&socket, true).map_err(os("ioctl(FIONBIO)"))?;
     let doorbell = epoll::create(CreateFlags::CLOEXEC).map_err(os("epoll_create1"))?;
     epoll::add(
@@ -624,9 +638,7 @@ impl VhostUserSeam {
     Ok(VhostUserSeam {
       socket,
       doorbell,
-      consumer: Principal::Uid {
-        uid: credentials.uid.as_raw(),
-      },
+      consumer,
       memory: GuestRegions::default(),
       vrings: (0..queues).map(|_| Vring::default()).collect(),
       features: 0,

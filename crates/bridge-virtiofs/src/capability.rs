@@ -14,6 +14,9 @@ use crate::admission::{GuestTransport, UnsupportedReason};
 
 /// Format: the contract's reason a DAX capability is not advertised (§4.6 A-9; AC-4.12).
 pub const DAX_NOT_ADVERTISED_REASON: &str = "the baseline contract does not require DAX; a requested DAX capability cannot be advertised until mapping isolation, pinning and teardown have been established for this VMM (§4.6 A-9, AC-4.12)";
+/// Format: why the vhost-user binding offers DAX (§4.6; A-168, A-169): its windows map per-file copies kept equal to the
+/// volume, each authorizing one file, so isolation and teardown hold by construction.
+pub const DAX_OFFERED_PER_ATTACH_REASON: &str = "a DAX window is offered when the attach names one: its windows map per-file copies slates keeps equal to the volume, each authorizing one file's bytes (§4.6, A-168)";
 
 /// Where the guest finds the volume: it mounts the device's tag (`mount -t virtiofs <tag>`); no
 /// host path exists for it, no directory is created, no socket is placed on disk (§4.6: "No disk
@@ -112,11 +115,18 @@ fn sharing_of(negotiated: Option<InitNegotiation>) -> SharingSemantics {
   }
 }
 
-/// The DAX line: never advertised, with the contract's reason.
-const fn dax() -> DaxCapability {
-  DaxCapability {
-    advertised: false,
-    reason: DAX_NOT_ADVERTISED_REASON,
+/// The DAX line of `transport`: the vhost-user binding offers DAX on Linux, where its windows map per-file backings
+/// (A-168); the in-process binding's fd-sharing placer is not established, so it advertises none.
+const fn dax(transport: GuestTransport) -> DaxCapability {
+  match transport {
+    GuestTransport::InheritedDescriptor if cfg!(target_os = "linux") => DaxCapability {
+      advertised: true,
+      reason: DAX_OFFERED_PER_ATTACH_REASON,
+    },
+    GuestTransport::InheritedDescriptor | GuestTransport::InProcess => DaxCapability {
+      advertised: false,
+      reason: DAX_NOT_ADVERTISED_REASON,
+    },
   }
 }
 
@@ -143,17 +153,17 @@ pub fn host_capability(transport: GuestTransport) -> TransportCapability {
     } else {
       Conformance::SimulatedGuestDriver
     },
-    dax: dax(),
+    dax: dax(transport),
   }
 }
 
-/// The report for an attached device: its tag, the policy its rights allow, and the semantics its
-/// guest negotiated.
+/// The report for an attached device: its tag, the policy its rights allow, the semantics its guest negotiated, and DAX
+/// only where its transport offers it and the device was given a window (`window`).
 pub fn attached_capability(
   transport: GuestTransport,
   tag: &str,
   rights: Rights,
-  negotiated: Option<InitNegotiation>,
+  (negotiated, window): (Option<InitNegotiation>, bool),
 ) -> TransportCapability {
   let mut report = host_capability(transport);
   report.target_path = TargetPath::GuestTag {
@@ -165,5 +175,6 @@ pub fn attached_capability(
     ReadWritePolicy::ReadOnly
   };
   report.sharing = sharing_of(negotiated);
+  report.dax.advertised = report.dax.advertised && window;
   report
 }

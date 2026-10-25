@@ -2134,6 +2134,20 @@ pub enum AttachRequest {
     /// The directory presented, as a path from the volume's root; the whole volume when absent.
     subtree: Option<String>,
   },
+  /// slates' own virtio-fs device served to an out-of-process VMM over vhost-user (§4.6; goal G-vhost): the daemon makes
+  /// a socket pair, serves the device's back end on its end, and hands the other end to the client, which passes it to
+  /// the VMM as its front end's socket (crosvm takes `socket=/proc/self/fd/N`). No socket file exists anywhere (R1). The
+  /// end reaches the client over its control socket, sent before the reply; Linux only. The attachment ends when the
+  /// VMM's end closes, as well as by `detach`, a revocation or the volume's destroy. Appended.
+  VhostUserFs {
+    /// The tag the guest mounts (`mount -t virtiofs <tag>`): at most 36 bytes of UTF-8, no NUL.
+    tag: String,
+    /// The directory presented, as a path from the volume's root; the whole volume when absent.
+    subtree: Option<String>,
+    /// The DAX window offered to the front end, in bytes: a power of two of at least one 2 MiB range. None offers no
+    /// window, and the guest reads and writes through the queue alone.
+    dax_window: Option<u64>,
+  },
 }
 
 impl AttachRequest {
@@ -2153,7 +2167,8 @@ impl AttachRequest {
       Self::ScopedHostMount { subtree } | Self::ScopedFuseMount { subtree, .. } => Some(subtree),
       Self::SharedFuseMount { subtree, .. }
       | Self::BoundHostMount { subtree, .. }
-      | Self::ShardsFs { subtree } => subtree.as_deref(),
+      | Self::ShardsFs { subtree }
+      | Self::VhostUserFs { subtree, .. } => subtree.as_deref(),
       _ => None,
     }
   }

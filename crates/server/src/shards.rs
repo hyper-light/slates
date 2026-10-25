@@ -163,10 +163,11 @@ impl std::fmt::Debug for ShardsStream {
 /// The shard's Shards streams, by attachment id.
 pub(crate) type ShardsStreams = BTreeMap<u64, ShardsStream>;
 
-/// A stream end owed to the client whose attach made it (A-161): kept on the client's shard under the attach's
-/// request word until the attach's reply is written (`verbs::send_reply`), and sent over the client's control socket
-/// just before it, only with that reply. Made on the volume's owner shard; a forwarded attach carries it back to the
-/// client's shard with the reply (`verbs::send_forward`).
+/// A socket end owed to the client whose attach made it: a Shards stream's (A-161) or a vhost-user device's (G-vhost,
+/// `crate::virtiofs::attach_verb`). Kept on the client's shard under the attach's request word until the attach's reply
+/// is written (`verbs::send_reply`), and sent over the client's control socket just before it, only with that reply.
+/// Made on the volume's owner shard; a forwarded attach carries it back to the client's shard with the reply
+/// (`verbs::send_forward`).
 pub(crate) struct Handoff {
   /// The attachment the daemon serves on the stream's other end.
   pub(crate) attachment: u64,
@@ -178,9 +179,9 @@ pub(crate) struct Handoff {
 /// requests the shard's clients may have in flight ([`handoff_bound`]): an attach past it is refused `Overloaded`.
 pub(crate) type Handoffs = BTreeMap<u64, Handoff>;
 
-/// Derived: the stream ends a shard may owe at once: one per request its clients may have in flight
+/// Derived: the socket ends a shard may owe at once: one per request its clients may have in flight
 /// (`clients_per_shard × ring slots`), the bound `verbs::remember_forwarded_ring` keeps for forwarded requests.
-fn handoff_bound(s: &ShardState) -> usize {
+pub(crate) fn handoff_bound(s: &ShardState) -> usize {
   s.config
     .clients_per_shard
     .saturating_mul(usize::try_from(s.config.region.slots).unwrap_or(1))
@@ -392,8 +393,8 @@ pub(crate) fn attach_verb(
   hand_out(s, id.word(), attached, capability, prepared)
 }
 
-/// The stream ends this shard holds for clients: kept for a control socket, or offered on the socket route.
-fn pending_ends(s: &ShardState) -> usize {
+/// The socket ends this shard holds for clients: kept for a control socket, or offered on the socket route.
+pub(crate) fn pending_ends(s: &ShardState) -> usize {
   #[cfg(target_os = "macos")]
   let offered = s.stream_offers.len();
   #[cfg(not(target_os = "macos"))]
