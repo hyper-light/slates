@@ -38,8 +38,8 @@ use slates_bridge_virtiofs::backed;
 use slates_client::{Client, Intent, VolumeId};
 use slates_guest_probe::protocol::{Command as Ask, Reply};
 use vm::{
-  Anchor, Guest, MountPoint, REPLY_WAIT, START_WAIT, created_volume, initramfs, pause, run,
-  start_anchor, write_at, write_whole,
+  Anchor, Guest, MountPoint, QUIT_WAIT, REPLY_WAIT, START_WAIT, created_volume, initramfs,
+  kill_the_daemon, pause, run, start_anchor, write_at, write_whole,
 };
 
 /// Shape: the pages the guest maps; the file never grows past them, so every byte of it lies in the map.
@@ -410,7 +410,7 @@ struct Rig {
   sdk: Client,
   origin_attachment: u64,
   session_attachment: u64,
-  _anchor: Anchor,
+  anchor: Anchor,
 }
 
 impl Rig {
@@ -475,7 +475,7 @@ impl Rig {
       sdk,
       origin_attachment,
       session_attachment,
-      _anchor: anchor,
+      anchor,
     };
     (rig, seed)
   }
@@ -559,6 +559,36 @@ impl Rig {
       || counter(&self.instance, backed::RELEASED) >= 1,
     );
   }
+}
+
+/// The attachment `slates vhost-user` announced on the console as it booted `guest`: read before the console's
+/// transcript can roll it out.
+fn device_attachment(guest: &Guest) -> String {
+  guest
+    .transcript()
+    .lines()
+    .find_map(|line| line.strip_prefix("attachment: "))
+    .map(str::to_owned)
+    .unwrap_or_else(|| panic!("no attachment announced\n{}", guest.transcript()))
+}
+
+/// Waits for the VM to end by itself, for at most [`QUIT_WAIT`]: its exit status, its VMM's last words drained into the
+/// transcript.
+fn vm_end(guest: &mut Guest) -> std::process::ExitStatus {
+  let started = Instant::now();
+  let status = loop {
+    if let Some(status) = guest.vm.try_wait().unwrap() {
+      break status;
+    }
+    assert!(
+      started.elapsed() < QUIT_WAIT,
+      "the VM ended within {QUIT_WAIT:?} once its device was gone\n{}",
+      guest.transcript()
+    );
+    pause();
+  };
+  guest.drain(QUIT_WAIT);
+  status
 }
 
 /// §4.6 (A-168, A-169) through a real guest. Do: boot crosvm with slates' own device through `slates vhost-user` and
@@ -1049,4 +1079,185 @@ fn a_guest_holds_every_change_of_a_session_file_over_generated_histories_through
     );
   }
   print_device_counters(&rig.instance, "histories");
+}
+
+/// The guest stores `value` over `[at, at + len)` of its map, unsynced, and the model with it.
+fn store(guest: &mut Guest, model: &mut Model, (at, len): (u64, u64), value: u8) {
+  guest.done(&Ask::Store {
+    at,
+    len,
+    byte: value,
+  });
+  model.store(at, len, value);
+}
+
+/// §4.6 (A-168) when the VM dies. Do: map the session's file and read it; store into it through the map and `msync`;
+/// store over three more spans without syncing, and over one past the file's end on its last page; kill crosvm and its
+/// device processes without warning, and at once write through the session's mount over part of an unsynced span,
+/// racing the device's end. Then boot a second guest on the session and map the file.
+///
+/// Expect: once the device has ended, the session holds each store the dead guest made within the file, which its
+/// stream's end ingested, and the mount's write over its span, the later write; nothing of the store past the end; and
+/// the second guest's map holds the same. The device counts runs ingested at its end.
+#[test]
+fn a_vm_killed_with_unsynced_stores_leaves_them_in_the_session_through_its_devices_end() {
+  let Some(gate) = Gate::from_env() else {
+    return;
+  };
+  let (rig, seed) = Rig::new(&gate, "vhost-vmkill");
+  let mut guest = rig.boot(&gate);
+  let mut model = Model::new(seed, rig.map_len);
+  let page = page();
+  map(&mut guest, &mut model);
+  map_holds(
+    &mut guest,
+    &model,
+    (0, model.touchable()),
+    "the first guest's map",
+  );
+  store(&mut guest, &mut model, (7, page), GUEST_FIRST);
+  guest.done(&Ask::Sync);
+  model.sync();
+  let ingested_before = counter(&rig.instance, backed::INGESTED);
+  let size = model.size();
+  let racing = (3 * page + 5, 2 * page);
+  for (span, value) in [
+    ((page + 100, 3000), GUEST_FIRST + 1),
+    (racing, GUEST_FIRST + 2),
+    ((size - 50, 30), GUEST_FIRST + 3),
+    ((size + 20, 40), GUEST_FIRST + 4),
+  ] {
+    store(&mut guest, &mut model, span, value);
+  }
+  guest.kill();
+  let over = racing.0 + page;
+  let bytes = vec![MOUNT_FIRST; 500];
+  write_at(&rig.mounted_file(), over, &bytes);
+  model.write(over, &bytes);
+  // The end's ingest: the guest's stores within the file, never past its end.
+  model.sync();
+  rig.await_device_end();
+  rig.volume_holds(
+    &rig.session,
+    &model.file,
+    "the session once the killed VM's device has ended",
+    &guest,
+  );
+  assert!(
+    counter(&rig.instance, backed::INGESTED) > ingested_before,
+    "non-vacuous: the device's end ingested the dead guest's stores"
+  );
+  let mut second = rig.boot(&gate);
+  let mut fresh = Model::new(model.file.clone(), rig.map_len);
+  map(&mut second, &mut fresh);
+  map_holds(
+    &mut second,
+    &fresh,
+    (0, fresh.touchable()),
+    "the second guest's map of what the first left",
+  );
+  print_device_counters(&rig.instance, "a VM killed");
+  let status = second.quit();
+  assert!(
+    status.success(),
+    "the second VM powered off cleanly: {status}\n{}",
+    second.transcript()
+  );
+}
+
+/// §4.6 (A-161, A-168, A-169) with the daemon killed under a guest's live map. Do: map the session's file and read it;
+/// store through the map and `msync`; write through the session's mount and through the SDK; store again without
+/// syncing; kill the daemon with `SIGKILL` and wait for the anchor's successor; then write through the session's mount,
+/// which the successor takes over (A-61), and boot a second guest on the session through the successor.
+///
+/// Expect: the VM ends by itself once its device's socket closes, as crosvm takes a vhost-user back end's hangup for a
+/// crashed device (`VmEventType::DeviceCrashed`, `devices/src/virtio/vhost_user_frontend/mod.rs` at 1c8d17a85); the
+/// session holds every byte the guest synced and every acknowledged write, and not the store the guest never synced,
+/// which died with the daemon; recovery removed the device's record, so `detach` of its attachment is refused
+/// `NotFound`; and the second guest's map holds the session, the write after the takeover included.
+#[test]
+fn a_daemon_killed_under_a_guests_live_map_ends_its_device_and_loses_nothing_the_guest_synced() {
+  let Some(gate) = Gate::from_env() else {
+    return;
+  };
+  let (mut rig, seed) = Rig::new(&gate, "vhost-dkill");
+  let mut guest = rig.boot(&gate);
+  let attachment = device_attachment(&guest);
+  let mut model = Model::new(seed, rig.map_len);
+  let page = page();
+  map(&mut guest, &mut model);
+  map_holds(
+    &mut guest,
+    &model,
+    (0, model.touchable()),
+    "the first guest's map",
+  );
+  store(&mut guest, &mut model, (7, page), GUEST_FIRST);
+  guest.done(&Ask::Sync);
+  model.sync();
+  let mounted = vec![MOUNT_FIRST; 900];
+  write_at(&rig.mounted_file(), 2 * page - 300, &mounted);
+  model.write(2 * page - 300, &mounted);
+  let mut replaced = model.file.clone();
+  replaced[ix(4 * page)..ix(4 * page + 1000)].fill(SDK_FIRST);
+  rig.replace_session(&replaced);
+  model.replace(&replaced);
+  rig.volume_holds(
+    &rig.session,
+    &model.file,
+    "the session before the kill",
+    &guest,
+  );
+  let synced = model.file.clone();
+  store(&mut guest, &mut model, (3 * page, 1000), GUEST_FIRST + 1);
+
+  let (old, new) = kill_the_daemon(&rig.anchor, &rig.instance);
+  assert_ne!(old, new, "the anchor's successor is a new daemon");
+  let status = vm_end(&mut guest);
+  let transcript = guest.transcript();
+  let crosvm_said: Vec<&str> = transcript
+    .lines()
+    .filter(|line| line.starts_with("crosvm: "))
+    .collect();
+  eprintln!(
+    "daemon {old} killed under the live map, successor {new}: the VM ended by itself, {status}; crosvm's last \
+     words:\n{}",
+    crosvm_said.join("\n")
+  );
+  rig.volume_holds(
+    &rig.session,
+    &synced,
+    "the session after the takeover: every synced byte and acknowledged write, and not the unsynced store",
+    &guest,
+  );
+  let (code, _, err) = run(&rig.instance, &["detach", &attachment]);
+  assert!(
+    code == 1 && err.contains("NotFound"),
+    "recovery removed the device's record: detach {attachment} → exit {code}, {err}"
+  );
+
+  let mut after = Model::new(synced, rig.map_len);
+  let later = vec![MOUNT_FIRST + 1; 700];
+  write_at(&rig.mounted_file(), page / 3, &later);
+  after.write(page / 3, &later);
+  let mut second = rig.boot(&gate);
+  map(&mut second, &mut after);
+  map_holds(
+    &mut second,
+    &after,
+    (0, after.touchable()),
+    "the second guest's map, through the successor",
+  );
+  rig.volume_holds(
+    &rig.session,
+    &after.file,
+    "the session after the takeover's write",
+    &second,
+  );
+  let status = second.quit();
+  assert!(
+    status.success(),
+    "the second VM powered off cleanly: {status}\n{}",
+    second.transcript()
+  );
 }

@@ -11274,6 +11274,50 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     mount makes it clean, and adds a `lost+found` (root's, mode 0700) that the merge takes as a new directory. Recorded,
     not changed: e2fsck puts any orphans it recovers there, so the merge must not drop it. `docs/cli.md` says so.
   - **Owed:** the arm64 guest's pmem DAX (Firecracker's doc covers aarch64, with `CONFIG_ARM64_PMEM`): G-arm64-guest.
+- **Proven 2026-10-25 (G-vhost step 4): the VM and the daemon killed under a guest's live map.**
+  `crates/cli/tests/guest_vhost.rs`, two tests on the box beside step 3's:
+  - **The VM killed** (`a_vm_killed_with_unsynced_stores_leaves_them_in_the_session_through_its_devices_end`): the guest
+    stores over three spans without syncing, and once past the file's end. crosvm and its device processes take
+    `SIGKILL`, and a mount write races the device's end over part of one span. Once the device has ended, the session
+    holds each store within the file (the stream's end ingested them), the mount's later write where it wrote, and
+    nothing of the store past the end. A second guest's map holds the same. **Red-check:** with no ingest at the
+    stream's end the test fails at that check (byte 4196 holds the seed where the dead guest stored 2).
+  - **The daemon killed** (`a_daemon_killed_under_a_guests_live_map_ends_its_device_and_loses_nothing_the_guest_synced`):
+    after synced stores, a mount write and an SDK write, and one store left unsynced, the daemon takes `SIGKILL`. The VM
+    ends by itself: crosvm takes a vhost-user back end's hangup for a crashed device ("vhost-user worker thread exited
+    with an error: ... Backend device disconnected early", "device crashed", "exiting with success", exit status 0;
+    `VmEventType::DeviceCrashed` in `devices/src/virtio/vhost_user_frontend/mod.rs` at 1c8d17a85). The successor holds
+    every synced byte and acknowledged write and not the unsynced store, which died with the daemon. Recovery removed
+    the device's record (`slates detach` of its attachment answers `NotFound`). The session's FUSE mount is taken over
+    (A-61), and a fresh VM through the successor sees a write made after the takeover.
+  - **Runs:** on the fixed code, the daemon kill 9 of 9 (5 alone, 4 in the whole binary) and the VM kill 4 of 4, capped
+    as in step 3; `guest_dax.rs` 3 of 3 beside them. **Found:** the A-170 bug below, in 2 rounds of 3 before the fix.
+  - **Owed, a later goal:** a VM that outlives its device's daemon. The anchor would have to hold the device's socket
+    end and its state (vrings, memory table, back-end channel, windows) across the restart, as A-61 holds a FUSE device.
+- **Fixed 2026-10-25 (A-170), found by step 4: a clone's copy-up sealed its origin's open extent behind the origin's
+  image, so a crash lost the shard.** `docs/bugs/2026-10-25-a-clones-copy-up-sealed-its-origins-open-extent-behind-its-image.md`.
+  - **Symptom:** the daemon-kill test failed 2 rounds of 3, then 3 of 4, always the fastest rounds. The successor logged
+    "partition 1: the recovery images' blocks were not claimed, no volume is rebuilt: EIO" and refused the origin, the
+    boot volume and the session.
+  - **Cause, named by instrumenting the claim:** two images named one open block, `(64, 0)`, with births 0 and 1. The
+    session's copy-up had sealed the origin's shared open extent in place, and the origin, still clean, kept
+    publishing the extent the seal freed; the session's next extent took the block.
+  - **Exposure:** any clone whose origin's snapshot held a file's last window open, changed by the clone, then a crash
+    before the origin published for a reason of its own. No VM or DAX is needed.
+  - **Fix:** a clone copies an open extent its origin owns (`ChunkStore::copy_open`); only a volume's own is sealed in
+    place.
+  - **Failing first:** two vfs tests (claim refused, `RecoveryIncomplete`) and a daemon restart test (the origin's file
+    read back as zeros), each red-checked with the in-place seal restored; the vfs (43 binaries) and recovery (41)
+    suites pass.
+  - **Price:** at most a chunk copied per such file, charged to the clone (`retained_bytes.rs` restates the rule).
+  - **Siblings:** the copy-up's seal refusal left a retention charge uncredited. The fix's one method for the seal and
+    the copy credits it now, untested, and a test injecting the refusal is owed. The cold reseal
+    (`Volume::reseal_inode`) changes shared chunk records with no ownership check and no dirty mark: reported, not
+    changed, owed a recovery test first (the bug record has both).
+- **Repaired 2026-10-25: CI on ff9964df.** Both Windows jobs refused `slates-cli` for an unused import
+  (`SOCKET_PLACEHOLDER`, used only by the Unix arm of `exec_vmm`); the constant is now named by its path there. The
+  ubuntu gates job failed `a_linux_container_reaches_the_shared_mount_as_its_own_ids` because Docker Hub refused the
+  runner's pull of `alpine:3.20` ("unauthorized: authentication required"), the environment's, not the code's.
 - **Proven 2026-10-25 (G-vhost step 3): a real crosvm guest maps a session's file through slates' own device with
   DAX.** `crates/cli/tests/guest_vhost.rs`, gated like `guest_dax.rs` (the box: KVM, crosvm 1c8d17a85, host and guest
   Linux 7.2.9-2-cachyos). `slates vhost-user SESSION --dax-window 8MiB -- crosvm run --vhost-user
@@ -11312,8 +11356,8 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   -- VMM ... {socket} ...` runs the VMM with it as `/proc/self/fd/N`. Linux only; elsewhere refused `BindingNotBuilt`.
   Proven by use with a stand-in front end on both shards, its refusals typed with nothing left behind, the whole DAX
   route through the daemon's real serve loop (map, another path's write in the window, the writable upgrade, the
-  guest's store at FSYNC), and the CLI with a real anchor; and through a real crosvm guest (G-vhost step 3, the entry
-  above). **Owed:** the VM and daemon kills (step 4).
+  guest's store at FSYNC), and the CLI with a real anchor; and through a real crosvm guest, the VM and the daemon
+  killed under its live map included (G-vhost steps 3 and 4, the entries above).
 - **Fixed in the device 2026-10-25 (A-168), and proven through a real crosvm guest the same day (G-vhost step 3,
   above): slates' own DAX window showed stale bytes, then zeros, after another path's write.**
   `docs/bugs/2026-10-24-slates-own-dax-window-shows-stale-bytes-then-zeros-after-another-paths-write.md`.

@@ -324,7 +324,10 @@ fn a_truncate_and_an_edit_charge_the_windows_they_release() {
 /// T-A9 (byte retention, clones): a clone's snapshot retains only what the clone owns. Overwriting
 /// an inherited window charges nothing (the origin's pinned snapshot holds that chunk whatever the
 /// clone does), while a window the clone wrote itself and then overwrote after its own snapshot is
-/// charged — for bytes and for inode versions alike.
+/// charged — for bytes and for inode versions alike. The window the origin's snapshot held open is the
+/// origin's to seal, so the clone's first change of the file copied it into an extent of the clone's own
+/// (A-170): from then on it is the clone's, and the clone's snapshot retains it like any window the clone
+/// wrote.
 #[test]
 fn a_clones_snapshot_charges_nothing_for_the_windows_its_origin_owns() {
   let mut store = store();
@@ -332,7 +335,8 @@ fn a_clones_snapshot_charges_nothing_for_the_windows_its_origin_owns() {
   let root = origin.root_inode(&store).unwrap();
   let chunk = u64::try_from(store.content.chunk_bytes()).unwrap();
   let f = origin.create_file_no(&mut store, root, "f", 0o644).unwrap();
-  write_windows(&mut origin, &mut store, f, 2, b'i');
+  // Windows 0 and 1 sealed, window 2 open, when the snapshot is taken.
+  write_windows(&mut origin, &mut store, f, 3, b'i');
   let pinned = origin.snapshot(&mut store).unwrap();
   let mut clone = Volume::clone_of(&store, &mut origin, pinned, clone_config(8)).unwrap();
   let block = vec![b'c'; usize::try_from(chunk).unwrap()];
@@ -366,10 +370,20 @@ fn a_clones_snapshot_charges_nothing_for_the_windows_its_origin_owns() {
     1,
     "the inherited window is not charged",
   );
+  // Window 2 was open in the origin's snapshot: the clone's first write copied it into its own extent (A-170), so the
+  // clone's snapshot holds that copy, and overwriting it retains the copy.
+  clone.write(&mut store, f, 2 * chunk, &block).unwrap();
+  assert_retained(
+    &store,
+    &clone,
+    2 * chunk,
+    1,
+    "the clone's own copy of the window its origin held open is retained",
+  );
   assert_eq!(
     origin.accounting().referenced_bytes,
-    2 * chunk,
-    "the origin still reaches both of its windows"
+    3 * chunk,
+    "the origin still reaches all three of its windows"
   );
 }
 

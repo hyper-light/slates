@@ -905,6 +905,50 @@ impl ChunkStore {
     })
   }
 
+  /// A copy of `open`'s bytes in a block of its own, born at `born` and sized for them as every open extent's block is
+  /// ([`ChunkStore::block_bytes`]), its block locked in RAM when `locked`: what a clone takes of an open extent its
+  /// origin holds, so no volume ever changes another's extent in place (`Volume::make_current_inode`). `open` is left
+  /// as it was. A copy that cannot be made gives its block back and refuses.
+  pub fn copy_open(
+    &mut self,
+    open: &OpenExtent,
+    born: Epoch,
+    locked: bool,
+  ) -> Result<OpenExtent, VfsError> {
+    let len = usize::try_from(open.len).map_err(|_| VfsError::Invalid)?;
+    let block = self.alloc(self.block_bytes(len), locked)?;
+    let carried = self
+      .arena
+      .bytes(open.block)
+      .and_then(|bytes| bytes.get(..len))
+      .map(<[u8]>::to_vec);
+    let copied = match (
+      carried,
+      self
+        .arena
+        .bytes_mut(block)
+        .and_then(|bytes| bytes.get_mut(..len)),
+    ) {
+      (Some(carried), Some(into)) => {
+        into.copy_from_slice(&carried);
+        true
+      }
+      _ => false,
+    };
+    if !copied {
+      return Err(VfsError::StaleHandle.after_undo(self.arena.free(block)));
+    }
+    Ok(OpenExtent {
+      off: open.off,
+      len: open.len,
+      block,
+      born,
+      // Only the copied bytes were written: the rest of the block reads zero, as the arena zeroes every block it frees
+      // (A-99).
+      dirty_to: open.len,
+    })
+  }
+
   /// Grows an open extent's block to hold `need` bytes, copying what was written; refuses past a
   /// chunk.
   pub fn grow(&mut self, open: &mut OpenExtent, need: usize) -> Result<(), VfsError> {

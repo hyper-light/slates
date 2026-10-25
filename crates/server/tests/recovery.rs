@@ -2085,6 +2085,87 @@ fn a_clone_recovers_over_its_recovered_origin_serving_inherited_and_its_own_file
   second.stop();
 }
 
+/// Shape: a file shorter than a content chunk on every host page (4 KiB and 16 KiB): its bytes stay in an open extent
+/// until the idle sweep seals them.
+const OPEN_FILE: usize = 6 * 4096 - 100;
+
+/// §4.8, A-64 with a clone's first change of a file its origin's snapshot holds open (A-170; found by the daemon kill of
+/// `crates/cli/tests/guest_vhost.rs`, 2026-10-25). Do: write a file shorter than a chunk into a volume through the SDK,
+/// so its last window is an open extent; snapshot the volume and clone the snapshot; rewrite the clone's copy of the
+/// file through the SDK; restart the daemon over the same segment. Expect: both volumes recovered, the origin reading
+/// its own bytes and the clone its own. Before the fix the clone's copy-up sealed the origin's open extent behind the
+/// origin's image, the seal freed the block, the clone's next extent took it, and recovery refused every volume of
+/// the shard.
+#[test]
+fn a_clones_rewrite_of_a_file_its_origin_holds_open_survives_a_restart_beside_the_origin() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-openclone-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let segment = anchor_segment("openclone", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let origin = client.create(&scratch("open-origin")).unwrap();
+  let origin_attachment = client
+    .attach(origin, None, slates_ipc::protocol::Intent::Write)
+    .unwrap()
+    .attachment;
+  let first_bytes = vec![b'o'; OPEN_FILE];
+  client
+    .fs_write((origin, origin_attachment), "f", &first_bytes, 0o644)
+    .unwrap();
+  let snapshot = client.snapshot(origin).unwrap();
+  let clone_name = clone_name_on_origin_partition("open-origin", "open-clone");
+  let clone = client
+    .clone_snapshot(origin, snapshot, &clone_name)
+    .unwrap();
+  let clone_attachment = client
+    .attach(clone, None, slates_ipc::protocol::Intent::Write)
+    .unwrap()
+    .attachment;
+  let rewritten = vec![b'c'; OPEN_FILE];
+  client
+    .fs_write((clone, clone_attachment), "f", &rewritten, 0o644)
+    .unwrap();
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let origin_read = read_answered(&mut client, origin, "f").unwrap();
+  assert!(
+    origin_read == first_bytes,
+    "the origin reads its own file after the restart: {}",
+    first_difference(&origin_read, &first_bytes)
+  );
+  let clone_read = read_answered(&mut client, clone, "f").unwrap();
+  assert!(
+    clone_read == rewritten,
+    "the clone reads its own file after the restart: {}",
+    first_difference(&clone_read, &rewritten)
+  );
+  drop(client);
+  second.stop();
+}
+
+/// Where `held` first differs from `expected`, for a failure's message: the lengths, and the first byte that differs.
+fn first_difference(held: &[u8], expected: &[u8]) -> String {
+  let at = held
+    .iter()
+    .zip(expected)
+    .position(|(held, expected)| held != expected);
+  match at {
+    Some(at) => format!(
+      "byte {at} holds {} where {} was written (lengths {} and {})",
+      held[at],
+      expected[at],
+      held.len(),
+      expected.len()
+    ),
+    None => format!("lengths {} and {}", held.len(), expected.len()),
+  }
+}
+
 /// Shape: the power-of-two part of the reserve in [`a_volume_past_the_reserves_power_of_two_part_fills_and_survives_a_restart`].
 const POWER_PART: u64 = 32 << 20;
 /// Shape: the files that test writes, each [`FILL_FILE`] long: more than [`POWER_PART`] holds.

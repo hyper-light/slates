@@ -1280,7 +1280,9 @@ ring and kicks the driver; a stale generation is ignored.
 > takes the whole image only when the volume is unpublished, its shape changed, the changed set has grown to the live
 > inode count, `base_plane_changed`, or `shared_diverged` — the last being the shared→private move a delta genuinely
 > cannot carry, set in `make_current_inode` when it copies up a clone-origin or own-snapshot-pinned inode. So **all
-> three volume shapes are O(delta) per op**, whole-image only on that divergence. Proven load-independently by
+> three volume shapes are O(delta) per op**, whole-image only on that divergence. Since A-170 (2026-10-25) a clone's
+> copy-up never changes a record its origin owns: an open extent of the origin's is copied, not sealed in place, since
+> the origin, left clean, would go on publishing the extent the seal freed. Proven load-independently by
 > allocation count in `crates/vfs/tests/delta_cost.rs` (one create costs the same in a 4,096-file volume as in a
 > 64-file one, for overlay, clone and snapshotted shapes) and end to end by
 > `crates/server/tests/recovery.rs::acknowledged_content_and_its_snapshot_survive_a_restart`.
@@ -12127,6 +12129,41 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
 
+### A-170 — A clone's copy-up copies an open extent its origin owns; only its own is sealed in place (accepted 2026-10-25)
+Applied in the same change to: `crates/vfs/src/volume.rs` (`Volume::make_current_inode`), `crates/vfs/src/content.rs`
+(`ChunkStore::copy_open`), `crates/vfs/tests/content_in_place.rs` and `crates/server/tests/recovery.rs` (the new tests
+below), `crates/vfs/tests/retained_bytes.rs` (the clone's retention rule restated), the A-134 note in §4.3's status,
+GAPS, and `docs/bugs/2026-10-25-a-clones-copy-up-sealed-its-origins-open-extent-behind-its-image.md`.
+- **Changes the copy-up every mutation begins with.** Before, a version born in an earlier epoch had its open extent
+  sealed in place, and the shared old record was rewritten to the sealed body so that every view of it saw the seal.
+  Now only a version this volume owns (born after its clone origin) is sealed in place. A clone's copy of a version
+  its origin owns takes a copy of the open extent, born at the clone's epoch, and the origin's record, and so the
+  image the origin publishes, is left exactly as it was.
+- **Why.** The rewritten record was the origin's: its head and its snapshot use it. The clone marked only itself
+  dirty, so the origin stayed clean (`Volume::is_clean`), and a barrier, which records only a volume that is not
+  clean, left the origin's last image naming the open extent. The seal had freed that block, the trimmed tail always
+  and the whole of it where a cipher moves the bytes (A-118, A-99), and a later allocation took it. Recovery then
+  either refused every volume of the shard (two images naming one block differently, at A-64's all-or-nothing claim:
+  the daemon kill of G-vhost step 4, 2 rounds of 3 on the box) or rebuilt the origin's file from the freed block,
+  which reads zeros (the new restart test with the fix reverted).
+- **Price.** A copy of at most one chunk per file a clone changes whose last window was open in its origin's snapshot,
+  made at the clone's first change of that file (a write, a truncate, a metadata change). The copy is the clone's, so
+  the clone's own snapshot retains it, where it once shared the origin's sealed chunk.
+- **Rejected:**
+  - sealing every open extent when a snapshot is taken: it shares with no copy, but needs a complete list of open
+    extents (a recovered one is in neither of the idle sweep's sets) and an answer for a block a DAX map pins, and it
+    puts O(open files) of seals into the snapshot verb;
+  - keeping the in-place seal and having the origin publish: a store-wide register of records sealed by another
+    volume, aware of lineage through clones of clones, with a lifecycle of its own. More cross-volume coupling, the
+    pattern that failed.
+- **Proven:** `a_clones_first_write_to_a_file_it_shares_with_its_origin_leaves_the_origins_image_true` and
+  `a_clones_first_write_to_a_sealed_volumes_shared_file_leaves_the_origins_image_true` (`content_in_place.rs`; without
+  and with a cipher) and `a_clones_rewrite_of_a_file_its_origin_holds_open_survives_a_restart_beside_the_origin`
+  (`recovery.rs`, through a daemon and its restart). Red-checked with the in-place seal restored: the first two fail
+  at the claim (`RecoveryIncomplete`), the third at the origin's bytes (zeros). The whole vfs suite (43 test binaries)
+  and the recovery suite (41 tests) pass. On the box, the daemon-kill chaos test, which failed 2 rounds of 3, then 3 of
+  4, passed 5 of 5 at the same timing.
+
 ### A-169 — An out-of-process VMM attaches slates' own virtio-fs device by the attach verb (accepted 2026-10-25)
 Applied in the same change to: §4.6 (the guest form over the ring), `crates/ipc/src/protocol.rs`
 (`AttachRequest::VhostUserFs`, appended), `crates/bridge-virtiofs` (`VhostUserSeam::adopt_for`; `serve::until_revoked`
@@ -12196,6 +12233,16 @@ dispatch; `shards.rs` the end handoff shared), `crates/client` (`attach_vhost_us
   mount's write is answered holds the seed); no ingest (the session by the sync's answer lacks the store); no window
   (the guest's `dax=always` mount refused: `mount virtiofs tag slates at /mnt: Invalid argument (os error 22)`). The
   red-check also found the probe cutting its last reply short, fixed (`docs/bugs/2026-10-25-the-guest-probes-last-reply-was-cut-short.md`).
+- **The VM and the daemon killed under the live map (G-vhost step 4, 2026-10-25),** in the same file:
+  - **The VM killed** with unsynced stores: the stream's end ingests them, all but a store past the file's end, while a
+    mount write racing the end keeps its bytes, and a second guest maps what the first left. Red-checked: with no ingest
+    at the stream's end, the dead guest's stores are missing.
+  - **The daemon killed:** the device's stream ends with it (a guest's attachment does not survive a restart, A-161).
+    crosvm then ends the VM, since it takes a vhost-user back end's hangup for a crashed device (exit 0). Every byte the
+    guest synced and every acknowledged write survives, the unsynced store does not, recovery removes the device's
+    record, and a fresh VM through the successor sees the session.
+  - **The bug it found:** a clone's copy-up had sealed its origin's open extent behind the origin's image, so the crash
+    lost the whole shard (A-170). A VM that outlives its device's daemon is owed to a later goal.
 
 ### A-168 — Slates' own virtio-fs device maps per-file backings for an out-of-process VMM (accepted 2026-10-25)
 Applied in the same change to: §4.6 (a status block before the 2026-10-16 record), `crates/bridge-virtiofs`

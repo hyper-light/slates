@@ -16,8 +16,7 @@ use slates_server::landing::{enroll_proof, revoke_proof};
 
 use crate::Failure;
 use crate::args::{
-  ClientRequest, ProfileOptions, RunRequest, SOCKET_PLACEHOLDER, ShardsRequest, SharePrincipal,
-  Verb, VhostUserRequest,
+  ClientRequest, ProfileOptions, RunRequest, ShardsRequest, SharePrincipal, Verb, VhostUserRequest,
 };
 use crate::format::volume_id_text;
 
@@ -1636,7 +1635,7 @@ fn exec_vmm(program: &str, args: &[String], end: slates_client::StreamEnd) -> Fa
   let named = format!("/proc/self/fd/{at}");
   let args: Vec<OsString> = args
     .iter()
-    .map(|argument| OsString::from(argument.replace(SOCKET_PLACEHOLDER, &named)))
+    .map(|argument| OsString::from(argument.replace(crate::args::SOCKET_PLACEHOLDER, &named)))
     .collect();
   let error = slates_ipc::stream::exec_with(OsStr::new(program), &args, end, at);
   Failure::Failed(format!(

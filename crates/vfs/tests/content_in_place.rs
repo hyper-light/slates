@@ -325,6 +325,98 @@ fn a_clone_and_its_origin_recover_sharing_their_chunks() {
   assert!(read_all(&recovered_origin, &fresh, f, 2 * chunk) == vec![b'o'; 2 * chunk]);
 }
 
+/// A-64 with a clone's first write to a file it shares with its origin (found by the daemon kill of
+/// `crates/cli/tests/guest_vhost.rs`, 2026-10-25: a whole shard's volumes refused at recovery). Do: write a file shorter
+/// than a chunk into the origin, so its bytes sit in an open extent; snapshot it, clone the snapshot, and publish both;
+/// write the clone's copy of the file, then a second, small file in the clone, which takes whatever the first write
+/// freed; publish again as a barrier does, recording only a volume that is not clean (`Volume::is_clean`), so the
+/// origin's last image stands unless the clone's writes changed the origin. Recover both from the surviving arena.
+///
+/// Expect: the claim takes every block the two images name, each once; both volumes rebuild; the origin reads its own
+/// bytes and the clone its own. `sealing` gives both volumes a seal key over a cipher, whose seal moves an extent's
+/// bytes to a new block (A-99), as a daemon's does.
+fn a_clones_first_write_to_a_shared_file_recovers(sealing: bool) {
+  let mut source = store();
+  if sealing {
+    source.content.set_cipher(Box::new(StreamCipher));
+  }
+  let mut origin = volume(&mut source, 1 << 30);
+  let root = origin.root_inode(&source).unwrap();
+  let len = source.content.chunk_bytes() / 2 + 100;
+  let f = origin
+    .create_file_no(&mut source, root, "f", 0o644)
+    .unwrap();
+  origin.write(&mut source, f, 0, &vec![b'o'; len]).unwrap();
+  let snapshot = origin.snapshot(&mut source).unwrap();
+  let mut clone =
+    Volume::clone_of(&source, &mut origin, snapshot, common::clone_config(8)).unwrap();
+  if sealing {
+    origin.set_seal_key(Some(SEAL_KEY));
+    clone.set_seal_key(Some(SEAL_KEY));
+  }
+  let mut origin_image = origin.to_image(&source, None).unwrap();
+  origin.mark_published(&source);
+  clone.mark_published(&source);
+
+  clone.write(&mut source, f, 0, b"clone").unwrap();
+  let clone_root = clone.root_inode(&source).unwrap();
+  let g = clone
+    .create_file_no(&mut source, clone_root, "g", 0o644)
+    .unwrap();
+  let small = vec![b'g'; source.content.chunk_bytes() / 8];
+  clone.write(&mut source, g, 0, &small).unwrap();
+  if !origin.is_clean(&source) {
+    origin_image = origin.to_image(&source, None).unwrap();
+  }
+  let clone_image = clone.to_image(&source, None).unwrap();
+
+  let mut fresh = common::surviving(&source);
+  if sealing {
+    fresh.content.set_cipher(Box::new(StreamCipher));
+  }
+  let claims =
+    Claims::prepare(&mut fresh, [&origin_image, &clone_image]).unwrap_or_else(|refusal| {
+      panic!("the records a barrier leaves name each block once, as what it is: {refusal:?}")
+    });
+  let recovered_origin = rebuild(&mut fresh, &origin_image, &claims).unwrap();
+  let recovered_clone = rebuild_clone(
+    &mut fresh,
+    &clone_image,
+    &claims,
+    &recovered_origin,
+    snapshot,
+  )
+  .unwrap();
+  let mut cloned = vec![b'o'; len];
+  cloned[..5].copy_from_slice(b"clone");
+  assert!(
+    read_all(&recovered_origin, &fresh, f, len) == vec![b'o'; len],
+    "the recovered origin reads its own bytes"
+  );
+  assert!(
+    read_all(&recovered_clone, &fresh, f, len) == cloned,
+    "the recovered clone reads its own copy of the shared file"
+  );
+  assert!(
+    read_all(&recovered_clone, &fresh, g, small.len()) == small,
+    "the recovered clone reads its own new file"
+  );
+}
+
+/// [`a_clones_first_write_to_a_shared_file_recovers`] with no cipher: the copy-up's seal trims the shared extent in
+/// place and frees its tail.
+#[test]
+fn a_clones_first_write_to_a_file_it_shares_with_its_origin_leaves_the_origins_image_true() {
+  a_clones_first_write_to_a_shared_file_recovers(false);
+}
+
+/// [`a_clones_first_write_to_a_shared_file_recovers`] with a cipher: the copy-up's seal moves the shared extent's bytes
+/// and frees its whole block, which the clone's next extent takes.
+#[test]
+fn a_clones_first_write_to_a_sealed_volumes_shared_file_leaves_the_origins_image_true() {
+  a_clones_first_write_to_a_shared_file_recovers(true);
+}
+
 /// A-64 (`PublishNeeded`). Do: in a 16 MiB arena, write a 6 MiB file, commit a publication (its image names the
 /// blocks), rewrite the file whole (every old block's free deferred), then write a second 6 MiB file. Expect: the
 /// second write lands short — the windows the free arena held — and the rest is refused `PublishNeeded` (the room

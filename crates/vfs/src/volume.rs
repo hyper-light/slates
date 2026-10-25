@@ -4783,6 +4783,50 @@ impl Volume {
     }
   }
 
+  /// What a copy-up does with the open extent of the version it copies into `copy` (A-170). One this volume owns is
+  /// sealed first: its snapshot keeps the sealed bytes, the old record is rewritten to match so every view of it sees
+  /// the seal, and the head continues in a fresh extent on its next write. One a clone's origin owns is the origin's
+  /// to change: the clone takes a copy of its own, born now, and leaves the origin's record, and the image its own
+  /// publications carry, exactly as they were. Sealing it in place changed the origin's file behind it: the origin,
+  /// clean, went on publishing an open extent the seal had freed, the clone's next extent took the freed block, and
+  /// recovery refused a whole shard's volumes
+  /// (`docs/bugs/2026-10-25-a-clones-copy-up-sealed-its-origins-open-extent-behind-its-image.md`). Returns the copy's
+  /// content before it changed hands, and the extent copied, when it copied one; refused with nothing changed.
+  fn copy_up_open_extent(
+    &mut self,
+    store: &mut Store,
+    handle: Handle<Inode>,
+    copy: &mut Inode,
+  ) -> Result<Option<(EpochContent, OpenExtent)>, VfsError> {
+    if !matches!(copy.body, Body::Open { .. }) {
+      return Ok(None);
+    }
+    // Moved out, not cloned: on a refusal the copy is dropped unused, and the store's records are as they were.
+    let Body::Open { open, sealed } = std::mem::replace(&mut copy.body, Body::None) else {
+      return Ok(None);
+    };
+    let before = content_by_epoch(store, handle);
+    if self.owns(open.born) {
+      // A seal trims the block to its length (A-118), so the charge follows what the arena now holds.
+      let mut extents = sealed;
+      if let Some(e) = store.content.seal(*open, self.seal_key)? {
+        insert_extent(&mut extents, e);
+      }
+      copy.body = Body::Sealed(extents);
+      if let Ok(old) = store.inodes.get_mut(handle) {
+        old.body = copy.body.clone();
+      }
+      self.reconcile(before, content_by_epoch(store, handle));
+      return Ok(None);
+    }
+    let own = store.content.copy_open(&open, self.epoch, self.locked)?;
+    copy.body = Body::Open {
+      open: Box::new(own),
+      sealed,
+    };
+    Ok(Some((before, own)))
+  }
+
   /// The current-epoch version of an inode, copying an older version and re-pointing the table.
   pub(crate) fn make_current_inode(
     &mut self,
@@ -4842,21 +4886,17 @@ impl Volume {
     let _ = kind;
     let mut copy = store.inodes.get(handle)?.clone();
     copy.born = self.epoch;
-    // An open extent born earlier is sealed first: the snapshot keeps the sealed bytes and the
-    // head continues in a fresh extent on its next write.
-    if let Body::Open { open, sealed } = copy.body {
-      // A seal trims the block to its length (A-118), so the charge follows what the arena now holds.
-      let before = content_by_epoch(store, handle);
-      let mut extents = sealed;
-      if let Some(e) = store.content.seal(*open, self.seal_key)? {
-        insert_extent(&mut extents, e);
+    // What the copy's content was before it changed hands, when the copy took an open extent of its own: the epoch
+    // histogram moves from that to what the installed copy holds.
+    let copied = match self.copy_up_open_extent(store, handle, &mut copy) {
+      Ok(copied) => copied,
+      Err(refusal) => {
+        if charged {
+          self.credit_retention(store, 0, 1);
+        }
+        return Err(refusal);
       }
-      copy.body = Body::Sealed(extents);
-      if let Ok(old) = store.inodes.get_mut(handle) {
-        old.body = copy.body.clone();
-      }
-      self.reconcile(before, content_by_epoch(store, handle));
-    }
+    };
     // The head's copy of inline content is born now; the old record keeps the snapshot's. Moved only
     // once the copy is installed.
     let inline = match &copy.body {
@@ -4876,12 +4916,19 @@ impl Volume {
         if charged {
           self.credit_retention(store, 0, 1);
         }
-        return Err(refusal);
+        // The copy's own extent goes back with it: no record holds it.
+        return Err(match copied {
+          Some((_, own)) => refusal.after_undo(store.content.release_open(own)),
+          None => refusal,
+        });
       }
     };
     if let Some(len) = inline {
       self.bytes.sub(born, len);
       self.bytes.add(self.epoch, len);
+    }
+    if let Some((before, _)) = copied {
+      self.reconcile(before, content_by_epoch(store, fresh));
     }
     self.retire(store, Dead::Inode(handle, born))?;
     Ok(fresh)
