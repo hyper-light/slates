@@ -40,9 +40,11 @@ timestamp in the future is racy. §4.5's sentence is amended (A-162).
 
 ## Sibling sweep
 
-- `rewitness` records every witness `racy: false`. A file edited inside the rewitness's own tick is then caught only by a
-  later fingerprint change, which a coarse-granularity filesystem may not show. That is correctness, not cost; reported,
-  not changed here (it needs its own failing test).
+- `rewitness` recorded every witness `racy: false`, so a file edited inside the rewitness's own tick was caught only by
+  a later fingerprint change, which a coarse-granularity filesystem may not show. Correctness, not cost. **Fixed the
+  same day**, failing test first: `a_rewitness_inside_the_files_tick_is_racy_and_a_same_tick_edit_is_caught`
+  (`crates/vfs/tests/base.rs`) failed ("re-witnessed in the tick its file was last written") and passes now that
+  `rewitness` asks the host's clock as `copy_up` does.
 - A racy witness stays racy after a drift check has re-hashed it at a time past its tick and found it equal. From then
   on, any edit moves the mtime to a later tick, so the fingerprint alone would do (git clears such entries when it
   rewrites its index). Until then, a genuinely racy large file hashes whole on every check. Reported, not changed here.

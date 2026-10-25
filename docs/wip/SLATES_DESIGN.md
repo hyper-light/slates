@@ -12139,8 +12139,10 @@ owner for review).
   review as the owner offered); the zero-copy question above, if a measurement ever makes the copy matter.
 
 ### A-162 — A copy-up's witness is racy only while the file's own timestamp tick is open (accepted 2026-10-24)
-Applied in the same change to: §4.5 (copy-up), `crates/vfs/src/base.rs` (`copy_up`), `crates/vfs/tests/base.rs`
-(`a_witness_taken_after_an_edit_made_since_the_listing_is_racy_only_while_the_edits_tick_is_open`), GAPS,
+Applied in the same change to: §4.5 (copy-up), `crates/vfs/src/base.rs` (`copy_up`, and `rewitness` the same day),
+`crates/vfs/tests/base.rs`
+(`a_witness_taken_after_an_edit_made_since_the_listing_is_racy_only_while_the_edits_tick_is_open`,
+`a_rewitness_inside_the_files_tick_is_racy_and_a_same_tick_edit_is_caught`), GAPS,
 `docs/bugs/2026-10-24-a-copy-up-judged-its-witness-racy-by-the-listings-time.md`.
 - Changes §4.5's copy-up: the witness's racy flag is decided by the host's clock at the copy-up's own `fstat` (racy when
   `now − mtime` is within the filesystem's timestamp granularity), no longer by the directory listing's read time. The
@@ -12153,9 +12155,10 @@ Applied in the same change to: §4.5 (copy-up), `crates/vfs/src/base.rs` (`copy_
   a debug build.
 - Unchanged: T-1.11 (a file copied up in the tick it was written is racy, and its in-place edit is caught by
   re-hashing); the listing racy rule for directories (§4.5), which is about the listing's own read.
+- `rewitness` follows the same rule (fixed the same day, failing test first). It had recorded every witness not racy,
+  so a same-tick edit after a rewitness was caught only by a later fingerprint change.
 - Owed, reported: a racy witness stays racy even after a re-hash at a time past its tick has confirmed it, so a
-  genuinely racy large file (a coarse-granularity filesystem) still hashes whole on every drift check; and `rewitness`
-  records every witness not racy, so a same-tick edit after a rewitness is caught only by a later fingerprint change.
+  genuinely racy large file (a coarse-granularity filesystem) still hashes whole on every drift check.
 
 ### A-161 — A Shards microVM's fs device is served by the daemon over an anonymous stream (accepted 2026-10-24)
 Applied in the same change to:

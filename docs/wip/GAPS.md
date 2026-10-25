@@ -11211,8 +11211,9 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   - `verify_current` (§4.15's digest) re-points an untouched inode to another file found at its name, where A-151
     detaches the inode and gives the name a new one; no test reaches this path (`digest_begin` has none). Its backings
     are marked stale there, in case it runs.
-  - `rewitness` records every witness `racy: false`, so a same-tick edit after it is caught only by a later fingerprint
-    change (correctness on a coarse-granularity filesystem).
+  - `rewitness` recorded every witness `racy: false`, so a same-tick edit after it was caught only by a later
+    fingerprint change (correctness on a coarse-granularity filesystem). **Fixed 2026-10-24**, failing test first: a
+    re-witness asks the host's clock as a copy-up does (A-162).
   - A racy witness never settles: after a re-hash past its tick confirms it, the fingerprint alone would do, but every
     drift check of it still hashes the whole file.
 - **Open, found by the new tests: a read-only attachment is not a read-only file system to its client.** On every FUSE

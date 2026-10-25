@@ -3591,12 +3591,17 @@ impl Overlay<'_> {
       let (dir, name) = self.home_of(store, no)?;
       let file = self.host.open_file(dir, &name).map_err(host_refusal)?;
       let fp = self.host.fstat(file).map_err(host_refusal)?;
+      // The racy rule as at a copy-up (§4.5, A-162): the host's clock after this `fstat` says whether the file's tick is
+      // still open, and a later edit inside it could leave the fingerprint unchanged. Until 2026-10-24 every re-witness
+      // was recorded not racy, and such an edit went unseen.
+      let granularity = i64::try_from(self.granularity()).unwrap_or(i64::MAX);
+      let racy = self.host.now_ns().saturating_sub(fp.mtime_ns) <= granularity;
       let bytes = self.read_whole(file, fp.size)?;
       let witness = Witness {
         fingerprint: fp,
         identity: *blake3::hash(&bytes).as_bytes(),
         witnessed_at: self.vol.clock.monotonic_ns(),
-        racy: false,
+        racy,
       };
       let at = self.vol.witness_clock();
       let plane = self.plane()?;

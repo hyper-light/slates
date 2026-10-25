@@ -803,6 +803,55 @@ fn a_witness_taken_after_an_edit_made_since_the_listing_is_racy_only_while_the_e
   );
 }
 
+/// The racy rule (§4.5) holds for a re-witness too (A-162's sibling). Do: on a filesystem of one-second timestamps,
+/// witness a file, drift it, and `rewitness` it in the same tick its drift was written; then edit it in place again,
+/// same size and same timestamps. Expect the re-witness racy, so the second edit is caught by re-hashing and reported as
+/// drift. Until 2026-10-24 `rewitness` recorded every witness not racy, and an edit inside its tick went unseen.
+#[test]
+fn a_rewitness_inside_the_files_tick_is_racy_and_a_same_tick_edit_is_caught() {
+  let mut host = SimHost::new();
+  host.set_granularity_ns(1_000_000_000);
+  host.replace_file("/notes.txt", b"version one");
+  host.advance_ns(2_000_000_000);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  let f = vol
+    .with_host(&mut host)
+    .resolve(&mut store, "/notes.txt")
+    .unwrap()
+    .inode;
+  vol
+    .with_host(&mut host)
+    .chmod(&mut store, f, 0o600)
+    .unwrap();
+  host.write_in_place("/notes.txt", b"version two", 1_000);
+  assert!(
+    !vol
+      .with_host(&mut host)
+      .status(&mut store)
+      .unwrap()
+      .drift
+      .is_empty(),
+    "the edit drifts the witness"
+  );
+  vol
+    .with_host(&mut host)
+    .rewitness(&mut store, None)
+    .unwrap();
+  assert!(
+    vol.base_plane().unwrap().witness(f).unwrap().racy,
+    "re-witnessed in the tick its file was last written"
+  );
+  // Same size, same timestamps: only the bytes differ, as a second write inside the tick leaves them.
+  let witnessed = vol.base_plane().unwrap().witness(f).unwrap().fingerprint;
+  host.write_in_place("/notes.txt", b"version 333", 0);
+  assert_eq!(host.fingerprint("/notes.txt").unwrap(), witnessed);
+  assert_eq!(
+    vol.with_host(&mut host).status(&mut store).unwrap().drift,
+    vec![("/notes.txt".to_owned(), DriftKind::Modified)]
+  );
+}
+
 /// T-1.12: `rm -r` of a 40k-entry base directory then recreate two files inside; expect one
 /// opaque directory over the whiteout, two overlay entries, and a merged listing of exactly two.
 #[test]
