@@ -3361,7 +3361,8 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 - a DAX window's descriptor ask is answered with a descriptor of one shared-memory object per attachment and file,
   holding only that file's bytes (A-163). The store names the file by its volume's own prefix and its inode number
   together, since a clone, and a snapshot a device presents, shares its origin's numbers (A-166). The object is sized
-  once to `2^63 − 2 MiB` and never resized, filled from the volume a
+  once to `2^63 − 2 MiB` and never resized. Every range an ask touches is kept equal from then on, past the file's end
+  too, since a guest maps by a size another path may have cut (A-167). It is filled from the volume a
   range at a time as asked, every change of the file through any path written into it before the change returns, and
   the guest's stores written back at its FSYNC, FLUSH, RELEASE and FORGET and the stream's end. So there is no revoke
   and no message to the device; the stream offers per-inode DAX (`FUSE_HAS_INODE_DAX`, `FUSE_ATTR_DAX` on files of a
@@ -12097,6 +12098,21 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
+
+### A-167 — A range a guest maps past a file's end is kept equal like any other (accepted 2026-10-25)
+Applied in the same change to: §4.6 (the Shards stream's DAX bullet), `crates/bridge-core/src/dax_backing.rs`
+(`covered` and the module's account of an ask), the test `a_range_asked_past_the_files_end_takes_a_later_write_into_it`
+in `crates/bridge-core/tests/dax_backing.rs` (new), GAPS,
+`docs/bugs/2026-10-25-a-range-mapped-past-the-files-end-missed-later-writes.md`.
+- Changes A-163's fill: an asked range covers every range it touches, past the file's end too, where the fill copies
+  nothing. Before, an asked range was clipped to the file's size, so a range wholly past the end was never marked
+  filled and write-through passed it by.
+- Why: a Linux guest maps the 2 MiB range holding the offset it touches by its own idea of the size (`fs/fuse/dax.c`,
+  `fuse_iomap_begin` declines only at `pos >= i_size`), which another path's cut makes stale. Such a guest then read
+  zeros through its map after a later write into the range, for as long as it held the mapping, since it never asks
+  again for a range it holds. Proven by the test above, which failed before the change.
+- Cost: such a range counts against the fill budget like any filled range, which is what a guest can store into.
+- Unchanged: a whole-file ask; the ingest, which compares only up to the file's end; the 25 Shards tests.
 
 ### A-166 — A DAX backing names its file by volume and inode number together (accepted 2026-10-25)
 Applied in the same change to: §4.6 (the Shards stream's DAX bullet), `crates/vfs/src/shards_backing.rs` (the registry

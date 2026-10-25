@@ -11282,6 +11282,14 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   the other's guest's map. Exposure was the Shards route (A-163) on a volume with a clone in the same shard. Backings are
   now keyed by the volume's own prefix and the number together; `a_change_of_a_clone_never_reaches_a_backing_of_its_
   origin` failed before the fix and passes after, and the 25 Shards tests pass unchanged.
+- **Fixed 2026-10-25 (A-167): a range a guest maps past a file's end missed later writes into it.**
+  `docs/bugs/2026-10-25-a-range-mapped-past-the-files-end-missed-later-writes.md`. The fill clipped an asked range to the
+  file's size, so a guest whose size was stale (another path cut the file) mapped a range write-through never reached,
+  and read zeros there after a later extension. `covered` now covers every range an ask touches;
+  `a_range_asked_past_the_files_end_takes_a_later_write_into_it` failed before and passes after.
+- **Open, observed while reading (owed a test with an injected refusal):** a fill refused part-way unmarks its range
+  but leaves the pages it stored in the object, and a later fill of the range skips what the volume then holds as holes
+  or zeros, so those pages could reach a guest's map.
 - **Open, reported by A-166's sibling sweep (each from reading; each to be proven by a test before a change):**
   - write-log replay (`verbs::replay_one`) routes a logged FUSE write by its inode number's prefix, which for a clone's
     inherited file is its origin's: a replayed write would land in the origin;

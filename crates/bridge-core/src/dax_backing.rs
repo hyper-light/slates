@@ -26,6 +26,9 @@
 //!   outsider's edit for the guest's store.
 //! - The node's backing, made on its first ask, has the asked ranges filled from the volume a slice at a time. Holes
 //!   are skipped (`SEEK_DATA`), and a page the volume holds as zeros is not copied, since an untouched page reads zero.
+//! - Every range an ask touches is filled, past the file's end too, where the fill copies nothing. A guest maps by its
+//!   own idea of the file's size, and after another path cuts the file that idea is stale; the range it maps must still
+//!   take a later write into it (`docs/bugs/2026-10-25-a-range-mapped-past-the-files-end-missed-later-writes.md`).
 //! - A range is marked filled when its fill starts, so a change written through meanwhile lands on it and the rest of
 //!   the fill reads the volume as changed.
 //! - The fill done, the answer is a new descriptor of the backing's object. Every ask of the node is answered with the
@@ -264,12 +267,14 @@ fn charge_of(backing: &ShardsBacking) -> u64 {
     .saturating_mul(DAX_RANGE_BYTES)
 }
 
-/// The ranges a fill covers, by index, first and last: the asked range's, or the whole file's, within the file. A first
-/// past the last covers nothing.
+/// The ranges a fill covers, by index, first and last. An asked range covers every range it touches, past the file's end
+/// too: a guest maps by its own idea of the file's size, which another path's cut makes stale, and a range it maps must
+/// take every later change, an extension into it included. Without a range, the whole file's. A first past the last
+/// covers nothing.
 #[must_use]
 pub fn covered(range: Option<(u64, u64)>, size: u64) -> (u64, u64) {
   let (from, to) = match range {
-    Some((offset, len)) => (offset, offset.saturating_add(len).min(size)),
+    Some((offset, len)) => (offset, offset.saturating_add(len)),
     None => (0, size),
   };
   if to <= from {
@@ -369,8 +374,8 @@ impl DaxBackingSession {
   }
 
   /// Takes `ask`: checks it, makes the node's backing if it has none, and leaves its fill pending, run by
-  /// [`DaxBackingSession::fill_step`]. A refusal leaves nothing pending.
-  pub fn ask(&mut self, bridge: &mut dyn Bridge, cx: &OpContext, ask: Ask) -> Result<(), Refused> {
+  /// [`DaxBackingSession::fill_step`]: the inode the node resolved to. A refusal leaves nothing pending.
+  pub fn ask(&mut self, bridge: &mut dyn Bridge, cx: &OpContext, ask: Ask) -> Result<u64, Refused> {
     if let Some((offset, len)) = ask.range
       && offset.saturating_add(len) > DAX_OBJECT_BYTES
     {
@@ -429,7 +434,7 @@ impl DaxBackingSession {
       progress: 0,
       range_charge: 0,
     });
-    Ok(())
+    Ok(inode)
   }
 
   /// One slice of the pending fill, of at most `slice_bytes`. When the fill is done, the answer is a new descriptor of
@@ -1100,11 +1105,12 @@ fn store_pages(
 mod tests {
   use super::*;
 
-  /// Do: compute the ranges a fill covers for asks with and without a range, at and past a file's end. Expect the
-  /// asked range's indexes within the file, the whole file's without one, and nothing past the end or for an empty
-  /// file. Serves Shards part 3, step 2.
+  /// Do: compute the ranges a fill covers for asks with and without a range, within, across and past a file's end.
+  /// Expect every range an asked range touches, past the end too; the whole file's without one; and nothing for an empty
+  /// ask or an empty file's whole. Serves Shards part 3, step 2, and the past-the-end rule
+  /// (`docs/bugs/2026-10-25-a-range-mapped-past-the-files-end-missed-later-writes.md`).
   #[test]
-  fn a_fill_covers_the_asked_ranges_within_the_file() {
+  fn a_fill_covers_every_range_an_ask_touches_and_a_whole_file_ask_the_file() {
     let range = DAX_RANGE_BYTES;
     assert_eq!(covered(None, 5 * range), (0, 4));
     assert_eq!(covered(None, 5 * range + 1), (0, 5));
@@ -1112,11 +1118,16 @@ mod tests {
     assert_eq!(covered(Some((2 * range, 3 * range)), 10 * range), (2, 4));
     assert_eq!(
       covered(Some((2 * range, 3 * range)), 3 * range),
-      (2, 2),
-      "clipped at the file's end"
+      (2, 4),
+      "a range across the file's end covers its ranges past it"
     );
-    let (first, last) = covered(Some((4 * range, range)), 3 * range);
-    assert!(first > last, "a range past the end covers nothing");
+    assert_eq!(
+      covered(Some((4 * range, range)), 3 * range),
+      (4, 4),
+      "a range wholly past the end is covered: a guest with a stale size maps it"
+    );
+    let (first, last) = covered(Some((4 * range, 0)), 10 * range);
+    assert!(first > last, "an empty ask covers nothing");
     let (first, last) = covered(None, 0);
     assert!(first > last, "an empty file covers nothing");
   }
