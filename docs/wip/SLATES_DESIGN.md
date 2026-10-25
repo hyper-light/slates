@@ -2899,6 +2899,15 @@ same-namespace host process is the first delivered case.
 > dax-map count yet for a reap count-assertion test — both owed); and the macOS control socket (macOS carries
 > refusing `send_mapping`/`recv_mapping` stubs, so it reads by copy).
 
+> **Status (the DAX matrix, A-164, 2026-10-24).** What DAX means in each environment, and which of its 52 cells
+> (each environment on each platform, by the mount route and the socket route) are proven, owed or ruled out by the
+> platform, is the matrix in `docs/wip/virtiofs.md` §8.
+> - **Proven:** a host process's shared map through the Linux FUSE mount; the same-kernel direct map on Linux x86_64
+>   (A-135); crosvm over a slates mount (Linux x86_64); a Shards guest over the daemon's stream (macOS arm64, A-163).
+> - **Ruled out by the platforms:** QEMU's vhost-user-fs and Cloud Hypervisor have no DAX window, so neither has Kata;
+>   crosvm's window is x86_64-only; Apple's Virtualization framework and WSL2 document none (unconfirmed).
+> - **Owed:** every other cell, each to a named goal.
+
 > **Status (DAX gate, 2026-10-12).** Mapping isolation, pinning and teardown are **built in the VFS** and proven by
 > use (`crates/vfs/src/dax.rs`, `crates/vfs/tests/dax.rs`, 21 tests; `crates/mem/src/arena.rs` pin set, 6 tests,
 > Miri-clean; recovery oracle 39/0). **Pinning:** a mapped block is pinned in the arena
@@ -12085,6 +12094,45 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
+
+### A-164 — What DAX means in each environment, and the cells the platforms rule out (accepted 2026-10-24)
+Applied in the same change to: `docs/wip/virtiofs.md` §8 (the DAX matrix, which replaces the route table's DAX column),
+§4.6 (its DAX status), GAPS. The evidence is kiln research 01a17143717a7556a52f40f1d5a0e1b2 (19 findings, each graded
+from its sources) and 01a171494952772991b9bc668b5d89f0 (the 10 the matrix rests on).
+- **The definition.** DAX is a consumer reading and writing a file's bytes in place, through memory mapped onto them and
+  coherent with every other path, rather than copying them through a read or a write call. What maps them depends on
+  the environment:
+  - **a VM or microVM** (QEMU, crosvm, Kata, Firecracker, a Shards microVM): the guest maps host bytes through its
+    device's DAX window (virtio-fs) or a pmem device, with no guest page cache between;
+  - **no VM** (bare metal, a Docker or OCI container, a Kubernetes pod on runc): a process maps the file;
+  - **a Kubernetes VM runtime** (Kata): as a VM.
+- **The two routes** (Ada, 2026-10-22), each defined per environment in the matrix:
+  - **the mount route:** the volume mounted on the host (FUSE on Linux, NFS on macOS, WinFsp on Windows), shared in by
+    the environment's own mechanism with its own DAX. With no VM, the host kernel's cache holds the pages a process's
+    map reaches;
+  - **the socket route:** slates' own device or descriptor, reached over a socket (A-161's handoff; socket files allowed
+    when what crosses them is encrypted end to end and at rest). With no VM, a same-kernel process maps slates' own
+    memory with no copy (A-135).
+- **Ruled out by the platforms**, each on the platform's own source:
+  - upstream QEMU's vhost-user-fs device has no DAX window property. The window is the front end's to offer, so a QEMU
+    guest, and Kata on upstream QEMU, has no virtio-fs DAX on either route, slates' own device included;
+  - Cloud Hypervisor states that virtio-fs DAX is not available;
+  - crosvm offers DAX on x86_64 only;
+  - Apple's Virtualization framework documents no DAX window for its virtio-fs device, so Docker Desktop's containers on
+    macOS map through the VM's cache (unconfirmed: the evidence is documentation that says nothing);
+  - WSL2 reaches Windows files over 9P, which has no window (unconfirmed: search summaries only).
+- **Possible and owed**, each a goal in the stack:
+  - Firecracker by virtio-pmem over the image file (1.14 and later). The guest mounts the ext2 image with the ext4
+    driver, since ext2's own DAX has been removed from Linux;
+  - VMs attaching slates' own device out of process (crosvm on Linux x86_64);
+  - the no-copy direct map on macOS and Windows;
+  - the mount route's maps on each platform, in a container and in a pod;
+  - Shards' own window over the macOS mount.
+- **Proven so far:** crosvm over a slates mount (Linux x86_64, 4 of 4); a Shards guest over the daemon's stream (macOS
+  arm64, 3 of 3 twice, A-163); the same-kernel direct map (Linux x86_64, A-135).
+- **Why this definition.** A DAX that meant only virtio-fs's window would leave the goal's environments without a VM
+  without a meaning. One that meant any `mmap` would count a copy into a guest's page cache as DAX. What the VMs and
+  microVMs share with bare metal is the consumer mapping the bytes in place, coherently, and that is the definition.
 
 ### A-163 — A Shards guest maps a file from a copy slates keeps equal to the volume (accepted 2026-10-24)
 Applied across 1675dc0c, ba0f8ef0, b3a3a07c, 8f0e1b2b and 2d2cee52, and in the same change to: §4.6 (the Shards stream's

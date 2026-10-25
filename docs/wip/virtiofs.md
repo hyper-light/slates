@@ -249,10 +249,89 @@ box shared with two other builds — timings are not benchmarks)
    | target | how it reaches the volume | DAX |
    |---|---|---|
    | bare metal | the host mount | slates' own: a read-only map of slates' memory handed to a program (A-135, built) |
-   | OCI (Docker, Kubernetes on runc) | the host mount bound into the container (A-28, proven 2026-10-19) | not applicable: no VM, the host kernel serves reads |
+   | OCI (Docker, Kubernetes on runc) | the host mount bound into the container (A-28, proven 2026-10-19) | a process in the container maps the file, through the bound mount or by A-135's direct map: the DAX matrix below (A-164) |
    | Shards | the host mount shared with `VOLUME … FOR`; or the daemon's own stream, handed out by `slates shards` (A-161) | over the mount, Shards' DAX window (D189, `crates/vmm/src/devices/virtio/fs/mod.rs` on `gpu`, read 2026-10-21) maps the host file; over the stream, it maps a per-attachment copy of the file that slates keeps equal to the volume (A-163, a real guest 3 of 3 on this Mac, 2026-10-24) |
    | QEMU, crosvm, Kubernetes on VM runtimes (Kata) | the host mount shared by virtio-fs (virtiofsd or the VMM's own device) | the sharer's DAX window maps the host file |
    | Firecracker | **no folder sharing at all** — no virtio-fs (its README, read 2026-10-21) — so a volume reaches it as a disk-image file: `slates image build` writes a snapshot as ext2 into an image volume, the guest's drive is that file through a slates mount, and `slates image merge` reads the guest's image back into a clone (A-160; built and proven by a real Firecracker v1.17.0 run, 2026-10-24) | pmem would map the image file; not yet run (the proven drive is virtio-blk) |
+
+   **The DAX matrix (A-164, 2026-10-24).** What DAX means in each environment is A-164's: a consumer reading and
+   writing a file's bytes in place, through mapped memory, coherent with every other path. Each cell below is one of:
+   - **proven:** the run or gated test is named;
+   - **owed:** the goal that owns it is named (legend after the tables);
+   - **impossible:** the platform's own source is cited (kiln research 01a17143717a7556a52f40f1d5a0e1b2);
+   - **none:** the environment does not run on that platform.
+
+   *Bare metal: a process on the host maps the file.*
+
+   | platform | mount route (the host kernel's cache) | socket route (no copy, A-135) |
+   |---|---|---|
+   | Linux x86_64 | proven: `crates/cli/tests/cli.rs` `a_shared_map_through_a_mount_writes_back_and_follows_another_paths_change`, and the generated histories of `crates/bridge-fuse/tests/coherence_mount.rs` (CI's Linux lane) | proven: `a_same_kernel_client_maps_a_file_with_no_copy` (A-135) |
+   | Linux arm64 | owed: G-arm64-host | owed: G-arm64-host |
+   | macOS arm64 | owed: G-mount (read-only maps over NFS); writable shared maps: G-nfs-writable | owed: G-direct |
+   | Windows x86_64 | owed: G-mount (WinFsp) | owed: G-direct (handle duplication) |
+   | Windows arm64 | owed: G-mount (WinFsp) | owed: G-direct (handle duplication) |
+
+   *VMs: the guest maps through its device's DAX window.*
+
+   | VMM, platform | mount route | socket route (slates' own device) |
+   |---|---|---|
+   | crosvm, Linux x86_64 | proven: `crates/cli/tests/guest_dax.rs` (4 of 4 on the box, gated) | owed: G-vhost |
+   | crosvm, Linux arm64 | impossible: crosvm offers DAX on x86_64 only (GAPS, 2026-10-22) | impossible: the same window |
+   | QEMU, and Kata on QEMU, any platform | impossible: upstream `hw/virtio/vhost-user-fs.c` has no window property | impossible: the window is the front end's to offer |
+   | Cloud Hypervisor, and Kata on it | impossible: "it is not available in Cloud Hypervisor" (its `docs/fs.md`) | impossible: the same |
+   | Apple's Virtualization framework, macOS | impossible (unconfirmed): its virtio-fs device documents no window | impossible: it offers no vhost-user device |
+   | Hyper-V and WSL2, Windows | impossible (unconfirmed): WSL2 reaches Windows files over 9P | impossible: no vhost-user device |
+
+   *microVMs (Firecracker, which runs on Linux KVM only).*
+
+   | platform | mount route (pmem over the image file, A-160) | socket route |
+   |---|---|---|
+   | Linux x86_64 | owed: G-pmem | impossible: Firecracker has no virtio-fs or vhost-user-fs device |
+   | Linux arm64 | owed: G-arm64-guest (Firecracker's pmem doc covers DAX on aarch64) | impossible: the same |
+   | macOS, Windows | none: Firecracker runs on Linux KVM only | none |
+
+   *Shards microVMs.*
+
+   | platform | mount route (Shards' own window over a host mount) | socket route (the daemon's stream, A-161, A-163) |
+   |---|---|---|
+   | macOS arm64 | owed: G-shards-mount; writable shared maps: G-nfs-writable | proven: Shards' `a_microvm_maps_a_slates_file_with_dax_and_each_side_sees_the_others_writes`, 3 of 3 twice (GAPS, 2026-10-24) |
+   | Linux x86_64 | owed: G-shards-linux | owed: G-shards-linux |
+   | Linux arm64 | owed: G-arm64-guest | owed: G-arm64-guest |
+   | Windows x86_64, arm64 | owed: G-shards-windows | owed: G-shards-windows (refused `DescriptorRouteNotBuilt` today) |
+
+   *Docker and OCI containers.*
+
+   | platform | mount route (the host mount bound in) | socket route (A-135 from inside the container) |
+   |---|---|---|
+   | Linux x86_64 | owed: G-mount (the bound mount reads and writes, A-28; a map inside the container not yet run) | owed: G-container-direct |
+   | Linux arm64 | owed: G-arm64-host | owed: G-arm64-host |
+   | macOS arm64 (Docker Desktop) | impossible (unconfirmed): VirtioFS on the Virtualization framework documents no window | impossible: the container runs in a VM, not on the daemon's kernel |
+   | Windows (Docker Desktop on WSL2) | impossible (unconfirmed): 9P | impossible: the container runs in a VM |
+   | Windows process-isolated containers | owed: G-mount (a WinFsp mount bound in) | owed: G-direct (handle duplication) |
+
+   *Kubernetes.*
+
+   | runtime, platform | mount route | socket route |
+   |---|---|---|
+   | pods on runc, Linux x86_64 (the KIND lane) | owed: G-mount | owed: G-container-direct |
+   | pods on runc, Linux arm64 | owed: G-arm64-host | owed: G-arm64-host |
+   | Kata (VM pods), any platform | impossible: QEMU and Cloud Hypervisor offer no window (above) | impossible: the same |
+
+   The goals, in kiln (agent 01a14885):
+   - G-pmem `01a1714948f072bca869043c7b0e74f4`;
+   - G-vhost `01a1714948f072bca869043d7693e23d`;
+   - G-direct `01a1714948f072bca869043e164295f2`;
+   - G-mount `01a1714948f072bca869043ffdf02ff9`;
+   - G-shards-mount `01a1714948f072bca8690440193d7e16`;
+   - G-shards-linux `01a1714e342e7243885a3dceaa6ed646`;
+   - G-shards-windows `01a1714e342e7243885a3dcfa07cfe5e`;
+   - G-container-direct `01a1714e342e7243885a3dd09bc0bb19`;
+   - G-arm64-host `01a1714e342e7243885a3dd1d0da43a0`;
+   - G-arm64-guest `01a16633113d7017b533c990c3b36511`;
+   - G-nfs-writable `01a16633113d7017b533c99240a0981e`.
+
+   A cell marked unconfirmed rests on documentation that says nothing, or on search summaries; it is re-judged the
+   first time a primary source or a run says otherwise.
 
    **What the mount route costs, stated so it is weighed honestly:** every uncached operation crosses two
    filesystems on the host instead of one; DAX maps the host kernel's cached copy of a file rather than slates'

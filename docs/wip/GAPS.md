@@ -11216,6 +11216,31 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     re-witness asks the host's clock as a copy-up does (A-162).
   - A racy witness never settles: after a re-hash past its tick confirms it, the fingerprint alone would do, but every
     drift check of it still hashes the whole file.
+- **The DAX matrix (A-164, 2026-10-24): every cell of "DAX everywhere" is proven, owed to a goal, or ruled out by its
+  platform.** The matrix is in `virtiofs.md` §8: six environments, each platform a row, two routes, 52 cells, none left
+  unknown. The research behind it is kiln 01a17143717a7556a52f40f1d5a0e1b2 (19 findings, graded from their sources).
+  - **Proven (4 cells):**
+    - bare-metal Linux x86_64 by both routes: the FUSE mount's shared maps, and the A-135 direct map;
+    - crosvm on Linux x86_64 by the mount route;
+    - a Shards guest on macOS arm64 by the socket route.
+  - **Ruled out:**
+    - QEMU and Kata on it: upstream vhost-user-fs has no window property;
+    - Cloud Hypervisor: "it is not available";
+    - crosvm on arm64: DAX is x86_64-only;
+    - Docker Desktop on macOS, and Apple's framework: no documented window (unconfirmed);
+    - WSL2: 9P (unconfirmed);
+    - Firecracker's socket route: it has no fs device.
+  - **Owed, each to a kiln goal:**
+    - Firecracker by pmem over the image file;
+    - VMs on slates' own device (crosvm, Linux);
+    - the direct map on macOS and Windows;
+    - the mount route's maps on macOS, Windows and in containers and pods;
+    - Shards' own window over the macOS mount;
+    - Shards on Linux KVM and on Windows;
+    - the direct map inside a Linux container;
+    - arm64 Linux hosts;
+    - arm64 Linux guests;
+    - macOS writable shared maps over NFS.
 - **Open, found by the new tests: a read-only attachment is not a read-only file system to its client.** On every FUSE
   transport (the shared bridge) an open for writing is granted and each write through it refused `EPERM`; NFS answers
   `PERM`. A read-only file system answers `EROFS`, at the open for an open. Every change is refused and nothing lands,
