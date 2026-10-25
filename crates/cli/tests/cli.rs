@@ -6639,6 +6639,8 @@ fn slates_mount_subtree_presents_one_directory_of_the_volume() {
 /// have done exactly that. The map itself is unmapped in `Drop::drop`, which runs before any field drops.
 struct MappedThroughAMount {
   map: *mut u8,
+  /// How the map was made: shared and writable, or read alone.
+  access: MapAccess,
   /// The system's page size: the unit `msync` aligns to.
   page: usize,
   /// The file's length and the map's: a whole number of pages.
@@ -6671,8 +6673,25 @@ impl MappedThroughAMount {
   }
 
   /// As [`MappedThroughAMount::with_pages`], on a volume bounded to `quota` (as `volume create --bounded` takes it).
-  #[allow(clippy::disallowed_methods)] // the test's own calls through the slates mount: RAM, not disk
   fn with_quota(tag: &str, seed: u8, pages: usize, quota: &str) -> MappedThroughAMount {
+    MappedThroughAMount::with_access(tag, (seed, pages, quota), MapAccess::Shared)
+  }
+
+  /// As [`MappedThroughAMount::new`], with `map.bin` opened for reading alone and mapped `PROT_READ`: what a program
+  /// that only reads a file through a mount holds (G-mount; the matrix's macOS mount-route cell is read-only maps,
+  /// since a writable shared map over NFS v3 is G-nfs-writable's question). Read it with
+  /// [`MappedThroughAMount::seen`]; [`MappedThroughAMount::view`] refuses it.
+  fn read_only(tag: &str, seed: u8) -> MappedThroughAMount {
+    MappedThroughAMount::with_access(tag, (seed, 1, "8MiB"), MapAccess::ReadOnly)
+  }
+
+  /// The fixture with `map.bin` `pages` pages of `seed` on a volume bounded to `quota`, mapped with `access`.
+  #[allow(clippy::disallowed_methods)] // the test's own calls through the slates mount: RAM, not disk
+  fn with_access(
+    tag: &str,
+    (seed, pages, quota): (u8, usize, &str),
+    access: MapAccess,
+  ) -> MappedThroughAMount {
     use std::os::fd::AsFd;
     let instance = format!("cli-{tag}-{}", std::process::id());
     let anchor = start_anchor(&instance);
@@ -6707,16 +6726,21 @@ impl MappedThroughAMount {
     assert_eq!(code, 0, "slates mount: {err}");
     let file = std::fs::OpenOptions::new()
       .read(true)
-      .write(true)
+      .write(access == MapAccess::Shared)
       .open(format!("{}/map.bin", point.path))
       .unwrap();
+    let protection = match access {
+      MapAccess::Shared => rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE,
+      MapAccess::ReadOnly => rustix::mm::ProtFlags::READ,
+    };
     // SAFETY: a fresh shared map of `length` bytes of an open file this fixture holds, at an address the kernel
-    // chooses; nothing else maps it, and `Drop` unmaps it before the file is closed and the mount removed.
+    // chooses, writable only when the file was opened for writing; nothing else maps it, and `Drop` unmaps it before
+    // the file is closed and the mount removed.
     let map = unsafe {
       rustix::mm::mmap(
         std::ptr::null_mut(),
         length,
-        rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE,
+        protection,
         rustix::mm::MapFlags::SHARED,
         file.as_fd(),
         0,
@@ -6726,6 +6750,7 @@ impl MappedThroughAMount {
     .cast::<u8>();
     MappedThroughAMount {
       map,
+      access,
       page,
       length,
       file,
@@ -6739,10 +6764,30 @@ impl MappedThroughAMount {
     }
   }
 
-  /// The mapped file.
+  /// The mapped file, to write through. A read-only map has no writable view: the kernel would refuse the first store
+  /// with a fault, so a test that asks for one fails here instead.
   fn view(&mut self) -> &mut [u8] {
-    // SAFETY: `map` is `length` readable and writable bytes, mapped in `with_pages` and unmapped only in `Drop`.
+    assert_eq!(
+      self.access,
+      MapAccess::Shared,
+      "a read-only map is read with `seen`"
+    );
+    // SAFETY: `map` is `length` readable and writable bytes (a shared, writable map, just checked), mapped in
+    // `with_access` and unmapped only in `Drop`.
     unsafe { std::slice::from_raw_parts_mut(self.map, self.length) }
+  }
+
+  /// The mapped file as it reads now, read-only map or writable: a copy taken a byte at a time with volatile loads,
+  /// since the kernel replaces the map's pages when another path changes the file, and a slice held over memory that
+  /// changes under it is not sound.
+  fn seen(&self) -> Vec<u8> {
+    (0..self.length)
+      .map(|offset| {
+        // SAFETY: `map` is `length` readable bytes, mapped in `with_access` and unmapped only in `Drop`, and `offset`
+        // is below `length`; a volatile load of one byte holds no reference across the kernel's page replacement.
+        unsafe { std::ptr::read_volatile(self.map.add(offset)) }
+      })
+      .collect()
   }
 
   /// Replaces `map.bin` with `fill` through slates itself — the fixture's SDK client, under another attachment than
@@ -6817,7 +6862,7 @@ impl MappedThroughAMount {
       if !cfg!(target_os = "linux") {
         let _ = rustix::fs::fstat(&self.file);
       }
-      if self.view() == expected {
+      if self.seen() == expected {
         return true;
       }
       pause();
@@ -6941,6 +6986,49 @@ fn a_shared_map_through_a_mount_writes_back_and_follows_another_paths_change() {
   assert!(
     fixture.follows(b'C'),
     "the replacement reached the map within {WAIT_FOR:?}"
+  );
+}
+
+/// How [`MappedThroughAMount`] maps its file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MapAccess {
+  /// Opened for reading and writing and mapped `PROT_READ | PROT_WRITE`, `MAP_SHARED`.
+  Shared,
+  /// Opened for reading alone and mapped `PROT_READ`, `MAP_SHARED`.
+  ReadOnly,
+}
+
+/// G-mount (§4.6; the DAX matrix's macOS mount-route cell, `docs/wip/virtiofs.md` §8): a program that maps a file
+/// read-only through a slates mount sees another path's changes. Do: map `map.bin` for reading alone (`PROT_READ`,
+/// `MAP_SHARED`) through a mount, read it, then replace it through another attachment [`MAP_CHANGES`] times with
+/// fills from a fixed-seed generator, reading the map after each. Expect the map to show every replacement within
+/// [`WAIT_FOR`]: on Linux as memory alone, since slates tells the FUSE mount of each change; on macOS after a `stat`,
+/// since an NFS v3 client revalidates only when asked, and Apple's client then takes the changed file's pages out of
+/// memory (`nfs_vinvalbuf2`'s `UBC_INVALIDATE`), so the next touch of the map reads the new bytes.
+#[test]
+fn a_read_only_map_through_a_mount_follows_another_paths_change() {
+  if !live_mount_runs() {
+    return;
+  }
+  let mut fixture = MappedThroughAMount::read_only("mapro", b'A');
+  assert!(
+    fixture.follows(b'A'),
+    "the read-only map reads the volume's bytes"
+  );
+  let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+  let mut missed = Vec::new();
+  for change in 0..MAP_CHANGES {
+    let fill = u8::try_from(xorshift(&mut state) % 255)
+      .unwrap_or(0)
+      .saturating_add(1);
+    fixture.replace_through_slates(fill);
+    if !fixture.follows(fill) {
+      missed.push((change, fill, fixture.seen().first().copied()));
+    }
+  }
+  assert!(
+    missed.is_empty(),
+    "the read-only map followed every replacement; missed (change, fill, the map's first byte): {missed:?}"
   );
 }
 

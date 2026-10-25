@@ -11477,8 +11477,13 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
 - **The DAX matrix (A-164, 2026-10-24): every cell of "DAX everywhere" is proven, owed to a goal, or ruled out by its
   platform.** The matrix is in `virtiofs.md` §8: six environments, each platform a row, two routes, 52 cells, none left
   unknown. The research behind it is kiln 01a17143717a7556a52f40f1d5a0e1b2 (19 findings, graded from their sources).
-  - **Proven (8 cells):**
-    - bare-metal Linux x86_64 by the mount route: the FUSE mount's shared maps;
+  - **Proven (9 cells):**
+    - bare-metal Linux x86_64 by the mount route: the FUSE mount's shared maps, and since 2026-10-25 a read-only map
+      too (`a_read_only_map_through_a_mount_follows_another_paths_change`, 16 replacements as memory alone, fedora);
+    - bare-metal macOS arm64 by the mount route, for read-only maps (G-mount step 1, 2026-10-25): the same test maps a
+      file read alone through the NFS mount and follows 16 replacements made through another attachment, each after a
+      `stat`, in 20.2 s on this Mac; red-checked with the server's file times frozen in a scratch copy (all 16 missed);
+      the plan and its research are kiln 01a1750c07637696b356e2e61103f2e2 (16 findings, graded);
     - bare-metal Linux x86_64 by the socket route: the direct map's sealed copy (A-171, 2026-10-25; the entry below);
     - bare-metal macOS arm64 by the socket route: the direct map's read-only copy over the daemon's socket route (A-173,
       2026-10-25; the entry below);
@@ -11501,7 +11506,8 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       **Corrected 2026-10-25:** this entry and the matrix
       had counted the A-135 direct map on Linux as proven while every run read by copy (its test reported the path
       and did not assert it); A-171 has proven it since, asserting the zero-copy path;
-    - the mount route's maps on macOS, Windows and in containers and pods;
+    - the mount route's maps on Windows and in containers and pods (G-mount steps 2 to 5; macOS's read-only maps proven
+      2026-10-25);
     - Shards' own window over the macOS mount;
     - Shards on Linux KVM and on Windows;
     - the direct map inside a Linux container;
