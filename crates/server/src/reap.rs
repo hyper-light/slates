@@ -14,6 +14,10 @@ use slates_wire::request::RequestId;
 
 use crate::state::{self, ClientSlot, ShardState};
 
+/// Counter: the direct maps' copies a dead client's reap gave back (§4.6, A-171), each kept until then by the client's
+/// own map of it.
+const DIRECT_MAPS_REAPED: &str = "dax.local_map_reaped";
+
 /// Finds dead clients and reserves their seats through owner cleanup. Failed cleanup is retried
 /// by the existing owned reaper task at its next cadence; no detached retirement task is created.
 pub(crate) async fn sweep(silence_ns: u64) -> usize {
@@ -163,8 +167,16 @@ fn finish(state: &mut ShardState, handle: Handle<ClientSlot>, client_id: u32) ->
   // Let go of the files' copies the client was handed by the direct map (§4.6, A-171): its map of each lives on in
   // its own process if the process does, no longer kept equal to the file, and each copy's bytes go back to the
   // backings' budget rather than staying charged for a client that is gone.
-  for backing in client.direct_maps.drain(..) {
-    let _released = state.store.shards_backings.remove(backing);
+  let reaped = client
+    .direct_maps
+    .drain(..)
+    .filter(|backing| state.store.shards_backings.remove(*backing).is_some())
+    .count();
+  if reaped > 0 {
+    state.count(
+      DIRECT_MAPS_REAPED,
+      u64::try_from(reaped).unwrap_or(u64::MAX),
+    );
   }
   state.read_ahead.credit(client.read_ahead_pending);
   crate::verbs::release_read_ahead(&mut state.read_ahead, &mut client);

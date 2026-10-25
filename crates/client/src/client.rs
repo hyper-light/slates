@@ -394,10 +394,14 @@ pub struct MappedRead {
 
 #[cfg(unix)]
 enum Mapped {
-  /// Zero-copy: a read-only view of the daemon's whole copy; the file was `file_len` bytes when it was mapped.
+  /// Zero-copy: a read-only view of the daemon's whole copy; the file was `file_len` bytes when it was mapped. The
+  /// copy is held for this client under `mapping_id` on `volume`'s owner until [`Client::release_map`] or the client's
+  /// end.
   Zero {
     view: slates_mem::PeerView,
     file_len: u64,
+    volume: VolumeId,
+    mapping_id: u64,
   },
   /// The daemon's bytes, read by the paged path.
   Copied(Vec<u8>),
@@ -409,7 +413,7 @@ impl MappedRead {
   #[must_use]
   pub fn len(&self) -> u64 {
     match &self.inner {
-      Mapped::Zero { view, file_len } => (*file_len).min(view.len()),
+      Mapped::Zero { view, file_len, .. } => (*file_len).min(view.len()),
       Mapped::Copied(bytes) => u64::try_from(bytes.len()).unwrap_or(u64::MAX),
     }
   }
@@ -438,7 +442,9 @@ impl MappedRead {
       .saturating_sub(offset)
       .min(u64::try_from(into.len()).unwrap_or(u64::MAX));
     let count = usize::try_from(take).unwrap_or(0);
-    let Some(into) = into.get_mut(..count) else {
+    // Nothing to take (an empty buffer, or an offset at or past the map's end) reads nothing, as `pread` past a file's
+    // end does; the view would refuse a load that starts past it, even an empty one.
+    let Some(into) = into.get_mut(..count).filter(|into| !into.is_empty()) else {
       return Ok(0);
     };
     match &self.inner {
@@ -495,9 +501,11 @@ impl MappedRead {
     }
   }
 
-  /// Maps the delivered copy whole, read alone: `block_len` bytes, the size the daemon made it.
+  /// Maps the delivered copy whole, read alone: `block_len` bytes, the size the daemon made it, held under
+  /// `mapping_id` on `volume`'s owner.
   fn map(
     delivery: slates_ipc::rendezvous::MappingDelivery,
+    (volume, mapping_id): (VolumeId, u64),
     file_len: u64,
     block_len: u64,
   ) -> Result<MappedRead, ClientError> {
@@ -511,7 +519,12 @@ impl MappedRead {
       })
     })?;
     Ok(MappedRead {
-      inner: Mapped::Zero { view, file_len },
+      inner: Mapped::Zero {
+        view,
+        file_len,
+        volume,
+        mapping_id,
+      },
     })
   }
 }
@@ -965,8 +978,9 @@ impl Client {
   /// §4.6, A-171: maps a file's bytes with no copy per read where the daemon can hand this same-kernel client its copy
   /// of the file, else reads them by the paged path; either way [`MappedRead::read_at`] reads the file's bytes. The
   /// daemon fills a copy of the file, sealed against every writer but itself, and sends its descriptor over the control
-  /// socket before the reply; this maps it read alone. The daemon keeps the copy equal to the file until this client
-  /// goes, so the map is live within its length (an explicit release on drop is owed).
+  /// socket before the reply; this maps it read alone. The daemon keeps the copy equal to the file, so the map is live
+  /// within its length, until [`Client::release_map`] or this client's end; dropping the map unmaps this process's view
+  /// alone. Refused `MapShareExhausted`, nothing made, when this client holds its share of maps already.
   #[cfg(unix)]
   pub fn map_read(&mut self, volume: VolumeId, path: &str) -> Result<MappedRead, ClientError> {
     let reply = match self.call(&RequestBody::MapRead {
@@ -997,9 +1011,35 @@ impl Client {
         let ControlDelivery::Mapping(mapping) = delivered else {
           return Err(ClientError::UnexpectedReply { verb: "map_read" });
         };
-        MappedRead::map(mapping, file_len, block_len)
+        MappedRead::map(mapping, (volume, mapping_id), file_len, block_len)
       }
       _ => Err(ClientError::UnexpectedReply { verb: "map_read" }),
+    }
+  }
+
+  /// §4.6, A-171: lets go of a map, unmapping this process's view and then asking the daemon to let go of its copy,
+  /// which it then keeps equal to the file no more and whose bytes go back to the daemon's budget. A copied read holds
+  /// nothing on the daemon and returns at once. Until it is released, or this client ends, a map counts against the
+  /// client's share, and a `map_read` past the share is refused `MapShareExhausted`.
+  #[cfg(unix)]
+  pub fn release_map(&mut self, mapped: MappedRead) -> Result<(), ClientError> {
+    let MappedRead {
+      inner: Mapped::Zero {
+        view,
+        volume,
+        mapping_id,
+        ..
+      },
+    } = mapped
+    else {
+      return Ok(());
+    };
+    drop(view);
+    match self.call(&RequestBody::ReleaseMap { volume, mapping_id })? {
+      ReplyBody::MapReleased => Ok(()),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "release_map",
+      }),
     }
   }
 

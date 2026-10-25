@@ -1169,6 +1169,18 @@ impl Daemon {
       .collect()
   }
 
+  /// The same-kernel direct maps' copies this daemon holds, on every shard, and their bytes (§4.6, A-171): what a
+  /// release, a reap or a refused share leaves, for a test or an operator to hold to its starting value. An
+  /// observation the daemon could not make is its typed refusal.
+  pub fn direct_map_copies(&self) -> Result<(usize, u64), ObserveError> {
+    let mut held = (0usize, 0u64);
+    for shard in self.shards.iter().copied() {
+      let (copies, bytes) = self.observe(Some(shard), |s| s.store.shards_backings.peers_held())?;
+      held = (held.0.saturating_add(copies), held.1.saturating_add(bytes));
+    }
+    Ok(held)
+  }
+
   /// The hosts this daemon's fleet currently sees alive (§4.8) — this node and the peers its control-shard
   /// membership loop has probed and found live — for a test or an operator to observe the membership the
   /// verbs read for placement. An observation the daemon could not make is its typed refusal

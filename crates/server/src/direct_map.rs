@@ -31,10 +31,101 @@
 
 use std::collections::BTreeMap;
 
+use slates_ipc::protocol::{Refusal, ReplyBody};
+use slates_mem::Handle;
+use slates_vfs::shards_backing::ShardsBacking;
 use slates_wire::request::RequestId;
 
 use crate::merge_service::ReplyRoute;
 use crate::state::ShardState;
+use crate::verbs::refused;
+
+/// Format: the bits a copy's handle index is shifted by in its mapping id, above the handle's generation.
+const MAPPING_ID_INDEX_SHIFT: u32 = 32;
+
+/// Counter: a direct map its client released (`ReleaseMap`): the copy let go and its bytes given back.
+const RELEASED: &str = "dax.local_map_released";
+
+/// The mapping id a client names a copy by: its backing's handle, index above generation. Process-local, like every
+/// handle, so a client's maps end with its daemon's process (a restarted daemon's client holds none). Linux alone hands
+/// copies today.
+#[cfg(target_os = "linux")]
+fn mapping_id_of(backing: Handle<ShardsBacking>) -> u64 {
+  (u64::from(backing.index()) << MAPPING_ID_INDEX_SHIFT) | u64::from(backing.generation())
+}
+
+/// The backing a mapping id names; the slab refuses a stale one.
+fn backing_of(mapping_id: u64) -> Handle<ShardsBacking> {
+  let index = u32::try_from(mapping_id >> MAPPING_ID_INDEX_SHIFT).unwrap_or(u32::MAX);
+  let generation = u32::try_from(mapping_id & u64::from(u32::MAX)).unwrap_or(u32::MAX);
+  Handle::from_raw(index, generation)
+}
+
+/// A client's share of a shard's direct maps (§4.6, A-171): the shard's capacity — the copies it may hold and its fill
+/// budget's bytes — over the clients it serves now, so one client never takes every copy from the others. A lone
+/// client's share is the whole capacity; copies held already are never taken back, so a client that held more before
+/// others came maps nothing more until it is within its share again.
+// Pure, so tested on every host; only Linux hands a copy today (macOS's and Windows' routes are owed), so elsewhere
+// only the tests call it.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+pub(crate) fn share_of(
+  (most_copies, budget_bytes): (usize, u64),
+  clients_served: usize,
+) -> (usize, u64) {
+  let clients = clients_served.max(1);
+  (
+    most_copies.checked_div(clients).unwrap_or(0),
+    budget_bytes
+      .checked_div(u64::try_from(clients).unwrap_or(u64::MAX))
+      .unwrap_or(0),
+  )
+}
+
+/// Whether a client holding `(maps, bytes)` may take one more copy of `object_bytes` within its `share`; refused
+/// `MapShareExhausted` with the counts if not.
+// Pure, so tested on every host; only Linux hands a copy today (macOS's and Windows' routes are owed), so elsewhere
+// only the tests call it.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+pub(crate) fn within_share(
+  (held_maps, held_bytes): (usize, u64),
+  object_bytes: u64,
+  (most_maps, share_bytes): (usize, u64),
+) -> Result<(), Refusal> {
+  if held_maps >= most_maps || held_bytes.saturating_add(object_bytes) > share_bytes {
+    return Err(Refusal::MapShareExhausted {
+      held_maps: u64::try_from(held_maps).unwrap_or(u64::MAX),
+      most_maps: u64::try_from(most_maps).unwrap_or(u64::MAX),
+      held_bytes,
+      share_bytes,
+    });
+  }
+  Ok(())
+}
+
+/// `ReleaseMap` (§4.6, A-171): lets go of a direct map this client holds. The copy leaves the store's backings, so it
+/// is written through no more and its bytes go back to the fill budget; the client unmapped its own view first.
+/// `NotFound` for a map this client does not hold: another client's, one released already, or one from before a
+/// restart.
+pub(crate) fn release_map(state: &mut ShardState, client_id: u32, mapping_id: u64) -> ReplyBody {
+  let backing = backing_of(mapping_id);
+  let ShardState { clients, store, .. } = state;
+  let Some(client) = clients
+    .iter_mut_all()
+    .map(|(_, client)| client)
+    .find(|client| client.client_id == client_id && !client.retiring)
+  else {
+    return refused(Refusal::NotFound);
+  };
+  let Some(at) = client.direct_maps.iter().position(|held| *held == backing) else {
+    return refused(Refusal::NotFound);
+  };
+  client.direct_maps.swap_remove(at);
+  let released = store.shards_backings.remove(backing).is_some();
+  if released {
+    state.count(RELEASED, 1);
+  }
+  ReplyBody::MapReleased
+}
 
 /// The direct maps being filled on this shard (§4.6, A-171).
 #[derive(Default)]
@@ -106,8 +197,8 @@ mod linux {
   /// sealed or not the size it claims, which must never happen. Its client reads by copy.
   const UNCONFINED: &str = "dax.local_map_unconfined";
 
-  /// Format: the bits a copy's handle index is shifted by in its mapping id, above the handle's generation.
-  const MAPPING_ID_INDEX_SHIFT: u32 = 32;
+  /// Counter: a `MapRead` refused because its client holds its share of the direct maps already (`MapShareExhausted`).
+  const SHARE_REFUSED: &str = "dax.local_map_share_refused";
 
   /// `MapRead` (§4.6, A-171): checks the uid, the view, the volume, the right, the client's channel and the path at
   /// once, makes the file's copy, and defers the reply to the task that fills and hands it over. `MapUnavailable` for
@@ -155,6 +246,10 @@ mod linux {
         state.count(FELL_BACK, 1);
         refused(Refusal::MapUnavailable)
       }
+      Err(Begun::ShareExhausted(refusal)) => {
+        state.count(SHARE_REFUSED, 1);
+        refused(refusal)
+      }
     }
   }
 
@@ -168,6 +263,8 @@ mod linux {
     Unavailable,
     /// The copy could not be made: the budget, the backings' capacity or the OS refused it.
     FellBack,
+    /// The client holds its share of the direct maps already: the refusal that says so.
+    ShareExhausted(Refusal),
   }
 
   /// A direct map being filled: its copy, where the fill is, and what the hand-off and the reply need.
@@ -196,7 +293,8 @@ mod linux {
   }
 
   impl Fill {
-    /// Resolves the path, makes the file's copy and keeps it in the store's backings, nothing filled yet.
+    /// Resolves the path, checks the client's share, makes the file's copy and keeps it in the store's backings, held
+    /// on the client's slot from now on, so the share counts copies still being filled as well as those handed.
     fn begin(
       state: &mut ShardState,
       volume: Handle<VolumeSlot>,
@@ -204,15 +302,30 @@ mod linux {
       key: &str,
       request: (u64, RequestId),
     ) -> Result<Fill, Begun> {
-      let served_here = state.clients.iter_mut_all().any(|(_, client)| {
-        client.client_id == client_id && !client.retiring && client.control.is_some()
-      });
       let name = format!("slates-map-{}", state.config.instance);
-      let ShardState { volumes, store, .. } = state;
+      let most_copies = state.config.direct_maps_per_shard;
+      let ShardState {
+        volumes,
+        store,
+        clients,
+        ..
+      } = state;
+      let served = clients
+        .iter_mut_all()
+        .filter(|(_, client)| !client.retiring)
+        .count();
+      let share = super::share_of((most_copies, store.shards_backings.budget()), served);
+      // A client served by another shard cannot be handed a descriptor from this one yet.
+      let client = clients
+        .iter_mut_all()
+        .map(|(_, client)| client)
+        .find(|client| {
+          client.client_id == client_id && !client.retiring && client.control.is_some()
+        })
+        .ok_or(Begun::Unavailable)?;
       let slot = volumes.get(volume).map_err(|_| Begun::Unavailable)?;
-      // An overlay's untouched file follows the disk, which no write boundary sees; and a client served by another
-      // shard cannot be handed a descriptor from this one yet.
-      if slot.host.is_some() || !served_here {
+      // An overlay's untouched file follows the disk, which no write boundary sees.
+      if slot.host.is_some() {
         return Err(Begun::Unavailable);
       }
       let located = slot.volume.resolve(store, key).map_err(Begun::Vfs)?;
@@ -224,14 +337,22 @@ mod linux {
         .stat(store, located.inode)
         .map_err(Begun::Vfs)?
         .size;
+      let object_bytes = PeerObject::bytes_for(size).map_err(|_| Begun::FellBack)?;
+      let held = holds(&mut client.direct_maps, &store.shards_backings);
+      super::within_share(held, object_bytes, share).map_err(Begun::ShareExhausted)?;
+      // Within its share, but the shard holds every copy the process's limits leave room for (others mapped before
+      // this client came): this client reads by copy until some are released.
+      if store.shards_backings.peers_held().0 >= most_copies {
+        return Err(Begun::FellBack);
+      }
       let object = PeerObject::create(&name, size).map_err(|_| Begun::FellBack)?;
-      let object_bytes = object.len();
       let backing = store
         .shards_backings
         .insert_peer(object, slot.volume.prefix(), located.inode)
         .map_err(|refusal| match refusal {
           PeerRefusal::Budget { .. } | PeerRefusal::Full(_) => Begun::FellBack,
         })?;
+      client.direct_maps.push(backing);
       Ok(Fill {
         volume,
         backing: Some(backing),
@@ -338,8 +459,7 @@ mod linux {
         state.count(FELL_BACK, 1);
         return refused(Refusal::MapUnavailable);
       };
-      let mapping_id =
-        (u64::from(backing.index()) << MAPPING_ID_INDEX_SHIFT) | u64::from(backing.generation());
+      let mapping_id = super::mapping_id_of(backing);
       match control.send_mapping(
         copy.object().descriptor(),
         mapping_id,
@@ -349,7 +469,7 @@ mod linux {
         self.object_bytes,
       ) {
         Ok(()) => {
-          client.direct_maps.push(backing);
+          // Held on the client's slot since the copy was made: the fill lets go of it no more.
           self.backing = None;
           state.count(HANDED, 1);
           ReplyBody::Mapped {
@@ -370,6 +490,17 @@ mod linux {
         }
       }
     }
+  }
+
+  /// What a client holds of the direct maps, `(maps, bytes)`: `held`, its copies handed or being filled, less those the
+  /// store let go of (a fill that ended early), which are forgotten here.
+  fn holds(held: &mut Vec<Handle<ShardsBacking>>, backings: &ShardsBackings) -> (usize, u64) {
+    held.retain(|backing| backings.peer_bytes(*backing).is_some());
+    let bytes = held
+      .iter()
+      .filter_map(|backing| backings.peer_bytes(*backing))
+      .fold(0u64, u64::saturating_add);
+    (held.len(), bytes)
   }
 
   /// Stores the pages of `bytes`, the file's from `at`, into the copy `backing` names, passing over pages of zeros: the
@@ -482,5 +613,55 @@ mod linux {
       }
     };
     (reply, route)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// AC-A-171 (G-direct step 2): a client's share is the shard's capacity over the clients served now. Do: share a
+  /// capacity of 100 copies and 1 MiB among one, four and zero clients. Expect the whole to one client, a quarter each
+  /// to four, and the whole when none is counted (a client asking is always served).
+  #[test]
+  fn a_clients_share_is_the_shards_capacity_over_the_clients_served() {
+    let capacity = (100, 1 << 20);
+    assert_eq!(share_of(capacity, 1), capacity);
+    assert_eq!(share_of(capacity, 4), (25, 1 << 18));
+    assert_eq!(share_of(capacity, 0), capacity);
+  }
+
+  /// AC-A-171 (G-direct step 2): a copy past a client's share is refused typed with the counts. Do: ask for copies
+  /// against a share of two maps and 8 KiB: one within both, one past the count, one past the bytes, one exactly filling
+  /// the bytes. Expect the first and last accepted, the others refused `MapShareExhausted` carrying what is held and the
+  /// share.
+  #[test]
+  fn a_copy_past_a_clients_share_is_refused_with_the_counts() {
+    let share = (2, 8192);
+    assert!(within_share((1, 2048), 4096, share).is_ok(), "within both");
+    assert_eq!(
+      within_share((2, 4096), 1, share),
+      Err(Refusal::MapShareExhausted {
+        held_maps: 2,
+        most_maps: 2,
+        held_bytes: 4096,
+        share_bytes: 8192
+      }),
+      "past the count"
+    );
+    assert!(
+      matches!(
+        within_share((1, 4097), 4096, share),
+        Err(Refusal::MapShareExhausted {
+          held_bytes: 4097,
+          ..
+        })
+      ),
+      "past the bytes"
+    );
+    assert!(
+      within_share((1, 4096), 4096, share).is_ok(),
+      "exactly the bytes"
+    );
   }
 }

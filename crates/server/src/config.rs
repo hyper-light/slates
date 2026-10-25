@@ -52,6 +52,17 @@ const ARCHIVE_SLICE_PERMILLE: u64 = 500;
 /// the shard's step budget, parts per thousand — the same half the archive walk and a granted landing take, and for
 /// the same reason: work in progress never takes the whole step from the clients.
 const COPY_SLICE_PERMILLE: u64 = 500;
+/// Shape: the share of the process's descriptor and mapping limits the same-kernel direct map's copies may hold, parts
+/// per thousand (§4.6, A-171): half, so the copies never take the whole of either from the rings, sockets and objects
+/// the daemon's other paths open, which it does not budget path by path yet; the same half a copy slice takes of a
+/// step, for the same reason.
+const DIRECT_MAP_LIMIT_SHARE_PERMILLE: u64 = 500;
+/// Format: the descriptors one direct-map copy holds in the daemon: its memfd, kept for the zeroing's `SEEK_DATA`
+/// (`slates_mem::PeerObject`).
+const DESCRIPTORS_PER_COPY: u64 = 1;
+/// Format: the mappings one direct-map copy holds in the daemon: its view, placed inside a reservation one grain longer
+/// (`slates_mem::shared`), which the placement splits into at most three: the slack before, the view, the slack after.
+const MAPPINGS_PER_COPY: u64 = 3;
 /// How often §4.6 L2's moving target shifts a writable DAX window. §4.6 states the interval directly — "the
 /// modern window is 16–32 ms and RowPress leaks across refresh windows, so the migration interval is derived
 /// from the lowest hammer threshold, not the classic 64 ms". Slower than the window is a shift an attacker can
@@ -256,6 +267,10 @@ pub struct DaemonConfig {
   /// Derived: clients per shard, the admission limit (AC-2.6): what the client share of the
   /// reserve holds in regions.
   pub clients_per_shard: usize,
+  /// Derived: the direct maps' copies one shard may hold at once, handed or being filled (§4.6, A-171):
+  /// [`direct_maps_per_shard`] over the process's descriptor and mapping limits. A client's share is this, and the
+  /// shard's fill budget, over the clients the shard serves.
+  pub direct_maps_per_shard: usize,
   /// Derived: the landings one owner shard holds awaiting a grant (§4.15 step 3; AUD-29-07) — the daemon's
   /// client seats, `clients_per_shard × shards`: a presentation lives on its volume's owner shard whichever
   /// shard its client sits on, and each seat may have one pending there. A presentation past it is refused
@@ -783,6 +798,20 @@ impl DaemonConfig {
       ["reserve_per_shard", "region_bytes"]
     );
     derivations.push(note("clients_per_shard", &clients));
+    // The same-kernel direct map's copies a shard may hold (§4.6, A-171): what the process's descriptor and mapping
+    // limits leave room for, over the shards.
+    let direct_maps: Derived<usize> = derived!(
+      direct_maps_per_shard(
+        slates_machine::facts::descriptor_limit(),
+        slates_machine::facts::mapping_limit(),
+        shards,
+        max_chunks.get()
+      ),
+      "min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × \
+       DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks",
+      ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"]
+    );
+    derivations.push(note("direct_maps_per_shard", &direct_maps));
     // A landing presentation lives on its volume's owner shard whichever shard its client sits on: the
     // daemon's seats bound the presentations one shard holds (AUD-29-07).
     let landings_awaiting: Derived<usize> = derived!(
@@ -842,6 +871,7 @@ impl DaemonConfig {
       region,
       lock_capacity_bytes: lock_capacity.get(),
       clients_per_shard: clients.get(),
+      direct_maps_per_shard: direct_maps.get(),
       landings_awaiting_per_shard: landings_awaiting.get(),
       reserve_per_shard: reserve.get(),
       large_class_bytes: d.arena_region_bytes.get(),
@@ -1055,6 +1085,34 @@ fn archive_slice_bytes(blake3_bytes_per_second: u64, quantum_ns: u64) -> u64 {
   (blake3_bytes_per_second.saturating_mul(quantum_ns) / NANOS_PER_SECOND)
     .saturating_mul(ARCHIVE_SLICE_PERMILLE)
     / PERMILLE
+}
+
+/// The direct maps' copies one shard may hold at once, handed or being filled (§4.6, A-171): the direct maps' share of
+/// the process's descriptor limit and of its mapping limit, each over what one copy holds, the smaller of the two, over
+/// the shards. The backings' slab capacity (`max_chunks` a shard) bounds it where no OS limit binds lower. Zero where
+/// the limits leave no room for one copy a shard: the shard then serves no direct map, and its clients read by copy.
+pub fn direct_maps_per_shard(
+  descriptors: Option<u64>,
+  mappings: Option<u64>,
+  shards: u64,
+  max_chunks: usize,
+) -> usize {
+  let share = |limit: u64, per_copy: u64| {
+    limit
+      .saturating_mul(DIRECT_MAP_LIMIT_SHARE_PERMILLE)
+      .checked_div(PERMILLE)
+      .and_then(|shared| shared.checked_div(per_copy))
+      .and_then(|process| process.checked_div(shards.max(1)))
+  };
+  let by_slab = u64::try_from(max_chunks).unwrap_or(u64::MAX);
+  let per_shard = [
+    descriptors.and_then(|limit| share(limit, DESCRIPTORS_PER_COPY)),
+    mappings.and_then(|limit| share(limit, MAPPINGS_PER_COPY)),
+  ]
+  .into_iter()
+  .flatten()
+  .fold(by_slab, u64::min);
+  usize::try_from(per_shard).unwrap_or(usize::MAX)
 }
 
 /// The content bytes one slice of copy-bound work may move within `quantum_ns`: half the quantum at the machine's
@@ -1328,6 +1386,44 @@ fn note<T: std::fmt::Debug>(name: &str, d: &Derived<T>) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// AC-A-171 (G-direct step 2): the direct maps' copies a shard may hold follow the process's limits. Do: derive it for
+  /// a host with Linux's default limits (1,024 descriptors soft, 65,530 mappings) over one and four shards; for one whose
+  /// mappings bind lower; for one with no OS limit; and for limits too small for a copy a shard. Expect half the
+  /// descriptors, one each (512), over the shards; a third of half the mappings when that is lower; the slab's capacity
+  /// with no limit and as a ceiling; and zero where nothing fits.
+  #[test]
+  fn the_direct_maps_a_shard_may_hold_follow_the_process_limits() {
+    let slab = 1_000_000;
+    assert_eq!(
+      direct_maps_per_shard(Some(1024), Some(65_530), 1, slab),
+      512
+    );
+    assert_eq!(
+      direct_maps_per_shard(Some(1024), Some(65_530), 4, slab),
+      128
+    );
+    assert_eq!(
+      direct_maps_per_shard(Some(524_288), Some(65_530), 1, slab),
+      65_530 / 2 / 3,
+      "the mappings bind lower"
+    );
+    assert_eq!(
+      direct_maps_per_shard(None, None, 2, slab),
+      slab,
+      "the slab alone"
+    );
+    assert_eq!(
+      direct_maps_per_shard(Some(524_288), None, 1, 100),
+      100,
+      "the slab as a ceiling"
+    );
+    assert_eq!(
+      direct_maps_per_shard(Some(3), None, 2, slab),
+      0,
+      "no room for a copy a shard"
+    );
+  }
 
   /// AC (§4.8 "Placement", D-14): the derived scatter width is the recovery floor — the candidate floor
   /// `2f + 1` when the re-replication bandwidth is unstated, wider when a stated bandwidth is too slow to

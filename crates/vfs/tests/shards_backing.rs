@@ -590,3 +590,136 @@ fn write_through_cost_per_mib() {
   );
   assert!(store.shards_backings.written() > 0, "write-through ran");
 }
+
+/// A same-kernel client's copy of the file `no` of `volume` (A-171), the file's page span, every range of it filled as
+/// the direct map's fill leaves it, with `content` stored: the backing's handle.
+fn client_copy(store: &mut Store, volume: &Volume, no: InodeNo, content: &[u8]) -> Handle {
+  let size = u64::try_from(content.len()).unwrap();
+  let budget = slates_mem::PeerObject::bytes_for(size)
+    .unwrap()
+    .saturating_mul(4);
+  store.shards_backings.set_budget(budget);
+  let mut object = slates_mem::PeerObject::create("slates-vfs-test", size).unwrap();
+  object.store(0, content).unwrap();
+  let handle = store
+    .shards_backings
+    .insert_peer(object, volume.prefix(), no)
+    .unwrap();
+  let ranges = size.div_ceil(DAX_RANGE_BYTES).max(1);
+  let backing = store.shards_backings.get_mut(handle).unwrap();
+  for range in 0..ranges {
+    backing.mark_filled(range);
+  }
+  handle
+}
+
+/// A client copy's bytes, the whole object.
+fn copy_bytes(store: &mut Store, handle: Handle) -> Vec<u8> {
+  let backing = store.shards_backings.get_mut(handle).unwrap();
+  let mut bytes = vec![0u8; ix(backing.object().len())];
+  backing.object_mut().load(0, &mut bytes).unwrap();
+  bytes
+}
+
+/// A-171, the write-through's bound for a client's copy. Do: copy a file of three pages less a few bytes, then write
+/// across the copy's end and truncate the file to one byte. Expect the part of the write inside the copy in it, the rest
+/// nowhere (the copy is the file's page span when it was made), and the truncate's cut zero in the copy.
+#[test]
+fn a_client_copy_takes_what_falls_inside_it_and_nothing_past_it() {
+  let page = u64::try_from(rustix::param::page_size()).unwrap();
+  let mut store = common::store();
+  let mut volume = common::volume(&mut store, 64 << 20);
+  let root = volume.root();
+  let no = volume.create_file(&mut store, root, "f", 0o644).unwrap();
+  let content = pattern(3 * page - 5, 0x31);
+  volume.write(&mut store, no, 0, &content).unwrap();
+  let handle = client_copy(&mut store, &volume, no, &content);
+  let across = pattern(2 * page, 0x77);
+  volume.write(&mut store, no, 2 * page, &across).unwrap();
+  let copy = copy_bytes(&mut store, handle);
+  assert_eq!(
+    copy.len(),
+    ix(3 * page),
+    "the copy is the page span it was made with"
+  );
+  assert!(
+    copy[ix(2 * page)..] == across[..ix(page)],
+    "the write's part inside the copy"
+  );
+  volume.truncate(&mut store, no, 1).unwrap();
+  let copy = copy_bytes(&mut store, handle);
+  assert_eq!(copy[0], content[0]);
+  assert!(
+    copy[1..].iter().all(|byte| *byte == 0),
+    "the cut reads zero in the copy"
+  );
+}
+
+/// A-171 (G-direct step 2), a destroyed volume's copies. Do: copy a file for a client and back it for a VMM too, detach
+/// the volume's client copies as its teardown does, write the file, then remove the client copy. Expect the detach to
+/// count one; the write to reach the VMM's backing and not the client's copy, which a volume given the prefix again
+/// would otherwise write into; the client copy held and counted until its removal, and given back with it.
+#[test]
+fn a_detached_client_copy_is_written_no_more_and_held_until_removed() {
+  let (mut store, mut volume, no, vmm, _model) = backed_file(1 << 20);
+  let content = file_bytes(&store, &volume, no, 1 << 20);
+  let copy = client_copy(&mut store, &volume, no, &content);
+  let held = store.shards_backings.peers_held();
+  let charged = store.shards_backings.charged();
+  assert_eq!(held.0, 1);
+  assert_eq!(
+    store.shards_backings.detach_volume_peers(volume.prefix()),
+    1
+  );
+  volume
+    .write(&mut store, no, 100, b"after the detach")
+    .unwrap();
+  assert_eq!(
+    &object_bytes(&mut store, vmm)[100..116],
+    b"after the detach",
+    "a VMM's backing is not the teardown's to detach"
+  );
+  assert!(
+    copy_bytes(&mut store, copy)[100..116] == content[100..116],
+    "the detached copy is written no more"
+  );
+  assert_eq!(
+    store.shards_backings.peers_held(),
+    held,
+    "held until removed"
+  );
+  assert_eq!(store.shards_backings.charged(), charged, "and counted");
+  assert!(store.shards_backings.remove(copy).is_some());
+  assert_eq!(store.shards_backings.peers_held(), (0, 0));
+  assert_eq!(
+    store.shards_backings.charged(),
+    charged - held.1,
+    "the removal gives its bytes back"
+  );
+}
+
+/// A-171 (G-direct step 2), a removed file's copies. Do: copy a file for a client, then unlink it while nothing holds it
+/// open, which reclaims it. Expect the file to have no backing in the index any more (`backs` answers false) while the
+/// copy stays held until its client lets it go.
+#[test]
+fn a_reclaimed_files_client_copy_is_detached_and_still_held() {
+  let mut store = common::store();
+  let mut volume = common::volume(&mut store, 64 << 20);
+  let root = volume.root();
+  let no = volume.create_file(&mut store, root, "f", 0o644).unwrap();
+  let content = pattern(64 << 10, 0x42);
+  volume.write(&mut store, no, 0, &content).unwrap();
+  let copy = client_copy(&mut store, &volume, no, &content);
+  assert!(store.shards_backings.backs(volume.prefix(), no));
+  volume.unlink(&mut store, root, "f").unwrap();
+  assert!(
+    !store.shards_backings.backs(volume.prefix(), no),
+    "the reclaimed file's copy left the index"
+  );
+  assert_eq!(store.shards_backings.peers_held().0, 1, "and stays held");
+  let held = copy_bytes(&mut store, copy);
+  assert!(
+    held[..content.len()] == content[..] && held[content.len()..].iter().all(|byte| *byte == 0),
+    "with the file's last bytes"
+  );
+}

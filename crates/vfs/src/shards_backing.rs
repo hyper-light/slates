@@ -270,6 +270,9 @@ pub struct ShardsBackings {
   charged: u64,
   /// The most they may count: the shard's content reserve, set by the server ([`ShardsBackings::set_budget`]).
   budget: u64,
+  /// Same-kernel clients' backings held, and their objects' bytes (A-171): what a released or reaped map gives back.
+  peers: usize,
+  peer_bytes: u64,
 }
 
 impl std::fmt::Debug for ShardsBackings {
@@ -281,6 +284,8 @@ impl std::fmt::Debug for ShardsBackings {
       .field("marked_stale", &self.marked_stale)
       .field("charged", &self.charged)
       .field("budget", &self.budget)
+      .field("peers", &self.peers)
+      .field("peer_bytes", &self.peer_bytes)
       .finish()
   }
 }
@@ -298,6 +303,8 @@ impl ShardsBackings {
       marked_stale: 0,
       charged: 0,
       budget: 0,
+      peers: 0,
+      peer_bytes: 0,
     }
   }
 
@@ -364,7 +371,11 @@ impl ShardsBackings {
       });
     }
     match self.insert(ShardsBacking::for_peer(object, volume, inode)) {
-      Ok(handle) => Ok(handle),
+      Ok(handle) => {
+        self.peers = self.peers.saturating_add(1);
+        self.peer_bytes = self.peer_bytes.saturating_add(object_bytes);
+        Ok(handle)
+      }
       Err(full) => {
         self.uncharge(object_bytes);
         Err(PeerRefusal::Full(full))
@@ -372,25 +383,63 @@ impl ShardsBackings {
     }
   }
 
-  /// Lets go of every same-kernel client's backing of a file of the volume of prefix `volume`, giving their objects'
-  /// bytes back to the budget: the volume's teardown. A prefix is handed to a new volume once its count wraps, and a
-  /// backing left behind would then take that volume's writes into a client's map of a file it never mapped. How many.
-  pub fn remove_volume_peers(&mut self, volume: u16) -> usize {
-    let peers: Vec<Handle<ShardsBacking>> = self
+  /// How many same-kernel clients' backings are held, and their objects' bytes.
+  #[must_use]
+  pub fn peers_held(&self) -> (usize, u64) {
+    (self.peers, self.peer_bytes)
+  }
+
+  /// The object's bytes of the same-kernel client's backing `handle` names, if it is one and live: what it counts
+  /// against its client's share.
+  #[must_use]
+  pub fn peer_bytes(&self, handle: Handle<ShardsBacking>) -> Option<u64> {
+    match &self.slab.get(handle).ok()?.object {
+      BackingObject::Peer(object) => Some(object.len()),
+      BackingObject::Vmm(_) => None,
+    }
+  }
+
+  /// Detaches every same-kernel client's backing of a file of the volume of prefix `volume`: the volume's teardown. A
+  /// detached backing is written through no more, since a prefix is handed to a new volume once its count wraps and a
+  /// copy left indexed would take that volume's writes into a client's map of a file it never mapped. It stays held,
+  /// and its object's bytes stay counted, until its client releases it or is reaped
+  /// ([`ShardsBackings::remove`]): the client's own map keeps the object's pages, which this process wrote. How many.
+  pub fn detach_volume_peers(&mut self, volume: u16) -> usize {
+    let files: Vec<(u16, InodeNo)> = self
       .by_file
       .range((volume, InodeNo(0))..=(volume, InodeNo(u64::MAX)))
-      .flat_map(|(_, handles)| handles.iter().copied())
-      .filter(|handle| {
-        self
-          .slab
-          .get(*handle)
-          .is_ok_and(|backing| matches!(backing.object, BackingObject::Peer(_)))
-      })
+      .map(|(file, _)| *file)
       .collect();
-    peers
+    files
       .into_iter()
-      .filter(|handle| self.remove(*handle).is_some())
-      .count()
+      .map(|file| self.detach_peers_of(file))
+      .fold(0usize, usize::saturating_add)
+  }
+
+  /// Detaches every same-kernel client's backing of file `inode` of the volume of prefix `volume`: the file has left
+  /// its volume for good (its last link and its last open gone), so nothing writes it again. Held and counted as
+  /// [`ShardsBackings::detach_volume_peers`] leaves them. How many.
+  pub fn detach_file_peers(&mut self, volume: u16, inode: InodeNo) -> usize {
+    self.detach_peers_of((volume, inode))
+  }
+
+  /// Takes the same-kernel clients' backings of `file` out of the index write-through walks, leaving a VMM's.
+  fn detach_peers_of(&mut self, file: (u16, InodeNo)) -> usize {
+    let ShardsBackings { slab, by_file, .. } = self;
+    let Some(handles) = by_file.get_mut(&file) else {
+      return 0;
+    };
+    let before = handles.len();
+    handles.retain(|handle| {
+      slab
+        .get(*handle)
+        .is_ok_and(|backing| matches!(backing.object, BackingObject::Vmm(_)))
+    });
+    let detached = before.saturating_sub(handles.len());
+    if handles.is_empty() {
+      by_file.remove(&file);
+    }
+    detached
   }
 
   /// Lets go of the backing `handle` names, if it is live: it, its object's mappings in this process ending with it. A
@@ -400,6 +449,8 @@ impl ShardsBackings {
     let backing = self.slab.remove(handle).ok()?;
     if let BackingObject::Peer(object) = &backing.object {
       self.uncharge(object.len());
+      self.peers = self.peers.saturating_sub(1);
+      self.peer_bytes = self.peer_bytes.saturating_sub(object.len());
     }
     let file = (backing.volume, backing.inode);
     if let Some(handles) = self.by_file.get_mut(&file) {

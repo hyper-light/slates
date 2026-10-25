@@ -2869,8 +2869,14 @@ coherence was "the version a live local map pins is held until the client drops 
 (it holds every volume), so a pinned version would need a copy of its own anyway, and a copy kept equal by write-through
 costs the same copy once and gives the client the file as it is, where a pinned copy would grow stale with no signal.
 The price is a copy of each write into each mapped file's copy, and a cut that zeroes by stores over what holds bytes
-(the write seal refuses the daemon's own hole punch). The client's slot holds the copy until it is reaped, and a
-volume's teardown lets go of its files' copies (a volume prefix is handed out again once its count wraps).
+(the write seal refuses the daemon's own hole punch). **Lifetime and bounds (A-172).** A copy is held for its client
+from the moment it is made until the client releases it (`ReleaseMap`, `Client::release_map`) or is reaped. A volume's
+destroy or a file's last unlink only detaches its copies: they leave the write-through index, so a volume given the
+prefix again once its count wraps never writes into them, but they stay held and counted, because the client's own map
+keeps the object's pages, which the daemon wrote and its memory is charged for. A shard holds at most the copies its
+share of the process's descriptor and mapping limits leaves room for (one descriptor and up to three mappings a copy),
+and at most its fill budget's bytes; a client's share is that capacity over the clients the shard serves now, and a map
+past it is refused `MapShareExhausted` with nothing made.
 A writable local map, if ever offered, goes through the VFS write boundary exactly as the
 guest's opt-in writable DAX (§4.6 L0). Reaching a consumer in a *separate* namespace (an OCI container, a k8s pod)
 needs the descriptor-passing channel to cross that namespace — the pathname-rendezvous question recorded in GAPS; the
@@ -2925,9 +2931,22 @@ same-namespace host process is the first delivered case.
 > `dax.local_map` counts each hand-off, `dax.local_map_fallback` each refused copy, `dax.local_map_unconfined` a copy
 > the rule refused (which must stay zero). **Owed:** macOS (its descriptor over A-161's socket route) and Windows
 > (handle duplication), each to its own step of G-direct; the cross-shard hand-off (a client served by another shard
-> reads by copy); overlays (an untouched file follows the disk, which no write boundary sees, so they read by copy); a
-> release on `MappedRead`'s drop (the copy lives until the client is reaped); and the measurement of copy-once-map-many
-> against copy-per-read.
+> reads by copy); overlays (an untouched file follows the disk, which no write boundary sees, so they read by copy);
+> and the measurement of copy-once-map-many against copy-per-read.
+>
+> **Amended 2026-10-25 (A-172, G-direct step 2) — lifetime and bounds, proven on Linux.** `ReleaseMap` lets a client
+> give a copy back; a reap gives back every copy a dead client held; a destroy or a last unlink detaches its copies,
+> which stay held until released or reaped. A shard's copies are bounded by its share of the process's descriptor and
+> mapping limits (`DaemonConfig::direct_maps_per_shard`) and by its fill budget; a client's share is that over the
+> clients served now. Proven on fedora (x86_64 Linux), 2026-10-25: `crates/client/tests/client.rs` (a release gives the
+> copy back and the file maps again, twice; a third map past a share of two is refused `MapShareExhausted` with
+> nothing made, maps after a release, and is refused again when a second client halves the share; a destroyed volume's
+> and a removed file's map keep reading the last bytes, their copy held until released), `crates/client/tests/reap_map.rs`
+> (a re-invoked test binary holding a map is `SIGKILL`ed and its copy is reaped), `crates/vfs/tests/shards_backing.rs`
+> (a detached copy is written no more and held until removed; a reclaimed file's copy leaves the index). Red-checked:
+> with no removal on release, on reap, no share check, no detach, and a detach that releases, each test failed. The
+> counters: `dax.local_map_released`, `dax.local_map_reaped`, `dax.local_map_share_refused`; `Daemon::direct_map_copies`
+> observes what is held. A release on `MappedRead`'s own drop stays owed (a drop cannot reach its client).
 
 > **Status (the DAX matrix, A-164, 2026-10-24).** What DAX means in each environment, and which of its 52 cells
 > (each environment on each platform, by the mount route and the socket route) are proven, owed or ruled out by the
@@ -12166,9 +12185,17 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
 - **Replaces A-135's mechanism.** A-135 handed the arena block's descriptor and pinned the version for the map's life; since 2026-10-18 the hand-off was refused (the arena holds every volume), so every `MapRead` read by copy. Now the daemon makes the unit of authorization per file: a sealable memfd of the file's page span (at least a page), its own writable map taken first, then `F_SEAL_FUTURE_WRITE | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL`. It fills the copy a slice at a time in a task of the owner shard (the reply deferred, as A-160's are), hands the descriptor, then replies. `confined_for_a_peer` is unchanged in code: offset zero, the object's whole length authorized, write- and size-sealed; one file's copy meets it, the arena never does.
 - **Decided: a live view, not a pinned version.** The goal left the choice open. A pinned version would need a copy of its own (no arena block can be handed), so it costs the same copy and then shows the client a stale file with no signal. A copy kept in the store's backings (A-163) is written through at the single write boundary, so a write, a cut and a growth within its length reach the client's map before the change returns: the semantics of a shared map of a file. A change past the copy's length is not seen; the client maps again. The client reads through atomics (`slates_mem::PeerView`), never a slice, since the daemon writes the bytes at any moment; `MappedRead::bytes()` was unsound for a live view and is replaced by `read_at`, `to_vec` and `descriptor`.
 - **Price, stated.** Each write into a mapped file is copied again into its copy (A-163 measured the write-through at 117 µs per MiB per backing on 2026-10-24, BENCHMARKS "What write-through adds to a write of a mapped file"; the direct map's own numbers are owed to G-direct step 3). A cut zeroes by stores over what holds bytes, since the write seal refuses the daemon's own hole punch (`mm/shmem.c`); untouched pages are passed over (`SEEK_DATA`). The copy's whole size is charged to the backings' fill budget when it is made.
-- **Lifetime and bounds.** The client's slot holds the copy's backing until the slot is reaped; a volume's teardown lets go of its files' copies (`remove_volume_peers`), because a prefix is handed to a new volume once its count wraps and a copy left behind would take that volume's writes. A copy whose hand-off did not happen is let go at once. Bounded by the backings' capacity and the fill budget, refused as `MapUnavailable` (the client's paged read) at either.
+- **Lifetime and bounds.** As first built: the client's slot held the copy's backing until the slot was reaped, and a volume's teardown let go of its files' copies. A-172 corrects the teardown (it detaches, and the copy stays held until released or reaped) and adds the release verb and the bounds. A copy whose hand-off did not happen is let go at once.
 - **Not served, read by copy:** another uid, a non-head view, a merge volume, an overlay (an untouched file follows the disk, which no write boundary sees), a client of another shard, and macOS and Windows until their own steps.
 - **Proven** on fedora (x86_64 Linux, 2026-10-25), 5 of 5 by `crates/client/tests/client.rs` over a real daemon, and red-checked four ways (§4.6 status). `slates-mem`'s `peer_object.rs` holds the object alone, 6 of 6 on Linux and 5 of 5 on macOS.
+
+### A-172 — A direct map's copy is held by its client until released or reaped, within a share of the shard's capacity (accepted 2026-10-25)
+Applied in the same change to: §4.6 (the direct map's lifetime and bounds, its status), GAPS, `crates/ipc` (`RequestBody::ReleaseMap`, `ReplyBody::MapReleased`, `Refusal::MapShareExhausted`), `crates/machine` (`facts::descriptor_limit`, `facts::mapping_limit`), `crates/vfs` (`shards_backing.rs`: `detach_volume_peers`, `detach_file_peers`, `peers_held`, `peer_bytes`; `volume.rs` `reclaim_inode`), `crates/server` (`direct_map.rs`: `release_map`, `share_of`, `within_share`; `config.rs` `direct_maps_per_shard`; `reap.rs`; `verbs.rs`; `daemon.rs` `direct_map_copies`), `crates/client` (`Client::release_map`; `MappedRead::read_at` past the end; the tests), `CLAUDE.md`, `docs/bugs/2026-10-25-a-direct-maps-read-past-its-end-was-refused.md`.
+- **Corrects A-171's teardown.** A-171 let a destroyed volume's copies go, giving their bytes back. But the client's own map keeps the object's pages alive, and the daemon wrote them, so its memory cgroup is charged for them however its budget counts: a client could map, destroy, map again and pin daemon memory the budget had forgotten. Now a destroy, and a file's last unlink (`reclaim_inode`), only detach the copies from the write-through index (which keeps a wrapped prefix from writing into them); the copies stay held, and counted, until their client releases them or is reaped.
+- **Adds the release.** `ReleaseMap { volume, mapping_id }` gives one copy back; it refuses `NotFound` for a copy the client does not hold (another client's, one released already, or one named before a restart, since mapping ids are handles and process-local). `Client::release_map` unmaps the client's view first. A copy is held on the client's slot from the moment it is made, so a client's in-flight fills count against its share too.
+- **Adds the bounds.** Each copy holds one descriptor and up to three mappings in the daemon (its view and its reservation's two slack ends). A shard may hold `direct_maps_per_shard` copies: half the process's descriptor limit (`RLIMIT_NOFILE`) and half its mapping limit (`vm.max_map_count`) over what a copy holds, the smaller, over the shards, at most the backings' slab capacity. Its bytes are bounded by its fill budget, as before. A client's share is that capacity over the clients the shard serves now (`share_of`), so one client cannot take every copy from the others, and a map past it is refused `MapShareExhausted`, with nothing made. Copies held are never taken back; a client over a share that others' arrival shrank maps nothing more until it releases.
+- **Rejected: a share per client seat.** First derived as the shard's budget over `clients_per_shard`, it gave every client about four of its own ring regions (1,081,474 bytes on fedora, 2026-10-25), since `clients_per_shard` is itself the reserve over a region: too small to map the 4 MiB file step 1 maps, whatever the machine. The count per seat came out at 0 or 26.
+- **Proven** on fedora, 2026-10-25, and red-checked five ways (§4.6 status).
 
 ### A-170 — A clone's copy-up copies an open extent its origin owns; only its own is sealed in place (accepted 2026-10-25)
 Applied in the same change to: `crates/vfs/src/volume.rs` (`Volume::make_current_inode`), `crates/vfs/src/content.rs`

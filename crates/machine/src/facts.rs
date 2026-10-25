@@ -788,6 +788,45 @@ pub fn huge_page_bytes() -> Option<u64> {
   None
 }
 
+/// The most descriptors this process may hold open: `RLIMIT_NOFILE`'s soft limit, the one the kernel refuses `EMFILE`
+/// at. `None` where nothing finite binds (an unlimited rlimit, a refused query) or the OS has no such limit (Windows,
+/// whose handle table is bounded by memory alone). The same-kernel direct map holds a descriptor per copy it hands
+/// (§4.6, A-171), so its per-client count is derived from this rather than assumed.
+#[cfg(unix)]
+#[must_use]
+pub fn descriptor_limit() -> Option<u64> {
+  rustix::process::getrlimit(rustix::process::Resource::Nofile).current
+}
+
+/// The paired arm: Windows has no descriptor rlimit; its handle table is bounded by memory alone.
+#[cfg(not(unix))]
+#[must_use]
+pub fn descriptor_limit() -> Option<u64> {
+  None
+}
+
+/// The most mappings this process may hold: Linux's `vm.max_map_count`, past which `mmap` refuses `ENOMEM` (65,530 by
+/// default). Read from the kernel rather than assumed, since a host may raise it. `None` off Linux, whose kernels set no
+/// such count (macOS and Windows bound a process's mappings by memory alone). The direct map's copies each hold a
+/// mapping, so their per-client count is derived from this (§4.6, A-171).
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn mapping_limit() -> Option<u64> {
+  std::fs::read_to_string("/proc/sys/vm/max_map_count")
+    .ok()?
+    .trim()
+    .parse::<u64>()
+    .ok()
+    .filter(|count| *count > 0)
+}
+
+/// The paired arm: no kernel off Linux counts a process's mappings.
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn mapping_limit() -> Option<u64> {
+  None
+}
+
 #[cfg(target_os = "linux")]
 mod platform {
   use super::{

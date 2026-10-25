@@ -3200,6 +3200,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::HomedElsewhere { .. } => "homed_elsewhere",
     Refusal::OwnerUnreachable { .. } => "owner_unreachable",
     Refusal::MapUnavailable => "map_unavailable",
+    Refusal::MapShareExhausted { .. } => "map_share_exhausted",
     Refusal::ImageRefused { .. } => "image_refused",
     Refusal::NotRootLeader => "not_root_leader",
     Refusal::ConsensusNotInitialized => "consensus_not_initialized",
@@ -3424,6 +3425,9 @@ fn dispatch_inner(
     }
     RequestBody::MapRead { volume, path, at } => {
       crate::direct_map::map_read(state, client_id, principal, volume, &path, at)
+    }
+    RequestBody::ReleaseMap { mapping_id, .. } => {
+      crate::direct_map::release_map(state, client_id, mapping_id)
     }
     RequestBody::ReadRange {
       volume,
@@ -7303,12 +7307,13 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
 /// over-offered), its records' metadata reservation, and the growth a dynamic volume acquired from
 /// the shard budget as it wrote.
 fn release_slot_credits(state: &mut ShardState, slot: &VolumeSlot) {
-  // The copies of its files the direct map handed out go too (§4.6, A-171): their charge comes back, and a prefix a
-  // new volume is given once the count wraps never writes into a map of a file it does not hold.
-  let _released = state
+  // The copies of its files the direct map handed out stop following them (§4.6, A-171), so a prefix a new volume is
+  // given once the count wraps never writes into a map of a file it does not hold. Each copy stays held, and charged,
+  // until its client releases it or is reaped: the client's own map keeps the object's pages, which the daemon wrote.
+  let _detached = state
     .store
     .shards_backings
-    .remove_volume_peers(slot.volume.prefix());
+    .detach_volume_peers(slot.volume.prefix());
   if let Some(r) = slot.reservation {
     state.store.budget.release(r);
   }

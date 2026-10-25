@@ -11230,6 +11230,33 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     re-witness asks the host's clock as a copy-up does (A-162).
   - A racy witness never settles: after a re-hash past its tick confirms it, the fingerprint alone would do, but every
     drift check of it still hashes the whole file.
+- **The direct map's lifetime and bounds (A-172, G-direct step 2, 2026-10-25): built, and proven on Linux by real
+  clients.**
+  - **What:** `ReleaseMap` (and `Client::release_map`) gives a copy back; a reap gives back every copy a dead client
+    held; a destroy or a file's last unlink detaches its copies from the write-through index, and they stay held and
+    counted until released or reaped (the client's map keeps pages the daemon wrote, so forgetting them would let a
+    client pin uncounted daemon memory: A-171 had done exactly that). A shard holds at most `direct_maps_per_shard`
+    copies (half the process's descriptor and mapping limits over what a copy holds, over the shards) and its fill
+    budget's bytes; a client's share is that over the clients served now, and a map past it is refused
+    `MapShareExhausted` with nothing made.
+  - **Proven** on fedora (x86_64 Linux): the client binary 20 of 20, `reap_map.rs` 1 of 1 (a re-invoked test binary holding
+    a map, `SIGKILL`ed, its copy reaped; its own binary, since `reap.rs` counts process-wide reaps), the vfs backings tests 11 of 11, the server's unit tests of the share
+    and the derivation 3 of 3; workspace clippy clean.
+  - **Red-checked** in a scratch copy, each mutant rebuilt: no removal on release, no removal on reap, no share check,
+    no detach, and a detach that releases (A-171's old rule) each failed their test; the restored tree passed 6 of 6.
+  - **Rejected on the way:** a share per client seat (the budget over `clients_per_shard`) gave every client about four
+    ring regions, 1,081,474 bytes on fedora, too small for a 4 MiB map on any machine, and a count of 0 or 26.
+  - **Fixed on the way, failing test first:** a read of a direct map at or past its end answered `OutOfRange` instead of
+    0 (`docs/bugs/2026-10-25-a-direct-maps-read-past-its-end-was-refused.md`).
+  - **Fixed on the way, CI's ThreadSanitizer lane (run 40204561799 on 8a86d124):** the hostile-descriptor test's
+    non-vacuity check counted the neighbour's marker in the content arena, which the idle sweep seals at rest (A-99); under
+    the lane's slowdown the sweep came first and the check found none. The test now maps the neighbour's file too, whose
+    copy is never sealed, so the marker is certain; no race was reported.
+  - **Owed:** a release on `MappedRead`'s own drop (a drop cannot reach its client: today a dropped map's copy waits for
+    an explicit release or the reap); and raising the daemon's own descriptor limit from its soft to its hard value at
+    start, which would raise every shard's count without a change here (systemd gives services a soft limit of 1,024
+    by default; fedora's session had 524,288).
+
 - **The three-daemon fleet test failed once on CI's macOS lane (2026-10-25, run 40196268300 on 2e1c1e59): open, not
   reproduced.** `three_daemon_processes_deploy_a_fleet_from_one_manifest_and_survive_the_owners_death`
   (`crates/cli/tests/cli.rs`) waited its full `FLEET_WAIT` (40 s) for two members after the owner's death and failed
@@ -11275,8 +11302,8 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     doc gate on fedora.
   - **Owed:**
     - macOS (its descriptor over A-161's socket route) and Windows (handle duplication): G-direct steps 4 and 5;
-    - the release, reap and cap behaviour as its own step (G-direct step 2): today the copy lives until its client is
-      reaped (no release on `MappedRead`'s drop), and a volume's teardown lets go of its files' copies;
+    - the release, reap and cap behaviour as its own step (G-direct step 2): **done the same day, A-172** (the entry
+      above this one);
     - the measurement of copy-once-map-many against copy-per-read, and of the cut's zeroing by stores (G-direct
       step 3);
     - the cross-shard hand-off: a client served by another shard reads by copy;

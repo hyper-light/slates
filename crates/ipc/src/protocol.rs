@@ -672,6 +672,15 @@ pub enum RequestBody {
     /// The clone's name.
     name: String,
   },
+  /// Let go of a direct map this client holds (§4.6, A-171): the daemon stops keeping the copy equal to its file and
+  /// gives its bytes back to the fill budget. The client unmaps its own view first. `NotFound` for a map this client
+  /// does not hold. Appended.
+  ReleaseMap {
+    /// The volume the map was of (routes the verb to its owner shard, where the copy is held).
+    volume: VolumeId,
+    /// The mapping id the `Mapped` reply named.
+    mapping_id: u64,
+  },
 }
 
 /// Format: the name of the image file in an image volume's root (§4.6, A-160): what a VMM is pointed at.
@@ -1207,6 +1216,7 @@ impl RequestBody {
       | RequestBody::AwaitPlaced { volume, .. }
       | RequestBody::Read { volume, .. }
       | RequestBody::MapRead { volume, .. }
+      | RequestBody::ReleaseMap { volume, .. }
       | RequestBody::ReadRange { volume, .. }
       | RequestBody::ReadWindow { volume, .. }
       | RequestBody::ReadDir { volume, .. }
@@ -2713,6 +2723,19 @@ pub enum Refusal {
     /// The reason, in words.
     reason: String,
   },
+  /// A `MapRead` would take this client past its share of the shard's direct maps (§4.6, A-171): its count, derived
+  /// from the process's descriptor and mapping limits, or its bytes, derived from the shard's fill budget. Nothing was
+  /// made. The client releases a map (`ReleaseMap`) or reads by the paged path. Appended.
+  MapShareExhausted {
+    /// The maps the client holds.
+    held_maps: u64,
+    /// The most it may hold.
+    most_maps: u64,
+    /// The bytes its maps hold.
+    held_bytes: u64,
+    /// The most bytes they may hold.
+    share_bytes: u64,
+  },
 }
 
 /// The writes a snapshot is known to include (§4.6 "Writeback and snapshot barrier"): every write the
@@ -3048,6 +3071,8 @@ pub enum ReplyBody {
     /// The single-use secret the claim's exchange is keyed from (256 bits).
     secret: [u8; 32],
   },
+  /// A direct map was let go (`ReleaseMap`). Appended.
+  MapReleased,
 }
 
 /// One entry of a directory listing (`ReadDir`).

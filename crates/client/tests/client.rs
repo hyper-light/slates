@@ -186,9 +186,19 @@ fn attach_status_detach(client: &mut Client, id: slates_client::VolumeId) {
 /// descriptor probes, which scope themselves by it.
 #[cfg(unix)]
 fn one_shard_daemon(tag: &str) -> (Daemon, Client, String) {
+  one_shard_daemon_with(tag, |_| {})
+}
+
+/// [`one_shard_daemon`] with its configuration adjusted by `adjust` before it starts.
+#[cfg(unix)]
+fn one_shard_daemon_with(
+  tag: &str,
+  adjust: impl FnOnce(&mut DaemonConfig),
+) -> (Daemon, Client, String) {
   let profile = profile();
   let instance = format!("cl-{tag}-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let mut config = DaemonConfig::derive(&profile, &instance, Some(1));
+  adjust(&mut config);
   let daemon = Daemon::start(
     &profile,
     config,
@@ -439,6 +449,200 @@ fn a_page_written_at_one_mib_shows(
     seen(mapped) == shown(&changed, mapped.mapped_len()),
     "and nothing else moved"
   );
+}
+
+/// AC-A-171 — a read of a map from its end or past it returns nothing, as `pread` past a file's end does. Do: map a
+/// small file, then `read_at` at the map's end and a page past it, and with an empty buffer inside it. Expect: each
+/// returns `Ok(0)` and leaves the buffer as it was; on Linux the map is a direct one, so its view is what answers.
+///
+/// Found by reading the client on 2026-10-25: the direct map's view refused a load past its end even for an empty
+/// buffer, so a read at an offset past the map answered `OutOfRange` where the copy path answered 0.
+#[cfg(unix)]
+#[test]
+fn a_read_from_a_maps_end_or_past_it_returns_nothing() {
+  let (_daemon, mut client, _instance) = one_shard_daemon("mapend");
+  let id = client.create(&room_for("mapend", 20 << 10)).unwrap();
+  let bytes = pattern(20 << 10, 9);
+  write_file(&mut client, id, "/f.bin", &bytes);
+  let mapped = client.map_read(id, "/f.bin").unwrap();
+  if cfg!(target_os = "linux") {
+    assert!(mapped.is_zero_copy(), "a direct map on Linux");
+  }
+  let end = mapped.mapped_len();
+  let page = u64::try_from(rustix::param::page_size()).unwrap();
+  for offset in [end, end + page, u64::MAX] {
+    let mut buffer = [7u8; 16];
+    assert_eq!(
+      mapped.read_at(offset, &mut buffer).unwrap(),
+      0,
+      "a read at {offset} of a map {end} bytes long"
+    );
+    assert_eq!(buffer, [7u8; 16], "the buffer is untouched");
+  }
+  assert_eq!(mapped.read_at(0, &mut []).unwrap(), 0, "an empty buffer");
+  drop(mapped);
+  client.destroy(id).unwrap();
+}
+
+/// AC-A-171 (G-direct step 2): a released map gives its copy back, and the file maps again. Do: map a file and release
+/// it, twice. Expect: every map reads every byte; on Linux each holds one copy of the file's page span and each release
+/// gives it back, so the daemon's held copies return to where they started each time and `dax.local_map_released`
+/// counts two. On every Unix the release succeeds (a copied read holds nothing to release).
+#[cfg(unix)]
+#[test]
+fn a_released_map_gives_its_copy_back_and_the_file_maps_again() {
+  let (daemon, mut client, _instance) = one_shard_daemon("maprel");
+  let id = client.create(&room_for("maprel", 64 << 10)).unwrap();
+  let bytes = pattern(64 << 10, 4);
+  write_file(&mut client, id, "/f.bin", &bytes);
+  let start = daemon.direct_map_copies().unwrap();
+  for round in 0..2 {
+    let mapped = client.map_read(id, "/f.bin").unwrap();
+    assert!(
+      mapped.to_vec().unwrap() == bytes,
+      "round {round}: every byte"
+    );
+    if cfg!(target_os = "linux") {
+      assert!(
+        mapped.is_zero_copy(),
+        "round {round}: a direct map on Linux"
+      );
+      assert_eq!(
+        daemon.direct_map_copies().unwrap(),
+        (start.0 + 1, start.1 + page_span(bytes.len())),
+        "round {round}: one copy held"
+      );
+    }
+    client.release_map(mapped).unwrap();
+    assert_eq!(
+      daemon.direct_map_copies().unwrap(),
+      start,
+      "round {round}: released, the copies are where they started"
+    );
+  }
+  if cfg!(target_os = "linux") {
+    assert_eq!(counted(&daemon, "dax.local_map_released"), 2);
+  }
+  client.destroy(id).unwrap();
+}
+
+/// AC-A-171 (G-direct step 2): a client past its share of the direct maps is refused typed, with nothing made. Do: a
+/// one-shard daemon whose shard may hold two copies, served to one client, so its share is two; map two one-page files,
+/// then a third; release one and map the third. Expect: the third map is refused `MapShareExhausted` with two maps held
+/// of two, and the daemon still holds two copies (nothing was made); after the release it maps; then a second client
+/// connects, the share halves to one each, and the first client, holding two, is refused again while the second maps.
+/// `dax.local_map_share_refused` counts both refusals. (The share's bytes are held to their rule by the unit tests of
+/// `crates/server/src/direct_map.rs`.)
+#[cfg(target_os = "linux")]
+#[test]
+fn a_client_past_its_share_of_maps_is_refused_typed_with_nothing_made() {
+  let page = page_span(1);
+  let (daemon, mut client, instance) = one_shard_daemon_with("mapshare", |config| {
+    config.direct_maps_per_shard = 2;
+  });
+  let id = client.create(&room_for("mapshare", 64 << 10)).unwrap();
+  let one_page = usize::try_from(page).unwrap();
+  for (index, name) in ["/a", "/b", "/c"].iter().enumerate() {
+    write_file(
+      &mut client,
+      id,
+      name,
+      &pattern(one_page, u8::try_from(index).unwrap()),
+    );
+  }
+  let first = client.map_read(id, "/a").unwrap();
+  let _second = client.map_read(id, "/b").unwrap();
+  let held = daemon.direct_map_copies().unwrap();
+  assert_share_refused(client.map_read(id, "/c").err(), (2, 2));
+  assert_eq!(
+    daemon.direct_map_copies().unwrap(),
+    held,
+    "the refusal made nothing"
+  );
+  client.release_map(first).unwrap();
+  let _third = client.map_read(id, "/c").unwrap();
+  // A second client halves the share: the first, holding two, is past its one; the second is within its own.
+  let mut second_client = connect(&instance);
+  assert_share_refused(client.map_read(id, "/a").err(), (2, 1));
+  assert_eq!(counted(&daemon, "dax.local_map_share_refused"), 2);
+  drop(second_client.map_read(id, "/a").err());
+}
+
+/// Holds `refusal` to `MapShareExhausted` with `(held_maps, most_maps)`.
+#[cfg(target_os = "linux")]
+fn assert_share_refused(refusal: Option<ClientError>, (held, most): (u64, u64)) {
+  match refusal {
+    Some(ClientError::Refused(Refusal::MapShareExhausted {
+      held_maps,
+      most_maps,
+      ..
+    })) => assert_eq!(
+      (held_maps, most_maps),
+      (held, most),
+      "maps held of the share"
+    ),
+    other => panic!("a map past the share answered {other:?}"),
+  }
+}
+
+/// Maps `/f.bin` of a new volume `name` holding `bytes`, checks the map is a direct one holding one copy more than
+/// `start`, runs `leave` (what makes the file leave), and checks the map still reads the file's last bytes and the copy
+/// is still held, counted against the share, until the release gives it back.
+#[cfg(target_os = "linux")]
+fn a_map_outlives_its_file_until_released(
+  name: &str,
+  leave: impl FnOnce(&mut Client, slates_client::VolumeId),
+) {
+  let (daemon, mut client, _instance) = one_shard_daemon(name);
+  let id = client.create(&room_for(name, 64 << 10)).unwrap();
+  let bytes = pattern(64 << 10, 6);
+  write_file(&mut client, id, "/f.bin", &bytes);
+  let start = daemon.direct_map_copies().unwrap();
+  let mapped = client.map_read(id, "/f.bin").unwrap();
+  assert!(mapped.is_zero_copy(), "a direct map on Linux");
+  let held = daemon.direct_map_copies().unwrap();
+  assert_eq!(held.0, start.0 + 1, "one copy held");
+  leave(&mut client, id);
+  assert!(
+    mapped.to_vec().unwrap() == bytes,
+    "the map still reads the file's last bytes: the client's own map holds the object"
+  );
+  assert_eq!(
+    daemon.direct_map_copies().unwrap(),
+    held,
+    "the copy stays held until its client lets it go: the client's map keeps the pages the daemon wrote"
+  );
+  client.release_map(mapped).unwrap();
+  assert_eq!(
+    daemon.direct_map_copies().unwrap(),
+    start,
+    "released, the copies are where they started"
+  );
+}
+
+/// AC-A-171 (G-direct step 2): a destroyed volume's map detaches from it and is released by its client. Do: map a file,
+/// destroy its volume, read the map, release it. Expect: the map still reads the file's last bytes, the daemon still
+/// holds the copy, and the release gives it back. (A destroyed volume's copies leave the write-through index at once, so
+/// a volume given the prefix again once the count wraps never writes into them: held to that rule in
+/// `crates/vfs/tests/shards_backing.rs`.)
+#[cfg(target_os = "linux")]
+#[test]
+fn a_destroyed_volumes_map_keeps_its_copy_until_released() {
+  a_map_outlives_its_file_until_released("mapgone", |client, id| client.destroy(id).unwrap());
+}
+
+/// AC-A-171 (G-direct step 2): a removed file's map detaches from it and is released by its client. Do: map a file,
+/// remove it, read the map, release it. Expect: as for a destroyed volume.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_removed_files_map_keeps_its_copy_until_released() {
+  a_map_outlives_its_file_until_released("maprm", |client, id| {
+    let attached = client.attach(id, None, Intent::Write).unwrap();
+    client
+      .fs_remove((id, attached.attachment), "/f.bin")
+      .unwrap();
+    client.detach(attached.attachment).unwrap();
+  });
 }
 
 /// AC-A-171 (cross-shard): on a two-shard daemon a client maps files whose owner shard may not be its home shard, and
@@ -785,16 +989,18 @@ fn assert_only_the_copy_arrived(arrived: &[i32], handed: std::os::fd::BorrowedFd
 }
 
 /// §4.6 A-171 with §4.13: the descriptor a direct map hands a peer reaches one file's bytes and can change nothing.
-/// Do: a one-shard daemon with two volumes of one account — a neighbour holding a marked file in the content arena,
-/// and the peer's own holding a file of many chunks — map the peer's file, then use the descriptor that arrived the
-/// way a hostile peer would ([`judge_the_handed_descriptor`]). Expect: a direct map, every byte of the file; only the
-/// copy arrived; it is exactly the mapped length, the neighbour's marker is in none of its bytes, every attempt to
-/// change it is refused by the seal; and the map still reads the file afterwards. The same uid is not the boundary
-/// here — a §4.13 consumer is an untrusted process of this very uid holding this very channel — so what the
-/// descriptor itself authorizes is.
+/// Do: a one-shard daemon with two volumes of one account — a neighbour holding a marked file, mapped too so its own
+/// copy sits beside the peer's, and the peer's own holding a file of many chunks — map the peer's file, then use the
+/// descriptor that arrived the way a hostile peer would ([`judge_the_handed_descriptor`]). Expect: a direct map, every
+/// byte of the file; only the copy arrived; it is exactly the mapped length, the neighbour's marker is in none of its
+/// bytes, every attempt to change it is refused by the seal; and the map still reads the file afterwards. The same uid
+/// is not the boundary here — a §4.13 consumer is an untrusted process of this very uid holding this very channel — so
+/// what the descriptor itself authorizes is.
 ///
-/// Non-vacuity: the marker is found in the daemon's content arena before the map, so a clean scan of the descriptor
-/// is a fact about the descriptor; and the descriptor probe sees this daemon's objects at all.
+/// Non-vacuity: the marker is found in this daemon's memory objects before the map, so a clean scan of the descriptor
+/// is a fact about the descriptor; and the descriptor probe sees this daemon's objects at all. The neighbour's copy is
+/// what makes the first certain: the content arena holds the marker only until the idle sweep seals its extent at rest
+/// (A-99), and on CI's ThreadSanitizer lane, 2026-10-25, the sweep came first and the arena held none.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_direct_maps_descriptor_reads_one_file_and_changes_nothing() {
@@ -813,10 +1019,16 @@ fn a_direct_maps_descriptor_reads_one_file_and_changes_nothing() {
   let bytes = pattern(MANY_CHUNKS_BYTES, 5);
   write_file(&mut client, mine, "/mine.bin", &bytes);
 
-  let in_the_arena = occurrences_in_this_process(NEIGHBOUR_MARKER, &instance);
+  // The neighbour's own copy holds its marker in the clear for as long as it is held: a copy is never sealed at rest.
+  let neighbours_map = client.map_read(neighbour, "/secret.bin").unwrap();
   assert!(
-    in_the_arena > 0,
-    "the neighbour's content is in the daemon's content arena, so the scan can find it"
+    neighbours_map.is_zero_copy(),
+    "the neighbour's map is a direct one"
+  );
+  let findable = occurrences_in_this_process(NEIGHBOUR_MARKER, &instance);
+  assert!(
+    findable > 0,
+    "the neighbour's content is in this daemon's memory objects, so the scan can find it"
   );
   let before = memory_object_descriptors(&instance);
   assert!(
@@ -840,6 +1052,7 @@ fn a_direct_maps_descriptor_reads_one_file_and_changes_nothing() {
   );
   drop(mapped);
   assert_eq!(counted(&daemon, "dax.local_map_unconfined"), 0);
+  drop(neighbours_map);
   client.destroy(mine).unwrap();
   client.destroy(neighbour).unwrap();
 }

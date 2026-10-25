@@ -5444,6 +5444,9 @@ impl Volume {
     // The number leaves the head: return its credit to the inode allowance (§4.2). The single
     // permanent-free site, matching `next_no`'s single charge.
     self.live_inodes = self.live_inodes.saturating_sub(1);
+    // A same-kernel client's copy of the file stops following it, since nothing writes the file again (§4.6, A-171);
+    // the copy stays held, and counted, until its client lets it go.
+    let _detached = store.shards_backings.detach_file_peers(self.prefix, no);
     // The base plane's descriptor, if one was held, is closed when the next overlay borrow ends (the volume holds no
     // host here); the tables forget the inode now.
     if let Some(file) = self.base_forget(store, no)
