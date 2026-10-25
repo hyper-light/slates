@@ -2903,7 +2903,8 @@ same-namespace host process is the first delivered case.
 > (each environment on each platform, by the mount route and the socket route) are proven, owed or ruled out by the
 > platform, is the matrix in `docs/wip/virtiofs.md` §8.
 > - **Proven:** a host process's shared map through the Linux FUSE mount; the same-kernel direct map on Linux x86_64
->   (A-135); crosvm over a slates mount (Linux x86_64); a Shards guest over the daemon's stream (macOS arm64, A-163).
+>   (A-135); crosvm over a slates mount (Linux x86_64); a Shards guest over the daemon's stream (macOS arm64, A-163);
+>   Firecracker by virtio-pmem over the image file through a slates mount (Linux x86_64, A-165).
 > - **Ruled out by the platforms:** QEMU's vhost-user-fs and Cloud Hypervisor have no DAX window, so neither has Kata;
 >   crosvm's window is x86_64-only; Apple's Virtualization framework and WSL2 document none (unconfirmed).
 > - **Owed:** every other cell, each to a named goal.
@@ -12094,6 +12095,65 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
+
+### A-165 — Firecracker maps a volume's image with DAX through virtio-pmem (accepted 2026-10-24)
+Applied in the same change to: `crates/guest-probe/src/guest.rs` (module loads, the device node's wait, the block
+mount's file system and `dax=` keys), `crates/cli/tests/guest_image.rs` (three pmem tests beside the drive test, which
+now shares their setup), `crates/cli/tests/vm/mod.rs` (an initramfs that carries modules; the daemon's and the VM's
+kills, shared), `crates/cli/tests/guest_dax.rs` (those helpers moved out), `docs/wip/virtiofs.md` §8 (the Firecracker
+row, the matrix's Firecracker cell, the pmem paragraph), §4.6 (the DAX matrix status), GAPS, `docs/cli.md` (an image a
+crashed guest left). The evidence is kiln research 01a171864dfb7057a3dc0aee87b29280 (12 findings, graded from their
+sources).
+- **What it answers.** A-164 left Firecracker's mount route owed. Firecracker has no virtio-fs, but since 1.14 it
+  presents a host file to its guest as a virtio-pmem device: it maps the file shared, as a range of the guest's
+  physical memory, and carries out a guest's flush as an `msync(MS_SYNC)` of the file (its `docs/pmem.md`). The image
+  A-160 builds, read through a slates mount, is that file, so nothing in the daemon changes. The guest's DAX reads,
+  writes and maps reach the image file's pages in the host's cache, and the host's cache writes them back into the
+  volume.
+- **The guest.** It mounts `/dev/pmem0` as ext4 with `dax=always`.
+  - ext4's driver mounts the ext2 image; ext2's own DAX was removed for Linux 7.2. DAX needs the 4 KiB block A-160's
+    format already has.
+  - A distribution's kernel builds virtio-pmem and the nvdimm drivers behind it as modules: on the box's 7.2.9 there are
+    nine, from `asn1_encoder` to `nd_pmem`, by `modules.dep`. The test carries them in the initramfs from the guest
+    kernel's module directory. The probe loads them with `finit_module`, which decompresses them in the kernel, then
+    waits for the device node on an inotify watch, since libnvdimm registers its namespaces asynchronously.
+  - Firecracker v1.17.0's configuration must name `drives` even when it attaches none.
+- **What DAX is here, by test.**
+  - A store through the guest's map is in the image file, read through the slates mount, before the guest syncs: it is
+    the file's own page in the host's cache.
+  - A write through the slates mount shows in the guest's map, the guest touching memory alone.
+  - The guest's sync, which Firecracker carries out as its `msync`, writes the guest's stores into the volume, read
+    through slates itself.
+- **Chaos.**
+  - **The daemon killed with `SIGKILL` under the guest's live map.** The anchor's successor serves the restored mount,
+    with A-158's round: 13 inodes invalidated and 3 epochs bumped a run. The guest's unsynced store is in the image after
+    the takeover, the host's next write shows in its map, and the merge is exact.
+  - **Firecracker killed with an unsynced store.** The store is the file's own page, so it reaches the volume when the
+    dead VMM's file closes.
+    - The guest never unmounted, so `slates image merge` refuses the image `NotClean`. It still refuses it after a
+      second guest mounts and cleanly unmounts it: ext4 without a journal clears the clean flag at mount and writes back,
+      at unmount, the state it found.
+    - `e2fsck -fy` through the mount makes the file system clean. Its one repair is the `lost+found` it creates, which
+      A-160's images do not carry. The merge takes it as a new directory, as it would take any orphans e2fsck recovered
+      there.
+- **Evidence (2026-10-24).** On the box: Linux 7.2.9 x86_64, Firecracker v1.17.0, the box's own kernel as the guest's.
+  Every run was in a capped `systemd --user` unit, at load 38–84 on 32 cores.
+  - The pmem test: green 5 of 5 in rounds of the whole image-test binary on the committed code, and 6 runs before.
+    - The guest booted to ready in 157–652 ms, the nine module loads included.
+    - The host's write reached the guest's map in 8–13 µs.
+    - The merge was exact: 2 made, 1 moved, 1 removed, and 4,123 bytes written (the patch's page and the new file).
+  - The takeover test: green 10 of 10 on the committed code (5 alone, 5 in whole-binary rounds), and 7 runs before. The
+    host's write reached the guest's map 83–3,351 µs after the takeover.
+  - The crash test: green 5 of 5 on the committed code, and 4 runs before.
+  - The drive test (A-160), sharing the new setup: green in every round.
+  - Red-checked, each mutation failing at its own check:
+    - without DAX: the map is not DAX;
+    - without DAX and without that assertion: the store is not in the host's file;
+    - without the guest's sync: slates lacks the guest's last store;
+    - the crash test with a clean quit for the kill: the merge is not refused;
+    - the crash test with no store: slates lacks it;
+    - the takeover test with no unsynced store: the image lacks it.
+- **Does not change:** A-160's format, build and merge, or the drive route.
 
 ### A-164 — What DAX means in each environment, and the cells the platforms rule out (accepted 2026-10-24)
 Applied in the same change to: `docs/wip/virtiofs.md` §8 (the DAX matrix, which replaces the route table's DAX column),

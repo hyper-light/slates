@@ -30,13 +30,18 @@ pub(crate) const REPLY_WAIT: Duration = Duration::from_secs(30);
 pub(crate) const QUIT_WAIT: Duration = Duration::from_secs(20);
 /// Shape: the console lines kept to explain a failure.
 pub(crate) const TRANSCRIPT_LINES: usize = 80;
-/// Format: the cpio `newc` magic, and the modes of the initramfs's directories and of `/init`
+/// Shape: how long the guest waits, touching memory only, for another path's write to reach its map. Delivery takes a
+/// median of 82 µs (GAPS, 2026-10-21); this bounds liveness, not latency.
+pub(crate) const DELIVERY_MILLIS: u64 = 10_000;
+/// Format: the cpio `newc` magic, and the modes of the initramfs's directories and files
 /// (`Documentation/driver-api/early-userspace/buffer-format.rst`).
 const CPIO_MAGIC: &[u8] = b"070701";
 /// Format: a directory, `rwxr-xr-x`.
 const DIRECTORY_MODE: u32 = 0o040_755;
 /// Format: a regular file, `rwxr-xr-x`.
 const EXECUTABLE_MODE: u32 = 0o100_755;
+/// Format: a regular file, `rw-r--r--`.
+const FILE_MODE: u32 = 0o100_644;
 /// Format: the name of the cpio archive's last entry.
 const CPIO_TRAILER: &str = "TRAILER!!!";
 
@@ -89,6 +94,49 @@ pub(crate) fn start_anchor(instance: &str) -> Anchor {
   let (code, _, err) = run(instance, &["bootstrap", "root"]);
   assert_eq!(code, 0, "explicit first-time bootstrap: {err}");
   anchor
+}
+
+/// The anchor's daemon: the process whose parent is the anchor (`/proc/PID/stat`'s fourth field).
+pub(crate) fn daemon_of(anchor: &Anchor) -> Option<u32> {
+  let anchor_pid = anchor.child.id();
+  #[allow(clippy::disallowed_methods)] // reads the kernel's process table: a query, never a write
+  let processes = std::fs::read_dir("/proc").ok()?;
+  processes
+    .flatten()
+    .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+    .find(|pid| {
+      #[allow(clippy::disallowed_methods)] // the same query, one process at a time
+      let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+      let parent = stat
+        .rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().nth(1))
+        .and_then(|parent| parent.parse::<u32>().ok());
+      parent == Some(anchor_pid)
+    })
+}
+
+/// Kills `anchor`'s daemon with `SIGKILL`, and waits until the anchor's successor answers `instance`'s verbs steadily:
+/// the two process ids.
+pub(crate) fn kill_the_daemon(anchor: &Anchor, instance: &str) -> (u32, u32) {
+  let old = daemon_of(anchor).expect("the anchor runs a daemon");
+  rustix::process::kill_process(
+    rustix::process::Pid::from_raw(i32::try_from(old).unwrap()).unwrap(),
+    rustix::process::Signal::KILL,
+  )
+  .unwrap();
+  let started = Instant::now();
+  let new = loop {
+    assert!(
+      started.elapsed() < START_WAIT,
+      "the anchor restarted its daemon within {START_WAIT:?}"
+    );
+    match daemon_of(anchor) {
+      Some(pid) if pid != old => break pid,
+      _ => pause(),
+    }
+  };
+  await_steady(instance);
+  (old, new)
 }
 
 /// Waits until `instance`'s daemon answers [`STABLE_STREAK`] verbs in a row.
@@ -193,20 +241,35 @@ pub(crate) fn write_at(path: &str, offset: u64, bytes: &[u8]) {
     .unwrap_or_else(|e| panic!("pwrite {path} at {offset}: {e}"));
 }
 
-/// The guest's initramfs in the `newc` cpio format the kernel unpacks: the directories the probe mounts over, and the
-/// probe itself as `/init`.
-pub(crate) fn initramfs(init: &[u8]) -> Vec<u8> {
+/// A kernel module the guest loads before its mount: its file name, which the guest's command line names, and its
+/// bytes, as its kernel's module directory holds them.
+pub(crate) struct Module {
+  pub(crate) name: String,
+  pub(crate) bytes: Vec<u8>,
+}
+
+/// The guest's initramfs in the `newc` cpio format the kernel unpacks: the directories the probe mounts over, the probe
+/// itself as `/init`, and `modules` under `/modules`, where the probe loads them from.
+pub(crate) fn initramfs(init: &[u8], modules: &[Module]) -> Vec<u8> {
   let mut archive = Vec::new();
-  for (inode, name) in ["dev", "proc", "sys", "mnt"].into_iter().enumerate() {
+  let mut inode = 0usize;
+  let mut next_inode = || {
+    inode = inode.saturating_add(1);
+    inode
+  };
+  for name in ["dev", "proc", "sys", "mnt", "modules"] {
+    cpio_entry(&mut archive, next_inode(), name, DIRECTORY_MODE, &[]);
+  }
+  cpio_entry(&mut archive, next_inode(), "init", EXECUTABLE_MODE, init);
+  for module in modules {
     cpio_entry(
       &mut archive,
-      inode.saturating_add(1),
-      name,
-      DIRECTORY_MODE,
-      &[],
+      next_inode(),
+      &format!("modules/{}", module.name),
+      FILE_MODE,
+      &module.bytes,
     );
   }
-  cpio_entry(&mut archive, 5, "init", EXECUTABLE_MODE, init);
   cpio_entry(&mut archive, 0, CPIO_TRAILER, 0, &[]);
   archive
 }
@@ -410,6 +473,16 @@ impl Guest {
       );
       pause();
     }
+  }
+
+  /// Kills the VM and its device processes without warning, as a crashed VMM dies.
+  pub(crate) fn kill(&mut self) {
+    rustix::process::kill_process_group(
+      rustix::process::Pid::from_child(&self.vm),
+      rustix::process::Signal::KILL,
+    )
+    .unwrap();
+    let _ = self.vm.wait();
   }
 }
 

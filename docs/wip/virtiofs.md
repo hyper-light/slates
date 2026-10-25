@@ -252,7 +252,7 @@ box shared with two other builds — timings are not benchmarks)
    | OCI (Docker, Kubernetes on runc) | the host mount bound into the container (A-28, proven 2026-10-19) | a process in the container maps the file, through the bound mount or by A-135's direct map: the DAX matrix below (A-164) |
    | Shards | the host mount shared with `VOLUME … FOR`; or the daemon's own stream, handed out by `slates shards` (A-161) | over the mount, Shards' DAX window (D189, `crates/vmm/src/devices/virtio/fs/mod.rs` on `gpu`, read 2026-10-21) maps the host file; over the stream, it maps a per-attachment copy of the file that slates keeps equal to the volume (A-163, a real guest 3 of 3 on this Mac, 2026-10-24) |
    | QEMU, crosvm, Kubernetes on VM runtimes (Kata) | the host mount shared by virtio-fs (virtiofsd or the VMM's own device) | the sharer's DAX window maps the host file |
-   | Firecracker | **no folder sharing at all** — no virtio-fs (its README, read 2026-10-21) — so a volume reaches it as a disk-image file: `slates image build` writes a snapshot as ext2 into an image volume, the guest's drive is that file through a slates mount, and `slates image merge` reads the guest's image back into a clone (A-160; built and proven by a real Firecracker v1.17.0 run, 2026-10-24) | pmem would map the image file; not yet run (the proven drive is virtio-blk) |
+   | Firecracker | **no folder sharing at all** — no virtio-fs (its README, read 2026-10-21) — so a volume reaches it as a disk-image file: `slates image build` writes a snapshot as ext2 into an image volume, the guest's drive is that file through a slates mount, and `slates image merge` reads the guest's image back into a clone (A-160; built and proven by a real Firecracker v1.17.0 run, 2026-10-24) | pmem maps the image file with DAX (A-165; proven by real runs on the box, 2026-10-24) |
 
    **The DAX matrix (A-164, 2026-10-24).** What DAX means in each environment is A-164's: a consumer reading and
    writing a file's bytes in place, through mapped memory, coherent with every other path. Each cell below is one of:
@@ -286,7 +286,7 @@ box shared with two other builds — timings are not benchmarks)
 
    | platform | mount route (pmem over the image file, A-160) | socket route |
    |---|---|---|
-   | Linux x86_64 | owed: G-pmem | impossible: Firecracker has no virtio-fs or vhost-user-fs device |
+   | Linux x86_64 | proven: `crates/cli/tests/guest_image.rs`, its three pmem tests (the box, gated; A-165) | impossible: Firecracker has no virtio-fs or vhost-user-fs device |
    | Linux arm64 | owed: G-arm64-guest (Firecracker's pmem doc covers DAX on aarch64) | impossible: the same |
    | macOS, Windows | none: Firecracker runs on Linux KVM only | none |
 
@@ -466,8 +466,20 @@ box shared with two other builds — timings are not benchmarks)
    initramfs held in a slates volume, the guest reading every node as the volume holds it, then patching, renaming,
    removing, writing, making a directory and flushing; the merge held the clone to exactly the guest's tree. Its exit
    on the guest's restart is a race between the keyboard-controller reset and the kernel's triple-fault fallback, which
-   the test takes in either form (GAPS). Still owed: Shards' DAX window over the macOS mount, and a pmem drive (DAX on
-   the image file) under Firecracker.
+   the test takes in either form (GAPS). Still owed: Shards' DAX window over the macOS mount.
+
+   **Firecracker's pmem form (A-165; built and proven 2026-10-24).** Firecracker (1.14 and later) can attach the same
+   image file as a virtio-pmem device: it maps the file shared as a range of the guest's physical memory, and carries
+   out a guest's flush as an `msync` of it. The guest mounts the device as ext4 with `dax=always`, after loading the
+   nine modules a distribution kernel builds virtio-pmem and nd_pmem as, which the test carries in the initramfs.
+   - What the three pmem tests in `crates/cli/tests/guest_image.rs` prove on the box:
+     - the guest's unsynced store is in the image file, read through the slates mount;
+     - a write through the mount shows in the guest's map in 8–13 µs;
+     - the guest's sync reaches the volume;
+     - a daemon killed under the live map is taken over with nothing lost;
+     - a killed Firecracker's unsynced stores reach the volume. The merge refuses that image as `NotClean` until
+       `e2fsck -fy` has checked it, whose one repair is a `lost+found` the merge then takes.
+   - Every check is red-checked.
 
    **What has to be proven, per target, by real runs** (the goal's bar: adversarial and chaos testing at each
    step): the guest or container reads and writes the volume; DAX works where the platform has it, which needs a

@@ -17,11 +17,21 @@
 //! removals, directories, a flush. With `slates.end=reboot` it ends the VM by rebooting, which is how a Firecracker
 //! guest stops it (its command line's `reboot=k` resets the keyboard controller, and Firecracker exits); otherwise by
 //! powering off, as under crosvm.
+//!
+//! **The pmem guest (A-165).** Firecracker can present the same image file as a virtio-pmem device instead: the file's
+//! pages, mapped shared by Firecracker through the slates mount, become a range of the guest's physical memory. With
+//! `slates.fs=ext4` and `slates.dax=always` the guest mounts it with DAX, so a file's reads, writes and maps reach
+//! those pages with no page cache of the guest's own between (ext2's own driver no longer offers DAX; ext4's mounts an
+//! ext2 image). A distribution's kernel builds virtio-pmem and the nvdimm drivers behind it as modules, so with
+//! `slates.modules=` the guest first loads the modules its initramfs carries under `/modules`, in the order named, and
+//! waits for the device's node, which the drivers create after their loads return.
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, c_int};
 use std::io::Write;
+use std::mem::MaybeUninit;
 use std::os::fd::OwnedFd;
 
+use rustix::fs::inotify::{CreateFlags, Reader, WatchFlags};
 use rustix::fs::{AtFlags, Mode, OFlags, StatxAttributes, StatxFlags};
 use rustix::mm::{MapFlags, MsyncFlags, ProtFlags};
 use rustix::mount::{MountFlags, UnmountFlags};
@@ -47,6 +57,27 @@ const END_KEY: &str = "slates.end=";
 /// Format: the file system a block device holds: the image a slates volume is presented as (A-160). A kernel without
 /// the ext2 driver mounts it through ext4's (`CONFIG_EXT4_USE_FOR_EXT2`).
 const BLOCK_FILESYSTEM: &str = "ext2";
+/// Format: the kernel command line's key naming the file system to mount a block device as, in place of
+/// [`BLOCK_FILESYSTEM`]: `ext4` for a DAX mount of the image (A-165).
+const FILESYSTEM_KEY: &str = "slates.fs=";
+/// Format: the kernel command line's key naming the kernel modules to load before the mount: files of
+/// [`MODULE_DIRECTORY`], comma-separated, in load order.
+const MODULES_KEY: &str = "slates.modules=";
+/// Format: where the initramfs carries the modules [`MODULES_KEY`] names.
+const MODULE_DIRECTORY: &str = "/modules";
+/// Format: `finit_module`'s flag for a compressed module file, which the kernel decompresses itself
+/// (`MODULE_INIT_COMPRESSED_FILE`, `include/uapi/linux/module.h`, since Linux 5.17).
+const MODULE_INIT_COMPRESSED_FILE: c_int = 4;
+/// Format: the suffixes of a compressed module file, one per compression a kernel can be built to load
+/// (`CONFIG_MODULE_COMPRESS_ZSTD`, `_XZ`, `_GZIP`).
+const COMPRESSED_MODULE_SUFFIXES: [&str; 3] = [".zst", ".xz", ".gz"];
+/// Format: the fixed part of an inotify event (`struct inotify_event`: `wd`, `mask`, `cookie`, `len`, four bytes each).
+const INOTIFY_EVENT_HEADER: usize = 16;
+/// Format: the longest name an inotify event carries (`NAME_MAX`).
+const NAME_MAX: usize = 255;
+/// Derived: the smallest buffer that reads at least one inotify event, as `inotify(7)` gives it:
+/// `sizeof(struct inotify_event) + NAME_MAX + 1`.
+const INOTIFY_BUFFER: usize = INOTIFY_EVENT_HEADER + NAME_MAX + 1;
 /// Shape: the most bytes one `write` or `patch` may carry, expanded from its runs: a few chunks of a test file.
 const LONGEST_WRITE: usize = 16 << 20;
 /// Shape: the most of the kernel command line read: x86_64's own limit is 2,048 bytes.
@@ -88,8 +119,12 @@ fn serve(end: &mut End) -> Result<(), String> {
   if option(&cmdline, END_KEY) == Some("reboot") {
     *end = End::Reboot;
   }
+  load_modules(&cmdline)?;
   match option(&cmdline, BLOCK_KEY) {
-    Some(device) => mount_block(device)?,
+    Some(device) => {
+      await_node(device)?;
+      mount_block(&cmdline, device)?;
+    }
     None => mount_tag(&cmdline)?,
   }
   say(&Reply::Ready)?;
@@ -278,16 +313,81 @@ fn described(full: &std::path::Path, path: &str) -> Result<(EntryKind, u64, u64)
   })
 }
 
-/// Mounts block device `device` as ext2 at [`MOUNT_POINT`].
-fn mount_block(device: &str) -> Result<(), String> {
+/// Loads the kernel modules the command line names ([`MODULES_KEY`]), in its order, each from [`MODULE_DIRECTORY`]; a
+/// compressed one the kernel decompresses. A module that does not load ends the guest, since the device it drives
+/// would never come.
+fn load_modules(cmdline: &str) -> Result<(), String> {
+  let Some(names) = option(cmdline, MODULES_KEY) else {
+    return Ok(());
+  };
+  for name in names.split(',').filter(|name| !name.is_empty()) {
+    let path = format!("{MODULE_DIRECTORY}/{name}");
+    let file = rustix::fs::open(
+      path.as_str(),
+      OFlags::RDONLY | OFlags::CLOEXEC,
+      Mode::empty(),
+    )
+    .map_err(|e| format!("open {path}: {e}"))?;
+    let flags = if COMPRESSED_MODULE_SUFFIXES
+      .iter()
+      .any(|suffix| name.ends_with(suffix))
+    {
+      MODULE_INIT_COMPRESSED_FILE
+    } else {
+      0
+    };
+    rustix::system::finit_module(&file, c"", flags)
+      .map_err(|e| format!("load module {name}: {e}"))?;
+  }
+  Ok(())
+}
+
+/// Waits until the device node `device` exists. A module's driver binds its device, and the kernel names it in `/dev`,
+/// after the load returns (libnvdimm registers its namespaces asynchronously), so the wait is on an inotify watch of the
+/// node's directory, set before the first look so that no creation falls between the two. The host's boot wait bounds
+/// it: a node that never comes is a guest that never says it is ready.
+fn await_node(device: &str) -> Result<(), String> {
+  let directory = std::path::Path::new(device)
+    .parent()
+    .ok_or_else(|| format!("{device} names no directory"))?;
+  let inotify =
+    rustix::fs::inotify::init(CreateFlags::CLOEXEC).map_err(|e| format!("inotify: {e}"))?;
+  rustix::fs::inotify::add_watch(&inotify, directory, WatchFlags::CREATE)
+    .map_err(|e| format!("watch {}: {e}", directory.display()))?;
+  let mut buffer = [MaybeUninit::<u8>::uninit(); INOTIFY_BUFFER];
+  let mut events = Reader::new(&inotify, &mut buffer);
+  loop {
+    match rustix::fs::stat(device) {
+      Ok(_) => return Ok(()),
+      Err(rustix::io::Errno::NOENT) => {
+        events.next().map_err(|e| format!("await {device}: {e}"))?;
+      }
+      Err(e) => return Err(format!("stat {device}: {e}")),
+    }
+  }
+}
+
+/// Mounts block device `device` at [`MOUNT_POINT`] as the file system the command line names ([`FILESYSTEM_KEY`], or
+/// [`BLOCK_FILESYSTEM`]), with the `dax=` option it names.
+fn mount_block(cmdline: &str, device: &str) -> Result<(), String> {
+  let filesystem = option(cmdline, FILESYSTEM_KEY).unwrap_or(BLOCK_FILESYSTEM);
+  let data = dax_option(cmdline)?;
   rustix::mount::mount(
     device,
     MOUNT_POINT,
-    BLOCK_FILESYSTEM,
+    filesystem,
     MountFlags::empty(),
-    None::<&CStr>,
+    data.as_deref(),
   )
-  .map_err(|e| format!("mount {device} as {BLOCK_FILESYSTEM} at {MOUNT_POINT}: {e}"))
+  .map_err(|e| format!("mount {device} as {filesystem} at {MOUNT_POINT}: {e}"))
+}
+
+/// The `dax=` mount option the command line names ([`DAX_KEY`]), if it names one.
+fn dax_option(cmdline: &str) -> Result<Option<CString>, String> {
+  option(cmdline, DAX_KEY)
+    .map(|mode| CString::new(format!("dax={mode}")))
+    .transpose()
+    .map_err(|e| format!("the dax option: {e}"))
 }
 
 /// Mounts a pseudo-filesystem the guest needs.
@@ -333,10 +433,7 @@ fn option<'c>(cmdline: &'c str, key: &str) -> Option<&'c str> {
 /// Mounts the virtio-fs tag at [`MOUNT_POINT`], with the DAX option the command line names.
 fn mount_tag(cmdline: &str) -> Result<(), String> {
   let tag = option(cmdline, TAG_KEY).unwrap_or(DEFAULT_TAG);
-  let data = option(cmdline, DAX_KEY)
-    .map(|mode| CString::new(format!("dax={mode}")))
-    .transpose()
-    .map_err(|e| format!("the dax option: {e}"))?;
+  let data = dax_option(cmdline)?;
   rustix::mount::mount(
     tag,
     MOUNT_POINT,

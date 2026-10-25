@@ -351,16 +351,21 @@ A volume reaches a VMM that shares no folder with its guest (Firecracker) as a d
 `slates image build ID SNAPSHOT NAME --capacity SIZE` renders the snapshot as an ext2 file system of
 `SIZE` bytes in a new volume `NAME`, as one file, `image.ext2`. It prints the image volume's `id`, its
 `file`, and the image's `image_bytes`, `blocks_used` and `inodes_used`. Mount the image volume and point
-the VMM's block device at `image.ext2`. The image carries names, kinds, permissions, owners, nanosecond
-times, symbolic links, hard links, FIFOs and sockets; it does not carry extended attributes or holes.
-The image volume pins its snapshot as a clone does: `volume destroy-snapshot` is refused until the image
-volume is destroyed. `slates image merge IMAGE NAME` reads the image as it is when the merge starts (an
-image the guest has not cleanly unmounted is refused). It makes a new clone `NAME` of the snapshot the
-image was built from hold the image's tree, and prints the clone's `id` and what the merge did: `kept`,
-`created`, `moved`, `linked`, `removed`, `names_removed`, `staged`, `bytes_compared`, `bytes_written`
-and `attributes_set`. A file the guest renamed keeps its identity in the clone, and an unchanged chunk
-stays shared. A name the volume cannot hold (not UTF-8), a device, or an image that is not ext2 as the
-build writes it is refused `ImageRefused`, naming why, and no clone is made. Both verbs run in slices on
+the VMM's block device at `image.ext2`, or its pmem device (Firecracker 1.14 and later): a guest that
+mounts the pmem device as ext4 with `dax=always` maps the file's pages with no page cache of its own
+(A-165). The image carries names, kinds, permissions, owners, nanosecond times, symbolic links, hard
+links, FIFOs and sockets; it does not carry extended attributes or holes. The image volume pins its
+snapshot as a clone does: `volume destroy-snapshot` is refused until the image volume is destroyed.
+`slates image merge IMAGE NAME` reads the image as it is when the merge starts (an image the guest has
+not cleanly unmounted is refused). It makes a new clone `NAME` of the snapshot the image was built from
+hold the image's tree, and prints the clone's `id` and what the merge did: `kept`, `created`, `moved`,
+`linked`, `removed`, `names_removed`, `staged`, `bytes_compared`, `bytes_written` and `attributes_set`. A
+file the guest renamed keeps its identity in the clone, and an unchanged chunk stays shared. A name the
+volume cannot hold (not UTF-8), a device, or an image that is not ext2 as the build writes it is refused
+`ImageRefused`, naming why, and no clone is made. After a guest's crash, run `e2fsck -fy` on
+`image.ext2` through the image volume's mount: it checks the file system and marks it clean, and the
+merge then takes the guest's tree. e2fsck adds a `lost+found` (the build makes none), which the merge
+takes like any new directory. Both verbs run in slices on
 the volume's owner while the daemon serves, and wait for their result.
 
 A fleet whose deployment manifest declares a `durability` policy (`accepted_loss`, `coincident_failures`)

@@ -27,17 +27,13 @@
 mod vm;
 
 use std::process::Command;
-use std::time::Instant;
 
 use slates_guest_probe::protocol::{Command as Ask, Reply};
 use vm::{
-  Anchor, Guest, MountPoint, REPLY_WAIT, START_WAIT, await_steady, created_volume, initramfs,
-  pause, run, start_anchor, write_at, write_whole,
+  Anchor, DELIVERY_MILLIS, Guest, MountPoint, REPLY_WAIT, created_volume, initramfs,
+  kill_the_daemon, run, start_anchor, write_at, write_whole,
 };
 
-/// Shape: how long the guest waits, touching memory only, for another path's write to reach its map. Delivery takes a
-/// median of 82 µs (GAPS, 2026-10-21); this bounds liveness, not latency.
-const DELIVERY_MILLIS: u64 = 10_000;
 /// Shape: the pages of each shared file; the guest's memory and processors.
 const PAGES: u64 = 8;
 /// Shape: the guest's memory, MiB.
@@ -425,7 +421,7 @@ impl Rig {
     // reads the built probe binary: a test input, never written
     let probe = std::fs::read(&gate.probe).unwrap_or_else(|e| panic!("read {}: {e}", gate.probe));
     let initrd = boot_side.file("initramfs.cpio");
-    write_whole(&initrd, &initramfs(&probe));
+    write_whole(&initrd, &initramfs(&probe, &[]));
     let most_bytes = usize::try_from(PAGES)
       .unwrap()
       .saturating_mul(rustix::param::page_size());
@@ -452,67 +448,12 @@ const UNSYNCED_STORES: usize = 6;
 /// Shape: the other path's writes after a VM's death, over spans its unsynced stores may share.
 const WRITES_AFTER_THE_KILL: usize = 4;
 
-/// The anchor's daemon: the process whose parent is the anchor (`/proc/PID/stat`'s fourth field).
-fn daemon_of(anchor: &Anchor) -> Option<u32> {
-  let anchor_pid = anchor.child.id();
-  #[allow(clippy::disallowed_methods)] // reads the kernel's process table: a query, never a write
-  let processes = std::fs::read_dir("/proc").ok()?;
-  processes
-    .flatten()
-    .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
-    .find(|pid| {
-      #[allow(clippy::disallowed_methods)] // the same query, one process at a time
-      let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
-      let parent = stat
-        .rsplit_once(')')
-        .and_then(|(_, rest)| rest.split_whitespace().nth(1))
-        .and_then(|parent| parent.parse::<u32>().ok());
-      parent == Some(anchor_pid)
-    })
-}
-
-/// Kills the rig's daemon with `SIGKILL`, and waits until the anchor's successor answers verbs steadily: the two
-/// process ids.
-fn kill_the_daemon(rig: &Rig) -> (u32, u32) {
-  let old = daemon_of(&rig.anchor).expect("the anchor runs a daemon");
-  rustix::process::kill_process(
-    rustix::process::Pid::from_raw(i32::try_from(old).unwrap()).unwrap(),
-    rustix::process::Signal::KILL,
-  )
-  .unwrap();
-  let started = Instant::now();
-  let new = loop {
-    assert!(
-      started.elapsed() < START_WAIT,
-      "the anchor restarted its daemon within {START_WAIT:?}"
-    );
-    match daemon_of(&rig.anchor) {
-      Some(pid) if pid != old => break pid,
-      _ => pause(),
-    }
-  };
-  await_steady(&rig.instance);
-  (old, new)
-}
-
 /// Syncs `path` through its slates mount from the host, so what the host's page cache holds dirty is written back.
 #[allow(clippy::disallowed_methods)] // the test's own sync through a slates mount: RAM, not disk
 fn sync_through(path: &str) {
   std::fs::File::open(path)
     .and_then(|file| file.sync_all())
     .unwrap_or_else(|e| panic!("fsync {path}: {e}"));
-}
-
-impl Guest {
-  /// Kills the VM and its device processes without warning, as a crashed VMM dies.
-  fn kill(&mut self) {
-    rustix::process::kill_process_group(
-      rustix::process::Pid::from_child(&self.vm),
-      rustix::process::Signal::KILL,
-    )
-    .unwrap();
-    let _ = self.vm.wait();
-  }
 }
 
 /// §4.6 (the mount route, A-139/A-140/A-146) through a real guest with DAX. Do: share a slates mount into a crosvm
@@ -588,7 +529,7 @@ fn a_daemon_killed_under_a_guests_live_map_is_taken_over_and_the_guest_goes_on()
     let span = history.span();
     history.guest_stores(span, &mut guest);
   }
-  let (old, new) = kill_the_daemon(&rig);
+  let (old, new) = kill_the_daemon(&rig.anchor, &rig.instance);
   assert_ne!(old, new, "the anchor's successor is a new daemon");
   history.steps(STEPS / 2, &mut guest);
   history.check(&mut guest);

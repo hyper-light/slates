@@ -11219,10 +11219,12 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
 - **The DAX matrix (A-164, 2026-10-24): every cell of "DAX everywhere" is proven, owed to a goal, or ruled out by its
   platform.** The matrix is in `virtiofs.md` §8: six environments, each platform a row, two routes, 52 cells, none left
   unknown. The research behind it is kiln 01a17143717a7556a52f40f1d5a0e1b2 (19 findings, graded from their sources).
-  - **Proven (4 cells):**
+  - **Proven (5 cells):**
     - bare-metal Linux x86_64 by both routes: the FUSE mount's shared maps, and the A-135 direct map;
     - crosvm on Linux x86_64 by the mount route;
-    - a Shards guest on macOS arm64 by the socket route.
+    - a Shards guest on macOS arm64 by the socket route;
+    - Firecracker on Linux x86_64 by the mount route: virtio-pmem over the image file (A-165, 2026-10-24; the entry
+      below).
   - **Ruled out:**
     - QEMU and Kata on it: upstream vhost-user-fs has no window property;
     - Cloud Hypervisor: "it is not available";
@@ -11231,7 +11233,6 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     - WSL2: 9P (unconfirmed);
     - Firecracker's socket route: it has no fs device.
   - **Owed, each to a kiln goal:**
-    - Firecracker by pmem over the image file;
     - VMs on slates' own device (crosvm, Linux);
     - the direct map on macOS and Windows;
     - the mount route's maps on macOS, Windows and in containers and pods;
@@ -11241,6 +11242,24 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     - arm64 Linux hosts;
     - arm64 Linux guests;
     - macOS writable shared maps over NFS.
+- **Firecracker maps a volume's image with DAX through virtio-pmem (A-165, 2026-10-24): proven by real runs.**
+  The image A-160 builds, read through a slates mount, is the pmem device's backing file. The guest loads the nine
+  modules its distribution kernel builds virtio-pmem and nd_pmem as, then mounts the device as ext4 with `dax=always`.
+  Nothing in the daemon changed.
+  - **Proven on the box** (`crates/cli/tests/guest_image.rs`, gated; Linux 7.2.9, Firecracker v1.17.0, capped runs at
+    load 38–84):
+    - the pmem test, 5 of 5 whole-binary rounds on the committed code: the guest's unsynced store is in the host's file,
+      the host's write reaches the guest's map in 8–13 µs, the guest's sync reaches slates, and the merge is exact;
+    - the takeover test, 10 of 10: a daemon killed under the live map loses nothing, and the host's write reaches the
+      map 83–3,351 µs after the takeover;
+    - the crash test, 5 of 5: a killed Firecracker's unsynced store reaches the volume, and the merge refuses the image
+      `NotClean` until `e2fsck -fy` has checked it.
+  - Six red-checks, each failing at its own check (A-165).
+  - **What a user meets after a guest's crash:** the merge refuses the image `NotClean`, and goes on refusing it after
+    a later guest's clean unmount (ext4 keeps an unchecked file system unchecked). `e2fsck -fy` on the image through its
+    mount makes it clean, and adds a `lost+found` (root's, mode 0700) that the merge takes as a new directory. Recorded,
+    not changed: e2fsck puts any orphans it recovers there, so the merge must not drop it. `docs/cli.md` says so.
+  - **Owed:** the arm64 guest's pmem DAX (Firecracker's doc covers aarch64, with `CONFIG_ARM64_PMEM`): G-arm64-guest.
 - **Open, found by the new tests: a read-only attachment is not a read-only file system to its client.** On every FUSE
   transport (the shared bridge) an open for writing is granted and each write through it refused `EPERM`; NFS answers
   `PERM`. A read-only file system answers `EROFS`, at the open for an open. Every change is refused and nothing lands,
