@@ -11246,8 +11246,12 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     hand-off (the read came by copy); with the judge bypassed too, the hostile test's duplicate that writes was granted.
   - **Open:**
     - arm64 Windows: its CI lane measures the escalation but runs no daemon yet (G-arm64-host);
-    - several daemons at once in one Windows process conflict: the client binary run whole on jupiter failed 18 of 20
-      tests, and every direct-map test passed run alone, so CI runs them one at a time; pre-existing, not yet diagnosed;
+    - replies stall on Windows when many daemons run at once in one process: on jupiter (32 cores) the client binary's
+      13 tests that restart nothing, run at the default 32 test threads, ended 6 `Stalled { after_ns: 1000000000 }` (a
+      reply past its 1 s deadline), and at 4 threads all 14 passed. **Corrected 2026-10-25:** this entry first said
+      several daemons in one Windows process conflict, from a whole-binary run whose 18 failures mixed these stalls
+      with the restart tests' below. Whether the stall is load or a lost wake (as A-44's was) is not yet diagnosed; CI
+      runs the direct-map tests one at a time meanwhile;
     - the client binary's restart tests fail on Windows (6 of them, never run there by CI): the restarted daemon meets
       its predecessor's still-live named section, `CreateFileMappingW` refused `ERROR_ALREADY_EXISTS`; pre-existing;
     - on every platform, a client's direct map outlives its daemon: after a `kill -9` and restart the map keeps the file

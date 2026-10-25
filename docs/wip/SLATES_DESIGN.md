@@ -3013,9 +3013,10 @@ same-namespace host process is the first delivered case.
 > neighbour's own handle; release, share, destroy, unlink and the cross-shard copy as on Linux. Red-checked: a section
 > under the default descriptor was refused unconfined at the hand-off (the read came by copy), and with the judge
 > bypassed as well the hostile test's duplicate that writes was granted. **Owed:** arm64 Windows (its CI lane measures
-> the escalation but runs no daemon); several daemons at once in one Windows process conflict, so the client binary's
-> tests run one at a time there, and its restart tests fail on Windows meeting their predecessor's still-live named
-> section (`ERROR_ALREADY_EXISTS`), both before this change (GAPS).
+> the escalation but runs no daemon); on Windows, replies stalled past their 1 s deadline when the client binary ran at
+> 32 test threads (6 of 13 tests; 4 threads ran all 14 green), not yet diagnosed, so CI runs the direct-map tests one
+> at a time; and the binary's restart tests fail on Windows meeting their predecessor's still-live named section
+> (`ERROR_ALREADY_EXISTS`); both before this change (GAPS).
 
 > **Status (the DAX matrix, A-164, 2026-10-24).** What DAX means in each environment, and which of its 52 cells
 > (each environment on each platform, by the mount route and the socket route) are proven, owed or ruled out by the
@@ -12297,7 +12298,7 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
 - **Decided: the record keeps no handle.** A handle in the client's process outlives the daemon that duplicated it, so a reply replayed from the completion record after a restart would name a live handle to a copy no daemon keeps equal to the file. The record keeps `MapHanded` with `handle` zero, and a client handed zero fails its map, as Linux's and macOS's replayed hand-offs fail (no descriptor arrives, no offer is held).
 - **Rejected: granting the user reading by SID.** The first descriptor named the user's SID with reading rights; it needed the token read and converted on every copy and granted nothing a handle does not already carry. `OWNER RIGHTS` alone refuses the same escalations (measured), with nine fewer unsafe sites.
 - **Proven** on jupiter (Windows 10.0.26200), 2026-10-25, and red-checked (§4.6 status); CI's two x86_64 Windows lanes run the same tests on every push to main.
-- **Owed:** arm64 Windows; the client binary's tests, run all at once in one Windows process, conflict (a pre-existing limit, GAPS).
+- **Owed:** arm64 Windows; replies that stalled on Windows with many daemons at once in one process, and the restart tests' named-section collision there (both pre-existing, GAPS).
 
 ### A-170 — A clone's copy-up copies an open extent its origin owns; only its own is sealed in place (accepted 2026-10-25)
 Applied in the same change to: `crates/vfs/src/volume.rs` (`Volume::make_current_inode`), `crates/vfs/src/content.rs`
