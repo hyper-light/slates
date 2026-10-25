@@ -11206,7 +11206,14 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       same map, then prints PASS.
   - **Red-checked with mutated slates binaries:** without ingest, the host's read shows the old bytes; without
     write-through, the guest never sees the change, and the test fails at its 90 s bound.
-  - **Owed:** the owner's review of the six-patch series (sent with its lint results); Shards' Linux CI legs on it.
+  - **Rebased on the owner's range (2026-10-24).** The owner wrote the range on the DESCRIPTOR ask into `gpu` themselves
+    (6534aee8), so patch 6 is dropped. Patches 1–5 applied onto 6534aee82 with no conflicts (branch `slates-dax-on-gpu`,
+    tree 30c677f8; the patch files rebuild the same tree).
+    - On that tree, with slates 34a88d86: `scripts/lint` format and all 8 targets clean.
+    - The DAX boot passed 3 of 3 against the owner's ranged ask, the store in `slates read` 75,388 / 76,446 / 80,149 µs
+      after the guest's word. Part 2's boot passed 3 of 3. Both red-checks failed again as they should.
+    - Sent to the owner for review and merge.
+  - **Owed:** the owner's review of the five-patch series; Shards' Linux CI legs on it.
 - **Open, found by step 4 (2026-10-24), reported:**
   - `verify_current` (§4.15's digest) re-points an untouched inode to another file found at its name, where A-151
     detaches the inode and gives the name a new one; no test reaches this path (`digest_begin` has none). Its backings

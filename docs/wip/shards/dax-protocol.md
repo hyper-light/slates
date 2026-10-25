@@ -336,7 +336,8 @@ Step 2 turns these platform facts into Rust tests by use.
   - stores through its map and fsyncs, then checks the host's `slates read`;
   - lets the host write through another path, then reads the change through the same map.
 - **The real boot** (step 6): that routine under `slates shards` on this Mac, 3 of 3. **Done 2026-10-24**: 3 of 3, the
-  synced store in `slates read` 261–581 ms after the guest's word.
+  synced store in `slates read` 261–581 ms after the guest's word. With the owner's ranged ask (`gpu` 6534aee8, which
+  replaced slates' patch 6), it took 75–80 ms, 3 of 3, on the five patches rebased onto it.
   - Red-check without write-through: the guest reads stale bytes. Seen: it never saw the change; the test failed at
     its 90 s bound.
   - Red-check without ingest: the host reads old bytes. Seen: the original pattern where the store should be.
