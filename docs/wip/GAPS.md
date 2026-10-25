@@ -11262,12 +11262,22 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       14 of 20 failed, 12 `Stalled`, one `BudgetExceeded { available: 44252790784 }`, and one daemon's heartbeat came
       1316 ms after the last, its shard having held **a single poll 1277 ms** (7 steps and 8 polls in the gap, none long
       in a task, blocked in the kernel or preempted by the host: all 8 unattributed). So the wait is inside one poll on
-      the shard, not between polls. Hypothesis, unmeasured: a first publication commits segment pages for a whole image
-      synchronously in that poll, and thirteen daemons committing at once serialize in Windows' memory manager; next,
-      time the first `create`'s admission, catalog commit and barrier, and the commit of segment pages, on Windows. The
-      trace also showed a runtime's shard ids handed out again after an earlier daemon's runtime ended (two daemons'
-      shard 16 seated a client 43 ms apart), harmless here since every named object carries the instance or its daemon's
-      key. CI runs the client binary one test at a time on Windows meanwhile;
+      the shard, not between polls. **Then measured, the same day** (a scratch copy outside the tree, never committed,
+      whose shards read the thread's kernel and user time from `GetThreadTimes`, so a long poll is attributed on
+      Windows too): **the long polls are the thread's own CPU, not a wait** (three heartbeats past the budget, polls of
+      1126 to 1134 ms, each "1 long in a task"). And at 32 threads the test process sometimes **aborted**: `memory
+      allocation of 873462528 bytes failed`, exit `0xc0000409` (Rust's abort on Windows), in 1 of 6 runs of the
+      committed tree and 2 of 3 of the scratch copy, a run's other failures 11 to 18 of 20. One test at a time the
+      binary passed 20 of 20 with no heartbeat past its budget at all. So these failures are oversubscription. Each
+      in-process daemon sizes itself from the whole machine (`DaemonConfig::derive`), Windows charges a committed
+      section and a large heap block against the commit limit when they are made (Linux and macOS back them only as
+      they are touched), and thirteen machine-sized daemons in one process meet that limit. Their first touches then
+      fault in pages concurrently, which the thread's CPU time counts. Owed: find the 873,462,528-byte allocation (one
+      daemon's, derived from this machine's RAM) and judge its size for one daemon; and size each daemon of a
+      many-daemon test from its share of the machine, or keep Windows CI one test at a time. The trace also showed a
+      runtime's shard ids handed out again after an earlier daemon's runtime ended (two daemons' shard 16 seated a
+      client 43 ms apart), harmless here since every named object carries the instance or its daemon's key. CI runs
+      the client binary one test at a time on Windows meanwhile;
     - **fixed 2026-10-25 (A-176): the client binary's restart tests on Windows.** They had never run there; on jupiter
       all six failed, the restarted daemon meeting its predecessor's still-live named section (`CreateFileMappingW`
       refused `ERROR_ALREADY_EXISTS`). Beneath it, the harness played the anchor's segment but not its rendezvous (now
