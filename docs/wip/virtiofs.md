@@ -250,7 +250,7 @@ box shared with two other builds — timings are not benchmarks)
    |---|---|---|
    | bare metal | the host mount | slates' own: a read-only map of slates' memory handed to a program (A-135, built) |
    | OCI (Docker, Kubernetes on runc) | the host mount bound into the container (A-28, proven 2026-10-19) | not applicable: no VM, the host kernel serves reads |
-   | Shards | the host mount shared with `VOLUME … FOR` | Shards' DAX window (D189, `crates/vmm/src/devices/virtio/fs/mod.rs` on `gpu`, read 2026-10-21) maps the host file |
+   | Shards | the host mount shared with `VOLUME … FOR`; or the daemon's own stream, handed out by `slates shards` (A-161) | over the mount, Shards' DAX window (D189, `crates/vmm/src/devices/virtio/fs/mod.rs` on `gpu`, read 2026-10-21) maps the host file; over the stream, it maps a per-attachment copy of the file that slates keeps equal to the volume (A-163, a real guest 3 of 3 on this Mac, 2026-10-24) |
    | QEMU, crosvm, Kubernetes on VM runtimes (Kata) | the host mount shared by virtio-fs (virtiofsd or the VMM's own device) | the sharer's DAX window maps the host file |
    | Firecracker | **no folder sharing at all** — no virtio-fs (its README, read 2026-10-21) — so a volume reaches it as a disk-image file: `slates image build` writes a snapshot as ext2 into an image volume, the guest's drive is that file through a slates mount, and `slates image merge` reads the guest's image back into a clone (A-160; built and proven by a real Firecracker v1.17.0 run, 2026-10-24) | pmem would map the image file; not yet run (the proven drive is virtio-blk) |
 
@@ -398,7 +398,10 @@ box shared with two other builds — timings are not benchmarks)
 
    **slates' direct connection** (the VM's virtio-fs device talking to slates itself: `attach_vhost_user_device`
    in-process, and since 2026-10-24 the daemon's Shards stream handed out by `slates shards`, A-161) removes the
-   host's filesystem layer and lets DAX map slates' own memory with no copy. It is not needed for any target to
+   host's filesystem layer. In-process, DAX maps slates' own memory with no copy. Over the Shards stream it maps a copy
+   of each file, one per attachment, that slates keeps equal to the volume by writing every change through before it
+   returns (A-163). A descriptor authorizes its whole object, so slates' own content, every volume's, cannot be handed
+   to another process. It is not needed for any target to
    work: the mount serves every one. Two designs for it were written and withdrawn on 2026-10-21: handing slates a
    socket from the launcher (which had no answer on macOS), then a slates-owned listener (Ada asked why another
    socket was needed when NFS has one, and why a mount would not do — it does). **Superseded on 2026-10-22:** Ada's

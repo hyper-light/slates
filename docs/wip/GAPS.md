@@ -11189,6 +11189,24 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   - **Owed in step 4:** a server-level test of the in-process exclusion (the registry side is tested; the Shards ask's
     check is one call); the edit's and a drift's re-copy run inside one turn, bounded by the filled ranges rather than
     sliced.
+- **Part 3, steps 5 and 6 (2026-10-24): a real guest maps a slates file with DAX on this Mac.**
+  - **Step 5, the Shards side**, built in a scratch clone of Shards: part 2's four patches apply cleanly to `gpu`
+    ff01fe0b3, and a fifth adds the testguest routine `slates_fs_dax` and the boot test
+    `a_microvm_maps_a_slates_file_with_dax_and_each_side_sees_the_others_writes`. The share gets a DAX window from
+    Shards' existing `--share-window` (D189).
+  - A sixth carries the range on the DESCRIPTOR ask: the owner offered to write or review it, and this is the version
+    for review. A recording backend sees both the SETUPMAPPING's ask and a restored mapping's re-ask carry their range
+    (red-checked), and the fs device's 53 tests pass.
+  - **Step 6, the boot**, under `slates shards` with slates 2d2cee52, 3 of 3, no SKIP, with whole-file fills and then
+    again with ranged asks (patch 6):
+    - the guest finds the 3 MiB file DAX (statx), stores through its map and fsyncs;
+    - `slates read` shows the store 261 / 361 / 581 ms after the guest's word (107 / 163 / 108 ms with ranged asks, on
+      a less loaded machine), the read's own cost (BENCHMARKS);
+    - the host rewrites the file through another attachment, and the guest sees the change and its own store in its
+      same map, then prints PASS.
+  - **Red-checked with mutated slates binaries:** without ingest, the host's read shows the old bytes; without
+    write-through, the guest never sees the change, and the test fails at its 90 s bound.
+  - **Owed:** the owner's review of the six-patch series (sent with its lint results); Shards' Linux CI legs on it.
 - **Open, found by step 4 (2026-10-24), reported:**
   - `verify_current` (§4.15's digest) re-points an untouched inode to another file found at its name, where A-151
     detaches the inode and gives the name a new one; no test reaches this path (`digest_begin` has none). Its backings

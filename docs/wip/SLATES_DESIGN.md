@@ -3346,8 +3346,14 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   guest's is, and the guest is revalidated, having no path for an invalidation;
 - a read is answered with every byte it asks, never cut to a buffer, since a short read is the file's end to the
   guest's kernel;
-- control asks are refused in Shards' own forms, a DAX window's descriptor ask with `EOPNOTSUPP`, so a share is
-  launched without a window until a backing that authorizes only the attachment's bytes exists;
+- control asks for its tables (a VM's save and restore) are refused in Shards' own forms, since slates keeps no tables a
+  VM's snapshot can carry;
+- a DAX window's descriptor ask is answered with a descriptor of one shared-memory object per attachment and file,
+  holding only that file's bytes (A-163): sized once to `2^63 − 2 MiB` and never resized, filled from the volume a
+  range at a time as asked, every change of the file through any path written into it before the change returns, and
+  the guest's stores written back at its FSYNC, FLUSH, RELEASE and FORGET and the stream's end. So there is no revoke
+  and no message to the device; the stream offers per-inode DAX (`FUSE_HAS_INODE_DAX`, `FUSE_ATTR_DAX` on files of a
+  range or more) while the shard's fill budget has room;
 - the peer's close, a hostile frame, a detach, a revocation, the volume's destroy and the daemon's stop end the
   attachment one way: its references swept, its record removed. Nothing survives a restart.
 
@@ -3360,8 +3366,11 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 > `crates/server/src/shards_route.rs`). `Client::attach_shards` takes either; Windows refuses the form
 > `DescriptorRouteNotBuilt`. `slates shards ID --fd N -- CMD` replaces itself with a program holding the end at
 > descriptor `N`, so the attachment ends when the program's end closes. A real Shards microVM on this Mac mounts, reads and
-> writes a volume the daemon serves this way (part 2: 3 of 3 boots, Shards' patch sent to its owner). Not yet: DAX. The
-> details and the evidence are A-161's.
+> writes a volume the daemon serves this way (part 2: 3 of 3 boots, Shards' patch sent to its owner). DAX (part 3,
+> A-163): built in `slates_mem::DaxObject`, `crates/server/src/shards/dax.rs` and `slates_vfs::shards_backing`, proven
+> by use against a real daemon and, on this Mac, by a real Shards guest that maps a 3 MiB file with DAX, syncs a store
+> that `slates read` then shows, and sees another attachment's rewrite in its same map (3 of 3, red-checked without
+> ingest and without write-through). The details and the evidence are A-161's and A-163's.
 
 **Writeback and snapshot barrier.** Kernel/guest cache negotiation changes when writes reach
 the owner. `snapshot`, `submit`, `advance`, clean `detach`, migration and archive must identify
@@ -12076,6 +12085,58 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
+
+### A-163 — A Shards guest maps a file from a copy slates keeps equal to the volume (accepted 2026-10-24)
+Applied across 1675dc0c, ba0f8ef0, b3a3a07c, 8f0e1b2b and 2d2cee52, and in the same change to: §4.6 (the Shards stream's
+DAX bullet and its status), GAPS, `docs/wip/shards/dax-protocol.md` (agreed with the Shards owner), BENCHMARKS (three
+sections), and Shards' patch series (six patches on its `gpu` ff01fe0b3, the range on the ask among them, with its
+owner for review).
+- **Adds §4.6's Shards DAX.** Shards' device asks the backend for a file's descriptor at each `FUSE_SETUPMAPPING`, and
+  maps each range from its own ask's descriptor (D189). slates answers with a descriptor of one shared-memory object per
+  attachment and file (`slates_mem::DaxObject`). On Linux it is a memfd sealed against growing, shrinking and further
+  seals; on macOS a POSIX shm object whose random name is unlinked at once. It holds only that file's bytes, so it
+  authorizes nothing else (A-135's rule). It is sized once to `2^63 − 2 MiB`, the largest file a guest can have,
+  sparse until touched, never resized: Shards' window follows a file's size by `fstat`, and a size that never changes
+  gives it nothing to follow. Ranges are filled from the volume a copy slice a turn as they are asked, holes skipped.
+- **Coherence is write-through, before acknowledgment** (`slates_vfs::shards_backing`, at the volume's one write
+  boundary). Every change, whatever its transport, is written into each backing's filled ranges before it returns: a
+  write's bytes, the hole an extension opens and the part a truncate cuts zeroed, an edit's shifted tail copied again.
+  Writes go through slates' own mapping, never `write(2)`, which would wake Shards' inotify watch. Beneath an overlay
+  (D-25):
+  - a writable ask copies the file up first (§4.6 DAX rights), so an outsider's edit is drift, never the guest's store;
+  - an untouched file's backings are refilled when the base plane adopts a disk change, before the reply that reveals
+    it;
+  - `rewitness` refuses a file mapped writable (`DaxMapped`).
+  An in-process writable map and a backing exclude each other.
+- **Durability is ingest at the guest's sync points.** At FSYNC, FLUSH, RELEASE, READ and FORGET of a file mapped
+  writable, and at the stream's end, the request is held while the object is compared with the volume over the ranges
+  asked writable. Each run that differs is written through the attachment's bridge and published before the reply. A
+  write-back the volume refuses answers the request's errno.
+- **Bounds (R3).** The fill budget is the shard's content reserve (`shard_content_layout().arena`), one copy of all it
+  can hold. A backing counts a range for each it filled, at least one. Past the budget, a fill is refused `ENOMEM` and
+  files stop being marked DAX.
+- **Measured** (BENCHMARKS, M5 Max):
+  - ingest: 0.70–1.14 ms per mapped MiB, after a chunked comparison beat a byte-at-a-time one by 30–42%;
+  - write-through: 117 µs per MiB per backing, 3.7 times the write itself (8-byte atomic stores into shared memory);
+  - a real guest's synced store shows in `slates read` 261–581 ms after the guest's word (the read process's own cost).
+- **Rejected,** each with its reason in the protocol note:
+  - the revoke protocol (a doorbell, REVOKES and REVOKED asks, a stage-2 unmap and remap), which would make every
+    writer wait on a VM;
+  - an object resized with its file (macOS refuses a second `ftruncate`; a peer able to resize could shrink it under
+    slates' mapping);
+  - doubling with a swap at growth;
+  - a fresh copy per ask;
+  - a Linux udmabuf over the arena's blocks.
+- **What zero copy would need:** a per-file content object, since a descriptor authorizes its whole object and the
+  arena holds every volume. That would end block sharing across files and volumes (clones, snapshots); not taken.
+- **Proven:**
+  - by use against a real daemon: 25 tests in `crates/server/tests/shards.rs` and 7 in
+    `crates/vfs/tests/shards_backing.rs`, including model tests over generated histories, each red-checked;
+  - on CI's Linux, the object's tests and the stream's;
+  - on this Mac, a real Shards guest under `slates shards`, 3 of 3, red-checked without ingest (the host reads old
+    bytes) and without write-through (the guest never sees the change).
+- **Owed:** Shards' review of the six-patch series (its sixth, the range on the descriptor ask, written by slates for
+  review as the owner offered); the zero-copy question above, if a measurement ever makes the copy matter.
 
 ### A-162 — A copy-up's witness is racy only while the file's own timestamp tick is open (accepted 2026-10-24)
 Applied in the same change to: §4.5 (copy-up), `crates/vfs/src/base.rs` (`copy_up`), `crates/vfs/tests/base.rs`

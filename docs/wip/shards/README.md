@@ -15,11 +15,14 @@ model (the guest's `mount` is refused without `CAP_SYS_ADMIN`).
 > encrypted socket route (`Client::attach_shards`), and `slates shards ID --fd N -- CMD` replaces itself with a spawner
 > holding it at descriptor `N`, so the recipe below no longer needs the one-file example, which is gone. A real boot
 > against the daemon passed 3 of 3 on this Mac (Shards part 2, 2026-10-24): the guest mounts, reads and writes. The
-> series for Shards' `gpu` is in `~/.cache/slates-scratch/shards-part2-patches/`, sent to its owner. Until a DAX backing
-> scoped to one attachment exists (part 3), launch a slates share with no DAX window. Part 3's protocol is agreed with
-> the Shards owner in [`dax-protocol.md`](dax-protocol.md) (2026-10-24): no revoke, and one optional addition, the range
-> on the descriptor ask. slates writes every change into one fixed-size shared object per attachment and file, and
-> ingests the guest's stores at its syncs.
+> series for Shards' `gpu` is in `~/.cache/slates-scratch/shards-part2-patches/`, sent to its owner. Part 3 (DAX), as
+> agreed with the Shards owner in [`dax-protocol.md`](dax-protocol.md) (no revoke; one optional addition, the range on
+> the descriptor ask), is built on slates' side (A-163, through 2d2cee52): slates writes every change into one
+> fixed-size shared object per attachment and file before it returns, and writes the guest's stores back at its syncs.
+> A real guest on this Mac mapped a 3 MiB file with DAX, synced a store that `slates read` then showed, and saw another
+> attachment's rewrite in its same map: 3 of 3, red-checked (2026-10-24). Launch the share with a DAX window
+> (`--share-window`). The six-patch series for `gpu` ff01fe0b3 (part 2's four, the DAX routine and the range on the
+> descriptor ask) is in `~/.cache/slates-scratch/shards-part3-patches/`, with its owner.
 >
 > **The Shards half, checked 2026-10-24 (read-only, from this checkout's remote refs; no fetch):** `slates-fs-native`
 > (08066b27) has been on origin since 2026-10-22; `origin/gpu` (1f82788c, 2026-10-24) still contains none of it.

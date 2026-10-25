@@ -1,6 +1,8 @@
 # Shards DAX over a slates backing: the protocol (Shards part 3; Shards D189, slates A-135)
 
-Status: **agreed 2026-10-24.** The Shards owner (the `g121` session, `gpu`'s owner) checked the five window behaviours
+Status: **agreed 2026-10-24; slates' side built and proven the same day** (A-163; a real guest on this Mac, 3 of 3).
+Shards' half is a six-patch series with its owner for review: part 2's four, the testguest DAX routine, and the range
+on the ask (written by slates, as the owner offered to write or review it). The Shards owner (the `g121` session, `gpu`'s owner) checked the five window behaviours
 below against `gpu` at `f5dcff24`, whose fs device is unchanged since `b12ec23d`, and confirmed each. They accepted the
 range on the ask and will write the device side of it. They asked for the testguest routine as a patch series on
 `gpu` rebased on its tip, linted with `scripts/lint` on all 8 targets, never pushed by slates. They added two points,
@@ -15,7 +17,8 @@ slates' side as built so far (2026-10-24), proven by use on macOS:
 - write-through at the volume's write boundary (step 4, `crates/vfs/src/shards_backing.rs`), and the overlay rules
   below ("What a guest sees").
 
-The testguest routine (step 5) and a real boot (step 6) are next.
+- the testguest routine (step 5, in Shards' series) and a real boot on this Mac (step 6): 3 of 3, red-checked without
+  ingest and without write-through (GAPS, BENCHMARKS).
 
 ## The decision in one paragraph
 
@@ -332,6 +335,8 @@ Step 2 turns these platform facts into Rust tests by use.
   - mounts `shards0` with `dax=inode` and checks that a file of at least 2 MiB is DAX;
   - stores through its map and fsyncs, then checks the host's `slates read`;
   - lets the host write through another path, then reads the change through the same map.
-- **The real boot** (step 6): that routine under `slates shards` on this Mac, 3 of 3.
-  - Red-check without write-through: the guest reads stale bytes.
-  - Red-check without ingest: the host reads old bytes.
+- **The real boot** (step 6): that routine under `slates shards` on this Mac, 3 of 3. **Done 2026-10-24**: 3 of 3, the
+  synced store in `slates read` 261–581 ms after the guest's word.
+  - Red-check without write-through: the guest reads stale bytes. Seen: it never saw the change; the test failed at
+    its 90 s bound.
+  - Red-check without ingest: the host reads old bytes. Seen: the original pattern where the store should be.

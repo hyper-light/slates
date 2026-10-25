@@ -6565,6 +6565,42 @@ step for a root of 256 directories.
   daemon's floor. The doubling itself is open: a ring a lagging reader has grown copies its whole length in one append
   (GAPS, "the journal's ring grows by copying").
 
+## How soon a guest's synced DAX store shows in slates' read (Shards part 3, step 6; 2026-10-24)
+
+**The question.** A Shards guest on this Mac maps a slates file with DAX, stores through its map and fsyncs. slates
+writes the store back into the volume before the fsync returns, so the store should show in another path's read as
+soon as the guest says it synced. The plan bounds that at 1 s.
+
+**The command.** In a scratch clone of Shards (`gpu` ff01fe0b3 plus the part 2 and part 3 series):
+`SLATES_BIN=<slates 2d2cee52, debug> cargo test --locked -p shards --test slates_fs a_microvm_maps_a_slates_file_with_dax -- --nocapture`.
+The guest prints `SLATES-DAX STORED` after its fsync returns. The host's clock starts when it reads that line from the
+console, and stops when a fresh `slates read` process (debug build) has returned the 3 MiB file holding the store. So
+the number is the read's own cost, a process start, a connection and a 3 MiB read; the store was already in the volume.
+
+**The machine.** Apple M5 Max, 18 cores, 128 GiB, macOS 26.4.1, HVF guest (aarch64, Linux 6.18.48), 18:24–18:28 PDT,
+load average about 25 from other sessions and a Shards lint.
+
+| run | synced store in slates' read after the guest's word | whole test |
+|---|---|---|
+| 1 | 261,119 µs | 4.76 s |
+| 2 | 360,657 µs | 4.64 s |
+| 3 | 580,634 µs | 5.81 s |
+
+Best 261 ms; all three within the 1 s bound. A run before these, the first after the build, took 313,848 µs (121 s
+with the guest's build).
+
+Again with Shards' sixth patch, the device's descriptor ask carrying the mapping's range so slates fills only the 2 MiB
+the guest maps, 18:50–18:53 PDT, load average 15–33 (falling):
+
+| run | synced store in slates' read after the guest's word | whole test |
+|---|---|---|
+| 1 | 107,073 µs | 6.51 s |
+| 2 | 163,042 µs | 3.23 s |
+| 3 | 108,057 µs | 3.08 s |
+
+Best 107 ms. The read's own cost dominates either way, so the difference between the two series is the machine's load
+more than the fill; the fill itself is not on this path (it runs at the guest's first touch, before the store).
+
 ## What write-through adds to a write of a mapped file (Shards part 3, step 4; 2026-10-24)
 
 **The question.** Every change of a file a Shards guest maps is written into its DAX object before the change returns
