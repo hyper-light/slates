@@ -11233,8 +11233,8 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
 - **The DAX matrix (A-164, 2026-10-24): every cell of "DAX everywhere" is proven, owed to a goal, or ruled out by its
   platform.** The matrix is in `virtiofs.md` §8: six environments, each platform a row, two routes, 52 cells, none left
   unknown. The research behind it is kiln 01a17143717a7556a52f40f1d5a0e1b2 (19 findings, graded from their sources).
-  - **Proven (6 cells):**
-    - bare-metal Linux x86_64 by both routes: the FUSE mount's shared maps, and the A-135 direct map;
+  - **Proven (5 cells):**
+    - bare-metal Linux x86_64 by the mount route: the FUSE mount's shared maps;
     - crosvm on Linux x86_64 by both routes: over a slates mount, and over slates' own device (G-vhost, 2026-10-25:
       `crates/cli/tests/guest_vhost.rs`, the entries below);
     - a Shards guest on macOS arm64 by the socket route;
@@ -11248,7 +11248,10 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     - WSL2: 9P (unconfirmed);
     - Firecracker's socket route: it has no fs device.
   - **Owed, each to a kiln goal:**
-    - the direct map on macOS and Windows;
+    - the direct map on Linux, macOS and Windows. **Corrected 2026-10-25:** this entry and the matrix counted the
+      A-135 direct map on Linux as proven. Its test, `a_same_kernel_client_maps_a_file_with_no_copy`, reports which
+      path ran and does not assert it. Since the 2026-10-18 escape fix every run reads by copy: the hand-off is
+      refused until a backing authorizes only the window (`docs/bugs/2026-10-18-a-read-handed-the-peer-the-whole-content-arena.md`);
     - the mount route's maps on macOS, Windows and in containers and pods;
     - Shards' own window over the macOS mount;
     - Shards on Linux KVM and on Windows;

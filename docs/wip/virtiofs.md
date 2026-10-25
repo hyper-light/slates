@@ -265,7 +265,7 @@ box shared with two other builds — timings are not benchmarks)
 
    | platform | mount route (the host kernel's cache) | socket route (no copy, A-135) |
    |---|---|---|
-   | Linux x86_64 | proven: `crates/cli/tests/cli.rs` `a_shared_map_through_a_mount_writes_back_and_follows_another_paths_change`, and the generated histories of `crates/bridge-fuse/tests/coherence_mount.rs` (CI's Linux lane) | proven: `a_same_kernel_client_maps_a_file_with_no_copy` (A-135) |
+   | Linux x86_64 | proven: `crates/cli/tests/cli.rs` `a_shared_map_through_a_mount_writes_back_and_follows_another_paths_change`, and the generated histories of `crates/bridge-fuse/tests/coherence_mount.rs` (CI's Linux lane) | owed: G-direct. The A-135 hand-off is refused for want of a backing that authorizes only the window (a shard's content arena is one object holding every volume: `docs/bugs/2026-10-18-a-read-handed-the-peer-the-whole-content-arena.md`), so `a_same_kernel_client_maps_a_file_with_no_copy` reads by copy, and reports the path it took rather than asserting it. This cell said "proven" until 2026-10-25. |
    | Linux arm64 | owed: G-arm64-host | owed: G-arm64-host |
    | macOS arm64 | owed: G-mount (read-only maps over NFS); writable shared maps: G-nfs-writable | owed: G-direct |
    | Windows x86_64 | owed: G-mount (WinFsp) | owed: G-direct (handle duplication) |
