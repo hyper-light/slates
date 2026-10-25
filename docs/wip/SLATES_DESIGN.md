@@ -2866,7 +2866,13 @@ shared-memory object reached by two descriptors alone, its name removed as soon 
 and write, and one opened read alone, which is offered on the daemon's socket route (A-161) behind a fresh single-use
 secret the reply carries. XNU refuses the holder of a read-only descriptor every way to write through it and sizes such
 an object once, so the descriptor's access mode is the capability, judged before the offer (`confined_read_only`: read
-alone, exactly the authorized length). **The map is a live view of the file within its length.** The copy sits in the store's
+alone, exactly the authorized length). Windows passes no descriptor (A-175): the copy is an unnamed pagefile-backed
+section whose security descriptor grants no one any right (`D:P(A;;RC;;;OW)`, which also cuts the owner's implicit
+`WRITE_DAC`), the daemon keeps the creator's handle, and it duplicates a read-only handle into the client's process,
+whose id the claim slot carries, once the process is found to run as the daemon's user and the handle is judged as a
+hostile holder would use it (`handle_route::hand_section`: exactly the authorized size, and a duplicate that writes,
+one that may rewrite the descriptor and a writable view each refused `ERROR_ACCESS_DENIED`); the reply names the
+handle's value, which the completion record leaves out. **The map is a live view of the file within its length.** The copy sits in the store's
 backings beside the VMMs' (A-163), so the volume's single write boundary writes every later write, cut and growth into
 it before the change returns: the client sees them as memory alone, with no request, as a shared map of a file does. A
 change past the copy's length is not seen; the client maps again for it. This replaces A-135's pinned version, whose
@@ -2991,6 +2997,25 @@ same-namespace host process is the first delivered case.
 > number free and maps, so the kernel can give it none — on macOS its claim's socket was refused `EMFILE`, on Linux the
 > delivered descriptor was dropped and the delivery refused `Layout` — and while it lives the daemon holds none of the
 > copy it made and handed, `dax.local_map_released` counting one. Red-checked: without the release the copy stayed held.
+>
+> **Amended 2026-10-25 (A-175, G-direct step 5) — Windows, by handle duplication, proven on a real Windows machine.** A
+> `MapRead` on Windows is answered `MapHanded`: the file's copy is a section under a descriptor that grants no one any
+> right, and the daemon duplicates a read-only handle of it into the client's process, which the client adopts and maps
+> (`slates_ipc::handle_route`, `slates_mem::PeerObject` and `PeerView` on Windows). Measured first (research f8,
+> `crates/mem/tests/peer_section.rs`, jupiter, Windows 10.0.26200, 2026-10-25): with a section's default descriptor a
+> same-user holder of a read-only handle duplicates one that writes and one that may rewrite the descriptor; under the
+> peer section's, both are refused `ERROR_ACCESS_DENIED`, and the creator's handle still maps writable. Proven on that
+> machine by `crates/client/tests/client.rs` over a real daemon, its 10 direct-map tests run one at a time (the command
+> CI's two x86_64 Windows lanes now run): zero copy asserted for a 20 KiB and a 4 MiB file and at every size to 1 MiB;
+> every change within the map seen with no request; the handed handle's section exactly the mapped length; a
+> duplicate that writes, one that may rewrite the descriptor and a writable view refused `ERROR_ACCESS_DENIED`, a
+> read-only view turned writable `ERROR_INVALID_PARAMETER`; the neighbour's marker absent, and found through the
+> neighbour's own handle; release, share, destroy, unlink and the cross-shard copy as on Linux. Red-checked: a section
+> under the default descriptor was refused unconfined at the hand-off (the read came by copy), and with the judge
+> bypassed as well the hostile test's duplicate that writes was granted. **Owed:** arm64 Windows (its CI lane measures
+> the escalation but runs no daemon); several daemons at once in one Windows process conflict, so the client binary's
+> tests run one at a time there, and its restart tests fail on Windows meeting their predecessor's still-live named
+> section (`ERROR_ALREADY_EXISTS`), both before this change (GAPS).
 
 > **Status (the DAX matrix, A-164, 2026-10-24).** What DAX means in each environment, and which of its 52 cells
 > (each environment on each platform, by the mount route and the socket route) are proven, owed or ruled out by the
@@ -2999,8 +3024,9 @@ same-namespace host process is the first delivered case.
 >   crosvm over slates' own device (Linux x86_64, A-168 and A-169, 2026-10-25); a Shards guest over the daemon's
 >   stream (macOS arm64, A-163); Firecracker by virtio-pmem over the image file through a slates mount (Linux x86_64,
 >   A-165); and, since 2026-10-25, the same-kernel direct map on Linux (A-171: a sealed copy of one file, asserted
->   zero-copy by a real client, red-checked) and on macOS (A-173: the copy's read-only descriptor over the socket route,
->   asserted zero-copy by a real client, red-checked). Seven cells. **Corrected 2026-10-25:** the direct map had been listed
+>   zero-copy by a real client, red-checked), on macOS (A-173: the copy's read-only descriptor over the socket route,
+>   asserted zero-copy by a real client, red-checked) and on Windows x86_64 (A-175: a read-only section handle
+>   duplicated into the client, asserted zero-copy by a real client on a Windows machine, red-checked). Eight cells. **Corrected 2026-10-25:** the direct map had been listed
 >   here as proven before A-171, when its test reported which path ran without asserting it and every read was a copy.
 > - **Ruled out by the platforms:** QEMU's vhost-user-fs and Cloud Hypervisor have no DAX window, so neither has Kata;
 >   crosvm's window is x86_64-only; Apple's Virtualization framework and WSL2 document none (unconfirmed).
@@ -3509,7 +3535,11 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 > A-163): built in `slates_mem::DaxObject`, `crates/server/src/shards/dax.rs` and `slates_vfs::shards_backing`, proven
 > by use against a real daemon and, on this Mac, by a real Shards guest that maps a 3 MiB file with DAX, syncs a store
 > that `slates read` then shows, and sees another attachment's rewrite in its same map (3 of 3, red-checked without
-> ingest and without write-through). The details and the evidence are A-161's and A-163's.
+> ingest and without write-through). The details and the evidence are A-161's and A-163's. **Fixed 2026-10-25:** an
+> ingest and a refill read a copy slice in one bridge call, which the volume bridge cuts at 256 KiB, so on a machine
+> whose derived slice is longer (CI's ubuntu runner) a guest's stores past the cut never reached the volume at `FSYNC`
+> and a refill zeroed its map past it; both now read a slice whole, and the oracle runs a whole range a slice on every
+> machine (`docs/bugs/2026-10-25-a-dax-slice-past-the-read-cap-dropped-a-guests-stores.md`).
 
 **Writeback and snapshot barrier.** Kernel/guest cache negotiation changes when writes reach
 the owner. `snapshot`, `submit`, `advance`, clean `detach`, migration and archive must identify
@@ -12259,6 +12289,16 @@ Applied in the same change to: §4.6 (the direct map's lifetime, its status), GA
 - **Rejected: letting the daemon release a copy whose offer expired unclaimed.** It would cover only macOS's unclaimed offers, not a claim that succeeded and then failed, nor Linux's deliveries, and a client holding unclaimed offers is within its share either way.
 - **Proven** on this Mac and on fedora, 2026-10-25, and red-checked (§4.6 status). The failure is injected as a real one: a client process that has used every descriptor number it may (`RLIMIT_NOFILE` capped at the lowest free one) can be handed nothing.
 
+### A-175 — Windows hands the direct map's copy as a read-only section handle duplicated into the client (accepted 2026-10-25)
+Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its status, the DAX matrix status), GAPS, `docs/wip/virtiofs.md` §8, `crates/mem` (`dax_object.rs`: `PeerObject` and `PeerView` on Windows, `PEER_SECTION_SDDL`, the racy view trait shared by both platforms; `tests/peer_section.rs`), `crates/ipc` (`handle_route.rs`; `protocol.rs`: `ReplyBody::MapHanded`, appended), `crates/vfs` (`BackingObject::read_only_handle`), `crates/machine` (`facts::descriptor_limit` on Windows), `crates/server` (`direct_map.rs`: the Windows hand-off, the same-user gate paired, `recorded_form`), `crates/client` (`map_read` and `MappedRead` on Windows; `slates-mem` a dependency everywhere; the tests on Windows), `.github/workflows/ci.yml` (both x86_64 Windows lanes), `unsafe-budget.toml` (`slates-mem` 49 → 60, `slates-ipc` 49 → 70), `CLAUDE.md`.
+- **What Windows lacks, and what stands in for it.** Windows passes no descriptor over a socket. A handle reaches another process when its holder duplicates it into that process's table (`DuplicateHandle` with the target's process handle), and only its value travels, in the reply on the ring.
+- **Measured first (research f8): a read-only handle is no capability by itself.** Windows checks a duplicate against the object's security descriptor when it asks for more than its source holds, so under a section's default descriptor a same-user holder of a `FILE_MAP_READ` handle duplicated one that writes and one that may rewrite the descriptor (jupiter, Windows 10.0.26200, 2026-10-25). So the section is made under `D:P(A;;RC;;;OW)`: a protected DACL whose one entry lets `OWNER RIGHTS` read the descriptor and nothing else, which also cuts the owner's implicit `WRITE_DAC`. Under it both duplicates are refused `ERROR_ACCESS_DENIED`, while the creator's handle, every access, still maps writable, and duplicates with no more than their source's access are never checked.
+- **Judged where the handle leaves the process.** `slates_ipc::handle_route::hand_section` refuses, as `UnconfinedDescriptor`, a handle whose section is any other size than authorized or that a holder could duplicate into one that writes or that may rewrite the descriptor, or map writable; each refusal must be the descriptor's own `ERROR_ACCESS_DENIED`, so a refusal for another reason judges nothing. Then the client's process, by the id its claim slot carries, must run as the daemon's user (`same_user`, by token SID), as Linux checks a peer's uid; a process of another user is refused `PeerRefused`.
+- **Decided: the record keeps no handle.** A handle in the client's process outlives the daemon that duplicated it, so a reply replayed from the completion record after a restart would name a live handle to a copy no daemon keeps equal to the file. The record keeps `MapHanded` with `handle` zero, and a client handed zero fails its map, as Linux's and macOS's replayed hand-offs fail (no descriptor arrives, no offer is held).
+- **Rejected: granting the user reading by SID.** The first descriptor named the user's SID with reading rights; it needed the token read and converted on every copy and granted nothing a handle does not already carry. `OWNER RIGHTS` alone refuses the same escalations (measured), with nine fewer unsafe sites.
+- **Proven** on jupiter (Windows 10.0.26200), 2026-10-25, and red-checked (§4.6 status); CI's two x86_64 Windows lanes run the same tests on every push to main.
+- **Owed:** arm64 Windows; the client binary's tests, run all at once in one Windows process, conflict (a pre-existing limit, GAPS).
+
 ### A-170 — A clone's copy-up copies an open extent its origin owns; only its own is sealed in place (accepted 2026-10-25)
 Applied in the same change to: `crates/vfs/src/volume.rs` (`Volume::make_current_inode`), `crates/vfs/src/content.rs`
 (`ChunkStore::copy_open`), `crates/vfs/tests/content_in_place.rs` and `crates/server/tests/recovery.rs` (the new tests
@@ -12626,6 +12666,15 @@ owner for review).
     bytes) and without write-through (the guest never sees the change).
 - **Owed:** Shards' review of the six-patch series (its sixth, the range on the descriptor ask, written by slates for
   review as the owner offered); the zero-copy question above, if a measurement ever makes the copy matter.
+- **Corrected 2026-10-25: a slice is read whole.** The ingest's compare and the refill each read a copy slice in one
+  bridge call, and a bridge answers at most its read cap a call (the volume bridge's `MAX_READ`, 256 KiB). The compare
+  took a capped call for the file's end, so a guest's stores past the cap were never written back while `FSYNC`
+  answered 0; the refill padded a capped call with zeros and stored them into the map. Only a machine whose derived
+  copy slice exceeds the cap shows it (CI's ubuntu runner on `d71ce235`, run 40211222944); every development machine
+  derived one within it, so the oracle never read a slice the bridge cuts. Both now read through `read_whole`, call
+  after call until the slice is read or a call reads nothing; the Shards tests run each case with the machine's slice
+  and with a whole range a slice. Slates' own virtio-fs device (A-168) shares the session and the fix
+  (`docs/bugs/2026-10-25-a-dax-slice-past-the-read-cap-dropped-a-guests-stores.md`).
 
 ### A-162 — A copy-up's witness is racy only while the file's own timestamp tick is open (accepted 2026-10-24)
 Applied in the same change to: §4.5 (copy-up), `crates/vfs/src/base.rs` (`copy_up`, and `rewitness` the same day),

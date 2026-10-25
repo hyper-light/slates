@@ -34,7 +34,7 @@
 //! ([`DaxObject::create`]), and unmaps each when its owner says ([`DaxObject::release_view`]).
 //!
 //! **A same-kernel peer's object** ([`PeerObject`], §4.6, A-171). The same-kernel direct map hands a client process the
-//! descriptor of one file's copy, which the client maps read alone (`PeerView`, Unix only). A descriptor carries its
+//! descriptor of one file's copy, which the client maps read alone ([`PeerView`]). A descriptor carries its
 //! whole object (A-135), so the object holds that file's bytes alone, at the file's own offsets, over the file's page
 //! span when it was made (at least a page), with zeros past the file's end. It is sized once, at its creation, and the
 //! client maps all of it.
@@ -49,7 +49,13 @@
 //! - **macOS:** an unlinked POSIX shared-memory object whose handed descriptor is a second one, opened read alone
 //!   before the unlink. No name opens the object again, a writable shared map of a read-only descriptor is refused, and
 //!   its size was set once, all macOS allows.
-//! - **Elsewhere:** refused by kind; Windows' route (handle duplication) is owed to its own step.
+//! - **Windows:** an unnamed pagefile-backed section under a security descriptor that grants no one any right to it
+//!   (`PEER_SECTION_SDDL`: `OWNER RIGHTS` may read the descriptor alone, which also cuts the owner's implicit
+//!   `WRITE_DAC`). slates keeps the creator's handle, with every access, and its writable view; a peer is handed a
+//!   read-only duplicate. Windows checks a duplicate against the descriptor only when it asks for more than its source
+//!   holds, so the read-only duplicates work and a holder's duplicate that writes or that may rewrite the descriptor is
+//!   refused `ERROR_ACCESS_DENIED`; measured 2026-10-25 on Windows 10.0.26200 (`tests/peer_section.rs`), where the
+//!   default descriptor grants both (A-175). Zeroing is stores over the whole span: Windows tells no section's holes.
 //!
 //! Because the write seal refuses slates' own hole punch too, a peer object's zeroing is stores of zeros over what
 //! holds bytes ([`PeerObject::zero`]): its cost is the bytes zeroed, where a DAX object's punch gives pages back.
@@ -74,17 +80,141 @@ pub const DAX_OBJECT_BYTES: u64 = match (1u64 << 63).checked_sub(DAX_RANGE_BYTES
   None => 0,
 };
 
-#[cfg(unix)]
-pub use imp::PeerView;
-pub use imp::{DaxObject, PeerObject};
+/// The security descriptor every Windows peer section is made under (A-175), for the test that measures it.
+#[cfg(windows)]
+pub use imp::PEER_SECTION_SDDL;
+pub use imp::{DaxObject, PeerObject, PeerView};
+
+/// A live mapping's bytes reached only through atomics, the one discipline every view of a peer object or a DAX object
+/// keeps on every platform (AUD-29-09): another process may store into the bytes at any moment, so no reference to them
+/// is ever formed.
+#[cfg(any(unix, windows))]
+mod racy {
+  use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+
+  use crate::error::MemError;
+
+  /// Shape: the bytes of the word the racy copies move at once.
+  const WORD_BYTES: usize = size_of::<u64>();
+
+  /// A live mapping's bytes as racy memory, loaded through atomics: every byte through an atomic, words where the
+  /// offset is aligned. Another process may store into the bytes at any moment, so no reference to them is ever formed.
+  pub(super) trait Racy {
+    /// The mapping's first byte, as the raw address it was mapped at.
+    fn address(&self) -> *mut u8;
+
+    /// The mapping's length in bytes.
+    fn extent(&self) -> usize;
+
+    /// The word at `at`, where `at` is word-aligned and the word lies inside the view.
+    fn word(&self, at: usize) -> Option<&AtomicU64> {
+      if !at.is_multiple_of(WORD_BYTES) || at.checked_add(WORD_BYTES)? > self.extent() {
+        return None;
+      }
+      // SAFETY: `at .. at + 8` lies inside this view's live mapping (checked above), which stays mapped while `self`
+      // is borrowed; the view's base is page-aligned, so `at` word-aligned makes the address aligned for
+      // `AtomicU64`, valid for every bit pattern. Every access slates makes to the object's bytes is atomic, and no
+      // reference to them exists: the other process's stores come from outside this one's memory model. A read-only
+      // view is only loaded (it has no `RacyStore`), and a relaxed load is a plain load on the 64-bit targets slates
+      // builds for (x86_64 and aarch64), which never writes the line.
+      Some(unsafe { &*self.address().wrapping_add(at).cast::<AtomicU64>() })
+    }
+
+    /// The byte at `at`, where it lies inside the view.
+    fn byte(&self, at: usize) -> Option<&AtomicU8> {
+      if at >= self.extent() {
+        return None;
+      }
+      // SAFETY: as in `word`; `AtomicU8` has no alignment requirement.
+      Some(unsafe { &*self.address().wrapping_add(at).cast::<AtomicU8>() })
+    }
+
+    fn load(&self, at: usize, into: &mut [u8]) -> Result<(), MemError> {
+      let refused = MemError::OutOfRange {
+        offset: at,
+        len: self.extent(),
+      };
+      let total = into.len();
+      let mut done = 0usize;
+      while done < total {
+        let here = at.checked_add(done).ok_or(refused.clone())?;
+        if here.is_multiple_of(WORD_BYTES) && total.saturating_sub(done) >= WORD_BYTES {
+          let value = self
+            .word(here)
+            .ok_or(refused.clone())?
+            .load(Ordering::Relaxed);
+          into
+            .get_mut(done..done.saturating_add(WORD_BYTES))
+            .ok_or(refused.clone())?
+            .copy_from_slice(&value.to_ne_bytes());
+          done = done.saturating_add(WORD_BYTES);
+        } else {
+          let value = self
+            .byte(here)
+            .ok_or(refused.clone())?
+            .load(Ordering::Relaxed);
+          *into.get_mut(done).ok_or(refused.clone())? = value;
+          done = done.saturating_add(1);
+        }
+      }
+      Ok(())
+    }
+  }
+
+  /// A writable mapping's racy stores, through the same atomics as its loads.
+  pub(super) trait RacyStore: Racy {
+    fn store(&self, at: usize, from: &[u8]) -> Result<(), MemError> {
+      let refused = MemError::OutOfRange {
+        offset: at,
+        len: self.extent(),
+      };
+      let mut done = 0usize;
+      while done < from.len() {
+        let here = at.checked_add(done).ok_or(refused.clone())?;
+        let word = (here.is_multiple_of(WORD_BYTES)
+          && from.len().saturating_sub(done) >= WORD_BYTES)
+          .then(|| from.get(done..done.saturating_add(WORD_BYTES)))
+          .flatten()
+          .and_then(|bytes| <[u8; WORD_BYTES]>::try_from(bytes).ok());
+        if let Some(bytes) = word {
+          self
+            .word(here)
+            .ok_or(refused.clone())?
+            .store(u64::from_ne_bytes(bytes), Ordering::Relaxed);
+          done = done.saturating_add(WORD_BYTES);
+        } else {
+          let byte = from.get(done).copied().ok_or(refused.clone())?;
+          self
+            .byte(here)
+            .ok_or(refused.clone())?
+            .store(byte, Ordering::Relaxed);
+          done = done.saturating_add(1);
+        }
+      }
+      Ok(())
+    }
+
+    fn zero_bytes(&self, from: usize, to: usize) -> Result<(), MemError> {
+      /// Shape: the zeros one store takes from (a page on every target slates builds for).
+      const ZEROS: [u8; 4096] = [0; 4096];
+      let mut at = from;
+      while at < to {
+        let take = to.saturating_sub(at).min(ZEROS.len());
+        self.store(at, ZEROS.get(..take).unwrap_or_default())?;
+        at = at.saturating_add(take);
+      }
+      Ok(())
+    }
+  }
+}
 
 #[cfg(unix)]
 mod imp {
   use std::collections::BTreeMap;
   use std::collections::btree_map::Entry;
   use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-  use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
+  use super::racy::{Racy, RacyStore};
   use super::{DAX_OBJECT_BYTES, DAX_RANGE_BYTES};
   use crate::error::MemError;
   use crate::shared::{RangeView, ReadView};
@@ -107,9 +237,6 @@ mod imp {
       offset.checked_rem(DAX_RANGE_BYTES)?,
     ))
   }
-
-  /// Shape: the bytes of the word the racy copies move at once.
-  const WORD_BYTES: usize = size_of::<u64>();
 
   fn refused(call: &'static str, e: rustix::io::Errno) -> MemError {
     MemError::OsRefused {
@@ -483,116 +610,6 @@ mod imp {
     Ok((range, within, take))
   }
 
-  /// A live mapping's bytes as racy memory, loaded through atomics: every byte through an atomic, words where the
-  /// offset is aligned. Another process may store into the bytes at any moment, so no reference to them is ever formed.
-  trait Racy {
-    /// The mapping's first byte, as the raw address it was mapped at.
-    fn address(&self) -> *mut u8;
-
-    /// The mapping's length in bytes.
-    fn extent(&self) -> usize;
-
-    /// The word at `at`, where `at` is word-aligned and the word lies inside the view.
-    fn word(&self, at: usize) -> Option<&AtomicU64> {
-      if !at.is_multiple_of(WORD_BYTES) || at.checked_add(WORD_BYTES)? > self.extent() {
-        return None;
-      }
-      // SAFETY: `at .. at + 8` lies inside this view's live mapping (checked above), which stays mapped while `self`
-      // is borrowed; the view's base is page-aligned, so `at` word-aligned makes the address aligned for
-      // `AtomicU64`, valid for every bit pattern. Every access slates makes to the object's bytes is atomic, and no
-      // reference to them exists: the other process's stores come from outside this one's memory model. A read-only
-      // view is only loaded (it has no `RacyStore`), and a relaxed load is a plain load on the 64-bit targets slates
-      // builds for (x86_64 and aarch64), which never writes the line.
-      Some(unsafe { &*self.address().wrapping_add(at).cast::<AtomicU64>() })
-    }
-
-    /// The byte at `at`, where it lies inside the view.
-    fn byte(&self, at: usize) -> Option<&AtomicU8> {
-      if at >= self.extent() {
-        return None;
-      }
-      // SAFETY: as in `word`; `AtomicU8` has no alignment requirement.
-      Some(unsafe { &*self.address().wrapping_add(at).cast::<AtomicU8>() })
-    }
-
-    fn load(&self, at: usize, into: &mut [u8]) -> Result<(), MemError> {
-      let refused = MemError::OutOfRange {
-        offset: at,
-        len: self.extent(),
-      };
-      let total = into.len();
-      let mut done = 0usize;
-      while done < total {
-        let here = at.checked_add(done).ok_or(refused.clone())?;
-        if here.is_multiple_of(WORD_BYTES) && total.saturating_sub(done) >= WORD_BYTES {
-          let value = self
-            .word(here)
-            .ok_or(refused.clone())?
-            .load(Ordering::Relaxed);
-          into
-            .get_mut(done..done.saturating_add(WORD_BYTES))
-            .ok_or(refused.clone())?
-            .copy_from_slice(&value.to_ne_bytes());
-          done = done.saturating_add(WORD_BYTES);
-        } else {
-          let value = self
-            .byte(here)
-            .ok_or(refused.clone())?
-            .load(Ordering::Relaxed);
-          *into.get_mut(done).ok_or(refused.clone())? = value;
-          done = done.saturating_add(1);
-        }
-      }
-      Ok(())
-    }
-  }
-
-  /// A writable mapping's racy stores, through the same atomics as its loads.
-  trait RacyStore: Racy {
-    fn store(&self, at: usize, from: &[u8]) -> Result<(), MemError> {
-      let refused = MemError::OutOfRange {
-        offset: at,
-        len: self.extent(),
-      };
-      let mut done = 0usize;
-      while done < from.len() {
-        let here = at.checked_add(done).ok_or(refused.clone())?;
-        let word = (here.is_multiple_of(WORD_BYTES)
-          && from.len().saturating_sub(done) >= WORD_BYTES)
-          .then(|| from.get(done..done.saturating_add(WORD_BYTES)))
-          .flatten()
-          .and_then(|bytes| <[u8; WORD_BYTES]>::try_from(bytes).ok());
-        if let Some(bytes) = word {
-          self
-            .word(here)
-            .ok_or(refused.clone())?
-            .store(u64::from_ne_bytes(bytes), Ordering::Relaxed);
-          done = done.saturating_add(WORD_BYTES);
-        } else {
-          let byte = from.get(done).copied().ok_or(refused.clone())?;
-          self
-            .byte(here)
-            .ok_or(refused.clone())?
-            .store(byte, Ordering::Relaxed);
-          done = done.saturating_add(1);
-        }
-      }
-      Ok(())
-    }
-
-    fn zero_bytes(&self, from: usize, to: usize) -> Result<(), MemError> {
-      /// Shape: the zeros one store takes from (a page on every target slates builds for).
-      const ZEROS: [u8; 4096] = [0; 4096];
-      let mut at = from;
-      while at < to {
-        let take = to.saturating_sub(at).min(ZEROS.len());
-        self.store(at, ZEROS.get(..take).unwrap_or_default())?;
-        at = at.saturating_add(take);
-      }
-      Ok(())
-    }
-  }
-
   impl Racy for RangeView {
     fn address(&self) -> *mut u8 {
       self.base()
@@ -962,8 +979,25 @@ mod imp {
   }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 mod imp {
+  use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
+
+  use windows_sys::Win32::Foundation::{
+    DuplicateHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+  };
+  use windows_sys::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+  };
+  use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+  use windows_sys::Win32::System::Memory::{
+    CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_BASIC_INFORMATION,
+    MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile, VirtualQuery,
+  };
+  use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+  use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+  use super::racy::{Racy, RacyStore};
   use crate::error::MemError;
 
   /// No DAX object exists off Unix: the Shards route hands descriptors, which Windows does not have, so an object is
@@ -1008,55 +1042,350 @@ mod imp {
     }
   }
 
-  /// No peer object exists off Unix yet: the same-kernel direct map hands descriptors, and Windows' handle route is
-  /// owed to its own step, so an object is never created and none of these methods can run.
-  #[derive(Debug)]
+  /// Format: a peer section's security descriptor, in SDDL: a protected DACL (`P`, nothing inherited) whose one entry
+  /// grants `OWNER RIGHTS` (`OW`) reading the descriptor (`RC`) alone. So the descriptor grants no one any right to the
+  /// section, and the owner's implicit `WRITE_DAC` is cut, so no one can rewrite it to grant one: a handle conveys only
+  /// the access it was made with. A handle duplicated with no more than its source's access is never checked against
+  /// the descriptor, so slates' own handle (the creator's, every access) and the read-only duplicates it hands keep
+  /// working, while a holder's duplicate that writes or that may rewrite the descriptor is refused (measured on Windows
+  /// 10.0.26200, `tests/peer_section.rs`; with the default descriptor both are granted).
+  pub const PEER_SECTION_SDDL: &str = "D:P(A;;RC;;;OW)";
+
+  /// The OS refused `call`: its error code, read before any other call.
+  fn os(call: &'static str) -> MemError {
+    // SAFETY: reads this thread's last error, which the failed call just set.
+    let code = unsafe { GetLastError() };
+    MemError::OsRefused {
+      call,
+      code: i32::try_from(code).ok(),
+    }
+  }
+
+  /// The system's page size, which an object's size is a whole number of.
+  fn page_bytes() -> u64 {
+    let mut info = SYSTEM_INFO::default();
+    // SAFETY: fills the struct this function owns.
+    unsafe { GetSystemInfo(&mut info) };
+    u64::from(info.dwPageSize.max(1))
+  }
+
+  /// A view of a section, unmapped when dropped. Its address is kept exposed rather than as a pointer, so the views'
+  /// owners are `Send` (a mapping belongs to the process, not a thread) with no unsafe impl, as `crate::shared` keeps
+  /// its views.
+  struct SectionView {
+    address: usize,
+    len: usize,
+  }
+
+  impl SectionView {
+    /// Maps `len` bytes of `section` from its start with `access`; `len` zero maps the whole section, whose length is
+    /// then read back from the view (`VirtualQuery`: the section's size, a whole number of pages).
+    fn map(section: BorrowedHandle<'_>, access: u32, len: usize) -> Result<SectionView, MemError> {
+      // SAFETY: a view at an address the system chooses of a section this process holds a handle to; the system
+      // refuses (null) a span past the section or an access the handle lacks. Unmapped by `drop`.
+      let view = unsafe { MapViewOfFile(section.as_raw_handle(), access, 0, 0, len) };
+      if view.Value.is_null() {
+        return Err(os("MapViewOfFile"));
+      }
+      let address = view.Value.expose_provenance();
+      if len > 0 {
+        return Ok(SectionView { address, len });
+      }
+      let mut region = MEMORY_BASIC_INFORMATION::default();
+      // SAFETY: asks about the view just made; the answer is written to a local of the size passed.
+      let answered = unsafe {
+        VirtualQuery(
+          view.Value,
+          &mut region,
+          std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+      };
+      let mapped = SectionView {
+        address,
+        len: region.RegionSize,
+      };
+      if answered == 0 {
+        return Err(os("VirtualQuery"));
+      }
+      Ok(mapped)
+    }
+  }
+
+  impl Drop for SectionView {
+    fn drop(&mut self) {
+      // SAFETY: the view this value mapped and alone holds; nothing reaches it after the drop.
+      unsafe {
+        UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+          Value: std::ptr::with_exposed_provenance_mut(self.address),
+        })
+      };
+    }
+  }
+
+  impl Racy for SectionView {
+    fn address(&self) -> *mut u8 {
+      std::ptr::with_exposed_provenance_mut(self.address)
+    }
+
+    fn extent(&self) -> usize {
+      self.len
+    }
+  }
+
+  /// slates' own view of a peer object, read and write: the only view that stores.
+  struct WriteView(SectionView);
+
+  impl Racy for WriteView {
+    fn address(&self) -> *mut u8 {
+      self.0.address()
+    }
+
+    fn extent(&self) -> usize {
+      self.0.extent()
+    }
+  }
+
+  impl RacyStore for WriteView {}
+
+  /// A new unnamed pagefile-backed section of `len` bytes under [`PEER_SECTION_SDDL`], which confines every handle but
+  /// the creator's to the access it was made with. The creator's handle keeps every access and is never handed.
+  fn confined_section(len: u64) -> Result<OwnedHandle, MemError> {
+    let text: Vec<u16> = PEER_SECTION_SDDL
+      .encode_utf16()
+      .chain(std::iter::once(0))
+      .collect();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: a NUL-terminated SDDL string and an out-pointer to a local; the descriptor is freed below.
+    let parsed = unsafe {
+      ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        text.as_ptr(),
+        SDDL_REVISION_1,
+        &mut descriptor,
+        std::ptr::null_mut(),
+      )
+    };
+    if parsed == 0 {
+      return Err(os("ConvertStringSecurityDescriptorToSecurityDescriptorW"));
+    }
+    let attributes = SECURITY_ATTRIBUTES {
+      nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(u32::MAX),
+      lpSecurityDescriptor: descriptor,
+      bInheritHandle: 0,
+    };
+    let high = u32::try_from(len >> u32::BITS).unwrap_or(u32::MAX);
+    let low = u32::try_from(len & u64::from(u32::MAX)).unwrap_or(u32::MAX);
+    // SAFETY: a pagefile-backed section with no name, so nothing opens it by one; the attributes and the descriptor
+    // they point at outlive the call.
+    let section = unsafe {
+      CreateFileMappingW(
+        INVALID_HANDLE_VALUE,
+        &attributes,
+        PAGE_READWRITE,
+        high,
+        low,
+        std::ptr::null(),
+      )
+    };
+    let made = if section.is_null() {
+      Err(os("CreateFileMappingW"))
+    } else {
+      // SAFETY: the section handle just made, owned from here and closed on drop.
+      Ok(unsafe { OwnedHandle::from_raw_handle(section) })
+    };
+    // SAFETY: the descriptor `ConvertStringSecurityDescriptorToSecurityDescriptorW` allocated, freed once.
+    unsafe { LocalFree(descriptor) };
+    made
+  }
+
+  /// One file's copy for a same-kernel peer, and slates' one writable view of it (§4.6, A-175 on Windows): an unnamed
+  /// pagefile-backed section ([`confined_section`]) sized once to the file's page span. slates holds the creator's
+  /// handle, with every access, and never hands it; a peer gets a read-only duplicate ([`PeerObject::read_only_handle`])
+  /// that the section's descriptor lets no one turn into more.
   pub struct PeerObject {
-    never: std::convert::Infallible,
+    section: OwnedHandle,
+    view: WriteView,
+    len: u64,
+  }
+
+  impl std::fmt::Debug for PeerObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+      f.debug_struct("PeerObject")
+        .field("len", &self.len)
+        .finish()
+    }
   }
 
   impl PeerObject {
-    /// Refused by kind: there is no peer object here.
-    pub fn bytes_for(_file_bytes: u64) -> Result<u64, MemError> {
-      Err(MemError::OsRefused {
-        call: "peer object",
-        code: None,
-      })
+    /// The size of the object a file of `file_bytes` is copied into: its page span, and at least one page, so the
+    /// object is never empty and a peer maps all of it. Refused `OutOfRange` where the span overflows.
+    pub fn bytes_for(file_bytes: u64) -> Result<u64, MemError> {
+      file_bytes
+        .max(1)
+        .checked_next_multiple_of(page_bytes())
+        .ok_or(MemError::OutOfRange {
+          offset: usize::try_from(file_bytes).unwrap_or(usize::MAX),
+          len: usize::MAX,
+        })
     }
 
-    /// Refused by kind: there is no peer object here.
-    pub fn create(_name: &str, _file_bytes: u64) -> Result<PeerObject, MemError> {
-      Err(MemError::OsRefused {
-        call: "peer object",
-        code: None,
-      })
+    /// A new object of zeros, [`PeerObject::bytes_for`] `file_bytes` long, with slates' writable view of all of it.
+    /// `_name` is Linux's (a memfd's name); a section here has none, so nothing opens it by one. Refused `OutOfRange`
+    /// where the span does not fit an address, `OsRefused` where the OS refuses a step.
+    pub fn create(_name: &str, file_bytes: u64) -> Result<PeerObject, MemError> {
+      let len = PeerObject::bytes_for(file_bytes)?;
+      let view_len = usize::try_from(len).map_err(|_| MemError::OutOfRange {
+        offset: 0,
+        len: usize::MAX,
+      })?;
+      let section = confined_section(len)?;
+      let view = WriteView(SectionView::map(
+        section.as_handle(),
+        FILE_MAP_WRITE | FILE_MAP_READ,
+        view_len,
+      )?);
+      Ok(PeerObject { section, view, len })
     }
 
-    /// Never reached: no object exists.
+    /// The object's size in bytes, which never changes.
     #[must_use]
     pub fn len(&self) -> u64 {
-      match self.never {}
+      self.len
     }
 
-    /// Never reached: no object exists.
+    /// Never: an object is at least a page. Here for the convention beside [`PeerObject::len`].
     #[must_use]
     pub fn is_empty(&self) -> bool {
-      match self.never {}
+      self.len == 0
     }
 
-    /// Never reached: no object exists.
-    pub fn store(&mut self, _offset: u64, _from: &[u8]) -> Result<(), MemError> {
-      match self.never {}
+    /// A duplicate of the section's handle in this process that maps it read alone (`FILE_MAP_READ`): what a peer is
+    /// handed, duplicated again into its process. The section's own handle, which writes, never leaves the object.
+    pub fn read_only_handle(&self) -> Result<OwnedHandle, MemError> {
+      let mut duplicate: HANDLE = std::ptr::null_mut();
+      // SAFETY: this process's pseudo-handle on both sides, the section's live handle, and an out-pointer to a local;
+      // the duplicate is owned below.
+      let done = unsafe {
+        DuplicateHandle(
+          GetCurrentProcess(),
+          self.section.as_raw_handle(),
+          GetCurrentProcess(),
+          &mut duplicate,
+          FILE_MAP_READ,
+          0,
+          0,
+        )
+      };
+      if done == 0 {
+        return Err(os("DuplicateHandle"));
+      }
+      // SAFETY: the duplicate just made, owned from here and closed on drop.
+      Ok(unsafe { OwnedHandle::from_raw_handle(duplicate) })
     }
 
-    /// Never reached: no object exists.
-    pub fn load(&mut self, _offset: u64, _into: &mut [u8]) -> Result<(), MemError> {
-      match self.never {}
+    /// Copies `from` into the object at `offset`, through atomics. Refused `OutOfRange` past the object.
+    pub fn store(&mut self, offset: u64, from: &[u8]) -> Result<(), MemError> {
+      let at = self.within(offset, from.len())?;
+      self.view.store(at, from)
     }
 
-    /// Never reached: no object exists.
-    pub fn zero(&mut self, _offset: u64, _len: u64) -> Result<(), MemError> {
-      match self.never {}
+    /// Copies the object's bytes at `offset` into `into`, through atomics. Refused `OutOfRange` past the object.
+    pub fn load(&mut self, offset: u64, into: &mut [u8]) -> Result<(), MemError> {
+      let at = self.within(offset, into.len())?;
+      self.view.load(at, into)
+    }
+
+    /// Makes the object's bytes `offset .. offset + len` read zero, by stores of zeros over all of them: Windows tells
+    /// no section's holes, so the pages zeroed are charged, within the object's size that its making charged already.
+    /// Refused `OutOfRange` past the object.
+    pub fn zero(&mut self, offset: u64, len: u64) -> Result<(), MemError> {
+      let count = usize::try_from(len).map_err(|_| MemError::OutOfRange {
+        offset: usize::try_from(offset).unwrap_or(usize::MAX),
+        len: usize::MAX,
+      })?;
+      let from = self.within(offset, count)?;
+      self.view.zero_bytes(from, from.saturating_add(count))
+    }
+
+    /// `offset .. offset + count` as an offset into slates' view, refused `OutOfRange` past the object.
+    fn within(&self, offset: u64, count: usize) -> Result<usize, MemError> {
+      let refused = MemError::OutOfRange {
+        offset: usize::try_from(offset).unwrap_or(usize::MAX),
+        len: usize::try_from(self.len).unwrap_or(usize::MAX),
+      };
+      let end = u64::try_from(count)
+        .ok()
+        .and_then(|count| offset.checked_add(count))
+        .ok_or(refused.clone())?;
+      if end > self.len {
+        return Err(refused);
+      }
+      usize::try_from(offset).map_err(|_| refused)
+    }
+  }
+
+  /// A client's view of the peer object a daemon handed it (§4.6, A-175 on Windows): the whole section, mapped read
+  /// alone through the handle the daemon duplicated into this process. The daemon writes it at any moment, since it
+  /// follows the file, so its bytes are loaded through atomics and never borrowed.
+  pub struct PeerView {
+    handle: OwnedHandle,
+    view: SectionView,
+    len: u64,
+  }
+
+  impl std::fmt::Debug for PeerView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+      f.debug_struct("PeerView").field("len", &self.len).finish()
+    }
+  }
+
+  impl PeerView {
+    /// Maps the whole section behind `handle`, read alone, and serves its first `len` bytes. Refused `OutOfRange` for an
+    /// empty view or one longer than the section, and `OsRefused` where the OS refuses the map.
+    pub fn map(handle: OwnedHandle, len: u64) -> Result<PeerView, MemError> {
+      let view = SectionView::map(handle.as_handle(), FILE_MAP_READ, 0)?;
+      let object_bytes = u64::try_from(view.len).unwrap_or(0);
+      if len == 0 || len > object_bytes {
+        return Err(MemError::OutOfRange {
+          offset: usize::try_from(len).unwrap_or(usize::MAX),
+          len: view.len,
+        });
+      }
+      Ok(PeerView { handle, view, len })
+    }
+
+    /// The view's length in bytes.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+      self.len
+    }
+
+    /// Never: an empty view is refused. Here for the convention beside [`PeerView::len`].
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+      self.len == 0
+    }
+
+    /// The handle the view maps, as the daemon handed it.
+    #[must_use]
+    pub fn handle(&self) -> BorrowedHandle<'_> {
+      self.handle.as_handle()
+    }
+
+    /// Copies the view's bytes at `offset` into `into`, through atomics. Refused `OutOfRange` past the view.
+    pub fn load(&self, offset: u64, into: &mut [u8]) -> Result<(), MemError> {
+      let refused = MemError::OutOfRange {
+        offset: usize::try_from(offset).unwrap_or(usize::MAX),
+        len: usize::try_from(self.len).unwrap_or(usize::MAX),
+      };
+      let end = u64::try_from(into.len())
+        .ok()
+        .and_then(|count| offset.checked_add(count))
+        .ok_or(refused.clone())?;
+      if end > self.len {
+        return Err(refused);
+      }
+      let at = usize::try_from(offset).map_err(|_| refused)?;
+      self.view.load(at, into)
     }
   }
 }

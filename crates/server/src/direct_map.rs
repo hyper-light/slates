@@ -9,7 +9,12 @@
 //! (`Control::send_mapping`, `confined_for_a_peer`): the object must be what is authorized, and sealed. macOS has no
 //! seals, so the client gets a second descriptor of an unlinked shared-memory object, opened read alone, which XNU
 //! refuses every way to write through or resize (A-173), judged before it is offered
-//! (`slates_ipc::route::confined_read_only`: read alone, and exactly the authorized length). The copy is kept in the
+//! (`slates_ipc::route::confined_read_only`: read alone, and exactly the authorized length). Windows passes no
+//! descriptor: the copy is an unnamed pagefile-backed section whose security descriptor grants no one any right
+//! (`OWNER RIGHTS` may read it alone), and the daemon duplicates a read-only handle of it into the client's process,
+//! judged first (`slates_ipc::handle_route::hand_section`: exactly the authorized size, and a duplicate that writes, one
+//! that may rewrite the descriptor and a writable view each refused) and the process checked to run as the daemon's
+//! user (A-175). The copy is kept in the
 //! store's backings ([`slates_vfs::shards_backing`]), so the volume's single write boundary writes every later change
 //! into it before the change returns: the client's map is a live view of the file within its length, as a shared map of
 //! a file is.
@@ -22,13 +27,14 @@
 //! of the fill reads the volume as changed. Holes and pages of zeros are passed over: the new copy reads zero there
 //! already. The fill done, the copy is handed: on Linux its descriptor goes over the client's control socket, then the
 //! reply goes on its ring; on macOS the descriptor is offered on the daemon's socket route (A-161) behind a fresh
-//! single-use secret that the reply carries, and the client claims it. The reply's completion is recorded as every
-//! verb's is.
+//! single-use secret that the reply carries, and the client claims it; on Windows the reply names the handle's value
+//! in the client's process. The reply's completion is recorded as every verb's is, a Windows handle's value left out
+//! ([`recorded_form`]).
 //!
 //! **What reads by copy instead** (`MapUnavailable`, which the client answers with its paged read): a peer of another
 //! uid, a view other than the head, a merge volume, an overlay (an untouched file follows the disk, which no write
-//! boundary sees), a client served by another shard (a descriptor does not cross shards yet), a platform with no route
-//! (Windows, owed to its own step), and a copy the fill budget, the backings' capacity or the OS refuses.
+//! boundary sees), a client served by another shard (a descriptor does not cross shards yet), and a copy the fill
+//! budget, the backings' capacity or the OS refuses.
 //!
 //! **Lifetime and bounds (A-172).** A copy is held on its client's slot from the moment it is made until the client
 //! releases it (`ReleaseMap`) or is reaped (`crate::reap`). Every way a copy goes is [`let_go`], which withdraws an
@@ -83,7 +89,7 @@ fn withdraw_offer(_state: &mut ShardState, _backing: Handle<ShardsBacking>) {}
 /// as an attachment id carries it, so macOS's socket route finds the shard that holds the copy's offer
 /// (`crate::shards_route`). `None` where the handle does not fit the packing (a slot or a generation past 2^24): that
 /// copy is not handed. Process-local, like every handle, so a client's maps end with its daemon's process.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn mapping_id_of(partition: u16, backing: Handle<ShardsBacking>) -> Option<u64> {
   backing.encode(partition).map(Encoded::word)
 }
@@ -190,9 +196,9 @@ pub(crate) fn join_in_flight(state: &mut ShardState, origin: u64, id: RequestId)
   true
 }
 
-/// `MapRead` where no route hands a client a descriptor of a sealed copy yet: Windows' (handle duplication) is owed to
-/// its own step. The client reads by its paged path, which applies the rights.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// `MapRead` where no route hands a client its copy: no platform slates ships, since Linux, macOS and Windows each
+/// have one. The client reads by its paged path, which applies the rights.
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub(crate) fn map_read(
   _state: &mut ShardState,
   _client_id: u32,
@@ -204,12 +210,13 @@ pub(crate) fn map_read(
   crate::verbs::refused(slates_ipc::protocol::Refusal::MapUnavailable)
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub(crate) use served::map_read;
 
-/// The platforms that hand a client its copy: Linux over the client's control socket, macOS over the socket route. The
-/// fill is one; the hand-off is a paired function.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// The platforms that hand a client its copy: Linux over the client's control socket, macOS over the socket route,
+/// Windows by duplicating a read-only handle into the client's process. The fill is one; the hand-off is a paired
+/// function.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod served {
   use slates_db::catalog::{Principal, Role};
   use slates_ipc::protocol::{ReadAt, Refusal, ReplyBody, VolumeId};
@@ -250,9 +257,7 @@ mod served {
     path: &str,
     at: ReadAt,
   ) -> ReplyBody {
-    let same_uid =
-      matches!(principal, Principal::Uid { uid } if *uid == rustix::process::geteuid().as_raw());
-    if !same_uid || !matches!(at, ReadAt::Head) {
+    if !is_the_daemons_user(principal) || !matches!(at, ReadAt::Head) {
       return refused(Refusal::MapUnavailable);
     }
     let record = match find_record(state, volume) {
@@ -598,6 +603,80 @@ mod served {
         secret,
       }
     }
+
+    /// Duplicates the filled copy's read-only handle into the client's process (Windows), judged first to authorize
+    /// reading the copy alone and the process to run as the daemon's user (`slates_ipc::handle_route::hand_section`);
+    /// the backing held on the client's slot since the copy was made. The reply names the handle's value there.
+    /// `MapUnavailable` (counted) where the volume, the file or the copy went, the client went, the mapping id does not
+    /// fit, the handle is unconfined, or the client's process is not the daemon's user's or refused the duplicate.
+    #[cfg(windows)]
+    fn hand_off(&mut self, state: &mut ShardState) -> ReplyBody {
+      use std::os::windows::io::AsHandle;
+
+      let Some(backing) = self.backing else {
+        return refused(Refusal::MapUnavailable);
+      };
+      let pid = state
+        .clients
+        .iter_mut_all()
+        .find(|(_, client)| client.client_id == self.client_id && !client.retiring)
+        .map(|(_, client)| client.pid);
+      let size = state
+        .volumes
+        .get(self.volume)
+        .ok()
+        .and_then(|slot| slot.volume.stat(&state.store, self.inode).ok())
+        .map(|attrs| attrs.size);
+      let read_only = state
+        .store
+        .shards_backings
+        .get(backing)
+        .and_then(|copy| copy.object().read_only_handle().ok());
+      let (Some(pid), Some(file_len), Some(read_only), Some(mapping_id)) = (
+        pid,
+        size,
+        read_only,
+        super::mapping_id_of(state.partition, backing),
+      ) else {
+        state.count(FELL_BACK, 1);
+        return refused(Refusal::MapUnavailable);
+      };
+      match slates_ipc::handle_route::hand_section(read_only.as_handle(), self.object_bytes, pid) {
+        Ok(handle) => {
+          // Held on the client's slot since the copy was made: the fill lets go of it no more.
+          self.backing = None;
+          state.count(HANDED, 1);
+          ReplyBody::MapHanded {
+            mapping_id,
+            file_len,
+            block_len: self.object_bytes,
+            handle,
+          }
+        }
+        Err(refusal) => {
+          if matches!(refusal, slates_ipc::IpcError::UnconfinedDescriptor { .. }) {
+            state.count(UNCONFINED, 1);
+          }
+          state.count(FELL_BACK, 1);
+          refused(Refusal::MapUnavailable)
+        }
+      }
+    }
+  }
+
+  /// Whether `principal` is the daemon's own user, the only one a copy is handed to (§4.6, A-135's same-uid rule): on
+  /// Unix the peer's uid against the daemon's.
+  #[cfg(unix)]
+  fn is_the_daemons_user(principal: &Principal) -> bool {
+    matches!(principal, Principal::Uid { uid } if *uid == rustix::process::geteuid().as_raw())
+  }
+
+  /// Whether `principal` may be handed a copy on Windows: a client's own principal (no enrolled consumer), whose
+  /// rendezvous carries no user, so the hand-off checks the client process's token against the daemon's instead
+  /// (`slates_ipc::handle_route::same_user`).
+  #[cfg(windows)]
+  fn is_the_daemons_user(principal: &Principal) -> bool {
+    matches!(principal, Principal::Uid { .. })
   }
 
   /// Whether `client` can be handed a copy's descriptor: on Linux, over its control socket, which it must hold.
@@ -611,6 +690,12 @@ mod served {
   #[cfg(target_os = "macos")]
   fn can_be_handed_a_descriptor(_client: &crate::state::ClientSlot) -> bool {
     true
+  }
+
+  /// Whether `client` can be handed a copy's handle: on Windows, by duplication into its process, which its claim named.
+  #[cfg(windows)]
+  fn can_be_handed_a_descriptor(client: &crate::state::ClientSlot) -> bool {
+    client.pid != 0
   }
 
   /// What a client holds of the direct maps, `(maps, bytes)`: `held`, its copies handed or being filled, less those the
@@ -632,8 +717,9 @@ mod served {
     at: u64,
     bytes: &[u8],
   ) -> Result<(), Refusal> {
-    let page = rustix::param::page_size().max(1);
-    let page_len = u64::try_from(page).unwrap_or(u64::MAX);
+    // A page: the object a one-byte file is copied into.
+    let page_len = PeerObject::bytes_for(1).map_err(|_| Refusal::MapUnavailable)?;
+    let page = usize::try_from(page_len).unwrap_or(usize::MAX).max(1);
     let target = backings.get_mut(backing).ok_or(Refusal::NotFound)?;
     let mut offset = at;
     for chunk in bytes.chunks(page) {
@@ -710,8 +796,9 @@ mod served {
     }
   }
 
-  /// Records the reply's completion as one transaction, and returns the reply with where it goes. A record the
-  /// database refuses leaves nothing durable: counted, and the refusal is the reply, so a retry runs the verb again.
+  /// Records the reply's completion as one transaction, in the form the record keeps ([`super::recorded_form`]), and
+  /// returns the reply with where it goes. A record the database refuses leaves nothing durable: counted, and the
+  /// refusal is the reply, so a retry runs the verb again.
   fn complete(
     state: &mut ShardState,
     (origin, id): (u64, RequestId),
@@ -723,8 +810,11 @@ mod served {
       .remove(&(origin, id.client, id.sequence))
       .flatten();
     state.db.begin();
-    let recorded = crate::verbs::record_completion(state, origin, id, reply);
+    let kept = super::recorded_form(&reply);
+    let recorded = crate::verbs::record_completion(state, origin, id, kept.clone());
     let reply = match state.db.commit(&mut state.segment) {
+      // The record holds the reply as it keeps it, so the client gets it whole, a Windows handle's value included.
+      Ok(_) if recorded == kept => reply,
       Ok(_) => recorded,
       Err(e) => {
         let refusal = refusal_of_db(&e);
@@ -737,9 +827,74 @@ mod served {
   }
 }
 
+/// A direct map's reply as its completion record keeps it (§4.6, A-175): a Windows hand-off without its handle's value
+/// (zero), every other reply as it is. The client's process outlives the daemon that duplicated the handle into it, so a
+/// reply replayed from the record after a restart must name no handle: a client adopting the old value would map a copy
+/// no daemon keeps equal to the file any more. Linux's descriptor and macOS's offer never enter a reply, so theirs are
+/// kept whole: replayed, their hand-off finds nothing and the map fails.
+#[cfg_attr(
+  not(any(target_os = "linux", target_os = "macos", windows)),
+  allow(dead_code)
+)]
+fn recorded_form(reply: &ReplyBody) -> ReplyBody {
+  match reply {
+    ReplyBody::MapHanded {
+      mapping_id,
+      file_len,
+      block_len,
+      ..
+    } => ReplyBody::MapHanded {
+      mapping_id: *mapping_id,
+      file_len: *file_len,
+      block_len: *block_len,
+      handle: 0,
+    },
+    other => other.clone(),
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// AC-A-175: a Windows hand-off's completion is recorded without its handle, so a reply replayed after a restart
+  /// names none. Do: take the record's form of a hand-off naming handle 0x1234, of a Linux map, of a macOS offer and of
+  /// a refusal. Expect: the hand-off kept with every field but its handle, which is zero; the others kept whole.
+  #[test]
+  fn a_handed_maps_record_names_no_handle() {
+    let handed = ReplyBody::MapHanded {
+      mapping_id: 7,
+      file_len: 5,
+      block_len: 4096,
+      handle: 0x1234,
+    };
+    assert_eq!(
+      recorded_form(&handed),
+      ReplyBody::MapHanded {
+        mapping_id: 7,
+        file_len: 5,
+        block_len: 4096,
+        handle: 0
+      }
+    );
+    for whole in [
+      ReplyBody::Mapped {
+        mapping_id: 7,
+        region_off: 0,
+        file_len: 5,
+        block_len: 4096,
+      },
+      ReplyBody::MapOffered {
+        mapping_id: 7,
+        file_len: 5,
+        block_len: 4096,
+        secret: [9; 32],
+      },
+      refused(Refusal::MapUnavailable),
+    ] {
+      assert_eq!(recorded_form(&whole), whole);
+    }
+  }
 
   /// AC-A-171 (G-direct step 2): a client's share is the shard's capacity over the clients served now. Do: share a
   /// capacity of 100 copies and 1 MiB among one, four and zero clients. Expect the whole to one client, a quarter each

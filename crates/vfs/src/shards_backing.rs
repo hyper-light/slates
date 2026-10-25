@@ -124,6 +124,19 @@ impl BackingObject {
       BackingObject::Peer(object) => object.descriptor(),
     }
   }
+
+  /// A read-only handle of a peer's copy, in this process: what the Windows hand-off duplicates into the client's
+  /// (A-175). A VMM's object has none here: no DAX object exists on Windows, so the arm is unreachable and refused.
+  #[cfg(windows)]
+  pub fn read_only_handle(&self) -> Result<std::os::windows::io::OwnedHandle, MemError> {
+    match self {
+      BackingObject::Vmm(_) => Err(MemError::OsRefused {
+        call: "a read-only handle of a VMM's object",
+        code: None,
+      }),
+      BackingObject::Peer(object) => object.read_only_handle(),
+    }
+  }
 }
 
 /// One file's backing for one holder: its object, the ranges filled from the volume, the ranges asked writable, and

@@ -184,13 +184,11 @@ fn attach_status_detach(client: &mut Client, id: slates_client::VolumeId) {
 /// A one-shard daemon and a client of it: one shard, so a volume's owner shard is the client's home shard, the only
 /// shard a descriptor is handed from (§4.6, A-171). `tag` names the instance; the instance name is returned for the
 /// descriptor probes, which scope themselves by it.
-#[cfg(unix)]
 fn one_shard_daemon(tag: &str) -> (Daemon, Client, String) {
   one_shard_daemon_with(tag, |_| {})
 }
 
 /// [`one_shard_daemon`] with its configuration adjusted by `adjust` before it starts.
-#[cfg(unix)]
 fn one_shard_daemon_with(
   tag: &str,
   adjust: impl FnOnce(&mut DaemonConfig),
@@ -215,7 +213,6 @@ fn one_shard_daemon_with(
 }
 
 /// A plain volume with room for a file of `bytes`, its rewrites and its records.
-#[cfg(unix)]
 fn room_for(name: &str, bytes: usize) -> CreateSpec {
   CreateSpec {
     name: name.to_owned(),
@@ -229,7 +226,6 @@ fn room_for(name: &str, bytes: usize) -> CreateSpec {
 }
 
 /// Writes `bytes` as the whole of `path` in `volume`, through a write attachment of `client`.
-#[cfg(unix)]
 fn write_file(client: &mut Client, volume: slates_client::VolumeId, path: &str, bytes: &[u8]) {
   let attached = client.attach(volume, None, Intent::Write).unwrap();
   client
@@ -239,7 +235,6 @@ fn write_file(client: &mut Client, volume: slates_client::VolumeId, path: &str, 
 }
 
 /// Bytes no untouched or zeroed byte equals (none is zero), different for each `seed`.
-#[cfg(unix)]
 fn pattern(len: usize, seed: u8) -> Vec<u8> {
   (0..len)
     .map(|index| u8::try_from(index % 251).unwrap().wrapping_add(seed) | 1)
@@ -247,15 +242,13 @@ fn pattern(len: usize, seed: u8) -> Vec<u8> {
 }
 
 /// The page span of a file of `bytes`, at least a page: the size of the copy a direct map hands (A-171).
-#[cfg(unix)]
 fn page_span(bytes: usize) -> u64 {
-  let page = rustix::param::page_size();
-  u64::try_from(bytes.max(1).div_ceil(page) * page).unwrap()
+  slates_mem::PeerObject::bytes_for(u64::try_from(bytes).unwrap()).unwrap()
 }
 
 /// What a direct map of `mapped_len` bytes must show of a file holding `file`: its bytes, cut at the map's length,
 /// then zeros to it.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn shown(file: &[u8], mapped_len: u64) -> Vec<u8> {
   let mut expect = vec![0u8; usize::try_from(mapped_len).unwrap()];
   expect
@@ -266,7 +259,7 @@ fn shown(file: &[u8], mapped_len: u64) -> Vec<u8> {
 }
 
 /// Everything the map shows now, loaded through the client's view.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn seen(mapped: &slates_client::MappedRead) -> Vec<u8> {
   let mut bytes = vec![0u8; usize::try_from(mapped.mapped_len()).unwrap()];
   let read = mapped.read_at(0, &mut bytes).unwrap();
@@ -275,7 +268,6 @@ fn seen(mapped: &slates_client::MappedRead) -> Vec<u8> {
 }
 
 /// How many times the daemon counted `name`, summed over its shards.
-#[cfg(unix)]
 fn counted(daemon: &Daemon, name: &str) -> u64 {
   daemon
     .refusals_on_every_shard()
@@ -288,22 +280,20 @@ fn counted(daemon: &Daemon, name: &str) -> u64 {
 /// Shape: a file of many content chunks: 4 MiB, over the 64 KiB chunk of the first zero-copy path, which returned a
 /// 4 MiB file's first 65,536 bytes as the whole
 /// (`docs/bugs/2026-10-18-a-zero-copy-read-of-a-multi-chunk-file-returned-one-chunk.md`).
-#[cfg(unix)]
 const MANY_CHUNKS_BYTES: usize = 4 << 20;
 
-/// AC-A-171 (§4.6 the same-kernel direct map): a `MapRead` maps the whole file with no copy on Linux and macOS, one
+/// AC-A-171 (§4.6 the same-kernel direct map): a `MapRead` maps the whole file with no copy on Linux, macOS and Windows, one
 /// content chunk or many. Do: on a one-shard daemon, write a 20 KiB file and a 4 MiB file and `map_read` each. Expect:
-/// on Linux and macOS each is zero-copy (macOS's copy claimed on the socket route), its map is the file's page span,
+/// each is zero-copy (macOS's copy claimed on the socket route, Windows' handed by handle), its map is the file's page span,
 /// every byte equals the file, and the daemon counted both hand-offs (`dax.local_map`), no fallback and nothing
-/// unconfined. Elsewhere each reads by copy, every byte: Windows' route is owed to its own step.
-#[cfg(unix)]
+/// unconfined.
 #[test]
 fn a_same_kernel_client_maps_a_file_with_no_copy() {
   let (daemon, mut client, _instance) = one_shard_daemon("dax");
   for (name, len) in [("one-chunk", 20 << 10), ("many-chunks", MANY_CHUNKS_BYTES)] {
     maps_whole(&mut client, name, len);
   }
-  if cfg!(any(target_os = "linux", target_os = "macos")) {
+  if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
     assert_eq!(
       counted(&daemon, "dax.local_map"),
       2,
@@ -315,8 +305,7 @@ fn a_same_kernel_client_maps_a_file_with_no_copy() {
 }
 
 /// Writes a file of `len` bytes into a new volume `name`, maps it, and checks the map: its length and every byte,
-/// and on Linux and macOS that it is a direct map of the file's page span.
-#[cfg(unix)]
+/// and that it is a direct map of the file's page span.
 fn maps_whole(client: &mut Client, name: &str, len: usize) {
   let id = client.create(&room_for(name, len)).unwrap();
   let bytes = pattern(len, 1);
@@ -328,10 +317,10 @@ fn maps_whole(client: &mut Client, name: &str, len: usize) {
     "{name}: the length"
   );
   assert!(mapped.to_vec().unwrap() == bytes, "{name}: every byte");
-  if cfg!(any(target_os = "linux", target_os = "macos")) {
+  if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
     assert!(
       mapped.is_zero_copy(),
-      "{name}: a direct map on Linux and macOS"
+      "{name}: a direct map on Linux, macOS and Windows"
     );
     assert_eq!(mapped.mapped_len(), page_span(len), "{name}: the page span");
   }
@@ -348,7 +337,6 @@ fn maps_whole(client: &mut Client, name: &str, len: usize) {
 /// Linux, a 256 KiB, a 1 MiB and a 4 MiB file each returned exactly 65,536 bytes
 /// (`docs/bugs/2026-10-18-a-zero-copy-read-of-a-multi-chunk-file-returned-one-chunk.md`); and a 0-byte file was
 /// refused `NotFound`, having no extent at offset 0. A copy of the file has neither hole.
-#[cfg(unix)]
 #[test]
 fn a_map_read_returns_the_whole_file_at_every_size() {
   let (_daemon, mut client, _instance) = one_shard_daemon("whole");
@@ -369,10 +357,10 @@ fn a_map_read_returns_the_whole_file_at_every_size() {
       mapped.is_zero_copy()
     );
     assert!(read == bytes, "{kib} KiB: every byte");
-    if cfg!(any(target_os = "linux", target_os = "macos")) {
+    if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
       assert!(
         mapped.is_zero_copy(),
-        "{kib} KiB: a direct map on Linux and macOS"
+        "{kib} KiB: a direct map on Linux, macOS and Windows"
       );
     }
     drop(mapped);
@@ -389,7 +377,7 @@ fn a_map_read_returns_the_whole_file_at_every_size() {
 ///
 /// The non-vacuity is the red-check: with the write boundary not writing through to the copy, the first rewrite's
 /// check fails (the map keeps the old page).
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[test]
 fn a_direct_map_follows_every_change_within_its_length_as_memory_alone() {
   let (daemon, mut reader, instance) = one_shard_daemon("mapcoh");
@@ -398,7 +386,10 @@ fn a_direct_map_follows_every_change_within_its_length_as_memory_alone() {
   let first = pattern(MANY_CHUNKS_BYTES, 1);
   write_file(&mut writer, id, "/f.bin", &first);
   let mapped = reader.map_read(id, "/f.bin").unwrap();
-  assert!(mapped.is_zero_copy(), "a direct map on Linux and macOS");
+  assert!(
+    mapped.is_zero_copy(),
+    "a direct map on Linux, macOS and Windows"
+  );
   let mapped_len = mapped.mapped_len();
   assert_eq!(mapped_len, page_span(MANY_CHUNKS_BYTES));
   assert!(
@@ -432,7 +423,7 @@ fn a_direct_map_follows_every_change_within_its_length_as_memory_alone() {
 
 /// Rewrites the file `first` with one page at 1 MiB changed, through `writer`, and checks the map shows that page, and
 /// nothing else moved.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn a_page_written_at_one_mib_shows(
   writer: &mut Client,
   volume: slates_client::VolumeId,
@@ -460,12 +451,11 @@ fn a_page_written_at_one_mib_shows(
 
 /// AC-A-171 — a read of a map from its end or past it returns nothing, as `pread` past a file's end does. Do: map a
 /// small file, then `read_at` at the map's end and a page past it, and with an empty buffer inside it. Expect: each
-/// returns `Ok(0)` and leaves the buffer as it was; on Linux and macOS the map is a direct one, so its view is what
+/// returns `Ok(0)` and leaves the buffer as it was; the map is a direct one, so its view is what
 /// answers.
 ///
 /// Found by reading the client on 2026-10-25: the direct map's view refused a load past its end even for an empty
 /// buffer, so a read at an offset past the map answered `OutOfRange` where the copy path answered 0.
-#[cfg(unix)]
 #[test]
 fn a_read_from_a_maps_end_or_past_it_returns_nothing() {
   let (_daemon, mut client, _instance) = one_shard_daemon("mapend");
@@ -473,11 +463,14 @@ fn a_read_from_a_maps_end_or_past_it_returns_nothing() {
   let bytes = pattern(20 << 10, 9);
   write_file(&mut client, id, "/f.bin", &bytes);
   let mapped = client.map_read(id, "/f.bin").unwrap();
-  if cfg!(any(target_os = "linux", target_os = "macos")) {
-    assert!(mapped.is_zero_copy(), "a direct map on Linux and macOS");
+  if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
+    assert!(
+      mapped.is_zero_copy(),
+      "a direct map on Linux, macOS and Windows"
+    );
   }
   let end = mapped.mapped_len();
-  let page = u64::try_from(rustix::param::page_size()).unwrap();
+  let page = slates_mem::PeerObject::bytes_for(1).unwrap();
   for offset in [end, end + page, u64::MAX] {
     let mut buffer = [7u8; 16];
     assert_eq!(
@@ -493,10 +486,9 @@ fn a_read_from_a_maps_end_or_past_it_returns_nothing() {
 }
 
 /// AC-A-171 (G-direct step 2): a released map gives its copy back, and the file maps again. Do: map a file and release
-/// it, twice. Expect: every map reads every byte; on Linux and macOS each holds one copy of the file's page span and each
+/// it, twice. Expect: every map reads every byte; each holds one copy of the file's page span and each
 /// release gives it back, so the daemon's held copies return to where they started each time and
-/// `dax.local_map_released` counts two. On every Unix the release succeeds (a copied read holds nothing to release).
-#[cfg(unix)]
+/// `dax.local_map_released` counts two.
 #[test]
 fn a_released_map_gives_its_copy_back_and_the_file_maps_again() {
   let (daemon, mut client, _instance) = one_shard_daemon("maprel");
@@ -510,10 +502,10 @@ fn a_released_map_gives_its_copy_back_and_the_file_maps_again() {
       mapped.to_vec().unwrap() == bytes,
       "round {round}: every byte"
     );
-    if cfg!(any(target_os = "linux", target_os = "macos")) {
+    if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
       assert!(
         mapped.is_zero_copy(),
-        "round {round}: a direct map on Linux and macOS"
+        "round {round}: a direct map on Linux, macOS and Windows"
       );
       assert_eq!(
         daemon.direct_map_copies().unwrap(),
@@ -528,7 +520,7 @@ fn a_released_map_gives_its_copy_back_and_the_file_maps_again() {
       "round {round}: released, the copies are where they started"
     );
   }
-  if cfg!(any(target_os = "linux", target_os = "macos")) {
+  if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
     assert_eq!(counted(&daemon, "dax.local_map_released"), 2);
   }
   client.destroy(id).unwrap();
@@ -609,7 +601,7 @@ fn a_released_maps_unclaimed_offer_is_withdrawn() {
 /// connects, the share halves to one each, and the first client, holding two, is refused again while the second maps.
 /// `dax.local_map_share_refused` counts both refusals. (The share's bytes are held to their rule by the unit tests of
 /// `crates/server/src/direct_map.rs`.)
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[test]
 fn a_client_past_its_share_of_maps_is_refused_typed_with_nothing_made() {
   let page = page_span(1);
@@ -649,7 +641,7 @@ fn a_client_past_its_share_of_maps_is_refused_typed_with_nothing_made() {
 }
 
 /// Holds `refusal` to `MapShareExhausted` with `(held_maps, most_maps)`.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn assert_share_refused(refusal: Option<ClientError>, (held, most): (u64, u64)) {
   match refusal {
     Some(ClientError::Refused(Refusal::MapShareExhausted {
@@ -668,7 +660,7 @@ fn assert_share_refused(refusal: Option<ClientError>, (held, most): (u64, u64)) 
 /// Maps `/f.bin` of a new volume `name` holding `bytes`, checks the map is a direct one holding one copy more than
 /// `start`, runs `leave` (what makes the file leave), and checks the map still reads the file's last bytes and the copy
 /// is still held, counted against the share, until the release gives it back.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn a_map_outlives_its_file_until_released(
   name: &str,
   leave: impl FnOnce(&mut Client, slates_client::VolumeId),
@@ -679,7 +671,10 @@ fn a_map_outlives_its_file_until_released(
   write_file(&mut client, id, "/f.bin", &bytes);
   let start = daemon.direct_map_copies().unwrap();
   let mapped = client.map_read(id, "/f.bin").unwrap();
-  assert!(mapped.is_zero_copy(), "a direct map on Linux and macOS");
+  assert!(
+    mapped.is_zero_copy(),
+    "a direct map on Linux, macOS and Windows"
+  );
   let held = daemon.direct_map_copies().unwrap();
   assert_eq!(held.0, start.0 + 1, "one copy held");
   leave(&mut client, id);
@@ -705,7 +700,7 @@ fn a_map_outlives_its_file_until_released(
 /// holds the copy, and the release gives it back. (A destroyed volume's copies leave the write-through index at once, so
 /// a volume given the prefix again once the count wraps never writes into them: held to that rule in
 /// `crates/vfs/tests/shards_backing.rs`.)
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[test]
 fn a_destroyed_volumes_map_keeps_its_copy_until_released() {
   a_map_outlives_its_file_until_released("mapgone", |client, id| client.destroy(id).unwrap());
@@ -713,7 +708,7 @@ fn a_destroyed_volumes_map_keeps_its_copy_until_released() {
 
 /// AC-A-171 (G-direct step 2): a removed file's map detaches from it and is released by its client. Do: map a file,
 /// remove it, read the map, release it. Expect: as for a destroyed volume.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 #[test]
 fn a_removed_files_map_keeps_its_copy_until_released() {
   a_map_outlives_its_file_until_released("maprm", |client, id| {
@@ -726,12 +721,10 @@ fn a_removed_files_map_keeps_its_copy_until_released() {
 }
 
 /// AC-A-171 (cross-shard): on a two-shard daemon a client maps files whose owner shard may not be its home shard, and
-/// always gets the bytes: a direct map where the owner is its home shard (on Linux and macOS), the paged copy where it is
-/// not (a
-/// descriptor does not cross shards yet). Several volumes spread across the shards by id, so at least one is owned by
+/// always gets the bytes: a direct map where the owner is its home shard, the paged copy where it is not (a descriptor
+/// does not cross shards yet). Several volumes spread across the shards by id, so at least one is owned by
 /// the shard the client did not connect to, which exercises the forwarded path (before its fix a `MapRead` there
 /// answered `NotFound`).
-#[cfg(unix)]
 #[test]
 fn a_client_maps_files_across_shards_and_always_gets_the_bytes() {
   let profile = profile();
@@ -769,12 +762,12 @@ fn a_client_maps_files_across_shards_and_always_gets_the_bytes() {
 
 /// Shape: the neighbour volume's marker: a byte run written into no other volume, so finding it inside a descriptor
 /// proves that descriptor reaches content the peer never asked for.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 const NEIGHBOUR_MARKER: &[u8; 16] = b"SL-NEIGHBOUR-SEC";
 
 /// Shape: a file large enough that its content lives in the shared content arena rather than inline in its inode, so
 /// the neighbour's marker is in the arena the 2026-10-18 escape handed out.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 const ARENA_BACKED_BYTES: usize = 20 << 10;
 
 /// This process's descriptors that name a kernel memory object (`/memfd:…`) **of the daemon named by
@@ -2201,6 +2194,197 @@ fn every_change_is_refused_on_macos(handed: std::os::fd::BorrowedFd<'_>, object_
     }
     Err(refused) => println!("reopen read-write through /dev/fd: refused ({refused})"),
   }
+}
+
+/// The size of the section `handle` names: a read-only view of all of it, asked its extent.
+#[cfg(windows)]
+fn section_bytes(handle: std::os::windows::io::BorrowedHandle<'_>) -> u64 {
+  use std::os::windows::io::AsRawHandle;
+  use windows_sys::Win32::System::Memory::{
+    FILE_MAP_READ, MEMORY_BASIC_INFORMATION, MapViewOfFile, UnmapViewOfFile, VirtualQuery,
+  };
+
+  // SAFETY: a read-only view of the whole section at an address the system chooses; unmapped below, never touched.
+  let view = unsafe { MapViewOfFile(handle.as_raw_handle(), FILE_MAP_READ, 0, 0, 0) };
+  assert!(!view.Value.is_null(), "the handle maps read alone");
+  let mut region = MEMORY_BASIC_INFORMATION::default();
+  // SAFETY: asks about the view just made; the answer is written to a local of the size passed.
+  let answered = unsafe {
+    VirtualQuery(
+      view.Value,
+      &mut region,
+      std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+    )
+  };
+  // SAFETY: the view made above, unmapped once.
+  unsafe { UnmapViewOfFile(view) };
+  assert_ne!(answered, 0, "the view answers its extent");
+  u64::try_from(region.RegionSize).unwrap()
+}
+
+/// How many times `needle` occurs in the whole section `handle` names, read through a read-only view of a duplicate of
+/// it.
+#[cfg(windows)]
+fn occurrences_through_handle(
+  handle: std::os::windows::io::BorrowedHandle<'_>,
+  needle: &[u8],
+) -> usize {
+  let bytes = section_bytes(handle);
+  let view = slates_mem::PeerView::map(handle.try_clone_to_owned().unwrap(), bytes).unwrap();
+  let mut all = vec![0u8; usize::try_from(bytes).unwrap()];
+  view.load(0, &mut all).unwrap();
+  all
+    .windows(needle.len())
+    .filter(|window| *window == needle)
+    .count()
+}
+
+/// What a hostile peer does on Windows with the read-only handle a direct map duplicated into it, and what Windows
+/// answers (measured 2026-10-25, Windows 10.0.26200, `slates-mem`'s `tests/peer_section.rs`): a duplicate that writes, one
+/// that may rewrite the section's descriptor and a writable view are each refused `ERROR_ACCESS_DENIED`, the
+/// descriptor's own refusal, so a refusal for some other reason cannot pass for it; a read-only view turned writable is
+/// refused `ERROR_INVALID_PARAMETER`.
+#[cfg(windows)]
+fn every_change_is_refused_on_windows(handed: std::os::windows::io::BorrowedHandle<'_>) {
+  use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+  use windows_sys::Win32::Foundation::{
+    DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, GetLastError, HANDLE,
+  };
+  use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
+  use windows_sys::Win32::System::Memory::{
+    FILE_MAP_READ, FILE_MAP_WRITE, MapViewOfFile, PAGE_PROTECTION_FLAGS, PAGE_READWRITE,
+    UnmapViewOfFile, VirtualProtect,
+  };
+  use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+  let duplicate = |access: u32| {
+    let mut out: HANDLE = std::ptr::null_mut();
+    // SAFETY: this process's pseudo-handle on both sides, the live handed handle, and an out-pointer to a local; a
+    // granted duplicate is owned and closed at once.
+    let done = unsafe {
+      DuplicateHandle(
+        GetCurrentProcess(),
+        handed.as_raw_handle(),
+        GetCurrentProcess(),
+        &mut out,
+        access,
+        0,
+        0,
+      )
+    };
+    if done == 0 {
+      // SAFETY: reads this thread's last error, which the refused call just set.
+      return Err(unsafe { GetLastError() });
+    }
+    // SAFETY: the duplicate just granted, owned here alone.
+    drop(unsafe { OwnedHandle::from_raw_handle(out) });
+    Ok(())
+  };
+  assert_eq!(
+    duplicate(FILE_MAP_WRITE | FILE_MAP_READ),
+    Err(ERROR_ACCESS_DENIED),
+    "a duplicate that writes"
+  );
+  assert_eq!(
+    duplicate(WRITE_DAC),
+    Err(ERROR_ACCESS_DENIED),
+    "a duplicate that may rewrite the section's descriptor"
+  );
+  // SAFETY: a writable view at an address the system chooses, never touched; a granted one is unmapped below.
+  let writable = unsafe { MapViewOfFile(handed.as_raw_handle(), FILE_MAP_WRITE, 0, 0, 0) };
+  // SAFETY: reads this thread's last error, before any other call.
+  let writable_error = unsafe { GetLastError() };
+  if !writable.Value.is_null() {
+    // SAFETY: the view just granted, unmapped once.
+    unsafe { UnmapViewOfFile(writable) };
+  }
+  assert!(writable.Value.is_null(), "a writable view");
+  assert_eq!(
+    writable_error, ERROR_ACCESS_DENIED,
+    "a writable view's refusal"
+  );
+  // SAFETY: a read-only view at an address the system chooses; only its first page's protection is changed.
+  let view = unsafe { MapViewOfFile(handed.as_raw_handle(), FILE_MAP_READ, 0, 0, 0) };
+  assert!(!view.Value.is_null(), "a read-only view is granted");
+  let mut old: PAGE_PROTECTION_FLAGS = 0;
+  let page = usize::try_from(slates_mem::PeerObject::bytes_for(1).unwrap()).unwrap();
+  // SAFETY: the view just made, its first page, which every copy has.
+  let turned = unsafe { VirtualProtect(view.Value, page, PAGE_READWRITE, &mut old) };
+  // SAFETY: reads this thread's last error, before any other call.
+  let turned_error = unsafe { GetLastError() };
+  // SAFETY: the view made above, unmapped once.
+  unsafe { UnmapViewOfFile(view) };
+  assert_eq!(turned, 0, "a read-only view turned writable");
+  assert_eq!(
+    turned_error, ERROR_INVALID_PARAMETER,
+    "a read-only view turned writable: its refusal"
+  );
+}
+
+/// §4.6 A-175 with §4.13, Windows: the read-only handle a direct map duplicates into a peer reaches one file's bytes and
+/// can change nothing. Do: a one-shard daemon with two volumes of one account — a neighbour holding a marked file,
+/// mapped too, and the peer's own holding a file of many chunks — map the peer's file, then use the handle that arrived
+/// the way a hostile peer would ([`every_change_is_refused_on_windows`]). Expect: a direct map, every byte of the file;
+/// the handle's section exactly the mapped length; the neighbour's marker found through the neighbour's own handle and
+/// through no byte of the peer's; every attempt to change the section refused with the descriptor's own refusal; the
+/// map still reads the file afterwards; nothing judged unconfined.
+///
+/// Non-vacuity: the same scan finds the marker through the neighbour's handle, so a clean scan of the peer's is a fact
+/// about that handle.
+#[cfg(windows)]
+#[test]
+fn a_direct_maps_handle_reads_one_file_and_changes_nothing() {
+  let (daemon, mut client, _instance) = one_shard_daemon("mapauth");
+  let neighbour = client
+    .create(&room_for("neighbour", ARENA_BACKED_BYTES))
+    .unwrap();
+  let secret: Vec<u8> = NEIGHBOUR_MARKER
+    .iter()
+    .copied()
+    .cycle()
+    .take(ARENA_BACKED_BYTES)
+    .collect();
+  write_file(&mut client, neighbour, "/secret.bin", &secret);
+  let mine = client.create(&room_for("mine", MANY_CHUNKS_BYTES)).unwrap();
+  let bytes = pattern(MANY_CHUNKS_BYTES, 5);
+  write_file(&mut client, mine, "/mine.bin", &bytes);
+
+  let neighbours_map = client.map_read(neighbour, "/secret.bin").unwrap();
+  assert!(
+    neighbours_map.is_zero_copy(),
+    "the neighbour's map is a direct one"
+  );
+  assert!(
+    occurrences_through_handle(neighbours_map.handle().unwrap(), NEIGHBOUR_MARKER) > 0,
+    "the scan finds the neighbour's marker through the neighbour's own handle"
+  );
+  let mapped = client.map_read(mine, "/mine.bin").unwrap();
+  assert!(mapped.is_zero_copy(), "a direct map on Windows");
+  assert!(
+    mapped.to_vec().unwrap() == bytes,
+    "every byte of the peer's own file"
+  );
+  let handed = mapped.handle().unwrap();
+  assert_eq!(
+    section_bytes(handed),
+    mapped.mapped_len(),
+    "the section is exactly what the map authorizes"
+  );
+  assert_eq!(
+    occurrences_through_handle(handed, NEIGHBOUR_MARKER),
+    0,
+    "the neighbour's content is reachable through the handle of another volume's file"
+  );
+  every_change_is_refused_on_windows(handed);
+  assert!(
+    mapped.to_vec().unwrap() == bytes,
+    "the attacks changed nothing the map reads"
+  );
+  drop(mapped);
+  drop(neighbours_map);
+  assert_eq!(counted(&daemon, "dax.local_map_unconfined"), 0);
+  client.destroy(mine).unwrap();
+  client.destroy(neighbour).unwrap();
 }
 
 /// §4.6 A-173 with §4.13, macOS: the read-only descriptor a direct map offers a peer reaches one file's bytes and can

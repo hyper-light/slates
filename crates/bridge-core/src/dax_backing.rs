@@ -934,16 +934,7 @@ impl DaxBackingSession {
   ) -> Result<(), Failure> {
     let handle = *self.backings.get(&inode).ok_or(Failure::Object)?;
     let span = usize::try_from(len).map_err(|_| Failure::Object)?;
-    fresh.clear();
-    bridge
-      .read(
-        ObjectId::new(inode, 0),
-        cx,
-        at,
-        u32::try_from(len).unwrap_or(u32::MAX),
-        fresh,
-      )
-      .map_err(Failure::Volume)?;
+    read_whole(bridge, cx, ObjectId::new(inode, 0), (at, len), fresh).map_err(Failure::Volume)?;
     fresh.resize(span, 0);
     held.clear();
     held.resize(span, 0);
@@ -981,10 +972,7 @@ fn write_back_runs(
   (at, len): (u64, u64),
   (stored, held): (&[u8], &mut Vec<u8>),
 ) -> Result<u64, Failure> {
-  held.clear();
-  bridge
-    .read(object, cx, at, u32::try_from(len).unwrap_or(u32::MAX), held)
-    .map_err(Failure::Volume)?;
+  read_whole(bridge, cx, object, (at, len), held).map_err(Failure::Volume)?;
   // A volume shorter than the object's span here (the file cut since) is compared as far as it reaches.
   let runs = differing_runs(stored, held);
   for &(from, to) in &runs {
@@ -995,6 +983,34 @@ fn write_back_runs(
       .map_err(Failure::Volume)?;
   }
   Ok(u64::try_from(runs.len()).unwrap_or(u64::MAX))
+}
+
+/// Reads `len` bytes of `object` from `at` into `out`, cleared first, in as many calls as the bridge's read cap takes,
+/// stopping short only at the file's end. A bridge answers at most its cap a call (the volume bridge's, 256 KiB), so a
+/// single call reads a slice past the cap short; a short call is the file's end only when it reads nothing. Taken for
+/// the end, a capped call lost a guest's stores past it at an ingest and zeroed its map past it at a refill, on every
+/// machine whose copy slice is longer than the cap
+/// (`docs/bugs/2026-10-25-a-dax-slice-past-the-read-cap-dropped-a-guests-stores.md`). Bounded by `len`: each call reads
+/// at least a byte or ends the loop.
+fn read_whole(
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  object: ObjectId,
+  (at, len): (u64, u64),
+  out: &mut Vec<u8>,
+) -> Result<(), VfsError> {
+  out.clear();
+  let want = usize::try_from(len).unwrap_or(usize::MAX);
+  while out.len() < want {
+    let before = out.len();
+    let offset = at.saturating_add(u64::try_from(before).unwrap_or(u64::MAX));
+    let rest = u32::try_from(want.saturating_sub(before)).unwrap_or(u32::MAX);
+    bridge.read(object, cx, offset, rest, out)?;
+    if out.len() == before {
+      break;
+    }
+  }
+  Ok(())
 }
 
 /// Moves an ingest on to its next inode.

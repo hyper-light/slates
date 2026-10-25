@@ -11230,6 +11230,47 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     re-witness asks the host's clock as a copy-up does (A-162).
   - A racy witness never settles: after a re-hash past its tick confirms it, the fingerprint alone would do, but every
     drift check of it still hashes the whole file.
+- **The direct map on Windows (A-175, G-direct step 5, 2026-10-25): built, and proven on a real Windows machine.**
+  - **What:** a `MapRead` on Windows is answered `MapHanded`. The file's copy is an unnamed pagefile-backed section under
+    `D:P(A;;RC;;;OW)`, a descriptor that grants no one any right to it; the daemon duplicates a read-only handle of it
+    into the client's process, judged first (`slates_ipc::handle_route::hand_section`) and the process checked to run as
+    the daemon's user; the reply names the handle's value, which the completion record leaves out.
+  - **Measured first** (`crates/mem/tests/peer_section.rs`, jupiter, Windows 10.0.26200): under a section's default
+    descriptor a read-only handle's holder duplicates one that writes and one that may rewrite the descriptor; under the
+    peer section's both are refused `ERROR_ACCESS_DENIED`.
+  - **Proven** on jupiter: the client binary's 10 direct-map tests, run one at a time (zero copy at every size, every
+    change seen, the hostile holder's escalations refused, the neighbour's marker absent, release, share, destroy,
+    unlink, cross-shard); `slates-mem` 96 + 3; Windows clippy of the seven crates clean. CI's two x86_64 Windows lanes now
+    run the same command.
+  - **Red-checked** in a scratch copy on jupiter: a section under the default descriptor was refused unconfined at the
+    hand-off (the read came by copy); with the judge bypassed too, the hostile test's duplicate that writes was granted.
+  - **Open:**
+    - arm64 Windows: its CI lane measures the escalation but runs no daemon yet (G-arm64-host);
+    - several daemons at once in one Windows process conflict: the client binary run whole on jupiter failed 18 of 20
+      tests, and every direct-map test passed run alone, so CI runs them one at a time; pre-existing, not yet diagnosed;
+    - the client binary's restart tests fail on Windows (6 of them, never run there by CI): the restarted daemon meets
+      its predecessor's still-live named section, `CreateFileMappingW` refused `ERROR_ALREADY_EXISTS`; pre-existing;
+    - on every platform, a client's direct map outlives its daemon: after a `kill -9` and restart the map keeps the file
+      as it was when the daemon died and follows it no more, with no signal to the client (its object lives on in the
+      client's process). A replayed map reply now fails rather than adopting such a copy (A-175's record rule; Linux's
+      and macOS's hand-offs fail as well), but a map made before the death goes stale silently. Owed: a decision on
+      how a client learns its map ended.
+
+- **A DAX copy slice past the bridge's 256 KiB read cap dropped a guest's stores (A-163, fixed 2026-10-25).** CI's
+  ubuntu lane on `d71ce235` (run 40211222944) failed two Shards tests: a store through a guest's DAX map past the first
+  256 KiB of a copy slice never reached the volume at `FSYNC`, which answered 0. Root cause, reproduced on fedora by
+  forcing a 4 MiB slice: the ingest's compare and the refill read a slice in one bridge call, which the volume bridge
+  cuts at `MAX_READ`, and took the cut for the file's end (the refill padded it with zeros into the guest's map). Only
+  a machine whose derived slice exceeds 256 KiB shows it; fedora, adacachy (load 242–249) and this Mac never did.
+  - **Fixed:** `read_whole` (`crates/bridge-core/src/dax_backing.rs`) reads a slice call after call; the Shards tests
+    run every targeted case and every generated history with the machine's slice and with a whole range a slice, and
+    the refill test compares the whole range (`docs/bugs/2026-10-25-a-dax-slice-past-the-read-cap-dropped-a-guests-stores.md`).
+  - **Verified:** this Mac, Shards 25 of 25; fedora, the three tests green, and all three red with `read_whole` cut to
+    one call.
+  - **Open, siblings found by the sweep:** WinFsp's host answers a Windows read with one bridge read, so a read past
+    256 KiB returns short mid-file, which Windows may zero-fill on a paging read (to measure on Windows); FSKit's shim
+    does the same.
+
 - **The direct map on macOS (A-173, G-direct step 4, 2026-10-25): built, and proven on this Mac by a real client.**
   - **What:** a `MapRead` on macOS is answered `MapOffered`. The file's copy is a shared-memory object whose name went
     as soon as its two descriptors were open; the read-only one is offered on the daemon's socket route (A-161, now
@@ -11373,10 +11414,12 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
 - **The DAX matrix (A-164, 2026-10-24): every cell of "DAX everywhere" is proven, owed to a goal, or ruled out by its
   platform.** The matrix is in `virtiofs.md` §8: six environments, each platform a row, two routes, 52 cells, none left
   unknown. The research behind it is kiln 01a17143717a7556a52f40f1d5a0e1b2 (19 findings, graded from their sources).
-  - **Proven (7 cells):**
+  - **Proven (8 cells):**
     - bare-metal Linux x86_64 by the mount route: the FUSE mount's shared maps;
     - bare-metal Linux x86_64 by the socket route: the direct map's sealed copy (A-171, 2026-10-25; the entry below);
     - bare-metal macOS arm64 by the socket route: the direct map's read-only copy over the daemon's socket route (A-173,
+      2026-10-25; the entry below);
+    - bare-metal Windows x86_64 by the socket route: a read-only section handle duplicated into the client (A-175,
       2026-10-25; the entry below);
     - crosvm on Linux x86_64 by both routes: over a slates mount, and over slates' own device (G-vhost, 2026-10-25:
       `crates/cli/tests/guest_vhost.rs`, the entries below);
@@ -11391,7 +11434,8 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     - WSL2: 9P (unconfirmed);
     - Firecracker's socket route: it has no fs device.
   - **Owed, each to a kiln goal:**
-    - the direct map on Windows (G-direct step 5; macOS proven since 2026-10-25, A-173). **Corrected 2026-10-25:** this entry and the matrix
+    - the direct map on arm64 Windows (macOS proven since 2026-10-25, A-173; Windows x86_64 since 2026-10-25, A-175).
+      **Corrected 2026-10-25:** this entry and the matrix
       had counted the A-135 direct map on Linux as proven while every run read by copy (its test reported the path
       and did not assert it); A-171 has proven it since, asserting the zero-copy path;
     - the mount route's maps on macOS, Windows and in containers and pods;

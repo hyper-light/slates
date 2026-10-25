@@ -1167,9 +1167,53 @@ fn hostile_frames_are_refused_and_end_only_their_own_stream() {
 /// A single-shard daemon whose shard reserve is `reserve` bytes where one is given (the fill budget is the reserve),
 /// with a client and a volume of `bound` bytes named `name`.
 fn dax_provisioned(name: &str, bound: u64, reserve: Option<u64>) -> (Daemon, Client, VolumeId) {
+  dax_provisioned_in(name, bound, reserve, Slices::Derived)
+}
+
+/// How a test's daemon slices its DAX copying: a backing's fill, its ingest at a sync, its refill.
+#[derive(Clone, Copy, Debug)]
+enum Slices {
+  /// As the machine derives them (its memcpy rate over half its step quantum): on most machines no more than the
+  /// volume bridge's 256 KiB read, on some (CI's runners on 2026-10-25) more.
+  Derived,
+  /// A whole DAX range a slice, past the volume bridge's 256 KiB read cap, on every machine: forced by a memcpy rate past
+  /// any machine's. The regime CI's runners derived, in which an ingest dropped a guest's stores past the cap and a
+  /// refill zeroed the map past it (`docs/bugs/2026-10-25-a-dax-slice-past-the-read-cap-dropped-a-guests-stores.md`).
+  WholeRange,
+}
+
+impl Slices {
+  /// Both regimes, for a test that runs in each.
+  const BOTH: [Slices; 2] = [Slices::Derived, Slices::WholeRange];
+
+  /// `config` set to slice this way.
+  fn applied(self, mut config: DaemonConfig) -> DaemonConfig {
+    if let Slices::WholeRange = self {
+      config.memcpy_bytes_per_second = u64::MAX;
+    }
+    config
+  }
+
+  /// A name part telling the regimes' daemons apart.
+  fn tag(self) -> &'static str {
+    match self {
+      Slices::Derived => "derived",
+      Slices::WholeRange => "whole",
+    }
+  }
+}
+
+/// [`dax_provisioned`] with its DAX copying sliced as `slices` says.
+fn dax_provisioned_in(
+  name: &str,
+  bound: u64,
+  reserve: Option<u64>,
+  slices: Slices,
+) -> (Daemon, Client, VolumeId) {
+  let name = format!("{name}-{}", slices.tag());
   let profile = common::machine_profile();
   let instance = format!("srv-{name}-{}", std::process::id());
-  let mut config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let mut config = slices.applied(DaemonConfig::derive(&profile, &instance, Some(1)));
   if let Some(reserve) = reserve {
     config.reserve_per_shard = reserve;
   }
@@ -1608,15 +1652,26 @@ fn mapped_file(
   (node, fh, content, window, object)
 }
 
-/// AC (Shards part 3, step 3), by use. Do: map a file's first range writable and store through the map at two offsets;
-/// read the volume; `FSYNC` the file; read again; restart the daemon and read once more. Expect the volume to show the
-/// old bytes before the `FSYNC`, the stored ones after it, counted as ingested, and the stored ones after the restart.
+/// AC (Shards part 3, step 3), by use. Do: map a file's first range writable and store through the map at two offsets,
+/// one past the volume bridge's 256 KiB read cap; read the volume; `FSYNC` the file; read again; restart the daemon and
+/// read once more; with the copying sliced as the machine derives it and a whole range a slice ([`Slices`]). Expect the
+/// volume to show the old bytes before the `FSYNC`, the stored ones after it, counted as ingested, and the stored ones
+/// after the restart.
 #[test]
 fn a_guests_stores_through_its_map_reach_the_volume_at_fsync_and_survive_a_restart() {
+  for slices in Slices::BOTH {
+    stores_reach_the_volume_at_fsync_and_survive_a_restart(slices);
+  }
+}
+
+/// [`a_guests_stores_through_its_map_reach_the_volume_at_fsync_and_survive_a_restart`] with its DAX copying sliced as
+/// `slices` says.
+fn stores_reach_the_volume_at_fsync_and_survive_a_restart(slices: Slices) {
   let profile = common::machine_profile();
-  let instance = format!("srv-shards-dax-ingest-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance, Some(1));
-  let segment = anchor_segment("shards-dax-ingest", &profile, &config);
+  let name = format!("shards-dax-ingest-{}", slices.tag());
+  let instance = format!("srv-{name}-{}", std::process::id());
+  let config = slices.applied(DaemonConfig::derive(&profile, &instance, Some(1)));
+  let segment = anchor_segment(&name, &profile, &config);
   let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
   first
     .bootstrap(true)
@@ -1939,49 +1994,86 @@ proptest::proptest! {
   }))]
 
   /// AC (Shards part 3, step 4), the oracle over a real daemon. Do: a generated history of up to 20 acts over a file a
-  /// guest maps writable in its first range. The acts are the guest's stores through its map, its syncs, another
-  /// attachment's writes (past the end too) and truncates, both ways. Expect after every act the guest's map to equal
-  /// the model's map and the volume's file to equal the model's file: each byte the latest write to it from either side,
-  /// a store in the volume only once synced, zeros where a size change cut or opened.
+  /// guest maps writable in its first range, run once with its daemon's copying sliced as the machine derives it and
+  /// once a whole range a slice ([`Slices`]), so the regime past the volume bridge's 256 KiB read cap is judged on every
+  /// machine. The acts are the guest's stores through its map, its syncs, another attachment's writes (past the end too)
+  /// and truncates, both ways. Expect after every act the guest's map to equal the model's map and the volume's file to
+  /// equal the model's file: each byte the latest write to it from either side, a store in the volume only once synced,
+  /// zeros where a size change cut or opened.
   #[test]
   fn the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte(
     acts in proptest::collection::vec(dax_act(), 1..20),
   ) {
-    let (daemon, client, id) = dax_provisioned("shards-dax-model", 16 << 20, None);
-    let mut guest = Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
-    guest.init();
-    let (node, fh, content, window, _object) = mapped_file(&mut guest, "modelled", 0xc1);
-    let mut other = Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
-    other.init();
-    let other_node = other.lookup(ROOT, "modelled").unwrap();
-    let other_fh = other.open(other_node, O_RDWR).unwrap();
-    let range = usize::try_from(DAX_RANGE).unwrap();
-    let mut model = DaxModel { map: content[..range].to_vec(), file: content };
-    for (step, act) in acts.iter().enumerate() {
-      match *act {
-        DaxAct::Store { at, len, seed } => {
-          let bytes = act_bytes(len, seed);
-          let end = (at + len).min(range);
-          window.store(at, &bytes[..end - at]);
-        }
-        DaxAct::Sync => proptest::prop_assert_eq!(guest.fsync(node, fh), 0),
-        DaxAct::Write { at, len, seed } => {
-          other.write(other_node, other_fh, at, &act_bytes(len, seed)).unwrap();
-        }
-        DaxAct::Truncate { len } => proptest::prop_assert_eq!(other.truncate(other_node, len), 0),
-      }
-      model.apply(act);
-      let map = window.bytes();
-      if let Some(first) = map.iter().zip(&model.map).position(|(a, b)| a != b) {
-        proptest::prop_assert!(false, "after step {} ({:?}) the map differs first at {}", step, act, first);
-      }
-      let file = volume_file(&daemon, id, "modelled");
-      proptest::prop_assert_eq!(file.len(), model.file.len(), "after step {} the file's size", step);
-      proptest::prop_assert!(file == model.file, "after step {} ({:?}) the file differs", step, act);
+    for slices in Slices::BOTH {
+      every_byte_holds_its_latest_write(&acts, slices)?;
     }
-    drop(client);
-    drop(daemon);
   }
+}
+
+/// One run of [`the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte`]'s history `acts`, its daemon's DAX
+/// copying sliced as `slices` says.
+fn every_byte_holds_its_latest_write(
+  acts: &[DaxAct],
+  slices: Slices,
+) -> Result<(), proptest::test_runner::TestCaseError> {
+  let (daemon, client, id) = dax_provisioned_in("shards-dax-model", 16 << 20, None, slices);
+  let mut guest = Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
+  guest.init();
+  let (node, fh, content, window, _object) = mapped_file(&mut guest, "modelled", 0xc1);
+  let mut other = Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
+  other.init();
+  let other_node = other.lookup(ROOT, "modelled").unwrap();
+  let other_fh = other.open(other_node, O_RDWR).unwrap();
+  let range = usize::try_from(DAX_RANGE).unwrap();
+  let mut model = DaxModel {
+    map: content[..range].to_vec(),
+    file: content,
+  };
+  for (step, act) in acts.iter().enumerate() {
+    match *act {
+      DaxAct::Store { at, len, seed } => {
+        let bytes = act_bytes(len, seed);
+        let end = (at + len).min(range);
+        window.store(at, &bytes[..end - at]);
+      }
+      DaxAct::Sync => proptest::prop_assert_eq!(guest.fsync(node, fh), 0),
+      DaxAct::Write { at, len, seed } => {
+        other
+          .write(other_node, other_fh, at, &act_bytes(len, seed))
+          .unwrap();
+      }
+      DaxAct::Truncate { len } => proptest::prop_assert_eq!(other.truncate(other_node, len), 0),
+    }
+    model.apply(act);
+    let map = window.bytes();
+    if let Some(first) = map.iter().zip(&model.map).position(|(a, b)| a != b) {
+      proptest::prop_assert!(
+        false,
+        "{:?}: after step {} ({:?}) the map differs first at {}",
+        slices,
+        step,
+        act,
+        first
+      );
+    }
+    let file = volume_file(&daemon, id, "modelled");
+    proptest::prop_assert_eq!(
+      file.len(),
+      model.file.len(),
+      "after step {} the file's size",
+      step
+    );
+    proptest::prop_assert!(
+      file == model.file,
+      "{:?}: after step {} ({:?}) the file differs",
+      slices,
+      step,
+      act
+    );
+  }
+  drop(client);
+  drop(daemon);
+  Ok(())
 }
 
 /// AC (Shards part 3, step 3), a write-back the volume refuses. Do: fill a bounded volume but for a MiB, map the first
@@ -2101,13 +2193,24 @@ fn a_writable_map_of_an_untouched_base_file_never_takes_an_outsiders_edit_for_th
 }
 
 /// AC (Shards part 3, step 4), beneath an overlay. Do: map the first range of a base file no one has written, to read;
-/// the host edits the file in place; the guest asks for the file's attributes. Expect the map to show the edit by the
-/// time the reply arrives, the refill counted: an untouched file follows the disk (D-25), and a map of it follows as a
-/// guest's pages do, so the reply that shows the change is held until the map shows it too.
+/// the host edits the file in place; the guest asks for the file's attributes; with the copying sliced as the machine
+/// derives it and a whole range a slice ([`Slices`]). Expect the map to show the edit by the time the reply arrives and
+/// every other byte of the range as it was, past the volume bridge's 256 KiB read cap too, the refill counted: an
+/// untouched file follows the disk (D-25), and a map of it follows as a guest's pages do, so the reply that shows the
+/// change is held until the map shows it too.
 #[test]
 fn a_read_only_map_of_an_untouched_base_file_shows_an_outsiders_edit_before_the_reply_that_reveals_it()
  {
-  let (daemon, mut client, _scratch) = dax_provisioned("shards-dax-refill", 16 << 20, None);
+  for slices in Slices::BOTH {
+    an_untouched_files_map_shows_an_outsiders_edit(slices);
+  }
+}
+
+/// [`a_read_only_map_of_an_untouched_base_file_shows_an_outsiders_edit_before_the_reply_that_reveals_it`] with its DAX
+/// copying sliced as `slices` says.
+fn an_untouched_files_map_shows_an_outsiders_edit(slices: Slices) {
+  let (daemon, mut client, _scratch) =
+    dax_provisioned_in("shards-dax-refill", 16 << 20, None, slices);
   let content = patterned(3 << 20, 0x41);
   let (base, overlay) = overlay_holding(&mut client, "big", &content);
   let mut guest = Guest::over(attach(&daemon, overlay, None, Intent::Read).unwrap());
@@ -2125,10 +2228,14 @@ fn a_read_only_map_of_an_untouched_base_file_shows_an_outsiders_edit_before_the_
     b"an outsider's edit",
     "the map shows the edit by the reply"
   );
+  let range = usize::try_from(DAX_RANGE).unwrap();
+  let rest = shown[18..range]
+    .iter()
+    .zip(&content[18..range])
+    .position(|(shown, was)| shown != was);
   assert_eq!(
-    &shown[18..4096],
-    &content[18..4096],
-    "and the rest as it was"
+    rest, None,
+    "{slices:?}: the rest of the range as it was, first differing at 18 + that"
   );
   assert!(counted_kind(&daemon, "shards.dax_refilled") >= 1);
   drop(client);

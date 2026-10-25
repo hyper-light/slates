@@ -3087,6 +3087,21 @@ pub enum ReplyBody {
     /// The single-use secret the claim's exchange is keyed from (256 bits).
     secret: [u8; 32],
   },
+  /// A same-kernel client's direct map was handed by handle (§4.6, A-175; Windows, where no socket carries one): the
+  /// daemon duplicated a read-only handle of its copy into the client's process, after judging that it authorizes
+  /// reading the copy alone; `handle` is its value there, which the client adopts once and maps all `block_len` bytes
+  /// of. Recorded with `handle` zero, since the client's process outlives the daemon that duplicated it: a reply
+  /// replayed from the record after a restart names no handle. Appended.
+  MapHanded {
+    /// The daemon-minted mapping id, what `ReleaseMap` names.
+    mapping_id: u64,
+    /// The file's length when it was handed.
+    file_len: u64,
+    /// The object's whole length: the file's page span when it was mapped.
+    block_len: u64,
+    /// The handle's value in the client's process; zero in the record.
+    handle: u64,
+  },
 }
 
 /// One entry of a directory listing (`ReadDir`).

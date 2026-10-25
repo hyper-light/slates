@@ -230,7 +230,14 @@ slates-machine = 51
 # has no Darwin advice, so they are `libc::madvise`); and the test-only footprint reader `test_serial::footprint`
 # (`proc_pid_rusage` into a buffer of its struct's size and the `assume_init` after it succeeded, 2), with which the
 # give-back's tests observe what macOS counts.
-slates-mem = 49
+slates-mem = 60
+# 2026-10-25 (+11, §4.6 A-175, the Windows direct map's peer section, `dax_object.rs` compiled only for Windows): there is
+#   no safe wrapper for a section under a security descriptor. `CreateFileMappingW` under the descriptor, the SDDL
+#   parsed into one and freed (`ConvertStringSecurityDescriptorToSecurityDescriptorW`, `LocalFree`), and the section's
+#   handle owned (4); the view mapped, asked its extent and unmapped (`MapViewOfFile`, `VirtualQuery`,
+#   `UnmapViewOfFile`, 3); the read-only duplicate a peer is handed and its ownership (`DuplicateHandle`,
+#   `from_raw_handle`, 2); the page size (`GetSystemInfo`, 1) and the last error (1). The atomic loads and stores are
+#   the shared racy-view trait's, moved out of the Unix module so both platforms keep one copy.
 # 2026-10-25 (+0, §4.6 A-171, the direct map's sealed copy): `PeerObject` and the client's read-only `PeerView` reuse the
 #   placed `mmap` (which now takes the mapping's access, read-write or read alone) and the two atomic views below, whose
 #   trait is split into loads and stores so a read-only view can only load. No new block.
@@ -281,7 +288,15 @@ slates-vfs = 0
 slates-land = 4
 slates-anchor = 6
 slates-db = 0
-slates-ipc = 49
+slates-ipc = 70
+# 2026-10-25 (+21, §4.6 A-175, the Windows handle route, `handle_route.rs` compiled only for Windows): Win32 has no safe
+#   wrapper for any of it. The hand-off: the client's process opened and owned (`OpenProcess`, `from_raw_handle`, 2),
+#   the read-only handle duplicated into it (1), and a handed handle closed there (`DUPLICATE_CLOSE_SOURCE`, 1); the
+#   judge: the section mapped read alone, asked its extent and unmapped (3), a duplicate that writes or that may rewrite
+#   the descriptor asked and a granted one owned and closed (2), a writable view asked and a granted one unmapped (2);
+#   the same-user check: this process's pseudo-handle borrowed (1), each token opened, owned and asked its user twice (4),
+#   the users compared and the refused one's relative id read (2); the client's adoption: the value checked live and
+#   owned (2); the last error (1).
 # 2026-09-19 (-1): Linux rendezvous awaits driver readiness; no raw-fd polling thread.
 # 2026-09-28 (+1): the inherited fleet serve sockets (`fleet.rs` `adopt_inherited`).
 #   Raised 5 → 6 on 2026-10-03 for A-64 (content resident once): `daemon::arena_region` maps the shard's arena range of

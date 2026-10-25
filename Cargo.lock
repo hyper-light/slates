@@ -1455,6 +1455,7 @@ dependencies = [
  "slates-server",
  "slates-vfs",
  "slates-wire",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

@@ -49,9 +49,7 @@ pub mod slab;
 pub mod words;
 
 pub use arena::{ChunkArena, Extent};
-#[cfg(unix)]
-pub use dax_object::PeerView;
-pub use dax_object::{DAX_OBJECT_BYTES, DAX_RANGE_BYTES, DaxObject, PeerObject};
+pub use dax_object::{DAX_OBJECT_BYTES, DAX_RANGE_BYTES, DaxObject, PeerObject, PeerView};
 pub use error::{ExtentRefusal, LayoutRefusal, MemError};
 pub use handle::{Encoded, Handle};
 pub use mpsc::MpscRing;

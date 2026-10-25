@@ -789,20 +789,27 @@ pub fn huge_page_bytes() -> Option<u64> {
 }
 
 /// The most descriptors this process may hold open: `RLIMIT_NOFILE`'s soft limit, the one the kernel refuses `EMFILE`
-/// at. `None` where nothing finite binds (an unlimited rlimit, a refused query) or the OS has no such limit (Windows,
-/// whose handle table is bounded by memory alone). The same-kernel direct map holds a descriptor per copy it hands
-/// (§4.6, A-171), so its per-client count is derived from this rather than assumed.
+/// at; on Windows, the handle table's ceiling. `None` where nothing finite binds (an unlimited rlimit, a refused
+/// query). The same-kernel direct map holds a descriptor (a section handle on Windows) per copy it hands (§4.6, A-171,
+/// A-175), so its per-client count is derived from this rather than assumed.
 #[cfg(unix)]
 #[must_use]
 pub fn descriptor_limit() -> Option<u64> {
   rustix::process::getrlimit(rustix::process::Resource::Nofile).current
 }
 
-/// The paired arm: Windows has no descriptor rlimit; its handle table is bounded by memory alone.
+/// Format: Windows' per-process limit on kernel handles (Microsoft Learn, "Kernel Objects", read 2026-10-25: "The
+/// per-process limit on kernel handles is 2^24. However, handles are stored in the paged pool, so the actual number of
+/// handles you can create is based on available memory").
+#[cfg(not(unix))]
+const WINDOWS_HANDLE_LIMIT: u64 = 1 << 24;
+
+/// The paired arm: Windows has no descriptor rlimit, and its handle table's ceiling is `WINDOWS_HANDLE_LIMIT`; paged
+/// pool may refuse a handle before it, as memory binds every count.
 #[cfg(not(unix))]
 #[must_use]
 pub fn descriptor_limit() -> Option<u64> {
-  None
+  Some(WINDOWS_HANDLE_LIMIT)
 }
 
 /// The most mappings this process may hold: Linux's `vm.max_map_count`, past which `mmap` refuses `ENOMEM` (65,530 by

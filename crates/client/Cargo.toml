@@ -18,10 +18,9 @@ pure-hash = ["slates-machine/pure-hash"]
 slates-machine = { workspace = true }
 slates-ipc = { workspace = true }
 slates-wire = { workspace = true }
-
-# The same-kernel direct map (§4.6, A-171) maps the daemon's sealed copy of a file read-only and loads it through
-# atomics: slates-mem's `PeerView` holds the map, so the racy-memory rule and its unsafe stay in that one crate.
-[target.'cfg(unix)'.dependencies]
+# The same-kernel direct map (§4.6, A-171, A-173, A-175) maps the daemon's copy of a file read-only and loads it
+# through atomics on every platform: slates-mem's `PeerView` holds the map, so the racy-memory rule and its unsafe stay
+# in that one crate.
 slates-mem = { workspace = true }
 
 [dev-dependencies]
@@ -40,6 +39,11 @@ slates-image = { workspace = true }
 slates-vfs = { workspace = true }
 # The Shards stream test speaks FUSE through the end it is handed (A-161), with the codec's ABI constants.
 slates-bridge-fuse = { workspace = true }
+
+# The Windows hostile test (A-175) uses the handle a direct map duplicated into it as a hostile peer would:
+# `DuplicateHandle`, `MapViewOfFile`, `VirtualProtect`.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true }
 
 [lints]
 workspace = true

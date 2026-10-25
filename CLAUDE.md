@@ -164,6 +164,11 @@ Every test is written as "do X, expect Y" and names the acceptance criterion or 
     hand-off for real, cap a re-invoked client's `RLIMIT_NOFILE` at its lowest free descriptor number
     (`crates/client/tests/reap_map.rs`): the kernel drops a passed descriptor (Linux) and refuses a new socket
     (macOS), so the client's give-back (A-174) runs where it would in the field.
+    Windows passes no descriptor (A-175): the copy is a section under `D:P(A;;RC;;;OW)` and a read-only handle is
+    duplicated into the client's process (`crates/ipc/src/handle_route.rs`). Gotchas, each measured: under a section's
+    default descriptor a read-only handle's holder duplicates one that writes, so the descriptor is the confinement;
+    the completion record must not keep the handle's value, since the client's handle outlives the daemon that made it;
+    and the client binary's tests run one at a time on Windows, since several daemons in one process there conflict.
   - The write seam and its only real implementation: `crates/vfs/src/host/mod.rs` (`LandFs`) with `crates/land/src/os.rs`; every verb takes a handle, never a path, and the engine (`crates/land/src/engine.rs`) is written against the seam so the oracle runs it unchanged over `SimHost`.
   - A per-shard singleton shared by the shard's tasks: `crates/rt/src/shard.rs` (`ShardContext::keep`/`keep_with` return a `Kept<T>` handle; `Kept::with` lends inside a closure only while its own context runs) with `crates/transport/src/demux.rs` (`DemuxId` is the handle; its receive loop awaits readiness outside the borrow). Gotcha: a `&'static` into state an owner frees is unsound however "only tasks hold it" — the type must confine the lend; and in edition 2024 an `impl Future` returned from `&self` captures the borrow unless it says `use<>` (`UdpSocket::readable`).
   - A detector's non-vacuity canary: `crates/mem/tests/race_canary.rs` with `xtask/src/tsan.rs` (the lane requires ThreadSanitizer's report from a deliberate race before it trusts a clean run of the suites). Gotcha: ThreadSanitizer v3 reports a race only while the earlier access is still in its thread's trace (three parts of 32,763 events by default) and otherwise drops it without a word, so the canary's first writer parks rather than polls between the writes; a polling first writer went unreported 2 times in 99 CI runs and 120 in 120 on a loaded Mac. The same bound holds in the suites: a race whose earlier access is further back than that is never reported.
@@ -179,6 +184,11 @@ Every test is written as "do X, expect Y" and names the acceptance criterion or 
       overwritten with what the compare read.
     - A refused write-back must fail the sync that asked for it; it once answered `FSYNC` 0.
     - A reply that can reveal a change (a new size) waits until the copy shows it (`flush_unless_refill_owed`).
+    - A bridge answers at most its read cap a call (the volume bridge's, 256 KiB), so a copy slice is read whole
+      (`read_whole` in `crates/bridge-core/src/dax_backing.rs`): taken for the file's end, a capped call lost a guest's
+      stores at the ingest and zeroed its map at the refill. The slice is derived from the machine, and every
+      development machine derived one within the cap, so the oracle runs a whole range a slice too (`Slices` in
+      `crates/server/tests/shards.rs`); only CI's runner had derived the regime that broke.
 - **Keep design docs in sync with code.** Changing a subsystem's behaviour updates its design section, its status blockquote and the ledger in the same commit.
 - **Commit everything, in imperative area-prefixed summaries that carry the measured fact**, in vorpal's style: `merge: one graph tool over seven relations; deferred-schema cost measured`. Always `git add -A && git commit -m "<message>"`. Never `git checkout`, `git stash`, `git reset`, or any destructive git command.
 - **Debugging protocol.** Add logging to file first; consult the design section rather than assuming from code; confirm scope, intended behaviour, timing and frequency with Ada; after root cause is confirmed by logs and analysis, write `docs/bugs/<date>-<slug>.md` with description, root cause, impact and exact edits; fix in plan mode; touch nothing beyond the fix, but report every sibling inconsistency found; never preserve the behaviour that caused the bug.

@@ -387,12 +387,21 @@ struct EditChain {
 /// object this maps before the change returns, so two reads may differ: the bytes are loaded through atomics at each
 /// [`MappedRead::read_at`], never lent as a slice. A change past the mapped length is not seen; map again for it. The
 /// mapping ends when this value drops; the daemon keeps its copy equal to the file until the client goes.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub struct MappedRead {
   inner: Mapped,
 }
 
+/// What a zero-copy map is handed on this platform: a descriptor of the daemon's copy on Unix (over the control
+/// socket on Linux, claimed on the socket route on macOS).
 #[cfg(unix)]
+type HandedCopy = std::os::fd::OwnedFd;
+/// What a zero-copy map is handed on this platform: a read-only handle of the daemon's copy, which the daemon
+/// duplicated into this process (A-175).
+#[cfg(windows)]
+type HandedCopy = std::os::windows::io::OwnedHandle;
+
+#[cfg(any(unix, windows))]
 enum Mapped {
   /// Zero-copy: a read-only view of the daemon's whole copy; the file was `file_len` bytes when it was mapped. The
   /// copy is held for this client under `mapping_id` on `volume`'s owner until [`Client::release_map`] or the client's
@@ -407,7 +416,7 @@ enum Mapped {
   Copied(Vec<u8>),
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl MappedRead {
   /// The file's length when it was mapped, within what the map shows.
   #[must_use]
@@ -486,10 +495,22 @@ impl MappedRead {
 
   /// The descriptor of the daemon's copy a zero-copy map was handed, or `None` for a copy: what a peer holds and could
   /// pass on, which authorizes reading this one file and nothing else.
+  #[cfg(unix)]
   #[must_use]
   pub fn descriptor(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
     match &self.inner {
       Mapped::Zero { view, .. } => Some(view.descriptor()),
+      Mapped::Copied(_) => None,
+    }
+  }
+
+  /// The handle of the daemon's copy a zero-copy map was handed, or `None` for a copy: what a peer holds and could
+  /// pass on, which authorizes reading this one file and nothing else (A-175).
+  #[cfg(windows)]
+  #[must_use]
+  pub fn handle(&self) -> Option<std::os::windows::io::BorrowedHandle<'_>> {
+    match &self.inner {
+      Mapped::Zero { view, .. } => Some(view.handle()),
       Mapped::Copied(_) => None,
     }
   }
@@ -504,7 +525,7 @@ impl MappedRead {
   /// Maps the delivered copy whole, read alone: `block_len` bytes, the size the daemon made it, held under
   /// `mapping_id` on `volume`'s owner.
   fn map(
-    block: std::os::fd::OwnedFd,
+    block: HandedCopy,
     (volume, mapping_id): (VolumeId, u64),
     file_len: u64,
     block_len: u64,
@@ -982,8 +1003,9 @@ impl Client {
   /// this claims (A-173); this maps it read alone. The daemon keeps the copy equal to the file, so the map is live
   /// within its length, until [`Client::release_map`] or this client's end; dropping the map unmaps this process's view
   /// alone. Refused `MapShareExhausted`, nothing made, when this client holds its share of maps already. A hand-off
-  /// that fails here gives the copy back before the failure returns (A-174).
-  #[cfg(unix)]
+  /// that fails here gives the copy back before the failure returns (A-174). On Windows the daemon duplicates a
+  /// read-only handle of its copy into this process and the reply names it (A-175).
+  #[cfg(any(unix, windows))]
   pub fn map_read(&mut self, volume: VolumeId, path: &str) -> Result<MappedRead, ClientError> {
     let reply = match self.call(&RequestBody::MapRead {
       volume,
@@ -1001,6 +1023,7 @@ impl Client {
       Err(error) => return Err(error),
     };
     match reply {
+      #[cfg(unix)]
       ReplyBody::Mapped {
         mapping_id,
         region_off: 0,
@@ -1020,6 +1043,7 @@ impl Client {
         self.kept_or_given_back(handed, (volume, mapping_id))
       }
       // macOS: the copy's read-only descriptor waits on the daemon's socket route, claimed once with the reply's secret.
+      #[cfg(unix)]
       ReplyBody::MapOffered {
         mapping_id,
         file_len,
@@ -1028,6 +1052,19 @@ impl Client {
       } => {
         let handed = self
           .claim_map(mapping_id, &secret)
+          .and_then(|block| MappedRead::map(block, (volume, mapping_id), file_len, block_len));
+        self.kept_or_given_back(handed, (volume, mapping_id))
+      }
+      // Windows: the daemon duplicated a read-only handle of its copy into this process; the reply names its value.
+      #[cfg(windows)]
+      ReplyBody::MapHanded {
+        mapping_id,
+        file_len,
+        block_len,
+        handle,
+      } => {
+        let handed = slates_ipc::handle_route::adopt_section(handle)
+          .map_err(ClientError::Ipc)
           .and_then(|block| MappedRead::map(block, (volume, mapping_id), file_len, block_len));
         self.kept_or_given_back(handed, (volume, mapping_id))
       }
@@ -1040,7 +1077,7 @@ impl Client {
   /// this client from then on, so a failure that kept it would hold it against this client's share until this client's
   /// end, out of reach of [`Client::release_map`], which takes the map. A copy the daemon no longer holds (`NotFound`)
   /// is given back already. A release that fails too returns both causes, `HandOffUnreleased`.
-  #[cfg(unix)]
+  #[cfg(any(unix, windows))]
   fn kept_or_given_back(
     &mut self,
     handed: Result<MappedRead, ClientError>,
@@ -1067,7 +1104,7 @@ impl Client {
   /// which it then keeps equal to the file no more and whose bytes go back to the daemon's budget. A copied read holds
   /// nothing on the daemon and returns at once. Until it is released, or this client ends, a map counts against the
   /// client's share, and a `map_read` past the share is refused `MapShareExhausted`.
-  #[cfg(unix)]
+  #[cfg(any(unix, windows))]
   pub fn release_map(&mut self, mapped: MappedRead) -> Result<(), ClientError> {
     let MappedRead {
       inner: Mapped::Zero {
