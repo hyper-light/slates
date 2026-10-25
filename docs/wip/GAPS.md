@@ -11267,6 +11267,15 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     mount makes it clean, and adds a `lost+found` (root's, mode 0700) that the merge takes as a new directory. Recorded,
     not changed: e2fsck puts any orphans it recovers there, so the merge must not drop it. `docs/cli.md` says so.
   - **Owed:** the arm64 guest's pmem DAX (Firecracker's doc covers aarch64, with `CONFIG_ARM64_PMEM`): G-arm64-guest.
+- **Open, found 2026-10-24 by a real crosvm run: slates' own DAX window shows stale bytes, then zeros, after another
+  path's write.** `docs/bugs/2026-10-24-slates-own-dax-window-shows-stale-bytes-then-zeros-after-another-paths-write.md`.
+  - The device drains the registry's revokes only at the end of a service pass, so a guest that just reads its map keeps
+    the old block (`A` for 40 s after an SDK write of `B`).
+  - When a guest request drives a pass, SHMEM_UNMAP leaves crosvm's anonymous read-only pages, so the map and `pread`
+    read 0.
+  - No production exposure: DAX on this device is unadvertised, and no guest device attaches over the ring.
+  - The fix (wake on the change; re-point the window rather than unmap it) is the core of goal G-vhost, failing test
+    first.
 - **Open, found by the new tests: a read-only attachment is not a read-only file system to its client.** On every FUSE
   transport (the shared bridge) an open for writing is granted and each write through it refused `EPERM`; NFS answers
   `PERM`. A read-only file system answers `EROFS`, at the open for an open. Every change is refused and nothing lands,
