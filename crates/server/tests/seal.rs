@@ -16,6 +16,7 @@ use slates_anchor::AnchorSegment;
 use slates_archive::Archive;
 use slates_cluster::sealed::{SealedChunk, SealedError, open_chunk, seal_chunk};
 use slates_db::catalog::VolumeId;
+use slates_ipc::HeldRendezvous;
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
 use slates_server::seal_keys::{lineage, namer};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
@@ -47,9 +48,15 @@ fn profile() -> MachineProfile {
     .expect("the machine profile measures")
 }
 
-/// The anchor the test plays: a segment and its content object under `tag`.
-fn played_anchor(config: &DaemonConfig, tag: &str) -> AnchorSegment {
-  AnchorSegment::create(
+/// The anchor the test plays: a segment and its content object, and the instance's rendezvous (A-114).
+struct PlayedAnchor {
+  segment: AnchorSegment,
+  rendezvous: HeldRendezvous,
+}
+
+/// The anchor the test plays for `config`'s instance, its segment and content object under `tag`.
+fn played_anchor(config: &DaemonConfig, tag: &str) -> PlayedAnchor {
+  let segment = AnchorSegment::create(
     &format!("slates-seg-{tag}-{}", std::process::id()),
     &profile().facts.identity,
     config.geometry,
@@ -59,13 +66,17 @@ fn played_anchor(config: &DaemonConfig, tag: &str) -> AnchorSegment {
     &format!("slates-con-{tag}-{}", std::process::id()),
     config.content_bytes(),
   )
-  .unwrap()
+  .unwrap();
+  PlayedAnchor {
+    segment,
+    rendezvous: HeldRendezvous::hold(&config.instance).unwrap(),
+  }
 }
 
 /// A daemon over `anchor`'s handoff.
-fn start_over(config: &DaemonConfig, anchor: &AnchorSegment) -> Daemon {
-  let (handoff, len) = anchor.handoff().unwrap();
-  let content = anchor.content_handoff().unwrap();
+fn start_over(config: &DaemonConfig, anchor: &PlayedAnchor) -> Daemon {
+  let (handoff, len) = anchor.segment.handoff().unwrap();
+  let content = anchor.segment.content_handoff().unwrap();
   Daemon::start(
     &profile(),
     config.clone(),
@@ -73,6 +84,7 @@ fn start_over(config: &DaemonConfig, anchor: &AnchorSegment) -> Daemon {
       handoff,
       len,
       content,
+      rendezvous: anchor.rendezvous.adoption(),
     },
   )
   .unwrap()
@@ -127,6 +139,9 @@ fn a_volumes_keys_survive_a_daemon_restart_and_die_with_the_anchor() {
     b"sealed before".repeat(500),
     "the restart opens it"
   );
+  // The anchor dies before a fresh one starts for the instance, as one instance's two anchors never live at once (the
+  // second could not hold the rendezvous).
+  drop(anchor);
   let fresh = played_anchor(&config, "seal-keys-fresh");
   let third = start_over(&config, &fresh);
   let foreign = open_on(&third, sealed);

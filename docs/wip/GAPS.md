@@ -11250,16 +11250,43 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       13 tests that restart nothing, run at the default 32 test threads, ended 6 `Stalled { after_ns: 1000000000 }` (a
       reply past its 1 s deadline), and at 4 threads all 14 passed. **Corrected 2026-10-25:** this entry first said
       several daemons in one Windows process conflict, from a whole-binary run whose 18 failures mixed these stalls
-      with the restart tests' below. Not yet diagnosed; ruled out so far by measurement: slow shard starts (19 inits per
-      run, at most 515 ms, medians 48 and 53 ms, against the 1 s deadline, while 5 and 6 tests stalled) and name
-      collisions (every rendezvous object, Event and region name carries the test's own instance). The stalls fall on
-      each test's first request. Next: a log of the client's wait and of the shard's park and kick, to tell starvation
-      from a lost wake (A-44's protocol fences both sides). CI runs the direct-map tests one at a time meanwhile;
-    - the client binary's restart tests fail on Windows (6 of them, never run there by CI): the restarted daemon meets
-      its predecessor's still-live named section, `CreateFileMappingW` refused `ERROR_ALREADY_EXISTS`; pre-existing.
-      Likely the harness: a Windows section's name cannot be unlinked and lives while anything maps it (the test's
-      client still maps the old bootstrap object), and a daemon supervised by an anchor adopts the rendezvous the anchor
-      holds rather than creating it, which these tests' second daemon does not; to confirm;
+      with the restart tests' (below, fixed). Not yet diagnosed; ruled out so far by measurement: slow shard starts (19
+      inits per run, at most 515 ms, medians 48 and 53 ms, against the 1 s deadline, while 5 and 6 tests stalled) and
+      name collisions (every rendezvous object and Event name carries the test's own instance, and since A-176 every
+      region's name its daemon's own key). **Traced 2026-10-25** (a scratch copy with timestamps at the client's send,
+      park and give-up, and at the daemon's seat, take and reply): **not a lost wake.** In every stall the daemon took
+      the request within 0.2 ms of its sending and published the reply 1.23 to 1.69 s later, after the client had given
+      up at its 1 s deadline (each late reply found the client no longer parked); three of four late replies landed
+      within 4 ms of each other, so the first verb of each daemon waited on something they shared and that was released
+      at once. **Measured 2026-10-25, after A-176** (the whole binary at 32 threads, its restart tests passing now):
+      14 of 20 failed, 12 `Stalled`, one `BudgetExceeded { available: 44252790784 }`, and one daemon's heartbeat came
+      1316 ms after the last, its shard having held **a single poll 1277 ms** (7 steps and 8 polls in the gap, none long
+      in a task, blocked in the kernel or preempted by the host: all 8 unattributed). So the wait is inside one poll on
+      the shard, not between polls. Hypothesis, unmeasured: a first publication commits segment pages for a whole image
+      synchronously in that poll, and thirteen daemons committing at once serialize in Windows' memory manager; next,
+      time the first `create`'s admission, catalog commit and barrier, and the commit of segment pages, on Windows. The
+      trace also showed a runtime's shard ids handed out again after an earlier daemon's runtime ended (two daemons'
+      shard 16 seated a client 43 ms apart), harmless here since every named object carries the instance or its daemon's
+      key. CI runs the client binary one test at a time on Windows meanwhile;
+    - **fixed 2026-10-25 (A-176): the client binary's restart tests on Windows.** They had never run there; on jupiter
+      all six failed, the restarted daemon meeting its predecessor's still-live named section (`CreateFileMappingW`
+      refused `ERROR_ALREADY_EXISTS`). Beneath it, the harness played the anchor's segment but not its rendezvous (now
+      it holds that too, as the field's anchor does), and three defects, each fixed with a failing test first:
+      a reconnecting client's region was refused by its live name, so every Windows restart cost every client its
+      session (`docs/bugs/2026-10-25-a-windows-client-could-not-reconnect-after-a-restart.md`); a claim's refusal cost
+      its accept round every client it had accepted, on every platform
+      (`docs/bugs/2026-10-25-a-refused-claim-dropped-its-rounds-accepted-clients.md`); and no daemon of an instance could
+      start on Windows beside a client of its dead owner
+      (`docs/bugs/2026-10-25-a-windows-instance-could-not-start-beside-a-dead-ones-client.md`). On jupiter the client
+      binary now passes whole, one test at a time, 20 of 20, and CI's two x86_64 Windows lanes run it so;
+    - macOS takes a live owner's rendezvous over (found 2026-10-25, A-176's sweep; pre-existing): an owner unlinks the
+      bootstrap object's name it finds (`shared.rs`, `create_object`), so a second daemon of a live instance, run alone,
+      or a second anchor, makes its own object; new clients reach the second, the first keeps the clients it has, and
+      the two run side by side with separate state. Linux refuses the second at the abstract address, and Windows at the
+      owner's token (`a_second_owner_of_a_live_instances_rendezvous_is_refused`, which leaves macOS out). Owed: a test
+      of whether any live owner holds the name before the unlink, with no disk and no race between two starting owners
+      (POSIX semaphores and shared objects outlive their creator; the socket route's own liveness question, A-161's
+      `InUse`, is one candidate);
     - on every platform, a client's direct map outlives its daemon: after a `kill -9` and restart the map keeps the file
       as it was when the daemon died and follows it no more, with no signal to the client (its object lives on in the
       client's process). A replayed map reply now fails rather than adopting such a copy (A-175's record rule; Linux's

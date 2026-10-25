@@ -29,6 +29,7 @@ use slates_anchor::AnchorSegment;
 use slates_client::{
   Capability, Client, ClientError, CreateSpec, Deadlines, NamePolicy, Refusal, SizeClass, VolumeId,
 };
+use slates_ipc::HeldRendezvous;
 use slates_ipc::delivery::{Delivery, Output, delivered};
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
 use slates_server::landing::{enroll_proof, revoke_proof};
@@ -415,8 +416,8 @@ fn a_client_holding_a_consumer_identity_binds_again_by_itself_after_a_daemon_res
   let profile = profile();
   let instance = format!("cl-rebind-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let segment = restart_segment("cl-rebind", &profile, &config);
-  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let anchor = restart_anchor("cl-rebind", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   first
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -439,38 +440,49 @@ fn a_client_holding_a_consumer_identity_binds_again_by_itself_after_a_daemon_res
   assert_eq!(workload.rebinds(), 0);
   first.stop();
 
-  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   second
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
   assert_served_as_the_consumer_after_the_restart(&mut workload, mine, consumer);
   assert_account_refused(&mut owner, mine, "after the restart");
   second.stop();
-  drop(segment);
+  drop(anchor);
 }
 
-/// The anchor's segment the test holds across both daemons, with its content object sized as the anchor
-/// sizes it (`DaemonConfig::content_bytes`), lazily backed.
-fn restart_segment(name: &str, profile: &MachineProfile, config: &DaemonConfig) -> AnchorSegment {
+/// What the test holds across both daemons as the anchor does: the segment, with its content object sized as the
+/// anchor sizes it (`DaemonConfig::content_bytes`), lazily backed, and the instance's rendezvous (A-114).
+struct RestartAnchor {
+  segment: AnchorSegment,
+  rendezvous: HeldRendezvous,
+}
+
+/// The anchor the test plays for `config`'s instance, its segment and content object under `name`.
+fn restart_anchor(name: &str, profile: &MachineProfile, config: &DaemonConfig) -> RestartAnchor {
   let content_bytes = config.content_bytes();
-  AnchorSegment::create(
+  let segment = AnchorSegment::create(
     &format!("slates-seg-{name}"),
     &profile.facts.identity,
     config.geometry,
   )
   .unwrap()
   .with_content(&format!("slates-con-{name}"), content_bytes)
-  .unwrap()
+  .unwrap();
+  RestartAnchor {
+    segment,
+    rendezvous: HeldRendezvous::hold(&config.instance).unwrap(),
+  }
 }
 
-/// The source a daemon starts over: the held segment's handoff.
-fn source_of(segment: &AnchorSegment) -> SegmentSource {
-  let (handoff, len) = segment.handoff().unwrap();
-  let content = segment.content_handoff().unwrap();
+/// The source a daemon starts over: the held segment's handoff and the held rendezvous.
+fn source_of(anchor: &RestartAnchor) -> SegmentSource {
+  let (handoff, len) = anchor.segment.handoff().unwrap();
+  let content = anchor.segment.content_handoff().unwrap();
   SegmentSource::Handoff {
     handoff,
     len,
     content,
+    rendezvous: anchor.rendezvous.adoption(),
   }
 }
 

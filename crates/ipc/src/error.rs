@@ -103,6 +103,11 @@ pub enum IpcError {
     /// Why.
     refusal: RouteRefusal,
   },
+  /// A live process already holds the instance's rendezvous: a daemon of the instance, or its anchor (A-176).
+  InstanceHeld {
+    /// The instance.
+    instance: String,
+  },
 }
 
 /// Why the daemon's socket route refused (A-161, A-173; `crate::route`).
@@ -195,6 +200,10 @@ impl fmt::Display for IpcError {
         write!(f, "consumer capability not delivered: {fault}")
       }
       Self::RouteRefused { refusal } => write!(f, "the socket route refused: {refusal}"),
+      Self::InstanceHeld { instance } => write!(
+        f,
+        "a live process already holds instance {instance}'s rendezvous (a daemon of the instance or its anchor)"
+      ),
     }
   }
 }

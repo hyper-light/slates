@@ -251,7 +251,7 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
     .map_err(|e| failed("rendezvous", e))?;
   supervisor.hold_environment(
     slates_ipc::rendezvous::ENV_RENDEZVOUS,
-    rendezvous.env_value(),
+    rendezvous.adoption().env_value().to_owned(),
   );
   let mut clock = HostClock::new();
   let now = clock.monotonic_ns();

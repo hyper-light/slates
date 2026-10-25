@@ -10,11 +10,14 @@ use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
 
 use slates_ipc::region::{ClientRegion, RegionGeometry};
-use slates_ipc::rendezvous::{ENV_RENDEZVOUS, HeldRendezvous};
+use slates_ipc::rendezvous::{Adoption, ENV_RENDEZVOUS, HeldRendezvous};
 use slates_ipc::slot::Slot;
 use slates_ipc::{
   CLAIM_WAIT_NS, ClientEnd, DaemonEnd, IpcError, Listener, Prepared, begin_connect_as, connect,
 };
+
+/// The regions this test process has made, which numbers the next one's name.
+static REGIONS_MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Format: the environment variable that turns this binary into the client.
 const CHILD_ROLE: &str = "SLATES_IPC_TEST_CLIENT";
@@ -89,7 +92,7 @@ fn rendezvous_client_refused() {
 #[test]
 fn a_client_process_refused_at_the_bound_is_told_so_typed() {
   let instance = format!("test-refused-{}", std::process::id());
-  let mut listener = Listener::open(&instance).unwrap();
+  let mut listener = Listener::open(&instance, None).unwrap();
   let exe = std::env::current_exe().unwrap();
   let mut child = Command::new(exe)
     .args(["--exact", "rendezvous_client_refused", "--nocapture"])
@@ -98,13 +101,16 @@ fn a_client_process_refused_at_the_bound_is_told_so_typed() {
     .unwrap();
   let started = Instant::now();
   while started.elapsed() < Duration::from_millis(SERVE_MS) && listener.capacity_refused() == 0 {
-    listener
-      .accept_pending(&|_| false, &mut |_client_id| {
+    let round = listener.accept_pending(
+      &|_| false,
+      &mut |_client_id| {
         Err(IpcError::TooManyClients {
           limit: REFUSED_LIMIT,
         })
-      })
-      .unwrap();
+      },
+      &mut |refusal| panic!("only the bound refuses here, and it is counted: {refusal}"),
+    );
+    assert!(round.ended.is_none(), "{:?}", round.ended);
     std::hint::spin_loop();
   }
   let status = child.wait().unwrap();
@@ -125,7 +131,7 @@ fn a_client_process_refused_at_the_bound_is_told_so_typed() {
 #[test]
 fn a_client_process_connects_and_completes_a_round_trip() {
   let instance = format!("test-{}", std::process::id());
-  let mut listener = Listener::open(&instance).unwrap();
+  let mut listener = Listener::open(&instance, None).unwrap();
   let exe = std::env::current_exe().unwrap();
   let mut child = Command::new(exe)
     .args(["--exact", "rendezvous_client", "--nocapture"])
@@ -137,8 +143,9 @@ fn a_client_process_connects_and_completes_a_round_trip() {
   let mut served = false;
   let pid = std::process::id();
   while started.elapsed() < Duration::from_millis(SERVE_MS) && !served {
-    let accepted = listener
-      .accept_pending(&|_| false, &mut |client_id| {
+    let round = listener.accept_pending(
+      &|_| false,
+      &mut |client_id| {
         Ok(Prepared {
           region: ClientRegion::create(
             &format!("slates-cr-{pid}-{client_id}"),
@@ -148,9 +155,11 @@ fn a_client_process_connects_and_completes_a_round_trip() {
           )?,
           kick_fd: None,
         })
-      })
-      .unwrap();
-    for a in accepted {
+      },
+      &mut |refusal| panic!("the one client is served: {refusal}"),
+    );
+    assert!(round.ended.is_none(), "{:?}", round.ended);
+    for a in round.accepted {
       assert_eq!(a.client_id, 1);
       ends.push(DaemonEnd::new(a.region));
     }
@@ -223,7 +232,7 @@ fn poll_bound() -> Duration {
 #[test]
 fn a_claim_is_polled_without_waiting_and_refused_at_the_claim_wait() {
   let instance = format!("test-claim-{}", std::process::id());
-  let mut listener = Listener::open(&instance).unwrap();
+  let mut listener = Listener::open(&instance, None).unwrap();
   let started = Instant::now();
   let (refusal, polls, longest) =
     poll_until_refused(begin_connect_as(&instance, 0, slates_ipc::CLAIM_WAIT_NS).unwrap());
@@ -313,18 +322,26 @@ fn serve_until_connected(
   // The daemon's side of each accepted claim, kept: its region lives while the daemon holds it.
   let mut accepted = Vec::new();
   loop {
-    let served = listener.accept_pending(&|_| false, &mut |client_id| {
-      Ok(Prepared {
-        region: ClientRegion::create(
-          &format!("slates-claim-{pid}-{client_id}"),
-          client_id,
-          0,
-          geometry(),
-        )?,
-        kick_fd: None,
-      })
-    });
-    accepted.extend(served.unwrap_or_default());
+    // A claim refused or a round ended early shows as the claim never connecting, which the bound below judges.
+    let round = listener.accept_pending(
+      &|_| false,
+      &mut |client_id| {
+        // Named once per region, as the daemon names them (A-176): a client still holding a dead listener's region
+        // keeps that name alive on Windows, and a fresh listener counts its client ids from one again.
+        let region = REGIONS_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Prepared {
+          region: ClientRegion::create(
+            &format!("slates-claim-{pid}-{region}"),
+            client_id,
+            0,
+            geometry(),
+          )?,
+          kick_fd: None,
+        })
+      },
+      &mut |_refusal| {},
+    );
+    accepted.extend(round.accepted);
     let at = Instant::now();
     let switches = slates_machine::bench::involuntary_switches();
     let polled = claim.poll().unwrap();
@@ -350,7 +367,7 @@ fn serve_until_connected(
 #[test]
 fn a_claim_whose_daemon_died_before_answering_is_unavailable_not_refused() {
   let instance = format!("test-claim-reset-{}", std::process::id());
-  let listener = Listener::open(&instance).unwrap();
+  let listener = Listener::open(&instance, None).unwrap();
   let claim = begin_connect_as(&instance, 0, slates_ipc::CLAIM_WAIT_NS).unwrap();
   drop(listener);
   let (refusal, _, _) = poll_until_refused(claim);
@@ -369,7 +386,10 @@ fn rendezvous_restart_child() {
   let Ok(instance) = std::env::var(CHILD_RESTART_ROLE) else {
     return;
   };
-  let first = Listener::open(&instance).unwrap();
+  // The parent's held rendezvous, handed across the spawn as an anchor hands it to the daemons it starts.
+  let adoption = Adoption::from_env().unwrap();
+  assert!(adoption.is_some(), "the parent hands its held rendezvous");
+  let first = Listener::open(&instance, adoption.as_ref()).unwrap();
   let first_opened = SystemTime::now();
   let claim = begin_connect_as(&instance, 0, slates_ipc::CLAIM_WAIT_NS).unwrap();
   // A daemon killed with the claim unanswered: nothing it published is taken back, its start stamp included.
@@ -379,7 +399,7 @@ fn rendezvous_restart_child() {
   while SystemTime::now() <= first_opened {
     std::hint::spin_loop();
   }
-  let mut second = Listener::open(&instance).unwrap();
+  let mut second = Listener::open(&instance, adoption.as_ref()).unwrap();
   // The second daemon lives on with its ends of what it accepted, as a running daemon does.
   let (connected, _, _accepted) = serve_until_connected(&mut second, claim);
   assert!(
@@ -403,7 +423,7 @@ fn a_claim_begun_before_a_restart_judges_the_daemon_that_answered_it_alive() {
   let status = Command::new(exe)
     .args(["--exact", "rendezvous_restart_child", "--nocapture"])
     .env(CHILD_RESTART_ROLE, &instance)
-    .env(ENV_RENDEZVOUS, held.env_value())
+    .env(ENV_RENDEZVOUS, held.adoption().env_value())
     .status()
     .unwrap();
   assert!(
@@ -411,4 +431,184 @@ fn a_claim_begun_before_a_restart_judges_the_daemon_that_answered_it_alive() {
     "the client judged the daemon that answered its claim alive: {status:?}"
   );
   drop(held);
+}
+
+/// A-176: do let two clients claim before one accept round, and refuse the second one's region (as Windows refused a
+/// reconnecting client's region by its name); expect the round to keep the first client, which it accepted and answered,
+/// the first client to connect, and the second to be told it was refused. Before A-176 the round answered the second
+/// with its refusal and then failed whole, dropping the first client's region and control with it: that client was
+/// told it had connected to a region nobody served, and on Linux the daemon's end of its control socket closed under it.
+#[test]
+fn a_refused_claim_does_not_cost_its_round_the_client_it_accepted() {
+  let instance = format!("test-round-{}", std::process::id());
+  let mut listener = Listener::open(&instance, None).unwrap();
+  let mut first = begin_connect_as(&instance, 0, CLAIM_WAIT_NS).unwrap();
+  let mut second = begin_connect_as(&instance, 0, CLAIM_WAIT_NS).unwrap();
+  let pid = std::process::id();
+  let mut regions_asked = 0;
+  let mut refusals = Vec::new();
+  let round = listener.accept_pending(
+    &|_| false,
+    &mut |client_id| {
+      regions_asked += 1;
+      if regions_asked > 1 {
+        return Err(IpcError::OsRefused {
+          call: "the test refuses every region after the first",
+          code: None,
+        });
+      }
+      Ok(Prepared {
+        region: ClientRegion::create(
+          &format!("slates-round-{pid}-{client_id}"),
+          client_id,
+          0,
+          geometry(),
+        )?,
+        kick_fd: None,
+      })
+    },
+    &mut |refusal| refusals.push(refusal),
+  );
+  assert_eq!(regions_asked, 2, "both claims reached the round");
+  assert!(
+    round.ended.is_none(),
+    "a refused claim does not end the round that refused it: {:?}",
+    round.ended
+  );
+  assert_eq!(
+    refusals.len(),
+    1,
+    "the refused claim is handed back once: {refusals:?}"
+  );
+  let accepted = round.accepted;
+  assert_eq!(
+    accepted.len(),
+    1,
+    "the round keeps the client it accepted before the refusal"
+  );
+  let Answer::Connected(connected) = answer_within_claim_wait(&mut first) else {
+    panic!("the accepted client connects");
+  };
+  assert!(
+    !connected.liveness.daemon_gone(),
+    "the accepted client's daemon end lives on in the round's result"
+  );
+  let refused = answer_within_claim_wait(&mut second);
+  assert!(
+    matches!(refused, Answer::Refused(_)),
+    "the second client is told the daemon refused it: {refused:?}"
+  );
+  drop(accepted);
+}
+
+/// How a claim whose round has run was answered (the connection boxed: it is many times a refusal's size).
+enum Answer {
+  Connected(Box<slates_ipc::Connected>),
+  Refused(IpcError),
+  /// Not within the claim wait.
+  Unanswered,
+}
+
+impl std::fmt::Debug for Answer {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Answer::Connected(_) => f.write_str("Connected"),
+      Answer::Refused(refusal) => write!(f, "Refused({refusal:?})"),
+      Answer::Unanswered => f.write_str("Unanswered"),
+    }
+  }
+}
+
+/// Polls `claim` until it is answered, within the claim wait.
+fn answer_within_claim_wait(claim: &mut slates_ipc::Claim) -> Answer {
+  let started = Instant::now();
+  while started.elapsed() < Duration::from_nanos(CLAIM_WAIT_NS) {
+    match claim.poll() {
+      Ok(Some(connected)) => return Answer::Connected(Box::new(connected)),
+      Ok(None) => {}
+      Err(refusal) => return Answer::Refused(refusal),
+    }
+  }
+  Answer::Unanswered
+}
+
+/// A-176: do open an instance's rendezvous with no anchor, connect a client and keep it (on macOS and Windows its
+/// doorbell maps the bootstrap object), and let the daemon die with no anchor holding its rendezvous (its listener and
+/// its ends of what it accepted dropped); then open a fresh rendezvous for the instance, as the next daemon run alone
+/// or a restarted anchor does. Expect: the fresh rendezvous opens and connects a new client, and the old client judges
+/// its daemon gone. Before A-176 Windows refused the fresh one `ERROR_ALREADY_EXISTS`: a section's name lives while any
+/// process maps it, and the old client's doorbell did, so no daemon of the instance could start until every client of
+/// the dead one had exited.
+#[test]
+fn a_fresh_rendezvous_opens_while_a_client_of_a_dead_daemon_lives() {
+  let instance = format!("test-fresh-{}", std::process::id());
+  let mut dead = Listener::open(&instance, None).unwrap();
+  let claim = begin_connect_as(&instance, 0, CLAIM_WAIT_NS).unwrap();
+  let (old_client, _, old_accepted) = serve_until_connected(&mut dead, claim);
+  drop(old_accepted);
+  drop(dead);
+  let mut fresh = Listener::open(&instance, None)
+    .expect("a fresh rendezvous opens while a client of the dead daemon still maps the old one");
+  let claim = begin_connect_as(&instance, 0, CLAIM_WAIT_NS).unwrap();
+  let (new_client, _, accepted) = serve_until_connected(&mut fresh, claim);
+  assert!(
+    old_client.liveness.daemon_gone(),
+    "the dead daemon's client judges it gone"
+  );
+  assert!(
+    !new_client.liveness.daemon_gone(),
+    "the fresh daemon's client judges it alive"
+  );
+  drop(accepted);
+}
+
+/// A-176: do open an instance's rendezvous with no anchor and keep it, then try a second owner of it, as a second
+/// daemon run alone or an anchor would; drop the first and hold it as an anchor, then try again. Expect: every second
+/// owner refused while the first lives (Windows: the owner's token, `InstanceHeld`; Linux: the abstract address in
+/// use), and the rendezvous free again once its owner is gone, so two owners never share one bootstrap object. macOS
+/// takes the name over even from a live owner, since an owner unlinks the name it finds (GAPS, A-176), so the test is
+/// Linux's and Windows'.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_second_owner_of_a_live_instances_rendezvous_is_refused() {
+  let instance = format!("test-owner-{}", std::process::id());
+  let first = Listener::open(&instance, None).unwrap();
+  assert_held(
+    Listener::open(&instance, None).map(|_| ()),
+    "a second daemon run alone",
+  );
+  assert_held(
+    HeldRendezvous::hold(&instance).map(|_| ()),
+    "an anchor beside a daemon run alone",
+  );
+  drop(first);
+  let held =
+    HeldRendezvous::hold(&instance).expect("the rendezvous is free once its owner is gone");
+  assert_held(
+    HeldRendezvous::hold(&instance).map(|_| ()),
+    "a second anchor",
+  );
+  assert_held(
+    Listener::open(&instance, None).map(|_| ()),
+    "a daemon run alone beside an anchor",
+  );
+  drop(held);
+}
+
+/// Asserts `outcome` is the refusal of a second owner of a live instance's rendezvous: the owner's token (Windows).
+#[cfg(windows)]
+fn assert_held(outcome: Result<(), IpcError>, who: &str) {
+  assert!(
+    matches!(outcome, Err(IpcError::InstanceHeld { .. })),
+    "{who} is refused while the instance's owner lives: {outcome:?}"
+  );
+}
+
+/// The paired arm: the abstract address in use (Linux).
+#[cfg(target_os = "linux")]
+fn assert_held(outcome: Result<(), IpcError>, who: &str) {
+  assert!(
+    matches!(outcome, Err(IpcError::OsRefused { call: "bind", .. })),
+    "{who} is refused while the instance's owner lives: {outcome:?}"
+  );
 }

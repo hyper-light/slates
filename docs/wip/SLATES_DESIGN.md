@@ -3014,9 +3014,9 @@ same-namespace host process is the first delivered case.
 > under the default descriptor was refused unconfined at the hand-off (the read came by copy), and with the judge
 > bypassed as well the hostile test's duplicate that writes was granted. **Owed:** arm64 Windows (its CI lane measures
 > the escalation but runs no daemon); on Windows, replies stalled past their 1 s deadline when the client binary ran at
-> 32 test threads (6 of 13 tests; 4 threads ran all 14 green), not yet diagnosed, so CI runs the direct-map tests one
-> at a time; and the binary's restart tests fail on Windows meeting their predecessor's still-live named section
-> (`ERROR_ALREADY_EXISTS`); both before this change (GAPS).
+> 32 test threads (6 of 13 tests; 4 threads ran all 14 green), not yet diagnosed, so CI runs the binary one test at a
+> time; before this change (GAPS). The binary's restart tests, which failed on Windows meeting their predecessor's
+> still-live named section (`ERROR_ALREADY_EXISTS`), pass there since A-176 (§4.7).
 
 > **Status (the DAX matrix, A-164, 2026-10-24).** What DAX means in each environment, and which of its 52 cells
 > (each environment on each platform, by the mount route and the socket route) are proven, owed or ruled out by the
@@ -3731,6 +3731,23 @@ same object; the client claims a slot by CAS in the bootstrap block; an optional
 for streams. Windows: open `Local\slates-<sid-hash>` section and the per-slot `Local\...` Event
 (DACL to the user's SID); optional named pipe for streams. Discovery: `SLATES_ENDPOINT`, then the
 well-known name.
+
+> **Status (2026-10-25, A-176).** Every in-process anchor hands its daemons the rendezvous it holds, as the field's
+> anchor does across the spawn (`SegmentSource::Handoff`'s `rendezvous`; `Adoption`), so nothing below a daemon's start
+> reads the environment. Windows keeps a kernel object's name while any process holds it, which three defects met,
+> each fixed with a failing test first:
+>
+> - a client's region is named afresh at every daemon start and for every region (`slates-cr-<key>-<number>`), since
+>   a reconnecting client still mapped the region of the same name;
+> - the owner of a rendezvous (its anchor, or a daemon run alone) holds a token only it opens, takes over an object a
+>   dead owner's clients still map, and refuses a second live owner `InstanceHeld`;
+> - a claim refused in an accept round ends that claim alone, on every platform, where before the round dropped the
+>   clients it had already accepted.
+>
+> A stopped daemon also takes back the start stamp it published, so a client in its own process judges it gone, as a
+> Linux client does when the control socket closes. Proven on jupiter (Windows 10.0.26200): the client binary whole,
+> one test at a time, 20 of 20, its seven restart tests the first sessions to outlive a daemon restart on Windows;
+> red-checked. macOS still takes a live owner's name over (GAPS).
 
 **Protocol.** Requests and replies are fixed-layout 64-byte slots; request ids are `(client_id,
 sequence)`; the daemon keeps a completion record per client until acknowledged (RIFL), so a retry
@@ -11326,13 +11343,15 @@ Applied in the same change to: D-10's rendezvous, GAPS, BENCHMARKS, docs/bugs/20
 
 Status: built 2026-10-06 (Linux, macOS; Windows by the shared module, cross-linted).
 - What it answers: a client that connected as its daemon died waited the one-second claim wait and failed "no
-  daemon", though the restart takes about 7 ms. A restarted daemon made a new rendezvous (macOS and Windows unlinked
-  and recreated the bootstrap object; on Linux the abstract socket vanished with the dead daemon), so a claim
-  published on the old one was never read.
+  daemon", though the restart takes about 7 ms. A restarted daemon made a new rendezvous (macOS unlinked and
+  recreated the bootstrap object; on Linux the abstract socket vanished with the dead daemon), so a claim published
+  on the old one was never read. (Windows, which cannot unlink a name, refused the new object outright while any
+  client still mapped the old one; A-176.)
 - The rule: the anchor holds every endpoint a client or a kernel connects through — the NFS listener (§4.6), the NFS
   connections (A-113), and now the rendezvous. It creates the rendezvous once (an inheritable listening socket on
   Linux, the bootstrap object with nothing published on macOS and Windows) and hands it to each daemon in
-  `SLATES_ANCHOR_RENDEZVOUS`. The daemon adopts it: Linux checks the inherited socket listens at the instance's
+  `SLATES_ANCHOR_RENDEZVOUS` (an anchor in the daemon's own process hands it over directly, `SegmentSource::Handoff`'s
+  `rendezvous`, since A-176). The daemon adopts it: Linux checks the inherited socket listens at the instance's
   address; macOS and Windows check the object's magic and slot count, return claims the dead daemon took and never
   answered to `CLAIMED`, and stamp the header. A daemon with no anchor makes its own, as before.
 - With nothing published (the anchor up, no daemon yet), a client is told "not yet published" at once, as with no
@@ -12299,7 +12318,20 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
 - **Rejected: granting the user reading by SID.** The first descriptor named the user's SID with reading rights; it needed the token read and converted on every copy and granted nothing a handle does not already carry. `OWNER RIGHTS` alone refuses the same escalations (measured), with nine fewer unsafe sites.
 - **Proven** on jupiter (Windows 10.0.26200), 2026-10-25, and red-checked (§4.6 status); CI's two x86_64 Windows lanes run the same tests on every push to main.
 - **Measured** the same day (BENCHMARKS, "Copy-once-map-many against copy-per-read", jupiter): a steady mapped read costs 1.4 % to 2.6 % of a copy read; the hand-off's setup is 28 to 56 µs at 4 KiB, repaid after 2 or 3 reads, and from 1 MiB the whole setup costs less than one copy read.
-- **Owed:** arm64 Windows; replies that stalled on Windows with many daemons at once in one process, and the restart tests' named-section collision there (both pre-existing, GAPS).
+- **Owed:** arm64 Windows; replies that stalled on Windows with many daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
+
+### A-176 — A Windows daemon restarts under its clients: names that no restart repeats, an owner's token, and a claim's refusal kept to itself (accepted 2026-10-25)
+Applied in the same change to: §4.7 (the rendezvous's status), A-114 (adoption handed over in process; its Windows sentence corrected), A-175's owed line, GAPS, `crates/ipc` (`rendezvous.rs`: `Adoption`, `Listener::open` taking it, `Round` and `Served`, the Windows owner token and takeover, the stamp taken back at a listener's drop; `wake.rs`: `Event::create_new`; `error.rs`: `InstanceHeld`; `tests/rendezvous.rs`), `crates/server` (`daemon.rs`: `SegmentSource::Handoff`'s `rendezvous`, `region_name_key`, `CLAIMS_REFUSED`, the accept loop's refusals), `crates/cli` (`anchor.rs`), every in-process anchor of the tests (`crates/client/tests/{client,consumer,driver}.rs`; `crates/server/tests/{common/anchor,fleet,seal,recovery,attach_forms,shards,virtiofs}.rs`; `daemon.rs`'s warm-restart test), `.github/workflows/ci.yml` (both x86_64 Windows lanes run the client binary whole, one test at a time), `CLAUDE.md`, and three bug records.
+- **What was found.** The client binary's six restart tests had never run on Windows. Run on jupiter (Windows 10.0.26200, 2026-10-25), each failed at its second daemon's start, `CreateFileMappingW` refusing `ERROR_ALREADY_EXISTS`. Windows keeps a kernel object's name while any process holds it and cannot unlink one, and beneath that one failure lay a harness gap and three defects.
+- **The harness: the tests played the anchor's segment but not its rendezvous.** So each daemon made its own, and the second met the first's bootstrap object in the surviving client's doorbell. The field's anchor holds the rendezvous (A-114), and every in-process anchor now does too, handing it to each daemon it starts as `SegmentSource::Handoff`'s `rendezvous` (an `Adoption`). The environment variable a spawned daemon reads would have reached every daemon of a test process, so nothing below a daemon's start reads the environment any more; `SegmentSource::FromEnv` reads it at the start.
+- **A reconnecting client was refused, so a Windows restart cost every client its session** (`docs/bugs/2026-10-25-a-windows-client-could-not-reconnect-after-a-restart.md`). The daemon named a client's region `slates-cr-<instance>-<client id>`, a reconnect keeps its id (§4.9), and the client still maps its old region, so Windows refused the name and the session ended `DaemonGone` where AC-2.3 says it resumes. Each region is now `slates-cr-<key>-<number>`: a 64-bit key derived with a keyed-hash domain of its own from the issuer secret every start mints, and the region's number in that daemon. The number wraps; a repeat can meet only a region made 2^32 regions earlier, and refuses that one connection, typed. The name takes 35 of the claim slot's 40 bytes.
+- **A claim's refusal cost its round every client it had accepted, on every platform** (`docs/bugs/2026-10-25-a-refused-claim-dropped-its-rounds-accepted-clients.md`). The round returned the refusal and dropped the clients it had accepted and already answered. Now each claim served is `Served::Accepted` or `Served::Refused`; a refusal is answered to its claimant, handed to the caller and ends that claim alone (counted `CLAIMS_REFUSED`). Only a failure of the rendezvous itself ends a round, which keeps what it accepted (`Round::ended`).
+- **No daemon of an instance could start on Windows beside a client of its dead owner** (`docs/bugs/2026-10-25-a-windows-instance-could-not-start-beside-a-dead-ones-client.md`). This hit a daemon run alone, or an anchor started again after its predecessor died. The owner (the anchor that holds the rendezvous, or a daemon run alone) now holds a token: a named Event created only if no live process holds one, which no one else opens, so its name lives exactly as long as its owner. Holding it, an owner takes over an object it finds: its layout checked, its claims readied as a restarted daemon readies them, nothing published and no anchor named. A second owner of a live instance is refused `InstanceHeld`. macOS keeps its unlinking create, with an empty token.
+- **One in-process semantic made the same everywhere: a stopped daemon takes back its start stamp.** The macOS and Windows listener's `Drop` takes back the stamp, by exchange so a successor's stays. With the anchor holding the object, a stopped daemon's stamp stayed published, and a client in the daemon's own process, whose exit watch sees no exit, judged it alive for good (`crates/client/tests/driver.rs`'s death phase found it once the driver's anchor held the rendezvous). A Linux client learns the same from its control socket closing.
+- **Proven** on jupiter, 2026-10-25: the client binary whole, one test at a time, 20 of 20, its seven restart tests the first sessions to outlive a daemon restart on Windows; the driver 2 of 2; the rendezvous 12 of 12. The same suites pass on this Mac (rendezvous 11 of 11, client 21, driver 2, consumer 3, recovery 41) and fedora (rendezvous 12, client 20, driver 2, consumer 3, recovery 43; `slates-ipc`, `slates-server`, `slates-client` and `slates-cli` linted). Red-checked on jupiter: the old region name fails the session test again, with the daemon's own log line, and a token taken by a plain create-or-open let a second owner in. Red-checked on fedora: the old round fails the round test again.
+- **Rejected for now: handing a Windows client its region by handle duplication.** A region with no name would also close GAP-A9-9's same-uid access to a ring on Windows, but it reshapes the claim slot's answer. Per-start names fix the restart and leave GAP-A9-9 where it was.
+- **Not changed: macOS takes a live owner's name over** (an owner unlinks the name it finds), so two daemons of one instance can run side by side there, each with its own clients (GAPS).
+- **Owed:** replies that stall on Windows with many daemons at once in one process (GAPS: a single poll held a shard 1277 ms).
 
 ### A-170 — A clone's copy-up copies an open extent its origin owns; only its own is sealed in place (accepted 2026-10-25)
 Applied in the same change to: `crates/vfs/src/volume.rs` (`Volume::make_current_inode`), `crates/vfs/src/content.rs`

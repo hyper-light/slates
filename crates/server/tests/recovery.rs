@@ -37,7 +37,7 @@ use slates_server::{BootFault, BootFaultKind, Daemon, DaemonConfig};
 use slates_wire::request::RequestId;
 
 mod common;
-use common::anchor::{anchor_segment, source_of};
+use common::anchor::{Anchor, held_anchor, source_of};
 use common::nfs::{create, fsstat, lookup, mount, read, write};
 
 /// Shape: shards per test daemon: two, so the volume can live on a shard other than the control
@@ -105,9 +105,9 @@ fn an_unpublished_verb_is_refused_typed_a_retry_re_executes_and_a_restart_agrees
   let profile = common::machine_profile();
   let instance = format!("srv-unpublished-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let segment = anchor_segment("unpublished", &profile, &config);
+  let anchor = held_anchor("unpublished", &profile, &config);
 
-  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   first
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -131,7 +131,7 @@ fn an_unpublished_verb_is_refused_typed_a_retry_re_executes_and_a_restart_agrees
   // The restart over the same segment agrees: the effect and its completion survived together.
   let member = first.member_identity().unwrap();
   first.stop();
-  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   assert_eq!(second.member_identity(), Ok(member), "a warm restart");
   assert_eq!(
     names_listed(&mut client),
@@ -165,9 +165,9 @@ fn an_unpublished_verb_stays_retryable_across_the_clients_acknowledgement() {
   let profile = common::machine_profile();
   let instance = format!("srv-unpublished-ack-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let segment = anchor_segment("unpublished-ack", &profile, &config);
+  let anchor = held_anchor("unpublished-ack", &profile, &config);
 
-  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   daemon
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -204,7 +204,7 @@ fn an_unpublished_verb_stays_retryable_across_the_clients_acknowledgement() {
     vec!["durable".to_owned(), "unpublished".to_owned()]
   );
   daemon.stop();
-  drop(segment);
+  drop(anchor);
 }
 
 /// The refused phase: the next publication on whichever shard runs the create is refused before its
@@ -330,9 +330,9 @@ fn acknowledged_content_and_its_snapshot_survive_a_daemon_restart_byte_for_byte(
   let profile = common::machine_profile();
   let instance = format!("srv-recover-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let segment = anchor_segment("recover", &profile, &config);
+  let anchor = held_anchor("recover", &profile, &config);
 
-  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   first
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -361,7 +361,7 @@ fn acknowledged_content_and_its_snapshot_survive_a_daemon_restart_byte_for_byte(
   let member = first.member_identity().unwrap();
   first.stop();
 
-  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   assert_eq!(
     second.member_identity(),
     Ok(member),
@@ -401,7 +401,7 @@ fn acknowledged_content_and_its_snapshot_survive_a_daemon_restart_byte_for_byte(
     "the snapshot's frozen bytes survived the restart"
   );
   second.stop();
-  drop(segment);
+  drop(anchor);
 }
 
 /// A one-file archive of `bytes` as one raw chunk, with the format's own header bounds — the replica the
@@ -539,8 +539,8 @@ fn a_cut_transfer_resumes_with_exactly_the_chunks_still_owed() {
   let profile = common::machine_profile();
   let instance = format!("srv-cut-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let segment = anchor_segment("cut", &profile, &config);
-  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let anchor = held_anchor("cut", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   daemon
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -548,7 +548,7 @@ fn a_cut_transfer_resumes_with_exactly_the_chunks_still_owed() {
     .map(|cut| cut_run(&daemon, cut))
     .collect();
   daemon.stop();
-  drop(segment);
+  drop(anchor);
   for run in runs {
     assert_cut_run(&run);
   }
@@ -658,8 +658,8 @@ fn an_abandoned_transfer_returns_every_charge_when_replaced() {
   let profile = common::machine_profile();
   let instance = format!("srv-abandon-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let segment = anchor_segment("abandon", &profile, &config);
-  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let anchor = held_anchor("abandon", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   daemon
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -687,7 +687,7 @@ fn an_abandoned_transfer_returns_every_charge_when_replaced() {
   let after = account();
   let abandoned_held = daemon.fleet_holder_content(abandoned.manifest_identity());
   daemon.stop();
-  drop(segment);
+  drop(anchor);
 
   assert_eq!(answered(&control_reply), Answered::Acked);
   assert_eq!(cut_reply, Answered::Progress);
@@ -756,11 +756,11 @@ fn two_daemons_in_one_process_measure_memory_pressure_from_their_own_start() {
     let instance = format!("srv-pressure-{name}-{}", std::process::id());
     let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
     let capacity = pressure_capacity(&config);
-    let segment = anchor_segment(&format!("pressure-{name}"), &profile, &config);
-    let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
-    (daemon, segment, capacity)
+    let anchor = held_anchor(&format!("pressure-{name}"), &profile, &config);
+    let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+    (daemon, anchor, capacity)
   };
-  let (first, first_segment, capacity) = start("first");
+  let (first, first_anchor, capacity) = start("first");
   // The shapes the test moves the host by: the host free at the first sample, the growth between the starts, the
   // later drop.
   let (sampled_available, grown_between_starts, later_drop) = (
@@ -775,7 +775,7 @@ fn two_daemons_in_one_process_measure_memory_pressure_from_their_own_start() {
   first.inject_available_memory(sampled_available).unwrap();
   let first_sampled =
     within_sampler_wait(|| first.pressure_baseline() == Ok(Some(sampled_available)));
-  let (second, second_segment, _) = start("second");
+  let (second, second_anchor, _) = start("second");
   second.inject_resident_memory(SAMPLED_RESIDENT).unwrap();
   second
     .inject_available_memory(sampled_available - grown_between_starts)
@@ -791,7 +791,7 @@ fn two_daemons_in_one_process_measure_memory_pressure_from_their_own_start() {
   let first_hold = withheld(&first);
   first.stop();
   second.stop();
-  drop((first_segment, second_segment));
+  drop((first_anchor, second_anchor));
   assert!(first_sampled, "the first daemon took its first sample");
   assert!(
     second_sampled,
@@ -844,8 +844,8 @@ fn a_daemons_own_growth_is_not_memory_pressure() {
     capacity / OWN_GROWTH_PARTS,
     capacity / LATER_DROP_PARTS,
   );
-  let segment = anchor_segment("pressure-own", &profile, &config);
-  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let anchor = held_anchor("pressure-own", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   daemon.inject_available_memory(sampled_available).unwrap();
   daemon.inject_resident_memory(SAMPLED_RESIDENT).unwrap();
   let sampled = within_sampler_wait(|| daemon.pressure_baseline() == Ok(Some(sampled_available)));
@@ -884,8 +884,8 @@ fn a_replica_is_admitted_only_from_the_holders_unpromised_capacity() {
   let profile = common::machine_profile();
   let instance = format!("srv-replica-cap-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let segment = anchor_segment("replica-cap", &profile, &config);
-  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let anchor = held_anchor("replica-cap", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   daemon
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -901,7 +901,7 @@ fn a_replica_is_admitted_only_from_the_holders_unpromised_capacity() {
   let admitted = place_replica(&daemon, object, 1, &archive);
   let held_after = daemon.fleet_holder_content(manifest);
   daemon.stop();
-  drop(segment);
+  drop(anchor);
   assert!(
     !acked(&refused),
     "no acknowledgement without unpromised capacity"
@@ -932,8 +932,8 @@ fn an_acknowledged_replica_survives_a_warm_daemon_restart() {
   let profile = common::machine_profile();
   let instance = format!("srv-replica-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let segment = anchor_segment("replica", &profile, &config);
-  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let anchor = held_anchor("replica", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   first
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -945,10 +945,10 @@ fn an_acknowledged_replica_survives_a_warm_daemon_restart() {
   let held_before = first.fleet_holder_content(manifest);
   first.stop();
 
-  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   let held_after = second.fleet_holder_content(manifest);
   second.stop();
-  drop(segment);
+  drop(anchor);
   assert!(acknowledged, "the holder acknowledged the put");
   assert_eq!(
     held_before,
@@ -977,8 +977,8 @@ fn an_acknowledged_held_record_survives_a_warm_daemon_restart() {
   let profile = common::machine_profile();
   let instance = format!("srv-record-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let segment = anchor_segment("record", &profile, &config);
-  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let anchor = held_anchor("record", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   first
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -999,11 +999,11 @@ fn an_acknowledged_held_record_survives_a_warm_daemon_restart() {
   let held_before = first.fleet_held_record(object);
   first.stop();
 
-  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   let held_after = second.fleet_held_record(object);
   let owner_after = second.member_identity();
   second.stop();
-  drop(segment);
+  drop(anchor);
   assert!(!reply.is_empty(), "the holder acknowledged the record");
   assert_eq!(
     owner_after,
@@ -1274,8 +1274,8 @@ fn assert_crash_state(run: &mut Run, daemon: &Daemon, k: usize, done: bool) {
 fn reference(profile: &MachineProfile) -> Observed {
   let instance = format!("srv-crash-ref-{}", std::process::id());
   let config = DaemonConfig::derive(profile, &instance, Some(TEST_SHARDS));
-  let segment = anchor_segment("crash-ref", profile, &config);
-  let daemon = Daemon::start(profile, config, source_of(&segment)).unwrap();
+  let anchor = held_anchor("crash-ref", profile, &config);
+  let daemon = Daemon::start(profile, config, source_of(&anchor)).unwrap();
   daemon
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -1285,7 +1285,7 @@ fn reference(profile: &MachineProfile) -> Observed {
   }
   let observed = observe(&mut run, &daemon);
   daemon.stop();
-  drop(segment);
+  drop(anchor);
   observed
 }
 
@@ -1338,10 +1338,10 @@ fn run_crash_point(profile: &MachineProfile, reference: &Observed, k: usize, cra
   let name = format!("crash-{k}-{crash:?}");
   let instance = format!("srv-{name}-{}", std::process::id());
   let config = DaemonConfig::derive(profile, &instance, Some(TEST_SHARDS));
-  let mut segment = anchor_segment(&name, profile, &config);
+  let mut anchor = held_anchor(&name, profile, &config);
   let partitions = config.geometry.partitions;
 
-  let first = Daemon::start(profile, config.clone(), source_of(&segment)).unwrap();
+  let first = Daemon::start(profile, config.clone(), source_of(&anchor)).unwrap();
   first
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -1349,7 +1349,7 @@ fn run_crash_point(profile: &MachineProfile, reference: &Observed, k: usize, cra
   for j in 1..k {
     step(&mut run, &first, j, false);
   }
-  let before = log_headers(&segment, partitions);
+  let before = log_headers(&anchor.segment, partitions);
   // Before-publish: the step never runs on the first daemon; the others run it, then the
   // between-state rolls the log back so only the content publish survives.
   if crash != Crash::BeforePublish {
@@ -1357,10 +1357,10 @@ fn run_crash_point(profile: &MachineProfile, reference: &Observed, k: usize, cra
   }
   first.stop();
   if crash == Crash::BetweenPublishAndRecord {
-    restore_log_headers(&mut segment, &before);
+    restore_log_headers(&mut anchor.segment, &before);
   }
 
-  let second = Daemon::start(profile, config, source_of(&segment)).unwrap();
+  let second = Daemon::start(profile, config, source_of(&anchor)).unwrap();
   let done = crash == Crash::AfterRecord;
   assert_crash_state(&mut run, &second, k, done);
   step(&mut run, &second, k, done);
@@ -1381,7 +1381,7 @@ fn run_crash_point(profile: &MachineProfile, reference: &Observed, k: usize, cra
   );
   drop(stream);
   second.stop();
-  drop(segment);
+  drop(anchor);
 }
 
 // ----------------------------------------------------------- the landing counter across a restart
@@ -1397,10 +1397,10 @@ fn a_landing_presented_before_a_restart_does_not_block_the_first_landing_after_i
   let profile = common::machine_profile();
   let instance = format!("srv-landctr-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let segment = anchor_segment("landctr", &profile, &config);
+  let anchor = held_anchor("landctr", &profile, &config);
   let target = common::target::target_dir();
 
-  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   first
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -1410,7 +1410,7 @@ fn a_landing_presented_before_a_restart_does_not_block_the_first_landing_after_i
   let before = present_landing(&mut client, kept, snapshot, &target.path);
   first.stop();
 
-  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   let after = present_landing(&mut client, kept, snapshot, &target.path);
   assert_ne!(
     after, before,
@@ -1418,7 +1418,7 @@ fn a_landing_presented_before_a_restart_does_not_block_the_first_landing_after_i
   );
   second.stop();
   drop(target);
-  drop(segment);
+  drop(anchor);
 }
 
 /// Shape: the grant term of the restart test's approvals — a minute, far past the test's length.
@@ -1462,10 +1462,10 @@ fn a_session_grant_outlives_a_restart_and_a_single_use_grant_stays_spent() {
   let profile = common::machine_profile();
   let instance = format!("srv-grantrst-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let segment = anchor_segment("grantrst", &profile, &config);
+  let anchor = held_anchor("grantrst", &profile, &config);
   let target = common::target::target_dir();
 
-  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   first
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -1504,7 +1504,7 @@ fn a_session_grant_outlives_a_restart_and_a_single_use_grant_stays_spent() {
   );
   first.stop();
 
-  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   for round in 0..2 {
     let landed = client.land(
       kept,
@@ -1550,7 +1550,7 @@ fn a_session_grant_outlives_a_restart_and_a_single_use_grant_stays_spent() {
   );
   second.stop();
   drop(target);
-  drop(segment);
+  drop(anchor);
 }
 
 /// Presents a landing of `snapshot` into `target` with no grant and returns its landing id — the
@@ -1656,11 +1656,11 @@ fn a_target_lease_outlives_its_daemon_and_blocks_landings_until_its_term() {
   let profile = common::machine_profile();
   let instance = format!("srv-leaserst-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let segment = anchor_segment("leaserst", &profile, &config);
+  let anchor = held_anchor("leaserst", &profile, &config);
   let blocked = common::target::target_dir();
   let freed = common::target::target_dir();
 
-  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   first
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -1684,7 +1684,7 @@ fn a_target_lease_outlives_its_daemon_and_blocks_landings_until_its_term() {
   .unwrap();
   first.stop();
 
-  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   let refused = land_granted(&mut client, &into_blocked);
   assert!(
     matches!(
@@ -1707,7 +1707,7 @@ fn a_target_lease_outlives_its_daemon_and_blocks_landings_until_its_term() {
   assert_eq!(target_leases(&mut client), 1, "the minute lease alone");
   second.stop();
   drop((blocked, freed));
-  drop(segment);
+  drop(anchor);
 }
 
 // ------------------------------------------------ clone pins and destroy completion across a restart
@@ -1735,9 +1735,9 @@ fn a_clone_pin_and_a_destroy_in_flight_reconcile_to_the_catalog_across_a_restart
   let profile = common::machine_profile();
   let instance = format!("srv-pins-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let mut segment = anchor_segment("pins", &profile, &config);
+  let mut anchor = held_anchor("pins", &profile, &config);
 
-  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   first
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -1749,7 +1749,7 @@ fn a_clone_pin_and_a_destroy_in_flight_reconcile_to_the_catalog_across_a_restart
 
   // Restart 1: the clone's pin on the snapshot survived in the image and is reconciled to the recorded
   // clone, so the snapshot's destroy is refused (a lost pin would be the only reason it were allowed).
-  let second = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let second = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   assert!(
     matches!(
       client.destroy_snapshot(kept, snapshot),
@@ -1764,7 +1764,7 @@ fn a_clone_pin_and_a_destroy_in_flight_reconcile_to_the_catalog_across_a_restart
   // leaves. The destroy verb commits `Destroying` + the completion in one record; the next record is
   // the reclamation's `VolumeDestroyed`.
   let clone_partition = owner_partition(clone);
-  let before_destroy = log_tail(&segment, clone_partition);
+  let before_destroy = log_tail(&anchor.segment, clone_partition);
   client.destroy(clone).unwrap();
   // Wait for the background reclamation to run (so a `VolumeDestroyed` record exists after the destroy
   // verb's), then cut the log to before it.
@@ -1779,12 +1779,12 @@ fn a_clone_pin_and_a_destroy_in_flight_reconcile_to_the_catalog_across_a_restart
       "the clone's destroy reclamation runs: {listed:?}"
     );
   }
-  cut_log_after_one_record(&mut segment, clone_partition, before_destroy);
+  cut_log_after_one_record(&mut anchor.segment, clone_partition, before_destroy);
   second.stop();
 
   // Restart 2 over the `Destroying` state: recovery completes the destroy, unpinning the origin, so
   // the snapshot's destroy now succeeds.
-  let third = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let third = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   let started = Instant::now();
   loop {
     let listed: Vec<String> = client.list().unwrap().into_iter().map(|v| v.name).collect();
@@ -1803,7 +1803,7 @@ fn a_clone_pin_and_a_destroy_in_flight_reconcile_to_the_catalog_across_a_restart
     "the snapshot's destroy succeeds once the recovered destroy unpinned it"
   );
   third.stop();
-  drop(segment);
+  drop(anchor);
 }
 
 /// A-160 (an image volume's pin across a restart): an image volume pins the snapshot it was built from through its
@@ -1817,8 +1817,8 @@ fn an_image_volumes_pin_on_its_snapshot_reconciles_across_a_restart() {
   let profile = common::machine_profile();
   let instance = format!("srv-image-pin-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let segment = anchor_segment("image-pin", &profile, &config);
-  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let anchor = held_anchor("image-pin", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   first
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -1831,7 +1831,7 @@ fn an_image_volumes_pin_on_its_snapshot_reconciles_across_a_restart() {
     .unwrap();
   first.stop();
 
-  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   assert!(
     matches!(
       client.destroy_snapshot(kept, snapshot),
@@ -1860,7 +1860,7 @@ fn an_image_volumes_pin_on_its_snapshot_reconciles_across_a_restart() {
     }
   }
   second.stop();
-  drop(segment);
+  drop(anchor);
 }
 
 /// Rolls a partition's log ring back to just past the one record that begins at `from_tail`, dropping
@@ -1912,8 +1912,8 @@ fn a_landed_scratch_volume_keeps_its_base_across_a_restart() {
   let profile = common::machine_profile();
   let instance = format!("srv-landrestart-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let segment = anchor_segment("landrestart", &profile, &config);
-  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let anchor = held_anchor("landrestart", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   first
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -1940,7 +1940,7 @@ fn a_landed_scratch_volume_keeps_its_base_across_a_restart() {
   drop(stream);
   first.stop();
 
-  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   let (mut stream, root) = mounted_on(&second, LANDED_VOLUME);
   let outside = lookup(&mut stream, &root, "outside", 6);
   assert_eq!(
@@ -1965,8 +1965,8 @@ fn an_overlays_copied_up_and_created_files_survive_a_restart_over_their_base() {
   let profile = common::machine_profile();
   let instance = format!("srv-overlayrestart-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let segment = anchor_segment("overlayrestart", &profile, &config);
-  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let anchor = held_anchor("overlayrestart", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   first
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -1989,7 +1989,7 @@ fn an_overlays_copied_up_and_created_files_survive_a_restart_over_their_base() {
   drop(stream);
   first.stop();
 
-  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   let (mut stream, root) = mounted_on(&second, LANDED_VOLUME);
   let outside = lookup(&mut stream, &root, "outside", 6);
   assert_eq!(
@@ -2019,8 +2019,8 @@ fn a_clone_recovers_over_its_recovered_origin_serving_inherited_and_its_own_file
   let profile = common::machine_profile();
   let instance = format!("srv-clonerec-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let segment = anchor_segment("clonerec", &profile, &config);
-  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let anchor = held_anchor("clonerec", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   first
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -2051,7 +2051,7 @@ fn a_clone_recovers_over_its_recovered_origin_serving_inherited_and_its_own_file
   drop(stream);
   first.stop();
 
-  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   let (mut stream, root) = mounted_on(&second, &clone_name);
   let inherited = lookup(&mut stream, &root, "inherited", 6);
   assert_eq!(
@@ -2101,8 +2101,8 @@ fn a_clones_rewrite_of_a_file_its_origin_holds_open_survives_a_restart_beside_th
   let profile = common::machine_profile();
   let instance = format!("srv-openclone-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let segment = anchor_segment("openclone", &profile, &config);
-  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let anchor = held_anchor("openclone", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   first
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -2131,7 +2131,7 @@ fn a_clones_rewrite_of_a_file_its_origin_holds_open_survives_a_restart_beside_th
     .unwrap();
   first.stop();
 
-  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   let origin_read = read_answered(&mut client, origin, "f").unwrap();
   assert!(
     origin_read == first_bytes,
@@ -2205,8 +2205,8 @@ fn a_volume_past_the_reserves_power_of_two_part_fills_and_survives_a_restart() {
   let instance = format!("srv-reserve-tail-{}", std::process::id());
   let mut config = DaemonConfig::derive(&profile, &instance, Some(1));
   config.reserve_per_shard = POWER_PART + POWER_PART / 2;
-  let segment = anchor_segment("reserve-tail", &profile, &config);
-  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let anchor = held_anchor("reserve-tail", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   first
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -2233,7 +2233,7 @@ fn a_volume_past_the_reserves_power_of_two_part_fills_and_survives_a_restart() {
     assert_eq!(wrote.ok(), Some(FILL_FILE as u64), "file {index}");
   }
   first.stop();
-  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   for index in 0..FILL_FILES {
     let read = read_answered(&mut client, volume, &format!("f{index}"));
     assert!(
@@ -2275,8 +2275,8 @@ fn a_volume_larger_than_its_shards_slice_fills_from_the_pool_and_survives_a_rest
   let instance = format!("srv-pool-{}", std::process::id());
   let mut config = DaemonConfig::derive(&profile, &instance, Some(POOL_SHARDS));
   config.reserve_per_shard = SLICE;
-  let segment = anchor_segment("pool", &profile, &config);
-  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let anchor = held_anchor("pool", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   first
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -2304,7 +2304,7 @@ fn a_volume_larger_than_its_shards_slice_fills_from_the_pool_and_survives_a_rest
     assert_eq!(wrote.ok(), Some(FILL_FILE as u64), "file {index}");
   }
   first.stop();
-  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   for index in 0..files {
     let read = client.read(
       volume,
@@ -2329,8 +2329,8 @@ fn a_shard_is_refused_while_another_holds_the_pool_and_admitted_once_it_returns(
   let instance = format!("srv-pool-meet-{}", std::process::id());
   let mut config = DaemonConfig::derive(&profile, &instance, Some(POOL_SHARDS));
   config.reserve_per_shard = SLICE;
-  let segment = anchor_segment("pool-meet", &profile, &config);
-  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let anchor = held_anchor("pool-meet", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   daemon
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -2378,8 +2378,8 @@ fn a_refused_admission_leaves_the_pool_to_the_other_shards() {
   let instance = format!("srv-pool-refused-{}", std::process::id());
   let mut config = DaemonConfig::derive(&profile, &instance, Some(POOL_SHARDS));
   config.reserve_per_shard = SLICE;
-  let segment = anchor_segment("pool-refused", &profile, &config);
-  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let anchor = held_anchor("pool-refused", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   daemon
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -2426,8 +2426,8 @@ fn an_extent_claimed_just_before_a_crash_is_returned_at_the_first_publication() 
   let instance = format!("srv-pool-crash-{}", std::process::id());
   let mut config = DaemonConfig::derive(&profile, &instance, Some(POOL_SHARDS));
   config.reserve_per_shard = SLICE;
-  let segment = anchor_segment("pool-crash", &profile, &config);
-  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let anchor = held_anchor("pool-crash", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   first
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -2455,10 +2455,10 @@ fn an_extent_claimed_just_before_a_crash_is_returned_at_the_first_publication() 
   }
   first.stop();
   assert!(
-    segment.pool_claim(OTHER_SLICE_EXTENT, 0).unwrap(),
+    anchor.segment.pool_claim(OTHER_SLICE_EXTENT, 0).unwrap(),
     "the other slice's extent was free, and is now held as a crash after its claim leaves it"
   );
-  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   for index in 0..files {
     let read = client.read(
       kept,
@@ -2474,7 +2474,7 @@ fn an_extent_claimed_just_before_a_crash_is_returned_at_the_first_publication() 
     .create(&bounded(name_on(0, "publish"), 1 << 20))
     .expect("shard 0 publishes");
   assert_eq!(
-    segment.pool_owner(OTHER_SLICE_EXTENT).unwrap(),
+    anchor.segment.pool_owner(OTHER_SLICE_EXTENT).unwrap(),
     None,
     "the orphaned claim is returned at the first publication"
   );
@@ -2509,8 +2509,8 @@ fn sealed_content_reads_back_byte_for_byte_after_a_restart() {
   let profile = common::machine_profile();
   let instance = format!("srv-sealed-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let segment = anchor_segment("sealed", &profile, &config);
-  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let anchor = held_anchor("sealed", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   first
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -2544,7 +2544,7 @@ fn sealed_content_reads_back_byte_for_byte_after_a_restart() {
     "no seal fell back to the clear"
   );
   first.stop();
-  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   for index in 0..SEALED_FILES {
     let read = client.read(
       volume,
@@ -2577,8 +2577,8 @@ fn a_shard_whose_start_outlasts_a_liveness_window_while_working_does_not_stop_th
       kind: BootFaultKind::Busy,
       for_ns: HELD_START_NS,
     });
-  let segment = anchor_segment("long-start", &profile, &config);
-  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let anchor = held_anchor("long-start", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   daemon
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -2587,7 +2587,7 @@ fn a_shard_whose_start_outlasts_a_liveness_window_while_working_does_not_stop_th
     .create(&scratch("after-a-long-start"))
     .expect("a daemon whose shard started slowly serves");
   daemon.stop();
-  drop(segment);
+  drop(anchor);
 }
 
 /// Boot (GAPS 2026-10-05): do start a daemon whose second shard sleeps through two liveness windows in its start, using
@@ -2603,17 +2603,17 @@ fn a_shard_stuck_in_its_start_stops_the_heartbeat_so_the_anchor_restarts_the_dae
       kind: BootFaultKind::Stuck,
       for_ns: HELD_START_NS,
     });
-  let segment = anchor_segment("stuck-start", &profile, &config);
-  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let anchor = held_anchor("stuck-start", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   let quiet = Duration::from_nanos(2 * slates_server::daemon::HEARTBEAT_NS);
   let started = Instant::now();
   let mut stopped = false;
   while started.elapsed() < START_WAIT {
-    let before = segment.supervision().unwrap().heartbeat_ns();
+    let before = anchor.segment.supervision().unwrap().heartbeat_ns();
     // The test plays the anchor, which watches the heartbeat from its own thread across time.
     #[allow(clippy::disallowed_methods)]
     std::thread::sleep(quiet);
-    let after = segment.supervision().unwrap().heartbeat_ns();
+    let after = anchor.segment.supervision().unwrap().heartbeat_ns();
     if before > 0 && before == after {
       stopped = true;
       break;
@@ -2624,7 +2624,7 @@ fn a_shard_stuck_in_its_start_stops_the_heartbeat_so_the_anchor_restarts_the_dae
     "the heartbeat stopped after the stuck shard was refused"
   );
   daemon.stop();
-  drop(segment);
+  drop(anchor);
 }
 
 /// Boot (A-100): do start a daemon whose second shard spends two liveness windows on the CPU in its start, and stop the
@@ -2642,8 +2642,8 @@ fn a_daemon_stopped_while_its_boot_waits_on_a_shard_stops() {
       kind: BootFaultKind::Busy,
       for_ns: HELD_START_NS,
     });
-  let segment = anchor_segment("stop-mid-boot", &profile, &config);
-  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let anchor = held_anchor("stop-mid-boot", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   let (stopped, done) = std::sync::mpsc::channel();
   let stopper = std::thread::spawn(move || {
     daemon.stop();
@@ -2654,7 +2654,7 @@ fn a_daemon_stopped_while_its_boot_waits_on_a_shard_stops() {
     "the daemon stopped while its boot was waiting on a shard"
   );
   stopper.join().unwrap();
-  drop(segment);
+  drop(anchor);
 }
 
 /// How many times `needle` occurs in the content memfd named `name` that this process holds. Only its data ranges are
@@ -2742,8 +2742,8 @@ fn recovery_memory_no_restart_reads_goes_back_and_a_restart_recovers_every_file(
   let profile = common::machine_profile();
   let instance = format!("srv-recovery-return-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(1));
-  let segment = anchor_segment("recovery-return", &profile, &config);
-  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let anchor = held_anchor("recovery-return", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   first
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -2775,7 +2775,7 @@ fn recovery_memory_no_restart_reads_goes_back_and_a_restart_recovers_every_file(
   }
   let returned_first = returned_after_idle(&first, 0);
   first.stop();
-  let second = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let second = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   assert_every_file(&mut client, volume, ROUNDS * PER_ROUND, PER_ROUND);
   // An SDK attachment ends with its daemon; the restarted one is attached afresh.
   let attachment = attach(&mut client);
@@ -2783,10 +2783,10 @@ fn recovery_memory_no_restart_reads_goes_back_and_a_restart_recovers_every_file(
   second.publish_every_shard().unwrap();
   let returned_second = returned_after_idle(&second, 0);
   second.stop();
-  let third = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let third = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   assert_every_file(&mut client, volume, (ROUNDS + 1) * PER_ROUND, PER_ROUND);
   third.stop();
-  drop(segment);
+  drop(anchor);
   // Pages go back where the content object can punch a hole (Linux) or mark them reusable (macOS,
   // `SparseObject::discard`); on Windows the return is a no-op and the restarts above are the whole test.
   if cfg!(any(target_os = "linux", target_os = "macos")) {
@@ -2842,8 +2842,8 @@ fn a_sealed_files_block_is_trimmed_to_its_pages_and_survives_a_restart() {
   let profile = common::machine_profile();
   let instance = format!("srv-trim-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(1));
-  let segment = anchor_segment("trim", &profile, &config);
-  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let anchor = held_anchor("trim", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   first
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -2883,7 +2883,7 @@ fn a_sealed_files_block_is_trimmed_to_its_pages_and_survives_a_restart() {
   eprintln!("trimmed {trimmed} bytes, declined {declined} bytes");
   first.publish_every_shard().unwrap();
   first.stop();
-  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   for (index, len) in SIZES.iter().enumerate() {
     let read = read_answered(&mut client, volume, &format!("t{index}"));
     assert!(
@@ -2892,7 +2892,7 @@ fn a_sealed_files_block_is_trimmed_to_its_pages_and_survives_a_restart() {
     );
   }
   second.stop();
-  drop(segment);
+  drop(anchor);
   assert!(
     trimmed > 0,
     "sealed blocks were trimmed: {trimmed} trimmed, {declined} declined"
@@ -2919,8 +2919,8 @@ fn a_deleted_files_memory_goes_back_to_the_os() {
   let config = DaemonConfig::derive(&profile, &instance, Some(1));
   let chunk = slates_vfs::content::chunk_bytes(config.page).get();
   let tag = format!("ram-back-{}", std::process::id());
-  let segment = anchor_segment(&tag, &profile, &config);
-  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let anchor = held_anchor(&tag, &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   daemon
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -2971,7 +2971,7 @@ fn a_deleted_files_memory_goes_back_to_the_os() {
     released = allocated_in_content(&content);
   }
   daemon.stop();
-  drop(segment);
+  drop(anchor);
   assert!(
     given_back >= file / 2,
     "most of the file's pages went back to the OS: {given_back} of {file}"
@@ -3008,8 +3008,8 @@ fn a_deleted_files_plaintext_leaves_the_content_object() {
   let instance = format!("srv-rest-delete-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
   let tag = format!("rest-delete-{}", std::process::id());
-  let segment = anchor_segment(&tag, &profile, &config);
-  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let anchor = held_anchor(&tag, &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   daemon
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -3048,7 +3048,7 @@ fn a_deleted_files_plaintext_leaves_the_content_object() {
   ));
   let after = published(&daemon);
   daemon.stop();
-  drop(segment);
+  drop(anchor);
   assert!(
     written > 0,
     "the scan sees the plaintext right after the write (its control)"
@@ -3078,8 +3078,8 @@ fn a_sealed_files_plaintext_leaves_the_content_object() {
   let instance = format!("srv-rest-scrub-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
   let tag = format!("rest-scrub-{}", std::process::id());
-  let segment = anchor_segment(&tag, &profile, &config);
-  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let anchor = held_anchor(&tag, &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   daemon
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -3108,7 +3108,7 @@ fn a_sealed_files_plaintext_leaves_the_content_object() {
   }
   let read = client.read(volume, "secret", slates_ipc::protocol::ReadAt::Head);
   daemon.stop();
-  drop(segment);
+  drop(anchor);
   assert!(
     written > 0,
     "the scan sees the open extent's plaintext right after the write (its control)"
@@ -3129,8 +3129,8 @@ fn an_idle_small_file_is_sealed_by_the_daemons_sweep() {
   let profile = common::machine_profile();
   let instance = format!("srv-idle-seal-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let segment = anchor_segment("idle-seal", &profile, &config);
-  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let anchor = held_anchor("idle-seal", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   daemon
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -3163,7 +3163,7 @@ fn an_idle_small_file_is_sealed_by_the_daemons_sweep() {
   let read = client.read(volume, "small", slates_ipc::protocol::ReadAt::Head);
   assert!(read.unwrap() == bytes, "the sealed file reads back");
   daemon.stop();
-  drop(segment);
+  drop(anchor);
 }
 
 /// Format: `NFS4ERR_NOENT` (RFC 8881 §15.1.4.6).
@@ -3225,9 +3225,9 @@ fn a_compound_retried_across_a_daemon_restart_is_answered_never_run_again() {
   let profile = common::machine_profile();
   let instance = format!("srv-v4-retry-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let segment = anchor_segment("v4retry", &profile, &config);
+  let anchor = held_anchor("v4retry", &profile, &config);
 
-  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   first
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -3253,7 +3253,7 @@ fn a_compound_retried_across_a_daemon_restart_is_answered_never_run_again() {
   );
   first.stop();
 
-  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   let port = second
     .nfs_port()
     .expect("the restarted daemon is serving NFS");
@@ -3294,7 +3294,7 @@ fn a_compound_retried_across_a_daemon_restart_is_answered_never_run_again() {
     "the restarted daemon answered both retried calls from its records ({answered})"
   );
   second.stop();
-  drop(segment);
+  drop(anchor);
 }
 
 /// An OPEN of `name` in the directory the session's `at` reaches, creating it `GUARDED` with mode 0644 for the
@@ -3356,9 +3356,9 @@ fn an_open_and_a_close_retried_across_a_daemon_restart_are_answered_never_run_ag
   let profile = common::machine_profile();
   let instance = format!("srv-v4-state-retry-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let segment = anchor_segment("v4stateretry", &profile, &config);
+  let anchor = held_anchor("v4stateretry", &profile, &config);
 
-  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   first
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -3375,7 +3375,7 @@ fn an_open_and_a_close_retried_across_a_daemon_restart_are_answered_never_run_ag
   let closed = close_kept(&mut closer, &capability, "closed", stateid).expect("the CLOSE");
   first.stop();
 
-  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   let port = second
     .nfs_port()
     .expect("the restarted daemon is serving NFS");
@@ -3409,7 +3409,7 @@ fn an_open_and_a_close_retried_across_a_daemon_restart_are_answered_never_run_ag
     "no retried call met its record under another digest"
   );
   second.stop();
-  drop(segment);
+  drop(anchor);
 }
 
 /// Format: `NFS4ERR_SHARE_DENIED` (RFC 8881 §15.1.3.6): an OPEN whose access another open denies.
@@ -3469,8 +3469,8 @@ fn a_dropped_clients_purge_owed_at_a_restart_is_sent_after_it() {
   let profile = common::machine_profile();
   let instance = format!("srv-v4-purge-owed-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let segment = anchor_segment("v4purgeowed", &profile, &config);
-  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let anchor = held_anchor("v4purgeowed", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   first
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -3505,7 +3505,7 @@ fn a_dropped_clients_purge_owed_at_a_restart_is_sent_after_it() {
     .unwrap_or(0);
   first.stop();
 
-  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   let port = second
     .nfs_port()
     .expect("the restarted daemon is serving NFS");
@@ -3531,7 +3531,7 @@ fn a_dropped_clients_purge_owed_at_a_restart_is_sent_after_it() {
     );
   }
   second.stop();
-  drop(segment);
+  drop(anchor);
   assert!(held.is_ok(), "A's open is granted: {held:?}");
   assert_eq!(
     denied.err(),
@@ -3565,9 +3565,9 @@ fn a_destroyed_sessions_records_are_purged_and_stay_purged_across_a_restart() {
   let profile = common::machine_profile();
   let instance = format!("srv-v4-purge-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let segment = anchor_segment("v4purge", &profile, &config);
+  let anchor = held_anchor("v4purge", &profile, &config);
 
-  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   first
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -3598,7 +3598,7 @@ fn a_destroyed_sessions_records_are_purged_and_stay_purged_across_a_restart() {
   );
   first.stop();
 
-  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   session.reconnect(
     second
       .nfs_port()
@@ -3621,7 +3621,7 @@ fn a_destroyed_sessions_records_are_purged_and_stay_purged_across_a_restart() {
     "no record of the destroyed session came back"
   );
   second.stop();
-  drop(segment);
+  drop(anchor);
 }
 
 /// §4.2, admission.md §5.5 (found as the flake of `an_extent_claimed_just_before_a_crash_is_returned_at_the_first_publication`
@@ -3638,8 +3638,8 @@ fn memory_others_take_from_a_roomy_host_is_held_only_where_it_eats_into_the_daem
   let instance = format!("srv-pressure-room-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
   let capacity = config.reserve_per_shard * u64::from(TEST_SHARDS);
-  let segment = anchor_segment("pressure-room", &profile, &config);
-  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let anchor = held_anchor("pressure-room", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   daemon.inject_resident_memory(SAMPLED_RESIDENT).unwrap();
   daemon.inject_available_memory(4 * capacity).unwrap();
   let sampled = within_sampler_wait(|| daemon.pressure_baseline() == Ok(Some(4 * capacity)));
@@ -3651,7 +3651,7 @@ fn memory_others_take_from_a_roomy_host_is_held_only_where_it_eats_into_the_daem
   let held = within_sampler_wait(|| withheld(&daemon) == Some(expected));
   let hold = withheld(&daemon);
   daemon.stop();
-  drop(segment);
+  drop(anchor);
   assert!(sampled, "the daemon took its first sample");
   assert!(
     !wrongly_held,
@@ -3692,15 +3692,15 @@ fn room_on(client: &mut Client, shard: u16, capacity: u64) -> Option<u64> {
 /// A placement-test daemon: two shards whose slices are `slice_units` pool units, its sampler shown a host with exactly
 /// its capacity free (no slack) and its own resident memory pinned. Returns the daemon, its anchor, a client, its
 /// capacity and its pool unit, once the sampler has taken its first sample.
-fn placement_daemon(name: &str, slice_units: u64) -> (Daemon, AnchorSegment, Client, u64, u64) {
+fn placement_daemon(name: &str, slice_units: u64) -> (Daemon, Anchor, Client, u64, u64) {
   let profile = common::machine_profile();
   let instance = format!("srv-placement-{name}-{}", std::process::id());
   let mut config = DaemonConfig::derive(&profile, &instance, Some(POOL_SHARDS));
   let unit = u64::try_from(config.pool_unit()).unwrap();
   config.reserve_per_shard = slice_units * unit;
   let capacity = config.reserve_per_shard * u64::from(POOL_SHARDS);
-  let segment = anchor_segment(&format!("placement-{name}"), &profile, &config);
-  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let anchor = held_anchor(&format!("placement-{name}"), &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   daemon
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -3711,7 +3711,7 @@ fn placement_daemon(name: &str, slice_units: u64) -> (Daemon, AnchorSegment, Cli
     "the daemon took its first sample"
   );
   let client = connect(&instance);
-  (daemon, segment, client, capacity, unit)
+  (daemon, anchor, client, capacity, unit)
 }
 
 /// §4.2, admission.md §5.5 (found 2026-10-09 reading the content pool beside the hold): the hold is the daemon's, so it
@@ -3722,7 +3722,7 @@ fn placement_daemon(name: &str, slice_units: u64) -> (Daemon, AnchorSegment, Cli
 /// (half the hold here; a fifth on a 5-shard laptop), while the pool (A-98) let it reach the whole capacity.
 #[test]
 fn a_pressured_daemons_hold_is_withheld_whole_from_a_volume_on_any_one_shard() {
-  let (daemon, segment, mut client, capacity, unit) =
+  let (daemon, anchor, mut client, capacity, unit) =
     placement_daemon("whole", PLACEMENT_SLICE_UNITS);
   let hold = PLACEMENT_HOLD_UNITS * unit;
   let before = [
@@ -3752,7 +3752,7 @@ fn a_pressured_daemons_hold_is_withheld_whole_from_a_volume_on_any_one_shard() {
   let pooled = daemon.pressure_pooled();
   let holds = daemon.pressure_holds();
   daemon.stop();
-  drop(segment);
+  drop(anchor);
   assert!(
     moved,
     "the hold reached both shards: before {before:?} after {after:?}"
@@ -3780,7 +3780,7 @@ fn a_pressured_daemons_hold_is_withheld_whole_from_a_volume_on_any_one_shard() {
 /// could still fill half of it.
 #[test]
 fn a_hold_the_pool_cannot_cover_is_taken_from_the_free_room_the_shards_hold() {
-  let (daemon, segment, mut client, capacity, unit) =
+  let (daemon, anchor, mut client, capacity, unit) =
     placement_daemon("residual", PLACEMENT_SLICE_UNITS);
   let bounded = |name: String, limit: u64| CreateSpec {
     size: SizeClass::Bounded { limit },
@@ -3801,7 +3801,7 @@ fn a_hold_the_pool_cannot_cover_is_taken_from_the_free_room_the_shards_hold() {
   let shard_1_after = room_on(&mut client, 1, capacity);
   let holds = daemon.pressure_holds();
   daemon.stop();
-  drop(segment);
+  drop(anchor);
   assert!(small.is_ok(), "the small volume is admitted: {small:?}");
   assert_eq!(
     holds,
@@ -3844,7 +3844,7 @@ const DEBT_HOLD_UNITS: u64 = 64;
 /// remainder with one more extent would hold back 128 units for a hold of 64, and leaving it out would hold back 2.
 #[test]
 fn a_hold_finer_than_the_pools_free_extents_is_owed_by_the_next_shard_to_grow() {
-  let (daemon, segment, mut client, capacity, unit) = placement_daemon("debt", DEBT_SLICE_UNITS);
+  let (daemon, anchor, mut client, capacity, unit) = placement_daemon("debt", DEBT_SLICE_UNITS);
   let hold = DEBT_HOLD_UNITS * unit;
   let before = [
     room_on(&mut client, 0, capacity),
@@ -3880,7 +3880,7 @@ fn a_hold_finer_than_the_pools_free_extents_is_owed_by_the_next_shard_to_grow() 
   let pooled = daemon.pressure_pooled();
   let holds = daemon.pressure_holds();
   daemon.stop();
-  drop(segment);
+  drop(anchor);
   assert!(
     moved,
     "the hold reached both shards: before {before:?} after {after:?}"

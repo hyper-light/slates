@@ -38,7 +38,7 @@ use slates_ipc::protocol::{
   AttachRequest, Direction, Intent, NamePolicy, ReadAt, Refusal, ReplyBody, RequestBody, Scope,
   SizeClass, SnapshotId, VolumeId, pack, unpack,
 };
-use slates_ipc::{ClientEnd, IpcError, connect};
+use slates_ipc::{ClientEnd, HeldRendezvous, IpcError, connect};
 use slates_machine::MachineProfile;
 use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
 use slates_server::daemon::{HEARTBEAT_NS, LIVENESS_BUDGET_NS, SessionHold, host_id_of};
@@ -1966,17 +1966,18 @@ fn fleet_config(
   })
 }
 
-/// An anchor segment with two recorded starts, exercising the handoff restart path.
-/// The supervision count is diagnostic; it does not derive voting identity (AUD-07).
-/// The returned segment must outlive its attached daemon.
+/// An anchor segment with two recorded starts, exercising the handoff restart path, and `instance`'s rendezvous, held
+/// beside it as the anchor holds it (A-114). The supervision count is diagnostic; it does not derive voting identity
+/// (AUD-07). What is returned beside the source must outlive its attached daemon.
 fn incarnation_one_segment(
-  name: &str,
+  (name, instance): (&str, &str),
   profile: &MachineProfile,
   geometry: Geometry,
   pid: u32,
-) -> (SegmentSource, AnchorSegment) {
+) -> (SegmentSource, (AnchorSegment, HeldRendezvous)) {
   let segment = AnchorSegment::create(name, &profile.facts.identity, geometry)
     .expect("the incarnation-one anchor segment");
+  let rendezvous = HeldRendezvous::hold(instance).expect("the instance's rendezvous");
   let supervision = segment
     .supervision()
     .expect("the segment's supervision block");
@@ -1988,8 +1989,9 @@ fn incarnation_one_segment(
       handoff,
       len,
       content: None,
+      rendezvous: rendezvous.adoption(),
     },
-    segment,
+    (segment, rendezvous),
   )
 }
 
@@ -2025,7 +2027,7 @@ fn a_restarted_peer_is_learned_on_contact_under_its_fresh_identity() {
   let _serial = serialize_fleet_tests();
   let pid = std::process::id();
   let mut fleet = restart_fleet_forms_and_seals(pid);
-  let (daemon_b_again, segment) = restart_b(&mut fleet, pid);
+  let (daemon_b_again, held) = restart_b(&mut fleet, pid);
   let observed: Vec<&Daemon> = vec![&fleet.survivors[0], &fleet.survivors[1], &daemon_b_again];
   let learned = observe_learned(&observed, &fleet, &daemon_b_again);
   let served_by = successor_serves(&observed, &fleet);
@@ -2041,7 +2043,7 @@ fn a_restarted_peer_is_learned_on_contact_under_its_fresh_identity() {
   for daemon in fleet.survivors {
     daemon.stop();
   }
-  drop(segment);
+  drop(held);
   assert_restart_learned(formed, knew_old, &learned);
   assert_successor_served(&served_by, &fleet.origin_owners);
   assert!(
@@ -2337,8 +2339,8 @@ fn restart_fleet_forms_and_seals(pid: u32) -> RestartFleet {
 }
 
 /// Restarts B over a handed-off anchor segment and observes its fresh member identity.
-/// The segment is returned so it outlives the daemon.
-fn restart_b(fleet: &mut RestartFleet, pid: u32) -> (Daemon, AnchorSegment) {
+/// The segment and its rendezvous are returned so they outlive the daemon.
+fn restart_b(fleet: &mut RestartFleet, pid: u32) -> (Daemon, (AnchorSegment, HeldRendezvous)) {
   let peers = std::mem::take(&mut fleet.peers_of_b_again);
   let identity = fleet
     .b_again
@@ -2352,8 +2354,11 @@ fn restart_b(fleet: &mut RestartFleet, pid: u32) -> (Daemon, AnchorSegment) {
     &peers,
     &fleet.domains,
   );
-  let (source, segment) = incarnation_one_segment(
-    &format!("slates-seg-fleet3-again-{}-{pid}", fleet.host_b.0),
+  let (source, held) = incarnation_one_segment(
+    (
+      &format!("slates-seg-fleet3-again-{}-{pid}", fleet.host_b.0),
+      &config.instance,
+    ),
     &fleet.profile_b,
     config.geometry,
     pid,
@@ -2372,7 +2377,7 @@ fn restart_b(fleet: &mut RestartFleet, pid: u32) -> (Daemon, AnchorSegment) {
       .expect("the restarted daemon reports its member id"),
     fleet.host_b
   );
-  (daemon, segment)
+  (daemon, held)
 }
 
 /// What the survivors learned of the restart on contact.
@@ -2516,7 +2521,7 @@ fn a_forged_announcement_is_refused_and_counted() {
   forged.stop();
   fleet.daemon_b.stop();
   fleet.daemon_a.stop();
-  drop(fleet.segment_b);
+  drop(fleet.held_b);
   assert!(
     learned_new,
     "A learned B's fresh id on contact and its mesh formed to it"
@@ -2532,8 +2537,8 @@ struct RefusalFleet {
   _ports: PortLease,
   daemon_a: Daemon,
   daemon_b: Daemon,
-  /// B's incarnation-one segment (the anchor recorded a restart on it), which outlives its daemon.
-  segment_b: AnchorSegment,
+  /// B's incarnation-one segment (the anchor recorded a restart on it) and its rendezvous, which outlive its daemon.
+  held_b: (AnchorSegment, HeldRendezvous),
   host_a: HostId,
   anchor_a: HostId,
   b_new: HostId,
@@ -2590,8 +2595,8 @@ fn refusal_fleet_forms(pid: u32) -> RefusalFleet {
       name: format!("slates-seg-{instance_a}"),
     },
   );
-  let (source_b, segment_b) = incarnation_one_segment(
-    &format!("slates-seg-{instance_b}"),
+  let (source_b, held_b) = incarnation_one_segment(
+    (&format!("slates-seg-{instance_b}"), &instance_b),
     &profile_b,
     config_b.geometry,
     pid,
@@ -2606,7 +2611,7 @@ fn refusal_fleet_forms(pid: u32) -> RefusalFleet {
     _ports,
     daemon_a,
     daemon_b,
-    segment_b,
+    held_b,
     host_a,
     anchor_a,
     b_new,
@@ -10300,12 +10305,17 @@ fn a_warm_fleet_restart_recovers_its_root_and_regional_quorums() {
       .unwrap()
     })
     .collect();
+  let rendezvous: Vec<_> = configs
+    .iter()
+    .map(|config| HeldRendezvous::hold(&config.instance).unwrap())
+    .collect();
   let source = |node: usize| {
     let (handoff, len) = segments[node].handoff().unwrap();
     SegmentSource::Handoff {
       handoff,
       len,
       content: None,
+      rendezvous: rendezvous[node].adoption(),
     }
   };
   let mut daemons: Vec<_> = profiles

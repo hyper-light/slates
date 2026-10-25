@@ -60,8 +60,8 @@ pub use endpoint::{ClientEnd, DaemonEnd, Reply, Request};
 pub use error::IpcError;
 pub use region::{ClientRegion, RegionGeometry};
 pub use rendezvous::{
-  Accepted, CLAIM_WAIT_NS, Claim, Connected, Doorbell, Listener, Liveness, Prepared,
-  begin_connect_as, connect, connect_as, instance_from_env,
+  Accepted, Adoption, CLAIM_WAIT_NS, Claim, Connected, Doorbell, HeldRendezvous, Listener,
+  Liveness, Prepared, begin_connect_as, connect, connect_as, instance_from_env,
 };
 pub use slot::{PAYLOAD_BYTES, Slot, SlotKind};
 

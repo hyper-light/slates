@@ -36,7 +36,7 @@ use slates_server::{Daemon, DaemonConfig, SegmentSource};
 use slates_wire::request::RequestId;
 
 mod common;
-use common::anchor::{anchor_segment, source_of};
+use common::anchor::{held_anchor, source_of};
 use common::nfs::{create, lookup, lookup_status, mkdir, mount, read, remove_status, write};
 
 /// Shape: the reply deadline (nanoseconds): five seconds, far past any served verb.
@@ -933,8 +933,8 @@ fn a_guests_acknowledged_close_survives_a_daemon_restart() {
   let profile = common::machine_profile();
   let instance = format!("srv-shards-durable-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(1));
-  let segment = anchor_segment("shards-durable", &profile, &config);
-  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let anchor = held_anchor("shards-durable", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   first
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -958,7 +958,7 @@ fn a_guests_acknowledged_close_survives_a_daemon_restart() {
   first.stop();
   assert!(guest.ended(), "the stop ended the stream");
 
-  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   let mut client = Client::connect(&instance);
   assert_eq!(
     status(&mut client, id).attachments,
@@ -981,7 +981,7 @@ fn a_guests_acknowledged_close_survives_a_daemon_restart() {
   drop(client);
   drop(host);
   second.stop();
-  drop(segment);
+  drop(anchor);
 }
 
 /// §3 the teardown sweep, by use. Do: the host writes a file over NFS; a guest looks it up through the stream (a
@@ -1671,8 +1671,8 @@ fn stores_reach_the_volume_at_fsync_and_survive_a_restart(slices: Slices) {
   let name = format!("shards-dax-ingest-{}", slices.tag());
   let instance = format!("srv-{name}-{}", std::process::id());
   let config = slices.applied(DaemonConfig::derive(&profile, &instance, Some(1)));
-  let segment = anchor_segment(&name, &profile, &config);
-  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let anchor = held_anchor(&name, &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   first
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -1704,14 +1704,14 @@ fn stores_reach_the_volume_at_fsync_and_survive_a_restart(slices: Slices) {
   first.stop();
   assert!(guest.ended(), "the stop ended the stream");
 
-  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   assert_eq!(
     volume_bytes(&second, id, "mapped", u64::try_from(late).unwrap(), 17),
     b"stored past a MiB",
     "the ingested stores survived the restart"
   );
   second.stop();
-  drop(segment);
+  drop(anchor);
 }
 
 /// AC (Shards part 3, step 3), by use. Do: map three files' first ranges writable and store a marker through each; then

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use slates_anchor::ENV_NFS_LISTENER;
 use slates_anchor::{AnchorSegment, RegionKind};
 use slates_db::catalog::Principal;
-use slates_ipc::{ClientRegion, Listener, Prepared};
+use slates_ipc::{Adoption, ClientRegion, Listener, Prepared};
 use slates_machine::facts::Identity;
 use slates_machine::{MachineProfile, derived};
 use slates_mem::arena::ChunkArena;
@@ -95,17 +95,19 @@ pub enum SessionHold {
   },
 }
 
-/// Where the segment comes from.
+/// Where the segment comes from, and with it the client rendezvous: what an anchor holds for its daemons (§4.8,
+/// A-114), or nothing.
 #[derive(Clone, Debug)]
 pub enum SegmentSource {
-  /// Create a fresh segment (tests, the first start without an anchor).
+  /// Create a fresh segment and a fresh rendezvous (tests, a daemon run alone without an anchor).
   Create {
     /// The object's name.
     name: String,
   },
-  /// Attach the segment the anchor handed over in the environment.
+  /// Attach the segment the anchor handed over in the environment and adopt the rendezvous it named there.
   FromEnv,
-  /// Attach a segment by its handoff (an anchor in this process: tests, embeddings).
+  /// Attach a segment by its handoff and adopt the rendezvous held beside it (an anchor in this process: tests,
+  /// embeddings).
   Handoff {
     /// The handoff.
     handoff: Handoff,
@@ -114,6 +116,10 @@ pub enum SegmentSource {
     /// The content object's handoff and length, if the anchor made one, so its shard content
     /// survives the restart (§4.8). `None` recreates content empty on rebuild as before (BUG-11).
     content: Option<(Handoff, usize)>,
+    /// The rendezvous the anchor holds, which every daemon it starts adopts (A-114): a client that connects while
+    /// one daemon stops is answered by the next, and on Windows, where a section's name lives while any client still
+    /// maps it, no daemon after the first could otherwise make its own.
+    rendezvous: Adoption,
   },
 }
 
@@ -339,10 +345,15 @@ pub static HANDOFF_LOST: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// reaped client (the control shard's channel full or gone when the forget task was sent): each is a
 /// slot of the client bound held until the daemon restarts, counted here and logged once, never silent.
 pub static RELEASE_LOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Accept rounds of the rendezvous that ended in an error other than a typed refusal (a peer's socket
-/// refusing mid-handoff, a region that could not be created): counted here and logged once, where before
-/// the round's error was dropped and the peer left with no handoff.
+/// Accept rounds the rendezvous itself ended early (an `accept` the kernel refused, a claim table that could
+/// not be read): counted here and logged once; the round keeps the clients it had accepted, and the next
+/// round serves what is still pending.
 pub static ACCEPTS_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Claims the rendezvous refused for a reason other than the client bound or another uid (a peer's socket
+/// refusing mid-handoff, a region that could not be created), each answered to its claimant: counted here
+/// and logged once. Since A-176 such a refusal ends that claim alone; before, it failed its whole accept
+/// round, and the clients the round had already accepted and answered were dropped unserved.
+pub static CLAIMS_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Gives `client_id` back to the control shard's live set (`state::with_handed`), from any shard: directly
 /// when the caller runs on the control shard, otherwise as a forget task on it (sharing by move). A forget
@@ -608,6 +619,13 @@ impl Daemon {
       });
     }
     let identity = profile.facts.identity.clone();
+    // The rendezvous comes from wherever the segment does (A-114): an anchor across the spawn names both in the
+    // environment, an anchor in this process hands both over, and a daemon with no anchor makes its own.
+    let adoption = match &source {
+      SegmentSource::Create { .. } => None,
+      SegmentSource::FromEnv => Adoption::from_env()?,
+      SegmentSource::Handoff { rendezvous, .. } => Some(rendezvous.clone()),
+    };
     let mut segment = match source {
       SegmentSource::Create { name } => {
         let content_name = content_name_of(&name);
@@ -619,6 +637,7 @@ impl Daemon {
         handoff,
         len,
         content,
+        rendezvous: _,
       } => {
         let mut segment = AnchorSegment::attach(&handoff, len, &identity)?;
         if let Some((content_handoff, content_len)) = content {
@@ -645,6 +664,7 @@ impl Daemon {
     slates_transport::handshake::secure_random(&mut issuer_secret)
       .map_err(|e| ServerError::IssuerSecret(e.to_string()))?;
     segment.publish_issuer_secret(&issuer_secret)?;
+    let region_names = region_name_key(&issuer_secret);
     // The node's sealing root (A-92): adopted from the previous daemon under this anchor, or made and published into
     // the anchor's locked page; sealing reports itself unavailable, never unlocked, where the OS refuses the lock.
     let sealing = crate::seal_keys::init(&mut segment, config.seal_key_slots);
@@ -708,7 +728,7 @@ impl Daemon {
       })?;
     }
     // The rendezvous and the doorbell.
-    let listener = Listener::open(&config.instance)?;
+    let listener = Listener::open(&config.instance, adoption.as_ref())?;
     let kicks: Vec<slates_rt::driver::Kick> = shards
       .iter()
       .filter_map(|s| registry::with_entry(s.0, |e| e.kick))
@@ -734,6 +754,7 @@ impl Daemon {
         control_env,
         control_identity,
         shard_ids,
+        region_names,
       ));
       // Construct the control future on its owning shard: recovery owns thread-local
       // cross-shard reply registrations, which must never migrate between threads.
@@ -2718,11 +2739,27 @@ pub fn host_id_of(identity: &Identity) -> u64 {
 /// must never equal — the record link keeps its pending dial across the placeholder's replacement on
 /// exactly that promise (`fleet::refresh_record_identity_in`). A zero digest word (odds 2⁻⁶⁴) becomes one.
 fn boot_incarnation(secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES]) -> u64 {
-  let digest = blake3::keyed_hash(secret, b"slates/member-incarnation/v1");
+  keyed_word(secret, b"slates/member-incarnation/v1").max(1)
+}
+
+/// The first eight bytes of `domain`'s keyed hash under `secret`, read as a little-endian word.
+fn keyed_word(secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES], domain: &[u8]) -> u64 {
+  let digest = blake3::keyed_hash(secret, domain);
   let mut word = [0; size_of::<u64>()];
   let (head, _) = digest.as_bytes().split_at(size_of::<u64>());
   word.copy_from_slice(head);
-  u64::from_le_bytes(word).max(1)
+  u64::from_le_bytes(word)
+}
+
+/// The key this daemon names its client regions under (A-176), derived with a keyed-hash domain of its own from the
+/// fresh secret minted at every start, so no daemon names a region as an earlier one did. Windows keeps a section's
+/// name while any process maps it, and a client reconnecting after a restart still maps the region the dead daemon
+/// made it: a name made of the instance and the client's id, which a reconnect keeps, was refused
+/// `ERROR_ALREADY_EXISTS`, and the client's session ended `DaemonGone` where it should have resumed (AC-2.3). The name
+/// is `slates-cr-`, this key in sixteen hex digits, `-` and the region's number in eight (35 bytes), within the 40 a
+/// claim slot's answer holds on macOS and Windows.
+fn region_name_key(secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES]) -> u64 {
+  keyed_word(secret, b"slates/client-region-name/v1")
 }
 
 /// The content object's name for a segment named `seg_name`: the segment name with its `seg`
@@ -4224,13 +4261,15 @@ fn reserve_client_identity(client: u32, instance: &str) -> Result<(), slates_ipc
 }
 
 /// The control shard's loop: the rendezvous, the heartbeat, and a client handed to its shard
-/// as a spawned task (sharing by move).
+/// as a spawned task (sharing by move). Every client region is named under `region_names`
+/// ([`region_name_key`]).
 async fn control_loop(
   mut listener: Listener,
   config: DaemonConfig,
   env: Vec<(String, String)>,
   identity: Identity,
   shards: Vec<ShardId>,
+  region_names: u64,
 ) {
   let Ok((handoff, len)) = handoff_of(&env) else {
     return;
@@ -4273,8 +4312,12 @@ async fn control_loop(
     ["clients_per_shard", "shards"]
   )
   .get();
+  // The regions this daemon has made, which numbers the next one's name. It wraps: a name then repeats only for a
+  // region made four billion regions earlier, and only a holder still mapping that one refuses the new connection,
+  // typed, as any refused region does; the next attempt takes the next number.
+  let mut regions_made: u32 = 0;
   loop {
-    let accepted = listener.accept_pending(
+    let round = listener.accept_pending(
       &|id| state::with_handed(|h| h.contains(&id)),
       &mut |client_id| {
         if state::with_handed(|h| h.len()) >= bound {
@@ -4298,12 +4341,9 @@ async fn control_loop(
           });
         };
         state::with_handed(|h| h.insert(client_id));
-        let region = match ClientRegion::create(
-          &format!("slates-cr-{}-{client_id}", config.instance),
-          client_id,
-          shard.0,
-          config.region,
-        ) {
+        let name = format!("slates-cr-{region_names:016x}-{regions_made:08x}");
+        regions_made = regions_made.wrapping_add(1);
+        let region = match ClientRegion::create(&name, client_id, shard.0, config.region) {
           Ok(region) => region,
           Err(e) => {
             state::with_handed(|h| h.remove(&client_id));
@@ -4315,34 +4355,38 @@ async fn control_loop(
           kick_fd: kick_fd_of(shard),
         })
       },
+      // A claim refused, each answered to its claimant, ends that claim alone (A-176). One admitted (its id
+      // reserved) whose handoff then failed gives the id back; each kind is counted and its first logged.
+      &mut |refusal| match refusal {
+        slates_ipc::IpcError::HandoffLost { client_id, cause } => {
+          state::with_handed(|h| h.remove(&client_id));
+          if HANDOFF_LOST.fetch_add(1, Ordering::AcqRel) == 0 {
+            eprintln!(
+              "slates-server: client {client_id}'s handoff failed after admission: {cause} (first \
+               occurrence; later ones are counted)"
+            );
+          }
+        }
+        refusal => {
+          if CLAIMS_REFUSED.fetch_add(1, Ordering::AcqRel) == 0 {
+            eprintln!(
+              "slates-server: a client's claim was refused: {refusal} (first occurrence; later ones \
+               are counted)"
+            );
+          }
+        }
+      },
     );
-    let accepted = match accepted {
-      Ok(accepted) => accepted,
-      // The client was admitted (its id reserved) and its handoff then failed: the id goes back, the
-      // loss is counted and logged once. Any other failure of the round is counted and logged once;
-      // the round admitted nothing.
-      Err(slates_ipc::IpcError::HandoffLost { client_id, cause }) => {
-        state::with_handed(|h| h.remove(&client_id));
-        if HANDOFF_LOST.fetch_add(1, Ordering::AcqRel) == 0 {
-          eprintln!(
-            "slates-server: client {client_id}'s handoff failed after admission: {cause} (first \
-             occurrence; later ones are counted)"
-          );
-        }
-        Vec::new()
-      }
-      Err(e) => {
-        if ACCEPTS_FAILED.fetch_add(1, Ordering::AcqRel) == 0 {
-          eprintln!(
-            "slates-server: a rendezvous accept round failed: {e} (first occurrence; later ones are \
-             counted)"
-          );
-        }
-        Vec::new()
-      }
-    };
+    if let Some(failure) = round.ended
+      && ACCEPTS_FAILED.fetch_add(1, Ordering::AcqRel) == 0
     {
-      for a in accepted {
+      eprintln!(
+        "slates-server: a rendezvous accept round ended early: {failure} (first occurrence; later \
+         ones are counted)"
+      );
+    }
+    {
+      for a in round.accepted {
         let shard = ShardId(a.region.shard());
         let principal = Principal::Uid { uid: a.uid };
         let client_id = a.client_id;
@@ -5037,12 +5081,14 @@ mod tests {
     let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
     let segment =
       AnchorSegment::create(&instance, &profile.facts.identity, config.geometry).unwrap();
+    let rendezvous = slates_ipc::HeldRendezvous::hold(&instance).unwrap();
     let source = || {
       let (handoff, len) = segment.handoff().unwrap();
       super::SegmentSource::Handoff {
         handoff,
         len,
         content: None,
+        rendezvous: rendezvous.adoption(),
       }
     };
     let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();

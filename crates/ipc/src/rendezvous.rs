@@ -16,7 +16,14 @@
 //!   and marks the slot done so the daemon can reclaim it. Liveness of a client is its
 //!   heartbeat slot (§4.7's "slot heartbeat lapse").
 //! - Windows: the same bootstrap shape over a `Local\` section (the DACL is the
-//!   authentication); the named Event per client arrives with the Windows bridge (Phase 4).
+//!   authentication), with a named Event per claim slot. A section's name lives while any
+//!   process maps it and cannot be unlinked, and every connected client's doorbell maps the
+//!   object, so its owner (the anchor, or a daemon run alone) holds a token only it opens and
+//!   takes over an object a dead owner's clients still map (A-176).
+//!
+//! A daemon adopts the rendezvous its anchor holds when it is handed an [`Adoption`] (across a
+//! spawn in [`ENV_RENDEZVOUS`], or from an anchor in its own process), else makes its own. A
+//! claim refused in an accept round ends that claim alone (A-176).
 //!
 //! Discovery: `SLATES_ENDPOINT` names the instance; else the well-known name `default`.
 
@@ -87,6 +94,24 @@ impl Accepted {
   }
 }
 
+/// What one accept round served (A-176): every client it accepted, each answered with its region, and the failure of
+/// the rendezvous itself that ended it early, if one did (the next round tries again with what is still pending).
+pub struct Round {
+  /// The clients accepted.
+  pub accepted: Vec<Accepted>,
+  /// The failure that ended the round before every pending claim was served.
+  pub ended: Option<IpcError>,
+}
+
+/// What serving one pending claim came to.
+pub enum Served {
+  /// Accepted and answered with its region (boxed: on Linux the accepted client's control socket and
+  /// completion signal make it several times the size of a refusal).
+  Accepted(Box<Accepted>),
+  /// Refused and told so where the claimant can still be reached; the claim is over, and the round goes on.
+  Refused(IpcError),
+}
+
 /// What the daemon opens once: the listener (Linux) or the bootstrap object (macOS, Windows).
 pub struct Listener {
   inner: platform::Listener,
@@ -135,18 +160,50 @@ impl HeldRendezvous {
     })
   }
 
-  /// The [`ENV_RENDEZVOUS`] value that hands this rendezvous to a daemon the anchor spawns.
-  pub fn env_value(&self) -> String {
-    self.inner.env_value()
+  /// How a daemon adopts this rendezvous: handed to a daemon the anchor spawns in [`ENV_RENDEZVOUS`], or directly to
+  /// one an anchor in this process starts.
+  pub fn adoption(&self) -> Adoption {
+    Adoption {
+      value: self.inner.env_value(),
+    }
+  }
+}
+
+/// How a daemon adopts the rendezvous its anchor holds (A-114): on Linux the held listening socket's descriptor number
+/// (duplicated by the daemon, never owned), on macOS and Windows `held` (the bootstrap object is found by the instance's
+/// name). It crosses a spawn in [`ENV_RENDEZVOUS`] and is handed over directly by an anchor in this process (tests,
+/// embeddings), as a segment's handoff is, so nothing below the daemon's start reads the environment: an anchor in a
+/// test process could hand one daemon its rendezvous only by setting a variable every daemon of that process reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Adoption {
+  value: String,
+}
+
+impl Adoption {
+  /// The adoption a supervising anchor handed across the spawn, if [`ENV_RENDEZVOUS`] is set (none: no anchor holds
+  /// this daemon's rendezvous). A value that is not text is refused rather than taken for no anchor.
+  pub fn from_env() -> Result<Option<Adoption>, IpcError> {
+    match std::env::var(ENV_RENDEZVOUS) {
+      Ok(value) => Ok(Some(Adoption { value })),
+      Err(std::env::VarError::NotPresent) => Ok(None),
+      Err(std::env::VarError::NotUnicode(_)) => Err(IpcError::Layout {
+        reason: "the anchor's rendezvous variable is not text",
+      }),
+    }
+  }
+
+  /// The value a spawning anchor sets in [`ENV_RENDEZVOUS`].
+  pub fn env_value(&self) -> &str {
+    &self.value
   }
 }
 
 impl Listener {
-  /// Opens the daemon's end of the rendezvous for `instance`: the one a supervising anchor holds when
-  /// [`ENV_RENDEZVOUS`] names it (adopted, its pending claims answered), else a fresh one this daemon owns.
-  pub fn open(instance: &str) -> Result<Listener, IpcError> {
+  /// Opens the daemon's end of the rendezvous for `instance`: the one its anchor holds when `adoption` names it
+  /// (adopted, its pending claims answered), else a fresh one this daemon owns.
+  pub fn open(instance: &str, adoption: Option<&Adoption>) -> Result<Listener, IpcError> {
     Ok(Listener {
-      inner: platform::Listener::open(instance)?,
+      inner: platform::Listener::open(instance, adoption.map(Adoption::env_value))?,
       next_client: 1,
       refused: 0,
       capacity_refused: 0,
@@ -162,13 +219,20 @@ impl Listener {
   /// Serves every pending connection without blocking: for each, `make_region` builds the
   /// client's region (the daemon's derivation of its geometry and shard) for the id the
   /// daemon assigns (the peer's wanted id when `in_use` says it is free, else a fresh one),
-  /// and the handoff is completed. A refused peer is counted and skipped.
+  /// and the handoff is completed. A peer of another uid and a connect past the client bound
+  /// are counted and answered; any other claim refused is answered to its claimant and handed
+  /// to `refused` (a `HandoffLost` names the id to give back), and the round goes on: one
+  /// claim's refusal never costs the round a client it accepted (A-176).
   pub fn accept_pending(
     &mut self,
     in_use: &dyn Fn(u32) -> bool,
     make_region: &mut dyn FnMut(u32) -> Result<Prepared, IpcError>,
-  ) -> Result<Vec<Accepted>, IpcError> {
-    let mut out = Vec::new();
+    refused: &mut dyn FnMut(IpcError),
+  ) -> Round {
+    let mut round = Round {
+      accepted: Vec::new(),
+      ended: None,
+    };
     loop {
       let mut assign = |wanted: u32| -> u32 {
         let assigned = if wanted != 0 && !in_use(wanted) {
@@ -183,20 +247,25 @@ impl Listener {
         assigned
       };
       match self.inner.accept_one(&mut assign, make_region) {
-        Ok(Some(accepted)) => {
-          out.push(accepted);
-        }
+        Ok(Some(Served::Accepted(accepted))) => round.accepted.push(*accepted),
         Ok(None) => break,
-        Err(IpcError::PeerRefused { .. }) => self.refused = self.refused.saturating_add(1),
+        Ok(Some(Served::Refused(IpcError::PeerRefused { .. }))) => {
+          self.refused = self.refused.saturating_add(1)
+        }
         // Answered typed to the client by the platform's `accept_one` (the bound in the refusal),
         // counted here, and the next pending connection is served: a full daemon keeps answering.
-        Err(IpcError::TooManyClients { .. }) => {
+        Ok(Some(Served::Refused(IpcError::TooManyClients { .. }))) => {
           self.capacity_refused = self.capacity_refused.saturating_add(1)
         }
-        Err(e) => return Err(e),
+        Ok(Some(Served::Refused(refusal))) => refused(refusal),
+        // The rendezvous itself failed: the round ends with what it accepted, and the next one tries again.
+        Err(failure) => {
+          round.ended = Some(failure);
+          break;
+        }
       }
     }
-    Ok(out)
+    round
   }
 
   /// Cross-uid connects refused so far.
@@ -535,7 +604,7 @@ pub mod platform {
   };
   use slates_mem::Handoff;
 
-  use super::{Accepted, Connected, Doorbell, Prepared, rendezvous_name};
+  use super::{Accepted, Connected, Doorbell, Prepared, Served, rendezvous_name};
   use crate::error::IpcError;
   use crate::region::ClientRegion;
 
@@ -954,9 +1023,10 @@ pub mod platform {
     }
   }
 
-  /// Adopts the listening socket an anchor handed over at descriptor `value`: duplicated close-on-exec (the inherited
-  /// number stays the process's, as an inherited segment's does), made non-blocking, and refused unless it listens at
-  /// `instance`'s own address — a number that names anything else is not this instance's rendezvous.
+  /// Adopts the listening socket an anchor handed over at descriptor `value`: duplicated close-on-exec (the number stays
+  /// the anchor's, inherited across the spawn or held by an anchor in this process, as a segment's handoff does), made
+  /// non-blocking, and refused unless it listens at `instance`'s own address — a number that names anything else is not
+  /// this instance's rendezvous.
   fn adopt(instance: &str, value: &str) -> Result<OwnedFd, IpcError> {
     use std::os::fd::BorrowedFd;
     let raw = value
@@ -966,9 +1036,9 @@ pub mod platform {
       .ok_or(IpcError::Layout {
         reason: "the anchor's rendezvous descriptor is not a number",
       })?;
-    // SAFETY: the anchor made this listening socket inheritable and handed it across the spawn at this number; it stays
-    // open for the process's life (nothing here closes the inherited number), and the borrow lasts only for the
-    // duplication.
+    // SAFETY: the anchor made this listening socket and handed over its number, across the spawn (inherited, open for
+    // the process's life) or within this process (held by the anchor for its own life, which spans every daemon it
+    // starts); nothing here closes the number, and the borrow lasts only for the duplication.
     let inherited = unsafe { BorrowedFd::borrow_raw(raw) };
     let socket = rustix::io::fcntl_dupfd_cloexec(inherited, 0).map_err(|e| refused("dup", e))?;
     rustix::io::ioctl_fionbio(&socket, true).map_err(|e| refused("ioctl(FIONBIO)", e))?;
@@ -983,10 +1053,10 @@ pub mod platform {
   }
 
   impl Listener {
-    pub(super) fn open(instance: &str) -> Result<Listener, IpcError> {
-      let socket = match std::env::var(super::ENV_RENDEZVOUS) {
-        Ok(value) => adopt(instance, &value)?,
-        Err(_) => listening(instance, SocketFlags::CLOEXEC)?,
+    pub(super) fn open(instance: &str, adoption: Option<&str>) -> Result<Listener, IpcError> {
+      let socket = match adoption {
+        Some(value) => adopt(instance, value)?,
+        None => listening(instance, SocketFlags::CLOEXEC)?,
       };
       Ok(Listener {
         socket,
@@ -1007,16 +1077,32 @@ pub mod platform {
       Some(self.socket.as_raw_fd())
     }
 
+    /// Accepts the next pending connection and serves it. A failure of the accept itself is the
+    /// rendezvous's (the round ends); anything after it is that one connection's refusal (A-176).
     pub(super) fn accept_one(
       &mut self,
       assign: &mut dyn FnMut(u32) -> u32,
       make_region: &mut dyn FnMut(u32) -> Result<Prepared, IpcError>,
-    ) -> Result<Option<Accepted>, IpcError> {
+    ) -> Result<Option<Served>, IpcError> {
       let peer = match rustix::net::accept_with(&self.socket, SocketFlags::CLOEXEC) {
         Ok(fd) => fd,
         Err(rustix::io::Errno::AGAIN) => return Ok(None),
         Err(e) => return Err(refused("accept", e)),
       };
+      Ok(Some(match self.serve(peer, assign, make_region) {
+        Ok(accepted) => Served::Accepted(Box::new(accepted)),
+        Err(refusal) => Served::Refused(refusal),
+      }))
+    }
+
+    /// Serves one accepted connection: its credentials, its hello, its region and the handoff. Every
+    /// failure here is this connection's alone, and the peer is told what it can be told.
+    fn serve(
+      &mut self,
+      peer: OwnedFd,
+      assign: &mut dyn FnMut(u32) -> u32,
+      make_region: &mut dyn FnMut(u32) -> Result<Prepared, IpcError>,
+    ) -> Result<Accepted, IpcError> {
       let cred = sockopt::socket_peercred(&peer).map_err(|e| refused("SO_PEERCRED", e))?;
       let uid = cred.uid.as_raw();
       if uid != self.uid {
@@ -1094,7 +1180,7 @@ pub mod platform {
         SendFlags::empty(),
       )
       .map_err(|e| lost(refused("sendmsg", e)))?;
-      Ok(Some(Accepted {
+      Ok(Accepted {
         client_id,
         uid,
         pid: u32::try_from(cred.pid.as_raw_nonzero().get()).unwrap_or(0),
@@ -1103,7 +1189,7 @@ pub mod platform {
           socket: peer,
           completion,
         }),
-      }))
+      })
     }
   }
 
@@ -1677,7 +1763,7 @@ pub mod platform {
 
   use slates_mem::{Handoff, SharedObject, Width, WordRun, Words};
 
-  use super::{Accepted, CLAIM_WAIT_NS, Connected, Doorbell, Prepared, rendezvous_name};
+  use super::{Accepted, CLAIM_WAIT_NS, Connected, Doorbell, Prepared, Served, rendezvous_name};
   use crate::error::IpcError;
   use crate::region::ClientRegion;
   #[cfg(not(windows))]
@@ -1885,6 +1971,22 @@ pub mod platform {
     /// The instance, for the doorbell waiters' own handles.
     #[cfg(windows)]
     instance: String,
+    /// This daemon's ownership of the object when it made its own (A-176); none when it adopted its anchor's.
+    _owner: Option<Owner>,
+  }
+
+  impl Drop for Listener {
+    /// A daemon that stops takes back the start stamp it published, so its clients judge it gone at their next liveness
+    /// question, as Linux's do when its control socket closes (A-176). With an anchor holding the object, a stopped
+    /// daemon's stamp otherwise stays published, and a client in the daemon's own process, whose exit watch sees no
+    /// exit, judged it alive for good; on Windows a client's own doorbell kept even an unheld object, and its stamp,
+    /// alive. By exchange, so a successor's stamp is never taken back.
+    fn drop(&mut self) {
+      if let Ok(word) = self.object.atomic_u64(AT_GENERATION) {
+        // Refused only when a successor has stamped the object since, whose stamp is to be left as it is.
+        let _ = word.compare_exchange(self.stamp, 0, Ordering::AcqRel, Ordering::Acquire);
+      }
+    }
   }
 
   /// The name of claim slot `index`'s READY Event (Windows), derived from the bootstrap object's
@@ -2059,11 +2161,81 @@ pub mod platform {
     Ok((stamp, read_u32(object, at.saturating_add(AT_ANSWERED_PID))?))
   }
 
-  /// A fresh bootstrap object for `instance`: the header's magic and slot count, every slot free, nothing published
-  /// (the start stamp zero until a daemon writes it).
-  fn fresh(instance: &str) -> Result<SharedObject, IpcError> {
-    let mut object =
-      SharedObject::create(&rendezvous_name(instance), OBJECT_BYTES, bootstrap_words())?;
+  /// What makes a process the owner of an instance's bootstrap object (A-176): the anchor that holds it, or a daemon
+  /// run alone that made its own. On Windows a named Event created only if no live process holds one by that name,
+  /// kept for the owner's life and opened by no one else, so its name lives exactly as long as the owner. The
+  /// section's own name cannot tell that: it lives while any process maps it, and every connected client's doorbell
+  /// maps it, so a dead owner's object outlives it in its clients. macOS needs no token: an owner unlinks a dead one's
+  /// name and makes its own object.
+  pub(super) struct Owner {
+    #[cfg(windows)]
+    _token: crate::wake::Event,
+  }
+
+  /// The name of the owner's token (Windows), beside the bootstrap object's.
+  #[cfg(windows)]
+  fn owner_token_name(instance: &str) -> String {
+    format!("{}-owner", rendezvous_name(instance))
+  }
+
+  /// Takes ownership of `instance`'s rendezvous, refused while a live process holds it: a daemon of the instance, or
+  /// its anchor.
+  #[cfg(windows)]
+  fn take_ownership(instance: &str) -> Result<Owner, IpcError> {
+    let token = crate::wake::Event::create_new(&owner_token_name(instance))?.ok_or_else(|| {
+      IpcError::InstanceHeld {
+        instance: instance.to_owned(),
+      }
+    })?;
+    Ok(Owner { _token: token })
+  }
+
+  /// The paired arm: macOS's owner needs no token.
+  #[cfg(not(windows))]
+  fn take_ownership(_instance: &str) -> Result<Owner, IpcError> {
+    Ok(Owner {})
+  }
+
+  /// A fresh bootstrap object for `instance`, owned by this process: the header's magic and slot count, every slot
+  /// free, nothing published (the start stamp zero until a daemon writes it). On Windows a dead owner's object that
+  /// its clients still map is taken over instead ([`owned_object`]).
+  fn fresh(instance: &str) -> Result<(SharedObject, Owner), IpcError> {
+    let owner = take_ownership(instance)?;
+    Ok((owned_object(instance)?, owner))
+  }
+
+  /// macOS: the object made new; `SharedObject::create` unlinks a dead owner's name first.
+  #[cfg(not(windows))]
+  fn owned_object(instance: &str) -> Result<SharedObject, IpcError> {
+    initialized(SharedObject::create(
+      &rendezvous_name(instance),
+      OBJECT_BYTES,
+      bootstrap_words(),
+    )?)
+  }
+
+  /// Windows: the object a dead owner left while its clients still map it, taken over; else one made new. This
+  /// process holds the owner's token, so no live owner holds the object, and no other owner makes one by its name
+  /// meanwhile.
+  #[cfg(windows)]
+  fn owned_object(instance: &str) -> Result<SharedObject, IpcError> {
+    let handoff =
+      SharedObject::handoff_for_name(&rendezvous_name(instance)).ok_or(IpcError::Unsupported {
+        feature: "rendezvous by name",
+      })?;
+    match SharedObject::open(&handoff, OBJECT_BYTES, bootstrap_words()) {
+      Ok(left) => take_over(left),
+      // None to open: one is made. Whatever kept the open from finding one, a creation that fails too says why.
+      Err(_) => initialized(SharedObject::create(
+        &rendezvous_name(instance),
+        OBJECT_BYTES,
+        bootstrap_words(),
+      )?),
+    }
+  }
+
+  /// A new object's header and table: the magic, the slot count, every slot free.
+  fn initialized(mut object: SharedObject) -> Result<SharedObject, IpcError> {
     object.write(0, &MAGIC.to_le_bytes())?;
     object.write(
       AT_SLOT_COUNT,
@@ -2075,17 +2247,56 @@ pub mod platform {
     Ok(object)
   }
 
+  /// A dead owner's object taken over (Windows, A-176): refused unless it is this layout's, its claims readied as a
+  /// restarted daemon readies them ([`readied`]), and nothing published and no anchor named until the new owner says
+  /// so. Its dead daemon's clients then judge it gone, and their claims are answered by the next daemon.
+  #[cfg(windows)]
+  fn take_over(left: SharedObject) -> Result<SharedObject, IpcError> {
+    let mut object = readied(
+      left,
+      "the rendezvous's name holds an object of another layout",
+    )?;
+    object
+      .atomic_u64(AT_GENERATION)?
+      .store(0, Ordering::Release);
+    object.write(AT_ANCHOR_PID, &0u32.to_le_bytes())?;
+    Ok(object)
+  }
+
+  /// `object`, refused with `reason` unless it is this layout's (its magic and slot count), with its slots readied
+  /// for the daemon that answers them now: a claim the last daemon took (`ANSWERING`) and never answered goes back to
+  /// `CLAIMED`, to be answered now; a slot its claimant finished (`DONE`) is freed. A claim still being written, one
+  /// published, and an answer not yet read are left as they are, for the accept and the stale reclaim.
+  fn readied(object: SharedObject, reason: &'static str) -> Result<SharedObject, IpcError> {
+    if read_u32(&object, 0)? != MAGIC
+      || usize::try_from(read_u32(&object, AT_SLOT_COUNT)?).ok() != Some(SLOTS)
+    {
+      return Err(IpcError::Layout { reason });
+    }
+    for i in 0..SLOTS {
+      let word = state(&object, i)?;
+      // Each exchange is refused for a slot in any other state, which is then left as it is.
+      let _ = word.compare_exchange(ANSWERING, CLAIMED, Ordering::AcqRel, Ordering::Acquire);
+      let _ = word.compare_exchange(DONE, FREE, Ordering::AcqRel, Ordering::Acquire);
+    }
+    Ok(object)
+  }
+
   /// The bootstrap object the anchor holds (A-114): created once, kept for the anchor's life, so a client's claim made
-  /// while a daemon restarts stays where the next daemon reads it.
+  /// while a daemon restarts stays where the next daemon reads it; and with it the anchor's ownership (A-176).
   pub(super) struct Held {
     _object: SharedObject,
+    _owner: Owner,
   }
 
   impl Held {
     pub(super) fn hold(instance: &str) -> Result<Held, IpcError> {
-      let mut object = fresh(instance)?;
+      let (mut object, owner) = fresh(instance)?;
       object.write(AT_ANCHOR_PID, &current_pid().to_le_bytes())?;
-      Ok(Held { _object: object })
+      Ok(Held {
+        _object: object,
+        _owner: owner,
+      })
     }
 
     pub(super) fn env_value(&self) -> String {
@@ -2094,36 +2305,26 @@ pub mod platform {
   }
 
   /// Opens the bootstrap object an anchor holds for `instance`, refused unless it is one (its magic and slot count),
-  /// and readies its slots for this daemon: a claim the dead daemon took (`ANSWERING`) and never answered goes back to
-  /// `CLAIMED`, to be answered now; a slot its claimant finished (`DONE`) is freed. A claim still being written, one
-  /// published, and an answer not yet read are left as they are, for this daemon's accept and stale reclaim.
+  /// and readies its slots for this daemon ([`readied`]).
   fn adopt(instance: &str) -> Result<SharedObject, IpcError> {
     let handoff =
       SharedObject::handoff_for_name(&rendezvous_name(instance)).ok_or(IpcError::Unsupported {
         feature: "rendezvous by name",
       })?;
-    let object = SharedObject::open(&handoff, OBJECT_BYTES, bootstrap_words())?;
-    if read_u32(&object, 0)? != MAGIC
-      || usize::try_from(read_u32(&object, AT_SLOT_COUNT)?).ok() != Some(SLOTS)
-    {
-      return Err(IpcError::Layout {
-        reason: "the anchor's rendezvous object is not this layout's",
-      });
-    }
-    for i in 0..SLOTS {
-      let word = state(&object, i)?;
-      let _ = word.compare_exchange(ANSWERING, CLAIMED, Ordering::AcqRel, Ordering::Acquire);
-      let _ = word.compare_exchange(DONE, FREE, Ordering::AcqRel, Ordering::Acquire);
-    }
-    Ok(object)
+    readied(
+      SharedObject::open(&handoff, OBJECT_BYTES, bootstrap_words())?,
+      "the anchor's rendezvous object is not this layout's",
+    )
   }
 
   impl Listener {
-    pub(super) fn open(instance: &str) -> Result<Listener, IpcError> {
-      let object = if std::env::var_os(super::ENV_RENDEZVOUS).is_some() {
-        adopt(instance)?
+    pub(super) fn open(instance: &str, adoption: Option<&str>) -> Result<Listener, IpcError> {
+      // The anchor owns the object it holds; a daemon run alone owns the one it makes.
+      let (object, owner) = if adoption.is_some() {
+        (adopt(instance)?, None)
       } else {
-        fresh(instance)?
+        let (object, owner) = fresh(instance)?;
+        (object, Some(owner))
       };
       // The start stamp last, with release: it publishes the header and the free table (never zero).
       let stamp = stamp_now().max(1);
@@ -2142,6 +2343,7 @@ pub mod platform {
         _doorbell_event: crate::wake::Event::open(&doorbell_event_name(instance))?,
         #[cfg(windows)]
         instance: instance.to_owned(),
+        _owner: owner,
       })
     }
 
@@ -2179,7 +2381,7 @@ pub mod platform {
       &mut self,
       assign: &mut dyn FnMut(u32) -> u32,
       make_region: &mut dyn FnMut(u32) -> Result<Prepared, IpcError>,
-    ) -> Result<Option<Accepted>, IpcError> {
+    ) -> Result<Option<Served>, IpcError> {
       for i in 0..SLOTS {
         let word = state(&self.object, i)?;
         let now = word.load(Ordering::Acquire);
@@ -2193,13 +2395,17 @@ pub mod platform {
             {
               let answered = self.answer(i, assign, make_region);
               // A claim this daemon took is always answered: a failure after it took the slot is the
-              // claimant's refusal, never a slot left `ANSWERING` for the claimant to wait out.
+              // claimant's refusal, never a slot left `ANSWERING` for the claimant to wait out. That
+              // failure is this claim's alone (A-176); only one to answer it is the rendezvous's.
               if let Err(error) = &answered
                 && state(&self.object, i)?.load(Ordering::Acquire) == ANSWERING
               {
                 self.refuse(i, error)?;
               }
-              return answered.map(Some);
+              return Ok(Some(match answered {
+                Ok(accepted) => Served::Accepted(Box::new(accepted)),
+                Err(refusal) => Served::Refused(refusal),
+              }));
             }
           }
           CLAIMING | READY | REFUSED => {
@@ -2626,7 +2832,7 @@ pub mod platform {
     /// The daemon's side of one accept: the wanted id granted, a real region made for it.
     fn accept(listener: &mut Listener, tag: &str) -> Result<Option<Accepted>, IpcError> {
       let tag = tag.to_owned();
-      listener.accept_one(&mut |wanted| wanted.max(1), &mut |id| {
+      let served = listener.accept_one(&mut |wanted| wanted.max(1), &mut |id| {
         Ok(Prepared {
           region: ClientRegion::create(
             &format!("rdvr-{tag}-{id}-{}", std::process::id()),
@@ -2636,7 +2842,12 @@ pub mod platform {
           )?,
           kick_fd: None,
         })
-      })
+      })?;
+      match served {
+        Some(Served::Accepted(accepted)) => Ok(Some(*accepted)),
+        Some(Served::Refused(refusal)) => Err(refusal),
+        None => Ok(None),
+      }
     }
 
     /// A client's own mapping of `name`'s bootstrap object.
@@ -2653,7 +2864,7 @@ pub mod platform {
     #[test]
     fn a_claim_is_answered_only_once_its_fields_are_published() {
       let name = instance("claiming");
-      let mut listener = Listener::open(&name).unwrap();
+      let mut listener = Listener::open(&name, None).unwrap();
       let mut client = client_mapping(&name);
       assert!(
         state(&client, 0)
@@ -2685,7 +2896,7 @@ pub mod platform {
     #[test]
     fn a_claim_abandoned_mid_write_is_reclaimed_past_the_stale_bound() {
       let name = instance("stale");
-      let mut listener = Listener::open(&name).unwrap();
+      let mut listener = Listener::open(&name, None).unwrap();
       let client = client_mapping(&name);
       state(&client, 0).unwrap().store(CLAIMING, Release);
       assert!(accept(&mut listener, "c").unwrap().is_none());
@@ -2704,7 +2915,7 @@ pub mod platform {
     #[test]
     fn a_claim_dropped_unanswered_gives_its_slot_back() {
       let name = instance("dropped");
-      let _listener = Listener::open(&name).unwrap();
+      let _listener = Listener::open(&name, None).unwrap();
       let client = client_mapping(&name);
       let claim = begin(&name, 0, CLAIM_WAIT_NS).unwrap();
       let index = claim.index;
@@ -2737,7 +2948,7 @@ pub mod platform {
 pub mod platform {
   //! Other platforms: no rendezvous yet.
 
-  use super::{Accepted, Connected, Prepared};
+  use super::{Accepted, Connected, Prepared, Served};
   use crate::error::IpcError;
   use crate::region::ClientRegion;
 
@@ -2791,7 +3002,7 @@ pub mod platform {
   pub(super) struct Listener;
 
   impl Listener {
-    pub(super) fn open(_instance: &str) -> Result<Listener, IpcError> {
+    pub(super) fn open(_instance: &str, _adoption: Option<&str>) -> Result<Listener, IpcError> {
       Err(IpcError::Unsupported {
         feature: "rendezvous",
       })
@@ -2813,7 +3024,7 @@ pub mod platform {
       &mut self,
       _assign: &mut dyn FnMut(u32) -> u32,
       _make_region: &mut dyn FnMut(u32) -> Result<Prepared, IpcError>,
-    ) -> Result<Option<Accepted>, IpcError> {
+    ) -> Result<Option<Served>, IpcError> {
       let _ = ClientRegion::open;
       Ok(None)
     }

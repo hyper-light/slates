@@ -719,12 +719,12 @@ fn a_snapshot_host_mount_presents_the_snapshot_read_only_and_pins_it() {
 #[cfg(unix)]
 #[test]
 fn a_snapshot_host_mount_presents_the_snapshot_again_after_a_restart() {
-  use common::anchor::{anchor_segment, source_of};
+  use common::anchor::{held_anchor, source_of};
   let profile = common::machine_profile();
   let instance = format!("srv-snapshot-view-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(1));
-  let segment = anchor_segment("snapshot-view", &profile, &config);
-  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let anchor = held_anchor("snapshot-view", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   first
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -741,7 +741,7 @@ fn a_snapshot_host_mount_presents_the_snapshot_again_after_a_restart() {
   drop(client);
   first.stop();
 
-  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   let port = second.nfs_port().expect("the second daemon serves NFS");
   assert_eq!(
     read_through_the_mount(port, &path, "f"),
@@ -749,7 +749,7 @@ fn a_snapshot_host_mount_presents_the_snapshot_again_after_a_restart() {
     "the view was rebuilt from the record"
   );
   second.stop();
-  drop(segment);
+  drop(anchor);
 }
 
 /// Attaches the subtree `subtree` of `volume` (named `name`) as a host mount: its capability path.
@@ -1010,12 +1010,12 @@ fn advance(
 #[cfg(unix)]
 #[test]
 fn a_snapshot_mount_advances_to_a_later_snapshot_and_names_what_changed() {
-  use common::anchor::{anchor_segment, source_of};
+  use common::anchor::{held_anchor, source_of};
   let profile = common::machine_profile();
   let instance = format!("srv-snapshot-advance-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(1));
-  let segment = anchor_segment("snapshot-advance", &profile, &config);
-  let first_daemon = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let anchor = held_anchor("snapshot-advance", &profile, &config);
+  let first_daemon = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   first_daemon
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -1045,7 +1045,7 @@ fn a_snapshot_mount_advances_to_a_later_snapshot_and_names_what_changed() {
   drop(client);
   first_daemon.stop();
 
-  let second_daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let second_daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   let port = second_daemon
     .nfs_port()
     .expect("the second daemon serves NFS");
@@ -1055,7 +1055,7 @@ fn a_snapshot_mount_advances_to_a_later_snapshot_and_names_what_changed() {
     "the re-pin was recorded and its view rebuilt"
   );
   second_daemon.stop();
-  drop(segment);
+  drop(anchor);
 }
 
 /// The mount of `first` at `path` reads `before`; an advance to a missing snapshot is refused and changes

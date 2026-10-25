@@ -35,7 +35,7 @@ use slates_server::{Daemon, DaemonConfig, SegmentSource};
 use slates_wire::request::RequestId;
 
 mod common;
-use common::anchor::{anchor_segment, source_of};
+use common::anchor::{held_anchor, source_of};
 use common::guest::{
   create_body, flush_body, message, my_uid, release_body, reply_error, round_trip, run_guest,
   run_guest_viewing, u64_at, write_body,
@@ -286,8 +286,8 @@ fn a_guests_acknowledged_close_survives_a_daemon_restart() {
   let profile = common::machine_profile();
   let instance = format!("srv-guest-durable-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(1));
-  let segment = anchor_segment("guest-durable", &profile, &config);
-  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let anchor = held_anchor("guest-durable", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   first
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -346,7 +346,7 @@ fn a_guests_acknowledged_close_survives_a_daemon_restart() {
   drop(client);
   first.stop();
 
-  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   let capability = second
     .mount_capability("durable")
     .expect("the owner shard answers")
@@ -362,7 +362,7 @@ fn a_guests_acknowledged_close_survives_a_daemon_restart() {
   );
   drop(stream);
   second.stop();
-  drop(segment);
+  drop(anchor);
 }
 
 /// Shape: heartbeats the guest watches its requests after the revocation — several of the loop's pass
@@ -2318,12 +2318,12 @@ fn a_guest_device_is_recorded_its_snapshot_view_advances_and_its_detach_ends_it(
 /// an attachment nothing serves.
 #[test]
 fn a_dead_daemons_guest_record_is_ended_by_recovery() {
-  use common::anchor::{anchor_segment, source_of};
+  use common::anchor::{held_anchor, source_of};
   let profile = common::machine_profile();
   let instance = format!("srv-guest-recorded-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(1));
-  let segment = anchor_segment("guest-recorded", &profile, &config);
-  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  let anchor = held_anchor("guest-recorded", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
   first
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
@@ -2353,7 +2353,7 @@ fn a_dead_daemons_guest_record_is_ended_by_recovery() {
   drop(client);
   first.stop();
 
-  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
   let mut client = Client::connect(&instance);
   assert_eq!(
     attachments_of(&mut client, id),
@@ -2362,7 +2362,7 @@ fn a_dead_daemons_guest_record_is_ended_by_recovery() {
   );
   drop(client);
   second.stop();
-  drop(segment);
+  drop(anchor);
 }
 
 /// The guest reads three bytes at the first snapshot; `advance` to `second` names `/f` alone; the guest then

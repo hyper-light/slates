@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use slates_anchor::AnchorSegment;
 use slates_client::driver::{Driver, Event, Ticket};
 use slates_client::{Client, ClientError, Deadlines};
+use slates_ipc::HeldRendezvous;
 use slates_ipc::protocol::ReplyBody;
 use slates_machine::{MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
@@ -191,11 +192,13 @@ fn step_bound() -> Duration {
   Duration::from_nanos(deadlines().reply_ns / 10)
 }
 
-/// The test's daemons over one anchor segment, so a second daemon recovers the first's state.
+/// The test's daemons over one anchor segment, so a second daemon recovers the first's state, and one held rendezvous.
 struct Anchor {
   profile: MachineProfile,
   config: DaemonConfig,
   segment: AnchorSegment,
+  /// The instance's rendezvous, which each daemon adopts (A-114).
+  rendezvous: HeldRendezvous,
 }
 
 impl Anchor {
@@ -215,6 +218,7 @@ impl Anchor {
       profile,
       config,
       segment,
+      rendezvous: HeldRendezvous::hold(instance).unwrap(),
     }
   }
 
@@ -228,6 +232,7 @@ impl Anchor {
         handoff,
         len,
         content,
+        rendezvous: self.rendezvous.adoption(),
       },
     )
     .unwrap();

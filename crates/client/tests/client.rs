@@ -18,6 +18,7 @@ use slates_anchor::AnchorSegment;
 use slates_client::{
   Client, ClientError, CreateSpec, Deadlines, Intent, NamePolicy, SizeClass, Submitted,
 };
+use slates_ipc::HeldRendezvous;
 use slates_ipc::protocol::{Refusal, RequestBody};
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
 use slates_server::daemon::LIVENESS_BUDGET_NS;
@@ -1321,6 +1322,8 @@ fn a_session_outlives_a_daemon_restart_and_its_retry_meets_the_completion_record
     content_bytes,
   )
   .unwrap();
+  // The rendezvous the anchor holds, which each daemon adopts (A-114).
+  let rendezvous = HeldRendezvous::hold(&instance).unwrap();
   let source = || {
     let (handoff, len) = segment.handoff().unwrap();
     let content = segment.content_handoff().unwrap();
@@ -1328,6 +1331,7 @@ fn a_session_outlives_a_daemon_restart_and_its_retry_meets_the_completion_record
       handoff,
       len,
       content,
+      rendezvous: rendezvous.adoption(),
     }
   };
   let first = Daemon::start(&profile, config.clone(), source()).unwrap();
@@ -1435,6 +1439,8 @@ fn a_client_at_its_last_sequence_refuses_fresh_requests_and_keeps_its_retries() 
     content_bytes,
   )
   .unwrap();
+  // The rendezvous the anchor holds, which each daemon adopts (A-114).
+  let rendezvous = HeldRendezvous::hold(&instance).unwrap();
   let source = || {
     let (handoff, len) = segment.handoff().unwrap();
     let content = segment.content_handoff().unwrap();
@@ -1442,6 +1448,7 @@ fn a_client_at_its_last_sequence_refuses_fresh_requests_and_keeps_its_retries() 
       handoff,
       len,
       content,
+      rendezvous: rendezvous.adoption(),
     }
   };
   let first = Daemon::start(&profile, config.clone(), source()).unwrap();
@@ -1526,12 +1533,15 @@ fn exhausted_client_id_space_refuses_fresh_callers_but_preserves_a_resuming_sess
   .unwrap();
   db.snapshot(&mut segment).unwrap();
   drop(db);
+  // The rendezvous the anchor holds, which each daemon adopts (A-114).
+  let rendezvous = HeldRendezvous::hold(&instance).unwrap();
   let source = || {
     let (handoff, len) = segment.handoff().unwrap();
     SegmentSource::Handoff {
       handoff,
       len,
       content: segment.content_handoff().unwrap(),
+      rendezvous: rendezvous.adoption(),
     }
   };
   let first = Daemon::start(&profile, config.clone(), source()).unwrap();
@@ -1618,6 +1628,8 @@ fn a_green_chain_survives_a_daemon_restart() {
     content_bytes,
   )
   .unwrap();
+  // The rendezvous the anchor holds, which each daemon adopts (A-114).
+  let rendezvous = HeldRendezvous::hold(&instance).unwrap();
   let source = || {
     let (handoff, len) = segment.handoff().unwrap();
     let content = segment.content_handoff().unwrap();
@@ -1625,6 +1637,7 @@ fn a_green_chain_survives_a_daemon_restart() {
       handoff,
       len,
       content,
+      rendezvous: rendezvous.adoption(),
     }
   };
   let first = Daemon::start(&profile, config.clone(), source()).unwrap();
@@ -1772,6 +1785,8 @@ fn a_base_seeded_greens_origin_survives_a_daemon_restart() {
     content_bytes,
   )
   .unwrap();
+  // The rendezvous the anchor holds, which each daemon adopts (A-114).
+  let rendezvous = HeldRendezvous::hold(&instance).unwrap();
   let source = || {
     let (handoff, len) = segment.handoff().unwrap();
     let content = segment.content_handoff().unwrap();
@@ -1779,6 +1794,7 @@ fn a_base_seeded_greens_origin_survives_a_daemon_restart() {
       handoff,
       len,
       content,
+      rendezvous: rendezvous.adoption(),
     }
   };
   let dir = host_dir_with_file();
@@ -1882,10 +1898,11 @@ fn an_async_edit_larger_than_a_request_is_chained_and_resolves_as_one() {
   daemon.stop();
 }
 
-/// A daemon over `segment`'s handoff (its content object included), started on a fresh config of `instance`.
-fn start_over(profile: &MachineProfile, config: &DaemonConfig, segment: &AnchorSegment) -> Daemon {
-  let (handoff, len) = segment.handoff().unwrap();
-  let content = segment.content_handoff().unwrap();
+/// A daemon over `anchor`'s handoff (its content object and rendezvous included), started on a fresh config of
+/// `instance`.
+fn start_over(profile: &MachineProfile, config: &DaemonConfig, anchor: &PlayedAnchor) -> Daemon {
+  let (handoff, len) = anchor.segment.handoff().unwrap();
+  let content = anchor.segment.content_handoff().unwrap();
   Daemon::start(
     profile,
     config.clone(),
@@ -1893,14 +1910,21 @@ fn start_over(profile: &MachineProfile, config: &DaemonConfig, segment: &AnchorS
       handoff,
       len,
       content,
+      rendezvous: anchor.rendezvous.adoption(),
     },
   )
   .unwrap()
 }
 
-/// The anchor a test plays: a segment and its content object under `tag`.
-fn played_anchor(profile: &MachineProfile, config: &DaemonConfig, tag: &str) -> AnchorSegment {
-  AnchorSegment::create(
+/// The anchor a test plays: a segment and its content object, and the instance's rendezvous (A-114).
+struct PlayedAnchor {
+  segment: AnchorSegment,
+  rendezvous: HeldRendezvous,
+}
+
+/// The anchor a test plays for `config`'s instance, its segment and content object under `tag`.
+fn played_anchor(profile: &MachineProfile, config: &DaemonConfig, tag: &str) -> PlayedAnchor {
+  let segment = AnchorSegment::create(
     &format!("slates-seg-{tag}-{}", std::process::id()),
     &profile.facts.identity,
     config.geometry,
@@ -1910,7 +1934,11 @@ fn played_anchor(profile: &MachineProfile, config: &DaemonConfig, tag: &str) -> 
     &format!("slates-con-{tag}-{}", std::process::id()),
     config.content_bytes(),
   )
-  .unwrap()
+  .unwrap();
+  PlayedAnchor {
+    segment,
+    rendezvous: HeldRendezvous::hold(&config.instance).unwrap(),
+  }
 }
 
 /// A-92 piece 2a: do start a daemon under an anchor and read its sealing root from its status, stop it and start a
@@ -1953,6 +1981,9 @@ fn a_restarted_daemon_adopts_its_anchors_sealing_root_and_a_fresh_anchor_mints_a
     adopted.key_slots > 0 && adopted.keys_held > 0,
     "held in the locked region: {adopted:?}"
   );
+  // The anchor dies before a fresh one starts for the instance, as one instance's two anchors never live at once (the
+  // second could not hold the rendezvous).
+  drop(anchor);
   let fresh_anchor = played_anchor(&profile, &config, "cl-seal-fresh");
   let third = start_over(&profile, &config, &fresh_anchor);
   let other = connect(&instance).daemon_status().unwrap().seal;

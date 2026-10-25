@@ -176,7 +176,9 @@ pub use win_event::Event;
 
 #[cfg(windows)]
 mod win_event {
-  use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+  use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+  };
   use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
 
   use crate::error::IpcError;
@@ -216,6 +218,17 @@ mod win_event {
     /// Creates or opens the named auto-reset Event (default DACL — the `Local\` namespace is the
     /// session's; manual-reset off; initial state non-signaled).
     pub fn open(name: &str) -> Result<Event, IpcError> {
+      Self::create(name).map(|(event, _existed)| event)
+    }
+
+    /// Creates the named Event only if no process holds one by that name: `None` when one exists. An Event
+    /// nobody else ever opens is then a token whose name lives exactly as long as its holder (A-176).
+    pub fn create_new(name: &str) -> Result<Option<Event>, IpcError> {
+      Self::create(name).map(|(event, existed)| (!existed).then_some(event))
+    }
+
+    /// Creates or opens the named Event, and whether it existed before this call.
+    fn create(name: &str) -> Result<(Event, bool), IpcError> {
       let name = wide(name);
       // SAFETY: a null attributes pointer (the default per-session security), the two `BOOL`s `0`/`0`
       // (auto-reset, initially non-signaled), and a valid null-terminated wide name.
@@ -223,9 +236,15 @@ mod win_event {
       if handle.is_null() {
         return Err(os("CreateEventW"));
       }
-      Ok(Event {
-        handle: handle.expose_provenance(),
-      })
+      // Read before anything else can set the thread's last error: an existing Event is opened, and says so here.
+      let existed =
+        std::io::Error::last_os_error().raw_os_error() == i32::try_from(ERROR_ALREADY_EXISTS).ok();
+      Ok((
+        Event {
+          handle: handle.expose_provenance(),
+        },
+        existed,
+      ))
     }
 
     fn handle(&self) -> HANDLE {
