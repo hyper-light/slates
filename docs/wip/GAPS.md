@@ -11258,10 +11258,11 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       end held until it expires; counted against the shard's handoff bound meanwhile, so no bound breaks;
     - this Mac's map arm of the break-even bench (step 3), now that the map is direct here;
     - a hand-off that fails at the client after the copy was made (a claim refused on macOS — `Busy`, an expired offer,
-      a confirmation that does not open — or, on Linux since A-171, a delivery that never arrives) returns the error
-      and leaves the copy held on the client's slot, unreachable by `release_map` (which takes the map), until the
-      client is reaped: bounded by the client's share, but each such failure shrinks it. The client should release the
-      copy by its id on the failure; owed as the next piece.
+      a confirmation that does not open — or, on Linux since A-171, a delivery that never arrives) returned the error
+      and left the copy held on the client's slot, unreachable by `release_map` (which takes the map), until the
+      client was reaped. **Fixed the same day, A-174:** the client gives the copy back by its id before the failure
+      returns; proven on this Mac and on fedora by a client process capped at its descriptors
+      (`crates/client/tests/reap_map.rs`), red-checked.
 
 - **Copy-once-map-many against copy-per-read, measured (G-direct step 3, 2026-10-25).** BENCHMARKS, "Copy-once-map-many
   against copy-per-read". On the box (load 65–80, capped) and on fedora (load 13), two runs each, best of 15: a steady

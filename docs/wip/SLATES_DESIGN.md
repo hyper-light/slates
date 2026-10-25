@@ -2875,7 +2875,9 @@ coherence was "the version a live local map pins is held until the client drops 
 costs the same copy once and gives the client the file as it is, where a pinned copy would grow stale with no signal.
 The price is a copy of each write into each mapped file's copy, and a cut that zeroes by stores over what holds bytes
 (the write seal refuses the daemon's own hole punch). **Lifetime and bounds (A-172).** A copy is held for its client
-from the moment it is made until the client releases it (`ReleaseMap`, `Client::release_map`) or is reaped. A volume's
+from the moment it is made until the client releases it (`ReleaseMap`, `Client::release_map`) or is reaped; a hand-off
+that fails in the client after the copy was made (its delivery, its claim or its map refused) gives it back before the
+failure returns (A-174). A volume's
 destroy or a file's last unlink only detaches its copies: they leave the write-through index, so a volume given the
 prefix again once its count wraps never writes into them, but they stay held and counted, because the client's own map
 keeps the object's pages, which the daemon wrote and its memory is charged for. A shard holds at most the copies its
@@ -2976,6 +2978,17 @@ same-namespace host process is the first delivered case.
 > (`direct_map::let_go`, `dax.local_map_offer_withdrawn`). **Owed:** Windows (G-direct step 5); this Mac's map arm of
 > the break-even bench (step 3); a test of the reap's withdrawal of its own (it shares the release's code; a test would
 > race the offer's own expiry, both two liveness budgets).
+>
+> **Amended 2026-10-25 (A-174) — a hand-off that fails in the client gives its copy back.** The daemon holds a copy for
+> its client from the moment it is made, so a hand-off that failed in the client — the descriptor's delivery on Linux,
+> its claim on macOS, or its map — held it against the client's share until the client's end, out of reach of
+> `Client::release_map`, which takes the map. Now the client releases the copy by its id before the failure returns
+> (`Client::kept_or_given_back`); a release that fails too returns both causes (`ClientError::HandOffUnreleased`), the
+> copy then held until the client's end. Proven on this Mac and on fedora by `crates/client/tests/reap_map.rs`
+> (`a_hand_off_that_fails_in_the_client_gives_its_copy_back`): a re-invoked client caps its descriptors at the lowest
+> number free and maps, so the kernel can give it none — on macOS its claim's socket was refused `EMFILE`, on Linux the
+> delivered descriptor was dropped and the delivery refused `Layout` — and while it lives the daemon holds none of the
+> copy it made and handed, `dax.local_map_released` counting one. Red-checked: without the release the copy stayed held.
 
 > **Status (the DAX matrix, A-164, 2026-10-24).** What DAX means in each environment, and which of its 52 cells
 > (each environment on each platform, by the mount route and the socket route) are proven, owed or ruled out by the
@@ -12235,6 +12248,13 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
 - **Rejected: the read-write descriptor with only a read-only map made of it.** The descriptor is the capability, not the map: handed in the read-only one's place in the red-check, its shared writable map and its turned map were granted.
 - **Proven** on this Mac (arm64, Darwin 25.4.0, 2026-10-25) by `crates/client/tests/client.rs` and `reap_map.rs` over a real daemon, red-checked (§4.6 status); Linux unchanged, the route being macOS's alone, its suites passing on fedora.
 - **Owed:** Windows (G-direct step 5); this Mac's map arm of the break-even bench (step 3); a test of the reap's withdrawal of its own (it shares the release's code; a test would race the offer's own expiry, both two liveness budgets); and the sibling found by the sweep: a Shards stream offer outlives an attachment that ended before its claim, a dead end held until it expires, within the shard's handoff bound (GAPS).
+
+### A-174 — A direct map's hand-off that fails in the client gives its copy back (accepted 2026-10-25)
+Applied in the same change to: §4.6 (the direct map's lifetime, its status), GAPS, `crates/client` (`Client::map_read`, `kept_or_given_back`; `ClientError::HandOffUnreleased`, appended; `tests/reap_map.rs`: the starved client), `CLAUDE.md`.
+- **What was wrong.** A copy is held for its client from the moment the daemon makes it (A-172), and the client gives it back by `release_map`, which takes the map. A hand-off that failed in the client — a delivery that never arrived or arrived without its descriptor (Linux), a claim refused (macOS: `Busy`, an expired offer, a confirmation that does not open, no descriptor to receive it in), or a map refused — returned the failure with no map to release, so the copy stayed held against the client's share until the client's end. Bounded by the share, but each failure shrank it, and a client whose failures recurred ended with no share at all.
+- **Decided: the client gives the copy back by its id before the failure returns.** The reply named the mapping id, so the client can release it whatever failed after. A release refused `NotFound` means the daemon holds it no more, which is the same outcome. A release that fails too (the channel itself failing) is not swallowed: the error names both causes, `HandOffUnreleased`, and the copy is then held until the client's end, as before.
+- **Rejected: letting the daemon release a copy whose offer expired unclaimed.** It would cover only macOS's unclaimed offers, not a claim that succeeded and then failed, nor Linux's deliveries, and a client holding unclaimed offers is within its share either way.
+- **Proven** on this Mac and on fedora, 2026-10-25, and red-checked (§4.6 status). The failure is injected as a real one: a client process that has used every descriptor number it may (`RLIMIT_NOFILE` capped at the lowest free one) can be handed nothing.
 
 ### A-170 — A clone's copy-up copies an open extent its origin owns; only its own is sealed in place (accepted 2026-10-25)
 Applied in the same change to: `crates/vfs/src/volume.rs` (`Volume::make_current_inode`), `crates/vfs/src/content.rs`

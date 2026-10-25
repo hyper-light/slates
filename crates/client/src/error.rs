@@ -69,6 +69,15 @@ pub enum ClientError {
     /// The file.
     path: String,
   },
+  /// A direct map's hand-off failed in this client after the daemon made the file's copy, and giving the copy back
+  /// failed too (§4.6, A-174): the copy stays held, against this client's share of the direct maps, until this
+  /// client's end. Both causes; a hand-off whose copy was given back returns its own failure alone.
+  HandOffUnreleased {
+    /// Why the hand-off failed: the descriptor's delivery, its claim on the socket route, or its map.
+    failure: Box<ClientError>,
+    /// Why giving the copy back failed.
+    release: Box<ClientError>,
+  },
 }
 
 impl fmt::Display for ClientError {
@@ -100,6 +109,11 @@ impl fmt::Display for ClientError {
       Self::ChangedWhileRead { path } => {
         write!(f, "{path} changed while it was read; read it again")
       }
+      Self::HandOffUnreleased { failure, release } => write!(
+        f,
+        "a direct map's hand-off failed ({failure}) and its copy could not be given back ({release}); it is held until \
+         this client ends"
+      ),
     }
   }
 }

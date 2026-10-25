@@ -977,10 +977,12 @@ impl Client {
 
   /// §4.6, A-171: maps a file's bytes with no copy per read where the daemon can hand this same-kernel client its copy
   /// of the file, else reads them by the paged path; either way [`MappedRead::read_at`] reads the file's bytes. The
-  /// daemon fills a copy of the file, sealed against every writer but itself, and sends its descriptor over the control
-  /// socket before the reply; this maps it read alone. The daemon keeps the copy equal to the file, so the map is live
+  /// daemon fills a copy of the file that no one but itself can write; on Linux it sends the copy's descriptor over the
+  /// control socket before the reply, and on macOS it offers a read-only descriptor of it on its socket route, which
+  /// this claims (A-173); this maps it read alone. The daemon keeps the copy equal to the file, so the map is live
   /// within its length, until [`Client::release_map`] or this client's end; dropping the map unmaps this process's view
-  /// alone. Refused `MapShareExhausted`, nothing made, when this client holds its share of maps already.
+  /// alone. Refused `MapShareExhausted`, nothing made, when this client holds its share of maps already. A hand-off
+  /// that fails here gives the copy back before the failure returns (A-174).
   #[cfg(unix)]
   pub fn map_read(&mut self, volume: VolumeId, path: &str) -> Result<MappedRead, ClientError> {
     let reply = match self.call(&RequestBody::MapRead {
@@ -1005,13 +1007,17 @@ impl Client {
         file_len,
         block_len,
       } => {
-        let delivered = self.recv_delivery(|delivery| {
-          matches!(delivery, ControlDelivery::Mapping(mapping) if mapping.mapping_id == mapping_id)
-        })?;
-        let ControlDelivery::Mapping(mapping) = delivered else {
-          return Err(ClientError::UnexpectedReply { verb: "map_read" });
-        };
-        MappedRead::map(mapping.block, (volume, mapping_id), file_len, block_len)
+        let handed = self
+          .recv_delivery(|delivery| {
+            matches!(delivery, ControlDelivery::Mapping(mapping) if mapping.mapping_id == mapping_id)
+          })
+          .and_then(|delivered| match delivered {
+            ControlDelivery::Mapping(mapping) => {
+              MappedRead::map(mapping.block, (volume, mapping_id), file_len, block_len)
+            }
+            ControlDelivery::Stream(_) => Err(ClientError::UnexpectedReply { verb: "map_read" }),
+          });
+        self.kept_or_given_back(handed, (volume, mapping_id))
       }
       // macOS: the copy's read-only descriptor waits on the daemon's socket route, claimed once with the reply's secret.
       ReplyBody::MapOffered {
@@ -1020,11 +1026,41 @@ impl Client {
         block_len,
         secret,
       } => {
-        let block = self.claim_map(mapping_id, &secret)?;
-        MappedRead::map(block, (volume, mapping_id), file_len, block_len)
+        let handed = self
+          .claim_map(mapping_id, &secret)
+          .and_then(|block| MappedRead::map(block, (volume, mapping_id), file_len, block_len));
+        self.kept_or_given_back(handed, (volume, mapping_id))
       }
       _ => Err(ClientError::UnexpectedReply { verb: "map_read" }),
     }
+  }
+
+  /// A direct map's hand-off as it ended in this client (§4.6, A-174): the map, or its failure — the descriptor's
+  /// delivery, its claim or its map refused — with the copy given back first. The daemon made the copy and holds it for
+  /// this client from then on, so a failure that kept it would hold it against this client's share until this client's
+  /// end, out of reach of [`Client::release_map`], which takes the map. A copy the daemon no longer holds (`NotFound`)
+  /// is given back already. A release that fails too returns both causes, `HandOffUnreleased`.
+  #[cfg(unix)]
+  fn kept_or_given_back(
+    &mut self,
+    handed: Result<MappedRead, ClientError>,
+    (volume, mapping_id): (VolumeId, u64),
+  ) -> Result<MappedRead, ClientError> {
+    let Err(failure) = handed else {
+      return handed;
+    };
+    let release = match self.call(&RequestBody::ReleaseMap { volume, mapping_id }) {
+      Ok(ReplyBody::MapReleased)
+      | Err(ClientError::Refused(slates_ipc::protocol::Refusal::NotFound)) => return Err(failure),
+      Ok(_) => ClientError::UnexpectedReply {
+        verb: "release_map",
+      },
+      Err(release) => release,
+    };
+    Err(ClientError::HandOffUnreleased {
+      failure: Box::new(failure),
+      release: Box::new(release),
+    })
   }
 
   /// §4.6, A-171: lets go of a map, unmapping this process's view and then asking the daemon to let go of its copy,
