@@ -1,14 +1,18 @@
-//! What a `MapRead` costs (§4.6, A-171), through the client API against a real one-shard daemon.
+//! Copy-once-map-many against copy-per-read (§4.6, A-171; G-direct step 3), through the client API against a real
+//! one-shard daemon.
 //!
-//! On Linux a `MapRead` is answered with the daemon's sealed copy of the file, filled once and kept equal to the file
-//! by the write boundary, so the client then reads it as memory with no request and no copy per read; elsewhere it
-//! reads by the paged copy path. Each sample is one whole `MapRead`: the request, the daemon's fill of a new copy, the
-//! hand-off and the map. Before 2026-10-25 the daemon refused to hand any descriptor (the arena held every volume), so
-//! every sample took the copy path; this harness priced that.
+//! A direct map pays once: the request, the daemon's fill of a copy of the file, the hand-off and the `mmap` (its
+//! setup), then the page faults of the first read through the map. After that a read is loads from memory the daemon
+//! keeps equal to the file. The copy read verb pays on every read: a request per page and a copy of every byte. This
+//! measures, for each file size, the setup, the first mapped read, a steady mapped read and a copy read, interleaved
+//! sample by sample on one daemon so the machine's load falls on every arm alike, and from the best of each the reads
+//! past which the map's one-off cost is repaid:
+//! `(setup + first mapped read − steady mapped read) / (copy read − steady mapped read)`.
 //!
-//! Command: `cargo run --release -p slates-client --example map_read_ab -- <file_kib> <samples>`
-//! (defaults 1024 and 200). Prints the path actually taken, so an arm that silently fell back is visible, and
-//! `/proc/loadavg` where it exists, since the figures are load-sensitive.
+//! Command: `cargo run --release -p slates-client --example map_read_ab -- <sizes_kib> <samples>` (defaults
+//! `4,1024,65536` and 15). Prints every sample of every arm, the best of each, the break-even read count, the path
+//! the map took and the load. A map that read by copy (macOS and Windows until their routes land) is reported as such
+//! and never priced as a direct one.
 // Bench harness code: an unwrap here is a failed run.
 #![allow(
   clippy::unwrap_used,
@@ -21,24 +25,33 @@
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
-use slates_client::{Client, ClientError, CreateSpec, Deadlines, Intent, NamePolicy, SizeClass};
+use slates_client::{
+  Client, ClientError, CreateSpec, Deadlines, Intent, NamePolicy, ReadAt, SizeClass, VolumeId,
+};
 #[cfg(unix)]
 use slates_machine::{MachineProfile, ProfileOptions};
 #[cfg(unix)]
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
-/// Shape: the file read per sample, in kibibytes, unless the first argument says otherwise.
+/// Shape: the file sizes read, in kibibytes, unless the first argument lists others: a page, a chunk's run of a
+/// mebibyte, and a file of 64 MiB, where a read's cost is its bytes.
 #[cfg(unix)]
-const DEFAULT_FILE_KIB: usize = 1024;
-/// Shape: reads sampled, unless the second argument says otherwise.
+const DEFAULT_SIZES_KIB: &[usize] = &[4, 1024, 65536];
+/// Shape: the samples a size takes of every arm, unless the second argument says otherwise.
 #[cfg(unix)]
-const DEFAULT_SAMPLES: usize = 200;
+const DEFAULT_SAMPLES: usize = 15;
 /// Shape: the machine profile's budget per probe.
 #[cfg(unix)]
 const PROBE_MS: u64 = 5;
 /// Shape: how long a client retries the rendezvous while the daemon starts.
 #[cfg(unix)]
 const START_WAIT: Duration = Duration::from_secs(5);
+/// Shape: the volume a file lives in holds this many times its bytes, room for its records and its rewrites.
+#[cfg(unix)]
+const ROOM_FACTOR: u64 = 8;
+/// Shape: the least room a volume is given, for a small file's records.
+#[cfg(unix)]
+const LEAST_ROOM: u64 = 1 << 20;
 
 #[cfg(unix)]
 fn deadlines() -> Deadlines {
@@ -62,36 +75,192 @@ fn connect(instance: &str) -> Client {
   }
 }
 
+/// The machine's load average, where the OS reports one: `/proc/loadavg` on Linux, `vm.loadavg` on macOS.
 #[cfg(unix)]
-fn percentile(sorted: &[u128], per_thousand: u64) -> u128 {
-  if sorted.is_empty() {
-    return 0;
+fn load() -> String {
+  #[allow(clippy::disallowed_methods)] // reading the kernel's load average, where it exists
+  if let Ok(text) = std::fs::read_to_string("/proc/loadavg") {
+    return text
+      .split_whitespace()
+      .take(3)
+      .collect::<Vec<_>>()
+      .join(" ");
   }
-  let last = sorted.len() - 1;
-  let at = (last as u128 * u128::from(per_thousand)) / 1000;
-  sorted[usize::try_from(at).unwrap_or(last).min(last)]
+  std::process::Command::new("sysctl")
+    .args(["-n", "vm.loadavg"])
+    .output()
+    .ok()
+    .and_then(|out| String::from_utf8(out.stdout).ok())
+    .map(|text| text.trim().trim_matches(['{', '}']).trim().to_owned())
+    .unwrap_or_else(|| "unknown".to_owned())
 }
 
-/// The paired arm: `Client::map_read` is `#[cfg(unix)]` (it maps a descriptor the daemon sends over the control
-/// socket), so there is nothing to price off Unix. It skips loudly, and `clippy --all-targets` compiles this
-/// example on every platform — which is how the Windows lane found it red (2026-10-19).
+/// One arm's samples, in nanoseconds, in the order taken.
+#[cfg(unix)]
+#[derive(Default)]
+struct Arm(Vec<u128>);
+
+#[cfg(unix)]
+impl Arm {
+  fn take<T>(&mut self, work: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let done = work();
+    self.0.push(started.elapsed().as_nanos());
+    done
+  }
+
+  fn best(&self) -> u128 {
+    self.0.iter().copied().min().unwrap_or(0)
+  }
+
+  fn all(&self) -> String {
+    self
+      .0
+      .iter()
+      .map(|ns| format!("{:.1}", *ns as f64 / 1000.0))
+      .collect::<Vec<_>>()
+      .join(" ")
+  }
+}
+
+/// A volume holding `/f.bin` of `kib` KiB of a pattern.
+#[cfg(unix)]
+fn volume_with_file(client: &mut Client, kib: usize) -> (VolumeId, Vec<u8>) {
+  let bytes: Vec<u8> = (0..(kib << 10))
+    .map(|index| u8::try_from(index % 251).unwrap() | 1)
+    .collect();
+  let room = u64::try_from(bytes.len())
+    .unwrap()
+    .saturating_mul(ROOM_FACTOR)
+    .max(LEAST_ROOM);
+  let id = client
+    .create(&CreateSpec {
+      name: format!("mapab-{kib}"),
+      size: SizeClass::Bounded { limit: room },
+      names: NamePolicy::Exact,
+      require_locked: false,
+      base: None,
+    })
+    .unwrap();
+  let attached = client.attach(id, None, Intent::Write).unwrap();
+  client
+    .fs_write((id, attached.attachment), "/f.bin", &bytes, 0o644)
+    .unwrap();
+  client.detach(attached.attachment).unwrap();
+  (id, bytes)
+}
+
+/// Every arm of one size: the copy read, the map's setup, its first read and a steady read.
+#[cfg(unix)]
+#[derive(Default)]
+struct Arms {
+  copy: Arm,
+  setup: Arm,
+  first: Arm,
+  steady: Arm,
+}
+
+/// Samples every arm `samples` times over `/f.bin` of `id`, interleaved; whether every map was a direct one.
+#[cfg(unix)]
+fn sample(client: &mut Client, id: VolumeId, bytes: &[u8], samples: usize) -> (Arms, bool) {
+  let mut arms = Arms::default();
+  let mut direct = true;
+  let mut checksum = 0u64;
+  // One of each outside the samples, so a first touch is not in the figures.
+  assert_eq!(
+    client.read(id, "/f.bin", ReadAt::Head).unwrap().len(),
+    bytes.len()
+  );
+  let warm = client.map_read(id, "/f.bin").unwrap();
+  client.release_map(warm).unwrap();
+  for _ in 0..samples {
+    let copied = arms
+      .copy
+      .take(|| client.read(id, "/f.bin", ReadAt::Head).unwrap());
+    assert!(copied == bytes, "the copy read returned the file");
+    let mapped = arms.setup.take(|| client.map_read(id, "/f.bin").unwrap());
+    direct &= mapped.is_zero_copy();
+    let mut buffer = vec![0u8; usize::try_from(mapped.len()).unwrap()];
+    let read = arms.first.take(|| mapped.read_at(0, &mut buffer).unwrap());
+    assert!(
+      read == bytes.len() && buffer == bytes,
+      "the first mapped read returned the file"
+    );
+    arms.steady.take(|| mapped.read_at(0, &mut buffer).unwrap());
+    checksum = checksum.wrapping_add(u64::from(buffer[buffer.len() / 2]));
+    client.release_map(mapped).unwrap();
+  }
+  println!("  checksum {checksum}");
+  (arms, direct)
+}
+
+/// Reports one size's arms and the reads past which the map is repaid.
+#[cfg(unix)]
+fn report(kib: usize, arms: &Arms, direct: bool) {
+  println!(
+    "{kib} KiB, map path={}",
+    if direct {
+      "direct"
+    } else {
+      "copy (not priced)"
+    }
+  );
+  for (name, arm) in [
+    ("copy read", &arms.copy),
+    ("map setup", &arms.setup),
+    ("first mapped read", &arms.first),
+    ("steady mapped read", &arms.steady),
+  ] {
+    println!(
+      "  {name:<19} best {:>10.1} us  all: {}",
+      arm.best() as f64 / 1000.0,
+      arm.all()
+    );
+  }
+  if !direct {
+    return;
+  }
+  let (copy, setup, first, steady) = (
+    arms.copy.best(),
+    arms.setup.best(),
+    arms.first.best(),
+    arms.steady.best(),
+  );
+  println!(
+    "  steady mapped read / copy read = {:.4}",
+    steady as f64 / copy.max(1) as f64
+  );
+  match copy.checked_sub(steady).filter(|saved| *saved > 0) {
+    Some(saved) => {
+      let once = setup + first.saturating_sub(steady);
+      println!(
+        "  break-even after {} reads (one-off {:.1} us, saved {:.1} us a read)",
+        once.div_ceil(saved),
+        once as f64 / 1000.0,
+        saved as f64 / 1000.0
+      );
+    }
+    None => println!("  never repaid: a mapped read costs no less than a copy read"),
+  }
+}
+
+/// The paired arm: `Client::map_read` is `#[cfg(unix)]`, so there is nothing to price off Unix; it skips loudly.
 #[cfg(not(unix))]
 fn main() {
-  eprintln!("skip: the local zero-copy read A/B needs the Unix client API (`Client::map_read`)");
+  eprintln!("skip: the copy-once-map-many bench needs the Unix client API (`Client::map_read`)");
 }
 
 #[cfg(unix)]
 fn main() {
   let mut args = std::env::args().skip(1);
-  let file_kib = args
+  let sizes: Vec<usize> = args
     .next()
-    .and_then(|a| a.parse::<usize>().ok())
-    .unwrap_or(DEFAULT_FILE_KIB);
+    .map(|list| list.split(',').filter_map(|kib| kib.parse().ok()).collect())
+    .unwrap_or_else(|| DEFAULT_SIZES_KIB.to_vec());
   let samples = args
     .next()
     .and_then(|a| a.parse::<usize>().ok())
     .unwrap_or(DEFAULT_SAMPLES);
-
   let profile = MachineProfile::measure_patiently(&ProfileOptions {
     budget_per_probe: Duration::from_millis(PROBE_MS),
     codecs: false,
@@ -99,7 +268,7 @@ fn main() {
   })
   .unwrap();
   let instance = format!("mapab-{}", std::process::id());
-  // One shard, so the volume's owner is the client's home shard: the cross-shard hand-off is a separate question.
+  // One shard, so the volume's owner is the client's home shard, the only one a descriptor is handed from.
   let config = DaemonConfig::derive(&profile, &instance, Some(1));
   let daemon = Daemon::start(
     &profile,
@@ -111,74 +280,12 @@ fn main() {
   .unwrap();
   daemon.bootstrap(true).unwrap();
   let mut client = connect(&instance);
-
-  let bytes: Vec<u8> = (0..(file_kib << 10))
-    .map(|i| u8::try_from(i % 251).unwrap_or(0))
-    .collect();
-  let id = client
-    .create(&CreateSpec {
-      name: "mapab".to_owned(),
-      size: SizeClass::Bounded {
-        limit: u64::try_from(bytes.len().saturating_mul(8)).unwrap_or(1 << 30),
-      },
-      names: NamePolicy::Exact,
-      require_locked: false,
-      base: None,
-    })
-    .unwrap();
-  let attached = client.attach(id, None, Intent::Write).unwrap();
-  client
-    .fs_write((id, attached.attachment), "/big.bin", &bytes, 0o644)
-    .unwrap();
-  client.detach(attached.attachment).unwrap();
-
-  // One read outside the sample, so the first-touch cost is not in the figures. What it returned is reported
-  // rather than asserted: the two paths are being compared, and a path that returns something else is the most
-  // interesting thing this can find — not a reason to abort before printing it.
-  let warm = client.map_read(id, "/big.bin").unwrap();
-  let zero_copy = warm.is_zero_copy();
-  let read = warm.to_vec().unwrap();
-  let got = read.len();
-  let equal = read == bytes;
-  println!(
-    "warm read: path={} returned_bytes={got} file_bytes={} equal={equal}",
-    if zero_copy { "zero-copy" } else { "copy" },
-    bytes.len()
-  );
-  drop(warm);
-
-  let mut taken: Vec<u128> = Vec::with_capacity(samples);
-  let mut checksum = 0u64;
-  for _ in 0..samples {
-    let started = Instant::now();
-    let mapped = client.map_read(id, "/big.bin").unwrap();
-    let mut first = [0u8; 1];
-    mapped.read_at(0, &mut first).unwrap();
-    let first = first[0];
-    taken.push(started.elapsed().as_nanos());
-    checksum = checksum.wrapping_add(u64::from(first));
-    drop(mapped);
+  println!("samples={samples} load before=\"{}\"", load());
+  for kib in sizes {
+    let (id, bytes) = volume_with_file(&mut client, kib);
+    let (arms, direct) = sample(&mut client, id, &bytes, samples);
+    report(kib, &arms, direct);
+    client.destroy(id).unwrap();
   }
-  taken.sort_unstable();
-
-  #[allow(clippy::disallowed_methods)] // reading the kernel's load average, where it exists
-  let load = std::fs::read_to_string("/proc/loadavg")
-    .map(|s| s.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
-    .unwrap_or_else(|_| "unknown".to_owned());
-  let p50 = percentile(&taken, 500);
-  println!(
-    "map_read path={} file_kib={file_kib} samples={samples} load=\"{load}\"",
-    if zero_copy { "zero-copy" } else { "copy" }
-  );
-  // Latency only, deliberately. A MiB/s computed from the *requested* size is a lie on any path that returns
-  // less than it, and this bench exists precisely because one path did: see the `warm read:` line above for what
-  // each arm actually handed back.
-  println!(
-    "  p50={} us  p99={} us  max={} us  checksum={checksum}",
-    p50 / 1_000,
-    percentile(&taken, 990) / 1_000,
-    taken.last().copied().unwrap_or(0) / 1_000,
-  );
-
-  client.destroy(id).unwrap();
+  println!("load after=\"{}\"", load());
 }

@@ -6001,7 +6001,156 @@ against the kernel attack surface and a `RLIMIT_MEMLOCK` boot failure. The drive
 than demoted — replace, do not layer. A quiesced re-run of this A/B is still owed as a record of the
 parked figure; it cannot change the decision, which rests on surface and on the spinning column.
 
+## Copy-once-map-many against copy-per-read: when a direct map repays its fill (A-171; G-direct step 3; 2026-10-25)
+
+**The question.** A direct map (A-171) pays once: the request, the daemon's fill of a sealed copy of the file, the
+hand-off and the `mmap` (its setup), then the page faults of the first read through the map. After that a read is
+loads from memory the daemon keeps equal to the file. The copy read verb pays on every read: a request a page and a
+copy of every byte. This records the four costs for each file size and the reads past which the map is repaid,
+`(setup + first mapped read − steady mapped read) / (copy read − steady mapped read)`. The record of 2026-10-18 below
+said it had never been measured.
+
+**The command.** `cargo run --release -p slates-client --example map_read_ab -- 4,1024,65536 15`, a release binary
+with its own one-shard daemon; for each size a fresh volume and file, one warm read of each kind outside the samples,
+then 15 samples in which every arm runs once in turn (copy read, map setup, first mapped read, steady mapped read,
+release), so the machine's load falls on every arm alike. Best of 15 reported, all 15 printed. The bench asserts every
+read returns the file's bytes, and reports the path each map took, so a map that read by copy is never priced as a
+direct one. Run twice on each machine, back to back, load recorded before and after.
+
+**The machines.**
+- **The box:** AMD Ryzen 9 9950X3D2 (16 cores, 32 threads), Linux 7.2.9-2-cachyos, in a capped unit (`MemoryMax=20G`,
+  `CPUWeight=1`, `Nice=19`, nvme I/O caps), shared and busy: load average 64.9 to 79.9 across both runs, three CI
+  jobs and other sessions' work beside it. 16:10 UTC.
+- **fedora:** Intel Core i9-14900HX (32 threads), 62 GB, Linux 6.19.10, a capped unit (`MemoryMax=20G`,
+  `CPUWeight=1`, `Nice=19`), load average 12.5 to 13.6. 16:07 UTC.
+
+**The box, best of 15 (run 1 / run 2):**
+
+| file | copy read | map setup | first mapped read | steady mapped read | steady / copy | repaid after |
+|---|---|---|---|---|---|---|
+| 4 KiB | 4.8 / 9.4 µs | 21.3 / 20.7 µs | 0.9 / 0.7 µs | 0.4 / 0.4 µs | 0.077 / 0.037 | 5 / 3 reads |
+| 1 MiB | 1,099.8 / 1,065.2 µs | 455.6 / 516.9 µs | 105.4 / 97.5 µs | 89.9 / 86.1 µs | 0.082 / 0.081 | 1 / 1 read |
+| 64 MiB | 96.1 / 93.5 ms | 38.9 / 57.6 ms | 15.4 / 20.5 ms | 9.85 / 9.65 ms | 0.103 / 0.103 | 1 / 1 read |
+
+**fedora, best of 15 (run 1 / run 2):**
+
+| file | copy read | map setup | first mapped read | steady mapped read | steady / copy | repaid after |
+|---|---|---|---|---|---|---|
+| 4 KiB | 19.1 / 24.9 µs | 54.8 / 59.0 µs | 2.0 / 2.2 µs | 1.1 / 1.1 µs | 0.055 / 0.044 | 4 / 3 reads |
+| 1 MiB | 3,236.3 / 2,642.5 µs | 1,613.9 / 989.7 µs | 184.1 / 186.0 µs | 161.5 / 164.5 µs | 0.050 / 0.062 | 1 / 1 read |
+| 64 MiB | 152.0 / 190.6 ms | 96.9 / 94.0 ms | 27.7 / 26.4 ms | 10.5 / 10.2 ms | 0.069 / 0.054 | 1 / 1 read |
+
+All 15 samples of every arm, as printed (µs):
+
+```
+the box, run 1
+4 KiB    copy 31.5 30.2 19.3 18.4 21.9 22.6 16.9 10.0 14.8 12.7 12.1 17.3 12.3 6.6 4.8
+         setup 54.7 51.2 25.8 29.5 29.5 23.9 21.7 21.3 21.9 21.4 23.5 44.6 24.1 21.4 31.7
+         first 1.1 1.5 5.3 1.2 1.0 1.0 0.9 0.9 0.9 0.9 0.9 1.1 0.9 0.9 1.4
+         steady 0.5 0.5 0.6 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.5 0.6 0.5 0.4
+1 MiB    copy 2028.4 1846.1 2360.5 2190.1 1767.0 2167.4 2212.4 1778.3 1099.8 1672.2 1752.4 2329.0 1733.5 2294.5 3837.1
+         setup 690.5 455.6 628.2 620.8 623.6 966.6 644.0 646.6 466.7 625.9 620.2 799.1 611.7 730.3 615.3
+         first 105.4 156.1 137.5 139.3 142.3 144.6 144.8 140.4 142.6 145.1 146.2 158.5 148.1 153.3 150.6
+         steady 89.9 143.8 124.4 107.6 129.0 133.2 130.5 134.8 92.7 128.9 153.8 148.8 130.3 131.7 128.8
+64 MiB   copy 124452.6 141299.3 111663.8 117158.9 124385.9 120342.1 114037.1 129808.5 98276.1 119985.4 115473.9
+              106735.4 96082.9 98211.1 113370.3
+         setup 57000.0 50958.8 55685.6 50840.9 49489.6 48784.8 38942.0 57734.6 46584.8 41191.6 47538.2 42314.0
+               54361.6 45807.4 46966.1
+         first 19836.6 17464.9 18360.3 19814.3 32702.0 21188.9 23527.5 29723.9 23239.6 22526.4 19342.8 20698.0
+               15394.9 24298.4 18571.2
+         steady 18715.3 12277.5 13186.7 21616.5 13506.0 33492.1 18026.7 11004.0 9845.1 11628.9 12686.3 15599.0
+                12458.8 14349.3 11842.9
+the box, run 2
+4 KiB    copy 35.0 31.1 26.3 33.5 16.3 18.0 18.5 19.7 16.2 19.5 18.1 14.5 14.6 15.0 9.4
+         setup 36.3 48.4 35.5 48.7 30.1 25.8 38.5 26.8 35.0 35.3 25.2 52.8 30.1 30.1 20.7
+         first 0.9 0.8 0.9 0.8 0.8 0.7 1.2 0.8 0.9 0.8 0.7 1.2 2.0 1.2 0.7
+         steady 0.4 0.4 0.5 0.4 0.4 0.4 0.4 0.4 0.5 0.4 0.4 0.4 0.4 0.5 0.4
+1 MiB    copy 1919.7 2614.4 1536.5 3240.3 4364.6 1796.9 1155.8 1065.2 1212.0 1642.7 1331.9 1501.9 1297.8 1077.6 1700.2
+         setup 783.0 855.5 629.4 820.5 628.0 590.1 516.9 684.2 611.5 588.1 560.0 582.1 537.7 583.7 696.6
+         first 183.9 126.5 143.7 160.2 178.4 113.2 97.5 109.8 127.1 112.1 143.2 125.9 145.9 100.9 163.6
+         steady 135.5 92.9 126.1 95.6 130.1 128.5 89.1 102.0 115.6 95.8 104.3 86.1 107.7 102.8 141.6
+64 MiB   copy 111266.8 119455.7 139981.4 118833.4 113266.8 118635.3 107733.9 102668.5 97441.6 93508.0 96441.5
+              97365.9 154735.9 109615.0 109535.9
+         setup 76751.5 75407.5 80652.1 63713.3 65943.5 73735.0 70184.3 57575.4 64076.6 58275.3 61786.1 58224.4
+               70627.9 65081.2 63847.5
+         first 31311.2 32804.8 31265.5 24218.7 35866.8 38031.3 31861.3 27225.0 37978.4 25892.4 20535.1 25276.3
+               26963.2 25563.6 25114.0
+         steady 18248.8 20367.9 13462.1 10945.6 23178.1 13226.9 12361.8 12426.3 11173.7 9649.1 10371.6 14245.7
+                11623.4 10702.2 11752.5
+fedora, run 1
+4 KiB    copy 53.1 69.9 39.8 40.4 38.8 42.4 36.0 32.9 36.0 32.9 32.4 35.5 33.7 27.0 19.1
+         setup 74.0 68.2 71.0 68.0 65.3 62.1 56.5 57.5 56.5 57.3 55.9 56.1 59.1 55.1 54.8
+         first 2.3 2.2 2.1 2.1 2.0 2.0 2.0 2.1 2.1 2.1 2.0 2.1 2.0 2.2 2.2
+         steady 1.1 (all 15)
+1 MiB    copy 3711.6 3736.6 3604.7 3805.1 3611.3 3642.9 3793.9 3665.9 3650.6 3707.8 3659.8 4096.2 3236.3 3346.7 3666.9
+         setup 1692.2 1687.1 1631.3 1736.6 1661.9 1724.7 1688.8 1674.7 1685.6 1670.6 1667.5 1762.5 1660.7 1613.9 1763.4
+         first 295.8 296.8 288.2 288.4 293.1 307.4 296.5 300.3 297.2 296.7 300.1 195.2 191.4 184.1 302.8
+         steady 276.4 269.5 272.3 263.1 263.1 278.8 276.8 270.6 270.5 277.4 270.6 164.6 161.5 161.5 270.5
+64 MiB   copy 160421.1 190764.1 223531.0 231766.6 204857.0 165716.4 166969.4 162104.2 159915.6 151963.4 158943.7
+              158722.9 155087.0 161123.0 155990.3
+         setup 146144.1 160202.1 153962.9 140560.3 101354.7 103830.1 99879.7 99926.1 96879.8 97842.2 97480.5 98308.6
+               98013.0 98426.7 99137.1
+         first 45499.7 45399.4 45686.2 43423.3 46009.1 45353.1 44982.6 45369.1 42829.0 44864.2 43061.5 37863.5
+               38268.3 27705.9 37485.7
+         steady 18986.1 18518.8 19490.2 17911.9 19488.1 10932.0 10669.3 10518.4 17751.8 17404.2 15238.0 10918.8
+                10647.9 10665.9 10997.6
+fedora, run 2
+4 KiB    copy 64.9 62.0 41.9 41.0 40.9 44.0 37.7 124.3 109.3 120.6 36.7 34.4 34.6 28.4 24.9
+         setup 79.8 79.0 67.3 67.3 69.1 63.0 59.8 127.2 115.3 71.3 62.1 70.2 66.8 61.7 59.0
+         first 2.4 2.3 2.3 2.2 2.2 2.2 2.3 3.3 3.4 2.6 2.3 2.2 2.3 2.3 2.3
+         steady 1.1 (all 15)
+1 MiB    copy 2803.0 2804.7 2700.2 2705.4 2642.5 2692.2 3960.6 3854.7 3888.5 3259.2 3903.9 4230.4 3698.1 3675.6 3650.2
+         setup 1033.2 1024.3 1003.6 989.7 990.3 1029.1 1776.7 1741.7 1729.1 1360.0 1944.4 1876.4 1852.8 1791.1 1705.5
+         first 314.0 311.6 305.3 303.5 310.3 313.5 305.7 305.3 308.1 318.8 315.5 188.3 191.7 187.1 186.0
+         steady 281.7 270.7 275.4 270.6 270.7 282.5 278.8 278.9 279.1 278.8 187.6 169.4 164.5 165.9 165.5
+64 MiB   copy 246702.4 277462.5 219969.8 215868.8 217487.1 190616.5 221027.5 214945.8 206560.0 209581.1 213685.9
+              213152.1 210985.8 216979.8 215730.6
+         setup 146290.5 147375.3 101709.3 96936.4 94026.4 104016.7 94983.8 99130.6 97398.4 96258.5 97778.8 96067.1
+               100687.0 95635.7 94793.1
+         first 44506.3 45122.7 38694.9 43558.3 28677.7 28926.1 45039.0 42013.1 36573.8 27188.2 29079.8 32390.2
+               45989.8 26399.2 43824.7
+         steady 18256.6 18484.8 10621.1 18361.4 10391.4 10698.7 18488.2 10206.0 12285.8 10636.2 10738.3 10659.2
+                12334.9 10625.7 18686.2
+```
+
+**What it says.**
+- **A steady mapped read costs 4–10 % of a copy read at every size on both Linux machines** (steady / copy 0.037 to
+  0.103), the step's ratio under 1 by a factor of ten and more. A mapped read is loads from memory, 8 bytes each
+  through atomics (the client may never borrow memory the daemon writes): 64 MiB in 9.6 to 10.5 ms, 6.4 to 7.0 GB/s,
+  on both machines; a copy read of the same file is a request a page and its copies, 94 to 191 ms.
+- **A map repays itself after one read from 1 MiB up, and after 3 to 5 reads of a 4 KiB file.** From 1 MiB its whole
+  setup, the fill of the copy included, already costs less than one copy read (64 MiB: 39 to 97 ms against 94 to
+  191 ms), because the fill is one copy inside the daemon where a copy read is many requests. At 4 KiB the setup's fixed
+  cost (a memfd, its map, its seals, a descriptor over the socket, the client's map: about 21 µs on the box, 55 to 59 µs
+  on fedora) is what the reads repay, 4 to 24 µs a read.
+- **The first mapped read pays the client's page faults:** 1.6 to 2.6 times a steady read at 64 MiB (15.4 to 27.7 ms
+  against 9.6 to 10.5 ms), about 2 times at 4 KiB. The break-even counts them in the one-off cost.
+- **The two runs agree within their spread on each machine**: every best lies inside the other run's samples, and the
+  break-even counts match at 1 MiB and 64 MiB and differ by one or two reads at 4 KiB, where the copy read's best moves
+  most with the load (box 4.8 against 9.4 µs, both runs ranging to 31–35 µs).
+- **Busy-machine caveat:** the box ran at load 65 to 80 with the lowest CPU weight, so its samples are wide (a steady
+  64 MiB read 9.6 to 33.5 ms); the bests are the honest floor, the spreads are the busy machine. Bimodal steady reads on
+  fedora (161 or 276 µs a MiB) follow which of the i9's two core kinds the thread ran on.
+
+**This Mac: the copy read's baseline, the map arm not priced.** Apple M5 Max, 128 GiB, macOS 26.4.1, 16:14 UTC, load
+average 36 to 58 from other sessions. macOS hands no direct map until G-direct step 4, so every `MapRead` here was
+answered `MapUnavailable` and read by copy: the bench printed `map path=copy (not priced)`, its "map setup" is that
+refusal plus a paged read, and its "mapped reads" are copies out of the client's own buffer. Only the copy read is a
+finding, best of 15 (run 1 / run 2):
+
+| file | copy read | "map setup" (refused, then a copy read) |
+|---|---|---|
+| 4 KiB | 37.2 / 47.2 µs | 55.5 / 64.8 µs |
+| 1 MiB | 7,469.9 / 9,256.6 µs | 7,351.3 / 8,795.7 µs |
+| 64 MiB | 741.6 / 1,178.4 ms | 898.7 / 945.4 ms |
+
+The Mac's copy read is 4 to 8 times the Linux machines' at 1 MiB and 64 MiB under its load (64 MiB: 0.74 to 1.18 s best,
+up to 5.7 s); step 4 prices its direct map against these.
+
 ## 2026-10-18: what the confined-descriptor rule costs a local zero-copy read (A-135)
+
+> Superseded 2026-10-25: A-171 hands a sealed copy of the file that meets the rule, and the entry above measures what
+> the map buys back against the copy read on two Linux machines. This record stays for what it measured then.
 
 Since 2026-10-18 the daemon refuses to hand a peer a descriptor that authorizes more than the read it answers
 (`Control::send_mapping` → `confined_for_a_peer`; the escape it closes is

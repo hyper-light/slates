@@ -11230,6 +11230,18 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     re-witness asks the host's clock as a copy-up does (A-162).
   - A racy witness never settles: after a re-hash past its tick confirms it, the fingerprint alone would do, but every
     drift check of it still hashes the whole file.
+- **Copy-once-map-many against copy-per-read, measured (G-direct step 3, 2026-10-25).** BENCHMARKS, "Copy-once-map-many
+  against copy-per-read". On the box (load 65–80, capped) and on fedora (load 13), two runs each, best of 15: a steady
+  mapped read costs 3.7 % to 10.3 % of a copy read at 4 KiB, 1 MiB and 64 MiB alike; a map repays its setup after one
+  read from 1 MiB up (its whole setup, the fill included, already costs less than one copy read: 64 MiB in 39–97 ms
+  against 94–191 ms) and after 3 to 5 reads of a 4 KiB file. The two runs agree within their spread on each machine.
+  This Mac's map arm reads by copy until step 4, so it is recorded as the copy read's baseline only (64 MiB in 0.74 to
+  1.18 s best at load 36–58, 4 to 8 times the Linux machines'), for step 4 to price its direct map against.
+  - **Fixed on the way, CI's ubuntu lane (run 40209801720 on 604e0875):** the share test asked for a third map right
+    after a second client connected and expected the share halved; on CI the shard had not yet taken the second client
+    in (a client reaches its shard as a task after its connect returns), so the share was still two. The test now has
+    the second client make a request first, whose answer shows the shard serves it.
+
 - **The direct map's lifetime and bounds (A-172, G-direct step 2, 2026-10-25): built, and proven on Linux by real
   clients.**
   - **What:** `ReleaseMap` (and `Client::release_map`) gives a copy back; a reap gives back every copy a dead client

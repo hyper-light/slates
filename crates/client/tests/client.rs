@@ -561,8 +561,12 @@ fn a_client_past_its_share_of_maps_is_refused_typed_with_nothing_made() {
   );
   client.release_map(first).unwrap();
   let _third = client.map_read(id, "/c").unwrap();
-  // A second client halves the share: the first, holding two, is past its one; the second is within its own.
+  // A second client halves the share: the first, holding two, is past its one; the second is within its own. The
+  // shard counts a client once it serves it, and a client reaches its shard as a task after its connect returns, so the
+  // second client's answered request is what shows the shard serves it (CI, 2026-10-25: asked at once, the share was
+  // still two).
   let mut second_client = connect(&instance);
+  second_client.list().unwrap();
   assert_share_refused(client.map_read(id, "/a").err(), (2, 1));
   assert_eq!(counted(&daemon, "dax.local_map_share_refused"), 2);
   drop(second_client.map_read(id, "/a").err());
