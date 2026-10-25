@@ -10,9 +10,12 @@ stream, what each side guarantees, what a guest sees, and why. The evidence is l
 slates' side as built so far (2026-10-24), proven by use on macOS:
 - the object (`crates/mem/src/dax_object.rs`);
 - the descriptor answer, with its fill, bounds and refusals (`crates/server/src/shards/dax.rs`);
-- the DAX offer at INIT and in attributes (`slates_bridge_core::DaxOffer`).
+- the DAX offer at INIT and in attributes (`slates_bridge_core::DaxOffer`);
+- ingest at FSYNC, FLUSH, RELEASE, READ, FORGET and the stream's end (step 3), a refused one answered with its errno;
+- write-through at the volume's write boundary (step 4, `crates/vfs/src/shards_backing.rs`), and the overlay rules
+  below ("What a guest sees").
 
-Ingest (step 3) and write-through (step 4) are next.
+The testguest routine (step 5) and a real boot (step 6) are next.
 
 ## The decision in one paragraph
 
@@ -185,6 +188,16 @@ The same as through the mount route, measured there in `docs/wip/virtiofs.md`:
   The guest's unsynced stores in its maps are lost, and its next sync fails, so it knows.
 - **A detached or revoked attachment:** the stream ends after a final ingest, and slates writes through no longer. The
   VM keeps the bytes it already maps, which it was allowed to read, and its writes reach nothing.
+- **A sync the volume refuses** (no room, a file drifted beneath an overlay): its FSYNC or FLUSH answers the errno, so
+  `fsync(2)` or `close(2)` fails; the stores stay in the map, and the next sync tries what still differs.
+- **A file beneath an overlay that no one has written** follows the disk (D-25). An outsider's edit reaches a map of it
+  when slates sees the edit: before the reply to the guest's next request that could show it (a GETATTR's new size,
+  say), the map is refilled, a copy slice a turn. Until that request, as with a guest's cached pages, the map holds the
+  bytes it had. A **writable** ask of such a file copies it up first, as its first write would. From then on the
+  outsider's edit is drift that `status` reports, never taken for the guest's stores. That ask can be refused with the
+  copy-up's errno.
+- **A file an in-process guest maps writable** (slates' own virtio-fs device) is refused `EBUSY`, and the other way
+  round: those stores go to the file's block past the write boundary, where no object could follow them.
 - **A saved VM (Shards D176), from the Shards owner.** slates refuses SAVE and RESTORE today, so no snapshot of a VM
   holding a slates share exists. If they are served one day, the window's memory is not in the snapshot. Stores made
   after the save and before the stream ends are ingested, so a VM restored from that snapshot sees them, as a host
@@ -209,14 +222,14 @@ Memory a guest touches is charged to the VM process:
 slates' own fills cover only bytes the volume references, since a hole needs none, so they are at most one copy of
 the volume per attachment, counted against the derived budget of guarantee 9.
 
-## Costs, to be measured in steps 2 and 3
+## Costs
 
-| cost | estimate |
+| cost | estimate, or measurement where one is recorded |
 |---|---|
 | Memory | One copy of each range the guest has asked for, held until the node is forgotten or the stream ends: at most one copy of the volume per attachment (slope 1.0 over mapped bytes, the cost `docs/bugs/2026-10-18-…` measured and rejected for the in-process device, where zero copy was possible). |
 | Time: fill | At most one 2 MiB copy per range, at its first ask. |
-| Time: write-through | One copy of the changed bytes per live backing. |
-| Time: ingest | One comparison over the ranges asked writable, per sync point. |
+| Time: write-through | One copy of the changed bytes per live backing: measured 117 µs per MiB per backing on an M5 Max, 3.7 times the write itself (BENCHMARKS, "What write-through adds to a write of a mapped file"). |
+| Time: ingest | One comparison over the ranges asked writable, per sync point: measured 0.70–1.14 ms per mapped MiB on an M5 Max (BENCHMARKS, "What a guest's FSYNC costs when its map is ingested"). |
 
 ## Rejected, with the reason
 

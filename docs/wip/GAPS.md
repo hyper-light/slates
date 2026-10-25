@@ -11149,6 +11149,54 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   - **Proposed as an option:** the ask carrying its range (26 bytes), so fills and ingests follow what the guest maps.
   - **Replaced in the plan:** the revoke protocol (a doorbell, REVOKES/REVOKED, a stage-2 unmap and remap), which
     would have made every writer wait on a VM.
+- **Part 3, step 3's bug, fixed (2026-10-24): a refused write-back answered success.** An ingest the volume refused (no
+  room, the file unreadable after drift) was counted and the held `FSYNC` served as if it had succeeded: an `fsync(2)`
+  returned 0 with the guest's stores not all in the volume. The `FSYNC`, `FLUSH` or `READ` now answers the refusal's errno
+  (`ENOSPC` in the test), and the stores stay in the map for the next sync to compare again
+  (`docs/bugs/2026-10-24-a-refused-dax-write-back-answered-its-fsync-success.md`; failing test first, red-checked).
+- **Part 3, step 4 built (2026-10-24): every change of a file reaches its guests' maps before it is acknowledged.**
+  - **Where.** The backings live in the shard's store (`slates_vfs::shards_backing`), so the volume's write boundary
+    writes each change through itself, whatever transport made it: a write's bytes over every filled range, the hole an
+    extension opens and the part a truncate cuts zeroed, and an SDK edit's shifted tail copied again. Writes go through
+    slates' own mapping, never `write(2)`, which would wake Shards' inotify watch. An ingest suppresses its own backing
+    while it writes the guest's stores, so a newer store is never overwritten with what it read.
+  - **Beneath an overlay** (D-25), where the disk changes an untouched file with no write:
+    - a writable ask copies the file up first (§4.6 DAX rights), so a write-back never takes an outsider's edit for the
+      guest's: the edit is drift, and a large file's sync then answers `EIO` rather than write over it;
+    - an untouched file's backings are marked stale where the base plane adopts a change (an edit seen by a listing or
+      by the descriptor's `fstat`, another file at the name, a `rewitness`) and refilled, a copy slice a turn, before
+      anything more reaches the guest: the reply that reveals the change waits for the map to show it;
+    - `rewitness` refuses an entry a guest maps writable (`DaxMapped`, `EBUSY`), whose unsynced stores a refill would lose.
+  - **The routes exclude each other.** An in-process writable DAX map stores into the file's own block, past the write
+    boundary, so `Volume::dax_map_write` refuses a file with a Shards backing and the Shards ask refuses a file with a
+    live in-process writable map (`EBUSY`).
+  - **Proven by use** (`crates/server/tests/shards.rs`, 6 tests, macOS arm64):
+    - another attachment's write, an NFS write and the guest's own stream reach its idle map before their replies, with
+      nothing sent to the guest;
+    - the guest's unsynced store survives them;
+    - a truncate and the hole an extension opens read zeros;
+    - the model test holds over generated histories of stores, syncs, writes past the end and truncates;
+    - a writable map of an untouched base file never takes an outsider's edit for the guest's;
+    - a read-only one shows an outsider's edit by the reply that reveals it;
+    - a writable ask after an edit finds the map refilled and writes back only the guest's store.
+  - **In the vfs** (`crates/vfs/tests/shards_backing.rs`, 7 tests): the oracle over generated writes, stores, truncates
+    and edits (300 cases in release), the suppression, the size bound, the stale marks, `rewitness`, the exclusion.
+  - **Red-checked**, each mutation failing its tests: no write-through; no zeroing on extension; no zeroing on
+    truncate; no copy-up at the writable ask; no refill; the stale mark dropped from the listing's adoption (vfs) and
+    from the descriptor's (server); no `rewitness` refusal; no exclusion.
+  - **Found and fixed on the way:** step 3's refused write-back (above), and a racy rule that made a file edited after
+    its listing racy for good (A-162).
+  - **Owed in step 4:** a server-level test of the in-process exclusion (the registry side is tested; the Shards ask's
+    check is one call); the edit's and a drift's re-copy run inside one turn, bounded by the filled ranges rather than
+    sliced.
+- **Open, found by step 4 (2026-10-24), reported:**
+  - `verify_current` (§4.15's digest) re-points an untouched inode to another file found at its name, where A-151
+    detaches the inode and gives the name a new one; no test reaches this path (`digest_begin` has none). Its backings
+    are marked stale there, in case it runs.
+  - `rewitness` records every witness `racy: false`, so a same-tick edit after it is caught only by a later fingerprint
+    change (correctness on a coarse-granularity filesystem).
+  - A racy witness never settles: after a re-hash past its tick confirms it, the fingerprint alone would do, but every
+    drift check of it still hashes the whole file.
 - **Open, found by the new tests: a read-only attachment is not a read-only file system to its client.** On every FUSE
   transport (the shared bridge) an open for writing is granted and each write through it refused `EPERM`; NFS answers
   `PERM`. A read-only file system answers `EROFS`, at the open for an open. Every change is refused and nothing lands,

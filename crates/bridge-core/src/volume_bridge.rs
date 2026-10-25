@@ -869,6 +869,17 @@ impl Bridge for VolumeBridge<'_> {
     }
   }
 
+  fn witness_for_writable_map(&mut self, object: ObjectId, cx: &OpContext) -> Result<(), VfsError> {
+    self.authorize_write(cx)?;
+    match host_for(&mut self.host, self.volume.is_overlay())? {
+      Some(host) => self
+        .volume
+        .with_host(host)
+        .witness_content(self.store, InodeNo(object.inode)),
+      None => Ok(()),
+    }
+  }
+
   fn opendir(&mut self, object: ObjectId, cx: &OpContext) -> Result<u64, VfsError> {
     self.authorize_read(cx)?;
     if self.volume.kind(self.store, InodeNo(object.inode))? != Kind::Dir {

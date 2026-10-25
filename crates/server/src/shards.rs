@@ -46,6 +46,7 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 
 use slates_bridge_core::volume_bridge::new_handle_store;
 use slates_bridge_core::{AttachmentId, Rights, View, VolumeBridge};
+use slates_bridge_fuse::Opcode;
 use slates_bridge_fuse::bridge::{
   EIO, KernelChange, kernel_changes, needs_barrier, reclaim_unreported,
 };
@@ -151,6 +152,11 @@ pub(crate) struct ShardsStream {
   ingest: Option<dax::Ingest>,
   /// Whether the ingest a stream takes before it ends has been started: once, whatever ends it.
   ingested_at_end: bool,
+  /// A refill under way: the objects of backings the disk changed beneath copied again, a slice a turn, before anything
+  /// more reaches the guest ([`dax::refill_step`]).
+  refill: Option<dax::Refill>,
+  /// The store's count of stale marks when this stream last found none of its backings stale.
+  stale_seen: u64,
 }
 
 impl std::fmt::Debug for ShardsStream {
@@ -313,6 +319,8 @@ pub(crate) fn attach(s: &mut ShardState, ask: ShardsAsk) -> Result<ShardsAttache
       owed_descriptor: None,
       ingest: None,
       ingested_at_end: false,
+      refill: None,
+      stale_seen: 0,
     },
   );
   if futures::spawn(serve(attachment))
@@ -662,15 +670,20 @@ fn turn(s: &mut ShardState, attachment: u64) -> Turned {
 /// answered, its reply out as far as the stream takes it.
 fn turn_with(s: &mut ShardState, stream: &mut ShardsStream) -> Turned {
   // An ending stream first writes back its guest's stores through its maps (step 3), once, then ends.
-  if stream.ending && stream.ingest.is_none() && !begin_end_ingest(stream) {
+  if stream.ending && stream.ingest.is_none() && !begin_end_ingest(s, stream) {
     return Turned::Ended;
   }
-  match flush(stream) {
-    Flushed::Done => {}
-    Flushed::Blocked => return Turned::Blocked,
-    Flushed::Failed => {
-      s.count(STREAM_FAILED, 1);
-      return Turned::Ended;
+  // A map the disk changed beneath is refilled before anything more reaches its guest (step 4): an owed reply that may
+  // show the change waits for it.
+  let refill_owed = !stream.ending && dax::refill_owed(s, stream);
+  if !refill_owed {
+    match flush(stream) {
+      Flushed::Done => {}
+      Flushed::Blocked => return Turned::Blocked,
+      Flushed::Failed => {
+        s.count(STREAM_FAILED, 1);
+        return Turned::Ended;
+      }
     }
   }
   // The volume is gone (destroyed): the attachment ends with it.
@@ -681,6 +694,10 @@ fn turn_with(s: &mut ShardState, stream: &mut ShardsStream) -> Turned {
   if crate::verbs::live_tree_fenced(s, stream.volume) {
     return Turned::Fenced;
   }
+  if refill_owed {
+    dax::refill_step(s, stream);
+    return Turned::Served;
+  }
   // An ingest runs a slice a turn; when it is done, the request it held is served, or the stream ends.
   if stream.ingest.is_some() {
     return ingest_turn(s, stream);
@@ -689,19 +706,13 @@ fn turn_with(s: &mut ShardState, stream: &mut ShardsStream) -> Turned {
   // and the device sends nothing more, since it waits for that answer with its stream held.
   if stream.pending.is_some() {
     dax::step(s, stream);
-    return match flush(stream) {
-      Flushed::Done | Flushed::Blocked => Turned::Served,
-      Flushed::Failed => {
-        s.count(STREAM_FAILED, 1);
-        Turned::Ended
-      }
-    };
+    return flush_unless_refill_owed(s, stream);
   }
   let (control, total) = match take_frame(stream) {
     Took::Frame { control, total } => (control, total),
     Took::Waiting => return Turned::Waiting,
     Took::Closed => {
-      return if begin_end_ingest(stream) {
+      return if begin_end_ingest(s, stream) {
         Turned::Served
       } else {
         Turned::Ended
@@ -709,7 +720,7 @@ fn turn_with(s: &mut ShardState, stream: &mut ShardsStream) -> Turned {
     }
     Took::Truncated => {
       s.count(FRAME_TRUNCATED, 1);
-      return if begin_end_ingest(stream) {
+      return if begin_end_ingest(s, stream) {
         Turned::Served
       } else {
         Turned::Ended
@@ -744,15 +755,24 @@ fn turn_with(s: &mut ShardState, stream: &mut ShardsStream) -> Turned {
         .get(LENGTH_BYTES..total)
         .unwrap_or(&[])
         .to_vec();
-      if dax::hold_for_ingest(stream, &request, total) {
+      if dax::hold_for_ingest(s, stream, &request, total) {
         return Turned::Served;
       }
-      serve_request(s, stream, total, false)
+      serve_request(s, stream, total, Ingested::default())
     }
   };
   consume(stream, total);
   if !served {
     return Turned::Ended;
+  }
+  flush_unless_refill_owed(s, stream)
+}
+
+/// Sends what `stream` owes its guest, unless serving it marked one of the stream's backings stale: the reply may show
+/// the disk's change (a size, a time), so it waits for the refill the next turn begins with (step 4).
+fn flush_unless_refill_owed(s: &mut ShardState, stream: &mut ShardsStream) -> Turned {
+  if !stream.ending && dax::refill_owed(s, stream) {
+    return Turned::Served;
   }
   match flush(stream) {
     Flushed::Done | Flushed::Blocked => Turned::Served,
@@ -764,12 +784,12 @@ fn turn_with(s: &mut ShardState, stream: &mut ShardsStream) -> Turned {
 }
 
 /// Starts the ingest a stream takes before it ends, once: whether one is under way now.
-fn begin_end_ingest(stream: &mut ShardsStream) -> bool {
+fn begin_end_ingest(s: &ShardState, stream: &mut ShardsStream) -> bool {
   if stream.ingested_at_end {
     return false;
   }
   stream.ingested_at_end = true;
-  dax::ingest_before_end(stream)
+  dax::ingest_before_end(s, stream)
 }
 
 /// One turn of an ingest under way. When it is done, the request it held is served (published first where the ingest
@@ -780,18 +800,20 @@ fn ingest_turn(s: &mut ShardState, stream: &mut ShardsStream) -> Turned {
   };
   match done.then {
     dax::Then::Serve { total } => {
-      let served = serve_request(s, stream, total, done.wrote);
+      let served = serve_request(
+        s,
+        stream,
+        total,
+        Ingested {
+          wrote: done.wrote,
+          refused: done.refused,
+        },
+      );
       consume(stream, total);
       if !served {
         return Turned::Ended;
       }
-      match flush(stream) {
-        Flushed::Done | Flushed::Blocked => Turned::Served,
-        Flushed::Failed => {
-          s.count(STREAM_FAILED, 1);
-          Turned::Ended
-        }
-      }
+      flush_unless_refill_owed(s, stream)
     }
     dax::Then::End => {
       if done.wrote
@@ -898,15 +920,26 @@ fn owe(stream: &mut ShardsStream, bytes: &[u8]) {
   stream.sent = 0;
 }
 
+/// What the ingest a request was held for did (step 3).
+#[derive(Clone, Copy, Debug, Default)]
+struct Ingested {
+  /// Whether it wrote the guest's stores into the volume: the change is published before the reply.
+  wrote: bool,
+  /// The errno of a write-back the volume refused, which the request answers if it is one that reports one.
+  refused: Option<i32>,
+}
+
 /// Answers the request at the head of `stream` (`total` bytes, its length word included): dispatched under the
 /// attachment's registry entry through a transient bridge, then the barrier its change waits for, refused `EIO` with
-/// what it granted given back when the barrier does not capture the volume. `false` when the attachment can no longer
-/// be served (its registry entry or its volume gone): the stream ends.
+/// what it granted given back when the barrier does not capture the volume. A request whose ingest the volume refused
+/// answers that errno where its asker reads one (an `FSYNC`, a `FLUSH` and a `READ`), so a guest's fsync or close learns
+/// its stores did not all reach the volume. A `RELEASE`'s answer the kernel ignores, and a `FORGET` has none. `false`
+/// when the attachment can no longer be served (its registry entry or its volume gone): the stream ends.
 fn serve_request(
   s: &mut ShardState,
   stream: &mut ShardsStream,
   total: usize,
-  ingested: bool,
+  ingested: Ingested,
 ) -> bool {
   crate::verbs::relieve_deferred(s);
   let dax_offer = dax::offer(s);
@@ -949,7 +982,7 @@ fn serve_request(
   // reserves (A-150), or a release of an open the committed publication counts (A-154).
   let awaits_publication = crate::verbs::awaits_publication(s, stream.volume);
   // An ingest that wrote the guest's stores before this request is published before its reply too (step 3).
-  if needs_barrier(answered.opcode, answered.error) || awaits_publication || ingested {
+  if needs_barrier(answered.opcode, answered.error) || awaits_publication || ingested.wrote {
     let captured =
       crate::verbs::publish_shard(s).is_ok_and(|published| published.captured(stream.volume));
     if !captured {
@@ -957,6 +990,14 @@ fn serve_request(
       reclaim(s, stream, &answered);
       stream.owed = refuse(answered.unique, EIO, &mut stream.outbound);
     }
+  }
+  if let Some(errno) = ingested.refused
+    && matches!(
+      answered.opcode,
+      Some(Opcode::FSync | Opcode::Flush | Opcode::Read)
+    )
+  {
+    stream.owed = refuse(answered.unique, errno, &mut stream.outbound);
   }
   true
 }

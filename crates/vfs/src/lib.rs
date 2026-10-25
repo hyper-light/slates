@@ -51,6 +51,7 @@ pub mod names;
 pub mod quota;
 pub mod recall_gate;
 pub mod recover;
+pub mod shards_backing;
 pub mod snapshot;
 pub mod trie;
 pub mod volume;

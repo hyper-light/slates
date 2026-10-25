@@ -445,13 +445,15 @@ impl Inode {
   /// the mode and owner when the observation carries them, and the host's times. The change counter
   /// moves when any of them differs from what the volume held, so a client caching by the counter
   /// sees the edit, and stays where it is when none does, so an unchanged file's cache is kept (A-38).
+  /// Whether anything differed: the caller tells the file's Shards backings (Shards part 3, step 4).
+  #[must_use]
   pub(crate) fn adopt_observed(
     &mut self,
     size: u64,
     mode_and_owner: Option<(u32, u32, u32)>,
     mtime: i64,
     ctime: i64,
-  ) {
+  ) -> bool {
     let changed = self.attrs.size != size
       || mode_and_owner.is_some_and(|(mode, uid, gid)| {
         (mode, uid, gid) != (self.attrs.mode, self.attrs.uid, self.attrs.gid)
@@ -459,7 +461,7 @@ impl Inode {
       || self.attrs.mtime != mtime
       || self.attrs.ctime != ctime;
     if !changed {
-      return;
+      return false;
     }
     self.attrs.size = size;
     if let Some((mode, uid, gid)) = mode_and_owner {
@@ -469,5 +471,6 @@ impl Inode {
     }
     self.attrs.mtime = mtime;
     self.stamp_change(ctime);
+    true
   }
 }

@@ -1743,9 +1743,10 @@ drift check `fstat`s.
   in its place (the base listing still holds the name); unlinking an overlay-only entry removes
   it. Creating an entry over a whiteout replaces the whiteout.
 - Copy-up (first write, truncate, chmod or other metadata change to a base-backed file):
-  `fstat` the base descriptor, compare with the listing's fingerprint (re-hash if racy: the
-  file's mtime is not older than the listing's read time by more than the filesystem's timestamp
-  granularity), record the `Witness` {fingerprint, BLAKE3, time}, then for the small class read
+  `fstat` the base descriptor, compare with the listing's fingerprint, record the `Witness`
+  {fingerprint, BLAKE3, time, racy}: racy when the file's timestamp tick is still open at this
+  `fstat`, its mtime not older than the host's clock then by more than the filesystem's timestamp
+  granularity (A-162; a racy witness is re-hashed by every drift check), then for the small class read
   the whole file into pinned chunks, and for the large class keep the descriptor and pin only
   the written page-multiple ranges (the rest reads through `ExtentSrc::Base`); the inode's body
   becomes `Open` over the pinned extents. The class boundary is the measured large-file class of
@@ -12075,6 +12076,25 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
+
+### A-162 — A copy-up's witness is racy only while the file's own timestamp tick is open (accepted 2026-10-24)
+Applied in the same change to: §4.5 (copy-up), `crates/vfs/src/base.rs` (`copy_up`), `crates/vfs/tests/base.rs`
+(`a_witness_taken_after_an_edit_made_since_the_listing_is_racy_only_while_the_edits_tick_is_open`), GAPS,
+`docs/bugs/2026-10-24-a-copy-up-judged-its-witness-racy-by-the-listings-time.md`.
+- Changes §4.5's copy-up: the witness's racy flag is decided by the host's clock at the copy-up's own `fstat` (racy when
+  `now − mtime` is within the filesystem's timestamp granularity), no longer by the directory listing's read time. The
+  witness's fingerprint is that `fstat`; whether a later edit in the same tick could hide from it is a question about
+  that moment, as git's racy-clean rule asks it of the time a stat was recorded [B: git racy-git].
+- Why: a file edited after its directory was listed has an mtime later than the listing's read time, and the old
+  subtraction saturated to zero: racy, for good. Every later drift check of such a witness hashed the whole file through
+  its descriptor, so every read of an unpinned range did. Found by the Shards route's refill (A-161's part 3), which
+  read a 3 MiB file in 76 slices, each re-hashing the whole file: a refill of one range took past the test's 5 s wait in
+  a debug build.
+- Unchanged: T-1.11 (a file copied up in the tick it was written is racy, and its in-place edit is caught by
+  re-hashing); the listing racy rule for directories (§4.5), which is about the listing's own read.
+- Owed, reported: a racy witness stays racy even after a re-hash at a time past its tick has confirmed it, so a
+  genuinely racy large file (a coarse-granularity filesystem) still hashes whole on every drift check; and `rewitness`
+  records every witness not racy, so a same-tick edit after a rewitness is caught only by a later fingerprint change.
 
 ### A-161 — A Shards microVM's fs device is served by the daemon over an anonymous stream (accepted 2026-10-24)
 Applied in the same change to:

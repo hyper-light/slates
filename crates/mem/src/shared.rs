@@ -1100,7 +1100,8 @@ mod platform {
   /// One range of a memory object, mapped on its own by the placed `mmap` every object here uses: a DAX object's views
   /// (`crate::dax_object`), which cannot map their object whole. The mapping is unmapped when the view drops. No
   /// reference to its bytes leaves this crate: the DAX object reaches them through atomics at [`RangeView::base`], and
-  /// lends [`RangeView::pages_mut`] to a page-giving `madvise` alone, which reads and writes no byte through it.
+  /// on Linux lends `RangeView::pages_mut` (which exists there alone, so it is named, not linked) to a page-giving
+  /// `madvise` alone, which reads and writes no byte through it.
   pub(crate) struct RangeView(Mapped);
 
   impl RangeView {

@@ -738,6 +738,71 @@ fn a_witness_is_racy_only_within_the_hosts_own_clock() {
   );
 }
 
+/// The racy rule (§4.5) asks whether a file's timestamp tick is still open when its fingerprint is taken. Do: list a
+/// directory, then have the host edit a file in it a millisecond later, let a second pass, and copy the file up. Expect
+/// the witness not racy: its fingerprint is the copy-up's own `fstat`, taken long after the edit's tick closed. Until
+/// 2026-10-24 the copy-up compared the edit's time with the listing's read time instead, and an edit made after the
+/// listing saturated that difference to zero: racy for good, and every later read of the file hashed all of it
+/// (found by the Shards route's refill, which read a 3 MiB file in 76 slices, each re-hashing the whole file).
+#[test]
+fn a_witness_taken_after_an_edit_made_since_the_listing_is_racy_only_while_the_edits_tick_is_open()
+{
+  let mut host = SimHost::new();
+  host.set_granularity_ns(1_000);
+  host.advance_ns(UNIX_SCALE_NS);
+  host.replace_file("/edited.txt", b"before the listing");
+  host.advance_ns(1_000_000_000);
+  let mut store = store();
+  let root = host.root();
+  let facts = host.facts(root).unwrap();
+  let mut vol = Volume::create_overlay(
+    &mut store,
+    VolumeConfig {
+      prefix: 7,
+      names: NameEquivalence::Exact,
+      quota: Quota::Bounded { limit: 1 << 30 },
+      journal_bytes: 1 << 20,
+      clock: Box::new(slates_vfs::clock::HostClock::new()),
+    },
+    BaseConfig {
+      root,
+      facts,
+      large_class_bytes: LARGE,
+    },
+  )
+  .unwrap();
+  let f = vol
+    .with_host(&mut host)
+    .resolve(&mut store, "/edited.txt")
+    .unwrap()
+    .inode;
+  host.write_in_place("/edited.txt", b"edited after the listing", 1_000_000);
+  host.advance_ns(1_000_000_000);
+  vol
+    .with_host(&mut host)
+    .chmod(&mut store, f, 0o600)
+    .unwrap();
+  let witness = vol.base_plane().unwrap().witness(f).unwrap();
+  assert!(
+    !witness.racy,
+    "an edit a second before the copy-up, at a microsecond granularity, is not racy"
+  );
+  host.replace_file("/fresh.txt", b"edited in the copy-up's own tick");
+  let g = vol
+    .with_host(&mut host)
+    .resolve(&mut store, "/fresh.txt")
+    .unwrap()
+    .inode;
+  vol
+    .with_host(&mut host)
+    .chmod(&mut store, g, 0o600)
+    .unwrap();
+  assert!(
+    vol.base_plane().unwrap().witness(g).unwrap().racy,
+    "a file whose tick is still open when the copy-up takes its fingerprint is racy"
+  );
+}
+
 /// T-1.12: `rm -r` of a 40k-entry base directory then recreate two files inside; expect one
 /// opaque directory over the whiteout, two overlay entries, and a merged listing of exactly two.
 #[test]

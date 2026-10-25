@@ -6565,6 +6565,30 @@ step for a root of 256 directories.
   daemon's floor. The doubling itself is open: a ring a lagging reader has grown copies its whole length in one append
   (GAPS, "the journal's ring grows by copying").
 
+## What write-through adds to a write of a mapped file (Shards part 3, step 4; 2026-10-24)
+
+**The question.** Every change of a file a Shards guest maps is written into its DAX object before the change returns
+(`slates_vfs::shards_backing`, at the volume's write boundary). The object is memory a VMM shares, so the copy goes
+through 8-byte atomic stores (racy shared memory is reached only through atomics), not a vectorized copy. This records
+what that adds to a write, per MiB written, for one backing. A file no guest maps pays one map lookup per write.
+
+**The command.** `cargo test --release -p slates-vfs --test shards_backing -- --ignored write_through_cost --nocapture`.
+One volume, two 1 MiB files, one with a backing whose range is filled. Each round overwrites a file in 64 KiB writes
+(a FUSE write's size); the two files alternate round by round, 25 rounds each; best reported, all shown.
+
+**The machine.** Apple M5 Max, 18 cores, 128 GiB, macOS 26.4.1, 17:40 PDT, load average 4.87 from other sessions.
+
+| file | best ns per MiB | all 25 rounds, ns |
+|---|---|---|
+| no backing | 42,958 | 104000, 45375, 43708, 46792, 43708, 43625, 43250, 78500, 65958, 137584, 95250, 69125, 43750, 43333, 43500, 47125, 44541, 48417, 43500, 43750, 43292, 43250, 42958, 45916, 46917 |
+| one backing | 159,750 | 366750, 183917, 181792, 183708, 181291, 181125, 292833, 269333, 277458, 260375, 217542, 172542, 170333, 170333, 171250, 178459, 168875, 173291, 171208, 172833, 170084, 186000, 179875, 159750, 163167 |
+
+- **Write-through adds about 117 µs per MiB per backing** (1 MiB in 117 µs is about 9 GB/s), 3.7 times the write itself
+  here: about 7.3 µs on a 64 KiB write, against 2.7 µs for the write.
+- The write itself copies with the platform's vectorized `memcpy`; the object takes one 8-byte store per word. A wider
+  single-copy-atomic store (16 bytes on Arm with LSE2) is the candidate if a profile of a real guest's writes shows this
+  cost; until then it is recorded, not changed.
+
 ## What a guest's FSYNC costs when its map is ingested (Shards part 3, step 3; 2026-10-24)
 
 **The question.** A Shards guest stores into a file's DAX object through its map. slates writes those stores back into

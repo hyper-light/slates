@@ -76,6 +76,8 @@ const EISDIR: i32 = 21;
 const EINVAL: i32 = 22;
 /// Linux's `ENOMEM`, a fill past the shard's DAX budget.
 const ENOMEM: i32 = 12;
+/// Linux's `ENOSPC`, a write the volume's bound refuses.
+const ENOSPC: i32 = 28;
 /// Format: `FATTR_SIZE`, a SETATTR's bit for the size.
 const FATTR_SIZE: u32 = 1 << 3;
 /// Format: `O_RDWR`, an open's access mode.
@@ -258,6 +260,15 @@ impl Guest {
     let mut bytes = vec![0u8; usize::try_from(word & !CONTROL).unwrap()];
     self.stream.read_exact(&mut bytes).unwrap();
     Some((word & CONTROL != 0, bytes))
+  }
+
+  /// Whether the daemon has sent this guest nothing it has not read: a read that would block.
+  fn nothing_sent(&mut self) -> bool {
+    self.stream.set_nonblocking(true).unwrap();
+    let mut byte = [0u8; 1];
+    let waiting = self.stream.read(&mut byte);
+    self.stream.set_nonblocking(false).unwrap();
+    matches!(waiting, Err(e) if e.kind() == ErrorKind::WouldBlock)
   }
 
   /// Whether the daemon has ended the stream: its next read answers the end (nothing is owed to this guest).
@@ -1710,6 +1721,472 @@ fn a_read_only_attachments_object_is_never_ingested() {
   );
   drop(client);
   drop(daemon);
+}
+
+// --- Shards part 3, step 4: a change through another path reaches the guest's map. ---
+
+/// The volume's whole file `name`, read through a fresh read-only stream in reads of the largest a guest may ask.
+fn volume_file(daemon: &Daemon, id: VolumeId, name: &str) -> Vec<u8> {
+  let mut reader = Guest::over(attach(daemon, id, None, Intent::Read).unwrap());
+  reader.init();
+  let node = reader.lookup(ROOT, name).unwrap();
+  let fh = reader.open(node, O_RDONLY).unwrap();
+  let piece = slates_bridge_fuse::init::MAX_WRITE;
+  let mut bytes = Vec::new();
+  loop {
+    let got = reader
+      .read(node, fh, u64::try_from(bytes.len()).unwrap(), piece)
+      .unwrap();
+    if got.is_empty() {
+      break;
+    }
+    bytes.extend_from_slice(&got);
+  }
+  assert_eq!(reader.close(node, fh), (0, 0));
+  bytes
+}
+
+/// AC (Shards part 3, step 4), by use. Do: a guest maps a file's first range writable and stores through its map;
+/// with that guest's stream idle throughout, another attachment writes into the range, the host writes over NFS, the
+/// guest writes through its own stream, and the other attachment truncates the file and then extends it over bytes
+/// the guest stored past the new end. Expect each change in the guest's map as soon as its writer has its reply, the
+/// guest's own store at other bytes still there, the cut and the opened hole reading zeros (not the guest's junk),
+/// nothing sent the idle guest throughout (no revoke, no message to the device), and the guest's store in the volume
+/// once it syncs.
+#[test]
+fn a_change_through_another_path_reaches_the_guests_map_before_its_reply() {
+  let (daemon, client, id) = dax_provisioned("shards-dax-through", 16 << 20, None);
+  let mut guest = Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
+  guest.init();
+  let (node, fh, _content, window, _object) = mapped_file(&mut guest, "shared", 0xb1);
+  window.store(50_000, b"the guest's own store");
+  let mut other = Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
+  other.init();
+  let other_node = other.lookup(ROOT, "shared").unwrap();
+  let other_fh = other.open(other_node, O_RDWR).unwrap();
+  other
+    .write(other_node, other_fh, 4096, b"another attachment")
+    .unwrap();
+  assert_shown(
+    &window,
+    4096,
+    b"another attachment",
+    "another attachment's write",
+  );
+  let (mut host, root) = host_mount(&daemon, "dax");
+  let host_file = lookup(&mut host, &root, "shared", 2);
+  write(&mut host, &host_file, b"over NFS", 3);
+  assert_shown(&window, 0, b"over NFS", "an NFS write");
+  guest
+    .write(node, fh, 9000, b"the guest's own stream")
+    .unwrap();
+  assert_shown(
+    &window,
+    9000,
+    b"the guest's own stream",
+    "its own stream's write",
+  );
+  assert_shown(
+    &window,
+    50_000,
+    b"the guest's own store",
+    "its unsynced store",
+  );
+  cut_and_extension_read_zeros(&mut other, other_node, other_fh, &window);
+  assert!(
+    guest.nothing_sent(),
+    "no change sent the guest anything: there is no revoke"
+  );
+  assert_eq!(guest.fsync(node, fh), 0);
+  assert_eq!(
+    volume_bytes(&daemon, id, "shared", 50_000, 21),
+    b"the guest's own store"
+  );
+  drop(client);
+  drop(daemon);
+}
+
+/// Asserts the guest's map shows `bytes` at `at`, `what` naming the change in the failure.
+fn assert_shown(window: &WindowRange, at: usize, bytes: &[u8], what: &str) {
+  assert_eq!(
+    &window.bytes()[at..at + bytes.len()],
+    bytes,
+    "{what} is in the map"
+  );
+}
+
+/// The other attachment truncates the file to a MiB, the guest stores junk past the new end, and the other attachment
+/// extends the file over it by writing further on: the cut and the hole the extension opened read zeros in the map.
+fn cut_and_extension_read_zeros(other: &mut Guest, node: u64, fh: u64, window: &WindowRange) {
+  let cut_at = 1 << 20;
+  assert_eq!(other.truncate(node, u64::try_from(cut_at).unwrap()), 0);
+  assert!(
+    zeros(&window.bytes()[cut_at..]),
+    "the cut reads zeros in the map"
+  );
+  window.store(cut_at + 100, b"junk past the end");
+  other
+    .write(node, fh, u64::try_from(cut_at + 5000).unwrap(), b"extended")
+    .unwrap();
+  assert!(
+    zeros(&window.bytes()[cut_at + 100..cut_at + 117]),
+    "the hole the extension opened reads zeros, not the guest's junk"
+  );
+  assert_shown(window, cut_at + 5000, b"extended", "the extending write");
+}
+
+/// Whether `bytes` are all zeros.
+fn zeros(bytes: &[u8]) -> bool {
+  bytes.iter().all(|byte| *byte == 0)
+}
+
+/// One act of a generated history over a mapped file.
+#[derive(Clone, Debug)]
+enum DaxAct {
+  /// The guest stores through its map at `at`.
+  Store { at: usize, len: usize, seed: u8 },
+  /// The guest syncs the file through its stream.
+  Sync,
+  /// Another attachment writes at `at`, past the end too.
+  Write { at: u64, len: usize, seed: u8 },
+  /// Another attachment truncates or extends the file to `len`.
+  Truncate { len: u64 },
+}
+
+/// One generated act: a kind, an offset within the range and a little past it, a length and a seed, as one strategy
+/// (no union of strategies, whose shared parts proptest holds in an `Arc`, D-8).
+fn dax_act() -> impl proptest::strategy::Strategy<Value = DaxAct> {
+  use proptest::prelude::*;
+  let reach = DAX_RANGE + (64 << 10);
+  (0..4u8, 0..reach, 1..4096usize, any::<u8>()).prop_map(|(kind, at, len, seed)| match kind {
+    0 => DaxAct::Store {
+      at: usize::try_from(at % (DAX_RANGE - 1)).unwrap(),
+      len,
+      seed,
+    },
+    1 => DaxAct::Sync,
+    2 => DaxAct::Write { at, len, seed },
+    _ => DaxAct::Truncate { len: at },
+  })
+}
+
+/// `len` bytes no act repeats by accident, never zero.
+fn act_bytes(len: usize, seed: u8) -> Vec<u8> {
+  (0..len)
+    .map(|at| u8::try_from(at % 251).unwrap() ^ seed | 1)
+    .collect()
+}
+
+/// The model of a mapped file: the volume's bytes, and the object's first range as the guest's map shows it.
+struct DaxModel {
+  file: Vec<u8>,
+  map: Vec<u8>,
+}
+
+impl DaxModel {
+  /// Applies `act` to the model as the protocol says: a store stays in the map; a sync writes the map into the file over
+  /// the range asked writable, to the file's end; a change through another path reaches the map over the range, and a
+  /// size change zeroes what it cuts or opens there.
+  fn apply(&mut self, act: &DaxAct) {
+    let range = self.map.len();
+    match *act {
+      DaxAct::Store { at, len, seed } => {
+        let bytes = act_bytes(len, seed);
+        let end = (at + len).min(range);
+        self.map[at..end].copy_from_slice(&bytes[..end - at]);
+      }
+      DaxAct::Sync => {
+        let reach = self.file.len().min(range);
+        self.file[..reach].copy_from_slice(&self.map[..reach]);
+      }
+      DaxAct::Write { at, len, seed } => {
+        let (at, bytes) = (usize::try_from(at).unwrap(), act_bytes(len, seed));
+        let old = self.file.len();
+        if at > old {
+          self.zero_map(old, at);
+          self.file.resize(at, 0);
+        }
+        if self.file.len() < at + len {
+          self.file.resize(at + len, 0);
+        }
+        self.file[at..at + len].copy_from_slice(&bytes);
+        for (offset, byte) in bytes.iter().enumerate() {
+          if at + offset < range {
+            self.map[at + offset] = *byte;
+          }
+        }
+      }
+      DaxAct::Truncate { len } => {
+        let (len, old) = (usize::try_from(len).unwrap(), self.file.len());
+        self.zero_map(len.min(old), len.max(old));
+        self.file.resize(len, 0);
+      }
+    }
+  }
+
+  fn zero_map(&mut self, from: usize, to: usize) {
+    let (from, to) = (from.min(self.map.len()), to.min(self.map.len()));
+    if from < to {
+      self.map[from..to].fill(0);
+    }
+  }
+}
+
+proptest::proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(proptest::prelude::ProptestConfig {
+    cases: slates_test_seeds::cases(6),
+    ..proptest::prelude::ProptestConfig::default()
+  }))]
+
+  /// AC (Shards part 3, step 4), the oracle over a real daemon. Do: a generated history of up to 20 acts over a file a
+  /// guest maps writable in its first range. The acts are the guest's stores through its map, its syncs, another
+  /// attachment's writes (past the end too) and truncates, both ways. Expect after every act the guest's map to equal
+  /// the model's map and the volume's file to equal the model's file: each byte the latest write to it from either side,
+  /// a store in the volume only once synced, zeros where a size change cut or opened.
+  #[test]
+  fn the_guests_map_and_the_volume_hold_the_latest_write_to_every_byte(
+    acts in proptest::collection::vec(dax_act(), 1..20),
+  ) {
+    let (daemon, client, id) = dax_provisioned("shards-dax-model", 16 << 20, None);
+    let mut guest = Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
+    guest.init();
+    let (node, fh, content, window, _object) = mapped_file(&mut guest, "modelled", 0xc1);
+    let mut other = Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
+    other.init();
+    let other_node = other.lookup(ROOT, "modelled").unwrap();
+    let other_fh = other.open(other_node, O_RDWR).unwrap();
+    let range = usize::try_from(DAX_RANGE).unwrap();
+    let mut model = DaxModel { map: content[..range].to_vec(), file: content };
+    for (step, act) in acts.iter().enumerate() {
+      match *act {
+        DaxAct::Store { at, len, seed } => {
+          let bytes = act_bytes(len, seed);
+          let end = (at + len).min(range);
+          window.store(at, &bytes[..end - at]);
+        }
+        DaxAct::Sync => proptest::prop_assert_eq!(guest.fsync(node, fh), 0),
+        DaxAct::Write { at, len, seed } => {
+          other.write(other_node, other_fh, at, &act_bytes(len, seed)).unwrap();
+        }
+        DaxAct::Truncate { len } => proptest::prop_assert_eq!(other.truncate(other_node, len), 0),
+      }
+      model.apply(act);
+      let map = window.bytes();
+      if let Some(first) = map.iter().zip(&model.map).position(|(a, b)| a != b) {
+        proptest::prop_assert!(false, "after step {} ({:?}) the map differs first at {}", step, act, first);
+      }
+      let file = volume_file(&daemon, id, "modelled");
+      proptest::prop_assert_eq!(file.len(), model.file.len(), "after step {} the file's size", step);
+      proptest::prop_assert!(file == model.file, "after step {} ({:?}) the file differs", step, act);
+    }
+    drop(client);
+    drop(daemon);
+  }
+}
+
+/// AC (Shards part 3, step 3), a write-back the volume refuses. Do: fill a bounded volume but for a MiB, map the first
+/// range of a sparse file writable, store two MiB through the map, and `FSYNC` the file. Expect the `FSYNC` answered
+/// `ENOSPC` and the ingest counted refused: a guest's fsync must learn that its stores did not all reach the volume,
+/// never be told they did.
+#[test]
+fn a_write_back_the_volume_refuses_fails_the_fsync_that_asked_for_it() {
+  let (daemon, client, id) = dax_provisioned("shards-dax-nospace", 6 << 20, None);
+  let mut guest = Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
+  guest.init();
+  guest_writes_large(&mut guest, "filler", &patterned(5 << 20, 0x11));
+  let (node, fh) = guest.create(ROOT, "sparse").unwrap();
+  assert_eq!(
+    guest.truncate(node, 3 << 20),
+    0,
+    "a sparse file holds no bytes"
+  );
+  let object = guest.descriptor(node, true, Some((0, DAX_RANGE))).unwrap();
+  let window = WindowRange::map(&object, 0);
+  window.store(0, &patterned(2 << 20, 0x22));
+  assert_eq!(
+    guest.fsync(node, fh),
+    ENOSPC,
+    "the fsync learns the write-back was refused"
+  );
+  assert!(wait_for_count(&daemon, "shards.dax_ingest_refused", 1) >= 1);
+  drop(client);
+  drop(daemon);
+}
+
+/// An overlay volume over a fresh directory in the build output holding file `name` of `bytes` (A-50): the directory,
+/// removed when dropped, and the volume.
+fn overlay_holding(
+  client: &mut Client,
+  name: &str,
+  bytes: &[u8],
+) -> (common::target::TargetDir, VolumeId) {
+  let base = common::target::target_dir();
+  base.seed(name, bytes);
+  let reply = client.call(&RequestBody::Create {
+    name: "over".into(),
+    size: SizeClass::Bounded { limit: 64 << 20 },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: Some(base.path.clone()),
+  });
+  let ReplyBody::Created { id } = reply else {
+    panic!("the overlay was not created: {reply:?}");
+  };
+  (base, id)
+}
+
+/// The host edits file `name` of `base` in place, as an outsider beneath an overlay does: `bytes` over its first bytes,
+/// the file's inode kept.
+fn host_edits_in_place(base: &common::target::TargetDir, name: &str, bytes: &[u8]) {
+  // The test's own directory in the build output (A-50), as its seeding is.
+  #[allow(clippy::disallowed_methods)]
+  let mut file = std::fs::OpenOptions::new()
+    .write(true)
+    .open(format!("{}/{name}", base.path))
+    .unwrap();
+  file.write_all(bytes).unwrap();
+}
+
+/// AC (Shards part 3, step 4), beneath an overlay. Do: map the first range of a base file no one has written, writable;
+/// the host edits the file in place; the guest, having stored nothing, syncs it. Expect nothing written back and the
+/// edit reported as drift. The writable ask copied the file up, so the object holds the witnessed bytes, and the
+/// outsider's change is drift. It is never taken for the guest's stores, which a landing would then apply over it.
+/// The sync's answer follows the file's class (§4.5): a small file's witnessed bytes are in memory, so it succeeds; a
+/// large one's are read from the disk's file, which the edit changed beneath the witness, so the volume refuses it
+/// (`BaseDrift`) and the sync answers `EIO`.
+#[test]
+fn a_writable_map_of_an_untouched_base_file_never_takes_an_outsiders_edit_for_the_guests() {
+  let (daemon, mut client, _scratch) = dax_provisioned("shards-dax-witness", 16 << 20, None);
+  let content = patterned(3 << 20, 0x31);
+  let (base, overlay) = overlay_holding(&mut client, "big", &content);
+  let mut guest = Guest::over(attach(&daemon, overlay, None, Intent::Write).unwrap());
+  guest.init();
+  let node = guest.lookup(ROOT, "big").unwrap();
+  let fh = guest.open(node, O_RDWR).unwrap();
+  let object = guest.descriptor(node, true, Some((0, DAX_RANGE))).unwrap();
+  let window = WindowRange::map(&object, 0);
+  assert_eq!(&window.bytes()[..4096], &content[..4096]);
+  host_edits_in_place(&base, "big", b"an outsider's edit");
+  let large_class =
+    DaemonConfig::derive(&common::machine_profile(), "class", Some(1)).large_class_bytes;
+  let synced = if u64::try_from(content.len()).unwrap() > large_class {
+    EIO
+  } else {
+    0
+  };
+  assert_eq!(guest.fsync(node, fh), synced);
+  assert_eq!(
+    counted_kind(&daemon, "shards.dax_ingested"),
+    0,
+    "nothing the guest stored, so nothing written back"
+  );
+  let ReplyBody::Status { report } = client.call(&RequestBody::Status { volume: overlay }) else {
+    panic!("status");
+  };
+  assert!(
+    report
+      .drifted
+      .iter()
+      .any(|entry| entry.starts_with("/big ")),
+    "the outsider's edit is drift beneath the witness the writable ask took: {:?}",
+    report.drifted
+  );
+  assert_eq!(
+    &window.bytes()[..4096],
+    &content[..4096],
+    "the map holds the witnessed bytes"
+  );
+  drop(client);
+  drop(daemon);
+}
+
+/// AC (Shards part 3, step 4), beneath an overlay. Do: map the first range of a base file no one has written, to read;
+/// the host edits the file in place; the guest asks for the file's attributes. Expect the map to show the edit by the
+/// time the reply arrives, the refill counted: an untouched file follows the disk (D-25), and a map of it follows as a
+/// guest's pages do, so the reply that shows the change is held until the map shows it too.
+#[test]
+fn a_read_only_map_of_an_untouched_base_file_shows_an_outsiders_edit_before_the_reply_that_reveals_it()
+ {
+  let (daemon, mut client, _scratch) = dax_provisioned("shards-dax-refill", 16 << 20, None);
+  let content = patterned(3 << 20, 0x41);
+  let (base, overlay) = overlay_holding(&mut client, "big", &content);
+  let mut guest = Guest::over(attach(&daemon, overlay, None, Intent::Read).unwrap());
+  guest.init();
+  let node = guest.lookup(ROOT, "big").unwrap();
+  let _fh = guest.open(node, O_RDONLY).unwrap();
+  let object = guest.descriptor(node, false, Some((0, DAX_RANGE))).unwrap();
+  let window = WindowRange::map(&object, 0);
+  assert_eq!(&window.bytes()[..4096], &content[..4096]);
+  host_edits_in_place(&base, "big", b"an outsider's edit");
+  assert_eq!(errno(&guest.getattr_reply(node)), 0);
+  let shown = window.bytes();
+  assert_eq!(
+    &shown[..18],
+    b"an outsider's edit",
+    "the map shows the edit by the reply"
+  );
+  assert_eq!(
+    &shown[18..4096],
+    &content[18..4096],
+    "and the rest as it was"
+  );
+  assert!(counted_kind(&daemon, "shards.dax_refilled") >= 1);
+  drop(client);
+  drop(daemon);
+}
+
+/// AC (Shards part 3, step 4), beneath an overlay. Do: map the first range of an untouched base file to read; the host
+/// edits it in place; the guest then asks for the same range writable, stores through its map and syncs. Expect the
+/// writable answer to come after the map shows the edit (the read-only fill was refilled first, since the copy-up
+/// witnessed the disk as edited), and the sync to write back the guest's store alone: one run, the edit and the store
+/// both in the volume.
+#[test]
+fn a_writable_ask_after_an_outsiders_edit_finds_the_map_refilled_and_writes_back_only_the_guests_store()
+ {
+  let (daemon, mut client, _scratch) = dax_provisioned("shards-dax-mixed", 16 << 20, None);
+  let content = patterned(3 << 20, 0x51);
+  let (base, overlay) = overlay_holding(&mut client, "big", &content);
+  let mut guest = Guest::over(attach(&daemon, overlay, None, Intent::Write).unwrap());
+  guest.init();
+  let node = guest.lookup(ROOT, "big").unwrap();
+  let fh = guest.open(node, O_RDWR).unwrap();
+  let read_only = guest.descriptor(node, false, Some((0, DAX_RANGE))).unwrap();
+  let window = WindowRange::map(&read_only, 0);
+  assert_eq!(&window.bytes()[..4096], &content[..4096]);
+  host_edits_in_place(&base, "big", b"an outsider's edit");
+  let _writable = guest.descriptor(node, true, Some((0, DAX_RANGE))).unwrap();
+  assert_eq!(
+    &window.bytes()[..18],
+    b"an outsider's edit",
+    "refilled before the writable answer"
+  );
+  window.store(100_000, b"the guest's store");
+  assert_eq!(guest.fsync(node, fh), 0);
+  assert_eq!(
+    counted_kind(&daemon, "shards.dax_ingested"),
+    1,
+    "the guest's store alone"
+  );
+  assert_eq!(
+    volume_bytes(&daemon, overlay, "big", 0, 18),
+    b"an outsider's edit"
+  );
+  assert_eq!(
+    volume_bytes(&daemon, overlay, "big", 100_000, 17),
+    b"the guest's store"
+  );
+  drop(client);
+  drop(daemon);
+}
+
+/// The ledger count of `kind` on every shard, now.
+fn counted_kind(daemon: &Daemon, kind: &str) -> u64 {
+  daemon
+    .refusals_on_every_shard()
+    .unwrap()
+    .get(kind)
+    .copied()
+    .unwrap_or(0)
 }
 
 /// Measured, not a gate (Shards part 3, step 3): what an `FSYNC` costs a guest when it ingests a mapped file's writable

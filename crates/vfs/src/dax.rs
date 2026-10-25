@@ -363,6 +363,17 @@ impl DaxRegistry {
       .any(|mapping| mapping.writable && mapping.inode.prefix() == prefix)
   }
 
+  /// Whether any **writable** mapping of inode `no` is live: a guest storing into the file's own block, which the
+  /// volume's write boundary never sees, so no Shards backing of the file could be kept equal to it (Shards part 3,
+  /// step 4). The Shards route refuses an ask of such a file `EBUSY`.
+  #[must_use]
+  pub fn has_writable_of(&self, no: InodeNo) -> bool {
+    self
+      .mappings
+      .iter()
+      .any(|mapping| mapping.writable && mapping.inode == no)
+  }
+
   /// The live window that already covers `file_offset` of inode `no` with the writability asked for, if one
   /// exists (§4.6). A guest that asks twice for the same window needs one window, not two: the map paths return
   /// this instead of minting a second entry, so **the registry grows with the windows that exist rather than
@@ -961,6 +972,12 @@ impl Volume {
     // Checked before any effect, so a refused map copies nothing up.
     if store.dax.recalling(no.prefix()) {
       return Err(VfsError::RecallInFlight);
+    }
+    // A Shards guest maps the file from an object of its own that the write boundary keeps equal to the volume (Shards
+    // part 3, step 4). Stores into this block would bypass that boundary and leave the object behind, so the two routes
+    // exclude each other: refused before any effect.
+    if store.shards_backings.backs(no) {
+      return Err(VfsError::DaxMapped);
     }
     // As for a read window, and here it also saves the copy-up, which is the expensive half of this path.
     if let Some(live) = store.dax.live_window(no, 0, true) {

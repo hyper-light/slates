@@ -659,6 +659,15 @@ pub trait Bridge {
   fn dax_offer(&mut self) -> DaxOffer {
     DaxOffer::Withheld
   }
+
+  /// Makes file `object` ready for a guest to map writable from a copy of its own (Shards part 3, step 4; §4.6 DAX
+  /// rights). Beneath an overlay the file is copied up first, as its first write would be
+  /// (`slates_vfs::base::Overlay::witness_content`), so what the volume serves for it changes only through the write
+  /// boundary or is refused. Needs `cx` to allow writing. The default, a bridge with no base, has nothing to do.
+  fn witness_for_writable_map(&mut self, object: ObjectId, cx: &OpContext) -> Result<(), VfsError> {
+    let _ = (object, cx);
+    Ok(())
+  }
   /// Appends to `out` every kernel invalidation owed since `cursor` — changes the transport
   /// named by `cx` did not make itself — and returns the cursor to pass next time. Bounded by the
   /// journal's retention budget and by the entries loaded under the hinted directories. The

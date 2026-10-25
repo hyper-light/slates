@@ -203,6 +203,11 @@ impl Bridge for ScopedBridge<'_> {
     self.inner.allocate(object, cx, offset, len)
   }
 
+  fn witness_for_writable_map(&mut self, object: ObjectId, cx: &OpContext) -> Result<(), VfsError> {
+    self.admit(object, cx)?;
+    self.inner.witness_for_writable_map(object, cx)
+  }
+
   fn opendir(&mut self, object: ObjectId, cx: &OpContext) -> Result<u64, VfsError> {
     self.admit(object, cx)?;
     self.inner.opendir(object, cx)

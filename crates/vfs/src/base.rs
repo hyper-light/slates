@@ -1401,7 +1401,8 @@ impl Overlay<'_> {
     self.adopt_fingerprint(store, no, fp)
   }
 
-  /// An untouched entry takes the disk's fingerprint: its attributes and its base length.
+  /// An untouched entry takes the disk's fingerprint: its attributes and its base length. A change it takes is the
+  /// disk's bytes changing beneath the file's Shards backings, which are refilled (Shards part 3, step 4).
   fn adopt_fingerprint(
     &mut self,
     store: &mut Store,
@@ -1410,7 +1411,7 @@ impl Overlay<'_> {
   ) -> Result<(), VfsError> {
     let handle = self.vol.make_current_inode(store, no)?;
     let inode = store.inodes.get_mut(handle)?;
-    inode.adopt_observed(
+    let changed = inode.adopt_observed(
       fp.size,
       Some((fp.mode, fp.uid, fp.gid)),
       fp.mtime_ns,
@@ -1418,6 +1419,9 @@ impl Overlay<'_> {
     );
     if let Body::Base(b) = &mut inode.body {
       b.base_len = fp.size;
+    }
+    if changed {
+      store.shards_backings.mark_stale(no);
     }
     Ok(())
   }
@@ -1471,9 +1475,13 @@ impl Overlay<'_> {
     let fp = self.host.fstat(file).map_err(host_refusal)?;
     let handle = self.vol.make_current_inode(store, no)?;
     let inode = store.inodes.get_mut(handle)?;
-    inode.adopt_observed(fp.size, None, fp.mtime_ns, fp.ctime_ns);
+    let changed = inode.adopt_observed(fp.size, None, fp.mtime_ns, fp.ctime_ns);
     if let Body::Base(b) = &mut inode.body {
       b.base_len = fp.size;
+    }
+    // The disk's bytes changed beneath the file's Shards backings: they are refilled (Shards part 3, step 4).
+    if changed {
+      store.shards_backings.mark_stale(no);
     }
     Ok(())
   }
@@ -2243,6 +2251,14 @@ impl Overlay<'_> {
     self.vol.chmod(store, no, mode)
   }
 
+  /// Copies a file up before a guest maps it to write (§4.6 DAX rights; Shards part 3, step 4), as its first write
+  /// would: its witness is the disk as it is now. From then on what the volume serves for it changes only through the
+  /// write boundary, or is refused `BaseDrift`, so the guest's map can be compared with it. An untouched file follows
+  /// the disk, and a write-back comparing a map against it would take each outsider's change for the guest's.
+  pub fn witness_content(&mut self, store: &mut Store, no: InodeNo) -> Result<(), VfsError> {
+    self.copy_up(store, no, CopyUp::Content)
+  }
+
   /// The open descriptor of a base-backed inode, opened through its home if needed. An untouched inode's must name the
   /// file the inode was made from (A-151): one that left its name, one whose name now names another file, and one a
   /// recovery restored on a filesystem that records no birth time (its file cannot be proven) are refused
@@ -2346,19 +2362,13 @@ impl Overlay<'_> {
     let file = self.host.open_file(host_dir, &name).map_err(host_refusal)?;
     let fp = self.host.fstat(file).map_err(host_refusal)?;
     let home_parent = self.vol.inode(store, no)?.home.map(|h| h.parent());
-    let read_at = home_parent
-      .and_then(|p| {
-        self
-          .vol
-          .base
-          .as_ref()?
-          .listings
-          .get(&p)
-          .map(|l| l.read_at_ns)
-      })
-      .unwrap_or(0);
+    // The racy rule (§4.5) asks whether the file's timestamp tick is still open when this fingerprint is taken: then a
+    // later edit inside the same tick would leave it unchanged, and only the bytes' hash can tell. Asked of the host's
+    // clock now, after the `fstat`, never of the listing's older read time. A file edited after the listing would
+    // otherwise saturate that difference to zero and be racy for good, every later read of it hashing the whole file
+    // (until 2026-10-24).
     let granularity = i64::try_from(self.granularity()).unwrap_or(i64::MAX);
-    let racy = read_at.saturating_sub(fp.mtime_ns) <= granularity;
+    let racy = self.host.now_ns().saturating_sub(fp.mtime_ns) <= granularity;
     let bytes = self.read_whole(file, fp.size)?;
     let identity = *blake3::hash(&bytes).as_bytes();
     let witness = Witness {
@@ -2375,9 +2385,9 @@ impl Overlay<'_> {
         .map_or(u64::MAX, |b| b.large_class_bytes);
     let handle = self.vol.make_current_inode(store, no)?;
     let prev = store.inodes.get(handle)?.version;
-    {
+    let changed = {
       let inode = store.inodes.get_mut(handle)?;
-      inode.adopt_observed(
+      let changed = inode.adopt_observed(
         fp.size,
         Some((fp.mode, fp.uid, fp.gid)),
         fp.mtime_ns,
@@ -2387,6 +2397,12 @@ impl Overlay<'_> {
         b.witness = Some(Box::new(witness));
         b.base_len = fp.size;
       }
+      changed
+    };
+    // The witness is the disk as it is now: a Shards backing filled before the disk changed is refilled to it (Shards
+    // part 3, step 4).
+    if changed {
+      store.shards_backings.mark_stale(no);
     }
     let at = self.vol.witness_clock();
     let home = home_parent.map(|home| (home, name.clone().into()));
@@ -2779,6 +2795,9 @@ impl Overlay<'_> {
         stats.stale = stats.stale.saturating_add(1);
       }
       self.adopt_fingerprint(store, no, at_path)?;
+      // Another file serves the entry now, whatever its attributes say: its Shards backings are refilled (Shards part
+      // 3, step 4).
+      store.shards_backings.mark_stale(no);
       self.invalidate_listing_of(store, no);
       return Ok((fresh, at_path));
     }
@@ -3532,6 +3551,12 @@ impl Overlay<'_> {
 
   /// `rewitness`: re-witness the named drifted entries (all drifted when none are named) to
   /// the disk as it is now; the volume's content is untouched; their drift records clear.
+  ///
+  /// A large entry's unpinned bytes are then read from the disk's file as it is now, so they can change beneath its
+  /// Shards backings (Shards part 3, step 4). A backing a guest maps only to read is refilled. One it maps to write
+  /// holds stores not yet written back, which a refill would lose and the next write-back would take the old bytes
+  /// around for. So while any named entry has such a backing, the whole call is refused `DaxMapped`, before anything
+  /// changes.
   pub fn rewitness(
     &mut self,
     store: &mut Store,
@@ -3552,6 +3577,12 @@ impl Overlay<'_> {
         .map(|b| b.drift.keys().copied().collect())
         .unwrap_or_default(),
     };
+    if targets
+      .iter()
+      .any(|no| store.shards_backings.mapped_writable(*no))
+    {
+      return Err(VfsError::DaxMapped);
+    }
     let mut done = Vec::new();
     for no in targets {
       if let Some(f) = self.plane()?.descriptors.remove(&no) {
@@ -3585,6 +3616,7 @@ impl Overlay<'_> {
       };
       if keep_descriptor {
         self.plane()?.descriptors.insert(no, file);
+        store.shards_backings.mark_stale(no);
       } else {
         self.host.close_file(file);
       }
