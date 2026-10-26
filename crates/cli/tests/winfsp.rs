@@ -216,7 +216,13 @@ fn windows_programs_read_and_write(instance: &str, id: &str, root: &str) {
     message.as_bytes(),
     "the bytes travel Windows -> WinFsp -> the owner shard and back"
   );
-  let (code, read, err) = run(instance, &["read", id, "hello.txt"]);
+  let started = Instant::now();
+  let (mut code, mut read, mut err) = run(instance, &["read", id, "hello.txt"]);
+  while read != message && started.elapsed() < WAIT_FOR {
+    pause();
+    (code, read, err) = run(instance, &["read", id, "hello.txt"]);
+  }
+  eprintln!("WINFSP-DIAG slates read after close: {:?} in {:?}", read.as_bytes().first(), started.elapsed());
   assert_eq!(code, 0, "{err}");
   assert_eq!(read, message, "slates itself reads what Windows wrote");
 

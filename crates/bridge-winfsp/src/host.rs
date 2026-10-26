@@ -265,6 +265,13 @@ impl Request {
   /// mount's notifications name ([`crate::notify`]) — in step with its opens, closes and renames. The reply is not sent
   /// yet: the caller publishes first when [`Served::needs_barrier`] says so.
   pub fn serve(self, bridge: &mut dyn Bridge, cx: &OpContext, names: &mut OpenNames) -> Served {
+    let described = describe(&self.op);
+    let served = self.serve_inner(bridge, cx, names);
+    eprintln!("WINFSP-DIAG {described} -> {}", reply_of(&served.reply));
+    served
+  }
+
+  fn serve_inner(self, bridge: &mut dyn Bridge, cx: &OpContext, names: &mut OpenNames) -> Served {
     let barrier = self.op.needs_barrier();
     let opened = match &self.op {
       Op::Open { path } | Op::Create { path, .. } => Some(path.clone()),
@@ -292,6 +299,42 @@ impl Request {
       sender: self.reply,
       barrier,
     }
+  }
+}
+
+fn describe(op: &Op) -> String {
+  match op {
+    Op::VolumeInfo => "VolumeInfo".to_owned(),
+    Op::Resolve { path } => format!("Resolve {path}"),
+    Op::Open { path } => format!("Open {path}"),
+    Op::Create { path, is_dir } => format!("Create {path} dir={is_dir}"),
+    Op::Read { object, offset, length } => format!("Read ino={} at={offset} len={length}", object.inode),
+    Op::Write { object, offset, data, append } => format!(
+      "Write ino={} at={offset} len={} append={append} first={:?}",
+      object.inode,
+      data.len(),
+      data.first()
+    ),
+    Op::Info { object } => format!("Info ino={}", object.inode),
+    Op::ReadDir { object, .. } => format!("ReadDir ino={}", object.inode),
+    Op::SetSize { object, new_size } => format!("SetSize ino={} size={new_size}", object.inode),
+    Op::Truncate { object } => format!("Truncate ino={}", object.inode),
+    Op::Rename { from, to } => format!("Rename {from} {to}"),
+    Op::Flush { object, .. } => format!("Flush ino={}", object.inode),
+    Op::Cleanup { delete } => format!("Cleanup delete={delete:?}"),
+    Op::Release { object, .. } => format!("Release ino={}", object.inode),
+  }
+}
+
+fn reply_of(reply: &Reply) -> String {
+  match reply {
+    Reply::Volume { .. } => "Volume".to_owned(),
+    Reply::Object { object, info, fh } => format!("Object ino={} size={} fh={fh}", object.inode, info.file_size),
+    Reply::Data { bytes } => format!("Data len={} first={:?}", bytes.len(), bytes.first()),
+    Reply::Wrote { written, info } => format!("Wrote {written} size={}", info.file_size),
+    Reply::Entries { entries } => format!("Entries {}", entries.len()),
+    Reply::Ok => "Ok".to_owned(),
+    Reply::Err(status) => format!("Err {status:#x}"),
   }
 }
 
@@ -807,6 +850,7 @@ extern "C" fn overwrite(
 }
 
 extern "C" fn cleanup(fs: *mut FileSystem, _context: Pvoid, file_name: Pwstr, flags: u32) {
+  eprintln!("WINFSP-DIAG cleanup flags={flags:#x}");
   if flags & CLEANUP_CHANGED == 0 {
     return;
   }
@@ -881,6 +925,7 @@ extern "C" fn write(
   p_bytes: *mut u32,
   p_info: *mut FileInfo,
 ) -> Ntstatus {
+  eprintln!("WINFSP-DIAG write callback at={offset} len={length} constrained={_constrained}");
   // SAFETY: our file system and a live open-file context.
   let handler = unsafe { handler(fs) };
   // SAFETY: `context` is a live OpenFile leaked by open/create, taken under the COARSE guard.
