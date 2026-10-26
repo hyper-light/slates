@@ -3218,6 +3218,8 @@ fn init_shard(
     mount_attachments: std::collections::BTreeMap::new(),
     #[cfg(target_os = "linux")]
     fuse_mounts: std::collections::BTreeMap::new(),
+    #[cfg(windows)]
+    winfsp_mounts: std::collections::BTreeMap::new(),
     stale_fuse_mounts: Vec::new(),
     #[cfg(target_os = "linux")]
     inherited_fuse,
@@ -4095,6 +4097,22 @@ impl Drop for EndMounts {
   }
 }
 
+/// Ends the shard's WinFsp mounts when its serve loop ends (§4.6 "Windows"), as `EndMounts` ends the FUSE mounts and
+/// for the same reason: on the shard's own thread with its state installed. Each mount's drive is removed and its
+/// thread joined (a drive letter has no directory beneath it to expose); a fenced shard writes no record, and the
+/// records end at the next start's recovery.
+#[cfg(windows)]
+struct EndWinFspMounts;
+
+#[cfg(windows)]
+impl Drop for EndWinFspMounts {
+  fn drop(&mut self) {
+    if state::with_state(crate::winfsp::end_all).is_none() {
+      let _ = state::with_state_at_shutdown(crate::winfsp::drop_all);
+    }
+  }
+}
+
 /// Ends the shard's Shards streams when its serve loop ends (§4.6, the Shards route; A-161), as `EndMounts` ends its
 /// FUSE mounts and for the same reason: on the shard's own thread with its state installed, not by a question queued
 /// behind its work. Each attachment's references are swept and its record removed; a fenced shard only closes the
@@ -4119,6 +4137,8 @@ impl Drop for EndStreams {
 async fn serve_loop() {
   #[cfg(target_os = "linux")]
   let _end_mounts = EndMounts;
+  #[cfg(windows)]
+  let _end_winfsp_mounts = EndWinFspMounts;
   #[cfg(unix)]
   let _end_streams = EndStreams;
   if let Some(task) = futures::current_task() {

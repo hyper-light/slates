@@ -1071,9 +1071,10 @@ impl Partition {
           .get(&id.to_be_bytes())
           .ok_or(DbError::NotFound)?;
         let record = self.attachments.get_mut(h).map_err(|_| DbError::NotFound)?;
-        // A FUSE form already names its mount point (the daemon mounted it); a bound mount keeps its identity and
-        // scope, and a scoped mount its scope, when it is bound; any other host mount is bound at a chosen path.
-        if record.form.fuse_mount_point().is_none() {
+        // A FUSE form or a WinFsp volume already names its mount point (the daemon mounted it); a bound mount keeps
+        // its identity and scope, and a scoped mount its scope, when it is bound; any other host mount is bound at a
+        // chosen path.
+        if record.form.daemon_mount_point().is_none() {
           record.form = match (record.form.bound_uid(), record.form.scope()) {
             (Some(uid), scope) => crate::catalog::AttachForm::BoundMount {
               uid,

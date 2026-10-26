@@ -465,6 +465,12 @@ pub enum AttachForm {
     /// The directory's inode number, when the stream presents one directory.
     scope: Option<u64>,
   },
+  /// A Windows WinFsp volume at a drive letter (§4.6 "Windows"). The WinFsp file system is the daemon process's own,
+  /// so recovery ends the record as it ends a FUSE mount the anchor did not hold. Appended.
+  WinFspMount {
+    /// The drive letter and its colon (`S:`).
+    path: String,
+  },
 }
 
 impl AttachForm {
@@ -474,7 +480,8 @@ impl AttachForm {
       Self::ChosenPath { path }
       | Self::FuseMount { path }
       | Self::ScopedFuseMount { path, .. }
-      | Self::SharedFuseMount { path, .. } => Some(path),
+      | Self::SharedFuseMount { path, .. }
+      | Self::WinFspMount { path } => Some(path),
       Self::ScopedMount { mount_point, .. } | Self::BoundMount { mount_point, .. } => {
         mount_point.as_deref()
       }
@@ -510,6 +517,15 @@ impl AttachForm {
       | Self::ScopedFuseMount { path, .. }
       | Self::SharedFuseMount { path, .. } => Some(path),
       _ => None,
+    }
+  }
+
+  /// The mount point of a mount the daemon itself established (a FUSE form or a WinFsp volume), which a later bind
+  /// leaves as it is: the daemon named it, so no client's report of where it is replaces it.
+  pub fn daemon_mount_point(&self) -> Option<&str> {
+    match self {
+      Self::WinFspMount { path } => Some(path),
+      _ => self.fuse_mount_point(),
     }
   }
 

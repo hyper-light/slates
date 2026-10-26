@@ -14,11 +14,14 @@
 //!   the `FspFileSystem*` FFI, **hand-transcribed from winfsp's `winfsp.h`/`fsctl.h`** — the same
 //!   discipline the rt AFD reactor uses over the WDK — so it is a faithful model, not a guess (the
 //!   structs carry the header's own `static_assert` sizes), and it cross-lints on the Windows target
-//!   from any host. Each callback dispatches onto the shared `Bridge` (`slates-bridge-core`) over a
-//!   single owner thread that holds the `!Send` volume (D-7's "sharing is a move over a bounded
-//!   channel"; no `Mutex`, no `Arc`). The live mount — mount a drive letter, create/write/read/list/
-//!   delete through the Windows kernel, unmount — runs on the native Windows CI runner, the way the
-//!   FSKit handler's live mount runs on macOS.
+//!   from any host. Each callback hands its request to the volume's owner shard over a bounded channel
+//!   (D-7's "sharing is a move over a bounded channel"; no `Mutex`, no `Arc`), where the daemon serves it
+//!   through the shared `Bridge` (`slates-bridge-core`). The live mount — `slates mount` at a drive letter,
+//!   files read and written through the Windows kernel, another path's change seen — runs on the native
+//!   Windows CI runner (`crates/cli/tests/winfsp.rs`).
+//!
+//! - **What Windows is told** ([`notify`]): the names Windows holds open and the `FspFileSystemNotify`
+//!   records a change made through another path owes them, host-buildable and tested on any host.
 
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
 // are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
@@ -35,6 +38,9 @@ use slates_vfs::inode::Kind;
 mod ffi;
 #[cfg(windows)]
 pub mod host;
+// What a mount tells Windows of another path's change: the names Windows holds open and the notification records
+// (§4.6 "Windows"). Pure, so it is tested on every host.
+pub mod notify;
 
 /// An `NTSTATUS` code — the 32-bit status WinFsp hands the kernel for a request (§4.6). Held as the raw
 /// `u32` the constants are written in; the Windows FFI casts it to the `NTSTATUS`/`LONG` (`i32`) the API
@@ -171,6 +177,18 @@ pub(crate) fn status_object_name_not_found() -> i32 {
 #[cfg(windows)]
 pub(crate) fn status_invalid_parameter() -> i32 {
   STATUS_INVALID_PARAMETER.as_i32()
+}
+
+/// Format: `STATUS_UNEXPECTED_IO_ERROR` (`0xC000_00E9`) — the request's effect is in the volume but the publication that
+/// makes it survive a restart was refused, so the caller is told rather than promised survival (the FUSE mount's `EIO`
+/// in the same place).
+#[cfg(windows)]
+const STATUS_UNEXPECTED_IO_ERROR: Ntstatus = Ntstatus(0xC000_00E9);
+
+/// [`STATUS_UNEXPECTED_IO_ERROR`] as the FFI `i32`.
+#[cfg(windows)]
+pub(crate) fn status_unexpected_io_error() -> i32 {
+  STATUS_UNEXPECTED_IO_ERROR.as_i32()
 }
 
 /// Format: `STATUS_BUFFER_OVERFLOW` (`0x8000_0005`) as the FFI `i32` — the security-descriptor buffer

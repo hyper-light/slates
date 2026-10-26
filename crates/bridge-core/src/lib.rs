@@ -26,6 +26,7 @@ pub mod authority;
 pub mod changed;
 #[cfg(unix)]
 pub mod dax_backing;
+pub mod delivery;
 pub mod links;
 pub mod scoped;
 pub mod volume_bridge;

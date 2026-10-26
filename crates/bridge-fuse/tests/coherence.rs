@@ -7,10 +7,10 @@
 // Test harness code: an unwrap here is a failed test.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use slates_bridge_core::delivery::{Coherence, Delivered};
 use slates_bridge_core::{
   AttachmentId, Attachments, Bridge, Invalidation, ObjectId, OpContext, Rights, SetAttr, View,
 };
-use slates_bridge_fuse::coherence::{Coherence, Delivered};
 use slates_bridge_fuse::volume_bridge::VolumeBridge;
 use slates_db::catalog::{Principal, VolumeId};
 

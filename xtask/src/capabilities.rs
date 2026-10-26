@@ -118,11 +118,17 @@ pub const CAPABILITIES: &[Capability] = &[
     name: "Mount a volume on Windows",
     status: Status::Limited,
     r#where: "Windows (WinFsp)",
-    limits: "proven for create, write, read, list and delete on the CI runner",
-    evidence: &[ev(
-      "crates/bridge-winfsp/tests/mount.rs",
-      "a_real_winfsp_mount_serves_a_volume_through_the_windows_filesystem",
-    )],
+    limits: "`slates mount` at a drive letter, served by the daemon; Windows is told of another path's change; whole volume only",
+    evidence: &[
+      ev(
+        "crates/cli/tests/winfsp.rs",
+        "a_volume_mounted_through_winfsp_is_read_and_written_by_windows_programs",
+      ),
+      ev(
+        "crates/cli/tests/winfsp.rs",
+        "a_cached_read_through_a_winfsp_mount_shows_another_paths_change",
+      ),
+    ],
   },
   Capability {
     name: "Land a volume to disk under a human grant",

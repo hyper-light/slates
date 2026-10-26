@@ -182,7 +182,7 @@ fn export_verb(
 /// `mount` over the loopback NFS bridge (macOS and the BSDs; §4.6): the mount's own attachment and capability,
 /// then `mount_nfs` with the capability in the export path — no privilege, no kernel extension, no Apple
 /// entitlement.
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn mount_verb(
   client: &mut Client,
   instance: &str,
@@ -271,6 +271,71 @@ fn mount_verb(
   Ok(())
 }
 
+/// `mount` on Windows (§4.6 "Windows"): the daemon mounts the volume through WinFsp at the drive letter `path` (`S:`)
+/// and serves it; the attachment is the mount's, ending with `slates unmount S:` (a `detach` of it), the volume's
+/// destroy, or the daemon's process. A read-only mount takes no write lease and is a read-only WinFsp volume.
+#[cfg(windows)]
+fn mount_verb(
+  client: &mut Client,
+  instance: &str,
+  volume: VolumeId,
+  path: &str,
+  (read_only, subtree, shared): (bool, Option<&str>, bool),
+) -> Result<(), Failure> {
+  if subtree.is_some() || shared {
+    return Err(Failure::Refused(
+      "--subtree and --shared are the Unix mounts'; a WinFsp mount presents the whole volume at a drive letter"
+        .to_owned(),
+    ));
+  }
+  let intent = if read_only {
+    Intent::Read
+  } else {
+    Intent::Write
+  };
+  let attachment = client
+    .attach_winfsp(volume, intent, path)
+    .map_err(|e| failure_of(e, instance))?;
+  println!(
+    "mounted: {}",
+    attachment.path.unwrap_or_else(|| path.to_owned())
+  );
+  Ok(())
+}
+
+/// `unmount` on Windows (§4.6 "Windows"): the WinFsp volume at drive `path` is the daemon's own, so it is unmounted by
+/// detaching its attachment, found among the volumes' reported mounts; the daemon then removes the drive.
+#[cfg(windows)]
+fn unmount_verb(instance: &str, path: &str) -> Result<(), Failure> {
+  let mut client = connect(instance)?;
+  let volumes = client.list().map_err(|e| failure_of(e, instance))?;
+  for summary in volumes {
+    let report = client
+      .status(summary.id)
+      .map_err(|e| failure_of(e, instance))?;
+    if let Some(mount) = report
+      .mounts
+      .iter()
+      .find(|mount| mount.path.eq_ignore_ascii_case(path))
+    {
+      client
+        .detach(mount.attachment)
+        .map_err(|e| failure_of(e, instance))?;
+      return Ok(());
+    }
+  }
+  Err(Failure::Refused(format!(
+    "no slates volume is mounted at {path}"
+  )))
+}
+
+/// `unmount` off Windows is the OS's own (`umount`, `fusermount3 -u`): it needs no daemon, so a stale mount is
+/// unmountable even after its daemon has gone.
+#[cfg(not(windows))]
+fn unmount_verb(_instance: &str, path: &str) -> Result<(), Failure> {
+  crate::mount::unmount(path)
+}
+
 fn connect(instance: &str) -> Result<Client, Failure> {
   let deadlines = Deadlines::derive(LIVENESS_BUDGET_NS, RECOVERY_BUDGET_NS).get();
   Client::connect(instance, deadlines).map_err(|e| failure_of(e, instance))
@@ -278,10 +343,10 @@ fn connect(instance: &str) -> Result<Client, Failure> {
 
 /// Runs one client verb.
 pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
-  // `unmount` is a pure OS operation (`umount`); it needs no daemon, so it runs before connecting —
-  // a stale mount is unmountable even after its daemon has gone.
+  // `unmount` off Windows is a pure OS operation (`umount`); it needs no daemon, so it runs before connecting —
+  // a stale mount is unmountable even after its daemon has gone. A WinFsp drive is the daemon's to remove.
   if let Verb::Unmount { path } = &request.verb {
-    crate::mount::unmount(path)?;
+    unmount_verb(&request.instance, path)?;
     println!("unmounted: {path}");
     return Ok(());
   }
@@ -774,7 +839,7 @@ fn emit_create(client: &mut Client, spec: &CreateSpec, json: bool) -> Result<(),
 /// `volume snapshot`: the snapshot's sequence number, as text or a JSON `{ "snapshot" }` (the MCP
 /// `slates.volume.snapshot` schema).
 /// A failure's text for a message that reports two of them at once (the NFS mount's bind-then-unmount).
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn failure_text(failure: &Failure) -> String {
   match failure {
     Failure::Refused(text) | Failure::Failed(text) => text.clone(),

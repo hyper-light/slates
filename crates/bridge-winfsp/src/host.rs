@@ -1,49 +1,60 @@
-//! The WinFsp mount host (§4.6, D-2): builds a live user-mode filesystem over the shared [`Bridge`]
-//! and mounts it at a drive letter or directory, so a Windows program sees a slates volume as a normal
-//! path — the Windows analogue of the NFS `Export`/daemon and the FSKit `MountSession`.
+//! The WinFsp mount host (§4.6 "Windows"): a live user-mode file system at a drive letter whose every request is
+//! served by the daemon on the volume's owner shard, so a Windows program sees a slates volume as a normal drive — the
+//! Windows analogue of the FUSE mount (`slates-server`'s `fuse`).
 //!
-//! **Threading.** A [`Volume`] is `!Send` (it holds a `Box<dyn Clock>`), so it can never cross a
-//! thread. WinFsp, in turn, drives its `FSP_FILE_SYSTEM_INTERFACE` callbacks from a pool of dispatcher
-//! threads. slates bridges the two with its own idiom (D-7, "sharing is a move over a bounded
-//! channel"): a single **owner thread** *constructs* the volume locally (via a `Send` builder, so the
-//! `!Send` value is born on that thread and never leaves it) and serves one operation at a time; each
-//! WinFsp callback packages its request as an [`Op`], sends it over a bounded channel, and blocks for
-//! the [`Reply`]. No `Mutex`, no `Arc` (R2) — one consumer of the volume, replies over per-call oneshot
-//! channels. WinFsp's COARSE operation guard serializes the callbacks on top of this, so the handler
-//! pointer stored in the file system's `UserContext` is never touched concurrently.
+//! **Threading (D-7, D-9).** WinFsp answers the kernel from a pool of dispatcher threads in this process, which are not
+//! the runtime's; the volume lives on its owner shard and never leaves it. The design's rule is that "WinFsp requests
+//! arrive on WinFsp's threads and are routed to the owning shard by handle" (§4.3 "Drivers"): each callback packages
+//! its request as a [`Request`], sends it over a bounded channel to the mount's task on that shard, wakes the task, and
+//! blocks its own thread for the reply. The task serves it whole, one request at a time, through the shared operation
+//! layer ([`Request::serve`] over any [`Bridge`]) and answers. No lock, no shared ownership (R2): one consumer of the
+//! channel, one reply channel per call. A dispatcher thread that finds the channel closed (the mount is being torn
+//! down) answers `STATUS_UNSUCCESSFUL` at once, never a hang.
 //!
-//! **Verification.** Every struct and export is hand-transcribed from winfsp's headers (`crate::ffi`)
-//! and cross-lints on the Windows target from any host; the live mount — provision a volume, mount a
-//! drive letter, create/write/read/list/delete through the Windows kernel, unmount — runs on the native
-//! Windows CI runner (`WINFSP_TEST_MOUNT=1`), the way the FSKit handler's live mount runs on macOS.
+//! **The mount thread.** `FspFileSystemSetMountPoint` defines a drive letter and broadcasts the device change, and
+//! `FspFileSystemStopDispatcher` joins the dispatcher threads; neither belongs on a shard. So each mount has one owned
+//! thread ([`MountThread`]) that creates, mounts and starts the file system, sends it each notification round, and
+//! stops and deletes it, reporting each outcome to the task with a wake. The thread is the file system's only owner,
+//! so its raw pointers never cross a thread. Its owner joins it ([`MountThread::stop`], or its drop).
+//!
+//! **Cache posture (§4.6 "Windows").** `FileInfoTimeout` is infinite: Windows keeps a file's attributes, listings and
+//! pages until told, and the mount tells it of every change made through any other path by `FspFileSystemNotify`
+//! (`crate::notify`), the analogue of the FUSE mount's notifications (A-141). The volume's free space has no
+//! notification, so its timeout is zero: every query asks the shard, since any write anywhere changes it. A
+//! notification round is begun with a zero timeout: while a rename holds WinFsp's rename lock it answers
+//! `STATUS_CANT_WAIT`, and the round is owed again rather than waited for, since the rename itself may be waiting on
+//! the shard.
+//!
+//! **Verification.** Every struct and export is hand-transcribed from winfsp's headers (`crate::ffi`) and cross-lints
+//! on the Windows target from any host; the live mount runs on the native Windows CI runner through the CLI
+//! (`crates/cli/tests/winfsp.rs`).
 
 use std::ffi::c_void;
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
+use std::task::Waker;
 use std::thread::JoinHandle;
 
-use slates_bridge_core::{
-  Attachments, Bridge, NodeAttr, ObjectId, OpContext, RenameFlags, Rights, SetAttr, View,
-  VolumeBridge, new_handle_store,
-};
-use slates_db::catalog::{Principal, VolumeId};
-use slates_mem::Slab;
+use slates_bridge_core::{Bridge, NodeAttr, ObjectId, OpContext, RenameFlags, SetAttr};
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::Kind;
-use slates_vfs::volume::{Store, Volume};
 
 use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::GetSecurityDescriptorLength;
 
 use crate::ffi::{
-  self, Boolean, DirInfo, FileInfo, FileSystem, GUARD_STRATEGY_COARSE, Interface, Ntstatus,
+  self, Api, Boolean, DirInfo, FileInfo, FileSystem, GUARD_STRATEGY_COARSE, Interface, Ntstatus,
   PSecurityDescriptor, Pvoid, Pwstr, VolumeInfo, VolumeParams,
 };
+use crate::notify::OpenNames;
 use crate::{STATUS_SUCCESS, file_attributes, filetime_from_unix_ns, ntstatus};
 
-/// A typed WinFsp host failure (R1: no panics; every refusal is a value).
+/// A typed WinFsp host failure (no panics; every refusal is a value).
 #[derive(Debug)]
 pub enum WinFspError {
+  /// WinFsp's library could not be loaded or lacks an export this host calls: WinFsp is not installed (or predates
+  /// the notification exports).
+  NotInstalled,
   /// A `FspFileSystem*` call returned a failure `NTSTATUS`.
   Api {
     /// The call that failed.
@@ -53,8 +64,28 @@ pub enum WinFspError {
   },
   /// The reference security descriptor could not be built (`ConvertStringSecurityDescriptor…`).
   SecurityDescriptor,
-  /// The owner thread could not be started.
-  OwnerThread,
+  /// The mount thread could not be started, or ended without reporting.
+  MountThread,
+}
+
+impl std::fmt::Display for WinFspError {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Self::NotInstalled => write!(
+        f,
+        "WinFsp is not installed (winfsp-x64.dll could not be loaded)"
+      ),
+      Self::Api { call, status } => write!(f, "{call} answered NTSTATUS {status:#010x}"),
+      Self::SecurityDescriptor => write!(f, "the mount's security descriptor could not be built"),
+      Self::MountThread => write!(f, "the mount thread could not run"),
+    }
+  }
+}
+
+/// Whether WinFsp's library loads on this host: the fact the daemon's transport report states (`WinFspNotInstalled`
+/// where it does not). Loads it once for the process.
+pub fn installed() -> bool {
+  ffi::api().is_ok()
 }
 
 /// Format: the sector size the mount reports — 4096 bytes, the volume core's chunk/page unit, so an
@@ -63,17 +94,28 @@ const SECTOR_SIZE: u16 = 4096;
 /// Format: one sector per allocation unit — the allocation unit equals the sector (the page), matching
 /// the volume core's page-granular accounting.
 const SECTORS_PER_UNIT: u16 = 1;
-/// Format: the file-info cache timeout WinFsp keeps attributes for (milliseconds). One second matches
-/// the NFS mount's `actimeo=1`: an overlay changes under merges and outside edits, so the cache is
-/// short but nonzero (the loopback path revalidates in well under a millisecond).
-const FILE_INFO_TIMEOUT_MS: u32 = 1000;
-/// Format: the dispatcher thread count. WinFsp uses a small pool regardless; the COARSE guard
-/// serializes them onto the one owner thread, so the count only bounds concurrent kernel requests.
-const DISPATCHER_THREADS: u32 = 0;
-/// Shape: the bound on in-flight operations queued to the owner thread. At least the dispatcher's
-/// concurrency, so no WinFsp thread blocks placing its one in-flight op; a small constant since each
-/// thread has at most one outstanding request and the owner drains them one at a time.
-const JOB_QUEUE_BOUND: usize = 64;
+/// Format: `INFINITE` (`0xFFFF_FFFF`) as WinFsp's `FileInfoTimeout`: Windows keeps what it fetched until the mount
+/// tells it otherwise (§4.6 "Windows": `FileInfoTimeout = -1` with `FspFileSystemNotify` invalidations). Under version-1
+/// parameters the listing, security, stream and extended-attribute caches inherit it (WinFsp `src/sys/volume.c`).
+const FILE_INFO_TIMEOUT_INFINITE: u32 = u32::MAX;
+/// Derived: the volume-information cache timeout, zero. Free space changes with every write through any path and no
+/// notification names it, so any positive timeout would report a stale number; a query costs one request to the shard.
+const VOLUME_INFO_TIMEOUT_MS: u32 = 0;
+/// Format: `VolumeInfoTimeoutValid`, bit 0 of the version-1 flag word (`fsctl.h`): the volume-information timeout is
+/// set apart from `FileInfoTimeout`.
+const VOLUME_INFO_TIMEOUT_VALID: u32 = 1 << 0;
+/// Derived: the dispatcher threads WinFsp runs for the mount: two. The COARSE guard admits one callback at a time and
+/// the owner shard serves one request at a time, so a second thread only takes the next request from the kernel while
+/// the first waits for its reply; a third would wait at the guard.
+const DISPATCHER_THREADS: u32 = 2;
+/// Derived: the requests that can wait in the channel to the shard: one per dispatcher thread, since each blocks for
+/// its reply before taking another.
+pub const REQUEST_BOUND: usize = DISPATCHER_THREADS as usize;
+/// Shape: the outcomes the mount thread can have unread at once: a notification round's (the task sends at most one
+/// round before reading its outcome) or the mount's, and the stop's after either.
+const OUTCOME_BOUND: usize = 2;
+/// Shape: commands queued to the mount thread: one round out at a time.
+const COMMAND_BOUND: usize = 1;
 /// Format: the default permission bits a created file takes (`rw-r--r--`); the mount presents Windows
 /// ACLs through the fixed descriptor, so the POSIX mode is bookkeeping the volume core carries.
 const DEFAULT_FILE_MODE: u32 = 0o644;
@@ -84,23 +126,26 @@ const DEFAULT_DIR_MODE: u32 = 0o755;
 const MAX_COMPONENT_LENGTH: u16 = 255;
 /// Format: an "allow Everyone full access" security descriptor in SDDL — owner and group the built-in
 /// Administrators, a protected DACL granting `FA` (full access) to `WD` (Everyone). WinFsp requires a
-/// valid descriptor for its access checks; a RAM scratch volume grants freely (the harness owns
-/// isolation, §4.13), so one fixed descriptor serves every object, exactly as WinFsp's `memfs` sample
-/// starts from a single SDDL string.
+/// valid descriptor for its access checks; the volume's own rights are the attachment's, enforced by the
+/// shard on every request, so one fixed descriptor serves every object, as WinFsp's `memfs` sample starts
+/// from a single SDDL string.
 const EVERYONE_SDDL: &str = "O:BAG:BAD:P(A;;FA;;;WD)";
+/// Format: the cleanup flags that say the handle changed the file or asked for its deletion (`winfsp.h`
+/// `FspCleanupDelete`, `SetAllocationSize`, `SetArchiveBit`, `SetLastWriteTime`, `SetChangeTime`): such a close
+/// publishes before its reply, as a FUSE close's `flush` does. A close that only read (`SetLastAccessTime` alone, or
+/// nothing) publishes nothing.
+const CLEANUP_CHANGED: u32 = 0x01 | 0x02 | 0x10 | 0x40 | 0x80;
 
-/// The per-open state WinFsp carries as an opaque `FileContext`: the object's identity and its bridge
-/// open handle. Boxed and leaked to a raw pointer on open/create, reclaimed on close — created and
-/// destroyed only inside COARSE-serialized callbacks, so never touched concurrently.
+/// The per-open state WinFsp carries as an opaque `FileContext`: the object's identity and its bridge open handle.
+/// Boxed and leaked to a raw pointer on open/create, reclaimed on close — created and destroyed only inside
+/// COARSE-serialized callbacks, so never touched concurrently.
 struct OpenFile {
   object: ObjectId,
   fh: u64,
-  is_dir: bool,
 }
 
-/// One operation the owner thread runs on the volume, with the parameters marshalled from a WinFsp
-/// callback. Paths arrive as Rust `String`s (converted from WinFsp's UTF-16), so the whole `Op` is
-/// `Send` and crosses the channel to the owner thread that holds the `!Send` volume.
+/// One operation the owner shard runs on the volume, with the parameters marshalled from a WinFsp callback. Paths
+/// arrive as Rust `String`s (converted from WinFsp's UTF-16), so the whole `Op` crosses the channel.
 enum Op {
   VolumeInfo,
   /// Resolve a path to an object and its attributes (`GetSecurityByName`), or report it missing.
@@ -130,8 +175,8 @@ enum Op {
   Info {
     object: ObjectId,
   },
-  /// List a directory's entries (name, attributes) — the owner reads them all; the trampoline handles
-  /// the WinFsp marker and buffer fill.
+  /// List a directory's entries (name, attributes) — the shard reads them all; the trampoline handles the WinFsp
+  /// marker and buffer fill.
   ReadDir {
     object: ObjectId,
     fh: u64,
@@ -147,19 +192,41 @@ enum Op {
     from: String,
     to: String,
   },
-  /// Delete the object named by a path (`Cleanup` with the delete flag): a file (`unlink`) or an empty
-  /// directory (`rmdir`), decided by the resolved kind.
-  Delete {
-    path: String,
+  /// `FlushFileBuffers` on a handle: the bridge's flush, then the publication that makes it durable.
+  Flush {
+    object: ObjectId,
+    fh: u64,
+  },
+  /// The last handle of a file object closed (`Cleanup`) after it changed the file: deletes the path when asked
+  /// (a file's `unlink`, an empty directory's `rmdir`, decided by the resolved kind), and publishes.
+  Cleanup {
+    delete: Option<String>,
   },
   Release {
     object: ObjectId,
     fh: u64,
-    is_dir: bool,
   },
 }
 
-/// The owner thread's reply to an [`Op`].
+impl Op {
+  /// Whether the request changed what survives a restart, so the shard publishes before it answers (§4.8, D-18): a
+  /// namespace or size change, an explicit flush, or the close of a handle that changed its file. A write alone does
+  /// not: Windows' cache writes back lazily, and its handle's close or flush carries the barrier, as a FUSE close's
+  /// `flush` does.
+  fn needs_barrier(&self) -> bool {
+    matches!(
+      self,
+      Op::Create { .. }
+        | Op::SetSize { .. }
+        | Op::Truncate { .. }
+        | Op::Rename { .. }
+        | Op::Flush { .. }
+        | Op::Cleanup { .. }
+    )
+  }
+}
+
+/// The shard's reply to an [`Op`].
 enum Reply {
   Volume {
     total: u64,
@@ -169,7 +236,6 @@ enum Reply {
   Object {
     object: ObjectId,
     info: FileInfo,
-    is_dir: bool,
     fh: u64,
   },
   Data {
@@ -187,63 +253,70 @@ enum Reply {
   Err(Ntstatus),
 }
 
-/// A job on the owner-thread channel: the operation and the oneshot channel its reply returns on.
-struct Job {
+/// One request from a dispatcher thread: the operation and the channel its reply returns on. The mount's task takes it
+/// from the channel [`MountThread::start`] was given and serves it on the owner shard ([`Request::serve`]).
+pub struct Request {
   op: Op,
   reply: SyncSender<Reply>,
 }
 
-/// The volume state the owner thread holds for a mount's whole life: the volume and its store, a
-/// persistent handle table (so an open handle survives across the read/write calls that share a
-/// `FileContext`), and the attachment the operations run under. Built on the owner thread (so the
-/// `!Send` volume never crosses a thread) by [`VolumeHost::new`].
-pub struct VolumeHost {
-  volume: Volume,
-  store: Store,
-  handles: Slab<u64>,
-  attachments: Attachments,
-  attachment: slates_bridge_core::AttachmentId,
-  volume_id: VolumeId,
+impl Request {
+  /// Serves the request whole through `bridge` under `cx`, keeping `names` — what Windows holds open, which the
+  /// mount's notifications name ([`crate::notify`]) — in step with its opens, closes and renames. The reply is not sent
+  /// yet: the caller publishes first when [`Served::needs_barrier`] says so.
+  pub fn serve(self, bridge: &mut dyn Bridge, cx: &OpContext, names: &mut OpenNames) -> Served {
+    let barrier = self.op.needs_barrier();
+    let opened = match &self.op {
+      Op::Open { path } | Op::Create { path, .. } => Some(path.clone()),
+      _ => None,
+    };
+    let closed = match &self.op {
+      Op::Release { fh, .. } => Some(*fh),
+      _ => None,
+    };
+    let renamed = match &self.op {
+      Op::Rename { from, to } => Some((from.clone(), to.clone())),
+      _ => None,
+    };
+    let reply = run(bridge, cx, self.op).unwrap_or_else(|e| Reply::Err(ntstatus(&e).as_i32()));
+    match (&reply, opened, closed, renamed) {
+      (Reply::Object { object, fh, .. }, Some(path), _, _) => {
+        names.opened(*fh, object.inode, &path);
+      }
+      (_, _, Some(fh), _) => names.closed(fh),
+      (Reply::Ok, _, _, Some((from, to))) => names.renamed(&from, &to),
+      _ => {}
+    }
+    Served {
+      reply,
+      sender: self.reply,
+      barrier,
+    }
+  }
 }
 
-impl VolumeHost {
-  /// The host for `volume`/`store` (volume id `volume_id`), served under `subject` with `rights`. Panics
-  /// only on an impossible attachment-registry overflow at construction (a fresh registry always admits
-  /// one); everything after is a typed refusal. Call this inside the `build` closure of [`mount`], on
-  /// the owner thread.
-  pub fn new(
-    volume_id: VolumeId,
-    volume: Volume,
-    store: Store,
-    subject: Principal,
-    rights: Rights,
-  ) -> Result<VolumeHost, WinFspError> {
-    let mut attachments = Attachments::new();
-    let attachment = attachments
-      .attach(volume_id, View::Current, subject, rights)
-      .map_err(|_| WinFspError::OwnerThread)?;
-    Ok(VolumeHost {
-      volume,
-      store,
-      handles: new_handle_store(),
-      attachments,
-      attachment,
-      volume_id,
-    })
+/// A served request whose reply is still to be sent.
+pub struct Served {
+  reply: Reply,
+  sender: SyncSender<Reply>,
+  barrier: bool,
+}
+
+impl Served {
+  /// Whether the request succeeded and changed what survives a restart: its reply waits for the shard's publication.
+  pub fn needs_barrier(&self) -> bool {
+    self.barrier && !matches!(self.reply, Reply::Err(_))
   }
 
-  /// A transient bridge over the volume for one operation (the "marshal each operation into the owning
-  /// shard's bridge queue" shape), with the persistent handle table lent in so open handles survive.
-  fn bridge(&mut self) -> Result<(VolumeBridge<'_>, OpContext), VfsError> {
-    let cx = self.attachments.context(self.attachment)?;
-    let bridge = VolumeBridge::attached(
-      self.volume_id,
-      &mut self.volume,
-      &mut self.store,
-      &mut self.handles,
-      None,
-    );
-    Ok((bridge, cx))
+  /// The publication was refused: the reply becomes `STATUS_UNEXPECTED_IO_ERROR`, the effect being in the volume but not
+  /// durable, so the caller is told rather than promised survival.
+  pub fn refuse_unpublished(&mut self) {
+    self.reply = Reply::Err(crate::status_unexpected_io_error());
+  }
+
+  /// Sends the reply to the waiting dispatcher thread. `false` when that thread is gone (the mount is being torn down).
+  pub fn send(self) -> bool {
+    self.sender.send(self.reply).is_ok()
   }
 }
 
@@ -273,11 +346,7 @@ fn components(path: &str) -> Vec<&str> {
 
 /// Resolves a WinFsp path to its object id and attributes by walking `lookup` from the root. The root
 /// (`\`) is the volume root itself.
-fn resolve(
-  bridge: &mut VolumeBridge<'_>,
-  cx: &OpContext,
-  path: &str,
-) -> Result<NodeAttr, VfsError> {
+fn resolve(bridge: &mut dyn Bridge, cx: &OpContext, path: &str) -> Result<NodeAttr, VfsError> {
   let root = bridge.root(cx)?;
   let mut current = bridge.getattr(ObjectId::new(root, 0), cx)?;
   for name in components(path) {
@@ -286,19 +355,17 @@ fn resolve(
   Ok(current)
 }
 
-/// Runs one [`Op`] on the owner thread's volume and returns its [`Reply`]. A `VfsError` becomes an
-/// `Err(NTSTATUS)` through the shared refusal taxonomy ([`ntstatus`]).
-fn serve(host: &mut VolumeHost, op: Op) -> Reply {
-  let (mut bridge, cx) = match host.bridge() {
-    Ok(pair) => pair,
-    Err(e) => return Reply::Err(ntstatus(&e).as_i32()),
-  };
-  let result = run(&mut bridge, &cx, op);
-  result.unwrap_or_else(|e| Reply::Err(ntstatus(&e).as_i32()))
+/// The attributes of `attr` as a reply naming its object.
+fn object_reply(attr: &NodeAttr, fh: u64) -> Result<Reply, VfsError> {
+  Ok(Reply::Object {
+    object: ObjectId::new(attr.ino, attr.generation),
+    info: file_info(attr)?,
+    fh,
+  })
 }
 
-/// The operation body, returning `Result` so the `?` operator threads refusals; [`serve`] maps them.
-fn run(bridge: &mut VolumeBridge<'_>, cx: &OpContext, op: Op) -> Result<Reply, VfsError> {
+/// The operation body, returning `Result` so the `?` operator threads refusals; [`Request::serve`] maps them.
+fn run(bridge: &mut dyn Bridge, cx: &OpContext, op: Op) -> Result<Reply, VfsError> {
   Ok(match op {
     Op::VolumeInfo => {
       let root = bridge.root(cx)?;
@@ -308,29 +375,18 @@ fn run(bridge: &mut VolumeBridge<'_>, cx: &OpContext, op: Op) -> Result<Reply, V
       Reply::Volume { total, free }
     }
     Op::Resolve { path } => match resolve(bridge, cx, &path) {
-      Ok(attr) => Reply::Object {
-        object: ObjectId::new(attr.ino, attr.generation),
-        info: file_info(&attr)?,
-        is_dir: matches!(attr.kind, Kind::Dir),
-        fh: 0,
-      },
+      Ok(attr) => object_reply(&attr, 0)?,
       Err(e) => Reply::Err(ntstatus(&e).as_i32()),
     },
     Op::Open { path } => {
       let attr = resolve(bridge, cx, &path)?;
       let object = ObjectId::new(attr.ino, attr.generation);
-      let is_dir = matches!(attr.kind, Kind::Dir);
-      let fh = if is_dir {
+      let fh = if matches!(attr.kind, Kind::Dir) {
         bridge.opendir(object, cx)?
       } else {
         bridge.open(object, cx, 0)?
       };
-      Reply::Object {
-        object,
-        info: file_info(&attr)?,
-        is_dir,
-        fh,
-      }
+      object_reply(&attr, fh)?
     }
     Op::Create { path, is_dir } => op_create(bridge, cx, &path, is_dir)?,
     Op::Read {
@@ -360,19 +416,10 @@ fn run(bridge: &mut VolumeBridge<'_>, cx: &OpContext, op: Op) -> Result<Reply, V
         info: file_info(&attr)?,
       }
     }
-    Op::Info { object } => {
-      let attr = bridge.getattr(object, cx)?;
-      Reply::Object {
-        object,
-        info: file_info(&attr)?,
-        is_dir: matches!(attr.kind, Kind::Dir),
-        fh: 0,
-      }
-    }
-    Op::ReadDir { object, fh } => {
-      let entries = read_all_entries(bridge, cx, object, fh)?;
-      Reply::Entries { entries }
-    }
+    Op::Info { object } => object_reply(&bridge.getattr(object, cx)?, 0)?,
+    Op::ReadDir { object, fh } => Reply::Entries {
+      entries: read_all_entries(bridge, cx, object, fh)?,
+    },
     Op::SetSize { object, new_size } => {
       let attr = bridge.setattr(
         object,
@@ -382,12 +429,7 @@ fn run(bridge: &mut VolumeBridge<'_>, cx: &OpContext, op: Op) -> Result<Reply, V
           ..SetAttr::default()
         },
       )?;
-      Reply::Object {
-        object,
-        info: file_info(&attr)?,
-        is_dir: false,
-        fh: 0,
-      }
+      object_reply(&attr, 0)?
     }
     Op::Truncate { object } => {
       let attr = bridge.setattr(
@@ -398,18 +440,19 @@ fn run(bridge: &mut VolumeBridge<'_>, cx: &OpContext, op: Op) -> Result<Reply, V
           ..SetAttr::default()
         },
       )?;
-      Reply::Object {
-        object,
-        info: file_info(&attr)?,
-        is_dir: false,
-        fh: 0,
-      }
+      object_reply(&attr, 0)?
     }
     Op::Rename { from, to } => op_rename(bridge, cx, &from, &to)?,
-    Op::Delete { path } => op_delete(bridge, cx, &path)?,
-    Op::Release { object, fh, is_dir } => {
-      let _ = is_dir;
-      let _ = bridge.release(object, cx, fh);
+    Op::Flush { object, fh } => {
+      bridge.flush(object, cx, fh)?;
+      Reply::Ok
+    }
+    Op::Cleanup { delete } => match delete {
+      Some(path) => op_delete(bridge, cx, &path)?,
+      None => Reply::Ok,
+    },
+    Op::Release { object, fh } => {
+      bridge.release(object, cx, fh)?;
       Reply::Ok
     }
   })
@@ -419,7 +462,7 @@ fn run(bridge: &mut VolumeBridge<'_>, cx: &OpContext, op: Op) -> Result<Reply, V
 /// or renamed name lives in). A path with no component (`\`) has no parent, reported as
 /// `STATUS_INVALID_PARAMETER`.
 fn split_parent<'p>(
-  bridge: &mut VolumeBridge<'_>,
+  bridge: &mut dyn Bridge,
   cx: &OpContext,
   path: &'p str,
 ) -> Result<Result<(&'p str, ObjectId), Ntstatus>, VfsError> {
@@ -434,7 +477,7 @@ fn split_parent<'p>(
 /// Creates a file or directory at `path`: split into parent and name, then `create`/`mkdir` and open a
 /// handle so the returned context is ready for the writes that follow.
 fn op_create(
-  bridge: &mut VolumeBridge<'_>,
+  bridge: &mut dyn Bridge,
   cx: &OpContext,
   path: &str,
   is_dir: bool,
@@ -445,28 +488,17 @@ fn op_create(
   };
   if is_dir {
     let attr = bridge.mkdir(parent_id, cx, name, DEFAULT_DIR_MODE)?;
-    let object = ObjectId::new(attr.ino, attr.generation);
-    let fh = bridge.opendir(object, cx)?;
-    Ok(Reply::Object {
-      object,
-      info: file_info(&attr)?,
-      is_dir: true,
-      fh,
-    })
+    let fh = bridge.opendir(ObjectId::new(attr.ino, attr.generation), cx)?;
+    object_reply(&attr, fh)
   } else {
     let (attr, fh) = bridge.create(parent_id, cx, name, DEFAULT_FILE_MODE, 0)?;
-    Ok(Reply::Object {
-      object: ObjectId::new(attr.ino, attr.generation),
-      info: file_info(&attr)?,
-      is_dir: false,
-      fh,
-    })
+    object_reply(&attr, fh)
   }
 }
 
 /// Renames `from` to `to` by resolving each path's parent and final name.
 fn op_rename(
-  bridge: &mut VolumeBridge<'_>,
+  bridge: &mut dyn Bridge,
   cx: &OpContext,
   from: &str,
   to: &str,
@@ -491,7 +523,7 @@ fn op_rename(
 }
 
 /// Deletes `path`: an empty directory (`rmdir`) or a file (`unlink`), decided by the resolved kind.
-fn op_delete(bridge: &mut VolumeBridge<'_>, cx: &OpContext, path: &str) -> Result<Reply, VfsError> {
+fn op_delete(bridge: &mut dyn Bridge, cx: &OpContext, path: &str) -> Result<Reply, VfsError> {
   let (name, parent_id) = match split_parent(bridge, cx, path)? {
     Ok(pair) => pair,
     Err(status) => return Ok(Reply::Err(status)),
@@ -506,12 +538,12 @@ fn op_delete(bridge: &mut VolumeBridge<'_>, cx: &OpContext, path: &str) -> Resul
 }
 
 /// Reads a directory's full entry list (`.`/`..` plus its children, which the bridge's `readdir`
-/// returns whole from offset 0), each resolved to its attributes by id — the owner-side of
+/// returns whole from offset 0), each resolved to its attributes by id — the shard side of
 /// `ReadDirectory`; the trampoline applies the WinFsp marker and buffer fill. An entry that vanished
 /// between the listing and its attribute lookup is reported with the entry's kind and a zero size
 /// rather than dropped, so the listing never desyncs.
 fn read_all_entries(
-  bridge: &mut VolumeBridge<'_>,
+  bridge: &mut dyn Bridge,
   cx: &OpContext,
   object: ObjectId,
   fh: u64,
@@ -534,24 +566,27 @@ fn read_all_entries(
 
 // --------------------------------------------------------------------- the WinFsp callback handler
 
-/// The handler stored in the file system's `UserContext`: the channel to the owner thread and the one
-/// reference security descriptor every object reports. `Send + Sync` (a `SyncSender` and a byte vector),
-/// so WinFsp's dispatcher threads reach it soundly; the COARSE guard serializes them regardless.
+/// The handler stored in the file system's `UserContext`: the channel to the mount's task, the waker of that task, and
+/// the one reference security descriptor every object reports. `Send + Sync` (a `SyncSender`, a `Waker` and a byte
+/// vector), so WinFsp's dispatcher threads reach it soundly; the COARSE guard serializes them regardless.
 struct Handler {
-  jobs: SyncSender<Job>,
+  requests: SyncSender<Request>,
+  wake: Waker,
   /// A self-relative security descriptor as raw bytes (built once from [`EVERYONE_SDDL`]).
   security_descriptor: Vec<u8>,
 }
 
 impl Handler {
-  /// Sends `op` to the owner thread and blocks for its reply; a dead owner thread (its receiver gone)
-  /// is `STATUS_UNSUCCESSFUL`, never a hang.
+  /// Sends `op` to the mount's task, wakes it, and blocks this dispatcher thread for its reply; a closed channel (the
+  /// mount is being torn down) is `STATUS_UNSUCCESSFUL`, never a hang.
   fn call(&self, op: Op) -> Reply {
-    let (tx, rx) = sync_channel(1);
-    if self.jobs.send(Job { op, reply: tx }).is_err() {
+    let (reply, answer) = sync_channel(1);
+    if self.requests.send(Request { op, reply }).is_err() {
       return Reply::Err(crate::status_unsuccessful());
     }
-    rx.recv()
+    self.wake.wake_by_ref();
+    answer
+      .recv()
       .unwrap_or(Reply::Err(crate::status_unsuccessful()))
   }
 }
@@ -559,8 +594,8 @@ impl Handler {
 /// The handler behind a file system pointer, from its `UserContext`.
 ///
 /// # Safety
-/// `fs` must be a live `FileSystem` whose `UserContext` holds a `Handler` pointer set by [`mount`] and
-/// not yet reclaimed. The COARSE guard serializes callbacks, so no concurrent access occurs.
+/// `fs` must be a live `FileSystem` whose `UserContext` holds a `Handler` pointer set by the mount thread and not yet
+/// reclaimed (the thread reclaims it only after the dispatcher has stopped).
 unsafe fn handler<'a>(fs: *mut FileSystem) -> &'a Handler {
   // SAFETY: the contract above — a live file system whose UserContext is our leaked Handler.
   unsafe { &*((*fs).user_context as *const Handler) }
@@ -693,12 +728,11 @@ unsafe fn copy_security_descriptor(
 fn finish_open(
   object: ObjectId,
   fh: u64,
-  is_dir: bool,
   info: FileInfo,
   p_context: *mut Pvoid,
   p_info: *mut FileInfo,
 ) -> Ntstatus {
-  let boxed = Box::into_raw(Box::new(OpenFile { object, fh, is_dir }));
+  let boxed = Box::into_raw(Box::new(OpenFile { object, fh }));
   // SAFETY: `p_context` is a writable PVOID out-parameter; `p_info` is handled by `put_info`.
   unsafe {
     *p_context = boxed.cast::<c_void>();
@@ -724,12 +758,7 @@ extern "C" fn create(
   let path = unsafe { wide_to_string(file_name) };
   let is_dir = create_options & ffi::FILE_DIRECTORY_FILE != 0;
   match handler.call(Op::Create { path, is_dir }) {
-    Reply::Object {
-      object,
-      info,
-      is_dir,
-      fh,
-    } => finish_open(object, fh, is_dir, info, p_context, p_info),
+    Reply::Object { object, info, fh } => finish_open(object, fh, info, p_context, p_info),
     Reply::Err(status) => status,
     _ => crate::status_unsuccessful(),
   }
@@ -748,12 +777,7 @@ extern "C" fn open_trampoline(
   // SAFETY: `file_name` is a NUL-terminated UTF-16 path WinFsp owns for this call.
   let path = unsafe { wide_to_string(file_name) };
   match handler.call(Op::Open { path }) {
-    Reply::Object {
-      object,
-      info,
-      is_dir,
-      fh,
-    } => finish_open(object, fh, is_dir, info, p_context, p_info),
+    Reply::Object { object, info, fh } => finish_open(object, fh, info, p_context, p_info),
     Reply::Err(status) => status,
     _ => crate::status_object_name_not_found(),
   }
@@ -782,16 +806,19 @@ extern "C" fn overwrite(
   }
 }
 
-extern "C" fn cleanup(fs: *mut FileSystem, context: Pvoid, file_name: Pwstr, flags: u32) {
-  if flags & ffi::FSP_CLEANUP_DELETE == 0 {
+extern "C" fn cleanup(fs: *mut FileSystem, _context: Pvoid, file_name: Pwstr, flags: u32) {
+  if flags & CLEANUP_CHANGED == 0 {
     return;
   }
-  // SAFETY: our file system; `file_name` the path to delete (sent only on a delete cleanup).
+  // SAFETY: our file system; `file_name` the path, sent when a delete is asked for.
   let handler = unsafe { handler(fs) };
-  let _ = context;
-  // SAFETY: `file_name` is a NUL-terminated UTF-16 path WinFsp owns for this call.
-  let path = unsafe { wide_to_string(file_name) };
-  let _ = handler.call(Op::Delete { path });
+  let delete = (flags & ffi::FSP_CLEANUP_DELETE != 0).then(|| {
+    // SAFETY: `file_name` is a NUL-terminated UTF-16 path WinFsp owns for this call.
+    unsafe { wide_to_string(file_name) }
+  });
+  // Cleanup returns nothing to the kernel: a refused delete or publication leaves the file as it was, which the
+  // caller sees at its next look; the shard counts what it refused.
+  let _ = handler.call(Op::Cleanup { delete });
 }
 
 extern "C" fn close(fs: *mut FileSystem, context: Pvoid) {
@@ -803,10 +830,10 @@ extern "C" fn close(fs: *mut FileSystem, context: Pvoid) {
   // SAFETY: `context` is the OpenFile leaked by open/create, reclaimed exactly once here (WinFsp
   // calls Close once per context, after the dispatcher has stopped delivering other calls for it).
   let open = unsafe { Box::from_raw(context as *mut OpenFile) };
+  // Close returns nothing to the kernel; the shard counts a release it refused.
   let _ = handler.call(Op::Release {
     object: open.object,
     fh: open.fh,
-    is_dir: open.is_dir,
   });
 }
 
@@ -828,7 +855,9 @@ extern "C" fn read(
     length,
   }) {
     Reply::Data { bytes } => {
-      let n = bytes.len().min(length as usize);
+      let n = bytes
+        .len()
+        .min(usize::try_from(length).unwrap_or(usize::MAX));
       // SAFETY: `buffer` is a WinFsp buffer of at least `length` bytes; we copy `n <= length`.
       unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.cast::<u8>(), n);
@@ -856,8 +885,11 @@ extern "C" fn write(
   let handler = unsafe { handler(fs) };
   // SAFETY: `context` is a live OpenFile leaked by open/create, taken under the COARSE guard.
   let object = unsafe { open_file(context) }.object;
+  let Ok(length) = usize::try_from(length) else {
+    return crate::status_invalid_parameter();
+  };
   // SAFETY: `buffer` is a WinFsp buffer of `length` bytes for this call.
-  let data = unsafe { std::slice::from_raw_parts(buffer.cast::<u8>(), length as usize) }.to_vec();
+  let data = unsafe { std::slice::from_raw_parts(buffer.cast::<u8>(), length) }.to_vec();
   match handler.call(Op::Write {
     object,
     offset,
@@ -877,11 +909,30 @@ extern "C" fn write(
   }
 }
 
-extern "C" fn flush(_fs: *mut FileSystem, _context: Pvoid, p_info: *mut FileInfo) -> Ntstatus {
-  // A slates write lands synchronously (durable before its reply), so a flush is a no-op success. The
-  // info out-parameter is left as WinFsp initialized it (a volume flush passes a null context).
-  let _ = p_info;
-  STATUS_SUCCESS.as_i32()
+extern "C" fn flush(fs: *mut FileSystem, context: Pvoid, p_info: *mut FileInfo) -> Ntstatus {
+  // A volume flush passes a null context: every publication already covers the whole shard, so there is nothing
+  // further to make durable than each handle's own flush does.
+  if context.is_null() {
+    return STATUS_SUCCESS.as_i32();
+  }
+  // SAFETY: our file system and a live open-file context.
+  let handler = unsafe { handler(fs) };
+  // SAFETY: `context` is a live OpenFile leaked by open/create, taken under the COARSE guard.
+  let open = unsafe { open_file(context) };
+  let (object, fh) = (open.object, open.fh);
+  match handler.call(Op::Flush { object, fh }) {
+    Reply::Ok => match handler.call(Op::Info { object }) {
+      Reply::Object { info, .. } => {
+        // SAFETY: `p_info` handled by put_info.
+        unsafe { put_info(p_info, info) };
+        STATUS_SUCCESS.as_i32()
+      }
+      Reply::Err(status) => status,
+      _ => crate::status_unsuccessful(),
+    },
+    Reply::Err(status) => status,
+    _ => crate::status_unsuccessful(),
+  }
 }
 
 extern "C" fn get_file_info(
@@ -905,7 +956,7 @@ extern "C" fn get_file_info(
 }
 
 extern "C" fn set_basic_info(
-  _fs: *mut FileSystem,
+  fs: *mut FileSystem,
   context: Pvoid,
   _file_attributes: u32,
   _creation_time: u64,
@@ -914,10 +965,10 @@ extern "C" fn set_basic_info(
   _change_time: u64,
   p_info: *mut FileInfo,
 ) -> Ntstatus {
-  // Times/attributes are accepted and reported from the current object (a RAM scratch mount does not
-  // persist Windows attribute bits); the object's live info is returned so the caller sees consistency.
+  // Times and attribute bits are accepted and reported from the current object (the volume keeps POSIX times, set
+  // through its own writes); the object's live info is returned so the caller sees what the volume holds.
   // SAFETY: our file system and a live open-file context.
-  let handler = unsafe { handler(_fs) };
+  let handler = unsafe { handler(fs) };
   // SAFETY: `context` is a live OpenFile leaked by open/create, taken under the COARSE guard.
   let object = unsafe { open_file(context) }.object;
   match handler.call(Op::Info { object }) {
@@ -959,11 +1010,10 @@ extern "C" fn set_file_size(
   }
 }
 
-extern "C" fn can_delete(_fs: *mut FileSystem, context: Pvoid, _file_name: Pwstr) -> Ntstatus {
+extern "C" fn can_delete(_fs: *mut FileSystem, _context: Pvoid, _file_name: Pwstr) -> Ntstatus {
   // The delete itself happens in Cleanup; here we only confirm deletability. An empty-directory check
   // is enforced by the volume core's `rmdir` at delete time (NotEmpty → the mapped NTSTATUS), so this
   // reports success and lets the real check run then.
-  let _ = context;
   STATUS_SUCCESS.as_i32()
 }
 
@@ -1028,6 +1078,9 @@ unsafe fn fill_directory(
   length: u32,
   p_bytes: *mut u32,
 ) -> Ntstatus {
+  let Ok(api) = ffi::api() else {
+    return crate::status_unsuccessful();
+  };
   let mut past_marker = marker.is_empty();
   for (name, info) in entries {
     if !past_marker {
@@ -1063,7 +1116,7 @@ unsafe fn fill_directory(
         scratch.as_mut_ptr().add(head),
         name_bytes,
       );
-      if ffi::FspFileSystemAddDirInfo(
+      if (api.add_dir_info)(
         scratch.as_mut_ptr().cast::<DirInfo>(),
         buffer,
         length,
@@ -1078,7 +1131,7 @@ unsafe fn fill_directory(
   // A NULL DirInfo marks the end of the listing.
   // SAFETY: AddDirInfo accepts a null DirInfo to write the terminating marker.
   unsafe {
-    ffi::FspFileSystemAddDirInfo(std::ptr::null_mut(), buffer, length, p_bytes);
+    (api.add_dir_info)(std::ptr::null_mut(), buffer, length, p_bytes);
   }
   STATUS_SUCCESS.as_i32()
 }
@@ -1107,153 +1160,295 @@ static INTERFACE: Interface = Interface {
 
 // ------------------------------------------------------------------------------- the mount lifecycle
 
-/// A live WinFsp mount: the file system object, the owner thread serving its volume, and the leaked
-/// handler. Unmounts, stops the dispatcher, deletes the file system, and joins the owner thread on drop.
-pub struct Mount {
+/// A live WinFsp file system: the object, the leaked handler, and the library's exports. Owned by the mount thread
+/// for its whole life; unmounts, stops the dispatcher, deletes the file system and reclaims the handler on drop.
+struct Mounted {
+  api: &'static Api,
   file_system: *mut FileSystem,
   handler: *mut Handler,
-  owner: Option<JoinHandle<()>>,
 }
 
-/// Builds the volume (on the owner thread, via `build`, so the `!Send` volume never crosses a
-/// thread), then mounts it at `mount_point` (a drive letter like `Z:` or a directory). The owner
-/// thread serves callbacks until the [`Mount`] is dropped.
-pub fn mount<F>(build: F, mount_point: &str) -> Result<Mount, WinFspError>
-where
-  F: FnOnce() -> Result<VolumeHost, WinFspError> + Send + 'static,
-{
-  let security_descriptor = everyone_security_descriptor()?;
-  let (jobs, job_rx) = sync_channel::<Job>(JOB_QUEUE_BOUND);
-  // The owner thread: build the volume locally, then serve one op at a time until the channel closes.
-  let owner = std::thread::Builder::new()
-    .name("slates-winfsp".to_owned())
-    .spawn(move || owner_loop(build, job_rx))
-    .map_err(|_| WinFspError::OwnerThread)?;
-  let handler = Box::into_raw(Box::new(Handler {
-    jobs,
-    security_descriptor,
-  }));
+/// What a notification round came to (§4.6 "Windows").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Notified {
+  /// Windows took the round: its work item invalidates and notifies each name (WinFsp processes a round
+  /// asynchronously, `FspVolumeNotify`).
+  Taken,
+  /// A rename held WinFsp's rename lock (`STATUS_CANT_WAIT` from a zero-timeout begin): nothing was told, and the
+  /// round is owed again.
+  RenameInProgress,
+}
 
-  // SAFETY: an all-zero VolumeParams is a valid, empty parameter block; the fields below fill it.
-  let mut params: VolumeParams = unsafe { std::mem::zeroed() };
-  params.version = 0;
-  params.sector_size = SECTOR_SIZE;
-  params.sectors_per_allocation_unit = SECTORS_PER_UNIT;
-  params.max_component_length = MAX_COMPONENT_LENGTH;
-  params.file_info_timeout = FILE_INFO_TIMEOUT_MS;
-  params.flags = ffi::VOLUME_FLAG_CASE_SENSITIVE_SEARCH
-    | ffi::VOLUME_FLAG_CASE_PRESERVED_NAMES
-    | ffi::VOLUME_FLAG_UNICODE_ON_DISK
-    | ffi::VOLUME_FLAG_PERSISTENT_ACLS;
-  write_wide(&mut params.file_system_name, "slates");
+impl Mounted {
+  /// Creates the file system, mounts it at `mount_point`, and starts its dispatcher; every partial step is undone on a
+  /// refusal.
+  fn new(
+    mount_point: &str,
+    read_only: bool,
+    requests: SyncSender<Request>,
+    wake: Waker,
+  ) -> Result<Mounted, WinFspError> {
+    let api = ffi::api().map_err(|_| WinFspError::NotInstalled)?;
+    let security_descriptor = everyone_security_descriptor()?;
+    let handler = Box::into_raw(Box::new(Handler {
+      requests,
+      wake,
+      security_descriptor,
+    }));
+    // SAFETY: an all-zero VolumeParams is a valid, empty parameter block; the fields below fill it.
+    let mut params: VolumeParams = unsafe { std::mem::zeroed() };
+    // Version-1 parameters (the version is the struct's size), so the volume-information timeout is set apart.
+    params.version = u16::try_from(std::mem::size_of::<VolumeParams>()).unwrap_or(0);
+    params.sector_size = SECTOR_SIZE;
+    params.sectors_per_allocation_unit = SECTORS_PER_UNIT;
+    params.max_component_length = MAX_COMPONENT_LENGTH;
+    params.file_info_timeout = FILE_INFO_TIMEOUT_INFINITE;
+    params.flags = ffi::VOLUME_FLAG_CASE_SENSITIVE_SEARCH
+      | ffi::VOLUME_FLAG_CASE_PRESERVED_NAMES
+      | ffi::VOLUME_FLAG_UNICODE_ON_DISK
+      | ffi::VOLUME_FLAG_PERSISTENT_ACLS;
+    if read_only {
+      params.flags |= ffi::VOLUME_FLAG_READ_ONLY_VOLUME;
+    }
+    params.flags_v1 = VOLUME_INFO_TIMEOUT_VALID;
+    params.volume_info_timeout = VOLUME_INFO_TIMEOUT_MS;
+    write_wide(&mut params.file_system_name, "slates");
 
-  let mut file_system: *mut FileSystem = std::ptr::null_mut();
-  let mut device = wide_nul("WinFsp.Disk");
-  // SAFETY: `device`/`params`/`INTERFACE` are live for the call; `file_system` is a writable out-ptr.
-  let status =
-    unsafe { ffi::FspFileSystemCreate(device.as_mut_ptr(), &params, &INTERFACE, &mut file_system) };
-  if status != 0 {
-    // Nothing was mounted; reclaim the handler and let the owner thread end (its sender drops).
-    // SAFETY: `handler` was just leaked and no callback has run.
-    drop(unsafe { Box::from_raw(handler) });
-    let _ = owner.join();
-    return Err(WinFspError::Api {
-      call: "FspFileSystemCreate",
-      status,
-    });
-  }
-  // SAFETY: `file_system` is the object just created; store the handler and serialize callbacks.
-  unsafe {
-    (*file_system).user_context = handler.cast::<c_void>();
-    ffi::FspFileSystemSetOperationGuardStrategyF(file_system, GUARD_STRATEGY_COARSE);
-  }
-  let mut mount_wide = wide_nul(mount_point);
-  // SAFETY: `file_system` is live; `mount_wide` a NUL-terminated mount point.
-  let status = unsafe { ffi::FspFileSystemSetMountPoint(file_system, mount_wide.as_mut_ptr()) };
-  if status != 0 {
-    return Err(teardown_partial(
+    let mut file_system: *mut FileSystem = std::ptr::null_mut();
+    let mut device = wide_nul("WinFsp.Disk");
+    // SAFETY: `device`/`params`/`INTERFACE` are live for the call; `file_system` is a writable out-ptr.
+    let status =
+      unsafe { (api.create)(device.as_mut_ptr(), &params, &INTERFACE, &mut file_system) };
+    if status != 0 {
+      // Nothing was created; no callback can reach the handler.
+      // SAFETY: `handler` was just leaked and nothing else holds it.
+      drop(unsafe { Box::from_raw(handler) });
+      return Err(WinFspError::Api {
+        call: "FspFileSystemCreate",
+        status,
+      });
+    }
+    let mut mounted = Mounted {
+      api,
       file_system,
       handler,
-      owner,
-      "FspFileSystemSetMountPoint",
-      status,
-    ));
-  }
-  // SAFETY: `file_system` is live and mounted; start its dispatcher threads.
-  let status = unsafe { ffi::FspFileSystemStartDispatcher(file_system, DISPATCHER_THREADS) };
-  if status != 0 {
-    // SAFETY: remove the mount point set above before tearing down.
-    unsafe { ffi::FspFileSystemRemoveMountPoint(file_system) };
-    return Err(teardown_partial(
-      file_system,
-      handler,
-      owner,
-      "FspFileSystemStartDispatcher",
-      status,
-    ));
-  }
-  Ok(Mount {
-    file_system,
-    handler,
-    owner: Some(owner),
-  })
-}
-
-/// Tears a partially-built mount down after a failed step: delete the file system, reclaim the handler
-/// (closing the owner channel), join the owner thread, and return the typed error.
-fn teardown_partial(
-  file_system: *mut FileSystem,
-  handler: *mut Handler,
-  owner: JoinHandle<()>,
-  call: &'static str,
-  status: i32,
-) -> WinFspError {
-  // SAFETY: `file_system` is a live object never dispatched; `handler` a leaked box taken once.
-  unsafe {
-    ffi::FspFileSystemDelete(file_system);
-    drop(Box::from_raw(handler));
-  }
-  let _ = owner.join();
-  WinFspError::Api { call, status }
-}
-
-impl Drop for Mount {
-  fn drop(&mut self) {
-    // SAFETY: `file_system` is live; stop the dispatcher (no more callbacks), unmount, and delete it.
+    };
+    // SAFETY: `file_system` is the object just created; store the handler and serialize callbacks.
     unsafe {
-      ffi::FspFileSystemStopDispatcher(self.file_system);
-      ffi::FspFileSystemRemoveMountPoint(self.file_system);
-      ffi::FspFileSystemDelete(self.file_system);
+      (*file_system).user_context = handler.cast::<c_void>();
+      (api.set_guard_strategy)(file_system, GUARD_STRATEGY_COARSE);
     }
-    // No callback can run now, so reclaim the handler; dropping its sender closes the owner channel.
-    // SAFETY: the handler was leaked in `mount` and the dispatcher is stopped, so this is the sole taker.
-    drop(unsafe { Box::from_raw(self.handler) });
-    if let Some(owner) = self.owner.take() {
-      let _ = owner.join();
+    let mut mount_wide = wide_nul(mount_point);
+    // SAFETY: `file_system` is live; `mount_wide` a NUL-terminated mount point.
+    let status = unsafe { (api.set_mount_point)(file_system, mount_wide.as_mut_ptr()) };
+    if status != 0 {
+      mounted.file_system = std::ptr::null_mut();
+      // SAFETY: the object was created and never mounted or dispatched; deleting it is its whole undo, and then the
+      // handler has no holder.
+      unsafe {
+        (api.delete)(file_system);
+        drop(Box::from_raw(handler));
+      }
+      return Err(WinFspError::Api {
+        call: "FspFileSystemSetMountPoint",
+        status,
+      });
+    }
+    // SAFETY: `file_system` is live and mounted; start its dispatcher threads.
+    let status = unsafe { (api.start_dispatcher)(file_system, DISPATCHER_THREADS) };
+    if status != 0 {
+      // The drop below removes the mount point and deletes the object; stopping a dispatcher that never started is a
+      // no-op in WinFsp.
+      return Err(WinFspError::Api {
+        call: "FspFileSystemStartDispatcher",
+        status,
+      });
+    }
+    Ok(mounted)
+  }
+
+  /// Hands Windows one round of notification records (`crate::notify::NotifyRound::bytes`).
+  fn notify(&self, round: &[u8]) -> Result<Notified, WinFspError> {
+    // SAFETY: `file_system` is live and its dispatcher started; a zero timeout never sleeps.
+    let begun = unsafe { (self.api.notify_begin)(self.file_system, 0) };
+    if begun == ffi::STATUS_CANT_WAIT {
+      return Ok(Notified::RenameInProgress);
+    }
+    if begun != 0 {
+      return Err(WinFspError::Api {
+        call: "FspFileSystemNotifyBegin",
+        status: begun,
+      });
+    }
+    // SAFETY: `round` is a live buffer of its length, read by the call (the kernel copies it before it returns).
+    let told = unsafe {
+      (self.api.notify)(
+        self.file_system,
+        round.as_ptr().cast_mut().cast::<c_void>(),
+        round.len(),
+      )
+    };
+    // SAFETY: as above; ends the session the begin opened, whatever the notify answered.
+    let ended = unsafe { (self.api.notify_end)(self.file_system) };
+    match (told, ended) {
+      (0, 0) => Ok(Notified::Taken),
+      (0, status) => Err(WinFspError::Api {
+        call: "FspFileSystemNotifyEnd",
+        status,
+      }),
+      (status, _) => Err(WinFspError::Api {
+        call: "FspFileSystemNotify",
+        status,
+      }),
     }
   }
 }
 
-/// The owner thread: build the volume locally, then serve each job on it until the channel closes (the
-/// handler dropped at unmount).
-fn owner_loop<F>(build: F, jobs: Receiver<Job>)
-where
-  F: FnOnce() -> Result<VolumeHost, WinFspError>,
-{
-  let mut host = match build() {
-    Ok(host) => host,
-    Err(_) => {
-      // The volume could not be built: drain jobs with a failure so no caller hangs.
-      while let Ok(job) = jobs.recv() {
-        let _ = job.reply.send(Reply::Err(crate::status_unsuccessful()));
-      }
+impl Drop for Mounted {
+  fn drop(&mut self) {
+    if self.file_system.is_null() {
+      return;
+    }
+    // SAFETY: `file_system` is live; stop the dispatcher (its threads joined, so no callback runs after), unmount, and
+    // delete it. A dispatcher thread waiting for the shard's reply returns once the channel's receiver is dropped,
+    // which the mount's owner does before it stops the thread.
+    unsafe {
+      (self.api.stop_dispatcher)(self.file_system);
+      (self.api.remove_mount_point)(self.file_system);
+      (self.api.delete)(self.file_system);
+    }
+    // No callback can run now, so reclaim the handler.
+    // SAFETY: the handler was leaked in `new` and the dispatcher is stopped, so this is the sole taker.
+    drop(unsafe { Box::from_raw(self.handler) });
+  }
+}
+
+/// A command to the mount thread.
+enum Command {
+  /// Hand Windows this round of notification records.
+  Notify(Vec<u8>),
+}
+
+/// What the mount thread reports, each followed by a wake of the mount's task.
+pub enum Outcome {
+  /// The mount is up, or why it is not.
+  Mounted(Result<(), WinFspError>),
+  /// A notification round's outcome.
+  Notified(Result<Notified, WinFspError>),
+  /// The file system is unmounted and deleted; the thread is ending.
+  Stopped,
+}
+
+/// The owned thread that holds a WinFsp mount for its whole life (see the module docs): it mounts, hands Windows each
+/// notification round, and unmounts, reporting each outcome to the mount's task and waking it.
+pub struct MountThread {
+  commands: Option<SyncSender<Command>>,
+  outcomes: Receiver<Outcome>,
+  thread: Option<JoinHandle<()>>,
+}
+
+impl MountThread {
+  /// Starts the thread, which mounts the volume at `mount_point` (`S:`) — read-only when `read_only` — with its
+  /// requests sent on `requests` and `wake` woken after each, and reports [`Outcome::Mounted`]. Refused only when no
+  /// thread can start.
+  pub fn start(
+    mount_point: &str,
+    read_only: bool,
+    requests: SyncSender<Request>,
+    wake: Waker,
+  ) -> Result<MountThread, WinFspError> {
+    let (commands, command_rx) = sync_channel::<Command>(COMMAND_BOUND);
+    let (outcome_tx, outcomes) = sync_channel::<Outcome>(OUTCOME_BOUND);
+    let mount_point = mount_point.to_owned();
+    let thread = std::thread::Builder::new()
+      .name("slates-winfsp".to_owned())
+      .spawn(move || {
+        run_mount(
+          &mount_point,
+          read_only,
+          (requests, wake),
+          &command_rx,
+          &outcome_tx,
+        );
+      })
+      .map_err(|_| WinFspError::MountThread)?;
+    Ok(MountThread {
+      commands: Some(commands),
+      outcomes,
+      thread: Some(thread),
+    })
+  }
+
+  /// The next outcome the thread reported, if any; [`Outcome::Stopped`] also when the thread ended without saying so.
+  pub fn outcome(&mut self) -> Option<Outcome> {
+    match self.outcomes.try_recv() {
+      Ok(outcome) => Some(outcome),
+      Err(TryRecvError::Empty) => None,
+      Err(TryRecvError::Disconnected) => Some(Outcome::Stopped),
+    }
+  }
+
+  /// Sends the thread a round of notification records; its [`Outcome::Notified`] follows. Refused when the thread is
+  /// gone or a round is already out (the caller sends one at a time).
+  pub fn notify(&self, round: Vec<u8>) -> Result<(), WinFspError> {
+    let commands = self.commands.as_ref().ok_or(WinFspError::MountThread)?;
+    commands
+      .try_send(Command::Notify(round))
+      .map_err(|_| WinFspError::MountThread)
+  }
+
+  /// Asks the thread to unmount and end: its [`Outcome::Stopped`] follows. The caller has dropped the request channel's
+  /// receiver first, so no dispatcher thread waits on it while the dispatcher stops.
+  pub fn stop(&mut self) {
+    self.commands = None;
+  }
+
+  /// Joins the thread once it has reported [`Outcome::Stopped`] (it has only to return).
+  pub fn join(&mut self) {
+    self.commands = None;
+    if let Some(thread) = self.thread.take() {
+      // A thread of shipped code cannot panic (and a panic aborts the process); nothing is left to report.
+      let _ = thread.join();
+    }
+  }
+}
+
+impl Drop for MountThread {
+  fn drop(&mut self) {
+    self.join();
+  }
+}
+
+/// The mount thread's body: mount, report, serve commands until the owner drops the command channel, unmount, report.
+fn run_mount(
+  mount_point: &str,
+  read_only: bool,
+  (requests, wake): (SyncSender<Request>, Waker),
+  commands: &Receiver<Command>,
+  outcomes: &SyncSender<Outcome>,
+) {
+  let report = |outcome: Outcome| {
+    // The receiver lives in the `MountThread`, which joins this thread before it drops; the bound holds every
+    // outcome the protocol leaves unread at once (`OUTCOME_BOUND`).
+    let _ = outcomes.send(outcome);
+    wake.wake_by_ref();
+  };
+  let mounted = match Mounted::new(mount_point, read_only, requests, wake.clone()) {
+    Ok(mounted) => {
+      report(Outcome::Mounted(Ok(())));
+      mounted
+    }
+    Err(error) => {
+      report(Outcome::Mounted(Err(error)));
+      report(Outcome::Stopped);
       return;
     }
   };
-  while let Ok(job) = jobs.recv() {
-    let reply = serve(&mut host, job.op);
-    let _ = job.reply.send(reply);
+  while let Ok(Command::Notify(round)) = commands.recv() {
+    report(Outcome::Notified(mounted.notify(&round)));
   }
+  drop(mounted);
+  report(Outcome::Stopped);
 }
 
 /// Builds the "allow Everyone" reference security descriptor as self-relative bytes, from [`EVERYONE_SDDL`].
@@ -1271,7 +1466,7 @@ fn everyone_security_descriptor() -> Result<Vec<u8>, WinFspError> {
   }
   // SAFETY: `sd` is a valid self-relative descriptor; copy its bytes out, then free the original.
   let bytes = unsafe {
-    let len = GetSecurityDescriptorLength(sd) as usize;
+    let len = usize::try_from(GetSecurityDescriptorLength(sd)).unwrap_or(0);
     let bytes = std::slice::from_raw_parts(sd.cast::<u8>(), len).to_vec();
     LocalFree(sd.cast());
     bytes
@@ -1291,9 +1486,3 @@ fn write_wide(field: &mut [u16], s: &str) {
     *slot = unit;
   }
 }
-
-// The `Mount` owns the raw file-system and handler pointers exclusively for its lifetime and tears them
-// down on drop; the owner thread's channel endpoints carry the shared state. It is safe to move a
-// `Mount` across threads (the pointers are only used on drop), so it is `Send` — but the raw pointers
-// make it `!Send` by default, and there is no need to share it, so no override is added (R2/D-8: no
-// `unsafe impl Send`). The mount is used from the thread that created it.

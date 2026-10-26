@@ -7,15 +7,17 @@
 //! The shape is adapted from sylk's cgofuse mount (`core/purevfs`): a **pure, injectable capability
 //! detection** (`classify`) so the selection tests on any host with no live mount, a **probe** that
 //! refuses with a message naming what is missing rather than a raw `mount_nfs` failure, and the
-//! **mount/unmount lifecycle** (`establish`, which is not Linux's, and [`unmount`], which is). Where sylk classifies a FUSE backend
+//! **mount/unmount lifecycle** (`establish`, which is not Linux's, and `unmount`, which is; neither is Windows', whose WinFsp drive the daemon mounts and removes itself). Where sylk classifies a FUSE backend
 //! (macFUSE vs FUSE-T), slates classifies its one mechanism — `mount_nfs`, built into macOS and the
 //! BSDs — because its NFS server replaces the FUSE library.
 
+#[cfg(not(windows))]
 use std::process::Command;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 use slates_client::StatusReport;
 
+#[cfg(not(windows))]
 use crate::Failure;
 
 /// Derived: the attribute-cache timeout (`actimeo`, whole seconds — `man mount_nfs`:
@@ -27,7 +29,7 @@ use crate::Failure;
 /// age) is far too stale for an overlay that changes under merges and outside edits. So the mount asks
 /// for the finest nonzero cache the knob expresses, one second — the same freshness/amortization
 /// trade-off sylk documents for its 100 ms FUSE attribute timeout (`core/purevfs`).
-#[cfg(any(not(target_os = "linux"), test))]
+#[cfg(any(all(unix, not(target_os = "linux")), test))]
 const ATTR_CACHE_SECONDS: u32 = 1;
 
 /// The READ and WRITE size the macOS mount asks for (`rsize`/`wsize`; the kernel takes the smaller of this and its own
@@ -51,15 +53,10 @@ const MACOS_TRANSFER_BYTES: u32 = 128 * 1024;
 /// The loopback mount mechanism a host offers (§4.6), the analogue of sylk's FUSE-backend selection.
 /// slates serves its own NFS, so its mechanism is `mount_nfs` — built into macOS and the BSDs, needing
 /// no FUSE library, kernel extension, or Apple entitlement.
-#[cfg(any(not(target_os = "linux"), test))]
+#[cfg(any(all(unix, not(target_os = "linux")), test))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum MountBackend {
   /// The loopback NFS mount, via `mount_nfs`.
-  ///
-  /// Never constructed off Unix — `backend()` there answers `Unsupported`, because a Windows host's mount is
-  /// WinFsp and is reached elsewhere — but kept, because the enum is the vocabulary every platform's callers
-  /// match on, and a variant that exists only where it can occur would make those matches platform-shaped.
-  #[cfg_attr(not(unix), allow(dead_code))]
   NfsLoopback,
   /// No supported loopback mount on this host (`mount_nfs` is not on the `PATH`).
   Unsupported,
@@ -101,16 +98,6 @@ pub(crate) fn backend() -> MountBackend {
   classify(command_on_path)
 }
 
-/// The paired arm for a host that is not Unix at all. These two said `not(macos), not(linux)`, which is true
-/// of Windows as well as of the BSDs they were written for, so Windows took the BSD path and reached
-/// `rustix::fs::access` — a POSIX call it does not have. Nothing caught it because nothing had ever compiled
-/// this crate for Windows (2026-10-20). A Windows host has no `mount_nfs` loopback; its mount is WinFsp,
-/// reached elsewhere, so the loopback backend is `Unsupported` and the caller refuses with that.
-#[cfg(not(unix))]
-pub(crate) fn backend() -> MountBackend {
-  MountBackend::Unsupported
-}
-
 /// The `mount_nfs` arguments to mount the volume named `name`, served on the daemon's loopback `port`,
 /// at `path`, under the mount `capability` (§4.13; AUD-01 — the attachment id and token `attach`
 /// returned, the bearer authority the daemon validates every request's file handle against; a mount
@@ -122,7 +109,7 @@ pub(crate) fn backend() -> MountBackend {
 /// so `port` and `mountport` are the same. The export is
 /// `localhost:/<name>@<attachment_hex>.<token_hex>`, the volume's provisioned name under the synthetic
 /// host root with its capability.
-#[cfg(any(all(not(target_os = "macos"), not(target_os = "linux")), test))]
+#[cfg(any(all(unix, not(target_os = "macos"), not(target_os = "linux")), test))]
 fn mount_args(
   port: u16,
   name: &str,
@@ -159,8 +146,9 @@ pub(crate) fn export_path(name: &str, capability: MountCapability) -> String {
 /// `capability` its attachment returned (`read_only` for a read-only mount), returning the mounted path.
 /// Refuses first (like sylk's `strictExecutionProbe`, naming what is missing) if the host has no loopback
 /// mount mechanism or the daemon is not serving NFS; then a typed failure if `mount_nfs` refuses (a
-/// missing mount point, a busy path).
-#[cfg(not(target_os = "linux"))]
+/// missing mount point, a busy path). A Windows host mounts through WinFsp, which the daemon serves itself
+/// (`slates attach` of the WinFsp form, `crate::verbs`), so this is the Unix hosts' alone.
+#[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) fn establish(
   report: &StatusReport,
   capability: MountCapability,
@@ -266,7 +254,7 @@ fn mount_volume(
 
 /// Mounts the volume with `mount_nfs` (the BSDs other than macOS, where the XDR arguments are not
 /// Apple's).
-#[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "linux")))]
 fn mount_volume(
   port: u16,
   name: &str,
@@ -289,7 +277,9 @@ fn mount_volume(
 }
 
 /// Unmounts the loopback bridge at `path` with `umount`, the lifecycle counterpart of `establish`
-/// (sylk's cgofuse `Close`). No privilege: a user unmounts a mount they made.
+/// (sylk's cgofuse `Close`). No privilege: a user unmounts a mount they made. A WinFsp drive is the daemon's own and
+/// is unmounted by detaching it (`crate::verbs`), so this is the Unix hosts' alone.
+#[cfg(not(windows))]
 pub(crate) fn unmount(path: &str) -> Result<(), Failure> {
   let status = Command::new(UNMOUNT_PROGRAM)
     .args(UNMOUNT_ARGS)
@@ -314,10 +304,10 @@ const UNMOUNT_PROGRAM: &str = "fusermount3";
 #[cfg(target_os = "linux")]
 const UNMOUNT_ARGS: &[&str] = &["-u"];
 /// Format: see the Linux form.
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 const UNMOUNT_PROGRAM: &str = "umount";
 /// Format: see the Linux form.
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 const UNMOUNT_ARGS: &[&str] = &[];
 
 #[cfg(test)]

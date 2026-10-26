@@ -1622,11 +1622,10 @@ const LEASE_TAKE_UNANSWERED: &str = "landing.lease_take_unanswered";
 const LEASE_UNRELEASED: &str = "landing.lease_unreleased";
 
 /// The placeholder a deferred landing's verb returns. It is never delivered: the verb deferred its reply, and
-/// `run_recorded` answers nothing for it.
-#[cfg(unix)]
+/// `run_recorded` answers nothing for it. A deferred attach's verb returns it too (the FUSE and WinFsp mounts).
 pub(crate) fn deferred_reply() -> ReplyBody {
   ReplyBody::Landed {
-    outcome: LandingOutcome {
+    outcome: slates_ipc::protocol::LandingOutcome {
       landing: 0,
       state: String::new(),
       written: 0,
@@ -1635,7 +1634,7 @@ pub(crate) fn deferred_reply() -> ReplyBody {
       failed: 0,
       bytes_written: 0,
       held: 0,
-      durability: LandingDurability {
+      durability: slates_ipc::protocol::LandingDurability {
         data_synced: false,
         dirs_synced: false,
         media: false,
