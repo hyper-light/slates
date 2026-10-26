@@ -2167,7 +2167,7 @@ pub mod platform {
   /// cannot tell that. On Windows it lives while any process maps the section, and every connected client's doorbell
   /// maps it, so a dead owner's object outlives it in its clients; there the token is a named Event opened by no one
   /// else. On macOS the object's name lives until it is unlinked, and an owner used to unlink whatever object held
-  /// it, a live owner's too; there the token is a Mach bootstrap name (A-178, [`crate::owner_name`]).
+  /// it, a live owner's too; there the token is a Mach bootstrap name (A-178, `crates/ipc/src/owner_name.rs`).
   pub(super) struct Owner {
     #[cfg(windows)]
     _token: crate::wake::Event,
