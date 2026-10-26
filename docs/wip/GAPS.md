@@ -11582,6 +11582,14 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       keeps its pages after another path's change, because WinFsp's notification purges with `CcPurgeCacheSection`,
       which "will not purge mapped files" (research f8, f9, f10). CI's Windows runner, run 40252840969: the view held its first
       byte for 10 s while a cached read through a handle, on a file nobody mapped, followed in 20.7 ms;
+    - Windows process-isolated containers by the mount route, measured (G-mount step 4, 2026-10-26): on CI's Windows
+      runner (Windows Server 2025, Docker 29.7.2, `nanoserver:ltsc2025`), run 40257213499, Docker's engine refused to
+      bind a folder of the WinFsp drive, `invalid mount config for type "bind": bind source path does not exist:
+      E:\share` (exit 125), while an NTFS folder bound into the same kind of container listed whole. The engine is a
+      service in a logon session of its own, and each logon session has its own drive letters (Microsoft Learn,
+      "Services and Redirected Drives"); a drive every session sees needs the file system run as LocalSystem, which
+      slates' daemon never is (R10); and past that, the bind filter refuses a custom file system's volume
+      (microsoft/Windows-Containers#335, closed by design);
     - QEMU and Kata on it: upstream vhost-user-fs has no window property;
     - Cloud Hypervisor: "it is not available";
     - crosvm on arm64: DAX is x86_64-only;
@@ -11593,8 +11601,6 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       **Corrected 2026-10-25:** this entry and the matrix
       had counted the A-135 direct map on Linux as proven while every run read by copy (its test reported the path
       and did not assert it); A-171 has proven it since, asserting the zero-copy path;
-    - the mount route's maps in Windows containers (G-mount step 4; macOS's read-only maps and Linux containers proven
-      2026-10-25, KIND pods 2026-10-26, Windows' ruled out above);
     - Shards' own window over the macOS mount;
     - Shards on Linux KVM and on Windows;
     - the direct map inside a Linux container;

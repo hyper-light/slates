@@ -307,7 +307,7 @@ box shared with two other builds — timings are not benchmarks)
    | Linux arm64 | owed: G-arm64-host | owed: G-arm64-host |
    | macOS arm64 (Docker Desktop) | impossible (unconfirmed): VirtioFS on the Virtualization framework documents no window | impossible: the container runs in a VM, not on the daemon's kernel |
    | Windows (Docker Desktop on WSL2) | impossible (unconfirmed): 9P | impossible: the container runs in a VM |
-   | Windows process-isolated containers | owed: G-mount (a WinFsp mount bound in) | owed: G-direct (handle duplication) |
+   | Windows process-isolated containers | impossible (G-mount step 4, 2026-10-26): Docker's engine refuses to bind a folder of the WinFsp drive into a process-isolated container — CI's Windows runner (Windows Server 2025, Docker 29.7.2, `nanoserver:ltsc2025`), run 40257213499: `invalid mount config for type "bind": bind source path does not exist: E:\share`, exit 125, while an NTFS folder bound into the same kind of container listed whole. The engine is a service in a logon session of its own, and "each logon session receives its own set of drive letters" (Microsoft Learn, "Services and Redirected Drives"), so it never sees the drive an unprivileged mount defines; a drive every session sees needs the file system run as LocalSystem, which slates' daemon never is (R10). Past that, Microsoft's container team says the bind filter refuses a custom file system's volume ("Do not attach the filter to the volume at this time", microsoft/Windows-Containers#335, closed by design). `crates/cli/tests/winfsp.rs` `a_winfsp_folder_bound_into_a_process_isolated_container` asserts the refusal and prints Windows' answer | owed: G-direct (handle duplication) |
 
    *Kubernetes.*
 

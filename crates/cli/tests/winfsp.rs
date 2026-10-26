@@ -656,10 +656,13 @@ fn run_bound(image: &str, source: &str, command: &str) -> (i32, String, String) 
 }
 
 /// What Windows answers when a process-isolated container binds a folder of the WinFsp mount, as the DAX matrix's
-/// Windows process-isolated container mount-route cell records it (`docs/wip/virtiofs.md` §8): refused. Microsoft's
-/// container team says the container bind filter cannot attach to a custom file system's volume ("Do not attach the
-/// filter to the volume at this time", microsoft/Windows-Containers#335, closed by design). G-mount step 4 decides it by
-/// this test's run on CI's Windows runner.
+/// Windows process-isolated container mount-route cell records it (`docs/wip/virtiofs.md` §8): refused. Decided by CI's
+/// Windows runner, run 40257213499 (Windows Server 2025, Docker 29.7.2, `nanoserver:ltsc2025`, 2026-10-26): Docker's
+/// engine answered "invalid mount config for type \"bind\": bind source path does not exist: E:\\share". The engine is a
+/// service in a logon session of its own, and each logon session has its own drive letters (Microsoft Learn, "Services
+/// and Redirected Drives"), so it never sees the drive an unprivileged mount defines. Past that, Microsoft's container
+/// team says the bind filter cannot attach to a custom file system's volume ("Do not attach the filter to the volume
+/// at this time", microsoft/Windows-Containers#335, closed by design).
 const CONTAINER_BIND_REFUSED: bool = true;
 
 /// §4.6 "Windows", the DAX matrix's Windows process-isolated container cell, G-mount step 4. Do: pull the Nano Server
@@ -692,11 +695,11 @@ fn a_winfsp_folder_bound_into_a_process_isolated_container() {
     "the control: a process-isolated container lists an NTFS folder bound into it (exit {code}): {listed} {err}"
   );
 
-  let instance = instance("wfcontainer");
+  let instance = instance("container");
   let _anchor = start_anchor(&instance);
   let (code, out, err) = run(
     &instance,
-    &["volume", "create", "wfcontainer", "--bounded", "64MiB"],
+    &["volume", "create", "container", "--bounded", "64MiB"],
   );
   assert_eq!(code, 0, "{err}");
   let hex = value_of(&out, "id");

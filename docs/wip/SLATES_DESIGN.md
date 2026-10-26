@@ -3035,7 +3035,11 @@ same-namespace host process is the first delivered case.
 > (each environment on each platform, by the mount route and the socket route) are proven, owed or ruled out by the
 > platform, is the matrix in `docs/wip/virtiofs.md` §8.
 > - **Ruled out by a run:** a host process's mapped view through the Windows WinFsp mount (G-mount step 2, A-177, CI's
->   Windows runner: WinFsp's purge refuses a mapped file, so the view keeps its pages).
+>   Windows runner: WinFsp's purge refuses a mapped file, so the view keeps its pages); and a process-isolated Windows
+>   container binding a folder of the WinFsp drive (G-mount step 4, 2026-10-26, CI's Windows runner, run 40257213499:
+>   Docker's engine, a service in a logon session of its own, does not see the drive an unprivileged mount defines,
+>   "bind source path does not exist", while an NTFS folder bound into the same kind of container listed whole; past
+>   that, the bind filter refuses a custom file system's volume, microsoft/Windows-Containers#335).
 > - **Proven:** a host process's shared map through the Linux FUSE mount; a host process's read-only map through the
 >   macOS NFS mount, following another path's changes after a `stat` (G-mount step 1, 2026-10-25, red-checked with the
 >   server's file times frozen); a program in a Linux container mapping a file through the host's FUSE mount bound in
