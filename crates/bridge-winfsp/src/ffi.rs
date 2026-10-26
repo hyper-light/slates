@@ -77,6 +77,10 @@ pub(crate) const VOLUME_FLAG_READ_ONLY_VOLUME: u32 = 1 << 9;
 /// Format: `FlushAndPurgeOnCleanup` — bit 14: at a file's last handle's cleanup the kernel writes its cached pages back
 /// and then purges them, before it posts the `Cleanup` request (`src/sys/cleanup.c`, `FspFileNodeCleanupFlush`).
 pub(crate) const VOLUME_FLAG_FLUSH_AND_PURGE_ON_CLEANUP: u32 = 1 << 14;
+/// Format: `UmFileContextIsUserContext2` — bit 16: a callback's `FileContext` is the one its own open returned (the
+/// kernel's per-handle `UserContext2`), not the file node's `UserContext`, which every open of the file shares
+/// (`src/dll/fsop.c`, `ValOfFileContext`).
+pub(crate) const VOLUME_FLAG_FILE_CONTEXT_PER_OPEN: u32 = 1 << 16;
 
 /// `FSP_FSCTL_VOLUME_INFO` (88 bytes) — free/total size and the volume label.
 #[repr(C)]

@@ -171,6 +171,9 @@ enum Op {
     offset: u64,
     data: Vec<u8>,
     append: bool,
+    /// A paging write the cache manager makes (`ConstrainedIo`): it may not change the file's size, so it is clipped to
+    /// the size the file has, as WinFsp's `memfs` clips it.
+    constrained: bool,
   },
   Info {
     object: ObjectId,
@@ -403,13 +406,23 @@ fn run(bridge: &mut dyn Bridge, cx: &OpContext, op: Op) -> Result<Reply, VfsErro
       offset,
       data,
       append,
+      constrained,
     } => {
-      let at = if append {
-        bridge.getattr(object, cx)?.size
+      let size = bridge.getattr(object, cx)?.size;
+      let at = if append && !constrained { size } else { offset };
+      // A paging write covers whole pages, past the file's end; only the bytes within its size are the file's. Before
+      // this, a 62-byte file written by PowerShell grew to its 4096-byte page, the rest zeros (CI run 40251802164).
+      let within = if constrained {
+        usize::try_from(size.saturating_sub(at)).unwrap_or(usize::MAX)
       } else {
-        offset
+        data.len()
       };
-      let written = bridge.write(object, cx, at, &data)?;
+      let bytes = data.get(..within.min(data.len())).unwrap_or_default();
+      let written = if bytes.is_empty() {
+        0
+      } else {
+        bridge.write(object, cx, at, bytes)?
+      };
       let attr = bridge.getattr(object, cx)?;
       Reply::Wrote {
         written,
@@ -877,7 +890,7 @@ extern "C" fn write(
   offset: u64,
   length: u32,
   write_to_end: Boolean,
-  _constrained: Boolean,
+  constrained: Boolean,
   p_bytes: *mut u32,
   p_info: *mut FileInfo,
 ) -> Ntstatus {
@@ -895,6 +908,7 @@ extern "C" fn write(
     offset,
     data,
     append: write_to_end != 0,
+    constrained: constrained != 0,
   }) {
     Reply::Wrote { written, info } => {
       // SAFETY: `p_bytes` writable; `p_info` handled by put_info.
@@ -1211,7 +1225,12 @@ impl Mounted {
       | ffi::VOLUME_FLAG_CASE_PRESERVED_NAMES
       | ffi::VOLUME_FLAG_UNICODE_ON_DISK
       | ffi::VOLUME_FLAG_PERSISTENT_ACLS
-      | ffi::VOLUME_FLAG_FLUSH_AND_PURGE_ON_CLEANUP;
+      | ffi::VOLUME_FLAG_FLUSH_AND_PURGE_ON_CLEANUP
+      // Each open's `FileContext` is its own `OpenFile`, reclaimed by its own `Close`. Without this the callbacks are
+      // handed the file node's context, the first open's, for every open of the file, and each `Close` reclaimed that
+      // one box again: a second open of a file freed the first's twice (a request log on CI's runner showed a release
+      // of inode 4096 read from the freed box, run 40251802164).
+      | ffi::VOLUME_FLAG_FILE_CONTEXT_PER_OPEN;
     if read_only {
       params.flags |= ffi::VOLUME_FLAG_READ_ONLY_VOLUME;
     }
