@@ -42,6 +42,12 @@ pub mod error;
 pub mod exit_watch;
 #[cfg(windows)]
 pub mod handle_route;
+/// The owner's token on macOS (A-176, A-178): a Mach bootstrap name that ends with its holder, so one live process
+/// owns an instance's rendezvous, as Windows's named Event token and Linux's abstract address make it there. A
+/// registration made once per owner's life; no message crosses it, so D-10's refusal of Mach messages as the request
+/// transport does not reach it.
+#[cfg(target_os = "macos")]
+mod owner_name;
 pub mod park;
 pub mod protocol;
 pub mod region;

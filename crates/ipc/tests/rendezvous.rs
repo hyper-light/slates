@@ -564,11 +564,9 @@ fn a_fresh_rendezvous_opens_while_a_client_of_a_dead_daemon_lives() {
 
 /// A-176: do open an instance's rendezvous with no anchor and keep it, then try a second owner of it, as a second
 /// daemon run alone or an anchor would; drop the first and hold it as an anchor, then try again. Expect: every second
-/// owner refused while the first lives (Windows: the owner's token, `InstanceHeld`; Linux: the abstract address in
-/// use), and the rendezvous free again once its owner is gone, so two owners never share one bootstrap object. macOS
-/// takes the name over even from a live owner, since an owner unlinks the name it finds (GAPS, A-176), so the test is
-/// Linux's and Windows'.
-#[cfg(not(target_os = "macos"))]
+/// owner refused while the first lives (Windows and macOS: the owner's token, `InstanceHeld`; Linux: the abstract
+/// address in use), and the rendezvous free again once its owner is gone, so two owners never share one bootstrap
+/// object.
 #[test]
 fn a_second_owner_of_a_live_instances_rendezvous_is_refused() {
   let instance = format!("test-owner-{}", std::process::id());
@@ -595,8 +593,9 @@ fn a_second_owner_of_a_live_instances_rendezvous_is_refused() {
   drop(held);
 }
 
-/// Asserts `outcome` is the refusal of a second owner of a live instance's rendezvous: the owner's token (Windows).
-#[cfg(windows)]
+/// Asserts `outcome` is the refusal of a second owner of a live instance's rendezvous: the owner's token (Windows,
+/// macOS).
+#[cfg(any(windows, target_os = "macos"))]
 fn assert_held(outcome: Result<(), IpcError>, who: &str) {
   assert!(
     matches!(outcome, Err(IpcError::InstanceHeld { .. })),
@@ -611,4 +610,67 @@ fn assert_held(outcome: Result<(), IpcError>, who: &str) {
     matches!(outcome, Err(IpcError::OsRefused { call: "bind", .. })),
     "{who} is refused while the instance's owner lives: {outcome:?}"
   );
+}
+
+/// Format: the environment variable naming the instance a re-invoked child tries to own, as a daemon run alone and as
+/// an anchor would.
+const CHILD_OWNER_ROLE: &str = "SLATES_RENDEZVOUS_SECOND_OWNER_CHILD";
+/// Format: the environment variable saying what that child must find: `held` (a live owner refuses it) or `owned`.
+const CHILD_OWNER_EXPECT: &str = "SLATES_RENDEZVOUS_SECOND_OWNER_EXPECT";
+
+/// A-176, A-178: the refusal across processes, where a second owner really runs, and where macOS's bootstrap server
+/// answers a second registrant otherwise than a second registration of one process (1100 against 1101). Do: own an
+/// instance's rendezvous here as a daemon run alone; from a second process try to own it as a daemon run alone and as
+/// an anchor; drop this owner and let a third process try. Expect: the second refused both ways while this owner
+/// lives, and the third owning it both ways once it is gone.
+#[test]
+fn a_second_process_is_refused_a_live_instances_rendezvous() {
+  let instance = format!("test-owner-process-{}", std::process::id());
+  let first = Listener::open(&instance, None).unwrap();
+  second_owner(&instance, "held");
+  drop(first);
+  second_owner(&instance, "owned");
+}
+
+/// Runs this binary as the child that tries to own `instance`, which must find it `expect`.
+fn second_owner(instance: &str, expect: &str) {
+  let output = Command::new(std::env::current_exe().unwrap())
+    .args(["--exact", "rendezvous_second_owner_child", "--nocapture"])
+    .env(CHILD_OWNER_ROLE, instance)
+    .env(CHILD_OWNER_EXPECT, expect)
+    .output()
+    .unwrap();
+  assert!(
+    output.status.success(),
+    "a second process expecting the rendezvous {expect}: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+}
+
+/// The child: tries to own the instance in the environment as a daemon run alone and then as an anchor, each let go at
+/// once, and exits 0 only when both found what the environment says (`held`: each refused as a live owner's; `owned`:
+/// each owned it). Passes trivially when not the child.
+#[test]
+fn rendezvous_second_owner_child() {
+  let (Ok(instance), Ok(expect)) = (
+    std::env::var(CHILD_OWNER_ROLE),
+    std::env::var(CHILD_OWNER_EXPECT),
+  ) else {
+    return;
+  };
+  let alone = Listener::open(&instance, None).map(|_| ());
+  let anchor = HeldRendezvous::hold(&instance).map(|_| ());
+  if expect == "held" {
+    assert_held(alone, "a second process run alone");
+    assert_held(
+      anchor,
+      "a second process holding the rendezvous as an anchor",
+    );
+  } else {
+    assert!(
+      alone.is_ok() && anchor.is_ok(),
+      "the rendezvous is free once its owner is gone: alone {alone:?}, anchor {anchor:?}"
+    );
+  }
+  std::process::exit(0);
 }

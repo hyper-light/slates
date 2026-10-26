@@ -288,7 +288,13 @@ slates-vfs = 0
 slates-land = 4
 slates-anchor = 6
 slates-db = 0
-slates-ipc = 70
+slates-ipc = 79
+# 2026-10-26 (+9, §4.7 A-178, the macOS owner's token, `owner_name.rs` compiled only for macOS): the bootstrap and
+#   Mach port calls libSystem has without a safe wrapper (`<servers/bootstrap.h>`, `<mach/mach_port.h>`). Their
+#   declarations (1); the process's own bootstrap port read (1) and each step up the chain (`bootstrap_parent`, 1);
+#   the registration (`bootstrap_register`, 1) and the look-up that tells a holder from another refusal (1); the
+#   token's receive right allocated (1) and its send right made (1); both given back at the token's drop or a failed
+#   claim (1); and a send right the walk or the look-up was given, given back (1).
 # 2026-10-25 (+21, §4.6 A-175, the Windows handle route, `handle_route.rs` compiled only for Windows): Win32 has no safe
 #   wrapper for any of it. The hand-off: the client's process opened and owned (`OpenProcess`, `from_raw_handle`, 2),
 #   the read-only handle duplicated into it (1), and a handed handle closed there (`DUPLICATE_CLOSE_SOURCE`, 1); the

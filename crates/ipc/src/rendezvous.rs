@@ -2162,20 +2162,38 @@ pub mod platform {
   }
 
   /// What makes a process the owner of an instance's bootstrap object (A-176): the anchor that holds it, or a daemon
-  /// run alone that made its own. On Windows a named Event created only if no live process holds one by that name,
-  /// kept for the owner's life and opened by no one else, so its name lives exactly as long as the owner. The
-  /// section's own name cannot tell that: it lives while any process maps it, and every connected client's doorbell
-  /// maps it, so a dead owner's object outlives it in its clients. macOS needs no token: an owner unlinks a dead one's
-  /// name and makes its own object.
+  /// run alone that made its own. A token held for the owner's life, made only if no live process holds one by its
+  /// name, and gone with its holder, so the name lives exactly as long as the owner. The bootstrap object's own name
+  /// cannot tell that. On Windows it lives while any process maps the section, and every connected client's doorbell
+  /// maps it, so a dead owner's object outlives it in its clients; there the token is a named Event opened by no one
+  /// else. On macOS the object's name lives until it is unlinked, and an owner used to unlink whatever object held
+  /// it, a live owner's too; there the token is a Mach bootstrap name (A-178, [`crate::owner_name`]).
   pub(super) struct Owner {
     #[cfg(windows)]
     _token: crate::wake::Event,
+    #[cfg(target_os = "macos")]
+    _token: crate::owner_name::OwnerName,
   }
 
   /// The name of the owner's token (Windows), beside the bootstrap object's.
   #[cfg(windows)]
   fn owner_token_name(instance: &str) -> String {
     format!("{}-owner", rendezvous_name(instance))
+  }
+
+  /// The name of the owner's token (macOS): the user's id and a key of the bootstrap object's name, so two users'
+  /// instances never meet and the name stays within a bootstrap name's bytes however long the instance's name is.
+  #[cfg(target_os = "macos")]
+  fn owner_token_name(instance: &str) -> String {
+    let digest = blake3::hash(rendezvous_name(instance).as_bytes());
+    let key = digest
+      .as_bytes()
+      .first_chunk::<{ size_of::<u64>() }>()
+      .map_or(0, |first| u64::from_le_bytes(*first));
+    format!(
+      "com.slates.owner.{}.{key:016x}",
+      rustix::process::getuid().as_raw()
+    )
   }
 
   /// Takes ownership of `instance`'s rendezvous, refused while a live process holds it: a daemon of the instance, or
@@ -2190,10 +2208,15 @@ pub mod platform {
     Ok(Owner { _token: token })
   }
 
-  /// The paired arm: macOS's owner needs no token.
-  #[cfg(not(windows))]
-  fn take_ownership(_instance: &str) -> Result<Owner, IpcError> {
-    Ok(Owner {})
+  /// The paired arm (macOS): the owner's bootstrap name, refused while a live process holds it.
+  #[cfg(target_os = "macos")]
+  fn take_ownership(instance: &str) -> Result<Owner, IpcError> {
+    let token = crate::owner_name::claim(&owner_token_name(instance))?.ok_or_else(|| {
+      IpcError::InstanceHeld {
+        instance: instance.to_owned(),
+      }
+    })?;
+    Ok(Owner { _token: token })
   }
 
   /// A fresh bootstrap object for `instance`, owned by this process: the header's magic and slot count, every slot
@@ -2204,7 +2227,8 @@ pub mod platform {
     Ok((owned_object(instance)?, owner))
   }
 
-  /// macOS: the object made new; `SharedObject::create` unlinks a dead owner's name first.
+  /// macOS: the object made new. `SharedObject::create` unlinks the name first, and the object it unlinks is a dead
+  /// owner's: this process holds the owner's token, so no live owner holds the object.
   #[cfg(not(windows))]
   fn owned_object(instance: &str) -> Result<SharedObject, IpcError> {
     initialized(SharedObject::create(

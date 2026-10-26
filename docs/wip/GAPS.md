@@ -11319,30 +11319,31 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       start on Windows beside a client of its dead owner
       (`docs/bugs/2026-10-25-a-windows-instance-could-not-start-beside-a-dead-ones-client.md`). On jupiter the client
       binary now passes whole, one test at a time, 20 of 20, and CI's two x86_64 Windows lanes run it so;
-    - macOS takes a live owner's rendezvous over (found 2026-10-25, A-176's sweep; pre-existing): an owner unlinks the
-      bootstrap object's name it finds (`shared.rs`, `create_object`), so a second daemon of a live instance, run alone,
-      or a second anchor, makes its own object; new clients reach the second, the first keeps the clients it has, and
-      the two run side by side with separate state. Linux refuses the second at the abstract address, and Windows at the
-      owner's token (`a_second_owner_of_a_live_instances_rendezvous_is_refused`, which leaves macOS out). Owed: a test
-      of whether any live owner holds the name before the unlink, with no disk and no race between two starting owners
-      (POSIX semaphores and shared objects outlive their creator; the socket route's own liveness question, A-161's
-      `InUse`, is one candidate, though it decides by a socket file, which is authorized for the DAX route alone).
-      Measured 2026-10-26 on this Mac (macOS 26, unprivileged, an Aqua session): a lock on the shared object itself is
-      not available (`flock` on a POSIX shared-memory descriptor answers `ENOTSUP`, `fcntl` record locks `EBADF`). A
-      Mach bootstrap name is: `bootstrap_register` from one process succeeded, a second process's registration of the
-      same name was refused (1100) while `bootstrap_look_up` found the first, and once the first process died the name
-      was gone (1102, unknown service) and a new registration succeeded. That is the Windows token's rule (the first
-      registrant wins, the kernel releases it on death, nothing on disk), at the cost of FFI unsafe in `slates-ipc`
-      and a deprecated call. A name registered in one login session's namespace (gui/501) may be unseen from a sibling
-      session of the same user (an ssh login under user/501), while the shared objects' names are seen from all of
-      them, so a session's token would leave two owners possible across sessions. The parent namespace answers that
-      here: `bootstrap_parent` succeeded unprivileged (port 7171 above this session's 2059), a name registered there was
-      refused to a second process both there and in its own session's namespace (1100), was found from both (0), and
-      was gone from both once its registrant died (1102). Not yet measured: that an ssh session's parent is the same
-      namespace, and which parent a process launchd starts as a job (CI's runner, an agent) is given. The machine-wide
-      alternative, a SysV semaphore held with `SEM_UNDO` (the kernel undoes it at death), fits the limits here
-      (`kern.sysv.semmni` 87,381, `semume` 10 per process) but names a set by a 32-bit key that other software also
-      draws from (5 sets under this user already), and a crash leaves its instance's set behind;
+    - **fixed 2026-10-26 (A-178): macOS took a live owner's rendezvous over** (found 2026-10-25, A-176's sweep;
+      pre-existing). An owner unlinked the bootstrap object's name it found, so a second daemon of a live instance, run
+      alone, or a second anchor, made its own object; new clients reached the second, the first kept the clients it had,
+      and the two ran side by side with separate state. Now an owner first claims a token, a Mach bootstrap name at the
+      top of its bootstrap chain (`crates/ipc/src/owner_name.rs`), and a second live owner is refused `InstanceHeld`, as
+      on Windows. Why that token, measured 2026-10-26 on this Mac (macOS 26, unprivileged, an Aqua session):
+      - no lock can be taken on the shared object itself (`flock` on a POSIX shared-memory descriptor answers
+        `ENOTSUP`, `fcntl` record locks `EBADF`), and the socket route's `InUse` decides by a socket file, which is
+        authorized for the DAX route alone;
+      - a bootstrap name is the first registrant's and is free when its holder's port dies: a second process refused
+        (1100), a second registration of the same process refused (1101), 200 of 200 re-registrations accepted at once
+        after a holder dropped its right (worst 0.105 ms), 20 of 20 after a holder killed with `SIGKILL` was reaped;
+      - at the top of the chain (a namespace that is its own parent) one name serves every session of the user: from
+        this GUI session the chain was three deep and every level accepted a registration, and a name registered in the
+        parent was refused to a second process both there and in its own namespace;
+      - the machine-wide alternative, a SysV semaphore held with `SEM_UNDO`, fits the limits here (`kern.sysv.semmni`
+        87,381, `semume` 10 per process) but names a set by a 32-bit key other software draws from (5 sets under this
+        user already), and a crash leaves its instance's set behind.
+      Proven: `a_second_owner_of_a_live_instances_rendezvous_is_refused` now runs on macOS, and
+      `a_second_process_is_refused_a_live_instances_rendezvous` (new) checks the refusal across processes on every
+      platform; the rendezvous suite 14 of 14 on this Mac and fedora, `slates-ipc` linted on all three. Red-checked on
+      this Mac with a token that never meets a holder: both fail. Bug record:
+      `docs/bugs/2026-10-26-a-second-owner-took-a-live-macos-instances-rendezvous-over.md`. Owed: the token's reach
+      measured beyond one GUI session, an ssh login's parent namespace and a launchd job's (CI's macOS runner runs
+      both tests);
     - on every platform, a client's direct map outlives its daemon: after a `kill -9` and restart the map keeps the file
       as it was when the daemon died and follows it no more, with no signal to the client (its object lives on in the
       client's process). A replayed map reply now fails rather than adopting such a copy (A-175's record rule; Linux's
