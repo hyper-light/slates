@@ -1108,6 +1108,27 @@ failed the test 3 of 3 on Linux and 5 of 5 on macOS with the same reading. The d
 phases (4) and (1), with no CPU and no hold dumped. Neither instrument failed in 6 interleaved runs each at load 11–47.
 The cause is not established.
 
+**Reopened 2026-10-25, closed 2026-10-26: late was charged as held, against another wait's delay**
+(`docs/bugs/2026-10-26-the-async-sdk-tests-noise-was-another-waits-timer-delay.md`).
+- **CI.** The macOS SDK job failed its first attempt on runs 40227172048 and 40239373189: the loop 0.268 s and 0.286 s
+  late against noise of 0.134 s and 0.150 s, with 0.002 s and 0.005 s of CPU. In the second, the sibling ran 0.128 s
+  into the hold and found the loop in its own idle wait, `kqueue.control`. Both passed on rerun; 2 of the last 40 runs.
+- **The cause, measured.** On macOS the kernel delays timed waits by primitive and policy. From a process launchd
+  started (this Mac, 2026-10-26), a 10 ms `nanosleep`, `select` or `time.sleep` came back 76 ms late at the median, a
+  10 ms kevent timeout 1.2 ms. The noise sampler and the sibling slept through `time.sleep` while the loop waits
+  through kevent, so the bound added one primitive's delay to another's tail. On this Mac the old test read noise of
+  0.080–0.087 s on every run while the loop's worst was 0.005–0.008 s. The sibling also woke every 86 ms instead of
+  every 10, and its "held" figure was the growth of a running maximum.
+- **The fix.** The control is an event loop like the Ticker's, in its own process; the sibling waits through the
+  selector; and a tick is charged only from the last moment the sibling saw the loop idle in its selector, when it saw
+  it there, the sibling was itself on time and the process burned under a period of CPU. Otherwise the tick is charged
+  whole. Every run prints its figures and its process's own wait delays.
+- **Verified.** An injected late wake of the idle loop (0.3 s) fails the old test and passes the new one with the tick
+  uncharged. Four injected holds fail the new one, charged 0.293–0.503 s: a GIL-releasing sleep on the loop, a busy
+  GIL hold, and a GIL-holding native call on the loop and on another thread. 26 of 26 green runs on macOS, including
+  under `taskpolicy -b`; the rule alone also on fedora (epoll).
+- **The open observation above** fits the same cause (an idle loop woken late, no CPU, nothing named), unproven.
+
 ### 8a-sdk-stamp. A client that reconnects during a restart may judge the new daemon gone (macOS, Windows; 2026-10-22, closed 2026-10-22 by A-143)
 
 **Seen once.** macOS, 2026-10-22, load 14.5 from other sessions, while verifying §8a-sdk-loop's fix. Phase (2) of the
@@ -11318,20 +11339,28 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       (this Mac); and a read is exact if the question follows the load, since no newer write is accepted until a new
       daemon has started.
 
-- **The Python async SDK's loop-hold test fails now and then on CI's macOS runner (open, found 2026-10-25).** In
-  `crates/sdk-python/tests/test_sdk_async.py` (`test_every_async_call_ends_across_restart_silence_cancellation_and_death`),
-  the macOS SDK packaging job failed twice in the seven runs after 21 straight passes:
-  - run 40227172048 (60ce0142, attempt 1): worst lateness 0.268 s in phase (2), a live daemon stopped by a signal,
-    against a bound of 0.234 s (0.1 s plus the runner's measured scheduling noise, 0.134 s); the process burned
-    0.002 s of CPU across the gap, and the test's own plain Python thread was held 0.079 s of it;
-  - run 40239373189 (becf5936): 0.286 s in phase (1), an overflow and then a restart under the outstanding calls,
-    against 0.250 s (noise 0.150 s); 0.005 s of CPU, the plain thread held 0.034 s.
-  Both passed on rerun. The second failure named the hold's frame: the event loop's own idle wait,
-  `selectors.KqueueSelector.select` in `kqueue.control(None, max_ev, timeout)`. So the loop was asleep in its
-  selector with a timeout due and woke late, with no SDK call on its stack. Leading suspect, unmeasured: macOS timer
-  coalescing for a process the runner schedules at low quality of service, which defers a sleeping thread's timer
-  past a busy runner's measured noise. Next: read the runner process's QoS and the selector's timeout against its
-  wake on a loaded Mac, before any change to the bound;
+- **The Python async SDK's loop-hold test failed now and then on CI's macOS runner (found 2026-10-25, fixed
+  2026-10-26).** Runs 40227172048 and 40239373189: the event loop, idle in its own selector, woken about 0.28 s late,
+  judged against a noise figure that measured another primitive's timer delay. The cause, the measurements and the
+  fix are in §8a-sdk-loop's last paragraph and
+  `docs/bugs/2026-10-26-the-async-sdk-tests-noise-was-another-waits-timer-delay.md`. Still to read: the runner's own
+  wait delays, which the fixed test prints on every run (`this process's 10 ms waits came back late by …`).
+- **On macOS, shipped code's std timed waits run up to eight times longer than asked under a launchd job's timer
+  policy (open, measured 2026-10-26).** From a process launchd started (this Mac, load 19 to 41), Rust's
+  `thread::park_timeout` came back late by 6.0 ms at 1 ms asked, 76 ms at 10 ms, 148 ms at 100 ms and 148 ms at 1 s
+  (medians; `thread::sleep` and `Condvar::wait_timeout` alike at 10 ms), while a kevent timeout came back within 0.25
+  to 2.01 ms at every interval. A daemon run as a launchd agent, CI's macOS runner and kiln's agents all start that
+  way. The runtime's own timers wait through kevent and are not affected. The std waits in shipped code are:
+  - the client's reconnect and transient-refusal backoff (`crates/client/src/client.rs`, `park_timeout`). Each pause
+    may run eight times its derived length, so a reconnect notices a restarted daemon later;
+  - the anchor's supervision pauses (`crates/cli/src/anchor.rs`) and the daemon's heartbeat park
+    (`crates/server/src/daemon.rs`);
+  - `recv_timeout` in `crates/rt/src/task.rs`, `crates/rt/src/registry.rs` and `crates/server/src/observe.rs`.
+  Not yet measured: what it costs end to end, such as a restart's time to the first answered call with and without
+  the policy. A candidate symptom: locally, with the test's slowdown factor at 1, phase (1) of the async SDK test came
+  back `Stalled { after_ns: 1000000000 }` in 2 of 10 runs of the old test file and in none of 10 of the new one, too
+  few to show a difference. Next: measure a restart's phases under the policy, then decide per site between a kevent
+  timed wait and a documented tolerance.
 - **A DAX copy slice past the bridge's 256 KiB read cap dropped a guest's stores (A-163, fixed 2026-10-25).** CI's
   ubuntu lane on `d71ce235` (run 40211222944) failed two Shards tests: a store through a guest's DAX map past the first
   256 KiB of a copy slice never reached the volume at `FSYNC`, which answered 0. Root cause, reproduced on fedora by

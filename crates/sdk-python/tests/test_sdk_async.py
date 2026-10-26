@@ -10,6 +10,7 @@ Run: `maturin develop && SLATES_DAEMON=target/debug/slates python3 -m unittest d
 
 import asyncio
 import os
+import selectors
 import signal
 import subprocess
 import sys
@@ -213,31 +214,51 @@ class SlatesAsyncRoundTrip(unittest.TestCase):
 TICK_BOUND_SECS = 1_000_000_000 / 10 / 1e9
 # The ticker's own period: a tenth of its bound, so a held loop shows as lateness well past one period.
 TICK_SECS = TICK_BOUND_SECS / 10
-# Shape: the noise sampler's sleep — the ticker's own period, so both measure the same scheduling grain.
+# Shape: the noise control's tick — the ticker's own period, so both measure the same scheduling grain.
 NOISE_SAMPLE_SECS = TICK_SECS
 
-# The noise sampler, run in its own interpreter: it sleeps NOISE_SAMPLE_SECS at a time until its stdin closes,
-# then prints the most any sleep returned late.
+# The noise control, run in its own interpreter: an event loop that ticks NOISE_SAMPLE_SECS at a time beside a
+# sibling thread that waits as the Ticker's sibling waits, until its stdin closes; then it prints the loop's worst
+# lateness. It is the Ticker without the SDK and without this harness: the same interpreter, the same two threads,
+# the same waits through the same primitive.
 _NOISE_SAMPLER = (
-    "import sys, threading, time\n"
+    "import asyncio, selectors, sys, threading, time\n"
+    "tick = float(sys.argv[1])\n"
     "stop = threading.Event()\n"
     "threading.Thread(target=lambda: (sys.stdin.read(), stop.set()), daemon=True).start()\n"
-    "worst = 0.0\n"
-    "while not stop.is_set():\n"
-    "    asked = time.monotonic()\n"
-    "    time.sleep(float(sys.argv[1]))\n"
-    "    worst = max(worst, time.monotonic() - asked - float(sys.argv[1]))\n"
-    "print(worst)\n"
+    "def sibling():\n"
+    "    with selectors.DefaultSelector() as selector:\n"
+    "        while not stop.is_set():\n"
+    "            selector.select(tick)\n"
+    "threading.Thread(target=sibling, daemon=True).start()\n"
+    "async def control():\n"
+    "    worst = 0.0\n"
+    "    while not stop.is_set():\n"
+    "        due = time.monotonic() + tick\n"
+    "        await asyncio.sleep(tick)\n"
+    "        worst = max(worst, time.monotonic() - due)\n"
+    "    return worst\n"
+    "print(asyncio.run(control()))\n"
 )
 
 
 class Noise:
-    """The machine's own scheduling noise while the test runs: a sampler in a separate process that sleeps
-    NOISE_SAMPLE_SECS at a time and records how much later than asked each sleep returned — time the OS kept
-    it off a core, as it can keep the loop's thread off. A separate process, not a thread: a native call that
-    wrongly held the GIL would delay a sampler thread as much as the loop and mask the very hold the bound
-    exists to catch. The loop's lateness is judged against the bound plus this noise — the pattern of the
-    Rust driver test and the Node SDK test (CI 2026-10-01: a macOS runner's loop was 0.186 s late under load)."""
+    """The machine's own scheduling noise while the test runs: a control in a separate process, an event loop that
+    ticks as the Ticker does, whose worst lateness is time the OS kept a loop like this one waiting. A separate
+    process, not a thread: a native call that wrongly held the GIL would delay a thread here as much as the loop and
+    mask the very hold the bound exists to catch. A charged hold is judged against the bound plus this noise — the
+    pattern of the Rust driver test and the Node SDK test (CI 2026-10-01: a macOS runner's loop was 0.186 s late under
+    load).
+
+    The control waits through the loop's own primitive, because on macOS the primitive decides the figure. Measured
+    2026-10-26 on this Mac (18 cores, load 19 to 72, Python 3.9 and 3.13, Rust std alike), from a process that a
+    launchd job started, as kiln's agents and GitHub's macOS runner both start one: a 10 ms `time.sleep`, `select`,
+    `nanosleep`, `park_timeout` or `Condvar` wait came back 76 ms late at the median, at most 116 ms; the delay is
+    about eight times the interval up to about 150 ms (6 ms late at 1 ms asked, 148 ms at 100 ms and at 1 s). The
+    event loop's own wait, a kevent timeout, came back 1.3 ms late at the median and at most 11 ms. Until 2026-10-26
+    this sampler slept with `time.sleep`, so its figure was mostly the other primitive's delay, and the loop's own tail
+    was compared against it: runs 40227172048 and 40239373189 failed with the loop 0.268 s and 0.286 s late against
+    noise of 0.134 s and 0.150 s."""
 
     def __init__(self):
         self._child = subprocess.Popen(
@@ -249,76 +270,145 @@ class Noise:
         self._worst = None
 
     def stop(self):
-        """Ends the sampler (once; later calls return the same figure) and returns its worst lateness."""
+        """Ends the control (once; later calls return the same figure) and returns its worst lateness."""
         if self._worst is None:
             out, _ = self._child.communicate(input="")
             self._worst = float(out.strip() or "0")
         return self._worst
 
 
+# Shape: how many waits of each kind `_wait_delays` takes the median of — five keeps the line under a second where a
+# `time.sleep` comes back 76 ms late.
+WAIT_DELAY_SAMPLES = 5
+
+
+def _wait_delays():
+    """How late this process's waits of one tick come back, the median of WAIT_DELAY_SAMPLES each: a `time.sleep` (a
+    nanosleep on Python 3.11 and later, a select before) and a selector wait (the loop's own primitive). Printed after
+    the measurement beside the ticker's figures, so every run records the timer policy its process ran under
+    (`Noise`)."""
+
+    def median_late(wait):
+        lates = []
+        for _ in range(WAIT_DELAY_SAMPLES):
+            due = time.monotonic() + TICK_SECS
+            wait()
+            lates.append(time.monotonic() - due)
+        return sorted(lates)[len(lates) // 2]
+
+    with selectors.DefaultSelector() as selector:
+        selected = median_late(lambda: selector.select(TICK_SECS))
+    slept = median_late(lambda: time.sleep(TICK_SECS))
+    return (
+        f"this process's {TICK_SECS * 1e3:.0f} ms waits came back late by, at the median of {WAIT_DELAY_SAMPLES}: "
+        f"time.sleep {slept * 1e3:.1f} ms, the selector {selected * 1e3:.1f} ms"
+    )
+
+
+def _idle_in_selector(frame):
+    """Whether `frame`, the loop thread's innermost Python frame, is the event loop's own idle wait: the selector's
+    `select`, which asyncio's `_run_once` calls once nothing is ready, and in which the thread waits in the kernel
+    (kevent on macOS, epoll on Linux) with the GIL released. A thread anywhere else is running a callback or is
+    blocked in a call."""
+    return frame is not None and frame.f_code is selectors.DefaultSelector.select.__code__
+
+
+class _Gap:
+    """What the sibling saw during one tick: its own worst lateness and, while the tick was more than a period
+    overdue, each sample of the loop thread's frame (`Ticker._observe`). The ticker reads it once the tick returns
+    (`Ticker._charge`)."""
+
+    __slots__ = ("heartbeat", "samples", "last_idle", "busy_stack", "sibling_late")
+
+    def __init__(self, heartbeat):
+        # When the ticker last ran: the tick in progress is due one period after.
+        self.heartbeat = heartbeat
+        self.samples = 0
+        # The last time the loop thread was seen idle in its selector while the tick was overdue.
+        self.last_idle = None
+        # The loop thread's stack the first time it was seen anywhere else while the tick was overdue.
+        self.busy_stack = None
+        self.sibling_late = 0.0
+
+
 class Ticker:
-    """An independent task on the loop: sleeps one period at a time and records how late it woke, and in
-    which phase of the scenario the worst lateness happened.
+    """An independent task on the loop: sleeps one period at a time and charges each tick with how long the loop was
+    held, by what a sibling thread saw while the tick was overdue; and records in which phase of the scenario the
+    worst charge fell.
 
     The phase is carried because this test has failed on CI without one and could not be acted on: runs
     39538566246 and 39539155335 reported 0.298 s and 0.243 s of lateness against a 0.1 s bound, with the
     separate-process noise sampler seeing 1 ms and 0 ms over the same window — so the loop really was held,
     and nothing said by what. The scenario kills a daemon under outstanding calls, stops a process group,
     cancels a call and kills an anchor; those are very different suspects. Whoever sees the next failure
-    should not have to guess which."""
+    should not have to guess which.
+
+    Late is not held. A tick is late when the loop has not run it by its due time, and a loop idle in its selector,
+    with nothing ready, waits in the kernel, which may wake it late. So while a tick is more than a period overdue,
+    the sibling samples the loop thread's frame each time it wakes, and the tick is charged:
+    - from the last moment the sibling saw the loop idle in its selector, when it saw it there at all, the sibling
+      itself was never late past the bound across the tick (so neither the GIL nor the whole process was held that
+      long), and the process burned less than one period of CPU across it;
+    - otherwise with its whole lateness.
+    Every hold the test exists to catch is charged whole. A call on the loop that blocks with the GIL released is
+    seen busy, in the call: the harness's process spawns held the loop that way until 2026-10-22. A busy hold of the
+    GIL burns CPU and keeps the sibling off. A call that blocks holding the GIL, on the loop's thread or any other,
+    keeps the sibling off for as long. Added 2026-10-26, after runs 40227172048 and 40239373189 failed with the loop
+    0.268 s and 0.286 s late, the process at 0.002 s and 0.005 s of CPU, and, in the second, the sibling awake 0.128 s
+    into the hold and finding the loop in `kqueue.control`: the event loop's own idle wait, woken late by the kernel,
+    which the bound charged as a hold."""
 
     def __init__(self):
-        self.worst = 0.0
         self.phase = "connecting"
-        self.worst_phase = self.phase
-        self.worst_cpu = 0.0
-        self.worst_thread = 0.0
-        self.thread_late = 0.0
-        # When the loop last ran this ticker, and the thread it runs on: the sibling reads both to name a hold
-        # while it lasts (`_name_a_hold`). `_named` is the heartbeat the last named hold began at, so each hold
-        # is named once.
-        self.heartbeat = time.monotonic()
+        # The worst charge, the figures of the tick that had it, and the stack the sibling first saw the loop busy at.
+        self.held = 0.0
+        self.held_phase = self.phase
+        self.held_late = 0.0
+        self.held_cpu = 0.0
+        self.held_sibling = 0.0
+        self.held_stack = None
+        # The worst lateness however it was charged, and how many ticks were late past the bound yet not charged
+        # (the loop idle in its selector, the sibling free, the process quiet): the kernel's lateness, on record.
+        self.late = 0.0
+        self.late_phase = self.phase
+        self.late_held = 0.0
+        self.uncharged = 0
         self._loop_ident = threading.get_ident()
-        self._named = None
+        self._gap = _Gap(time.monotonic())
         self._stop = threading.Event()
-        # A sibling probe *inside this process*, on a thread of its own. The separate-process sampler
-        # answers "was the machine scheduling anyone", which is not the same question: a process that
-        # sleeps 99.9% of the time is easy to schedule even on a runner that is starving the test, whose
-        # daemon, anchor and sampler all want the same cores. This one answers "could any Python code in
-        # *this* process run", and the pair of them separates the two causes. The test's older comment
-        # rejected a thread because a native call holding the GIL would delay it as much as the loop —
-        # which is precisely the signal, once there is a process probe beside it to rule out starvation.
+        # A sibling probe *inside this process*, on a thread of its own. The separate-process control
+        # answers "was the machine scheduling a loop like this one", which is not the same question: this
+        # one answers "could any Python code in *this* process run", and it can look at the loop while the
+        # loop is late. The test's older comment rejected a thread because a native call holding the GIL
+        # would delay it as much as the loop — which is precisely the signal, once there is a process
+        # control beside it to rule out starvation.
         self._thread = threading.Thread(target=self._sibling, daemon=True)
         self._thread.start()
         self.task = asyncio.get_running_loop().create_task(self._run())
 
     def stop(self):
         """Ends the measurement: the ticker's task and the sibling together, so the scenario's own teardown is
-        neither measured nor named as a hold."""
+        neither measured nor charged."""
         self.task.cancel()
         self._stop.set()
 
     def _sibling(self):
-        while not self._stop.is_set():
-            due = time.monotonic() + TICK_SECS
-            time.sleep(TICK_SECS)
-            now = time.monotonic()
-            self.thread_late = max(self.thread_late, now - due)
-            self._name_a_hold(now)
+        # It waits as the loop waits, through the selector. A `time.sleep` is a nanosleep, which a launchd job's
+        # policy delays eight times over (`Noise`): a sibling that slept so woke every 86 ms instead of every 10,
+        # looked at the loop that coarsely, and read the delay as its own lateness.
+        with selectors.DefaultSelector() as selector:
+            while not self._stop.is_set():
+                due = time.monotonic() + TICK_SECS
+                selector.select(TICK_SECS)
+                now = time.monotonic()
+                self._observe(now, now - due)
 
-    def _name_a_hold(self, now):
-        """Prints the loop thread's Python stack, once per hold, while the hold lasts: when the loop has not
-        run the ticker for one period plus the bound. The probes in `_tick` say what kind of hold it was; this
-        says where. Added after run 39974152220 (2026-10-23): 0.672 s in phase 'connecting', no CPU and the
-        sibling free, with the harness's own spawns already off the loop, so the probes ruled out every suspect
-        they could name.
-
-        It runs on the sibling. A hold that releases the GIL, the kind that run had, is named while it lasts. A
-        hold that keeps the GIL keeps the sibling off until it ends, and is named at once after: the interpreter
-        hands the GIL to a thread that has waited a switch interval at the holder's next instruction, so the
-        loop's frame is still the holding call's. Measured 2026-10-23 (CPython 3.9.6, macOS) with 0.3 s holds,
-        5 runs of each: a `time.sleep` was named 0.117–0.153 s in and a `ctypes.PyDLL` usleep 0.352–0.382 s in,
-        each once and each at the holding line.
+    def _observe(self, now, late):
+        """One sibling wake: its own lateness, and, while the tick in progress is more than a period overdue, a
+        sample of where the loop thread is. A hold that releases the GIL is seen while it lasts. A hold that keeps
+        the GIL keeps the sibling off until it ends and is seen at once after: the interpreter hands the GIL to a
+        thread that has waited a switch interval at the holder's next instruction, so the loop's frame is still the
+        holding call's, and the sibling's own lateness records the hold.
 
         Measured and rejected, 2026-10-23: `faulthandler.dump_traceback_later`, armed before each tick's sleep
         and cancelled after. Every arm starts a new watchdog thread and every cancel waits for the old one to
@@ -326,55 +416,64 @@ class Ticker:
         fell inside the interval the ticker measures. At load average 14 to 17 on macOS the pair cost a 1.1 ms
         median, 19.7 ms at p99, 64.9 ms at p999 and 74.7 ms at worst over 2000 ticks, and the test failed 2 of
         5 there with no hold dumped."""
-        heartbeat = self.heartbeat
-        silent = now - heartbeat
-        if silent <= TICK_SECS + TICK_BOUND_SECS or self._named == heartbeat or self._stop.is_set():
+        gap = self._gap
+        gap.sibling_late = max(gap.sibling_late, late)
+        if now - gap.heartbeat <= 2 * TICK_SECS or self._stop.is_set():
             return
-        self._named = heartbeat
         frame = sys._current_frames().get(self._loop_ident)
-        stack = "".join(traceback.format_stack(frame)) if frame is not None else "  (no Python frame)\n"
-        print(
-            f"ticker: the loop has not run for {silent:.3f} s, in phase {self.phase!r}; its thread is at:\n{stack}",
-            file=sys.stderr,
-        )
+        gap.samples += 1
+        if _idle_in_selector(frame):
+            gap.last_idle = now
+        elif gap.busy_stack is None:
+            gap.busy_stack = (
+                "".join(traceback.format_stack(frame)) if frame is not None else "  (no Python frame)\n"
+            )
 
     async def _run(self):
         while True:
             await self._tick()
 
     async def _tick(self):
-        """One period: sleeps, records that the loop ran (`heartbeat`), and how late it came back."""
+        """One period: sleeps, hands the sibling a fresh record, and charges the tick that ended."""
         due = time.monotonic() + TICK_SECS
         cpu = time.process_time()
-        thread_before = self.thread_late
         await asyncio.sleep(TICK_SECS)
         now = time.monotonic()
-        self.heartbeat = now
-        late = now - due
-        if late > self.worst:
-            self.worst, self.worst_phase = late, self.phase
-            # How much CPU this process burned across the gap, and whether a plain Python thread of
-            # its own was held over the same gap. Together they read three ways:
-            #
-            #   CPU burned                      code ran on the loop while holding the GIL
-            #   no CPU, sibling thread held     the OS kept this whole process off a core (the
-            #                                   separate noise sampler is usually late too), or a
-            #                                   blocking call kept the GIL (it is not)
-            #   no CPU, sibling thread free     a blocking call on the loop thread that releases
-            #                                   the GIL: what `park_timeout` in Rust looks like,
-            #                                   and what a process spawn waiting on its child's
-            #                                   exec looked like (`_run_async`, 2026-10-22)
-            #
-            # Measured 2026-10-20 to check neither probe is vacuous: a deliberate 200 ms busy GIL
-            # hold read 200.7 ms late / 195.6 ms CPU / 24.7 ms thread (the sibling gets the GIL back
-            # in switch-interval slices, so it reads less than the hold); a 200 ms GIL-releasing
-            # `time.sleep` read 272.3 ms late / 1.0 ms CPU / 0.2 ms thread. And 2026-10-23, so the
-            # middle row is measured too: a 200 ms native call that blocks while holding the GIL
-            # (`ctypes.PyDLL` usleep) read 334–362 ms late / 0.3–0.5 ms CPU / 269–330 ms thread, 5 of 5
-            # (Python 3.9.6, a loaded Mac): the loop's next `select` releases the GIL, and the sibling
-            # records its wait before the ticker reads it.
-            self.worst_cpu = time.process_time() - cpu
-            self.worst_thread = self.thread_late - thread_before
+        gap, self._gap = self._gap, _Gap(now)
+        self._charge(gap, now - due, now, time.process_time() - cpu)
+
+    def _charge(self, gap, late, now, cpu):
+        """Charges one tick by the rule in the class's docstring, keeps the worst, and prints any charge past the
+        bound with the stack the sibling saw."""
+        quiet = gap.last_idle is not None and gap.sibling_late <= TICK_BOUND_SECS and cpu < TICK_SECS
+        held = now - gap.last_idle if quiet else late
+        if held > self.held:
+            self.held, self.held_phase = held, self.phase
+            self.held_late, self.held_cpu, self.held_sibling = late, cpu, gap.sibling_late
+            self.held_stack = gap.busy_stack
+        if late > self.late:
+            self.late, self.late_phase, self.late_held = late, self.phase, held
+        if late > TICK_BOUND_SECS and quiet:
+            self.uncharged += 1
+        if held > TICK_BOUND_SECS:
+            stack = gap.busy_stack or "  (never seen busy)\n"
+            print(
+                f"ticker: the loop was held {held:.3f} s in phase {self.phase!r} (the tick {late:.3f} s late, "
+                f"{cpu:.3f} s of CPU, the sibling {gap.sibling_late:.3f} s late, {gap.samples} samples of the "
+                f"loop); first seen busy at:\n{stack}",
+                file=sys.stderr,
+            )
+
+    def summary(self, scheduling):
+        """The run's figures, printed whether it passes or fails, so a passing run's margin is on record too."""
+        return (
+            f"the ticker: worst charge {self.held:.3f} s in phase {self.held_phase!r} (that tick "
+            f"{self.held_late:.3f} s late, {self.held_cpu:.3f} s of CPU, the sibling {self.held_sibling:.3f} s "
+            f"late); worst lateness {self.late:.3f} s in phase {self.late_phase!r}, charged "
+            f"{self.late_held:.3f} s; {self.uncharged} ticks late past the bound and not charged (the loop idle "
+            f"in its selector, the sibling free, the process quiet); the control loop's worst lateness "
+            f"{scheduling:.3f} s"
+        )
 
 
 # The slowest exec wait of each command the harness ran, in seconds, by program name: how long its `Popen`
@@ -588,31 +687,32 @@ class SlatesAsyncEveryCallEnds(unittest.TestCase):
             for result in doomed:
                 self.assertIsInstance(result, slates.SlatesError)
                 self.assertIn("DaemonGone", str(result))
-            # Stop measuring before tearing the sampler down. `noise.stop()` blocks: `communicate()`
+            # Stop measuring before tearing the control down. `noise.stop()` blocks: `communicate()`
             # closes the child's stdin, reads to EOF and waits for a whole Python interpreter to exit,
-            # and it was being called while the ticker still ran — so that block landed in
-            # `ticker.worst`, charged to the SDK. The sampler has already stopped by then, so
-            # `scheduling` cannot account for it either. Measured on an idle machine 2026-10-20:
-            # `communicate()` blocked 3–11 ms and the loop's lateness tracked it almost exactly
-            # (10.9 ms blocked → 10.6 ms recorded), while the sampler reported a flat ~8 ms.
+            # and it was being called while the ticker still ran — so that block landed in the ticker's
+            # figures, charged to the SDK. The control has already stopped by then, so `scheduling`
+            # cannot account for it either. Measured on an idle machine 2026-10-20: `communicate()`
+            # blocked 3–11 ms and the loop's lateness tracked it almost exactly (10.9 ms blocked →
+            # 10.6 ms recorded), while the sampler reported a flat ~8 ms.
             ticker.stop()
-            worst, worst_phase = ticker.worst, ticker.worst_phase
             scheduling = noise.stop()
             print(
                 "the harness's own process spawns, each off the loop: slowest exec wait "
                 + ", ".join(f"{name} {seconds:.3f} s" for name, seconds in sorted(_exec_waits.items())),
                 file=sys.stderr,
             )
+            print(ticker.summary(scheduling), file=sys.stderr)
+            print(_wait_delays(), file=sys.stderr)
+            stack = ticker.held_stack or (
+                "  (never seen busy: the sibling or the whole process was held too, or the process burned CPU)\n"
+            )
             self.assertLess(
-                worst, TICK_BOUND_SECS + scheduling,
-                f"the loop was never held: worst lateness {worst:.3f} s in phase "
-                f"{worst_phase!r}, bound {TICK_BOUND_SECS} s plus the machine's own scheduling "
-                f"noise {scheduling:.3f} s. Across that gap this process burned "
-                f"{ticker.worst_cpu:.3f} s of CPU and a plain Python thread of its own was held "
-                f"{ticker.worst_thread:.3f} s — CPU burned means code ran on the loop holding the GIL; "
-                f"no CPU with the thread held too means the whole process was kept off a core or a "
-                f"blocking call kept the GIL, and the noise figure tells those apart; no CPU with the "
-                f"thread free means the loop's thread was blocked in a call that released the GIL",
+                ticker.held, TICK_BOUND_SECS + scheduling,
+                f"the loop was never held past the bound, {TICK_BOUND_SECS} s plus the control loop's worst "
+                f"lateness: {ticker.summary(scheduling)}. CPU burned means code ran on the loop holding the GIL; "
+                f"the sibling late too means the GIL or the whole process was held, and the control's figure "
+                f"tells those apart; a busy stack names a call that blocked the loop. The loop's thread, first "
+                f"seen busy in the worst charged tick:\n{stack}",
             )
         finally:
             noise.stop()
