@@ -294,7 +294,7 @@ box shared with two other builds — timings are not benchmarks)
 
    | platform | mount route (Shards' own window over a host mount) | socket route (the daemon's stream, A-161, A-163) |
    |---|---|---|
-   | macOS arm64 | owed: G-shards-mount; writable shared maps: G-nfs-writable | proven: Shards' `a_microvm_maps_a_slates_file_with_dax_and_each_side_sees_the_others_writes`, 3 of 3 twice (GAPS, 2026-10-24) |
+   | macOS arm64 | proven (G-shards-mount, 2026-10-26): a microVM under a Shards daemon gets a `slates mount` (NFS over loopback) as an ordinary volume with its own DAX window (`-v MOUNT:/v`, a 64 MiB share window, D189); the guest's kernel maps an 8 MiB file into the window (`dax /v/big yes`) and reads it whole through it, and a byte rewritten through another slates attachment reached a fresh open and read in the guest after 790.8, 24.4 and 728.1 ms, 3 of 3 on this Mac (HVF) against slates `b9014531`; red-checked with the window off (`dax /v/big no`). The test is Shards' `a_microvm_maps_a_slates_mount_file_through_its_own_dax_window` (`crates/shards/tests/slates_fs.rs`), a patch on Shards' `gpu` 3a659450 with its owner for review. Writable shared maps: G-nfs-writable | proven: Shards' `a_microvm_maps_a_slates_file_with_dax_and_each_side_sees_the_others_writes`, 3 of 3 twice (GAPS, 2026-10-24) |
    | Linux x86_64 | owed: G-shards-linux | owed: G-shards-linux |
    | Linux arm64 | owed: G-arm64-guest | owed: G-arm64-guest |
    | Windows x86_64, arm64 | owed: G-shards-windows | owed: G-shards-windows (refused `DescriptorRouteNotBuilt` today) |
@@ -466,7 +466,8 @@ box shared with two other builds — timings are not benchmarks)
    initramfs held in a slates volume, the guest reading every node as the volume holds it, then patching, renaming,
    removing, writing, making a directory and flushing; the merge held the clone to exactly the guest's tree. Its exit
    on the guest's restart is a race between the keyboard-controller reset and the kernel's triple-fault fallback, which
-   the test takes in either form (GAPS). Still owed: Shards' DAX window over the macOS mount.
+   the test takes in either form (GAPS). Shards' own DAX window over the macOS mount is proven since 2026-10-26 (the
+   Shards rows above).
 
    **Firecracker's pmem form (A-165; built and proven 2026-10-24).** Firecracker (1.14 and later) can attach the same
    image file as a virtio-pmem device: it maps the file shared as a range of the guest's physical memory, and carries

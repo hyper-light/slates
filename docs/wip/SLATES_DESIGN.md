@@ -3048,11 +3048,12 @@ same-namespace host process is the first delivered case.
 >   stat and a read (G-mount step 5, 2026-10-26, CI's KIND lane, red-checked with the change attribute frozen); crosvm
 >   over a slates mount (Linux x86_64);
 >   crosvm over slates' own device (Linux x86_64, A-168 and A-169, 2026-10-25); a Shards guest over the daemon's
->   stream (macOS arm64, A-163); Firecracker by virtio-pmem over the image file through a slates mount (Linux x86_64,
+>   stream (macOS arm64, A-163), and through Shards' own DAX window over a `slates mount` (macOS arm64, 2026-10-26,
+>   red-checked with the window off); Firecracker by virtio-pmem over the image file through a slates mount (Linux x86_64,
 >   A-165); and, since 2026-10-25, the same-kernel direct map on Linux (A-171: a sealed copy of one file, asserted
 >   zero-copy by a real client, red-checked), on macOS (A-173: the copy's read-only descriptor over the socket route,
 >   asserted zero-copy by a real client, red-checked) and on Windows x86_64 (A-175: a read-only section handle
->   duplicated into the client, asserted zero-copy by a real client on a Windows machine, red-checked). Eleven cells. **Corrected 2026-10-25:** the direct map had been listed
+>   duplicated into the client, asserted zero-copy by a real client on a Windows machine, red-checked). Twelve cells. **Corrected 2026-10-25:** the direct map had been listed
 >   here as proven before A-171, when its test reported which path ran without asserting it and every read was a copy.
 > - **Ruled out by the platforms:** QEMU's vhost-user-fs and Cloud Hypervisor have no DAX window, so neither has Kata;
 >   crosvm's window is x86_64-only; Apple's Virtualization framework and WSL2 document none (unconfirmed).
