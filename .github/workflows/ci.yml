@@ -457,6 +457,10 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-rt --test pipe
+      - name: Test a shard's lateness after a park (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-rt --test overrun
       # A shard's CPU clock read from another thread (§4.14, A-65): `GetThreadTimes` for the time it ran and
       # `QueryThreadCycleTime` for whether it ran; then the observations that count their budget in it — a starved
       # shard answered past the wall budget, a wedged one ended in one budget
@@ -637,6 +641,8 @@ jobs:
         run: cargo test -p slates-rt --test udp
       - name: Test the IOCP driver's pipe ends (native arm64 Windows)
         run: cargo test -p slates-rt --test pipe
+      - name: Test a shard's lateness after a park (native arm64 Windows)
+        run: cargo test -p slates-rt --test overrun
       - name: Test the shard CPU clock (native arm64 Windows)
         run: 'cargo test -p slates-rt --lib thread_clock::'
       - name: Test the wire codec and its CRC32C on arm64 hardware
@@ -788,6 +794,10 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-rt --test pipe
+      - name: Test a shard's lateness after a park (Windows, every push to main)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-rt --test overrun
       - name: Test the client binary and the async driver, one test at a time (Windows, every push to main)
         if: ${{ !cancelled() }}
         timeout-minutes: 15

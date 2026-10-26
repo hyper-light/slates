@@ -143,6 +143,45 @@ impl IocpDriver {
   }
 }
 
+impl IocpDriver {
+  /// One `GetQueuedCompletionStatusEx` for at most `remaining_ns` (none: without bound), rounded up to whole
+  /// milliseconds: how many entries it filled, or `None` when it timed out.
+  fn dequeue(&mut self, remaining_ns: Option<u64>) -> Result<Option<usize>, RtError> {
+    /// Format: nanoseconds per millisecond.
+    const NANOS_PER_MILLI: u64 = 1_000_000;
+    /// Format: INFINITE.
+    const INFINITE: u32 = u32::MAX;
+    let timeout_ms = remaining_ns.map_or(INFINITE, |ns| {
+      u32::try_from(ns.div_ceil(NANOS_PER_MILLI)).unwrap_or(INFINITE - 1)
+    });
+    let mut count: u32 = 0;
+    let capacity = u32::try_from(self.entries.len()).unwrap_or(u32::MAX);
+    // SAFETY: the entry buffer holds `capacity` records and `count` is writable.
+    let ok = unsafe {
+      GetQueuedCompletionStatusEx(
+        self.port,
+        self.entries.as_mut_ptr(),
+        capacity,
+        &raw mut count,
+        timeout_ms,
+        0,
+      )
+    };
+    if ok == 0 {
+      let code = std::io::Error::last_os_error().raw_os_error();
+      return if code == Some(i32::try_from(WAIT_TIMEOUT).unwrap_or(0)) {
+        Ok(None)
+      } else {
+        Err(RtError::DriverRefused {
+          call: "GetQueuedCompletionStatusEx",
+          code,
+        })
+      };
+    }
+    Ok(Some(usize::try_from(count).unwrap_or(0)))
+  }
+}
+
 /// Posts a kick packet to `port`, a live port the caller has pinned ([`KickPort::with`]); safe from
 /// any thread. A failed post means the port is being torn down with its shard, the documented outcome
 /// of a kick to an exiting shard (`Kick::kick`).
@@ -166,42 +205,21 @@ impl Driver for IocpDriver {
   }
 
   fn wait(&mut self, timeout_ns: Option<u64>, out: &mut Vec<Completion>) -> Result<(), RtError> {
-    /// Format: nanoseconds per millisecond.
-    const NANOS_PER_MILLI: u64 = 1_000_000;
-    /// Format: INFINITE.
-    const INFINITE: u32 = u32::MAX;
-    let timeout_ms = timeout_ns.map_or(INFINITE, |ns| {
-      u32::try_from(ns.div_ceil(NANOS_PER_MILLI)).unwrap_or(INFINITE - 1)
-    });
-    let mut count: u32 = 0;
-    let capacity = u32::try_from(self.entries.len()).unwrap_or(u32::MAX);
-    // SAFETY: the entry buffer holds `capacity` records and `count` is writable.
-    let ok = unsafe {
-      GetQueuedCompletionStatusEx(
-        self.port,
-        self.entries.as_mut_ptr(),
-        capacity,
-        &raw mut count,
-        timeout_ms,
-        0,
-      )
+    // Windows expires a timed wait on its timer's tick, which can fall before the deadline as the shard's clock (QPC)
+    // reads it. Measured on jupiter 2026-10-26: a park for a 5 ms timer woke 2.32 ms and 0.18 ms early, 2 waits in 60
+    // (`docs/bugs/2026-10-26-a-windows-park-woke-before-its-deadline.md`). A wait that times out before its deadline
+    // waits out the rest, so a park never returns early, as the seam promises. Each further wait asks for at least a
+    // millisecond, so the rest shrinks every time; a kick or a completion still ends the wait at once.
+    let deadline = timeout_ns.map(|ns| self.now_ns().saturating_add(ns));
+    let count = loop {
+      let remaining = deadline.map(|due| due.saturating_sub(self.now_ns()));
+      match self.dequeue(remaining)? {
+        Some(count) => break count,
+        None if deadline.is_some_and(|due| self.now_ns() < due) => {}
+        None => return Ok(()),
+      }
     };
-    if ok == 0 {
-      let code = std::io::Error::last_os_error().raw_os_error();
-      return if code == Some(i32::try_from(WAIT_TIMEOUT).unwrap_or(0)) {
-        Ok(())
-      } else {
-        Err(RtError::DriverRefused {
-          call: "GetQueuedCompletionStatusEx",
-          code,
-        })
-      };
-    }
-    for entry in self
-      .entries
-      .iter()
-      .take(usize::try_from(count).unwrap_or(0))
-    {
+    for entry in self.entries.iter().take(count) {
       match entry.lpCompletionKey {
         KICK_KEY => {}
         NOP_KEY => out.push(Completion {

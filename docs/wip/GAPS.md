@@ -717,18 +717,16 @@ are retained with their scope; no documentation edit is an implementation accept
   Nothing on Windows or Linux has *run* yet: that needs those machines (Phase 1's reference
   boxes).
 
-### 8a-win-overrun. A Windows shard's late step can read short of the time it was held off (2026-10-26, OPEN)
+### 8a-win-overrun. A Windows shard's park woke before its deadline (2026-10-26, closed 2026-10-26)
 
-`crates/rt/tests/overrun.rs`, `a_wait_stepped_past_its_deadline_reports_the_lateness`, fails on jupiter (Windows
-10.0.26200.9711) at its second assertion: the overrun a step reports is less than the time the test held the shard
-off its core after the park.
-- **How often:** 1 run in 12 at HEAD 65200c80, the runtime unchanged, and 2 in 8 with A-179's pipe change. The pipe
-  change touches no timer and no park.
-- **Hypothesis, not yet instrumented:** an IOCP wait returns before its deadline as the shard's clock reads it. The
-  wait's timeout is whole milliseconds, rounded up, but Windows expires waits on its timer tick. If so, the scheduler
-  overrun counter under-reports on Windows.
-- **Owed:** log the park's return against its deadline in that test on jupiter, then fix the wait or the measure;
-  check whether CI's Windows lanes have met it.
+`crates/rt/tests/overrun.rs`, `a_wait_stepped_past_its_deadline_reports_the_lateness`, failed on jupiter (1 run in 12,
+2 in 8, 5 in 40): the overrun a step reports fell 0.01 to 2.4 ms short of the time the test held the shard.
+- **Cause, logged:** the IOCP driver's timed wait expired on Windows' timer tick, before its deadline as the shard's
+  clock reads it. In 60 logged runs both failures had woken early (-2.32 ms and -0.18 ms) and all 58 passes late.
+- **Fixed:** `IocpDriver::wait` waits out the rest of a wait that times out early, so a park never returns before its
+  deadline, as the driver seam promises. 0 of 100 failed with the fix, and 0 woke early.
+- **Coverage:** the Windows CI lanes now run `overrun.rs`, which they never did.
+- Record: `docs/bugs/2026-10-26-a-windows-park-woke-before-its-deadline.md`.
 
 ### 8a-lint. The Linux lint gate was red, and only Linux could see it (2026-10-21)
 
