@@ -11542,7 +11542,7 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
 - **The DAX matrix (A-164, 2026-10-24): every cell of "DAX everywhere" is proven, owed to a goal, or ruled out by its
   platform.** The matrix is in `virtiofs.md` §8: six environments, each platform a row, two routes, 52 cells, none left
   unknown. The research behind it is kiln 01a17143717a7556a52f40f1d5a0e1b2 (19 findings, graded from their sources).
-  - **Proven (12 cells):**
+  - **Proven (14 cells):**
     - bare-metal Linux x86_64 by the mount route: the FUSE mount's shared maps, and since 2026-10-25 a read-only map
       too (`a_read_only_map_through_a_mount_follows_another_paths_change`, 16 replacements as memory alone, fedora);
     - bare-metal macOS arm64 by the mount route, for read-only maps (G-mount step 1, 2026-10-25): the same test maps a
@@ -11579,8 +11579,14 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       `slates mount` as an ordinary volume with its own DAX window (`-v MOUNT:/v`, D189); the guest maps an 8 MiB file
       into the window (`dax /v/big yes`) and reads it whole, and a byte rewritten through another slates attachment
       reached a fresh open and read in the guest after 790.8, 24.4 and 728.1 ms, 3 of 3 on this Mac (HVF); red-checked
-      with the window off (`dax /v/big no`). The test is a patch to Shards (`crates/shards/tests/slates_fs.rs`) with
-      its owner for review;
+      with the window off (`dax /v/big no`). The test is on Shards' `gpu` as `d717197a`;
+    - Shards on Linux x86_64 KVM by both routes (G-shards-linux, 2026-10-26, adacachy: CachyOS, Linux 7.2.9, against
+      slates `be7fa221`): over the daemon's stream, Shards'
+      `a_microvm_maps_a_slates_file_with_dax_and_each_side_sees_the_others_writes` 3 of 3 (`SHARDS-TEST PASS`; 28.7,
+      26.6 and 7.6 s); and Shards' own window over a `slates mount`
+      (FUSE, no `allow_other`: Shards confines its VM with seccomp and Landlock under the same uid), the same test as on
+      macOS, 3 of 3 (`dax /v/big yes`, digest whole, the new byte seen after 29.0, 26.8 and 27.0 ms). Both red-checked
+      with the window off (`SHARDS-TEST FAIL /mnt/big is not DAX`; `dax /v/big no`);
     - Firecracker on Linux x86_64 by the mount route: virtio-pmem over the image file (A-165, 2026-10-24; the entry
       below).
   - **Ruled out:**
@@ -11607,7 +11613,7 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       **Corrected 2026-10-25:** this entry and the matrix
       had counted the A-135 direct map on Linux as proven while every run read by copy (its test reported the path
       and did not assert it); A-171 has proven it since, asserting the zero-copy path;
-    - Shards on Linux KVM and on Windows;
+    - Shards on Windows;
     - the direct map inside a Linux container;
     - arm64 Linux hosts;
     - arm64 Linux guests;
