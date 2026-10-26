@@ -11542,7 +11542,7 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
 - **The DAX matrix (A-164, 2026-10-24): every cell of "DAX everywhere" is proven, owed to a goal, or ruled out by its
   platform.** The matrix is in `virtiofs.md` §8: six environments, each platform a row, two routes, 52 cells, none left
   unknown. The research behind it is kiln 01a17143717a7556a52f40f1d5a0e1b2 (19 findings, graded from their sources).
-  - **Proven (14 cells):**
+  - **Proven (15 cells):**
     - bare-metal Linux x86_64 by the mount route: the FUSE mount's shared maps, and since 2026-10-25 a read-only map
       too (`a_read_only_map_through_a_mount_follows_another_paths_change`, 16 replacements as memory alone, fedora);
     - bare-metal macOS arm64 by the mount route, for read-only maps (G-mount step 1, 2026-10-25): the same test maps a
@@ -11568,6 +11568,13 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       Red-checked on adacachy with the export answering a frozen change attribute for regular files: the map kept the
       old bytes for 120 s;
     - bare-metal Linux x86_64 by the socket route: the direct map's sealed copy (A-171, 2026-10-25; the entry below);
+    - Docker containers on Linux x86_64 by the socket route (G-container-direct, 2026-10-26): a process in the container
+      maps a slates file by the direct map with no copy (`a_container_maps_a_slates_file_by_the_direct_map_with_no_copy`:
+      the test binary as the container's client, a 4 MiB file, zero-copy and every byte, one `dax.local_map` and no
+      fallback), 3 of 3 on adacachy (Docker 29.9.0); red-checked with the hand-off forced to a copy. The container shares
+      the daemon's kernel and uid and the host's network namespace (`--network host`): the rendezvous is an abstract
+      socket, which Linux scopes to its network namespace (unix(7)), so a container with a namespace of its own cannot
+      reach the daemon at all;
     - bare-metal macOS arm64 by the socket route: the direct map's read-only copy over the daemon's socket route (A-173,
       2026-10-25; the entry below);
     - bare-metal Windows x86_64 by the socket route: a read-only section handle duplicated into the client (A-175,
@@ -11614,7 +11621,8 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       had counted the A-135 direct map on Linux as proven while every run read by copy (its test reported the path
       and did not assert it); A-171 has proven it since, asserting the zero-copy path;
     - Shards on Windows;
-    - the direct map inside a Linux container;
+    - the direct map inside a pod, which would need the host's network namespace to reach the rendezvous, as the Docker
+      container did, and a rendezvous a container with a network namespace of its own can reach;
     - arm64 Linux hosts;
     - arm64 Linux guests;
     - macOS writable shared maps over NFS.

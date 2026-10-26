@@ -8755,9 +8755,14 @@ fn probe_binaries() -> Vec<String> {
   let mut mounts = vec![readonly_bind(&binary, MAP_PROBE_BINARY)];
   for line in String::from_utf8_lossy(&listed.stdout).lines() {
     // `libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x...)`, `/lib64/ld-linux-x86-64.so.2 (0x...)`, or the vDSO,
-    // which has no file.
+    // which has no file. Some glibc builds list the loader by its own path on the left of the arrow too
+    // (`/lib64/ld-linux-x86-64.so.2 => /usr/lib64/ld-linux-x86-64.so.2 (0x...)`, CachyOS): a left side that is a
+    // path is the loader.
     let line = line.trim();
     let (name, path) = match line.split_once(" => ") {
+      Some((name, rest)) if name.starts_with('/') => {
+        ("ld.so".to_owned(), rest.split(" (").next().unwrap_or(rest))
+      }
       Some((name, rest)) => (name.to_owned(), rest.split(" (").next().unwrap_or(rest)),
       None => {
         let path = line.split(" (").next().unwrap_or(line);
@@ -9091,6 +9096,189 @@ fn probe_line(
       Err(e) => return Err(format!("waiting for {prefix:?}: {e}")),
     }
   }
+}
+
+/// Format: the environment variable naming the instance the container's direct-map probe connects to.
+#[cfg(target_os = "linux")]
+const DIRECT_PROBE_INSTANCE: &str = "SLATES_DIRECT_PROBE_INSTANCE";
+/// Format: the environment variable naming the volume (its 32 hexadecimal digits) whose file the probe maps.
+#[cfg(target_os = "linux")]
+const DIRECT_PROBE_VOLUME: &str = "SLATES_DIRECT_PROBE_VOLUME";
+/// Format: the environment variable giving the file's length and its one byte value, as `LENGTH:FILL`.
+#[cfg(target_os = "linux")]
+const DIRECT_PROBE_SHAPE: &str = "SLATES_DIRECT_PROBE_SHAPE";
+/// Format: the tag of the probe's one line, found anywhere in a line (libtest prints the test's name before it).
+#[cfg(target_os = "linux")]
+const DIRECT_PROBE_TAG: &str = "direct-map:";
+/// Format: the file the container maps, in the volume's root.
+#[cfg(target_os = "linux")]
+const DIRECT_PROBE_FILE: &str = "/direct.bin";
+/// Shape: the file's length: 4 MiB, many content chunks, as the same-kernel test's many-chunk file
+/// (`crates/client/tests/client.rs` `MANY_CHUNKS_BYTES`).
+#[cfg(target_os = "linux")]
+const DIRECT_PROBE_BYTES: usize = 4 << 20;
+
+/// The re-invoked role of [`a_container_maps_a_slates_file_by_the_direct_map_with_no_copy`]: inside the container,
+/// connects to the instance the environment names, maps the file by `map_read`, and prints one tagged line: whether the
+/// map is zero-copy, and whether it holds every byte. Passes trivially when not the role.
+#[cfg(target_os = "linux")]
+#[test]
+fn container_direct_map_probe() {
+  let Ok(instance) = std::env::var(DIRECT_PROBE_INSTANCE) else {
+    return;
+  };
+  let volume = volume_id_of(&std::env::var(DIRECT_PROBE_VOLUME).unwrap());
+  let shape = std::env::var(DIRECT_PROBE_SHAPE).unwrap();
+  let (length, fill) = shape.split_once(':').unwrap();
+  let (length, fill): (usize, u8) = (length.parse().unwrap(), fill.parse().unwrap());
+  let deadlines = slates_client::Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get();
+  let mut client = slates_client::Client::connect(&instance, deadlines).unwrap();
+  let mapped = client.map_read(volume, DIRECT_PROBE_FILE).unwrap();
+  let bytes = mapped.to_vec().unwrap();
+  let whole = bytes.len() == length && bytes.iter().all(|byte| *byte == fill);
+  println!(
+    "{DIRECT_PROBE_TAG} zero_copy={} whole={whole} len={}",
+    mapped.is_zero_copy(),
+    bytes.len()
+  );
+}
+
+/// The daemon's status counter `name`, summed over its shards (`slates status` prints `name: count` per shard).
+#[cfg(target_os = "linux")]
+fn status_counter(instance: &str, name: &str) -> u64 {
+  let (code, out, err) = run(instance, &["status"]);
+  assert_eq!(code, 0, "slates status: {err}");
+  let named = format!("{name}: ");
+  out
+    .lines()
+    .filter_map(|line| line.split_once(named.as_str()))
+    .filter_map(|(_, count)| count.trim().parse::<u64>().ok())
+    .sum()
+}
+
+/// G-container-direct (§4.6 A-135, A-171; the DAX matrix's Docker Linux x86_64 socket-route cell, `docs/wip/virtiofs.md`
+/// §8): a process in a Linux container maps a slates file with no copy. Do: start a daemon, write a 4 MiB file through the
+/// SDK, and run the cli test binary in a Docker container, through its own loader and libraries bound read-only, as the
+/// container's [`container_direct_map_probe`], which connects to the instance and maps the file by `map_read`. The
+/// container shares the daemon's kernel and its uid (`--user`), and the host's network namespace (`--network host`):
+/// Linux scopes an abstract socket, the rendezvous, to its network namespace (unix(7)). Expect: the map is zero-copy and
+/// holds every byte, and the daemon counted one hand-off (`dax.local_map`), no fallback to a copy and nothing
+/// unconfined. Gated on `SLATES_TEST_CLI` and a reachable Docker; skips loudly.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_container_maps_a_slates_file_by_the_direct_map_with_no_copy() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!("SKIP: the container direct map needs SLATES_TEST_CLI=1 (a live daemon)");
+    return;
+  }
+  let server = match docker_server() {
+    Ok(server) => server,
+    Err(why) => {
+      eprintln!("SKIP: the container direct map needs a reachable Docker: {why}");
+      return;
+    }
+  };
+  eprintln!("the direct-map probe over {server}");
+  let instance = format!("cli-container-direct-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "containerdirect", "--bounded", "16MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let volume = volume_id_of(&id);
+  let deadlines = slates_client::Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get();
+  let mut writer = slates_client::Client::connect(&instance, deadlines).unwrap();
+  let attachment = writer
+    .attach(volume, None, slates_client::Intent::Write)
+    .unwrap()
+    .attachment;
+  let fill = b'D';
+  writer
+    .fs_write(
+      (volume, attachment),
+      DIRECT_PROBE_FILE.trim_start_matches('/'),
+      &vec![fill; DIRECT_PROBE_BYTES],
+      FILE_MODE,
+    )
+    .unwrap();
+  let handed = status_counter(&instance, "dax.local_map");
+  let fallbacks = status_counter(&instance, "dax.local_map_fallback");
+  let unconfined = status_counter(&instance, "dax.local_map_unconfined");
+
+  let mut command = Command::new("docker");
+  command.args([
+    "run",
+    "--rm",
+    "--network",
+    "host",
+    "--user",
+    &format!(
+      "{}:{}",
+      rustix::process::getuid().as_raw(),
+      rustix::process::getgid().as_raw()
+    ),
+  ]);
+  for mount in probe_binaries() {
+    command.args(["--mount", &mount]);
+  }
+  command.args([
+    "-e",
+    &format!("{DIRECT_PROBE_INSTANCE}={instance}"),
+    "-e",
+    &format!("{DIRECT_PROBE_VOLUME}={id}"),
+    "-e",
+    &format!("{DIRECT_PROBE_SHAPE}={DIRECT_PROBE_BYTES}:{fill}"),
+    CONTAINER_IMAGE,
+    &format!("{MAP_PROBE_LIBRARIES}/ld.so"),
+    "--library-path",
+    MAP_PROBE_LIBRARIES,
+    MAP_PROBE_BINARY,
+    "--exact",
+    "container_direct_map_probe",
+    "--nocapture",
+    "--test-threads=1",
+  ]);
+  let (code, out, err) =
+    bounded(&mut command, CONTAINER_WAIT).unwrap_or_else(|why| panic!("docker run: {why}"));
+  let line = out
+    .lines()
+    .find_map(|line| {
+      line
+        .split_once(DIRECT_PROBE_TAG)
+        .map(|(_, rest)| rest.trim().to_owned())
+    })
+    .unwrap_or_else(|| {
+      panic!("the probe printed no {DIRECT_PROBE_TAG} line (exit {code}): {out} {err}")
+    });
+  eprintln!("{DIRECT_PROBE_TAG} {line}");
+  let handed_now = status_counter(&instance, "dax.local_map");
+  let fallbacks_now = status_counter(&instance, "dax.local_map_fallback");
+  let unconfined_now = status_counter(&instance, "dax.local_map_unconfined");
+  drop(writer);
+  drop(anchor);
+  assert_eq!(code, 0, "the probe ran to its end: {err}");
+  assert_eq!(
+    line,
+    format!("zero_copy=true whole=true len={DIRECT_PROBE_BYTES}"),
+    "a process in the container maps the file with no copy, every byte"
+  );
+  assert_eq!(
+    handed_now.saturating_sub(handed),
+    1,
+    "the daemon handed the container one direct map"
+  );
+  assert_eq!(fallbacks_now, fallbacks, "no fallback to a copy");
+  assert_eq!(unconfined_now, unconfined, "nothing unconfined");
 }
 
 /// §4.6 A-9 / RQ-20: **an OCI container consumes the same VFS** — the row of `docs/wip/CONSUMERS.md` that read
