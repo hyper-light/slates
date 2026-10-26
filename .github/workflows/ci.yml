@@ -633,6 +633,42 @@ jobs:
       - name: Test the wire codec and its CRC32C on arm64 hardware
         run: cargo test -p slates-wire
 
+  # Linux arm64, run natively (G-arm64-host): the same-kernel direct map, the FUSE mount's maps and the containers that
+  # map through either, on GitHub's `ubuntu-24.04-arm` image, free for a public repository as `windows-11-arm` is. The
+  # cross-lint above proves the arm64 Linux triples compile; nothing had ever run them, and arm64 is the weaker memory
+  # model, under which the copy's atomic loads, the ring and the doorbell had never executed on Linux. The DAX matrix's
+  # Linux arm64 cells (`docs/wip/virtiofs.md` §8) cite this lane. On main and the nightly only, as `windows-arm64` is,
+  # so a first run that finds something real does not block every pull request. fuse3 and the operator's
+  # user_allow_other are what the x86_64 lane's CLI flow has (the conformance lane installs fuse3 the same way).
+  linux-arm64:
+    name: aarch64 linux (native, by test)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: FUSE and the operator's grant (Linux arm64)
+        run: |
+          command -v fusermount3 >/dev/null || { sudo apt-get update && sudo apt-get install -y fuse3; }
+          grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+          uname -m
+          docker version --format 'docker {{.Server.Version}} {{.Server.Os}}/{{.Server.Arch}}' || true
+      - name: The same-kernel direct map on arm64 (every client map test)
+        run: cargo test -p slates-client --test client -- --test-threads=1 --nocapture map
+      - name: The FUSE mount's maps and the containers on arm64 (the CLI flow's map tests)
+        env:
+          SLATES_TEST_CLI: "1"
+        run: >-
+          cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture
+          a_shared_map_through_a_mount_writes_back_and_follows_another_paths_change
+          a_read_only_map_through_a_mount_follows_another_paths_change
+          a_container_maps_a_file_through_the_bound_mount_and_follows_another_paths_change
+          a_rootless_container_maps_a_file_through_the_mount_and_follows_another_paths_change
+          a_container_maps_a_slates_file_by_the_direct_map_with_no_copy
+
   # Miri (the memory-model interpreter) and loom (the concurrency-permutation checker) run
   # on the unit tests of the crates that hold unsafe code. Miri ships only with the
   # nightly toolchain, which CI installs for this job alone; the pinned stable toolchain builds
