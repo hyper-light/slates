@@ -97,9 +97,8 @@ mod reap;
 pub mod seal_keys;
 mod snapshot_view;
 // The Shards fs transport (§4.6, the Shards route; A-161): a volume served to a Shards microVM over an anonymous
-// stream, on the volume's owning shard; it rides the runtime's Unix descriptor readiness, so it is gated like the
-// virtio-fs transport.
-#[cfg(unix)]
+// stream, on the volume's owning shard: a socket pair on Unix, a duplex named pipe on Windows served by the runtime's
+// completion driver (A-179).
 pub mod shards;
 // The Shards stream's socket route (A-161): macOS hands a client its stream end through it, having no control socket.
 #[cfg(target_os = "macos")]

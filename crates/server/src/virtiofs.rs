@@ -40,7 +40,6 @@ use slates_db::catalog::{Principal, VolumeId as DbVolumeId};
 use slates_ipc::protocol::{Refusal, VolumeId};
 use slates_mem::Slab;
 use slates_rt::control::Control;
-use slates_rt::error::RtError;
 use slates_rt::registry;
 use slates_rt::task::SpawnRequest;
 use slates_vfs::error::VfsError;
@@ -48,7 +47,7 @@ use slates_vfs::error::VfsError;
 use crate::daemon::Daemon;
 use crate::error::ServerError;
 use crate::state::{self, ShardState};
-use crate::verbs::{owner_of, rights_of};
+use crate::verbs::rights_of;
 
 /// The virtio-fs mount tag a guest sees (e.g. `slates`), re-exported so a caller of the vhost-user attach API
 /// below can name the `tag` argument those fns take without depending on the bridge crate directly.
@@ -947,18 +946,6 @@ pub(crate) fn revoke_attachment_device(s: &ShardState, attachment: u64) -> bool 
 }
 
 impl Daemon {
-  /// The runtime shard that owns `volume`, or the typed refusal when the partition has no shard.
-  pub(crate) fn owner_shard(&self, volume: VolumeId) -> Result<u16, ServerError> {
-    let partition = owner_of(volume);
-    self
-      .shards()
-      .get(usize::from(partition))
-      .map(|shard| shard.0)
-      .ok_or(ServerError::Runtime(RtError::ShardGone {
-        shard: partition,
-      }))
-  }
-
   /// Attaches a guest device to `volume` under `tag` over the harness's `seam`, presenting `view` (the head, a
   /// subtree, or a snapshot read-only), served on the volume's owning shard for its whole life; the outcome
   /// reaches the harness through `on_end`.

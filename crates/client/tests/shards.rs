@@ -5,8 +5,9 @@
 //! (a little-endian length, then the request; one reply frame back) and checks every change through slates' own reads
 //! and writes. The daemon has two shards and the test attaches a volume on each, so one attach is served on the
 //! client's own shard and the other on another shard, whose end comes home with the forwarded reply (Linux) or is
-//! taken from the owner shard by the route's exchange (macOS). On Windows, which has no route yet, the attach is
-//! refused by kind, the reason the daemon's own transport report gives.
+//! taken from the owner shard by the route's exchange (macOS). On Windows the daemon duplicates the client end of the
+//! attachment's named pipe into this process and the reply names its value (A-179); the same history, hostile frames
+//! and endings run over it, and a second process is refused the pipe by name.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(
   clippy::unwrap_used,
@@ -98,14 +99,20 @@ fn volume(client: &mut Client, name: &str) -> VolumeId {
     .unwrap()
 }
 
-/// Linux and macOS: the end comes by the platform's route, and FUSE runs through it.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// Linux, macOS and Windows: the end comes by the platform's route, and FUSE runs through it.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod delivered {
   use std::io::{ErrorKind, Read, Write};
+  #[cfg(unix)]
   use std::os::unix::net::UnixStream;
 
   use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
   use slates_bridge_fuse::reply::EntryOut;
+  #[cfg(windows)]
+  use std::process::Command;
+
+  #[cfg(windows)]
+  use slates_client::AttachTransport;
   use slates_client::{ReadAt, ShardsStream};
 
   use super::*;
@@ -128,17 +135,61 @@ mod delivered {
     b"written through the stream end the client received, read by slates' own read\n";
   const FROM_SLATES: &[u8] = b"written by slates' own write, read through the stream end\n";
 
+  /// The end the client received, as Shards' device reads and writes it: a Unix socket with the test's read bound.
+  #[cfg(unix)]
+  type Wire = UnixStream;
+
+  /// The end the client received on Windows: the client end of the attachment's pipe, opened for overlapped I/O, so
+  /// each read and write waits on an `OVERLAPPED` of its own (`slates_ipc::stream::read_waiting`, `write_waiting`).
+  #[cfg(windows)]
+  struct Wire(slates_client::StreamEnd);
+
+  #[cfg(windows)]
+  impl Read for Wire {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+      use std::os::windows::io::AsHandle;
+      slates_ipc::stream::read_waiting(self.0.as_handle(), buf).map_err(std::io::Error::other)
+    }
+  }
+
+  #[cfg(windows)]
+  impl Write for Wire {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+      use std::os::windows::io::AsHandle;
+      slates_ipc::stream::write_waiting(self.0.as_handle(), buf).map_err(std::io::Error::other)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+      Ok(())
+    }
+  }
+
+  /// The received end as a [`Wire`].
+  #[cfg(unix)]
+  fn wire(end: slates_client::StreamEnd) -> Wire {
+    let stream = UnixStream::from(end);
+    stream.set_read_timeout(Some(WAIT)).unwrap();
+    stream
+  }
+
+  /// The received end as a [`Wire`].
+  #[cfg(windows)]
+  fn wire(end: slates_client::StreamEnd) -> Wire {
+    Wire(end)
+  }
+
   /// Shards' fs device, as seen from the end the client received.
   struct Guest {
-    stream: UnixStream,
+    stream: Wire,
     unique: u64,
   }
 
   impl Guest {
     fn over(shards: ShardsStream) -> Guest {
-      let stream = UnixStream::from(shards.stream);
-      stream.set_read_timeout(Some(WAIT)).unwrap();
-      let mut guest = Guest { stream, unique: 0 };
+      let mut guest = Guest {
+        stream: wire(shards.stream),
+        unique: 0,
+      };
       let mut init = Vec::new();
       for word in [MAJOR, MINOR, 128 << 10, 0] {
         init.extend_from_slice(&word.to_le_bytes());
@@ -232,6 +283,11 @@ mod delivered {
 
     fn unlink(&mut self, name: &str) -> i32 {
       errno(&self.ask(Opcode::Unlink, ROOT, &named(name)))
+    }
+
+    /// Writes raw bytes on the stream, as a hostile device would.
+    fn send_raw(&mut self, bytes: &[u8]) {
+      self.stream.write_all(bytes).unwrap();
     }
 
     /// Whether the daemon has ended the stream (its next read is the end).
@@ -417,6 +473,193 @@ mod delivered {
     drop(daemon);
   }
 
+  /// Waits until the daemon has counted `kind` at least `at_least` times on any shard: the count, after at most
+  /// [`WAIT`].
+  fn wait_for_count(daemon: &Daemon, kind: &str, at_least: u64) -> u64 {
+    let started = Instant::now();
+    loop {
+      let counted = daemon
+        .refusals_on_every_shard()
+        .unwrap()
+        .get(kind)
+        .copied()
+        .unwrap_or(0);
+      if counted >= at_least || started.elapsed() > WAIT {
+        return counted;
+      }
+      std::thread::yield_now();
+    }
+  }
+
+  /// Format: the length word's bit that marks Shards' own control frames (`shards_fs::CONTROL_FRAME`).
+  const CONTROL: u32 = 1 << 31;
+
+  /// A-161, A-179, hostile input over the platform's stream (a socket pair on Unix, a named pipe on Windows): a
+  /// length of `u32::MAX`, a length past the largest frame, a frame cut off inside its length word and one cut off
+  /// inside its body by the peer's close. Do: send each on a stream of its own, beside a bystander's. Expect each
+  /// refused before anything is allocated for it (the bound is checked on the length word alone, `split_frame`),
+  /// counted by its kind, its stream ended and its attachment removed, so the volume's attachment count comes back to
+  /// the bystander's one and then to zero; the bystander served throughout, and the daemon never panics.
+  #[test]
+  fn hostile_frames_end_only_their_own_stream_and_leave_no_attachment() {
+    let (daemon, mut client) = start("hostile");
+    let id = volume(&mut client, "hostile");
+    let mut bystander = Guest::over(client.attach_shards(id, Intent::Write, None).unwrap());
+    for (word, refused) in [(u32::MAX, 1), (!CONTROL, 2)] {
+      let mut hostile = Guest::over(client.attach_shards(id, Intent::Write, None).unwrap());
+      hostile.send_raw(&word.to_le_bytes());
+      assert!(
+        hostile.ended(),
+        "a refused length ends its stream: {word:#x}"
+      );
+      assert_eq!(
+        wait_for_count(&daemon, "shards.frame_refused", refused),
+        refused
+      );
+    }
+    let mut cut = 64u32.to_le_bytes().to_vec();
+    cut.extend_from_slice(&[0u8; 10]);
+    for (part, truncated) in [(&cut[..2], 1), (&cut[..], 2)] {
+      let mut hostile = Guest::over(client.attach_shards(id, Intent::Write, None).unwrap());
+      hostile.send_raw(part);
+      drop(hostile);
+      assert_eq!(
+        wait_for_count(&daemon, "shards.frame_truncated", truncated),
+        truncated
+      );
+    }
+    wait_for_attachments(&mut client, id, 1);
+    assert_eq!(bystander.lookup(ROOT, "nothing"), Err(ENOENT));
+    bystander.write_file("still-served.txt", FROM_GUEST);
+    drop(bystander);
+    wait_for_attachments(&mut client, id, 0);
+    let refusals = daemon.refusals_on_every_shard().unwrap();
+    for kind in [
+      "shards.sweep_refused",
+      "shards.record_end_refused",
+      "shards.end_refused",
+    ] {
+      assert_eq!(refusals.get(kind), None, "{kind}: {refusals:?}");
+    }
+    drop(client);
+    drop(daemon);
+  }
+
+  /// Whether `attachment`'s record is on `volume`'s owner partition, asked of that shard in this process.
+  fn recorded(daemon: &Daemon, volume: VolumeId, attachment: u64) -> bool {
+    let partition = usize::from(slates_server::verbs::owner_of(volume));
+    let shard = daemon.shards().get(partition).copied();
+    daemon
+      .observation(
+        shard,
+        slates_server::daemon::OBSERVE_BUDGET_NS,
+        move |state: &mut slates_server::state::ShardState| {
+          state.db.partition().attachment(attachment).is_some()
+        },
+      )
+      .unwrap()
+      .wait()
+      .unwrap()
+  }
+
+  /// A-161, A-179: the volume's destroy ends its stream. Do: attach a volume in the Shards form, speak through the end,
+  /// then destroy the volume. Expect the end to read the end of the stream and then the attachment's record gone from
+  /// its partition (asked of the owner shard: the end is seen at once, and the record goes at the serve task's next
+  /// turn), with no sweep or record refusal counted.
+  #[test]
+  fn a_destroy_ends_the_stream_and_removes_its_record() {
+    let (daemon, mut client) = start("destroy");
+    let id = volume(&mut client, "destroy");
+    let shards = client.attach_shards(id, Intent::Write, None).unwrap();
+    let attachment = shards.attachment.attachment;
+    let mut guest = Guest::over(shards);
+    guest.write_file("doomed.txt", FROM_GUEST);
+    client.destroy(id).unwrap();
+    assert!(guest.ended(), "the destroy ends the stream");
+    let started = Instant::now();
+    while recorded(&daemon, id, attachment) {
+      assert!(
+        started.elapsed() < WAIT,
+        "the destroyed volume's stream kept its record"
+      );
+      std::thread::yield_now();
+    }
+    let refusals = daemon.refusals_on_every_shard().unwrap();
+    for kind in [
+      "shards.sweep_refused",
+      "shards.record_end_refused",
+      "shards.end_refused",
+    ] {
+      assert_eq!(refusals.get(kind), None, "{kind}: {refusals:?}");
+    }
+    drop(client);
+    drop(daemon);
+  }
+
+  /// The account a client of this machine's rendezvous is: its uid on Unix; zero on Windows, where the rendezvous names
+  /// every client's uid zero and judges the user by its token instead.
+  #[cfg(unix)]
+  fn account() -> u32 {
+    rustix::process::getuid().as_raw()
+  }
+
+  /// See the Unix arm.
+  #[cfg(windows)]
+  fn account() -> u32 {
+    0
+  }
+
+  /// A-161, A-179, AUD-29-84: a revocation ends its consumer's stream. Do: enroll a consumer, share the account's
+  /// volume with it for writing, bind a channel to it and attach the volume in the Shards form, then revoke the
+  /// consumer from the account. Expect the end to read the end of the stream and the attachment gone from the volume's
+  /// count, as every other attachment a revoked consumer held.
+  #[test]
+  fn a_revocation_ends_its_consumers_stream() {
+    use slates_server::landing::{enroll_proof, revoke_proof};
+    let (daemon, mut owner) = start("revoke");
+    let secret = daemon.segment().issuer_secret().unwrap();
+    let account = account();
+    let (consumer, capability) = owner
+      .enroll(account, enroll_proof(&secret, account))
+      .unwrap();
+    let id = volume(&mut owner, "revoked");
+    owner
+      .share(
+        id,
+        slates_client::Principal::Consumer { account, consumer },
+        slates_client::Rights {
+          read: true,
+          write: true,
+          admin: false,
+        },
+      )
+      .unwrap();
+    let instance = format!("shards-revoke-{}", std::process::id());
+    let deadlines =
+      Deadlines::derive(LIVENESS_BUDGET_NS, slates_db::replay::RECOVERY_BUDGET_NS).get();
+    let mut bound = Client::connect(&instance, deadlines).unwrap();
+    bound.attest(consumer, &capability).unwrap();
+    let shards = bound.attach_shards(id, Intent::Write, None).unwrap();
+    let mut guest = Guest::over(shards);
+    assert_eq!(guest.lookup(ROOT, "nothing"), Err(ENOENT));
+    owner
+      .revoke(consumer, revoke_proof(&secret, consumer))
+      .unwrap();
+    assert!(guest.ended(), "the revocation ends the consumer's stream");
+    wait_for_attachments(&mut owner, id, 0);
+    let refusals = daemon.refusals_on_every_shard().unwrap();
+    for kind in [
+      "shards.sweep_refused",
+      "shards.record_end_refused",
+      "shards.end_refused",
+    ] {
+      assert_eq!(refusals.get(kind), None, "{kind}: {refusals:?}");
+    }
+    drop(bound);
+    drop(owner);
+    drop(daemon);
+  }
+
   /// Shape: the ends the in-flight test receives, as many as macOS's route test claims under its churn
   /// (`crates/server/tests/shards.rs`, `CLAIMS_UNDER_CHURN`), where 16 to 40 of 48 arrived flushed before its fix.
   #[cfg(target_os = "linux")]
@@ -502,23 +745,70 @@ mod delivered {
     drop(near);
     drop(far);
   }
-}
 
-/// Windows: no route hands a client a handle yet, so the daemon refuses the form by kind.
-#[cfg(windows)]
-mod refused {
-  use slates_client::{AttachTransport, Refusal, UnsupportedReason};
+  /// Format: the variable that makes a re-invoked test binary the opener, naming the pipe it opens.
+  #[cfg(windows)]
+  const ROLE_PIPE: &str = "SLATES_SHARDS_TEST_OPEN_PIPE";
+  /// Format: the tag the opener prints before the code its open was refused with (libtest prints its own banner and
+  /// test name on stdout first, so the parent looks for the tag anywhere in a line).
+  #[cfg(windows)]
+  const OPENED_TAG: &str = "SHARDS-PIPE-OPEN";
+  /// Format: `ERROR_PIPE_BUSY`, what an open of a connected one-instance pipe answers.
+  #[cfg(windows)]
+  const ERROR_PIPE_BUSY: u32 = 231;
 
-  use super::*;
-
-  /// A-161 (Shards part 1 step 4: "Windows compiles and refuses the form by kind"). Do: attach a volume in the Shards
-  /// form, for writing and for reading, whole and as a directory, and read the volume's transport report. Expect every
-  /// attach refused `AttachmentUnsupported` for the Shards transport with `DescriptorRouteNotBuilt`, the reason the
-  /// report gives for the transport, and no attachment made.
+  /// The opener's role, run only when re-invoked with [`ROLE_PIPE`] set: opens the named pipe for reading and writing
+  /// as any client would, and prints the code the open was refused with (0 for an open that succeeded).
+  #[cfg(windows)]
   #[test]
-  fn the_shards_form_is_refused_by_kind_where_no_route_hands_a_handle() {
-    let (_daemon, mut client) = start("refused");
-    let id = volume(&mut client, "refused");
+  #[ignore = "a role the parent test re-invokes this binary for"]
+  fn opener() {
+    use windows_sys::Win32::Foundation::{
+      CloseHandle, GENERIC_READ, GENERIC_WRITE, GetLastError, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+      CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
+    };
+    let Some(name) = std::env::var_os(ROLE_PIPE) else {
+      return;
+    };
+    let wide: Vec<u16> = name
+      .to_string_lossy()
+      .encode_utf16()
+      .chain(std::iter::once(0))
+      .collect();
+    // SAFETY: a NUL-terminated name; a handle made is closed below.
+    let handle = unsafe {
+      CreateFileW(
+        wide.as_ptr(),
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        std::ptr::null(),
+        OPEN_EXISTING,
+        FILE_FLAG_OVERLAPPED,
+        std::ptr::null_mut(),
+      )
+    };
+    let code = if handle == INVALID_HANDLE_VALUE {
+      // SAFETY: reads this thread's last error.
+      unsafe { GetLastError() }
+    } else {
+      // SAFETY: the handle just opened, closed once.
+      unsafe { CloseHandle(handle) };
+      0
+    };
+    println!("{OPENED_TAG} {code}");
+  }
+
+  /// A-179, by use. Do: attach a volume in the Shards form and take the handle the daemon duplicated into this
+  /// process; read the transport report; then have a second process open the handle's pipe by its name, and speak
+  /// FUSE over the handle after. Expect the report to offer the Shards transport, the handle to name a Shards stream's
+  /// pipe, the second process refused `ERROR_PIPE_BUSY`, and the stream to go on serving its own client.
+  #[cfg(windows)]
+  #[test]
+  fn a_second_process_is_refused_an_attached_streams_pipe_by_name() {
+    let (daemon, mut client) = start("pipe-busy");
+    let id = volume(&mut client, "pipe-busy");
     let report = client.status(id).unwrap();
     let shards_fs = report
       .transports
@@ -526,28 +816,41 @@ mod refused {
       .iter()
       .find(|capability| capability.transport == AttachTransport::ShardsFs)
       .expect("the report names the Shards transport");
-    assert!(!shards_fs.supported);
+    assert!(shards_fs.supported, "{shards_fs:?}");
+    let shards = client.attach_shards(id, Intent::Write, None).unwrap();
+    let name = {
+      use std::os::windows::io::AsHandle;
+      slates_ipc::stream::name_of(shards.stream.as_handle()).unwrap()
+    };
+    assert!(name.starts_with(r"\slates-shards-"), "{name}");
+    let full = format!(r"\\.\pipe{name}");
+    let output = Command::new(std::env::current_exe().unwrap())
+      .args(["--ignored", "--exact", "delivered::opener", "--nocapture"])
+      .env(ROLE_PIPE, &full)
+      .output()
+      .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let code: u32 = stdout
+      .lines()
+      .find_map(|line| {
+        line
+          .split_once(OPENED_TAG)
+          .map(|(_, code)| code.trim().to_owned())
+      })
+      .unwrap_or_else(|| panic!("the opener printed no code: {stdout}"))
+      .parse()
+      .unwrap();
+    assert_eq!(code, ERROR_PIPE_BUSY, "{stdout}");
+    let attachment = shards.attachment.attachment;
+    let mut guest = Guest::over(shards);
     assert_eq!(
-      shards_fs.unsupported_reason,
-      Some(UnsupportedReason::DescriptorRouteNotBuilt)
+      guest.lookup(ROOT, "nothing"),
+      Err(ENOENT),
+      "the stream serves its own client after the refused open"
     );
-    for (intent, subtree) in [
-      (Intent::Write, None),
-      (Intent::Read, None),
-      (Intent::Write, Some("dir")),
-    ] {
-      match client.attach_shards(id, intent, subtree) {
-        Err(ClientError::Refused(Refusal::AttachmentUnsupported { transport, reason })) => {
-          assert_eq!(transport, AttachTransport::ShardsFs);
-          assert_eq!(reason, UnsupportedReason::DescriptorRouteNotBuilt);
-        }
-        other => panic!("{intent:?} {subtree:?}: {other:?}"),
-      }
-    }
-    assert_eq!(
-      client.status(id).unwrap().attachments,
-      0,
-      "a refused attach makes no attachment"
-    );
+    client.detach(attachment).unwrap();
+    drop(guest);
+    drop(client);
+    drop(daemon);
   }
 }

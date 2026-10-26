@@ -485,12 +485,14 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-client --test client --test driver -- --test-threads=1
-      # The Shards form (§4.6, A-161) where no route hands a client a handle yet: an in-process daemon refuses the
-      # attach by kind, `AttachmentUnsupported` with `DescriptorRouteNotBuilt`, the reason its transport report gives.
-      - name: Test the Shards form's typed refusal (native Windows)
+      # The Shards form (§4.6, A-161, A-179) by the handle route: an in-process daemon duplicates the client end of the
+      # attachment's named pipe into the test, which speaks FUSE through it in Shards' framing; hostile frames, a
+      # destroy and a revocation each end the attachment; a second process is refused the pipe `ERROR_PIPE_BUSY`. One
+      # test at a time, as the client binary's other daemon-per-test suites run here.
+      - name: Test the Shards form over the handle route (native Windows)
         if: ${{ !cancelled() }}
         timeout-minutes: 15
-        run: cargo test -p slates-client --test shards
+        run: cargo test -p slates-client --test shards -- --test-threads=1
       # The WinFsp mount through the command (§4.6 "Windows"; G-mount step 2): a real anchor and daemon, `slates
       # mount VOLUME S:` served on the volume's owner shard through the real kernel FSD, Windows programs creating,
       # writing, reading, listing and deleting through the drive, `slates unmount`; then a change made through the SDK
@@ -802,10 +804,10 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-client --test client --test driver -- --test-threads=1
-      - name: Test the Shards form's typed refusal (Windows, every push to main)
+      - name: Test the Shards form over the handle route (Windows, every push to main)
         if: ${{ !cancelled() }}
         timeout-minutes: 15
-        run: cargo test -p slates-client --test shards
+        run: cargo test -p slates-client --test shards -- --test-threads=1
       - name: Test the WinFsp mount through the CLI (Windows, every push to main)
         if: ${{ !cancelled() }}
         timeout-minutes: 20

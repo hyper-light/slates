@@ -298,7 +298,14 @@ slates-vfs = 0
 slates-land = 4
 slates-anchor = 6
 slates-db = 0
-slates-ipc = 79
+slates-ipc = 94
+# 2026-10-26 (+15, §4.6 A-179, the Shards stream on Windows, `stream_pipe.rs` compiled only for Windows): Win32 has no
+#   safe wrapper for a named pipe. The pair: the name's 128 bits from `BCryptGenRandom` (1); the owner-only descriptor
+#   parsed and freed (2); the server end made and owned (`CreateNamedPipeW`, `from_raw_handle`, 2) and the client end
+#   opened and owned (`CreateFileW`, `from_raw_handle`, 2); the connection confirmed (`ConnectNamedPipe`, 1), and a
+#   wait that pended cancelled and awaited (1); the pipe's name read from a handle (`GetFileInformationByHandleEx`, 1);
+#   a waited read or write on the handed end: its event made and owned (2), the operation started (1) and awaited
+#   (`GetOverlappedResult`, 1); the last error (1). `OVERLAPPED::default` stands for two zeroed records.
 # 2026-10-26 (+9, §4.7 A-178, the macOS owner's token, `owner_name.rs` compiled only for macOS): the bootstrap and
 #   Mach port calls libSystem has without a safe wrapper (`<servers/bootstrap.h>`, `<mach/mach_port.h>`). Their
 #   declarations (1); the process's own bootstrap port read (1) and each step up the chain (`bootstrap_parent`, 1);

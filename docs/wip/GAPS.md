@@ -11862,6 +11862,20 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     from memory of `fs/fuse/dax.c`, a Linux guest's DAX read returns the error instead. Shards' device answers the
     mapping itself, so a stream never meets this; a vhost-user guest without a window would.
 
+- **Windows built (G-shards-windows step 1, A-179, 2026-10-26):** the form is served on Windows over a duplex named
+  pipe connected to itself (a fresh 128-bit name, one instance, remote clients refused, an owner-only descriptor), its
+  server end on the shard's IOCP driver (`slates_rt::pipe`, 95483cea), its client end duplicated into the client's
+  process by the handle route (`ReplyBody::ShardsHanded`). The refusal by kind (`DescriptorRouteNotBuilt`, step 4) is
+  gone. On jupiter `crates/client/tests/shards.rs` passes 7 of 7 in each of 3 runs: the FUSE history on either shard,
+  scoped streams, hostile frames, a detach, a destroy and a revocation each ending the stream and its record, and a
+  second process refused the pipe `ERROR_PIPE_BUSY`. The CI steps that ran the refusal now run these. **Owed:** Windows'
+  DAX window (a descriptor ask is refused `ENOSYS` there; step 5), `slates shards` on Windows (step 2), and Shards'
+  device on Windows (step 3).
+- **Fixed on the way: a destroyed volume's stream was ended again on each teardown pass**
+  (`docs/bugs/2026-10-26-a-destroyed-volumes-stream-was-ended-again-each-teardown-pass.md`): a second shutdown is
+  refused on macOS and was counted `shards.end_refused`, so a real failed end could not be told from it. Found by the
+  new destroy test, which asserts none; a stream is now ended once.
+
 ### 2026-10-24: a renewal test reads the client's wall clock as the lease's — open
 
 CI run 40095492759 (commit `3acca40a`, the Linux test lane) failed `a_landing_longer_than_its_lease_term_renews_it_

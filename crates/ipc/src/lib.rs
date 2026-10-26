@@ -57,7 +57,12 @@ pub mod route;
 
 pub mod slot;
 pub mod status;
+// The stream a Shards guest's transport rides (§4.6, A-161): an anonymous socket pair on Unix, a duplex named pipe
+// connected to itself on Windows (A-179). Paired modules under one name, so a caller names `stream` on every platform.
 #[cfg(unix)]
+pub mod stream;
+#[cfg(windows)]
+#[path = "stream_pipe.rs"]
 pub mod stream;
 pub mod wake;
 

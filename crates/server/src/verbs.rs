@@ -6229,9 +6229,8 @@ fn vhost_user_attach(
   })
 }
 
-/// The attach verb's Shards form (A-161): served on Unix by `crate::shards`, which refuses it where the platform has no
-/// route to hand the client a descriptor.
-#[cfg(unix)]
+/// The attach verb's Shards form (A-161): served by `crate::shards` on every platform, which refuses it where the
+/// platform has no route to hand the client its end (A-179 built Windows' handle route).
 fn shards_attach(
   state: &mut ShardState,
   principal: &Principal,
@@ -6242,55 +6241,22 @@ fn shards_attach(
   crate::shards::attach_verb(state, principal, volume, snapshot, ask)
 }
 
-/// The attach verb's Shards form has no stream to serve here (no Unix descriptor readiness): refused before any effect.
-#[cfg(not(unix))]
-fn shards_attach(
-  _state: &mut ShardState,
-  _principal: &Principal,
-  _volume: VolumeId,
-  _snapshot: Option<SnapshotId>,
-  _ask: (Intent, Option<String>),
-) -> ReplyBody {
-  refused(Refusal::AttachmentUnsupported {
-    transport: slates_ipc::protocol::AttachTransport::ShardsFs,
-    reason: slates_ipc::protocol::UnsupportedReason::DescriptorRouteNotBuilt,
-  })
-}
-
 /// What a verb run on its volume's owner shard carries back to its client's shard besides its reply: the Shards stream
-/// end owed for it, if it made one (A-161). Nothing on a platform with no stream.
-#[cfg(unix)]
+/// end owed for it, if it made one (A-161; Windows too since A-179).
 type Carried = Option<crate::shards::Handoff>;
-/// See the Unix arm: no stream, so nothing is carried. A unit struct rather than `()`, so the one code path that carries
-/// it home binds and passes it on every platform without passing a unit value.
-#[cfg(not(unix))]
-#[derive(Clone, Copy, Debug)]
-struct Carried;
 
 /// Takes what request `request`'s verb, just run here, owes its client besides its reply.
-#[cfg(unix)]
 fn take_carried(state: &mut ShardState, request: u64) -> Carried {
   state.stream_handoffs.remove(&request)
 }
 
-/// See the Unix arm.
-#[cfg(not(unix))]
-fn take_carried(_state: &mut ShardState, _request: u64) -> Carried {
-  Carried
-}
-
 /// Keeps on the client's shard what request `request`'s verb carried back, for `send_reply` to hand over with the
 /// reply.
-#[cfg(unix)]
 fn keep_carried(state: &mut ShardState, request: u64, carried: Carried) {
   if let Some(handoff) = carried {
     state.stream_handoffs.insert(request, handoff);
   }
 }
-
-/// See the Unix arm.
-#[cfg(not(unix))]
-fn keep_carried(_state: &mut ShardState, _request: u64, _carried: Carried) {}
 
 /// Commits an attachment record. A host mount of a snapshot opens its read-only view first (AUD-29-76), so a
 /// refusal changes nothing, and closes it again if the record does not commit.
@@ -6327,9 +6293,8 @@ fn commit_attachment(
 }
 
 /// The bridge a transport's requests are served through: held to `scope` when the attachment presents one directory
-/// (AUD-29-76), else the volume's whole bridge. `scoped` is the caller's slot the scoped bridge lives in. Unix only: its
-/// callers are the FUSE mount and the Shards stream.
-#[cfg(unix)]
+/// (AUD-29-76), else the volume's whole bridge. `scoped` is the caller's slot the scoped bridge lives in. Its callers
+/// are the FUSE mount and the Shards stream (on every platform since A-179).
 pub(crate) fn scoped_or_whole<'a>(
   bridge: &'a mut slates_bridge_core::VolumeBridge<'_>,
   scoped: &'a mut Option<slates_bridge_core::scoped::ScopedBridge<'a>>,
@@ -7008,7 +6973,6 @@ pub(crate) fn end_attachment(
   }
   // A Shards stream's record ends its stream: its task wakes on the stream's own end and sweeps what its guest held
   // (`crate::shards`). Every end, not only a detach: nothing beneath the stream is exposed by ending it.
-  #[cfg(unix)]
   crate::shards::end_stream(state, record.id);
   // A FUSE mount of the attachment is unmounted only when its user detached it; the kernel's disconnect then ends
   // its serve task. Any other end leaves the mount in place, its requests refused under the revoked registry
@@ -7230,7 +7194,7 @@ fn destroy(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> R
   let devices_serving = crate::virtiofs::revoke_volume_devices(state, record.id)
     .saturating_add(crate::shards::end_volume_streams(state, record.id));
   #[cfg(not(unix))]
-  let devices_serving = 0;
+  let devices_serving = crate::shards::end_volume_streams(state, record.id);
   if devices_serving == 0
     && let Err(e) = start_teardown(state, handle, record.id)
   {
@@ -7291,7 +7255,6 @@ pub(crate) fn reconcile_unpublished_effects(state: &mut ShardState) -> usize {
   });
   crate::work_charge::release(state, released);
   // A Shards stream whose attachment the rollback removed serves nothing, and its end is handed to no one (A-161).
-  #[cfg(unix)]
   crate::shards::reconcile_unrecorded(state);
   // Nor does a vhost-user device the verb handed out (G-vhost).
   #[cfg(target_os = "linux")]
@@ -7328,9 +7291,10 @@ fn teardown_started(
     return true;
   }
   #[cfg(unix)]
-  if crate::virtiofs::revoke_volume_devices(state, volume) > 0
-    || crate::shards::end_volume_streams(state, volume) > 0
-  {
+  if crate::virtiofs::revoke_volume_devices(state, volume) > 0 {
+    return false;
+  }
+  if crate::shards::end_volume_streams(state, volume) > 0 {
     return false;
   }
   if let Err(e) = start_teardown(state, handle, volume) {
@@ -8644,8 +8608,8 @@ fn send_reply(
   reply: &mut ReplyBody,
 ) -> bool {
   // A stream end owed for this request goes first, over the client's control socket, so the client finds it waiting
-  // when it reads the reply (A-161); it is taken out here whatever becomes of the reply.
-  #[cfg(unix)]
+  // when it reads the reply (A-161); on Windows it is duplicated into the client's process and its value written into
+  // the reply (A-179). It is taken out here whatever becomes of the reply.
   crate::shards::deliver_handoff(state, client_index, request, reply);
   let Some(generation) = state.clients.generation_at(client_index) else {
     return true;
@@ -9987,9 +9951,8 @@ pub(crate) const COUNTERS_TOPPED_UP: &str = "publish.counters_topped_up";
 
 /// Whether an effect a client keeps across a restart waits for volume `volume`'s next publication
 /// (`Volume::awaits_publication`: an unreserved inode number, A-150; a release the committed publication still counts
-/// as an open, A-154): the reply must wait for the barrier (D-18). `false` for a volume this shard does not hold. Unix
-/// only, as the transports that ask it are (the FUSE and NFS replies).
-#[cfg(unix)]
+/// as an open, A-154): the reply must wait for the barrier (D-18). `false` for a volume this shard does not hold. Asked
+/// by the FUSE and NFS replies and by the Shards stream's (on every platform since A-179).
 pub(crate) fn awaits_publication(state: &ShardState, volume: DbVolumeId) -> bool {
   state
     .by_id

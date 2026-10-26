@@ -2027,8 +2027,9 @@ pub enum UnsupportedReason {
   /// A container bind on Linux binds a mount other users' processes can reach; the source is a FUSE mount the
   /// daemon made for its user alone. Mount it with `slates mount --shared`. Appended.
   MountNotShared,
-  /// The form hands the client a descriptor, and this platform's route for one is not built: Linux sends it over
-  /// the client's control socket; the macOS socket route and a Windows handle route are owed (A-161). Appended.
+  /// The form hands the client a descriptor, and this platform's route for one is not built. Every platform slates
+  /// ships has its route now (Linux the control socket, macOS the socket route, Windows the handle route, A-161 and
+  /// A-179), so no daemon answers it; it stays for the wire's append-only order and for an older daemon. Appended.
   DescriptorRouteNotBuilt,
   /// WinFsp's user-mode library (`winfsp-x64.dll`) could not be loaded: WinFsp is not installed on this host. slates
   /// installs nothing (R10); WinFsp's own installer is the one privileged piece (§4.6). Appended.
@@ -3111,6 +3112,21 @@ pub enum ReplyBody {
     /// The object's whole length: the file's page span when it was mapped.
     block_len: u64,
     /// The handle's value in the client's process; zero in the record.
+    handle: u64,
+  },
+  /// A Shards stream was attached and its end handed by handle (§4.6, A-161, A-179; Windows, where no socket carries
+  /// one): the daemon duplicated the client end of the attachment's pipe into the client's process, and `handle` is its
+  /// value there, which the client adopts once. Zero names no handle: the attach is recorded with zero, filled in only
+  /// as the reply goes to the client, so a reply replayed from the record after a restart names none; and a hand-off
+  /// refused leaves it zero, its end closed, so the attachment ends. Appended.
+  ShardsHanded {
+    /// The attachment the daemon serves on the stream.
+    attachment: u64,
+    /// The lease epoch, for a write intent.
+    lease_epoch: Option<u64>,
+    /// The transport's report for this attachment.
+    capability: AttachmentCapability,
+    /// The handle's value in the client's process; zero in the record, or where the hand-off was refused.
     handle: u64,
   },
 }

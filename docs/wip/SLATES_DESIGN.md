@@ -3540,7 +3540,10 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 - an attach with the Shards form (a directory or the whole volume, for reading or for writing within the principal's
   rights, a write taking the lease) makes an anonymous socket pair, records the attachment (`AttachForm::ShardsFs`,
   a guest's) and serves its end on the volume's owner shard; the other end is the attachment's capability, handed to
-  whoever attached;
+  whoever attached. On Windows, which has no socket pair without a socket file, the pair is a duplex named pipe
+  connected to itself under a fresh 128-bit name, one instance, remote clients refused, a descriptor for the owner
+  alone; its server end is served by the shard's IOCP driver and its client end is duplicated into the attaching
+  client's process (A-179);
 - a stream end may go to a VMM where a content object may not (A-135): the daemon answers nothing on it but the one
   attachment;
 - requests are answered by the shared FUSE dispatch, a durable change published before its reply as a virtio-fs
@@ -3567,8 +3570,11 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 > wire: on Linux `attach` with `AttachRequest::ShardsFs` sends the end over the client's control socket just before the
 > reply, from either shard; on macOS the reply carries a single-use secret and the client claims the end on the
 > daemon's socket route, an exchange keyed by HKDF-SHA256 and sealed with AES-256-GCM (`slates_ipc::route`,
-> `crates/server/src/shards_route.rs`). `Client::attach_shards` takes either; Windows refuses the form
-> `DescriptorRouteNotBuilt`. `slates shards ID --fd N -- CMD` replaces itself with a program holding the end at
+> `crates/server/src/shards_route.rs`). On Windows (A-179, 2026-10-26) the reply names the value of the pipe's client
+> end, which the daemon duplicated into the client's process (`ReplyBody::ShardsHanded`); the serve loop is the same
+> code over `crates/server/src/shards/end.rs`, whose Windows arm is a `slates_rt::pipe::PipeEnd`, and a DAX descriptor
+> ask is refused `ENOSYS` there until Windows' window is built (G-shards-windows step 5). `Client::attach_shards` takes
+> every form. `slates shards ID --fd N -- CMD` replaces itself with a program holding the end at
 > descriptor `N`, so the attachment ends when the program's end closes. A real Shards microVM on this Mac mounts, reads and
 > writes a volume the daemon serves this way (part 2: 3 of 3 boots, Shards' patch sent to its owner). DAX (part 3,
 > A-163): built in `slates_mem::DaxObject`, `crates/server/src/shards/dax.rs` and `slates_vfs::shards_backing`, proven
@@ -12391,8 +12397,21 @@ Applied in the same change to: §4.6 ("Windows (own thin WinFsp binding)" and it
 ### A-179 — The Shards route on Windows rides a duplex named pipe, which the runtime serves by completions (accepted 2026-10-26)
 Applied in the same change to: §4.3 (the drivers' status), GAPS, `crates/rt` (`pipe.rs` and `pipe_state.rs`, new;
 `iocp.rs`, its pipe table and completion key; `driver.rs` and `shard.rs`, the pipe calls; `afd.rs`, `dos_error`
-shared; `tests/pipe.rs`, new), `unsafe-budget.toml` (`slates-rt` 73 → 84). This change is the runtime's half. The
-route's half (the daemon's pair, its serve loop, the hand-out, the client, `slates shards`) extends this entry.
+shared; `tests/pipe.rs`, new), `unsafe-budget.toml` (`slates-rt` 73 → 84). This change is the runtime's half.
+The route's half (2026-10-26, G-shards-windows step 1) was applied in the same change to:
+- §4.6 (the Shards form's bullet and status), A-161's report entry, GAPS;
+- `crates/ipc`: `stream_pipe.rs` (new: `slates_ipc::stream` on Windows, the pair, `name_of`, `read_waiting` and
+  `write_waiting`), `lib.rs`, `handle_route.rs` (`hand_stream`, `adopt_stream`; the duplication and the adoption
+  shared with a section's), `protocol.rs` (`ReplyBody::ShardsHanded`, appended; `DescriptorRouteNotBuilt`'s doc);
+- `crates/server`: `shards.rs` (built on every platform; Windows' hand-out; `deliver_handoff` split by platform;
+  `end_stream` ends a stream once; `owner_shard`, moved from `virtiofs.rs`), `shards/end.rs` (new: the daemon's end per
+  platform, one seam), `shards/dax_refused.rs` (new: Windows' DAX arm, every descriptor ask refused `ENOSYS`),
+  `shards/dax.rs` (`Then` and `Done` moved to the parent), `verbs.rs`, `state.rs`, `daemon.rs`, `lib.rs`,
+  `transports.rs` (Windows offers the form), `Cargo.toml` (the FUSE codec on every platform);
+- `crates/client`: `client.rs` (`StreamEnd` on Windows, the `ShardsHanded` arm), `tests/shards.rs` (run on Windows;
+  hostile frames, a destroy, a revocation, a second process refused the pipe);
+- the workspace `Cargo.toml` (`Win32_Security_Cryptography`), `unsafe-budget.toml` (`slates-ipc` 79 → 94), `ci.yml`,
+  and `docs/bugs/2026-10-26-a-destroyed-volumes-stream-was-ended-again-each-teardown-pass.md`.
 - **Why a pipe.** The Shards form hands a microVM's virtio-fs device a stream with nothing on disk (A-161, R1).
   Windows has no `socketpair`. An AF_UNIX socket at an abstract address binds and listens, but its connect is refused
   `WSAEINVAL`, so the only AF_UNIX pair is one made through a socket file. A duplex named pipe under a fresh name needs
@@ -12423,6 +12442,34 @@ route's half (the daemon's pair, its serve loop, the hand-out, the client, `slat
     a write refused as `ERROR_BROKEN_PIPE`); 64 KiB taken a byte at a time; an end dropped with a read in the kernel
     and a new end after it; a disconnect waking its reader.
   - `slates-rt` is clean under clippy `-D warnings` on macOS and on Windows.
+- **The route.** The daemon makes the pair (`slates_ipc::stream::pair` on Windows): a duplex named pipe under
+  `\\.\pipe\slates-shards-` and 32 hex digits from `BCryptGenRandom`, with `FILE_FLAG_FIRST_PIPE_INSTANCE`, one
+  instance, `PIPE_REJECT_REMOTE_CLIENTS` and the descriptor `D:P(A;;GA;;;OW)`, connected at once by the daemon's own
+  open of the client end, which asks `SECURITY_ANONYMOUS` so the server end cannot impersonate its holder. Both ends
+  are overlapped and neither is inheritable. The pipe buffers one largest frame each way, so a frame's write completes
+  without its reader: with the system's default of zero every write waited for its reader, and this module's own
+  round-trip test hung on jupiter. The server end becomes a `PipeEnd` on the volume's owner shard, and the serve loop of
+  `crates/server/src/shards.rs` runs unchanged over `shards/end.rs`, the one seam whose arms read, write and end a
+  socket or a pipe. The client end is kept under the attach's request word as Linux keeps its socket end. As the reply
+  goes to the client, `deliver_handoff` duplicates the end into the client's process (`handle_route::hand_stream`,
+  which judges the process to run as the daemon's user) and writes the value into `ReplyBody::ShardsHanded`. The record
+  keeps zero, so a reply replayed after a restart names no handle. The client adopts it (`adopt_stream`). No
+  descriptor rides a pipe, so a DAX descriptor ask is refused `ENOSYS`, and no file is offered for DAX, until step 5
+  builds Windows' window.
+- **Proven (route), 2026-10-26:**
+  - On jupiter: `slates-ipc`'s stream tests (a round trip each way; a second client refused `ERROR_PIPE_BUSY` and a
+    second server refused; a dropped end read as the end, every byte before it delivered; a fresh name per pair);
+    `crates/client/tests/shards.rs` 7 of 7 in each of 3 runs, over the handle the daemon duplicated in:
+    - the FUSE history on two volumes, one served on the client's own shard and one on the other (`INIT`, `CREATE`,
+      `WRITE`, `LOOKUP`, `OPEN`, `READ`, `FLUSH`, `RELEASE`, `RENAME`, `UNLINK`, each checked through slates' own
+      verbs);
+    - two scoped streams, each reaching only its own directory;
+    - hostile frames (a length of `u32::MAX`, one past the largest frame, a frame cut in its length word and one cut
+      in its body by the peer's close), each counted by its kind, with the volume's attachments back to zero;
+    - a detach, a destroy and a revocation each ending the stream and its record;
+    - a second process refused the attachment's pipe by name, `ERROR_PIPE_BUSY`, and the stream serving on after.
+  - Unchanged on Unix: the same client tests pass on macOS (its 6) and on Linux x86_64 (adacachy, its 7), and the server's Shards suite passes on macOS (26) and Linux (21, one ignored). `slates-ipc`,
+    `slates-server` and `slates-client` are clean under clippy `-D warnings` on all three.
 
 ### A-178 — macOS refuses a second owner of a live instance's rendezvous: the owner's token is a Mach bootstrap name (accepted 2026-10-26)
 Applied in the same change to: §4.7 (the rendezvous's status), A-176 (its macOS sentences), GAPS, `crates/ipc` (`owner_name.rs`, new; `rendezvous.rs`: the macOS `Owner`, `owner_token_name` and `take_ownership`; `lib.rs`; `tests/rendezvous.rs`: the second-owner test now also macOS's, and a cross-process one on every platform), `unsafe-budget.toml` (`slates-ipc` 70 → 79), `CLAUDE.md`, and a bug record (`docs/bugs/2026-10-26-a-second-owner-took-a-live-macos-instances-rendezvous-over.md`).

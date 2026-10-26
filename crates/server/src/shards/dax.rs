@@ -33,6 +33,9 @@
 //! - `shards.dax_witness`, the bridge's errno: a writable ask's file could not be copied up;
 //! - `shards.dax_busy`, `EBUSY`: an in-process guest maps the file writable.
 //!
+//! The descriptor an answer carries is a Unix descriptor ([`Descriptor`]); Windows' arm (`dax_refused.rs`) has the same
+//! surface and refuses every ask until its own window is built (A-179).
+//!
 //! An answered ask counts `shards.dax_answered`; an ingest's written runs `shards.dax_ingested`, and one the bridge
 //! refused `shards.dax_ingest_refused`. A refilled backing counts `shards.dax_refilled`; a range the volume refused to
 //! read for it `shards.dax_refill_refused` (the object keeps its bytes); a stale range asked writable, which is never
@@ -47,7 +50,7 @@ use slates_bridge_fuse::shards_fs::{descriptor_answer, descriptor_ask, descripto
 use slates_vfs::error::VfsError;
 use slates_vfs::host::HostFs;
 
-use super::{ShardsStream, owe};
+use super::{Done, ShardsStream, Then, owe};
 use crate::state::ShardState;
 
 /// Format: the refusal-ledger name of an answered descriptor ask.
@@ -84,28 +87,11 @@ const REFILL_REFUSED: &str = "shards.dax_refill_refused";
 /// rather than lose the guest's stores: never expected, since a file is copied up before any writable ask of it.
 const REFILL_WRITABLE: &str = "shards.dax_refill_writable";
 
-/// What an ingest was for, on a stream.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Then {
-  /// The held request of `total` bytes at the head of the stream is served next.
-  Serve {
-    /// The request's bytes, its length word included.
-    total: usize,
-  },
-  /// The stream ends next.
-  End,
-}
+/// The descriptor an answer carries by `SCM_RIGHTS`: one file's DAX object.
+pub(crate) type Descriptor = std::os::fd::OwnedFd;
 
-/// A stream's finished ingest.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Done {
-  /// What asked for it.
-  pub(super) then: Then,
-  /// Whether anything was written: the change is then published before what asked for it goes on.
-  pub(super) wrote: bool,
-  /// The errno of the first write-back the bridge refused, which the request that asked for it answers.
-  pub(super) refused: Option<i32>,
-}
+/// A stream's DAX session: the shared backed session (`slates_bridge_core::dax_backing`).
+pub(crate) type Session = DaxBackingSession;
 
 /// The counter `refused` is recorded under.
 fn refused_counter(refused: &Refused) -> &'static str {

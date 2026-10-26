@@ -1,5 +1,5 @@
 //! The daemon's handle route on Windows (§4.6, A-175): how a same-kernel client receives the read-only handle of a
-//! direct map's copy. Windows carries no descriptor over a socket. A handle reaches another process when its holder
+//! direct map's copy, and the client end of a Shards stream's pipe (A-179, [`hand_stream`]). Windows carries no descriptor over a socket. A handle reaches another process when its holder
 //! duplicates it into that process's handle table (`DuplicateHandle`, with the target's process handle opened for
 //! `PROCESS_DUP_HANDLE`), and only its value travels, in the reply on the client's ring (`DuplicateHandle`: "the source
 //! process must use interprocess communication to pass the value of the duplicate handle to the target process").
@@ -71,6 +71,23 @@ pub fn hand_section(
   pid: u32,
 ) -> Result<u64, IpcError> {
   confined_section(read_only, authorized)?;
+  duplicate_into(read_only, pid)
+}
+
+/// Duplicates `stream`, the client end of a Shards stream's pipe (`crate::stream::pair`, A-179), into the process `pid`
+/// and returns the duplicate's value there, once [`same_user`] has judged the process to run as this one's user.
+/// Refused `PeerRefused`, or `OsRefused` naming the step the OS refused.
+///
+/// The end needs none of a section's judging: a holder of it reaches the one conversation the daemon serves on its
+/// pipe and nothing else, since the pipe allows one instance and it is connected, so no duplicate of it, whatever its
+/// access, opens anything more (the Unix arm hands its socket end unjudged for the same reason, `crate::stream`).
+pub fn hand_stream(stream: BorrowedHandle<'_>, pid: u32) -> Result<u64, IpcError> {
+  duplicate_into(stream, pid)
+}
+
+/// Duplicates `handle` into the process `pid`, with the access it has, once [`same_user`] has judged the process: the
+/// duplicate's value there, which only travels in a reply.
+fn duplicate_into(handle: BorrowedHandle<'_>, pid: u32) -> Result<u64, IpcError> {
   let process = open_process(pid, PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION)?;
   same_user(process.as_handle())?;
   let mut value: HANDLE = std::ptr::null_mut();
@@ -79,7 +96,7 @@ pub fn hand_section(
   let done = unsafe {
     DuplicateHandle(
       GetCurrentProcess(),
-      read_only.as_raw_handle(),
+      handle.as_raw_handle(),
       process.as_raw_handle(),
       &mut value,
       0,
@@ -121,15 +138,31 @@ pub fn close_handed(pid: u32, value: u64) -> Result<(), IpcError> {
 /// Refused `Layout` for zero (a reply recorded without its value, replayed after a restart) and `OsRefused` for a value
 /// that names no live handle here.
 pub fn adopt_section(value: u64) -> Result<OwnedHandle, IpcError> {
+  adopt(
+    value,
+    "a map reply that names no handle (recorded before a restart)",
+  )
+}
+
+/// The handle `value` a daemon duplicated into this process for a Shards attach's reply (A-179): the client end of
+/// the attachment's stream, taken as this process's own. Refused as [`adopt_section`] refuses.
+pub fn adopt_stream(value: u64) -> Result<OwnedHandle, IpcError> {
+  adopt(
+    value,
+    "a Shards attach reply that names no handle (its hand-off refused, or recorded before a restart)",
+  )
+}
+
+/// The handle `value` a daemon duplicated into this process, taken as this process's own once it is checked live
+/// here; zero is refused `Layout` with `none`, the reason the reply named no handle.
+fn adopt(value: u64, none: &'static str) -> Result<OwnedHandle, IpcError> {
   if value == 0 {
-    return Err(IpcError::Layout {
-      reason: "a map reply that names no handle (recorded before a restart)",
-    });
+    return Err(IpcError::Layout { reason: none });
   }
   let raw: HANDLE =
     std::ptr::with_exposed_provenance_mut(usize::try_from(value).map_err(|_| {
       IpcError::Layout {
-        reason: "a map reply's handle wider than an address",
+        reason: "a reply's handle wider than an address",
       }
     })?);
   let mut flags = 0u32;

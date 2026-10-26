@@ -513,7 +513,8 @@ fn guest_entries(situation: &Situation) -> Vec<AttachmentCapability> {
 /// The Shards fs stream (§4.6, the Shards route; A-161): the daemon serves an attachment on one end of an anonymous
 /// socket pair and hands the attaching client the other, for a Shards VMM. Offered where the daemon can hand a client
 /// a descriptor: Linux, over the client's control socket (`crate::shards`), and macOS, on the socket route when its
-/// listener bound (`crate::shards_route`); a Windows handle route is owed. The guest's kernel negotiates no write-back
+/// listener bound (`crate::shards_route`); and Windows, by the handle route (A-179: the pipe's client end duplicated
+/// into the client's process). The guest's kernel negotiates no write-back
 /// cache and has no invalidation path, so it revalidates, and its pages are its own; DAX is not offered (a descriptor
 /// ask is refused). The evidence is a test playing Shards' device against a real daemon, not yet a Shards microVM.
 pub(crate) fn shards_fs(situation: &Situation) -> AttachmentCapability {
@@ -531,7 +532,8 @@ pub(crate) fn shards_fs(situation: &Situation) -> AttachmentCapability {
     Platform::Linux => None,
     Platform::MacOs if situation.stream_route_bound => None,
     Platform::MacOs => Some(UnsupportedReason::ListenerNotBound),
-    Platform::Windows => Some(UnsupportedReason::DescriptorRouteNotBuilt),
+    // The handle route (A-175) hands the client end of the attachment's pipe (A-179).
+    Platform::Windows => None,
     Platform::Other => Some(UnsupportedReason::HostPlatform),
   };
   let Some(reason) = reason else {
@@ -885,14 +887,16 @@ mod tests {
 
   /// The Shards stream (A-161) is offered where the daemon hands a client a descriptor, as a tag-like target with the
   /// guest's own page cache, no DAX and the simulated device as its evidence: on Linux always, on macOS when the
-  /// socket route bound (refused `ListenerNotBound` when it did not); Windows names the owed descriptor route, and any
-  /// other platform has none.
+  /// socket route bound (refused `ListenerNotBound` when it did not); on Windows always, by the handle route (A-179);
+  /// and any other platform has none.
   #[test]
   fn the_shards_stream_is_offered_where_a_descriptor_reaches_the_client() {
     for (platform, bound) in [
       (Platform::Linux, false),
       (Platform::Linux, true),
       (Platform::MacOs, true),
+      (Platform::Windows, false),
+      (Platform::Windows, true),
     ] {
       let offered = entry(&on(platform, bound), AttachTransport::ShardsFs);
       assert!(offered.supported, "{platform:?}");
@@ -905,11 +909,6 @@ mod tests {
     }
     for (platform, bound, reason) in [
       (Platform::MacOs, false, UnsupportedReason::ListenerNotBound),
-      (
-        Platform::Windows,
-        true,
-        UnsupportedReason::DescriptorRouteNotBuilt,
-      ),
       (Platform::Other, true, UnsupportedReason::HostPlatform),
     ] {
       let refused = entry(&on(platform, bound), AttachTransport::ShardsFs);

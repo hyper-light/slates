@@ -3228,9 +3228,7 @@ fn init_shard(
     snapshot_views: std::collections::BTreeMap::new(),
     #[cfg(unix)]
     guest_devices: Vec::new(),
-    #[cfg(unix)]
     shards_streams: std::collections::BTreeMap::new(),
-    #[cfg(unix)]
     stream_handoffs: std::collections::BTreeMap::new(),
     #[cfg(target_os = "macos")]
     stream_offers: std::collections::BTreeMap::new(),
@@ -4117,10 +4115,8 @@ impl Drop for EndWinFspMounts {
 /// FUSE mounts and for the same reason: on the shard's own thread with its state installed, not by a question queued
 /// behind its work. Each attachment's references are swept and its record removed; a fenced shard only closes the
 /// streams, and their records end at the next start's recovery.
-#[cfg(unix)]
 struct EndStreams;
 
-#[cfg(unix)]
 impl Drop for EndStreams {
   fn drop(&mut self) {
     if state::with_state(crate::shards::end_all).is_none() {
@@ -4139,7 +4135,6 @@ async fn serve_loop() {
   let _end_mounts = EndMounts;
   #[cfg(windows)]
   let _end_winfsp_mounts = EndWinFspMounts;
-  #[cfg(unix)]
   let _end_streams = EndStreams;
   if let Some(task) = futures::current_task() {
     let _ =

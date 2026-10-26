@@ -444,12 +444,11 @@ pub struct ShardState {
   )>,
   /// The Shards fs streams this shard serves, by attachment (§4.6, the Shards route; A-161; `crate::shards`). Bounded
   /// by the shard's client seats (`clients_per_shard`): an attach past them is refused `Overloaded`.
-  #[cfg(unix)]
   pub(crate) shards_streams: crate::shards::ShardsStreams,
   /// The Shards stream ends owed to this shard's clients, by the request word of the attach that made each (A-161;
-  /// `crate::shards::Handoff`): sent over the client's control socket just before the attach's reply. Bounded by the
+  /// `crate::shards::Handoff`): sent over the client's control socket just before the attach's reply (Linux), or
+  /// duplicated into the client's process as it goes (Windows, A-179). Bounded by the
   /// requests the shard's clients may have in flight: an attach past it is refused `Overloaded`.
-  #[cfg(unix)]
   pub(crate) stream_handoffs: crate::shards::Handoffs,
   /// The Shards stream ends offered on the socket route, by attachment (A-161, macOS; `crate::shards_route`): each
   /// claimable once with its secret until it expires. Bounded with the handoffs.

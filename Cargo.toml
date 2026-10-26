@@ -73,6 +73,9 @@ windows-sys = { version = "0.60", features = [
   "Win32_System_Console",
   "Win32_Networking_WinSock",
   "Win32_Security_Authorization",
+  # The fresh name of a Shards stream's pipe (`slates-ipc`'s `stream` on Windows, A-179): `BCryptGenRandom` with the
+  # system's preferred generator, the OS's random source.
+  "Win32_Security_Cryptography",
   # The anonymous pipe of the consumer-capability delivery (`slates-ipc`'s `delivery`, §4.13):
   # `CreatePipe` and `PeekNamedPipe`.
   "Win32_System_Pipes",

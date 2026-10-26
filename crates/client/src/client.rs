@@ -158,12 +158,12 @@ pub struct VhostUserDevice {
 #[cfg(unix)]
 pub type StreamEnd = std::os::fd::OwnedFd;
 
-/// A Shards stream's end on Windows: there is none. No route hands a client a handle yet (A-161 owes it), and the daemon
-/// refuses the Shards form there by kind (`UnsupportedReason::DescriptorRouteNotBuilt`), so this type has no values and
-/// `attach_shards` can only answer that refusal.
-#[cfg(not(unix))]
-#[derive(Debug)]
-pub enum StreamEnd {}
+/// A Shards stream's end on Windows (A-179): the client end of the attachment's named pipe, which the daemon duplicated
+/// into this process. It is opened for overlapped I/O, so every read and write passes an `OVERLAPPED`
+/// (`slates_ipc::stream::read_waiting` and `write_waiting` wait on one); hand it to a VMM by duplicating it into the VMM's
+/// process.
+#[cfg(windows)]
+pub type StreamEnd = std::os::windows::io::OwnedHandle;
 
 /// What `create` takes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -313,6 +313,23 @@ pub struct Client {
   /// The reconnect claim in flight (AUD-29-19): made by one [`Client::try_reconnect`], its answer read by
   /// the next, so no attempt waits on the daemon.
   reconnecting: Option<Claim>,
+}
+
+/// The stream end a Windows daemon duplicated into this process for a Shards attach (A-179): the reply's handle,
+/// adopted once as this process's own. Refused `Ipc(Layout)` for zero, which names no handle (the hand-off refused, or
+/// the reply replayed from its record after a restart), and `Ipc(OsRefused)` for a value naming no live handle here.
+#[cfg(windows)]
+fn adopt_handed_stream(handle: u64) -> Result<StreamEnd, ClientError> {
+  slates_ipc::handle_route::adopt_stream(handle).map_err(ClientError::Ipc)
+}
+
+/// No Unix daemon hands a stream by handle (Linux sends it on the control socket, macOS offers it on its route), so a
+/// `ShardsHanded` reply is not one of its answers.
+#[cfg(unix)]
+fn adopt_handed_stream(_handle: u64) -> Result<StreamEnd, ClientError> {
+  Err(ClientError::UnexpectedReply {
+    verb: "attach_shards",
+  })
 }
 
 fn ack_every_of(end: &ClientEnd) -> u32 {
@@ -1134,8 +1151,8 @@ impl Client {
   /// The attachment ends when the stream's other end closes (or a `detach`, a revocation, the volume's destroy). Linux
   /// receives the end over the control socket, sent before the reply; macOS claims it on the daemon's socket route
   /// with the secret the reply carries (`slates_ipc::route`), each socket step bounded by the reply deadline. Windows
-  /// has no route yet: its daemon refuses the form, `Refusal::AttachmentUnsupported` with
-  /// `UnsupportedReason::DescriptorRouteNotBuilt`.
+  /// adopts the handle the daemon duplicated into this process, whose value the reply names (A-179); a reply naming
+  /// none (its hand-off refused, or replayed from the record after a restart) is refused `Ipc(Layout)`.
   pub fn attach_shards(
     &mut self,
     volume: VolumeId,
@@ -1169,6 +1186,23 @@ impl Client {
           established,
           capability,
           token,
+        },
+      }),
+      ReplyBody::ShardsHanded {
+        attachment,
+        lease_epoch,
+        capability,
+        handle,
+      } => Ok(ShardsStream {
+        stream: adopt_handed_stream(handle)?,
+        attachment: Attachment {
+          attachment,
+          lease_epoch,
+          path: None,
+          version: None,
+          established: Established::Record,
+          capability,
+          token: None,
         },
       }),
       ReplyBody::ShardsOffered {
@@ -1261,8 +1295,8 @@ impl Client {
     }
   }
 
-  /// No control socket carries a handle here: a Windows daemon refuses the Shards form, so `Attached` is not one of its
-  /// answers to it.
+  /// No control socket carries a handle here: a Windows daemon answers the Shards form `ShardsHanded`, naming the handle
+  /// in the reply, so `Attached` is not one of its answers to it.
   #[cfg(not(unix))]
   fn delivered_stream(&self, _attachment: u64) -> Result<StreamEnd, ClientError> {
     Err(ClientError::UnexpectedReply {
@@ -1284,7 +1318,7 @@ impl Client {
   }
 
   /// No socket route here: a Linux daemon answers the Shards form with the end on the control socket and a Windows
-  /// daemon refuses it, so an offer is not one of their replies.
+  /// daemon with a handle duplicated into this process, so an offer is not one of their replies.
   #[cfg(not(target_os = "macos"))]
   fn claim_offer(&self, _attachment: u64, _secret: &[u8; 32]) -> Result<StreamEnd, ClientError> {
     Err(ClientError::UnexpectedReply {

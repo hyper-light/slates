@@ -42,7 +42,10 @@
 //! never outlives its record. Nothing survives a restart: recovery removes the record, as it removes every guest's.
 
 use std::collections::BTreeMap;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+#[cfg(unix)]
+use std::os::fd::AsFd;
+#[cfg(windows)]
+use std::os::windows::io::AsHandle;
 
 use slates_bridge_core::volume_bridge::new_handle_store;
 use slates_bridge_core::{AttachmentId, Rights, View, VolumeBridge};
@@ -70,7 +73,43 @@ use crate::daemon::Daemon;
 use crate::error::ServerError;
 use crate::state::{self, ShardState};
 
+// The DAX half (Shards part 3): Unix answers a descriptor ask with a file's DAX object; Windows' arm, with the same
+// surface, refuses every ask until its own window is built (A-179; plan G-shards-windows step 5).
+#[cfg(unix)]
 mod dax;
+#[cfg(windows)]
+#[path = "shards/dax_refused.rs"]
+mod dax;
+// The daemon's end of the stream as each platform serves it: one seam, paired arms.
+mod end;
+
+pub use end::HandedEnd;
+use end::{DaemonEnd, Received, Sent};
+
+/// What an ingest was for, on a stream.
+// Built by the Unix DAX arm's ingest; Windows' arm backs nothing yet, so it never ingests (A-179, step 5 owes it).
+#[cfg_attr(windows, allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Then {
+  /// The held request of `total` bytes at the head of the stream is served next.
+  Serve {
+    /// The request's bytes, its length word included.
+    total: usize,
+  },
+  /// The stream ends next.
+  End,
+}
+
+/// A stream's finished ingest.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Done {
+  /// What asked for it.
+  pub(super) then: Then,
+  /// Whether anything was written: the change is then published before what asked for it goes on.
+  pub(super) wrote: bool,
+  /// The errno of the first write-back the bridge refused, which the request that asked for it answers.
+  pub(super) refused: Option<i32>,
+}
 
 /// Format: the refusal-ledger name of an ending stream's ingested writes that the publication after them did not
 /// capture: they reach the volume, and are made durable by the next publication.
@@ -120,8 +159,8 @@ const UNKNOWN_ASK: &str = "a control ask slates does not know";
 /// One attachment served over a stream: its end of the pair, the open-handle map kept across requests, the registry
 /// attachment its requests are admitted under, what it presents, and the frames in and out.
 pub(crate) struct ShardsStream {
-  /// The daemon's end of the pair, non-blocking.
-  stream: OwnedFd,
+  /// The daemon's end of the pair: a non-blocking socket (Unix), or a pipe end its shard's driver serves (Windows).
+  stream: DaemonEnd,
   /// The attachment's open file handles, kept across requests as FUSE keeps them.
   handles: Slab<u64>,
   /// The registry attachment its requests are admitted under.
@@ -147,9 +186,10 @@ pub(crate) struct ShardsStream {
   ending: bool,
   /// The backed DAX session of the files this attachment's guest maps (Shards part 3, [`dax`]): their backings, and the
   /// fill, ingest and refill under way, each a slice a turn.
-  dax: slates_bridge_core::dax_backing::DaxBackingSession,
-  /// The descriptor the owed reply carries by `SCM_RIGHTS` on its first byte: sent with it, then closed.
-  owed_descriptor: Option<OwnedFd>,
+  dax: dax::Session,
+  /// The descriptor the owed reply carries by `SCM_RIGHTS` on its first byte: sent with it, then closed (Unix; none
+  /// exists on Windows).
+  owed_descriptor: Option<dax::Descriptor>,
   /// Whether the ingest a stream takes before it ends has been started: once, whatever ends it.
   ingested_at_end: bool,
 }
@@ -176,7 +216,7 @@ pub(crate) struct Handoff {
   /// The attachment the daemon serves on the stream's other end.
   pub(crate) attachment: u64,
   /// The end to hand the client.
-  pub(crate) stream: OwnedFd,
+  pub(crate) stream: HandedEnd,
 }
 
 /// The shard's stream ends owed to clients, by the request word of the attach that made each. Bounded by the
@@ -200,7 +240,7 @@ pub struct ShardsAttached {
   /// The write lease's epoch, for a write intent.
   pub lease_epoch: Option<u64>,
   /// The other end of the stream the daemon serves the attachment on, for the VMM.
-  pub stream: OwnedFd,
+  pub stream: HandedEnd,
 }
 
 /// The caller's callback for an attach with the Shards form: the attachment and its stream end, or the typed refusal.
@@ -254,8 +294,7 @@ pub(crate) fn attach(s: &mut ShardState, ask: ShardsAsk) -> Result<ShardsAttache
   if s.shards_streams.len() >= s.config.clients_per_shard {
     return Err(Refusal::Overloaded { shard: s.shard });
   }
-  let (daemon_end, handed) =
-    slates_ipc::stream::pair().map_err(|_| Refusal::Overloaded { shard: s.shard })?;
+  let (daemon_end, handed) = end::pair().map_err(|_| Refusal::Overloaded { shard: s.shard })?;
   let now = s.clock.monotonic_ns();
   let lease_epoch = crate::verbs::lease_for(s, &record, &principal, intent, now)?;
   let granted = crate::verbs::granted_rights(rights, intent);
@@ -310,7 +349,7 @@ pub(crate) fn attach(s: &mut ShardState, ask: ShardsAsk) -> Result<ShardsAttache
       owed: 0,
       sent: 0,
       ending: false,
-      dax: slates_bridge_core::dax_backing::DaxBackingSession::new(),
+      dax: dax::Session::new(),
       owed_descriptor: None,
       ingested_at_end: false,
     },
@@ -495,9 +534,36 @@ fn hand_out(
   }
 }
 
+/// Windows (A-179): the end is kept under the request's word, as on Linux, and duplicated into the client's process as
+/// the reply goes to it (`deliver_handoff`), which writes the value into the reply. The reply recorded here names no
+/// handle (zero): a reply replayed from the record after a restart must not name one, since the client's process
+/// outlives the daemon that duplicated it.
+#[cfg(windows)]
+fn hand_out(
+  s: &mut ShardState,
+  request: u64,
+  attached: ShardsAttached,
+  capability: slates_ipc::protocol::AttachmentCapability,
+  _nothing: Prepared,
+) -> slates_ipc::protocol::ReplyBody {
+  let ShardsAttached {
+    attachment,
+    lease_epoch,
+    stream,
+  } = attached;
+  s.stream_handoffs
+    .insert(request, Handoff { attachment, stream });
+  slates_ipc::protocol::ReplyBody::ShardsHanded {
+    attachment,
+    lease_epoch,
+    capability,
+    handle: 0,
+  }
+}
+
 /// Any other Unix: no route to hand a client the end, which the transport report refuses before this is reached; the
 /// end closes, so the stream ends its attachment.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn hand_out(
   _s: &mut ShardState,
   _request: u64,
@@ -513,31 +579,28 @@ fn hand_out(
   }
 }
 
-/// Sends the stream end owed for `request`, if the shard holds one, over the control socket of the client at
-/// `client_index`, just before `reply` is written into its ring: run by `verbs::send_reply` for every reply, so the
-/// end is taken out exactly once whatever the reply's fate. Sent only with the attach that made it; any other reply
-/// for the request (the verb rolled back and answered a refusal) drops it, counted. A client gone, retiring, or
-/// without a control socket, or a refused send, drops it too, counted: the end closes, so the stream sees its peer's
-/// close and ends its attachment. The end is sent before the ring's reply, so the client finds it waiting.
+/// Hands over the stream end owed for `request`, if the shard holds one, to the client at `client_index`, just before
+/// `reply` is written into its ring: run by `verbs::send_reply` for every reply, so the end is taken out exactly once
+/// whatever the reply's fate. Handed only with the attach that made it; any other reply for the request (the verb
+/// rolled back and answered a refusal) drops it, counted. A client gone or retiring, or a hand-off the OS refused, drops
+/// it too, counted: the end closes, so the stream sees its peer's close and ends its attachment. Linux sends it over the
+/// client's control socket before the ring's reply, so the client finds it waiting; Windows duplicates it into the
+/// client's process and writes the value into the reply ([`hand_to_client`]).
 pub(crate) fn deliver_handoff(
   s: &mut ShardState,
   client_index: u32,
   request: u64,
-  reply: &slates_ipc::protocol::ReplyBody,
+  reply: &mut slates_ipc::protocol::ReplyBody,
 ) {
   let Some(handoff) = s.stream_handoffs.remove(&request) else {
     return;
   };
-  let ours = matches!(
-    reply,
-    slates_ipc::protocol::ReplyBody::Attached { attachment, .. } if *attachment == handoff.attachment
-  );
-  if !ours {
+  if handed_attachment(reply) != Some(handoff.attachment) {
     s.count(HANDOFF_DROPPED, 1);
     return;
   }
   let client = slates_wire::request::RequestId::from_word(request).client;
-  let sent = s
+  let handed = s
     .clients
     .generation_at(client_index)
     .and_then(|generation| {
@@ -546,14 +609,57 @@ pub(crate) fn deliver_handoff(
         .ok()
     })
     .filter(|slot| !slot.retiring && slot.client_id == client)
-    .and_then(|slot| slot.control.as_ref())
-    .is_some_and(|control| {
-      control
-        .send_stream(handoff.stream.as_fd(), request, handoff.attachment)
-        .is_ok()
-    });
-  if !sent {
+    .is_some_and(|slot| hand_to_client(slot, request, &handoff, reply));
+  if !handed {
     s.count(DELIVERY_REFUSED, 1);
+  }
+}
+
+/// The attachment a reply hands a stream end for: the attach that made it, in the platform's form of its reply.
+fn handed_attachment(reply: &slates_ipc::protocol::ReplyBody) -> Option<u64> {
+  match reply {
+    slates_ipc::protocol::ReplyBody::Attached { attachment, .. }
+    | slates_ipc::protocol::ReplyBody::ShardsHanded { attachment, .. } => Some(*attachment),
+    _ => None,
+  }
+}
+
+/// Sends `handoff`'s end over `client`'s control socket (Unix; only Linux keeps ends for it, macOS offering them on its
+/// socket route): whether it went.
+#[cfg(unix)]
+fn hand_to_client(
+  client: &crate::state::ClientSlot,
+  request: u64,
+  handoff: &Handoff,
+  _reply: &mut slates_ipc::protocol::ReplyBody,
+) -> bool {
+  client.control.as_ref().is_some_and(|control| {
+    control
+      .send_stream(handoff.stream.as_fd(), request, handoff.attachment)
+      .is_ok()
+  })
+}
+
+/// Duplicates `handoff`'s end into `client`'s process (Windows, A-175's route, A-179), once the process is judged to
+/// run as the daemon's user, and writes the duplicate's value into `reply`: whether it went. The daemon's copy closes
+/// when `handoff` drops, so the client's is then the only one.
+#[cfg(windows)]
+fn hand_to_client(
+  client: &crate::state::ClientSlot,
+  _request: u64,
+  handoff: &Handoff,
+  reply: &mut slates_ipc::protocol::ReplyBody,
+) -> bool {
+  // The reply's slot first, so a value is duplicated only where it will be written.
+  let slates_ipc::protocol::ReplyBody::ShardsHanded { handle, .. } = reply else {
+    return false;
+  };
+  match slates_ipc::handle_route::hand_stream(handoff.stream.as_handle(), client.pid) {
+    Ok(value) => {
+      *handle = value;
+      true
+    }
+    Err(_) => false,
   }
 }
 
@@ -612,7 +718,7 @@ async fn serve(attachment: u64) {
     let Some(Some((stream, writing))) = state::with_state(|s| {
       s.shards_streams
         .get(&attachment)
-        .map(|stream| (stream.stream.as_raw_fd(), stream.sent < stream.owed))
+        .map(|stream| (end::raw(&stream.stream), stream.sent < stream.owed))
     }) else {
       return;
     };
@@ -796,7 +902,7 @@ fn ingest_turn(s: &mut ShardState, stream: &mut ShardsStream) -> Turned {
     return Turned::Served;
   };
   match done.then {
-    dax::Then::Serve { total } => {
+    Then::Serve { total } => {
       let served = serve_request(
         s,
         stream,
@@ -812,7 +918,7 @@ fn ingest_turn(s: &mut ShardState, stream: &mut ShardsStream) -> Turned {
       }
       flush_unless_refill_owed(s, stream)
     }
-    dax::Then::End => {
+    Then::End => {
       if done.wrote
         && !crate::verbs::publish_shard(s).is_ok_and(|published| published.captured(stream.volume))
       {
@@ -872,12 +978,12 @@ fn take_frame(stream: &mut ShardsStream) -> Took {
     let Some(room) = stream.inbound.get_mut(stream.filled..) else {
       return Took::Failed;
     };
-    match slates_ipc::stream::recv(stream.stream.as_fd(), room) {
-      Ok(0) if stream.filled > 0 => return Took::Truncated,
-      Ok(0) => return Took::Closed,
-      Ok(read) => stream.filled = stream.filled.saturating_add(read),
-      Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => return Took::Waiting,
-      Err(_) => return Took::Failed,
+    match end::receive(&stream.stream, room) {
+      Received::Closed if stream.filled > 0 => return Took::Truncated,
+      Received::Closed => return Took::Closed,
+      Received::Bytes(read) => stream.filled = stream.filled.saturating_add(read),
+      Received::Waiting => return Took::Waiting,
+      Received::Failed => return Took::Failed,
     }
   }
 }
@@ -1072,19 +1178,13 @@ fn flush(stream: &mut ShardsStream) -> Flushed {
       return Flushed::Failed;
     };
     // A descriptor the reply carries rides its first byte; once any byte is out, the descriptor went with it.
-    let sent = match stream.owed_descriptor.as_ref() {
-      Some(descriptor) => {
-        slates_ipc::stream::send_with_descriptor(stream.stream.as_fd(), rest, descriptor.as_fd())
-      }
-      None => slates_ipc::stream::send(stream.stream.as_fd(), rest),
-    };
-    match sent {
-      Ok(0) | Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => return Flushed::Blocked,
-      Ok(sent) => {
+    match end::send(&stream.stream, rest, stream.owed_descriptor.as_ref()) {
+      Sent::Blocked => return Flushed::Blocked,
+      Sent::Taken(sent) => {
         stream.owed_descriptor = None;
         stream.sent = stream.sent.saturating_add(sent);
       }
-      Err(_) => return Flushed::Failed,
+      Sent::Failed => return Flushed::Failed,
     }
   }
   stream.owed = 0;
@@ -1160,15 +1260,23 @@ fn sweep(s: &mut ShardState, stream: &mut ShardsStream) {
 
 /// Ends the stream of `attachment`, if the shard serves one: run by `verbs::end_attachment` for every end but the
 /// stream's own (a detach, a revocation, the volume's destroy). The stream is marked ending, so its task reads nothing
-/// more, and ended both ways, so the task wakes on its own readiness and ends the rest ([`ended`]).
+/// more, and ended both ways, so the task wakes on its own readiness and ends the rest ([`ended`]). A stream already
+/// ending is left as it is: it ends at its task's next turn.
 pub(crate) fn end_stream(s: &mut ShardState, attachment: u64) {
   // Withdrawn here, before the ending's reply, so no claim made after it can take the end.
   withdraw_offer(s, attachment);
-  let Some(stream) = s.shards_streams.get_mut(&attachment) else {
+  // Ended once: a destroy's teardown asks again each pass while it waits for the stream (`verbs::teardown_started`),
+  // and a second shutdown of a socket is refused (`ENOTCONN` on macOS), which was counted as a failed end
+  // (2026-10-25, found by `a_destroy_ends_the_stream_and_removes_its_record`).
+  let Some(stream) = s
+    .shards_streams
+    .get_mut(&attachment)
+    .filter(|stream| !stream.ending)
+  else {
     return;
   };
   stream.ending = true;
-  if slates_ipc::stream::end(stream.stream.as_fd()).is_err() {
+  if !end::end(&stream.stream) {
     s.count(END_REFUSED, 1);
   }
 }
@@ -1190,6 +1298,22 @@ pub(crate) fn drop_all(s: &mut ShardState) {
 }
 
 impl Daemon {
+  /// The runtime shard that owns `volume`, or the typed refusal when the partition has no shard: where a Shards stream
+  /// (here) or a guest device (`crate::virtiofs`, Unix) is served.
+  pub(crate) fn owner_shard(
+    &self,
+    volume: slates_ipc::protocol::VolumeId,
+  ) -> Result<u16, ServerError> {
+    let partition = crate::verbs::owner_of(volume);
+    self
+      .shards()
+      .get(usize::from(partition))
+      .map(|shard| shard.0)
+      .ok_or(ServerError::Runtime(slates_rt::RtError::ShardGone {
+        shard: partition,
+      }))
+  }
+
   /// Attaches a volume to a Shards microVM's fs device over a new anonymous stream (§4.6, the Shards route; A-161),
   /// served on the volume's owning shard for its whole life: `ask` names the volume, who attaches, the directory it
   /// presents if one, and its intent. `on_attached` receives the attachment and the stream end to hand the VMM, or the
