@@ -3045,7 +3045,9 @@ same-namespace host process is the first delivered case.
 >   server's file times frozen); a program in a Linux container mapping a file through the host's FUSE mount bound in
 >   (G-mount step 3, 2026-10-25, Docker and rootless podman, red-checked with the mount's invalidation off); a process
 >   in a Docker container mapping a slates file by the direct map with no copy (G-container-direct, 2026-10-26, the
->   container on the host's network namespace to reach the abstract-socket rendezvous, red-checked); a pod's
+>   container on the host's network namespace to reach the abstract-socket rendezvous, red-checked); on Linux arm64,
+>   bare metal and Docker containers by both routes (G-arm64-host, 2026-10-26, CI's native arm64 lane; red-checked on
+>   x86_64); a pod's
 >   read-only map through kubelet's NFS mount of the export over RPC-with-TLS, following another path's change after a
 >   stat and a read (G-mount step 5, 2026-10-26, CI's KIND lane, red-checked with the change attribute frozen); crosvm
 >   over a slates mount (Linux x86_64);
@@ -3055,7 +3057,7 @@ same-namespace host process is the first delivered case.
 >   A-165); and, since 2026-10-25, the same-kernel direct map on Linux (A-171: a sealed copy of one file, asserted
 >   zero-copy by a real client, red-checked), on macOS (A-173: the copy's read-only descriptor over the socket route,
 >   asserted zero-copy by a real client, red-checked) and on Windows x86_64 (A-175: a read-only section handle
->   duplicated into the client, asserted zero-copy by a real client on a Windows machine, red-checked). Fifteen cells. **Corrected 2026-10-25:** the direct map had been listed
+>   duplicated into the client, asserted zero-copy by a real client on a Windows machine, red-checked). Nineteen cells. **Corrected 2026-10-25:** the direct map had been listed
 >   here as proven before A-171, when its test reported which path ran without asserting it and every read was a copy.
 > - **Ruled out by the platforms:** QEMU's vhost-user-fs and Cloud Hypervisor have no DAX window, so neither has Kata;
 >   crosvm's window is x86_64-only; Apple's Virtualization framework and WSL2 document none (unconfirmed).
