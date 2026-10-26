@@ -1203,10 +1203,15 @@ impl Mounted {
     params.sectors_per_allocation_unit = SECTORS_PER_UNIT;
     params.max_component_length = MAX_COMPONENT_LENGTH;
     params.file_info_timeout = FILE_INFO_TIMEOUT_INFINITE;
+    // A closed file's bytes are written back before its close's request (which publishes them) and its pages dropped:
+    // a Windows program's write reaches every other path by its close, not at the cache manager's lazy write-back
+    // seconds later. Without it, CI's first run (40249524066) read a file PowerShell had written and closed as 62 zero
+    // bytes through slates: its size had reached the shard, and its bytes were still in Windows' cache.
     params.flags = ffi::VOLUME_FLAG_CASE_SENSITIVE_SEARCH
       | ffi::VOLUME_FLAG_CASE_PRESERVED_NAMES
       | ffi::VOLUME_FLAG_UNICODE_ON_DISK
-      | ffi::VOLUME_FLAG_PERSISTENT_ACLS;
+      | ffi::VOLUME_FLAG_PERSISTENT_ACLS
+      | ffi::VOLUME_FLAG_FLUSH_AND_PURGE_ON_CLEANUP;
     if read_only {
       params.flags |= ffi::VOLUME_FLAG_READ_ONLY_VOLUME;
     }

@@ -74,6 +74,9 @@ pub(crate) const VOLUME_FLAG_UNICODE_ON_DISK: u32 = 1 << 2;
 pub(crate) const VOLUME_FLAG_PERSISTENT_ACLS: u32 = 1 << 3;
 /// Format: `ReadOnlyVolume` — bit 9: Windows refuses every write to the volume before it reaches the shard.
 pub(crate) const VOLUME_FLAG_READ_ONLY_VOLUME: u32 = 1 << 9;
+/// Format: `FlushAndPurgeOnCleanup` — bit 14: at a file's last handle's cleanup the kernel writes its cached pages back
+/// and then purges them, before it posts the `Cleanup` request (`src/sys/cleanup.c`, `FspFileNodeCleanupFlush`).
+pub(crate) const VOLUME_FLAG_FLUSH_AND_PURGE_ON_CLEANUP: u32 = 1 << 14;
 
 /// `FSP_FSCTL_VOLUME_INFO` (88 bytes) — free/total size and the volume label.
 #[repr(C)]

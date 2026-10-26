@@ -464,17 +464,20 @@ impl Drop for MappedView {
 }
 
 /// What a mapped view through the WinFsp mount does after another path's change, as the DAX matrix's Windows
-/// mount-route cell records it (`docs/wip/virtiofs.md` §8): `None` until a run on CI's Windows runner has decided it.
-/// The sources predict a stale view: WinFsp's notification purges with `CcPurgeCacheSection` (`src/sys/file.c`), which
-/// "will not purge mapped files" (Microsoft Learn, `CcPurgeCacheSection`); only `CcCoherencyFlushAndPurgeCache`
-/// invalidates user-mapped views.
-const MAPPED_VIEW_FOLLOWS: Option<bool> = None;
+/// mount-route cell records it (`docs/wip/virtiofs.md` §8): it stays stale. WinFsp's notification purges with
+/// `CcPurgeCacheSection` (`src/sys/file.c`), which "will not purge mapped files" (Microsoft Learn,
+/// `CcPurgeCacheSection`); only `CcCoherencyFlushAndPurgeCache` invalidates user-mapped views. Decided by CI's Windows
+/// runner, run 40249524066 (Windows Server 2025, WinFsp 2.1.25156, 2026-10-26): the view kept its first byte for 10 s,
+/// and so did a read through another handle while the view stood, since the refused purge leaves the whole file's
+/// pages in Windows' cache.
+const MAPPED_VIEW_FOLLOWS: bool = false;
 
 /// §4.6 "Windows", the DAX matrix's Windows mount-route cell, G-mount step 2. Do: map `file.bin` read-only through the
 /// drive and read the view, then rewrite the file in place through the SDK, and watch the view as memory alone for
-/// [`WAIT_FOR`]; beside it, read the file through a second handle opened after the view. Expect: the second handle
-/// shows the change (the notification reached Windows), and the view does what [`MAPPED_VIEW_FOLLOWS`] records — the
-/// outcome printed either way, so the run is the evidence.
+/// [`WAIT_FOR`]; beside it, read the file through a second handle opened after the view; then close the view and every
+/// handle and open the file again. Expect: the view does what [`MAPPED_VIEW_FOLLOWS`] records (stale), and so does the
+/// second handle while the view stands; once the view and the handles are gone, a fresh open reads the change, so the
+/// staleness ends with the file's last view and handle. Each outcome is printed, so the run is the evidence.
 #[test]
 fn a_mapped_view_through_a_winfsp_mount_after_another_paths_change() {
   if !live_mount_runs() {
@@ -504,15 +507,33 @@ fn a_mapped_view_through_a_winfsp_mount_after_another_paths_change() {
       |took| format!("followed it in {took:?}")
     ),
   );
-  assert!(
-    read_took.is_some(),
-    "a read through a handle shows the SDK's change within {WAIT_FOR:?}, so Windows was told"
+  assert_eq!(
+    view_took.is_some(),
+    MAPPED_VIEW_FOLLOWS,
+    "the mapped view does what the matrix records"
   );
-  if let Some(follows) = MAPPED_VIEW_FOLLOWS {
-    assert_eq!(
-      view_took.is_some(),
-      follows,
-      "the mapped view does what the matrix records"
-    );
-  }
+  assert_eq!(
+    read_took.is_some(),
+    MAPPED_VIEW_FOLLOWS,
+    "while the view stands, a read through another handle is as stale as the view"
+  );
+  drop(view);
+  drop(reader);
+  drop(handle);
+  let fresh_took = follows(b'C', || {
+    std::fs::File::open(&fixture.file)
+      .map(|fresh| read_page(&fresh))
+      .unwrap_or_default()
+  });
+  eprintln!(
+    "WINFSP AFTER THE VIEW: {}",
+    fresh_took.map_or_else(
+      || format!("a fresh open still stale after {WAIT_FOR:?}"),
+      |took| format!("a fresh open read the change in {took:?}")
+    )
+  );
+  assert!(
+    fresh_took.is_some(),
+    "once the view and every handle are gone, a fresh open reads the SDK's change within {WAIT_FOR:?}"
+  );
 }
