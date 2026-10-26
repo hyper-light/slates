@@ -717,6 +717,19 @@ are retained with their scope; no documentation edit is an implementation accept
   Nothing on Windows or Linux has *run* yet: that needs those machines (Phase 1's reference
   boxes).
 
+### 8a-win-overrun. A Windows shard's late step can read short of the time it was held off (2026-10-26, OPEN)
+
+`crates/rt/tests/overrun.rs`, `a_wait_stepped_past_its_deadline_reports_the_lateness`, fails on jupiter (Windows
+10.0.26200.9711) at its second assertion: the overrun a step reports is less than the time the test held the shard
+off its core after the park.
+- **How often:** 1 run in 12 at HEAD 65200c80, the runtime unchanged, and 2 in 8 with A-179's pipe change. The pipe
+  change touches no timer and no park.
+- **Hypothesis, not yet instrumented:** an IOCP wait returns before its deadline as the shard's clock reads it. The
+  wait's timeout is whole milliseconds, rounded up, but Windows expires waits on its timer tick. If so, the scheduler
+  overrun counter under-reports on Windows.
+- **Owed:** log the park's return against its deadline in that test on jupiter, then fix the wait or the measure;
+  check whether CI's Windows lanes have met it.
+
 ### 8a-lint. The Linux lint gate was red, and only Linux could see it (2026-10-21)
 
 Running `cargo clippy --workspace --all-targets -- -D warnings` in a native

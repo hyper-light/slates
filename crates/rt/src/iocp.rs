@@ -12,6 +12,8 @@ use windows_sys::Win32::System::IO::{
 use crate::afd::{Afd, Block, READABLE_EVENTS, WRITABLE_EVENTS, base_socket};
 use crate::driver::{Completion, Driver, DriverKind, Kick, KickPort, nanos_since};
 use crate::error::RtError;
+use crate::pipe::{PIPE_KEY, Pipes};
+use crate::pipe_state::{PipeRead, PipeWrite};
 
 /// Format: the completion key that marks a kick.
 const KICK_KEY: usize = usize::MAX;
@@ -58,6 +60,9 @@ pub struct IocpDriver {
   /// The AFD readiness device, opened and associated with `port` on the first socket registration
   /// (a shard that only kicks and times out never opens it). Socket readiness is polled through it.
   afd: Option<Afd>,
+  /// The pipe ends this driver serves (A-179): their completions come back under `PIPE_KEY`, and their readiness is a
+  /// finished operation rather than an AFD poll.
+  pipes: Pipes,
 }
 
 impl std::fmt::Debug for IocpDriver {
@@ -99,6 +104,7 @@ impl IocpDriver {
       epoch: Instant::now(),
       entries,
       afd: None,
+      pipes: Pipes::default(),
     })
   }
 
@@ -218,6 +224,17 @@ impl Driver for IocpDriver {
             });
           }
         }
+        PIPE_KEY => {
+          // A pipe operation finished: reclaim its block, and wake the waiter its side registered, if its end is still
+          // served (a completion for a released end frees its block and wakes no one).
+          // SAFETY: completions under `PIPE_KEY` carry a block `pipe::start` leaked, delivered once by the port.
+          if let Some(word) = unsafe { self.pipes.complete(entry.lpOverlapped) } {
+            out.push(Completion {
+              user_data: word,
+              result: 0,
+            });
+          }
+        }
         key => out.push(Completion {
           user_data: u64::try_from(key).unwrap_or(0),
           result: i32::try_from(entry.dwNumberOfBytesTransferred).unwrap_or(i32::MAX),
@@ -241,6 +258,13 @@ impl Driver for IocpDriver {
   }
 
   fn register_readable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError> {
+    // A pipe end's readability is a finished read (A-179): told at once when one is held, else by its completion.
+    if self.pipes.holds(raw) {
+      if self.pipes.want(raw, false, user_data)? {
+        self.submit_nop(user_data)?;
+      }
+      return Ok(());
+    }
     // One-shot AFD poll for the read edges (data, an incoming connection, EOF, an error): it completes
     // on this port when any fires, and `wait` wakes `user_data`. The readiness-native drivers (kqueue,
     // epoll) do this with `EVFILT_READ`/`EPOLLIN`; AFD is the Windows equivalent.
@@ -248,7 +272,30 @@ impl Driver for IocpDriver {
   }
 
   fn register_writable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError> {
+    // A pipe end's writability is its write in the kernel finishing (A-179), or at once when none is.
+    if self.pipes.holds(raw) {
+      if self.pipes.want(raw, true, user_data)? {
+        self.submit_nop(user_data)?;
+      }
+      return Ok(());
+    }
     // One-shot AFD poll for the write edges (send-buffer space, a connect result, an error).
     self.arm(raw, WRITABLE_EVENTS, user_data)
+  }
+
+  fn adopt_pipe(&mut self, raw: i32, handle: usize, sizes: (usize, usize)) -> Result<(), RtError> {
+    self.pipes.adopt(self.port, (raw, handle), sizes)
+  }
+
+  fn release_pipe(&mut self, raw: i32) {
+    self.pipes.release(raw);
+  }
+
+  fn pipe_read(&mut self, raw: i32, out: &mut [u8]) -> Result<PipeRead, RtError> {
+    self.pipes.read(raw, out)
+  }
+
+  fn pipe_write(&mut self, raw: i32, bytes: &[u8]) -> Result<PipeWrite, RtError> {
+    self.pipes.write(raw, bytes)
   }
 }

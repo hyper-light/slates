@@ -194,6 +194,43 @@ pub trait Driver {
   /// completion-native drivers refused it as owed, which they no longer do.
   fn register_writable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError>;
 
+  /// Takes a Windows pipe end into the driver (§4.6, A-179): `handle` is the end's live handle, which the caller owns
+  /// and keeps open until [`Self::release_pipe`]; `raw` is the value the readiness seam names it by; `sizes` are the
+  /// most bytes one read asks for and one write takes. Only the IOCP driver serves pipes; the simulation refuses.
+  #[cfg(windows)]
+  fn adopt_pipe(
+    &mut self,
+    _raw: i32,
+    _handle: usize,
+    _sizes: (usize, usize),
+  ) -> Result<(), RtError> {
+    Err(NO_PIPES)
+  }
+
+  /// Releases a pipe end, cancelling what it has in the kernel, before its owner closes the handle.
+  #[cfg(windows)]
+  fn release_pipe(&mut self, _raw: i32) {}
+
+  /// A try to read a pipe end (`crate::pipe::PipeEnd::try_read`).
+  #[cfg(windows)]
+  fn pipe_read(
+    &mut self,
+    _raw: i32,
+    _out: &mut [u8],
+  ) -> Result<crate::pipe_state::PipeRead, RtError> {
+    Err(NO_PIPES)
+  }
+
+  /// A try to write a pipe end (`crate::pipe::PipeEnd::try_write`).
+  #[cfg(windows)]
+  fn pipe_write(
+    &mut self,
+    _raw: i32,
+    _bytes: &[u8],
+  ) -> Result<crate::pipe_state::PipeWrite, RtError> {
+    Err(NO_PIPES)
+  }
+
   /// Whether a `wait` would return a completion or a kick without blocking, as far as the driver
   /// can tell without a syscall (an idle loop skips the wait when this is false).
   fn has_pending(&self) -> bool;
@@ -204,6 +241,13 @@ pub trait Driver {
     false
   }
 }
+
+/// The refusal a pipe operation gets from a driver that serves no pipes (the simulation, A-179).
+#[cfg(windows)]
+const NO_PIPES: RtError = RtError::DriverRefused {
+  call: "a pipe end on a driver that serves no pipes",
+  code: None,
+};
 
 /// What builds a driver on the shard's thread: a closure the runtime prepared with the OS
 /// resources the kick needs (created up front, so the kick is known before the thread exists).

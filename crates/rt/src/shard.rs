@@ -958,6 +958,49 @@ impl ShardContext {
     }
   }
 
+  /// Takes a Windows pipe end into this shard's driver (A-179, `crate::pipe::PipeEnd::adopt`).
+  #[cfg(windows)]
+  pub(crate) fn adopt_pipe(
+    &self,
+    raw: i32,
+    handle: usize,
+    sizes: (usize, usize),
+  ) -> Result<(), RtError> {
+    self
+      .with_inner(|inner| inner.driver.adopt_pipe(raw, handle, sizes))
+      .unwrap_or(Err(RtError::NotOnShardThread))
+  }
+
+  /// Releases a Windows pipe end from this shard's driver (its `Drop`).
+  #[cfg(windows)]
+  pub(crate) fn release_pipe(&self, raw: i32) {
+    self.with_inner(|inner| inner.driver.release_pipe(raw));
+  }
+
+  /// A try to read a Windows pipe end.
+  #[cfg(windows)]
+  pub(crate) fn pipe_read(
+    &self,
+    raw: i32,
+    out: &mut [u8],
+  ) -> Result<crate::pipe_state::PipeRead, RtError> {
+    self
+      .with_inner(|inner| inner.driver.pipe_read(raw, out))
+      .unwrap_or(Err(RtError::NotOnShardThread))
+  }
+
+  /// A try to write a Windows pipe end.
+  #[cfg(windows)]
+  pub(crate) fn pipe_write(
+    &self,
+    raw: i32,
+    bytes: &[u8],
+  ) -> Result<crate::pipe_state::PipeWrite, RtError> {
+    self
+      .with_inner(|inner| inner.driver.pipe_write(raw, bytes))
+      .unwrap_or(Err(RtError::NotOnShardThread))
+  }
+
   /// Whether this shard runs the simulation driver (so a `UdpSocket` uses the in-memory fabric).
   pub fn driver_is_sim(&self) -> bool {
     self

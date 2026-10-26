@@ -282,7 +282,17 @@ slates-mem = 60
 # `&self`, instead of a `&'static` field — a runtime passed by value had that field protected while its drop
 # freed the clock (Miri, `--test ownership`). (+1) the same for `LocalRuntime::context` (`runtime.rs`), whose
 # context its own `Drop` frees.
-slates-rt = 73
+# 2026-10-26 (+11, A-179): a Windows named pipe's end served by the IOCP driver (`pipe.rs`, `iocp.rs`), Win32 FFI
+# without a safe wrapper. In `pipe.rs`:
+# - the end's association with the port, `CreateIoCompletionPort` (1);
+# - the release's `CancelIoEx` (1);
+# - `PipeEnd::disconnect`'s `DisconnectNamedPipe` and `CancelIoEx` (2);
+# - `Pipes::complete`, an `unsafe fn` by contract, and its `Box::from_raw` of a delivered block (2);
+# - in `start`: the zeroed `OVERLAPPED` of a block (1), the `ReadFile`/`WriteFile` handing a leaked block to the
+#   kernel (1), its `GetLastError` (1), and the `Box::from_raw` of a block the kernel refused at once (1).
+# In `iocp.rs`, the wait's call of `Pipes::complete` (1). `afd.rs`'s `RtlNtStatusToDosError` moved into `dos_error`,
+# which both modules call (0).
+slates-rt = 84
 slates-base = 10
 slates-vfs = 0
 slates-land = 4

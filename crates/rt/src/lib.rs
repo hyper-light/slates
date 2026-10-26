@@ -41,6 +41,12 @@ pub mod futures;
 mod interest;
 mod netsys;
 pub mod parking;
+// A Windows pipe end on the runtime (A-179): its decisions are pure and tested on every host (`pipe_state`, public on
+// every host so cfg-free callers can name its answers); its Win32 calls are Windows' alone (`pipe`, and the IOCP
+// driver).
+#[cfg(target_os = "windows")]
+pub mod pipe;
+pub mod pipe_state;
 pub mod queue;
 pub mod readiness;
 pub mod registry;

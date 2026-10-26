@@ -1328,6 +1328,14 @@ cluster.
 > by use on the readiness-native driver: `crates/rt/tests/tcp.rs` runs an accept→read→write→read round
 > trip with both ends on the runtime's own sockets, `tests/udp.rs` the datagram path.
 >
+> **Status (2026-10-26, A-179: a Windows pipe end on the IOCP driver).** A duplex named pipe's end is served by the
+> IOCP driver (`crates/rt/src/pipe.rs`): the Shards route's stream on Windows, where no AF_UNIX pair can be made
+> without a socket file. Pipes report their I/O on completion and AFD does not take them. So the driver keeps at most
+> one read and one write of each end in the kernel, each into a block the kernel owns until its completion, which
+> always comes through the port. The decisions that turn completions into the readiness model (a try answers bytes,
+> would-block or the end of the stream; readiness is a finished operation) are pure and tested on every host
+> (`pipe_state.rs`, every sequence of ten events six deep). Windows tests: `crates/rt/tests/pipe.rs`.
+>
 > **Status (2026-10-22, A-149: a readiness wait names its own descriptor).** A registration hands the driver an
 > interest word naming its descriptor and direction, and the shard's table (`crates/rt/src/interest.rs`) maps it to the
 > waiting task, so a readiness future answers ready only when its own descriptor fired. Before, a completion carried
@@ -12379,6 +12387,42 @@ Applied in the same change to: §4.6 ("Windows (own thin WinFsp binding)" and it
 - **Proven** on CI's Windows runner (Windows Server 2025, WinFsp 2.1.25156), run 40252840969, the CLI tests 3 of 3 (`crates/cli/tests/winfsp.rs`): Windows programs create, write, read, list and delete through the drive, and `slates read` returns their bytes; a cached read through a handle opened before an SDK write follows it in 20.7 ms (20.5 and 20.5 ms in runs 40249524066 and 40250856246). Red-checked twice with the mount handing Windows empty rounds (runs 40249528145 and 40250871529): the cached read stayed stale for 10 s and the test failed.
 - **Decided by the run: a mapped view does not follow.** The view held its first byte for 10 s in every run. WinFsp's notification purges with `CcPurgeCacheSection` (research f8, `src/sys/file.c`), which "will not purge mapped files" (f9, Microsoft Learn); only `CcCoherencyFlushAndPurgeCache` invalidates user-mapped views (f9), and WinFsp does not call it (f10). So the DAX matrix's Windows mount-route cell is impossible through WinFsp. Worse, while the view stands a read through any other handle is stale too, and after the view and handles closed a fresh open read the change only 3.03 s later (GAPS: "A file mapped through the WinFsp mount…").
 - **Owed:** a scoped (`--subtree`) and a read-shared WinFsp mount; arm64 Windows; a WinFsp mount across a daemon restart (the file system is the dead process's own, so recovery ends its record); the attribute and AppleDouble-like calls (§4.6 status).
+
+### A-179 — The Shards route on Windows rides a duplex named pipe, which the runtime serves by completions (accepted 2026-10-26)
+Applied in the same change to: §4.3 (the drivers' status), GAPS, `crates/rt` (`pipe.rs` and `pipe_state.rs`, new;
+`iocp.rs`, its pipe table and completion key; `driver.rs` and `shard.rs`, the pipe calls; `afd.rs`, `dos_error`
+shared; `tests/pipe.rs`, new), `unsafe-budget.toml` (`slates-rt` 73 → 84). This change is the runtime's half. The
+route's half (the daemon's pair, its serve loop, the hand-out, the client, `slates shards`) extends this entry.
+- **Why a pipe.** The Shards form hands a microVM's virtio-fs device a stream with nothing on disk (A-161, R1).
+  Windows has no `socketpair`. An AF_UNIX socket at an abstract address binds and listens, but its connect is refused
+  `WSAEINVAL`, so the only AF_UNIX pair is one made through a socket file. A duplex named pipe under a fresh name needs
+  none. Measured (Shards' PM M340: jupiter, and GitHub's windows-2022 and windows-2025 runners, 2026-10-26):
+  - the pair costs 9.9 to 14.3 µs at p50, against an AF_UNIX pair's 0.6 ms;
+  - once connected, a second client or server instance is refused `ERROR_PIPE_BUSY`;
+  - a reader gets every byte at its writer's exit, where AF_UNIX loses what is unread;
+  - every handle to an end names the pipe;
+  - its round trip is the shorter on every host, 0.6 to 0.9 times loopback TCP's on the runners.
+
+  Throughput is not why: it is two to eight times TCP's on jupiter and 0.7 to 1.8 times on the runners. The Shards
+  owner agreed the interface: `--slates-fs-handle V`, duplicated into the confined VM process by its spawner.
+- **Why completions, and how ownership holds.**
+  - Pipes report their I/O when it finishes, and the AFD reactor gives readiness to sockets alone. So each end holds
+    at most one read and one write in the kernel, each in a leaked block reclaimed exactly once: at its completion,
+    which always comes through the port (no `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`), or at once when the kernel
+    refused it, which posts nothing.
+  - A block names its end by handle value and generation, so a completion for a released end frees its buffer and
+    wakes no one.
+  - The handle is never lent out: overlapped I/O issued on it elsewhere would deliver a pointer the driver does not
+    own. What an owner needs beyond reading and writing is a method: `PipeEnd::disconnect` cuts the peer off without
+    closing the end, as `shutdown(Both)` does a socket.
+- **Proven:**
+  - `pipe_state`'s tests, every sequence of ten events six deep (10⁶): each delivered byte taken once and in order,
+    each waiter handed back by its completion, and nothing started after the end.
+  - On jupiter, `crates/rt/tests/pipe.rs` passes 6 of 6, 3 runs: a round trip; a write ten times the pipe's buffers
+    to a reader that waits, whose would-block path is signalled, not slept on; a peer gone (the end of the stream, and
+    a write refused as `ERROR_BROKEN_PIPE`); 64 KiB taken a byte at a time; an end dropped with a read in the kernel
+    and a new end after it; a disconnect waking its reader.
+  - `slates-rt` is clean under clippy `-D warnings` on macOS and on Windows.
 
 ### A-178 — macOS refuses a second owner of a live instance's rendezvous: the owner's token is a Mach bootstrap name (accepted 2026-10-26)
 Applied in the same change to: §4.7 (the rendezvous's status), A-176 (its macOS sentences), GAPS, `crates/ipc` (`owner_name.rs`, new; `rendezvous.rs`: the macOS `Owner`, `owner_token_name` and `take_ownership`; `lib.rs`; `tests/rendezvous.rs`: the second-owner test now also macOS's, and a cross-process one on every platform), `unsafe-budget.toml` (`slates-ipc` 70 → 79), `CLAUDE.md`, and a bug record (`docs/bugs/2026-10-26-a-second-owner-took-a-live-macos-instances-rendezvous-over.md`).

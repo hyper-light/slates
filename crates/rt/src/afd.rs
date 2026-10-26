@@ -345,10 +345,15 @@ pub(crate) fn base_socket(socket: SOCKET) -> Result<SOCKET, RtError> {
 /// An [`RtError`] from an `NTSTATUS`, mapped to its Win32 error code so the refusal carries a number a
 /// reader can look up (the same shape `RtError::os` produces from `GetLastError`).
 fn nt_error(call: &'static str, status: NTSTATUS) -> RtError {
-  // SAFETY: a pure mapping function over the status value; no memory is touched.
-  let code = unsafe { RtlNtStatusToDosError(status) };
   RtError::DriverRefused {
     call,
-    code: i32::try_from(code).ok(),
+    code: i32::try_from(dos_error(status)).ok(),
   }
+}
+
+/// The Win32 error code an `NTSTATUS` maps to: an AFD poll's refusal here, and a finished pipe operation's status
+/// (`crate::pipe`, A-179).
+pub(crate) fn dos_error(status: NTSTATUS) -> u32 {
+  // SAFETY: a pure mapping function over the status value; no memory is touched.
+  unsafe { RtlNtStatusToDosError(status) }
 }
