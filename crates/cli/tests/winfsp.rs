@@ -529,3 +529,221 @@ fn a_mapped_view_through_a_winfsp_mount_after_another_paths_change() {
     )
   );
 }
+
+/// Shape: how long one container command may take, its image's pull included: the bound the Linux container leg of
+/// `crates/cli/tests/cli.rs` keeps (`CONTAINER_WAIT`, its first emulated run measured past 90 s at the memory wall).
+const CONTAINER_WAIT: Duration = Duration::from_secs(300);
+
+/// Format: the image a process-isolated container runs on each host build: a process-isolated container runs only on
+/// a host of its own build (Microsoft Learn, "Windows container version compatibility"), and Nano Server is the
+/// smallest image that has `cmd`. Windows Server 2025 is build 26100, Windows Server 2022 build 20348.
+const NANOSERVER_BY_BUILD: [(&str, &str); 2] = [
+  ("26100", "mcr.microsoft.com/windows/nanoserver:ltsc2025"),
+  ("20348", "mcr.microsoft.com/windows/nanoserver:ltsc2022"),
+];
+
+/// Reads `pipe` to its end on a thread of its own, so a child that fills it never stops; what it held, with a note if
+/// it could not be read whole.
+fn gather<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<String> {
+  std::thread::spawn(move || {
+    let mut text = String::new();
+    if let Some(mut pipe) = pipe
+      && let Err(why) = pipe.read_to_string(&mut text)
+    {
+      text.push_str(&format!("\n(the output could not be read whole: {why})"));
+    }
+    text
+  })
+}
+
+/// Runs `command` to its end within `wait`, its two outputs read as they come; its exit code and outputs, or why it gave
+/// none (it never started, or it was killed at the bound, with what it had printed).
+fn bounded_output(command: &mut Command, wait: Duration) -> Result<(i32, String, String), String> {
+  let mut child = command
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .map_err(|e| format!("spawn: {e}"))?;
+  let out = gather(child.stdout.take());
+  let err = gather(child.stderr.take());
+  let started = Instant::now();
+  let ended = loop {
+    match child.try_wait() {
+      Ok(Some(status)) => break Ok(status.code().unwrap_or(-1)),
+      Ok(None) if started.elapsed() > wait => {
+        let killed = child
+          .kill()
+          .err()
+          .map(|e| format!("; the kill refused: {e}"));
+        let reaped = child
+          .wait()
+          .err()
+          .map(|e| format!("; the reap refused: {e}"));
+        break Err(format!(
+          "killed after {wait:?}{}{}",
+          killed.unwrap_or_default(),
+          reaped.unwrap_or_default()
+        ));
+      }
+      Ok(None) => pause(),
+      Err(why) => break Err(format!("wait: {why}")),
+    }
+  };
+  let out = out
+    .join()
+    .map_err(|_| "the output's reader ended in a panic".to_owned())?;
+  let err = err
+    .join()
+    .map_err(|_| "the error output's reader ended in a panic".to_owned())?;
+  match ended {
+    Ok(code) => Ok((code, out, err)),
+    Err(why) => Err(format!("{why}; it had printed: {out} / {err}")),
+  }
+}
+
+/// The Nano Server image a process-isolated container runs here: Docker's engine answering in Windows mode, and an
+/// image built for this host's build; else `None`, the loud skip printed.
+fn process_isolated_image() -> Option<&'static str> {
+  match bounded_output(
+    Command::new("docker").args(["version", "--format", "{{.Server.Os}}"]),
+    CONTAINER_WAIT,
+  ) {
+    Ok((0, os, _)) if os.trim() == "windows" => {}
+    other => {
+      eprintln!(
+        "SKIP: the container leg needs Docker's engine in Windows-container mode: {other:?}"
+      );
+      return None;
+    }
+  }
+  // `ver` prints "Microsoft Windows [Version 10.0.BUILD.REVISION]".
+  let (_, ver, _) = bounded_output(Command::new("cmd").args(["/c", "ver"]), WAIT_FOR).ok()?;
+  let build = ver
+    .split("Version ")
+    .nth(1)
+    .and_then(|version| version.split('.').nth(2))
+    .unwrap_or("unknown")
+    .to_owned();
+  let image = NANOSERVER_BY_BUILD
+    .iter()
+    .find(|(known, _)| *known == build)
+    .map(|(_, image)| *image);
+  if image.is_none() {
+    eprintln!("SKIP: no Nano Server image is listed for this host's build {build} ({ver:?})");
+  }
+  image
+}
+
+/// `docker run --rm --isolation=process` of `image` with `source` bound read-only at `C:\data`, running `cmd /c`
+/// `command` there; its exit code and outputs.
+fn run_bound(image: &str, source: &str, command: &str) -> (i32, String, String) {
+  let mount = format!("type=bind,source={source},target=C:\\data,readonly");
+  bounded_output(
+    Command::new("docker").args([
+      "run",
+      "--rm",
+      "--isolation=process",
+      "--mount",
+      &mount,
+      image,
+      "cmd",
+      "/c",
+      command,
+    ]),
+    CONTAINER_WAIT,
+  )
+  .unwrap_or_else(|why| panic!("docker run of {image} with {source} bound: {why}"))
+}
+
+/// What Windows answers when a process-isolated container binds a folder of the WinFsp mount, as the DAX matrix's
+/// Windows process-isolated container mount-route cell records it (`docs/wip/virtiofs.md` §8): refused. Microsoft's
+/// container team says the container bind filter cannot attach to a custom file system's volume ("Do not attach the
+/// filter to the volume at this time", microsoft/Windows-Containers#335, closed by design). G-mount step 4 decides it by
+/// this test's run on CI's Windows runner.
+const CONTAINER_BIND_REFUSED: bool = true;
+
+/// §4.6 "Windows", the DAX matrix's Windows process-isolated container cell, G-mount step 4. Do: pull the Nano Server
+/// image of this host's build; as a control, bind the test binary's own folder (NTFS) into a process-isolated container
+/// and list it; then mount a volume read-only through WinFsp, its `share/file.bin` written through the SDK, and bind the
+/// mount's `share` folder into the same kind of container, which types the file. Expect: the control lists its folder,
+/// so this runner binds a folder into a process-isolated container; and the WinFsp bind does what
+/// [`CONTAINER_BIND_REFUSED`] records, its answer printed either way.
+#[test]
+fn a_winfsp_folder_bound_into_a_process_isolated_container() {
+  if !live_mount_runs() {
+    return;
+  }
+  let Some(image) = process_isolated_image() else {
+    return;
+  };
+  let (code, out, err) = bounded_output(
+    Command::new("docker").args(["pull", "--quiet", image]),
+    CONTAINER_WAIT,
+  )
+  .unwrap_or_else(|why| panic!("docker pull {image}: {why}"));
+  assert_eq!(code, 0, "docker pull {image}: {out} {err}");
+
+  let exe = std::env::current_exe().unwrap();
+  let own_folder = exe.parent().unwrap().display().to_string();
+  let own_name = exe.file_name().unwrap().to_string_lossy().into_owned();
+  let (code, listed, err) = run_bound(image, &own_folder, "dir /b C:\\data");
+  assert!(
+    code == 0 && listed.contains(&own_name),
+    "the control: a process-isolated container lists an NTFS folder bound into it (exit {code}): {listed} {err}"
+  );
+
+  let instance = instance("wfcontainer");
+  let _anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "wfcontainer", "--bounded", "64MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let hex = value_of(&out, "id");
+  let volume = volume_id_of(&hex);
+  let deadlines = slates_client::Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get();
+  let mut writer = slates_client::Client::connect(&instance, deadlines).unwrap();
+  let attachment = writer
+    .attach(volume, None, slates_client::Intent::Write)
+    .unwrap()
+    .attachment;
+  writer
+    .fs_mkdir((volume, attachment), "share", 0o755)
+    .unwrap();
+  writer
+    .fs_write(
+      (volume, attachment),
+      "share/file.bin",
+      &[b'A'; FILE_BYTES],
+      FILE_MODE,
+    )
+    .unwrap();
+  let drive = free_drive_letter();
+  let (code, _, err) = run(&instance, &["mount", &hex, &drive, "--read-only"]);
+  assert_eq!(code, 0, "mount: {err}");
+  let share = format!("{drive}\\share");
+  wait_ready(&format!("{share}\\file.bin"));
+
+  let (code, typed, err) = run_bound(image, &share, "type C:\\data\\file.bin");
+  let bound = code == 0 && typed.contains(&"A".repeat(FILE_BYTES));
+  eprintln!(
+    "WINFSP CONTAINER BIND: {} (exit {code}; image {image}): {} {}",
+    if bound {
+      "bound, the file typed whole"
+    } else {
+      "refused"
+    },
+    typed.trim(),
+    err.trim()
+  );
+  assert_eq!(
+    !bound, CONTAINER_BIND_REFUSED,
+    "the WinFsp folder's bind does what the matrix records; if it binds, step 4 owes the map through it"
+  );
+  let (code, _, err) = run(&instance, &["unmount", &drive]);
+  assert_eq!(code, 0, "unmount: {err}");
+}
