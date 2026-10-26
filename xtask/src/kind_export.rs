@@ -11,13 +11,25 @@
 //!    (measured 2026-10-01), so this leg runs on the GitHub Linux runner.
 //! 2. An authority, pod 0's certificate (the fleet's name, its failure domain, and the export's cluster IP,
 //!    which the node's client verifies), and the node's client certificate are minted into the scratch.
-//! 3. The slates image and the node image (`deploy/kind/node-tls.Dockerfile`) are built, and a one-worker
-//!    cluster is created that mounts the client material into its nodes for `tlshd`.
+//! 3. The slates image, the map probe's image (`deploy/kind/pod-probe.Dockerfile`) and the node image
+//!    (`deploy/kind/node-tls.Dockerfile`) are built, and a one-worker cluster is created that mounts the client
+//!    material into its nodes for `tlshd`.
 //! 4. The chart is installed with one replica, the authority and the export Service. The group is
 //!    bootstrapped, a volume created, and `slates export` prints its path.
 //! 5. A PersistentVolume names the export (`nfsvers=4.2,xprtsec=mtls,nosuid,nodev`), and a pod writes a file
 //!    through kubelet's mount. A second pod, a fresh mount, must read exactly those bytes, and the kernel must
 //!    list its mount `nosuid,nodev`.
+//! 6. A pod maps a file read-only through kubelet's mount, another path (a write attachment on pod 0, through
+//!    `slates write`) replaces its bytes, and the pod's map must show the change within `MAP_WAIT` (G-mount
+//!    step 5; the DAX matrix's KIND mount-route cell, `docs/wip/virtiofs.md` §8). The other path is the daemon,
+//!    never a second pod: pods on one node share the node's NFS client and its page cache, so a second pod's write
+//!    would reach the map as memory and prove nothing about the export. Linux's NFS client takes a changed file's
+//!    pages out of every map only when it revalidates the file's mapping (`nfs_revalidate_mapping`, which runs on a
+//!    `read`, a `splice`, an `mmap` or a lock, and calls `invalidate_inode_pages2`); a `stat` fetches the new change
+//!    attribute and marks the pages invalid but drops none (`nfs_getattr`, `fs/nfs/inode.c`). So the pod's probe
+//!    (`slates-pod-probe`, `crates/guest-probe/src/pod.rs`) stats the file until the change shows, prints whether
+//!    its map already followed, then reads one byte through its descriptor, and its map must then show the new
+//!    bytes.
 //!
 //! On any failure the pods' events and the node's `tlshd` journal are printed before the cluster is deleted.
 
@@ -25,8 +37,9 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use super::{
-  CLUSTER_WAIT, FLEET_NAME, Failure, Lane, NAMESPACE, Options, POLL_CLUSTER, RELEASE, Scratch,
-  base_port, base64, capture, create_scratch, down, image, pause, stream, write_scratch,
+  CLUSTER_WAIT, FLEET_NAME, Failure, Lane, NAMESPACE, Options, POLL, POLL_CLUSTER, RELEASE,
+  Scratch, base_port, base64, capture, capture_with_input, create_scratch, down, image, pause,
+  stream, u64_of, write_scratch,
 };
 
 /// Shape: the export leg's own kind cluster; created here, deleted at the end, never anyone else's.
@@ -57,6 +70,22 @@ const POD_WAIT: Duration = Duration::from_secs(180);
 const GROUP_WAIT: Duration = Duration::from_secs(60);
 /// Format: what the writer pod writes and the reader pod must read.
 const PAYLOAD: &str = "written through the kubelet RPC-with-TLS mount of a slates volume";
+/// Shape: the map leg's probe image, built by the lane from `deploy/kind/pod-probe.Dockerfile` (the test-only
+/// `slates-pod-probe` of `crates/guest-probe`, `src/pod.rs`) and loaded into the cluster.
+const MAP_PROBE_TAG: &str = "slates-pod-probe:lane";
+/// Format: the file the map leg maps, at the volume's root.
+const MAP_FILE: &str = "map.bin";
+/// Shape: the mapped file's length: four 16 KiB pages (arm64's largest common page size; sixteen of x86_64's 4 KiB
+/// pages), so the map spans several pages on either architecture.
+const MAP_FILE_BYTES: usize = 4 << 14;
+/// Format: the byte the file is first filled with, which the pod's map must show first.
+const MAP_BEFORE: u8 = b'o';
+/// Format: the byte another path fills the file with, which the pod's map must come to show.
+const MAP_AFTER: u8 = b'n';
+/// Shape: how long the pod's map gets to show another path's change. Linux's NFS client trusts a cached attribute
+/// for at most `acregmax`, 60 s by default (nfs(5)), before a `stat` asks the server again; the bound is that twice
+/// over, the second for the recall of a delegation the pod's client may hold, which the change waits on (§4.6 A-79).
+const MAP_WAIT: Duration = Duration::from_secs(120);
 
 /// `kind export`.
 pub(super) fn run(root: &Path, options: &Options) -> Result<(), Failure> {
@@ -72,6 +101,7 @@ pub(super) fn run(root: &Path, options: &Options) -> Result<(), Failure> {
   let scratch = Scratch::create(options.keep)?;
   let values = mint(&scratch.path)?;
   image(root, &options.tag)?;
+  probe_image(root)?;
   node_image(root)?;
   let config = cluster_config(&scratch.path)?;
   stream(
@@ -129,6 +159,22 @@ fn kernel_has_tls() -> Result<bool, Failure> {
     ],
   )?;
   Ok(outcome.code == 0)
+}
+
+/// The map leg's probe image, from `deploy/kind/pod-probe.Dockerfile`, built from the repository root.
+fn probe_image(root: &Path) -> Result<(), Failure> {
+  let dockerfile = root.join("deploy/kind/pod-probe.Dockerfile");
+  stream(
+    "docker",
+    &[
+      "build",
+      "-t",
+      MAP_PROBE_TAG,
+      "-f",
+      &dockerfile.to_string_lossy(),
+      &root.to_string_lossy(),
+    ],
+  )
 }
 
 /// The node image, from `deploy/kind/node-tls.Dockerfile`.
@@ -249,7 +295,14 @@ fn cluster_config(scratch: &Path) -> Result<String, Failure> {
 fn prove(lane: &Lane) -> Result<(), Failure> {
   stream(
     "kind",
-    &["load", "docker-image", &lane.tag, "--name", EXPORT_CLUSTER],
+    &[
+      "load",
+      "docker-image",
+      &lane.tag,
+      MAP_PROBE_TAG,
+      "--name",
+      EXPORT_CLUSTER,
+    ],
   )?;
   let elapsed = lane.install(1, None)?;
   eprintln!(
@@ -257,8 +310,8 @@ fn prove(lane: &Lane) -> Result<(), Failure> {
     elapsed.as_secs_f64()
   );
   lane.bootstrap()?;
-  let path = lane.publish()?;
-  eprintln!("kind export: published {path}");
+  let (id, path) = lane.publish()?;
+  eprintln!("kind export: published {path} (volume {id})");
   lane.apply("persistent-volume", &persistent_volume(&path))?;
   let written = lane.workload(
     "slates-writer",
@@ -286,6 +339,7 @@ fn prove(lane: &Lane) -> Result<(), Failure> {
     .unwrap_or("")
     .to_owned();
   eprintln!("kind export: the pod's mount is {mount_options} (kubelet's carries nosuid,nodev)");
+  map_follows(lane, &id)?;
   lane.kubelet_mount_diagnostics();
   let (unguarded, guarded) = setuid_probe(lane)?;
   if unguarded.trim() != "0" {
@@ -303,6 +357,78 @@ fn prove(lane: &Lane) -> Result<(), Failure> {
   );
   eprintln!(
     "kind export: kubelet mounted the volume over RPC-with-TLS; a second mount read the bytes the first wrote"
+  );
+  Ok(())
+}
+
+/// The map leg (module doc, step 6): `map.bin` written through `slates write` on pod 0, a pod that maps it read-only
+/// through kubelet's mount, the file replaced the same way once the map shows the first fill, and the pod's map
+/// required to show the replacement within [`MAP_WAIT`].
+fn map_follows(lane: &Lane, id: &str) -> Result<(), Failure> {
+  lane.write_through_slates(id, MAP_FILE, &[MAP_BEFORE; MAP_FILE_BYTES])?;
+  let size = MAP_FILE_BYTES.to_string();
+  let before = MAP_BEFORE.to_string();
+  let after = MAP_AFTER.to_string();
+  let wait = MAP_WAIT.as_millis().to_string();
+  let poll = POLL.as_millis().to_string();
+  let mapped_path = format!("/data/{MAP_FILE}");
+  lane.start_pod(
+    "slates-mapper",
+    MAP_PROBE_TAG,
+    &serde_json::json!([
+      "/slates-pod-probe",
+      mapped_path,
+      size,
+      before,
+      after,
+      wait,
+      poll
+    ]),
+    &serde_json::json!({}),
+  )?;
+  let started = Instant::now();
+  loop {
+    let logs = lane.kubectl(&["logs", "slates-mapper"])?;
+    if logs.stdout.contains("mapper: mapped") {
+      break;
+    }
+    let phase = lane.kubectl(&[
+      "get",
+      "pod",
+      "slates-mapper",
+      "-o",
+      "jsonpath={.status.phase}",
+    ])?;
+    if matches!(phase.stdout.trim(), "Succeeded" | "Failed") {
+      return Err(Failure(format!(
+        "kind export: the mapping pod ended before it mapped the file: {}",
+        logs.stdout.trim()
+      )));
+    }
+    if started.elapsed() > POD_WAIT {
+      return Err(Failure(format!(
+        "kind export: the mapping pod did not map the file within {POD_WAIT:?}: {}",
+        logs.stdout.trim()
+      )));
+    }
+    pause(POLL_CLUSTER);
+  }
+  lane.write_through_slates(id, MAP_FILE, &[MAP_AFTER; MAP_FILE_BYTES])?;
+  let changed = Instant::now();
+  let succeeded = lane.finished("slates-mapper", MAP_WAIT.saturating_add(POD_WAIT))?;
+  let logs = lane.kubectl(&["logs", "slates-mapper"])?;
+  for line in logs.stdout.lines() {
+    eprintln!("kind export: {line}");
+  }
+  if !succeeded {
+    return Err(Failure(format!(
+      "kind export: a pod's read-only map through kubelet's mount did not follow another path's change within {MAP_WAIT:?}"
+    )));
+  }
+  eprintln!(
+    "kind export: a pod's read-only map through kubelet's RPC-with-TLS mount followed another path's change \
+     after a stat and a read, {:.1} s after the change",
+    changed.elapsed().as_secs_f64()
   );
   Ok(())
 }
@@ -374,8 +500,9 @@ spec:
 }
 
 impl Lane {
-  /// Creates a volume on pod 0 (once the group accepts it) and `slates export`s it: the path it prints.
-  fn publish(&self) -> Result<String, Failure> {
+  /// Creates a volume on pod 0 (once the group accepts it) and `slates export`s it: the volume's id and the path
+  /// the export prints.
+  fn publish(&self) -> Result<(String, String), Failure> {
     let pod = format!("{RELEASE}-0");
     let started = Instant::now();
     let id = loop {
@@ -412,7 +539,7 @@ impl Lane {
       )));
     }
     let reply: serde_json::Value = serde_json::from_str(&exported.stdout)?;
-    reply
+    let path = reply
       .get("path")
       .and_then(serde_json::Value::as_str)
       .map(str::to_owned)
@@ -421,7 +548,8 @@ impl Lane {
           "kind export: export printed no path: {}",
           exported.stdout
         ))
-      })
+      })?;
+    Ok((id, path))
   }
 
   /// `kubectl apply` of `manifest`, written to the scratch first as `<name>.yaml`.
@@ -452,6 +580,28 @@ impl Lane {
     script: &str,
     security: &serde_json::Value,
   ) -> Result<String, Failure> {
+    self.start_pod(
+      name,
+      image,
+      &serde_json::json!(["sh", "-c", script]),
+      security,
+    )?;
+    if !self.finished(name, POD_WAIT)? {
+      return Err(Failure(format!("kind export: pod {name} failed")));
+    }
+    let logs = self.kubectl(&["logs", name])?;
+    Ok(logs.stdout)
+  }
+
+  /// Starts a pod named `name` running `command` in `image`, with the claim mounted at /data and the container's
+  /// `securityContext` set to `security`; returns once the API server accepts it.
+  fn start_pod(
+    &self,
+    name: &str,
+    image: &str,
+    command: &serde_json::Value,
+    security: &serde_json::Value,
+  ) -> Result<(), Failure> {
     let pod = serde_json::json!({
       "apiVersion": "v1",
       "kind": "Pod",
@@ -462,33 +612,85 @@ impl Lane {
           "name": "work",
           "image": image,
           "imagePullPolicy": "IfNotPresent",
-          "command": ["sh", "-c", script],
+          "command": command,
           "volumeMounts": [{ "name": "data", "mountPath": "/data" }],
           "securityContext": security,
         }],
         "volumes": [{ "name": "data", "persistentVolumeClaim": { "claimName": "slates-export" } }],
       },
     });
-    self.apply(name, &pod.to_string())?;
+    self.apply(name, &pod.to_string())
+  }
+
+  /// Waits (bounded by `wait`) until pod `name` finishes: whether it succeeded.
+  fn finished(&self, name: &str, wait: Duration) -> Result<bool, Failure> {
     let started = Instant::now();
     loop {
       let phase = self.kubectl(&["get", "pod", name, "-o", "jsonpath={.status.phase}"])?;
       match phase.stdout.trim() {
-        "Succeeded" => break,
-        "Failed" => {
-          return Err(Failure(format!("kind export: pod {name} failed")));
-        }
-        _ if started.elapsed() > POD_WAIT => {
+        "Succeeded" => return Ok(true),
+        "Failed" => return Ok(false),
+        _ if started.elapsed() > wait => {
           return Err(Failure(format!(
-            "kind export: pod {name} did not finish within {POD_WAIT:?} (phase {:?})",
+            "kind export: pod {name} did not finish within {wait:?} (phase {:?})",
             phase.stdout.trim()
           )));
         }
         _ => pause(POLL_CLUSTER),
       }
     }
-    let logs = self.kubectl(&["logs", name])?;
-    Ok(logs.stdout)
+  }
+
+  /// Replaces `path` in volume `id` with `bytes` through `slates write` on pod 0, under a write attachment made for
+  /// it and ended after it. Each `slates` run is a client of its own whose attachments end when it exits, so one is
+  /// never kept across runs (an attachment kept across the map leg's pod start was gone by its detach, measured
+  /// 2026-10-25 on adacachy: `NotFound`).
+  fn write_through_slates(&self, id: &str, path: &str, bytes: &[u8]) -> Result<(), Failure> {
+    let pod = format!("{RELEASE}-0");
+    let attached = self.verb(&pod, &["attach", id, "--write"])?;
+    if attached.code != 0 {
+      return Err(Failure(format!(
+        "kind export: `slates attach --write` refused: {}",
+        attached.stderr.trim()
+      )));
+    }
+    let attached: serde_json::Value = serde_json::from_str(&attached.stdout)?;
+    let attachment = u64_of(&attached, "attachment").to_string();
+    let context = format!("kind-{}", self.cluster);
+    let wrote = capture_with_input(
+      "kubectl",
+      &[
+        "--context",
+        &context,
+        "-n",
+        NAMESPACE,
+        "exec",
+        "-i",
+        &pod,
+        "--",
+        "/slates",
+        "write",
+        id,
+        &attachment,
+        path,
+        "--json",
+      ],
+      bytes,
+    )?;
+    if wrote.code != 0 {
+      return Err(Failure(format!(
+        "kind export: `slates write {path}` on {pod} refused: {}",
+        wrote.stderr.trim()
+      )));
+    }
+    let detached = self.verb(&pod, &["detach", &attachment])?;
+    if detached.code != 0 {
+      return Err(Failure(format!(
+        "kind export: detach refused: {}",
+        detached.stderr.trim()
+      )));
+    }
+    Ok(())
   }
 
   /// Where a mount flag the PersistentVolume asked for was lost: kubelet's own NFS mount on the worker, or the
@@ -556,7 +758,12 @@ impl Lane {
   /// What a failed leg leaves to read: the workload pods' events (a refused mount names its error there) and
   /// the worker's `tlshd` journal (the handshake's side).
   fn export_diagnostics(&self) {
-    for pod in ["slates-writer", "slates-reader", &format!("{RELEASE}-0")] {
+    for pod in [
+      "slates-writer",
+      "slates-reader",
+      "slates-mapper",
+      &format!("{RELEASE}-0"),
+    ] {
       if let Ok(described) = self.kubectl(&["describe", "pod", pod]) {
         eprintln!("kind export: pod {pod}:\n{}", described.stdout);
       }

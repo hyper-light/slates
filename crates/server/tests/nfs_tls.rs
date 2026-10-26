@@ -388,3 +388,73 @@ fn a_probe_inside_the_session_is_bad_credential() {
   drop(socket);
   runtime.shutdown().unwrap();
 }
+
+/// Feeds every byte of `ciphertext` to `client` and returns the plaintext it completes.
+fn client_receives(client: &mut ClientConnection, ciphertext: &[u8]) -> Vec<u8> {
+  let mut rest = ciphertext;
+  let mut plaintext = Vec::new();
+  while !rest.is_empty() {
+    client.read_tls(&mut rest).unwrap();
+    let state = client.process_new_packets().unwrap();
+    let mut readable = vec![0u8; state.plaintext_bytes_to_read()];
+    client.reader().read_exact(&mut readable).unwrap();
+    plaintext.extend_from_slice(&readable);
+  }
+  plaintext
+}
+
+/// Runs the mutual TLS 1.3 handshake between `client` and the server's `session` in memory, as the socket would carry
+/// it, until neither side is handshaking.
+fn handshake_in_memory(
+  client: &mut ClientConnection,
+  session: &mut slates_server::nfs_tls::TlsSession,
+) {
+  while client.is_handshaking() || session.is_handshaking() {
+    let mut to_server = Vec::new();
+    while client.wants_write() {
+      client.write_tls(&mut to_server).unwrap();
+    }
+    let mut plaintext = Vec::new();
+    session.receive(&to_server, &mut plaintext).unwrap();
+    assert!(
+      plaintext.is_empty(),
+      "no call was sent during the handshake"
+    );
+    let mut to_client = Vec::new();
+    session.transmit(&mut to_client).unwrap();
+    assert!(client_receives(client, &to_client).is_empty());
+  }
+}
+
+/// AUD-29-75's kernel leg found it (G-mount step 5, 2026-10-25): a kubelet-mounted export answered every READ of a
+/// 64 KiB file by closing the connection, because the session handed rustls the whole reply at once and rustls holds
+/// at most 64 KiB of sealed bytes unsent (`DEFAULT_BUFFER_LIMIT`), so the write came back short and the session was
+/// refused. Do: complete the handshake in memory, then send one framed reply of the codec's largest message
+/// (`MAX_MESSAGE`, the size a READ at the client's `rsize` comes to) and transmit it. Expect: the send is accepted and
+/// the client decrypts exactly that record.
+#[test]
+fn a_reply_larger_than_the_tls_send_buffer_is_sealed_whole() {
+  let authority = Authority::new();
+  let server = rpc_tls_connection(&identity(&authority), ALPN_SUNRPC).unwrap();
+  let mut session = slates_server::nfs_tls::TlsSession::new(server);
+  let config = client_config(
+    &authority,
+    Some(authority.issue("node-a")),
+    Some(ALPN_SUNRPC),
+  );
+  let mut client =
+    ClientConnection::new(config, ServerName::try_from(SERVER_NAME).unwrap()).unwrap();
+  handshake_in_memory(&mut client, &mut session);
+  let header = reply_bytes(21, AcceptStatus::Success, &[]).len();
+  let body: Vec<u8> = (0..=u8::MAX)
+    .cycle()
+    .take(slates_bridge_nfs::rpc::MAX_MESSAGE - header)
+    .collect();
+  let record = write_record(&reply_bytes(21, AcceptStatus::Success, &body));
+  session
+    .send(&record)
+    .expect("a reply of the codec's largest message is accepted whole");
+  let mut ciphertext = Vec::new();
+  session.transmit(&mut ciphertext).unwrap();
+  assert_eq!(client_receives(&mut client, &ciphertext), record);
+}

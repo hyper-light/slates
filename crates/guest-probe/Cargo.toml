@@ -13,6 +13,12 @@ description = "A Linux VM guest's /init for the mount-route tests: it mounts the
 name = "slates-guest-probe"
 path = "src/main.rs"
 
+# A pod's map probe for the KIND lane's export leg (`src/pod.rs`): maps a file through kubelet's NFS mount and waits for
+# another path's change.
+[[bin]]
+name = "slates-pod-probe"
+path = "src/pod.rs"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { workspace = true, features = ["stdio", "termios"] }
 

@@ -89,6 +89,9 @@ pub struct TlsSession {
   connection: ServerConnection,
   /// Whether the completed handshake's protocol was checked (once, when the handshake ends).
   protocol_checked: bool,
+  /// Replies sealed by [`TlsSession::send`] and not yet taken by [`TlsSession::transmit`]. The serve loop transmits
+  /// after every reply, so this holds at most one reply's records: `MAX_MESSAGE` plus each record's overhead.
+  sealed: Vec<u8>,
 }
 
 impl TlsSession {
@@ -97,6 +100,7 @@ impl TlsSession {
     TlsSession {
       connection,
       protocol_checked: false,
+      sealed: Vec::new(),
     }
   }
 
@@ -133,20 +137,50 @@ impl TlsSession {
   }
 
   /// Encrypts one framed reply for the socket (sent by the next [`TlsSession::transmit`]).
+  ///
+  /// rustls holds at most 64 KiB of sealed records unsent (`DEFAULT_BUFFER_LIMIT`) and takes no more plaintext once
+  /// they reach it, so a reply larger than that cannot be handed over in one write. Until 2026-10-25 it was, and every
+  /// READ reply past 64 KiB (a 64 KiB file read whole, as a Linux client's readahead asks) came back short and closed
+  /// the connection; the client reconnected and asked again, for good (G-mount step 5). The reply is handed over in
+  /// the pieces rustls takes, and the records each piece fills are moved out between them.
   pub fn send(&mut self, framed_reply: &[u8]) -> Result<(), TlsRefusal> {
-    self
-      .connection
-      .writer()
-      .write_all(framed_reply)
-      .map_err(|e| TlsRefusal::Io(format!("writing a reply into the session: {e}")))
+    let mut rest = framed_reply;
+    while !rest.is_empty() {
+      let taken = self
+        .connection
+        .writer()
+        .write(rest)
+        .map_err(|e| TlsRefusal::Io(format!("writing a reply into the session: {e}")))?;
+      rest = rest.get(taken..).unwrap_or_default();
+      let sealed_before = self.sealed.len();
+      self.seal()?;
+      if taken == 0 && self.sealed.len() == sealed_before {
+        return Err(TlsRefusal::Io(
+          "the session took none of the reply and sealed nothing to make room".to_owned(),
+        ));
+      }
+    }
+    Ok(())
   }
 
   /// Appends to `out` every TLS byte the session has to send: handshake flights, alerts, sealed replies.
   pub fn transmit(&mut self, out: &mut Vec<u8>) -> Result<(), TlsRefusal> {
+    out.append(&mut self.sealed);
     while self.connection.wants_write() {
       self
         .connection
         .write_tls(out)
+        .map_err(|e| TlsRefusal::Io(format!("sealing TLS records: {e}")))?;
+    }
+    Ok(())
+  }
+
+  /// Moves the records rustls holds into [`TlsSession::sealed`], which frees its buffer for more plaintext.
+  fn seal(&mut self) -> Result<(), TlsRefusal> {
+    while self.connection.wants_write() {
+      self
+        .connection
+        .write_tls(&mut self.sealed)
         .map_err(|e| TlsRefusal::Io(format!("sealing TLS records: {e}")))?;
     }
     Ok(())

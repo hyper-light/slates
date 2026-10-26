@@ -381,7 +381,10 @@ slates-test-seeds = 0
 # which never runs on a host. Its shared map of a file the VMM shares in: the `mmap`, the `munmap` on drop, the
 # `msync`, and one volatile read and one volatile write of a byte the map's bounds check has placed inside it. rustix's
 # map calls are unsafe by signature, and DAX is reached only through the map; the protocol it speaks is pure.
-slates-guest-probe = 5
+# Raised to 8 on 2026-10-25 by its pod probe (`src/pod.rs`, G-mount step 5, the KIND lane's map leg): its read-only
+# shared map of a file through kubelet's NFS mount, the `munmap` on drop, and one volatile read of a byte below the
+# map's length.
+slates-guest-probe = 8
 # slates-image (0): the disk-image form of a volume (A-160) is byte buffers built field by field and read by checked
 # offset (`format.rs`), with every block pointer range-checked before use; no casts, no maps, no FFI.
 slates-image = 0
