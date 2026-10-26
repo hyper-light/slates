@@ -3750,12 +3750,21 @@ campaign's start: no re-dial, fault or invalidation. The campaign now waits for 
 - In 1 of those 4 trials the outranked pod won instead.
 - So did one unlogged trial, whose central candidate's 3 pre-elections drew no reply.
 
-**Open — one CI failure, unexplained.** `a_green_chain_survives_a_daemon_restart` (`crates/client/tests/
-client.rs`) failed once on CI's Ubuntu lane (io_uring), run 36554081271 on `b036a0e`. The second daemon's
-rendezvous bind was refused `EADDRINUSE` after `first.stop()`, the symptom of
-`docs/bugs/2026-09-19-io-uring-retains-listener-after-shutdown.md`. It is not in the previous ten failed
-runs, and 270 local Linux runs under io_uring did not reproduce it (aarch64, kernel 6.12; isolated, the
-whole binary, and on 4 contended CPUs). Owed: a reproduction on CI's kernel, then the cause.
+**Closed 2026-10-26: no longer exposed; probable cause, not reproduced at `b036a0e`.**
+`a_green_chain_survives_a_daemon_restart` (`crates/client/tests/client.rs`) failed once on CI's Ubuntu lane
+(io_uring), run 36554081271 on `b036a0e`. The second daemon's rendezvous bind was refused `EADDRINUSE` after
+`first.stop()`, the symptom of `docs/bugs/2026-09-19-io-uring-retains-listener-after-shutdown.md`. It was not in
+the previous ten failed runs, and 270 local Linux runs under io_uring did not reproduce it (aarch64, kernel 6.12;
+isolated, the whole binary, and on 4 contended CPUs).
+- **Probable cause:** the descriptor copy measured in
+  `docs/bugs/2026-10-26-a-dropped-rendezvous-stayed-bound-in-another-tests-spawn.md`. A child another test spawns
+  holds every descriptor of the test process from its fork to its exec, so a dropped listener stays bound for that
+  window. On adacachy, 44 of 100 runs of the rendezvous suite were refused this way, and none of 100 with the
+  spawning tests left out.
+- **Why it fits:** at `b036a0e` this test's second daemon bound the address itself, right after the first stopped,
+  while three tests of the same binary spawn children.
+- **Why it is closed:** since `af985556` (2026-10-25) the test holds the rendezvous as an anchor does, and both
+  daemons adopt it, so no bind can meet the copy.
 
 **Measured the same day — a late pre-vote reply is dropped.** With both fixes, 4 of the KIND successors' 10
 pre-elections drew no reply within their deadline (one logged at over 127 ms against 124 ms). Raft counts a

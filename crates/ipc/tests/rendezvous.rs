@@ -547,7 +547,7 @@ fn a_fresh_rendezvous_opens_while_a_client_of_a_dead_daemon_lives() {
   let (old_client, _, old_accepted) = serve_until_connected(&mut dead, claim);
   drop(old_accepted);
   drop(dead);
-  let mut fresh = Listener::open(&instance, None)
+  let mut fresh = once_released(|| Listener::open(&instance, None))
     .expect("a fresh rendezvous opens while a client of the dead daemon still maps the old one");
   let claim = begin_connect_as(&instance, 0, CLAIM_WAIT_NS).unwrap();
   let (new_client, _, accepted) = serve_until_connected(&mut fresh, claim);
@@ -580,8 +580,8 @@ fn a_second_owner_of_a_live_instances_rendezvous_is_refused() {
     "an anchor beside a daemon run alone",
   );
   drop(first);
-  let held =
-    HeldRendezvous::hold(&instance).expect("the rendezvous is free once its owner is gone");
+  let held = once_released(|| HeldRendezvous::hold(&instance))
+    .expect("the rendezvous is free once its owner is gone");
   assert_held(
     HeldRendezvous::hold(&instance).map(|_| ()),
     "a second anchor",
@@ -593,23 +593,59 @@ fn a_second_owner_of_a_live_instances_rendezvous_is_refused() {
   drop(held);
 }
 
-/// Asserts `outcome` is the refusal of a second owner of a live instance's rendezvous: the owner's token (Windows,
-/// macOS).
-#[cfg(any(windows, target_os = "macos"))]
+/// Asserts `outcome` is the refusal of a second owner of a live instance's rendezvous ([`refused_as_held`]).
 fn assert_held(outcome: Result<(), IpcError>, who: &str) {
   assert!(
-    matches!(outcome, Err(IpcError::InstanceHeld { .. })),
+    matches!(&outcome, Err(refusal) if refused_as_held(refusal)),
     "{who} is refused while the instance's owner lives: {outcome:?}"
   );
 }
 
+/// Whether `refusal` is what a live owner's rendezvous answers a second owner: the owner's token (Windows, macOS).
+#[cfg(any(windows, target_os = "macos"))]
+fn refused_as_held(refusal: &IpcError) -> bool {
+  matches!(refusal, IpcError::InstanceHeld { .. })
+}
+
 /// The paired arm: the abstract address in use (Linux).
 #[cfg(target_os = "linux")]
-fn assert_held(outcome: Result<(), IpcError>, who: &str) {
-  assert!(
-    matches!(outcome, Err(IpcError::OsRefused { call: "bind", .. })),
-    "{who} is refused while the instance's owner lives: {outcome:?}"
-  );
+fn refused_as_held(refusal: &IpcError) -> bool {
+  matches!(
+    refusal,
+    IpcError::OsRefused { call: "bind", code: Some(code) }
+      if *code == rustix::io::Errno::ADDRINUSE.raw_os_error()
+  )
+}
+
+/// Shape: how long a test that has let an instance's rendezvous go waits to own it again. Every child a test of this
+/// binary spawns holds a copy of each descriptor open at its fork until its exec closes the close-on-exec ones, and a
+/// Linux socket keeps its address until its last copy closes. So a listener dropped here stays bound while another
+/// test's child is between the two. Measured 2026-10-26 on adacachy (32 cores, load 44 to 80, 16 test threads): 44 runs
+/// of 100 refused `EADDRINUSE`, each refusal gone at the first retry, 14 to 36 µs later, and none of 100 with the
+/// spawning tests left out (`docs/bugs/2026-10-26-a-dropped-rendezvous-stayed-bound-in-another-tests-spawn.md`). One
+/// claim wait is far past any exec and still fails a hold that never ends.
+const RELEASE_WAIT: Duration = Duration::from_nanos(CLAIM_WAIT_NS);
+
+/// Owns an instance's rendezvous again through `own` once this test's dropped owner has let it go: retried while it is
+/// refused as held ([`refused_as_held`]), within [`RELEASE_WAIT`], for the reason given there. Prints how many
+/// refusals it waited out, so a log shows when another test's spawn held the address.
+fn once_released<T>(mut own: impl FnMut() -> Result<T, IpcError>) -> Result<T, IpcError> {
+  let deadline = Instant::now() + RELEASE_WAIT;
+  let mut refusals = 0u32;
+  loop {
+    match own() {
+      Err(refusal) if refused_as_held(&refusal) && Instant::now() < deadline => {
+        refusals = refusals.saturating_add(1);
+        std::thread::yield_now();
+      }
+      outcome => {
+        if refusals > 0 {
+          eprintln!("once_released: owned after {refusals} refusals as held");
+        }
+        return outcome;
+      }
+    }
+  }
 }
 
 /// Format: the environment variable naming the instance a re-invoked child tries to own, as a daemon run alone and as
@@ -648,8 +684,9 @@ fn second_owner(instance: &str, expect: &str) {
 }
 
 /// The child: tries to own the instance in the environment as a daemon run alone and then as an anchor, each let go at
-/// once, and exits 0 only when both found what the environment says (`held`: each refused as a live owner's; `owned`:
-/// each owned it). Passes trivially when not the child.
+/// once, and exits 0 only when both found what the environment says (`held`: each refused as a live owner's, at the
+/// first try; `owned`: each owned it, once the parent's dropped owner is let go, [`once_released`]). Passes trivially
+/// when not the child.
 #[test]
 fn rendezvous_second_owner_child() {
   let (Ok(instance), Ok(expect)) = (
@@ -658,15 +695,18 @@ fn rendezvous_second_owner_child() {
   ) else {
     return;
   };
-  let alone = Listener::open(&instance, None).map(|_| ());
-  let anchor = HeldRendezvous::hold(&instance).map(|_| ());
   if expect == "held" {
-    assert_held(alone, "a second process run alone");
     assert_held(
-      anchor,
+      Listener::open(&instance, None).map(|_| ()),
+      "a second process run alone",
+    );
+    assert_held(
+      HeldRendezvous::hold(&instance).map(|_| ()),
       "a second process holding the rendezvous as an anchor",
     );
   } else {
+    let alone = once_released(|| Listener::open(&instance, None)).map(|_| ());
+    let anchor = once_released(|| HeldRendezvous::hold(&instance)).map(|_| ());
     assert!(
       alone.is_ok() && anchor.is_ok(),
       "the rendezvous is free once its owner is gone: alone {alone:?}, anchor {anchor:?}"
