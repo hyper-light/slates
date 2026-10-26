@@ -2,8 +2,8 @@
 
 **Status:** fixed 2026-10-26, decided under the standing goal (G-mount step 6 needs CI green), not in plan mode.
 Root cause confirmed by measurement on this Mac and on fedora, and by an injected reproduction that fails the old test
-and passes the new one. One link is inferred, not yet measured on the runner: that CI's macOS runner delays `nanosleep`
-as this Mac does. The fixed test prints that delay on every run, so the next CI run measures it. **Audit:** AUD-29-19,
+and passes the new one. The one link first inferred, that CI's macOS runner delays `nanosleep` as this Mac does, was
+measured by the fix's own CI run (40251576842): the runner printed `time.sleep 76.5 ms, the selector 3.2 ms`. **Audit:** AUD-29-19,
 AUD-29-20. **Design:** R6, D-19; GAPS 8a-sdk-loop. **Found by:** the macOS SDK packaging job, first attempts of CI runs
 40227172048 (`60ce0142`) and 40239373189 (`becf5936`), CPython 3.11; both passed on rerun.
 
@@ -57,9 +57,10 @@ The harness's own spawns were short (slowest exec waits 0.028–0.029 s for `pgr
 And the rule itself charged every late tick as a hold. A loop idle in its selector is not held; the kernel woke it
 late. The bound's noise term could only stand in for that if it measured the same wait.
 
-**Inferred, not measured on the runner:** GitHub's macOS runner is a launchd job too, and its noise figures (0.134 s,
-0.150 s at CPython 3.11) fit a `nanosleep` delayed as here plus a tail. The fixed test prints each run's own delays
-(`_wait_delays`), which settles it.
+**On the runner, inferred and then measured:** GitHub's macOS runner is a launchd job too, and its noise figures
+(0.134 s, 0.150 s at CPython 3.11) fit a `nanosleep` delayed as here plus a tail. The fixed test prints each run's own
+delays (`_wait_delays`), and the fix's own CI run (40251576842, job 121344444762) settled it: `this process's 10 ms
+waits came back late by, at the median of 5: time.sleep 76.5 ms, the selector 3.2 ms`.
 
 The SDK is not involved: in both runs the loop sat in its own selector wait with the process idle.
 

@@ -313,7 +313,7 @@ box shared with two other builds — timings are not benchmarks)
 
    | runtime, platform | mount route | socket route |
    |---|---|---|
-   | pods on runc, Linux x86_64 (the KIND lane) | owed: G-mount | owed: G-container-direct |
+   | pods on runc, Linux x86_64 (the KIND lane) | proven (G-mount step 5, 2026-10-26): a pod maps a file read alone and shared through kubelet's mount of the export, NFS over RPC-with-TLS (the lane's PersistentVolume, `cargo xtask kind export --require-kernel-tls`), and follows another path's change after a stat and a read through its descriptor, 4.2 s after the change (adacachy, Linux 7.2.9, kind v0.33.0, Kubernetes 1.36.4; the mapper leg, `crates/guest-probe/src/pod.rs`). On Linux's NFS client a stat alone marks the cached pages invalid without dropping them (`nfs_getattr`), and the map follows once a read revalidates the mapping (`nfs_revalidate_mapping` runs only on a read, splice, mmap or lock); the probe prints both facts each run. Red-checked with the export answering a frozen change attribute for regular files: the map kept the old bytes for 120 s. CI's KIND lane runs it (run 40253147189: 3.2 s after the change) | owed: G-container-direct |
    | pods on runc, Linux arm64 | owed: G-arm64-host | owed: G-arm64-host |
    | Kata (VM pods), any platform | impossible: QEMU and Cloud Hypervisor offer no window (above) | impossible: the same |
 

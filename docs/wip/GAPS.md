@@ -11326,7 +11326,23 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       owner's token (`a_second_owner_of_a_live_instances_rendezvous_is_refused`, which leaves macOS out). Owed: a test
       of whether any live owner holds the name before the unlink, with no disk and no race between two starting owners
       (POSIX semaphores and shared objects outlive their creator; the socket route's own liveness question, A-161's
-      `InUse`, is one candidate);
+      `InUse`, is one candidate, though it decides by a socket file, which is authorized for the DAX route alone).
+      Measured 2026-10-26 on this Mac (macOS 26, unprivileged, an Aqua session): a lock on the shared object itself is
+      not available (`flock` on a POSIX shared-memory descriptor answers `ENOTSUP`, `fcntl` record locks `EBADF`). A
+      Mach bootstrap name is: `bootstrap_register` from one process succeeded, a second process's registration of the
+      same name was refused (1100) while `bootstrap_look_up` found the first, and once the first process died the name
+      was gone (1102, unknown service) and a new registration succeeded. That is the Windows token's rule (the first
+      registrant wins, the kernel releases it on death, nothing on disk), at the cost of FFI unsafe in `slates-ipc`
+      and a deprecated call. A name registered in one login session's namespace (gui/501) may be unseen from a sibling
+      session of the same user (an ssh login under user/501), while the shared objects' names are seen from all of
+      them, so a session's token would leave two owners possible across sessions. The parent namespace answers that
+      here: `bootstrap_parent` succeeded unprivileged (port 7171 above this session's 2059), a name registered there was
+      refused to a second process both there and in its own session's namespace (1100), was found from both (0), and
+      was gone from both once its registrant died (1102). Not yet measured: that an ssh session's parent is the same
+      namespace, and which parent a process launchd starts as a job (CI's runner, an agent) is given. The machine-wide
+      alternative, a SysV semaphore held with `SEM_UNDO` (the kernel undoes it at death), fits the limits here
+      (`kern.sysv.semmni` 87,381, `semume` 10 per process) but names a set by a 32-bit key that other software also
+      draws from (5 sets under this user already), and a crash leaves its instance's set behind;
     - on every platform, a client's direct map outlives its daemon: after a `kill -9` and restart the map keeps the file
       as it was when the daemon died and follows it no more, with no signal to the client (its object lives on in the
       client's process). A replayed map reply now fails rather than adopting such a copy (A-175's record rule; Linux's
@@ -11343,8 +11359,10 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   2026-10-26).** Runs 40227172048 and 40239373189: the event loop, idle in its own selector, woken about 0.28 s late,
   judged against a noise figure that measured another primitive's timer delay. The cause, the measurements and the
   fix are in §8a-sdk-loop's last paragraph and
-  `docs/bugs/2026-10-26-the-async-sdk-tests-noise-was-another-waits-timer-delay.md`. Still to read: the runner's own
-  wait delays, which the fixed test prints on every run (`this process's 10 ms waits came back late by …`).
+  `docs/bugs/2026-10-26-the-async-sdk-tests-noise-was-another-waits-timer-delay.md`. Measured on the runner since: in
+  the fix's own CI run (40251576842) the macOS SDK job printed `time.sleep 76.5 ms, the selector 3.2 ms`, the delay
+  this Mac reads, and the fixed test passed with a worst charge of 0.010 s against the control loop's 0.011 s
+  (ubuntu: `time.sleep 0.1 ms, the selector 0.1 ms`; 0.002 s against 0.000 s).
 - **On macOS, shipped code's std timed waits run up to eight times longer than asked under a launchd job's timer
   policy (open, measured 2026-10-26).** From a process launchd started (this Mac, load 19 to 41), Rust's
   `thread::park_timeout` came back late by 6.0 ms at 1 ms asked, 76 ms at 10 ms, 148 ms at 100 ms and 148 ms at 1 s
@@ -11353,8 +11371,11 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   way. The runtime's own timers wait through kevent and are not affected. The std waits in shipped code are:
   - the client's reconnect and transient-refusal backoff (`crates/client/src/client.rs`, `park_timeout`). Each pause
     may run eight times its derived length, so a reconnect notices a restarted daemon later;
-  - the anchor's supervision pauses (`crates/cli/src/anchor.rs`) and the daemon's heartbeat park
-    (`crates/server/src/daemon.rs`);
+  - the anchor's graceful-stop steps and its pause when it has no descriptor to poll (`crates/cli/src/anchor.rs`,
+    `park_timeout`), and the daemon's heartbeat park (`crates/server/src/daemon.rs`). The anchor's usual wait is not
+    stretched: it polls the daemon's exit watch and its hold channel with `poll(2)`, which XNU builds on kqueue, and
+    a 10 ms `poll` came back 1.98 ms late at the median (a `select` beside it, 78.6 ms), so a death is still seen at
+    once;
   - `recv_timeout` in `crates/rt/src/task.rs`, `crates/rt/src/registry.rs` and `crates/server/src/observe.rs`.
   Not yet measured: what it costs end to end, such as a restart's time to the first answered call with and without
   the policy. A candidate symptom: locally, with the test's slowdown factor at 1, phase (1) of the async SDK test came
@@ -11520,7 +11541,7 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
 - **The DAX matrix (A-164, 2026-10-24): every cell of "DAX everywhere" is proven, owed to a goal, or ruled out by its
   platform.** The matrix is in `virtiofs.md` §8: six environments, each platform a row, two routes, 52 cells, none left
   unknown. The research behind it is kiln 01a17143717a7556a52f40f1d5a0e1b2 (19 findings, graded from their sources).
-  - **Proven (10 cells):**
+  - **Proven (11 cells):**
     - bare-metal Linux x86_64 by the mount route: the FUSE mount's shared maps, and since 2026-10-25 a read-only map
       too (`a_read_only_map_through_a_mount_follows_another_paths_change`, 16 replacements as memory alone, fedora);
     - bare-metal macOS arm64 by the mount route, for read-only maps (G-mount step 1, 2026-10-25): the same test maps a
@@ -11536,6 +11557,15 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       `allow_other` (fedora: 0.99 s; red-checked the same way: "stale 65", failed in 14.84 s). The probe is the test
       binary itself, run in `alpine:3.20` through its own loader and the libraries `ldd` names, so the lane adds no
       tooling (CLAUDE.md §2 item 13);
+    - pods on runc on Linux x86_64 by the mount route (G-mount step 5, 2026-10-26; `cargo xtask kind export
+      --require-kernel-tls`, the probe `crates/guest-probe/src/pod.rs`): a pod maps a file read alone and shared through
+      kubelet's mount of the export, NFS over RPC-with-TLS, and follows another path's change after a stat and a read
+      through its descriptor: 3.2 s after the change in CI's KIND lane (run 40253147189, job 121349203447) and 4.2 s on
+      adacachy (Linux 7.2.9, kind v0.33.0, Kubernetes 1.36.4). On Linux's NFS client a stat alone marks the cached
+      pages invalid without dropping them (`nfs_getattr`), and the map follows once a read revalidates the mapping
+      (`nfs_revalidate_mapping` runs only on a read, splice, mmap or lock); the probe prints both facts every run.
+      Red-checked on adacachy with the export answering a frozen change attribute for regular files: the map kept the
+      old bytes for 120 s;
     - bare-metal Linux x86_64 by the socket route: the direct map's sealed copy (A-171, 2026-10-25; the entry below);
     - bare-metal macOS arm64 by the socket route: the direct map's read-only copy over the daemon's socket route (A-173,
       2026-10-25; the entry below);
@@ -11562,14 +11592,28 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       **Corrected 2026-10-25:** this entry and the matrix
       had counted the A-135 direct map on Linux as proven while every run read by copy (its test reported the path
       and did not assert it); A-171 has proven it since, asserting the zero-copy path;
-    - the mount route's maps in Windows containers and in pods (G-mount steps 4 and 5; macOS's read-only maps and
-      Linux containers proven 2026-10-25, Windows' ruled out above);
+    - the mount route's maps in Windows containers (G-mount step 4; macOS's read-only maps and Linux containers proven
+      2026-10-25, KIND pods 2026-10-26, Windows' ruled out above);
     - Shards' own window over the macOS mount;
     - Shards on Linux KVM and on Windows;
     - the direct map inside a Linux container;
     - arm64 Linux hosts;
     - arm64 Linux guests;
     - macOS writable shared maps over NFS.
+- **A READ reply past 64 KiB closed the RPC-with-TLS export (found and fixed 2026-10-25, `3e05c70d`).** rustls caps
+  its buffer of sealed records at 64 KiB, and the session's send wrote a reply with `write_all`, so any READ reply past
+  it ended the connection, and the kubelet's `hard` mount retried it for good: through a kubelet-mounted export a file
+  past about 64 KiB could not be read at all. The node's `mountstats` read 2,953 READs with 2,952 errors, and the
+  daemon's `nfs.tls.session` stood at 2,520 and climbing. Found by G-mount step 5's map leg, whose pod never finished
+  its first touch of a 64 KiB map; the lane's earlier legs had never sent a large READ. Record:
+  `docs/bugs/2026-10-25-a-read-reply-past-64-kib-closed-the-tls-export.md`; test `crates/server/tests/nfs_tls.rs`
+  `a_reply_larger_than_the_tls_send_buffer_is_sealed_whole`.
+- **The KIND export leg's cluster deletion fails (open, pre-existing, seen 2026-10-26).** `kind delete cluster --name
+  slates-export` exits 1 ("did not receive an exit event") in CI runs 40243755704 and 40253147189, after the leg
+  passes: the worker's `hard` NFS mount of the export outlives the export's pod, so the node's container does not
+  stop. On adacachy it was freed by writing 1 to `/sys/fs/nfs/<device>/shutdown` inside the node's network namespace,
+  entered through Docker's `SandboxKey`. Owed: end the consumers and the mount (the pods, then the PersistentVolume)
+  before the cluster is deleted, and fail the leg when the deletion fails.
 - **A file mapped through the WinFsp mount hides another path's change from every reader of it (A-177, 2026-10-26):
   open.** While any process maps a file through a WinFsp mount, WinFsp's purge of its pages is refused (`CcPurgeCacheSection`
   "will not purge mapped files"), so the notification the mount sends reaches no reader. CI's Windows runner (Windows
