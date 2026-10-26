@@ -411,6 +411,10 @@ pub struct ShardState {
   /// by the partition's attachment cap: one entry per live FUSE attachment at most.
   #[cfg(target_os = "linux")]
   pub(crate) fuse_mounts: crate::fuse::FuseMounts,
+  /// The Windows WinFsp mounts this shard serves, by attachment (§4.6 "Windows"; `crate::winfsp`). Bounded by the
+  /// partition's attachment cap: one entry per live WinFsp attachment at most.
+  #[cfg(windows)]
+  pub(crate) winfsp_mounts: crate::winfsp::WinFspMounts,
   /// The FUSE mounts recovery ended (attachment, mount point): their device died with the old process, so
   /// each dead mount is unmounted once the shard runs (`fuse::unmount_stale`). Filled once, at recovery, and
   /// emptied by that step; bounded by the partition's attachment cap.
@@ -1038,10 +1042,9 @@ pub fn try_with_state<R>(f: impl FnOnce(&mut ShardState) -> R) -> Result<R, Stat
 }
 
 /// Borrows the state for the shutdown's release of what the process holds in the kernel (a FUSE mount, a Shards
-/// stream), whether or not the shard is fenced (§4.6 "Linux"; AUD-29-64): a fenced shard writes no record, but its
-/// mounts and streams must not outlive it. Nothing may write a record through this borrow; the records of what it
-/// releases end at the next start's recovery. `None` when the thread holds no state or it is borrowed.
-#[cfg(unix)]
+/// stream, a WinFsp mount), whether or not the shard is fenced (§4.6 "Linux"; AUD-29-64): a fenced shard writes no
+/// record, but its mounts and streams must not outlive it. Nothing may write a record through this borrow; the records
+/// of what it releases end at the next start's recovery. `None` when the thread holds no state or it is borrowed.
 pub(crate) fn with_state_at_shutdown<R>(f: impl FnOnce(&mut ShardState) -> R) -> Option<R> {
   STATE.with(|cell| {
     let mut guard = cell.try_borrow_mut().ok()?;

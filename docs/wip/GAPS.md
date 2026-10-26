@@ -11547,6 +11547,10 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     - Firecracker on Linux x86_64 by the mount route: virtio-pmem over the image file (A-165, 2026-10-24; the entry
       below).
   - **Ruled out:**
+    - bare-metal Windows by the mount route, measured (G-mount step 2, A-177): a mapped view through the WinFsp mount
+      keeps its pages after another path's change, because WinFsp's notification purges with `CcPurgeCacheSection`,
+      which "will not purge mapped files" (research f8, f9, f10). CI's Windows runner, run 40252840969: the view held its first
+      byte for 10 s while a cached read through a handle, on a file nobody mapped, followed in 20.7 ms;
     - QEMU and Kata on it: upstream vhost-user-fs has no window property;
     - Cloud Hypervisor: "it is not available";
     - crosvm on arm64: DAX is x86_64-only;
@@ -11558,14 +11562,33 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       **Corrected 2026-10-25:** this entry and the matrix
       had counted the A-135 direct map on Linux as proven while every run read by copy (its test reported the path
       and did not assert it); A-171 has proven it since, asserting the zero-copy path;
-    - the mount route's maps on Windows, in Windows containers and in pods (G-mount steps 2, 4 and 5; macOS's read-only
-      maps and Linux containers proven 2026-10-25);
+    - the mount route's maps in Windows containers and in pods (G-mount steps 4 and 5; macOS's read-only maps and
+      Linux containers proven 2026-10-25, Windows' ruled out above);
     - Shards' own window over the macOS mount;
     - Shards on Linux KVM and on Windows;
     - the direct map inside a Linux container;
     - arm64 Linux hosts;
     - arm64 Linux guests;
     - macOS writable shared maps over NFS.
+- **A file mapped through the WinFsp mount hides another path's change from every reader of it (A-177, 2026-10-26):
+  open.** While any process maps a file through a WinFsp mount, WinFsp's purge of its pages is refused (`CcPurgeCacheSection`
+  "will not purge mapped files"), so the notification the mount sends reaches no reader. CI's Windows runner (Windows
+  Server 2025, WinFsp 2.1.25156): a read through a second handle, opened while the view stood, stayed stale for 10 s
+  (runs 40249524066, 40250856246, 40252840969); once the view and every handle were closed, a fresh open read the change after
+  3.03 s (run 40252840969), and after 10 s or more while open contexts were freed twice (runs 40249524066 and 40250856246, before the
+  fix in `docs/bugs/2026-10-26-a-winfsp-file-opened-twice-freed-its-first-context-twice.md`). Nothing tells Windows
+  again after the views go, so what ends the staleness is Windows releasing the file's section (a hypothesis: not
+  instrumented). The candidates, none built: a WinFsp change to `CcCoherencyFlushAndPurgeCache`, which Microsoft says
+  invalidates user-mapped views (upstream, not slates'); a notification sent again for a changed file at its last
+  close; opening a mapped file uncached, which WinFsp's user-mode API does not expose (`DisableCache` is a field of the
+  kernel's reply, `fsctl.h`, set by no callback). The test prints both reads and asserts only the view
+  (`a_mapped_view_through_a_winfsp_mount_after_another_paths_change`).
+- **The FUSE chaos test refused a write-back once on CI's Linux lane (2026-10-26, run 40252840969): open, not reproduced.**
+  `generated_map_stores_direct_reads_and_other_writes_never_revert_another_paths_write`
+  (`crates/bridge-fuse/tests/coherence_mount.rs`) panicked at line 1027 unwrapping `EIO` on a third seed after two passed
+  (55 and 346 bytes kept back, one write-back refused unknown each). The same code passed on the change's first run
+  (40249524066) and 10 of 10 on fedora (2026-10-26). A write-back over an unknown byte is refused `EIO` by design (A-144);
+  the test's seeds expect that refusal only where they make it. Not attributed: no log of the run's rounds.
 - **Firecracker maps a volume's image with DAX through virtio-pmem (A-165, 2026-10-24): proven by real runs.**
   The image A-160 builds, read through a slates mount, is the pmem device's backing file. The guest loads the nine
   modules its distribution kernel builds virtio-pmem and nd_pmem as, then mounts the device as ext4 with `dax=always`.

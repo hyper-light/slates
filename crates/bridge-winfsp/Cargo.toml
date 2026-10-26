@@ -10,11 +10,9 @@ description = "The Windows WinFsp bridge (§4.6, D-2; Phase 4): the refusal taxo
 
 [dependencies]
 slates-vfs = { workspace = true }
+slates-bridge-core = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-slates-bridge-core = { workspace = true }
-slates-db = { workspace = true }
-slates-mem = { workspace = true }
 # A direct dep so a cross-lint for the Windows target from a host with no MSVC assembler can enable
 # blake3's pure-Rust backend with `--features slates-machine/pure-hash` (as ipc/client do); the CI
 # Windows build uses the default SIMD C path. The crate does not use slates-machine directly yet.

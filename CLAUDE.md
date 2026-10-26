@@ -192,6 +192,14 @@ Every test is written as "do X, expect Y" and names the acceptance criterion or 
       stores at the ingest and zeroed its map at the refill. The slice is derived from the machine, and every
       development machine derived one within the cap, so the oracle runs a whole range a slice too (`Slices` in
       `crates/server/tests/shards.rs`); only CI's runner had derived the regime that broke.
+  - A foreign-thread framework served by a shard: `crates/server/src/winfsp.rs` with `crates/bridge-winfsp/src/host.rs`
+    (WinFsp's dispatcher threads send each request over a bounded channel and wake the mount's task; an owned mount
+    thread holds the file system; `crates/cli/tests/winfsp.rs` on CI's Windows runner). Gotchas, each found on the
+    runner: WinFsp turns Windows' data cache on only when `FileInfoTimeout` is infinite (`src/sys/create.c`), so
+    paging writes (`ConstrainedIo`, clip them to the file's size) and lazy write-back (`FlushAndPurgeOnCleanup`) arrive
+    with it; without `UmFileContextIsUserContext2` every open is handed the first open's context, so per-open boxes
+    are freed twice; and WinFsp's notification cannot purge a mapped file (A-177). jupiter has no WinFsp, so the live
+    tests run on CI only: a request log on a diagnostics branch (never main) is how the runner is read.
 - **Keep design docs in sync with code.** Changing a subsystem's behaviour updates its design section, its status blockquote and the ledger in the same commit.
 - **Commit everything, in imperative area-prefixed summaries that carry the measured fact**, in vorpal's style: `merge: one graph tool over seven relations; deferred-schema cost measured`. Always `git add -A && git commit -m "<message>"`. Never `git checkout`, `git stash`, `git reset`, or any destructive git command.
 - **Debugging protocol.** Add logging to file first; consult the design section rather than assuming from code; confirm scope, intended behaviour, timing and frequency with Ada; after root cause is confirmed by logs and analysis, write `docs/bugs/<date>-<slug>.md` with description, root cause, impact and exact edits; fix in plan mode; touch nothing beyond the fix, but report every sibling inconsistency found; never preserve the behaviour that caused the bug.

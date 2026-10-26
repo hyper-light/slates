@@ -1,7 +1,7 @@
 //! The WinFsp user-mode FFI (§4.6), hand-transcribed from winfsp's `winfsp.h`/`fsctl.h` (v2.0), the
 //! exact discipline the AFD reactor uses over the WDK: the real `#[repr(C)]` struct layouts and the
-//! `FspFileSystem*` exports, so the bridge cross-lints on the Windows target without linking and runs
-//! against the real DLL on Windows. Not a guess — the structs carry the header's own `static_assert`
+//! `FspFileSystem*` exports, found in the DLL at run time ([`api`]), so the bridge cross-lints on the Windows
+//! target and runs against the real DLL on Windows. Not a guess — the structs carry the header's own `static_assert`
 //! sizes as comments, and the calling conventions match the header (`extern "system"` = the `FSP_API`
 //! stdcall/WINAPI exports; `extern "C"` = the interface's default-convention callbacks).
 
@@ -72,6 +72,15 @@ pub(crate) const VOLUME_FLAG_CASE_PRESERVED_NAMES: u32 = 1 << 1;
 pub(crate) const VOLUME_FLAG_UNICODE_ON_DISK: u32 = 1 << 2;
 /// Format: `PersistentAcls` — bit 3 (the file system enforces access-control lists).
 pub(crate) const VOLUME_FLAG_PERSISTENT_ACLS: u32 = 1 << 3;
+/// Format: `ReadOnlyVolume` — bit 9: Windows refuses every write to the volume before it reaches the shard.
+pub(crate) const VOLUME_FLAG_READ_ONLY_VOLUME: u32 = 1 << 9;
+/// Format: `FlushAndPurgeOnCleanup` — bit 14: at a file's last handle's cleanup the kernel writes its cached pages back
+/// and then purges them, before it posts the `Cleanup` request (`src/sys/cleanup.c`, `FspFileNodeCleanupFlush`).
+pub(crate) const VOLUME_FLAG_FLUSH_AND_PURGE_ON_CLEANUP: u32 = 1 << 14;
+/// Format: `UmFileContextIsUserContext2` — bit 16: a callback's `FileContext` is the one its own open returned (the
+/// kernel's per-handle `UserContext2`), not the file node's `UserContext`, which every open of the file shares
+/// (`src/dll/fsop.c`, `ValOfFileContext`).
+pub(crate) const VOLUME_FLAG_FILE_CONTEXT_PER_OPEN: u32 = 1 << 16;
 
 /// `FSP_FSCTL_VOLUME_INFO` (88 bytes) — free/total size and the volume label.
 #[repr(C)]
@@ -101,7 +110,7 @@ pub(crate) struct FileInfo {
 }
 
 /// `FSP_FSCTL_DIR_INFO`'s fixed head (104 bytes; the variable `FileNameBuf` follows). The host fills
-/// one per directory entry and hands it to [`FspFileSystemAddDirInfo`], which copies it plus the name.
+/// one per directory entry and hands it to `FspFileSystemAddDirInfo` ([`Api::add_dir_info`]), which copies it plus the name.
 #[repr(C)]
 pub(crate) struct DirInfo {
   pub(crate) size: u16,
@@ -261,35 +270,203 @@ pub(crate) const FSP_CLEANUP_DELETE: u32 = 0x01;
 /// callback, so the host's single-owner volume is never touched concurrently.
 pub(crate) const GUARD_STRATEGY_COARSE: i32 = 1;
 
-// SAFETY (whole block): these are the `FSP_API` exports of `winfsp-x64.dll` (the import library the
-// build script links), each transcribed with its header signature and the WINAPI (`extern "system"`)
-// convention. A cross-target `cargo check` type-checks them without linking.
-unsafe extern "system" {
-  pub(crate) fn FspFileSystemCreate(
-    device_name: Pwstr,
-    volume_params: *const VolumeParams,
-    interface: *const Interface,
-    file_system: *mut *mut FileSystem,
-  ) -> Ntstatus;
-  pub(crate) fn FspFileSystemDelete(file_system: *mut FileSystem);
-  pub(crate) fn FspFileSystemSetMountPoint(
-    file_system: *mut FileSystem,
-    mount_point: Pwstr,
-  ) -> Ntstatus;
-  pub(crate) fn FspFileSystemRemoveMountPoint(file_system: *mut FileSystem);
-  pub(crate) fn FspFileSystemStartDispatcher(
-    file_system: *mut FileSystem,
-    thread_count: u32,
-  ) -> Ntstatus;
-  pub(crate) fn FspFileSystemStopDispatcher(file_system: *mut FileSystem);
-  pub(crate) fn FspFileSystemSetOperationGuardStrategyF(
-    file_system: *mut FileSystem,
-    strategy: i32,
-  );
-  pub(crate) fn FspFileSystemAddDirInfo(
-    dir_info: *mut DirInfo,
-    buffer: Pvoid,
-    length: u32,
-    bytes_transferred: *mut u32,
-  ) -> Boolean;
+/// Format: `STATUS_CANT_WAIT` (`0xC000_00D8`, ntstatus.h) as WinFsp's `NTSTATUS`: `FspFileSystemNotifyBegin` with a zero
+/// timeout answers it while a rename is in progress, and the round is owed again.
+pub(crate) const STATUS_CANT_WAIT: Ntstatus = i32::from_ne_bytes(0xC000_00D8_u32.to_ne_bytes());
+/// Format: `STATUS_DLL_NOT_FOUND` (`0xC000_0135`, ntstatus.h): WinFsp's library is not on this host.
+pub(crate) const STATUS_DLL_NOT_FOUND: Ntstatus = i32::from_ne_bytes(0xC000_0135_u32.to_ne_bytes());
+
+/// `FspFileSystemCreate` (`winfsp.h`).
+pub(crate) type CreateFn = unsafe extern "system" fn(
+  device_name: Pwstr,
+  volume_params: *const VolumeParams,
+  interface: *const Interface,
+  file_system: *mut *mut FileSystem,
+) -> Ntstatus;
+/// `FspFileSystemDelete`, `FspFileSystemRemoveMountPoint` and `FspFileSystemStopDispatcher`: each takes the file
+/// system and returns nothing.
+pub(crate) type FileSystemFn = unsafe extern "system" fn(file_system: *mut FileSystem);
+/// `FspFileSystemSetMountPoint`.
+pub(crate) type SetMountPointFn =
+  unsafe extern "system" fn(file_system: *mut FileSystem, mount_point: Pwstr) -> Ntstatus;
+/// `FspFileSystemStartDispatcher`.
+pub(crate) type StartDispatcherFn =
+  unsafe extern "system" fn(file_system: *mut FileSystem, thread_count: u32) -> Ntstatus;
+/// `FspFileSystemSetOperationGuardStrategyF`.
+pub(crate) type SetGuardStrategyFn =
+  unsafe extern "system" fn(file_system: *mut FileSystem, strategy: i32);
+/// `FspFileSystemAddDirInfo`.
+pub(crate) type AddDirInfoFn = unsafe extern "system" fn(
+  dir_info: *mut DirInfo,
+  buffer: Pvoid,
+  length: u32,
+  bytes_transferred: *mut u32,
+) -> Boolean;
+/// `FspFileSystemNotifyBegin`.
+pub(crate) type NotifyBeginFn =
+  unsafe extern "system" fn(file_system: *mut FileSystem, timeout: u32) -> Ntstatus;
+/// `FspFileSystemNotifyEnd`.
+pub(crate) type NotifyEndFn = unsafe extern "system" fn(file_system: *mut FileSystem) -> Ntstatus;
+/// `FspFileSystemNotify`: the records of a round (`FSP_FSCTL_NOTIFY_INFO`, built by `crate::notify`) and their size.
+pub(crate) type NotifyFn = unsafe extern "system" fn(
+  file_system: *mut FileSystem,
+  notify_info: Pvoid,
+  size: usize,
+) -> Ntstatus;
+
+/// The `FSP_API` exports the host calls, found in `winfsp-x64.dll` at run time rather than linked through its import
+/// library. Linked, a daemon on a Windows machine without WinFsp could not start at all (`STATUS_DLL_NOT_FOUND` at
+/// load), though WinFsp is only its mount transport; loaded, the daemon starts everywhere and reports the WinFsp
+/// transport refused `WinFspNotInstalled` where the library is absent. The search is WinFsp's own `FspLoad`
+/// (`winfsp.h`): the library by name, then `<InstallDir>\bin\` under the registry key WinFsp's installer writes.
+#[derive(Clone, Copy)]
+pub(crate) struct Api {
+  pub(crate) create: CreateFn,
+  pub(crate) delete: FileSystemFn,
+  pub(crate) set_mount_point: SetMountPointFn,
+  pub(crate) remove_mount_point: FileSystemFn,
+  pub(crate) start_dispatcher: StartDispatcherFn,
+  pub(crate) stop_dispatcher: FileSystemFn,
+  pub(crate) set_guard_strategy: SetGuardStrategyFn,
+  pub(crate) add_dir_info: AddDirInfoFn,
+  pub(crate) notify_begin: NotifyBeginFn,
+  pub(crate) notify_end: NotifyEndFn,
+  pub(crate) notify: NotifyFn,
+}
+
+/// Format: the library's name for this architecture (`FSP_DLLNAME`: `winfsp-` and `FSP_FSCTL_PRODUCT_FILE_ARCH`).
+#[cfg(target_arch = "x86_64")]
+const LIBRARY: &str = "winfsp-x64.dll";
+/// Format: see the x86_64 form.
+#[cfg(target_arch = "aarch64")]
+const LIBRARY: &str = "winfsp-a64.dll";
+/// Format: the registry key WinFsp's installer records its directory under on a 64-bit Windows
+/// (`FSP_FSCTL_PRODUCT_FULL_REGKEY`: the 32-bit installer writes the 32-bit view).
+const REGISTRY_KEY: &str = "Software\\WOW6432Node\\WinFsp";
+/// Format: the value naming the install directory (`FspLoad`'s `InstallDir`).
+const REGISTRY_VALUE: &str = "InstallDir";
+/// Format: where the library sits under the install directory (`FSP_DLLPATH`).
+const LIBRARY_DIRECTORY: &str = "bin\\";
+/// Format: the most UTF-16 units of the install directory read from the registry: `MAX_PATH`, the bound `FspLoad`'s own
+/// buffer has.
+const INSTALL_DIR_UNITS: usize = 260;
+
+/// The exports, loaded once for the process and kept for its life (the library is never unloaded: every mount's
+/// dispatcher threads run inside it). The load's refusal is kept as well, so a host without WinFsp asks once.
+pub(crate) fn api() -> Result<&'static Api, Ntstatus> {
+  static API: std::sync::OnceLock<Result<Api, Ntstatus>> = std::sync::OnceLock::new();
+  API.get_or_init(load).as_ref().map_err(|status| *status)
+}
+
+/// Loads the library and finds every export, or refuses `STATUS_DLL_NOT_FOUND` (no library) or the procedure's absence
+/// (`STATUS_DLL_NOT_FOUND` too: a WinFsp older than the notify exports, 2021's 1.10, cannot serve this mount).
+fn load() -> Result<Api, Ntstatus> {
+  let module = load_library().ok_or(STATUS_DLL_NOT_FOUND)?;
+  Ok(Api {
+    create: symbol(module, c"FspFileSystemCreate")?,
+    delete: symbol(module, c"FspFileSystemDelete")?,
+    set_mount_point: symbol(module, c"FspFileSystemSetMountPoint")?,
+    remove_mount_point: symbol(module, c"FspFileSystemRemoveMountPoint")?,
+    start_dispatcher: symbol(module, c"FspFileSystemStartDispatcher")?,
+    stop_dispatcher: symbol(module, c"FspFileSystemStopDispatcher")?,
+    set_guard_strategy: symbol(module, c"FspFileSystemSetOperationGuardStrategyF")?,
+    add_dir_info: symbol(module, c"FspFileSystemAddDirInfo")?,
+    notify_begin: symbol(module, c"FspFileSystemNotifyBegin")?,
+    notify_end: symbol(module, c"FspFileSystemNotifyEnd")?,
+    notify: symbol(module, c"FspFileSystemNotify")?,
+  })
+}
+
+/// `winfsp-x64.dll` by name (a library on the loader's path), else by the directory WinFsp's installer recorded.
+fn load_library() -> Option<windows_sys::Win32::Foundation::HMODULE> {
+  use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
+  let by_name = wide(LIBRARY);
+  // SAFETY: `by_name` is a NUL-terminated UTF-16 string that outlives the call.
+  let module = unsafe { LoadLibraryW(by_name.as_ptr()) };
+  if !module.is_null() {
+    return Some(module);
+  }
+  let mut path = install_dir()?;
+  path.push_str(LIBRARY_DIRECTORY);
+  path.push_str(LIBRARY);
+  let by_path = wide(&path);
+  // SAFETY: as above, for the full path.
+  let module = unsafe { LoadLibraryW(by_path.as_ptr()) };
+  (!module.is_null()).then_some(module)
+}
+
+/// The install directory WinFsp's installer recorded (with its trailing separator), or `None`.
+fn install_dir() -> Option<String> {
+  use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
+  let key = wide(REGISTRY_KEY);
+  let value = wide(REGISTRY_VALUE);
+  let mut buffer = [0u16; INSTALL_DIR_UNITS];
+  let mut bytes = u32::try_from(std::mem::size_of_val(&buffer)).ok()?;
+  // SAFETY: `key` and `value` are NUL-terminated; `buffer` holds `bytes` bytes, which the call reads as its capacity and
+  // overwrites with the length it wrote, never more.
+  let status = unsafe {
+    RegGetValueW(
+      HKEY_LOCAL_MACHINE,
+      key.as_ptr(),
+      value.as_ptr(),
+      RRF_RT_REG_SZ,
+      std::ptr::null_mut(),
+      buffer.as_mut_ptr().cast(),
+      &mut bytes,
+    )
+  };
+  if status != 0 {
+    return None;
+  }
+  let units = usize::try_from(bytes)
+    .ok()?
+    .checked_div(std::mem::size_of::<u16>())?;
+  let written = buffer.get(..units)?;
+  let text: Vec<u16> = written
+    .iter()
+    .copied()
+    .take_while(|unit| *unit != 0)
+    .collect();
+  let mut dir = String::from_utf16(&text).ok()?;
+  if !dir.ends_with('\\') {
+    dir.push('\\');
+  }
+  Some(dir)
+}
+
+/// A NUL-terminated UTF-16 copy of `text`.
+fn wide(text: &str) -> Vec<u16> {
+  text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// The function-pointer types [`symbol`] may produce: exactly the export signatures above. Sealed by being private, so
+/// [`symbol`]'s one reinterpretation is only ever to the signature the header gives the export it names.
+trait Export: Copy {}
+impl Export for CreateFn {}
+impl Export for FileSystemFn {}
+impl Export for SetMountPointFn {}
+impl Export for StartDispatcherFn {}
+impl Export for SetGuardStrategyFn {}
+impl Export for AddDirInfoFn {}
+// `NotifyBeginFn` has `StartDispatcherFn`'s shape (the file system and a `u32`), so the impl above covers it.
+impl Export for NotifyEndFn {}
+impl Export for NotifyFn {}
+
+/// The export `name` of `module`, as the function-pointer type `T` the header gives it; refused when the library does not
+/// export it.
+fn symbol<T: Export>(
+  module: windows_sys::Win32::Foundation::HMODULE,
+  name: &std::ffi::CStr,
+) -> Result<T, Ntstatus> {
+  use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
+  // SAFETY: `module` is a library this process loaded and never unloads; `name` is NUL-terminated.
+  let found =
+    unsafe { GetProcAddress(module, name.as_ptr().cast()) }.ok_or(STATUS_DLL_NOT_FOUND)?;
+  if std::mem::size_of::<T>() != std::mem::size_of_val(&found) {
+    return Err(STATUS_DLL_NOT_FOUND);
+  }
+  // SAFETY: `found` is the address of the export `name`, and `T` is a function-pointer type of the same size (checked)
+  // whose signature and convention are the header's for that export (the sealed `Export` set; each caller names the
+  // export and the type together in `load`). A function pointer is reinterpreted as another of identical layout.
+  Ok(unsafe { std::mem::transmute_copy::<_, T>(&found) })
 }

@@ -792,9 +792,8 @@ pub(crate) fn lease_refusal(state: &mut ShardState, object: ObjectId) -> Option<
 /// Whether this owner must not serve `volume`'s latest state to a mounted transport now (§4.8 "Leases and
 /// reads"; AUD-08, AUD-29-83): the configuration group is not ready, or the owner lease does not hold — the
 /// gate the NFS live tree applies before every procedure, shared by the FUSE mount and the guest device, which
-/// hold their caller's requests while it stands rather than answer from a stale view. A lease refusal is
-/// counted by its reason ([`lease_refusal`]).
-#[cfg(unix)]
+/// hold their caller's requests while it stands rather than answer from a stale view (and the WinFsp mount, on
+/// Windows). A lease refusal is counted by its reason ([`lease_refusal`]).
 pub(crate) fn live_tree_fenced(state: &mut ShardState, volume: DbVolumeId) -> bool {
   !state.consensus_ready || lease_refusal(state, ObjectId(volume.bytes)).is_some()
 }
@@ -6111,8 +6110,8 @@ fn attach(
     rights: granted_rights(rights, intent),
     token,
   };
-  if form.fuse_mount_point().is_some() {
-    return defer_fuse_attach(
+  if let Some(defer) = deferred_mount(&form) {
+    return defer(
       state,
       attachment_record,
       situation,
@@ -6345,8 +6344,7 @@ pub(crate) fn scoped_or_whole<'a>(
 /// Releases the write lease an attach took for `record` before the attachment it was for was recorded, when no other
 /// attachment of the holder came of it: the attach failed after its lease (a FUSE mount refused, a Shards stream that
 /// could not be served). A refused release is counted, never raised: the lease's own term ends it. Unix only, as its
-/// callers are.
-#[cfg(unix)]
+/// callers are (the FUSE mount, the Shards stream, the WinFsp mount).
 pub(crate) fn release_unrecorded_lease(state: &mut ShardState, record: &AttachmentRecord) {
   let holds_another = state
     .db
@@ -6446,6 +6444,9 @@ fn recorded_form(form: &AttachRequest, established: AttachForm, scope: Option<u6
       path: mount_point.clone(),
       scope,
     },
+    (AttachRequest::WinFspMount { mount_point }, _) => AttachForm::WinFspMount {
+      path: mount_point.clone(),
+    },
     (AttachRequest::BoundHostMount { uid, .. }, scope) => AttachForm::BoundMount {
       uid: *uid,
       scope,
@@ -6537,6 +6538,131 @@ fn defer_fuse_attach(
   )
 }
 
+/// A deferred mount's establishment: the shard, the record to commit, the situation, the intent, the lease's epoch and
+/// the capability token, to the placeholder reply.
+type DeferMount = fn(
+  &mut ShardState,
+  AttachmentRecord,
+  crate::transports::Situation,
+  Intent,
+  Option<u64>,
+  [u8; 16],
+) -> ReplyBody;
+
+/// The establishment a mount form the daemon itself mounts defers its reply to — a FUSE mount's or a WinFsp volume's —
+/// or `None` for a form recorded at once.
+fn deferred_mount(form: &AttachRequest) -> Option<DeferMount> {
+  if matches!(form, AttachRequest::WinFspMount { .. }) {
+    Some(defer_winfsp_attach)
+  } else if form.fuse_mount_point().is_some() {
+    Some(defer_fuse_attach)
+  } else {
+    None
+  }
+}
+
+/// A FUSE mount's establishment, before any effect: offered where the host has FUSE, presenting the live head (never a
+/// snapshot), at a mount point that passes `check_fuse_mount_point`.
+fn establish_fuse(
+  situation: &crate::transports::Situation,
+  snapshot: Option<SnapshotId>,
+  form: &AttachRequest,
+  principal: &Principal,
+) -> Result<(), Refusal> {
+  if let Some(reason) = crate::transports::fuse(situation).unsupported_reason {
+    return Err(Refusal::AttachmentUnsupported {
+      transport: AttachTransport::Fuse,
+      reason,
+    });
+  }
+  if snapshot.is_some() {
+    return Err(Refusal::AttachmentUnsupported {
+      transport: AttachTransport::Fuse,
+      reason: UnsupportedReason::SnapshotNotPresentedByHostMount,
+    });
+  }
+  check_fuse_mount_point(form, principal)
+}
+
+/// A WinFsp volume's establishment, before any effect: offered where WinFsp is installed, presenting the live head
+/// (never a snapshot), at a drive letter.
+fn establish_winfsp(
+  situation: &crate::transports::Situation,
+  snapshot: Option<SnapshotId>,
+  mount_point: &str,
+) -> Result<(), Refusal> {
+  if let Some(reason) = crate::transports::winfsp(situation).unsupported_reason {
+    return Err(Refusal::AttachmentUnsupported {
+      transport: AttachTransport::WinFsp,
+      reason,
+    });
+  }
+  if snapshot.is_some() {
+    return Err(Refusal::AttachmentUnsupported {
+      transport: AttachTransport::WinFsp,
+      reason: UnsupportedReason::SnapshotNotPresentedByHostMount,
+    });
+  }
+  check_winfsp_mount_point(mount_point)
+}
+
+/// Hands a WinFsp attach to its deferred establishment (`crate::winfsp`): the drive is mounted off the shard, and the
+/// attachment recorded with the reply once it is (§4.6 "Windows").
+#[cfg(windows)]
+fn defer_winfsp_attach(
+  state: &mut ShardState,
+  record: AttachmentRecord,
+  situation: crate::transports::Situation,
+  intent: Intent,
+  lease_epoch: Option<u64>,
+  token: [u8; 16],
+) -> ReplyBody {
+  let mut capability = crate::transports::winfsp(&situation);
+  capability.read_write = read_write_of(intent);
+  let rights = slates_bridge_core::Rights {
+    read: record.rights.read,
+    write: record.rights.write,
+  };
+  crate::winfsp::defer_attach(
+    state,
+    crate::winfsp::PendingAttach {
+      record,
+      rights,
+      lease_epoch,
+      capability,
+      token,
+    },
+  )
+}
+
+/// WinFsp mounts are Windows'; `establish_form` has refused the form before any effect elsewhere.
+#[cfg(not(windows))]
+fn defer_winfsp_attach(
+  _state: &mut ShardState,
+  _record: AttachmentRecord,
+  _situation: crate::transports::Situation,
+  _intent: Intent,
+  _lease_epoch: Option<u64>,
+  _token: [u8; 16],
+) -> ReplyBody {
+  refused(Refusal::AttachmentUnsupported {
+    transport: AttachTransport::WinFsp,
+    reason: UnsupportedReason::HostPlatform,
+  })
+}
+
+/// A WinFsp mount point's check, before any effect (`crate::winfsp::check_mount_point`).
+#[cfg(windows)]
+fn check_winfsp_mount_point(mount_point: &str) -> Result<(), Refusal> {
+  crate::winfsp::check_mount_point(mount_point)
+}
+
+/// WinFsp is Windows'; the transport report refused it before this elsewhere.
+#[cfg(not(windows))]
+fn check_winfsp_mount_point(_mount_point: &str) -> Result<(), Refusal> {
+  Ok(())
+}
+
 /// FUSE mounts are Linux's; `establish_form` has refused the form before any effect elsewhere.
 #[cfg(not(target_os = "linux"))]
 fn defer_fuse_attach(
@@ -6576,7 +6702,8 @@ pub(crate) fn consumer_of(form: &AttachRequest, client_id: u32) -> Result<Consum
     | AttachRequest::ScopedHostMount { .. }
     | AttachRequest::ScopedFuseMount { .. }
     | AttachRequest::SharedFuseMount { .. }
-    | AttachRequest::BoundHostMount { .. } => Ok(Consumer::Bridge),
+    | AttachRequest::BoundHostMount { .. }
+    | AttachRequest::WinFspMount { .. } => Ok(Consumer::Bridge),
     AttachRequest::Root => Ok(Consumer::Sdk { client: client_id }),
     AttachRequest::Oci { .. } => Err(Refusal::AttachmentUnsupported {
       transport: AttachTransport::Oci,
@@ -6648,20 +6775,11 @@ fn establish_form(
     AttachRequest::FuseMount { .. }
     | AttachRequest::ScopedFuseMount { .. }
     | AttachRequest::SharedFuseMount { .. } => {
-      if let Some(reason) = crate::transports::fuse(situation).unsupported_reason {
-        return Err(Refusal::AttachmentUnsupported {
-          transport: AttachTransport::Fuse,
-          reason,
-        });
-      }
-      if snapshot.is_some() {
-        return Err(Refusal::AttachmentUnsupported {
-          transport: AttachTransport::Fuse,
-          reason: UnsupportedReason::SnapshotNotPresentedByHostMount,
-        });
-      }
-      check_fuse_mount_point(form, principal)?;
-      return Ok(None);
+      return establish_fuse(situation, snapshot, form, principal).map(|()| None);
+    }
+    // A WinFsp volume (§4.6 "Windows"): offered where WinFsp is installed, at a drive letter, presenting the live head.
+    AttachRequest::WinFspMount { mount_point } => {
+      return establish_winfsp(situation, snapshot, mount_point).map(|()| None);
     }
     AttachRequest::Guest { .. }
     | AttachRequest::ShardsFs { .. }
@@ -6900,6 +7018,10 @@ pub(crate) fn end_attachment(
     #[cfg(target_os = "linux")]
     crate::fuse::unmount_if_mounted(state, record.id);
   }
+  // A WinFsp mount ends with its attachment, however it ends: a drive letter has no directory beneath it for a later
+  // write by path to reach, so nothing is exposed by removing it (§4.6 "Windows").
+  #[cfg(windows)]
+  crate::winfsp::end_if_mounted(state, record.id);
   // The registry attachment a mount's requests rode ends with the record: revoked so no later request
   // is admitted under it, drained so its slot is reused (GAP-A9-4).
   if let Some(mount) = state.mount_attachments.remove(&record.id) {
@@ -10402,7 +10524,9 @@ fn reconcile_lost(state: &mut ShardState, record: &VolumeRecord) -> (usize, usiz
         state.stale_fuse_mounts.push((a.id, path.to_owned()));
         return true;
       }
+      // A WinFsp volume's file system was the dead process's own (§4.6 "Windows"): its drive went with it.
       matches!(a.consumer, Consumer::Sdk { .. } | Consumer::Guest)
+        || matches!(a.form, AttachForm::WinFspMount { .. })
     })
     .map(|a| a.id)
     .collect();

@@ -38,8 +38,7 @@ use crate::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
 use crate::allocate::{Allocation, Begun};
 use crate::bridge::{Bridge, KernelChange, reply_error};
 use crate::coherence::{
-  Coherence, Delivered, KernelHolds, MOST_ADDED_BY_AN_UPDATE, OwnRecords, PageStates, RANGE_BYTES,
-  WritableOpens,
+  KernelHolds, MOST_ADDED_BY_AN_UPDATE, OwnRecords, PageStates, RANGE_BYTES, WritableOpens,
 };
 use crate::dispatch;
 use crate::error::FuseError;
@@ -48,6 +47,7 @@ use crate::notify::{EXPIRE_ONLY, inc_epoch, inval_entry, inval_inode};
 use crate::reply::ReplyHeader;
 use crate::request::Request;
 use crate::session::Session;
+use slates_bridge_core::delivery::{Coherence, Delivered};
 use slates_bridge_core::{AttachmentId, Attachments, CachedBytes, Invalidation};
 
 /// Format: the device the kernel's FUSE client and the daemon exchange messages over.

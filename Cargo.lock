@@ -1404,9 +1404,7 @@ name = "slates-bridge-winfsp"
 version = "0.1.0"
 dependencies = [
  "slates-bridge-core",
- "slates-db",
  "slates-machine",
- "slates-mem",
  "slates-vfs",
  "windows-sys 0.60.2",
 ]
@@ -1654,6 +1652,7 @@ dependencies = [
  "slates-bridge-nfs",
  "slates-bridge-oci",
  "slates-bridge-virtiofs",
+ "slates-bridge-winfsp",
  "slates-client",
  "slates-cluster",
  "slates-conformance",

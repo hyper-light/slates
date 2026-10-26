@@ -338,19 +338,23 @@ slates-sdk-node = 0
 # the Swift FSVolume handler a C ABI over `serve` — sanctioned FFI unsafe, each block with a SAFETY
 # note. The shipped crate (no `test-harness` feature) builds none of it; the count is a text scan.
 slates-bridge-fskit = 9
-# slates-bridge-winfsp (86): the VfsError->NTSTATUS refusal taxonomy stays safe Rust (lib.rs, 0). The
-# WinFsp mount host is Windows-only FFI, hand-transcribed from winfsp's headers (like the rt AFD
-# reactor from the WDK) and compiled only for Windows, each block with a `// SAFETY:` line (clippy
-# `undocumented_unsafe_blocks` enforces it): `ffi.rs` (18) declares the `FspFileSystem*` exports and
-# the `FSP_FILE_SYSTEM_INTERFACE` callback signatures; `host.rs` (68) is the mount driver — the 16
-# `FSP_FILE_SYSTEM_INTERFACE` trampolines that read WinFsp's raw pointers (the file system's
-# `UserContext` handler, the opaque `FileContext` open-files, UTF-16 path strings, the read/write
-# buffers) under WinFsp's COARSE operation guard that serializes them, plus `FspFileSystemCreate`/
-# `SetMountPoint`/`StartDispatcher`/`AddDirInfo`, the leaked `Handler`/`OpenFile` boxes, and the
-# `ConvertStringSecurityDescriptor…`/`GetSecurityDescriptorLength`/`LocalFree` for the reference
-# descriptor. All are Win32/WinFsp FFI without a safe wrapper; there is no `unsafe impl Send`/`Sync`
-# (the volume is owned by one thread and shared only over channels, R2/D-7).
-slates-bridge-winfsp = 86
+# slates-bridge-winfsp (104): the VfsError->NTSTATUS refusal taxonomy and the notification records stay safe Rust
+# (lib.rs, notify.rs: 0). The WinFsp mount host is Windows-only FFI, hand-transcribed from winfsp's headers (like the
+# rt AFD reactor from the WDK) and compiled only for Windows, each block with a `// SAFETY:` line (clippy
+# `undocumented_unsafe_blocks` enforces it): `ffi.rs` declares the `FspFileSystem*` export signatures and the
+# `FSP_FILE_SYSTEM_INTERFACE` callback signatures, and finds the exports at run time (`LoadLibraryW` twice, by name and
+# by the registry's install directory; `RegGetValueW`; `GetProcAddress`; one reinterpretation of each found address as
+# its header signature, sealed to those signatures); `host.rs` is the mount driver — the 16
+# `FSP_FILE_SYSTEM_INTERFACE` trampolines that read WinFsp's raw pointers (the file system's `UserContext` handler, the
+# opaque `FileContext` open-files, UTF-16 path strings, the read/write buffers) under WinFsp's COARSE operation guard
+# that serializes them, the calls through the loaded exports (create, mount point, dispatcher, the directory fill, and
+# the notification round's begin, notify and end), the leaked `Handler`/`OpenFile` boxes, and the
+# `ConvertStringSecurityDescriptor…`/`GetSecurityDescriptorLength`/`LocalFree` for the reference descriptor. All are
+# Win32/WinFsp FFI without a safe wrapper; there is no `unsafe impl Send`/`Sync` (the file system is owned by its mount
+# thread and the volume by its shard, shared only over channels, R2/D-7). Raised 86 -> 104 on 2026-10-25 (G-mount
+# step 2): the library loaded at run time rather than linked, so a daemon starts on a Windows host without WinFsp
+# (the loader's five sites), and the notification round that tells Windows of another path's change (§4.6 "Windows").
+slates-bridge-winfsp = 104
 # Raised 3 -> 5 on 2026-10-19 for `udmabuf.rs` (the `UDMABUF_CREATE` ioctl and the descriptor it returns), which
 # confined a guest's DAX window to a descriptor covering only that window
 # (docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md). Lowered 5 -> 3 on 2026-10-25

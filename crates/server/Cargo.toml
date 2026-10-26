@@ -52,6 +52,8 @@ slates-bridge-fuse = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
+# The WinFsp mount host (§4.6 "Windows"; `crate::winfsp`): the daemon serves a volume at a drive letter.
+slates-bridge-winfsp = { workspace = true }
 
 [dev-dependencies]
 # self-signed fleet identities for the two-daemon membership test (as the cluster tests mint them).

@@ -2030,6 +2030,9 @@ pub enum UnsupportedReason {
   /// The form hands the client a descriptor, and this platform's route for one is not built: Linux sends it over
   /// the client's control socket; the macOS socket route and a Windows handle route are owed (A-161). Appended.
   DescriptorRouteNotBuilt,
+  /// WinFsp's user-mode library (`winfsp-x64.dll`) could not be loaded: WinFsp is not installed on this host. slates
+  /// installs nothing (R10); WinFsp's own installer is the one privileged piece (§4.6). Appended.
+  WinFspNotInstalled,
 }
 
 /// One transport's report (§4.6 A-9: "supported transport, target-path constraints, read/write policy,
@@ -2158,6 +2161,14 @@ pub enum AttachRequest {
     /// The DAX window offered to the front end, in bytes: a power of two of at least one 2 MiB range. None offers no
     /// window, and the guest reads and writes through the queue alone.
     dax_window: Option<u64>,
+  },
+  /// A Windows WinFsp volume of the whole volume at `mount_point`, a free drive letter (`S:`), that the daemon
+  /// establishes and serves on the volume's owner shard (§4.6 "Windows"). The attachment is the mount's, as a
+  /// `FuseMount`'s is: it ends with a `detach`, the volume's destroy, or the daemon's process, which holds the WinFsp
+  /// file system. A directory mount point is refused (an NTFS reparse point, §4.6). Appended.
+  WinFspMount {
+    /// The drive letter and its colon (`S:`).
+    mount_point: String,
   },
 }
 

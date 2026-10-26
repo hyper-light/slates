@@ -45,7 +45,7 @@ pub(crate) enum Platform {
   MacOs,
   /// Linux: the FUSE bridge is the host mount the daemon does not wire yet; NFS needs a privilege.
   Linux,
-  /// Windows: WinFsp is the bridge the daemon does not wire yet.
+  /// Windows: WinFsp is the host mount, where WinFsp is installed.
   Windows,
   /// Anything else: no host mount.
   Other,
@@ -76,6 +76,9 @@ pub(crate) struct Situation {
   /// Whether this host offers an unprivileged FUSE mount (Linux: `/dev/fuse` and the OS's `fusermount3`),
   /// read once per process.
   pub(crate) fuse_available: bool,
+  /// Whether this host's WinFsp library loads (Windows: `winfsp-x64.dll`, found as WinFsp's own `FspLoad` finds it),
+  /// read once per process.
+  pub(crate) winfsp_installed: bool,
   /// Whether the daemon's Shards stream route bound its socket (macOS, A-161): whether a stream end can reach a
   /// client there.
   pub(crate) stream_route_bound: bool,
@@ -88,6 +91,7 @@ pub(crate) fn situation(_state: &ShardState, rights: &Rights) -> Situation {
     nfs_listener_bound: crate::daemon::NFS_PORT.load(std::sync::atomic::Ordering::Acquire) != 0,
     may_write: rights.write,
     fuse_available: host_facts_once().fuse_available,
+    winfsp_installed: host_facts_once().winfsp_installed,
     stream_route_bound: crate::daemon::SHARDS_ROUTE_BOUND
       .load(std::sync::atomic::Ordering::Acquire),
   }
@@ -293,16 +297,46 @@ fn fskit(situation: &Situation) -> AttachmentCapability {
   )
 }
 
-/// The Windows WinFsp volume (§4.6 "Windows"): the binding exists (`crates/bridge-winfsp`); the
-/// daemon does not serve it.
-fn winfsp(situation: &Situation) -> AttachmentCapability {
-  unwired_bridge(
-    AttachTransport::WinFsp,
-    situation,
-    Platform::Windows,
-    TargetPathConstraint::DriveLetter,
-    sharing(true, KernelCache::NotEstablished, DeleteWhileOpen::Unlinked),
-  )
+/// The Windows WinFsp volume (§4.6 "Windows"; `crate::winfsp`): offered where WinFsp's library loads, at a drive
+/// letter, with Windows' cache kept for as long as the mount does not say otherwise (`FileInfoTimeout` infinite, every
+/// other path's change told by `FspFileSystemNotify`) and its writes held back by the cache manager until they are
+/// written back; refused `WinFspNotInstalled` on a Windows host without it.
+pub(crate) fn winfsp(situation: &Situation) -> AttachmentCapability {
+  let sharing = sharing(
+    true,
+    KernelCache::Negotiated {
+      writeback: true,
+      explicit_invalidation: true,
+    },
+    DeleteWhileOpen::Unlinked,
+  );
+  let target = TargetPathConstraint::DriveLetter;
+  match situation.platform {
+    Platform::Windows if situation.winfsp_installed => offered(
+      AttachTransport::WinFsp,
+      situation,
+      target,
+      sharing,
+      Residency::DaemonRamAndKernelCache,
+      Conformance::LiveKernelMountTest,
+    ),
+    Platform::Windows => refused(
+      AttachTransport::WinFsp,
+      situation,
+      UnsupportedReason::WinFspNotInstalled,
+      target,
+      sharing,
+      Residency::DaemonRamAndKernelCache,
+    ),
+    Platform::MacOs | Platform::Linux | Platform::Other => refused(
+      AttachTransport::WinFsp,
+      situation,
+      UnsupportedReason::HostPlatform,
+      target,
+      sharing,
+      Residency::DaemonRamAndKernelCache,
+    ),
+  }
 }
 
 /// What a delete of an open file does through a container bind: its host mount's rule — the macOS
@@ -615,6 +649,7 @@ struct HostFacts {
   os: String,
   kernel: Option<String>,
   fuse_available: bool,
+  winfsp_installed: bool,
 }
 
 fn host_facts_once() -> &'static HostFacts {
@@ -625,8 +660,21 @@ fn host_facts_once() -> &'static HostFacts {
       os,
       kernel,
       fuse_available: probe_fuse(),
+      winfsp_installed: probe_winfsp(),
     }
   })
+}
+
+/// Whether WinFsp's library loads on this host (Windows): the fact the WinFsp transport is offered by.
+#[cfg(windows)]
+fn probe_winfsp() -> bool {
+  slates_bridge_winfsp::host::installed()
+}
+
+/// No WinFsp off Windows.
+#[cfg(not(windows))]
+fn probe_winfsp() -> bool {
+  false
 }
 
 /// The report for `situation`: the host facts (read once per process), then every transport.
@@ -650,6 +698,7 @@ mod tests {
       nfs_listener_bound,
       may_write: true,
       fuse_available: false,
+      winfsp_installed: false,
       stream_route_bound: nfs_listener_bound,
     }
   }
@@ -789,16 +838,34 @@ mod tests {
     }
   }
 
-  /// Windows: WinFsp is the unwired bridge on a drive letter; the Unix mounts do not exist there.
+  /// Windows: WinFsp is the host mount on a drive letter where its library loads, with the live mount as its evidence
+  /// and Windows' cache invalidated explicitly; refused `WinFspNotInstalled` where it does not; the Unix mounts do not
+  /// exist there.
   #[test]
-  fn windows_names_winfsp_as_unwired_and_the_unix_mounts_as_other_platforms() {
+  fn windows_offers_winfsp_where_it_is_installed_and_the_unix_mounts_nowhere() {
     let situation = on(Platform::Windows, true);
     let winfsp = entry(&situation, AttachTransport::WinFsp);
     assert_eq!(
       winfsp.unsupported_reason,
-      Some(UnsupportedReason::BridgeNotWired)
+      Some(UnsupportedReason::WinFspNotInstalled)
     );
     assert_eq!(winfsp.target_path, TargetPathConstraint::DriveLetter);
+    let installed = entry(
+      &Situation {
+        winfsp_installed: true,
+        ..situation
+      },
+      AttachTransport::WinFsp,
+    );
+    assert!(installed.supported);
+    assert_eq!(installed.conformance, Conformance::LiveKernelMountTest);
+    assert_eq!(
+      installed.sharing.cache,
+      KernelCache::Negotiated {
+        writeback: true,
+        explicit_invalidation: true
+      }
+    );
     assert_eq!(
       entry(&situation, AttachTransport::Oci).unsupported_reason,
       Some(UnsupportedReason::HostPlatform)

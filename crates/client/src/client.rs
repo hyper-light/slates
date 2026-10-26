@@ -106,7 +106,9 @@ pub fn defers_reply(body: &RequestBody) -> bool {
         | RequestBody::Attach {
           form: AttachRequest::FuseMount { .. }
             | AttachRequest::ScopedFuseMount { .. }
-            | AttachRequest::SharedFuseMount { .. },
+            | AttachRequest::SharedFuseMount { .. }
+            // A WinFsp volume is answered once its mount thread has mounted it (§4.6 "Windows").
+            | AttachRequest::WinFspMount { .. },
           ..
         }
     )
@@ -3118,6 +3120,26 @@ impl Client {
       None,
       intent,
       AttachRequest::FuseMount {
+        mount_point: mount_point.to_owned(),
+      },
+    )
+  }
+
+  /// Attaches a Windows WinFsp volume of `volume` at the drive letter `mount_point` (`S:`), which the daemon mounts and
+  /// serves (§4.6 "Windows"); the reply comes once it is mounted and names the drive as its `path`. The attachment is
+  /// the mount's: it ends with a `detach` (which unmounts), the volume's destroy, or the daemon's process. Refused typed
+  /// where WinFsp is not installed or the mount point is not a free drive letter.
+  pub fn attach_winfsp(
+    &mut self,
+    volume: VolumeId,
+    intent: Intent,
+    mount_point: &str,
+  ) -> Result<Attachment, ClientError> {
+    self.attach_with(
+      volume,
+      None,
+      intent,
+      AttachRequest::WinFspMount {
         mount_point: mount_point.to_owned(),
       },
     )
