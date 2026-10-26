@@ -625,7 +625,7 @@ fn deliver_owed(
   *mount.owed = false;
   let too_long = round.too_long();
   if !round.is_empty() {
-    if mount.thread.notify(round.bytes().to_vec()).is_ok() {
+    if mount.thread.notify(Vec::new()).is_ok() {
       *mount.round_out = Some(before);
       *mount.told = mount
         .told
