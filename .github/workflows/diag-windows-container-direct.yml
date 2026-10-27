@@ -41,7 +41,11 @@ jobs:
             Set-Content -NoNewline -Path $file -Value $changed
           }
           git diff --stat
-      - name: Build the binary and the probe
+      # Run 40580524733 built them with the C runtime linked dynamically (the workspace's default), and neither started in
+      # Nano Server: exit 0xC0000135, STATUS_DLL_NOT_FOUND, the Visual C++ runtime (vcruntime140.dll) being absent there.
+      - name: Build the binary and the probe, the C runtime linked statically
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
         run: cargo build --release -p slates-cli --bin slates --example pod_direct_probe
       - name: Stage them for the container
         shell: pwsh
@@ -52,6 +56,7 @@ jobs:
           docker version --format '{{.Server.Version}} {{.Server.Os}}'
           [System.Environment]::OSVersion.Version
           docker pull --quiet mcr.microsoft.com/windows/nanoserver:ltsc2025
+          docker run --rm --isolation=process -v C:\slates-bin:C:\slates:ro mcr.microsoft.com/windows/nanoserver:ltsc2025 cmd /v:on /c "echo DIAG: user %USERNAME% & C:\slates\slates.exe --version & echo DIAG: version exit !errorlevel!"
       - name: "Leg A: the daemon and its clients inside one process-isolated container"
         id: leg_a
         continue-on-error: true
@@ -81,7 +86,7 @@ jobs:
           Write-Output "DIAG: the host's own map (the control):"
           & "$bin\pod_direct_probe.exe" map $volume /direct.bin 4194304 68
           Write-Output "DIAG: the container's map of the host daemon's file:"
-          docker run --rm --isolation=process -v C:\slates-bin:C:\slates:ro mcr.microsoft.com/windows/nanoserver:ltsc2025 cmd /v:on /c "whoami & C:\slates\pod_direct_probe.exe map $volume /direct.bin 4194304 68 & echo DIAG: container map exit !errorlevel!"
+          docker run --rm --isolation=process -v C:\slates-bin:C:\slates:ro mcr.microsoft.com/windows/nanoserver:ltsc2025 cmd /v:on /c "echo DIAG: user %USERNAME% & C:\slates\pod_direct_probe.exe map $volume /direct.bin 4194304 68 & echo DIAG: container map exit !errorlevel!"
           & "$bin\slates.exe" status | Select-String "dax.local_map"
           Stop-Process -Id $anchor.Id -Force
       - name: The verdict (leg A)

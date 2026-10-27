@@ -2,8 +2,7 @@
 rem The daemon and its clients inside one process-isolated container (the Windows container DAX cell's leg A).
 setlocal enabledelayedexpansion
 set S=C:\slates
-echo DIAG: whoami
-whoami
+echo DIAG: user %USERNAME%
 start "" /b %S%\slates.exe anchor --quick --shards 1
 set /a tries=0
 :wait
