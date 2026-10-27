@@ -149,12 +149,13 @@ COPY --from=l1 init /init
 RUN chmod 755 /init
 ```
 
-`/init`, the VM's first process:
+`/init`, the VM's first process (`l1.run=image` or `l1.run=shards` on the kernel's command line picks the suite):
 
 ```sh
 #!/bin/sh
-# The L1 VM's init: a real arm64 Linux with KVM (nested virtualization on an Apple M-series Mac), running slates'
-# Firecracker image test, whose pmem tests are the DAX matrix's arm64 microVM cell. Prints, then powers off.
+# The L1 VM's init: a real arm64 Linux with KVM (nested virtualization on an Apple M-series Mac). The kernel argument
+# `l1.run=` picks what it runs: `image`, slates' Firecracker image test (the arm64 microVM cell), or `shards`, Shards'
+# slates_fs tests (the arm64 Shards cells). Prints, then powers off.
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
@@ -164,18 +165,32 @@ mount -t devpts devpts /dev/pts
 mount -t tmpfs tmpfs /dev/shm
 mount -t tmpfs tmpfs /run
 mount -t tmpfs tmpfs /tmp
+# The loopback interface, which a fresh network namespace starts with down (Shards' tests serve an image locally).
+busybox ip link set lo up
 K=$(ls /lib/modules)
+RUN=$(sed -n 's/.*l1\.run=\([a-z]*\).*/\1/p' /proc/cmdline)
 echo "L1: $(uname -a)"
 echo "L1: $(dmesg | grep -m1 'started at EL')"
 ls -l /dev/kvm /dev/fuse
-echo "L1: firecracker $(/opt/firecracker/firecracker --version | head -1)"
-export HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin SLATES_TEST_CLI=1 \
-  SLATES_GUEST_FIRECRACKER=/opt/firecracker/firecracker SLATES_GUEST_VMLINUX=/boot/vmlinuz-$K \
-  SLATES_GUEST_PROBE=/opt/slates/slates-guest-probe SLATES_GUEST_MODULES=/lib/modules/$K
+export HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin SLATES_TEST_CLI=1
 mkdir -p /root
 cd /root
-/opt/slates/guest_image --test-threads=1 --nocapture 2>&1
-echo "L1: test exit $?"
+case "$RUN" in
+  shards)
+    export SLATES_BIN=/work/target/release/slates SHARDS_TEST_GUESTS=/opt/shards-guests SHARDS_REQUIRE_VMS=1
+    T=$(cat /opt/shards-test-binary)
+    echo "L1: shards test binary $T"
+    "$T" --test-threads=1 --nocapture 2>&1
+    echo "L1: test exit $?"
+    ;;
+  *)
+    echo "L1: firecracker $(/opt/firecracker/firecracker --version | head -1)"
+    export SLATES_GUEST_FIRECRACKER=/opt/firecracker/firecracker SLATES_GUEST_VMLINUX=/boot/vmlinuz-$K \
+      SLATES_GUEST_PROBE=/opt/slates/slates-guest-probe SLATES_GUEST_MODULES=/lib/modules/$K
+    /opt/slates/guest_image --test-threads=1 --nocapture 2>&1
+    echo "L1: test exit $?"
+    ;;
+esac
 busybox poweroff -f
 ```
 
@@ -189,6 +204,30 @@ tar -xf rootfs.tar boot/vmlinuz-6.12.113+deb13-arm64          # the kernel the V
 vzrun vmlinuz-6.12.113+deb13-arm64 l1-initrd.gz "console=hvc0 rdinit=/init loglevel=4" 6 16384 < /dev/null
 ```
 
+The Shards variant adds Shards' cross-built tests on top of that image, its `shards` and `shardsrc` build contexts being
+the Shards clone's `target/` and the clone itself (a `.dockerignore` there leaving out `target/`). Shards' tests are built
+on the Mac with Shards' own guest toolchain: `CC_aarch64_unknown_linux_musl=scripts/zig-cc`,
+`AR_aarch64_unknown_linux_musl=scripts/zig-ar`, `ZIG_TARGET=aarch64-linux-musl`,
+`CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld`, then `cargo build -p shards-testguest --profile guest --target
+aarch64-unknown-linux-musl --target-dir target/guest` and, with `CARGO_PROFILE_TEST_RELEASE_DEBUG=false`, `cargo test -p
+shards --profile test-release --no-run --message-format=json-render-diagnostics --target aarch64-unknown-linux-musl
+--target-dir target/l1 --test slates_fs`, whose JSON names the paths to place.
+
+```dockerfile
+# The arm64 KVM host's Shards variant: Shards' slates_fs tests, cross-built as static musl on the Mac as Shards' own
+# linux_tests() builds them, placed at the absolute paths their build baked in (CARGO_BIN_EXE_shards, OUT_DIR, the
+# carried helpers), with the test guest under SHARDS_TEST_GUESTS and the pinned kernel in Shards' artifact cache.
+FROM slates-vz-l1
+COPY --from=shardsrc . /Users/adalundhe/.cache/slates-scratch/shards-arm64/
+COPY --from=shards l1/aarch64-unknown-linux-musl/test-release/deps/slates_fs-3309d29f56a295f2 /Users/adalundhe/.cache/slates-scratch/shards-arm64/target/l1/aarch64-unknown-linux-musl/test-release/deps/slates_fs-3309d29f56a295f2
+COPY --from=shards l1/aarch64-unknown-linux-musl/test-release/shards /Users/adalundhe/.cache/slates-scratch/shards-arm64/target/l1/aarch64-unknown-linux-musl/test-release/shards
+COPY --from=shards l1/aarch64-unknown-linux-musl/test-release/build/shards-3e4a7afdb878dd44/out/ /Users/adalundhe/.cache/slates-scratch/shards-arm64/target/l1/aarch64-unknown-linux-musl/test-release/build/shards-3e4a7afdb878dd44/out/
+COPY --from=shards guest/aarch64-unknown-linux-musl/guest/shards-testguest /opt/shards-guests/guest/shards-testguest
+COPY --from=shards artifacts/Image-6.18.48-aarch64-e39058b2b627 /Users/adalundhe/.cache/slates-scratch/shards-arm64/target/artifacts/Image-6.18.48-aarch64-e39058b2b627
+COPY --from=l1 init /init
+RUN chmod 755 /init && echo /Users/adalundhe/.cache/slates-scratch/shards-arm64/target/l1/aarch64-unknown-linux-musl/test-release/deps/slates_fs-3309d29f56a295f2 > /opt/shards-test-binary
+```
+
 ## Results
 
 - **Firecracker's pmem DAX (2026-10-27, slates 9799eb77 with the test's module changes):** the image test 4 of 4 in
@@ -196,6 +235,13 @@ vzrun vmlinuz-6.12.113+deb13-arm64 l1-initrd.gz "console=hvc0 rdinit=/init logle
   Red-checked with the guest mounting `dax=never` (its own image, built with a separate cargo cache, `Compiling
   slates-cli` seen): the three pmem tests fail at "Mapped { dax: false }: DAX is what this test is for", the drive's
   passes. `virtiofs.md` §8, the microVM row for Linux arm64.
+- **Shards on Linux arm64 (2026-10-27, Shards `gpu` 8597f56, slates 9799eb77):** Shards' `slates_fs` suite, cross-built as
+  static musl on the Mac as Shards' own `linux_tests()` builds it (zig for its C, `rust-lld`), placed in the image at the
+  absolute paths its build baked in (`CARGO_BIN_EXE_shards`, the build script's `OUT_DIR` with `shards-init` and the
+  carried helpers), its test guest under `SHARDS_TEST_GUESTS` and its pinned kernel in its artifact cache (`l1.run=shards`):
+  4 of 4, both DAX routes, in 3.12 s. The mount route's own red-check, the share window off, fails at `dax /v/big no`.
+  The first run failed one test at `shards pull` of an image the test serves locally: init had left the loopback
+  interface down, which it now brings up.
 
 ## What the first runs found
 
@@ -206,3 +252,19 @@ vzrun vmlinuz-6.12.113+deb13-arm64 l1-initrd.gz "console=hvc0 rdinit=/init logle
   crypto-crc32c`), which `modprobe` honours and a guest without `modprobe` does not: "EXT4-fs (pmem0): Cannot load crc32c
   driver", all four tests failing. The test now carries a module's `modules.softdep` `pre:` modules too, resolved
   through `modules.alias` (`crypto-crc32c` is `crc32c_generic`).
+
+## The framework's virtio-fs device has no DAX window (2026-10-27)
+
+With `VZRUN_SHARE=DIR`, the launcher adds a `VZVirtioFileSystemDeviceConfiguration` sharing `DIR` read-only, tag
+`share`. A busybox guest of Debian's arm64 kernel (virtio-fs and FUSE DAX built in) then logged, on this Mac:
+
+```
+virtiofs virtio1: virtio_fs_setup_dax: No cache capability
+virtio-fs: dax can't be enabled as filesystem device does not support it.
+mount -t virtiofs -o dax=always share /mnt   -> exit 255
+mount -t virtiofs share /mnt                 -> 0, the Mac's file read whole
+```
+
+So no guest of Apple's framework maps a shared file through a window, and Docker Desktop's containers, whose VM shares
+the Mac's folders through the same device (`virtiofs0 /run/host_virtiofs/Users`), cannot either (`virtiofs.md` §8).
+

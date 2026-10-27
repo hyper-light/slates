@@ -11709,8 +11709,11 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     - QEMU and Kata on it: upstream vhost-user-fs has no window property;
     - Cloud Hypervisor: "it is not available";
     - crosvm on arm64: DAX is x86_64-only;
-    - Docker Desktop on macOS, and Apple's framework: no documented window (unconfirmed);
-    - WSL2: 9P (unconfirmed);
+    - Docker Desktop on macOS, and Apple's framework: measured 2026-10-27, the framework's virtio-fs device has no cache
+      window (`virtio_fs_setup_dax: No cache capability`; `dax=always` refused), and Docker Desktop's VM shares the
+      Mac's folders through that device (`virtiofs0 /run/host_virtiofs/Users`) under its `fakeowner` layer;
+    - WSL2: measured 2026-10-27 on CI's `windows-2025` (WSL 3.0.3.0): Windows' drives are 9P mounts in the guest
+      (`C:\ /mnt/c 9p …aname=drvfs`), a message protocol with no window to map (run 40585743122);
     - Firecracker's socket route: it has no fs device.
   - **Owed, each to a kiln goal:**
     - the direct map on arm64 Windows: proven 2026-10-27 (above). **Corrected 2026-10-25:** this entry and the matrix
@@ -11739,8 +11742,10 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       hypervisor mode (`kvm [1]: HYP mode not available`, no `/dev/kvm`; diagnostics run 40570705949, 2026-10-27), and
       Docker Desktop's VM on this kiln's Macs has no `/dev/kvm` either. Apple's Virtualization framework does, with
       nested virtualization on (M3 and later): a Linux guest boots at EL2 with KVM on this Mac (`arm64-kvm-on-a-mac.md`).
-      **Firecracker's pmem DAX proven there 2026-10-27** (the image test 4 of 4; `virtiofs.md` §8). Shards on Linux
-      arm64 still owed, on the same host;
+      **Firecracker's pmem DAX proven there 2026-10-27** (the image test 4 of 4, red-checked with `dax=never`), and
+      **Shards on Linux arm64 by both routes** (its `slates_fs` suite 4 of 4: the stream's DAX and its own window over a
+      `slates mount`, the new byte seen after 19.99 ms; the mount route red-checked with the window off, `dax /v/big no`;
+      `virtiofs.md` §8). Not a CI lane: GitHub has no arm64 host with KVM to run one on;
     - macOS writable shared maps over NFS.
 - **A READ reply past 64 KiB closed the RPC-with-TLS export (found and fixed 2026-10-25, `3e05c70d`).** rustls caps
   its buffer of sealed records at 64 KiB, and the session's send wrote a reply with `write_all`, so any READ reply past
