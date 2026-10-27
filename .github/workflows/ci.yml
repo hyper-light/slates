@@ -489,8 +489,9 @@ jobs:
       # attachment's named pipe into the test, which speaks FUSE through it in Shards' framing; hostile frames, a
       # destroy and a revocation each end the attachment; a second process is refused the pipe `ERROR_PIPE_BUSY`.
       # Windows' DAX window (plan G-shards-windows step 5): a descriptor ask naming a process that does not hold the
-      # stream is refused `EACCES` with nothing put into it; a genuine one maps the section, stores, fsyncs. One
-      # test at a time, as the client binary's other daemon-per-test suites run here.
+      # stream is refused `EACCES` with nothing put into it; a genuine one maps the section, stores, fsyncs, sees another
+      # attachment's write and has its backing let go at the end; an untouched base file's section is refilled with the
+      # host's edit. One test at a time, as the client binary's other daemon-per-test suites run here.
       - name: Test the Shards form over the handle route (native Windows)
         if: ${{ !cancelled() }}
         timeout-minutes: 15

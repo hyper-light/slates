@@ -453,6 +453,18 @@ impl ShardsBackings {
     (self.peers, self.peer_bytes)
   }
 
+  /// The VMMs' backings held now, and what all backings count against the budget: what a stream's end gives back
+  /// (its backings let go, their charge returned), for a test or an operator to hold to its starting value.
+  #[must_use]
+  pub fn vmms_held(&self) -> (usize, u64) {
+    let vmms = self
+      .slab
+      .iter()
+      .filter(|(_, backing)| matches!(backing.object, BackingObject::Vmm(_)))
+      .count();
+    (vmms, self.charged)
+  }
+
   /// The object's bytes of the same-kernel client's backing `handle` names, if it is one and live: what it counts
   /// against its client's share.
   #[must_use]

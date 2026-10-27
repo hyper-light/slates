@@ -49,11 +49,11 @@ use crate::{FsKind, WINDOWS_NAME_BREAKS, granularity_for, one_entry};
 
 /// Format: Windows file times count 100 ns intervals since 1601.
 const HUNDRED_NS: i64 = 100;
-/// Format: the FILETIME epoch (1601-01-01) precedes the Unix epoch (1970-01-01) by 11,644,473,600
-/// seconds, so a Unix time enters the FILETIME domain the fingerprints use by adding it.
-const FILETIME_EPOCH_OFFSET_S: i64 = 11_644_473_600;
-/// Format: nanoseconds per second.
-const NS_PER_S: i64 = 1_000_000_000;
+/// Format: the FILETIME epoch (1601-01-01) precedes the Unix epoch (1970-01-01) by 11,644,473,600 seconds, which is
+/// this many 100 ns intervals. A file time leaves the FILETIME domain by subtracting it before its intervals become
+/// nanoseconds: nanoseconds since 1601 pass `i64::MAX` for any date after 1893, so every time saturated
+/// (docs/bugs/2026-10-26-windows-base-file-times-saturated-so-no-outsider-edit-was-seen.md).
+const FILETIME_UNIX_EPOCH_TICKS: i64 = 116_444_736_000_000_000;
 
 /// Format: `FILE_FLAG_BACKUP_SEMANTICS`, which lets `CreateFileW` open a directory handle.
 const BACKUP_SEMANTICS: u32 = 0x0200_0000;
@@ -377,7 +377,7 @@ fn fingerprint_of_handle(
       info.ftLastWriteTime.dwLowDateTime,
     )
   } else {
-    basic.ChangeTime.saturating_mul(HUNDRED_NS)
+    unix_ns_of_ticks(basic.ChangeTime)
   };
   Ok(Fingerprint {
     dev: u64::from(info.dwVolumeSerialNumber),
@@ -401,11 +401,17 @@ fn fingerprint_of_handle(
   })
 }
 
-/// A `FILETIME` as nanoseconds.
+/// A `FILETIME` as nanoseconds since the Unix epoch, the domain every host's fingerprints are in.
 fn filetime_ns(high: u32, low: u32) -> i64 {
   let ticks = (u64::from(high) << u32::BITS) | u64::from(low);
-  i64::try_from(ticks)
-    .unwrap_or(i64::MAX)
+  unix_ns_of_ticks(i64::try_from(ticks).unwrap_or(i64::MAX))
+}
+
+/// A count of 100 ns intervals since 1601 as nanoseconds since the Unix epoch: the epoch's intervals subtracted
+/// first, so every date to 2262 fits.
+fn unix_ns_of_ticks(ticks: i64) -> i64 {
+  ticks
+    .saturating_sub(FILETIME_UNIX_EPOCH_TICKS)
     .saturating_mul(HUNDRED_NS)
 }
 
@@ -500,15 +506,11 @@ impl HostFs for OsHost {
   }
 
   fn now_ns(&mut self) -> i64 {
-    // The fingerprints' timestamps are FILETIME nanoseconds (`filetime_ns`), so "now" is too.
+    // The fingerprints' timestamps are nanoseconds since the Unix epoch (`filetime_ns`), so "now" is too.
     let since_unix = std::time::SystemTime::now()
       .duration_since(std::time::UNIX_EPOCH)
       .unwrap_or(std::time::Duration::ZERO);
-    i64::try_from(since_unix.as_secs())
-      .unwrap_or(i64::MAX)
-      .saturating_add(FILETIME_EPOCH_OFFSET_S)
-      .saturating_mul(NS_PER_S)
-      .saturating_add(i64::from(since_unix.subsec_nanos()))
+    i64::try_from(since_unix.as_nanos()).unwrap_or(i64::MAX)
   }
 
   fn fingerprint_dir(&mut self, dir: HostDir) -> Result<Fingerprint, HostError> {

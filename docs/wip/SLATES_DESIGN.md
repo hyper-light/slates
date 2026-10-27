@@ -12517,25 +12517,40 @@ readied before its fill; the page size from `slates-machine`, so no `rustix`), `
   is stores of zeros.
 - **One code path.** The backed session and the stream's DAX module are the Unix ones. Only the parse of the ask, the
   claim and the hand-off are paired `#[cfg]` functions.
+- **Fixed on the way: Windows base file times saturated, so no outsider's edit was ever seen**
+  (`docs/bugs/2026-10-26-windows-base-file-times-saturated-so-no-outsider-edit-was-seen.md`). The Windows host kept
+  every time as nanoseconds since 1601, which pass `i64::MAX` for any date after 1893. So every modification, change
+  and birth time was `i64::MAX`, measured by the guest's `GETATTR` and by instrumenting `follow_live_disk`, and
+  `now_ns` saturated too. Every host time is now nanoseconds since the Unix epoch, as on Unix:
+  `crates/base/src/windows.rs`, with `crates/base/tests/host.rs`
+  `a_files_times_are_unix_nanoseconds_and_an_in_place_edit_moves_them`, which failed on jupiter before the fix and runs
+  on every host.
 - **Rejected: the pipe's name, as the goal stated it** (above: it lets an asker hold the shard). **Rejected: the
   daemon keeping a duplicate of the client end as the reference.** Any handle keeps the pipe's client open, so the
   stream would never end when its VM did.
 - **Proven** on jupiter (Windows 10.0.26200), 2026-10-26:
-  - `crates/client/tests/shards.rs` 9 of 9 in each of 3 runs, among them the two DAX tests against an in-process
+  - `crates/client/tests/shards.rs` 10 of 10 in each of 3 runs, among them the three DAX tests against an in-process
     daemon. Four hostile claimants each get `EACCES`, counted `shards.dax_claim_refused`, with the named process's
     handle count the same before and after, and the stream serving on: a process holding another attachment's pipe,
     one holding an event and no pipe, a value naming nothing, and a process that has exited. A genuine claimant names
     a second handle of its own stream, a different value of the same object, and maps the section it is handed. The
     section holds exactly the file's 8,292 bytes and zeros to the end of the range. The claimant stores into it and
     sends `FSYNC`, and slates' own read returns the stored bytes. A write through another attachment shows in the map
-    at once, and still after a request on the stream. A duplicate that may rewrite the descriptor is refused
-    `ERROR_ACCESS_DENIED`.
+    at once, and still after a request on the stream, and the guest's next `FSYNC` (the compare-back) leaves it
+    standing in the volume and the map. A duplicate that may rewrite the descriptor is refused `ERROR_ACCESS_DENIED`.
+    The backing is held while the attachment lives (one, 2 MiB charged) and let go, its charge given back, when the
+    attachment ends (`Daemon::dax_backings_held` back to zero).
+  - The refill, beneath an overlay over a real directory in the build output: a read-only section of an untouched base
+    file shows the host's in-place edit by the reply to the guest's next `GETATTR`, every other byte as it was,
+    `shards.dax_refilled` counted. Its first run found that no Windows overlay had ever seen an in-place edit: every
+    base file's times were `i64::MAX` (fixed on the way, below).
   - `crates/mem/tests/dax_section.rs` 2 of 2: a section of 132,766,498,816 bytes (63,308 ranges, the machine's
     memory) whose first and last ranges each side reads and stores; a read-only and a writable duplicate each refused
     `WRITE_DAC`, and the read-only one refused a duplicate or a view that writes.
   - Red-checked in a scratch tree: the claim check passing everyone handed the section to a holder of another pipe
-    (`Ok(192)` where `EACCES` was asserted); an owner-all descriptor granted the widening duplicate in both tests; and
-    ranges never committed killed the test process (`STATUS_ACCESS_VIOLATION`).
+    (`Ok(192)` where `EACCES` was asserted); an owner-all descriptor granted the widening duplicate in both tests;
+    ranges never committed killed the test process (`STATUS_ACCESS_VIOLATION`); and an ended stream that let nothing go
+    kept its backing (`(1, 2097152)` where `(0, 0)` was asserted). The refill test failed 3 of 3 before the fix below.
   - Measured, release build, 3 runs of 41: a section's making takes 4 to 16 µs at p50 (53 µs at most) once the
     process has made one confined section. The first confined section a process makes, a peer's or a DAX one, costs
     592 to 837 µs (the descriptor's conversion), which the first ask's shard pays (GAPS).

@@ -1202,6 +1202,22 @@ impl Daemon {
     Ok(held)
   }
 
+  /// The VMMs' DAX backings this daemon holds, on every shard, and what every backing counts against the shards' fill
+  /// budgets (§4.6, A-163, A-180): what a stream's end lets go, for a test or an operator to hold to its starting value.
+  /// An observation the daemon could not make is its typed refusal.
+  pub fn dax_backings_held(&self) -> Result<(usize, u64), ObserveError> {
+    let mut held = (0usize, 0u64);
+    for shard in self.shards.iter().copied() {
+      let (backings, charged) =
+        self.observe(Some(shard), |s| s.store.shards_backings.vmms_held())?;
+      held = (
+        held.0.saturating_add(backings),
+        held.1.saturating_add(charged),
+      );
+    }
+    Ok(held)
+  }
+
   /// The hosts this daemon's fleet currently sees alive (§4.8) — this node and the peers its control-shard
   /// membership loop has probed and found live — for a test or an operator to observe the membership the
   /// verbs read for placement. An observation the daemon could not make is its typed refusal

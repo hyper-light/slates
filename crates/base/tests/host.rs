@@ -327,7 +327,6 @@ fn an_overlay_over_the_workspace_tree_digests_a_file_as_the_disk_holds_it() {
 /// Shape: the floor for the pause that lets a filesystem's timestamp tick close so a digest may be
 /// kept — two milliseconds, far past the nanosecond granularity of tmpfs and APFS and macOS's
 /// microsecond clock resolution, which is what this constant alone used to assume.
-#[cfg(unix)]
 const TICK_FLOOR: std::time::Duration = std::time::Duration::from_millis(2);
 
 /// Derived: the pause this host actually needs, from the same measured number the base plane
@@ -341,7 +340,6 @@ const TICK_FLOOR: std::time::Duration = std::time::Duration::from_millis(2);
 /// granularity *plus* clock resolution can reach past two milliseconds, the digest is correctly not
 /// kept, and the test failed 3/3 on aarch64 Linux in a container while passing on macOS/APFS and on
 /// btrfs. The product was right; the constant was the part that assumed a filesystem.
-#[cfg(unix)]
 fn tick_for(facts: &slates_vfs::host::HostFacts) -> std::time::Duration {
   std::time::Duration::from_nanos(facts.timestamp_granularity_ns.saturating_mul(2)).max(TICK_FLOOR)
 }
@@ -727,4 +725,62 @@ fn an_in_place_write_to_an_opened_base_file_hints_its_directory() {
     after_close.contains(&slates_vfs::host::Hint::Entry(root, "f".into())),
     "inotify: the directory's watch hears a write to any file in it, open or not: {after_close:?}"
   );
+}
+
+/// Shape: how far a file's times and the host's clock may lie from this process's wall clock and still be the same
+/// instant, the write and the reads between them included.
+const CLOCK_SLACK_NS: i64 = 60 * 1_000_000_000;
+
+/// This process's wall clock as nanoseconds since the Unix epoch, the domain every host time is in.
+fn unix_now_ns() -> i64 {
+  let since = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .unwrap();
+  i64::try_from(since.as_nanos()).unwrap()
+}
+
+/// docs/bugs/2026-10-26-windows-base-file-times-saturated-so-no-outsider-edit-was-seen.md, by use, on every host. Do:
+/// over a real directory in the build output, fingerprint a file just written, read the host's clock, wait past the
+/// filesystem's granularity, write over the file's first bytes in place and fingerprint it again. Expect each time and
+/// the host's clock within a minute of this process's wall clock, in nanoseconds since the Unix epoch, and the edit to
+/// move the file's modification time forward. On Windows each time had been 100 ns ticks since 1601 multiplied to
+/// nanoseconds, past `i64::MAX` for any date after 1893, so every file reported `i64::MAX` and no edit was ever seen.
+#[test]
+fn a_files_times_are_unix_nanoseconds_and_an_in_place_edit_moves_them() {
+  use std::io::Write;
+  let owned = BuildOutputDir::new("times");
+  let dir = owned.0.clone();
+  let (mut host, root) = OsHost::open_root(&dir).unwrap();
+  let tick = tick_for(&host.facts(root).unwrap());
+  std::fs::write(dir.join("f"), b"the first bytes").unwrap();
+  let file = host.open_file(root, "f").unwrap();
+  let before = host.fstat(file).unwrap();
+  let now = host.now_ns();
+  let wall = unix_now_ns();
+  for (what, time) in [
+    ("mtime", before.mtime_ns),
+    ("ctime", before.ctime_ns),
+    ("birth", before.birth_ns),
+    ("now", now),
+  ] {
+    assert!(
+      (time - wall).abs() < CLOCK_SLACK_NS,
+      "{what} {time} is not near the wall clock {wall}"
+    );
+  }
+  std::thread::sleep(tick);
+  let mut edit = std::fs::OpenOptions::new()
+    .write(true)
+    .open(dir.join("f"))
+    .unwrap();
+  edit.write_all(b"an outsider's").unwrap();
+  drop(edit);
+  let after = host.fstat(file).unwrap();
+  assert!(
+    after.mtime_ns > before.mtime_ns,
+    "the edit moved the modification time: {} then {}",
+    before.mtime_ns,
+    after.mtime_ns
+  );
+  assert_eq!(after.size, before.size);
 }

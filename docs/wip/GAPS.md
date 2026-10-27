@@ -11875,7 +11875,17 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   `CompareObjectHandles` against a known holder, never by a name query, which hung past 3 s on a synchronous pipe with
   a read pending (measured on jupiter). Then it fills and commits the asked ranges of a confined reserved section
   sized to the machine's memory, and duplicates it into that process. Proven on jupiter, 3 runs of
-  `crates/client/tests/shards.rs` (9 of 9 each) and `crates/mem/tests/dax_section.rs`, red-checked three ways (A-180).
+  `crates/client/tests/shards.rs` (10 of 10 each: the claim, the map, store and `FSYNC`, another attachment's write
+  through a compare-back, the refill of an untouched base file, the backing let go at the end) and
+  `crates/mem/tests/dax_section.rs`, red-checked four ways (A-180).
+  - **Fixed on the way: every Windows base file's times were `i64::MAX`**, so no in-place edit beneath a Windows
+    overlay was ever seen (`docs/bugs/2026-10-26-windows-base-file-times-saturated-so-no-outsider-edit-was-seen.md`).
+    Every host time is now nanoseconds since the Unix epoch.
+  - **Open, environment: two `slates-base` junction tests fail on jupiter**
+    (`an_intermediate_swapped_for_a_junction_is_never_traversed`, `a_retained_root_keeps_naming_the_base_after_its_path_becomes_a_junction`):
+    `cmd /C mklink /J` reads the forward-slash `CARGO_TARGET_TMPDIR` (`C:/Users/...`) as a switch, "Invalid switch -
+    "Users"", with this change and without it. CI's runner has not reported it; the fixture should pass the paths with
+    backslashes.
   **Owed:** Shards'
   device on Windows (step 6, the Shards side), a real guest over it (needs WHP and an AppContainer per VM; GitHub's
   runners), and arm64 Windows.

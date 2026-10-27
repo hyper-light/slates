@@ -1073,6 +1073,104 @@ mod delivered {
       }
     }
 
+    impl Guest {
+      /// Asks for `node`'s attributes: the errno of the `GETATTR`.
+      fn getattr(&mut self, node: u64) -> i32 {
+        errno(&self.ask(Opcode::GetAttr, node, &[0u8; 16]))
+      }
+    }
+
+    /// Format: what the host writes over the base file's first bytes, as an outsider beneath an overlay.
+    const OUTSIDERS_EDIT: &[u8] = b"an outsider's edit";
+
+    /// A directory of the test's own in the build output (A-50), named by the process, holding `name` of `bytes`;
+    /// removed when dropped.
+    struct HostDir(std::path::PathBuf);
+
+    impl HostDir {
+      fn holding(name: &str, bytes: &[u8]) -> HostDir {
+        let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+          .join(format!("slates-shards-dax-{}", std::process::id()));
+        // The test's own directory in the build output (A-50), as is every write below.
+        #[allow(clippy::disallowed_methods)]
+        std::fs::create_dir_all(&path).unwrap();
+        #[allow(clippy::disallowed_methods)]
+        std::fs::write(path.join(name), bytes).unwrap();
+        HostDir(path)
+      }
+
+      /// Writes `bytes` over the first bytes of `name`, in place, as an outsider does.
+      fn edit_in_place(&self, name: &str, bytes: &[u8]) {
+        #[allow(clippy::disallowed_methods)]
+        let mut file = std::fs::OpenOptions::new()
+          .write(true)
+          .open(self.0.join(name))
+          .unwrap();
+        file.write_all(bytes).unwrap();
+      }
+    }
+
+    impl Drop for HostDir {
+      fn drop(&mut self) {
+        #[allow(clippy::disallowed_methods)]
+        let _removed = std::fs::remove_dir_all(&self.0);
+      }
+    }
+
+    /// T-shards-windows-5.6, beneath an overlay. Do: map the first range of a base file no one has written, to read,
+    /// through a section; the host edits the file in place; the guest asks for the file's attributes. Expect the
+    /// section to show the edit by the time the reply arrives and every other byte as it was, the refill counted: an
+    /// untouched file follows the disk (D-25), and so does a section of it.
+    #[test]
+    fn a_section_of_an_untouched_base_file_is_refilled_with_an_outsiders_edit() {
+      let (daemon, mut client) = start("dax-refill");
+      let file = pattern();
+      let host = HostDir::holding("based.bin", &file);
+      let overlay = client
+        .create(&CreateSpec {
+          name: "dax-refill".to_owned(),
+          size: SizeClass::Bounded { limit: QUOTA },
+          names: NamePolicy::Exact,
+          require_locked: false,
+          base: Some(host.0.to_string_lossy().into_owned()),
+        })
+        .unwrap();
+      let mut guest = Guest::over(client.attach_shards(overlay, Intent::Read, None).unwrap());
+      let node = guest.lookup(ROOT, "based.bin").unwrap();
+      let value = guest
+        .descriptor(node, false, std::process::id(), guest.stream_value())
+        .unwrap();
+      // SAFETY: the value the daemon duplicated into this process, taken as this test's own.
+      let section = unsafe {
+        OwnedHandle::from_raw_handle(std::ptr::with_exposed_provenance_mut(
+          usize::try_from(value).unwrap(),
+        ))
+      };
+      let map = Mapped::map(&section, FILE_MAP_READ).unwrap();
+      assert_eq!(map.read(0, FILE_BYTES), file);
+      host.edit_in_place("based.bin", OUTSIDERS_EDIT);
+      assert_eq!(guest.getattr(node), 0, "GETATTR");
+      assert_eq!(
+        map.read(0, OUTSIDERS_EDIT.len()),
+        OUTSIDERS_EDIT,
+        "the section shows the edit by the reply"
+      );
+      assert_eq!(
+        map.read(OUTSIDERS_EDIT.len(), FILE_BYTES - OUTSIDERS_EDIT.len()),
+        &file[OUTSIDERS_EDIT.len()..],
+        "and every other byte as it was"
+      );
+      let refusals = daemon.refusals_on_every_shard().unwrap();
+      assert!(
+        refusals
+          .get("shards.dax_refilled")
+          .is_some_and(|&count| count >= 1),
+        "{refusals:?}"
+      );
+      drop(map);
+      drop((section, guest, client, daemon, host));
+    }
+
     /// A file of [`FILE_BYTES`] whose every byte names its offset, so a byte out of place shows.
     fn pattern() -> Vec<u8> {
       (0..FILE_BYTES)
@@ -1214,6 +1312,48 @@ mod delivered {
       assert_eq!((done, unsafe { GetLastError() }), (0, ERROR_ACCESS_DENIED));
     }
 
+    /// T-shards-windows-5.5's ledger: the one ask answered, no claim refused.
+    fn one_ask_answered_and_none_refused(daemon: &Daemon) {
+      let refusals = daemon.refusals_on_every_shard().unwrap();
+      assert_eq!(
+        refusals.get("shards.dax_answered"),
+        Some(&1),
+        "{refusals:?}"
+      );
+      assert_eq!(
+        refusals.get("shards.dax_claim_refused"),
+        None,
+        "{refusals:?}"
+      );
+    }
+
+    /// T-shards-windows-5.5's end: the backing is held while the attachment lives, and let go when it ends.
+    fn the_end_lets_the_backing_go(
+      daemon: &Daemon,
+      client: &mut Client,
+      id: VolumeId,
+      own: u64,
+      holders: (Guest, OwnedHandle),
+    ) {
+      // The backing is held while the attachment lives, and let go, its charge given back, when it ends; the section
+      // this process was handed stays its own to close.
+      let held = daemon.dax_backings_held().unwrap();
+      assert_eq!(
+        held.0, 1,
+        "one backing while the attachment lives: {held:?}"
+      );
+      assert!(held.1 > 0, "{held:?}");
+      client.detach(own).unwrap();
+      // Every holder of the stream's client end closes it, the second handle too, so the stream ends.
+      drop(holders);
+      wait_for_attachments(client, id, 0);
+      assert_eq!(
+        daemon.dax_backings_held().unwrap(),
+        (0, 0),
+        "the attachment's end lets its backing go"
+      );
+    }
+
     /// T-shards-windows-5.5. Do: ask for a file's section naming this process and a second handle of its own stream
     /// (the same pipe, another value), map the range it answers, check the file's bytes, store into the map and send
     /// `FSYNC`; then write the file through another slates attachment, and try to widen the handed section. Expect the
@@ -1233,7 +1373,7 @@ mod delivered {
       let this = unsafe { GetCurrentProcess() };
       let second = duplicate_into(guest.stream.0.as_raw_handle(), this);
       // SAFETY: the duplicate just made in this process, owned here and closed at the test's end.
-      let _second = unsafe {
+      let second_handle = unsafe {
         OwnedHandle::from_raw_handle(std::ptr::with_exposed_provenance_mut(
           usize::try_from(second).unwrap(),
         ))
@@ -1272,22 +1412,25 @@ mod delivered {
       assert_eq!(read.len(), FILE_BYTES);
 
       let own = another_write_shows_in_the_map(&mut client, id, &mut guest, &map);
+      // The compare-back at the guest's next sync finds the map equal to the volume: nothing of the guest's older view
+      // is written back over the other attachment's write.
+      assert_eq!(guest.fsync(node, fh), 0, "FSYNC after the other write");
+      assert_eq!(
+        client.read(id, "/mapped.bin", ReadAt::Head).unwrap(),
+        REWRITTEN,
+        "slates reads the other attachment's write after the compare-back"
+      );
+      assert_eq!(
+        map.read(0, REWRITTEN.len()),
+        REWRITTEN,
+        "and the map still shows it"
+      );
       a_widening_duplicate_is_refused(&section);
 
-      let refusals = daemon.refusals_on_every_shard().unwrap();
-      assert_eq!(
-        refusals.get("shards.dax_answered"),
-        Some(&1),
-        "{refusals:?}"
-      );
-      assert_eq!(
-        refusals.get("shards.dax_claim_refused"),
-        None,
-        "{refusals:?}"
-      );
+      one_ask_answered_and_none_refused(&daemon);
+      the_end_lets_the_backing_go(&daemon, &mut client, id, own, (guest, second_handle));
       drop(map);
-      client.detach(own).unwrap();
-      drop((guest, client, daemon));
+      drop((section, client, daemon));
     }
   }
 }
