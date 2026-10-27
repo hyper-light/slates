@@ -743,8 +743,8 @@ Owed from A-183:
   shedding tasks.
 - **The MCP test in the Windows CI lanes,** once landing runs on Windows: it passes there through the HTTP edge and
   stops at `slates.land.materialize`'s `Unsupported`.
-- **Linux sockets close-on-exec as they are made** (`SOCK_CLOEXEC`): the seam sets the flag after `socket()`, so a
-  process that another thread starts in between inherits the socket. macOS has no atomic form.
+- **Linux sockets close-on-exec as they are made:** closed 2026-10-26 (`SOCK_CLOEXEC | SOCK_NONBLOCK` at `socket()`,
+  `accept4` for accepted ones). macOS has no atomic form and keeps the set-right-after window.
 
 **Closed 2026-10-26 by A-184:** the NFS server, and with it the network export, on Windows. A connection there frames
 its requests in its own inbox, since Windows keeps no receive low-water mark. Owed from A-184:

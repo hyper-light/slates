@@ -645,11 +645,13 @@ jobs:
   # this landed: `Microsoft.VisualStudio.Component.VC.Tools.ARM64`, LLVM 22.1.8 with the clang-cl
   # components, rustup and clippy.
   #
-  # Scoped to the five crates the cross-lint above already proves compile for the target, so the one
-  # new variable is native execution. base, vfs, server and the SDKs are the next increment and are
-  # left out deliberately: they pull `zstd-sys` and `aws-lc-sys`, and aws-lc-sys's builder refuses
-  # aarch64-pc-windows-msvc without clang-cl, which is present on this image but has never been
-  # exercised for that target. On main and the nightly only, as `windows-nightly` is, so a first run
+  # Scoped at first to the five crates the cross-lint above proves compile for the target, so the one
+  # new variable was native execution. Since 2026-10-26 (docs/wip/platforms.md) it also builds and runs
+  # the daemon, the client, the NFS export and `slates shards`, none of which had ever run on arm64
+  # Windows: they pull `aws-lc-sys`, whose builder refuses aarch64-pc-windows-msvc without clang-cl, so
+  # the lane points the target's C compiler at the image's clang-cl first. That is how `cargo xwin` lints
+  # them for this target, and they linted clean that way on 2026-10-26, every target of each. The SDKs
+  # are still left out. On main and the nightly only, as `windows-nightly` is, so a first run
   # that finds something real does not block every pull request.
   #
   # Unlike every other lane added this week, this one could not be rehearsed before landing: there is
@@ -695,6 +697,47 @@ jobs:
         run: 'cargo test -p slates-rt --lib thread_clock::'
       - name: Test the wire codec and its CRC32C on arm64 hardware
         run: cargo test -p slates-wire
+      # aws-lc-sys builds its C and its arm64 assembly with clang-cl on this target (its builder refuses cl.exe here);
+      # the image carries LLVM with the clang-cl components. The target's C compiler is named for every later step.
+      - name: clang-cl for the C the daemon links (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          & $clang --version
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Clippy the daemon, the client and the MCP server natively on arm64 Windows
+        if: ${{ !cancelled() }}
+        run: >-
+          cargo clippy -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-anchor
+          -p slates-bridge-winfsp -p slates-mcp --all-targets -- -D warnings
+      - name: Clippy the shipped binary and its Shards test natively on arm64 Windows
+        if: ${{ !cancelled() }}
+        run: cargo clippy -p slates-cli --bin slates --test shards -- -D warnings
+      # The daemon on a weak memory model: an in-process daemon found through the rendezvous, its verbs over the rings,
+      # the async driver; one test at a time, as on x86_64 (each daemon is sized from the whole machine).
+      - name: Test the client binary and the async driver, one test at a time (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: cargo test -p slates-client --test client --test driver -- --test-threads=1
+      - name: Test the Shards form over the handle route (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: cargo test -p slates-client --test shards -- --test-threads=1
+      - name: Test the NFS server and the network export (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: cargo test -p slates-server --test nfs_hostile --test nfs_tls -- --test-threads=1
+      - name: The Shards hand-off through the CLI (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        env:
+          SLATES_TEST_CLI: "1"
+        run: cargo test -p slates-cli --test shards -- --nocapture
 
   # Linux arm64, run natively (G-arm64-host): the same-kernel direct map, the FUSE mount's maps and the containers that
   # map through either, on GitHub's `ubuntu-24.04-arm` image, free for a public repository as `windows-11-arm` is. The

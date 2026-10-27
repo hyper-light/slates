@@ -62,19 +62,33 @@ mod imp {
   }
 
   pub(crate) fn dgram_socket() -> Result<Socket, RtError> {
-    // `SocketFlags` on `socket()` is Linux-only, so non-blocking/cloexec are set after creation.
-    let fd = socket_with(
-      AddressFamily::INET,
-      SocketType::DGRAM,
-      SocketFlags::empty(),
-      None,
-    )
-    .map_err(|e| refused("socket(DGRAM)", e))?;
-    rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)
-      .map_err(|e| refused("fcntl(CLOEXEC)", e))?;
-    rustix::io::ioctl_fionbio(&fd, true).map_err(|e| refused("ioctl(FIONBIO)", e))?;
+    let fd = new_socket(SocketType::DGRAM, "socket(DGRAM)")?;
     set_dont_fragment(&fd)?;
     Ok(Socket { fd })
+  }
+
+  /// A non-blocking, close-on-exec INET socket of `kind`, made so in the one call on Linux (`SOCK_CLOEXEC |
+  /// SOCK_NONBLOCK`, socket(2)): a process another thread starts between a `socket()` and a later `fcntl` would keep a
+  /// copy for its whole life, its copy never marked. `call` names the creation in a refusal.
+  #[cfg(target_os = "linux")]
+  fn new_socket(kind: SocketType, call: &'static str) -> Result<OwnedFd, RtError> {
+    socket_with(
+      AddressFamily::INET,
+      kind,
+      SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+      None,
+    )
+    .map_err(|e| refused(call, e))
+  }
+
+  /// A non-blocking, close-on-exec INET socket of `kind`: macOS's `socket()` takes no such flags, so both are set right
+  /// after it, and a process another thread starts in that window can keep a copy (Apple offers no atomic form).
+  #[cfg(not(target_os = "linux"))]
+  fn new_socket(kind: SocketType, call: &'static str) -> Result<OwnedFd, RtError> {
+    let fd = socket_with(AddressFamily::INET, kind, SocketFlags::empty(), None)
+      .map_err(|e| refused(call, e))?;
+    set_nonblocking_cloexec(&fd)?;
+    Ok(fd)
   }
 
   /// Sets the don't-fragment bit on every datagram the socket sends, and has the kernel leave the
@@ -219,26 +233,37 @@ mod imp {
     Ok(socket)
   }
 
-  /// Creates a non-blocking, close-on-exec INET stream socket. `SocketFlags` on `socket()` is Linux-only, so
-  /// close-on-exec and non-blocking are set after creation, as the datagram socket does: the driver provides the
-  /// waiting, and the descriptor is not inherited across an exec.
+  /// Creates a non-blocking, close-on-exec INET stream socket ([`new_socket`]): the driver provides the waiting, and
+  /// the descriptor is not inherited across an exec.
   pub(crate) fn stream_socket() -> Result<Socket, RtError> {
-    let fd = socket_with(
-      AddressFamily::INET,
-      SocketType::STREAM,
-      SocketFlags::empty(),
-      None,
-    )
-    .map_err(|e| refused("socket(STREAM)", e))?;
-    set_nonblocking_cloexec(&fd)?;
-    Ok(Socket { fd })
+    Ok(Socket {
+      fd: new_socket(SocketType::STREAM, "socket(STREAM)")?,
+    })
   }
 
   pub(crate) fn listen(socket: &Socket, backlog: i32) -> Result<(), RtError> {
     rustix::net::listen(&socket.fd, backlog).map_err(|e| refused("listen", e))
   }
 
-  /// The next pending connection on `listener`, made ready to serve ([`prepared`]).
+  /// The next pending connection on `listener`, made ready to serve: on Linux close-on-exec and non-blocking as it is
+  /// accepted (`accept4`, the reason [`new_socket`] gives), then `TCP_NODELAY`.
+  #[cfg(target_os = "linux")]
+  pub(crate) fn accept(listener: &Socket) -> Result<Io<Socket>, RtError> {
+    match rustix::net::accept_with(&listener.fd, SocketFlags::CLOEXEC | SocketFlags::NONBLOCK) {
+      Ok(fd) => {
+        let socket = Socket { fd };
+        set_nodelay(&socket)?;
+        Ok(Io::Ready(socket))
+      }
+      Err(rustix::io::Errno::AGAIN) => Ok(Io::WouldBlock),
+      Err(rustix::io::Errno::INTR) => Ok(Io::Interrupted),
+      Err(e) => Err(refused("accept4", e)),
+    }
+  }
+
+  /// The next pending connection on `listener`, made ready to serve ([`prepared`]): macOS has no `accept4`, so the
+  /// flags are set right after the accept.
+  #[cfg(not(target_os = "linux"))]
   pub(crate) fn accept(listener: &Socket) -> Result<Io<Socket>, RtError> {
     match rustix::net::accept(&listener.fd) {
       Ok(fd) => prepared(fd).map(Io::Ready),

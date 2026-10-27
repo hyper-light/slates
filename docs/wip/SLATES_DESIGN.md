@@ -1334,6 +1334,9 @@ cluster.
 > any process a daemon started kept its fleet port, and a local process could bind the port on loopback and take the
 > datagrams sent there. A stream also half-closes (`TcpStream::close_write`), which the MCP edge's staged close uses.
 > `tests/udp.rs` and `tests/tcp.rs` show a child keeping no copy on every platform, and the bind refused on Windows.
+> On Linux a socket is close-on-exec and non-blocking from the call that makes it (`SOCK_CLOEXEC | SOCK_NONBLOCK`, and
+> `accept4` for an accepted one), so no process another thread starts can keep one; macOS's `socket()` and `accept()`
+> take no such flags, so both are set right after, the one window left.
 >
 > **Status (2026-10-26, A-182: TCP on every platform).** `tcp` rides the platform socket seam (`netsys`) as `udp`
 > does: one code path, `rustix` on Unix and Winsock 2 on Windows, where the IOCP driver's AFD reactor gives a
@@ -12823,8 +12826,9 @@ Applied in the same change to:
   - The accept loop's `503` to a connection past the bound still closes at once, since the loop must not wait. A client
     that has already sent its request can read a reset there. Staging that close needs a bounded set of shedding
     tasks (GAPS `8a-platforms`).
-  - Linux could make a socket close-on-exec as it is made (`SOCK_CLOEXEC`), where the seam sets the flag after
-    `socket()`. A process that another thread starts in between inherits the socket. macOS has no such atomic form.
+  - Linux could make a socket close-on-exec as it is made (`SOCK_CLOEXEC`), where the seam set the flag after
+    `socket()`, so a process another thread started in between inherited the socket for its life. Done the same day:
+    `netsys::new_socket` and `accept4` on Linux; macOS has no such atomic form.
   - The MCP test joins the Windows CI lanes once landing runs on Windows.
 
 ### A-182 — The runtime's TCP is built on every platform: one code path over the socket seam, Winsock 2 and the AFD reactor on Windows (accepted 2026-10-26)
