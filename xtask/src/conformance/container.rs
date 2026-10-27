@@ -33,8 +33,8 @@ use crate::Failure;
 /// Format: the runtime CLI the lane binds with — the one profile the handshake holds evidence for.
 const RUNTIME: &str = "docker";
 /// Format: the image the suite is compiled and run in: the toolchain image the Linux lanes already use
-/// (`rust:1.98.0`, Debian with `cc`), so the lane installs nothing.
-const IMAGE: &str = "rust:1.98.0";
+/// (`rust:1.98.1`, Debian with `cc`), so the lane installs nothing.
+const IMAGE: &str = "rust:1.98.1";
 /// Format: where the container sees the volume, and where it sees the pinned sources (read-only).
 const DESTINATION: &str = "/work";
 const SOURCES: &str = "/src";

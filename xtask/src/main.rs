@@ -20,7 +20,9 @@
 //!   the release guard (the tag must be `v` + the version).
 //! - `cargo xtask npm-reserve --out DIR` — the 0.0.0 stub packages a maintainer publishes once to
 //!   create each npm name, derived from the same manifests (see `version.rs`).
-//! - `cargo xtask check` — structural, literals, the unsafe budget and the version.
+//! - `cargo xtask toolchain` — every image, build and workflow pin names `rust-toolchain.toml`'s channel (see
+//!   `toolchain.rs`).
+//! - `cargo xtask check` — structural, literals, the unsafe budget, the version and the toolchain pins.
 //! - `cargo xtask ratchet [--record] [--tighten] [--reset] [--runs N]` — the performance
 //!   ratchet over the bench examples, keyed by machine identity (see `ratchet.rs`).
 //! - `cargo xtask conformance (plan | run --suite S | all | matrix [--write]) [--records DIR]
@@ -44,6 +46,7 @@ mod capabilities;
 mod conformance;
 mod kind;
 mod ratchet;
+mod toolchain;
 mod tsan;
 mod unsafe_budget;
 mod version;
@@ -82,6 +85,7 @@ fn main() -> ExitCode {
       .and_then(|()| literals::run())
       .and_then(|()| workspace_root().and_then(|root| unsafe_budget::run(&root, false)))
       .and_then(|()| workspace_root().and_then(|root| version::run(&root, &version::Mode::Check)))
+      .and_then(|()| workspace_root().and_then(|root| toolchain::run(&root)))
       .and_then(|()| workspace_root().and_then(|root| check_capabilities(&root))),
     "callgrind" => workspace_root().and_then(|root| {
       let iai = args
@@ -136,8 +140,9 @@ fn main() -> ExitCode {
       kind::run(&root, &options)
     }),
     "tsan" => workspace_root().and_then(|root| tsan::run(&root)),
+    "toolchain" => workspace_root().and_then(|root| toolchain::run(&root)),
     other => Err(Failure(format!(
-      "unknown task `{other}`; tasks: structural, literals, unsafe, version, npm-reserve, check, capabilities, callgrind, ratchet, conformance, kind, tsan"
+      "unknown task `{other}`; tasks: structural, literals, unsafe, version, toolchain, npm-reserve, check, capabilities, callgrind, ratchet, conformance, kind, tsan"
     ))),
   };
   match outcome {

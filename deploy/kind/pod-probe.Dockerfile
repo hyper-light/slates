@@ -7,14 +7,14 @@
 # same reason (the binary links the builder's glibc).
 
 # syntax=docker/dockerfile:1.7
-FROM rust:1.98 AS build
+FROM rust:1.98.1 AS build
 WORKDIR /work
 ARG CARGO_BUILD_JOBS
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/work/target,sharing=locked \
-    RUSTUP_TOOLCHAIN=1.98.0 cargo build --release --locked -p slates-guest-probe --bin slates-pod-probe \
+    RUSTUP_TOOLCHAIN=1.98.1 cargo build --release --locked -p slates-guest-probe --bin slates-pod-probe \
     && cp target/release/slates-pod-probe /slates-pod-probe
 
 FROM gcr.io/distroless/cc-debian13:nonroot

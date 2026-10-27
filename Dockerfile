@@ -14,7 +14,7 @@
 # UDP sockets (R1; nothing under /etc/slates is written — the manifest and certificates are mounted read-only).
 
 # syntax=docker/dockerfile:1.7
-FROM rust:1.98 AS build
+FROM rust:1.98.1 AS build
 WORKDIR /work
 # The caller can bound build concurrency for a supervised validation run.
 ARG CARGO_BUILD_JOBS

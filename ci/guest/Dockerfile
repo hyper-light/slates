@@ -2,7 +2,7 @@
 # toolchain image plus QEMU, the distribution's kernel (virtio-fs, FUSE, virtio-pci and the serial console built
 # in), a busybox initramfs whose /init mounts the slates tag, and the roster's tools. Built for the host's
 # architecture (arm64 locally, amd64 on the CI runner). Ada authorized QEMU in CI on 2026-10-01.
-FROM rust:1.98.0
+FROM rust:1.98.1
 RUN set -e; arch=$(dpkg --print-architecture); \
     case "$arch" in arm64) qemu=qemu-system-arm;; amd64) qemu=qemu-system-x86;; *) echo "no guest recipe for $arch"; exit 1;; esac; \
     apt-get update -qq && apt-get install -y -qq --no-install-recommends "$qemu" "linux-image-$arch" busybox-static \

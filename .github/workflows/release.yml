@@ -50,9 +50,9 @@ jobs:
         run: cargo build --release --workspace --target ${{ matrix.target }}
       # musl lanes build inside the official rust:alpine container, native per arch, with
       # +crt-static for binaries; cdylibs get -crt-static from .cargo/config.toml (B.2).
-      - name: Build (musl, in the rust:1.98-alpine container)
+      - name: Build (musl, in the rust:1.98.1-alpine container)
         if: ${{ matrix.musl }}
         run: |
-          docker run --rm -v "$PWD":/work -w /work rust:1.98-alpine sh -c '
+          docker run --rm -v "$PWD":/work -w /work rust:1.98.1-alpine sh -c '
             apk add --no-cache build-base &&
             RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --workspace --target ${{ matrix.target }}'

@@ -28,9 +28,22 @@ And as slates' own test (`crates/wire/tests/toolchain.rs`): SIGSEGV built by 1.9
 
 ## Fix
 
-- Every pin moves to 1.98.1, as the toolchain file asks, in one commit: `rust-toolchain.toml`, the workflows' setup
-  steps, `.kiln/ci.yaml` and `.kiln/nightly.yaml` (`rust:1.98.1`), the `Dockerfile` and the MCP conformance build
-  script. The workspace's `rust-version` stays `1.98`.
+- Every pin moves to 1.98.1, as the toolchain file asks: `rust-toolchain.toml`, the workflows' setup steps,
+  `.kiln/ci.yaml` and `.kiln/nightly.yaml` (`rust:1.98.1`), the `Dockerfile`'s toolchain and the MCP conformance build
+  script (7318e744). The workspace's `rust-version` stays `1.98`.
+- 7318e744 said every pin had moved, and it had not. The same day, a sweep for every spelling of a toolchain
+  (`rust:1.98`, `rust:1.98.0`, `RUSTUP_TOOLCHAIN=`, `-alpine`) found seven more:
+  - the live-guest image and the Linux container lane's image (`ci/guest/Dockerfile`, `ci/linux-oci/Dockerfile`:
+    `FROM rust:1.98.0`);
+  - the KIND lane's pod probe image (`deploy/kind/pod-probe.Dockerfile`: `RUSTUP_TOOLCHAIN=1.98.0`, which made the
+    image build the probe with 1.98.0 whatever its base held);
+  - the conformance lane's container (`xtask/src/conformance/container.rs`: `rust:1.98.0`);
+  - two floating tags, which take whichever 1.98 release a machine has cached: the slates image's and the probe
+    image's `FROM rust:1.98`, and the release's musl builds' `rust:1.98-alpine` (`.github/workflows/release.yml`,
+    `.kiln/release.yaml`).
+
+  Each is now `1.98.1` exactly (`rust:1.98.1`, `rust:1.98.1-alpine`; both tags checked for linux/amd64 and
+  linux/arm64 with `docker buildx imagetools inspect`).
 - `crates/wire/tests/toolchain.rs` carries focal's reduction unchanged, so a stale toolchain or image fails the build
   on every platform CI tests `slates-wire`.
 
@@ -43,4 +56,8 @@ And as slates' own test (`crates/wire/tests/toolchain.rs`): SIGSEGV built by 1.9
 ## Siblings
 
 - The historical records in `docs/` (benchmarks, audits, bug records) name 1.98.0 as what they ran on. They stay as
-  written: they record what was measured.
+  written: they record what was measured. So do two comments that tell what happened on a date: the cross-lint
+  lane's note on a cached `rust:1.98.0` image (`.github/workflows/ci.yml`) and the FUSE ABI test's
+  (`crates/bridge-fuse/tests/abi.rs`).
+- Only the setup steps' `toolchain:` lines carry the "keep in sync with rust-toolchain.toml" note. The image tags had
+  no such note, and the first sweep looked only for those lines.

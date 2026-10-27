@@ -44,17 +44,17 @@ jobs:
       - name: Build (native via --target)
         run: cargo build --release --workspace --target x86_64-unknown-linux-gnu
 
-  # GHA runs `docker run rust:1.98-alpine`; here that image is the pod itself (native musl, no docker).
+  # GHA runs `docker run rust:1.98.1-alpine`; here that image is the pod itself (native musl, no docker).
   build-musl:
     name: x86_64-unknown-linux-musl
     needs: [guard]
     runs-on: [k8s]
-    image: docker.io/library/rust:1.98-alpine
+    image: docker.io/library/rust:1.98.1-alpine
     resources: { cpu: "6", memory: 12Gi }
     timeout-minutes: 90
     env: { CARGO_BUILD_JOBS: "6", AWS_LC_SYS_PREBUILT_NASM: "0" }
     steps:
-      - name: Build (musl, in the rust:1.98-alpine image)
+      - name: Build (musl, in the rust:1.98.1-alpine image)
         run: |
           apk add --no-cache build-base
           RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --workspace --target x86_64-unknown-linux-musl
