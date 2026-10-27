@@ -1,22 +1,25 @@
 //! Async TCP through the runtime's driver (§4.6, R5): a server task accepts a connection, reads a
 //! request and writes a framed reply, all awaiting the shard's driver; a client task connects, sends
 //! the request and reads the reply back — the accept/read/write path the NFS loopback server runs on,
-//! proven end to end on the readiness-native driver (kqueue here on macOS; epoll on Linux), with no
-//! foreign runtime and both ends on the runtime's own sockets.
+//! proven end to end on each readiness-native driver (kqueue on macOS, epoll on Linux, the IOCP driver's
+//! AFD reactor on Windows), with no foreign runtime and both ends on the runtime's own sockets.
 
-// Test harness code: an unwrap here is a failed test, which is what it should be.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-// Async TCP is the NFS loopback mount server's alone (macOS/Linux); Windows mounts through WinFsp, so
-// the `tcp` module and this test are gated off it (the fleet transport is QUIC over UDP — see udp.rs).
-#![cfg(not(windows))]
+// Test harness code: an unwrap here is a failed test, which is what it should be; the shared helper below
+// panics and indexes as a test does.
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 use std::sync::mpsc::channel;
 use std::time::Duration;
 
-// The address types come through `rustix::net` (the standard types re-exported) to honour the
-// host-path wall's `std::net` guard.
-use rustix::net::{Ipv4Addr, SocketAddrV4};
+// The address types come through `slates_rt::tcp` (the standard types re-exported), honouring the host-path
+// wall's `std::net` guard on every platform.
 use slates_rt::runtime::{Runtime, RuntimeConfig};
+use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
 use slates_rt::tcp::{TcpListener, TcpStream};
 
 fn config() -> RuntimeConfig {
@@ -108,12 +111,12 @@ fn a_tcp_request_and_reply_travel_through_the_driver() {
   rt.shutdown().unwrap();
 }
 
-/// A listener bound, reduced to its bare descriptor, and re-adopted serves on the SAME port — the
-/// descriptor handoff a supervisor uses to keep the loopback port across a daemon restart (§4.6,
-/// "One TCP loopback listener held by the anchor"). Proven by accepting a connection on the adopted
+/// A listener bound, reduced to its bare OS handle (a descriptor on Unix, a socket on Windows), and re-adopted
+/// serves on the SAME port — the hand-off a supervisor uses to keep the loopback port across a daemon restart
+/// (§4.6, "One TCP loopback listener held by the anchor"). Proven by accepting a connection on the adopted
 /// listener at the original port, so the port is stable across the hand-off, not re-assigned.
 #[test]
-fn a_listener_handed_over_by_descriptor_serves_on_the_same_port() {
+fn a_listener_handed_over_by_its_handle_serves_on_the_same_port() {
   let rt = Runtime::start(&config()).unwrap();
   let id = rt.shard_ids()[0];
 
@@ -122,7 +125,7 @@ fn a_listener_handed_over_by_descriptor_serves_on_the_same_port() {
   let bound = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), BACKLOG).unwrap();
   let port = bound.local_addr().unwrap().port();
   assert_ne!(port, 0, "the OS assigned a port");
-  let listener = TcpListener::from_fd(bound.into_fd()).unwrap();
+  let listener = TcpListener::from_owned(bound.into_owned()).unwrap();
   assert_eq!(
     listener.local_addr().unwrap().port(),
     port,
@@ -327,8 +330,8 @@ const LARGE_RECORD_BYTES: usize = 8 * 1024 * 1024 / 3;
 /// A run of records sent by one vectored write arrives as their concatenation (2026-10-09: the NFS server sends a
 /// turn's replies this way, never copying them into one buffer). Do: on one connection, send a run of three small
 /// records, then a run of three records too large for the send buffer, each with `send_records_vectored`; read
-/// everything on the other end. Expect: the small run was sent whole, the large one completed after a short send,
-/// and the bytes read are both runs' records in order, byte for byte.
+/// everything on the other end. Expect: the small run was sent whole, the large one completed after a short send on
+/// Unix (Windows took it in one send), and the bytes read are both runs' records in order, byte for byte.
 #[test]
 fn a_vectored_run_of_records_arrives_whole_and_in_order() {
   let rt = Runtime::start(&config()).unwrap();
@@ -396,13 +399,209 @@ fn a_vectored_run_of_records_arrives_whole_and_in_order() {
     matches!(first, slates_rt::tcp::Sent::Whole),
     "the small run went in one send: {first:?}"
   );
+  // How much of a run one send takes is the kernel's. A Unix kernel bounds the send buffer below the large run
+  // (Linux `tcp_wmem` at 4 MiB, macOS's autotuned buffer below that), so there the run is completed after a short
+  // send, which runs the completion path. Windows' AFD took the whole 8 MiB run in one `WSASend` on loopback
+  // (jupiter, 2026-10-26: `Whole`), so there the bytes read are the check; the completion path is the same code.
+  #[cfg(unix)]
   assert!(
     matches!(second, slates_rt::tcp::Sent::Completed),
     "the large run was completed after a short send: {second:?}"
   );
+  #[cfg(windows)]
+  let _ = second;
   assert_eq!(got.len(), want, "every byte arrived");
   assert!(
     got == expected,
     "both runs' records arrived in order, byte for byte"
   );
+}
+
+/// Shape: how long a test waits for its task's answer. Windows retries a connect refused on loopback before it
+/// reports the refusal (about two seconds), so the wait leaves room for that.
+const WAIT: Duration = Duration::from_secs(10);
+
+/// A loopback address at `port`.
+fn local(port: u16) -> SocketAddrV4 {
+  SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)
+}
+
+/// What `task` answered on a fresh one-shard runtime within [`WAIT`]; the test fails with the runtime's counters when
+/// it never answered.
+fn answered<T: Send + 'static>(task: impl Future<Output = T> + Send + 'static) -> T {
+  let rt = Runtime::start(&config()).unwrap();
+  let id = rt.shard_ids()[0];
+  let (tx, rx) = channel();
+  rt.spawn_on(id, async move {
+    let _ = tx.send(task.await);
+  })
+  .unwrap();
+  match rx.recv_timeout(WAIT) {
+    Ok(answer) => {
+      rt.shutdown().unwrap();
+      answer
+    }
+    Err(e) => {
+      let counters = rt.shutdown().unwrap();
+      panic!("timed out ({e}); counters {counters:#?}");
+    }
+  }
+}
+
+/// Do: connect to a loopback port nothing listens on (a listener bound, then dropped). Expect a typed refusal naming
+/// `connect`, neither a stream nor a hang: the failed handshake reaches the writable edge (on Windows the AFD
+/// reactor's `AFD_POLL_CONNECT_FAIL`) and `SO_ERROR` names it.
+#[test]
+fn a_connection_nothing_accepts_is_refused_typed() {
+  let addr = TcpListener::bind(local(0), BACKLOG)
+    .unwrap()
+    .local_addr()
+    .unwrap();
+  let answer = answered(async move { TcpStream::connect(addr).await.map(|_| ()) });
+  assert!(
+    matches!(
+      answer,
+      Err(slates_rt::RtError::DriverRefused {
+        call: "connect",
+        code: Some(_)
+      })
+    ),
+    "{answer:?}"
+  );
+}
+
+/// Do: connect a pair and ask each side whether its peer closed; then shut the client's stream down and ask the server
+/// again once readability says something changed. Expect false while both stand and true after: the kernel's own
+/// record of the connection (`TCP_INFO`, `TCP_CONNECTION_INFO`, `SIO_TCP_INFO`) left the established state (A-113).
+#[test]
+fn a_peers_close_is_seen_in_the_kernels_record_of_the_connection() {
+  let answer = answered(async move {
+    let listener = TcpListener::bind(local(0), BACKLOG)?;
+    let client = TcpStream::connect(listener.local_addr()?).await?;
+    let server = listener.accept().await?;
+    let standing = (server.peer_closed()?, client.peer_closed()?);
+    client.shutdown()?;
+    server.wait_readable().await?;
+    Ok::<_, slates_rt::RtError>((standing, server.peer_closed()?))
+  });
+  assert_eq!(answer.unwrap(), ((false, false), true));
+}
+
+/// Do: send twelve bytes, peek them, discard the first eight, then read. Expect the peek to see all twelve and leave
+/// them queued, and the read to return the last four alone: a peeked request stays in the kernel until it is
+/// consumed (A-113), on every platform (`MSG_PEEK`; `MSG_TRUNC` on Linux, a copy elsewhere).
+#[test]
+fn a_peeked_request_stays_queued_until_it_is_discarded() {
+  const SENT: &[u8; 12] = b"headbodytail";
+  let answer = answered(async move {
+    let listener = TcpListener::bind(local(0), BACKLOG)?;
+    let client = TcpStream::connect(listener.local_addr()?).await?;
+    let server = listener.accept().await?;
+    client.write_all(SENT).await?;
+    let mut peeked = [0u8; 12];
+    let mut seen = 0;
+    while seen < SENT.len() {
+      server.wait_readable().await?;
+      seen = server.peek_now(&mut peeked)?.unwrap_or(0);
+    }
+    let mut scratch = [0u8; 8];
+    server.discard(8, &mut scratch)?;
+    let mut rest = [0u8; 4];
+    let read = server.read(&mut rest).await?;
+    Ok::<_, slates_rt::RtError>((peeked, read, rest))
+  });
+  let (peeked, read, rest) = answer.unwrap();
+  assert_eq!(&peeked, SENT, "the peek saw every byte");
+  assert_eq!(
+    (read, &rest),
+    (4, b"tail"),
+    "the discard took the first eight alone"
+  );
+}
+
+/// Do: ask a stream for a receive low-water mark of 4 KiB. Expect it kept on Unix; on Windows, a typed refusal
+/// naming `setsockopt(SO_RCVLOWAT)`, since Windows' TCP provider keeps no such mark (Microsoft Learn, SOL_SOCKET
+/// options), and the answer must say so rather than pretend.
+#[test]
+fn a_receive_low_water_mark_is_kept_where_the_kernel_keeps_one() {
+  let answer = answered(async move {
+    let listener = TcpListener::bind(local(0), BACKLOG)?;
+    let client = TcpStream::connect(listener.local_addr()?).await?;
+    let _server = listener.accept().await?;
+    Ok::<_, slates_rt::RtError>(client.want_bytes(4096))
+  })
+  .unwrap();
+  #[cfg(unix)]
+  assert!(answer.is_ok(), "{answer:?}");
+  #[cfg(windows)]
+  assert!(
+    matches!(
+      answer,
+      Err(slates_rt::RtError::DriverRefused {
+        call: "setsockopt(SO_RCVLOWAT)",
+        ..
+      })
+    ),
+    "{answer:?}"
+  );
+}
+
+/// Do (Windows): bind a listener, then bind another socket to its port with `SO_REUSEADDR`, as a process taking its
+/// connections would. Expect the second bind refused `WSAEACCES`: the listener's address is its alone
+/// (`SO_EXCLUSIVEADDRUSE`); without it Windows lets the second socket share the port (Microsoft Learn, "Using
+/// SO_REUSEADDR and SO_EXCLUSIVEADDRUSE").
+#[cfg(windows)]
+#[test]
+fn no_other_socket_can_bind_a_windows_listeners_port() {
+  use windows_sys::Win32::Networking::WinSock::{
+    AF_INET, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, IPPROTO_TCP, SO_REUSEADDR, SOCK_STREAM, SOCKADDR,
+    SOCKADDR_IN, SOCKET_ERROR, SOL_SOCKET, WSAEACCES, WSAGetLastError, bind, closesocket,
+    setsockopt, socket,
+  };
+  // The runtime's bind starts Winsock in this process.
+  let listener = TcpListener::bind(local(0), BACKLOG).unwrap();
+  let port = listener.local_addr().unwrap().port();
+  // SAFETY: a plain socket creation, checked against INVALID_SOCKET and closed below.
+  let other = unsafe { socket(i32::from(AF_INET), SOCK_STREAM, IPPROTO_TCP) };
+  assert_ne!(other, INVALID_SOCKET);
+  let on: i32 = 1;
+  // SAFETY: an `int` option set from a live local of its size, on the socket just made.
+  let shared = unsafe {
+    setsockopt(
+      other,
+      SOL_SOCKET,
+      SO_REUSEADDR,
+      (&raw const on).cast::<u8>(),
+      i32::try_from(size_of::<i32>()).unwrap(),
+    )
+  };
+  assert_ne!(shared, SOCKET_ERROR);
+  let address = SOCKADDR_IN {
+    sin_family: AF_INET,
+    sin_port: port.to_be(),
+    sin_addr: IN_ADDR {
+      S_un: IN_ADDR_0 {
+        S_addr: u32::from_ne_bytes(Ipv4Addr::LOCALHOST.octets()),
+      },
+    },
+    sin_zero: [0; 8],
+  };
+  // SAFETY: a live SOCKADDR_IN passed with its own length.
+  let bound = unsafe {
+    bind(
+      other,
+      (&raw const address).cast::<SOCKADDR>(),
+      i32::try_from(size_of::<SOCKADDR_IN>()).unwrap(),
+    )
+  };
+  // SAFETY: reads this thread's last Winsock error, before anything else can set it.
+  let error = unsafe { WSAGetLastError() };
+  // SAFETY: the socket made above, closed once.
+  unsafe { closesocket(other) };
+  assert_eq!(
+    (bound, error),
+    (SOCKET_ERROR, WSAEACCES),
+    "the port is the listener's alone"
+  );
+  drop(listener);
 }

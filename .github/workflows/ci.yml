@@ -466,6 +466,13 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-rt --test pipe
+      # TCP on the AFD reactor (`docs/wip/platforms.md` gap 1): a request and a framed reply, a listener handed over by
+      # its socket, a refused connect, the peer's close in Windows' own record of the connection, a peeked request left
+      # queued, the receive low-water mark refused typed, and a listener's port no other socket can bind.
+      - name: Test TCP on the AFD reactor (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-rt --test tcp
       - name: Test a shard's lateness after a park (native Windows)
         if: ${{ !cancelled() }}
         timeout-minutes: 15
@@ -668,6 +675,8 @@ jobs:
         run: cargo test -p slates-rt --test udp
       - name: Test the IOCP driver's pipe ends (native arm64 Windows)
         run: cargo test -p slates-rt --test pipe
+      - name: Test TCP on the AFD reactor (native arm64 Windows)
+        run: cargo test -p slates-rt --test tcp
       - name: Test a shard's lateness after a park (native arm64 Windows)
         run: cargo test -p slates-rt --test overrun
       - name: Test the shard CPU clock (native arm64 Windows)
@@ -825,6 +834,10 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-rt --test pipe
+      - name: Test TCP on the AFD reactor (Windows, every push to main)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-rt --test tcp
       - name: Test a shard's lateness after a park (Windows, every push to main)
         if: ${{ !cancelled() }}
         timeout-minutes: 15

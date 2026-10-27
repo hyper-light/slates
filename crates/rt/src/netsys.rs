@@ -1,13 +1,13 @@
-//! The platform datagram-socket seam (§4.10a, the vorpal `mem/src/policy.rs` shape: paired `#[cfg]`
-//! functions with identical signatures, so `udp` holds the async logic cfg-free and only the syscalls
-//! differ). A [`Socket`] owns one non-blocking INET **UDP** socket; the free functions are the
-//! blocking-free primitives the datagram type drives, each returning [`Io`] so "not ready yet" is a
-//! value the caller awaits on, never an error to classify.
+//! The platform socket seam (§4.10a, §4.6; the vorpal `mem/src/policy.rs` shape: paired `#[cfg]`
+//! functions with identical signatures, so `udp` and `tcp` hold the async logic cfg-free and only the
+//! syscalls differ). A [`Socket`] owns one non-blocking INET socket, a datagram or a stream one; the free
+//! functions are the blocking-free primitives the two types drive, each returning [`Io`] so "not ready
+//! yet" is a value the caller awaits on, never an error to classify.
 //!
-//! UDP is the transport that must cross platforms: the fleet claims plane rides slates's owned QUIC
-//! dialect over this socket (`crates/transport`, `rustls::quic`), so it runs wherever a daemon does.
-//! TCP is *not* here — the runtime's async TCP is the NFS loopback mount server's alone (macOS/Linux;
-//! Windows mounts through WinFsp), so it stays `rustix`-only in `crate::tcp`, gated off Windows.
+//! Both cross platforms. The fleet claims plane rides slates's owned QUIC dialect over the datagram socket
+//! (`crates/transport`, `rustls::quic`), and the NFS servers, the MCP HTTP edge and the network export ride
+//! the stream socket, so each runs wherever a daemon does (`docs/wip/platforms.md`: until 2026-10-26 the
+//! stream half was Unix's alone, and every TCP service was missing on Windows).
 //!
 //! The Unix arm is `rustix` (the lint wall reserves `std::net`; the address types are `core::net`'s,
 //! which `rustix::net` re-exports); the Windows arm is Winsock 2 (`windows-sys`). Both present one
@@ -43,7 +43,7 @@ mod imp {
   use crate::driver::refused;
   use crate::error::RtError;
 
-  /// A non-blocking OS UDP socket owned here (closed on drop, by `OwnedFd`).
+  /// A non-blocking OS socket owned here, a datagram or a stream one (closed on drop, by `OwnedFd`).
   #[derive(Debug)]
   pub(crate) struct Socket {
     fd: OwnedFd,
@@ -175,28 +175,374 @@ mod imp {
       Err(e) => Err(refused("sendto", e)),
     }
   }
+
+  // ---------------------------------------------------------------------------- streams (TCP)
+
+  /// The owned OS handle a stream or a listener is handed over as: a file descriptor.
+  pub(crate) type OwnedStream = OwnedFd;
+
+  /// The flags of a [`discard`]: Linux drops the bytes in the kernel; elsewhere they are copied out.
+  #[cfg(target_os = "linux")]
+  const DISCARD_FLAGS: RecvFlags = RecvFlags::TRUNC;
+  /// See the Linux arm.
+  #[cfg(not(target_os = "linux"))]
+  const DISCARD_FLAGS: RecvFlags = RecvFlags::empty();
+
+  /// Format: the option naming the kernel's connection record and the established state's number in it: Linux
+  /// `TCP_INFO` with `TCP_ESTABLISHED` (`include/net/tcp_states.h`, 1).
+  #[cfg(target_os = "linux")]
+  const TCP_STATE_OPTION: libc::c_int = libc::TCP_INFO;
+  /// Format: Linux `TCP_ESTABLISHED` (`include/net/tcp_states.h`), the state byte of an established connection.
+  #[cfg(target_os = "linux")]
+  const TCP_ESTABLISHED: u8 = 1;
+  /// Format: macOS `TCP_CONNECTION_INFO` with `TCPS_ESTABLISHED` (`<netinet/tcp_fsm.h>`, 4).
+  #[cfg(not(target_os = "linux"))]
+  const TCP_STATE_OPTION: libc::c_int = libc::TCP_CONNECTION_INFO;
+  /// Format: macOS `TCPS_ESTABLISHED` (`<netinet/tcp_fsm.h>`), the state byte of an established connection.
+  #[cfg(not(target_os = "linux"))]
+  const TCP_ESTABLISHED: u8 = 4;
+
+  /// Marks `fd` close-on-exec and non-blocking (applied to a fresh socket and to each accepted one, which does not
+  /// inherit non-blocking on macOS/BSD).
+  fn set_nonblocking_cloexec(fd: &OwnedFd) -> Result<(), RtError> {
+    rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::CLOEXEC)
+      .map_err(|e| refused("fcntl(CLOEXEC)", e))?;
+    rustix::io::ioctl_fionbio(fd, true).map_err(|e| refused("ioctl(FIONBIO)", e))?;
+    Ok(())
+  }
+
+  /// A connected stream made ready to serve: non-blocking, close-on-exec and `TCP_NODELAY` ([`set_nodelay`]).
+  fn prepared(fd: OwnedFd) -> Result<Socket, RtError> {
+    set_nonblocking_cloexec(&fd)?;
+    let socket = Socket { fd };
+    set_nodelay(&socket)?;
+    Ok(socket)
+  }
+
+  /// Creates a non-blocking, close-on-exec INET stream socket. `SocketFlags` on `socket()` is Linux-only, so
+  /// close-on-exec and non-blocking are set after creation, as the datagram socket does: the driver provides the
+  /// waiting, and the descriptor is not inherited across an exec.
+  pub(crate) fn stream_socket() -> Result<Socket, RtError> {
+    let fd = socket_with(
+      AddressFamily::INET,
+      SocketType::STREAM,
+      SocketFlags::empty(),
+      None,
+    )
+    .map_err(|e| refused("socket(STREAM)", e))?;
+    set_nonblocking_cloexec(&fd)?;
+    Ok(Socket { fd })
+  }
+
+  pub(crate) fn listen(socket: &Socket, backlog: i32) -> Result<(), RtError> {
+    rustix::net::listen(&socket.fd, backlog).map_err(|e| refused("listen", e))
+  }
+
+  /// The next pending connection on `listener`, made ready to serve ([`prepared`]).
+  pub(crate) fn accept(listener: &Socket) -> Result<Io<Socket>, RtError> {
+    match rustix::net::accept(&listener.fd) {
+      Ok(fd) => prepared(fd).map(Io::Ready),
+      Err(rustix::io::Errno::AGAIN) => Ok(Io::WouldBlock),
+      Err(rustix::io::Errno::INTR) => Ok(Io::Interrupted),
+      Err(e) => Err(refused("accept", e)),
+    }
+  }
+
+  /// Begins `socket`'s connection to `addr`: `Ready` when it connected at once, `WouldBlock` while the handshake
+  /// runs (`EINPROGRESS`), when the caller awaits writability and then asks [`connected`].
+  pub(crate) fn connect(socket: &Socket, addr: SocketAddrV4) -> Result<Io<()>, RtError> {
+    match rustix::net::connect(&socket.fd, &addr) {
+      Ok(()) => Ok(Io::Ready(())),
+      Err(rustix::io::Errno::INPROGRESS) => Ok(Io::WouldBlock),
+      Err(e) => Err(refused("connect", e)),
+    }
+  }
+
+  /// How a handshake that ran ended: the socket's pending error (`SO_ERROR`), a refused connection among them.
+  pub(crate) fn connected(socket: &Socket) -> Result<(), RtError> {
+    match rustix::net::sockopt::socket_error(&socket.fd)
+      .map_err(|e| refused("getsockopt(SO_ERROR)", e))?
+    {
+      Ok(()) => Ok(()),
+      Err(err) => Err(refused("connect", err)),
+    }
+  }
+
+  /// `TCP_NODELAY`, so a small write leaves at once instead of waiting for the peer to acknowledge the previous one
+  /// (Nagle, RFC 896; `crate::tcp` says why every stream here wants it).
+  pub(crate) fn set_nodelay(socket: &Socket) -> Result<(), RtError> {
+    rustix::net::sockopt::set_tcp_nodelay(&socket.fd, true)
+      .map_err(|e| refused("setsockopt(TCP_NODELAY)", e))
+  }
+
+  pub(crate) fn read(socket: &Socket, buf: &mut [u8]) -> Result<Io<usize>, RtError> {
+    match rustix::io::read(&socket.fd, buf) {
+      Ok(n) => Ok(Io::Ready(n)),
+      Err(rustix::io::Errno::AGAIN) => Ok(Io::WouldBlock),
+      Err(rustix::io::Errno::INTR) => Ok(Io::Interrupted),
+      Err(e) => Err(refused("read", e)),
+    }
+  }
+
+  pub(crate) fn write(socket: &Socket, buf: &[u8]) -> Result<Io<usize>, RtError> {
+    match rustix::io::write(&socket.fd, buf) {
+      Ok(n) => Ok(Io::Ready(n)),
+      Err(rustix::io::Errno::AGAIN) => Ok(Io::WouldBlock),
+      Err(rustix::io::Errno::INTR) => Ok(Io::Interrupted),
+      Err(e) => Err(refused("write", e)),
+    }
+  }
+
+  pub(crate) fn write_vectored(
+    socket: &Socket,
+    slices: &[std::io::IoSlice<'_>],
+  ) -> Result<Io<usize>, RtError> {
+    match rustix::io::writev(&socket.fd, slices) {
+      Ok(n) => Ok(Io::Ready(n)),
+      Err(rustix::io::Errno::AGAIN) => Ok(Io::WouldBlock),
+      Err(rustix::io::Errno::INTR) => Ok(Io::Interrupted),
+      Err(e) => Err(refused("writev", e)),
+    }
+  }
+
+  /// The bytes at the head of the receive queue copied into `buf`, left queued (`MSG_PEEK`).
+  pub(crate) fn peek(socket: &Socket, buf: &mut [u8]) -> Result<Io<usize>, RtError> {
+    match rustix::net::recv(&socket.fd, buf, RecvFlags::PEEK) {
+      Ok((n, _)) => Ok(Io::Ready(n)),
+      Err(rustix::io::Errno::AGAIN) => Ok(Io::WouldBlock),
+      Err(rustix::io::Errno::INTR) => Ok(Io::Interrupted),
+      Err(e) => Err(refused("recv(MSG_PEEK)", e)),
+    }
+  }
+
+  /// Up to `into.len()` bytes consumed from the head of the receive queue and dropped: in the kernel on Linux
+  /// (`MSG_TRUNC` on a TCP socket, tcp(7)), copied into `into` elsewhere.
+  pub(crate) fn discard(socket: &Socket, into: &mut [u8]) -> Result<Io<usize>, RtError> {
+    match rustix::net::recv(&socket.fd, into, DISCARD_FLAGS) {
+      Ok((n, _)) => Ok(Io::Ready(n)),
+      Err(rustix::io::Errno::AGAIN) => Ok(Io::WouldBlock),
+      Err(rustix::io::Errno::INTR) => Ok(Io::Interrupted),
+      Err(e) => Err(refused("recv(discard)", e)),
+    }
+  }
+
+  /// Sets an integer socket option `rustix` does not wrap (`SO_RCVLOWAT`, `SO_SNDLOWAT`).
+  fn set_int_option(
+    fd: &OwnedFd,
+    level: libc::c_int,
+    name: libc::c_int,
+    value: i32,
+  ) -> Result<(), rustix::io::Errno> {
+    let length = libc::socklen_t::try_from(size_of::<i32>()).unwrap_or(0);
+    // SAFETY: `fd` is a live socket this stream owns for the call; the value pointer names an `i32` on this frame
+    // that outlives the call, and the length passed is that `i32`'s size, so the kernel reads exactly the bytes it is
+    // given.
+    let result = unsafe {
+      libc::setsockopt(
+        fd.as_raw_fd(),
+        level,
+        name,
+        std::ptr::from_ref(&value).cast::<libc::c_void>(),
+        length,
+      )
+    };
+    if result == 0 {
+      Ok(())
+    } else {
+      Err(
+        rustix::io::Errno::from_io_error(&std::io::Error::last_os_error())
+          .unwrap_or(rustix::io::Errno::INVAL),
+      )
+    }
+  }
+
+  /// Reads a socket option `rustix` does not wrap into `into` (the kernel copies at most its length; an option whose
+  /// value it shortens below that length is refused, since the caller reads every byte it asked for).
+  fn get_option(
+    fd: &OwnedFd,
+    level: libc::c_int,
+    name: libc::c_int,
+    into: &mut [u8],
+  ) -> Result<(), rustix::io::Errno> {
+    let asked = libc::socklen_t::try_from(into.len()).map_err(|_| rustix::io::Errno::INVAL)?;
+    let mut length = asked;
+    // SAFETY: `fd` is a live socket this stream owns for the call; `into` is a buffer the caller owns for the call,
+    // and `length` (on this frame, which the kernel may lower) says its size, so the kernel writes at most those bytes.
+    let result = unsafe {
+      libc::getsockopt(
+        fd.as_raw_fd(),
+        level,
+        name,
+        into.as_mut_ptr().cast::<libc::c_void>(),
+        &raw mut length,
+      )
+    };
+    if result != 0 {
+      return Err(
+        rustix::io::Errno::from_io_error(&std::io::Error::last_os_error())
+          .unwrap_or(rustix::io::Errno::INVAL),
+      );
+    }
+    if length < asked {
+      return Err(rustix::io::Errno::INVAL);
+    }
+    Ok(())
+  }
+
+  /// The BSD arm of [`reserve_buffers`]: both buffers set and read back.
+  #[cfg(not(target_os = "linux"))]
+  pub(crate) fn reserve_buffers(socket: &Socket, buffer_bytes: usize) -> Result<(), RtError> {
+    use rustix::net::sockopt;
+    let fd = &socket.fd;
+    sockopt::set_socket_send_buffer_size(fd, buffer_bytes)
+      .map_err(|e| refused("setsockopt(SO_SNDBUF)", e))?;
+    sockopt::set_socket_recv_buffer_size(fd, buffer_bytes)
+      .map_err(|e| refused("setsockopt(SO_RCVBUF)", e))?;
+    let send =
+      sockopt::socket_send_buffer_size(fd).map_err(|e| refused("getsockopt(SO_SNDBUF)", e))?;
+    let receive =
+      sockopt::socket_recv_buffer_size(fd).map_err(|e| refused("getsockopt(SO_RCVBUF)", e))?;
+    if send < buffer_bytes || receive < buffer_bytes {
+      return Err(refused(
+        "setsockopt(SO_SNDBUF/SO_RCVBUF)",
+        rustix::io::Errno::NOBUFS,
+      ));
+    }
+    Ok(())
+  }
+
+  /// The Linux arm of [`reserve_buffers`]: the receive buffer grown once, at admission, by raising the low-water mark
+  /// to `buffer_bytes` and setting it back (`tcp_set_rcvlowat` raises an unlocked socket's buffer to fit the mark, up
+  /// to `tcp_rmem[2]`, with no privilege; `SO_RCVBUF` is capped by `rmem_max` and would lock autotuning). Without it a
+  /// reader that peeks and never consumes (A-113) can deadlock: autotuning grows the buffer from what the application
+  /// consumes, so it stays at `tcp_rmem`'s default, and the kernel's per-segment overhead filled that with one third of
+  /// a record (44,416 bytes of payload charged as 129,984 against a 131,072-byte buffer, Linux 6.12). The window
+  /// closes, the record never completes, and the NFS client waited about 10 s and dialed again
+  /// (`docs/bugs/2026-10-08-the-first-large-nfs-write-on-linux-stalls-ten-seconds.md`). The send buffer autotunes.
+  #[cfg(target_os = "linux")]
+  pub(crate) fn reserve_buffers(socket: &Socket, buffer_bytes: usize) -> Result<(), RtError> {
+    let value = i32::try_from(buffer_bytes).unwrap_or(i32::MAX);
+    set_int_option(&socket.fd, libc::SOL_SOCKET, libc::SO_RCVLOWAT, value)
+      .map_err(|e| refused("setsockopt(SO_RCVLOWAT)", e))?;
+    set_int_option(&socket.fd, libc::SOL_SOCKET, libc::SO_RCVLOWAT, 1)
+      .map_err(|e| refused("setsockopt(SO_RCVLOWAT)", e))
+  }
+
+  /// The BSD arm of [`make_sends_whole`]: the send buffer must hold the record, then the low-water mark is it.
+  /// Whether every send of at most `record_bytes` is now whole.
+  #[cfg(not(target_os = "linux"))]
+  pub(crate) fn make_sends_whole(socket: &Socket, record_bytes: usize) -> Result<bool, RtError> {
+    let buffer = rustix::net::sockopt::socket_send_buffer_size(&socket.fd)
+      .map_err(|e| refused("getsockopt(SO_SNDBUF)", e))?;
+    if buffer < record_bytes {
+      return Err(refused(
+        "setsockopt(SO_SNDLOWAT)",
+        rustix::io::Errno::NOBUFS,
+      ));
+    }
+    let value = i32::try_from(record_bytes)
+      .map_err(|_| refused("setsockopt(SO_SNDLOWAT)", rustix::io::Errno::RANGE))?;
+    set_int_option(&socket.fd, libc::SOL_SOCKET, libc::SO_SNDLOWAT, value)
+      .map_err(|e| refused("setsockopt(SO_SNDLOWAT)", e))?;
+    Ok(true)
+  }
+
+  /// The Linux arm of [`make_sends_whole`]: `SO_SNDLOWAT` is fixed (socket(7)), and a send copies what fits.
+  #[cfg(target_os = "linux")]
+  pub(crate) fn make_sends_whole(_socket: &Socket, _record_bytes: usize) -> Result<bool, RtError> {
+    Ok(false)
+  }
+
+  /// Sets the receive low-water mark (`SO_RCVLOWAT`) to `bytes` and reads it back, refused where the kernel kept less.
+  pub(crate) fn want_bytes(socket: &Socket, bytes: usize) -> Result<(), RtError> {
+    let value = i32::try_from(bytes.max(1)).unwrap_or(i32::MAX);
+    set_int_option(&socket.fd, libc::SOL_SOCKET, libc::SO_RCVLOWAT, value)
+      .map_err(|e| refused("setsockopt(SO_RCVLOWAT)", e))?;
+    let mut kept = [0u8; size_of::<i32>()];
+    get_option(&socket.fd, libc::SOL_SOCKET, libc::SO_RCVLOWAT, &mut kept)
+      .map_err(|e| refused("getsockopt(SO_RCVLOWAT)", e))?;
+    if i32::from_ne_bytes(kept) < value {
+      return Err(refused(
+        "setsockopt(SO_RCVLOWAT)",
+        rustix::io::Errno::NOBUFS,
+      ));
+    }
+    Ok(())
+  }
+
+  /// Whether the connection is still established, from the kernel's own connection record (Linux `TCP_INFO`, macOS
+  /// `TCP_CONNECTION_INFO`): both copy out as much of it as the caller's length asks, and its first byte is the state.
+  pub(crate) fn established(socket: &Socket) -> Result<bool, RtError> {
+    let mut state = [0u8; 1];
+    get_option(&socket.fd, libc::IPPROTO_TCP, TCP_STATE_OPTION, &mut state)
+      .map_err(|e| refused("getsockopt(TCP state)", e))?;
+    Ok(state == [TCP_ESTABLISHED])
+  }
+
+  /// Ends both directions of the connection, whoever else holds a copy of its descriptor.
+  pub(crate) fn shutdown(socket: &Socket) -> Result<(), RtError> {
+    rustix::net::shutdown(&socket.fd, rustix::net::Shutdown::Both)
+      .map_err(|e| refused("shutdown", e))
+  }
+
+  /// A listening socket handed over (a supervisor's, across an exec), made non-blocking and close-on-exec.
+  pub(crate) fn adopt_listener(fd: OwnedStream) -> Result<Socket, RtError> {
+    set_nonblocking_cloexec(&fd)?;
+    Ok(Socket { fd })
+  }
+
+  /// A connected stream handed over (from another shard, or across an exec), made ready to serve ([`prepared`]).
+  pub(crate) fn adopt_stream(fd: OwnedStream) -> Result<Socket, RtError> {
+    prepared(fd)
+  }
+
+  /// The socket's descriptor, borrowed: to hand a duplicate to another process by `SCM_RIGHTS`.
+  pub(crate) fn as_fd(socket: &Socket) -> std::os::fd::BorrowedFd<'_> {
+    std::os::fd::AsFd::as_fd(&socket.fd)
+  }
+
+  /// A send the kernel took nothing of without blocking: the stream is broken (`EPIPE`).
+  pub(crate) fn broken_pipe(call: &'static str) -> RtError {
+    refused(call, rustix::io::Errno::PIPE)
+  }
+
+  /// A request the caller's own arguments made impossible (`EINVAL`).
+  pub(crate) fn invalid(call: &'static str) -> RtError {
+    refused(call, rustix::io::Errno::INVAL)
+  }
+
+  /// A call that would have had to wait where the caller knew it would not (`EAGAIN`).
+  pub(crate) fn would_block(call: &'static str) -> RtError {
+    refused(call, rustix::io::Errno::AGAIN)
+  }
 }
 
 // ============================================================================== Windows (Winsock 2)
 
 #[cfg(windows)]
 mod imp {
-  use std::os::windows::io::IntoRawSocket;
+  use std::os::windows::io::{FromRawSocket, IntoRawSocket};
   use std::sync::OnceLock;
 
+  use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
   use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, FIONBIO, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, IP_DONTFRAGMENT, IPPROTO_IP, IPPROTO_UDP,
-    SO_RCVBUF, SO_TYPE, SOCK_DGRAM, SOCKADDR, SOCKADDR_IN, SOCKET, SOCKET_ERROR, SOL_SOCKET,
-    WSADATA, WSAEINTR, WSAEWOULDBLOCK, WSAGetLastError, WSAStartup, bind as ws_bind, closesocket,
-    getsockname, getsockopt, ioctlsocket, recvfrom as ws_recvfrom, sendto as ws_sendto, setsockopt,
-    socket as ws_socket,
+    AF_INET, FIONBIO, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, IP_DONTFRAGMENT, IPPROTO_IP, IPPROTO_TCP,
+    IPPROTO_UDP, MSG_PEEK, SD_BOTH, SIO_TCP_INFO, SO_ERROR, SO_EXCLUSIVEADDRUSE, SO_RCVBUF,
+    SO_RCVLOWAT, SO_SNDBUF, SO_TYPE, SOCK_DGRAM, SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKET,
+    SOCKET_ERROR, SOL_SOCKET, TCP_INFO_v0, TCP_NODELAY, TCPSTATE_ESTABLISHED,
+    WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED, WSABUF, WSADATA, WSAEINTR, WSAEINVAL,
+    WSAENOBUFS, WSAESHUTDOWN, WSAEWOULDBLOCK, WSAGetLastError, WSAIoctl, WSASend, WSASocketW,
+    WSAStartup, accept as ws_accept, bind as ws_bind, closesocket, connect as ws_connect,
+    getsockname, getsockopt, ioctlsocket, listen as ws_listen, recv as ws_recv,
+    recvfrom as ws_recvfrom, send as ws_send, sendto as ws_sendto, setsockopt,
+    shutdown as ws_shutdown, socket as ws_socket,
   };
 
   use super::{Io, Ipv4Addr, SocketAddrV4};
   use crate::error::RtError;
 
-  /// A non-blocking Winsock UDP socket owned here (closed on drop). Held as the raw `SOCKET`; the drop
-  /// closes it once. Not `Copy`, so ownership is single.
+  /// A non-blocking Winsock socket owned here, a datagram or a stream one (closed on drop). Held as the raw
+  /// `SOCKET`; the drop closes it once. Not `Copy`, so ownership is single.
   #[derive(Debug)]
   pub(crate) struct Socket {
     socket: SOCKET,
@@ -478,11 +824,417 @@ mod imp {
     }
     Ok(Io::Ready(usize::try_from(rc).unwrap_or(0)))
   }
+
+  // ---------------------------------------------------------------------------- streams (TCP)
+
+  /// The owned OS handle a stream or a listener is handed over as: a Winsock socket.
+  pub(crate) type OwnedStream = std::os::windows::io::OwnedSocket;
+
+  /// Sets one `int`-valued option of `socket` at `level`; `call` names it in a refusal.
+  fn set_int(
+    socket: &Socket,
+    level: i32,
+    option: i32,
+    value: i32,
+    call: &'static str,
+  ) -> Result<(), RtError> {
+    let len = i32::try_from(std::mem::size_of::<i32>()).unwrap_or(i32::MAX);
+    // SAFETY: the option is an `int`; the pointer and length name one live local `i32`, and the socket is this
+    // value's, open for the call.
+    let outcome = unsafe {
+      setsockopt(
+        socket.socket,
+        level,
+        option,
+        (&raw const value).cast::<u8>(),
+        len,
+      )
+    };
+    if outcome == SOCKET_ERROR {
+      return Err(last(call));
+    }
+    Ok(())
+  }
+
+  /// Takes `socket` out of every child process's inheritance (`HANDLE_FLAG_INHERIT` off): Windows' close-on-exec. A
+  /// socket made with `WSA_FLAG_NO_HANDLE_INHERIT` starts so; an accepted or adopted one is cleared here, as Rust's
+  /// standard library clears each accepted socket.
+  fn not_inherited(socket: &Socket) -> Result<(), RtError> {
+    // SAFETY: changes one flag of a socket this value owns; a base provider's socket is a kernel handle, the shape
+    // `crate::afd` registers it in.
+    if unsafe { SetHandleInformation(socket.socket as HANDLE, HANDLE_FLAG_INHERIT, 0) } == 0 {
+      return Err(RtError::os("SetHandleInformation(socket)"));
+    }
+    Ok(())
+  }
+
+  /// A connected stream made ready to serve: no child inherits it, non-blocking, and `TCP_NODELAY` ([`set_nodelay`]).
+  fn prepared(socket: Socket) -> Result<Socket, RtError> {
+    not_inherited(&socket)?;
+    set_nonblocking(&socket)?;
+    set_nodelay(&socket)?;
+    Ok(socket)
+  }
+
+  /// Creates a non-blocking INET stream socket that no child process inherits (`WSA_FLAG_NO_HANDLE_INHERIT`, Unix's
+  /// close-on-exec) and whose address no other socket may share (`SO_EXCLUSIVEADDRUSE`): without it another process
+  /// could bind a listener's port with `SO_REUSEADDR` and take its connections (Microsoft Learn, "Using SO_REUSEADDR
+  /// and SO_EXCLUSIVEADDRUSE"). `WSA_FLAG_OVERLAPPED` is what `socket()` gives every socket; nothing here issues
+  /// overlapped I/O on it, the AFD reactor polls its base handle.
+  pub(crate) fn stream_socket() -> Result<Socket, RtError> {
+    ensure_started()?;
+    // SAFETY: a plain socket creation with no protocol record or group; checked against INVALID_SOCKET.
+    let raw = unsafe {
+      WSASocketW(
+        i32::from(AF_INET),
+        SOCK_STREAM,
+        IPPROTO_TCP,
+        std::ptr::null(),
+        0,
+        WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,
+      )
+    };
+    if raw == INVALID_SOCKET {
+      return Err(last("WSASocketW(STREAM)"));
+    }
+    let socket = Socket { socket: raw };
+    set_nonblocking(&socket)?;
+    set_int(
+      &socket,
+      SOL_SOCKET,
+      SO_EXCLUSIVEADDRUSE,
+      1,
+      "setsockopt(SO_EXCLUSIVEADDRUSE)",
+    )?;
+    Ok(socket)
+  }
+
+  pub(crate) fn listen(socket: &Socket, backlog: i32) -> Result<(), RtError> {
+    // SAFETY: a listen on a bound socket this value owns.
+    if unsafe { ws_listen(socket.socket, backlog) } == SOCKET_ERROR {
+      return Err(last("listen"));
+    }
+    Ok(())
+  }
+
+  /// The next pending connection on `listener`, made ready to serve ([`prepared`]).
+  pub(crate) fn accept(listener: &Socket) -> Result<Io<Socket>, RtError> {
+    // SAFETY: an accept on a listening socket this value owns, asking for no peer address.
+    let raw = unsafe { ws_accept(listener.socket, std::ptr::null_mut(), std::ptr::null_mut()) };
+    if raw == INVALID_SOCKET {
+      return Ok(match last_code() {
+        WSAEWOULDBLOCK => Io::WouldBlock,
+        WSAEINTR => Io::Interrupted,
+        _ => return Err(last("accept")),
+      });
+    }
+    prepared(Socket { socket: raw }).map(Io::Ready)
+  }
+
+  /// Begins `socket`'s connection to `addr`: `Ready` when it connected at once, `WouldBlock` while the handshake runs
+  /// (Winsock answers a non-blocking connect under way `WSAEWOULDBLOCK`, its `EINPROGRESS`), when the caller awaits
+  /// writability (the AFD reactor's writable edge includes `AFD_POLL_CONNECT_FAIL`) and then asks [`connected`].
+  pub(crate) fn connect(socket: &Socket, addr: SocketAddrV4) -> Result<Io<()>, RtError> {
+    let sa = sockaddr(addr);
+    // SAFETY: `sa` is a live SOCKADDR_IN of the given length, passed as the generic SOCKADDR.
+    let rc = unsafe {
+      ws_connect(
+        socket.socket,
+        std::ptr::addr_of!(sa).cast::<SOCKADDR>(),
+        i32::try_from(size_of::<SOCKADDR_IN>()).unwrap_or(0),
+      )
+    };
+    if rc == SOCKET_ERROR {
+      return match last_code() {
+        WSAEWOULDBLOCK => Ok(Io::WouldBlock),
+        _ => Err(last("connect")),
+      };
+    }
+    Ok(Io::Ready(()))
+  }
+
+  /// How a handshake that ran ended: the socket's pending error (`SO_ERROR`), a refused connection among them.
+  pub(crate) fn connected(socket: &Socket) -> Result<(), RtError> {
+    let error = int_option(socket, SO_ERROR, "getsockopt(SO_ERROR)")?;
+    if error != 0 {
+      return Err(RtError::DriverRefused {
+        call: "connect",
+        code: Some(error),
+      });
+    }
+    Ok(())
+  }
+
+  /// `TCP_NODELAY` (`crate::tcp` says why every stream here wants it).
+  pub(crate) fn set_nodelay(socket: &Socket) -> Result<(), RtError> {
+    set_int(
+      socket,
+      IPPROTO_TCP,
+      TCP_NODELAY,
+      1,
+      "setsockopt(TCP_NODELAY)",
+    )
+  }
+
+  /// One non-blocking `recv` of up to `buf.len()` bytes with `flags`, classified; `call` names it in a refusal.
+  fn receive(
+    socket: &Socket,
+    buf: &mut [u8],
+    flags: i32,
+    call: &'static str,
+  ) -> Result<Io<usize>, RtError> {
+    let len = i32::try_from(buf.len()).unwrap_or(i32::MAX);
+    // SAFETY: recv writes at most `len` bytes into `buf`, which this call borrows mutably.
+    let rc = unsafe { ws_recv(socket.socket, buf.as_mut_ptr(), len, flags) };
+    if rc == SOCKET_ERROR {
+      return Ok(match last_code() {
+        WSAEWOULDBLOCK => Io::WouldBlock,
+        WSAEINTR => Io::Interrupted,
+        _ => return Err(last(call)),
+      });
+    }
+    Ok(Io::Ready(usize::try_from(rc).unwrap_or(0)))
+  }
+
+  pub(crate) fn read(socket: &Socket, buf: &mut [u8]) -> Result<Io<usize>, RtError> {
+    receive(socket, buf, 0, "recv")
+  }
+
+  /// The bytes at the head of the receive queue copied into `buf`, left queued (`MSG_PEEK`).
+  pub(crate) fn peek(socket: &Socket, buf: &mut [u8]) -> Result<Io<usize>, RtError> {
+    receive(socket, buf, MSG_PEEK, "recv(MSG_PEEK)")
+  }
+
+  /// Up to `into.len()` bytes consumed from the head of the receive queue, copied into `into` and dropped (Winsock
+  /// has no `MSG_TRUNC` for TCP).
+  pub(crate) fn discard(socket: &Socket, into: &mut [u8]) -> Result<Io<usize>, RtError> {
+    receive(socket, into, 0, "recv(discard)")
+  }
+
+  pub(crate) fn write(socket: &Socket, buf: &[u8]) -> Result<Io<usize>, RtError> {
+    let len = i32::try_from(buf.len()).unwrap_or(i32::MAX);
+    // SAFETY: send reads at most `len` bytes from `buf`, which this call borrows.
+    let rc = unsafe { ws_send(socket.socket, buf.as_ptr(), len, 0) };
+    if rc == SOCKET_ERROR {
+      return Ok(match last_code() {
+        WSAEWOULDBLOCK => Io::WouldBlock,
+        WSAEINTR => Io::Interrupted,
+        _ => return Err(last("send")),
+      });
+    }
+    Ok(Io::Ready(usize::try_from(rc).unwrap_or(0)))
+  }
+
+  /// One gathering send of `slices` (`WSASend` with no `OVERLAPPED`, so it completes or refuses before it returns). A
+  /// slice longer than a `WSABUF` holds offers its first `u32::MAX` bytes: the count sent says how far it went, which
+  /// is all a caller reads.
+  pub(crate) fn write_vectored(
+    socket: &Socket,
+    slices: &[std::io::IoSlice<'_>],
+  ) -> Result<Io<usize>, RtError> {
+    let buffers: Vec<WSABUF> = slices
+      .iter()
+      .map(|slice| WSABUF {
+        len: u32::try_from(slice.len()).unwrap_or(u32::MAX),
+        buf: slice.as_ptr().cast_mut(),
+      })
+      .collect();
+    let count = u32::try_from(buffers.len()).unwrap_or(u32::MAX);
+    let mut sent = 0u32;
+    // SAFETY: `buffers` describes `count` live slices the caller borrows for the call, which WSASend reads alone; with
+    // no OVERLAPPED the call is done with them before it returns.
+    let rc = unsafe {
+      WSASend(
+        socket.socket,
+        buffers.as_ptr(),
+        count,
+        &raw mut sent,
+        0,
+        std::ptr::null_mut(),
+        None,
+      )
+    };
+    if rc == SOCKET_ERROR {
+      return Ok(match last_code() {
+        WSAEWOULDBLOCK => Io::WouldBlock,
+        WSAEINTR => Io::Interrupted,
+        _ => return Err(last("WSASend")),
+      });
+    }
+    Ok(Io::Ready(usize::try_from(sent).unwrap_or(0)))
+  }
+
+  /// Both buffers set to `buffer_bytes` and read back, refused where Windows kept less, as on the BSDs.
+  pub(crate) fn reserve_buffers(socket: &Socket, buffer_bytes: usize) -> Result<(), RtError> {
+    let value = i32::try_from(buffer_bytes).unwrap_or(i32::MAX);
+    set_int(
+      socket,
+      SOL_SOCKET,
+      SO_SNDBUF,
+      value,
+      "setsockopt(SO_SNDBUF)",
+    )?;
+    set_int(
+      socket,
+      SOL_SOCKET,
+      SO_RCVBUF,
+      value,
+      "setsockopt(SO_RCVBUF)",
+    )?;
+    let send = int_option(socket, SO_SNDBUF, "getsockopt(SO_SNDBUF)")?;
+    let receive = int_option(socket, SO_RCVBUF, "getsockopt(SO_RCVBUF)")?;
+    if send < value || receive < value {
+      return Err(RtError::DriverRefused {
+        call: "setsockopt(SO_SNDBUF/SO_RCVBUF)",
+        code: Some(WSAENOBUFS),
+      });
+    }
+    Ok(())
+  }
+
+  /// Never on Windows: a non-blocking send on a stream socket may take "between 1 and the requested length" bytes
+  /// (Microsoft Learn, `send`), and Winsock keeps no send low-water mark that would make it all or none.
+  pub(crate) fn make_sends_whole(_socket: &Socket, _record_bytes: usize) -> Result<bool, RtError> {
+    Ok(false)
+  }
+
+  /// Sets the receive low-water mark (`SO_RCVLOWAT`) to `bytes` and reads it back. Microsoft Learn says Windows' TCP
+  /// provider refuses the option (`WSAEINVAL` since Vista); Windows' own answer is what the caller gets, typed.
+  pub(crate) fn want_bytes(socket: &Socket, bytes: usize) -> Result<(), RtError> {
+    let value = i32::try_from(bytes.max(1)).unwrap_or(i32::MAX);
+    set_int(
+      socket,
+      SOL_SOCKET,
+      SO_RCVLOWAT,
+      value,
+      "setsockopt(SO_RCVLOWAT)",
+    )?;
+    let kept = int_option(socket, SO_RCVLOWAT, "getsockopt(SO_RCVLOWAT)")?;
+    if kept < value {
+      return Err(RtError::DriverRefused {
+        call: "setsockopt(SO_RCVLOWAT)",
+        code: Some(WSAENOBUFS),
+      });
+    }
+    Ok(())
+  }
+
+  /// Whether the connection is still established, from Windows' own record of it (`SIO_TCP_INFO`, version 0, Windows
+  /// 10 1703 and later): its state is `TCPSTATE_ESTABLISHED`.
+  pub(crate) fn established(socket: &Socket) -> Result<bool, RtError> {
+    let version: u32 = 0;
+    let mut info = TCP_INFO_v0::default();
+    let mut returned = 0u32;
+    // SAFETY: the version is a live DWORD in and the record a live TCP_INFO_v0 out, each passed with its own length;
+    // with no OVERLAPPED the call is done with both before it returns.
+    let rc = unsafe {
+      WSAIoctl(
+        socket.socket,
+        SIO_TCP_INFO,
+        (&raw const version).cast(),
+        u32::try_from(size_of::<u32>()).unwrap_or(0),
+        (&raw mut info).cast(),
+        u32::try_from(size_of::<TCP_INFO_v0>()).unwrap_or(0),
+        &raw mut returned,
+        std::ptr::null_mut(),
+        None,
+      )
+    };
+    if rc == SOCKET_ERROR {
+      return Err(last("WSAIoctl(SIO_TCP_INFO)"));
+    }
+    Ok(info.State == TCPSTATE_ESTABLISHED)
+  }
+
+  /// Ends both directions of the connection, whoever else holds a copy of the socket.
+  pub(crate) fn shutdown(socket: &Socket) -> Result<(), RtError> {
+    // SAFETY: a shutdown of both directions of a socket this value owns.
+    if unsafe { ws_shutdown(socket.socket, SD_BOTH) } == SOCKET_ERROR {
+      return Err(last("shutdown"));
+    }
+    Ok(())
+  }
+
+  /// A socket handed over, refused unless it is a stream socket; owned from here, no child inherits it, non-blocking.
+  fn adopt_stream_socket(owned: OwnedStream) -> Result<Socket, RtError> {
+    ensure_started()?;
+    let Ok(raw) = SOCKET::try_from(owned.into_raw_socket()) else {
+      return Err(RtError::DriverRefused {
+        call: "adopt(SOCKET)",
+        code: None,
+      });
+    };
+    // Owned from here: the drop closes it once, on every refusal below too.
+    let socket = Socket { socket: raw };
+    let kind = int_option(&socket, SO_TYPE, "getsockopt(SO_TYPE)")?;
+    if kind != SOCK_STREAM {
+      return Err(RtError::DriverRefused {
+        call: "adopt(SO_TYPE)",
+        code: Some(kind),
+      });
+    }
+    not_inherited(&socket)?;
+    set_nonblocking(&socket)?;
+    Ok(socket)
+  }
+
+  /// A listening socket handed over (a supervisor's), made ready as one this seam made.
+  pub(crate) fn adopt_listener(owned: OwnedStream) -> Result<Socket, RtError> {
+    adopt_stream_socket(owned)
+  }
+
+  /// A connected stream handed over (from another shard, or another process), made ready to serve.
+  pub(crate) fn adopt_stream(owned: OwnedStream) -> Result<Socket, RtError> {
+    let socket = adopt_stream_socket(owned)?;
+    set_nodelay(&socket)?;
+    Ok(socket)
+  }
+
+  /// Gives up the socket: the counterpart to the adoptions.
+  pub(crate) fn into_owned(socket: Socket) -> OwnedStream {
+    let socket = std::mem::ManuallyDrop::new(socket);
+    // A `SOCKET` is pointer-width and a raw socket 64 bits, so the widening keeps every bit on every target Rust
+    // builds for Windows.
+    let raw = socket.socket as std::os::windows::io::RawSocket;
+    // SAFETY: the socket this value owned, whose drop never runs (`ManuallyDrop`), so the returned owner closes it
+    // once.
+    unsafe { std::os::windows::io::OwnedSocket::from_raw_socket(raw) }
+  }
+
+  /// A send Windows took nothing of without blocking: the stream can take no more (`WSAESHUTDOWN`, Winsock's nearest
+  /// to `EPIPE`).
+  pub(crate) fn broken_pipe(call: &'static str) -> RtError {
+    RtError::DriverRefused {
+      call,
+      code: Some(WSAESHUTDOWN),
+    }
+  }
+
+  /// A request the caller's own arguments made impossible (`WSAEINVAL`).
+  pub(crate) fn invalid(call: &'static str) -> RtError {
+    RtError::DriverRefused {
+      call,
+      code: Some(WSAEINVAL),
+    }
+  }
+
+  /// A call that would have had to wait where the caller knew it would not (`WSAEWOULDBLOCK`).
+  pub(crate) fn would_block(call: &'static str) -> RtError {
+    RtError::DriverRefused {
+      call,
+      code: Some(WSAEWOULDBLOCK),
+    }
+  }
 }
 
 #[cfg(unix)]
-pub(crate) use imp::into_owned;
-pub(crate) use imp::{OwnedDatagram, Socket};
+pub(crate) use imp::as_fd;
+pub(crate) use imp::{OwnedDatagram, OwnedStream, Socket};
+pub(crate) use imp::{
+  accept, adopt_listener, adopt_stream, broken_pipe, connect, connected, discard, established,
+  into_owned, invalid, listen, make_sends_whole, peek, read, reserve_buffers, set_nodelay,
+  shutdown, stream_socket, want_bytes, would_block, write, write_vectored,
+};
 pub(crate) use imp::{
   adopt, bind, dgram_socket, local_addr, recv_buffer_bytes, recv_from, send_to,
 };

@@ -106,6 +106,13 @@
 #   of a whole record all-or-nothing on macOS; and one `getsockopt` of the first byte of the kernel's TCP connection
 #   record (Linux `TCP_INFO`, macOS `TCP_CONNECTION_INFO`) for the peer's close, which a peeking reader cannot see
 #   behind an unfinished record (1). 73 → 75.
+#   TCP on Windows (`netsys.rs`'s stream half, 2026-10-26, `docs/wip/platforms.md` gap 1): the Winsock 2 stream calls,
+#   none with a safe wrapper: `WSASocketW` with inheritance off, one `setsockopt` helper for every integer option
+#   (`TCP_NODELAY`, `SO_EXCLUSIVEADDRUSE`, the buffers, `SO_RCVLOWAT`), `SetHandleInformation` for an accepted or
+#   adopted socket's inheritance, `listen`, `accept`, `connect`, one `recv` helper for read, peek and discard, `send`,
+#   the gathering `WSASend`, `WSAIoctl(SIO_TCP_INFO)` for the peer's close, `shutdown`, and the
+#   `OwnedSocket::from_raw_socket` that hands a socket over (12). The Unix stream calls moved from `tcp.rs` into the
+#   seam unchanged in number. 84 → 96.
 # slates-wire (4): the CRC32C hardware intrinsics behind runtime feature detection.
 # slates-wire-derive (0).
 # slates-base (10): rustix marks kevent unsafe because the kernel fills the output list; one
@@ -296,7 +303,7 @@ slates-mem = 61
 #   kernel (1), its `GetLastError` (1), and the `Box::from_raw` of a block the kernel refused at once (1).
 # In `iocp.rs`, the wait's call of `Pipes::complete` (1). `afd.rs`'s `RtlNtStatusToDosError` moved into `dos_error`,
 # which both modules call (0).
-slates-rt = 84
+slates-rt = 96
 slates-base = 10
 slates-vfs = 0
 slates-land = 4

@@ -2,26 +2,36 @@
 //! and serves each over the executor's own driver — no foreign runtime (R6, D-9). `accept` and `read`
 //! await read-readiness through the shard's driver; `write_all` awaits write-readiness so a write to a
 //! stalled peer (a soft-mounted NFS client that stopped reading, filling the send buffer) yields the
-//! shard instead of blocking it; `connect` awaits write-readiness for the handshake to complete. The
-//! socket is a `rustix` TCP socket (not `std::net`, which the lint wall reserves; the address types
-//! come through `rustix::net`, the standard types re-exported). Only the readiness-native drivers
-//! (kqueue, epoll) back it; TCP is host-local, so unlike the UDP fleet plane (§4.10a) it has no
-//! simulated fabric — it runs on a real runtime.
+//! shard instead of blocking it; `connect` awaits write-readiness for the handshake to complete.
+//!
+//! One code path on every platform: the async logic is here, and the socket calls are the platform seam's
+//! (`crate::netsys`: `rustix` on Unix, since the lint wall reserves `std::net`; Winsock 2 on Windows), as
+//! the datagram socket's are. The readiness-native drivers back it: kqueue and epoll on Unix, and on Windows
+//! the IOCP driver's AFD reactor, whose readable edge includes a pending accept, a disconnect and a failed
+//! connect, and whose writable edge a completed or failed handshake (`crate::afd`). TCP is host-local, so
+//! unlike the UDP fleet plane (§4.10a) it has no simulated fabric: it runs on a real runtime.
+//!
+//! Where the platforms differ, each answers for itself rather than pretending:
+//! - **Whole sends** ([`TcpStream::make_sends_whole`]): macOS and the BSDs make a send of up to the record bound
+//!   all or none (`SO_SNDLOWAT`); Linux and Windows do not, and say so ([`WholeSends::NotOffered`]).
+//! - **A receive low-water mark** ([`TcpStream::want_bytes`]): Unix keeps one; Windows' TCP provider refuses
+//!   `SO_RCVLOWAT` (Microsoft Learn, SOL_SOCKET options), and its refusal reaches the caller typed.
+//! - **Handing a stream to another process** (`SCM_RIGHTS` of the borrowed descriptor) is Unix's; Windows
+//!   duplicates a socket into another process with `WSADuplicateSocketW` instead (`docs/wip/platforms.md`, gap 2).
+//! - **The address a listener binds** on Windows is its alone (`SO_EXCLUSIVEADDRUSE`), so no other process can take
+//!   its port's connections by binding it with `SO_REUSEADDR`.
 
-use std::os::fd::{AsRawFd, OwnedFd};
-
-use rustix::net::{
-  AddressFamily, SocketAddr, SocketFlags, SocketType, accept, bind, connect, getsockname, listen,
-  socket_with,
-};
-
-// The socket address types are `rustix::net`'s (the standard `core::net` types, re-exported); re-export
-// them here so a consumer of this API can name a bind address without depending on `rustix` directly.
-pub use rustix::net::{Ipv4Addr, SocketAddrV4};
-
-use crate::driver::refused;
 use crate::error::RtError;
+use crate::netsys::{self, Io, Socket};
 use crate::readiness::{readable, writable};
+
+// The socket address types are `core::net`'s (the same ones `rustix::net` re-exports and the seam uses);
+// re-exported here so a consumer of this API names a bind address without depending on a socket backend.
+pub use core::net::{Ipv4Addr, SocketAddrV4};
+
+/// The owned OS handle a listener or a stream is handed over as: a file descriptor on Unix, a Winsock socket on
+/// Windows ([`TcpListener::into_owned`], [`TcpStream::from_owned`]).
+pub type OwnedStream = netsys::OwnedStream;
 
 /// What [`TcpStream::send_records`] did with a run of records.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,215 +51,18 @@ pub enum WholeSends {
   NotOffered,
 }
 
-/// The flags of a [`TcpStream::discard`]: Linux drops the bytes in the kernel; elsewhere they are copied out.
-#[cfg(target_os = "linux")]
-const DISCARD_FLAGS: rustix::net::RecvFlags = rustix::net::RecvFlags::TRUNC;
-/// See the Linux arm.
-#[cfg(not(target_os = "linux"))]
-const DISCARD_FLAGS: rustix::net::RecvFlags = rustix::net::RecvFlags::empty();
-
-/// Sets an integer socket option `rustix` does not wrap (`SO_RCVLOWAT`, `SO_SNDLOWAT`).
-fn set_int_option(
-  fd: &OwnedFd,
-  level: libc::c_int,
-  name: libc::c_int,
-  value: i32,
-) -> Result<(), rustix::io::Errno> {
-  let length = libc::socklen_t::try_from(size_of::<i32>()).unwrap_or(0);
-  // SAFETY: `fd` is a live socket this stream owns for the call; the value pointer names an `i32` on this frame that
-  // outlives the call, and the length passed is that `i32`'s size, so the kernel reads exactly the bytes it is given.
-  let result = unsafe {
-    libc::setsockopt(
-      fd.as_raw_fd(),
-      level,
-      name,
-      std::ptr::from_ref(&value).cast::<libc::c_void>(),
-      length,
-    )
-  };
-  if result == 0 {
-    Ok(())
-  } else {
-    Err(
-      rustix::io::Errno::from_io_error(&std::io::Error::last_os_error())
-        .unwrap_or(rustix::io::Errno::INVAL),
-    )
-  }
-}
-
-/// Format: the option naming the kernel's connection record and the established state's number in it: Linux
-/// `TCP_INFO` with `TCP_ESTABLISHED` (`include/net/tcp_states.h`, 1).
-#[cfg(target_os = "linux")]
-const TCP_STATE_OPTION: libc::c_int = libc::TCP_INFO;
-/// Format: Linux `TCP_ESTABLISHED` (`include/net/tcp_states.h`), the state byte of an established connection.
-#[cfg(target_os = "linux")]
-const TCP_ESTABLISHED: u8 = 1;
-/// Format: macOS `TCP_CONNECTION_INFO` with `TCPS_ESTABLISHED` (`<netinet/tcp_fsm.h>`, 4).
-#[cfg(not(target_os = "linux"))]
-const TCP_STATE_OPTION: libc::c_int = libc::TCP_CONNECTION_INFO;
-/// Format: macOS `TCPS_ESTABLISHED` (`<netinet/tcp_fsm.h>`), the state byte of an established connection.
-#[cfg(not(target_os = "linux"))]
-const TCP_ESTABLISHED: u8 = 4;
-
-/// The TCP state byte at the head of the kernel's connection record: both kernels copy out as much of the record as the
-/// caller's length asks, so one byte reads the state alone.
-fn tcp_state(fd: &OwnedFd) -> Result<u8, rustix::io::Errno> {
-  let mut state = [0u8; 1];
-  get_option(fd, libc::IPPROTO_TCP, TCP_STATE_OPTION, &mut state)?;
-  Ok(state[0])
-}
-
-/// Reads a socket option `rustix` does not wrap into `into` (the kernel copies at most its length; an option whose
-/// value it shortens below that length is refused, since the caller reads every byte it asked for).
-fn get_option(
-  fd: &OwnedFd,
-  level: libc::c_int,
-  name: libc::c_int,
-  into: &mut [u8],
-) -> Result<(), rustix::io::Errno> {
-  let asked = libc::socklen_t::try_from(into.len()).map_err(|_| rustix::io::Errno::INVAL)?;
-  let mut length = asked;
-  // SAFETY: `fd` is a live socket this stream owns for the call; `into` is a buffer the caller owns for the call, and
-  // `length` (on this frame, which the kernel may lower) says its size, so the kernel writes at most those bytes.
-  let result = unsafe {
-    libc::getsockopt(
-      fd.as_raw_fd(),
-      level,
-      name,
-      into.as_mut_ptr().cast::<libc::c_void>(),
-      &raw mut length,
-    )
-  };
-  if result != 0 {
-    return Err(
-      rustix::io::Errno::from_io_error(&std::io::Error::last_os_error())
-        .unwrap_or(rustix::io::Errno::INVAL),
-    );
-  }
-  if length < asked {
-    return Err(rustix::io::Errno::INVAL);
-  }
-  Ok(())
-}
-
-/// The BSD arm of [`TcpStream::reserve_buffers`]: both buffers set and read back.
-#[cfg(not(target_os = "linux"))]
-fn reserve_buffers(fd: &OwnedFd, buffer_bytes: usize) -> Result<(), RtError> {
-  use rustix::net::sockopt;
-  sockopt::set_socket_send_buffer_size(fd, buffer_bytes)
-    .map_err(|e| refused("setsockopt(SO_SNDBUF)", e))?;
-  sockopt::set_socket_recv_buffer_size(fd, buffer_bytes)
-    .map_err(|e| refused("setsockopt(SO_RCVBUF)", e))?;
-  let send =
-    sockopt::socket_send_buffer_size(fd).map_err(|e| refused("getsockopt(SO_SNDBUF)", e))?;
-  let receive =
-    sockopt::socket_recv_buffer_size(fd).map_err(|e| refused("getsockopt(SO_RCVBUF)", e))?;
-  if send < buffer_bytes || receive < buffer_bytes {
-    return Err(refused(
-      "setsockopt(SO_SNDBUF/SO_RCVBUF)",
-      rustix::io::Errno::NOBUFS,
-    ));
-  }
-  Ok(())
-}
-
-/// The Linux arm of [`TcpStream::reserve_buffers`]: the receive buffer grown once, at admission, by raising the
-/// low-water mark to `buffer_bytes` and setting it back (`tcp_set_rcvlowat` raises an unlocked socket's buffer to fit
-/// the mark, up to `tcp_rmem[2]`, with no privilege; `SO_RCVBUF` is capped by `rmem_max` and would lock autotuning).
-/// Without it a reader that peeks and never consumes (A-113) can deadlock: autotuning grows the buffer from what the
-/// application consumes, so it stays at `tcp_rmem`'s default, and the kernel's per-segment overhead filled that with
-/// one third of a record (44,416 bytes of payload charged as 129,984 against a 131,072-byte buffer, Linux 6.12). The
-/// window closes, the record never completes, and the NFS client waited about 10 s and dialed again
-/// (`docs/bugs/2026-10-08-the-first-large-nfs-write-on-linux-stalls-ten-seconds.md`). The send buffer autotunes.
-#[cfg(target_os = "linux")]
-fn reserve_buffers(fd: &OwnedFd, buffer_bytes: usize) -> Result<(), RtError> {
-  let value = i32::try_from(buffer_bytes).unwrap_or(i32::MAX);
-  set_int_option(fd, libc::SOL_SOCKET, libc::SO_RCVLOWAT, value)
-    .map_err(|e| refused("setsockopt(SO_RCVLOWAT)", e))?;
-  set_int_option(fd, libc::SOL_SOCKET, libc::SO_RCVLOWAT, 1)
-    .map_err(|e| refused("setsockopt(SO_RCVLOWAT)", e))
-}
-
-/// The BSD arm of [`TcpStream::make_sends_whole`]: the send buffer must hold the record, then the low-water mark is it.
-#[cfg(not(target_os = "linux"))]
-fn make_sends_whole(fd: &OwnedFd, record_bytes: usize) -> Result<WholeSends, RtError> {
-  let buffer = rustix::net::sockopt::socket_send_buffer_size(fd)
-    .map_err(|e| refused("getsockopt(SO_SNDBUF)", e))?;
-  if buffer < record_bytes {
-    return Err(refused(
-      "setsockopt(SO_SNDLOWAT)",
-      rustix::io::Errno::NOBUFS,
-    ));
-  }
-  let value = i32::try_from(record_bytes)
-    .map_err(|_| refused("setsockopt(SO_SNDLOWAT)", rustix::io::Errno::RANGE))?;
-  set_int_option(fd, libc::SOL_SOCKET, libc::SO_SNDLOWAT, value)
-    .map_err(|e| refused("setsockopt(SO_SNDLOWAT)", e))?;
-  Ok(WholeSends::Guaranteed)
-}
-
-/// The Linux arm of [`TcpStream::make_sends_whole`]: `SO_SNDLOWAT` is fixed (socket(7)), and a send copies what fits.
-#[cfg(target_os = "linux")]
-fn make_sends_whole(_fd: &OwnedFd, _record_bytes: usize) -> Result<WholeSends, RtError> {
-  Ok(WholeSends::NotOffered)
-}
-
-/// A listening TCP socket on the runtime: a non-blocking `rustix` socket whose `accept` awaits the
-/// shard's driver for the next connection.
+/// A listening TCP socket on the runtime: a non-blocking socket whose `accept` awaits the shard's driver for
+/// the next connection.
 #[derive(Debug)]
 pub struct TcpListener {
-  fd: OwnedFd,
+  socket: Socket,
 }
 
-/// A connected TCP stream on the runtime: a non-blocking `rustix` socket whose `read` and `write_all`
-/// await the shard's driver.
+/// A connected TCP stream on the runtime: a non-blocking socket whose `read` and `write_all` await the shard's
+/// driver.
 #[derive(Debug)]
 pub struct TcpStream {
-  fd: OwnedFd,
-}
-
-/// Creates a non-blocking, close-on-exec INET stream socket. `SocketFlags` on `socket()` is
-/// Linux-only, so CLOEXEC and non-blocking are set after creation (as the UDP socket does): the
-/// driver provides the waiting, and the descriptor is not inherited across an exec.
-fn stream_socket() -> Result<OwnedFd, RtError> {
-  let fd = socket_with(
-    AddressFamily::INET,
-    SocketType::STREAM,
-    SocketFlags::empty(),
-    None,
-  )
-  .map_err(|e| refused("socket(STREAM)", e))?;
-  set_nonblocking_cloexec(&fd)?;
-  Ok(fd)
-}
-
-/// Marks `fd` close-on-exec and non-blocking (applied to a fresh socket and to each accepted one,
-/// which does not inherit non-blocking on macOS/BSD).
-fn set_nonblocking_cloexec(fd: &OwnedFd) -> Result<(), RtError> {
-  rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::CLOEXEC)
-    .map_err(|e| refused("fcntl(CLOEXEC)", e))?;
-  rustix::io::ioctl_fionbio(fd, true).map_err(|e| refused("ioctl(FIONBIO)", e))?;
-  Ok(())
-}
-
-/// Prepares a connected stream (accepted, connected or adopted): non-blocking and close-on-exec, and
-/// `TCP_NODELAY`, so a small write leaves at once instead of waiting for the peer to acknowledge the
-/// previous one (Nagle, RFC 896). Every stream here carries request/reply traffic that the server already
-/// coalesces into one write per batch, so Nagle has nothing left to merge; left on, a reply written while
-/// an earlier one is unacknowledged waits for the client's delayed ACK — 40 ms on Linux (`TCP_DELACK_MIN`),
-/// measured as the median round of `a_reply_in_two_writes_does_not_wait_for_the_peers_delayed_acknowledgement`
-/// on Linux (42 ms before; docs/bugs/2026-10-05-nagle-delayed-ack.md).
-fn prepare_stream(fd: &OwnedFd) -> Result<(), RtError> {
-  set_nonblocking_cloexec(fd)?;
-  rustix::net::sockopt::set_tcp_nodelay(fd, true).map_err(|e| refused("setsockopt(TCP_NODELAY)", e))
-}
-
-/// The bound address of `fd` as an IPv4 socket address.
-fn local_v4(fd: &OwnedFd) -> Result<SocketAddrV4, RtError> {
-  match SocketAddr::try_from(getsockname(fd).map_err(|e| refused("getsockname", e))?) {
-    Ok(SocketAddr::V4(v4)) => Ok(v4),
-    _ => Err(refused("getsockname", rustix::io::Errno::AFNOSUPPORT)),
-  }
+  socket: Socket,
 }
 
 impl TcpListener {
@@ -258,105 +71,101 @@ impl TcpListener {
   /// the accept loop takes them — the caller derives it from its connection fan-in, and the OS clamps
   /// it to the system maximum.
   pub fn bind(addr: SocketAddrV4, backlog: i32) -> Result<TcpListener, RtError> {
-    let fd = stream_socket()?;
-    bind(&fd, &addr).map_err(|e| refused("bind", e))?;
-    listen(&fd, backlog).map_err(|e| refused("listen", e))?;
-    Ok(TcpListener { fd })
+    let socket = netsys::stream_socket()?;
+    netsys::bind(&socket, addr)?;
+    netsys::listen(&socket, backlog)?;
+    Ok(TcpListener { socket })
   }
 
-  /// Adopts an already-bound, listening socket from an existing descriptor — a listener a supervisor
-  /// bound and handed over across an exec so its port survives a daemon restart (§4.6, "One TCP
-  /// loopback listener held by the anchor"). The descriptor must name a bound, listening INET stream
-  /// socket; it is made non-blocking (the driver waits on it) and close-on-exec (the adopting process
-  /// does not re-inherit it), then owned here. `fd` is an `OwnedFd`, so the caller has already taken
-  /// ownership of the raw descriptor (its own `unsafe` at the inheritance boundary).
-  pub fn from_fd(fd: OwnedFd) -> Result<TcpListener, RtError> {
-    set_nonblocking_cloexec(&fd)?;
-    Ok(TcpListener { fd })
+  /// Adopts an already-bound, listening socket — a listener a supervisor bound and handed over so its port
+  /// survives a daemon restart (§4.6, "One TCP loopback listener held by the anchor"). It must name a bound,
+  /// listening INET stream socket; it is made non-blocking (the driver waits on it) and kept from the adopting
+  /// process's own children (close-on-exec on Unix, inheritance off on Windows), then owned here. The caller has
+  /// already taken ownership of the raw handle (its own `unsafe` at the inheritance boundary).
+  pub fn from_owned(owned: OwnedStream) -> Result<TcpListener, RtError> {
+    Ok(TcpListener {
+      socket: netsys::adopt_listener(owned)?,
+    })
   }
 
-  /// Gives up ownership of the underlying descriptor — the counterpart to [`TcpListener::from_fd`],
-  /// for a supervisor that binds the listener, then hands its descriptor to the daemon it spawns so
-  /// the port survives a restart (§4.6). The caller owns the returned descriptor and its lifetime.
-  pub fn into_fd(self) -> OwnedFd {
-    self.fd
+  /// Gives up ownership of the underlying handle — the counterpart to [`TcpListener::from_owned`], for a
+  /// supervisor that binds the listener, then hands it to the daemon it spawns so the port survives a restart
+  /// (§4.6). The caller owns the returned handle and its lifetime.
+  pub fn into_owned(self) -> OwnedStream {
+    netsys::into_owned(self.socket)
   }
 
   /// The local address the listener is bound to (the OS-assigned port on an ephemeral bind).
   pub fn local_addr(&self) -> Result<SocketAddrV4, RtError> {
-    local_v4(&self.fd)
+    netsys::local_addr(&self.socket)
   }
 
   /// Accepts the next connection, awaiting readability through the driver when none is pending. The
-  /// accepted socket is made non-blocking and close-on-exec, like the listener, and `TCP_NODELAY`.
+  /// accepted socket is made non-blocking and kept from children, like the listener, and `TCP_NODELAY`.
   pub async fn accept(&self) -> Result<TcpStream, RtError> {
     loop {
-      match accept(&self.fd) {
-        Ok(fd) => {
-          prepare_stream(&fd)?;
-          return Ok(TcpStream { fd });
-        }
-        Err(rustix::io::Errno::AGAIN) => readable(self.fd.as_raw_fd()).await?,
-        Err(rustix::io::Errno::INTR) => continue,
-        Err(e) => return Err(refused("accept", e)),
+      match netsys::accept(&self.socket)? {
+        Io::Ready(socket) => return Ok(TcpStream { socket }),
+        Io::WouldBlock => readable(self.socket.raw_id()).await?,
+        Io::Interrupted => continue,
       }
     }
   }
 }
 
 impl TcpStream {
-  /// Connects to `addr`, awaiting the driver until the handshake completes. A non-blocking `connect`
-  /// returns immediately with `EINPROGRESS`; the socket becomes writable when the handshake finishes,
-  /// and a pending socket error (a refused connection) surfaces then, as a typed refusal.
+  /// Connects to `addr`, awaiting the driver until the handshake completes. A non-blocking connect
+  /// returns at once while the handshake runs; the socket becomes writable when it finishes, and a
+  /// pending socket error (a refused connection) surfaces then, as a typed refusal.
   pub async fn connect(addr: SocketAddrV4) -> Result<TcpStream, RtError> {
-    let fd = stream_socket()?;
-    match connect(&fd, &addr) {
-      Ok(()) => {}
-      Err(rustix::io::Errno::INPROGRESS) => {
-        writable(fd.as_raw_fd()).await?;
-        if let Err(err) =
-          rustix::net::sockopt::socket_error(&fd).map_err(|e| refused("getsockopt(SO_ERROR)", e))?
-        {
-          return Err(refused("connect", err));
-        }
+    let socket = netsys::stream_socket()?;
+    match netsys::connect(&socket, addr)? {
+      Io::Ready(()) => {}
+      Io::WouldBlock | Io::Interrupted => {
+        writable(socket.raw_id()).await?;
+        netsys::connected(&socket)?;
       }
-      Err(e) => return Err(refused("connect", e)),
     }
-    rustix::net::sockopt::set_tcp_nodelay(&fd, true)
-      .map_err(|e| refused("setsockopt(TCP_NODELAY)", e))?;
-    Ok(TcpStream { fd })
+    // `TCP_NODELAY`, so a small write leaves at once instead of waiting for the peer to acknowledge the previous
+    // one (Nagle, RFC 896). Every stream here carries request/reply traffic that the server already coalesces into
+    // one write per batch, so Nagle has nothing left to merge; left on, a reply written while an earlier one is
+    // unacknowledged waits for the client's delayed ACK — 40 ms on Linux (`TCP_DELACK_MIN`), measured as the median
+    // round of `a_reply_in_two_writes_does_not_wait_for_the_peers_delayed_acknowledgement` on Linux (42 ms before;
+    // docs/bugs/2026-10-05-nagle-delayed-ack.md). An accepted or adopted stream gets it in the seam.
+    netsys::set_nodelay(&socket)?;
+    Ok(TcpStream { socket })
   }
 
-  /// Gives up the stream's descriptor, to move the connection to another shard (§4.6: a mount's connection is
+  /// Gives up the stream's handle, to move the connection to another shard (§4.6: a mount's connection is
   /// served on the shard that owns its volume). No readiness is armed between awaits — every registration is
   /// one-shot, re-armed by the next await — so nothing on this shard's driver waits on it once the serving
   /// task stops awaiting it; on epoll a fired one-shot entry stays in this shard's interest list disabled,
   /// never reported, until the descriptor closes.
-  pub fn into_fd(self) -> OwnedFd {
-    self.fd
+  pub fn into_owned(self) -> OwnedStream {
+    netsys::into_owned(self.socket)
   }
 
-  /// Adopts a connected stream's descriptor on the current shard: the counterpart to
-  /// [`TcpStream::into_fd`]. It is made non-blocking and close-on-exec, as an accepted stream is.
-  pub fn from_fd(fd: OwnedFd) -> Result<TcpStream, RtError> {
-    prepare_stream(&fd)?;
-    Ok(TcpStream { fd })
+  /// Adopts a connected stream's handle on the current shard: the counterpart to [`TcpStream::into_owned`]. It
+  /// is made non-blocking, kept from children and `TCP_NODELAY`, as an accepted stream is.
+  pub fn from_owned(owned: OwnedStream) -> Result<TcpStream, RtError> {
+    Ok(TcpStream {
+      socket: netsys::adopt_stream(owned)?,
+    })
   }
 
   /// The local address this stream is bound to.
   pub fn local_addr(&self) -> Result<SocketAddrV4, RtError> {
-    local_v4(&self.fd)
+    netsys::local_addr(&self.socket)
   }
 
   /// Reads into `buf`, awaiting readability through the driver when nothing is ready; returns the
   /// byte count, or zero at end of stream (the peer closed its write half).
   pub async fn read(&self, buf: &mut [u8]) -> Result<usize, RtError> {
     loop {
-      match rustix::io::read(&self.fd, &mut *buf) {
-        Ok(n) => return Ok(n),
-        Err(rustix::io::Errno::AGAIN) => readable(self.fd.as_raw_fd()).await?,
-        Err(rustix::io::Errno::INTR) => continue,
-        Err(e) => return Err(refused("read", e)),
+      match netsys::read(&self.socket, &mut *buf)? {
+        Io::Ready(n) => return Ok(n),
+        Io::WouldBlock => readable(self.socket.raw_id()).await?,
+        Io::Interrupted => continue,
       }
     }
   }
@@ -366,7 +175,7 @@ impl TcpStream {
   /// borrows no buffer, so a caller can await it and then [`TcpStream::peek_now`] into a buffer it holds only across
   /// that synchronous call.
   pub async fn wait_readable(&self) -> Result<(), RtError> {
-    readable(self.fd.as_raw_fd()).await
+    readable(self.socket.raw_id()).await
   }
 
   /// Copies the bytes at the head of the receive queue into `buf` without consuming them (`MSG_PEEK`), without
@@ -375,11 +184,10 @@ impl TcpStream {
   /// of the descriptor (A-113).
   pub fn peek_now(&self, buf: &mut [u8]) -> Result<Option<usize>, RtError> {
     loop {
-      match rustix::net::recv(&self.fd, &mut *buf, rustix::net::RecvFlags::PEEK) {
-        Ok((n, _)) => return Ok(Some(n)),
-        Err(rustix::io::Errno::AGAIN) => return Ok(None),
-        Err(rustix::io::Errno::INTR) => continue,
-        Err(e) => return Err(refused("recv(MSG_PEEK)", e)),
+      match netsys::peek(&self.socket, &mut *buf)? {
+        Io::Ready(n) => return Ok(Some(n)),
+        Io::WouldBlock => return Ok(None),
+        Io::Interrupted => continue,
       }
     }
   }
@@ -395,12 +203,12 @@ impl TcpStream {
       let into = scratch
         .get_mut(..take)
         .filter(|into| !into.is_empty())
-        .ok_or_else(|| refused("recv(discard)", rustix::io::Errno::INVAL))?;
-      match rustix::net::recv(&self.fd, into, DISCARD_FLAGS) {
-        Ok((0, _)) => return Err(refused("recv(discard)", rustix::io::Errno::PIPE)),
-        Ok((n, _)) => left = left.saturating_sub(n.min(take)),
-        Err(rustix::io::Errno::INTR) => continue,
-        Err(e) => return Err(refused("recv(discard)", e)),
+        .ok_or_else(|| netsys::invalid("recv(discard)"))?;
+      match netsys::discard(&self.socket, into)? {
+        Io::Ready(0) => return Err(netsys::broken_pipe("recv(discard)")),
+        Io::Ready(n) => left = left.saturating_sub(n.min(take)),
+        Io::Interrupted => continue,
+        Io::WouldBlock => return Err(netsys::would_block("recv(discard)")),
       }
     }
     Ok(())
@@ -413,22 +221,21 @@ impl TcpStream {
   /// can count it: the stream crossed a moment when it ended mid-record.
   pub async fn send_records(&self, records: &[u8]) -> Result<Sent, RtError> {
     loop {
-      match rustix::io::write(&self.fd, records) {
-        Ok(0) if !records.is_empty() => return Err(refused("write", rustix::io::Errno::PIPE)),
-        Ok(n) if n >= records.len() => return Ok(Sent::Whole),
-        Ok(n) => {
+      match netsys::write(&self.socket, records)? {
+        Io::Ready(0) if !records.is_empty() => return Err(netsys::broken_pipe("write")),
+        Io::Ready(n) if n >= records.len() => return Ok(Sent::Whole),
+        Io::Ready(n) => {
           self.write_all(records.get(n..).unwrap_or_default()).await?;
           return Ok(Sent::Completed);
         }
-        Err(rustix::io::Errno::AGAIN) => writable(self.fd.as_raw_fd()).await?,
-        Err(rustix::io::Errno::INTR) => continue,
-        Err(e) => return Err(refused("write", e)),
+        Io::WouldBlock => writable(self.socket.raw_id()).await?,
+        Io::Interrupted => continue,
       }
     }
   }
 
-  /// [`TcpStream::send_records`] for a run held in pieces: one `writev` of `records` in order, so a run of replies is
-  /// sent without first being copied into one buffer (each 256 KiB READ reply was copied into the run once more,
+  /// [`TcpStream::send_records`] for a run held in pieces: one gathering send of `records` in order, so a run of replies
+  /// is sent without first being copied into one buffer (each 256 KiB READ reply was copied into the run once more,
   /// 3.4% of the daemon's samples on a Linux NFSv4.2 read, 2026-10-09). The kernel takes a vectored send by its total
   /// length (XNU `sosend` judges `uio_resid` against the send low-water mark), so a run no longer than the record bound
   /// on a whole-send stream is still taken all or nothing (A-113). A short send is completed here and answered
@@ -443,16 +250,15 @@ impl TcpStream {
       .map(|record| std::io::IoSlice::new(record))
       .collect();
     loop {
-      match rustix::io::writev(&self.fd, &slices) {
-        Ok(0) if total > 0 => return Err(refused("writev", rustix::io::Errno::PIPE)),
-        Ok(n) if n >= total => return Ok(Sent::Whole),
-        Ok(n) => {
+      match netsys::write_vectored(&self.socket, &slices)? {
+        Io::Ready(0) if total > 0 => return Err(netsys::broken_pipe("writev")),
+        Io::Ready(n) if n >= total => return Ok(Sent::Whole),
+        Io::Ready(n) => {
           self.write_all_from(records, n).await?;
           return Ok(Sent::Completed);
         }
-        Err(rustix::io::Errno::AGAIN) => writable(self.fd.as_raw_fd()).await?,
-        Err(rustix::io::Errno::INTR) => continue,
-        Err(e) => return Err(refused("writev", e)),
+        Io::WouldBlock => writable(self.socket.raw_id()).await?,
+        Io::Interrupted => continue,
       }
     }
   }
@@ -475,14 +281,14 @@ impl TcpStream {
   }
 
   /// Makes the stream's kernel buffers hold `buffer_bytes` each way, so a whole record can sit in the receive queue to
-  /// be peeked and a whole record fits the send queue. On macOS and the BSDs the buffers are set (`SO_SNDBUF`,
-  /// `SO_RCVBUF`, within `kern.ipc.maxsockbuf`), refused unless the kernel keeps at least that much. Linux is left to
-  /// autotune: an unprivileged `SO_RCVBUF` is clamped at `net.core.rmem_max` (about 208 KiB by default, below a record)
-  /// and turns autotuning off, while a receive low-water mark grows an unlocked buffer to fit it, up to half of
-  /// `tcp_rmem[2]` (`tcp_set_rcvlowat`, net/ipv4/tcp.c, read 2026-10-06) — what [`TcpStream::want_bytes`] asks and
-  /// checks. Linux sends are not made whole ([`WholeSends::NotOffered`]), so its send buffer needs no floor.
+  /// be peeked and a whole record fits the send queue. On macOS, the BSDs and Windows the buffers are set (`SO_SNDBUF`,
+  /// `SO_RCVBUF`), refused unless the kernel keeps at least that much. Linux is left to autotune: an unprivileged
+  /// `SO_RCVBUF` is clamped at `net.core.rmem_max` (about 208 KiB by default, below a record) and turns autotuning off,
+  /// while a receive low-water mark grows an unlocked buffer to fit it, up to half of `tcp_rmem[2]`
+  /// (`tcp_set_rcvlowat`, net/ipv4/tcp.c, read 2026-10-06) — what [`TcpStream::want_bytes`] asks and checks. Linux
+  /// sends are not made whole ([`WholeSends::NotOffered`]), so its send buffer needs no floor.
   pub fn reserve_buffers(&self, buffer_bytes: usize) -> Result<(), RtError> {
-    reserve_buffers(&self.fd, buffer_bytes)
+    netsys::reserve_buffers(&self.socket, buffer_bytes)
   }
 
   /// Makes every send of at most `record_bytes` whole — all of it or none — where the kernel offers that, and says
@@ -491,51 +297,45 @@ impl TcpStream {
   /// failing midway (XNU `bsd/kern/uipc_socket.c` `sosend`, read 2026-10-06); with `SO_SNDLOWAT` at `record_bytes` a
   /// send that size or smaller is whole. The kernel clamps the mark to the send buffer without saying so, so a buffer
   /// smaller than `record_bytes` is refused here rather than trusted. Linux keeps `SO_SNDLOWAT` fixed (socket(7)) and
-  /// copies what fits, so it answers [`WholeSends::NotOffered`].
+  /// copies what fits, and a non-blocking Windows send may take part of its bytes, so both answer
+  /// [`WholeSends::NotOffered`].
   pub fn make_sends_whole(&self, record_bytes: usize) -> Result<WholeSends, RtError> {
-    make_sends_whole(&self.fd, record_bytes)
+    Ok(if netsys::make_sends_whole(&self.socket, record_bytes)? {
+      WholeSends::Guaranteed
+    } else {
+      WholeSends::NotOffered
+    })
   }
 
   /// Sets the receive low-water mark (`SO_RCVLOWAT`): readability is reported once `bytes` are queued (or at end of
   /// stream), so a reader waiting for a whole record is woken once, not for every segment of it.
   /// The kernel caps the mark without saying so (Linux at half of `tcp_rmem[2]`, BSD at the receive buffer); a mark it
-  /// kept below `bytes` would report readable before the record is whole, so it is read back and refused.
+  /// kept below `bytes` would report readable before the record is whole, so it is read back and refused. Windows'
+  /// TCP provider keeps no such mark, and its refusal is returned.
   pub fn want_bytes(&self, bytes: usize) -> Result<(), RtError> {
-    let value = i32::try_from(bytes.max(1)).unwrap_or(i32::MAX);
-    set_int_option(&self.fd, libc::SOL_SOCKET, libc::SO_RCVLOWAT, value)
-      .map_err(|e| refused("setsockopt(SO_RCVLOWAT)", e))?;
-    let mut kept = [0u8; size_of::<i32>()];
-    get_option(&self.fd, libc::SOL_SOCKET, libc::SO_RCVLOWAT, &mut kept)
-      .map_err(|e| refused("getsockopt(SO_RCVLOWAT)", e))?;
-    if i32::from_ne_bytes(kept) < value {
-      return Err(refused(
-        "setsockopt(SO_RCVLOWAT)",
-        rustix::io::Errno::NOBUFS,
-      ));
-    }
-    Ok(())
+    netsys::want_bytes(&self.socket, bytes)
   }
 
   /// Whether the connection has left the established state — the peer closed its half (its FIN arrived: close-wait) or
   /// the connection is gone. A reader that peeks and never consumes an unfinished record cannot learn of the peer's close
   /// from a zero-length read, since the unfinished bytes stay queued; it asks this once readability says something
   /// changed (A-113). This process never half-closes a stream it still reads, so every other state means the peer is
-  /// done. Read from the kernel's own connection record (Linux `TCP_INFO`, macOS `TCP_CONNECTION_INFO`), whose first byte
-  /// is the TCP state.
+  /// done. Read from the kernel's own connection record (Linux `TCP_INFO`, macOS `TCP_CONNECTION_INFO`, Windows
+  /// `SIO_TCP_INFO`).
   pub fn peer_closed(&self) -> Result<bool, RtError> {
-    let state = tcp_state(&self.fd).map_err(|e| refused("getsockopt(TCP state)", e))?;
-    Ok(state != TCP_ESTABLISHED)
+    Ok(!netsys::established(&self.socket)?)
   }
 
-  /// Ends both directions of the connection (`shutdown(SHUT_RDWR)`), whoever else holds a copy of its descriptor: a
-  /// close drops only this process's copy, and the connection lives while another process (the anchor) holds one.
+  /// Ends both directions of the connection, whoever else holds a copy of its handle: a close drops only this
+  /// process's copy, and the connection lives while another process (the anchor) holds one.
   pub fn shutdown(&self) -> Result<(), RtError> {
-    rustix::net::shutdown(&self.fd, rustix::net::Shutdown::Both).map_err(|e| refused("shutdown", e))
+    netsys::shutdown(&self.socket)
   }
 
   /// The stream's descriptor, borrowed: to hand a duplicate to another process by `SCM_RIGHTS`.
+  #[cfg(unix)]
   pub fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
-    std::os::fd::AsFd::as_fd(&self.fd)
+    netsys::as_fd(&self.socket)
   }
 
   /// Writes all of `buf`, awaiting writability through the driver whenever the send buffer is full,
@@ -543,14 +343,13 @@ impl TcpStream {
   pub async fn write_all(&self, buf: &[u8]) -> Result<(), RtError> {
     let mut sent = 0;
     while let Some(unsent) = buf.get(sent..).filter(|unsent| !unsent.is_empty()) {
-      match rustix::io::write(&self.fd, unsent) {
-        // A non-blocking write of a non-empty slice returns bytes written, `EAGAIN`, or an error; a
-        // zero here would mean the kernel accepted nothing without blocking, which is a broken pipe.
-        Ok(0) => return Err(refused("write", rustix::io::Errno::PIPE)),
-        Ok(n) => sent = sent.saturating_add(n),
-        Err(rustix::io::Errno::AGAIN) => writable(self.fd.as_raw_fd()).await?,
-        Err(rustix::io::Errno::INTR) => continue,
-        Err(e) => return Err(refused("write", e)),
+      match netsys::write(&self.socket, unsent)? {
+        // A non-blocking write of a non-empty slice returns bytes written, a would-block, or an error; a zero here
+        // would mean the kernel accepted nothing without blocking, which is a broken pipe.
+        Io::Ready(0) => return Err(netsys::broken_pipe("write")),
+        Io::Ready(n) => sent = sent.saturating_add(n),
+        Io::WouldBlock => writable(self.socket.raw_id()).await?,
+        Io::Interrupted => continue,
       }
     }
     Ok(())

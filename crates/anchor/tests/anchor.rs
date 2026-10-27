@@ -275,7 +275,7 @@ fn the_supervised_child_inherits_the_held_nfs_listener() {
   const BACKLOG: i32 = 1;
   let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), BACKLOG).unwrap();
   let port = listener.local_addr().unwrap().port();
-  let fd = listener.into_fd();
+  let fd = listener.into_owned();
   // Make the descriptor inheritable so the spawned child receives it across the exec.
   rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::empty()).unwrap();
 

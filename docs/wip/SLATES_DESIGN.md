@@ -1328,6 +1328,13 @@ cluster.
 > by use on the readiness-native driver: `crates/rt/tests/tcp.rs` runs an accept→read→write→read round
 > trip with both ends on the runtime's own sockets, `tests/udp.rs` the datagram path.
 >
+> **Status (2026-10-26, A-182: TCP on every platform).** `tcp` rides the platform socket seam (`netsys`) as `udp`
+> does: one code path, `rustix` on Unix and Winsock 2 on Windows, where the IOCP driver's AFD reactor gives a
+> listener, a stream and a handshake their readiness. Until then the module was `#[cfg(not(windows))]`, so every TCP
+> service was missing on Windows (`docs/wip/platforms.md`, gap 1). A listener or a stream is handed over as an
+> `OwnedStream` (a descriptor, or a socket). `tests/tcp.rs` runs on all three platforms and in the three Windows CI
+> lanes.
+>
 > **Status (2026-10-26, A-179: a Windows pipe end on the IOCP driver).** A duplex named pipe's end is served by the
 > IOCP driver (`crates/rt/src/pipe.rs`): the Shards route's stream on Windows, where no AF_UNIX pair can be made
 > without a socket file. Pipes report their I/O on completion and AFD does not take them. So the driver keeps at most
@@ -5596,7 +5603,8 @@ client channel.
 > daemon's derived `clients_per_shard` connections) and authorizes before dispatch: `Host` and `Origin`
 > must name the loopback edge, the target is `/mcp`, the body `application/json`, and a 128-bit bearer
 > token minted at start is required. Stdio lines share the message bound. Owed: servable roots enrolled
-> by a human (§4.13); the HTTP edge on Windows (the runtime's TCP is macOS/Linux).
+> by a human (§4.13); the HTTP edge on Windows. The runtime has TCP there since A-182 (2026-10-26); the edge's own
+> gate (`crates/mcp/src/lib.rs`) is the next piece (`docs/wip/platforms.md`).
 
 **MCP server.** `slates mcp`: stdio and loopback Streamable HTTP; the 2026-07-28 stateless
 protocol with per-request `_meta`, `server/discover`, `resultType`, `ttlMs`/`cacheScope`,
@@ -12648,6 +12656,47 @@ day, `crates/ipc` (`protocol.rs`: `RequestBody::ShardsHolder`, `ReplyBody::Shard
   - The first run of the no-job mutant passed the CLI kill case: the holder then waited on its standard input, and that
     read returned once the command died, so the holder exited by itself. The holder now parks for good, so only the
     job can end it, and the mutant fails.
+
+### A-182 — The runtime's TCP is built on every platform: one code path over the socket seam, Winsock 2 and the AFD reactor on Windows (accepted 2026-10-26)
+Applied in the same change to: §4.3 (the sockets' status), §4.6 (the MCP server's status), `docs/wip/platforms.md`
+(new: every function by platform, with this as gap 1's close), GAPS (`8a-platforms`, new), `crates/rt` (`netsys.rs`,
+its stream half on both arms and three refusal helpers; `tcp.rs`, cfg-free over the seam, its hand-off named
+`from_owned`/`into_owned` over `OwnedStream` where it said `from_fd`/`into_fd`; `lib.rs`, the module ungated; `udp.rs`,
+`into_owned` on every platform; `tests/tcp.rs`, run on every platform, five tests added), the renamed callers
+(`crates/server` `nfs.rs`, `fleet.rs`, `daemon.rs`; `crates/cli` `anchor.rs`; `crates/anchor` `supervise.rs`,
+`tests/anchor.rs`), `unsafe-budget.toml` (`slates-rt` 84 → 96), and `ci.yml` (the three Windows lanes run
+`tests/tcp.rs`).
+- **Why.** Ada's rule (2026-10-26): every function works on macOS arm64, Linux and Windows on amd64 and arm64. The
+  runtime had no TCP on Windows (`#[cfg(not(windows))] pub mod tcp`), so every TCP service was missing there: the MCP
+  HTTP edge, the NFS network export, a fleet node's export, and with the export Docker Desktop's and WSL2's way in.
+  This is what each of them stands on; each is built on it next (`docs/wip/platforms.md`).
+- **Shape.** The async logic stays in `tcp.rs`, and the calls are the seam's, as `udp.rs`'s are: the Unix arm is the
+  `rustix` and `libc` code `tcp.rs` held, moved unchanged; the Windows arm is Winsock 2. The AFD reactor already armed
+  a socket's accept, disconnect, abort and connect-failure edges, so readiness needed nothing new.
+- **Where the platforms differ, each answers for itself:**
+  - whole sends: macOS and the BSDs (`SO_SNDLOWAT`); Linux and Windows answer `NotOffered` (a non-blocking Winsock
+    send may take part of its bytes);
+  - a receive low-water mark: Unix keeps one; Windows' TCP provider refuses `SO_RCVLOWAT`, and the refusal is
+    returned, not hidden (the A-113 peek-whole-record design needs another wait on Windows, for the export's turn);
+  - the peer's close: Linux `TCP_INFO`, macOS `TCP_CONNECTION_INFO`, Windows `SIO_TCP_INFO`;
+  - a Windows stream socket is made with `WSA_FLAG_NO_HANDLE_INHERIT` (Unix's close-on-exec), an accepted or adopted
+    one has inheritance cleared, and every one binds with `SO_EXCLUSIVEADDRUSE`, so no other process can take a
+    listener's connections by binding its port with `SO_REUSEADDR` (Microsoft Learn).
+- **Proven** (2026-10-26):
+  - Windows x86_64 (jupiter, Windows 10.0.26200): `crates/rt/tests/tcp.rs` 10 of 10, among them a refused connect
+    reported typed, the peer's close seen in Windows' own record, a peeked request left queued until discarded, the
+    low-water mark refused typed, and a second socket's `SO_REUSEADDR` bind of a listener's port refused `WSAEACCES`;
+    CI's Windows doc step clean.
+  - Linux x86_64: `tests/tcp.rs` 9 of 9 and the NFS server's hostile-client suite 17 of 17 over the moved calls.
+  - macOS arm64: `tests/tcp.rs` 9 of 9, the NFS hostile suite 17 of 17, the anchor's 15 of 15.
+  - Clippy `-D warnings` on macOS (the workspace), Linux x86_64 and arm64, and Windows x86_64 and arm64 (`slates-rt`);
+    format, `cargo xtask check` and CI's doc step clean.
+- **Measured and set aside:** the vectored-run test expected the 8 MiB run back `Completed` after a short send, a Unix
+  kernel's buffer bound. Windows' AFD took the whole run in one `WSASend` on loopback (`Whole`), so there the test keeps
+  the byte-for-byte check and the completion path is covered by the same code's Unix runs.
+- **Siblings found:** the Windows datagram socket is made by `socket()`, which Winsock makes inheritable, and binds
+  without `SO_EXCLUSIVEADDRUSE`, so a local process could share a fleet node's UDP port. It is the next item in
+  `docs/wip/platforms.md`.
 
 ### A-178 — macOS refuses a second owner of a live instance's rendezvous: the owner's token is a Mach bootstrap name (accepted 2026-10-26)
 Applied in the same change to: §4.7 (the rendezvous's status), A-176 (its macOS sentences), GAPS, `crates/ipc` (`owner_name.rs`, new; `rendezvous.rs`: the macOS `Owner`, `owner_token_name` and `take_ownership`; `lib.rs`; `tests/rendezvous.rs`: the second-owner test now also macOS's, and a cross-process one on every platform), `unsafe-budget.toml` (`slates-ipc` 70 → 79), `CLAUDE.md`, and a bug record (`docs/bugs/2026-10-26-a-second-owner-took-a-live-macos-instances-rendezvous-over.md`).

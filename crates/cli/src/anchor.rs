@@ -104,7 +104,7 @@ fn hold_nfs_listener(supervisor: &mut Supervisor) {
   else {
     return;
   };
-  let fd = listener.into_fd();
+  let fd = listener.into_owned();
   // Clear close-on-exec so the daemon inherits the descriptor across the spawn (the anchor keeps its
   // own copy, so the socket outlives any one daemon). If that is refused the listener is not held at
   // all: handing the daemon a descriptor number it will not inherit would have it adopt whatever that
@@ -150,7 +150,7 @@ fn hold_fleet_serve(
   // The network export's listener (§4.6, AUD-29-75), held and handed over the same way when the plan has one.
   let export = match serve.export {
     Some(listener) => {
-      let fd = listener.into_fd();
+      let fd = listener.into_owned();
       rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::empty()).map_err(|e| {
         failed(
           "fleet serve",

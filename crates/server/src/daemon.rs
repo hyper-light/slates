@@ -329,7 +329,7 @@ fn nfs_listener() -> Result<TcpListener, RtError> {
     // inherited at this number; ownership is ours now (the anchor keeps its own copy), so wrapping it
     // in an `OwnedFd` gives it a single owner that closes it on drop.
     let owned = unsafe { OwnedFd::from_raw_fd(raw) };
-    return TcpListener::from_fd(owned);
+    return TcpListener::from_owned(owned);
   }
   TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), NFS_BACKLOG)
 }

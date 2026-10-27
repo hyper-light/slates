@@ -46,7 +46,7 @@
 //! name in `entries`). The root-listing gather fans out to the shards in parallel. The **listener
 //! survives a daemon restart** (§4.6): a supervising anchor holds it and hands its descriptor over in
 //! the environment, and the daemon adopts it (`crate::daemon`'s `nfs_listener` over
-//! `slates_rt::tcp::TcpListener::from_fd` and `slates_anchor::ENV_NFS_LISTENER`) rather than binding a
+//! `slates_rt::tcp::TcpListener::from_owned` and `slates_anchor::ENV_NFS_LISTENER`) rather than binding a
 //! fresh ephemeral one, so the loopback
 //! port is stable across restarts; a standalone daemon (tests) still binds its own. **Every connection survives it
 //! too (A-113):** the anchor holds a duplicate of each from its accept, a request is consumed only once its reply is in
@@ -2451,7 +2451,7 @@ pub(crate) fn adopt_held(
       held: Some(connection),
     };
     let previously = HELD_CONNECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let Ok(stream) = TcpStream::from_fd(socket) else {
+    let Ok(stream) = TcpStream::from_owned(socket) else {
       crate::fleet::count_refusal(HOLD_REFUSED);
       ending.release();
       continue;
@@ -3013,7 +3013,7 @@ fn migrate(owner: u16, connection: Connection) {
     held,
     ..
   } = connection;
-  let fd = stream.into_fd();
+  let fd = stream.into_owned();
   // A copy of the session stays behind for the refusal path: a move refused before it left returns the session to its
   // home table, so the home never points at a session no shard holds.
   let kept = carry.clone();
@@ -3023,7 +3023,7 @@ fn migrate(owner: u16, connection: Connection) {
       if let Some((sessionid, departed)) = carry {
         adopt_session(sessionid, departed);
       }
-      let Ok(stream) = TcpStream::from_fd(fd) else {
+      let Ok(stream) = TcpStream::from_owned(fd) else {
         crate::fleet::count_refusal(MIGRATE_REFUSED);
         ending.release();
         return;

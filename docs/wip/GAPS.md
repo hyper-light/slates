@@ -717,6 +717,24 @@ are retained with their scope; no documentation edit is an implementation accept
   Nothing on Windows or Linux has *run* yet: that needs those machines (Phase 1's reference
   boxes).
 
+### 8a-platforms. Every function on every platform (2026-10-26, OPEN)
+
+Ada's rule (2026-10-26): every slates function works on macOS arm64, Linux x86_64 and arm64, and Windows x86_64 and
+arm64; macOS x86_64 is the one exception, and a piece one platform lacks is a gap to build, never a reason to close on
+the others. `docs/wip/platforms.md` is the inventory: every function by platform, each cell built, built but unrun,
+missing, or impossible with its source, and the order of work. Two gaps underlay most of the missing cells:
+1. **TCP in the Windows runtime: closed 2026-10-26 by A-182.** `crates/rt` had no `tcp` on Windows, so the MCP HTTP
+   edge, the NFS network export and a fleet node's export were missing there. Each is now built on it in turn.
+2. **Holding a restarted daemon's sockets and mounts on Windows (OPEN).** The anchor holds the fleet's serve sockets,
+   the NFS listener and the FUSE devices by descriptor inheritance, all Unix-only; on Windows a fleet node's ports are
+   free across a restart and a WinFsp mount dies with its daemon.
+
+The rest of the list: the MCP HTTP edge and the network export on Windows; `slates exec` on macOS and Windows;
+`slates oci-runtime`/`oci-check` on Windows; the anchor's restart from its own image on macOS (A-145); the Windows
+datagram socket's inheritance and exclusive address (A-182's sibling); and a run for every built-but-unrun cell, the
+Windows arm64 lane's daemon, CLI (its lane builds no `slates-cli`) and SDK tests first. `8a-win-dumps` stays Ada's
+call.
+
 ### 8a-win-overrun. A Windows shard's park woke before its deadline (2026-10-26, closed 2026-10-26)
 
 `crates/rt/tests/overrun.rs`, `a_wait_stepped_past_its_deadline_reports_the_lateness`, failed on jupiter (1 run in 12,

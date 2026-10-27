@@ -437,7 +437,7 @@ fn adopt_export(
     fault: ServeFault::Refused(refusal),
   };
   let listener =
-    slates_rt::tcp::TcpListener::from_fd(inherited_descriptor(raw)).map_err(refused)?;
+    slates_rt::tcp::TcpListener::from_owned(inherited_descriptor(raw)).map_err(refused)?;
   let bound = listener.local_addr().map_err(refused)?;
   if bound != planned {
     return Err(ServeBindError {

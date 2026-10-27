@@ -28,7 +28,7 @@ pub const ENV_ANCHOR_PID: &str = "SLATES_ANCHOR_PID";
 /// holds (§4.6, "One TCP loopback listener held by the anchor"), inherited by the daemon across the
 /// spawn so its loopback port is stable across a restart — a live mount survives it. Set only when the
 /// anchor holds a listener (a Unix concern: NFS is the macOS/Linux bridge, Windows uses WinFsp), and a
-/// daemon without it binds its own. The daemon adopts it through `slates_rt::tcp::TcpListener::from_fd`.
+/// daemon without it binds its own. The daemon adopts it through `slates_rt::tcp::TcpListener::from_owned`.
 pub const ENV_NFS_LISTENER: &str = "SLATES_ANCHOR_NFS";
 
 /// Format: the environment variable carrying a fleet node's two serve sockets (§4.8 "Deployment") as

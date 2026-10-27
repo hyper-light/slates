@@ -56,9 +56,8 @@ pub mod sim;
 pub mod task;
 mod thread_clock;
 pub use thread_clock::CpuReading;
-// Async TCP is the NFS loopback mount server's alone (macOS/Linux; Windows mounts through WinFsp), so
-// it stays a `rustix` module gated off Windows — the fleet transport is QUIC over UDP, not TCP.
-#[cfg(not(windows))]
+// Async TCP on every platform, through the socket seam (`netsys`): the NFS servers, the MCP HTTP edge and the
+// network export ride it (`docs/wip/platforms.md`, gap 1).
 pub mod tcp;
 pub mod timer;
 pub mod udp;

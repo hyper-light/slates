@@ -91,11 +91,9 @@ impl UdpSocket {
     })
   }
 
-  /// Gives up the OS socket's descriptor — the counterpart to [`UdpSocket::adopt`], for a supervisor that
-  /// binds a socket and hands it to each process it spawns (the anchor's fleet serve sockets, §4.8, held
-  /// across daemon restarts as its NFS listener is, §4.6). Refused on the simulation driver, whose sockets
-  /// are fabric ports. Unix: the supervisor that uses it is (Windows daemons are not anchor-spawned).
-  #[cfg(unix)]
+  /// Gives up the OS socket — the counterpart to [`UdpSocket::adopt`], for a supervisor that binds a socket
+  /// and hands it to each process it spawns (the anchor's fleet serve sockets, §4.8, held across daemon
+  /// restarts as its NFS listener is, §4.6). Refused on the simulation driver, whose sockets are fabric ports.
   pub fn into_owned(self) -> Result<OwnedDatagram, RtError> {
     match self.inner {
       Inner::Real { socket } => Ok(netsys::into_owned(socket)),
