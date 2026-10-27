@@ -11645,9 +11645,13 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       of 10: zero-copy at every size, following every change, the seal against a hostile peer, the hand-off and release
       cases), the FUSE mount's read-only and shared maps, and the three container map tests (Docker's bound mount,
       rootless podman's, the container direct map: `zero_copy=true whole=true len=4194304`), all passing. Red-checked on
-      x86_64 with the same tests and mutants, whose assertions are the same code. An arm64 red-check run is owed: on
-      adas-mac-studio, whose Docker runs arm64 Linux natively, a 1.5 GB Rust image did not arrive in 30 minutes at the
-      165 KB/s it downloaded at, and this Mac had 18 GB of disk free;
+      x86_64 with the same tests and mutants, whose assertions are the same code. Red-checked on arm64 too (2026-10-27,
+      slates 7318e744, linux/arm64 natively in Docker Desktop on this Mac, Linux 6.12.76, rustc 1.98.1): green, the
+      direct-map client tests 10 of 10 and the FUSE mount's two map tests 2 of 2; with `FUSE_NOTIFY_INVAL_INODE` never
+      sent, both mount tests fail (the read-only map kept its first fill, `A`, through all 16 replacements); with every
+      direct map read by copy (`map_read` answering `MapUnavailable`), 9 of 10 client tests fail their zero-copy
+      assertions. The container tests take the same two paths; their own red-checks are the x86_64 ones, since running
+      them here would need Docker inside Docker;
     - bare-metal macOS arm64 by the socket route: the direct map's read-only copy over the daemon's socket route (A-173,
       2026-10-25; the entry below);
     - bare-metal Windows x86_64 by the socket route: a read-only section handle duplicated into the client (A-175,
