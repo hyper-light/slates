@@ -12808,6 +12808,17 @@ Applied in the same change to:
     is red-checked there with close-on-exec removed: `EADDRINUSE`.
   - **Linux x86_64:** `cargo clippy -D warnings` on the three crates; `tests/tcp.rs` 10 of 10 and `tests/udp.rs` 11 of
     11; the MCP test whole.
+- **Corrected the same day (CI on 8233f875):** both kinds' child test failed on GitHub's Ubuntu runner with the port
+  still bound right after the spawn, in both lanes that ran them, and passed on jupiter, macOS and adacachy.
+  - **Cause, from the kernel's source:** Linux v6.11 releases a vfork parent, and so the standard library's
+    `posix_spawn`, in `exec_mmap` (`exec_mm_release` → `mm_release` → `complete_vfork_done`). `begin_new_exec` reaches
+    `do_close_on_exec` only after that (fs/exec.c, kernel/fork.c). So for a moment the spawned child still holds every
+    close-on-exec descriptor.
+  - **Why only CI showed it:** Linux master closes them first. adacachy's 7.2 kernel passed 50 of 50 even with both
+    processes pinned to one CPU.
+  - **The fix:** the tests now wait for the child's own first line, which only a child past its exec prints, before
+    closing the socket. The property is unchanged: a child never runs code holding the socket.
+  - **Red-checked:** close-on-exec removed, the test still fails `EADDRINUSE`.
 - **Siblings, not done here:**
   - The accept loop's `503` to a connection past the bound still closes at once, since the loop must not wait. A client
     that has already sent its request can read a reset there. Staging that close needs a bounded set of shedding

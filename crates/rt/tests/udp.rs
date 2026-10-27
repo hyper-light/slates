@@ -248,16 +248,26 @@ const INHERITANCE_TEST: &str = "a_child_started_while_a_socket_is_open_keeps_no_
 /// Format: the argument making the re-invoked binary the child, which libtest takes as a name filter that matches no
 /// test: the child holds whatever it inherited until its input closes.
 const HOLDER: &str = "role=holder";
+/// Format: the line the child prints once it runs its own code, which only a child whose exec has finished can do. The
+/// parent looks for it anywhere in a line, since libtest prints `test <name> ... ` before it without a line break.
+const HOLDING: &str = "slates-rt-test: holding";
 
-/// AC (§4.10a; docs/wip/platforms.md, A-182's sibling): do bind a socket, start a child process while it is open, close
-/// the socket, then bind its port again. The child is this binary re-invoked through the standard library, which on
-/// Windows starts every child inheriting each inheritable handle of this process, and it holds what it inherited until
-/// its input closes. Expect the port free at once: no child keeps a copy of the socket (Windows:
-/// `WSA_FLAG_NO_HANDLE_INHERIT`; Unix: close-on-exec). Until 2026-10-26 the Windows socket was made by `socket()`,
-/// inheritable, so any process a daemon started held its fleet port after the daemon closed it.
+/// AC (§4.10a; docs/wip/platforms.md, A-182's sibling): do bind a socket, start a child process while it is open, wait
+/// until the child runs its own code, close the socket, then bind its port again. The child is this binary re-invoked
+/// through the standard library, which on Windows starts every child inheriting each inheritable handle of this process,
+/// and it holds what it inherited until its input closes. Expect the port free at once: no child keeps a copy of the
+/// socket (Windows: `WSA_FLAG_NO_HANDLE_INHERIT`; Unix: close-on-exec). Until 2026-10-26 the Windows socket was made by
+/// `socket()`, inheritable, so any process a daemon started held its fleet port after the daemon closed it.
+///
+/// Why the wait: close-on-exec closes a child's copy during its exec, not before the spawn returns. Linux v6.11 releases
+/// a vfork parent, and so the standard library's `posix_spawn`, in `exec_mmap` (`exec_mm_release` → `mm_release` →
+/// `complete_vfork_done`), before `begin_new_exec` reaches `do_close_on_exec` (fs/exec.c, kernel/fork.c); master closes
+/// them first. GitHub's Ubuntu runner showed it: the port was still bound right after the spawn returned, in both CI
+/// lanes that ran this (2026-10-26). A child running its own code has finished its exec.
 #[test]
 fn a_child_started_while_a_socket_is_open_keeps_no_copy_of_it() {
   if std::env::args().any(|argument| argument == HOLDER) {
+    println!("{HOLDING}");
     let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut Vec::new());
     std::process::exit(0);
   }
@@ -266,10 +276,14 @@ fn a_child_started_while_a_socket_is_open_keeps_no_copy_of_it() {
   let mut child = std::process::Command::new(std::env::current_exe().unwrap())
     .args(["--exact", INHERITANCE_TEST, "--nocapture", HOLDER])
     .stdin(std::process::Stdio::piped())
-    .stdout(std::process::Stdio::null())
+    .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::null())
     .spawn()
     .unwrap();
+  let holding = std::io::BufRead::lines(std::io::BufReader::new(child.stdout.take().unwrap()))
+    .map_while(Result::ok)
+    .any(|line| line.contains(HOLDING));
+  assert!(holding, "the child runs its own code, its exec finished");
   drop(socket);
   let rebound = std::net::UdpSocket::bind(("127.0.0.1", port));
   drop(child.stdin.take());

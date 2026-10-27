@@ -551,15 +551,21 @@ const INHERITANCE_TEST: &str = "a_child_started_while_a_listener_is_open_keeps_n
 /// Format: the argument making the re-invoked binary the child, which libtest takes as a name filter that matches no
 /// test: the child holds whatever it inherited until its input closes.
 const HOLDER: &str = "role=holder";
+/// Format: the line the child prints once it runs its own code, which only a child whose exec has finished can do. The
+/// parent looks for it anywhere in a line, since libtest prints `test <name> ... ` before it without a line break.
+const HOLDING: &str = "slates-rt-test: holding";
 
-/// Do: bind a listener, start a child process while it is open, close the listener, then bind its port again. The
-/// child is this binary re-invoked through the standard library, which on Windows starts every child inheriting each
-/// inheritable handle of this process, and it holds what it inherited until its input closes. Expect the port free at
-/// once: no child keeps a copy of the listener (Windows: `WSA_FLAG_NO_HANDLE_INHERIT`; Unix: close-on-exec), so a
-/// process the daemon starts can neither accept its connections nor keep its port after the daemon closes it.
+/// Do: bind a listener, start a child process while it is open, wait until the child runs its own code, close the
+/// listener, then bind its port again. The child is this binary re-invoked through the standard library, which on
+/// Windows starts every child inheriting each inheritable handle of this process, and it holds what it inherited until
+/// its input closes. Expect the port free at once: no child keeps a copy of the listener (Windows:
+/// `WSA_FLAG_NO_HANDLE_INHERIT`; Unix: close-on-exec), so a process the daemon starts can neither accept its connections
+/// nor keep its port after the daemon closes it. The wait is the datagram twin's (`tests/udp.rs`): Linux v6.11 returns
+/// from the spawn before the child's exec has closed its close-on-exec descriptors.
 #[test]
 fn a_child_started_while_a_listener_is_open_keeps_no_copy_of_it() {
   if std::env::args().any(|argument| argument == HOLDER) {
+    println!("{HOLDING}");
     let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut Vec::new());
     std::process::exit(0);
   }
@@ -568,10 +574,14 @@ fn a_child_started_while_a_listener_is_open_keeps_no_copy_of_it() {
   let mut child = std::process::Command::new(std::env::current_exe().unwrap())
     .args(["--exact", INHERITANCE_TEST, "--nocapture", HOLDER])
     .stdin(std::process::Stdio::piped())
-    .stdout(std::process::Stdio::null())
+    .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::null())
     .spawn()
     .unwrap();
+  let holding = std::io::BufRead::lines(std::io::BufReader::new(child.stdout.take().unwrap()))
+    .map_while(Result::ok)
+    .any(|line| line.contains(HOLDING));
+  assert!(holding, "the child runs its own code, its exec finished");
   drop(listener);
   let rebound = std::net::TcpListener::bind(("127.0.0.1", port));
   drop(child.stdin.take());
