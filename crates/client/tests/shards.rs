@@ -1433,4 +1433,79 @@ mod delivered {
       drop((section, client, daemon));
     }
   }
+
+  /// A-181, hostile input to `ShardsHolder` on Windows: the request that tells the daemon a process holds a stream is
+  /// judged by object before anything is recorded. Do: attach a stream; name this process with its own handle of the
+  /// stream; with the handle of another pipe this process holds; with a small value that names no handle of the
+  /// stream; and an attachment that does not exist. Expect the true claim taken and counted `shards.holder_added`, sent at once after the attach and so
+  /// resent while the attach's own holder record is on its way (`HolderPending`), the other pipe and the small value
+  /// refused `Forbidden` and counted `shards.holder_refused`, the missing attachment refused `NotFound`, and the stream
+  /// serving throughout.
+  #[cfg(windows)]
+  #[test]
+  fn a_holder_is_added_only_when_its_handle_is_the_streams_own() {
+    use std::os::windows::io::AsRawHandle;
+    let (daemon, mut client) = start("holder");
+    let volume = volume(&mut client, "holder");
+    let shards = client.attach_shards(volume, Intent::Write, None).unwrap();
+    let attachment = shards.attachment.attachment;
+    let own = u64::try_from(shards.stream.as_raw_handle().expose_provenance()).unwrap();
+    let pid = std::process::id();
+    client
+      .tell_shards_holder(volume, attachment, pid, own)
+      .unwrap();
+    assert_eq!(wait_for_count(&daemon, "shards.holder_added", 1), 1);
+    eprintln!(
+      "holder: sent at once after the attach, met no holder yet {} times before it was taken",
+      wait_for_count(&daemon, "shards.holder_pending", 0)
+    );
+    let (_other_kept, other) = slates_ipc::stream::pair(64).unwrap();
+    let other = u64::try_from(other.as_raw_handle().expose_provenance()).unwrap();
+    for (value, what) in [
+      (other, "another pipe's handle"),
+      (4, "a value naming no handle of the stream"),
+    ] {
+      assert!(
+        matches!(
+          client.tell_shards_holder(volume, attachment, pid, value),
+          Err(ClientError::Refused(
+            slates_client::Refusal::Forbidden { .. }
+          ))
+        ),
+        "{what} is refused"
+      );
+    }
+    assert_eq!(wait_for_count(&daemon, "shards.holder_refused", 2), 2);
+    assert!(matches!(
+      client.tell_shards_holder(volume, attachment ^ 1, pid, own),
+      Err(ClientError::Refused(slates_client::Refusal::NotFound))
+    ));
+    let mut guest = Guest::over(shards);
+    assert_eq!(
+      guest.lookup(ROOT, "nothing"),
+      Err(ENOENT),
+      "the stream still serves"
+    );
+    drop(guest);
+    drop(client);
+    drop(daemon);
+  }
+
+  /// A-181: on Unix `ShardsHolder` is refused by kind, since a Unix end is a descriptor the daemon never looks for again.
+  #[cfg(unix)]
+  #[test]
+  fn naming_a_holder_is_refused_by_kind_on_unix() {
+    let (daemon, mut client) = start("holder");
+    let volume = volume(&mut client, "holder");
+    let shards = client.attach_shards(volume, Intent::Write, None).unwrap();
+    assert!(matches!(
+      client.tell_shards_holder(volume, shards.attachment.attachment, std::process::id(), 3),
+      Err(ClientError::Refused(
+        slates_client::Refusal::Unsupported { .. }
+      ))
+    ));
+    drop(shards);
+    drop(client);
+    drop(daemon);
+  }
 }

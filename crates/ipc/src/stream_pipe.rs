@@ -387,11 +387,11 @@ fn gone_or_refused(code: u32, way: Way) -> Result<usize, IpcError> {
 }
 
 /// A program [`spawn_with`] started holding a stream's end, inside a job that ends it when this process ends. This
-/// process's own copy of the end is held here too, and closes when this value goes.
+/// process's own copy of the end is held here too until [`HandedChild::let_go_of_end`], or until this value goes.
 pub struct HandedChild {
   process: crate::win_spawn::Process,
-  /// This process's copy of the end, kept while the child runs (see [`spawn_with`] for why).
-  _stream: OwnedHandle,
+  /// This process's copy of the end, until it lets go (see [`spawn_with`] for why it is kept at first).
+  stream: Option<OwnedHandle>,
   /// The end's handle value in the child, as its arguments named it.
   handed: u64,
   /// The kill-on-close job the child is in; held, never used, until this value goes.
@@ -418,6 +418,13 @@ impl HandedChild {
     self.handed
   }
 
+  /// Closes this process's own copy of the end, so the child's is the only one and the attachment ends when the
+  /// child's closes. Done once the daemon knows the child as a holder (`slates shards` tells it first); a second call
+  /// does nothing.
+  pub fn let_go_of_end(&mut self) {
+    drop(self.stream.take());
+  }
+
   /// Waits for the child to end: its exit code, as Windows reports it (a `u32` read back as the `i32` with the same
   /// bits, which `std::process::exit` hands on unchanged).
   pub fn wait(&mut self) -> Result<i32, IpcError> {
@@ -436,14 +443,14 @@ impl HandedChild {
 /// inheritable. In the child the handle stays inheritable, as a Unix end at its number is open across exec; Shards'
 /// spawner clears that before it hands the end on.
 ///
-/// This process keeps its own copy, `stream`, until the [`HandedChild`] goes: the caller waits for the child and then
-/// lets it go, so the attachment ends when the child exits. It does not end earlier, when a child closes its copy while
-/// still running, as it does on Unix, where the program holds the only copy. The daemon judges a VM's claim of the end
-/// by object identity against a known holder's handle, first the attaching client's (A-179, the Windows DAX window): a
-/// name query, the other way to tell a pipe, hung past 3 s on jupiter, 2026-10-26, on a synchronous pipe handle with a
-/// read pending, so a VM could wedge a shard by naming one. The attaching client's copy must therefore stand until the
-/// VM's first ask, and the child it started is the one whose life bounds that ask. If the child cannot be started, the
-/// end is closed here, with nothing started.
+/// This process keeps its own copy, `stream`, until it calls [`HandedChild::let_go_of_end`] or the [`HandedChild`] goes.
+/// The daemon judges a VMM's DAX claim of the end by object identity against a holder it knows (A-180): a name query,
+/// the other way to tell a pipe, hung past 3 s on jupiter, 2026-10-26, on a synchronous pipe handle with a read
+/// pending, so a VMM could wedge a shard by naming one. The first holder it knows is this process, the attaching
+/// client. So the caller tells the daemon the child holds the end ([`HandedChild::id`], [`HandedChild::handed`]) while
+/// its own copy still stands for the daemon to judge that against, then lets go, after which the child's end is the
+/// only one and the attachment ends when it closes (`slates shards`, A-181). If the child cannot be started, the end
+/// is closed here, with nothing started.
 ///
 /// What exec gives on Unix — a supervisor that ends the launched process ends the program — is kept by a job: the child
 /// is created inside a kill-on-close job only this process holds, so however this process ends, its program ends with
@@ -487,7 +494,7 @@ pub fn spawn_with(
   let process = spawned?;
   let child = HandedChild {
     process,
-    _stream: stream,
+    stream: Some(stream),
     handed,
     _job: job,
   };

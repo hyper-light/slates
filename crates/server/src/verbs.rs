@@ -3200,6 +3200,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::OwnerUnreachable { .. } => "owner_unreachable",
     Refusal::MapUnavailable => "map_unavailable",
     Refusal::MapShareExhausted { .. } => "map_share_exhausted",
+    Refusal::HolderPending => "holder_pending",
     Refusal::ImageRefused { .. } => "image_refused",
     Refusal::NotRootLeader => "not_root_leader",
     Refusal::ConsensusNotInitialized => "consensus_not_initialized",
@@ -3428,6 +3429,12 @@ fn dispatch_inner(
     RequestBody::ReleaseMap { mapping_id, .. } => {
       crate::direct_map::release_map(state, client_id, mapping_id)
     }
+    RequestBody::ShardsHolder {
+      volume,
+      attachment,
+      pid,
+      handle,
+    } => crate::shards::add_holder(state, to_db_volume(volume), attachment, (pid, handle)),
     RequestBody::ReadRange {
       volume,
       path,

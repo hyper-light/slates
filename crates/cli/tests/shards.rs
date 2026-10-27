@@ -50,6 +50,9 @@ const SILENT: &str = "role=silent";
 const CLOSER: &str = "role=closer";
 /// Format: see [`READER`]: the holder parks for good, so only its command's job can end it.
 const HOLDER: &str = "role=holder";
+/// Format: the daemon's counter of processes `ShardsHolder` added as a stream's known holders
+/// (`crates/server/src/shards.rs`).
+const HOLDER_ADDED: &str = "shards.holder_added";
 /// Format: the placeholder `slates shards` replaces with the handle's value.
 const PLACEHOLDER: &str = "{handle}";
 /// Format: the tag the reader puts before the bytes it read, in hex: the re-invoked test binary prints libtest's banner
@@ -256,10 +259,11 @@ fn shards_probe(instance: &str, id: &str, role: &str) -> Command {
 /// ends when the child exits; no other child the CLI starts inherits the handle". Do: write a file into a volume; run
 /// `slates shards ID -- <this binary> ... {handle}`, the probe mounting the attachment over the handle it was named
 /// (INIT, LOOKUP, OPEN, READ, RELEASE) and printing what it read; run a probe that exits 7 without a word; a probe that
-/// closes its handle and then waits while `slates shards` waits for it, then is let go; a probe that holds its handle while the test
+/// closes its handle and then waits while `slates shards` waits for it; a probe that holds its handle while the test
 /// kills `slates shards`; then the refusals. Expect the bytes equal to the file and the attachment gone after the
-/// probe's exit; the command's exit code 7; the closer's attachment standing while the command holds its copy, and gone
-/// once the closer exits, so no other copy of the end exists (not another child's); the attachment gone once the command is
+/// probe's exit, and the daemon's count of holders added moved once per run, so the command named its program as a holder
+/// before letting go; the command's exit code 7; the attachment gone while the closer and the command still run, so no
+/// other copy of the end exists (not the command's own, not another child's); the attachment gone once the command is
 /// killed, its job taking the holder along; a missing volume refused (exit 1), a program that cannot run a failure
 /// (exit 4) leaving no attachment, and `--fd` or a command without `{handle}` usage (exit 2).
 #[test]
@@ -280,7 +284,7 @@ fn slates_shards_hands_a_program_a_working_handle_and_the_attachment_ends_with_i
   let before = attachments_of(&instance, &id);
   a_reader_reads_the_file_through_its_handle(&instance, &id, &before);
   a_silent_program_exits_and_ends_its_attachment(&instance, &id, &before);
-  the_attachment_ends_when_the_program_exits_not_when_it_closes_its_handle(&instance, &id, &before);
+  the_attachment_ends_when_the_handle_closes_while_the_command_runs(&instance, &id, &before);
   a_killed_command_takes_its_program_and_the_attachment_along(&instance, &id, &before);
   the_refusals_leave_no_attachment(&instance, &id, &before);
 }
@@ -305,6 +309,7 @@ fn a_volume_with_the_file(instance: &str) -> String {
 
 /// The reader reads the file's bytes through its handle; then its attachment is gone.
 fn a_reader_reads_the_file_through_its_handle(instance: &str, id: &str, before: &str) {
+  let added = counter(instance, HOLDER_ADDED);
   let reader = shards_probe(instance, id, READER).output().unwrap();
   let stdout = String::from_utf8_lossy(&reader.stdout);
   assert_eq!(
@@ -323,6 +328,23 @@ fn a_reader_reads_the_file_through_its_handle(instance: &str, id: &str, before: 
     "the bytes read through the handle are the file's"
   );
   the_attachment_ends(instance, id, before, &value_of(&stdout, "attachment"));
+  assert_eq!(
+    counter(instance, HOLDER_ADDED),
+    added + 1,
+    "the command named its program as the stream's holder, judged against its own copy, before letting go"
+  );
+}
+
+/// The daemon's status counter `name`, summed over its shards (`slates status` prints `name: count` per shard).
+fn counter(instance: &str, name: &str) -> u64 {
+  let (code, out, err) = run(instance, &["status"]);
+  assert_eq!(code, 0, "slates status: {err}");
+  let named = format!("{name}: ");
+  out
+    .lines()
+    .filter_map(|line| line.split_once(named.as_str()))
+    .filter_map(|(_, count)| count.trim().parse::<u64>().ok())
+    .sum()
 }
 
 /// A program that never speaks on its end and exits 7: the command exits 7, and the attachment ends.
@@ -358,12 +380,11 @@ fn read_until(
   panic!("the probe never printed {tag:?}: {before}");
 }
 
-/// A program that closes its handle and then waits on its standard input: its attachment stands while it, and the
-/// `slates shards` waiting for it, still run, since the command keeps its own copy until the program exits (the
-/// daemon's claim check needs a live holder until a VM's first ask; `slates_ipc::stream::spawn_with`); once the
-/// program exits, the command exits with it and the attachment is gone, so no other copy exists, not one another child
-/// inherited.
-fn the_attachment_ends_when_the_program_exits_not_when_it_closes_its_handle(
+/// A program that closes its handle and then waits on its standard input: its attachment is gone while it, and the
+/// `slates shards` waiting for it, still run, so nothing but the program's handle held the attachment: not a copy the
+/// command kept (it let go once the daemon took the program as a holder), not one another child inherited. The
+/// command then exits with the program.
+fn the_attachment_ends_when_the_handle_closes_while_the_command_runs(
   instance: &str,
   id: &str,
   before: &str,
@@ -378,10 +399,9 @@ fn the_attachment_ends_when_the_program_exits_not_when_it_closes_its_handle(
   let mut lines = std::io::BufReader::new(running.0.stdout.take().unwrap()).lines();
   let (announced, _) = read_until(&mut lines, CLOSED_LINE);
   let attachment = value_of(&announced, "attachment");
-  assert_ne!(
-    attachments_of(instance, id),
-    before,
-    "attachment {attachment} stands while the command holds its copy"
+  assert!(
+    wait_for(|| attachments_of(instance, id) == before),
+    "attachment {attachment} ended once the program closed its handle"
   );
   assert!(
     running.0.try_wait().unwrap().is_none(),
@@ -389,7 +409,11 @@ fn the_attachment_ends_when_the_program_exits_not_when_it_closes_its_handle(
   );
   drop(running.0.stdin.take());
   assert_eq!(running.0.wait().unwrap().code(), Some(0));
-  the_attachment_ends(instance, id, before, &attachment);
+  let (code, _, err) = run(instance, &["detach", &attachment]);
+  assert_eq!(
+    code, 1,
+    "no attachment {attachment} remains to detach: {err}"
+  );
 }
 
 /// Chaos, the way a supervisor ends a run: killing `slates shards` (`TerminateProcess`) while its program holds the

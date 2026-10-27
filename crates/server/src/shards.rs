@@ -142,6 +142,17 @@ const DELIVERY_REFUSED: &str = "shards.delivery_refused";
 /// that stream's DAX asks are then refused.
 #[cfg(windows)]
 const HOLDER_UNTOLD: &str = "shards.holder_untold";
+/// Format: the refusal-ledger name of a `ShardsHolder` whose named handle is not the stream's (Windows, A-181).
+#[cfg(windows)]
+const HOLDER_REFUSED: &str = "shards.holder_refused";
+/// Format: the refusal-ledger name of a `ShardsHolder` that met a stream with no known holder yet (Windows, A-181):
+/// the attach's own holder record had not reached the stream's shard, so it is refused `HolderPending` and resent.
+#[cfg(windows)]
+const HOLDER_PENDING: &str = "shards.holder_pending";
+/// Format: the counter of processes `ShardsHolder` added as known holders of a stream (Windows, A-181): `slates
+/// shards` adds the command it started, so each such run moves it once.
+#[cfg(windows)]
+const HOLDER_ADDED: &str = "shards.holder_added";
 /// Format: the refusal-ledger name of a stream end dropped because its request's reply was not the attach that made
 /// it (a rolled-back verb answered a refusal): the end closes, so the stream ends with it.
 const HANDOFF_DROPPED: &str = "shards.handoff_dropped";
@@ -707,6 +718,60 @@ fn tell_holder(handoff: &Handoff, pid: u32, value: u64) -> bool {
     None,
   );
   registry::send_control(handoff.owner, Control::Spawn(Box::new(task))).is_ok()
+}
+
+/// `ShardsHolder` (§4.6, A-181; Windows): adds `pid` as a known holder of the stream of `attachment`, its handle there
+/// `handle`, once the claim is judged against a holder this shard already knows (`slates_ipc::handle_route::claim`):
+/// `slates shards` names the command it started while its own copy still holds the stream, so the command stays a
+/// known holder after that copy closes, and a VMM's DAX claim can be judged against it (A-180). A true claim adds no
+/// authority, since the named process holds the stream already; a false one is refused `Forbidden` and counted.
+/// `HolderPending` while the attach's own holder record has not arrived; `NotFound` for no stream of `attachment`
+/// serving `volume` here.
+#[cfg(windows)]
+pub(crate) fn add_holder(
+  s: &mut ShardState,
+  volume: VolumeId,
+  attachment: u64,
+  (pid, handle): (u32, u64),
+) -> slates_ipc::protocol::ReplyBody {
+  let Some(stream) = s
+    .shards_streams
+    .get(&attachment)
+    .filter(|stream| stream.volume == volume && !stream.ending)
+  else {
+    return crate::verbs::refused(Refusal::NotFound);
+  };
+  // The attach records its client as the first holder by a task it queues here as it replies, which a request sent at
+  // once can overtake (measured on jupiter, 2026-10-26: 3 of 3 such requests met no holder). Judged against nothing,
+  // every claim would fail, so the caller is told to send again; nothing is recorded meanwhile.
+  if stream.holders.is_empty() {
+    s.count(HOLDER_PENDING, 1);
+    return crate::verbs::refused(Refusal::HolderPending);
+  }
+  if slates_ipc::handle_route::claim(pid, handle, &stream.holders).is_err() {
+    s.count(HOLDER_REFUSED, 1);
+    return crate::verbs::refused(Refusal::Forbidden {
+      verb: "shards_holder".to_owned(),
+    });
+  }
+  dax::record_holder(s, attachment, pid, handle);
+  s.count(HOLDER_ADDED, 1);
+  slates_ipc::protocol::ReplyBody::ShardsHolderAdded
+}
+
+/// `ShardsHolder` on Unix (§4.6, A-181): refused by kind. A Unix stream's end is a descriptor the daemon never looks
+/// for again, and DAX answers ride the stream itself.
+#[cfg(unix)]
+pub(crate) fn add_holder(
+  _s: &mut ShardState,
+  _volume: VolumeId,
+  _attachment: u64,
+  _holder: (u32, u64),
+) -> slates_ipc::protocol::ReplyBody {
+  crate::verbs::refused(Refusal::Unsupported {
+    feature: "naming a Shards stream's holder (Windows only: a Unix end is a descriptor)"
+      .to_owned(),
+  })
 }
 
 /// Ends every stream serving `volume` (its destroy): each marked ending and ended both ways, so its task sweeps its

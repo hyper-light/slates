@@ -1145,6 +1145,32 @@ impl Client {
     }
   }
 
+  /// Tells the daemon that the process `pid` holds the Shards stream of `attachment` (on `volume`) as the handle `handle`
+  /// there (§4.6, A-181; Windows): what `slates shards` sends once the command it started holds the end, before it
+  /// closes its own copy, so the command is a known holder a VMM's DAX claim is judged against (A-180). Call it while
+  /// this process still holds its own copy: the daemon judges the claim against it. Sent again while the attach's own
+  /// holder record is still on its way (`HolderPending`), within the reconnect budget. Refused `Forbidden` where the
+  /// handle is not the stream's, `NotFound` for no such stream, `Unsupported` on Unix.
+  pub fn tell_shards_holder(
+    &mut self,
+    volume: VolumeId,
+    attachment: u64,
+    pid: u32,
+    handle: u64,
+  ) -> Result<(), ClientError> {
+    match self.call_through_transient(&RequestBody::ShardsHolder {
+      volume,
+      attachment,
+      pid,
+      handle,
+    })? {
+      ReplyBody::ShardsHolderAdded => Ok(()),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "tell_shards_holder",
+      }),
+    }
+  }
+
   /// Attaches `volume` to a Shards microVM's fs device over an anonymous stream (§4.6, the Shards route; A-161): the
   /// daemon serves the attachment on its end of a socket pair, on the volume's owner shard, and hands this client the
   /// other end, to pass to the VMM. With `subtree`, only that directory; with `Intent::Read`, every change refused.
@@ -2507,10 +2533,11 @@ impl Client {
     }
   }
 
-  /// One read-only page request (`ReadRange`, `ReadDir`), sent again while the daemon refuses it with a transient
-  /// refusal: no owner answered within the takeover bound (`OwnerUnreachable`, a successor serves once a takeover
-  /// installs it) or the owner's lease is not confirmed yet (`LeaseUnconfirmed`). A page changes nothing, so a resend
-  /// under a fresh id is safe. The resends back off as a reconnect does and stop at the reconnect budget (the restart's
+  /// One read-only page request (`ReadRange`, `ReadDir`), or a `ShardsHolder`, sent again while the daemon refuses it
+  /// with a transient refusal: no owner answered within the takeover bound (`OwnerUnreachable`, a successor serves once
+  /// a takeover installs it), the owner's lease is not confirmed yet (`LeaseUnconfirmed`), or a stream's attach has not
+  /// yet recorded its holder (`HolderPending`, A-181). A page changes nothing, and a refused `ShardsHolder` recorded
+  /// nothing, so a resend under a fresh id is safe. The resends back off as a reconnect does and stop at the reconnect budget (the restart's
   /// recovery budget plus one reply deadline, `Deadlines::derive`), after which the last refusal is the caller's. Until
   /// 2026-10-09 the first such refusal failed the whole read (contested cross-region reads at 10% loss, 2 in 9).
   fn call_through_transient(&mut self, body: &RequestBody) -> Result<ReplyBody, ClientError> {
@@ -2523,7 +2550,8 @@ impl Client {
       match self.call(body) {
         Err(ClientError::Refused(
           slates_ipc::protocol::Refusal::OwnerUnreachable { .. }
-          | slates_ipc::protocol::Refusal::LeaseUnconfirmed { .. },
+          | slates_ipc::protocol::Refusal::LeaseUnconfirmed { .. }
+          | slates_ipc::protocol::Refusal::HolderPending,
         )) if elapsed_ns(*refused_since.get_or_insert_with(Instant::now)) < budget => {
           self.transient_retries = self.transient_retries.saturating_add(1);
           std::thread::park_timeout(std::time::Duration::from_nanos(pause_ns));

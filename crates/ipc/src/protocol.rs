@@ -681,6 +681,24 @@ pub enum RequestBody {
     /// The mapping id the `Mapped` reply named.
     mapping_id: u64,
   },
+  /// Tells the daemon that the process `pid` holds the Shards stream of `attachment` as the handle `handle` there
+  /// (§4.6, A-181; Windows): what `slates shards` sends once the command it started holds the end, before it closes its
+  /// own copy, so the command is a known holder that a VMM's DAX claim can be judged against (A-180). The daemon checks
+  /// the claim first, by object against a holder it knows (`slates_ipc::handle_route::claim`), so the request grants
+  /// nothing a true claim did not already have. Refused `NotFound` for no such stream of `volume`, `Forbidden` where the
+  /// handle is not the stream's, `HolderPending` while the attach's own holder record is still on its way to the
+  /// stream's shard, `Unsupported` on Unix, where the end is a descriptor the daemon never needs to find again.
+  /// Appended.
+  ShardsHolder {
+    /// The volume the stream serves (routes the verb to its owner shard, where the stream is served).
+    volume: VolumeId,
+    /// The attachment the stream serves.
+    attachment: u64,
+    /// The process that holds the stream.
+    pid: u32,
+    /// The value of its handle of the stream, in that process.
+    handle: u64,
+  },
 }
 
 /// Format: the name of the image file in an image volume's root (§4.6, A-160): what a VMM is pointed at.
@@ -1217,6 +1235,7 @@ impl RequestBody {
       | RequestBody::Read { volume, .. }
       | RequestBody::MapRead { volume, .. }
       | RequestBody::ReleaseMap { volume, .. }
+      | RequestBody::ShardsHolder { volume, .. }
       | RequestBody::ReadRange { volume, .. }
       | RequestBody::ReadWindow { volume, .. }
       | RequestBody::ReadDir { volume, .. }
@@ -2748,6 +2767,10 @@ pub enum Refusal {
     /// The most bytes they may hold.
     share_bytes: u64,
   },
+  /// A `ShardsHolder` met a stream whose attach has not yet recorded its own holder on the stream's shard (A-181): the
+  /// attach queues that record there as it replies, so a request sent at once can overtake it. Nothing was recorded,
+  /// and the request may be sent again; the client does so within its reconnect budget. Appended.
+  HolderPending,
 }
 
 /// The writes a snapshot is known to include (§4.6 "Writeback and snapshot barrier"): every write the
@@ -3129,6 +3152,8 @@ pub enum ReplyBody {
     /// The handle's value in the client's process; zero in the record, or where the hand-off was refused.
     handle: u64,
   },
+  /// The process a `ShardsHolder` named was judged to hold the stream and is now a known holder of it. Appended.
+  ShardsHolderAdded,
 }
 
 /// One entry of a directory listing (`ReadDir`).

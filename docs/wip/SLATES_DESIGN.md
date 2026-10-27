@@ -3593,13 +3593,14 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 > {handle} ...` attaches in the Shards form and starts CMD holding the stream end as a handle, its decimal value
 > written wherever `{handle}` stands, as Shards' `--slates-fs-handle {handle}` takes it (`slates_ipc::stream::
 > spawn_with`). No process replaces itself on Windows, so the command waits for CMD and exits with its code. Only CMD
-> inherits the end: an inheritable duplicate exists for the one spawn, named in its handle list. The command keeps its
-> own copy until CMD exits, since A-180's claim check needs a live holder at a VM's first ask, so the attachment ends
-> when CMD exits, not when CMD closes its copy early as it does on Unix. CMD runs in a kill-on-close job only the
-> command holds, so ending the command ends CMD, as exec's single process does on Unix. On jupiter, 2026-10-26, `crates/cli/tests/shards.rs` passes
-> in each of 3 runs as committed: a probe the command started reads a file through the handle it was named; the command exits with
-> its program's code; the attachment stands while the command holds its copy and ends once the program exits; a killed
-> command takes its program and the attachment along.
+> inherits the end: an inheritable duplicate exists for the one spawn, named in its handle list. Once CMD has the end,
+> the command tells the daemon CMD holds it (`ShardsHolder`, judged by object against the command's own copy, A-180),
+> so CMD is a known holder a VM's DAX claim is judged against, and then closes its own copy: the attachment lives
+> exactly as long as CMD's end, as on Unix. CMD runs in a kill-on-close job only the command holds, so ending the
+> command ends CMD, as exec's single process does on Unix. On jupiter, 2026-10-26, `crates/cli/tests/shards.rs` passes
+> in each of 6 runs: a probe the command started reads a file through the handle it was named, and the daemon counts it
+> added as a holder; the command exits with its program's code; the attachment ends as soon as the program closes its
+> handle while the command still runs; a killed command takes its program and the attachment along.
 
 **Writeback and snapshot barrier.** Kernel/guest cache negotiation changes when writes reach
 the owner. `snapshot`, `submit`, `advance`, clean `detach`, migration and archive must identify
@@ -12516,7 +12517,7 @@ readied before its fill; the page size from `slates-machine`, so no `rustix`), `
   the duplicate's close each answered at once. So a name check would let any asker hold the shard by naming a
   synchronous handle of any same-user process. The pipe allows one instance, already connected, so the object check
   refuses and grants exactly the claimants the name check would. Its cost: a holder must still hold its handle at the
-  first claim, so `slates shards` keeps its copy until its child exits (A-181).
+  first claim, so `slates shards` names its child as a holder (`ShardsHolder`) before it closes its own copy (A-181).
 - **The object's size, derived.** A section's making costs in proportion to its size, reserved or not. Measured on
   jupiter the same day: 2^48 bytes took 3.3 ms and 12,001 pages of commit, 2^53 took 129 ms and 358,807 pages, and
   2^62 or more was refused `ERROR_NO_SYSTEM_RESOURCES`. So Windows sizes it to the machine's physical memory in whole
@@ -12576,7 +12577,11 @@ handle-list spawn moved out of `delivery.rs`, now with a job list, a kill-on-clo
 `crates/cli` (`args.rs`: `HandOffKind`, `HandOff`, `HANDLE_PLACEHOLDER`, both forms parsed on every host; `verbs.rs`:
 `run_shards` over `hand_to`, paired per platform, and `exec_vmm`'s Windows arm, which no longer compiled once A-179
 gave `StreamEnd` values there; `tests/shards.rs`, new; `Cargo.toml`: the FUSE codec a dev-dependency on every
-platform), `ci.yml` (the Windows lanes), `unsafe-budget.toml` (`slates-ipc` + 5).
+platform), `ci.yml` (the Windows lanes), `unsafe-budget.toml` (`slates-ipc` + 5); and, in a second change the same
+day, `crates/ipc` (`protocol.rs`: `RequestBody::ShardsHolder`, `ReplyBody::ShardsHolderAdded`,
+`Refusal::HolderPending`, appended; `stream_pipe.rs`: `HandedChild::let_go_of_end`), `crates/server` (`shards.rs`:
+`add_holder`; `verbs.rs`), `crates/client` (`Client::tell_shards_holder`, resent through `call_through_transient`;
+`tests/shards.rs`: the hostile holder test), and A-180's claim bullet.
 - **What was there.** `slates shards` replaced itself with its command, the end at `--fd N`, on Unix alone. A-179 gave
   Windows the stream, so its `StreamEnd` became a handle and the Windows arms that matched it as empty no longer built.
 - **Why a named handle, not a number.** A Windows process cannot choose the value a handle gets in another process, so
@@ -12594,36 +12599,52 @@ platform), `ci.yml` (the Windows lanes), `unsafe-budget.toml` (`slates-ipc` + 5)
   beneath. Ctrl-C reaches every process on the console, so after the spawn the command answers console events as
   handled (a handler, never `SetConsoleCtrlHandler(NULL, TRUE)`, whose ignore flag children created later inherit) and
   leaves the shutdown to CMD.
-- **Decided with A-180: the command keeps its copy until CMD exits.** The plan's step said the command closes its copy
-  once CMD has the handle. A-180's claim check compares a VM's handle with a known holder's by object, the attaching
-  client's first, because a name query on a synchronous pipe handle with a read pending hung past 3 s (jupiter,
-  2026-10-26). So the client's copy must stand until the VM's first ask. The cost is one difference from Unix: CMD
-  closing its copy early does not end the attachment until CMD exits. Shards' spawner keeps its copy for the VM's life,
-  so a real VM never meets it. Rejected: a new verb telling the daemon the child's process and value, which keeps Unix's
-  semantics exactly for a case nothing relies on.
-- **Proven** on jupiter (Windows 10.0.26200), 2026-10-26, against the tree with A-180 beneath it:
-  - `crates/ipc/tests/stream_spawn.rs`, 1 of 1 in each of 5 runs. A program writes through the handle its arguments
-    name and exits 7, and `wait` returns 7. The end stays open after the program has gone, until the launcher lets
-    it go. A child the standard library starts afterwards, told the value, finds no handle there naming the pipe,
-    while an inheritable copy, the contrast, is found. A dropped launcher's job ends a program that never exits on its
-    own. No placeholder is refused `Layout`, and the end is closed.
-  - `crates/cli/tests/shards.rs` with `SLATES_TEST_CLI=1`, 1 of 1 in each of 3 runs as committed (and 4 before the
-    holder parked), a real anchor and daemon:
+- **The command names CMD as a holder, then closes its copy, as the plan states.** A-180's claim check compares a
+  VM's handle with a known holder's by object, the attaching client's first, because a name query on a synchronous
+  pipe handle with a read pending hung past 3 s (jupiter, 2026-10-26). Closing the command's copy at once would leave
+  the stream with no live known holder, and a VM's first DAX ask would be refused `EACCES`. So once CMD has the end,
+  the command sends `ShardsHolder { volume, attachment, pid, handle }` naming CMD's process and handle. The stream's
+  shard judges it by `claim` against the holders it knows, the command's own copy still open among them, records CMD
+  (`dax::record_holder`, which keeps the first holder and the latest), and only then does the command close its copy.
+  A true claim adds no authority, since CMD holds the stream already; a false one is refused `Forbidden` and counted.
+  A daemon that will not take CMD fails the run: the command drops CMD's job, which ends CMD, and exits 4.
+- **Found by the first test: the request can overtake the attach's own holder record.** The attach records its
+  client as the first holder by a task it queues on the stream's shard as it replies, and a request sent at once met
+  no holder, 3 of 3 on jupiter (counted `shards.holder_unknown`, as the diagnosis named it), so it was refused although
+  true. The daemon now answers a stream with no known holder `HolderPending` (counted `shards.holder_pending`), having
+  recorded nothing, and the client sends again through `call_through_transient`, the bounded, backed-off resend it
+  already uses for `OwnerUnreachable`, within its reconnect budget. A command that starts CMD first takes
+  milliseconds, and never met it in its runs.
+- **Rejected: the command keeping its copy until CMD exits,** built first in b16bac34. It needed no new request, but
+  the attachment then outlived CMD closing its end early, which the plan rules out and Unix does not do.
+- **Proven** on jupiter (Windows 10.0.26200), 2026-10-26, against the tree with A-180 beneath it, as committed:
+  - `crates/ipc/tests/stream_spawn.rs`, 1 of 1 in each of 6 runs. A program writes through the handle its arguments
+    name and exits 7, and `wait` returns 7. The end stays open after the program has gone while the launcher holds
+    its copy, and closes once the launcher lets go. A child the standard library starts afterwards, told the value,
+    finds no handle there naming the pipe, while an inheritable copy, the contrast, is found. A dropped launcher's job
+    ends a program that never exits on its own. No placeholder is refused `Layout`, and the end is closed.
+  - `crates/cli/tests/shards.rs` with `SLATES_TEST_CLI=1`, 1 of 1 in each of 6 runs, a real anchor and daemon:
     - a probe started by `slates shards` mounts the attachment over `{handle}` (INIT, LOOKUP, OPEN, READ, RELEASE) and
-      reads the file's bytes, and the attachment is gone after the probe's exit;
+      reads the file's bytes; the daemon's `shards.holder_added` moves by one; the attachment is gone after the
+      probe's exit;
     - the command exits 7 with a silent program;
-    - the attachment stands while a program that closed its handle still runs, and is gone once it exits;
+    - the attachment ends while a program that closed its handle still runs, with the command still waiting;
     - a `TerminateProcess` of the command takes a program that never exits on its own, and the attachment, along;
     - a missing volume exits 1, a program that cannot run exits 4 and leaves no attachment, and `--fd` or no
       `{handle}` exits 2.
-  - The consumer delivery, whose spawn moved, passes `crates/ipc/tests/delivery.rs` (3 of 3, two ignored roles). Step
-    5's client Shards suite passes 10 of 10. Clippy `-D warnings` and the documentation step are clean over the
-    Windows lane's crates, the binary and both of its Windows test targets.
+  - `crates/client/tests/shards.rs`, 11 of 11 in each of 3 runs, among them the new hostile holder test: this
+    process's own handle is taken (after one `HolderPending` in each run), another pipe's handle and a value naming no
+    handle of the stream are refused `Forbidden`, a missing attachment `NotFound`, and the stream serves throughout.
+    On Unix the request is refused `Unsupported` (macOS).
+  - The consumer delivery, whose spawn moved, passes `crates/ipc/tests/delivery.rs`. Clippy `-D warnings` and the
+    documentation step are clean over the Windows lane's crates, the binary and both of its Windows test targets.
   - **Red-checked** on the same copy, one mutant at a time:
     - the inheritable duplicate never closed fails the hand-off test (the end outlives its launcher);
-    - no job fails it (a dropped launcher's program and end stay alive), and fails the CLI test's kill case;
-    - the launcher's copy closed at once, the plan's first text, fails both (the attachment ends while the command
-      holds nothing).
+    - no job fails it, and fails the CLI test's kill case;
+    - the launcher's copy closed with no holder named fails both;
+    - the command never letting go fails the CLI test (the attachment outlives the closed handle);
+    - the daemon recording a holder without judging it fails the hostile holder test (another pipe's handle taken);
+    - the client not resending on `HolderPending` fails it too.
   - The first run of the no-job mutant passed the CLI kill case: the holder then waited on its standard input, and that
     read returned once the command died, so the holder exited by itself. The holder now parks for good, so only the
     job can end it, and the mutant fails.

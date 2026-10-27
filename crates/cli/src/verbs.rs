@@ -1640,12 +1640,13 @@ pub(crate) fn run_consumer(request: &RunRequest) -> Result<(), Failure> {
 ///
 /// On Windows (A-179), `shards ID [--subtree DIR] [--read-only] -- CMD ... {handle} ...`: no process replaces itself
 /// there, so this one starts the command holding the end as a handle, its value written where `{handle}` stands, and
-/// waits for it (`slates_ipc::stream::spawn_with`). Only the command inherits the end. This process keeps its own copy
-/// until the command exits, since the daemon checks a VM's claim of the end against a live holder, the attaching
-/// client first, so the attachment lives as long as the command: it ends when the command exits, not when the command
-/// closes its copy early (the reason is `spawn_with`'s). The command runs in a job this process alone holds, so a
-/// supervisor that ends this process ends the command too, and this process lets Ctrl-C be the command's to act on. The
-/// command's exit code is this one's.
+/// waits for it (`slates_ipc::stream::spawn_with`). Only the command inherits the end. Once it has it, this process
+/// tells the daemon the command holds the stream (`ShardsHolder`, judged against this process's own copy), so a VMM's
+/// DAX claim can later be judged against the command (A-180), and then closes its own copy, so the attachment lives
+/// exactly as long as the command's end. A daemon that will not take the command as a holder fails the run: the command
+/// is ended and nothing is left serving. The command runs in a job this process alone holds, so a supervisor that ends
+/// this process ends the command too, and this process lets Ctrl-C be the command's to act on. The command's exit code
+/// is this one's.
 pub(crate) fn run_shards(request: &ShardsRequest) -> Result<(), Failure> {
   let (program, args) = request
     .command
@@ -1656,63 +1657,99 @@ pub(crate) fn run_shards(request: &ShardsRequest) -> Result<(), Failure> {
   } else {
     Intent::Write
   };
-  let shards = connect(&request.instance)?
+  let mut client = connect(&request.instance)?;
+  let shards = client
     .attach_shards(request.volume, intent, request.subtree.as_deref())
     .map_err(|e| failure_of(e, &request.instance))?;
   announce_attachment(shards.attachment.attachment, request.json);
-  hand_to(OsStr::new(program), args, shards.stream, request.handed)
+  let handed = Handed {
+    volume: request.volume,
+    attachment: shards.attachment.attachment,
+    stream: shards.stream,
+    at: request.handed,
+  };
+  hand_to(client, OsStr::new(program), args, handed)
+}
+
+/// What `shards` hands its command: the stream's end, the attachment and volume it serves, and where the command finds
+/// the end.
+struct Handed {
+  /// The volume the stream serves.
+  #[cfg_attr(unix, allow(dead_code))]
+  volume: slates_client::VolumeId,
+  /// The attachment the stream serves.
+  #[cfg_attr(unix, allow(dead_code))]
+  attachment: u64,
+  /// The end.
+  stream: slates_client::StreamEnd,
+  /// Where the command finds it.
+  at: crate::args::HandOff,
 }
 
 /// Replaces this process with `program`, the stream end at the descriptor number `handed` names
-/// (`slates_ipc::stream::exec_with`); returns only the refusal of a command that could not run. A hand-off by handle is
-/// Windows' and is never parsed here.
+/// (`slates_ipc::stream::exec_with`); returns only the refusal of a command that could not run. The client is closed
+/// first, so only the end at that number goes into the command. A hand-off by handle is Windows' and is never parsed
+/// here.
 #[cfg(unix)]
 fn hand_to(
+  client: slates_client::Client,
   program: &OsStr,
   args: &[String],
-  stream: slates_client::StreamEnd,
-  handed: crate::args::HandOff,
+  handed: Handed,
 ) -> Result<(), Failure> {
-  let crate::args::HandOff::Descriptor(at) = handed else {
+  drop(client);
+  let crate::args::HandOff::Descriptor(at) = handed.at else {
     return Err(Failure::Failed(
       "shards: this platform hands the end at a descriptor number (--fd N)".to_owned(),
     ));
   };
   let args: Vec<OsString> = args.iter().map(OsString::from).collect();
-  let error = slates_ipc::stream::exec_with(program, &args, stream, at);
+  let error = slates_ipc::stream::exec_with(program, &args, handed.stream, at);
   Err(Failure::Failed(format!(
     "shards: running {} with its end at descriptor {at}: {error}",
     program.to_string_lossy()
   )))
 }
 
-/// Starts `program` holding the stream end as a handle named where `{handle}` stands in `args`, and waits for it
-/// (`slates_ipc::stream::spawn_with`): its exit code is this command's. A hand-off at a descriptor number is Unix's and
-/// is never parsed here.
+/// Starts `program` holding the stream end as a handle named where `{handle}` stands in `args`
+/// (`slates_ipc::stream::spawn_with`), tells the daemon the program holds it, lets go of this process's copy, and waits:
+/// the program's exit code is this command's. A daemon that refuses the program as a holder ends the program (its job
+/// closes) and fails the command. A hand-off at a descriptor number is Unix's and is never parsed here.
 #[cfg(windows)]
 fn hand_to(
+  mut client: slates_client::Client,
   program: &OsStr,
   args: &[String],
-  stream: slates_client::StreamEnd,
-  handed: crate::args::HandOff,
+  handed: Handed,
 ) -> Result<(), Failure> {
-  if handed != crate::args::HandOff::Handle {
+  if handed.at != crate::args::HandOff::Handle {
     return Err(Failure::Failed(
       "shards: Windows hands the end as a handle ({handle} in the command's arguments)".to_owned(),
     ));
   }
-  let mut child =
-    slates_ipc::stream::spawn_with(program, args, stream, crate::args::HANDLE_PLACEHOLDER)
-      .map_err(|e| {
-        Failure::Failed(format!(
-          "shards: running {} with its end's handle: {e}",
-          program.to_string_lossy()
-        ))
-      })?;
+  let name = program.to_string_lossy();
+  let mut child = slates_ipc::stream::spawn_with(
+    program,
+    args,
+    handed.stream,
+    crate::args::HANDLE_PLACEHOLDER,
+  )
+  .map_err(|e| Failure::Failed(format!("shards: running {name} with its end's handle: {e}")))?;
+  if let Err(e) =
+    client.tell_shards_holder(handed.volume, handed.attachment, child.id(), child.handed())
+  {
+    // Dropping the child closes its job, which ends it; its end closes with it, and the attachment ends.
+    let pid = child.id();
+    drop(child);
+    return Err(Failure::Failed(format!(
+      "shards: the daemon did not take {name} (process {pid}) as the stream's holder, so it was ended: {e}"
+    )));
+  }
+  child.let_go_of_end();
+  drop(client);
   let code = child.wait().map_err(|e| {
     Failure::Failed(format!(
-      "shards: waiting for {} (process {}): {e}",
-      program.to_string_lossy(),
+      "shards: waiting for {name} (process {}): {e}",
       child.id()
     ))
   })?;

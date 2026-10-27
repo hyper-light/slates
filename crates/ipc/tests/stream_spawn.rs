@@ -98,9 +98,9 @@ fn arguments(role: &str) -> Vec<String> {
 /// and then waits, and while it holds the end start a bystander through the standard library, told the value the
 /// program was handed and the pipe's name; then drop the launcher's hold on the program; (3) hand an end with no
 /// placeholder in the arguments. Expect (1) the bytes on the kept end; the program's own exit code; the end still open
-/// once the program has exited, as the launcher keeps its copy while it holds the child (the daemon's claim check needs
-/// a live holder until the VM's first ask); then end of stream once the launcher lets the child go, so no other copy
-/// exists; (2) the bytes; the bystander finding no handle at that value naming the pipe,
+/// once the program has exited, as the launcher keeps its copy until it lets go (`slates shards` first tells the
+/// daemon the program holds the end, judged against that copy); then end of stream once the launcher lets go, so no
+/// other copy exists; (2) the bytes; the bystander finding no handle at that value naming the pipe,
 /// so a child started after the hand-off inherits nothing of it; then end of stream within the wait, as the job ends the
 /// program with its launcher's hold, as exec's single process does on Unix; (3) refused `Layout`, nothing started, and
 /// the end closed.
@@ -146,11 +146,11 @@ fn the_end_lasts_until_the_launcher_lets_its_program_go(exe: &std::path::Path) {
     peer_holds(kept.as_handle()),
     "the launcher's copy keeps the end open after its program exited"
   );
-  drop(writer);
+  writer.let_go_of_end();
   assert_eq!(
     next_read(&kept).as_deref(),
     Some(&[][..]),
-    "the end closed once the launcher let its program go: no other copy exists"
+    "the end closed once the launcher let go of its copy: no other copy exists"
   );
 }
 

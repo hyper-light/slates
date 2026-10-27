@@ -11872,12 +11872,15 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   device on Windows (step 3).
 - **`slates shards` on Windows (G-shards-windows step 2, A-181, 2026-10-26):** `slates shards ID -- CMD ... {handle}
   ...` starts CMD holding the stream end as an inherited handle whose value replaces `{handle}`, inside a kill-on-close
-  job the command alone holds, and exits with CMD's code. Only CMD inherits the end. The command keeps its own copy
-  until CMD exits, for A-180's claim check, so on Windows the attachment ends when CMD exits rather than when CMD closes
-  its copy. On jupiter the CLI test (a probe reading a file through `{handle}`, the exit code, the attachment
-  ending with the program, a killed command taking its program along) passes in each of 3 runs as committed, and the ipc
-  hand-off test (no later child inherits the end, against an inheritable copy's contrast) in each of 5. Both are red-checked. **Owed:** arm64 Windows runs `stream_spawn` but not the CLI test (its lane
-  builds no `slates-cli`).
+  job the command alone holds, and exits with CMD's code. Only CMD inherits the end. Once CMD has it, the command names
+  CMD to the daemon as a holder (`ShardsHolder`, judged by object against its own copy, for A-180's claim check), then
+  closes its own copy, so the attachment ends when CMD's end closes, as on Unix. A request that overtakes the attach's
+  own holder record is answered `HolderPending` and resent by the client within its reconnect budget. On jupiter the
+  CLI test passes in each of 6 runs (a probe reading a file through `{handle}`, counted as an added holder; the exit
+  code; the attachment ending as the probe closes its handle; a killed command taking its program along). The ipc
+  hand-off test passes in each of 6 (no later child inherits the end, against an inheritable copy's contrast), and the
+  client Shards suite 11 of 11 in each of 3, with the hostile holder test. All are red-checked. **Owed:** arm64 Windows
+  runs `stream_spawn` but not the CLI test (its lane builds no `slates-cli`).
 - **Windows' DAX window built (G-shards-windows step 5, A-180, 2026-10-26):** a descriptor ask on a Windows stream
   names the asking process and its stream handle there. The daemon checks the handle is this stream's own object, by
   `CompareObjectHandles` against a known holder, never by a name query, which hung past 3 s on a synchronous pipe with
