@@ -1,0 +1,52 @@
+name: DIAG arm64 hypervisors (not for main)
+
+# A diagnostics branch, never merged. The DAX matrix's arm64 guest cells (docs/wip/virtiofs.md §8: Firecracker and
+# Shards on Linux arm64, Shards on Windows arm64) need an arm64 host with a hypervisor. No machine in this kiln is one
+# (Docker Desktop's VM on the Macs has no /dev/kvm, 2026-10-27). This reads whether CI's arm64 runners are.
+
+on:
+  push:
+    branches: [diag-arm64-hypervisors]
+
+jobs:
+  linux:
+    name: KVM on ubuntu-24.04-arm
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Probe
+        run: |
+          uname -a
+          lscpu | head -20
+          ls -l /dev/kvm || echo "NO /dev/kvm"
+          sudo dmesg | grep -i -E 'kvm|hyp|el2' | head -20 || true
+          grep -m1 -i 'features' /proc/cpuinfo || true
+          cat /sys/module/kvm/parameters/* 2>/dev/null | head || true
+  windows:
+    name: Hypervisor on windows-11-arm
+    runs-on: windows-11-arm
+    steps:
+      - name: Probe
+        shell: pwsh
+        run: |
+          [System.Environment]::OSVersion.Version
+          Get-CimInstance Win32_ComputerSystem | Select-Object Model, HypervisorPresent | Format-List
+          Get-CimInstance Win32_Processor | Select-Object Name, VirtualizationFirmwareEnabled, SecondLevelAddressTranslationExtensions, VMMonitorModeExtensions | Format-List
+          foreach ($feature in "HypervisorPlatform", "Microsoft-Hyper-V", "VirtualMachinePlatform", "Containers") {
+            try { Get-WindowsOptionalFeature -Online -FeatureName $feature | Select-Object FeatureName, State | Format-List }
+            catch { Write-Output "$feature : $($_.Exception.Message)" }
+          }
+          systeminfo | Select-String -Pattern "Hyper-V|Virtualization|hypervisor"
+          Get-Command docker -ErrorAction SilentlyContinue | Select-Object Source
+  windows-x64:
+    name: Hypervisor on windows-2025 (the x86_64 control)
+    runs-on: windows-2025
+    steps:
+      - name: Probe
+        shell: pwsh
+        run: |
+          [System.Environment]::OSVersion.Version
+          Get-CimInstance Win32_ComputerSystem | Select-Object Model, HypervisorPresent | Format-List
+          foreach ($feature in "HypervisorPlatform", "Microsoft-Hyper-V", "VirtualMachinePlatform", "Containers") {
+            try { Get-WindowsOptionalFeature -Online -FeatureName $feature | Select-Object FeatureName, State | Format-List }
+            catch { Write-Output "$feature : $($_.Exception.Message)" }
+          }
