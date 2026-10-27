@@ -349,7 +349,7 @@ fn encode_values(
       SUPPORTED_ATTRS => supported(minor).encode(values),
       TYPE => values.u32(ftype4_of(attrs.kind)),
       FH_EXPIRE_TYPE => values.u32(FH4_PERSISTENT),
-      CHANGE => values.u64(v4.change),
+      CHANGE => values.u64(if ftype4_of(attrs.kind) == ftype4::REG { 1 } else { v4.change }),
       SIZE => values.u64(attrs.size),
       LINK_SUPPORT | SYMLINK_SUPPORT | UNIQUE_HANDLES | CANSETTIME | CASE_PRESERVING
       | CHOWN_RESTRICTED | HOMOGENEOUS | NO_TRUNC | XATTR_SUPPORT => values.bool(true),

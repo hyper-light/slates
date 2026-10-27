@@ -1,5 +1,7 @@
-name: DIAG arm64 KIND legs (not for main)
+name: RED-CHECK arm64 KIND export leg (not for main)
 
+# A red-check, never merged: the export answers a frozen change attribute for regular files
+# (crates/bridge-nfs/src/v4/attr.rs), so the export leg's map leg must fail, the pod's map keeping the old bytes.
 # A diagnostics branch, never merged. The DAX matrix's Kubernetes rows (docs/wip/virtiofs.md §8) owe Linux arm64 its
 # mount route: kubelet's NFS mount of the export over RPC-with-TLS needs the kernel's TLS record layer, which Docker
 # Desktop's kernel on this kiln's Macs lacks. GitHub's `ubuntu-24.04-arm` runs the same two legs as the x86_64 KIND lane:
@@ -7,7 +9,7 @@ name: DIAG arm64 KIND legs (not for main)
 
 on:
   push:
-    branches: [diag-arm64-kind]
+    branches: [diag-arm64-kind-red]
 
 jobs:
   kind:
@@ -32,6 +34,3 @@ jobs:
         run: sudo modprobe tls && sudo modprobe nfs && sudo modprobe nfsv4
       - name: The export leg (kubelet's nfs PersistentVolume over RPC-with-TLS)
         run: cargo xtask kind export --require-kernel-tls
-      - name: The direct leg (a pod's process maps a file by the direct map)
-        if: success() || failure()
-        run: cargo xtask kind direct
