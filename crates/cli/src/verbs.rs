@@ -1636,8 +1636,16 @@ pub(crate) fn run_consumer(request: &RunRequest) -> Result<(), Failure> {
 /// first and only the copy at N goes into the command, so the attachment lives exactly as long as the command's end; and
 /// the process its launcher started is the command itself, its pid, signals and exit code the command's, so a
 /// supervisor that ends it ends the attachment. Returns only when the command could not run (refused, exit 4, its end
-/// closing as this process exits). Where the daemon has no route to hand a client the end (Windows), the attach is
-/// refused by kind and nothing runs.
+/// closing as this process exits).
+///
+/// On Windows (A-179), `shards ID [--subtree DIR] [--read-only] -- CMD ... {handle} ...`: no process replaces itself
+/// there, so this one starts the command holding the end as a handle, its value written where `{handle}` stands, and
+/// waits for it (`slates_ipc::stream::spawn_with`). Only the command inherits the end. This process keeps its own copy
+/// until the command exits, since the daemon checks a VM's claim of the end against a live holder, the attaching
+/// client first, so the attachment lives as long as the command: it ends when the command exits, not when the command
+/// closes its copy early (the reason is `spawn_with`'s). The command runs in a job this process alone holds, so a
+/// supervisor that ends this process ends the command too, and this process lets Ctrl-C be the command's to act on. The
+/// command's exit code is this one's.
 pub(crate) fn run_shards(request: &ShardsRequest) -> Result<(), Failure> {
   let (program, args) = request
     .command
@@ -1652,13 +1660,66 @@ pub(crate) fn run_shards(request: &ShardsRequest) -> Result<(), Failure> {
     .attach_shards(request.volume, intent, request.subtree.as_deref())
     .map_err(|e| failure_of(e, &request.instance))?;
   announce_attachment(shards.attachment.attachment, request.json);
+  hand_to(OsStr::new(program), args, shards.stream, request.handed)
+}
+
+/// Replaces this process with `program`, the stream end at the descriptor number `handed` names
+/// (`slates_ipc::stream::exec_with`); returns only the refusal of a command that could not run. A hand-off by handle is
+/// Windows' and is never parsed here.
+#[cfg(unix)]
+fn hand_to(
+  program: &OsStr,
+  args: &[String],
+  stream: slates_client::StreamEnd,
+  handed: crate::args::HandOff,
+) -> Result<(), Failure> {
+  let crate::args::HandOff::Descriptor(at) = handed else {
+    return Err(Failure::Failed(
+      "shards: this platform hands the end at a descriptor number (--fd N)".to_owned(),
+    ));
+  };
   let args: Vec<OsString> = args.iter().map(OsString::from).collect();
-  Err(exec_handed(
-    OsStr::new(program),
-    &args,
-    shards.stream,
-    request.fd,
-  ))
+  let error = slates_ipc::stream::exec_with(program, &args, stream, at);
+  Err(Failure::Failed(format!(
+    "shards: running {} with its end at descriptor {at}: {error}",
+    program.to_string_lossy()
+  )))
+}
+
+/// Starts `program` holding the stream end as a handle named where `{handle}` stands in `args`, and waits for it
+/// (`slates_ipc::stream::spawn_with`): its exit code is this command's. A hand-off at a descriptor number is Unix's and
+/// is never parsed here.
+#[cfg(windows)]
+fn hand_to(
+  program: &OsStr,
+  args: &[String],
+  stream: slates_client::StreamEnd,
+  handed: crate::args::HandOff,
+) -> Result<(), Failure> {
+  if handed != crate::args::HandOff::Handle {
+    return Err(Failure::Failed(
+      "shards: Windows hands the end as a handle ({handle} in the command's arguments)".to_owned(),
+    ));
+  }
+  let mut child =
+    slates_ipc::stream::spawn_with(program, args, stream, crate::args::HANDLE_PLACEHOLDER)
+      .map_err(|e| {
+        Failure::Failed(format!(
+          "shards: running {} with its end's handle: {e}",
+          program.to_string_lossy()
+        ))
+      })?;
+  let code = child.wait().map_err(|e| {
+    Failure::Failed(format!(
+      "shards: waiting for {} (process {}): {e}",
+      program.to_string_lossy(),
+      child.id()
+    ))
+  })?;
+  match code {
+    0 => Ok(()),
+    code => Err(Failure::ChildExited { code }),
+  }
 }
 
 /// `vhost-user ID [--tag NAME] [--subtree DIR] [--read-only] [--dax-window SIZE] -- VMM [ARG ...]` (§4.6; goal G-vhost):
@@ -1708,11 +1769,14 @@ fn exec_vmm(program: &str, args: &[String], end: slates_client::StreamEnd) -> Fa
   ))
 }
 
-/// No socket end exists here (`slates_client::StreamEnd` has no values off Unix: the daemon refuses the form by kind), so
-/// there is nothing to run.
+/// No VMM is run this way off Unix: a Windows daemon refuses the vhost-user form by kind, so no device's end reaches
+/// here; one that did is closed, and the command fails.
 #[cfg(not(unix))]
-fn exec_vmm(_program: &str, _args: &[String], end: slates_client::StreamEnd) -> Failure {
-  match end {}
+fn exec_vmm(program: &str, _args: &[String], end: slates_client::StreamEnd) -> Failure {
+  drop(end);
+  Failure::Failed(format!(
+    "vhost-user: {program} is not run with a device's end on this platform"
+  ))
 }
 
 /// Prints the attachment a `shards` command runs under, before the command starts, so a human can find it in `status`
@@ -1725,34 +1789,6 @@ fn announce_attachment(attachment: u64, json: bool) {
     println!("attachment: {attachment}");
   }
   let _ = std::io::stdout().flush();
-}
-
-/// Replaces this process with `program`, the stream end at descriptor number `at` (`slates_ipc::stream::exec_with`);
-/// returns only the refusal of a command that could not run.
-#[cfg(unix)]
-fn exec_handed(
-  program: &OsStr,
-  args: &[OsString],
-  stream: slates_client::StreamEnd,
-  at: i32,
-) -> Failure {
-  let error = slates_ipc::stream::exec_with(program, args, stream, at);
-  Failure::Failed(format!(
-    "shards: running {} with its end at descriptor {at}: {error}",
-    program.to_string_lossy()
-  ))
-}
-
-/// No stream end exists here (`slates_client::StreamEnd` has no values off Unix: the daemon refuses the form by kind),
-/// so there is nothing to run.
-#[cfg(not(unix))]
-fn exec_handed(
-  _program: &OsStr,
-  _args: &[OsString],
-  stream: slates_client::StreamEnd,
-  _at: i32,
-) -> Failure {
-  match stream {}
 }
 
 /// `grant`: the human surface (§4.13 "Grants"). The command runs as the user who started the anchor and

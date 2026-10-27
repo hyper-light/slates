@@ -302,12 +302,17 @@ slates-vfs = 0
 slates-land = 4
 slates-anchor = 6
 slates-db = 0
-slates-ipc = 98
+slates-ipc = 103
 # 2026-10-26 (+4, §4.6 A-180, Windows' Shards DAX claim, `handle_route.rs` compiled only for Windows): there is no safe
 #   wrapper for another process's handle table. The claimed handle and each known holder's duplicated out of their
 #   processes into this one and owned (`DuplicateHandle`, `from_raw_handle`, 2); the two compared as kernel objects
 #   (`CompareObjectHandles`, 1), never by a name query, which waits on a synchronous handle's lock; and the section
 #   duplicated into the claimant's process (`DuplicateHandle`, 1).
+# 2026-10-26 (+5, §4.6 A-181, `slates shards` on Windows, `win_spawn.rs` compiled only for Windows): the handle-list
+#   spawn moved out of `delivery.rs` unchanged in its sites, and three new things Win32 has no safe wrapper for. The
+#   kill-on-close job: made (`CreateJobObjectW`, 1), its limit record zeroed (1) and set (`SetInformationJobObject`, 1);
+#   the console-event handler registered (`SetConsoleCtrlHandler`, 1), and the handler itself, an `extern "system"`
+#   function the console calls (1). The job list rides the attribute list's one update call, now shared by both lists.
 # 2026-10-26 (+15, §4.6 A-179, the Shards stream on Windows, `stream_pipe.rs` compiled only for Windows): Win32 has no
 #   safe wrapper for a named pipe. The pair: the name's 128 bits from `BCryptGenRandom` (1); the owner-only descriptor
 #   parsed and freed (2); the server end made and owned (`CreateNamedPipeW`, `from_raw_handle`, 2) and the client end

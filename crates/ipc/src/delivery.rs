@@ -646,14 +646,10 @@ mod platform {
 
 #[cfg(windows)]
 mod platform {
-  //! Windows: a byte pipe with a unique name and one instance, `CreateProcessW` with a
-  //! `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` naming the two inherited handles of its read end (and the
-  //! standard three), the pipe's identity confirmed before adoption (the module's header says why and
-  //! how), `PeekNamedPipe` for a read that never blocks. The standard library's `Command` cannot restrict inheritance —
-  //! it passes `bInheritHandles` and the handle-list attribute is unstable on the pinned toolchain
-  //! (`windows_process_extensions_raw_attribute`, rust-lang/rust#114854) — so the spawn is made here,
-  //! the way `crates/rt`'s AFD reactor and `bridge-winfsp` make their Win32 calls: hand-transcribed
-  //! from the headers windows-sys binds, each call with its invariant stated.
+  //! Windows: a byte pipe with a unique name and one instance, a spawn whose handle list names the
+  //! two inherited handles of its read end and the standard three (`crate::win_spawn`, shared with a
+  //! Shards stream's hand-off), the pipe's identity confirmed before adoption (the module's header
+  //! says why and how), `PeekNamedPipe` for a read that never blocks.
 
   use std::ffi::{OsStr, OsString};
   use std::os::windows::ffi::OsStrExt;
@@ -661,229 +657,30 @@ mod platform {
   use std::sync::atomic::{AtomicU64, Ordering};
 
   use windows_sys::Win32::Foundation::{
-    CloseHandle, CompareObjectHandles, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_BROKEN_PIPE,
-    FILETIME, GENERIC_WRITE, GetHandleInformation, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
-    INVALID_HANDLE_VALUE, MAX_PATH, SetHandleInformation, WAIT_OBJECT_0,
+    CompareObjectHandles, ERROR_BROKEN_PIPE, FILETIME, GENERIC_WRITE, GetHandleInformation,
+    GetLastError, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, MAX_PATH,
+    SetHandleInformation,
   };
   use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_SHARE_NONE,
     FILE_TYPE_PIPE, FileNameInfo, GetFileInformationByHandleEx, GetFileType, OPEN_EXISTING,
     PIPE_ACCESS_INBOUND, ReadFile, WriteFile,
   };
-  use windows_sys::Win32::System::Console::{
-    GetStdHandle, STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-  };
   use windows_sys::Win32::System::Pipes::{
     CreateNamedPipeW, CreatePipe, NAMED_PIPE_MODE, PIPE_NOWAIT, PIPE_READMODE_BYTE,
     PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT, PeekNamedPipe, SetNamedPipeHandleState,
   };
-  use windows_sys::Win32::System::Threading::{
-    CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, INFINITE,
-    InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
-    WaitForSingleObject,
-  };
+  use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
 
   use super::{
     Delivered, DeliveryFault, ENV_CONSUMER_FD, OUTPUT_CHUNK, Output, RECORD_BYTES, decode,
     keep_within, zero,
   };
   use crate::error::IpcError;
-
-  /// The calling thread's last Win32 error, as the refusal's code.
-  fn last_error() -> Option<i32> {
-    // SAFETY: a thread-local read with no preconditions.
-    let code = unsafe { GetLastError() };
-    Some(i32::try_from(code).unwrap_or(i32::MAX))
-  }
-
-  fn refused(call: &'static str) -> IpcError {
-    IpcError::OsRefused {
-      call,
-      code: last_error(),
-    }
-  }
-
-  /// A handle this module created or duplicated, closed when it goes out of scope.
-  struct ClosedOnDrop(HANDLE);
-
-  impl Drop for ClosedOnDrop {
-    fn drop(&mut self) {
-      if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
-        // SAFETY: a live handle this module owns and nothing else closes.
-        unsafe { CloseHandle(self.0) };
-      }
-    }
-  }
-
-  /// Whether a duplicate is inheritable (the `bInheritHandle` of `DuplicateHandle`).
-  #[derive(Clone, Copy)]
-  enum Inheritance {
-    /// Only this process holds it.
-    Kept,
-    /// A child created with it in its handle list inherits it.
-    Inheritable,
-  }
-
-  /// A duplicate of `handle` in this process — the same object, a new handle — which the caller
-  /// closes.
-  fn duplicate(handle: HANDLE, inheritance: Inheritance) -> Result<ClosedOnDrop, IpcError> {
-    let mut duplicate: HANDLE = null_mut();
-    let inherit = match inheritance {
-      Inheritance::Kept => 0,
-      Inheritance::Inheritable => 1,
-    };
-    // SAFETY: the current process's pseudo-handle needs no closing; `handle` is live; the
-    // out-pointer is a local the call fills.
-    let ok = unsafe {
-      DuplicateHandle(
-        GetCurrentProcess(),
-        handle,
-        GetCurrentProcess(),
-        &mut duplicate,
-        0,
-        inherit,
-        DUPLICATE_SAME_ACCESS,
-      )
-    };
-    if ok == 0 {
-      return Err(refused("DuplicateHandle"));
-    }
-    Ok(ClosedOnDrop(duplicate))
-  }
-
-  /// An inheritable duplicate of `handle` in this process, which the caller closes after the spawn.
-  fn duplicate_inheritable(handle: HANDLE) -> Result<ClosedOnDrop, IpcError> {
-    duplicate(handle, Inheritance::Inheritable)
-  }
-
-  /// An inheritable duplicate of one of this process's standard handles, or none when the process
-  /// has no such handle (no console, a closed stream).
-  fn standard_handle_inheritable(which: STD_HANDLE) -> Result<Option<ClosedOnDrop>, IpcError> {
-    // SAFETY: a query with no preconditions; the answer may be null or invalid, checked below.
-    let handle = unsafe { GetStdHandle(which) };
-    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-      return Ok(None);
-    }
-    duplicate_inheritable(handle).map(Some)
-  }
-
-  /// The `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` naming exactly the handles the child inherits (Raymond
-  /// Chen, "Programmatically controlling which handles are inherited by new processes in Win32" \[D\]).
-  /// The list's storage is pointer-aligned and the handle array outlives the list, as the attribute
-  /// keeps a pointer to it until the list is deleted (on drop).
-  struct AttributeList {
-    storage: Vec<usize>,
-    handles: Vec<HANDLE>,
-  }
-
-  impl AttributeList {
-    fn new(handles: Vec<HANDLE>) -> Result<AttributeList, IpcError> {
-      let mut size: usize = 0;
-      // SAFETY: the documented size query — a null list with a count of one fills `size` and fails
-      // with ERROR_INSUFFICIENT_BUFFER, which is the expected answer here.
-      unsafe { InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut size) };
-      if size == 0 {
-        return Err(refused("InitializeProcThreadAttributeList"));
-      }
-      let mut list = AttributeList {
-        storage: vec![0usize; size.div_ceil(size_of::<usize>())],
-        handles,
-      };
-      // SAFETY: `storage` holds `size` bytes, pointer-aligned, and lives as long as the list.
-      let ok = unsafe {
-        InitializeProcThreadAttributeList(list.storage.as_mut_ptr().cast(), 1, 0, &mut size)
-      };
-      if ok == 0 {
-        list.storage.clear();
-        return Err(refused("InitializeProcThreadAttributeList"));
-      }
-      let bytes = list.handles.len().saturating_mul(size_of::<HANDLE>());
-      // SAFETY: the list is initialized; the handle array is live for the list's whole life (it is
-      // owned beside it and dropped after the delete); the attribute id and byte length are the
-      // documented ones.
-      let ok = unsafe {
-        UpdateProcThreadAttribute(
-          list.storage.as_mut_ptr().cast(),
-          0,
-          usize::try_from(PROC_THREAD_ATTRIBUTE_HANDLE_LIST).unwrap_or(0),
-          list.handles.as_ptr().cast(),
-          bytes,
-          null_mut(),
-          null(),
-        )
-      };
-      if ok == 0 {
-        return Err(refused("UpdateProcThreadAttribute"));
-      }
-      Ok(list)
-    }
-
-    fn pointer(&mut self) -> *mut core::ffi::c_void {
-      self.storage.as_mut_ptr().cast()
-    }
-  }
-
-  impl Drop for AttributeList {
-    fn drop(&mut self) {
-      if !self.storage.is_empty() {
-        // SAFETY: an initialized list this struct owns; deleted once, here.
-        unsafe { DeleteProcThreadAttributeList(self.storage.as_mut_ptr().cast()) };
-      }
-    }
-  }
-
-  /// Appends `argument` to a command line under the C runtime's parsing rules (Microsoft, "Parsing
-  /// C++ command-line arguments" \[B\]): an argument with a space, a tab, a quote — or nothing at all —
-  /// is quoted; a quote inside is escaped with a backslash; backslashes are doubled only where they
-  /// precede a quote or the closing quote.
-  fn append_quoted(line: &mut Vec<u16>, argument: &OsStr) {
-    let quote = u16::from(b'"');
-    let backslash = u16::from(b'\\');
-    let units: Vec<u16> = argument.encode_wide().collect();
-    let needs_quotes = units.is_empty()
-      || units
-        .iter()
-        .any(|unit| *unit == u16::from(b' ') || *unit == u16::from(b'\t') || *unit == quote);
-    if needs_quotes {
-      line.push(quote);
-    }
-    let mut backslashes = 0usize;
-    for unit in units {
-      if unit == backslash {
-        backslashes = backslashes.saturating_add(1);
-        line.push(unit);
-        continue;
-      }
-      if unit == quote {
-        line.extend(std::iter::repeat_n(
-          backslash,
-          backslashes.saturating_add(1),
-        ));
-      }
-      backslashes = 0;
-      line.push(unit);
-    }
-    if needs_quotes {
-      line.extend(std::iter::repeat_n(backslash, backslashes));
-      line.push(quote);
-    }
-  }
-
-  /// The command line `CreateProcessW` parses back into the child's `argv`, null-terminated; the
-  /// program is its first token, which the call resolves as a shell would (the application's
-  /// directory, the working directory, the system directories, then `PATH`).
-  fn command_line_of(program: &OsStr, args: &[OsString]) -> Vec<u16> {
-    let mut line: Vec<u16> = Vec::new();
-    append_quoted(&mut line, program);
-    for argument in args {
-      line.push(u16::from(b' '));
-      append_quoted(&mut line, argument);
-    }
-    line.push(0);
-    line
-  }
+  use crate::win_spawn::{
+    ClosedOnDrop, Inheritance, Process, Spawn, StandardOutput, duplicate, duplicate_inheritable,
+    refused, spawn,
+  };
 
   /// Whether two variable names are the same to the environment's reader (case-insensitively).
   fn same_name(a: &OsStr, b: &OsStr) -> bool {
@@ -1092,77 +889,33 @@ mod platform {
     ) -> Result<ConsumerChild, IpcError> {
       // The child's copies: two inheritable duplicates of the read end that exist for the length of
       // this call only; their values and the pipe's name are what the child is told (inheritance
-      // keeps a handle's value). Between here and the create, a `CreateProcess` from another thread
-      // of this process that inherits handles would carry them along — the window Win32 leaves every
-      // handle list (Chen [D]).
+      // keeps a handle's value).
       let inherited = duplicate_inheritable(self.read_end.0)?;
       let inherited_twin = duplicate_inheritable(self.read_end.0)?;
-      let stdin = standard_handle_inheritable(STD_INPUT_HANDLE)?;
       // A captured output is a pipe whose write end the child inherits (as its standard output) and
-      // whose read end this process keeps; the parent's own copies of the write end close after the
+      // whose read end this process keeps; the parent's own copy of the write end closes after the
       // spawn, so the read end sees end of stream when the child ends.
       let captured = match output {
         Output::Captured => Some(create_pipe()?),
         Output::Inherit => None,
       };
-      let stdout = match &captured {
-        Some((_, write_end)) => Some(duplicate_inheritable(write_end.0)?),
-        None => standard_handle_inheritable(STD_OUTPUT_HANDLE)?,
-      };
-      let stderr = standard_handle_inheritable(STD_ERROR_HANDLE)?;
-      // SAFETY: a plain-data record every zero of which is a valid field value.
-      let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
-      startup.StartupInfo.cb = u32::try_from(size_of::<STARTUPINFOEXW>()).unwrap_or(0);
-      startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-      let mut handles: Vec<HANDLE> = vec![inherited.0, inherited_twin.0];
-      for (slot, duplicate) in [
-        (&mut startup.StartupInfo.hStdInput, &stdin),
-        (&mut startup.StartupInfo.hStdOutput, &stdout),
-        (&mut startup.StartupInfo.hStdError, &stderr),
-      ] {
-        if let Some(duplicate) = duplicate {
-          *slot = duplicate.0;
-          handles.push(duplicate.0);
-        }
-      }
-      let mut list = AttributeList::new(handles)?;
-      startup.lpAttributeList = list.pointer();
-      let mut command_line = command_line_of(program, args);
       let environment_block = environment_block(
         environment,
         &delivery_name(&inherited, &inherited_twin, &self.pipe_name),
       );
-      // SAFETY: a plain-data record the call fills.
-      let mut information: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-      // SAFETY: the command line is a mutable null-terminated buffer (the call may edit it); the
-      // environment block is a well-formed double-null-terminated wide block; the startup record
-      // is the extended form with its attribute list live, and the flag says so; inheritance is
-      // on, narrowed to the list by the attribute.
-      let ok = unsafe {
-        CreateProcessW(
-          null(),
-          command_line.as_mut_ptr(),
-          null(),
-          null(),
-          1,
-          EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
-          environment_block.as_ptr().cast(),
-          null(),
-          &startup.StartupInfo,
-          &mut information,
-        )
-      };
-      let error = if ok == 0 {
-        Some(refused("CreateProcessW"))
-      } else {
-        None
-      };
-      // The list, the duplicates and this process's own read end are closed now: the child holds
-      // its own copies, and nothing of the delivery stays open here.
-      drop(list);
-      drop(stdin);
-      drop(stdout);
-      drop(stderr);
+      let spawned = spawn(&Spawn {
+        program,
+        args,
+        environment: Some(&environment_block),
+        inherited: &[inherited.0, inherited_twin.0],
+        output: match &captured {
+          Some((_, write_end)) => StandardOutput::Into(write_end),
+          None => StandardOutput::Inherited,
+        },
+        job: None,
+      });
+      // The duplicates and this process's own read end are closed now: the child holds its own
+      // copies, and nothing of the delivery stays open here.
       drop(inherited_twin);
       drop(inherited);
       drop(self);
@@ -1170,13 +923,8 @@ mod platform {
         drop(write_end);
         read_end
       });
-      if let Some(error) = error {
-        return Err(error);
-      }
-      drop(ClosedOnDrop(information.hThread));
       Ok(ConsumerChild {
-        process: ClosedOnDrop(information.hProcess),
-        id: information.dwProcessId,
+        process: spawned?,
         stdout: captured_read_end,
       })
     }
@@ -1184,15 +932,14 @@ mod platform {
 
   /// The spawned workload.
   pub(super) struct ConsumerChild {
-    process: ClosedOnDrop,
-    id: u32,
+    process: Process,
     /// The read end of the captured output, until it is read to its end.
     stdout: Option<ClosedOnDrop>,
   }
 
   impl ConsumerChild {
     pub(super) fn id(&self) -> u32 {
-      self.id
+      self.process.id()
     }
 
     pub(super) fn wait_with_output(
@@ -1244,27 +991,11 @@ mod platform {
     }
 
     pub(super) fn wait(&mut self) -> Result<Option<i32>, IpcError> {
-      // SAFETY: a live process handle this struct owns; the wait returns when the process ends.
-      let waited = unsafe { WaitForSingleObject(self.process.0, INFINITE) };
-      if waited != WAIT_OBJECT_0 {
-        return Err(refused("WaitForSingleObject"));
-      }
-      let mut code = 0u32;
-      // SAFETY: the out-pointer is a live local; the handle is the process's.
-      let ok = unsafe { GetExitCodeProcess(self.process.0, &mut code) };
-      if ok == 0 {
-        return Err(refused("GetExitCodeProcess"));
-      }
-      Ok(Some(i32::from_ne_bytes(code.to_ne_bytes())))
+      self.process.wait()
     }
 
     pub(super) fn kill(&mut self) -> Result<(), IpcError> {
-      // SAFETY: the process handle this struct owns.
-      let ok = unsafe { TerminateProcess(self.process.0, 1) };
-      if ok == 0 {
-        return Err(refused("TerminateProcess"));
-      }
-      Ok(())
+      self.process.kill()
     }
   }
 

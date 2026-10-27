@@ -11868,8 +11868,16 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   process by the handle route (`ReplyBody::ShardsHanded`). The refusal by kind (`DescriptorRouteNotBuilt`, step 4) is
   gone. On jupiter `crates/client/tests/shards.rs` passes 7 of 7 in each of 3 runs: the FUSE history on either shard,
   scoped streams, hostile frames, a detach, a destroy and a revocation each ending the stream and its record, and a
-  second process refused the pipe `ERROR_PIPE_BUSY`. The CI steps that ran the refusal now run these. **Owed:** `slates shards` on Windows (step 2), and Shards'
+  second process refused the pipe `ERROR_PIPE_BUSY`. The CI steps that ran the refusal now run these. **Owed:** Shards'
   device on Windows (step 3).
+- **`slates shards` on Windows (G-shards-windows step 2, A-181, 2026-10-26):** `slates shards ID -- CMD ... {handle}
+  ...` starts CMD holding the stream end as an inherited handle whose value replaces `{handle}`, inside a kill-on-close
+  job the command alone holds, and exits with CMD's code. Only CMD inherits the end. The command keeps its own copy
+  until CMD exits, for A-180's claim check, so on Windows the attachment ends when CMD exits rather than when CMD closes
+  its copy. On jupiter the CLI test (a probe reading a file through `{handle}`, the exit code, the attachment
+  ending with the program, a killed command taking its program along) passes in each of 3 runs as committed, and the ipc
+  hand-off test (no later child inherits the end, against an inheritable copy's contrast) in each of 5. Both are red-checked. **Owed:** arm64 Windows runs `stream_spawn` but not the CLI test (its lane
+  builds no `slates-cli`).
 - **Windows' DAX window built (G-shards-windows step 5, A-180, 2026-10-26):** a descriptor ask on a Windows stream
   names the asking process and its stream handle there. The daemon checks the handle is this stream's own object, by
   `CompareObjectHandles` against a known holder, never by a name query, which hung past 3 s on a synchronous pipe with

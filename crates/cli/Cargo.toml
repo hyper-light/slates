@@ -44,19 +44,17 @@ slates-rt = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
 
-[target.'cfg(unix)'.dev-dependencies]
-# `init::MAX_WRITE`: the in-flight resend test writes one page of it, the largest write the mount advertises, so the
-# daemon is serving one for as long as a single write can hold it when the kill lands (A-61 / T-3.5; Linux, as that
-# test is). And the FUSE ABI's opcodes and header lengths for the reader `slates shards` hands a stream end (A-161),
-# on Linux and macOS.
-slates-bridge-fuse = { workspace = true }
-
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # The names of the status counters slates' own virtio-fs device adds while a guest uses its DAX window, which the real
 # guest test holds non-vacuous (`tests/guest_vhost.rs`, A-168).
 slates-bridge-virtiofs = { workspace = true }
 
 [dev-dependencies]
+# `init::MAX_WRITE`: the in-flight resend test writes one page of it, the largest write the mount advertises, so the
+# daemon is serving one for as long as a single write can hold it when the kill lands (A-61 / T-3.5; Linux, as that
+# test is). And the FUSE ABI's opcodes and header lengths for the reader `slates shards` hands a stream end, on every
+# platform (A-161; Windows, A-179).
+slates-bridge-fuse = { workspace = true }
 # The archive's codec decision, so the codec gate can ask the policy the daemon derived what it
 # would actually do with a compressible chunk rather than stopping at "a candidate exists".
 slates-archive = { workspace = true }

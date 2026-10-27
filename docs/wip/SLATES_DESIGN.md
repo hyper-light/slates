@@ -3589,6 +3589,18 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 > and a refill zeroed its map past it; both now read a slice whole, and the oracle runs a whole range a slice on every
 > machine (`docs/bugs/2026-10-25-a-dax-slice-past-the-read-cap-dropped-a-guests-stores.md`).
 
+> **Status (2026-10-26, `slates shards` on Windows, A-181).** `slates shards ID [--subtree DIR] [--read-only] -- CMD ...
+> {handle} ...` attaches in the Shards form and starts CMD holding the stream end as a handle, its decimal value
+> written wherever `{handle}` stands, as Shards' `--slates-fs-handle {handle}` takes it (`slates_ipc::stream::
+> spawn_with`). No process replaces itself on Windows, so the command waits for CMD and exits with its code. Only CMD
+> inherits the end: an inheritable duplicate exists for the one spawn, named in its handle list. The command keeps its
+> own copy until CMD exits, since A-180's claim check needs a live holder at a VM's first ask, so the attachment ends
+> when CMD exits, not when CMD closes its copy early as it does on Unix. CMD runs in a kill-on-close job only the
+> command holds, so ending the command ends CMD, as exec's single process does on Unix. On jupiter, 2026-10-26, `crates/cli/tests/shards.rs` passes
+> in each of 3 runs as committed: a probe the command started reads a file through the handle it was named; the command exits with
+> its program's code; the attachment stands while the command holds its copy and ends once the program exits; a killed
+> command takes its program and the attachment along.
+
 **Writeback and snapshot barrier.** Kernel/guest cache negotiation changes when writes reach
 the owner. `snapshot`, `submit`, `advance`, clean `detach`, migration and archive must identify
 the set of contributing writable attachments, stop admission into the closing generation,
@@ -12556,6 +12568,65 @@ readied before its fill; the page size from `slates-machine`, so no `rustix`), `
     592 to 837 µs (the descriptor's conversion), which the first ask's shard pays (GAPS).
   - macOS: the Unix DAX suites pass unchanged (`slates-server --test shards` 26 of 26, `slates-vfs --test
     shards_backing`, `slates-mem --test dax_object`, `slates-bridge-core`, `slates-bridge-fuse`).
+
+### A-181 — `slates shards` on Windows starts its command holding the stream end as a named handle, and waits for it (accepted 2026-10-26)
+Applied in the same change to: §4.6 (the Shards form's Windows status), GAPS, `crates/ipc` (`win_spawn.rs`, new: the
+handle-list spawn moved out of `delivery.rs`, now with a job list, a kill-on-close job and the console-event handler;
+`delivery.rs` spawns through it; `stream_pipe.rs`: `spawn_with`, `HandedChild`; `tests/stream_spawn.rs`, new),
+`crates/cli` (`args.rs`: `HandOffKind`, `HandOff`, `HANDLE_PLACEHOLDER`, both forms parsed on every host; `verbs.rs`:
+`run_shards` over `hand_to`, paired per platform, and `exec_vmm`'s Windows arm, which no longer compiled once A-179
+gave `StreamEnd` values there; `tests/shards.rs`, new; `Cargo.toml`: the FUSE codec a dev-dependency on every
+platform), `ci.yml` (the Windows lanes), `unsafe-budget.toml` (`slates-ipc` + 5).
+- **What was there.** `slates shards` replaced itself with its command, the end at `--fd N`, on Unix alone. A-179 gave
+  Windows the stream, so its `StreamEnd` became a handle and the Windows arms that matched it as empty no longer built.
+- **Why a named handle, not a number.** A Windows process cannot choose the value a handle gets in another process, so
+  the command is told it in its arguments, where `{handle}` stands. The Shards device's author agreed the interface:
+  `--slates-fs-handle V`, V decimal, which the spawner checks is a pipe and not one of its own standard handles, then
+  makes non-inheritable and duplicates into its confined VM.
+- **Why inheritance through a handle list.** A handle duplicated into a child after it is created has a value the
+  child's command line could not have named. An inherited handle keeps its value, so an inheritable duplicate is made
+  first and named in the arguments, and `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` gives the child that one handle and its
+  standard three, so nothing else inheritable reaches it (the consumer delivery's spawn, now shared). The standard
+  library cannot set the attribute on the pinned toolchain (`windows_process_extensions_raw_attribute`).
+- **Exec, emulated.** On Unix the command is CMD, so a supervisor's kill ends CMD and the attachment. Here CMD is
+  created inside a kill-on-close job (`PROC_THREAD_ATTRIBUTE_JOB_LIST`, a member from its first instruction) whose only
+  handle the command holds, so the kernel ends CMD when the command ends by any means; Shards' VM nests its own job
+  beneath. Ctrl-C reaches every process on the console, so after the spawn the command answers console events as
+  handled (a handler, never `SetConsoleCtrlHandler(NULL, TRUE)`, whose ignore flag children created later inherit) and
+  leaves the shutdown to CMD.
+- **Decided with A-180: the command keeps its copy until CMD exits.** The plan's step said the command closes its copy
+  once CMD has the handle. A-180's claim check compares a VM's handle with a known holder's by object, the attaching
+  client's first, because a name query on a synchronous pipe handle with a read pending hung past 3 s (jupiter,
+  2026-10-26). So the client's copy must stand until the VM's first ask. The cost is one difference from Unix: CMD
+  closing its copy early does not end the attachment until CMD exits. Shards' spawner keeps its copy for the VM's life,
+  so a real VM never meets it. Rejected: a new verb telling the daemon the child's process and value, which keeps Unix's
+  semantics exactly for a case nothing relies on.
+- **Proven** on jupiter (Windows 10.0.26200), 2026-10-26, against the tree with A-180 beneath it:
+  - `crates/ipc/tests/stream_spawn.rs`, 1 of 1 in each of 5 runs. A program writes through the handle its arguments
+    name and exits 7, and `wait` returns 7. The end stays open after the program has gone, until the launcher lets
+    it go. A child the standard library starts afterwards, told the value, finds no handle there naming the pipe,
+    while an inheritable copy, the contrast, is found. A dropped launcher's job ends a program that never exits on its
+    own. No placeholder is refused `Layout`, and the end is closed.
+  - `crates/cli/tests/shards.rs` with `SLATES_TEST_CLI=1`, 1 of 1 in each of 3 runs as committed (and 4 before the
+    holder parked), a real anchor and daemon:
+    - a probe started by `slates shards` mounts the attachment over `{handle}` (INIT, LOOKUP, OPEN, READ, RELEASE) and
+      reads the file's bytes, and the attachment is gone after the probe's exit;
+    - the command exits 7 with a silent program;
+    - the attachment stands while a program that closed its handle still runs, and is gone once it exits;
+    - a `TerminateProcess` of the command takes a program that never exits on its own, and the attachment, along;
+    - a missing volume exits 1, a program that cannot run exits 4 and leaves no attachment, and `--fd` or no
+      `{handle}` exits 2.
+  - The consumer delivery, whose spawn moved, passes `crates/ipc/tests/delivery.rs` (3 of 3, two ignored roles). Step
+    5's client Shards suite passes 10 of 10. Clippy `-D warnings` and the documentation step are clean over the
+    Windows lane's crates, the binary and both of its Windows test targets.
+  - **Red-checked** on the same copy, one mutant at a time:
+    - the inheritable duplicate never closed fails the hand-off test (the end outlives its launcher);
+    - no job fails it (a dropped launcher's program and end stay alive), and fails the CLI test's kill case;
+    - the launcher's copy closed at once, the plan's first text, fails both (the attachment ends while the command
+      holds nothing).
+  - The first run of the no-job mutant passed the CLI kill case: the holder then waited on its standard input, and that
+    read returned once the command died, so the holder exited by itself. The holder now parks for good, so only the
+    job can end it, and the mutant fails.
 
 ### A-178 — macOS refuses a second owner of a live instance's rendezvous: the owner's token is a Mach bootstrap name (accepted 2026-10-26)
 Applied in the same change to: §4.7 (the rendezvous's status), A-176 (its macOS sentences), GAPS, `crates/ipc` (`owner_name.rs`, new; `rendezvous.rs`: the macOS `Owner`, `owner_token_name` and `take_ownership`; `lib.rs`; `tests/rendezvous.rs`: the second-owner test now also macOS's, and a cross-process one on every platform), `unsafe-budget.toml` (`slates-ipc` 70 → 79), `CLAUDE.md`, and a bug record (`docs/bugs/2026-10-26-a-second-owner-took-a-live-macos-instances-rendezvous-over.md`).

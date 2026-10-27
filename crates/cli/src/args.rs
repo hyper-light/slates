@@ -61,6 +61,9 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   exec --volume V --at PATH -- CMD [ARG ...]        run CMD with the volume at PATH
   shards ID [--subtree DIR] [--read-only] --fd N [--json] -- CMD [ARG ...]
             run CMD with a Shards fs stream of the volume at descriptor N (Linux, macOS)
+  shards ID [--subtree DIR] [--read-only] [--json] -- CMD [ARG ...]
+            run CMD with a Shards fs stream of the volume as a handle: {handle} in its arguments names its value,
+            e.g. `shards run --slates-fs-handle {handle} ...` (Windows)
   vhost-user ID [--tag NAME] [--subtree DIR] [--read-only] [--dax-window SIZE] [--json] -- VMM [ARG ...]
             run VMM with slates' own virtio-fs device of the volume: {socket} in its arguments names the device's
             socket end (/proc/self/fd/N), e.g. `crosvm run --vhost-user type=fs,socket={socket} ...` (Linux)
@@ -540,8 +543,9 @@ pub(crate) struct RunRequest {
   pub command: Vec<String>,
 }
 
-/// A `slates shards` request (§4.6, the Shards route; A-161): attach a volume in the Shards form and run a command with
-/// the stream end at a descriptor number it names, the way a Shards spawner hands its VMM `--slates-fs-fd`.
+/// A `slates shards` request (§4.6, the Shards route; A-161, A-179): attach a volume in the Shards form and run a command
+/// with the stream end: on Unix at a descriptor number it names, the way a Shards spawner hands its VMM `--slates-fs-fd`;
+/// on Windows as a handle whose value replaces `{handle}` in its arguments, as `--slates-fs-handle {handle}`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ShardsRequest {
   /// The instance.
@@ -552,8 +556,8 @@ pub(crate) struct ShardsRequest {
   pub subtree: Option<String>,
   /// Every change refused (`--read-only`); otherwise for writing, as `mount` attaches.
   pub read_only: bool,
-  /// The descriptor number the command finds its end at.
-  pub fd: i32,
+  /// Where the command finds its end.
+  pub handed: HandOff,
   /// Announce the attachment as JSON.
   pub json: bool,
   /// The command and its arguments.
@@ -734,19 +738,101 @@ fn parse_exec(taken: &Taken, arguments: &[String]) -> Result<Command, ParseError
 /// number, too).
 const FIRST_HANDED_FD: i32 = 3;
 
-/// Parses `shards ID [--subtree DIR] [--read-only] --fd N [--json] -- CMD ...`: one volume and the flags before `--`, the
-/// command after it.
-fn parse_shards(taken: &Taken, arguments: &[String]) -> Result<Command, ParseError> {
+/// Format: where a `shards` command's arguments name its stream end on Windows: each occurrence becomes the handle's
+/// value in the command's process, in decimal, as Shards' `--slates-fs-handle V` takes it (A-179).
+pub(crate) const HANDLE_PLACEHOLDER: &str = "{handle}";
+
+/// How a platform hands a `shards` command its stream end: Unix places a descriptor at a number the command is told
+/// with `--fd N` before it replaces itself with the command; Windows starts the command inheriting a handle whose value
+/// is written where `{handle}` stands in its arguments, since a handle's value is not the caller's to choose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HandOffKind {
+  /// At a descriptor number (`--fd N`).
+  // The other platform's kind is parsed only by the tests, which check both forms on every host.
+  #[cfg_attr(all(windows, not(test)), allow(dead_code))]
+  Descriptor,
+  /// As a handle named in the arguments (`{handle}`).
+  #[cfg_attr(all(unix, not(test)), allow(dead_code))]
+  Handle,
+}
+
+/// This platform's hand-off.
+#[cfg(unix)]
+const PLATFORM_HAND_OFF: HandOffKind = HandOffKind::Descriptor;
+/// This platform's hand-off.
+#[cfg(windows)]
+const PLATFORM_HAND_OFF: HandOffKind = HandOffKind::Handle;
+
+/// Where a parsed `shards` command finds its end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HandOff {
+  /// At this descriptor number.
+  Descriptor(i32),
+  /// As the handle whose value replaces [`HANDLE_PLACEHOLDER`] in its arguments.
+  Handle,
+}
+
+/// Parses `shards ID [--subtree DIR] [--read-only] --fd N [--json] -- CMD ...` (Unix) or `shards ID [--subtree DIR]
+/// [--read-only] [--json] -- CMD ... {handle} ...` (Windows): one volume and the flags before `--`, the command after
+/// it.
+fn parse_shards(
+  taken: &Taken,
+  arguments: &[String],
+  kind: HandOffKind,
+) -> Result<Command, ParseError> {
   let command = command_after(arguments)?;
-  taken.only(&Spec {
-    values: &["--subtree", "--fd"],
-    switches: &["--read-only"],
-  })?;
+  let handed = match kind {
+    HandOffKind::Descriptor => {
+      taken.only(&Spec {
+        values: &["--subtree", "--fd"],
+        switches: &["--read-only"],
+      })?;
+      HandOff::Descriptor(handed_fd(taken)?)
+    }
+    HandOffKind::Handle => {
+      if taken.value("--fd").is_some() {
+        return Err(ParseError::BadValue {
+          what: "--fd",
+          reason: format!(
+            "Windows hands the command a handle, not a descriptor: name it {HANDLE_PLACEHOLDER} in the command's arguments"
+          ),
+        });
+      }
+      taken.only(&Spec {
+        values: &["--subtree"],
+        switches: &["--read-only"],
+      })?;
+      HandOff::Handle
+    }
+  };
   let id = match taken.words.as_slice() {
     [_, id] => id,
     [_, _, extra, ..] => return Err(ParseError::Extra(extra.clone())),
     _ => return Err(ParseError::Missing("volume ID")),
   };
+  if handed == HandOff::Handle
+    && !command
+      .iter()
+      .skip(1)
+      .any(|argument| argument.contains(HANDLE_PLACEHOLDER))
+  {
+    return Err(ParseError::Missing(
+      "{handle} in the command's arguments, where the stream end's handle goes (e.g. --slates-fs-handle {handle})",
+    ));
+  }
+  Ok(Command::Shards(ShardsRequest {
+    instance: taken.instance(),
+    volume: volume(id)?,
+    subtree: taken.value("--subtree").map(str::to_owned),
+    read_only: taken.switch("--read-only"),
+    handed,
+    json: taken.json(),
+    command,
+  }))
+}
+
+/// The descriptor number `--fd N` names: required, and past standard input, output and error.
+fn handed_fd(taken: &Taken) -> Result<i32, ParseError> {
   let fd = taken
     .value("--fd")
     .ok_or(ParseError::Missing(
@@ -765,15 +851,7 @@ fn parse_shards(taken: &Taken, arguments: &[String]) -> Result<Command, ParseErr
       ),
     });
   }
-  Ok(Command::Shards(ShardsRequest {
-    instance: taken.instance(),
-    volume: volume(id)?,
-    subtree: taken.value("--subtree").map(str::to_owned),
-    read_only: taken.switch("--read-only"),
-    fd,
-    json: taken.json(),
-    command,
-  }))
+  Ok(fd)
 }
 
 /// Format: the tag a guest mounts when `vhost-user` names none: the product's name, which the guest probe and the
@@ -1265,6 +1343,12 @@ fn parse_submit(taken: &Taken, work: &str) -> Result<Command, ParseError> {
 
 /// Parses the arguments (without the program name).
 pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
+  parse_on(arguments, PLATFORM_HAND_OFF)
+}
+
+/// Parses the arguments as a platform that hands a `shards` command its end by `hand_off` would: [`parse`] for this
+/// platform, and the other platform's form in the tests, so both are checked on every host.
+fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, ParseError> {
   let boundary = arguments.iter().position(|argument| argument == "--");
   let before_boundary = arguments
     .get(..boundary.unwrap_or(arguments.len()))
@@ -1274,7 +1358,7 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
   match words.first().copied() {
     Some("run") => return parse_run(&taken, arguments),
     Some("exec") => return parse_exec(&taken, arguments),
-    Some("shards") => return parse_shards(&taken, arguments),
+    Some("shards") => return parse_shards(&taken, arguments, hand_off),
     Some("vhost-user") => return parse_vhost_user(&taken, arguments),
     _ if boundary.is_some() => return Err(ParseError::UnknownFlag("--".to_owned())),
     _ => {}
@@ -2479,34 +2563,97 @@ mod tests {
     ));
   }
 
-  /// A-161 (Shards part 1 step 4). Do: parse `shards` with every flag and with the fewest. Expect the instance, the
-  /// volume, the subtree, the intent, the number, the JSON switch and the command after `--` untouched.
+  /// A-161 (Shards part 1 step 4). Do: parse `shards` as Unix hands its end, with every flag and with the fewest.
+  /// Expect the instance, the volume, the subtree, the intent, the number, the JSON switch and the command after `--`
+  /// untouched.
   #[test]
   fn shards_takes_one_volume_a_number_and_the_untouched_command() {
     let id = "0123456789abcdef0123456789abcdef";
-    let Command::Shards(request) = parse(&args(&format!(
+    let unix = |line: &str| parse_on(&args(line), HandOffKind::Descriptor);
+    let Command::Shards(request) = unix(&format!(
       "--instance outer shards {id} --subtree work --read-only --fd 5 --json -- shards run --slates-fs-fd 5 --help"
-    )))
+    ))
     .unwrap() else {
       panic!("shards");
     };
     assert_eq!(
-      (request.instance.as_str(), request.volume, request.fd),
-      ("outer", volume(id).unwrap(), 5)
+      (request.instance.as_str(), request.volume, request.handed),
+      ("outer", volume(id).unwrap(), HandOff::Descriptor(5))
     );
     assert_eq!(
       (request.subtree.as_deref(), request.read_only, request.json),
       (Some("work"), true, true)
     );
     assert_eq!(request.command, args("shards run --slates-fs-fd 5 --help"));
-    let Command::Shards(fewest) = parse(&args(&format!("shards {id} --fd 3 -- reader"))).unwrap()
-    else {
+    let Command::Shards(fewest) = unix(&format!("shards {id} --fd 3 -- reader")).unwrap() else {
       panic!("shards");
     };
     assert_eq!(
       (fewest.subtree, fewest.read_only, fewest.json),
       (None, false, false)
     );
+  }
+
+  /// A-179 (G-shards-windows step 2). Do: parse `shards` as Windows hands its end, with every flag and with the fewest.
+  /// Expect the instance, the volume, the subtree, the intent, the hand-off by handle, the JSON switch, and the command
+  /// after `--` untouched, `{handle}` still in it for the spawn to replace.
+  #[test]
+  fn shards_on_windows_takes_one_volume_and_a_command_naming_its_handle() {
+    let id = "0123456789abcdef0123456789abcdef";
+    let windows = |line: &str| parse_on(&args(line), HandOffKind::Handle);
+    let Command::Shards(request) = windows(&format!(
+      "--instance outer shards {id} --subtree work --read-only --json -- shards run vm --slates-fs-handle {{handle}}"
+    ))
+    .unwrap() else {
+      panic!("shards");
+    };
+    assert_eq!(
+      (request.instance.as_str(), request.volume, request.handed),
+      ("outer", volume(id).unwrap(), HandOff::Handle)
+    );
+    assert_eq!(
+      (request.subtree.as_deref(), request.read_only, request.json),
+      (Some("work"), true, true)
+    );
+    assert_eq!(
+      request.command,
+      args("shards run vm --slates-fs-handle {handle}")
+    );
+    let Command::Shards(fewest) =
+      windows(&format!("shards {id} -- reader handle={{handle}}")).unwrap()
+    else {
+      panic!("shards");
+    };
+    assert_eq!(
+      (fewest.subtree, fewest.read_only, fewest.json, fewest.handed),
+      (None, false, false, HandOff::Handle)
+    );
+  }
+
+  /// A-179. Do: parse `shards` as Windows hands its end with each thing wrong in turn. Expect each refused as usage, for
+  /// its own reason: a descriptor number, which Windows does not take; no `{handle}` in the command's arguments, or only
+  /// as the program itself; no volume; no command.
+  #[test]
+  fn shards_on_windows_refuses_a_number_or_a_command_that_never_names_its_handle() {
+    let id = "0123456789abcdef0123456789abcdef";
+    let refusal = |line: &str| match parse_on(&args(line), HandOffKind::Handle) {
+      Err(ParseError::BadValue { what, .. }) => format!("bad {what}"),
+      Err(e) => e.to_string(),
+      Ok(command) => format!("parsed {command:?}"),
+    };
+    let unnamed = "missing {handle} in the command's arguments, where the stream end's handle goes (e.g. --slates-fs-handle {handle})";
+    for (line, expected) in [
+      (
+        format!("shards {id} --fd 5 -- reader {{handle}}"),
+        "bad --fd",
+      ),
+      (format!("shards {id} -- reader"), unnamed),
+      (format!("shards {id} -- {{handle}} reader"), unnamed),
+      ("shards -- reader {handle}".to_owned(), "missing volume ID"),
+      (format!("shards {id} --"), "missing a command after `--`"),
+    ] {
+      assert_eq!(refusal(&line), expected, "{line}");
+    }
   }
 
   /// G-vhost. Do: parse `vhost-user` with every flag and with the fewest. Expect the instance, the volume, the tag (the
@@ -2601,7 +2748,7 @@ mod tests {
   #[test]
   fn shards_refuses_a_bad_number_volume_word_flag_or_command_as_usage() {
     let id = "0123456789abcdef0123456789abcdef";
-    let refusal = |line: &str| match parse(&args(line)) {
+    let refusal = |line: &str| match parse_on(&args(line), HandOffKind::Descriptor) {
       Err(ParseError::BadValue { what, .. }) => format!("bad {what}"),
       Err(e) => e.to_string(),
       Ok(command) => format!("parsed {command:?}"),

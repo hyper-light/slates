@@ -381,6 +381,8 @@ jobs:
       # reason: the rest of its targets are Unix by nature.
       - name: Clippy the WinFsp CLI test (native Windows)
         run: cargo clippy -p slates-cli --test winfsp -- -D warnings
+      - name: Clippy the Shards hand-off CLI test (native Windows)
+        run: cargo clippy -p slates-cli --test shards -- -D warnings
       # The other half of the documentation gate in `gates`. That one runs on ubuntu and macos, so it checks
       # every reference those two hosts can resolve — and a reference resolves or not *per platform*, because
       # an item behind `#[cfg(windows)]` exists for no other. Of the errors that gate found, five were visible
@@ -433,6 +435,13 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-ipc --test delivery
+      # A Shards stream's end handed to a program by `spawn_with` (§4.6, A-181): the program writes through the handle its
+      # arguments name; a child started afterwards inherits nothing of it, against an inheritable copy's contrast; the
+      # launcher's copy stands until it lets the program go, and its kill-on-close job ends a program it drops.
+      - name: Test the stream hand-off to a program (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-ipc --test stream_spawn
       # The IOCP driver woken by the registry's kick, the one every sender uses: a parked shard that no
       # kick reached never ran a spawn or a shutdown (docs/bugs/2026-09-26-windows-shards-were-never-kicked.md).
       - name: Test the IOCP driver's kick and no-op (native Windows)
@@ -510,6 +519,17 @@ jobs:
           SLATES_TEST_CLI: "1"
           WINFSP_TEST_MOUNT: "1"
         run: cargo test -p slates-cli --test winfsp -- --test-threads=1 --nocapture
+      # `slates shards` on Windows (§4.6, A-181; G-shards-windows step 2): a real anchor and daemon, and the command
+      # starting this test binary as a probe that holds the stream end as the handle `{handle}` named, mounts the
+      # attachment over it and reads a file; the command exiting with its program; the attachment standing while the
+      # command holds its copy and gone once the program exits; a killed command taking its program and the
+      # attachment along through its job; the refusals. Gated by `SLATES_TEST_CLI=1`.
+      - name: The Shards hand-off through the CLI (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        env:
+          SLATES_TEST_CLI: "1"
+        run: cargo test -p slates-cli --test shards -- --nocapture
 
   # D-20: instruction-count gates. callgrind counts are deterministic for a given binary, so
   # they see the one-percent change the wall clock cannot. valgrind is non-Rust tooling, admitted
@@ -640,6 +660,8 @@ jobs:
         run: cargo test -p slates-ipc --test rendezvous
       - name: Test the typed delivery (native arm64 Windows)
         run: cargo test -p slates-ipc --test delivery
+      - name: Test the stream hand-off to a program (native arm64 Windows)
+        run: cargo test -p slates-ipc --test stream_spawn
       - name: Test the IOCP driver's kick and no-op (native arm64 Windows)
         run: 'cargo test -p slates-rt --lib driver::'
       - name: Test the AFD readiness over loopback UDP (native arm64 Windows)
@@ -785,6 +807,10 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-ipc --test delivery
+      - name: Test the stream hand-off to a program (Windows, every push to main)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-ipc --test stream_spawn
       # The IOCP driver woken by the registry's kick, the one every sender uses: a parked shard that no
       # kick reached never ran a spawn or a shutdown (docs/bugs/2026-09-26-windows-shards-were-never-kicked.md).
       - name: Test the IOCP driver's kick and no-op (Windows, every push to main)
@@ -818,6 +844,12 @@ jobs:
           SLATES_TEST_CLI: "1"
           WINFSP_TEST_MOUNT: "1"
         run: cargo test -p slates-cli --test winfsp -- --test-threads=1 --nocapture
+      - name: The Shards hand-off through the CLI (Windows, every push to main)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        env:
+          SLATES_TEST_CLI: "1"
+        run: cargo test -p slates-cli --test shards -- --nocapture
 
   # Part 6 "Conformance" and "Real workloads", example 8 "Hermeticity"; AC-9.7/T-9.1 (GAP-A9-15): the
   # suites the design names — pjdfstest, fsx, fsstress — plus the workload suite and the filesystem-write

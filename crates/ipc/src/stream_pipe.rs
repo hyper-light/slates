@@ -386,6 +386,115 @@ fn gone_or_refused(code: u32, way: Way) -> Result<usize, IpcError> {
   })
 }
 
+/// A program [`spawn_with`] started holding a stream's end, inside a job that ends it when this process ends. This
+/// process's own copy of the end is held here too, and closes when this value goes.
+pub struct HandedChild {
+  process: crate::win_spawn::Process,
+  /// This process's copy of the end, kept while the child runs (see [`spawn_with`] for why).
+  _stream: OwnedHandle,
+  /// The end's handle value in the child, as its arguments named it.
+  handed: u64,
+  /// The kill-on-close job the child is in; held, never used, until this value goes.
+  _job: crate::win_spawn::ClosedOnDrop,
+}
+
+impl std::fmt::Debug for HandedChild {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("HandedChild")
+      .field("id", &self.process.id())
+      .field("handed", &self.handed)
+      .finish()
+  }
+}
+
+impl HandedChild {
+  /// The child's process id.
+  pub fn id(&self) -> u32 {
+    self.process.id()
+  }
+
+  /// The end's handle value in the child: what replaced the placeholder in its arguments.
+  pub fn handed(&self) -> u64 {
+    self.handed
+  }
+
+  /// Waits for the child to end: its exit code, as Windows reports it (a `u32` read back as the `i32` with the same
+  /// bits, which `std::process::exit` hands on unchanged).
+  pub fn wait(&mut self) -> Result<i32, IpcError> {
+    self.process.wait().map(|code| code.unwrap_or(0))
+  }
+}
+
+/// Starts `program` with `args`, handing it `stream` (§4.6, A-179): what `slates shards` does on Windows, where no
+/// process replaces itself as `crate::stream::exec_with` does on Unix, so a Shards spawner, or a test, gets its stream
+/// end without linking slates.
+///
+/// Exactly one copy of the end reaches the program. An inheritable duplicate of it is made for this spawn alone, the
+/// child created with a handle list naming that duplicate and its standard three (`crate::win_spawn`), and each
+/// occurrence of `placeholder` in `args` replaced by its value, which inheritance keeps; the duplicate is closed here
+/// at once. No other child of this process inherits it: neither the end nor this process's own handles are ever made
+/// inheritable. In the child the handle stays inheritable, as a Unix end at its number is open across exec; Shards'
+/// spawner clears that before it hands the end on.
+///
+/// This process keeps its own copy, `stream`, until the [`HandedChild`] goes: the caller waits for the child and then
+/// lets it go, so the attachment ends when the child exits. It does not end earlier, when a child closes its copy while
+/// still running, as it does on Unix, where the program holds the only copy. The daemon judges a VM's claim of the end
+/// by object identity against a known holder's handle, first the attaching client's (A-179, the Windows DAX window): a
+/// name query, the other way to tell a pipe, hung past 3 s on jupiter, 2026-10-26, on a synchronous pipe handle with a
+/// read pending, so a VM could wedge a shard by naming one. The attaching client's copy must therefore stand until the
+/// VM's first ask, and the child it started is the one whose life bounds that ask. If the child cannot be started, the
+/// end is closed here, with nothing started.
+///
+/// What exec gives on Unix — a supervisor that ends the launched process ends the program — is kept by a job: the child
+/// is created inside a kill-on-close job only this process holds, so however this process ends, its program ends with
+/// it. And this process outlives console control events from then on, so Ctrl-C is the child's to act on before this
+/// process, and with it the job, goes (`crate::win_spawn::outlive_console_events`). The caller waits with
+/// [`HandedChild::wait`] and exits with the child's code.
+///
+/// Refused `Layout` when no argument names the placeholder (the child would hold a handle it is never told of); refused
+/// `OsRefused` when the job, the duplicate or the child cannot be made, the end then closed with nothing started.
+pub fn spawn_with(
+  program: &std::ffi::OsStr,
+  args: &[String],
+  stream: OwnedHandle,
+  placeholder: &str,
+) -> Result<HandedChild, IpcError> {
+  use crate::win_spawn::{Spawn, StandardOutput, duplicate_inheritable, kill_on_close_job, spawn};
+  if !args.iter().any(|argument| argument.contains(placeholder)) {
+    return Err(IpcError::Layout {
+      reason: "a handed stream end is named in the program's arguments",
+    });
+  }
+  let job = kill_on_close_job()?;
+  let inherited = duplicate_inheritable(stream.as_raw_handle())?;
+  let handed = u64::try_from(inherited.0.expose_provenance()).map_err(|_| IpcError::Layout {
+    reason: "a handle value wider than 64 bits",
+  })?;
+  let value = handed.to_string();
+  let args: Vec<std::ffi::OsString> = args
+    .iter()
+    .map(|argument| std::ffi::OsString::from(argument.replace(placeholder, &value)))
+    .collect();
+  let spawned = spawn(&Spawn {
+    program,
+    args: &args,
+    environment: None,
+    inherited: &[inherited.0],
+    output: StandardOutput::Inherited,
+    job: Some(job.0),
+  });
+  drop(inherited);
+  let process = spawned?;
+  let child = HandedChild {
+    process,
+    _stream: stream,
+    handed,
+    _job: job,
+  };
+  crate::win_spawn::outlive_console_events()?;
+  Ok(child)
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;

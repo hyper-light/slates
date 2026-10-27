@@ -65,6 +65,9 @@ pub mod stream;
 #[path = "stream_pipe.rs"]
 pub mod stream;
 pub mod wake;
+// Starting a child that inherits exactly the handles named for it (the delivery's read end, a Shards stream's end).
+#[cfg(windows)]
+mod win_spawn;
 
 pub use delivery::{Capability, Delivered, Delivery, DeliveryFault};
 pub use endpoint::{ClientEnd, DaemonEnd, Reply, Request};
