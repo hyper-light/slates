@@ -11942,9 +11942,25 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     `cmd /C mklink /J` reads the forward-slash `CARGO_TARGET_TMPDIR` (`C:/Users/...`) as a switch, "Invalid switch -
     "Users"", with this change and without it. CI's runner has not reported it; the fixture should pass the paths with
     backslashes.
-  **Owed:** Shards'
-  device on Windows (step 6, the Shards side), a real guest over it (needs WHP and an AppContainer per VM; GitHub's
-  runners), and arm64 Windows.
+  **Owed then, since done:** Shards' device and window on Windows and a real guest over them (below); still owed:
+  arm64 Windows.
+- **A WHP guest maps a slates file with DAX over the daemon's stream (G-shards-windows steps 3, 6 and 7, 2026-10-27,
+  closed).**
+  - **The pieces, on Shards' `gpu`, merged by its owner:**
+    - its virtio-fs device over the named pipe (3b1e52a4, e4fbf13c);
+    - its WHP DAX window (bc032060): a view of slates' section placed into a placeholder per range, each range mapped
+      at stage 2 once and left standing (Shards' M341);
+    - `slates_fs`'s tests on Windows (648e0de2, 54b62886, cdc692bc), run by `slates-fs.yml` on GitHub's windows-2025
+      against slates f71282e1.
+  - **The guest mounts, reads and writes a volume:** 3 of 3, run 40455011746.
+  - **The guest maps a file with DAX:** 3 of 3 in each of runs 40503725694, 40505101140 and 40521211082. In each it maps `big` through
+    its window, stores and fsyncs (slates' first read held the store 51 to 95 ms after the guest's word), sees another
+    attachment's change in its same map, and reads zeros past the end of a cut. slates zeroes what a cut takes, and the
+    guest's view is that very section.
+  - **Red-checked:** with the window off the guest finds no DAX and fails its map check (`SHARDS-TEST FAIL /mnt/big is
+    not DAX`), run 40521211082; it is now a test of Shards' own, run on every push that touches the route.
+  - **Still owed:** arm64 Windows (no arm64 Windows runner has run a Shards guest), and the DAX test against a slates
+    commit past f71282e1 (the workflow pins its slates commit).
   - **Open, measured: the first confined section a Windows process makes costs 592 to 837 µs** (jupiter, release, 3
     runs; each later one 4 to 16 µs at p50). It is the SDDL's conversion
     (`ConvertStringSecurityDescriptorToSecurityDescriptorW`), and it is paid on the shard that makes the first

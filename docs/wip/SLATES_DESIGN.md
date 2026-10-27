@@ -3632,6 +3632,17 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 > added as a holder; the command exits with its program's code; the attachment ends as soon as the program closes its
 > handle while the command still runs; a killed command takes its program and the attachment along.
 
+> **Status (2026-10-27, G-shards-windows: a WHP guest maps with DAX).** A Shards microVM on Windows maps a slates file
+> with DAX over the daemon's stream. On GitHub's windows-2025, against slates f71282e1 and Shards' `gpu`, the guest of
+> `slates shards ID -- shards run ... --slates-fs-handle {handle} --share-window 64`:
+> - maps `big` through its WHP window, whose ranges are views of the sections A-180 answers with;
+> - stores through the map and fsyncs, and slates' read holds the store;
+> - sees another attachment's change in its same map;
+> - reads zeros past the end of a cut.
+>
+> It passed 3 of 3 in each of runs 40503725694, 40505101140 and 40521211082. With the window off the same guest finds no DAX (run
+> 40521211082). GAPS records the pieces and what stays owed (arm64 Windows).
+
 **Writeback and snapshot barrier.** Kernel/guest cache negotiation changes when writes reach
 the owner. `snapshot`, `submit`, `advance`, clean `detach`, migration and archive must identify
 the set of contributing writable attachments, stop admission into the closing generation,
