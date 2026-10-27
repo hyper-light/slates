@@ -650,7 +650,8 @@ jobs:
   # the daemon, the client, the NFS export and `slates shards`, none of which had ever run on arm64
   # Windows: they pull `aws-lc-sys`, whose builder refuses aarch64-pc-windows-msvc without clang-cl, so
   # the lane points the target's C compiler at the image's clang-cl first. That is how `cargo xwin` lints
-  # them for this target, and they linted clean that way on 2026-10-26, every target of each. The SDKs
+  # them for this target, and they linted clean that way on 2026-10-26, every target of each. Since 2026-10-27 it
+  # also installs WinFsp and runs its mount tests (the arm64 mount-route cell of the DAX matrix). The SDKs
   # are still left out. On main and the nightly only, as `windows-nightly` is, so a first run
   # that finds something real does not block every pull request.
   #
@@ -715,9 +716,9 @@ jobs:
         run: >-
           cargo clippy -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-anchor
           -p slates-bridge-winfsp -p slates-mcp --all-targets -- -D warnings
-      - name: Clippy the shipped binary and its Shards test natively on arm64 Windows
+      - name: Clippy the shipped binary and its Shards and WinFsp tests natively on arm64 Windows
         if: ${{ !cancelled() }}
-        run: cargo clippy -p slates-cli --bin slates --test shards -- -D warnings
+        run: cargo clippy -p slates-cli --bin slates --test shards --test winfsp -- -D warnings
       # The daemon on a weak memory model: an in-process daemon found through the rendezvous, its verbs over the rings,
       # the async driver; one test at a time, as on x86_64 (each daemon is sized from the whole machine).
       - name: Test the client binary and the async driver, one test at a time (native arm64 Windows)
@@ -738,6 +739,23 @@ jobs:
         env:
           SLATES_TEST_CLI: "1"
         run: cargo test -p slates-cli --test shards -- --nocapture
+      # The WinFsp mount on arm64 (the DAX matrix's bare-metal Windows arm64 mount-route cell, docs/wip/virtiofs.md §8):
+      # WinFsp's package carries its arm64 driver and library (`winfsp-a64.sys`, `winfsp-a64.dll`, which the bridge
+      # loads by name on this target), and the same tests as the x86_64 lanes run: a cached read follows another path's
+      # change, and a mapped view's outcome is asserted as measured (A-177). First run on this image in diagnostics run
+      # 40570394717 (2026-10-27): the cached read followed in 20.9 ms, the mapped view stayed stale for 10 s.
+      - name: Install WinFsp (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        run: |
+          choco install winfsp -y --no-progress
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: The WinFsp mount through the CLI (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        env:
+          SLATES_TEST_CLI: "1"
+          WINFSP_TEST_MOUNT: "1"
+        run: cargo test -p slates-cli --test winfsp -- --test-threads=1 --nocapture
 
   # Linux arm64, run natively (G-arm64-host): the same-kernel direct map, the FUSE mount's maps and the containers that
   # map through either, on GitHub's `ubuntu-24.04-arm` image, free for a public repository as `windows-11-arm` is. The
@@ -1110,6 +1128,13 @@ jobs:
         run: sudo modprobe tls && sudo modprobe nfs && sudo modprobe nfsv4
       - name: The export leg (kubelet's nfs PersistentVolume over RPC-with-TLS)
         run: cargo xtask kind export --require-kernel-tls
+      # The DAX matrix's Kubernetes socket-route cell (docs/wip/virtiofs.md §8; `xtask/src/kind_direct.rs`): a process in
+      # an ephemeral container of the daemon's pod maps a 4 MiB file by the direct map, with no copy, on a cluster of its
+      # own. Its first run found a daemon refusing every client it cannot see by pid
+      # (docs/bugs/2026-10-27-a-peer-whose-process-the-daemon-cannot-see-was-refused-by-undefined-behaviour.md).
+      - name: The direct leg (a pod's process maps a file by the direct map)
+        if: success() || failure()
+        run: cargo xtask kind direct
       - name: The lane, end to end (the cluster is deleted at the end whatever happens)
         if: success() || failure()
         run: cargo xtask kind all

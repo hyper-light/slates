@@ -751,14 +751,17 @@ its requests in its own inbox, since Windows keeps no receive low-water mark. Ow
 - **A real Linux kernel client** mounting a Windows export: Docker Desktop's machine through `host.docker.internal`, or
   WSL2.
 - **The owner a Windows export presents:** a provisioned root's group is 0 there (`verbs::creator_gid`).
-- **The arm64 Windows lane** builds no server, so the export is unrun there.
+- **The arm64 Windows lane** builds no server, so the export is unrun there. **Closed 2026-10-27:** the lane builds
+  the daemon and runs the NFS server's hostile suite and the RPC-with-TLS export, 17 of 17 and 8 of 8 (run
+  40525669353, `windows-11-arm`).
 
 The rest of the list:
 - `slates exec` on macOS and Windows;
 - `slates oci-runtime`/`oci-check` on Windows;
 - the anchor's restart from its own image on macOS (A-145);
-- a run for every built-but-unrun cell, the Windows arm64 lane's daemon, CLI (its lane builds no `slates-cli`) and SDK
-  tests first.
+- a run for every built-but-unrun cell, the Windows arm64 lane's SDK tests first. Its daemon and CLI run since
+  2026-10-26: the client binary 20 of 20 and the async driver 2 of 2, the Shards form 11 of 11, `slates shards` through
+  the CLI 1 of 1 (run 40525669353), and since 2026-10-27 the WinFsp mount 4 of 4 (diagnostics run 40570394717).
 
 `8a-win-dumps` stays Ada's call.
 
@@ -11331,7 +11334,9 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   - **Red-checked** in a scratch copy on jupiter: a section under the default descriptor was refused unconfined at the
     hand-off (the read came by copy); with the judge bypassed too, the hostile test's duplicate that writes was granted.
   - **Open:**
-    - arm64 Windows: its CI lane measures the escalation but runs no daemon yet (G-arm64-host);
+    - arm64 Windows: its CI lane measures the escalation but runs no daemon yet (G-arm64-host). **Closed 2026-10-27:**
+      the lane runs the client binary, 20 of 20 (run 40525669353), and the red-checks ran on its image (the DAX
+      matrix's entry below);
     - replies stall on Windows when many daemons run at once in one process: on jupiter (32 cores) the client binary's
       13 tests that restart nothing, run at the default 32 test threads, ended 6 `Stalled { after_ns: 1000000000 }` (a
       reply past its 1 s deadline), and at 4 threads all 14 passed. **Corrected 2026-10-25:** this entry first said
@@ -11656,6 +11661,12 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       2026-10-25; the entry below);
     - bare-metal Windows x86_64 by the socket route: a read-only section handle duplicated into the client (A-175,
       2026-10-25; the entry below);
+    - bare-metal Windows arm64 by the socket route (2026-10-27): the client binary's direct-map tests, 20 of 20, in CI's
+      `windows-arm64` lane on `windows-11-arm` (run 40525669353). Red-checked on the same image from a diagnostics
+      branch: with every map read by copy, 9 of 20 fail their zero-copy assertions (run 40570140348); a section under
+      the default descriptor is refused by the hand-off's own judge, so every map falls back to a copy and the same 9
+      fail (same run); with that judge passed too, only the hostile holder's test fails, its duplicate that writes
+      granted (`Ok(())`, not `Err(5)`; run 40572762430);
     - crosvm on Linux x86_64 by both routes: over a slates mount, and over slates' own device (G-vhost, 2026-10-25:
       `crates/cli/tests/guest_vhost.rs`, the entries below);
     - a Shards guest on macOS arm64 by the socket route;
@@ -11677,7 +11688,16 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     - bare-metal Windows by the mount route, measured (G-mount step 2, A-177): a mapped view through the WinFsp mount
       keeps its pages after another path's change, because WinFsp's notification purges with `CcPurgeCacheSection`,
       which "will not purge mapped files" (research f8, f9, f10). CI's Windows runner, run 40252840969: the view held its first
-      byte for 10 s while a cached read through a handle, on a file nobody mapped, followed in 20.7 ms;
+      byte for 10 s while a cached read through a handle, on a file nobody mapped, followed in 20.7 ms. The same on
+      arm64 (2026-10-27, `windows-11-arm`, WinFsp 2.1.25156's arm64 driver, diagnostics run 40570394717): the cached
+      read followed in 20.9 ms, the view held its first byte for 10 s; red-checked with empty notification rounds (the
+      cached read stale for 10 s). CI's `windows-arm64` lane runs the tests since;
+    - Shards on Windows by the mount route: a Shards window over a host mount maps the host file's view, and on
+      Windows the host mount is WinFsp's, whose mapped views keep their pages (the entry above, both architectures);
+      Shards also shares no host folder there, having no share server on Windows (D38);
+    - Shards on Windows arm64 by either route: none, the environment does not exist: Shards builds a hypervisor
+      backend for Windows x86_64 only (`crates/vmm/build.rs` on its `gpu` 930a1158), and GitHub's `windows-11-arm`
+      has the Windows Hypervisor Platform disabled, Hyper-V enabled (diagnostics run 40570705949, 2026-10-27);
     - Windows process-isolated containers by the mount route, measured (G-mount step 4, 2026-10-26): on CI's Windows
       runner (Windows Server 2025, Docker 29.7.2, `nanoserver:ltsc2025`), run 40257213499, Docker's engine refused to
       bind a folder of the WinFsp drive, `invalid mount config for type "bind": bind source path does not exist:
@@ -11693,15 +11713,25 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     - WSL2: 9P (unconfirmed);
     - Firecracker's socket route: it has no fs device.
   - **Owed, each to a kiln goal:**
-    - the direct map on arm64 Windows (macOS proven since 2026-10-25, A-173; Windows x86_64 since 2026-10-25, A-175).
-      **Corrected 2026-10-25:** this entry and the matrix
+    - the direct map on arm64 Windows: proven 2026-10-27 (above). **Corrected 2026-10-25:** this entry and the matrix
       had counted the A-135 direct map on Linux as proven while every run read by copy (its test reported the path
       and did not assert it); A-171 has proven it since, asserting the zero-copy path;
-    - Shards on Windows;
-    - the direct map inside a pod, which would need the host's network namespace to reach the rendezvous, as the Docker
-      container did, and a rendezvous a container with a network namespace of its own can reach;
-    - arm64 Linux pods (KIND on arm64), and an arm64 red-check run of the Linux arm64 cells;
-    - arm64 Linux guests;
+    - Shards on Windows: proven 2026-10-27 by the socket route on x86_64 (G-shards-windows), ruled out by the mount
+      route and on arm64 (above);
+    - Windows process-isolated containers by the socket route (G-direct): a host daemon's handle route meets the
+      container's own object namespace and accounts;
+    - the direct map inside a pod: **proven on arm64 2026-10-27** for a container of the daemon's pod (`cargo xtask kind
+      direct` on Docker Desktop on this Mac, linux/arm64: two ephemeral containers in pod 0, a writer and a mapper,
+      `zero_copy=true whole=true len=4194304`, one hand-off; red-checked with every map read by copy), and run by CI's
+      KIND lane on x86_64 since. Still owed: a pod with a network namespace of its own, which cannot reach the daemon's
+      abstract socket and needs a rendezvous it can reach (a socket file, which Ada authorized for DAX on 2026-10-22 under
+      the encryption rules);
+    - arm64 Linux pods by the mount route: kubelet's NFS mount over RPC-with-TLS needs the kernel's TLS record layer,
+      which Docker Desktop's kernel lacks (6.12.76-linuxkit: no `/sys/module/tls`), so the export leg runs on GitHub's
+      `ubuntu-24.04-arm`. The arm64 red-check of the Linux arm64 bare-metal cells is done (G-arm64-host, the entry above);
+    - arm64 Linux guests: they need an arm64 host with KVM, and CI has none: GitHub's `ubuntu-24.04-arm` boots without
+      hypervisor mode (`kvm [1]: HYP mode not available`, no `/dev/kvm`; diagnostics run 40570705949, 2026-10-27), and
+      Docker Desktop's VM on this kiln's Macs has no `/dev/kvm` either;
     - macOS writable shared maps over NFS.
 - **A READ reply past 64 KiB closed the RPC-with-TLS export (found and fixed 2026-10-25, `3e05c70d`).** rustls caps
   its buffer of sealed records at 64 KiB, and the session's send wrote a reply with `write_all`, so any READ reply past
@@ -11711,6 +11741,28 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   its first touch of a 64 KiB map; the lane's earlier legs had never sent a large READ. Record:
   `docs/bugs/2026-10-25-a-read-reply-past-64-kib-closed-the-tls-export.md`; test `crates/server/tests/nfs_tls.rs`
   `a_reply_larger_than_the_tls_send_buffer_is_sealed_whole`.
+- **A daemon refused every client it cannot see by pid, by undefined behaviour (found and fixed 2026-10-27).** Linux
+  reports a socket peer's pid as the reader's pid namespace sees it, and 0 for a process outside it: a client in a
+  container of a pod beside the daemon's, with no process namespace shared, which is a pod's default. rustix 1.1's
+  `socket_peercred` reads the pid into a non-zero `Pid`, and the invalid value read back as an error through the pid's
+  niche, the uid's low bits taken for an errno: "SO_PEERCRED refused (code Some(4))" for uid 65532. The claim was closed
+  unanswered. Found by the KIND direct leg's first run. Fixed by `crates/ipc/src/peer.rs`, which reads `SO_PEERCRED` as
+  plain integers, at both of its sites (the rendezvous, and the vhost-user seam's check of its front end). Test
+  `crates/ipc/tests/rendezvous.rs` `a_client_whose_process_the_daemon_cannot_see_is_served` (a listener in a user and pid
+  namespace of its own): red at HEAD on adacachy (`refused SO_PEERCRED refused (code Some(-1000))`), green with the fix,
+  the suite 16 of 16. Record: `docs/bugs/2026-10-27-a-peer-whose-process-the-daemon-cannot-see-was-refused-by-undefined-behaviour.md`.
+  **Open, reported:** a claim the rendezvous refuses for another uid, or for a peer it cannot read, is closed without
+  telling the client why. The client reads "the daemon closed the rendezvous before answering the claim"; only the
+  capacity refusal is typed on the wire.
+- **A CLI attachment ends about a second after the `slates attach` that made it (open, seen 2026-10-27).** The reaper
+  removes a dead client's attachments at the liveness cadence (`crates/server/src/reap.rs`, every 1 s), and each `slates`
+  run is a client of its own. So `slates attach`, then `slates write`, then `slates detach`, each a process, races the
+  sweep. The KIND legs' helper (`write_through_slates` in `xtask/src/kind_export.rs`) does exactly that. On this Mac at
+  load 18 its detach answered `NotFound` (the direct leg's red-check run, 2026-10-27), after the write had landed. The
+  direct leg now writes from one client (`crates/cli/examples/pod_direct_probe.rs`, its `write` mode); the export leg's
+  helper still races. A user's `slates attach` at the command line meets the same window. Owed, Ada's call: a CLI
+  attachment that outlives its process until `slates detach` (as the export's own attachment does), or a `slates write`
+  that attaches for itself.
 - **The KIND export leg's cluster deletion fails (open, pre-existing, seen 2026-10-26).** `kind delete cluster --name
   slates-export` exits 1 ("did not receive an exit event") in CI runs 40243755704 and 40253147189, after the leg
   passes: the worker's `hard` NFS mount of the export outlives the export's pod, so the node's container does not

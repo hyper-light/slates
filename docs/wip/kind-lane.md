@@ -100,6 +100,8 @@ cluster is `slates-lane` (created and deleted by the lane; the box's `desktop`/`
 cargo xtask kind all                 # image → up → install → prove → scale → netem → delete cluster
 cargo xtask kind image | smoke | up | install | prove | scale | netem | down | certs --out FILE
 cargo xtask kind succession [--trials N] [--tag TAG] [--cluster NAME]   # a recorded measurement, not in `all`
+cargo xtask kind export [--require-kernel-tls]   # kubelet's NFS mount of the export, on a cluster of its own
+cargo xtask kind direct                          # a pod's process maps a file by the direct map, on a cluster of its own
 ```
 
 `--tag` names the image the lane builds and loads, and since 2026-09-29 the one its installs run: the lane
@@ -385,6 +387,26 @@ joint writes go on, and nothing is refused meanwhile. The fast track would save 
 hop per report, and it would bring its most complex path into a group whose bursts are mostly membership
 changes, which the fast track refuses.
 
+## Piece 8 — the direct leg: the DAX socket route in a pod (built 2026-10-27; run under `direct`)
+
+`cargo xtask kind direct` (`xtask/src/kind_direct.rs`) is the DAX matrix's Kubernetes socket-route cell
+(`docs/wip/virtiofs.md` §8). On a cluster of one control plane and one worker it installs the chart with one replica,
+creates a volume, and runs the lane's probe image twice in pod 0, each time as an ephemeral container (`kubectl debug
+--profile=restricted`): once to write a 4 MiB file, attaching, writing and detaching as one client, and once to map it
+by the direct map. An ephemeral container shares the pod's network namespace, where the daemon's rendezvous, an
+abstract socket, lives. The pod's security context gives it the daemon's uid. Everything else is a workload's own: a
+mount namespace, a root file system, and a pid namespace. The map must be zero-copy and whole, and the daemon must
+count exactly one hand-off, with no fallback and nothing unconfined. The leg needs no kernel feature beyond Linux's own,
+so it runs on Docker Desktop too.
+
+- **Its first run found a bug** (2026-10-27): the daemon refused every client it could not see by pid, because rustix
+  1.1's `socket_peercred` cannot hold the pid 0 that Linux reports for one
+  (`docs/bugs/2026-10-27-a-peer-whose-process-the-daemon-cannot-see-was-refused-by-undefined-behaviour.md`).
+- **The writer is one client.** A write split across `slates attach`, `slates write` and `slates detach`, as the export
+  leg's helper makes it, races the reaper, which ends a dead client's attachments each second (GAPS).
+- **Limit:** a pod in a network namespace of its own cannot reach the daemon's abstract socket at all; that needs a
+  rendezvous it can reach (GAPS, the DAX matrix's entry).
+
 ## The one gap left — a whole-pod restart does not rejoin (open; not the cause first recorded)
 
 When the owner's pod is deleted, the StatefulSet recreates it under the same name at a new IP. The
@@ -430,8 +452,9 @@ is the §4.8 takeover. The in-pod mount read-back is owed with that mount decisi
 `.github/workflows/ci.yml` `kind:` job (push cadence): `azure/setup-helm@v4` (v4.3.0) and
 `helm/kind-action@v1` (v0.33.0) install the tooling — the versions validated here; non-Rust tooling
 admitted for this lane by the charter, as the conformance lane's suites are — then `cargo test -p xtask
---test helm_chart` (the chart gates, also in `gates` on every PR) and `cargo xtask kind all` (the lane,
-deleting its cluster at the end).
+--test helm_chart` (the chart gates, also in `gates` on every PR), the export leg (`cargo xtask kind export
+--require-kernel-tls`), the direct leg (`cargo xtask kind direct`, since 2026-10-27) and `cargo xtask kind all` (the
+lane, deleting its cluster at the end). The two legs run on clusters of their own, each deleted at its end.
 
 ## Integrator notes (§4.8)
 

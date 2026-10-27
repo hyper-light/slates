@@ -28,6 +28,9 @@
 //!   mounts a published volume as an `nfs` PersistentVolume over the daemon's RPC-with-TLS export, through
 //!   the node's `tlshd`, and a second mount reads what the first wrote. Skips loudly on a kernel without TLS,
 //!   or fails there with `--require-kernel-tls` (CI).
+//! - `direct` — the DAX matrix's Kubernetes socket-route leg on its own cluster (`kind_direct.rs`): a process in an
+//!   ephemeral container of the daemon's pod maps a file by the direct map, and must get it whole with no copy. Needs
+//!   no kernel feature beyond Linux's own, so it runs wherever kind does.
 //! - `down` — deletes the cluster. `all` runs every step in order and deletes the cluster at the end,
 //!   also on failure, unless `--keep`.
 //!
@@ -47,6 +50,10 @@ use crate::Failure;
 /// The export leg (AUD-29-75's kernel leg), a child module so it reuses the lane's machinery.
 #[path = "kind_export.rs"]
 mod export;
+
+/// The direct leg (the DAX matrix's Kubernetes socket-route cells), a child module for the same reason.
+#[path = "kind_direct.rs"]
+mod direct;
 
 /// Shape: the image tag the lane builds and loads when none is given.
 const DEFAULT_TAG: &str = "slates:lane";
@@ -176,6 +183,7 @@ pub(crate) enum Step {
   Succession,
   Burst,
   Export,
+  Direct,
   Down,
   All,
 }
@@ -260,11 +268,12 @@ pub(crate) fn parse(args: &[String]) -> Result<Options, Failure> {
     Some("succession") => Step::Succession,
     Some("burst") => Step::Burst,
     Some("export") => Step::Export,
+    Some("direct") => Step::Direct,
     Some("down") => Step::Down,
     Some("all") => Step::All,
     other => {
       return Err(Failure(format!(
-        "kind: unknown step {other:?}; steps: image, smoke, certs, up, install, prove, scale, netem, succession, burst, export, down, all"
+        "kind: unknown step {other:?}; steps: image, smoke, certs, up, install, prove, scale, netem, succession, burst, export, direct, down, all"
       )));
     }
   };
@@ -334,6 +343,7 @@ pub(crate) fn run(root: &Path, options: &Options) -> Result<(), Failure> {
     }
     Step::Down => down(&options.cluster),
     Step::Export => export::run(root, options),
+    Step::Direct => direct::run(root, options),
     _ => {
       let lane = Lane::new(root, options)?;
       lane.step(options.step)
@@ -1208,7 +1218,7 @@ impl Lane {
       Step::Succession => self.succession(self.trials),
       Step::Burst => self.burst(self.trials),
       Step::All => self.all(),
-      Step::Image | Step::Smoke | Step::Certs | Step::Export | Step::Down => Ok(()),
+      Step::Image | Step::Smoke | Step::Certs | Step::Export | Step::Direct | Step::Down => Ok(()),
     }
   }
 

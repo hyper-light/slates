@@ -610,9 +610,9 @@ impl VhostUserSeam {
   /// device of `config`'s queues. The consumer is the peer's uid, read now, before any message.
   pub fn adopt(socket: OwnedFd, config: &DeviceConfig) -> Result<VhostUserSeam, VhostError> {
     let credentials =
-      rustix::net::sockopt::socket_peercred(&socket).map_err(|_| VhostError::PeerUnverified)?;
+      slates_ipc::peer::peer_credentials(socket.as_fd()).map_err(|_| VhostError::PeerUnverified)?;
     let consumer = Principal::Uid {
-      uid: credentials.uid.as_raw(),
+      uid: credentials.uid,
     };
     VhostUserSeam::adopt_for(socket, config, consumer)
   }

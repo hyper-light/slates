@@ -1392,6 +1392,7 @@ dependencies = [
  "slates-bridge-core",
  "slates-bridge-fuse",
  "slates-db",
+ "slates-ipc",
  "slates-machine",
  "slates-mem",
  "slates-rt",

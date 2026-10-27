@@ -312,7 +312,13 @@ slates-vfs = 0
 slates-land = 4
 slates-anchor = 6
 slates-db = 0
-slates-ipc = 103
+slates-ipc = 104
+# 2026-10-27 (+1, `peer.rs` compiled only for Linux; docs/bugs/2026-10-27-a-peer-whose-process-the-daemon-cannot-see-was-
+#   refused-by-undefined-behaviour.md): one `getsockopt(SOL_SOCKET, SO_PEERCRED)` into a `libc::ucred` of plain
+#   integers. rustix 1.1's `socket_peercred`, the safe wrapper it replaces at both of its call sites (the rendezvous and
+#   the vhost-user seam), reads the peer's pid into a non-zero `Pid`, and the kernel reports pid 0 for a peer whose
+#   process the reader cannot see: an invalid value, read back as an error through the pid's niche (a KIND pod's
+#   ephemeral container, refused "SO_PEERCRED refused (code Some(4))").
 # 2026-10-26 (+4, §4.6 A-180, Windows' Shards DAX claim, `handle_route.rs` compiled only for Windows): there is no safe
 #   wrapper for another process's handle table. The claimed handle and each known holder's duplicated out of their
 #   processes into this one and owned (`DuplicateHandle`, `from_raw_handle`, 2); the two compared as kernel objects

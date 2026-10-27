@@ -33,6 +33,9 @@ memmap2 = { workspace = true }
 # rustix has no wrapper for it, and its typed `ioctl` cannot express one that *returns* a descriptor without an
 # `unsafe impl Ioctl` of our own — which would be two unsafe sites where libc is one.
 libc = { workspace = true }
+# The vhost-user front end's credentials (`SO_PEERCRED`), read soundly: rustix 1.1's `UCred` cannot hold the pid 0 the
+# kernel reports for a front end whose process this one cannot see (`slates_ipc::peer`).
+slates-ipc = { workspace = true }
 
 [dev-dependencies]
 

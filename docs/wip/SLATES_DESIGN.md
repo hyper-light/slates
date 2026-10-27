@@ -3833,6 +3833,14 @@ for streams. Windows: open `Local\slates-<sid-hash>` section and the per-slot `L
 (DACL to the user's SID); optional named pipe for streams. Discovery: `SLATES_ENDPOINT`, then the
 well-known name.
 
+> **Status (2026-10-27): a peer the daemon cannot see by pid is served.** Linux reports a socket peer's process id as
+> the reader's pid namespace sees it, and 0 for a process outside it: a client in a container of a pod beside the
+> daemon's, with no process namespace shared, which is a pod's default. rustix 1.1's `socket_peercred` cannot hold that
+> 0 (its `Pid` is non-zero), and its reading was undefined behaviour, which turned every such claim into an error and an
+> unanswered close. The check now reads `SO_PEERCRED` as plain integers (`crates/ipc/src/peer.rs`), and the uid is still
+> the only check: a Linux client's liveness rides its control socket, so its pid is never needed there. Found by the KIND
+> lane's direct leg; `docs/bugs/2026-10-27-a-peer-whose-process-the-daemon-cannot-see-was-refused-by-undefined-behaviour.md`.
+
 > **Status (2026-10-25, A-176).** Every in-process anchor hands its daemons the rendezvous it holds, as the field's
 > anchor does across the spawn (`SegmentSource::Handoff`'s `rendezvous`; `Adoption`), so nothing below a daemon's start
 > reads the environment. Windows keeps a kernel object's name while any process holds it, which three defects met,

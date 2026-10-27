@@ -64,7 +64,9 @@ pub struct Accepted {
   pub client_id: u32,
   /// The peer's uid.
   pub uid: u32,
-  /// The peer's process id (the liveness probe's input where no socket closes).
+  /// The peer's process id as the daemon's pid namespace sees it (the liveness probe's input where no socket closes).
+  /// 0 on Linux when the peer's process is not visible from the daemon's namespace (`crate::peer`): its control socket
+  /// still tells its liveness.
   pub pid: u32,
   /// The daemon's mapping of the region.
   pub region: ClientRegion,
@@ -600,7 +602,7 @@ pub mod platform {
 
   use rustix::net::{
     AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
-    SendAncillaryMessage, SendFlags, SocketAddrUnix, SocketFlags, SocketType, sockopt,
+    SendAncillaryMessage, SendFlags, SocketAddrUnix, SocketFlags, SocketType,
   };
   use slates_mem::Handoff;
 
@@ -1103,8 +1105,8 @@ pub mod platform {
       assign: &mut dyn FnMut(u32) -> u32,
       make_region: &mut dyn FnMut(u32) -> Result<Prepared, IpcError>,
     ) -> Result<Accepted, IpcError> {
-      let cred = sockopt::socket_peercred(&peer).map_err(|e| refused("SO_PEERCRED", e))?;
-      let uid = cred.uid.as_raw();
+      let cred = crate::peer::peer_credentials(peer.as_fd())?;
+      let uid = cred.uid;
       if uid != self.uid {
         return Err(IpcError::PeerRefused { uid });
       }
@@ -1183,7 +1185,7 @@ pub mod platform {
       Ok(Accepted {
         client_id,
         uid,
-        pid: u32::try_from(cred.pid.as_raw_nonzero().get()).unwrap_or(0),
+        pid: cred.pid,
         region,
         control: Some(Control {
           socket: peer,

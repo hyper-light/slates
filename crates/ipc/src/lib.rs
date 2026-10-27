@@ -49,6 +49,10 @@ pub mod handle_route;
 #[cfg(target_os = "macos")]
 mod owner_name;
 pub mod park;
+/// A Unix socket peer's credentials on Linux, read soundly (`SO_PEERCRED`; a peer whose process the reader cannot see
+/// has pid 0, which rustix 1.1's `UCred` cannot hold).
+#[cfg(target_os = "linux")]
+pub mod peer;
 pub mod protocol;
 pub mod region;
 pub mod rendezvous;

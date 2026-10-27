@@ -714,3 +714,138 @@ fn rendezvous_second_owner_child() {
   }
   std::process::exit(0);
 }
+
+/// Format: the environment variable that turns this binary into a listener whose pid namespace cannot see its client.
+#[cfg(target_os = "linux")]
+const UNSEEN_LISTENER_ROLE: &str = "SLATES_RENDEZVOUS_UNSEEN_LISTENER";
+/// Format: the tag of the unseen listener's lines, found anywhere in a line (libtest prints `test <name> ... ` first).
+#[cfg(target_os = "linux")]
+const UNSEEN_TAG: &str = "unseen-listener:";
+/// Format: util-linux's `unshare` arguments that give a process a user and a pid namespace of its own, the user's uid
+/// mapped to itself, and run the command as the new namespace's first process.
+#[cfg(target_os = "linux")]
+const UNSEEN_NAMESPACES: [&str; 4] = ["--user", "--map-current-user", "--pid", "--fork"];
+
+/// The re-invoked listener of [`a_client_whose_process_the_daemon_cannot_see_is_served`]: inside a pid namespace of its
+/// own, it listens on the instance the environment names and says so, serves until one claim is accepted or refused
+/// (within [`SERVE_MS`]), and prints what it saw: `accepted uid=U pid=P`, `refused REFUSAL`, or `nothing`. Passes
+/// trivially when not the role.
+#[cfg(target_os = "linux")]
+#[test]
+fn rendezvous_unseen_listener() {
+  let Ok(instance) = std::env::var(UNSEEN_LISTENER_ROLE) else {
+    return;
+  };
+  let mut listener = Listener::open(&instance, None).unwrap();
+  println!("{UNSEEN_TAG} listening");
+  let pid = std::process::id();
+  let started = Instant::now();
+  let mut seen: Option<String> = None;
+  // The accepted client's side, held until this process ends: its region lives while the daemon holds it.
+  let mut kept = Vec::new();
+  while seen.is_none() && started.elapsed() < Duration::from_millis(SERVE_MS) {
+    let mut refused: Option<String> = None;
+    let round = listener.accept_pending(
+      &|_| false,
+      &mut |client_id| {
+        Ok(Prepared {
+          region: ClientRegion::create(
+            &format!("slates-unseen-{pid}-{client_id}"),
+            client_id,
+            0,
+            geometry(),
+          )?,
+          kick_fd: None,
+        })
+      },
+      &mut |refusal| refused = Some(refusal.to_string()),
+    );
+    for accepted in round.accepted {
+      seen = Some(format!(
+        "accepted uid={} pid={}",
+        accepted.uid, accepted.pid
+      ));
+      kept.push(accepted);
+    }
+    if let Some(refusal) = refused {
+      seen = Some(format!("refused {refusal}"));
+    }
+    std::hint::spin_loop();
+  }
+  println!(
+    "{UNSEEN_TAG} {}",
+    seen.unwrap_or_else(|| "nothing".to_owned())
+  );
+  std::process::exit(0);
+}
+
+/// §4.7 "Rendezvous"; `docs/bugs/2026-10-27-a-peer-whose-process-the-daemon-cannot-see-was-refused-by-undefined-behaviour.md`:
+/// a client whose process the daemon cannot see is served. Linux reports a socket peer's process id as the reader's pid
+/// namespace sees it, and 0 for a process outside it: a pod's sidecar or ephemeral container beside the daemon's, with
+/// no process namespace shared, which is a pod's default. Do: re-invoke this binary as a listener inside a user and a pid
+/// namespace of its own (`unshare --user --map-current-user --pid --fork`), so this process, the client, is outside
+/// every pid it can see, and connect to it. Expect: the claim is answered, and the listener saw the client's uid as this
+/// process's and its pid as 0, rather than refusing it. Skips loudly where the host refuses an unprivileged user and pid
+/// namespace.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_client_whose_process_the_daemon_cannot_see_is_served() {
+  use std::io::{BufRead, BufReader};
+  use std::process::Stdio;
+
+  match Command::new("unshare")
+    .args(UNSEEN_NAMESPACES)
+    .arg("true")
+    .output()
+  {
+    Ok(probe) if probe.status.success() => {}
+    other => {
+      eprintln!(
+        "SKIP: this host refuses an unprivileged user and pid namespace (`unshare {}`): {other:?}",
+        UNSEEN_NAMESPACES.join(" ")
+      );
+      return;
+    }
+  }
+  let instance = format!("test-unseen-{}", std::process::id());
+  let mut child = Command::new("unshare")
+    .args(UNSEEN_NAMESPACES)
+    .arg(std::env::current_exe().unwrap())
+    .args([
+      "--exact",
+      "rendezvous_unseen_listener",
+      "--nocapture",
+      "--test-threads=1",
+    ])
+    .env(UNSEEN_LISTENER_ROLE, &instance)
+    .stdout(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let mut lines = BufReader::new(child.stdout.take().unwrap())
+    .lines()
+    .map_while(Result::ok);
+  let listening = format!("{UNSEEN_TAG} listening");
+  assert!(
+    lines.by_ref().any(|line| line.contains(&listening)),
+    "the listener started"
+  );
+  let connected = connect(&instance);
+  let seen = lines.find_map(|line| {
+    line
+      .split_once(UNSEEN_TAG)
+      .map(|(_, rest)| rest.trim().to_owned())
+  });
+  let status = child.wait().unwrap();
+  let uid = rustix::process::getuid().as_raw();
+  assert!(
+    connected.is_ok(),
+    "the claim is answered: {:?} (the listener saw {seen:?})",
+    connected.err()
+  );
+  assert_eq!(
+    seen,
+    Some(format!("accepted uid={uid} pid=0")),
+    "the listener served a client it cannot see by pid, its uid ours"
+  );
+  assert!(status.success(), "the listener ended cleanly: {status:?}");
+}

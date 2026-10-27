@@ -72,7 +72,7 @@ const GROUP_WAIT: Duration = Duration::from_secs(60);
 const PAYLOAD: &str = "written through the kubelet RPC-with-TLS mount of a slates volume";
 /// Shape: the map leg's probe image, built by the lane from `deploy/kind/pod-probe.Dockerfile` (the test-only
 /// `slates-pod-probe` of `crates/guest-probe`, `src/pod.rs`) and loaded into the cluster.
-const MAP_PROBE_TAG: &str = "slates-pod-probe:lane";
+pub(super) const MAP_PROBE_TAG: &str = "slates-pod-probe:lane";
 /// Format: the file the map leg maps, at the volume's root.
 const MAP_FILE: &str = "map.bin";
 /// Shape: the mapped file's length: four 16 KiB pages (arm64's largest common page size; sixteen of x86_64's 4 KiB
@@ -162,7 +162,7 @@ fn kernel_has_tls() -> Result<bool, Failure> {
 }
 
 /// The map leg's probe image, from `deploy/kind/pod-probe.Dockerfile`, built from the repository root.
-fn probe_image(root: &Path) -> Result<(), Failure> {
+pub(super) fn probe_image(root: &Path) -> Result<(), Failure> {
   let dockerfile = root.join("deploy/kind/pod-probe.Dockerfile");
   stream(
     "docker",
