@@ -6,8 +6,11 @@ name: RED-CHECK arm64 Windows direct map (not for main)
 # must fail the tests it targets, and the unchanged tree must pass, in one run.
 #   copy:       `map_read` answers `MapUnavailable` for every request, so every map is read by copy (the zero-copy
 #               assertions must fail).
-#   descriptor: the peer section is made under Windows' default security descriptor rather than `PEER_SECTION_SDDL`
-#               (the hostile holder's duplicate that writes must be granted, so its test must fail).
+#   descriptor: the peer section is made under Windows' default security descriptor rather than `PEER_SECTION_SDDL`.
+#               Run 40570140348: the hand-off's own judge (`handle_route::confined_section`) refused every such
+#               section, so each map fell back to a copy (9 of 20 failed at their zero-copy assertions).
+#   unconfined: the default descriptor and that judge passed, so the unconfined handle reaches the client and the
+#               hostile holder's test must catch the escalation itself.
 
 on:
   push:
@@ -19,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mutant: [green, copy, descriptor]
+        mutant: [unconfined]
     runs-on: windows-11-arm
     steps:
       - uses: actions/checkout@v4
@@ -56,6 +59,14 @@ jobs:
               Mutate "crates/mem/src/dax_object.rs" `
                 "lpSecurityDescriptor: descriptor," `
                 "lpSecurityDescriptor: std::ptr::null_mut(),"
+            }
+            "unconfined" {
+              Mutate "crates/mem/src/dax_object.rs" `
+                "lpSecurityDescriptor: descriptor," `
+                "lpSecurityDescriptor: std::ptr::null_mut(),"
+              Mutate "crates/ipc/src/handle_route.rs" `
+                "if writable || object_bytes != authorized {" `
+                "if false && (writable || object_bytes != authorized) {"
             }
             default { throw "unknown mutant" }
           }
