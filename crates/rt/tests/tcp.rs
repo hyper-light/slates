@@ -546,36 +546,67 @@ fn a_receive_low_water_mark_is_kept_where_the_kernel_keeps_one() {
   );
 }
 
-/// Do (Windows): bind a listener, then bind another socket to its port with `SO_REUSEADDR`, as a process taking its
-/// connections would. Expect the second bind refused `WSAEACCES`: the listener's address is its alone
-/// (`SO_EXCLUSIVEADDRUSE`); without it Windows lets the second socket share the port (Microsoft Learn, "Using
-/// SO_REUSEADDR and SO_EXCLUSIVEADDRUSE").
+/// Format: this test's name, which the re-invoked binary runs as the child.
+const INHERITANCE_TEST: &str = "a_child_started_while_a_listener_is_open_keeps_no_copy_of_it";
+/// Format: the argument making the re-invoked binary the child, which libtest takes as a name filter that matches no
+/// test: the child holds whatever it inherited until its input closes.
+const HOLDER: &str = "role=holder";
+
+/// Do: bind a listener, start a child process while it is open, close the listener, then bind its port again. The
+/// child is this binary re-invoked through the standard library, which on Windows starts every child inheriting each
+/// inheritable handle of this process, and it holds what it inherited until its input closes. Expect the port free at
+/// once: no child keeps a copy of the listener (Windows: `WSA_FLAG_NO_HANDLE_INHERIT`; Unix: close-on-exec), so a
+/// process the daemon starts can neither accept its connections nor keep its port after the daemon closes it.
+#[test]
+fn a_child_started_while_a_listener_is_open_keeps_no_copy_of_it() {
+  if std::env::args().any(|argument| argument == HOLDER) {
+    let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut Vec::new());
+    std::process::exit(0);
+  }
+  let listener = TcpListener::bind(local(0), BACKLOG).unwrap();
+  let port = listener.local_addr().unwrap().port();
+  let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+    .args(["--exact", INHERITANCE_TEST, "--nocapture", HOLDER])
+    .stdin(std::process::Stdio::piped())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .spawn()
+    .unwrap();
+  drop(listener);
+  let rebound = std::net::TcpListener::bind(("127.0.0.1", port));
+  drop(child.stdin.take());
+  let ended = child.wait().unwrap();
+  assert!(
+    rebound.is_ok(),
+    "the port is free once the listener closes, so the child holds no copy: {rebound:?}"
+  );
+  assert!(
+    ended.success(),
+    "the child ended when its input closed: {ended}"
+  );
+}
+
+/// Do (Windows): bind a listener to the wildcard address, then bind another socket, with no option at all, to the same
+/// port on the loopback address, as a local process taking its connections would. Expect the second bind refused
+/// `WSAEACCES`: the port is the listener's on every address (`SO_EXCLUSIVEADDRUSE`). Without it Windows binds the second
+/// socket, the more specific address, and hands it the connections made to that address (Microsoft Learn, "Using
+/// SO_REUSEADDR and SO_EXCLUSIVEADDRUSE"). Measured 2026-10-26 on jupiter (Windows 10.0.26200): beside a default listener
+/// on `0.0.0.0` the plain loopback bind succeeds. A second bind of the very address the listener holds is refused either
+/// way (`WSAEADDRINUSE` plain, `WSAEACCES` with `SO_REUSEADDR`), which is why this test until then, binding both to
+/// loopback, passed without the option too.
 #[cfg(windows)]
 #[test]
 fn no_other_socket_can_bind_a_windows_listeners_port() {
   use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, IPPROTO_TCP, SO_REUSEADDR, SOCK_STREAM, SOCKADDR,
-    SOCKADDR_IN, SOCKET_ERROR, SOL_SOCKET, WSAEACCES, WSAGetLastError, bind, closesocket,
-    setsockopt, socket,
+    AF_INET, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, IPPROTO_TCP, SOCK_STREAM, SOCKADDR, SOCKADDR_IN,
+    SOCKET_ERROR, WSAEACCES, WSAGetLastError, bind, closesocket, socket,
   };
   // The runtime's bind starts Winsock in this process.
-  let listener = TcpListener::bind(local(0), BACKLOG).unwrap();
+  let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0), BACKLOG).unwrap();
   let port = listener.local_addr().unwrap().port();
   // SAFETY: a plain socket creation, checked against INVALID_SOCKET and closed below.
   let other = unsafe { socket(i32::from(AF_INET), SOCK_STREAM, IPPROTO_TCP) };
   assert_ne!(other, INVALID_SOCKET);
-  let on: i32 = 1;
-  // SAFETY: an `int` option set from a live local of its size, on the socket just made.
-  let shared = unsafe {
-    setsockopt(
-      other,
-      SOL_SOCKET,
-      SO_REUSEADDR,
-      (&raw const on).cast::<u8>(),
-      i32::try_from(size_of::<i32>()).unwrap(),
-    )
-  };
-  assert_ne!(shared, SOCKET_ERROR);
   let address = SOCKADDR_IN {
     sin_family: AF_INET,
     sin_port: port.to_be(),
@@ -601,7 +632,7 @@ fn no_other_socket_can_bind_a_windows_listeners_port() {
   assert_eq!(
     (bound, error),
     (SOCKET_ERROR, WSAEACCES),
-    "the port is the listener's alone"
+    "the port is the listener's alone, on every address"
   );
   drop(listener);
 }

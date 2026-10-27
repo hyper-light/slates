@@ -480,18 +480,11 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
 pub(crate) fn mcp(options: &crate::args::McpOptions) -> Result<(), Failure> {
   let client = connect(&options.instance)?;
   match options.http {
-    #[cfg(not(windows))]
     Some(port) => serve_mcp_http(slates_mcp::McpServer::new(client), port, &options.instance),
-    #[cfg(windows)]
-    Some(_) => Err(Failure::Failed(
-      "mcp http: the loopback HTTP edge is served on macOS and Linux; use stdio on Windows"
-        .to_owned(),
-    )),
     None => serve_mcp_stdio(slates_mcp::McpServer::streaming(client)),
   }
 }
 
-#[cfg(not(windows))]
 /// Serves MCP over a loopback Streamable HTTP port (§4.12; AUD-29-23, AUD-29-24) on one slates shard. The
 /// shard's shape and the connections served at once are the daemon's own derivation for one shard of this
 /// machine (`clients_per_shard`: every request goes through the one daemon client, so more connections

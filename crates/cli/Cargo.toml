@@ -30,6 +30,8 @@ slates-client = { workspace = true }
 # The MCP HTTP edge's bearer token comes from the platform's secure random (AUD-29-24).
 slates-transport = { workspace = true }
 slates-mcp = { workspace = true }
+# The MCP HTTP edge runs on a slates shard, whose TCP every platform has (A-182).
+slates-rt = { workspace = true }
 serde_json = { workspace = true }
 slates-vfs = { workspace = true }
 
@@ -39,7 +41,6 @@ libc = { workspace = true }
 slates-bridge-nfs = { workspace = true }
 slates-bridge-oci = { workspace = true }
 rustix = { workspace = true }
-slates-rt = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }

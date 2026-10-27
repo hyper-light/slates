@@ -319,9 +319,10 @@ impl TcpStream {
   /// Whether the connection has left the established state — the peer closed its half (its FIN arrived: close-wait) or
   /// the connection is gone. A reader that peeks and never consumes an unfinished record cannot learn of the peer's close
   /// from a zero-length read, since the unfinished bytes stay queued; it asks this once readability says something
-  /// changed (A-113). This process never half-closes a stream it still reads, so every other state means the peer is
-  /// done. Read from the kernel's own connection record (Linux `TCP_INFO`, macOS `TCP_CONNECTION_INFO`, Windows
-  /// `SIO_TCP_INFO`).
+  /// changed (A-113). Every other state means the peer is done, for a stream this side has not half-closed: its own
+  /// [`TcpStream::close_write`] also takes a stream out of the established state, so this is never asked of one (the MCP
+  /// edge half-closes only to drain a connection it is ending). Read from the kernel's own connection record (Linux
+  /// `TCP_INFO`, macOS `TCP_CONNECTION_INFO`, Windows `SIO_TCP_INFO`).
   pub fn peer_closed(&self) -> Result<bool, RtError> {
     Ok(!netsys::established(&self.socket)?)
   }
@@ -330,6 +331,14 @@ impl TcpStream {
   /// process's copy, and the connection lives while another process (the anchor) holds one.
   pub fn shutdown(&self) -> Result<(), RtError> {
     netsys::shutdown(&self.socket)
+  }
+
+  /// Ends this side's sending and keeps its receiving (a half-close): the peer reads end of stream after every byte
+  /// already written, and this side still reads what the peer sends. A server closes a connection in stages this way
+  /// (RFC 9112 §9.6, "Tear-down"): closed outright with the peer's bytes unread, the connection is reset, and a reset can
+  /// erase the server's last response before the peer reads it, as Windows does.
+  pub fn close_write(&self) -> Result<(), RtError> {
+    netsys::shutdown_write(&self.socket)
   }
 
   /// The stream's descriptor, borrowed: to hand a duplicate to another process by `SCM_RIGHTS`.

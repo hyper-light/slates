@@ -243,6 +243,97 @@ fn an_adopted_socket_receives_and_its_port_is_never_released_in_between() {
   drop(held);
 }
 
+/// Format: this test's name, which the re-invoked binary runs as the child.
+const INHERITANCE_TEST: &str = "a_child_started_while_a_socket_is_open_keeps_no_copy_of_it";
+/// Format: the argument making the re-invoked binary the child, which libtest takes as a name filter that matches no
+/// test: the child holds whatever it inherited until its input closes.
+const HOLDER: &str = "role=holder";
+
+/// AC (§4.10a; docs/wip/platforms.md, A-182's sibling): do bind a socket, start a child process while it is open, close
+/// the socket, then bind its port again. The child is this binary re-invoked through the standard library, which on
+/// Windows starts every child inheriting each inheritable handle of this process, and it holds what it inherited until
+/// its input closes. Expect the port free at once: no child keeps a copy of the socket (Windows:
+/// `WSA_FLAG_NO_HANDLE_INHERIT`; Unix: close-on-exec). Until 2026-10-26 the Windows socket was made by `socket()`,
+/// inheritable, so any process a daemon started held its fleet port after the daemon closed it.
+#[test]
+fn a_child_started_while_a_socket_is_open_keeps_no_copy_of_it() {
+  if std::env::args().any(|argument| argument == HOLDER) {
+    let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut Vec::new());
+    std::process::exit(0);
+  }
+  let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+  let port = socket.local_addr().unwrap().port();
+  let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+    .args(["--exact", INHERITANCE_TEST, "--nocapture", HOLDER])
+    .stdin(std::process::Stdio::piped())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .spawn()
+    .unwrap();
+  drop(socket);
+  let rebound = std::net::UdpSocket::bind(("127.0.0.1", port));
+  drop(child.stdin.take());
+  let ended = child.wait().unwrap();
+  assert!(
+    rebound.is_ok(),
+    "the port is free once the socket closes, so the child holds no copy: {rebound:?}"
+  );
+  assert!(
+    ended.success(),
+    "the child ended when its input closed: {ended}"
+  );
+}
+
+/// AC (§4.10a; docs/wip/platforms.md, A-182's sibling): do (Windows) bind a socket to the wildcard address, then bind
+/// another socket, with no option at all, to the same port on the loopback address, as a local process taking a fleet
+/// node's datagrams would. Expect the second bind refused `WSAEACCES`: the port is the first socket's on every address
+/// (`SO_EXCLUSIVEADDRUSE`). Without it Windows binds the second socket, the more specific address, and hands it the
+/// datagrams sent to that address. Measured 2026-10-26 on jupiter (Windows 10.0.26200), for UDP and TCP alike: beside a
+/// default socket on `0.0.0.0` the plain loopback bind succeeds. A second bind of the very address the first holds is
+/// refused either way (`WSAEADDRINUSE` plain, `WSAEACCES` with `SO_REUSEADDR`), so that case cannot tell the two apart.
+#[cfg(windows)]
+#[test]
+fn no_other_socket_can_bind_a_windows_datagram_sockets_port() {
+  use windows_sys::Win32::Networking::WinSock::{
+    AF_INET, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, IPPROTO_UDP, SOCK_DGRAM, SOCKADDR, SOCKADDR_IN,
+    SOCKET_ERROR, WSAEACCES, WSAGetLastError, bind, closesocket, socket,
+  };
+  // The runtime's bind starts Winsock in this process.
+  let first = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+  let port = first.local_addr().unwrap().port();
+  // SAFETY: a plain socket creation, checked against INVALID_SOCKET and closed below.
+  let other = unsafe { socket(i32::from(AF_INET), SOCK_DGRAM, IPPROTO_UDP) };
+  assert_ne!(other, INVALID_SOCKET);
+  let address = SOCKADDR_IN {
+    sin_family: AF_INET,
+    sin_port: port.to_be(),
+    sin_addr: IN_ADDR {
+      S_un: IN_ADDR_0 {
+        S_addr: u32::from_ne_bytes(Ipv4Addr::LOCALHOST.octets()),
+      },
+    },
+    sin_zero: [0; 8],
+  };
+  // SAFETY: a live SOCKADDR_IN passed with its own length.
+  let bound = unsafe {
+    bind(
+      other,
+      (&raw const address).cast::<SOCKADDR>(),
+      i32::try_from(size_of::<SOCKADDR_IN>()).unwrap(),
+    )
+  };
+  // SAFETY: reads this thread's last Winsock error, before anything else can set it.
+  let error = unsafe { WSAGetLastError() };
+  // SAFETY: the socket made above, closed once.
+  unsafe { closesocket(other) };
+  assert_eq!(
+    (bound, error),
+    (SOCKET_ERROR, WSAEACCES),
+    "the port is the first socket's alone, on every address"
+  );
+  drop(first);
+}
+
 /// AC (§4.10a, typed refusals): adoption takes only a bound datagram socket — a stream socket is refused
 /// by kind, not adopted and left to fail on its first receive.
 #[test]

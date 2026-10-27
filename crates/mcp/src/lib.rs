@@ -35,15 +35,13 @@ use slates_client::{
   VolumeSummary, WorkOp,
 };
 
-// The loopback HTTP edge runs on a slates shard's TCP, which the runtime offers on macOS and Linux (the
-// Windows runtime's sockets are UDP only); Windows serves MCP over stdio.
-#[cfg(not(windows))]
+// The loopback HTTP edge runs on a slates shard's TCP, which the runtime offers on every platform (A-182: on
+// Windows over Winsock and the AFD reactor), so both transports are served everywhere.
 pub mod http;
 
 pub mod query;
 mod skills;
 
-#[cfg(not(windows))]
 pub use http::serve;
 
 /// Shape: the largest MCP message accepted on either transport — an HTTP body or a stdio line — a bound on
@@ -146,30 +144,24 @@ mod code {
   pub(crate) const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
   /// Format: MCP 2026-07-28 `HEADER_MISMATCH`: an HTTP request's MCP headers disagree with its body, or a required
   /// one is missing.
-  #[cfg(not(windows))]
   pub(crate) const HEADER_MISMATCH: i64 = -32020;
 }
 
 /// Format: the radix of a volume id's hex text.
 const HEX_RADIX: u32 = 16;
 
-#[cfg(not(windows))]
 /// Format: the `_meta` key a modern request names its protocol version under, for the HTTP edge's header check.
 pub(crate) const META_PROTOCOL_VERSION_KEY: &str = META_PROTOCOL_VERSION;
-#[cfg(not(windows))]
 /// Format: `UnsupportedProtocolVersion`, answered `400` on HTTP.
 pub(crate) const UNSUPPORTED_PROTOCOL_VERSION_CODE: i64 = code::UNSUPPORTED_PROTOCOL_VERSION;
-#[cfg(not(windows))]
 /// Format: JSON-RPC "method not found", answered `404` on HTTP.
 pub(crate) const METHOD_NOT_FOUND_CODE: i64 = code::METHOD_NOT_FOUND;
 
-#[cfg(not(windows))]
 /// Whether `version` is a revision this server speaks, in either era.
 pub(crate) fn speaks(version: &str) -> bool {
   MODERN_VERSIONS.contains(&version) || LEGACY_VERSIONS.contains(&version)
 }
 
-#[cfg(not(windows))]
 /// The `HeaderMismatch` error (MCP 2026-07-28, `-32020`) for request `id`: its HTTP headers disagree with its body,
 /// or a required one is missing, as `mismatch` says.
 pub(crate) fn header_mismatch_reply(id: &Value, mismatch: &str) -> Value {

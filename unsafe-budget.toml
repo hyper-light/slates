@@ -303,7 +303,10 @@ slates-mem = 61
 #   kernel (1), its `GetLastError` (1), and the `Box::from_raw` of a block the kernel refused at once (1).
 # In `iocp.rs`, the wait's call of `Pipes::complete` (1). `afd.rs`'s `RtlNtStatusToDosError` moved into `dos_error`,
 # which both modules call (0).
-slates-rt = 96
+# 2026-10-26 (-1, A-183): the Windows datagram and stream sockets are made by one `WSASocketW` (`exclusive_socket`),
+# where the datagram socket had its own `socket()` call; the new half-close shares the one `shutdown` call
+# (`shutdown_directions`).
+slates-rt = 95
 slates-base = 10
 slates-vfs = 0
 slates-land = 4

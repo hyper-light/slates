@@ -44,8 +44,8 @@ Each of these blocks several functions below, so it comes first.
 | A mount that outlives a daemon restart | built (the anchor holds the NFS listener; A-113) | built (the anchor holds the FUSE device; A-61) | built, unrun | missing: foundational gap 2 | missing |
 | A daemon restarted from the anchor's own image after an in-place upgrade (A-145) | missing: the anchor refuses the restart, as macOS gives a process no link to its running image (`crates/cli/tests/cli.rs`, `a_daemon_killed_after_its_anchors_executable_is_replaced_restarts_from_the_anchors_own_image`) | built | built, unrun | unjudged: Windows locks a running image against replacement but lets it be renamed | unjudged |
 | The network export (`slates export`, a fleet node's NFS export, Kubernetes PersistentVolumes) | built | built | built (KIND lane is x86_64; arm64 owed) | missing: `ExportListener` is `#[cfg(unix)]` (`crates/server/src/fleet.rs`); the TCP it needs exists since A-182 | missing |
-| MCP server | built (stdio, loopback HTTP) | built | built, unrun | stdio only: the HTTP edge is `#[cfg(not(windows))]` (`crates/mcp/src/lib.rs`); the TCP it needs exists since A-182 | stdio only |
-| Fleet node (consensus, transport over UDP, takeover) | built | built | built, unrun | partly: the daemon's transport runs over AFD UDP, but the anchor holds no serve sockets (gap 2), there is no export, and the datagram socket is inheritable and shareable (made by `socket()`, no `SO_EXCLUSIVEADDRUSE`; A-182's sibling) | partly (same) |
+| MCP server | built (stdio, loopback HTTP) | built | built, unrun | built (A-183): stdio and the loopback HTTP edge, one code path. The MCP test passes through the HTTP edge on jupiter and stops at landing's `Unsupported`; it joins the Windows CI lanes when landing runs there | built, unrun: the arm64 lane lints five crates and runs no daemon |
+| Fleet node (consensus, transport over UDP, takeover) | built | built | built, unrun | partly: the daemon's transport runs over AFD UDP, on a socket no child inherits and no other socket can bind on any address (A-183), but the anchor holds no serve sockets (gap 2) and there is no export | partly (same) |
 | `slates exec` (a program sees a volume at a path) | missing: "needs Linux user and mount namespaces" (`crates/cli/src/main.rs`) | built | built, unrun | missing | missing |
 | Container bind (the OCI attachment) | built (the NFS mount bound in) | built | built (CI's arm64 lane) | missing for Docker Desktop's Linux containers (the export into WSL2 would carry it, once the export is built); impossible for process-isolated containers, measured (G-mount step 4: Docker's engine cannot see a WinFsp drive) | missing (same) |
 | `slates oci-runtime` and `oci-check` (judging the engine and the bind source) | built | built | built, unrun | missing: "facilities this platform does not have" (`crates/cli/src/main.rs`) | missing |
@@ -61,9 +61,9 @@ Each of these blocks several functions below, so it comes first.
 
 ## Order of work
 
-1. **TCP in the Windows runtime** (gap 1): done, A-182. On it next: the MCP HTTP edge on Windows, and the network
-   export on Windows (which also carries Docker Desktop's Linux containers and WSL2); and the Windows datagram socket
-   made non-inheritable and exclusive, as A-182 made the stream socket.
+1. **TCP in the Windows runtime** (gap 1): done, A-182. The MCP HTTP edge on Windows and the Windows datagram socket
+   made non-inheritable and exclusive: done, A-183. On it next: the network export on Windows, which also carries
+   Docker Desktop's Linux containers and WSL2.
 2. **Holding a restarted daemon's sockets and mounts on Windows** (gap 2): the fleet's serve sockets, then a WinFsp
    mount that outlives its daemon.
 3. **The macOS anchor's restart from its own image** (A-145), and crash dumps on Windows once Ada decides

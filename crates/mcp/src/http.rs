@@ -25,6 +25,11 @@
 //! listener keeps serving. Until 2026-10-01 this edge read with unbounded `read_line`s, served one
 //! connection at a time for its whole keep-alive life, and ended the server on any connection's I/O error.
 //!
+//! A refusal ends its connection in stages (RFC 9112 §9.6): the response, a half-close, then the client's remaining
+//! bytes read and dropped within the deadline, so the client reads the refusal rather than a reset. Until 2026-10-26 the
+//! edge closed at once, and on Windows, whose reset discards what the client has not read, a client that sent a body
+//! past the bound never saw its `413`.
+//!
 //! **The caller's authority, before any dispatch (AUD-29-24).** A loopback bind does not identify the
 //! caller: a web page in the user's browser can POST to `127.0.0.1`, and a DNS-rebound host can reach it
 //! by name. So every request must name this edge — `Host` the loopback address and port it listens on
@@ -401,7 +406,7 @@ async fn serve_connection(stream: &TcpStream, shared: Kept<Shared>, edge: &HttpE
     let (head, body) = match request {
       Ok(Some(Ok(Some(request)))) => request,
       Ok(Some(Err(refused))) => {
-        let _ = write_refusal(stream, refused).await;
+        refuse(stream, refused, edge).await;
         return;
       }
       // The peer closed, the deadline passed, the read failed, or the timer could not be armed.
@@ -443,7 +448,7 @@ async fn serve_connection(stream: &TcpStream, shared: Kept<Shared>, edge: &HttpE
         (OK, Some(crate::error(&id, code, &message)))
       }
       None => {
-        let _ = write_refusal(stream, Refused::Unavailable).await;
+        refuse(stream, Refused::Unavailable, edge).await;
         return;
       }
     };
@@ -767,6 +772,36 @@ fn response(status: &str, reply: Option<Value>, keep_alive: bool) -> Vec<u8> {
 }
 
 /// Answers a refusal and closes: the status, and for `401` the challenge naming the scheme.
+/// Answers `refused` and ends the connection in stages (RFC 9112 §9.6, "Tear-down"): the refusal, a half-close of the
+/// edge's side, then what the client still sends read and dropped until it closes its side, a read fails, or the edge's
+/// deadline passes. Ended outright with the client's bytes unread, the connection is reset, and the reset can erase the
+/// refusal before the client reads it (§9.6: "the reset packet might erase the client's unacknowledged input buffers").
+/// On Windows it did, every run: a client that sent a body past the bound read `ConnectionAborted`, never `413`
+/// (2026-10-26). The drain keeps no byte and holds the connection's slot no longer than a request may, the deadline.
+async fn refuse(stream: &TcpStream, refused: Refused, edge: &HttpEdge) {
+  if write_refusal(stream, refused).await.is_err() || stream.close_write().is_err() {
+    return;
+  }
+  // However the drain ends (the client closed, a read failed, the deadline passed, or no timer could be armed), the
+  // connection ends here.
+  let _ = within(edge.deadline_ns, drain(stream)).await;
+}
+
+/// Reads and drops what the peer sends until it closes its side or a read fails, in reads the size a request is read
+/// in.
+async fn drain(stream: &TcpStream) {
+  let mut dropped = [0u8; MAX_LINE_BYTES];
+  while let Ok(read) = stream.read(&mut dropped).await {
+    if read == 0 {
+      break;
+    }
+  }
+}
+
+/// Writes `refused` as a response that closes the connection. Within a served connection the close is staged by
+/// [`refuse`]; a connection past the bound is answered here and closed at once, since the accept loop does not wait on a
+/// connection it does not serve, so a request that is already sent can reset it and erase the `503` (GAPS
+/// `8a-platforms`).
 async fn write_refusal(
   stream: &TcpStream,
   refused: Refused,

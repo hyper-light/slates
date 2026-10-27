@@ -485,6 +485,12 @@ mod imp {
       .map_err(|e| refused("shutdown", e))
   }
 
+  /// Ends this side's sending (`SHUT_WR`) and keeps its receiving: the peer reads end of stream after every byte sent.
+  pub(crate) fn shutdown_write(socket: &Socket) -> Result<(), RtError> {
+    rustix::net::shutdown(&socket.fd, rustix::net::Shutdown::Write)
+      .map_err(|e| refused("shutdown(SHUT_WR)", e))
+  }
+
   /// A listening socket handed over (a supervisor's, across an exec), made non-blocking and close-on-exec.
   pub(crate) fn adopt_listener(fd: OwnedStream) -> Result<Socket, RtError> {
     set_nonblocking_cloexec(&fd)?;
@@ -527,15 +533,15 @@ mod imp {
   use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
   use windows_sys::Win32::Networking::WinSock::{
     AF_INET, FIONBIO, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, IP_DONTFRAGMENT, IPPROTO_IP, IPPROTO_TCP,
-    IPPROTO_UDP, MSG_PEEK, SD_BOTH, SIO_TCP_INFO, SO_ERROR, SO_EXCLUSIVEADDRUSE, SO_RCVBUF,
-    SO_RCVLOWAT, SO_SNDBUF, SO_TYPE, SOCK_DGRAM, SOCK_STREAM, SOCKADDR, SOCKADDR_IN, SOCKET,
-    SOCKET_ERROR, SOL_SOCKET, TCP_INFO_v0, TCP_NODELAY, TCPSTATE_ESTABLISHED,
+    IPPROTO_UDP, MSG_PEEK, SD_BOTH, SD_SEND, SIO_TCP_INFO, SO_ERROR, SO_EXCLUSIVEADDRUSE,
+    SO_RCVBUF, SO_RCVLOWAT, SO_SNDBUF, SO_TYPE, SOCK_DGRAM, SOCK_STREAM, SOCKADDR, SOCKADDR_IN,
+    SOCKET, SOCKET_ERROR, SOL_SOCKET, TCP_INFO_v0, TCP_NODELAY, TCPSTATE_ESTABLISHED,
     WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED, WSABUF, WSADATA, WSAEINTR, WSAEINVAL,
     WSAENOBUFS, WSAESHUTDOWN, WSAEWOULDBLOCK, WSAGetLastError, WSAIoctl, WSASend, WSASocketW,
     WSAStartup, accept as ws_accept, bind as ws_bind, closesocket, connect as ws_connect,
     getsockname, getsockopt, ioctlsocket, listen as ws_listen, recv as ws_recv,
     recvfrom as ws_recvfrom, send as ws_send, sendto as ws_sendto, setsockopt,
-    shutdown as ws_shutdown, socket as ws_socket,
+    shutdown as ws_shutdown,
   };
 
   use super::{Io, Ipv4Addr, SocketAddrV4};
@@ -550,7 +556,7 @@ mod imp {
 
   impl Drop for Socket {
     fn drop(&mut self) {
-      // SAFETY: our socket, created by `socket()`; closed exactly once here.
+      // SAFETY: our socket, made by `WSASocketW`, accepted or adopted; closed exactly once here.
       unsafe { closesocket(self.socket) };
     }
   }
@@ -605,16 +611,47 @@ mod imp {
     }
   }
 
+  /// Creates a non-blocking INET datagram socket that no child process inherits and whose address no other socket may
+  /// share ([`exclusive_socket`]): without `SO_EXCLUSIVEADDRUSE` another process could bind a fleet node's port with
+  /// `SO_REUSEADDR` and take its datagrams, and an inheritable socket outlives the daemon in any child it starts.
+  /// Until 2026-10-26 this was `socket()`, which gives neither.
   pub(crate) fn dgram_socket() -> Result<Socket, RtError> {
+    let socket = exclusive_socket(SOCK_DGRAM, IPPROTO_UDP, "WSASocketW(DGRAM)")?;
+    set_dont_fragment(&socket)?;
+    Ok(socket)
+  }
+
+  /// Creates a non-blocking INET socket of `kind` over `protocol` that no child process inherits
+  /// (`WSA_FLAG_NO_HANDLE_INHERIT`, Unix's close-on-exec, set as the socket is made so no concurrent process start can
+  /// take a copy) and whose address no other socket may share (`SO_EXCLUSIVEADDRUSE`, set before any bind, which is
+  /// when Windows takes it: Microsoft Learn, "Using SO_REUSEADDR and SO_EXCLUSIVEADDRUSE"). `WSA_FLAG_OVERLAPPED` is
+  /// what `socket()` gives every socket; nothing here issues overlapped I/O on it, the AFD reactor polls its base
+  /// handle. `call` names the creation in a refusal.
+  fn exclusive_socket(kind: i32, protocol: i32, call: &'static str) -> Result<Socket, RtError> {
     ensure_started()?;
-    // SAFETY: a plain socket creation; the result is checked against INVALID_SOCKET.
-    let raw = unsafe { ws_socket(AF_INET as i32, SOCK_DGRAM, IPPROTO_UDP) };
+    // SAFETY: a plain socket creation with no protocol record or group; checked against INVALID_SOCKET.
+    let raw = unsafe {
+      WSASocketW(
+        i32::from(AF_INET),
+        kind,
+        protocol,
+        std::ptr::null(),
+        0,
+        WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,
+      )
+    };
     if raw == INVALID_SOCKET {
-      return Err(last("socket(DGRAM)"));
+      return Err(last(call));
     }
     let socket = Socket { socket: raw };
     set_nonblocking(&socket)?;
-    set_dont_fragment(&socket)?;
+    set_int(
+      &socket,
+      SOL_SOCKET,
+      SO_EXCLUSIVEADDRUSE,
+      1,
+      "setsockopt(SO_EXCLUSIVEADDRUSE)",
+    )?;
     Ok(socket)
   }
 
@@ -704,7 +741,9 @@ mod imp {
 
   /// An already-bound OS socket the caller hands over (the socket-activation shape): the port was never
   /// released between the caller's bind and this adoption, so nothing can take it in between. Refused
-  /// unless it is a datagram socket; made non-blocking like one this seam created.
+  /// unless it is a datagram socket; made non-blocking, and taken out of every child's inheritance, like one
+  /// this seam created. Its sharing is its creator's: `SO_EXCLUSIVEADDRUSE` takes effect only before a bind, so a
+  /// supervisor handing a port over sets it on the socket it binds.
   pub(crate) fn adopt(owned: OwnedDatagram) -> Result<Socket, RtError> {
     ensure_started()?;
     let Ok(raw) = SOCKET::try_from(owned.into_raw_socket()) else {
@@ -722,6 +761,7 @@ mod imp {
         code: Some(kind),
       });
     }
+    not_inherited(&socket)?;
     set_nonblocking(&socket)?;
     set_dont_fragment(&socket)?;
     Ok(socket)
@@ -876,37 +916,11 @@ mod imp {
     Ok(socket)
   }
 
-  /// Creates a non-blocking INET stream socket that no child process inherits (`WSA_FLAG_NO_HANDLE_INHERIT`, Unix's
-  /// close-on-exec) and whose address no other socket may share (`SO_EXCLUSIVEADDRUSE`): without it another process
-  /// could bind a listener's port with `SO_REUSEADDR` and take its connections (Microsoft Learn, "Using SO_REUSEADDR
-  /// and SO_EXCLUSIVEADDRUSE"). `WSA_FLAG_OVERLAPPED` is what `socket()` gives every socket; nothing here issues
-  /// overlapped I/O on it, the AFD reactor polls its base handle.
+  /// Creates a non-blocking INET stream socket that no child process inherits and whose address no other socket may
+  /// share ([`exclusive_socket`]): without `SO_EXCLUSIVEADDRUSE` another process could bind a listener's port with
+  /// `SO_REUSEADDR` and take its connections.
   pub(crate) fn stream_socket() -> Result<Socket, RtError> {
-    ensure_started()?;
-    // SAFETY: a plain socket creation with no protocol record or group; checked against INVALID_SOCKET.
-    let raw = unsafe {
-      WSASocketW(
-        i32::from(AF_INET),
-        SOCK_STREAM,
-        IPPROTO_TCP,
-        std::ptr::null(),
-        0,
-        WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,
-      )
-    };
-    if raw == INVALID_SOCKET {
-      return Err(last("WSASocketW(STREAM)"));
-    }
-    let socket = Socket { socket: raw };
-    set_nonblocking(&socket)?;
-    set_int(
-      &socket,
-      SOL_SOCKET,
-      SO_EXCLUSIVEADDRUSE,
-      1,
-      "setsockopt(SO_EXCLUSIVEADDRUSE)",
-    )?;
-    Ok(socket)
+    exclusive_socket(SOCK_STREAM, IPPROTO_TCP, "WSASocketW(STREAM)")
   }
 
   pub(crate) fn listen(socket: &Socket, backlog: i32) -> Result<(), RtError> {
@@ -1148,9 +1162,19 @@ mod imp {
 
   /// Ends both directions of the connection, whoever else holds a copy of the socket.
   pub(crate) fn shutdown(socket: &Socket) -> Result<(), RtError> {
-    // SAFETY: a shutdown of both directions of a socket this value owns.
-    if unsafe { ws_shutdown(socket.socket, SD_BOTH) } == SOCKET_ERROR {
-      return Err(last("shutdown"));
+    shutdown_directions(socket, SD_BOTH, "shutdown")
+  }
+
+  /// Ends this side's sending (`SD_SEND`) and keeps its receiving: the peer reads end of stream after every byte sent.
+  pub(crate) fn shutdown_write(socket: &Socket) -> Result<(), RtError> {
+    shutdown_directions(socket, SD_SEND, "shutdown(SD_SEND)")
+  }
+
+  /// Shuts down the directions `how` names (`SD_BOTH`, `SD_SEND`) of `socket`; `call` names it in a refusal.
+  fn shutdown_directions(socket: &Socket, how: i32, call: &'static str) -> Result<(), RtError> {
+    // SAFETY: a shutdown of a socket this value owns, open for the call.
+    if unsafe { ws_shutdown(socket.socket, how) } == SOCKET_ERROR {
+      return Err(last(call));
     }
     Ok(())
   }
@@ -1233,7 +1257,7 @@ pub(crate) use imp::{OwnedDatagram, OwnedStream, Socket};
 pub(crate) use imp::{
   accept, adopt_listener, adopt_stream, broken_pipe, connect, connected, discard, established,
   into_owned, invalid, listen, make_sends_whole, peek, read, reserve_buffers, set_nodelay,
-  shutdown, stream_socket, want_bytes, would_block, write, write_vectored,
+  shutdown, shutdown_write, stream_socket, want_bytes, would_block, write, write_vectored,
 };
 pub(crate) use imp::{
   adopt, bind, dgram_socket, local_addr, recv_buffer_bytes, recv_from, send_to,

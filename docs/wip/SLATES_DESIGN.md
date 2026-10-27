@@ -1328,6 +1328,13 @@ cluster.
 > by use on the readiness-native driver: `crates/rt/tests/tcp.rs` runs an accept→read→write→read round
 > trip with both ends on the runtime's own sockets, `tests/udp.rs` the datagram path.
 >
+> **Status (2026-10-26, A-183: no Windows socket is inherited or shared).** Both kinds of Windows socket are made by
+> one `WSASocketW` (`netsys::exclusive_socket`) that no child process inherits and whose port no other socket may bind
+> on any address (`SO_EXCLUSIVEADDRUSE`, set before the bind). Until then the datagram socket was made by `socket()`:
+> any process a daemon started kept its fleet port, and a local process could bind the port on loopback and take the
+> datagrams sent there. A stream also half-closes (`TcpStream::close_write`), which the MCP edge's staged close uses.
+> `tests/udp.rs` and `tests/tcp.rs` show a child keeping no copy on every platform, and the bind refused on Windows.
+>
 > **Status (2026-10-26, A-182: TCP on every platform).** `tcp` rides the platform socket seam (`netsys`) as `udp`
 > does: one code path, `rustix` on Unix and Winsock 2 on Windows, where the IOCP driver's AFD reactor gives a
 > listener, a stream and a handshake their readiness. Until then the module was `#[cfg(not(windows))]`, so every TCP
@@ -5602,9 +5609,9 @@ client channel.
 > bound stated (RFC 9112 line and field limits, the message bound, the client's derived deadline, the
 > daemon's derived `clients_per_shard` connections) and authorizes before dispatch: `Host` and `Origin`
 > must name the loopback edge, the target is `/mcp`, the body `application/json`, and a 128-bit bearer
-> token minted at start is required. Stdio lines share the message bound. Owed: servable roots enrolled
-> by a human (§4.13); the HTTP edge on Windows. The runtime has TCP there since A-182 (2026-10-26); the edge's own
-> gate (`crates/mcp/src/lib.rs`) is the next piece (`docs/wip/platforms.md`).
+> token minted at start is required. Stdio lines share the message bound. A refusal ends its connection in stages
+> (RFC 9112 §9.6), so the client reads it rather than a reset. Both transports are served on every platform since
+> A-183 (2026-10-26). Owed: servable roots enrolled by a human (§4.13).
 
 **MCP server.** `slates mcp`: stdio and loopback Streamable HTTP; the 2026-07-28 stateless
 protocol with per-request `_meta`, `server/discover`, `resultType`, `ttlMs`/`cacheScope`,
@@ -12657,6 +12664,74 @@ day, `crates/ipc` (`protocol.rs`: `RequestBody::ShardsHolder`, `ReplyBody::Shard
     read returned once the command died, so the holder exited by itself. The holder now parks for good, so only the
     job can end it, and the mutant fails.
 
+### A-183 — The MCP HTTP edge is served on every platform, a refusal ends its connection in stages, and no Windows socket is inherited or shared (accepted 2026-10-26)
+Applied in the same change to:
+- the design: §4.3 (the sockets' status), §4.12 (the HTTP edge's status), and A-182 (its exclusivity proof, corrected
+  below);
+- the records: `docs/wip/platforms.md` (the MCP and fleet rows, the order of work), GAPS (`8a-platforms`), and a bug
+  record (`docs/bugs/2026-10-26-the-mcp-edges-refusal-was-erased-by-a-reset-on-windows.md`);
+- `crates/mcp`: `lib.rs` (the edge ungated) and `http.rs` (`refuse`, `drain`);
+- `crates/cli`: `verbs.rs` (`slates mcp --http` on Windows) and `Cargo.toml` (`slates-rt` on every platform);
+- `crates/rt`:
+  - `netsys.rs`: `exclusive_socket`, which now makes the datagram socket too; an adopted datagram socket taken out of
+    inheritance; `shutdown_write`;
+  - `tcp.rs`: `TcpStream::close_write`;
+  - `tests/udp.rs` and `tests/tcp.rs`: a test that a child keeps no copy, and the exclusivity tests rebuilt on the
+    case that tells the two apart;
+- `unsafe-budget.toml` (`slates-rt` 96 → 95) and `ci.yml` (`slates-mcp` linted and documented in the Windows lanes).
+
+- **Why.** Ada's rule (2026-10-26): every function on every platform. The HTTP edge stood on A-182's TCP; once that
+  was built, the edge's own `cfg` was the only thing keeping `slates mcp --http` off Windows.
+- **The edge on Windows: one code path.** The gates are gone. The first Windows run of the MCP test found a bug the Unix
+  stacks had hidden:
+  - The edge refused a request on its head (a body past the bound) and closed with the body still arriving.
+  - The close reset the connection, and Windows' reset discarded the `413` the client had not yet read: the client
+    read `ConnectionAborted`.
+  - RFC 9112 §9.6 says any stack may do this. So every refusal inside a served connection now ends it in stages: the
+    refusal, a half-close, the client's remaining bytes read and dropped within the edge's deadline, then the close.
+- **No Windows socket is inherited or shared.**
+  - **Before.** The datagram socket was made by `socket()`, which Winsock makes inheritable. Any process a daemon
+    started kept the fleet port after the daemon closed it: the standard library's spawn inherits every inheritable
+    handle, `unsafe-budget.toml`'s `slates-ipc` note. It also lacked `SO_EXCLUSIVEADDRUSE`.
+  - **Now.** Both kinds are made by one `WSASocketW` with `WSA_FLAG_NO_HANDLE_INHERIT`, and `SO_EXCLUSIVEADDRUSE`
+    set before any bind. An adopted datagram socket has its inheritance cleared, as an adopted stream socket does.
+    Its sharing is its creator's, since the option only takes effect before a bind.
+- **What exclusivity defends, measured.** Jupiter, Windows 10.0.26200, 2026-10-26, one user. Every pair of a first
+  socket (default or exclusive; on `0.0.0.0` or `127.0.0.1`) and a second (plain or `SO_REUSEADDR`; on either
+  address), for UDP and TCP. Both protocols behaved the same:
+  - a second bind of the address the first holds is refused either way: plain `WSAEADDRINUSE`, `SO_REUSEADDR`
+    `WSAEACCES`;
+  - a second bind of the wildcard address beside a first on loopback succeeds either way;
+  - only beside a first socket on the wildcard address does the option tell. There a plain loopback bind of the same
+    port succeeds against a default socket and takes the traffic addressed to loopback; against an exclusive one it is
+    refused `WSAEACCES`.
+- **Corrects A-182.** Its exclusivity test bound both sockets to loopback, so it would have passed without the option.
+  The datagram twin's red-check exposed this: it passed against a mutant without the option. Both tests now bind the
+  first socket to the wildcard address and the second, with no option, to loopback.
+- **Proven** (2026-10-26):
+  - **Windows x86_64 (jupiter):**
+    - `tests/tcp.rs` and `tests/udp.rs` 11 of 11 each.
+    - Red-checked with one mutant made without the inherit flag and without the option: exactly the four new or
+      rebuilt tests fail. Each kind's child test fails `WSAEADDRINUSE`, and each exclusivity test fails because the
+      loopback bind was accepted.
+    - The MCP test runs through the HTTP edge, the `413` now read whole. It stops at landing: `slates.land.materialize`
+      answers `Unsupported` on Windows until the Windows landing lands, which is in progress (G-shards-windows step
+      5's owner).
+    - Before the staged close, the same test failed with `(Err(ConnectionAborted), "")`.
+    - `cargo clippy -D warnings` clean on `slates-rt` and `slates-mcp` (all targets), the `slates-cli` binary, and its
+      two Windows tests.
+  - **macOS arm64:** the MCP test whole (1.75 s); `tests/tcp.rs` 10 of 10 and `tests/udp.rs` 11 of 11. The child test
+    is red-checked there with close-on-exec removed: `EADDRINUSE`.
+  - **Linux x86_64:** `cargo clippy -D warnings` on the three crates; `tests/tcp.rs` 10 of 10 and `tests/udp.rs` 11 of
+    11; the MCP test whole.
+- **Siblings, not done here:**
+  - The accept loop's `503` to a connection past the bound still closes at once, since the loop must not wait. A client
+    that has already sent its request can read a reset there. Staging that close needs a bounded set of shedding
+    tasks (GAPS `8a-platforms`).
+  - Linux could make a socket close-on-exec as it is made (`SOCK_CLOEXEC`), where the seam sets the flag after
+    `socket()`. A process that another thread starts in between inherits the socket. macOS has no such atomic form.
+  - The MCP test joins the Windows CI lanes once landing runs on Windows.
+
 ### A-182 — The runtime's TCP is built on every platform: one code path over the socket seam, Winsock 2 and the AFD reactor on Windows (accepted 2026-10-26)
 Applied in the same change to: §4.3 (the sockets' status), §4.6 (the MCP server's status), `docs/wip/platforms.md`
 (new: every function by platform, with this as gap 1's close), GAPS (`8a-platforms`, new), `crates/rt` (`netsys.rs`,
@@ -12695,8 +12770,8 @@ its stream half on both arms and three refusal helpers; `tcp.rs`, cfg-free over 
   kernel's buffer bound. Windows' AFD took the whole run in one `WSASend` on loopback (`Whole`), so there the test keeps
   the byte-for-byte check and the completion path is covered by the same code's Unix runs.
 - **Siblings found:** the Windows datagram socket is made by `socket()`, which Winsock makes inheritable, and binds
-  without `SO_EXCLUSIVEADDRUSE`, so a local process could share a fleet node's UDP port. It is the next item in
-  `docs/wip/platforms.md`.
+  without `SO_EXCLUSIVEADDRUSE`, so a local process could share a fleet node's UDP port. Closed by A-183, which also
+  found this amendment's exclusivity test vacuous (both sockets on loopback) and rebuilt it.
 
 ### A-178 — macOS refuses a second owner of a live instance's rendezvous: the owner's token is a Mach bootstrap name (accepted 2026-10-26)
 Applied in the same change to: §4.7 (the rendezvous's status), A-176 (its macOS sentences), GAPS, `crates/ipc` (`owner_name.rs`, new; `rendezvous.rs`: the macOS `Owner`, `owner_token_name` and `take_ownership`; `lib.rs`; `tests/rendezvous.rs`: the second-owner test now also macOS's, and a cross-process one on every platform), `unsafe-budget.toml` (`slates-ipc` 70 → 79), `CLAUDE.md`, and a bug record (`docs/bugs/2026-10-26-a-second-owner-took-a-live-macos-instances-rendezvous-over.md`).

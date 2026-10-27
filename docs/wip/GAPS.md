@@ -729,11 +729,29 @@ missing, or impossible with its source, and the order of work. Two gaps underlay
    the NFS listener and the FUSE devices by descriptor inheritance, all Unix-only; on Windows a fleet node's ports are
    free across a restart and a WinFsp mount dies with its daemon.
 
-The rest of the list: the MCP HTTP edge and the network export on Windows; `slates exec` on macOS and Windows;
-`slates oci-runtime`/`oci-check` on Windows; the anchor's restart from its own image on macOS (A-145); the Windows
-datagram socket's inheritance and exclusive address (A-182's sibling); and a run for every built-but-unrun cell, the
-Windows arm64 lane's daemon, CLI (its lane builds no `slates-cli`) and SDK tests first. `8a-win-dumps` stays Ada's
-call.
+**Closed 2026-10-26 by A-183:** the MCP HTTP edge on Windows, and the Windows datagram socket's inheritance and
+exclusive address (A-182's sibling). Its first Windows run found that a refusal closed at once was erased by the reset
+(`docs/bugs/2026-10-26-the-mcp-edges-refusal-was-erased-by-a-reset-on-windows.md`), and its red-check that A-182's
+exclusivity test was vacuous; both are fixed.
+
+Owed from A-183:
+- **The `503` to a connection past the bound** still closes at once: the accept loop must not wait on a connection it
+  does not serve, so a client that has already sent its request can read a reset. Staging it needs a bounded set of
+  shedding tasks.
+- **The MCP test in the Windows CI lanes,** once landing runs on Windows: it passes there through the HTTP edge and
+  stops at `slates.land.materialize`'s `Unsupported`.
+- **Linux sockets close-on-exec as they are made** (`SOCK_CLOEXEC`): the seam sets the flag after `socket()`, so a
+  process that another thread starts in between inherits the socket. macOS has no atomic form.
+
+The rest of the list:
+- the network export on Windows;
+- `slates exec` on macOS and Windows;
+- `slates oci-runtime`/`oci-check` on Windows;
+- the anchor's restart from its own image on macOS (A-145);
+- a run for every built-but-unrun cell, the Windows arm64 lane's daemon, CLI (its lane builds no `slates-cli`) and SDK
+  tests first.
+
+`8a-win-dumps` stays Ada's call.
 
 ### 8a-win-overrun. A Windows shard's park woke before its deadline (2026-10-26, closed 2026-10-26)
 
