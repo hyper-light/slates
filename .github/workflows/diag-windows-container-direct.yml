@@ -1,0 +1,98 @@
+name: DIAG Windows process-isolated container direct map (not for main)
+
+# A diagnostics branch, never merged. The DAX matrix's Windows process-isolated container socket-route cell
+# (docs/wip/virtiofs.md §8) is owed. CI's windows-2025 runner has Docker's engine in Windows-container mode, which no
+# machine in this kiln has. Two legs, each recorded:
+#   A. the daemon and its clients inside one process-isolated container: a probe writes a 4 MiB file as one client,
+#      another maps it by the direct map (the read-only section handle duplicated into its process, A-175);
+#   B. the daemon on the host and the probe in a container: what the container's own object namespace and accounts
+#      leave a host daemon able to reach.
+# The `copy` mutant (`map_read` answering `MapUnavailable`) must make leg A fail its zero-copy check.
+
+on:
+  push:
+    branches: [diag-windows-container-direct]
+
+jobs:
+  container:
+    name: process-isolated container direct map (${{ matrix.mutant }})
+    strategy:
+      fail-fast: false
+      matrix:
+        mutant: [green, copy]
+    runs-on: windows-2025
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: Install NASM
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Apply the mutant
+        shell: pwsh
+        run: |
+          if ("${{ matrix.mutant }}" -eq "copy") {
+            $file = "crates/server/src/direct_map.rs"
+            $text = Get-Content -Raw $file
+            $changed = $text.Replace("if !is_the_daemons_user(principal) || !matches!(at, ReadAt::Head) {", "if true || !is_the_daemons_user(principal) || !matches!(at, ReadAt::Head) {")
+            if ($changed -eq $text) { throw "the mutant did not apply" }
+            Set-Content -NoNewline -Path $file -Value $changed
+          }
+          git diff --stat
+      - name: Build the binary and the probe
+        run: cargo build --release -p slates-cli --bin slates --example pod_direct_probe
+      - name: Stage them for the container
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force C:\slates-bin | Out-Null
+          Copy-Item target\release\slates.exe, target\release\examples\pod_direct_probe.exe, diag\container-direct.cmd C:\slates-bin
+          Get-ChildItem C:\slates-bin | Select-Object Name, Length
+          docker version --format '{{.Server.Version}} {{.Server.Os}}'
+          [System.Environment]::OSVersion.Version
+          docker pull --quiet mcr.microsoft.com/windows/nanoserver:ltsc2025
+      - name: "Leg A: the daemon and its clients inside one process-isolated container"
+        id: leg_a
+        continue-on-error: true
+        timeout-minutes: 15
+        run: docker run --rm --isolation=process -v C:\slates-bin:C:\slates:ro mcr.microsoft.com/windows/nanoserver:ltsc2025 cmd /c C:\slates\container-direct.cmd
+      - name: "Leg B: the daemon on the host, the probe in a container"
+        if: ${{ always() }}
+        continue-on-error: true
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          $bin = "C:\slates-bin"
+          $log = Join-Path $env:RUNNER_TEMP "anchor"
+          $anchor = Start-Process -FilePath "$bin\slates.exe" -ArgumentList "anchor", "--quick", "--shards", "1" -PassThru -NoNewWindow -RedirectStandardOutput "$log.out" -RedirectStandardError "$log.err"
+          $ready = $false
+          foreach ($try in 1..120) {
+            & "$bin\slates.exe" volume list *> $null
+            if ($LASTEXITCODE -eq 0) { $ready = $true; break }
+            Start-Sleep -Milliseconds 500
+          }
+          if (-not $ready) { Get-Content "$log.err"; throw "the host daemon never answered" }
+          & "$bin\slates.exe" bootstrap root
+          $created = & "$bin\slates.exe" volume create direct --bounded 16MiB
+          $volume = ($created | Select-String -Pattern '^id: (\S+)').Matches[0].Groups[1].Value
+          Write-Output "DIAG: host volume $volume"
+          & "$bin\pod_direct_probe.exe" write $volume /direct.bin 4194304 68
+          Write-Output "DIAG: the host's own map (the control):"
+          & "$bin\pod_direct_probe.exe" map $volume /direct.bin 4194304 68
+          Write-Output "DIAG: the container's map of the host daemon's file:"
+          docker run --rm --isolation=process -v C:\slates-bin:C:\slates:ro mcr.microsoft.com/windows/nanoserver:ltsc2025 cmd /v:on /c "whoami & C:\slates\pod_direct_probe.exe map $volume /direct.bin 4194304 68 & echo DIAG: container map exit !errorlevel!"
+          & "$bin\slates.exe" status | Select-String "dax.local_map"
+          Stop-Process -Id $anchor.Id -Force
+      - name: The verdict (leg A)
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          $outcome = "${{ steps.leg_a.outcome }}"
+          Write-Output "DIAG mutant=${{ matrix.mutant }} leg_a=$outcome"
+          if ("${{ matrix.mutant }}" -eq "green") {
+            if ($outcome -ne "success") { exit 1 }
+          } elseif ($outcome -ne "failure") {
+            Write-Output "REDCHECK FAILED: the mutant passed leg A"
+            exit 1
+          }
