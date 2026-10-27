@@ -11718,20 +11718,29 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       and did not assert it); A-171 has proven it since, asserting the zero-copy path;
     - Shards on Windows: proven 2026-10-27 by the socket route on x86_64 (G-shards-windows), ruled out by the mount
       route and on arm64 (above);
-    - Windows process-isolated containers by the socket route (G-direct): a host daemon's handle route meets the
-      container's own object namespace and accounts;
+    - Windows process-isolated containers by the socket route: **proven 2026-10-27 with the daemon in the container**
+      (CI's `windows-2025`, `nanoserver:ltsc2025` as `ContainerUser`: a writer and a mapper beside the daemon,
+      `zero_copy=true whole=true len=4194304`, one hand-off; red-checked with every map read by copy; diagnostics run
+      40582122662). A daemon on the host is out of the container's reach: "the rendezvous object is not there (no daemon
+      has created it)", the server silo's object namespace being its own (same run);
     - the direct map inside a pod: **proven on arm64 2026-10-27** for a container of the daemon's pod (`cargo xtask kind
       direct` on Docker Desktop on this Mac, linux/arm64: two ephemeral containers in pod 0, a writer and a mapper,
-      `zero_copy=true whole=true len=4194304`, one hand-off; red-checked with every map read by copy), and run by CI's
-      KIND lane on x86_64 since. Still owed: a pod with a network namespace of its own, which cannot reach the daemon's
+      `zero_copy=true whole=true len=4194304`, one hand-off; red-checked with every map read by copy), on GitHub's
+      `ubuntu-24.04-arm` (run 40580252064), and on x86_64 by CI's KIND lane (run 40580068439, the same line). Still
+      owed: a pod with a network namespace of its own, which cannot reach the daemon's
       abstract socket and needs a rendezvous it can reach (a socket file, which Ada authorized for DAX on 2026-10-22 under
       the encryption rules);
-    - arm64 Linux pods by the mount route: kubelet's NFS mount over RPC-with-TLS needs the kernel's TLS record layer,
-      which Docker Desktop's kernel lacks (6.12.76-linuxkit: no `/sys/module/tls`), so the export leg runs on GitHub's
-      `ubuntu-24.04-arm`. The arm64 red-check of the Linux arm64 bare-metal cells is done (G-arm64-host, the entry above);
+    - arm64 Linux pods by the mount route: **proven 2026-10-27** on GitHub's `ubuntu-24.04-arm` (the export leg: a
+      pod's read-only map followed another path's change 3.00 s after it; run 40580252064), red-checked with a frozen
+      change attribute (the map kept the old bytes for 120 s; run 40582373759). Docker Desktop's kernel lacks the TLS
+      record layer the leg needs (6.12.76-linuxkit: no `/sys/module/tls`). The arm64 red-check of the Linux arm64
+      bare-metal cells is done (G-arm64-host, the entry above);
     - arm64 Linux guests: they need an arm64 host with KVM, and CI has none: GitHub's `ubuntu-24.04-arm` boots without
       hypervisor mode (`kvm [1]: HYP mode not available`, no `/dev/kvm`; diagnostics run 40570705949, 2026-10-27), and
-      Docker Desktop's VM on this kiln's Macs has no `/dev/kvm` either;
+      Docker Desktop's VM on this kiln's Macs has no `/dev/kvm` either. Apple's Virtualization framework does, with
+      nested virtualization on (M3 and later): a Linux guest boots at EL2 with KVM on this Mac (`arm64-kvm-on-a-mac.md`).
+      **Firecracker's pmem DAX proven there 2026-10-27** (the image test 4 of 4; `virtiofs.md` §8). Shards on Linux
+      arm64 still owed, on the same host;
     - macOS writable shared maps over NFS.
 - **A READ reply past 64 KiB closed the RPC-with-TLS export (found and fixed 2026-10-25, `3e05c70d`).** rustls caps
   its buffer of sealed records at 64 KiB, and the session's send wrote a reply with `write_all`, so any READ reply past
@@ -11754,6 +11763,13 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   **Open, reported:** a claim the rendezvous refuses for another uid, or for a peer it cannot read, is closed without
   telling the client why. The client reads "the daemon closed the rendezvous before answering the claim"; only the
   capacity refusal is typed on the wire.
+- **The Windows binary needs the Visual C++ runtime (open, owed to the release pipeline, seen 2026-10-27).** Built as
+  the workspace builds it, with the C runtime linked dynamically (`x86_64-pc-windows-msvc`'s default; neither
+  `.cargo/config.toml` nor `release.yml` sets `+crt-static` for Windows), `slates.exe` needs `vcruntime140.dll`, which
+  Windows does not ship and Nano Server and Server Core images lack: in a process-isolated `nanoserver:ltsc2025` container
+  it exits `0xC0000135`, `STATUS_DLL_NOT_FOUND`, before any code runs (CI's `windows-2025`, run 40580524733). Built with
+  `-C target-feature=+crt-static` it runs there whole, the daemon included (run 40582122662). Owed: the release's Windows
+  binaries built with the C runtime linked statically, and a by-use test that the published binary starts in Nano Server.
 - **A CLI attachment ends about a second after the `slates attach` that made it (open, seen 2026-10-27).** The reaper
   removes a dead client's attachments at the liveness cadence (`crates/server/src/reap.rs`, every 1 s), and each `slates`
   run is a client of its own. So `slates attach`, then `slates write`, then `slates detach`, each a process, races the

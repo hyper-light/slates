@@ -16,15 +16,18 @@
 //! - `SLATES_GUEST_FIRECRACKER`: a Firecracker binary, v1.17.0 or later (the release binary, its checksum verified
 //!   against the release's `SHA256SUMS`). It runs with `--no-api`, so it opens no socket, and with `--enable-pci`, so
 //!   the guest finds its disk on PCI.
-//! - `SLATES_GUEST_VMLINUX`: an uncompressed guest kernel (ELF, as Firecracker boots on x86_64) with virtio-blk and
-//!   virtio-pci built in, and ext2 (or `CONFIG_EXT4_USE_FOR_EXT2`). A distribution's kernel serves, unpacked from its
-//!   bzImage by the kernel tree's `scripts/extract-vmlinux`.
+//! - `SLATES_GUEST_VMLINUX`: an uncompressed guest kernel (ELF, as Firecracker boots on x86_64; the `Image`, as it boots
+//!   on aarch64) with virtio-pci built in, and virtio-blk and ext2 (or `CONFIG_EXT4_USE_FOR_EXT2`) built in or carried
+//!   as modules (below). A distribution's kernel serves: unpacked from its bzImage by the kernel tree's
+//!   `scripts/extract-vmlinux` on x86_64, and Debian's arm64 `vmlinuz` is the `Image` already.
 //! - `SLATES_GUEST_PROBE`: the guest's `/init`, static (`tests/guest_dax.rs` says how to build it).
 //!
 //! The pmem test also needs `SLATES_GUEST_MODULES`, the guest kernel's module directory (`/lib/modules/<release>` of the
 //! same build as the kernel), read only. A distribution's kernel builds virtio-pmem and the nvdimm drivers behind it as
-//! modules; the test carries the ones `modules.dep` says it needs in the initramfs, and the guest loads them. A module
-//! `modules.builtin` lists is already in the kernel. Without the variable the pmem test skips loudly.
+//! modules, and some build the drive and the file system as modules too (Debian's arm64 kernel builds `virtio_blk` and
+//! `ext4` so). The test carries in the initramfs every module a form needs that `modules.builtin` does not list, with
+//! the ones `modules.dep` says those need in turn, and the guest loads them. Without the variable the pmem test skips
+//! loudly, and the drive's test carries no module, so its kernel must build them in.
 //!
 //! The initramfs and Firecracker's configuration are written into a volume of their own through its mount, so the
 //! test writes nothing to disk but its mount points.
@@ -73,8 +76,13 @@ const PATCH_BYTE: u8 = b'#';
 /// Format: the bytes the guest writes as its new file.
 const NEW_FILE: &[u8] = b"written by the guest kernel";
 /// Format: the modules a pmem guest needs, beside what they need in turn: `virtio_pmem` drives the device and
-/// registers its memory as an nvdimm region; `nd_pmem` makes the region's block device, with DAX, `/dev/pmem0`.
-const PMEM_MODULES: [&str; 2] = ["virtio_pmem", "nd_pmem"];
+/// registers its memory as an nvdimm region; `nd_pmem` makes the region's block device, with DAX, `/dev/pmem0`; `ext4`
+/// mounts it. Each is carried only where `modules.builtin` does not list it.
+const PMEM_MODULES: [&str; 3] = ["virtio_pmem", "nd_pmem", "ext4"];
+/// Format: the modules a drive's guest needs, beside what they need in turn: `virtio_blk` drives the disk, `/dev/vda`;
+/// `ext4` mounts its ext2 (`CONFIG_EXT4_USE_FOR_EXT2`, as Debian and CachyOS build it). Each is carried only where
+/// `modules.builtin` does not list it.
+const DRIVE_MODULES: [&str; 2] = ["virtio_blk", "ext4"];
 /// Shape: how long one e2fsck run may take before the test gives up on it, as `crates/image/tests/e2fsck.rs` bounds
 /// it: a check of this image takes well under a second, and e2fsck 1.47.4 can deadlock on an image it would fix.
 const FSCK_WAIT_SECONDS: &str = "120";
@@ -295,8 +303,8 @@ fn the_other_changes(guest: &mut Guest) {
 /// How Firecracker presents the image to its guest.
 enum Disk {
   /// A writable virtio-blk drive, its flushes written through to the file (`cache_type: Writeback`, so a guest's sync
-  /// reaches the volume), mounted as ext2 (A-160).
-  Drive,
+  /// reaches the volume), mounted as ext2 (A-160) once the guest has loaded `modules`, in their order.
+  Drive { modules: Vec<Module> },
   /// A writable virtio-pmem device, which Firecracker maps shared (its flushes an `msync`), mounted as ext4 with DAX
   /// once the guest has loaded `modules`, in their order (A-165).
   Pmem { modules: Vec<Module> },
@@ -307,7 +315,7 @@ impl Disk {
   /// none (v1.17.0 refuses one without: "missing field `drives`").
   fn device(&self, image: &str) -> String {
     match self {
-      Disk::Drive => format!(
+      Disk::Drive { .. } => format!(
         r#""drives": [
     {{
       "drive_id": "image",
@@ -335,24 +343,27 @@ impl Disk {
   /// What the guest's command line tells its probe to load and mount.
   fn guest_options(&self) -> String {
     match self {
-      Disk::Drive => "slates.block=/dev/vda".to_owned(),
-      Disk::Pmem { modules } => {
-        let names: Vec<&str> = modules.iter().map(|module| module.name.as_str()).collect();
-        format!(
-          "slates.block=/dev/pmem0 slates.fs=ext4 slates.dax=always slates.modules={}",
-          names.join(",")
-        )
-      }
+      Disk::Drive { modules } if modules.is_empty() => "slates.block=/dev/vda".to_owned(),
+      Disk::Drive { modules } => format!("slates.block=/dev/vda slates.modules={}", names(modules)),
+      Disk::Pmem { modules } => format!(
+        "slates.block=/dev/pmem0 slates.fs=ext4 slates.dax=always slates.modules={}",
+        names(modules)
+      ),
     }
   }
 
   /// The modules the guest's initramfs carries.
   fn modules(&self) -> &[Module] {
     match self {
-      Disk::Drive => &[],
-      Disk::Pmem { modules } => modules,
+      Disk::Drive { modules } | Disk::Pmem { modules } => modules,
     }
   }
+}
+
+/// The probe's list of `modules`, by file name, in their order.
+fn names(modules: &[Module]) -> String {
+  let names: Vec<&str> = modules.iter().map(|module| module.name.as_str()).collect();
+  names.join(",")
 }
 
 /// Firecracker's configuration: the kernel, the initramfs, the image as `disk` presents it, and a small machine. The
@@ -385,14 +396,18 @@ fn module_name(path: &str) -> String {
   file.split('.').next().unwrap_or(file).replace('-', "_")
 }
 
-/// Places the module at `path` after every module it needs, depth first: `needs` maps each module's path to the paths
-/// of the modules its `modules.dep` line names. `entered` catches a cycle, which depmod never writes.
-fn place(
-  path: &str,
-  needs: &BTreeMap<String, Vec<String>>,
-  entered: &mut BTreeSet<String>,
-  placed: &mut Vec<String>,
-) {
+/// What a module needs before it loads, by path: `hard`, the modules its `modules.dep` line names, and `soft`, the
+/// modules its `modules.softdep` line names `pre:` (resolved through `modules.alias`), which `modprobe` loads first and
+/// the guest, having no `modprobe`, must be given (Debian's ext4 and jbd2 load `crypto-crc32c` so, without which ext4
+/// refuses to mount: "Cannot load crc32c driver", measured on arm64, 2026-10-27).
+struct Needs {
+  hard: BTreeMap<String, Vec<String>>,
+  soft: BTreeMap<String, Vec<String>>,
+}
+
+/// Places the module at `path` after every module it needs, soft ones first, depth first. `entered` catches a cycle
+/// through hard needs, which depmod never writes; a soft need already entered is left where it is.
+fn place(path: &str, needs: &Needs, entered: &mut BTreeSet<String>, placed: &mut Vec<String>) {
   if placed.iter().any(|done| done == path) {
     return;
   }
@@ -400,7 +415,13 @@ fn place(
     entered.insert(path.to_owned()),
     "modules.dep has a cycle through {path}"
   );
+  for soft in needs.soft.get(path).into_iter().flatten() {
+    if !entered.contains(soft) {
+      place(soft, needs, entered, placed);
+    }
+  }
   for needed in needs
+    .hard
     .get(path)
     .unwrap_or_else(|| panic!("modules.dep has no line for {path}"))
   {
@@ -419,14 +440,14 @@ fn modules_needed(directory: &str, wanted: &[&str]) -> Vec<Module> {
       .unwrap_or_else(|e| panic!("read {directory}/{name}: {e}"))
   };
   let builtin: BTreeSet<String> = read("modules.builtin").lines().map(module_name).collect();
-  let mut needs = BTreeMap::new();
+  let mut hard = BTreeMap::new();
   let mut path_of = BTreeMap::new();
   for line in read("modules.dep").lines() {
     let Some((path, needed)) = line.split_once(':') else {
       continue;
     };
     path_of.insert(module_name(path), path.to_owned());
-    needs.insert(
+    hard.insert(
       path.to_owned(),
       needed
         .split_whitespace()
@@ -434,6 +455,44 @@ fn modules_needed(directory: &str, wanted: &[&str]) -> Vec<Module> {
         .collect::<Vec<_>>(),
     );
   }
+  // `alias NAME MODULE`: the first module an alias names, which is the one `modprobe` tries first.
+  let mut module_of_alias = BTreeMap::new();
+  for line in read("modules.alias").lines() {
+    if let Some(["alias", alias, module]) = line.split_whitespace().collect::<Vec<_>>().get(..3) {
+      module_of_alias
+        .entry((*alias).to_owned())
+        .or_insert_with(|| (*module).replace('-', "_"));
+    }
+  }
+  // `softdep MODULE pre: A B post: C`: A and B, each a module name or an alias, as a carried module's path; a name
+  // the kernel builds in, or that names nothing here, needs nothing carried.
+  let mut soft = BTreeMap::new();
+  for line in read("modules.softdep").lines() {
+    let mut words = line.split_whitespace();
+    let (Some("softdep"), Some(module)) = (words.next(), words.next()) else {
+      continue;
+    };
+    let Some(path) = path_of.get(&module.replace('-', "_")) else {
+      continue;
+    };
+    let pre: Vec<String> = words
+      .skip_while(|word| *word != "pre:")
+      .skip(1)
+      .take_while(|word| !word.ends_with(':'))
+      .filter_map(|name| {
+        // A module's name reads dashes as underscores; an alias is matched as written (`crypto-crc32c`).
+        let as_module = name.replace('-', "_");
+        let module = if path_of.contains_key(&as_module) {
+          Some(as_module)
+        } else {
+          module_of_alias.get(name).cloned()
+        }?;
+        (!builtin.contains(&module)).then(|| path_of.get(&module).cloned())?
+      })
+      .collect();
+    soft.insert(path.clone(), pre);
+  }
+  let needs = Needs { hard, soft };
   let mut entered = BTreeSet::new();
   let mut placed = Vec::new();
   for name in wanted {
@@ -783,7 +842,7 @@ fn a_firecracker_guest_reads_and_writes_a_volume_through_its_image() {
     return;
   };
   let rig = Rig::new(&format!("guest-image-{}", std::process::id()));
-  let mut guest = rig.boot(&gate, &Disk::Drive);
+  let mut guest = rig.boot(&gate, &drive_disk(&gate));
   assert_eq!(
     listed(&mut guest),
     rig.source.listing(),
@@ -801,6 +860,18 @@ fn a_firecracker_guest_reads_and_writes_a_volume_through_its_image() {
   );
   the_guest_ends_the_vm_by_its_restart(&mut guest);
   rig.merged_holds_every_change();
+}
+
+/// The drive, with the modules its guest needs from the module directory the environment names, or none when it names
+/// none (its kernel builds them in).
+fn drive_disk(gate: &Gate) -> Disk {
+  Disk::Drive {
+    modules: gate
+      .modules
+      .as_deref()
+      .map(|directory| modules_needed(directory, &DRIVE_MODULES))
+      .unwrap_or_default(),
+  }
 }
 
 /// The pmem disk, with the modules its guest needs from the module directory the environment names; `None`, after
