@@ -1,0 +1,37 @@
+name: DIAG arm64 KIND legs (not for main)
+
+# A diagnostics branch, never merged. The DAX matrix's Kubernetes rows (docs/wip/virtiofs.md §8) owe Linux arm64 its
+# mount route: kubelet's NFS mount of the export over RPC-with-TLS needs the kernel's TLS record layer, which Docker
+# Desktop's kernel on this kiln's Macs lacks. GitHub's `ubuntu-24.04-arm` runs the same two legs as the x86_64 KIND lane:
+# the export leg (the mount route) and the direct leg (the socket route).
+
+on:
+  push:
+    branches: [diag-arm64-kind]
+
+jobs:
+  kind:
+    name: KIND legs on ubuntu-24.04-arm
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.3.0
+      - uses: helm/kind-action@v1
+        with:
+          version: v0.33.0
+          install_only: true
+      - name: The machine
+        run: uname -a && docker version --format '{{.Server.Version}} {{.Server.Os}}/{{.Server.Arch}}' && kind version
+      - name: The kernel's TLS record layer and NFS client (for the export leg)
+        run: sudo modprobe tls && sudo modprobe nfs && sudo modprobe nfsv4
+      - name: The export leg (kubelet's nfs PersistentVolume over RPC-with-TLS)
+        run: cargo xtask kind export --require-kernel-tls
+      - name: The direct leg (a pod's process maps a file by the direct map)
+        if: success() || failure()
+        run: cargo xtask kind direct
