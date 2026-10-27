@@ -37,12 +37,12 @@ rustls = { workspace = true }
 # Shards fs transport (`crate::shards`; §4.6, A-161), which carries FUSE requests over a stream from a Linux, a macOS
 # or a Windows host (A-179).
 slates-bridge-fuse = { workspace = true }
+# The NFS server (`crate::nfs`): the macOS mount's loopback transport, and on every platform the network export, over
+# the runtime's TCP (A-182).
+slates-bridge-nfs = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
-# The NFS loopback mount server is the macOS/Linux mount path (Windows mounts through WinFsp), and it
-# rides `slates_rt::tcp`, which is Unix-only, so the daemon's NFS transport (`crate::nfs`) is too.
-slates-bridge-nfs = { workspace = true }
 # The virtio-fs guest device (§4.6 A-9): its loop rides the runtime's Unix descriptor readiness, and a
 # Linux guest is hosted from a Linux or macOS host, so the daemon's guest transport (`crate::virtiofs`)
 # is Unix-only too.

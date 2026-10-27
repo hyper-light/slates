@@ -6,7 +6,6 @@
 //! handle with one bit flipped — all with a spinner thread per core running. The volume lives on the shard the
 //! listener is not served on, so every connection moves (`nfs.rs` `migrate`) and the breaks land on that path too.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-#![cfg(unix)]
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -276,10 +275,41 @@ fn break_once(
         &read_args(victim),
         xid.wrapping_add(1),
       ));
-      let _ = rustix::net::sockopt::set_socket_linger(&stream, Some(Duration::ZERO));
+      reset_on_close(&stream);
     }
   }
   None
+}
+
+/// Makes `stream` close with a reset, as a client aborting does: `SO_LINGER` on, with a zero timeout.
+#[cfg(unix)]
+fn reset_on_close(stream: &TcpStream) {
+  let _ = rustix::net::sockopt::set_socket_linger(stream, Some(Duration::ZERO));
+}
+
+/// Makes `stream` close with a reset, as a client aborting does: Winsock's `SO_LINGER` on, with a zero timeout
+/// (Microsoft Learn, "Graceful Shutdown, Linger Options, and Socket Closure").
+#[cfg(windows)]
+fn reset_on_close(stream: &TcpStream) {
+  use std::os::windows::io::AsRawSocket;
+  use windows_sys::Win32::Networking::WinSock::{
+    LINGER, SO_LINGER, SOCKET, SOL_SOCKET, setsockopt,
+  };
+  let socket = SOCKET::try_from(stream.as_raw_socket()).unwrap();
+  let linger = LINGER {
+    l_onoff: 1,
+    l_linger: 0,
+  };
+  // SAFETY: a `LINGER` option set from a live local of its own size, on a socket this stream owns for the call.
+  let _ = unsafe {
+    setsockopt(
+      socket,
+      SOL_SOCKET,
+      SO_LINGER,
+      (&raw const linger).cast::<u8>(),
+      i32::try_from(size_of::<LINGER>()).unwrap(),
+    )
+  };
 }
 
 /// The tasks alive on every shard (spawned and not yet ended).

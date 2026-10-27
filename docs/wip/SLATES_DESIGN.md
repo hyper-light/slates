@@ -2201,6 +2201,19 @@ Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 > `VfsError::NameTooLong` is now checked on lookups too and mapped to each host's code. The run's failures are now
 > exactly the reviewed Linux root list's.
 
+> **Status (2026-10-26, A-184: the NFS server and the network export on Windows).** The NFS server runs on Windows
+> too, one code path over A-182's TCP. That covers the loopback listener `slates export` names, which Docker
+> Desktop's machine reaches through `host.docker.internal` and WSL2 in its mirrored mode through `localhost`, and a
+> fleet node's RPC-with-TLS export. Two pieces differ by platform, each a paired function:
+> - **Framing.** Windows keeps no receive low-water mark. So a connection reads its requests into its own inbox,
+>   bounded as the kernel buffer is on Unix (two records), and consumes each once its reply is sent. Unix peeks them
+>   whole in the kernel's queue (A-113).
+> - **Holding.** No anchor holds a Windows daemon's listener or connections (`docs/wip/platforms.md`, gap 2). Its port
+>   changes at a restart, and its clients reconnect with their file handles.
+>
+> The inode reserve there is the NFS term (A-150). Proven on jupiter: the hostile-client suite 17 of 17, and the
+> RPC-with-TLS suite 8 of 8. Owed: a real Linux kernel client mounting a Windows export.
+
 > **Status (2026-10-01, AUD-29-75: the network export over RPC-with-TLS).** A fleet node whose manifest names an
 > operator authority serves its NFS edge on a second listener: TCP on its base port (the UDP planes keep the
 > same number, so the block stays two wide). It is held by the anchor and handed across a restart as a third
@@ -12663,6 +12676,77 @@ day, `crates/ipc` (`protocol.rs`: `RequestBody::ShardsHolder`, `ReplyBody::Shard
   - The first run of the no-job mutant passed the CLI kill case: the holder then waited on its standard input, and that
     read returned once the command died, so the holder exited by itself. The holder now parks for good, so only the
     job can end it, and the mutant fails.
+
+### A-184 — The NFS server, and with it the network export, runs on Windows: a connection's inbox frames requests where no receive low-water mark exists (accepted 2026-10-26)
+Applied in the same change to:
+- the design: §4.6 (the export's status);
+- the records: `docs/wip/platforms.md` (the export, fleet and container rows), GAPS (`8a-platforms`, and gap 2's
+  owed work);
+- `crates/server`:
+  - `lib.rs`: the NFS modules ungated; `anchor_hold` paired with a Windows arm, `anchor_hold_windows.rs`, new;
+  - `Cargo.toml`: `slates-bridge-nfs` on every platform;
+  - `nfs.rs`: the framing pair `head`, `want`, `consume` and `closed_mid_record`, the Windows `Inbox`, migration
+    carrying it, the thread clock paired;
+  - `config.rs`: the NFSv4 caps on every platform, and `inode_reserve` one function over a paired
+    `guest_listing_entries`;
+  - `state.rs`, `daemon.rs`, `verbs.rs` and `fleet.rs`: the NFS state, the transport's start, the publication's call
+    records and replies, the service times, and the export listener on every platform;
+  - `tests/nfs_hostile.rs` and `tests/nfs_tls.rs`: run on every platform;
+- `crates/rt`: `tcp.rs` (`TcpStream::read_now`);
+- `ci.yml`: both x86_64 Windows lanes run the two suites.
+
+- **Why.** Ada's rule (2026-10-26). The NFS server is the network export on every platform: `slates export`, a fleet
+  node's export, and the way in for Docker Desktop's Linux containers and WSL2. Its gate was the runtime's TCP, built
+  by A-182. Windows' local mount stays WinFsp: this serves other machines and virtual machines, it mounts nothing
+  here.
+- **What Windows refused, and the shape that answers it.** The first Windows run ended 15 of the hostile suite's 17
+  tests at their first call: the client read `WSAECONNABORTED` or `WSAECONNRESET`.
+  - **Cause.** A connection waits for a whole request by setting the receive low-water mark to the record's length
+    (A-113), and Windows' TCP refuses `SO_RCVLOWAT` (A-182). The connection ended rather than spin, as its rule says,
+    at its first `want(1)`.
+  - **No equivalent exists.** Winsock refuses `MSG_WAITALL` with `MSG_PEEK`, and the AFD reactor's readiness is
+    level-triggered. A request cannot wait whole in the kernel there: a connection peeking half a record would wake
+    at once, every time.
+  - **The Windows arm.** A connection reads what is queued into its own inbox, two records long as the kernel buffer
+    is on Unix, and parses whole records there. It consumes each once its reply is sent, and sees a close as the end
+    of stream it is. Once the queue is drained, each wake brings new bytes, so waiting never spins. The inbox moves
+    with the connection to its volume's owner shard, carrying the call that moved it.
+  - **What it gives up.** A-113's survival of a daemon's death: a request read into the inbox dies with its daemon.
+    On Windows so does the connection, since no anchor holds it (gap 2), and the client resends on its next
+    connection. NFSv4.1's call records (A-127) still answer a retry exactly once. Holding Windows connections across a
+    restart must carry the inbox's bytes with the socket.
+- **The inode reserve on Windows.**
+  - **Before.** It was zero: "no transport here hands out an inode number a client keeps across a restart".
+  - **Now.** The export is such a transport, since an NFS client keeps its file handles across a server restart. So
+    the reserve is the NFS term there.
+  - **The guest term** stays zero on Windows: a guest's stream ends with its daemon, since no anchor holds it.
+    `guest_listing_entries` is the paired place where holding it adds the term.
+- **Also on every platform now:** the NFSv4 caps, the publication's NFS call records and held replies (Windows
+  published none before), the NFS service times, and a fleet node's export listener. That listener's adoption from an
+  anchor stays Unix (gap 2).
+- **Measured and left out:** Windows charges a thread's CPU time a scheduler tick at a time (15.6 ms), too coarse to
+  split a call of microseconds. So the off-core share of a local call is not recorded there, rather than recorded as
+  its whole wall time.
+- **Proven** (2026-10-26):
+  - **Windows x86_64 (jupiter):**
+    - `nfs_hostile` 17 of 17. Its honest clients write and read back their own files while breakers send partial
+      records, oversized markers and garbage, abort mid-call and replay tampered handles; the volume lives on the
+      shard the listener is not on, so every connection moves with its inbox.
+    - `nfs_tls` 8 of 8.
+    - Run 17 at once, every test stalled a reply past its one-second deadline: each starts a daemon sized from the
+      whole machine, as the client suite's did. So CI runs them one test at a time.
+  - **Red:** before the inbox, 15 of 17 failed with the connection aborted or reset at its first call.
+  - **macOS arm64:** `nfs_hostile` 17 of 17, `nfs_tls` 8 of 8, the recovery oracle 41 of 41.
+  - **Linux x86_64 (adacachy, capped, load 70):** `nfs_hostile` 17 of 17, `nfs_tls` 8 of 8, the recovery oracle 43
+    of 43; clippy on the server, the runtime and the CLI.
+  - **Lints:** clippy `-D warnings` on `slates-server` (all targets) and the `slates-cli` binary for Windows
+    (`cargo xwin`, and natively on jupiter), and on macOS.
+- **Owed:**
+  - A real Linux kernel client mounting a Windows export: Docker Desktop's machine through `host.docker.internal`, or
+    WSL2.
+  - What owner a Windows export presents: a provisioned root's group is 0 there (`verbs::creator_gid`), where Unix
+    takes the creator's.
+  - The arm64 Windows lane, which builds no server.
 
 ### A-183 — The MCP HTTP edge is served on every platform, a refusal ends its connection in stages, and no Windows socket is inherited or shared (accepted 2026-10-26)
 Applied in the same change to:

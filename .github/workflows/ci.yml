@@ -354,7 +354,8 @@ jobs:
           "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       # `--workspace` cannot build here: the NFS-mount and FUSE/FSKit crates (bridge-nfs, cli,
       # bridge-fuse, bridge-fskit) are macOS/Linux-only — Windows mounts through WinFsp, and the fleet
-      # transport is QUIC over UDP, not the NFS-over-TCP loopback. So clippy the crates that carry
+      # transport is QUIC over UDP, not the NFS-over-TCP loopback. (Since A-184, 2026-10-26, `slates-bridge-nfs`
+      # builds here inside `slates-server`: the NFS server is the Windows network export.) So clippy the crates that carry
       # Windows code: the shared memory and wake (mem, ipc), the runtime with its IOCP/AFD driver (rt),
       # the client, the **daemon** (`slates-server` — a RAM-only IPC daemon on Windows, its NFS mount
       # transport gated off; provisioning, merge and landing all cross-platform), the **WinFsp mount
@@ -475,6 +476,15 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-rt --test tcp
+      # The NFS server on Windows (A-183), the network export's: honest clients write and read back their files while
+      # breakers send partial records, oversized markers and garbage, abort mid-call and replay tampered handles, every
+      # request framed by the connection's own inbox (Windows keeps no receive low-water mark); and the fleet export's
+      # RPC-with-TLS by its RFC's rules. One test at a time: each starts a daemon sized from the whole machine, and
+      # seventeen at once stalled a reply past its deadline on jupiter, as the client suite's did.
+      - name: Test the NFS server and the network export (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: cargo test -p slates-server --test nfs_hostile --test nfs_tls -- --test-threads=1
       - name: Test a shard's lateness after a park (native Windows)
         if: ${{ !cancelled() }}
         timeout-minutes: 15
@@ -840,6 +850,10 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-rt --test tcp
+      - name: Test the NFS server and the network export (Windows, every push to main)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: cargo test -p slates-server --test nfs_hostile --test nfs_tls -- --test-threads=1
       - name: Test a shard's lateness after a park (Windows, every push to main)
         if: ${{ !cancelled() }}
         timeout-minutes: 15

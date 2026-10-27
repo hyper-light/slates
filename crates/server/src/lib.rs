@@ -43,7 +43,12 @@ pub mod discovery;
 mod retention;
 // Name resolution for a peer named by DNS in the manifest (the Kubernetes deployment): an asynchronous
 // A-record client over the runtime's UDP, resolved at every dial so a rescheduled peer is found.
+// The daemon's end of the anchor's hold (A-61, A-113): paired per platform, one API; Windows' answers that no anchor
+// holds (docs/wip/platforms.md, gap 2).
 #[cfg(unix)]
+mod anchor_hold;
+#[cfg(windows)]
+#[path = "anchor_hold_windows.rs"]
 mod anchor_hold;
 pub mod dns;
 pub mod doorbell;
@@ -68,22 +73,16 @@ mod write_log;
 // The Windows WinFsp transport (§4.6 "Windows"): a volume at a drive letter, served on its owner shard.
 #[cfg(windows)]
 mod winfsp;
-// The NFS mount transport is the macOS/Linux mount path (Windows mounts through WinFsp); it rides the
-// Unix-only `slates_rt::tcp`, so it is gated off Windows. A Windows daemon serves IPC clients and lands
-// (both cross-platform) but does not serve NFS — the mount arrives with the WinFsp bridge.
-#[cfg(unix)]
+// The NFS server: the macOS mount's loopback transport, and on every platform the network export (a fleet node's
+// export, `slates export`) that remote and virtual-machine clients mount (Windows mounts locally through WinFsp). It
+// rides the runtime's TCP, which every platform has since A-182.
 mod callback;
-#[cfg(unix)]
 mod delegation;
 mod listing;
 mod lock_ledger;
-#[cfg(unix)]
 pub mod nfs;
-#[cfg(unix)]
 mod nfs_replay;
-#[cfg(unix)]
 mod nfs_state;
-#[cfg(unix)]
 pub mod nfs_tls;
 pub mod observe;
 mod owner_location;

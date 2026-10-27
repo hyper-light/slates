@@ -16,11 +16,9 @@ use slates_machine::facts::Identity;
 use slates_machine::{MachineProfile, derived};
 use slates_mem::arena::ChunkArena;
 use slates_mem::{Handoff, Slab};
-#[cfg(unix)]
 use slates_rt::RtError;
 use slates_rt::control::Control;
 use slates_rt::task::SpawnRequest;
-#[cfg(unix)]
 use slates_rt::tcp::{Ipv4Addr, SocketAddrV4, TcpListener};
 use slates_rt::{Runtime, ShardId, futures, registry};
 use slates_vfs::clock::HostClock;
@@ -309,16 +307,13 @@ fn doorbell_flag(control: u16) -> &'static AtomicBool {
     .0
 }
 /// Shape: pending NFS connections the kernel queues before the accept loop takes them. A mount opens a
-/// small, bounded number of connections; the OS clamps the backlog to the system maximum anyway. Unix
-/// only, with the NFS transport.
-#[cfg(unix)]
+/// small, bounded number of connections; the OS clamps the backlog to the system maximum anyway.
 pub(crate) const NFS_BACKLOG: i32 = 16;
 
 /// The NFS loopback listener to serve: the one a supervising anchor holds and hands over in the
 /// environment ([`slates_anchor::ENV_NFS_LISTENER`]), so its port survives a daemon restart (§4.6) —
 /// adopted here; failing that (a standalone start or tests) a fresh ephemeral bind. Adopting the
-/// anchor's descriptor is the only path that keeps the port stable across restarts. Unix only: NFS is
-/// the macOS/Linux mount path (Windows mounts through WinFsp), and it rides the Unix-only rt TCP.
+/// anchor's descriptor is the only path that keeps the port stable across restarts.
 #[cfg(unix)]
 fn nfs_listener() -> Result<TcpListener, RtError> {
   if let Some(raw) = std::env::var(ENV_NFS_LISTENER)
@@ -331,6 +326,15 @@ fn nfs_listener() -> Result<TcpListener, RtError> {
     let owned = unsafe { OwnedFd::from_raw_fd(raw) };
     return TcpListener::from_owned(owned);
   }
+  TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), NFS_BACKLOG)
+}
+
+/// The NFS loopback listener to serve on Windows: a fresh ephemeral bind, since no anchor holds one there across a
+/// restart (`docs/wip/platforms.md`, gap 2), so its port changes with each daemon. It serves the network export
+/// (`slates export`) to the clients that reach this host's loopback: Docker Desktop's Linux machine through
+/// `host.docker.internal`, and WSL2 in its mirrored networking mode.
+#[cfg(windows)]
+fn nfs_listener() -> Result<TcpListener, RtError> {
   TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), NFS_BACKLOG)
 }
 /// Shards whose initialization refused (a health signal; the daemon serves the rest).
@@ -678,13 +682,11 @@ impl Daemon {
     crate::lock_ledger::reset(shards.first().map_or(0, |shard| shard.0));
     // What the anchor held across the restart (A-61, A-113): the FUSE devices, each moved to the shard that owns its
     // mount, and the NFS loopback connections, served again on the listener's shard below.
-    #[cfg(unix)]
     let handed = crate::anchor_hold::adopt();
     #[cfg(target_os = "linux")]
     let mut inherited_fuse = crate::fuse_hold::split(handed.devices, shards.len()).into_iter();
     #[cfg(all(unix, not(target_os = "linux")))]
     release_devices_without_fuse(handed.devices);
-    #[cfg(unix)]
     let handed_connections = handed.connections;
     for (index, shard) in shards.iter().enumerate() {
       let env = segment.handoff_env()?;
@@ -776,14 +778,9 @@ impl Daemon {
         crate::fleet::run_membership(transport).await;
       })?;
     }
-    #[cfg(unix)]
     let nfs_port = start_nfs_transport(&runtime, control, &config, handed_connections)?;
     #[cfg(target_os = "macos")]
     start_shards_route(&runtime, control, &config)?;
-    // No NFS transport on Windows: NFS is the macOS/Linux mount path (Windows mounts through WinFsp),
-    // so a Windows daemon serves IPC clients and lands, but publishes no mount port.
-    #[cfg(windows)]
-    let nfs_port: Option<u16> = None;
     Ok(Daemon {
       runtime: Some(runtime),
       segment,
@@ -1625,7 +1622,6 @@ impl Daemon {
   /// How long this daemon took to serve each NFS call, from the call read to its reply built, summed over every
   /// shard (§4.14): calls served on the shard that read them, then calls forwarded to their volume's owner shard.
   /// What a caller measured beyond these is outside the serve: the kernel client, the socket and the wakes.
-  #[cfg(unix)]
   pub fn nfs_service_times(&self) -> Result<crate::nfs::ServiceQuantiles, ObserveError> {
     let mut summed = crate::nfs::ServiceTimes::default();
     for shard in self.shards.iter().copied() {
@@ -3197,23 +3193,14 @@ fn init_shard(
     #[cfg(target_os = "linux")]
     recovered_replies: std::collections::BTreeMap::new(),
     write_verifier: now.to_be_bytes(),
-    #[cfg(unix)]
     nfs_v4: None,
-    #[cfg(unix)]
     nfs_v4_files: None,
-    #[cfg(unix)]
     recall_queues: std::collections::BTreeMap::new(),
-    #[cfg(unix)]
     nfs_v4_instance: None,
-    #[cfg(unix)]
     nfs_calls: slates_bridge_nfs::v4::replay::CallRecords::new(config.nfs_v4.record_bytes),
-    #[cfg(unix)]
     nfs_call: None,
-    #[cfg(unix)]
     held_nfs_replies: std::collections::BTreeMap::new(),
-    #[cfg(unix)]
     held_nfs_replies_changed: false,
-    #[cfg(unix)]
     recovered_nfs_replies: std::collections::BTreeMap::new(),
     db,
     fleet,
@@ -3284,9 +3271,7 @@ fn init_shard(
     placed_heads: std::collections::BTreeMap::new(),
     formed_probe_peers: std::collections::BTreeSet::new(),
     plane: crate::member_task::PlaneState::default(),
-    #[cfg(unix)]
     nfs_service: crate::nfs::ServiceTimes::default(),
-    #[cfg(unix)]
     callbacks: crate::callback::Callbacks::default(),
     staging: crate::staging::Staging::default(),
     member_boot_nonce: incarnation,
@@ -3463,14 +3448,10 @@ async fn reap_loop() {
       CLIENTS_REAPED.fetch_add(u64::try_from(reaped).unwrap_or(u64::MAX), Ordering::AcqRel);
     }
     refresh_pressure_hold().await;
-    // NFS owed-work purge and delegation recalls are the Unix transports' state (`crate::nfs`/`crate::delegation`
-    // are `#[cfg(unix)]`); Windows has no NFS mount, so the maintenance loop skips them and keeps the rest.
-    #[cfg(unix)]
     crate::nfs::purge_owed_here().await;
     state::with_state(|s| {
       process_base_hints(s);
       // The recalls the hints asked for are sent now: nothing else runs the drain while no call is served.
-      #[cfg(unix)]
       crate::delegation::drain(s);
     });
     seal_idle_content().await;
@@ -4669,7 +4650,6 @@ fn kick_fd_of(_shard: ShardId) -> Option<i32> {
 /// other shards. The connections the anchor held across the restart (A-113) are served first there; without a listener
 /// nothing could serve them, so each is released — the anchor closes the last copy and the kernel client reconnects to
 /// whatever listener comes next, rather than wait on a connection nobody reads. The port, if the listener bound.
-#[cfg(unix)]
 fn start_nfs_transport(
   runtime: &Runtime,
   control: ShardId,

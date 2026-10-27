@@ -2100,7 +2100,6 @@ fn serve_here(
   let reply = run_recorded(state, origin, id, client_id, &principal, body);
   // A change this verb was refused for a delegation asked for a recall; it is sent now, after the verb's own
   // transaction (A-79).
-  #[cfg(unix)]
   crate::delegation::drain(state);
   match reply {
     Some(reply) => Served::Reply(reply),
@@ -2238,7 +2237,6 @@ fn run_forwarded(
   state.current_span = cause;
   let reply = run_recorded(state, origin, id, client_id, principal, body);
   state.current_span = None;
-  #[cfg(unix)]
   crate::delegation::drain(state);
   reply
 }
@@ -2933,18 +2931,9 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
   }
 }
 
-/// The NFS calls this shard served, by NFSv3 procedure (`nfs::ServiceTimes::calls`); empty off Unix, where no NFS
-/// bridge runs.
+/// The NFS calls this shard served, by NFSv3 procedure (`nfs::ServiceTimes::calls`).
 fn nfs_calls_of(state: &ShardState) -> Vec<u64> {
-  #[cfg(unix)]
-  {
-    state.nfs_service.calls.to_vec()
-  }
-  #[cfg(not(unix))]
-  {
-    let _ = state;
-    Vec::new()
-  }
+  state.nfs_service.calls.to_vec()
 }
 
 /// Whether `state` is the control shard's — the first of the daemon's shards, the one that runs the
@@ -9475,7 +9464,6 @@ fn being_destroyed(volume: &slates_vfs::volume::Volume) -> bool {
 /// Takes back what answers the NFS requests a dead daemon applied and left unanswered: the call records it published
 /// and committed, which answer its NFSv4.1 clients' retries (A-127), and the NFSv3 replies it published for its held
 /// connections and never sent, which answer their requests read again (A-128). Counted.
-#[cfg(unix)]
 fn restore_nfs_answers(
   state: &mut ShardState,
   calls: Vec<slates_vfs::recover::HeldCall>,
@@ -9500,19 +9488,8 @@ fn restore_nfs_answers(
   }
 }
 
-/// Takes back what answers the NFS requests a dead daemon left: nothing where the NFS transport is not served.
-#[cfg(not(unix))]
-fn restore_nfs_answers(
-  state: &mut ShardState,
-  calls: Vec<slates_vfs::recover::HeldCall>,
-  nfs_replies: Vec<slates_vfs::recover::HeldNfsReply>,
-) {
-  let _ = (state, calls, nfs_replies);
-}
-
 /// The call records a delta carries (A-127): the durable ones changed since the last publication, and the slots purged
 /// since.
-#[cfg(unix)]
 fn call_records_delta(
   state: &ShardState,
 ) -> (
@@ -9522,41 +9499,19 @@ fn call_records_delta(
   crate::nfs_replay::delta(state)
 }
 
-/// The call records a delta carries: none where the NFS transport is not served (A-127).
-#[cfg(not(unix))]
-fn call_records_delta(
-  state: &ShardState,
-) -> (
-  Vec<slates_vfs::recover::HeldCall>,
-  Vec<[u8; slates_vfs::recover::HELD_CALL_KEY_BYTES]>,
-) {
-  let _ = state;
-  (Vec::new(), Vec::new())
-}
-
 /// The call records a checkpoint carries: every durable one (A-127).
-#[cfg(unix)]
 fn call_records_checkpoint(state: &ShardState) -> Vec<slates_vfs::recover::HeldCall> {
   crate::nfs_replay::checkpoint(state)
 }
 
-/// The call records a checkpoint carries: none where the NFS transport is not served (A-127).
-#[cfg(not(unix))]
-fn call_records_checkpoint(state: &ShardState) -> Vec<slates_vfs::recover::HeldCall> {
-  let _ = state;
-  Vec::new()
-}
-
 /// A publication carrying the call records and the held NFSv3 replies committed: nothing of them is owed to the next
 /// one (A-127, A-128).
-#[cfg(unix)]
 fn call_records_published(state: &mut ShardState) {
   state.nfs_calls.published();
   state.held_nfs_replies_changed = false;
 }
 
 /// The held NFSv3 replies a publication carries (A-128): every reply held for a held connection's turn in progress.
-#[cfg(unix)]
 fn held_nfs_replies(state: &ShardState) -> Vec<slates_vfs::recover::HeldNfsReply> {
   state
     .held_nfs_replies
@@ -9572,30 +9527,9 @@ fn held_nfs_replies(state: &ShardState) -> Vec<slates_vfs::recover::HeldNfsReply
     .collect()
 }
 
-/// The held NFSv3 replies a publication carries: none where the NFS transport is not served (A-128).
-#[cfg(not(unix))]
-fn held_nfs_replies(state: &ShardState) -> Vec<slates_vfs::recover::HeldNfsReply> {
-  let _ = state;
-  Vec::new()
-}
-
 /// Whether the held NFSv3 replies changed since the last publication, which a delta then carries whole (A-128).
-#[cfg(unix)]
 fn held_nfs_replies_changed(state: &ShardState) -> bool {
   state.held_nfs_replies_changed
-}
-
-/// Whether the held NFSv3 replies changed: never where the NFS transport is not served (A-128).
-#[cfg(not(unix))]
-fn held_nfs_replies_changed(state: &ShardState) -> bool {
-  let _ = state;
-  false
-}
-
-/// A publication committed where the NFS transport is not served: no call records to settle (A-127).
-#[cfg(not(unix))]
-fn call_records_published(state: &mut ShardState) {
-  let _ = state;
 }
 
 /// The barrier replies not yet delivered, which ride with the effects they answer (A-61).
@@ -12320,9 +12254,8 @@ enum NfsTimes {
   Forwarded,
 }
 
-/// The quantile `ppm` of one of this shard's NFS service-time histograms; `None` until a call was recorded there
-/// (an unmeasured time is unknown, never zero), and always `None` where the daemon serves no NFS.
-#[cfg(unix)]
+/// The quantile `ppm` of one of this shard's NFS service-time histograms; `None` until a call was recorded there (an
+/// unmeasured time is unknown, never zero; on Windows the off-core share is never recorded, `nfs::ServiceTimes`).
 fn nfs_quantile(state: &ShardState, times: NfsTimes, ppm: u64) -> Option<u64> {
   let histogram = match times {
     NfsTimes::Local => &state.nfs_service.local,
@@ -12330,10 +12263,4 @@ fn nfs_quantile(state: &ShardState, times: NfsTimes, ppm: u64) -> Option<u64> {
     NfsTimes::Forwarded => &state.nfs_service.forwarded,
   };
   (histogram.count() > 0).then(|| histogram.quantile(ppm))
-}
-
-/// Windows serves no NFS (it mounts through WinFsp): every NFS time is unknown.
-#[cfg(not(unix))]
-fn nfs_quantile(_state: &ShardState, _times: NfsTimes, _ppm: u64) -> Option<u64> {
-  None
 }

@@ -213,14 +213,9 @@ pub struct ServeAddresses {
   pub export: Option<SocketAddrV4>,
 }
 
-/// The network export's listener: a TCP listener on Unix, where the NFS transport runs; uninhabited
-/// elsewhere (a Windows daemon serves no NFS; it mounts through WinFsp), so the field is always `None` there.
-#[cfg(unix)]
+/// The network export's listener: the runtime's TCP listener, on every platform (A-184; until 2026-10-26 it was
+/// uninhabited on Windows, which served no NFS).
 pub type ExportListener = slates_rt::tcp::TcpListener;
-/// The network export's listener: uninhabited off Unix (no NFS transport there).
-#[cfg(not(unix))]
-#[derive(Debug)]
-pub enum ExportListener {}
 
 /// A node's bound serve sockets, one per plane, and its export listener — what the membership loop serves on.
 #[derive(Debug)]
@@ -310,7 +305,6 @@ impl ServeAddresses {
 }
 
 /// Binds the network export's listener at `address`.
-#[cfg(unix)]
 fn bind_export(address: SocketAddrV4) -> Result<ExportListener, ServeBindError> {
   // The loopback listener's backlog: the same kind of client (a kernel NFS client, one connection per server
   // it mounts, reconnected when lost), so the same bound on connections queued before the accept loop runs.
@@ -320,17 +314,6 @@ fn bind_export(address: SocketAddrV4) -> Result<ExportListener, ServeBindError> 
       address,
       fault: ServeFault::Refused(refusal),
     }
-  })
-}
-
-/// A plan never names an export off Unix (the deployment plan sets it only where NFS runs); one that did is
-/// refused rather than silently served nowhere.
-#[cfg(not(unix))]
-fn bind_export(address: SocketAddrV4) -> Result<ExportListener, ServeBindError> {
-  Err(ServeBindError {
-    plane: "export",
-    address,
-    fault: ServeFault::Malformed,
   })
 }
 
@@ -846,7 +829,6 @@ pub(crate) fn record_exchange_budget_ns() -> u64 {
 /// Serves the network export's listener on this shard (§4.6 "Kubernetes publication without privilege",
 /// AUD-29-75), each connection's session built from the kept `identity`. A listener whose port cannot be read,
 /// or whose task the arena refused, is counted, never silent.
-#[cfg(unix)]
 fn serve_export(export: Option<ExportListener>, identity: Kept<Identity>) {
   let Some(listener) = export else {
     return;
@@ -862,14 +844,6 @@ fn serve_export(export: Option<ExportListener>, identity: Kept<Identity>) {
     Err(_) => {
       count_refusal(BIND_REFUSED);
     }
-  }
-}
-
-/// No export off Unix: the field is uninhabited there.
-#[cfg(not(unix))]
-fn serve_export(export: Option<ExportListener>, _identity: Kept<Identity>) {
-  if let Some(never) = export {
-    match never {}
   }
 }
 

@@ -170,6 +170,20 @@ impl TcpStream {
     }
   }
 
+  /// Reads what is queued into `buf` without waiting: `Some(0)` at end of stream (the peer closed its write half),
+  /// `None` when nothing is queued. A reader that must not wait mid-turn takes bytes this way and awaits
+  /// [`TcpStream::wait_readable`] only once it has drained the queue, so each wake brings new bytes, where the kernel
+  /// offers no receive low-water mark to wait for a whole record with (Windows: [`TcpStream::want_bytes`]).
+  pub fn read_now(&self, buf: &mut [u8]) -> Result<Option<usize>, RtError> {
+    loop {
+      match netsys::read(&self.socket, &mut *buf)? {
+        Io::Ready(n) => return Ok(Some(n)),
+        Io::WouldBlock => return Ok(None),
+        Io::Interrupted => continue,
+      }
+    }
+  }
+
   /// Awaits readability through the driver: bytes queued, at least as many as the receive low-water mark
   /// ([`TcpStream::want_bytes`]; kqueue's read filter and Linux's `tcp_poll` both honour it), or end of stream. It
   /// borrows no buffer, so a caller can await it and then [`TcpStream::peek_now`] into a buffer it holds only across

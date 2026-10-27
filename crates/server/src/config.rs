@@ -359,8 +359,7 @@ pub struct DaemonConfig {
   /// Unix only, as the guest transport is.
   #[cfg(unix)]
   pub guest_credits: slates_bridge_virtiofs::credit::AttachmentCredits,
-  /// Derived: the NFSv4 listener's table bounds (§4.6 A-35). Unix only, as the NFS transport is.
-  #[cfg(unix)]
+  /// Derived: the NFSv4 listener's table bounds (§4.6 A-35).
   pub nfs_v4: NfsV4Caps,
   /// Derived (A-150): the inode numbers each publication reserves ahead of a volume's counter, so a reply may hand one
   /// out with no barrier of its own while a successor still starts past it ([`inode_reserve`]).
@@ -857,7 +856,6 @@ impl DaemonConfig {
     #[cfg(unix)]
     let guest_credits = guest_credits(profile, admission.get(), &mut derivations);
     let inode_reserve = inode_reserve(&mut derivations);
-    #[cfg(unix)]
     let nfs_v4 = nfs_v4_caps(
       reserve.get(),
       (runtime.shards.max(1), region.slots),
@@ -903,7 +901,6 @@ impl DaemonConfig {
       boot_fault: None,
       #[cfg(unix)]
       guest_credits,
-      #[cfg(unix)]
       nfs_v4,
       inode_reserve,
       derivations,
@@ -932,7 +929,6 @@ pub enum BootFaultKind {
 }
 
 /// The NFSv4 listener's table bounds (§4.6 A-35): what its sessions, clients and opens may hold.
-#[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NfsV4Caps {
   /// Derived: the requests one session keeps in flight (its slot count).
@@ -951,13 +947,11 @@ pub struct NfsV4Caps {
 /// Shape: the holders the NFSv4 client share of a shard's reserve is split between (A-127): the slot caches (a kept
 /// reply per slot) and the call records (what a kept reply becomes across a restart, published with its effects).
 /// Each takes an equal part, so neither crowds out the other.
-#[cfg(unix)]
 const NFS_V4_CLIENT_SHARE_HOLDERS: u64 = 2;
 
 /// Shape: the sessions one NFSv4 client holds at once: the live one and its successor, which a client
 /// creates before destroying the old when it replaces a session (RFC 8881 §2.10.13); a client that
 /// trunks more connections binds them to one session (§2.10.3.1).
-#[cfg(unix)]
 pub const NFS_V4_SESSIONS_PER_CLIENT: usize = 2;
 
 /// The NFSv4 listener's table bounds from the listener shard's reserve, the shard count and the
@@ -973,7 +967,6 @@ pub const NFS_V4_SESSIONS_PER_CLIENT: usize = 2;
 /// - **locks** = the same bound: a lock range names a byte range of an open file, and one lock-owner's
 ///   locks on a file merge into as few ranges as their gaps allow, so a range per file is the common
 ///   case and each costs what an open costs.
-#[cfg(unix)]
 fn nfs_v4_caps(
   reserve_per_shard: u64,
   (shards, in_flight): (u16, u32),
@@ -1331,7 +1324,6 @@ const SMALLEST_FUSE_DIRENT: u64 = 32;
 /// Format: the smallest NFSv3 `entry3` a `READDIR` reply carries (RFC 1813 §3.3.16): the file id (8), the name's length
 /// (4) and one padded word of name (4), the cookie (8), and the next entry's flag (4). That is 28 bytes, each entry
 /// naming an inode.
-#[cfg(unix)]
 const SMALLEST_NFS_ENTRY: u64 = 28;
 
 /// Derived (A-150): the inode numbers each publication reserves ahead of a volume's counter. A reply may hand out a
@@ -1339,41 +1331,55 @@ const SMALLEST_NFS_ENTRY: u64 = 28;
 /// successor never issues a number a client still holds. The reserve is the most numbers one unit of work can issue,
 /// times [`slates_vfs::volume::RESERVE_TOP_UP_SHARE`], so the top-up the owner runs at that share leaves a whole unit's
 /// numbers reserved before the unit runs. The most is a directory listing filling the largest reply a transport serves
-/// with its smallest entries, each naming an inode: a guest's reply cap over the smallest `fuse_dirent`, or the NFS
-/// message cap over the smallest `entry3`, whichever is more. A successor skips at most this many numbers per takeover,
-/// against a counter space of 2^47 per volume.
-#[cfg(unix)]
+/// with its smallest entries, each naming an inode: the NFS message cap over the smallest `entry3`, or a guest's reply
+/// cap over the smallest `fuse_dirent` where a guest keeps its numbers across a restart ([`guest_listing_entries`]),
+/// whichever is more. A successor skips at most this many numbers per takeover, against a counter space of 2^47 per
+/// volume. Until 2026-10-26 Windows reserved none, having no transport whose client keeps a number across a restart;
+/// its network export is one (A-184), as an NFS client keeps its file handles.
 fn inode_reserve(derivations: &mut Vec<String>) -> u64 {
-  let guest = slates_bridge_virtiofs::device::writable_cap()
-    .get()
-    .checked_div(SMALLEST_FUSE_DIRENT)
-    .unwrap_or(0);
   let nfs = u64::try_from(slates_bridge_nfs::rpc::MAX_MESSAGE)
     .unwrap_or(u64::MAX)
     .checked_div(SMALLEST_NFS_ENTRY)
     .unwrap_or(0);
+  let guest = guest_listing_entries();
+  derivations.push(note("guest_listing_entries", &guest));
   let reserve: Derived<u64> = derived!(
     guest
+      .get()
       .max(nfs)
       .saturating_mul(slates_vfs::volume::RESERVE_TOP_UP_SHARE),
-    "max(guest writable cap / smallest fuse_dirent, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE",
-    ["guest.writable_cap", "nfs.max_message"]
+    "max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE",
+    ["guest_listing_entries", "nfs.max_message"]
   );
   derivations.push(note("inode_reserve", &reserve));
   reserve.get()
 }
 
-/// Derived (A-150): no reserve. No transport on this platform hands an inode number to a client that keeps it across a
-/// restart: there is no host mount, and the SDK names files by path, so every number may be recorded exactly as issued.
-#[cfg(not(unix))]
-fn inode_reserve(derivations: &mut Vec<String>) -> u64 {
-  let reserve: Derived<u64> = derived!(
+/// Derived: the most entries a guest's directory listing can carry, its reply cap over the smallest `fuse_dirent`. A
+/// guest's device outlives a daemon restart under the anchor (A-61, A-168), so the numbers it was given must never be
+/// issued again.
+#[cfg(unix)]
+fn guest_listing_entries() -> Derived<u64> {
+  derived!(
+    slates_bridge_virtiofs::device::writable_cap()
+      .get()
+      .checked_div(SMALLEST_FUSE_DIRENT)
+      .unwrap_or(0),
+    "guest writable cap / smallest fuse_dirent",
+    ["guest.writable_cap"]
+  )
+}
+
+/// Derived: none kept across a restart. A Windows guest's stream ends with its daemon, since no anchor holds it there
+/// (`docs/wip/platforms.md`, gap 2), so the numbers its session was given die with it. Holding the stream adds the
+/// guest's term here, as on Unix.
+#[cfg(windows)]
+fn guest_listing_entries() -> Derived<u64> {
+  derived!(
     0,
-    "none: no transport here hands out an inode number a client keeps across a restart",
+    "none: a Windows guest's stream ends with its daemon, so no number it holds outlives a restart",
     []
-  );
-  derivations.push(note("inode_reserve", &reserve));
-  reserve.get()
+  )
 }
 
 fn note<T: std::fmt::Debug>(name: &str, d: &Derived<T>) -> String {

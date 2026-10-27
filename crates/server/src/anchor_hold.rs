@@ -12,7 +12,7 @@
 //! A daemon without a supervising anchor (a test harness, a standalone start) has no channel: its sends are answered
 //! `None`, and its mounts and connections end with it, as before A-61 and A-113.
 
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, OwnedFd, RawFd};
 use std::sync::OnceLock;
 
 use slates_anchor::held::{self, ENV_CONNECTIONS, ENV_DEVICES, HoldRefusal, Outgoing};
@@ -122,12 +122,15 @@ pub(crate) fn send(message: &Outgoing<'_>) -> Option<Result<(), HoldRefusal>> {
   Some(held::send(channel.as_fd(), message))
 }
 
-/// Asks the anchor to hold `socket` as `connection` (A-113).
+/// Asks the anchor to hold `stream`'s socket as `connection` (A-113).
 pub(crate) fn hold_connection(
   connection: u64,
-  socket: BorrowedFd<'_>,
+  stream: &slates_rt::tcp::TcpStream,
 ) -> Option<Result<(), HoldRefusal>> {
-  send(&Outgoing::HoldConnection { connection, socket })
+  send(&Outgoing::HoldConnection {
+    connection,
+    socket: stream.as_fd(),
+  })
 }
 
 /// Tells the anchor `connection` ended, so it closes its copy (A-113).

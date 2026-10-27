@@ -1395,7 +1395,9 @@ async fn serve_v3(
     ),
   };
   let elapsed = slates_machine::clock::monotonic_ns().saturating_sub(started);
-  let on_cpu = thread_cpu_ns().saturating_sub(started_cpu);
+  let on_cpu = started_cpu
+    .zip(thread_cpu_ns())
+    .map(|(started, ended)| ended.saturating_sub(started));
   let _ = state::with_state_counted(|s| {
     if program == NFS_PROGRAM
       && let Some(calls) = usize::try_from(procedure)
@@ -1408,9 +1410,11 @@ async fn serve_v3(
       s.nfs_service.forwarded.record(elapsed);
     } else {
       s.nfs_service.local.record(elapsed);
-      s.nfs_service
-        .local_off_cpu
-        .record(elapsed.saturating_sub(on_cpu));
+      if let Some(on_cpu) = on_cpu {
+        s.nfs_service
+          .local_off_cpu
+          .record(elapsed.saturating_sub(on_cpu));
+      }
     }
   });
   served
@@ -1493,14 +1497,25 @@ fn leading_status(results: &[u8]) -> Option<u32> {
 
 /// The calling thread's CPU time in nanoseconds (`CLOCK_THREAD_CPUTIME_ID`), so a local serve's wall time splits
 /// into the time it ran and the time the operating system held the shard's thread off a core.
-fn thread_cpu_ns() -> u64 {
+#[cfg(unix)]
+fn thread_cpu_ns() -> Option<u64> {
   /// Format: nanoseconds per second.
   const NS_PER_SECOND: u64 = 1_000_000_000;
   let reading = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
-  u64::try_from(reading.tv_sec)
-    .unwrap_or(0)
-    .saturating_mul(NS_PER_SECOND)
-    .saturating_add(u64::try_from(reading.tv_nsec).unwrap_or(0))
+  Some(
+    u64::try_from(reading.tv_sec)
+      .unwrap_or(0)
+      .saturating_mul(NS_PER_SECOND)
+      .saturating_add(u64::try_from(reading.tv_nsec).unwrap_or(0)),
+  )
+}
+
+/// No reading fine enough to split a call: Windows charges a thread's CPU time a scheduler tick at a time (15.6 ms by
+/// default; `slates_rt`'s thread clock), and a call takes microseconds, so its off-core share is not recorded there
+/// rather than recorded as its whole wall time.
+#[cfg(windows)]
+fn thread_cpu_ns() -> Option<u64> {
+  None
 }
 
 /// How long a shard took to serve the NFS calls it read (§4.14): from the call parsed to its results built,
@@ -1512,7 +1527,8 @@ pub struct ServiceTimes {
   /// Calls forwarded to their volume's owner shard and answered back.
   pub forwarded: crate::histogram::DurationHistogram,
   /// Of each local call, the wall time the shard's thread spent off a core (its wall time less its CPU time): a
-  /// synchronous serve never waits, so this is the operating system's preemption, not the serve's work.
+  /// synchronous serve never waits, so this is the operating system's preemption, not the serve's work. Not recorded
+  /// on Windows, whose thread clock is too coarse to split a call ([`thread_cpu_ns`]).
   pub local_off_cpu: crate::histogram::DurationHistogram,
   /// Calls served, by NFSv3 procedure number (an NFSv4 compound counts each operation's v3 call): how many round
   /// trips each client operation cost, which a client's own counters cannot say on a shared machine (`nfsstat` is
@@ -2343,11 +2359,15 @@ const RELEASE_LOST: &str = "nfs.connection_release_lost";
 /// once per connection's admission and end, never per request.
 static HELD_CONNECTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+#[cfg(unix)]
 std::thread_local! {
   /// This shard's stream buffer: the bytes a peek copies out of a connection's receive queue, and the sink of a
   /// discard where the kernel cannot drop bytes itself. One per shard thread, borrowed only inside a synchronous call,
   /// never across an await, so every connection the shard serves shares it.
   static STREAM_BUFFER: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+std::thread_local! {
   /// The last connection id this shard handed out ([`next_connection_id`]).
   static LAST_CONNECTION_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
@@ -2422,7 +2442,7 @@ fn admit(stream: TcpStream, port: u16, bound: usize) -> Option<Connection> {
     }
     let connection = next_connection_id();
     if !matches!(
-      crate::anchor_hold::hold_connection(connection, stream.as_fd()),
+      crate::anchor_hold::hold_connection(connection, &stream),
       Some(Ok(()))
     ) {
       HELD_CONNECTIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -2472,8 +2492,9 @@ pub(crate) fn adopt_held(
 /// its copy, and with the daemon's dropped here the client sees the connection close and reconnects.
 pub(crate) fn release_handed(handed: Vec<crate::anchor_hold::HandedConnection>) {
   for crate::anchor_hold::HandedConnection { connection, socket } in handed {
-    let _ = rustix::net::shutdown(&socket, rustix::net::Shutdown::Both);
-    drop(socket);
+    if let Ok(stream) = TcpStream::from_owned(socket) {
+      let _ = stream.shutdown();
+    }
     if matches!(
       crate::anchor_hold::release_connection(connection),
       Some(Err(_))
@@ -2486,10 +2507,10 @@ pub(crate) fn release_handed(handed: Vec<crate::anchor_hold::HandedConnection>) 
 /// Counter: connections a dead daemon left that this daemon serves again (A-113).
 const NFS_CONNECTIONS_ADOPTED: &str = "nfs.connections_adopted";
 
-/// A connection's serving state, moved whole to the shard that owns the volume its calls name ([`migrate`]). The
-/// requests not yet answered live in the socket's receive queue, not here (A-113): each turn peeks them, and a request
-/// is consumed only once its reply is in the send queue, so the state a move carries — and a death loses — is no more
-/// than the socket.
+/// A connection's serving state, moved whole to the shard that owns the volume its calls name ([`migrate`]). On Unix
+/// the requests not yet answered live in the socket's receive queue, not here (A-113): each turn peeks them, and a
+/// request is consumed only once its reply is in the send queue, so the state a move carries — and a death loses — is
+/// no more than the socket. On Windows they live in the connection's `Inbox` (A-184), which moves with it.
 struct Connection {
   stream: TcpStream,
   port: u16,
@@ -2500,7 +2521,11 @@ struct Connection {
   /// The connection's id while the anchor holds it.
   held: Option<u64>,
   /// The receive low-water mark last set, so it is set only when it changes (0: not known on this shard).
+  #[cfg(unix)]
   wanted: usize,
+  /// The requests read and not yet answered (A-184).
+  #[cfg(windows)]
+  inbox: Inbox,
 }
 
 impl Connection {
@@ -2511,7 +2536,10 @@ impl Connection {
       home: registry::current_shard().unwrap_or(0),
       carry: None,
       held,
+      #[cfg(unix)]
       wanted: 0,
+      #[cfg(windows)]
+      inbox: Inbox::default(),
     }
   }
 
@@ -2530,6 +2558,7 @@ impl Connection {
   /// Sets the receive low-water mark to `bytes` if it is not already that; whether the kernel keeps it. A mark it caps
   /// below `bytes` (Linux at half of `tcp_rmem[2]`) would wake the connection before the record is whole, every time,
   /// so the caller ends the connection rather than spin.
+  #[cfg(unix)]
   fn want(&mut self, bytes: usize) -> bool {
     if self.wanted == bytes {
       return true;
@@ -2540,6 +2569,134 @@ impl Connection {
     self.wanted = bytes;
     true
   }
+
+  /// Nothing to set on Windows: the inbox drained the receive queue ([`Inbox::fill`]), so the next readability is
+  /// bytes the inbox has not seen, whatever their number, and waking for each is no spin.
+  #[cfg(windows)]
+  fn want(&mut self, _bytes: usize) -> bool {
+    true
+  }
+}
+
+/// The requests a Windows connection has read and not yet answered (A-184). Windows' TCP keeps no receive low-water
+/// mark (`SO_RCVLOWAT` is refused: `crates/rt/tests/tcp.rs`), Winsock refuses `MSG_WAITALL` with `MSG_PEEK`, and the
+/// AFD reactor's readiness is level-triggered, so a request cannot wait whole in the kernel as on Unix (A-113): a
+/// connection peeking half a record would wake at once, every time. So the connection reads what is queued into its
+/// own buffer, bounded as the kernel's is ([`CONNECTION_BUFFER_BYTES`]), parses whole records there, and consumes
+/// each once its reply is sent. A request read here dies with its daemon; on Windows so does the connection, since no
+/// anchor holds it (`docs/wip/platforms.md`, gap 2), and its client resends on its next connection. Holding Windows
+/// connections across a restart must carry these bytes with the socket.
+#[cfg(windows)]
+#[derive(Default)]
+struct Inbox {
+  /// The bytes read, allocated at the connection's first read, [`CONNECTION_BUFFER_BYTES`] long.
+  bytes: Option<Box<[u8]>>,
+  /// How many of them are held: read, and not yet consumed.
+  held: usize,
+  /// Whether the client closed its side: a read answered end of stream.
+  ended: bool,
+}
+
+#[cfg(windows)]
+impl Inbox {
+  /// Reads what the client sent until nothing more is queued, the inbox is full, or the stream ends; whether every read
+  /// succeeded.
+  fn fill(&mut self, stream: &TcpStream) -> bool {
+    let bytes = self
+      .bytes
+      .get_or_insert_with(|| vec![0u8; CONNECTION_BUFFER_BYTES].into_boxed_slice());
+    while !self.ended {
+      let Some(spare) = bytes.get_mut(self.held..).filter(|spare| !spare.is_empty()) else {
+        return true;
+      };
+      match stream.read_now(spare) {
+        Ok(Some(0)) => self.ended = true,
+        Ok(Some(read)) => self.held = self.held.saturating_add(read),
+        Ok(None) => return true,
+        Err(_) => return false,
+      }
+    }
+    true
+  }
+
+  /// The bytes held, oldest first.
+  fn held(&self) -> &[u8] {
+    self
+      .bytes
+      .as_deref()
+      .and_then(|bytes| bytes.get(..self.held))
+      .unwrap_or_default()
+  }
+
+  /// Drops the `count` oldest bytes held, those of requests answered; whether that many were held.
+  fn consume(&mut self, count: usize) -> bool {
+    if count == 0 {
+      return true;
+    }
+    let Some(bytes) = self.bytes.as_mut() else {
+      return false;
+    };
+    if count > self.held || self.held > bytes.len() {
+      return false;
+    }
+    bytes.copy_within(count..self.held, 0);
+    self.held = self.held.saturating_sub(count);
+    true
+  }
+}
+
+/// What a turn finds at the head of `connection`'s queue: on Unix, a peek of the kernel's receive queue (A-113).
+#[cfg(unix)]
+fn head(connection: &mut Connection) -> Head {
+  peek_head(&connection.stream)
+}
+
+/// What a turn finds at the head of `connection`'s queue: on Windows, what its inbox holds once filled ([`Inbox`]). A
+/// close is seen as the end of stream it is: with nothing held the connection ended at a record boundary; with an
+/// unfinished record held, [`closed_mid_record`] answers for it.
+#[cfg(windows)]
+fn head(connection: &mut Connection) -> Head {
+  if !connection.inbox.fill(&connection.stream) {
+    return Head::Ended;
+  }
+  if connection.inbox.ended && connection.inbox.held == 0 {
+    return Head::Ended;
+  }
+  read_head(connection.inbox.held())
+}
+
+/// Whether a connection waiting for the rest of a record will never get it, its client having closed: on Unix, asked
+/// of the kernel's record of the connection once readability woke it with an unfinished record queued, since a peek
+/// never shows the close behind bytes it does not consume.
+#[cfg(unix)]
+fn closed_mid_record(connection: &Connection, woken: bool, bytes: usize) -> bool {
+  woken && bytes > 1 && connection.stream.peer_closed().unwrap_or(true)
+}
+
+/// Whether a connection waiting for the rest of a record will never get it: on Windows, the inbox read the end of the
+/// stream behind it.
+#[cfg(windows)]
+fn closed_mid_record(connection: &Connection, _woken: bool, _bytes: usize) -> bool {
+  connection.inbox.ended
+}
+
+/// Consumes `count` bytes of answered requests from `connection`'s queue: on Unix from the kernel's receive queue,
+/// through this shard's stream buffer where the kernel cannot drop them itself.
+#[cfg(unix)]
+fn consume(connection: &mut Connection, count: usize) -> bool {
+  STREAM_BUFFER.with(|cell| {
+    cell
+      .try_borrow_mut()
+      .ok()
+      .is_some_and(|mut buffer| connection.stream.discard(count, &mut buffer).is_ok())
+  })
+}
+
+/// Consumes `count` bytes of answered requests from `connection`'s queue: on Windows from its inbox, the kernel having
+/// given them up when they were read.
+#[cfg(windows)]
+fn consume(connection: &mut Connection, count: usize) -> bool {
+  connection.inbox.consume(count)
 }
 
 /// One record at the head of a connection's receive queue: its body, and the queue offset just past it (what a discard
@@ -2562,6 +2719,7 @@ enum Head {
 }
 
 /// Peeks the head of `stream`'s receive queue into this shard's stream buffer and reads the whole records there.
+#[cfg(unix)]
 fn peek_head(stream: &TcpStream) -> Head {
   STREAM_BUFFER.with(|cell| {
     let Ok(mut buffer) = cell.try_borrow_mut() else {
@@ -2640,7 +2798,7 @@ async fn serve_connection(mut connection: Connection) {
   // moment to ask whether the peer closed (a peek never shows the close behind bytes it does not consume).
   let mut woken = false;
   loop {
-    match peek_head(&connection.stream) {
+    match head(&mut connection) {
       Head::Ended => {
         crate::fleet::count_refusal(CONNECTION_ENDED_BY_PEER);
         connection.end();
@@ -2652,7 +2810,7 @@ async fn serve_connection(mut connection: Connection) {
         return;
       }
       Head::Waiting(bytes) => {
-        if woken && bytes > 1 && connection.stream.peer_closed().unwrap_or(true) {
+        if closed_mid_record(&connection, woken, bytes) {
           // The peer closed with an unfinished record queued: it never completes.
           crate::fleet::count_refusal(CONNECTION_CLOSED_MID_RECORD);
           connection.end();
@@ -2680,7 +2838,7 @@ async fn serve_connection(mut connection: Connection) {
       }
       Head::Records(records) => {
         let turn = serve_turn(this, &mut connection, records, registration.0).await;
-        if !send_turn(&connection, &turn).await {
+        if !send_turn(&mut connection, &turn).await {
           crate::fleet::count_refusal(CONNECTION_SEND_FAILED);
           connection.end();
           return;
@@ -2780,7 +2938,7 @@ fn bounded_record(xid: u32, record: Vec<u8>) -> Vec<u8> {
 /// only once its reply is in it, so a daemon that dies anywhere here leaves every unanswered request for its successor,
 /// and at worst a reply sent twice, which the client drops by its xid (RFC 5531 §9) (A-113). Whether the connection
 /// still stands.
-async fn send_turn(connection: &Connection, turn: &Turn) -> bool {
+async fn send_turn(connection: &mut Connection, turn: &Turn) -> bool {
   // A run is its records' slices, sent by one vectored write: never copied into one buffer first.
   let mut run: Vec<&[u8]> = Vec::new();
   let mut run_bytes = 0usize;
@@ -2822,7 +2980,7 @@ async fn send_turn(connection: &Connection, turn: &Turn) -> bool {
 
 /// Sends one run of whole records (if any), then consumes the receive queue through `through`; whether both succeeded.
 async fn send_run(
-  connection: &Connection,
+  connection: &mut Connection,
   run: &[&[u8]],
   through: usize,
   consumed: &mut usize,
@@ -2835,12 +2993,7 @@ async fn send_run(
     }
   }
   let count = through.saturating_sub(*consumed);
-  let discarded = STREAM_BUFFER.with(|cell| {
-    cell
-      .try_borrow_mut()
-      .ok()
-      .is_some_and(|mut buffer| connection.stream.discard(count, &mut buffer).is_ok())
-  });
+  let discarded = consume(connection, count);
   *consumed = through;
   discarded
 }
@@ -3011,6 +3164,8 @@ fn migrate(owner: u16, connection: Connection) {
     home,
     carry,
     held,
+    #[cfg(windows)]
+    inbox,
     ..
   } = connection;
   let fd = stream.into_owned();
@@ -3034,7 +3189,11 @@ fn migrate(owner: u16, connection: Connection) {
         home,
         carry: None,
         held,
+        #[cfg(unix)]
         wanted: 0,
+        // The requests read here and not yet answered, the call that moved the connection among them, go with it.
+        #[cfg(windows)]
+        inbox,
       };
       spawn_connection(connection);
     }),

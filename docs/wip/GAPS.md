@@ -727,7 +727,10 @@ missing, or impossible with its source, and the order of work. Two gaps underlay
    edge, the NFS network export and a fleet node's export were missing there. Each is now built on it in turn.
 2. **Holding a restarted daemon's sockets and mounts on Windows (OPEN).** The anchor holds the fleet's serve sockets,
    the NFS listener and the FUSE devices by descriptor inheritance, all Unix-only; on Windows a fleet node's ports are
-   free across a restart and a WinFsp mount dies with its daemon.
+   free across a restart and a WinFsp mount dies with its daemon. Since A-184 the Windows NFS server answers it in two
+   paired places, which change with it: `anchor_hold`'s Windows arm answers that no anchor holds, and a connection's
+   inbox holds requests already read from the kernel, so holding a connection must carry the inbox's bytes. A held
+   Shards stream also adds the guest term to the inode reserve (`guest_listing_entries`).
 
 **Closed 2026-10-26 by A-183:** the MCP HTTP edge on Windows, and the Windows datagram socket's inheritance and
 exclusive address (A-182's sibling). Its first Windows run found that a refusal closed at once was erased by the reset
@@ -743,8 +746,14 @@ Owed from A-183:
 - **Linux sockets close-on-exec as they are made** (`SOCK_CLOEXEC`): the seam sets the flag after `socket()`, so a
   process that another thread starts in between inherits the socket. macOS has no atomic form.
 
+**Closed 2026-10-26 by A-184:** the NFS server, and with it the network export, on Windows. A connection there frames
+its requests in its own inbox, since Windows keeps no receive low-water mark. Owed from A-184:
+- **A real Linux kernel client** mounting a Windows export: Docker Desktop's machine through `host.docker.internal`, or
+  WSL2.
+- **The owner a Windows export presents:** a provisioned root's group is 0 there (`verbs::creator_gid`).
+- **The arm64 Windows lane** builds no server, so the export is unrun there.
+
 The rest of the list:
-- the network export on Windows;
 - `slates exec` on macOS and Windows;
 - `slates oci-runtime`/`oci-check` on Windows;
 - the anchor's restart from its own image on macOS (A-145);

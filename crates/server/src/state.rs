@@ -275,44 +275,35 @@ pub struct ShardState {
   /// created with the first v4 call under the configuration's derived bounds. A v4 client's session
   /// outlives its connection, so the state is the listener's, not a connection's. `None` on a shard
   /// that serves no v4 call.
-  #[cfg(unix)]
   pub nfs_v4: Option<slates_bridge_nfs::v4::compound::Server>,
   /// The NFSv4 file state of the files this shard owns (§4.6 A-36): their opens and locks, whichever
   /// listener or connection made them, created with the first v4 state call under the configuration's
   /// derived bounds.
-  #[cfg(unix)]
   pub nfs_v4_files: Option<slates_bridge_nfs::v4::files::FileState>,
   /// The delegation recalls waiting for each session's back channel (`crate::delegation`; bounded by the delegations
   /// each client holds).
-  #[cfg(unix)]
   pub(crate) recall_queues: std::collections::BTreeMap<
     slates_bridge_nfs::v4::types::SessionId,
     crate::delegation::RecallQueue,
   >,
   /// This daemon life's NFSv4 instance on the shard's partition (§4.6 A-37), advanced durably on first
   /// use; every NFSv4 id the shard mints names it.
-  #[cfg(unix)]
   pub nfs_v4_instance: Option<u32>,
   /// The call records of the recorded compounds whose calls this shard served (A-127), bounded by the configuration's
   /// derived record bytes; what answers a compound retried after a restart.
-  #[cfg(unix)]
   pub(crate) nfs_calls: slates_bridge_nfs::v4::replay::CallRecords,
   /// The call of a recorded compound this shard is serving right now (A-127), set for the synchronous span of one
   /// call so a file-state change it makes carries the compound's record in its own transaction.
-  #[cfg(unix)]
   pub(crate) nfs_call: Option<crate::nfs_replay::RecordedCall>,
   /// The NFSv3 replies held for connections the anchor holds (A-128), by (connection, xid): each mutation's reply,
   /// recorded before its barrier publishes so the publication carries it with the effect, and dropped once its turn's
   /// replies are sent. At most a turn's mutations per held connection on this shard.
-  #[cfg(unix)]
   pub(crate) held_nfs_replies: std::collections::BTreeMap<(u64, u32), (bool, Vec<u8>)>,
   /// Whether [`ShardState::held_nfs_replies`] changed since the last publication, which a delta then carries whole.
-  #[cfg(unix)]
   pub(crate) held_nfs_replies_changed: bool,
   /// The held NFSv3 replies the previous daemon published and never sent (A-128), by (connection, xid): a request it
   /// applied and left unanswered on a held connection is answered from here, never applied twice. Each is taken when
   /// its request is read again; at most the previous image's.
-  #[cfg(unix)]
   pub(crate) recovered_nfs_replies: std::collections::BTreeMap<(u64, u32), (bool, Vec<u8>)>,
   /// The partition.
   pub db: Db,
@@ -610,10 +601,8 @@ pub struct ShardState {
   /// the epochs keyed from each pair's canonical record session (`crate::member_task`). Empty on a laptop.
   pub(crate) plane: crate::member_task::PlaneState,
   /// How long this shard took to serve each NFS call it read, served here or forwarded to its owner (§4.14).
-  #[cfg(unix)]
   pub nfs_service: crate::nfs::ServiceTimes,
   /// The NFSv4.1 back channels of the connections this shard serves (`crate::callback`).
-  #[cfg(unix)]
   pub(crate) callbacks: crate::callback::Callbacks,
   /// The staging buffers of edits too large for one request, for the works this shard owns (`crate::staging`).
   pub(crate) staging: crate::staging::Staging,
