@@ -43,7 +43,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         if: ${{ !matrix.musl }}
         with:
-          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
           targets: ${{ matrix.target }}
       - name: Build (native or cross via --target)
         if: ${{ !matrix.musl }}

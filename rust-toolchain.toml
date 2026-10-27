@@ -3,7 +3,12 @@
 # machine, so CI's runner and a laptop can be several stables apart, which makes a
 # `clippy -D warnings` gate unreproducible (vorpal learned this; Appendix B.1). Bump this file
 # and the matching pins in .github/workflows/ in one commit, after a local `cargo clippy` pass.
-channel = "1.98.0"
+# 1.98.1, not 1.98.0: 1.98.0 miscompiles some trait-object vtables, leaving a slot that must hold a function pointer
+# null, so a call through it jumps to address 0 in safe code (Rust 1.98.1 release notes). focal's reduction
+# (`crates/wire/tests/toolchain.rs`) dies of SIGSEGV built by 1.98.0 at opt-level 0 and 3, and passes built by 1.98.1
+# (aarch64-apple-darwin, 2026-10-27); slates boxes such chains (`NameEquivalence::folded`'s `flat_map`, the directory
+# iterators). Shards and hyper-raft moved to it for the same reduction.
+channel = "1.98.1"
 # miri is nightly-only: it is unavailable for a stable channel, so listing it here makes every stable
 # `cargo` invocation warn ("skipping unavailable component miri") and, under a strict install (the KIND
 # lane's `rustup ... --locked` in Docker), fail. The miri CI job installs it from nightly explicitly

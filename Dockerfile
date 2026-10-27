@@ -24,7 +24,7 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/work/target,sharing=locked \
-    RUSTUP_TOOLCHAIN=1.98.0 cargo build --release --locked -p slates-cli \
+    RUSTUP_TOOLCHAIN=1.98.1 cargo build --release --locked -p slates-cli \
     && cp target/release/slates /slates
 
 # The runtime base is the builder's own Debian release (13, glibc 2.41): the binary links the builder's

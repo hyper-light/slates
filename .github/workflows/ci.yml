@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       # The workspace runs the byte-for-byte chart golden too. Use its renderer, as in the
@@ -268,7 +268,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with:
@@ -335,7 +335,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
           components: clippy
       - uses: Swatinem/rust-cache@v2
       # AWS-LC's x86_64 Windows assembly is NASM source, built from source rather than taken prebuilt (Ada,
@@ -560,7 +560,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: valgrind
@@ -617,7 +617,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
           components: clippy
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
@@ -666,7 +666,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Clippy natively on arm64 Windows
@@ -754,7 +754,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
       - name: FUSE and the operator's grant (Linux arm64)
         run: |
@@ -786,7 +786,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
       # AC-0.7 / T-0.3: every loom model in the workspace — the one-producer ring, the two contending
       # producers, the lapping producer, the handle core (a handle crossing threads against its slot's
@@ -820,7 +820,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       # AWS-LC's x86_64 Windows assembly is NASM source, built from source rather than taken prebuilt (Ada,
@@ -947,7 +947,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
       # strace for the tracer; the NFS client for the root-mount adapter; fuse3 (fusermount3) for the FUSE
       # and container (`oci-linux`) transports; the workload tools the design names that the image lacks
@@ -1027,7 +1027,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
       - name: shuttle (T-1.6 two agents on one base; T-6.7 sixteen agents on one green)
         run: RUSTFLAGS="--cfg shuttle" cargo test -p slates-vfs -p slates-merge --test shuttle_clones --test shuttle_green -- --nocapture
@@ -1045,7 +1045,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
@@ -1090,7 +1090,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
       - uses: azure/setup-helm@v4
         with:
