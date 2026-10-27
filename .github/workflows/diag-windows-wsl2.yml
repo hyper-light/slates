@@ -1,0 +1,35 @@
+name: DIAG WSL2 file sharing (not for main)
+
+# A diagnostics branch, never merged. The DAX matrix's "Hyper-V and WSL2" and "Docker Desktop on WSL2" cells
+# (docs/wip/virtiofs.md §8) say a WSL2 guest reaches Windows' files over 9P, with no DAX window, unconfirmed by a run.
+# This boots a WSL2 distribution on CI's windows-2025 and reads how it mounts the Windows drive, and whether any
+# virtio-fs device or DAX window exists in it.
+
+on:
+  push:
+    branches: [diag-windows-wsl2]
+
+jobs:
+  wsl2:
+    name: WSL2 file sharing on windows-2025
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - name: WSL as installed
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          wsl --version
+          wsl --status
+          wsl --list --verbose
+      - name: A distribution, without a user
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          wsl --install --no-launch --distribution Ubuntu-24.04 --web-download
+          wsl --list --verbose
+      - name: How the WSL2 guest sees Windows' drive
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          wsl --distribution Ubuntu-24.04 --user root -- sh -c "uname -a; echo ---; grep -E ' /mnt/c | 9p | virtiofs | drvfs ' /proc/mounts; echo ---; grep -i -E 'virtiofs|9p' /proc/filesystems; echo ---; dmesg | grep -i -E 'virtio_fs|virtiofs|dax|9p|hv_|vmbus' | head -30; echo ---; ls /sys/bus/virtio/drivers/ 2>/dev/null; cat /sys/bus/virtio/devices/*/device 2>/dev/null"
