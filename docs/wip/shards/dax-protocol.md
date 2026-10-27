@@ -147,6 +147,43 @@ server does (`answer` reads `1..9` and `9`).
      room. A budgeted run therefore holds its stores to holes until slates lets the object go, when the node is
      forgotten or the stream ends. Shards will record this in D188 and D189 when this lands.
 
+## Windows (plan G-shards-windows step 5, agreed with the Shards device's author 2026-10-26)
+
+Windows passes no descriptor over a stream, so the object goes to the VM process by handle duplication, and the ask
+says where.
+
+**The ask** is the 26-byte ranged ask, then two fields: 38 bytes after the length word. Windows accepts no shorter form.
+
+| bytes | field | meaning |
+|---|---|---|
+| 26..30 | pid | the asking process's id, `le32` (`GetCurrentProcessId`) |
+| 30..38 | stream | the value, in that process, of its handle of the stream, `le64` |
+
+**The answer** keeps the `shards_ipc` framing: kind 0 with an 8-byte payload, the section's handle value in the asking
+process (`le64`); kind 1 with the errno (`le32`, Linux numbers), as on Unix.
+
+**The check before anything is handed.** The daemon opens the named process, duplicates the named handle into itself,
+and requires it to be the same kernel object as a known holder's handle of this stream (`CompareObjectHandles`). The
+known holders are the attaching client, whose handle the attach duplicated, and the last claimant that passed. Any
+other answer is refused `EACCES`, and nothing is put into the named process: another pipe, no pipe, a value naming
+nothing, a process gone or of another user. The pipe allows one instance, already connected, so "the same object" and
+"a handle of this pipe's name" refuse and grant the same claimants. The check is by object because every name query
+waits on a synchronous handle's lock: measured on jupiter (Windows 10.0.26200, 2026-10-26), `FileNameInfo`,
+`NtQueryObject(ObjectNameInformation)` and `FileModeInformation` each hung past 3 s on a synchronous pipe with a read
+pending. `CompareObjectHandles`, `GetFileType`, the object's type, and closing the duplicate each answered at once. So
+the attaching client keeps its copy of the stream until its child exits (step 2).
+
+**The object** is an unnamed pagefile-backed section under `D:P(A;;RC;;;OW)` (A-175's confining descriptor). It is
+reserved (`SEC_RESERVE`) at the machine's physical memory in whole ranges (`slates_mem::dax_object_bytes`), not at
+`2^63 − 2 MiB`, because a section's making costs in proportion to its size, reserved or not. Measured on jupiter the
+same day: 2^48 bytes took 3.3 ms and 12,001 pages of commit to make, 2^53 took 129 ms and 358,807 pages, and 2^62 or
+more was refused `ERROR_NO_SYSTEM_RESOURCES`. A RAM-only volume's file holds no more bytes than the machine has, so
+only a hand-made sparse file can pass the size; a change taking a backed file past it is refused `EFBIG`, as on Unix
+past `2^63 − 2 MiB`. A reserved page faults every view until it is committed, so each range an ask covers is committed
+whole before the answer, past the file's end too. A commit belongs to the section, so the device commits nothing.
+The duplicate maps read alone, or read and write for a writable ask, and may query its size (`SECTION_QUERY`). The
+descriptor refuses any duplicate of more, a rewrite of the descriptor included.
+
 ## What Shards' device does
 
 **Nothing new is required.** The design rests on behaviour the device already has, each confirmed by its owner on

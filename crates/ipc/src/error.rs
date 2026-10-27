@@ -108,6 +108,12 @@ pub enum IpcError {
     /// The instance.
     instance: String,
   },
+  /// A process named to receive a handle does not hold the stream it must hold (Windows, plan G-shards-windows step
+  /// 5): the handle it names there is not the stream's object, or names nothing.
+  NotAHolder {
+    /// The process named.
+    pid: u32,
+  },
 }
 
 /// Why the daemon's socket route refused (A-161, A-173; `crate::route`).
@@ -203,6 +209,10 @@ impl fmt::Display for IpcError {
       Self::InstanceHeld { instance } => write!(
         f,
         "a live process already holds instance {instance}'s rendezvous (a daemon of the instance or its anchor)"
+      ),
+      Self::NotAHolder { pid } => write!(
+        f,
+        "process {pid} does not hold the stream: the handle it names is not the stream's"
       ),
     }
   }

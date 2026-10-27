@@ -2563,7 +2563,7 @@ impl Volume {
       .checked_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
       .ok_or(VfsError::FileTooLarge)?;
     // A file a Shards guest maps has an object of a fixed size (Shards part 3): a change past it cannot reach the map.
-    if end > slates_mem::DAX_OBJECT_BYTES && store.shards_backings.backs(self.prefix, no) {
+    if end > slates_mem::dax_object_bytes() && store.shards_backings.backs(self.prefix, no) {
       return Err(VfsError::FileTooLarge);
     }
     // A journaled write is a namespace write; an unjournaled one is an attribute value's.
@@ -2856,7 +2856,7 @@ impl Volume {
     recorded: Recorded,
   ) -> Result<(), VfsError> {
     // A file a Shards guest maps has an object of a fixed size (Shards part 3): a size past it cannot reach the map.
-    if len > slates_mem::DAX_OBJECT_BYTES && store.shards_backings.backs(self.prefix, no) {
+    if len > slates_mem::dax_object_bytes() && store.shards_backings.backs(self.prefix, no) {
       return Err(VfsError::FileTooLarge);
     }
     let old_size = self.inode(store, no)?.attrs.size;

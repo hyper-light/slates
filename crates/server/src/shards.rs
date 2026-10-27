@@ -73,12 +73,8 @@ use crate::daemon::Daemon;
 use crate::error::ServerError;
 use crate::state::{self, ShardState};
 
-// The DAX half (Shards part 3): Unix answers a descriptor ask with a file's DAX object; Windows' arm, with the same
-// surface, refuses every ask until its own window is built (A-179; plan G-shards-windows step 5).
-#[cfg(unix)]
-mod dax;
-#[cfg(windows)]
-#[path = "shards/dax_refused.rs"]
+// The DAX half (Shards part 3): a descriptor ask is answered with a file's DAX object, by descriptor on Unix and by a
+// section duplicated into the claimant's process on Windows (plan G-shards-windows step 5).
 mod dax;
 // The daemon's end of the stream as each platform serves it: one seam, paired arms.
 mod end;
@@ -87,8 +83,6 @@ pub use end::HandedEnd;
 use end::{DaemonEnd, Received, Sent};
 
 /// What an ingest was for, on a stream.
-// Built by the Unix DAX arm's ingest; Windows' arm backs nothing yet, so it never ingests (A-179, step 5 owes it).
-#[cfg_attr(windows, allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Then {
   /// The held request of `total` bytes at the head of the stream is served next.
@@ -144,6 +138,10 @@ const OFFER_WITHDRAWN: &str = "shards.route_withdrawn";
 /// Format: the refusal-ledger name of a stream end that could not be sent to its client (no control socket, the
 /// client gone, a refused send): the end closes, so the stream ends and its attachment with it.
 const DELIVERY_REFUSED: &str = "shards.delivery_refused";
+/// Format: the refusal-ledger name of a hand-off whose holder could not be told to the stream's owner shard (Windows):
+/// that stream's DAX asks are then refused.
+#[cfg(windows)]
+const HOLDER_UNTOLD: &str = "shards.holder_untold";
 /// Format: the refusal-ledger name of a stream end dropped because its request's reply was not the attach that made
 /// it (a rolled-back verb answered a refusal): the end closes, so the stream ends with it.
 const HANDOFF_DROPPED: &str = "shards.handoff_dropped";
@@ -190,6 +188,13 @@ pub(crate) struct ShardsStream {
   /// The descriptor the owed reply carries by `SCM_RIGHTS` on its first byte: sent with it, then closed (Unix; none
   /// exists on Windows).
   owed_descriptor: Option<dax::Descriptor>,
+  /// The processes known to hold this stream, each with the value of its handle there: the attaching client, once the
+  /// attach's hand-off is recorded, and the last DAX claimant that passed (Windows; `dax::record_holder`).
+  #[cfg(windows)]
+  holders: Vec<(u32, u64)>,
+  /// The process the DAX ask being filled is answered into, judged to hold the stream (Windows).
+  #[cfg(windows)]
+  claimant: Option<slates_ipc::handle_route::Claimant>,
   /// Whether the ingest a stream takes before it ends has been started: once, whatever ends it.
   ingested_at_end: bool,
 }
@@ -215,6 +220,9 @@ pub(crate) type ShardsStreams = BTreeMap<u64, ShardsStream>;
 pub(crate) struct Handoff {
   /// The attachment the daemon serves on the stream's other end.
   pub(crate) attachment: u64,
+  /// The shard that serves the stream, told who holds it once it is handed (Windows: `tell_holder`).
+  #[cfg(windows)]
+  pub(crate) owner: u16,
   /// The end to hand the client.
   pub(crate) stream: HandedEnd,
 }
@@ -351,6 +359,10 @@ pub(crate) fn attach(s: &mut ShardState, ask: ShardsAsk) -> Result<ShardsAttache
       ending: false,
       dax: dax::Session::new(),
       owed_descriptor: None,
+      #[cfg(windows)]
+      holders: Vec::new(),
+      #[cfg(windows)]
+      claimant: None,
       ingested_at_end: false,
     },
   );
@@ -551,8 +563,15 @@ fn hand_out(
     lease_epoch,
     stream,
   } = attached;
-  s.stream_handoffs
-    .insert(request, Handoff { attachment, stream });
+  let owner = registry::current_shard().unwrap_or(0);
+  s.stream_handoffs.insert(
+    request,
+    Handoff {
+      attachment,
+      owner,
+      stream,
+    },
+  );
   slates_ipc::protocol::ReplyBody::ShardsHanded {
     attachment,
     lease_epoch,
@@ -600,7 +619,7 @@ pub(crate) fn deliver_handoff(
     return;
   }
   let client = slates_wire::request::RequestId::from_word(request).client;
-  let handed = s
+  let slot = s
     .clients
     .generation_at(client_index)
     .and_then(|generation| {
@@ -608,10 +627,21 @@ pub(crate) fn deliver_handoff(
         .get(slates_mem::Handle::from_raw(client_index, generation))
         .ok()
     })
-    .filter(|slot| !slot.retiring && slot.client_id == client)
-    .is_some_and(|slot| hand_to_client(slot, request, &handoff, reply));
+    .filter(|slot| !slot.retiring && slot.client_id == client);
+  #[cfg(windows)]
+  let pid = slot.map_or(0, |slot| slot.pid);
+  let handed = slot.is_some_and(|slot| hand_to_client(slot, request, &handoff, reply));
   if !handed {
     s.count(DELIVERY_REFUSED, 1);
+  }
+  #[cfg(windows)]
+  {
+    if handed
+      && let slates_ipc::protocol::ReplyBody::ShardsHanded { handle, .. } = reply
+      && !tell_holder(&handoff, pid, *handle)
+    {
+      s.count(HOLDER_UNTOLD, 1);
+    }
   }
 }
 
@@ -661,6 +691,22 @@ fn hand_to_client(
     }
     Err(_) => false,
   }
+}
+
+/// Tells the stream's owner shard that `pid` holds the stream as the handle `value` (Windows, plan G-shards-windows
+/// step 5): the known holder a VMM's DAX claim is judged against (`dax::record_holder`). Sent as a task to that shard,
+/// where the stream lives, before the attach's reply is written, so it is queued there before the client can name the
+/// value to anyone. Whether the runtime took it: if not, the stream has no known holder, and its DAX asks are refused.
+#[cfg(windows)]
+fn tell_holder(handoff: &Handoff, pid: u32, value: u64) -> bool {
+  let attachment = handoff.attachment;
+  let task = SpawnRequest::new(
+    Box::pin(async move {
+      state::with_state(|s| dax::record_holder(s, attachment, pid, value));
+    }),
+    None,
+  );
+  registry::send_control(handoff.owner, Control::Spawn(Box::new(task))).is_ok()
 }
 
 /// Ends every stream serving `volume` (its destroy): each marked ending and ended both ways, so its task sweeps its

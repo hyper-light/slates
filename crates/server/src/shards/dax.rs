@@ -33,8 +33,17 @@
 //! - `shards.dax_witness`, the bridge's errno: a writable ask's file could not be copied up;
 //! - `shards.dax_busy`, `EBUSY`: an in-process guest maps the file writable.
 //!
-//! The descriptor an answer carries is a Unix descriptor ([`Descriptor`]); Windows' arm (`dax_refused.rs`) has the same
-//! surface and refuses every ask until its own window is built (A-179).
+//! **Windows** (plan G-shards-windows step 5). Windows passes no descriptor, so the object (a confined section,
+//! `slates_mem::DaxObject`) is duplicated into the process the ask names, and the answer carries the duplicate's value
+//! (`descriptor_handle_answer`). The ask states the process's id and the value there of its stream handle
+//! (`descriptor_claim`), and before anything is made or filled the daemon checks that the handle is this attachment's
+//! stream (`slates_ipc::handle_route::claim`): the same object as a known holder's, the attaching client's handle that
+//! the attach duplicated (recorded by `record_holder`) or the last claimant that passed. Identity rather than the
+//! pipe's name, since a name query waits on a synchronous handle's lock (measured; `claim` says by how much). A
+//! claimant that fails is refused `EACCES`, counted `shards.dax_claim_refused`, and nothing is put into its process. The
+//! duplicate maps read alone, or read and write for a writable ask, and its section's descriptor lets no holder widen
+//! it (A-175's discipline). A hand-off the OS refuses at the end is refused `EIO`, counted
+//! `shards.dax_hand_refused`.
 //!
 //! An answered ask counts `shards.dax_answered`; an ingest's written runs `shards.dax_ingested`, and one the bridge
 //! refused `shards.dax_ingest_refused`. A refilled backing counts `shards.dax_refilled`; a range the volume refused to
@@ -46,7 +55,9 @@ use slates_bridge_core::dax_backing::{
 };
 use slates_bridge_core::{Bridge, DaxOffer, OpContext, VolumeBridge};
 use slates_bridge_fuse::bridge::{dax_failure_errno, dax_refused_errno};
-use slates_bridge_fuse::shards_fs::{descriptor_answer, descriptor_ask, descriptor_refusal};
+use slates_bridge_fuse::shards_fs::descriptor_refusal;
+#[cfg(unix)]
+use slates_bridge_fuse::shards_fs::{descriptor_answer, descriptor_ask};
 use slates_vfs::error::VfsError;
 use slates_vfs::host::HostFs;
 
@@ -87,8 +98,27 @@ const REFILL_REFUSED: &str = "shards.dax_refill_refused";
 /// rather than lose the guest's stores: never expected, since a file is copied up before any writable ask of it.
 const REFILL_WRITABLE: &str = "shards.dax_refill_writable";
 
+/// Format: the refusal-ledger name of a Windows ask whose named process does not hold this attachment's stream (another
+/// pipe's handle, no pipe's, a value naming nothing, a process gone or of another user): nothing is duplicated into it.
+#[cfg(windows)]
+const CLAIM_REFUSED: &str = "shards.dax_claim_refused";
+/// Format: the refusal-ledger name of a Windows hand-off the OS refused once the fill was done (the claimant's process
+/// gone meanwhile).
+#[cfg(windows)]
+const HAND_REFUSED: &str = "shards.dax_hand_refused";
+/// Shape: the stream holders a Windows stream remembers for the claim check: the attaching client and the last
+/// claimant that passed.
+#[cfg(windows)]
+const HOLDERS: usize = 2;
+
 /// The descriptor an answer carries by `SCM_RIGHTS`: one file's DAX object.
+#[cfg(unix)]
 pub(crate) type Descriptor = std::os::fd::OwnedFd;
+/// No descriptor rides a pipe: the answer carries the section's value in the claimant's process instead, so this type
+/// has no values and no reply owes one (Windows).
+#[cfg(windows)]
+#[derive(Debug)]
+pub(crate) enum Descriptor {}
 
 /// A stream's DAX session: the shared backed session (`slates_bridge_core::dax_backing`).
 pub(crate) type Session = DaxBackingSession;
@@ -183,11 +213,45 @@ fn with_session<T>(
 /// Takes the DESCRIPTOR ask whose body (after its ask byte) is `body` on `stream`: the session checks it, makes the
 /// node's backing if it has none, and leaves its fill pending, run by [`step`]. A refusal is answered and counted at
 /// once.
+#[cfg(unix)]
 pub(super) fn begin(s: &mut ShardState, stream: &mut ShardsStream, body: &[u8]) {
   let Some(parsed) = descriptor_ask(body) else {
     refuse(s, stream, &Refused::Malformed);
     return;
   };
+  take(s, stream, parsed);
+}
+
+/// Takes the Windows DESCRIPTOR ask whose body (after its ask byte) is `body` on `stream`: its claimant checked first
+/// (`slates_ipc::handle_route::claim`), then as on Unix. A refusal is answered and counted at once; a claimant refused
+/// gets nothing.
+#[cfg(windows)]
+pub(super) fn begin(s: &mut ShardState, stream: &mut ShardsStream, body: &[u8]) {
+  stream.claimant = None;
+  let Some(parsed) = slates_bridge_fuse::shards_fs::descriptor_claim(body) else {
+    refuse(s, stream, &Refused::Malformed);
+    return;
+  };
+  match slates_ipc::handle_route::claim(parsed.pid, parsed.stream, &stream.holders) {
+    Ok(claimant) => stream.claimant = Some(claimant),
+    Err(_) => {
+      owe(
+        stream,
+        &descriptor_refusal(slates_bridge_fuse::bridge::EACCES),
+      );
+      s.count(CLAIM_REFUSED, 1);
+      return;
+    }
+  }
+  take(s, stream, parsed.ask);
+}
+
+/// Hands `parsed` to the session.
+fn take(
+  s: &mut ShardState,
+  stream: &mut ShardsStream,
+  parsed: slates_bridge_fuse::shards_fs::DescriptorAsk,
+) {
   let ask = Ask {
     node: parsed.node,
     writable: parsed.writable,
@@ -198,6 +262,27 @@ pub(super) fn begin(s: &mut ShardState, stream: &mut ShardsStream, body: &[u8]) 
   if let Err(refused) = taken {
     refuse(s, stream, &refused);
   }
+}
+
+/// Records `(pid, stream)` as a holder of the stream of `attachment` on this shard: the attaching client and the
+/// handle the attach duplicated into it (Windows). Kept at most [`HOLDERS`]: the first, and the latest.
+#[cfg(windows)]
+pub(crate) fn record_holder(s: &mut ShardState, attachment: u64, pid: u32, value: u64) {
+  if let Some(stream) = s.shards_streams.get_mut(&attachment) {
+    remember(&mut stream.holders, (pid, value));
+  }
+}
+
+/// Adds `holder` to `holders`, keeping the first and the latest, at most [`HOLDERS`].
+#[cfg(windows)]
+fn remember(holders: &mut Vec<(u32, u64)>, holder: (u32, u64)) {
+  if holders.contains(&holder) {
+    return;
+  }
+  if holders.len() >= HOLDERS {
+    holders.truncate(HOLDERS.saturating_sub(1));
+  }
+  holders.push(holder);
 }
 
 /// One slice of `stream`'s pending fill. When the fill is done the answer is owed, its descriptor with it; a refusal
@@ -213,17 +298,55 @@ pub(super) fn step(s: &mut ShardState, stream: &mut ShardsStream) {
       refuse(s, stream, &Refused::Unreachable(VfsError::NotFound));
     }
     Some(FillStep::Idle | FillStep::Filling) => {}
-    Some(FillStep::Done(descriptor)) => {
-      owe(stream, &descriptor_answer());
-      stream.owed_descriptor = Some(descriptor);
-    }
+    Some(FillStep::Done(handed)) => answer(s, stream, handed),
     Some(FillStep::Refused(refused)) => refuse(s, stream, &refused),
   }
   forward_counts(s, stream);
 }
 
+/// Answers the filled ask with its descriptor, riding the answer by `SCM_RIGHTS` (Unix).
+#[cfg(unix)]
+fn answer(_s: &mut ShardState, stream: &mut ShardsStream, handed: Descriptor) {
+  owe(stream, &descriptor_answer());
+  stream.owed_descriptor = Some(handed);
+}
+
+/// Answers the filled ask with the value of the section's duplicate in the claimant's process (Windows), and remembers
+/// the claimant as a holder; the daemon's own duplicate closes here. With no claimant (never expected: every ask is
+/// claimed before it is taken), or the OS refusing the duplicate, the ask is refused `EIO`, counted.
+#[cfg(windows)]
+fn answer(
+  s: &mut ShardState,
+  stream: &mut ShardsStream,
+  handed: slates_vfs::shards_backing::HandedObject,
+) {
+  use std::os::windows::io::AsHandle;
+  let value = stream.claimant.take().and_then(|claimant| {
+    let value = slates_ipc::handle_route::hand_to_claimant(handed.as_handle(), &claimant).ok()?;
+    remember(&mut stream.holders, (claimant.pid(), claimant.stream()));
+    Some(value)
+  });
+  match value {
+    Some(value) => owe(
+      stream,
+      &slates_bridge_fuse::shards_fs::descriptor_handle_answer(value),
+    ),
+    None => {
+      owe(
+        stream,
+        &descriptor_refusal(dax_refused_errno(&Refused::Object)),
+      );
+      s.count(HAND_REFUSED, 1);
+    }
+  }
+}
+
 /// Answers the ask being taken or filled with `refused`, and counts it.
 fn refuse(s: &mut ShardState, stream: &mut ShardsStream, refused: &Refused) {
+  #[cfg(windows)]
+  {
+    stream.claimant = None;
+  }
   owe(stream, &descriptor_refusal(dax_refused_errno(refused)));
   s.count(refused_counter(refused), 1);
 }

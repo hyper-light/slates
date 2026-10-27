@@ -1326,6 +1326,7 @@ dependencies = [
  "proptest",
  "rustix",
  "slates-db",
+ "slates-machine",
  "slates-mem",
  "slates-test-seeds",
  "slates-vfs",

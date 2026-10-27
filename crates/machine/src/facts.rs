@@ -295,6 +295,18 @@ impl Facts {
     platform::resident_bytes()
   }
 
+  /// The machine's physical memory in bytes (one cheap query; 0 where the OS refuses it): what bounds the bytes any file
+  /// of a RAM-only volume can hold, so it sizes what must cover any such file (a Windows DAX section, `slates-mem`).
+  pub fn memory_total() -> u64 {
+    platform::memory(&mut Vec::new()).total
+  }
+
+  /// The base page size in bytes (one cheap query), at least one: the unit a mapping's pages come in, on every
+  /// platform (the backed DAX session skips pages of zeros in it, `slates-bridge-core`).
+  pub fn page_bytes() -> u64 {
+    platform::page(&mut Vec::new()).base.max(1)
+  }
+
   /// Every fact, queried now (the boot profile's input).
   pub fn query() -> Facts {
     let mut notes = Vec::new();

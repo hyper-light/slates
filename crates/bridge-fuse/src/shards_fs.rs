@@ -310,6 +310,53 @@ pub fn descriptor_answer() -> [u8; IPC_HEADER_BYTES] {
   [IPC_DESCRIPTOR, 0, 0, 0, 0]
 }
 
+/// Format: a DESCRIPTOR ask's body on Windows, after its ask byte (plan G-shards-windows step 5, agreed with the Shards
+/// device's author 2026-10-26): the ranged body, then the asking process's id (`le32`, `GetCurrentProcessId`) and the
+/// value in that process of its handle of the stream (`le64`). Windows passes no descriptor, so the section is
+/// duplicated into the process the ask names, and the stream handle is how the daemon checks that the process holds
+/// this attachment's stream.
+pub const DESCRIPTOR_ASK_CLAIMED_BODY: usize =
+  DESCRIPTOR_ASK_RANGED_BODY + size_of::<u32>() + size_of::<u64>();
+
+/// A Windows DESCRIPTOR ask: the ask, and the process that claims to hold the stream with the value of its handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DescriptorClaim {
+  /// The ask, always with its range.
+  pub ask: DescriptorAsk,
+  /// The process the section is to be duplicated into.
+  pub pid: u32,
+  /// The value, in that process, of its handle of the stream.
+  pub stream: u64,
+}
+
+/// Parses a Windows DESCRIPTOR ask's body after its ask byte: `None` for a body of any other length than
+/// [`DESCRIPTOR_ASK_CLAIMED_BODY`] or a range [`descriptor_ask`] refuses. The device is new on Windows, so it has no
+/// shorter form to accept.
+pub fn descriptor_claim(body: &[u8]) -> Option<DescriptorClaim> {
+  if body.len() != DESCRIPTOR_ASK_CLAIMED_BODY {
+    return None;
+  }
+  let (ranged, claim) = body.split_at_checked(DESCRIPTOR_ASK_RANGED_BODY)?;
+  let ask = descriptor_ask(ranged)?;
+  let (pid, stream) = claim.split_at_checked(size_of::<u32>())?;
+  Some(DescriptorClaim {
+    ask,
+    pid: u32::from_le_bytes(pid.try_into().ok()?),
+    stream: u64::from_le_bytes(stream.try_into().ok()?),
+  })
+}
+
+/// The answer that hands a section on Windows: a `shards_ipc` message of kind zero whose payload is the value of the
+/// section's handle in the asking process, `le64`.
+pub fn descriptor_handle_answer(value: u64) -> Vec<u8> {
+  let payload = value.to_le_bytes();
+  let mut message = Vec::with_capacity(IPC_HEADER_BYTES.saturating_add(payload.len()));
+  message.push(IPC_DESCRIPTOR);
+  message.extend_from_slice(&u32::try_from(payload.len()).unwrap_or(0).to_be_bytes());
+  message.extend_from_slice(&payload);
+  message
+}
+
 /// The answer to a descriptor ask slates refuses: a `shards_ipc` message of a kind other than zero, whose payload is
 /// the errno, little-endian, which Shards' device returns to the guest's mapping (its `descriptor_on`).
 pub fn descriptor_refusal(errno: i32) -> Vec<u8> {
@@ -324,6 +371,46 @@ pub fn descriptor_refusal(errno: i32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// T-shards-windows-5.3. Do: parse a Windows DESCRIPTOR ask of each length around the claimed one, and one whose
+  /// range is empty. Expect the claimed body parsed field by field and every other refused; and the handle answer to
+  /// be kind zero, an 8-byte big-endian length, then the value little-endian (golden bytes).
+  #[test]
+  fn a_windows_descriptor_ask_carries_its_claim_and_its_answer_the_handle_value() {
+    let mut body = Vec::new();
+    body.extend_from_slice(&7u64.to_le_bytes());
+    body.push(1);
+    body.extend_from_slice(&(2u64 << 20).to_le_bytes());
+    body.extend_from_slice(&(2u64 << 20).to_le_bytes());
+    body.extend_from_slice(&0x1234u32.to_le_bytes());
+    body.extend_from_slice(&0x0abc_u64.to_le_bytes());
+    assert_eq!(body.len(), DESCRIPTOR_ASK_CLAIMED_BODY);
+    assert_eq!(
+      descriptor_claim(&body),
+      Some(DescriptorClaim {
+        ask: DescriptorAsk {
+          node: 7,
+          writable: true,
+          range: Some((2 << 20, 2 << 20)),
+        },
+        pid: 0x1234,
+        stream: 0x0abc,
+      })
+    );
+    assert_eq!(descriptor_claim(&body[..body.len() - 1]), None);
+    assert_eq!(descriptor_claim(&body[..DESCRIPTOR_ASK_RANGED_BODY]), None);
+    assert_eq!(descriptor_claim(&body[..DESCRIPTOR_ASK_BODY]), None);
+    let mut longer = body.clone();
+    longer.push(0);
+    assert_eq!(descriptor_claim(&longer), None);
+    let mut empty_range = body.clone();
+    empty_range[17..25].copy_from_slice(&0u64.to_le_bytes());
+    assert_eq!(descriptor_claim(&empty_range), None);
+    assert_eq!(
+      descriptor_handle_answer(0x0102_0304_0506_0708),
+      [0, 0, 0, 0, 8, 8, 7, 6, 5, 4, 3, 2, 1]
+    );
+  }
 
   /// Do: split a request, a control ask, partial frames, a frame past the bound, and a control frame with no ask.
   /// Expect each whole frame with its length, a partial one with the bytes it needs in all, and the two hostile ones

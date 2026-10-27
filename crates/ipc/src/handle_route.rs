@@ -28,8 +28,8 @@
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 
 use windows_sys::Win32::Foundation::{
-  DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED,
-  GetHandleInformation, GetLastError, HANDLE,
+  CompareObjectHandles, DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DuplicateHandle,
+  ERROR_ACCESS_DENIED, GetHandleInformation, GetLastError, HANDLE,
 };
 use windows_sys::Win32::Security::{
   EqualSid, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TOKEN_QUERY,
@@ -108,6 +108,114 @@ fn duplicate_into(handle: BorrowedHandle<'_>, pid: u32) -> Result<u64, IpcError>
     return Err(os("DuplicateHandle into the client"));
   }
   Ok(u64::try_from(value.expose_provenance()).unwrap_or(0))
+}
+
+/// A process judged to hold a Shards stream, opened to duplicate into (plan G-shards-windows step 5): what a VMM's
+/// descriptor ask is answered into, once [`claim`] has judged it.
+#[derive(Debug)]
+pub struct Claimant {
+  process: OwnedHandle,
+  pid: u32,
+  stream: u64,
+}
+
+impl Claimant {
+  /// The claimant's process id.
+  #[must_use]
+  pub fn pid(&self) -> u32 {
+    self.pid
+  }
+
+  /// The value of its stream handle, in its process: a known holder from now on.
+  #[must_use]
+  pub fn stream(&self) -> u64 {
+    self.stream
+  }
+}
+
+/// Judges whether the process `pid` holds the stream whose known holders are `holders` (each a process id and the
+/// value of a handle of the stream in it): the handle `stream` it names there must be the very object one of them
+/// holds. The claimant's handle and each holder's are duplicated into this process, compared by
+/// `CompareObjectHandles`, and closed; nothing is put into the claimant's process. Refused `PeerRefused` for a process
+/// of another user, `NotAHolder` where no holder's handle is the same object (a handle of another pipe, of no pipe, or
+/// a value that names nothing), and `OsRefused` where the process cannot be opened (gone, or not this user's).
+///
+/// Why identity and not the pipe's name. A name query waits on the file object's lock when the handle is synchronous,
+/// so a claimant naming any synchronous handle with a read pending would hold the asking shard: measured on jupiter
+/// (Windows 10.0.26200, 2026-10-26), `GetFileInformationByHandleEx(FileNameInfo)`, `NtQueryObject` with
+/// `ObjectNameInformation` and `NtQueryInformationFile` each hung past 3 s on such a pipe's duplicate, while
+/// `CompareObjectHandles` and closing the duplicate answered at once. The stream's pipe allows one instance, already
+/// connected, so a handle bearing its name is a handle of this one object: the outcome is the name check's.
+pub fn claim(pid: u32, stream: u64, holders: &[(u32, u64)]) -> Result<Claimant, IpcError> {
+  let process = open_process(pid, PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION)?;
+  same_user(process.as_handle())?;
+  let Ok(claimed) = duplicate_out(process.as_handle(), stream) else {
+    return Err(IpcError::NotAHolder { pid });
+  };
+  let held = holders.iter().any(|&(holder_pid, holder_value)| {
+    open_process(holder_pid, PROCESS_DUP_HANDLE)
+      .and_then(|holder| duplicate_out(holder.as_handle(), holder_value))
+      .is_ok_and(|known| {
+        // SAFETY: two live handles this process owns; the call compares the objects they name and touches neither.
+        unsafe { CompareObjectHandles(claimed.as_raw_handle(), known.as_raw_handle()) != 0 }
+      })
+  });
+  if !held {
+    return Err(IpcError::NotAHolder { pid });
+  }
+  Ok(Claimant {
+    process,
+    pid,
+    stream,
+  })
+}
+
+/// Duplicates `section`, with the access it has, into `claimant`'s process: the duplicate's value there, which only
+/// travels in the answer. Refused `OsRefused` where the process is gone or refuses.
+pub fn hand_to_claimant(section: BorrowedHandle<'_>, claimant: &Claimant) -> Result<u64, IpcError> {
+  let mut value: HANDLE = std::ptr::null_mut();
+  // SAFETY: this process's pseudo-handle as the source, a live handle of it, the claimant's process opened for
+  // duplication, and an out-pointer to a local; the duplicate lives in the claimant's table.
+  let done = unsafe {
+    DuplicateHandle(
+      GetCurrentProcess(),
+      section.as_raw_handle(),
+      claimant.process.as_raw_handle(),
+      &mut value,
+      0,
+      0,
+      DUPLICATE_SAME_ACCESS,
+    )
+  };
+  if done == 0 {
+    return Err(os("DuplicateHandle into the claimant"));
+  }
+  Ok(u64::try_from(value.expose_provenance()).unwrap_or(0))
+}
+
+/// A duplicate in this process of the handle `value` of `process`, with the access it has. Refused `OsRefused` for a
+/// value that names no handle there.
+fn duplicate_out(process: BorrowedHandle<'_>, value: u64) -> Result<OwnedHandle, IpcError> {
+  let source: HANDLE = std::ptr::with_exposed_provenance_mut(usize::try_from(value).unwrap_or(0));
+  let mut duplicate: HANDLE = std::ptr::null_mut();
+  // SAFETY: a process opened for duplication, a value in its table (checked by the call, refused if it names nothing),
+  // this process as the target, and an out-pointer to a local; the duplicate is owned below.
+  let done = unsafe {
+    DuplicateHandle(
+      process.as_raw_handle(),
+      source,
+      GetCurrentProcess(),
+      &mut duplicate,
+      0,
+      0,
+      DUPLICATE_SAME_ACCESS,
+    )
+  };
+  if done == 0 {
+    return Err(os("DuplicateHandle out of the claimant"));
+  }
+  // SAFETY: the duplicate just made, owned here alone and closed on drop.
+  Ok(unsafe { OwnedHandle::from_raw_handle(duplicate) })
 }
 
 /// Closes the handle `value` that [`hand_section`] duplicated into the process `pid`, in that process: what undoes a

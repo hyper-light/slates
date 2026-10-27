@@ -230,7 +230,11 @@ slates-machine = 51
 # has no Darwin advice, so they are `libc::madvise`); and the test-only footprint reader `test_serial::footprint`
 # (`proc_pid_rusage` into a buffer of its struct's size and the `assume_init` after it succeeded, 2), with which the
 # give-back's tests observe what macOS counts.
-slates-mem = 60
+slates-mem = 61
+# 2026-10-26 (+1, §4.6 A-180, a Shards DAX object on Windows, `dax_object.rs` compiled only for Windows): the object is
+#   a reserved section committed a range at a time, `VirtualAlloc(MEM_COMMIT)` over a range's fresh view (1). Its view
+#   at an offset shares the map's one `MapViewOfFile` site, and the handed duplicate and the peer's read-only one share
+#   one `DuplicateHandle` and its ownership, so the section's other calls are the peer section's sites above.
 # 2026-10-25 (+11, §4.6 A-175, the Windows direct map's peer section, `dax_object.rs` compiled only for Windows): there is
 #   no safe wrapper for a section under a security descriptor. `CreateFileMappingW` under the descriptor, the SDDL
 #   parsed into one and freed (`ConvertStringSecurityDescriptorToSecurityDescriptorW`, `LocalFree`), and the section's
@@ -298,7 +302,12 @@ slates-vfs = 0
 slates-land = 4
 slates-anchor = 6
 slates-db = 0
-slates-ipc = 94
+slates-ipc = 98
+# 2026-10-26 (+4, §4.6 A-180, Windows' Shards DAX claim, `handle_route.rs` compiled only for Windows): there is no safe
+#   wrapper for another process's handle table. The claimed handle and each known holder's duplicated out of their
+#   processes into this one and owned (`DuplicateHandle`, `from_raw_handle`, 2); the two compared as kernel objects
+#   (`CompareObjectHandles`, 1), never by a name query, which waits on a synchronous handle's lock; and the section
+#   duplicated into the claimant's process (`DuplicateHandle`, 1).
 # 2026-10-26 (+15, §4.6 A-179, the Shards stream on Windows, `stream_pipe.rs` compiled only for Windows): Win32 has no
 #   safe wrapper for a named pipe. The pair: the name's 128 bits from `BCryptGenRandom` (1); the owner-only descriptor
 #   parsed and freed (2); the server end made and owned (`CreateNamedPipeW`, `from_raw_handle`, 2) and the client end

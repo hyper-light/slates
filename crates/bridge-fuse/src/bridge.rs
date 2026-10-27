@@ -60,8 +60,9 @@ const EAGAIN: i32 = 11;
 const ENOENT: i32 = 2;
 /// Format: EPERM, operation not permitted.
 const EPERM: i32 = 1;
-/// Format: Linux EACCES, a symlink out of the volume refused to a caller who does not own it (A-107).
-const EACCES: i32 = 13;
+/// Format: Linux EACCES, a symlink out of the volume refused to a caller who does not own it (A-107), and a Windows
+/// DAX ask naming a process that does not hold its stream (plan G-shards-windows step 5).
+pub const EACCES: i32 = 13;
 /// Format: EEXIST, the name already exists.
 const EEXIST: i32 = 17;
 /// Format: ENOTDIR, not a directory.
@@ -83,10 +84,8 @@ const ENAMETOOLONG: i32 = 36;
 /// Format: EMFILE, too many open files (the bridge's handle table is full).
 const EMFILE: i32 = 24;
 /// Format: Linux ENOMEM, the answer to a DAX mapping past the shard's fill budget (A-163).
-#[cfg(unix)]
 const ENOMEM: i32 = 12;
 /// Format: Linux EBUSY, the answer to a DAX mapping of a file an in-process guest maps writable (A-163).
-#[cfg(unix)]
 const EBUSY: i32 = 16;
 /// Format: Linux ESTALE, a stale file handle: the node names a file no longer reachable (A-151: a base file that left
 /// its name with no descriptor held). A kernel's path walk that meets it looks the name up again.
@@ -675,7 +674,6 @@ pub fn errno(e: VfsError) -> i32 {
 
 /// The errno a guest's DAX mapping is answered for a backed session's refusal (§4.6, A-163): one mapping for every
 /// transport that hands a VMM a file's backing, the Shards route and slates' own virtio-fs device.
-#[cfg(unix)]
 pub fn dax_refused_errno(refused: &slates_bridge_core::dax_backing::Refused) -> i32 {
   use slates_bridge_core::dax_backing::Refused;
   match refused {
@@ -692,7 +690,6 @@ pub fn dax_refused_errno(refused: &slates_bridge_core::dax_backing::Refused) -> 
 
 /// The errno a request that asked for a guest's stores answers when their write-back stopped at `failure` (§4.6,
 /// A-163), so the guest's fsync or close fails rather than claim bytes durable that are not.
-#[cfg(unix)]
 pub fn dax_failure_errno(failure: &slates_bridge_core::dax_backing::Failure) -> i32 {
   use slates_bridge_core::dax_backing::Failure;
   match failure {

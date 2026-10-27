@@ -3560,7 +3560,9 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
   range at a time as asked, every change of the file through any path written into it before the change returns, and
   the guest's stores written back at its FSYNC, FLUSH, RELEASE and FORGET and the stream's end. So there is no revoke
   and no message to the device; the stream offers per-inode DAX (`FUSE_HAS_INODE_DAX`, `FUSE_ATTR_DAX` on files of a
-  range or more) while the shard's fill budget has room;
+  range or more) while the shard's fill budget has room. On Windows (A-180) the object is a section under A-175's
+  confining descriptor, reserved at the machine's memory and committed a range at a time. It is duplicated into the
+  process the ask names, once the handle that process names is shown to be this stream's own object;
 - the peer's close, a hostile frame, a detach, a revocation, the volume's destroy and the daemon's stop end the
   attachment one way: its references swept, its record removed. Nothing survives a restart.
 
@@ -3572,8 +3574,9 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 > daemon's socket route, an exchange keyed by HKDF-SHA256 and sealed with AES-256-GCM (`slates_ipc::route`,
 > `crates/server/src/shards_route.rs`). On Windows (A-179, 2026-10-26) the reply names the value of the pipe's client
 > end, which the daemon duplicated into the client's process (`ReplyBody::ShardsHanded`); the serve loop is the same
-> code over `crates/server/src/shards/end.rs`, whose Windows arm is a `slates_rt::pipe::PipeEnd`, and a DAX descriptor
-> ask is refused `ENOSYS` there until Windows' window is built (G-shards-windows step 5). `Client::attach_shards` takes
+> code over `crates/server/src/shards/end.rs`, whose Windows arm is a `slates_rt::pipe::PipeEnd`. A DAX descriptor ask
+> there is answered with a section duplicated into the asking process once its claim to hold the stream is checked
+> (A-180, G-shards-windows step 5). `Client::attach_shards` takes
 > every form. `slates shards ID --fd N -- CMD` replaces itself with a program holding the end at
 > descriptor `N`, so the attachment ends when the program's end closes. A real Shards microVM on this Mac mounts, reads and
 > writes a volume the daemon serves this way (part 2: 3 of 3 boots, Shards' patch sent to its owner). DAX (part 3,
@@ -12455,7 +12458,7 @@ The route's half (2026-10-26, G-shards-windows step 1) was applied in the same c
   which judges the process to run as the daemon's user) and writes the value into `ReplyBody::ShardsHanded`. The record
   keeps zero, so a reply replayed after a restart names no handle. The client adopts it (`adopt_stream`). No
   descriptor rides a pipe, so a DAX descriptor ask is refused `ENOSYS`, and no file is offered for DAX, until step 5
-  builds Windows' window.
+  builds Windows' window (built 2026-10-26, A-180).
 - **Proven (route), 2026-10-26:**
   - On jupiter: `slates-ipc`'s stream tests (a round trip each way; a second client refused `ERROR_PIPE_BUSY` and a
     second server refused; a dropped end read as the end, every byte before it delivered; a fresh name per pair);
@@ -12470,6 +12473,74 @@ The route's half (2026-10-26, G-shards-windows step 1) was applied in the same c
     - a second process refused the attachment's pipe by name, `ERROR_PIPE_BUSY`, and the stream serving on after.
   - Unchanged on Unix: the same client tests pass on macOS (its 6) and on Linux x86_64 (adacachy, its 7), and the server's Shards suite passes on macOS (26) and Linux (21, one ignored). `slates-ipc`,
     `slates-server` and `slates-client` are clean under clippy `-D warnings` on all three.
+
+### A-180 — Windows answers a Shards DAX ask with a confined section duplicated into a process that proves it holds the stream (accepted 2026-10-26)
+Applied in the same change to: §4.6 (the Shards form's DAX bullet and status), A-179's route line, GAPS,
+`docs/wip/shards/dax-protocol.md` ("Windows"), `crates/mem` (`dax_object.rs`: `DaxObject` on Windows, a reserved
+confined section viewed and committed a range at a time; `dax_object_bytes`; `prepare_range` on both platforms;
+`tests/dax_section.rs`, new), `crates/machine` (`Facts::memory_total`, `Facts::page_bytes`), `crates/vfs`
+(`shards_backing.rs`: `handed_to_vmm`, `prepare_range`, `HandedObject`; `volume.rs`: the size refusals read
+`dax_object_bytes`), `crates/bridge-core` (`dax_backing` built on every platform: the answer is a `HandedObject`, a range
+readied before its fill; the page size from `slates-machine`, so no `rustix`), `crates/bridge-fuse` (`shards_fs.rs`:
+`descriptor_claim`, `descriptor_handle_answer`; `bridge.rs`: the DAX errno maps on every platform, `EACCES` public),
+`crates/ipc` (`handle_route.rs`: `claim`, `Claimant`, `hand_to_claimant`; `error.rs`: `NotAHolder`), `crates/server`
+(`shards/dax.rs` serves both platforms, `shards/dax_refused.rs` removed; `shards.rs`: the stream's holders and claimant,
+`tell_holder`), `crates/client/tests/shards.rs` (the Windows DAX tests), `ci.yml` (the Shards step's comment),
+`unsafe-budget.toml` (`slates-mem` 60 → 61, `slates-ipc` + 4).
+- **What was there.** Since A-179 a Windows stream refused every DAX ask `ENOSYS` and withheld per-inode DAX at `INIT`,
+  because no descriptor rides a pipe.
+- **The hand-off.** The ask carries two more fields, agreed with the Shards device's author: the asking process's id
+  and the value there of its stream handle (38 bytes). Once its fill is done the object's section is duplicated into
+  that process, and the answer carries the duplicate's value. The duplicate maps read alone, or read and write for a
+  writable ask, and may query its size. The section is made under A-175's confining descriptor, so no holder can widen
+  a duplicate, a rewrite of the descriptor included.
+- **The claim check, by object and not by name.** Before anything is made or filled, the named handle is duplicated
+  into the daemon and must be the same object as a known holder's handle (`CompareObjectHandles`). The known holders are
+  the attaching client, whose handle the attach duplicated and whose owner shard is told of it, and the last claimant
+  that passed. Anything else is refused `EACCES`, counted, and nothing is put into the named process. The goal named
+  the pipe's name as the test. Measured first (jupiter, Windows 10.0.26200, 2026-10-26): on a synchronous pipe with a
+  read pending, `FileNameInfo`, `NtQueryObject(ObjectNameInformation)` and `FileModeInformation` each hung past 3 s,
+  because a synchronous file's queries wait on its lock. `CompareObjectHandles`, `GetFileType`, the object's type and
+  the duplicate's close each answered at once. So a name check would let any asker hold the shard by naming a
+  synchronous handle of any same-user process. The pipe allows one instance, already connected, so the object check
+  refuses and grants exactly the claimants the name check would. Its cost: a holder must still hold its handle at the
+  first claim, so `slates shards` keeps its copy until its child exits (A-181).
+- **The object's size, derived.** A section's making costs in proportion to its size, reserved or not. Measured on
+  jupiter the same day: 2^48 bytes took 3.3 ms and 12,001 pages of commit, 2^53 took 129 ms and 358,807 pages, and
+  2^62 or more was refused `ERROR_NO_SYSTEM_RESOURCES`. So Windows sizes it to the machine's physical memory in whole
+  ranges (`dax_object_bytes`). A RAM-only volume's file holds no more bytes than that, so only a hand-made sparse file
+  passes it, and a change taking a backed file past it is refused `EFBIG`, as Unix refuses past `2^63 − 2 MiB`.
+- **Committed a range at a time.** A reserved page faults any view until it is committed, so each range an ask covers is
+  committed whole before its fill begins (`prepare_range`), past the file's end and over holes too. A commit is the
+  section's, so the VMM's views need no commit of their own. Committed pages stay charged until the backing ends,
+  within the fill budget's one range per range filled. Windows gives no committed page of a section back, so a zeroing
+  is stores of zeros.
+- **One code path.** The backed session and the stream's DAX module are the Unix ones. Only the parse of the ask, the
+  claim and the hand-off are paired `#[cfg]` functions.
+- **Rejected: the pipe's name, as the goal stated it** (above: it lets an asker hold the shard). **Rejected: the
+  daemon keeping a duplicate of the client end as the reference.** Any handle keeps the pipe's client open, so the
+  stream would never end when its VM did.
+- **Proven** on jupiter (Windows 10.0.26200), 2026-10-26:
+  - `crates/client/tests/shards.rs` 9 of 9 in each of 3 runs, among them the two DAX tests against an in-process
+    daemon. Four hostile claimants each get `EACCES`, counted `shards.dax_claim_refused`, with the named process's
+    handle count the same before and after, and the stream serving on: a process holding another attachment's pipe,
+    one holding an event and no pipe, a value naming nothing, and a process that has exited. A genuine claimant names
+    a second handle of its own stream, a different value of the same object, and maps the section it is handed. The
+    section holds exactly the file's 8,292 bytes and zeros to the end of the range. The claimant stores into it and
+    sends `FSYNC`, and slates' own read returns the stored bytes. A write through another attachment shows in the map
+    at once, and still after a request on the stream. A duplicate that may rewrite the descriptor is refused
+    `ERROR_ACCESS_DENIED`.
+  - `crates/mem/tests/dax_section.rs` 2 of 2: a section of 132,766,498,816 bytes (63,308 ranges, the machine's
+    memory) whose first and last ranges each side reads and stores; a read-only and a writable duplicate each refused
+    `WRITE_DAC`, and the read-only one refused a duplicate or a view that writes.
+  - Red-checked in a scratch tree: the claim check passing everyone handed the section to a holder of another pipe
+    (`Ok(192)` where `EACCES` was asserted); an owner-all descriptor granted the widening duplicate in both tests; and
+    ranges never committed killed the test process (`STATUS_ACCESS_VIOLATION`).
+  - Measured, release build, 3 runs of 41: a section's making takes 4 to 16 µs at p50 (53 µs at most) once the
+    process has made one confined section. The first confined section a process makes, a peer's or a DAX one, costs
+    592 to 837 µs (the descriptor's conversion), which the first ask's shard pays (GAPS).
+  - macOS: the Unix DAX suites pass unchanged (`slates-server --test shards` 26 of 26, `slates-vfs --test
+    shards_backing`, `slates-mem --test dax_object`, `slates-bridge-core`, `slates-bridge-fuse`).
 
 ### A-178 — macOS refuses a second owner of a live instance's rendezvous: the owner's token is a Mach bootstrap name (accepted 2026-10-26)
 Applied in the same change to: §4.7 (the rendezvous's status), A-176 (its macOS sentences), GAPS, `crates/ipc` (`owner_name.rs`, new; `rendezvous.rs`: the macOS `Owner`, `owner_token_name` and `take_ownership`; `lib.rs`; `tests/rendezvous.rs`: the second-owner test now also macOS's, and a cross-process one on every platform), `unsafe-budget.toml` (`slates-ipc` 70 → 79), `CLAUDE.md`, and a bug record (`docs/bugs/2026-10-26-a-second-owner-took-a-live-macos-instances-rendezvous-over.md`).

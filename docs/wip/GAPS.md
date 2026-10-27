@@ -11868,9 +11868,23 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   process by the handle route (`ReplyBody::ShardsHanded`). The refusal by kind (`DescriptorRouteNotBuilt`, step 4) is
   gone. On jupiter `crates/client/tests/shards.rs` passes 7 of 7 in each of 3 runs: the FUSE history on either shard,
   scoped streams, hostile frames, a detach, a destroy and a revocation each ending the stream and its record, and a
-  second process refused the pipe `ERROR_PIPE_BUSY`. The CI steps that ran the refusal now run these. **Owed:** Windows'
-  DAX window (a descriptor ask is refused `ENOSYS` there; step 5), `slates shards` on Windows (step 2), and Shards'
+  second process refused the pipe `ERROR_PIPE_BUSY`. The CI steps that ran the refusal now run these. **Owed:** `slates shards` on Windows (step 2), and Shards'
   device on Windows (step 3).
+- **Windows' DAX window built (G-shards-windows step 5, A-180, 2026-10-26):** a descriptor ask on a Windows stream
+  names the asking process and its stream handle there. The daemon checks the handle is this stream's own object, by
+  `CompareObjectHandles` against a known holder, never by a name query, which hung past 3 s on a synchronous pipe with
+  a read pending (measured on jupiter). Then it fills and commits the asked ranges of a confined reserved section
+  sized to the machine's memory, and duplicates it into that process. Proven on jupiter, 3 runs of
+  `crates/client/tests/shards.rs` (9 of 9 each) and `crates/mem/tests/dax_section.rs`, red-checked three ways (A-180).
+  **Owed:** Shards'
+  device on Windows (step 6, the Shards side), a real guest over it (needs WHP and an AppContainer per VM; GitHub's
+  runners), and arm64 Windows.
+  - **Open, measured: the first confined section a Windows process makes costs 592 to 837 µs** (jupiter, release, 3
+    runs; each later one 4 to 16 µs at p50). It is the SDDL's conversion
+    (`ConvertStringSecurityDescriptorToSecurityDescriptorW`), and it is paid on the shard that makes the first
+    section, a direct map's (A-175) or a DAX ask's: one turn about 40 times its usual length, once per process. The
+    fix to measure: build the descriptor at the daemon's start, or by hand rather than from SDDL, so no shard pays
+    it.
 - **Fixed on the way: a destroyed volume's stream was ended again on each teardown pass**
   (`docs/bugs/2026-10-26-a-destroyed-volumes-stream-was-ended-again-each-teardown-pass.md`): a second shutdown is
   refused on macOS and was counted `shards.end_refused`, so a real failed end could not be told from it. Found by the

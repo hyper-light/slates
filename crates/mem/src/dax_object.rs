@@ -15,7 +15,11 @@
 //! - **macOS:** a POSIX shared-memory object under a random name that is unlinked at once, so nothing reaches it by
 //!   name, only by its descriptor. It is sized once, which is all macOS allows: a second `ftruncate` is refused
 //!   `EINVAL`.
-//! - **Elsewhere:** refused by kind. The route hands descriptors, which Windows does not have.
+//! - **Windows** (plan G-shards-windows step 5): an unnamed pagefile-backed section under the peer section's confining
+//!   descriptor, made reserved at [`dax_object_bytes`] (the machine's memory: a section's making costs in proportion
+//!   to its size, measured) and committed a range at a time as slates views or prepares it, since a reserved page
+//!   faults until committed. The VMM is handed a duplicate of no more access than its ask needs, which the
+//!   descriptor lets no holder widen (A-175).
 //!
 //! Measured on this Mac (macOS 26.4.1, Apple silicon, 2026-10-24):
 //! - every size up to `2^63 − 2 MiB` was accepted, and its last 2 MiB mapped, took a byte and read it back;
@@ -79,6 +83,34 @@ pub const DAX_OBJECT_BYTES: u64 = match (1u64 << 63).checked_sub(DAX_RANGE_BYTES
   Some(bytes) => bytes,
   None => 0,
 };
+
+/// The size of every DAX object this process makes, fixed for its life ([`DaxObject::create`]): nothing is written
+/// through past it, and a change that would take a backed file past it is refused `FileTooLarge`.
+/// - **Unix:** [`DAX_OBJECT_BYTES`], every offset a guest's file can have; both kernels take it sparse at no cost.
+/// - **Windows** (plan G-shards-windows step 5): derived, the machine's physical memory in whole ranges, at least one.
+///   A pagefile-backed section's making costs in proportion to its size, reserved or not: measured on jupiter
+///   (Windows 10.0.26200, 2026-10-26) a reserved section of 2^48 bytes took 3.3 ms and 12,001 pages of commit to make,
+///   2^53 took 129 ms and 358,807 pages, and 2^62 or more was refused `ERROR_NO_SYSTEM_RESOURCES`. A RAM-only volume's
+///   file holds no more bytes than the machine has, so its memory covers every file but a hand-made sparse one, at
+///   about 2^-22 of the size in commit (a few pages on a machine of 128 GiB).
+#[must_use]
+pub fn dax_object_bytes() -> u64 {
+  #[cfg(windows)]
+  {
+    static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+      slates_machine::facts::Facts::memory_total()
+        .max(DAX_RANGE_BYTES)
+        .checked_next_multiple_of(DAX_RANGE_BYTES)
+        .unwrap_or(DAX_RANGE_BYTES)
+        .min(DAX_OBJECT_BYTES)
+    })
+  }
+  #[cfg(not(windows))]
+  {
+    DAX_OBJECT_BYTES
+  }
+}
 
 /// The security descriptor every Windows peer section is made under (A-175), for the test that measures it.
 #[cfg(windows)]
@@ -280,6 +312,32 @@ mod imp {
     /// How many ranges slates maps now.
     pub fn views(&self) -> usize {
       self.views.len()
+    }
+
+    /// The object's size in bytes, which never changes: [`DAX_OBJECT_BYTES`].
+    #[must_use]
+    pub fn len(&self) -> u64 {
+      DAX_OBJECT_BYTES
+    }
+
+    /// Never: an object is at least a range. Here for the convention beside [`DaxObject::len`].
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+      false
+    }
+
+    /// Readies range `range` for a VMM's map: nothing here, since a shared-memory page comes into being when it is
+    /// first touched, by anyone (Windows commits the range, its arm's doc says why). Refused `OutOfRange` past the
+    /// object.
+    pub fn prepare_range(&mut self, range: u64) -> Result<(), MemError> {
+      range
+        .checked_mul(DAX_RANGE_BYTES)
+        .and_then(|start| span_end(start, DAX_RANGE_BYTES).ok())
+        .map(drop)
+        .ok_or(MemError::OutOfRange {
+          offset: usize::try_from(range).unwrap_or(usize::MAX),
+          len: usize::try_from(DAX_OBJECT_BYTES).unwrap_or(usize::MAX),
+        })
     }
 
     /// Unmaps slates' view of range `range`, if it holds one; the object keeps its bytes. Whether a view went.
@@ -981,6 +1039,7 @@ mod imp {
 
 #[cfg(windows)]
 mod imp {
+  use std::collections::BTreeMap;
   use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
 
   use windows_sys::Win32::Foundation::{
@@ -991,8 +1050,9 @@ mod imp {
   };
   use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
   use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_BASIC_INFORMATION,
-    MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile, VirtualQuery,
+    CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MEM_COMMIT, MEMORY_BASIC_INFORMATION,
+    MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READWRITE, SEC_COMMIT, SEC_RESERVE,
+    SECTION_QUERY, UnmapViewOfFile, VirtualAlloc, VirtualQuery,
   };
   use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
   use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -1000,46 +1060,257 @@ mod imp {
   use super::racy::{Racy, RacyStore};
   use crate::error::MemError;
 
-  /// No DAX object exists off Unix: the Shards route hands descriptors, which Windows does not have, so an object is
-  /// never created and none of these methods can run.
-  #[derive(Debug)]
+  /// A file's DAX object and the views of it slates holds (Windows, plan G-shards-windows step 5): an unnamed
+  /// pagefile-backed section under [`PEER_SECTION_SDDL`], made reserved (`SEC_RESERVE`) at [`super::dax_object_bytes`]
+  /// and committed a range at a time as slates views it. Reserved, a section charges no commit for its size; a page of
+  /// it must be committed before any view of it is touched, so a range is committed whole when slates first views it
+  /// ([`DaxObject::prepare_range`] for one the fill copies nothing into), and the VMM maps only ranges an ask has had
+  /// filled. A commit is the section's, not the view's, so it outlives the view that made it. slates keeps the
+  /// creator's handle, every access, and hands duplicates of no more access than an ask needs ([`DaxObject::handed`]);
+  /// the descriptor refuses any duplicate of more (A-175's discipline).
   pub struct DaxObject {
-    never: std::convert::Infallible,
+    section: OwnedHandle,
+    len: u64,
+    views: BTreeMap<u64, WriteView>,
+    most_views: usize,
+  }
+
+  impl std::fmt::Debug for DaxObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+      f.debug_struct("DaxObject")
+        .field("len", &self.len)
+        .field("views", &self.views.len())
+        .field("most_views", &self.most_views)
+        .finish()
+    }
   }
 
   impl DaxObject {
-    /// Refused by kind: there is no DAX object here.
-    pub fn create(_most_views: usize) -> Result<DaxObject, MemError> {
-      Err(MemError::OsRefused {
-        call: "dax object",
-        code: None,
+    /// A new object of [`super::dax_object_bytes`], all zeros and nothing committed, of which slates may map at most
+    /// `most_views` ranges at once. Refused `OsRefused` where the OS refuses the section.
+    pub fn create(most_views: usize) -> Result<DaxObject, MemError> {
+      let len = super::dax_object_bytes();
+      Ok(DaxObject {
+        section: confined_section(len, SEC_RESERVE)?,
+        len,
+        views: BTreeMap::new(),
+        most_views,
       })
     }
 
-    /// Never reached: no object exists.
+    /// The object's size in bytes, which never changes.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+      self.len
+    }
+
+    /// Never: an object is at least a range. Here for the convention beside [`DaxObject::len`].
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+      self.len == 0
+    }
+
+    /// A duplicate of the section's handle in this process that maps it read alone, or read and write where
+    /// `writable`, and may ask its size (`SECTION_QUERY`): what a VMM is handed, duplicated again into its process.
+    /// The section's own handle never leaves the object.
+    pub fn handed(&self, writable: bool) -> Result<OwnedHandle, MemError> {
+      let access = if writable {
+        FILE_MAP_READ | FILE_MAP_WRITE | SECTION_QUERY
+      } else {
+        FILE_MAP_READ | SECTION_QUERY
+      };
+      duplicate_here(self.section.as_handle(), access)
+    }
+
+    /// How many ranges slates maps now.
     pub fn views(&self) -> usize {
-      match self.never {}
+      self.views.len()
     }
 
-    /// Never reached: no object exists.
-    pub fn release_view(&mut self, _range: u64) -> bool {
-      match self.never {}
+    /// Unmaps slates' view of range `range`, if it holds one; the object keeps its bytes and its commit. Whether a view
+    /// went.
+    pub fn release_view(&mut self, range: u64) -> bool {
+      self.views.remove(&range).is_some()
     }
 
-    /// Never reached: no object exists.
-    pub fn store(&mut self, _offset: u64, _from: &[u8]) -> Result<(), MemError> {
-      match self.never {}
+    /// Commits range `range` whole, so a view of it anywhere may touch any byte: a range an ask covers is prepared
+    /// before the VMM is answered, though the fill copies nothing into it (a hole, or past the file's end). A view
+    /// slates holds was committed when it was made; otherwise a view is made for the commit and let go. Refused
+    /// `OutOfRange` past the object and `OsRefused` where the OS refuses the view or the commit (no commit left).
+    pub fn prepare_range(&mut self, range: u64) -> Result<(), MemError> {
+      if self.views.contains_key(&range) {
+        return Ok(());
+      }
+      self.committed_view(range).map(drop)
     }
 
-    /// Never reached: no object exists.
-    pub fn load(&mut self, _offset: u64, _into: &mut [u8]) -> Result<(), MemError> {
-      match self.never {}
+    /// Copies `from` into the object at `offset`, through atomics. Refused `OutOfRange` past the object and
+    /// `ViewsExhausted` where a range it needs cannot be viewed; a refusal part-way leaves the earlier ranges written.
+    pub fn store(&mut self, offset: u64, from: &[u8]) -> Result<(), MemError> {
+      let len = u64::try_from(from.len()).map_err(|_| MemError::OutOfRange {
+        offset: usize::MAX,
+        len: from.len(),
+      })?;
+      self.span_end(offset, len)?;
+      let mut done = 0usize;
+      while done < from.len() {
+        let at = offset.saturating_add(u64::try_from(done).unwrap_or(u64::MAX));
+        let (range, within, take) = piece(at, from.len().saturating_sub(done))?;
+        let bytes = from
+          .get(done..done.saturating_add(take))
+          .ok_or(MemError::OutOfRange {
+            offset: done,
+            len: from.len(),
+          })?;
+        self.view(range)?.store(within, bytes)?;
+        done = done.saturating_add(take);
+      }
+      Ok(())
     }
 
-    /// Never reached: no object exists.
-    pub fn zero(&mut self, _offset: u64, _len: u64) -> Result<(), MemError> {
-      match self.never {}
+    /// Copies the object's bytes at `offset` into `into`, through atomics. Refused as [`DaxObject::store`] is.
+    pub fn load(&mut self, offset: u64, into: &mut [u8]) -> Result<(), MemError> {
+      let len = u64::try_from(into.len()).map_err(|_| MemError::OutOfRange {
+        offset: usize::MAX,
+        len: into.len(),
+      })?;
+      self.span_end(offset, len)?;
+      let total = into.len();
+      let mut done = 0usize;
+      while done < total {
+        let at = offset.saturating_add(u64::try_from(done).unwrap_or(u64::MAX));
+        let (range, within, take) = piece(at, total.saturating_sub(done))?;
+        let bytes = into
+          .get_mut(done..done.saturating_add(take))
+          .ok_or(MemError::OutOfRange {
+            offset: done,
+            len: total,
+          })?;
+        self.view(range)?.load(within, bytes)?;
+        done = done.saturating_add(take);
+      }
+      Ok(())
     }
+
+    /// Makes the object's bytes `offset .. offset + len` read zero, by stores of zeros: Windows gives no committed page
+    /// of a section back, so the pages stay charged, within the ranges the fill budget already counts. Refused as
+    /// [`DaxObject::store`] is.
+    pub fn zero(&mut self, offset: u64, len: u64) -> Result<(), MemError> {
+      let end = self.span_end(offset, len)?;
+      let mut at = offset;
+      while at < end {
+        let left = usize::try_from(end.saturating_sub(at)).unwrap_or(usize::MAX);
+        let (range, within, take) = piece(at, left)?;
+        self
+          .view(range)?
+          .zero_bytes(within, within.saturating_add(take))?;
+        at = at.saturating_add(u64::try_from(take).unwrap_or(u64::MAX));
+      }
+      Ok(())
+    }
+
+    /// The span `offset .. offset + len` inside the object, as its end; refused `OutOfRange` past it.
+    fn span_end(&self, offset: u64, len: u64) -> Result<u64, MemError> {
+      match offset.checked_add(len) {
+        Some(end) if end <= self.len => Ok(end),
+        _ => Err(MemError::OutOfRange {
+          offset: usize::try_from(offset).unwrap_or(usize::MAX),
+          len: usize::try_from(self.len).unwrap_or(usize::MAX),
+        }),
+      }
+    }
+
+    /// The view of range `range`, mapped and committed now if slates holds none, within the owner's bound.
+    fn view(&mut self, range: u64) -> Result<&WriteView, MemError> {
+      if self.views.contains_key(&range) {
+        return self.views.get(&range).ok_or(MemError::ViewsExhausted {
+          most: self.most_views,
+        });
+      }
+      if self.views.len() >= self.most_views {
+        return Err(MemError::ViewsExhausted {
+          most: self.most_views,
+        });
+      }
+      let view = self.committed_view(range)?;
+      Ok(self.views.entry(range).or_insert(view))
+    }
+
+    /// A new writable view of range `range`, its pages committed. Refused `OutOfRange` past the object and `OsRefused`
+    /// where the OS refuses the view or the commit.
+    fn committed_view(&self, range: u64) -> Result<WriteView, MemError> {
+      let refused = MemError::OutOfRange {
+        offset: usize::try_from(range).unwrap_or(usize::MAX),
+        len: usize::try_from(self.len).unwrap_or(usize::MAX),
+      };
+      let start = range
+        .checked_mul(super::DAX_RANGE_BYTES)
+        .filter(|start| start.saturating_add(super::DAX_RANGE_BYTES) <= self.len)
+        .ok_or(refused.clone())?;
+      let len = usize::try_from(super::DAX_RANGE_BYTES).map_err(|_| refused)?;
+      let view = SectionView::map_at(
+        self.section.as_handle(),
+        FILE_MAP_WRITE | FILE_MAP_READ,
+        start,
+        len,
+      )?;
+      // SAFETY: commits the pages of the view just made, whose span this call names exactly; a reserved section's
+      // pages are committed through any view of them, and the commit is the section's (`VirtualAlloc`, `SEC_RESERVE`).
+      let committed = unsafe {
+        VirtualAlloc(
+          std::ptr::with_exposed_provenance(view.address),
+          len,
+          MEM_COMMIT,
+          PAGE_READWRITE,
+        )
+      };
+      if committed.is_null() {
+        return Err(os("VirtualAlloc(MEM_COMMIT) of a DAX range"));
+      }
+      Ok(WriteView(view))
+    }
+  }
+
+  /// The range an offset falls in, where in it, and how many of `left` bytes lie in it from there.
+  fn piece(at: u64, left: usize) -> Result<(u64, usize, usize), MemError> {
+    let refused = MemError::OutOfRange {
+      offset: usize::try_from(at).unwrap_or(usize::MAX),
+      len: left,
+    };
+    let range = at
+      .checked_div(super::DAX_RANGE_BYTES)
+      .ok_or(refused.clone())?;
+    let within = at
+      .checked_rem(super::DAX_RANGE_BYTES)
+      .ok_or(refused.clone())?;
+    let room = usize::try_from(super::DAX_RANGE_BYTES.saturating_sub(within))
+      .map_err(|_| refused.clone())?;
+    let within = usize::try_from(within).map_err(|_| refused)?;
+    Ok((range, within, left.min(room)))
+  }
+
+  /// A duplicate of `handle` in this process with `access`, which a section's descriptor grants only where the source
+  /// holds as much.
+  fn duplicate_here(handle: BorrowedHandle<'_>, access: u32) -> Result<OwnedHandle, MemError> {
+    let mut duplicate: HANDLE = std::ptr::null_mut();
+    // SAFETY: this process's pseudo-handle on both sides, a live handle, and an out-pointer to a local; the duplicate
+    // is owned below.
+    let done = unsafe {
+      DuplicateHandle(
+        GetCurrentProcess(),
+        handle.as_raw_handle(),
+        GetCurrentProcess(),
+        &mut duplicate,
+        access,
+        0,
+        0,
+      )
+    };
+    if done == 0 {
+      return Err(os("DuplicateHandle"));
+    }
+    // SAFETY: the duplicate just made, owned from here and closed on drop.
+    Ok(unsafe { OwnedHandle::from_raw_handle(duplicate) })
   }
 
   /// Format: a peer section's security descriptor, in SDDL: a protected DACL (`P`, nothing inherited) whose one entry
@@ -1081,9 +1352,23 @@ mod imp {
     /// Maps `len` bytes of `section` from its start with `access`; `len` zero maps the whole section, whose length is
     /// then read back from the view (`VirtualQuery`: the section's size, a whole number of pages).
     fn map(section: BorrowedHandle<'_>, access: u32, len: usize) -> Result<SectionView, MemError> {
+      SectionView::map_at(section, access, 0, len)
+    }
+
+    /// Maps `len` bytes of `section` from `offset` (a whole number of the system's allocation granules) with `access`;
+    /// `len` zero maps from there to the section's end, as [`SectionView::map`] does.
+    fn map_at(
+      section: BorrowedHandle<'_>,
+      access: u32,
+      offset: u64,
+      len: usize,
+    ) -> Result<SectionView, MemError> {
+      let high = u32::try_from(offset >> u32::BITS).unwrap_or(u32::MAX);
+      let low = u32::try_from(offset & u64::from(u32::MAX)).unwrap_or(u32::MAX);
       // SAFETY: a view at an address the system chooses of a section this process holds a handle to; the system
-      // refuses (null) a span past the section or an access the handle lacks. Unmapped by `drop`.
-      let view = unsafe { MapViewOfFile(section.as_raw_handle(), access, 0, 0, len) };
+      // refuses (null) a span past the section, an offset off its granule or an access the handle lacks. Unmapped by
+      // `drop`.
+      let view = unsafe { MapViewOfFile(section.as_raw_handle(), access, high, low, len) };
       if view.Value.is_null() {
         return Err(os("MapViewOfFile"));
       }
@@ -1149,7 +1434,9 @@ mod imp {
 
   /// A new unnamed pagefile-backed section of `len` bytes under [`PEER_SECTION_SDDL`], which confines every handle but
   /// the creator's to the access it was made with. The creator's handle keeps every access and is never handed.
-  fn confined_section(len: u64) -> Result<OwnedHandle, MemError> {
+  /// `commit` is `SEC_COMMIT` (every page charged now, a peer's copy) or `SEC_RESERVE` (none until committed, a DAX
+  /// object).
+  fn confined_section(len: u64, commit: u32) -> Result<OwnedHandle, MemError> {
     let text: Vec<u16> = PEER_SECTION_SDDL
       .encode_utf16()
       .chain(std::iter::once(0))
@@ -1180,7 +1467,7 @@ mod imp {
       CreateFileMappingW(
         INVALID_HANDLE_VALUE,
         &attributes,
-        PAGE_READWRITE,
+        PAGE_READWRITE | commit,
         high,
         low,
         std::ptr::null(),
@@ -1237,7 +1524,7 @@ mod imp {
         offset: 0,
         len: usize::MAX,
       })?;
-      let section = confined_section(len)?;
+      let section = confined_section(len, SEC_COMMIT)?;
       let view = WriteView(SectionView::map(
         section.as_handle(),
         FILE_MAP_WRITE | FILE_MAP_READ,
@@ -1261,25 +1548,7 @@ mod imp {
     /// A duplicate of the section's handle in this process that maps it read alone (`FILE_MAP_READ`): what a peer is
     /// handed, duplicated again into its process. The section's own handle, which writes, never leaves the object.
     pub fn read_only_handle(&self) -> Result<OwnedHandle, MemError> {
-      let mut duplicate: HANDLE = std::ptr::null_mut();
-      // SAFETY: this process's pseudo-handle on both sides, the section's live handle, and an out-pointer to a local;
-      // the duplicate is owned below.
-      let done = unsafe {
-        DuplicateHandle(
-          GetCurrentProcess(),
-          self.section.as_raw_handle(),
-          GetCurrentProcess(),
-          &mut duplicate,
-          FILE_MAP_READ,
-          0,
-          0,
-        )
-      };
-      if done == 0 {
-        return Err(os("DuplicateHandle"));
-      }
-      // SAFETY: the duplicate just made, owned from here and closed on drop.
-      Ok(unsafe { OwnedHandle::from_raw_handle(duplicate) })
+      duplicate_here(self.section.as_handle(), FILE_MAP_READ)
     }
 
     /// Copies `from` into the object at `offset`, through atomics. Refused `OutOfRange` past the object.

@@ -487,7 +487,9 @@ jobs:
         run: cargo test -p slates-client --test client --test driver -- --test-threads=1
       # The Shards form (§4.6, A-161, A-179) by the handle route: an in-process daemon duplicates the client end of the
       # attachment's named pipe into the test, which speaks FUSE through it in Shards' framing; hostile frames, a
-      # destroy and a revocation each end the attachment; a second process is refused the pipe `ERROR_PIPE_BUSY`. One
+      # destroy and a revocation each end the attachment; a second process is refused the pipe `ERROR_PIPE_BUSY`.
+      # Windows' DAX window (plan G-shards-windows step 5): a descriptor ask naming a process that does not hold the
+      # stream is refused `EACCES` with nothing put into it; a genuine one maps the section, stores, fsyncs. One
       # test at a time, as the client binary's other daemon-per-test suites run here.
       - name: Test the Shards form over the handle route (native Windows)
         if: ${{ !cancelled() }}

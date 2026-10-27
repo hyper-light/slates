@@ -13,6 +13,10 @@ slates-vfs = { workspace = true }
 slates-db = { workspace = true }
 slates-mem = { workspace = true }
 # The host's page, the unit a DAX backing's fill skips pages of zeros in (`src/dax_backing.rs`).
+slates-machine = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+# The backed session's test maps a backing's descriptor as a VMM would (`tests/dax_backing.rs`, Unix).
 rustix = { workspace = true }
 
 [dev-dependencies]

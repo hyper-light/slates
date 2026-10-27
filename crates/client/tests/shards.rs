@@ -853,4 +853,441 @@ mod delivered {
     drop(client);
     drop(daemon);
   }
+
+  /// Windows' DAX window over the stream (plan G-shards-windows step 5): a descriptor ask names the asking process and
+  /// its stream handle there, and is answered with a section duplicated into that process, or refused with an errno.
+  #[cfg(windows)]
+  mod dax {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+    use std::process::{Child, Command, Stdio};
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    use slates_bridge_fuse::abi::{OUT_HEADER_LEN, Opcode};
+    use slates_bridge_fuse::shards_fs::{ASK_DESCRIPTOR, CONTROL_FRAME};
+    use windows_sys::Win32::Foundation::{
+      DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ACCESS_DENIED, GetLastError, HANDLE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
+    use windows_sys::Win32::System::Memory::{
+      FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
+    };
+    use windows_sys::Win32::System::Threading::{
+      CreateEventW, GetCurrentProcess, GetProcessHandleCount,
+    };
+
+    use super::*;
+
+    /// Format: the variable that makes a re-invoked test binary a holder: a process that waits on its stdin.
+    const ROLE_HOLD: &str = "SLATES_SHARDS_TEST_HOLD";
+    /// Format: the tag the holder prints once it waits, so its handle count is steady before the parent reads it.
+    const HOLDING_TAG: &str = "SHARDS-HOLDING";
+    /// Format: Linux `EACCES`, a claimant that does not hold the stream.
+    const EACCES: i32 = 13;
+    /// Format: a DAX range, 2 MiB (`FUSE_DAX_SZ`), the span every ask here maps.
+    const RANGE: u64 = 2 << 20;
+    /// Shape: the file the guest maps, two pages and a part, so its end falls inside a page of the range.
+    const FILE_BYTES: usize = 8192 + 100;
+    /// Shape: where in the file the guest stores, and what.
+    const STORE_AT: usize = 4000;
+    const STORED: &[u8] = b"stored by the guest through its mapped section";
+    /// Shape: what another attachment writes over the file afterwards.
+    const REWRITTEN: &[u8] = b"rewritten through another slates attachment";
+
+    /// The holder's role, run only when re-invoked with [`ROLE_HOLD`] set: prints [`HOLDING_TAG`] and waits until its
+    /// stdin closes, holding whatever handles the parent duplicates into it.
+    #[test]
+    #[ignore = "a role the parent test re-invokes this binary for"]
+    fn holder() {
+      if std::env::var_os(ROLE_HOLD).is_none() {
+        return;
+      }
+      println!("{HOLDING_TAG}");
+      std::io::stdout().flush().unwrap();
+      let mut rest = Vec::new();
+      std::io::stdin().read_to_end(&mut rest).unwrap();
+    }
+
+    /// A re-invoked holder, waiting, and its stdout, kept open so its last lines (libtest's) have a reader.
+    struct Holder {
+      child: Child,
+      _out: std::io::Lines<BufReader<std::process::ChildStdout>>,
+    }
+
+    impl Holder {
+      fn spawn() -> Holder {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+          .args([
+            "--ignored",
+            "--exact",
+            "delivered::dax::holder",
+            "--nocapture",
+          ])
+          .env(ROLE_HOLD, "1")
+          .stdin(Stdio::piped())
+          .stdout(Stdio::piped())
+          .spawn()
+          .unwrap();
+        let mut out = BufReader::new(child.stdout.take().unwrap()).lines();
+        assert!(
+          out.any(|line| line.unwrap().contains(HOLDING_TAG)),
+          "the holder never said it waits"
+        );
+        Holder { child, _out: out }
+      }
+
+      /// Closes its stdin, so it ends, and waits for it.
+      fn end(&mut self) {
+        drop(self.child.stdin.take());
+        self.child.wait().unwrap();
+      }
+    }
+
+    /// Duplicates `handle` of this process into `process`: its value there.
+    fn duplicate_into(handle: RawHandle, process: RawHandle) -> u64 {
+      let mut value: HANDLE = std::ptr::null_mut();
+      // SAFETY: this process's live handle, a process opened by `spawn` (it may be duplicated into), an out-pointer.
+      let done = unsafe {
+        DuplicateHandle(
+          GetCurrentProcess(),
+          handle,
+          process,
+          &mut value,
+          0,
+          0,
+          DUPLICATE_SAME_ACCESS,
+        )
+      };
+      assert_ne!(done, 0, "the test duplicates into its holder");
+      u64::try_from(value.expose_provenance()).unwrap()
+    }
+
+    /// The handles `process` holds now.
+    fn handle_count(process: RawHandle) -> u32 {
+      let mut count = 0u32;
+      // SAFETY: a live process handle and an out-pointer to a local.
+      assert_ne!(unsafe { GetProcessHandleCount(process, &mut count) }, 0);
+      count
+    }
+
+    /// A view of one range of a handed section, unmapped on drop.
+    struct Mapped(MEMORY_MAPPED_VIEW_ADDRESS);
+
+    impl Mapped {
+      fn map(section: &OwnedHandle, access: u32) -> Result<Mapped, u32> {
+        // SAFETY: a view at an address the system chooses of a live section handle; refused views are null.
+        let view = unsafe {
+          MapViewOfFile(
+            section.as_raw_handle(),
+            access,
+            0,
+            0,
+            usize::try_from(RANGE).unwrap(),
+          )
+        };
+        if view.Value.is_null() {
+          // SAFETY: reads this thread's last error.
+          return Err(unsafe { GetLastError() });
+        }
+        Ok(Mapped(view))
+      }
+
+      fn byte(&self, at: usize) -> &AtomicU8 {
+        assert!(at < usize::try_from(RANGE).unwrap());
+        // SAFETY: inside this live view; slates stores into it at any moment, so it is read through an atomic.
+        unsafe { &*self.0.Value.cast::<u8>().add(at).cast::<AtomicU8>() }
+      }
+
+      fn read(&self, at: usize, len: usize) -> Vec<u8> {
+        (at..at + len)
+          .map(|i| self.byte(i).load(Ordering::Relaxed))
+          .collect()
+      }
+
+      fn store(&self, at: usize, bytes: &[u8]) {
+        for (i, byte) in bytes.iter().enumerate() {
+          self.byte(at + i).store(*byte, Ordering::Relaxed);
+        }
+      }
+    }
+
+    impl Drop for Mapped {
+      fn drop(&mut self) {
+        // SAFETY: the view this value mapped, unmapped once.
+        unsafe { UnmapViewOfFile(self.0) };
+      }
+    }
+
+    impl Guest {
+      /// The value of this end's handle in this process: what a VMM names as its stream.
+      fn stream_value(&self) -> u64 {
+        u64::try_from(self.stream.0.as_raw_handle().expose_provenance()).unwrap()
+      }
+
+      /// Sends a Windows DESCRIPTOR ask for `node`'s first range, claiming `pid` holds the stream as `stream`, and reads
+      /// its `shards_ipc` answer: the section's value in `pid`, or the errno.
+      fn descriptor(
+        &mut self,
+        node: u64,
+        writable: bool,
+        pid: u32,
+        stream: u64,
+      ) -> Result<u64, i32> {
+        let mut ask = vec![ASK_DESCRIPTOR];
+        ask.extend_from_slice(&node.to_le_bytes());
+        ask.push(u8::from(writable));
+        ask.extend_from_slice(&0u64.to_le_bytes());
+        ask.extend_from_slice(&RANGE.to_le_bytes());
+        ask.extend_from_slice(&pid.to_le_bytes());
+        ask.extend_from_slice(&stream.to_le_bytes());
+        let word = u32::try_from(ask.len()).unwrap() | CONTROL_FRAME;
+        self.send_raw(&word.to_le_bytes());
+        self.send_raw(&ask);
+        let mut header = [0u8; 5];
+        self.stream.read_exact(&mut header).unwrap();
+        let mut payload =
+          vec![0u8; usize::try_from(u32::from_be_bytes(header[1..5].try_into().unwrap())).unwrap()];
+        self.stream.read_exact(&mut payload).unwrap();
+        if header[0] == 0 {
+          Ok(u64::from_le_bytes(payload.try_into().unwrap()))
+        } else {
+          Err(i32::from_le_bytes(payload.try_into().unwrap()))
+        }
+      }
+
+      /// Opens `name` for reading and writing: its node and handle.
+      fn open_rw(&mut self, name: &str) -> (u64, u64) {
+        let node = self.lookup(ROOT, name).unwrap();
+        let mut open = O_RDWR.to_le_bytes().to_vec();
+        open.extend_from_slice(&0u32.to_le_bytes());
+        let opened = self.ask(Opcode::Open, node, &open);
+        assert_eq!(errno(&opened), 0, "OPEN {name}");
+        (node, u64_at(&opened, OUT_HEADER_LEN))
+      }
+
+      /// Asks `node`'s stores to be durable: the errno of the `FSYNC`.
+      fn fsync(&mut self, node: u64, fh: u64) -> i32 {
+        let mut body = fh.to_le_bytes().to_vec();
+        body.extend_from_slice(&[0u8; 8]);
+        errno(&self.ask(Opcode::FSync, node, &body))
+      }
+    }
+
+    /// A file of [`FILE_BYTES`] whose every byte names its offset, so a byte out of place shows.
+    fn pattern() -> Vec<u8> {
+      (0..FILE_BYTES)
+        .map(|at| u8::try_from(at % 251).unwrap())
+        .collect()
+    }
+
+    /// T-shards-windows-5.4. Do: on a stream, ask for a file's section naming, in turn, a holder process that holds
+    /// another attachment's stream (that stream's value), one that holds an event and no pipe, a value that names no
+    /// handle there, and a process that has exited, each read before and after by its handle count. Expect each refused
+    /// `EACCES`, counted `shards.dax_claim_refused`, the named process's handle count unchanged, and the stream still
+    /// serving after.
+    #[test]
+    fn a_claimant_that_does_not_hold_the_stream_is_refused_and_given_nothing() {
+      let (daemon, mut client) = start("dax-claim");
+      let id = volume(&mut client, "dax-claim");
+      let mut guest = Guest::over(client.attach_shards(id, Intent::Write, None).unwrap());
+      guest.write_file("mapped.bin", &pattern());
+      let node = guest.lookup(ROOT, "mapped.bin").unwrap();
+      let other = client.attach_shards(id, Intent::Write, None).unwrap();
+
+      let mut holder = Holder::spawn();
+      let process = holder.child.as_raw_handle();
+      let another_pipe = duplicate_into(other.stream.as_raw_handle(), process);
+      // SAFETY: a manual-reset event with no name, owned below and closed when dropped.
+      let event = unsafe {
+        OwnedHandle::from_raw_handle(CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()))
+      };
+      let no_pipe = duplicate_into(event.as_raw_handle(), process);
+      let nothing = no_pipe.wrapping_add(0x4000) & !3;
+      let mut dead = Holder::spawn();
+      dead.end();
+
+      let claims = [
+        (
+          "another attachment's pipe",
+          holder.child.id(),
+          another_pipe,
+          Some(process),
+        ),
+        (
+          "an event, no pipe",
+          holder.child.id(),
+          no_pipe,
+          Some(process),
+        ),
+        (
+          "a value naming nothing",
+          holder.child.id(),
+          nothing,
+          Some(process),
+        ),
+        (
+          "a process that has exited",
+          dead.child.id(),
+          guest.stream_value(),
+          None,
+        ),
+      ];
+      for (what, pid, value, counted) in claims {
+        let before = counted.map(handle_count);
+        assert_eq!(
+          guest.descriptor(node, true, pid, value),
+          Err(EACCES),
+          "{what}"
+        );
+        assert_eq!(
+          counted.map(handle_count),
+          before,
+          "{what}: a handle was left in the process"
+        );
+        assert_eq!(
+          guest.lookup(ROOT, "missing"),
+          Err(ENOENT),
+          "{what}: the stream serves on"
+        );
+      }
+      let refusals = daemon.refusals_on_every_shard().unwrap();
+      assert_eq!(
+        refusals.get("shards.dax_claim_refused"),
+        Some(&4),
+        "{refusals:?}"
+      );
+      assert_eq!(refusals.get("shards.dax_answered"), None, "{refusals:?}");
+
+      holder.end();
+      drop((guest, other, client, daemon));
+    }
+
+    /// T-shards-windows-5.5's second half: a write through another attachment of `id` shows in `map`, at once and
+    /// after a request on the stream. The attachment it wrote through, for the caller to detach.
+    fn another_write_shows_in_the_map(
+      client: &mut Client,
+      id: VolumeId,
+      guest: &mut Guest,
+      map: &Mapped,
+    ) -> u64 {
+      let own = client.attach(id, None, Intent::Write).unwrap().attachment;
+      client
+        .fs_write((id, own), "/mapped.bin", REWRITTEN, 0o644)
+        .unwrap();
+      assert_eq!(
+        map.read(0, REWRITTEN.len()),
+        REWRITTEN,
+        "another attachment's write shows in the map"
+      );
+      assert!(
+        map
+          .read(REWRITTEN.len(), FILE_BYTES - REWRITTEN.len())
+          .iter()
+          .all(|&b| b == 0),
+        "and what it cut reads zero"
+      );
+      assert_eq!(guest.lookup(ROOT, "missing"), Err(ENOENT));
+      assert_eq!(
+        map.read(0, REWRITTEN.len()),
+        REWRITTEN,
+        "still after a request on the stream"
+      );
+      own
+    }
+
+    /// T-shards-windows-5.5's last check: a duplicate of the handed `section` that may rewrite its descriptor is refused.
+    fn a_widening_duplicate_is_refused(section: &OwnedHandle) {
+      let mut wider: HANDLE = std::ptr::null_mut();
+      // SAFETY: the handed section's live handle, this process on both sides, and an out-pointer; a refusal is asserted.
+      let done = unsafe {
+        DuplicateHandle(
+          GetCurrentProcess(),
+          section.as_raw_handle(),
+          GetCurrentProcess(),
+          &mut wider,
+          WRITE_DAC,
+          0,
+          0,
+        )
+      };
+      // SAFETY: reads this thread's last error.
+      assert_eq!((done, unsafe { GetLastError() }), (0, ERROR_ACCESS_DENIED));
+    }
+
+    /// T-shards-windows-5.5. Do: ask for a file's section naming this process and a second handle of its own stream
+    /// (the same pipe, another value), map the range it answers, check the file's bytes, store into the map and send
+    /// `FSYNC`; then write the file through another slates attachment, and try to widen the handed section. Expect the
+    /// map to hold exactly the file's bytes and zeros past its end; slates' own read to return the stored bytes after
+    /// the `FSYNC`; the other attachment's write to show in the map, and still after a request on the stream; and a
+    /// duplicate that may rewrite the section's descriptor refused `ERROR_ACCESS_DENIED`.
+    #[test]
+    fn a_genuine_claimant_maps_the_section_stores_and_fsyncs() {
+      let (daemon, mut client) = start("dax-map");
+      let id = volume(&mut client, "dax-map");
+      let mut guest = Guest::over(client.attach_shards(id, Intent::Write, None).unwrap());
+      let file = pattern();
+      guest.write_file("mapped.bin", &file);
+      let (node, fh) = guest.open_rw("mapped.bin");
+      // A second handle of the same stream: the claim is judged by the object, not by the value the attach handed.
+      // SAFETY: this process's pseudo-handle, valid for its life.
+      let this = unsafe { GetCurrentProcess() };
+      let second = duplicate_into(guest.stream.0.as_raw_handle(), this);
+      // SAFETY: the duplicate just made in this process, owned here and closed at the test's end.
+      let _second = unsafe {
+        OwnedHandle::from_raw_handle(std::ptr::with_exposed_provenance_mut(
+          usize::try_from(second).unwrap(),
+        ))
+      };
+      let value = guest
+        .descriptor(node, true, std::process::id(), second)
+        .unwrap();
+      // SAFETY: the value the daemon duplicated into this process, taken as this test's own.
+      let section = unsafe {
+        OwnedHandle::from_raw_handle(std::ptr::with_exposed_provenance_mut(
+          usize::try_from(value).unwrap(),
+        ))
+      };
+      let map = Mapped::map(&section, FILE_MAP_READ | FILE_MAP_WRITE).unwrap();
+      assert_eq!(
+        map.read(0, FILE_BYTES),
+        file,
+        "the section holds the file's bytes"
+      );
+      assert!(
+        map
+          .read(FILE_BYTES, usize::try_from(RANGE).unwrap() - FILE_BYTES)
+          .iter()
+          .all(|&b| b == 0),
+        "and zeros past its end"
+      );
+
+      map.store(STORE_AT, STORED);
+      assert_eq!(guest.fsync(node, fh), 0, "FSYNC");
+      let read = client.read(id, "/mapped.bin", ReadAt::Head).unwrap();
+      assert_eq!(
+        &read[STORE_AT..STORE_AT + STORED.len()],
+        STORED,
+        "slates reads the guest's stores"
+      );
+      assert_eq!(read.len(), FILE_BYTES);
+
+      let own = another_write_shows_in_the_map(&mut client, id, &mut guest, &map);
+      a_widening_duplicate_is_refused(&section);
+
+      let refusals = daemon.refusals_on_every_shard().unwrap();
+      assert_eq!(
+        refusals.get("shards.dax_answered"),
+        Some(&1),
+        "{refusals:?}"
+      );
+      assert_eq!(
+        refusals.get("shards.dax_claim_refused"),
+        None,
+        "{refusals:?}"
+      );
+      drop(map);
+      client.detach(own).unwrap();
+      drop((guest, client, daemon));
+    }
+  }
 }

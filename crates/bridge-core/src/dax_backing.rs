@@ -31,8 +31,11 @@
 //!   take a later write into it (`docs/bugs/2026-10-25-a-range-mapped-past-the-files-end-missed-later-writes.md`).
 //! - A range is marked filled when its fill starts, so a change written through meanwhile lands on it and the rest of
 //!   the fill reads the volume as changed.
-//! - The fill done, the answer is a new descriptor of the backing's object. Every ask of the node is answered with the
-//!   same object, so every range of the file stays coherent however the device maps them.
+//! - The fill done, the answer is a new descriptor of the backing's object (on Windows, a section handle of the ask's
+//!   access, which the transport duplicates into the VMM's process). Every ask of the node is answered with the same
+//!   object, so every range of the file stays coherent however the device maps them.
+//! - Before a range's fill begins it is readied for the VMM's map (`DaxObject::prepare_range`): Windows commits it
+//!   whole, since a reserved section's page faults any view until committed; Unix pages come on touch.
 //!
 //! **Ingest.** The guest's stores through a map reach the volume when the transport asks: before it serves a request
 //! that asks for them (a sync, a flush, a release, a read of the file, a forget of it) and before the attachment ends.
@@ -57,13 +60,12 @@
 //! slates' own virtio-fs device by `crates/bridge-virtiofs/tests/device.rs`.
 
 use std::collections::{BTreeMap, VecDeque, btree_map::Entry};
-use std::os::fd::OwnedFd;
 
-use slates_mem::{DAX_OBJECT_BYTES, DAX_RANGE_BYTES, DaxObject, Handle};
+use slates_mem::{DAX_RANGE_BYTES, DaxObject, Handle, dax_object_bytes};
 use slates_vfs::error::VfsError;
 use slates_vfs::ids::InodeNo;
 use slates_vfs::inode::Kind;
-use slates_vfs::shards_backing::{ShardsBacking, ShardsBackings};
+use slates_vfs::shards_backing::{HandedObject, ShardsBacking, ShardsBackings};
 
 use crate::{Bridge, DaxOffer, ObjectId, OpContext};
 
@@ -146,8 +148,9 @@ pub enum FillStep {
   Idle,
   /// The fill goes on next turn.
   Filling,
-  /// The fill is done: a new descriptor of the backing's object, to hand the VMM.
-  Done(OwnedFd),
+  /// The fill is done: what to hand the VMM for the backing's object (a new descriptor on Unix; on Windows a section
+  /// handle in this process, of the ask's access, for the transport to duplicate into the VMM's process).
+  Done(HandedObject),
   /// The fill was refused: nothing is pending any more.
   Refused(Refused),
 }
@@ -332,9 +335,14 @@ pub fn differing_runs(stored: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
   runs
 }
 
-/// The host's page in bytes, at least one: the unit pages of zeros are skipped in.
+/// The host's page in bytes, at least one: the unit pages of zeros are skipped in. Asked once (a slice asks per call).
 fn page_bytes() -> usize {
-  rustix::param::page_size().max(1)
+  static PAGE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+  *PAGE.get_or_init(|| {
+    usize::try_from(slates_machine::facts::Facts::page_bytes())
+      .unwrap_or(1)
+      .max(1)
+  })
 }
 
 impl DaxBackingSession {
@@ -383,7 +391,7 @@ impl DaxBackingSession {
   /// [`DaxBackingSession::fill_step`]: the inode the node resolved to. A refusal leaves nothing pending.
   pub fn ask(&mut self, bridge: &mut dyn Bridge, cx: &OpContext, ask: Ask) -> Result<u64, Refused> {
     if let Some((offset, len)) = ask.range
-      && offset.saturating_add(len) > DAX_OBJECT_BYTES
+      && offset.saturating_add(len) > dax_object_bytes()
     {
       return Err(Refused::Malformed);
     }
@@ -513,6 +521,12 @@ impl DaxBackingSession {
       if pending.progress == 0 {
         // The range's fill begins: it is counted, then marked filled, so write-through reaches it from now on.
         let target = state.backings.get_mut(handle).ok_or(Refused::Object)?;
+        // Readied for the VMM's map first: a Windows section's range is committed whole, past the file's end and over
+        // its holes too, where the fill copies nothing and the VMM's touch would otherwise fault.
+        target
+          .object_mut()
+          .prepare_range(pending.next)
+          .map_err(|_| Refused::Object)?;
         let before = charge_of(target);
         target.mark_filled(pending.next);
         let after = charge_of(target);
@@ -539,8 +553,8 @@ impl DaxBackingSession {
     Ok(false)
   }
 
-  /// The fill is done: marks the ranges asked writable, and makes a new descriptor of the object for the answer.
-  fn answered(&mut self, bridge: &mut dyn Bridge, pending: &Fill) -> Result<OwnedFd, Refused> {
+  /// The fill is done: marks the ranges asked writable, and makes what the answer hands the VMM for the object.
+  fn answered(&mut self, bridge: &mut dyn Bridge, pending: &Fill) -> Result<HandedObject, Refused> {
     let handle = *self.backings.get(&pending.inode).ok_or(Refused::Object)?;
     let state = bridge.dax_state().ok_or(Refused::Object)?;
     let target = state.backings.get_mut(handle).ok_or(Refused::Object)?;
@@ -554,8 +568,7 @@ impl DaxBackingSession {
     }
     target
       .object()
-      .descriptor()
-      .try_clone_to_owned()
+      .handed_to_vmm(pending.ask.writable)
       .map_err(|_| Refused::Object)
   }
 

@@ -48,9 +48,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use slates_mem::{
-  DAX_OBJECT_BYTES, DAX_RANGE_BYTES, DaxObject, Handle, MemError, PeerObject, Slab,
-};
+use slates_mem::{DAX_RANGE_BYTES, DaxObject, Handle, MemError, PeerObject, Slab};
 
 use crate::ids::InodeNo;
 
@@ -59,7 +57,8 @@ const SEGMENT_SLOTS: usize = 16;
 
 /// What a backing's bytes live in.
 pub enum BackingObject {
-  /// A VMM's: sized to the largest file a guest can have and viewed a range at a time (`slates_mem::DaxObject`).
+  /// A VMM's: sized to the largest file a guest can have (`slates_mem::dax_object_bytes`) and viewed a range at a time
+  /// (`slates_mem::DaxObject`).
   Vmm(DaxObject),
   /// A same-kernel client's direct map (A-171): sized to the file's page span when it was mapped, and sealed against
   /// the client (`slates_mem::PeerObject`).
@@ -80,7 +79,7 @@ impl BackingObject {
   #[must_use]
   pub fn len(&self) -> u64 {
     match self {
-      BackingObject::Vmm(_) => DAX_OBJECT_BYTES,
+      BackingObject::Vmm(object) => object.len(),
       BackingObject::Peer(object) => object.len(),
     }
   }
@@ -126,7 +125,7 @@ impl BackingObject {
   }
 
   /// A read-only handle of a peer's copy, in this process: what the Windows hand-off duplicates into the client's
-  /// (A-175). A VMM's object has none here: no DAX object exists on Windows, so the arm is unreachable and refused.
+  /// (A-175). A VMM's object is handed by [`BackingObject::handed_to_vmm`] instead, so it is refused here.
   #[cfg(windows)]
   pub fn read_only_handle(&self) -> Result<std::os::windows::io::OwnedHandle, MemError> {
     match self {
@@ -137,7 +136,59 @@ impl BackingObject {
       BackingObject::Peer(object) => object.read_only_handle(),
     }
   }
+
+  /// Readies range `range` of a VMM's object for the VMM's map before its ask is answered (Windows commits it; see
+  /// `slates_mem::DaxObject::prepare_range`). A peer's copy is whole from its making, so nothing is done for one.
+  pub fn prepare_range(&mut self, range: u64) -> Result<(), MemError> {
+    match self {
+      BackingObject::Vmm(object) => object.prepare_range(range),
+      BackingObject::Peer(_) => Ok(()),
+    }
+  }
+
+  /// What a VMM's ask is answered with: a new descriptor of the object, read-write whatever the ask (HVF maps a shared
+  /// range only from a descriptor opened to write, M17; the guest's stores reach the volume only by an ingest, which a
+  /// read-only attachment never runs). A peer's copy is never a VMM's, so it is refused.
+  #[cfg(unix)]
+  pub fn handed_to_vmm(&self, _writable: bool) -> Result<HandedObject, MemError> {
+    match self {
+      BackingObject::Vmm(object) => {
+        object
+          .descriptor()
+          .try_clone_to_owned()
+          .map_err(|e| MemError::OsRefused {
+            call: "a VMM's descriptor of a DAX object",
+            code: e.raw_os_error(),
+          })
+      }
+      BackingObject::Peer(_) => Err(MemError::OsRefused {
+        call: "a VMM's descriptor of a peer's copy",
+        code: None,
+      }),
+    }
+  }
+
+  /// What a VMM's ask is answered with: a duplicate of the object's section in this process that maps it read alone,
+  /// or read and write where the ask is `writable`, for the transport to duplicate into the VMM's process (Windows, plan
+  /// G-shards-windows step 5). A peer's copy is never a VMM's, so it is refused.
+  #[cfg(windows)]
+  pub fn handed_to_vmm(&self, writable: bool) -> Result<HandedObject, MemError> {
+    match self {
+      BackingObject::Vmm(object) => object.handed(writable),
+      BackingObject::Peer(_) => Err(MemError::OsRefused {
+        call: "a VMM's handle of a peer's copy",
+        code: None,
+      }),
+    }
+  }
 }
+
+/// What a VMM is handed for its object: a descriptor (Unix) or a section handle in this process (Windows).
+#[cfg(unix)]
+pub type HandedObject = std::os::fd::OwnedFd;
+/// What a VMM is handed for its object: a descriptor (Unix) or a section handle in this process (Windows).
+#[cfg(windows)]
+pub type HandedObject = std::os::windows::io::OwnedHandle;
 
 /// One file's backing for one holder: its object, the ranges filled from the volume, the ranges asked writable, and
 /// whether the disk has changed the file beneath it since.
