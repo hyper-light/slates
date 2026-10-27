@@ -1,0 +1,79 @@
+name: RED-CHECK arm64 Windows direct map (not for main)
+
+# A diagnostics branch, never merged: it reads CI's native arm64 Windows runner, which no machine in this kiln is.
+# The bare-metal Windows arm64 socket-route cell of the DAX matrix (docs/wip/virtiofs.md §8) cites the direct-map
+# tests' green run in the `windows-arm64` lane (run 40525669353). This red-checks them on the same image: each mutant
+# must fail the tests it targets, and the unchanged tree must pass, in one run.
+#   copy:       `map_read` answers `MapUnavailable` for every request, so every map is read by copy (the zero-copy
+#               assertions must fail).
+#   descriptor: the peer section is made under Windows' default security descriptor rather than `PEER_SECTION_SDDL`
+#               (the hostile holder's duplicate that writes must be granted, so its test must fail).
+
+on:
+  push:
+    branches: [dax-arm64-windows-redcheck]
+
+jobs:
+  redcheck:
+    name: direct map on arm64 Windows (${{ matrix.mutant }})
+    strategy:
+      fail-fast: false
+      matrix:
+        mutant: [green, copy, descriptor]
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: clang-cl for the C the daemon links
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          & $clang --version
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Apply the mutant
+        shell: pwsh
+        run: |
+          function Mutate($file, $old, $new) {
+            $text = Get-Content -Raw $file
+            $changed = $text.Replace($old, $new)
+            if ($changed -eq $text) { throw "the mutant did not apply to $file" }
+            Set-Content -NoNewline -Path $file -Value $changed
+          }
+          switch ("${{ matrix.mutant }}") {
+            "green" { }
+            "copy" {
+              Mutate "crates/server/src/direct_map.rs" `
+                "if !is_the_daemons_user(principal) || !matches!(at, ReadAt::Head) {" `
+                "if true || !is_the_daemons_user(principal) || !matches!(at, ReadAt::Head) {"
+            }
+            "descriptor" {
+              Mutate "crates/mem/src/dax_object.rs" `
+                "lpSecurityDescriptor: descriptor," `
+                "lpSecurityDescriptor: std::ptr::null_mut(),"
+            }
+            default { throw "unknown mutant" }
+          }
+          git diff
+      - name: The client tests, one at a time
+        id: tests
+        continue-on-error: ${{ matrix.mutant != 'green' }}
+        timeout-minutes: 30
+        run: cargo test -p slates-client --test client -- --test-threads=1
+      - name: The verdict
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          $outcome = "${{ steps.tests.outcome }}"
+          Write-Output "REDCHECK mutant=${{ matrix.mutant }} tests=$outcome"
+          if ("${{ matrix.mutant }}" -eq "green") {
+            if ($outcome -ne "success") { exit 1 }
+          } elseif ($outcome -ne "failure") {
+            Write-Output "REDCHECK FAILED: the mutant passed every test"
+            exit 1
+          }
