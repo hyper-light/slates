@@ -1,0 +1,93 @@
+name: DIAG arm64 Windows WinFsp mount (not for main)
+
+# A diagnostics branch, never merged: it reads CI's native arm64 Windows runner, which no machine in this kiln is.
+# The bare-metal Windows arm64 mount-route cell of the DAX matrix (docs/wip/virtiofs.md §8) is owed: WinFsp's mount
+# tests have only run on x86_64 (A-177). This installs WinFsp on windows-11-arm and runs them, unchanged and with the
+# mount handing Windows empty notification rounds (the cached-read test must then fail, as it did on x86_64 in runs
+# 40249528145 and 40250871529).
+
+on:
+  push:
+    branches: [dax-arm64-windows-winfsp]
+
+jobs:
+  winfsp:
+    name: WinFsp mount on arm64 Windows (${{ matrix.mutant }})
+    strategy:
+      fail-fast: false
+      matrix:
+        mutant: [green, empty-rounds]
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: clang-cl for the C the daemon links
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          & $clang --version
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Install WinFsp
+        shell: pwsh
+        run: |
+          [System.Environment]::OSVersion.Version
+          $env:PROCESSOR_ARCHITECTURE
+          if (Get-Command choco -ErrorAction SilentlyContinue) {
+            choco install winfsp -y --no-progress
+          } else {
+            Write-Output "no chocolatey on this image: the MSI from WinFsp's release"
+            $msi = Join-Path $env:RUNNER_TEMP "winfsp.msi"
+            Invoke-WebRequest -Uri "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi" -OutFile $msi
+            $install = Start-Process msiexec.exe -ArgumentList "/i", $msi, "/qn", "/norestart" -Wait -PassThru
+            if ($install.ExitCode -ne 0) { throw "msiexec exited $($install.ExitCode)" }
+          }
+          $bin = "C:\Program Files (x86)\WinFsp\bin"
+          Get-ChildItem $bin | Select-Object Name, Length
+          if (-not (Test-Path (Join-Path $bin "winfsp-a64.dll"))) { throw "no winfsp-a64.dll in $bin" }
+          $bin | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          sc.exe query WinFsp.Launcher
+      - name: Apply the mutant
+        shell: pwsh
+        run: |
+          function Mutate($file, $old, $new) {
+            $text = Get-Content -Raw $file
+            $changed = $text.Replace($old, $new)
+            if ($changed -eq $text) { throw "the mutant did not apply to $file" }
+            Set-Content -NoNewline -Path $file -Value $changed
+          }
+          switch ("${{ matrix.mutant }}") {
+            "green" { }
+            "empty-rounds" {
+              Mutate "crates/server/src/winfsp.rs" `
+                "if mount.thread.notify(round.bytes().to_vec()).is_ok() {" `
+                "if mount.thread.notify(Vec::new()).is_ok() {"
+            }
+            default { throw "unknown mutant" }
+          }
+          git diff
+      - name: The WinFsp mount through the CLI
+        id: tests
+        continue-on-error: ${{ matrix.mutant != 'green' }}
+        timeout-minutes: 30
+        env:
+          SLATES_TEST_CLI: "1"
+          WINFSP_TEST_MOUNT: "1"
+        run: cargo test -p slates-cli --test winfsp -- --test-threads=1 --nocapture
+      - name: The verdict
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          $outcome = "${{ steps.tests.outcome }}"
+          Write-Output "DIAG mutant=${{ matrix.mutant }} tests=$outcome"
+          if ("${{ matrix.mutant }}" -eq "green") {
+            if ($outcome -ne "success") { exit 1 }
+          } elseif ($outcome -ne "failure") {
+            Write-Output "REDCHECK FAILED: the mutant passed every test"
+            exit 1
+          }
