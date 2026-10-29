@@ -689,14 +689,25 @@ fn single_shard_daemon(name: &str) -> (Daemon, String) {
   (daemon, instance)
 }
 
-/// Provisions a bounded volume named `name` on `instance`.
+/// Provisions a bounded volume named `name` on `instance`. The connect is retried while the daemon is still coming up,
+/// within [`SETTLE`], as `provision_remote_volume`'s is: a claim on an in-process daemon waits one claim wait, and CI's
+/// Windows runner, slowed (a shard initialized in 19 ms where an unloaded machine takes about 2), left one unanswered
+/// for that long right after the daemon started (run 40855180817; GAPS 8a-tsan-wait is the same shape).
 fn provision(instance: &str, name: &str) {
   let deadlines = slates_client::Deadlines::derive(
     slates_server::daemon::LIVENESS_BUDGET_NS,
     slates_db::replay::RECOVERY_BUDGET_NS,
   )
   .get();
-  let mut client = slates_client::Client::connect(instance, deadlines).unwrap();
+  let started = Instant::now();
+  let mut client = loop {
+    match slates_client::Client::connect(instance, deadlines) {
+      Ok(client) => break client,
+      Err(slates_client::ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. }))
+        if started.elapsed() < SETTLE => {}
+      Err(e) => panic!("connect: {e}"),
+    }
+  };
   client
     .create(&slates_client::CreateSpec {
       name: name.to_owned(),

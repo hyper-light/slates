@@ -12599,8 +12599,10 @@ of its own).
   a claim instead: an administrator's `local` PersistentVolume names the node's directory, a claim in the namespace binds
   it by name, and the pod mounts the claim read-only, a `persistentVolumeClaim` volume, which the restricted profile
   allows; the kubelet mounts it, and nothing privileged of slates' own is involved. A CSI driver, the other way, would
-  be a privileged node plugin of slates' own, which R10 rules out. The KIND leg's step 7 runs it: the namespace must
-  first refuse a hostPath pod, then its pods write through the socket file over the claim (first run owed to CI).
+  be a privileged node plugin of slates' own, which R10 rules out. Proven by the KIND leg's step 7 on x86_64 (run
+  40855180817) and arm64 (diagnostics run 40855403394): the namespace refuses a hostPath pod ("violates PodSecurity
+  \"restricted:latest\": restricted volume types"), then its pods write the file and write through it over the claim,
+  `differing=37 synced=37 released=0 whole=true`.
 - **Measured in release** (adacachy, load 31 to 42, 2026-10-29, the same interleaved A/B in release builds): the least
   connect of each run 24.1, 25.2 and 24.1 µs unsealed against 69.7, 79.4 and 72.7 µs sealed, the median 43.2, 45.7 and
   41.0 µs against 115.9, 117.5 and 116.9 µs: the exchange adds about 48 µs at the least and 73 µs at the median, of

@@ -11345,10 +11345,10 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   - **Owed:**
     - **Measured since, in release** (adacachy, 2026-10-29): a sealed connect 115.9 to 117.5 µs at the median against
       41.0 to 45.7 µs unsealed, 69.7 to 79.4 µs at the least against 24.1 to 25.2 µs (BENCHMARKS).
-    - **A namespace that forbids hostPath**, built since: its pods mount the directory through a claim bound to an
-      administrator's `local` PersistentVolume, which the restricted profile allows (the KIND leg's step 7, its control a
-      hostPath pod the namespace must refuse). First run owed to CI. A CSI driver would be a privileged node plugin of
-      slates' own, which R10 rules out.
+    - **A namespace that forbids hostPath**, built and proven since: its pods mount the directory through a claim bound
+      to an administrator's `local` PersistentVolume, which the restricted profile allows; the KIND leg's step 7 on
+      x86_64 (run 40855180817) and arm64 (diagnostics run 40855403394), the namespace refusing a hostPath pod first. A
+      CSI driver would be a privileged node plugin of slates' own, which R10 rules out.
     - The client's check of the listener's user is tested only as root (a listener of another user needs root to
       start), so CI's runners skip it loudly; so is the `unshare` namespace test, since the runners refuse an
       unprivileged user namespace (`write failed /proc/self/uid_map`). Both ran on arm64 Linux in a container and the
@@ -11377,7 +11377,11 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   - **Found on the way, reported:**
     - `MapRead` does not refuse a file an in-process guest maps writable (the DAX registry's `has_writable_of`), which
       `MapWrite` refuses: that guest's stores bypass the write boundary, so a read-only copy made meanwhile would go
-      stale. `Volume::dax_map_write` refuses the other order already. No test reaches it; left for its own fix.
+      stale. `Volume::dax_map_write` refuses the other order already. **Unreachable in a daemon, checked 2026-10-29:**
+      a writable window over a file's own block needs the volume's writable-DAX opt-in, and nothing in the daemon calls
+      `Volume::enable_writable_dax` (only vfs and bridge tests do), so `has_writable_of` is false there; a daemon's guest
+      windows map per-file backings that write-through keeps equal (A-168). If a daemon opt-in is ever added, `MapRead`
+      must refuse as `MapWrite` does, in `Fill::begin` where both resolve their inode.
     - The fill's deferral answered its never-expected route refusal with the copy still held: the fill's drop runs
       inside the state's borrow there and cannot reach the store. The shared deferral lets the copy go on both of its
       refusals now.
