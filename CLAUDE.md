@@ -155,7 +155,11 @@ Every test is written as "do X, expect Y" and names the acceptance criterion or 
     The copy's hold outlives its file: a destroy or a last unlink only detaches it, since the client's map keeps pages
     the daemon was charged for; only a release or the reap frees it (A-172). And a share per client seat is no share:
     `clients_per_shard` is itself the reserve over one ring region, so the reserve over it is about four regions on any
-    machine; share the shard's capacity among the clients served now.
+    machine; share the shard's capacity among the clients served now. Since A-188 a map is held on its volume's shard
+    under its client, whichever shard serves it (`DirectMapState::held`), so the share is counted over the clients served
+    there, those holding its copies and the one asking; and a Linux delivery is sealed under the client's own channel
+    (A-187), so only the client's shard may send it: the copy's shard asks it by `crate::xshard::call_within`, and a
+    reap's sliced write-back on another shard runs as a task there (`crate::xshard::task_within`).
     macOS has no seals (A-173): the peer gets a second descriptor of an unlinked shared-memory object opened read alone,
     offered on the socket route (`crates/ipc/src/route.rs`, `crates/server/src/shards_route.rs`), and the access mode is
     the capability. Gotchas, each measured: hold every refusal to the read-only mode's own errno (`EPERM` map, `EBADF`

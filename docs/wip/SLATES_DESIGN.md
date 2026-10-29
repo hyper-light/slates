@@ -2946,12 +2946,17 @@ destroy or a file's last unlink only detaches its copies: they leave the write-t
 prefix again once its count wraps never writes into them, but they stay held and counted, because the client's own map
 keeps the object's pages, which the daemon wrote and its memory is charged for. A shard holds at most the copies its
 share of the process's descriptor and mapping limits leaves room for (one descriptor and up to three mappings a copy),
-and at most its fill budget's bytes; a client's share is that capacity over the clients the shard serves now, and a map
-past it is refused `MapShareExhausted` with nothing made.
-A writable local map, if ever offered, goes through the VFS write boundary exactly as the
-guest's opt-in writable DAX (§4.6 L0). Reaching a consumer in a *separate* namespace (an OCI container, a k8s pod)
-needs the descriptor-passing channel to cross that namespace — the pathname-rendezvous question recorded in GAPS; the
-same-namespace host process is the first delivered case.
+and at most its fill budget's bytes; a client's share is that capacity over the clients the shard serves, those holding
+its copies and the one asking, and a map past it is refused `MapShareExhausted` with nothing made. **A client of any
+shard (A-188).** Every map verb names its volume and runs on the volume's shard, and the copy is held there, in that
+shard's table under its client, whichever shard serves the client. The hand-off reaches the client where it is: on Linux
+the copy's shard asks the client's own shard, by a cross-shard call, to send the descriptor on the client's control
+socket, whose deliveries are sealed under the client's channel (A-187); on Windows it asks that shard for the client's
+process and duplicates the handle into it; macOS's offer is made on the copy's shard and claimed by the mapping id,
+which names it. The reply is delivered to the client's ring on its own shard. The client's own shard runs its reap and
+reaches every shard: there the client's writable maps are written back before its attachments go, and its copies let
+go after. A consumer in a separate network namespace (a container on a bridge network, a pod of its own) reaches the
+daemon through the rendezvous's socket file (A-187).
 
 > **Status (local zero-copy read / A-135, 2026-10-15).** **Built and proven end to end on x86_64 Linux.** A same-uid
 > client requests `MapRead` over the command ring; the daemon mints a read mapping (`Volume::dax_map_read`) and sends
@@ -3070,8 +3075,10 @@ same-namespace host process is the first delivered case.
 > read-only view turned writable `ERROR_INVALID_PARAMETER`; the neighbour's marker absent, and found through the
 > neighbour's own handle; release, share, destroy, unlink and the cross-shard copy as on Linux. Red-checked: a section
 > under the default descriptor was refused unconfined at the hand-off (the read came by copy), and with the judge
-> bypassed as well the hostile test's duplicate that writes was granted. **Owed:** arm64 Windows (its CI lane measures
-> the escalation but runs no daemon); on Windows, replies stalled past their 1 s deadline when the client binary ran at
+> bypassed as well the hostile test's duplicate that writes was granted. **Arm64 Windows since proven** (2026-10-27): the
+> direct-map client tests, 20 of 20, in CI's `windows-arm64` lane on `windows-11-arm` (run 40525669353), red-checked
+> there (runs 40570140348, 40572762430), and the 8 writable-map tests (A-186, run 40816824486). **Owed:** on Windows,
+> replies stalled past their 1 s deadline when the client binary ran at
 > 32 test threads (6 of 13 tests; 4 threads ran all 14 green), not yet diagnosed, so CI runs the binary one test at a
 > time; before this change (GAPS). The binary's restart tests, which failed on Windows meeting their predecessor's
 > still-live named section (`ERROR_ALREADY_EXISTS`), pass there since A-176 (§4.7).
@@ -3861,7 +3868,9 @@ well-known name.
 > costs about 36 µs a rendezvous in release, and a sealed connect is about 180 µs slower at the median in a debug build
 > (BENCHMARKS, A-187), once per client session. A container on a bridge network and a KIND pod of its own each wrote a
 > file through a writable direct map across the socket file in CI (run 40844136550, diagnostics run 40847130881),
-> red-checked. Owed: the connect's cost in a release build.
+> red-checked. In release a sealed connect costs about 73 µs more at the median (adacachy). A namespace whose Pod Security
+> profile forbids hostPath mounts the directory through a claim on a `local` PersistentVolume (A-187; the KIND leg's
+> step 7).
 
 > **Status (2026-10-27): a peer the daemon cannot see by pid is served.** Linux reports a socket peer's process id as
 > the reader's pid namespace sees it, and 0 for a process outside it: a client in a container of a pod beside the
@@ -12463,7 +12472,49 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
 - **Rejected: granting the user reading by SID.** The first descriptor named the user's SID with reading rights; it needed the token read and converted on every copy and granted nothing a handle does not already carry. `OWNER RIGHTS` alone refuses the same escalations (measured), with nine fewer unsafe sites.
 - **Proven** on jupiter (Windows 10.0.26200), 2026-10-25, and red-checked (§4.6 status); CI's two x86_64 Windows lanes run the same tests on every push to main.
 - **Measured** the same day (BENCHMARKS, "Copy-once-map-many against copy-per-read", jupiter): a steady mapped read costs 1.4 % to 2.6 % of a copy read; the hand-off's setup is 28 to 56 µs at 4 KiB, repaid after 2 or 3 reads, and from 1 MiB the whole setup costs less than one copy read.
-- **Owed:** arm64 Windows; replies that stalled on Windows with many daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
+- **Arm64 Windows proven** since (2026-10-27): the direct-map client tests, 20 of 20, on CI's `windows-11-arm` (run
+  40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
+  daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
+
+### A-188 — A client of any shard is handed a direct map: the copy held on its volume's shard, the hand-off through the client's own (accepted and built 2026-10-29)
+Applied in the same change to: §4.6 (the same-kernel direct map paragraph), A-186 (its owed item), GAPS,
+`crates/server` (`direct_map.rs`: `ClientMaps` and `DirectMapState::held`, the share counted over the clients served,
+holding and asking, `Fill::begin` taking the principal, the three hand-offs reaching the client's shard, `deliver_to`,
+`write_back_held` and `let_go_held` replacing `write_back_for_reap`, `give_back`; `xshard.rs`: `task_within`;
+`reap.rs`: each shard's maps written back before its attachments go and let go after; `state.rs` and `daemon.rs`: the
+slot's `direct_maps` removed; `config.rs` doc), `crates/client` (`tests/client.rs`, `tests/reap_map.rs`), `crates/cli`
+(`tests/cli.rs` doc), `CLAUDE.md`.
+- **What it answers.** A copy was handed only to a client of the volume's own shard: the copy and its write-through
+  live where the volume does, and the client's slot, which held the copy and the channel it went over, lives where the
+  client is served, its id's residue over the shards. So in a daemon of N shards a writable map was served to about one
+  client in N, and every other client's read map fell back to the paged copy: the direct map, A-171's zero-copy read and
+  A-186's write, was a one-shard feature. Every map verb already names its volume and runs on the volume's shard.
+- **The hold moves to the copy.** A map is held on its volume's shard, in that shard's table under its client id, with
+  the principal its write-back is checked under, whichever shard serves the client. `MapSync`, `ReleaseMap` and the
+  detach's `MapsHeld` read that table where they run. A client's share of a shard's copies is counted over the clients
+  the shard serves, those holding its copies, and the one asking: a superset of the clients it served before, so a
+  share is never larger than it was.
+- **The hand-off reaches the client.** Linux: the copy's shard asks the client's own shard, the reply route's, by a
+  cross-shard call, to send the descriptor on the client's control socket, since a delivery is sealed under the
+  client's channel and only that shard may seal on it (A-187); the reply follows once that shard answers, so the
+  descriptor is waiting when the client reads the reply, as before. Windows: the copy's shard asks the client's shard
+  for the client's process and duplicates the handle into it. macOS: the offer is made on the copy's shard, where any
+  client claims it by the mapping id, whose high bits name the shard (A-173 already found offers there). The reply is
+  delivered to the client's ring on its shard, as an image build's is (A-160).
+- **The reap reaches every shard.** The client's own shard runs its reap and visits every shard in turn: there the
+  client's writable maps are written back before its attachments go (A-186), then its copies are let go. A write-back
+  is sliced, a copy slice a turn, so it runs as a task on its shard: the new cross-shard call `task_within` awaits a
+  task's result where `call_within` awaits a closure's. A write-back that does not end within the reap's deadline
+  defers the reap, which is retried, rather than removing an attachment its stores still need.
+- **Proven** (2026-10-29): on a two-shard daemon a client of the shard that does not own the volume maps a 20 KiB file
+  read-only, zero-copy, then read and write, its sync writing exactly the differing bytes, which another client reads,
+  every copy given back after (`a_client_of_another_shard_maps_a_file_read_and_write`); the cross-shard read test now
+  demands zero-copy on every volume; and a client of the other shard killed with unsynced stores has them written back
+  by its reap through the volume's shard, the copy let go there
+  (`a_killed_client_of_another_shard_has_its_writable_maps_stores_written_back`). macOS (this Mac): the client suite
+  32, reap 1, reap_map 4, the server's direct-map, cross-shard and reap unit tests 6, the Shards suite 26; Linux
+  x86_64 (adacachy): clippy of the server and client, the client suite 31, netns, reap 1, reap_map 4. Each new test
+  failed before the change: the read maps fell back to copies and the writable map was refused `MapUnavailable`.
 
 ### A-187 — A client in its own network namespace reaches the daemon through a socket file, every rendezvous sealed (accepted 2026-10-28; built and proven 2026-10-29)
 Applied in the same change to: §4.7 (the rendezvous paragraph and its status), GAPS, `docs/wip/virtiofs.md` §8 (the
@@ -12544,9 +12595,17 @@ of its own).
   123347393577) and on arm64 (diagnostics run 40847130881). Red-checked on arm64 with the socket file read as an
   abstract name: step 6's pod of its own and the bridge container were each refused "daemon unavailable". Linux x86_64
   ran the ipc, client and namespace suites on adacachy the same day (29, 22, 30 and 1 passed).
-- **Owed:** the connect's cost in a release build; a namespace whose Pod Security admission forbids hostPath volumes
-  cannot mount the directory (a CSI driver serving it as an inline volume, as SPIFFE's does for its agent's socket,
-  would); CI's runners refuse an unprivileged user namespace, so the `unshare` test skips there loudly.
+- **A namespace that forbids hostPath** (Pod Security's restricted and baseline profiles) reaches the directory through
+  a claim instead: an administrator's `local` PersistentVolume names the node's directory, a claim in the namespace binds
+  it by name, and the pod mounts the claim read-only, a `persistentVolumeClaim` volume, which the restricted profile
+  allows; the kubelet mounts it, and nothing privileged of slates' own is involved. A CSI driver, the other way, would
+  be a privileged node plugin of slates' own, which R10 rules out. The KIND leg's step 7 runs it: the namespace must
+  first refuse a hostPath pod, then its pods write through the socket file over the claim (first run owed to CI).
+- **Measured in release** (adacachy, load 31 to 42, 2026-10-29, the same interleaved A/B in release builds): the least
+  connect of each run 24.1, 25.2 and 24.1 µs unsealed against 69.7, 79.4 and 72.7 µs sealed, the median 43.2, 45.7 and
+  41.0 µs against 115.9, 117.5 and 116.9 µs: the exchange adds about 48 µs at the least and 73 µs at the median, of
+  which about 36 µs is the seal's own crypto and the rest the half round trip more.
+- **Owed:** CI's runners refuse an unprivileged user namespace, so the `unshare` test skips there loudly.
 
 ### A-186 — The direct map maps a file read and write: the client's stores are compared back into the file at its sync points (accepted 2026-10-28)
 Applied in the same change to: §4.6 (the same-kernel direct map paragraph and its status, the DAX matrix status), GAPS, `docs/wip/virtiofs.md` §8, `crates/mem` (`dax_object.rs`: `PeerAccess`, `PeerObject::create` taking it, `PeerObject::access` and `read_write_handle`, `PeerWriteView` on every platform, `within_view`; `tests/peer_object.rs`, `tests/peer_section.rs`), `crates/ipc` (`protocol.rs`: `RequestBody::MapWrite` and `MapSync`, `ReplyBody::MapSynced`, `Refusal::MapsHeld`, appended; `rendezvous.rs`: `Mapping`, the Linux judge by access and its writable test; `route.rs`: `confined_map`, replacing `confined_read_only`; `handle_route.rs`: `confined_section` and `hand_section` by access), `crates/vfs` (`shards_backing.rs`: a writable copy's ranges marked writable, `is_attached`, `BackingObject::peer_handle` replacing `read_only_handle`), `crates/bridge-core` (`dax_backing.rs`: `write_back_slice` and `WroteBack`, the one compare-back, which the ingest now calls), `crates/server` (`direct_map.rs`: `HeldMap`, `map_write`, `map_sync`, `Sync`, the writable release, `write_back_for_reap`, `defer_task`, `complete` shared; `fs_verbs.rs`: `with_writer`, `writable_file`; `verbs.rs`: the verbs' dispatch, the detach's `MapsHeld`, the refusal's ledger name; `reap.rs`; `state.rs`), `crates/client` (`MappedWrite`, `map_write`, `map_sync`, `release_map_write`; `tests/client.rs`, `tests/reap_map.rs`).
@@ -12637,13 +12696,9 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph and i
   caught by the hostile test (a duplicate that may rewrite the descriptor granted). The detached-copy guard is not
   red-checkable without a volume prefix handed out again: the attachment's check and the inode's own absence refuse
   first.
-- **Owed:**
-  - **A client of another shard.** A copy is handed only to a client of the shard that owns the volume: a descriptor
-    does not cross shards yet. A read falls back to a copy there; a writable map is refused `MapUnavailable`, since it
-    has no copy to fall back to. A client's shard is its id's residue, so in a daemon of N shards a writable map is
-    served to about one client in N. The test daemons run one shard for this reason (`crates/client/tests/client.rs`'s
-    `one_shard_daemon`, and `crates/cli/tests/cli.rs`'s container tests since this change: with two shards, their
-    container's client landed on the volume's shard or not by how many clients came before it).
+- **Owed then, built since (A-188, 2026-10-29):** a client of another shard than the volume's was handed no copy: a
+  read fell back to the paged copy and a writable map was refused `MapUnavailable`, so in a daemon of N shards about one
+  client in N was served. Every map is now held on its volume's shard under its client, whichever shard serves it.
   - Nothing more by platform: CI's run of 4552995b (40816824486) ran the 8 writable-map client tests on its native
     arm64 lanes, Linux (`ubuntu-24.04-arm`: 159,669 stores over 200 syncs, none undone) and Windows (`windows-11-arm`,
     with the writable section test), all passing, and its x86_64 KIND lane's pod wrote through its map

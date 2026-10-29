@@ -35,14 +35,19 @@
 //!    node's directory read-only, write the file and write through it by a writable direct map, as step 5 does: the
 //!    sync writes the stored bytes that differ, the release nothing more, the file holds the store, and the daemon
 //!    counts one hand-off and two write-backs, none refused, nothing unconfined.
+//! 7. The same from a namespace that enforces Pod Security's restricted profile, which forbids hostPath volumes: the
+//!    namespace must first refuse a pod mounting the node's directory by hostPath. An administrator's `local`
+//!    PersistentVolume names the directory, a claim in that namespace binds it, and pods of their own there mount the
+//!    claim read-only (a `persistentVolumeClaim` volume, which the restricted profile allows) and write the file and
+//!    write through it as step 6's do. Nothing privileged of slates' own is involved: the kubelet mounts the volume.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use super::export::{MAP_PROBE_TAG, probe_image};
 use super::{
-  CLUSTER_WAIT, Failure, Lane, NAMESPACE, Options, POLL_CLUSTER, Scratch, capture_with_input,
-  certs, down, image, pause, stream, write_scratch,
+  CLUSTER_WAIT, Failure, Lane, NAMESPACE, Options, POLL_CLUSTER, Scratch, capture,
+  capture_with_input, certs, down, image, pause, stream, write_scratch,
 };
 
 /// Shape: the leg's own kind cluster; created here, deleted at the end, never anyone else's.
@@ -93,6 +98,15 @@ const RENDEZVOUS_HOST_PATH: &str = "/run/slates-rendezvous";
 const DAEMON_USER: u32 = 65_532;
 /// Format: the tag of the probe's one line in its reach mode.
 const REACH_TAG: &str = "direct-reach:";
+/// Format: the namespace step 7's pods run in, which enforces Pod Security's restricted profile.
+const RESTRICTED_NAMESPACE: &str = "slates-restricted";
+/// Format: the PersistentVolume naming the node's rendezvous directory, and the claim bound to it in that namespace.
+const RENDEZVOUS_VOLUME: &str = "slates-rendezvous";
+/// Format: the storage class the volume and its claim share, which no provisioner serves: the claim binds by name.
+const RENDEZVOUS_CLASS: &str = "slates-rendezvous";
+/// Shape: the capacity the volume and its claim state: Kubernetes requires one, and a directory holding one socket
+/// file needs none.
+const RENDEZVOUS_CAPACITY: &str = "1Mi";
 /// Format: the daemon's counter of writable maps' write-backs refused.
 const SYNC_REFUSED: &str = "dax.local_map_sync_refused";
 
@@ -327,19 +341,158 @@ fn prove_own_namespace(lane: &Lane) -> Result<(), Failure> {
     "kind direct: a pod with a network namespace of its own wrote a file in place through a writable direct map, \
      reaching the daemon at the rendezvous's socket file"
   );
+  prove_restricted_namespace(lane, &node, &id)
+}
+
+/// Step 7: a namespace enforcing Pod Security's restricted profile refuses a hostPath pod, and its pods reach the
+/// socket file through a claim bound to an administrator's `local` PersistentVolume instead.
+fn prove_restricted_namespace(lane: &Lane, node: &str, id: &str) -> Result<(), Failure> {
+  let context = format!("kind-{}", lane.cluster);
+  apply(
+    &context,
+    &serde_json::json!({
+      "apiVersion": "v1",
+      "kind": "Namespace",
+      "metadata": {
+        "name": RESTRICTED_NAMESPACE,
+        "labels": {
+          "pod-security.kubernetes.io/enforce": "restricted",
+          "pod-security.kubernetes.io/enforce-version": "latest",
+        },
+      },
+    }),
+  )?;
+  let control = OwnPod::hostpath_in_restricted().manifest(node).to_string();
+  let refused = capture_with_input(
+    "kubectl",
+    &["--context", &context, "apply", "-f", "-"],
+    control.as_bytes(),
+  )?;
+  if refused.code == 0 || !refused.stderr.contains("hostPath") {
+    return Err(Failure(format!(
+      "kind direct: the restricted namespace did not refuse a hostPath pod: exit {}, {}",
+      refused.code,
+      refused.stderr.trim()
+    )));
+  }
+  eprintln!(
+    "kind direct: the restricted namespace refuses a hostPath pod: {}",
+    refused.stderr.lines().next().unwrap_or_default()
+  );
+  apply(&context, &rendezvous_volume(node))?;
+  apply(
+    &context,
+    &serde_json::json!({
+      "apiVersion": "v1",
+      "kind": "PersistentVolumeClaim",
+      "metadata": { "name": RENDEZVOUS_VOLUME, "namespace": RESTRICTED_NAMESPACE },
+      "spec": {
+        "accessModes": ["ReadWriteOnce"],
+        "storageClassName": RENDEZVOUS_CLASS,
+        "volumeName": RENDEZVOUS_VOLUME,
+        "resources": { "requests": { "storage": RENDEZVOUS_CAPACITY } },
+      },
+    }),
+  )?;
+  let wrote = run_own_pod(lane, node, OwnPod::restricted(Probe::Write, id))?;
+  if wrote != format!("wrote {DIRECT_FILE_BYTES}") {
+    return Err(Failure(format!(
+      "kind direct: the restricted pod did not write the file through the claim: {wrote:?}"
+    )));
+  }
+  let before = Counters::read(lane)?;
+  let line = run_own_pod(lane, node, OwnPod::restricted(Probe::MapWrite, id))?;
+  let after = Counters::read(lane)?;
+  eprintln!("kind direct: restricted pod {MAP_WRITE_TAG} {line}");
+  if !writes_through(&line) {
+    return Err(Failure(format!(
+      "kind direct: the restricted pod did not write the file through its map: {line:?}"
+    )));
+  }
+  if after.handed.saturating_sub(before.handed) != 1
+    || after.synced.saturating_sub(before.synced) != 2
+    || after.sync_refused != before.sync_refused
+    || after.unconfined != before.unconfined
+  {
+    return Err(Failure(format!(
+      "kind direct: the daemon's counters do not show one hand-off and two write-backs for the restricted pod: \
+       before {before:?}, after {after:?}"
+    )));
+  }
+  eprintln!(
+    "kind direct: a pod in a namespace enforcing the restricted profile wrote a file in place through a writable \
+     direct map, the rendezvous directory mounted through a claim"
+  );
   Ok(())
 }
 
-/// A run of the probe in a pod of its own (step 6).
+/// The administrator's `local` PersistentVolume naming the node's rendezvous directory on `node`, which a claim in the
+/// restricted namespace binds by name.
+fn rendezvous_volume(node: &str) -> serde_json::Value {
+  serde_json::json!({
+    "apiVersion": "v1",
+    "kind": "PersistentVolume",
+    "metadata": { "name": RENDEZVOUS_VOLUME },
+    "spec": {
+      "capacity": { "storage": RENDEZVOUS_CAPACITY },
+      "accessModes": ["ReadWriteOnce"],
+      "persistentVolumeReclaimPolicy": "Retain",
+      "storageClassName": RENDEZVOUS_CLASS,
+      "local": { "path": RENDEZVOUS_HOST_PATH },
+      "nodeAffinity": {
+        "required": {
+          "nodeSelectorTerms": [{
+            "matchExpressions": [{
+              "key": "kubernetes.io/hostname",
+              "operator": "In",
+              "values": [node],
+            }],
+          }],
+        },
+      },
+    },
+  })
+}
+
+/// Applies `object` (one Kubernetes object whose namespace, if it has one, it names itself).
+fn apply(context: &str, object: &serde_json::Value) -> Result<(), Failure> {
+  let applied = capture_with_input(
+    "kubectl",
+    &["--context", context, "apply", "-f", "-"],
+    object.to_string().as_bytes(),
+  )?;
+  if applied.code != 0 {
+    return Err(Failure(format!(
+      "kind direct: kubectl apply refused: {}",
+      applied.stderr.trim()
+    )));
+  }
+  Ok(())
+}
+
+/// How a pod of its own mounts the node's rendezvous directory (steps 6 and 7).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mount {
+  /// Not at all: the daemon named by its abstract instance.
+  Nothing,
+  /// By a hostPath volume, read-only.
+  HostPath,
+  /// By a claim bound to the administrator's `local` PersistentVolume, read-only.
+  Claim,
+}
+
+/// A run of the probe in a pod of its own (steps 6 and 7).
 struct OwnPod {
   /// The pod's name, one for each run.
   name: String,
+  /// The namespace it runs in.
+  namespace: &'static str,
   /// The probe's arguments after its binary.
   args: Vec<String>,
   /// The tag of its one line.
   tag: &'static str,
-  /// Whether the node's rendezvous directory is mounted, and the daemon named by its socket file there.
-  mounted: bool,
+  /// How it mounts the node's rendezvous directory, and with it whether the daemon is named by its socket file there.
+  mount: Mount,
 }
 
 impl OwnPod {
@@ -347,25 +500,44 @@ impl OwnPod {
   fn reach() -> OwnPod {
     OwnPod {
       name: "direct-own-reach".to_owned(),
+      namespace: NAMESPACE,
       args: vec!["reach".to_owned()],
       tag: REACH_TAG,
-      mounted: false,
+      mount: Mount::Nothing,
     }
   }
 
-  /// `probe`'s mode over the volume `id`, with the directory mounted.
+  /// `probe`'s mode over the volume `id`, with the directory mounted by hostPath (step 6).
   fn probe(probe: Probe, id: &str) -> OwnPod {
     OwnPod {
       name: format!("direct-own-{}", probe.mode()),
-      args: vec![
-        probe.mode().to_owned(),
-        id.to_owned(),
-        format!("/{DIRECT_FILE}"),
-        DIRECT_FILE_BYTES.to_string(),
-        DIRECT_FILL.to_string(),
-      ],
+      namespace: NAMESPACE,
+      args: probe_args(probe, id),
       tag: probe.tag(),
-      mounted: true,
+      mount: Mount::HostPath,
+    }
+  }
+
+  /// `probe`'s mode over the volume `id`, in the restricted namespace, with the directory mounted by its claim (step 7).
+  fn restricted(probe: Probe, id: &str) -> OwnPod {
+    OwnPod {
+      name: format!("direct-restricted-{}", probe.mode()),
+      namespace: RESTRICTED_NAMESPACE,
+      args: probe_args(probe, id),
+      tag: probe.tag(),
+      mount: Mount::Claim,
+    }
+  }
+
+  /// Step 7's control: a pod in the restricted namespace mounting the directory by hostPath, which its admission must
+  /// refuse. Otherwise as the restricted profile asks, so the hostPath volume is all it is refused for.
+  fn hostpath_in_restricted() -> OwnPod {
+    OwnPod {
+      name: "direct-restricted-hostpath".to_owned(),
+      namespace: RESTRICTED_NAMESPACE,
+      args: vec!["reach".to_owned()],
+      tag: REACH_TAG,
+      mount: Mount::HostPath,
     }
   }
 
@@ -402,25 +574,45 @@ impl OwnPod {
         "seccompProfile": { "type": "RuntimeDefault" },
       },
     });
-    if self.mounted {
+    let volume = match self.mount {
+      Mount::Nothing => None,
+      Mount::HostPath => Some(serde_json::json!({
+        "name": "rendezvous",
+        "hostPath": { "path": RENDEZVOUS_HOST_PATH, "type": "Directory" },
+      })),
+      Mount::Claim => Some(serde_json::json!({
+        "name": "rendezvous",
+        "persistentVolumeClaim": { "claimName": RENDEZVOUS_VOLUME, "readOnly": true },
+      })),
+    };
+    if let Some(volume) = volume {
       container["env"] = serde_json::json!([
         { "name": "SLATES_ENDPOINT", "value": format!("{RENDEZVOUS_DIRECTORY}/default") },
       ]);
       container["volumeMounts"] = serde_json::json!([
         { "name": "rendezvous", "mountPath": RENDEZVOUS_DIRECTORY, "readOnly": true },
       ]);
-      spec["volumes"] = serde_json::json!([
-        { "name": "rendezvous", "hostPath": { "path": RENDEZVOUS_HOST_PATH, "type": "Directory" } },
-      ]);
+      spec["volumes"] = serde_json::json!([volume]);
     }
     spec["containers"] = serde_json::json!([container]);
     serde_json::json!({
       "apiVersion": "v1",
       "kind": "Pod",
-      "metadata": { "name": self.name },
+      "metadata": { "name": self.name, "namespace": self.namespace },
       "spec": spec,
     })
   }
+}
+
+/// The probe's arguments for `probe`'s mode over the volume `id`.
+fn probe_args(probe: Probe, id: &str) -> Vec<String> {
+  vec![
+    probe.mode().to_owned(),
+    id.to_owned(),
+    format!("/{DIRECT_FILE}"),
+    DIRECT_FILE_BYTES.to_string(),
+    DIRECT_FILL.to_string(),
+  ]
 }
 
 /// Runs `pod` on `node` to its end and returns its tagged line, the tag taken off; the pod is deleted after. Prints the
@@ -428,9 +620,14 @@ impl OwnPod {
 fn run_own_pod(lane: &Lane, node: &str, pod: OwnPod) -> Result<String, Failure> {
   let context = format!("kind-{}", lane.cluster);
   let manifest = pod.manifest(node).to_string();
+  let in_namespace = |args: &[&str]| {
+    let mut full = vec!["--context", context.as_str(), "-n", pod.namespace];
+    full.extend_from_slice(args);
+    capture("kubectl", &full)
+  };
   let applied = capture_with_input(
     "kubectl",
-    &["--context", &context, "-n", NAMESPACE, "apply", "-f", "-"],
+    &["--context", &context, "apply", "-f", "-"],
     manifest.as_bytes(),
   )?;
   if applied.code != 0 {
@@ -442,7 +639,7 @@ fn run_own_pod(lane: &Lane, node: &str, pod: OwnPod) -> Result<String, Failure> 
   }
   let started = Instant::now();
   let phase = loop {
-    let phase = lane.kubectl(&["get", "pod", &pod.name, "-o", "jsonpath={.status.phase}"])?;
+    let phase = in_namespace(&["get", "pod", &pod.name, "-o", "jsonpath={.status.phase}"])?;
     let phase = phase.stdout.trim().to_owned();
     if phase == "Succeeded" || phase == "Failed" {
       break phase;
@@ -455,22 +652,24 @@ fn run_own_pod(lane: &Lane, node: &str, pod: OwnPod) -> Result<String, Failure> 
     }
     pause(POLL_CLUSTER);
   };
-  let addresses = [lane.pod(0), pod.name.clone()].map(|name| {
-    lane
-      .kubectl(&["get", "pod", &name, "-o", "jsonpath={.status.podIP}"])
-      .map(|outcome| outcome.stdout.trim().to_owned())
-  });
-  let [daemon_address, own_address] = addresses;
-  let (daemon_address, own_address) = (daemon_address?, own_address?);
+  let daemon_address = lane
+    .kubectl(&["get", "pod", &lane.pod(0), "-o", "jsonpath={.status.podIP}"])?
+    .stdout
+    .trim()
+    .to_owned();
+  let own_address = in_namespace(&["get", "pod", &pod.name, "-o", "jsonpath={.status.podIP}"])?
+    .stdout
+    .trim()
+    .to_owned();
   eprintln!(
     "kind direct: pod {} at {own_address}, pod 0 at {daemon_address}, ended {phase}",
     pod.name
   );
-  let logs = lane.kubectl(&["logs", &pod.name])?;
+  let logs = in_namespace(&["logs", &pod.name])?;
   for line in logs.stdout.lines() {
     eprintln!("kind direct: {}: {line}", pod.name);
   }
-  lane.kubectl(&["delete", "pod", &pod.name, "--wait=false"])?;
+  in_namespace(&["delete", "pod", &pod.name, "--wait=false"])?;
   if own_address == daemon_address {
     return Err(Failure(format!(
       "kind direct: the pod {} shares pod 0's address, so not a network namespace of its own",

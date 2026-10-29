@@ -11343,11 +11343,12 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   - **Red-checked:** eight mutants, each failing its guard (A-187 lists them); and on arm64 in CI, the socket file read
     as an abstract name: step 6's pod of its own and the bridge container each refused "daemon unavailable".
   - **Owed:**
-    - The connect's cost in a release build. In debug test binaries on adacachy (x86_64, load 60 to 132, 2026-10-29)
-      the sealed exchange took a connect from 169 to 195 µs at the median to 357 to 369 µs, and from 73 to 97 µs at
-      the least to 226 to 254 µs (three interleaved runs of 200 connects each, A-187's record).
-    - A namespace whose Pod Security admission forbids hostPath volumes cannot mount the directory. A CSI driver serving
-      the socket as an inline volume would, as SPIFFE's driver does for its agent's socket.
+    - **Measured since, in release** (adacachy, 2026-10-29): a sealed connect 115.9 to 117.5 µs at the median against
+      41.0 to 45.7 µs unsealed, 69.7 to 79.4 µs at the least against 24.1 to 25.2 µs (BENCHMARKS).
+    - **A namespace that forbids hostPath**, built since: its pods mount the directory through a claim bound to an
+      administrator's `local` PersistentVolume, which the restricted profile allows (the KIND leg's step 7, its control a
+      hostPath pod the namespace must refuse). First run owed to CI. A CSI driver would be a privileged node plugin of
+      slates' own, which R10 rules out.
     - The client's check of the listener's user is tested only as root (a listener of another user needs root to
       start), so CI's runners skip it loudly; so is the `unshare` namespace test, since the runners refuse an
       unprivileged user namespace (`write failed /proc/self/uid_map`). Both ran on arm64 Linux in a container and the
@@ -11385,10 +11386,10 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       three status calls and landed on the volume's shard; the writable test's, after four, was refused
       `MapUnavailable`. Both run a one-shard daemon now, as the client suite's do.
   - **Open:**
-    - **A client of another shard** is refused a writable map (a read falls back to a copy): a descriptor does not
-      cross shards yet, so in a daemon of N shards about one client in N is served. The hand-off would go through the
-      client's home shard, which holds its control socket; the copy stays on the volume's shard, where its writes are
-      kept.
+    - **Closed by A-188 (2026-10-29):** a client of another shard was refused a writable map (a read fell back to a
+      copy), since a descriptor did not cross shards, so in a daemon of N shards about one client in N was served. Every
+      map is now held on its volume's shard under its client; Linux's hand-off goes through the client's own shard, which
+      holds its sealed control socket, and the copy stays on the volume's shard, where its writes are kept.
     - **Arm64 done by CI** (run 40816824486): the 8 writable-map client tests on `ubuntu-24.04-arm` and
       `windows-11-arm`, all passing; and the x86_64 KIND lane's pod wrote through its map. **Containers and pods done** the same
       day: Docker on adacachy (`synced=43 released=0`), a KIND pod on `ubuntu-24.04-arm` and a Windows process-isolated

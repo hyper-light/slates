@@ -182,9 +182,10 @@ fn attach_status_detach(client: &mut Client, id: slates_client::VolumeId) {
   assert_eq!(client.status(id).unwrap().lease_epoch, None);
 }
 
-/// A one-shard daemon and a client of it: one shard, so a volume's owner shard is the client's home shard, the only
-/// shard a descriptor is handed from (§4.6, A-171). `tag` names the instance; the instance name is returned for the
-/// descriptor probes, which scope themselves by it.
+/// A one-shard daemon and a client of it: one shard, so every count a direct-map test reads is the one shard's and every
+/// copy is made where its client is served. A client of another shard is handed a copy too since A-188, which
+/// [`a_client_of_another_shard_maps_a_file_read_and_write`] proves on two shards. `tag` names the instance; the instance
+/// name is returned for the descriptor probes, which scope themselves by it.
 fn one_shard_daemon(tag: &str) -> (Daemon, Client, String) {
   one_shard_daemon_with(tag, |_| {})
 }
@@ -1325,11 +1326,11 @@ fn a_removed_files_map_keeps_its_copy_until_released() {
   });
 }
 
-/// AC-A-171 (cross-shard): on a two-shard daemon a client maps files whose owner shard may not be its home shard, and
-/// always gets the bytes: a direct map where the owner is its home shard, the paged copy where it is not (a descriptor
-/// does not cross shards yet). Several volumes spread across the shards by id, so at least one is owned by
-/// the shard the client did not connect to, which exercises the forwarded path (before its fix a `MapRead` there
-/// answered `NotFound`).
+/// AC-A-171 (cross-shard), A-188: on a two-shard daemon a client maps files whose owner shard may not be its home shard,
+/// and every map is a direct one with the file's bytes, whichever shard owns the volume. Several volumes spread across
+/// the shards by id, so at least one is owned by the shard the client did not connect to, which exercises the forwarded
+/// path (before its fix a `MapRead` there answered `NotFound`; before A-188 it fell back to the paged copy, a descriptor
+/// not crossing shards).
 #[test]
 fn a_client_maps_files_across_shards_and_always_gets_the_bytes() {
   let profile = profile();
@@ -1358,11 +1359,107 @@ fn a_client_maps_files_across_shards_and_always_gets_the_bytes() {
     let mapped = client.map_read(id, "/f.bin").unwrap();
     assert!(
       mapped.to_vec().unwrap() == bytes,
-      "volume {n}: the bytes, whether mapped (its owner the client's shard) or copied (another shard)"
+      "volume {n}: the file's bytes"
+    );
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    assert!(
+      mapped.is_zero_copy(),
+      "volume {n}: a direct map, whether its owner is the client's shard or the other"
     );
     drop(mapped);
     client.destroy(id).unwrap();
   }
+}
+
+/// Shape: the names a test tries for a volume of the shard its client is not served by: each name lands on either of
+/// two shards, so all of them landing on the client's own is a chance of one in two to this power.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+const NAMES_TRIED: u32 = 64;
+
+/// A two-shard daemon, a client of it, and a volume with room for a file of `bytes` owned by the shard the client is not
+/// served by (§4.6, A-188): a client's shard is its id's residue over the shards and a volume's owner is named in its
+/// id, so volumes are made until one is owned elsewhere. The daemon, the client, the instance and the volume.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn a_volume_of_the_other_shard(
+  tag: &str,
+  bytes: usize,
+) -> (Daemon, Client, String, slates_client::VolumeId) {
+  let profile = profile();
+  let instance = format!("cl-{tag}-{}", std::process::id());
+  let daemon = Daemon::start(
+    &profile,
+    DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS)),
+    SegmentSource::Create {
+      name: format!("slates-seg-cl-{tag}-{}", std::process::id()),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture creates its local consensus group");
+  let mut client = connect(&instance);
+  let home = client.client_id() % u32::from(TEST_SHARDS);
+  let volume = (0..NAMES_TRIED)
+    .find_map(|n| {
+      let id = client
+        .create(&room_for(&format!("{tag}-{n}"), bytes))
+        .unwrap();
+      if u32::from(slates_server::verbs::owner_of(id)) == home {
+        client.destroy(id).unwrap();
+        return None;
+      }
+      Some(id)
+    })
+    .expect("a volume of the other shard among the names tried");
+  (daemon, client, instance, volume)
+}
+
+/// AC-A-188 (§4.6, the direct map for a client of any shard): do, on a two-shard daemon, write a 20 KiB file into a
+/// volume owned by the shard the client is not served by; map it read-only and release it; attach for writing, map it
+/// read and write, store a phrase across a page boundary, sync, and read the file through a second client; release;
+/// detach. Expect: the read map is a direct one with the file's bytes; the writable map is zero-copy over the file's
+/// page span and shows the file; the sync writes exactly the bytes that differ, which the second client then reads; the
+/// release writes nothing more; and every copy is given back. Before A-188 the read map fell back to the paged copy and
+/// the writable map was refused `MapUnavailable`, since a copy was handed only to a client of the volume's own shard.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+fn a_client_of_another_shard_maps_a_file_read_and_write() {
+  let len = 20 << 10;
+  let (daemon, mut client, instance, id) = a_volume_of_the_other_shard("xshardmap", len);
+  let old = pattern(len, 7);
+  write_file(&mut client, id, "/f.bin", &old);
+  let start = daemon.direct_map_copies().unwrap();
+  let read = client.map_read(id, "/f.bin").unwrap();
+  assert!(
+    read.is_zero_copy(),
+    "the read map is a direct one from the other shard"
+  );
+  assert!(read.to_vec().unwrap() == old, "and holds the file");
+  client.release_map(read).unwrap();
+  let attachment = client.attach(id, None, Intent::Write).unwrap().attachment;
+  let mapped = client.map_write((id, attachment), "/f.bin").unwrap();
+  assert_maps_the_file(&mapped, &old);
+  let page = usize::try_from(page_span(1)).unwrap();
+  let mut new = old.clone();
+  store_phrase(&mapped, &mut new, page - 3, b"stored from another shard");
+  assert_eq!(
+    client.map_sync(&mapped).unwrap(),
+    differing_bytes(&old, &new),
+    "the sync wrote exactly the bytes that differ"
+  );
+  let mut reader = connect(&instance);
+  assert_file(&mut reader, id, &new, "the file holds the stores");
+  assert_eq!(
+    client.release_map_write(mapped).unwrap(),
+    0,
+    "nothing more at the release"
+  );
+  client.detach(attachment).unwrap();
+  assert_eq!(
+    daemon.direct_map_copies().unwrap(),
+    start,
+    "every copy given back"
+  );
 }
 
 /// Shape: the neighbour volume's marker: a byte run written into no other volume, so finding it inside a descriptor

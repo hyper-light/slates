@@ -55,11 +55,6 @@ pub struct ClientSlot {
   /// to its window when a batch is delivered, and credited with the client when it goes — so a batch whose reply
   /// was never carried home (`crate::xshard::send_back`) holds its charge no longer than its client.
   pub(crate) read_ahead_pending: u64,
-  /// The files' copies this client was handed by the same-kernel direct map (§4.6, A-171), each kept equal to its file
-  /// by the store's write boundary until the client goes: let go when the client is reaped (`crate::reap`), their bytes
-  /// given back to the backings' budget, a writable one's stores written back first (A-186). Empty for a client that
-  /// never mapped; bounded by the backings' capacity.
-  pub(crate) direct_maps: Vec<crate::direct_map::HeldMap>,
 }
 
 impl std::fmt::Debug for ClientSlot {

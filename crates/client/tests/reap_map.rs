@@ -154,6 +154,169 @@ fn writer() {
   }
 }
 
+/// The cross-shard writer: connects, takes of the two volumes it is given the one its own shard does not own (a
+/// client's shard is its id's residue over two shards; a volume's owner is named in its id), attaches it for writing,
+/// maps `/f.bin` read and write, stores [`STORED`] at each of [`STORED_AT`] without syncing, prints the volume it took,
+/// and waits to be killed with the stores in the map alone.
+fn cross_shard_writer() {
+  let instance = std::env::var(ROLE_INSTANCE).unwrap();
+  let volumes: Vec<VolumeId> = std::env::var(ROLE_VOLUME)
+    .unwrap()
+    .split(',')
+    .map(unhex)
+    .collect();
+  let mut client = Client::connect(&instance, deadlines()).unwrap();
+  let home = client.client_id() % u32::from(SHARDS);
+  let volume = volumes
+    .into_iter()
+    .find(|volume| u32::from(slates_server::verbs::owner_of(*volume)) != home)
+    .unwrap();
+  let attachment = client
+    .attach(volume, None, Intent::Write)
+    .unwrap()
+    .attachment;
+  let mapped = client.map_write((volume, attachment), "/f.bin").unwrap();
+  for at in STORED_AT {
+    assert_eq!(mapped.write_at(at, STORED).unwrap(), STORED.len());
+  }
+  println!("xwriter-volume: {}", hex(volume));
+  loop {
+    std::thread::park();
+  }
+}
+
+/// Shape: the shards of the cross-shard daemon: two, so a client is served by one and a volume can be owned by the
+/// other.
+const SHARDS: u16 = 2;
+/// Shape: the names tried for a volume of each shard: each lands on either, so a shard getting none is a chance of one
+/// in two to this power.
+const NAMES_TRIED: u32 = 64;
+
+/// A two-shard daemon of a fresh instance tagged `tag`, with a volume owned by each shard, each holding `/f.bin`, 64
+/// KiB: the daemon, its instance and the two volumes.
+fn two_shard_daemon_with_files(tag: &str) -> (Daemon, String, [VolumeId; 2]) {
+  let profile = MachineProfile::measure_patiently(&ProfileOptions {
+    budget_per_probe: Duration::from_millis(PROBE_MS),
+    codecs: false,
+    core_matrix: false,
+  })
+  .expect("the machine profile measures");
+  let instance = format!("cl-{tag}-{}", std::process::id());
+  let daemon = Daemon::start(
+    &profile,
+    DaemonConfig::derive(&profile, &instance, Some(SHARDS)),
+    SegmentSource::Create {
+      name: format!("slates-seg-cl-{tag}-{}", std::process::id()),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut owner = Client::connect(&instance, deadlines()).unwrap();
+  let mut by_shard: [Option<VolumeId>; 2] = [None, None];
+  for n in 0..NAMES_TRIED {
+    let volume = owner
+      .create(&slates_client::CreateSpec {
+        name: format!("mapped-{n}"),
+        size: SizeClass::Bounded { limit: 1 << 20 },
+        names: NamePolicy::Exact,
+        require_locked: false,
+        base: None,
+      })
+      .unwrap();
+    let shard = usize::from(slates_server::verbs::owner_of(volume));
+    match by_shard.get_mut(shard) {
+      Some(slot @ None) => *slot = Some(volume),
+      _ => owner.destroy(volume).unwrap(),
+    }
+    if by_shard.iter().all(Option::is_some) {
+      break;
+    }
+  }
+  let volumes =
+    by_shard.map(|volume| volume.expect("a volume of each shard among the names tried"));
+  let bytes: Vec<u8> = (0..(64usize << 10))
+    .map(|index| u8::try_from(index % 251).unwrap() | 1)
+    .collect();
+  for volume in volumes {
+    let attached = owner.attach(volume, None, Intent::Write).unwrap();
+    owner
+      .fs_write((volume, attached.attachment), "/f.bin", &bytes, 0o644)
+      .unwrap();
+    owner.detach(attached.attachment).unwrap();
+  }
+  (daemon, instance, volumes)
+}
+
+/// AC-A-188 with A-186's reap: a store into a writable map outlives its client's process when the volume is owned by a
+/// shard the client is not served by. Do: on a two-shard daemon with a volume of each shard, a re-invoked test binary
+/// takes the volume its own shard does not own, maps its file read and write, stores a phrase at two offsets without
+/// syncing, and parks; then `SIGKILL` it. Expect: the reap, which the client's own shard runs, writes the stores back
+/// through the other shard before it removes the writer's attachment there, so the file holds the phrase at both
+/// offsets and nothing else changed; the copy is let go there (`dax.local_map_reaped` one, the held copies where they
+/// started) and one write-back finished. Before A-188 the writer's map was refused `MapUnavailable`.
+#[test]
+fn a_killed_client_of_another_shard_has_its_writable_maps_stores_written_back() {
+  if std::env::var(ROLE).as_deref() == Ok("xwriter") {
+    cross_shard_writer();
+    return;
+  }
+  let (daemon, instance, volumes) = two_shard_daemon_with_files("reapxwrite");
+  let before = daemon.direct_map_copies().unwrap();
+  let mut reader = Client::connect(&instance, deadlines()).unwrap();
+  let mut child = Victim(
+    Command::new(std::env::current_exe().unwrap())
+      .args([
+        "--exact",
+        "a_killed_client_of_another_shard_has_its_writable_maps_stores_written_back",
+        "--nocapture",
+      ])
+      .env(ROLE, "xwriter")
+      .env(ROLE_INSTANCE, &instance)
+      .env(
+        ROLE_VOLUME,
+        format!("{},{}", hex(volumes[0]), hex(volumes[1])),
+      )
+      .stdout(Stdio::piped())
+      .spawn()
+      .unwrap(),
+  );
+  let taken = BufReader::new(child.0.stdout.take().unwrap())
+    .lines()
+    .map(|line| line.expect("read the writer's report"))
+    .find_map(|line| {
+      line
+        .split_once("xwriter-volume: ")
+        .map(|(_, rest)| rest.trim().to_owned())
+    })
+    .expect("the writer took a volume of the other shard and stored");
+  let volume = unhex(&taken);
+  let old = reader
+    .read(volume, "/f.bin", slates_client::ReadAt::Head)
+    .unwrap();
+  child.0.kill().unwrap();
+  child.0.wait().unwrap();
+  wait_until("the killed writer's copy is reaped", || {
+    daemon.direct_map_copies().unwrap() == before
+  });
+  let mut expect = old.clone();
+  for at in STORED_AT {
+    let at = usize::try_from(at).unwrap();
+    expect[at..at + STORED.len()].copy_from_slice(STORED);
+  }
+  assert!(
+    reader
+      .read(volume, "/f.bin", slates_client::ReadAt::Head)
+      .unwrap()
+      == expect,
+    "the reap wrote the stores back through the other shard, and nothing else changed"
+  );
+  assert_eq!(counted(&daemon, "dax.local_map_reaped"), 1);
+  assert_eq!(counted(&daemon, "dax.local_map_synced"), 1);
+  daemon.stop();
+}
+
 /// How many times the daemon counted `name`, summed over its shards.
 fn counted(daemon: &Daemon, name: &str) -> u64 {
   daemon

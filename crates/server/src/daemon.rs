@@ -4445,7 +4445,6 @@ async fn control_loop(
                 owner_route: None,
                 read_ahead: None,
                 read_ahead_pending: 0,
-                direct_maps: Vec::new(),
               }) {
                 Ok(_) => admission.seat(),
                 Err(e) => {

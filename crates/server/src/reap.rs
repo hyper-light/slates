@@ -14,10 +14,6 @@ use slates_wire::request::RequestId;
 
 use crate::state::{self, ClientSlot, ShardState};
 
-/// Counter: the direct maps' copies a dead client's reap gave back (§4.6, A-171), each kept until then by the client's
-/// own map of it.
-const DIRECT_MAPS_REAPED: &str = "dax.local_map_reaped";
-
 /// Finds dead clients and reserves their seats through owner cleanup. Failed cleanup is retried
 /// by the existing owned reaper task at its next cadence; no detached retirement task is created.
 pub(crate) async fn sweep(silence_ns: u64) -> usize {
@@ -34,9 +30,6 @@ pub(crate) async fn sweep(silence_ns: u64) -> usize {
   };
   let mut reaped: usize = 0;
   for (handle, client_id) in clients {
-    // A writable direct map's stores reach its file only through the attachment it was made under, so they are written
-    // back before the attachments go: a store to a shared map outlives its process (§4.6, A-186).
-    crate::direct_map::write_back_for_reap(handle, client_id).await;
     let result = remove_on_owners(origin, &shards, batch, client_id, silence_ns).await;
     state::with_state(|state| match result {
       Ok(()) => {
@@ -87,6 +80,10 @@ fn begin(state: &mut ShardState, silence_ns: u64) -> Vec<(Handle<ClientSlot>, u3
 
 /// A read-only gather followed by bounded removals. Cancellation may leave an admitted callback
 /// running later; only frozen attachment ids cross the mutating boundary, never a live client query.
+/// On each shard the client's direct maps held there (§4.6, A-188) bracket the removal: a writable map's stores reach
+/// its file only through the attachment it was made under, so they are written back first (A-186), a store to a shared
+/// map outliving its process; and the copies are let go once the attachments are gone. A write-back that does not end
+/// within the deadline defers the reap, which is retried, rather than removing an attachment its stores still need.
 async fn remove_on_owners(
   origin: u16,
   shards: &[u16],
@@ -95,6 +92,14 @@ async fn remove_on_owners(
   deadline: u64,
 ) -> Result<(), Refusal> {
   for &shard in shards {
+    crate::xshard::task_within(
+      origin,
+      shard,
+      move || crate::direct_map::write_back_held(client),
+      deadline,
+    )
+    .await
+    .ok_or(Refusal::Overloaded { shard })?;
     // The client's presentations there are abandoned with it (AUD-29-07): nothing waits on them now.
     crate::xshard::call_within(
       origin,
@@ -124,6 +129,14 @@ async fn remove_on_owners(
       .ok_or(Refusal::Overloaded { shard })??;
       slates_rt::futures::yield_now().await;
     }
+    crate::xshard::call_within(
+      origin,
+      shard,
+      move |state| crate::direct_map::let_go_held(state, client),
+      deadline,
+    )
+    .await
+    .ok_or(Refusal::Overloaded { shard })?;
   }
   Ok(())
 }
@@ -167,21 +180,8 @@ fn finish(state: &mut ShardState, handle: Handle<ClientSlot>, client_id: u32) ->
     return false;
   };
   client.status_pages.clear(&mut state.store.metadata);
-  // Let go of the files' copies the client was handed by the direct map (§4.6, A-171): its map of each lives on in
-  // its own process if the process does, no longer kept equal to the file, and each copy's bytes go back to the
-  // backings' budget rather than staying charged for a client that is gone; an offer of one it never claimed (macOS)
-  // is withdrawn with it. A writable one's stores were written back before its attachments went (`sweep`, A-186).
-  let reaped = client
-    .direct_maps
-    .drain(..)
-    .filter(|held| crate::direct_map::let_go(state, held.backing))
-    .count();
-  if reaped > 0 {
-    state.count(
-      DIRECT_MAPS_REAPED,
-      u64::try_from(reaped).unwrap_or(u64::MAX),
-    );
-  }
+  // The files' copies the client was handed by the direct map were let go on every shard that held them, after its
+  // attachments there (`remove_on_owners`, A-188).
   state.read_ahead.credit(client.read_ahead_pending);
   crate::verbs::release_read_ahead(&mut state.read_ahead, &mut client);
   if let Some(control) = state.shards.first().copied() {

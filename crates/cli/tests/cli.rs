@@ -153,9 +153,10 @@ fn start_anchor_with_environment(
   start_anchor_of(instance, environment, SHARDS)
 }
 
-/// [`start_anchor`] with one shard: what a direct-map test needs, since a copy is handed only to a client of the shard
-/// that owns the volume (a descriptor does not cross shards yet, `crates/server/src/direct_map.rs`), and with two
-/// shards which one a client lands on is its id's residue, which turns on how many clients came before.
+/// [`start_anchor`] with one shard, which the direct-map tests run: every count they read is the one shard's. A copy is
+/// handed to a client of any shard since A-188 (`crates/client/tests/client.rs`,
+/// `a_client_of_another_shard_maps_a_file_read_and_write`); before it, which shard a container's client landed on, its
+/// id's residue, decided whether it was handed one.
 #[cfg(target_os = "linux")]
 fn start_one_shard_anchor(instance: &str) -> AnchorProcess {
   start_anchor_of(instance, &[], ONE_SHARD)

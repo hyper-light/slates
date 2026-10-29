@@ -269,7 +269,7 @@ pub struct DaemonConfig {
   pub clients_per_shard: usize,
   /// Derived: the direct maps' copies one shard may hold at once, handed or being filled (§4.6, A-171):
   /// [`direct_maps_per_shard`] over the process's descriptor and mapping limits. A client's share is this, and the
-  /// shard's fill budget, over the clients the shard serves.
+  /// shard's fill budget, over the clients the shard serves, those holding its copies, and the one asking (A-188).
   pub direct_maps_per_shard: usize,
   /// Derived: the landings one owner shard holds awaiting a grant (§4.15 step 3; AUD-29-07) — the daemon's
   /// client seats, `clients_per_shard × shards`: a presentation lives on its volume's owner shard whichever

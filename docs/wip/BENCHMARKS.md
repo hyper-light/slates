@@ -6951,5 +6951,16 @@ one-shard daemon, ran alternately, A B A B A B (`~/a187-ab/ab.sh`, kept in A-187
 - **In debug the sealed connect is about 180 µs slower at the median.** That is three X25519 operations in sequence
   in an unoptimized build, and half a round trip more.
 - **The p99 is the loaded box's own** on both sides.
-- A connect happens once per client session, never per request, so R9's provisioning floor is untouched. A release
-  A/B of the whole connect is owed (GAPS, A-187).
+- A connect happens once per client session, never per request, so R9's provisioning floor is untouched.
+
+**A whole connect, A/B, in release.** The same script built with `--release` (fat LTO), A ce36e9aa and B 19433762,
+adacachy at load 31–42, 2026-10-29 02:4x PDT.
+
+| variant | least, three runs | median, three runs | p99, three runs |
+|---|---|---|---|
+| A: unsealed | 24.1, 25.2, 24.1 µs | 43.2, 45.7, 41.0 µs | 8.0, 6.7, 5.7 ms |
+| B: sealed | 69.7, 79.4, 72.7 µs | 115.9, 117.5, 116.9 µs | 5.5, 5.5, 7.5 ms |
+
+- **The exchange adds about 48 µs at the least and 73 µs at the median** to a connect in release: about 36 µs of
+  crypto (above) and half a round trip more, with the daemon's second round woken by the client's opening.
+- **The p99 is the loaded box's** in both arms. One connect of every run took 5 to 9 ms, sealed or not.

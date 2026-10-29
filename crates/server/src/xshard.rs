@@ -272,6 +272,85 @@ pub async fn call_within<T: Send + 'static>(
   within(call, deadline_ns).await
 }
 
+/// Runs the future `start` makes as a task on `shard`, and awaits its result on this shard (`origin`) for at most
+/// `deadline_ns`: the call for work that must yield on its shard as it goes (a write-back a copy slice a turn, §4.3's
+/// bounded work, A-188), which [`call_within`]'s closure, run in one turn, cannot be. The future is made on the target, so
+/// it may hold what is not `Send` across its turns; only its result crosses back. `None` as [`call_within`] answers, and
+/// when the target's task arena refused the task. A late result is dropped, as `call_within`'s is, while the task runs
+/// to its end on its shard. A call to this shard runs the future here.
+pub async fn task_within<T, F>(
+  origin: u16,
+  shard: u16,
+  start: impl FnOnce() -> F + Send + 'static,
+  deadline_ns: u64,
+) -> Option<T>
+where
+  T: Send + 'static,
+  F: Future<Output = T> + 'static,
+{
+  if shard == origin {
+    return slates_rt::futures::within(deadline_ns, start())
+      .await
+      .ok()
+      .flatten();
+  }
+  let id = register();
+  let task = SpawnRequest::new(
+    Box::pin(async move {
+      if !spawn_carrying_home(origin, id, start) {
+        let back = SpawnRequest::new(
+          Box::pin(async move {
+            deliver(id, Box::new(None::<T>));
+          }),
+          None,
+        );
+        send_back(origin, back).await;
+      }
+    }),
+    None,
+  );
+  match registry::send_control(shard, Control::Spawn(Box::new(task))) {
+    Ok(()) => {
+      within(
+        CrossShardCall {
+          id: Some(id),
+          ready: None,
+          _thread: PhantomData,
+        },
+        deadline_ns,
+      )
+      .await
+    }
+    Err(_) => {
+      forget(id);
+      None
+    }
+  }
+}
+
+/// On the target of a [`task_within`]: spawns the future `start` makes as a task of this shard, which carries its result
+/// home to `origin` as call `id` when it ends. Whether the shard's task arena took it. Kept out of the task that called
+/// it, so that task holds nothing but `Send` values across its own await.
+fn spawn_carrying_home<T, F>(origin: u16, id: u64, start: impl FnOnce() -> F + 'static) -> bool
+where
+  T: Send + 'static,
+  F: Future<Output = T> + 'static,
+{
+  let work = async move {
+    let result = start().await;
+    let back = SpawnRequest::new(
+      Box::pin(async move {
+        deliver(id, Box::new(Some(result)));
+      }),
+      None,
+    );
+    send_back(origin, back).await;
+  };
+  slates_rt::futures::spawn(work)
+    .and_then(slates_rt::futures::detach)
+    .is_ok()
+}
+
 /// Awaits a registered call within the caller's remaining time budget (§4.3): its answer, or `None` when
 /// the call failed, the deadline passed, or no deadline could be armed (off a shard — never read as time
 /// passing, AUD-29-39). Dropping this future cancels its registration even when neither the call nor its
