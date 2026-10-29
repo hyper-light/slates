@@ -1,0 +1,87 @@
+name: DIAG a workload in a network namespace of its own (not for main)
+
+# A-187's two first runs on arm64, each red-checked. The KIND direct leg's step 6 (a pod of its own on pod 0's node,
+# mounting the rendezvous directory read-only) runs on ubuntu-24.04-arm, where CI's push lane runs no KIND; and the
+# bridge-network container test runs under the mutant only, its green run being CI's arm64 lane's (run 40844136550).
+# The mutant `nofile` reads an instance named by a path as an abstract name (`node` in crates/ipc/src/rendezvous.rs),
+# so a daemon told to bind a socket file binds an abstract socket in its own network namespace instead: both must fail.
+
+on:
+  push:
+    branches: [diag-a187-own-namespace]
+
+jobs:
+  arm64-kind:
+    name: KIND direct leg on ubuntu-24.04-arm (${{ matrix.mutant }})
+    strategy:
+      fail-fast: false
+      matrix:
+        mutant: [green, nofile]
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.3.0
+      - uses: helm/kind-action@v1
+        with:
+          version: v0.33.0
+          install_only: true
+      - name: Apply the mutant
+        run: |
+          if [ "${{ matrix.mutant }}" = nofile ]; then
+            grep -q '    if !path.is_absolute() {' crates/ipc/src/rendezvous.rs
+            sed -i 's/    if !path.is_absolute() {/    if true {/' crates/ipc/src/rendezvous.rs
+          fi
+          git diff --stat
+      - name: The machine
+        run: uname -a && docker version --format '{{.Server.Version}} {{.Server.Os}}/{{.Server.Arch}}' && kind version
+      - name: The direct leg (pods of the daemon's own, then pods of their own through the socket file)
+        id: leg
+        continue-on-error: true
+        run: cargo xtask kind direct
+      - name: The verdict
+        if: ${{ always() }}
+        run: |
+          echo "DIAG mutant=${{ matrix.mutant }} leg=${{ steps.leg.outcome }}"
+          if [ "${{ matrix.mutant }}" = green ]; then
+            test "${{ steps.leg.outcome }}" = success
+          else
+            test "${{ steps.leg.outcome }}" = failure || { echo "REDCHECK FAILED: the mutant passed"; exit 1; }
+          fi
+
+  arm64-bridge:
+    name: The bridge-network container on ubuntu-24.04-arm (nofile)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: FUSE and the operator's grant (Linux arm64)
+        run: |
+          command -v fusermount3 >/dev/null || { sudo apt-get update && sudo apt-get install -y fuse3; }
+          grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+      - name: Apply the mutant
+        run: |
+          grep -q '    if !path.is_absolute() {' crates/ipc/src/rendezvous.rs
+          sed -i 's/    if !path.is_absolute() {/    if true {/' crates/ipc/src/rendezvous.rs
+          git diff --stat
+      - name: The bridge-network container
+        id: leg
+        continue-on-error: true
+        env:
+          SLATES_TEST_CLI: "1"
+        run: >-
+          cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture --exact
+          a_container_on_a_bridge_network_maps_a_slates_file_read_and_write_through_the_socket_file
+      - name: The verdict
+        if: ${{ always() }}
+        run: |
+          echo "DIAG mutant=nofile leg=${{ steps.leg.outcome }}"
+          test "${{ steps.leg.outcome }}" = failure || { echo "REDCHECK FAILED: the mutant passed"; exit 1; }
