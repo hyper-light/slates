@@ -11793,7 +11793,21 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       **Shards on Linux arm64 by both routes** (its `slates_fs` suite 4 of 4: the stream's DAX and its own window over a
       `slates mount`, the new byte seen after 19.99 ms; the mount route red-checked with the window off, `dax /v/big no`;
       `virtiofs.md` §8). Not a CI lane: GitHub has no arm64 host with KVM to run one on;
-    - macOS writable shared maps over NFS.
+    - macOS writable shared maps over NFS: **measured 2026-10-28; coherent at sync points, and the platform's client
+      cannot do better.** CI's macOS lane passes `a_shared_map_through_a_mount_writes_back_and_follows_another_paths_change`
+      and its generated sequence: a store through a shared map reaches the volume at `msync`, and another path's change
+      reaches the map after a `stat`. The case those leave out was measured on CI's `macos-latest` (macOS 26.6.2, 16 KiB
+      pages; diagnostics run 40821794698, 3 runs of 3): a page dirtied through the map (`Z` at byte 0) and not synced
+      while another path replaces the file with 16,384 `C`. After a `stat` the map still showed `ZAAAAAAA`, and after
+      the map's `msync` the file held `Z` and 16,383 stale `A`: the client wrote its whole page back, and every byte of
+      the other path's write was lost. NFSv3 has no recall to make the client flush first. NFSv4.1 would not help
+      through Apple's client either: in its source (apple-oss-distributions/NFS, NFS-343.100.5) a `CB_RECALL` only queues
+      the node (`nfs_socket.c` 3175), and `nfs4_delegation_return` (`nfs4_vnops.c` 7184) reclaims the node's opens and
+      locks and sends `DELEGRETURN` with no flush of dirty data, where RFC 8881 §10.4.1 asks the client to write
+      modified data back first. Nor can the server tell a client's store from the stale bytes of the page it writes
+      back, and choosing bytes between the two would be an inferred merge (banned item 11). So on macOS a program that
+      maps a file writable and needs another path's concurrent writes kept takes the socket route's writable map
+      (A-186), which keeps the copy current by write-through and writes back only the bytes that differ.
 - **A READ reply past 64 KiB closed the RPC-with-TLS export (found and fixed 2026-10-25, `3e05c70d`).** rustls caps
   its buffer of sealed records at 64 KiB, and the session's send wrote a reply with `write_all`, so any READ reply past
   it ended the connection, and the kubelet's `hard` mount retried it for good: through a kubelet-mounted export a file
