@@ -953,6 +953,13 @@ impl Connecting {
   }
 }
 
+/// Installs the rendezvous seal every Linux claim crosses under (§4.7, A-187), before this process's first claim; a later
+/// install changes nothing, and macOS and Windows hand a claim over in a per-user shared-memory object, with no seal.
+fn install_seal() {
+  #[cfg(target_os = "linux")]
+  slates_seal::install();
+}
+
 /// The capability the harness delivered to this process, if it was spawned as a consumer (§4.13;
 /// `slates_ipc::delivery`): none when the delivery variable is absent — the process is the account's
 /// own client — and a typed refusal when it is present but unusable, so a broken delivery never
@@ -974,6 +981,7 @@ impl Client {
   /// delivery is the account's client.
   pub fn connect(instance: &str, deadlines: Deadlines) -> Result<Client, ClientError> {
     let delivered = delivered_capability()?;
+    install_seal();
     let connected = connect_as(instance, 0, deadlines.reconnect_ns)?;
     let mut client = Client::over(instance, connected, 0, deadlines);
     client.bind_delivered(delivered)?;
@@ -985,6 +993,7 @@ impl Client {
   /// without waiting, as a reconnected channel binds again.
   pub fn begin_connect(instance: &str, deadlines: Deadlines) -> Result<Connecting, ClientError> {
     let delivered = delivered_capability()?;
+    install_seal();
     let claim = begin_connect_as(instance, 0, deadlines.reconnect_ns)?;
     Ok(Connecting {
       instance: instance.to_owned(),
@@ -1005,6 +1014,7 @@ impl Client {
     deadlines: Deadlines,
   ) -> Result<Client, ClientError> {
     let delivered = delivered_capability()?;
+    install_seal();
     let connected = connect_as(instance, session.client_id, deadlines.reconnect_ns)?;
     let assigned = connected.region.client_id();
     if assigned != session.client_id {

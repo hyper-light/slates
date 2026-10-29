@@ -16,6 +16,9 @@ use slates_ipc::{
   CLAIM_WAIT_NS, ClientEnd, DaemonEnd, IpcError, Listener, Prepared, begin_connect_as, connect,
 };
 
+#[path = "support/toy_seal.rs"]
+mod toy_seal;
+
 /// The regions this test process has made, which numbers the next one's name.
 static REGIONS_MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -46,6 +49,7 @@ fn geometry() -> RegionGeometry {
 /// reply to be the payload reversed, exits 0. Passes trivially when not the child.
 #[test]
 fn rendezvous_client() {
+  toy_seal::install();
   let Ok(instance) = std::env::var(CHILD_ROLE) else {
     return;
   };
@@ -64,12 +68,62 @@ fn rendezvous_client() {
 /// for, distinct from the ids and lengths that flow through a served handoff.
 const REFUSED_LIMIT: usize = 3;
 
+/// Format: the environment variable that turns this binary into a client with no seal installed.
+#[cfg(target_os = "linux")]
+const CHILD_UNSEALED_ROLE: &str = "SLATES_RENDEZVOUS_UNSEALED_CHILD";
+
+/// The client with no seal: connects to the instance in the environment without installing one, and expects the claim
+/// refused `Unsupported` before anything is sent. Passes trivially when not the child.
+#[cfg(target_os = "linux")]
+#[test]
+fn rendezvous_client_unsealed() {
+  let Ok(instance) = std::env::var(CHILD_UNSEALED_ROLE) else {
+    return;
+  };
+  let outcome = begin_connect_as(&instance, 0, CLAIM_WAIT_NS).map(|_| ());
+  assert!(
+    matches!(outcome, Err(IpcError::Unsupported { .. })),
+    "a process with no seal installed claims nothing: {outcome:?}"
+  );
+  std::process::exit(0);
+}
+
+/// A-187 (§4.7 "Rendezvous"): a rendezvous is never made in the clear. Do: open a daemon end, and re-invoke this binary
+/// as a client that installs no seal and claims. Expect: the child's claim is refused `Unsupported` before it connects,
+/// and the daemon end sees no connection at all: no round accepts, begins or refuses anything. Linux only: the socket
+/// rendezvous is the one a seal crosses; macOS and Windows hand a claim over in a per-user shared-memory object.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_process_with_no_seal_installed_claims_nothing() {
+  toy_seal::install();
+  let instance = format!("test-unsealed-{}", std::process::id());
+  let mut listener = Listener::open(&instance, None).unwrap();
+  let exe = std::env::current_exe().unwrap();
+  let status = Command::new(exe)
+    .args(["--exact", "rendezvous_client_unsealed", "--nocapture"])
+    .env(CHILD_UNSEALED_ROLE, &instance)
+    .status()
+    .unwrap();
+  assert!(
+    status.success(),
+    "the child's claim was refused before it connected: {status:?}"
+  );
+  let round = listener.accept_pending(
+    &|_| false,
+    &mut |_| panic!("no region is asked for a claim never made"),
+    &mut |refusal| panic!("no claim reached the daemon end to be refused: {refusal}"),
+  );
+  assert!(round.accepted.is_empty() && round.ended.is_none());
+  assert_eq!(listener.pending().0.len(), 0, "no exchange was begun");
+}
+
 /// The client refused at the bound: connects to the instance in the environment and expects the typed
 /// refusal `TooManyClients { limit: REFUSED_LIMIT }` — where before it read a short handoff (Linux) or
 /// waited out its claim (macOS, Windows). Exits 0 only on the typed refusal. Passes trivially when not
 /// the child.
 #[test]
 fn rendezvous_client_refused() {
+  toy_seal::install();
   let Ok(instance) = std::env::var(CHILD_REFUSED_ROLE) else {
     return;
   };
@@ -91,6 +145,7 @@ fn rendezvous_client_refused() {
 /// round ends in well under the claim wait (a reply, not a timeout).
 #[test]
 fn a_client_process_refused_at_the_bound_is_told_so_typed() {
+  toy_seal::install();
   let instance = format!("test-refused-{}", std::process::id());
   let mut listener = Listener::open(&instance, None).unwrap();
   let exe = std::env::current_exe().unwrap();
@@ -130,6 +185,7 @@ fn a_client_process_refused_at_the_bound_is_told_so_typed() {
 /// its request, and the child exits 0; no cross-uid refusals were counted.
 #[test]
 fn a_client_process_connects_and_completes_a_round_trip() {
+  toy_seal::install();
   let instance = format!("test-{}", std::process::id());
   let mut listener = Listener::open(&instance, None).unwrap();
   let exe = std::env::current_exe().unwrap();
@@ -185,6 +241,7 @@ fn a_client_process_connects_and_completes_a_round_trip() {
 /// behind.
 #[test]
 fn no_daemon_means_daemon_unavailable() {
+  toy_seal::install();
   let started = Instant::now();
   let refused = connect("slates-test-no-such-daemon").err().unwrap();
   assert!(
@@ -231,6 +288,7 @@ fn poll_bound() -> Duration {
 /// to the claim wait on macOS and Windows, and without any bound on Linux.
 #[test]
 fn a_claim_is_polled_without_waiting_and_refused_at_the_claim_wait() {
+  toy_seal::install();
   let instance = format!("test-claim-{}", std::process::id());
   let mut listener = Listener::open(&instance, None).unwrap();
   let started = Instant::now();
@@ -366,6 +424,7 @@ fn serve_until_connected(
 /// (`ECONNRESET`); macOS and Windows leave the claim unanswered until the claim wait.
 #[test]
 fn a_claim_whose_daemon_died_before_answering_is_unavailable_not_refused() {
+  toy_seal::install();
   let instance = format!("test-claim-reset-{}", std::process::id());
   let listener = Listener::open(&instance, None).unwrap();
   let claim = begin_connect_as(&instance, 0, slates_ipc::CLAIM_WAIT_NS).unwrap();
@@ -383,6 +442,7 @@ fn a_claim_whose_daemon_died_before_answering_is_unavailable_not_refused() {
 /// the child.
 #[test]
 fn rendezvous_restart_child() {
+  toy_seal::install();
   let Ok(instance) = std::env::var(CHILD_RESTART_ROLE) else {
     return;
   };
@@ -417,6 +477,7 @@ fn rendezvous_restart_child() {
 /// construction: its liveness is the control socket's peer, the daemon that accepted the connection.
 #[test]
 fn a_claim_begun_before_a_restart_judges_the_daemon_that_answered_it_alive() {
+  toy_seal::install();
   let instance = format!("test-claim-restart-{}", std::process::id());
   let held = HeldRendezvous::hold(&instance).unwrap();
   let exe = std::env::current_exe().unwrap();
@@ -440,10 +501,12 @@ fn a_claim_begun_before_a_restart_judges_the_daemon_that_answered_it_alive() {
 /// told it had connected to a region nobody served, and on Linux the daemon's end of its control socket closed under it.
 #[test]
 fn a_refused_claim_does_not_cost_its_round_the_client_it_accepted() {
+  toy_seal::install();
   let instance = format!("test-round-{}", std::process::id());
   let mut listener = Listener::open(&instance, None).unwrap();
   let mut first = begin_connect_as(&instance, 0, CLAIM_WAIT_NS).unwrap();
   let mut second = begin_connect_as(&instance, 0, CLAIM_WAIT_NS).unwrap();
+  exchange_keys(&mut listener, [&mut first, &mut second]);
   let pid = std::process::id();
   let mut regions_asked = 0;
   let mut refusals = Vec::new();
@@ -501,6 +564,35 @@ fn a_refused_claim_does_not_cost_its_round_the_client_it_accepted() {
   drop(accepted);
 }
 
+/// Linux (A-187): runs the round that begins each claim's exchange, which asks for no region, and polls each claim once,
+/// so its opening waits for the next round, which then finds every claim at once. Elsewhere a claim is answered in the
+/// round that finds it, so nothing runs here.
+#[cfg(target_os = "linux")]
+fn exchange_keys<const CLAIMS: usize>(
+  listener: &mut Listener,
+  claims: [&mut slates_ipc::Claim; CLAIMS],
+) {
+  let round = listener.accept_pending(
+    &|_| false,
+    &mut |_| panic!("no region is asked for before a claim's opening has come"),
+    &mut |refusal| panic!("no claim is refused before its opening has come: {refusal}"),
+  );
+  assert!(round.accepted.is_empty() && round.ended.is_none());
+  for claim in claims {
+    assert!(
+      claim.poll().unwrap().is_none(),
+      "a claim answers the daemon's key with its opening and waits for the handoff"
+    );
+  }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn exchange_keys<const CLAIMS: usize>(
+  _listener: &mut Listener,
+  _claims: [&mut slates_ipc::Claim; CLAIMS],
+) {
+}
+
 /// How a claim whose round has run was answered (the connection boxed: it is many times a refusal's size).
 enum Answer {
   Connected(Box<slates_ipc::Connected>),
@@ -541,6 +633,7 @@ fn answer_within_claim_wait(claim: &mut slates_ipc::Claim) -> Answer {
 /// the dead one had exited.
 #[test]
 fn a_fresh_rendezvous_opens_while_a_client_of_a_dead_daemon_lives() {
+  toy_seal::install();
   let instance = format!("test-fresh-{}", std::process::id());
   let mut dead = Listener::open(&instance, None).unwrap();
   let claim = begin_connect_as(&instance, 0, CLAIM_WAIT_NS).unwrap();
@@ -569,6 +662,7 @@ fn a_fresh_rendezvous_opens_while_a_client_of_a_dead_daemon_lives() {
 /// object.
 #[test]
 fn a_second_owner_of_a_live_instances_rendezvous_is_refused() {
+  toy_seal::install();
   let instance = format!("test-owner-{}", std::process::id());
   let first = Listener::open(&instance, None).unwrap();
   assert_held(
@@ -661,6 +755,7 @@ const CHILD_OWNER_EXPECT: &str = "SLATES_RENDEZVOUS_SECOND_OWNER_EXPECT";
 /// lives, and the third owning it both ways once it is gone.
 #[test]
 fn a_second_process_is_refused_a_live_instances_rendezvous() {
+  toy_seal::install();
   let instance = format!("test-owner-process-{}", std::process::id());
   let first = Listener::open(&instance, None).unwrap();
   second_owner(&instance, "held");
@@ -689,6 +784,7 @@ fn second_owner(instance: &str, expect: &str) {
 /// when not the child.
 #[test]
 fn rendezvous_second_owner_child() {
+  toy_seal::install();
   let (Ok(instance), Ok(expect)) = (
     std::env::var(CHILD_OWNER_ROLE),
     std::env::var(CHILD_OWNER_EXPECT),
@@ -733,6 +829,7 @@ const UNSEEN_NAMESPACES: [&str; 4] = ["--user", "--map-current-user", "--pid", "
 #[cfg(target_os = "linux")]
 #[test]
 fn rendezvous_unseen_listener() {
+  toy_seal::install();
   let Ok(instance) = std::env::var(UNSEEN_LISTENER_ROLE) else {
     return;
   };
@@ -790,6 +887,7 @@ fn rendezvous_unseen_listener() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_client_whose_process_the_daemon_cannot_see_is_served() {
+  toy_seal::install();
   use std::io::{BufRead, BufReader};
   use std::process::Stdio;
 
@@ -848,4 +946,220 @@ fn a_client_whose_process_the_daemon_cannot_see_is_served() {
     "the listener served a client it cannot see by pid, its uid ours"
   );
   assert!(status.success(), "the listener ended cleanly: {status:?}");
+}
+
+/// Format: the environment variable that turns this binary into a listener of another user at a victim's abstract name.
+#[cfg(target_os = "linux")]
+const IMPOSTOR_ROLE: &str = "SLATES_RENDEZVOUS_IMPOSTOR";
+/// Format: the tag of the impostor's lines, found anywhere in a line.
+#[cfg(target_os = "linux")]
+const IMPOSTOR_TAG: &str = "impostor:";
+/// Format: the user the impostor runs as: the conventional unprivileged `nobody`.
+#[cfg(target_os = "linux")]
+const IMPOSTOR_UID: u32 = 65_534;
+
+/// The impostor of [`a_listener_of_another_user_is_refused_by_the_client`]: binds the abstract name of the instance the
+/// environment names as root's daemon would, says so, and waits to be killed. An abstract name is anyone's to bind
+/// (unix(7)), so nothing stops it. Passes trivially when not the role.
+#[cfg(target_os = "linux")]
+#[test]
+fn rendezvous_impostor_listener() {
+  let Ok(instance) = std::env::var(IMPOSTOR_ROLE) else {
+    return;
+  };
+  use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+  let socket = rustix::net::socket_with(
+    AddressFamily::UNIX,
+    SocketType::STREAM,
+    SocketFlags::CLOEXEC,
+    None,
+  )
+  .unwrap();
+  // Root's daemon's name for this instance: `slates-rv-<instance>/<uid>` (the instance holds only letters, digits and
+  // dashes, so it is its own clean name).
+  let name = format!("slates-rv-{instance}/0");
+  rustix::net::bind(
+    &socket,
+    &SocketAddrUnix::new_abstract_name(name.as_bytes()).unwrap(),
+  )
+  .unwrap();
+  rustix::net::listen(&socket, 1).unwrap();
+  println!(
+    "{IMPOSTOR_TAG} listening as {}",
+    rustix::process::getuid().as_raw()
+  );
+  loop {
+    std::thread::park();
+  }
+}
+
+/// A-187 (§4.7 "Rendezvous"): a client checks the daemon as the daemon checks it. Do: as root, run this binary as a
+/// listener of another user (`setpriv` to `nobody`) at the abstract name root's daemon of an instance would bind, then
+/// claim on that instance. Expect: the claim is refused `PeerRefused` naming the impostor's user before anything is
+/// sent, where without the check the claim would have run its exchange with whoever answered. Skips loudly unless run
+/// as root, the only way to start a process of another user (CI's runners are not root; a root container is).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_listener_of_another_user_is_refused_by_the_client() {
+  use std::io::{BufRead, BufReader};
+  use std::process::Stdio;
+  toy_seal::install();
+  if rustix::process::getuid().as_raw() != 0 {
+    eprintln!(
+      "SKIP: a listener of another user needs root to start (this test runs as uid {})",
+      rustix::process::getuid().as_raw()
+    );
+    return;
+  }
+  let instance = format!("test-impostor-{}", std::process::id());
+  let mut impostor = Command::new("setpriv")
+    .args([
+      &format!("--reuid={IMPOSTOR_UID}"),
+      &format!("--regid={IMPOSTOR_UID}"),
+      "--clear-groups",
+    ])
+    .arg(std::env::current_exe().unwrap())
+    .args([
+      "--exact",
+      "rendezvous_impostor_listener",
+      "--nocapture",
+      "--test-threads=1",
+    ])
+    .env(IMPOSTOR_ROLE, &instance)
+    .stdout(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let listening = BufReader::new(impostor.stdout.take().unwrap())
+    .lines()
+    .map_while(Result::ok)
+    .find(|line| line.contains(IMPOSTOR_TAG));
+  let claimed = begin_connect_as(&instance, 0, CLAIM_WAIT_NS).map(|_| ());
+  impostor.kill().unwrap();
+  impostor.wait().unwrap();
+  assert!(
+    listening.is_some_and(|line| line.contains(&format!("listening as {IMPOSTOR_UID}"))),
+    "the impostor listened as another user"
+  );
+  assert_eq!(
+    claimed,
+    Err(IpcError::PeerRefused { uid: IMPOSTOR_UID }),
+    "the claim was refused at the impostor's user"
+  );
+}
+
+/// Format: the RAM-backed file system a test makes its own directory in: shared memory, there on every Linux.
+#[cfg(target_os = "linux")]
+const TEST_DIRECTORY_ROOT: &str = "/dev/shm";
+
+/// A directory a test made for itself in shared memory, never on disk, named with its tag and the process id, and
+/// removed when dropped (CLAUDE.md §4): where a test binds a socket file (A-187).
+#[cfg(target_os = "linux")]
+struct TestDirectory(String);
+
+#[cfg(target_os = "linux")]
+impl TestDirectory {
+  /// Makes `/dev/shm/<tag>-<pid>` with exactly `mode`.
+  fn make(tag: &str, mode: rustix::fs::Mode) -> TestDirectory {
+    let path = format!("{TEST_DIRECTORY_ROOT}/{tag}-{}", std::process::id());
+    // A test's own directory in shared memory, named with the process id and removed when dropped (CLAUDE.md §4).
+    // structural: allow
+    rustix::fs::mkdir(path.as_str(), mode).unwrap();
+    // The process's umask narrowed the mode the directory was made with. structural: allow
+    rustix::fs::chmod(path.as_str(), mode).unwrap();
+    TestDirectory(path)
+  }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for TestDirectory {
+  fn drop(&mut self) {
+    // The test's own directory goes with it; whoever bound a socket file in it removed it first. structural: allow
+    let _ = rustix::fs::rmdir(self.0.as_str());
+  }
+}
+
+/// A-187 (§4.7 "Rendezvous"): a socket file is bound only in a directory that is the daemon's user's alone. Do: open a
+/// daemon end at an instance in a directory of this user that others may read and enter (0755), then in the same
+/// directory made the user's alone (0700), then in `/`, which is root's. Expect: the first refused `SharedDirectory`,
+/// the second open, the third refused `SharedDirectory` unless this test runs as root, whose directory `/` is. A
+/// workload of another user could otherwise replace the node or reach a daemon it was never meant to.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_socket_file_is_bound_only_in_a_directory_of_the_users_alone() {
+  use rustix::fs::Mode;
+  use slates_ipc::error::RouteRefusal;
+  toy_seal::install();
+  let shared = TestDirectory::make(
+    "slates-a187-shared",
+    Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+  );
+  let refused = Listener::open(&format!("{}/shared", shared.0), None).map(|_| ());
+  assert_eq!(
+    refused,
+    Err(IpcError::RouteRefused {
+      refusal: RouteRefusal::SharedDirectory
+    }),
+    "a directory others may use is refused"
+  );
+  // The user's alone now.
+  // structural: allow
+  rustix::fs::chmod(shared.0.as_str(), Mode::RWXU).unwrap();
+  let opened = Listener::open(&format!("{}/private", shared.0), None);
+  assert!(
+    opened.is_ok(),
+    "a directory of the user's alone binds: {:?}",
+    opened.err()
+  );
+  drop(opened);
+  if rustix::process::geteuid().as_raw() != 0 {
+    assert_eq!(
+      Listener::open("/rootdir", None).map(|_| ()),
+      Err(IpcError::RouteRefused {
+        refusal: RouteRefusal::SharedDirectory
+      }),
+      "another user's directory is refused"
+    );
+  }
+}
+
+/// A-187: a socket file a dead owner left is replaced, and a live owner's is not. Do: in a directory of the user's alone,
+/// hold an instance's rendezvous as an anchor does and open a daemon end at it; then let the holder go, leave a node at
+/// the instance's socket file as a killed owner leaves one (bound, then closed, never removed), and open a daemon end
+/// again, and claim through it. Expect: the open beside a live holder refused `EADDRINUSE`, as the abstract name's is;
+/// the open over the dead owner's node succeeds and its claim connects.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_socket_file_a_dead_owner_left_is_replaced_and_a_live_ones_is_not() {
+  use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+  toy_seal::install();
+  let directory = TestDirectory::make("slates-a187-stale", rustix::fs::Mode::RWXU);
+  let pid = std::process::id();
+  let instance = format!("{}/test-stale-{pid}", directory.0);
+  let node = format!("{}/slates-rv-test-stale-{pid}.sock", directory.0);
+  let held = HeldRendezvous::hold(&instance).unwrap();
+  let beside = Listener::open(&instance, None).map(|_| ());
+  assert!(
+    refused_as_held(&beside.err().unwrap()),
+    "a live holder's socket file is not taken over"
+  );
+  drop(held);
+  // A killed owner's node: bound, then closed without being removed.
+  let dead = rustix::net::socket_with(
+    AddressFamily::UNIX,
+    SocketType::STREAM,
+    SocketFlags::CLOEXEC,
+    None,
+  )
+  .unwrap();
+  rustix::net::bind(&dead, &SocketAddrUnix::new(node.as_str()).unwrap()).unwrap();
+  drop(dead);
+  let mut listener = Listener::open(&instance, None).unwrap();
+  let (connected, _, _accepted) = serve_until_connected(
+    &mut listener,
+    begin_connect_as(&instance, 0, CLAIM_WAIT_NS).unwrap(),
+  );
+  assert!(
+    connected.region.client_id() > 0,
+    "a claim connects through the replaced node"
+  );
 }

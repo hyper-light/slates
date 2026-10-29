@@ -75,6 +75,19 @@ pub enum IpcError {
   },
   /// A wait ended at its deadline.
   DeadlineExceeded,
+  /// A rendezvous message did not seal or open (§4.7, A-187): a public key the exchange refuses, a message of another
+  /// class or under another key, one replayed, dropped, reordered or changed, or a count of messages spent. `why` names
+  /// which.
+  SealRefused {
+    /// What was refused.
+    why: &'static str,
+  },
+  /// The rendezvous's handshakes begun and not yet complete are at their bound (§4.7, A-187): the connection is closed
+  /// unanswered, which its client reads as a daemon that did not answer and retries.
+  HandshakesFull {
+    /// The bound.
+    limit: usize,
+  },
   /// The daemon's derived client bound is reached (§4.7 admission, AC-2.6).
   TooManyClients {
     /// The bound.
@@ -98,7 +111,8 @@ pub enum IpcError {
     fault: DeliveryFault,
   },
   /// The daemon's socket route refused (§4.6; A-161, A-173): the daemon's answer to a claim of a stream end or a map's
-  /// copy, or the route's own place on this host.
+  /// copy, or the route's own place on this host; and a Linux rendezvous's socket file's place (§4.7, A-187): its
+  /// directory not the user's alone, or its path too long for an address.
   RouteRefused {
     /// Why.
     refusal: RouteRefusal,
@@ -195,6 +209,12 @@ impl fmt::Display for IpcError {
         }
       ),
       Self::DeadlineExceeded => f.write_str("deadline exceeded"),
+      Self::SealRefused { why } => write!(f, "the rendezvous seal refused: {why}"),
+      Self::HandshakesFull { limit } => write!(
+        f,
+        "the rendezvous's pending handshakes are at their bound ({limit}); the connection was closed for its \
+         client to retry"
+      ),
       Self::TooManyClients { limit } => write!(f, "too many clients (the bound is {limit})"),
       Self::HandoffLost { client_id, cause } => {
         write!(

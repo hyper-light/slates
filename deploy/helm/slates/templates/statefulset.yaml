@@ -5,6 +5,9 @@ retried by the dialer) and NO volumeClaimTemplates: slates is RAM-only, its §4.
 replicated to 2f + 1 holders, and a node that loses its RAM rejoins and is re-filled (R1; "restart = join").
 A DaemonSet was considered and rejected: no stable per-pod DNS name.
 */ -}}
+{{- if and .Values.rendezvous.directory (not .Values.rendezvous.hostPath) }}
+{{- fail "rendezvous.directory needs rendezvous.hostPath: the node's directory the socket file lives in" }}
+{{- end }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -112,6 +115,12 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            {{- if .Values.rendezvous.directory }}
+            # The rendezvous at a socket file in the mounted directory (values.yaml `rendezvous`; A-187): the anchor,
+            # the readiness probe and every `kubectl exec` of `slates` reach the daemon there.
+            - name: SLATES_ENDPOINT
+              value: {{ printf "%s/default" .Values.rendezvous.directory | quote }}
+            {{- end }}
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -146,6 +155,11 @@ spec:
               mountPath: /etc/slates/keys/node.key.der
               subPathExpr: $(POD_NAME).key.der
               readOnly: true
+            {{- if .Values.rendezvous.directory }}
+            # The node's rendezvous directory, where the daemon binds its socket file (A-187).
+            - name: rendezvous
+              mountPath: {{ .Values.rendezvous.directory }}
+            {{- end }}
       volumes:
         - name: fleet
           configMap:
@@ -166,3 +180,11 @@ spec:
                     - key: {{ $pod }}.key.der
                       path: {{ $pod }}.key.der
               {{- end }}
+        {{- if .Values.rendezvous.directory }}
+        # The node's rendezvous directory (A-187): it must exist, the daemon's user's alone, so `Directory`, never
+        # `DirectoryOrCreate`, whose directory the kubelet would make root's.
+        - name: rendezvous
+          hostPath:
+            path: {{ .Values.rendezvous.hostPath }}
+            type: Directory
+        {{- end }}

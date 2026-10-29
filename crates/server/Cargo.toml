@@ -51,6 +51,11 @@ slates-bridge-virtiofs = { workspace = true }
 # verified against the kernel's mount table; there is no host mount on Windows to bind.
 slates-bridge-oci = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# The rendezvous seal (§4.7, A-187): every Linux rendezvous's messages cross under it, and `slates-ipc` takes it from
+# its caller since it builds where aws-lc-rs cannot.
+slates-seal = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
 # The WinFsp mount host (§4.6 "Windows"; `crate::winfsp`): the daemon serves a volume at a drive letter.

@@ -9139,13 +9139,16 @@ const DIRECT_PROBE_FILE: &str = "/direct.bin";
 /// (`crates/client/tests/client.rs` `MANY_CHUNKS_BYTES`).
 #[cfg(target_os = "linux")]
 const DIRECT_PROBE_BYTES: usize = 4 << 20;
-/// Format: the environment variable choosing the probe's map: `write` for a writable map (A-186), anything else or
-/// nothing for a read-only one.
+/// Format: the environment variable choosing the probe's map: `write` for a writable map (A-186), `reach` for no map, only
+/// whether the instance answers a claim (A-187), anything else or nothing for a read-only one.
 #[cfg(target_os = "linux")]
 const DIRECT_PROBE_MODE: &str = "SLATES_DIRECT_PROBE_MODE";
 /// Format: the tag of the writable probe's one line.
 #[cfg(target_os = "linux")]
 const DIRECT_WRITE_TAG: &str = "direct-map-write:";
+/// Format: the tag of the reach probe's one line (A-187): `connected`, `unavailable`, or another refusal.
+#[cfg(target_os = "linux")]
+const DIRECT_REACH_TAG: &str = "direct-reach:";
 /// Format: what the writable probe stores through its map, a page's end less [`DIRECT_WRITE_BEFORE_PAGE`] bytes into the
 /// file, so the store crosses a page boundary.
 #[cfg(target_os = "linux")]
@@ -9172,6 +9175,17 @@ fn container_direct_map_probe() {
     slates_db::replay::RECOVERY_BUDGET_NS,
   )
   .get();
+  if std::env::var(DIRECT_PROBE_MODE).as_deref() == Ok("reach") {
+    let reached = match slates_client::Client::connect(&instance, deadlines) {
+      Ok(_) => "connected".to_owned(),
+      Err(slates_client::ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. })) => {
+        "unavailable".to_owned()
+      }
+      Err(other) => format!("{other:?}"),
+    };
+    println!("{DIRECT_REACH_TAG} {reached}");
+    return;
+  }
   let mut client = slates_client::Client::connect(&instance, deadlines).unwrap();
   if std::env::var(DIRECT_PROBE_MODE).as_deref() == Ok("write") {
     container_write_probe(&mut client, volume);
@@ -9239,7 +9253,7 @@ fn a_container_maps_a_slates_file_by_the_direct_map_with_no_copy() {
   let handed = status_counter(&probe.instance, "dax.local_map");
   let fallbacks = status_counter(&probe.instance, "dax.local_map_fallback");
   let unconfined = status_counter(&probe.instance, "dax.local_map_unconfined");
-  let (code, line, err) = probe.run_in_container("read", DIRECT_PROBE_TAG);
+  let (code, line, err) = probe.run_in_container("read", DIRECT_PROBE_TAG, Network::Host);
   let handed_now = status_counter(&probe.instance, "dax.local_map");
   let fallbacks_now = status_counter(&probe.instance, "dax.local_map_fallback");
   let unconfined_now = status_counter(&probe.instance, "dax.local_map_unconfined");
@@ -9269,14 +9283,116 @@ fn a_container_maps_a_slates_file_by_the_direct_map_with_no_copy() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_container_maps_a_slates_file_read_and_write_by_the_direct_map() {
-  let Some(mut probe) = DirectProbe::start("container-direct-write") else {
+  let Some(probe) = DirectProbe::start("container-direct-write") else {
     return;
   };
+  assert_a_container_writes_through(probe, Network::Host);
+}
+
+/// A-187 (the DAX matrix's Docker Linux socket-route cells for a container with a network namespace of its own,
+/// `docs/wip/virtiofs.md` §8): a process in a container on a bridge network maps a slates file read and write through the
+/// rendezvous's socket file. Do: start a daemon at an abstract instance and ask from a container on a bridge network
+/// whether it answers; then start a daemon whose instance is a socket file in a directory of the user's alone, and run the
+/// writable probe in a container on a bridge network with that directory bound in read-only, as the read-and-write case
+/// does. Expect: the first container finds no daemon, since Docker's bridge network is a namespace of its own, which the
+/// abstract rendezvous does not reach; the second writes through as the host-network case does: the sync writes the
+/// stored bytes that differ and the release nothing more, the host reads the store in place, one map handed, two
+/// write-backs finished, none refused, nothing unconfined. Gated on `SLATES_TEST_CLI` and a reachable Docker; skips
+/// loudly.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_container_on_a_bridge_network_maps_a_slates_file_read_and_write_through_the_socket_file() {
+  let Some(abstract_probe) = DirectProbe::start("bridge-abstract") else {
+    return;
+  };
+  // The control asks from a bridge network with a directory of its own bound in, as the real case does, and nothing
+  // listening in it.
+  let unused = TestDirectory::make("slates-a187-bridge-control");
+  let (code, reached, err) = abstract_probe.run_in_container(
+    "reach",
+    DIRECT_REACH_TAG,
+    Network::Bridge {
+      directory: &unused.0,
+    },
+  );
+  drop(abstract_probe);
+  assert_eq!(code, 0, "the reach probe ran to its end: {err}");
+  assert_eq!(
+    reached, "unavailable",
+    "the abstract rendezvous does not reach a container on a bridge network"
+  );
+  let directory = TestDirectory::make("slates-a187-bridge");
+  let instance = format!("{}/cli-bridge-{}", directory.0, std::process::id());
+  let Some(probe) = DirectProbe::start_at(&instance) else {
+    return;
+  };
+  assert_a_container_writes_through(
+    probe,
+    Network::Bridge {
+      directory: &directory.0,
+    },
+  );
+}
+
+/// Format: the RAM-backed file system a test makes its own directory in: shared memory, there on every Linux.
+#[cfg(target_os = "linux")]
+const TEST_DIRECTORY_ROOT: &str = "/dev/shm";
+
+/// A directory a test made for itself in shared memory, never on disk, the user's alone, named with its tag and the
+/// process id, and removed when dropped with what it holds (CLAUDE.md §4): where a test's anchor binds its socket file
+/// (A-187). The tests end an anchor with `SIGKILL`, which leaves its node behind, so the drop removes the directory's
+/// entries first.
+#[cfg(target_os = "linux")]
+struct TestDirectory(String);
+
+#[cfg(target_os = "linux")]
+impl TestDirectory {
+  fn make(tag: &str) -> TestDirectory {
+    let path = format!("{TEST_DIRECTORY_ROOT}/{tag}-{}", std::process::id());
+    // A test's own directory in shared memory, named with the process id and removed when dropped (CLAUDE.md §4).
+    // structural: allow
+    rustix::fs::mkdir(path.as_str(), rustix::fs::Mode::RWXU).unwrap();
+    TestDirectory(path)
+  }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for TestDirectory {
+  fn drop(&mut self) {
+    use rustix::fs::{AtFlags, Mode, OFlags};
+    // What a killed anchor left in the test's own directory, then the directory. structural: allow
+    if let Ok(directory) = rustix::fs::open(
+      self.0.as_str(),
+      OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+      Mode::empty(),
+    ) && let Ok(entries) = rustix::fs::Dir::read_from(&directory)
+    {
+      for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name != c"." && name != c".." {
+          // A socket node a killed anchor left in the test's own directory in shared memory, never a host path (R1).
+          // structural: allow
+          #[allow(clippy::disallowed_methods)]
+          let _ = rustix::fs::unlinkat(&directory, name, AtFlags::empty());
+        }
+      }
+    }
+    // structural: allow
+    let _ = rustix::fs::rmdir(self.0.as_str());
+  }
+}
+
+/// The read-and-write case's run and its expectations (A-186), from a container on `network`: the writable probe stores a
+/// phrase across the first page's end, syncs and releases; the sync wrote the stored bytes that differ and the release
+/// nothing more; the host reads the store in place and every other byte as it was; the daemon handed one map, finished
+/// two write-backs, refused none and judged nothing unconfined.
+#[cfg(target_os = "linux")]
+fn assert_a_container_writes_through(mut probe: DirectProbe, network: Network<'_>) {
   let handed = status_counter(&probe.instance, "dax.local_map");
   let synced = status_counter(&probe.instance, "dax.local_map_synced");
   let refused = status_counter(&probe.instance, "dax.local_map_sync_refused");
   let unconfined = status_counter(&probe.instance, "dax.local_map_unconfined");
-  let (code, line, err) = probe.run_in_container("write", DIRECT_WRITE_TAG);
+  let (code, line, err) = probe.run_in_container("write", DIRECT_WRITE_TAG, network);
   let at = rustix::param::page_size() - DIRECT_WRITE_BEFORE_PAGE;
   let mut expect = vec![probe.fill; DIRECT_PROBE_BYTES];
   expect[at..at + DIRECT_WRITE_PHRASE.len()].copy_from_slice(DIRECT_WRITE_PHRASE);
@@ -9313,6 +9429,16 @@ fn a_container_maps_a_slates_file_read_and_write_by_the_direct_map() {
   assert_eq!(unconfined_now, unconfined, "nothing unconfined");
 }
 
+/// Where a container's probe reaches the daemon from.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum Network<'a> {
+  /// The host's network namespace (`--network host`), where the abstract rendezvous lives.
+  Host,
+  /// A bridge network of its own (Docker's default), with the rendezvous directory bound in read-only (A-187).
+  Bridge { directory: &'a str },
+}
+
 /// A daemon with a volume holding [`DIRECT_PROBE_FILE`], 4 MiB of one byte, and the client that wrote it: what the
 /// container direct-map tests run their probe against. The anchor goes with it.
 #[cfg(target_os = "linux")]
@@ -9342,7 +9468,20 @@ impl DirectProbe {
       }
     };
     eprintln!("the direct-map probe over {server}");
-    let instance = format!("cli-{tag}-{}", std::process::id());
+    DirectProbe::start_at(&format!("cli-{tag}-{}", std::process::id()))
+  }
+
+  /// A daemon at `instance` and its file, or `None` (skipping loudly) without `SLATES_TEST_CLI` or a reachable Docker.
+  fn start_at(instance: &str) -> Option<DirectProbe> {
+    if std::env::var_os("SLATES_TEST_CLI").is_none() {
+      eprintln!("SKIP: the container direct map needs SLATES_TEST_CLI=1 (a live daemon)");
+      return None;
+    }
+    if let Err(why) = docker_server() {
+      eprintln!("SKIP: the container direct map needs a reachable Docker: {why}");
+      return None;
+    }
+    let instance = instance.to_owned();
     let anchor = start_one_shard_anchor(&instance);
     let (code, out, err) = run(
       &instance,
@@ -9382,14 +9521,24 @@ impl DirectProbe {
   }
 
   /// Runs the cli test binary in a Docker container as [`container_direct_map_probe`] in `mode`, sharing the daemon's
-  /// kernel, uid and network namespace: its exit code, the rest of its line tagged `tag`, and its standard error.
-  fn run_in_container(&self, mode: &str, tag: &str) -> (i32, String, String) {
+  /// kernel and uid, on `network`: its exit code, the rest of its line tagged `tag`, and its standard error.
+  fn run_in_container(&self, mode: &str, tag: &str, network: Network<'_>) -> (i32, String, String) {
     let mut command = Command::new("docker");
+    command.args(["run", "--rm"]);
+    match network {
+      Network::Host => {
+        command.args(["--network", "host"]);
+      }
+      Network::Bridge { directory } => {
+        command.args([
+          "--network",
+          "bridge",
+          "--mount",
+          &format!("type=bind,source={directory},target={directory},readonly"),
+        ]);
+      }
+    }
     command.args([
-      "run",
-      "--rm",
-      "--network",
-      "host",
       "--user",
       &format!(
         "{}:{}",

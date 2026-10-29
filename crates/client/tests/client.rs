@@ -3093,3 +3093,32 @@ fn a_direct_maps_descriptor_reads_one_file_and_changes_nothing() {
   client.destroy(mine).unwrap();
   client.destroy(neighbour).unwrap();
 }
+
+/// Shape: the connects [`a_connect_is_answered_within_a_tenth_of_the_claim_wait`] times, one after another.
+const CONNECTS_TIMED: usize = 20;
+
+/// A-187 (§4.7 "Rendezvous"): a claim is answered in a fraction of the claim wait. On Linux the sealed exchange takes the
+/// daemon two rounds, the second woken by the client's opening on the connection's socket; a daemon that waited on its
+/// listener alone would serve that second round only at the earliest pending handshake's deadline, a claim wait later.
+/// Do: on a one-shard daemon, connect [`CONNECTS_TIMED`] clients one after another, timing each. Expect: the quickest
+/// took less than a tenth of the claim wait. The least of identical rounds, so a busy machine that preempts some of them
+/// cannot fail it; every time is printed.
+#[test]
+fn a_connect_is_answered_within_a_tenth_of_the_claim_wait() {
+  let (_daemon, _client, instance) = one_shard_daemon("connect-wait");
+  let took: Vec<Duration> = (0..CONNECTS_TIMED)
+    .map(|_| {
+      let at = Instant::now();
+      let client = Client::connect(&instance, deadlines()).unwrap();
+      let took = at.elapsed();
+      drop(client);
+      took
+    })
+    .collect();
+  let quickest = took.iter().min().copied().unwrap();
+  println!("connect: quickest {quickest:?} of {took:?}");
+  assert!(
+    quickest < Duration::from_nanos(slates_ipc::CLAIM_WAIT_NS / 10),
+    "the quickest of {CONNECTS_TIMED} connects took {quickest:?}, a tenth of the claim wait or more"
+  );
+}

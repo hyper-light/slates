@@ -112,6 +112,9 @@ pub enum Served {
   Accepted(Box<Accepted>),
   /// Refused and told so where the claimant can still be reached; the claim is over, and the round goes on.
   Refused(IpcError),
+  /// Accepted and its sealed exchange begun (Linux, A-187): the daemon sent its public key and keeps the connection
+  /// among its pending handshakes until the client's opening arrives, so no client's pace holds the round.
+  Pending,
 }
 
 /// What the daemon opens once: the listener (Linux) or the bootstrap object (macOS, Windows).
@@ -260,6 +263,8 @@ impl Listener {
           self.capacity_refused = self.capacity_refused.saturating_add(1)
         }
         Ok(Some(Served::Refused(refusal))) => refused(refusal),
+        // A handshake begun: it completes in a later round, when its client's opening arrives.
+        Ok(Some(Served::Pending)) => {}
         // The rendezvous itself failed: the round ends with what it accepted, and the next one tries again.
         Err(failure) => {
           round.ended = Some(failure);
@@ -273,6 +278,12 @@ impl Listener {
   /// Cross-uid connects refused so far.
   pub fn refused(&self) -> u64 {
     self.refused
+  }
+
+  /// The handshakes begun and not yet complete (Linux, A-187): their sockets' descriptors, which the daemon waits on
+  /// beside the listener's, and the nanoseconds until the earliest of them is due to be given up. None elsewhere.
+  pub fn pending(&self) -> (Vec<i32>, Option<u64>) {
+    self.inner.pending()
   }
 
   /// Connects refused at the client bound so far, each answered typed.
@@ -615,10 +626,29 @@ fn rendezvous_name(instance: &str) -> String {
 
 #[cfg(target_os = "linux")]
 pub mod platform {
-  //! Linux: the abstract-namespace socket, `SO_PEERCRED`, `SCM_RIGHTS`.
+  //! Linux: the abstract-namespace socket, `SO_PEERCRED`, `SCM_RIGHTS`, every message after the exchange of public keys
+  //! sealed (A-187, `crate::seal`).
+  //!
+  //! **The address.** An instance named by a plain name is reached at the abstract name `slates-rv-<name>/<uid>`, which
+  //! the kernel scopes to a network namespace (unix(7)), so it needs no file. An instance named by an absolute path,
+  //! `<directory>/<name>`, is reached at the socket file `slates-rv-<name>.sock` in that directory instead (A-187): an
+  //! operator names one so a workload in a network namespace of its own (a pod, a container on a bridge network) can
+  //! reach the daemon through a mount of the directory, which it mounts read-only so it can connect but not replace
+  //! the node. The directory must be the daemon's user's alone, checked before the bind; the node is made owner-only; a
+  //! node a dead owner left is found unanswered and replaced; and the node goes with whoever bound it, the anchor that
+  //! holds it across restarts (A-114) or a daemon that runs alone. The protocol over either address is one, sealed.
+  //!
+  //! **The exchange, daemon first.** The daemon accepts a connection, checks its peer's user, sends its public key and
+  //! keeps the connection among its pending handshakes; it waits on nothing. The client, once that key has come, sends
+  //! its own public key and its hello sealed, in one message, and waits for the handoff. When that opening arrives the
+  //! daemon agrees, opens the hello and answers with the handoff sealed, the client's descriptors beside it. So no
+  //! client's pace holds the daemon's round (a connection that never sends is given up at the claim wait, its slot
+  //! freed), and no daemon's pace holds the client's poll (AUD-29-19).
 
+  use std::cell::RefCell;
   use std::io::{IoSlice, IoSliceMut};
   use std::os::fd::{AsFd, OwnedFd};
+  use std::path::{Path, PathBuf};
 
   use rustix::net::{
     AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer,
@@ -627,8 +657,11 @@ pub mod platform {
   use slates_mem::Handoff;
 
   use super::{Accepted, Connected, Doorbell, Prepared, Served, rendezvous_name};
-  use crate::error::IpcError;
+  use crate::error::{IpcError, RouteRefusal};
   use crate::region::ClientRegion;
+  use crate::seal::{
+    self, Class, PUBLIC_KEY_BYTES, RendezvousSeal, Role, SealedChannel, TAG_BYTES,
+  };
 
   /// Refuses a descriptor that would authorize a peer more than the hand-off does (§4.6; A-135, A-171, A-186).
   ///
@@ -744,14 +777,33 @@ pub mod platform {
   const DELIVERY_MAX_BYTES: usize = KIND_BYTES + MAPPING_MSG_BYTES;
   /// Format: the one descriptor every delivery carries: an arena block's backing object, or a stream end.
   const DELIVERY_FDS: usize = 1;
+  /// Format: the client's hello, sealed.
+  const SEALED_HELLO_BYTES: usize = HELLO_BYTES + TAG_BYTES;
+  /// Format: the client's opening: its public key, then its hello sealed.
+  const OPENING_BYTES: usize = PUBLIC_KEY_BYTES + SEALED_HELLO_BYTES;
+  /// Format: the daemon's handoff (or its refusal), sealed.
+  const SEALED_HANDOFF_BYTES: usize = HANDOFF_BYTES + TAG_BYTES;
+  /// Format: a delivery as it crosses: every kind's body padded to the longest's, then sealed, so every delivery is
+  /// one length and a receive reads exactly one.
+  const SEALED_DELIVERY_BYTES: usize = DELIVERY_MAX_BYTES + TAG_BYTES;
+  /// Derived: the most handshakes a listener keeps pending: one for each connection its backlog can hold, so a
+  /// round's arrivals all fit, and a further one is turned away (its socket closed, which its client retries).
+  fn pending_most() -> usize {
+    usize::try_from(BACKLOG).unwrap_or(1).max(1)
+  }
 
-  /// Sends the typed refusal handoff to `peer`: client [`REFUSED_CLIENT`], `limit` in the length word,
-  /// no descriptors.
-  fn send_refusal(peer: &OwnedFd, limit: usize) -> Result<(), IpcError> {
+  /// Sends the typed refusal handoff to `peer`, sealed under `channel`: client [`REFUSED_CLIENT`], `limit` in the
+  /// length word, no descriptors.
+  fn send_refusal(
+    peer: &OwnedFd,
+    channel: &mut dyn SealedChannel,
+    limit: usize,
+  ) -> Result<(), IpcError> {
     let mut body = [0u8; HANDOFF_BYTES];
     body[HANDOFF_AT_CLIENT..HANDOFF_AT_LEN].copy_from_slice(&REFUSED_CLIENT.to_le_bytes());
     body[HANDOFF_AT_LEN..].copy_from_slice(&u64::try_from(limit).unwrap_or(u64::MAX).to_le_bytes());
-    rustix::net::send(peer, &body, SendFlags::empty()).map_err(|e| refused("send", e))?;
+    let sealed = channel.seal(Class::Handoff, &body)?;
+    rustix::net::send(peer, &sealed, SendFlags::NOSIGNAL).map_err(|e| refused("send", e))?;
     Ok(())
   }
   /// Shape: the listen backlog (connections pending accept); the control shard drains them
@@ -765,13 +817,17 @@ pub mod platform {
     }
   }
 
-  /// The control channel to one client: the socket (its close means the client died) and the
-  /// completion eventfd the daemon signals for a parked SDK event loop.
+  /// The control channel to one client: the socket (its close means the client died), the
+  /// completion eventfd the daemon signals for a parked SDK event loop, and the seal its rendezvous agreed, which every
+  /// delivery crosses under (A-187).
   pub struct Control {
     /// The socket.
     pub socket: OwnedFd,
     /// The completion eventfd.
     pub completion: OwnedFd,
+    /// The channel this client's deliveries are sealed on. Borrowed for one seal at a time on the shard that serves the
+    /// client, so the borrow never meets another.
+    seal: RefCell<Box<dyn SealedChannel>>,
   }
 
   /// The client's control channel: the completion eventfd an SDK event loop polls.
@@ -855,14 +911,29 @@ pub mod platform {
       self.send_delivery(&body, stream, "sendmsg stream")
     }
 
-    /// One delivery, `body` with `descriptor` by `SCM_RIGHTS`, in one `sendmsg`, so the descriptor arrives with its
-    /// body and a receive never runs past it into the next delivery.
+    /// One delivery, `body` padded to the longest kind's and sealed, with `descriptor` by `SCM_RIGHTS`, in one
+    /// `sendmsg`, so the descriptor arrives with its body and a receive, which reads exactly one sealed delivery, never
+    /// runs past it into the next.
     fn send_delivery(
       &self,
       body: &[u8],
       descriptor: std::os::fd::BorrowedFd<'_>,
       call: &'static str,
     ) -> Result<(), IpcError> {
+      let mut padded = [0u8; DELIVERY_MAX_BYTES];
+      padded
+        .get_mut(..body.len())
+        .ok_or(IpcError::Layout {
+          reason: "a delivery's body is longer than the longest kind's",
+        })?
+        .copy_from_slice(body);
+      let sealed = self
+        .seal
+        .try_borrow_mut()
+        .map_err(|_| IpcError::Layout {
+          reason: "a delivery's seal was already in use",
+        })?
+        .seal(Class::Delivery, &padded)?;
       let fds = [descriptor];
       let mut space =
         [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(DELIVERY_FDS))];
@@ -874,9 +945,9 @@ pub mod platform {
       }
       rustix::net::sendmsg(
         &self.socket,
-        &[IoSlice::new(body)],
+        &[IoSlice::new(&sealed)],
         &mut control,
-        SendFlags::empty(),
+        SendFlags::NOSIGNAL,
       )
       .map_err(|e| refused(call, e))?;
       Ok(())
@@ -909,9 +980,12 @@ pub mod platform {
     }
   }
 
-  /// The client's liveness check: the control socket; its peer end closes with the daemon.
+  /// The client's liveness check: the control socket; its peer end closes with the daemon. It also receives the
+  /// daemon's deliveries, which it opens under the seal its rendezvous agreed (A-187).
   pub struct Liveness {
     socket: OwnedFd,
+    /// The channel the daemon's deliveries are opened on, borrowed for one open at a time.
+    seal: RefCell<Box<dyn SealedChannel>>,
   }
 
   impl Liveness {
@@ -937,13 +1011,13 @@ pub mod platform {
     /// unknown kind, or a descriptor count other than one is refused `Layout`, and every descriptor that came with
     /// it is closed: nothing a refused delivery carried stays open in the client.
     pub(super) fn recv_delivery(&self) -> Result<Option<super::ControlDelivery>, IpcError> {
-      let mut body = [0u8; DELIVERY_MAX_BYTES];
+      let mut sealed = [0u8; SEALED_DELIVERY_BYTES];
       let mut space =
         [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(DELIVERY_FDS))];
       let mut control = RecvAncillaryBuffer::new(&mut space);
       let received = match rustix::net::recvmsg(
         &self.socket,
-        &mut [IoSliceMut::new(&mut body)],
+        &mut [IoSliceMut::new(&mut sealed)],
         &mut control,
         RecvFlags::CMSG_CLOEXEC | RecvFlags::DONTWAIT,
       ) {
@@ -962,19 +1036,22 @@ pub mod platform {
       if received == 0 {
         return Ok(None);
       }
-      let kind = word_at(&body, 0);
-      let expected = match kind {
-        KIND_MAPPING => KIND_BYTES + MAPPING_MSG_BYTES,
-        KIND_STREAM => KIND_BYTES + STREAM_MSG_BYTES,
-        _ => {
-          return Err(IpcError::Layout {
-            reason: "a delivery of an unknown kind",
-          });
-        }
-      };
-      if received != expected {
+      if received != SEALED_DELIVERY_BYTES {
         return Err(IpcError::Layout {
-          reason: "a delivery was the wrong length for its kind",
+          reason: "a delivery was not one sealed delivery long",
+        });
+      }
+      let body = self
+        .seal
+        .try_borrow_mut()
+        .map_err(|_| IpcError::Layout {
+          reason: "a delivery's seal was already in use",
+        })?
+        .open(Class::Delivery, &sealed)?;
+      let kind = word_at(&body, 0);
+      if kind != KIND_MAPPING && kind != KIND_STREAM {
+        return Err(IpcError::Layout {
+          reason: "a delivery of an unknown kind",
         });
       }
       if descriptors.len() != DELIVERY_FDS {
@@ -1007,18 +1084,184 @@ pub mod platform {
 
   pub(super) struct Listener {
     socket: OwnedFd,
+    /// The socket file this daemon bound itself, removed when it stops (A-187); none for one its anchor holds, which
+    /// the anchor removes.
+    node: Option<PathBuf>,
     uid: u32,
+    /// The handshakes begun whose openings have not all come, oldest first. With [`Self::ready`], at most
+    /// [`pending_most`].
+    pending: Vec<Handshake>,
+    /// Whether this round has read the pending handshakes' openings: once a round, so a round costs one read for each
+    /// pending handshake however many connections it serves.
+    swept: bool,
+    /// The handshakes this round's sweep found complete, oldest first, served before any new connection is accepted.
+    ready: std::collections::VecDeque<Handshake>,
+    /// The handshakes this round's sweep gave up at the claim wait, each reported as one refusal.
+    given_up: usize,
+  }
+
+  impl Drop for Listener {
+    fn drop(&mut self) {
+      let_node_go(self.node.as_deref());
+    }
+  }
+
+  /// A connection whose sealed exchange is under way (A-187): the daemon sent its public key and waits for the
+  /// client's opening, its public key and its hello sealed.
+  struct Handshake {
+    peer: OwnedFd,
+    uid: u32,
+    pid: u32,
+    seal: Box<dyn RendezvousSeal>,
+    /// The opening's bytes received so far.
+    opening: Vec<u8>,
+    started: std::time::Instant,
+  }
+
+  /// Where a pending handshake's opening stands.
+  enum Opening {
+    /// Not all of it has come.
+    Due,
+    /// All of it has come.
+    Complete,
+    /// The client closed its end, or its socket failed: the handshake is dropped.
+    Gone,
+  }
+
+  /// Reads what has come of `handshake`'s opening, without waiting.
+  fn read_opening(handshake: &mut Handshake) -> Opening {
+    let want = OPENING_BYTES.saturating_sub(handshake.opening.len());
+    if want == 0 {
+      return Opening::Complete;
+    }
+    let mut buffer = [0u8; OPENING_BYTES];
+    let Some(room) = buffer.get_mut(..want) else {
+      return Opening::Gone;
+    };
+    match rustix::net::recv(&handshake.peer, room, RecvFlags::DONTWAIT) {
+      Ok((0, _)) => Opening::Gone,
+      Ok((got, _)) => {
+        handshake
+          .opening
+          .extend_from_slice(buffer.get(..got).unwrap_or_default());
+        if handshake.opening.len() >= OPENING_BYTES {
+          Opening::Complete
+        } else {
+          Opening::Due
+        }
+      }
+      Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => Opening::Due,
+      Err(_) => Opening::Gone,
+    }
+  }
+
+  /// Nanoseconds since `started`.
+  fn elapsed_ns(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+  }
+
+  /// Format: what follows the rendezvous name in a socket file's name (A-187).
+  const NODE_SUFFIX: &str = ".sock";
+  /// Format: the bytes a Unix socket address holds for a path, its terminating NUL among them (`sun_path`, unix(7)).
+  const SUN_PATH_BYTES: usize = 108;
+
+  /// The socket file `instance`'s rendezvous is reached at when the instance is named by an absolute path (the module
+  /// doc): `slates-rv-<name>.sock` in the path's directory. `None` for an instance named otherwise, which is reached at
+  /// its abstract name. Refused `PathTooLong` when the node would not fit a socket address.
+  fn node(instance: &str) -> Result<Option<PathBuf>, IpcError> {
+    let path = Path::new(instance);
+    if !path.is_absolute() {
+      return Ok(None);
+    }
+    let (Some(directory), Some(name)) = (path.parent(), path.file_name()) else {
+      return Err(IpcError::Layout {
+        reason: "a rendezvous path names no directory and instance",
+      });
+    };
+    let node = directory.join(format!(
+      "{}{NODE_SUFFIX}",
+      rendezvous_name(&name.to_string_lossy())
+    ));
+    if node.as_os_str().len() >= SUN_PATH_BYTES {
+      return Err(IpcError::RouteRefused {
+        refusal: RouteRefusal::PathTooLong,
+      });
+    }
+    Ok(Some(node))
   }
 
   fn address(instance: &str) -> Result<SocketAddrUnix, IpcError> {
+    if let Some(node) = node(instance)? {
+      return SocketAddrUnix::new(&node).map_err(|e| refused("socket address", e));
+    }
     let uid = rustix::process::getuid().as_raw();
     let name = format!("{}/{uid}", rendezvous_name(instance));
     SocketAddrUnix::new_abstract_name(name.as_bytes()).map_err(|e| refused("abstract name", e))
   }
 
+  /// Refuses `SharedDirectory` unless `directory` is a directory the effective user owns that no one else may use, the
+  /// one a rendezvous's socket file may be bound in (A-187), as the macOS route refuses its own (A-161).
+  fn owner_only(directory: &Path) -> Result<(), IpcError> {
+    use rustix::fs::{FileType, Mode};
+    let stat = rustix::fs::stat(directory).map_err(|e| refused("stat rendezvous directory", e))?;
+    let mine = stat.st_uid == rustix::process::geteuid().as_raw();
+    let private = !Mode::from_raw_mode(stat.st_mode).intersects(Mode::RWXG | Mode::RWXO);
+    let is_directory = FileType::from_raw_mode(stat.st_mode) == FileType::Directory;
+    if mine && private && is_directory {
+      Ok(())
+    } else {
+      Err(IpcError::RouteRefused {
+        refusal: RouteRefusal::SharedDirectory,
+      })
+    }
+  }
+
+  /// Whether anything listens at `address`: a daemon, or the anchor holding the rendezvous across a restart.
+  fn answers(address: &SocketAddrUnix) -> bool {
+    rustix::net::socket_with(
+      AddressFamily::UNIX,
+      SocketType::STREAM,
+      SocketFlags::CLOEXEC,
+      None,
+    )
+    .is_ok_and(|probe| rustix::net::connect(&probe, address).is_ok())
+  }
+
+  /// Removes a rendezvous's socket file at `node`.
+  fn remove_node(node: &Path) -> Result<(), IpcError> {
+    // A rendezvous's own socket node, removed by whoever bound it or found left by a dead owner (A-187; socket files
+    // authorized by Ada 2026-10-22 when what crosses them is encrypted). structural: allow
+    rustix::fs::unlink(node).map_err(|e| refused("unlink rendezvous", e))
+  }
+
+  /// Binds `socket` at the socket file `node` (the module doc): its directory checked, a node a dead owner left
+  /// replaced, a live owner's refused as the abstract name's is (`EADDRINUSE`), and the node made owner-only.
+  fn bind_node(socket: &OwnedFd, address: &SocketAddrUnix, node: &Path) -> Result<(), IpcError> {
+    if let Some(directory) = node.parent() {
+      owner_only(directory)?;
+    }
+    match rustix::net::bind(socket, address) {
+      Ok(()) => {}
+      Err(rustix::io::Errno::ADDRINUSE) => {
+        if answers(address) {
+          return Err(refused("bind", rustix::io::Errno::ADDRINUSE));
+        }
+        // A node a dead owner left: nothing answers it, so it is removed and bound again.
+        remove_node(node)?;
+        rustix::net::bind(socket, address).map_err(|e| refused("bind", e))?;
+      }
+      Err(e) => return Err(refused("bind", e)),
+    }
+    // The rendezvous's own socket node, made the user's alone (A-187; socket files authorized by Ada 2026-10-22 when
+    // what crosses them is encrypted). structural: allow
+    rustix::fs::chmod(node, rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR)
+      .map_err(|e| refused("chmod rendezvous", e))
+  }
+
   /// A listening socket bound at `instance`'s address, with `flags` (close-on-exec for the daemon's own; none for the
-  /// anchor's, which every daemon it spawns inherits).
-  fn listening(instance: &str, flags: SocketFlags) -> Result<OwnedFd, IpcError> {
+  /// anchor's, which every daemon it spawns inherits), and the socket file it was bound at, if any, which its owner
+  /// removes when it lets the socket go.
+  fn listening(instance: &str, flags: SocketFlags) -> Result<(OwnedFd, Option<PathBuf>), IpcError> {
     let socket = rustix::net::socket_with(
       AddressFamily::UNIX,
       SocketType::STREAM,
@@ -1026,22 +1269,42 @@ pub mod platform {
       None,
     )
     .map_err(|e| refused("socket", e))?;
-    rustix::net::bind(&socket, &address(instance)?).map_err(|e| refused("bind", e))?;
+    let address = address(instance)?;
+    let node = node(instance)?;
+    match &node {
+      Some(node) => bind_node(&socket, &address, node)?,
+      None => rustix::net::bind(&socket, &address).map_err(|e| refused("bind", e))?,
+    }
     rustix::net::listen(&socket, BACKLOG).map_err(|e| refused("listen", e))?;
-    Ok(socket)
+    Ok((socket, node))
+  }
+
+  /// Removes the socket file a listener was bound at, when it was bound at one: a removal refused leaves a node the next
+  /// owner finds unanswered and replaces.
+  fn let_node_go(node: Option<&Path>) {
+    if let Some(node) = node {
+      let _ = remove_node(node);
+    }
   }
 
   /// The anchor's listening socket (A-114): inheritable, so the kernel keeps the address and queues every connect while
   /// no daemon runs.
   pub(super) struct Held {
     socket: OwnedFd,
+    /// The socket file the anchor bound, removed when it stops (A-187).
+    node: Option<PathBuf>,
+  }
+
+  impl Drop for Held {
+    fn drop(&mut self) {
+      let_node_go(self.node.as_deref());
+    }
   }
 
   impl Held {
     pub(super) fn hold(instance: &str) -> Result<Held, IpcError> {
-      Ok(Held {
-        socket: listening(instance, SocketFlags::empty())?,
-      })
+      let (socket, node) = listening(instance, SocketFlags::empty())?;
+      Ok(Held { socket, node })
     }
 
     pub(super) fn env_value(&self) -> String {
@@ -1081,14 +1344,35 @@ pub mod platform {
 
   impl Listener {
     pub(super) fn open(instance: &str, adoption: Option<&str>) -> Result<Listener, IpcError> {
-      let socket = match adoption {
-        Some(value) => adopt(instance, value)?,
+      let (socket, node) = match adoption {
+        Some(value) => (adopt(instance, value)?, None),
         None => listening(instance, SocketFlags::CLOEXEC)?,
       };
       Ok(Listener {
         socket,
+        node,
         uid: rustix::process::getuid().as_raw(),
+        pending: Vec::new(),
+        swept: false,
+        ready: std::collections::VecDeque::new(),
+        given_up: 0,
       })
+    }
+
+    /// The pending handshakes' descriptors, and the nanoseconds until the earliest is due to be given up.
+    pub(super) fn pending(&self) -> (Vec<i32>, Option<u64>) {
+      use std::os::fd::AsRawFd;
+      let descriptors = self
+        .pending
+        .iter()
+        .map(|handshake| handshake.peer.as_raw_fd())
+        .collect();
+      let due = self
+        .pending
+        .iter()
+        .map(|handshake| super::CLAIM_WAIT_NS.saturating_sub(elapsed_ns(handshake.started)))
+        .min();
+      (descriptors, due)
     }
 
     pub(super) fn doorbell(&self) -> Option<&std::sync::atomic::AtomicU32> {
@@ -1104,124 +1388,212 @@ pub mod platform {
       Some(self.socket.as_raw_fd())
     }
 
-    /// Accepts the next pending connection and serves it. A failure of the accept itself is the
-    /// rendezvous's (the round ends); anything after it is that one connection's refusal (A-176).
+    /// Serves the listener a step: a pending handshake whose opening has come is completed (its handoff or its
+    /// refusal), one given up at the claim wait is reported, else a new connection is accepted and its exchange begun.
+    /// A failure of the accept itself is the rendezvous's (the round ends); anything after it is that one connection's
+    /// refusal (A-176). `None` once none of these has anything left, which ends the round.
     pub(super) fn accept_one(
       &mut self,
       assign: &mut dyn FnMut(u32) -> u32,
       make_region: &mut dyn FnMut(u32) -> Result<Prepared, IpcError>,
     ) -> Result<Option<Served>, IpcError> {
-      let peer = match rustix::net::accept_with(&self.socket, SocketFlags::CLOEXEC) {
+      if !self.swept {
+        self.sweep();
+        self.swept = true;
+      }
+      if let Some(handshake) = self.ready.pop_front() {
+        return Ok(Some(match serve(handshake, assign, make_region) {
+          Ok(accepted) => Served::Accepted(Box::new(accepted)),
+          Err(refusal) => Served::Refused(refusal),
+        }));
+      }
+      if self.given_up > 0 {
+        self.given_up = self.given_up.saturating_sub(1);
+        return Ok(Some(Served::Refused(IpcError::DeadlineExceeded)));
+      }
+      let peer = match rustix::net::accept_with(
+        &self.socket,
+        SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+      ) {
         Ok(fd) => fd,
-        Err(rustix::io::Errno::AGAIN) => return Ok(None),
-        Err(e) => return Err(refused("accept", e)),
+        Err(rustix::io::Errno::AGAIN) => {
+          self.swept = false;
+          return Ok(None);
+        }
+        Err(e) => {
+          self.swept = false;
+          return Err(refused("accept", e));
+        }
       };
-      Ok(Some(match self.serve(peer, assign, make_region) {
-        Ok(accepted) => Served::Accepted(Box::new(accepted)),
+      Ok(Some(match self.begin_handshake(peer) {
+        Ok(()) => Served::Pending,
         Err(refusal) => Served::Refused(refusal),
       }))
     }
 
-    /// Serves one accepted connection: its credentials, its hello, its region and the handoff. Every
-    /// failure here is this connection's alone, and the peer is told what it can be told.
-    fn serve(
-      &mut self,
-      peer: OwnedFd,
-      assign: &mut dyn FnMut(u32) -> u32,
-      make_region: &mut dyn FnMut(u32) -> Result<Prepared, IpcError>,
-    ) -> Result<Accepted, IpcError> {
+    /// Begins `peer`'s exchange: its user checked, the daemon's public key sent, and the connection kept among the
+    /// pending handshakes. Refused for a peer of another user, past [`pending_most`] (its socket closes, which its client
+    /// retries), or where the key cannot be made or sent.
+    fn begin_handshake(&mut self, peer: OwnedFd) -> Result<(), IpcError> {
       let cred = crate::peer::peer_credentials(peer.as_fd())?;
-      let uid = cred.uid;
-      if uid != self.uid {
-        return Err(IpcError::PeerRefused { uid });
+      if cred.uid != self.uid {
+        return Err(IpcError::PeerRefused { uid: cred.uid });
       }
-      let mut hello = [0u8; HELLO_BYTES];
-      let got =
-        rustix::net::recv(&peer, &mut hello, RecvFlags::empty()).map_err(|e| refused("recv", e))?;
-      let wanted = if got.0 == HELLO_BYTES {
-        u32::from_le_bytes(hello)
-      } else {
-        0
-      };
-      let client_id = assign(wanted);
-      let Prepared { region, kick_fd } = match make_region(client_id) {
-        Ok(prepared) => prepared,
-        // The bound is reached: the client is told so, typed — a handoff naming client `REFUSED_CLIENT`
-        // with the bound in the length word and no descriptors — where before the socket was dropped
-        // and the client read a short handoff it could not interpret (2026-09-14).
-        Err(IpcError::TooManyClients { limit }) => {
-          send_refusal(&peer, limit)?;
-          return Err(IpcError::TooManyClients { limit });
-        }
-        // Any other refusal of the region (one that could not be created): the client is told there is
-        // no region for it (a refusal with no bound), never left to read a closed socket.
-        Err(e) => {
-          send_refusal(&peer, super::NO_BOUND)?;
-          return Err(e);
-        }
-      };
-      // From here the client holds an id the daemon reserved: a failure is reported with that id so
-      // the daemon gives it back (`IpcError::HandoffLost`), never a reservation held for a client that
-      // was never seated.
-      let lost = |cause: IpcError| IpcError::HandoffLost {
-        client_id,
-        cause: Box::new(cause),
-      };
-      let (handoff, len) = region.handoff().map_err(lost)?;
-      let Handoff::Descriptor(raw) = handoff else {
-        return Err(lost(IpcError::Layout {
-          reason: "a Linux region hands off a descriptor",
-        }));
-      };
-      let kick = match kick_fd {
-        Some(fd) => rustix::io::dup(
-          // SAFETY: the caller's control shard is completing this handoff. The runtime
-          // keeps every shard's kick descriptor until all its shard threads have joined,
-          // so the eventfd stays open throughout this duplicate.
-          unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) },
-        )
-        .map_err(|e| lost(refused("dup", e)))?,
-        None => rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)
-          .map_err(|e| lost(refused("eventfd", e)))?,
-      };
-      // SAFETY: the number is the duplicate `handoff` created for a child to inherit; this
-      // process owns it and closes it after the send.
-      let region_fd = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(raw) };
-      let completion = rustix::event::eventfd(
-        0,
-        rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK,
-      )
-      .map_err(|e| lost(refused("eventfd", e)))?;
-      let mut body = [0u8; HANDOFF_BYTES];
-      body[HANDOFF_AT_CLIENT..HANDOFF_AT_LEN].copy_from_slice(&client_id.to_le_bytes());
-      body[HANDOFF_AT_LEN..].copy_from_slice(&u64::try_from(len).unwrap_or(u64::MAX).to_le_bytes());
-      let fds = [region_fd.as_fd(), completion.as_fd(), kick.as_fd()];
-      let mut space =
-        [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(HANDOFF_FDS))];
-      let mut control = SendAncillaryBuffer::new(&mut space);
-      control.push(SendAncillaryMessage::ScmRights(&fds));
-      rustix::net::sendmsg(
-        &peer,
-        &[IoSlice::new(&body)],
-        &mut control,
-        SendFlags::empty(),
-      )
-      .map_err(|e| lost(refused("sendmsg", e)))?;
-      Ok(Accepted {
-        client_id,
-        uid,
+      if self.pending.len().saturating_add(self.ready.len()) >= pending_most() {
+        return Err(IpcError::HandshakesFull {
+          limit: pending_most(),
+        });
+      }
+      let seal = seal::fresh()?;
+      let key = seal.public_key();
+      // A fresh socket's send buffer takes the key whole.
+      let sent =
+        rustix::net::send(&peer, &key, SendFlags::NOSIGNAL).map_err(|e| refused("send", e))?;
+      if sent != key.len() {
+        return Err(IpcError::Layout {
+          reason: "the daemon's public key was sent short",
+        });
+      }
+      self.pending.push(Handshake {
+        peer,
+        uid: cred.uid,
         pid: cred.pid,
-        region,
-        control: Some(Control {
-          socket: peer,
-          completion,
-        }),
-      })
+        seal,
+        opening: Vec::with_capacity(OPENING_BYTES),
+        started: std::time::Instant::now(),
+      });
+      Ok(())
+    }
+
+    /// Reads every pending handshake's opening once: those complete move to [`Self::ready`], those past the claim wait
+    /// are given up (their sockets closed, which their clients read as a daemon that did not answer), and those whose
+    /// clients have gone are dropped.
+    fn sweep(&mut self) {
+      let mut kept = Vec::with_capacity(self.pending.len());
+      for mut handshake in std::mem::take(&mut self.pending) {
+        match read_opening(&mut handshake) {
+          Opening::Complete => self.ready.push_back(handshake),
+          Opening::Due if elapsed_ns(handshake.started) < super::CLAIM_WAIT_NS => {
+            kept.push(handshake);
+          }
+          Opening::Due => self.given_up = self.given_up.saturating_add(1),
+          Opening::Gone => {}
+        }
+      }
+      self.pending = kept;
     }
   }
 
-  /// A claim in flight (AUD-29-19): the connected, non-blocking socket with the hello sent, the
-  /// handoff not yet received.
+  /// Serves one completed handshake: its key agreed, its hello opened, its region made and the handoff sent sealed.
+  /// Every failure here is this connection's alone, and the peer is told what it can be told.
+  fn serve(
+    handshake: Handshake,
+    assign: &mut dyn FnMut(u32) -> u32,
+    make_region: &mut dyn FnMut(u32) -> Result<Prepared, IpcError>,
+  ) -> Result<Accepted, IpcError> {
+    let Handshake {
+      peer,
+      uid,
+      pid,
+      seal,
+      opening,
+      ..
+    } = handshake;
+    let (key, sealed_hello) =
+      opening
+        .split_at_checked(PUBLIC_KEY_BYTES)
+        .ok_or(IpcError::Layout {
+          reason: "a short opening",
+        })?;
+    let key = <[u8; PUBLIC_KEY_BYTES]>::try_from(key).map_err(|_| IpcError::Layout {
+      reason: "a short public key",
+    })?;
+    let mut channel = seal.agree(&key, Role::Daemon)?;
+    let hello = channel.open(Class::Hello, sealed_hello)?;
+    let wanted = <[u8; HELLO_BYTES]>::try_from(hello.as_slice())
+      .map(u32::from_le_bytes)
+      .unwrap_or(0);
+    // The control socket blocks on its sends for its life, as it did before the exchange made the accept non-blocking.
+    rustix::io::ioctl_fionbio(&peer, false).map_err(|e| refused("ioctl(FIONBIO)", e))?;
+    let client_id = assign(wanted);
+    let Prepared { region, kick_fd } = match make_region(client_id) {
+      Ok(prepared) => prepared,
+      // The bound is reached: the client is told so, typed — a handoff naming client `REFUSED_CLIENT`
+      // with the bound in the length word and no descriptors — where before the socket was dropped
+      // and the client read a short handoff it could not interpret (2026-09-14).
+      Err(IpcError::TooManyClients { limit }) => {
+        send_refusal(&peer, channel.as_mut(), limit)?;
+        return Err(IpcError::TooManyClients { limit });
+      }
+      // Any other refusal of the region (one that could not be created): the client is told there is
+      // no region for it (a refusal with no bound), never left to read a closed socket.
+      Err(e) => {
+        send_refusal(&peer, channel.as_mut(), super::NO_BOUND)?;
+        return Err(e);
+      }
+    };
+    // From here the client holds an id the daemon reserved: a failure is reported with that id so
+    // the daemon gives it back (`IpcError::HandoffLost`), never a reservation held for a client that
+    // was never seated.
+    let lost = |cause: IpcError| IpcError::HandoffLost {
+      client_id,
+      cause: Box::new(cause),
+    };
+    let (handoff, len) = region.handoff().map_err(lost)?;
+    let Handoff::Descriptor(raw) = handoff else {
+      return Err(lost(IpcError::Layout {
+        reason: "a Linux region hands off a descriptor",
+      }));
+    };
+    let kick = match kick_fd {
+      Some(fd) => rustix::io::dup(
+        // SAFETY: the caller's control shard is completing this handoff. The runtime
+        // keeps every shard's kick descriptor until all its shard threads have joined,
+        // so the eventfd stays open throughout this duplicate.
+        unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) },
+      )
+      .map_err(|e| lost(refused("dup", e)))?,
+      None => rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)
+        .map_err(|e| lost(refused("eventfd", e)))?,
+    };
+    // SAFETY: the number is the duplicate `handoff` created for a child to inherit; this
+    // process owns it and closes it after the send.
+    let region_fd = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(raw) };
+    let completion = rustix::event::eventfd(
+      0,
+      rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK,
+    )
+    .map_err(|e| lost(refused("eventfd", e)))?;
+    let mut body = [0u8; HANDOFF_BYTES];
+    body[HANDOFF_AT_CLIENT..HANDOFF_AT_LEN].copy_from_slice(&client_id.to_le_bytes());
+    body[HANDOFF_AT_LEN..].copy_from_slice(&u64::try_from(len).unwrap_or(u64::MAX).to_le_bytes());
+    let fds = [region_fd.as_fd(), completion.as_fd(), kick.as_fd()];
+    let mut space =
+      [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(HANDOFF_FDS))];
+    let mut control = SendAncillaryBuffer::new(&mut space);
+    control.push(SendAncillaryMessage::ScmRights(&fds));
+    let sealed = channel.seal(Class::Handoff, &body).map_err(lost)?;
+    rustix::net::sendmsg(
+      &peer,
+      &[IoSlice::new(&sealed)],
+      &mut control,
+      SendFlags::NOSIGNAL,
+    )
+    .map_err(|e| lost(refused("sendmsg", e)))?;
+    Ok(Accepted {
+      client_id,
+      uid,
+      pid,
+      region,
+      control: Some(Control {
+        socket: peer,
+        completion,
+        seal: RefCell::new(channel),
+      }),
+    })
+  }
+
+  /// A claim in flight (AUD-29-19): the connected, non-blocking socket and where its sealed exchange stands (A-187).
   pub struct Claim {
     instance: String,
     /// The socket; taken once the claim is answered or refused.
@@ -1230,11 +1602,30 @@ pub mod platform {
     /// How long the handoff may take: the caller's restart bound, since a listening socket means a live daemon or the
     /// anchor holding the rendezvous across a restart (`super::begin_connect_as`).
     wait_ns: u64,
+    /// Where the exchange stands.
+    stage: Stage,
   }
 
-  /// Connects a non-blocking socket to the daemon's rendezvous and sends the hello; nothing waits (a
-  /// stream connect over `AF_UNIX` completes at once or is refused when the daemon's backlog is full).
+  /// Where a claim's exchange stands, daemon first (the module doc).
+  enum Stage {
+    /// Waiting for the daemon's public key: this side's half of the exchange, the id it wants, and the key's bytes
+    /// received so far.
+    AwaitingKey {
+      seal: Box<dyn RendezvousSeal>,
+      wanted: u32,
+      key: Vec<u8>,
+    },
+    /// The opening sent: waiting for the handoff, which opens under the channel the exchange agreed.
+    AwaitingHandoff { channel: Box<dyn SealedChannel> },
+    /// Answered or refused: nothing is left to read.
+    Spent,
+  }
+
+  /// Connects a non-blocking socket to the daemon's rendezvous; nothing waits (a stream connect over `AF_UNIX`
+  /// completes at once or is refused when the daemon's backlog is full), and nothing is sent until the daemon's key has
+  /// come. This side's half of the exchange is made first, so a process with no seal installed claims nothing.
   pub(super) fn begin(instance: &str, wanted: u32, wait_ns: u64) -> Result<Claim, IpcError> {
+    let seal = seal::fresh()?;
     let socket = rustix::net::socket_with(
       AddressFamily::UNIX,
       SocketType::STREAM,
@@ -1245,99 +1636,217 @@ pub mod platform {
     rustix::net::connect(&socket, &address(instance)?).map_err(|errno| {
       IpcError::DaemonUnavailable {
         endpoint: instance.to_owned(),
-        why: if errno == rustix::io::Errno::AGAIN {
-          "the rendezvous backlog is full (the daemon is not accepting)"
-        } else {
-          "the rendezvous socket refused the connection (no daemon listening)"
+        why: match errno {
+          rustix::io::Errno::AGAIN => {
+            "the rendezvous backlog is full (the daemon is not accepting)"
+          }
+          rustix::io::Errno::ACCESS => {
+            "the rendezvous socket file refused this user (its directory or node is another user's)"
+          }
+          _ => "the rendezvous socket refused the connection (no daemon listening)",
         },
       }
     })?;
-    // A fresh socket's send buffer takes the four-byte hello whole. A daemon that died between the connect
-    // and the hello is unavailable (retried), as at the handoff's receive.
-    rustix::net::send(&socket, &wanted.to_le_bytes(), SendFlags::empty()).map_err(|errno| {
-      match errno {
-        rustix::io::Errno::CONNRESET
-        | rustix::io::Errno::CONNREFUSED
-        | rustix::io::Errno::PIPE
-        | rustix::io::Errno::NOTCONN => IpcError::DaemonUnavailable {
-          endpoint: instance.to_owned(),
-          why: "the daemon closed the rendezvous before the claim was sent",
-        },
-        other => refused("send", other),
-      }
-    })?;
+    // The daemon is checked as it checks its clients: the listener's user must be this one, or the claim goes no further.
+    // An abstract name is anyone's to bind, so without this a process of another user could answer as the daemon.
+    let daemon = crate::peer::peer_credentials(socket.as_fd())?;
+    if daemon.uid != rustix::process::getuid().as_raw() {
+      return Err(IpcError::PeerRefused { uid: daemon.uid });
+    }
     Ok(Claim {
       instance: instance.to_owned(),
       socket: Some(socket),
       started: std::time::Instant::now(),
       wait_ns,
+      stage: Stage::AwaitingKey {
+        seal,
+        wanted,
+        key: Vec::with_capacity(PUBLIC_KEY_BYTES),
+      },
     })
   }
 
+  /// A handoff opened: its body, and the descriptors that came with it.
+  struct Opened {
+    body: Vec<u8>,
+    fds: Vec<OwnedFd>,
+  }
+
+  /// Whether `errno` says the daemon's end of the rendezvous is gone (killed with the claim still queued, or closing as
+  /// it did): a claim it never answered, which a reconnect retries, never a refusal that ends the caller's calls (found
+  /// on CI 2026-10-01: `OsRefused { call: "recvmsg", code: Some(104) }`).
+  fn daemon_left(errno: rustix::io::Errno) -> bool {
+    matches!(
+      errno,
+      rustix::io::Errno::CONNRESET
+        | rustix::io::Errno::CONNREFUSED
+        | rustix::io::Errno::PIPE
+        | rustix::io::Errno::NOTCONN
+    )
+  }
+
   impl Claim {
-    /// The handoff, without waiting: received and decoded when it has come; `None` while it is due
-    /// within the claim wait; unavailable past it, or when the daemon closed the socket unanswered.
+    /// The handoff, without waiting: the exchange advanced as far as what has come allows, and the handoff received and
+    /// decoded once it has come; `None` while it is due within the claim wait; unavailable past it, or when the daemon
+    /// closed the socket unanswered.
     pub(super) fn poll(&mut self) -> Result<Option<Connected>, IpcError> {
-      let Some(socket) = self.socket.as_ref() else {
-        return Err(IpcError::DaemonUnavailable {
+      let answer = self.advance();
+      if !matches!(answer, Ok(None)) {
+        self.socket = None;
+        self.stage = Stage::Spent;
+      }
+      answer
+    }
+
+    /// One step of the exchange: the opening sent once the daemon's key has come, then the handoff read.
+    fn advance(&mut self) -> Result<Option<Connected>, IpcError> {
+      if let Stage::AwaitingKey { .. } = self.stage {
+        if !self.read_key()? {
+          return self.due();
+        }
+        self.send_opening()?;
+      }
+      match std::mem::replace(&mut self.stage, Stage::Spent) {
+        Stage::AwaitingHandoff { mut channel } => match self.read_handoff(channel.as_mut())? {
+          Some(Opened { body, fds }) => {
+            let socket = self.socket.take().ok_or(IpcError::Layout {
+              reason: "the claim's socket was already taken",
+            })?;
+            decode_handoff(&self.instance, socket, &body, fds, channel).map(Some)
+          }
+          None => {
+            self.stage = Stage::AwaitingHandoff { channel };
+            self.due()
+          }
+        },
+        Stage::AwaitingKey { .. } | Stage::Spent => Err(IpcError::DaemonUnavailable {
           endpoint: self.instance.clone(),
           why: "the claim was already answered or refused",
+        }),
+      }
+    }
+
+    /// `None` while the claim wait lasts; unavailable past it.
+    fn due(&self) -> Result<Option<Connected>, IpcError> {
+      if elapsed_ns(self.started) < self.wait_ns {
+        return Ok(None);
+      }
+      Err(IpcError::DaemonUnavailable {
+        endpoint: self.instance.clone(),
+        why: "the daemon did not answer the claim within the claim wait",
+      })
+    }
+
+    /// The socket, while the claim lasts.
+    fn socket(&self) -> Result<&OwnedFd, IpcError> {
+      self.socket.as_ref().ok_or(IpcError::DaemonUnavailable {
+        endpoint: self.instance.clone(),
+        why: "the claim was already answered or refused",
+      })
+    }
+
+    /// The daemon closed the rendezvous before it answered.
+    fn left(&self) -> IpcError {
+      IpcError::DaemonUnavailable {
+        endpoint: self.instance.clone(),
+        why: "the daemon closed the rendezvous before answering the claim",
+      }
+    }
+
+    /// Reads what has come of the daemon's public key: whether all of it has.
+    fn read_key(&mut self) -> Result<bool, IpcError> {
+      let socket = self.socket()?;
+      let Stage::AwaitingKey { key, .. } = &self.stage else {
+        return Ok(true);
+      };
+      let want = PUBLIC_KEY_BYTES.saturating_sub(key.len());
+      let mut buffer = [0u8; PUBLIC_KEY_BYTES];
+      let room = buffer.get_mut(..want).ok_or(IpcError::Layout {
+        reason: "the daemon's key overran its length",
+      })?;
+      let got = match rustix::net::recv(socket, room, RecvFlags::DONTWAIT) {
+        Ok((0, _)) => return Err(self.left()),
+        Ok((got, _)) => got,
+        Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => return Ok(false),
+        Err(errno) if daemon_left(errno) => return Err(self.left()),
+        Err(errno) => return Err(refused("recv", errno)),
+      };
+      let Stage::AwaitingKey { key, .. } = &mut self.stage else {
+        return Ok(true);
+      };
+      key.extend_from_slice(buffer.get(..got).unwrap_or_default());
+      Ok(key.len() >= PUBLIC_KEY_BYTES)
+    }
+
+    /// Agrees with the daemon's key and sends the opening, this side's public key and its hello sealed, in one send;
+    /// the claim then waits for the handoff.
+    fn send_opening(&mut self) -> Result<(), IpcError> {
+      let Stage::AwaitingKey { seal, wanted, key } =
+        std::mem::replace(&mut self.stage, Stage::Spent)
+      else {
+        return Err(IpcError::Layout {
+          reason: "the opening was sent twice",
         });
       };
-      let mut body = [0u8; HANDOFF_BYTES];
+      let daemon_key =
+        <[u8; PUBLIC_KEY_BYTES]>::try_from(key.as_slice()).map_err(|_| IpcError::Layout {
+          reason: "the daemon's key is not one key long",
+        })?;
+      let public = seal.public_key();
+      let mut channel = seal.agree(&daemon_key, Role::Client)?;
+      let mut opening = Vec::with_capacity(OPENING_BYTES);
+      opening.extend_from_slice(&public);
+      opening.extend_from_slice(&channel.seal(Class::Hello, &wanted.to_le_bytes())?);
+      // A fresh socket's send buffer takes the opening whole.
+      let sent = match rustix::net::send(self.socket()?, &opening, SendFlags::NOSIGNAL) {
+        Ok(sent) => sent,
+        Err(errno) if daemon_left(errno) => return Err(self.left()),
+        Err(errno) => return Err(refused("send", errno)),
+      };
+      if sent != opening.len() {
+        return Err(IpcError::Layout {
+          reason: "the client's opening was sent short",
+        });
+      }
+      self.stage = Stage::AwaitingHandoff { channel };
+      Ok(())
+    }
+
+    /// Reads the handoff, sealed, with its descriptors, and opens it under `channel`: its body and the descriptors that
+    /// came with it, or `None` while it has not come.
+    fn read_handoff(&self, channel: &mut dyn SealedChannel) -> Result<Option<Opened>, IpcError> {
+      let mut sealed = [0u8; SEALED_HANDOFF_BYTES];
       let mut space =
         [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(HANDOFF_FDS))];
       let mut control = RecvAncillaryBuffer::new(&mut space);
-      match rustix::net::recvmsg(
-        socket,
-        &mut [IoSliceMut::new(&mut body)],
+      let received = match rustix::net::recvmsg(
+        self.socket()?,
+        &mut [IoSliceMut::new(&mut sealed)],
         &mut control,
         RecvFlags::CMSG_CLOEXEC | RecvFlags::DONTWAIT,
       ) {
-        Err(rustix::io::Errno::AGAIN) => {
-          let elapsed = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-          if elapsed < self.wait_ns {
-            return Ok(None);
-          }
-          self.socket = None;
-          Err(IpcError::DaemonUnavailable {
-            endpoint: self.instance.clone(),
-            why: "the daemon did not answer the claim within the claim wait",
-          })
-        }
-        Err(rustix::io::Errno::INTR) => Ok(None),
-        // The daemon went away with the claim still queued (killed before it accepted, or closing as it
-        // did): it never answered, which a reconnect retries — not a refusal that ends the caller's calls
-        // (found on CI 2026-10-01: `OsRefused { call: "recvmsg", code: Some(104) }`).
-        Err(
-          rustix::io::Errno::CONNRESET
-          | rustix::io::Errno::CONNREFUSED
-          | rustix::io::Errno::PIPE
-          | rustix::io::Errno::NOTCONN,
-        ) => {
-          self.socket = None;
-          Err(IpcError::DaemonUnavailable {
-            endpoint: self.instance.clone(),
-            why: "the daemon closed the rendezvous before answering the claim",
-          })
-        }
-        Err(e) => {
-          self.socket = None;
-          Err(refused("recvmsg", e))
-        }
-        Ok(received) => {
-          let socket = self.socket.take().ok_or(IpcError::Layout {
-            reason: "the claim's socket was already taken",
-          })?;
-          if received.bytes == 0 {
-            return Err(IpcError::DaemonUnavailable {
-              endpoint: self.instance.clone(),
-              why: "the daemon closed the rendezvous before answering the claim",
-            });
-          }
-          decode_handoff(&self.instance, socket, &body, received.bytes, &mut control).map(Some)
+        Ok(received) => received.bytes,
+        Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => return Ok(None),
+        Err(errno) if daemon_left(errno) => return Err(self.left()),
+        Err(errno) => return Err(refused("recvmsg", errno)),
+      };
+      // Taken before any check, so every descriptor a refused handoff carried is closed with it.
+      let mut fds: Vec<OwnedFd> = Vec::new();
+      for message in control.drain() {
+        if let RecvAncillaryMessage::ScmRights(iter) = message {
+          fds.extend(iter);
         }
       }
+      if received == 0 {
+        return Err(self.left());
+      }
+      if received != SEALED_HANDOFF_BYTES {
+        return Err(IpcError::Layout {
+          reason: "short handoff message",
+        });
+      }
+      let body = channel.open(Class::Handoff, &sealed)?;
+      Ok(Some(Opened { body, fds }))
     }
 
     /// Waits for the handoff between polls on the socket's readability, bounded by the claim wait.
@@ -1350,8 +1859,7 @@ pub mod platform {
         let Some(socket) = self.socket.as_ref() else {
           continue;
         };
-        let elapsed = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        let remaining = self.wait_ns.saturating_sub(elapsed);
+        let remaining = self.wait_ns.saturating_sub(elapsed_ns(self.started));
         let timeout = Timespec {
           tv_sec: i64::try_from(remaining / NS_PER_SECOND).unwrap_or(i64::MAX),
           tv_nsec: i64::try_from(remaining % NS_PER_SECOND).unwrap_or(0),
@@ -1368,38 +1876,33 @@ pub mod platform {
   /// Format: nanoseconds in a second, the unit split of a `poll` timeout.
   const NS_PER_SECOND: u64 = 1_000_000_000;
 
-  /// Decodes a received handoff of `received` bytes: the daemon's typed refusal, or the region, the
-  /// completion eventfd and the shard's kick, with `socket` kept as the control channel and the
-  /// liveness signal.
+  /// Decodes an opened handoff: the daemon's typed refusal, or the region, the completion eventfd and the shard's kick,
+  /// with `socket` kept as the control channel and the liveness signal, and `channel` as the seal its deliveries open
+  /// under (A-187).
   fn decode_handoff(
     instance: &str,
     socket: OwnedFd,
-    body: &[u8; HANDOFF_BYTES],
-    received: usize,
-    control: &mut RecvAncillaryBuffer<'_>,
+    body: &[u8],
+    mut fds: Vec<OwnedFd>,
+    channel: Box<dyn SealedChannel>,
   ) -> Result<Connected, IpcError> {
-    if received != HANDOFF_BYTES {
+    if body.len() != HANDOFF_BYTES {
       return Err(IpcError::Layout {
         reason: "short handoff message",
       });
     }
-    let mut client_word = [0u8; size_of::<u32>()];
-    client_word.copy_from_slice(&body[HANDOFF_AT_CLIENT..HANDOFF_AT_LEN]);
-    if u32::from_le_bytes(client_word) == REFUSED_CLIENT {
-      // The daemon's typed refusal: no region, the bound in the length word (any descriptor that
-      // came with it is closed with `control`).
-      let mut limit_word = [0u8; size_of::<u64>()];
-      limit_word.copy_from_slice(&body[HANDOFF_AT_LEN..HANDOFF_BYTES]);
+    let client_word = body
+      .get(HANDOFF_AT_CLIENT..HANDOFF_AT_LEN)
+      .and_then(|word| <[u8; size_of::<u32>()]>::try_from(word).ok())
+      .map_or(REFUSED_CLIENT, u32::from_le_bytes);
+    let len_word = word_at(body, HANDOFF_AT_LEN);
+    if client_word == REFUSED_CLIENT {
+      // The daemon's typed refusal: no region, the bound in the length word (any descriptor that came with it is closed
+      // with `fds`).
       return Err(super::refusal_of(
-        usize::try_from(u64::from_le_bytes(limit_word)).unwrap_or(usize::MAX),
+        usize::try_from(len_word).unwrap_or(usize::MAX),
         instance,
       ));
-    }
-    let mut fds: Vec<OwnedFd> = Vec::new();
-    for message in control.drain() {
-      if let RecvAncillaryMessage::ScmRights(iter) = message {
-        fds.extend(iter);
-      }
     }
     if fds.len() != HANDOFF_FDS {
       return Err(IpcError::Layout {
@@ -1415,16 +1918,17 @@ pub mod platform {
     let region_fd = fds.pop().ok_or(IpcError::Layout {
       reason: "no region fd",
     })?;
-    let mut len_word = [0u8; size_of::<u64>()];
-    len_word.copy_from_slice(&body[HANDOFF_AT_LEN..HANDOFF_BYTES]);
-    let len = usize::try_from(u64::from_le_bytes(len_word)).unwrap_or(0);
+    let len = usize::try_from(len_word).unwrap_or(0);
     let raw = std::os::fd::IntoRawFd::into_raw_fd(region_fd);
     let region = ClientRegion::open(&Handoff::Descriptor(raw), len)?;
     Ok(Connected {
       region,
       doorbell: Doorbell::Eventfd(kick),
       liveness: super::Liveness {
-        inner: Liveness { socket },
+        inner: Liveness {
+          socket,
+          seal: RefCell::new(channel),
+        },
       },
       control: Some(ClientControl { completion }),
     })
@@ -1450,22 +1954,7 @@ pub mod platform {
     #[test]
     fn a_mapping_delivery_hands_the_client_the_block_descriptor_and_its_bytes()
     -> Result<(), IpcError> {
-      let (daemon_socket, client_socket) = rustix::net::socketpair(
-        AddressFamily::UNIX,
-        SocketType::STREAM,
-        SocketFlags::CLOEXEC,
-        None,
-      )
-      .map_err(|e| super::refused("socketpair", e))?;
-      let completion = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)
-        .map_err(|e| super::refused("eventfd", e))?;
-      let control = Control {
-        socket: daemon_socket,
-        completion,
-      };
-      let liveness = Liveness {
-        socket: client_socket,
-      };
+      let (control, liveness) = channel()?;
 
       // An arena-block stand-in: a memfd holding a full block of known bytes, with the file's
       // authorized length shorter than the block (so the metadata's file length is exercised).
@@ -1545,22 +2034,7 @@ pub mod platform {
     #[test]
     fn a_descriptor_that_would_authorize_more_than_the_hand_off_is_never_sent()
     -> Result<(), IpcError> {
-      let (daemon_socket, client_socket) = rustix::net::socketpair(
-        AddressFamily::UNIX,
-        SocketType::STREAM,
-        SocketFlags::CLOEXEC,
-        None,
-      )
-      .map_err(|e| super::refused("socketpair", e))?;
-      let completion = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)
-        .map_err(|e| super::refused("eventfd", e))?;
-      let control = Control {
-        socket: daemon_socket,
-        completion,
-      };
-      let liveness = Liveness {
-        socket: client_socket,
-      };
+      let (control, liveness) = channel()?;
 
       // A sealed object of 8 KiB, standing in for an arena holding more than one volume's blocks.
       let object_bytes: u64 = 8192;
@@ -1741,13 +2215,17 @@ pub mod platform {
       .map_err(|e| super::refused("socketpair", e))?;
       let completion = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)
         .map_err(|e| super::refused("eventfd", e))?;
+      // Agreed under the stand-in seal, as a rendezvous agrees them under the real one (A-187).
+      let (daemon_seal, client_seal) = crate::toy_seal::channel_pair()?;
       Ok((
         Control {
           socket: daemon_socket,
           completion,
+          seal: std::cell::RefCell::new(daemon_seal),
         },
         Liveness {
           socket: client_socket,
+          seal: std::cell::RefCell::new(client_seal),
         },
       ))
     }
@@ -1821,37 +2299,73 @@ pub mod platform {
       Ok(())
     }
 
-    /// Hostile input on the client's side: a delivery of an unknown kind, and one of a known kind but the wrong
-    /// length, are refused `Layout`, and the descriptor each carried is closed in the client (its peer sees the end).
+    /// One way a hostile writer on the control socket might hand the client a delivery.
+    #[derive(Clone, Copy, Debug)]
+    enum Hostile {
+      /// The bytes of a stream delivery, unsealed: the wrong length to be one.
+      Unsealed,
+      /// A sealed delivery's length of bytes that were never sealed.
+      Forged,
+      /// Sealed by the daemon's own channel, of a kind no delivery has.
+      UnknownKind,
+      /// Sealed and sent second, after the first was taken off the socket unopened.
+      AfterADropped,
+    }
+
+    /// Hostile input on the client's side (A-135, A-161, A-187): a delivery that is not one sealed delivery long, one
+    /// that does not open, one that opens to an unknown kind, and one that arrives after another was dropped are each
+    /// refused, and the descriptor each carried is closed in the client (its peer sees the end). Do: each on a fresh
+    /// control socket. Expect: `Layout` for the unsealed one and the unknown kind, `SealRefused` for the forged one
+    /// and the one after a drop, whose count is not the next.
     #[test]
-    fn an_unknown_or_misshapen_delivery_is_refused_and_its_descriptor_closed()
+    fn an_unsealed_forged_unknown_or_dropped_delivery_is_refused_and_its_descriptor_closed()
     -> Result<(), IpcError> {
-      use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
-      let (control, liveness) = channel()?;
-      for (kind, length) in [(99u64, 24usize), (super::KIND_STREAM, 20)] {
+      for case in [
+        Hostile::Unsealed,
+        Hostile::Forged,
+        Hostile::UnknownKind,
+        Hostile::AfterADropped,
+      ] {
+        let (control, liveness) = channel()?;
         let (daemon_end, handed) = crate::stream::pair()?;
-        let mut body = vec![0u8; length];
-        super::put_words(&mut body, &[(0, kind)]);
-        let fds = [handed.as_fd()];
-        let mut space = [std::mem::MaybeUninit::<u8>::uninit();
-          rustix::cmsg_space!(ScmRights(super::DELIVERY_FDS))];
-        let mut ancillary = SendAncillaryBuffer::new(&mut space);
-        if !ancillary.push(SendAncillaryMessage::ScmRights(&fds)) {
-          return Err(IpcError::Layout {
-            reason: "the hostile delivery's descriptor did not fit",
-          });
+        match case {
+          Hostile::Unsealed => {
+            let mut body = [0u8; super::KIND_BYTES + super::STREAM_MSG_BYTES];
+            super::put_words(&mut body, &[(0, super::KIND_STREAM)]);
+            send_unsealed(&control, &body, handed.as_fd())?;
+          }
+          Hostile::Forged => {
+            send_unsealed(
+              &control,
+              &[0xa5; super::SEALED_DELIVERY_BYTES],
+              handed.as_fd(),
+            )?;
+          }
+          Hostile::UnknownKind => {
+            let mut body = [0u8; super::KIND_BYTES + super::STREAM_MSG_BYTES];
+            super::put_words(&mut body, &[(0, 99)]);
+            control.send_delivery(&body, handed.as_fd(), "sendmsg hostile")?;
+          }
+          Hostile::AfterADropped => {
+            let (_first_end, first) = crate::stream::pair()?;
+            control.send_stream(first.as_fd(), 1, 1)?;
+            control.send_stream(handed.as_fd(), 2, 2)?;
+            drop_one(&liveness)?;
+          }
         }
-        rustix::net::sendmsg(
-          &control.socket,
-          &[std::io::IoSlice::new(&body)],
-          &mut ancillary,
-          SendFlags::empty(),
-        )
-        .map_err(|e| super::refused("sendmsg", e))?;
         drop(handed);
-        if !matches!(liveness.recv_delivery(), Err(IpcError::Layout { .. })) {
+        let refusal = liveness.recv_delivery();
+        let as_expected = match case {
+          Hostile::Unsealed | Hostile::UnknownKind => {
+            matches!(refusal, Err(IpcError::Layout { .. }))
+          }
+          Hostile::Forged | Hostile::AfterADropped => {
+            matches!(refusal, Err(IpcError::SealRefused { .. }))
+          }
+        };
+        if !as_expected {
           return Err(IpcError::Layout {
-            reason: "a hostile delivery was taken",
+            reason: "a hostile delivery was taken, or refused for another reason than its own",
           });
         }
         let mut probe = [0u8; 1];
@@ -1860,6 +2374,209 @@ pub mod platform {
             reason: "a refused delivery's descriptor stayed open in the client",
           });
         }
+      }
+      Ok(())
+    }
+
+    /// Sends `body` as it is, unsealed, with `descriptor`, as a hostile writer on the control socket would.
+    fn send_unsealed(
+      control: &Control,
+      body: &[u8],
+      descriptor: std::os::fd::BorrowedFd<'_>,
+    ) -> Result<(), IpcError> {
+      use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
+      let fds = [descriptor];
+      let mut space = [std::mem::MaybeUninit::<u8>::uninit();
+        rustix::cmsg_space!(ScmRights(super::DELIVERY_FDS))];
+      let mut ancillary = SendAncillaryBuffer::new(&mut space);
+      if !ancillary.push(SendAncillaryMessage::ScmRights(&fds)) {
+        return Err(IpcError::Layout {
+          reason: "the hostile delivery's descriptor did not fit",
+        });
+      }
+      rustix::net::sendmsg(
+        &control.socket,
+        &[std::io::IoSlice::new(body)],
+        &mut ancillary,
+        SendFlags::empty(),
+      )
+      .map_err(|e| super::refused("sendmsg", e))?;
+      Ok(())
+    }
+
+    /// Takes one delivery off the client's socket without opening it, and drops it with its descriptor.
+    fn drop_one(liveness: &Liveness) -> Result<(), IpcError> {
+      use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags};
+      let mut sealed = [0u8; super::SEALED_DELIVERY_BYTES];
+      let mut space = [std::mem::MaybeUninit::<u8>::uninit();
+        rustix::cmsg_space!(ScmRights(super::DELIVERY_FDS))];
+      let mut ancillary = RecvAncillaryBuffer::new(&mut space);
+      rustix::net::recvmsg(
+        &liveness.socket,
+        &mut [std::io::IoSliceMut::new(&mut sealed)],
+        &mut ancillary,
+        RecvFlags::CMSG_CLOEXEC,
+      )
+      .map_err(|e| super::refused("recvmsg", e))?;
+      for message in ancillary.drain() {
+        if let RecvAncillaryMessage::ScmRights(descriptors) = message {
+          descriptors.for_each(drop);
+        }
+      }
+      Ok(())
+    }
+
+    /// A region for client `client_id` of a test's daemon end, named for this process and a count.
+    fn test_region(client_id: u32) -> Result<super::Prepared, IpcError> {
+      use std::sync::atomic::{AtomicU64, Ordering};
+      static MADE: AtomicU64 = AtomicU64::new(0);
+      let made = MADE.fetch_add(1, Ordering::Relaxed);
+      let geometry = crate::region::RegionGeometry {
+        slots: 16,
+        spin_ns: 100_000,
+        spin_shift: 4,
+        bulk_bytes: 4096,
+        page: u64::try_from(rustix::param::page_size()).map_err(|_| IpcError::Layout {
+          reason: "a page size wider than 64 bits",
+        })?,
+      };
+      Ok(super::Prepared {
+        region: crate::region::ClientRegion::create(
+          &format!("slates-a187-{}-{made}", std::process::id()),
+          client_id,
+          0,
+          geometry,
+        )?,
+        kick_fd: None,
+      })
+    }
+
+    /// A connected socket to `instance`'s rendezvous that speaks only when the test makes it.
+    fn raw_claimant(instance: &str) -> Result<OwnedFd, IpcError> {
+      let socket = rustix::net::socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC,
+        None,
+      )
+      .map_err(|e| super::refused("socket", e))?;
+      rustix::net::connect(&socket, &super::address(instance)?)
+        .map_err(|e| super::refused("connect", e))?;
+      Ok(socket)
+    }
+
+    /// Reads `bytes.len()` bytes from `socket`, waiting: how many came before its end.
+    fn read_whole(socket: &OwnedFd, bytes: &mut [u8]) -> Result<usize, IpcError> {
+      let mut got = 0;
+      while let Some(room) = bytes.get_mut(got..).filter(|room| !room.is_empty()) {
+        match rustix::net::recv(socket, room, rustix::net::RecvFlags::empty()) {
+          Ok((0, _)) => break,
+          Ok((read, _)) => got += read,
+          Err(rustix::io::Errno::INTR) => {}
+          Err(e) => return Err(super::refused("recv", e)),
+        }
+      }
+      Ok(got)
+    }
+
+    /// A-187 (§4.7 "Rendezvous"): a claimant that never sends its opening holds no round. Do: connect a socket that
+    /// neither reads nor sends, then begin an honest claim, and serve rounds while polling the claim. Expect: the
+    /// honest claim connects while the silent one is still pending (the listener names its descriptor), the silent one
+    /// is given up once, no sooner than the claim wait, and its socket reads the daemon's public key and then its end.
+    /// Before A-187 the daemon read each claimant's hello with a blocking receive, and a silent claimant held the round,
+    /// and every claimant behind it, for as long as it stayed silent.
+    #[test]
+    fn a_claimant_that_never_sends_its_opening_holds_no_round() -> Result<(), IpcError> {
+      use std::time::{Duration, Instant};
+      crate::toy_seal::install();
+      let instance = format!("test-silent-{}", std::process::id());
+      let mut listener = super::super::Listener::open(&instance, None)?;
+      let silent = raw_claimant(&instance)?;
+      let mut claim = super::super::begin_connect_as(&instance, 0, super::super::CLAIM_WAIT_NS)?;
+      let started = Instant::now();
+      let give_up_by = Duration::from_nanos(super::super::CLAIM_WAIT_NS.saturating_mul(2));
+      let mut refusals = Vec::new();
+      let mut accepted = Vec::new();
+      let mut connected_at = None;
+      let mut pending_while_connected = 0;
+      while started.elapsed() < give_up_by && (connected_at.is_none() || refusals.is_empty()) {
+        let round = listener.accept_pending(&|_| false, &mut test_region, &mut |refusal| {
+          refusals.push((refusal, started.elapsed()));
+        });
+        accepted.extend(round.accepted);
+        if connected_at.is_none() && claim.poll()?.is_some() {
+          connected_at = Some(started.elapsed());
+          pending_while_connected = listener.pending().0.len();
+        }
+      }
+      let Some(connected_at) = connected_at else {
+        return Err(IpcError::Layout {
+          reason: "the honest claim was never served beside the silent one",
+        });
+      };
+      let [(IpcError::DeadlineExceeded, given_up_at)] = refusals.as_slice() else {
+        return Err(IpcError::Layout {
+          reason: "the silent claimant was not given up once at the claim wait",
+        });
+      };
+      let mut key = [0u8; crate::seal::PUBLIC_KEY_BYTES + 1];
+      let read = read_whole(&silent, &mut key)?;
+      let shaped = accepted.len() == 1
+        && pending_while_connected == 1
+        && connected_at < *given_up_at
+        && *given_up_at >= Duration::from_nanos(super::super::CLAIM_WAIT_NS)
+        && listener.pending().0.is_empty()
+        && read == crate::seal::PUBLIC_KEY_BYTES;
+      if !shaped {
+        return Err(IpcError::Layout {
+          reason: "the silent claimant held the round, or was not given up at the claim wait",
+        });
+      }
+      Ok(())
+    }
+
+    /// A-187: an opening that does not open is refused and asks for no region. Do: connect a raw claimant, let a round
+    /// send it the daemon's key, and answer with a public key and a hello sealed under a channel agreed with another
+    /// key. Expect: the next round refuses it `SealRefused` without asking for a region, and closes its socket.
+    #[test]
+    fn an_opening_that_does_not_open_is_refused_and_asks_for_no_region() -> Result<(), IpcError> {
+      crate::toy_seal::install();
+      let instance = format!("test-forged-{}", std::process::id());
+      let mut listener = super::super::Listener::open(&instance, None)?;
+      let forger = raw_claimant(&instance)?;
+      let mut regions_asked = 0u32;
+      let mut refusals = Vec::new();
+      let mut serve = |listener: &mut super::super::Listener, refusals: &mut Vec<IpcError>| {
+        listener.accept_pending(
+          &|_| false,
+          &mut |client_id| {
+            regions_asked += 1;
+            test_region(client_id)
+          },
+          &mut |refusal| refusals.push(refusal),
+        )
+      };
+      let begun = serve(&mut listener, &mut refusals);
+      let mut key = [0u8; crate::seal::PUBLIC_KEY_BYTES];
+      let read = read_whole(&forger, &mut key)?;
+      let (_, mut elsewhere) = crate::toy_seal::channel_pair()?;
+      let mut opening = crate::toy_seal::make()?.public_key().to_vec();
+      opening.extend_from_slice(&elsewhere.seal(crate::seal::Class::Hello, &0u32.to_le_bytes())?);
+      rustix::net::send(&forger, &opening, rustix::net::SendFlags::NOSIGNAL)
+        .map_err(|e| super::refused("send", e))?;
+      let refused = serve(&mut listener, &mut refusals);
+      let mut rest = [0u8; 1];
+      let after = read_whole(&forger, &mut rest)?;
+      let shaped = begun.accepted.is_empty()
+        && refused.accepted.is_empty()
+        && read == crate::seal::PUBLIC_KEY_BYTES
+        && matches!(refusals.as_slice(), [IpcError::SealRefused { .. }])
+        && regions_asked == 0
+        && after == 0;
+      if !shaped {
+        return Err(IpcError::Layout {
+          reason: "an opening that does not open was served, or not refused as one",
+        });
       }
       Ok(())
     }
@@ -2508,6 +3225,11 @@ pub mod platform {
       None
     }
 
+    /// No handshakes wait here: a claim is answered in the bootstrap object, whole, in the round that finds it.
+    pub(super) fn pending(&self) -> (Vec<i32>, Option<u64>) {
+      (Vec::new(), None)
+    }
+
     pub(super) fn accept_one(
       &mut self,
       assign: &mut dyn FnMut(u32) -> u32,
@@ -2977,6 +3699,9 @@ pub mod platform {
       match served {
         Some(Served::Accepted(accepted)) => Ok(Some(*accepted)),
         Some(Served::Refused(refusal)) => Err(refusal),
+        Some(Served::Pending) => Err(IpcError::Layout {
+          reason: "the bootstrap object begins no handshake: a claim is answered whole",
+        }),
         None => Ok(None),
       }
     }
@@ -3149,6 +3874,10 @@ pub mod platform {
 
     pub(super) fn raw_fd(&self) -> Option<i32> {
       None
+    }
+
+    pub(super) fn pending(&self) -> (Vec<i32>, Option<u64>) {
+      (Vec::new(), None)
     }
 
     pub(super) fn accept_one(

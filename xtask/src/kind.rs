@@ -1297,6 +1297,16 @@ impl Lane {
   /// `install`: the chart installed or upgraded at `replicas`, with a netem profile when given, then the
   /// rollout waited for (readiness is `slates status` on every pod). Returns the elapsed time.
   fn install(&self, replicas: u64, netem: Option<&Shaping>) -> Result<Duration, Failure> {
+    self.install_with(replicas, netem, &[])
+  }
+
+  /// [`Self::install`] with `values` (`key=value` pairs) set on top of the lane's own.
+  fn install_with(
+    &self,
+    replicas: u64,
+    netem: Option<&Shaping>,
+    values: &[String],
+  ) -> Result<Duration, Failure> {
     let started = Instant::now();
     let chart = self.root.join("deploy/helm/slates");
     let lane_values = self.root.join("deploy/kind/values-lane.yaml");
@@ -1349,6 +1359,9 @@ impl Lane {
           format!("netem.delays.{ordinal}={delay}"),
         ]);
       }
+    }
+    for value in values {
+      args.extend(["--set".to_owned(), value.clone()]);
     }
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
     stream("helm", &borrowed)?;

@@ -11319,6 +11319,33 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     re-witness asks the host's clock as a copy-up does (A-162).
   - A racy witness never settles: after a re-hash past its tick confirms it, the fingerprint alone would do, but every
     drift check of it still hashes the whole file.
+- **A workload in a network namespace of its own reaches the daemon (A-187, 2026-10-29): built; proven on arm64
+  Linux; its Docker and Kubernetes cells' first runs owed to CI.**
+  - **What:** Linux's rendezvous was an abstract socket, which the kernel scopes to a network namespace, so a pod of
+    its own or a container on a bridge network could not reach the daemon, and the DAX matrix's Docker and Kubernetes
+    socket-route cells held only for a workload in the daemon's namespace. An instance named by an absolute path is now
+    reached at a socket file in that directory (the chart's `rendezvous.directory` and `rendezvous.hostPath`), and
+    every rendezvous, abstract or file, is sealed: an X25519 exchange, a key per direction by HKDF-SHA256, AES-256-GCM
+    per message (`crates/seal`, aws-lc-rs, installed into `slates-ipc` through `slates_ipc::seal`). The exchange is
+    daemon first and blocks neither side, so a claimant that never sends its opening no longer holds the round: before,
+    the daemon read each hello with a blocking receive. The client checks the listener's user.
+  - **Proven** (arm64 Linux in a container on this Mac, 2026-10-28): the seal's 8 tests; the ipc crate's 29 module
+    tests and 22 rendezvous tests, sealed; a client under `unshare --user --map-current-user --net` mapping a file read
+    and write through the socket file while it finds no daemon at an abstract name (`net 4026533850 abstract
+    unavailable len 65536 mapped 65536 shows true wrote 42`); the client suite, `reap_map` and `reap` over the real
+    seal. The Mac's ipc and seal tests, and the Windows and musl cross lints of `slates-ipc`, clean.
+  - **Red-checked:** eight mutants, each failing its guard (A-187 lists them).
+  - **Owed:**
+    - The first runs of the Docker bridge-network test (`a_container_on_a_bridge_network_maps_a_slates_file_read_and_write_through_the_socket_file`,
+      CI's arm64 lane) and the KIND lane's step 6, a pod of its own on pod 0's node mounting the directory read-only
+      (CI's KIND job). Both were written after Docker Desktop on this Mac was quit (2026-10-28 23:34, from its own
+      window, `/app/quit` in its log), so neither has run.
+    - A run on Linux x86_64 (queued on adacachy, starved under its CPU cap, and CI).
+    - The exchange's cost per connect, measured: an A/B against A-186's tree was cut off after its first round.
+    - A namespace whose Pod Security admission forbids hostPath volumes cannot mount the directory. A CSI driver serving
+      the socket as an inline volume would, as SPIFFE's driver does for its agent's socket.
+    - The client's check of the listener's user is tested only as root (a listener of another user needs root to
+      start), so CI's runners skip it loudly.
 - **The direct map writes (A-186, 2026-10-28): built, and proven by real clients on Linux x86_64, macOS arm64 and
   Windows x86_64.**
   - **What:** `MapWrite` maps a file read and write under the caller's own write attachment. The daemon makes the

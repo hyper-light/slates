@@ -3834,14 +3834,32 @@ SDK) travel through a per-client bulk region referenced by offset from a slot.
 > The local delayed-accept regression fails before and passes after the change; the traced
 > startup assertion remains unchanged. See the dated startup/kick-retirement bug report.
 
-**Rendezvous.** Linux: connect to the abstract-namespace socket `@slates/<uid>/<instance>`, the
-daemon checks `SO_PEERCRED`, sends the region fd with `SCM_RIGHTS`, and both sides close the
-socket (kept only as the control channel). macOS: `shm_open` on a name prefixed with the app group (`<team id>.slates/` plus a uid hash,
+**Rendezvous.** Linux: connect to the abstract-namespace socket `@slates/<uid>/<instance>`, or, for an instance
+named by an absolute path, the socket file in that path's directory (A-187); each side checks the other's
+`SO_PEERCRED`; the daemon sends an ephemeral public key, the client answers with its own and its hello sealed, and the
+daemon sends the region fd with `SCM_RIGHTS` beside the sealed handoff; the socket stays as the control channel, every
+delivery on it sealed. macOS: `shm_open` on a name prefixed with the app group (`<team id>.slates/` plus a uid hash,
 kept within the 31-character limit), `mode 0600`, so the sandboxed FSKit extension can open the
 same object; the client claims a slot by CAS in the bootstrap block; an optional control socket
 for streams. Windows: open `Local\slates-<sid-hash>` section and the per-slot `Local\...` Event
 (DACL to the user's SID); optional named pipe for streams. Discovery: `SLATES_ENDPOINT`, then the
 well-known name.
+
+> **Status (2026-10-29, A-187): every Linux rendezvous is sealed, and a socket file reaches a workload in a network
+> namespace of its own.** The exchange is daemon first and never blocks: the daemon accepts, checks the peer's user,
+> sends its X25519 public key and keeps the connection among at most `BACKLOG` pending handshakes; the client's poll
+> answers with its key and its hello sealed; the daemon's next round, woken by that connection's readiness, agrees,
+> opens the hello and sends the handoff sealed (`slates_ipc::seal`, implemented by `crates/seal` with aws-lc-rs). A
+> claimant that never sends its opening is given up at the claim wait and holds no round: before, the daemon read each
+> hello with a blocking receive, and one silent claimant held every claim behind it. The client checks the listener's
+> user too, since an abstract name is anyone's to bind. An instance named `<directory>/<name>` is reached at
+> `<directory>/slates-rv-<name>.sock`, bound only in a directory of the daemon's user's alone, owner-only, a dead
+> owner's node replaced, removed by whoever bound it. Proven on arm64 Linux (2026-10-28, in a container on this Mac):
+> a client in a user and network namespace of its own (`unshare`) maps a file read and write by the direct map through
+> the socket file while it finds no daemon at the abstract name, and every rendezvous test passes sealed; eight mutants
+> each fail their guard. The chart takes the directory as `rendezvous.directory` and `rendezvous.hostPath`. Owed: the
+> first runs of the Docker bridge-network test and the KIND lane's pod of its own (CI), and the exchange's measured
+> cost per connect.
 
 > **Status (2026-10-27): a peer the daemon cannot see by pid is served.** Linux reports a socket peer's process id as
 > the reader's pid namespace sees it, and 0 for a process outside it: a client in a container of a pod beside the
@@ -12444,6 +12462,71 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
 - **Proven** on jupiter (Windows 10.0.26200), 2026-10-25, and red-checked (§4.6 status); CI's two x86_64 Windows lanes run the same tests on every push to main.
 - **Measured** the same day (BENCHMARKS, "Copy-once-map-many against copy-per-read", jupiter): a steady mapped read costs 1.4 % to 2.6 % of a copy read; the hand-off's setup is 28 to 56 µs at 4 KiB, repaid after 2 or 3 reads, and from 1 MiB the whole setup costs less than one copy read.
 - **Owed:** arm64 Windows; replies that stalled on Windows with many daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
+
+### A-187 — A client in its own network namespace reaches the daemon through a socket file, every rendezvous sealed (accepted 2026-10-28; built 2026-10-29)
+Applied in the same change to: §4.7 (the rendezvous paragraph and its status), GAPS, `docs/wip/virtiofs.md` §8 (the
+Docker and Kubernetes socket-route cells), `crates/ipc` (`seal.rs`: the interface, `Role`, `Class`, `install`, `fresh`;
+`rendezvous.rs`: the Linux address (`node`, `bind_node`, `owner_only`), the daemon-first exchange (`Handshake`, the
+round's `sweep`, `serve`), the client's `Claim` stages, sealed deliveries, `Listener::pending`, `Served::Pending`;
+`error.rs`: `SealRefused`, `HandshakesFull`; `tests/support/toy_seal.rs`, the stand-in both test kinds share), the new
+`crates/seal` (aws-lc-rs: X25519, HKDF-SHA256, AES-256-GCM, RFC vectors and golden messages), `crates/server`
+(`daemon.rs`: the seal installed before the listener opens; the rendezvous wait also on pending handshakes and their
+deadline), `crates/client` (`install_seal`; `tests/netns.rs`), `crates/cli` (the probe's `reach` mode; the bridge-network
+container test), the chart (`rendezvous.directory`, `rendezvous.hostPath`) and `xtask/src/kind_direct.rs` (step 6, a pod
+of its own).
+- **What it answers.** The DAX matrix's Kubernetes and Docker socket-route cells are proven only for a workload in the
+  daemon's network namespace: a container of the daemon's pod, or `docker run --network host`. Linux's rendezvous is an
+  abstract socket, which the kernel scopes to a network namespace (unix(7)), so a pod with a namespace of its own, or
+  a container on a bridge network, cannot reach it. A socket file can be reached through a mount, and Ada authorized
+  socket files for DAX when what crosses them is encrypted end to end and at rest (2026-10-22).
+- **The address.** When the operator names a rendezvous directory, the daemon's listener is a socket file there instead
+  of the abstract name, and a client given the same directory connects to it; with none, the abstract name, as now.
+  The address is configuration, like the instance's name, and carried by it: an instance named by an absolute path,
+  `<directory>/<name>`, is reached at `<directory>/slates-rv-<name>.sock`, any other at the abstract name; the protocol
+  over either is one. The directory must be the daemon's user's alone (owned by it, no permission for group or
+  others), checked before the bind, as macOS's route checks its directory; the node is owner-only, a node a dead
+  daemon left is found unanswered and replaced, a live owner's is refused as the abstract name's is (`EADDRINUSE`),
+  and it is removed by whoever bound it: the anchor, which holds the listener across daemon restarts as it holds the
+  abstract one (A-114), or a daemon run alone. A workload mounts the directory read-only, so it can connect but cannot
+  replace the node: a Unix socket's connect asks only the node's permission, which a read-only bind mount leaves.
+- **Every rendezvous is sealed**, abstract or file, so there is one exchange and no plain mode: each side sends an
+  ephemeral X25519 public key, both derive one key per direction by HKDF-SHA256 from the shared secret, salted with
+  both public keys, and every later message (the hello, the handoff, every delivery) is sealed with AES-256-GCM under
+  its direction's key at a counter nonce, its kind as additional data. A descriptor rides beside its sealed message
+  (`SCM_RIGHTS` carries kernel objects, not bytes). Each side checks the other's user by `SO_PEERCRED` as the daemon
+  checks a client's now. Nothing crosses at rest: a socket file holds no bytes.
+- **Where the seal lives.** `slates-ipc` builds for targets with no C toolchain (CI's cross-lint), so it takes the seal
+  from its caller through a small interface, and a crate of its own implements it with aws-lc-rs, the one crypto
+  library (A-66); the daemon and the client supply it. A second crypto library in ipc was the alternative, rejected for
+  A-66's reason.
+- **The exchange never blocks either side.** The daemon speaks first: it accepts, checks the peer's user, sends its
+  public key and keeps the connection pending; the client answers with its public key and its hello sealed, in one
+  send; the daemon's next round, woken by that socket's readiness or the earliest pending deadline, agrees, opens the
+  hello and sends the handoff sealed. A round reads each pending handshake once. At most `BACKLOG` handshakes are
+  pending, one more is refused `HandshakesFull` (its socket closed, which its client retries), and one whose opening
+  has not come within the claim wait is given up. The client checks the listener's user as the daemon checks the
+  client's, since an abstract name is anyone's to bind.
+- **Proven** (arm64 Linux in a container on this Mac, rust 1.98.1, 2026-10-28; the Mac and the Windows and musl cross
+  lints the same day):
+  - the seal's 8 tests (RFC 7748 and RFC 5869 vectors, golden messages, tampered, replayed and reordered messages
+    refused);
+  - the ipc crate's 29 module tests and the rendezvous suite's 22, every exchange sealed: a silent claimant given up
+    at the claim wait while an honest claim beside it connects, a forged opening refused asking for no region, an
+    unsealed, forged, unknown or dropped delivery refused with its descriptor closed, a process with no seal claiming
+    nothing, a listener of another user refused by the client (run as root), a shared directory refused, a dead
+    owner's node replaced and a live one's kept;
+  - a client in a user and network namespace of its own (`unshare --user --map-current-user --net`) mapping a 64 KiB
+    file read and write by the direct map through the socket file, its sync writing the 42 stored bytes back, while
+    its claim on a daemon at an abstract name this process reaches finds none;
+  - the client suite's 30 tests, `reap_map` and `reap`, over the real seal.
+- **Red-checked:** eight mutants each fail their guard: the socket file read as an abstract name (the namespaced
+  client finds no daemon), no give-up, no check of the listener's user, the hello used unopened, a delivery parsed
+  unopened, the rendezvous wait blind to pending handshakes (every connect took 1.001 s to 1.012 s, against a bound of
+  100 ms), any directory accepted, a live owner's node replaced.
+- **Owed:** the first runs of the Docker bridge-network test (CI's arm64 lane) and the KIND lane's step 6 (CI's KIND
+  job); a run on Linux x86_64; the exchange's measured cost per connect (the A/B was cut off after its first round);
+  a namespace whose Pod Security admission forbids hostPath volumes cannot mount the directory (a CSI driver serving it
+  as an inline volume, as SPIFFE's does for its agent's socket, would).
 
 ### A-186 — The direct map maps a file read and write: the client's stores are compared back into the file at its sync points (accepted 2026-10-28)
 Applied in the same change to: §4.6 (the same-kernel direct map paragraph and its status, the DAX matrix status), GAPS, `docs/wip/virtiofs.md` §8, `crates/mem` (`dax_object.rs`: `PeerAccess`, `PeerObject::create` taking it, `PeerObject::access` and `read_write_handle`, `PeerWriteView` on every platform, `within_view`; `tests/peer_object.rs`, `tests/peer_section.rs`), `crates/ipc` (`protocol.rs`: `RequestBody::MapWrite` and `MapSync`, `ReplyBody::MapSynced`, `Refusal::MapsHeld`, appended; `rendezvous.rs`: `Mapping`, the Linux judge by access and its writable test; `route.rs`: `confined_map`, replacing `confined_read_only`; `handle_route.rs`: `confined_section` and `hand_section` by access), `crates/vfs` (`shards_backing.rs`: a writable copy's ranges marked writable, `is_attached`, `BackingObject::peer_handle` replacing `read_only_handle`), `crates/bridge-core` (`dax_backing.rs`: `write_back_slice` and `WroteBack`, the one compare-back, which the ingest now calls), `crates/server` (`direct_map.rs`: `HeldMap`, `map_write`, `map_sync`, `Sync`, the writable release, `write_back_for_reap`, `defer_task`, `complete` shared; `fs_verbs.rs`: `with_writer`, `writable_file`; `verbs.rs`: the verbs' dispatch, the detach's `MapsHeld`, the refusal's ledger name; `reap.rs`; `state.rs`), `crates/client` (`MappedWrite`, `map_write`, `map_sync`, `release_map_write`; `tests/client.rs`, `tests/reap_map.rs`).

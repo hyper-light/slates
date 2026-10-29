@@ -56,8 +56,16 @@ pub mod peer;
 pub mod protocol;
 pub mod region;
 pub mod rendezvous;
+pub mod seal;
+// The stand-in seal this crate's own tests rendezvous under (A-187), one file shared with the integration tests, which
+// name this crate as `slates_ipc`; so do the module tests, through the alias.
+#[cfg(test)]
+extern crate self as slates_ipc;
 #[cfg(target_os = "macos")]
 pub mod route;
+#[cfg(test)]
+#[path = "../tests/support/toy_seal.rs"]
+pub(crate) mod toy_seal;
 
 pub mod slot;
 pub mod status;

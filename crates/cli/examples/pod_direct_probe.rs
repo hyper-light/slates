@@ -14,6 +14,8 @@
 //!   `slates attach`, `slates write` and `slates detach` races that sweep (met by the lane on a loaded machine,
 //!   2026-10-27: the detach answered `NotFound`).
 //! - `map VOLUME PATH LEN FILL` maps the file by the direct map and prints `direct-map: zero_copy=BOOL whole=BOOL len=N`.
+//! - `reach` connects and prints `direct-reach: connected`, or `direct-reach: unavailable` when no daemon answers the
+//!   claim, or the refusal: whether the instance can be reached from where the probe runs at all (A-187).
 //! - `map-write VOLUME PATH LEN FILL` attaches for writing, maps the file read and write by the direct map (A-186),
 //!   stores [`STORED`] across the first page's end, syncs, releases and detaches, then reads the file back. It prints
 //!   `direct-map-write: differing=N synced=N released=N whole=BOOL`: the stored bytes that differ from the file, the
@@ -25,7 +27,8 @@
 //! stored; 2 when the probe could not run. Test infrastructure, built into the lane's probe
 //! image (`deploy/kind/pod-probe.Dockerfile`) and never shipped.
 //!
-//! Run: `slates-pod-direct-probe (write | map | map-write) VOLUME PATH LEN FILL` in a container of the daemon's pod.
+//! Run: `slates-pod-direct-probe (write | map | map-write) VOLUME PATH LEN FILL` or `slates-pod-direct-probe reach` in a
+//! container of the daemon's pod, or in a pod of its own with the rendezvous directory mounted (A-187).
 
 use std::process::ExitCode;
 
@@ -39,6 +42,8 @@ const MAP_TAG: &str = "direct-map:";
 const WRITE_TAG: &str = "direct-write:";
 /// Format: the tag of the map-write mode's one line, which the lane looks for.
 const MAP_WRITE_TAG: &str = "direct-map-write:";
+/// Format: the tag of the reach mode's one line, which the lane looks for.
+const REACH_TAG: &str = "direct-reach:";
 /// Format: what the map-write mode stores through its map, beginning [`BEFORE_PAGE`] bytes before the first page's end,
 /// so the store crosses a page boundary.
 const STORED: &[u8] = b"stored in place by a process in a pod";
@@ -61,10 +66,11 @@ fn main() -> ExitCode {
     Some((mode, rest)) if mode == "write" => (WRITE_TAG, write(rest).map(|()| true)),
     Some((mode, rest)) if mode == "map" => (MAP_TAG, map(rest)),
     Some((mode, rest)) if mode == "map-write" => (MAP_WRITE_TAG, map_write(rest)),
+    Some((mode, [])) if mode == "reach" => (REACH_TAG, reach().map(|()| true)),
     _ => (
       MAP_TAG,
       Err(format!(
-        "usage: slates-pod-direct-probe (write | map | map-write) VOLUME PATH LEN FILL (given {args:?})"
+        "usage: slates-pod-direct-probe (write | map | map-write) VOLUME PATH LEN FILL, or reach (given {args:?})"
       )),
     ),
   };
@@ -109,6 +115,22 @@ fn connect() -> Result<Client, String> {
   let instance = slates_ipc::rendezvous::instance_from_env();
   let deadlines = Deadlines::derive(LIVENESS_BUDGET_NS, RECOVERY_BUDGET_NS).get();
   Client::connect(&instance, deadlines).map_err(|e| format!("connect to {instance:?}: {e}"))
+}
+
+/// The reach mode (A-187): whether a claim on the daemon the environment names is answered from here, printed as the
+/// tagged line. Any outcome is the probe's answer, so only a line that could not be printed is a failure.
+fn reach() -> Result<(), String> {
+  let instance = slates_ipc::rendezvous::instance_from_env();
+  let deadlines = Deadlines::derive(LIVENESS_BUDGET_NS, RECOVERY_BUDGET_NS).get();
+  let reached = match Client::connect(&instance, deadlines) {
+    Ok(_) => "connected".to_owned(),
+    Err(slates_client::ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. })) => {
+      "unavailable".to_owned()
+    }
+    Err(other) => format!("refused {other}"),
+  };
+  println!("{REACH_TAG} {reached}");
+  Ok(())
 }
 
 /// The write mode: attaches for writing, writes the file and detaches, as one client, and prints the tagged line.

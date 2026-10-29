@@ -435,6 +435,11 @@ pub static RECOVERY_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 /// (`init_shard`), since a shard without them serves nothing.
 /// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
 const LOOP_SPAWN_REFUSED: &str = "daemon.loop_spawn";
+/// Format: the status refusal under which the rendezvous loop counts a pending handshake's readiness wait the driver
+/// refused (§4.7, A-187): that handshake is then served at the earliest handshake's deadline rather than on its
+/// opening's arrival.
+#[cfg(target_os = "linux")]
+const HANDSHAKE_WAIT_REFUSED: &str = "daemon.handshake_wait";
 /// Format: the status refusal under which a shard counts a volume it could not image for a publish (§4.8): the
 /// rest of the shard still publishes, the volume gets no stable acknowledgement, and recovery refuses it. Per
 /// shard, so each daemon's status and `refusals_on_every_shard` show it (until 2026-10-01 a process-wide
@@ -729,7 +734,10 @@ impl Daemon {
         }
       })?;
     }
-    // The rendezvous and the doorbell.
+    // The rendezvous and the doorbell. Every Linux rendezvous is sealed (§4.7, A-187), so the seal is installed before
+    // the listener can answer a claim; a second daemon in this process installs the same one.
+    #[cfg(target_os = "linux")]
+    slates_seal::install();
     let listener = Listener::open(&config.instance, adoption.as_ref())?;
     let kicks: Vec<slates_rt::driver::Kick> = shards
       .iter()
@@ -4478,10 +4486,44 @@ async fn control_loop(
 
 /// Register only after draining the accept queue. One-shot readiness observes connections
 /// already queued and those arriving during registration, without a polling thread (§4.7).
+/// The wait also ends when a pending handshake's socket is readable (its client's opening has come, A-187) and no later
+/// than the earliest pending handshake is due to be given up, so a claimant that never speaks is closed at the claim
+/// wait even when nothing else arrives.
 #[cfg(target_os = "linux")]
 async fn wait_for_rendezvous(listener: &Listener) -> Result<(), slates_rt::RtError> {
+  use std::task::Poll;
   let raw = listener.raw_fd().ok_or(slates_rt::RtError::DriverLost)?;
-  slates_rt::readiness::readable(raw).await
+  let (handshakes, due_ns) = listener.pending();
+  // The listener's wait first: its refusal is the rendezvous's, as before handshakes were waited on.
+  let mut waits: Vec<_> = std::iter::once(raw)
+    .chain(handshakes)
+    .map(|descriptor| Some(Box::pin(slates_rt::readiness::readable(descriptor))))
+    .collect();
+  let any_readable = std::future::poll_fn(|cx| {
+    for (at, slot) in waits.iter_mut().enumerate() {
+      let Some(wait) = slot else {
+        continue;
+      };
+      match wait.as_mut().poll(cx) {
+        Poll::Ready(Ok(())) => return Poll::Ready(Ok(())),
+        Poll::Ready(Err(refusal)) if at == 0 => return Poll::Ready(Err(refusal)),
+        // A handshake's wait the driver refused is left to the deadline below, which ends the wait no later than that
+        // handshake is due; counted, never silent (banned item 9).
+        Poll::Ready(Err(_)) => {
+          *slot = None;
+          crate::fleet::count_refusal(HANDSHAKE_WAIT_REFUSED);
+        }
+        Poll::Pending => {}
+      }
+    }
+    Poll::Pending
+  });
+  match due_ns {
+    Some(due_ns) => futures::within(due_ns, any_readable)
+      .await?
+      .unwrap_or(Ok(())),
+    None => any_readable.await,
+  }
 }
 
 /// Shared-memory rendezvous is driven by the word doorbell's registered poller (§4.7).

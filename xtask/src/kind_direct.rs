@@ -26,16 +26,23 @@
 //!    release nothing more, and the file holds the store; the daemon's counters must show one more hand-off and two
 //!    write-backs finished (`dax.local_map_synced`), none refused.
 //!
-//! A pod with a network namespace of its own cannot reach the daemon this way: that needs a rendezvous it can reach
-//! (`docs/wip/GAPS.md`, the DAX matrix's entry).
+//! 6. A pod of its own (A-187), with a network namespace of its own, on pod 0's node, as the daemon's user and under the
+//!    same restrictions by its own security context: first, before the daemon has a rendezvous directory, it asks
+//!    whether the daemon answers at its abstract socket, and must find no daemon, since that socket is scoped to pod
+//!    0's network namespace. Then the node's directory is made the daemon's user's alone, the chart is upgraded to bind
+//!    the rendezvous at a socket file there (`rendezvous.directory`, `rendezvous.hostPath`; the daemon restarts, and
+//!    being RAM-only it starts empty), the group is bootstrapped, a volume made, and pods of their own, mounting the
+//!    node's directory read-only, write the file and write through it by a writable direct map, as step 5 does: the
+//!    sync writes the stored bytes that differ, the release nothing more, the file holds the store, and the daemon
+//!    counts one hand-off and two write-backs, none refused, nothing unconfined.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use super::export::{MAP_PROBE_TAG, probe_image};
 use super::{
-  CLUSTER_WAIT, Failure, Lane, Options, POLL_CLUSTER, Scratch, certs, down, image, pause, stream,
-  write_scratch,
+  CLUSTER_WAIT, Failure, Lane, NAMESPACE, Options, POLL_CLUSTER, Scratch, capture_with_input,
+  certs, down, image, pause, stream, write_scratch,
 };
 
 /// Shape: the leg's own kind cluster; created here, deleted at the end, never anyone else's.
@@ -78,6 +85,14 @@ const FELL_BACK: &str = "dax.local_map_fallback";
 const UNCONFINED: &str = "dax.local_map_unconfined";
 /// Format: the daemon's counter of writable maps' write-backs that finished (A-186).
 const SYNCED: &str = "dax.local_map_synced";
+/// Format: where the rendezvous directory is mounted, in the daemon's pod and a workload's pod alike (A-187).
+const RENDEZVOUS_DIRECTORY: &str = "/run/slates";
+/// Format: the node's directory mounted there, made by the leg for the daemon's user alone.
+const RENDEZVOUS_HOST_PATH: &str = "/run/slates-rendezvous";
+/// Format: the daemon's user and group in the chart's security context, whose alone the node's directory is.
+const DAEMON_USER: u32 = 65_532;
+/// Format: the tag of the probe's one line in its reach mode.
+const REACH_TAG: &str = "direct-reach:";
 /// Format: the daemon's counter of writable maps' write-backs refused.
 const SYNC_REFUSED: &str = "dax.local_map_sync_refused";
 
@@ -231,7 +246,253 @@ fn prove_map_write(lane: &Lane, id: &str) -> Result<(), Failure> {
   eprintln!(
     "kind direct: a process in a container of the daemon's pod wrote a file in place through a writable direct map"
   );
+  prove_own_namespace(lane)
+}
+
+/// Step 6 (A-187): pods of their own reach the daemon through the rendezvous's socket file, and only through it.
+fn prove_own_namespace(lane: &Lane) -> Result<(), Failure> {
+  let node = lane
+    .kubectl(&[
+      "get",
+      "pod",
+      &lane.pod(0),
+      "-o",
+      "jsonpath={.spec.nodeName}",
+    ])?
+    .stdout
+    .trim()
+    .to_owned();
+  let reached = run_own_pod(lane, &node, OwnPod::reach())?;
+  if reached != "unavailable" {
+    return Err(Failure(format!(
+      "kind direct: a pod of its own reached the daemon's abstract socket, or failed otherwise: {reached:?}"
+    )));
+  }
+  eprintln!(
+    "kind direct: a pod of its own finds no daemon at the abstract socket, as Linux scopes it"
+  );
+  let owner = DAEMON_USER.to_string();
+  stream(
+    "docker",
+    &[
+      "exec",
+      &node,
+      "install",
+      "-d",
+      "-m",
+      "0700",
+      "-o",
+      &owner,
+      "-g",
+      &owner,
+      RENDEZVOUS_HOST_PATH,
+    ],
+  )?;
+  lane.install_with(
+    1,
+    None,
+    &[
+      format!("rendezvous.directory={RENDEZVOUS_DIRECTORY}"),
+      format!("rendezvous.hostPath={RENDEZVOUS_HOST_PATH}"),
+    ],
+  )?;
+  lane.bootstrap()?;
+  let id = create_volume(lane)?;
+  let wrote = run_own_pod(lane, &node, OwnPod::probe(Probe::Write, &id))?;
+  if wrote != format!("wrote {DIRECT_FILE_BYTES}") {
+    return Err(Failure(format!(
+      "kind direct: the pod of its own did not write the file through the socket file: {wrote:?}"
+    )));
+  }
+  let before = Counters::read(lane)?;
+  let line = run_own_pod(lane, &node, OwnPod::probe(Probe::MapWrite, &id))?;
+  let after = Counters::read(lane)?;
+  eprintln!("kind direct: own pod {MAP_WRITE_TAG} {line}");
+  if !writes_through(&line) {
+    return Err(Failure(format!(
+      "kind direct: the pod of its own did not write the file through its map: {line:?}"
+    )));
+  }
+  if after.handed.saturating_sub(before.handed) != 1
+    || after.synced.saturating_sub(before.synced) != 2
+    || after.sync_refused != before.sync_refused
+    || after.unconfined != before.unconfined
+  {
+    return Err(Failure(format!(
+      "kind direct: the daemon's counters do not show one hand-off and two write-backs for the pod of its own: \
+       before {before:?}, after {after:?}"
+    )));
+  }
+  eprintln!(
+    "kind direct: a pod with a network namespace of its own wrote a file in place through a writable direct map, \
+     reaching the daemon at the rendezvous's socket file"
+  );
   Ok(())
+}
+
+/// A run of the probe in a pod of its own (step 6).
+struct OwnPod {
+  /// The pod's name, one for each run.
+  name: String,
+  /// The probe's arguments after its binary.
+  args: Vec<String>,
+  /// The tag of its one line.
+  tag: &'static str,
+  /// Whether the node's rendezvous directory is mounted, and the daemon named by its socket file there.
+  mounted: bool,
+}
+
+impl OwnPod {
+  /// The reach mode, with no directory mounted: the daemon named by its abstract instance.
+  fn reach() -> OwnPod {
+    OwnPod {
+      name: "direct-own-reach".to_owned(),
+      args: vec!["reach".to_owned()],
+      tag: REACH_TAG,
+      mounted: false,
+    }
+  }
+
+  /// `probe`'s mode over the volume `id`, with the directory mounted.
+  fn probe(probe: Probe, id: &str) -> OwnPod {
+    OwnPod {
+      name: format!("direct-own-{}", probe.mode()),
+      args: vec![
+        probe.mode().to_owned(),
+        id.to_owned(),
+        format!("/{DIRECT_FILE}"),
+        DIRECT_FILE_BYTES.to_string(),
+        DIRECT_FILL.to_string(),
+      ],
+      tag: probe.tag(),
+      mounted: true,
+    }
+  }
+
+  /// The pod's manifest: on `node`, with a network namespace of its own (no host network), as the daemon's user, every
+  /// capability dropped, no privilege escalation, a read-only root and the runtime's default seccomp profile: what
+  /// `kubectl debug --profile=restricted` gives the earlier steps' containers. When mounted, the node's directory is
+  /// read-only at [`RENDEZVOUS_DIRECTORY`] and the daemon named by its socket file there.
+  fn manifest(&self, node: &str) -> serde_json::Value {
+    let mut command = vec![serde_json::Value::from(PROBE_BINARY)];
+    command.extend(
+      self
+        .args
+        .iter()
+        .map(|arg| serde_json::Value::from(arg.as_str())),
+    );
+    let mut container = serde_json::json!({
+      "name": "probe",
+      "image": MAP_PROBE_TAG,
+      "imagePullPolicy": "IfNotPresent",
+      "command": command,
+      "securityContext": {
+        "allowPrivilegeEscalation": false,
+        "readOnlyRootFilesystem": true,
+        "capabilities": { "drop": ["ALL"] },
+      },
+    });
+    let mut spec = serde_json::json!({
+      "nodeName": node,
+      "restartPolicy": "Never",
+      "securityContext": {
+        "runAsNonRoot": true,
+        "runAsUser": DAEMON_USER,
+        "runAsGroup": DAEMON_USER,
+        "seccompProfile": { "type": "RuntimeDefault" },
+      },
+    });
+    if self.mounted {
+      container["env"] = serde_json::json!([
+        { "name": "SLATES_ENDPOINT", "value": format!("{RENDEZVOUS_DIRECTORY}/default") },
+      ]);
+      container["volumeMounts"] = serde_json::json!([
+        { "name": "rendezvous", "mountPath": RENDEZVOUS_DIRECTORY, "readOnly": true },
+      ]);
+      spec["volumes"] = serde_json::json!([
+        { "name": "rendezvous", "hostPath": { "path": RENDEZVOUS_HOST_PATH, "type": "Directory" } },
+      ]);
+    }
+    spec["containers"] = serde_json::json!([container]);
+    serde_json::json!({
+      "apiVersion": "v1",
+      "kind": "Pod",
+      "metadata": { "name": self.name },
+      "spec": spec,
+    })
+  }
+}
+
+/// Runs `pod` on `node` to its end and returns its tagged line, the tag taken off; the pod is deleted after. Prints the
+/// pod's address beside pod 0's, the evidence that its network namespace is its own.
+fn run_own_pod(lane: &Lane, node: &str, pod: OwnPod) -> Result<String, Failure> {
+  let context = format!("kind-{}", lane.cluster);
+  let manifest = pod.manifest(node).to_string();
+  let applied = capture_with_input(
+    "kubectl",
+    &["--context", &context, "-n", NAMESPACE, "apply", "-f", "-"],
+    manifest.as_bytes(),
+  )?;
+  if applied.code != 0 {
+    return Err(Failure(format!(
+      "kind direct: the pod {} was refused: {}",
+      pod.name,
+      applied.stderr.trim()
+    )));
+  }
+  let started = Instant::now();
+  let phase = loop {
+    let phase = lane.kubectl(&["get", "pod", &pod.name, "-o", "jsonpath={.status.phase}"])?;
+    let phase = phase.stdout.trim().to_owned();
+    if phase == "Succeeded" || phase == "Failed" {
+      break phase;
+    }
+    if started.elapsed() > PROBE_WAIT {
+      return Err(Failure(format!(
+        "kind direct: the pod {} did not finish within {PROBE_WAIT:?} (phase {phase:?})",
+        pod.name
+      )));
+    }
+    pause(POLL_CLUSTER);
+  };
+  let addresses = [lane.pod(0), pod.name.clone()].map(|name| {
+    lane
+      .kubectl(&["get", "pod", &name, "-o", "jsonpath={.status.podIP}"])
+      .map(|outcome| outcome.stdout.trim().to_owned())
+  });
+  let [daemon_address, own_address] = addresses;
+  let (daemon_address, own_address) = (daemon_address?, own_address?);
+  eprintln!(
+    "kind direct: pod {} at {own_address}, pod 0 at {daemon_address}, ended {phase}",
+    pod.name
+  );
+  let logs = lane.kubectl(&["logs", &pod.name])?;
+  for line in logs.stdout.lines() {
+    eprintln!("kind direct: {}: {line}", pod.name);
+  }
+  lane.kubectl(&["delete", "pod", &pod.name, "--wait=false"])?;
+  if own_address == daemon_address {
+    return Err(Failure(format!(
+      "kind direct: the pod {} shares pod 0's address, so not a network namespace of its own",
+      pod.name
+    )));
+  }
+  logs
+    .stdout
+    .lines()
+    .find_map(|line| {
+      line
+        .split_once(pod.tag)
+        .map(|(_, rest)| rest.trim().to_owned())
+    })
+    .ok_or_else(|| {
+      Failure(format!(
+        "kind direct: the pod {} printed no {} line ({phase}): {}",
+        pod.name,
+        pod.tag,
+        logs.stdout.trim()
+      ))
+    })
 }
 
 /// Whether the map-write probe's line says the sync wrote the stored bytes that differ (some), the release nothing

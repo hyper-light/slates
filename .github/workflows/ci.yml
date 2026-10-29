@@ -785,6 +785,10 @@ jobs:
       # A client killed holding a direct map: its copy reaped, and a writable map's stores written back first (A-186).
       - name: The direct map's killed clients on arm64
         run: cargo test -p slates-client --test reap_map -- --test-threads=1 --nocapture
+      # A client in a network namespace of its own maps a file through the rendezvous's socket file (A-187). It skips
+      # loudly where the runner refuses an unprivileged user namespace; the bridge-network container below does not.
+      - name: A client in a network namespace of its own on arm64
+        run: cargo test -p slates-client --test netns -- --nocapture
       - name: The FUSE mount's maps and the containers on arm64 (the CLI flow's map tests)
         env:
           SLATES_TEST_CLI: "1"
@@ -796,6 +800,7 @@ jobs:
           a_rootless_container_maps_a_file_through_the_mount_and_follows_another_paths_change
           a_container_maps_a_slates_file_by_the_direct_map_with_no_copy
           a_container_maps_a_slates_file_read_and_write_by_the_direct_map
+          a_container_on_a_bridge_network_maps_a_slates_file_read_and_write_through_the_socket_file
 
   # Miri (the memory-model interpreter) and loom (the concurrency-permutation checker) run
   # on the unit tests of the crates that hold unsafe code. Miri ships only with the

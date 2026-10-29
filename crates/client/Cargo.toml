@@ -42,6 +42,11 @@ slates-bridge-fuse = { workspace = true }
 
 # The Windows hostile test (A-175) uses the handle a direct map duplicated into it as a hostile peer would:
 # `DuplicateHandle`, `MapViewOfFile`, `VirtualProtect`.
+[target.'cfg(target_os = "linux")'.dependencies]
+# The rendezvous seal (§4.7, A-187): every Linux rendezvous's messages cross under it, and `slates-ipc` takes it from
+# its caller since it builds where aws-lc-rs cannot.
+slates-seal = { workspace = true }
+
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { workspace = true }
 

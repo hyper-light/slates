@@ -105,6 +105,18 @@ readiness:
   # probe, seconds.
   initialDelaySeconds: 5
 
+# The rendezvous directory (§4.7, A-187). Empty: a client reaches the daemon at its abstract socket, which only a
+# container of the daemon's own pod can, since Linux scopes an abstract socket to its network namespace. Set: the daemon
+# listens at a socket file in `directory` instead (its instance is `directory`/default), mounted from the node's
+# `hostPath`, and a workload's pod of its own reaches it by mounting the same `hostPath` read-only at the same
+# `directory`, as the daemon's user (`runAsUser` below), scheduled on the same node. The node's directory must exist,
+# owned by that user with mode 0700; the daemon refuses any other. Every message across the socket is sealed (an X25519
+# exchange, a key per direction by HKDF-SHA256, AES-256-GCM), and a socket file holds no bytes. A workload's hostPath
+# mount needs a namespace whose Pod Security admission allows hostPath volumes.
+rendezvous:
+  directory: ""
+  hostPath: ""
+
 # Extra arguments to `slates anchor` (after `--fleet PATH --node NAME`); `--quick` skips the full machine
 # profile measurement at boot (a test cluster), never a production value.
 extraArgs: []

@@ -1452,6 +1452,7 @@ dependencies = [
  "slates-ipc",
  "slates-machine",
  "slates-mem",
+ "slates-seal",
  "slates-server",
  "slates-vfs",
  "slates-wire",
@@ -1636,6 +1637,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "slates-seal"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "slates-ipc",
+]
+
+[[package]]
 name = "slates-server"
 version = "0.1.0"
 dependencies = [
@@ -1666,6 +1675,7 @@ dependencies = [
  "slates-mem",
  "slates-merge",
  "slates-rt",
+ "slates-seal",
  "slates-test-seeds",
  "slates-transport",
  "slates-vfs",

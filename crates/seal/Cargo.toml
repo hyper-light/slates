@@ -1,0 +1,16 @@
+[package]
+name = "slates-seal"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "The rendezvous seal (design §4.7, A-187): an X25519 exchange, HKDF-SHA256 keys per direction and AES-256-GCM per message at a counter nonce, implementing slates-ipc's seal interface with aws-lc-rs, the one crypto library (A-66)."
+
+[dependencies]
+slates-ipc = { workspace = true }
+aws-lc-rs = { workspace = true }
+
+[lints]
+workspace = true
