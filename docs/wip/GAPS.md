@@ -11366,6 +11366,11 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     (`docs/bugs/2026-10-28-a-writable-maps-long-write-back-was-reported-stalled.md`); and its test, a 1 ms reply
     deadline, found macOS refusing a zero-timeout wait as `OsRefused`
     (`docs/bugs/2026-10-28-a-wait-with-no-time-left-was-refused-on-macos.md`).
+  - **Found by CI's macOS lane** (run 40822078142, 2026-10-29), fixed failing test first: a map's copy is claimed on
+    macOS's socket route, whose every step gave up at the client's reply deadline, so a live daemon slow to answer its
+    route failed the map `DeadlineExceeded`. A step whose wait runs out now waits again while the daemon lives, as the
+    map's own reply is waited for, and the Shards stream end's claim with it
+    (`docs/bugs/2026-10-29-a-route-claim-gave-up-on-a-live-daemon-at-the-reply-deadline.md`).
 - **The direct map on Windows (A-175, G-direct step 5, 2026-10-25): built, and proven on a real Windows machine.**
   - **What:** a `MapRead` on Windows is answered `MapHanded`. The file's copy is an unnamed pagefile-backed section under
     `D:P(A;;RC;;;OW)`, a descriptor that grants no one any right to it; the daemon duplicates a read-only handle of it

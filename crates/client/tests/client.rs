@@ -1027,9 +1027,11 @@ fn writable_object_is_confined(mapped: &slates_client::MappedWrite) {
 }
 
 /// Shape: a reply deadline short enough that filling or comparing back a [`LONG_MAP_BYTES`] copy outlasts it on any
-/// machine (each takes milliseconds); a client's connect waits by its reconnect budget, so it is not affected.
+/// machine (each takes milliseconds), and that the daemon's answer on the macOS socket route outlasts too (it takes
+/// microseconds: CI's macOS runner took it past 1 ms, run 40822078142); a client's connect waits by its reconnect
+/// budget, so it is not affected.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-const IMPATIENT_REPLY_NS: u64 = 1_000_000;
+const IMPATIENT_REPLY_NS: u64 = 1_000;
 /// Shape: a file whose writable map's fill and write-backs each take milliseconds: 16 MiB.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 const LONG_MAP_BYTES: usize = 16 << 20;
@@ -1177,6 +1179,7 @@ fn a_released_maps_unclaimed_offer_is_withdrawn() {
     (OfferKind::Map, mapping_id),
     &secret,
     Duration::from_nanos(LIVENESS_BUDGET_NS),
+    &mut || false,
   );
   assert!(
     matches!(

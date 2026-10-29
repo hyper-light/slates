@@ -607,13 +607,16 @@ fn refusal_of(kind: u8) -> RouteRefusal {
 
 /// Claims the `kind` offer `id` from the daemon of `instance` with the offer's `secret` (the client's side of the
 /// exchange in the module doc): its descriptor, once the daemon's confirmation opens. Each socket read and write waits
-/// at most `within`; the daemon's refusals arrive typed (`RouteRefused`), and a confirmation that does not open is
-/// refused `Confirmation` with the descriptor it carried closed.
+/// `within` at a time, and when that runs out asks `alive` whether the daemon still lives: while it does, the step goes
+/// on waiting, as a client waits for a deferred reply (A-186), since a live daemon always answers its route; once it
+/// does not, the claim is refused `DeadlineExceeded`. The daemon's refusals arrive typed (`RouteRefused`), and a
+/// confirmation that does not open is refused `Confirmation` with the descriptor it carried closed.
 pub fn claim(
   instance: &str,
   (kind, id): (OfferKind, u64),
   secret: &[u8; SECRET_BYTES],
   within: Duration,
+  alive: &mut dyn FnMut() -> bool,
 ) -> Result<OwnedFd, IpcError> {
   let address = SocketAddrUnix::new(path(instance)?).map_err(|e| refused("socket address", e))?;
   let socket = stream_socket()?;
@@ -630,19 +633,19 @@ pub fn claim(
     id,
     client_nonce: random()?,
   };
-  write_all(socket.as_fd(), &hello.encode())?;
+  write_all(socket.as_fd(), &hello.encode(), alive)?;
   let mut answer = [0u8; 1];
-  read_exact(socket.as_fd(), &mut answer)?;
+  read_exact(socket.as_fd(), &mut answer, alive)?;
   if answer != [KIND_CHALLENGE] {
     return Err(IpcError::RouteRefused {
       refusal: refusal_of(answer.first().copied().unwrap_or(KIND_MALFORMED)),
     });
   }
   let mut daemon_nonce = [0u8; NONCE_BYTES];
-  read_exact(socket.as_fd(), &mut daemon_nonce)?;
+  read_exact(socket.as_fd(), &mut daemon_nonce, alive)?;
   let exchange = Exchange::new(secret, (kind, id), &hello.client_nonce, &daemon_nonce)?;
-  write_all(socket.as_fd(), &exchange.proof()?)?;
-  let (confirmation, stream) = receive_confirmation(socket.as_fd())?;
+  write_all(socket.as_fd(), &exchange.proof()?, alive)?;
+  let (confirmation, stream) = receive_confirmation(socket.as_fd(), alive)?;
   if !exchange.confirmation_holds(&confirmation) {
     return Err(IpcError::RouteRefused {
       refusal: RouteRefusal::Confirmation,
@@ -659,18 +662,38 @@ pub fn claim(
   Ok(stream)
 }
 
-/// The daemon's answer to a proof: its confirmation and the stream end it carried, or its refusal.
-fn receive_confirmation(socket: BorrowedFd<'_>) -> Result<([u8; SEALED_BYTES], OwnedFd), IpcError> {
+/// Whether a step whose wait ran out may wait again: while `alive` says the daemon lives; otherwise the claim is
+/// refused `DeadlineExceeded`.
+fn wait_again(alive: &mut dyn FnMut() -> bool) -> Result<(), IpcError> {
+  if alive() {
+    Ok(())
+  } else {
+    Err(IpcError::DeadlineExceeded)
+  }
+}
+
+/// The daemon's answer to a proof: its confirmation and the stream end it carried, or its refusal. Its wait runs out
+/// and is renewed as [`claim`] says.
+fn receive_confirmation(
+  socket: BorrowedFd<'_>,
+  alive: &mut dyn FnMut() -> bool,
+) -> Result<([u8; SEALED_BYTES], OwnedFd), IpcError> {
   let mut message = [0u8; 1 + SEALED_BYTES];
   let mut space = [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(1))];
   let mut control = RecvAncillaryBuffer::new(&mut space);
-  let received = rustix::net::recvmsg(
-    socket,
-    &mut [IoSliceMut::new(&mut message)],
-    &mut control,
-    RecvFlags::empty(),
-  )
-  .map_err(|e| refused("recvmsg confirmation", e))?;
+  let received = loop {
+    match rustix::net::recvmsg(
+      socket,
+      &mut [IoSliceMut::new(&mut message)],
+      &mut control,
+      RecvFlags::empty(),
+    ) {
+      Ok(received) => break received,
+      Err(rustix::io::Errno::INTR) => {}
+      Err(rustix::io::Errno::AGAIN) => wait_again(alive)?,
+      Err(e) => return Err(refused("recvmsg confirmation", e)),
+    }
+  };
   let mut descriptors: Vec<OwnedFd> = Vec::new();
   for ancillary in control.drain() {
     if let RecvAncillaryMessage::ScmRights(iter) = ancillary {
@@ -707,8 +730,12 @@ fn receive_confirmation(socket: BorrowedFd<'_>) -> Result<([u8; SEALED_BYTES], O
   Ok((confirmation, stream))
 }
 
-/// Writes all of `bytes` on a blocking socket whose writes time out.
-fn write_all(socket: BorrowedFd<'_>, mut bytes: &[u8]) -> Result<(), IpcError> {
+/// Writes all of `bytes` on a blocking socket whose writes time out, each wait renewed as [`claim`] says.
+fn write_all(
+  socket: BorrowedFd<'_>,
+  mut bytes: &[u8],
+  alive: &mut dyn FnMut() -> bool,
+) -> Result<(), IpcError> {
   while !bytes.is_empty() {
     match rustix::net::send(socket, bytes, SendFlags::empty()) {
       Ok(0) => {
@@ -718,16 +745,20 @@ fn write_all(socket: BorrowedFd<'_>, mut bytes: &[u8]) -> Result<(), IpcError> {
       }
       Ok(sent) => bytes = bytes.get(sent..).unwrap_or(&[]),
       Err(rustix::io::Errno::INTR) => {}
-      Err(rustix::io::Errno::AGAIN) => return Err(IpcError::DeadlineExceeded),
+      Err(rustix::io::Errno::AGAIN) => wait_again(alive)?,
       Err(e) => return Err(refused("send route", e)),
     }
   }
   Ok(())
 }
 
-/// Fills `buffer` from a blocking socket whose reads time out; the daemon's closing before it is full is
-/// `Malformed`.
-fn read_exact(socket: BorrowedFd<'_>, buffer: &mut [u8]) -> Result<(), IpcError> {
+/// Fills `buffer` from a blocking socket whose reads time out, each wait renewed as [`claim`] says; the daemon's
+/// closing before it is full is `Malformed`.
+fn read_exact(
+  socket: BorrowedFd<'_>,
+  buffer: &mut [u8],
+  alive: &mut dyn FnMut() -> bool,
+) -> Result<(), IpcError> {
   let mut filled = 0usize;
   while filled < buffer.len() {
     let Some(room) = buffer.get_mut(filled..) else {
@@ -741,7 +772,7 @@ fn read_exact(socket: BorrowedFd<'_>, buffer: &mut [u8]) -> Result<(), IpcError>
       }
       Ok((read, _)) => filled = filled.saturating_add(read),
       Err(rustix::io::Errno::INTR) => {}
-      Err(rustix::io::Errno::AGAIN) => return Err(IpcError::DeadlineExceeded),
+      Err(rustix::io::Errno::AGAIN) => wait_again(alive)?,
       Err(e) => return Err(refused("recv route", e)),
     }
   }

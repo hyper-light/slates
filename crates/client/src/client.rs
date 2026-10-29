@@ -1587,6 +1587,7 @@ impl Client {
       (slates_ipc::route::OfferKind::Stream, attachment),
       secret,
       std::time::Duration::from_nanos(self.deadlines.reply_ns),
+      &mut || !self.end.daemon_gone(),
     )
     .map_err(ClientError::Ipc)
   }
@@ -1600,8 +1601,8 @@ impl Client {
     })
   }
 
-  /// Claims a direct map's copy offered on the daemon's socket route (§4.6, A-173, macOS): its read-only descriptor,
-  /// within the reply deadline.
+  /// Claims a direct map's copy offered on the daemon's socket route (§4.6, A-173, macOS): its descriptor, each step of
+  /// the claim waited for in reply deadlines while the daemon lives, as the map's own reply is (A-186).
   #[cfg(target_os = "macos")]
   fn claim_map(
     &self,
@@ -1613,6 +1614,7 @@ impl Client {
       (slates_ipc::route::OfferKind::Map, mapping_id),
       secret,
       std::time::Duration::from_nanos(self.deadlines.reply_ns),
+      &mut || !self.end.daemon_gone(),
     )
     .map_err(ClientError::Ipc)
   }

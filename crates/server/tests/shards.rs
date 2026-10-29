@@ -2521,6 +2521,7 @@ mod route {
       (OfferKind::Stream, attachment),
       &secret,
       CREDIT_WAIT,
+      &mut || false,
     )
     .unwrap();
     let mut guest = Guest::over(ShardsAttached {
@@ -2535,7 +2536,8 @@ mod route {
         &instance,
         (OfferKind::Stream, attachment),
         &secret,
-        CREDIT_WAIT
+        CREDIT_WAIT,
+        &mut || false,
       ),
       Err(IpcError::RouteRefused {
         refusal: slates_ipc::error::RouteRefusal::NoOffer
@@ -2617,6 +2619,7 @@ mod route {
         (OfferKind::Stream, attachment),
         &secret,
         CREDIT_WAIT,
+        &mut || false,
       ) {
         Ok(stream) => stream,
         Err(IpcError::RouteRefused {
@@ -2661,7 +2664,8 @@ mod route {
         &instance,
         (OfferKind::Stream, attachment),
         &secret,
-        CREDIT_WAIT
+        CREDIT_WAIT,
+        &mut || false,
       ),
       Err(IpcError::RouteRefused {
         refusal: slates_ipc::error::RouteRefusal::NoOffer
@@ -2700,6 +2704,7 @@ mod route {
       (OfferKind::Stream, attachment),
       &secret,
       CREDIT_WAIT,
+      &mut || false,
     );
     assert!(
       matches!(
