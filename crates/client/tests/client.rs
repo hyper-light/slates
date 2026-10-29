@@ -1026,6 +1026,61 @@ fn writable_object_is_confined(mapped: &slates_client::MappedWrite) {
   );
 }
 
+/// Shape: a reply deadline short enough that filling or comparing back a [`LONG_MAP_BYTES`] copy outlasts it on any
+/// machine (each takes milliseconds); a client's connect waits by its reconnect budget, so it is not affected.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+const IMPATIENT_REPLY_NS: u64 = 1_000_000;
+/// Shape: a file whose writable map's fill and write-backs each take milliseconds: 16 MiB.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+const LONG_MAP_BYTES: usize = 16 << 20;
+
+/// AC-A-186 with the client's deadline (`Deadlines::derive`): a writable map's fill and its write-backs run in slices for
+/// as long as the file takes, and the client waits for them while its daemon lives, as it does for a read map's fill
+/// (A-171), never reporting a live daemon stalled. Do: on a one-shard daemon, attach a volume holding a 16 MiB file for
+/// writing; from a client whose reply deadline is [`IMPATIENT_REPLY_NS`], map the file read and write under that
+/// attachment, store a phrase, sync and release. Expect: each answers, none `Stalled`; the sync writes the phrase's
+/// differing bytes and the file holds them. Found by CI's ThreadSanitizer lane, whose slowdown took a 4 MiB map's
+/// release past the one-second deadline (run 40816824486).
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+fn a_long_writable_map_is_waited_for_while_the_daemon_lives() {
+  let (_daemon, mut client, instance) = one_shard_daemon("mapwlong");
+  let id = client
+    .create(&room_for("mapwlong", LONG_MAP_BYTES))
+    .unwrap();
+  let old = pattern(LONG_MAP_BYTES, 9);
+  write_file(&mut client, id, "/f.bin", &old);
+  let attachment = client.attach(id, None, Intent::Write).unwrap().attachment;
+  let mut impatient = Client::connect(
+    &instance,
+    Deadlines {
+      reply_ns: IMPATIENT_REPLY_NS,
+      ..deadlines()
+    },
+  )
+  .unwrap();
+  let mapped = impatient.map_write((id, attachment), "/f.bin").unwrap();
+  let mut new = old.clone();
+  store_phrase(
+    &mapped,
+    &mut new,
+    LONG_MAP_BYTES / 2,
+    b"waited for, never stalled",
+  );
+  assert_eq!(
+    impatient.map_sync(&mapped).unwrap(),
+    differing_bytes(&old, &new)
+  );
+  assert_eq!(impatient.release_map_write(mapped).unwrap(), 0);
+  assert!(
+    client
+      .read(id, "/f.bin", slates_client::ReadAt::Head)
+      .unwrap()
+      == new
+  );
+  client.detach(attachment).unwrap();
+}
+
 /// AC-A-186: a writable map needs the caller's own write attachment, as a file verb does, and a regular file. Do: on a
 /// volume holding a file and a directory, ask `map_write` under an attachment that does not exist, under a read
 /// attachment, for the directory and for a missing file. Expect: `NotFound`, `Forbidden`, `BadRequest` and `NotFound`,

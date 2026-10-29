@@ -84,8 +84,9 @@ impl Deadlines {
 }
 
 /// Whether the daemon defers `body`'s reply until long work ends — a granted landing, which runs in slices for
-/// as long as its tree takes; an image's build or merge and a direct map's fill, which run in slices for as long as
-/// their data takes; a FUSE mount, which waits on the OS's mount helper; and any verb the daemon may forward
+/// as long as its tree takes; an image's build or merge, a direct map's fill and a writable map's write-back, which run
+/// in slices for as long as their data takes; a FUSE mount, which waits on the OS's mount helper; and any verb the
+/// daemon may forward
 /// to its volume's owner across the fleet (`RequestBody::may_be_forwarded`), under a location round and a forward
 /// the daemon bounds by the measured path — so a caller waits for it while the daemon lives rather than for one reply
 /// deadline.
@@ -103,6 +104,11 @@ pub fn defers_reply(body: &RequestBody) -> bool {
         | RequestBody::ImageMerge { .. }
         // A direct map's copy is filled in slices on the owner shard, as long as the file takes (A-171).
         | RequestBody::MapRead { .. }
+        // A writable map's copy is filled the same way, and its stores are compared back into the file in slices at
+        // its sync and its release, as long as the file takes (A-186). A read-only map's release answers at once.
+        | RequestBody::MapWrite { .. }
+        | RequestBody::MapSync { .. }
+        | RequestBody::ReleaseMap { .. }
         | RequestBody::Attach {
           form: AttachRequest::FuseMount { .. }
             | AttachRequest::ScopedFuseMount { .. }

@@ -306,6 +306,31 @@ fn wake_without_reply(region: &ClientRegion) {
   region.wake_signal().unwrap();
 }
 
+/// §4.7 "Wake strategy": a wait whose budget is already spent answers at once, as a timeout or as the word's move, never
+/// as an error. Do: over a real region's wake word (shared memory, as the client waits on it), wait with no time left
+/// for the word to leave the value it holds, then for it to leave a value it does not hold. Expect: `Ok(false)`, timed
+/// out, then `Ok(true)`, the word differs. macOS refuses a zero timeout (`os_sync_wait_on_address_with_timeout`:
+/// "Passing zero for the @timeout_ns results in an error being returned", `EINVAL`, its SDK header), and a client whose
+/// spin had spent its whole reply deadline met that as `OsRefused` (A-186's one-millisecond deadline test on macOS,
+/// 2026-10-28).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_wait_with_no_time_left_answers_at_once() {
+  let (daemon, _client) = pair("zero-wait");
+  let word = daemon.region().wake_word().unwrap();
+  let holds = word.load(Ordering::Acquire);
+  assert_eq!(
+    slates_ipc::wake::wait(word, holds, Some(0)),
+    Ok(false),
+    "timed out"
+  );
+  assert_eq!(
+    slates_ipc::wake::wait(word, holds.wrapping_add(1), Some(0)),
+    Ok(true),
+    "the word differs from the value waited on"
+  );
+}
+
 /// Takes the next item `take` yields, bounded by the reply deadline (a hang guard: one that never arrives
 /// fails the test with `what`, never spins it forever).
 fn take_within<T>(mut take: impl FnMut() -> Option<T>, what: &str) -> T {

@@ -75,7 +75,7 @@ mod platform {
 
 #[cfg(target_os = "macos")]
 mod platform {
-  use std::sync::atomic::AtomicU32;
+  use std::sync::atomic::{AtomicU32, Ordering};
 
   use crate::error::IpcError;
 
@@ -84,6 +84,13 @@ mod platform {
     expected: u32,
     timeout_ns: Option<u64>,
   ) -> Result<bool, IpcError> {
+    // A wait with no time left asks only whether the word has moved, as a futex answers it at once. macOS refuses a
+    // zero timeout ("Passing zero for the @timeout_ns results in an error being returned", `EINVAL`, its SDK's
+    // `os/os_sync_wait_on_address.h`), so the word is read here rather than the OS asked: a client whose spin had spent
+    // its whole reply deadline met that refusal as `OsRefused` (2026-10-28).
+    if timeout_ns == Some(0) {
+      return Ok(word.load(Ordering::Acquire) != expected);
+    }
     let addr = word.as_ptr().cast::<std::ffi::c_void>();
     // SAFETY: `addr` is a live 4-byte word in a shared mapping for the call's duration; the
     // flags and size describe exactly that word; the call writes nothing to memory.

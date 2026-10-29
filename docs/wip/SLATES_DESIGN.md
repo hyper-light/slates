@@ -12507,7 +12507,11 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph and i
 
   `tests/reap_map.rs` kills a client holding unsynced stores and finds them in the file after its reap. From a Docker
   container on adacachy (`crates/cli/tests/cli.rs`, `a_container_maps_a_slates_file_read_and_write_by_the_direct_map`),
-  the container's process stores 43 bytes through its map, syncs and releases, and the host reads them in place. `slates-mem`'s
+  the container's process stores 43 bytes through its map, syncs and releases, and the host reads them in place. From
+  a Kubernetes pod (GitHub's `ubuntu-24.04-arm`, the KIND direct leg's third probe) and from a Windows process-isolated
+  container (`windows-2025`, Nano Server, its daemon beside it), a client stores 37 bytes, syncs, releases and reads
+  them back (`differing=37 synced=37 released=0 whole=true`, diagnostics run 40816955827), each red-checked in the same
+  run with a write-back comparing nothing. `slates-mem`'s
   `peer_object.rs` holds the writable object alone, 9 of 9 on Linux and 8 of 8 on macOS, and `peer_section.rs` the
   writable section, 4 of 4 on Windows. The rendezvous judges writable hand-offs. Clippy is clean on all three.
 - **Red-checked** on the box, eleven mutants, one at a time in a separate tree and target, each failing the test that
@@ -12537,9 +12541,18 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph and i
     served to about one client in N. The test daemons run one shard for this reason (`crates/client/tests/client.rs`'s
     `one_shard_daemon`, and `crates/cli/tests/cli.rs`'s container tests since this change: with two shards, their
     container's client landed on the volume's shard or not by how many clients came before it).
-  - The writable map from pods (the KIND direct leg's write mode, built in this change: it runs on CI's KIND lane)
-    and from a Windows container (a diagnostics run), and arm64 by run (CI's native arm64 lanes run these tests on
-    every push).
+  - Nothing more by platform: CI's run of 4552995b (40816824486) ran the 8 writable-map client tests on its native
+    arm64 lanes, Linux (`ubuntu-24.04-arm`: 159,669 stores over 200 syncs, none undone) and Windows (`windows-11-arm`,
+    with the writable section test), all passing, and its x86_64 KIND lane's pod wrote through its map
+    (`differing=37 synced=37 released=0 whole=true`).
+- **Found after the first push, each fixed failing test first:**
+  - **A long write-back reported stalled.** CI's ThreadSanitizer lane slowed a 4 MiB map's release past the client's
+    one-second reply deadline, and the client answered `Stalled` while the daemon finished: `defers_reply` named
+    `MapRead` but not `MapWrite`, `MapSync` or `ReleaseMap`, whose replies are deferred the same way
+    (`docs/bugs/2026-10-28-a-writable-maps-long-write-back-was-reported-stalled.md`).
+  - **A wait with no time left refused on macOS.** The test for the first, a client with a 1 ms reply deadline, met
+    `os_sync_wait_on_address`'s refusal of a zero timeout (`EINVAL`) as `OsRefused`; the wake word's wait now reads the
+    word for a zero timeout, as a futex answers it (`docs/bugs/2026-10-28-a-wait-with-no-time-left-was-refused-on-macos.md`).
 
 ### A-176 — A Windows daemon restarts under its clients: names that no restart repeats, an owner's token, and a claim's refusal kept to itself (accepted 2026-10-25)
 Applied in the same change to: §4.7 (the rendezvous's status), A-114 (adoption handed over in process; its Windows sentence corrected), A-175's owed line, GAPS, `crates/ipc` (`rendezvous.rs`: `Adoption`, `Listener::open` taking it, `Round` and `Served`, the Windows owner token and takeover, the stamp taken back at a listener's drop; `wake.rs`: `Event::create_new`; `error.rs`: `InstanceHeld`; `tests/rendezvous.rs`), `crates/server` (`daemon.rs`: `SegmentSource::Handoff`'s `rendezvous`, `region_name_key`, `CLAIMS_REFUSED`, the accept loop's refusals), `crates/cli` (`anchor.rs`), every in-process anchor of the tests (`crates/client/tests/{client,consumer,driver}.rs`; `crates/server/tests/{common/anchor,fleet,seal,recovery,attach_forms,shards,virtiofs}.rs`; `daemon.rs`'s warm-restart test), `.github/workflows/ci.yml` (both x86_64 Windows lanes run the client binary whole, one test at a time), `CLAUDE.md`, and three bug records.

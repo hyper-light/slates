@@ -11356,10 +11356,16 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       cross shards yet, so in a daemon of N shards about one client in N is served. The hand-off would go through the
       client's home shard, which holds its control socket; the copy stays on the volume's shard, where its writes are
       kept.
-    - The writable map from pods (the KIND direct leg's write mode, built: CI's KIND lane runs it) and from a Windows
-      container (a diagnostics run); arm64 by run, which CI's native arm64 lanes give on push. **Docker done** the same
-      day on adacachy: the container's process stores through its map and the host reads the store
-      (`synced=43 released=0`), red-checked with the sync comparing nothing.
+    - **Arm64 done by CI** (run 40816824486): the 8 writable-map client tests on `ubuntu-24.04-arm` and
+      `windows-11-arm`, all passing; and the x86_64 KIND lane's pod wrote through its map. **Containers and pods done** the same
+      day: Docker on adacachy (`synced=43 released=0`), a KIND pod on `ubuntu-24.04-arm` and a Windows process-isolated
+      container on `windows-2025` (`differing=37 synced=37 released=0 whole=true`, diagnostics run 40816955827), each
+      red-checked with a write-back comparing nothing.
+  - **Found after the first push** (CI's ThreadSanitizer lane, run 40816824486), each fixed failing test first: the
+    client reported a long write-back `Stalled`, `defers_reply` not naming the new verbs
+    (`docs/bugs/2026-10-28-a-writable-maps-long-write-back-was-reported-stalled.md`); and its test, a 1 ms reply
+    deadline, found macOS refusing a zero-timeout wait as `OsRefused`
+    (`docs/bugs/2026-10-28-a-wait-with-no-time-left-was-refused-on-macos.md`).
 - **The direct map on Windows (A-175, G-direct step 5, 2026-10-25): built, and proven on a real Windows machine.**
   - **What:** a `MapRead` on Windows is answered `MapHanded`. The file's copy is an unnamed pagefile-backed section under
     `D:P(A;;RC;;;OW)`, a descriptor that grants no one any right to it; the daemon duplicates a read-only handle of it
