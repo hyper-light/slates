@@ -1,0 +1,37 @@
+name: DIAG macOS NFS dirty mapped page against another path's write (not for main)
+
+# A diagnostics branch, never merged. G-nfs-writable (docs/wip/GAPS.md): through slates' own NFSv3 mount on macOS, a
+# page dirtied through a shared map and not yet synced while another path replaces the file: what does the map show,
+# and what does the file hold after the map's msync? Measured on a quiet runner, three times; each run unmounts before
+# its daemon stops (a daemon stopped under a live macOS NFS mount has panicked a kernel).
+
+on:
+  push:
+    branches: [diag-macos-nfs-dirty]
+
+jobs:
+  measure:
+    name: dirty mapped page over the NFSv3 mount (macos-latest)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the CLI
+        run: cargo build --release -p slates-cli --bin slates
+      - name: The machine
+        run: sw_vers && uname -a && sysctl -n hw.pagesize
+      - name: Measure, three runs
+        env:
+          SLATES_BIN: ${{ github.workspace }}/target/release/slates
+        run: |
+          for run in 1 2 3; do
+            export SLATES_WORK="$RUNNER_TEMP/nfs-dirty-$run"
+            echo "== run $run"
+            ./diag/nfs-dirty-page.sh || echo "run $run exited $?"
+          done
+      - name: Anything left mounted
+        if: always()
+        run: mount | grep nfs-dirty || echo "nothing mounted"
