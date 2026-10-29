@@ -11319,6 +11319,47 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     re-witness asks the host's clock as a copy-up does (A-162).
   - A racy witness never settles: after a re-hash past its tick confirms it, the fingerprint alone would do, but every
     drift check of it still hashes the whole file.
+- **The direct map writes (A-186, 2026-10-28): built, and proven by real clients on Linux x86_64, macOS arm64 and
+  Windows x86_64.**
+  - **What:** `MapWrite` maps a file read and write under the caller's own write attachment. The daemon makes the
+    per-file copy writable and hands it as `MapRead`'s copy is handed. The client's stores reach the file at its
+    `MapSync`, at its `ReleaseMap` and before its reap removes its attachments: the copy is compared back through the
+    attachment by A-163's compare-back (`write_back_slice`, now one function for both), and the shard publishes before
+    the reply. A `Detach` with writable maps held under it is refused `MapsHeld`.
+  - **Proven:**
+    - Linux on adacachy (Linux 7.2.9, 4 KiB pages): the client binary's 8 writable-map tests, and `reap_map`'s killed
+      writer (its unsynced stores in the file after its reap); `peer_object` 9 of 9; the rendezvous's writable judge;
+      clippy of the six crates clean.
+    - macOS on this Mac (macOS 26.4.1, 16 KiB pages): the same client tests, the killed writer, `peer_object` 8 of 8,
+      clippy clean.
+    - Windows on jupiter (Windows 10.0.26200): the client tests, one at a time, and `peer_section`'s writable section
+      (a duplicate that may rewrite the descriptor or extend the section refused `ERROR_ACCESS_DENIED`); clippy clean.
+    - The store race (a store made during a sync is never undone) ran about 130,000 stores over 200 syncs on Linux
+      (3 runs of 3), 1,251,963 on macOS and 209,504 on Windows, none undone.
+  - **Red-checked** on the box, eleven mutants, each failing its guard (A-186 lists them; without the write-back's
+    suppression, 84 of 158,498 stores were undone). On jupiter, three: a writable handle handed with `WRITE_DAC`, and a
+    section under the default descriptor, each refused unconfined at the hand-off; and that section with the judge
+    passing everything, which the hostile test catches.
+  - **Found on the way, reported:**
+    - `MapRead` does not refuse a file an in-process guest maps writable (the DAX registry's `has_writable_of`), which
+      `MapWrite` refuses: that guest's stores bypass the write boundary, so a read-only copy made meanwhile would go
+      stale. `Volume::dax_map_write` refuses the other order already. No test reaches it; left for its own fix.
+    - The fill's deferral answered its never-expected route refusal with the copy still held: the fill's drop runs
+      inside the state's borrow there and cannot reach the store. The shared deferral lets the copy go on both of its
+      refusals now.
+    - The Docker direct-map test passed by the parity of its client count: its daemon ran two shards, a client's shard
+      is its id's residue, and a copy is handed only to a client of the volume's shard. Its container connected after
+      three status calls and landed on the volume's shard; the writable test's, after four, was refused
+      `MapUnavailable`. Both run a one-shard daemon now, as the client suite's do.
+  - **Open:**
+    - **A client of another shard** is refused a writable map (a read falls back to a copy): a descriptor does not
+      cross shards yet, so in a daemon of N shards about one client in N is served. The hand-off would go through the
+      client's home shard, which holds its control socket; the copy stays on the volume's shard, where its writes are
+      kept.
+    - The writable map from pods (the KIND direct leg's write mode, built: CI's KIND lane runs it) and from a Windows
+      container (a diagnostics run); arm64 by run, which CI's native arm64 lanes give on push. **Docker done** the same
+      day on adacachy: the container's process stores through its map and the host reads the store
+      (`synced=43 released=0`), red-checked with the sync comparing nothing.
 - **The direct map on Windows (A-175, G-direct step 5, 2026-10-25): built, and proven on a real Windows machine.**
   - **What:** a `MapRead` on Windows is answered `MapHanded`. The file's copy is an unnamed pagefile-backed section under
     `D:P(A;;RC;;;OW)`, a descriptor that grants no one any right to it; the daemon duplicates a read-only handle of it

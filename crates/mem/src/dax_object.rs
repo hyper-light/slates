@@ -61,8 +61,25 @@
 //!   refused `ERROR_ACCESS_DENIED`; measured 2026-10-25 on Windows 10.0.26200 (`tests/peer_section.rs`), where the
 //!   default descriptor grants both (A-175). Zeroing is stores over the whole span: Windows tells no section's holes.
 //!
+//! **A copy the peer writes too** ([`PeerAccess::ReadWrite`], §4.6, A-186). The writable direct map hands a client the
+//! same per-file copy to map read and write ([`PeerWriteView`]). The client's stores land in the copy, and the daemon
+//! compares the copy back into the file at the client's sync points, as it does a Shards guest's stores (A-163). The
+//! copy still authorizes that one file's bytes and nothing else, and its size stays fixed:
+//! - **Linux:** sealed against growing, shrinking and further seals (`F_SEAL_SHRINK`, `F_SEAL_GROW`, `F_SEAL_SEAL`), but
+//!   not against writes, so the client's shared map writes. A `write` or a hole punch by the client changes bytes as a
+//!   store would; a resize and a new seal are refused `EPERM` (`mm/shmem.c`, `mm/memfd.c`).
+//! - **macOS:** the handed descriptor is opened read and write before the name goes. XNU refuses a second sizing
+//!   whatever the mode (`EINVAL`), as for the read-only copy.
+//! - **Windows:** the peer is handed a duplicate that maps read and write (`PeerObject::read_write_handle`). The
+//!   section's descriptor refuses any wider duplicate, so a holder can neither extend the section nor rewrite its
+//!   descriptor.
+//!
+//! A read-only copy is never handed a writable way: the object keeps the access it was made with and refuses a
+//! writable handle, and the Linux write seal and the macOS read-only descriptor refuse the client any.
+//!
 //! Because the write seal refuses slates' own hole punch too, a peer object's zeroing is stores of zeros over what
-//! holds bytes ([`PeerObject::zero`]): its cost is the bytes zeroed, where a DAX object's punch gives pages back.
+//! holds bytes ([`PeerObject::zero`]): its cost is the bytes zeroed, where a DAX object's punch gives pages back. A
+//! writable copy zeroes the same way, so both kinds take one path.
 //!
 //! **Zeroing commits no fresh memory.**
 //! - **Linux** punches the hole through slates' own view with `MADV_REMOVE`, which the kernel carries out as a
@@ -115,7 +132,36 @@ pub fn dax_object_bytes() -> u64 {
 /// The security descriptor every Windows peer section is made under (A-175), for the test that measures it.
 #[cfg(windows)]
 pub use imp::PEER_SECTION_SDDL;
-pub use imp::{DaxObject, PeerObject, PeerView};
+pub use imp::{DaxObject, PeerObject, PeerView, PeerWriteView};
+
+/// What a same-kernel peer may do with the copy it is handed (§4.6): map it read alone (A-171), or read and write
+/// (A-186). An object keeps the access it was made with, and is handed no way that writes unless it was made
+/// [`PeerAccess::ReadWrite`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerAccess {
+  /// Read alone: every writer but slates' own view is refused.
+  Read,
+  /// Read and write: the peer may change the copy's bytes, which the daemon compares back into the file, and nothing
+  /// else about it (its size and its seals are fixed).
+  ReadWrite,
+}
+
+/// `offset .. offset + count` as an offset into a peer object or view of `len` bytes, refused `OutOfRange` past it.
+#[cfg(any(unix, windows))]
+fn within_view(offset: u64, count: usize, len: u64) -> Result<usize, crate::error::MemError> {
+  let refused = crate::error::MemError::OutOfRange {
+    offset: usize::try_from(offset).unwrap_or(usize::MAX),
+    len: usize::try_from(len).unwrap_or(usize::MAX),
+  };
+  let end = u64::try_from(count)
+    .ok()
+    .and_then(|count| offset.checked_add(count))
+    .ok_or(refused.clone())?;
+  if end > len {
+    return Err(refused);
+  }
+  usize::try_from(offset).map_err(|_| refused)
+}
 
 /// A live mapping's bytes reached only through atomics, the one discipline every view of a peer object or a DAX object
 /// keeps on every platform (AUD-29-09): another process may store into the bytes at any moment, so no reference to them
@@ -247,7 +293,7 @@ mod imp {
   use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
   use super::racy::{Racy, RacyStore};
-  use super::{DAX_OBJECT_BYTES, DAX_RANGE_BYTES};
+  use super::{DAX_OBJECT_BYTES, DAX_RANGE_BYTES, PeerAccess, within_view};
   use crate::error::MemError;
   use crate::shared::{RangeView, ReadView};
 
@@ -457,22 +503,26 @@ mod imp {
     }
   }
 
-  /// One file's copy for a same-kernel peer, and slates' one writable view of it (§4.6, A-171): the object a client
-  /// maps read alone. It is sized once, at its creation, to the file's page span ([`PeerObject::bytes_for`]), and
-  /// slates reaches its bytes only with `&mut self`, through atomics, since the client loads them at any moment.
+  /// One file's copy for a same-kernel peer, and slates' one writable view of it (§4.6): the object a client maps read
+  /// alone (A-171) or read and write (A-186), as its [`PeerAccess`] says. It is sized once, at its creation, to the
+  /// file's page span ([`PeerObject::bytes_for`]), and slates reaches its bytes only with `&mut self`, through atomics,
+  /// since the client loads them, or stores them, at any moment.
   pub struct PeerObject {
     fd: OwnedFd,
-    /// The descriptor a peer is handed: a second one, opened read alone before the object's name went (macOS).
+    /// The descriptor a peer is handed: a second one, opened before the object's name went, read alone or read and
+    /// write as the access says (macOS).
     #[cfg(target_os = "macos")]
     handed: OwnedFd,
     view: RangeView,
     len: u64,
+    access: PeerAccess,
   }
 
   impl std::fmt::Debug for PeerObject {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
       f.debug_struct("PeerObject")
         .field("len", &self.len)
+        .field("access", &self.access)
         .finish()
     }
   }
@@ -492,26 +542,29 @@ mod imp {
     }
 
     /// A new object of zeros, [`PeerObject::bytes_for`] `file_bytes` long, named `name` where the OS shows names
-    /// (`memfd:<name>` in `/proc` on Linux), with slates' writable view of all of it taken and every other writer
-    /// refused: sealed against writes and resizing on Linux, handed read alone on macOS. Refused `OutOfRange` where the
-    /// span does not fit an address, `OsRefused` where the OS refuses a step, and by kind where there is no route.
-    pub fn create(name: &str, file_bytes: u64) -> Result<PeerObject, MemError> {
+    /// (`memfd:<name>` in `/proc` on Linux), with slates' writable view of all of it taken. A copy of
+    /// [`PeerAccess::Read`] refuses every other writer: sealed against writes and resizing on Linux, handed read alone
+    /// on macOS. One of [`PeerAccess::ReadWrite`] refuses any change but its bytes': sealed against resizing alone on
+    /// Linux, handed read and write on macOS. Refused `OutOfRange` where the span does not fit an address, `OsRefused`
+    /// where the OS refuses a step, and by kind where there is no route.
+    pub fn create(name: &str, file_bytes: u64, access: PeerAccess) -> Result<PeerObject, MemError> {
       let len = PeerObject::bytes_for(file_bytes)?;
       let view_len = usize::try_from(len).map_err(|_| MemError::OutOfRange {
         offset: 0,
         len: usize::MAX,
       })?;
-      let made = platform::create_peer_object(name, len)?;
+      let made = platform::create_peer_object(name, len, access)?;
       // The view first, then the seals: the write seal refuses every writable map made after it, slates' own included,
       // and keeps working only the ones made before (`memfd_create(2)`, F_SEAL_FUTURE_WRITE).
       let view = RangeView::map(&made.fd, 0, view_len)?;
-      platform::seal_peer_object(&made.fd)?;
+      platform::seal_peer_object(&made.fd, access)?;
       Ok(PeerObject {
         fd: made.fd,
         #[cfg(target_os = "macos")]
         handed: made.handed,
         view,
         len,
+        access,
       })
     }
 
@@ -521,13 +574,20 @@ mod imp {
       self.len
     }
 
+    /// What a peer may do with the object, fixed when it was made.
+    #[must_use]
+    pub fn access(&self) -> PeerAccess {
+      self.access
+    }
+
     /// Never: an object is at least a page. Here for the convention beside [`PeerObject::len`].
     #[must_use]
     pub fn is_empty(&self) -> bool {
       self.len == 0
     }
 
-    /// The descriptor to hand a peer: the sealed object itself on Linux, the read-only second descriptor on macOS.
+    /// The descriptor to hand a peer: the sealed object itself on Linux, the second descriptor on macOS (read alone, or
+    /// read and write, as the object's access says).
     #[must_use]
     pub fn descriptor(&self) -> BorrowedFd<'_> {
       #[cfg(target_os = "macos")]
@@ -569,18 +629,7 @@ mod imp {
 
     /// `offset .. offset + count` as an offset into slates' view, refused `OutOfRange` past the object.
     fn within(&self, offset: u64, count: usize) -> Result<usize, MemError> {
-      let refused = MemError::OutOfRange {
-        offset: usize::try_from(offset).unwrap_or(usize::MAX),
-        len: usize::try_from(self.len).unwrap_or(usize::MAX),
-      };
-      let end = u64::try_from(count)
-        .ok()
-        .and_then(|count| offset.checked_add(count))
-        .ok_or(refused.clone())?;
-      if end > self.len {
-        return Err(refused);
-      }
-      usize::try_from(offset).map_err(|_| refused)
+      within_view(offset, count, self.len)
     }
   }
 
@@ -636,19 +685,76 @@ mod imp {
 
     /// Copies the view's bytes at `offset` into `into`, through atomics. Refused `OutOfRange` past the view.
     pub fn load(&self, offset: u64, into: &mut [u8]) -> Result<(), MemError> {
-      let refused = MemError::OutOfRange {
-        offset: usize::try_from(offset).unwrap_or(usize::MAX),
-        len: usize::try_from(self.len).unwrap_or(usize::MAX),
-      };
-      let end = u64::try_from(into.len())
-        .ok()
-        .and_then(|count| offset.checked_add(count))
-        .ok_or(refused.clone())?;
-      if end > self.len {
-        return Err(refused);
-      }
-      let at = usize::try_from(offset).map_err(|_| refused)?;
+      let at = within_view(offset, into.len(), self.len)?;
       self.view.load(at, into)
+    }
+  }
+
+  /// A client's view of a writable copy a daemon handed it (§4.6, A-186): the whole object, mapped read and write and
+  /// shared, so its stores land in the daemon's copy, which compares them back into the file at the client's sync
+  /// points. The daemon writes the copy at any moment too, since it follows the file, so the bytes are loaded and
+  /// stored through atomics and never borrowed.
+  pub struct PeerWriteView {
+    fd: OwnedFd,
+    view: RangeView,
+    len: u64,
+  }
+
+  impl std::fmt::Debug for PeerWriteView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+      f.debug_struct("PeerWriteView")
+        .field("len", &self.len)
+        .finish()
+    }
+  }
+
+  impl PeerWriteView {
+    /// Maps the first `len` bytes of the object behind `fd`, read and write. Refused `OutOfRange` for an empty view or
+    /// one longer than the object, which would fault past its end, and `OsRefused` where the OS refuses the map (a
+    /// read-only descriptor, or a Linux object sealed against writes).
+    pub fn map(fd: OwnedFd, len: u64) -> Result<PeerWriteView, MemError> {
+      let object = rustix::fs::fstat(&fd).map_err(|e| refused("fstat", e))?;
+      let object_bytes = u64::try_from(object.st_size).unwrap_or(0);
+      let view_len = usize::try_from(len)
+        .ok()
+        .filter(|bytes| *bytes > 0 && len <= object_bytes)
+        .ok_or(MemError::OutOfRange {
+          offset: usize::try_from(len).unwrap_or(usize::MAX),
+          len: usize::try_from(object_bytes).unwrap_or(usize::MAX),
+        })?;
+      let view = RangeView::map(&fd, 0, view_len)?;
+      Ok(PeerWriteView { fd, view, len })
+    }
+
+    /// The view's length in bytes.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+      self.len
+    }
+
+    /// Never: an empty view is refused. Here for the convention beside [`PeerWriteView::len`].
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+      self.len == 0
+    }
+
+    /// The descriptor the view maps, as the daemon handed it.
+    #[must_use]
+    pub fn descriptor(&self) -> BorrowedFd<'_> {
+      self.fd.as_fd()
+    }
+
+    /// Copies the view's bytes at `offset` into `into`, through atomics. Refused `OutOfRange` past the view.
+    pub fn load(&self, offset: u64, into: &mut [u8]) -> Result<(), MemError> {
+      let at = within_view(offset, into.len(), self.len)?;
+      self.view.load(at, into)
+    }
+
+    /// Copies `from` into the view at `offset`, through atomics: the store lands in the daemon's copy at once, and in
+    /// the file at the next sync. Refused `OutOfRange` past the view.
+    pub fn store(&self, offset: u64, from: &[u8]) -> Result<(), MemError> {
+      let at = within_view(offset, from.len(), self.len)?;
+      self.view.store(at, from)
     }
   }
 
@@ -690,7 +796,7 @@ mod imp {
     }
   }
 
-  /// A new peer object's descriptors: slates' own, and on macOS the read-only one a peer is handed.
+  /// A new peer object's descriptors: slates' own, and on macOS the one a peer is handed.
   struct MadePeer {
     fd: OwnedFd,
     #[cfg(target_os = "macos")]
@@ -701,12 +807,17 @@ mod imp {
   mod platform {
     use std::os::fd::OwnedFd;
 
-    use super::{DAX_OBJECT_BYTES, MadePeer, RacyStore, refused};
+    use super::{DAX_OBJECT_BYTES, MadePeer, PeerAccess, RacyStore, refused};
     use crate::error::MemError;
     use crate::shared::RangeView;
 
-    /// A sealable memfd of `len` bytes named `name`, not yet sealed: slates maps its view before the write seal.
-    pub(super) fn create_peer_object(name: &str, len: u64) -> Result<MadePeer, MemError> {
+    /// A sealable memfd of `len` bytes named `name`, not yet sealed: slates maps its view before the write seal. One
+    /// descriptor serves every access, since the seals decide what a holder may do (`_access` is macOS's).
+    pub(super) fn create_peer_object(
+      name: &str,
+      len: u64,
+      _access: PeerAccess,
+    ) -> Result<MadePeer, MemError> {
       let fd = rustix::fs::memfd_create(
         name,
         rustix::fs::MemfdFlags::CLOEXEC | rustix::fs::MemfdFlags::ALLOW_SEALING,
@@ -718,18 +829,18 @@ mod imp {
       Ok(MadePeer { fd })
     }
 
-    /// Seals a peer object against every later writer and any change of size or seals. The write seal is the
-    /// "future" one, so the view slates took before it keeps writing (Linux 5.1 and later; an older kernel refuses
-    /// the seal, and the object with it).
-    pub(super) fn seal_peer_object(fd: &OwnedFd) -> Result<(), MemError> {
-      rustix::fs::fcntl_add_seals(
-        fd,
-        rustix::fs::SealFlags::FUTURE_WRITE
-          | rustix::fs::SealFlags::SHRINK
-          | rustix::fs::SealFlags::GROW
-          | rustix::fs::SealFlags::SEAL,
-      )
-      .map_err(|e| refused("fcntl_add_seals", e))
+    /// Seals a peer object against any change of size or seals, and a read-only one against every later writer too.
+    /// The write seal is the "future" one, so the view slates took before it keeps writing (Linux 5.1 and later; an
+    /// older kernel refuses the seal, and the object with it). A writable one takes no write seal: its peer's shared map
+    /// writes, and a `write` or a hole punch by the peer changes bytes as a store would, within the fixed size.
+    pub(super) fn seal_peer_object(fd: &OwnedFd, access: PeerAccess) -> Result<(), MemError> {
+      let fixed =
+        rustix::fs::SealFlags::SHRINK | rustix::fs::SealFlags::GROW | rustix::fs::SealFlags::SEAL;
+      let seals = match access {
+        PeerAccess::Read => rustix::fs::SealFlags::FUTURE_WRITE | fixed,
+        PeerAccess::ReadWrite => fixed,
+      };
+      rustix::fs::fcntl_add_seals(fd, seals).map_err(|e| refused("fcntl_add_seals", e))
     }
 
     /// Zeroes `from .. to` of a peer object's view by stores over the object's data alone. `SEEK_DATA` and `SEEK_HOLE`
@@ -817,16 +928,20 @@ mod imp {
   mod platform {
     use std::os::fd::OwnedFd;
 
-    use super::{DAX_OBJECT_BYTES, MadePeer, RacyStore, refused};
+    use super::{DAX_OBJECT_BYTES, MadePeer, PeerAccess, RacyStore, refused};
     use crate::error::MemError;
     use crate::shared::RangeView;
 
     /// A shared-memory object of `len` bytes reached from now on by its two descriptors alone: slates' own, read and
-    /// write, and the one a peer is handed, opened read alone while the name still reached the object. A read-only
-    /// descriptor of an unlinked object is all a peer can have: no name opens it again, a writable shared map of it is
-    /// refused, and its size was set once, which is all macOS allows. `_name` is Linux's: here the name is random and
-    /// goes at once.
-    pub(super) fn create_peer_object(_name: &str, len: u64) -> Result<MadePeer, MemError> {
+    /// write, and the one a peer is handed, opened while the name still reached the object, read alone or read and
+    /// write as `access` says. A descriptor of an unlinked object is all a peer can have: no name opens it again, its
+    /// access mode is all it may do (a writable shared map of a read-only one is refused), and its size was set once,
+    /// which is all macOS allows. `_name` is Linux's: here the name is random and goes at once.
+    pub(super) fn create_peer_object(
+      _name: &str,
+      len: u64,
+      access: PeerAccess,
+    ) -> Result<MadePeer, MemError> {
       use rustix::fs::Mode;
       use rustix::shm::OFlags;
       let name = random_name()?;
@@ -838,8 +953,13 @@ mod imp {
         Mode::RUSR | Mode::WUSR,
       )
       .map_err(|e| refused("shm_open", e))?;
-      // structural: allow — shm_open of the kernel object just created, read alone (no filesystem entry; D-10).
-      let handed = rustix::shm::open(name.as_str(), OFlags::RDONLY, Mode::empty());
+      let mode = match access {
+        PeerAccess::Read => OFlags::RDONLY,
+        // structural: allow — the shared-memory object's access mode for a writable copy's peer, not a file's.
+        PeerAccess::ReadWrite => OFlags::RDWR,
+      };
+      // structural: allow — shm_open of the kernel object just created, in the peer's access (no filesystem entry; D-10).
+      let handed = rustix::shm::open(name.as_str(), mode, Mode::empty());
       // The name goes at once, whether or not the second open was granted, so no other process of this user can open
       // the object and nothing is left behind under its name.
       let unlinked = rustix::shm::unlink(name.as_str()).map_err(|e| refused("shm_unlink", e));
@@ -851,8 +971,8 @@ mod imp {
       Ok(MadePeer { fd, handed })
     }
 
-    /// Nothing to seal on macOS: the peer's descriptor is read alone and the size was set once.
-    pub(super) fn seal_peer_object(_fd: &OwnedFd) -> Result<(), MemError> {
+    /// Nothing to seal on macOS: the peer's descriptor's mode is its access, and the size was set once.
+    pub(super) fn seal_peer_object(_fd: &OwnedFd, _access: PeerAccess) -> Result<(), MemError> {
       Ok(())
     }
 
@@ -982,12 +1102,16 @@ mod imp {
   mod platform {
     use std::os::fd::OwnedFd;
 
-    use super::MadePeer;
+    use super::{MadePeer, PeerAccess};
     use crate::error::MemError;
     use crate::shared::RangeView;
 
     /// No peer object on this platform: refused by kind.
-    pub(super) fn create_peer_object(_name: &str, _len: u64) -> Result<MadePeer, MemError> {
+    pub(super) fn create_peer_object(
+      _name: &str,
+      _len: u64,
+      _access: PeerAccess,
+    ) -> Result<MadePeer, MemError> {
       Err(MemError::OsRefused {
         call: "peer object",
         code: None,
@@ -995,7 +1119,7 @@ mod imp {
     }
 
     /// Never reached: no peer object is ever created here.
-    pub(super) fn seal_peer_object(_fd: &OwnedFd) -> Result<(), MemError> {
+    pub(super) fn seal_peer_object(_fd: &OwnedFd, _access: PeerAccess) -> Result<(), MemError> {
       Err(MemError::OsRefused {
         call: "peer object",
         code: None,
@@ -1058,6 +1182,7 @@ mod imp {
   use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
   use super::racy::{Racy, RacyStore};
+  use super::{PeerAccess, within_view};
   use crate::error::MemError;
 
   /// A file's DAX object and the views of it slates holds (Windows, plan G-shards-windows step 5): an unnamed
@@ -1486,18 +1611,21 @@ mod imp {
 
   /// One file's copy for a same-kernel peer, and slates' one writable view of it (§4.6, A-175 on Windows): an unnamed
   /// pagefile-backed section ([`confined_section`]) sized once to the file's page span. slates holds the creator's
-  /// handle, with every access, and never hands it; a peer gets a read-only duplicate ([`PeerObject::read_only_handle`])
-  /// that the section's descriptor lets no one turn into more.
+  /// handle, with every access, and never hands it. A peer gets a read-only duplicate ([`PeerObject::read_only_handle`])
+  /// or, from a copy made [`PeerAccess::ReadWrite`], one that writes too ([`PeerObject::read_write_handle`], A-186); the
+  /// section's descriptor lets no one turn either into more.
   pub struct PeerObject {
     section: OwnedHandle,
     view: WriteView,
     len: u64,
+    access: PeerAccess,
   }
 
   impl std::fmt::Debug for PeerObject {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
       f.debug_struct("PeerObject")
         .field("len", &self.len)
+        .field("access", &self.access)
         .finish()
     }
   }
@@ -1515,10 +1643,14 @@ mod imp {
         })
     }
 
-    /// A new object of zeros, [`PeerObject::bytes_for`] `file_bytes` long, with slates' writable view of all of it.
-    /// `_name` is Linux's (a memfd's name); a section here has none, so nothing opens it by one. Refused `OutOfRange`
-    /// where the span does not fit an address, `OsRefused` where the OS refuses a step.
-    pub fn create(_name: &str, file_bytes: u64) -> Result<PeerObject, MemError> {
+    /// A new object of zeros, [`PeerObject::bytes_for`] `file_bytes` long, with slates' writable view of all of it, to
+    /// be handed as `access` says. `_name` is Linux's (a memfd's name); a section here has none, so nothing opens it by
+    /// one. Refused `OutOfRange` where the span does not fit an address, `OsRefused` where the OS refuses a step.
+    pub fn create(
+      _name: &str,
+      file_bytes: u64,
+      access: PeerAccess,
+    ) -> Result<PeerObject, MemError> {
       let len = PeerObject::bytes_for(file_bytes)?;
       let view_len = usize::try_from(len).map_err(|_| MemError::OutOfRange {
         offset: 0,
@@ -1530,7 +1662,18 @@ mod imp {
         FILE_MAP_WRITE | FILE_MAP_READ,
         view_len,
       )?);
-      Ok(PeerObject { section, view, len })
+      Ok(PeerObject {
+        section,
+        view,
+        len,
+        access,
+      })
+    }
+
+    /// What a peer may do with the object, fixed when it was made.
+    #[must_use]
+    pub fn access(&self) -> PeerAccess {
+      self.access
     }
 
     /// The object's size in bytes, which never changes.
@@ -1549,6 +1692,20 @@ mod imp {
     /// handed, duplicated again into its process. The section's own handle, which writes, never leaves the object.
     pub fn read_only_handle(&self) -> Result<OwnedHandle, MemError> {
       duplicate_here(self.section.as_handle(), FILE_MAP_READ)
+    }
+
+    /// A duplicate of the section's handle in this process that maps it read and write (`FILE_MAP_READ |
+    /// FILE_MAP_WRITE`, A-186): what a peer of a writable copy is handed, duplicated again into its process. It cannot
+    /// extend the section or rewrite its descriptor, rights the descriptor grants no one. Refused `OsRefused` for a copy
+    /// made [`PeerAccess::Read`], which is never handed a way to write.
+    pub fn read_write_handle(&self) -> Result<OwnedHandle, MemError> {
+      if self.access != PeerAccess::ReadWrite {
+        return Err(MemError::OsRefused {
+          call: "a writable handle of a read-only copy",
+          code: None,
+        });
+      }
+      duplicate_here(self.section.as_handle(), FILE_MAP_READ | FILE_MAP_WRITE)
     }
 
     /// Copies `from` into the object at `offset`, through atomics. Refused `OutOfRange` past the object.
@@ -1577,18 +1734,7 @@ mod imp {
 
     /// `offset .. offset + count` as an offset into slates' view, refused `OutOfRange` past the object.
     fn within(&self, offset: u64, count: usize) -> Result<usize, MemError> {
-      let refused = MemError::OutOfRange {
-        offset: usize::try_from(offset).unwrap_or(usize::MAX),
-        len: usize::try_from(self.len).unwrap_or(usize::MAX),
-      };
-      let end = u64::try_from(count)
-        .ok()
-        .and_then(|count| offset.checked_add(count))
-        .ok_or(refused.clone())?;
-      if end > self.len {
-        return Err(refused);
-      }
-      usize::try_from(offset).map_err(|_| refused)
+      within_view(offset, count, self.len)
     }
   }
 
@@ -1642,19 +1788,78 @@ mod imp {
 
     /// Copies the view's bytes at `offset` into `into`, through atomics. Refused `OutOfRange` past the view.
     pub fn load(&self, offset: u64, into: &mut [u8]) -> Result<(), MemError> {
-      let refused = MemError::OutOfRange {
-        offset: usize::try_from(offset).unwrap_or(usize::MAX),
-        len: usize::try_from(self.len).unwrap_or(usize::MAX),
-      };
-      let end = u64::try_from(into.len())
-        .ok()
-        .and_then(|count| offset.checked_add(count))
-        .ok_or(refused.clone())?;
-      if end > self.len {
-        return Err(refused);
-      }
-      let at = usize::try_from(offset).map_err(|_| refused)?;
+      let at = within_view(offset, into.len(), self.len)?;
       self.view.load(at, into)
+    }
+  }
+
+  /// A client's view of a writable copy a daemon handed it (§4.6, A-186 on Windows): the whole section, mapped read and
+  /// write through the handle the daemon duplicated into this process, so its stores land in the daemon's copy, which
+  /// compares them back into the file at the client's sync points. The daemon writes it at any moment too, so its bytes
+  /// are loaded and stored through atomics and never borrowed.
+  pub struct PeerWriteView {
+    handle: OwnedHandle,
+    view: WriteView,
+    len: u64,
+  }
+
+  impl std::fmt::Debug for PeerWriteView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+      f.debug_struct("PeerWriteView")
+        .field("len", &self.len)
+        .finish()
+    }
+  }
+
+  impl PeerWriteView {
+    /// Maps the whole section behind `handle`, read and write, and serves its first `len` bytes. Refused `OutOfRange`
+    /// for an empty view or one longer than the section, and `OsRefused` where the OS refuses the map (a handle that
+    /// does not write).
+    pub fn map(handle: OwnedHandle, len: u64) -> Result<PeerWriteView, MemError> {
+      let view = SectionView::map(handle.as_handle(), FILE_MAP_READ | FILE_MAP_WRITE, 0)?;
+      let object_bytes = u64::try_from(view.len).unwrap_or(0);
+      if len == 0 || len > object_bytes {
+        return Err(MemError::OutOfRange {
+          offset: usize::try_from(len).unwrap_or(usize::MAX),
+          len: view.len,
+        });
+      }
+      Ok(PeerWriteView {
+        handle,
+        view: WriteView(view),
+        len,
+      })
+    }
+
+    /// The view's length in bytes.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+      self.len
+    }
+
+    /// Never: an empty view is refused. Here for the convention beside [`PeerWriteView::len`].
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+      self.len == 0
+    }
+
+    /// The handle the view maps, as the daemon handed it.
+    #[must_use]
+    pub fn handle(&self) -> BorrowedHandle<'_> {
+      self.handle.as_handle()
+    }
+
+    /// Copies the view's bytes at `offset` into `into`, through atomics. Refused `OutOfRange` past the view.
+    pub fn load(&self, offset: u64, into: &mut [u8]) -> Result<(), MemError> {
+      let at = within_view(offset, into.len(), self.len)?;
+      self.view.load(at, into)
+    }
+
+    /// Copies `from` into the view at `offset`, through atomics: the store lands in the daemon's copy at once, and in
+    /// the file at the next sync. Refused `OutOfRange` past the view.
+    pub fn store(&self, offset: u64, from: &[u8]) -> Result<(), MemError> {
+      let at = within_view(offset, from.len(), self.len)?;
+      self.view.store(at, from)
     }
   }
 }

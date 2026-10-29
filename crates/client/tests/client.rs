@@ -527,6 +527,552 @@ fn a_released_map_gives_its_copy_back_and_the_file_maps_again() {
   client.destroy(id).unwrap();
 }
 
+/// The bytes where `before` and `after` differ: what a write-back of `after` over `before` writes (A-186).
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn differing_bytes(before: &[u8], after: &[u8]) -> u64 {
+  u64::try_from(
+    before
+      .iter()
+      .zip(after)
+      .filter(|(was, is)| was != is)
+      .count(),
+  )
+  .unwrap()
+}
+
+/// Stores `phrase` into `mapped` at `at` and into `expect` at the same offset: what the file holds once written back.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn store_phrase(mapped: &slates_client::MappedWrite, expect: &mut [u8], at: usize, phrase: &[u8]) {
+  assert_eq!(
+    mapped.write_at(u64::try_from(at).unwrap(), phrase).unwrap(),
+    phrase.len(),
+    "the map takes the store at {at}"
+  );
+  expect
+    .get_mut(at..at + phrase.len())
+    .unwrap()
+    .copy_from_slice(phrase);
+}
+
+/// AC-A-186 (§4.6 the writable direct map): a writable map's stores reach the file at its sync, and only then. Do: on a
+/// one-shard daemon, write a 20 KiB file, attach for writing, map the file read and write, store a phrase across a page
+/// boundary and another at the file's start; read the file through a second client; sync; read again; sync again;
+/// release; detach. Expect: the map is zero-copy over the file's page span and shows the file; before the sync the
+/// second client reads the old bytes, the stores being in the copy alone; the sync writes exactly the bytes that differ
+/// and after it the second client reads them; the second sync and the release write nothing more; the release gives the
+/// copy back; three write-backs finished (`dax.local_map_synced`) with the differing bytes written once
+/// (`dax.local_map_synced_bytes`), and none was refused.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+fn a_writable_maps_stores_reach_the_file_at_its_sync() {
+  let (daemon, mut client, instance) = one_shard_daemon("mapw");
+  let mut reader = connect(&instance);
+  let len = 20 << 10;
+  let id = client.create(&room_for("mapw", len)).unwrap();
+  let old = pattern(len, 1);
+  write_file(&mut client, id, "/f.bin", &old);
+  let start = daemon.direct_map_copies().unwrap();
+  let attachment = client.attach(id, None, Intent::Write).unwrap().attachment;
+  let mapped = client.map_write((id, attachment), "/f.bin").unwrap();
+  assert_maps_the_file(&mapped, &old);
+  let page = usize::try_from(page_span(1)).unwrap();
+  let mut new = old.clone();
+  store_phrase(&mapped, &mut new, page - 5, b"across a page boundary");
+  store_phrase(&mapped, &mut new, 0, b"head");
+  assert_file(
+    &mut reader,
+    id,
+    &old,
+    "before the sync the stores are in the copy alone",
+  );
+  assert_eq!(
+    client.map_sync(&mapped).unwrap(),
+    differing_bytes(&old, &new),
+    "the sync wrote exactly the bytes that differ"
+  );
+  assert_file(
+    &mut reader,
+    id,
+    &new,
+    "after the sync the file holds the stores",
+  );
+  assert_eq!(
+    client.map_sync(&mapped).unwrap(),
+    0,
+    "nothing more to write"
+  );
+  assert_eq!(
+    client.release_map_write(mapped).unwrap(),
+    0,
+    "nor at the release"
+  );
+  assert_eq!(
+    daemon.direct_map_copies().unwrap(),
+    start,
+    "the release gave the copy back"
+  );
+  client.detach(attachment).unwrap();
+  assert_write_backs(&daemon, 3, differing_bytes(&old, &new));
+}
+
+/// The map is zero-copy over `file`'s page span and shows `file`.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn assert_maps_the_file(mapped: &slates_client::MappedWrite, file: &[u8]) {
+  assert_eq!(mapped.len(), u64::try_from(file.len()).unwrap());
+  assert_eq!(mapped.mapped_len(), page_span(file.len()));
+  let mut now = vec![0u8; file.len()];
+  assert_eq!(mapped.read_at(0, &mut now).unwrap(), file.len());
+  assert!(now == file, "the map shows the file");
+}
+
+/// `/f.bin` of `volume`, read through `reader`, is `expect`.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn assert_file(reader: &mut Client, volume: slates_client::VolumeId, expect: &[u8], what: &str) {
+  assert!(
+    reader
+      .read(volume, "/f.bin", slates_client::ReadAt::Head)
+      .unwrap()
+      == expect,
+    "{what}"
+  );
+}
+
+/// The daemon handed one map, finished `finished` write-backs that wrote `bytes` in all, refused none and judged
+/// nothing unconfined.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn assert_write_backs(daemon: &Daemon, finished: u64, bytes: u64) {
+  assert_eq!(counted(daemon, "dax.local_map"), 1);
+  assert_eq!(counted(daemon, "dax.local_map_synced"), finished);
+  assert_eq!(counted(daemon, "dax.local_map_synced_bytes"), bytes);
+  assert_eq!(counted(daemon, "dax.local_map_sync_refused"), 0);
+  assert_eq!(counted(daemon, "dax.local_map_unconfined"), 0);
+}
+
+/// Shape: how many syncs the store race overlaps with its stores: enough that a write-back written into its own copy
+/// would meet a store made since on some of them (each sync writes the copy's newest number back while stores go on).
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+const SYNCS_RACED: u64 = 200;
+
+/// AC-A-186: a store made while its map is being synced is never undone. A write-back writes the copy's bytes into the
+/// file, and the write boundary writes every change into the file's copies; the copy a write-back reads from is passed
+/// over (`ShardsBackings::suppress`), or the write-back would write the bytes it read back into the copy over a store
+/// the client made since. Do: map a file read and write; on one thread store an ever-larger number into the map's first
+/// word and load it back after each store, until [`SYNCS_RACED`] syncs are done on another thread; then sync once more.
+/// Expect: no load ever reads back less than the number just stored; the file ends holding the last number; the syncs
+/// wrote (the race ran).
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+fn a_store_made_while_its_map_is_synced_is_never_undone() {
+  use std::sync::atomic::{AtomicBool, Ordering};
+
+  let (daemon, mut client, instance) = one_shard_daemon("mapwrace");
+  let mut reader = connect(&instance);
+  let id = client.create(&room_for("mapwrace", 4 << 10)).unwrap();
+  write_file(&mut client, id, "/f.bin", &pattern(4 << 10, 6));
+  let attachment = client.attach(id, None, Intent::Write).unwrap().attachment;
+  let mapped = client.map_write((id, attachment), "/f.bin").unwrap();
+  let stop = AtomicBool::new(false);
+  let (undone, last) = std::thread::scope(|scope| {
+    let storer = scope.spawn(|| {
+      let (mut undone, mut value) = (0u64, 0u64);
+      while !stop.load(Ordering::Acquire) {
+        value += 1;
+        mapped.write_at(0, &value.to_le_bytes()).unwrap();
+        let mut back = [0u8; 8];
+        mapped.read_at(0, &mut back).unwrap();
+        undone += u64::from(u64::from_le_bytes(back) < value);
+      }
+      (undone, value)
+    });
+    for _ in 0..SYNCS_RACED {
+      client.map_sync(&mapped).unwrap();
+    }
+    stop.store(true, Ordering::Release);
+    storer.join().unwrap()
+  });
+  client.map_sync(&mapped).unwrap();
+  println!("store race: {last} stores over {SYNCS_RACED} syncs, {undone} undone");
+  assert_eq!(undone, 0, "a store made during a sync was undone");
+  let file = reader
+    .read(id, "/f.bin", slates_client::ReadAt::Head)
+    .unwrap();
+  assert_eq!(
+    file.get(..8).unwrap(),
+    last.to_le_bytes(),
+    "the file holds the last number"
+  );
+  assert!(
+    counted(&daemon, "dax.local_map_synced_bytes") > 0,
+    "the syncs wrote: the race ran"
+  );
+  client.release_map_write(mapped).unwrap();
+  client.detach(attachment).unwrap();
+}
+
+/// AC-A-186: a writable map sees another path's write at once, and a later store writes back only itself. Do: map a
+/// 64 KiB file read and write; store a phrase at 1000 and leave it unsynced; from a second client replace the whole file
+/// (`fs_write`: a cut to nothing, then a rewrite); store a second phrase at 2000 through the map; sync. Expect: after
+/// the replacement the map shows the replacement, the first store gone, as a later write over a shared map's page
+/// leaves it; the sync writes the second phrase's differing bytes alone, so the file is the replacement with that
+/// phrase in it and every other byte the other writer wrote is kept.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+fn a_writable_map_sees_another_paths_write_and_keeps_its_bytes() {
+  let (_daemon, mut client, instance) = one_shard_daemon("mapwcoh");
+  let mut writer = connect(&instance);
+  let len = 64 << 10;
+  let id = client.create(&room_for("mapwcoh", len)).unwrap();
+  write_file(&mut client, id, "/f.bin", &pattern(len, 1));
+  let attachment = client.attach(id, None, Intent::Write).unwrap().attachment;
+  let mapped = client.map_write((id, attachment), "/f.bin").unwrap();
+  let mut lost = pattern(len, 1);
+  store_phrase(&mapped, &mut lost, 1000, b"stored, then written over");
+  let replacement = pattern(len, 2);
+  write_file(&mut writer, id, "/f.bin", &replacement);
+  let mut now = vec![0u8; len];
+  assert_eq!(mapped.read_at(0, &mut now).unwrap(), len);
+  assert!(
+    now == replacement,
+    "the map shows the replacement, the earlier store gone"
+  );
+  let mut expect = replacement.clone();
+  store_phrase(&mapped, &mut expect, 2000, b"stored after the replacement");
+  assert_eq!(
+    client.map_sync(&mapped).unwrap(),
+    differing_bytes(&replacement, &expect),
+    "only the later store is written"
+  );
+  assert!(
+    writer
+      .read(id, "/f.bin", slates_client::ReadAt::Head)
+      .unwrap()
+      == expect,
+    "the other writer's bytes are kept, with the later store in them"
+  );
+  client.release_map_write(mapped).unwrap();
+  client.detach(attachment).unwrap();
+}
+
+/// AC-A-186: a store past the file's end is not the file's, as with a shared map of a file. Do: map a file of a page
+/// and 100 bytes read and write (its copy two pages), store a phrase 300 bytes past its end, read the map there, and
+/// sync. Expect: the map shows the store (it is in the copy); the sync writes nothing; the file keeps its length and
+/// its bytes.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+fn a_writable_maps_store_past_the_files_end_is_not_the_files() {
+  let (_daemon, mut client, _instance) = one_shard_daemon("mapwend");
+  let page = usize::try_from(page_span(1)).unwrap();
+  let len = page + 100;
+  let id = client.create(&room_for("mapwend", len)).unwrap();
+  let old = pattern(len, 3);
+  write_file(&mut client, id, "/f.bin", &old);
+  let attachment = client.attach(id, None, Intent::Write).unwrap().attachment;
+  let mapped = client.map_write((id, attachment), "/f.bin").unwrap();
+  assert_eq!(mapped.mapped_len(), page_span(len));
+  let phrase = b"past the end";
+  let at = u64::try_from(len + 300).unwrap();
+  assert_eq!(mapped.write_at(at, phrase).unwrap(), phrase.len());
+  let mut seen = [0u8; 12];
+  mapped.read_at(at, &mut seen).unwrap();
+  assert_eq!(&seen, phrase, "the store is in the copy");
+  assert_eq!(
+    client.map_sync(&mapped).unwrap(),
+    0,
+    "nothing past the end is written"
+  );
+  assert!(
+    client
+      .read(id, "/f.bin", slates_client::ReadAt::Head)
+      .unwrap()
+      == old,
+    "the file keeps its length and its bytes"
+  );
+  client.release_map_write(mapped).unwrap();
+  client.detach(attachment).unwrap();
+}
+
+/// AC-A-186: a detach waits for its writable maps, and a release writes their stores back. Do: map a file read and
+/// write under an attachment, store a phrase, detach the attachment; then release the map without syncing, read the
+/// file, and detach again. Expect: the first detach refused `MapsHeld { maps: 1 }` with nothing changed; the release
+/// reports the phrase's differing bytes written and the file holds them; the second detach succeeds and the daemon
+/// holds no copy.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+fn a_detach_waits_for_its_writable_maps_and_a_release_writes_back() {
+  let (daemon, mut client, _instance) = one_shard_daemon("mapwdet");
+  let len = 8 << 10;
+  let id = client.create(&room_for("mapwdet", len)).unwrap();
+  let old = pattern(len, 4);
+  write_file(&mut client, id, "/f.bin", &old);
+  let start = daemon.direct_map_copies().unwrap();
+  let attachment = client.attach(id, None, Intent::Write).unwrap().attachment;
+  let mapped = client.map_write((id, attachment), "/f.bin").unwrap();
+  let mut new = old.clone();
+  store_phrase(&mapped, &mut new, 100, b"written back at the release");
+  assert_eq!(
+    client.detach(attachment),
+    Err(ClientError::Refused(Refusal::MapsHeld { maps: 1 })),
+    "the attachment stays while its writable map is held"
+  );
+  assert_eq!(
+    client.release_map_write(mapped).unwrap(),
+    differing_bytes(&old, &new),
+    "the release wrote the store back"
+  );
+  assert!(
+    client
+      .read(id, "/f.bin", slates_client::ReadAt::Head)
+      .unwrap()
+      == new
+  );
+  client.detach(attachment).unwrap();
+  assert_eq!(daemon.direct_map_copies().unwrap(), start);
+}
+
+/// AC-A-186: a writable map follows its file, not its name, and its stores reach nothing once the file is gone, as a
+/// deleted file's do. Do: map a file read and write; from a second client rename it; store a phrase and sync; read the
+/// new name; then remove the file through the second client, store again and sync; release. Expect: the first sync
+/// writes the phrase into the renamed file; once the file is gone the sync is refused `NotFound` and writes nothing,
+/// and the release is refused the same way and still gives the copy back.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+fn a_writable_map_follows_its_file_and_reaches_nothing_once_it_is_gone() {
+  let (daemon, mut client, instance) = one_shard_daemon("mapwgone");
+  let mut other = connect(&instance);
+  let len = 8 << 10;
+  let id = client.create(&room_for("mapwgone", len)).unwrap();
+  let old = pattern(len, 7);
+  write_file(&mut client, id, "/f.bin", &old);
+  let start = daemon.direct_map_copies().unwrap();
+  let attachment = client.attach(id, None, Intent::Write).unwrap().attachment;
+  let mapped = client.map_write((id, attachment), "/f.bin").unwrap();
+  let others = other.attach(id, None, Intent::Write).unwrap().attachment;
+  other.fs_rename((id, others), "/f.bin", "/g.bin").unwrap();
+  let mut new = old.clone();
+  store_phrase(&mapped, &mut new, 64, b"follows the file");
+  assert_eq!(
+    client.map_sync(&mapped).unwrap(),
+    differing_bytes(&old, &new)
+  );
+  assert!(
+    other
+      .read(id, "/g.bin", slates_client::ReadAt::Head)
+      .unwrap()
+      == new,
+    "the store reached the file under its new name"
+  );
+  other.fs_remove((id, others), "/g.bin").unwrap();
+  store_phrase(&mapped, &mut new, 128, b"reaches nothing");
+  assert_eq!(
+    client.map_sync(&mapped),
+    Err(ClientError::Refused(Refusal::NotFound)),
+    "the file is gone"
+  );
+  assert_eq!(
+    client.release_map_write(mapped),
+    Err(ClientError::Refused(Refusal::NotFound)),
+    "the release's write-back finds no file"
+  );
+  assert_eq!(
+    daemon.direct_map_copies().unwrap(),
+    start,
+    "and the copy is given back"
+  );
+  other.detach(others).unwrap();
+  client.detach(attachment).unwrap();
+}
+
+/// AC-A-186 with §4.13: what a writable map hands its client changes one file's bytes and nothing else. Do: a one-shard
+/// daemon with two volumes of one account, a neighbour holding a marked file (mapped read-only too) and the client's own
+/// holding a file of many chunks; map the client's file read and write, then use what arrived as a hostile peer would
+/// ([`writable_object_is_confined`]): scan it for the neighbour's marker, resize it both ways, add a seal (Linux),
+/// duplicate it wider (Windows). Expect: the object is exactly the mapped length; no byte of it holds the marker, which
+/// the neighbour's own map shows; every resize, seal and wider duplicate refused; the map still shows the file; nothing
+/// judged unconfined.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+fn a_writable_maps_object_changes_one_files_bytes_and_nothing_else() {
+  let (daemon, mut client, _instance) = one_shard_daemon("mapwauthz");
+  let neighbour = client
+    .create(&room_for("neighbour", ARENA_BACKED_BYTES))
+    .unwrap();
+  let secret: Vec<u8> = NEIGHBOUR_MARKER
+    .iter()
+    .copied()
+    .cycle()
+    .take(ARENA_BACKED_BYTES)
+    .collect();
+  write_file(&mut client, neighbour, "/secret.bin", &secret);
+  let neighbours_map = client.map_read(neighbour, "/secret.bin").unwrap();
+  assert!(
+    markers(&neighbours_map.to_vec().unwrap()) > 0,
+    "the scan finds the neighbour's marker through the neighbour's own map"
+  );
+  let mine = client.create(&room_for("mine", MANY_CHUNKS_BYTES)).unwrap();
+  let bytes = pattern(MANY_CHUNKS_BYTES, 8);
+  write_file(&mut client, mine, "/mine.bin", &bytes);
+  let attachment = client.attach(mine, None, Intent::Write).unwrap().attachment;
+  let mapped = client.map_write((mine, attachment), "/mine.bin").unwrap();
+  let mut all = vec![0u8; usize::try_from(mapped.mapped_len()).unwrap()];
+  mapped.read_at(0, &mut all).unwrap();
+  assert_eq!(markers(&all), 0, "no byte of the object is the neighbour's");
+  writable_object_is_confined(&mapped);
+  assert!(
+    all.get(..bytes.len()).unwrap() == bytes.as_slice(),
+    "the map shows the file"
+  );
+  client.release_map_write(mapped).unwrap();
+  client.release_map(neighbours_map).unwrap();
+  client.detach(attachment).unwrap();
+  assert_eq!(counted(&daemon, "dax.local_map_unconfined"), 0);
+}
+
+/// How many times the neighbour's marker occurs in `bytes`.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn markers(bytes: &[u8]) -> usize {
+  bytes
+    .windows(NEIGHBOUR_MARKER.len())
+    .filter(|window| *window == NEIGHBOUR_MARKER)
+    .count()
+}
+
+/// What a hostile peer does with the descriptor a writable map handed it (Unix), and what the kernel answers: the object
+/// is exactly the mapped length; a resize either way is refused, `EPERM` by Linux's size seals and `EINVAL` by XNU,
+/// which sizes a shared-memory object once whatever the mode; on Linux a new seal is refused `EPERM`, by `F_SEAL_SEAL`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn writable_object_is_confined(mapped: &slates_client::MappedWrite) {
+  use rustix::io::Errno;
+
+  let handed = mapped.descriptor();
+  let bytes = u64::try_from(rustix::fs::fstat(handed).unwrap().st_size).unwrap();
+  assert_eq!(
+    bytes,
+    mapped.mapped_len(),
+    "the object is exactly what the map authorizes"
+  );
+  let resize = if cfg!(target_os = "linux") {
+    Errno::PERM
+  } else {
+    Errno::INVAL
+  };
+  for size in [bytes / 2, bytes * 2] {
+    #[allow(clippy::disallowed_methods)]
+    // the memory object a map handed: RAM, not a host path (R1).
+    let resized = rustix::fs::ftruncate(handed, size);
+    assert_eq!(refusal(resized), Some(resize), "a resize to {size} bytes");
+  }
+  #[cfg(target_os = "linux")]
+  assert_eq!(
+    refusal(rustix::fs::fcntl_add_seals(
+      handed,
+      rustix::fs::SealFlags::WRITE
+    )),
+    Some(Errno::PERM),
+    "a seal added by the peer"
+  );
+}
+
+/// What a hostile peer does with the handle a writable map duplicated into it (Windows), and what the section's
+/// descriptor answers: the section is exactly the mapped length; a duplicate that may rewrite the descriptor and one that
+/// may extend the section are refused `ERROR_ACCESS_DENIED`, the descriptor's own refusal.
+#[cfg(windows)]
+fn writable_object_is_confined(mapped: &slates_client::MappedWrite) {
+  use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+  use windows_sys::Win32::Foundation::{
+    DuplicateHandle, ERROR_ACCESS_DENIED, GetLastError, HANDLE,
+  };
+  use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
+  use windows_sys::Win32::System::Memory::SECTION_EXTEND_SIZE;
+  use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+  let handed = mapped.handle();
+  assert_eq!(
+    section_bytes(handed),
+    mapped.mapped_len(),
+    "the section is exactly what the map authorizes"
+  );
+  let duplicate = |access: u32| {
+    let mut out: HANDLE = std::ptr::null_mut();
+    // SAFETY: this process's pseudo-handle on both sides, the live handed handle, and an out-pointer to a local; a
+    // granted duplicate is owned and closed at once.
+    let done = unsafe {
+      DuplicateHandle(
+        GetCurrentProcess(),
+        handed.as_raw_handle(),
+        GetCurrentProcess(),
+        &mut out,
+        access,
+        0,
+        0,
+      )
+    };
+    if done == 0 {
+      // SAFETY: reads this thread's last error, which the refused call just set.
+      return Err(unsafe { GetLastError() });
+    }
+    // SAFETY: the duplicate just granted, owned here alone.
+    drop(unsafe { OwnedHandle::from_raw_handle(out) });
+    Ok(())
+  };
+  assert_eq!(
+    duplicate(WRITE_DAC),
+    Err(ERROR_ACCESS_DENIED),
+    "a duplicate that may rewrite the section's descriptor"
+  );
+  assert_eq!(
+    duplicate(SECTION_EXTEND_SIZE),
+    Err(ERROR_ACCESS_DENIED),
+    "a duplicate that may extend the section"
+  );
+}
+
+/// AC-A-186: a writable map needs the caller's own write attachment, as a file verb does, and a regular file. Do: on a
+/// volume holding a file and a directory, ask `map_write` under an attachment that does not exist, under a read
+/// attachment, for the directory and for a missing file. Expect: `NotFound`, `Forbidden`, `BadRequest` and `NotFound`,
+/// and no copy made.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+fn a_writable_map_needs_a_write_attachment_and_a_file() {
+  let (daemon, mut client, _instance) = one_shard_daemon("mapwauth");
+  let id = client.create(&room_for("mapwauth", 4 << 10)).unwrap();
+  write_file(&mut client, id, "/f.bin", &pattern(4 << 10, 5));
+  let writing = client.attach(id, None, Intent::Write).unwrap().attachment;
+  client.fs_mkdir((id, writing), "/d", 0o755).unwrap();
+  let start = daemon.direct_map_copies().unwrap();
+  let reading = client.attach(id, None, Intent::Read).unwrap().attachment;
+  let refused = |outcome: Result<slates_client::MappedWrite, ClientError>| match outcome {
+    Err(ClientError::Refused(refusal)) => refusal,
+    other => panic!("refused expected: {other:?}"),
+  };
+  assert_eq!(
+    refused(client.map_write((id, u64::MAX), "/f.bin")),
+    Refusal::NotFound,
+    "no such attachment"
+  );
+  assert!(
+    matches!(
+      refused(client.map_write((id, reading), "/f.bin")),
+      Refusal::Forbidden { .. }
+    ),
+    "a read attachment"
+  );
+  assert!(
+    matches!(
+      refused(client.map_write((id, writing), "/d")),
+      Refusal::BadRequest { .. }
+    ),
+    "a directory"
+  );
+  assert_eq!(
+    refused(client.map_write((id, writing), "/missing")),
+    Refusal::NotFound,
+    "a missing file"
+  );
+  assert_eq!(daemon.direct_map_copies().unwrap(), start, "no copy made");
+  client.detach(reading).unwrap();
+  client.detach(writing).unwrap();
+}
+
 /// AC-A-173 (G-direct step 4), macOS: a copy released before its offer was claimed takes the offer with it, so no
 /// offer keeps a copy's object alive past the client's share of the direct maps. Do: request a map by hand on the
 /// ring, leave its offer on the socket route unclaimed, release the map, then claim the offer with its own secret.

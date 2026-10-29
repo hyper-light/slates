@@ -1,13 +1,14 @@
-//! A same-kernel peer's object by use (§4.6, A-171): the copy of one file a daemon hands a client process to map read
-//! alone. Each test plays the client with a duplicate of the object's handed descriptor, as `SCM_RIGHTS` delivers one,
-//! and checks what the client sees of slates' stores and zeroing, and what the client cannot do to the object.
+//! A same-kernel peer's object by use (§4.6): the copy of one file a daemon hands a client process to map read alone
+//! (A-171), or read and write (A-186). Each test plays the client with a duplicate of the object's handed descriptor,
+//! as `SCM_RIGHTS` delivers one, and checks what the client sees of slates' stores and zeroing, what slates sees of a
+//! writable copy's client's stores, and what the client cannot do to the object.
 // Test harness code: an unwrap here is a failed test.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 #![cfg(unix)]
 
 use std::os::fd::OwnedFd;
 
-use slates_mem::{MemError, PeerObject, PeerView};
+use slates_mem::{MemError, PeerAccess, PeerObject, PeerView, PeerWriteView};
 
 /// The page size, which an object's size is a whole number of.
 fn page() -> u64 {
@@ -50,7 +51,7 @@ fn an_object_is_the_files_page_span_and_never_empty() {
     PeerObject::bytes_for(u64::MAX).is_err(),
     "a span past every address is refused"
   );
-  let object = PeerObject::create("slates-peer-test", 5 * page - 3).unwrap();
+  let object = PeerObject::create("slates-peer-test", 5 * page - 3, PeerAccess::Read).unwrap();
   assert_eq!(object.len(), 5 * page);
   let size = rustix::fs::fstat(object.descriptor()).unwrap().st_size;
   assert_eq!(u64::try_from(size).unwrap(), 5 * page);
@@ -65,7 +66,7 @@ fn an_object_is_the_files_page_span_and_never_empty() {
 fn the_client_sees_every_store_and_every_zeroing() {
   let page = page();
   let len = 4 * page;
-  let mut object = PeerObject::create("slates-peer-test", len).unwrap();
+  let mut object = PeerObject::create("slates-peer-test", len, PeerAccess::Read).unwrap();
   let bytes = pattern(usize::try_from(len).unwrap(), 7);
   object.store(0, &bytes).unwrap();
   assert_eq!(as_the_client_sees(&object), bytes, "every stored byte");
@@ -103,7 +104,7 @@ fn the_client_sees_every_store_and_every_zeroing() {
 #[cfg_attr(miri, ignore)] // a shared memory object is not modelled by Miri, as at `shared_region.rs`
 fn an_access_past_the_object_is_refused() {
   let len = page();
-  let mut object = PeerObject::create("slates-peer-test", len).unwrap();
+  let mut object = PeerObject::create("slates-peer-test", len, PeerAccess::Read).unwrap();
   let view = PeerView::map(handed(&object), object.len()).unwrap();
   let mut past = [0u8; 2];
   assert!(matches!(
@@ -133,13 +134,13 @@ fn an_access_past_the_object_is_refused() {
 #[cfg_attr(miri, ignore)] // a shared memory object is not modelled by Miri, as at `shared_region.rs`
 fn zeroing_passes_over_what_holds_nothing() {
   let page = page();
-  let mut untouched = PeerObject::create("slates-peer-test", 8 * page).unwrap();
+  let mut untouched = PeerObject::create("slates-peer-test", 8 * page, PeerAccess::Read).unwrap();
   untouched.zero(page / 3, 7 * page).unwrap();
   assert!(
     rustix::fs::seek(untouched.descriptor(), rustix::fs::SeekFrom::Data(0)).is_err(),
     "zeroing an untouched object committed a page"
   );
-  let mut sparse = PeerObject::create("slates-peer-test", 8 * page).unwrap();
+  let mut sparse = PeerObject::create("slates-peer-test", 8 * page, PeerAccess::Read).unwrap();
   let middle = pattern(usize::try_from(page).unwrap(), 3);
   sparse.store(4 * page, &middle).unwrap();
   sparse.zero(0, 8 * page).unwrap();
@@ -155,7 +156,7 @@ fn zeroing_passes_over_what_holds_nothing() {
 fn the_client_cannot_write_resize_or_reach_past_the_object() {
   let page = page();
   let len = 2 * page;
-  let mut object = PeerObject::create("slates-peer-test", len).unwrap();
+  let mut object = PeerObject::create("slates-peer-test", len, PeerAccess::Read).unwrap();
   let bytes = pattern(usize::try_from(len).unwrap(), 11);
   object.store(0, &bytes).unwrap();
   let fd = handed(&object);
@@ -301,7 +302,7 @@ fn linux_only_attacks(fd: &OwnedFd, span: usize) {
 #[test]
 #[cfg_attr(miri, ignore)] // a shared memory object is not modelled by Miri, as at `shared_region.rs`
 fn a_view_longer_than_the_object_or_empty_is_refused() {
-  let object = PeerObject::create("slates-peer-test", page()).unwrap();
+  let object = PeerObject::create("slates-peer-test", page(), PeerAccess::Read).unwrap();
   assert!(matches!(
     PeerView::map(handed(&object), object.len() + page()),
     Err(MemError::OutOfRange { .. })
@@ -309,5 +310,157 @@ fn a_view_longer_than_the_object_or_empty_is_refused() {
   assert!(matches!(
     PeerView::map(handed(&object), 0),
     Err(MemError::OutOfRange { .. })
+  ));
+}
+
+/// Do: make a writable copy and map it as its client does (a read-write view of a duplicate of the handed descriptor);
+/// store a pattern across a page boundary through the client's view, and another through slates' own at a disjoint
+/// offset; then store one byte past the view's end, and two bytes straddling it. Expect: each side loads the other's
+/// stores at once; the stores past the end are refused `OutOfRange` and change nothing.
+/// Serves AC-A-186 (a writable copy carries its client's stores to the daemon, which compares them back).
+#[test]
+#[cfg_attr(miri, ignore)] // a shared memory object is not modelled by Miri, as at `shared_region.rs`
+fn a_writable_copy_carries_stores_both_ways() {
+  let page = page();
+  let len = 3 * page - 5;
+  let mut object = PeerObject::create("slates-peer-test", len, PeerAccess::ReadWrite).unwrap();
+  assert_eq!(object.access(), PeerAccess::ReadWrite);
+  let client = PeerWriteView::map(handed(&object), object.len()).unwrap();
+  let theirs = pattern(usize::try_from(page).unwrap() + 3, 5);
+  client.store(page - 1, &theirs).unwrap();
+  let mut seen = vec![0u8; theirs.len()];
+  object.load(page - 1, &mut seen).unwrap();
+  assert_eq!(seen, theirs, "slates loads the client's store");
+  let ours = pattern(17, 9);
+  object.store(2 * page + 7, &ours).unwrap();
+  let mut back = vec![0u8; ours.len()];
+  client.load(2 * page + 7, &mut back).unwrap();
+  assert_eq!(back, ours, "the client loads slates' store");
+  let end = object.len();
+  assert!(matches!(
+    client.store(end, b"x"),
+    Err(MemError::OutOfRange { .. })
+  ));
+  assert!(matches!(
+    client.store(end - 1, b"xy"),
+    Err(MemError::OutOfRange { .. })
+  ));
+  let mut last = [0u8; 1];
+  object.load(end - 1, &mut last).unwrap();
+  assert_eq!(last, [0], "a refused store changed nothing");
+}
+
+/// Do: as the client of a writable copy, try what goes past changing its bytes: a resize either way, and on Linux a
+/// further seal and a write past the end; and on Linux change bytes by a `write` and by a hole punch, which a holder of
+/// a writable memfd can do. Expect: the resizes, the seal and the write past the end refused and the object still its
+/// size; the write and the punch land as stores of those bytes and of zeros would; the copy is sealed against resizing
+/// and further seals and not against writes.
+/// Serves AC-A-186 (a writable copy authorizes its client to change its bytes and nothing else).
+#[test]
+#[cfg_attr(miri, ignore)] // a shared memory object is not modelled by Miri, as at `shared_region.rs`
+fn a_writable_copys_client_changes_its_bytes_and_nothing_else() {
+  let page = page();
+  let len = 2 * page;
+  let mut object = PeerObject::create("slates-peer-test", len, PeerAccess::ReadWrite).unwrap();
+  object
+    .store(0, &pattern(usize::try_from(len).unwrap(), 3))
+    .unwrap();
+  let fd = handed(&object);
+  #[allow(clippy::disallowed_methods)] // the memory object: RAM, not a host path (R1).
+  let shrink = rustix::fs::ftruncate(&fd, page);
+  assert!(shrink.is_err(), "a shrink through the handed descriptor");
+  #[allow(clippy::disallowed_methods)] // the memory object: RAM, not a host path (R1).
+  let grow = rustix::fs::ftruncate(&fd, 4 * page);
+  assert!(grow.is_err(), "a growth through the handed descriptor");
+  let size = rustix::fs::fstat(&fd).unwrap().st_size;
+  assert_eq!(
+    u64::try_from(size).unwrap(),
+    len,
+    "the object keeps its size"
+  );
+  #[cfg(target_os = "linux")]
+  linux_writable_bounds(&mut object, &fd, len);
+}
+
+/// What a holder of a writable memfd may and may not do beyond its shared map: a further seal and a write past the
+/// end, which would grow it, are refused; a `write` and a hole punch change bytes as stores would.
+#[cfg(target_os = "linux")]
+fn linux_writable_bounds(object: &mut PeerObject, fd: &OwnedFd, len: u64) {
+  linux_writable_seals(fd);
+  assert!(
+    rustix::io::pwrite(fd, b"x", len).is_err(),
+    "a write past the end, which would grow the object"
+  );
+  linux_writable_bytes(object, fd, len);
+}
+
+/// A writable copy's seals: the size seals and `F_SEAL_SEAL`, no write seal, and no seal its holder can add.
+#[cfg(target_os = "linux")]
+fn linux_writable_seals(fd: &OwnedFd) {
+  let seals = rustix::fs::fcntl_get_seals(fd).unwrap();
+  for seal in [
+    rustix::fs::SealFlags::SHRINK,
+    rustix::fs::SealFlags::GROW,
+    rustix::fs::SealFlags::SEAL,
+  ] {
+    assert!(seals.contains(seal), "{seal:?} in {seals:?}");
+  }
+  assert!(
+    !seals.intersects(rustix::fs::SealFlags::WRITE | rustix::fs::SealFlags::FUTURE_WRITE),
+    "no write seal on a writable copy: {seals:?}"
+  );
+  for seal in [
+    rustix::fs::SealFlags::WRITE,
+    rustix::fs::SealFlags::FUTURE_WRITE,
+  ] {
+    assert!(
+      rustix::fs::fcntl_add_seals(fd, seal).is_err(),
+      "{seal:?} added by the client"
+    );
+  }
+}
+
+/// A `write` and a hole punch by a writable copy's holder land as stores of those bytes and of zeros would, and leave
+/// the object its size.
+#[cfg(target_os = "linux")]
+fn linux_writable_bytes(object: &mut PeerObject, fd: &OwnedFd, len: u64) {
+  assert_eq!(rustix::io::pwrite(fd, b"written", 5).unwrap(), 7);
+  let mut seen = [0u8; 7];
+  object.load(5, &mut seen).unwrap();
+  assert_eq!(&seen, b"written", "a write lands as a store would");
+  let page = page();
+  #[allow(clippy::disallowed_methods)] // the memory object: RAM, not a host path (R1).
+  rustix::fs::fallocate(
+    fd,
+    rustix::fs::FallocateFlags::PUNCH_HOLE | rustix::fs::FallocateFlags::KEEP_SIZE,
+    0,
+    page,
+  )
+  .unwrap();
+  let mut punched = vec![7u8; usize::try_from(page).unwrap()];
+  object.load(0, &mut punched).unwrap();
+  assert!(
+    punched.iter().all(|byte| *byte == 0),
+    "a hole punch lands as stores of zeros would"
+  );
+  let size = rustix::fs::fstat(fd).unwrap().st_size;
+  assert_eq!(
+    u64::try_from(size).unwrap(),
+    len,
+    "the object keeps its size"
+  );
+}
+
+/// Do: make a read-only copy and try to map it as a writable copy's client does. Expect: refused by the OS (Linux's
+/// write seal, macOS's read-only descriptor), so a read-only copy is never written through a view the client chose.
+/// Serves AC-A-171 and AC-A-186 (an object keeps the access it was made with).
+#[test]
+#[cfg_attr(miri, ignore)] // a shared memory object is not modelled by Miri, as at `shared_region.rs`
+fn a_read_only_copy_refuses_a_writable_view() {
+  let object = PeerObject::create("slates-peer-test", page(), PeerAccess::Read).unwrap();
+  assert_eq!(object.access(), PeerAccess::Read);
+  assert!(matches!(
+    PeerWriteView::map(handed(&object), object.len()),
+    Err(MemError::OsRefused { .. })
   ));
 }

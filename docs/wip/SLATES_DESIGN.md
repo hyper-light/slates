@@ -2923,7 +2923,14 @@ section whose security descriptor grants no one any right (`D:P(A;;RC;;;OW)`, wh
 whose id the claim slot carries, once the process is found to run as the daemon's user and the handle is judged as a
 hostile holder would use it (`handle_route::hand_section`: exactly the authorized size, and a duplicate that writes,
 one that may rewrite the descriptor and a writable view each refused `ERROR_ACCESS_DENIED`); the reply names the
-handle's value, which the completion record leaves out. **The map is a live view of the file within its length.** The copy sits in the store's
+handle's value, which the completion record leaves out. **A map may write too (A-186).** `MapWrite` names the
+caller's own write attachment and resolves the file through it, as a file verb does; the copy is made writable (sealed
+against resizing and new seals but not writes on Linux, its handed descriptor opened read and write on macOS, a
+read-write handle on Windows whose section's descriptor refuses any wider one), judged for that access where it
+leaves the process. The client's stores land in the copy, and the daemon compares the copy back into the file at the
+client's `MapSync`, at its `ReleaseMap` and before its reap removes its attachments, writing each run that differs
+through the attachment and publishing before it answers (A-163's compare-back, one function for both). A `Detach` with
+writable maps held under it is refused `MapsHeld`. **The map is a live view of the file within its length.** The copy sits in the store's
 backings beside the VMMs' (A-163), so the volume's single write boundary writes every later write, cut and growth into
 it before the change returns: the client sees them as memory alone, with no request, as a shared map of a file does. A
 change past the copy's length is not seen; the client maps again for it. This replaces A-135's pinned version, whose
@@ -3095,7 +3102,10 @@ same-namespace host process is the first delivered case.
 >   A-165); and, since 2026-10-25, the same-kernel direct map on Linux (A-171: a sealed copy of one file, asserted
 >   zero-copy by a real client, red-checked), on macOS (A-173: the copy's read-only descriptor over the socket route,
 >   asserted zero-copy by a real client, red-checked) and on Windows x86_64 (A-175: a read-only section handle
->   duplicated into the client, asserted zero-copy by a real client on a Windows machine, red-checked). Nineteen cells. **Corrected 2026-10-25:** the direct map had been listed
+>   duplicated into the client, asserted zero-copy by a real client on a Windows machine, red-checked); and, since
+>   2026-10-28, read and write by the same route (A-186: the client's stores compared back into the file at its sync,
+>   release and reap; Linux x86_64, macOS arm64 and Windows x86_64 by real clients, red-checked eleven ways on Linux and
+>   three on Windows). Nineteen cells. **Corrected 2026-10-25:** the direct map had been listed
 >   here as proven before A-171, when its test reported which path ran without asserting it and every read was a copy.
 > - **Ruled out by the platforms:** QEMU's vhost-user-fs and Cloud Hypervisor have no DAX window, so neither has Kata;
 >   crosvm's window is x86_64-only; Apple's Virtualization framework and WSL2 document none (unconfirmed).
@@ -12434,6 +12444,102 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
 - **Proven** on jupiter (Windows 10.0.26200), 2026-10-25, and red-checked (§4.6 status); CI's two x86_64 Windows lanes run the same tests on every push to main.
 - **Measured** the same day (BENCHMARKS, "Copy-once-map-many against copy-per-read", jupiter): a steady mapped read costs 1.4 % to 2.6 % of a copy read; the hand-off's setup is 28 to 56 µs at 4 KiB, repaid after 2 or 3 reads, and from 1 MiB the whole setup costs less than one copy read.
 - **Owed:** arm64 Windows; replies that stalled on Windows with many daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
+
+### A-186 — The direct map maps a file read and write: the client's stores are compared back into the file at its sync points (accepted 2026-10-28)
+Applied in the same change to: §4.6 (the same-kernel direct map paragraph and its status, the DAX matrix status), GAPS, `docs/wip/virtiofs.md` §8, `crates/mem` (`dax_object.rs`: `PeerAccess`, `PeerObject::create` taking it, `PeerObject::access` and `read_write_handle`, `PeerWriteView` on every platform, `within_view`; `tests/peer_object.rs`, `tests/peer_section.rs`), `crates/ipc` (`protocol.rs`: `RequestBody::MapWrite` and `MapSync`, `ReplyBody::MapSynced`, `Refusal::MapsHeld`, appended; `rendezvous.rs`: `Mapping`, the Linux judge by access and its writable test; `route.rs`: `confined_map`, replacing `confined_read_only`; `handle_route.rs`: `confined_section` and `hand_section` by access), `crates/vfs` (`shards_backing.rs`: a writable copy's ranges marked writable, `is_attached`, `BackingObject::peer_handle` replacing `read_only_handle`), `crates/bridge-core` (`dax_backing.rs`: `write_back_slice` and `WroteBack`, the one compare-back, which the ingest now calls), `crates/server` (`direct_map.rs`: `HeldMap`, `map_write`, `map_sync`, `Sync`, the writable release, `write_back_for_reap`, `defer_task`, `complete` shared; `fs_verbs.rs`: `with_writer`, `writable_file`; `verbs.rs`: the verbs' dispatch, the detach's `MapsHeld`, the refusal's ledger name; `reap.rs`; `state.rs`), `crates/client` (`MappedWrite`, `map_write`, `map_sync`, `release_map_write`; `tests/client.rs`, `tests/reap_map.rs`).
+- **What it answers.** A-164 defines DAX as reading and writing a file's bytes in place. With no VM (bare metal, a
+  container, a pod) the socket route's direct map read alone (A-171, A-173, A-175), so writing in place had only the
+  mount route, and Windows has no mount route that maps (A-177). A writable direct map gives every platform both.
+- **The mechanism: A-163's, for a process.** The daemon makes the same per-file copy, writable
+  (`slates_mem::PeerAccess::ReadWrite`), fills it a slice at a time, and hands it as the read-only copy is handed. The
+  client's stores land in the copy. The daemon compares the copy back into the file at the client's sync points, with
+  the compare-back a Shards guest's stores take (`slates_bridge_core::dax_backing::write_back_slice`, one function for
+  both). Each run where the copy differs from the file is written through the map's attachment, a copy slice a turn,
+  and the shard publishes before the reply, as a file verb does. The write boundary keeps writing every other path's
+  change into the copy, as for a read-only copy. The copy being written back from is passed over while its runs are
+  written (`ShardsBackings::suppress`), or the bytes the comparison read would land back in the copy over a store made
+  since.
+- **What the copy authorizes.** Its bytes, and nothing else about it:
+  - **Linux:** sealed against shrinking, growing and new seals, but not against writes;
+  - **macOS:** the handed descriptor is opened read and write before the name goes, and XNU refuses a second sizing
+    whatever the mode;
+  - **Windows:** the peer is handed a duplicate that maps read and write, and the section's descriptor refuses any
+    wider one (rewriting the descriptor, extending the section).
+
+  Each is judged for that access where it leaves the process (`confined_for_a_peer`, `confined_map`,
+  `confined_section`). A read-only copy keeps its access: it refuses a writable handle, and its judge refuses a writable
+  object.
+- **Coherence and durability.** A store reaches the file at the client's `MapSync`, at its `ReleaseMap` (whose reply
+  then reports that write-back), and before its reap removes its attachments. So a store outlives its client's process,
+  as a store into a shared map of a file does. Other paths see a client's stores after its sync, as they see a guest's
+  (A-163) and a mount's mapped stores after write-back. The client sees every other path's change at once, through the
+  copy. A store past the file's end within the copy's last page is not the file's and is never written. A later write
+  over a store not yet synced wins, in the order the writes reached the copy.
+- **Authority.** `MapWrite` names the caller's own write attachment, and resolves the file through it, its scope
+  applied, by the check every file verb takes (`crate::fs_verbs::with_writer`). Each write-back slice takes that check
+  again, so an attachment that ends stops the write-back. A `Detach` of an attachment with writable maps held under it
+  is refused `MapsHeld`, as a file system with files open refuses to unmount. A copy detached from its file (the volume
+  destroyed, the file's last link and open gone) is never compared back, since its inode number may name another file
+  by then: its stores reach nothing, as a deleted file's do.
+- **An in-process guest's writable window and a writable map exclude each other,** as a Shards backing and such a
+  window do (A-163): the guest's stores go to the file's block past the write boundary.
+- **Rejected:**
+  - **A copied fallback** (read the file, let the client change a buffer, write it back): it could not keep the bytes
+    another writer changed meanwhile, so a writable map the daemon cannot hand is refused `MapUnavailable`.
+  - **Writing back at every other path's read of the file:** each such read would pay a comparison (0.70–1.14 ms per
+    mapped MiB, A-163) on behalf of a client that has not asked for its stores to be durable.
+  - **Ending the map with its attachment:** a detach would drop stores silently. Refusing the detach keeps every store
+    to an explicit end.
+- **Proven:** Linux x86_64 (adacachy, Linux 7.2.9, 4 KiB pages), macOS arm64 (this Mac, macOS 26.4.1, 16 KiB pages)
+  and Windows x86_64 (jupiter, Windows 10.0.26200), 2026-10-28. `crates/client/tests/client.rs` runs 8 tests over a
+  real daemon on each:
+  - the sync writes exactly the bytes that differ;
+  - another path's write reaches the map, and the other writer's bytes are kept;
+  - a store past the end is not written;
+  - a detach is refused while a map is held, and a release writes back;
+  - the map follows its file across a rename, and reaches nothing once the file is gone;
+  - the authority check refuses a missing attachment, a read attachment, a directory and a missing file;
+  - what the map hands changes one file's bytes and nothing else: exactly the mapped length, no neighbour's byte in it,
+    a resize refused (Linux `EPERM`, macOS `EINVAL`), a new seal refused (Linux), a wider duplicate refused (Windows
+    `ERROR_ACCESS_DENIED`);
+  - a store made during a sync is never undone (Linux: about 130,000 stores over 200 syncs, 3 runs of 3; macOS:
+    1,251,963; Windows: 209,504).
+
+  `tests/reap_map.rs` kills a client holding unsynced stores and finds them in the file after its reap. From a Docker
+  container on adacachy (`crates/cli/tests/cli.rs`, `a_container_maps_a_slates_file_read_and_write_by_the_direct_map`),
+  the container's process stores 43 bytes through its map, syncs and releases, and the host reads them in place. `slates-mem`'s
+  `peer_object.rs` holds the writable object alone, 9 of 9 on Linux and 8 of 8 on macOS, and `peer_section.rs` the
+  writable section, 4 of 4 on Windows. The rendezvous judges writable hand-offs. Clippy is clean on all three.
+- **Red-checked** on the box, eleven mutants, one at a time in a separate tree and target, each failing the test that
+  guards it (and three on jupiter, after the list):
+  - the sync comparing nothing;
+  - the reap writing nothing back;
+  - a writable release letting go unsynced;
+  - a detach not refused;
+  - no write-through into a writable copy;
+  - both end-of-file guards gone (the comparison's end and the volume read's short tail; either alone keeps the store
+    out);
+  - a read attachment allowed to write;
+  - the write-back written through into its own copy: 84 of 158,498 stores undone over 200 syncs;
+  - a writable copy sealed against writes;
+  - the writable judge without `F_SEAL_SEAL`;
+  - the read-only judge passing a writable copy.
+
+  On jupiter, a writable handle handed with `WRITE_DAC`, and a section made under the default descriptor, were each
+  refused unconfined at the hand-off (`MapUnavailable`); that section with the writable judge passing everything was
+  caught by the hostile test (a duplicate that may rewrite the descriptor granted). The detached-copy guard is not
+  red-checkable without a volume prefix handed out again: the attachment's check and the inode's own absence refuse
+  first.
+- **Owed:**
+  - **A client of another shard.** A copy is handed only to a client of the shard that owns the volume: a descriptor
+    does not cross shards yet. A read falls back to a copy there; a writable map is refused `MapUnavailable`, since it
+    has no copy to fall back to. A client's shard is its id's residue, so in a daemon of N shards a writable map is
+    served to about one client in N. The test daemons run one shard for this reason (`crates/client/tests/client.rs`'s
+    `one_shard_daemon`, and `crates/cli/tests/cli.rs`'s container tests since this change: with two shards, their
+    container's client landed on the volume's shard or not by how many clients came before it).
+  - The writable map from pods (the KIND direct leg's write mode, built in this change: it runs on CI's KIND lane)
+    and from a Windows container (a diagnostics run), and arm64 by run (CI's native arm64 lanes run these tests on
+    every push).
 
 ### A-176 — A Windows daemon restarts under its clients: names that no restart repeats, an owner's token, and a claim's refusal kept to itself (accepted 2026-10-25)
 Applied in the same change to: §4.7 (the rendezvous's status), A-114 (adoption handed over in process; its Windows sentence corrected), A-175's owed line, GAPS, `crates/ipc` (`rendezvous.rs`: `Adoption`, `Listener::open` taking it, `Round` and `Served`, the Windows owner token and takeover, the stamp taken back at a listener's drop; `wake.rs`: `Event::create_new`; `error.rs`: `InstanceHeld`; `tests/rendezvous.rs`), `crates/server` (`daemon.rs`: `SegmentSource::Handoff`'s `rendezvous`, `region_name_key`, `CLAIMS_REFUSED`, the accept loop's refusals), `crates/cli` (`anchor.rs`), every in-process anchor of the tests (`crates/client/tests/{client,consumer,driver}.rs`; `crates/server/tests/{common/anchor,fleet,seal,recovery,attach_forms,shards,virtiofs}.rs`; `daemon.rs`'s warm-restart test), `.github/workflows/ci.yml` (both x86_64 Windows lanes run the client binary whole, one test at a time), `CLAUDE.md`, and three bug records.

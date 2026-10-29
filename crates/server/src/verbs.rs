@@ -3190,6 +3190,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::MapUnavailable => "map_unavailable",
     Refusal::MapShareExhausted { .. } => "map_share_exhausted",
     Refusal::HolderPending => "holder_pending",
+    Refusal::MapsHeld { .. } => "maps_held",
     Refusal::ImageRefused { .. } => "image_refused",
     Refusal::NotRootLeader => "not_root_leader",
     Refusal::ConsensusNotInitialized => "consensus_not_initialized",
@@ -3415,8 +3416,16 @@ fn dispatch_inner(
     RequestBody::MapRead { volume, path, at } => {
       crate::direct_map::map_read(state, client_id, principal, volume, &path, at)
     }
+    RequestBody::MapWrite {
+      volume,
+      attachment,
+      path,
+    } => crate::direct_map::map_write(state, client_id, principal, (volume, attachment), &path),
+    RequestBody::MapSync { volume, mapping_id } => {
+      crate::direct_map::map_sync(state, client_id, principal, (volume, mapping_id))
+    }
     RequestBody::ReleaseMap { mapping_id, .. } => {
-      crate::direct_map::release_map(state, client_id, mapping_id)
+      crate::direct_map::release_map(state, client_id, principal, mapping_id)
     }
     RequestBody::ShardsHolder {
       volume,
@@ -6843,6 +6852,12 @@ fn detach(state: &mut ShardState, principal: &Principal, attachment: u64) -> Rep
   };
   if &record.principal != principal {
     return forbidden("detach");
+  }
+  // A writable direct map's stores reach its file only through the attachment it was made under (§4.6, A-186): the
+  // attachment stays until each is released, as a file system with files open refuses to unmount.
+  let maps = crate::direct_map::writable_maps_of(state, attachment);
+  if maps > 0 {
+    return refused(Refusal::MapsHeld { maps });
   }
   match end_attachment(state, &record, Ending::Detached) {
     Ok(()) => ReplyBody::Detached,

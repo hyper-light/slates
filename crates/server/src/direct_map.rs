@@ -36,6 +36,21 @@
 //! boundary sees), a client served by another shard (a descriptor does not cross shards yet), and a copy the fill
 //! budget, the backings' capacity or the OS refuses.
 //!
+//! **A writable map (A-186).** `MapWrite` names the caller's own write attachment of the volume and resolves the file
+//! through it, as a file verb does (`crate::fs_verbs::with_writer`, its scope applied), then makes the same copy
+//! writable (`slates_mem::PeerAccess::ReadWrite`): sealed against resizing and new seals but not against writes on
+//! Linux, handed read and write on macOS, duplicated with a writable handle on Windows, each judged for that access
+//! where it leaves the process. The client's stores land in the copy. They reach the file when the daemon compares the
+//! copy back (`slates_bridge_core::dax_backing::write_back_slice`, A-163's compare-back, one implementation for both),
+//! up to the file's end, writing each run that differs through the map's attachment, a copy slice a turn, and
+//! publishes before it replies. That happens at the client's `MapSync`, at its `ReleaseMap` (whose reply then reports
+//! the write-back), and before its reap removes its attachments (`crate::reap`), so a store is not lost to its client's
+//! exit, as a store to a shared map outlives its process. A `Detach` of the attachment is refused `MapsHeld` while a
+//! writable map made under it is held. A copy detached from its file (the volume destroyed, or the file gone for good)
+//! is never compared back, since its inode number may name another file by then: its stores reach nothing, as a
+//! deleted file's do. An in-process guest's writable DAX window and a writable map exclude each other, as a Shards
+//! backing does (A-163).
+//!
 //! **Lifetime and bounds (A-172).** A copy is held on its client's slot from the moment it is made until the client
 //! releases it (`ReleaseMap`) or is reaped (`crate::reap`). Every way a copy goes is [`let_go`], which withdraws an
 //! unclaimed offer of it too (macOS), so an offer never outlives its copy. A volume's destroy or a file's last unlink
@@ -45,7 +60,7 @@
 
 use std::collections::BTreeMap;
 
-use slates_ipc::protocol::{Refusal, ReplyBody};
+use slates_ipc::protocol::{Refusal, ReplyBody, VolumeId};
 use slates_mem::{Encoded, Handle};
 use slates_vfs::shards_backing::ShardsBacking;
 use slates_wire::request::RequestId;
@@ -56,6 +71,27 @@ use crate::verbs::refused;
 
 /// Counter: a direct map its client released (`ReleaseMap`): the copy let go and its bytes given back.
 const RELEASED: &str = "dax.local_map_released";
+
+/// A copy a client holds (§4.6): its backing, and for a writable map (A-186) the attachment its stores are written
+/// back under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HeldMap {
+  /// The copy.
+  pub(crate) backing: Handle<ShardsBacking>,
+  /// For a writable map, its volume and the caller's write attachment it was made under; `None` for a read-only map.
+  pub(crate) writer: Option<(VolumeId, u64)>,
+}
+
+/// The writable maps any client holds under `attachment` (§4.6, A-186): what a `Detach` of it is refused for
+/// (`MapsHeld`), since their stores reach the file only through it.
+pub(crate) fn writable_maps_of(state: &ShardState, attachment: u64) -> u64 {
+  state
+    .clients
+    .iter()
+    .flat_map(|(_, client)| client.direct_maps.iter())
+    .filter(|held| held.writer.is_some_and(|(_, writer)| writer == attachment))
+    .fold(0u64, |count, _| count.saturating_add(1))
+}
 /// Counter: a copy's offer on the socket route withdrawn unclaimed because its copy was let go (macOS).
 #[cfg(target_os = "macos")]
 const OFFER_WITHDRAWN: &str = "dax.local_map_offer_withdrawn";
@@ -148,27 +184,437 @@ pub(crate) fn within_share(
 }
 
 /// `ReleaseMap` (§4.6, A-171): lets go of a direct map this client holds. The copy leaves the store's backings, so it
-/// is written through no more and its bytes go back to the fill budget; the client unmapped its own view first.
-/// `NotFound` for a map this client does not hold: another client's, one released already, or one from before a
-/// restart.
-pub(crate) fn release_map(state: &mut ShardState, client_id: u32, mapping_id: u64) -> ReplyBody {
+/// is written through no more and its bytes go back to the fill budget; the client unmapped its own view first. A
+/// writable map's stores are written back first (A-186), a slice a turn, and the reply reports that write-back
+/// (`MapSynced`, or its refusal); the copy is let go whatever it answers. `NotFound` for a map this client does not
+/// hold: another client's, one released already, or one from before a restart.
+pub(crate) fn release_map(
+  state: &mut ShardState,
+  client_id: u32,
+  principal: &slates_db::catalog::Principal,
+  mapping_id: u64,
+) -> ReplyBody {
   let backing = backing_of(mapping_id);
-  let Some(client) = state
-    .clients
-    .iter_mut_all()
-    .map(|(_, client)| client)
-    .find(|client| client.client_id == client_id && !client.retiring)
-  else {
+  let Some(held) = held_by(state, client_id, backing) else {
     return refused(Refusal::NotFound);
   };
-  let Some(at) = client.direct_maps.iter().position(|held| *held == backing) else {
-    return refused(Refusal::NotFound);
-  };
-  client.direct_maps.swap_remove(at);
+  if held.writer.is_some() {
+    return sync_then(state, client_id, principal, held, AfterSync::Release);
+  }
+  forget(state, client_id, backing);
   if let_go(state, backing) {
     state.count(RELEASED, 1);
   }
   ReplyBody::MapReleased
+}
+
+/// The map `backing` this served client holds, if it does.
+fn held_by(
+  state: &mut ShardState,
+  client_id: u32,
+  backing: Handle<ShardsBacking>,
+) -> Option<HeldMap> {
+  state
+    .clients
+    .iter_mut_all()
+    .map(|(_, client)| client)
+    .find(|client| client.client_id == client_id && !client.retiring)?
+    .direct_maps
+    .iter()
+    .find(|held| held.backing == backing)
+    .copied()
+}
+
+/// Takes `backing` off its client's held maps, whether or not the client is retiring. Whether it was held.
+fn forget(state: &mut ShardState, client_id: u32, backing: Handle<ShardsBacking>) -> bool {
+  let Some(client) = state
+    .clients
+    .iter_mut_all()
+    .map(|(_, client)| client)
+    .find(|client| client.client_id == client_id)
+  else {
+    return false;
+  };
+  let Some(at) = client
+    .direct_maps
+    .iter()
+    .position(|held| held.backing == backing)
+  else {
+    return false;
+  };
+  client.direct_maps.swap_remove(at);
+  true
+}
+
+/// Counter: a writable map's write-back that finished (`MapSync`, a writable `ReleaseMap`, or a reap; §4.6 A-186), the
+/// writable map's non-vacuity counter: a test asserts it moved, so a dead write-back cannot pass as a slow one.
+const SYNCED: &str = "dax.local_map_synced";
+/// Counter: the bytes the finished write-backs wrote into files: the runs where a copy differed from its file.
+const SYNCED_BYTES: &str = "dax.local_map_synced_bytes";
+/// Counter: a write-back refused (its attachment or its file gone, the volume refusing a write, a publication that did
+/// not capture the volume): that map's stores did not all reach the file.
+const SYNC_REFUSED: &str = "dax.local_map_sync_refused";
+
+/// `MapSync` (§4.6, A-186): writes the stores this client made through its writable map `mapping_id` of `volume` into
+/// the file, deferring the reply to the write-back ([`Sync`]), which answers `MapSynced`. `NotFound` for a map this
+/// client does not hold, a read-only one, or one of another volume.
+pub(crate) fn map_sync(
+  state: &mut ShardState,
+  client_id: u32,
+  principal: &slates_db::catalog::Principal,
+  (volume, mapping_id): (VolumeId, u64),
+) -> ReplyBody {
+  match held_by(state, client_id, backing_of(mapping_id)) {
+    Some(held) if held.writer.is_some_and(|(of, _)| of == volume) => {
+      sync_then(state, client_id, principal, held, AfterSync::Answer)
+    }
+    _ => refused(Refusal::NotFound),
+  }
+}
+
+/// What a write-back answers when it ends: `MapSync`'s reply, or a `ReleaseMap`'s, the copy let go after.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AfterSync {
+  /// `MapSync`: the map stays held.
+  Answer,
+  /// `ReleaseMap`: the map is let go whatever the write-back answered.
+  Release,
+}
+
+/// Defers the current request's reply to a write-back of `held` ([`Sync`]) that answers as `after` says. Refused
+/// `ConsensusNotInitialized` before the shard can publish, as every verb that changes its image is, and as
+/// [`defer_task`] refuses; the map stays held either way.
+fn sync_then(
+  state: &mut ShardState,
+  client_id: u32,
+  principal: &slates_db::catalog::Principal,
+  held: HeldMap,
+  after: AfterSync,
+) -> ReplyBody {
+  if !state.consensus_ready {
+    return refused(Refusal::ConsensusNotInitialized);
+  }
+  let Some(request) = state.current_request else {
+    return refused(Refusal::Unsupported {
+      feature: "a direct map's write-back outside a recorded request".to_owned(),
+    });
+  };
+  let sync = match Sync::new(state, client_id, held, principal.clone()) {
+    Ok(sync) => sync,
+    Err(refusal) => return refused(refusal),
+  };
+  match defer_task(state, request, answer_after(sync, request, after)) {
+    // Never seen: `run_recorded` sends nothing for a verb that deferred its acceptance.
+    Ok(()) => ReplyBody::Acknowledged,
+    Err(refusal) => refused(refusal),
+  }
+}
+
+/// Runs `sync` to its end, then answers the request it was for: `MapSynced`, or the write-back's refusal; for a
+/// release, the copy let go first, whatever the write-back answered. Records the reply's completion and delivers it.
+async fn answer_after(mut sync: Sync, request: (u64, RequestId), after: AfterSync) {
+  // The shard's state is unreachable (its shutdown): no reply can be recorded, and the client's retry, on the shard
+  // that succeeds this one, finds no map.
+  let Some(outcome) = sync.run().await else {
+    return;
+  };
+  let answered = crate::state::with_state(|s| {
+    let reply = match outcome {
+      Ok(synced) => ReplyBody::MapSynced {
+        written: synced.written,
+        file_len: synced.file_len,
+      },
+      Err(refusal) => refused(refusal),
+    };
+    if after == AfterSync::Release {
+      forget(s, sync.client_id, sync.held.backing);
+      if let_go(s, sync.held.backing) {
+        s.count(RELEASED, 1);
+      }
+    }
+    complete(s, request, reply)
+  });
+  // Delivered after the state's borrow ends, since delivery takes it again; on this shard, where the client is.
+  if let Some((reply, Some(route))) = answered {
+    crate::state::deliver(route.client_index, route.request, reply, true);
+  }
+}
+
+/// Writes back every writable map the dead client `client` holds (§4.6, A-186), before its reap removes its
+/// attachments, through which alone the stores reach their files: a store to a shared map outlives its process. Each
+/// runs to its end, a slice a turn; a refusal is counted and the next goes on, since no one is left to answer.
+pub(crate) async fn write_back_for_reap(client: Handle<crate::state::ClientSlot>, client_id: u32) {
+  let Some((principal, writable)) = crate::state::with_state(|s| {
+    let slot = s
+      .clients
+      .get(client)
+      .ok()
+      .filter(|slot| slot.client_id == client_id)?;
+    let writable: Vec<HeldMap> = slot
+      .direct_maps
+      .iter()
+      .filter(|held| held.writer.is_some())
+      .copied()
+      .collect();
+    Some((slot.principal.clone(), writable))
+  })
+  .flatten() else {
+    return;
+  };
+  for held in writable {
+    let Some(Ok(mut sync)) =
+      crate::state::with_state(|s| Sync::new(s, client_id, held, principal.clone()))
+    else {
+      continue;
+    };
+    // Counted by `Sync::run` either way (`dax.local_map_synced`, `dax.local_map_sync_refused`): no one is left to
+    // answer.
+    let _counted = sync.run().await;
+  }
+}
+
+/// What a finished write-back did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Synced {
+  /// The bytes written: the runs where the copy differed from the file.
+  written: u64,
+  /// The file's length when the comparison began.
+  file_len: u64,
+}
+
+/// A writable map's stores being written into its file (§4.6, A-186): the copy compared with the file a copy slice a
+/// turn, from its start to the file's end as it stood at the first slice (within the copy), each run that differs
+/// written through the map's attachment ([`crate::fs_verbs::with_writer`], whose check runs at every slice, so an
+/// attachment that ends meanwhile stops it), by the compare-back a Shards guest's stores take
+/// (`slates_bridge_core::dax_backing::write_back_slice`). A copy detached from its file is never compared back. When
+/// anything was written, the shard publishes before the write-back answers, as a file verb does.
+struct Sync {
+  /// The client that holds the map.
+  client_id: u32,
+  /// The map: its copy, and its volume and attachment.
+  held: HeldMap,
+  /// The client's principal, which the attachment's check needs.
+  principal: slates_db::catalog::Principal,
+  /// The file the copy is of, and the copy's size, read when the write-back began.
+  inode: u64,
+  object_bytes: u64,
+  /// The file's length at the first slice: the comparison stops there, within the copy.
+  file_len: Option<u64>,
+  /// The next byte to compare.
+  next: u64,
+  /// The bytes written so far.
+  written: u64,
+  /// The copy's bytes and the file's for the slice being compared, kept across slices.
+  stored: Vec<u8>,
+  current: Vec<u8>,
+}
+
+impl Sync {
+  /// A write-back of `held`, which `client_id` holds under `principal`. `NotFound` for a read-only map or a copy that
+  /// is gone.
+  fn new(
+    state: &ShardState,
+    client_id: u32,
+    held: HeldMap,
+    principal: slates_db::catalog::Principal,
+  ) -> Result<Sync, Refusal> {
+    if held.writer.is_none() {
+      return Err(Refusal::NotFound);
+    }
+    let copy = state
+      .store
+      .shards_backings
+      .get(held.backing)
+      .ok_or(Refusal::NotFound)?;
+    Ok(Sync {
+      client_id,
+      held,
+      principal,
+      inode: copy.inode().0,
+      object_bytes: copy.object().len(),
+      file_len: None,
+      next: 0,
+      written: 0,
+      stored: Vec::new(),
+      current: Vec::new(),
+    })
+  }
+
+  /// Runs the write-back to its end, a slice a turn: what it did, or why not, counted. `None` when the shard's state
+  /// is unreachable (its shutdown).
+  async fn run(&mut self) -> Option<Result<Synced, Refusal>> {
+    let outcome = loop {
+      match crate::state::with_state(|s| self.slice(s))? {
+        Ok(true) => break crate::state::with_state(|s| self.finish(s))?,
+        Ok(false) => slates_rt::futures::yield_now().await,
+        Err(refusal) => break Err(refusal),
+      }
+    };
+    crate::state::with_state(|s| match &outcome {
+      Ok(synced) => {
+        s.count(SYNCED, 1);
+        if synced.written > 0 {
+          s.count(SYNCED_BYTES, synced.written);
+        }
+      }
+      Err(_) => s.count(SYNC_REFUSED, 1),
+    });
+    Some(outcome)
+  }
+
+  /// One slice: up to the shard's copy slice of the copy compared with the file and its differing runs written back.
+  /// Whether the comparison has reached its end.
+  fn slice(&mut self, state: &mut ShardState) -> Result<bool, Refusal> {
+    let (volume, attachment) = self.held.writer.ok_or(Refusal::NotFound)?;
+    let slice_bytes = state.config.copy_slice_page_bytes();
+    let backing = self.held.backing;
+    let Sync {
+      principal,
+      inode,
+      object_bytes,
+      file_len,
+      next,
+      written,
+      stored,
+      current,
+      ..
+    } = self;
+    crate::fs_verbs::with_writer(
+      state,
+      principal,
+      (volume, attachment),
+      "map",
+      |bridge, cx| {
+        // A copy detached from its file (the volume destroyed, the file gone for good) is never compared back: its
+        // inode number may name another file by now.
+        if !bridge
+          .dax_state()
+          .is_some_and(|dax| dax.backings.is_attached(backing))
+        {
+          return Err(Refusal::NotFound);
+        }
+        let len = match *file_len {
+          Some(len) => len,
+          None => {
+            let len = bridge
+              .getattr(slates_bridge_core::ObjectId::new(*inode, 0), cx)
+              .map_err(|e| crate::error::refusal_of_vfs(&e))?
+              .size;
+            *file_len = Some(len);
+            len
+          }
+        };
+        let end = len.min(*object_bytes);
+        if *next >= end {
+          return Ok(true);
+        }
+        let want = end.saturating_sub(*next).min(slice_bytes);
+        let wrote = slates_bridge_core::dax_backing::write_back_slice(
+          bridge,
+          cx,
+          (backing, *inode),
+          (*next, want),
+          (stored, current),
+        )
+        .map_err(|failure| refusal_of_failure(&failure))?;
+        *written = written.saturating_add(wrote.bytes);
+        *next = next.saturating_add(want);
+        Ok(*next >= end)
+      },
+    )?
+  }
+
+  /// The write-back's end: when anything was written, the shard publishes, and a publication that did not capture the
+  /// volume refuses, as a file verb's does.
+  fn finish(&self, state: &mut ShardState) -> Result<Synced, Refusal> {
+    let (volume, _) = self.held.writer.ok_or(Refusal::NotFound)?;
+    if self.written > 0 {
+      let volume = crate::verbs::to_db_volume(volume);
+      match crate::verbs::publish_shard(state) {
+        Ok(published)
+          if state.by_id.contains_key(&volume)
+            && !published.captured(volume)
+            && !published.destroying(volume) =>
+        {
+          return Err(crate::error::refusal_of_vfs(
+            &slates_vfs::VfsError::RecoveryIncomplete,
+          ));
+        }
+        Ok(_) => {}
+        Err(error) => return Err(crate::error::refusal_of_vfs(&error)),
+      }
+    }
+    Ok(Synced {
+      written: self.written,
+      file_len: self.file_len.unwrap_or(0),
+    })
+  }
+}
+
+/// The refusal a write-back's failure answers: the copy unreadable (the OS refused its view), an attachment that may not
+/// write, or the volume's own refusal.
+fn refusal_of_failure(failure: &slates_bridge_core::dax_backing::Failure) -> Refusal {
+  match failure {
+    slates_bridge_core::dax_backing::Failure::Object => Refusal::ContentUnavailable,
+    slates_bridge_core::dax_backing::Failure::ReadOnly => Refusal::Forbidden {
+      verb: "map".to_owned(),
+    },
+    slates_bridge_core::dax_backing::Failure::Volume(error) => crate::error::refusal_of_vfs(error),
+  }
+}
+
+/// Defers the current request's reply to `task`, which answers it through [`complete`] and delivers it: the request
+/// becomes in flight, so a retry joins it. Refused `MapUnavailable` when the reply would not go to this shard's ring
+/// (the client is served here, checked before, so never expected), and `Overloaded` when the shard's task arena is
+/// full: nothing runs either way.
+fn defer_task(
+  state: &mut ShardState,
+  (origin, id): (u64, RequestId),
+  task: impl Future<Output = ()> + 'static,
+) -> Result<(), Refusal> {
+  let route = state.reply_route.take();
+  if route.is_none_or(|route| route.shard != state.shard) {
+    return Err(Refusal::MapUnavailable);
+  }
+  slates_rt::futures::spawn(task)
+    .and_then(slates_rt::futures::detach)
+    .map_err(|_| Refusal::Overloaded { shard: state.shard })?;
+  state
+    .direct_map
+    .in_flight
+    .insert((origin, id.client, id.sequence), route);
+  state.acceptance_deferred = true;
+  Ok(())
+}
+
+/// Records a deferred reply's completion as one transaction, in the form the record keeps ([`recorded_form`]), and
+/// returns the reply with where it goes. A record the database refuses leaves nothing durable: counted, and the
+/// refusal is the reply, so a retry runs the verb again.
+fn complete(
+  state: &mut ShardState,
+  (origin, id): (u64, RequestId),
+  reply: ReplyBody,
+) -> (ReplyBody, Option<ReplyRoute>) {
+  let route = state
+    .direct_map
+    .in_flight
+    .remove(&(origin, id.client, id.sequence))
+    .flatten();
+  state.db.begin();
+  let kept = recorded_form(&reply);
+  let recorded = crate::verbs::record_completion(state, origin, id, kept.clone());
+  let reply = match state.db.commit(&mut state.segment) {
+    // The record holds the reply as it keeps it, so the client gets it whole, a Windows handle's value included.
+    Ok(_) if recorded == kept => reply,
+    Ok(_) => recorded,
+    Err(e) => {
+      let refusal = crate::error::refusal_of_db(&e);
+      state.count(crate::verbs::refusal_name(&refusal), 1);
+      crate::verbs::reconcile_unpublished_effects(state);
+      refused(refusal)
+    }
+  };
+  (reply, route)
 }
 
 /// The direct maps being filled on this shard (§4.6, A-171).
@@ -210,8 +656,21 @@ pub(crate) fn map_read(
   crate::verbs::refused(slates_ipc::protocol::Refusal::MapUnavailable)
 }
 
+/// `MapWrite` where no route hands a client its copy: no platform slates ships. Refused `MapUnavailable`, as a
+/// writable map has no paged fallback.
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub(crate) fn map_write(
+  _state: &mut ShardState,
+  _client_id: u32,
+  _principal: &slates_db::catalog::Principal,
+  _target: (VolumeId, u64),
+  _path: &str,
+) -> ReplyBody {
+  refused(Refusal::MapUnavailable)
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-pub(crate) use served::map_read;
+pub(crate) use served::{map_read, map_write};
 
 /// The platforms that hand a client its copy: Linux over the client's control socket, macOS over the socket route,
 /// Windows by duplicating a read-only handle into the client's process. The fill is one; the hand-off is a paired
@@ -220,15 +679,15 @@ pub(crate) use served::map_read;
 mod served {
   use slates_db::catalog::{Principal, Role};
   use slates_ipc::protocol::{ReadAt, Refusal, ReplyBody, VolumeId};
-  use slates_mem::{Handle, PeerObject};
+  use slates_mem::{Handle, PeerAccess, PeerObject};
   use slates_vfs::dir::Child;
   use slates_vfs::ids::InodeNo;
   use slates_vfs::shards_backing::{PeerRefusal, ShardsBacking, ShardsBackings};
   use slates_vfs::volume::Seek;
   use slates_wire::request::RequestId;
 
-  use crate::error::{refusal_of_db, refusal_of_vfs};
-  use crate::merge_service::{ReplyRoute, canonical_path, find_record};
+  use crate::error::refusal_of_vfs;
+  use crate::merge_service::{canonical_path, find_record};
   use crate::state::{ShardState, VolumeSlot};
   use crate::verbs::{find, forbidden, refused, rights_of};
 
@@ -279,7 +738,8 @@ mod served {
         feature: "a direct map outside a recorded request".to_owned(),
       });
     };
-    match Fill::begin(state, handle, client_id, canonical_path(path), request) {
+    let target = Target::Path(canonical_path(path));
+    match Fill::begin(state, handle, client_id, target, request, None) {
       Ok(fill) => defer(state, fill),
       Err(Begun::Directory) => refused(Refusal::BadRequest {
         reason: "the path is a directory".to_owned(),
@@ -295,6 +755,82 @@ mod served {
         refused(refusal)
       }
     }
+  }
+
+  /// `MapWrite` (§4.6, A-186): checks the uid and the client's channel at once, resolves the file through the caller's
+  /// write attachment as a file verb does (`crate::fs_verbs::writable_file`: the attachment the caller's own, of this
+  /// volume, for writing, not a snapshot's, its scope applied), makes the file's writable copy, and defers the reply to
+  /// the task that fills and hands it over, as `MapRead`'s. `MapUnavailable` for every shape the direct map does not
+  /// serve, and for a file an in-process guest maps writable; `Forbidden` or `NotFound` as the attachment's check
+  /// answers.
+  pub(crate) fn map_write(
+    state: &mut ShardState,
+    client_id: u32,
+    principal: &Principal,
+    (volume, attachment): (VolumeId, u64),
+    path: &str,
+  ) -> ReplyBody {
+    if !is_the_daemons_user(principal) {
+      return refused(Refusal::MapUnavailable);
+    }
+    let record = match find_record(state, volume) {
+      Ok(record) => record,
+      Err(refusal) => return refused(refusal),
+    };
+    if !matches!(record.policy.role, Role::Plain) {
+      return refused(Refusal::MapUnavailable);
+    }
+    let (handle, _) = match find(state, volume) {
+      Ok(found) => found,
+      Err(reply) => return *reply,
+    };
+    let inode = match crate::fs_verbs::writable_file(state, principal, (volume, attachment), path) {
+      Ok(inode) => InodeNo(inode),
+      Err(refusal) => return refused(refusal),
+    };
+    // An in-process guest storing into the file's own block bypasses the write boundary, so no copy of the file could
+    // be kept equal to it, nor compared back against it: the two exclude each other, as a Shards backing and such a
+    // window do (A-163; `Volume::dax_map_write` refuses the other way round).
+    if state.store.dax.has_writable_of(inode) {
+      return refused(Refusal::MapUnavailable);
+    }
+    let Some(request) = state.current_request else {
+      return refused(Refusal::Unsupported {
+        feature: "a direct map outside a recorded request".to_owned(),
+      });
+    };
+    match Fill::begin(
+      state,
+      handle,
+      client_id,
+      Target::Inode(inode),
+      request,
+      Some((volume, attachment)),
+    ) {
+      Ok(fill) => defer(state, fill),
+      Err(Begun::Directory) => refused(Refusal::BadRequest {
+        reason: "the path is a directory".to_owned(),
+      }),
+      Err(Begun::Vfs(error)) => refused(refusal_of_vfs(&error)),
+      Err(Begun::Unavailable) => refused(Refusal::MapUnavailable),
+      Err(Begun::FellBack) => {
+        state.count(FELL_BACK, 1);
+        refused(Refusal::MapUnavailable)
+      }
+      Err(Begun::ShareExhausted(refusal)) => {
+        state.count(SHARE_REFUSED, 1);
+        refused(refusal)
+      }
+    }
+  }
+
+  /// The file a direct map copies: a path from the volume's root, resolved here (a read map, which the volume's read
+  /// right covers whole), or an inode a writable map's attachment resolved already, its scope applied.
+  enum Target<'p> {
+    /// A canonical path from the volume's root.
+    Path(&'p str),
+    /// A regular file's inode.
+    Inode(InodeNo),
   }
 
   /// Why a direct map did not begin.
@@ -313,6 +849,8 @@ mod served {
 
   /// A direct map being filled: its copy, where the fill is, and what the hand-off and the reply need.
   struct Fill {
+    /// What the client may do with the copy: read it, or write it too (A-186).
+    access: PeerAccess,
     /// The volume's slot, which a destroy meanwhile makes stale.
     volume: Handle<VolumeSlot>,
     /// The copy's backing, until the hand-off gives it to the client's slot; let go when the fill ends without one.
@@ -337,15 +875,21 @@ mod served {
   }
 
   impl Fill {
-    /// Resolves the path, checks the client's share, makes the file's copy and keeps it in the store's backings, held
-    /// on the client's slot from now on, so the share counts copies still being filled as well as those handed.
+    /// Resolves the target, checks the client's share, makes the file's copy (writable where `writer` names the
+    /// attachment its stores are written back under, A-186) and keeps it in the store's backings, held on the client's
+    /// slot from now on, so the share counts copies still being filled as well as those handed.
     fn begin(
       state: &mut ShardState,
       volume: Handle<VolumeSlot>,
       client_id: u32,
-      key: &str,
+      target: Target<'_>,
       request: (u64, RequestId),
+      writer: Option<(VolumeId, u64)>,
     ) -> Result<Fill, Begun> {
+      let access = match writer {
+        Some(_) => PeerAccess::ReadWrite,
+        None => PeerAccess::Read,
+      };
       let name = format!("slates-map-{}", state.config.instance);
       let most_copies = state.config.direct_maps_per_shard;
       let ShardState {
@@ -372,15 +916,17 @@ mod served {
       if slot.host.is_some() {
         return Err(Begun::Unavailable);
       }
-      let located = slot.volume.resolve(store, key).map_err(Begun::Vfs)?;
-      if matches!(located.child, Child::Dir(_)) {
-        return Err(Begun::Directory);
-      }
-      let size = slot
-        .volume
-        .stat(store, located.inode)
-        .map_err(Begun::Vfs)?
-        .size;
+      let inode = match target {
+        Target::Path(key) => {
+          let located = slot.volume.resolve(store, key).map_err(Begun::Vfs)?;
+          if matches!(located.child, Child::Dir(_)) {
+            return Err(Begun::Directory);
+          }
+          located.inode
+        }
+        Target::Inode(inode) => inode,
+      };
+      let size = slot.volume.stat(store, inode).map_err(Begun::Vfs)?.size;
       let object_bytes = PeerObject::bytes_for(size).map_err(|_| Begun::FellBack)?;
       let held = holds(&mut client.direct_maps, &store.shards_backings);
       super::within_share(held, object_bytes, share).map_err(Begun::ShareExhausted)?;
@@ -389,18 +935,19 @@ mod served {
       if store.shards_backings.peers_held().0 >= most_copies {
         return Err(Begun::FellBack);
       }
-      let object = PeerObject::create(&name, size).map_err(|_| Begun::FellBack)?;
+      let object = PeerObject::create(&name, size, access).map_err(|_| Begun::FellBack)?;
       let backing = store
         .shards_backings
-        .insert_peer(object, slot.volume.prefix(), located.inode)
+        .insert_peer(object, slot.volume.prefix(), inode)
         .map_err(|refusal| match refusal {
           PeerRefusal::Budget { .. } | PeerRefusal::Full(_) => Begun::FellBack,
         })?;
-      client.direct_maps.push(backing);
+      client.direct_maps.push(super::HeldMap { backing, writer });
       Ok(Fill {
+        access,
         volume,
         backing: Some(backing),
-        inode: located.inode,
+        inode,
         object_bytes,
         next: 0,
         client_id,
@@ -508,14 +1055,15 @@ mod served {
         state.count(FELL_BACK, 1);
         return refused(Refusal::MapUnavailable);
       };
-      match control.send_mapping(
-        copy.object().descriptor(),
+      let mapping = slates_ipc::rendezvous::Mapping {
+        request_id: mapping_id,
         mapping_id,
-        mapping_id,
-        0,
+        region_off: 0,
         file_len,
-        self.object_bytes,
-      ) {
+        block_len: self.object_bytes,
+        access: self.access,
+      };
+      match control.send_mapping(copy.object().descriptor(), mapping) {
         Ok(()) => {
           // Held on the client's slot since the copy was made: the fill lets go of it no more.
           self.backing = None;
@@ -539,8 +1087,8 @@ mod served {
       }
     }
 
-    /// Offers the filled copy's read-only descriptor on the socket route (macOS), judged first to authorize reading
-    /// the copy alone (`slates_ipc::route::confined_read_only`), behind a fresh single-use secret the reply carries; the
+    /// Offers the filled copy's descriptor on the socket route (macOS), judged first to authorize the copy alone in the
+    /// map's access (`slates_ipc::route::confined_map`), behind a fresh single-use secret the reply carries; the
     /// backing held on the client's slot since the copy was made. The reply; `MapUnavailable` (counted) where the
     /// volume, the file or the copy went, the mapping id does not fit, the descriptor is unconfined, no secret can be
     /// drawn or no offer kept.
@@ -579,7 +1127,9 @@ mod served {
         state.count(FELL_BACK, 1);
         return refused(Refusal::MapUnavailable);
       };
-      if slates_ipc::route::confined_read_only(descriptor.as_fd(), self.object_bytes).is_err() {
+      if slates_ipc::route::confined_map(descriptor.as_fd(), self.object_bytes, self.access)
+        .is_err()
+      {
         state.count(UNCONFINED, 1);
         state.count(FELL_BACK, 1);
         return refused(Refusal::MapUnavailable);
@@ -604,9 +1154,9 @@ mod served {
       }
     }
 
-    /// Duplicates the filled copy's read-only handle into the client's process (Windows), judged first to authorize
-    /// reading the copy alone and the process to run as the daemon's user (`slates_ipc::handle_route::hand_section`);
-    /// the backing held on the client's slot since the copy was made. The reply names the handle's value there.
+    /// Duplicates the filled copy's handle, read-only or for a writable map read and write, into the client's process
+    /// (Windows), judged first to authorize the copy alone in that access and the process to run as the daemon's user
+    /// (`slates_ipc::handle_route::hand_section`); the backing held on the client's slot since the copy was made. The reply names the handle's value there.
     /// `MapUnavailable` (counted) where the volume, the file or the copy went, the client went, the mapping id does not
     /// fit, the handle is unconfined, or the client's process is not the daemon's user's or refused the duplicate.
     #[cfg(windows)]
@@ -627,21 +1177,26 @@ mod served {
         .ok()
         .and_then(|slot| slot.volume.stat(&state.store, self.inode).ok())
         .map(|attrs| attrs.size);
-      let read_only = state
+      let section = state
         .store
         .shards_backings
         .get(backing)
-        .and_then(|copy| copy.object().read_only_handle().ok());
-      let (Some(pid), Some(file_len), Some(read_only), Some(mapping_id)) = (
+        .and_then(|copy| copy.object().peer_handle().ok());
+      let (Some(pid), Some(file_len), Some(section), Some(mapping_id)) = (
         pid,
         size,
-        read_only,
+        section,
         super::mapping_id_of(state.partition, backing),
       ) else {
         state.count(FELL_BACK, 1);
         return refused(Refusal::MapUnavailable);
       };
-      match slates_ipc::handle_route::hand_section(read_only.as_handle(), self.object_bytes, pid) {
+      match slates_ipc::handle_route::hand_section(
+        section.as_handle(),
+        self.object_bytes,
+        pid,
+        self.access,
+      ) {
         Ok(handle) => {
           // Held on the client's slot since the copy was made: the fill lets go of it no more.
           self.backing = None;
@@ -700,11 +1255,11 @@ mod served {
 
   /// What a client holds of the direct maps, `(maps, bytes)`: `held`, its copies handed or being filled, less those the
   /// store let go of (a fill that ended early), which are forgotten here.
-  fn holds(held: &mut Vec<Handle<ShardsBacking>>, backings: &ShardsBackings) -> (usize, u64) {
-    held.retain(|backing| backings.peer_bytes(*backing).is_some());
+  fn holds(held: &mut Vec<super::HeldMap>, backings: &ShardsBackings) -> (usize, u64) {
+    held.retain(|map| backings.peer_bytes(map.backing).is_some());
     let bytes = held
       .iter()
-      .filter_map(|backing| backings.peer_bytes(*backing))
+      .filter_map(|map| backings.peer_bytes(map.backing))
       .fold(0u64, u64::saturating_add);
     (held.len(), bytes)
   }
@@ -734,34 +1289,23 @@ mod served {
     Ok(())
   }
 
-  /// Defers the current request's reply to the task that fills and hands over `fill`: the request becomes in flight,
-  /// so a retry joins it. `Overloaded` when the shard's task arena is full, the copy let go.
+  /// Defers the current request's reply to the task that fills and hands over `fill` ([`super::defer_task`]). Refused
+  /// as that refuses, the copy let go: the task was never spawned, or was dropped inside this borrow of the shard's
+  /// state, where the fill's own drop cannot reach the store.
   fn defer(state: &mut ShardState, fill: Fill) -> ReplyBody {
-    let (origin, id) = fill.request;
-    let route = state.reply_route.take();
-    // The reply goes to the client's ring on this shard: the client is served here (checked as the fill began).
-    if route.is_none_or(|route| route.shard != state.shard) {
-      state.count(FELL_BACK, 1);
-      return refused(Refusal::MapUnavailable);
-    }
+    let request = fill.request;
     let backing = fill.backing;
-    match slates_rt::futures::spawn(run(fill)).and_then(slates_rt::futures::detach) {
-      Ok(()) => {
-        state
-          .direct_map
-          .in_flight
-          .insert((origin, id.client, id.sequence), route);
-        state.acceptance_deferred = true;
-        // Never seen: `run_recorded` sends nothing for a verb that deferred its acceptance.
-        ReplyBody::Acknowledged
-      }
-      Err(_) => {
-        // The task was dropped inside this borrow of the shard's state, where its fill cannot reach the store: the copy
-        // goes back here.
+    match super::defer_task(state, request, run(fill)) {
+      // Never seen: `run_recorded` sends nothing for a verb that deferred its acceptance.
+      Ok(()) => ReplyBody::Acknowledged,
+      Err(refusal) => {
         if let Some(backing) = backing {
           let _released = super::let_go(state, backing);
         }
-        refused(Refusal::Overloaded { shard: state.shard })
+        if matches!(refusal, Refusal::MapUnavailable) {
+          state.count(FELL_BACK, 1);
+        }
+        refused(refusal)
       }
     }
   }
@@ -788,42 +1332,12 @@ mod served {
           refused(Refusal::MapUnavailable)
         }
       };
-      complete(s, request, reply)
+      super::complete(s, request, reply)
     });
     // Delivered after the state's borrow ends, since delivery takes it again; on this shard, where the client is.
     if let Some((reply, Some(route))) = answered {
       crate::state::deliver(route.client_index, route.request, reply, true);
     }
-  }
-
-  /// Records the reply's completion as one transaction, in the form the record keeps ([`super::recorded_form`]), and
-  /// returns the reply with where it goes. A record the database refuses leaves nothing durable: counted, and the
-  /// refusal is the reply, so a retry runs the verb again.
-  fn complete(
-    state: &mut ShardState,
-    (origin, id): (u64, RequestId),
-    reply: ReplyBody,
-  ) -> (ReplyBody, Option<ReplyRoute>) {
-    let route = state
-      .direct_map
-      .in_flight
-      .remove(&(origin, id.client, id.sequence))
-      .flatten();
-    state.db.begin();
-    let kept = super::recorded_form(&reply);
-    let recorded = crate::verbs::record_completion(state, origin, id, kept.clone());
-    let reply = match state.db.commit(&mut state.segment) {
-      // The record holds the reply as it keeps it, so the client gets it whole, a Windows handle's value included.
-      Ok(_) if recorded == kept => reply,
-      Ok(_) => recorded,
-      Err(e) => {
-        let refusal = refusal_of_db(&e);
-        state.count(crate::verbs::refusal_name(&refusal), 1);
-        crate::verbs::reconcile_unpublished_effects(state);
-        refused(refusal)
-      }
-    };
-    (reply, route)
   }
 }
 

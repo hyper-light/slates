@@ -12,7 +12,9 @@
 //!
 //! **Authority is the volume's grant.** The typed channel authorizes by the attachment's rights (§4.13), as its
 //! reads of a plain volume do; POSIX mode bits stay the rule between the users of a mount, which a mount's own
-//! transport applies. A file the verb creates is owned by a Unix caller (a uid, or a consumer's host account).
+//! transport applies. A file the verb creates is owned by a Unix caller (a uid, or a consumer's host account). The
+//! writable direct map (§4.6, A-186) resolves its file and writes its client's stores back through the same check and
+//! the same bridge ([`with_writer`]), so every write the typed channel makes stands behind one authority.
 //!
 //! **What a write is.** `FsWrite` replaces a file's whole content: an absent file is created with the verb's mode in
 //! an existing directory; a present one is truncated and rewritten. A refusal partway (the volume's quota) is typed
@@ -28,7 +30,7 @@ use slates_vfs::inode::Kind;
 
 use crate::error::refusal_of_vfs;
 use crate::state::{MountAttachment, ShardState};
-use crate::verbs::{find, forbidden, refused, to_db_volume};
+use crate::verbs::{find, refused, to_db_volume};
 
 /// One file verb.
 pub(crate) enum FsOp<'a> {
@@ -69,7 +71,7 @@ pub(crate) fn serve(
   (volume, attachment): (VolumeId, u64),
   op: FsOp<'_>,
 ) -> ReplyBody {
-  let (handle, record) = match find(state, volume) {
+  let (_, record) = match find(state, volume) {
     Ok(found) => found,
     Err(reply) => return *reply,
   };
@@ -79,20 +81,51 @@ pub(crate) fn serve(
         .to_owned(),
     });
   }
+  match with_writer(
+    state,
+    principal,
+    (volume, attachment),
+    "fs",
+    |bridge, cx| run(bridge, cx, op),
+  ) {
+    Ok(Ok(size)) => ReplyBody::FsDone { size },
+    Ok(Err(e)) => refused(refusal_of_vfs(&e)),
+    Err(refusal) => refused(refusal),
+  }
+}
+
+/// Runs `f` on the bridge and context a write under the caller's write `attachment` of `volume` runs with (the module
+/// doc): the attachment must be the caller's, of this volume, for writing, and not a snapshot's; it is admitted in the
+/// shard's attachment registry for `f`'s span, so a barrier sees the write in flight, and its scope applies. Shared by
+/// the file verbs and the writable direct map (A-186), so one check stands behind every write the typed channel makes.
+/// Refused as [`find`] refuses the volume, `NotFound` for an attachment that is gone, `Forbidden` naming `verb` for one
+/// the caller may not write through, and `Overloaded` while the registry is at its bound (retryable, as a full
+/// cross-shard queue is).
+pub(crate) fn with_writer<T>(
+  state: &mut ShardState,
+  principal: &Principal,
+  (volume, attachment): (VolumeId, u64),
+  verb: &str,
+  f: impl FnOnce(&mut dyn Bridge, &OpContext) -> T,
+) -> Result<T, Refusal> {
+  let handle = match find(state, volume) {
+    Ok((handle, _)) => handle,
+    Err(reply) => return Err(refusal_in(*reply)),
+  };
   let Some(catalog) = state.db.partition().attachment(attachment).cloned() else {
-    return refused(Refusal::NotFound);
+    return Err(Refusal::NotFound);
   };
   if catalog.volume != to_db_volume(volume)
     || catalog.principal != *principal
     || !catalog.rights.write
     || catalog.snapshot.is_some()
   {
-    return forbidden("fs");
+    return Err(Refusal::Forbidden {
+      verb: verb.to_owned(),
+    });
   }
-  // The registry is bounded: at its bound the verb is refused retryable, as a full cross-shard queue is.
-  let Some(registry) = admit(state, volume, attachment, &catalog) else {
-    return refused(Refusal::Overloaded { shard: state.shard });
-  };
+  let registry =
+    admit(state, volume, attachment, &catalog).ok_or(Refusal::Overloaded { shard: state.shard })?;
   let scope = catalog.form.scope();
   let ShardState {
     store,
@@ -100,9 +133,7 @@ pub(crate) fn serve(
     attachments,
     ..
   } = state;
-  let Ok(slot) = volumes.get_mut(handle) else {
-    return refused(Refusal::NotFound);
-  };
+  let slot = volumes.get_mut(handle).map_err(|_| Refusal::NotFound)?;
   let mut handles = new_handle_store();
   let mut bridge = VolumeBridge::attached(
     to_db_volume(volume),
@@ -111,24 +142,49 @@ pub(crate) fn serve(
     &mut handles,
     slot.host.as_mut().map(|host| host as &mut dyn HostFs),
   );
-  let mut cx = match attachments.begin(registry) {
-    Ok(cx) => cx,
-    Err(e) => return refused(refusal_of_vfs(&e)),
-  };
+  let mut cx = attachments
+    .begin(registry)
+    .map_err(|e| refusal_of_vfs(&e))?;
   cx.owner_uid = unix_uid(principal);
-  let mut scoped;
-  let served: &mut dyn Bridge = match scope {
-    Some(scope) => {
-      scoped = slates_bridge_core::scoped::ScopedBridge::new(&mut bridge, scope);
-      &mut scoped
-    }
-    None => &mut bridge,
-  };
-  let outcome = run(served, &cx, op);
+  let mut scoped = None;
+  let served = crate::verbs::scoped_or_whole(&mut bridge, &mut scoped, scope);
+  let outcome = f(served, &cx);
   attachments.end(registry);
-  match outcome {
-    Ok(size) => ReplyBody::FsDone { size },
-    Err(e) => refused(refusal_of_vfs(&e)),
+  Ok(outcome)
+}
+
+/// The regular file at `path` as the caller's write `attachment` of `volume` reaches it, its scope applied (§4.6,
+/// A-186: the file a writable direct map copies): its inode. Refused as [`with_writer`] refuses, and as the walk
+/// refuses: `IsDirectory` for a directory, `Invalid` for anything else that is not a regular file.
+pub(crate) fn writable_file(
+  state: &mut ShardState,
+  principal: &Principal,
+  (volume, attachment): (VolumeId, u64),
+  path: &str,
+) -> Result<u64, Refusal> {
+  with_writer(
+    state,
+    principal,
+    (volume, attachment),
+    "map",
+    |bridge, cx| {
+      let (parent, name) = parent_of(bridge, cx, path)?;
+      let found = bridge.lookup(parent, cx, name)?;
+      match found.kind {
+        Kind::File => Ok(found.ino),
+        Kind::Dir => Err(VfsError::IsDirectory),
+        Kind::Symlink | Kind::Fifo | Kind::Socket => Err(VfsError::Invalid),
+      }
+    },
+  )?
+  .map_err(|e| refusal_of_vfs(&e))
+}
+
+/// The refusal a refused reply carries; any other reply, which [`find`] never returns, as `NotFound`.
+fn refusal_in(reply: ReplyBody) -> Refusal {
+  match reply {
+    ReplyBody::Refused { refusal } => refusal,
+    _ => Refusal::NotFound,
   }
 }
 

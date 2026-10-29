@@ -514,20 +514,26 @@ fn answers(address: &SocketAddrUnix) -> bool {
   stream_socket().is_ok_and(|probe| rustix::net::connect(&probe, address).is_ok())
 }
 
-/// Refuses a direct map's descriptor that would authorize a peer more than reading the copy it is offered for (§4.6,
-/// A-173, macOS). macOS has no seals, so the capability is the descriptor's own access: it must be open read alone
-/// (`F_GETFL`), which refuses the peer a writable shared map and a write of it (XNU refuses any second sizing of such an
-/// object whatever the mode), and its object must be exactly the `authorized` bytes (`fstat`), the copy and nothing
-/// more. An object reached by no name (the daemon unlinks it at
-/// once) cannot be opened read-write again; a read-only descriptor of one is a read-only capability (measured on macOS
+/// Refuses a direct map's descriptor that would authorize a peer more than the copy it is offered for allows (§4.6,
+/// A-173, A-186, macOS). macOS has no seals, so the capability is the descriptor's own access. A read-only offer's
+/// descriptor must be open read alone (`F_GETFL`), which refuses the peer a writable shared map and a write of it; a
+/// writable offer's may be open read and write, since changing the copy's bytes is what it authorizes. Either way XNU
+/// refuses any second sizing of the object whatever the mode (`EINVAL`), and the object must be exactly the
+/// `authorized` bytes (`fstat`), the copy and nothing more. An object reached by no name (the daemon unlinks it at once)
+/// cannot be opened again in another mode; a read-only descriptor of one is a read-only capability (measured on macOS
 /// 26.4.1, `crates/mem/tests/peer_object.rs`). Refused `UnconfinedDescriptor` naming what it would have authorized.
-pub fn confined_read_only(descriptor: BorrowedFd<'_>, authorized: u64) -> Result<(), IpcError> {
+pub fn confined_map(
+  descriptor: BorrowedFd<'_>,
+  authorized: u64,
+  access: slates_mem::PeerAccess,
+) -> Result<(), IpcError> {
   let object_bytes = rustix::fs::fstat(descriptor)
     .map(|stat| u64::try_from(stat.st_size).unwrap_or(u64::MAX))
     .map_err(|e| refused("fstat offered map", e))?;
-  let access = rustix::fs::fcntl_getfl(descriptor).map_err(|e| refused("fcntl(F_GETFL)", e))?;
+  let mode = rustix::fs::fcntl_getfl(descriptor).map_err(|e| refused("fcntl(F_GETFL)", e))?;
   // structural: allow — the access modes `F_GETFL` answered, compared to refuse a writable descriptor; nothing is opened.
-  let writable = access.intersects(rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::RDWR);
+  let opened_to_write = mode.intersects(rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::RDWR);
+  let writable = opened_to_write && access == slates_mem::PeerAccess::Read;
   if writable || object_bytes != authorized {
     return Err(IpcError::UnconfinedDescriptor {
       object_bytes,

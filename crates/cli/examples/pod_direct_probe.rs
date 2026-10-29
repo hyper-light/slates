@@ -14,17 +14,22 @@
 //!   `slates attach`, `slates write` and `slates detach` races that sweep (met by the lane on a loaded machine,
 //!   2026-10-27: the detach answered `NotFound`).
 //! - `map VOLUME PATH LEN FILL` maps the file by the direct map and prints `direct-map: zero_copy=BOOL whole=BOOL len=N`.
+//! - `map-write VOLUME PATH LEN FILL` attaches for writing, maps the file read and write by the direct map (A-186),
+//!   stores [`STORED`] across the first page's end, syncs, releases and detaches, then reads the file back. It prints
+//!   `direct-map-write: differing=N synced=N released=N whole=BOOL`: the stored bytes that differ from the file, the
+//!   bytes the sync and the release wrote, and whether the file holds the store in place and every other byte as it was.
 //!
 //! `VOLUME` is the volume's 32 hexadecimal digits, `PATH` the file's path from the volume's root, `LEN` its length and
-//! `FILL` the one byte value it holds. The exit code is 0 when the file was written, or mapped zero-copy and whole; 1
-//! when the map is a copy or not whole; 2 when the probe could not run. Test infrastructure, built into the lane's probe
+//! `FILL` the one byte value it holds. The exit code is 0 when the file was written, mapped zero-copy and whole, or
+//! written through the map and read back as stored; 1 when the map is a copy or not whole, or the file is not as
+//! stored; 2 when the probe could not run. Test infrastructure, built into the lane's probe
 //! image (`deploy/kind/pod-probe.Dockerfile`) and never shipped.
 //!
-//! Run: `slates-pod-direct-probe (write | map) VOLUME PATH LEN FILL` in a container of the daemon's pod.
+//! Run: `slates-pod-direct-probe (write | map | map-write) VOLUME PATH LEN FILL` in a container of the daemon's pod.
 
 use std::process::ExitCode;
 
-use slates_client::{Client, Deadlines, Intent, VolumeId};
+use slates_client::{Client, Deadlines, Intent, ReadAt, VolumeId};
 use slates_db::replay::RECOVERY_BUDGET_NS;
 use slates_server::daemon::LIVENESS_BUDGET_NS;
 
@@ -32,6 +37,13 @@ use slates_server::daemon::LIVENESS_BUDGET_NS;
 const MAP_TAG: &str = "direct-map:";
 /// Format: the tag of the write mode's one line, which the lane looks for.
 const WRITE_TAG: &str = "direct-write:";
+/// Format: the tag of the map-write mode's one line, which the lane looks for.
+const MAP_WRITE_TAG: &str = "direct-map-write:";
+/// Format: what the map-write mode stores through its map, beginning [`BEFORE_PAGE`] bytes before the first page's end,
+/// so the store crosses a page boundary.
+const STORED: &[u8] = b"stored in place by a process in a pod";
+/// Shape: how far before the first page's end the map-write mode's store begins.
+const BEFORE_PAGE: usize = 7;
 /// Format: the exit code when the file was written, or mapped zero-copy and whole.
 const DONE: u8 = 0;
 /// Format: the exit code when the map is a copy, or does not hold every byte.
@@ -48,10 +60,11 @@ fn main() -> ExitCode {
   let (tag, outcome) = match args.split_first() {
     Some((mode, rest)) if mode == "write" => (WRITE_TAG, write(rest).map(|()| true)),
     Some((mode, rest)) if mode == "map" => (MAP_TAG, map(rest)),
+    Some((mode, rest)) if mode == "map-write" => (MAP_WRITE_TAG, map_write(rest)),
     _ => (
       MAP_TAG,
       Err(format!(
-        "usage: slates-pod-direct-probe (write | map) VOLUME PATH LEN FILL (given {args:?})"
+        "usage: slates-pod-direct-probe (write | map | map-write) VOLUME PATH LEN FILL (given {args:?})"
       )),
     ),
   };
@@ -137,6 +150,55 @@ fn map(args: &[String]) -> Result<bool, String> {
     bytes.len()
   );
   Ok(zero_copy && whole)
+}
+
+/// The map-write mode (A-186): attaches for writing, maps the file read and write under that attachment, stores
+/// [`STORED`] across the first page's end, syncs, releases and detaches, as one client; then reads the file back and
+/// prints the tagged line. Whether the sync wrote the stored bytes that differ, the release nothing more, and the file
+/// holds the store in place and every other byte as it was.
+fn map_write(args: &[String]) -> Result<bool, String> {
+  let file = File::of(args)?;
+  let mut client = connect()?;
+  let attachment = client
+    .attach(file.volume, None, Intent::Write)
+    .map_err(|e| format!("attach for writing: {e}"))?
+    .attachment;
+  let mapped = client
+    .map_write((file.volume, attachment), &file.path)
+    .map_err(|e| format!("map_write {}: {e}", file.path))?;
+  let at = usize::try_from(slates_machine::facts::Facts::page_bytes())
+    .map_err(|e| e.to_string())?
+    .checked_sub(BEFORE_PAGE)
+    .ok_or("a page shorter than the store's offset")?;
+  let stored = mapped
+    .write_at(u64::try_from(at).map_err(|e| e.to_string())?, STORED)
+    .map_err(|e| format!("store into the map: {e}"))?;
+  if stored != STORED.len() {
+    return Err(format!("the map took {stored} of {} bytes", STORED.len()));
+  }
+  let synced = client
+    .map_sync(&mapped)
+    .map_err(|e| format!("map_sync: {e}"))?;
+  let released = client
+    .release_map_write(mapped)
+    .map_err(|e| format!("release the map: {e}"))?;
+  client
+    .detach(attachment)
+    .map_err(|e| format!("detach: {e}"))?;
+  let bytes = client
+    .read(file.volume, &file.path, ReadAt::Head)
+    .map_err(|e| format!("read {} back: {e}", file.path))?;
+  let mut expect = vec![file.fill; file.len];
+  expect
+    .get_mut(at..at.saturating_add(STORED.len()))
+    .ok_or("a file shorter than the store")?
+    .copy_from_slice(STORED);
+  let whole = bytes == expect;
+  let differing = STORED.iter().filter(|byte| **byte != file.fill).count();
+  println!(
+    "{MAP_WRITE_TAG} differing={differing} synced={synced} released={released} whole={whole}"
+  );
+  Ok(whole && u64::try_from(differing).ok() == Some(synced) && released == 0)
 }
 
 /// The volume id `hex` spells: 32 hexadecimal digits, two to a byte.

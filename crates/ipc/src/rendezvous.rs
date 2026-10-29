@@ -514,6 +514,26 @@ pub struct MappingDelivery {
   pub block_len: u64,
 }
 
+/// What a direct map's delivery says beside its descriptor (§4.6): the request it answers, the mapping, where the file
+/// sits in the object and its lengths, and what the peer may do with the object (A-171 read alone, A-186 read and
+/// write), which the hand-off judges the descriptor against before it is sent.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+pub struct Mapping {
+  /// The request the delivery answers (the command-ring map request's id).
+  pub request_id: u64,
+  /// The daemon-minted mapping id, named by the later release message.
+  pub mapping_id: u64,
+  /// The file's byte offset within the object: zero, since the object is the file's copy.
+  pub region_off: u64,
+  /// The file's length when it was handed.
+  pub file_len: u64,
+  /// The object's whole length: the file's page span when it was mapped.
+  pub block_len: u64,
+  /// What the peer may do with the object.
+  pub access: slates_mem::PeerAccess,
+}
+
 /// The other end of a Shards fs stream the daemon delivered to the client that attached it (§4.6, A-161): the
 /// attachment's capability, which the client hands to the VMM. The daemon serves that one attachment on its own end.
 #[cfg(unix)]
@@ -610,22 +630,24 @@ pub mod platform {
   use crate::error::IpcError;
   use crate::region::ClientRegion;
 
-  /// Refuses a descriptor that would authorize a peer more than the hand-off does (§4.6; A-135, A-171).
+  /// Refuses a descriptor that would authorize a peer more than the hand-off does (§4.6; A-135, A-171, A-186).
   ///
-  /// What may cross is one file's copy, all of it authorized, sealed against writing and resizing: the
-  /// object the direct map makes for each file it hands (`slates_mem::PeerObject`). Two questions, both
-  /// measured on the descriptor itself rather than taken from the caller:
+  /// What may cross is one file's copy, all of it authorized, sealed against resizing, and against writing too unless
+  /// the hand-off is a writable one: the object the direct map makes for each file it hands
+  /// (`slates_mem::PeerObject`). Two questions, both measured on the descriptor itself rather than taken from the
+  /// caller:
   ///
   /// 1. **Does it reach past what is authorized?** `fstat` gives the object's whole length, which is what
   ///    the holder of the descriptor may map. The authorized bytes start at `region_off` and run
   ///    `authorized` bytes, so the descriptor passes only when they are the whole object: offset zero and
   ///    equal lengths. One file's copy is that by construction; the shared content arena holding every
   ///    volume's blocks never is, and it is what the 2026-10-18 escape handed over.
-  /// 2. **Could the peer still write or resize it?** `F_GET_SEALS`. Writing must be sealed
-  ///    (`F_SEAL_WRITE`, or `F_SEAL_FUTURE_WRITE` where the owner keeps its own earlier map) and both
-  ///    `F_SEAL_SHRINK` and `F_SEAL_GROW` must be set, or a peer shrinks the object under the daemon's
-  ///    feet. A descriptor duplicated read-only does **not** pass and must not: measured, a same-uid
-  ///    peer re-opens such a duplicate `O_RDWR` through `/proc/self/fd` and maps it writable.
+  /// 2. **Could the peer do more to it than the hand-off allows?** `F_GET_SEALS`. Both `F_SEAL_SHRINK` and
+  ///    `F_SEAL_GROW` must be set, or a peer shrinks the object under the daemon's feet. A read-only hand-off needs
+  ///    writing sealed too (`F_SEAL_WRITE`, or `F_SEAL_FUTURE_WRITE` where the owner keeps its own earlier map). A
+  ///    descriptor duplicated read-only does **not** pass and must not: measured, a same-uid peer re-opens such a
+  ///    duplicate `O_RDWR` through `/proc/self/fd` and maps it writable. A writable hand-off needs `F_SEAL_SEAL` as
+  ///    well, so its peer can add no seal of its own: what the peer may change is the copy's bytes alone.
   ///
   /// An object with no seal support at all answers `F_GET_SEALS` with `F_SEAL_SEAL` absent and no write
   /// seal, so it is refused by the same arm; a file that is not a memfd refuses the call, and is
@@ -634,6 +656,7 @@ pub mod platform {
     descriptor: std::os::fd::BorrowedFd<'_>,
     region_off: u64,
     authorized: u64,
+    access: slates_mem::PeerAccess,
   ) -> Result<(), IpcError> {
     let object_bytes = match rustix::fs::fstat(descriptor) {
       Ok(stat) => u64::try_from(stat.st_size).unwrap_or(u64::MAX),
@@ -644,7 +667,12 @@ pub mod platform {
       || seals.contains(rustix::fs::SealFlags::FUTURE_WRITE);
     let size_sealed =
       seals.contains(rustix::fs::SealFlags::SHRINK) && seals.contains(rustix::fs::SealFlags::GROW);
-    let writable = !(write_sealed && size_sealed);
+    let writable = match access {
+      slates_mem::PeerAccess::Read => !(write_sealed && size_sealed),
+      slates_mem::PeerAccess::ReadWrite => {
+        !(size_sealed && seals.contains(rustix::fs::SealFlags::SEAL))
+      }
+    };
     if region_off != 0 || object_bytes != authorized || writable {
       return Err(IpcError::UnconfinedDescriptor {
         object_bytes,
@@ -771,7 +799,8 @@ pub mod platform {
     /// scope the *request* and bind the peer to nothing. The peer is not trusted merely for sharing
     /// this uid: a §4.13 consumer is an untrusted process of exactly this uid holding exactly this
     /// channel. So the object must be all authorized, one file's copy and nothing more
-    /// ([`IpcError::UnconfinedDescriptor`] otherwise), and it must be sealed against writing and resizing.
+    /// ([`IpcError::UnconfinedDescriptor`] otherwise), and it must be sealed against resizing, and against writing
+    /// unless the hand-off is a writable one (A-186), whose object must refuse any new seal instead.
     ///
     /// The seals are the measured mechanism rather than a chosen one (2026-10-18, kernel 7.2.9): a
     /// read-only duplicate of a memfd is **no** defence — the peer re-opens it `O_RDWR` through
@@ -782,23 +811,19 @@ pub mod platform {
     pub fn send_mapping(
       &self,
       block: std::os::fd::BorrowedFd<'_>,
-      request_id: u64,
-      mapping_id: u64,
-      region_off: u64,
-      file_len: u64,
-      block_len: u64,
+      mapping: super::Mapping,
     ) -> Result<(), IpcError> {
-      confined_for_a_peer(block, region_off, block_len)?;
+      confined_for_a_peer(block, mapping.region_off, mapping.block_len, mapping.access)?;
       let mut body = [0u8; KIND_BYTES + MAPPING_MSG_BYTES];
       put_words(
         &mut body,
         &[
           (0, KIND_MAPPING),
-          (KIND_BYTES + AT_REQUEST, request_id),
-          (KIND_BYTES + MAPPING_AT_ID, mapping_id),
-          (KIND_BYTES + MAPPING_AT_OFF, region_off),
-          (KIND_BYTES + MAPPING_AT_FILE_LEN, file_len),
-          (KIND_BYTES + MAPPING_AT_BLOCK_LEN, block_len),
+          (KIND_BYTES + AT_REQUEST, mapping.request_id),
+          (KIND_BYTES + MAPPING_AT_ID, mapping.mapping_id),
+          (KIND_BYTES + MAPPING_AT_OFF, mapping.region_off),
+          (KIND_BYTES + MAPPING_AT_FILE_LEN, mapping.file_len),
+          (KIND_BYTES + MAPPING_AT_BLOCK_LEN, mapping.block_len),
         ],
       );
       self.send_delivery(&body, block, "sendmsg mapping")
@@ -1407,7 +1432,7 @@ pub mod platform {
 
   #[cfg(test)]
   mod tests {
-    use std::os::fd::AsFd;
+    use std::os::fd::{AsFd, OwnedFd};
 
     use rustix::fs::{MemfdFlags, memfd_create};
     use rustix::net::{AddressFamily, SocketFlags, SocketType};
@@ -1478,7 +1503,7 @@ pub mod platform {
         });
       }
 
-      control.send_mapping(mem.as_fd(), 7, 42, 0, file_len, block_len)?;
+      control.send_mapping(mem.as_fd(), read_only(7, 42, (0, file_len, block_len)))?;
 
       let delivery = mapping_of(liveness.recv_delivery()?)?;
       let metadata_ok = delivery.request_id == 7
@@ -1579,7 +1604,10 @@ pub mod platform {
       // receive nothing at all would satisfy that however `send_mapping` behaved — by sending one hand-off
       // that *does* meet the rule and taking it off the socket first. So the peer's side is known to work, and
       // the emptiness after the three refusals is a fact about the refusals.
-      control.send_mapping(sealed.as_fd(), 9, 11, 0, object_bytes, object_bytes)?;
+      control.send_mapping(
+        sealed.as_fd(),
+        read_only(9, 11, (0, object_bytes, object_bytes)),
+      )?;
       let good = mapping_of(liveness.recv_delivery()?)?;
       if good.mapping_id != 11 {
         return Err(IpcError::Layout {
@@ -1587,7 +1615,10 @@ pub mod platform {
         });
       }
       for (descriptor, region_off, authorized, what) in offers {
-        match control.send_mapping(descriptor, 7, 42, region_off, authorized, authorized) {
+        match control.send_mapping(
+          descriptor,
+          read_only(7, 42, (region_off, authorized, authorized)),
+        ) {
           Err(IpcError::UnconfinedDescriptor { .. }) => {}
           Ok(()) => {
             let _ = what;
@@ -1604,6 +1635,84 @@ pub mod platform {
         });
       }
       Ok(())
+    }
+
+    /// §4.6, A-186: a writable hand-off is judged for what a writable copy may be, and a read-only one is never handed
+    /// a writable copy. Do: offer a memfd sealed against resizing and new seals but not writes as a writable hand-off
+    /// and as a read-only one; offer one sealed against resizing alone (no `F_SEAL_SEAL`) and an unsealed one as
+    /// writable hand-offs; take whatever reached the client. Expect: the first passes as writable and arrives; every
+    /// other offer is refused `UnconfinedDescriptor` naming it writable, and nothing more reached the client.
+    #[test]
+    fn a_writable_hand_off_is_judged_for_what_a_writable_copy_may_be() -> Result<(), IpcError> {
+      let (control, liveness) = channel()?;
+      let bytes: u64 = 4096;
+      let sealed = |name: &str, seals: rustix::fs::SealFlags| -> Result<OwnedFd, IpcError> {
+        let fd = memfd_create(name, MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING)
+          .map_err(|e| super::refused("memfd_create", e))?;
+        #[allow(clippy::disallowed_methods)] // sizing a memory object: RAM, not a host path (R1).
+        rustix::fs::ftruncate(&fd, bytes).map_err(|e| super::refused("ftruncate", e))?;
+        if !seals.is_empty() {
+          rustix::fs::fcntl_add_seals(&fd, seals).map_err(|e| super::refused("add seals", e))?;
+        }
+        Ok(fd)
+      };
+      let fixed =
+        rustix::fs::SealFlags::SHRINK | rustix::fs::SealFlags::GROW | rustix::fs::SealFlags::SEAL;
+      let writable = sealed("slates-a186-writable", fixed)?;
+      let resealable = sealed(
+        "slates-a186-resealable",
+        rustix::fs::SealFlags::SHRINK | rustix::fs::SealFlags::GROW,
+      )?;
+      let open = sealed("slates-a186-open", rustix::fs::SealFlags::empty())?;
+      let as_writable = |request_id| super::super::Mapping {
+        access: slates_mem::PeerAccess::ReadWrite,
+        ..read_only(request_id, request_id, (0, bytes, bytes))
+      };
+      control.send_mapping(writable.as_fd(), as_writable(1))?;
+      if mapping_of(liveness.recv_delivery()?)?.mapping_id != 1 {
+        return Err(IpcError::Layout {
+          reason: "the writable hand-off arrived with the wrong metadata",
+        });
+      }
+      let offers = [
+        (writable.as_fd(), read_only(2, 2, (0, bytes, bytes))),
+        (resealable.as_fd(), as_writable(3)),
+        (open.as_fd(), as_writable(4)),
+      ];
+      for (descriptor, mapping) in offers {
+        match control.send_mapping(descriptor, mapping) {
+          Err(IpcError::UnconfinedDescriptor { writable: true, .. }) => {}
+          Ok(()) => {
+            return Err(IpcError::Layout {
+              reason: "a descriptor that authorizes more than its hand-off was sent",
+            });
+          }
+          Err(other) => return Err(other),
+        }
+      }
+      if liveness.recv_delivery()?.is_some() {
+        return Err(IpcError::Layout {
+          reason: "a refused hand-off still reached the peer",
+        });
+      }
+      Ok(())
+    }
+
+    /// A read-only hand-off's metadata: request `request_id`, mapping `mapping_id`, and `(region_off, file_len,
+    /// block_len)`.
+    fn read_only(
+      request_id: u64,
+      mapping_id: u64,
+      (region_off, file_len, block_len): (u64, u64, u64),
+    ) -> super::super::Mapping {
+      super::super::Mapping {
+        request_id,
+        mapping_id,
+        region_off,
+        file_len,
+        block_len,
+        access: slates_mem::PeerAccess::Read,
+      }
     }
 
     /// The mapping a delivery holds, or a typed error for none or another kind.
@@ -1666,7 +1775,7 @@ pub mod platform {
       .map_err(|e| super::refused("add seals", e))?;
 
       control.send_stream(handed.as_fd(), 5, 501)?;
-      control.send_mapping(block.as_fd(), 6, 12, 0, 4096, 4096)?;
+      control.send_mapping(block.as_fd(), read_only(6, 12, (0, 4096, 4096)))?;
       control.send_stream(other_handed.as_fd(), 7, 502)?;
       drop(handed);
 
@@ -1863,11 +1972,7 @@ pub mod platform {
     pub fn send_mapping(
       &self,
       _block: std::os::fd::BorrowedFd<'_>,
-      _request_id: u64,
-      _mapping_id: u64,
-      _region_off: u64,
-      _file_len: u64,
-      _block_len: u64,
+      _mapping: super::Mapping,
     ) -> Result<(), IpcError> {
       Err(IpcError::Unsupported {
         feature: "same-kernel direct map (macOS control socket owed)",

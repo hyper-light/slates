@@ -699,6 +699,32 @@ pub enum RequestBody {
     /// The value of its handle of the stream, in that process.
     handle: u64,
   },
+  /// Map a file's bytes read and write into a same-kernel client's address space (§4.6, A-186), under the caller's own
+  /// write attachment of the volume, as a file verb rides one: the daemon fills a copy of the file that the client may
+  /// change the bytes of and nothing else, keeps it equal to the file as `MapRead`'s copy is, and hands it as `MapRead`
+  /// does (the reply is `Mapped`, `MapOffered` or `MapHanded`). The client's stores land in the copy and reach the file
+  /// at its `MapSync`, its `ReleaseMap`, or its end, each written back through the attachment. Refused
+  /// `MapUnavailable` for every shape `MapRead` refuses, with no paged fallback, since a copied map could not keep
+  /// another writer's bytes; `Forbidden` for an attachment the caller may not write through. Appended.
+  MapWrite {
+    /// The volume (routes the verb to its owner shard).
+    volume: VolumeId,
+    /// The caller's write attachment of the volume, which the map's stores are written back under.
+    attachment: u64,
+    /// The file.
+    path: String,
+  },
+  /// Write the stores a writable direct map holds into its file (§4.6, A-186): the daemon compares the copy with the
+  /// file up to the file's end and writes each run that differs through the map's attachment, then publishes before it
+  /// replies, as a file verb does. Stores past the file's end within the copy's last page are not the file's and are
+  /// not written. The reply waits for the comparison, which runs in slices on the owner shard. `NotFound` for a map
+  /// this client does not hold or that is read-only, or whose attachment or file is gone. Appended.
+  MapSync {
+    /// The volume the map is of (routes the verb to its owner shard, where the copy is held).
+    volume: VolumeId,
+    /// The mapping id the map's hand-off named.
+    mapping_id: u64,
+  },
 }
 
 /// Format: the name of the image file in an image volume's root (§4.6, A-160): what a VMM is pointed at.
@@ -1234,6 +1260,8 @@ impl RequestBody {
       | RequestBody::AwaitPlaced { volume, .. }
       | RequestBody::Read { volume, .. }
       | RequestBody::MapRead { volume, .. }
+      | RequestBody::MapWrite { volume, .. }
+      | RequestBody::MapSync { volume, .. }
       | RequestBody::ReleaseMap { volume, .. }
       | RequestBody::ShardsHolder { volume, .. }
       | RequestBody::ReadRange { volume, .. }
@@ -2771,6 +2799,14 @@ pub enum Refusal {
   /// attach queues that record there as it replies, so a request sent at once can overtake it. Nothing was recorded,
   /// and the request may be sent again; the client does so within its reconnect budget. Appended.
   HolderPending,
+  /// A `Detach` met writable direct maps made under the attachment and not yet released (§4.6, A-186): their stores
+  /// reach the file only through the attachment, at a `MapSync`, a `ReleaseMap` or their client's end, so the
+  /// attachment stays until each is released, as a file system with files open refuses to unmount. Nothing changed.
+  /// Appended.
+  MapsHeld {
+    /// The writable maps held under the attachment.
+    maps: u64,
+  },
 }
 
 /// The writes a snapshot is known to include (§4.6 "Writeback and snapshot barrier"): every write the
@@ -3154,6 +3190,13 @@ pub enum ReplyBody {
   },
   /// The process a `ShardsHolder` named was judged to hold the stream and is now a known holder of it. Appended.
   ShardsHolderAdded,
+  /// A writable direct map's stores were written into its file and published (`MapSync`, §4.6 A-186). Appended.
+  MapSynced {
+    /// The bytes written: those of the runs where the copy differed from the file.
+    written: u64,
+    /// The file's length when the comparison began: the copy's bytes past it within its last page are not the file's.
+    file_len: u64,
+  },
 }
 
 /// One entry of a directory listing (`ReadDir`).

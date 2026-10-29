@@ -31,7 +31,7 @@ use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
 use windows_sys::Win32::System::Memory::{
   CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MapViewOfFile, PAGE_PROTECTION_FLAGS,
-  PAGE_READWRITE, UnmapViewOfFile, VirtualProtect,
+  PAGE_READWRITE, SECTION_EXTEND_SIZE, UnmapViewOfFile, VirtualProtect,
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
@@ -232,7 +232,9 @@ fn a_read_only_section_handle_escalates_unless_its_descriptor_refuses() {
 fn a_peer_objects_handed_handle_turns_into_nothing_more() {
   use std::os::windows::io::AsRawHandle;
 
-  let object = slates_mem::PeerObject::create("unused-on-windows", 5 << 10).unwrap();
+  let object =
+    slates_mem::PeerObject::create("unused-on-windows", 5 << 10, slates_mem::PeerAccess::Read)
+      .unwrap();
   let handed = object.read_only_handle().unwrap();
   let outcome = escalations("a peer object's handed handle", handed.as_raw_handle());
   assert_eq!(outcome.to_write, Err(ERROR_ACCESS_DENIED));
@@ -249,7 +251,12 @@ fn a_peer_objects_handed_handle_turns_into_nothing_more() {
 #[test]
 fn the_client_sees_every_store_and_every_zeroing() {
   let page = page_bytes();
-  let mut object = slates_mem::PeerObject::create("unused-on-windows", 5 * page - 3).unwrap();
+  let mut object = slates_mem::PeerObject::create(
+    "unused-on-windows",
+    5 * page - 3,
+    slates_mem::PeerAccess::Read,
+  )
+  .unwrap();
   assert_eq!(object.len(), 5 * page);
   let pattern: Vec<u8> = (0..usize::try_from(3 * page).unwrap())
     .map(|index| u8::try_from(index % 251).unwrap() | 1)
@@ -282,6 +289,54 @@ fn the_client_sees_every_store_and_every_zeroing() {
     "the bytes after it are kept"
   );
   views_longer_than_the_object_or_empty_are_refused(&object);
+}
+
+/// AC-A-186: a writable copy's handed handle writes, and turns into nothing more. Do: make a writable peer object,
+/// take the read-write handle it hands, store through a client's read-write view of it and through slates' own, then
+/// ask of the handle a duplicate that may rewrite the section's descriptor and one that may extend the section; and ask
+/// a read-only copy for a read-write handle. Expect: each side loads the other's stores; both duplicates refused
+/// `ERROR_ACCESS_DENIED`, the descriptor's own refusal; the read-only copy refuses a read-write handle by kind.
+#[test]
+fn a_writable_copys_handed_handle_writes_and_turns_into_nothing_more() {
+  use std::os::windows::io::AsRawHandle;
+
+  let page = page_bytes();
+  let mut object = slates_mem::PeerObject::create(
+    "unused-on-windows",
+    3 * page - 5,
+    slates_mem::PeerAccess::ReadWrite,
+  )
+  .unwrap();
+  let handed = object.read_write_handle().unwrap();
+  assert_eq!(
+    duplicate(handed.as_raw_handle(), WRITE_DAC).map(close),
+    Err(ERROR_ACCESS_DENIED),
+    "a duplicate that may rewrite the descriptor"
+  );
+  assert_eq!(
+    duplicate(handed.as_raw_handle(), SECTION_EXTEND_SIZE).map(close),
+    Err(ERROR_ACCESS_DENIED),
+    "a duplicate that may extend the section"
+  );
+  let client = slates_mem::PeerWriteView::map(handed, object.len()).unwrap();
+  let theirs: Vec<u8> = (0..usize::try_from(page + 3).unwrap())
+    .map(|index| u8::try_from(index % 251).unwrap() | 1)
+    .collect();
+  client.store(page - 1, &theirs).unwrap();
+  let mut seen = vec![0u8; theirs.len()];
+  object.load(page - 1, &mut seen).unwrap();
+  assert_eq!(seen, theirs, "slates loads the client's store");
+  object.store(2 * page + 7, b"ours").unwrap();
+  let mut back = [0u8; 4];
+  client.load(2 * page + 7, &mut back).unwrap();
+  assert_eq!(&back, b"ours", "the client loads slates' store");
+  let read_only =
+    slates_mem::PeerObject::create("unused-on-windows", page, slates_mem::PeerAccess::Read)
+      .unwrap();
+  assert!(matches!(
+    read_only.read_write_handle(),
+    Err(slates_mem::MemError::OsRefused { .. })
+  ));
 }
 
 /// A view of `object`'s handed handle one byte longer than the object, and an empty one: each refused `OutOfRange`.

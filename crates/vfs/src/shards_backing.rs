@@ -26,12 +26,14 @@
 //! ([`ShardsBackings::suppress`]). Writing those bytes back into it would overwrite any store the guest made after the
 //! ingest read them. A write-through the OS refuses is counted, the change itself standing.
 //!
-//! **A same-kernel client's copy** (§4.6, A-171). The direct map hands a client process one file's copy to map read
-//! alone ([`BackingObject::Peer`]). It is kept here beside the VMMs' backings, so the one write boundary keeps it equal
-//! to the file over its whole length, which is the file's page span when it was mapped: a write, a cut and a growth
-//! within it reach the client's map before the change returns. A change past that length reaches no one there; the
-//! client maps again to see it. The client cannot write the object, so nothing is ingested from it, and the server
-//! refuses the direct map beneath an overlay, so it is never marked stale.
+//! **A same-kernel client's copy** (§4.6, A-171). The direct map hands a client process one file's copy to map
+//! ([`BackingObject::Peer`]). It is kept here beside the VMMs' backings, so the one write boundary keeps it equal to the
+//! file over its whole length, which is the file's page span when it was mapped: a write, a cut and a growth within it
+//! reach the client's map before the change returns. A change past that length reaches no one there; the client maps
+//! again to see it. A client of a read-only copy cannot write it, so nothing is ingested from it. A writable copy
+//! (A-186) has every range marked writable, so [`ShardsBackings::mapped_writable`] reports it, and the server compares
+//! it back into the file at its client's sync points through the bridge, as an ingest does. The server refuses the
+//! direct map beneath an overlay, so a copy is never marked stale.
 //!
 //! **Beneath an overlay** (D-25) the disk can change a file's bytes without any write: an untouched file follows the
 //! disk. The base plane marks the file's backings stale where it takes such a change ([`ShardsBackings::mark_stale`]):
@@ -48,7 +50,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use slates_mem::{DAX_RANGE_BYTES, DaxObject, Handle, MemError, PeerObject, Slab};
+use slates_mem::{DAX_RANGE_BYTES, DaxObject, Handle, MemError, PeerAccess, PeerObject, Slab};
 
 use crate::ids::InodeNo;
 
@@ -124,16 +126,20 @@ impl BackingObject {
     }
   }
 
-  /// A read-only handle of a peer's copy, in this process: what the Windows hand-off duplicates into the client's
-  /// (A-175). A VMM's object is handed by [`BackingObject::handed_to_vmm`] instead, so it is refused here.
+  /// A handle of a peer's copy, in this process, in the copy's own access: read-only (A-175), or read and write for a
+  /// writable copy (A-186). What the Windows hand-off duplicates into the client's. A VMM's object is handed by
+  /// [`BackingObject::handed_to_vmm`] instead, so it is refused here.
   #[cfg(windows)]
-  pub fn read_only_handle(&self) -> Result<std::os::windows::io::OwnedHandle, MemError> {
+  pub fn peer_handle(&self) -> Result<std::os::windows::io::OwnedHandle, MemError> {
     match self {
       BackingObject::Vmm(_) => Err(MemError::OsRefused {
-        call: "a read-only handle of a VMM's object",
+        call: "a peer's handle of a VMM's object",
         code: None,
       }),
-      BackingObject::Peer(object) => object.read_only_handle(),
+      BackingObject::Peer(object) => match object.access() {
+        PeerAccess::Read => object.read_only_handle(),
+        PeerAccess::ReadWrite => object.read_write_handle(),
+      },
     }
   }
 
@@ -222,11 +228,18 @@ impl ShardsBacking {
     ShardsBacking::over(BackingObject::Vmm(object), volume, inode)
   }
 
-  /// A same-kernel client's backing of file `inode` of the volume of prefix `volume` over `object` (A-171), nothing
-  /// filled yet. A client maps it read alone, so no range is ever asked writable and nothing is ingested from it.
+  /// A same-kernel client's backing of file `inode` of the volume of prefix `volume` over `object`, nothing filled
+  /// yet. A read-only copy (A-171) has no range asked writable, and nothing is ingested from it; a writable one (A-186)
+  /// has every range of its object asked writable from the start, since its client may store anywhere in it.
   #[must_use]
   pub fn for_peer(object: PeerObject, volume: u16, inode: InodeNo) -> ShardsBacking {
-    ShardsBacking::over(BackingObject::Peer(object), volume, inode)
+    let writable_ranges = match object.access() {
+      PeerAccess::Read => 0,
+      PeerAccess::ReadWrite => object.len().div_ceil(DAX_RANGE_BYTES),
+    };
+    let mut backing = ShardsBacking::over(BackingObject::Peer(object), volume, inode);
+    backing.writable.extend(0..writable_ranges);
+    backing
   }
 
   fn over(object: BackingObject, volume: u16, inode: InodeNo) -> ShardsBacking {
@@ -550,6 +563,19 @@ impl ShardsBackings {
   /// The backing `handle` names, if it is live, mutably.
   pub fn get_mut(&mut self, handle: Handle<ShardsBacking>) -> Option<&mut ShardsBacking> {
     self.slab.get_mut(handle).ok()
+  }
+
+  /// Whether the backing `handle` names is live and still indexed under its file, so write-through reaches it: `false`
+  /// for one let go or detached (its volume destroyed, or its file gone for good). A writable copy's stores are compared
+  /// back only while this holds (A-186): a detached copy's inode number may name another file by now.
+  #[must_use]
+  pub fn is_attached(&self, handle: Handle<ShardsBacking>) -> bool {
+    self.slab.get(handle).is_ok_and(|backing| {
+      self
+        .by_file
+        .get(&(backing.volume, backing.inode))
+        .is_some_and(|handles| handles.contains(&handle))
+    })
   }
 
   /// Whether file `inode` of the volume of prefix `volume` has any backing: the write boundary's one check, a map

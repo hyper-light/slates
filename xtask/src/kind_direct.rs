@@ -21,6 +21,10 @@
 //!    seccomp profile.
 //! 4. The probe must print `zero_copy=true whole=true` at the file's length, and the daemon's counters must show one
 //!    hand-off (`dax.local_map`), no fallback to a copy and no unconfined descriptor.
+//! 5. The probe runs a third time, mapping the file read and write (A-186): it stores across the first page's end,
+//!    syncs, releases and reads the file back. It must print that the sync wrote the stored bytes that differ, the
+//!    release nothing more, and the file holds the store; the daemon's counters must show one more hand-off and two
+//!    write-backs finished (`dax.local_map_synced`), none refused.
 //!
 //! A pod with a network namespace of its own cannot reach the daemon this way: that needs a rendezvous it can reach
 //! (`docs/wip/GAPS.md`, the DAX matrix's entry).
@@ -42,12 +46,16 @@ const NODE_IMAGE: &str = "kindest/node:v1.36.4";
 const WRITER_CONTAINER: &str = "direct-writer";
 /// Format: the mapper's ephemeral container's name in pod 0.
 const PROBE_CONTAINER: &str = "direct-probe";
+/// Format: the writable mapper's ephemeral container's name in pod 0.
+const MAP_WRITER_CONTAINER: &str = "direct-map-writer";
 /// Format: the probe binary in the probe image.
 const PROBE_BINARY: &str = "/slates-pod-direct-probe";
 /// Format: the tag of the probe's one line in its write mode (`crates/cli/examples/pod_direct_probe.rs`).
 const WRITE_TAG: &str = "direct-write:";
 /// Format: the tag of the probe's one line in its map mode.
 const PROBE_TAG: &str = "direct-map:";
+/// Format: the tag of the probe's one line in its map-write mode.
+const MAP_WRITE_TAG: &str = "direct-map-write:";
 /// Format: the file the probe maps, at the volume's root.
 const DIRECT_FILE: &str = "direct.bin";
 /// Shape: the file's length: 4 MiB, many content chunks, as the Docker container's direct-map test maps
@@ -68,6 +76,10 @@ const HANDED: &str = "dax.local_map";
 const FELL_BACK: &str = "dax.local_map_fallback";
 /// Format: the daemon's counter of descriptors the hand-off judged unconfined.
 const UNCONFINED: &str = "dax.local_map_unconfined";
+/// Format: the daemon's counter of writable maps' write-backs that finished (A-186).
+const SYNCED: &str = "dax.local_map_synced";
+/// Format: the daemon's counter of writable maps' write-backs refused.
+const SYNC_REFUSED: &str = "dax.local_map_sync_refused";
 
 /// `kind direct`.
 pub(super) fn run(root: &Path, options: &Options) -> Result<(), Failure> {
@@ -191,7 +203,50 @@ fn prove(lane: &Lane) -> Result<(), Failure> {
     "kind direct: a process in a container of the daemon's pod mapped a {DIRECT_FILE_BYTES}-byte file by the direct \
      map, with no copy"
   );
+  prove_map_write(lane, &id)
+}
+
+/// Step 5: the probe maps the file read and write, stores, syncs, releases and reads the file back; the daemon's
+/// counters must show one more hand-off and two write-backs, none refused, nothing unconfined.
+fn prove_map_write(lane: &Lane, id: &str) -> Result<(), Failure> {
+  let before = Counters::read(lane)?;
+  let line = run_probe(lane, Probe::MapWrite, id)?;
+  let after = Counters::read(lane)?;
+  eprintln!("kind direct: {MAP_WRITE_TAG} {line}");
+  if !writes_through(&line) {
+    return Err(Failure(format!(
+      "kind direct: the pod's process did not write the file through its map: {line:?}"
+    )));
+  }
+  if after.handed.saturating_sub(before.handed) != 1
+    || after.synced.saturating_sub(before.synced) != 2
+    || after.sync_refused != before.sync_refused
+    || after.unconfined != before.unconfined
+  {
+    return Err(Failure(format!(
+      "kind direct: the daemon's counters do not show one hand-off and two write-backs: before {before:?}, after \
+       {after:?}"
+    )));
+  }
+  eprintln!(
+    "kind direct: a process in a container of the daemon's pod wrote a file in place through a writable direct map"
+  );
   Ok(())
+}
+
+/// Whether the map-write probe's line says the sync wrote the stored bytes that differ (some), the release nothing
+/// more, and the file holds the store.
+fn writes_through(line: &str) -> bool {
+  let field = |name: &str| {
+    line
+      .split_whitespace()
+      .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
+  };
+  let differing = field("differing").and_then(|value| value.parse::<u64>().ok());
+  differing.is_some_and(|differing| differing > 0)
+    && field("synced").and_then(|value| value.parse::<u64>().ok()) == differing
+    && field("released") == Some("0")
+    && field("whole") == Some("true")
 }
 
 /// Creates the leg's volume on pod 0 once the group accepts it: its id.
@@ -233,6 +288,8 @@ enum Probe {
   Write,
   /// Maps the file by the direct map.
   Map,
+  /// Maps the file read and write, stores, syncs, releases and reads it back (A-186).
+  MapWrite,
 }
 
 impl Probe {
@@ -241,6 +298,7 @@ impl Probe {
     match self {
       Probe::Write => "write",
       Probe::Map => "map",
+      Probe::MapWrite => "map-write",
     }
   }
 
@@ -249,6 +307,7 @@ impl Probe {
     match self {
       Probe::Write => WRITER_CONTAINER,
       Probe::Map => PROBE_CONTAINER,
+      Probe::MapWrite => MAP_WRITER_CONTAINER,
     }
   }
 
@@ -257,6 +316,7 @@ impl Probe {
     match self {
       Probe::Write => WRITE_TAG,
       Probe::Map => PROBE_TAG,
+      Probe::MapWrite => MAP_WRITE_TAG,
     }
   }
 }
@@ -335,10 +395,12 @@ struct Counters {
   handed: u64,
   fell_back: u64,
   unconfined: u64,
+  synced: u64,
+  sync_refused: u64,
 }
 
 impl Counters {
-  /// `slates status --json` on pod 0, read for the three counters.
+  /// `slates status --json` on pod 0, read for the counters.
   fn read(lane: &Lane) -> Result<Counters, Failure> {
     let status = lane.verb(&lane.pod(0), &["status"])?;
     if status.code != 0 {
@@ -352,6 +414,8 @@ impl Counters {
       handed: counter(&status, HANDED),
       fell_back: counter(&status, FELL_BACK),
       unconfined: counter(&status, UNCONFINED),
+      synced: counter(&status, SYNCED),
+      sync_refused: counter(&status, SYNC_REFUSED),
     })
   }
 }
@@ -388,5 +452,24 @@ mod tests {
     assert_eq!(counter(&status, HANDED), 5);
     assert_eq!(counter(&status, FELL_BACK), 1);
     assert_eq!(counter(&status, UNCONFINED), 0);
+  }
+
+  /// Do: judge the map-write probe's line as it prints it after a store that differed in 37 bytes, and lines that tell
+  /// of a sync writing other than that, a release writing, a file not as stored, a store that differed nowhere and a
+  /// field missing. Expect: the first passes and each other is refused.
+  #[test]
+  fn a_writable_maps_line_passes_only_when_the_store_reached_the_file() {
+    assert!(writes_through(
+      "differing=37 synced=37 released=0 whole=true"
+    ));
+    for line in [
+      "differing=37 synced=0 released=0 whole=true",
+      "differing=37 synced=37 released=4 whole=true",
+      "differing=37 synced=37 released=0 whole=false",
+      "differing=0 synced=0 released=0 whole=true",
+      "differing=37 released=0 whole=true",
+    ] {
+      assert!(!writes_through(line), "{line}");
+    }
   }
 }

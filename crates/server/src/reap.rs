@@ -34,6 +34,9 @@ pub(crate) async fn sweep(silence_ns: u64) -> usize {
   };
   let mut reaped: usize = 0;
   for (handle, client_id) in clients {
+    // A writable direct map's stores reach its file only through the attachment it was made under, so they are written
+    // back before the attachments go: a store to a shared map outlives its process (§4.6, A-186).
+    crate::direct_map::write_back_for_reap(handle, client_id).await;
     let result = remove_on_owners(origin, &shards, batch, client_id, silence_ns).await;
     state::with_state(|state| match result {
       Ok(()) => {
@@ -167,11 +170,11 @@ fn finish(state: &mut ShardState, handle: Handle<ClientSlot>, client_id: u32) ->
   // Let go of the files' copies the client was handed by the direct map (§4.6, A-171): its map of each lives on in
   // its own process if the process does, no longer kept equal to the file, and each copy's bytes go back to the
   // backings' budget rather than staying charged for a client that is gone; an offer of one it never claimed (macOS)
-  // is withdrawn with it.
+  // is withdrawn with it. A writable one's stores were written back before its attachments went (`sweep`, A-186).
   let reaped = client
     .direct_maps
     .drain(..)
-    .filter(|backing| crate::direct_map::let_go(state, *backing))
+    .filter(|held| crate::direct_map::let_go(state, held.backing))
     .count();
   if reaped > 0 {
     state.count(

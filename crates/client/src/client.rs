@@ -569,6 +569,143 @@ impl MappedRead {
   }
 }
 
+/// A file's bytes mapped read and write into a same-kernel client (§4.6, A-186): a view of the daemon's copy of the
+/// file, which this process loads and stores in place, with no request per access.
+///
+/// **Coherence.** The daemon writes every change another path makes to the file within the mapped length into the copy
+/// before that change returns, so a load sees it. This client's stores land in the copy at once and reach the file at
+/// [`Client::map_sync`], at [`Client::release_map_write`], or when this client ends (its reap writes them back before
+/// its attachments go), each written through the attachment the map was made under. A store past the file's end
+/// within the copy's last page is not the file's and is never written, as with a shared map of a file. The bytes are
+/// loaded and stored through atomics, never lent as a slice, since the daemon writes the copy at any moment too.
+///
+/// There is no copied fallback: a writable map the daemon cannot hand is refused `MapUnavailable`, since a copy could
+/// not keep the bytes another writer changes meanwhile.
+#[cfg(any(unix, windows))]
+pub struct MappedWrite {
+  view: slates_mem::PeerWriteView,
+  file_len: u64,
+  volume: VolumeId,
+  mapping_id: u64,
+}
+
+#[cfg(any(unix, windows))]
+impl std::fmt::Debug for MappedWrite {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("MappedWrite")
+      .field("file_len", &self.file_len)
+      .field("mapped_len", &self.view.len())
+      .field("mapping_id", &self.mapping_id)
+      .finish()
+  }
+}
+
+#[cfg(any(unix, windows))]
+impl MappedWrite {
+  /// The file's length when it was mapped, within what the map shows.
+  #[must_use]
+  pub fn len(&self) -> u64 {
+    self.file_len.min(self.view.len())
+  }
+
+  /// Whether the file was empty when it was mapped.
+  #[must_use]
+  pub fn is_empty(&self) -> bool {
+    self.len() == 0
+  }
+
+  /// How many bytes the map shows: the file's page span when it was mapped, within which a later change of the file
+  /// is seen and a store lands.
+  #[must_use]
+  pub fn mapped_len(&self) -> u64 {
+    self.view.len()
+  }
+
+  /// Copies the map's bytes from `offset` into `into`, as many as the map shows from there; how many. The file as it is
+  /// now, with this client's stores not yet written back; past the file's end, zeros or this client's own stores.
+  pub fn read_at(&self, offset: u64, into: &mut [u8]) -> Result<usize, ClientError> {
+    let count = shown_from(self.view.len(), offset, into.len());
+    let Some(into) = into.get_mut(..count).filter(|into| !into.is_empty()) else {
+      return Ok(0);
+    };
+    self
+      .view
+      .load(offset, into)
+      .map_err(|error| mapped_access_refused("load a mapped write", &error))?;
+    Ok(count)
+  }
+
+  /// Stores `from` into the map at `offset`, as many bytes as the map shows from there; how many. The store lands in
+  /// the daemon's copy at once and in the file at the next write-back; a store past the file's end is not written.
+  pub fn write_at(&self, offset: u64, from: &[u8]) -> Result<usize, ClientError> {
+    let count = shown_from(self.view.len(), offset, from.len());
+    let Some(from) = from.get(..count).filter(|from| !from.is_empty()) else {
+      return Ok(0);
+    };
+    self
+      .view
+      .store(offset, from)
+      .map_err(|error| mapped_access_refused("store into a mapped write", &error))?;
+    Ok(count)
+  }
+
+  /// The descriptor of the daemon's copy the map was handed: what a peer holds and could pass on, which authorizes
+  /// changing this one file's copy's bytes and nothing else.
+  #[cfg(unix)]
+  #[must_use]
+  pub fn descriptor(&self) -> std::os::fd::BorrowedFd<'_> {
+    self.view.descriptor()
+  }
+
+  /// The handle of the daemon's copy the map was handed: what a peer holds and could pass on, which authorizes
+  /// changing this one file's copy's bytes and nothing else (A-175's discipline).
+  #[cfg(windows)]
+  #[must_use]
+  pub fn handle(&self) -> std::os::windows::io::BorrowedHandle<'_> {
+    self.view.handle()
+  }
+
+  /// Maps the delivered copy whole, read and write: `block_len` bytes, the size the daemon made it, held under
+  /// `mapping_id` on `volume`'s owner.
+  fn map(
+    block: HandedCopy,
+    (volume, mapping_id): (VolumeId, u64),
+    file_len: u64,
+    block_len: u64,
+  ) -> Result<MappedWrite, ClientError> {
+    let view = slates_mem::PeerWriteView::map(block, block_len)
+      .map_err(|error| mapped_access_refused("mmap", &error))?;
+    Ok(MappedWrite {
+      view,
+      file_len,
+      volume,
+      mapping_id,
+    })
+  }
+}
+
+/// How many of `wanted` bytes from `offset` a map of `shown` bytes holds: none at or past its end, as `pread` past a
+/// file's end reads nothing; a view refuses an access that starts past it, even an empty one.
+#[cfg(any(unix, windows))]
+fn shown_from(shown: u64, offset: u64, wanted: usize) -> usize {
+  let take = shown
+    .saturating_sub(offset)
+    .min(u64::try_from(wanted).unwrap_or(u64::MAX));
+  usize::try_from(take).unwrap_or(0)
+}
+
+/// A map's access the OS refused, as the client's typed error, naming `call`.
+#[cfg(any(unix, windows))]
+fn mapped_access_refused(call: &'static str, error: &slates_mem::MemError) -> ClientError {
+  ClientError::Ipc(IpcError::OsRefused {
+    call,
+    code: match error {
+      slates_mem::MemError::OsRefused { code, .. } => *code,
+      _ => None,
+    },
+  })
+}
+
 /// Maps a decoded reply body to a result: a refusal becomes the typed error, any other body passes
 /// through — the same rule [`Client::exchange`] applies to a synchronous reply.
 fn resolved(body: ReplyBody) -> Result<ReplyBody, ClientError> {
@@ -1097,16 +1234,17 @@ impl Client {
   /// end, out of reach of [`Client::release_map`], which takes the map. A copy the daemon no longer holds (`NotFound`)
   /// is given back already. A release that fails too returns both causes, `HandOffUnreleased`.
   #[cfg(any(unix, windows))]
-  fn kept_or_given_back(
+  fn kept_or_given_back<Map>(
     &mut self,
-    handed: Result<MappedRead, ClientError>,
+    handed: Result<Map, ClientError>,
     (volume, mapping_id): (VolumeId, u64),
-  ) -> Result<MappedRead, ClientError> {
+  ) -> Result<Map, ClientError> {
     let Err(failure) = handed else {
       return handed;
     };
+    // A writable copy's release answers its write-back (`MapSynced`): nothing was stored into a copy never mapped.
     let release = match self.call(&RequestBody::ReleaseMap { volume, mapping_id }) {
-      Ok(ReplyBody::MapReleased)
+      Ok(ReplyBody::MapReleased | ReplyBody::MapSynced { .. })
       | Err(ClientError::Refused(slates_ipc::protocol::Refusal::NotFound)) => return Err(failure),
       Ok(_) => ClientError::UnexpectedReply {
         verb: "release_map",
@@ -1139,6 +1277,110 @@ impl Client {
     drop(view);
     match self.call(&RequestBody::ReleaseMap { volume, mapping_id })? {
       ReplyBody::MapReleased => Ok(()),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "release_map",
+      }),
+    }
+  }
+
+  /// §4.6, A-186: maps the file at `path` of `volume` read and write, under this client's own write `attachment` of
+  /// the volume, which the daemon resolves the path through (its scope applied) and writes the map's stores back
+  /// under. The daemon fills a copy of the file that this process may change the bytes of and nothing else, and hands
+  /// it as [`Client::map_read`]'s is: over the control socket on Linux, claimed on its socket route on macOS, duplicated
+  /// into this process on Windows. Refused `MapUnavailable` where the daemon cannot hand one (another user, an
+  /// overlay, a volume another shard owns, an in-process guest mapping the file to write), with no copied fallback;
+  /// `Forbidden` for an attachment this client may not write through; `MapShareExhausted` past this client's share. A
+  /// hand-off that fails here gives the copy back before the failure returns (A-174).
+  #[cfg(any(unix, windows))]
+  pub fn map_write(
+    &mut self,
+    (volume, attachment): (VolumeId, u64),
+    path: &str,
+  ) -> Result<MappedWrite, ClientError> {
+    match self.call(&RequestBody::MapWrite {
+      volume,
+      attachment,
+      path: path.to_owned(),
+    })? {
+      #[cfg(unix)]
+      ReplyBody::Mapped {
+        mapping_id,
+        region_off: 0,
+        file_len,
+        block_len,
+      } => {
+        let handed = self
+          .recv_delivery(|delivery| {
+            matches!(delivery, ControlDelivery::Mapping(mapping) if mapping.mapping_id == mapping_id)
+          })
+          .and_then(|delivered| match delivered {
+            ControlDelivery::Mapping(mapping) => {
+              MappedWrite::map(mapping.block, (volume, mapping_id), file_len, block_len)
+            }
+            ControlDelivery::Stream(_) => Err(ClientError::UnexpectedReply { verb: "map_write" }),
+          });
+        self.kept_or_given_back(handed, (volume, mapping_id))
+      }
+      // macOS: the copy's read-write descriptor waits on the daemon's socket route, claimed once with the reply's
+      // secret.
+      #[cfg(unix)]
+      ReplyBody::MapOffered {
+        mapping_id,
+        file_len,
+        block_len,
+        secret,
+      } => {
+        let handed = self
+          .claim_map(mapping_id, &secret)
+          .and_then(|block| MappedWrite::map(block, (volume, mapping_id), file_len, block_len));
+        self.kept_or_given_back(handed, (volume, mapping_id))
+      }
+      // Windows: the daemon duplicated a read-write handle of its copy into this process; the reply names its value.
+      #[cfg(windows)]
+      ReplyBody::MapHanded {
+        mapping_id,
+        file_len,
+        block_len,
+        handle,
+      } => {
+        let handed = slates_ipc::handle_route::adopt_section(handle)
+          .map_err(ClientError::Ipc)
+          .and_then(|block| MappedWrite::map(block, (volume, mapping_id), file_len, block_len));
+        self.kept_or_given_back(handed, (volume, mapping_id))
+      }
+      _ => Err(ClientError::UnexpectedReply { verb: "map_write" }),
+    }
+  }
+
+  /// §4.6, A-186: writes the stores this process made through `mapped` into the file and waits until they are
+  /// published: the bytes written, those of the runs where the copy differed from the file. A store past the file's
+  /// end is not the file's and is not written. Refused as the write-back refuses: `NotFound` when the map's attachment
+  /// or file is gone, the volume's own refusal for a write it refuses (no room, a recall in flight).
+  #[cfg(any(unix, windows))]
+  pub fn map_sync(&mut self, mapped: &MappedWrite) -> Result<u64, ClientError> {
+    match self.call(&RequestBody::MapSync {
+      volume: mapped.volume,
+      mapping_id: mapped.mapping_id,
+    })? {
+      ReplyBody::MapSynced { written, .. } => Ok(written),
+      _ => Err(ClientError::UnexpectedReply { verb: "map_sync" }),
+    }
+  }
+
+  /// §4.6, A-186: lets go of a writable map: unmaps this process's view, then asks the daemon to write the map's stores
+  /// back one last time and let go of its copy; the bytes that last write-back wrote. The copy is let go whatever the
+  /// write-back answers, so a refusal says the last stores did not all reach the file.
+  #[cfg(any(unix, windows))]
+  pub fn release_map_write(&mut self, mapped: MappedWrite) -> Result<u64, ClientError> {
+    let MappedWrite {
+      view,
+      volume,
+      mapping_id,
+      ..
+    } = mapped;
+    drop(view);
+    match self.call(&RequestBody::ReleaseMap { volume, mapping_id })? {
+      ReplyBody::MapSynced { written, .. } => Ok(written),
       _ => Err(ClientError::UnexpectedReply {
         verb: "release_map",
       }),

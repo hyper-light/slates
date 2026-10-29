@@ -599,7 +599,8 @@ fn client_copy(store: &mut Store, volume: &Volume, no: InodeNo, content: &[u8]) 
     .unwrap()
     .saturating_mul(4);
   store.shards_backings.set_budget(budget);
-  let mut object = slates_mem::PeerObject::create("slates-vfs-test", size).unwrap();
+  let mut object =
+    slates_mem::PeerObject::create("slates-vfs-test", size, slates_mem::PeerAccess::Read).unwrap();
   object.store(0, content).unwrap();
   let handle = store
     .shards_backings

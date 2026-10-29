@@ -767,41 +767,17 @@ impl DaxBackingSession {
   }
 
   /// Compares `span.1` bytes of `inode`'s object from `span.0` with the volume's, and writes each run that differs into
-  /// the volume through the bridge: how many runs were written, or why not. The backing is suppressed in the store while
-  /// its stores are written, so the write boundary does not copy them back into it over a store the guest made since.
+  /// the volume through the bridge: how many runs were written, or why not ([`write_back_slice`]).
   fn compare_and_write(
     &self,
     bridge: &mut dyn Bridge,
     cx: &OpContext,
     inode: u64,
-    (at, len): (u64, u64),
-    (stored, held): (&mut Vec<u8>, &mut Vec<u8>),
+    span: (u64, u64),
+    buffers: (&mut Vec<u8>, &mut Vec<u8>),
   ) -> Result<u64, Failure> {
     let handle = *self.backings.get(&inode).ok_or(Failure::Object)?;
-    stored.clear();
-    stored.resize(usize::try_from(len).map_err(|_| Failure::Object)?, 0);
-    {
-      let state = bridge.dax_state().ok_or(Failure::Object)?;
-      state
-        .backings
-        .get_mut(handle)
-        .ok_or(Failure::Object)?
-        .object_mut()
-        .load(at, stored)
-        .map_err(|_| Failure::Object)?;
-      state.backings.suppress(Some(handle));
-    }
-    let runs = write_back_runs(
-      bridge,
-      cx,
-      ObjectId::new(inode, 0),
-      (at, len),
-      (stored, held),
-    );
-    if let Some(state) = bridge.dax_state() {
-      state.backings.suppress(None);
-    }
-    runs
+    write_back_slice(bridge, cx, (handle, inode), span, buffers).map(|wrote| wrote.runs)
   }
 
   /// Whether the session owes its guest a refill before anything more: one under way, or a backing of its marked stale
@@ -984,18 +960,72 @@ fn write_back_runs(
   object: ObjectId,
   (at, len): (u64, u64),
   (stored, held): (&[u8], &mut Vec<u8>),
-) -> Result<u64, Failure> {
+) -> Result<WroteBack, Failure> {
   read_whole(bridge, cx, object, (at, len), held).map_err(Failure::Volume)?;
   // A volume shorter than the object's span here (the file cut since) is compared as far as it reaches.
   let runs = differing_runs(stored, held);
+  let mut wrote = WroteBack::default();
   for &(from, to) in &runs {
     let bytes = stored.get(from..to).ok_or(Failure::Object)?;
     let offset = at.saturating_add(u64::try_from(from).unwrap_or(u64::MAX));
     bridge
       .write(object, cx, offset, bytes)
       .map_err(Failure::Volume)?;
+    wrote.runs = wrote.runs.saturating_add(1);
+    wrote.bytes = wrote
+      .bytes
+      .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
   }
-  Ok(u64::try_from(runs.len()).unwrap_or(u64::MAX))
+  Ok(wrote)
+}
+
+/// What one slice of a write-back wrote into the volume ([`write_back_slice`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WroteBack {
+  /// The runs of bytes that differed and were written.
+  pub runs: u64,
+  /// Their bytes.
+  pub bytes: u64,
+}
+
+/// Compares `len` bytes of the copy `handle` names, file `inode`'s, from `at` with the volume's, and writes each run
+/// that differs into the volume through the bridge, so its scope, rights and every gate in front of a write apply: what
+/// it wrote, or why not. The one compare-back every copy another process stores into takes: a guest's DAX backing
+/// (A-163's ingest) and a client's writable direct map (A-186). The copy is suppressed in the store while its bytes are
+/// written, so the write boundary does not copy them back into it over a store made since; every other backing of the
+/// file takes them. The volume is read as far as the file reaches now, so a run past an end another path cut is never
+/// written back. `stored` and `held` are the caller's buffers, kept across slices so a slice allocates nothing new.
+pub fn write_back_slice(
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  (handle, inode): (Handle<ShardsBacking>, u64),
+  (at, len): (u64, u64),
+  (stored, held): (&mut Vec<u8>, &mut Vec<u8>),
+) -> Result<WroteBack, Failure> {
+  stored.clear();
+  stored.resize(usize::try_from(len).map_err(|_| Failure::Object)?, 0);
+  {
+    let state = bridge.dax_state().ok_or(Failure::Object)?;
+    state
+      .backings
+      .get_mut(handle)
+      .ok_or(Failure::Object)?
+      .object_mut()
+      .load(at, stored)
+      .map_err(|_| Failure::Object)?;
+    state.backings.suppress(Some(handle));
+  }
+  let wrote = write_back_runs(
+    bridge,
+    cx,
+    ObjectId::new(inode, 0),
+    (at, len),
+    (stored, held),
+  );
+  if let Some(state) = bridge.dax_state() {
+    state.backings.suppress(None);
+  }
+  wrote
 }
 
 /// Reads `len` bytes of `object` from `at` into `out`, cleared first, in as many calls as the bridge's read cap takes,

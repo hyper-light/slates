@@ -172,6 +172,14 @@ Every test is written as "do X, expect Y" and names the acceptance criterion or 
     time. The cause is oversubscription. Each in-process daemon sizes itself from the whole machine, and Windows charges
     commit when memory is made. So thirteen daemons met the commit limit: the process aborted allocating 873,462,528
     bytes, and the shards spent over a second of their own CPU in one poll (GAPS).
+    The copy may be writable (A-186, `PeerAccess::ReadWrite`; `crates/server/src/direct_map.rs` `Sync`): the client's
+    stores are compared back through the map's attachment at its sync, release and reap, by the one compare-back
+    (`crates/bridge-core/src/dax_backing.rs` `write_back_slice`). Gotchas, each found by a test: the copy written back
+    from must be passed over by its own write-back's write-through, or a store made meanwhile is undone (84 of 158,498
+    stores, `a_store_made_while_its_map_is_synced_is_never_undone`); the reap must write back before it removes the
+    client's attachments, through which alone the stores reach the file (`crates/client/tests/reap_map.rs`); a detach
+    with writable maps held is refused, or their stores would drop with no error; and a store past the file's end is
+    kept out twice (the comparison's end and the volume read's short tail), so red-check them together.
   - The write seam and its only real implementation: `crates/vfs/src/host/mod.rs` (`LandFs`) with `crates/land/src/os.rs`; every verb takes a handle, never a path, and the engine (`crates/land/src/engine.rs`) is written against the seam so the oracle runs it unchanged over `SimHost`.
   - A per-shard singleton shared by the shard's tasks: `crates/rt/src/shard.rs` (`ShardContext::keep`/`keep_with` return a `Kept<T>` handle; `Kept::with` lends inside a closure only while its own context runs) with `crates/transport/src/demux.rs` (`DemuxId` is the handle; its receive loop awaits readiness outside the borrow). Gotcha: a `&'static` into state an owner frees is unsound however "only tasks hold it" — the type must confine the lend; and in edition 2024 an `impl Future` returned from `&self` captures the borrow unless it says `use<>` (`UdpSocket::readable`).
   - A detector's non-vacuity canary: `crates/mem/tests/race_canary.rs` with `xtask/src/tsan.rs` (the lane requires ThreadSanitizer's report from a deliberate race before it trusts a clean run of the suites). Gotcha: ThreadSanitizer v3 reports a race only while the earlier access is still in its thread's trace (three parts of 32,763 events by default) and otherwise drops it without a word, so the canary's first writer parks rather than polls between the writes; a polling first writer went unreported 2 times in 99 CI runs and 120 in 120 on a loaded Mac. The same bound holds in the suites: a race whose earlier access is further back than that is never reported.

@@ -37,8 +37,8 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
 use windows_sys::Win32::System::Memory::{
-  FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_BASIC_INFORMATION, MapViewOfFile, UnmapViewOfFile,
-  VirtualQuery,
+  FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_BASIC_INFORMATION, MapViewOfFile, SECTION_EXTEND_SIZE,
+  UnmapViewOfFile, VirtualQuery,
 };
 use windows_sys::Win32::System::Threading::{
   GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_DUP_HANDLE,
@@ -61,17 +61,18 @@ fn os(call: &'static str) -> IpcError {
   }
 }
 
-/// Duplicates `read_only`, the read-only handle of a direct map's copy, into the process `pid` and returns the
-/// duplicate's value there, once [`confined_section`] has judged it to authorize reading `authorized` bytes and
-/// nothing more and [`same_user`] the process to run as this one's user. Refused `UnconfinedDescriptor`,
-/// `PeerRefused`, or `OsRefused` naming the step the OS refused.
+/// Duplicates `section`, a handle of a direct map's copy, into the process `pid` and returns the duplicate's value
+/// there, once [`confined_section`] has judged it to authorize `authorized` bytes in `access` and nothing more, and
+/// [`same_user`] the process to run as this one's user. Refused `UnconfinedDescriptor`, `PeerRefused`, or `OsRefused`
+/// naming the step the OS refused.
 pub fn hand_section(
-  read_only: BorrowedHandle<'_>,
+  section: BorrowedHandle<'_>,
   authorized: u64,
   pid: u32,
+  access: slates_mem::PeerAccess,
 ) -> Result<u64, IpcError> {
-  confined_section(read_only, authorized)?;
-  duplicate_into(read_only, pid)
+  confined_section(section, authorized, access)?;
+  duplicate_into(section, pid)
 }
 
 /// Duplicates `stream`, the client end of a Shards stream's pipe (`crate::stream::pair`, A-179), into the process `pid`
@@ -284,16 +285,27 @@ fn adopt(value: u64, none: &'static str) -> Result<OwnedHandle, IpcError> {
   Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
 }
 
-/// Refuses a section handle that would authorize a peer more than reading the `authorized` bytes it is handed for: one
-/// whose section is any other size, or that a holder can duplicate into a handle that writes or that may rewrite the
-/// section's descriptor, or map writable. Each refusal must be `ERROR_ACCESS_DENIED`, the descriptor's own; any other
-/// answer refuses the hand-off too, since then nothing was judged. Refused `UnconfinedDescriptor` naming what the
-/// handle would have authorized, or `OsRefused` where the judging could not be done.
-pub fn confined_section(read_only: BorrowedHandle<'_>, authorized: u64) -> Result<(), IpcError> {
-  let object_bytes = section_bytes(read_only)?;
-  let writable = escalates(read_only, FILE_MAP_WRITE | FILE_MAP_READ)?
-    || escalates(read_only, WRITE_DAC)?
-    || maps_writable(read_only)?;
+/// Refuses a section handle that would authorize a peer more than the `authorized` bytes in `access` it is handed for:
+/// one whose section is any other size, or that a holder can duplicate into a handle that may rewrite the section's
+/// descriptor or extend the section. A read-only handle (A-175) must also refuse a duplicate that writes and a writable
+/// view; a writable one (A-186) writes by design, and those two are its grant. Each refusal must be
+/// `ERROR_ACCESS_DENIED`, the descriptor's own; any other answer refuses the hand-off too, since then nothing was
+/// judged. Refused `UnconfinedDescriptor` naming what the handle would have authorized, or `OsRefused` where the
+/// judging could not be done.
+pub fn confined_section(
+  section: BorrowedHandle<'_>,
+  authorized: u64,
+  access: slates_mem::PeerAccess,
+) -> Result<(), IpcError> {
+  let object_bytes = section_bytes(section)?;
+  let reaches_further = escalates(section, WRITE_DAC)? || escalates(section, SECTION_EXTEND_SIZE)?;
+  let writes_unasked = match access {
+    slates_mem::PeerAccess::Read => {
+      escalates(section, FILE_MAP_WRITE | FILE_MAP_READ)? || maps_writable(section)?
+    }
+    slates_mem::PeerAccess::ReadWrite => false,
+  };
+  let writable = reaches_further || writes_unasked;
   if writable || object_bytes != authorized {
     return Err(IpcError::UnconfinedDescriptor {
       object_bytes,

@@ -1,7 +1,8 @@
-//! The direct map's tests that need a client process of their own (§4.6; A-172, A-174). The test binary re-invoked is
-//! the client (an environment variable selects its role), so what happens to it is real: a client holding a direct map
-//! is killed with `SIGKILL` and the daemon reaps its copy (T-2.3's shape); a client that can be given no descriptor
-//! fails its hand-off and gives the copy back. Its own binary, apart from `reap.rs`: that suite counts the
+//! The direct map's tests that need a client process of their own (§4.6; A-172, A-174, A-186). The test binary
+//! re-invoked is the client (an environment variable selects its role), so what happens to it is real: a client holding
+//! a direct map is killed with `SIGKILL` and the daemon reaps its copy (T-2.3's shape); a client killed with stores in a
+//! writable map it never synced has them written back by the reap; a client that can be given no descriptor fails its
+//! hand-off and gives the copy back. Its own binary, apart from `reap.rs`: that suite counts the
 //! process-wide `CLIENTS_REAPED`, and a second reap in its process during its window broke it (2026-10-25).
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(
@@ -123,6 +124,31 @@ fn mapper() {
     client.client_id(),
     mapped.is_zero_copy()
   );
+  loop {
+    std::thread::park();
+  }
+}
+
+/// Format: what the writer stores into its writable map, and where.
+const STORED: &[u8] = b"stored before the kill, never synced";
+const STORED_AT: [u64; 2] = [1000, 40_000];
+
+/// The writer: connects, attaches the volume it is given for writing, maps `/f.bin` read and write under that
+/// attachment, stores [`STORED`] at each of [`STORED_AT`] without syncing, prints whether the map is a direct one, and
+/// waits to be killed with the stores in the map alone.
+fn writer() {
+  let instance = std::env::var(ROLE_INSTANCE).unwrap();
+  let volume = unhex(&std::env::var(ROLE_VOLUME).unwrap());
+  let mut client = Client::connect(&instance, deadlines()).unwrap();
+  let attachment = client
+    .attach(volume, None, Intent::Write)
+    .unwrap()
+    .attachment;
+  let mapped = client.map_write((volume, attachment), "/f.bin").unwrap();
+  for at in STORED_AT {
+    assert_eq!(mapped.write_at(at, STORED).unwrap(), STORED.len());
+  }
+  println!("writer-id: {} stored", client.client_id());
   loop {
     std::thread::park();
   }
@@ -288,5 +314,73 @@ fn a_hand_off_that_fails_in_the_client_gives_its_copy_back() {
     "the failed hand-off gave its copy back while its client lives"
   );
   assert_eq!(counted(&daemon, "dax.local_map_released"), 1);
+  daemon.stop();
+}
+
+/// AC-A-186: a store into a writable map outlives its client's process, as one into a shared map of a file does. Do: on
+/// a one-shard daemon, a re-invoked test binary attaches a 64 KiB file's volume for writing, maps the file read and
+/// write, stores a phrase at two offsets without syncing, and parks; read the file through another client; `SIGKILL`
+/// the writer. Expect: before the kill the file holds its old bytes (the stores are in the copy alone); after it, the
+/// reap writes them back before it removes the writer's attachment, so the file holds the phrase at both offsets and
+/// nothing else changed; the copy is let go (`dax.local_map_reaped` one, the held copies where they started) and one
+/// write-back finished (`dax.local_map_synced` one) with the phrase's bytes, twice, written.
+#[test]
+fn a_killed_clients_writable_map_has_its_stores_written_back() {
+  if std::env::var(ROLE).as_deref() == Ok("writer") {
+    writer();
+    return;
+  }
+  let (daemon, instance, volume, file_len) = daemon_with_a_file("reapwrite");
+  let before = daemon.direct_map_copies().unwrap();
+  let mut reader = Client::connect(&instance, deadlines()).unwrap();
+  let old = reader
+    .read(volume, "/f.bin", slates_client::ReadAt::Head)
+    .unwrap();
+  assert_eq!(old.len(), file_len);
+  let (mut child, report) = start_role(
+    &instance,
+    volume,
+    (
+      "writer",
+      "a_killed_clients_writable_map_has_its_stores_written_back",
+    ),
+    "writer-id: ",
+  );
+  assert!(report.ends_with("stored"), "the writer stored: {report}");
+  assert_eq!(
+    reader
+      .read(volume, "/f.bin", slates_client::ReadAt::Head)
+      .unwrap(),
+    old,
+    "before the kill the stores are in the copy alone"
+  );
+  child.0.kill().unwrap();
+  child.0.wait().unwrap();
+  wait_until("the killed writer's copy is reaped", || {
+    daemon.direct_map_copies().unwrap() == before
+  });
+  let mut expect = old.clone();
+  for at in STORED_AT {
+    let at = usize::try_from(at).unwrap();
+    expect[at..at + STORED.len()].copy_from_slice(STORED);
+  }
+  assert!(
+    reader
+      .read(volume, "/f.bin", slates_client::ReadAt::Head)
+      .unwrap()
+      == expect,
+    "the reap wrote the stores back, and nothing else changed"
+  );
+  let differing = old
+    .iter()
+    .zip(&expect)
+    .filter(|(was, is)| was != is)
+    .count();
+  assert_eq!(counted(&daemon, "dax.local_map_reaped"), 1);
+  assert_eq!(counted(&daemon, "dax.local_map_synced"), 1);
+  assert_eq!(
+    counted(&daemon, "dax.local_map_synced_bytes"),
+    u64::try_from(differing).unwrap()
+  );
   daemon.stop();
 }

@@ -57,8 +57,9 @@ pub struct ClientSlot {
   pub(crate) read_ahead_pending: u64,
   /// The files' copies this client was handed by the same-kernel direct map (§4.6, A-171), each kept equal to its file
   /// by the store's write boundary until the client goes: let go when the client is reaped (`crate::reap`), their bytes
-  /// given back to the backings' budget. Empty for a client that never mapped; bounded by the backings' capacity.
-  pub(crate) direct_maps: Vec<slates_mem::Handle<slates_vfs::shards_backing::ShardsBacking>>,
+  /// given back to the backings' budget, a writable one's stores written back first (A-186). Empty for a client that
+  /// never mapped; bounded by the backings' capacity.
+  pub(crate) direct_maps: Vec<crate::direct_map::HeldMap>,
 }
 
 impl std::fmt::Debug for ClientSlot {
