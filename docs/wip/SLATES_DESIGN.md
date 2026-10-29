@@ -3857,9 +3857,11 @@ well-known name.
 > owner's node replaced, removed by whoever bound it. Proven on arm64 Linux (2026-10-28, in a container on this Mac):
 > a client in a user and network namespace of its own (`unshare`) maps a file read and write by the direct map through
 > the socket file while it finds no daemon at the abstract name, and every rendezvous test passes sealed; eight mutants
-> each fail their guard. The chart takes the directory as `rendezvous.directory` and `rendezvous.hostPath`. Owed: the
-> first runs of the Docker bridge-network test and the KIND lane's pod of its own (CI), and the exchange's measured
-> cost per connect.
+> each fail their guard. The chart takes the directory as `rendezvous.directory` and `rendezvous.hostPath`. The seal
+> costs about 36 µs a rendezvous in release, and a sealed connect is about 180 µs slower at the median in a debug build
+> (BENCHMARKS, A-187), once per client session. A container on a bridge network and a KIND pod of its own each wrote a
+> file through a writable direct map across the socket file in CI (run 40844136550, diagnostics run 40847130881),
+> red-checked. Owed: the connect's cost in a release build.
 
 > **Status (2026-10-27): a peer the daemon cannot see by pid is served.** Linux reports a socket peer's process id as
 > the reader's pid namespace sees it, and 0 for a process outside it: a client in a container of a pod beside the
@@ -12463,7 +12465,7 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
 - **Measured** the same day (BENCHMARKS, "Copy-once-map-many against copy-per-read", jupiter): a steady mapped read costs 1.4 % to 2.6 % of a copy read; the hand-off's setup is 28 to 56 µs at 4 KiB, repaid after 2 or 3 reads, and from 1 MiB the whole setup costs less than one copy read.
 - **Owed:** arm64 Windows; replies that stalled on Windows with many daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
 
-### A-187 — A client in its own network namespace reaches the daemon through a socket file, every rendezvous sealed (accepted 2026-10-28; built 2026-10-29)
+### A-187 — A client in its own network namespace reaches the daemon through a socket file, every rendezvous sealed (accepted 2026-10-28; built and proven 2026-10-29)
 Applied in the same change to: §4.7 (the rendezvous paragraph and its status), GAPS, `docs/wip/virtiofs.md` §8 (the
 Docker and Kubernetes socket-route cells), `crates/ipc` (`seal.rs`: the interface, `Role`, `Class`, `install`, `fresh`;
 `rendezvous.rs`: the Linux address (`node`, `bind_node`, `owner_only`), the daemon-first exchange (`Handshake`, the
@@ -12523,10 +12525,28 @@ of its own).
   client finds no daemon), no give-up, no check of the listener's user, the hello used unopened, a delivery parsed
   unopened, the rendezvous wait blind to pending handshakes (every connect took 1.001 s to 1.012 s, against a bound of
   100 ms), any directory accepted, a live owner's node replaced.
-- **Owed:** the first runs of the Docker bridge-network test (CI's arm64 lane) and the KIND lane's step 6 (CI's KIND
-  job); a run on Linux x86_64; the exchange's measured cost per connect (the A/B was cut off after its first round);
-  a namespace whose Pod Security admission forbids hostPath volumes cannot mount the directory (a CSI driver serving it
-  as an inline volume, as SPIFFE's does for its agent's socket, would).
+- **Measured** (adacachy, x86_64, Linux 7.2.9, load 60 to 132, 2026-10-29; debug test binaries, so a release figure
+  is owed): `~/a187-ab/ab.sh` builds A (ce36e9aa, unsealed) and B (844792e3, sealed) each in its own target and runs
+  their `a_connect_is_answered_within_a_tenth_of_the_claim_wait` alternately, three times each, 200 connects to a fresh
+  one-shard daemon a run. The least connect of each run was 90, 73 and 97 µs unsealed against 228, 254 and 226 µs
+  sealed; the median 178, 169 and 195 µs against 357, 369 and 367 µs; the 99th percentile 5.1 to 10.6 ms against 5.9
+  to 6.9 ms, the loaded box's own. So the exchange adds about 160 µs at the least and 180 µs at the median to a connect
+  in a debug build: three X25519 operations in sequence and half a round trip more. In a release binary the seal
+  itself, one whole exchange with both sides' operations, costs about 36 µs at the least on both an M5 Max and a Ryzen
+  9 9950X3D2 (`cargo run --release -p slates-seal --example seal_cost -- 2000`; BENCHMARKS, "What sealing the rendezvous
+  costs a connect"). A connect happens once per client session, never per request, so R9's provisioning floor is
+  untouched.
+- **Proven in containers and pods** (2026-10-29): the bridge-network container test on CI's x86_64 and arm64 lanes,
+  `synced=43 released=0` through the socket file while a container on a bridge network finds no daemon at an abstract
+  instance (run 40844136550); and the KIND direct leg's step 6, a pod of its own on pod 0's node finding no daemon at the
+  abstract socket, then pods of their own writing the file and writing through it by a writable direct map through the
+  node's directory mounted read-only, `differing=37 synced=37 released=0 whole=true`, on x86_64 (the same run, job
+  123347393577) and on arm64 (diagnostics run 40847130881). Red-checked on arm64 with the socket file read as an
+  abstract name: step 6's pod of its own and the bridge container were each refused "daemon unavailable". Linux x86_64
+  ran the ipc, client and namespace suites on adacachy the same day (29, 22, 30 and 1 passed).
+- **Owed:** the connect's cost in a release build; a namespace whose Pod Security admission forbids hostPath volumes
+  cannot mount the directory (a CSI driver serving it as an inline volume, as SPIFFE's does for its agent's socket,
+  would); CI's runners refuse an unprivileged user namespace, so the `unshare` test skips there loudly.
 
 ### A-186 — The direct map maps a file read and write: the client's stores are compared back into the file at its sync points (accepted 2026-10-28)
 Applied in the same change to: §4.6 (the same-kernel direct map paragraph and its status, the DAX matrix status), GAPS, `docs/wip/virtiofs.md` §8, `crates/mem` (`dax_object.rs`: `PeerAccess`, `PeerObject::create` taking it, `PeerObject::access` and `read_write_handle`, `PeerWriteView` on every platform, `within_view`; `tests/peer_object.rs`, `tests/peer_section.rs`), `crates/ipc` (`protocol.rs`: `RequestBody::MapWrite` and `MapSync`, `ReplyBody::MapSynced`, `Refusal::MapsHeld`, appended; `rendezvous.rs`: `Mapping`, the Linux judge by access and its writable test; `route.rs`: `confined_map`, replacing `confined_read_only`; `handle_route.rs`: `confined_section` and `hand_section` by access), `crates/vfs` (`shards_backing.rs`: a writable copy's ranges marked writable, `is_attached`, `BackingObject::peer_handle` replacing `read_only_handle`), `crates/bridge-core` (`dax_backing.rs`: `write_back_slice` and `WroteBack`, the one compare-back, which the ingest now calls), `crates/server` (`direct_map.rs`: `HeldMap`, `map_write`, `map_sync`, `Sync`, the writable release, `write_back_for_reap`, `defer_task`, `complete` shared; `fs_verbs.rs`: `with_writer`, `writable_file`; `verbs.rs`: the verbs' dispatch, the detach's `MapsHeld`, the refusal's ledger name; `reap.rs`; `state.rs`), `crates/client` (`MappedWrite`, `map_write`, `map_sync`, `release_map_write`; `tests/client.rs`, `tests/reap_map.rs`).

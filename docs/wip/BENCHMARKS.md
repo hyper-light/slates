@@ -6920,3 +6920,36 @@ against the volume's bytes in place, without the copy, is the next measured cand
 
 **Measured and replaced.** Variant A, the first build. Its byte-at-a-time run finder walked every byte of a slice whose
 bytes were all equal.
+
+## What sealing the rendezvous costs a connect (A-187; 2026-10-29)
+
+**The question.** Since A-187 every Linux rendezvous is sealed: an X25519 exchange, a key per direction by HKDF-SHA256,
+and AES-256-GCM on each message, with the daemon speaking first. This records the seal's own cost per rendezvous in a
+release binary, and what a whole connect costs with and without it.
+
+**The seal alone.** `cargo run --release -p slates-seal --example seal_cost -- 2000`. Each round is one whole exchange,
+both sides, timed alone: two halves made, both agreed, the hello sealed and opened, the handoff sealed and opened. In the
+rendezvous the client makes its half before it connects, so the connect waits on about three of the four X25519
+operations.
+
+| machine | load | least, three runs | median, three runs | p99, three runs |
+|---|---|---|---|---|
+| Apple M5 Max, macOS 26.4.1, 01:50 PDT | 8.4–9.9 | 36.6, 37.5, 37.7 µs | 38.0, 38.0, 38.9 µs | 41.4, 39.8, 41.2 µs |
+| adacachy, AMD Ryzen 9 9950X3D2, Linux 7.2.9, 01:51 PDT, a `systemd-run --user` unit at `CPUWeight=1` | 49–57 | 35.6, 35.8, 36.2 µs | 43.4, 46.5, 50.7 µs | 90.2, 152.1, 53.9 µs |
+
+**A whole connect, A/B.** Debug test binaries, so these overstate a release build: aws-lc's C is built at the profile's
+level too. A is ce36e9aa (unsealed) and B 844792e3 (sealed), each built in its own target on adacachy, load 60–132,
+2026-10-29 01:4x PDT. Their `a_connect_is_answered_within_a_tenth_of_the_claim_wait`, with 200 connects a run to a fresh
+one-shard daemon, ran alternately, A B A B A B (`~/a187-ab/ab.sh`, kept in A-187's record).
+
+| variant | least, three runs | median, three runs | p99, three runs |
+|---|---|---|---|
+| A: unsealed | 90.1, 72.9, 97.3 µs | 177.5, 168.6, 194.7 µs | 5.1, 10.6, 5.9 ms |
+| B: sealed | 227.6, 254.4, 226.2 µs | 356.8, 369.4, 367.0 µs | 5.9, 6.7, 6.9 ms |
+
+- **The seal costs about 36 µs a rendezvous in release**, the same on both machines, at the least of each run.
+- **In debug the sealed connect is about 180 µs slower at the median.** That is three X25519 operations in sequence
+  in an unoptimized build, and half a round trip more.
+- **The p99 is the loaded box's own** on both sides.
+- A connect happens once per client session, never per request, so R9's provisioning floor is untouched. A release
+  A/B of the whole connect is owed (GAPS, A-187).
