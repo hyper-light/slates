@@ -4,13 +4,14 @@
 # architecture (arm64 locally, amd64 on the CI runner). Ada authorized QEMU in CI on 2026-10-01.
 # QEMU comes from trixie-backports (11.1.2): 11.1 is the first QEMU whose generic vhost-user device makes a back end's
 # shared-memory region a PCI BAR, the guest's DAX window over slates' own device (A-189); trixie's own is 10.0. fuse3
-# is for that leg's `slates mount`s, which reach the kernel through fusermount3.
+# is for that leg's `slates mount`s, which reach the kernel through fusermount3, and e2fsprogs for the image test's
+# check of an image a killed guest left.
 FROM rust:1.98.1
 RUN set -e; arch=$(dpkg --print-architecture); \
     case "$arch" in arm64) qemu=qemu-system-arm;; amd64) qemu=qemu-system-x86;; *) echo "no guest recipe for $arch"; exit 1;; esac; \
     echo "deb http://deb.debian.org/debian trixie-backports main" > /etc/apt/sources.list.d/trixie-backports.list; \
     apt-get update -qq && apt-get install -y -qq --no-install-recommends -t trixie-backports "$qemu" >/dev/null && \
-    apt-get install -y -qq --no-install-recommends "linux-image-$arch" busybox-static fuse3 \
+    apt-get install -y -qq --no-install-recommends "linux-image-$arch" busybox-static fuse3 e2fsprogs \
       cpio gzip xz-utils kmod rsync ripgrep vim nodejs npm sqlite3 inotify-tools >/dev/null && rm -rf /var/lib/apt/lists/*
 COPY init /guest/init
 RUN set -e; K=$(ls /lib/modules); mkdir -p /guest/root/bin /guest/root/lib/9p; \
