@@ -66,7 +66,8 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
             e.g. `shards run --slates-fs-handle {handle} ...` (Windows)
   vhost-user ID [--tag NAME] [--subtree DIR] [--read-only] [--dax-window SIZE] [--json] -- VMM [ARG ...]
             run VMM with slates' own virtio-fs device of the volume: {socket} in its arguments names the device's
-            socket end (/proc/self/fd/N), e.g. `crosvm run --vhost-user type=fs,socket={socket} ...` (Linux)
+            socket end (/proc/self/fd/N) and {fd} its descriptor (N), e.g. `crosvm run --vhost-user
+            type=fs,socket={socket} ...` or `qemu-system-x86_64 -chardev socket,id=fs,fd={fd} ...` (Linux)
 ";
 
 /// Format: the usage notes: the size grammar's examples, the instance's discovery, the exit codes.
@@ -565,7 +566,7 @@ pub(crate) struct ShardsRequest {
 }
 
 /// A `slates vhost-user` request (§4.6; goal G-vhost): attach a volume to slates' own virtio-fs device and run a VMM with
-/// the device's socket end, named in its arguments where `{socket}` stands.
+/// the device's socket end, named in its arguments where `{socket}` or `{fd}` stands.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct VhostUserRequest {
   /// The instance.
@@ -582,7 +583,7 @@ pub(crate) struct VhostUserRequest {
   pub dax_window: Option<u64>,
   /// Announce the attachment as JSON.
   pub json: bool,
-  /// The VMM and its arguments, `{socket}` among them.
+  /// The VMM and its arguments, `{socket}` or `{fd}` among them.
   pub command: Vec<String>,
 }
 
@@ -862,9 +863,14 @@ pub(crate) const DEFAULT_GUEST_TAG: &str = "slates";
 /// `/proc/self/fd/N`, the end's descriptor in the VMM, which crosvm takes as an inherited socket.
 pub(crate) const SOCKET_PLACEHOLDER: &str = "{socket}";
 
+/// Format: where a `vhost-user` command's arguments name the device's socket end by its number alone: each occurrence
+/// becomes `N`, the end's descriptor in the VMM. QEMU takes an inherited socket this way (`-chardev socket,id=fs,fd=N`)
+/// and cannot take `/proc/self/fd/N`, which it would connect to as a path.
+pub(crate) const FD_PLACEHOLDER: &str = "{fd}";
+
 /// Parses `vhost-user ID [--tag NAME] [--subtree DIR] [--read-only] [--dax-window SIZE] [--json] -- VMM ...`: one volume
-/// and the flags before `--`, the VMM after it, `{socket}` in at least one of its arguments (the device is reached
-/// through it alone).
+/// and the flags before `--`, the VMM after it, `{socket}` or `{fd}` in at least one of its arguments (the device is
+/// reached through it alone).
 fn parse_vhost_user(taken: &Taken, arguments: &[String]) -> Result<Command, ParseError> {
   let command = command_after(arguments)?;
   taken.only(&Spec {
@@ -879,10 +885,11 @@ fn parse_vhost_user(taken: &Taken, arguments: &[String]) -> Result<Command, Pars
   if !command
     .iter()
     .skip(1)
-    .any(|argument| argument.contains(SOCKET_PLACEHOLDER))
+    .any(|argument| argument.contains(SOCKET_PLACEHOLDER) || argument.contains(FD_PLACEHOLDER))
   {
     return Err(ParseError::Missing(
-      "{socket} in the VMM's arguments, where the device's socket end goes (e.g. --vhost-user type=fs,socket={socket})",
+      "{socket} or {fd} in the VMM's arguments, where the device's socket end goes (e.g. --vhost-user \
+       type=fs,socket={socket}, or -chardev socket,id=fs,fd={fd})",
     ));
   }
   let dax_window = taken
@@ -2656,9 +2663,9 @@ mod tests {
     }
   }
 
-  /// G-vhost. Do: parse `vhost-user` with every flag and with the fewest. Expect the instance, the volume, the tag (the
-  /// default when none is named), the subtree, the intent, the DAX window in bytes, the JSON switch and the VMM after
-  /// `--` untouched, `{socket}` still in it.
+  /// G-vhost. Do: parse `vhost-user` with every flag, with the fewest, and with QEMU's form of the end. Expect the
+  /// instance, the volume, the tag (the default when none is named), the subtree, the intent, the DAX window in bytes,
+  /// the JSON switch and the VMM after `--` untouched, `{socket}` or `{fd}` still in it.
   #[test]
   fn vhost_user_takes_one_volume_and_the_untouched_vmm_with_its_socket_placeholder() {
     let id = "0123456789abcdef0123456789abcdef";
@@ -2706,11 +2713,22 @@ mod tests {
       ),
       (DEFAULT_GUEST_TAG, None, false, None, false)
     );
+    let qemu = "qemu-system-x86_64 -chardev socket,id=fs,fd={fd} -device vhost-user-test-device-pci,chardev=fs";
+    let Command::VhostUser(by_number) = parse(&args(&format!(
+      "vhost-user {id} --dax-window 8MiB -- {qemu}"
+    )))
+    .unwrap() else {
+      panic!("vhost-user");
+    };
+    assert_eq!(
+      (by_number.dax_window, by_number.command),
+      (Some(8 << 20), args(qemu))
+    );
   }
 
   /// G-vhost. Do: parse `vhost-user` with each thing wrong in turn. Expect each refused as usage, for its own reason: no
-  /// `{socket}` among the VMM's arguments (the VMM's own name does not count); a DAX window that is no size; no volume,
-  /// or a second word; a foreign flag; no VMM.
+  /// `{socket}` or `{fd}` among the VMM's arguments (the VMM's own name does not count); a DAX window that is no size; no
+  /// volume, or a second word; a foreign flag; no VMM.
   #[test]
   fn vhost_user_refuses_a_missing_placeholder_bad_window_volume_flag_or_vmm_as_usage() {
     let id = "0123456789abcdef0123456789abcdef";
@@ -2722,6 +2740,7 @@ mod tests {
     for (line, mentions) in [
       (format!("vhost-user {id} -- crosvm run vmlinuz"), "{socket}"),
       (format!("vhost-user {id} -- {{socket}} run"), "{socket}"),
+      (format!("vhost-user {id} -- {{fd}} run"), "{fd}"),
       (
         format!("vhost-user {id} --dax-window lots -- vmm socket={{socket}}"),
         "bad --dax-window",

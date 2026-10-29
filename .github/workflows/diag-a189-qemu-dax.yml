@@ -1,0 +1,126 @@
+name: DIAG slates' own device with DAX in QEMU 11.1 (not for main)
+
+# A-189: QEMU 11.1's generic vhost-user device (vhost-user-test-device-pci) makes slates' own device's shared-memory
+# region a PCI BAR, the guest's DAX window. Green on x86_64 with KVM (the guest suite in QEMU, and the live-guest suite
+# on the image's new QEMU, since the push lane's image changes with it) and on arm64 under QEMU's own emulation
+# (GitHub's arm64 runner has no KVM). Red on trixie's own QEMU 10.0, whose generic device has no shared-memory BAR: the
+# guest's dax=always mount must be refused there.
+
+on:
+  push:
+    branches: [diag-a189-qemu-dax]
+
+jobs:
+  x86-64:
+    name: QEMU 11.1 DAX on x86_64 with KVM (green)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Open KVM to the job
+        run: |
+          if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; fi
+          ls -l /dev/kvm || echo "no /dev/kvm: the guest runs under software emulation"
+      - name: Build the guest image
+        run: docker build -t slates-guest ci/guest
+      - name: The guest suite in QEMU
+        shell: bash
+        run: |
+          set -o pipefail
+          docker run --rm --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+            --device /dev/fuse --cap-add SYS_ADMIN \
+            $( [ -e /dev/kvm ] && echo --device /dev/kvm ) \
+            -v "$PWD":/src -w /src slates-guest sh -c \
+            'set -e; host=$(rustc -vV | sed -n "s/^host: //p"); \
+             RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -p slates-guest-probe \
+               --bin slates-guest-probe --target "$host" --target-dir target/probe; \
+             SLATES_GUEST_QEMU=$(ls /usr/bin/qemu-system-x86_64 /usr/bin/qemu-system-aarch64 2>/dev/null | head -1) \
+             SLATES_GUEST_KERNEL=/guest/vmlinuz \
+             SLATES_GUEST_PROBE="/src/target/probe/$host/release/slates-guest-probe" \
+             cargo test -p slates-cli --test guest_vhost -- --nocapture --test-threads=1' 2>&1 | tee guest-vhost.log
+          if grep -q "SKIP: the guest-over-slates" guest-vhost.log; then echo "the QEMU guest was skipped"; exit 1; fi
+          grep -q "guest over slates' own device in qemu: QEMU emulator version 11" guest-vhost.log
+      - name: The live-guest suite on the image's QEMU
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -o pipefail
+          docker run --rm --security-opt seccomp=unconfined \
+            $( [ -e /dev/kvm ] && echo --device /dev/kvm ) \
+            -v "$PWD":/src -w /src slates-guest sh -c \
+            'SLATES_GUEST_QEMU=$(ls /usr/bin/qemu-system-x86_64 /usr/bin/qemu-system-aarch64 2>/dev/null | head -1) \
+             SLATES_GUEST_KERNEL=/guest/vmlinuz SLATES_GUEST_INITRD=/guest/initrd.gz \
+             cargo test -p slates-server --test virtiofs -- --nocapture' 2>&1 | tee live-guest.log
+          if grep -q "SKIP: the live guest" live-guest.log; then echo "the live guest was skipped"; exit 1; fi
+          grep -q "guest workload git: Identical" live-guest.log
+          grep -q "guest suite fsx: ok" live-guest.log
+          grep -q "guest suite fsstress: ok" live-guest.log
+          grep -q "guest suite pjdfstest: ok" live-guest.log
+
+  arm64:
+    name: QEMU 11.1 DAX on arm64 under emulation (green)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: The machine
+        run: |
+          uname -a
+          ls -l /dev/kvm || echo "no /dev/kvm: QEMU emulates the guest"
+      - name: Build the guest image
+        run: docker build -t slates-guest ci/guest
+      - name: The guest suite in QEMU
+        shell: bash
+        run: |
+          set -o pipefail
+          docker run --rm --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+            --device /dev/fuse --cap-add SYS_ADMIN \
+            $( [ -e /dev/kvm ] && echo --device /dev/kvm ) \
+            -v "$PWD":/src -w /src slates-guest sh -c \
+            'set -e; host=$(rustc -vV | sed -n "s/^host: //p"); \
+             RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -p slates-guest-probe \
+               --bin slates-guest-probe --target "$host" --target-dir target/probe; \
+             SLATES_GUEST_QEMU=$(ls /usr/bin/qemu-system-aarch64 2>/dev/null | head -1) \
+             SLATES_GUEST_KERNEL=/guest/vmlinuz \
+             SLATES_GUEST_PROBE="/src/target/probe/$host/release/slates-guest-probe" \
+             cargo test -p slates-cli --test guest_vhost -- --nocapture --test-threads=1' 2>&1 | tee guest-vhost.log
+          if grep -q "SKIP: the guest-over-slates" guest-vhost.log; then echo "the QEMU guest was skipped"; exit 1; fi
+          grep -q "guest over slates' own device in qemu: QEMU emulator version 11" guest-vhost.log
+
+  red:
+    name: QEMU 11.1 with no window offered refuses dax=always (red)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Open KVM to the job
+        run: |
+          if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; fi
+      - name: Build the guest image
+        run: docker build -t slates-guest ci/guest
+      - name: The device offered with no window
+        run: |
+          sed -i '/^      "--dax-window",$/d; /^      WINDOW,$/d' crates/cli/tests/guest_vhost.rs
+          grep -c -- '--dax-window' crates/cli/tests/guest_vhost.rs || true
+      - name: The guest suite must be refused DAX at boot
+        shell: bash
+        run: |
+          set +e
+          docker run --rm --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+            --device /dev/fuse --cap-add SYS_ADMIN \
+            $( [ -e /dev/kvm ] && echo --device /dev/kvm ) \
+            -v "$PWD":/src -w /src slates-guest sh -c \
+            'set -e; host=$(rustc -vV | sed -n "s/^host: //p"); \
+             RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -p slates-guest-probe \
+               --bin slates-guest-probe --target "$host" --target-dir target/probe; \
+             SLATES_GUEST_QEMU=$(ls /usr/bin/qemu-system-x86_64 2>/dev/null | head -1) \
+             SLATES_GUEST_KERNEL=/guest/vmlinuz \
+             SLATES_GUEST_PROBE="/src/target/probe/$host/release/slates-guest-probe" \
+             cargo test -p slates-cli --test guest_vhost -- --nocapture --test-threads=1' > guest-vhost.log 2>&1
+          code=$?
+          set -e
+          grep -v "^slates daemon:" guest-vhost.log | tail -60
+          test "$code" -ne 0
+          grep -q "guest over slates' own device in qemu: QEMU emulator version 11" guest-vhost.log
+          grep -q "mounts the tag of slates' own device with dax=always" guest-vhost.log
+          test "$(grep -c "mounts the tag of slates' own device with dax=always" guest-vhost.log)" -ge 5

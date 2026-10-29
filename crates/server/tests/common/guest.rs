@@ -149,6 +149,50 @@ impl<M: GuestMemory> Guest<M> {
       head,
       GuestRange::new(GuestAddr(reply_at), u64::from(reply_capacity)).unwrap(),
     );
+    self.publish(head)
+  }
+
+  /// Submits a request whose payload lies outside the driver's buffers, at `payload` (another region of guest memory: a
+  /// DAX window's range, say), with `reply_capacity` writable bytes; returns the head. The chain is three descriptors:
+  /// `head_bytes` from the driver's buffers (the request up to its payload, its header counting the payload), the
+  /// payload, then the reply. A guest's `O_DIRECT` write from a mapped file's pages makes such a chain.
+  pub(crate) fn submit_with_payload_at(
+    &mut self,
+    head_bytes: &[u8],
+    payload: GuestRange,
+    reply_capacity: u32,
+  ) -> u16 {
+    let size = QUEUE_SIZES[1];
+    let head = self.next_desc;
+    let middle = (head + 1) % size;
+    let tail = (head + 2) % size;
+    self.next_desc = (self.next_desc + 4) % size;
+    let request_at = self.next_buffer;
+    self.next_buffer += u64::try_from(head_bytes.len()).unwrap();
+    let reply_at = self.next_buffer;
+    self.next_buffer += u64::from(reply_capacity);
+    self.write(request_at, head_bytes);
+    let head_len = u32::try_from(head_bytes.len()).unwrap();
+    let payload_len = u32::try_from(payload.len()).unwrap();
+    self.descriptor(head, request_at, head_len, VIRTQ_DESC_F_NEXT, middle);
+    self.descriptor(
+      middle,
+      payload.start().0,
+      payload_len,
+      VIRTQ_DESC_F_NEXT,
+      tail,
+    );
+    self.descriptor(tail, reply_at, reply_capacity, VIRTQ_DESC_F_WRITE, 0);
+    self.writable.insert(
+      head,
+      GuestRange::new(GuestAddr(reply_at), u64::from(reply_capacity)).unwrap(),
+    );
+    self.publish(head)
+  }
+
+  /// Makes the chain at `head` available on the request queue: its slot in the available ring, then the index after
+  /// the driver's barrier; returns `head`.
+  fn publish(&mut self, head: u16) -> u16 {
     let layout = self.layouts[1];
     let slot = u64::from(self.avail_idx % layout.size);
     self.write(layout.available_ring.0 + 4 + slot * 2, &head.to_le_bytes());

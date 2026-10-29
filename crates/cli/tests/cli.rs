@@ -1940,12 +1940,14 @@ fn slates_shards_hands_a_program_a_working_stream_end_and_the_attachment_ends_wi
 const SOCKET_END_TAG: &str = "socket-end: ";
 
 /// G-vhost, step 2: "`slates vhost-user` substitutes the device's socket end for `{socket}` and execs the VMM with the end
-/// inherited". Do: make a volume; run `slates vhost-user ID -- /bin/sh -c SCRIPT sh socket={socket}`, the script checking
-/// that the path it was given is a socket in its own process and printing it; then a program that cannot run, a volume
-/// that does not exist, and a VMM with no `{socket}`. Expect: the script's exit 0, the path `/proc/self/fd/N` with N at
-/// least 3 and a socket in the program; the attachment it announced gone once the program exits; the program that
-/// cannot run a failure (exit 4) whose attachment ends; the missing volume refused (exit 1); no `{socket}` usage (exit
-/// 2); no attachment left by any of them. Linux only, where vhost-user is built; gated like the other process flows.
+/// inherited". Do: make a volume; run `slates vhost-user ID -- /bin/sh -c SCRIPT sh socket={socket} fd={fd}`, the script
+/// checking that the path it was given is a socket in its own process, that the number names the same descriptor (the
+/// form QEMU takes, `-chardev socket,id=fs,fd={fd}`), and printing the path; then a program that cannot run, a volume
+/// that does not exist, and a VMM with no `{socket}` or `{fd}`. Expect: the script's exit 0, the path `/proc/self/fd/N`
+/// with N at least 3 and a socket in the program; the attachment it announced gone once the program exits; the program
+/// that cannot run a failure (exit 4) whose attachment ends; the missing volume refused (exit 1); no placeholder usage
+/// (exit 2); no attachment left by any of them. Linux only, where vhost-user is built; gated like the other process
+/// flows.
 #[cfg(target_os = "linux")]
 #[test]
 fn slates_vhost_user_names_the_devices_socket_end_in_the_vmms_arguments_and_ends_with_it() {
@@ -1964,7 +1966,9 @@ fn slates_vhost_user_names_the_devices_socket_end_in_the_vmms_arguments_and_ends
   assert_eq!(code, 0, "{err}");
   let id = value_of(&out, "id");
   let before = attachments_of(&instance, &id);
-  let script = format!(r#"p="${{1#socket=}}"; test -S "$p" && echo "{SOCKET_END_TAG}$p""#);
+  let script = format!(
+    r#"p="${{1#socket=}}"; n="${{2#fd=}}"; test -S "$p" && test "$p" = "/proc/self/fd/$n" && echo "{SOCKET_END_TAG}$p""#
+  );
   let ran = slates()
     .args([
       "--instance",
@@ -1977,6 +1981,7 @@ fn slates_vhost_user_names_the_devices_socket_end_in_the_vmms_arguments_and_ends
       &script,
       "sh",
       "socket={socket}",
+      "fd={fd}",
     ])
     .output()
     .unwrap();
@@ -2020,7 +2025,10 @@ fn slates_vhost_user_names_the_devices_socket_end_in_the_vmms_arguments_and_ends
   );
   assert_eq!(code, 1, "a volume that does not exist is refused: {err}");
   let (code, _, err) = run(&instance, &["vhost-user", &id, "--", "/bin/true"]);
-  assert_eq!(code, 2, "a VMM with no {{socket}} is usage: {err}");
+  assert_eq!(
+    code, 2,
+    "a VMM with no {{socket}} or {{fd}} is usage: {err}"
+  );
   assert_eq!(attachments_of(&instance, &id), before);
 }
 

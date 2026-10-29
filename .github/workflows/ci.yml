@@ -130,6 +130,35 @@ jobs:
       - name: Landing over the disk, with kill -9 (Linux)
         if: runner.os == 'Linux'
         run: cargo test -p slates-land --release --test os -- --nocapture
+      # Clients in namespaces of their own (A-187): one in a network namespace maps a file through the rendezvous's
+      # socket file (`crates/client/tests/netns.rs`), and one in a pid namespace the daemon cannot see into is served
+      # (`crates/ipc/tests/rendezvous.rs`). Each makes an unprivileged user namespace, which the runner's AppArmor
+      # refuses (Ubuntu 24.04's `kernel.apparmor_restrict_unprivileged_userns=1`), so both skipped in the workspace
+      # run. The job lifts the restriction on its own runner, as a host without it is, and a skip fails.
+      - name: Clients in namespaces of their own (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          cargo test -p slates-client --test netns -- --nocapture 2>&1 | tee namespaces.log
+          cargo test -p slates-ipc --test rendezvous -- --nocapture --exact \
+            a_client_whose_process_the_daemon_cannot_see_is_served 2>&1 | tee -a namespaces.log
+          if grep -q "SKIP" namespaces.log; then echo "a namespace test skipped"; exit 1; fi
+      # A listener of another user is refused by the client (A-187). Only root can start a process of another user and
+      # the runner is not root, so the test binary runs as root in a container of the runner's own Ubuntu (whose
+      # util-linux carries `setpriv`), bound in at its own path; a skip fails.
+      - name: A listener of another user refused by the client (Linux, as root in a container)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          binary=$(CARGO_TERM_COLOR=never cargo test -p slates-ipc --test rendezvous --no-run 2>&1 \
+            | sed -n 's/.*Executable tests\/rendezvous.rs (\(.*\))/\1/p' | tail -1)
+          docker run --rm -v "$PWD":"$PWD" -w "$PWD" ubuntu:24.04 "$binary" --nocapture --exact \
+            a_listener_of_another_user_is_refused_by_the_client 2>&1 | tee impostor.log
+          if grep -q "SKIP" impostor.log; then echo "the impostor test skipped"; exit 1; fi
+          grep -q "test result: ok. 1 passed" impostor.log
       # The end-to-end CLI flow spawns a real anchor and daemon; it needs the machine to
       # itself (a busy parallel suite starves the daemon), so it is its own step.
       # The Linux container profile binds a FUSE mount shared with the runtime's processes (`slates mount
@@ -241,6 +270,27 @@ jobs:
           grep -q "guest suite fsx: ok" live-guest.log
           grep -q "guest suite fsstress: ok" live-guest.log
           grep -q "guest suite pjdfstest: ok" live-guest.log
+      # The socket route's DAX in QEMU (A-189): `slates vhost-user` hands QEMU 11.1's generic vhost-user device the
+      # end of slates' own device, whose shared-memory region is the guest's DAX window; the guest is the static
+      # probe, and every test of tests/guest_vhost.rs runs. The rig's `slates mount`s need FUSE in the container.
+      - name: slates' own device with DAX in QEMU
+        shell: bash
+        run: |
+          set -o pipefail
+          docker run --rm --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+            --device /dev/fuse --cap-add SYS_ADMIN \
+            $( [ -e /dev/kvm ] && echo --device /dev/kvm ) \
+            -v "$PWD":/src -w /src slates-guest sh -c \
+            'set -e; host=$(rustc -vV | sed -n "s/^host: //p"); \
+             RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -p slates-guest-probe \
+               --bin slates-guest-probe --target "$host" --target-dir target/probe; \
+             SLATES_GUEST_QEMU=$(ls /usr/bin/qemu-system-x86_64 /usr/bin/qemu-system-aarch64 2>/dev/null | head -1) \
+             SLATES_GUEST_KERNEL=/guest/vmlinuz \
+             SLATES_GUEST_PROBE="/src/target/probe/$host/release/slates-guest-probe" \
+             cargo test -p slates-cli --test guest_vhost -- --nocapture --test-threads=1' 2>&1 | tee guest-vhost.log
+          # The image provides the whole environment, so a skip is a vacuous pass and fails.
+          if grep -q "SKIP: the guest-over-slates" guest-vhost.log; then echo "the QEMU guest was skipped"; exit 1; fi
+          grep -q "guest over slates' own device in qemu: QEMU emulator version 11" guest-vhost.log
 
   # The two SDKs as a user installs them (§2.4; docs/publish.md), by use on Linux and macOS. The
   # cp39-abi3 wheel maturin builds is installed into a fresh venv after twine checks its metadata
@@ -785,10 +835,28 @@ jobs:
       # A client killed holding a direct map: its copy reaped, and a writable map's stores written back first (A-186).
       - name: The direct map's killed clients on arm64
         run: cargo test -p slates-client --test reap_map -- --test-threads=1 --nocapture
-      # A client in a network namespace of its own maps a file through the rendezvous's socket file (A-187). It skips
-      # loudly where the runner refuses an unprivileged user namespace; the bridge-network container below does not.
-      - name: A client in a network namespace of its own on arm64
-        run: cargo test -p slates-client --test netns -- --nocapture
+      # Clients in namespaces of their own, and a listener of another user, on arm64 (A-187): as the gates job's Linux
+      # steps run them, the restriction on unprivileged user namespaces lifted for this runner and the impostor test as
+      # root in a container; a skip fails.
+      - name: Clients in namespaces of their own on arm64
+        shell: bash
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          cargo test -p slates-client --test netns -- --nocapture 2>&1 | tee namespaces.log
+          cargo test -p slates-ipc --test rendezvous -- --nocapture --exact \
+            a_client_whose_process_the_daemon_cannot_see_is_served 2>&1 | tee -a namespaces.log
+          if grep -q "SKIP" namespaces.log; then echo "a namespace test skipped"; exit 1; fi
+      - name: A listener of another user refused by the client on arm64 (as root in a container)
+        shell: bash
+        run: |
+          binary=$(CARGO_TERM_COLOR=never cargo test -p slates-ipc --test rendezvous --no-run 2>&1 \
+            | sed -n 's/.*Executable tests\/rendezvous.rs (\(.*\))/\1/p' | tail -1)
+          docker run --rm -v "$PWD":"$PWD" -w "$PWD" ubuntu:24.04 "$binary" --nocapture --exact \
+            a_listener_of_another_user_is_refused_by_the_client 2>&1 | tee impostor.log
+          if grep -q "SKIP" impostor.log; then echo "the impostor test skipped"; exit 1; fi
+          grep -q "test result: ok. 1 passed" impostor.log
       - name: The FUSE mount's maps and the containers on arm64 (the CLI flow's map tests)
         env:
           SLATES_TEST_CLI: "1"
