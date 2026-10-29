@@ -1,0 +1,32 @@
+name: DIAG the KIND direct leg on arm64, steps 6 and 7 (not for main)
+
+# A-187's pods of their own on arm64 after A-188: the direct leg's step 6 (a pod of its own mounting the rendezvous
+# directory by hostPath) and step 7 (a namespace enforcing the restricted Pod Security profile, which must refuse a
+# hostPath pod, and whose pods mount the directory through a claim on a local PersistentVolume). CI's push lane runs
+# KIND on x86_64 only. The socket file's red-check on arm64 is diagnostics run 40847130881.
+
+on:
+  push:
+    branches: [diag-a188-arm64-kind]
+
+jobs:
+  arm64-kind:
+    name: KIND direct leg on ubuntu-24.04-arm (green)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.3.0
+      - uses: helm/kind-action@v1
+        with:
+          version: v0.33.0
+          install_only: true
+      - name: The machine
+        run: uname -a && docker version --format '{{.Server.Version}} {{.Server.Os}}/{{.Server.Arch}}' && kind version
+      - name: The direct leg (steps 1 to 7)
+        run: cargo xtask kind direct
