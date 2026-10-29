@@ -1,0 +1,48 @@
+name: DIAG clients in namespaces and a listener of another user on CI (not for main)
+
+# A-187's three tests that skipped on CI's runners: a client in a network namespace of its own, a client in a pid
+# namespace the daemon cannot see into, and a listener of another user. The first two need an unprivileged user
+# namespace, which the runners' AppArmor refuses until the job lifts it; the third needs root, which a container gives.
+
+on:
+  push:
+    branches: [diag-a187-namespaces]
+
+jobs:
+  namespaces:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    name: namespaces and the impostor on ${{ matrix.runner }} (green)
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: The runner's restriction, before
+        run: |
+          uname -a
+          cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns || echo "no restriction sysctl"
+      - name: Clients in namespaces of their own
+        shell: bash
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          cargo test -p slates-client --test netns -- --nocapture 2>&1 | tee namespaces.log
+          cargo test -p slates-ipc --test rendezvous -- --nocapture --exact \
+            a_client_whose_process_the_daemon_cannot_see_is_served 2>&1 | tee -a namespaces.log
+          if grep -q "SKIP" namespaces.log; then echo "a namespace test skipped"; exit 1; fi
+      - name: A listener of another user refused by the client (as root in a container)
+        shell: bash
+        run: |
+          binary=$(CARGO_TERM_COLOR=never cargo test -p slates-ipc --test rendezvous --no-run 2>&1 \
+            | sed -n 's/.*Executable tests\/rendezvous.rs (\(.*\))/\1/p' | tail -1)
+          echo "binary: $binary"
+          docker run --rm -v "$PWD":"$PWD" -w "$PWD" ubuntu:24.04 "$binary" --nocapture --exact \
+            a_listener_of_another_user_is_refused_by_the_client 2>&1 | tee impostor.log
+          if grep -q "SKIP" impostor.log; then echo "the impostor test skipped"; exit 1; fi
+          grep -q "test result: ok. 1 passed" impostor.log
