@@ -3115,9 +3115,13 @@ daemon through the rendezvous's socket file (A-187).
 >   three on Windows). Nineteen cells. **Corrected 2026-10-25:** the direct map had been listed
 >   here as proven before A-171, when its test reported which path ran without asserting it and every read was a copy.
 > - **Proven since (A-189, 2026-10-29):** QEMU 11.1 over slates' own device, on Linux x86_64 with KVM and on Linux arm64
->   under QEMU's own emulation (diagnostics run 40876474403, red-checked with no window offered).
-> - **Ruled out by the platforms:** QEMU's vhost-user-fs device and virtiofsd have no window, so QEMU has no mount route,
->   and Kata, which drives that device, has neither; Cloud Hypervisor has none; crosvm's own fs device is x86_64-only;
+>   under QEMU's own emulation (diagnostics run 40876474403, red-checked with no window offered); and QEMU's mount route
+>   by the image form, virtio-pmem over the image file through a slates mount, on Linux x86_64 (diagnostics run
+>   40883925064, red-checked with `dax=never`). QEMU builds virtio-pmem for x86 machines only, so arm64 has no such
+>   route.
+> - **Ruled out by the platforms:** QEMU's vhost-user-fs device and virtiofsd have no window, so QEMU shares no file tree
+>   with DAX by its own device, its mount route is the image form, x86_64 only (it builds virtio-pmem for x86 machines
+>   alone), and Kata, which drives that device, has neither route; Cloud Hypervisor has none; crosvm's own fs device is x86_64-only;
 >   Apple's Virtualization framework's virtio-fs device and WSL2's 9P have none (both measured 2026-10-27).
 >   **Corrected 2026-10-29 (A-189):** this line ruled QEMU out on both routes and crosvm on arm64 on both. QEMU 11.1's
 >   generic vhost-user device maps slates' own device's window, and crosvm's vhost-user front end has no architecture
@@ -12517,9 +12521,14 @@ trixie-backports, fuse3), `.github/workflows/ci.yml` (the live-guest lane's QEMU
   (`VHOST_MEMORY_BASELINE_NREGIONS`). Past them its own commit fails and the back end keeps the table it has, so the
   guest's maps work and a request buffer in a range past the eighth region is refused. The incremental form
   (`ADD_MEM_REG`, `REM_MEM_REG`, up to QEMU's 512 slots) is owed (GAPS).
-- **What stays out.** The mount route: QEMU has no virtio-fs device of its own, its vhost-user-fs-pci has no window, and
-  virtiofsd, the back end that would serve a host mount through one, has no DAX in any release (its "feat: add DAX
-  support", merge request !318, open since 2026-06-03, unmerged on 2026-10-29). Kata: its QEMU driver asks
+- **QEMU's mount route is the image form.** QEMU has no virtio-fs device of its own: its vhost-user-fs-pci has no
+  window, and virtiofsd, the back end that would serve a host mount through one, has no DAX in any release (its "feat:
+  add DAX support", merge request !318, open since 2026-06-03, unmerged on 2026-10-29). Its virtio-pmem serves A-165's
+  image form as Firecracker's does: QEMU maps the image file, through a slates mount, shared as the device's memory
+  (`memory-backend-file,share=on`), and a guest's flush is QEMU's `fsync` of the file (`hw/virtio/virtio-pmem.c`). QEMU
+  builds virtio-pmem for x86 machines only (`hw/i386/Kconfig` selects `VIRTIO_PMEM_SUPPORTED`, `hw/arm/Kconfig` does
+  not), and the arm `virt` machine's NVDIMM needs a firmware boot with ACPI and passes no guest flush to its file, so an
+  arm64 QEMU guest, Apple silicon's included, has no mount route. Kata: its QEMU driver asks
   vhost-user-fs-pci for a `cache-size` (govmm `qemu.go`), a property upstream's device has never had, so neither route
   reaches a Kata guest. Windows: QEMU builds no vhost-user there (`meson.build`: "vhost-user is not available on
   Windows"). macOS: QEMU builds vhost-user only when asked (`--enable-vhost-user`), which Homebrew's 11.1.3 does not
@@ -12538,7 +12547,11 @@ trixie-backports, fuse3), `.github/workflows/ci.yml` (the live-guest lane's QEMU
   one). Red-checked in the same run with the device offered no window: all 5 refused at the guest's mount
   (job 123456467863). The device's own test of QEMU's tables (`crates/server/tests/virtiofs.rs`
   `a_front_end_that_puts_each_placed_map_in_its_memory_table_keeps_its_device`) failed before the change on adacachy and
-  passes after, with the virtio-fs suite 23 of 23, bridge-virtiofs's suites and the five crosvm tests unchanged.
+  passes after, with the virtio-fs suite 23 of 23, bridge-virtiofs's suites and the five crosvm tests unchanged. The
+  image form in QEMU 11.1.2 with KVM: `crates/cli/tests/guest_image.rs` 4 of 4 in 11.67 s (diagnostics run 40883925064,
+  job 123482449569), red-checked with the guest mounting `dax=never`, the three pmem tests failing at their DAX check
+  (job 123482450208); on arm64 the same QEMU has no `virtio-pmem-pci` (job 123482450147), and the drive form passed
+  there. The Firecracker leg of the same test, after its refactor into one leg per VMM, 4 of 4 on adacachy.
 
 ### A-188 — A client of any shard is handed a direct map: the copy held on its volume's shard, the hand-off through the client's own (accepted and built 2026-10-29)
 Applied in the same change to: §4.6 (the same-kernel direct map paragraph), A-186 (its owed item), GAPS,
@@ -13542,9 +13555,11 @@ from its sources) and 01a171494952772991b9bc668b5d89f0 (the 10 the matrix rests 
     when what crosses them is encrypted end to end and at rest). With no VM, a same-kernel process maps slates' own
     memory with no copy (A-135).
 - **Ruled out by the platforms**, each on the platform's own source:
-  - upstream QEMU's vhost-user-fs device has no DAX window property, and virtiofsd has no DAX, so a QEMU guest has no
-    mount route, and Kata, which drives that device, has neither. **Corrected 2026-10-29 (A-189):** this line ruled
-    out slates' own device too; QEMU 11.1's generic vhost-user device offers its window, proven on x86_64 and arm64;
+  - upstream QEMU's vhost-user-fs device has no DAX window property, and virtiofsd has no DAX, so a QEMU guest gets no
+    file tree with DAX from QEMU's own device, and Kata, which drives that device, has neither route. **Corrected
+    2026-10-29 (A-189):** this line ruled QEMU out on both routes. QEMU 11.1's generic vhost-user device offers slates'
+    own device its window (proven on x86_64 and arm64), and QEMU's virtio-pmem serves the image form on x86_64
+    (proven; QEMU builds it for x86 machines only);
   - Cloud Hypervisor states that virtio-fs DAX is not available;
   - crosvm's own fs device offers DAX on x86_64 only (its vhost-user front end has no such gate: A-189);
   - Apple's Virtualization framework documents no DAX window for its virtio-fs device, so Docker Desktop's containers on

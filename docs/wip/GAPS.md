@@ -11340,6 +11340,12 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     crosvm tests 5 of 5; clippy of bridge-virtiofs, server and cli.
   - **Red-checked:** the same QEMU with the device offered no window, all 5 refused at the guest's `dax=always` mount
     (job 123456467863).
+  - **QEMU's mount route by the image form, proven on x86_64** (diagnostics run 40883925064): `guest_image.rs` 4 of 4
+    in QEMU 11.1.2 with KVM (job 123482449569, 11.67 s), virtio-pmem over the image file through a slates mount;
+    red-checked with `dax=never` (job 123482450208). **Not on arm64:** QEMU builds virtio-pmem for x86 machines only
+    (`hw/i386/Kconfig`), and Debian's arm64 QEMU answers "'virtio-pmem-pci' is not a valid device model name" (job
+    123482450147); the test skips QEMU's pmem tests loudly there. The live-guest lane runs the image tests in QEMU on
+    every push since.
   - **Owed:**
     - `VHOST_USER_PROTOCOL_F_CONFIGURE_MEM_SLOTS`: without it QEMU sends at most 8 regions, and past them its own commit
       fails and the back end keeps the table it has. The guest's maps still work, and a request buffer in a range past
@@ -11350,12 +11356,16 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       crosvm;
     - QEMU on macOS: QEMU builds vhost-user there only with `--enable-vhost-user`, which Homebrew's 11.1.3 does not
       ask, and slates' vhost-user back end is Linux's;
-    - crosvm on arm64 by the socket route: its vhost-user front end maps a back end's region with no architecture gate
-      (the matrix's "impossible" there was wrong; the x86_64 gate is in crosvm's own fs device). It needs crosvm built
-      for arm64 on an arm64 host with KVM: the nested virtualization VM on this Mac, not CI.
-  - **Stays out, each on its source:** QEMU's mount route (vhost-user-fs-pci has no window, and virtiofsd no DAX in any
-    release: its merge request !318 is open since 2026-06-03); Kata on QEMU (it asks vhost-user-fs-pci for a
-    `cache-size` upstream never had); QEMU on Windows (no vhost-user there).
+    - crosvm on arm64 by both routes: its vhost-user front end maps a back end's region with no architecture gate (the
+      matrix's "impossible" there was wrong; the x86_64 gate is in crosvm's own fs device), and its `--pmem` serves the
+      image form with no gate either. It needs crosvm built for arm64 on an arm64 host with KVM: the nested
+      virtualization VM on this Mac, whose initramfs is built with Docker (`vz-l1`), off since Ada quit it;
+    - Cloud Hypervisor by the image form: its virtio-pmem is always built in (`docs/device_model.md`); it needs the
+      Cloud Hypervisor binary, new tooling in CI or on the box.
+  - **Stays out, each on its source:** a file tree in QEMU by its own device (vhost-user-fs-pci has no window, and
+    virtiofsd no DAX in any release: its merge request !318 is open since 2026-06-03), so QEMU's mount route is the
+    image form; QEMU's mount route on arm64, Apple silicon's included (no virtio-pmem); Kata on QEMU (it asks
+    vhost-user-fs-pci for a `cache-size` upstream never had); QEMU on Windows (no vhost-user there).
 - **A workload in a network namespace of its own reaches the daemon (A-187, 2026-10-29): built, and proven in a
   container on a bridge network and in a KIND pod of its own, on x86_64 and arm64.**
   - **What:** Linux's rendezvous was an abstract socket, which the kernel scopes to a network namespace, so a pod of
@@ -11837,9 +11847,11 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       "Services and Redirected Drives"); a drive every session sees needs the file system run as LocalSystem, which
       slates' daemon never is (R10); and past that, the bind filter refuses a custom file system's volume
       (microsoft/Windows-Containers#335, closed by design);
-    - QEMU's mount route: its vhost-user-fs device has no window and virtiofsd has no DAX; Kata on QEMU by either route,
-      since Kata drives that device. **Corrected 2026-10-29 (A-189):** this line ruled out QEMU's socket route too, which
-      QEMU 11.1's generic vhost-user device serves (proven on x86_64 and arm64, the A-189 entry);
+    - a file tree in QEMU by its own device: its vhost-user-fs device has no window and virtiofsd has no DAX; QEMU's
+      mount route on arm64 (QEMU builds virtio-pmem for x86 machines only); Kata on QEMU by either route, since Kata
+      drives that device. **Corrected 2026-10-29 (A-189):** this line ruled out QEMU on both routes. QEMU 11.1's
+      generic vhost-user device serves slates' own device (proven on x86_64 and arm64), and QEMU's virtio-pmem serves
+      the image form on x86_64 (proven), the A-189 entry;
     - Cloud Hypervisor: "it is not available";
     - crosvm on arm64 by the mount route: its own fs device's DAX is x86_64-only. **Corrected 2026-10-29 (A-189):** the
       socket route there is owed, not ruled out (its vhost-user front end has no such gate);

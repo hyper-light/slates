@@ -12,7 +12,13 @@
 //! syncs, a write through the slates mount shows in the guest's map, and a guest's flush is Firecracker's `msync` of
 //! the file, which writes its pages back into the volume.
 //!
-//! Gated. It needs Linux with KVM and three files named in the environment; without them it skips loudly:
+//! **QEMU (A-189).** The same tests run in QEMU when the environment names it: QEMU maps the image file shared as a
+//! virtio-pmem device's memory (`-object memory-backend-file,share=on` with `-device virtio-pmem-pci`), or attaches it
+//! as a virtio-blk drive, and with `-no-reboot` takes the guest's restart as its clean exit. QEMU's own virtio-fs device
+//! has no window and virtiofsd has no DAX, so this is QEMU's mount route, as it is Firecracker's.
+//! QEMU builds virtio-pmem for x86 machines only, so on arm64 its pmem tests skip loudly and its drive test runs.
+//!
+//! Gated. It needs Linux and three files named in the environment for each VMM it runs; without them it skips loudly:
 //! - `SLATES_GUEST_FIRECRACKER`: a Firecracker binary, v1.17.0 or later (the release binary, its checksum verified
 //!   against the release's `SHA256SUMS`). It runs with `--no-api`, so it opens no socket, and with `--enable-pci`, so
 //!   the guest finds its disk on PCI.
@@ -20,6 +26,9 @@
 //!   on aarch64) with virtio-pci built in, and virtio-blk and ext2 (or `CONFIG_EXT4_USE_FOR_EXT2`) built in or carried
 //!   as modules (below). A distribution's kernel serves: unpacked from its bzImage by the kernel tree's
 //!   `scripts/extract-vmlinux` on x86_64, and Debian's arm64 `vmlinuz` is the `Image` already.
+//! - `SLATES_GUEST_QEMU` and `SLATES_GUEST_KERNEL`, in place of or beside the two above: a QEMU binary and the kernel
+//!   its `-kernel` boots (a distribution's `vmlinuz` serves). It runs with KVM where the host has it and with its own
+//!   emulation where not.
 //! - `SLATES_GUEST_PROBE`: the guest's `/init`, static (`tests/guest_dax.rs` says how to build it).
 //!
 //! The pmem test also needs `SLATES_GUEST_MODULES`, the guest kernel's module directory (`/lib/modules/<release>` of the
@@ -65,6 +74,11 @@ const VCPU_SHUT_DOWN: &str = "Unexpected exit reason on vcpu run: Shutdown";
 const GUEST_MEMORY_MIB: u32 = 256;
 /// See [`GUEST_MEMORY_MIB`].
 const GUEST_CPUS: u32 = 1;
+/// Format: a mebibyte, in bytes.
+const MIB: u64 = 1 << 20;
+/// Shape: the granule QEMU's memory-device room above the guest's RAM (`maxmem`) is rounded up to, MiB: a gibibyte,
+/// so the room for the pmem device's memory is whole on every machine type.
+const MEMORY_DEVICE_ROOM_MIB: u64 = 1 << 10;
 /// Shape: the most bytes a reply's run may carry; the listing's replies carry none.
 const MOST_BYTES: usize = 1 << 20;
 /// Shape: the bytes the large file runs past its third chunk, so its last chunk is partial.
@@ -92,35 +106,72 @@ const FSCK_KILL_AFTER_SECONDS: &str = "10";
 /// Format: e2fsck's exit codes for a file system left clean: nothing wrong, or errors corrected (`e2fsck(8)`).
 const FSCK_CLEAN: [i32; 2] = [0, 1];
 
-/// The paths the test needs from the environment, or `None` after saying loudly which are missing.
+/// A VMM the tests boot their guests in. Every test runs once in each VMM the environment names.
+enum Vmm {
+  /// Firecracker (`SLATES_GUEST_FIRECRACKER`, booting the uncompressed kernel `SLATES_GUEST_VMLINUX`): it attaches the
+  /// image as its configuration file says, and ends the VM at the guest's restart with an error code (`reboot=k`).
+  Firecracker { binary: String, vmlinux: String },
+  /// QEMU (`SLATES_GUEST_QEMU`, booting `SLATES_GUEST_KERNEL`): it attaches the image as its command line says, and
+  /// with `-no-reboot` ends the VM cleanly at the guest's restart.
+  Qemu { binary: String, kernel: String },
+}
+
+impl Vmm {
+  /// Its name, in the rig's instance name and the run's record.
+  fn name(&self) -> &'static str {
+    match self {
+      Vmm::Firecracker { .. } => "firecracker",
+      Vmm::Qemu { .. } => "qemu",
+    }
+  }
+
+  /// The tag its own lines, its standard error, carry in a transcript.
+  fn tag(&self) -> &'static str {
+    match self {
+      Vmm::Firecracker { .. } => "firecracker: ",
+      Vmm::Qemu { .. } => "qemu: ",
+    }
+  }
+}
+
+/// The paths one run needs from the environment: its VMM, the probe, and the guest kernel's module directory.
 struct Gate {
-  firecracker: String,
-  vmlinux: String,
+  vmm: Vmm,
   probe: String,
   /// The guest kernel's module directory, for the pmem test.
   modules: Option<String>,
 }
 
 impl Gate {
-  fn from_env() -> Option<Gate> {
+  /// A gate for each VMM the environment names, or none after saying loudly what is missing.
+  fn each_from_env() -> Vec<Gate> {
     let named = |key: &str| std::env::var(key).ok().filter(|value| !value.is_empty());
-    match (
-      named("SLATES_GUEST_FIRECRACKER"),
-      named("SLATES_GUEST_VMLINUX"),
-      named("SLATES_GUEST_PROBE"),
-    ) {
-      (Some(firecracker), Some(vmlinux), Some(probe)) => Some(Gate {
-        firecracker,
-        vmlinux,
-        probe,
-        modules: named("SLATES_GUEST_MODULES"),
-      }),
+    let vmms: Vec<Vmm> = [
+      named("SLATES_GUEST_FIRECRACKER")
+        .zip(named("SLATES_GUEST_VMLINUX"))
+        .map(|(binary, vmlinux)| Vmm::Firecracker { binary, vmlinux }),
+      named("SLATES_GUEST_QEMU")
+        .zip(named("SLATES_GUEST_KERNEL"))
+        .map(|(binary, kernel)| Vmm::Qemu { binary, kernel }),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    match named("SLATES_GUEST_PROBE") {
+      Some(probe) if !vmms.is_empty() => vmms
+        .into_iter()
+        .map(|vmm| Gate {
+          vmm,
+          probe: probe.clone(),
+          modules: named("SLATES_GUEST_MODULES"),
+        })
+        .collect(),
       _ => {
         eprintln!(
-          "SKIP: the Firecracker image test needs SLATES_GUEST_FIRECRACKER, SLATES_GUEST_VMLINUX and \
-           SLATES_GUEST_PROBE (tests/guest_image.rs says what each is)"
+          "SKIP: the image test needs SLATES_GUEST_FIRECRACKER and SLATES_GUEST_VMLINUX, or SLATES_GUEST_QEMU and \
+           SLATES_GUEST_KERNEL, and SLATES_GUEST_PROBE (tests/guest_image.rs says what each is)"
         );
-        None
+        Vec::new()
       }
     }
   }
@@ -300,7 +351,7 @@ fn the_other_changes(guest: &mut Guest) {
   guest.done(&Ask::Flush);
 }
 
-/// How Firecracker presents the image to its guest.
+/// How the VMM presents the image to its guest.
 enum Disk {
   /// A writable virtio-blk drive, its flushes written through to the file (`cache_type: Writeback`, so a guest's sync
   /// reaches the volume), mounted as ext2 (A-160) once the guest has loaded `modules`, in their order.
@@ -340,6 +391,25 @@ impl Disk {
     }
   }
 
+  /// QEMU's arguments for the image at `image`, `len` bytes: a drive QEMU writes through its own cache, its flushes
+  /// reaching the file; or the file mapped shared as a virtio-pmem device's memory, its flushes an `msync`.
+  fn qemu_device(&self, image: &str, len: u64) -> Vec<String> {
+    match self {
+      Disk::Drive { .. } => vec![
+        "-drive".to_owned(),
+        format!("file={image},if=none,id=image,format=raw,cache=writeback"),
+        "-device".to_owned(),
+        "virtio-blk-pci,drive=image".to_owned(),
+      ],
+      Disk::Pmem { .. } => vec![
+        "-object".to_owned(),
+        format!("memory-backend-file,id=image,mem-path={image},size={len},share=on"),
+        "-device".to_owned(),
+        "virtio-pmem-pci,memdev=image,id=pmem".to_owned(),
+      ],
+    }
+  }
+
   /// What the guest's command line tells its probe to load and mount.
   fn guest_options(&self) -> String {
     match self {
@@ -368,7 +438,7 @@ fn names(modules: &[Module]) -> String {
 
 /// Firecracker's configuration: the kernel, the initramfs, the image as `disk` presents it, and a small machine. The
 /// guest ends the VM by rebooting, which Firecracker takes as its exit (`reboot=k`).
-fn firecracker_config(gate: &Gate, initrd: &str, image: &str, disk: &Disk) -> String {
+fn firecracker_config(vmlinux: &str, initrd: &str, image: &str, disk: &Disk) -> String {
   format!(
     r#"{{
   "boot-source": {{
@@ -383,10 +453,59 @@ fn firecracker_config(gate: &Gate, initrd: &str, image: &str, disk: &Disk) -> St
   }}
 }}
 "#,
-    kernel = gate.vmlinux,
+    kernel = vmlinux,
     options = disk.guest_options(),
     device = disk.device(image),
   )
+}
+
+/// QEMU's command line: the kernel, the initramfs, the image as `disk` presents it (`len` bytes), and a small machine
+/// with room above its RAM for the pmem device's memory. The guest's restart ends QEMU cleanly (`-no-reboot`).
+fn qemu_arguments(
+  kernel: &str,
+  initrd: &str,
+  (image, len): (&str, u64),
+  disk: &Disk,
+) -> Vec<String> {
+  let (machine, console) = if cfg!(target_arch = "aarch64") {
+    ("virt,gic-version=max", "ttyAMA0")
+  } else {
+    ("q35", "ttyS0")
+  };
+  let room = u64::from(GUEST_MEMORY_MIB)
+    .saturating_add(len.div_ceil(MIB))
+    .next_multiple_of(MEMORY_DEVICE_ROOM_MIB);
+  let mut arguments = vec![
+    "-accel".to_owned(),
+    "kvm".to_owned(),
+    "-accel".to_owned(),
+    "tcg".to_owned(),
+    "-machine".to_owned(),
+    machine.to_owned(),
+    "-cpu".to_owned(),
+    "max".to_owned(),
+    "-m".to_owned(),
+    format!("{GUEST_MEMORY_MIB}M,slots=1,maxmem={room}M"),
+    "-smp".to_owned(),
+    GUEST_CPUS.to_string(),
+    "-kernel".to_owned(),
+    kernel.to_owned(),
+    "-initrd".to_owned(),
+    initrd.to_owned(),
+    "-append".to_owned(),
+    format!(
+      "console={console} reboot=k panic=1 rdinit=/init quiet {} slates.end=reboot",
+      disk.guest_options()
+    ),
+    "-nodefaults".to_owned(),
+    "-display".to_owned(),
+    "none".to_owned(),
+    "-serial".to_owned(),
+    "stdio".to_owned(),
+    "-no-reboot".to_owned(),
+  ];
+  arguments.extend(disk.qemu_device(image, len));
+  arguments
 }
 
 /// A module's name from its file's path in a module directory: the file name up to its first dot, dashes read as
@@ -539,10 +658,10 @@ fn the_guest_ends_the_vm_by_its_restart(guest: &mut Guest) {
       && guest.said(VCPU_SHUT_DOWN));
   assert!(
     restarted,
-    "Firecracker exited {status}, not by the guest's restart\n{}",
+    "the VMM exited {status}, not by the guest's restart\n{}",
     guest.transcript()
   );
-  eprintln!("Firecracker ended by the guest's restart: {status}");
+  eprintln!("the VMM ended by the guest's restart: {status}");
 }
 
 /// Every node of the volume mounted at `mount`, as a guest would list it. A directory the test's user may not read is
@@ -746,26 +865,42 @@ impl Rig {
     held
   }
 
-  /// Boots Firecracker from an initramfs and a configuration held in the boot volume, the image presented as `disk`
-  /// says, and waits until the guest is ready.
+  /// Boots the gate's VMM from an initramfs held in the boot volume (Firecracker from a configuration held there too),
+  /// the image presented as `disk` says, and waits until the guest is ready.
   fn boot(&self, gate: &Gate, disk: &Disk) -> Guest {
     #[allow(clippy::disallowed_methods)] // reads the probe binary the environment names
     let probe = std::fs::read(&gate.probe).unwrap();
     let initrd = self.boot_mount.file("initramfs.cpio");
     write_whole(&initrd, &initramfs(&probe, disk.modules()));
-    let config = self.boot_mount.file("vm.json");
-    write_whole(
-      &config,
-      firecracker_config(gate, &initrd, &self.image_file(), disk).as_bytes(),
-    );
+    let image = self.image_file();
     let booting = std::time::Instant::now();
-    let guest = Guest::spawn(
-      Command::new(&gate.firecracker).args(["--no-api", "--enable-pci", "--config-file", &config]),
-      "firecracker: ",
-      MOST_BYTES,
-    );
+    let guest = match &gate.vmm {
+      Vmm::Firecracker { binary, vmlinux } => {
+        let config = self.boot_mount.file("vm.json");
+        write_whole(
+          &config,
+          firecracker_config(vmlinux, &initrd, &image, disk).as_bytes(),
+        );
+        Guest::spawn(
+          Command::new(binary).args(["--no-api", "--enable-pci", "--config-file", &config]),
+          gate.vmm.tag(),
+          MOST_BYTES,
+        )
+      }
+      Vmm::Qemu { binary, kernel } => {
+        #[allow(clippy::disallowed_methods)]
+        // the image file's length, through the slates mount: RAM, not disk
+        let len = std::fs::metadata(&image).unwrap().len();
+        Guest::spawn(
+          Command::new(binary).args(qemu_arguments(kernel, &initrd, (&image, len), disk)),
+          gate.vmm.tag(),
+          MOST_BYTES,
+        )
+      }
+    };
     eprintln!(
-      "Firecracker booted the guest to its probe's ready in {} ms",
+      "{} booted the guest to its probe's ready in {} ms",
+      gate.vmm.name(),
       booting.elapsed().as_millis()
     );
     guest
@@ -828,21 +963,29 @@ impl Rig {
   }
 }
 
-/// A-160 by use: a real Firecracker v1.17.0 microVM reads and writes a slates volume through its disk image. Do: write
-/// a tree into a volume, snapshot it and `slates image build` it; boot Firecracker from an initramfs held in a slates
+/// A-160 by use: a real VM (Firecracker v1.17.0, QEMU) reads and writes a slates volume through its disk image. Do: write
+/// a tree into a volume, snapshot it and `slates image build` it; boot the VM from an initramfs held in a slates
 /// volume, its disk the image file read through a slates mount; have the guest list every node, patch a file inside its
 /// second chunk, rename one into another directory, remove one, write a new file and make a directory, list again, flush
 /// and end the VM; `slates image merge` the image and read the clone through its mount. Expect the guest to read every
-/// node as the volume holds it (kind, size and digest), and its changes in its second listing; Firecracker to exit
+/// node as the volume holds it (kind, size and digest), and its changes in its second listing; the VM to end
 /// cleanly; the merge to make two nodes, move one and remove one, and to write the new file's bytes and the one page
 /// the patch lies in; and the clone to hold exactly what the guest left.
 #[test]
-fn a_firecracker_guest_reads_and_writes_a_volume_through_its_image() {
-  let Some(gate) = Gate::from_env() else {
-    return;
-  };
-  let rig = Rig::new(&format!("guest-image-{}", std::process::id()));
-  let mut guest = rig.boot(&gate, &drive_disk(&gate));
+fn a_guest_reads_and_writes_a_volume_through_its_image() {
+  for gate in Gate::each_from_env() {
+    reads_and_writes_through_the_image(&gate);
+  }
+}
+
+/// [`a_guest_reads_and_writes_a_volume_through_its_image`] in the VMM `gate` names.
+fn reads_and_writes_through_the_image(gate: &Gate) {
+  let rig = Rig::new(&format!(
+    "guest-image-{}-{}",
+    gate.vmm.name(),
+    std::process::id()
+  ));
+  let mut guest = rig.boot(gate, &drive_disk(gate));
   assert_eq!(
     listed(&mut guest),
     rig.source.listing(),
@@ -877,6 +1020,13 @@ fn drive_disk(gate: &Gate) -> Disk {
 /// The pmem disk, with the modules its guest needs from the module directory the environment names; `None`, after
 /// saying so loudly, when it names none.
 fn pmem_disk(gate: &Gate) -> Option<Disk> {
+  if matches!(gate.vmm, Vmm::Qemu { .. }) && cfg!(target_arch = "aarch64") {
+    eprintln!(
+      "SKIP: QEMU builds virtio-pmem for x86 machines only (11.1: hw/i386/Kconfig selects VIRTIO_PMEM_SUPPORTED, \
+       hw/arm/Kconfig does not), so an arm64 QEMU guest has no pmem device; measured in diagnostics run 40883925064"
+    );
+    return None;
+  }
   let Some(directory) = gate.modules.as_deref() else {
     eprintln!(
       "SKIP: the pmem tests need SLATES_GUEST_MODULES, the guest kernel's module directory \
@@ -999,8 +1149,9 @@ fn hosts_write_shows_in_the_map(
 }
 
 /// The guest stores the patch's last `len` bytes at `map_at` through its map, then syncs. Nothing has opened the image
-/// file since, so only the guest's flush, which Firecracker carries out as an `msync` of the file, writes them into the
-/// volume. slates itself, read past the kernel, must then hold the whole patch at `found`.
+/// file since, so only the guest's flush, which the VMM carries out on the file (Firecracker by an `msync`, QEMU 11.1 by
+/// an `fsync`, `hw/virtio/virtio-pmem.c`), writes them into the volume. slates itself, read past the kernel, must then
+/// hold the whole patch at `found`.
 fn guests_sync_reaches_the_volume(
   rig: &Rig,
   guest: &mut Guest,
@@ -1019,8 +1170,8 @@ fn guests_sync_reaches_the_volume(
   );
 }
 
-/// A-165 by use: a real Firecracker v1.17.0 microVM maps a slates volume's image with DAX through a virtio-pmem device.
-/// Do: build the image as the drive test does; boot Firecracker with the image file, through a slates mount, as its pmem
+/// A-165 by use: a real VM (Firecracker v1.17.0, QEMU) maps a slates volume's image with DAX through a virtio-pmem device.
+/// Do: build the image as the drive test does; boot the VM with the image file, through a slates mount, as its pmem
 /// device, the guest loading the nvdimm modules its kernel needs and mounting the device as ext4 with DAX; have the
 /// guest list every node and map the large file. Then write the patch in three parts: the guest stores its first
 /// quarter through the map, and the host finds it in the image file read through the slates mount; the host writes the
@@ -1031,15 +1182,23 @@ fn guests_sync_reaches_the_volume(
 /// the guest's map, the guest touching memory alone; after the guest's sync, slates to hold the whole patch; and the
 /// merge and the clone to hold exactly the guest's tree, the drive test's to the byte.
 #[test]
-fn a_firecracker_guest_maps_a_volume_image_with_dax_through_virtio_pmem() {
-  let Some(gate) = Gate::from_env() else {
+fn a_guest_maps_a_volume_image_with_dax_through_virtio_pmem() {
+  for gate in Gate::each_from_env() {
+    maps_the_image_with_dax(&gate);
+  }
+}
+
+/// [`a_guest_maps_a_volume_image_with_dax_through_virtio_pmem`] in the VMM `gate` names.
+fn maps_the_image_with_dax(gate: &Gate) {
+  let Some(disk) = pmem_disk(gate) else {
     return;
   };
-  let Some(disk) = pmem_disk(&gate) else {
-    return;
-  };
-  let rig = Rig::new(&format!("guest-pmem-{}", std::process::id()));
-  let mut guest = rig.boot(&gate, &disk);
+  let rig = Rig::new(&format!(
+    "guest-pmem-{}-{}",
+    gate.vmm.name(),
+    std::process::id()
+  ));
+  let mut guest = rig.boot(gate, &disk);
   let patch_at = lists_and_maps(&rig, &mut guest);
   let len = PATCH.1;
   let quarter = len / 4;
@@ -1107,7 +1266,7 @@ fn stores_after_the_takeover(rig: &Rig, guest: &mut Guest, patch_at: usize, len:
 
 /// A-165 with a takeover (A-61, A-158) under a pmem guest's live DAX map. Do: boot a pmem guest, list, map the large
 /// file; store the patch's first quarter through the map and sync; store its second quarter, unsynced; kill the daemon
-/// with `SIGKILL` while Firecracker maps the image through the slates mount; wait for the anchor's successor; find the
+/// with `SIGKILL` while the VMM maps the image through the slates mount; wait for the anchor's successor; find the
 /// guest's stores in the image file through the mount; have the host write the third quarter through the mount and the
 /// guest wait for it in its map; store the rest and sync; make the other changes, list, end the VM and merge. Expect the
 /// successor to be a new daemon; the guest to go on; both its stores, the unsynced one included, in the image after the
@@ -1115,14 +1274,22 @@ fn stores_after_the_takeover(rig: &Rig, guest: &mut Guest, patch_at: usize, len:
 /// merge and the clone to hold exactly the guest's tree.
 #[test]
 fn a_daemon_killed_under_a_pmem_guests_live_map_is_taken_over_and_the_guest_goes_on() {
-  let Some(gate) = Gate::from_env() else {
+  for gate in Gate::each_from_env() {
+    a_daemon_killed_under_the_map(&gate);
+  }
+}
+
+/// [`a_daemon_killed_under_a_pmem_guests_live_map_is_taken_over_and_the_guest_goes_on`] in the VMM `gate` names.
+fn a_daemon_killed_under_the_map(gate: &Gate) {
+  let Some(disk) = pmem_disk(gate) else {
     return;
   };
-  let Some(disk) = pmem_disk(&gate) else {
-    return;
-  };
-  let rig = Rig::new(&format!("guest-pmem-takeover-{}", std::process::id()));
-  let mut guest = rig.boot(&gate, &disk);
+  let rig = Rig::new(&format!(
+    "guest-pmem-takeover-{}-{}",
+    gate.vmm.name(),
+    std::process::id()
+  ));
+  let mut guest = rig.boot(gate, &disk);
   let patch_at = lists_and_maps(&rig, &mut guest);
   let quarter = PATCH.1 / 4;
   guest_stores(&mut guest, patch_at, quarter);
@@ -1158,9 +1325,9 @@ fn a_daemon_killed_under_a_pmem_guests_live_map_is_taken_over_and_the_guest_goes
 }
 
 /// A-165 when the VM dies. A pmem guest's DAX stores are the image file's own pages, so a store the guest never synced
-/// is in the image when Firecracker is killed. The guest never unmounted the file system, so the merge refuses the image
+/// is in the image when the VMM is killed. The guest never unmounted the file system, so the merge refuses the image
 /// as possibly half-written until e2fsck has checked it. Do: boot a pmem guest, list, map the large file and store the
-/// whole patch through the map, unsynced; kill Firecracker without warning; read the image through slates; merge it;
+/// whole patch through the map, unsynced; kill the VMM without warning; read the image through slates; merge it;
 /// boot a second pmem guest on the image, list, end it; merge again; `e2fsck -fy` the image through the slates mount;
 /// merge. Expect slates to hold the whole patch after the kill; both merges before the check to be refused `NotClean`
 /// (ext4 leaves a file system it mounted unchecked unchecked at its unmount); the second guest to read the patched file;
@@ -1169,10 +1336,14 @@ fn a_daemon_killed_under_a_pmem_guests_live_map_is_taken_over_and_the_guest_goes
 /// and write the one page the patch lies in, its clone holding the patched tree and `lost+found`.
 #[test]
 fn a_pmem_guest_killed_with_unsynced_stores_leaves_them_in_the_image_for_a_checked_merge() {
-  let Some(gate) = Gate::from_env() else {
-    return;
-  };
-  let Some(disk) = pmem_disk(&gate) else {
+  for gate in Gate::each_from_env() {
+    a_guest_killed_with_unsynced_stores(&gate);
+  }
+}
+
+/// [`a_pmem_guest_killed_with_unsynced_stores_leaves_them_in_the_image_for_a_checked_merge`] in the VMM `gate` names.
+fn a_guest_killed_with_unsynced_stores(gate: &Gate) {
+  let Some(disk) = pmem_disk(gate) else {
     return;
   };
   if !present("e2fsck") {
@@ -1181,8 +1352,12 @@ fn a_pmem_guest_killed_with_unsynced_stores_leaves_them_in_the_image_for_a_check
     );
     return;
   }
-  let rig = Rig::new(&format!("guest-pmem-crash-{}", std::process::id()));
-  let mut first = rig.boot(&gate, &disk);
+  let rig = Rig::new(&format!(
+    "guest-pmem-crash-{}-{}",
+    gate.vmm.name(),
+    std::process::id()
+  ));
+  let mut first = rig.boot(gate, &disk);
   let patch_at = lists_and_maps(&rig, &mut first);
   guest_stores(&mut first, patch_at, PATCH.1);
   first.kill();
@@ -1193,7 +1368,7 @@ fn a_pmem_guest_killed_with_unsynced_stores_leaves_them_in_the_image_for_a_check
     "slates itself, after the VM's death",
   );
   rig.merge_is_refused_unclean("refused-after-the-kill", "after the guest's death");
-  let mut second = rig.boot(&gate, &disk);
+  let mut second = rig.boot(gate, &disk);
   let patched = rig.source.patched_listing();
   assert_eq!(
     listed(&mut second),
