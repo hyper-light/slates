@@ -1,0 +1,116 @@
+name: DIAG writable direct map from containers and pods (not for main)
+
+# A diagnostics branch, never merged. The DAX matrix's container and pod socket-route cells (docs/wip/virtiofs.md §8)
+# owe the writable direct map (A-186) by a real run in two places no machine in this kiln has:
+#   - Windows: CI's windows-2025 runner has Docker's engine in Windows-container mode. The daemon and its clients run
+#     in one process-isolated Nano Server container: a probe writes a 4 MiB file, maps it read-only by the direct map,
+#     then maps it read and write, stores across the first page's end, syncs, releases and reads it back.
+#   - Linux arm64: `cargo xtask kind direct` on ubuntu-24.04-arm, whose direct leg now runs the probe's map-write mode
+#     in pod 0 after its read-only map.
+# The `nosync` mutant makes a write-back compare nothing (the comparison's end at zero): both legs must fail it.
+
+on:
+  push:
+    branches: [diag-a186-containers]
+
+jobs:
+  windows-container:
+    name: Windows process-isolated container (${{ matrix.mutant }})
+    strategy:
+      fail-fast: false
+      matrix:
+        mutant: [green, nosync]
+    runs-on: windows-2025
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: Install NASM
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Apply the mutant
+        shell: pwsh
+        run: |
+          if ("${{ matrix.mutant }}" -eq "nosync") {
+            $file = "crates/server/src/direct_map.rs"
+            $text = Get-Content -Raw $file
+            $changed = $text.Replace("let end = len.min(*object_bytes);", "let end = 0u64.min(*object_bytes);")
+            if ($changed -eq $text) { throw "the mutant did not apply" }
+            Set-Content -NoNewline -Path $file -Value $changed
+          }
+          git diff --stat
+      # Nano Server has no vcruntime140.dll, so the binaries link the C runtime statically (run 40580524733).
+      - name: Build the binary and the probe, the C runtime linked statically
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --release -p slates-cli --bin slates --example pod_direct_probe
+      - name: Stage them for the container
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force C:\slates-bin | Out-Null
+          Copy-Item target\release\slates.exe, target\release\examples\pod_direct_probe.exe, diag\container-direct.cmd C:\slates-bin
+          docker version --format '{{.Server.Version}} {{.Server.Os}}'
+          [System.Environment]::OSVersion.Version
+          docker pull --quiet mcr.microsoft.com/windows/nanoserver:ltsc2025
+      - name: The daemon and its clients inside one process-isolated container
+        id: leg
+        continue-on-error: true
+        timeout-minutes: 15
+        run: docker run --rm --isolation=process -v C:\slates-bin:C:\slates:ro mcr.microsoft.com/windows/nanoserver:ltsc2025 cmd /c C:\slates\container-direct.cmd
+      - name: The verdict
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          $outcome = "${{ steps.leg.outcome }}"
+          Write-Output "DIAG mutant=${{ matrix.mutant }} leg=$outcome"
+          if ("${{ matrix.mutant }}" -eq "green") {
+            if ($outcome -ne "success") { exit 1 }
+          } elseif ($outcome -ne "failure") {
+            Write-Output "REDCHECK FAILED: the mutant passed"
+            exit 1
+          }
+
+  arm64-kind:
+    name: KIND direct leg on ubuntu-24.04-arm (${{ matrix.mutant }})
+    strategy:
+      fail-fast: false
+      matrix:
+        mutant: [green, nosync]
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.3.0
+      - uses: helm/kind-action@v1
+        with:
+          version: v0.33.0
+          install_only: true
+      - name: Apply the mutant
+        run: |
+          if [ "${{ matrix.mutant }}" = nosync ]; then
+            grep -q 'let end = len.min(\*object_bytes);' crates/server/src/direct_map.rs
+            sed -i 's/let end = len.min(\*object_bytes);/let end = 0u64.min(*object_bytes);/' crates/server/src/direct_map.rs
+          fi
+          git diff --stat
+      - name: The machine
+        run: uname -a && docker version --format '{{.Server.Version}} {{.Server.Os}}/{{.Server.Arch}}' && kind version
+      - name: The direct leg (a pod's process maps a file read-only, then read and write)
+        id: leg
+        continue-on-error: true
+        run: cargo xtask kind direct
+      - name: The verdict
+        if: ${{ always() }}
+        run: |
+          echo "DIAG mutant=${{ matrix.mutant }} leg=${{ steps.leg.outcome }}"
+          if [ "${{ matrix.mutant }}" = green ]; then
+            test "${{ steps.leg.outcome }}" = success
+          else
+            test "${{ steps.leg.outcome }}" = failure || { echo "REDCHECK FAILED: the mutant passed"; exit 1; }
+          fi
