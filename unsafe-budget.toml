@@ -445,3 +445,8 @@ slates-guest-probe = 8
 # slates-image (0): the disk-image form of a volume (A-160) is byte buffers built field by field and read by checked
 # offset (`format.rs`), with every block pointer range-checked before use; no casts, no maps, no FFI.
 slates-image = 0
+# slates-seal (0): the rendezvous seal (A-187) is safe Rust over aws-lc-rs's own safe API: X25519 agreement, HKDF-SHA256
+# and AES-256-GCM through its types, keys and nonces as owned arrays; aws-lc-rs holds every FFI call. Recorded
+# 2026-10-29, when `cargo xtask unsafe` found the crate unbudgeted since A-187 added it (CI runs the structural and
+# literal checks, not the budget).
+slates-seal = 0

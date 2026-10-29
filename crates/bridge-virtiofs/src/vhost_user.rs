@@ -298,8 +298,29 @@ pub struct MappedRegion {
   user_addr: u64,
   /// Where the region begins in its memory object.
   offset: u64,
+  /// Which memory object it maps: the object's device and inode, as `fstat` names them.
+  identity: ObjectIdentity,
   /// The mapping: the object from its start to the region's end.
   object: SharedObject,
+}
+
+/// A memory object's identity across descriptors: its device and inode. A front end re-sends a region's object under a
+/// new descriptor in every memory table, so the descriptor's number names nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ObjectIdentity {
+  device: u64,
+  inode: u64,
+}
+
+impl ObjectIdentity {
+  /// The identity of the object `fd` names.
+  fn of(fd: &OwnedFd) -> Result<ObjectIdentity, VhostError> {
+    let stat = rustix::fs::fstat(fd).map_err(os("fstat"))?;
+    Ok(ObjectIdentity {
+      device: stat.st_dev,
+      inode: stat.st_ino,
+    })
+  }
 }
 
 impl std::fmt::Debug for MappedRegion {
@@ -355,8 +376,8 @@ impl MappedRegion {
         reason: "the region's object is not sealed against shrinking",
       });
     }
-    let length = rustix::fs::fstat(fd).map_err(os("fstat"))?.st_size;
-    if u64::try_from(length).unwrap_or(0) < end {
+    let stat = rustix::fs::fstat(fd).map_err(os("fstat"))?;
+    if u64::try_from(stat.st_size).unwrap_or(0) < end {
       return Err(VhostError::Memory {
         reason: "the region's object is shorter than the region",
       });
@@ -377,8 +398,29 @@ impl MappedRegion {
       size: entry.size,
       user_addr: entry.user_addr,
       offset: entry.offset,
+      identity: ObjectIdentity {
+        device: stat.st_dev,
+        inode: stat.st_ino,
+      },
       object,
     })
+  }
+
+  /// Whether this region is `entry` over the object `identity` names: the same object at the same guest and front-end
+  /// addresses, from the same offset.
+  fn is(&self, entry: &RegionEntry, identity: ObjectIdentity) -> bool {
+    self.guest_phys == entry.guest_phys
+      && self.size == entry.size
+      && self.user_addr == entry.user_addr
+      && self.offset == entry.offset
+      && self.identity == identity
+  }
+
+  /// Whether the front end's address `user` lies in this region.
+  fn holds_user(&self, user: u64) -> bool {
+    user
+      .checked_sub(self.user_addr)
+      .is_some_and(|within| within < self.size)
   }
 
   /// Whether `range` lies wholly in this region.
@@ -1031,11 +1073,15 @@ impl VhostUserSeam {
     Ok((vring, num))
   }
 
+  /// `SET_MEM_TABLE`: the guest's memory as the front end maps it, taken whole before the rings are configured. A front
+  /// end sends it again under running rings whenever its memory changes. QEMU puts every shared memory section that has
+  /// a descriptor in it (11.1, `hw/virtio/vhost.c` `vhost_section`), so each window map the device places comes back as
+  /// a table with the map's range added, and each unmap as one without it (A-189). Such a table is taken when every
+  /// region a configured ring lies in is still in it unchanged: the same object at the same guest and front-end
+  /// addresses, from the same offset. A region the table keeps keeps its mapping, a new one is mapped, and one it drops
+  /// is let go. A table that moves or drops a ring's region is refused, since the device validated its rings where they
+  /// were.
   fn set_mem_table(&mut self, payload: &[u8]) -> Result<Answer, VhostError> {
-    if !self.memory.is_empty() && self.vrings.iter().any(|vring| vring.kick.is_some()) {
-      // Memory replaced under configured rings (hotplug) would move what the device's layouts name.
-      return Err(protocol("the memory table changed under configured rings"));
-    }
     let count = usize::try_from(u32_at(payload, 0)?).map_err(|_| protocol("region count"))?;
     if count == 0 || count > MAX_REGIONS {
       return Err(protocol(
@@ -1052,7 +1098,7 @@ impl VhostUserSeam {
         "a memory table whose descriptors do not match its regions",
       ));
     }
-    let mut regions = Vec::with_capacity(count);
+    let mut entries = Vec::with_capacity(count);
     for (position, fd) in fds.iter().enumerate() {
       let at = MEM_TABLE_HEAD_LEN.saturating_add(position.saturating_mul(REGION_ENTRY_LEN));
       let entry = RegionEntry {
@@ -1061,7 +1107,57 @@ impl VhostUserSeam {
         user_addr: u64_at(payload, at.saturating_add(REGION_AT_USER))?,
         offset: u64_at(payload, at.saturating_add(REGION_AT_OFFSET))?,
       };
-      regions.push(MappedRegion::map(entry, fd)?);
+      entries.push((entry, ObjectIdentity::of(fd)?));
+    }
+    let kept = |region: &MappedRegion| {
+      entries
+        .iter()
+        .any(|(entry, identity)| region.is(entry, *identity))
+    };
+    let ring_addresses: Vec<u64> = self
+      .vrings
+      .iter()
+      .filter(|vring| vring.kick.is_some())
+      .filter_map(|vring| vring.addresses)
+      .flat_map(|addresses| [addresses.descriptor, addresses.available, addresses.used])
+      .collect();
+    if self
+      .memory
+      .regions
+      .iter()
+      .any(|region| !kept(region) && ring_addresses.iter().any(|&at| region.holds_user(at)))
+    {
+      return Err(protocol(
+        "a memory table that moves or drops a region a configured ring lies in",
+      ));
+    }
+    let mut fresh = Vec::with_capacity(count);
+    for ((entry, identity), fd) in entries.iter().zip(fds.iter()) {
+      let held = self
+        .memory
+        .regions
+        .iter()
+        .any(|region| region.is(entry, *identity));
+      fresh.push(if held {
+        None
+      } else {
+        Some(MappedRegion::map(*entry, fd)?)
+      });
+    }
+    let mut held = std::mem::take(&mut self.memory.regions);
+    let mut regions = Vec::with_capacity(count);
+    for ((entry, identity), fresh) in entries.iter().zip(fresh) {
+      let region = match fresh {
+        Some(region) => region,
+        None => {
+          let at = held
+            .iter()
+            .position(|region| region.is(entry, *identity))
+            .ok_or(protocol("a memory table naming one region twice"))?;
+          held.swap_remove(at)
+        }
+      };
+      regions.push(region);
     }
     self.memory = GuestRegions::new(regions)?;
     Ok(Answer::Acknowledge)

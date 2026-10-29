@@ -433,20 +433,32 @@ exchange keyed by a single-use secret. Windows refuses the form by kind (`Attach
 VM whose virtio-fs device is slates' own (Linux). It attaches the volume (or only `DIR` of it; for writing unless
 `--read-only`), announces the attachment like `shards`, and replaces itself with `VMM`, the device's socket end
 inherited at the descriptor it arrived at. Each `{socket}` in the VMM's arguments becomes `/proc/self/fd/N`, that
-descriptor, so for crosvm:
+descriptor, and each `{fd}` becomes `N`. So for crosvm:
 
 ```
 slates vhost-user ID --dax-window 8MiB -- crosvm run --vhost-user type=fs,socket={socket} ... vmlinuz
 ```
 
+and for QEMU 11.1 or later, whose generic vhost-user device gives the device its DAX window (guest memory must be
+shared, as vhost-user needs):
+
+```
+slates vhost-user ID --dax-window 8MiB -- qemu-system-x86_64 -machine q35,memory-backend=mem \
+  -object memory-backend-memfd,id=mem,size=512M,share=on -m 512M \
+  -chardev socket,id=slates,fd={fd} \
+  -device vhost-user-test-device-pci,chardev=slates,virtio-id=26,num_vqs=2,config_size=40 ...
+```
+
 and the guest mounts `mount -t virtiofs slates /mnt -o dax=always` (`--tag` names another tag). No socket file exists
-anywhere. A VMM with no `{socket}` in its arguments is usage (exit 2): the device is reached through that end alone.
+anywhere. A VMM with neither `{socket}` nor `{fd}` in its arguments is usage (exit 2): the device is reached through
+that end alone. QEMU's vhost-user-fs-pci has no DAX window, so use the generic device for DAX; QEMU before 11.1 offers
+no window on either.
 `--dax-window SIZE` offers the guest a DAX window of that size (a power of two of at least 2MiB); through it the guest
 maps a copy of each file slates keeps equal to the volume, so every change by any path shows in its map, and its own
 stores reach the volume when it syncs, closes, or the VM ends. The attachment lasts as long as the VMM's end: it ends
 when the VM exits, never started, or closes it (or on `detach`, a revocation, the volume's destroy), and a VMM that
-cannot run is a failure (exit 4). The device lives in the daemon, so the daemon's death ends it, and crosvm then ends
-the VM: what the guest synced or closed is in the volume, and its unsynced stores are lost with the daemon. A VM that
+cannot run is a failure (exit 4). The device lives in the daemon, so the daemon's death ends it; crosvm then ends
+the VM, and QEMU keeps it with the device gone: what the guest synced or closed is in the volume, and its unsynced stores are lost with the daemon. A VM that
 dies on its own leaves its unsynced stores in the volume (a store past a file's end never reaches it, as POSIX says of
 a map). While the VM runs, `slates status` counts what its window does: maps sent to the VMM
 (`virtiofs.dax_maps_sent`), runs of the guest's stores written into the volume (`virtiofs.dax_runs_ingested`), and the

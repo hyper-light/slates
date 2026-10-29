@@ -3114,8 +3114,14 @@ daemon through the rendezvous's socket file (A-187).
 >   release and reap; Linux x86_64, macOS arm64 and Windows x86_64 by real clients, red-checked eleven ways on Linux and
 >   three on Windows). Nineteen cells. **Corrected 2026-10-25:** the direct map had been listed
 >   here as proven before A-171, when its test reported which path ran without asserting it and every read was a copy.
-> - **Ruled out by the platforms:** QEMU's vhost-user-fs and Cloud Hypervisor have no DAX window, so neither has Kata;
->   crosvm's window is x86_64-only; Apple's Virtualization framework and WSL2 document none (unconfirmed).
+> - **Proven since (A-189, 2026-10-29):** QEMU 11.1 over slates' own device, on Linux x86_64 with KVM and on Linux arm64
+>   under QEMU's own emulation (diagnostics run 40876474403, red-checked with no window offered).
+> - **Ruled out by the platforms:** QEMU's vhost-user-fs device and virtiofsd have no window, so QEMU has no mount route,
+>   and Kata, which drives that device, has neither; Cloud Hypervisor has none; crosvm's own fs device is x86_64-only;
+>   Apple's Virtualization framework's virtio-fs device and WSL2's 9P have none (both measured 2026-10-27).
+>   **Corrected 2026-10-29 (A-189):** this line ruled QEMU out on both routes and crosvm on arm64 on both. QEMU 11.1's
+>   generic vhost-user device maps slates' own device's window, and crosvm's vhost-user front end has no architecture
+>   gate, so slates' own device under crosvm on arm64 is owed.
 > - **Owed:** every other cell, each to a named goal.
 
 > **Status (DAX gate, 2026-10-12).** Mapping isolation, pinning and teardown are **built in the VFS** and proven by
@@ -12476,6 +12482,64 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
 
+### A-189 — QEMU 11.1 maps the window of slates' own device: its generic vhost-user device takes the end by number, and the back end takes the memory tables QEMU sends as it maps (accepted and built 2026-10-29)
+Applied in the same change to: §4.6 (the DAX matrix's status and its list of what the platforms rule out), A-164 (the
+same list), `docs/wip/virtiofs.md` §8 (the VMs table's QEMU, Kata and crosvm arm64 rows), GAPS, `docs/cli.md`,
+`crates/cli` (`args.rs`: `{fd}`; `verbs.rs`: `exec_vmm`; `tests/cli.rs`; `tests/guest_vhost.rs`: every test in each VMM
+the environment names, and QEMU's command line), `crates/bridge-virtiofs` (`vhost_user.rs`: `set_mem_table` under
+running rings, `ObjectIdentity`), `crates/server` (`tests/virtiofs.rs`: the test of QEMU's tables;
+`tests/common/guest.rs`: a chain whose payload lies in another region), `ci/guest/Dockerfile` (QEMU from
+trixie-backports, fuse3), `.github/workflows/ci.yml` (the live-guest lane's QEMU leg), and
+`docs/bugs/2026-10-29-qemus-memory-table-after-a-map-ended-slates-own-device.md`.
+- **What it answers.** The DAX matrix ruled QEMU out on both routes: upstream's vhost-user-fs device has no window
+  property, and the window is the front end's to offer. That holds of QEMU's vhost-user-fs-pci, which has no window in
+  11.1 either, and was wrong of QEMU. 11.1.0 is the first release whose generic vhost-user device
+  (`vhost-user-test-device-pci`, user-creatable since 10.2) asks the back end for its shared-memory regions
+  (`VHOST_USER_GET_SHMEM_CONFIG`, request 44), makes them a PCI BAR, and maps each `VHOST_USER_BACKEND_SHMEM_MAP`
+  (request 9) into it: QEMU 6608dca74ecf, "vhost-user-device: Add shared memory BAR", 2026-06-03; `vhost-user.rst` at
+  v11.1.0. slates' back end already speaks those numbers for crosvm (protocol feature 22, requests 44, 9 and 10). Debian
+  ships QEMU 11.1.2 in trixie-backports. The device is `-device
+  vhost-user-test-device-pci,chardev=slates,virtio-id=26,num_vqs=2,config_size=40` over guest memory from a shared
+  memfd backend.
+- **The end by number.** `slates vhost-user` named the device's end only as `/proc/self/fd/N`, which crosvm takes and
+  QEMU would connect to as a path. `{fd}` names it by number, as QEMU takes an inherited socket: `-chardev
+  socket,id=slates,fd={fd}`.
+- **The tables QEMU sends.** QEMU puts every shared memory section that has a descriptor in the memory table it sends
+  the back end (`hw/virtio/vhost.c` `vhost_section`), so each map it places comes back as a new `SET_MEM_TABLE` under
+  running rings, and each unmap as one without it. The back end refused any table under configured rings, so the first
+  run ended the device at the guest's first map (diagnostics run 40874255591; the bug record). A table under configured
+  rings is now taken when every region a configured ring lies in is still in it unchanged: the same object, by device
+  and inode, at the same guest and front-end addresses, from the same offset. A kept region keeps its mapping, a new
+  one is mapped, a dropped one is let go; a table that moves or drops a ring's region is refused, as before. With the
+  window's ranges in its table, the device reads and writes a request's buffer that lies in the window, as a guest's
+  `O_DIRECT` read into or write from a mapped file's pages makes one.
+- **Its bound.** Without `VHOST_USER_PROTOCOL_F_CONFIGURE_MEM_SLOTS`, QEMU sends at most 8 regions
+  (`VHOST_MEMORY_BASELINE_NREGIONS`). Past them its own commit fails and the back end keeps the table it has, so the
+  guest's maps work and a request buffer in a range past the eighth region is refused. The incremental form
+  (`ADD_MEM_REG`, `REM_MEM_REG`, up to QEMU's 512 slots) is owed (GAPS).
+- **What stays out.** The mount route: QEMU has no virtio-fs device of its own, its vhost-user-fs-pci has no window, and
+  virtiofsd, the back end that would serve a host mount through one, has no DAX in any release (its "feat: add DAX
+  support", merge request !318, open since 2026-06-03, unmerged on 2026-10-29). Kata: its QEMU driver asks
+  vhost-user-fs-pci for a `cache-size` (govmm `qemu.go`), a property upstream's device has never had, so neither route
+  reaches a Kata guest. Windows: QEMU builds no vhost-user there (`meson.build`: "vhost-user is not available on
+  Windows"). macOS: QEMU builds vhost-user only when asked (`--enable-vhost-user`), which Homebrew's 11.1.3 does not
+  ask, and slates' vhost-user back end is Linux's (memfds and eventfds), so that cell is owed. crosvm on arm64, corrected
+  in the same change: its x86_64 gate is in its own fs device (`devices/device_virtio_fs/src/lib.rs`), the mount route;
+  its vhost-user front end maps a back end's region on any architecture, so slates' own device under crosvm on arm64
+  is owed, not ruled out.
+- **Proven** (2026-10-29), every test of `crates/cli/tests/guest_vhost.rs` in QEMU 11.1.2 from trixie-backports
+  (Debian 1:11.1.2+ds-3~bpo13+4), Debian's 6.12 kernel, the static probe as `/init`: on x86_64 with KVM (CI's
+  `ubuntu-latest`, diagnostics run 40876474403, job 123456468150: 5 of 5 in 11.88 s) and on arm64 under QEMU's own
+  emulation (`ubuntu-24.04-arm`, which has no KVM; the same run, job 123456468166: 5 of 5 in 23.17 s). The live-guest
+  lane's own suite passes on the new QEMU too (the same x86_64 job, 23 of 23: pjdfstest's 8,798 cases with no unlisted
+  failure, fsx, fsstress, the roster's workloads identical on slates and on the guest's RAM). Each guest maps the session's file with
+  `dax=always` and holds every change of every path as memory alone, its stores reaching the session at sync, at close
+  and at the VM's death, never past the file's end, over generated histories (123 ingests held and 51 runs ingested in
+  one). Red-checked in the same run with the device offered no window: all 5 refused at the guest's mount
+  (job 123456467863). The device's own test of QEMU's tables (`crates/server/tests/virtiofs.rs`
+  `a_front_end_that_puts_each_placed_map_in_its_memory_table_keeps_its_device`) failed before the change on adacachy and
+  passes after, with the virtio-fs suite 23 of 23, bridge-virtiofs's suites and the five crosvm tests unchanged.
+
 ### A-188 — A client of any shard is handed a direct map: the copy held on its volume's shard, the hand-off through the client's own (accepted and built 2026-10-29)
 Applied in the same change to: §4.6 (the same-kernel direct map paragraph), A-186 (its owed item), GAPS,
 `crates/server` (`direct_map.rs`: `ClientMaps` and `DirectMapState::held`, the share counted over the clients served,
@@ -12607,7 +12671,10 @@ of its own).
   connect of each run 24.1, 25.2 and 24.1 µs unsealed against 69.7, 79.4 and 72.7 µs sealed, the median 43.2, 45.7 and
   41.0 µs against 115.9, 117.5 and 116.9 µs: the exchange adds about 48 µs at the least and 73 µs at the median, of
   which about 36 µs is the seal's own crypto and the rest the half round trip more.
-- **Owed:** CI's runners refuse an unprivileged user namespace, so the `unshare` test skips there loudly.
+- **Run on CI since 2026-10-29:** CI's runners refuse an unprivileged user namespace (AppArmor's
+  `apparmor_restrict_unprivileged_userns`), so the `unshare` tests skipped there loudly, and the impostor test, which
+  needs root, skipped too. The Linux lanes now lift the restriction for their own runner and run the impostor test as
+  root in a container, a skip failing the step; all three passed on x86_64 and arm64 (diagnostics run 40876479984).
 
 ### A-186 — The direct map maps a file read and write: the client's stores are compared back into the file at its sync points (accepted 2026-10-28)
 Applied in the same change to: §4.6 (the same-kernel direct map paragraph and its status, the DAX matrix status), GAPS, `docs/wip/virtiofs.md` §8, `crates/mem` (`dax_object.rs`: `PeerAccess`, `PeerObject::create` taking it, `PeerObject::access` and `read_write_handle`, `PeerWriteView` on every platform, `within_view`; `tests/peer_object.rs`, `tests/peer_section.rs`), `crates/ipc` (`protocol.rs`: `RequestBody::MapWrite` and `MapSync`, `ReplyBody::MapSynced`, `Refusal::MapsHeld`, appended; `rendezvous.rs`: `Mapping`, the Linux judge by access and its writable test; `route.rs`: `confined_map`, replacing `confined_read_only`; `handle_route.rs`: `confined_section` and `hand_section` by access), `crates/vfs` (`shards_backing.rs`: a writable copy's ranges marked writable, `is_attached`, `BackingObject::peer_handle` replacing `read_only_handle`), `crates/bridge-core` (`dax_backing.rs`: `write_back_slice` and `WroteBack`, the one compare-back, which the ingest now calls), `crates/server` (`direct_map.rs`: `HeldMap`, `map_write`, `map_sync`, `Sync`, the writable release, `write_back_for_reap`, `defer_task`, `complete` shared; `fs_verbs.rs`: `with_writer`, `writable_file`; `verbs.rs`: the verbs' dispatch, the detach's `MapsHeld`, the refusal's ledger name; `reap.rs`; `state.rs`), `crates/client` (`MappedWrite`, `map_write`, `map_sync`, `release_map_write`; `tests/client.rs`, `tests/reap_map.rs`).
@@ -13475,10 +13542,11 @@ from its sources) and 01a171494952772991b9bc668b5d89f0 (the 10 the matrix rests 
     when what crosses them is encrypted end to end and at rest). With no VM, a same-kernel process maps slates' own
     memory with no copy (A-135).
 - **Ruled out by the platforms**, each on the platform's own source:
-  - upstream QEMU's vhost-user-fs device has no DAX window property. The window is the front end's to offer, so a QEMU
-    guest, and Kata on upstream QEMU, has no virtio-fs DAX on either route, slates' own device included;
+  - upstream QEMU's vhost-user-fs device has no DAX window property, and virtiofsd has no DAX, so a QEMU guest has no
+    mount route, and Kata, which drives that device, has neither. **Corrected 2026-10-29 (A-189):** this line ruled
+    out slates' own device too; QEMU 11.1's generic vhost-user device offers its window, proven on x86_64 and arm64;
   - Cloud Hypervisor states that virtio-fs DAX is not available;
-  - crosvm offers DAX on x86_64 only;
+  - crosvm's own fs device offers DAX on x86_64 only (its vhost-user front end has no such gate: A-189);
   - Apple's Virtualization framework documents no DAX window for its virtio-fs device, so Docker Desktop's containers on
     macOS map through the VM's cache (unconfirmed: the evidence is documentation that says nothing);
   - WSL2 reaches Windows files over 9P, which has no window (unconfirmed: search summaries only).

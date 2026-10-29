@@ -11319,6 +11319,43 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     re-witness asks the host's clock as a copy-up does (A-162).
   - A racy witness never settles: after a re-hash past its tick confirms it, the fingerprint alone would do, but every
     drift check of it still hashes the whole file.
+- **QEMU maps slates' own device's window (A-189, 2026-10-29): built, and proven in QEMU 11.1 on Linux x86_64 and
+  arm64.**
+  - **What:** the matrix had ruled QEMU out on both routes, from its vhost-user-fs device's missing window. QEMU 11.1.0
+    is the first release whose generic vhost-user device (`vhost-user-test-device-pci`) asks a back end for its
+    shared-memory regions and maps each `SHMEM_MAP` into a PCI BAR (QEMU 6608dca74ecf); slates' back end already speaks
+    those messages for crosvm. Debian ships QEMU 11.1.2 in trixie-backports, which the live-guest image now installs.
+  - **Found by the first run, fixed:**
+    - `slates vhost-user` named the end only as `/proc/self/fd/N`, which QEMU would connect to as a path; `{fd}` names
+      it by number (`-chardev socket,id=slates,fd={fd}`);
+    - QEMU sends a new memory table under running rings with each map it places and each unmap, and the back end
+      refused any such table, ending the device at the guest's first map (diagnostics run 40874255591; the bug record
+      `docs/bugs/2026-10-29-qemus-memory-table-after-a-map-ended-slates-own-device.md`). A table that keeps every region
+      a configured ring lies in, unchanged, is now taken; one that moves or drops a ring's region is still refused.
+  - **Proven** (diagnostics run 40876474403): every test of `crates/cli/tests/guest_vhost.rs` in QEMU 11.1.2 on x86_64
+    with KVM (`ubuntu-latest`, job 123456468150, 5 of 5 in 11.88 s) and on arm64 under QEMU's own emulation
+    (`ubuntu-24.04-arm`, no KVM, job 123456468166, 5 of 5 in 23.17 s). The live-guest suite passes on QEMU 11.1 too (the
+    x86_64 job, 23 of 23, pjdfstest's 8,798 cases with no unlisted failure). On adacachy: the device's test of QEMU's
+    tables failed before the fix and passes after; the virtio-fs suite 23 of 23; bridge-virtiofs's suites; the five
+    crosvm tests 5 of 5; clippy of bridge-virtiofs, server and cli.
+  - **Red-checked:** the same QEMU with the device offered no window, all 5 refused at the guest's `dax=always` mount
+    (job 123456467863).
+  - **Owed:**
+    - `VHOST_USER_PROTOCOL_F_CONFIGURE_MEM_SLOTS`: without it QEMU sends at most 8 regions, and past them its own commit
+      fails and the back end keeps the table it has. The guest's maps still work, and a request buffer in a range past
+      the eighth region is refused (the next item). The incremental form reaches QEMU's 512 slots;
+    - a request buffer in a window range the back end's table does not name faults the queue: always under crosvm, which
+      never names the window in its table (`set_mem_table` over the VM's RAM at activation), and under QEMU past 8
+      regions. A guest's `O_DIRECT` read into or write from a mapped file's pages makes one. No test reaches it under
+      crosvm;
+    - QEMU on macOS: QEMU builds vhost-user there only with `--enable-vhost-user`, which Homebrew's 11.1.3 does not
+      ask, and slates' vhost-user back end is Linux's;
+    - crosvm on arm64 by the socket route: its vhost-user front end maps a back end's region with no architecture gate
+      (the matrix's "impossible" there was wrong; the x86_64 gate is in crosvm's own fs device). It needs crosvm built
+      for arm64 on an arm64 host with KVM: the nested virtualization VM on this Mac, not CI.
+  - **Stays out, each on its source:** QEMU's mount route (vhost-user-fs-pci has no window, and virtiofsd no DAX in any
+    release: its merge request !318 is open since 2026-06-03); Kata on QEMU (it asks vhost-user-fs-pci for a
+    `cache-size` upstream never had); QEMU on Windows (no vhost-user there).
 - **A workload in a network namespace of its own reaches the daemon (A-187, 2026-10-29): built, and proven in a
   container on a bridge network and in a KIND pod of its own, on x86_64 and arm64.**
   - **What:** Linux's rendezvous was an abstract socket, which the kernel scopes to a network namespace, so a pod of
@@ -11349,10 +11386,14 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       to an administrator's `local` PersistentVolume, which the restricted profile allows; the KIND leg's step 7 on
       x86_64 (run 40855180817) and arm64 (diagnostics run 40855403394), the namespace refusing a hostPath pod first. A
       CSI driver would be a privileged node plugin of slates' own, which R10 rules out.
-    - The client's check of the listener's user is tested only as root (a listener of another user needs root to
-      start), so CI's runners skip it loudly; so is the `unshare` namespace test, since the runners refuse an
-      unprivileged user namespace (`write failed /proc/self/uid_map`). Both ran on arm64 Linux in a container and the
-      namespace test on adacachy.
+    - **Run on CI since 2026-10-29:** the client's check of the listener's user needs root (a listener of another user
+      needs root to start), and the two namespace tests (a client in a network namespace of its own; one in a pid
+      namespace the daemon cannot see) need an unprivileged user namespace, which the runners' AppArmor refuses
+      (`kernel.apparmor_restrict_unprivileged_userns=1`), so CI's runners had skipped all three loudly. The Linux lanes
+      now lift the restriction for their own runner and run the impostor test as root in an `ubuntu:24.04` container,
+      the test binary bound in, a skip failing the step. All three passed on x86_64 and arm64 (diagnostics run
+      40876479984, jobs 123456488199 and 123456488585: the network namespace's client in 0.27 s and 0.41 s, the impostor
+      refused).
 - **The direct map writes (A-186, 2026-10-28): built, and proven by real clients on Linux x86_64, macOS arm64 and
   Windows x86_64.**
   - **What:** `MapWrite` maps a file read and write under the caller's own write attachment. The daemon makes the
@@ -11796,9 +11837,12 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       "Services and Redirected Drives"); a drive every session sees needs the file system run as LocalSystem, which
       slates' daemon never is (R10); and past that, the bind filter refuses a custom file system's volume
       (microsoft/Windows-Containers#335, closed by design);
-    - QEMU and Kata on it: upstream vhost-user-fs has no window property;
+    - QEMU's mount route: its vhost-user-fs device has no window and virtiofsd has no DAX; Kata on QEMU by either route,
+      since Kata drives that device. **Corrected 2026-10-29 (A-189):** this line ruled out QEMU's socket route too, which
+      QEMU 11.1's generic vhost-user device serves (proven on x86_64 and arm64, the A-189 entry);
     - Cloud Hypervisor: "it is not available";
-    - crosvm on arm64: DAX is x86_64-only;
+    - crosvm on arm64 by the mount route: its own fs device's DAX is x86_64-only. **Corrected 2026-10-29 (A-189):** the
+      socket route there is owed, not ruled out (its vhost-user front end has no such gate);
     - Docker Desktop on macOS, and Apple's framework: measured 2026-10-27, the framework's virtio-fs device has no cache
       window (`virtio_fs_setup_dax: No cache capability`; `dax=always` refused), and Docker Desktop's VM shares the
       Mac's folders through that device (`virtiofs0 /run/host_virtiofs/Users`) under its `fakeowner` layer;

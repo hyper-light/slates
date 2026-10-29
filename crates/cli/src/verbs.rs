@@ -1755,8 +1755,9 @@ fn hand_to(
 /// `vhost-user ID [--tag NAME] [--subtree DIR] [--read-only] [--dax-window SIZE] -- VMM [ARG ...]` (§4.6; goal G-vhost):
 /// attaches the volume to slates' own virtio-fs device, announces the attachment, and replaces this process with the
 /// VMM. The device's socket end stays at the descriptor number it arrived at, so it displaces nothing the VMM was handed
-/// by whoever ran this (a tap device's descriptor, say), and each `{socket}` in the VMM's arguments names it as
-/// `/proc/self/fd/N`, which crosvm takes as an inherited socket. No socket file exists anywhere (R1). As `shards`: the
+/// by whoever ran this (a tap device's descriptor, say). Each `{socket}` in the VMM's arguments names it as
+/// `/proc/self/fd/N`, which crosvm takes as an inherited socket, and each `{fd}` as `N`, which QEMU takes
+/// (`-chardev socket,id=fs,fd={fd}`). No socket file exists anywhere (R1). As `shards`: the
 /// client is closed first and only the end goes into the VMM, so the attachment lives exactly as long as the VMM's end,
 /// and the process its launcher started is the VMM itself. Returns only when the VMM could not run (refused, exit 4).
 /// Where vhost-user is not built (every platform but Linux), the attach is refused by kind and nothing runs.
@@ -1783,15 +1784,23 @@ pub(crate) fn run_vhost_user(request: &VhostUserRequest) -> Result<(), Failure> 
 }
 
 /// Replaces this process with `program`, the device's socket end kept at its own descriptor number and named where
-/// `{socket}` stands in `args` (`slates_ipc::stream::exec_with`); returns only the refusal of a VMM that could not run.
+/// `{socket}` or `{fd}` stands in `args` (`slates_ipc::stream::exec_with`); returns only the refusal of a VMM that could
+/// not run.
 #[cfg(unix)]
 fn exec_vmm(program: &str, args: &[String], end: slates_client::StreamEnd) -> Failure {
   use std::os::fd::AsRawFd;
   let at = end.as_raw_fd();
   let named = format!("/proc/self/fd/{at}");
+  let number = at.to_string();
   let args: Vec<OsString> = args
     .iter()
-    .map(|argument| OsString::from(argument.replace(crate::args::SOCKET_PLACEHOLDER, &named)))
+    .map(|argument| {
+      OsString::from(
+        argument
+          .replace(crate::args::SOCKET_PLACEHOLDER, &named)
+          .replace(crate::args::FD_PLACEHOLDER, &number),
+      )
+    })
     .collect();
   let error = slates_ipc::stream::exec_with(OsStr::new(program), &args, end, at);
   Failure::Failed(format!(

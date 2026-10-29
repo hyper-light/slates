@@ -685,7 +685,8 @@ mod vhost_front_end {
     Guest::over(GuestRegions::new(vec![region]).unwrap())
   }
 
-  fn region_entry() -> RegionEntry {
+  /// The guest's RAM as the memory table names it: from guest address zero, at [`USER_BASE`] in the front end.
+  pub(crate) fn region_entry() -> RegionEntry {
     RegionEntry {
       guest_phys: 0,
       size: GUEST_RAM,
@@ -731,7 +732,7 @@ mod vhost_front_end {
   }
 
   impl FrontEnd {
-    fn send(&self, request: u32, flags: u32, payload: &[u8], fds: &[BorrowedFd<'_>]) {
+    pub(crate) fn send(&self, request: u32, flags: u32, payload: &[u8], fds: &[BorrowedFd<'_>]) {
       let mut message = Vec::new();
       message.extend_from_slice(&request.to_le_bytes());
       message.extend_from_slice(&(VERSION | flags).to_le_bytes());
@@ -984,11 +985,17 @@ mod vhost_front_end {
 
   /// The memory table: one region, the guest's RAM from guest address zero.
   fn memory_table() -> Vec<u8> {
-    let entry = region_entry();
-    let mut table = 1u32.to_le_bytes().to_vec();
+    memory_table_of(&[region_entry()])
+  }
+
+  /// A memory table of `entries`, in their order (each sent with its memory object's descriptor, in the same order).
+  pub(crate) fn memory_table_of(entries: &[RegionEntry]) -> Vec<u8> {
+    let mut table = u32::try_from(entries.len()).unwrap().to_le_bytes().to_vec();
     table.extend_from_slice(&0u32.to_le_bytes());
-    for word in [entry.guest_phys, entry.size, entry.user_addr, entry.offset] {
-      table.extend_from_slice(&word.to_le_bytes());
+    for entry in entries {
+      for word in [entry.guest_phys, entry.size, entry.user_addr, entry.offset] {
+        table.extend_from_slice(&word.to_le_bytes());
+      }
     }
     table
   }
@@ -1291,12 +1298,25 @@ mod vhost_form {
   /// What the front end's back-end-request channel delivered for a SHMEM_MAP, mapped as crosvm maps it into the guest's
   /// window (here at an address the kernel chooses): shared, writable when the map asked so.
   struct WindowMap {
-    _object: std::os::fd::OwnedFd,
+    object: std::os::fd::OwnedFd,
     at: *mut std::ffi::c_void,
     len: usize,
+    /// Where the map begins in its object: the file offset of the range.
+    offset: u64,
   }
 
   impl WindowMap {
+    /// The map as a front end that puts it in its memory table names it (QEMU, A-189): at `guest_phys` in the guest,
+    /// at its own address of the map in the front end, from its offset in the object.
+    fn region_at(&self, guest_phys: u64) -> slates_bridge_virtiofs::vhost_user::RegionEntry {
+      slates_bridge_virtiofs::vhost_user::RegionEntry {
+        guest_phys,
+        size: u64::try_from(self.len).unwrap(),
+        user_addr: self.at as u64,
+        offset: self.offset,
+      }
+    }
+
     /// `len` bytes from `at`, as the guest reads its window.
     fn read(&self, at: usize, len: usize) -> Vec<u8> {
       assert!(at + len <= self.len);
@@ -1408,9 +1428,10 @@ mod vhost_form {
     )
     .unwrap();
     WindowMap {
-      _object: object,
+      object,
       at,
       len,
+      offset: fd_offset,
     }
   }
 
@@ -1580,6 +1601,152 @@ mod vhost_form {
       1,
       "the file's backing is let go when the device ends"
     );
+    drop(client);
+    drop(daemon);
+  }
+
+  /// Shape: where the test front end places the DAX window in guest-physical space: past the guest's RAM, as a PCI
+  /// BAR lies past a VM's RAM.
+  const WINDOW_GUEST_BASE: u64 = 1 << 32;
+  /// Shape: the bytes the guest writes to `copy.bin` from the window: one page, all of it the mapped file's.
+  const COPIED_BYTES: usize = 4096;
+
+  /// A-189, QEMU's form of the window (11.1): QEMU puts every shared memory section that has a descriptor in the
+  /// memory table it sends the back end (`hw/virtio/vhost.c`, `vhost_section`), so each map it places for the device
+  /// comes back as a new `SET_MEM_TABLE` under running queues, and each unmap as one without it. Its first run on CI
+  /// ended the device at the first map (`vhost_set_mem_table failed`, diagnostics run 40874255591). Do: map the file's
+  /// first range as the guest does and place the map; send the table with the map's range added (the RAM unchanged,
+  /// the range at the window's guest address and at the front end's own address of the map); as the guest, create
+  /// `copy.bin` and write to it from the window, a WRITE whose payload descriptor lies in the window's range, as a
+  /// guest's `O_DIRECT` write from a mapped file's pages is; send the table without the range, as after an unmap, and
+  /// look the file up; then send a table that moves the RAM the rings lie in.
+  ///
+  /// Expect: both tables that keep the RAM taken (ack 0) and the device serving after each; `copy.bin` holding the
+  /// window's bytes, which the device read through the range the table added; the table that moves the RAM refused,
+  /// which ends the device and its attachment.
+  #[test]
+  fn a_front_end_that_puts_each_placed_map_in_its_memory_table_keeps_its_device() {
+    use std::os::fd::AsFd;
+
+    use slates_bridge_virtiofs::memory::{GuestAddr, GuestRange};
+    use slates_bridge_virtiofs::vhost_user::{FLAG_NEED_REPLY, RegionEntry, request};
+    let (daemon, mut client) = daemon_and_client("vhost-qemu-table");
+    let volume = volume(&mut client, "dax");
+    let own = client
+      .attach(volume, None, Intent::Write)
+      .unwrap()
+      .attachment;
+    client
+      .fs_write(
+        (volume, own),
+        "/mapped.bin",
+        &vec![0x41; MAPPED_FILE_BYTES],
+        0o644,
+      )
+      .unwrap();
+    let device = client
+      .attach_vhost_user(volume, Intent::Write, ("slates", None), Some(WINDOW))
+      .unwrap();
+    let front = vhost_front_end::FrontEnd::over(device.end);
+    let ram = vhost_front_end::guest_ram(true);
+    let mut guest = vhost_front_end::guest_over(&ram);
+    let backend = front.negotiate_dax(&ram, WINDOW);
+    front.configure_queues(&guest);
+    let (_node, window) = map_the_file(&front, &mut guest, &backend);
+
+    let ram_region = vhost_front_end::region_entry();
+    let with_the_range =
+      vhost_front_end::memory_table_of(&[ram_region, window.region_at(WINDOW_GUEST_BASE)]);
+    assert_eq!(
+      front.set(
+        request::SET_MEM_TABLE,
+        &with_the_range,
+        &[ram.as_fd(), window.object.as_fd()]
+      ),
+      0,
+      "the table with the placed map's range is taken under running queues"
+    );
+    let created = through_vhost(
+      &front,
+      &mut guest,
+      &message(Opcode::Create.to_wire(), 5, 1, &create_body("copy.bin")),
+    );
+    assert_eq!(
+      reply_error(&created),
+      0,
+      "the device serves after the table"
+    );
+    let copy = u64_at(&created, OUT_HEADER_LEN);
+    let fh = u64_at(&created, OUT_HEADER_LEN + EntryOut::LEN);
+    let whole = message(
+      Opcode::Write.to_wire(),
+      6,
+      copy,
+      &write_body(fh, &[0; COPIED_BYTES]),
+    );
+    let head_bytes = &whole[..whole.len() - COPIED_BYTES];
+    let payload = GuestRange::new(
+      GuestAddr(WINDOW_GUEST_BASE),
+      u64::try_from(COPIED_BYTES).unwrap(),
+    )
+    .unwrap();
+    let head = guest.submit_with_payload_at(head_bytes, payload, common::guest::REPLY_CAP);
+    front.kick_and_wait(1);
+    let (id, len) = guest.reap().expect("the write from the window is answered");
+    assert_eq!(id, head);
+    assert_eq!(
+      reply_error(&guest.reply_of(head, len)),
+      0,
+      "the write from the window succeeds"
+    );
+    let released = through_vhost(
+      &front,
+      &mut guest,
+      &message(Opcode::Release.to_wire(), 7, copy, &release_body(fh)),
+    );
+    assert_eq!(reply_error(&released), 0);
+    assert_eq!(
+      client.read(volume, "/copy.bin", ReadAt::Head).unwrap(),
+      vec![0x41; COPIED_BYTES],
+      "copy.bin holds the window's bytes, read through the range the table added"
+    );
+
+    assert_eq!(
+      front.set(
+        request::SET_MEM_TABLE,
+        &vhost_front_end::memory_table_of(&[ram_region]),
+        &[ram.as_fd()]
+      ),
+      0,
+      "the table without the range, as after an unmap, is taken"
+    );
+    let found = through_vhost(
+      &front,
+      &mut guest,
+      &message(Opcode::Lookup.to_wire(), 8, 1, b"copy.bin\0"),
+    );
+    assert_eq!(
+      reply_error(&found),
+      0,
+      "the device serves after the range left its table"
+    );
+
+    let moved = RegionEntry {
+      guest_phys: WINDOW_GUEST_BASE,
+      ..ram_region
+    };
+    front.send(
+      request::SET_MEM_TABLE,
+      FLAG_NEED_REPLY,
+      &vhost_front_end::memory_table_of(&[moved]),
+      &[ram.as_fd()],
+    );
+    wait_for_attachments(&mut client, volume, 1);
+    drop(window);
+    drop(front);
+    drop(backend);
+    client.detach(own).unwrap();
+    wait_for_attachments(&mut client, volume, 0);
     drop(client);
     drop(daemon);
   }

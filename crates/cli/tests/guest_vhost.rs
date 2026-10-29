@@ -1,6 +1,7 @@
-//! A real VM over slates' own virtio-fs device, with DAX (§4.6; A-168, A-169; goal G-vhost). `slates vhost-user` hands
-//! crosvm the socket end of the daemon's device, which crosvm takes as `--vhost-user type=fs,socket={socket}`, and the
-//! guest, whose `/init` is `slates-guest-probe`, mounts the tag with `dax=always` and maps a file through the device's
+//! A real VM over slates' own virtio-fs device, with DAX (§4.6; A-168, A-169, A-189; goal G-vhost). `slates vhost-user`
+//! hands the VMM the socket end of the daemon's device: crosvm takes it as `--vhost-user type=fs,socket={socket}`, and
+//! QEMU 11.1 or later as `-chardev socket,id=slates,fd={fd}` under its generic vhost-user device, whose shared-memory BAR
+//! is the window. The guest, whose `/init` is `slates-guest-probe`, mounts the tag with `dax=always` and maps a file through the device's
 //! window. The window maps a copy of the file that slates keeps equal to the volume: every change by any path is written
 //! into it before the change returns, and the guest's stores reach the volume when it syncs or closes the file (A-168).
 //! The test drives the guest over its serial console ([`slates_guest_probe::protocol`]) while two other paths change
@@ -18,8 +19,9 @@
 //!   out any modified portions of the last page of an object which are beyond its end");
 //! - the session's origin untouched by any of it, and the origin's own later write never in the guest's map (A-166).
 //!
-//! Gated like `tests/guest_dax.rs`: Linux with KVM and the same three files named in the environment, or it skips
-//! loudly. The guest's initramfs is written into a slates volume through its mount, so the test writes nothing to disk
+//! Gated: Linux, with the guest's kernel and the probe named in the environment as for `tests/guest_dax.rs`, and crosvm
+//! (`SLATES_GUEST_CROSVM`, with KVM) or QEMU (`SLATES_GUEST_QEMU`, with KVM where the host has it and its own emulation
+//! where not), or it skips loudly. Every test runs once in each VMM named. The guest's initramfs is written into a slates volume through its mount, so the test writes nothing to disk
 //! but its mount points (in `CARGO_TARGET_TMPDIR`, named with the process id, removed at the end).
 #![cfg(target_os = "linux")]
 // Test harness code: an unwrap here is a failed test, which is what it should be.
@@ -80,32 +82,186 @@ const SDK_FIRST: u8 = 64;
 /// Format: see [`SEED_BYTE`].
 const MOUNT_FIRST: u8 = 128;
 
-/// The paths the test needs from the environment, or `None` after saying loudly which are missing.
+/// Format: the guest's kernel arguments after its console: the probe is `/init`, and it mounts the tag with DAX.
+const GUEST_ARGUMENTS: &str = "rdinit=/init quiet slates.dax=always";
+/// Format: a file system's virtio device id (virtio 1.2 §5.11), which QEMU's generic vhost-user device is told.
+const VIRTIO_ID_FS: u16 = 26;
+/// Shape: the queues slates' own device serves: the high-priority queue and one request queue (`docs/wip/virtiofs.md`,
+/// "request queues offered").
+const FS_QUEUES: u32 = 2;
+/// Format: the bytes of virtio-fs's configuration space, `struct virtio_fs_config`: the 36-byte tag and the request
+/// queue count (virtio 1.2 §5.11.4). QEMU's generic device forwards the guest's reads of them to the back end.
+const FS_CONFIG_BYTES: u32 = 40;
+
+/// A VMM the tests boot their guests in. Every test runs once in each VMM the environment names.
+enum Vmm {
+  /// crosvm (`SLATES_GUEST_CROSVM`). It takes the device's end as an inherited socket's path
+  /// (`--vhost-user type=fs,socket={socket}`), and ends the VM when the device hangs up, taking that for a crashed device
+  /// (`VmEventType::DeviceCrashed`, `devices/src/virtio/vhost_user_frontend/mod.rs` at 1c8d17a85).
+  Crosvm(String),
+  /// QEMU (`SLATES_GUEST_QEMU`), 11.1 or later. Its generic vhost-user device asks the back end for its shared-memory
+  /// regions (`VHOST_USER_GET_SHMEM_CONFIG`), makes them a PCI BAR, which is the guest's DAX window, and maps each
+  /// `SHMEM_MAP` into it (`hw/virtio/vhost-user-test-device-pci.c` and `hw/virtio/vhost-user.c`, both from 11.1.0;
+  /// 11.0's device has no BAR). It takes the device's end by its number (`-chardev socket,id=slates,fd={fd}`), and keeps
+  /// the VM running when the device hangs up.
+  Qemu(String),
+}
+
+impl Vmm {
+  /// Its name, in the rig's instance name and the run's record.
+  fn name(&self) -> &'static str {
+    match self {
+      Vmm::Crosvm(_) => "crosvm",
+      Vmm::Qemu(_) => "qemu",
+    }
+  }
+
+  /// The tag its own lines, its standard error, carry in a transcript.
+  fn tag(&self) -> &'static str {
+    match self {
+      Vmm::Crosvm(_) => "crosvm: ",
+      Vmm::Qemu(_) => "qemu: ",
+    }
+  }
+
+  /// Whether it ends the VM by itself once the device hangs up.
+  fn ends_the_vm_with_its_device(&self) -> bool {
+    matches!(self, Vmm::Crosvm(_))
+  }
+
+  /// Its command line for a guest of `kernel` and `initrd` over slates' own device, with the device's end where
+  /// `{socket}` or `{fd}` stands. QEMU accelerates the guest with KVM where the host has it, and otherwise emulates it.
+  fn command(&self, kernel: &str, initrd: &str) -> Vec<String> {
+    let memory = GUEST_MEMORY_MIB.to_string();
+    let cpus = GUEST_CPUS.to_string();
+    let words: Vec<String> = match self {
+      Vmm::Crosvm(crosvm) => vec![
+        crosvm.clone(),
+        "run".into(),
+        "-m".into(),
+        memory,
+        "--cpus".into(),
+        cpus,
+        "--vhost-user".into(),
+        "type=fs,socket={socket}".into(),
+        "--initrd".into(),
+        initrd.into(),
+        "-p".into(),
+        format!("console=ttyS0 {GUEST_ARGUMENTS}"),
+        "--serial".into(),
+        "type=stdout,hardware=serial,num=1,console,stdin".into(),
+        kernel.into(),
+      ],
+      Vmm::Qemu(qemu) => {
+        let (machine, console) = if cfg!(target_arch = "aarch64") {
+          (
+            "virt,memory-backend=guest-memory,gic-version=max",
+            "ttyAMA0",
+          )
+        } else {
+          ("q35,memory-backend=guest-memory", "ttyS0")
+        };
+        vec![
+          qemu.clone(),
+          "-accel".into(),
+          "kvm".into(),
+          "-accel".into(),
+          "tcg".into(),
+          "-machine".into(),
+          machine.into(),
+          "-cpu".into(),
+          "max".into(),
+          "-m".into(),
+          format!("{memory}M"),
+          "-smp".into(),
+          cpus,
+          "-object".into(),
+          format!("memory-backend-memfd,id=guest-memory,size={memory}M,share=on"),
+          "-chardev".into(),
+          "socket,id=slates,fd={fd}".into(),
+          "-device".into(),
+          format!(
+            "vhost-user-test-device-pci,chardev=slates,virtio-id={VIRTIO_ID_FS},num_vqs={FS_QUEUES},\
+             config_size={FS_CONFIG_BYTES}"
+          ),
+          "-kernel".into(),
+          kernel.into(),
+          "-initrd".into(),
+          initrd.into(),
+          "-append".into(),
+          format!("console={console} {GUEST_ARGUMENTS}"),
+          "-nodefaults".into(),
+          "-display".into(),
+          "none".into(),
+          "-serial".into(),
+          "stdio".into(),
+          "-no-reboot".into(),
+        ]
+      }
+    };
+    words
+  }
+
+  /// The first line of its version, for the run's record (`crosvm version`, `qemu-system-* --version`).
+  fn version(&self) -> String {
+    let (program, ask) = match self {
+      Vmm::Crosvm(path) => (path, "version"),
+      Vmm::Qemu(path) => (path, "--version"),
+    };
+    std::process::Command::new(program)
+      .arg(ask)
+      .output()
+      .map(|out| {
+        String::from_utf8_lossy(&out.stdout)
+          .lines()
+          .next()
+          .unwrap_or_default()
+          .to_owned()
+      })
+      .unwrap_or_else(|e| format!("{program} {ask}: {e}"))
+  }
+}
+
+/// The paths one run needs from the environment: its VMM, the guest's kernel and the probe.
 struct Gate {
-  crosvm: String,
+  vmm: Vmm,
   kernel: String,
   probe: String,
 }
 
 impl Gate {
-  fn from_env() -> Option<Gate> {
+  /// A gate for each VMM the environment names, or none after saying loudly what is missing.
+  fn each_from_env() -> Vec<Gate> {
     let named = |key: &str| std::env::var(key).ok().filter(|value| !value.is_empty());
-    match (
-      named("SLATES_GUEST_CROSVM"),
-      named("SLATES_GUEST_KERNEL"),
-      named("SLATES_GUEST_PROBE"),
-    ) {
-      (Some(crosvm), Some(kernel), Some(probe)) => Some(Gate {
-        crosvm,
-        kernel,
-        probe,
-      }),
+    let vmms: Vec<Vmm> = [
+      named("SLATES_GUEST_CROSVM").map(Vmm::Crosvm),
+      named("SLATES_GUEST_QEMU").map(Vmm::Qemu),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    match (named("SLATES_GUEST_KERNEL"), named("SLATES_GUEST_PROBE")) {
+      (Some(kernel), Some(probe)) if !vmms.is_empty() => vmms
+        .into_iter()
+        .map(|vmm| {
+          eprintln!(
+            "guest over slates' own device in {}: {}",
+            vmm.name(),
+            vmm.version()
+          );
+          Gate {
+            vmm,
+            kernel: kernel.clone(),
+            probe: probe.clone(),
+          }
+        })
+        .collect(),
       _ => {
         eprintln!(
-          "SKIP: the guest-over-slates'-own-device test needs SLATES_GUEST_CROSVM, SLATES_GUEST_KERNEL and \
-           SLATES_GUEST_PROBE (tests/guest_dax.rs says how to build the probe)"
+          "SKIP: the guest-over-slates'-own-device test needs SLATES_GUEST_CROSVM or SLATES_GUEST_QEMU (11.1 or \
+           later), SLATES_GUEST_KERNEL and SLATES_GUEST_PROBE (tests/guest_dax.rs says how to build the probe)"
         );
-        None
+        Vec::new()
       }
     }
   }
@@ -417,7 +573,7 @@ impl Rig {
   /// Starts an anchor for an instance named after `tag`, makes the origin with the file, snapshots and clones it into
   /// the session, mounts the session, and writes the initramfs: the rig and the file's first bytes.
   fn new(gate: &Gate, tag: &str) -> (Rig, Vec<u8>) {
-    let instance = format!("{tag}-{}", std::process::id());
+    let instance = format!("{tag}-{}-{}", gate.vmm.name(), std::process::id());
     let anchor = start_anchor(&instance);
     let first = FIRST_PAGES
       .checked_mul(page())
@@ -480,11 +636,9 @@ impl Rig {
     (rig, seed)
   }
 
-  /// Boots a guest whose virtio-fs device is slates' own, through `slates vhost-user` with a DAX window, and holds that
-  /// it mounted the tag with `dax=always`, which a kernel refuses on a device with no window.
+  /// Boots a guest whose virtio-fs device is slates' own, through `slates vhost-user` with a DAX window, in the gate's
+  /// VMM, and holds that it mounted the tag with `dax=always`, which a kernel refuses on a device with no window.
   fn boot(&self, gate: &Gate) -> Guest {
-    let memory = GUEST_MEMORY_MIB.to_string();
-    let cpus = GUEST_CPUS.to_string();
     let mut vmm = vm::slates();
     vmm.args([
       "--instance",
@@ -494,28 +648,15 @@ impl Rig {
       "--dax-window",
       WINDOW,
       "--",
-      &gate.crosvm,
-      "run",
-      "-m",
-      &memory,
-      "--cpus",
-      &cpus,
-      "--vhost-user",
-      "type=fs,socket={socket}",
-      "--initrd",
-      &self.initrd,
-      "-p",
-      "console=ttyS0 rdinit=/init quiet slates.dax=always",
-      "--serial",
-      "type=stdout,hardware=serial,num=1,console,stdin",
-      &gate.kernel,
     ]);
-    let (guest, first) = Guest::start(&mut vmm, "crosvm: ", ix(self.map_len));
+    vmm.args(gate.vmm.command(&gate.kernel, &self.initrd));
+    let (guest, first) = Guest::start(&mut vmm, gate.vmm.tag(), ix(self.map_len));
     assert_eq!(
       first,
       Reply::Ready,
-      "the guest mounts the tag of slates' own device with dax=always, which a kernel refuses without the device's \
-       DAX window\n{}",
+      "the guest in {} mounts the tag of slates' own device with dax=always, which a kernel refuses without the \
+       device's DAX window\n{}",
+      gate.vmm.name(),
       guest.transcript()
     );
     guest
@@ -591,7 +732,7 @@ fn vm_end(guest: &mut Guest) -> std::process::ExitStatus {
   status
 }
 
-/// §4.6 (A-168, A-169) through a real guest. Do: boot crosvm with slates' own device through `slates vhost-user` and
+/// §4.6 (A-168, A-169) through a real guest. Do: boot a VM with slates' own device through `slates vhost-user` and
 /// map the session's file; then, reading the guest's map as memory alone right after each writer is answered, write
 /// through a `slates mount` of the session across a page; replace the file through the SDK; grow the file within its
 /// last page; cut it two pages short; grow it past its first last page, leaving a hole, and map it again; and replace
@@ -601,15 +742,19 @@ fn vm_end(guest: &mut Guest) -> std::process::ExitStatus {
 /// the guest's: the growth past the end the guest knows; zeros over the cut, where a guest of the mount route's window
 /// hangs (GAPS, "a stated limit of DAX under KVM"); the grown file and its hole once mapped again; the origin's write
 /// nowhere in it (A-166). The session and the origin each read through slates as written, and the device's counter
-/// shows the map it sent crosvm.
+/// shows the map it sent the VMM.
 #[test]
 fn a_guest_maps_a_session_file_through_slates_own_device_with_dax_and_sees_each_change_as_its_writer_is_answered()
  {
-  let Some(gate) = Gate::from_env() else {
-    return;
-  };
-  let (mut rig, seed) = Rig::new(&gate, "vhost-see");
-  let mut guest = rig.boot(&gate);
+  for gate in Gate::each_from_env() {
+    sees_each_change(&gate);
+  }
+}
+
+/// [`a_guest_maps_a_session_file_through_slates_own_device_with_dax_and_sees_each_change_as_its_writer_is_answered`] in the VMM `gate` names.
+fn sees_each_change(gate: &Gate) {
+  let (mut rig, seed) = Rig::new(gate, "vhost-see");
+  let mut guest = rig.boot(gate);
   let mut model = Model::new(seed.clone(), rig.map_len);
   let page = page();
   map(&mut guest, &mut model);
@@ -695,7 +840,7 @@ fn a_guest_maps_a_session_file_through_slates_own_device_with_dax_and_sees_each_
   );
   assert!(
     counter(&rig.instance, backed::MAPS_SENT) >= 1,
-    "non-vacuous: the device sent crosvm a map of the file's backing"
+    "non-vacuous: the device sent the VMM a map of the file's backing"
   );
   print_device_counters(&rig.instance, "sees each change");
   let status = guest.quit();
@@ -718,11 +863,15 @@ fn a_guest_maps_a_session_file_through_slates_own_device_with_dax_and_sees_each_
 /// backing let go when the device ended.
 #[test]
 fn a_guests_stores_reach_the_session_when_it_syncs_or_closes_and_never_past_the_files_end() {
-  let Some(gate) = Gate::from_env() else {
-    return;
-  };
-  let (rig, seed) = Rig::new(&gate, "vhost-store");
-  let mut guest = rig.boot(&gate);
+  for gate in Gate::each_from_env() {
+    stores_reach_the_session(&gate);
+  }
+}
+
+/// [`a_guests_stores_reach_the_session_when_it_syncs_or_closes_and_never_past_the_files_end`] in the VMM `gate` names.
+fn stores_reach_the_session(gate: &Gate) {
+  let (rig, seed) = Rig::new(gate, "vhost-store");
+  let mut guest = rig.boot(gate);
   let mut model = Model::new(seed.clone(), rig.map_len);
   let page = page();
   map(&mut guest, &mut model);
@@ -1006,11 +1155,15 @@ impl History<'_> {
 #[test]
 fn a_guest_holds_every_change_of_a_session_file_over_generated_histories_through_slates_own_device()
 {
-  let Some(gate) = Gate::from_env() else {
-    return;
-  };
-  let (mut rig, seed) = Rig::new(&gate, "vhost-history");
-  let mut guest = rig.boot(&gate);
+  for gate in Gate::each_from_env() {
+    holds_every_change_over_histories(&gate);
+  }
+}
+
+/// [`a_guest_holds_every_change_of_a_session_file_over_generated_histories_through_slates_own_device`] in the VMM `gate` names.
+fn holds_every_change_over_histories(gate: &Gate) {
+  let (mut rig, seed) = Rig::new(gate, "vhost-history");
+  let mut guest = rig.boot(gate);
   let mut model = Model::new(seed.clone(), rig.map_len);
   map(&mut guest, &mut model);
   let mut tallies = Vec::new();
@@ -1092,7 +1245,7 @@ fn store(guest: &mut Guest, model: &mut Model, (at, len): (u64, u64), value: u8)
 }
 
 /// §4.6 (A-168) when the VM dies. Do: map the session's file and read it; store into it through the map and `msync`;
-/// store over three more spans without syncing, and over one past the file's end on its last page; kill crosvm and its
+/// store over three more spans without syncing, and over one past the file's end on its last page; kill the VMM and its
 /// device processes without warning, and at once write through the session's mount over part of an unsynced span,
 /// racing the device's end. Then boot a second guest on the session and map the file.
 ///
@@ -1101,11 +1254,15 @@ fn store(guest: &mut Guest, model: &mut Model, (at, len): (u64, u64), value: u8)
 /// the second guest's map holds the same. The device counts runs ingested at its end.
 #[test]
 fn a_vm_killed_with_unsynced_stores_leaves_them_in_the_session_through_its_devices_end() {
-  let Some(gate) = Gate::from_env() else {
-    return;
-  };
-  let (rig, seed) = Rig::new(&gate, "vhost-vmkill");
-  let mut guest = rig.boot(&gate);
+  for gate in Gate::each_from_env() {
+    a_vm_killed(&gate);
+  }
+}
+
+/// [`a_vm_killed_with_unsynced_stores_leaves_them_in_the_session_through_its_devices_end`] in the VMM `gate` names.
+fn a_vm_killed(gate: &Gate) {
+  let (rig, seed) = Rig::new(gate, "vhost-vmkill");
+  let mut guest = rig.boot(gate);
   let mut model = Model::new(seed, rig.map_len);
   let page = page();
   map(&mut guest, &mut model);
@@ -1147,7 +1304,7 @@ fn a_vm_killed_with_unsynced_stores_leaves_them_in_the_session_through_its_devic
     counter(&rig.instance, backed::INGESTED) > ingested_before,
     "non-vacuous: the device's end ingested the dead guest's stores"
   );
-  let mut second = rig.boot(&gate);
+  let mut second = rig.boot(gate);
   let mut fresh = Model::new(model.file.clone(), rig.map_len);
   map(&mut second, &mut fresh);
   map_holds(
@@ -1170,18 +1327,22 @@ fn a_vm_killed_with_unsynced_stores_leaves_them_in_the_session_through_its_devic
 /// syncing; kill the daemon with `SIGKILL` and wait for the anchor's successor; then write through the session's mount,
 /// which the successor takes over (A-61), and boot a second guest on the session through the successor.
 ///
-/// Expect: the VM ends by itself once its device's socket closes, as crosvm takes a vhost-user back end's hangup for a
-/// crashed device (`VmEventType::DeviceCrashed`, `devices/src/virtio/vhost_user_frontend/mod.rs` at 1c8d17a85); the
-/// session holds every byte the guest synced and every acknowledged write, and not the store the guest never synced,
+/// Expect: under crosvm the VM ends by itself once its device's socket closes, as crosvm takes a vhost-user back end's
+/// hangup for a crashed device (`VmEventType::DeviceCrashed`, `devices/src/virtio/vhost_user_frontend/mod.rs` at
+/// 1c8d17a85); QEMU keeps the VM, and the test kills it. In either, the session holds every byte the guest synced and every acknowledged write, and not the store the guest never synced,
 /// which died with the daemon; recovery removed the device's record, so `detach` of its attachment is refused
 /// `NotFound`; and the second guest's map holds the session, the write after the takeover included.
 #[test]
 fn a_daemon_killed_under_a_guests_live_map_ends_its_device_and_loses_nothing_the_guest_synced() {
-  let Some(gate) = Gate::from_env() else {
-    return;
-  };
-  let (mut rig, seed) = Rig::new(&gate, "vhost-dkill");
-  let mut guest = rig.boot(&gate);
+  for gate in Gate::each_from_env() {
+    a_daemon_killed(&gate);
+  }
+}
+
+/// [`a_daemon_killed_under_a_guests_live_map_ends_its_device_and_loses_nothing_the_guest_synced`] in the VMM `gate` names.
+fn a_daemon_killed(gate: &Gate) {
+  let (mut rig, seed) = Rig::new(gate, "vhost-dkill");
+  let mut guest = rig.boot(gate);
   let attachment = device_attachment(&guest);
   let mut model = Model::new(seed, rig.map_len);
   let page = page();
@@ -1213,16 +1374,22 @@ fn a_daemon_killed_under_a_guests_live_map_ends_its_device_and_loses_nothing_the
 
   let (old, new) = kill_the_daemon(&rig.anchor, &rig.instance);
   assert_ne!(old, new, "the anchor's successor is a new daemon");
-  let status = vm_end(&mut guest);
+  let ending = if gate.vmm.ends_the_vm_with_its_device() {
+    format!("the VM ended by itself, {}", vm_end(&mut guest))
+  } else {
+    // QEMU keeps a VM whose vhost-user device hung up, so the test ends it; what the guest synced is all it asks.
+    guest.kill();
+    "the VMM keeps a VM whose device hung up, so the test killed it".to_owned()
+  };
   let transcript = guest.transcript();
-  let crosvm_said: Vec<&str> = transcript
+  let vmm_said: Vec<&str> = transcript
     .lines()
-    .filter(|line| line.starts_with("crosvm: "))
+    .filter(|line| line.starts_with(gate.vmm.tag()))
     .collect();
   eprintln!(
-    "daemon {old} killed under the live map, successor {new}: the VM ended by itself, {status}; crosvm's last \
-     words:\n{}",
-    crosvm_said.join("\n")
+    "daemon {old} killed under the live map, successor {new}: {ending}; {}'s last words:\n{}",
+    gate.vmm.name(),
+    vmm_said.join("\n")
   );
   rig.volume_holds(
     &rig.session,
@@ -1240,7 +1407,7 @@ fn a_daemon_killed_under_a_guests_live_map_ends_its_device_and_loses_nothing_the
   let later = vec![MOUNT_FIRST + 1; 700];
   write_at(&rig.mounted_file(), page / 3, &later);
   after.write(page / 3, &later);
-  let mut second = rig.boot(&gate);
+  let mut second = rig.boot(gate);
   map(&mut second, &mut after);
   map_holds(
     &mut second,
