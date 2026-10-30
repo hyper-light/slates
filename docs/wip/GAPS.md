@@ -11360,8 +11360,9 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       matrix's "impossible" there was wrong; the x86_64 gate is in crosvm's own fs device), and its `--pmem` serves the
       image form with no gate either. It needs crosvm built for arm64 on an arm64 host with KVM: the nested
       virtualization VM on this Mac, whose initramfs is built with Docker (`vz-l1`), off since Ada quit it;
-    - Cloud Hypervisor by the image form: its virtio-pmem is always built in (`docs/device_model.md`); it needs the
-      Cloud Hypervisor binary, new tooling in CI or on the box.
+    - Cloud Hypervisor by the image form: **proven on x86_64, 2026-10-30** (Ada's go for its binary on the box):
+      `guest_image.rs` 4 of 4 in v54.0 on adacachy, red-checked with `dax=never`; arm64 owed, as crosvm's is (the
+      nested host's initramfs needs Docker).
   - **Stays out, each on its source:** a file tree in QEMU by its own device (vhost-user-fs-pci has no window, and
     virtiofsd no DAX in any release: its merge request !318 is open since 2026-06-03), so QEMU's mount route is the
     image form; QEMU's mount route on arm64, Apple silicon's included (no virtio-pmem); Kata on QEMU (it asks
@@ -11852,7 +11853,8 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       drives that device. **Corrected 2026-10-29 (A-189):** this line ruled out QEMU on both routes. QEMU 11.1's
       generic vhost-user device serves slates' own device (proven on x86_64 and arm64), and QEMU's virtio-pmem serves
       the image form on x86_64 (proven), the A-189 entry;
-    - Cloud Hypervisor: "it is not available";
+    - Cloud Hypervisor by its fs device: "it is not available" (its mount route is the image form, proven on x86_64
+      2026-10-30, the A-189 entry);
     - crosvm on arm64 by the mount route: its own fs device's DAX is x86_64-only. **Corrected 2026-10-29 (A-189):** the
       socket route there is owed, not ruled out (its vhost-user front end has no such gate);
     - Docker Desktop on macOS, and Apple's framework: measured 2026-10-27, the framework's virtio-fs device has no cache

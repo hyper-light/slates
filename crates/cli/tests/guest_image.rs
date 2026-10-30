@@ -17,6 +17,9 @@
 //! as a virtio-blk drive, and with `-no-reboot` takes the guest's restart as its clean exit. QEMU's own virtio-fs device
 //! has no window and virtiofsd has no DAX, so this is QEMU's mount route, as it is Firecracker's.
 //! QEMU builds virtio-pmem for x86 machines only, so on arm64 its pmem tests skip loudly and its drive test runs.
+//! **Cloud Hypervisor (A-189)** likewise: its virtio-pmem device maps the image file shared (`--pmem
+//! file=…,discard_writes=off`), and its guest powers off at the end, since it reboots a guest that restarts. Its own
+//! virtio-fs device has no DAX ("it is not available in Cloud Hypervisor", its `docs/fs.md`).
 //!
 //! Gated. It needs Linux and three files named in the environment for each VMM it runs; without them it skips loudly:
 //! - `SLATES_GUEST_FIRECRACKER`: a Firecracker binary, v1.17.0 or later (the release binary, its checksum verified
@@ -29,6 +32,8 @@
 //! - `SLATES_GUEST_QEMU` and `SLATES_GUEST_KERNEL`, in place of or beside the two above: a QEMU binary and the kernel
 //!   its `-kernel` boots (a distribution's `vmlinuz` serves). It runs with KVM where the host has it and with its own
 //!   emulation where not.
+//! - `SLATES_GUEST_CLOUD_HYPERVISOR`, with `SLATES_GUEST_VMLINUX`: a Cloud Hypervisor binary (the release's static one,
+//!   its digest checked), booting the kernel by its PVH entry.
 //! - `SLATES_GUEST_PROBE`: the guest's `/init`, static (`tests/guest_dax.rs` says how to build it).
 //!
 //! The pmem test also needs `SLATES_GUEST_MODULES`, the guest kernel's module directory (`/lib/modules/<release>` of the
@@ -114,6 +119,10 @@ enum Vmm {
   /// QEMU (`SLATES_GUEST_QEMU`, booting `SLATES_GUEST_KERNEL`): it attaches the image as its command line says, and
   /// with `-no-reboot` ends the VM cleanly at the guest's restart.
   Qemu { binary: String, kernel: String },
+  /// Cloud Hypervisor (`SLATES_GUEST_CLOUD_HYPERVISOR`, booting the uncompressed kernel `SLATES_GUEST_VMLINUX` by its
+  /// PVH entry): it attaches the image as its command line says, a virtio-pmem device "bypassing the guest page cache"
+  /// (its `docs/device_model.md`) or a virtio-blk disk. It reboots a guest that restarts, so its guest powers off.
+  CloudHypervisor { binary: String, vmlinux: String },
 }
 
 impl Vmm {
@@ -122,6 +131,7 @@ impl Vmm {
     match self {
       Vmm::Firecracker { .. } => "firecracker",
       Vmm::Qemu { .. } => "qemu",
+      Vmm::CloudHypervisor { .. } => "cloud-hypervisor",
     }
   }
 
@@ -130,6 +140,7 @@ impl Vmm {
     match self {
       Vmm::Firecracker { .. } => "firecracker: ",
       Vmm::Qemu { .. } => "qemu: ",
+      Vmm::CloudHypervisor { .. } => "cloud-hypervisor: ",
     }
   }
 }
@@ -153,6 +164,9 @@ impl Gate {
       named("SLATES_GUEST_QEMU")
         .zip(named("SLATES_GUEST_KERNEL"))
         .map(|(binary, kernel)| Vmm::Qemu { binary, kernel }),
+      named("SLATES_GUEST_CLOUD_HYPERVISOR")
+        .zip(named("SLATES_GUEST_VMLINUX"))
+        .map(|(binary, vmlinux)| Vmm::CloudHypervisor { binary, vmlinux }),
     ]
     .into_iter()
     .flatten()
@@ -168,8 +182,9 @@ impl Gate {
         .collect(),
       _ => {
         eprintln!(
-          "SKIP: the image test needs SLATES_GUEST_FIRECRACKER and SLATES_GUEST_VMLINUX, or SLATES_GUEST_QEMU and \
-           SLATES_GUEST_KERNEL, and SLATES_GUEST_PROBE (tests/guest_image.rs says what each is)"
+          "SKIP: the image test needs SLATES_GUEST_FIRECRACKER and SLATES_GUEST_VMLINUX, SLATES_GUEST_QEMU and \
+           SLATES_GUEST_KERNEL, or SLATES_GUEST_CLOUD_HYPERVISOR and SLATES_GUEST_VMLINUX, and SLATES_GUEST_PROBE \
+           (tests/guest_image.rs says what each is)"
         );
         Vec::new()
       }
@@ -410,6 +425,18 @@ impl Disk {
     }
   }
 
+  /// Cloud Hypervisor's arguments for the image at `image`: a disk it writes through its own cache, its flushes reaching
+  /// the file; or the file mapped shared as a virtio-pmem device's memory, every write kept (`discard_writes=off`).
+  fn cloud_hypervisor_device(&self, image: &str) -> Vec<String> {
+    match self {
+      Disk::Drive { .. } => vec!["--disk".to_owned(), format!("path={image},image_type=raw")],
+      Disk::Pmem { .. } => vec![
+        "--pmem".to_owned(),
+        format!("file={image},discard_writes=off"),
+      ],
+    }
+  }
+
   /// What the guest's command line tells its probe to load and mount.
   fn guest_options(&self) -> String {
     match self {
@@ -505,6 +532,43 @@ fn qemu_arguments(
     "-no-reboot".to_owned(),
   ];
   arguments.extend(disk.qemu_device(image, len));
+  arguments
+}
+
+/// Cloud Hypervisor's command line: the kernel by its PVH entry, the initramfs, the image as `disk` presents it, a small
+/// machine, and the serial console on its standard streams. Its guest ends the VM by powering off, since Cloud
+/// Hypervisor reboots a guest that restarts.
+fn cloud_hypervisor_arguments(
+  vmlinux: &str,
+  initrd: &str,
+  image: &str,
+  disk: &Disk,
+) -> Vec<String> {
+  let console = if cfg!(target_arch = "aarch64") {
+    "ttyAMA0"
+  } else {
+    "ttyS0"
+  };
+  let mut arguments = vec![
+    "--kernel".to_owned(),
+    vmlinux.to_owned(),
+    "--initramfs".to_owned(),
+    initrd.to_owned(),
+    "--cmdline".to_owned(),
+    format!(
+      "console={console} panic=1 rdinit=/init quiet {}",
+      disk.guest_options()
+    ),
+    "--cpus".to_owned(),
+    format!("boot={GUEST_CPUS}"),
+    "--memory".to_owned(),
+    format!("size={GUEST_MEMORY_MIB}M"),
+    "--serial".to_owned(),
+    "tty".to_owned(),
+    "--console".to_owned(),
+    "off".to_owned(),
+  ];
+  arguments.extend(disk.cloud_hypervisor_device(image));
   arguments
 }
 
@@ -646,7 +710,8 @@ fn modules_needed(directory: &str, wanted: &[&str]) -> Vec<Module> {
 /// `native_machine_emergency_restart`). Firecracker stops the vCPU from its main thread; when that thread is later than
 /// the millisecond, the vCPU meets the fallback first, a KVM shutdown exit Firecracker leaves unhandled and exits 1 for.
 /// Measured on the box at load 46-53 (2026-10-24): 1 run of 18. Either way the guest ended the VM by its own restart,
-/// after its flush; the merge that follows holds the bytes to it.
+/// after its flush; the merge that follows holds the bytes to it. QEMU (`-no-reboot`) exits 0 at the restart, and a
+/// Cloud Hypervisor guest powers off instead, which ends it with 0.
 fn the_guest_ends_the_vm_by_its_restart(guest: &mut Guest) {
   let status = guest.quit();
   if !status.success() {
@@ -897,6 +962,11 @@ impl Rig {
           MOST_BYTES,
         )
       }
+      Vmm::CloudHypervisor { binary, vmlinux } => Guest::spawn_on_terminal(
+        Command::new(binary).args(cloud_hypervisor_arguments(vmlinux, &initrd, &image, disk)),
+        gate.vmm.tag(),
+        MOST_BYTES,
+      ),
     };
     eprintln!(
       "{} booted the guest to its probe's ready in {} ms",

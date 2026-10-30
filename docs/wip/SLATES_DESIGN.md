@@ -3121,7 +3121,8 @@ daemon through the rendezvous's socket file (A-187).
 >   route.
 > - **Ruled out by the platforms:** QEMU's vhost-user-fs device and virtiofsd have no window, so QEMU shares no file tree
 >   with DAX by its own device, its mount route is the image form, x86_64 only (it builds virtio-pmem for x86 machines
->   alone), and Kata, which drives that device, has neither route; Cloud Hypervisor has none; crosvm's own fs device is x86_64-only;
+>   alone), and Kata, which drives that device, has neither route; Cloud Hypervisor's fs device has none (its mount
+>   route is the image form, proven on x86_64 2026-10-30); crosvm's own fs device is x86_64-only;
 >   Apple's Virtualization framework's virtio-fs device and WSL2's 9P have none (both measured 2026-10-27).
 >   **Corrected 2026-10-29 (A-189):** this line ruled QEMU out on both routes and crosvm on arm64 on both. QEMU 11.1's
 >   generic vhost-user device maps slates' own device's window, and crosvm's vhost-user front end has no architecture
@@ -12552,6 +12553,12 @@ trixie-backports, fuse3), `.github/workflows/ci.yml` (the live-guest lane's QEMU
   job 123482449569), red-checked with the guest mounting `dax=never`, the three pmem tests failing at their DAX check
   (job 123482450208); on arm64 the same QEMU has no `virtio-pmem-pci` (job 123482450147), and the drive form passed
   there. The Firecracker leg of the same test, after its refactor into one leg per VMM, 4 of 4 on adacachy.
+- **Cloud Hypervisor's mount route is the image form too** (2026-10-30, Ada's go for its binary on the box): its
+  virtio-pmem device (`--pmem file=…,discard_writes=off`) maps the image file shared, and the same test passes 4 of 4 in
+  Cloud Hypervisor v54.0 on adacachy, red-checked with `dax=never`. Its `--serial tty` reads input only from an
+  interactive terminal (`vmm/src/serial_manager.rs`), so the harness gives it a pseudo-terminal
+  (`Guest::spawn_on_terminal`); its disks need `image_type=raw`; and its guest powers off, since it reboots a guest
+  that restarts. Its fs device has no DAX, so slates' own device gets no window there.
 
 ### A-188 — A client of any shard is handed a direct map: the copy held on its volume's shard, the hand-off through the client's own (accepted and built 2026-10-29)
 Applied in the same change to: §4.6 (the same-kernel direct map paragraph), A-186 (its owed item), GAPS,

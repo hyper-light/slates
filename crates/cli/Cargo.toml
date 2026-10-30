@@ -65,6 +65,9 @@ rcgen = { workspace = true }
 rustls = { workspace = true }
 # The line protocol the guest's /init speaks, for the guest-over-the-mount test (`tests/guest_dax.rs`).
 slates-guest-probe = { workspace = true }
+# A pseudo-terminal for a VMM that reads its serial console only from an interactive terminal (Cloud Hypervisor's
+# `--serial tty`; `tests/vm/mod.rs`, `Guest::start_on_terminal`).
+rustix = { workspace = true, features = ["pty"] }
 
 [lints]
 workspace = true

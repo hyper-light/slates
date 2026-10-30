@@ -9,7 +9,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::CommandExt;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -314,7 +314,8 @@ fn pad_to_four(archive: &mut Vec<u8>) {
 /// told to quit and, if it has not gone within [`QUIT_WAIT`], killed with its whole process group.
 pub(crate) struct Guest {
   pub(crate) vm: Child,
-  console: ChildStdin,
+  /// Where commands go: the VMM's standard input, or the controlling end of its terminal.
+  console: Box<dyn Write + Send>,
   lines: Receiver<String>,
   readers: Vec<JoinHandle<()>>,
   transcript: std::collections::VecDeque<String>,
@@ -374,7 +375,7 @@ impl Guest {
       forward_lines(vm.stderr.take().unwrap(), what, sender),
     ];
     let mut guest = Guest {
-      console: vm.stdin.take().unwrap(),
+      console: Box::new(vm.stdin.take().unwrap()),
       vm,
       lines,
       readers,
@@ -383,6 +384,58 @@ impl Guest {
     };
     let first = guest.next_reply(BOOT_WAIT);
     (guest, first)
+  }
+
+  /// Starts the VM as [`Guest::spawn`] does, its serial console on a pseudo-terminal rather than pipes, for a VMM that
+  /// reads its console only from an interactive terminal: Cloud Hypervisor's `--serial tty` takes input "if running on
+  /// an interactive TTY" alone (`vmm/src/serial_manager.rs`, v54.0). The VMM gets the terminal as its standard input and
+  /// output; the harness reads and writes the terminal's other end, as it does the pipes.
+  pub(crate) fn spawn_on_terminal(
+    vmm: &mut Command,
+    what: &'static str,
+    most_bytes: usize,
+  ) -> Guest {
+    use rustix::fs::{Mode, OFlags};
+    use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+    let controller =
+      openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC).unwrap();
+    grantpt(&controller).unwrap();
+    unlockpt(&controller).unwrap();
+    let name = ptsname(&controller, Vec::new()).unwrap();
+    let terminal = rustix::fs::open(
+      name.as_c_str(),
+      OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
+      Mode::empty(),
+    )
+    .unwrap();
+    let output = terminal.try_clone().unwrap();
+    let mut vm = vmm
+      .stdin(Stdio::from(terminal))
+      .stdout(Stdio::from(output))
+      .stderr(Stdio::piped())
+      .process_group(0)
+      .spawn()
+      .unwrap_or_else(|e| panic!("start {what}: {e}"));
+    // The command still holds its copies of the terminal; dropped, the VMM's exit closes the terminal and ends the
+    // reader, as a closed pipe does.
+    vmm.stdin(Stdio::null()).stdout(Stdio::null());
+    let reader = std::fs::File::from(controller.try_clone().unwrap());
+    let (sender, lines) = channel();
+    let readers = vec![
+      forward_lines(reader, "", sender.clone()),
+      forward_lines(vm.stderr.take().unwrap(), what, sender),
+    ];
+    let mut guest = Guest {
+      console: Box::new(std::fs::File::from(controller)),
+      vm,
+      lines,
+      readers,
+      transcript: std::collections::VecDeque::new(),
+      most_bytes,
+    };
+    let first = guest.next_reply(BOOT_WAIT);
+    assert_eq!(first, Reply::Ready, "{}", guest.transcript());
+    guest
   }
 
   fn keep(&mut self, line: String) {
