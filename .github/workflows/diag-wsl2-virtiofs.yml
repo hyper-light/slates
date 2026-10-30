@@ -1,0 +1,45 @@
+name: DIAG WSL2 virtio-fs file sharing and DAX (not for main)
+
+# A diagnostics branch, never merged. WSL2 now shares Windows' drives over virtio-fs when `.wslconfig` asks
+# (`[wsl2] virtiofs=true`); the DAX matrix's WSL2 row measured only the default 9P (diagnostics run 40585743122).
+# This turns virtio-fs on, boots a distribution, and reads how the guest mounts the drive, what the kernel says of a
+# DAX cache window, and whether a virtio-fs mount with dax=always is accepted.
+
+on:
+  push:
+    branches: [diag-wsl2-virtiofs]
+
+jobs:
+  wsl2:
+    name: WSL2 virtio-fs on windows-2025
+    runs-on: windows-2025
+    timeout-minutes: 40
+    steps:
+      - name: WSL as installed
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          wsl --version
+          wsl --status
+      - name: Ask for virtio-fs
+        shell: pwsh
+        run: |
+          "[wsl2]`nvirtiofs=true" | Out-File -FilePath "$env:USERPROFILE\.wslconfig" -Encoding ascii
+          Get-Content "$env:USERPROFILE\.wslconfig"
+          wsl --shutdown
+      - name: A distribution, without a user
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          wsl --install --no-launch --distribution Ubuntu-24.04 --web-download
+          wsl --list --verbose
+      - name: How the guest sees Windows' drive, and DAX
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          wsl --distribution Ubuntu-24.04 --user root -- sh -c "uname -a; echo '--- mounts'; grep -E ' /mnt/c | 9p | virtiofs | drvfs ' /proc/mounts; echo '--- filesystems'; grep -i -E 'virtiofs|9p|fuse' /proc/filesystems; echo '--- kernel'; dmesg | grep -i -E 'virtio_fs|virtiofs|dax|cache cap|9p' | head -40; echo '--- virtio devices'; for d in /sys/bus/virtio/devices/*; do echo \"`$d `$(cat `$d/device) `$(cat `$d/driver/module 2>/dev/null | head -c 0)`$(basename `$(readlink `$d/driver) 2>/dev/null)\"; done; echo '--- config'; zcat /proc/config.gz 2>/dev/null | grep -E 'CONFIG_FUSE_DAX|CONFIG_VIRTIO_FS|CONFIG_FS_DAX' "
+      - name: A virtio-fs mount with dax=always
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          wsl --distribution Ubuntu-24.04 --user root -- sh -c "tag=`$(awk '`$3==\"virtiofs\"{print `$1; exit}' /proc/mounts); echo tag=`$tag; mkdir -p /mnt/daxtest; if [ -n \"`$tag\" ]; then mount -t virtiofs \"`$tag\" /mnt/daxtest -o dax=always; echo mount-exit=`$?; grep daxtest /proc/mounts; dmesg | tail -5; else echo 'no virtiofs mount found'; fi"
