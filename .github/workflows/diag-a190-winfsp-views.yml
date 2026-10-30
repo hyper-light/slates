@@ -1,0 +1,96 @@
+name: DIAG a mapped view through the WinFsp mount follows another path's change (not for main)
+
+# A-190: after each notification round the mount writes each changed range through the drive unbuffered, which makes
+# WinFsp purge with CcCoherencyFlushAndPurgeCache (documented to invalidate user mapped views); the host answers the
+# write without applying it. Green on windows-latest (x86_64) and windows-11-arm; red on x86_64 with no purge planned,
+# where the view must stay stale as A-177 measured it.
+
+on:
+  push:
+    branches: [diag-a190-winfsp-views]
+
+jobs:
+  green:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-latest, nasm: true }
+          - { runner: windows-11-arm, nasm: false }
+    name: the mapped view on ${{ matrix.runner }} (green)
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        if: matrix.nasm
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Install WinFsp, and check it installed
+        shell: pwsh
+        run: |
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            choco install winfsp -y --no-progress
+            if (Test-Path "C:\Program Files (x86)\WinFsp\bin") { break }
+            Start-Sleep -Seconds 30
+          }
+          if (-not (Test-Path "C:\Program Files (x86)\WinFsp\bin")) { Write-Error "WinFsp did not install"; exit 1 }
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: The WinFsp mount through the CLI
+        shell: bash
+        env:
+          SLATES_TEST_CLI: "1"
+          WINFSP_TEST_MOUNT: "1"
+          AWS_LC_SYS_PREBUILT_NASM: ${{ matrix.nasm && '0' || '' }}
+        run: |
+          set -o pipefail
+          cargo test -p slates-cli --test winfsp -- --test-threads=1 --nocapture 2>&1 | tee winfsp.log
+          grep -E "WINFSP|test result" winfsp.log
+          grep -q "WINFSP MAPPED VIEW: followed" winfsp.log
+          grep -q "WINFSP PURGES:" winfsp.log
+
+  red:
+    name: the mapped view on windows-latest with no purge planned (red)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Install WinFsp, and check it installed
+        shell: pwsh
+        run: |
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            choco install winfsp -y --no-progress
+            if (Test-Path "C:\Program Files (x86)\WinFsp\bin") { break }
+            Start-Sleep -Seconds 30
+          }
+          if (-not (Test-Path "C:\Program Files (x86)\WinFsp\bin")) { Write-Error "WinFsp did not install"; exit 1 }
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Plan no purge
+        shell: bash
+        run: |
+          sed -i 's/let purges = purges_owed(bridge, cx, names, (&changed, overruns > 0));/let purges = Vec::new();/' crates/server/src/winfsp.rs
+          grep -c "let purges = Vec::new();" crates/server/src/winfsp.rs
+      - name: The mapped view must stay stale
+        shell: bash
+        env:
+          SLATES_TEST_CLI: "1"
+          WINFSP_TEST_MOUNT: "1"
+          AWS_LC_SYS_PREBUILT_NASM: "0"
+        run: |
+          set +e
+          cargo test -p slates-cli --test winfsp -- --test-threads=1 --nocapture \
+            a_mapped_view_through_a_winfsp_mount_after_another_paths_change > winfsp.log 2>&1
+          code=$?
+          set -e
+          grep -E "WINFSP|panicked|test result" winfsp.log
+          test "$code" -ne 0
+          grep -q "WINFSP MAPPED VIEW: stale" winfsp.log

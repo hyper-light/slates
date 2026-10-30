@@ -42,10 +42,12 @@ use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
 use slates_bridge_core::delivery::{Coherence, Delivered};
 use slates_bridge_core::volume_bridge::new_handle_store;
 use slates_bridge_core::{
-  AttachmentId, Invalidation, InvalidationCursor, Rights, View, VolumeBridge,
+  AttachmentId, Bridge, CachedBytes, Invalidation, InvalidationCursor, ObjectId, Rights, View,
+  VolumeBridge,
 };
 use slates_bridge_winfsp::host::{MountThread, Notified, Outcome, REQUEST_BOUND, Request};
 use slates_bridge_winfsp::notify::{NotifyRound, OpenNames};
+use slates_bridge_winfsp::purge::{Purge, purge_range};
 use slates_db::Op;
 use slates_db::catalog::{AttachmentRecord, VolumeId};
 use slates_ipc::protocol::{AttachmentCapability, Established, Refusal, ReplyBody};
@@ -80,6 +82,15 @@ const ROUNDS_REFUSED: &str = "winfsp.rounds_refused";
 const JOURNAL_OVERRUNS: &str = "winfsp.journal_overruns";
 /// Format: names left out of a round for being longer than any WinFsp path. Zero is the healthy reading.
 const NAMES_TOO_LONG: &str = "winfsp.names_too_long";
+/// Format: files whose changed ranges the mount thread purged from Windows' cache and every view mapped of them
+/// (`slates_bridge_winfsp::purge`, A-190): the non-vacuity counter of the view purge.
+const PURGES_DONE: &str = "winfsp.purges_done";
+/// Format: purges whose open or write was refused (a file renamed or removed since its round).
+const PURGES_REFUSED: &str = "winfsp.purges_refused";
+/// Format: purges not made because WinFsp cannot name an open's process. Zero on a current WinFsp.
+const PURGES_UNAVAILABLE: &str = "winfsp.purges_unavailable";
+/// Format: purge writes the host answered without applying them: the count that shows purges reached the host.
+const PURGE_ECHOES: &str = "winfsp.purge_echoes";
 
 /// A mounted volume being served: the channel WinFsp's dispatcher threads send on, the mount's thread, the open-handle
 /// map that persists across requests, the registry attachment its requests are admitted under, what Windows holds
@@ -227,7 +238,7 @@ async fn await_mounted(
         ));
       }
       // No round is sent before the mount is up, so none can come back.
-      Some(Outcome::Notified(_)) | None => futures::idle().await,
+      Some(Outcome::Notified(..)) | None => futures::idle().await,
     }
   }
 }
@@ -418,7 +429,7 @@ async fn reap(mut thread: MountThread) {
         thread.join();
         return;
       }
-      Some(Outcome::Mounted(_) | Outcome::Notified(_)) => {}
+      Some(Outcome::Mounted(_) | Outcome::Notified(..)) => {}
       None => futures::idle().await,
     }
   }
@@ -543,7 +554,10 @@ fn take_outcomes(s: &mut ShardState, mount: &mut WinFspMount) -> Result<bool, ()
   let mut deferred = false;
   while let Some(outcome) = mount.thread.outcome() {
     match outcome {
-      Outcome::Notified(told) => {
+      Outcome::Notified(told, purged) => {
+        s.count(PURGES_DONE, purged.done);
+        s.count(PURGES_REFUSED, purged.refused);
+        s.count(PURGES_UNAVAILABLE, purged.unavailable);
         let before = mount.round_out.take().flatten();
         match told {
           Ok(Notified::Taken) => s.count(ROUNDS_TAKEN, 1),
@@ -609,12 +623,15 @@ fn deliver_owed(
   let before = mount.coherence.cursor();
   let mut round = NotifyRound::new();
   let mut overruns = 0u64;
+  let mut changed: Vec<(u64, CachedBytes)> = Vec::new();
   let names = mount.names;
   let Ok(delivered) = mount
     .coherence
     .deliver(bridge, cx, &mut |invalidation: &Invalidation| {
-      if matches!(invalidation, Invalidation::Everything) {
-        overruns = overruns.saturating_add(1);
+      match invalidation {
+        Invalidation::Everything => overruns = overruns.saturating_add(1),
+        Invalidation::Inode { ino, data } => changed.push((*ino, *data)),
+        Invalidation::Entry { .. } => {}
       }
       round.add(invalidation, names);
       Ok::<(), std::convert::Infallible>(())
@@ -625,7 +642,8 @@ fn deliver_owed(
   *mount.owed = false;
   let too_long = round.too_long();
   if !round.is_empty() {
-    if mount.thread.notify(round.bytes().to_vec()).is_ok() {
+    let purges = purges_owed(bridge, cx, names, (&changed, overruns > 0));
+    if mount.thread.notify(round.bytes().to_vec(), purges).is_ok() {
       *mount.round_out = Some(before);
       *mount.told = mount
         .told
@@ -644,8 +662,64 @@ fn deliver_owed(
   }
 }
 
+/// The purges a round owes (`slates_bridge_winfsp::purge`, A-190): each changed inode Windows holds open, under every
+/// name it is open by, over the hull of what changed of it, widened to whole sectors and clipped to the file as it now
+/// stands. A round that found the mount behind the journal owes every open file whole. Bounded by what Windows holds
+/// open.
+fn purges_owed(
+  bridge: &mut VolumeBridge<'_>,
+  cx: &slates_bridge_core::OpContext,
+  names: &OpenNames,
+  (changed, everything): (&[(u64, CachedBytes)], bool),
+) -> Vec<Purge> {
+  let sector = slates_bridge_winfsp::host::sector_bytes();
+  let owed: Vec<(u64, CachedBytes)> = if everything {
+    names
+      .open_inodes()
+      .into_iter()
+      .map(|ino| (ino, CachedBytes::ALL))
+      .collect()
+  } else {
+    changed.to_vec()
+  };
+  let mut hulls: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+  for (ino, data) in owed {
+    if names.open_names(ino).is_empty() {
+      continue;
+    }
+    let Ok(attr) = bridge.getattr(ObjectId::new(ino, 0), cx) else {
+      continue;
+    };
+    let Some((offset, len)) = purge_range(&data, attr.size, sector) else {
+      continue;
+    };
+    let end = offset.saturating_add(len);
+    hulls
+      .entry(ino)
+      .and_modify(|(first, last)| {
+        *first = (*first).min(offset);
+        *last = (*last).max(end);
+      })
+      .or_insert((offset, end));
+  }
+  let mut purges = Vec::new();
+  for (ino, (offset, end)) in hulls {
+    for name in names.open_names(ino) {
+      purges.push(Purge {
+        path: name.to_owned(),
+        offset,
+        len: end.saturating_sub(offset),
+      });
+    }
+  }
+  purges
+}
+
 /// Publishes when the served request needs it, then sends its reply.
 fn answer(s: &mut ShardState, mount: &WinFspMount, mut served: slates_bridge_winfsp::host::Served) {
+  if served.is_purge_echo() {
+    s.count(PURGE_ECHOES, 1);
+  }
   if served.needs_barrier() {
     let captured =
       crate::verbs::publish_shard(s).is_ok_and(|published| published.captured(mount.volume));

@@ -307,6 +307,14 @@ impl Facts {
     platform::page(&mut Vec::new()).base.max(1)
   }
 
+  /// The mapping granularity in bytes (one cheap query), at least one: the base page everywhere but Windows, where views
+  /// are mapped in coarser units (64 KiB). What bounds a WinFsp purge's write (`slates-bridge-winfsp`, A-190).
+  pub fn allocation_granularity() -> u64 {
+    platform::page(&mut Vec::new())
+      .allocation_granularity
+      .max(1)
+  }
+
   /// Every fact, queried now (the boot profile's input).
   pub fn query() -> Facts {
     let mut notes = Vec::new();

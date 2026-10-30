@@ -407,7 +407,11 @@ slates-bridge-fskit = 9
 # thread and the volume by its shard, shared only over channels, R2/D-7). Raised 86 -> 104 on 2026-10-25 (G-mount
 # step 2): the library loaded at run time rather than linked, so a daemon starts on a Windows host without WinFsp
 # (the loader's five sites), and the notification round that tells Windows of another path's change (§4.6 "Windows").
-slates-bridge-winfsp = 104
+# Raised 104 -> 111 on 2026-10-30 (A-190, the mapped-view purge): `FspFileSystemOperationProcessIdF`'s export type and
+# its call inside an open (which process made it); `CreateFileW` of a changed file through the drive, unbuffered, the
+# `OwnedHandle` taking its handle, and `WriteFile` of each piece, which make WinFsp purge coherently; the write callback's
+# out-parameters for a purge's write, answered without being applied; and the cleanup's read of a purge's open-file.
+slates-bridge-winfsp = 111
 # Raised 3 -> 5 on 2026-10-19 for `udmabuf.rs` (the `UDMABUF_CREATE` ioctl and the descriptor it returns), which
 # confined a guest's DAX window to a descriptor covering only that window
 # (docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md). Lowered 5 -> 3 on 2026-10-25
