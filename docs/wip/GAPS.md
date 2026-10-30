@@ -11825,18 +11825,20 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       macOS, 3 of 3 (`dax /v/big yes`, digest whole, the new byte seen after 29.0, 26.8 and 27.0 ms). Both red-checked
       with the window off (`SHARDS-TEST FAIL /mnt/big is not DAX`; `dax /v/big no`);
     - Firecracker on Linux x86_64 by the mount route: virtio-pmem over the image file (A-165, 2026-10-24; the entry
-      below).
+      below);
+    - bare-metal Windows by the mount route, x86_64 and arm64 (A-190, 2026-10-30): a mapped view through the WinFsp
+      mount follows an SDK rewrite within one 20 ms poll, on CI's `windows-latest` and `windows-11-arm` (diagnostics
+      run 41133474977, jobs 124330034742 and 124330034878), red-checked with no purge planned (job 124330034929: the
+      view kept its first byte for 10 s). Until then it was ruled out by a run (G-mount step 2, A-177): WinFsp's
+      notification purges with `CcPurgeCacheSection`, which "will not purge mapped files" (research f8, f9, f10), and
+      the view held its first byte for 10 s on both architectures (runs 40252840969 and 40570394717). The mount now
+      writes each changed range through the drive unbuffered after a round, which makes WinFsp purge with
+      `CcCoherencyFlushAndPurgeCache`, and answers that write without applying it (the entry "A file mapped through
+      the WinFsp mount", below).
   - **Ruled out:**
-    - bare-metal Windows by the mount route, measured (G-mount step 2, A-177): a mapped view through the WinFsp mount
-      keeps its pages after another path's change, because WinFsp's notification purges with `CcPurgeCacheSection`,
-      which "will not purge mapped files" (research f8, f9, f10). CI's Windows runner, run 40252840969: the view held its first
-      byte for 10 s while a cached read through a handle, on a file nobody mapped, followed in 20.7 ms. The same on
-      arm64 (2026-10-27, `windows-11-arm`, WinFsp 2.1.25156's arm64 driver, diagnostics run 40570394717): the cached
-      read followed in 20.9 ms, the view held its first byte for 10 s; red-checked with empty notification rounds (the
-      cached read stale for 10 s). CI's `windows-arm64` lane runs the tests since;
-    - Shards on Windows by the mount route: a Shards window over a host mount maps the host file's view, and on
-      Windows the host mount is WinFsp's, whose mapped views keep their pages (the entry above, both architectures);
-      Shards also shares no host folder there, having no share server on Windows (D38);
+    - Shards on Windows by the mount route: Shards shares no host folder there, having no share server on Windows
+      (D38). (Until A-190 a WinFsp file's mapped view also kept its pages after another path's change; it follows
+      now.);
     - Shards on Windows arm64 by either route: none, the environment does not exist: Shards builds a hypervisor
       backend for Windows x86_64 only (`crates/vmm/build.rs` on its `gpu` 930a1158), and GitHub's `windows-11-arm`
       has the Windows Hypervisor Platform disabled, Hyper-V enabled (diagnostics run 40570705949, 2026-10-27);
@@ -11953,7 +11955,19 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   entered through Docker's `SandboxKey`. Owed: end the consumers and the mount (the pods, then the PersistentVolume)
   before the cluster is deleted, and fail the leg when the deletion fails.
 - **A file mapped through the WinFsp mount hides another path's change from every reader of it (A-177, 2026-10-26):
-  open.** While any process maps a file through a WinFsp mount, WinFsp's purge of its pages is refused (`CcPurgeCacheSection`
+  closed 2026-10-30 by A-190.** After each notification round Windows took, the mount's thread opens each changed file
+  Windows holds open through the drive, unbuffered, and writes the changed range from zeros: WinFsp's non-cached write
+  flushes the file's dirty pages and purges the range with `CcCoherencyFlushAndPurgeCache` (`src/sys/write.c`), which
+  invalidates user mapped views, and the host answers the write without applying it (an open this process made
+  unbuffered, named by `FspFileSystemOperationProcessIdF`; recognition fails closed, and with no such export no purge is
+  made, counted `winfsp.purges_unavailable`). CI's runners, diagnostics run 41133474977: on x86_64 and arm64 the view
+  followed an SDK rewrite within one 20 ms poll, a read through another handle in 169.5 and 169.6 µs, a fresh open
+  after the view in 493.5 and 492.6 µs (3.03 s before), the daemon counting 1 purge and 1 write answered without being
+  applied; red-checked with no purge planned, the view and a handle's read stale for 10 s (job 124330034929). Still
+  open, stated in A-190: a cut under a live view leaves the view's pages past the new end (Windows refuses to cut a
+  mapped file, and another path's cut cannot be shown to it); a program's store and another path's write to the same
+  page race, the purge's flush writing the program's page first; and a process serving a WinFsp mount must not write
+  its own mount unbuffered, since such writes are taken as purges and dropped. The record of the open entry, kept: While any process maps a file through a WinFsp mount, WinFsp's purge of its pages is refused (`CcPurgeCacheSection`
   "will not purge mapped files"), so the notification the mount sends reaches no reader. CI's Windows runner (Windows
   Server 2025, WinFsp 2.1.25156): a read through a second handle, opened while the view stood, stayed stale for 10 s
   (runs 40249524066, 40250856246, 40252840969); once the view and every handle were closed, a fresh open read the change after

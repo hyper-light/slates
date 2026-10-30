@@ -464,21 +464,38 @@ impl Drop for MappedView {
 }
 
 /// What a mapped view through the WinFsp mount does after another path's change, as the DAX matrix's Windows
-/// mount-route cell records it (`docs/wip/virtiofs.md` §8): it stays stale. WinFsp's notification purges with
+/// mount-route cell records it (`docs/wip/virtiofs.md` §8): it follows (A-190). WinFsp's notification purges with
 /// `CcPurgeCacheSection` (`src/sys/file.c`), which "will not purge mapped files" (Microsoft Learn,
-/// `CcPurgeCacheSection`); only `CcCoherencyFlushAndPurgeCache` invalidates user-mapped views. Decided by CI's Windows
-/// runner, run 40249524066 (Windows Server 2025, WinFsp 2.1.25156, 2026-10-26): the view kept its first byte for 10 s,
-/// and so did a read through another handle while the view stood, since the refused purge leaves the whole file's
-/// pages in Windows' cache.
-const MAPPED_VIEW_FOLLOWS: bool = false;
+/// `CcPurgeCacheSection`), and the view had kept its first byte for 10 s on CI's Windows runner (run 40249524066,
+/// Windows Server 2025, WinFsp 2.1.25156, 2026-10-26; A-177). Since A-190 the mount writes each changed range through
+/// the drive unbuffered after the round, which makes WinFsp purge with `CcCoherencyFlushAndPurgeCache` (`src/sys/write.c`),
+/// documented to invalidate user mapped views, and drops the write itself (`slates_bridge_winfsp::purge`).
+const MAPPED_VIEW_FOLLOWS: bool = true;
 
-/// §4.6 "Windows", the DAX matrix's Windows mount-route cell, G-mount step 2. Do: map `file.bin` read-only through the
-/// drive and read the view, then rewrite the file in place through the SDK, and watch the view as memory alone for
+/// Format: the daemon's counter of files the mount purged from Windows' cache and its views (A-190).
+const PURGES_DONE: &str = "winfsp.purges_done";
+/// Format: the daemon's counter of purge writes the mount answered without applying them (A-190).
+const PURGE_ECHOES: &str = "winfsp.purge_echoes";
+
+/// The daemon's counter `name`, summed over the shards `slates status` prints.
+fn counter(instance: &str, name: &str) -> u64 {
+  let (code, out, err) = run(instance, &["status"]);
+  assert_eq!(code, 0, "slates status: {err}");
+  let named = format!("{name}: ");
+  out
+    .lines()
+    .filter_map(|line| line.split_once(named.as_str()))
+    .filter_map(|(_, count)| count.trim().parse::<u64>().ok())
+    .sum()
+}
+
+/// §4.6 "Windows", the DAX matrix's Windows mount-route cell, G-mount step 2, A-190. Do: map `file.bin` read-only through
+/// the drive and read the view, then rewrite the file in place through the SDK, and watch the view as memory alone for
 /// [`WAIT_FOR`]; beside it, read the file through a second handle opened after the view; then close the view and every
-/// handle and open the file again. Expect: the view does what [`MAPPED_VIEW_FOLLOWS`] records (stale). The two reads
-/// beside it are printed, not asserted: on CI's runner both stayed stale for 10 s (runs 40249524066 and 40250856246), a
-/// defect of the mount the gap ledger owns (GAPS, "a mapped file through the WinFsp mount"), and a test that asserted
-/// the defect would call its fix a regression.
+/// handle and open the file again. Expect: the view does what [`MAPPED_VIEW_FOLLOWS`] records (it follows), and so does
+/// the read through the second handle, since the purge drops the range from Windows' cache too; and the daemon counts a
+/// purge made and its write answered without being applied, so the view cannot follow by any other path. Before A-190
+/// both stayed stale for 10 s on CI's runner (runs 40249524066 and 40250856246).
 #[test]
 fn a_mapped_view_through_a_winfsp_mount_after_another_paths_change() {
   if !live_mount_runs() {
@@ -512,6 +529,19 @@ fn a_mapped_view_through_a_winfsp_mount_after_another_paths_change() {
     view_took.is_some(),
     MAPPED_VIEW_FOLLOWS,
     "the mapped view does what the matrix records"
+  );
+  assert!(
+    read_took.is_some(),
+    "a read through a second handle follows the change once the range is purged"
+  );
+  let (purges, echoes) = (
+    counter(&fixture.instance, PURGES_DONE),
+    counter(&fixture.instance, PURGE_ECHOES),
+  );
+  eprintln!("WINFSP PURGES: {purges} made, {echoes} writes answered without being applied");
+  assert!(
+    purges >= 1 && echoes >= 1,
+    "non-vacuous: the mount purged the file and dropped the purge's write ({purges} purges, {echoes} echoes)"
   );
   drop(view);
   drop(reader);

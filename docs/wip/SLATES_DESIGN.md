@@ -2828,10 +2828,17 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 > a paging write is clipped to the file's size. WinFsp's library is found at run time, so a daemon without WinFsp
 > refuses the form `WinFspNotInstalled`. Proven on CI's Windows runner (run 40252840969): Windows programs create, write, read,
 > list and delete through the drive and slates reads their bytes; a cached read through a handle follows an SDK write in
-> 20.7 ms, red-checked twice with empty rounds (stale for 10 s). A mapped view does not follow (WinFsp's purge refuses a
-> mapped file), so the DAX matrix's Windows mount-route cell is impossible through WinFsp, and while a file is mapped
-> no reader of it sees another path's change (GAPS). Owed: the scoped and shared forms, a second drive letter as the
-> chosen-path form, arm64, and the attribute calls.
+> 20.7 ms, red-checked twice with empty rounds (stale for 10 s). Owed: the scoped and shared forms, a second drive
+> letter as the chosen-path form, and the attribute calls.
+
+> **Status (2026-10-30, A-190: a mapped view follows).** A-177 found a mapped view kept its pages after another path's
+> change (WinFsp's purge refuses a mapped file), and while it stood no reader of the file saw the change. After each
+> round Windows took, the mount's thread now writes each changed range of a file Windows holds open through the drive,
+> unbuffered, which makes WinFsp purge with `CcCoherencyFlushAndPurgeCache`, documented to invalidate user mapped
+> views; the host answers that write without applying it. Proven on CI's x86_64 and arm64 runners (run 41133474977):
+> the view follows an SDK write within one 20 ms poll, a read through another handle and a fresh open follow in under
+> 0.5 ms, red-checked with no purge planned (the view stale for 10 s). The DAX matrix's Windows mount-route cells are
+> proven by it.
 
 **Base reads on macOS and Windows.** As on Linux, the daemon reads untouched base files through its own descriptor or
 handle into evictable cache chunks (one copy, `pread`/`ReadFile` on the owner shard's driver) and
@@ -3086,8 +3093,7 @@ daemon through the rendezvous's socket file (A-187).
 > **Status (the DAX matrix, A-164, 2026-10-24).** What DAX means in each environment, and which of its 52 cells
 > (each environment on each platform, by the mount route and the socket route) are proven, owed or ruled out by the
 > platform, is the matrix in `docs/wip/virtiofs.md` §8.
-> - **Ruled out by a run:** a host process's mapped view through the Windows WinFsp mount (G-mount step 2, A-177, CI's
->   Windows runner: WinFsp's purge refuses a mapped file, so the view keeps its pages); and a process-isolated Windows
+> - **Ruled out by a run:** a process-isolated Windows
 >   container binding a folder of the WinFsp drive (G-mount step 4, 2026-10-26, CI's Windows runner, run 40257213499:
 >   Docker's engine, a service in a logon session of its own, does not see the drive an unprivileged mount defines,
 >   "bind source path does not exist", while an NTFS folder bound into the same kind of container listed whole; past
@@ -3106,7 +3112,9 @@ daemon through the rendezvous's socket file (A-187).
 >   crosvm over slates' own device (Linux x86_64, A-168 and A-169, 2026-10-25); a Shards guest over the daemon's
 >   stream (macOS arm64, A-163; Linux x86_64 KVM, 2026-10-26), and through Shards' own DAX window over a `slates mount`
 >   (macOS arm64 and Linux x86_64 KVM, 2026-10-26, each red-checked with the window off); Firecracker by virtio-pmem over the image file through a slates mount (Linux x86_64,
->   A-165); and, since 2026-10-25, the same-kernel direct map on Linux (A-171: a sealed copy of one file, asserted
+>   A-165); a host process's mapped view through the Windows WinFsp mount, x86_64 and arm64 (A-190, 2026-10-30, CI's
+>   Windows runners, run 41133474977, red-checked with no purge planned; A-177 had ruled it out by a run, before the
+>   coherent purge); and, since 2026-10-25, the same-kernel direct map on Linux (A-171: a sealed copy of one file, asserted
 >   zero-copy by a real client, red-checked), on macOS (A-173: the copy's read-only descriptor over the socket route,
 >   asserted zero-copy by a real client, red-checked) and on Windows x86_64 (A-175: a read-only section handle
 >   duplicated into the client, asserted zero-copy by a real client on a Windows machine, red-checked); and, since
@@ -12487,6 +12495,52 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
 
+### A-190 — A mapped view through the WinFsp mount follows another path's change: the mount purges views through WinFsp's own coherent purge (accepted and built 2026-10-30; an experiment Ada asked to build and measure)
+Applied in the same change to: §4.6 ("Windows" and its status; the DAX matrix's A-164 status), A-177 (its decision by
+the run, superseded), `docs/wip/virtiofs.md` §8 (the bare-metal Windows mount-route cells, and the Shards Windows
+cell's reason), GAPS, `crates/bridge-winfsp` (`purge.rs`, new: the plan, pure and tested on every host; `host.rs`: an
+open this process made unbuffered taken as a purge, its writes answered without being applied and its cleanup publishing
+nothing, and the mount thread's purge after a round Windows took; `ffi.rs`: `FspFileSystemOperationProcessIdF`,
+optional; `notify.rs`: `open_names`, `open_inodes`), `crates/server` (`winfsp.rs`: `purges_owed`, the purge counters),
+`crates/machine` (`Facts::allocation_granularity`), `crates/cli` (`tests/winfsp.rs`: the view must follow, and the
+purge must be counted), `unsafe-budget.toml` (`slates-bridge-winfsp` 104 → 111).
+- **What it answers.** A process's mapped view of a file through the WinFsp mount kept its pages after another path's
+  change (A-177, measured on CI's x86_64 and arm64 runners), and while the view stood a read through any other handle
+  was stale too. WinFsp purges a notified file with `CcPurgeCacheSection` (`src/sys/file.c`), which "will not purge
+  mapped files" (Microsoft Learn). WinFsp's non-cached write purges first with `CcCoherencyFlushAndPurgeCache`
+  (`src/sys/write.c`, `FspFsvolWriteNonCached` calling `FspFileNodeFlushAndPurgeCache`), which Microsoft documents as
+  invalidating user mapped views. A-177 listed three candidates and called the cell impossible; this is a fourth, which
+  needs no change to WinFsp.
+- **The mechanism.** After a notification round Windows took, the mount's thread opens each changed file Windows holds
+  open through the drive, unbuffered and write-through, and writes the changed range, widened to whole sectors and
+  clipped to the file's last sector, in pieces of the machine's allocation granularity, from a zeroed buffer. WinFsp
+  flushes the file's dirty pages (a program's stores reach the volume as its writes), purges the range from the cache
+  and invalidates every view of it, so a view's next touch reads the volume. The write reaches the host on an open the
+  host knows as its own and is answered with the file's attributes, never applied; the open's cleanup publishes nothing.
+- **Why a purge cannot write a file.** The host knows an open as a purge when this process made it unbuffered: WinFsp
+  names a create's requester (`FspFileSystemOperationProcessIdF`), and the create's options carry
+  `FILE_NO_INTERMEDIATE_BUFFERING`. Only such an open can carry a purge's bytes, and every write through it is dropped,
+  so recognition fails closed. Where WinFsp cannot name an open's process (an older WinFsp without the export), no purge
+  is made at all, counted `winfsp.purges_unavailable`. A process serving a WinFsp mount must therefore not write its own
+  mount unbuffered: such writes are taken as purges and dropped. `ReadOnlyVolume` does not stop the purge: WinFsp only
+  reports it (`src/sys/volinfo.c`), and the host's open asks for nothing a read-only mount refuses.
+- **Proven** on CI's Windows runners, diagnostics run 41133474977 (slates 78483e80, this change on 405b2d83; WinFsp
+  2.1.25156), `crates/cli/tests/winfsp.rs` 4 of 4 on each:
+  - x86_64 (`windows-latest`, job 124330034742): the view followed the SDK's change at the test's second poll, 20.8 ms
+    (the poll is 20 ms); a read through a handle opened after it followed in 169.5 µs; the daemon counted 1 purge made
+    and 1 purge write answered without being applied; after the view and every handle closed, a fresh open read the
+    change in 493.5 µs, where A-177 measured 3.03 s.
+  - arm64 (`windows-11-arm`, job 124330034878): 20.5 ms, 169.6 µs, 1 purge and 1 write dropped, and 492.6 µs.
+  - Red-checked in the same run (job 124330034929): with the server planning no purge, the view kept its first byte for
+    10 s (`Some(65)`, the old `A`), a read through a handle was stale for 10 s too, and the test failed.
+  - The plan's tests (`purge.rs`, 4, on every host): a change widened to whole sectors, never past the file's last
+    sector, extreme offsets without overflow, and a range cut into pieces that cover it exactly.
+- **Its limits.** A cut under a live view leaves the view's pages past the new end: Windows refuses to cut a file a view
+  maps, and a cut through another path cannot be shown to it. A program's store and another path's write to the same
+  page race, as any two writers of one page do; the flush the purge makes writes the program's page first.
+- **What it does not change.** The notification rounds (they still drop what Windows caches through handles), the
+  mount's other requests, and every other transport.
+
 ### A-189 — QEMU 11.1 maps the window of slates' own device: its generic vhost-user device takes the end by number, and the back end takes the memory tables QEMU sends as it maps (accepted and built 2026-10-29)
 Applied in the same change to: §4.6 (the DAX matrix's status and its list of what the platforms rule out), A-164 (the
 same list), `docs/wip/virtiofs.md` §8 (the VMs table's QEMU, Kata and crosvm arm64 rows), GAPS, `docs/cli.md`,
@@ -12823,7 +12877,8 @@ Applied in the same change to: §4.6 ("Windows (own thin WinFsp binding)" and it
 - **Decided: the library is found at run time, not linked.** Linked, a daemon could not start on a Windows host without WinFsp. Loaded as WinFsp's own `FspLoad` loads it, the daemon starts everywhere, and the form is refused `WinFspNotInstalled` where the library is absent (run on jupiter, which has no WinFsp, 2026-10-25).
 - **Two defects found on the runner by a request log, both fixed** (run 40251802164). A paging write (`ConstrainedIo`) was applied whole, so a 62-byte file grew to its 4096-byte page; it is now clipped to the file's size, as WinFsp's `memfs` clips it (`docs/bugs/2026-10-26-a-paging-write-through-winfsp-grew-a-file-to-its-page.md`). And since the host was first written, every open of a file was handed the first open's context, so a second open freed that context twice (`docs/bugs/2026-10-26-a-winfsp-file-opened-twice-freed-its-first-context-twice.md`); the mount now takes per-handle contexts (`UmFileContextIsUserContext2`). A file's last close now writes its pages back before its publication (`FlushAndPurgeOnCleanup`): before, a Windows program's write reached the shard only at the cache manager's lazy write-back.
 - **Proven** on CI's Windows runner (Windows Server 2025, WinFsp 2.1.25156), run 40252840969, the CLI tests 3 of 3 (`crates/cli/tests/winfsp.rs`): Windows programs create, write, read, list and delete through the drive, and `slates read` returns their bytes; a cached read through a handle opened before an SDK write follows it in 20.7 ms (20.5 and 20.5 ms in runs 40249524066 and 40250856246). Red-checked twice with the mount handing Windows empty rounds (runs 40249528145 and 40250871529): the cached read stayed stale for 10 s and the test failed.
-- **Decided by the run: a mapped view does not follow.** The view held its first byte for 10 s in every run. WinFsp's notification purges with `CcPurgeCacheSection` (research f8, `src/sys/file.c`), which "will not purge mapped files" (f9, Microsoft Learn); only `CcCoherencyFlushAndPurgeCache` invalidates user-mapped views (f9), and WinFsp does not call it (f10). So the DAX matrix's Windows mount-route cell is impossible through WinFsp. Worse, while the view stands a read through any other handle is stale too, and after the view and handles closed a fresh open read the change only 3.03 s later (GAPS: "A file mapped through the WinFsp mount…").
+- **Decided by the run: a mapped view does not follow** (superseded 2026-10-30 by A-190: the mount now makes WinFsp purge
+  coherently, and the view follows; the measurements below stand). The view held its first byte for 10 s in every run. WinFsp's notification purges with `CcPurgeCacheSection` (research f8, `src/sys/file.c`), which "will not purge mapped files" (f9, Microsoft Learn); only `CcCoherencyFlushAndPurgeCache` invalidates user-mapped views (f9), and WinFsp does not call it (f10). So the DAX matrix's Windows mount-route cell is impossible through WinFsp. Worse, while the view stands a read through any other handle is stale too, and after the view and handles closed a fresh open read the change only 3.03 s later (GAPS: "A file mapped through the WinFsp mount…").
 - **Owed:** a scoped (`--subtree`) and a read-shared WinFsp mount; arm64 Windows; a WinFsp mount across a daemon restart (the file system is the dead process's own, so recovery ends its record); the attribute and AppleDouble-like calls (§4.6 status).
 
 ### A-179 — The Shards route on Windows rides a duplex named pipe, which the runtime serves by completions (accepted 2026-10-26)

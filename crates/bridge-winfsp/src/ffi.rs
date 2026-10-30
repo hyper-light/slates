@@ -264,6 +264,9 @@ impl Interface {
 /// Format: `FILE_DIRECTORY_FILE` (NT `CreateOptions`) — the one create option a user-mode FS must
 /// read: the object being created/opened is a directory, not a file.
 pub(crate) const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+/// Format: `FILE_NO_INTERMEDIATE_BUFFERING` (`0x0000_0008`, wdm.h), the create option an unbuffered open
+/// (`FILE_FLAG_NO_BUFFERING`) carries; WinFsp passes the request's options to `Open` whole (`src/sys/create.c`).
+pub(crate) const FILE_NO_INTERMEDIATE_BUFFERING: u32 = 0x0000_0008;
 /// Format: `FspCleanupDelete` — the Cleanup flag that means "delete this object now" (`winfsp.h`).
 pub(crate) const FSP_CLEANUP_DELETE: u32 = 0x01;
 /// Format: `FSP_FILE_SYSTEM_OPERATION_GUARD_STRATEGY_COARSE` — one mutually-exclusive lock around every
@@ -307,6 +310,9 @@ pub(crate) type NotifyBeginFn =
   unsafe extern "system" fn(file_system: *mut FileSystem, timeout: u32) -> Ntstatus;
 /// `FspFileSystemNotifyEnd`.
 pub(crate) type NotifyEndFn = unsafe extern "system" fn(file_system: *mut FileSystem) -> Ntstatus;
+/// `FspFileSystemOperationProcessIdF`: the process that made the create or open being served (its id from the request's
+/// access token, `winfsp.h` `FspFileSystemOperationProcessId`), zero for any other request.
+pub(crate) type OperationProcessIdFn = unsafe extern "system" fn() -> u32;
 /// `FspFileSystemNotify`: the records of a round (`FSP_FSCTL_NOTIFY_INFO`, built by `crate::notify`) and their size.
 pub(crate) type NotifyFn = unsafe extern "system" fn(
   file_system: *mut FileSystem,
@@ -332,6 +338,8 @@ pub(crate) struct Api {
   pub(crate) notify_begin: NotifyBeginFn,
   pub(crate) notify_end: NotifyEndFn,
   pub(crate) notify: NotifyFn,
+  /// Absent from a WinFsp that predates it: the mount then makes no purge (`crate::purge`), and serves as before.
+  pub(crate) operation_process_id: Option<OperationProcessIdFn>,
 }
 
 /// Format: the library's name for this architecture (`FSP_DLLNAME`: `winfsp-` and `FSP_FSCTL_PRODUCT_FILE_ARCH`).
@@ -374,6 +382,7 @@ fn load() -> Result<Api, Ntstatus> {
     notify_begin: symbol(module, c"FspFileSystemNotifyBegin")?,
     notify_end: symbol(module, c"FspFileSystemNotifyEnd")?,
     notify: symbol(module, c"FspFileSystemNotify")?,
+    operation_process_id: symbol(module, c"FspFileSystemOperationProcessIdF").ok(),
   })
 }
 
@@ -451,6 +460,7 @@ impl Export for AddDirInfoFn {}
 // `NotifyBeginFn` has `StartDispatcherFn`'s shape (the file system and a `u32`), so the impl above covers it.
 impl Export for NotifyEndFn {}
 impl Export for NotifyFn {}
+impl Export for OperationProcessIdFn {}
 
 /// The export `name` of `module`, as the function-pointer type `T` the header gives it; refused when the library does not
 /// export it.

@@ -15,7 +15,8 @@ slates-bridge-core = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 # A direct dep so a cross-lint for the Windows target from a host with no MSVC assembler can enable
 # blake3's pure-Rust backend with `--features slates-machine/pure-hash` (as ipc/client do); the CI
-# Windows build uses the default SIMD C path. The crate does not use slates-machine directly yet.
+# Windows build uses the default SIMD C path. The host reads the machine's allocation granularity from it, which bounds
+# a purge's write (A-190).
 slates-machine = { workspace = true }
 windows-sys = { workspace = true }
 

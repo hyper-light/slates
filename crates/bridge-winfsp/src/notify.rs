@@ -105,6 +105,19 @@ impl OpenNames {
     self.by_handle.is_empty()
   }
 
+  /// Every distinct inode Windows holds open: what a round that fell behind the journal purges whole (`crate::purge`).
+  pub fn open_inodes(&self) -> Vec<u64> {
+    let mut inodes: Vec<u64> = self.by_handle.values().map(|(ino, _)| *ino).collect();
+    inodes.sort_unstable();
+    inodes.dedup();
+    inodes
+  }
+
+  /// Every distinct name inode `ino` is open under: what a purge of its pages opens (`crate::purge`).
+  pub fn open_names(&self, ino: u64) -> Vec<&str> {
+    self.names_of(ino)
+  }
+
   /// Every distinct name inode `ino` is open under.
   fn names_of(&self, ino: u64) -> Vec<&str> {
     let mut names: Vec<&str> = self

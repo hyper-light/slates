@@ -22,6 +22,10 @@
 //!
 //! - **What Windows is told** ([`notify`]): the names Windows holds open and the `FspFileSystemNotify`
 //!   records a change made through another path owes them, host-buildable and tested on any host.
+//!
+//! - **What a mapped view is purged of** ([`purge`]): the range an unbuffered write through the drive must cover so
+//!   WinFsp's coherent purge invalidates a process's view of a file another path changed (A-190, an experiment),
+//!   host-buildable and tested on any host.
 
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
 // are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
@@ -41,6 +45,7 @@ pub mod host;
 // What a mount tells Windows of another path's change: the names Windows holds open and the notification records
 // (§4.6 "Windows"). Pure, so it is tested on every host.
 pub mod notify;
+pub mod purge;
 
 /// An `NTSTATUS` code — the 32-bit status WinFsp hands the kernel for a request (§4.6). Held as the raw
 /// `u32` the constants are written in; the Windows FFI casts it to the `NTSTATUS`/`LONG` (`i32`) the API
