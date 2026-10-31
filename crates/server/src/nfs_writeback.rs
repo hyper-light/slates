@@ -70,6 +70,9 @@ const LOST_FOR_ROOM: &str = "nfs.writeback_states_lost";
 /// Format: trackers whose consumer task could not be spawned, kept current only as their connections call. Zero is the
 /// healthy reading.
 const KEEPER_REFUSED: &str = "nfs.writeback_keeper_refused";
+/// Format: consumer tasks that found a newer tracker of their volume in place of the one they were spawned for, and
+/// ended rather than take it: a tracker closed before its task first ran, and a new one opened.
+const STALE_KEEPERS: &str = "nfs.writeback_keepers_stale";
 
 /// Format: the point of a byte the client never fetched: no record can follow it, so no change makes the byte stale.
 const ABSENT: u64 = u64::MAX;
@@ -84,12 +87,18 @@ const READER_KEY: u64 = u64::MAX;
 #[derive(Debug, Default)]
 pub(crate) struct WritebackStates {
   trackers: BTreeMap<VolumeId, Tracker>,
+  /// The identity the next tracker made takes.
+  next_tracker: u64,
 }
 
 /// One volume's tracker: how far its journal is consumed, its change generation as of then, and each connection's
 /// states.
 #[derive(Debug, Default)]
 struct Tracker {
+  /// Which tracker of its volume this is: its consumer task keeps only the tracker it was spawned for. A tracker can
+  /// close before its task first runs and a new one open for the volume; found by the volume alone, the old task took
+  /// the new tracker as its own, and the one of the two that parked first was never woken again.
+  id: u64,
   cursor: u64,
   seen: u64,
   connections: BTreeMap<u64, Connection>,
@@ -391,16 +400,20 @@ fn tracking(s: &mut ShardState, volume: VolumeId) -> bool {
   slot
     .volume
     .open_journal_reader(READER_KEY, crate::daemon::LIVENESS_BUDGET_NS);
+  let id = s.nfs_writeback.next_tracker;
+  // Identities need only differ among the trackers whose tasks are alive at once; wrapping past 2^64 cannot meet one.
+  s.nfs_writeback.next_tracker = id.wrapping_add(1);
   s.nfs_writeback.trackers.insert(
     volume,
     Tracker {
+      id,
       cursor: head,
       seen,
       connections: BTreeMap::new(),
       keeper: None,
     },
   );
-  if slates_rt::futures::spawn(keep(volume))
+  if slates_rt::futures::spawn(keep(volume, id))
     .and_then(slates_rt::futures::detach)
     .is_err()
   {
@@ -497,13 +510,13 @@ fn ranges_per_page() -> usize {
     .max(1)
 }
 
-/// A volume's consumer: parked on its change generation, consuming each change as it is made, until the tracker closes
-/// or the volume goes.
-async fn keep(volume: VolumeId) {
+/// The consumer of `volume`'s tracker `id`: parked on the volume's change generation, consuming each change as it is
+/// made, until that tracker closes or the volume goes.
+async fn keep(volume: VolumeId, id: u64) {
   loop {
     let woke =
       std::future::poll_fn(
-        |cx| match state::with_state_counted(|s| park(s, volume, cx.waker())) {
+        |cx| match state::with_state_counted(|s| park(s, (volume, id), cx.waker())) {
           Some(Some(true)) => std::task::Poll::Ready(true),
           Some(Some(false)) => std::task::Poll::Pending,
           // The tracker closed, the volume went, or the shard's state is out of reach.
@@ -518,9 +531,13 @@ async fn keep(volume: VolumeId) {
   }
 }
 
-/// Whether `volume` changed past what its tracker consumed (`Some(true)`), parking `waker` until it does when it has not
-/// (`Some(false)`); `None` when the tracker or the volume is gone.
-fn park(s: &mut ShardState, volume: VolumeId, waker: &std::task::Waker) -> Option<bool> {
+/// Whether `volume` changed past what its tracker `id` consumed (`Some(true)`), parking `waker` until it does when it
+/// has not (`Some(false)`); `None` when that tracker or the volume is gone.
+fn park(s: &mut ShardState, (volume, id): (VolumeId, u64), waker: &std::task::Waker) -> Option<bool> {
+  if s.nfs_writeback.trackers.get(&volume)?.id != id {
+    s.count(STALE_KEEPERS, 1);
+    return None;
+  }
   let tracker = s.nfs_writeback.trackers.get_mut(&volume)?;
   if !tracker
     .keeper
@@ -533,4 +550,91 @@ fn park(s: &mut ShardState, volume: VolumeId, waker: &std::task::Waker) -> Optio
   let &handle = s.by_id.get(&volume)?;
   let slot = s.volumes.get_mut(handle).ok()?;
   Some(slot.volume.wait_for_change(seen, waker))
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Shape: rounds of the race, so a keeper left behind in each shows as a count well past any task the shard's own
+  /// loops start and end meanwhile.
+  const ROUNDS: u64 = 8;
+  /// Shape: the inode the connections' states are about; any number works, since the states never read the file.
+  const INODE: u64 = 2;
+  /// Shape: the bytes a connection is said to have fetched: one page.
+  const FETCHED: std::ops::Range<u64> = 0..16_384;
+  /// Shape: how long the shard may take to end the keepers, as the NFS tests allow their connections' tasks.
+  const SETTLE: std::time::Duration = std::time::Duration::from_secs(10);
+  /// Shape: the pause between two looks at the shard's live tasks while it ends them.
+  const SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+  /// A-192, found by the hostile NFS test on a loaded Linux box (`9 live before, 16 after`). Do, eight times on one
+  /// volume of an audit daemon: in one turn of its shard, open a tracker for a connection, end the connection (so the
+  /// tracker closes before its keeper ever ran) and open a new tracker for a second connection; let the shard run what
+  /// that turn spawned; then end the second connection. Expect: every keeper ends, so the shard's live tasks come back
+  /// to where they were, and each round's first keeper met the newer tracker (`nfs.writeback_keepers_stale`, 8).
+  /// Before, the first keeper found the second tracker by its volume and kept it as its own; the tracker woke at its
+  /// close only the keeper that parked last, and the other stayed parked on the volume until its next change.
+  #[test]
+  // The test thread waits off the shard while the shard ends the keepers.
+  #[allow(clippy::disallowed_methods)]
+  fn a_keeper_ends_with_the_tracker_it_was_spawned_for() {
+    let daemon = crate::daemon::audit_daemon();
+    let volume = crate::daemon::observe_first(&daemon, |state| {
+      let made = crate::verbs::dispatch(
+        state,
+        0,
+        &slates_db::catalog::Principal::Uid { uid: 501 },
+        slates_ipc::protocol::RequestBody::Create {
+          name: "keepers".to_owned(),
+          size: slates_ipc::protocol::SizeClass::Bounded { limit: 4 << 20 },
+          names: slates_ipc::protocol::NamePolicy::Exact,
+          require_locked: false,
+          base: None,
+        },
+      );
+      state.by_id.keys().next().copied().ok_or(made)
+    })
+    .expect("the volume was made");
+    let live = || -> u64 {
+      daemon
+        .shard_pulses()
+        .iter()
+        .map(|pulse| pulse.spawns.saturating_sub(pulse.completed))
+        .sum()
+    };
+    let baseline = live();
+    for round in 0..ROUNDS {
+      let (first, second) = (2 * round + 1, 2 * round + 2);
+      crate::daemon::observe_first(&daemon, move |state| {
+        fetched(state, first, (volume, INODE), FETCHED);
+        ended(state, first);
+        fetched(state, second, (volume, INODE), FETCHED);
+      });
+      // The shard runs the keepers that turn spawned before it takes the next question.
+      crate::daemon::observe_first(&daemon, |_| ());
+      crate::daemon::observe_first(&daemon, move |state| ended(state, second));
+    }
+    let settled_at = std::time::Instant::now();
+    while live() > baseline && settled_at.elapsed() < SETTLE {
+      std::thread::sleep(SETTLE_POLL);
+    }
+    let after = live();
+    let stale = crate::daemon::observe_first(&daemon, |state| {
+      state
+        .refusals
+        .get("nfs.writeback_keepers_stale")
+        .copied()
+        .unwrap_or(0)
+    });
+    daemon.stop();
+    assert!(
+      after <= baseline,
+      "every keeper ends with its tracker: {after} tasks live after, {baseline} before"
+    );
+    assert_eq!(
+      stale, ROUNDS,
+      "non-vacuity: each round's first keeper met the second round's tracker in place of its own"
+    );
+  }
 }
