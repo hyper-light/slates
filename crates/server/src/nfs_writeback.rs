@@ -1,5 +1,5 @@
-//! A page an NFS client writes back over another path's newer change is refused, never applied (§4.6 "NFS v3", A-192;
-//! an A/B against the sync-point coherence it replaces, Ada's choice of 2026-10-31).
+//! A page an NFS client writes back over another path's newer change is refused, never applied (§4.6 "NFS v3", A-192:
+//! the winner of the A/B Ada asked for on 2026-10-31 against the sync-point coherence it replaces).
 //!
 //! **What it answers.** An NFS v3 client caches a file's pages and writes a dirty page back whole: the program's stores
 //! with the rest of the page as the client fetched it. When another path changed the file in between, that write-back
@@ -7,6 +7,11 @@
 //! program dirtied through a shared map and did not sync (measured 3 of 3 on CI's macOS runner, diagnostics run
 //! 40821794698: the other path's 16,384 bytes lost), NFS v3 has no recall that could make it flush first, and Apple's
 //! NFSv4.1 recall returns the delegation without flushing (GAPS).
+//!
+//! **Measured (A-192).** Against the sync-point coherence it replaces, on the adversarial suite (`tests/nfs_writeback.rs`)
+//! this passes 6 of 6 cases and that 2 of 6; through Apple's own client (macOS 26.6.2, CI's runner) the other path's
+//! write survives every order of a store and a write, where it was lost in every one; a write-back costs a few percent
+//! more only while another path writes, and the states about 0.2 % of the daemon's memory (`docs/wip/BENCHMARKS.md`).
 //!
 //! **The rule.** The server keeps, for each connection, what the client's cache of each file it touched is as of: A-140's
 //! byte states ([`PageStates`]), fed here instead of by a FUSE mount's rounds.
@@ -17,11 +22,18 @@
 //!   first is a write, never a stale copy, and is applied.
 //!
 //! A WRITE whose range holds stale bytes that differ from the file's bytes now would put old bytes back over a newer
-//! change, so it is refused, `NFS3ERR_IO`, and nothing of it applied: the program's sync reports the conflict, and the
-//! other path's change survives. Stale bytes equal to the file's are no harm, and the WRITE is applied. Nothing is
-//! inferred: the server never picks bytes out of a write (CLAUDE.md, banned item 11), it applies the write whole or
-//! refuses it whole, the verdicts of D-27. Where the states cannot tell (a file lost for want of room, a journal that
-//! moved past what the connection consumed), the WRITE is refused too, counted.
+//! change, so it is refused, `NFS3ERR_IO`, and nothing of it applied: the other path's change survives. Stale bytes equal
+//! to the file's are no harm, and the WRITE is applied. Nothing is inferred: the server never picks bytes out of a write
+//! (CLAUDE.md, banned item 11), it applies the write whole or refuses it whole, the verdicts of D-27. Where the states
+//! cannot tell (a file lost for want of room, a journal that moved past what the connection consumed), the WRITE is
+//! refused too, counted.
+//!
+//! **What it cannot do.** Apple's client takes the refusal and tells the program nothing: its `msync` and `close` answered
+//! 0 in every measured case. So the program's stores in a refused page are gone without a word. When they came before
+//! the other path's write, that is the order of events (the later write wins); when they came after, through a page
+//! the client had not refetched, they were the newer write and are lost — the case only a byte-level merge could keep,
+//! which is banned. A program that needs both kept maps through the socket route (A-186). And a daemon restart starts
+//! the states empty, so a page fetched before it is not judged.
 //!
 //! **Keeping the states current.** One tracker per volume with connections tracking its files: a journal reader (A-157),
 //! so a record waits for it, and a task parked on the volume's change generation that consumes each change into every
@@ -30,7 +42,8 @@
 //!
 //! **Bounds.** The states are charged to the shard's metadata ledger, [`RANGE_BYTES`] a range, as a FUSE mount's are
 //! (A-155); a file whose ranges the ledger refuses is lost, and its writes are refused until its connection ends. A
-//! connection's states go when it ends, on every shard. The connections are the listener's, bounded by its admission.
+//! connection's states go when it ends, however it ends, on the shards its READs and WRITEs were served on and no other
+//! ([`Footprint`]). The connections are the listener's, bounded by its admission.
 
 use std::collections::BTreeMap;
 
@@ -262,26 +275,68 @@ pub(crate) fn made(s: &mut ShardState, connection: u64, volume: VolumeId, before
   }
 }
 
-/// Format: connection ends whose states could not be dropped on another shard (its control channel full): left until
-/// that tracker closes. Zero is the healthy reading.
+/// Format: connection ends refused by a shard their states are kept on (its control channel full past a coordinator
+/// period, or the shard gone): the states are left until that tracker closes. Zero is the healthy reading.
 const CLOSE_REFUSED: &str = "nfs.writeback_close_refused";
 
-/// Connection `connection` closed: its states go on every shard, since its calls may have reached volumes of several.
-/// Called off any shard state borrow, from the shard it closed on.
-pub(crate) fn closed(connection: u64) {
-  let Some((this, shards)) = state::with_state(|s| (s.shard, s.shards.clone())) else {
-    return;
-  };
-  for shard in shards {
-    if crate::xshard::run_on(this, shard, move |s| ended(s, connection)).is_err() {
-      crate::fleet::count_refusal(CLOSE_REFUSED);
+/// Format: connection ends sent to another shard, where the connection's states are kept: what a connection's end costs
+/// the other shards. A connection that read and wrote one shard's volumes ends where its states are and sends nothing.
+const ENDS_SENT: &str = "nfs.writeback_ends_sent";
+
+/// Where a connection's states are kept: the shards its READs and WRITEs were served on, each once. The connection
+/// carries it from its first call to its end, across every move between shards. Dropped — the connection ended, its
+/// move was refused, or its task was cancelled — it drops the states there and only there: inline on this shard, by a
+/// message to each other one. So a connection leaves nothing behind however it ends, and a client that opens and drops
+/// connections that read nothing costs no other shard anything. Before, an end went to every shard: a task on each
+/// shard's control channel, the channel forwarded calls are admitted through.
+#[derive(Debug)]
+pub(crate) struct Footprint {
+  connection: u64,
+  shards: Vec<u16>,
+}
+
+impl Footprint {
+  /// Connection `connection`'s footprint, before its first call.
+  pub(crate) fn of(connection: u64) -> Footprint {
+    Footprint {
+      connection,
+      shards: Vec::new(),
+    }
+  }
+
+  /// The connection whose states these are.
+  pub(crate) fn connection(&self) -> u64 {
+    self.connection
+  }
+
+  /// Notes that a call of the connection is served on `shard`, so it may keep states there. Each shard is noted once, so
+  /// the list is bounded by the shard count.
+  pub(crate) fn note(&mut self, shard: u16) {
+    if !self.shards.contains(&shard) {
+      self.shards.push(shard);
+    }
+  }
+}
+
+impl Drop for Footprint {
+  fn drop(&mut self) {
+    // Off a shard the states went with the shard's own state.
+    let Some(this) = slates_rt::registry::current_shard() else {
+      return;
+    };
+    let connection = self.connection;
+    for &shard in &self.shards {
+      if shard != this {
+        crate::fleet::count_refusal(ENDS_SENT);
+      }
+      crate::xshard::run_on_waiting(this, shard, move |s| ended(s, connection), CLOSE_REFUSED);
     }
   }
 }
 
 /// Connection `connection` ended: its states go from every tracker of this shard, their ledger bytes returned, and a
 /// tracker left with no connection closes.
-pub(crate) fn ended(s: &mut ShardState, connection: u64) {
+fn ended(s: &mut ShardState, connection: u64) {
   let mut emptied = Vec::new();
   let mut credit = 0u64;
   for (volume, tracker) in &mut s.nfs_writeback.trackers {

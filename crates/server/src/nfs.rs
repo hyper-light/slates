@@ -1132,6 +1132,14 @@ fn read_range(args: &[u8], results: &[u8]) -> Option<(u64, std::ops::Range<u64>)
   Some((handle.inode, at..at.saturating_add(count)))
 }
 
+/// Whether `call` may keep states of its client's cache where it is served: an NFSv3 READ, whose bytes the client holds
+/// from then on, or WRITE, judged against what it holds (A-192).
+fn keeps_states(call: &Call) -> bool {
+  call.program == NFS_PROGRAM
+    && call.version == NFS_VERSION
+    && (call.procedure == NFSPROC3_READ || call.procedure == NFSPROC3_WRITE)
+}
+
 /// What a call is answered with before it is served, if anything:
 /// - an NFSv3 request a dead daemon applied and left unanswered on a held connection, from the reply it published with
 ///   the effect (A-128), never applied twice;
@@ -2374,14 +2382,20 @@ impl Call {
 }
 
 /// The RPC reply for one deframed call message, framed as one record: the entry the network export's TLS session
-/// serves its plaintext calls through ([`crate::nfs_tls`]), exactly as [`serve_connection`] serves the loopback's.
+/// serves its plaintext calls through ([`crate::nfs_tls`]), exactly as [`serve_connection`] serves the loopback's. A READ
+/// or WRITE is served on its volume's owner shard and may keep its client's cache states there, which `footprint` notes
+/// (A-192).
 pub(crate) async fn reply_to_message(
   this: u16,
   message: Vec<u8>,
   port: u16,
-  connection: u64,
+  footprint: &mut crate::nfs_writeback::Footprint,
 ) -> Vec<u8> {
-  reply_to(this, Call::parse(message), port, (None, connection)).await
+  let call = Call::parse(message);
+  if keeps_states(&call) {
+    footprint.note(route(call.program, call.procedure, call.args()).unwrap_or(this));
+  }
+  reply_to(this, call, port, (None, footprint.connection())).await
 }
 
 /// The RPC reply for one call, framed as one record ([`reply_record`]). An NFSv4 call goes to the v4 front end, which presents a
@@ -2476,7 +2490,8 @@ std::thread_local! {
 
 /// A connection id unique across the anchor's life: the host's monotonic clock, which every daemon under one anchor
 /// shares and which never runs back (`slates_machine::clock`), made strictly increasing on this shard. Only the
-/// listener's shard hands ids out, and an id a dead daemon handed out is older than any reading after it.
+/// control shard hands ids out — the loopback listener and the network export's sessions both run there — and an id a
+/// dead daemon handed out is older than any reading after it.
 pub(crate) fn next_connection_id() -> u64 {
   LAST_CONNECTION_ID.with(|last| {
     let id = slates_machine::clock::monotonic_ns().max(last.get().saturating_add(1));
@@ -2619,6 +2634,9 @@ struct Connection {
   /// The connection's id: the anchor's while it holds the connection, else one of this daemon's own. What the server
   /// keeps of its client's cache is keyed by it (`crate::nfs_writeback`).
   id: u64,
+  /// The shards that keep what the server knows of its client's cache: those its READs and WRITEs were served on. It
+  /// moves with the connection and, dropped with it however it ends, drops those states there (A-192).
+  footprint: crate::nfs_writeback::Footprint,
   /// The shard that accepted the connection: where its NFSv4 client table lives (A-76).
   home: u16,
   /// An NFSv4 session moving with the connection to the shard its volume lives on (A-76), taken in there.
@@ -2635,10 +2653,12 @@ struct Connection {
 
 impl Connection {
   fn new(stream: TcpStream, port: u16, held: Option<u64>) -> Connection {
+    let id = held.unwrap_or_else(next_connection_id);
     Connection {
       stream,
       port,
-      id: held.unwrap_or_else(next_connection_id),
+      id,
+      footprint: crate::nfs_writeback::Footprint::of(id),
       home: registry::current_shard().unwrap_or(0),
       carry: None,
       held,
@@ -2655,10 +2675,9 @@ impl Connection {
   }
 
   /// Ends the connection while this daemon lives: shuts it down, so the client sees it close although the anchor's copy
-  /// would keep it open, and releases the hold.
+  /// would keep it open, and releases the hold. Its footprint goes with it, and with that its client's cache states.
   fn end(self) {
     let _ = self.stream.shutdown();
-    crate::nfs_writeback::closed(self.id);
     self.ending().release();
   }
 
@@ -3007,6 +3026,10 @@ async fn serve_turn(
       turn.moving = moving;
       reply
     } else {
+      // A READ or WRITE is served here, on its volume's shard, and may keep its client's cache states here (A-192).
+      if keeps_states(&call) {
+        connection.footprint.note(this);
+      }
       reply_to(
         this,
         call,
@@ -3271,10 +3294,12 @@ fn owner_elsewhere(call: &Call) -> Option<u16> {
 /// kernel client reconnects, as at a refused accept.
 fn migrate(owner: u16, connection: Connection) {
   let ending = connection.ending();
+  // The footprint is named, so it moves with the connection: left in the husk, it would drop the states here.
   let Connection {
     stream,
     port,
     id,
+    footprint,
     home,
     carry,
     held,
@@ -3294,15 +3319,16 @@ fn migrate(owner: u16, connection: Connection) {
       }
       let Ok(stream) = TcpStream::from_owned(fd) else {
         crate::fleet::count_refusal(MIGRATE_REFUSED);
-        crate::nfs_writeback::closed(id);
         ending.release();
         return;
       };
-      // The id goes with the connection, so what the server keeps of its client's cache follows it (A-192).
+      // The id and the footprint go with the connection, so what the server keeps of its client's cache follows it and
+      // goes when it ends (A-192).
       let connection = Connection {
         stream,
         port,
         id,
+        footprint,
         home,
         carry: None,
         held,
@@ -3318,8 +3344,7 @@ fn migrate(owner: u16, connection: Connection) {
   );
   if registry::send_control(owner, slates_rt::control::Control::Spawn(Box::new(arrive))).is_err() {
     crate::fleet::count_refusal(MIGRATE_REFUSED);
-    // The refused spawn dropped the descriptor; releasing the anchor's copy closes the connection.
-    crate::nfs_writeback::closed(id);
+    // The refused spawn dropped the descriptor and the footprint; releasing the anchor's copy closes the connection.
     ending.release();
     if let Some((sessionid, departed)) = kept {
       let _ = state::with_state_counted(|s| {

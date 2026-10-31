@@ -24,6 +24,7 @@
 )]
 
 use std::net::TcpStream;
+use std::time::{Duration, Instant};
 
 use slates_client::{Client, Intent, VolumeId};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
@@ -40,6 +41,13 @@ const FILE: &str = "f";
 const FILE_MODE: u32 = 0o644;
 /// Format: `NFS3_OK`.
 const OK: u32 = 0;
+/// Shape: connections that each read the file of one volume, so an end sent to every shard shows as a count, not a
+/// coincidence.
+const ONE_SHARD_CONNECTIONS: usize = 32;
+/// Shape: how long the daemon may take to end the closed connections' tasks, as the hostile NFS test allows.
+const SETTLE: Duration = Duration::from_secs(10);
+/// Shape: the pause between two looks at the daemon's live tasks while it ends them.
+const SETTLE_POLL: Duration = Duration::from_millis(20);
 
 /// A started, bootstrapped daemon of `shards` shards, and its instance name.
 fn daemon(tag: &str, shards: u16) -> (Daemon, String) {
@@ -123,14 +131,27 @@ impl World {
 
   /// A daemon counter, summed over its shards.
   fn counter(&self, name: &str) -> u64 {
-    self
-      .daemon
-      .refusals_on_every_shard()
-      .unwrap()
-      .get(name)
-      .copied()
-      .unwrap_or(0)
+    counter_of(&self.daemon, name)
   }
+}
+
+/// `daemon`'s counter `name`, summed over its shards.
+fn counter_of(daemon: &Daemon, name: &str) -> u64 {
+  daemon
+    .refusals_on_every_shard()
+    .unwrap()
+    .get(name)
+    .copied()
+    .unwrap_or(0)
+}
+
+/// The tasks `daemon`'s shards have spawned and not finished.
+fn live_tasks(daemon: &Daemon) -> u64 {
+  daemon
+    .shard_pulses()
+    .iter()
+    .map(|pulse| pulse.spawns.saturating_sub(pulse.completed))
+    .sum()
 }
 
 /// READ of `count` bytes at `offset`: the bytes, or the status answered instead.
@@ -480,4 +501,65 @@ fn hostile_writes_are_answered_and_the_export_goes_on() {
     Some(&b'Z'),
     "the export still serves the file"
   );
+}
+
+/// A-192, a connection's end reaches only the shards its reads and writes did. Do: on a two-shard daemon with a volume
+/// on each shard, its file written through the SDK, end 32 connections that each read the file of one volume, then one
+/// connection that reads the file of each. Expect: only the last connection's end goes to another shard, the one it read
+/// first (`nfs.writeback_ends_sent` 1), and every tracker closes, so the daemon's live tasks come back to where they
+/// were before the first connection. An end sent to every shard whatever its connection read made a client that opens
+/// and drops connections put a task on every shard's control channel, the channel forwarded calls are admitted through.
+#[test]
+fn a_connections_end_reaches_only_the_shards_its_reads_and_writes_did() {
+  let (daemon, instance) = daemon("wb-ends", 2);
+  let mut sdk = connect(&instance);
+  let [near, far] = [0u16, 1].map(|partition| {
+    let name = (0..)
+      .map(|index| format!("wb-ends-{index}"))
+      .find(|name| slates_server::verbs::owner_of_name(name, 2) == partition)
+      .unwrap();
+    let volume = sdk.create(&scratch(&name)).unwrap();
+    let attachment = sdk.attach(volume, None, Intent::Write).unwrap().attachment;
+    sdk
+      .fs_write((volume, attachment), FILE, &page(b'A'), FILE_MODE)
+      .unwrap();
+    daemon.mount_capability(&name).unwrap().unwrap()
+  });
+  let port = daemon.nfs_port().unwrap();
+  let baseline = live_tasks(&daemon);
+  for _ in 0..ONE_SHARD_CONNECTIONS {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    assert_eq!(read_file_of(&mut stream, &near, 1), page(b'A'));
+  }
+  let mut both = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  assert_eq!(read_file_of(&mut both, &near, 1), page(b'A'));
+  assert_eq!(read_file_of(&mut both, &far, 4), page(b'A'));
+  drop(both);
+  let settled_at = Instant::now();
+  while live_tasks(&daemon) > baseline && settled_at.elapsed() < SETTLE {
+    // A test polling the daemon's task count while it ends the closed connections' tasks.
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(SETTLE_POLL);
+  }
+  let live_after = live_tasks(&daemon);
+  let sent = counter_of(&daemon, "nfs.writeback_ends_sent");
+  eprintln!(
+    "NFS-AB ends: {sent} sent to another shard for {} connections; live tasks {baseline} before, {live_after} after",
+    ONE_SHARD_CONNECTIONS + 1
+  );
+  assert_eq!(
+    sent, 1,
+    "only the connection that read both shards' volumes sends its end to another shard"
+  );
+  assert!(
+    live_after <= baseline,
+    "every tracker closes when its connections end: {live_after} tasks live after, {baseline} before"
+  );
+}
+
+/// Mounts `export` on `stream` and reads its file's first page, as a client caching it does, with xids from `xid` on.
+fn read_file_of(stream: &mut TcpStream, export: &str, xid: u32) -> Vec<u8> {
+  let root = mount(stream, export, xid);
+  let fh = common::nfs::lookup(stream, &root, FILE, xid + 1);
+  read_at(stream, &fh, (0, count(PAGE)), xid + 2).unwrap()
 }
