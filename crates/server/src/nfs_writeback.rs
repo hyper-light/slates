@@ -3,15 +3,16 @@
 //!
 //! **What it answers.** An NFS v3 client caches a file's pages and writes a dirty page back whole: the program's stores
 //! with the rest of the page as the client fetched it. When another path changed the file in between, that write-back
-//! carries the old bytes and put them back over the newer write, silently. Apple's client does exactly this for a page a
+//! carries the old bytes and puts them back over the newer write, silently. Apple's client does exactly this for a page a
 //! program dirtied through a shared map and did not sync (measured 3 of 3 on CI's macOS runner, diagnostics run
 //! 40821794698: the other path's 16,384 bytes lost), NFS v3 has no recall that could make it flush first, and Apple's
 //! NFSv4.1 recall returns the delegation without flushing (GAPS).
 //!
 //! **Measured (A-192).** Against the sync-point coherence it replaces, on the adversarial suite (`tests/nfs_writeback.rs`)
 //! this passes 6 of 6 cases and that 2 of 6; through Apple's own client (macOS 26.6.2, CI's runner) the other path's
-//! write survives every order of a store and a write, where it was lost in every one; a write-back costs a few percent
-//! more only while another path writes, and the states about 0.2 % of the daemon's memory (`docs/wip/BENCHMARKS.md`).
+//! write survives every order of a store and a write, where it was lost in every one. Only while another path writes
+//! does a write-back cost more: 2 to 3 % at the median, and up to 10 % fewer write-backs a second on a loaded Mac. The
+//! states cost under 1 % of the daemon's memory (`docs/wip/BENCHMARKS.md`).
 //!
 //! **The rule.** The server keeps, for each connection, what the client's cache of each file it touched is as of: A-140's
 //! byte states ([`PageStates`]), fed here instead of by a FUSE mount's rounds.
@@ -38,7 +39,8 @@
 //! **Keeping the states current.** One tracker per volume with connections tracking its files: a journal reader (A-157),
 //! so a record waits for it, and a task parked on the volume's change generation that consumes each change into every
 //! connection's states as it is made, so the states never depend on how long the journal keeps a record. A WRITE
-//! consumes what is pending before it is judged.
+//! consumes what is pending before it is judged. A tracker can close before its task first runs and a new one open for
+//! the volume, so each tracker has an identity and its task keeps only the tracker it was spawned for.
 //!
 //! **Bounds.** The states are charged to the shard's metadata ledger, [`RANGE_BYTES`] a range, as a FUSE mount's are
 //! (A-155); a file whose ranges the ledger refuses is lost, and its writes are refused until its connection ends. A
@@ -514,16 +516,15 @@ fn ranges_per_page() -> usize {
 /// made, until that tracker closes or the volume goes.
 async fn keep(volume: VolumeId, id: u64) {
   loop {
-    let woke =
-      std::future::poll_fn(
-        |cx| match state::with_state_counted(|s| park(s, (volume, id), cx.waker())) {
-          Some(Some(true)) => std::task::Poll::Ready(true),
-          Some(Some(false)) => std::task::Poll::Pending,
-          // The tracker closed, the volume went, or the shard's state is out of reach.
-          _ => std::task::Poll::Ready(false),
-        },
-      )
-      .await;
+    let woke = std::future::poll_fn(|cx| {
+      match state::with_state_counted(|s| park(s, (volume, id), cx.waker())) {
+        Some(Some(true)) => std::task::Poll::Ready(true),
+        Some(Some(false)) => std::task::Poll::Pending,
+        // The tracker closed, the volume went, or the shard's state is out of reach.
+        _ => std::task::Poll::Ready(false),
+      }
+    })
+    .await;
     if !woke {
       return;
     }
@@ -533,7 +534,11 @@ async fn keep(volume: VolumeId, id: u64) {
 
 /// Whether `volume` changed past what its tracker `id` consumed (`Some(true)`), parking `waker` until it does when it
 /// has not (`Some(false)`); `None` when that tracker or the volume is gone.
-fn park(s: &mut ShardState, (volume, id): (VolumeId, u64), waker: &std::task::Waker) -> Option<bool> {
+fn park(
+  s: &mut ShardState,
+  (volume, id): (VolumeId, u64),
+  waker: &std::task::Waker,
+) -> Option<bool> {
   if s.nfs_writeback.trackers.get(&volume)?.id != id {
     s.count(STALE_KEEPERS, 1);
     return None;
