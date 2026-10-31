@@ -23,7 +23,8 @@ use slates_client::{
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
-use common::landing::{approve, connect, deadlines, scratch};
+use common::client::{connect, deadlines, scratch};
+use common::landing::approve;
 use common::nfs::{create, mount, write};
 use common::target::target_dir;
 

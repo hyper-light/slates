@@ -12533,7 +12533,9 @@ between shards, a WRITE judged before it is served, a READ's bytes and a call's 
 `tests/nfs_writeback.rs`, new), `crates/bridge-fuse`
 (`coherence.rs`: an empty range clipped to nothing), `crates/cli/examples/nfs_writeback_ab.rs` (new), and three records
 in `docs/bugs/` (2026-10-31: the byte states' empty range, a connection's end sent to every shard, a keeper that took
-a newer tracker).
+a newer tracker); in a second commit the same day, `crates/cli/tests/cli.rs` (the dirty-page test through Apple's
+client, on CI's macOS runner) and `docs/bugs/2026-10-21-a-dirty-shared-map-page-overwrites-a-later-write-through-another-path.md`
+(its macOS side, decided).
 - **What was open.** An NFS v3 client writes a dirty page back whole: the program's stores and the rest of the page as
   it was fetched. Through Apple's client a page dirtied through a shared map and not synced while another path replaced
   the file came back over the replacement, and the replacement's 16,384 bytes were lost (3 of 3, diagnostics run
@@ -12561,7 +12563,11 @@ a newer tracker).
   after a refetch, a blind write, an identical rewrite) and answered hostile offsets. Through Apple's client (macOS
   26.6.2 on CI's runner, diagnostics runs 41230091726 and 41233122465), in each order of a store and another path's
   write — the measured order, the same with no `stat` before the `msync`, and the other path first — arm A lost the
-  other path's write in every run (9 of 9) and arm B kept it in every run (9 of 9). The hostile NFS suite, interleaved
+  other path's write in every run (9 of 9) and arm B kept it in every run (9 of 9); the measured order is now a test of
+  the CLI suite on CI's macOS runner (`a_dirty_shared_map_page_never_undoes_a_later_write_through_the_nfs_mount`; with
+  the refusal disabled it fails with 16,383 of 16,384 bytes the page's stale copy, on this Mac's own client), and
+  the suite's five other mapped-mount tests, which write through a map around other paths' changes, pass through
+  Apple's client with the rule in place. The hostile NFS suite, interleaved
   on fedora-2 under its caps (`CPUWeight=1`), passed 8 of 8 in each arm at load 72–139 with arm B as landed. An earlier
   series at load 24–63 found the keeper defect below in arm B, and failed the broken-connections test the same way in
   both arms once each (`SYSTEM_ERR` to an honest client, A's daemon reporting its shard starved 1.6 s): main's, not

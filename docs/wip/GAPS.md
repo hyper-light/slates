@@ -11942,7 +11942,10 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       - Through Apple's client (macOS 26.6.2, CI's runner; diagnostics runs 41230091726 and 41233122465): in every order
         of a store and another path's write — the measured one, one with no `stat` before the `msync`, and one where the
         other path wrote first — arm A lost the other path's write (5 of 5, 2 of 2, 2 of 2) and arm B kept it (5 of 5,
-        2 of 2, 2 of 2), counting its refusals.
+        2 of 2, 2 of 2), counting its refusals. The CLI suite holds the order with no `stat` on CI's macOS runner
+        (`a_dirty_shared_map_page_never_undoes_a_later_write_through_the_nfs_mount`; red-checked on this Mac with the
+        refusal disabled: 16,383 of 16,384 bytes the page's stale copy), and its five other mapped-mount tests pass
+        through Apple's client with the rule in place.
       - Performance (`docs/wip/BENCHMARKS.md`): through the mount, no difference outside the runner's spread (a 64 MiB
         write and `fsync`, rounds of map stores synced) and 0.1–0.3 % more daemon memory; in process, nothing measurable
         while quiet, and while another connection writes a write-back 2 to 3 % slower and up to 10 % fewer a second (the

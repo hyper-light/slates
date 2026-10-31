@@ -22,7 +22,7 @@ use slates_client::{Client, Intent, VolumeId};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
-use common::landing::{connect, scratch};
+use common::client::{connect, scratch};
 use common::target::{TargetDir, target_dir};
 
 /// Shape: the shard counts the SDK test runs on. On one shard the client is served where its volume lives, so an

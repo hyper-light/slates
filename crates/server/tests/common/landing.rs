@@ -2,56 +2,10 @@
 //! scratch volumes, and a landing presented and approved the way the human's surface approves it (the proof
 //! under the daemon's issuer secret).
 
-use std::time::{Duration, Instant};
-
-use slates_client::{
-  Client, ClientError, CreateSpec, Deadlines, Landing, NamePolicy, SizeClass, SnapshotId, VolumeId,
-};
+use slates_client::{Client, Landing, SnapshotId, VolumeId};
 use slates_ipc::protocol::{Filter, GrantScope};
-
-/// Shape: how long a client retries the rendezvous while a daemon starts.
-const START_WAIT: Duration = Duration::from_secs(5);
 /// Shape: the grant term of the tests' approvals: a minute, far past any test.
 pub(crate) const GRANT_TERM_NS: u64 = 60_000_000_000;
-
-/// The product's own deadlines (`Deadlines::derive` over the anchor's liveness budget and the recovery
-/// budget).
-pub(crate) fn deadlines() -> Deadlines {
-  Deadlines::derive(
-    slates_server::daemon::LIVENESS_BUDGET_NS,
-    slates_db::replay::RECOVERY_BUDGET_NS,
-  )
-  .get()
-}
-
-/// A client of `instance`, retrying the rendezvous while the daemon starts.
-pub(crate) fn connect(instance: &str) -> Client {
-  let started = Instant::now();
-  loop {
-    match Client::connect(instance, deadlines()) {
-      Ok(client) => return client,
-      Err(ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. }))
-        if started.elapsed() < START_WAIT =>
-      {
-        std::hint::spin_loop();
-      }
-      Err(e) => panic!("{e}"),
-    }
-  }
-}
-
-/// A four-mebibyte scratch volume named `name`.
-pub(crate) fn scratch(name: &str) -> CreateSpec {
-  CreateSpec {
-    name: name.to_owned(),
-    // 4 MiB: room for the fairness test's 600 files in the inode allowance, a quota's share of the slab at about
-    // 2.4 KB per inode (A-109); 1 MiB allowed 436.
-    size: SizeClass::Bounded { limit: 4 << 20 },
-    names: NamePolicy::Exact,
-    require_locked: false,
-    base: None,
-  }
-}
 
 /// Presents the landing of `snapshot` (the head when `None`) into `target` and approves it once; the
 /// grant id.

@@ -18,7 +18,7 @@ use slates_client::{ClientError, Intent, Refusal};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
-use common::landing::{connect, scratch};
+use common::client::{connect, scratch};
 use common::target::target_dir;
 
 /// Shape: two shards, so the volume's owner may not be the shard the client lands on.

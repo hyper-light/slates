@@ -1,7 +1,8 @@
 # A dirty page in a mount's shared map is written back over a later write through another path
 
 **Status:** fixed on Linux FUSE (A-139; its basis revised 2026-10-22 by A-140, after revision 3 refused a long-lived
-map's write-backs). Open on macOS, where NFS v3 cannot carry the fix (below). Root cause confirmed by measurement on
+map's write-backs). On macOS, decided 2026-10-31 by Ada's A/B (A-192): the server refuses a stale write-back, so the
+later write survives and the dirty page's store goes with the refusal (below). Root cause confirmed by measurement on
 both platforms and in the Linux 6.12 source.
 **Severity:** loss of an acknowledged write. Bytes another path wrote, including bytes the map never touched,
 revert to their earlier value.
@@ -136,9 +137,14 @@ The one passing run had passed by timing: the store's page was written back befo
 fetched and before the change is delivered, is kept back too. That is two writers racing on the same bytes. For
 writers that hold no kernel lock it closes once they are answered after delivery (AC-3.3, open in the ledger).
 
-**macOS (open, Ada's decision).** NFS v3 has no write-back mark and no callback, so the server cannot tell a stale
-write-back from a new write. The options are NFSv4 with delegations, where the recall gate already does this (the Mac
-client is v4.0, which D-2 rejects), or recording such sharing as unsupported on the Mac.
+**macOS (decided 2026-10-31, A-192).** NFS v3 has no write-back mark and no callback, and Apple's NFSv4.1 recall
+returns its delegation without flushing, so the client cannot be made to write back first. Instead the server keeps,
+per connection, the byte states A-140 keeps per FUSE mount, fed by the connection's READs, its own changes and every
+other change, and refuses (`NFS3ERR_IO`) a WRITE whose stale bytes differ from the file. Through Apple's client the
+later write survived 9 of 9 (it was lost 9 of 9 before); `a_dirty_shared_map_page_never_undoes_a_later_write_through_the_nfs_mount`
+in `crates/cli/tests/cli.rs` holds it on CI's macOS runner. The store is lost with the refused write-back, silently,
+since Apple's client tells the program nothing, and keeping both would take a byte-level merge (banned item 11); the
+socket route's writable map (A-186) keeps both.
 
 ## Verification
 

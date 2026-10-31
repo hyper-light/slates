@@ -3531,7 +3531,7 @@ fn landing_a_delegated_volume(
 ) {
   let (daemon, client, a, fh_a, delegation, v3, _file) = delegated_to_a(name);
   let secret = daemon.segment().issuer_secret().unwrap();
-  let mut lander = common::landing::connect(daemon.instance());
+  let mut lander = common::client::connect(daemon.instance());
   let volume = lander
     .list()
     .unwrap()

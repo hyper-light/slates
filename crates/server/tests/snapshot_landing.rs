@@ -17,7 +17,8 @@ use slates_ipc::protocol::Filter;
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
-use common::landing::{approve, connect, scratch};
+use common::client::{connect, scratch};
+use common::landing::approve;
 use common::nfs::{create, lookup, mount, read, write};
 use common::target::target_dir;
 

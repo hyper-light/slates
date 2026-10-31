@@ -6868,9 +6868,9 @@ impl MappedThroughAMount {
     assert!(synced.is_ok(), "the map's write is flushed: {synced:?}");
   }
 
-  /// `msync`s the whole map, so every page it dirtied is written back before this returns. Linux only, as the tests that
-  /// leave a map's stores unsynced are.
-  #[cfg(target_os = "linux")]
+  /// `msync`s the whole map, so every page it dirtied is written back before this returns. Linux and macOS, as the tests
+  /// that leave a map's stores unsynced are.
+  #[cfg(any(target_os = "linux", target_os = "macos"))]
   fn sync_map(&mut self) {
     // SAFETY: syncs exactly the live map made in `with_pages`.
     let synced =
@@ -7250,8 +7250,9 @@ fn a_shared_map_a_second_mount_and_the_sdk_agree_with_the_volume_through_a_gener
 /// the replacement's, in slates and in the map. Then store again, write other bytes of the same page through a second
 /// mount, sync. Expect both: the store and the second mount's bytes, as one shared page cache would hold them.
 ///
-/// Linux only. An NFS v3 client cannot be told of the other write and its write-back carries no mark, so on macOS the
-/// later write is lost (measured; the bug record says what deciding it needs).
+/// Linux only. On macOS an NFS v3 client cannot be told of the other write, and since A-192 the server refuses the dirty
+/// page's stale write-back: the replacement survives (the test after this one), but the store goes with the refusal,
+/// and keeping both, as the second half here does, would take a byte-level merge, which is banned.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path() {
@@ -7286,6 +7287,32 @@ fn a_dirty_shared_map_page_never_undoes_a_later_write_through_another_path() {
   assert!(
     fixture.follows_bytes(&expected),
     "the map reads both within {WAIT_FOR:?}"
+  );
+}
+
+/// §4.6 the mount route's dirty pages on macOS (A-192). Apple's NFS client writes a page dirtied through a shared map back
+/// whole, with the bytes it fetched before another path's write, and no recall makes it flush first. Do: store a byte
+/// through the map and leave it unsynced; replace the whole file through the SDK; sync the map. Expect every byte the
+/// replacement's in slates: the server refuses the write-back whose stale bytes would undo it. Before A-192 the file
+/// ended the store and 16,383 stale bytes, the replacement lost (diagnostics run 40821794698, 3 of 3; arm A of the A/B
+/// 9 of 9). The store is lost with the refused write-back and the `msync` answers 0, since Apple's client tells the
+/// program nothing of the refusal; A-192 states that, and the socket route's writable map keeps both (A-186).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_dirty_shared_map_page_never_undoes_a_later_write_through_the_nfs_mount() {
+  if !live_mount_runs() {
+    return;
+  }
+  let mut fixture = MappedThroughAMount::new("mapstale", b'A');
+  let length = fixture.length;
+  fixture.view()[0] = b'Z';
+  fixture.replace_through_slates(b'C');
+  fixture.sync_map();
+  let bytes = fixture.volume_bytes();
+  let stale = bytes.iter().filter(|byte| **byte == b'A').count();
+  assert!(
+    bytes == vec![b'C'; length],
+    "the later replacement survives the dirty page's write-back: {stale} of {length} bytes are the page's stale copy"
   );
 }
 

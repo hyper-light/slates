@@ -30,7 +30,7 @@ use slates_client::{Client, Intent, VolumeId};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
-use common::landing::{connect, scratch};
+use common::client::{connect, scratch};
 use common::nfs::{create, mount, read_whole, write_at_status};
 
 /// Format: the page a client writes back whole: Apple silicon's 16 KiB, the page of the measured case.

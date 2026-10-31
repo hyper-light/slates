@@ -21,7 +21,7 @@ use slates_client::Intent;
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
-use common::landing::{connect, scratch};
+use common::client::{connect, scratch};
 use common::target::target_dir;
 
 /// Shape: two shards, so the two mounts' tasks and the client may land on different shards.
