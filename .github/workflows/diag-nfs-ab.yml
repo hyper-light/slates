@@ -31,7 +31,7 @@ jobs:
         run: cd arm-a && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-a" cargo build --release -p slates-cli --bin slates
       - name: Interleaved, three times
         run: |
-          for run in 1 2 3; do
+          for run in 1 2; do
             for arm in A B; do
               if [ "$arm" = A ]; then bin="$GITHUB_WORKSPACE/target-a/release/slates"; else bin="$GITHUB_WORKSPACE/target/release/slates"; fi
               work="$RUNNER_TEMP/nfsab-$arm-$run"

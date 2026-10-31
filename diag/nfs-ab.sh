@@ -38,24 +38,40 @@ import mmap, os, subprocess, sys, time
 mnt, page, s, inst, vid, att, arm, dpid = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8]
 path = os.path.join(mnt, "map.bin")
 
-# 1. The measured case.
-f = open(path, "r+b")
-m = mmap.mmap(f.fileno(), page, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
-m[0:1] = b"Z"
-subprocess.run([s, "--instance", inst, "write", vid, att, "map.bin"], input=b"C" * page, check=True, capture_output=True)
-os.stat(path)
-synced = "ok"
-try:
-    m.flush()
-except OSError as e:
-    synced = "refused errno %d" % e.errno
-try:
-    m.close()
-    f.close()
-except OSError as e:
-    synced += ", close refused errno %d" % e.errno
-out = subprocess.run([s, "--instance", inst, "read", vid, "map.bin"], capture_output=True, check=True).stdout
-print("AB-KERNEL %s case: msync %s; the file: C %d, A %d, Z %d, length %d" % (arm, synced, out.count(b"C"), out.count(b"A"), out.count(b"Z"), len(out)), flush=True)
+# 1. Three orders of a store through a shared map and another path's write, each on a file of its own, each reported:
+#    "measured": store, the other path's replace, a stat, msync (diagnostics run 40821794698's order);
+#    "nostat":   store, the other path's replace, msync with no stat between;
+#    "reverse":  the map faulted in, the other path's replace, then the store, then msync.
+def run_case(name, order):
+    target = os.path.join(mnt, name + ".bin")
+    subprocess.run([s, "--instance", inst, "write", vid, att, name + ".bin"], input=b"A" * page, check=True, capture_output=True)
+    f = open(target, "r+b")
+    m = mmap.mmap(f.fileno(), page, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+    first = m[0:1]
+    replace = lambda: subprocess.run([s, "--instance", inst, "write", vid, att, name + ".bin"], input=b"C" * page, check=True, capture_output=True)
+    if order == "reverse":
+        replace()
+        m[1:2] = b"Z"
+    else:
+        m[0:1] = b"Z"
+        replace()
+        if order == "measured":
+            os.stat(target)
+    synced = "ok"
+    try:
+        m.flush()
+    except OSError as e:
+        synced = "refused errno %d" % e.errno
+    try:
+        m.close()
+        f.close()
+    except OSError as e:
+        synced += ", close refused errno %d" % e.errno
+    out = subprocess.run([s, "--instance", inst, "read", vid, name + ".bin"], capture_output=True, check=True).stdout
+    print("AB-KERNEL %s %s: first byte %r; msync %s; the file: C %d, A %d, Z %d, length %d" % (arm, name, first, synced, out.count(b"C"), out.count(b"A"), out.count(b"Z"), len(out)), flush=True)
+
+for name in ("measured", "nostat", "reverse"):
+    run_case(name, name)
 
 # 2. Throughput through the mount.
 big = os.path.join(mnt, "big")
