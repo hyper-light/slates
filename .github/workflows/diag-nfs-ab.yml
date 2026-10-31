@@ -1,0 +1,45 @@
+name: DIAG A-192's A/B through macOS's own NFS v3 client (not for main)
+
+# Diagnostics, never merged. Ada's A/B of 2026-10-31: arm A (main: sync-point coherence) against arm B (a stale write-back
+# refused). Both arms built in one job on one runner, then run interleaved, three times each: the measured case of a
+# dirty mapped page against another path's write (diagnostics run 40821794698 found the other path's bytes lost), and
+# throughput and memory through the mount. Each run unmounts before its daemon stops.
+
+on:
+  push:
+    branches: [diag-nfs-ab]
+
+jobs:
+  kernel:
+    name: the A/B through the macOS NFS v3 mount (macos-latest)
+    runs-on: macos-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: nfs-ab-a
+          path: arm-a
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: The machine
+        run: sw_vers && uname -a && sysctl -n hw.pagesize hw.ncpu && sysctl -n vm.loadavg
+      - name: Build arm B (this branch)
+        run: cargo build --release -p slates-cli --bin slates
+      - name: Build arm A (main and the shared suite)
+        run: cd arm-a && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-a" cargo build --release -p slates-cli --bin slates
+      - name: Interleaved, three times
+        run: |
+          for run in 1 2 3; do
+            for arm in A B; do
+              if [ "$arm" = A ]; then bin="$GITHUB_WORKSPACE/target-a/release/slates"; else bin="$GITHUB_WORKSPACE/target/release/slates"; fi
+              work="$RUNNER_TEMP/nfsab-$arm-$run"
+              mkdir -p "$work"
+              echo "== run $run arm $arm, load $(sysctl -n vm.loadavg)"
+              ./diag/nfs-ab.sh "$arm" "$bin" "$work" || echo "run $run arm $arm exited $?"
+            done
+          done
+      - name: Anything left mounted
+        if: always()
+        run: mount | grep nfsab || echo "nothing mounted"
