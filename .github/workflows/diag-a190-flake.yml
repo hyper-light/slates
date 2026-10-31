@@ -11,7 +11,7 @@ on:
 
 jobs:
   loop:
-    name: the WinFsp tests fifteen times on windows-latest, Docker's engine running
+    name: the WinFsp tests fifteen times on windows-latest, Docker's engine running and every core loaded
     runs-on: windows-latest
     timeout-minutes: 120
     steps:
@@ -44,6 +44,14 @@ jobs:
         env:
           AWS_LC_SYS_PREBUILT_NASM: "0"
         run: cargo test -p slates-cli --test winfsp --no-run
+      - name: Load every core, as the failing job's machine profile found its runner loaded
+        shell: pwsh
+        run: |
+          $cores = [Environment]::ProcessorCount
+          for ($k = 0; $k -lt $cores; $k++) {
+            Start-Process -WindowStyle Hidden -FilePath pwsh -ArgumentList '-NoProfile', '-Command', 'while ($true) { }'
+          }
+          "started $cores spinners"
       - name: The WinFsp tests fifteen times
         shell: bash
         env:
