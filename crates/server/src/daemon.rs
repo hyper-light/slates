@@ -3270,6 +3270,8 @@ fn init_shard(
     tracer: slates_wire::observe::Tracer::new(host.0, partition),
     current_span: None,
     reply_route: None,
+    told_waiters: crate::told::ToldWaiters::default(),
+    told_owed: None,
     current_request: None,
     acceptance_deferred: false,
     lease_waiters: crate::lease_wait::LeaseWaiters::default(),
@@ -4665,8 +4667,9 @@ fn log_late_beat(
 }
 
 /// Shape: a beat that late — this share of the liveness budget or more after the last — is logged as a near
-/// miss ([`log_late_beat`]): half the budget, so the stalls that stop short of a kill are seen too.
-const LATE_BEAT_SHARE: u64 = 2;
+/// miss ([`log_late_beat`]): half the budget, so the stalls that stop short of a kill are seen too. A writer waits for
+/// its volume's FUSE mounts no longer than that ([`crate::told::TOLD_WAIT_NS`], AC-3.3).
+pub(crate) const LATE_BEAT_SHARE: u64 = 2;
 
 /// Format: nanoseconds per millisecond, for the late-beat log.
 const NS_PER_MS: u64 = 1_000_000;

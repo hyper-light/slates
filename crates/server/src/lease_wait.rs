@@ -190,6 +190,10 @@ fn run(state: &mut ShardState, waiter: LeaseWaiter, confirmed: bool) {
   state.db.begin();
   state.current_request = Some((origin, id));
   state.reply_route = route;
+  // Where the verb's volume stands in its journal before it runs, as `run_recorded` notes it (AC-3.3).
+  let mark = body
+    .volume()
+    .and_then(|volume| crate::told::mark(state, crate::verbs::to_db_volume(volume)));
   let reply = if confirmed {
     crate::verbs::dispatch(state, client_id, &principal, body)
   } else {
@@ -220,6 +224,15 @@ fn run(state: &mut ShardState, waiter: LeaseWaiter, confirmed: bool) {
   let Some(route) = route else {
     // A verb forwarded from another node: its exchange polls the completion record.
     return;
+  };
+  // A change the verb recorded is told to every FUSE mount of its volume before the reply (AC-3.3): held and sent by
+  // a task of this shard; a reply that cannot be held goes now, counted.
+  let (route, recorded) = match mark.and_then(|mark| crate::told::owed(state, mark)) {
+    Some(owed) => match crate::told::hold_until_told(state, owed, route, recorded) {
+      None => return,
+      Some(unheld) => unheld,
+    },
+    None => (route, recorded),
   };
   let delivery = slates_rt::task::SpawnRequest::new(
     Box::pin(async move {

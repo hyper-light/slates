@@ -558,6 +558,13 @@ pub struct ShardState {
   /// its reply to the merge plane to deliver once the record is placed. `None` for a verb forwarded
   /// from another node (its reply travels back on the fleet exchange that carried it).
   pub(crate) reply_route: Option<crate::merge_service::ReplyRoute>,
+  /// The writers parked until every FUSE mount of their volume has been told of their change, and the replies held for
+  /// them (AC-3.3; `crate::told`). Bounded by the tasks waiting and the shard's client credit.
+  pub(crate) told_waiters: crate::told::ToldWaiters,
+  /// What the reply of the verb `run_recorded` just ran owes its volume's FUSE mounts, when the verb has no ring route
+  /// to hold its reply on: a verb forwarded from another node, whose exchange awaits it on this shard before answering
+  /// (`verbs::serve_forward`; AC-3.3). Cleared by each `run_recorded`, taken by its caller.
+  pub(crate) told_owed: Option<crate::told::Owed>,
   /// The completion key of the recorded verb now running — its origin (the requesting node's stable
   /// anchor) and request id — set by `run_recorded` for the verb's duration, so a verb that defers its
   /// acceptance (AUD-11) records the completion under the same key later. `None` between verbs.

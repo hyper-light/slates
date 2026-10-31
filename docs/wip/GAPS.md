@@ -2683,7 +2683,8 @@ mutation — `inval_inode` (an inode's attributes and a data range), `inval_entr
 name → node mapping) and `delete` (an entry removed). They are pure encoders (the header with a
 zero unique and the notification code in `error`, then the body), tested on every host with
 golden byte checks (4 tests). The driver writes them before it acknowledges a mutating request,
-so a second process never reads stale attributes after the mutating call returns (AC-3.3); wiring
+so a second process never reads stale attributes after the mutating call returns (AC-3.3; delivery before each request
+was withdrawn on 2026-10-17, and since A-191 a writer outside FUSE waits for every mount to be told); wiring
 them into the mutating dispatch paths is the driver's, with the transport.
 
 Base files through the bridge landed 2026-09-05 (Phase 3 task 8's read path, §4.6 "Base files",
@@ -10760,16 +10761,32 @@ fault included. macOS over NFS v3 cannot be told of a change at all; its tests a
 the limit is recorded in the mount-route design.
 (`docs/bugs/2026-10-21-a-fuse-mount-hears-of-another-paths-change-only-on-its-next-request.md`.)
 
-**Open (AC-3.3): the mount is told after the writer is answered, not before.** AC-3.3 reads "every mutation
-invalidates before it is acknowledged (a second process never reads stale attributes after the mutating call
-returns)". The 2026-10-17 amendment withdrew delivery before each request on the mount's own serving thread (it
-deadlocked), but AC-3.3's text was never brought into line. For a change through another path the window is now the
-82 µs median above, not indefinite, yet it is still a window: a reader of the mount right after the write returns can
-see the old bytes. Writers that hold no kernel lock — the typed channel and SDK, NFS, merges — could wait, without
-blocking their shard, until every FUSE mount of the volume has been told. A write through one FUSE mount cannot wait on
-another: the kernel holds the written pages locked for the whole request, so two mounts writing one file, each waiting
-for the other's invalidation, would deadlock — the amendment's reason again. Owed: the design's answer for each source,
-and AC-3.3's text.
+**Closed 2026-10-30 by A-191 (AC-3.3): a writer outside FUSE is answered once every FUSE mount of its volume has been
+told.** It was open as "the mount is told after the writer is answered, not before": AC-3.3 read "every mutation
+invalidates before it is acknowledged", the 2026-10-17 amendment had withdrawn delivery before each request on the
+mount's own serving thread (it deadlocked), and a reader of the mount right after another path's write returned could
+see the old bytes for the 82 µs median above.
+- **The answer for each source.** A verb over the typed channel (the SDKs, the CLI, MCP, the merge plane's verbs, all run
+  by `run_recorded`, cross-node forwards included), an NFS call (v3, and v4's operations through it), a direct map's
+  write-back and a parked verb's late run each note the volume's journal head before they run, and their reply waits on
+  the volume's owner shard, without blocking it, until every FUSE mount of the volume has been told through the newest
+  record they made (`crates/server/src/told.rs`; a mount's told point is `ServeState::told_through`). The wait ends at
+  half the liveness budget, 500 ms, past which the writer is answered and the mount counted `fuse.told_overdue`.
+  A write through a FUSE mount is answered at once, as before: requests on two mounts could otherwise each wait for the
+  other's notification. AC-3.3's text now states that window.
+- **Proven** (fedora-2, Linux 6.19, 2026-10-30; `crates/server/tests/fuse_told.rs`): with two FUSE mounts of one volume
+  mapping one file, 0 of 200 first reads after an SDK write (one shard and two) or an NFS WRITE were stale; a copy whose
+  writers never wait had 7 of 200 and 58 of 200 stale; a copy whose mounts are never told answered every write at the
+  bound, counted. The FUSE-to-FUSE window: a median of 21–35 µs in seven release runs, 1.7 ms in an eighth at a
+  busier moment, at worst 40 ms.
+- **Cost** (`docs/wip/BENCHMARKS.md`): with a mount, an SDK write's p50 about 28 → 40 µs and p90 about 35 → 53 µs; with
+  none, unchanged.
+- **Owed:**
+  - A guest's write through slates' own virtio-fs device (in-process or `slates vhost-user`) or a Shards stream, and a
+    Shards guest's DAX stores compared back at its sync points, are not held: each device's loop answers its requests in
+    order, so holding one reply would stall the queue behind it; a held reply needs completions out of order.
+  - A retry of a held request is answered from its completion record at once, not held again.
+  - A write through a FUSE mount, by design (above).
 
 ### 2026-10-21: an anchor exited during its boot once in seven Linux CLI suite runs — mechanism shown and fixed 2026-10-22 (A-145); this event's trigger unshown
 
@@ -11005,7 +11022,8 @@ stale page back, and the other write's bytes on it reverted: measured 4,095 of 4
   write-back in `coherence_mount` was refused unknown. A sweep of the trait's implementers found only this one;
   `VolumeBridge` and `ScopedBridge` implement both.
 - **The residual:** a store into bytes another path is changing, made between the page's fetch and the change's
-  delivery. That needs AC-3.3, above.
+  delivery. AC-3.3's wait (A-191, above) narrows it: a writer outside FUSE returns only once every mount was told, so
+  only a store concurrent with its call, or with a write through another FUSE mount, still races.
 
 (`docs/bugs/2026-10-21-a-dirty-shared-map-page-overwrites-a-later-write-through-another-path.md`).
 
@@ -11103,7 +11121,8 @@ without a user namespace, which needs root.
     orphan that carries one (the lineage the rolled-back record named must be read before the rollback).
 
   AC-3.3's residual applies to a guest as to any map: a store into bytes another path is changing, made between the
-  page's fetch and the change's delivery, is kept back.
+  page's fetch and the change's delivery, is kept back (since A-191 only a store concurrent with the other path's call,
+  or with a write through another FUSE mount).
 - **Found by the guest takeover test: a restored mount lost a store made after a re-fetch — fixed (A-147).** With a
   daemon killed under the guest's live map, a store the guest made after re-fetching another path's write was kept
   back after the takeover, 3 of 3. The same holds for any process's map, without a VM. The entry "A restored mount's

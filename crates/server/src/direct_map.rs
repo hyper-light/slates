@@ -348,11 +348,16 @@ fn sync_then(
       feature: "a direct map's write-back outside a recorded request".to_owned(),
     });
   };
+  // Where the map's volume stands in its journal before the write-back: its reply waits for the volume's FUSE mounts
+  // to be told of what it writes (AC-3.3; `crate::told`).
+  let mark = held
+    .writer
+    .and_then(|(volume, _)| crate::told::mark(state, crate::verbs::to_db_volume(volume)));
   let sync = match Sync::new(state, client_id, held, principal.clone()) {
     Ok(sync) => sync,
     Err(refusal) => return refused(refusal),
   };
-  match defer_task(state, request, answer_after(sync, request, after)) {
+  match defer_task(state, request, answer_after(sync, request, (after, mark))) {
     // Never seen: `run_recorded` sends nothing for a verb that deferred its acceptance.
     Ok(()) => ReplyBody::Acknowledged,
     Err(refusal) => refused(refusal),
@@ -360,8 +365,13 @@ fn sync_then(
 }
 
 /// Runs `sync` to its end, then answers the request it was for: `MapSynced`, or the write-back's refusal; for a
-/// release, the copy let go first, whatever the write-back answered. Records the reply's completion and delivers it.
-async fn answer_after(mut sync: Sync, request: (u64, RequestId), after: AfterSync) {
+/// release, the copy let go first, whatever the write-back answered. Records the reply's completion and delivers it,
+/// once every FUSE mount of the volume has been told of what the write-back wrote since `mark` (AC-3.3).
+async fn answer_after(
+  mut sync: Sync,
+  request: (u64, RequestId),
+  (after, mark): (AfterSync, Option<crate::told::Mark>),
+) {
   // The shard's state is unreachable (its shutdown): no reply can be recorded, and the client's retry, on the shard
   // that succeeds this one, finds no map.
   let Some(outcome) = sync.run().await else {
@@ -382,10 +392,14 @@ async fn answer_after(mut sync: Sync, request: (u64, RequestId), after: AfterSyn
       }
     }
     let (reply, route) = complete(s, request, reply);
-    (reply, route, s.shard)
+    let owed = mark.and_then(|mark| crate::told::owed(s, mark));
+    (reply, route, s.shard, owed)
   });
   // Delivered after the state's borrow ends, since delivery takes it again.
-  if let Some((reply, Some(route), here)) = answered {
+  if let Some((reply, Some(route), here, owed)) = answered {
+    if let Some(owed) = owed {
+      let _ = crate::told::wait(owed).await;
+    }
     deliver_to(route, reply, here).await;
   }
 }

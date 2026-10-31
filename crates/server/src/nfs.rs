@@ -971,7 +971,8 @@ fn refused_for_write_delegation(
 }
 
 /// Serves one call locally, on this shard's volumes and synthetic root, as `requester` (the mounting
-/// user's subject and the group its created objects take).
+/// user's subject and the group its created objects take). With the reply goes what it owes the FUSE mounts of the
+/// volume it changed, if anything (AC-3.3; `crate::told`): the caller awaits that on this shard before it answers.
 fn serve_local(
   requester: Requester,
   xid: u32,
@@ -979,10 +980,14 @@ fn serve_local(
   procedure: u32,
   args: &[u8],
   port: u16,
-) -> (AcceptStatus, Vec<u8>) {
+) -> ((AcceptStatus, Vec<u8>), Option<crate::told::Owed>) {
   if let Some(early) = answered_or_refused(&requester, xid, program, procedure, args) {
-    return early;
+    return (early, None);
   }
+  // Where the call's volume stands in its journal before the call runs: its reply waits for the volume's FUSE mounts
+  // to be told of whatever it records (AC-3.3).
+  let mark = target_volume(program, procedure, args)
+    .and_then(|volume| state::with_state(|s| crate::told::mark(s, volume)).flatten());
   let call = requester.call;
   // The `bridge.request` chokepoint span (§4.14): one NFS bridge call from arrival to reply, served on
   // this shard's volumes, opened as a root — the kernel's call is the entry point of its trace. Its
@@ -1050,7 +1055,8 @@ fn serve_local(
   }
   // A change this call was refused for a delegation asked for a recall; it is sent now (A-79).
   let _ = state::with_state_counted(crate::delegation::drain);
-  result
+  let owed = mark.and_then(|mark| state::with_state(|s| crate::told::owed(s, mark)).flatten());
+  (result, owed)
 }
 
 /// What a call is answered with before it is served, if anything:
@@ -1156,15 +1162,22 @@ async fn serve_remote(
   args: Vec<u8>,
   port: u16,
 ) -> (AcceptStatus, Vec<u8>) {
-  let call = crate::xshard::call_on(origin, owner, move || {
-    Some(serve_local(requester, xid, program, procedure, &args, port))
-  });
-  let Ok(call) = call else {
-    return (AcceptStatus::SystemErr, Vec::new());
-  };
-  crate::xshard::within(call, crate::daemon::LIVENESS_BUDGET_NS)
-    .await
-    .unwrap_or((AcceptStatus::SystemErr, Vec::new()))
+  // A task on the owner, not a closure, so the reply can wait there for the volume's FUSE mounts to be told of the
+  // call's change (AC-3.3) without holding the owner's turn.
+  crate::xshard::task_within(
+    origin,
+    owner,
+    move || async move {
+      let (served, owed) = serve_local(requester, xid, program, procedure, &args, port);
+      if let Some(owed) = owed {
+        let _ = crate::told::wait(owed).await;
+      }
+      served
+    },
+    crate::daemon::LIVENESS_BUDGET_NS,
+  )
+  .await
+  .unwrap_or((AcceptStatus::SystemErr, Vec::new()))
 }
 
 // ------------------------------------------------------- the host root's cross-shard listing
@@ -1445,7 +1458,12 @@ async fn serve_local_held(
   let mut deadline: Option<u64> = None;
   loop {
     let seen = state::with_state(|s| s.store.recall_gate.refusals());
-    let served = serve_local(requester.clone(), xid, program, procedure, args, port);
+    let (served, owed) = serve_local(requester.clone(), xid, program, procedure, args, port);
+    // A change the call recorded is told to every FUSE mount of its volume before the reply (AC-3.3). A call the
+    // recall gate refused changed nothing, so it owes nothing and is not held here.
+    if let Some(owed) = owed {
+      let _ = crate::told::wait(owed).await;
+    }
     let gate = state::with_state(|s| {
       (
         s.store.recall_gate.refusals(),

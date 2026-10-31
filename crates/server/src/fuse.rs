@@ -539,6 +539,15 @@ fn owes_takeover_round(s: &ShardState, attachment: u64) -> bool {
     .is_some_and(|mount| mount.serve.owes_takeover_round())
 }
 
+/// Whether every FUSE mount of `volume` has been told through journal record `seq` (AC-3.3; `crate::told`): asked on the
+/// volume's owner shard, which serves all of its mounts. A mount whose kernel holds nothing yet owes nothing.
+pub(crate) fn every_mount_told_through(s: &ShardState, volume: VolumeId, seq: u64) -> bool {
+  s.fuse_mounts
+    .values()
+    .filter(|mount| mount.volume == volume)
+    .all(|mount| mount.serve.told_through().is_none_or(|told| told >= seq))
+}
+
 /// Waits until mount `attachment` has work (§4.6 cache posture): a request on its device, a finished round of
 /// notifications on its signal, or a change to its volume made through any other path. Until 2026-10-21 the device
 /// was the only source, so a change made elsewhere reached the kernel's cache only at its next request — never, on an
@@ -656,6 +665,7 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
   let Some(&handle) = s.by_id.get(&mount.volume) else {
     return Turned::Ended;
   };
+  let told_before = mount.serve.told_through();
   // The live-tree fence the NFS mount applies before every procedure (§4.8 "Leases and reads"; AUD-29-83):
   // while the owner's lease does not hold, no request is read, so none is answered from a stale view.
   if crate::verbs::live_tree_fenced(s, mount.volume) {
@@ -787,6 +797,11 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
       .volumes
       .get(handle)
       .map_or(mount.seen, |slot| slot.volume.change_generation());
+  }
+  // The writers parked on this volume ask again once its kernel was told further (AC-3.3; `crate::told`): a round came
+  // back, or the cursor moved past what needed no telling.
+  if mount.serve.told_through() != told_before {
+    crate::told::wake(s, mount.volume);
   }
   turned
 }
@@ -1114,6 +1129,8 @@ fn ended(s: &mut ShardState, attachment: u64) {
     release_states(s, &mount);
     s.attachments.revoke(mount.registry);
     s.attachments.drain(mount.registry);
+    // A gone mount holds no writer: those parked on it ask again (AC-3.3).
+    crate::told::wake(s, mount.volume);
   }
   // The anchor closes its copy of the device (A-61), so an ended mount is never handed to the next daemon.
   if matches!(crate::fuse_hold::release(attachment), Some(Err(_))) {
@@ -1154,6 +1171,7 @@ pub(crate) fn drop_devices(s: &mut ShardState) {
     if let Some(mount) = s.fuse_mounts.remove(&attachment) {
       close_journal_reader(s, &mount);
       release_states(s, &mount);
+      crate::told::wake(s, mount.volume);
     }
     let _ = crate::fuse_hold::release(attachment);
   }

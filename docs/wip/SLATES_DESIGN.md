@@ -2348,10 +2348,14 @@ mutation journals through `Volume::record` and every outsider change beneath a b
 hint sequence, and both wake the tasks parked on the volume, so a mount's task delivers the owed notifications at once
 rather than at its kernel's next request (2026-10-21; before then a change through any other path waited, owed, until
 the mount happened to get a request — indefinitely for a shared map or DAX through the mount, measured; see
-`docs/bugs/2026-10-21-a-fuse-mount-hears-of-another-paths-change-only-on-its-next-request.md`). "At once" is measured
-and is *after* the writer is answered: a shared map read the new bytes 52–193 µs after the reply, median 82 µs. AC-3.3's
-"invalidates before it is acknowledged" therefore does not hold for a change through another path; which writers can
-be made to wait for the mount, and which cannot without a deadlock, is open in the ledger. **What the kernel is told to
+`docs/bugs/2026-10-21-a-fuse-mount-hears-of-another-paths-change-only-on-its-next-request.md`). "At once" was measured
+*after* the writer's reply: a shared map read the new bytes 52–193 µs after it, median 82 µs. **Since A-191 a writer
+outside FUSE is answered only once every FUSE mount of its volume has been told** — a verb over the typed channel (the
+SDKs, the CLI, MCP, the merge plane's verbs), an NFS call, a direct map's write-back. Each mount's told point is its
+coherence cursor, held back while a round is out (`ServeState::told_through`); the writer's reply waits on the volume's
+owner shard without blocking it, at most half the liveness budget, past which it is answered and the late mount
+counted. A write through a FUSE mount is still answered first, since requests on two mounts, each waiting for the
+other mount's notification, could deadlock; AC-3.3 states that window. **What the kernel is told to
 drop is what changed** (A-146). A content change drops the cached pages holding the bytes it touched, never the whole
 file:
 - an overwrite, or bytes appended past the end, drops its own bytes;
@@ -7293,9 +7297,18 @@ fd handoff through the anchor, `slates exec`, the conformance and workload harne
 - AC-3.2 Every workload passes with outputs identical to tmpfs and `git status` clean; `cargo
   build` incremental reports "Fresh" (catches: mtime/inode instability).
 - AC-3.3 Kernel-cached operations are answered without a daemon round trip (measured: the daemon
-  sees no LOOKUP/GETATTR for cached entries), and every mutation invalidates before it is
-  acknowledged (a second process never reads stale attributes after the mutating call returns)
-  (catches: coherence bugs).
+  sees no LOOKUP/GETATTR for cached entries). A mutation by a writer outside FUSE — a verb over the
+  typed channel (the SDKs, the CLI, MCP, the merge plane's verbs), an NFS call, a direct map's
+  write-back — is acknowledged only once every FUSE mount of its volume has been told of it, so a
+  second process reading through a FUSE mount never reads stale names, attributes or bytes after
+  that call returns; the wait never blocks the shard and ends at half the liveness budget, past
+  which the writer is acknowledged and the late mount counted (A-191). A write through one FUSE
+  mount is acknowledged before the volume's other FUSE mounts are told, since requests on two
+  mounts could otherwise wait on each other: in that window a reader through another mount can see
+  the old bytes, measured at a median of 21–35 µs in seven runs and 1.7 ms in an eighth taken at a
+  busier moment, at worst 40 ms (Linux 6.19, release builds, 2026-10-30,
+  `crates/server/tests/fuse_told.rs`). A guest's write through slates' own virtio-fs device or a
+  Shards stream does not wait yet (GAPS) (catches: coherence bugs).
 - AC-3.4 Daemon restart with the fd handoff leaves open files usable after the window; the
   window is measured and within the recovery budget (catches: lost mounts).
 - AC-3.5 The launcher creates no filesystem entries; `slates exec` refuses unsatisfiable chosen
@@ -12495,6 +12508,64 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
 
+### A-191 — A writer outside FUSE is answered once every FUSE mount of its volume has been told (accepted and built 2026-10-30)
+Applied in the same change to: §4.6 ("Cache posture": the paragraph on when a mount is told), Phase 3's AC-3.3, A-139
+and A-140 (their residual), A-141 ("Why writers never wait instead"), GAPS, `crates/bridge-fuse` (`channel.rs`:
+`ServeState::told_through`, the takeover round's `takeover_out`), `crates/server` (`told.rs`, new: the wait, its bound
+and its counters; `fuse.rs`: `told_through` over a volume's mounts, the parked writers woken as a mount is told further
+or ends; `verbs.rs`: `run_recorded` holds a recorded verb's reply, `serve_forward` awaits a cross-node verb's; `nfs.rs`:
+an NFS call awaits its own; `direct_map.rs`: a write-back's reply; `lease_wait.rs`: a parked verb's late reply;
+`state.rs`, `daemon.rs`, `lib.rs`), `crates/server/tests/fuse_told.rs` (new), and `docs/wip/BENCHMARKS.md`.
+- **What was open.** AC-3.3 read "every mutation invalidates before it is acknowledged". Since 2026-10-21 a mount's task
+  tells its kernel as soon as another path changes the volume, but that was after the writer's reply: a shared map read
+  an SDK write's bytes 52–193 µs after the reply (median 82 µs), so a reader of the mount right after the write
+  returned could see the old bytes (GAPS, the AC-3.3 entry, closed by this amendment).
+- **The rule.** A writer that holds no kernel lock — a verb over the typed channel (the SDKs, the CLI, MCP and the merge
+  plane's verbs, all run by `verbs::run_recorded`), an NFS call, a direct map's write-back — notes its volume's journal
+  head before it runs. Its reply then owes every FUSE mount of the volume the newest record it made: each mount must
+  have been told through it. A mount's told point is its coherence cursor, held back while a round is out (that round's
+  records are told only once its write to the device returns) and while a restored mount's takeover round is unsent or
+  out; a mount whose first round has not run holds nothing and owes nothing (`ServeState::told_through`). The reply waits
+  on the volume's owner shard, which serves the volume and all its FUSE mounts, parked and woken as a mount is told
+  further or ends, so the shard serves on: a verb's reply is held and sent by a task, an NFS call's task awaits it, and
+  a verb forwarded from another node awaits it on the owner before its exchange answers. A reply that cannot be held
+  (the held replies at the shard's client credit, or no task) is answered at once and counted `fuse.told_unwaited`.
+- **The bound.** Half the liveness budget, 500 ms (`told::TOLD_WAIT_NS = LIVENESS_BUDGET_NS / LATE_BEAT_SHARE`): the
+  longest the daemon lets one of its own shards go unheard before it logs a near miss, so a live mount told late on a
+  loaded machine still holds its writer, and a writer held to it keeps half its client's reply deadline (the same
+  liveness budget; past it the client reports the verb stalled). Past the bound the writer is answered, its change
+  already applied and published, and the late mount counted `fuse.told_overdue`. This answers A-141's objection: a
+  mount whose round is blocked in its kernel holds each writer at most the bound, never for good.
+- **Why a write through FUSE does not wait.** A request through one FUSE mount holds its kernel's locks on what it
+  touches — a read's or a write's pages, a lookup's directory — until the daemon answers it, and another mount's
+  notification needs that mount's own locks. Two mounts each with a request in flight on one file, each reply waiting
+  for the other mount's notification, would wait on each other until the bound: the 2026-10-17 amendment's deadlock,
+  across two mounts. So a write through a FUSE mount is answered at once, and the volume's other FUSE mounts are told
+  just after, as before. AC-3.3's text states the window: a write through one mount reached a read-only map of the file
+  through the other after a median of 22–35 µs (p90 43–74 µs, worst 2.6 ms) in three runs of the change's release build
+  and 1.7 ms (worst 40 ms) in a fourth taken at a busier moment; the build without the wait, whose FUSE writes take the
+  same path, measured 21–29 µs (p90 24–34 µs, worst 263 µs) in four runs interleaved with them (fedora-2, Linux 6.19,
+  load 17–25). A debug build measured 237 µs.
+- **Proven** (fedora-2: Linux 6.19.10, x86_64, 32 cores, `fusermount3`, 2026-10-30), `crates/server/tests/fuse_told.rs`:
+  - **Red-checked**, a copy of the tree whose writers never wait (`told::owed` answering nothing), release builds,
+    interleaved with the change: after an SDK write on one shard 7 and 4 of 50 first reads of the maps were stale,
+    then 7 of 200 (on two shards, where the reply travels home first, 1 of 50); after an NFS WRITE 11, 13 and 10 of
+    50, then 58 of 200. The mount is often told before the writer's own thread has woken to read, which is why so few:
+    the test runs 200 writes, and one shard is its sharpest case.
+  - **With the change**, four runs of the release build and one of the debug: every first read after an SDK write and
+    after an NFS WRITE showed the write — 0 of 50 a case in four runs, then 0 of 200 (the one-shard SDK case in the last
+    three) — the daemon counting a wait per write, none overdue and none unheld.
+  - **The bound**, a copy of the tree whose mounts are never told (`told::told` answering false), five writes each:
+    every write was answered after the bound, `fuse.told_overdue` counting each (13 writes in 6.70 s, setup's
+    included), and no read was stale, since the mounts were in fact told well within it.
+  - The FUSE-to-FUSE window, the same test's third case: 50 of 50 and 199 of 200 first reads stale, as designed.
+  - Linux clippy `-D warnings` clean for `slates-bridge-fuse` and `slates-server`, every target.
+- **Cost** (`docs/wip/BENCHMARKS.md`): an SDK write to a volume a FUSE mount reads now waits for the mount's notify thread: with the mount, its p50 rose from about 28 µs to about 40 µs and its p90 from about 35 µs to about 53 µs; with no mount it is unchanged, about 13 µs (fedora-2, `write_round_ab`, release builds differing only in the wait, interleaved three times, load 19–20).
+- **What it does not change.** A write through a FUSE mount (the window above). A guest's write through slates' own
+  virtio-fs device or a Shards stream, answered by its device's loop in order, is not held yet (GAPS, owed). WinFsp
+  mounts are Windows' and never share a daemon with FUSE mounts. A retry of a held request is answered from its
+  completion record at once.
+
 ### A-190 — A mapped view through the WinFsp mount follows another path's change: the mount purges views through WinFsp's own coherent purge (accepted and built 2026-10-30; an experiment Ada asked to build and measure)
 Applied in the same change to: §4.6 ("Windows" and its status; the DAX matrix's A-164 status), A-177 (its decision by
 the run, superseded), `docs/wip/virtiofs.md` §8 (the bare-metal Windows mount-route cells, and the Shards Windows
@@ -14985,7 +15056,9 @@ tests in `bridge-core/tests/invalidation.rs`, `bridge-fuse/tests/kernel_changes.
   - an invalidation of a name takes it away, since a later use is a new lookup.
 - **Why writers never wait instead** (the alternative weighed in the bug record). Holding the journal for a lagging
   mount would make writers wait on mounts. That is the AC-3.3 machinery, and a mount whose round is blocked in its
-  kernel would hold every writer behind it. Pushing changes to each mount as they are journaled would keep a second
+  kernel would hold every writer behind it. (Since A-191 a writer outside FUSE does wait, for each mount's told point
+  rather than the journal, and at most half the liveness budget, so a blocked round holds a writer only that long; the
+  journal's retention is unchanged.) Pushing changes to each mount as they are journaled would keep a second
   record of every change beside the journal. An overrun costs one burst of notifications and a cold kernel cache, and
   only when the bound is reached.
 - **Evidence.** One SDK client pipelining a ring of writes onto a volume with a one-page journal left a FUSE mount
@@ -15026,7 +15099,8 @@ mount's own requests and at reads, and judged at write-back); `crates/server/src
   it can still be in flight (A-139's evidence).
 - **Proven.** See the bug record's verification.
 - **What it does not change.** The write-back's routing, the masked apply and the write log's applied parts, the first
-  writable open's cache drop, the residual race (AC-3.3), and every other transport.
+  writable open's cache drop, the residual race (AC-3.3; narrowed by A-191 to a store concurrent with another path's
+  call), and every other transport.
 - **Owed, stated in the ledger.**
   - A mount restored across a daemon restart has files whose opens predate the daemon. They have no states and are
     judged from the mount's start against every record since, as under A-139, so a long-lived one is refused past
@@ -15067,8 +15141,9 @@ record.
   masked; and any other transport. macOS NFS v3 cannot carry it, since it has no write-back mark and no callback: open
   in the ledger.
 - **Residual, stated.** A store into the very bytes another path is changing, made after its page's fetch and before
-  the change is delivered, is kept back: two writers racing on the same bytes. AC-3.3 would close it for writers that
-  hold no kernel lock.
+  the change is delivered, is kept back: two writers racing on the same bytes. Since A-191 a writer that holds no
+  kernel lock returns only after every mount was told, so a store made after its call returned lands on the new page;
+  only a store concurrent with the call, or with a write through another FUSE mount, still races.
 
 ### A-138 — A guest's DAX window is handed out as a descriptor covering only that window (accepted 2026-10-19)
 Applied in the same change to: §4.6 (DAX), `crates/bridge-virtiofs/src/udmabuf.rs` (new), `crates/bridge-virtiofs/src/device.rs`, `crates/mem/src/shared.rs`, `crates/bridge-virtiofs/tests/device.rs`, `unsafe-budget.toml`, GAPS (gate row 1), `docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md`.

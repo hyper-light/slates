@@ -53,6 +53,10 @@ use slates_bridge_core::{AttachmentId, Attachments, CachedBytes, Invalidation};
 /// Format: the device the kernel's FUSE client and the daemon exchange messages over.
 const FUSE_DEVICE: &str = "/dev/fuse";
 
+/// Format: the journal sequence before the volume's first record (`slates_vfs::journal::OpLog` numbers records from 1):
+/// a kernel told through it has been told of nothing ([`ServeState::told_through`]).
+const TOLD_OF_NOTHING: u64 = 0;
+
 /// Shape: the request buffer size: the negotiated maximum write (256 KiB) plus a page for the
 /// headers, the size the kernel expects a reader to offer so a large write arrives in one read.
 const BUFFER_BYTES: usize = 256 * 1024 + 4096;
@@ -617,6 +621,9 @@ pub struct ServeState {
   /// Where this mount's takeover round stands (A-158): the epoch bump and the invalidations of everything its kernel may
   /// hold older than the volume ([`takeover_told`]), sent in slices from a restored mount's first turn.
   takeover: Takeover,
+  /// Whether the round out carries a slice of the takeover round: until it is back, the kernel has been told of nothing
+  /// this mount's writers could rely on ([`ServeState::told_through`]).
+  takeover_out: bool,
   /// The time one slice of the takeover round may take on the serving thread, set by the owner before each turn from its
   /// shard's live step quantum ([`ServeState::slices_within`]). Zero sends one inode a slice.
   slice_ns: u64,
@@ -676,6 +683,7 @@ impl ServeState {
       adopts_unseen_handles: false,
       adopt_restored: false,
       takeover: Takeover::Told,
+      takeover_out: false,
       slice_ns: 0,
       epochs_bumped: 0,
       epochs_unsupported: 0,
@@ -724,6 +732,26 @@ impl ServeState {
   /// round is out this is false, and the round's return wakes the owner, so a takeover never spins its owner's shard.
   pub fn owes_takeover_round(&self) -> bool {
     self.takeover != Takeover::Told && !self.notifier.as_ref().is_some_and(Notifier::busy)
+  }
+
+  /// How far this mount's kernel has been told of its volume's journal, for a writer outside FUSE whose reply waits on
+  /// every mount of the volume (AC-3.3): the newest journal sequence such that the kernel holds nothing older that a
+  /// record up to it could have made stale. `None` while the kernel holds nothing at all — no round has run, and the
+  /// first starts at the head ([`Coherence::deliver`]), so no record before it can be in the kernel.
+  ///
+  /// It is the cursor, except while a round is out: that round's records are told only once its write returns, so the
+  /// kernel stands where the cursor stood before it (a first round out started at the head with an empty kernel, so the
+  /// cursor stands). The cursor also moves past this mount's own requests' records, which its kernel made and needs no
+  /// notice of. A mount taken over from a daemon that died has been told of nothing until its takeover round is sent and
+  /// back (A-158): the records before its adoption reach its kernel only through that round.
+  pub fn told_through(&self) -> Option<u64> {
+    if self.takeover != Takeover::Told || self.takeover_out {
+      return Some(TOLD_OF_NOTHING);
+    }
+    match self.notifier.as_ref().and_then(|notifier| notifier.out) {
+      Some(Some(before)) => Some(before.journal_seq),
+      Some(None) | None => self.coherence.cursor().map(|cursor| cursor.journal_seq),
+    }
   }
 
   /// Bounds each slice of the takeover round to `ns` of the serving thread (A-158): the owner's share of its shard's live
@@ -920,6 +948,8 @@ fn deliver_owed(
         gather_refused: true,
       });
     };
+    // The round is back, whatever its outcome: a takeover slice it carried is no longer out.
+    state.takeover_out = false;
     match outcome {
       Err(refusal) => {
         state.coherence.rewind(before);
@@ -993,6 +1023,7 @@ fn deliver_owed(
     };
     let notifier = state.notifier.insert(notifier);
     notifier.send(messages, before)?;
+    state.takeover_out = takeover.is_some();
   }
   if let Some(slice) = takeover {
     if state.takeover == Takeover::Owed {

@@ -6355,6 +6355,68 @@ A bare thread start and join, timed in the same runs: p50 16.2–19.8 µs, p90 2
 **What remains**, about 2 µs at the p90, is the round itself: the gather, the encode and the hand-off over the
 notifier's channel.
 
+## A writer outside FUSE waits for every FUSE mount to be told: what an SDK write pays (A-191; 2026-10-30)
+
+**The question.** Since A-191 the reply to a write through another path waits until every FUSE mount of the volume has
+been told: the mount's round gathered, its notifications written by the mount's notify thread, and the outcome back on
+the owner shard. Before, the writer was answered first and the round ran after (A-142's measurement: the p50 did not
+move with a mount). This measures what the wait adds.
+
+**The command.** `crates/cli/examples/write_round_ab.rs`, unchanged since A-142: an in-process daemon, one volume, and
+an SDK client timing 2,000 sequential 64-byte whole-file writes of one file per phase, phases alternating between no
+mount and a mount made by the real `slates mount` (which reads the file first), four phases each way. The "before" and
+"after" binaries were built from one tree in two target directories, differing only in `crates/server/src/told.rs`'s
+`owed`, which in "before" answers nothing, so no writer waits (binary hashes `82f4b694`, `9a14532b`). They ran
+interleaved, before then after, three times: `cargo build --release -p slates-cli --bin slates --example write_round_ab
+&& target/release/examples/write_round_ab`.
+
+**The machine.** fedora-2 (bare metal, x86_64, 32 cores, Linux 6.19.10, `fusermount3`), 2026-10-30 about 16:40 UTC,
+under the shared boxes' caps (a `systemd-run --user` unit, `CPUWeight=1`, `Nice=19`), with a load average of 19–20 from
+other work.
+
+| run | arm | phase | no mount p50 | no mount p90 | mounted p50 | mounted p90 |
+|---|---|---|---|---|---|---|
+| 1 | before | 0 | 14.5 | 29.2 | 67.5 | 87.6 |
+| 1 | before | 1 | 26.4 | 35.4 | 27.5 | 34.8 |
+| 1 | before | 2 | 13.4 | 18.5 | 28.8 | 35.1 |
+| 1 | before | 3 | 13.1 | 17.3 | 28.0 | 34.9 |
+| 1 | after | 0 | 12.9 | 19.6 | 40.2 | 49.7 |
+| 1 | after | 1 | 14.0 | 20.1 | 40.8 | 53.5 |
+| 1 | after | 2 | 13.8 | 19.4 | 39.3 | 49.7 |
+| 1 | after | 3 | 13.5 | 17.4 | 42.0 | 54.4 |
+| 2 | before | 0 | 17.4 | 24.8 | 34.9 | 47.5 |
+| 2 | before | 1 | 14.1 | 20.4 | 27.8 | 38.2 |
+| 2 | before | 2 | 12.7 | 20.8 | 29.0 | 32.9 |
+| 2 | before | 3 | 13.3 | 19.0 | 30.8 | 36.0 |
+| 2 | after | 0 | 15.4 | 22.0 | 46.3 | 65.6 |
+| 2 | after | 1 | 14.8 | 20.7 | 46.0 | 57.8 |
+| 2 | after | 2 | 14.0 | 21.0 | 42.9 | 53.5 |
+| 2 | after | 3 | 12.1 | 20.0 | 44.0 | 52.9 |
+| 3 | before | 0 | 12.2 | 19.7 | 28.1 | 34.8 |
+| 3 | before | 1 | 12.9 | 19.4 | 28.1 | 33.5 |
+| 3 | before | 2 | 11.4 | 19.9 | 28.0 | 34.7 |
+| 3 | before | 3 | 12.4 | 18.5 | 27.8 | 35.0 |
+| 3 | after | 0 | 11.9 | 25.6 | 38.0 | 105.8 |
+| 3 | after | 1 | 12.7 | 323.7 | 37.0 | 45.7 |
+| 3 | after | 2 | 10.8 | 13.2 | 37.2 | 43.4 |
+| 3 | after | 3 | 12.3 | 18.7 | 37.1 | 42.2 |
+
+Microseconds; the p99s (1.6–7.1 ms) and means are the box's background load in both arms and both modes, and are not
+read.
+
+**What it shows.**
+- **With a mount, the p50 rose from a median of 28.1 µs (27.5–67.5) to 40.5 µs (37.0–46.3), and the p90 from 35.0 µs
+  (32.9–87.6) to 53.2 µs (42.2–105.8).** That is the writer now waiting for the mount's notify thread to write the
+  round and the owner shard to take its outcome: about 12 µs at the median.
+- **With no mount nothing moved:** a median p50 of 13.2 µs before and 13.2 µs after. A writer whose volume has no FUSE
+  mount owes nothing and is not held.
+- **On this box the mounted p50 already sat about 15 µs above the unmounted one before the wait,** where A-142's run on
+  adacachy found them equal: the round runs on the owner shard between the writer's requests, and here, at `Nice=19`
+  under load, it delays the next write. The A/B's difference is the wait alone, since both arms ran the same rounds.
+
+**What it buys:** a reader of the mount after the write returns never sees the old bytes (A-191's proof). Before, it did
+in the window this wait now covers; one SDK write in ten and one NFS WRITE in four were caught by the test's first read.
+
 ## A change drops only its bytes from a mount's cache: what a guest's DAX map saves (A-146; 2026-10-22)
 
 **The question.** A guest's DAX map of a file shared through a slates mount lives in the host kernel's page cache for

@@ -903,16 +903,30 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
           prune_forwarded(s, origin_host, id.client, up_to);
         }
         // The fleet envelope carries no trace context yet: the verb's span declares its cause missing.
-        run_forwarded(s, origin_host, id, 0, &principal, body, None)
+        let reply = run_forwarded(s, origin_host, id, 0, &principal, body, None);
+        (reply, s.told_owed.take())
       },
       crate::daemon::LIVENESS_BUDGET_NS,
     )
     .await;
     match forwarded {
-      Some(Some(reply)) => Some(reply),
+      Some((Some(reply), owed)) => {
+        // A change the verb recorded is told to every FUSE mount of its volume before the exchange answers (AC-3.3):
+        // the wait runs on the owner shard, where the mounts are, and is bounded by its own deadline.
+        if let Some(owed) = owed {
+          let _ = crate::xshard::task_within(
+            control,
+            shard,
+            move || crate::told::wait(owed),
+            crate::daemon::LIVENESS_BUDGET_NS,
+          )
+          .await;
+        }
+        Some(reply)
+      }
       // The verb deferred its acceptance to a fleet commit (AUD-11): this exchange waits for the
       // completion record the commit writes, within the same liveness budget.
-      Some(None) => await_deferred_completion(control, shard, origin_host, id).await,
+      Some((None, _)) => await_deferred_completion(control, shard, origin_host, id).await,
       None => None,
     }
   } else {
@@ -2103,7 +2117,8 @@ fn serve_here(
   crate::delegation::drain(state);
   match reply {
     Some(reply) => Served::Reply(reply),
-    // The verb deferred its reply to a fleet commit (AUD-11): it comes back through `deliver`.
+    // The verb deferred its reply to a fleet commit (AUD-11), or its reply waits for its volume's FUSE mounts to be told
+    // (AC-3.3): it comes back through `deliver`.
     None => Served::Forwarded,
   }
 }
@@ -2146,9 +2161,15 @@ fn run_recorded(
   }
   state.db.begin();
   state.current_request = Some((origin, id));
+  // Where the verb's volume stands in its journal before it runs: its reply waits for the volume's FUSE mounts to be
+  // told of whatever it records (AC-3.3; `crate::told`).
+  state.told_owed = None;
+  let mark = body
+    .volume()
+    .and_then(|volume| crate::told::mark(state, to_db_volume(volume)));
   let reply = dispatch(state, client_id, principal, body);
   state.current_request = None;
-  state.reply_route = None;
+  let route = state.reply_route.take();
   // A verb that deferred its acceptance to a fleet commit (`submit` at `f > 0`; AUD-11) commits its
   // effects now but records no completion and gets no reply here: both follow the commit at the
   // quorum (`merge_service::resolve_accepted`), so a retry meanwhile joins the wait, never reads a
@@ -2184,9 +2205,20 @@ fn run_recorded(
   crate::telemetry::emit(state, op.end(label, end_ns));
   crate::telemetry::emit(state, append.end(partition_label, end_ns));
   if deferred && !matches!(reply, ReplyBody::Refused { .. }) {
-    None
-  } else {
-    Some(reply)
+    return None;
+  }
+  // A verb that recorded a change is answered once every FUSE mount of its volume has been told of it (AC-3.3): held
+  // and sent by a task of this shard where it has a ring to go to, else awaited by the exchange that carried it here
+  // from another node (`serve_forward`). A reply that cannot be held is answered now, counted.
+  let Some(owed) = mark.and_then(|mark| crate::told::owed(state, mark)) else {
+    return Some(reply);
+  };
+  match route {
+    Some(route) => crate::told::hold_until_told(state, owed, route, reply).map(|(_, reply)| reply),
+    None => {
+      state.told_owed = Some(owed);
+      Some(reply)
+    }
   }
 }
 
@@ -2418,7 +2450,9 @@ fn send_forward(
         .await;
         return;
       }
-      // A verb that deferred its reply to a fleet commit (AUD-11) answers through the merge plane.
+      // A verb that deferred its reply to a fleet commit (AUD-11) answers through the merge plane, and one whose reply
+      // waits for its volume's FUSE mounts to be told (AC-3.3) through the task holding it; neither carries anything
+      // else home, since only an attach does, and an attach records nothing in its volume.
       let Some(reply) = reply else {
         return;
       };
