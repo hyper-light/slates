@@ -549,12 +549,14 @@ jobs:
       # The NFS server on Windows (A-183), the network export's: honest clients write and read back their files while
       # breakers send partial records, oversized markers and garbage, abort mid-call and replay tampered handles, every
       # request framed by the connection's own inbox (Windows keeps no receive low-water mark); and the fleet export's
-      # RPC-with-TLS by its RFC's rules. One test at a time: each starts a daemon sized from the whole machine, and
-      # seventeen at once stalled a reply past its deadline on jupiter, as the client suite's did.
-      - name: Test the NFS server and the network export (native Windows)
+      # RPC-with-TLS by its RFC's rules; and a caching client's stale write-back refused (A-192), 7 of 7 on jupiter in 236 s.
+      # One test at a time: each starts a daemon sized from the whole machine, and seventeen at once stalled a reply past
+      # its deadline on jupiter, as the client suite's did; the write-back suite's seven at once had a create refused
+      # BudgetExceeded behind a 24 s poll there.
+      - name: Test the NFS server, its write-back judgment and the network export (native Windows)
         if: ${{ !cancelled() }}
         timeout-minutes: 20
-        run: cargo test -p slates-server --test nfs_hostile --test nfs_tls -- --test-threads=1
+        run: cargo test -p slates-server --test nfs_hostile --test nfs_tls --test nfs_writeback -- --test-threads=1
       - name: Test a shard's lateness after a park (native Windows)
         if: ${{ !cancelled() }}
         timeout-minutes: 15
@@ -799,10 +801,10 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 20
         run: cargo test -p slates-client --test shards -- --test-threads=1
-      - name: Test the NFS server and the network export (native arm64 Windows)
+      - name: Test the NFS server, its write-back judgment and the network export (native arm64 Windows)
         if: ${{ !cancelled() }}
         timeout-minutes: 20
-        run: cargo test -p slates-server --test nfs_hostile --test nfs_tls -- --test-threads=1
+        run: cargo test -p slates-server --test nfs_hostile --test nfs_tls --test nfs_writeback -- --test-threads=1
       - name: The Shards hand-off through the CLI (native arm64 Windows)
         if: ${{ !cancelled() }}
         timeout-minutes: 20
@@ -1008,10 +1010,10 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-rt --test tcp
-      - name: Test the NFS server and the network export (Windows, every push to main)
+      - name: Test the NFS server, its write-back judgment and the network export (Windows, every push to main)
         if: ${{ !cancelled() }}
         timeout-minutes: 20
-        run: cargo test -p slates-server --test nfs_hostile --test nfs_tls -- --test-threads=1
+        run: cargo test -p slates-server --test nfs_hostile --test nfs_tls --test nfs_writeback -- --test-threads=1
       - name: Test a shard's lateness after a park (Windows, every push to main)
         if: ${{ !cancelled() }}
         timeout-minutes: 15

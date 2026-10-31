@@ -11951,7 +11951,9 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
         while quiet, and while another connection writes a write-back 2 to 3 % slower and up to 10 % fewer a second (the
         loaded Mac; 2.6 % on fedora-2 at best), since every change is fed into every tracking connection's states.
       - The hostile NFS suite, interleaved on fedora-2 under its caps with arm B as landed: 8 of 8 in each arm at load
-        72–139.
+        72–139. On Windows the write-back suite passes 7 of 7 (jupiter, one test at a time, 236 s) and runs in CI's three
+        Windows lanes; seven at once had a create refused `BudgetExceeded` behind a 24 s poll, the oversubscription the
+        Windows client suite already runs one at a time for.
       - Found on the way, fixed in the same change, each failing a test first (records in `docs/bugs/`, 2026-10-31): the
         byte states panicked on an empty range, which an NFS WRITE of no bytes reached; a connection's end went to every
         shard whatever it had read, a control message on each other shard's channel (33 of 33 ends in the new test, now
