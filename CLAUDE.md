@@ -213,6 +213,16 @@ Every test is written as "do X, expect Y" and names the acceptance criterion or 
     with it; without `UmFileContextIsUserContext2` every open is handed the first open's context, so per-open boxes
     are freed twice; and WinFsp's notification cannot purge a mapped file (A-177). jupiter has no WinFsp, so the live
     tests run on CI only: a request log on a diagnostics branch (never main) is how the runner is read.
+  - State a connection keeps on other shards, released however it ends: `crates/server/src/nfs_writeback.rs`
+    (`Footprint`, the shards a connection's calls were served on, owned by the connection and moved with it between
+    shards; dropped, it releases the states there and only there, inline on its own shard and by a waiting message
+    elsewhere, `xshard::run_on_waiting`), with `a_connections_end_reaches_only_the_shards_its_reads_and_writes_did` in
+    `crates/server/tests/nfs_writeback.rs` (A-192). Gotchas, each found by a test: an end sent to every shard puts
+    connection churn on every control channel, outside the bound they are sized by (33 of 33 ends); a `..` destructure
+    leaves an unnamed guard in the husk, which drops it where the connection is leaving (`migrate` names it); and a
+    task that finds its state by a shared key (the volume) takes a newer instance's state as its own when the first
+    closes before the task runs, so each instance carries an identity its task checks (`Tracker::id`; the unit test
+    leaked 8 of 8 rounds' keepers before).
 - **Keep design docs in sync with code.** Changing a subsystem's behaviour updates its design section, its status blockquote and the ledger in the same commit.
 - **Commit everything, in imperative area-prefixed summaries that carry the measured fact**, in vorpal's style: `merge: one graph tool over seven relations; deferred-schema cost measured`. Always `git add -A && git commit -m "<message>"`. Never `git checkout`, `git stash`, `git reset`, or any destructive git command.
 - **Debugging protocol.** Add logging to file first; consult the design section rather than assuming from code; confirm scope, intended behaviour, timing and frequency with Ada; after root cause is confirmed by logs and analysis, write `docs/bugs/<date>-<slug>.md` with description, root cause, impact and exact edits; fix in plan mode; touch nothing beyond the fix, but report every sibling inconsistency found; never preserve the behaviour that caused the bug.

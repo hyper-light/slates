@@ -561,6 +561,9 @@ pub struct ShardState {
   /// The writers parked until every FUSE mount of their volume has been told of their change, and the replies held for
   /// them (AC-3.3; `crate::told`). Bounded by the tasks waiting and the shard's client credit.
   pub(crate) told_waiters: crate::told::ToldWaiters,
+  /// What each NFS connection's client cache holds of the files it touched, by volume (A-192; `crate::nfs_writeback`).
+  /// Bounded by the metadata ledger and the listener's connections.
+  pub(crate) nfs_writeback: crate::nfs_writeback::WritebackStates,
   /// What the reply of the verb `run_recorded` just ran owes its volume's FUSE mounts, when the verb has no ring route
   /// to hold its reply on: a verb forwarded from another node, whose exchange awaits it on this shard before answering
   /// (`verbs::serve_forward`; AC-3.3). Cleared by each `run_recorded`, taken by its caller.

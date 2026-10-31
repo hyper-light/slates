@@ -7026,3 +7026,123 @@ adacachy at load 31–42, 2026-10-29 02:4x PDT.
 - **The exchange adds about 48 µs at the least and 73 µs at the median** to a connect in release: about 36 µs of
   crypto (above) and half a round trip more, with the daemon's second round woken by the client's opening.
 - **The p99 is the loaded box's** in both arms. One connect of every run took 5 to 9 ms, sealed or not.
+
+## A stale NFS write-back refused or applied: what judging every WRITE costs (A-192; 2026-10-31)
+
+**The question.** Ada asked for the two routes for an NFS client's stale write-back built in isolated worktrees, A/B
+tested, and the winner picked on robustness and performance. Arm A is sync-point coherence: the write-back is applied,
+stale bytes and all. Arm B judges each WRITE against what the connection's client has cached and refuses one that would
+put stale bytes back over another path's newer change. Robustness is in A-192 (arm B 6 of 6 adversarial cases, arm A
+2 of 6; through Apple's client, the other path's write kept 9 of 9 and lost 9 of 9). This records the cost: what the
+judging and the states that feed it cost a caching client's write-backs, and the daemon's CPU and memory.
+
+**The commands.**
+- In process: `crates/cli/examples/nfs_writeback_ab.rs`. One connection plays a caching client: it READs a 16 KiB page
+  and writes it back whole with a store, 2,000 times a phase over 32 files of 1 MiB. In a contended phase a second
+  connection writes pages of 32 other files as fast as it can, so every one of its writes is a change the server
+  accounts against the first client's cache, and none is a reason to refuse. Four quiet and four contended phases
+  alternate. Each arm is built from its own worktree (A: `sl-nfs-a` at 622dd430; B: `sl-nfs-b`), and the two binaries
+  run interleaved, A B A B A B: `cargo build --release -p slates-cli --example nfs_writeback_ab &&
+  target/release/examples/nfs_writeback_ab`. No write-back was refused in either arm (the `refused` column, 0 in every
+  phase).
+- Through Apple's client: both arms built in one job of a diagnostics branch on CI's macOS runner. Per arm and round:
+  a daemon, `slates mount` over NFS v3, then a 64 MiB write and `fsync`, a read of it, and rounds of 16 MiB of stores
+  through a shared map synced by `msync`, with the daemon's peak memory. Diagnostics runs 41230091726 (912ae651, three
+  rounds a side) and 41233122465 (f6297ff5, two).
+
+**The machines.**
+- Apple M5 Max, 18 cores, macOS 26.4.1, 16 KiB pages: 2026-10-31 11:36 PDT, load 17–22 from other work. Binaries A
+  `39b61001`, B `37b548bb`.
+- fedora-2: x86_64, 32 cores, Linux 6.19.10-300.fc44, in a `systemd-run --user` unit at `CPUWeight=1`, `Nice=19`:
+  2026-10-31 12:10 PDT, load 18–19, with 5- and 15-minute averages of 30 and 50. Binaries A `b51c78ac`, B `5d7141e5`.
+- CI's macOS runner: macOS 26.6.2, 3 CPUs, 16 KiB pages, load 12–13 and 5.
+
+**In process, the Mac.** Each cell lists a run's four phases of that kind, in order.
+
+| run | arm | phases | write p50 (µs) | write p99 (µs) | read p50 (µs) | write-backs/s |
+|---|---|---|---|---|---|---|
+| 1 | A | quiet | 229.8, 224.8, 220.8, 219.4 | 1601.3, 491.5, 439.2, 713.9 | 63.8, 60.8, 59.0, 58.7 | 2,550, 3,658, 3,939, 3,854 |
+| 1 | A | contended | 232.6, 223.0, 220.3, 216.4 | 1591.4, 600.6, 482.6, 1696.2 | 70.8, 64.5, 62.4, 60.5 | 2,409, 3,285, 3,523, 3,223 |
+| 1 | B | quiet | 221.0, 222.2, 224.7, 153.4 | 414.1, 433.7, 454.5, 389.7 | 60.2, 60.4, 62.2, 40.7 | 4,065, 3,952, 3,864, 4,252 |
+| 1 | B | contended | 220.0, 226.6, 226.1, 234.5 | 537.4, 613.4, 479.4, 825.0 | 61.5, 63.9, 64.8, 70.6 | 3,513, 3,288, 3,349, 2,769 |
+| 2 | A | quiet | 222.8, 224.8, 222.5, 220.5 | 448.9, 564.7, 468.6, 426.3 | 61.6, 61.2, 61.0, 59.7 | 3,951, 3,721, 3,886, 4,030 |
+| 2 | A | contended | 223.5, 222.8, 222.1, 229.3 | 529.5, 851.5, 980.2, 1192.8 | 64.0, 63.7, 62.8, 67.0 | 3,428, 3,152, 3,192, 2,789 |
+| 2 | B | quiet | 224.1, 223.2, 226.8, 225.1 | 377.2, 1041.0, 1418.9, 830.0 | 62.6, 61.8, 60.9, 59.8 | 3,959, 3,422, 3,076, 3,687 |
+| 2 | B | contended | 223.6, 228.5, 233.8, 224.5 | 1850.0, 1416.2, 1495.8, 500.5 | 63.4, 65.6, 69.2, 64.0 | 2,642, 2,774, 2,678, 3,388 |
+| 3 | A | quiet | 223.2, 139.8, 219.1, 227.5 | 380.4, 449.7, 471.2, 532.2 | 60.9, 32.8, 60.2, 62.9 | 4,052, 4,222, 3,938, 3,537 |
+| 3 | A | contended | 222.4, 226.4, 219.3, 220.7 | 517.5, 1798.1, 580.5, 512.4 | 63.7, 65.2, 62.5, 63.9 | 3,436, 2,963, 3,378, 3,449 |
+| 3 | B | quiet | 218.1, 227.4, 227.1, 229.0 | 423.5, 968.3, 778.8, 1780.7 | 60.2, 62.1, 61.8, 63.2 | 3,955, 3,563, 3,433, 3,269 |
+| 3 | B | contended | 226.1, 227.9, 231.9, 228.7 | 482.0, 1011.2, 1167.1, 2018.5 | 64.9, 65.4, 69.4, 65.8 | 3,381, 3,036, 2,835, 2,688 |
+
+| arm | process CPU (s), three runs | peak RSS (KiB), three runs | wall (s), three runs |
+|---|---|---|---|
+| A | 4.33, 4.28, 4.23 | 106,784, 101,216, 101,264 | 7.47, 5.25, 5.11 |
+| B | 4.28, 4.38, 4.44 | 101,312, 101,360, 101,664 | 5.10, 5.73, 5.58 |
+
+**In process, fedora-2.**
+
+| run | arm | phases | write p50 (µs) | write p99 (µs) | read p50 (µs) | write-backs/s |
+|---|---|---|---|---|---|---|
+| 1 | A | quiet | 64.3, 68.3, 64.9, 76.1 | 93.0, 102.5, 153.2, 109.3 | 26.6, 25.4, 28.2, 32.3 | 10,808, 10,137, 8,743, 8,863 |
+| 1 | A | contended | 69.8, 136.9, 70.3, 90.1 | 138.3, 275.5, 141.7, 295.1 | 34.4, 72.7, 34.2, 43.1 | 7,874, 4,532, 7,820, 5,735 |
+| 1 | B | quiet | 125.0, 65.8, 124.4, 135.6 | 266.9, 145.2, 181.7, 191.2 | 49.3, 29.0, 49.7, 53.6 | 5,514, 9,745, 5,761, 5,101 |
+| 1 | B | contended | 135.6, 150.7, 155.2, 159.8 | 252.6, 278.5, 279.1, 269.9 | 74.9, 78.7, 83.8, 83.8 | 4,568, 3,700, 3,950, 3,515 |
+| 2 | A | quiet | 77.2, 80.7, 79.1, 142.9 | 134.8, 139.0, 259.6, 366.5 | 32.8, 34.4, 33.4, 54.0 | 8,471, 8,203, 7,127, 5,627 |
+| 2 | A | contended | 123.0, 81.0, 135.9, 134.7 | 266.8, 251.1, 659.9, 274.1 | 67.8, 38.5, 73.5, 71.0 | 4,950, 6,147, 4,135, 4,271 |
+| 2 | B | quiet | 96.7, 112.7, 117.6, 114.5 | 229.9, 156.7, 150.1, 142.7 | 43.1, 45.3, 47.9, 47.4 | 6,691, 6,735, 5,894, 6,042 |
+| 2 | B | contended | 136.4, 140.5, 133.1, 76.5 | 255.9, 250.9, 227.5, 154.0 | 75.4, 78.7, 72.4, 38.0 | 4,229, 3,888, 4,204, 7,101 |
+| 3 | A | quiet | 70.5, 111.8, 117.4, 71.8 | 96.4, 155.6, 153.3, 136.1 | 29.6, 42.9, 45.2, 30.3 | 9,880, 6,764, 5,968, 8,913 |
+| 3 | A | contended | 70.5, 131.9, 107.0, 71.5 | 126.8, 221.5, 222.7, 127.3 | 32.7, 67.8, 62.2, 33.8 | 7,864, 4,182, 5,827, 7,888 |
+| 3 | B | quiet | 62.3, 69.6, 69.5, 69.5 | 82.3, 90.6, 88.4, 89.8 | 22.4, 29.7, 29.8, 29.7 | 11,437, 9,991, 9,834, 9,858 |
+| 3 | B | contended | 76.1, 71.9, 72.4, 72.5 | 219.2, 129.4, 134.2, 174.6 | 38.0, 36.0, 36.1, 36.2 | 6,481, 7,686, 7,608, 7,234 |
+
+| arm | process CPU (s), three runs | peak RSS (KiB), three runs | wall (s), three runs |
+|---|---|---|---|
+| A | 2.59, 3.31, 2.85 | 82,448, 82,532, 82,404 | 2.61, 3.24, 2.85 |
+| B | 3.76, 3.47, 2.38 | 83,188, 82,808, 82,864 | 3.71, 3.64, 2.22 |
+
+**Through Apple's client.**
+
+| run | round | arm | 64 MiB write + `fsync` (s) | read (s) | map rounds, median (best–worst) (s) | daemon peak (KiB) | refused |
+|---|---|---|---|---|---|---|---|
+| 41230091726 | 1 | A | 0.279 | 0.010 | 0.054 (0.044–0.091) | 102,704 | 0 |
+| 41230091726 | 1 | B | 0.195 | 0.010 | 0.034 (0.025–0.055) | 102,848 | 1 |
+| 41230091726 | 2 | A | 0.146 | 0.008 | 0.035 (0.024–0.067) | 102,704 | 0 |
+| 41230091726 | 2 | B | 0.216 | 0.006 | 0.045 (0.040–0.079) | 102,960 | 1 |
+| 41230091726 | 3 | A | 0.238 | 0.008 | 0.052 (0.040–0.091) | 102,704 | 0 |
+| 41230091726 | 3 | B | 0.190 | 0.007 | 0.044 (0.035–0.088) | 102,992 | 1 |
+| 41233122465 | 1 | A | 0.161 | 0.007 | 0.032 (0.025–0.075) | 103,472 | 0 |
+| 41233122465 | 1 | B | 0.146 | 0.006 | 0.028 (0.022–0.051) | 103,680 | 3 |
+| 41233122465 | 2 | A | 0.230 | 0.015 | 0.034 (0.026–0.110) | 103,408 | 0 |
+| 41233122465 | 2 | B | 0.179 | 0.006 | 0.030 (0.023–0.059) | 103,664 | 3 |
+
+The refusals are each round's case, run before the timings: one order in the first run, three in the second.
+
+**What it shows.**
+- **Quiet, judging costs nothing measurable.** On the Mac the write-back's median over twelve quiet phases moved
+  222.6 → 224.4 µs (+0.8 %) and its rate 3,912 → 3,776 a second; on fedora-2 the quickest quiet phases are B's
+  (62.3 µs against 64.3 µs).
+- **While another connection writes, it costs a few percent a write and more in the tail.** On the Mac the contended
+  median moved 222.6 → 227.2 µs (+2.1 %), the median p99 726 → 918 µs, and the rate 3,254 → 2,936 a second (−9.8 %).
+  That is the consumption: each change the other connection makes is fed into every tracking connection's states, by
+  the volume's keeper as it is made and by a WRITE's judgment first, so the shard does work per change per connection
+  tracking the volume, where arm A does none. Quiet, there is nothing to consume.
+- **On fedora-2 the box, not the arm, sets the median.** Its load splits both arms' phases into a fast mode (write p50
+  62–80 µs) and a slow one (123–160 µs), a few between: B's run 3 ran all fast and its runs 1 and 2 mostly slow, A's
+  runs mixed both. Phase for phase in the fast mode, contended: A 69.8–71.5 µs, B 71.9–76.5 µs, about 3 % at the
+  least, and the best contended rate 7,888 against 7,686 a second (−2.6 %).
+- **Memory: the states are small.** Peak RSS on fedora-2 82.4–82.5 MB against 82.8–83.2 MB (+0.3–0.9 %); on the Mac
+  equal after A's first run; through the mount the daemon's peak 0.1–0.3 % higher in B. CPU: +1–3 % on the Mac.
+- **Through Apple's client, no difference outside the runner's spread.** The 64 MiB write and `fsync` took a median of
+  0.230 s in A (0.146–0.279) and 0.190 s in B (0.146–0.216); the map rounds' medians 0.035 and 0.034 s.
+
+**The landed arm B, again on the Mac.** The rule as landed adds a footprint per connection and an identity per tracker
+(A-192's two defects found on the way), each a comparison per call or per park. The same commands, A against the landed
+B (`66804e7a`), ran interleaved at 13:30 PDT while the Mac's load climbed from 20 to 31. That swamped the rate in both
+arms, at different moments (A's run 3 at 415–3,304 write-backs a second, B's run 2 at 461–674), so its medians compare
+the moments, not the arms, and are not read. What does compare: the least write p50, quiet A 221.9 µs and B 224.8 µs
+(+1.3 %), contended A 225.2 µs and B 232.7 µs (+3.3 %); process CPU A 4.57–4.94 s, B 4.68–5.03 s.
+
+**Measured and rejected: arm A**, which costs nothing here and keeps nothing: in the adversarial suite it put the
+client's stale copy back over another path's write in every such case, silently, and through Apple's client it lost the
+other path's write in 9 runs of 9.

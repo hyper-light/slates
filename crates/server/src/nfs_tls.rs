@@ -321,6 +321,9 @@ async fn serve_session(
   chunk: &mut [u8],
 ) -> Result<(), &'static str> {
   let this = registry::current_shard().unwrap_or(0);
+  // What the server keeps of the session's client cache is keyed by an id of the session's own, and goes with this
+  // footprint when the session ends, however it ends (A-192).
+  let mut footprint = crate::nfs_writeback::Footprint::of(crate::nfs::next_connection_id());
   let mut plaintext = Vec::new();
   let mut records = RecordReader::default();
   let mut outgoing = Vec::new();
@@ -336,7 +339,7 @@ async fn serve_session(
           crate::fleet::count_refusal(AUTH_TLS_INSIDE);
           write_record(&bad_credential_reply(xid_of(&message)))
         } else {
-          crate::nfs::reply_to_message(this, message, port).await
+          crate::nfs::reply_to_message(this, message, port, &mut footprint).await
         };
         session.send(&record).map_err(|_| SESSION_REFUSED)?;
         plaintext.drain(..consumed);

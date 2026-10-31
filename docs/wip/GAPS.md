@@ -11930,6 +11930,48 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       back, and choosing bytes between the two would be an inferred merge (banned item 11). So on macOS a program that
       maps a file writable and needs another path's concurrent writes kept takes the socket route's writable map
       (A-186), which keeps the copy current by write-through and writes back only the bytes that differ.
+      **Settled 2026-10-31 by Ada's A/B (A-192): a stale write-back is refused.** Ada asked for the routes A/B tested in
+      isolated worktrees and the winner picked on robustness and performance. Arm A was the status quo above; arm B
+      judges each WRITE against what the connection's client has cached (A-140's byte states, fed by its READs, its own
+      changes and every other change to the volume) and refuses, `NFS3ERR_IO`, one that would put stale bytes back over
+      a newer change. The mask (applying the write-back except its stale bytes) was not an arm: it is the inferred merge
+      banned item 11 forbids, and Ada's answer did not authorize it.
+      - Robustness, `crates/server/tests/nfs_writeback.rs`: arm B 6 of 6, arm A 2 of 6. A failed every case of a stale
+        page against another path's write (the SDK's replace, a second client's write, a cut the stale page brought
+        back to 32,768 bytes, a volume on either shard), each silently.
+      - Through Apple's client (macOS 26.6.2, CI's runner; diagnostics runs 41230091726 and 41233122465): in every order
+        of a store and another path's write — the measured one, one with no `stat` before the `msync`, and one where the
+        other path wrote first — arm A lost the other path's write (5 of 5, 2 of 2, 2 of 2) and arm B kept it (5 of 5,
+        2 of 2, 2 of 2), counting its refusals.
+      - Performance (`docs/wip/BENCHMARKS.md`): through the mount, no difference outside the runner's spread (a 64 MiB
+        write and `fsync`, rounds of map stores synced) and 0.1–0.3 % more daemon memory; in process, nothing measurable
+        while quiet, and while another connection writes a write-back 2 to 3 % slower and up to 10 % fewer a second (the
+        loaded Mac; 2.6 % on fedora-2 at best), since every change is fed into every tracking connection's states.
+      - The hostile NFS suite, interleaved on fedora-2 under its caps with arm B as landed: 8 of 8 in each arm at load
+        72–139.
+      - Found on the way, fixed in the same change, each failing a test first (records in `docs/bugs/`, 2026-10-31): the
+        byte states panicked on an empty range, which an NFS WRITE of no bytes reached; a connection's end went to every
+        shard whatever it had read, a control message on each other shard's channel (33 of 33 ends in the new test, now
+        1 of 33); a keeper that ran only after its tracker closed took the volume's next tracker as its own, and one of
+        the two was never woken (fedora-2's hostile run left 16 tasks live where 9 were before; the unit test 8 of 8
+        rounds); and arm B's consumer task outlived its last connection until the volume changed again.
+      **Still open after A-192:**
+      - Apple's client tells the program nothing of a refusal: `msync` and `close` answered 0 in every case, so a
+        program's stores in a refused page go without a word. Where they came after the other path's write, through a
+        page the client had not refetched, they were the newer write and are lost; only a byte-level merge, which is
+        banned, could keep both. The socket route's writable map (A-186) keeps both.
+      - A daemon restart starts the states empty: a page fetched before it is not judged.
+      - Main's, seen in both arms on fedora-2 at load 24–63 under `CPUWeight=1`: `nfs_hostile`'s broken-connections test
+        answers an honest client's forwarded call `SYSTEM_ERR` once in about five runs (arm A 1 of 5, arm B 1 of 5
+        interleaved; 0 of 8 each in a later series at load 72–139). The call is forwarded under the liveness budget, 1 s,
+        and the failing run's daemon reported its shard starved 1.6 s (`a heartbeat came 1626 ms after the last`).
+        Arm B's one stall of the stale-handle test's attackers (0 attempts in its 2 s window, 1 of 14 runs; arm A 0 of
+        13) has the same look, in a test where arm B does nothing but look its tracker up.
+      - Main's, found sweeping for the connection end's siblings: a READDIR of the host root asks every shard for its
+        entries (`nfs.rs` `gather_all_entries`), though the capability it presents authorizes one volume, whose owner its
+        id names (D-14); a client holding a capability can make every shard answer as often as it likes.
+      - Seen in both arms, not this change's: a WRITE at the last offsets of the range is answered
+        `NFS3ERR_SERVERFAULT`, where RFC 1813 has `NFS3ERR_FBIG`.
 - **A READ reply past 64 KiB closed the RPC-with-TLS export (found and fixed 2026-10-25, `3e05c70d`).** rustls caps
   its buffer of sealed records at 64 KiB, and the session's send wrote a reply with `write_all`, so any READ reply past
   it ended the connection, and the kubelet's `hard` mount retried it for good: through a kubelet-mounted export a file

@@ -2541,6 +2541,21 @@ therefore never appears in `ps`, `mount` or `nfsstat -m`, all of which every loc
   tokens. Open in GAPS. A handle is also canonical: a flip of any bit outside the inode's counter is refused
   (`crates/server/tests/nfs_hostile.rs`, all 456 bits; `docs/bugs/2026-10-04-a-handle-with-flipped-inode-prefix-bits-read-its-file.md`).
 
+**A stale write-back is refused (A-192).** An NFS v3 client writes a dirty page back whole, its program's stores with
+the rest of the page as it fetched it. Apple's client does so for a page dirtied through a shared map while another path
+changed the file, and no recall makes it flush first. So the server keeps, per connection, A-140's byte states for each
+file the connection's READs and WRITEs touched. A READ makes bytes fresh, the connection's own changes refresh them,
+and every other change, fed by a per-volume keeper reading the journal (A-157), makes fetched bytes stale. A WRITE
+whose stale bytes differ from the file's bytes now is refused whole, `NFS3ERR_IO`, never merged (banned item 11). A
+write over bytes never fetched, or over stale bytes equal to the file's, is applied. The states go with their
+connection, on the shards its calls were served on, however it ends (`crates/server/src/nfs_writeback.rs`). Apple's
+client takes the refusal without telling the program (`msync` returns 0), so a program that needs both writes kept maps
+through the socket route (A-186).
+> Status (2026-10-31): built and measured, Ada's A/B against applying the write-back (A-192). Through Apple's client the
+> other path's write is kept 9 of 9 (arm A lost it 9 of 9); the adversarial suite passes 6 of 6 (arm A 2 of 6). It costs
+> nothing measurable quiet, and 2–3 % a write-back while another connection writes (`docs/wip/BENCHMARKS.md`). A
+> restart starts the states empty (GAPS).
+
 **NFS versions (direction, 2026-09-26).** One NFS server speaks several versions over the shared
 bridge core: v3 as today, and v4.1 and v4.2 (RFC 8881, RFC 7862, RFC 8276, and pNFS flexfiles
 RFC 8435). The client negotiates; ONC RPC carries versions 3 and 4 of program 100003 side by side, so
@@ -12507,6 +12522,72 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
 - **Arm64 Windows proven** since (2026-10-27): the direct-map client tests, 20 of 20, on CI's `windows-11-arm` (run
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
+
+### A-192 — An NFS v3 write-back that would put stale bytes back over another path's newer change is refused: the winner of Ada's A/B against sync-point coherence (accepted and built 2026-10-31)
+Applied in the same change to: §4.6 (the macOS fallback: a stale write-back is refused, with its status), GAPS (the
+macOS writable maps entry, settled), `docs/wip/virtiofs.md` §8 (the macOS bare-metal mount-route cell),
+`docs/wip/BENCHMARKS.md`, `CLAUDE.md` (the footprint as a canonical example, with its gotchas), `crates/server`
+(`nfs_writeback.rs`, new, with its unit test; `nfs.rs`: an id and a footprint for every connection, both moved with it
+between shards, a WRITE judged before it is served, a READ's bytes and a call's own records noted after it;
+`nfs_tls.rs`: a session's footprint; `xshard.rs`: `run_on_waiting`; `state.rs`, `daemon.rs`, `lib.rs`;
+`tests/nfs_writeback.rs`, new), `crates/bridge-fuse`
+(`coherence.rs`: an empty range clipped to nothing), `crates/cli/examples/nfs_writeback_ab.rs` (new), and three records
+in `docs/bugs/` (2026-10-31: the byte states' empty range, a connection's end sent to every shard, a keeper that took
+a newer tracker).
+- **What was open.** An NFS v3 client writes a dirty page back whole: the program's stores and the rest of the page as
+  it was fetched. Through Apple's client a page dirtied through a shared map and not synced while another path replaced
+  the file came back over the replacement, and the replacement's 16,384 bytes were lost (3 of 3, diagnostics run
+  40821794698). NFS v3 has no recall, and Apple's NFSv4.1 recall returns the delegation without flushing, so the
+  client cannot be made to flush first (GAPS). The open question was what the server does with such a write-back.
+- **How it was decided.** Ada asked for the routes built in isolated worktrees, A/B tested, and the winner picked on
+  robustness (adversarial edge cases, fault tolerance) and performance (throughput, resource consumption). Arm A was the
+  status quo: maps coherent at sync points, the stale write-back applied. Arm B refuses it. Applying the write-back
+  except its stale bytes was not an arm: it is an inferred merge (banned item 11), which Ada's answer did not
+  authorize.
+- **The rule (arm B).** The server keeps, per connection, A-140's byte states for each file the client touched: a READ
+  makes the bytes it returned fresh as of the journal's head, the connection's own changes refresh what they wrote,
+  another path's change makes earlier-fetched bytes stale, and a byte never fetched is absent, so a write made without
+  reading is applied. A per-volume tracker's consumer task, parked on the volume's change generation and reading the
+  journal as a reader of its own (A-157), feeds every change into every connection's states as it is made; each
+  tracker has exactly the task spawned for it. A WRITE whose stale bytes differ from the file's bytes now is refused
+  whole, `NFS3ERR_IO`, and nothing of it applied; stale bytes equal to the file's are applied. Where the states cannot
+  tell (a file lost for room, a journal overrun) the WRITE is refused too. The states are charged to the metadata
+  ledger. A connection carries a footprint, the shards its READs and WRITEs were served on, and however it ends its
+  states are dropped there and only there.
+- **Robustness.** The adversarial suite (`crates/server/tests/nfs_writeback.rs`, driving the export with a hand-rolled
+  client as a cache does): arm B 6 of 6, arm A 2 of 6. Arm A failed every case of a stale page against another path's
+  write — the SDK's replace, a second client's write, a cut the stale page brought back to 32,768 bytes, a volume of
+  either shard — each silently; both arms applied every write-back nobody overtook (alone, beside another client's page,
+  after a refetch, a blind write, an identical rewrite) and answered hostile offsets. Through Apple's client (macOS
+  26.6.2 on CI's runner, diagnostics runs 41230091726 and 41233122465), in each order of a store and another path's
+  write — the measured order, the same with no `stat` before the `msync`, and the other path first — arm A lost the
+  other path's write in every run (9 of 9) and arm B kept it in every run (9 of 9). The hostile NFS suite, interleaved
+  on fedora-2 under its caps (`CPUWeight=1`), passed 8 of 8 in each arm at load 72–139 with arm B as landed. An earlier
+  series at load 24–63 found the keeper defect below in arm B, and failed the broken-connections test the same way in
+  both arms once each (`SYSTEM_ERR` to an honest client, A's daemon reporting its shard starved 1.6 s): main's, not
+  this change's. In that series arm B also stalled the stale-handle test's attackers once for its whole 2 s window
+  (0 attempts), a test in which arm B does nothing but look its tracker up and find none; 0 of the other 13 runs of
+  each arm did.
+- **Performance** (`docs/wip/BENCHMARKS.md`). In process (`nfs_writeback_ab`), nothing measurable while quiet (the Mac's
+  median write-back +0.8 %). While another connection writes, +2 to 3 % a write-back at the median and the least, a
+  heavier tail, and up to 10 % fewer write-backs a second on the loaded Mac (2.6 % on fedora-2 at best): every change is
+  fed into every tracking connection's states, work arm A does not do. Peak memory +0.3–0.9 %, CPU +1–3 %. Through
+  Apple's client, no difference outside the runner's spread (a 64 MiB write and `fsync` a median 0.230 s in A and
+  0.190 s in B, five runs a side).
+- **Its limits.** Apple's client tells the program nothing of a refusal: `msync` and `close` answered 0 in every case. So
+  a program's stores in a refused page go without a word. When they came before the other path's write, that is the
+  order of events; when they came after, through a page the client had not refetched, they were the newer write and
+  are lost, the case only a byte-level merge could keep. A program that needs both kept maps through the socket route
+  (A-186). A daemon restart starts the states empty, so a page fetched before it is not judged.
+- **Found and fixed on the way**, each failing a test first, each recorded in `docs/bugs/`:
+  - The byte states panicked on an empty range, which an NFS WRITE of no bytes reached and no FUSE kernel sends: a
+    release daemon would have aborted on it.
+  - A connection's end went to every shard, whatever it had read: a control message on each other shard's channel per
+    connection, outside the bound the channel is sized by (33 of 33 ends in the new test; now 1 of 33, the one
+    connection that read both shards' volumes).
+  - A keeper that ran only after its tracker closed took the volume's next tracker as its own, and one of the two was
+    never woken again (fedora-2's `9 live before, 16 after`; the unit test leaked 8 of 8 rounds' keepers).
+  - And arm B's consumer task outlived its last connection until the volume changed again; a closed tracker wakes it.
 
 ### A-191 — A writer outside FUSE is answered once every FUSE mount of its volume has been told (accepted and built 2026-10-30)
 Applied in the same change to: §4.6 ("Cache posture": the paragraph on when a mount is told), Phase 3's AC-3.3, A-139

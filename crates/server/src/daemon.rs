@@ -3271,6 +3271,7 @@ fn init_shard(
     current_span: None,
     reply_route: None,
     told_waiters: crate::told::ToldWaiters::default(),
+    nfs_writeback: crate::nfs_writeback::WritebackStates::default(),
     told_owed: None,
     current_request: None,
     acceptance_deferred: false,

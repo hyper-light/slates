@@ -186,10 +186,17 @@ impl<T: 'static> Future for CrossShardCall<T> {
 /// (`xshard.reply_dropped`) and its waiter's own deadline answers it (the client's reply deadline; `call_within`'s).
 /// Before 2026-10-07 every refusal dropped the reply at once and unseen.
 pub async fn send_back(origin: u16, back: SpawnRequest) {
-  let mut message = Control::Spawn(Box::new(back));
+  if !given_room(origin, Control::Spawn(Box::new(back))).await {
+    state::with_state_counted(|s| s.count(REPLY_DROPPED, 1));
+  }
+}
+
+/// Sends `message` to `target`, waiting out a full channel: asked again every [`REPLY_PACE_NS`] for one coordinator
+/// period. Whether it was sent; `false` past that, or at once for a shard gone.
+async fn given_room(target: u16, mut message: Control) -> bool {
   for _ in 0..REPLY_ROOM_ATTEMPTS {
-    match registry::send_control_or_return(origin, message) {
-      Ok(()) => return,
+    match registry::send_control_or_return(target, message) {
+      Ok(()) => return true,
       Err(registry::RefusedControl {
         error: RtError::ControlFull { .. },
         message: Some(unsent),
@@ -197,10 +204,52 @@ pub async fn send_back(origin: u16, back: SpawnRequest) {
         message = unsent;
         let _ = slates_rt::futures::sleep(REPLY_PACE_NS).await;
       }
-      Err(_) => break,
+      Err(_) => return false,
     }
   }
-  state::with_state_counted(|s| s.count(REPLY_DROPPED, 1));
+  false
+}
+
+/// [`run_on`] for work whose loss would leave state behind on `shard` (a closed connection's byte states, A-192): a
+/// channel full at once hands the message to a task of this shard that waits for room as a result carried home does
+/// ([`send_back`]). Counted under `refused` on this shard when it is refused past that, the shard is gone, or this shard
+/// could not take the waiting task.
+pub fn run_on_waiting(
+  origin: u16,
+  shard: u16,
+  work: impl FnOnce(&mut ShardState) + Send + 'static,
+  refused: &'static str,
+) {
+  if shard == origin {
+    state::with_state_counted(work);
+    return;
+  }
+  let task = SpawnRequest::new(
+    Box::pin(async move {
+      state::with_state_counted(work);
+    }),
+    None,
+  );
+  let unsent = match registry::send_control_or_return(shard, Control::Spawn(Box::new(task))) {
+    Ok(()) => return,
+    Err(registry::RefusedControl {
+      error: RtError::ControlFull { .. },
+      message: Some(unsent),
+    }) => unsent,
+    Err(_) => {
+      state::with_state_counted(|s| s.count(refused, 1));
+      return;
+    }
+  };
+  let waiting = slates_rt::futures::spawn(async move {
+    if !given_room(shard, unsent).await {
+      state::with_state_counted(|s| s.count(refused, 1));
+    }
+  })
+  .and_then(slates_rt::futures::detach);
+  if waiting.is_err() {
+    state::with_state_counted(|s| s.count(refused, 1));
+  }
 }
 
 /// Shape: the pace of a reply's retries for room — a tenth of a coordinator period, the collection loops' cadence
