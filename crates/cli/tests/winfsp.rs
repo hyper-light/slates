@@ -476,6 +476,10 @@ const MAPPED_VIEW_FOLLOWS: bool = true;
 const PURGES_DONE: &str = "winfsp.purges_done";
 /// Format: the daemon's counter of purge writes the mount answered without applying them (A-190).
 const PURGE_ECHOES: &str = "winfsp.purge_echoes";
+/// Format: the daemon's counter of purges whose open or write Windows refused (A-190).
+const PURGES_REFUSED: &str = "winfsp.purges_refused";
+/// Format: the daemon's counter of purges not made because WinFsp cannot name an open's process (A-190).
+const PURGES_UNAVAILABLE: &str = "winfsp.purges_unavailable";
 
 /// The daemon's counter `name`, summed over the shards `slates status` prints.
 fn counter(instance: &str, name: &str) -> u64 {
@@ -525,20 +529,27 @@ fn a_mapped_view_through_a_winfsp_mount_after_another_paths_change() {
       |took| format!("followed it in {took:?}")
     ),
   );
+  // The purge's counters are read and printed before any assertion, so a failure carries what the mount did: no purge
+  // planned, one refused, or one made that did not take (main's Windows job saw the view stale once, run 41148561681).
+  let (purges, echoes, refused, unavailable) = (
+    counter(&fixture.instance, PURGES_DONE),
+    counter(&fixture.instance, PURGE_ECHOES),
+    counter(&fixture.instance, PURGES_REFUSED),
+    counter(&fixture.instance, PURGES_UNAVAILABLE),
+  );
+  eprintln!(
+    "WINFSP PURGES: {purges} made, {echoes} writes answered without being applied, {refused} refused, {unavailable} \
+     unavailable"
+  );
   assert_eq!(
     view_took.is_some(),
     MAPPED_VIEW_FOLLOWS,
-    "the mapped view does what the matrix records"
+    "the mapped view does what the matrix records ({purges} purges, {refused} refused, {unavailable} unavailable)"
   );
   assert!(
     read_took.is_some(),
     "a read through a second handle follows the change once the range is purged"
   );
-  let (purges, echoes) = (
-    counter(&fixture.instance, PURGES_DONE),
-    counter(&fixture.instance, PURGE_ECHOES),
-  );
-  eprintln!("WINFSP PURGES: {purges} made, {echoes} writes answered without being applied");
   assert!(
     purges >= 1 && echoes >= 1,
     "non-vacuous: the mount purged the file and dropped the purge's write ({purges} purges, {echoes} echoes)"

@@ -12004,6 +12004,23 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   (55 and 346 bytes kept back, one write-back refused unknown each). The same code passed on the change's first run
   (40249524066) and 10 of 10 on fedora (2026-10-26). A write-back over an unknown byte is refused `EIO` by design (A-144);
   the test's seeds expect that refusal only where they make it. Not attributed: no log of the run's rounds.
+- **A-190's mapped view stayed stale once in main's Windows job (2026-10-31): open, not reproduced.** In run 41148561681
+  (slates adeb5fa5, `windows-latest`, image windows-2025-vs2026 20261021.278.1, WinFsp 2.1.25156) the view and a read
+  through a handle opened after it held the old bytes for 10 s each, as before A-190, and the test failed. The same test
+  passed in A-190's diagnostics run (x86_64 and arm64), in main's run of d5ce585e, on arm64 in the failing run itself,
+  and in 25 diagnostics iterations on the same image (runs 41151000035 and 41166727208, the second with Docker's engine
+  started, as the failing job had it), each making one purge and refusing none. The failing test printed nothing of the
+  purge, since its counters were read after the assertion; they are now printed before it. One clue: that daemon's
+  machine profile measured the runner slow at its start, a copy slice of 497 bytes where the previous test's daemon a
+  minute earlier derived 2,206, so the runner was loaded. The candidates, none shown: no purge planned (the file not
+  known open, or its range empty), a purge refused (its open or a write), or a purge made that did not take.
+- **The anchored export test binds its export's TCP port unreserved (2026-10-30): open, seen once.**
+  `an_anchored_node_serves_its_export_over_rpc_with_tls_across_a_daemon_restart` (`crates/cli/tests/cli.rs`) failed in
+  the Linux CLI suite on fedora-2 at load 22–31 (75 of 76 passed) with `AddrInUse` at its own
+  `TcpListener::bind(("127.0.0.1", port))`, before any daemon ran, and passed 3 of 3 alone. Its port block holds only
+  UDP sockets (`HeldBlock`, the 2026-09-28 fix for a released port taken before the daemon bound it), while
+  `start_anchor` binds TCP on the block's base port, which nothing reserved, so any other process can hold it. Owed: the
+  block holds the export's TCP listener too, and `start_anchor` hands that one over.
 - **Firecracker maps a volume's image with DAX through virtio-pmem (A-165, 2026-10-24): proven by real runs.**
   The image A-160 builds, read through a slates mount, is the pmem device's backing file. The guest loads the nine
   modules its distribution kernel builds virtio-pmem and nd_pmem as, then mounts the device as ext4 with `dax=always`.
