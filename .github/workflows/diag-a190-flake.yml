@@ -11,7 +11,7 @@ on:
 
 jobs:
   loop:
-    name: the WinFsp tests ten times on windows-latest
+    name: the WinFsp tests fifteen times on windows-latest, Docker's engine running
     runs-on: windows-latest
     timeout-minutes: 120
     steps:
@@ -32,12 +32,19 @@ jobs:
           }
           if (-not (Test-Path "C:\Program Files (x86)\WinFsp\bin")) { Write-Error "WinFsp did not install"; exit 1 }
           "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Start Docker's engine, as main's Windows job found it running
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Start-Service docker
+          docker version --format "{{.Server.Os}} {{.Server.Version}}"
+          Get-Service docker | Format-List Name, Status, StartType
       - name: Build the WinFsp tests
         shell: bash
         env:
           AWS_LC_SYS_PREBUILT_NASM: "0"
         run: cargo test -p slates-cli --test winfsp --no-run
-      - name: The WinFsp tests ten times
+      - name: The WinFsp tests fifteen times
         shell: bash
         env:
           SLATES_TEST_CLI: "1"
@@ -46,11 +53,11 @@ jobs:
         run: |
           set +e
           failed=0
-          for i in 1 2 3 4 5 6 7 8 9 10; do
+          for i in $(seq 1 15); do
             cargo test -p slates-cli --test winfsp -- --test-threads=1 --nocapture > "winfsp-$i.log" 2>&1
             code=$?
             echo "== iteration $i exit $code"
             grep -E "WINFSP|DIAG|test result|panicked" "winfsp-$i.log"
             if [ "$code" -ne 0 ]; then failed=$((failed+1)); fi
           done
-          echo "== $failed of 10 iterations failed"
+          echo "== $failed of 15 iterations failed"
