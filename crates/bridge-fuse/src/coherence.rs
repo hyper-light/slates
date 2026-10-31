@@ -481,8 +481,12 @@ impl FileStates {
     }
   }
 
-  /// Merges touching neighbours of one state from just before `range` to just past it.
+  /// Merges touching neighbours of one state from just before `range` to just past it; a range ending before it starts
+  /// has nothing around it to merge.
   fn merge_around(&mut self, range: std::ops::Range<u64>) {
+    if range.start > range.end {
+      return;
+    }
     let first = self
       .ranges
       .range(..range.start)
@@ -507,9 +511,18 @@ impl FileStates {
     }
   }
 
-  /// A copy of the states over `range` alone.
+  /// A copy of the states over `range` alone; an empty range holds no bytes, and nothing of them. Until A-192 an empty
+  /// range searched the map from one past its own end, which `BTreeMap` refuses with a panic: an NFS client's WRITE of no
+  /// bytes took its shard down.
   fn clipped(&self, range: std::ops::Range<u64>) -> FileStates {
     let mut ranges = std::collections::BTreeMap::new();
+    if range.start >= range.end {
+      return FileStates {
+        ranges,
+        lost: self.lost,
+        touched: false,
+      };
+    }
     let reaching = self
       .ranges
       .range(..=range.start)
@@ -689,7 +702,33 @@ impl KernelHolds {
 
 #[cfg(test)]
 mod tests {
-  use super::OwnRecords;
+  use super::{OwnRecords, PageStates};
+
+  /// A-192, hostile input: an NFS client sends a WRITE of no bytes, and one at the very end of the offset range, which no
+  /// FUSE kernel does. Do: on a tracked file, judge, fetch and change empty ranges and ranges ending at `u64::MAX`.
+  /// Expect: each answered — no stale bytes in an empty range, the fetched and changed bytes as said — and no panic;
+  /// before the fix the empty range's judgment searched the states from past its own end, which `BTreeMap` refuses with
+  /// a panic, and the shard serving it went down.
+  #[test]
+  fn empty_ranges_and_ranges_at_the_end_are_judged_without_a_panic() {
+    let mut states = PageStates::default();
+    states.grow_room(64);
+    states.opened(7, 1);
+    for empty in [0..0, 5..5, u64::MAX..u64::MAX] {
+      assert_eq!(
+        states.stale_after(7, empty.clone(), 1, &[]),
+        Some(Vec::new())
+      );
+      states.fetched(7, empty.clone(), 2);
+      states.changed(7, empty, 3, false);
+    }
+    states.changed(7, (u64::MAX - 1)..u64::MAX, 4, false);
+    assert_eq!(
+      states.stale_after(7, (u64::MAX - 10)..u64::MAX, 1, &[]),
+      Some(vec![(u64::MAX - 1)..u64::MAX]),
+      "the changed last byte is stale"
+    );
+  }
 
   /// The dirty-page write-back rule's own records, told by sequence. Do: note two consecutive requests (records 11 to
   /// 13), then one after another path's record 14 (record 15), then a request that took nothing; then twenty more

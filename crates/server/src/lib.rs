@@ -81,9 +81,11 @@ mod delegation;
 mod listing;
 mod lock_ledger;
 pub mod nfs;
+// A stale page an NFS client writes back over another path's newer change is refused (A-192).
 mod nfs_replay;
 mod nfs_state;
 pub mod nfs_tls;
+mod nfs_writeback;
 pub mod observe;
 mod owner_location;
 mod staging;

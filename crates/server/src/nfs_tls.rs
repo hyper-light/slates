@@ -321,6 +321,20 @@ async fn serve_session(
   chunk: &mut [u8],
 ) -> Result<(), &'static str> {
   let this = registry::current_shard().unwrap_or(0);
+  // The session's id: what the server keeps of its client's cache is keyed by it, and goes when it ends (A-192).
+  let connection = crate::nfs::next_connection_id();
+  let served = serve_calls(stream, (this, port, connection), session, chunk).await;
+  crate::nfs_writeback::closed(connection);
+  served
+}
+
+/// [`serve_session`]'s calls, as connection `connection` on shard `this`, until the peer closes.
+async fn serve_calls(
+  stream: &TcpStream,
+  (this, port, connection): (u16, u16, u64),
+  session: &mut TlsSession,
+  chunk: &mut [u8],
+) -> Result<(), &'static str> {
   let mut plaintext = Vec::new();
   let mut records = RecordReader::default();
   let mut outgoing = Vec::new();
@@ -336,7 +350,7 @@ async fn serve_session(
           crate::fleet::count_refusal(AUTH_TLS_INSIDE);
           write_record(&bad_credential_reply(xid_of(&message)))
         } else {
-          crate::nfs::reply_to_message(this, message, port).await
+          crate::nfs::reply_to_message(this, message, port, connection).await
         };
         session.send(&record).map_err(|_| SESSION_REFUSED)?;
         plaintext.drain(..consumed);
