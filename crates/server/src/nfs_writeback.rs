@@ -80,6 +80,9 @@ struct Tracker {
   cursor: u64,
   seen: u64,
   connections: BTreeMap<u64, Connection>,
+  /// The consumer task's waker as it last parked: woken when the tracker closes, so the task ends then rather than at
+  /// the volume's next change, which may never come.
+  keeper: Option<std::task::Waker>,
 }
 
 /// One connection's states for one volume: its byte states, the records its own calls made, and the metadata ledger
@@ -304,6 +307,10 @@ fn close(s: &mut ShardState, volume: VolumeId) {
     if credit > 0 {
       s.store.metadata.release(MetadataCredit { bytes: credit });
     }
+    // The consumer finds its tracker gone and ends (the hostile NFS test caught it outliving its last connection).
+    if let Some(keeper) = tracker.keeper {
+      keeper.wake();
+    }
   }
   if let Some(&handle) = s.by_id.get(&volume)
     && let Ok(slot) = s.volumes.get_mut(handle)
@@ -335,6 +342,7 @@ fn tracking(s: &mut ShardState, volume: VolumeId) -> bool {
       cursor: head,
       seen,
       connections: BTreeMap::new(),
+      keeper: None,
     },
   );
   if slates_rt::futures::spawn(keep(volume))
@@ -458,7 +466,15 @@ async fn keep(volume: VolumeId) {
 /// Whether `volume` changed past what its tracker consumed (`Some(true)`), parking `waker` until it does when it has not
 /// (`Some(false)`); `None` when the tracker or the volume is gone.
 fn park(s: &mut ShardState, volume: VolumeId, waker: &std::task::Waker) -> Option<bool> {
-  let seen = s.nfs_writeback.trackers.get(&volume)?.seen;
+  let tracker = s.nfs_writeback.trackers.get_mut(&volume)?;
+  if !tracker
+    .keeper
+    .as_ref()
+    .is_some_and(|keeper| keeper.will_wake(waker))
+  {
+    tracker.keeper = Some(waker.clone());
+  }
+  let seen = tracker.seen;
   let &handle = s.by_id.get(&volume)?;
   let slot = s.volumes.get_mut(handle).ok()?;
   Some(slot.volume.wait_for_change(seen, waker))
