@@ -685,14 +685,25 @@ fn purges_owed(
   let mut hulls: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
   for (ino, data) in owed {
     if names.open_names(ino).is_empty() {
+      eprintln!("DIAG winfsp plan: ino {ino} {data:?}: no open name");
       continue;
     }
     let Ok(attr) = bridge.getattr(ObjectId::new(ino, 0), cx) else {
+      eprintln!("DIAG winfsp plan: ino {ino} {data:?}: getattr refused");
       continue;
     };
     let Some((offset, len)) = purge_range(&data, attr.size, sector) else {
+      eprintln!(
+        "DIAG winfsp plan: ino {ino} {data:?}: no range in size {}",
+        attr.size
+      );
       continue;
     };
+    eprintln!(
+      "DIAG winfsp plan: ino {ino} {data:?}: size {} purge [{offset}, +{len}) names {:?}",
+      attr.size,
+      names.open_names(ino)
+    );
     let end = offset.saturating_add(len);
     hulls
       .entry(ino)

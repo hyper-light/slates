@@ -1,0 +1,56 @@
+name: DIAG the WinFsp mapped view stayed stale once on main (not for main)
+
+# A-190's mapped-view test failed once in main's Windows job (run 41148561681, job 124379339258: the view and a handle's
+# read stale for 10 s), after passing in its diagnostics run and in main's run of d5ce585e on the same image. This
+# branch logs each purge's plan and outcome (DIAG lines in the daemon's stderr) and runs the WinFsp tests repeatedly, as
+# main's job runs them, to catch the failing case with its evidence.
+
+on:
+  push:
+    branches: [diag-a190-flake]
+
+jobs:
+  loop:
+    name: the WinFsp tests ten times on windows-latest
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Install WinFsp, and check it installed
+        shell: pwsh
+        run: |
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            choco install winfsp -y --no-progress
+            if (Test-Path "C:\Program Files (x86)\WinFsp\bin") { break }
+            Start-Sleep -Seconds 30
+          }
+          if (-not (Test-Path "C:\Program Files (x86)\WinFsp\bin")) { Write-Error "WinFsp did not install"; exit 1 }
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Build the WinFsp tests
+        shell: bash
+        env:
+          AWS_LC_SYS_PREBUILT_NASM: "0"
+        run: cargo test -p slates-cli --test winfsp --no-run
+      - name: The WinFsp tests ten times
+        shell: bash
+        env:
+          SLATES_TEST_CLI: "1"
+          WINFSP_TEST_MOUNT: "1"
+          AWS_LC_SYS_PREBUILT_NASM: "0"
+        run: |
+          set +e
+          failed=0
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            cargo test -p slates-cli --test winfsp -- --test-threads=1 --nocapture > "winfsp-$i.log" 2>&1
+            code=$?
+            echo "== iteration $i exit $code"
+            grep -E "WINFSP|DIAG|test result|panicked" "winfsp-$i.log"
+            if [ "$code" -ne 0 ]; then failed=$((failed+1)); fi
+          done
+          echo "== $failed of 10 iterations failed"

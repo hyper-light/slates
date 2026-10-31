@@ -525,6 +525,13 @@ fn a_mapped_view_through_a_winfsp_mount_after_another_paths_change() {
       |took| format!("followed it in {took:?}")
     ),
   );
+  eprintln!(
+    "DIAG WINFSP COUNTERS: done {} refused {} unavailable {} echoes {}",
+    counter(&fixture.instance, PURGES_DONE),
+    counter(&fixture.instance, "winfsp.purges_refused"),
+    counter(&fixture.instance, "winfsp.purges_unavailable"),
+    counter(&fixture.instance, PURGE_ECHOES)
+  );
   assert_eq!(
     view_took.is_some(),
     MAPPED_VIEW_FOLLOWS,

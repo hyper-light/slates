@@ -1447,12 +1447,22 @@ impl Mounted {
       )
     };
     if raw == INVALID_HANDLE_VALUE || raw.is_null() {
+      eprintln!(
+        "DIAG winfsp purge: open {} refused: {}",
+        purge.path,
+        std::io::Error::last_os_error()
+      );
       return false;
     }
     // SAFETY: a handle the call above just opened and nothing else holds; owned from here and closed on drop.
     let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
-    pieces(purge.offset, purge.len, piece)
-      .all(|(offset, len)| write_zeros_at(&handle, zeros, offset, len))
+    let done = pieces(purge.offset, purge.len, piece)
+      .all(|(offset, len)| write_zeros_at(&handle, zeros, offset, len));
+    eprintln!(
+      "DIAG winfsp purge: {} [{}, +{}) piece {} done={done}",
+      purge.path, purge.offset, purge.len, piece
+    );
+    done
   }
 }
 
@@ -1521,6 +1531,12 @@ fn write_zeros_at(handle: &OwnedHandle, zeros: &[u8], offset: u64, len: u32) -> 
       &mut overlapped,
     )
   };
+  if done == 0 || written != len {
+    eprintln!(
+      "DIAG winfsp purge: write at {offset} of {len} wrote {written}: {}",
+      std::io::Error::last_os_error()
+    );
+  }
   done != 0 && written == len
 }
 
@@ -1679,6 +1695,12 @@ fn run_mount(
   };
   while let Ok(Command::Notify { round, purges }) = commands.recv() {
     let told = mounted.notify(&round);
+    eprintln!(
+      "DIAG winfsp round: {} bytes, {} purges, notify {:?}",
+      round.len(),
+      purges.len(),
+      told
+    );
     let purged = if matches!(told, Ok(Notified::Taken)) {
       mounted.purge(&purges)
     } else {
