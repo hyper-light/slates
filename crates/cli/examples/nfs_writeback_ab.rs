@@ -318,7 +318,11 @@ fn main() {
       let others = writer.map_or(0, |writer| writer.join().unwrap());
       (reads, writes, refused, others, took)
     });
-    let rate = (WRITEBACKS as f64 / took.as_secs_f64()) as u64;
+    /// Format: nanoseconds per second.
+    const NS_PER_SECOND: u128 = 1_000_000_000;
+    let rate =
+      u64::try_from((WRITEBACKS as u128).saturating_mul(NS_PER_SECOND) / took.as_nanos().max(1))
+        .unwrap_or(u64::MAX);
     println!(
       "nfs_wb\t{phase}\t{}\t{}\t{}\t{rate}\t{refused}\t{others}\t{}",
       if contended { "contended" } else { "quiet" },

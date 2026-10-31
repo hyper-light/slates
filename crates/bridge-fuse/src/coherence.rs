@@ -723,9 +723,10 @@ mod tests {
       states.changed(7, empty, 3, false);
     }
     states.changed(7, (u64::MAX - 1)..u64::MAX, 4, false);
+    let last_byte: Vec<std::ops::Range<u64>> = std::iter::once((u64::MAX - 1)..u64::MAX).collect();
     assert_eq!(
       states.stale_after(7, (u64::MAX - 10)..u64::MAX, 1, &[]),
-      Some(vec![(u64::MAX - 1)..u64::MAX]),
+      Some(last_byte),
       "the changed last byte is stale"
     );
   }

@@ -19,7 +19,8 @@
   clippy::unwrap_used,
   clippy::expect_used,
   clippy::panic,
-  clippy::indexing_slicing
+  clippy::indexing_slicing,
+  clippy::unwrap_in_result
 )]
 
 use std::net::TcpStream;
@@ -158,6 +159,16 @@ fn read_at(
   Ok(common::nfs::read_opaque(&reply, off).0)
 }
 
+/// `bytes` as an RPC count.
+fn count(bytes: usize) -> u32 {
+  u32::try_from(bytes).unwrap()
+}
+
+/// `bytes` as a file offset.
+fn offset(bytes: usize) -> u64 {
+  u64::try_from(bytes).unwrap()
+}
+
 /// A page of `fill`.
 fn page(fill: u8) -> Vec<u8> {
   vec![fill; PAGE]
@@ -206,7 +217,7 @@ fn a_stale_page_never_puts_its_old_bytes_back_over_the_sdks_write() {
   let xid = world.xid();
   assert_eq!(write_at_status(&mut client, &fh, 0, &page(b'A'), xid), OK);
   let xid = world.xid();
-  let fetched = read_at(&mut client, &fh, (0, PAGE as u32), xid).unwrap();
+  let fetched = read_at(&mut client, &fh, (0, count(PAGE)), xid).unwrap();
   world.sdk_writes(&page(b'C'));
   let xid = world.xid();
   let status = write_at_status(&mut client, &fh, 0, &written_back(&fetched), xid);
@@ -231,10 +242,10 @@ fn a_stale_page_never_brings_back_bytes_another_path_cut() {
   let xid = world.xid();
   assert_eq!(write_at_status(&mut client, &fh, 0, &two, xid), OK);
   let xid = world.xid();
-  let fetched = read_at(&mut client, &fh, (PAGE as u64, PAGE as u32), xid).unwrap();
+  let fetched = read_at(&mut client, &fh, (offset(PAGE), count(PAGE)), xid).unwrap();
   world.sdk_writes(&[]);
   let xid = world.xid();
-  let status = write_at_status(&mut client, &fh, PAGE as u64, &written_back(&fetched), xid);
+  let status = write_at_status(&mut client, &fh, offset(PAGE), &written_back(&fetched), xid);
   let bytes = world.bytes(&fh);
   eprintln!(
     "NFS-AB cut: write-back answered {status}, length after {} (the cut left 0)",
@@ -263,7 +274,7 @@ fn one_clients_stale_page_never_undoes_another_clients_write() {
   let xid = world.xid();
   assert_eq!(write_at_status(&mut one, &fh, 0, &page(b'A'), xid), OK);
   let xid = world.xid();
-  let fetched = read_at(&mut one, &fh, (0, PAGE as u32), xid).unwrap();
+  let fetched = read_at(&mut one, &fh, (0, count(PAGE)), xid).unwrap();
   let xid = world.xid();
   assert_eq!(write_at_status(&mut two, &fh, 0, &page(b'C'), xid), OK);
   let xid = world.xid();
@@ -285,7 +296,7 @@ fn a_stale_page_is_caught_on_a_volume_of_either_shard() {
     let xid = world.xid();
     assert_eq!(write_at_status(&mut client, &fh, 0, &page(b'A'), xid), OK);
     let xid = world.xid();
-    let fetched = read_at(&mut client, &fh, (0, PAGE as u32), xid).unwrap();
+    let fetched = read_at(&mut client, &fh, (0, count(PAGE)), xid).unwrap();
     world.sdk_writes(&page(b'C'));
     let xid = world.xid();
     let status = write_at_status(&mut client, &fh, 0, &written_back(&fetched), xid);
@@ -303,100 +314,14 @@ fn write_backs_no_other_path_overtook_are_applied() {
   let mut world = World::new("wb-fair", 1);
   let (mut one, root) = world.connection();
   let (mut two, _) = world.connection();
-  let mut cases = Vec::new();
-
-  // Nobody else wrote.
-  let xid = world.xid();
-  let fh = create(&mut one, &root, "alone", xid);
-  let xid = world.xid();
-  assert_eq!(write_at_status(&mut one, &fh, 0, &page(b'A'), xid), OK);
-  let xid = world.xid();
-  let fetched = read_at(&mut one, &fh, (0, PAGE as u32), xid).unwrap();
-  let xid = world.xid();
-  cases.push((
-    "alone",
-    write_at_status(&mut one, &fh, 0, &written_back(&fetched), xid),
-    fh,
-  ));
-
-  // Another client wrote another page.
-  let xid = world.xid();
-  let fh = create(&mut one, &root, "beside", xid);
-  let mut three = page(b'A');
-  three.extend_from_slice(&page(b'A'));
-  three.extend_from_slice(&page(b'A'));
-  let xid = world.xid();
-  assert_eq!(write_at_status(&mut one, &fh, 0, &three, xid), OK);
-  let xid = world.xid();
-  let fetched = read_at(&mut one, &fh, (0, 3 * PAGE as u32), xid).unwrap();
-  let xid = world.xid();
-  assert_eq!(
-    write_at_status(&mut two, &fh, 2 * PAGE as u64, &page(b'C'), xid),
-    OK
-  );
-  let xid = world.xid();
-  cases.push((
-    "beside",
-    write_at_status(&mut one, &fh, 0, &written_back(&fetched[..PAGE]), xid),
-    fh.clone(),
-  ));
-  let beside = world.bytes(&fh);
-  assert_eq!(
-    &beside[2 * PAGE..],
-    &page(b'C')[..],
-    "beside: the other client's page is kept"
-  );
-
-  // Fetched again after another client's change.
-  let xid = world.xid();
-  let fh = create(&mut one, &root, "again", xid);
-  let xid = world.xid();
-  assert_eq!(write_at_status(&mut one, &fh, 0, &page(b'A'), xid), OK);
-  let xid = world.xid();
-  let _ = read_at(&mut one, &fh, (0, PAGE as u32), xid).unwrap();
-  let xid = world.xid();
-  assert_eq!(write_at_status(&mut two, &fh, 0, &page(b'C'), xid), OK);
-  let xid = world.xid();
-  let again = read_at(&mut one, &fh, (0, PAGE as u32), xid).unwrap();
-  let xid = world.xid();
-  cases.push((
-    "again",
-    write_at_status(&mut one, &fh, 0, &written_back(&again), xid),
-    fh,
-  ));
-
-  // Written without a read.
-  let xid = world.xid();
-  let fh = create(&mut two, &root, "blind", xid);
-  let xid = world.xid();
-  assert_eq!(write_at_status(&mut two, &fh, 0, &page(b'C'), xid), OK);
-  let xid = world.xid();
-  cases.push((
-    "blind",
-    write_at_status(&mut one, &fh, 0, &written_back(&page(b'Y')), xid),
-    fh,
-  ));
-
-  // The stale bytes rewritten with the same values.
-  let xid = world.xid();
-  let fh = create(&mut one, &root, "same", xid);
-  let xid = world.xid();
-  assert_eq!(write_at_status(&mut one, &fh, 0, &page(b'A'), xid), OK);
-  let xid = world.xid();
-  let fetched = read_at(&mut one, &fh, (0, PAGE as u32), xid).unwrap();
-  let xid = world.xid();
-  assert_eq!(
-    write_at_status(&mut two, &fh, 100, &vec![b'A'; 100], xid),
-    OK
-  );
-  let xid = world.xid();
-  cases.push((
-    "same",
-    write_at_status(&mut one, &fh, 0, &written_back(&fetched), xid),
-    fh,
-  ));
-
-  for (case, status, fh) in cases {
+  let cases = [
+    ("alone", alone(&mut world, &mut one, &root)),
+    ("beside", beside(&mut world, (&mut one, &mut two), &root)),
+    ("again", again(&mut world, (&mut one, &mut two), &root)),
+    ("blind", blind(&mut world, (&mut one, &mut two), &root)),
+    ("same", same(&mut world, (&mut one, &mut two), &root)),
+  ];
+  for (case, (status, fh)) in cases {
     let bytes = world.bytes(&fh);
     eprintln!(
       "NFS-AB fair {case}: answered {status}, store landed {}",
@@ -408,6 +333,106 @@ fn write_backs_no_other_path_overtook_are_applied() {
     );
     assert_eq!(bytes.first(), Some(&b'Z'), "{case}: the store landed");
   }
+}
+
+/// A file `name` of `pages` pages of `A`, written and then read whole by `client`: its handle and the bytes fetched.
+fn fetched_file(
+  world: &mut World,
+  client: &mut TcpStream,
+  root: &[u8],
+  (name, pages): (&str, usize),
+) -> (Vec<u8>, Vec<u8>) {
+  let xid = world.xid();
+  let fh = create(client, root, name, xid);
+  let xid = world.xid();
+  assert_eq!(
+    write_at_status(client, &fh, 0, &vec![b'A'; pages * PAGE], xid),
+    OK
+  );
+  let xid = world.xid();
+  let fetched = read_at(client, &fh, (0, count(pages * PAGE)), xid).unwrap();
+  (fh, fetched)
+}
+
+/// The fair case nobody else wrote: the write-back's status and the file.
+fn alone(world: &mut World, one: &mut TcpStream, root: &[u8]) -> (u32, Vec<u8>) {
+  let (fh, fetched) = fetched_file(world, one, root, ("alone", 1));
+  let xid = world.xid();
+  (
+    write_at_status(one, &fh, 0, &written_back(&fetched), xid),
+    fh,
+  )
+}
+
+/// The fair case where another client wrote another page, which must be kept.
+fn beside(
+  world: &mut World,
+  (one, two): (&mut TcpStream, &mut TcpStream),
+  root: &[u8],
+) -> (u32, Vec<u8>) {
+  let (fh, fetched) = fetched_file(world, one, root, ("beside", 3));
+  let xid = world.xid();
+  assert_eq!(
+    write_at_status(two, &fh, offset(2 * PAGE), &page(b'C'), xid),
+    OK
+  );
+  let xid = world.xid();
+  let status = write_at_status(one, &fh, 0, &written_back(&fetched[..PAGE]), xid);
+  let bytes = world.bytes(&fh);
+  assert_eq!(
+    &bytes[2 * PAGE..],
+    &page(b'C')[..],
+    "beside: the other client's page is kept"
+  );
+  (status, fh)
+}
+
+/// The fair case where the client fetched the page again after another client's change.
+fn again(
+  world: &mut World,
+  (one, two): (&mut TcpStream, &mut TcpStream),
+  root: &[u8],
+) -> (u32, Vec<u8>) {
+  let (fh, _) = fetched_file(world, one, root, ("again", 1));
+  let xid = world.xid();
+  assert_eq!(write_at_status(two, &fh, 0, &page(b'C'), xid), OK);
+  let xid = world.xid();
+  let again = read_at(one, &fh, (0, count(PAGE)), xid).unwrap();
+  let xid = world.xid();
+  (write_at_status(one, &fh, 0, &written_back(&again), xid), fh)
+}
+
+/// The fair case of a write made without a read, over another client's write.
+fn blind(
+  world: &mut World,
+  (one, two): (&mut TcpStream, &mut TcpStream),
+  root: &[u8],
+) -> (u32, Vec<u8>) {
+  let xid = world.xid();
+  let fh = create(two, root, "blind", xid);
+  let xid = world.xid();
+  assert_eq!(write_at_status(two, &fh, 0, &page(b'C'), xid), OK);
+  let xid = world.xid();
+  (
+    write_at_status(one, &fh, 0, &written_back(&page(b'Y')), xid),
+    fh,
+  )
+}
+
+/// The fair case where another client rewrote the stale bytes with the values they had.
+fn same(
+  world: &mut World,
+  (one, two): (&mut TcpStream, &mut TcpStream),
+  root: &[u8],
+) -> (u32, Vec<u8>) {
+  let (fh, fetched) = fetched_file(world, one, root, ("same", 1));
+  let xid = world.xid();
+  assert_eq!(write_at_status(two, &fh, 100, &[b'A'; 100], xid), OK);
+  let xid = world.xid();
+  (
+    write_at_status(one, &fh, 0, &written_back(&fetched), xid),
+    fh,
+  )
 }
 
 /// A-192, never broken by hostile input. Do: after a READ, WRITE at the last offsets of the range, an empty WRITE, a
@@ -422,7 +447,7 @@ fn hostile_writes_are_answered_and_the_export_goes_on() {
   let xid = world.xid();
   assert_eq!(write_at_status(&mut client, &fh, 0, &page(b'A'), xid), OK);
   let xid = world.xid();
-  let fetched = read_at(&mut client, &fh, (0, PAGE as u32), xid).unwrap();
+  let fetched = read_at(&mut client, &fh, (0, count(PAGE)), xid).unwrap();
   let mut answered = Vec::new();
   for (offset, len) in [
     (u64::MAX - 1, 100usize),
@@ -445,7 +470,7 @@ fn hostile_writes_are_answered_and_the_export_goes_on() {
   // Only the first page is read back: the write past the end made the file sparse and many gigabytes long.
   let (mut reader, _) = world.connection();
   let xid = world.xid();
-  let first = read_at(&mut reader, &fh, (0, PAGE as u32), xid).unwrap();
+  let first = read_at(&mut reader, &fh, (0, count(PAGE)), xid).unwrap();
   assert_eq!(
     status, OK,
     "the export still applies a write-back after hostile input"
