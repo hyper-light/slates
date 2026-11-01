@@ -34,9 +34,10 @@ jobs:
           echo "image $ImageOS $ImageVersion; $(nproc) CPUs; $(uname -srm)"
       - name: Build the release binaries
         run: cargo build --release --locked -p slates-cli --bin slates --example mount_bench
-      - name: The mount benchmark
+      - name: The mount benchmark, three runs
         shell: bash
-        run: bash docs/wip/bench/fsbench/linux.sh 2>&1 | tee fsbench.txt
+        run: |
+          for run in 1 2 3; do echo "## run $run of 3"; bash docs/wip/bench/fsbench/linux.sh; done 2>&1 | tee fsbench.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -57,9 +58,10 @@ jobs:
         run: echo "image $ImageOS $ImageVersion; $(sysctl -n hw.ncpu) CPUs; $(sw_vers -productVersion); $(uname -m)"
       - name: Build the release binaries
         run: cargo build --release --locked -p slates-cli --bin slates --example mount_bench
-      - name: The mount benchmark
+      - name: The mount benchmark, three runs
         shell: bash
-        run: bash docs/wip/bench/fsbench/macos.sh 2>&1 | tee fsbench.txt
+        run: |
+          for run in 1 2 3; do echo "## run $run of 3"; bash docs/wip/bench/fsbench/macos.sh; done 2>&1 | tee fsbench.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -129,7 +131,8 @@ jobs:
           if (-not (Test-Path winfsp-fsbench/fsbench.exe)) { Write-Error "fsbench did not build"; exit 1 }
       - name: The mount benchmark and WinFsp's fsbench
         shell: bash
-        run: FSBENCH="$(pwd)/winfsp-fsbench/fsbench.exe" bash docs/wip/bench/fsbench/windows.sh 2>&1 | tee fsbench.txt
+        run: |
+          for run in 1 2 3; do echo "## run $run of 3"; FSBENCH="$(pwd)/winfsp-fsbench/fsbench.exe" bash docs/wip/bench/fsbench/windows.sh; done 2>&1 | tee fsbench.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -59,6 +59,8 @@ echo "# date $(date -u +%FT%TZ); $(cmd //c ver | tr -d '\r' | grep -v '^$'); $PR
 "$BENCH" \
   --arm ntfs="$W/ntfs" --arm slates="$DRIVE/" \
   ${FILES:+--files "$FILES"} ${ROUNDS:+--rounds "$ROUNDS"}
+echo "# the daemon's counters after the run: NFS calls by procedure, FUSE and WinFsp events (status)"
+"$SLATES" --instance "$INSTANCE" status | tr -d '\r' | grep -E "nfs_calls|fuse\.|winfsp\." || true
 
 if [ -z "$FSBENCH" ]; then
   echo "# WinFsp's fsbench: skipped, FSBENCH is unset"

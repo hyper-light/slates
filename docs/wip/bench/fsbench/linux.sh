@@ -72,3 +72,5 @@ echo "# base: $BASE_FILES files in d/ under the overlay's lower directory and th
   --arm tmpfs="$W/tmpfs" --arm overlayfs="$W/ovl" \
   --arm slates="$W/slates" --arm slates-base="$W/slates-base" \
   ${FILES:+--files "$FILES"} ${ROUNDS:+--rounds "$ROUNDS"}
+echo "# the daemon's counters after the run: NFS calls by procedure, FUSE and WinFsp events (status)"
+"$SLATES" --instance "$INSTANCE" status | tr -d '\r' | grep -E "nfs_calls|fuse\.|winfsp\." || true
