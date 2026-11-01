@@ -36,6 +36,10 @@
 //!   object, so every range of the file stays coherent however the device maps them.
 //! - Before a range's fill begins it is readied for the VMM's map (`DaxObject::prepare_range`): Windows commits it
 //!   whole, since a reserved section's page faults any view until committed; Unix pages come on touch.
+//! - A backing lays its file out as its session says (`DaxLayout`): slates' own device tells its VMM where each piece of
+//!   a window lies, so its backings hold the file in the interiors of their pages, a guard of one chunk window held
+//!   empty at both ends of each, and a window is mapped from interiors alone (A-194). The Shards route maps by the file's
+//!   own offsets, as its protocol fixes (A-163).
 //! - As a range's fill finishes it is placed in one huge page, where the host has one of a range's size
 //!   (`DaxObject::place_range`; §4.6, the backed route's L1; A-193). A guest's reads of its window hammer the rows
 //!   behind it as surely as its stores (Kim et al., ISCA 2014), so a placed range lies on 2 MiB of contiguous memory of
@@ -69,7 +73,7 @@
 
 use std::collections::{BTreeMap, VecDeque, btree_map::Entry};
 
-use slates_mem::{DAX_RANGE_BYTES, DaxObject, Handle, Placement, dax_object_bytes};
+use slates_mem::{DAX_RANGE_BYTES, DaxLayout, DaxObject, Handle, Placement, dax_object_bytes};
 use slates_vfs::error::VfsError;
 use slates_vfs::ids::InodeNo;
 use slates_vfs::inode::Kind;
@@ -251,6 +255,9 @@ struct Refill {
 /// ingest and the refill under way, each a slice per turn of the transport that drives it.
 #[derive(Debug, Default)]
 pub struct DaxBackingSession {
+  /// How the backings it makes lay out their files: guarded for a VMM told where each piece lies (slates' own device,
+  /// A-194), the identity for one that maps by the file's own offsets (the Shards protocol, A-163).
+  layout: DaxLayout,
   backings: BTreeMap<u64, Handle<ShardsBacking>>,
   pending: Option<Fill>,
   ingest: Option<Ingest>,
@@ -261,25 +268,49 @@ pub struct DaxBackingSession {
 }
 
 /// The DAX offer an attachment's requests are answered under: per-inode DAX for regular files of a range or more,
-/// marked while the store's fill budget has room for another backing (the one range each counts at least), so files
-/// stop being offered DAX before a fill would be refused.
+/// marked while the store's fill budget has room for another backing's first range in `layout` (a page under the
+/// identity, two under a guard), so files stop being offered DAX before a fill would be refused.
 #[must_use]
-pub fn offer(backings: &ShardsBackings) -> DaxOffer {
+pub fn offer(backings: &ShardsBackings, layout: DaxLayout) -> DaxOffer {
+  let first_range = layout
+    .pages_holding([0])
+    .max(1)
+    .saturating_mul(DAX_RANGE_BYTES);
   DaxOffer::PerInode {
     smallest: DAX_RANGE_BYTES,
-    new_files: backings.charged().saturating_add(DAX_RANGE_BYTES) <= backings.budget(),
+    new_files: backings.charged().saturating_add(first_range) <= backings.budget(),
   }
 }
 
-/// Derived: the views of its object a backing may hold at once: the fill budget in ranges, the most it can fill.
+/// The layout of the backings of a device that tells its VMM where each piece of a window lies (slates' own device,
+/// A-168; §4.6, the backed route's L1; A-194): guarded by one chunk window at each end of every page, the slot the
+/// arena's zones hold as their guard rows (`slates_vfs::content::chunk_bytes`), where this host can place a range in
+/// one huge page; the identity elsewhere, where a guard would isolate nothing. A host fact, so it is asked once a
+/// process: the virtio-fs device's DAX offer reads it with every request.
+#[must_use]
+pub fn guarded_layout() -> DaxLayout {
+  static LAYOUT: std::sync::OnceLock<DaxLayout> = std::sync::OnceLock::new();
+  *LAYOUT.get_or_init(|| {
+    let page = usize::try_from(slates_machine::facts::Facts::page_bytes()).unwrap_or(usize::MAX);
+    let guard = u64::try_from(slates_vfs::content::chunk_bytes(page).get()).unwrap_or(u64::MAX);
+    DaxLayout::for_backings(guard)
+  })
+}
+
+/// Derived: the views of its object a backing may hold at once: the fill budget in pages, the most it can fill.
 fn most_views(backings: &ShardsBackings) -> usize {
   usize::try_from(backings.budget().checked_div(DAX_RANGE_BYTES).unwrap_or(0)).unwrap_or(usize::MAX)
 }
 
-/// What a backing counts against the fill budget: a range for each range it has filled, at least one.
+/// What a backing counts against the fill budget: a page for each page its filled ranges lie in (one a range under the
+/// identity; under a guard two for a range alone and sixteen for fifteen in a row), at least one. That is what its
+/// placed pages hold resident, so a placement never takes memory the budget does not count.
 fn charge_of(backing: &ShardsBacking) -> u64 {
-  u64::try_from(backing.filled().len().max(1))
-    .unwrap_or(u64::MAX)
+  backing
+    .object()
+    .layout()
+    .pages_holding(backing.filled().iter().copied())
+    .max(1)
     .saturating_mul(DAX_RANGE_BYTES)
 }
 
@@ -359,10 +390,25 @@ fn page_bytes() -> usize {
 }
 
 impl DaxBackingSession {
-  /// A session with no backings.
+  /// A session with no backings, which lays its files out by their own offsets (the Shards protocol, A-163).
   #[must_use]
   pub fn new() -> DaxBackingSession {
     DaxBackingSession::default()
+  }
+
+  /// A session with no backings, which lays its files out in `layout` ([`guarded_layout`] for slates' own device).
+  #[must_use]
+  pub fn with_layout(layout: DaxLayout) -> DaxBackingSession {
+    DaxBackingSession {
+      layout,
+      ..DaxBackingSession::default()
+    }
+  }
+
+  /// How the backings it makes lay out their files: what a transport maps a window's pieces by.
+  #[must_use]
+  pub fn layout(&self) -> DaxLayout {
+    self.layout
   }
 
   /// Whether the session backs no file.
@@ -404,7 +450,7 @@ impl DaxBackingSession {
   /// [`DaxBackingSession::fill_step`]: the inode the node resolved to. A refusal leaves nothing pending.
   pub fn ask(&mut self, bridge: &mut dyn Bridge, cx: &OpContext, ask: Ask) -> Result<u64, Refused> {
     if let Some((offset, len)) = ask.range
-      && offset.saturating_add(len) > dax_object_bytes()
+      && offset.saturating_add(len) > self.layout.file_bytes(dax_object_bytes())
     {
       return Err(Refused::Malformed);
     }
@@ -433,7 +479,7 @@ impl DaxBackingSession {
       if !state.backings.charge(DAX_RANGE_BYTES) {
         return Err(Refused::Budget);
       }
-      let made = DaxObject::create(most_views(state.backings))
+      let made = DaxObject::create(most_views(state.backings), self.layout)
         .map_err(|_| Refused::Object)
         .and_then(|object| {
           state

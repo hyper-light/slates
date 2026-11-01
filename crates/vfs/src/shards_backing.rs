@@ -45,11 +45,12 @@
 //!
 //! **Placement** (§4.6, the backed route's L1; A-193). A Rowhammer aggressor needs only to read, so a guest reading its
 //! window hammers the rows behind it as surely as one storing. Each range of a VMM's backing is placed in one huge page
-//! as its fill finishes, where the host has a huge page of a range's size ([`BackingObject::place_range`]): a guest's
-//! range then lies on 2 MiB of contiguous memory of its own, beside foreign rows only at its two ends where 2 MiB spans
-//! several DRAM rows of each bank (§4.6 says where it buys less).
-//! [`ShardsBackings::placed_ranges`] counts the ranges placed now, and [`ShardsBackings::placements`] reads where each
-//! lies. A range is placed only once it is filled and counted, and a filled range stays filled while its backing lives,
+//! as its fill finishes, where the host has a huge page of a range's size ([`BackingObject::place_range`]): every page
+//! holding it is then 2 MiB of contiguous memory of its own. slates' own device lays its backings out guarded (A-194):
+//! the file's bytes lie in the interiors of the object's pages, a guard held empty at both ends of each, and the guest's
+//! window is mapped from interiors alone, so it reaches no page's edge rows. The Shards route keeps the file's own
+//! offsets, which its protocol fixes (A-163). [`ShardsBackings::placed_pages`] counts the pages placed now, and
+//! [`ShardsBackings::placements`] reads where each lies. A range is placed only once it is filled and counted, and a filled range stays filled while its backing lives,
 //! so the bytes the placed ranges hold never exceed what the backings count against the budget. A decline likely to
 //! hold is remembered until the daemon's reap tick re-arms it ([`ShardsBackings::place`]), since a declined collapse
 //! costs the shard milliseconds of the kernel's compaction effort.
@@ -62,7 +63,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use slates_mem::{
-  DAX_RANGE_BYTES, DaxObject, Handle, MemError, PeerAccess, PeerObject, Placement, Slab,
+  DAX_RANGE_BYTES, DaxLayout, DaxObject, Handle, MemError, PeerAccess, PeerObject, Placement, Slab,
 };
 
 use crate::ids::InodeNo;
@@ -165,8 +166,18 @@ impl BackingObject {
     }
   }
 
-  /// Places range `range` of a VMM's object in one huge page, its fill done (§4.6, the backed route's L1; A-193; see
-  /// `slates_mem::DaxObject::place_range`). A peer's copy is never a guest's window, so it is refused.
+  /// How the object lays out its file: a VMM's object as it was made, a peer's copy by the file's own offsets.
+  #[must_use]
+  pub fn layout(&self) -> DaxLayout {
+    match self {
+      BackingObject::Vmm(object) => object.layout(),
+      BackingObject::Peer(_) => DaxLayout::Identity,
+    }
+  }
+
+  /// Places the pages holding range `range` of a VMM's object in one huge page each, its fill done (§4.6, the backed
+  /// route's L1; A-193, A-194; see `slates_mem::DaxObject::place_range`). A peer's copy is never a guest's window, so
+  /// it is refused.
   pub fn place_range(&mut self, range: u64) -> Result<Placement, MemError> {
     match self {
       BackingObject::Vmm(object) => object.place_range(range),
@@ -221,16 +232,18 @@ pub type HandedObject = std::os::fd::OwnedFd;
 #[cfg(windows)]
 pub type HandedObject = std::os::windows::io::OwnedHandle;
 
-/// One placed range of a VMM's backing and where it lies, as [`ShardsBackings::placements`] reads it.
+/// One placed page of a VMM's backing and where it lies, as [`ShardsBackings::placements`] reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RangePlacement {
+pub struct PagePlacement {
   /// The prefix of the volume the backing's file is of.
   pub volume: u16,
   /// The backing's file.
   pub inode: InodeNo,
-  /// The range's index: it holds the file's bytes from `range × DAX_RANGE_BYTES`.
-  pub range: u64,
-  /// The bytes of slates' view of the range the kernel maps with PMD entries: the whole range where it is one huge page.
+  /// The page's index in the object: it is the object's bytes from `page × DAX_RANGE_BYTES`.
+  pub page: u64,
+  /// How the object lays out its file, so a reader knows where the page's guards lie.
+  pub layout: DaxLayout,
+  /// The bytes of slates' view of the page the kernel maps with PMD entries: the whole page where it is one huge page.
   pub pmd_bytes: Option<u64>,
 }
 
@@ -570,35 +583,37 @@ impl ShardsBackings {
     self.placements_asked
   }
 
-  /// How many ranges of the VMMs' backings are placed in a huge page each now (§4.6, the backed route's L1; A-193): a
+  /// How many pages of the VMMs' backings are placed in a huge page each now (§4.6, the backed route's L1; A-193): a
   /// gauge, which falls back to zero as the backings are let go.
   #[must_use]
-  pub fn placed_ranges(&self) -> usize {
+  pub fn placed_pages(&self) -> usize {
     self
       .slab
       .iter()
       .map(|(_, backing)| match &backing.object {
-        BackingObject::Vmm(object) => object.placed_ranges(),
+        BackingObject::Vmm(object) => object.placed_pages(),
         BackingObject::Peer(_) => 0,
       })
       .fold(0usize, usize::saturating_add)
   }
 
-  /// Where each placed range of the VMMs' backings lies now (§4.6, the backed route's L1; A-193): for a test or an
-  /// operator to check that the placement holds. Each range's reading maps slates' view of it if none is held, as
-  /// `slates_mem::DaxObject::range_pmd_bytes` says; a reading the OS refused is `None`.
-  pub fn placements(&mut self) -> Vec<RangePlacement> {
+  /// Where each placed page of the VMMs' backings lies now (§4.6, the backed route's L1; A-193, A-194): for a test or
+  /// an operator to check that the placement holds. Each page's reading maps slates' view of it if none is held, as
+  /// `slates_mem::DaxObject::page_pmd_bytes` says; a reading the OS refused is `None`.
+  pub fn placements(&mut self) -> Vec<PagePlacement> {
     let mut placements = Vec::new();
     for (_, backing) in self.slab.iter_mut_all() {
       let (volume, inode) = (backing.volume, backing.inode);
       if let BackingObject::Vmm(object) = &mut backing.object {
-        let ranges: Vec<u64> = object.placed().collect();
-        for range in ranges {
-          placements.push(RangePlacement {
+        let layout = object.layout();
+        let pages: Vec<u64> = object.placed().collect();
+        for page in pages {
+          placements.push(PagePlacement {
             volume,
             inode,
-            range,
-            pmd_bytes: object.range_pmd_bytes(range).ok().flatten(),
+            page,
+            layout,
+            pmd_bytes: object.page_pmd_bytes(page).ok().flatten(),
           });
         }
       }

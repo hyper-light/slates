@@ -33,7 +33,7 @@ use slates_bridge_core::dax_backing::{Counts, DaxBackingSession};
 use slates_bridge_fuse::abi::Opcode;
 use slates_bridge_fuse::bridge::{KernelChange, kernel_changes};
 use slates_bridge_fuse::request::InHeader;
-use slates_mem::DAX_OBJECT_BYTES;
+use slates_mem::{DAX_OBJECT_BYTES, DaxLayout};
 
 use crate::virtqueue::DescriptorChain;
 
@@ -46,8 +46,8 @@ pub struct BackedWindow {
   pub(crate) len: u64,
   /// The file, as the volume numbers it (the guest's node resolved).
   pub(crate) inode: u64,
-  /// The file offset the window starts at: its offset in the backing's object too, which holds the file at the file's
-  /// own offsets.
+  /// The file offset the window starts at. Where its bytes lie in the backing's object is the session's layout's to say
+  /// ([`window_pieces`]): at the file's own offsets, or in the interiors of guarded pages (A-194).
   pub(crate) foffset: u64,
   /// Whether the front end maps it writable: whether the attachment may write.
   pub(crate) writable: bool,
@@ -58,6 +58,37 @@ impl BackedWindow {
   pub(crate) fn overlaps(&self, moffset: u64, len: u64) -> bool {
     self.moffset < moffset.saturating_add(len) && moffset < self.moffset.saturating_add(self.len)
   }
+}
+
+/// One piece of a window the front end is asked to map or to unmap: its window, where it lies in the guest's window,
+/// and where in the backing's object it maps from (§4.6, the backed route's L1; A-194). A window under a guarded layout
+/// is two pieces, each inside one page's interior; under the identity, one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BackedPiece {
+  /// The window the piece is of.
+  pub(crate) window: BackedWindow,
+  /// The piece's offset in the guest's DAX window.
+  pub(crate) moffset: u64,
+  /// Its length.
+  pub(crate) len: u64,
+  /// The offset in the backing's object it maps from.
+  pub(crate) object_offset: u64,
+}
+
+/// The pieces `window` is mapped as under `layout`, in window order: each piece of the window's file range
+/// (`DaxLayout::pieces`) at its place in the guest's window.
+pub(crate) fn window_pieces(layout: DaxLayout, window: &BackedWindow) -> Vec<BackedPiece> {
+  layout
+    .pieces(window.foffset, window.len)
+    .map(|piece| BackedPiece {
+      window: *window,
+      moffset: window
+        .moffset
+        .saturating_add(piece.file_offset.saturating_sub(window.foffset)),
+      len: piece.len,
+      object_offset: piece.object_offset,
+    })
+    .collect()
 }
 
 /// A SETUPMAPPING the device holds: its chain, and the window it asks for.
@@ -76,6 +107,13 @@ pub(crate) struct HeldMap {
   pub(crate) sends: bool,
   /// Whether the map is sent and awaits the front end's acknowledgement.
   pub(crate) sent: bool,
+  /// The window's pieces sent and not yet acknowledged.
+  pub(crate) pieces_left: usize,
+  /// The pieces the front end acknowledged mapped, unmapped again if another is refused: a window is mapped whole or
+  /// not at all. At most a window's pieces.
+  pub(crate) mapped: Vec<BackedPiece>,
+  /// Whether the front end refused one of the pieces.
+  pub(crate) refused: bool,
 }
 
 /// A request held, unserved, for the ingest of the guest's stores it asks for.
@@ -231,13 +269,14 @@ impl BackedDax {
 }
 
 /// Whether a SETUPMAPPING's file range fits the backing's object: it starts at a whole granule, since the front end maps
-/// the object from there, and ends within the object. The guest's window range is the placer's to check.
-pub(crate) fn file_range_fits(foffset: u64, len: u64, granule: u64) -> bool {
+/// the object from there, and ends within the file the object holds in `layout`. The guest's window range is the
+/// placer's to check.
+pub(crate) fn file_range_fits(foffset: u64, len: u64, granule: u64, layout: DaxLayout) -> bool {
   granule > 0
     && foffset.is_multiple_of(granule)
     && foffset
       .checked_add(len)
-      .is_some_and(|end| end <= DAX_OBJECT_BYTES)
+      .is_some_and(|end| end <= layout.file_bytes(DAX_OBJECT_BYTES))
 }
 
 /// Which backings a request asks the guest's stores of to reach the volume before it is served.
@@ -330,20 +369,36 @@ mod tests {
   #[test]
   fn a_file_range_must_start_at_a_granule_and_end_within_the_object() {
     let granule = 4096;
-    assert!(file_range_fits(0, 2 << 20, granule));
-    assert!(!file_range_fits(1, 2 << 20, granule), "off a granule");
+    let identity = DaxLayout::Identity;
+    assert!(file_range_fits(0, 2 << 20, granule, identity));
     assert!(
-      file_range_fits(DAX_OBJECT_BYTES - granule, granule, granule),
+      !file_range_fits(1, 2 << 20, granule, identity),
+      "off a granule"
+    );
+    assert!(
+      file_range_fits(DAX_OBJECT_BYTES - granule, granule, granule, identity),
       "ending at the object's end"
     );
     assert!(
-      !file_range_fits(DAX_OBJECT_BYTES, granule, granule),
+      !file_range_fits(DAX_OBJECT_BYTES, granule, granule, identity),
       "past the object"
     );
     assert!(
-      !file_range_fits(u64::MAX - granule + 1, granule, granule),
+      !file_range_fits(u64::MAX - granule + 1, granule, granule, identity),
       "an end that overflows"
     );
-    assert!(!file_range_fits(0, granule, 0), "a zero granule");
+    assert!(!file_range_fits(0, granule, 0, identity), "a zero granule");
+    let guarded = DaxLayout::Guarded {
+      guard: 16 * granule,
+    };
+    let held = guarded.file_bytes(DAX_OBJECT_BYTES);
+    assert!(
+      file_range_fits(held - granule, granule, granule, guarded),
+      "ending at the end of the file a guarded object holds"
+    );
+    assert!(
+      !file_range_fits(held, granule, granule, guarded),
+      "past the file a guarded object holds, though within the object's bytes"
+    );
   }
 }
