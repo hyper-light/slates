@@ -10366,6 +10366,20 @@ beside it (no unprivileged process sees a frame number), and L2's shift (no map 
   the backing. No test reaches a fill failing part-way. Placement does not widen it: a range is placed only once its
   fill finishes.
 
+### 2026-11-01: the Linux arm64 KVM cells, with no Docker on the Mac (Step 7 of the VFS and DAX plan) — closed
+
+**Closed.** The DAX matrix's owed Linux arm64 cells are proven on a nested arm64 KVM host on this Mac (Apple M5 Max;
+Debian 6.12.113 at EL2 under Apple's Virtualization framework, 6 vCPUs, 16 GiB, `vzrun`), whose initramfs CI's native
+arm64 runner builds from a diagnostics branch, so no Docker runs on the Mac (`arm64-kvm-on-a-mac.md`; diagnostics runs
+41318050347 and 41319438579): crosvm (1c8d17a85, built for arm64) by the image form and by slates' own device, Cloud
+Hypervisor v54.0 by the image form and over a handed copy, and Firecracker v1.17.0 over a handed copy (Step 6.6).
+`crates/cli/tests/guest_image.rs` 7 of 7 with all three VMMs in each of three runs (156 to 173 s), and
+`crates/cli/tests/guest_vhost.rs` 8 of 8 in crosvm twice (141.63 and 145.08 s); every takeover test taken over with the
+host's next write in the guest's map; every `dax=never` red-check failing at its DAX check, in each VMM alone.
+`guest_image.rs` gained a crosvm gate for it (Step 7.1, 4a641bb7: 7 of 7 in each of three runs on adacachy).
+**Found:** crosvm's sandbox cannot pivot away from an initramfs (pivot_root(2): EINVAL on rootfs), which failed every
+crosvm test of the first run; the host's init now moves its root onto a tmpfs before anything runs.
+
 ### 2026-11-01: pmem over a handed copy, a socket route for every pmem VMM (A-197) — built on Linux x86_64
 
 **Built (A-197, Step 6.1 of the VFS and DAX plan).** `slates pmem ID FILE --fd N -- VMM` maps a file to write with a
@@ -10406,10 +10420,12 @@ socket-route cell on Linux x86_64 turned from impossible to proven, Cloud Hyperv
 image, and QEMU's, proven by slates' own device (A-189), gained the same route for an image; Firecracker's on Linux arm64
 turned from impossible to owed (Step 6.6).
 
+**Closed (A-197, Step 6.6): Firecracker on arm64 over a handed copy**, on the nested arm64 KVM host Step 7 built: the
+pmem tests over the copy in each of three runs (the entry above).
+
 **Owed:**
 - macOS and Windows writable copies across a takeover: a macOS copy keeps a second descriptor the anchor does not hold,
-  and Windows' anchor holds no descriptors;
-- Firecracker on arm64 over a handed copy, on the nested host Step 7 builds (Step 6.6).
+  and Windows' anchor holds no descriptors.
 
 ### 2026-11-01: one window kind: the fd-sharing placer maps per-file backings, and the arena's windows are gone (A-195)
 
@@ -11395,7 +11411,8 @@ without a user namespace, which needs root.
   size never changes, and a cut zeroes the cut range in it, so the guest reads zeros there; shown by a real guest on
   2026-10-25 (`guest_vhost.rs`, G-vhost step 3).
 - **crosvm offers DAX on x86_64 only** (`cfg!(target_arch = "x86_64")`, TODO b/176129399, at 1c8d17a85). On an arm64
-  host the mount route under crosvm runs without DAX.
+  host the mount route under crosvm's own fs device runs without DAX. (crosvm's image form and slates' own device give
+  it DAX on arm64: proven 2026-11-01, Step 7.)
 
 ### 2026-10-24: the daemon serves a Shards microVM's fs device over a stream (A-161) — built through the CLI; a real boot and DAX owed
 
@@ -11628,11 +11645,11 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
       ask, and slates' vhost-user back end is Linux's;
     - crosvm on arm64 by both routes: its vhost-user front end maps a back end's region with no architecture gate (the
       matrix's "impossible" there was wrong; the x86_64 gate is in crosvm's own fs device), and its `--pmem` serves the
-      image form with no gate either. It needs crosvm built for arm64 on an arm64 host with KVM: the nested
-      virtualization VM on this Mac, whose initramfs is built with Docker (`vz-l1`), off since Ada quit it;
+      image form with no gate either. **Closed 2026-11-01 (Step 7):** both proven on the nested arm64 KVM host whose
+      image CI's arm64 runner builds (the Step 7 entry);
     - Cloud Hypervisor by the image form: **proven on x86_64, 2026-10-30** (Ada's go for its binary on the box):
-      `guest_image.rs` 4 of 4 in v54.0 on adacachy, red-checked with `dax=never`; arm64 owed, as crosvm's is (the
-      nested host's initramfs needs Docker).
+      `guest_image.rs` 4 of 4 in v54.0 on adacachy, red-checked with `dax=never`; **arm64 proven 2026-11-01** (Step 7,
+      the entry of that name).
   - **Stays out, each on its source:** a file tree in QEMU by its own device (vhost-user-fs-pci has no window, and
     virtiofsd no DAX in any release: its merge request !318 is open since 2026-06-03), so QEMU's mount route is the
     image form; QEMU's mount route on arm64, Apple silicon's included (no virtio-pmem); Kata on QEMU (it asks
@@ -12128,7 +12145,8 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     - Cloud Hypervisor by its fs device: "it is not available" (its mount route is the image form, proven on x86_64
       2026-10-30, the A-189 entry);
     - crosvm on arm64 by the mount route: its own fs device's DAX is x86_64-only. **Corrected 2026-10-29 (A-189):** the
-      socket route there is owed, not ruled out (its vhost-user front end has no such gate);
+      socket route there is owed, not ruled out (its vhost-user front end has no such gate), and is proven since
+      2026-11-01 (Step 7), as is the image form;
     - Docker Desktop on macOS, and Apple's framework: measured 2026-10-27, the framework's virtio-fs device has no cache
       window (`virtio_fs_setup_dax: No cache capability`; `dax=always` refused), and Docker Desktop's VM shares the
       Mac's folders through that device (`virtiofs0 /run/host_virtiofs/Users`) under its `fakeowner` layer;

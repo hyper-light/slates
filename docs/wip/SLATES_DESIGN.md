@@ -3156,6 +3156,12 @@ daemon through the rendezvous's socket file (A-187).
 >   then impossible) and Cloud Hypervisor on Linux x86_64 (on adacachy, each pmem test of `guest_image.rs` three of three
 >   in three runs, and three tests of a hostile guest), and QEMU 11.1 by the same route beside slates' own device (CI,
 >   diagnostics runs 41307486734 and 41310124785). Firecracker on Linux arm64 by this route is owed (Step 6.6).
+> - **Proven since (Step 7 of the VFS and DAX plan, 2026-11-01):** every Linux arm64 cell that was owed, on a nested arm64
+>   KVM host on this Mac (Apple M5 Max; Debian 6.12.113 at EL2 under Apple's Virtualization framework) whose image CI's
+>   arm64 runner builds, so no Docker runs on the Mac (diagnostics runs 41318050347 and 41319438579;
+>   `arm64-kvm-on-a-mac.md`): crosvm by the image form and by slates' own device, Cloud Hypervisor by the image form and
+>   over a handed copy, and Firecracker over a handed copy (Step 6.6), each red-checked with the guest mounting
+>   `dax=never`. No Linux arm64 cell of the matrix is owed.
 > - **Ruled out by the platforms:** QEMU's vhost-user-fs device and virtiofsd have no window, so QEMU shares no file tree
 >   with DAX by its own device, its mount route is the image form, x86_64 only (it builds virtio-pmem for x86 machines
 >   alone), and Kata, which drives that device, has neither route; Cloud Hypervisor's fs device has none (its mount

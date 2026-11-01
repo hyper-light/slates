@@ -10,8 +10,9 @@ with KVM. Neither CI nor this kiln has one as a machine:
 Apple's Virtualization framework offers nested virtualization on M3 and later Macs since macOS 15
 (`VZGenericPlatformConfiguration.isNestedVirtualizationSupported`, true on this Mac: Apple M5 Max, macOS 26.4.1). A
 Linux guest with it on boots at EL2 and runs KVM, so it is a real arm64 KVM host: hardware virtualization, nested. This
-file is the recipe. Nothing of it is in slates or its CI: a 67-line Swift launcher, an image built with Docker, and a
-boot. Each run is a command on the record below.
+file is the recipe. Nothing of it is in slates or its CI's main workflows: a 67-line Swift launcher, an image built with
+Docker (on this Mac until 2026-10-28; on CI's arm64 runner from a diagnostics branch since 2026-11-01, the last section),
+and a boot. Each run is a command on the record below.
 
 ## What the VM showed
 
@@ -268,3 +269,211 @@ mount -t virtiofs share /mnt                 -> 0, the Mac's file read whole
 So no guest of Apple's framework maps a shared file through a window, and Docker Desktop's containers, whose VM shares
 the Mac's folders through the same device (`virtiofs0 /run/host_virtiofs/Users`), cannot either (`virtiofs.md` §8).
 
+## Built on CI's arm64 runner, with no Docker on the Mac (2026-11-01, Step 7 of the VFS and DAX plan)
+
+Ada quit Docker Desktop on 2026-10-28, so the image above can no longer be built on this Mac. It is now built on CI's
+native arm64 runner (`ubuntu-24.04-arm`), whose Docker is the runner's, from a diagnostics branch that carries the
+Dockerfile, the init and the workflow below as `ci/s7-l1/` and `.github/workflows/diag-s7-l1.yml` (never main). The Mac
+downloads the artifact, checks its digests against the run's log, and boots it:
+
+```
+gh run download <run> -n s7-l1 -D <dir>      # l1-initrd.gz and l1-kernel; shasum -a 256 each against the run's log
+vzrun l1-kernel l1-initrd.gz "console=hvc0 rdinit=/init loglevel=4 l1.run=image" 6 16384 < /dev/null   # or vhost, red
+```
+
+What it adds to the image above: crosvm for arm64 at 1c8d17a85, the x86_64 box's, built with its own toolchain (1.88.0)
+and without its default features (its jail's build script compiles its seccomp policies with `python3`); Cloud
+Hypervisor v54.0's static aarch64 binary, its digest pinned; Firecracker v1.17.0 as before; guest_vhost's test binary
+beside guest_image's; and copies of both built with their guests mounting `dax=never`, the red-checks. The initramfs is
+made with the runner's own `cpio`, `dev/console` left out as before.
+
+**crosvm cannot sandbox on an initramfs.** The first run failed each crosvm test before the guest booted:
+`libminijail[1]: pivot_root: Invalid argument`, then "failed to create a PCI root hub". crosvm's sandbox pivots each
+jailed device into `/var/empty`, and pivot_root(2) refuses when the current root is the kernel's rootfs ("EINVAL The
+current root is on the rootfs (initial ramfs) mount"). The init now copies the tree onto a tmpfs and `switch_root`s into
+it before anything runs; on the box crosvm runs on a real root and needs none of it.
+
+```dockerfile
+# The arm64 KVM host for the DAX matrix's Linux arm64 cells (Step 7 of the VFS and DAX plan), booted as a
+# nested-virtualization VM on an Apple M-series Mac (vzrun, docs/wip/arm64-kvm-on-a-mac.md). Built on CI's native arm64
+# runner from a diagnostics branch, never on the Mac, which runs no Docker. Built from the slates tree as context, with
+# this folder as the `l1` build context.
+FROM rust:1.98.1 AS build
+WORKDIR /work
+COPY . .
+ENV RUSTUP_TOOLCHAIN=1.98.1 CARGO_BUILD_JOBS=4
+RUN mkdir -p /out/work/target/release /out/opt/slates \
+ && cargo build --release --locked -p slates-cli --bin slates \
+ && cp target/release/slates /out/work/target/release/slates \
+ && cargo test --release --locked -p slates-cli --test guest_image --test guest_vhost --no-run --message-format=json > /tmp/test.json \
+ && for t in guest_image guest_vhost; do \
+      T=$(grep -o "\"executable\":\"[^\"]*/${t}-[^\"]*\"" /tmp/test.json | head -1 | cut -d'"' -f4); \
+      echo "test binary $t: $T"; cp "$T" "/out/opt/slates/$t"; \
+    done \
+ && sed -i 's/slates.dax=always slates.modules/slates.dax=never slates.modules/' crates/cli/tests/guest_image.rs \
+ && grep -q 'slates.dax=never slates.modules' crates/cli/tests/guest_image.rs \
+ && sed -i 's/^const GUEST_ARGUMENTS: &str = "rdinit=\/init quiet slates.dax=always";/const GUEST_ARGUMENTS: \&str = "rdinit=\/init quiet slates.dax=never";/' crates/cli/tests/guest_vhost.rs \
+ && grep -q '^const GUEST_ARGUMENTS: &str = "rdinit=/init quiet slates.dax=never";' crates/cli/tests/guest_vhost.rs \
+ && cargo test --release --locked -p slates-cli --test guest_image --test guest_vhost --no-run --message-format=json > /tmp/red.json \
+ && for t in guest_image guest_vhost; do \
+      T=$(grep -o "\"executable\":\"[^\"]*/${t}-[^\"]*\"" /tmp/red.json | head -1 | cut -d'"' -f4); \
+      echo "red test binary $t: $T"; cp "$T" "/out/opt/slates/${t}_red"; \
+    done \
+ && rustup target add aarch64-unknown-linux-musl \
+ && RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --locked -p slates-guest-probe --bin slates-guest-probe --target aarch64-unknown-linux-musl \
+ && cp target/aarch64-unknown-linux-musl/release/slates-guest-probe /out/opt/slates/slates-guest-probe
+
+# crosvm at the commit the x86_64 box runs (1c8d17a85), with its own toolchain (its rust-toolchain: 1.88.0), built
+# without its default features (gpu, audio, usb, net, wl): pmem, the vhost-user front end and the fs device are core.
+FROM debian:trixie AS crosvm
+# python3: crosvm's jail build script compiles its seccomp policies with minijail's compile_seccomp_policy.py.
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates curl git build-essential \
+      pkg-config libcap-dev clang libclang-dev python3 >/dev/null
+RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.88.0
+ENV PATH=/root/.cargo/bin:$PATH
+RUN git clone --filter=blob:none https://chromium.googlesource.com/crosvm/crosvm /crosvm \
+ && cd /crosvm && git checkout 1c8d17a85 && git submodule update --init third_party/minijail
+RUN cd /crosvm && cargo build --release --no-default-features && cp target/release/crosvm /crosvm-bin \
+ && /crosvm-bin version
+
+FROM debian:trixie-slim AS fetch
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates >/dev/null
+WORKDIR /fetch
+RUN curl -fsSLO https://github.com/firecracker-microvm/firecracker/releases/download/v1.17.0/firecracker-v1.17.0-aarch64.tgz \
+ && echo "e351ebe4f7a16b5873bbd51005d2e6767103cff4d5ebc829df2d3f95a93e2256  firecracker-v1.17.0-aarch64.tgz" | sha256sum -c \
+ && tar -xzf firecracker-v1.17.0-aarch64.tgz && cp release-v1.17.0-aarch64/firecracker-v1.17.0-aarch64 /fetch/firecracker \
+ && curl -fsSLO https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v54.0/cloud-hypervisor-static-aarch64 \
+ && echo "e8a6d9786ea678e739f1a386682846e93742dcb9c7b6e3e0c62e3bda6cff0ef3  cloud-hypervisor-static-aarch64" | sha256sum -c \
+ && chmod 755 cloud-hypervisor-static-aarch64
+
+FROM debian:trixie-slim
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends linux-image-arm64 e2fsprogs fuse3 kmod \
+      busybox-static procps coreutils libcap2 >/dev/null 2>&1 && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/ /
+COPY --from=crosvm /crosvm-bin /opt/crosvm/crosvm
+COPY --from=fetch /fetch/firecracker /opt/firecracker/firecracker
+COPY --from=fetch /fetch/cloud-hypervisor-static-aarch64 /opt/cloud-hypervisor/cloud-hypervisor
+COPY --from=l1 init /init
+# crosvm's sandbox pivots each jailed device into /var/empty, which a slim image lacks.
+RUN chmod 755 /init && mkdir -p /var/empty
+```
+
+```sh
+#!/bin/sh
+# The L1 VM's init: a real arm64 Linux with KVM (nested virtualization on an Apple M-series Mac; Step 7 of the VFS and
+# DAX plan). The kernel argument `l1.run=` picks what it runs:
+# `image`, guest_image.rs with Firecracker, Cloud Hypervisor and crosvm; `vhost`, guest_vhost.rs with crosvm; `red`,
+# guest_image.rs and guest_vhost.rs built with the guest mounting dax=never, guest_image's maps test once in each VMM
+# alone and guest_vhost's map test in crosvm, each of which must fail at its DAX check. Prints, then powers off.
+#
+# First it moves itself off the initramfs: the kernel's rootfs cannot be pivoted away from (pivot_root(2): EINVAL "The
+# current root is on the rootfs (initial ramfs) mount"), and crosvm's sandbox pivots each jailed device into /var/empty,
+# so on rootfs crosvm fails ("libminijail[1]: pivot_root: Invalid argument"). The tree is copied onto a tmpfs, which
+# switch_root makes the root, freeing the initramfs; the copy then runs this script again.
+if [ ! -e /.l1-switched ]; then
+  mkdir -p /newroot
+  mount -t tmpfs tmpfs /newroot
+  (cd / && tar --one-file-system -cf - .) | tar -C /newroot -xpf -
+  touch /newroot/.l1-switched
+  exec busybox switch_root /newroot /init
+fi
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+exec </dev/console >/dev/console 2>&1
+mkdir -p /dev/pts /dev/shm
+mount -t devpts devpts /dev/pts
+mount -t tmpfs tmpfs /dev/shm
+mount -t tmpfs tmpfs /run
+mount -t tmpfs tmpfs /tmp
+busybox ip link set lo up
+K=$(ls /lib/modules)
+RUN=$(sed -n 's/.*l1\.run=\([a-z]*\).*/\1/p' /proc/cmdline)
+echo "L1: $(uname -a)"
+echo "L1: $(dmesg | grep -m1 'started at EL')"
+ls -l /dev/kvm /dev/fuse
+export HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin SLATES_TEST_CLI=1
+mkdir -p /root /work/target/tmp
+cd /root
+echo "L1: firecracker $(/opt/firecracker/firecracker --version | head -1)"
+echo "L1: cloud-hypervisor $(/opt/cloud-hypervisor/cloud-hypervisor --version | head -1)"
+echo "L1: crosvm $(/opt/crosvm/crosvm version | head -1)"
+export SLATES_GUEST_PROBE=/opt/slates/slates-guest-probe SLATES_GUEST_MODULES=/lib/modules/$K
+FC="SLATES_GUEST_FIRECRACKER=/opt/firecracker/firecracker SLATES_GUEST_VMLINUX=/boot/vmlinuz-$K"
+CH="SLATES_GUEST_CLOUD_HYPERVISOR=/opt/cloud-hypervisor/cloud-hypervisor SLATES_GUEST_VMLINUX=/boot/vmlinuz-$K"
+CROSVM="SLATES_GUEST_CROSVM=/opt/crosvm/crosvm SLATES_GUEST_KERNEL=/boot/vmlinuz-$K"
+case "$RUN" in
+  vhost)
+    env $CROSVM /opt/slates/guest_vhost --test-threads=1 --nocapture 2>&1
+    echo "L1: test exit $?"
+    ;;
+  red)
+    for vmm in FC CH CROSVM; do
+      eval "gate=\$$vmm"
+      echo "L1: red-check in $vmm"
+      env $gate /opt/slates/guest_image_red --test-threads=1 --nocapture \
+        --exact a_guest_maps_a_volume_image_with_dax_through_virtio_pmem 2>&1
+      echo "L1: red $vmm exit $?"
+    done
+    echo "L1: red-check of slates' own device in CROSVM"
+    env $CROSVM /opt/slates/guest_vhost_red --test-threads=1 --nocapture \
+      --exact a_guest_maps_a_session_file_through_slates_own_device_with_dax_and_sees_each_change_as_its_writer_is_answered 2>&1
+    echo "L1: red vhost CROSVM exit $?"
+    ;;
+  *)
+    env $FC $CH $CROSVM /opt/slates/guest_image --test-threads=1 --nocapture 2>&1
+    echo "L1: test exit $?"
+    ;;
+esac
+busybox poweroff -f
+```
+
+```yaml
+name: diag-s7-l1
+# Diagnostics for Step 7 of the VFS and DAX plan, never main: the nested arm64 KVM host's initramfs and kernel, built on
+# CI's native arm64 runner (Docker is the runner's, never the Mac's), as an artifact the Mac boots under its nested
+# virtualization (vzrun, docs/wip/arm64-kvm-on-a-mac.md).
+on:
+  push:
+    branches: ['diag-s7-l1-*']
+jobs:
+  l1:
+    name: the nested arm64 KVM host's initramfs (Step 7)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the L1 image
+        run: docker build --build-context l1=ci/s7-l1 -t slates-l1 -f ci/s7-l1/Dockerfile .
+      - name: Make the initramfs and take the kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+          C=$(docker create slates-l1); docker export "$C" > rootfs.tar; docker rm "$C"
+          mkdir rootfs
+          # `docker export` writes dev/console as an empty regular file, which the kernel would open as init's console.
+          sudo tar -xf rootfs.tar -C rootfs --exclude=dev/console
+          K=$(cd rootfs && ls boot/vmlinuz-* | head -1); cp "rootfs/$K" l1-kernel
+          (cd rootfs && sudo find . -print0 | sudo cpio --null -o -H newc --quiet) | gzip -1 > l1-initrd.gz
+          ls -la l1-initrd.gz l1-kernel; sha256sum l1-initrd.gz l1-kernel; echo "kernel $K"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: s7-l1
+          path: |
+            l1-initrd.gz
+            l1-kernel
+          retention-days: 7
+```
+
+**Results** (2026-11-01; diagnostics runs 41318050347 and 41319438579, each artifact's digests checked on the Mac):
+- `guest_image.rs` 7 of 7 in each of three runs (172.27, 156.38 and 173.35 s), Firecracker, Cloud Hypervisor and crosvm
+  each booting 13 guests a run (nested, Firecracker in 2.6 to 3.4 s, Cloud Hypervisor in 2.7 to 3.3 s, crosvm in 3.8 to
+  6.3 s): the pmem tests over the image file through a slates mount and over a copy `slates pmem` hands the VMM, the
+  drive test, and the three hostile guests. Each run's six takeovers (three VMMs, two backings) went to a new daemon,
+  the host's next write showing in the guest's map in 0 to 307 µs, and each kill mid-sweep left an exact boundary
+  (sweeps 149 to 244), arm64's store order notwithstanding.
+- `guest_vhost.rs` 8 of 8 in crosvm, twice (141.63 and 145.08 s): slates' own device's window on arm64, six daemon kills
+  under a guest's write each taken over with the map following in 38 to 126 µs, and twelve guest kills.
+- The red-checks: guest_image's maps test, with its guest mounting `dax=never`, fails at its DAX check (`Mapped { dax:
+  false }: DAX is what this test is for`) in Firecracker, Cloud Hypervisor and crosvm alone, and guest_vhost's map test
+  fails at its own (`the map is not DAX`) in crosvm.
