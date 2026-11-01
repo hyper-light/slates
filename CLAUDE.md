@@ -225,7 +225,7 @@ Every test is written as "do X, expect Y" and names the acceptance criterion or 
     leaked 8 of 8 rounds' keepers before).
   - A defence the host may decline, counted and remembered: `ShardsBackings::place` in
     `crates/vfs/src/shards_backing.rs` (each range a guest maps placed in huge pages as its fill finishes, A-193),
-    re-armed on the daemon's reap tick beside `DaxZones::rearm_refusals`; and the guard rows around it, a layout the
+    re-armed on the daemon's reap tick (`rearm_placement`); and the guard rows around it, a layout the
     object's offsets go through (`DaxLayout` in `crates/mem/src/dax_object.rs`, A-194): slates' own device maps each
     window as two pieces from page interiors. Gotchas, each found by a run or a review:
     - a guard needs no physical neighbour you cannot see: put it inside the page and map the window around it, since the
@@ -242,7 +242,17 @@ Every test is written as "do X, expect Y" and names the acceptance criterion or 
       remember it;
     - a test that gets no huge page from a busy host skips loudly, while one that asked the kernel nothing fails;
     - a stand-in vhost-user front end must acknowledge every unmap too, in order;
-    - `fuse_removemapping_in` is a bare count with no padding (`crates/bridge-virtiofs/tests/device.rs`).
+    - `fuse_removemapping_in` is a bare count with no padding (`crates/bridge-virtiofs/tests/device.rs`);
+    - every stand-in front end must take every piece of a window: the server's vhost-form tests took one, pass on a Mac,
+      where they do not run, and failed both Linux lanes (CI run 41279217175). Run a Linux-only suite on Linux before
+      pushing a change to what it drives.
+  - One window kind with two placers: `crates/bridge-virtiofs/src/device.rs` (`map_held_window`, `unmap_pieces`) with the
+    backed fixture in `crates/bridge-virtiofs/tests/device.rs` (`Placer`, `placers()`, `GuestMap`; A-195). A placer is
+    only how a window's pieces are mapped and unmapped: the fd-sharing placer overlays each piece and acknowledges it at
+    once through the completion the message placer's acknowledgements use, so every backed test runs over each placer
+    the host has. Gotcha: a range the fd-sharing placer restored is `PROT_NONE`, which no test can read without a fault,
+    so hold its maps and removals to the overlays it made and restored (`Device::dax_overlays`): nothing else a test can
+    observe tells a REMOVEMAPPING that left them from one that did not.
 - **Keep design docs in sync with code.** Changing a subsystem's behaviour updates its design section, its status blockquote and the ledger in the same commit.
 - **Commit everything, in imperative area-prefixed summaries that carry the measured fact**, in vorpal's style: `merge: one graph tool over seven relations; deferred-schema cost measured`. Always `git add -A && git commit -m "<message>"`. Never `git checkout`, `git stash`, `git reset`, or any destructive git command.
 - **Debugging protocol.** Add logging to file first; consult the design section rather than assuming from code; confirm scope, intended behaviour, timing and frequency with Ada; after root cause is confirmed by logs and analysis, write `docs/bugs/<date>-<slug>.md` with description, root cause, impact and exact edits; fix in plan mode; touch nothing beyond the fix, but report every sibling inconsistency found; never preserve the behaviour that caused the bug.

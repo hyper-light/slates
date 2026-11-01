@@ -4637,40 +4637,9 @@ fn open_base(
   Ok((volume, Some(host)))
 }
 
-/// A snapshot, with the DAX recall it may have begun ended on the way out (§4.6 step 5).
-///
-/// The recall excludes new writable DAX windows of the volume while the device munmaps the ones this snapshot
-/// called back; it is this snapshot's to end. Every answer but the retryable `Overloaded` means this snapshot is
-/// finished with the volume — frozen, or refused — so the exclusion lifts here, in one place rather than at each of
-/// the inner function's seven returns. Without it a client that simply stopped retrying would leave the volume
-/// unable to take a writable window at all, with nothing to clear it but a `destroy`.
+/// A snapshot of `volume` (§4.4 `snapshot`). A guest's DAX windows need nothing of it: each maps its file's backing, an
+/// object the write boundary keeps equal to the head, never the shared content a snapshot freezes (A-168, A-195).
 fn snapshot(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> ReplyBody {
-  let reply = snapshot_within_recall(state, principal, volume);
-  let still_recalling = matches!(
-    reply,
-    ReplyBody::Refused {
-      refusal: Refusal::Overloaded { .. }
-    }
-  );
-  if !still_recalling
-    && let Ok((handle, _)) = crate::merge_service::find_store_backed(
-      state,
-      volume,
-      crate::merge_service::StoreVerb::Snapshot,
-    )
-    && let Ok(slot) = state.volumes.get(handle)
-  {
-    let prefix = slot.volume.prefix();
-    state.store.dax.end_recall(prefix);
-  }
-  reply
-}
-
-fn snapshot_within_recall(
-  state: &mut ShardState,
-  principal: &Principal,
-  volume: VolumeId,
-) -> ReplyBody {
   use crate::merge_service::{StoreVerb, find_store_backed};
   let (handle, record) = match find_store_backed(state, volume, StoreVerb::Snapshot) {
     Ok(x) => x,
@@ -4678,38 +4647,6 @@ fn snapshot_within_recall(
   };
   if !rights_of(&record, principal).write {
     return forbidden("snapshot");
-  }
-  // Before freezing, recall any live WRITABLE DAX window of this volume (§4.6): the snapshot shares the window's
-  // block with the frozen version, and a guest's direct DAX write through a stale writable window would reach that
-  // frozen version (CoW cannot see a hardware write). `dax_revoke_writable_of_prefix` hands each writable window to
-  // the device to munmap (two-phase, writable-only — read-only windows survive as immutable shared content); the
-  // snapshot is refused **retryable** until the device has drained them (`has_pending_of_prefix` clears), so it
-  // freezes only once no writable window can still reach a shared block — the writable-DAX↔snapshot exclusion, the
-  // same shape a write delegation needs. A no-op on a volume with no writable DAX window — the production case,
-  // since DAX stays unadvertised (§4.6 A-9); reached only once a guest holds a writable window.
-  let prefix = match state.volumes.get(handle) {
-    Ok(slot) => slot.volume.prefix(),
-    Err(_) => return refused(Refusal::NotFound),
-  };
-  // The recall begins with the revoke and holds until this snapshot answers something other than the retryable
-  // refusal (`snapshot`, above): while it holds, `Volume::dax_map_write` refuses the volume, so a guest cannot
-  // re-arm a writable window between two retries and hold the snapshot off forever.
-  if state.store.dax.has_writable_of_prefix(prefix) {
-    state.store.dax_revoke_writable_of_prefix(prefix);
-    if !state.store.dax.begin_recall(prefix) {
-      // The registry is already holding its bound in recalls. Refused retryable rather than freezing with the
-      // exclusion unheld, since without it a guest can re-arm a window between the retries.
-      return refused(Refusal::Overloaded { shard: state.shard });
-    }
-  }
-  if state.store.dax.has_pending_of_prefix(prefix) {
-    // Kick the volume's device loops to munmap the recalled windows now (not on the guest's next doorbell kick),
-    // then refuse retryable: the client's retry meets the frozen-safe volume once the device has drained — the
-    // retryable-refusal shape `await_deferred_completion` uses.
-    // Unix-only, as the module is: a platform with no guest device has no window to munmap.
-    #[cfg(unix)]
-    crate::virtiofs::kick_volume_devices(state, record.id);
-    return refused(Refusal::Overloaded { shard: state.shard });
   }
   // The volume's next epoch, checked before any effect: an epoch with no successor refuses the snapshot
   // rather than repeat one (AUD-29-26's sibling; reachable only through a maximal recorded epoch).

@@ -721,6 +721,17 @@ impl ShardsBackings {
     })
   }
 
+  /// The backings of file `inode` of the volume of prefix `volume`, one per session that backs it: what a test or an
+  /// operator reads to see what a guest's window reaches (its object's guards, the bytes it holds) without the VMM.
+  pub fn of_file(&self, volume: u16, inode: InodeNo) -> impl Iterator<Item = &ShardsBacking> + '_ {
+    self
+      .by_file
+      .get(&(volume, inode))
+      .into_iter()
+      .flatten()
+      .filter_map(|handle| self.slab.get(*handle).ok())
+  }
+
   /// Whether file `inode` of the volume of prefix `volume` has any backing: the write boundary's one check, a map
   /// lookup, on files no guest maps.
   #[must_use]

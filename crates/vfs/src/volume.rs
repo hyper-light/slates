@@ -136,17 +136,9 @@ pub struct Store {
   /// Releases of retired objects the store refused (an object already gone, or a free the arena refused): each is an
   /// object listed twice or one left held, so it is counted and surfaced (`store.release_refused`), never silent.
   pub release_refusals: u64,
-  /// The shard's DAX mapping registry (§4.6, AC-4.12): every live guest window, so the content paths revoke before
-  /// they move, share, land or take over a mapped block, and the hardware access path tells a live mapping from a
-  /// revoked one. Daemon-only RAM — no agent, SDK, MCP or guest reaches it; a mapping is minted here, never supplied.
-  /// Empty on any shard no guest maps, so it costs a length check on the hot paths.
-  pub dax: crate::dax::DaxRegistry,
   /// The Shards route's DAX backings (§4.6; Shards part 3): each file's object for each attachment, which every change
   /// of the file reaches at the write boundary ([`crate::shards_backing`]).
   pub shards_backings: crate::shards_backing::ShardsBackings,
-  /// The shard's §4.6 L1 sandboxes, one per volume whose writable DAX content has been shifted, and the
-  /// generator the shift's placement is drawn from.
-  pub dax_zones: crate::daxzone::DaxZones,
   /// The inode numbers each publication reserves ahead of a volume's counter (A-150): a publication records the counter
   /// plus this ([`Volume::recorded_counter`]), so a reply may hand out any number below the recorded value with no
   /// barrier of its own, and a successor starts past every number its dead predecessor could have handed out. Set by
@@ -239,11 +231,7 @@ impl Store {
         crate::base::digest_capacity(config.max_inodes).get(),
       ),
       release_refusals: 0,
-      // Derived: a mapping pins a chunk, and the shard holds no more chunks than `max_chunks`, so that is the most
-      // mappings it can hold at once — the registry's bound, not a tunable.
-      dax: crate::dax::DaxRegistry::new(config.max_chunks),
       shards_backings: crate::shards_backing::ShardsBackings::new(config.max_chunks),
-      dax_zones: crate::daxzone::DaxZones::new(),
       inode_reserve: 0,
       counters_low: false,
     }
@@ -423,19 +411,6 @@ pub struct Volume {
   /// Whether the volume's content is locked in RAM (§4.2 D-12, a strict `--locked` volume): every block it allocates
   /// is locked, and only its blocks, so a plain volume beside it is never pinned by its neighbour's policy.
   pub(crate) locked: bool,
-  /// Whether this volume has **opted in to writable DAX** (§4.6 multi-tenancy L0). Read-only DAX is the default and
-  /// needs no opt-in; a *writable* mapping lets a guest's stores reach this volume's content blocks directly, so
-  /// [`Volume::dax_map_write`] refuses `NotPermitted` unless the owner has enabled it here. The gate bounds stores, not
-  /// hammering: reading alone hammers (Kim et al., ISCA 2014; A-193), so a read-only window reaches the rows behind it
-  /// as a writable one does. Keeping writable DAX rare keeps the zone and moving-target defences to few blocks, and
-  /// keeps B2's net, which can heal only read-only content, over the rest. Default `false`; a clone does not inherit it
-  /// (the capability is each owner's own deliberate choice).
-  pub(crate) writable_dax: bool,
-  /// Whether this volume's **read-only** DAX mappings are guarded by §4.6's B2 self-healing net: a clean
-  /// BLAKE3 and a pinned clean copy taken at map time, so a periodic scrub can catch a bit flip the daemon
-  /// never saw and restore the block. Off by default, for the same reason L0 is: the guard costs a hash and a
-  /// second copy of every mapped block, which an owner with no co-located untrusted neighbour should not pay.
-  pub(crate) dax_integrity_guard: bool,
   /// The inodes written since an idle sweep, each by the sweep tick it was last written in (A-99): a sweep seals the
   /// open extent of each one not written since the sweep before, so a file smaller than a chunk is not left in
   /// plaintext while idle. Bounded by the volume's inodes; empty for a volume that does not seal.
@@ -445,32 +420,6 @@ pub struct Volume {
   /// Files aged past a sweep tick and not yet sealed, sealed a budget at a time ([`Volume::seal_pending`]); a write
   /// takes a file back out.
   pub(crate) idle_pending: std::collections::BTreeSet<InodeNo>,
-  /// Files with a chunk reopened in place for a DAX map (§4.6 DAX open frontier, the REOPEN arm), re-sealed a budget at
-  /// a time once the mapping is gone ([`Volume::reseal_cold`]); so content is plaintext at rest only while a guest maps
-  /// it. Empty in production while DAX is unadvertised.
-  pub(crate) reseal_pending: std::collections::BTreeSet<InodeNo>,
-  /// How many consecutive idle sweeps a reopened chunk must sit unmapped before the sweep re-seals it (§4.6).
-  /// **Learned, not chosen**: it starts at zero (re-seal as soon as the window is gone) and grows by one each time the
-  /// gate catches a re-seal it should not have made — a chunk re-opened because the guest came back inside the hold,
-  /// which pays an encrypt and a decrypt for nothing. Measured against a real guest kernel, the revoke→remap interval
-  /// moved 8× (67 ms to 537 ms) for one workload merely by changing the guest's DAX cache, so no fixed figure is
-  /// right for every deployment and the volume learns its own. Reset to zero when the volume goes quiescent, so a new
-  /// workload re-learns rather than inheriting.
-  pub(crate) reseal_hold_sweeps: u32,
-  /// The ceiling on [`Volume::reseal_hold_sweeps`], whatever the learner asks for.
-  /// Derived: the idle sweep already leaves a file's written bytes in the clear for one to two ticks before sealing
-  /// them ([`Volume::age_writes`]), so holding DAX-reopened plaintext longer than that would make a mapped read a
-  /// weaker at-rest guarantee than an ordinary write. Two sweeps, the same window, unless policy lowers it.
-  pub(crate) reseal_hold_cap_sweeps: u32,
-  /// Consecutive sweeps each reopened chunk has been seen unmapped, by chunk slab index: the sweep is its own clock,
-  /// so the hold needs no timestamp. Bounded by the chunks a volume has reopened.
-  pub(crate) cold_sweeps: std::collections::BTreeMap<u32, u32>,
-  /// Chunks the sweep re-sealed and the tick it did, so the gate can recognise a re-seal the guest immediately undid.
-  /// Pruned every sweep to the hold's own window, so it holds only what the learner can still act on.
-  pub(crate) resealed_at: std::collections::BTreeMap<u32, u64>,
-  /// Re-seals the gate caught as premature — the non-vacuity counter of the learned hold: a test asserts it moved, so
-  /// a learner that never learns cannot pass for one that does.
-  pub(crate) reseal_regret: u64,
   pub(crate) state: VolumeState,
   pub(crate) destroy_queue: Vec<Dead>,
   /// Open and lookup references per inode number (§4.6 lifetime; the inode-addressed-io design):
@@ -739,17 +688,9 @@ impl Volume {
       change: ChangeWaiters::default(),
       seal_key: None,
       locked: false,
-      writable_dax: false,
-      dax_integrity_guard: false,
       written: BTreeMap::new(),
       sweep_tick: 0,
       idle_pending: std::collections::BTreeSet::new(),
-      reseal_pending: std::collections::BTreeSet::new(),
-      reseal_hold_sweeps: 0,
-      reseal_hold_cap_sweeps: Volume::WRITE_PLAINTEXT_SWEEPS,
-      cold_sweeps: std::collections::BTreeMap::new(),
-      resealed_at: std::collections::BTreeMap::new(),
-      reseal_regret: 0,
       state: VolumeState::Live,
       destroy_queue: Vec::new(),
       references: BTreeMap::new(),
@@ -828,17 +769,9 @@ impl Volume {
       change: ChangeWaiters::default(),
       seal_key: None,
       locked: false,
-      writable_dax: false,
-      dax_integrity_guard: false,
       written: BTreeMap::new(),
       sweep_tick: 0,
       idle_pending: std::collections::BTreeSet::new(),
-      reseal_pending: std::collections::BTreeSet::new(),
-      reseal_hold_sweeps: 0,
-      reseal_hold_cap_sweeps: Volume::WRITE_PLAINTEXT_SWEEPS,
-      cold_sweeps: std::collections::BTreeMap::new(),
-      resealed_at: std::collections::BTreeMap::new(),
-      reseal_regret: 0,
       state: VolumeState::Live,
       destroy_queue: Vec::new(),
       references: BTreeMap::new(),
@@ -936,17 +869,9 @@ impl Volume {
       change: ChangeWaiters::default(),
       seal_key: None,
       locked: false,
-      writable_dax: false,
-      dax_integrity_guard: false,
       written: BTreeMap::new(),
       sweep_tick: 0,
       idle_pending: std::collections::BTreeSet::new(),
-      reseal_pending: std::collections::BTreeSet::new(),
-      reseal_hold_sweeps: 0,
-      reseal_hold_cap_sweeps: Volume::WRITE_PLAINTEXT_SWEEPS,
-      cold_sweeps: std::collections::BTreeMap::new(),
-      resealed_at: std::collections::BTreeMap::new(),
-      reseal_regret: 0,
       state: VolumeState::Live,
       destroy_queue: Vec::new(),
       references: BTreeMap::new(),
@@ -1327,54 +1252,11 @@ impl Volume {
     self.locked
   }
 
-  /// Opts this volume in to **writable DAX** (§4.6 multi-tenancy L0): from here a writable mapping
-  /// ([`Volume::dax_map_write`]) is allowed; before it, every writable map is refused `NotPermitted` and only
-  /// read-only DAX is served. The owner sets it deliberately — writable DAX is the one mode a guest can Rowhammer, so
-  /// it is off until explicitly asked for. Idempotent.
-  pub fn enable_writable_dax(&mut self) {
-    self.writable_dax = true;
-  }
-
-  /// Opts this volume's **read-only** DAX mappings into §4.6's B2 self-healing net: from here each one is
-  /// guarded at map time with a clean checksum and a pinned clean copy, and the shard's periodic scrub catches
-  /// and heals a bit flip in it that no slates write explains (`Store::dax_scrub`).
-  ///
-  /// Off by default and the owner's to turn on, as L0 is, because it is the same kind of decision: the guard
-  /// costs a BLAKE3 of the block and a second copy of it per mapping, which is worth paying where untrusted
-  /// tenants share the host's DRAM and is pure overhead where they do not. slates cannot see the host's other
-  /// tenants, so it cannot make that call. A guard the shard has no room for is counted and the mapping is left
-  /// unguarded — the map itself never fails for want of a net.
-  pub fn enable_dax_integrity_guard(&mut self) {
-    self.dax_integrity_guard = true;
-  }
-
-  /// Whether §4.6's B2 net is opted in on this volume ([`Volume::enable_dax_integrity_guard`]).
-  #[must_use]
-  pub fn dax_integrity_guard_enabled(&self) -> bool {
-    self.dax_integrity_guard
-  }
-
-  /// Whether writable DAX is opted in on this volume ([`Volume::enable_writable_dax`]); read-only DAX needs no opt-in.
-  #[must_use]
-  pub fn writable_dax_enabled(&self) -> bool {
-    self.writable_dax
-  }
-
-  /// The idle sweep (A-99) in one call: [`Volume::age_writes`], then [`Volume::seal_pending`] within `budget_bytes`,
-  /// then [`Volume::reseal_cold`] within the same budget (re-sealing any chunk a DAX map reopened and has since
-  /// released, §4.6 DAX open frontier).
+  /// The idle sweep (A-99) in one call: [`Volume::age_writes`], then [`Volume::seal_pending`] within `budget_bytes`.
   pub fn seal_idle(&mut self, store: &mut Store, budget_bytes: u64) -> IdleSweep {
     self.age_writes();
-    let sweep = self.seal_pending(store, budget_bytes);
-    self.reseal_cold(store, budget_bytes);
-    sweep
+    self.seal_pending(store, budget_bytes)
   }
-
-  /// The sweeps a write's bytes may sit in the clear before the idle sweep seals them: a file is swept once its last
-  /// write is older than the previous tick, so one to two ticks pass between the write and its seal
-  /// ([`Volume::age_writes`]). It is the ceiling on how long a DAX-reopened chunk may be held plaintext, so a mapped
-  /// read never gets a weaker at-rest guarantee than an ordinary write.
-  const WRITE_PLAINTEXT_SWEEPS: u32 = 2;
 
   /// Advances the idle sweep's tick (A-99): every file last written before the previous tick, and not since, is due a
   /// seal. A file whose last write is one to two ticks old is sealed, as ZFS commits dirty data each transaction group
@@ -1405,18 +1287,10 @@ impl Volume {
   /// The changed inodes are marked for the next recovery image.
   pub fn seal_pending(&mut self, store: &mut Store, budget_bytes: u64) -> IdleSweep {
     let mut outcome = IdleSweep::default();
-    let mut deferred: Vec<InodeNo> = Vec::new();
     while outcome.sealed_bytes < budget_bytes {
       let Some(no) = self.idle_pending.pop_first() else {
         break;
       };
-      // Pin-defers-seal (§4.6 "DAX maps the open frontier"): a DAX-mapped (pinned) open block must not be sealed —
-      // sealing encrypts it in place (A-92/A-99) and a live window would then read ciphertext. Defer it and re-queue
-      // so a later sweep seals it once the last mapping of it is revoked and the block unpins.
-      if self.open_block_pinned(store, no) {
-        deferred.push(no);
-        continue;
-      }
       match self.seal_open_body(store, no) {
         Ok(0) => {}
         Ok(bytes) => {
@@ -1426,30 +1300,8 @@ impl Volume {
         Err(_) => outcome.refused = outcome.refused.saturating_add(1),
       }
     }
-    for no in deferred {
-      self.idle_pending.insert(no);
-    }
     outcome.left = u64::try_from(self.idle_pending.len()).unwrap_or(u64::MAX);
     outcome
-  }
-
-  /// Whether inode `no`'s open block is pinned by a live DAX mapping (§4.6 "DAX maps the open frontier"): the idle
-  /// sweep must not seal such a block, since sealing encrypts it in place (A-92/A-99) and a live window would then
-  /// read ciphertext under the guest's MMU. The block unpins when the last mapping of it is revoked, after which a
-  /// later sweep seals it. A no-op in production while DAX is unadvertised (no block is DAX-pinned). The same-kernel
-  /// direct map pins nothing since A-171: it hands a copy of the file, which no seal touches.
-  fn open_block_pinned(&self, store: &Store, no: InodeNo) -> bool {
-    let Some(handle) = trie::get(&store.tries, self.inode_root, no) else {
-      return false;
-    };
-    let block = match store.inodes.get(handle) {
-      Ok(inode) => match &inode.body {
-        Body::Open { open, .. } => open.block,
-        _ => return false,
-      },
-      Err(_) => return false,
-    };
-    store.content.arena().is_pinned(block)
   }
 
   /// Seals inode `no`'s open extent into a chunk, if its body has one: the open bytes sealed, or zero.
@@ -1483,148 +1335,6 @@ impl Volume {
     self.reconcile(before, content_by_epoch(store, handle));
     self.dirty.inode(no.0);
     Ok(bytes)
-  }
-
-  /// Records that the gate reopened the chunk in slab slot `chunk` for a DAX map (§4.6), and **learns** from it: if
-  /// the sweep re-sealed that very chunk within the current hold, the guest came back faster than the hold assumed,
-  /// so that encrypt and this decrypt were both avoidable and the hold grows by one sweep (never past the derived
-  /// cap). A chunk being mapped is no longer cold, so its unmapped-sweep count is dropped.
-  pub(crate) fn note_dax_reopen(&mut self, chunk: u32) {
-    self.cold_sweeps.remove(&chunk);
-    let Some(sealed_at) = self.resealed_at.remove(&chunk) else {
-      return;
-    };
-    let since = self.sweep_tick.saturating_sub(sealed_at);
-    if since <= u64::from(self.reseal_hold_sweeps.saturating_add(1)) {
-      self.reseal_regret = self.reseal_regret.saturating_add(1);
-      self.reseal_hold_sweeps = self
-        .reseal_hold_sweeps
-        .saturating_add(1)
-        .min(self.reseal_hold_cap_sweeps);
-    }
-  }
-
-  /// The learned hold, in sweeps, and the premature re-seals that taught it (§4.6) — what a test asserts moved.
-  pub const fn reseal_hold(&self) -> (u32, u64) {
-    (self.reseal_hold_sweeps, self.reseal_regret)
-  }
-
-  /// Lowers the ceiling on the learned hold (§4.6): how many sweeps a DAX-reopened chunk may stay plaintext after its
-  /// window is gone. Policy, not performance — an operator trading at-rest exposure for the re-seal churn the hold
-  /// avoids. Never raised past the derived default (`Volume::WRITE_PLAINTEXT_SWEEPS`).
-  pub fn set_plaintext_hold_cap(&mut self, sweeps: u32) {
-    self.reseal_hold_cap_sweeps = sweeps.min(Self::WRITE_PLAINTEXT_SWEEPS);
-    self.reseal_hold_sweeps = self.reseal_hold_sweeps.min(self.reseal_hold_cap_sweeps);
-  }
-
-  /// Marks inode `no` for re-seal (§4.6 DAX open frontier, the REOPEN arm): a chunk of it was reopened in place for a
-  /// DAX map and must be re-encrypted once its window is gone. [`Volume::reseal_cold`] does it on the idle sweep.
-  pub(crate) fn mark_reseal(&mut self, no: InodeNo) {
-    self.reseal_pending.insert(no);
-  }
-
-  /// Re-seals the chunks reopened for a DAX map on files whose window is now gone (§4.6 DAX open frontier), until
-  /// `budget_bytes` of reopened bytes are re-sealed (one cooperative slice); the rest wait for the next slice. A
-  /// reopened chunk whose block is still pinned by a live mapping is deferred and re-queued, like the open block in
-  /// [`Volume::seal_pending`]: content is plaintext at rest only while a guest maps it. Returns the bytes re-sealed. A
-  /// no-op without a seal key (the set is cleared — nothing was ever sealed to reopen).
-  pub fn reseal_cold(&mut self, store: &mut Store, budget_bytes: u64) -> u64 {
-    let Some(key) = self.seal_key else {
-      self.reseal_pending.clear();
-      return 0;
-    };
-    let mut resealed_bytes = 0u64;
-    let mut deferred: Vec<InodeNo> = Vec::new();
-    while resealed_bytes < budget_bytes {
-      let Some(no) = self.reseal_pending.pop_first() else {
-        break;
-      };
-      let (bytes, incomplete) = self.reseal_inode(store, no, key);
-      resealed_bytes = resealed_bytes.saturating_add(bytes);
-      if incomplete {
-        deferred.push(no);
-      }
-    }
-    for no in deferred {
-      self.reseal_pending.insert(no);
-    }
-    // Keep only the re-seals the learner can still act on: a regret is a re-open within the hold's own window.
-    let window = u64::from(self.reseal_hold_sweeps.saturating_add(2));
-    let tick = self.sweep_tick;
-    self
-      .resealed_at
-      .retain(|_, at| tick.saturating_sub(*at) <= window);
-    // Quiescent: nothing reopened and nothing waiting, so the next workload learns its own hold rather than
-    // inheriting one measured against a different access pattern.
-    if self.reseal_pending.is_empty() && self.cold_sweeps.is_empty() {
-      self.reseal_hold_sweeps = 0;
-    }
-    resealed_bytes
-  }
-
-  /// Re-seals inode `no`'s reopened (plaintext, seal-cleared) sealed-list chunks under `key` ([`Volume::reseal_cold`]).
-  /// Returns the bytes re-sealed and whether any chunk was left reopened — still pinned by a live window, or a refused
-  /// seal — so the file is re-queued for a later sweep. Re-sealing is charge-neutral (the chunk's stored bytes are
-  /// unchanged), so no reconcile is needed.
-  fn reseal_inode(&mut self, store: &mut Store, no: InodeNo, key: u32) -> (u64, bool) {
-    let Some(handle) = trie::get(&store.tries, self.inode_root, no) else {
-      return (0, false);
-    };
-    let mut targets: Vec<(slates_mem::Handle<crate::content::Chunk>, bool, u64)> = Vec::new();
-    match store.inodes.get(handle) {
-      Ok(inode) => {
-        let sealed = match &inode.body {
-          Body::Open { sealed, .. } => sealed.as_slice(),
-          Body::Sealed(sealed) => sealed.as_slice(),
-          _ => return (0, false),
-        };
-        for extent in sealed {
-          let crate::content::ExtentSrc::Chunk { chunk, .. } = extent.src else {
-            continue;
-          };
-          let Some(c) = store.content.chunk(chunk) else {
-            continue;
-          };
-          if c.seal.is_some() {
-            continue;
-          }
-          let pinned = store.content.arena().is_pinned(c.block);
-          targets.push((chunk, pinned, u64::from(c.len)));
-        }
-      }
-      Err(_) => return (0, false),
-    }
-    let mut resealed = 0u64;
-    let mut incomplete = false;
-    let hold = self.reseal_hold_sweeps;
-    let tick = self.sweep_tick;
-    for (chunk, pinned, len) in targets {
-      let slot = chunk.index();
-      // A mapped chunk is not cold at all: the window still reads it, and sealing under a live window would hand the
-      // guest ciphertext (the pin-defers-seal rule).
-      if pinned {
-        self.cold_sweeps.remove(&slot);
-        incomplete = true;
-        continue;
-      }
-      // The sweep is the hold's clock: a chunk must be seen unmapped for more sweeps than the learned hold before it
-      // is re-encrypted, so a guest that comes back quickly finds its plaintext still there.
-      let seen = self.cold_sweeps.entry(slot).or_insert(0);
-      *seen = seen.saturating_add(1);
-      if *seen <= hold {
-        incomplete = true;
-        continue;
-      }
-      match store.content.reseal(chunk, key) {
-        Ok(()) => {
-          resealed = resealed.saturating_add(len);
-          self.cold_sweeps.remove(&slot);
-          self.resealed_at.insert(slot, tick);
-        }
-        Err(_) => incomplete = true,
-      }
-    }
-    (resealed, incomplete)
   }
 
   /// The key this volume's chunks are sealed under, if any.
@@ -2588,11 +2298,6 @@ impl Volume {
     if bytes.is_empty() {
       return Ok(0);
     }
-    // A VFS write to a DAX-mapped file is a second write boundary onto content a guest holds mapped: revoke its
-    // mappings first so the one boundary stays single (§4.6, AC-4.12). Whether the guest re-maps after its fault is
-    // open (`crate::dax`'s header); a window over a backing never comes here, since the write reaches it below. Empty
-    // on any file no guest maps (the common case), so this is a length check.
-    store.dax_revoke_inode(no);
     let charge = self.write_charge(store, no, off, end)?;
     // The windows this write reopens retain their old chunks (§4.2 retention): secure those bytes
     // from unpromised capacity before anything changes, then admit the quota, then mutate; what the
@@ -2835,9 +2540,6 @@ impl Volume {
     if kind == Kind::Symlink {
       return Err(VfsError::Invalid);
     }
-    // A truncate changes the file's blocks under any DAX guest holding it mapped: revoke its mappings first (§4.6),
-    // the same single-write-boundary rule as a write (whether the guest re-maps after is open, `crate::dax`).
-    store.dax_revoke_inode(no);
     // The windows a truncate cuts away retain their chunks when a snapshot pins them (§4.2
     // retention): secured before anything changes.
     let retention = self.retention_of_truncate(store, no, len)?;
@@ -2987,11 +2689,6 @@ impl Volume {
   /// Takes a snapshot: one record; O(1).
   pub fn snapshot(&mut self, store: &mut Store) -> Result<SnapshotId, VfsError> {
     self.live()?;
-    // A snapshot shares this volume's current blocks with the frozen version (§4.6, AC-4.12): a writable DAX mapping
-    // of one must be torn down before the share, or the guest's later write would reach the frozen version. Read-only
-    // mappings survive — immutable shared content is the gate's allowed DAX case. Empty when no guest maps this volume.
-    let prefix = self.prefix();
-    store.dax_revoke_writable_of_prefix(prefix);
     let record = Snapshot {
       epoch: self.epoch,
       root: self.root,
@@ -3791,10 +3488,6 @@ impl Volume {
       return Err(VfsError::Destroying);
     }
     self.state = VolumeState::Destroying;
-    // The volume is going away: tear down every DAX mapping of it (§4.6, AC-4.12 "eventual reclamation") so its
-    // mapped blocks are not held pinned — their deferred frees would otherwise outlive the volume. Empty when no
-    // guest maps it.
-    store.dax_revoke_volume(self.prefix());
     // The whole volume's retention returns to the shard budgets (§4.2): settled here, at destroy,
     // while `destroy_step` frees the objects in slices afterward; bounded by what this volume
     // charged, so a re-entered destroy credits zero. The bytes secured for open-unlinked orphans

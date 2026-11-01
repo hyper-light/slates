@@ -535,8 +535,8 @@ fn the_capability_report_is_truthful() {
   assert_eq!(report.read_write, ReadWritePolicy::ReadWrite);
   assert!(!report.dax.advertised);
   assert!(
-    report.dax.reason.contains("mapping isolation"),
-    "{}",
+    report.dax.reason.contains("AC-9.7"),
+    "the in-process seam advertises no DAX until a live guest has run over it: {}",
     report.dax.reason
   );
   assert_eq!(report.conformance, Conformance::SimulatedGuestDriver);
@@ -669,41 +669,67 @@ fn the_terminal_step_releases_everything_whatever_the_sweep_did() {
   );
 }
 
-/// §4.6 step 5 through the production serve path (AC-4.12): the daemon→device DAX coherence channel driven by
-/// `AdmittedDevice::service`, the entry point the shard's device loop uses. Do: admit a device offering a DAX cache
-/// window on an anchor-backed volume; drive FUSE_INIT then a writable FUSE_SETUPMAPPING of a file (one live guest
-/// window); then, between service passes, write the file (a client mutation on the shard enqueues a step-5 revoke in
-/// the VFS); then run one more service pass. Expect: the mapping is established; the write revokes it in the VFS; and
-/// the next `service` pass drains the pending revoke and tears the guest's now-stale window down — the non-vacuity
-/// counter `dax_window_revokes` moves from 0 to 1 — so a reused block is never reachable through the guest's stale
-/// TLB. The transient `VolumeBridge` per pass models the shard exactly. No VMM, no KVM.
+/// Shape: the passes the backed-route test drives before it judges the device stuck: far more than its fill takes.
+#[cfg(unix)]
+const DAX_TURNS: usize = 4096;
+
+/// Passes as the shard's device loop does (`serve.rs`, `one_pass`) until the guest's request on the request queue is
+/// answered: the backed DAX's turn, then, unless it was busy, a service pass, a reply held for the owner's barrier
+/// completed as an owner whose barrier captures. The reply's errno.
+#[cfg(unix)]
+fn served_through_the_loop(
+  admitted: &mut AdmittedDevice<SimVmm>,
+  bridge: &mut VolumeBridge<'_>,
+  registry: &Attachments,
+  slice: u64,
+) -> i32 {
+  let rq = usize::from(FIRST_REQUEST_QUEUE);
+  for _ in 0..DAX_TURNS {
+    let turned = admitted.dax_turn(bridge, registry, slice).unwrap();
+    if turned.barrier_owed {
+      admitted.complete_barrier(bridge, registry, true).unwrap();
+    }
+    if !turned.busy {
+      let pass = admitted.service(bridge, registry).unwrap();
+      if pass.barrier_owed {
+        admitted.complete_barrier(bridge, registry, true).unwrap();
+      }
+    }
+    if let Some((id, len)) = admitted.seam_mut().guest_mut().reap(rq) {
+      return reply_error(&admitted.seam_mut().guest_mut().reply_of(rq, id, len));
+    }
+  }
+  panic!("the request was not answered within {DAX_TURNS} passes");
+}
+
+/// §4.6 (A-168, A-195), the backed route through the production entry points, with no VMM: an admitted device whose
+/// VMM shares a DAX window maps the file's backing through `AdmittedDevice::dax_turn` and `service`, as the shard's
+/// device loop drives them. Do: admit a device offering a cache window; serve FUSE_INIT, then a writable SETUPMAPPING of
+/// a page's file over a whole 2 MiB range; write the file through the volume; store through the window and FSYNC; run
+/// the terminal step. Expect: the SETUPMAPPING answered once the device mapped the window, which shows the file; the
+/// write shown in the window at once, with no pass and no window torn; the guest's store in the volume by the FSYNC's
+/// answer; and the terminal step unmapping the window and letting the backing go, so nothing is held or counted after.
 #[cfg(unix)]
 #[test]
-fn a_service_pass_drains_a_pending_dax_revoke_and_tears_the_window_down() {
-  use common::{dax_init_body, dax_setup_body, dax_shared_store};
+fn an_admitted_devices_window_maps_the_files_backing_through_the_loops_entry_points() {
+  use common::{context, dax_init_body, dax_setup_body};
   const ROOT: u64 = 1;
+  let range = slates_mem::DAX_RANGE_BYTES;
   let rq = usize::from(FIRST_REQUEST_QUEUE);
-  // The DAX window maps whole host pages, so sizes here are the real page size (16 KiB on macOS arm64), not the
-  // fixed `PAGE` the non-DAX helpers use.
-  let page_bytes = rustix::param::page_size().max(1);
-  let page = page_bytes as u64;
-
-  let mut store = dax_shared_store("admit-drain");
+  let page = rustix::param::page_size().max(1);
+  let slice = 2 * u64::try_from(page).unwrap();
+  let mut store = store();
+  store.shards_backings.set_budget(4 * range);
   let mut vol = volume(&mut store);
-  vol.enable_writable_dax();
   let root = vol.root_inode(&store).unwrap();
   let no = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
-  vol
-    .write(&mut store, no, 0, &vec![0x5A; page_bytes])
-    .unwrap();
+  vol.write(&mut store, no, 0, &vec![0x5A; page]).unwrap();
   // The setup stands for an SDK verb, whose publication commits before the guest's first request: the file's inode
   // number is reserved (A-150), so the guest's replies need no barrier for it.
   vol.mark_published(&store);
-  let nodeid = no.0;
-
   let mut registry = Attachments::new();
-  let seam = SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 0 }))
-    .with_dax_window("admit-drain", page * 4);
+  let seam =
+    SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 0 })).with_dax_window("admit-backed", range);
   let mut admitted = admit(
     request(GuestTransport::InProcess),
     seam,
@@ -715,191 +741,87 @@ fn a_service_pass_drains_a_pending_dax_revoke_and_tears_the_window_down() {
   .unwrap();
   assert!(
     admitted.device().dax_offered(),
-    "the admitted device offers DAX — the seam's cache window was installed"
+    "the admitted device offers DAX: the seam's cache window was installed"
   );
-
-  // Pass one: FUSE_INIT brings the connection up, then a writable SETUPMAPPING maps the file — one live window.
-  {
-    let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
-    admitted.seam_mut().guest_mut().submit(
-      rq,
-      &message(Opcode::Init.to_wire(), 1, ROOT, &dax_init_body()),
-      4096,
-      1,
-    );
-    admitted.service(&mut bridge, &registry).unwrap();
-    let (id, len) = admitted.seam_mut().guest_mut().reap(rq).unwrap();
-    let reply = admitted.seam_mut().guest_mut().reply_of(rq, id, len);
-    assert_eq!(reply_error(&reply), 0, "INIT served");
-
-    admitted.seam_mut().guest_mut().submit(
-      rq,
-      &message(
-        Opcode::SetupMapping.to_wire(),
-        2,
-        nodeid,
-        &dax_setup_body(0, page, true, 0),
-      ),
-      4096,
-      1,
-    );
-    admitted.service(&mut bridge, &registry).unwrap();
-    let (id, len) = admitted.seam_mut().guest_mut().reap(rq).unwrap();
-    let reply = admitted.seam_mut().guest_mut().reply_of(rq, id, len);
-    assert_eq!(
-      reply_error(&reply),
-      0,
-      "SETUPMAPPING served over the DAX window"
-    );
-  }
-  assert_eq!(
-    admitted.device().dax_window_count(),
-    1,
-    "one live guest window after the map pass"
+  let mut handles = slates_bridge_core::volume_bridge::new_handle_store();
+  let mut bridge = VolumeBridge::attached(vid(), &mut vol, &mut store, &mut handles, None);
+  let guest = |admitted: &mut AdmittedDevice<SimVmm>, request: Vec<u8>| {
+    admitted
+      .seam_mut()
+      .guest_mut()
+      .submit(rq, &request, 4096, 1);
+  };
+  guest(
+    &mut admitted,
+    message(Opcode::Init.to_wire(), 1, ROOT, &dax_init_body()),
   );
   assert_eq!(
-    admitted.counters().dax_window_revokes,
+    served_through_the_loop(&mut admitted, &mut bridge, &registry, slice),
     0,
-    "no daemon revoke drained yet"
+    "INIT served"
   );
-
-  // A client on the shard writes the mapped file between passes: the VFS write boundary enqueues a step-5 revoke.
-  vol
-    .write(&mut store, no, 0, &vec![0xA5; page_bytes])
-    .unwrap();
-
-  // Pass two: the production serve path drains the pending revoke and tears the stale window down.
-  {
-    let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
-    admitted.service(&mut bridge, &registry).unwrap();
-  }
+  guest(
+    &mut admitted,
+    message(
+      Opcode::SetupMapping.to_wire(),
+      2,
+      no.0,
+      &dax_setup_body(0, range, true, 0),
+    ),
+  );
   assert_eq!(
-    admitted.device().dax_window_count(),
+    served_through_the_loop(&mut admitted, &mut bridge, &registry, slice),
     0,
-    "the service pass drained the pending revoke and unmapped the guest window"
+    "SETUPMAPPING answered once the device mapped the window"
   );
   assert_eq!(
-    admitted.counters().dax_window_revokes,
-    1,
-    "the non-vacuity counter moved: the drain tore down exactly one window"
+    admitted.device().dax_window_bytes(0, 4),
+    Some(vec![0x5A; 4]),
+    "the window shows the file"
   );
-}
-
-/// §4.6 — the snapshot writable-only recall, end to end through the production service pass (a sim guest, no VMM;
-/// the live e2e needs a DAX-capable VMM this host lacks). A guest maps one inode both writable and read-only (two
-/// live windows). The daemon runs what `snapshot` runs before it freezes — `dax_revoke_writable_of_prefix`, handing
-/// the volume's WRITABLE windows to the device (enqueued writable_only). The next `service` pass drains it and the
-/// device tears only the writable window; the read-only window — immutable shared content a snapshot keeps —
-/// survives, and `dax_window_revokes` counts the one torn. So a snapshot frees a shared block from a guest's direct
-/// write without disturbing its read-only view, exercised through the same serve path the daemon uses.
-#[cfg(unix)]
-#[test]
-fn a_snapshot_recall_tears_the_writable_window_and_keeps_the_read_only_through_a_service_pass() {
-  use common::{dax_init_body, dax_setup_body, dax_shared_store};
-  const ROOT: u64 = 1;
-  let rq = usize::from(FIRST_REQUEST_QUEUE);
-  let page_bytes = rustix::param::page_size().max(1);
-  let page = page_bytes as u64;
-
-  let mut store = dax_shared_store("admit-snaprecall");
-  let mut vol = volume(&mut store);
-  vol.enable_writable_dax();
-  let prefix = vol.prefix();
-  let root = vol.root_inode(&store).unwrap();
-  let no = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
-  vol
-    .write(&mut store, no, 0, &vec![0x5A; page_bytes])
+  bridge
+    .write(ObjectId::new(no.0, 0), &context(), 0, b"another")
     .unwrap();
-  // The setup stands for an SDK verb, whose publication commits before the guest's first request: the file's inode
-  // number is reserved (A-150), so the guest's replies need no barrier for it.
-  vol.mark_published(&store);
-  let nodeid = no.0;
-
-  let mut registry = Attachments::new();
-  let seam = SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 0 }))
-    .with_dax_window("admit-snaprecall", page * 4);
-  let mut admitted = admit(
-    request(GuestTransport::InProcess),
-    seam,
-    config(),
-    roomy(),
-    rw,
-    &mut registry,
-  )
-  .unwrap();
-
-  // INIT, then a writable window (slot 0) and a read-only window (slot `page`) of the same inode.
-  {
-    let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
-    admitted.seam_mut().guest_mut().submit(
-      rq,
-      &message(Opcode::Init.to_wire(), 1, ROOT, &dax_init_body()),
-      4096,
-      1,
-    );
-    admitted.service(&mut bridge, &registry).unwrap();
-    let (id, len) = admitted.seam_mut().guest_mut().reap(rq).unwrap();
-    let reply = admitted.seam_mut().guest_mut().reply_of(rq, id, len);
-    assert_eq!(reply_error(&reply), 0, "INIT served");
-
-    admitted.seam_mut().guest_mut().submit(
-      rq,
-      &message(
-        Opcode::SetupMapping.to_wire(),
-        2,
-        nodeid,
-        &dax_setup_body(0, page, true, 0),
-      ),
-      4096,
-      1,
-    );
-    admitted.service(&mut bridge, &registry).unwrap();
-    let (id, len) = admitted.seam_mut().guest_mut().reap(rq).unwrap();
-    let reply = admitted.seam_mut().guest_mut().reply_of(rq, id, len);
-    assert_eq!(reply_error(&reply), 0, "writable SETUPMAPPING served");
-
-    admitted.seam_mut().guest_mut().submit(
-      rq,
-      &message(
-        Opcode::SetupMapping.to_wire(),
-        3,
-        nodeid,
-        &dax_setup_body(0, page, false, page),
-      ),
-      4096,
-      1,
-    );
-    admitted.service(&mut bridge, &registry).unwrap();
-    let (id, len) = admitted.seam_mut().guest_mut().reap(rq).unwrap();
-    let reply = admitted.seam_mut().guest_mut().reply_of(rq, id, len);
-    assert_eq!(reply_error(&reply), 0, "read-only SETUPMAPPING served");
-  }
   assert_eq!(
-    admitted.device().dax_window_count(),
-    2,
-    "both the writable and read-only windows are live"
+    (
+      admitted.device().dax_window_bytes(0, 7),
+      admitted.device().dax_window_count()
+    ),
+    (Some(b"another".to_vec()), 1),
+    "another path's write shows in the window at once, and no window is torn"
   );
-
-  // What `snapshot` runs before freezing: recall the volume's writable windows (hand them to the device, two-phase).
-  assert_eq!(
-    store.dax_revoke_writable_of_prefix(prefix),
-    1,
-    "exactly the writable mapping is revoked-pending"
+  assert!(
+    admitted.dax_window_store(16, b"the guest's store"),
+    "the guest stores through its window"
   );
-
-  // The next service pass drains the writable-only revoke; the device tears the writable window, keeps the read-only.
-  {
-    let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
-    admitted.service(&mut bridge, &registry).unwrap();
-  }
-  assert_eq!(
-    admitted.device().dax_window_count(),
-    1,
-    "the writable window is torn; the read-only window survives"
+  let mut fsync = 0u64.to_le_bytes().to_vec();
+  fsync.extend_from_slice(&[0u8; 8]);
+  guest(
+    &mut admitted,
+    message(Opcode::FSync.to_wire(), 3, no.0, &fsync),
   );
   assert_eq!(
-    admitted.counters().dax_window_revokes,
-    1,
-    "exactly one window was torn — the writable one"
+    served_through_the_loop(&mut admitted, &mut bridge, &registry, slice),
+    0,
+    "FSYNC answered"
+  );
+  let mut read = Vec::new();
+  bridge
+    .read(ObjectId::new(no.0, 0), &context(), 16, 17, &mut read)
+    .unwrap();
+  assert_eq!(
+    read,
+    b"the guest's store".to_vec(),
+    "the guest's store is in the volume by the FSYNC's answer"
+  );
+  admitted.reclaim(&mut bridge, &mut registry).unwrap();
+  drop(bridge);
+  assert_eq!(
+    (
+      admitted.device().dax_window_count(),
+      store.shards_backings.vmms_held()
+    ),
+    (0, (0, 0)),
+    "the terminal step unmapped the window and let the backing go"
   );
 }

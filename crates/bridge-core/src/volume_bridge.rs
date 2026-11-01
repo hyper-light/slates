@@ -1349,7 +1349,6 @@ impl Bridge for VolumeBridge<'_> {
     let store = &mut *self.store;
     Some(crate::DaxState {
       backings: &mut store.shards_backings,
-      registry: &store.dax,
       volume,
     })
   }
@@ -1581,118 +1580,5 @@ impl Bridge for VolumeBridge<'_> {
       // case behaviour, not a fixed guess.
       case_sensitive: self.volume.policy().case_sensitive(),
     })
-  }
-
-  fn dax_map(
-    &mut self,
-    object: ObjectId,
-    cx: &OpContext,
-    writable: bool,
-    file_offset: usize,
-  ) -> Result<slates_vfs::dax::Mapping, VfsError> {
-    // A writable mapping copies the block up, which is a write; a read mapping needs only read rights.
-    if writable {
-      self.authorize_write(cx)?;
-    } else {
-      self.authorize_read(cx)?;
-    }
-    // The DAX core gates an attribute inode through `namespace_inode`; the raw number is otherwise this volume's
-    // (the transport routed the request to this bridge by the handle's volume).
-    let no = InodeNo(object.inode);
-    // A directory is mapped as a flat read-only snapshot of its entries (metadata DAX, READDIR) — a guest reads the
-    // directory through its own page table with no READDIR round-trip. A writable directory map is nonsensical
-    // (dirents are not written through DAX) and refused. `file_offset` does not apply to the materialized dir block.
-    if self.volume.kind(self.store, no)? == Kind::Dir {
-      if writable {
-        return Err(VfsError::NotPermitted);
-      }
-      return self.volume.dax_map_dir(self.store, no);
-    }
-    if writable {
-      // Writable DAX is the single-block (offset 0) path today; writable per-chunk is the gated follow-on.
-      self.volume.dax_map_write(self.store, no)
-    } else {
-      // Read maps the OPEN chunk covering the guest's offset (the open tail of a multi-block file), refusing a
-      // sealed chunk so the guest FUSE_READs it — §4.6 "DAX maps the open frontier".
-      self.volume.dax_map_read_at(self.store, no, file_offset)
-    }
-  }
-
-  fn dax_unmap(
-    &mut self,
-    mapping: &slates_vfs::dax::Mapping,
-    cx: &OpContext,
-  ) -> Result<bool, VfsError> {
-    // Giving up a window mapping needs no particular right (it only drops access), but it must name this volume.
-    self.authorize_read(cx)?;
-    // Defence in depth: a mapping of another volume is not this bridge's to revoke. The device's window table is
-    // per-guest, so this is unreachable in practice, but a stray cross-volume mapping is refused, never revoked.
-    if mapping.inode.prefix() != self.volume.prefix() {
-      return Err(VfsError::NotFound);
-    }
-    Ok(self.store.dax_revoke(mapping))
-  }
-
-  #[cfg(unix)]
-  fn dax_backing(
-    &self,
-    mapping: &slates_vfs::dax::Mapping,
-  ) -> Option<(std::os::fd::BorrowedFd<'_>, usize, usize)> {
-    // A mapping of another volume is not this bridge's to back (the per-guest window table makes this unreachable in
-    // practice; a stray cross-volume mapping is refused, never mapped).
-    if mapping.inode.prefix() != self.volume.prefix() {
-      return None;
-    }
-    self.store.dax_backing(mapping)
-  }
-
-  fn dax_revoke_pending(
-    &mut self,
-    mapping: &slates_vfs::dax::Mapping,
-    cx: &OpContext,
-  ) -> Result<bool, VfsError> {
-    // Giving up a window needs no particular right (it only drops access), but it must name this volume.
-    self.authorize_read(cx)?;
-    if mapping.inode.prefix() != self.volume.prefix() {
-      return Err(VfsError::NotFound);
-    }
-    Ok(self.store.dax_revoke_pending(mapping))
-  }
-
-  fn dax_release_after_unmap(
-    &mut self,
-    mapping: &slates_vfs::dax::Mapping,
-    cx: &OpContext,
-  ) -> Result<bool, VfsError> {
-    self.authorize_read(cx)?;
-    if mapping.inode.prefix() != self.volume.prefix() {
-      return Err(VfsError::NotFound);
-    }
-    Ok(self.store.dax_release_after_unmap(mapping))
-  }
-
-  fn take_pending_dax_revokes(&mut self) -> Vec<(u64, bool)> {
-    // Drain the shard DAX registry's step-5 queue as `(raw inode, writable_only)`. The registry is this shard's; an
-    // entry's inode carries its volume prefix, and the device this bridge serves only holds windows for its own
-    // volume, so the device munmaps just the ones it has (all, or writable-only per the flag) and no-ops the rest.
-    self
-      .store
-      .dax
-      .take_pending_revokes()
-      .into_iter()
-      .map(|(no, writable_only)| (no.0, writable_only))
-      .collect()
-  }
-
-  fn dax_window_current(&mut self, mapping: &slates_vfs::dax::Mapping, cx: &OpContext) -> bool {
-    // A window is this reader's to validate only if its context binds this volume and the mapping names it; an
-    // unauthorized or cross-volume window is not current here, so the device tears it (the per-guest window table
-    // makes the cross-volume case unreachable in practice, checked for the same confinement discipline).
-    if self.authorize_read(cx).is_err() || mapping.inode.prefix() != self.volume.prefix() {
-      return false;
-    }
-    // The mapping's block must still be the inode's current content block in this bridge's view; after an advance
-    // the changed inodes' blocks differ and fail this, so the device tears those windows and the guest re-maps.
-    self.volume.dax_still_current(self.store, mapping)
   }
 }

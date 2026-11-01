@@ -172,6 +172,82 @@ fn a_range_asked_past_the_files_end_takes_a_later_write_into_it() {
   );
 }
 
+/// §4.6 (DAX confinement, the "one predicate per method" discipline; AUD-29-76 scoped exports): a guest's ask through
+/// a scoped mount is answered for a file in its subtree and refused for one outside it before any backing is made, so
+/// no window opens onto content the scope does not grant. Do: a volume with `/shared/f` and `/private/secret`; through
+/// a `ScopedBridge` on `/shared`, ask a range of `f`, then of `secret`; then ask `secret` through the unscoped bridge.
+/// Expect `f` answered and filled; `secret` refused as the scope's miss (`NotFound`) with no backing made and nothing
+/// charged; and the unscoped ask answered, so the refusal is the scope's, not the file's.
+#[test]
+fn a_scoped_mounts_ask_is_confined_to_its_subtree() {
+  use slates_bridge_core::dax_backing::Refused;
+  use slates_bridge_core::scoped::ScopedBridge;
+  use slates_vfs::error::VfsError;
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let cx = rw_cx();
+  let ask = |node| Ask {
+    node,
+    writable: false,
+    range: Some((0, DAX_RANGE_BYTES)),
+  };
+  let mut session = DaxBackingSession::new();
+  let mut inner = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let root = inner.root(&cx).unwrap();
+  let shared = inner
+    .mkdir(ObjectId::new(root, 0), &cx, "shared", 0o755)
+    .unwrap();
+  let private = inner
+    .mkdir(ObjectId::new(root, 0), &cx, "private", 0o755)
+    .unwrap();
+  let (f, _) = inner
+    .create(ObjectId::new(shared.ino, 0), &cx, "f", 0o644, 0)
+    .unwrap();
+  inner
+    .write(ObjectId::new(f.ino, 0), &cx, 0, &[0xAB; PAGE])
+    .unwrap();
+  let (secret, _) = inner
+    .create(ObjectId::new(private.ino, 0), &cx, "secret", 0o644, 0)
+    .unwrap();
+  inner
+    .write(ObjectId::new(secret.ino, 0), &cx, 0, &[0xCD; PAGE])
+    .unwrap();
+
+  {
+    let mut scoped = ScopedBridge::new(&mut inner, shared.ino);
+    assert_eq!(
+      session.ask(&mut scoped, &cx, ask(f.ino)),
+      Ok(f.ino),
+      "the scoped mount maps its own file"
+    );
+    let descriptor = filled(&mut session, &mut scoped, &cx);
+    assert!(
+      object_bytes(&descriptor, 0, PAGE) == vec![0xAB; PAGE],
+      "the file's backing holds the file"
+    );
+  }
+  let held = inner.dax_state().unwrap().backings.vmms_held();
+  {
+    let mut scoped = ScopedBridge::new(&mut inner, shared.ino);
+    assert_eq!(
+      session.ask(&mut scoped, &cx, ask(secret.ino)),
+      Err(Refused::Unreachable(VfsError::NotFound)),
+      "the scoped mount cannot map a file outside its subtree"
+    );
+  }
+  assert_eq!(
+    inner.dax_state().unwrap().backings.vmms_held(),
+    held,
+    "the refused ask made no backing and charged nothing"
+  );
+  // Non-vacuity: the private file is mappable, so the scope alone refused it.
+  assert_eq!(
+    session.ask(&mut inner, &cx, ask(secret.ino)),
+    Ok(secret.ino),
+    "the unscoped bridge maps the private file"
+  );
+}
+
 /// The bytes the object `descriptor` names holds in memory: its allocated blocks, as `fstat` counts them in 512-byte
 /// units (`st_blocks`, POSIX).
 fn object_resident(descriptor: &OwnedFd) -> u64 {

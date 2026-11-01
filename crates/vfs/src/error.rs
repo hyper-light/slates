@@ -49,19 +49,9 @@ pub enum VfsError {
   /// The snapshot is pinned by a live clone; destroy the clone (and unpin) first.
   Pinned,
   /// A guest maps the file in a way the change cannot keep its map equal to, so the change is refused until the
-  /// mapping ends (Shards part 3, step 4). A Shards guest's writable map holds stores not yet written back, which a
-  /// `rewitness` would have to discard. An in-process writable map stores into the file's block where no Shards
-  /// backing of it can follow, so the two exclude each other.
+  /// mapping ends (Shards part 3, step 4): a guest's writable map over the file's backing holds stores not yet written
+  /// back, which a `rewitness` would have to discard.
   DaxMapped,
-  /// A snapshot of this volume has recalled its writable DAX windows and is waiting for the device to munmap them
-  /// (§4.6 step 5), so a new writable map is refused until the recall ends. Without this a guest that re-maps
-  /// between the snapshot's retries holds the snapshot off forever.
-  RecallInFlight,
-  /// This host cannot give the volume a physically-contiguous sandbox for its writable DAX rows (§4.6 L1), so a
-  /// shift of them would move no physical rows and the defence it is part of would be theatre. Refused rather
-  /// than performed: the kernel declined a huge page for the span, the host has none to offer (every non-Linux
-  /// host, and a Linux built without transparent huge pages), or the arena has no page to spare for one.
-  NoPhysicalIsolation,
   /// The base beneath an overlay entry cannot be served: the host's errno.
   BaseUnavailable(i32),
   /// A witnessed base entry changed on disk beneath an unpinned range: the read refuses rather
@@ -155,12 +145,7 @@ impl VfsError {
       Self::FileTooLarge => "EFBIG",
       Self::CrossVolumeMove => "EXDEV",
       Self::StaleHandle => "ESTALE",
-      Self::Destroying | Self::Archived | Self::Pinned | Self::RecallInFlight | Self::DaxMapped => {
-        "EBUSY"
-      }
-      // The operation is sound and the caller is permitted; this host simply cannot back it with the
-      // physical isolation it would need to mean anything (§4.6 L1), which is "not supported here".
-      Self::NoPhysicalIsolation => "EOPNOTSUPP",
+      Self::Destroying | Self::Archived | Self::Pinned | Self::DaxMapped => "EBUSY",
       Self::BaseUnavailable(_) | Self::BaseDrift | Self::RecoveryIncomplete | Self::Integrity => {
         "EIO"
       }

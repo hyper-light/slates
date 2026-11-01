@@ -740,9 +740,9 @@ mod platform {
   /// modulo the huge page. `mmap` left to choose returns whatever address suits it, which on Linux is a
   /// 64 KiB boundary: measured 2026-10-20 on 6.12.76 (aarch64), 13 of 16 objects came back incongruent, and a
   /// `MADV_COLLAPSE` over an incongruent span is refused `EINVAL` whether it is the address or the offset that
-  /// is huge-aligned. §4.6's L1 sandbox *is* that collapse, and a daemon serves DAX from this object
-  /// (`server/src/content_pool.rs`), so left to luck the sandbox was available only on the runs where `mmap`
-  /// happened to land right — 8 of 8 volumes got one or none of them did, by address. So the window is placed:
+  /// is huge-aligned. A DAX object's range placement (A-193, `crate::dax_object`) *is* that collapse, and left to
+  /// luck it would hold only on the runs where `mmap` happened to land right, as §4.6's former L1 sandbox did:
+  /// 8 of 8 volumes got one or none of them did, by address. So the window is placed:
   /// a reservation is taken with a huge page of slack, the object is mapped over the congruent address inside
   /// it, and the reservation is given back whole at drop. The slack costs address space and no memory.
   ///
@@ -817,7 +817,7 @@ mod platform {
       code: None,
     })?;
     // Derived: the grain the address and the offset must agree on is this host's huge page, because that is the
-    // mapping the sandbox's collapse forms — but only where this object is long enough to hold one. An object
+    // mapping a DAX object's placement collapses to (A-193) — but only where this object is long enough to hold one. An object
     // shorter than a huge page can never be backed by one, and a host without huge pages has none to be
     // congruent with; either way the grain is the page, which every mapping meets already. That matters because
     // the slack a placement reserves is one grain and a client's ring is its own object (`ipc/src/region.rs`):
@@ -889,18 +889,17 @@ mod platform {
     }
   }
 
-  /// Asks for transparent huge pages behind a shared object's mapping (Linux).
-  ///
-  /// §4.6 L1 needs the content arena to be **physically** contiguous: `Volume::dax_migrate` moves a block to a
-  /// different *virtual* block, and if the backing is 4 KiB pages that moves no physical rows — the design calls
-  /// that security theatre in as many words. A private `Region` has asked for huge pages since it was written;
-  /// a shared object never has, and the DAX arena is a shared object.
+  /// Asks for transparent huge pages behind a shared object's mapping (Linux), as a private `Region` does when its
+  /// caller asks. A DAX object's ranges are placed in huge pages (A-193), and where the host's `shmem_enabled` is
+  /// `advise` the kernel allocates them at the fill's own faults only for a mapping that asked ("advise: only
+  /// allocate huge pages if requested with madvise(MADV_HUGEPAGE)", the kernel's `transhuge.rst`); the placement's
+  /// `MADV_COLLAPSE` forms what the faults did not.
   ///
   /// Unconditional, and harmless where it cannot apply: measured on Linux 7.2, a 64 KiB and a 1 MiB mapping
   /// both take the advice with `OK` and receive **zero** huge pages, while an 8 MiB one comes back fully
   /// backed — the kernel simply ignores what it cannot honour. That is also why the advice is not a *claim*:
-  /// whether a mapping actually got huge pages is `AnonHugePages`/`ShmemPmdMapped` in `/proc/self/smaps`, which
-  /// L1's zones must read and refuse on rather than trusting this call.
+  /// whether a mapping actually got huge pages is `ShmemPmdMapped` in `/proc/self/smaps`, which the placement tests
+  /// read for every page the DAX object reports placed (`DaxObject::page_pmd_bytes`) rather than trusting this call.
   #[cfg(target_os = "linux")]
   fn advise_huge_object(map: &Mapped) {
     // A refusal here costs nothing: the mapping is correct either way, and the only consequence is base pages.

@@ -30,8 +30,7 @@
 //! - `shards.dax_read_only`, `EPERM`;
 //! - `shards.dax_budget`, `ENOMEM`;
 //! - `shards.dax_object`, `EIO`: the OS refused the object, a view or a fill;
-//! - `shards.dax_witness`, the bridge's errno: a writable ask's file could not be copied up;
-//! - `shards.dax_busy`, `EBUSY`: an in-process guest maps the file writable.
+//! - `shards.dax_witness`, the bridge's errno: a writable ask's file could not be copied up.
 //!
 //! **Windows** (plan G-shards-windows step 5). Windows passes no descriptor, so the object (a confined section,
 //! `slates_mem::DaxObject`) is duplicated into the process the ask names, and the answer carries the duplicate's value
@@ -83,8 +82,6 @@ const OBJECT: &str = "shards.dax_object";
 /// Format: the refusal-ledger name of a writable ask whose file the bridge refused to copy up first (the disk's file
 /// unreadable, or no room for the copy).
 const WITNESS: &str = "shards.dax_witness";
-/// Format: the refusal-ledger name of an ask for a file an in-process guest maps writable.
-const BUSY: &str = "shards.dax_busy";
 /// Format: the refusal-ledger name of an ingest the bridge refused (the attachment revoked, its volume gone, no room,
 /// or the file unreadable now): that file's stores are not all written, and the request that asked for them answers
 /// the bridge's errno.
@@ -140,7 +137,6 @@ fn refused_counter(refused: &Refused) -> &'static str {
     Refused::Budget => BUDGET,
     Refused::Object => OBJECT,
     Refused::Witness(_) => WITNESS,
-    Refused::Busy => BUSY,
   }
 }
 
