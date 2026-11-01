@@ -442,6 +442,8 @@ pub(crate) fn collapse_huge(_span: &[u8]) -> Result<(), CollapseDeclined> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CollapseDeclined {
   /// `EAGAIN`: a page was locked, off the LRU or held elsewhere for the moment; asking again may succeed.
+  // Made only where the kernel is asked (Linux) and compared only by the Unix DAX object, so Windows builds neither.
+  #[cfg_attr(not(unix), allow(dead_code))]
   Transient,
   /// Any other answer, likely to hold for a while: no huge page could be had (`ENOMEM`), the memory cgroup refused
   /// its charge (`EBUSY`), the range or the process does not allow one, or the kernel predates 6.1 (`EINVAL`). Off
