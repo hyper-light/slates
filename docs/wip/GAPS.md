@@ -10383,6 +10383,13 @@ and crosvm on adacachy, 5 of 5 in 33.18 s. The first QEMU run hung all five at t
 QEMU sends `SET_MEM_TABLE` after each map and waits for the answer before reading the next piece, and the serve loop
 waited on map acknowledgements alone. It now serves control messages while acknowledgements are owed (A-194).
 
+**Missed, then fixed (2026-11-01).** The server's vhost-form tests (`crates/server/tests/virtiofs.rs`) stand in for the
+front end, and theirs took and acknowledged one SHMEM_MAP a window. The device answers a SETUPMAPPING on the last of
+its two pieces, so CI run 41279217175 failed both Linux lanes at two of those tests ("an interrupt in time", left 0,
+right 1). The suite is Linux-only and was not run before the push. Its front end now takes, places and acknowledges
+every piece of a window, and puts each in the memory table it sends, as QEMU does: 5 of 5 on CI's x86_64 and arm64
+runners, the old front end failing the same two on both (diagnostics run 41281870201).
+
 **Owed:**
 - the Shards route's guard rows: the protocol would have to carry pieces, which is the Shards owner's to agree;
 - `VHOST_USER_PROTOCOL_F_CONFIGURE_MEM_SLOTS` is more pressing now: QEMU makes a memory region of each piece, so a guest
