@@ -3947,15 +3947,23 @@ const SLICE_PAGES: u64 = 2;
 #[cfg(target_os = "linux")]
 const PAST_THE_ARENA_PAGES: usize = 128;
 
-/// A SHMEM_MAP as the stand-in front end received it, with the backing's pages mapped as crosvm maps them into the
-/// guest's window (`MAP_SHARED`), writable when the map asked so. It is placed as a VMM's window over a huge-page
-/// aligned region is: congruent with the object's offsets modulo the huge page, so its map of a range placed in one
-/// huge page can be one PMD entry.
+/// One SHMEM_MAP of a window as the stand-in front end received it: where in the backing's object it maps from, where in
+/// the guest's window it goes, and how long it is.
 #[cfg(target_os = "linux")]
-struct FrontMap {
-  descriptor: std::os::fd::OwnedFd,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FrontPiece {
   fd_offset: u64,
   shm_offset: u64,
+  len: u64,
+}
+
+/// A window as the stand-in front end mapped it: every SHMEM_MAP of it (one under the identity, two under the device's
+/// guarded layout, A-194) placed at its offset in one region, as crosvm maps each into the guest's window
+/// (`MAP_SHARED | MAP_FIXED`), writable when the maps asked so. The guest reads it as one contiguous range.
+#[cfg(target_os = "linux")]
+struct FrontMap {
+  descriptors: Vec<std::os::fd::OwnedFd>,
+  pieces: Vec<FrontPiece>,
   len: usize,
   writable: bool,
   at: *mut std::ffi::c_void,
@@ -3968,17 +3976,30 @@ impl FrontMap {
   fn resident(&self) -> u64 {
     /// Format: the unit of `st_blocks` (POSIX `<sys/stat.h>`).
     const BLOCK_BYTES: u64 = 512;
-    u64::try_from(rustix::fs::fstat(&self.descriptor).unwrap().st_blocks).unwrap() * BLOCK_BYTES
+    u64::try_from(rustix::fs::fstat(&self.descriptors[0]).unwrap().st_blocks).unwrap() * BLOCK_BYTES
   }
 
-  /// The bytes of the map the kernel maps with PMD entries (`/proc/self/smaps`), after one byte of each of its 2 MiB
-  /// ranges is read, since a mapping holds an entry only for what it has touched.
-  fn pmd_bytes(&self) -> Option<u64> {
-    let range = usize::try_from(slates_mem::DAX_RANGE_BYTES).unwrap();
-    for at in (0..self.len).step_by(range) {
-      let _ = self.read(at, 1);
+  /// `len` bytes of the map's object from `offset` (a whole page), read through a mapping of the object the test makes
+  /// for the read: where no piece maps, such as a page's guards.
+  fn object_bytes(&self, offset: u64, len: usize) -> Vec<u8> {
+    // SAFETY: a fresh read-only shared mapping at an address the kernel chooses, of `len` bytes of a descriptor this
+    // value owns, from a page-aligned offset inside the object; copied out and unmapped below before anything else runs.
+    let at = unsafe {
+      rustix::mm::mmap(
+        std::ptr::null_mut(),
+        len,
+        rustix::mm::ProtFlags::READ,
+        rustix::mm::MapFlags::SHARED,
+        &self.descriptors[0],
+        offset,
+      )
     }
-    slates_machine::facts::huge_backed_bytes(self.at as usize)
+    .unwrap();
+    // SAFETY: `at` is the mapping just made, `len` bytes long.
+    let bytes = unsafe { std::slice::from_raw_parts(at.cast::<u8>(), len) }.to_vec();
+    // SAFETY: unmapping exactly the mapping made above.
+    unsafe { rustix::mm::munmap(at, len) }.unwrap();
+    bytes
   }
 
   /// `len` bytes of the window from `at`, as the guest reads them through its map.
@@ -4002,7 +4023,8 @@ impl FrontMap {
 #[cfg(target_os = "linux")]
 impl Drop for FrontMap {
   fn drop(&mut self) {
-    // SAFETY: unmapping exactly the mapping this value made, with its own address and length.
+    // SAFETY: unmapping exactly the region this value reserved and mapped its pieces into, with its own address and
+    // length.
     unsafe { rustix::mm::munmap(self.at, self.len) }.unwrap();
   }
 }
@@ -4047,65 +4069,93 @@ fn front_take(
   Some((code, body, fds.into_iter().next()))
 }
 
-/// Maps a SHMEM_MAP's descriptor as the front end does: `len` bytes from `fd_offset`, shared, writable when its flags
-/// say so.
+/// Maps a window's SHMEM_MAPs as the front end does: each piece's `len` bytes from its `fd_offset`, shared, at its
+/// offset in the window, into one region reserved for the whole window, writable when its flags say so.
 #[cfg(target_os = "linux")]
 fn front_map(
-  body: &[u8; slates_bridge_virtiofs::vhost_user::MMAP_LEN],
-  descriptor: std::os::fd::OwnedFd,
+  received: Vec<(
+    [u8; slates_bridge_virtiofs::vhost_user::MMAP_LEN],
+    std::os::fd::OwnedFd,
+  )>,
 ) -> FrontMap {
   use slates_bridge_virtiofs::vhost_user::MMAP_FLAG_MAP_RW;
-  let field = |at: usize| u64::from_le_bytes(body[at..at + 8].try_into().unwrap());
-  let (fd_offset, shm_offset, len, flags) = (field(8), field(16), field(24), field(32));
-  let writable = flags & MMAP_FLAG_MAP_RW != 0;
-  let len = usize::try_from(len).unwrap();
+  let field = |body: &[u8], at: usize| u64::from_le_bytes(body[at..at + 8].try_into().unwrap());
+  let mut pieces: Vec<(FrontPiece, bool)> = received
+    .iter()
+    .map(|(body, _)| {
+      (
+        FrontPiece {
+          fd_offset: field(body, 8),
+          shm_offset: field(body, 16),
+          len: field(body, 24),
+        },
+        field(body, 32) & MMAP_FLAG_MAP_RW != 0,
+      )
+    })
+    .collect();
+  let writable = pieces[0].1;
+  assert!(
+    pieces
+      .iter()
+      .all(|(_, piece_writable)| *piece_writable == writable),
+    "every piece of a window is mapped alike"
+  );
+  let start = pieces
+    .iter()
+    .map(|(piece, _)| piece.shm_offset)
+    .min()
+    .unwrap();
+  let end = pieces
+    .iter()
+    .map(|(piece, _)| piece.shm_offset + piece.len)
+    .max()
+    .unwrap();
+  assert_eq!(
+    pieces.iter().map(|(piece, _)| piece.len).sum::<u64>(),
+    end - start,
+    "the pieces cover the window once, with no gap"
+  );
+  let len = usize::try_from(end - start).unwrap();
   let prot = if writable {
     rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE
   } else {
     rustix::mm::ProtFlags::READ
   };
-  // A reservation a huge page longer than the map, so a congruent address lies inside it; the map replaces that part,
-  // and the rest is given back.
-  let huge = usize::try_from(slates_mem::DAX_RANGE_BYTES).unwrap();
-  // SAFETY: a fresh private reservation with no access at an address the kernel chooses, which nothing else uses; the
-  // part the map does not replace is unmapped below.
-  let reserved = unsafe {
+  // SAFETY: a fresh private reservation with no access at an address the kernel chooses, which nothing else uses; each
+  // piece replaces its part below, and `FrontMap` unmaps the whole of it.
+  let at = unsafe {
     rustix::mm::mmap_anonymous(
       std::ptr::null_mut(),
-      len + huge,
+      len,
       rustix::mm::ProtFlags::empty(),
       rustix::mm::MapFlags::PRIVATE | rustix::mm::MapFlags::NORESERVE,
     )
   }
   .unwrap();
-  let base = reserved as usize;
-  let congruent = usize::try_from(fd_offset).unwrap() % huge;
-  let start = base + (congruent + huge - base % huge) % huge;
-  // SAFETY: `[start, start + len)` lies inside the reservation just made, which nothing else uses; `MAP_FIXED` replaces
-  // that part of it with `len` bytes of a descriptor this test owns, from a page-aligned offset. `FrontMap` unmaps it
-  // with the same address and length before the descriptor drops.
-  let at = unsafe {
-    rustix::mm::mmap(
-      start as *mut std::ffi::c_void,
-      len,
-      prot,
-      rustix::mm::MapFlags::SHARED | rustix::mm::MapFlags::FIXED,
-      &descriptor,
-      fd_offset,
-    )
-  }
-  .expect("the front end maps what it was sent");
-  assert_eq!(at as usize, start, "the map lies where it was placed");
-  for (from, to) in [(base, start), (start + len, base + len + huge)] {
-    if to > from {
-      // SAFETY: unmapping a part of the reservation above that the map did not replace, which nothing uses.
-      unsafe { rustix::mm::munmap(from as *mut std::ffi::c_void, to - from) }.unwrap();
+  for ((piece, _), (_, descriptor)) in pieces.iter().zip(&received) {
+    let place = at as usize + usize::try_from(piece.shm_offset - start).unwrap();
+    // SAFETY: `[place, place + piece.len)` lies inside the reservation just made; `MAP_FIXED` replaces that part of it
+    // with the piece's bytes of a descriptor this test owns, from a page-aligned offset.
+    let mapped = unsafe {
+      rustix::mm::mmap(
+        place as *mut std::ffi::c_void,
+        usize::try_from(piece.len).unwrap(),
+        prot,
+        rustix::mm::MapFlags::SHARED | rustix::mm::MapFlags::FIXED,
+        descriptor,
+        piece.fd_offset,
+      )
     }
+    .expect("the front end maps what it was sent");
+    assert_eq!(mapped as usize, place, "the piece lies where it was placed");
   }
+  pieces.sort_by_key(|(piece, _)| piece.shm_offset);
   FrontMap {
-    descriptor,
-    fd_offset,
-    shm_offset,
+    descriptors: received
+      .into_iter()
+      .map(|(_, descriptor)| descriptor)
+      .collect(),
+    pieces: pieces.into_iter().map(|(piece, _)| piece).collect(),
     len,
     writable,
     at,
@@ -4157,6 +4207,8 @@ fn backed_bridge<'v>(
 /// volume, store (with a fill budget) and guest driver; INIT served. The passes run as the serve loop runs them.
 #[cfg(target_os = "linux")]
 struct BackedFixture {
+  /// How the device lays its backings out, so the stand-in front end knows how many pieces each window is.
+  layout: slates_mem::DaxLayout,
   store: slates_vfs::volume::Store,
   vol: slates_vfs::volume::Volume,
   host: Option<slates_vfs::host::sim::SimHost>,
@@ -4231,6 +4283,7 @@ impl BackedFixture {
       WINDOW_RANGES * slates_mem::DAX_RANGE_BYTES,
     ));
     let mut fixture = BackedFixture {
+      layout: slates_bridge_core::dax_backing::guarded_layout(),
       store,
       vol,
       host,
@@ -4362,22 +4415,27 @@ impl BackedFixture {
     panic!("the request was not answered within {TURNS} passes");
   }
 
-  /// Passes until the held SETUPMAPPING `head` sends its map, with no reply published before: the map, mapped as the
-  /// front end maps it.
-  fn until_mapped(&mut self, head: u16) -> FrontMap {
+  /// Passes until the held SETUPMAPPING `head` sends its `pieces` maps, with no reply published before: the window, its
+  /// pieces mapped as the front end maps them.
+  fn until_mapped(&mut self, head: u16, pieces: usize) -> FrontMap {
     use slates_bridge_virtiofs::vhost_user::backend_request;
+    let mut received = Vec::new();
     for _ in 0..TURNS {
       self.pass();
-      if let Some((code, body, descriptor)) = front_take(&self.front) {
+      while let Some((code, body, descriptor)) = front_take(&self.front) {
         assert_eq!(
           code,
           backend_request::SHMEM_MAP,
           "the back-end request is SHMEM_MAP"
         );
-        return front_map(
-          &body,
+        received.push((
+          body,
           descriptor.expect("SHMEM_MAP carries the backing's descriptor"),
-        );
+        ));
+      }
+      if !received.is_empty() {
+        assert_eq!(received.len(), pieces, "the window's pieces, sent together");
+        return front_map(received);
       }
       assert!(
         self.reply_now(FIRST_REQUEST_QUEUE, head).is_none(),
@@ -4387,20 +4445,23 @@ impl BackedFixture {
     panic!("the map was not sent within {TURNS} passes");
   }
 
-  /// The front end acknowledges the map with `status`, and the device drains the ack: the SETUPMAPPING's errno.
-  fn ack(&mut self, head: u16, status: u64) -> i32 {
+  /// The front end acknowledges each of the window's `pieces` maps with `status`, and the device drains the acks: the
+  /// SETUPMAPPING's errno, answered on the last.
+  fn ack(&mut self, head: u16, status: u64, pieces: usize) -> i32 {
     use slates_bridge_virtiofs::vhost_user::backend_request;
-    front_send_ack(&self.front, backend_request::SHMEM_MAP, status);
+    for _ in 0..pieces {
+      front_send_ack(&self.front, backend_request::SHMEM_MAP, status);
+    }
     self
       .device
       .complete_dax_awaiting(&mut self.driver.memory, &mut Unlimited)
       .unwrap();
     self
       .reply_now(FIRST_REQUEST_QUEUE, head)
-      .expect("the SETUPMAPPING is answered on the ack")
+      .expect("the SETUPMAPPING is answered on the last ack")
   }
 
-  /// Maps `node`'s range `[foffset, foffset + len)` at window offset `moffset`, through the whole exchange: the map.
+  /// Maps `node`'s range `[foffset, foffset + len)` at window offset `moffset`, through the whole exchange: the window.
   fn mapped(
     &mut self,
     node: u64,
@@ -4408,25 +4469,26 @@ impl BackedFixture {
     writable: bool,
     moffset: u64,
   ) -> FrontMap {
+    let pieces = self.layout.pieces(foffset, len).count();
     let head = self.submit(
       FIRST_REQUEST_QUEUE,
       Opcode::SetupMapping,
       node,
       &dax_setup_body(foffset, len, writable, moffset),
     );
-    let map = self.until_mapped(head);
+    let map = self.until_mapped(head, pieces);
     assert_eq!(
-      self.ack(head, 0),
+      self.ack(head, 0, pieces),
       0,
       "SETUPMAPPING answered once the front end mapped it"
     );
     map
   }
 
-  /// Removes the window range `[moffset, moffset + len)` as a guest does, through the whole exchange: the device
-  /// answers the REMOVEMAPPING and sends the front end one unmap, carrying no descriptor, which the front end
-  /// acknowledges and the device drains, since the channel answers its requests in order.
-  fn unmapped(&mut self, node: u64, moffset: u64, len: u64) {
+  /// Removes the window at `moffset` over the file's `[foffset, foffset + len)` as a guest does, through the whole
+  /// exchange: the device answers the REMOVEMAPPING and sends the front end one unmap a piece, carrying no descriptor,
+  /// which the front end acknowledges and the device drains, since the channel answers its requests in order.
+  fn unmapped(&mut self, node: u64, moffset: u64, (foffset, len): (u64, u64)) {
     use slates_bridge_virtiofs::vhost_user::backend_request;
     // `fuse_removemapping_in` (the count) then one `fuse_removemapping_one` (`include/uapi/linux/fuse.h`), unpadded.
     let mut remove = Vec::new();
@@ -4443,10 +4505,16 @@ impl BackedFixture {
       }
     }
     assert_eq!(answered, Some(0), "REMOVEMAPPING answered");
-    let (code, _, descriptor) = front_take(&self.front).expect("an unmap sent");
-    assert_eq!(code, backend_request::SHMEM_UNMAP);
-    assert!(descriptor.is_none(), "an unmap carries no descriptor");
-    front_send_ack(&self.front, backend_request::SHMEM_UNMAP, 0);
+    for _ in self.layout.pieces(foffset, len) {
+      let (code, _, descriptor) = front_take(&self.front).expect("an unmap sent for each piece");
+      assert_eq!(code, backend_request::SHMEM_UNMAP);
+      assert!(descriptor.is_none(), "an unmap carries no descriptor");
+      front_send_ack(&self.front, backend_request::SHMEM_UNMAP, 0);
+    }
+    assert!(
+      front_take(&self.front).is_none(),
+      "one unmap a piece, no more"
+    );
     self
       .device
       .complete_dax_awaiting(&mut self.driver.memory, &mut Unlimited)
@@ -4510,10 +4578,19 @@ fn a_window_over_a_backing_shows_every_other_paths_change_with_no_message() {
   let range = slates_mem::DAX_RANGE_BYTES;
   let node = f.file("f", &vec![0x41; page]);
   let map = f.mapped(node, (0, range), false, 0);
+  let expected: Vec<FrontPiece> = f
+    .layout
+    .pieces(0, range)
+    .map(|piece| FrontPiece {
+      fd_offset: piece.object_offset,
+      shm_offset: piece.file_offset,
+      len: piece.len,
+    })
+    .collect();
   assert_eq!(
-    (map.fd_offset, map.shm_offset, map.len as u64, map.writable),
-    (0, 0, range, true),
-    "the whole asked range of the file's backing, writable at the front end"
+    (map.pieces.clone(), map.len as u64, map.writable),
+    (expected, range, true),
+    "the whole asked range of the file's backing, piece by piece as the layout holds it, writable at the front end"
   );
   assert_eq!(
     map.read(0, page),
@@ -4818,8 +4895,9 @@ fn hostile_setupmappings_are_refused_with_no_window_and_no_message() {
 }
 
 /// §4.6 (G-vhost), a forgotten node's backing is let go. Do: map a file, remove the mapping as a guest does before it
-/// forgets the inode, then FORGET it. Expect: the REMOVEMAPPING sends one unmap and leaves no window; once the FORGET is
-/// served the backing is gone from the store and counted released.
+/// forgets the inode, then FORGET it. Expect: the REMOVEMAPPING sends one unmap for each piece of the window (two under
+/// the device's guarded layout, A-194) and leaves no window; once the FORGET is served the backing is gone from the
+/// store and counted released.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_forget_lets_the_nodes_backing_go_after_its_mapping_is_removed() {
@@ -4840,9 +4918,11 @@ fn a_forget_lets_the_nodes_backing_go_after_its_mapping_is_removed() {
     Some(0),
     "REMOVEMAPPING answered"
   );
-  let (code, _, descriptor) = front_take(&f.front).expect("an unmap sent");
-  assert_eq!(code, backend_request::SHMEM_UNMAP);
-  assert!(descriptor.is_none(), "an unmap carries no descriptor");
+  for _ in f.layout.pieces(0, range) {
+    let (code, _, descriptor) = front_take(&f.front).expect("an unmap sent for each piece");
+    assert_eq!(code, backend_request::SHMEM_UNMAP);
+    assert!(descriptor.is_none(), "an unmap carries no descriptor");
+  }
   assert_eq!(f.device.dax_window_count(), 0);
   drop(map);
   let backed = |f: &BackedFixture| {
@@ -4875,29 +4955,23 @@ fn ranges_can_be_huge(test: &str) -> bool {
   can
 }
 
-/// Whether range `index` of file `node` is among `placements`.
+/// Whether a page of file `node` is among `placements`.
 #[cfg(target_os = "linux")]
-fn is_placed(
-  placements: &[slates_vfs::shards_backing::RangePlacement],
-  node: u64,
-  index: u64,
-) -> bool {
-  placements
-    .iter()
-    .any(|placement| placement.inode.0 == node && placement.range == index)
+fn node_has_placed(placements: &[slates_vfs::shards_backing::PagePlacement], node: u64) -> bool {
+  placements.iter().any(|placement| placement.inode.0 == node)
 }
 
-/// Holds the placements a fixture's device made to §4.6's backed L1 (A-193): every range `maps` maps placed or counted
-/// refused, at least one placed, the store holding every placement counted, and each placed range one PMD page in
-/// slates' view and in the front end's map of it. The placements it read; `None`, said loudly as a skip of `test`,
-/// where the host declined every placement, which proves nothing either way. One that placed none and refused none
-/// never asked, and fails.
+/// Holds the placements a fixture's device made to §4.6's backed L1 (A-193, A-194): every range `maps` maps placed or
+/// counted refused, at least one placed; the device's backings laid out guarded; each placed page one PMD page in
+/// slates' view; and every piece the front end was sent inside one page's interior, none reaching a guard. The
+/// placements it read; `None`, said loudly as a skip of `test`, where the host declined every placement, which proves
+/// nothing either way. One that placed none and refused none never asked, and fails.
 #[cfg(target_os = "linux")]
 fn assert_maps_placed(
   f: &mut BackedFixture,
   maps: &[(u64, u64, FrontMap)],
   test: &str,
-) -> Option<Vec<slates_vfs::shards_backing::RangePlacement>> {
+) -> Option<Vec<slates_vfs::shards_backing::PagePlacement>> {
   let range = slates_mem::DAX_RANGE_BYTES;
   let counts = f.device.dax_backed_counts().session;
   let placements = f.store.shards_backings.placements();
@@ -4917,40 +4991,66 @@ fn assert_maps_placed(
     counts.placed > 0,
     "no range was placed or refused: placement never ran"
   );
-  assert_eq!(
-    placements.len() as u64,
-    counts.placed,
-    "the store holds every placement counted"
-  );
+  let slates_mem::DaxLayout::Guarded { guard } = f.layout else {
+    panic!("a host that places ranges lays the device's backings out guarded");
+  };
   for placement in &placements {
     assert_eq!(
       placement.pmd_bytes,
       Some(range),
-      "slates' view of range {} of inode {} is one PMD page",
-      placement.range,
+      "slates' view of page {} of inode {} is one PMD page",
+      placement.page,
       placement.inode.0
     );
   }
   for (node, index, map) in maps {
-    if is_placed(&placements, *node, *index) {
-      assert_eq!(
-        map.pmd_bytes(),
-        Some(range),
-        "the front end's map of range {index} of node {node} is one PMD page"
+    for piece in &map.pieces {
+      let within = piece.fd_offset % range;
+      assert!(
+        within >= guard && within + piece.len <= range - guard,
+        "range {index} of node {node}: {piece:?} reaches a guard"
       );
     }
   }
   Some(placements)
 }
 
-/// Holds what the placements cost against the fill budget (§4.6, the backed route's L1; A-193): each file's object,
-/// read through its first map in `maps`, holding no more than the backings count, and exactly its placed ranges' bytes
+/// Holds that the guard slots of every placed page of file `node`, read through `map`'s object, hold nothing: no byte
+/// of the file and no store of the guest's reaches them (§4.6, the backed route's L1; A-194).
+#[cfg(target_os = "linux")]
+fn assert_guards_hold_nothing(
+  map: &FrontMap,
+  placements: &[slates_vfs::shards_backing::PagePlacement],
+  node: u64,
+) {
+  let range = slates_mem::DAX_RANGE_BYTES;
+  for placement in placements
+    .iter()
+    .filter(|placement| placement.inode.0 == node)
+  {
+    let guard = placement.layout.guard();
+    let page_start = placement.page * range;
+    for start in [page_start, page_start + range - guard] {
+      assert!(
+        map
+          .object_bytes(start, usize::try_from(guard).unwrap())
+          .iter()
+          .all(|byte| *byte == 0),
+        "a guard of page {} of node {node} holds a byte",
+        placement.page
+      );
+    }
+  }
+}
+
+/// Holds what the placements cost against the fill budget (§4.6, the backed route's L1; A-193, A-194): each file's
+/// object, read through its first map in `maps`, holding no more than the backings count, and exactly its placed pages
 /// where no placement was refused; the backings counting within the budget. Prints each measurement.
 #[cfg(target_os = "linux")]
 fn assert_placement_cost(
   f: &BackedFixture,
   maps: &[(u64, u64, FrontMap)],
-  placements: &[slates_vfs::shards_backing::RangePlacement],
+  placements: &[slates_vfs::shards_backing::PagePlacement],
 ) {
   let range = slates_mem::DAX_RANGE_BYTES;
   let refused = f.device.dax_backed_counts().session.placement_refused;
@@ -4968,14 +5068,14 @@ fn assert_placement_cost(
       .filter(|placement| placement.inode.0 == *node)
       .count() as u64;
     println!(
-      "node {node}: {placed_here} ranges placed, its object holds {resident} bytes; \
+      "node {node}: {placed_here} pages placed, its object holds {resident} bytes; \
        the backings count {charged} of {budget}"
     );
     if refused == 0 {
       assert_eq!(
         resident,
         placed_here * range,
-        "node {node}'s object holds its placed ranges and nothing more"
+        "node {node}'s object holds its placed pages and nothing more"
       );
     }
     assert!(
@@ -4986,17 +5086,47 @@ fn assert_placement_cost(
   assert!(charged <= budget, "the backings count within the budget");
 }
 
-/// §4.6, the backed route's L1 (A-193), read-only and writable alike: reading alone hammers (Kim et al., ISCA 2014), so
-/// every window a guest maps is an aggressor's reach. Do: map a read-only window over a four-page file's first range,
-/// and writable windows over another file's first range and over a range wholly past its end; read where each range
-/// lies, in slates' view and in the front end's map, how many bytes each backing's object holds, and the counts the
-/// device reports; then store through a writable window and FSYNC, and cut the read-only file to one page through the
-/// volume. Expect, where the host's PMD page is a range: every range mapped placed or counted refused, at least one
-/// placed; each placed range one PMD page in slates' view and in the front end's map; each object holding no more than
-/// the backings count, exactly its placed ranges' bytes where none was refused, within the budget; the counts under
-/// their status names; and the windows served as before (the whole read-only range the file's bytes and zeros, nothing
-/// of anyone else's; the store in the volume; the cut reading zero), the cut keeping its range one PMD page, since a
-/// placed range is zeroed by stores, never a hole punch. Where the host declines every placement, it skips loudly.
+/// The guest stores across the whole of `maps`' last window, past its file's end and into a page it shares with the
+/// window before it (`maps[1]`, the file's first page `page` bytes of `0x42`): no guard of any placed page takes a byte
+/// of it, and the window before keeps its own bytes.
+#[cfg(target_os = "linux")]
+fn guest_stores_reach_no_guard(
+  maps: &mut [(u64, u64, FrontMap)],
+  placements: &[slates_vfs::shards_backing::PagePlacement],
+  page: usize,
+) {
+  let whole = maps[2].2.len;
+  maps[2].2.store(0, &vec![0xEE; whole]);
+  for (node, _, map) in maps.iter() {
+    assert_guards_hold_nothing(map, placements, *node);
+  }
+  assert_eq!(
+    maps[1].2.read(0, page),
+    vec![0x42; page],
+    "the window before keeps the file's bytes"
+  );
+  assert!(
+    maps[1]
+      .2
+      .read(page, maps[1].2.len - page)
+      .iter()
+      .all(|byte| *byte == 0),
+    "the window before keeps its zeros past the file's end"
+  );
+}
+
+/// §4.6, the backed route's L1 (A-193, A-194), read-only and writable alike: reading alone hammers (Kim et al., ISCA
+/// 2014), so every window a guest maps is an aggressor's reach. Do: map a read-only window over a four-page file's first
+/// range, and writable windows over another file's first range and over its second, wholly past its end; read where each
+/// page lies, the pieces the front end was sent, how many bytes each backing's object holds, and the counts the device
+/// reports; store across the whole of the last window; then store through the first writable window and FSYNC, and cut
+/// the read-only file to one page through the volume. Expect, where the host's PMD page is a range: every range mapped
+/// placed or counted refused, at least one placed; the backings guarded; each placed page one PMD page in slates' view;
+/// every piece inside a page's interior; every guard slot holding nothing, even after the guest's stores across a whole
+/// window, and the window sharing that page keeping its bytes; each object holding exactly its placed pages where none
+/// was refused, within the budget; the counts under their status names; and the windows served as before (the file's
+/// bytes and zeros; the store in the volume; the cut reading zero), the cut keeping its pages one PMD page each, since a
+/// placed page is zeroed by stores, never a hole punch. Where the host declines every placement, it skips loudly.
 #[cfg(target_os = "linux")]
 #[test]
 fn every_window_over_a_backing_is_one_huge_page_read_only_or_writable() {
@@ -5038,25 +5168,26 @@ fn every_window_over_a_backing_is_one_huge_page_read_only_or_writable() {
     )),
     "the refusals stand under their status name"
   );
+  guest_stores_reach_no_guard(&mut maps, &placements, page);
 
   let whole = maps[0].2.read(0, maps[0].2.len);
   assert!(
     whole[..4 * page].iter().all(|byte| *byte == 0x41)
       && whole[4 * page..].iter().all(|byte| *byte == 0),
-    "the placed page holds the file's bytes and zeros, nothing of anyone else's"
+    "the read-only window holds the file's bytes and zeros, nothing of anyone else's"
   );
   maps[1].2.store(0, b"placed");
   let fsync = f.submit(FIRST_REQUEST_QUEUE, Opcode::FSync, writable, &[0u8; 16]);
   assert_eq!(f.answer(FIRST_REQUEST_QUEUE, fsync), 0);
   assert_eq!(f.volume_bytes(writable, 0, 6), b"placed".to_vec());
-  let placed = is_placed(&placements, read_only, 0);
+  let placed = node_has_placed(&placements, read_only);
   cut_keeps_the_placement(&mut f, read_only, &maps[0].2, placed);
   drop(maps);
 }
 
 /// Cuts four-page file `node`, which `map` maps from its start, to one page through the volume: the map reads the page
-/// and zeros after it, and where its range was `placed`, the range is still one PMD page in the front end's map and in
-/// slates' view, since a placed range is zeroed by stores, never a hole punch, which would split its page.
+/// and zeros after it, and where its pages were `placed`, they are still placed and still one PMD page each in slates'
+/// view, since a placed page is zeroed by stores, never a hole punch, which would split it.
 #[cfg(target_os = "linux")]
 fn cut_keeps_the_placement(f: &mut BackedFixture, node: u64, map: &FrontMap, placed: bool) {
   let range = slates_mem::DAX_RANGE_BYTES;
@@ -5076,18 +5207,16 @@ fn cut_keeps_the_placement(f: &mut BackedFixture, node: u64, map: &FrontMap, pla
   if !placed {
     return;
   }
-  assert_eq!(
-    map.pmd_bytes(),
-    Some(range),
-    "the cut kept the front end's map of its range one PMD page"
-  );
   let after = f.store.shards_backings.placements();
-  assert!(is_placed(&after, node, 0), "the cut kept its range placed");
+  assert!(
+    node_has_placed(&after, node),
+    "the cut kept its pages placed"
+  );
   assert!(
     after
       .iter()
       .all(|placement| placement.pmd_bytes == Some(range)),
-    "the cut kept slates' view of its range one PMD page: {after:?}"
+    "the cut kept slates' view of its pages one PMD page each: {after:?}"
   );
 }
 
@@ -5114,7 +5243,7 @@ fn churn_once(f: &mut BackedFixture, node: u64, page: usize) {
     0,
     "a writable ask over the live window is answered"
   );
-  f.unmapped(node, 0, range);
+  f.unmapped(node, 0, (0, range));
   drop(map);
 }
 
@@ -5163,19 +5292,25 @@ fn a_hostile_guests_churn_over_placed_backings_is_served_as_before_and_leaks_not
     "each range placed once however often it is mapped"
   );
   let placements = f.store.shards_backings.placements();
-  assert_eq!(placements.len() as u64, counts.session.placed);
+  if counts.session.placement_refused == 0 {
+    assert_eq!(
+      placements.len() as u64,
+      f.layout.pages_holding([0, 3]),
+      "the pages the two ranges lie in, each placed once"
+    );
+  }
   assert!(
     placements
       .iter()
       .all(|placement| placement.pmd_bytes == Some(range)),
-    "every placed range is one PMD page while its backing lives: {placements:?}"
+    "every placed page is one PMD page while its backing lives: {placements:?}"
   );
-  f.unmapped(node, range, range);
+  f.unmapped(node, range, (3 * range, range));
   drop(past);
   f.forgotten(node);
   assert_eq!(
     (
-      f.store.shards_backings.placed_ranges(),
+      f.store.shards_backings.placed_pages(),
       f.store.shards_backings.vmms_held()
     ),
     (0, (0, 0)),
@@ -5232,7 +5367,7 @@ fn a_read_only_attachments_window_is_placed_and_its_writable_ask_refused() {
   );
   assert_eq!(
     (
-      f.store.shards_backings.placed_ranges(),
+      f.store.shards_backings.placed_pages(),
       f.store.shards_backings.vmms_held()
     ),
     (0, (0, 0)),
@@ -5255,13 +5390,14 @@ fn a_read_only_attachments_window_is_placed_and_its_writable_ask_refused() {
     "a_read_only_attachments_window_is_placed_and_its_writable_ask_refused",
   ) {
     assert_placement_cost(&f, &maps, &placements);
+    assert_guards_hold_nothing(&maps[0].2, &placements, node);
   }
-  f.unmapped(node, 0, range);
+  f.unmapped(node, 0, (0, range));
   drop(maps);
   f.forgotten(node);
   assert_eq!(
     (
-      f.store.shards_backings.placed_ranges(),
+      f.store.shards_backings.placed_pages(),
       f.store.shards_backings.vmms_held()
     ),
     (0, (0, 0)),

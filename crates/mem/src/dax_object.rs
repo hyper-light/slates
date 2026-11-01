@@ -171,10 +171,179 @@ pub enum Placement {
   Unavailable,
 }
 
-/// Whether this host can back a DAX object's range with one huge page: Linux, with a PMD page of exactly a range.
-#[cfg(unix)]
+/// Whether this host can back a DAX object's range with one huge page: Linux, with a PMD page of exactly a range. A
+/// host fact read from sysfs, so it is asked once a process rather than once a range filled.
 fn ranges_can_be_huge() -> bool {
-  cfg!(target_os = "linux") && slates_machine::facts::huge_page_bytes() == Some(DAX_RANGE_BYTES)
+  static CAN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+  *CAN.get_or_init(|| {
+    cfg!(target_os = "linux") && slates_machine::facts::huge_page_bytes() == Some(DAX_RANGE_BYTES)
+  })
+}
+
+/// How a DAX object lays out the bytes of the file it holds (§4.6, the backed route's L1; A-193, A-194). The object is
+/// cut into pages of [`DAX_RANGE_BYTES`], each placed in one huge page where the host can ([`Placement`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DaxLayout {
+  /// The file's byte `x` at the object's byte `x`. A VMM that maps the object by the file's own offsets needs it (the
+  /// Shards protocol, A-163), and a host that cannot place a range in one huge page keeps it, since a guard isolates
+  /// nothing without one.
+  #[default]
+  Identity,
+  /// The file's bytes in the interiors of the object's consecutive pages, `guard` bytes held empty at both ends of every
+  /// page. A VMM told where each piece lies maps a guest's window from interiors alone (slates' own device, A-168), so no
+  /// window reaches a page's edge rows and each placed page is one huge page with its guard rows: CATT's shape (Brasser
+  /// et al., USENIX Security 2017), as the arena's zones hold it (§4.6 L1).
+  Guarded {
+    /// The bytes held empty at each end of every page.
+    guard: u64,
+  },
+}
+
+/// One piece of a file span as a DAX object holds it: contiguous in the file and in the object, inside one page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DaxPiece {
+  /// Where the piece starts in the file.
+  pub file_offset: u64,
+  /// Where it starts in the object: the offset a VMM maps it from.
+  pub object_offset: u64,
+  /// Its length in bytes.
+  pub len: u64,
+}
+
+impl DaxLayout {
+  /// The layout for the backings of a VMM that is told where each piece lies (§4.6, the backed route's L1; A-194), with
+  /// `guard` bytes held empty at each end of every page: guarded where this host can place a range in one huge page and
+  /// a page keeps an interior past its two guards, both in whole pages; the identity elsewhere, where a guard would
+  /// isolate nothing ([`Placement::Unavailable`]).
+  #[must_use]
+  pub fn for_backings(guard: u64) -> DaxLayout {
+    let page = slates_machine::facts::Facts::page_bytes();
+    let guarded = DaxLayout::Guarded { guard };
+    if ranges_can_be_huge() && guard > 0 && guard.is_multiple_of(page) && guarded.interior() > 0 {
+      guarded
+    } else {
+      DaxLayout::Identity
+    }
+  }
+
+  /// The bytes held empty at each end of every page: none for the identity.
+  #[must_use]
+  pub fn guard(&self) -> u64 {
+    match self {
+      DaxLayout::Identity => 0,
+      DaxLayout::Guarded { guard } => *guard,
+    }
+  }
+
+  /// The bytes of the file each page holds: the whole page for the identity, the page less its two guards otherwise.
+  #[must_use]
+  pub fn interior(&self) -> u64 {
+    DAX_RANGE_BYTES.saturating_sub(self.guard().saturating_mul(2))
+  }
+
+  /// The bytes of the file an object of `object_bytes` holds: its whole pages' interiors.
+  #[must_use]
+  pub fn file_bytes(&self, object_bytes: u64) -> u64 {
+    object_bytes
+      .checked_div(DAX_RANGE_BYTES)
+      .unwrap_or(0)
+      .saturating_mul(self.interior())
+  }
+
+  /// The page holding the file's byte `file_offset`, and where in the page; `None` where it overflows or no interior is
+  /// left.
+  fn locate(&self, file_offset: u64) -> Option<(u64, u64)> {
+    let interior = self.interior();
+    Some((
+      file_offset.checked_div(interior)?,
+      self
+        .guard()
+        .checked_add(file_offset.checked_rem(interior)?)?,
+    ))
+  }
+
+  /// The pieces the file's bytes `file_offset .. file_offset + len` lie in, in file order, each inside one page's
+  /// interior: what a VMM maps one by one to show the span contiguous, none of it reaching a guard. A guest's 2 MiB range
+  /// takes two under a guard whose double divides a range (one chunk window does), one under the identity.
+  #[must_use]
+  pub fn pieces(&self, file_offset: u64, len: u64) -> DaxPieces {
+    DaxPieces {
+      layout: *self,
+      at: file_offset,
+      end: file_offset.saturating_add(len),
+    }
+  }
+
+  /// The first and last page holding the file's bytes `file_offset .. file_offset + len`; `None` for an empty span or
+  /// one that overflows.
+  #[must_use]
+  pub fn pages_of(&self, file_offset: u64, len: u64) -> Option<(u64, u64)> {
+    let last = file_offset.checked_add(len)?.checked_sub(1)?;
+    if len == 0 {
+      return None;
+    }
+    Some((self.locate(file_offset)?.0, self.locate(last)?.0))
+  }
+
+  /// How many distinct pages hold the file's ranges `ranges` (by index, ascending, each [`DAX_RANGE_BYTES`] of the file):
+  /// what a backing's filled ranges keep resident once placed, and so what its fill budget counts. Neighbouring ranges
+  /// share the page between them under a guard, so the count grows by sixteen pages for every fifteen consecutive
+  /// ranges under a 64 KiB guard, and by two for a range alone.
+  #[must_use]
+  pub fn pages_holding(&self, ranges: impl IntoIterator<Item = u64>) -> u64 {
+    let mut pages = 0u64;
+    let mut counted_to: Option<u64> = None;
+    for range in ranges {
+      let Some((first, last)) = range
+        .checked_mul(DAX_RANGE_BYTES)
+        .and_then(|start| self.pages_of(start, DAX_RANGE_BYTES))
+      else {
+        continue;
+      };
+      let from = match counted_to {
+        Some(counted) if counted >= first => counted.saturating_add(1),
+        _ => first,
+      };
+      if last >= from {
+        pages = pages.saturating_add(last.saturating_sub(from).saturating_add(1));
+        counted_to = Some(last);
+      }
+    }
+    pages
+  }
+}
+
+/// The pieces of a file span as a layout holds them ([`DaxLayout::pieces`]).
+#[derive(Clone, Debug)]
+pub struct DaxPieces {
+  layout: DaxLayout,
+  at: u64,
+  end: u64,
+}
+
+impl Iterator for DaxPieces {
+  type Item = DaxPiece;
+
+  fn next(&mut self) -> Option<DaxPiece> {
+    if self.at >= self.end {
+      return None;
+    }
+    let (page, within) = self.layout.locate(self.at)?;
+    let interior_end = self.layout.guard().saturating_add(self.layout.interior());
+    let len = interior_end
+      .saturating_sub(within)
+      .min(self.end.saturating_sub(self.at));
+    if len == 0 {
+      return None;
+    }
+    let piece = DaxPiece {
+      file_offset: self.at,
+      object_offset: page.checked_mul(DAX_RANGE_BYTES)?.checked_add(within)?,
+      len,
+    };
+    self.at = self.at.saturating_add(len);
+    Some(piece)
+  }
 }
 
 /// `offset .. offset + count` as an offset into a peer object or view of `len` bytes, refused `OutOfRange` past it.
@@ -325,28 +494,25 @@ mod imp {
 
   use super::racy::{Racy, RacyStore};
   use super::{
-    DAX_OBJECT_BYTES, DAX_RANGE_BYTES, PeerAccess, Placement, ranges_can_be_huge, within_view,
+    DAX_OBJECT_BYTES, DAX_RANGE_BYTES, DaxLayout, PeerAccess, Placement, ranges_can_be_huge,
+    within_view,
   };
   use crate::error::MemError;
   use crate::shared::{RangeView, ReadView};
 
-  /// The span `offset .. offset + len` inside a DAX object, as its end; refused `OutOfRange` past the object.
-  fn span_end(offset: u64, len: u64) -> Result<u64, MemError> {
-    match offset.checked_add(len) {
-      Some(end) if end <= DAX_OBJECT_BYTES => Ok(end),
-      _ => Err(MemError::OutOfRange {
-        offset: usize::try_from(offset).unwrap_or(usize::MAX),
-        len: usize::try_from(DAX_OBJECT_BYTES).unwrap_or(usize::MAX),
-      }),
+  /// The worse of two placements of the pages of one range: a lasting decline over a transient one, any decline over
+  /// unavailable, unavailable over placed, and placed over kept.
+  fn worse(one: Placement, other: Placement) -> Placement {
+    match (one, other) {
+      (Placement::Declined { transient: false }, _)
+      | (_, Placement::Declined { transient: false }) => Placement::Declined { transient: false },
+      (Placement::Declined { .. }, _) | (_, Placement::Declined { .. }) => {
+        Placement::Declined { transient: true }
+      }
+      (Placement::Unavailable, _) | (_, Placement::Unavailable) => Placement::Unavailable,
+      (Placement::Placed, _) | (_, Placement::Placed) => Placement::Placed,
+      (Placement::Kept, Placement::Kept) => Placement::Kept,
     }
-  }
-
-  /// The range an offset falls in, and where in it.
-  fn range_of(offset: u64) -> Option<(u64, u64)> {
-    Some((
-      offset.checked_div(DAX_RANGE_BYTES)?,
-      offset.checked_rem(DAX_RANGE_BYTES)?,
-    ))
   }
 
   fn refused(call: &'static str, e: rustix::io::Errno) -> MemError {
@@ -360,16 +526,20 @@ mod imp {
   /// reaches the object's bytes only with `&mut self`.
   pub struct DaxObject {
     fd: OwnedFd,
+    /// How the file's bytes lie in the object's pages: by the file's own offsets, or in guarded interiors.
+    layout: DaxLayout,
+    /// slates' views, one a page, by page.
     views: BTreeMap<u64, RangeView>,
     most_views: usize,
-    /// The ranges placed in one huge page each ([`DaxObject::place_range`]). A placed range is zeroed by stores, never
-    /// by a hole punch, which would split its page.
+    /// The pages placed in one huge page each ([`DaxObject::place_range`]). A placed page is zeroed by stores, never by
+    /// a hole punch, which would split it.
     placed: BTreeSet<u64>,
   }
 
   impl std::fmt::Debug for DaxObject {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
       f.debug_struct("DaxObject")
+        .field("layout", &self.layout)
         .field("views", &self.views.len())
         .field("most_views", &self.most_views)
         .field("placed", &self.placed.len())
@@ -378,40 +548,70 @@ mod imp {
   }
 
   impl DaxObject {
-    /// A new object of [`DAX_OBJECT_BYTES`], all zeros, of which slates may map at most `most_views` ranges at once.
-    pub fn create(most_views: usize) -> Result<DaxObject, MemError> {
+    /// A new object of [`DAX_OBJECT_BYTES`], all zeros, holding its file in `layout`, of which slates may map at most
+    /// `most_views` pages at once.
+    pub fn create(most_views: usize, layout: DaxLayout) -> Result<DaxObject, MemError> {
       Ok(DaxObject {
         fd: platform::create_object()?,
+        layout,
         views: BTreeMap::new(),
         most_views,
         placed: BTreeSet::new(),
       })
     }
 
-    /// Places range `range` in one huge page before a guest maps it (§4.6, the backed route's L1; A-193). The range's
-    /// view is placed where a huge page can form behind it (`crate::shared`'s congruent `mmap`); one byte of it is read,
-    /// so the object holds a page there (a shmem collapse of a range holding none stops at `SCAN_TRUNCATED`,
-    /// `mm/khugepaged.c`); and `MADV_COLLAPSE` is asked about the view's whole span, whose answer decides, as §4.6's L1
-    /// takes it for the arena's zones. The read changes no byte, so the range may hold the file's bytes already.
+    /// How the object lays out its file.
+    #[must_use]
+    pub fn layout(&self) -> DaxLayout {
+      self.layout
+    }
+
+    /// Places every page holding the file's range `range` in one huge page before a guest maps it (§4.6, the backed
+    /// route's L1; A-193, A-194): one under the identity, two under a guard. Each page's view is placed where a huge
+    /// page can form behind it (`crate::shared`'s congruent `mmap`); one byte of it is read, so the object holds a page
+    /// there (a shmem collapse of a range holding none stops at `SCAN_TRUNCATED`, `mm/khugepaged.c`); and
+    /// `MADV_COLLAPSE` is asked about the view's whole span, whose answer decides, as §4.6's L1 takes it for the arena's
+    /// zones. The read changes no byte, so the page may hold the file's bytes already.
     ///
     /// [`Placement::Unavailable`] off Linux and where the host's PMD page is not a range; [`Placement::Declined`] where
-    /// the kernel would not, with whether it said asking again may succeed, and the range is then served on base pages.
-    /// Refused `OutOfRange` past the object and `ViewsExhausted` where the range cannot be viewed.
+    /// the kernel would not place one of the pages, with whether it said asking again may succeed, and that page is
+    /// then served on base pages. Refused `OutOfRange` past the object and `ViewsExhausted` where a page cannot be
+    /// viewed.
     pub fn place_range(&mut self, range: u64) -> Result<Placement, MemError> {
       if !ranges_can_be_huge() {
         return Ok(Placement::Unavailable);
       }
-      let view = self.view_mut(range)?;
+      let (first, last) = range
+        .checked_mul(DAX_RANGE_BYTES)
+        .and_then(|start| self.layout.pages_of(start, DAX_RANGE_BYTES))
+        .ok_or(MemError::OutOfRange {
+          offset: usize::try_from(range).unwrap_or(usize::MAX),
+          len: usize::try_from(DAX_OBJECT_BYTES).unwrap_or(usize::MAX),
+        })?;
+      let mut placement = Placement::Kept;
+      for page in first..=last {
+        placement = worse(placement, self.place_page(page)?);
+        // A declined collapse costs the kernel's compaction effort; the range is declined whatever the next page does.
+        if matches!(placement, Placement::Declined { .. }) {
+          break;
+        }
+      }
+      Ok(placement)
+    }
+
+    /// Places page `page` in one huge page ([`DaxObject::place_range`]'s work for one page).
+    fn place_page(&mut self, page: u64) -> Result<Placement, MemError> {
+      let view = self.view_mut(page)?;
       let mut first = [0u8; 1];
       view.load(0, &mut first)?;
       match view.collapse_huge() {
-        Ok(()) => Ok(if self.placed.insert(range) {
+        Ok(()) => Ok(if self.placed.insert(page) {
           Placement::Placed
         } else {
           Placement::Kept
         }),
         Err(declined) => {
-          self.placed.remove(&range);
+          self.placed.remove(&page);
           Ok(Placement::Declined {
             transient: declined == crate::region::CollapseDeclined::Transient,
           })
@@ -419,24 +619,24 @@ mod imp {
       }
     }
 
-    /// How many of the object's ranges are placed in a huge page each.
+    /// How many of the object's pages are placed in a huge page each.
     #[must_use]
-    pub fn placed_ranges(&self) -> usize {
+    pub fn placed_pages(&self) -> usize {
       self.placed.len()
     }
 
-    /// The indices of the ranges placed in a huge page each, in order.
+    /// The indices of the pages placed in a huge page each, in order.
     pub fn placed(&self) -> impl Iterator<Item = u64> + '_ {
       self.placed.iter().copied()
     }
 
-    /// The bytes of slates' view of range `range` that the kernel maps with PMD entries (`/proc/self/smaps`): the whole
-    /// range where it is one huge page, as a placed range is on Linux. The view is mapped if slates holds none and one
-    /// byte of it is read, which changes nothing, so the reading is of the range's pages as they are now: a mapping
-    /// shows a PMD entry only for a huge page it has touched. `None` where the kernel gives no reading; refused as
-    /// [`DaxObject::place_range`] is.
-    pub fn range_pmd_bytes(&mut self, range: u64) -> Result<Option<u64>, MemError> {
-      let view = self.view_mut(range)?;
+    /// The bytes of slates' view of page `page` that the kernel maps with PMD entries (`/proc/self/smaps`): the whole
+    /// page where it is one huge page, as a placed page is on Linux. The view is mapped if slates holds none and one byte
+    /// of it is read, which changes nothing, so the reading is of the page as it is now: a mapping shows a PMD entry only
+    /// for a huge page it has touched. `None` where the kernel gives no reading; refused as [`DaxObject::place_range`]
+    /// is.
+    pub fn page_pmd_bytes(&mut self, page: u64) -> Result<Option<u64>, MemError> {
+      let view = self.view_mut(page)?;
       let mut first = [0u8; 1];
       view.load(0, &mut first)?;
       Ok(view.pmd_bytes())
@@ -464,13 +664,13 @@ mod imp {
       false
     }
 
-    /// Readies range `range` for a VMM's map: nothing here, since a shared-memory page comes into being when it is
-    /// first touched, by anyone (Windows commits the range, its arm's doc says why). Refused `OutOfRange` past the
-    /// object.
+    /// Readies the file's range `range` for a VMM's map: nothing here, since a shared-memory page comes into being when
+    /// it is first touched, by anyone (Windows commits the range, its arm's doc says why). Refused `OutOfRange` past the
+    /// file the object can hold.
     pub fn prepare_range(&mut self, range: u64) -> Result<(), MemError> {
       range
         .checked_mul(DAX_RANGE_BYTES)
-        .and_then(|start| span_end(start, DAX_RANGE_BYTES).ok())
+        .and_then(|start| self.span_end(start, DAX_RANGE_BYTES).ok())
         .map(drop)
         .ok_or(MemError::OutOfRange {
           offset: usize::try_from(range).unwrap_or(usize::MAX),
@@ -490,11 +690,11 @@ mod imp {
         offset: usize::MAX,
         len: from.len(),
       })?;
-      span_end(offset, len)?;
+      self.span_end(offset, len)?;
       let mut done = 0usize;
       while done < from.len() {
         let at = offset.saturating_add(u64::try_from(done).unwrap_or(u64::MAX));
-        let (range, within, take) = piece(at, from.len().saturating_sub(done))?;
+        let (range, within, take) = self.piece(at, from.len().saturating_sub(done))?;
         let bytes = from
           .get(done..done.saturating_add(take))
           .ok_or(MemError::OutOfRange {
@@ -513,12 +713,12 @@ mod imp {
         offset: usize::MAX,
         len: into.len(),
       })?;
-      span_end(offset, len)?;
+      self.span_end(offset, len)?;
       let total = into.len();
       let mut done = 0usize;
       while done < total {
         let at = offset.saturating_add(u64::try_from(done).unwrap_or(u64::MAX));
-        let (range, within, take) = piece(at, total.saturating_sub(done))?;
+        let (range, within, take) = self.piece(at, total.saturating_sub(done))?;
         let bytes = into
           .get_mut(done..done.saturating_add(take))
           .ok_or(MemError::OutOfRange {
@@ -535,12 +735,12 @@ mod imp {
     /// given back (Linux) or zeroed only where they hold something (macOS), and the partial pages at the ends are
     /// zeroed through atomics. Refused as [`DaxObject::store`] is, and `OsRefused` where the OS refuses the punch.
     pub fn zero(&mut self, offset: u64, len: u64) -> Result<(), MemError> {
-      let end = span_end(offset, len)?;
+      let end = self.span_end(offset, len)?;
       let page = u64::try_from(rustix::param::page_size().max(1)).unwrap_or(u64::MAX);
       let mut at = offset;
       while at < end {
         let left = usize::try_from(end.saturating_sub(at)).unwrap_or(usize::MAX);
-        let (range, within, take) = piece(at, left)?;
+        let (range, within, take) = self.piece(at, left)?;
         let within_end = within.saturating_add(take);
         let placed = self.placed.contains(&range);
         let view = self.view_mut(range)?;
@@ -571,7 +771,44 @@ mod imp {
       Ok(())
     }
 
-    /// The view of range `range`, mapped now if slates holds none, within the owner's bound.
+    /// The file span `offset .. offset + len` as its end; refused `OutOfRange` past the file the object can hold in its
+    /// layout.
+    fn span_end(&self, offset: u64, len: u64) -> Result<u64, MemError> {
+      match offset.checked_add(len) {
+        Some(end) if end <= self.layout.file_bytes(DAX_OBJECT_BYTES) => Ok(end),
+        _ => Err(MemError::OutOfRange {
+          offset: usize::try_from(offset).unwrap_or(usize::MAX),
+          len: usize::try_from(DAX_OBJECT_BYTES).unwrap_or(usize::MAX),
+        }),
+      }
+    }
+
+    /// The piece of the file at offset `at` with `left` bytes to go, as the object holds it: its page, where in the page,
+    /// and how many bytes it takes (to the end of the page's interior at most).
+    fn piece(&self, at: u64, left: usize) -> Result<(u64, usize, usize), MemError> {
+      let refused = MemError::OutOfRange {
+        offset: usize::try_from(at).unwrap_or(usize::MAX),
+        len: left,
+      };
+      let piece = self
+        .layout
+        .pieces(at, u64::try_from(left).unwrap_or(u64::MAX))
+        .next()
+        .ok_or(refused.clone())?;
+      let page = piece
+        .object_offset
+        .checked_div(DAX_RANGE_BYTES)
+        .ok_or(refused.clone())?;
+      let within = piece
+        .object_offset
+        .checked_rem(DAX_RANGE_BYTES)
+        .and_then(|within| usize::try_from(within).ok())
+        .ok_or(refused.clone())?;
+      let take = usize::try_from(piece.len).map_err(|_| refused)?;
+      Ok((page, within, take))
+    }
+
+    /// The view of page `range`, mapped now if slates holds none, within the owner's bound.
     fn view(&mut self, range: u64) -> Result<&RangeView, MemError> {
       self.view_mut(range).map(|view| &*view)
     }
@@ -855,22 +1092,6 @@ mod imp {
       let at = within_view(offset, from.len(), self.len)?;
       self.view.store(at, from)
     }
-  }
-
-  /// The piece of a copy at object offset `at` with `left` bytes to go: its range, where in the range, and how many
-  /// bytes it takes (to the range's end at most).
-  fn piece(at: u64, left: usize) -> Result<(u64, usize, usize), MemError> {
-    let (range, within) = range_of(at).ok_or(MemError::OutOfRange {
-      offset: usize::MAX,
-      len: left,
-    })?;
-    let room = DAX_RANGE_BYTES.saturating_sub(within);
-    let take = usize::try_from(room).unwrap_or(usize::MAX).min(left);
-    let within = usize::try_from(within).map_err(|_| MemError::OutOfRange {
-      offset: usize::MAX,
-      len: left,
-    })?;
-    Ok((range, within, take))
   }
 
   impl Racy for RangeView {
@@ -1311,8 +1532,17 @@ mod imp {
 
   impl DaxObject {
     /// A new object of [`super::dax_object_bytes`], all zeros and nothing committed, of which slates may map at most
-    /// `most_views` ranges at once. Refused `OsRefused` where the OS refuses the section.
-    pub fn create(most_views: usize) -> Result<DaxObject, MemError> {
+    /// `most_views` ranges at once, holding its file by the file's own offsets. Refused `OsRefused` where the OS refuses
+    /// the section, and for any other layout.
+    pub fn create(most_views: usize, layout: super::DaxLayout) -> Result<DaxObject, MemError> {
+      // Only the identity: the guarded layout is for a host that places ranges in huge pages, which Windows never does
+      // ([`super::DaxLayout::for_backings`]), and a guarded section is refused rather than laid out without its point.
+      if layout != super::DaxLayout::Identity {
+        return Err(MemError::OsRefused {
+          call: "a guarded DAX object off Linux",
+          code: None,
+        });
+      }
       let len = super::dax_object_bytes();
       Ok(DaxObject {
         section: confined_section(len, SEC_RESERVE)?,
@@ -1363,19 +1593,25 @@ mod imp {
       Ok(super::Placement::Unavailable)
     }
 
-    /// None: no range is ever placed here.
+    /// The identity, always: see [`DaxObject::create`].
     #[must_use]
-    pub fn placed_ranges(&self) -> usize {
+    pub fn layout(&self) -> super::DaxLayout {
+      super::DaxLayout::Identity
+    }
+
+    /// None: no page is ever placed here.
+    #[must_use]
+    pub fn placed_pages(&self) -> usize {
       0
     }
 
-    /// None: no range is ever placed here.
+    /// None: no page is ever placed here.
     pub fn placed(&self) -> impl Iterator<Item = u64> + '_ {
       std::iter::empty()
     }
 
     /// None: Windows gives no reading of how a view is backed.
-    pub fn range_pmd_bytes(&mut self, _range: u64) -> Result<Option<u64>, MemError> {
+    pub fn page_pmd_bytes(&mut self, _page: u64) -> Result<Option<u64>, MemError> {
       Ok(None)
     }
 

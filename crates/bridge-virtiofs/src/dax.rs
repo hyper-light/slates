@@ -233,7 +233,7 @@ pub enum DaxPlacer {
   /// nothing may change what such a window maps while the guest holds it ([`crate::backed`]). Linux only (the
   /// back-end-request channel is a Linux/vhost-user feature).
   #[cfg(target_os = "linux")]
-  Message(crate::vhost_user::MessagePlacer<crate::backed::BackedWindow>),
+  Message(crate::vhost_user::MessagePlacer<crate::backed::BackedPiece>),
 }
 
 impl DaxPlacer {

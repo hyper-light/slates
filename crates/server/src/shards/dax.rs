@@ -146,7 +146,7 @@ fn refused_counter(refused: &Refused) -> &'static str {
 
 /// The DAX offer a stream's requests are answered under (`slates_bridge_core::dax_backing::offer`).
 pub(super) fn offer(s: &ShardState) -> DaxOffer {
-  slates_bridge_core::dax_backing::offer(&s.store.shards_backings)
+  slates_bridge_core::dax_backing::offer(&s.store.shards_backings, slates_mem::DaxLayout::Identity)
 }
 
 /// Derived: the bytes one fill, ingest or refill slice copies: the shard's copy slice, in whole pages, at least one

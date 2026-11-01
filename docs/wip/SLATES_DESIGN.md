@@ -3233,29 +3233,56 @@ daemon through the rendezvous's socket file (A-187).
 >      production serves (A-168's backings) carried none of the layers below, read-only and writable alike; its layer
 >      is now the next one. Keeping writable arena DAX rare still narrows something real: B2 below can heal only
 >      read-only content, since a writable block changes legitimately.
->    - **L1 for the backed route — every range a guest maps is one huge page (built 2026-10-31, A-193).** Since A-168,
->      slates' own device maps per-file backings, not the arena's blocks, and the Shards route maps the same objects
->      (A-163). The layers L1, L2 and B2 below were built on the arena.
+>    - **L1 for the backed route — every range a guest maps lies in huge pages with guard rows (built 2026-10-31 and
+>      2026-11-01, A-193, A-194).** Since A-168, slates' own device maps per-file backings, not the arena's blocks, and the
+>      Shards route maps the same objects (A-163). The layers L1, L2 and B2 below were built on the arena.
 >
->      **How a range is placed.** Each range of a backing is placed as its fill finishes, before the guest's ask is
->      answered (`DaxObject::place_range`, through `ShardsBackings::place`, from the shared DAX session in
->      `crates/bridge-core/src/dax_backing.rs`):
->      1. slates' view of the range is mapped congruent with the object, as the arena's views are (`crates/mem/src/shared.rs`);
->      2. one byte of the range is read, so the object holds a page there, since a shmem collapse of a range holding no
+>      **How a backing lays out its file** (`DaxLayout`, A-194). A backing's object is cut into pages of 2 MiB, each placed
+>      in one huge page where the host can.
+>      - *slates' own device* tells its VMM where each piece of a window lies, so its backings are **guarded**: the file's
+>        bytes lie in the interiors of consecutive pages, and the first and last chunk window of every page (64 KiB on a
+>        4 KiB-paged host, `slates_vfs::content::chunk_bytes`, the slot the arena's zones hold as guard rows) are held
+>        empty. A guest's 2 MiB window is mapped as two pieces, each inside one page's interior (an interior is 1,920 KiB,
+>        fifteen 128 KiB parts, so every 2 MiB range is exactly two pieces), and no window ever maps a guard. Each placed
+>        page is then one huge page with its guard rows, CATT's shape (Brasser et al., USENIX Security 2017) as the
+>        zones hold it.
+>      - *The Shards route* maps by the file's own offsets, as its agreed protocol fixes (A-163), so its windows map whole
+>        pages: placement without guard rows. Guard rows there need the protocol to carry pieces, which is for the Shards
+>        owner to agree.
+>      - Where the host cannot place a range in one huge page, both keep the file's own offsets: a guard without a huge page
+>        behind it isolates nothing (`Placement::Unavailable`).
+>
+>      **How a range is placed.** As a range's fill finishes, before the guest's ask is answered, every page holding it
+>      (two under the guard, one otherwise) is placed (`DaxObject::place_range`, through `ShardsBackings::place`, from the
+>      shared DAX session in `crates/bridge-core/src/dax_backing.rs`):
+>      1. slates' view of the page is mapped congruent with the object, as the arena's views are (`crates/mem/src/shared.rs`);
+>      2. one byte of the page is read, so the object holds a page there, since a shmem collapse of a range holding no
 >         page stops at `SCAN_TRUNCATED` (`mm/khugepaged.c`);
 >      3. `MADV_COLLAPSE` is asked about the view's span, and its verdict decides, as it decides for the zones.
 >
->      **What placement buys, and where.** A placed range is one physically contiguous, aligned 2 MiB page that holds
->      nothing of anyone else's. What that is in DRAM rows depends on how the memory controller spreads physical
->      addresses over channels, ranks and banks, which is undocumented and learned only by reverse engineering (DRAMA,
->      Pessl et al., USENIX Security 2016).
+>      The device then sends the window's pieces together, its ring's room asked for all of them first, answers the guest
+>      on the last acknowledgement, and unmaps each piece on its own, since a vhost-user unmap must name the whole of one
+>      mapped region. A piece the front end refuses fails the SETUPMAPPING, and the pieces that did map are unmapped
+>      again: a window is mapped whole or not at all. While a piece's acknowledgement is owed, the serve loop answers the
+>      front end's control messages too. QEMU 11.1 answers a map and then commits it, sending `SET_MEM_TABLE` and awaiting
+>      the back end's answer before it reads the next request (`vhost_user_backend_handle_shmem_map`, then its memory
+>      transaction's commit, `hw/virtio/vhost-user.c`). A loop that waited for the second piece's acknowledgement alone
+>      waited forever: every guest test in QEMU hung on its first read until the wait served the doorbell too.
+>
+>      **What placement buys, and where.** A placed page is one physically contiguous, aligned 2 MiB page that holds
+>      nothing of anyone else's, and under the guard a guest's window reaches only its interior: its first and last
+>      64 KiB hold nothing and no window maps them, so the rows a guest's reads and stores activate are never the page's
+>      edge rows. What that is in DRAM rows depends on how the memory controller spreads physical addresses over channels,
+>      ranks and banks, which is undocumented and learned only by reverse engineering (DRAMA, Pessl et al., USENIX
+>      Security 2016).
 >      - Where 2 MiB spans several rows of each bank it touches, the page's inner rows have only its own rows beside
->        them, and foreign rows lie beside it only at its two ends. For example, with 8 KiB rows, 16 banks, two ranks and
->        two channels, a row across every bank is 512 KiB, so a page spans four rows a bank. A foreign row at an end is
->        hammered from one side; hammering it from both sides takes another of the guest's ranges placed on its far side,
->        which the guest cannot choose, only hope for by churning its ranges.
+>        them. For example, with 8 KiB rows, 16 banks, two ranks and two channels, a row across every bank is 512 KiB, so a
+>        page spans four rows a bank. Without a guard, a guest's window holds the page's edge rows, and the foreign rows
+>        beside them are hammered from one side. The guard keeps the guest off those edge rows wherever a guard slot
+>        covers a page's edge in each bank it touches. That holds where the interleaving lays 64 KiB in whole rows at the
+>        page's ends, and it is the same bet the arena's zones make with the same slot.
 >      - Where a row across every bank is 2 MiB or more, as with many channels, a placed page is less than a row of each
->        bank. It buys no row isolation then, only a bounded, contiguous set of rows the guest can reach.
+>        bank. It buys no row isolation then, guard or not, only a bounded, contiguous set of rows the guest can reach.
 >
 >      Without placement a range lay on whatever pages the fault path gave: base pages where `shmem_enabled` is `never`
 >      (CI's runners), each beside whatever was there.
@@ -3277,57 +3304,66 @@ daemon through the rendezvous's socket file (A-187).
 >      ranges ask the kernel once, and a re-arm asks again
 >      (`a_declined_placement_is_remembered_until_re_armed`, `crates/bridge-core/tests/dax_backing.rs`).
 >
->      **The cost is a whole 2 MiB per range, however little the file fills.** A one-page file mapped costs 2 MiB, not a
->      page. The fill budget already counts each filled range as 2 MiB, and a range is placed only once it is filled
->      and counted, so the placed bytes never exceed what the budget counts. Measured on adacachy (Linux 7.2.9) with
->      `fstat`'s `st_blocks`, 2026-10-31, and again on CI's Linux runners, x86_64 and arm64 (Linux 7.0, `shmem_enabled`
->      `[never]`, diagnostics run 41271016248):
->      - one object over two placed ranges held 4,194,304 bytes, against 4,194,304 counted;
->      - three placed ranges across two files held 2,097,152 and 4,194,304 bytes, against 6,291,456 counted;
+>      **The cost.** A placed page holds a whole 2 MiB, however little of it the file fills, and under the guard a range lies
+>      in two pages: a one-page file mapped costs 4 MiB (2 MiB under the identity), and fifteen ranges in a row cost sixteen
+>      pages, 6.7% over the file. The fill budget counts exactly the pages a backing's filled ranges lie in
+>      (`DaxLayout::pages_holding`), and a range is placed only once it is filled and counted, so the placed bytes never
+>      exceed what the budget counts. A VMM maps two pieces a window where it mapped one. crosvm maps each into its one
+>      window arena. QEMU makes a memory region of each, so a QEMU guest without `CONFIGURE_MEM_SLOTS` meets its
+>      eight-region table at half as many windows (GAPS). The pieces are not 2 MiB-aligned, so a VMM maps them with
+>      base-page entries.
+>      Measured with `fstat`'s `st_blocks` on adacachy (Linux 7.2.9) and on CI's x86_64 and arm64 runners (Linux 7.0,
+>      `shmem_enabled` `[never]`; diagnostics run 41277950761), 2026-11-01, every range placed and none refused:
+>      - a one-page file's first range and a range wholly past its end lie in four pages: 8,388,608 bytes held, 8,388,608
+>        counted;
+>      - a read-only window over one file holds two pages, 4,194,304 bytes; writable windows over another file's two
+>        neighbouring ranges hold three, 6,291,456 bytes; the backings count 10,485,760 for both;
 >      - the budget was 16,777,216 bytes.
 >
->      A fill step that places its range took 266 and 193 µs on CI's x86_64 runner and 359 and 191 µs on its arm64
->      runner, one sample each in debug builds. What placement adds to a step is not separated: no run timed the same
->      runner with placement off (BENCHMARKS).
+>      A fill step that places its range's two pages took 387 to 579 µs on CI's runners, one sample each in debug builds
+>      (BENCHMARKS).
 >
->      Proven by `each_range_a_guest_maps_is_one_huge_page_within_the_fill_budget` (`crates/bridge-core/tests/dax_backing.rs`)
->      and three device tests in `crates/bridge-virtiofs/tests/device.rs`:
->      - read-only and writable windows, each placed range one PMD page in slates' view and in the front end's map, and
->        a cut keeping it so;
->      - a hostile guest's churn, with each range placed once however often it is mapped, and nothing left placed or
->        held once the node is forgotten;
->      - a read-only attachment's window placed, and its writable ask refused with nothing made.
+>      Proven by `each_range_a_guest_maps_is_one_huge_page_within_the_fill_budget` and
+>      `a_declined_placement_is_remembered_until_re_armed` (`crates/bridge-core/tests/dax_backing.rs`), the layout's
+>      arithmetic (`crates/mem/tests/dax_layout.rs`), a guarded object's round trip (`crates/mem/tests/dax_object.rs`), and
+>      three device tests in `crates/bridge-virtiofs/tests/device.rs`:
+>      - read-only and writable windows: each placed page one PMD page in slates' view, every piece the front end was sent
+>        inside a page's interior, every guard slot holding nothing even after the guest stores across a whole window, the
+>        window sharing that page keeping its bytes, and a cut keeping the pages placed;
+>      - a hostile guest's churn, each range placed once however often it is mapped, and nothing left placed or held once
+>        the node is forgotten;
+>      - a read-only attachment's window placed with its guards empty, and its writable ask refused with nothing made.
 >
->      They pass on adacachy and on CI's x86_64 and arm64 runners, every range placed there. Red-checked on both runners
->      (diagnostics run 41271016248), each mutation failing on its own assertion:
->      - with placement off, all five placement tests failed;
->      - with a placed range punched rather than zeroed by stores, the cut test failed on "the cut kept the front end's
->        map of its range one PMD page";
->      - with the memo off, the memo test failed on "the kernel asked once for the three".
+>      They pass on adacachy and on CI's x86_64 and arm64 runners (diagnostics run 41277950761), every range placed.
+>      Red-checked on both runners, each mutation failing on its own assertion:
+>      - placement off failed all five placement tests;
+>      - a placed page punched rather than zeroed failed the cut's check, the punched page reading no PMD bytes;
+>      - the memo off failed "the kernel asked once for the three";
+>      - the interior widened by a guard failed "`FrontPiece { fd_offset: 65536, … len: 2031616 }` reaches a guard".
+>
+>      Real VMMs map the two pieces: QEMU 11.1.2 with KVM passes every test of `crates/cli/tests/guest_vhost.rs` through
+>      slates' own device, 5 of 5 in 9.62 s, every range placed (CI's x86_64 runner, diagnostics run 41278779089), and
+>      crosvm passes the same 5 of 5 on adacachy in 33.18 s. On that box, at load 87 to 218, three windows were placed and
+>      three declined and served on base pages, every guest's bytes right.
 >
 >      **What cannot apply to a backing, and why.**
->      - *Guard rows* in the range. A Linux guest asks for every mapping a whole range, `inarg.len = FUSE_DAX_SZ`,
->        2 MiB (`fs/fuse/dax.c`, `fuse_setup_one_mapping`). The device must map the file's bytes into all of it, so the
->        guest's rows include its page's edge rows.
->      - *Guard rows* beside the range. These would need memory known to lie physically beside the page, which an
->        unprivileged process can neither choose nor see. Since Linux 4.2 pagemap zeroes the frame number without
->        `CAP_SYS_ADMIN`, because "information about PFNs helps in exploiting Rowhammer vulnerability"
->        (`Documentation/admin-guide/mm/pagemap.rst`). A larger page than a PMD is hugetlb's, reserved by an
->        administrator, which R10 refuses to require.
+>      - *Guard rows on the Shards route.* Its VMM maps a backing by the file's own offsets, which the protocol agreed with
+>        the Shards owner fixes (`docs/wip/shards/dax-protocol.md`, A-163), so a window maps whole pages, edge rows
+>        included. Guard rows there need the protocol to carry pieces, which is the owner's to agree.
+>      - *Guard rows outside a page.* Memory known to lie physically beside a page cannot be had: an unprivileged process
+>        can neither choose nor see it. Since Linux 4.2 pagemap zeroes the frame number without `CAP_SYS_ADMIN`, because
+>        "information about PFNs helps in exploiting Rowhammer vulnerability" (`Documentation/admin-guide/mm/pagemap.rst`),
+>        and a page larger than a PMD is hugetlb's, reserved by an administrator, which R10 refuses to require. So the
+>        guards lie inside each page, at the cost of its two ends.
 >      - *L2's shift.* Moving a guest's range to other rows means mapping over its live window, which the vhost-user
 >        specification forbids. Unmapping first opens the zero-page gap a real guest read (A-168).
 >      - *B2's net.* A read-only range's backing could be compared with the volume on the reap tick, as B2 compares the
 >        arena's guarded blocks. Not built; owed (GAPS).
->      - *Considered and rejected: a guard by splitting each range.* A guest's range could be served from the middles of
->        two huge pages, each with guard space at its ends, by two maps. That costs twice a placed range's memory and
->        breaks the identity layout the Shards protocol shares (A-163). Its guard is also only a count of bytes: what
->        it is worth in rows depends on how the memory controller interleaves channels, ranks and banks, a mapping that
->        is undocumented and learned only by reverse engineering (DRAMA, Pessl et al., USENIX Security 2016).
 >
 >      **The floor that remains is the host's.** It is ECC, and in-DRAM Target Row Refresh, which TRR-aware many-sided
 >      patterns defeat on 13 of 42 DDR4 modules (TRRespass, Frigo et al., IEEE S&P 2020), and not placing untrusted
->      tenants on one host. Where a page spans several rows a bank, placement narrows what a guest's accesses reach to its
->      own page's two ends. It never makes a guest unable to flip a neighbour's bit.
+>      tenants on one host. Where a page spans several rows a bank, placement and the guard narrow what a guest's accesses
+>      reach to rows its own page holds. They never make a guest unable to flip a neighbour's bit.
 >    - **L1 — zones + guard rows (built, `crates/vfs/src/daxzone.rs`).** A tenant's writable-DAX content is shifted
 >      only inside a sandbox reserved for that tenant: one transparent huge page of the content arena, **verified**
 >      to have actually been given as one, cut into slots that are therefore distinct physical rows of the same
@@ -12631,6 +12667,64 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
 
+### A-194 — slates' own device lays its backings out guarded: the first and last chunk window of every page held empty, and each guest window mapped as two pieces from page interiors (accepted and built 2026-11-01)
+Applied in the same change to: §4.6 (the backed route's layer: the layout, what it buys, its cost, its limits),
+GAPS (the 2026-10-31 entry), `docs/wip/BENCHMARKS.md` (the placement's cost under the guard), `CLAUDE.md` (the
+canonical example), `crates/mem` (`dax_object.rs`: `DaxLayout`, `DaxPiece`, `DaxPieces`; `DaxObject::create` takes a
+layout, its offsets go through it, `place_range` places every page a range lies in, `placed_pages`, `page_pmd_bytes`;
+the host's huge-page fact asked once; `tests/dax_layout.rs` new, `tests/dax_object.rs`, `tests/dax_section.rs`),
+`crates/vfs/src/shards_backing.rs` (`BackingObject::layout`, `PagePlacement`, `placed_pages`; its tests),
+`crates/bridge-core/src/dax_backing.rs` (`DaxBackingSession::with_layout`, `layout`, `guarded_layout`, the charge in
+pages, `offer` by layout; its tests), `crates/bridge-virtiofs` (`backed.rs`: `BackedPiece`, `window_pieces`, the held
+map's pieces, `file_range_fits` by layout; `device.rs`: pieces sent together and acknowledged, a refused piece undoing
+the window, an unmap per piece; `vhost_user.rs`: `has_room_for`; `serve.rs`: control messages served while map acknowledgements are owed;
+`tests/device.rs`: the stand-in front end maps a window's pieces), and `crates/server` (`virtiofs.rs`: the guarded offer;
+`shards/dax.rs`: the identity offer).
+- **Corrects A-193**, which rejected guard rows for backings as impossible and a guard by splitting each range as not
+  worth its cost, for three reasons, none of which holds:
+  - "it breaks the identity layout the Shards protocol shares": only the Shards route's VMM maps by the file's own
+    offsets. slates' own device names every SHMEM_MAP's descriptor offset itself, so its backings can lie as it chooses;
+  - "a guard's worth in rows depends on the memory controller's undocumented interleaving": true, and equally true of
+    the arena's zones, whose one-slot guard §4.6 L1 already takes on the same bet;
+  - "it costs memory": the step asked for exactly that, a defense whose memory cost is measured and bounded by the fill
+    budget. The cost is two pages for a range alone and sixteen for fifteen in a row, not the double A-193 assumed.
+- **The layout.** A guarded object holds the file in the interiors of consecutive 2 MiB pages, the first and last chunk
+  window of each page (64 KiB on a 4 KiB-paged host, the zones' slot, `slates_vfs::content::chunk_bytes`) held empty. An
+  interior is 1,920 KiB, fifteen parts of 128 KiB, and a guest range is sixteen, so every range is exactly two pieces,
+  never three (`a_guest_range_is_two_pieces_inside_page_interiors_under_a_guard`). Neighbouring ranges share the page
+  between them, a window mapping only its own range's part. The layout is `guarded_layout()`, asked once a process:
+  guarded where the host places a range in one huge page, the identity elsewhere, since a guard isolates nothing without
+  one.
+- **The device.** A SETUPMAPPING's pieces are sent together after the ring's room is asked for all of them, so a window
+  is never half sent for want of room; the guest is answered on the last acknowledgement. A refused piece fails the
+  SETUPMAPPING with `EIO` and the pieces that did map are unmapped, so a window is mapped whole or not at all. An unmap
+  goes a piece at a time, since vhost-user requires an unmap to name the whole of one mapped region.
+- **Found by QEMU 11.1's guest tests, fixed in the same change:** QEMU answers each SHMEM_MAP and then commits it,
+  sending `SET_MEM_TABLE` and waiting for the back end's answer before it reads the next request
+  (`hw/virtio/vhost-user.c`). The serve loop waited for the second piece's acknowledgement and served nothing else, so
+  all five tests of `crates/cli/tests/guest_vhost.rs` hung at the guest's first read (diagnostics run 41277950761). The
+  wait now races the doorbell and serves the front end's control messages (`drive_dax_acks`), and a kick it drains
+  meanwhile gets another pass. One piece a window never met this, since the loop's wait ended at the first
+  acknowledgement; crosvm sends no table on a map.
+- **What it costs.** A one-page file mapped holds 4 MiB, not 2 MiB. The fill budget counts the pages a backing's filled
+  ranges lie in, so placed bytes never exceed what it counts. A VMM maps two pieces a window; QEMU makes a memory region
+  of each, which halves the windows a guest has before QEMU's eight-region table without `CONFIGURE_MEM_SLOTS` (owed,
+  GAPS). The pieces map with base-page entries, not the PMD entry a whole aligned range could take.
+- **Kept:** the Shards route's identity layout (its protocol fixes it), and with it placement without guard rows there.
+- **Measured and proven** 2026-11-01, on adacachy (Linux 7.2.9) and on CI's x86_64 and arm64 runners (Linux 7.0,
+  diagnostics run 41277950761):
+  - every range placed;
+  - each placed page one PMD page in slates' view;
+  - every piece inside an interior, every guard slot empty after the guest's stores across a whole window;
+  - each object exactly its pages, counted alike: 8,388,608 bytes for two lone ranges, 4,194,304 and 6,291,456 for one
+    range and for two neighbours;
+  - four red-checks, each failing on its own assertion: placement off, a placed page punched, the memo off, and the
+    interior widened into a guard.
+
+  Real VMMs: QEMU 11.1.2 with KVM, `crates/cli/tests/guest_vhost.rs` 5 of 5 in 9.62 s, every range placed (diagnostics
+  run 41278779089, after the deadlock below was fixed); crosvm on adacachy, 5 of 5 in 33.18 s, three windows placed
+  and three declined on the loaded box, every guest's bytes right.
+
 ### A-193 — Reading alone hammers: §4.6's read-only premise corrected, and every range a guest maps over a backing is placed in one huge page (accepted and built 2026-10-31)
 Applied in the same change to: §4.6 (Rowhammer: L0's premise corrected; the backed route's layer, its cost, its limits
 and the floor beneath it; the layers' summary), GAPS (the 2026-10-13 multi-tenancy entry's L0, and a 2026-10-31
@@ -12677,7 +12771,8 @@ placed congruent with the object, its unmaps acknowledged, and the forget test's
   it beside the arena zones' memo. A host out of huge pages is asked at most once a tick per shard, and a guest churning
   its ranges cannot make the shard pay the compaction again and again. Proven in a child process whose huge pages the
   kernel refuses (`a_declined_placement_is_remembered_until_re_armed`).
-- **Rejected:**
+- **Rejected** (the first and third overturned the next day by A-194, which builds guard rows inside each page: their
+  reasons did not hold; rows outside a page and L2's shift still cannot apply):
   - *guard rows* in the range, since a Linux guest maps each range whole, `inarg.len = FUSE_DAX_SZ`, 2 MiB
     (`fs/fuse/dax.c`), so its rows include the page's edge rows;
   - *guard rows* beside it, which need memory known to lie physically beside the page: an unprivileged process sees no

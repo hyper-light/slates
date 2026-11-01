@@ -10358,6 +10358,38 @@ beside it (no unprivileged process sees a frame number), and L2's shift (no map 
   the backing. No test reaches a fill failing part-way. Placement does not widen it: a range is placed only once its
   fill finishes.
 
+### 2026-11-01: guard rows for the backings of slates' own device (A-194), and A-193 was wrong to call them impossible
+
+**Found.** A-193 said a backing's range could carry no guard rows, because a guest maps each 2 MiB range whole, and
+rejected splitting each range over two pages as not worth its cost. slates' own device names every SHMEM_MAP's offset
+in the backing's object itself, so a window can be mapped from page interiors. A guard's worth in rows is the same bet
+the arena's zones already make, and the cost is two pages for a range alone and sixteen for fifteen in a row, not double.
+
+**Built (A-194).** The device's backings are laid out guarded (`DaxLayout::Guarded`, `guarded_layout()`): the first and
+last chunk window (64 KiB) of every 2 MiB page held empty, a guest's window mapped as two pieces from interiors, sent
+together after a room check, answered on the last acknowledgement, undone whole if a piece is refused, and unmapped a
+piece at a time. The fill budget counts the pages a backing's ranges lie in. The Shards route keeps the file's own
+offsets, which its protocol fixes.
+
+**Proven** 2026-11-01, on adacachy (Linux 7.2.9) and on CI's x86_64 and arm64 runners (diagnostics run 41277950761):
+- the layout's arithmetic and a guarded object's round trip;
+- the session's placement, four pages for two lone ranges, held and counted alike;
+- the device tests: pieces inside interiors, guards empty after a guest's stores across a whole window, the neighbouring
+  window intact, two and three pages held and counted;
+- four red-checks, each failing on its own assertion.
+
+Real VMMs map the two pieces: QEMU 11.1.2 with KVM, `guest_vhost.rs` 5 of 5 in 9.62 s (diagnostics run 41278779089),
+and crosvm on adacachy, 5 of 5 in 33.18 s. The first QEMU run hung all five at the guest's first read (run 41277950761):
+QEMU sends `SET_MEM_TABLE` after each map and waits for the answer before reading the next piece, and the serve loop
+waited on map acknowledgements alone. It now serves control messages while acknowledgements are owed (A-194).
+
+**Owed:**
+- the Shards route's guard rows: the protocol would have to carry pieces, which is the Shards owner's to agree;
+- `VHOST_USER_PROTOCOL_F_CONFIGURE_MEM_SLOTS` is more pressing now: QEMU makes a memory region of each piece, so a guest
+  meets its eight-region table at half as many windows;
+- what the pieces' base-page mapping costs a guest's DAX reads against the whole-range PMD mapping a VMM could make
+  before, unmeasured.
+
 ### 2026-10-20: a test helper that hung instead of refusing, and the R1/R10 arc it was blocking
 
 Writing the end-to-end landing test — a volume over a base, written through its mount, landed onto a target —

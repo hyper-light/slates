@@ -352,12 +352,17 @@ async fn serve_until_idle<S: VmmSeam, B: BridgeAccess>(
     }
     match one_pass(admitted, bridge, counters) {
       Ok(more) => {
-        // A message-based SETUPMAPPING may have parked for the front end's map-ack (§4.6); await it and answer
-        // the guest, and settle any deferred unmap-acks. No-op without a message placer or outstanding request.
+        // A message-based SETUPMAPPING may have parked for the front end's map-acks (§4.6); await them and answer
+        // the guest, and settle any deferred unmap-acks. No-op without a message placer or outstanding request. A
+        // guest kick the wait drained is served by another pass.
         #[cfg(target_os = "linux")]
-        if let Some(reason) = drive_dax_acks(admitted, bridge).await {
-          return Some(reason);
-        }
+        let more = {
+          let driven = drive_dax_acks(admitted, bridge).await;
+          if let Some(reason) = driven.end {
+            return Some(reason);
+          }
+          more || driven.kicked
+        };
         #[cfg(target_os = "linux")]
         report_dax_counts(admitted, bridge, counters);
         if more {
@@ -421,37 +426,122 @@ fn one_pass<S: VmmSeam, B: BridgeAccess>(
   Ok(pass.more_pending)
 }
 
-/// Completes a parked message-based DAX map (§4.6): await the front end's reply-ack on the back-end-request
-/// channel, then answer the guest's SETUPMAPPING; and settle any deferred unmap-acks (unpinning their blocks).
-/// `Some(reason)` when the loop must end — the channel's readiness was lost, the front end closed, or the
-/// attachment's volume is gone. The fd-sharing path has no acks, so this is Linux only; a device with no
-/// outstanding DAX request does nothing.
+/// What awaiting a parked map's acknowledgements came to: why the loop must end, if it must, and whether the wait
+/// drained a guest kick, which another pass then serves.
+#[cfg(target_os = "linux")]
+struct AcksDriven {
+  end: Option<EndReason>,
+  kicked: bool,
+}
+
+/// What ended a wait on a map's acknowledgement.
+#[cfg(target_os = "linux")]
+enum AckWoke {
+  /// The back-end-request channel is readable: an acknowledgement arrived.
+  Ack,
+  /// The doorbell is readable: a control message from the front end, or a guest kick.
+  Doorbell,
+}
+
+/// Waits until the back-end-request channel `ack` or, where the device has one, the doorbell is readable. Each
+/// readiness answers only for its own descriptor (A-149), so an acknowledgement is never taken for a control message.
+#[cfg(target_os = "linux")]
+async fn ack_or_doorbell(ack: i32, doorbell: Option<i32>) -> Result<AckWoke, RtError> {
+  let mut ack = std::pin::pin!(readable(ack));
+  let mut doorbell = std::pin::pin!(doorbell.map(readable));
+  std::future::poll_fn(|cx| {
+    if let Poll::Ready(ready) = ack.as_mut().poll(cx) {
+      return Poll::Ready(ready.map(|()| AckWoke::Ack));
+    }
+    match doorbell.as_mut().as_pin_mut() {
+      Some(doorbell) => doorbell
+        .poll(cx)
+        .map(|ready| ready.map(|()| AckWoke::Doorbell)),
+      None => Poll::Pending,
+    }
+  })
+  .await
+}
+
+/// Completes a parked message-based DAX map (§4.6): awaits the front end's reply-acks on the back-end-request channel,
+/// one a piece of the window, then answers the guest's SETUPMAPPING; and settles any deferred unmap-acks. While an
+/// acknowledgement is owed it serves the front end's control messages too: QEMU answers each piece's map and then
+/// commits it, sending `SET_MEM_TABLE` and awaiting the answer before it reads the next piece, so a window of two pieces
+/// waited forever on a loop that served nothing else (A-194, found by QEMU 11.1's guest tests). A kick drained
+/// meanwhile is reported, so the loop serves it. `end` is why the loop must end, if it must: the readiness was lost, the
+/// front end closed, or the attachment's volume is gone. The fd-sharing path has no acks, so this is Linux only; a
+/// device with no outstanding DAX request does nothing.
 #[cfg(target_os = "linux")]
 async fn drive_dax_acks<S: VmmSeam, B: BridgeAccess>(
   admitted: &mut AdmittedDevice<S>,
   bridge: &mut B,
-) -> Option<EndReason> {
+) -> AcksDriven {
+  let mut kicked = false;
   while admitted.dax_map_ack_owed() {
     let Some(raw) = admitted.dax_ack_raw_fd() else {
       break;
     };
-    if let Err(error) = readable(raw).await {
-      return Some(EndReason::DoorbellLost(error));
+    let doorbell = match admitted.doorbell() {
+      Doorbell::Descriptor(doorbell) => Some(doorbell),
+      Doorbell::InProcess => None,
+    };
+    match ack_or_doorbell(raw, doorbell).await {
+      Err(error) => {
+        return AcksDriven {
+          end: Some(EndReason::DoorbellLost(error)),
+          kicked,
+        };
+      }
+      Ok(AckWoke::Doorbell) => {
+        match admitted.drain_doorbell() {
+          Ok(Drained::HungUp) => {
+            return AcksDriven {
+              end: Some(EndReason::DoorbellHungUp),
+              kicked,
+            };
+          }
+          Ok(Drained::Kicked) => kicked = true,
+          Ok(Drained::Nothing) => {}
+          Err(e) => {
+            return AcksDriven {
+              end: Some(EndReason::Faulted(ServeError::Seam(e))),
+              kicked,
+            };
+          }
+        }
+        continue;
+      }
+      Ok(AckWoke::Ack) => {}
     }
     match bridge.with_bridge(|_, registry| admitted.complete_dax_map(registry)) {
       Ok(Ok(_)) => {}
-      Ok(Err(e)) => return Some(EndReason::Faulted(e)),
-      Err(gone) => return Some(EndReason::VolumeGone(gone)),
+      Ok(Err(e)) => {
+        return AcksDriven {
+          end: Some(EndReason::Faulted(e)),
+          kicked,
+        };
+      }
+      Err(gone) => {
+        return AcksDriven {
+          end: Some(EndReason::VolumeGone(gone)),
+          kicked,
+        };
+      }
     }
   }
   // Opportunistically settle any arrived unmap-acks without blocking, so the outstanding ring stays short.
   if admitted.dax_outstanding() {
     match bridge.with_bridge(|_, registry| admitted.complete_dax_map(registry)) {
       Ok(Ok(_)) | Err(_) => {}
-      Ok(Err(e)) => return Some(EndReason::Faulted(e)),
+      Ok(Err(e)) => {
+        return AcksDriven {
+          end: Some(EndReason::Faulted(e)),
+          kicked,
+        };
+      }
     }
   }
-  None
+  AcksDriven { end: None, kicked }
 }
 
 /// The ingest the guest's stores through its maps take before the device ends (§4.6, A-163): every backing with ranges

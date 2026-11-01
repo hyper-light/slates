@@ -201,7 +201,7 @@ fn backed_file(size: u64) -> (Store, Volume, InodeNo, Handle, Model) {
     .unwrap();
   let content = pattern(size, 0x5a);
   volume.write(&mut store, no, 0, &content).unwrap();
-  let mut object = DaxObject::create(4).unwrap();
+  let mut object = DaxObject::create(4, slates_mem::DaxLayout::Identity).unwrap();
   let held = content.len().min(filled());
   object.store(0, &content[..held]).unwrap();
   let mut backing = ShardsBacking::new(object, volume.prefix(), no);
@@ -277,7 +277,11 @@ proptest! {
 #[test]
 fn a_suppressed_backing_is_passed_over_and_the_others_are_not() {
   let (mut store, mut volume, no, source, _model) = backed_file(1 << 20);
-  let mut other = ShardsBacking::new(DaxObject::create(4).unwrap(), volume.prefix(), no);
+  let mut other = ShardsBacking::new(
+    DaxObject::create(4, slates_mem::DaxLayout::Identity).unwrap(),
+    volume.prefix(),
+    no,
+  );
   other.mark_filled(0);
   let other = store.shards_backings.insert(other).unwrap();
   store.shards_backings.suppress(Some(source));
@@ -390,7 +394,11 @@ fn overlay(host: &mut slates_vfs::host::sim::SimHost, store: &mut Store) -> Volu
 /// A backing of file `no` of the volume of prefix `volume` registered in the store, its first range filled: as a guest's
 /// read-only map leaves it.
 fn back(store: &mut Store, volume: u16, no: InodeNo) -> Handle {
-  let mut backing = ShardsBacking::new(DaxObject::create(4).unwrap(), volume, no);
+  let mut backing = ShardsBacking::new(
+    DaxObject::create(4, slates_mem::DaxLayout::Identity).unwrap(),
+    volume,
+    no,
+  );
   backing.mark_filled(0);
   store.shards_backings.insert(backing).unwrap()
 }
@@ -481,7 +489,11 @@ fn rewitness_refuses_a_file_mapped_writable_and_marks_one_mapped_to_read() {
   host.write_in_place("/big", &pattern(1 << 20, 0x5c), 1_000);
   let mut buf = vec![0u8; 4096];
   let _ = vol.with_host(&mut host).read(&mut store, no, 0, &mut buf);
-  let mut writable = ShardsBacking::new(DaxObject::create(4).unwrap(), vol.prefix(), no);
+  let mut writable = ShardsBacking::new(
+    DaxObject::create(4, slates_mem::DaxLayout::Identity).unwrap(),
+    vol.prefix(),
+    no,
+  );
   writable.mark_filled(0);
   writable.mark_writable(0);
   let writable = store.shards_backings.insert(writable).unwrap();
@@ -561,7 +573,11 @@ fn write_through_cost_per_mib() {
     .unwrap();
   volume.write(&mut store, plain, 0, &bytes).unwrap();
   volume.write(&mut store, backed, 0, &bytes).unwrap();
-  let mut backing = ShardsBacking::new(DaxObject::create(4).unwrap(), volume.prefix(), backed);
+  let mut backing = ShardsBacking::new(
+    DaxObject::create(4, slates_mem::DaxLayout::Identity).unwrap(),
+    volume.prefix(),
+    backed,
+  );
   backing.mark_filled(0);
   store.shards_backings.insert(backing).unwrap();
   let mut write_mib = |no: InodeNo, seed: u8| {

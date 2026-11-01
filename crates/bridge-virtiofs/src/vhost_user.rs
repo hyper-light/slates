@@ -1865,9 +1865,9 @@ impl<T: Copy> MessagePlacer<T> {
     u64::try_from(self.page).unwrap_or(u64::MAX)
   }
 
-  /// Derived: the most requests outstanding at once — one per whole page of the cache region (the most windows that
-  /// can be live, each awaiting at most one unmap) plus one in-flight map while a teardown's unmaps drain. A request
-  /// past this is refused, never grown (banned: unbounded growth).
+  /// Derived: the most requests outstanding at once — one per whole page of the cache region (the most mapped pieces
+  /// that can be live, each at least a page and awaiting at most one unmap) plus one in-flight map while a teardown's
+  /// unmaps drain. A request past this is refused, never grown (banned: unbounded growth).
   fn outstanding_bound(&self) -> usize {
     let per_page = self
       .region_bytes
@@ -1891,6 +1891,17 @@ impl<T: Copy> MessagePlacer<T> {
       return Err(MessagePlaceError::BadRange);
     }
     Ok(())
+  }
+
+  /// Whether the outstanding ring has room for `requests` more: what a device asks before it sends a window's pieces or
+  /// their unmaps, so a window is never half sent for want of room (§4.6, A-194).
+  #[must_use]
+  pub fn has_room_for(&self, requests: usize) -> bool {
+    self
+      .outstanding
+      .len()
+      .checked_add(requests)
+      .is_some_and(|after| after <= self.outstanding_bound())
   }
 
   /// Refuses when the outstanding ring is already at its bound.

@@ -224,8 +224,19 @@ Every test is written as "do X, expect Y" and names the acceptance criterion or 
     closes before the task runs, so each instance carries an identity its task checks (`Tracker::id`; the unit test
     leaked 8 of 8 rounds' keepers before).
   - A defence the host may decline, counted and remembered: `ShardsBackings::place` in
-    `crates/vfs/src/shards_backing.rs` (each range a guest maps placed in one huge page as its fill finishes, A-193),
-    re-armed on the daemon's reap tick beside `DaxZones::rearm_refusals`. Gotchas, each found by a run:
+    `crates/vfs/src/shards_backing.rs` (each range a guest maps placed in huge pages as its fill finishes, A-193),
+    re-armed on the daemon's reap tick beside `DaxZones::rearm_refusals`; and the guard rows around it, a layout the
+    object's offsets go through (`DaxLayout` in `crates/mem/src/dax_object.rs`, A-194): slates' own device maps each
+    window as two pieces from page interiors. Gotchas, each found by a run or a review:
+    - a guard needs no physical neighbour you cannot see: put it inside the page and map the window around it, since the
+      device, not the guest, names each map's offset (A-193 called this impossible and was wrong the next day);
+    - send a window's pieces only after the ring has room for all of them, answer on the last acknowledgement, undo the
+      window if a piece is refused, and unmap a piece at a time (an unmap names the whole of one mapped region);
+    - keep answering the front end's control messages while an acknowledgement is owed: QEMU sends `SET_MEM_TABLE`
+      after each map and waits for the answer before it reads the next piece, so a loop waiting on acks alone hangs
+      every guest (`drive_dax_acks` in `crates/bridge-virtiofs/src/serve.rs`); a stand-in that acks every piece at once
+      cannot show it, and only the real VMM lane did;
+    - charge the pages a backing's ranges lie in, not its ranges, or a guarded range's second page goes uncounted;
     - place only once the range is filled and charged, or a fill that fails part-way leaves a huge page nobody counts;
     - a decline costs the shard milliseconds of the kernel's compaction (1,954 and 2,832 µs a step at load 90), so
       remember it;
