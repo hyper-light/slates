@@ -1,7 +1,6 @@
-//! The message placer's DAX windows over per-file backings (§4.6; the backings of A-163, shared through
-//! `slates_bridge_core::dax_backing`; goal G-vhost). An out-of-process VMM (crosvm) maps what the device sends into the
-//! guest's DAX window and keeps it there, and nothing afterwards can change what a window maps without the guest seeing
-//! wrong bytes:
+//! The device's DAX windows over per-file backings, whichever placer maps them (§4.6; the backings of A-163, shared
+//! through `slates_bridge_core::dax_backing`; A-168, A-195). Once a guest's window maps something, nothing afterwards can
+//! change what it maps without the guest seeing wrong bytes:
 //! - a Linux guest records each 2 MiB range it mapped and serves every access from it without asking again
 //!   (`fs/fuse/dax.c`);
 //! - the vhost-user protocol forbids a map over a live one;
@@ -10,24 +9,29 @@
 //!
 //! So a window maps the file's backing: one object per attachment and file, which never moves and which the volume's
 //! single write boundary keeps equal to the file before any change returns. Nothing the daemon does to the file reaches
-//! the window as a message, and no window is ever torn down under a guest that still holds it.
+//! the window as a message, and no window is ever torn down under a guest that still holds it. The fd-sharing placer
+//! (an in-process VMM's window, which the device overlays itself) and the message placer (an out-of-process front end's
+//! window, sent each piece over vhost-user) map the same backings in the same pieces; they differ only in who maps a
+//! piece and when it is acknowledged.
 //!
 //! What the device keeps here, and drives a step a turn (`Device::dax_turn`):
-//! - **The windows**: each a range of the guest's window over a range of one file's backing, recorded when the front end
-//!   acknowledges its map and removed at the guest's REMOVEMAPPING.
+//! - **The windows**: each a range of the guest's window over a range of one file's backing, recorded when its last
+//!   piece is mapped (at once for the fd-sharing placer, at the front end's acknowledgement for the message placer) and
+//!   removed at the guest's REMOVEMAPPING.
 //! - **The session**: the backings, their fills, the ingest of the guest's stores and the refill of a backing the disk
 //!   changed beneath.
 //! - **What it holds of the guest's requests**, one at a time, since the device serves nothing past a held request:
-//!   - a SETUPMAPPING whose backing is being filled, then whose map awaits the front end's acknowledgement;
+//!   - a SETUPMAPPING whose backing is being filled, then whose map awaits the front end's acknowledgement (the message
+//!     placer's alone);
 //!   - a request that asks for the guest's stores to reach the volume first ([`ingest_asked`]), served once its ingest is
 //!     done, with the write-back's refusal as its answer where its asker reads one;
 //!   - a reply that could reveal a change the disk made beneath a backing, published once the backing is refilled.
 //!
-//! **Writable at the front end.** Every window is mapped writable when the attachment may write, whatever the guest
-//! asked. A guest upgrades a range from read-only to writable with a second SETUPMAPPING over the same window
-//! (`fuse_upgrade_dax_mapping`); since no map may go over a live one, the upgrade is answered with no message. The
-//! guest's own page tables keep its read-only mappings read-only, and an ingest compares only the ranges asked writable.
-#![cfg(target_os = "linux")]
+//! **Writable at the placer.** Every window is mapped writable when the attachment may write, whatever the guest asked.
+//! A guest upgrades a range from read-only to writable with a second SETUPMAPPING over the same window
+//! (`fuse_upgrade_dax_mapping`); since no map may go over a live one, the upgrade is answered with no map. The guest's
+//! own page tables keep its read-only mappings read-only, and an ingest compares only the ranges asked writable.
+#![cfg(unix)]
 
 use slates_bridge_core::dax_backing::{Counts, DaxBackingSession};
 use slates_bridge_fuse::abi::Opcode;
@@ -49,7 +53,7 @@ pub struct BackedWindow {
   /// The file offset the window starts at. Where its bytes lie in the backing's object is the session's layout's to say
   /// ([`window_pieces`]): at the file's own offsets, or in the interiors of guarded pages (A-194).
   pub(crate) foffset: u64,
-  /// Whether the front end maps it writable: whether the attachment may write.
+  /// Whether the placer maps it writable: whether the attachment may write.
   pub(crate) writable: bool,
 }
 
@@ -60,9 +64,9 @@ impl BackedWindow {
   }
 }
 
-/// One piece of a window the front end is asked to map or to unmap: its window, where it lies in the guest's window,
-/// and where in the backing's object it maps from (§4.6, the backed route's L1; A-194). A window under a guarded layout
-/// is two pieces, each inside one page's interior; under the identity, one.
+/// One piece of a window the placer maps or unmaps: its window, where it lies in the guest's window, and where in the
+/// backing's object it maps from (§4.6, the backed route's L1; A-194). A window under a guarded layout is two pieces,
+/// each inside one page's interior; under the identity, one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BackedPiece {
   /// The window the piece is of.
@@ -102,17 +106,17 @@ pub(crate) struct HeldMap {
   pub(crate) unique: u64,
   /// The window it asks for.
   pub(crate) window: BackedWindow,
-  /// Whether the window is sent to the front end once the fill is done: not when the front end maps it as asked
-  /// already (a repeat, or a writable upgrade of a window mapped writable).
+  /// Whether the window is mapped once the fill is done: not when the placer maps it as asked already (a repeat, or a
+  /// writable upgrade of a window mapped writable).
   pub(crate) sends: bool,
-  /// Whether the map is sent and awaits the front end's acknowledgement.
+  /// Whether its pieces are mapped or sent, and their acknowledgements are being counted.
   pub(crate) sent: bool,
-  /// The window's pieces sent and not yet acknowledged.
+  /// The window's pieces mapped or sent and not yet acknowledged.
   pub(crate) pieces_left: usize,
-  /// The pieces the front end acknowledged mapped, unmapped again if another is refused: a window is mapped whole or
-  /// not at all. At most a window's pieces.
+  /// The pieces acknowledged mapped, unmapped again if another is refused: a window is mapped whole or not at all. At
+  /// most a window's pieces.
   pub(crate) mapped: Vec<BackedPiece>,
-  /// Whether the front end refused one of the pieces.
+  /// Whether the placer refused one of the pieces.
   pub(crate) refused: bool,
 }
 
@@ -137,16 +141,17 @@ pub(crate) struct HeldReply {
   pub(crate) written: u32,
 }
 
-/// What the message placer's backed DAX did: non-vacuity witnesses for the tests and the status report.
+/// What the device's backed DAX did: non-vacuity witnesses for the tests and the status report.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BackedCounts {
-  /// Maps sent to the front end.
+  /// Windows mapped: overlaid by the fd-sharing placer, or sent to the front end by the message placer.
   pub maps_sent: u64,
-  /// SETUPMAPPINGs answered with no message: a window the front end maps as asked already.
+  /// SETUPMAPPINGs answered with no map: a window the placer maps as asked already.
   pub maps_kept: u64,
-  /// Unmaps sent to the front end.
+  /// Windows unmapped: by the fd-sharing placer, or sent to the front end by the message placer.
   pub unmaps_sent: u64,
-  /// Unmaps the front end refused: the guest's window range still maps the backing, which stays equal to the file.
+  /// Unmaps refused, by the host (the fd-sharing placer) or the front end: the guest's window range still maps the
+  /// backing, which stays equal to the file.
   pub unmaps_refused: u64,
   /// Requests held for an ingest of the guest's stores.
   pub ingests_held: u64,
@@ -158,13 +163,13 @@ pub struct BackedCounts {
   pub session: Counts,
 }
 
-/// Format: the owner's status counter of maps sent to the front end ([`BackedCounts::maps_sent`]).
+/// Format: the owner's status counter of windows mapped ([`BackedCounts::maps_sent`]).
 pub const MAPS_SENT: &str = "virtiofs.dax_maps_sent";
-/// Format: the owner's status counter of SETUPMAPPINGs answered with no message ([`BackedCounts::maps_kept`]).
+/// Format: the owner's status counter of SETUPMAPPINGs answered with no map ([`BackedCounts::maps_kept`]).
 pub const MAPS_KEPT: &str = "virtiofs.dax_maps_kept";
-/// Format: the owner's status counter of unmaps sent to the front end ([`BackedCounts::unmaps_sent`]).
+/// Format: the owner's status counter of windows unmapped ([`BackedCounts::unmaps_sent`]).
 pub const UNMAPS_SENT: &str = "virtiofs.dax_unmaps_sent";
-/// Format: the owner's status counter of unmaps the front end refused ([`BackedCounts::unmaps_refused`]).
+/// Format: the owner's status counter of unmaps refused ([`BackedCounts::unmaps_refused`]).
 pub const UNMAPS_REFUSED: &str = "virtiofs.dax_unmaps_refused";
 /// Format: the owner's status counter of requests held for an ingest ([`BackedCounts::ingests_held`]).
 pub const INGESTS_HELD: &str = "virtiofs.dax_ingests_held";
@@ -233,7 +238,7 @@ impl BackedCounts {
   }
 }
 
-/// The message placer's windows, its session and what it holds of the guest's requests.
+/// The device's windows over backings, its session and what it holds of the guest's requests.
 #[derive(Debug, Default)]
 pub(crate) struct BackedDax {
   /// The live windows, bounded by the guest's window: one per granule at most.
@@ -256,7 +261,8 @@ impl BackedDax {
     self.map.is_some() || self.request.is_some() || self.reply.is_some()
   }
 
-  /// Whether a held SETUPMAPPING's map is sent and awaits the front end's acknowledgement.
+  /// Whether a held SETUPMAPPING's map is sent and awaits the front end's acknowledgement (the message placer's alone).
+  #[cfg(target_os = "linux")]
   pub(crate) fn acking(&self) -> bool {
     self.map.as_ref().is_some_and(|held| held.sent)
   }
@@ -268,7 +274,7 @@ impl BackedDax {
   }
 }
 
-/// Whether a SETUPMAPPING's file range fits the backing's object: it starts at a whole granule, since the front end maps
+/// Whether a SETUPMAPPING's file range fits the backing's object: it starts at a whole granule, since the placer maps
 /// the object from there, and ends within the file the object holds in `layout`. The guest's window range is the
 /// placer's to check.
 pub(crate) fn file_range_fits(foffset: u64, len: u64, granule: u64, layout: DaxLayout) -> bool {

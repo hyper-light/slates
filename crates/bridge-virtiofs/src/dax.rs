@@ -1,17 +1,16 @@
-//! The DAX cache region (§4.6, A-9, AC-4.12): the host-side window the device maps content blocks' pages into, so a
-//! guest reaches arena bytes through its own page table with no daemon call (FUSE_SETUPMAPPING / FUSE_REMOVEMAPPING).
+//! The DAX cache region (§4.6, A-9, A-168): the host-side window the fd-sharing placer maps per-file backings into, so a
+//! guest reaches a file's bytes through its own page table with no daemon call (FUSE_SETUPMAPPING / FUSE_REMOVEMAPPING).
 //!
 //! This is the **fd-sharing** form: the VMM shares the cache window as a memory object, the device reserves the whole
-//! window at construction (`PROT_NONE`, inaccessible), and each SETUPMAPPING overlays a page-aligned sub-range with a
-//! shared mapping of a content block's descriptor (`MAP_FIXED`). A REMOVEMAPPING — and the teardown half of a revoke —
-//! restores the inert reservation, so a guest's stale page table reaches a faulting hole, never a reused block. The
-//! block's descriptor is the content arena's shared object and the block is **pinned by the gate** while mapped
-//! ([`slates_vfs::dax`]), so its pages are stable. This module is the fd-sharing path an in-process VMM (libkrun) uses,
-//! and the one the sim exercises end to end without a VMM. An out-of-process VMM (crosvm, over vhost-user SHMEM_MAP)
-//! maps per-file backings instead, which the write boundary keeps equal to the file, since nothing may change what its
-//! window maps while the guest holds it (`crate::backed`, Linux).
+//! window at construction (`PROT_NONE`, inaccessible), and each SETUPMAPPING overlays page-aligned sub-ranges with a
+//! shared mapping of the file's backing (`MAP_FIXED`), one overlay a piece of the window (`crate::backed`). A
+//! REMOVEMAPPING restores the inert reservation, so a guest's stale page table reaches a faulting hole. The backing is the
+//! file's own DAX object, which the volume's write boundary keeps equal to the file before any change returns, so nothing
+//! the daemon does to the file ever needs a mapping torn down. An in-process VMM (libkrun) shares its window this way,
+//! and the sim exercises it end to end without a VMM; an out-of-process VMM (crosvm, QEMU) is sent each piece over
+//! vhost-user `SHMEM_MAP` instead (`crate::vhost_user`, Linux). Both map the same backings in the same pieces (A-195).
 //!
-//! Unix only (the DAX window is a Linux/vhost-user feature; the primitive is exercised on macOS over an `shm` object).
+//! Unix only (the primitive is exercised on macOS over a shared-memory object).
 #![cfg(unix)]
 
 use std::os::fd::BorrowedFd;
@@ -113,8 +112,14 @@ impl DaxCacheRegion {
     Ok((addr, len))
   }
 
-  /// Maps `len` bytes at `foffset` of block descriptor `fd` into the window at `moffset`, read-only or writable per
-  /// `writable` (FUSE_SETUPMAPPING). The block is pinned by the gate, so its pages are stable for the mapping's life.
+  /// Whether `[moffset, moffset+len)` is a range this window can map: non-empty, page-aligned at both ends and inside the
+  /// window; else [`DaxCacheError::BadRange`].
+  pub fn check_window(&self, moffset: u64, len: u64) -> Result<(), DaxCacheError> {
+    self.fixed_addr(moffset, len).map(|_| ())
+  }
+
+  /// Maps `len` bytes at `foffset` of the backing descriptor `fd` into the window at `moffset`, read-only or writable per
+  /// `writable` (one piece of a FUSE_SETUPMAPPING's window). The mapping holds the backing's object for its own life.
   pub fn map(
     &mut self,
     moffset: u64,
@@ -130,8 +135,9 @@ impl DaxCacheRegion {
       ProtFlags::READ
     };
     // SAFETY: `addr` is a page-aligned sub-range strictly within the window reservation (`fixed_addr`); `MAP_FIXED`
-    // replaces only that sub-range (never memory outside the reservation); `fd` is the pinned content block's object,
-    // valid and stable for this call and while the mapping lives. The reservation's `MmapMut` still owns the range.
+    // replaces only that sub-range (never memory outside the reservation); `fd` is a file's DAX object, valid for this
+    // call, which no process resizes while a view of it lives (`slates_mem::DaxObject`). No reference to the mapped
+    // bytes is formed here, and the reservation's `MmapMut` still owns the range.
     unsafe {
       rustix::mm::mmap(
         addr,
@@ -147,13 +153,13 @@ impl DaxCacheRegion {
     Ok(())
   }
 
-  /// Restores `[moffset, moffset+len)` to an inert, inaccessible mapping (FUSE_REMOVEMAPPING, and the teardown half of a
-  /// revoke): a fresh anonymous `MAP_FIXED` over the sub-range, so the block's descriptor is no longer reachable through
-  /// the window and a stale guest access faults. The caller unpins the block only after this returns.
+  /// Restores `[moffset, moffset+len)` to an inert, inaccessible mapping (FUSE_REMOVEMAPPING, and the teardown): a fresh
+  /// anonymous `MAP_FIXED` over the sub-range, so the backing is no longer reachable through the window and a stale guest
+  /// access faults.
   pub fn unmap(&mut self, moffset: u64, len: u64) -> Result<(), DaxCacheError> {
     let (addr, len) = self.fixed_addr(moffset, len)?;
     // SAFETY: as `map` — a page-aligned sub-range within the reservation; `MAP_FIXED | ANON` replaces it with a
-    // private, inaccessible mapping, detaching the block's descriptor from the window. The reservation still owns it.
+    // private, inaccessible mapping, detaching the backing from the window. The reservation still owns it.
     unsafe {
       rustix::mm::mmap_anonymous(
         addr,
@@ -218,33 +224,41 @@ impl DaxCacheRegion {
   }
 }
 
-/// How a device places a content block's pages into a guest's DAX window (§4.6), chosen at admission by the kind of
-/// VMM the device serves. The device holds one of these when DAX was offered; `serve_dax` and the teardown paths drive
-/// it. A DAX window is delivered two ways (§4.6, `crate::vhost_user`, which is Linux-only); this names which.
+/// How a device places a file's backing into a guest's DAX window (§4.6, A-168), chosen at admission by the kind of VMM
+/// the device serves. The device holds one of these when DAX was offered; both map the same backings in the same pieces
+/// (`crate::backed::window_pieces`), and differ only in who maps them.
 pub enum DaxPlacer {
   /// An **in-process / fd-sharing** VMM (libkrun, and the sim): the VMM shared the cache window as a memory object, so
-  /// the device reserved it whole and overlays each content block itself with `MAP_FIXED` ([`DaxCacheRegion`]). A map
-  /// and an unmap complete synchronously on the placing call — there is no separate front-end process to await.
+  /// the device reserved it whole and overlays each piece of a window itself with `MAP_FIXED` ([`DaxCacheRegion`]). A map
+  /// and an unmap complete on the placing call — there is no separate front-end process to await.
   Local(DaxCacheRegion),
-  /// An **out-of-process / message-based** VMM (crosvm): the back end does not own the window; it asks the front end
-  /// to map a file's backing over the back-end-request channel and awaits the reply-ack
-  /// ([`crate::vhost_user::MessagePlacer`]). A SETUPMAPPING's guest reply waits for the backing's fill and the front
-  /// end's map-ack, so the guest never reads an unmapped page. A window maps the file's backing, never content, since
-  /// nothing may change what such a window maps while the guest holds it ([`crate::backed`]). Linux only (the
-  /// back-end-request channel is a Linux/vhost-user feature).
+  /// An **out-of-process / message-based** VMM (crosvm, QEMU): the back end does not own the window; it asks the front
+  /// end to map each piece over the back-end-request channel and awaits the reply-acks
+  /// ([`crate::vhost_user::MessagePlacer`]). Linux only (the back-end-request channel is a Linux/vhost-user feature).
   #[cfg(target_os = "linux")]
   Message(crate::vhost_user::MessagePlacer<crate::backed::BackedPiece>),
 }
 
 impl DaxPlacer {
   /// The map granule — the multiple a window offset and length must be aligned to (the host page here, or a
-  /// negotiated FUSE_MAP_ALIGNMENT). Both forms expose it so `serve_dax` bounds a mapping the same way.
+  /// negotiated FUSE_MAP_ALIGNMENT). Both forms expose it so a SETUPMAPPING is bounded the same way.
   #[must_use]
   pub fn page(&self) -> usize {
     match self {
       DaxPlacer::Local(cache) => cache.page(),
       #[cfg(target_os = "linux")]
       DaxPlacer::Message(placer) => placer.page(),
+    }
+  }
+
+  /// Whether `[moffset, moffset+len)` is a range of the guest's window this placer can map: non-empty, whole granules,
+  /// inside the window.
+  #[must_use]
+  pub fn window_fits(&self, moffset: u64, len: u64) -> bool {
+    match self {
+      DaxPlacer::Local(cache) => cache.check_window(moffset, len).is_ok(),
+      #[cfg(target_os = "linux")]
+      DaxPlacer::Message(placer) => placer.check_window(moffset, len).is_ok(),
     }
   }
 }

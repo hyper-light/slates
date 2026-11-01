@@ -441,8 +441,9 @@ impl FallocateIn {
 }
 
 /// Format: the `fuse_setupmapping_in` flag asking for a writable DAX mapping (`FUSE_SETUPMAPPING_FLAG_WRITE`);
-/// `1 << 1` is the read flag. slates copies a file up before a writable mapping (`Volume::dax_map_write`), so a
-/// writable request is the one that must not land on immutable or snapshot-shared content.
+/// `1 << 1` is the read flag. slates copies a file up before a writable mapping
+/// (`slates_bridge_core::dax_backing::DaxBackingSession::ask`), so a writable request is the one that must not land on
+/// immutable or snapshot-shared content.
 pub const SETUPMAPPING_FLAG_WRITE: u64 = 1 << 0;
 
 /// The fields of a `FUSE_SETUPMAPPING` body (`struct fuse_setupmapping_in`): the open handle, the file offset and

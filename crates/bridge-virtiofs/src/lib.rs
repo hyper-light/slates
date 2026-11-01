@@ -55,11 +55,11 @@
 pub mod admission;
 pub mod capability;
 pub mod credit;
-// The DAX cache region maps content blocks' pages into a guest's page table (`MAP_FIXED`), which is a Unix feature;
-// the primitive is exercised on macOS over an `shm` object, so it is `cfg(unix)`, not Linux-only.
-// The message placer's DAX windows over per-file backings (§4.6, goal G-vhost): what an out-of-process VMM maps stays
-// equal to the file with no message, and no window is torn down under a guest that holds it. Linux's, as vhost-user is.
-#[cfg(target_os = "linux")]
+// The device's DAX windows over per-file backings (§4.6, A-168, A-195): what a guest maps stays equal to the file with
+// no message, and no window is torn down under a guest that holds it. The fd-sharing cache region overlays them into a
+// guest's window (`MAP_FIXED`), which is a Unix feature exercised on macOS over a shared-memory object, so both modules
+// are `cfg(unix)`; the message placer that sends them to an out-of-process front end is Linux's, as vhost-user is.
+#[cfg(unix)]
 pub mod backed;
 #[cfg(unix)]
 pub mod dax;

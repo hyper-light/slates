@@ -781,14 +781,13 @@ pub fn huge_backed_bytes(_base: usize) -> Option<u64> {
 
 /// The size of one transparent huge page on this host, the span a PMD entry maps.
 ///
-/// §4.6's L1 sandbox is sized in these: a tenant's writable-DAX rows must sit inside one physically
-/// contiguous page, or a shift between two of its offsets moves no physical rows. Read from the kernel
-/// rather than assumed, because it is not the same number on every architecture slates targets — 2 MiB on
-/// x86_64 and on arm64 with 4 KiB base pages, 32 MiB on arm64 with 16 KiB base pages, 512 MiB with 64 KiB —
-/// and a sandbox built to the wrong one is either unbuildable or silently split across pages.
+/// A DAX backing's range is placed in one of these only where it is exactly a range (2 MiB; §4.6, A-193), and a
+/// shared object's mapping is placed congruent with it so one can form (`slates_mem::shared`). Read from the kernel
+/// rather than assumed, because it is not the same number on every architecture slates targets — 2 MiB on x86_64 and
+/// on arm64 with 4 KiB base pages, 32 MiB on arm64 with 16 KiB base pages, 512 MiB with 64 KiB.
 ///
 /// `None` where the host has no transparent huge pages to size (off Linux, or a kernel built without
-/// `CONFIG_TRANSPARENT_HUGEPAGE`), which the caller reads as "no sandbox here", never as a default.
+/// `CONFIG_TRANSPARENT_HUGEPAGE`), which the caller reads as "no huge page here", never as a default.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn huge_page_bytes() -> Option<u64> {

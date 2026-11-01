@@ -3,8 +3,9 @@
 //! read/write policy, sharing/cache semantics, residency boundary and conformance evidence"; AC-9.7:
 //! "A skipped lane or pure simulation cannot close its transport guarantee"). Every field states
 //! what is true of this build, and the conformance evidence names the simulated driver as the
-//! evidence — never a live guest until one has run. DAX is reported as not advertised, with the
-//! contract's reason (AC-4.12 "Do not advertise DAX without this gate").
+//! evidence — never a live guest until one has run. DAX is reported advertised only by a binding a
+//! live guest has run over per-file backings, and otherwise not, with the reason (AC-4.12 "Do not
+//! advertise DAX without this gate"; AC-9.7).
 
 use slates_bridge_core::Rights;
 use slates_bridge_fuse::abi::flags;
@@ -12,8 +13,8 @@ use slates_bridge_fuse::init::InitNegotiation;
 
 use crate::admission::{GuestTransport, UnsupportedReason};
 
-/// Format: the contract's reason a DAX capability is not advertised (§4.6 A-9; AC-4.12).
-pub const DAX_NOT_ADVERTISED_REASON: &str = "the baseline contract does not require DAX; a requested DAX capability cannot be advertised until mapping isolation, pinning and teardown have been established for this VMM (§4.6 A-9, AC-4.12)";
+/// Format: the reason a DAX capability is not advertised (§4.6 A-9, A-195; AC-4.12, AC-9.7).
+pub const DAX_NOT_ADVERTISED_REASON: &str = "DAX is offered only by a binding a live guest has run: the in-process seam maps per-file backings as the vhost-user binding does (A-195), but no in-process VMM has run a guest over it, and a simulated driver cannot close a transport guarantee (AC-9.7)";
 /// Format: why the vhost-user binding offers DAX (§4.6; A-168, A-169): its windows map per-file copies kept equal to the
 /// volume, each authorizing one file, so isolation and teardown hold by construction.
 pub const DAX_OFFERED_PER_ATTACH_REASON: &str = "a DAX window is offered when the attach names one: its windows map per-file copies slates keeps equal to the volume, each authorizing one file's bytes (§4.6, A-168)";
@@ -116,7 +117,8 @@ fn sharing_of(negotiated: Option<InitNegotiation>) -> SharingSemantics {
 }
 
 /// The DAX line of `transport`: the vhost-user binding offers DAX on Linux, where its windows map per-file backings
-/// (A-168); the in-process binding's fd-sharing placer is not established, so it advertises none.
+/// (A-168) and live guests have run over them; the in-process binding's fd-sharing placer maps the same backings
+/// (A-195) but no live guest has run over it (AC-9.7), so it advertises none.
 const fn dax(transport: GuestTransport) -> DaxCapability {
   match transport {
     GuestTransport::InheritedDescriptor if cfg!(target_os = "linux") => DaxCapability {

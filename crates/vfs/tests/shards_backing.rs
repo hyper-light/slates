@@ -523,33 +523,6 @@ fn rewitness_refuses_a_file_mapped_writable_and_marks_one_mapped_to_read() {
   assert!(take_stale(&mut store, handle));
 }
 
-/// AC (Shards part 3, step 4), the routes exclude each other. Do: on a volume that allows writable DAX, back a file for
-/// a Shards guest and map it writable in process; let the backing go and map it again. Expect the first refused
-/// `DaxMapped`, an in-process guest's stores would bypass the write boundary the backing relies on, and the second to
-/// succeed with the registry reporting the file mapped writable.
-#[test]
-fn an_in_process_writable_map_and_a_shards_backing_exclude_each_other() {
-  let mut store = common::store();
-  let mut volume = common::volume(&mut store, 64 << 20);
-  volume.enable_writable_dax();
-  let root = volume.root();
-  let no = volume
-    .create_file(&mut store, root, "mapped", 0o644)
-    .unwrap();
-  volume
-    .write(&mut store, no, 0, &pattern(4096, 0x13))
-    .unwrap();
-  let handle = back(&mut store, volume.prefix(), no);
-  assert!(matches!(
-    volume.dax_map_write(&mut store, no),
-    Err(slates_vfs::error::VfsError::DaxMapped)
-  ));
-  assert!(!store.dax.has_writable_of(no));
-  store.shards_backings.remove(handle);
-  volume.dax_map_write(&mut store, no).unwrap();
-  assert!(store.dax.has_writable_of(no));
-}
-
 /// Measured, not a gate (Shards part 3, step 4): what write-through adds to a write. Do: write 1 MiB into a file in
 /// 64 KiB writes, once into a file no guest maps and once into a file with one backing whose range is filled, the two
 /// interleaved round by round, 25 rounds each; print every round and the best of each. Run by hand in release:

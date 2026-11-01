@@ -212,8 +212,6 @@ pub enum DaxOffer {
 pub struct DaxState<'a> {
   /// The store's DAX backings, which the volume's write boundary writes every change of a backed file through.
   pub backings: &'a mut slates_vfs::shards_backing::ShardsBackings,
-  /// The in-process DAX registry: a file a guest maps writable there cannot also be backed.
-  pub registry: &'a slates_vfs::dax::DaxRegistry,
   /// The prefix of the volume the bridge serves ([`slates_vfs::volume::Volume::prefix`]): with an inode number, what
   /// names a file in the store, since a clone shares its origin's numbers.
   pub volume: u16,
@@ -514,101 +512,6 @@ pub trait Bridge {
   /// only the scope itself — conservative, never wider.
   fn within(&mut self, object: ObjectId, scope: u64, _cx: &OpContext) -> Result<bool, VfsError> {
     Ok(object.inode == scope)
-  }
-
-  /// Mint a DAX mapping of the **open chunk** of `object` covering `file_offset` (§4.6 A-9, AC-4.12,
-  /// "DAX maps the open frontier"; `slates_vfs::dax`): the daemon pins the arena block and registers the mapping, and
-  /// the returned [`slates_vfs::dax::Mapping`] names the block the virtio-fs device places in its DAX window (a
-  /// `MAP_FIXED` of the content arena's memfd, or a `SHMEM_MAP` to the front end), so the guest reaches the block
-  /// through its own page table with no per-access daemon call. A single-block file maps at `file_offset` 0; a
-  /// multi-block file maps the open tail covering `file_offset`, while a sealed chunk (ciphertext at rest) is refused
-  /// so the guest FUSE_READs that range. `writable` copies the block up first (`Volume::dax_map_write`) so it is this
-  /// version's alone. The default is *no DAX window on this transport* — plain `/dev/fuse` and the scratch bridges
-  /// never serve it — refused `SpecialFileOperation` (EOPNOTSUPP); a transport advertises DAX in FUSE_INIT only when
-  /// its bridge overrides this behind the gate.
-  fn dax_map(
-    &mut self,
-    object: ObjectId,
-    cx: &OpContext,
-    writable: bool,
-    file_offset: usize,
-  ) -> Result<slates_vfs::dax::Mapping, VfsError> {
-    let _ = (object, cx, writable, file_offset);
-    Err(VfsError::SpecialFileOperation)
-  }
-
-  /// Revoke a DAX mapping a guest gave up (FUSE_REMOVEMAPPING): unregister it and unpin its block so the block may
-  /// be reused. The caller (the device) must have already torn the guest's window range down — the unpin is here,
-  /// **after** the window `munmap`, never before, or the guest's page table could outlive the pin and reach a
-  /// reused block. `Ok(true)` if the mapping was live, `Ok(false)` if it was already gone. The default holds no
-  /// mappings.
-  fn dax_unmap(
-    &mut self,
-    mapping: &slates_vfs::dax::Mapping,
-    cx: &OpContext,
-  ) -> Result<bool, VfsError> {
-    let _ = (mapping, cx);
-    Ok(false)
-  }
-
-  /// The backing descriptor, byte offset and length of a **live** mapping's block (FUSE_SETUPMAPPING), for the device
-  /// to map its pages into the VMM's DAX cache region. `None` for a revoked mapping, a scratch (anonymous-backed)
-  /// volume with no descriptor to hand a VMM, a mapping of another volume, or a bridge that serves no DAX. Unix only
-  /// (the DAX window is a Linux/vhost-user feature). The default serves none.
-  #[cfg(unix)]
-  fn dax_backing(
-    &self,
-    mapping: &slates_vfs::dax::Mapping,
-  ) -> Option<(std::os::fd::BorrowedFd<'_>, usize, usize)> {
-    let _ = mapping;
-    None
-  }
-
-  /// Phase one of a live-guest DAX revoke (FUSE_REMOVEMAPPING, or a content-path teardown): unregister the mapping so
-  /// the hardware path is inert and no new access is authorized, but **keep the block pinned** until the device has
-  /// unmapped the window and the guest's TLB is flushed. `Ok(true)` if it was live. The default holds no mappings.
-  fn dax_revoke_pending(
-    &mut self,
-    mapping: &slates_vfs::dax::Mapping,
-    cx: &OpContext,
-  ) -> Result<bool, VfsError> {
-    let _ = (mapping, cx);
-    Ok(false)
-  }
-
-  /// Phase two: unpin the block of a mapping revoked by [`Bridge::dax_revoke_pending`], **after** the device confirms
-  /// the window unmap and the cross-core TLB flush, so the block may be reused — never before, or a stale guest page
-  /// table could reach a reused block (the one cross-tenant hazard once spatial isolation holds). `Ok(true)` when the
-  /// hold was dropped. The default holds no mappings.
-  fn dax_release_after_unmap(
-    &mut self,
-    mapping: &slates_vfs::dax::Mapping,
-    cx: &OpContext,
-  ) -> Result<bool, VfsError> {
-    let _ = (mapping, cx);
-    Ok(false)
-  }
-
-  /// The inodes a daemon-side revoke marked revoke-pending (§4.6 step 5): a write/truncate of a mapped inode (or a
-  /// snapshot/clone of its volume) left the mapping revoked but its block pinned, awaiting the device to munmap the
-  /// guest's window. Each is `(inode, writable_only)`: `writable_only` false tears **every** window of the inode (a
-  /// write makes all stale), true tears only the writable ones and keeps the read-only (a snapshot shares the block
-  /// read-only). The device serve loop drains this each pass, so a block the daemon is about to reuse or freeze is
-  /// unmapped from the guest before it is unpinned. A bridge with no DAX registry has none.
-  fn take_pending_dax_revokes(&mut self) -> Vec<(u64, bool)> {
-    Vec::new()
-  }
-
-  /// Whether a live DAX window's `mapping` still names its file's current content block in this bridge's view (§4.6
-  /// "revoke on advance"). After a snapshot reader `advance`s its view, the device re-validates each window it holds
-  /// through this and tears any that no longer passes — the inodes whose content changed between the old view and
-  /// the new — so a hardware guest re-maps against the new view rather than reading stale bytes through a lingering
-  /// window. Unlike a write or truncate (which revokes every reader's windows of the inode), an advance moves one
-  /// reader, so its device validates only its own windows against its own view here. The default serves no DAX and
-  /// holds no window, so nothing is current: `false`.
-  fn dax_window_current(&mut self, mapping: &slates_vfs::dax::Mapping, cx: &OpContext) -> bool {
-    let _ = (mapping, cx);
-    false
   }
 
   /// The AppleDouble view of `owner_name`'s extended attributes in directory `parent` (§4.6
