@@ -1,0 +1,48 @@
+name: DIAG A-194 pieces at the server's stand-in front end (not for main)
+
+# CI run 41279217175 failed two server tests on both Linux lanes: the stand-in front end of tests/virtiofs.rs took and
+# acknowledged one SHMEM_MAP, while A-194's device sends two pieces a window and answers the guest on the last ack, so
+# the guest's interrupt never came ("an interrupt in time", left 0, right 1). The fix takes, places and acknowledges
+# every piece. This runs Linux clippy over the server, the vhost-form tests on both Linux architectures, and a red-check
+# that restores the old front end in this throwaway checkout, which must fail the two tests.
+
+on:
+  push:
+    branches: ['diag-a194-*']
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  pieces:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    name: vhost-form tests on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy on Linux
+        run: cargo clippy --locked -p slates-server --all-targets -- -D warnings
+      - name: The vhost-form tests
+        shell: bash
+        run: cargo test --locked -p slates-server --test virtiofs vhost_form -- --nocapture --test-threads 1
+      - name: Red-check, the old front end that takes one map a window
+        shell: bash
+        run: |
+          set -u
+          git show HEAD~1:crates/server/tests/virtiofs.rs > crates/server/tests/virtiofs.rs
+          if cargo test --locked -p slates-server --test virtiofs vhost_form -- --test-threads 1 > red.txt 2>&1; then
+            grep -E "^test |test result" red.txt; echo "RED-CHECK: the old front end passed"; exit 1
+          fi
+          grep -E "^test |panicked|left:|right:|test result" red.txt
+          grep -q "an interrupt in time" red.txt

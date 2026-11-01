@@ -1295,26 +1295,38 @@ mod vhost_form {
   /// Format: Linux `FUSE_DAX_SZ`, the range a guest's SETUPMAPPING maps.
   const DAX_RANGE: u64 = 2 << 20;
 
-  /// What the front end's back-end-request channel delivered for a SHMEM_MAP, mapped as crosvm maps it into the guest's
-  /// window (here at an address the kernel chooses): shared, writable when the map asked so.
-  struct WindowMap {
+  /// One SHMEM_MAP of a window as the front end received it: the object it maps, where in the window it goes (from the
+  /// window's start), its length, and where in the object it maps from.
+  struct WindowPiece {
     object: std::os::fd::OwnedFd,
+    in_window: u64,
+    len: u64,
+    fd_offset: u64,
+  }
+
+  /// A window as the front end placed it: every SHMEM_MAP the device sent for it (two under the device's guarded layout,
+  /// A-194, one under the identity) mapped at its place in one region, as crosvm maps each into the guest's window
+  /// (`MAP_SHARED | MAP_FIXED`), writable when the maps asked so.
+  struct WindowMap {
+    pieces: Vec<WindowPiece>,
     at: *mut std::ffi::c_void,
     len: usize,
-    /// Where the map begins in its object: the file offset of the range.
-    offset: u64,
   }
 
   impl WindowMap {
-    /// The map as a front end that puts it in its memory table names it (QEMU, A-189): at `guest_phys` in the guest,
-    /// at its own address of the map in the front end, from its offset in the object.
-    fn region_at(&self, guest_phys: u64) -> slates_bridge_virtiofs::vhost_user::RegionEntry {
-      slates_bridge_virtiofs::vhost_user::RegionEntry {
-        guest_phys,
-        size: u64::try_from(self.len).unwrap(),
-        user_addr: self.at as u64,
-        offset: self.offset,
-      }
+    /// The window's pieces as a front end that puts each placed map in its memory table names them (QEMU, A-189): each at
+    /// its place from `guest_phys` in the guest, at its own address in the front end, from its offset in the object.
+    fn regions_at(&self, guest_phys: u64) -> Vec<slates_bridge_virtiofs::vhost_user::RegionEntry> {
+      self
+        .pieces
+        .iter()
+        .map(|piece| slates_bridge_virtiofs::vhost_user::RegionEntry {
+          guest_phys: guest_phys + piece.in_window,
+          size: piece.len,
+          user_addr: self.at as u64 + piece.in_window,
+          offset: piece.fd_offset,
+        })
+        .collect()
     }
 
     /// `len` bytes from `at`, as the guest reads its window.
@@ -1337,18 +1349,16 @@ mod vhost_form {
 
   impl Drop for WindowMap {
     fn drop(&mut self) {
-      // SAFETY: unmapping exactly the mapping this value made, with its own address and length.
+      // SAFETY: unmapping exactly the region this value reserved and placed its pieces in, with its own address and
+      // length.
       unsafe { rustix::mm::munmap(self.at, self.len) }.unwrap();
     }
   }
 
-  /// Takes one SHMEM_MAP on the back-end-request channel `backend` (waiting for it, bounded) and maps its descriptor as
-  /// the front end does; then acknowledges it, as a front end does once the window is placed.
-  fn take_and_place_map(backend: &std::os::fd::OwnedFd) -> WindowMap {
-    use slates_bridge_virtiofs::vhost_user::{
-      ACK_LEN, FLAG_REPLY, HEADER_AT_FLAGS, HEADER_AT_SIZE, HEADER_LEN, MAP_FDS, MMAP_FLAG_MAP_RW,
-      MMAP_LEN, VERSION, backend_request,
-    };
+  /// Takes one SHMEM_MAP on the back-end-request channel `backend`, waiting for it, bounded: its `VhostUserMMap` body's
+  /// file offset, window offset, length and flags, and its descriptor.
+  fn take_map(backend: &std::os::fd::OwnedFd) -> ((u64, u64, u64, u64), std::os::fd::OwnedFd) {
+    use slates_bridge_virtiofs::vhost_user::{HEADER_LEN, MAP_FDS, MMAP_LEN, backend_request};
     let mut fds = [rustix::event::PollFd::new(
       backend,
       rustix::event::PollFlags::IN,
@@ -1394,44 +1404,96 @@ mod vhost_form {
           .unwrap(),
       )
     };
-    let (fd_offset, len, flags) = (field(8), field(24), field(32));
-    let len = usize::try_from(len).unwrap();
-    let prot = if flags & MMAP_FLAG_MAP_RW != 0 {
-      rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE
-    } else {
-      rustix::mm::ProtFlags::READ
+    ((field(8), field(16), field(24), field(32)), object)
+  }
+
+  /// Takes every SHMEM_MAP of the window `[0, len)` of the file the device maps (one a piece of the device's layout,
+  /// A-194) on the back-end-request channel `backend`, places each at its offset in one region reserved for the window,
+  /// as the front end does, and then acknowledges each, as a front end does once a map is placed.
+  fn take_and_place_window(backend: &std::os::fd::OwnedFd, len: u64) -> WindowMap {
+    use slates_bridge_virtiofs::vhost_user::{
+      ACK_LEN, FLAG_REPLY, HEADER_AT_FLAGS, HEADER_AT_SIZE, HEADER_LEN, MMAP_FLAG_MAP_RW, VERSION,
+      backend_request,
     };
-    // SAFETY: a fresh shared mapping at an address the kernel chooses, of `len` bytes of a descriptor this test owns, at
-    // a page-aligned offset; `WindowMap` unmaps it, with the same address and length, before the descriptor drops.
+    let pieces = slates_bridge_core::dax_backing::guarded_layout()
+      .pieces(0, len)
+      .count();
+    let maps: Vec<_> = (0..pieces).map(|_| take_map(backend)).collect();
+    let start = maps
+      .iter()
+      .map(|((_, shm_offset, _, _), _)| *shm_offset)
+      .min()
+      .unwrap();
+    let window_len = usize::try_from(len).unwrap();
+    // SAFETY: a fresh private reservation with no access at an address the kernel chooses, which nothing else uses;
+    // each piece replaces its part below, and `WindowMap` unmaps the whole of it.
     let at = unsafe {
-      rustix::mm::mmap(
+      rustix::mm::mmap_anonymous(
         std::ptr::null_mut(),
-        len,
-        prot,
-        rustix::mm::MapFlags::SHARED,
-        &object,
-        fd_offset,
+        window_len,
+        rustix::mm::ProtFlags::empty(),
+        rustix::mm::MapFlags::PRIVATE | rustix::mm::MapFlags::NORESERVE,
       )
     }
     .unwrap();
-    let mut ack = [0u8; HEADER_LEN + ACK_LEN];
-    ack[0..4].copy_from_slice(&backend_request::SHMEM_MAP.to_le_bytes());
-    ack[HEADER_AT_FLAGS..HEADER_AT_FLAGS + 4]
-      .copy_from_slice(&(VERSION | FLAG_REPLY).to_le_bytes());
-    ack[HEADER_AT_SIZE..HEADER_AT_SIZE + 4]
-      .copy_from_slice(&u32::try_from(ACK_LEN).unwrap().to_le_bytes());
-    rustix::net::sendmsg(
-      backend,
-      &[std::io::IoSlice::new(&ack)],
-      &mut rustix::net::SendAncillaryBuffer::default(),
-      rustix::net::SendFlags::NOSIGNAL,
-    )
-    .unwrap();
-    WindowMap {
-      object,
-      at,
+    let mut placed = Vec::new();
+    for ((fd_offset, shm_offset, piece_len, flags), object) in maps {
+      let prot = if flags & MMAP_FLAG_MAP_RW != 0 {
+        rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE
+      } else {
+        rustix::mm::ProtFlags::READ
+      };
+      let in_window = shm_offset - start;
+      assert!(
+        in_window + piece_len <= len,
+        "the piece lies inside the window"
+      );
+      // SAFETY: `[at + in_window, at + in_window + piece_len)` lies inside the reservation just made; `MAP_FIXED`
+      // replaces that part of it with the piece's bytes of a descriptor this test owns, from a page-aligned offset.
+      unsafe {
+        rustix::mm::mmap(
+          at.cast::<u8>()
+            .add(usize::try_from(in_window).unwrap())
+            .cast(),
+          usize::try_from(piece_len).unwrap(),
+          prot,
+          rustix::mm::MapFlags::SHARED | rustix::mm::MapFlags::FIXED,
+          &object,
+          fd_offset,
+        )
+      }
+      .expect("the front end places what it was sent");
+      placed.push(WindowPiece {
+        object,
+        in_window,
+        len: piece_len,
+        fd_offset,
+      });
+    }
+    assert_eq!(
+      placed.iter().map(|piece| piece.len).sum::<u64>(),
       len,
-      offset: fd_offset,
+      "the pieces cover the window once"
+    );
+    for _ in &placed {
+      let mut ack = [0u8; HEADER_LEN + ACK_LEN];
+      ack[0..4].copy_from_slice(&backend_request::SHMEM_MAP.to_le_bytes());
+      ack[HEADER_AT_FLAGS..HEADER_AT_FLAGS + 4]
+        .copy_from_slice(&(VERSION | FLAG_REPLY).to_le_bytes());
+      ack[HEADER_AT_SIZE..HEADER_AT_SIZE + 4]
+        .copy_from_slice(&u32::try_from(ACK_LEN).unwrap().to_le_bytes());
+      rustix::net::sendmsg(
+        backend,
+        &[std::io::IoSlice::new(&ack)],
+        &mut rustix::net::SendAncillaryBuffer::default(),
+        rustix::net::SendFlags::NOSIGNAL,
+      )
+      .unwrap();
+    }
+    WindowMap {
+      pieces: placed,
+      at,
+      len: window_len,
     }
   }
 
@@ -1462,9 +1524,9 @@ mod vhost_form {
     rustix::event::poll(&mut fds, Some(&now)).unwrap() > 0
   }
 
-  /// The guest's lookup of `mapped.bin` and its read-only map of the file's first range at window offset zero, the map
-  /// placed and acknowledged as the front end does, the SETUPMAPPING answered only after the ack: the node and the
-  /// window, which shows the file.
+  /// The guest's lookup of `mapped.bin` and its read-only map of the file's first range at window offset zero, each
+  /// piece of the map placed and acknowledged as the front end does, the SETUPMAPPING answered only after the last ack:
+  /// the node and the window, which shows the file.
   fn map_the_file(
     front: &vhost_front_end::FrontEnd,
     guest: &mut common::guest::Guest<slates_bridge_virtiofs::vhost_user::GuestRegions>,
@@ -1487,7 +1549,7 @@ mod vhost_form {
       common::guest::REPLY_CAP,
     );
     front.kick(1);
-    let window = take_and_place_map(backend);
+    let window = take_and_place_window(backend, DAX_RANGE);
     front.wait_call(1);
     let (id, len) = guest
       .reap()
@@ -1655,16 +1717,18 @@ mod vhost_form {
     let (_node, window) = map_the_file(&front, &mut guest, &backend);
 
     let ram_region = vhost_front_end::region_entry();
-    let with_the_range =
-      vhost_front_end::memory_table_of(&[ram_region, window.region_at(WINDOW_GUEST_BASE)]);
+    let mut regions = vec![ram_region];
+    regions.extend(window.regions_at(WINDOW_GUEST_BASE));
+    let mut objects = vec![ram.as_fd()];
+    objects.extend(window.pieces.iter().map(|piece| piece.object.as_fd()));
     assert_eq!(
       front.set(
         request::SET_MEM_TABLE,
-        &with_the_range,
-        &[ram.as_fd(), window.object.as_fd()]
+        &vhost_front_end::memory_table_of(&regions),
+        &objects
       ),
       0,
-      "the table with the placed map's range is taken under running queues"
+      "the table with every placed piece's range is taken under running queues"
     );
     let created = through_vhost(
       &front,
