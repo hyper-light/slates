@@ -89,6 +89,10 @@ const PURGES_DONE: &str = "winfsp.purges_done";
 const PURGES_REFUSED: &str = "winfsp.purges_refused";
 /// Format: purges not made because WinFsp cannot name an open's process. Zero on a current WinFsp.
 const PURGES_UNAVAILABLE: &str = "winfsp.purges_unavailable";
+/// Format: the counter of purges Windows did not take: written whole, but read back through its cache as bytes the host
+/// no longer holds, so the round is owed again (Step 8 of the VFS and DAX plan;
+/// docs/bugs/2026-11-01-a-winfsp-purge-windows-did-not-take-left-a-mapped-view-stale.md).
+const PURGES_UNTAKEN: &str = "winfsp.purges_untaken";
 /// Format: purge writes the host answered without applying them: the count that shows purges reached the host.
 const PURGE_ECHOES: &str = "winfsp.purge_echoes";
 
@@ -558,8 +562,17 @@ fn take_outcomes(s: &mut ShardState, mount: &mut WinFspMount) -> Result<bool, ()
         s.count(PURGES_DONE, purged.done);
         s.count(PURGES_REFUSED, purged.refused);
         s.count(PURGES_UNAVAILABLE, purged.unavailable);
+        s.count(PURGES_UNTAKEN, purged.untaken);
         let before = mount.round_out.take().flatten();
         match told {
+          Ok(Notified::Taken) if purged.untaken > 0 => {
+            // Windows took the round but kept a page of a purged range, so a view of it still holds the old bytes: the
+            // round is owed again, a tick on, as a deferred one is, and its purges are made again until each takes.
+            s.count(ROUNDS_TAKEN, 1);
+            mount.coherence.rewind(before);
+            mount.owed = true;
+            deferred = true;
+          }
           Ok(Notified::Taken) => s.count(ROUNDS_TAKEN, 1),
           Ok(Notified::RenameInProgress) => {
             s.count(ROUNDS_DEFERRED, 1);
