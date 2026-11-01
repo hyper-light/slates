@@ -12,7 +12,7 @@
 
 use std::os::fd::OwnedFd;
 
-use slates_bridge_core::dax_backing::{Ask, Counts, DaxBackingSession, FillStep};
+use slates_bridge_core::dax_backing::{Ask, Counts, DaxBackingSession, FillStep, guarded_layout};
 use slates_bridge_core::{Attachments, Bridge, ObjectId, OpContext, Rights, View, VolumeBridge};
 use slates_db::catalog::{Principal, VolumeId};
 use slates_mem::DAX_RANGE_BYTES;
@@ -21,7 +21,7 @@ use slates_mem::region::Region;
 use slates_vfs::clock::HostClock;
 use slates_vfs::names::NameEquivalence;
 use slates_vfs::quota::Quota;
-use slates_vfs::shards_backing::RangePlacement;
+use slates_vfs::shards_backing::PagePlacement;
 use slates_vfs::volume::{Store, StoreConfig, Volume, VolumeConfig};
 
 /// Shape: the store's page size.
@@ -237,43 +237,45 @@ fn host_declined_every_placement(test: &str, placed: u64, refused: u64) -> bool 
   declined
 }
 
-/// Holds a session's placements to §4.6's backed L1 on a host whose PMD page is a range: every one of `ranges` ranges
-/// filled placed or counted refused, at least one placed, each placed range one PMD page; and the object holding no more
-/// than the backings count, `charged`, and exactly the placed ranges' bytes where none was refused.
+/// Holds a session's placements to §4.6's backed L1 on a host whose PMD page is a range: every one of `ranges` filled
+/// placed or counted refused, at least one placed; under the device's guarded layout, each placed page one PMD page;
+/// and the object holding no more than the backings count, `charged`, and, where none was refused, exactly the pages
+/// its ranges lie in, which is what the budget counts.
 fn assert_placed(
   counts: &Counts,
-  placements: &[RangePlacement],
-  ranges: usize,
+  placements: &[PagePlacement],
+  ranges: &[u64],
   resident: u64,
   charged: u64,
 ) {
+  let layout = guarded_layout();
+  assert!(
+    matches!(layout, slates_mem::DaxLayout::Guarded { .. }),
+    "a host that places ranges lays the device's backings out guarded"
+  );
   assert_eq!(
     counts.placed + counts.placement_refused,
-    ranges as u64,
+    ranges.len() as u64,
     "every range filled is placed or counted refused"
   );
   assert!(
     counts.placed > 0,
     "no range was placed or refused: placement never ran"
   );
-  assert_eq!(
-    placements.len() as u64,
-    counts.placed,
-    "the store holds every placement counted"
-  );
   for placement in placements {
     assert_eq!(
       placement.pmd_bytes,
       Some(DAX_RANGE_BYTES),
-      "range {} is one PMD page",
-      placement.range
+      "page {} is one PMD page",
+      placement.page
     );
   }
   if counts.placement_refused == 0 {
-    assert_eq!(
+    assert_whole_cost(
+      placements.len() as u64,
+      layout.pages_holding(ranges.iter().copied()),
       resident,
-      counts.placed * DAX_RANGE_BYTES,
-      "the object holds the placed ranges and nothing more"
+      charged,
     );
   }
   assert!(
@@ -282,14 +284,31 @@ fn assert_placed(
   );
 }
 
-/// §4.6, the backed route's L1 (A-193): each range a guest maps is placed in one huge page as its fill finishes,
-/// where the host has a huge page of a range's size, and the placement costs no more memory than the fill budget
-/// counts. Do: make a file of one page; ask, read-only, its first range and a range wholly past its end, and fill
-/// each; read where each placed range lies and how many bytes the object holds; then let every backing go. Expect, on
-/// a host whose PMD page is a range: every range filled is placed or counted refused, at least one placed, and each
-/// placed range one PMD page in slates' view; the object holding no more than what the backing counts against the
-/// budget, which is within it, and exactly the placed ranges' bytes once every range is placed; and, once let go,
-/// nothing placed, held or counted. Elsewhere: nothing placed and nothing counted.
+/// Holds a placement with nothing refused to its whole cost: `placed` pages placed, exactly the `pages` its ranges lie
+/// in, the object holding them (`resident` bytes) and the backings counting them (`charged`) and nothing more.
+fn assert_whole_cost(placed: u64, pages: u64, resident: u64, charged: u64) {
+  assert_eq!(placed, pages, "every page the ranges lie in is placed");
+  assert_eq!(
+    resident,
+    pages * DAX_RANGE_BYTES,
+    "the object holds the placed pages and nothing more"
+  );
+  assert_eq!(
+    charged,
+    pages * DAX_RANGE_BYTES,
+    "the backings count exactly the pages placed"
+  );
+}
+
+/// §4.6, the backed route's L1 (A-193, A-194): each range a guest maps is placed in huge pages as its fill finishes,
+/// where the host has a huge page of a range's size, laid out as slates' own device lays its backings out (guarded),
+/// and the placement costs no more memory than the fill budget counts. Do: make a file of one page; ask, read-only,
+/// through a session in the device's layout, its first range and a range wholly past its end, and fill each; read where
+/// each placed page lies and how many bytes the object holds; then let every backing go. Expect, on a host whose PMD
+/// page is a range: the layout guarded; every range filled placed or counted refused, at least one placed, each placed
+/// page one PMD page in slates' view; the object holding exactly the pages its ranges lie in (two a range alone under
+/// the guard, four here), which is what the backings count, within the budget; and, once let go, nothing placed, held
+/// or counted. Elsewhere: nothing placed and nothing counted.
 #[test]
 fn each_range_a_guest_maps_is_one_huge_page_within_the_fill_budget() {
   /// Shape: the ranges asked: the file's own and one wholly past its end, where the fill copies nothing.
@@ -301,7 +320,7 @@ fn each_range_a_guest_maps_is_one_huge_page_within_the_fill_budget() {
   let no = vol.create_file(&mut store, root, "f", 0o644).unwrap();
   vol.write(&mut store, no, 0, &[0x41; PAGE]).unwrap();
 
-  let mut session = DaxBackingSession::new();
+  let mut session = DaxBackingSession::with_layout(guarded_layout());
   let descriptors = filled_ranges(&mut session, &mut vol, &mut store, &cx, no.0, &RANGES);
   let counts = session.take_counts();
   let placements = store.shards_backings.placements();
@@ -320,7 +339,7 @@ fn each_range_a_guest_maps_is_one_huge_page_within_the_fill_budget() {
       counts.placed,
       counts.placement_refused,
     ) {
-      assert_placed(&counts, &placements, RANGES.len(), resident, charged);
+      assert_placed(&counts, &placements, &RANGES, resident, charged);
     }
   } else {
     assert_eq!(
@@ -337,7 +356,7 @@ fn each_range_a_guest_maps_is_one_huge_page_within_the_fill_budget() {
   session.release_all(&mut store.shards_backings);
   assert_eq!(
     (
-      store.shards_backings.placed_ranges(),
+      store.shards_backings.placed_pages(),
       store.shards_backings.vmms_held()
     ),
     (0, (0, 0)),

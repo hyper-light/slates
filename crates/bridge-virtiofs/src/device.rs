@@ -532,8 +532,13 @@ impl Device {
   #[cfg(target_os = "linux")]
   pub fn install_dax_message_placer(
     &mut self,
-    placer: crate::vhost_user::MessagePlacer<crate::backed::BackedWindow>,
+    placer: crate::vhost_user::MessagePlacer<crate::backed::BackedPiece>,
   ) {
+    // This device tells its VMM where each piece of a window lies, so its backings hold their files in guarded pages
+    // (§4.6, the backed route's L1; A-194).
+    self.backed.session = slates_bridge_core::dax_backing::DaxBackingSession::with_layout(
+      slates_bridge_core::dax_backing::guarded_layout(),
+    );
     self.dax_placer = Some(crate::dax::DaxPlacer::Message(placer));
   }
 
@@ -626,8 +631,9 @@ impl Device {
   #[cfg(target_os = "linux")]
   fn release_backed(&mut self, bridge: &mut dyn slates_bridge_core::Bridge) {
     if let Some(crate::dax::DaxPlacer::Message(placer)) = self.dax_placer.as_mut() {
+      let layout = self.backed.session.layout();
       for window in std::mem::take(&mut self.backed.windows) {
-        unmap_backed(placer, &mut self.backed.counts, &window);
+        unmap_backed(placer, &mut self.backed.counts, &window, layout);
       }
     }
     if let Some(state) = bridge.dax_state() {
@@ -1115,11 +1121,12 @@ impl Device {
     }))
   }
 
-  /// Drains the message placer's reply-acks (§4.6) and acts on each: a held SETUPMAPPING's map-ack records its window
-  /// and answers the guest, and a refused map answers `EIO`. An unmap's ack settles nothing, since a window over a
-  /// backing holds no pin; a refused one is counted (the window range still maps the backing, which stays equal to the
-  /// file). Returns the completed chain when the map-ack landed here, so the caller notifies its queue. The fd-sharing
-  /// placer never has acks, so this is Linux only.
+  /// Drains the message placer's reply-acks (§4.6) and acts on each: the last map-ack of a held SETUPMAPPING's pieces
+  /// records its window and answers the guest, and a refused piece answers `EIO` once every piece is acknowledged, the
+  /// pieces that did map unmapped again. An unmap's ack settles nothing, since a window over a backing holds no pin; a
+  /// refused one is counted (the window range still maps the backing, which stays equal to the file). Returns the
+  /// completed chain when the last map-ack landed here, so the caller notifies its queue. The fd-sharing placer never
+  /// has acks, so this is Linux only.
   #[cfg(target_os = "linux")]
   pub fn complete_dax_awaiting(
     &mut self,
@@ -1136,12 +1143,15 @@ impl Device {
     let mut completed = None;
     for completion in completions {
       match completion {
-        crate::vhost_user::DaxCompletion::Mapped(window) => {
-          self.backed.windows.push(window);
-          completed = self.answer_held_map(memory, None, admission)?;
+        crate::vhost_user::DaxCompletion::Mapped(piece) => {
+          if let Some(done) = self.held_piece_acknowledged(memory, piece, true, admission)? {
+            completed = Some(done);
+          }
         }
-        crate::vhost_user::DaxCompletion::MapRefused { .. } => {
-          completed = self.answer_held_map(memory, Some(EIO), admission)?;
+        crate::vhost_user::DaxCompletion::MapRefused { token, .. } => {
+          if let Some(done) = self.held_piece_acknowledged(memory, token, false, admission)? {
+            completed = Some(done);
+          }
         }
         crate::vhost_user::DaxCompletion::Unmapped(_) => {}
         crate::vhost_user::DaxCompletion::UnmapRefused { .. } => {
@@ -1150,6 +1160,47 @@ impl Device {
       }
     }
     Ok(completed)
+  }
+
+  /// One piece of the held SETUPMAPPING's window acknowledged by the front end, `mapped` or refused (§4.6, the backed
+  /// route's L1; A-194). Once the last is in, the window is recorded and the guest answered. If any piece was refused,
+  /// the pieces that did map are unmapped again, so a window is mapped whole or not at all, and the guest is answered
+  /// `EIO`; where the ring has no room for those unmaps, the window is kept, so the next request over its range unmaps
+  /// it. `None` until the last piece, and when no SETUPMAPPING is held.
+  #[cfg(target_os = "linux")]
+  fn held_piece_acknowledged(
+    &mut self,
+    memory: &mut dyn GuestMemory,
+    piece: crate::backed::BackedPiece,
+    mapped: bool,
+    admission: &mut dyn ChainAdmission,
+  ) -> Result<Option<Completed>, DeviceError> {
+    let Some(held) = self.backed.map.as_mut() else {
+      return Ok(None);
+    };
+    held.pieces_left = held.pieces_left.saturating_sub(1);
+    if mapped {
+      held.mapped.push(piece);
+    } else {
+      held.refused = true;
+    }
+    if held.pieces_left > 0 {
+      return Ok(None);
+    }
+    let window = held.window;
+    if held.refused {
+      let undo = std::mem::take(&mut held.mapped);
+      let unmapped = match self.dax_placer.as_mut() {
+        Some(crate::dax::DaxPlacer::Message(placer)) => unmap_pieces(placer, &undo),
+        _ => Unmapped::ChannelGone,
+      };
+      if unmapped == Unmapped::NoRoom {
+        self.backed.windows.push(window);
+      }
+      return self.answer_held_map(memory, Some(EIO), admission);
+    }
+    self.backed.windows.push(window);
+    self.answer_held_map(memory, None, admission)
   }
 
   /// Answers the held SETUPMAPPING ([`crate::backed::HeldMap`]): success (`errno` `None`) or that errno. Scatters the
@@ -1331,6 +1382,9 @@ impl Device {
               window,
               sends,
               sent: false,
+              pieces_left: 0,
+              mapped: Vec::new(),
+              refused: false,
             });
             return Ok(ChainOutcome::DaxMapHeld);
           }
@@ -1583,6 +1637,7 @@ impl Device {
       busy: true,
       ..DaxTurned::default()
     };
+    let layout = self.backed.session.layout();
     let answered = match self.backed.session.fill_step(bridge, cx, slice_bytes) {
       slates_bridge_core::dax_backing::FillStep::Filling => return Ok(busy),
       slates_bridge_core::dax_backing::FillStep::Done(descriptor) => {
@@ -1593,21 +1648,35 @@ impl Device {
           }
           (Some(held), Some(crate::dax::DaxPlacer::Message(placer))) => {
             use std::os::fd::AsFd as _;
-            let window = held.window;
-            match placer.begin_map(
-              window.moffset,
-              window.len,
-              descriptor.as_fd(),
-              window.foffset,
-              window.writable,
-              window,
-            ) {
-              Ok(()) => {
-                held.sent = true;
-                self.backed.counts.maps_sent = self.backed.counts.maps_sent.saturating_add(1);
-                return Ok(busy);
+            // A window is its backing's pieces (§4.6, A-194): every one is sent, the ring's room asked for all first so
+            // a window is never half sent for want of it, and the guest is answered on the last acknowledgement.
+            let pieces = crate::backed::window_pieces(layout, &held.window);
+            let mut sent = 0usize;
+            if placer.has_room_for(pieces.len()) {
+              for piece in &pieces {
+                let begun = placer.begin_map(
+                  piece.moffset,
+                  piece.len,
+                  descriptor.as_fd(),
+                  piece.object_offset,
+                  held.window.writable,
+                  *piece,
+                );
+                if begun.is_err() {
+                  break;
+                }
+                sent = sent.saturating_add(1);
               }
-              Err(_) => Some(EIO),
+            }
+            if sent == 0 {
+              Some(EIO)
+            } else {
+              held.sent = true;
+              held.pieces_left = sent;
+              held.refused = sent < pieces.len();
+              held.mapped.clear();
+              self.backed.counts.maps_sent = self.backed.counts.maps_sent.saturating_add(1);
+              return Ok(busy);
             }
           }
           _ => Some(EIO),
@@ -1689,10 +1758,11 @@ impl Device {
       }
       let mut unmapped = true;
       let mut index = 0;
+      let layout = self.backed.session.layout();
       while index < self.backed.windows.len() {
         match self.backed.windows.get(index).copied() {
           Some(window) if window.inode == node => {
-            if unmap_backed(placer, &mut self.backed.counts, &window) {
+            if unmap_backed(placer, &mut self.backed.counts, &window, layout) {
               self.backed.windows.swap_remove(index);
             } else {
               unmapped = false;
@@ -2214,7 +2284,7 @@ fn serve_backed_dax(
   bridge: &mut dyn slates_bridge_core::Bridge,
   cx: &slates_bridge_core::OpContext,
   (placer, backed): (
-    &mut crate::vhost_user::MessagePlacer<crate::backed::BackedWindow>,
+    &mut crate::vhost_user::MessagePlacer<crate::backed::BackedPiece>,
     &mut crate::backed::BackedDax,
   ),
   out: &mut [u8],
@@ -2232,7 +2302,7 @@ fn serve_backed_dax(
       };
       let granule = u64::try_from(placer.page()).unwrap_or(u64::MAX);
       if placer.check_window(m.moffset, m.len).is_err()
-        || !crate::backed::file_range_fits(m.foffset, m.len, granule)
+        || !crate::backed::file_range_fits(m.foffset, m.len, granule, backed.session.layout())
       {
         return err(dax_errno::EINVAL, out);
       }
@@ -2272,11 +2342,12 @@ fn serve_backed_dax(
       let Ok(m) = RemoveMappingIn::parse(Opcode::RemoveMapping.to_wire(), req.body) else {
         return err(dax_errno::EINVAL, out);
       };
+      let layout = backed.session.layout();
       for one in &m.entries {
         let named = backed.windows.iter().position(|w| w.moffset == one.moffset);
         if let Some(index) = named
           && let Some(window) = backed.windows.get(index).copied()
-          && unmap_backed(placer, &mut backed.counts, &window)
+          && unmap_backed(placer, &mut backed.counts, &window, layout)
         {
           backed.windows.swap_remove(index);
         }
@@ -2288,40 +2359,74 @@ fn serve_backed_dax(
   }
 }
 
-/// Asks the front end to unmap `window` (SHMEM_UNMAP): whether the device may forget it. A sent unmap and a dead
-/// channel answer yes (nothing maps through a channel that is gone); a ring at its bound answers no, so the window is
-/// kept and its unmap asked again by whatever needs it gone. A window over a backing pins nothing, so nothing waits on
-/// the unmap's acknowledgement.
+/// How asking the front end to unmap a window's pieces came out.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unmapped {
+  /// An unmap was sent for every piece.
+  Sent,
+  /// The channel is gone, so nothing maps through it any more.
+  ChannelGone,
+  /// The ring had no room for every piece's unmap; none was sent, or an unexpected refusal stopped part-way.
+  NoRoom,
+}
+
+/// Asks the front end to unmap each of `pieces` (one SHMEM_UNMAP a piece, since an unmap must name the whole of one
+/// mapped region, vhost-user `VHOST_USER_BACKEND_SHMEM_UNMAP`), asking the ring's room for all of them first.
+#[cfg(target_os = "linux")]
+fn unmap_pieces(
+  placer: &mut crate::vhost_user::MessagePlacer<crate::backed::BackedPiece>,
+  pieces: &[crate::backed::BackedPiece],
+) -> Unmapped {
+  if !placer.has_room_for(pieces.len()) {
+    return Unmapped::NoRoom;
+  }
+  for piece in pieces {
+    match placer.begin_unmap(piece.moffset, piece.len, *piece) {
+      Ok(()) => {}
+      Err(crate::vhost_user::MessagePlaceError::Channel(_)) => return Unmapped::ChannelGone,
+      Err(_) => return Unmapped::NoRoom,
+    }
+  }
+  Unmapped::Sent
+}
+
+/// Asks the front end to unmap `window`, a SHMEM_UNMAP for each of its pieces under `layout`: whether the device may
+/// forget it. Unmaps sent and a dead channel answer yes (nothing maps through a channel that is gone); a ring without
+/// room answers no, so the window is kept and its unmap asked again by whatever needs it gone. A window over a backing
+/// pins nothing, so nothing waits on the unmaps' acknowledgements.
 #[cfg(target_os = "linux")]
 fn unmap_backed(
-  placer: &mut crate::vhost_user::MessagePlacer<crate::backed::BackedWindow>,
+  placer: &mut crate::vhost_user::MessagePlacer<crate::backed::BackedPiece>,
   counts: &mut crate::backed::BackedCounts,
   window: &crate::backed::BackedWindow,
+  layout: slates_mem::DaxLayout,
 ) -> bool {
-  match placer.begin_unmap(window.moffset, window.len, *window) {
-    Ok(()) => {
+  match unmap_pieces(placer, &crate::backed::window_pieces(layout, window)) {
+    Unmapped::Sent => {
       counts.unmaps_sent = counts.unmaps_sent.saturating_add(1);
       true
     }
-    Err(crate::vhost_user::MessagePlaceError::Channel(_)) => true,
-    Err(_) => false,
+    Unmapped::ChannelGone => true,
+    Unmapped::NoRoom => false,
   }
 }
 
 /// Unmaps every window over the guest's window range `[moffset, moffset + len)`: whether none is left there.
 #[cfg(target_os = "linux")]
 fn unmap_overlapping(
-  placer: &mut crate::vhost_user::MessagePlacer<crate::backed::BackedWindow>,
+  placer: &mut crate::vhost_user::MessagePlacer<crate::backed::BackedPiece>,
   backed: &mut crate::backed::BackedDax,
   moffset: u64,
   len: u64,
 ) -> bool {
   let mut cleared = true;
   let mut index = 0;
+  let layout = backed.session.layout();
   while index < backed.windows.len() {
     match backed.windows.get(index).copied() {
       Some(window) if window.overlaps(moffset, len) => {
-        if unmap_backed(placer, &mut backed.counts, &window) {
+        if unmap_backed(placer, &mut backed.counts, &window, layout) {
           backed.windows.swap_remove(index);
         } else {
           cleared = false;

@@ -8,7 +8,7 @@
 
 use std::os::fd::{AsFd, OwnedFd};
 
-use slates_mem::{DAX_OBJECT_BYTES, DAX_RANGE_BYTES, DaxObject, MemError};
+use slates_mem::{DAX_OBJECT_BYTES, DAX_RANGE_BYTES, DaxLayout, DaxObject, MemError};
 
 /// Shape: the most views the tests' objects allow at once.
 const VIEWS: usize = 4;
@@ -92,7 +92,7 @@ fn last_range() -> u64 {
 #[test]
 #[cfg_attr(miri, ignore)] // a shared memory object is not modelled by Miri, as at `shared_region.rs`
 fn an_object_is_the_largest_file_a_guest_can_have_and_its_last_range_maps() {
-  let mut object = DaxObject::create(VIEWS).unwrap();
+  let mut object = DaxObject::create(VIEWS, DaxLayout::Identity).unwrap();
   let size = rustix::fs::fstat(object.descriptor()).unwrap().st_size;
   assert_eq!(u64::try_from(size).unwrap(), DAX_OBJECT_BYTES);
   assert_eq!(DAX_OBJECT_BYTES, (1u64 << 63) - (2 << 20));
@@ -115,7 +115,7 @@ fn an_object_is_the_largest_file_a_guest_can_have_and_its_last_range_maps() {
 #[test]
 #[cfg_attr(miri, ignore)] // a shared memory object is not modelled by Miri, as at `shared_region.rs`
 fn the_peer_and_slates_see_each_others_stores() {
-  let mut object = DaxObject::create(VIEWS).unwrap();
+  let mut object = DaxObject::create(VIEWS, DaxLayout::Identity).unwrap();
   let peer = PeerRange::map(&object, 3);
   let from_peer: Vec<u8> = (0u8..=200).collect();
   peer.store(5, &from_peer);
@@ -139,7 +139,7 @@ fn the_peer_and_slates_see_each_others_stores() {
 #[test]
 #[cfg_attr(miri, ignore)] // a shared memory object is not modelled by Miri, as at `shared_region.rs`
 fn a_copy_crossing_ranges_is_whole() {
-  let mut object = DaxObject::create(VIEWS).unwrap();
+  let mut object = DaxObject::create(VIEWS, DaxLayout::Identity).unwrap();
   let run: Vec<u8> = (0..4096u32).map(|n| (n % 251) as u8).collect();
   let at = DAX_RANGE_BYTES - 1000;
   object.store(at, &run).unwrap();
@@ -155,7 +155,7 @@ fn a_copy_crossing_ranges_is_whole() {
 #[test]
 #[cfg_attr(miri, ignore)] // a shared memory object is not modelled by Miri, as at `shared_region.rs`
 fn the_peer_cannot_resize_the_object() {
-  let object = DaxObject::create(VIEWS).unwrap();
+  let object = DaxObject::create(VIEWS, DaxLayout::Identity).unwrap();
   let fd = rustix::io::fcntl_dupfd_cloexec(object.descriptor(), 0).unwrap();
   #[allow(clippy::disallowed_methods)] // the memory object: RAM, not a host path (R1).
   let shrink = rustix::fs::ftruncate(&fd, DAX_RANGE_BYTES);
@@ -187,7 +187,7 @@ fn the_peer_cannot_resize_the_object() {
 #[test]
 #[cfg_attr(miri, ignore)] // a shared memory object is not modelled by Miri, as at `shared_region.rs`
 fn zeroing_leaves_zeros_and_commits_nothing_for_untouched_pages() {
-  let mut object = DaxObject::create(VIEWS).unwrap();
+  let mut object = DaxObject::create(VIEWS, DaxLayout::Identity).unwrap();
   let page = rustix::param::page_size();
   let span = 3 * page + 100;
   let at = DAX_RANGE_BYTES + 50;
@@ -229,7 +229,7 @@ fn zeroing_leaves_zeros_and_commits_nothing_for_untouched_pages() {
 #[test]
 #[cfg_attr(miri, ignore)] // a shared memory object is not modelled by Miri, as at `shared_region.rs`
 fn zeroing_clears_what_the_peer_stored() {
-  let mut object = DaxObject::create(VIEWS).unwrap();
+  let mut object = DaxObject::create(VIEWS, DaxLayout::Identity).unwrap();
   let peer = PeerRange::map(&object, 1);
   peer.store(0, &[7u8; 8192]);
   let mut seen = vec![0u8; 8192];
@@ -250,7 +250,7 @@ fn zeroing_clears_what_the_peer_stored() {
 #[test]
 #[cfg_attr(miri, ignore)] // a shared memory object is not modelled by Miri, as at `shared_region.rs`
 fn views_past_the_owners_bound_are_refused_until_one_is_released() {
-  let mut object = DaxObject::create(2).unwrap();
+  let mut object = DaxObject::create(2, DaxLayout::Identity).unwrap();
   object.store(0, b"a").unwrap();
   object.store(DAX_RANGE_BYTES, b"b").unwrap();
   assert!(matches!(
@@ -272,7 +272,7 @@ fn views_past_the_owners_bound_are_refused_until_one_is_released() {
 #[test]
 #[cfg_attr(miri, ignore)] // a shared memory object is not modelled by Miri, as at `shared_region.rs`
 fn an_access_past_the_object_is_refused() {
-  let mut object = DaxObject::create(VIEWS).unwrap();
+  let mut object = DaxObject::create(VIEWS, DaxLayout::Identity).unwrap();
   assert!(matches!(
     object.store(DAX_OBJECT_BYTES - 1, b"ab"),
     Err(MemError::OutOfRange { .. })
@@ -286,4 +286,81 @@ fn an_access_past_the_object_is_refused() {
     Err(MemError::OutOfRange { .. })
   ));
   assert_eq!(object.views(), 0);
+}
+
+/// §4.6, the backed route's L1 (A-194): a guarded object holds its file in page interiors and nothing ever lands in a
+/// guard. Do: under a guard of one chunk window (16 pages), store a marked span across the end of the first page's
+/// interior and load it back; map pages 0 and 1 as the VMM does; zero the span; then store past the last byte the
+/// guarded object holds. Expect: the span loads back whole; its bytes lie at the end of page 0's interior and the start
+/// of page 1's; every guard slot of both pages reads zero, before and after the zeroing; the zeroed span reads zero; and
+/// the store past the guarded file is refused `OutOfRange`.
+#[test]
+#[cfg_attr(miri, ignore)] // a shared memory object is not modelled by Miri, as at `shared_region.rs`
+fn a_guarded_object_holds_its_file_in_page_interiors_and_its_guards_stay_zero() {
+  /// Shape: one chunk window, the arena's slot, in base pages (`slates_vfs::content::chunk_bytes`).
+  const GUARD_PAGES: u64 = 16;
+  let page = u64::try_from(rustix::param::page_size()).unwrap();
+  let guard = GUARD_PAGES * page;
+  if guard * 2 >= DAX_RANGE_BYTES {
+    eprintln!(
+      "SKIP a_guarded_object_holds_its_file_in_page_interiors_and_its_guards_stay_zero: a {page}-byte page leaves no interior"
+    );
+    return;
+  }
+  let layout = DaxLayout::Guarded { guard };
+  let interior = layout.interior();
+  let mut object = DaxObject::create(VIEWS, layout).unwrap();
+  let span = usize::try_from(page * 2).unwrap();
+  let start = interior - page;
+  let marked: Vec<u8> = (0..span)
+    .map(|at| u8::try_from(at % 251 + 1).unwrap())
+    .collect();
+  object.store(start, &marked).unwrap();
+  let mut back = vec![0u8; span];
+  object.load(start, &mut back).unwrap();
+  assert_eq!(back, marked, "the span loads back whole");
+
+  let first = PeerRange::map(&object, 0);
+  let second = PeerRange::map(&object, 1);
+  let guard_bytes = usize::try_from(guard).unwrap();
+  let range = usize::try_from(DAX_RANGE_BYTES).unwrap();
+  let half = span / 2;
+  assert_eq!(
+    first.load(range - guard_bytes - half, half),
+    marked[..half].to_vec(),
+    "page 0's interior ends with the span's first half"
+  );
+  assert_eq!(
+    second.load(guard_bytes, half),
+    marked[half..].to_vec(),
+    "page 1's interior starts with the span's second half"
+  );
+  let guards_zero = |view: &PeerRange| {
+    view.load(0, guard_bytes).iter().all(|byte| *byte == 0)
+      && view
+        .load(range - guard_bytes, guard_bytes)
+        .iter()
+        .all(|byte| *byte == 0)
+  };
+  assert!(
+    guards_zero(&first) && guards_zero(&second),
+    "the guard slots hold nothing"
+  );
+
+  object.zero(start, u64::try_from(span).unwrap()).unwrap();
+  object.load(start, &mut back).unwrap();
+  assert!(
+    back.iter().all(|byte| *byte == 0),
+    "the zeroed span reads zero"
+  );
+  assert!(
+    guards_zero(&first) && guards_zero(&second),
+    "the guard slots still hold nothing"
+  );
+
+  let past = layout.file_bytes(DAX_OBJECT_BYTES);
+  assert!(matches!(
+    object.store(past, &[1]),
+    Err(MemError::OutOfRange { .. })
+  ));
 }

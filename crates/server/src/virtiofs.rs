@@ -159,7 +159,10 @@ impl BridgeAccess for ShardBridge {
       let handle = *s.by_id.get(&volume)?;
       crate::verbs::relieve_deferred(s);
       let offer = if dax {
-        slates_bridge_core::dax_backing::offer(&s.store.shards_backings)
+        slates_bridge_core::dax_backing::offer(
+          &s.store.shards_backings,
+          slates_bridge_core::dax_backing::guarded_layout(),
+        )
       } else {
         slates_bridge_core::DaxOffer::Withheld
       };

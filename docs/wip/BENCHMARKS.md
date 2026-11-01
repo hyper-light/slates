@@ -7150,7 +7150,7 @@ the moments, not the arms, and are not read. What does compare: the least write 
 client's stale copy back over another path's write in every such case, silently, and through Apple's client it lost the
 other path's write in 9 runs of 9.
 
-## What placing a guest's DAX range in one huge page costs (A-193; 2026-10-31)
+## What placing a guest's DAX range in huge pages costs, before and with guard rows (A-193, A-194; 2026-10-31, 2026-11-01)
 
 **The question.** Each range of a backing a guest maps is placed in one huge page as its fill finishes (§4.6, the
 backed route's L1). This records what that costs: the memory a placed range holds against what the fill budget counts,
@@ -7208,6 +7208,31 @@ The longest fill step of each range's fill, the step that finishes the range and
   host at load 90. That is why a decline likely to hold is remembered until the daemon's reap tick (A-193): the shard
   pays it once a tick, not once a range.
 - The `shmem_enabled` `[never]` runners show that the placement needs no host setting: `MADV_COLLAPSE` ignores it.
+
+**With guard rows (A-194, 2026-11-01).** slates' own device now lays its backings out guarded: the first and last
+64 KiB of every 2 MiB page held empty and each window mapped as two pieces from interiors, so a range alone lies in two
+pages. The same commands, on adacachy (Linux 7.2.9, at load 90 to 218 from other sessions) and on CI's runners
+(diagnostics run 41277950761, same images and kernel as above):
+
+| run | ranges | pages placed | refused | object bytes | counted bytes | budget |
+|---|---|---|---|---|---|---|
+| session test, adacachy and both CI runners | 2 (a range alone each) | 4 | 0 | 8,388,608 | 8,388,608 | 16,777,216 |
+| device, read-only window, adacachy and both CI runners | 1 | 2 | 0 | 4,194,304 | 10,485,760 for both files | 16,777,216 |
+| device, writable windows over two neighbouring ranges, the same | 2 | 3 | 0 | 6,291,456 | (as above) | 16,777,216 |
+| device, a hostile guest's 17 maps over 2 ranges, the same | 2 | 4 | 0 | not read | not read | 16,777,216 |
+
+| machine | the fill's longest step, range 0 | range 2 |
+|---|---|---|
+| CI x86_64 | 563 µs | 579 µs |
+| CI arm64 | 467 µs | 387 µs |
+| adacachy | 349 µs | 264 µs |
+
+- **A range alone costs two pages, 4 MiB, and neighbours share the page between them**: one range held 4,194,304 bytes
+  and two neighbours 6,291,456, not 8,388,608. Fifteen in a row take sixteen pages (`DaxLayout::pages_holding`, its
+  test). Every object held exactly its pages, which the budget counts, so the guard adds memory the budget already
+  answers for.
+- **The placing step now places two pages**, and took 264 to 579 µs, one sample each in debug builds. Not separated from
+  the step's other work, as above.
 
 ## Every platform's mount, like for like, quiet and under load (T-4.8; condition 12; 2026-11-01)
 

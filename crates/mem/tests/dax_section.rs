@@ -18,7 +18,7 @@
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use slates_mem::{DAX_RANGE_BYTES, DaxObject, dax_object_bytes};
+use slates_mem::{DAX_RANGE_BYTES, DaxLayout, DaxObject, dax_object_bytes};
 use windows_sys::Win32::Foundation::{
   CloseHandle, DuplicateHandle, ERROR_ACCESS_DENIED, GetLastError, HANDLE,
 };
@@ -129,7 +129,7 @@ fn the_vmm_and_slates_see_each_others_stores(
 #[test]
 fn a_dax_section_is_sized_from_the_machine_and_both_sides_see_each_others_stores() {
   let started = std::time::Instant::now();
-  let mut object = DaxObject::create(MOST_VIEWS).unwrap();
+  let mut object = DaxObject::create(MOST_VIEWS, DaxLayout::Identity).unwrap();
   let made = started.elapsed();
   let bytes = dax_object_bytes();
   println!(
@@ -170,7 +170,7 @@ fn a_dax_section_is_sized_from_the_machine_and_both_sides_see_each_others_stores
 /// own refusal, while a duplicate of no more access is granted.
 #[test]
 fn a_handed_dax_section_cannot_be_widened() {
-  let mut object = DaxObject::create(MOST_VIEWS).unwrap();
+  let mut object = DaxObject::create(MOST_VIEWS, DaxLayout::Identity).unwrap();
   object.prepare_range(0).unwrap();
   let read_only = object.handed(false).unwrap();
   let writable = object.handed(true).unwrap();
