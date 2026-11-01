@@ -258,6 +258,30 @@ impl BridgeAccess for ShardBridge {
   fn count(&mut self, name: &'static str, by: u64) {
     let _counted = state::with_state(|s| s.count(name, by));
   }
+
+  /// The owner shard's wait on the volume's FUSE mounts (`crate::told`, A-196).
+  type Told = crate::told::Parked;
+
+  /// Asked of the owner shard's FUSE mounts of the volume (`crate::told`). Out of reach, the owner's state is gone with
+  /// its mounts, and nothing is owed.
+  fn told_through(&mut self, seq: u64) -> bool {
+    let volume = self.volume;
+    state::with_state(|s| crate::told::told_through(s, volume, seq)).unwrap_or(true)
+  }
+
+  fn told(&mut self, seq: u64) -> crate::told::Parked {
+    crate::told::parked(self.volume, seq)
+  }
+
+  /// Every writer's bound (`crate::told::TOLD_WAIT_NS`, A-191).
+  fn told_bound_ns(&mut self) -> u64 {
+    crate::told::TOLD_WAIT_NS
+  }
+
+  /// On the writers' ledger (`fuse.told_waits`, `fuse.told_overdue`).
+  fn told_settled(&mut self, waited: u64, overdue: u64) {
+    let _counted = state::with_state(|s| crate::told::count_settled(s, waited, overdue));
+  }
 }
 
 /// Format: the refusal-ledger name of a refused device's terminal step whose sweep could not run.

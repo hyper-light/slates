@@ -14,8 +14,11 @@ mod common;
 
 use std::cell::{Cell, RefCell};
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::channel;
-use std::time::Duration;
+use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant};
 
 use common::{SimDriver, SimVmm, message, reply_error, store, vid, volume};
 use slates_bridge_core::{Attachments, Bridge, Rights, VolumeBridge};
@@ -28,7 +31,7 @@ use slates_bridge_virtiofs::credit::AttachmentCredits;
 use slates_bridge_virtiofs::device::{DeviceConfig, FIRST_REQUEST_QUEUE, FsTag};
 use slates_bridge_virtiofs::memory::{GuestMemory, GuestMemoryError, GuestRange};
 use slates_bridge_virtiofs::serve::{
-  BridgeAccess, DeviceId, EndReason, ServeEnd, register, request_revoke, serve_loop,
+  BridgeAccess, DeviceId, EndReason, ServeEnd, TOLD_ABANDONED, register, request_revoke, serve_loop,
 };
 use slates_bridge_virtiofs::virtqueue::QueueLayout;
 use slates_db::catalog::Principal;
@@ -75,6 +78,22 @@ const FENCE_WAIT_NS: u64 = 1_000_000;
 const HELD_INTERVALS: u64 = 5;
 /// Shape: the bytes a DAX backing's fill, ingest or refill slice copies here: one 4 KiB page, the smallest whole slice.
 const COPY_SLICE: u64 = 4096;
+/// Shape: the bound the test owner names for a reply's wait on the volume's FUSE mounts (AC-3.3): long enough that a read
+/// the guest sends after a write is served well within it, short enough to keep the tests quick.
+const TOLD_BOUND_NS: u64 = 200_000_000;
+/// Shape: the bytes the told tests' guest writes and reads back: a reply that fits [`REPLY_CAP`].
+const TOLD_BYTES: usize = 64;
+/// Format: the byte the told tests' file holds first, and the byte the guest writes over it.
+const FIRST: u8 = 0x11;
+const WRITTEN: u8 = 0x5A;
+/// Format: `fuse_write_in` and `fuse_read_in` (`include/uapi/linux/fuse.h`): `fh` (8), `offset` (8), `size` (4), the
+/// flags and lock owner after them, 40 bytes each, before a write's data.
+const IO_IN_BYTES: usize = 40;
+/// Format: the bytes of a `fuse_write_out`: the size written (4) and padding (4).
+const WRITE_OUT_BYTES: usize = 8;
+
+/// The waits on the stand-in FUSE mount alive now, for the tests that do not count them.
+static TOLD_LIVE_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
   /// Whether the test owner is fenced (AUD-29-83): its lease does not hold, so it may not serve latest
@@ -86,6 +105,54 @@ thread_local! {
   /// The guest, shared by the device task and the guest task on the one shard — the in-process
   /// VMM's shape: one address space, two parties, never concurrent.
   static GUEST: RefCell<Option<SimDriver>> = const { RefCell::new(None) };
+  /// The stand-in FUSE mount's told point (AC-3.3): every journal record through it has been told. `u64::MAX`, the
+  /// default, tells every change at once, as a volume with no FUSE mount does.
+  static TOLD_THROUGH: Cell<u64> = const { Cell::new(u64::MAX) };
+  /// The waits parked on the stand-in mount, woken as its told point moves.
+  static TOLD_WAKERS: RefCell<Vec<Waker>> = const { RefCell::new(Vec::new()) };
+  /// What the loop counted on the stand-in mount: replies that waited for it, and replies published at the bound.
+  static TOLD_COUNTED: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+  /// The replies the loop counted as still held for the stand-in mount when it ended ([`TOLD_ABANDONED`]).
+  static ABANDONED: Cell<u64> = const { Cell::new(0) };
+  /// When the guest of the guest-kill test hung up, for the loop's task to measure its end from.
+  static HUNG_UP: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// The stand-in FUSE mount's wait for its told point to reach a journal record, counted alive in `live` until it is
+/// dropped, so a test can hold that no wait outlives the loop that made it.
+struct StandInTold {
+  seq: u64,
+  live: &'static AtomicU64,
+}
+
+impl StandInTold {
+  fn new(seq: u64, live: &'static AtomicU64) -> StandInTold {
+    live.fetch_add(1, Ordering::Relaxed);
+    StandInTold { seq, live }
+  }
+}
+
+impl std::future::Future for StandInTold {
+  type Output = ();
+
+  fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+    if TOLD_THROUGH.with(Cell::get) >= self.seq {
+      return Poll::Ready(());
+    }
+    TOLD_WAKERS.with(|wakers| {
+      let mut wakers = wakers.borrow_mut();
+      if !wakers.iter().any(|waker| waker.will_wake(cx.waker())) {
+        wakers.push(cx.waker().clone());
+      }
+    });
+    Poll::Pending
+  }
+}
+
+impl Drop for StandInTold {
+  fn drop(&mut self) {
+    self.live.fetch_sub(1, Ordering::Relaxed);
+  }
 }
 
 /// The guest memory as the seam lends it: every access borrows the shared guest briefly.
@@ -198,6 +265,8 @@ struct OwnedVolume {
   registry: Attachments,
   /// The barriers the loop ran (AUD-29-82); each captures (the test owner has nothing to refuse with).
   barriers: u64,
+  /// Where the stand-in FUSE mount's waits are counted alive.
+  told_live: &'static AtomicU64,
 }
 
 impl OwnedVolume {
@@ -209,7 +278,27 @@ impl OwnedVolume {
       volume,
       registry: Attachments::new(),
       barriers: 0,
+      told_live: &TOLD_LIVE_ELSEWHERE,
     }
+  }
+
+  /// A volume holding file `f` of [`TOLD_BYTES`] bytes of [`FIRST`], its stand-in mount's waits counted in `live`: with
+  /// the file's node and the journal head after it was made.
+  fn with_file(live: &'static AtomicU64) -> (OwnedVolume, u64, u64) {
+    let mut owned = OwnedVolume::fresh();
+    owned.told_live = live;
+    let root = owned.volume.root_inode(&owned.store).unwrap();
+    let node = owned
+      .volume
+      .create_file_no(&mut owned.store, root, "f", 0o644)
+      .unwrap();
+    owned
+      .volume
+      .write(&mut owned.store, node, 0, &[FIRST; TOLD_BYTES])
+      .unwrap();
+    owned.volume.mark_published(&owned.store);
+    let head = owned.volume.op_log().head_seq();
+    (owned, node.0, head)
   }
 }
 
@@ -249,9 +338,34 @@ impl BridgeAccess for OwnedVolume {
     true
   }
 
-  /// These loops serve no backed DAX, so nothing is counted; the daemon's status test holds the counts by use
-  /// (`crates/server/tests/virtiofs.rs`).
-  fn count(&mut self, _name: &'static str, _by: u64) {}
+  /// Keeps the replies abandoned with the loop (A-196). These loops serve no backed DAX, whose counts the daemon's status
+  /// test holds by use (`crates/server/tests/virtiofs.rs`).
+  fn count(&mut self, name: &'static str, by: u64) {
+    if name == TOLD_ABANDONED {
+      ABANDONED.with(|abandoned| abandoned.set(abandoned.get() + by));
+    }
+  }
+
+  type Told = StandInTold;
+
+  fn told_through(&mut self, seq: u64) -> bool {
+    TOLD_THROUGH.with(Cell::get) >= seq
+  }
+
+  fn told(&mut self, seq: u64) -> StandInTold {
+    StandInTold::new(seq, self.told_live)
+  }
+
+  fn told_bound_ns(&mut self) -> u64 {
+    TOLD_BOUND_NS
+  }
+
+  fn told_settled(&mut self, waited: u64, overdue: u64) {
+    TOLD_COUNTED.with(|counted| {
+      let (before_waited, before_overdue) = counted.get();
+      counted.set((before_waited + waited, before_overdue + overdue));
+    });
+  }
 }
 
 fn credits() -> AttachmentCredits {
@@ -672,4 +786,308 @@ fn a_revoke_requested_mid_service_ends_the_loop_at_the_next_pass() {
   assert_eq!(answered, 8, "the first pass's requests, and no more");
   assert!(end.reclaimed.is_ok());
   rt.shutdown().unwrap();
+}
+
+/// A `FUSE_WRITE` of [`TOLD_BYTES`] bytes of [`WRITTEN`] at the start of node `node`.
+fn write_request(unique: u64, node: u64) -> Vec<u8> {
+  let mut body = Vec::new();
+  body.extend_from_slice(&0u64.to_le_bytes());
+  body.extend_from_slice(&0u64.to_le_bytes());
+  body.extend_from_slice(&u32::try_from(TOLD_BYTES).unwrap().to_le_bytes());
+  body.resize(IO_IN_BYTES, 0);
+  body.extend_from_slice(&[WRITTEN; TOLD_BYTES]);
+  message(Opcode::Write.to_wire(), unique, node, &body)
+}
+
+/// A `FUSE_READ` of [`TOLD_BYTES`] bytes at the start of node `node`.
+fn read_request(unique: u64, node: u64) -> Vec<u8> {
+  let mut body = Vec::new();
+  body.extend_from_slice(&0u64.to_le_bytes());
+  body.extend_from_slice(&0u64.to_le_bytes());
+  body.extend_from_slice(&u32::try_from(TOLD_BYTES).unwrap().to_le_bytes());
+  body.resize(IO_IN_BYTES, 0);
+  message(Opcode::Read.to_wire(), unique, node, &body)
+}
+
+/// Waits for the device's next used-buffer notification.
+async fn notified(call_read: &OwnedFd) {
+  loop {
+    readable(call_read.as_raw_fd()).await.unwrap();
+    if drain(call_read).unwrap() == Drained::Kicked {
+      break;
+    }
+  }
+}
+
+/// What the guest saw of a write to `f` and a read of it sent after: the write's chain head, and the read's used
+/// element (its head, its errno and its data) and how long after the write was sent it was published.
+struct ReadAfterWrite {
+  write: u16,
+  read: (u16, i32, Vec<u8>),
+  read_after: Duration,
+  sent: Instant,
+}
+
+/// The guest writes node `node`, lets the loop serve it, then reads it back, and takes the first used element the
+/// device publishes after that.
+async fn read_after_write(node: u64, kick: &OwnedFd, call: &OwnedFd) -> ReadAfterWrite {
+  let rq = usize::from(FIRST_REQUEST_QUEUE);
+  let sent = Instant::now();
+  let write = with_guest(|g| g.submit(rq, &write_request(1, node), REPLY_CAP, 1));
+  rustix::io::write(kick, &[1u8]).unwrap();
+  // The loop runs on this shard, so it serves the write once this task yields to it.
+  let _ = futures::yield_now().await;
+  let read = with_guest(|g| g.submit(rq, &read_request(2, node), REPLY_CAP, 1));
+  rustix::io::write(kick, &[1u8]).unwrap();
+  notified(call).await;
+  let (head, len) = with_guest(|g| g.reap(rq)).expect("a used element after the notification");
+  let reply = with_guest(|g| g.reply_of(rq, head, len));
+  assert_eq!(
+    head, read,
+    "the read's element is published first, while the write's waits"
+  );
+  ReadAfterWrite {
+    write,
+    read: (
+      head,
+      reply_error(&reply),
+      reply.get(OUT_HEADER..).unwrap_or(&[]).to_vec(),
+    ),
+    read_after: sent.elapsed(),
+    sent,
+  }
+}
+
+/// Format: the bytes of a `fuse_out_header`.
+const OUT_HEADER: usize = 16;
+
+/// AC-3.3 for a guest writer, with a FUSE mount whose round is held (A-196). Do: over a volume holding file `f`, whose
+/// one FUSE mount (a stand-in) has been told through every record so far and is told nothing more, the guest writes
+/// `f` and then reads it back; then it hangs up. Expect: the read's used element is published first, its data the
+/// written bytes, while the write's waits; the write's is published only once the bound has passed since it was sent,
+/// counted overdue and never held beyond; the loop's wait on the mount is gone once the reply is out; the terminal step
+/// restores every credit.
+#[test]
+fn a_guests_write_waits_for_a_held_fuse_mount_to_the_bound_while_a_later_read_completes() {
+  static LIVE: AtomicU64 = AtomicU64::new(0);
+  let rt = Runtime::start(&config()).unwrap();
+  let shard = rt.shard_ids()[0];
+  let (end_tx, end_rx) = channel::<(ServeEnd, u64)>();
+  let (guest_tx, guest_rx) = channel::<(
+    ReadAfterWrite,
+    Duration,
+    (i32, Option<u32>),
+    (u64, u64),
+    u64,
+  )>();
+  rt.spawn_on(shard, async move {
+    let (mut owned, node, head) = OwnedVolume::with_file(&LIVE);
+    // The stand-in mount was told through every record so far, and its round for the guest's write is held.
+    TOLD_THROUGH.with(|told| told.set(head));
+    let (admitted, kick_write, call_read) = admitted_over_pipes(&mut owned.registry);
+    let id = register(DEVICE_BOUND).unwrap();
+    let device_task = futures::spawn(async move {
+      let end = serve_loop(id, admitted, owned).await;
+      let _ = end_tx.send((end, ABANDONED.with(Cell::get)));
+    })
+    .unwrap();
+    let _ = futures::detach(device_task);
+    let guest_task = futures::spawn(async move {
+      let seen = read_after_write(node, &kick_write, &call_read).await;
+      notified(&call_read).await;
+      let rq = usize::from(FIRST_REQUEST_QUEUE);
+      let (head, len) = with_guest(|g| g.reap(rq)).expect("the write's element, at the bound");
+      assert_eq!(
+        head, seen.write,
+        "the second element published is the write's"
+      );
+      let write_after = seen.sent.elapsed();
+      let reply = with_guest(|g| g.reply_of(rq, head, len));
+      let wrote = reply
+        .get(OUT_HEADER..OUT_HEADER + WRITE_OUT_BYTES)
+        .and_then(|out| out.get(..4))
+        .and_then(|size| size.try_into().ok())
+        .map(u32::from_le_bytes);
+      let live = LIVE.load(Ordering::Relaxed);
+      drop(kick_write);
+      let answer = (reply_error(&reply), wrote);
+      let _ = guest_tx.send((
+        seen,
+        write_after,
+        answer,
+        TOLD_COUNTED.with(Cell::get),
+        live,
+      ));
+    })
+    .unwrap();
+    let _ = futures::detach(guest_task);
+  })
+  .unwrap();
+
+  let (seen, write_after, (errno, wrote), counted, live) =
+    guest_rx.recv_timeout(WAIT).expect("the guest finished");
+  println!(
+    "the read was published {:?} after the write was sent, the write {write_after:?}",
+    seen.read_after
+  );
+  assert_eq!(
+    (seen.read.1, seen.read.2.as_slice()),
+    (0, &[WRITTEN; TOLD_BYTES][..]),
+    "the read succeeded and saw the write, applied before its reply"
+  );
+  assert!(
+    write_after >= Duration::from_nanos(TOLD_BOUND_NS),
+    "the write's reply waited the bound: {write_after:?}"
+  );
+  assert_eq!(errno, 0, "the write succeeded");
+  assert_eq!(
+    wrote,
+    u32::try_from(TOLD_BYTES).ok(),
+    "the write's reply reports every byte written"
+  );
+  assert_eq!(counted, (0, 1), "counted overdue, not waited");
+  assert_eq!(
+    live, 0,
+    "the loop's wait on the mount is gone once the reply is out"
+  );
+  let (end, abandoned) = end_rx.recv_timeout(WAIT).expect("the loop ended");
+  assert_eq!(end.why, EndReason::DoorbellHungUp);
+  assert_eq!(
+    abandoned, 0,
+    "no reply was still held at the end: the write's went out at the bound"
+  );
+  let reclaimed = end.reclaimed.expect("the terminal step ran");
+  assert_eq!(reclaimed.credits_restored, (8, 1 << 20));
+  rt.shutdown().unwrap();
+}
+
+/// AC-3.3, chaos (A-196): the guest killed while its write's reply waits for a FUSE mount whose round is held. Do: the
+/// guest writes `f` and reads it back, served at once, then hangs up while the write's reply still waits. Expect: the
+/// loop ends on the hangup at once, not at the bound; its wait on the mount is gone; the terminal step restores every
+/// credit; and the write's element was never published while the read showed its bytes: applied, never half.
+#[test]
+fn a_guest_killed_while_its_writes_reply_waits_ends_the_loop_and_leaks_nothing() {
+  static LIVE: AtomicU64 = AtomicU64::new(0);
+  let rt = Runtime::start(&config()).unwrap();
+  let shard = rt.shard_ids()[0];
+  let (end_tx, end_rx) = channel::<(ServeEnd, bool, Duration, u64)>();
+  let (guest_tx, guest_rx) = channel::<(ReadAfterWrite, Instant)>();
+  rt.spawn_on(shard, async move {
+    let (mut owned, node, head) = OwnedVolume::with_file(&LIVE);
+    TOLD_THROUGH.with(|told| told.set(head));
+    let (admitted, kick_write, call_read) = admitted_over_pipes(&mut owned.registry);
+    let id = register(DEVICE_BOUND).unwrap();
+    let device_task = futures::spawn(async move {
+      let end = serve_loop(id, admitted, owned).await;
+      let never_published = with_guest(|g| g.reap(usize::from(FIRST_REQUEST_QUEUE))).is_none();
+      let after = HUNG_UP
+        .with(Cell::get)
+        .map_or(Duration::MAX, |at| at.elapsed());
+      let _ = end_tx.send((end, never_published, after, ABANDONED.with(Cell::get)));
+    })
+    .unwrap();
+    let _ = futures::detach(device_task);
+    let guest_task = futures::spawn(async move {
+      let seen = read_after_write(node, &kick_write, &call_read).await;
+      let at = Instant::now();
+      HUNG_UP.with(|hung_up| hung_up.set(Some(at)));
+      drop(kick_write);
+      let _ = guest_tx.send((seen, at));
+    })
+    .unwrap();
+    let _ = futures::detach(guest_task);
+  })
+  .unwrap();
+
+  let (seen, _at) = guest_rx
+    .recv_timeout(WAIT)
+    .expect("the guest wrote, read and hung up");
+  assert_eq!(
+    seen.read.2.as_slice(),
+    &[WRITTEN; TOLD_BYTES][..],
+    "the read saw the write: it was applied"
+  );
+  let (end, never_published, after, abandoned) = end_rx.recv_timeout(WAIT).expect("the loop ended");
+  assert_eq!(end.why, EndReason::DoorbellHungUp);
+  assert_eq!(
+    abandoned, 1,
+    "the loop counted the write's reply abandoned with it"
+  );
+  assert!(
+    after < Duration::from_nanos(TOLD_BOUND_NS),
+    "the loop ended on the hangup, not at the bound: {after:?}"
+  );
+  assert!(
+    never_published,
+    "the held write's element was never published"
+  );
+  assert_eq!(
+    LIVE.load(Ordering::Relaxed),
+    0,
+    "no wait on the mount outlives the loop"
+  );
+  let reclaimed = end.reclaimed.expect("the terminal step ran");
+  assert_eq!(
+    reclaimed.credits_restored,
+    (8, 1 << 20),
+    "every credit restored, the held chain's too"
+  );
+  rt.shutdown().unwrap();
+}
+
+/// AC-3.3, chaos (A-196): the daemon killed while a guest write's reply waits. Do: as above, but the runtime that runs
+/// the loop shuts down while the write's reply waits, as a killed daemon's goes. Expect: the loop's wait on the mount
+/// goes with it (none alive afterwards), the loop never reports an end of its own, and the write was applied (the read
+/// showed it) while its element was never published.
+#[test]
+fn a_daemon_stopped_while_a_guest_writes_reply_waits_leaves_no_wait_behind() {
+  static LIVE: AtomicU64 = AtomicU64::new(0);
+  let rt = Runtime::start(&config()).unwrap();
+  let shard = rt.shard_ids()[0];
+  let (end_tx, end_rx) = channel::<ServeEnd>();
+  let (guest_tx, guest_rx) = channel::<(ReadAfterWrite, u64)>();
+  rt.spawn_on(shard, async move {
+    let (mut owned, node, head) = OwnedVolume::with_file(&LIVE);
+    TOLD_THROUGH.with(|told| told.set(head));
+    let (admitted, kick_write, call_read) = admitted_over_pipes(&mut owned.registry);
+    let id = register(DEVICE_BOUND).unwrap();
+    let device_task = futures::spawn(async move {
+      let end = serve_loop(id, admitted, owned).await;
+      let _ = end_tx.send(end);
+    })
+    .unwrap();
+    let _ = futures::detach(device_task);
+    let guest_task = futures::spawn(async move {
+      let seen = read_after_write(node, &kick_write, &call_read).await;
+      // The loop is waiting on the held write's mount now: its wait is alive.
+      let live = LIVE.load(Ordering::Relaxed);
+      let _ = guest_tx.send((seen, live));
+      // Keep the guest alive across the stop: only the daemon goes.
+      let _kept = kick_write;
+      let _ = futures::idle().await;
+    })
+    .unwrap();
+    let _ = futures::detach(guest_task);
+  })
+  .unwrap();
+
+  let (seen, live_before) = guest_rx
+    .recv_timeout(WAIT)
+    .expect("the guest wrote and read");
+  assert_eq!(
+    seen.read.2.as_slice(),
+    &[WRITTEN; TOLD_BYTES][..],
+    "the write was applied"
+  );
+  assert_eq!(live_before, 1, "the loop waits on the held write's mount");
+  rt.shutdown().unwrap();
+  assert_eq!(
+    LIVE.load(Ordering::Relaxed),
+    0,
+    "the stop dropped the loop's wait with it"
+  );
+  assert!(
+    end_rx.recv_timeout(Duration::from_millis(1)).is_err(),
+    "the loop never ended on its own: the stop took it"
+  );
 }

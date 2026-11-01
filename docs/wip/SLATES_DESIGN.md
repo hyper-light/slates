@@ -2351,10 +2351,12 @@ the mount happened to get a request — indefinitely for a shared map or DAX thr
 `docs/bugs/2026-10-21-a-fuse-mount-hears-of-another-paths-change-only-on-its-next-request.md`). "At once" was measured
 *after* the writer's reply: a shared map read the new bytes 52–193 µs after it, median 82 µs. **Since A-191 a writer
 outside FUSE is answered only once every FUSE mount of its volume has been told** — a verb over the typed channel (the
-SDKs, the CLI, MCP, the merge plane's verbs), an NFS call, a direct map's write-back. Each mount's told point is its
-coherence cursor, held back while a round is out (`ServeState::told_through`); the writer's reply waits on the volume's
-owner shard without blocking it, at most half the liveness budget, past which it is answered and the late mount
-counted. A write through a FUSE mount is still answered first, since requests on two mounts, each waiting for the
+SDKs, the CLI, MCP, the merge plane's verbs), an NFS call, a direct map's write-back — **and since A-196 so is a guest's
+write through slates' own virtio-fs device or a Shards stream**: the device holds the write's reply and serves the
+guest's later requests meanwhile, completing the held reply out of order, which virtio permits (virtio 1.2 §2.6), and a
+Shards stream, whose VMM sends one request at a time, holds its reply frame. Each mount's told point is its coherence
+cursor, held back while a round is out (`ServeState::told_through`); the writer's reply waits on the volume's owner shard
+without blocking it, at most half the liveness budget, past which it is answered and the late mount counted. A write through a FUSE mount is still answered first, since requests on two mounts, each waiting for the
 other mount's notification, could deadlock; AC-3.3 states that window. **What the kernel is told to
 drop is what changed** (A-146). A content change drops the cached pages holding the bytes it touched, never the whole
 file:
@@ -7549,7 +7551,8 @@ fd handoff through the anchor, `slates exec`, the conformance and workload harne
   the old bytes, measured at a median of 21–35 µs in seven runs and 1.7 ms in an eighth taken at a
   busier moment, at worst 40 ms (Linux 6.19, release builds, 2026-10-30,
   `crates/server/tests/fuse_told.rs`). A guest's write through slates' own virtio-fs device or a
-  Shards stream does not wait yet (GAPS) (catches: coherence bugs).
+  Shards stream waits the same way, the device serving the guest's later requests meanwhile
+  (A-196) (catches: coherence bugs).
 - AC-3.4 Daemon restart with the fd handoff leaves open files usable after the window; the
   window is measured and within the recovery budget (catches: lost mounts).
 - AC-3.5 The launcher creates no filesystem entries; `slates exec` refuses unsatisfiable chosen
@@ -12752,6 +12755,111 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
 
+### A-196 — A guest's write through slates' own device or a Shards stream is answered once every FUSE mount of its volume has been told, and the device serves on while the reply waits (accepted and built 2026-11-01)
+Applied in the same change to: §4.6 ("Cache posture": the paragraph on when a mount is told), Phase 3's AC-3.3, A-191
+("What it does not change"), GAPS (the AC-3.3 entry's owed guests), `crates/bridge-virtiofs` (`device.rs`: the told hold
+— `hold_replies_for_told`, `hold_or_publish`, `settle_told`, `told_oldest`, a pass's `Serviced::published`, and the
+module's note on `FUSE_INTERRUPT`; `admission.rs`: the same through the admitted device, and a pass notifying a queue
+only for the replies it published; `backed.rs`: a held request's journal mark and a held reply's owed record;
+`serve.rs`: `BridgeAccess`'s told wait, the loop's race of its doorbell, a request and the oldest held reply's wait or
+bound, `TOLD_ABANDONED`), `crates/server` (`told.rs`: `told_through`, `parked`, `count_settled`; `virtiofs.rs`: the
+bridge's told wait on the owner shard; `shards.rs`: a stream's reply flushed only once its record was told), the tests
+(`crates/bridge-virtiofs/tests/serve.rs` and `tests/admission.rs`; `crates/server/tests/shards.rs`, with
+`tests/common/fuse_map.rs`, new, the map reader A-191's test had kept to itself; `crates/cli/tests/guest_vhost.rs` and
+`tests/vm/mod.rs`), and CLAUDE.md.
+- **What was open.** A-191 holds the reply of every writer outside FUSE that holds no kernel lock until every FUSE mount
+  of its volume has been told. A guest's write through slates' own virtio-fs device (in-process or `slates vhost-user`)
+  or a Shards stream was still answered as soon as it was applied (GAPS, the AC-3.3 entry), so a host process reading the
+  file through a FUSE mount right after the guest's write returned could see the old bytes. The device's loop answered
+  its requests in order, so holding one reply would have stalled every request behind it.
+- **The rule for slates' own device.** Before the device serves a request it notes its volume's journal head
+  (`Bridge::seen`, the journal `told::mark` notes). A request whose serving made a newer record owes every FUSE mount of
+  the volume that record. The device keeps its reply aside, its chain and its credits with it, and goes on serving the
+  guest's later requests; the loop publishes it once every mount has been told through the record. Virtio allows this:
+  "Device is not generally required to use buffers in the same order in which they have been made available by the
+  driver" (virtio 1.2 §2.6), and the device never offers `VIRTIO_F_IN_ORDER` (§2.7.9; `OFFERED_FEATURES` is
+  `VIRTIO_F_VERSION_1` and the protocol-features bit). Only the told wait completes out of order:
+  - a request held for the ingest of the guest's DAX stores (a sync's write-back) keeps its order, and its reply, which
+    covers the records the ingest wrote, waits for the mounts after it;
+  - a reply that waits for the owner's barrier (D-18) is published only after the barrier, then waits for the mounts.
+- **How the loop settles.** After every pass, and whenever the oldest held reply's wait or its bound wakes the idle loop
+  (the loop races its doorbell, a request and that one wait), it publishes each held reply whose mounts were told, and
+  each that has waited the bound: A-191's half the liveness budget, 500 ms, counted from the first settle that saw the
+  reply. A reply past the bound is published all the same and counted `fuse.told_overdue`: never held for good. A reply
+  already told when its pass ends — always, on a volume no FUSE mount holds anything of — is published at the pass's
+  end, uncounted, so a pass's write replies go out together after it rather than one by one. A pass notifies a queue
+  only for the replies it published, and a settle for the ones it published, so the guest is never woken with nothing
+  new in its used ring.
+  - **Bounded.** The held replies are at most the sum of the device's queue sizes, each one of the guest's descriptor
+    chains; a reply past that is published at once. One wait is parked at a time, the oldest held reply's.
+  - **Switched on by the settling loop alone** (`serve_loop` calls `hold_replies_for_told`), so no other caller of the
+    device can strand a reply.
+  - **Counted** on A-191's ledger: a reply that waited, `fuse.told_waits`; one published at the bound,
+    `fuse.told_overdue` as well. A reply still held when the device ends — its guest gone, or the device revoked — goes
+    unsent with every other reply in flight at an end, its write applied, counted `virtiofs.told_abandoned`.
+  - **Interrupts.** The device still answers `FUSE_INTERRUPT` `ENOSYS`: a held reply is a request already applied,
+    which an interrupt could not undo, waiting at most the bound.
+- **The rule for a Shards stream.** Shards' VMM sends one request at a time on a stream and reads its reply before the
+  next (one lock across the frame's write and the reply's read: Shards' `crates/vmm/src/devices/virtio/fs/mod.rs`,
+  `Slot::ask`), so nothing queues behind a held reply. The stream's reply frame is flushed only once its record has been
+  told, the serve task awaiting A-191's `told::wait` as an SDK verb's held reply does. A request held for the ingest of
+  the guest's DAX stores takes its mark when it is held, so what its sync writes back is covered.
+- **Where the wait runs.** The device and the stream serve on the volume's owner shard, which serves the volume and all
+  its FUSE mounts (A-191), so the wait is a parked waker on that shard, woken as a mount is told further or ends, and
+  the shard serves on.
+- **Found on the way.** The first build notified a queue for every chain a pass served, held replies included, so a
+  pass whose only reply was held woke the guest with nothing in its used ring. The daemon's vhost-user tests, whose
+  front end reaps once per interrupt, found it on Linux (`crates/server/tests/virtiofs.rs`, "a used element after the
+  interrupt", two tests of 23); the pass now counts what it published (`Serviced::published`), and an admission test
+  holds it on every host.
+- **Proven** (adacachy: Linux 7.2.9-2-cachyos, x86_64, 32 cores, crosvm 0.1.0, `fusermount3`, 2026-11-01, load 24–36
+  unless stated):
+  - **Through a real guest** (`crates/cli/tests/guest_vhost.rs`): a guest mounting the tag with `dax=never` wrote a page
+    200 times while a host process mapped the file read-only through a `slates mount`, reading the map as memory alone
+    the moment each write returned. 0 of 200 first reads were stale on an anchor of one shard and 0 of 200 on two, in
+    each of three runs, every write's reply counted waiting and none overdue. In the two runs that printed it, a write
+    took 1.9 and 1.6 ms at the median and 40 and 68 ms at p99 on one shard, 2.4 and 2.0 ms and 43 and 56 ms on two, as
+    the test saw it, the serial console's carriage included.
+  - **In QEMU** 11.1.2 with KVM, on CI's x86_64 runner (diagnostics run 41292937267): 0 of 200 on one shard and on two,
+    every write waiting and none overdue, a write's median 4.1 and 4.9 ms; every test of `tests/guest_vhost.rs` passed,
+    8 of 8.
+  - **Red-checked**, a copy of the tree whose device holds nothing: 1 of 200 first reads stale and no write waiting
+    through crosvm (one shard, load 205), and 0 of 200 in QEMU. Few or none, because the guest's close of the file (its
+    `FLUSH` and `RELEASE`) and the console give the mount's round time before the test reads; the counted waits, 0
+    against 200, are the check that cannot miss, and failed the copy both times.
+  - **Hermetic** (`crates/bridge-virtiofs/tests/serve.rs`, a stand-in FUSE mount whose round is held; macOS and Linux):
+    the write's reply was published at 202.3 ms, past a 200 ms bound, counted overdue, while a read the guest sent after
+    it was published at 195 µs. Red-checked: the copy whose device holds nothing fails it.
+  - **A Shards stream** (`crates/server/tests/shards.rs`): 0 of 200 first reads stale, 200 waits, none overdue, on
+    adacachy and on CI's x86_64 and arm64 runners (Linux 7.0, diagnostics run 41292937267); the copy whose stream waits
+    for nothing read 196, 191 and 141 of 200 stale there.
+  - **The notification**, `a_pass_notifies_a_queue_only_for_the_replies_it_published` (`tests/admission.rs`); the copy
+    that notifies for every chain served fails it on adacachy and both CI runners, and fails three of the daemon's
+    vhost-user tests.
+  - **Chaos.** Hermetic: the guest killed while its write's reply waits ends the loop at once, not at the bound, with
+    its wait on the mount gone, every credit restored, the reply counted abandoned and the write applied; the daemon
+    stopped while the reply waits takes the wait with it. Through crosvm: 12 guests killed at 12 points across their
+    write's round trip, in each of two runs — every page held all of one write or all of the other (3 and 4 of 12 cut
+    writes applied), every device ended and let its attachment go, and the host's map came to show what the volume
+    held. None of the 24 landed inside the hold (`virtiofs.told_abandoned` 0), which lasts about a mount's delivery
+    (median 82 µs, A-191) of a round of 2–35 ms. In QEMU one of 12 did: its reply was counted abandoned, its write was
+    applied, and the map showed it 256 µs later (4 of 12 cut writes applied). The hermetic test is what holds that case
+    every time. And 6 daemons killed under a guest's write, in each of two crosvm runs and one QEMU run, and taken over
+    by the anchor's successor: every page whole (1, 1 and 2 of 6 applied), the host's map through the mount the
+    successor took over showing the successor's page within 2.7–5.2 ms through crosvm (its first run's figures) and
+    276–396 µs in QEMU, and the next guest's writes told before they returned.
+  - Every test of `tests/guest_vhost.rs` passed through crosvm and QEMU (8 of 8), the DAX tests included with the hold
+    on; the virtio-fs suites, the server's virtiofs (23 of 23), shards, fuse_told and recovery suites and the client's
+    shards suite on adacachy and both CI runners, where A-191's SDK and NFS cases still read 0 of 200 stale; Linux
+    clippy `-D warnings` for `slates-bridge-virtiofs`, `slates-server`, `slates-client` and `slates-cli`, every target;
+    the Linux doc gate.
+- **Cost.** Not measured apart. A held reply waits for the mount's notify thread as an SDK write does (A-191: p50 about
+  +12 µs with a mount, nothing without), and a guest's round through the console is milliseconds, so the test's round
+  times cannot show it. Owed (GAPS).
+- **What it does not change.** A write through a FUSE mount (A-191's window). A retry of a held request is answered from
+  its completion record at once. A guest's DAX stores reach the volume at its sync points, as before (A-168); the sync's
+  reply now waits for the mounts like a write's.
+
 ### A-195 — One window kind: the fd-sharing placer maps per-file backings as the message placer does, and every path that mapped the arena's blocks into a guest is removed (accepted and built 2026-11-01)
 Applied in the same change to: §4.6 (the DAX rule restated for backings; a status for the one window kind; the DAX
 gate's, the device-seam wiring's and the 2026-10-16 binding's records, and the open-frontier decision with its
@@ -13093,7 +13201,8 @@ an NFS call awaits its own; `direct_map.rs`: a write-back's reply; `lease_wait.r
   - Linux clippy `-D warnings` clean for `slates-bridge-fuse` and `slates-server`, every target.
 - **Cost** (`docs/wip/BENCHMARKS.md`): an SDK write to a volume a FUSE mount reads now waits for the mount's notify thread: with the mount, its p50 rose from about 28 µs to about 40 µs and its p90 from about 35 µs to about 53 µs; with no mount it is unchanged, about 13 µs (fedora-2, `write_round_ab`, release builds differing only in the wait, interleaved three times, load 19–20).
 - **What it does not change.** A write through a FUSE mount (the window above). A guest's write through slates' own
-  virtio-fs device or a Shards stream, answered by its device's loop in order, is not held yet (GAPS, owed). WinFsp
+  virtio-fs device or a Shards stream, answered by its device's loop in order, was not held yet (held since A-196,
+  its device completing the held reply out of order). WinFsp
   mounts are Windows' and never share a daemon with FUSE mounts. A retry of a held request is answered from its
   completion record at once.
 

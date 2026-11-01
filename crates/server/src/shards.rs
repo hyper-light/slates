@@ -208,6 +208,12 @@ pub(crate) struct ShardsStream {
   claimant: Option<slates_ipc::handle_route::Claimant>,
   /// Whether the ingest a stream takes before it ends has been started: once, whatever ends it.
   ingested_at_end: bool,
+  /// Where the volume's journal stood when the request held for its ingest was taken: the records the ingest writes
+  /// are then that request's own (AC-3.3, A-196).
+  told_mark: Option<crate::told::Mark>,
+  /// What the owed reply waits for before it is sent: every FUSE mount of the volume told through the newest record its
+  /// request made (AC-3.3, A-196). Shards' VMM asks one request at a time, so nothing else waits behind it.
+  told: Option<crate::told::Owed>,
 }
 
 impl std::fmt::Debug for ShardsStream {
@@ -375,6 +381,8 @@ pub(crate) fn attach(s: &mut ShardState, ask: ShardsAsk) -> Result<ShardsAttache
       #[cfg(windows)]
       claimant: None,
       ingested_at_end: false,
+      told_mark: None,
+      told: None,
     },
   );
   if futures::spawn(serve(attachment))
@@ -818,6 +826,9 @@ enum Turned {
   Blocked,
   /// The owner may not serve the volume's latest state now (AUD-29-83): nothing was read.
   Fenced,
+  /// The owed reply waits for every FUSE mount of the volume to have been told of its request's change (AC-3.3, A-196):
+  /// the task awaits that, bounded, then sends it.
+  Told(crate::told::Owed),
   /// The attachment ended.
   Ended,
 }
@@ -860,6 +871,16 @@ async fn serve(attachment: u64) {
           crate::daemon::pace(crate::daemon::HEARTBEAT_NS).await;
           break;
         }
+        Some(Turned::Told(owed)) => {
+          // Every FUSE mount of the volume is told of the change, or the bound passes, before the reply goes out
+          // (AC-3.3); the next turn sends it. Shards' VMM sends nothing more meanwhile, since it waits for this reply.
+          let _waited = crate::told::wait(owed).await;
+          let _ = state::with_state_counted(|s| {
+            if let Some(stream) = s.shards_streams.get_mut(&attachment) {
+              stream.told = None;
+            }
+          });
+        }
         Some(Turned::Ended) | None => {
           let _ = state::with_state_counted(|s| ended(s, attachment));
           return;
@@ -891,6 +912,9 @@ fn turn_with(s: &mut ShardState, stream: &mut ShardsStream) -> Turned {
   // show the change waits for it.
   let refill_owed = !stream.ending && dax::refill_owed(s, stream);
   if !refill_owed {
+    if let Some(owed) = told_owed(s, stream) {
+      return Turned::Told(owed);
+    }
     match flush(stream) {
       Flushed::Done => {}
       Flushed::Blocked => return Turned::Blocked,
@@ -970,6 +994,7 @@ fn turn_with(s: &mut ShardState, stream: &mut ShardsStream) -> Turned {
         .unwrap_or(&[])
         .to_vec();
       if dax::hold_for_ingest(s, stream, &request, total) {
+        stream.told_mark = crate::told::mark(s, stream.volume);
         return Turned::Served;
       }
       serve_request(s, stream, total, Ingested::default())
@@ -988,6 +1013,9 @@ fn flush_unless_refill_owed(s: &mut ShardState, stream: &mut ShardsStream) -> Tu
   if !stream.ending && dax::refill_owed(s, stream) {
     return Turned::Served;
   }
+  if let Some(owed) = told_owed(s, stream) {
+    return Turned::Told(owed);
+  }
   match flush(stream) {
     Flushed::Done | Flushed::Blocked => Turned::Served,
     Flushed::Failed => {
@@ -995,6 +1023,17 @@ fn flush_unless_refill_owed(s: &mut ShardState, stream: &mut ShardsStream) -> Tu
       Turned::Ended
     }
   }
+}
+
+/// What the owed reply of `stream` still waits for: every FUSE mount of its volume told through its request's newest
+/// record (AC-3.3, A-196). Cleared once they are, so the reply is sent; an ending stream waits for nothing.
+fn told_owed(s: &ShardState, stream: &mut ShardsStream) -> Option<crate::told::Owed> {
+  let owed = stream.told?;
+  if stream.ending || crate::told::told(s, owed) {
+    stream.told = None;
+    return None;
+  }
+  Some(owed)
 }
 
 /// Starts the ingest a stream takes before it ends, once: whether one is under way now.
@@ -1157,6 +1196,12 @@ fn serve_request(
 ) -> bool {
   crate::verbs::relieve_deferred(s);
   let dax_offer = dax::offer(s);
+  // Where the journal stood before the request (or the ingest held for it) ran: its reply waits for the volume's FUSE
+  // mounts to have been told of the records since (AC-3.3, A-196).
+  let told_mark = stream
+    .told_mark
+    .take()
+    .or_else(|| crate::told::mark(s, stream.volume));
   let Some(&handle) = s.by_id.get(&stream.volume) else {
     return false;
   };
@@ -1213,6 +1258,7 @@ fn serve_request(
   {
     stream.owed = refuse(answered.unique, errno, &mut stream.outbound);
   }
+  stream.told = told_mark.and_then(|mark| crate::told::owed(s, mark));
   true
 }
 

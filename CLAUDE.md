@@ -253,6 +253,17 @@ Every test is written as "do X, expect Y" and names the acceptance criterion or 
     the host has. Gotcha: a range the fd-sharing placer restored is `PROT_NONE`, which no test can read without a fault,
     so hold its maps and removals to the overlays it made and restored (`Device::dax_overlays`): nothing else a test can
     observe tells a REMOVEMAPPING that left them from one that did not.
+  - A reply completed out of order while the queue serves on: `crates/bridge-virtiofs/src/device.rs` (`hold_or_publish`,
+    `settle_told`, a pass's `Serviced::published`) with `crates/bridge-virtiofs/src/serve.rs` (`doorbell_request_or_told`
+    races the doorbell, a request and the oldest held reply's wait or bound), held by a stand-in FUSE mount whose round
+    never comes in `crates/bridge-virtiofs/tests/serve.rs` (A-196). Gotchas, each found by a test: notify a queue only
+    for the replies a pass published, or the guest is woken with nothing to reap (the daemon's vhost-user tests, whose
+    front end reaps once per interrupt, found it on Linux; the first admission test also published a second reply in the
+    same pass and passed with the bug put back, so its first pass now publishes nothing); let only the loop that settles
+    switch holding on, so no other caller strands a reply; and through a real guest the stale-read red rate is low (1 of
+    200 through crosvm and 0 of 200 in QEMU, since the guest's close and the console give the mount's round time), so
+    the counted waits are the check that cannot miss. A real-system kill rarely lands inside a hold of about 82 µs (1
+    of 36 did): hold that case with the stand-in.
 - **Keep design docs in sync with code.** Changing a subsystem's behaviour updates its design section, its status blockquote and the ledger in the same commit.
 - **Commit everything, in imperative area-prefixed summaries that carry the measured fact**, in vorpal's style: `merge: one graph tool over seven relations; deferred-schema cost measured`. Always `git add -A && git commit -m "<message>"`. Never `git checkout`, `git stash`, `git reset`, or any destructive git command.
 - **Debugging protocol.** Add logging to file first; consult the design section rather than assuming from code; confirm scope, intended behaviour, timing and frequency with Ada; after root cause is confirmed by logs and analysis, write `docs/bugs/<date>-<slug>.md` with description, root cause, impact and exact edits; fix in plan mode; touch nothing beyond the fix, but report every sibling inconsistency found; never preserve the behaviour that caused the bug.

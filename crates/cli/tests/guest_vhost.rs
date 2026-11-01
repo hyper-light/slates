@@ -34,14 +34,17 @@
 
 mod vm;
 
-use std::time::Instant;
+use std::os::fd::AsFd;
+use std::time::{Duration, Instant};
 
 use slates_bridge_virtiofs::backed;
+use slates_bridge_virtiofs::serve::TOLD_ABANDONED;
 use slates_client::{Client, Intent, VolumeId};
 use slates_guest_probe::protocol::{Command as Ask, Reply};
 use vm::{
-  Anchor, Guest, MountPoint, QUIT_WAIT, REPLY_WAIT, START_WAIT, created_volume, initramfs,
-  kill_the_daemon, pause, run, start_anchor, write_at, write_whole,
+  Anchor, Guest, MountPoint, QUIT_WAIT, REPLY_WAIT, START_WAIT, created_volume, daemon_of,
+  initramfs, kill_daemon, kill_the_daemon, pause, run, start_anchor, start_anchor_with, write_at,
+  write_whole,
 };
 
 /// Shape: the pages the guest maps; the file never grows past them, so every byte of it lies in the map.
@@ -129,9 +132,10 @@ impl Vmm {
     matches!(self, Vmm::Crosvm(_))
   }
 
-  /// Its command line for a guest of `kernel` and `initrd` over slates' own device, with the device's end where
-  /// `{socket}` or `{fd}` stands. QEMU accelerates the guest with KVM where the host has it, and otherwise emulates it.
-  fn command(&self, kernel: &str, initrd: &str) -> Vec<String> {
+  /// Its command line for a guest of `kernel` and `initrd` over slates' own device, the guest's kernel given
+  /// `arguments` after its console, with the device's end where `{socket}` or `{fd}` stands. QEMU accelerates the guest
+  /// with KVM where the host has it, and otherwise emulates it.
+  fn command(&self, kernel: &str, initrd: &str, arguments: &str) -> Vec<String> {
     let memory = GUEST_MEMORY_MIB.to_string();
     let cpus = GUEST_CPUS.to_string();
     let words: Vec<String> = match self {
@@ -147,7 +151,7 @@ impl Vmm {
         "--initrd".into(),
         initrd.into(),
         "-p".into(),
-        format!("console=ttyS0 {GUEST_ARGUMENTS}"),
+        format!("console=ttyS0 {arguments}"),
         "--serial".into(),
         "type=stdout,hardware=serial,num=1,console,stdin".into(),
         kernel.into(),
@@ -189,7 +193,7 @@ impl Vmm {
           "-initrd".into(),
           initrd.into(),
           "-append".into(),
-          format!("console={console} {GUEST_ARGUMENTS}"),
+          format!("console={console} {arguments}"),
           "-nodefaults".into(),
           "-display".into(),
           "none".into(),
@@ -649,7 +653,11 @@ impl Rig {
       WINDOW,
       "--",
     ]);
-    vmm.args(gate.vmm.command(&gate.kernel, &self.initrd));
+    vmm.args(
+      gate
+        .vmm
+        .command(&gate.kernel, &self.initrd, GUEST_ARGUMENTS),
+    );
     let (guest, first) = Guest::start(&mut vmm, gate.vmm.tag(), ix(self.map_len));
     assert_eq!(
       first,
@@ -1426,5 +1434,495 @@ fn a_daemon_killed(gate: &Gate) {
     status.success(),
     "the second VM powered off cleanly: {status}\n{}",
     second.transcript()
+  );
+}
+
+// AC-3.3 for a guest writer (§4.6 "Cache posture"; A-191, A-196): a write through slates' own device is answered once
+// every FUSE mount of its volume has been told of it, as an SDK or NFS write is, and the device serves on meanwhile.
+
+/// Shape: the anchors' shard counts the told test runs on. On one shard the device, the volume and its mount share one
+/// thread, so a reply sent unheld leaves before the mount's round has run at all; on two the device's verbs and the
+/// mount's may arrive at a shard other than the volume's.
+const TOLD_SHARDS: [u16; 2] = [1, 2];
+/// Shape: the guest's writes in each told run, as many as A-191's SDK test makes (`crates/server/tests/fuse_told.rs`),
+/// where without the wait about one first read in ten was stale: a pass by chance is about 0.9^200.
+const TOLD_ROUNDS: u32 = 200;
+/// Shape: the guests the guest-kill test boots and kills. Each is killed a step later after its write is sent, the
+/// steps sweeping one write's round trip as the same guest just took it, so some kills land while the device holds the
+/// reply and others before or after it.
+const GUEST_KILLS: u32 = 12;
+/// Shape: the daemons the daemon-kill test kills under a guest's write, each a step later in the same sweep: fewer
+/// than the guests, since each one's takeover takes seconds.
+const DAEMON_KILLS: u32 = 6;
+/// Format: the guest's kernel arguments for the told tests: the probe is `/init`, and it mounts the tag with `dax=never`,
+/// so each write it makes is a FUSE WRITE the device answers, with no window between.
+const TOLD_GUEST_ARGUMENTS: &str = "rdinit=/init quiet slates.dax=never";
+/// Format: the file the told tests' guest writes and the host maps, one page, at the root of the volume.
+const TOLD_FILE: &str = "told.bin";
+/// Format: the byte the told file starts with; [`told_fill`] never returns it.
+const TOLD_SEED: u8 = b'A';
+/// Format: the daemon's counter of writers whose reply waited for their volume's FUSE mounts (AC-3.3).
+const TOLD_WAITS: &str = "fuse.told_waits";
+/// Format: the daemon's counter of waits that reached their bound with a mount untold.
+const TOLD_OVERDUE: &str = "fuse.told_overdue";
+
+/// The fill of told write `round`: a byte no two consecutive writes share, never [`TOLD_SEED`].
+fn told_fill(round: u32) -> u8 {
+  b'B' + u8::try_from(round % 24).unwrap()
+}
+
+/// The guest's command writing `fill` over the told file's page.
+fn patch_page(fill: u8) -> Ask {
+  Ask::Patch {
+    path: TOLD_FILE.into(),
+    at: 0,
+    bytes: vec![fill; ix(page())],
+  }
+}
+
+/// Spins until `delay` has passed: a sleep's timer slack would blur the sweep's steps, which are microseconds apart.
+fn spin_for(delay: Duration) {
+  let started = Instant::now();
+  while started.elapsed() < delay {
+    std::hint::spin_loop();
+  }
+}
+
+/// Step `step` of `steps` across `span`: `span × step / steps`.
+fn sweep_step(span: Duration, step: u32, steps: u32) -> Duration {
+  span
+    .checked_mul(step)
+    .and_then(|scaled| scaled.checked_div(steps))
+    .unwrap()
+}
+
+/// A file mapped read-only and shared through a `slates mount` on the host, as a program that only reads a shared file
+/// holds it: AC-3.3's reader.
+struct HostMap {
+  map: *mut u8,
+  length: usize,
+  _file: std::fs::File,
+}
+
+impl HostMap {
+  /// Maps `length` bytes of `path` and reads them once, so the mount's kernel holds the pages.
+  #[allow(clippy::disallowed_methods)] // the test's own open through a slates mount: RAM, not disk
+  fn of(path: &str, length: usize) -> HostMap {
+    let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {path}: {e}"));
+    // SAFETY: a fresh shared, read-only map of `length` bytes of a file this value holds open, at an address the kernel
+    // chooses; nothing else maps it, and `Drop` unmaps it before the file closes.
+    let map = unsafe {
+      rustix::mm::mmap(
+        std::ptr::null_mut(),
+        length,
+        rustix::mm::ProtFlags::READ,
+        rustix::mm::MapFlags::SHARED,
+        file.as_fd(),
+        0,
+      )
+    }
+    .unwrap()
+    .cast::<u8>();
+    let mapped = HostMap {
+      map,
+      length,
+      _file: file,
+    };
+    let _ = mapped.seen();
+    mapped
+  }
+
+  /// The map's bytes as they read now, a byte at a time with volatile loads: the kernel replaces the map's pages when
+  /// the file changes, and a slice held over memory that changes under it is not sound.
+  fn seen(&self) -> Vec<u8> {
+    (0..self.length)
+      .map(|offset| {
+        // SAFETY: `map` is `length` readable bytes, mapped in `of` and unmapped only in `Drop`, and `offset` is below
+        // `length`; a volatile load of one byte holds no reference across the kernel's page replacement.
+        unsafe { std::ptr::read_volatile(self.map.add(offset)) }
+      })
+      .collect()
+  }
+
+  /// Whether every byte reads `fill` now.
+  fn shows(&self, fill: u8) -> bool {
+    self.seen().iter().all(|byte| *byte == fill)
+  }
+}
+
+impl Drop for HostMap {
+  fn drop(&mut self) {
+    // SAFETY: unmaps exactly the map made in `of`, which nothing reads after this.
+    let _ = unsafe { rustix::mm::munmap(self.map.cast(), self.length) };
+  }
+}
+
+/// What the told tests stand on: an anchor of a chosen shard count; a volume holding [`TOLD_FILE`], one page of
+/// [`TOLD_SEED`], written through the SDK so no host page of it is dirty; a `slates mount` of the volume on the host,
+/// through which the test maps the file; and a volume holding the guest's initramfs. Fields drop in order: the map
+/// before its mount, the mounts and the client before the anchor.
+struct ToldRig {
+  instance: String,
+  volume: String,
+  map: HostMap,
+  _host_side: MountPoint,
+  _boot_side: MountPoint,
+  initrd: String,
+  _sdk: Client,
+  anchor: Anchor,
+}
+
+impl ToldRig {
+  /// Starts an anchor of `shards` shards for an instance named after `tag`, makes the volume with the file, mounts it
+  /// and maps the file on the host, and writes the initramfs.
+  fn new(gate: &Gate, tag: &str, shards: u16) -> ToldRig {
+    let instance = format!("{tag}{shards}-{}-{}", gate.vmm.name(), std::process::id());
+    let anchor = start_anchor_with(&instance, shards);
+    let volume = created_volume(&instance, "told");
+    let deadlines = slates_client::Deadlines::derive(
+      slates_server::daemon::LIVENESS_BUDGET_NS,
+      slates_db::replay::RECOVERY_BUDGET_NS,
+    )
+    .get();
+    let mut sdk = Client::connect(&instance, deadlines).unwrap();
+    let writer = sdk
+      .attach(volume_id(&volume), None, Intent::Write)
+      .unwrap()
+      .attachment;
+    sdk
+      .fs_write(
+        (volume_id(&volume), writer),
+        TOLD_FILE,
+        &vec![TOLD_SEED; ix(page())],
+        FILE_MODE,
+      )
+      .unwrap();
+    let host_side = MountPoint::of(&instance, &volume);
+    let map = HostMap::of(&host_side.file(TOLD_FILE), ix(page()));
+    let boot = created_volume(&instance, "boot");
+    let boot_side = MountPoint::of(&instance, &boot);
+    #[allow(clippy::disallowed_methods)]
+    // reads the built probe binary: a test input, never written
+    let probe = std::fs::read(&gate.probe).unwrap_or_else(|e| panic!("read {}: {e}", gate.probe));
+    let initrd = boot_side.file("initramfs.cpio");
+    write_whole(&initrd, &initramfs(&probe, &[]));
+    ToldRig {
+      instance,
+      volume,
+      map,
+      _host_side: host_side,
+      _boot_side: boot_side,
+      initrd,
+      _sdk: sdk,
+      anchor,
+    }
+  }
+
+  /// Boots a guest over slates' own device through `slates vhost-user`, in the gate's VMM, mounting the tag with
+  /// `dax=never` ([`TOLD_GUEST_ARGUMENTS`]).
+  fn boot(&self, gate: &Gate) -> Guest {
+    let mut vmm = vm::slates();
+    vmm.args([
+      "--instance",
+      &self.instance,
+      "vhost-user",
+      &self.volume,
+      "--dax-window",
+      WINDOW,
+      "--",
+    ]);
+    vmm.args(
+      gate
+        .vmm
+        .command(&gate.kernel, &self.initrd, TOLD_GUEST_ARGUMENTS),
+    );
+    let (guest, first) = Guest::start(&mut vmm, gate.vmm.tag(), ix(page()));
+    assert_eq!(
+      first,
+      Reply::Ready,
+      "the guest in {} mounts the tag of slates' own device without DAX\n{}",
+      gate.vmm.name(),
+      guest.transcript()
+    );
+    guest
+  }
+
+  /// The guest writes `fill` over the file's page, and the test reads the host's map as memory alone the moment the
+  /// guest's write returns: whether that first read was stale, and how long the write took as the test saw it.
+  fn told_round(&self, guest: &mut Guest, fill: u8) -> (bool, Duration) {
+    let started = Instant::now();
+    guest.done(&patch_page(fill));
+    let took = started.elapsed();
+    (!self.map.shows(fill), took)
+  }
+
+  /// The file as the volume holds it, read through slates itself past every mount.
+  fn volume_file(&self) -> Vec<u8> {
+    let (code, held, err) = run(
+      &self.instance,
+      &["read", &self.volume, &format!("/{TOLD_FILE}")],
+    );
+    assert_eq!(code, 0, "slates read {} /{TOLD_FILE}: {err}", self.volume);
+    held
+  }
+
+  /// The volume's attachments, as `slates status` counts them.
+  fn attachments(&self) -> String {
+    let (code, out, err) = run(&self.instance, &["status", &self.volume]);
+    assert_eq!(code, 0, "slates status {}: {err}", self.volume);
+    value_of(&out, "attachments")
+  }
+
+  /// Holds that the volume's page is whole after a write was cut off: all of `earlier`, the write before it, or all of
+  /// `fill`, the write itself, and never a mix. Whether the write was applied.
+  fn whole_after_cut(&self, earlier: u8, fill: u8, what: &str, guest: &Guest) -> bool {
+    let held = self.volume_file();
+    let page = ix(page());
+    let applied = held == vec![fill; page];
+    assert!(
+      applied || held == vec![earlier; page],
+      "{what}: the page holds all of the earlier write ({}) or all of the cut one ({}), never a mix: {}\n{}",
+      writer_byte(earlier),
+      writer_byte(fill),
+      runs_of_page(&held),
+      guest.transcript()
+    );
+    applied
+  }
+
+  /// Waits until the host's map shows what the volume holds, for at most [`START_WAIT`]: the mount was told of whatever
+  /// the volume took. How long the map took to follow, from the moment the volume was read.
+  fn map_follows_the_volume(&self, what: &str) -> Duration {
+    let held = self.volume_file();
+    let started = Instant::now();
+    wait_for(what, || self.map.seen() == held);
+    started.elapsed()
+  }
+}
+
+/// A fill's name in a failure: the byte as a character.
+fn writer_byte(fill: u8) -> String {
+  format!("{:?}", char::from(fill))
+}
+
+/// A page's bytes as runs of one value, for a failure's report.
+fn runs_of_page(bytes: &[u8]) -> String {
+  let mut runs: Vec<(u8, usize)> = Vec::new();
+  for &byte in bytes {
+    match runs.last_mut() {
+      Some((value, count)) if *value == byte => *count += 1,
+      _ => runs.push((byte, 1)),
+    }
+  }
+  runs
+    .iter()
+    .map(|(value, count)| format!("{}x{count}", writer_byte(*value)))
+    .collect::<Vec<_>>()
+    .join(",")
+}
+
+/// AC-3.3 for a guest writer (§4.6 "Cache posture"; A-191, A-196) through a real guest. Do: on an anchor of one shard
+/// and then of two ([`TOLD_SHARDS`]), map [`TOLD_FILE`] read-only through a `slates mount` on the host, boot a guest over
+/// slates' own device that mounts the tag without DAX, and have it write the file's page [`TOLD_ROUNDS`] times, reading
+/// the host's map as memory alone the moment each write returns. Expect: every first read shows the write, since the
+/// guest's reply waited until the mount was told; the daemon counts a wait for every write and none overdue.
+#[test]
+fn a_guests_write_through_slates_own_device_is_answered_once_every_fuse_mount_of_its_volume_was_told()
+ {
+  for gate in Gate::each_from_env() {
+    for shards in TOLD_SHARDS {
+      guest_writes_are_told(&gate, shards);
+    }
+  }
+}
+
+/// [`a_guests_write_through_slates_own_device_is_answered_once_every_fuse_mount_of_its_volume_was_told`] in the VMM
+/// `gate` names, on an anchor of `shards` shards.
+fn guest_writes_are_told(gate: &Gate, shards: u16) {
+  let rig = ToldRig::new(gate, "vhost-told", shards);
+  let mut guest = rig.boot(gate);
+  let (waits_before, overdue_before) = (
+    counter(&rig.instance, TOLD_WAITS),
+    counter(&rig.instance, TOLD_OVERDUE),
+  );
+  let mut stale = Vec::new();
+  let mut took = Vec::new();
+  for round in 0..TOLD_ROUNDS {
+    let (was_stale, round_took) = rig.told_round(&mut guest, told_fill(round));
+    if was_stale {
+      stale.push(round);
+    }
+    took.push(round_took);
+  }
+  let waited = counter(&rig.instance, TOLD_WAITS).saturating_sub(waits_before);
+  let overdue = counter(&rig.instance, TOLD_OVERDUE).saturating_sub(overdue_before);
+  took.sort_unstable();
+  let at_share = |share: usize| took[(took.len() - 1) * share / 100];
+  eprintln!(
+    "AC-3.3 guest in {} ({shards} shards): {} of {TOLD_ROUNDS} first reads stale; {waited} writes waited, {overdue} \
+     overdue; a write took {:?} at the median, {:?} at p99 and {:?} at most, as the test saw it (the console's carriage \
+     included)",
+    gate.vmm.name(),
+    stale.len(),
+    at_share(50),
+    at_share(99),
+    at_share(100)
+  );
+  assert!(
+    stale.is_empty(),
+    "the host's map read the old bytes right after the guest's write returned ({shards} shards), rounds {stale:?}\n{}",
+    guest.transcript()
+  );
+  assert!(
+    waited >= u64::from(TOLD_ROUNDS),
+    "non-vacuous: each write's reply waited for the mount ({waited} waits)"
+  );
+  assert_eq!(overdue, 0, "no wait reached its bound");
+  let status = guest.quit();
+  assert!(
+    status.success(),
+    "the VM powered off cleanly: {status}\n{}",
+    guest.transcript()
+  );
+}
+
+/// AC-3.3, chaos (A-196): a guest killed while its write's reply waits. Do: [`GUEST_KILLS`] times, boot a guest, have it
+/// write the page once (a told round, timed), then send another write and kill the VM a step later each time, the steps
+/// sweeping the timed round. Expect: the device ends and lets its attachment go; the volume's page holds all of one
+/// write or all of the other, never a mix; the host's map comes to show what the volume holds; and a reply the daemon
+/// counts abandoned with its device ([`TOLD_ABANDONED`]) belongs to a write the volume holds.
+#[test]
+fn a_guest_killed_while_its_writes_reply_waits_leaves_the_write_whole_and_its_device_ended() {
+  for gate in Gate::each_from_env() {
+    guests_killed_mid_write(&gate);
+  }
+}
+
+/// [`a_guest_killed_while_its_writes_reply_waits_leaves_the_write_whole_and_its_device_ended`] in the VMM `gate` names.
+fn guests_killed_mid_write(gate: &Gate) {
+  let rig = ToldRig::new(gate, "vhost-told-gkill", vm::SHARDS);
+  let attachments = rig.attachments();
+  let mut abandoned_in_all = 0u64;
+  let mut applied_in_all = 0u32;
+  for kill in 0..GUEST_KILLS {
+    let mut guest = rig.boot(gate);
+    let earlier = told_fill(kill.saturating_mul(2));
+    let (was_stale, took) = rig.told_round(&mut guest, earlier);
+    assert!(
+      !was_stale,
+      "the host's map showed the guest's write once it returned\n{}",
+      guest.transcript()
+    );
+    let fill = told_fill(kill.saturating_mul(2).saturating_add(1));
+    let delay = sweep_step(took, kill, GUEST_KILLS);
+    let abandoned_before = counter(&rig.instance, TOLD_ABANDONED);
+    guest.send(&patch_page(fill));
+    spin_for(delay);
+    guest.kill();
+    wait_for(
+      "the killed guest's device ended and let its attachment go",
+      || rig.attachments() == attachments,
+    );
+    let applied = rig.whole_after_cut(earlier, fill, "the volume after the guest's kill", &guest);
+    let told_after = rig.map_follows_the_volume("the host's map shows what the volume holds");
+    let abandoned = counter(&rig.instance, TOLD_ABANDONED).saturating_sub(abandoned_before);
+    eprintln!(
+      "guest kill {kill} in {}, {delay:?} after its write was sent (a round took {took:?}): applied {applied}, \
+       {abandoned} reply abandoned, the map followed in {told_after:?}",
+      gate.vmm.name()
+    );
+    assert!(
+      abandoned == 0 || applied,
+      "a reply abandoned with its device belongs to a write the volume holds"
+    );
+    abandoned_in_all = abandoned_in_all.saturating_add(abandoned);
+    applied_in_all = applied_in_all.saturating_add(u32::from(applied));
+  }
+  eprintln!(
+    "guest kills in {}: {applied_in_all} of {GUEST_KILLS} cut writes applied; {abandoned_in_all} kills landed while the \
+     write's reply waited for the mount",
+    gate.vmm.name()
+  );
+  let mut last = rig.boot(gate);
+  let (was_stale, _) = rig.told_round(&mut last, TOLD_SEED.saturating_sub(1));
+  assert!(
+    !was_stale,
+    "a guest after the kills is still answered once the mount was told\n{}",
+    last.transcript()
+  );
+  let status = last.quit();
+  assert!(
+    status.success(),
+    "the last VM powered off cleanly: {status}\n{}",
+    last.transcript()
+  );
+}
+
+/// AC-3.3, chaos (A-196): the daemon killed under a guest's write and taken over. Do: [`DAEMON_KILLS`] times, boot a
+/// guest, have it write the page once (a told round, timed), then send another write and kill the daemon a step later
+/// each time, the steps sweeping the timed round; the anchor restarts it, and the host's mount is taken over. Expect:
+/// the successor's page holds all of one write or all of the other, never a mix; the host's map, through the mount the
+/// successor took over, comes to show what the successor holds; and the next guest's write, through the successor, is
+/// told before it returns.
+#[test]
+fn a_daemon_killed_under_a_guests_write_is_taken_over_with_the_write_whole_and_told() {
+  for gate in Gate::each_from_env() {
+    daemons_killed_mid_write(&gate);
+  }
+}
+
+/// [`a_daemon_killed_under_a_guests_write_is_taken_over_with_the_write_whole_and_told`] in the VMM `gate` names.
+fn daemons_killed_mid_write(gate: &Gate) {
+  let rig = ToldRig::new(gate, "vhost-told-dkill", vm::SHARDS);
+  let mut applied_in_all = 0u32;
+  for kill in 0..DAEMON_KILLS {
+    let mut guest = rig.boot(gate);
+    let earlier = told_fill(kill.saturating_mul(2));
+    let (was_stale, took) = rig.told_round(&mut guest, earlier);
+    assert!(
+      !was_stale,
+      "the host's map showed the guest's write once it returned, through the daemon {kill} kills in\n{}",
+      guest.transcript()
+    );
+    let fill = told_fill(kill.saturating_mul(2).saturating_add(1));
+    let delay = sweep_step(took, kill, DAEMON_KILLS);
+    let old = daemon_of(&rig.anchor).expect("the anchor runs a daemon");
+    guest.send(&patch_page(fill));
+    spin_for(delay);
+    let new = kill_daemon(&rig.anchor, &rig.instance, old);
+    assert_ne!(old, new, "the anchor's successor is a new daemon");
+    if gate.vmm.ends_the_vm_with_its_device() {
+      let _ = vm_end(&mut guest);
+    } else {
+      // QEMU keeps a VM whose vhost-user device hung up, so the test ends it.
+      guest.kill();
+    }
+    let applied = rig.whole_after_cut(earlier, fill, "the successor's volume", &guest);
+    let told_after = rig.map_follows_the_volume(
+      "the host's map, through the mount the successor took over, shows what the successor holds",
+    );
+    eprintln!(
+      "daemon {old} killed in {}, {delay:?} after the guest's write was sent (a round took {took:?}), successor \
+       {new}: applied {applied}, the map followed in {told_after:?}",
+      gate.vmm.name()
+    );
+    applied_in_all = applied_in_all.saturating_add(u32::from(applied));
+  }
+  eprintln!(
+    "daemon kills in {}: {applied_in_all} of {DAEMON_KILLS} cut writes applied",
+    gate.vmm.name()
+  );
+  let mut last = rig.boot(gate);
+  let (was_stale, _) = rig.told_round(&mut last, TOLD_SEED.saturating_sub(1));
+  assert!(
+    !was_stale,
+    "a guest through the last successor is answered once the mount it took over was told\n{}",
+    last.transcript()
+  );
+  let status = last.quit();
+  assert!(
+    status.success(),
+    "the last VM powered off cleanly: {status}\n{}",
+    last.transcript()
   );
 }

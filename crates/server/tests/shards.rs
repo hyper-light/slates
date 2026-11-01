@@ -2755,3 +2755,86 @@ mod route {
     );
   }
 }
+
+// AC-3.3 for a Shards guest's write (§4.6 "Cache posture"; A-191, A-196): answered once every FUSE mount of its volume
+// has been told of it, as an SDK or NFS write is.
+
+/// Shape: the guest's writes in the told test, as many as A-191's SDK test makes (`tests/fuse_told.rs`), where without
+/// the wait about one first read in ten was stale: a pass by chance is about 0.9^200.
+#[cfg(target_os = "linux")]
+const TOLD_ROUNDS: u32 = 200;
+/// Format: the file the told test's guest writes and the host maps.
+#[cfg(target_os = "linux")]
+const TOLD_FILE: &str = "told.bin";
+/// Format: the daemon's counter of writers whose reply waited for their volume's FUSE mounts (AC-3.3).
+#[cfg(target_os = "linux")]
+const TOLD_WAITS: &str = "fuse.told_waits";
+/// Format: the daemon's counter of waits that reached their bound with a mount untold.
+#[cfg(target_os = "linux")]
+const TOLD_OVERDUE: &str = "fuse.told_overdue";
+
+/// AC-3.3 for a Shards guest's write (§4.6 "Cache posture"; A-191, A-196). Do: on a single-shard daemon, map a file
+/// read-only through a FUSE mount of the volume, then have the guest write the file's page over its stream
+/// [`TOLD_ROUNDS`] times, reading the map as memory alone the moment each write's reply frame is read. Expect: every
+/// first read shows the write, since the stream's reply waited until the mount was told; the daemon counts a wait for
+/// every write and none overdue. On one shard the stream, the volume and the mount share a thread, so a reply sent
+/// unheld leaves before the mount's round has run. Linux only; skips loudly without FUSE.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_guests_write_over_a_shards_stream_is_answered_once_every_fuse_mount_of_its_volume_was_told() {
+  if !common::fuse_map::fuse_available() {
+    return;
+  }
+  let (daemon, instance) = single_shard_daemon("shards-told");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("shared")) else {
+    panic!("the volume was not created");
+  };
+  let mut guest = Guest::over(attach(&daemon, id, None, Intent::Write).unwrap());
+  guest.init();
+  let page = rustix::param::page_size();
+  let whole_page = Ok(u32::try_from(page).unwrap());
+  let (file, fh) = guest.create(ROOT, TOLD_FILE).unwrap();
+  assert_eq!(guest.write(file, fh, 0, &vec![b'A'; page]), whole_page);
+  let mut sdk = common::client::connect(&instance);
+  let point = common::target::target_dir();
+  sdk.attach_fuse(id, Intent::Read, &point.path).unwrap();
+  let map = common::fuse_map::ReadOnlyMap::of(&format!("{}/{TOLD_FILE}", point.path), page);
+  let counted = |name: &str| {
+    daemon
+      .refusals_on_every_shard()
+      .unwrap()
+      .get(name)
+      .copied()
+      .unwrap_or(0)
+  };
+  let (waits_before, overdue_before) = (counted(TOLD_WAITS), counted(TOLD_OVERDUE));
+  let mut stale = Vec::new();
+  for round in 0..TOLD_ROUNDS {
+    let fill = b'B' + u8::try_from(round % 24).unwrap();
+    assert_eq!(guest.write(file, fh, 0, &vec![fill; page]), whole_page);
+    if !map.shows(fill) {
+      stale.push(round);
+    }
+  }
+  let waited = counted(TOLD_WAITS).saturating_sub(waits_before);
+  let overdue = counted(TOLD_OVERDUE).saturating_sub(overdue_before);
+  eprintln!(
+    "AC-3.3 Shards stream: {} of {TOLD_ROUNDS} first reads stale; {waited} writes waited, {overdue} overdue",
+    stale.len()
+  );
+  assert!(
+    stale.is_empty(),
+    "the map read the old bytes right after the stream answered the write, rounds {stale:?}"
+  );
+  assert!(
+    waited >= u64::from(TOLD_ROUNDS),
+    "non-vacuous: each write's reply waited for the mount ({waited} waits)"
+  );
+  assert_eq!(overdue, 0, "no wait reached its bound");
+  assert_eq!(guest.close(file, fh), (0, 0));
+  drop(map);
+  drop(point);
+  drop(guest);
+  daemon.stop();
+}

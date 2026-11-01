@@ -622,9 +622,11 @@ impl<S: VmmSeam> AdmittedDevice<S> {
           .service_queue(queue, memory, bridge, &cx, batch, &mut self.ledger)
           .map_err(ServeError::Device)?;
         total.served = total.served.saturating_add(pass.served);
+        total.published = total.published.saturating_add(pass.published);
         total.more_pending |= pass.more_pending;
         total.interrupt_wanted |= pass.interrupt_wanted;
-        if pass.served > 0 && pass.interrupt_wanted {
+        // Only for replies the guest can reap now: one held for the volume's FUSE mounts notifies when it is settled.
+        if pass.published > 0 && pass.interrupt_wanted {
           to_notify.push(queue);
         }
         if pass.barrier_owed {
@@ -661,6 +663,52 @@ impl<S: VmmSeam> AdmittedDevice<S> {
       .map_err(ServeError::Authority)?;
     self.device.view_advanced(bridge);
     Ok(())
+  }
+
+  /// Makes the device's replies wait for every FUSE mount of the volume to have been told of their requests' changes
+  /// before they are published (AC-3.3, A-191; [`Device::hold_replies_for_told`]). The device loop's to switch on,
+  /// since it settles the waits ([`AdmittedDevice::settle_told`]).
+  pub fn hold_replies_for_told(&mut self) {
+    self.device.hold_replies_for_told();
+  }
+
+  /// The oldest reply waiting for the volume's FUSE mounts, if one does ([`Device::told_oldest`]).
+  #[must_use]
+  pub fn told_oldest(&self) -> Option<crate::device::ToldOldest> {
+    self.device.told_oldest()
+  }
+
+  /// Publishes the device's held replies whose volume's FUSE mounts have been told through their records
+  /// (`told_through`), or whose bound has passed, as of `now_ns` ([`Device::settle_told`]), and notifies each queue
+  /// whose driver asks. Nothing to do once the device is not live: a revoked device's held chains are the terminal
+  /// step's.
+  pub fn settle_told(
+    &mut self,
+    told_through: &mut dyn FnMut(u64) -> bool,
+    (now_ns, bound_ns): (u64, u64),
+  ) -> Result<crate::device::ToldSettled, ServeError> {
+    if self.state != AttachmentState::Live {
+      return Ok(crate::device::ToldSettled::default());
+    }
+    let settled = {
+      let memory = self.seam.memory().map_err(ServeError::Seam)?;
+      self
+        .device
+        .settle_told(memory, told_through, (now_ns, bound_ns), &mut self.ledger)
+        .map_err(ServeError::Device)?
+    };
+    let mut notified: Vec<u16> = Vec::new();
+    for done in &settled.completed {
+      if done.interrupt_wanted && !notified.contains(&done.queue) {
+        notified.push(done.queue);
+        self
+          .seam
+          .notify_used(done.queue)
+          .map_err(ServeError::Seam)?;
+        self.counters.notifications = self.counters.notifications.saturating_add(1);
+      }
+    }
+    Ok(settled)
   }
 
   /// Completes the chain a pass held for the owner's barrier (AUD-29-82): `captured` says whether the owner's

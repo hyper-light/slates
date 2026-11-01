@@ -10976,10 +10976,21 @@ see the old bytes for the 82 µs median above.
   busier moment, at worst 40 ms.
 - **Cost** (`docs/wip/BENCHMARKS.md`): with a mount, an SDK write's p50 about 28 → 40 µs and p90 about 35 → 53 µs; with
   none, unchanged.
+- **Closed 2026-11-01 by A-196: a guest's write.** A guest's write through slates' own virtio-fs device (in-process or
+  `slates vhost-user`) or a Shards stream, and the write-back of a guest's DAX stores at its sync points, are answered
+  once every FUSE mount of the volume has been told. The device keeps the held reply aside and serves the guest's later
+  requests meanwhile, completing it out of order (virtio 1.2 §2.6 allows it; the device offers no `VIRTIO_F_IN_ORDER`);
+  a Shards stream, whose VMM sends one request at a time, holds its reply frame. Proven on adacachy (Linux 7.2.9,
+  crosvm, 2026-11-01; `crates/cli/tests/guest_vhost.rs`, `crates/server/tests/shards.rs`): 0 of 200 first reads of a
+  host FUSE mount's map stale after a guest's write returned, on one shard and on two, in three runs, and in QEMU 11.1.2
+  on CI's x86_64 runner (diagnostics run 41292937267); the Shards stream 0 of 200; red-checked, 1 of 200 through crosvm
+  and 0 of 200 in QEMU (the device's hold off: its counted waits, 0 of 200, failed it both times) and 196 of 200 (the
+  stream's wait off). The
+  device's held reply past the bound, and the guest killed or the daemon stopped while it waits, are held by a stand-in
+  mount whose round never comes (`crates/bridge-virtiofs/tests/serve.rs`).
 - **Owed:**
-  - A guest's write through slates' own virtio-fs device (in-process or `slates vhost-user`) or a Shards stream, and a
-    Shards guest's DAX stores compared back at its sync points, are not held: each device's loop answers its requests in
-    order, so holding one reply would stall the queue behind it; a held reply needs completions out of order.
+  - The wait's cost to a guest's write through the device, measured apart from the serial console's carriage, which is
+    milliseconds against a mount's delivery of about 82 µs (A-196 "Cost").
   - A retry of a held request is answered from its completion record at once, not held again.
   - A write through a FUSE mount, by design (above).
 

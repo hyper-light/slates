@@ -14,8 +14,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::net::TcpStream;
-use std::os::fd::AsFd;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use slates_client::{Client, Intent, VolumeId};
@@ -23,6 +21,7 @@ use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
 use common::client::{connect, scratch};
+use common::fuse_map::{ReadOnlyMap, fuse_available};
 use common::target::{TargetDir, target_dir};
 
 /// Shape: the shard counts the SDK test runs on. On one shard the client is served where its volume lives, so an
@@ -52,23 +51,6 @@ const TOLD_OVERDUE: &str = "fuse.told_overdue";
 /// Format: the daemon's counter of writers answered unheld although a mount was untold.
 const TOLD_UNWAITED: &str = "fuse.told_unwaited";
 
-fn command_available(name: &str) -> bool {
-  Command::new("sh")
-    .args(["-c", &format!("command -v {name}")])
-    .output()
-    .map(|o| o.status.success())
-    .unwrap_or(false)
-}
-
-/// Whether the FUSE tests run here; a skip is printed, never a failure.
-fn fuse_available() -> bool {
-  let available = command_available("fusermount3") && std::path::Path::new("/dev/fuse").exists();
-  if !available {
-    eprintln!("SKIP: no fusermount3 or /dev/fuse on this host; the FUSE transport needs both");
-  }
-  available
-}
-
 /// A started, bootstrapped daemon of `shards` shards, and its instance name.
 fn daemon(tag: &str, shards: u16) -> (Daemon, String) {
   let profile = common::machine_profile();
@@ -96,66 +78,6 @@ fn counter(daemon: &Daemon, name: &str) -> u64 {
     .get(name)
     .copied()
     .unwrap_or(0)
-}
-
-/// A file mapped read-only through a mount, as a program that only reads it holds it.
-struct ReadOnlyMap {
-  map: *mut u8,
-  length: usize,
-  _file: std::fs::File,
-}
-
-impl ReadOnlyMap {
-  /// Maps `length` bytes of `path`, shared and read-only, and reads it once so its pages are in the mount's cache.
-  #[allow(clippy::disallowed_methods)] // the test's own open through the slates mount: RAM, not disk
-  fn of(path: &str, length: usize) -> ReadOnlyMap {
-    let file = std::fs::File::open(path).unwrap();
-    // SAFETY: a fresh shared, read-only map of `length` bytes of a file this value holds open, at an address the kernel
-    // chooses; nothing else maps it, and `Drop` unmaps it before the file closes.
-    let map = unsafe {
-      rustix::mm::mmap(
-        std::ptr::null_mut(),
-        length,
-        rustix::mm::ProtFlags::READ,
-        rustix::mm::MapFlags::SHARED,
-        file.as_fd(),
-        0,
-      )
-    }
-    .unwrap()
-    .cast::<u8>();
-    let mapped = ReadOnlyMap {
-      map,
-      length,
-      _file: file,
-    };
-    let _ = mapped.seen();
-    mapped
-  }
-
-  /// The map's bytes as they read now: a copy taken a byte at a time with volatile loads, since the kernel replaces the
-  /// map's pages when the file changes, and a slice held over memory that changes under it is not sound.
-  fn seen(&self) -> Vec<u8> {
-    (0..self.length)
-      .map(|offset| {
-        // SAFETY: `map` is `length` readable bytes, mapped in `of` and unmapped only in `Drop`, and `offset` is below
-        // `length`; a volatile load of one byte holds no reference across the kernel's page replacement.
-        unsafe { std::ptr::read_volatile(self.map.add(offset)) }
-      })
-      .collect()
-  }
-
-  /// Whether every byte reads `fill` now.
-  fn shows(&self, fill: u8) -> bool {
-    self.seen().iter().all(|byte| *byte == fill)
-  }
-}
-
-impl Drop for ReadOnlyMap {
-  fn drop(&mut self) {
-    // SAFETY: unmaps exactly the map made in `of`, which nothing reads after this.
-    let _ = unsafe { rustix::mm::munmap(self.map.cast(), self.length) };
-  }
 }
 
 /// Two FUSE mounts of one volume, each a read-only mount with the file mapped through it.
