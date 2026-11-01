@@ -902,6 +902,15 @@ extern "C" fn close(fs: *mut FileSystem, context: Pvoid) {
   });
 }
 
+
+/// DIAG (never main): microseconds since the epoch, to order the diagnostics' lines across processes.
+fn diag_us() -> u128 {
+  std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map(|since| since.as_micros())
+    .unwrap_or(0)
+}
+
 extern "C" fn read(
   fs: *mut FileSystem,
   context: Pvoid,
@@ -914,6 +923,7 @@ extern "C" fn read(
   let handler = unsafe { handler(fs) };
   // SAFETY: `context` is a live OpenFile leaked by open/create, taken under the COARSE guard.
   let object = unsafe { open_file(context) }.object;
+  let asked = diag_us();
   match handler.call(Op::Read {
     object,
     offset,
@@ -923,6 +933,11 @@ extern "C" fn read(
       let n = bytes
         .len()
         .min(usize::try_from(length).unwrap_or(usize::MAX));
+      eprintln!(
+        "DIAG read {object:?} off {offset} len {length} n {n} first {:?} asked {asked} answered {}",
+        bytes.first(),
+        diag_us()
+      );
       // SAFETY: `buffer` is a WinFsp buffer of at least `length` bytes; we copy `n <= length`.
       unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.cast::<u8>(), n);
@@ -1447,12 +1462,27 @@ impl Mounted {
       )
     };
     if raw == INVALID_HANDLE_VALUE || raw.is_null() {
+      eprintln!(
+        "DIAG purge open {} refused at {}: {}",
+        purge.path,
+        diag_us(),
+        std::io::Error::last_os_error()
+      );
       return false;
     }
     // SAFETY: a handle the call above just opened and nothing else holds; owned from here and closed on drop.
     let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
-    pieces(purge.offset, purge.len, piece)
-      .all(|(offset, len)| write_zeros_at(&handle, zeros, offset, len))
+    let began = diag_us();
+    let done = pieces(purge.offset, purge.len, piece)
+      .all(|(offset, len)| write_zeros_at(&handle, zeros, offset, len));
+    eprintln!(
+      "DIAG purge {} [{}, +{}) piece {piece} done {done} from {began} to {}",
+      purge.path,
+      purge.offset,
+      purge.len,
+      diag_us()
+    );
+    done
   }
 }
 
@@ -1521,6 +1551,12 @@ fn write_zeros_at(handle: &OwnedHandle, zeros: &[u8], offset: u64, len: u32) -> 
       &mut overlapped,
     )
   };
+  if done == 0 || written != len {
+    eprintln!(
+      "DIAG purge write at {offset} of {len} wrote {written}: {}",
+      std::io::Error::last_os_error()
+    );
+  }
   done != 0 && written == len
 }
 
@@ -1678,12 +1714,20 @@ fn run_mount(
     }
   };
   while let Ok(Command::Notify { round, purges }) = commands.recv() {
+    let notifying = diag_us();
     let told = mounted.notify(&round);
+    let notified = diag_us();
     let purged = if matches!(told, Ok(Notified::Taken)) {
       mounted.purge(&purges)
     } else {
       Purged::default()
     };
+    eprintln!(
+      "DIAG round {} bytes, purges {:?}, notify {told:?} from {notifying} to {notified}, purged {purged:?} by {}",
+      round.len(),
+      purges,
+      diag_us()
+    );
     report(Outcome::Notified(told, purged));
   }
   drop(mounted);
