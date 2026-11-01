@@ -1,0 +1,67 @@
+#!/bin/sh
+# The L1 VM's init: a real arm64 Linux with KVM (nested virtualization on an Apple M-series Mac; Step 7 of the VFS and
+# DAX plan). The kernel argument `l1.run=` picks what it runs:
+# `image`, guest_image.rs with Firecracker, Cloud Hypervisor and crosvm; `vhost`, guest_vhost.rs with crosvm; `red`,
+# guest_image.rs and guest_vhost.rs built with the guest mounting dax=never, guest_image's maps test once in each VMM
+# alone and guest_vhost's map test in crosvm, each of which must fail at its DAX check. Prints, then powers off.
+#
+# First it moves itself off the initramfs: the kernel's rootfs cannot be pivoted away from (pivot_root(2): EINVAL "The
+# current root is on the rootfs (initial ramfs) mount"), and crosvm's sandbox pivots each jailed device into /var/empty,
+# so on rootfs crosvm fails ("libminijail[1]: pivot_root: Invalid argument"). The tree is copied onto a tmpfs, which
+# switch_root makes the root, freeing the initramfs; the copy then runs this script again.
+if [ ! -e /.l1-switched ]; then
+  mkdir -p /newroot
+  mount -t tmpfs tmpfs /newroot
+  (cd / && tar --one-file-system -cf - .) | tar -C /newroot -xpf -
+  touch /newroot/.l1-switched
+  exec busybox switch_root /newroot /init
+fi
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+exec </dev/console >/dev/console 2>&1
+mkdir -p /dev/pts /dev/shm
+mount -t devpts devpts /dev/pts
+mount -t tmpfs tmpfs /dev/shm
+mount -t tmpfs tmpfs /run
+mount -t tmpfs tmpfs /tmp
+busybox ip link set lo up
+K=$(ls /lib/modules)
+RUN=$(sed -n 's/.*l1\.run=\([a-z]*\).*/\1/p' /proc/cmdline)
+echo "L1: $(uname -a)"
+echo "L1: $(dmesg | grep -m1 'started at EL')"
+ls -l /dev/kvm /dev/fuse
+export HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin SLATES_TEST_CLI=1
+mkdir -p /root /work/target/tmp
+cd /root
+echo "L1: firecracker $(/opt/firecracker/firecracker --version | head -1)"
+echo "L1: cloud-hypervisor $(/opt/cloud-hypervisor/cloud-hypervisor --version | head -1)"
+echo "L1: crosvm $(/opt/crosvm/crosvm version | head -1)"
+export SLATES_GUEST_PROBE=/opt/slates/slates-guest-probe SLATES_GUEST_MODULES=/lib/modules/$K
+FC="SLATES_GUEST_FIRECRACKER=/opt/firecracker/firecracker SLATES_GUEST_VMLINUX=/boot/vmlinuz-$K"
+CH="SLATES_GUEST_CLOUD_HYPERVISOR=/opt/cloud-hypervisor/cloud-hypervisor SLATES_GUEST_VMLINUX=/boot/vmlinuz-$K"
+CROSVM="SLATES_GUEST_CROSVM=/opt/crosvm/crosvm SLATES_GUEST_KERNEL=/boot/vmlinuz-$K"
+case "$RUN" in
+  vhost)
+    env $CROSVM /opt/slates/guest_vhost --test-threads=1 --nocapture 2>&1
+    echo "L1: test exit $?"
+    ;;
+  red)
+    for vmm in FC CH CROSVM; do
+      eval "gate=\$$vmm"
+      echo "L1: red-check in $vmm"
+      env $gate /opt/slates/guest_image_red --test-threads=1 --nocapture \
+        --exact a_guest_maps_a_volume_image_with_dax_through_virtio_pmem 2>&1
+      echo "L1: red $vmm exit $?"
+    done
+    echo "L1: red-check of slates' own device in CROSVM"
+    env $CROSVM /opt/slates/guest_vhost_red --test-threads=1 --nocapture \
+      --exact a_guest_maps_a_session_file_through_slates_own_device_with_dax_and_sees_each_change_as_its_writer_is_answered 2>&1
+    echo "L1: red vhost CROSVM exit $?"
+    ;;
+  *)
+    env $FC $CH $CROSVM /opt/slates/guest_image --test-threads=1 --nocapture 2>&1
+    echo "L1: test exit $?"
+    ;;
+esac
+busybox poweroff -f
