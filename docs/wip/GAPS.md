@@ -12320,16 +12320,31 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   (55 and 346 bytes kept back, one write-back refused unknown each). The same code passed on the change's first run
   (40249524066) and 10 of 10 on fedora (2026-10-26). A write-back over an unknown byte is refused `EIO` by design (A-144);
   the test's seeds expect that refusal only where they make it. Not attributed: no log of the run's rounds.
-- **A-190's mapped view stayed stale once in main's Windows job (2026-10-31): open, not reproduced.** In run 41148561681
-  (slates adeb5fa5, `windows-latest`, image windows-2025-vs2026 20261021.278.1, WinFsp 2.1.25156) the view and a read
-  through a handle opened after it held the old bytes for 10 s each, as before A-190, and the test failed. The same test
-  passed in A-190's diagnostics run (x86_64 and arm64), in main's run of d5ce585e, on arm64 in the failing run itself,
-  and in 25 diagnostics iterations on the same image (runs 41151000035 and 41166727208, the second with Docker's engine
-  started, as the failing job had it), each making one purge and refusing none. The failing test printed nothing of the
-  purge, since its counters were read after the assertion; they are now printed before it. One clue: that daemon's
-  machine profile measured the runner slow at its start, a copy slice of 497 bytes where the previous test's daemon a
-  minute earlier derived 2,206, so the runner was loaded. The candidates, none shown: no purge planned (the file not
-  known open, or its range empty), a purge refused (its open or a write), or a purge made that did not take.
+- **A-190's mapped view stayed stale once in main's Windows job (2026-10-31): closed 2026-11-01 (Step 8 of the VFS and
+  DAX plan). The cause was a purge Windows did not take; each purge is now read back and made again until it takes.**
+  - **What was seen.** In run 41148561681 (slates adeb5fa5, `windows-latest`, image windows-2025-vs2026
+    20261021.278.1, WinFsp 2.1.25156) the view and a read through a handle opened after it held the old bytes for 10 s
+    each, as before A-190, on a runner the daemon's profile measured loaded. The same test passed in 25 unloaded
+    diagnostics iterations (runs 41151000035 and 41166727208).
+  - **Reproduced.** The view test ran alone beside two CPU spinners a core and two I/O loops, logging each round's
+    purge plan and outcome and each read the host served: 9 of 200 iterations stale on the x86_64 runner, 0 of 200 on
+    arm64 (runs 41326838360 and 41327264613).
+  - **The cause.** Of the three candidates the third held, a purge made that did not take. Each stale iteration planned
+    its purge, made it, had its write dropped and refused nothing, and no read of the file reached the host after it.
+    Each of the 95 passing iterations of the second run saw one. `CcCoherencyFlushAndPurgeCache` reports a page it could
+    not invalidate as `STATUS_CACHE_PAGE_LOCKED`, a success status, which WinFsp turns into `STATUS_SUCCESS`. What held
+    the page is not visible from user mode: nothing the host saw (the purge's open delay, its write time, the last read
+    before it) told the stale iterations apart.
+  - **The fix.** Each purged piece is now read back through Windows' cache and around it. A purge whose two reads
+    differ is counted untaken and made again on its own, after a wait that doubles from a tick. It is given up, counted
+    kept, if Windows still keeps the page once the volume's 300 s request timeout has passed (at most 14 attempts;
+    A-190, amended).
+  - **Measured after** (diagnostics run 41336524903 unless named):
+    - x86_64, the reproducing load: 0 of 200 views stale; 10 purges untaken were taken at their first or second retry,
+      and none was given up.
+    - arm64: 0 of 100 at that load. Beside 40% of memory held, where the code before the fix kept 1 of 100 views stale
+      (run 41346373137), the fix kept 0 of 100 (run 41346376630).
+  - Bug record: `docs/bugs/2026-11-01-a-winfsp-purge-windows-did-not-take-left-a-mapped-view-stale.md`.
 - **The anchored export test binds its export's TCP port unreserved (2026-10-30): open, seen once.**
   `an_anchored_node_serves_its_export_over_rpc_with_tls_across_a_daemon_restart` (`crates/cli/tests/cli.rs`) failed in
   the Linux CLI suite on fedora-2 at load 22–31 (75 of 76 passed) with `AddrInUse` at its own

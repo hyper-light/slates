@@ -1,0 +1,119 @@
+# A WinFsp purge Windows did not take left a mapped view stale (2026-11-01)
+
+Step 8 of the VFS and DAX plan; A-190, §4.6 "Windows".
+
+## Description
+
+A-190 purges a changed file from Windows' cache and from every view mapped of it: after each notification round the
+mount's thread opens the file through the drive unbuffered and writes the changed range, and WinFsp's non-cached write
+calls `CcCoherencyFlushAndPurgeCache` before the host drops the write. In main's Windows job the mapped-view test once
+found the view, and a read through a handle opened after it, holding the old bytes for 10 s each (run 41148561681,
+2026-10-31), with no purge counters printed, on a runner its daemon's profile found loaded.
+
+Reproduced on CI's runners by running the mapped-view test alone a hundred times beside two CPU spinners a core and two
+I/O loops (`diag-s8-winfsp-*`, each round's purge plan and outcome, each read the host served and the test's change
+logged with their times):
+
+| runner | run | stale iterations |
+|---|---|---|
+| windows-latest (x86_64, 4 cores) | 41326838360 | 4 of 100 (27, 36, 96, 100) |
+| windows-latest (x86_64, 4 cores) | 41327264613 | 5 of 100 (5, 70, 90, 92, 97) |
+| windows-11-arm (arm64, 4 cores) | 41326838360 | 0 of 100 |
+| windows-11-arm (arm64, 4 cores) | 41327264613 | 0 of 100 |
+
+## Root cause
+
+Of the three candidates A-190's open entry named, the third holds: **a purge made that did not take.**
+
+- Not *no purge planned*: every stale iteration planned one (`DIAG plan … purge [0, +4096) names ["\file.bin"]`) and
+  counted it made.
+- Not *a purge refused*: every stale iteration counted `1 made, 1 writes answered without being applied, 0 refused, 0
+  unavailable`; the purge's open and its write succeeded (`done true`) and the host dropped the write as its own.
+- *Made and not taken*: after the purge no read of the file reached the host for 10 s, in all nine stale iterations.
+  In every one of the 95 passing iterations of run 41327264613 the view's next touch faulted and a read reached the host
+  after the purge, carrying the new bytes. So Windows had not dropped the page.
+
+`CcCoherencyFlushAndPurgeCache` reports a page it could not invalidate as `STATUS_CACHE_PAGE_LOCKED`, which Microsoft
+documents as a success status ("STATUS_CACHE_PAGE_LOCKED indicates that page invalidation failed"), and WinFsp's
+`FspFileNodeFlushAndPurgeCache` (`src/sys/file.c`) turns it into `STATUS_SUCCESS`. The non-cached write then proceeds and
+succeeds, so nothing reaches the host that tells a purge taken from one not taken.
+
+What held the page is not visible from user mode. It was not one of the host's own reads: none was in flight at any
+purge, stale or passing (WinFsp's paging read holds the file node's `Full` resource shared until its request ends, and
+the non-cached write takes it exclusive before it purges). Nor did anything the host can see tell the stale iterations
+apart: the purge's open waited 335–356 ms after the round (passing median 345 ms, 86 of 95 at 300 ms or more), its write
+took 42–112 ms (passing median 79.5 ms), and the last read before it ended 643–759 ms earlier (passing median 712 ms).
+
+## Impact
+
+A program's mapped view of a WinFsp file, and cached reads of it through any handle, kept the bytes another path had
+replaced, for as long as Windows kept the file's section (indefinitely while the program held the file), in about one
+purge in twenty under load on CI's x86_64 runner. Nothing was counted: the purge reported done.
+
+## The fix
+
+A purge is checked, and one Windows did not take is made again, alone, on a doubling wait, until it takes or the
+volume's request timeout passes.
+
+- `crates/bridge-winfsp/src/purge.rs`: `PurgeTarget` (the file through the drive: an unbuffered write of zeros, a read
+  through Windows' cache, a read around it), `PurgeOutcome` (`Taken`, `Untaken`, `Refused`) and `purge_through`, which
+  writes each piece and reads it back both ways: a page Windows dropped is read from the host again, so the two agree; a
+  page it kept still holds its old bytes, so they differ, and the purge is untaken. Pure and cfg-free, tested on every
+  host against a modelled file whose locked pages a purge cannot drop.
+- `crates/bridge-winfsp/src/retry.rs` (new): `PurgeRetries`, the purges owed again. The first attempt waits one tick,
+  each next attempt twice as long, and a purge is given up (`Recorded::Kept`) once its next attempt would come later
+  than the volume's request timeout after Windows first kept its page, or when the list (one purge per open handle at
+  most) is full. Pure and cfg-free, tested on every host.
+- `crates/bridge-winfsp/src/host.rs`: `DriveFile`, the Win32 `PurgeTarget` (the purge's open made for reading too, a
+  cached open made at the first read back, `ReadFile` into a sector-aligned buffer for the unbuffered read);
+  `Mounted::purge` reports each purge's outcome; a purge-only command (`MountThread::purge`, `Outcome::Purged`); the
+  volume's request timeout set to WinFsp's default from `retry::REQUEST_TIMEOUT_MS`, so the horizon is the volume's own.
+- `crates/bridge-core/src/volume_bridge.rs`: `MAX_OPEN_HANDLES` public, the retry list's bound.
+- `crates/server/src/winfsp.rs`: each mount's `PurgeRetries`; a due purge is sent as a purge-only command when no
+  command is out; the task waits for the next due time or any wake (`idle_or_sleep`), so a wait never holds up a
+  request; `winfsp.purges_untaken`, `winfsp.purges_kept`, `winfsp.purge_retries`.
+- `crates/cli/tests/winfsp.rs`: the mapped-view test waits for the purge to be counted (its read back ends after the
+  view follows) and prints the untaken and given-up purges beside the others.
+- `unsafe-budget.toml`: `slates-bridge-winfsp` 111 → 112, for the `ReadFile`.
+
+The first form of the fix put the round's cursor back and owed the whole round again a tick on, as a deferred round
+is, with no bound: it re-told every record, re-purged every file of the round, and a page a program keeps locked
+(`VirtualLock` on a view, say) would have been purged at full rate for as long as the program held it. Its load run
+(diagnostics run 41332247673) also showed its counters could be read early: on arm64, 3 of 100 iterations read 0
+purges made though the view had followed, since a purge is counted after its read back. Both were changed before
+landing.
+
+**Failing test first.** `purge.rs`'s `a_purge_windows_could_not_drop_a_page_of_is_untaken` and
+`one_page_windows_could_not_drop_makes_the_purge_untaken_and_the_rest_drop` were written against a `purge_through` that
+only wrote its pieces, as the mount's purge did, and failed: `left: Taken, right: Untaken`. With the read back they pass,
+eight of eight. `retry.rs`'s tests were run against a copy of the module with its horizon, its overflow check and its
+bound removed, a retry that never ends: four failed (`attempts never end: 129 made` twice, `left: Retrying, right:
+Kept` twice) and fifteen passed. With them the crate's 29 tests pass.
+
+**Verified under load** (the mapped-view test alone, each iteration's log kept):
+
+| runner, load | before the fix | the fix as it landed |
+|---|---|---|
+| x86_64, two spinners a core and two I/O loops | 9 of 200 stale (runs 41326838360, 41327264613) | 0 of 200 stale; 10 untaken purges retaken (9 at the first retry, 1 at the second), none given up (run 41336524903) |
+| arm64, the same load | 0 of 200 stale | 0 of 100 stale, none untaken (run 41336524903) |
+| arm64, the same load and 40% of memory held (25 x 256 MiB of 16 GiB, touched every 2 s) | 1 of 100 stale (run 41346373137) | 0 of 100 stale (run 41346376630) |
+| arm64, four spinners a core and four I/O loops of 256 MiB, no memory held | 0 of 100 stale (run 41346373137) | 0 of 100 stale (run 41346376630) |
+
+On arm64 the CPU and I/O load alone kept no view stale; holding memory did, so what keeps the page there goes with the
+memory manager's own work.
+
+A heavier load (60% of memory held and touched every 200 ms, four spinners a core, four I/O loops of 256 MiB) kept 2
+arm64 views stale before the fix (run 41332842815), but it starved the daemon (heartbeats 5 to 7 s late against the
+anchor's 1 s budget), so 65 of 96 iterations stalled at setup and it could not measure the fix. The first form of the
+fix kept 0 of 200 views stale on x86_64, with 5 untaken purges each retaken at its first retry (run 41332247673).
+
+## Siblings, reported
+
+- A round a rename's lock deferred, or one WinFsp refused, is still owed again with no bound on its attempts
+  (`crates/server/src/winfsp.rs`, `take_outcomes`). The cause is transient in both cases seen, but nothing bounds them.
+
+- The purge's open through the drive waited about 345 ms under this load (median), with two dispatcher threads serving
+  the mount; not a cause, but the time a view stays stale before any purge.
+- The check doubles a purge's reads of its range (one through the cache, one around it); purges are made only for files
+  Windows holds open with a change.
+- A round owed again tells Windows its records again; WinFsp takes a repeated record as it took the first.

@@ -52,8 +52,10 @@ const NAME_MAX: u32 = 255;
 /// concurrent-open working set (a large build holds a few thousand files open at once), few
 /// enough that the handle table stays about a mebibyte, so a runaway is a typed
 /// `MemError::SlabFull` refusal rather than unbounded growth (audit BUG-4). The precise
-/// per-volume budget-derived cap is owed to the §4.2 admission wiring (GAP-A9-1).
-const MAX_OPEN_HANDLES: usize = 1 << 16;
+/// per-volume budget-derived cap is owed to the §4.2 admission wiring (GAP-A9-1). Public because
+/// what a transport keeps per open handle is bounded by it too (the WinFsp mount's purges owed
+/// again, `slates_bridge_winfsp::retry`).
+pub const MAX_OPEN_HANDLES: usize = 1 << 16;
 /// Shape: the handle slab's segment size — about one page of slots, so the table grows a page at
 /// a time up to [`MAX_OPEN_HANDLES`] and an idle bridge holds one small segment.
 const HANDLE_SEGMENT: usize = 256;

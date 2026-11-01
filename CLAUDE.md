@@ -228,8 +228,13 @@ Every test is written as "do X, expect Y" and names the acceptance criterion or 
     runner: WinFsp turns Windows' data cache on only when `FileInfoTimeout` is infinite (`src/sys/create.c`), so
     paging writes (`ConstrainedIo`, clip them to the file's size) and lazy write-back (`FlushAndPurgeOnCleanup`) arrive
     with it; without `UmFileContextIsUserContext2` every open is handed the first open's context, so per-open boxes
-    are freed twice; and WinFsp's notification cannot purge a mapped file (A-177). jupiter has no WinFsp, so the live
-    tests run on CI only: a request log on a diagnostics branch (never main) is how the runner is read.
+    are freed twice; WinFsp's notification cannot purge a mapped file (A-177); and the coherent purge that can (A-190)
+    may report a page it could not drop as done (`STATUS_CACHE_PAGE_LOCKED` is a success status, and WinFsp answers
+    `STATUS_SUCCESS`), so the mount reads each purge back through the cache and around it. A purge whose reads differ
+    is made again alone, on a doubling wait, until they agree or the volume's request timeout passes
+    (`crates/bridge-winfsp/src/retry.rs`). Unchecked, 9 of 200 views stayed stale under load on the x86_64 runner (the
+    bug record of 2026-11-01). jupiter has no WinFsp, so the live tests run on CI only: a request log on a diagnostics branch (never
+    main) is how the runner is read.
   - State a connection keeps on other shards, released however it ends: `crates/server/src/nfs_writeback.rs`
     (`Footprint`, the shards a connection's calls were served on, owned by the connection and moved with it between
     shards; dropped, it releases the states there and only there, inline on its own shard and by a waiting message

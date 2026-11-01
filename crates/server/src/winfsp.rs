@@ -28,6 +28,10 @@
 //! (`slates_bridge_winfsp::notify`). The mount thread hands the round over; one round is out at a time, and a round
 //! WinFsp could not take (a rename held its lock, or the call failed) puts the cursor back, so it is gathered again.
 //! The mount's own requests move the cursor past their own records, so Windows is never told of what it did itself.
+//! After a round Windows took, the mount thread purges each changed file Windows holds open from its cache and every
+//! view of it (A-190), and reads each purge back: a purge Windows did not take is owed again, alone, after a wait that
+//! doubles from a tick, and sent as a purge-only command once due, until it takes or Windows has kept its page past the
+//! volume's request timeout (`slates_bridge_winfsp::retry`). One command, a round or a purge, is out at a time.
 //!
 //! **Teardown.** A drive letter has nothing beneath it, so ending a mount unmounts it: there is no directory for a later
 //! write by path to fall through to (the FUSE transport's reason to leave an ended mount in place, A-102, does not
@@ -40,14 +44,15 @@ use std::collections::BTreeMap;
 use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
 
 use slates_bridge_core::delivery::{Coherence, Delivered};
-use slates_bridge_core::volume_bridge::new_handle_store;
+use slates_bridge_core::volume_bridge::{MAX_OPEN_HANDLES, new_handle_store};
 use slates_bridge_core::{
   AttachmentId, Bridge, CachedBytes, Invalidation, InvalidationCursor, ObjectId, Rights, View,
   VolumeBridge,
 };
-use slates_bridge_winfsp::host::{MountThread, Notified, Outcome, REQUEST_BOUND, Request};
+use slates_bridge_winfsp::host::{MountThread, Notified, Outcome, Purged, REQUEST_BOUND, Request};
 use slates_bridge_winfsp::notify::{NotifyRound, OpenNames};
 use slates_bridge_winfsp::purge::{Purge, purge_range};
+use slates_bridge_winfsp::retry::{PurgeRetries, REQUEST_TIMEOUT_NS, Recorded};
 use slates_db::Op;
 use slates_db::catalog::{AttachmentRecord, VolumeId};
 use slates_ipc::protocol::{AttachmentCapability, Established, Refusal, ReplyBody};
@@ -85,10 +90,19 @@ const NAMES_TOO_LONG: &str = "winfsp.names_too_long";
 /// Format: files whose changed ranges the mount thread purged from Windows' cache and every view mapped of them
 /// (`slates_bridge_winfsp::purge`, A-190): the non-vacuity counter of the view purge.
 const PURGES_DONE: &str = "winfsp.purges_done";
-/// Format: purges whose open or write was refused (a file renamed or removed since its round).
+/// Format: purges whose open, write or read back was refused (a file renamed or removed since its round).
 const PURGES_REFUSED: &str = "winfsp.purges_refused";
 /// Format: purges not made because WinFsp cannot name an open's process. Zero on a current WinFsp.
 const PURGES_UNAVAILABLE: &str = "winfsp.purges_unavailable";
+/// Format: the counter of purge attempts Windows did not take: written whole, but read back through its cache as bytes
+/// the host no longer holds, so the purge is owed again (`slates_bridge_winfsp::retry`; Step 8 of the VFS and DAX plan,
+/// docs/bugs/2026-11-01-a-winfsp-purge-windows-did-not-take-left-a-mapped-view-stale.md).
+const PURGES_UNTAKEN: &str = "winfsp.purges_untaken";
+/// Format: purges given up after Windows kept their page until the volume's request timeout (or with the retry list
+/// full): a view of the range may stay stale until a later change purges it again. Zero is the healthy reading.
+const PURGES_KEPT: &str = "winfsp.purges_kept";
+/// Format: purge-only commands sent to the mount thread, each the purges owed again that had come due.
+const PURGE_RETRIES: &str = "winfsp.purge_retries";
 /// Format: purge writes the host answered without applying them: the count that shows purges reached the host.
 const PURGE_ECHOES: &str = "winfsp.purge_echoes";
 
@@ -119,6 +133,11 @@ pub(crate) struct WinFspMount {
   waker: std::task::Waker,
   /// Records handed to the mount thread since the last turn counted them ([`RECORDS_TOLD`]).
   told: u64,
+  /// The purges Windows did not take, each owed another attempt after its wait (`slates_bridge_winfsp::retry`).
+  retries: PurgeRetries,
+  /// A purge-only command is out at the mount thread: no round or other purge is sent until its outcome is read, so one
+  /// command is out at a time.
+  purge_out: bool,
 }
 
 impl std::fmt::Debug for WinFspMount {
@@ -237,8 +256,8 @@ async fn await_mounted(
           Some(thread),
         ));
       }
-      // No round is sent before the mount is up, so none can come back.
-      Some(Outcome::Notified(..)) | None => futures::idle().await,
+      // No command (a round or a purge) is sent before the mount is up, so none can come back.
+      Some(Outcome::Notified(..) | Outcome::Purged(_)) | None => futures::idle().await,
     }
   }
 }
@@ -355,6 +374,8 @@ fn established(
       ending: false,
       waker,
       told: 0,
+      retries: PurgeRetries::new(MAX_OPEN_HANDLES, tick_ns(), REQUEST_TIMEOUT_NS),
+      purge_out: false,
     },
   );
   if let Err(e) = s.db.mutate(&mut s.segment, &op, now) {
@@ -376,6 +397,31 @@ fn established(
   (reply, None)
 }
 
+/// Derived: one tick of the mount's pacing, the daemon's heartbeat over the fleet's polls a period: a deferred round's
+/// wait, and the first wait of a purge owed again.
+fn tick_ns() -> u64 {
+  crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD
+}
+
+/// Waits `ns`, or until the task is woken for anything else (a request, a change, the mount thread's outcome), whichever
+/// comes first: a purge's wait that never holds up the mount's other work. Where no timer can be armed (off a shard) it
+/// waits for a wake alone, as a deferred round does.
+async fn idle_or_sleep(ns: u64) {
+  let mut timer = std::pin::pin!(futures::sleep(ns));
+  let mut armed = false;
+  std::future::poll_fn(|cx| {
+    if armed {
+      return std::task::Poll::Ready(());
+    }
+    armed = true;
+    match timer.as_mut().poll(cx) {
+      std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(()),
+      std::task::Poll::Ready(Err(_)) | std::task::Poll::Pending => std::task::Poll::Pending,
+    }
+  })
+  .await;
+}
+
 /// What one turn did.
 enum Turned {
   /// Nothing waited: the task waits for a request, a change, or the mount thread.
@@ -384,6 +430,8 @@ enum Turned {
   Served,
   /// A rename held WinFsp's lock, so the owed round waits a tick.
   RoundDeferred,
+  /// Nothing waited but a purge owed again, due in this many nanoseconds: the task waits that long or until it is woken.
+  RetryIn(u64),
   /// The owner may not serve the volume's latest state now (AUD-29-83): no request was taken.
   Fenced,
   /// The mount ends.
@@ -394,27 +442,35 @@ enum Turned {
 async fn serve(attachment: u64) {
   loop {
     match state::with_state(|s| turn(s, attachment)) {
-      Some(Turned::Served) => {
-        // A served request is client activity, as a FUSE request is (§4.3, §4.7): the shard spins out its idle window
-        // after it, so a burst's next request is taken without a wake.
-        slates_rt::registry::with_current(|ctx| ctx.note_activity());
-        let _ = futures::yield_now().await;
-      }
-      Some(Turned::Idle) => futures::idle().await,
-      Some(Turned::RoundDeferred) => {
-        let tick = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
-        if futures::sleep(tick).await.is_err() {
-          futures::idle().await;
-        }
-      }
-      Some(Turned::Fenced) => crate::daemon::pace(crate::daemon::HEARTBEAT_NS).await,
       Some(Turned::Ended) | None => {
         if let Some(Some(thread)) = state::with_state_counted(|s| ended(s, attachment)) {
           reap(thread).await;
         }
         return;
       }
+      Some(turned) => wait_after(turned).await,
     }
+  }
+}
+
+/// What the task waits for after a turn that did not end the mount.
+async fn wait_after(turned: Turned) {
+  match turned {
+    Turned::Served => {
+      // A served request is client activity, as a FUSE request is (§4.3, §4.7): the shard spins out its idle window
+      // after it, so a burst's next request is taken without a wake.
+      slates_rt::registry::with_current(|ctx| ctx.note_activity());
+      let _ = futures::yield_now().await;
+    }
+    // `Ended` never reaches here: the loop ends the mount before it waits.
+    Turned::Idle | Turned::Ended => futures::idle().await,
+    Turned::RoundDeferred => {
+      if futures::sleep(tick_ns()).await.is_err() {
+        futures::idle().await;
+      }
+    }
+    Turned::RetryIn(ns) => idle_or_sleep(ns).await,
+    Turned::Fenced => crate::daemon::pace(crate::daemon::HEARTBEAT_NS).await,
   }
 }
 
@@ -429,7 +485,7 @@ async fn reap(mut thread: MountThread) {
         thread.join();
         return;
       }
-      Some(Outcome::Mounted(_) | Outcome::Notified(..)) => {}
+      Some(Outcome::Mounted(_) | Outcome::Notified(..) | Outcome::Purged(_)) => {}
       None => futures::idle().await,
     }
   }
@@ -473,10 +529,11 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
     Some(Err(TryRecvError::Disconnected)) | None => return Turned::Ended,
   };
   if request.is_none() && !changed && !mount.owed {
+    let retry_in = send_due_retries(s, mount);
     return if deferred {
       Turned::RoundDeferred
     } else {
-      Turned::Idle
+      retry_in.map_or(Turned::Idle, Turned::RetryIn)
     };
   }
   let Ok(cx) = s.attachments.begin(mount.registry) else {
@@ -490,6 +547,7 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
         names,
         coherence,
         round_out,
+        purge_out,
         owed,
         thread,
         told,
@@ -510,6 +568,7 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
           coherence,
           names,
           round_out,
+          purge_out: *purge_out,
           owed,
           thread,
           told,
@@ -538,13 +597,14 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
       .get(handle)
       .map_or(mount.seen, |slot| slot.volume.change_generation());
   }
+  let retry_in = send_due_retries(s, mount);
   match served {
     Some(served) => {
       answer(s, mount, served);
       Turned::Served
     }
     None if deferred => Turned::RoundDeferred,
-    None => Turned::Idle,
+    None => retry_in.map_or(Turned::Idle, Turned::RetryIn),
   }
 }
 
@@ -555,9 +615,7 @@ fn take_outcomes(s: &mut ShardState, mount: &mut WinFspMount) -> Result<bool, ()
   while let Some(outcome) = mount.thread.outcome() {
     match outcome {
       Outcome::Notified(told, purged) => {
-        s.count(PURGES_DONE, purged.done);
-        s.count(PURGES_REFUSED, purged.refused);
-        s.count(PURGES_UNAVAILABLE, purged.unavailable);
+        record_purges(s, &mut mount.retries, &purged);
         let before = mount.round_out.take().flatten();
         match told {
           Ok(Notified::Taken) => s.count(ROUNDS_TAKEN, 1),
@@ -574,6 +632,10 @@ fn take_outcomes(s: &mut ShardState, mount: &mut WinFspMount) -> Result<bool, ()
           }
         }
       }
+      Outcome::Purged(purged) => {
+        mount.purge_out = false;
+        record_purges(s, &mut mount.retries, &purged);
+      }
       Outcome::Mounted(_) => {}
       Outcome::Stopped => {
         s.count(MOUNT_LOST, 1);
@@ -582,6 +644,46 @@ fn take_outcomes(s: &mut ShardState, mount: &mut WinFspMount) -> Result<bool, ()
     }
   }
   Ok(deferred)
+}
+
+/// Counts what a command's purges came to and records each in the mount's retries: a purge Windows did not take is owed
+/// again after its wait, and given up, counted kept, once Windows has kept its page past the volume's request timeout
+/// (`slates_bridge_winfsp::retry`).
+fn record_purges(s: &mut ShardState, retries: &mut PurgeRetries, purged: &Purged) {
+  s.count(PURGES_UNAVAILABLE, purged.unavailable);
+  let now = futures::now_ns();
+  for (purge, outcome) in &purged.outcomes {
+    match retries.record(purge, *outcome, now) {
+      Recorded::Taken => s.count(PURGES_DONE, 1),
+      Recorded::Refused => s.count(PURGES_REFUSED, 1),
+      Recorded::Retrying => s.count(PURGES_UNTAKEN, 1),
+      Recorded::Kept => {
+        s.count(PURGES_UNTAKEN, 1);
+        s.count(PURGES_KEPT, 1);
+      }
+    }
+  }
+}
+
+/// Sends the mount thread the purges owed again that have come due, when no command is out there, so one command is out
+/// at a time. Answers how long the task may wait before the next falls due: `None` when nothing is owed, or when a
+/// command is out (its outcome wakes the task).
+fn send_due_retries(s: &mut ShardState, mount: &mut WinFspMount) -> Option<u64> {
+  if mount.purge_out || mount.round_out.is_some() {
+    return None;
+  }
+  let now = futures::now_ns();
+  let due = mount.retries.due(now);
+  if due.is_empty() {
+    return mount.retries.next_due_in(now);
+  }
+  if mount.thread.purge(due).is_ok() {
+    mount.purge_out = true;
+    s.count(PURGE_RETRIES, 1);
+    return None;
+  }
+  // The thread is gone (the next turn reads its stop and ends the mount) or busy: the purges stay owed, sent a tick on.
+  Some(tick_ns())
 }
 
 /// What [`deliver_owed`] did.
@@ -596,6 +698,8 @@ struct Rounds<'m> {
   coherence: &'m mut Coherence,
   names: &'m OpenNames,
   round_out: &'m mut Option<Option<InvalidationCursor>>,
+  /// A purge-only command is out, so no round is sent until its outcome is read.
+  purge_out: bool,
   owed: &'m mut bool,
   thread: &'m MountThread,
   told: &'m mut u64,
@@ -617,7 +721,7 @@ fn deliver_owed(
     overruns: 0,
     too_long: 0,
   };
-  if mount.round_out.is_some() {
+  if mount.round_out.is_some() || mount.purge_out {
     return refused;
   }
   let before = mount.coherence.cursor();
