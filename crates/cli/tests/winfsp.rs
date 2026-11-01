@@ -513,7 +513,16 @@ fn a_mapped_view_through_a_winfsp_mount_after_another_paths_change() {
     vec![b'A'; FILE_BYTES],
     "the view reads the volume's bytes"
   );
+  let changing = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map(|since| since.as_micros())
+    .unwrap_or(0);
   fixture.change_through_slates(b'C');
+  let changed = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map(|since| since.as_micros())
+    .unwrap_or(0);
+  eprintln!("DIAG test: the SDK's change from {changing} to {changed}");
   let view_took = follows(b'C', || view.page());
   let reader = std::fs::File::open(&fixture.file).unwrap();
   let read_took = follows(b'C', || read_page(&reader));

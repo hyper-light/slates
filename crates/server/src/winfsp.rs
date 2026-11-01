@@ -640,6 +640,11 @@ fn deliver_owed(
     return refused;
   }
   *mount.owed = false;
+  eprintln!(
+    "DIAG gather at {}: changed {changed:?}, overruns {overruns}, round empty {}",
+    diag_us(),
+    round.is_empty()
+  );
   let too_long = round.too_long();
   if !round.is_empty() {
     let purges = purges_owed(bridge, cx, names, (&changed, overruns > 0));
@@ -685,14 +690,27 @@ fn purges_owed(
   let mut hulls: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
   for (ino, data) in owed {
     if names.open_names(ino).is_empty() {
+      eprintln!("DIAG plan ino {ino} {data:?} at {}: no open name", diag_us());
       continue;
     }
     let Ok(attr) = bridge.getattr(ObjectId::new(ino, 0), cx) else {
+      eprintln!("DIAG plan ino {ino} {data:?} at {}: getattr refused", diag_us());
       continue;
     };
     let Some((offset, len)) = purge_range(&data, attr.size, sector) else {
+      eprintln!(
+        "DIAG plan ino {ino} {data:?} at {}: no range in size {}",
+        diag_us(),
+        attr.size
+      );
       continue;
     };
+    eprintln!(
+      "DIAG plan ino {ino} {data:?} at {}: size {} purge [{offset}, +{len}) names {:?}",
+      diag_us(),
+      attr.size,
+      names.open_names(ino)
+    );
     let end = offset.saturating_add(len);
     hulls
       .entry(ino)
@@ -715,9 +733,18 @@ fn purges_owed(
   purges
 }
 
+/// DIAG (never main): microseconds since the epoch, to order the diagnostics' lines across processes.
+fn diag_us() -> u128 {
+  std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map(|since| since.as_micros())
+    .unwrap_or(0)
+}
+
 /// Publishes when the served request needs it, then sends its reply.
 fn answer(s: &mut ShardState, mount: &WinFspMount, mut served: slates_bridge_winfsp::host::Served) {
   if served.is_purge_echo() {
+    eprintln!("DIAG purge echo at {}", diag_us());
     s.count(PURGE_ECHOES, 1);
   }
   if served.needs_barrier() {
