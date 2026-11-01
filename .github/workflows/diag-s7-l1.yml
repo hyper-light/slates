@@ -1,0 +1,34 @@
+name: diag-s7-l1
+# Diagnostics for Step 7 of the VFS and DAX plan, never main: the nested arm64 KVM host's initramfs and kernel, built on
+# CI's native arm64 runner (Docker is the runner's, never the Mac's), as an artifact the Mac boots under its nested
+# virtualization (vzrun, docs/wip/arm64-kvm-on-a-mac.md).
+on:
+  push:
+    branches: ['diag-s7-l1-*']
+jobs:
+  l1:
+    name: the nested arm64 KVM host's initramfs (Step 7)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the L1 image
+        run: docker build --build-context l1=ci/s7-l1 -t slates-l1 -f ci/s7-l1/Dockerfile .
+      - name: Make the initramfs and take the kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+          C=$(docker create slates-l1); docker export "$C" > rootfs.tar; docker rm "$C"
+          mkdir rootfs
+          # `docker export` writes dev/console as an empty regular file, which the kernel would open as init's console.
+          sudo tar -xf rootfs.tar -C rootfs --exclude=dev/console
+          K=$(cd rootfs && ls boot/vmlinuz-* | head -1); cp "rootfs/$K" l1-kernel
+          (cd rootfs && sudo find . -print0 | sudo cpio --null -o -H newc --quiet) | gzip -1 > l1-initrd.gz
+          ls -la l1-initrd.gz l1-kernel; sha256sum l1-initrd.gz l1-kernel; echo "kernel $K"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: s7-l1
+          path: |
+            l1-initrd.gz
+            l1-kernel
+          retention-days: 7
