@@ -43,6 +43,12 @@
 //! the ones `modules.dep` says those need in turn, and the guest loads them. Without the variable the pmem test skips
 //! loudly, and the drive's test carries no module, so its kernel must build them in.
 //!
+//! **A handed copy (A-197).** Each pmem test runs twice: once with the image file through a slates mount as the pmem
+//! device's backing, and once with a writable copy of it that `slates pmem` hands the VMM at descriptor 3, with no host
+//! mount in the VMM's path. Over the copy the guest's own flush reaches no file: its stores reach the volume when the
+//! launcher compares the copy back, at its SIGUSR1 and at the VM's exit, and the test syncs through the launcher where
+//! over the mount the guest's flush would do.
+//!
 //! The initramfs and Firecracker's configuration are written into a volume of their own through its mount, so the
 //! test writes nothing to disk but its mount points.
 #![cfg(target_os = "linux")]
@@ -65,8 +71,45 @@ use vm::{
   initramfs, kill_the_daemon, run, start_anchor, write_at, write_whole,
 };
 
-/// Shape: the image's capacity: the source's files and the guest's room to write.
+/// Shape: the image's capacity: the source's files and the guest's room to write. A 2 MiB multiple, so a handed copy of
+/// it is the file's own length (`slates pmem` rounds its copy up to 2 MiB).
 const CAPACITY: &str = "32MiB";
+/// Format: the descriptor number `slates pmem` hands its copy at, and the copy's name in the VMM.
+const COPY_FD: &str = "3";
+/// See [`COPY_FD`].
+const COPY_PATH: &str = "/proc/self/fd/3";
+/// Format: the launcher's lines: a sync it made at SIGUSR1, and one it made because its daemon went (A-197).
+const LAUNCHER_SYNCED: &str = "synced: ";
+/// See [`LAUNCHER_SYNCED`].
+const LAUNCHER_RESYNCED: &str = "resynced: ";
+/// Format: the launcher's line once it has let the map go at the VM's exit, comparing the copy back (A-197).
+const LAUNCHER_RELEASED: &str = "released: ";
+/// Format: the exit code a launcher passes on for a VMM a signal ended: 128 and the signal's number, as a shell gives.
+const SIGNALLED_EXIT: i32 = 128;
+
+/// How a pmem device reaches the image's bytes (A-165, A-197).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Backing {
+  /// The image file through a slates mount: the VMM maps the file shared, and its guest's flush, the VMM's `msync` of
+  /// the file, writes the guest's stores into the volume.
+  Mount,
+  /// A writable copy of the image that `slates pmem` hands the VMM at [`COPY_FD`], with no host mount: the guest's
+  /// stores reach the volume at the launcher's sync points (its SIGUSR1, the VM's exit), never at the guest's flush.
+  Handed,
+}
+
+impl Backing {
+  /// Its name, in the rig's instance name and the run's record.
+  fn name(self) -> &'static str {
+    match self {
+      Backing::Mount => "mount",
+      Backing::Handed => "handed",
+    }
+  }
+}
+
+/// Every backing each pmem test runs over.
+const BACKINGS: [Backing; 2] = [Backing::Mount, Backing::Handed];
 /// Format: Firecracker's exit code for a VM stopped by an error (`FcExitCode::GenericError`, as its log names it:
 /// "Firecracker exiting with error. exit_code=1").
 const FIRECRACKER_ERROR_EXIT: i32 = 1;
@@ -931,13 +974,39 @@ impl Rig {
   }
 
   /// Boots the gate's VMM from an initramfs held in the boot volume (Firecracker from a configuration held there too),
-  /// the image presented as `disk` says, and waits until the guest is ready.
+  /// the image presented as `disk` says, through a slates mount, and waits until the guest is ready.
   fn boot(&self, gate: &Gate, disk: &Disk) -> Guest {
+    self.boot_over(gate, disk, Backing::Mount)
+  }
+
+  /// [`Rig::boot`], the pmem device's backing as `backing` says: the image file through the slates mount, or a copy
+  /// `slates pmem` hands the VMM (the VMM then runs as the launcher's child, and the guest's console carries the
+  /// launcher's lines too).
+  fn boot_over(&self, gate: &Gate, disk: &Disk, backing: Backing) -> Guest {
     #[allow(clippy::disallowed_methods)] // reads the probe binary the environment names
     let probe = std::fs::read(&gate.probe).unwrap();
     let initrd = self.boot_mount.file("initramfs.cpio");
     write_whole(&initrd, &initramfs(&probe, disk.modules()));
-    let image = self.image_file();
+    let image = match backing {
+      Backing::Mount => self.image_file(),
+      Backing::Handed => COPY_PATH.to_owned(),
+    };
+    let vmm = |binary: &str| match backing {
+      Backing::Mount => Command::new(binary),
+      Backing::Handed => {
+        let mut launcher = vm::slates();
+        launcher
+          .args([
+            "--instance",
+            &self.instance,
+            "pmem",
+            &self.image,
+            "/image.ext2",
+          ])
+          .args(["--fd", COPY_FD, "--", binary]);
+        launcher
+      }
+    };
     let booting = std::time::Instant::now();
     let guest = match &gate.vmm {
       Vmm::Firecracker { binary, vmlinux } => {
@@ -947,23 +1016,23 @@ impl Rig {
           firecracker_config(vmlinux, &initrd, &image, disk).as_bytes(),
         );
         Guest::spawn(
-          Command::new(binary).args(["--no-api", "--enable-pci", "--config-file", &config]),
+          vmm(binary).args(["--no-api", "--enable-pci", "--config-file", &config]),
           gate.vmm.tag(),
           MOST_BYTES,
         )
       }
       Vmm::Qemu { binary, kernel } => {
         #[allow(clippy::disallowed_methods)]
-        // the image file's length, through the slates mount: RAM, not disk
-        let len = std::fs::metadata(&image).unwrap().len();
+        // the image file's length, through the slates mount: RAM, not disk; a handed copy is as long (2 MiB multiples)
+        let len = std::fs::metadata(self.image_file()).unwrap().len();
         Guest::spawn(
-          Command::new(binary).args(qemu_arguments(kernel, &initrd, (&image, len), disk)),
+          vmm(binary).args(qemu_arguments(kernel, &initrd, (&image, len), disk)),
           gate.vmm.tag(),
           MOST_BYTES,
         )
       }
       Vmm::CloudHypervisor { binary, vmlinux } => Guest::spawn_on_terminal(
-        Command::new(binary).args(cloud_hypervisor_arguments(vmlinux, &initrd, &image, disk)),
+        vmm(binary).args(cloud_hypervisor_arguments(vmlinux, &initrd, &image, disk)),
         gate.vmm.tag(),
         MOST_BYTES,
       ),
@@ -1166,11 +1235,32 @@ fn patch_in(image: &[u8], len: usize, patch_at: usize, what: &str) -> usize {
   found
 }
 
+/// The launcher of a handed copy compares the copy back at its SIGUSR1 (A-197): the bytes its sync wrote, from the
+/// `synced:` line it prints on the guest's console.
+fn launcher_syncs(guest: &mut Guest) -> u64 {
+  rustix::process::kill_process(
+    rustix::process::Pid::from_child(&guest.vm),
+    rustix::process::Signal::USR1,
+  )
+  .unwrap();
+  let line = guest.expect_line(LAUNCHER_SYNCED, REPLY_WAIT);
+  line
+    .rsplit_once(LAUNCHER_SYNCED)
+    .and_then(|(_, written)| written.trim().parse().ok())
+    .unwrap_or_else(|| panic!("no byte count in `{line}`\n{}", guest.transcript()))
+}
+
 /// The guest stores the patch's first `len` bytes through its DAX map of the large file, unsynced, and the host finds
 /// them in the image file, read through the slates mount, at the patch's offset within its block: where the image file
 /// holds them. Nothing in the image was that run before. Without DAX the store would sit in the guest's own page cache
-/// until the guest wrote it back.
-fn guests_store_is_in_the_host_file(rig: &Rig, guest: &mut Guest, len: usize) -> usize {
+/// until the guest wrote it back. Over a mount the map is the file's pages, so the store is there before any sync; over
+/// a handed copy it is in the copy until the launcher compares it back, which the test asks for first.
+fn guests_store_is_in_the_host_file(
+  rig: &Rig,
+  guest: &mut Guest,
+  len: usize,
+  backing: Backing,
+) -> usize {
   let patch_at = rig.source.chunk + PATCH.0;
   assert_eq!(
     run_of(&rig.image_bytes(), len),
@@ -1178,6 +1268,15 @@ fn guests_store_is_in_the_host_file(rig: &Rig, guest: &mut Guest, len: usize) ->
     "the image holds no run of the patch's byte before the guest stores one"
   );
   guest_stores(guest, patch_at, len);
+  if backing == Backing::Handed {
+    assert_eq!(
+      run_of(&rig.image_bytes(), len),
+      None,
+      "over a handed copy the guest's store stays in the copy until the launcher compares it back"
+    );
+    let written = launcher_syncs(guest);
+    assert!(written > 0, "the launcher's sync wrote the guest's store");
+  }
   patch_in(
     &rig.image_bytes(),
     len,
@@ -1220,17 +1319,29 @@ fn hosts_write_shows_in_the_map(
 
 /// The guest stores the patch's last `len` bytes at `map_at` through its map, then syncs. Nothing has opened the image
 /// file since, so only the guest's flush, which the VMM carries out on the file (Firecracker by an `msync`, QEMU 11.1 by
-/// an `fsync`, `hw/virtio/virtio-pmem.c`), writes them into the volume. slates itself, read past the kernel, must then
-/// hold the whole patch at `found`.
+/// an `fsync`, `hw/virtio/virtio-pmem.c`), writes them into the volume over a mount; over a handed copy the flush
+/// reaches no file, so slates holds after it what it held before the store, and the launcher's sync writes them
+/// (A-197). slates itself, read past the kernel, must then hold the whole patch at `found`.
 fn guests_sync_reaches_the_volume(
   rig: &Rig,
   guest: &mut Guest,
-  map_at: usize,
-  len: usize,
-  found: usize,
+  (map_at, len, found): (usize, usize, usize),
+  backing: Backing,
 ) {
+  // The store ends at the patch's end, which lies at `found + PATCH.1` in the image.
+  let stored = found + PATCH.1 - len..found + PATCH.1;
+  let before = rig.held_by_slates().get(stored.clone()).map(<[u8]>::to_vec);
   guest_stores(guest, map_at, len);
   guest.done(&Ask::Sync);
+  if backing == Backing::Handed {
+    assert_eq!(
+      rig.held_by_slates().get(stored).map(<[u8]>::to_vec),
+      before,
+      "over a handed copy the guest's flush reaches no file: slates holds what it held before the guest's store"
+    );
+    let written = launcher_syncs(guest);
+    assert!(written > 0, "the launcher's sync wrote the guest's stores");
+  }
   assert!(
     rig
       .held_by_slates()
@@ -1240,17 +1351,20 @@ fn guests_sync_reaches_the_volume(
   );
 }
 
-/// A-165 by use: a real VM (Firecracker v1.17.0, QEMU) maps a slates volume's image with DAX through a virtio-pmem device.
-/// Do: build the image as the drive test does; boot the VM with the image file, through a slates mount, as its pmem
-/// device, the guest loading the nvdimm modules its kernel needs and mounting the device as ext4 with DAX; have the
-/// guest list every node and map the large file. Then write the patch in three parts: the guest stores its first
-/// quarter through the map, and the host finds it in the image file read through the slates mount; the host writes the
-/// second quarter into the image file through the slates mount, and the guest waits for it in its map; the guest stores
-/// the rest through the map and syncs, and slates itself is read. Make the drive test's other changes, list again, end
-/// the VM and merge. Expect the guest to read every node as the volume holds it; its map to be DAX; its unsynced store
-/// to be in the host's file, at the patch's offset within its block, and nowhere before it; the host's write to show in
-/// the guest's map, the guest touching memory alone; after the guest's sync, slates to hold the whole patch; and the
-/// merge and the clone to hold exactly the guest's tree, the drive test's to the byte.
+/// A-165 by use: a real VM (Firecracker v1.17.0, QEMU, Cloud Hypervisor) maps a slates volume's image with DAX through
+/// a virtio-pmem device. Do: build the image as the drive test does; boot the VM with the image file, through a slates
+/// mount, as its pmem device, the guest loading the nvdimm modules its kernel needs and mounting the device as ext4
+/// with DAX; have the guest list every node and map the large file. Then write the patch in three parts: the guest
+/// stores its first quarter through the map, and the host finds it in the image file read through the slates mount; the
+/// host writes the second quarter into the image file through the slates mount, and the guest waits for it in its map;
+/// the guest stores the rest through the map and syncs, and slates itself is read. Make the drive test's other changes,
+/// list again, end the VM and merge. Expect the guest to read every node as the volume holds it; its map to be DAX; its
+/// unsynced store to be in the host's file, at the patch's offset within its block, and nowhere before it; the host's
+/// write to show in the guest's map, the guest touching memory alone; after the guest's sync, slates to hold the whole
+/// patch; and the merge and the clone to hold exactly the guest's tree, the drive test's to the byte. Then again over a
+/// copy `slates pmem` hands the VMM (A-197), with no host mount in the VMM's path, the launcher's SIGUSR1 following
+/// each store and the guest's sync. Expect the same, and the guest's store not in the host's file until the launcher's
+/// sync, and slates to hold after the guest's own flush exactly what it held before the store.
 #[test]
 fn a_guest_maps_a_volume_image_with_dax_through_virtio_pmem() {
   for gate in Gate::each_from_env() {
@@ -1258,21 +1372,29 @@ fn a_guest_maps_a_volume_image_with_dax_through_virtio_pmem() {
   }
 }
 
-/// [`a_guest_maps_a_volume_image_with_dax_through_virtio_pmem`] in the VMM `gate` names.
+/// [`a_guest_maps_a_volume_image_with_dax_through_virtio_pmem`] in the VMM `gate` names, over each backing.
 fn maps_the_image_with_dax(gate: &Gate) {
   let Some(disk) = pmem_disk(gate) else {
     return;
   };
+  for backing in BACKINGS {
+    maps_the_image_with_dax_over(gate, &disk, backing);
+  }
+}
+
+/// [`maps_the_image_with_dax`] over `backing`.
+fn maps_the_image_with_dax_over(gate: &Gate, disk: &Disk, backing: Backing) {
   let rig = Rig::new(&format!(
-    "guest-pmem-{}-{}",
+    "guest-pmem-{}-{}-{}",
     gate.vmm.name(),
+    backing.name(),
     std::process::id()
   ));
-  let mut guest = rig.boot(gate, &disk);
+  let mut guest = rig.boot_over(gate, disk, backing);
   let patch_at = lists_and_maps(&rig, &mut guest);
   let len = PATCH.1;
   let quarter = len / 4;
-  let found = guests_store_is_in_the_host_file(&rig, &mut guest, quarter);
+  let found = guests_store_is_in_the_host_file(&rig, &mut guest, quarter, backing);
   hosts_write_shows_in_the_map(
     &rig,
     &mut guest,
@@ -1283,9 +1405,8 @@ fn maps_the_image_with_dax(gate: &Gate) {
   guests_sync_reaches_the_volume(
     &rig,
     &mut guest,
-    patch_at + 2 * quarter,
-    len - 2 * quarter,
-    found,
+    (patch_at + 2 * quarter, len - 2 * quarter, found),
+    backing,
   );
   the_other_changes(&mut guest);
   let changed = rig.source.changed_listing();
@@ -1341,7 +1462,10 @@ fn stores_after_the_takeover(rig: &Rig, guest: &mut Guest, patch_at: usize, len:
 /// guest wait for it in its map; store the rest and sync; make the other changes, list, end the VM and merge. Expect the
 /// successor to be a new daemon; the guest to go on; both its stores, the unsynced one included, in the image after the
 /// takeover; the host's write to reach the guest's map; slates to hold the whole patch after the last sync; and the
-/// merge and the clone to hold exactly the guest's tree.
+/// merge and the clone to hold exactly the guest's tree. Then again over a copy `slates pmem` hands the VMM (A-197),
+/// each sync followed by the launcher's SIGUSR1. Expect the same, the launcher to sync as soon as its daemon goes
+/// (`resynced:`), which writes the unsynced store through the successor, and the copy the anchor held to serve the
+/// guest on.
 #[test]
 fn a_daemon_killed_under_a_pmem_guests_live_map_is_taken_over_and_the_guest_goes_on() {
   for gate in Gate::each_from_env() {
@@ -1349,25 +1473,43 @@ fn a_daemon_killed_under_a_pmem_guests_live_map_is_taken_over_and_the_guest_goes
   }
 }
 
-/// [`a_daemon_killed_under_a_pmem_guests_live_map_is_taken_over_and_the_guest_goes_on`] in the VMM `gate` names.
+/// [`a_daemon_killed_under_a_pmem_guests_live_map_is_taken_over_and_the_guest_goes_on`] in the VMM `gate` names, over
+/// each backing.
 fn a_daemon_killed_under_the_map(gate: &Gate) {
   let Some(disk) = pmem_disk(gate) else {
     return;
   };
+  for backing in BACKINGS {
+    a_daemon_killed_under_the_map_over(gate, &disk, backing);
+  }
+}
+
+/// [`a_daemon_killed_under_the_map`] over `backing`. Over a handed copy the anchor holds the copy across the takeover
+/// and the successor takes it back (A-197); the launcher syncs as soon as its daemon goes (`resynced:`), which writes the
+/// guest's unsynced store through the successor before the host looks.
+fn a_daemon_killed_under_the_map_over(gate: &Gate, disk: &Disk, backing: Backing) {
   let rig = Rig::new(&format!(
-    "guest-pmem-takeover-{}-{}",
+    "guest-pmem-takeover-{}-{}-{}",
     gate.vmm.name(),
+    backing.name(),
     std::process::id()
   ));
-  let mut guest = rig.boot(gate, &disk);
+  let mut guest = rig.boot_over(gate, disk, backing);
   let patch_at = lists_and_maps(&rig, &mut guest);
   let quarter = PATCH.1 / 4;
   guest_stores(&mut guest, patch_at, quarter);
   guest.done(&Ask::Sync);
+  if backing == Backing::Handed {
+    let _written = launcher_syncs(&mut guest);
+  }
   guest_stores(&mut guest, patch_at + quarter, quarter);
   let (old, new) = kill_the_daemon(&rig.anchor, &rig.instance);
   assert_ne!(old, new, "the anchor's successor is a new daemon");
   eprintln!("daemon {old} killed under the guest's live map; successor {new}");
+  if backing == Backing::Handed {
+    let resynced = guest.expect_line(LAUNCHER_RESYNCED, REPLY_WAIT);
+    eprintln!("the launcher, its daemon gone: {resynced}");
+  }
   let found = stores_after_the_takeover(&rig, &mut guest, patch_at, 2 * quarter);
   hosts_write_shows_in_the_map(
     &rig,
@@ -1379,9 +1521,8 @@ fn a_daemon_killed_under_the_map(gate: &Gate) {
   guests_sync_reaches_the_volume(
     &rig,
     &mut guest,
-    patch_at + 3 * quarter,
-    PATCH.1 - 3 * quarter,
-    found,
+    (patch_at + 3 * quarter, PATCH.1 - 3 * quarter, found),
+    backing,
   );
   the_other_changes(&mut guest);
   assert_eq!(
@@ -1403,7 +1544,9 @@ fn a_daemon_killed_under_the_map(gate: &Gate) {
 /// (ext4 leaves a file system it mounted unchecked unchecked at its unmount); the second guest to read the patched file;
 /// e2fsck to leave the file system clean, its one repair the `lost+found` it makes (slates' images carry none, A-160),
 /// so the crash left nothing else to mend; and the last merge to take that directory as new, move and remove nothing,
-/// and write the one page the patch lies in, its clone holding the patched tree and `lost+found`.
+/// and write the one page the patch lies in, its clone holding the patched tree and `lost+found`. Then again over a
+/// copy `slates pmem` hands the VMM (A-197), the VMM alone killed under its launcher. Expect the same, the launcher to
+/// let the map go at the VM's exit, comparing the copy back (`released:`), and to exit 137 as its VMM did.
 #[test]
 fn a_pmem_guest_killed_with_unsynced_stores_leaves_them_in_the_image_for_a_checked_merge() {
   for gate in Gate::each_from_env() {
@@ -1411,7 +1554,8 @@ fn a_pmem_guest_killed_with_unsynced_stores_leaves_them_in_the_image_for_a_check
   }
 }
 
-/// [`a_pmem_guest_killed_with_unsynced_stores_leaves_them_in_the_image_for_a_checked_merge`] in the VMM `gate` names.
+/// [`a_pmem_guest_killed_with_unsynced_stores_leaves_them_in_the_image_for_a_checked_merge`] in the VMM `gate` names,
+/// over each backing.
 fn a_guest_killed_with_unsynced_stores(gate: &Gate) {
   let Some(disk) = pmem_disk(gate) else {
     return;
@@ -1422,15 +1566,71 @@ fn a_guest_killed_with_unsynced_stores(gate: &Gate) {
     );
     return;
   }
+  for backing in BACKINGS {
+    a_guest_killed_with_unsynced_stores_over(gate, &disk, backing);
+  }
+}
+
+/// Kills the VMM a handed copy's launcher runs, with `SIGKILL`, as a crashed VMM dies, and waits for the launcher to
+/// end: it lets the map go at the VM's exit, which compares the copy back (A-197), says so, and exits as its VMM did.
+fn kill_the_vmm_under_its_launcher(guest: &mut Guest) {
+  let launcher = guest.vm.id();
+  #[allow(clippy::disallowed_methods)] // reads the kernel's process table: a query, never a write
+  let children = std::fs::read_to_string(format!("/proc/{launcher}/task/{launcher}/children"))
+    .unwrap_or_default();
+  let vmm: i32 = children
+    .split_whitespace()
+    .next()
+    .and_then(|pid| pid.parse().ok())
+    .unwrap_or_else(|| panic!("the launcher {launcher} runs a VMM\n{}", guest.transcript()));
+  rustix::process::kill_process(
+    rustix::process::Pid::from_raw(vmm).unwrap(),
+    rustix::process::Signal::KILL,
+  )
+  .unwrap();
+  let started = std::time::Instant::now();
+  let status = loop {
+    if let Some(status) = guest.vm.try_wait().unwrap() {
+      break status;
+    }
+    assert!(
+      started.elapsed() < QUIT_WAIT,
+      "the launcher ended within {QUIT_WAIT:?} once its VMM was killed\n{}",
+      guest.transcript()
+    );
+    vm::pause();
+  };
+  guest.drain(QUIT_WAIT);
+  let killed = SIGNALLED_EXIT + rustix::process::Signal::KILL.as_raw();
+  assert_eq!(
+    status.code(),
+    Some(killed),
+    "the launcher exits as its killed VMM did\n{}",
+    guest.transcript()
+  );
+  assert!(
+    guest.said(LAUNCHER_RELEASED),
+    "the launcher let the map go at the VM's exit, comparing the copy back\n{}",
+    guest.transcript()
+  );
+}
+
+/// [`a_guest_killed_with_unsynced_stores`] over `backing`. Over a handed copy the VMM alone is killed: its launcher lets
+/// the map go at the VM's exit, which writes the guest's unsynced stores into the image, as a mount's file holds them.
+fn a_guest_killed_with_unsynced_stores_over(gate: &Gate, disk: &Disk, backing: Backing) {
   let rig = Rig::new(&format!(
-    "guest-pmem-crash-{}-{}",
+    "guest-pmem-crash-{}-{}-{}",
     gate.vmm.name(),
+    backing.name(),
     std::process::id()
   ));
-  let mut first = rig.boot(gate, &disk);
+  let mut first = rig.boot_over(gate, disk, backing);
   let patch_at = lists_and_maps(&rig, &mut first);
   guest_stores(&mut first, patch_at, PATCH.1);
-  first.kill();
+  match backing {
+    Backing::Mount => first.kill(),
+    Backing::Handed => kill_the_vmm_under_its_launcher(&mut first),
+  }
   patch_in(
     &rig.held_by_slates(),
     PATCH.1,
@@ -1438,7 +1638,7 @@ fn a_guest_killed_with_unsynced_stores(gate: &Gate) {
     "slates itself, after the VM's death",
   );
   rig.merge_is_refused_unclean("refused-after-the-kill", "after the guest's death");
-  let mut second = rig.boot(gate, &disk);
+  let mut second = rig.boot_over(gate, disk, backing);
   let patched = rig.source.patched_listing();
   assert_eq!(
     listed(&mut second),

@@ -12766,7 +12766,8 @@ Applied in the same change to: A-186 (the copy's length), GAPS, `crates/ipc` (`p
 `ClientEnd::daemon_watch`), `crates/client` (`Client::daemon_watch`), `crates/server` (`held_copy.rs`, new;
 `anchor_hold.rs`, `config.rs`: `held_copy_bound`, `daemon.rs`, `direct_map.rs`, `reap.rs`, `state.rs`, `verbs.rs`:
 recovery keeps a held copy's writer and takes its copy back before the write log's replay), `crates/cli` (the
-launcher's watch on its daemon; `anchor.rs`).
+launcher's watch on its daemon; `anchor.rs`). The real VMMs (Step 6.3): `crates/cli/tests/guest_image.rs` (each pmem
+test over both backings) and `tests/vm/mod.rs` (`Guest::expect_line`).
 - **What it answers.** A pmem VMM reached a slates volume only through a host mount: Firecracker, Cloud Hypervisor and
   QEMU map an image file shared as a virtio-pmem device's memory, and the file was a path through a slates mount (the
   image form's pmem route, A-160, A-165, A-189). Firecracker has no folder sharing at all, so its socket-route cell was
@@ -12843,8 +12844,23 @@ launcher's watch on its daemon; `anchor.rs`).
     its bound and refuses malformed handoffs (`crates/anchor/src/held.rs`, 4 tests). The recovery oracle 43 of 43, the
     anchor's suites and the client's on Linux; the client package once ran eight of its tests `Stalled` past the 1 s
     reply deadline at load 50, and passed whole in each of three runs after.
-- **Owed** (GAPS): `guest_image.rs`'s three pmem tests over a handed copy with Firecracker, Cloud Hypervisor and QEMU,
-  and Firecracker on arm64; the adversarial and chaos tests; the DAX matrix's cells.
+- **Through real VMMs** (Step 6.3). `crates/cli/tests/guest_image.rs` runs each of its three pmem tests twice: over the
+  image file through a slates mount, and over a copy `slates pmem` hands the VMM at descriptor 3, with no host mount in
+  the VMM's path (Firecracker's `path_on_host`, Cloud Hypervisor's `--pmem file=` and QEMU's `mem-path=` each name
+  `/proc/self/fd/3`). Over the copy the test sends the launcher SIGUSR1 where over the mount the guest's flush writes,
+  and holds what only the copy does: the guest's store is not in the host's file until the launcher's sync; after the
+  guest's own flush slates holds exactly the bytes it held before the store; when the daemon is killed under the live
+  map, the launcher's resync writes the store the guest left unsynced through the successor, and the copy the anchor
+  held serves the guest on; and a VMM killed under its launcher has its unsynced stores compared back at its exit
+  (`released:`), the launcher exiting 137 as its VMM did.
+  - **Proven** (adacachy: Linux 7.2.9, x86_64; 2026-11-01): three of three in each of three runs with Firecracker
+    v1.17.0 and Cloud Hypervisor v54.0, over both backings, 30 to 42 s a run at load 21 to 37; the resync wrote 498
+    bytes each time, the quarter of the patch the guest left unsynced less the two bytes the file already held as the
+    patch's byte. QEMU 11.1 (CI's guest image, from Debian's trixie-backports) on CI's ubuntu runner: three of three in
+    each of three runs, 31 to 32 s a run, the resync 498 bytes each time (diagnostics run 41307486734). Red-checked in
+    a copy of the tree: with the guest mounting `dax=never` over the handed copy alone, the test failed at the DAX
+    check (`map docs/sub/b.bin → Mapped { dax: false }`, exit 101), on adacachy with Firecracker and on CI with QEMU.
+- **Owed** (GAPS): Firecracker on arm64; the adversarial and chaos tests; the DAX matrix's cells.
 
 ### A-196 — A guest's write through slates' own device or a Shards stream is answered once every FUSE mount of its volume has been told, and the device serves on while the reply waits (accepted and built 2026-11-01)
 Applied in the same change to: §4.6 ("Cache posture": the paragraph on when a mount is told), Phase 3's AC-3.3, A-191

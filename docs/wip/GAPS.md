@@ -10383,12 +10383,18 @@ pmem.rs` 6 of 6 in each of three runs, with the takeover and the unclaimed copy;
 the adoption, and without the reclaim. A client package run once stalled eight tests past the 1 s reply deadline at load
 50, and passed whole in three runs after.
 
+**Built (A-197, Step 6.3): through real VMMs.** `crates/cli/tests/guest_image.rs` runs its three pmem tests over the
+image file through a slates mount and over a copy `slates pmem` hands the VMM, with no host mount in the VMM's path: the
+guest's store is not in the host's file until the launcher's sync, the guest's own flush changes nothing slates holds,
+the launcher's resync carries an unsynced store across a takeover, and a VMM killed under its launcher has its stores
+compared back at its exit. Proven 3 of 3 in each of three runs with Firecracker v1.17.0 and Cloud Hypervisor v54.0 on
+adacachy (2026-11-01), and with QEMU 11.1 on CI (diagnostics run 41307486734); red-checked with the guest mounting
+`dax=never` over the copy, which fails at the DAX check.
+
 **Owed:**
 - macOS and Windows writable copies across a takeover: a macOS copy keeps a second descriptor the anchor does not hold,
   and Windows' anchor holds no descriptors;
-- `crates/cli/tests/guest_image.rs`'s three pmem tests over a handed copy, no host mount as the backing, with
-  Firecracker and Cloud Hypervisor on adacachy and QEMU on CI, and Firecracker on arm64 on the nested host Step 7
-  builds;
+- Firecracker on arm64 over a handed copy, on the nested host Step 7 builds;
 - the adversarial and chaos tests: writes past the image's end, a flush storm with no slates I/O, a guest killed
   mid-store;
 - the DAX matrix's Firecracker socket-route cell, which stays "impossible" until the tests above pass.
