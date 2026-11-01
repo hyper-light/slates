@@ -10391,12 +10391,20 @@ compared back at its exit. Proven 3 of 3 in each of three runs with Firecracker 
 adacachy (2026-11-01), and with QEMU 11.1 on CI (diagnostics run 41307486734); red-checked with the guest mounting
 `dax=never` over the copy, which fails at the DAX check.
 
+**Built (A-197, Step 6.4): a hostile guest over a handed copy.** Three tests of `crates/cli/tests/guest_image.rs`,
+through probe commands made for them: the guest's writes through its block device past the image's end stay in the copy
+(the image keeps its length and slates holds none of them, after the launcher's sync and the VM's end); 10,000
+store-and-sync rounds ask nothing of slates (served requests rise by a status read's alone, no map syncs, slates holds
+none of the stores); a guest killed mid-sweep leaves one sweep's byte up to the kill and the sweep before's after it,
+every stored byte compared back at the VM's exit. Seven of seven tests in each of three runs with Firecracker and Cloud
+Hypervisor on adacachy (2026-11-01), and with QEMU 11.1 on CI (diagnostics run 41310124785); red-checked with both
+past-end guards removed (the image grew to 33,554,432 bytes), the storm over a mount (the patch reached slates) and a
+release without its compare-back (0 bytes).
+
 **Owed:**
 - macOS and Windows writable copies across a takeover: a macOS copy keeps a second descriptor the anchor does not hold,
   and Windows' anchor holds no descriptors;
 - Firecracker on arm64 over a handed copy, on the nested host Step 7 builds;
-- the adversarial and chaos tests: writes past the image's end, a flush storm with no slates I/O, a guest killed
-  mid-store;
 - the DAX matrix's Firecracker socket-route cell, which stays "impossible" until the tests above pass.
 
 ### 2026-11-01: one window kind: the fd-sharing placer maps per-file backings, and the arena's windows are gone (A-195)

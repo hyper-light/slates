@@ -310,7 +310,7 @@ jobs:
              SLATES_GUEST_PROBE="/src/target/probe/$host/release/slates-guest-probe" \
              cargo test -p slates-cli --test guest_image -- --nocapture --test-threads=1' 2>&1 | tee guest-image.log
           if grep -q "SKIP" guest-image.log; then echo "an image test was skipped"; exit 1; fi
-          grep -q "test result: ok. 4 passed" guest-image.log
+          grep -q "test result: ok. 7 passed" guest-image.log
 
   # The two SDKs as a user installs them (§2.4; docs/publish.md), by use on Linux and macOS. The
   # cp39-abi3 wheel maturin builds is installed into a fresh venv after twine checks its metadata

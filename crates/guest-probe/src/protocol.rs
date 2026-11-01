@@ -19,6 +19,8 @@ const STORE_ARGUMENTS: usize = 3;
 const WAIT_ARGUMENTS: usize = 3;
 /// Format: the arguments `patch` takes: a path, an offset and the bytes.
 const PATCH_ARGUMENTS: usize = 3;
+/// Format: the arguments `storm` takes: an offset, a length, a byte and a count of rounds.
+const STORM_ARGUMENTS: usize = 4;
 /// Format: the words an `entry` reply carries after its verb: a kind, a size, a digest and a path.
 const ENTRY_WORDS: usize = 4;
 /// Format: the byte runs of no bytes at all, so an empty file's `write` keeps its argument.
@@ -29,6 +31,15 @@ const DIGEST_RADIX: u32 = 16;
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 /// See [`FNV_OFFSET`].
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// The byte sweep `sweep` of a [`Command::Sweep`] stores: 1 to 255 in turn, so two sweeps in a row store different bytes
+/// and none stores 0, the byte of a page nobody wrote.
+pub fn sweep_value(sweep: u64) -> u8 {
+  sweep
+    .checked_rem(u64::from(u8::MAX))
+    .and_then(|step| u8::try_from(step).ok())
+    .map_or(1, |step| step.saturating_add(1))
+}
 
 /// The digest an `entry` carries for `bytes` (a file's, or a symbolic link's target): FNV-1a over them. A check that
 /// the guest read what the host wrote, not a cryptographic one: nothing here is adversarial.
@@ -157,6 +168,36 @@ pub enum Command {
   },
   /// Write every dirty block of the mounted file system out to its device (`sync`).
   Flush,
+  /// Write `bytes` into the guest's block device (the one the kernel command line names) at `at`, past any file system
+  /// on it; sync the device, drop its cached pages for those bytes, and read them back from the device itself.
+  Device {
+    /// The first byte, counted from the device's start.
+    at: u64,
+    /// The bytes.
+    bytes: Vec<u8>,
+  },
+  /// Store `byte` into the map's bytes `[at, at + len)` and `msync` the whole map, `rounds` times over. Each sync
+  /// writes the page back and write-protects it, so the next round's store dirties it again and each sync flushes the
+  /// device once.
+  Storm {
+    /// The first byte stored.
+    at: u64,
+    /// How many bytes each round stores.
+    len: u64,
+    /// The value stored.
+    byte: u8,
+    /// How many store-and-sync rounds.
+    rounds: u64,
+  },
+  /// Store into the map's bytes `[0, len)` one byte at a time, in order, `sweeps` times over, sweep `s` storing
+  /// [`sweep_value`]`(s)`. A guest killed during a sweep leaves that sweep's value up to the byte it reached and the
+  /// sweep before's after it, where a processor makes its stores visible in program order.
+  Sweep {
+    /// How many bytes each sweep stores.
+    len: u64,
+    /// How many sweeps.
+    sweeps: u64,
+  },
   /// Unmap, unmount, sync and power the VM off.
   Quit,
 }
@@ -184,6 +225,11 @@ pub enum Reply {
   TimedOut {
     /// The value the byte held at the end.
     seen: u8,
+  },
+  /// A storm's rounds were done in this many microseconds.
+  Stormed {
+    /// Microseconds from the first round's store to the last round's sync.
+    micros: u64,
   },
   /// One node of a [`Command::List`]: its kind, its size (a file's length, a link's target's), the [`digest`] of its
   /// bytes or target (zero for anything else), and its path under the mount.
@@ -278,6 +324,14 @@ impl Command {
       Command::Remove { path } => format!("remove {path}"),
       Command::Mkdir { path } => format!("mkdir {path}"),
       Command::Flush => "flush".to_owned(),
+      Command::Device { at, bytes } => format!("device {at} {}", runs_or_none(bytes)),
+      Command::Storm {
+        at,
+        len,
+        byte,
+        rounds,
+      } => format!("storm {at} {len} {byte} {rounds}"),
+      Command::Sweep { len, sweeps } => format!("sweep {len} {sweeps}"),
       Command::Quit => "quit".to_owned(),
     }
   }
@@ -328,6 +382,13 @@ impl Command {
         })
       }
       "flush" => exactly::<0>("flush", arguments).map(|[]| Command::Flush),
+      "device" => {
+        let [at, runs] = exactly::<2>("device", arguments)?;
+        Ok(Command::Device {
+          at: number(at)?,
+          bytes: bytes_or_none(runs, most_bytes)?,
+        })
+      }
       _ => Command::parse(line),
     }
   }
@@ -373,6 +434,22 @@ impl Command {
           millis: number(millis)?,
         })
       }
+      "storm" => {
+        let [at, len, byte, rounds] = exactly::<STORM_ARGUMENTS>("storm", arguments)?;
+        Ok(Command::Storm {
+          at: number(at)?,
+          len: number(len)?,
+          byte: number(byte)?,
+          rounds: number(rounds)?,
+        })
+      }
+      "sweep" => {
+        let [len, sweeps] = exactly::<2>("sweep", arguments)?;
+        Ok(Command::Sweep {
+          len: number(len)?,
+          sweeps: number(sweeps)?,
+        })
+      }
       "quit" => exactly::<0>("quit", arguments).map(|[]| Command::Quit),
       other => Err(ProtocolError::UnknownVerb(other.to_owned())),
     }
@@ -389,6 +466,7 @@ impl Reply {
       Reply::Bytes(bytes) => format!("bytes {}", runs_of(bytes)),
       Reply::Waited { micros } => format!("waited {micros}"),
       Reply::TimedOut { seen } => format!("timedout {seen}"),
+      Reply::Stormed { micros } => format!("stormed {micros}"),
       Reply::Entry {
         kind,
         size,
@@ -419,6 +497,7 @@ impl Reply {
       "bytes" => bytes_of(rest, most_bytes).map(Reply::Bytes),
       "waited" => number(rest).map(|micros| Reply::Waited { micros }),
       "timedout" => number(rest).map(|seen| Reply::TimedOut { seen }),
+      "stormed" => number(rest).map(|micros| Reply::Stormed { micros }),
       "entry" => entry_of(rest),
       "refused" => Ok(Reply::Refused(rest.to_owned())),
       "fatal" => Ok(Reply::Fatal(rest.to_owned())),
@@ -524,6 +603,16 @@ mod tests {
         byte: 72,
         millis: 10_000,
       },
+      Command::Storm {
+        at: 65_636,
+        len: 2_000,
+        byte: 35,
+        rounds: 10_000,
+      },
+      Command::Sweep {
+        len: 196_608,
+        sweeps: u64::MAX,
+      },
       Command::Quit,
     ] {
       assert_eq!(Command::parse(&command.encode()), Ok(command));
@@ -562,8 +651,26 @@ mod tests {
         path: "made".to_owned(),
       },
       Command::Flush,
+      Command::Device {
+        at: 32_505_856,
+        bytes: vec![35u8; 65_536],
+      },
     ] {
       assert_eq!(Command::parse_within(&command.encode(), ROOMY), Ok(command));
+    }
+  }
+
+  /// Do: take the byte of the first sweeps and of the sweeps around the cycle's end. Expect 1, 2, … 255, then 1 again:
+  /// two sweeps in a row never store the same byte, and none stores 0.
+  #[test]
+  fn sweeps_store_one_to_255_in_turn() {
+    assert_eq!(
+      [0, 1, 253, 254, 255, 256].map(sweep_value),
+      [1, 2, 254, 255, 1, 2]
+    );
+    for sweep in 0..1_000u64 {
+      assert_ne!(sweep_value(sweep), 0);
+      assert_ne!(sweep_value(sweep), sweep_value(sweep + 1));
     }
   }
 
@@ -621,6 +728,7 @@ mod tests {
       Reply::Bytes(Vec::new()),
       Reply::Waited { micros: 509 },
       Reply::TimedOut { seen: 104 },
+      Reply::Stormed { micros: 412_345 },
       Reply::Refused("no map yet".to_owned()),
       Reply::Fatal("mount virtiofs slates: ENODEV".to_owned()),
     ] {
@@ -719,6 +827,37 @@ mod tests {
     assert_eq!(
       Command::parse("read -1 4"),
       Err(ProtocolError::Number("-1".to_owned()))
+    );
+  }
+
+  /// Do: parse hostile lines of the hostile guest's commands: a storm short of an argument, a sweep count past `u64`,
+  /// a device write holding more bytes than the reader allows, and one with no bytes. Expect each refused with its own
+  /// error, never a command.
+  #[test]
+  fn hostile_storm_sweep_and_device_lines_are_refused_by_name() {
+    assert_eq!(
+      Command::parse("storm 0 1 35"),
+      Err(ProtocolError::Arguments {
+        verb: "storm",
+        wanted: 4,
+        got: 3
+      })
+    );
+    assert_eq!(
+      Command::parse("sweep 4096 18446744073709551616"),
+      Err(ProtocolError::Number("18446744073709551616".to_owned()))
+    );
+    assert!(matches!(
+      Command::parse_within("device 0 35x4097", 4096),
+      Err(ProtocolError::Runs(_))
+    ));
+    assert_eq!(
+      Command::parse_within("device 4096", ROOMY),
+      Err(ProtocolError::Arguments {
+        verb: "device",
+        wanted: 2,
+        got: 1
+      })
     );
   }
 }

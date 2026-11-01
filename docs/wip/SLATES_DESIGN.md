@@ -12767,7 +12767,10 @@ Applied in the same change to: A-186 (the copy's length), GAPS, `crates/ipc` (`p
 `anchor_hold.rs`, `config.rs`: `held_copy_bound`, `daemon.rs`, `direct_map.rs`, `reap.rs`, `state.rs`, `verbs.rs`:
 recovery keeps a held copy's writer and takes its copy back before the write log's replay), `crates/cli` (the
 launcher's watch on its daemon; `anchor.rs`). The real VMMs (Step 6.3): `crates/cli/tests/guest_image.rs` (each pmem
-test over both backings) and `tests/vm/mod.rs` (`Guest::expect_line`).
+test over both backings) and `tests/vm/mod.rs` (`Guest::expect_line`). The hostile guests (Step 6.4):
+`crates/guest-probe` (`protocol.rs`: `device`, `storm`, `sweep`, the `stormed` reply and `sweep_value`; `guest.rs`),
+`crates/cli/tests/guest_image.rs` (three tests over a handed copy), `tests/vm/mod.rs` (`Guest::last_line_holding`)
+and CI's image-form step (seven tests).
 - **What it answers.** A pmem VMM reached a slates volume only through a host mount: Firecracker, Cloud Hypervisor and
   QEMU map an image file shared as a virtio-pmem device's memory, and the file was a path through a slates mount (the
   image form's pmem route, A-160, A-165, A-189). Firecracker has no folder sharing at all, so its socket-route cell was
@@ -12860,7 +12863,41 @@ test over both backings) and `tests/vm/mod.rs` (`Guest::expect_line`).
     each of three runs, 31 to 32 s a run, the resync 498 bytes each time (diagnostics run 41307486734). Red-checked in
     a copy of the tree: with the guest mounting `dax=never` over the handed copy alone, the test failed at the DAX
     check (`map docs/sub/b.bin → Mapped { dax: false }`, exit 101), on adacachy with Firecracker and on CI with QEMU.
-- **Owed** (GAPS): Firecracker on arm64; the adversarial and chaos tests; the DAX matrix's cells.
+- **A hostile guest** (Step 6.4). Three tests of `guest_image.rs` play a guest over a handed copy that the launcher and
+  the daemon must survive, each through a probe command made for it.
+  - **A write past the image's end stays in the copy.** The copy is the file's length rounded up to 2 MiB, so the
+    guest's pmem device runs past the file's end. Over a 31 MiB image the guest wrote 64 KiB through its block device
+    at the image's end (32,505,856) and at the copy's last 64 KiB (33,488,896 of its 33,554,432 bytes), each read back
+    from the device with its cached pages dropped, so from the copy itself. After the launcher's sync (42 to 52 bytes,
+    the mount's metadata, within the file) and after the VM's end, the image kept its length, alone in its volume,
+    slates held none of those bytes, and the merge changed nothing. Two guards hold it, each enough alone: a
+    compare-back stops at the file's length when it began (`direct_map.rs`), and compares only as far as the file's
+    bytes reach (`write_back_runs` in `crates/bridge-core/src/dax_backing.rs`). Red-checked in a copy of the tree:
+    with the first removed the second held and the test passed its checks; with both removed the launcher's sync wrote
+    131,124 bytes, the two runs and the metadata, and the image grew to 33,554,432 bytes, which the test refused.
+  - **A flush storm asks nothing of slates.** The guest stored the patch and synced its map 10,000 times over, each
+    sync a flush of its device, in 241 to 795 ms. The daemon's served requests (every client request records its
+    completion) rose by what a `slates status` read costs alone, no map was synced, and slates held none of the stores;
+    the launcher's one sync then raised both counts and put the patch in slates. Served requests count no FUSE request,
+    so the bytes are the check that no flush wrote through any path: red-checked over the image file through a mount,
+    the same storm left the patch in slates and the test refused it.
+  - **A guest killed mid-store leaves each byte compared back or lost.** The guest swept the large file's whole pages
+    (196,608 bytes) a byte at a time, sweep after sweep, each sweep's byte one more than the last's; the launcher synced
+    until a sync wrote at least half a sweep's bytes, so the guest was storing; then the VMM alone was killed. Its
+    launcher's compare-back at the VM's exit wrote what the guest had changed since the last sync (all 196,608 swept
+    bytes each time on adacachy, where it had swept on), and the launcher exited 137; a second guest read one sweep's byte up to the point the kill reached and the sweep before's
+    after it, exactly, as x86's in-order stores leave them; the file's last part, the other files, the image's length
+    and the other volumes were as they were. Each of the six kills landed mid-sweep (sweeps 42 to 227, at bytes 4,204
+    to 147,662). Red-checked with a release that lets the copy go without comparing it back: it wrote 0 bytes, which
+    the test refused. arm64 may make stores visible out of order, so there the test holds each byte past the point to
+    the sweep's byte or what was there; and a kill during the first sweep would leave the file's own bytes past the
+    point, which the test takes as the sweep before's.
+  - **Proven** (adacachy, 2026-11-01): the seven tests of `guest_image.rs`, the three above among them, seven of seven
+    in each of three runs with Firecracker v1.17.0 and Cloud Hypervisor v54.0, 52 to 73 s a run at load 23 to 33.
+    QEMU 11.1 on CI's ubuntu runner: seven of seven in each of three runs, 50 to 51 s a run (diagnostics run
+    41310124785); its storms took 811 to 850 ms, each kill landed mid-sweep (sweeps 136 to 189, at bytes 3,670 to
+    168,301), and each release at the VM's exit wrote 192,600 to 196,608 bytes.
+- **Owed** (GAPS): Firecracker on arm64; the DAX matrix's cells.
 
 ### A-196 — A guest's write through slates' own device or a Shards stream is answered once every FUSE mount of its volume has been told, and the device serves on while the reply waits (accepted and built 2026-11-01)
 Applied in the same change to: §4.6 ("Cache posture": the paragraph on when a mount is told), Phase 3's AC-3.3, A-191

@@ -25,6 +25,12 @@
 //! ext2 image). A distribution's kernel builds virtio-pmem and the nvdimm drivers behind it as modules, so with
 //! `slates.modules=` the guest first loads the modules its initramfs carries under `/modules`, in the order named, and
 //! waits for the device's node, which the drivers create after their loads return.
+//!
+//! **A hostile pmem guest (A-197).** Three commands play a guest the host must survive when its pmem device is a copy
+//! `slates pmem` hands the VMM: `device` writes the block device past the file system's end, which over a copy rounded
+//! up to 2 MiB is past the image file's end, and reads the bytes back from the device once its cached pages are dropped;
+//! `storm` stores and syncs over and over, each sync a flush of the device; `sweep` stores sweep after sweep, a byte at
+//! a time and in order, so a VM killed during one leaves a known boundary in the copy.
 
 use std::ffi::{CStr, CString, c_int};
 use std::io::Write;
@@ -38,7 +44,9 @@ use rustix::mount::{MountFlags, UnmountFlags};
 use rustix::system::RebootCommand;
 use rustix::termios::OptionalActions;
 use rustix::time::ClockId;
-use slates_guest_probe::protocol::{Command, EntryKind, LONGEST_COMMAND, Reply, digest};
+use slates_guest_probe::protocol::{
+  Command, EntryKind, LONGEST_COMMAND, Reply, digest, sweep_value,
+};
 
 /// Format: where the guest mounts the shared tag.
 const MOUNT_POINT: &str = "/mnt";
@@ -138,7 +146,7 @@ fn serve(end: &mut End) -> Result<(), String> {
         list()?;
         Reply::Done
       }
-      Ok(command) => execute(command, &mut map),
+      Ok(command) => execute(command, &mut map, option(&cmdline, BLOCK_KEY)),
       Err(refusal) => Reply::Refused(refusal.to_string()),
     };
     say(&reply)?;
@@ -150,8 +158,8 @@ fn serve(end: &mut End) -> Result<(), String> {
   say(&Reply::Done)
 }
 
-/// One command, carried out against the map or the mounted file system.
-fn execute(command: Command, map: &mut Option<SharedMap>) -> Reply {
+/// One command, carried out against the map, the mounted file system or the block device `block` names.
+fn execute(command: Command, map: &mut Option<SharedMap>, block: Option<&str>) -> Reply {
   match command {
     Command::Map { path, pages } => match SharedMap::open(&path, pages) {
       Ok((made, dax)) => {
@@ -169,6 +177,7 @@ fn execute(command: Command, map: &mut Option<SharedMap>) -> Reply {
       rustix::fs::sync();
       Reply::Done
     }
+    Command::Device { at, bytes } => done_or_refused(write_device(block, at, &bytes)),
     other => match map.as_ref() {
       Some(mapped) => mapped.answer(other),
       None => Reply::Refused("no map has been made".to_owned()),
@@ -209,6 +218,50 @@ fn patch_file(path: &str, at: u64, bytes: &[u8]) -> Result<(), String> {
     .open(under_mount(path)?)
     .and_then(|file| file.write_all_at(bytes, at))
     .map_err(|e| format!("patch {path} at {at}: {e}"))
+}
+
+/// Writes `bytes` into the block device `block` at `at`, syncs the device, drops its cached pages for those bytes and
+/// reads them back, so the read comes from the device itself (a pmem device's memory), not from the page cache the
+/// write filled. Refused when the command line names no block device, or the device does not read back what was
+/// written.
+fn write_device(block: Option<&str>, at: u64, bytes: &[u8]) -> Result<(), String> {
+  use std::os::unix::fs::FileExt;
+  let device = block.ok_or_else(|| "no block device: the command line names none".to_owned())?;
+  // structural: allow — the guest's own block device, in a VM: this binary never runs on a host.
+  let file = std::fs::OpenOptions::new()
+    .read(true)
+    .write(true)
+    .open(device)
+    .map_err(|e| format!("open {device}: {e}"))?;
+  file
+    .write_all_at(bytes, at)
+    .map_err(|e| format!("write {device} at {at}: {e}"))?;
+  file.sync_all().map_err(|e| format!("sync {device}: {e}"))?;
+  let len = u64::try_from(bytes.len()).map_err(|_| format!("{} bytes is too long", bytes.len()))?;
+  rustix::fs::fadvise(
+    &file,
+    at,
+    std::num::NonZeroU64::new(len),
+    rustix::fs::Advice::DontNeed,
+  )
+  .map_err(|e| format!("drop {device}'s cached pages at {at}: {e}"))?;
+  let mut back = vec![0u8; bytes.len()];
+  file
+    .read_exact_at(&mut back, at)
+    .map_err(|e| format!("read {device} at {at}: {e}"))?;
+  let differing = back
+    .iter()
+    .zip(bytes)
+    .filter(|(read, written)| read != written)
+    .count();
+  if differing == 0 {
+    Ok(())
+  } else {
+    Err(format!(
+      "{device} at {at} reads back {differing} of {} bytes otherwise",
+      bytes.len()
+    ))
+  }
 }
 
 /// Renames `from` to `to`.
@@ -606,6 +659,13 @@ impl SharedMap {
       Command::Wait { at, byte, millis } => self
         .span(at, 1)
         .map(|offsets| self.wait(offsets.start, byte, millis)),
+      Command::Storm {
+        at,
+        len,
+        byte,
+        rounds,
+      } => self.storm(at, len, byte, rounds),
+      Command::Sweep { len, sweeps } => self.sweep(len, sweeps),
       Command::Map { .. }
       | Command::Quit
       | Command::List
@@ -614,7 +674,8 @@ impl SharedMap {
       | Command::Rename { .. }
       | Command::Remove { .. }
       | Command::Mkdir { .. }
-      | Command::Flush => Err("not a command a map answers".to_owned()),
+      | Command::Flush
+      | Command::Device { .. } => Err("not a command a map answers".to_owned()),
     };
     answered.unwrap_or_else(Reply::Refused)
   }
@@ -635,6 +696,31 @@ impl SharedMap {
     unsafe { rustix::mm::msync(self.base.cast(), self.len, MsyncFlags::SYNC) }
       .map(|()| Reply::Done)
       .map_err(|e| format!("msync: {e}"))
+  }
+
+  /// Stores `byte` into `[at, at + len)` and syncs the whole map, `rounds` times over: each sync writes the page back
+  /// and write-protects it, so the next store dirties it again and every sync flushes the device. The time it took.
+  fn storm(&self, at: u64, len: u64, byte: u8, rounds: u64) -> Result<Reply, String> {
+    self.span(at, len)?;
+    let started = now_micros();
+    for _ in 0..rounds {
+      self.store(at, len, byte)?;
+      self.sync()?;
+    }
+    Ok(Reply::Stormed {
+      micros: now_micros().saturating_sub(started),
+    })
+  }
+
+  /// Stores into `[0, len)`, a byte at a time and in order, `sweeps` times over, sweep `s` storing
+  /// [`sweep_value`]`(s)`: a VM killed during a sweep leaves that sweep's byte before the point it reached and the
+  /// sweep before's after it.
+  fn sweep(&self, len: u64, sweeps: u64) -> Result<Reply, String> {
+    self.span(0, len)?;
+    for sweep in 0..sweeps {
+      self.store(0, len, sweep_value(sweep))?;
+    }
+    Ok(Reply::Done)
   }
 
   /// Polls the byte at `offset`, memory alone, until it holds `byte` or `millis` pass.
