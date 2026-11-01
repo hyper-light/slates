@@ -2846,7 +2846,7 @@ mod tests {
       (format!("shards {id} --fd five -- reader"), "bad --fd"),
       (
         format!("shards {id} -- reader"),
-        "missing --fd N (the descriptor number the command finds its stream end at)",
+        "missing --fd N (the descriptor number the command finds what it is handed at: a stream end, a pmem copy)",
       ),
       ("shards --fd 5 -- reader".to_owned(), "missing volume ID"),
       (
