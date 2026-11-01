@@ -58,9 +58,11 @@ done
 "$SLATES" --instance "$INSTANCE" bootstrap root > /dev/null 2>&1 || true
 # A bounded volume reserves its whole limit from its shard's share of the machine (about 1 GiB a shard on a
 # 16 GiB, four-core runner); a round holds about 6.5 MB, so 256 MiB fits every runner with room to spare.
-PLAIN=$("$SLATES" --instance "$INSTANCE" volume create fsb --bounded 256MiB | awk '$1 == "id" { print $2 }')
+PLAIN=$("$SLATES" --instance "$INSTANCE" volume create fsb --bounded 256MiB | awk '$1 == "id:" { print $2 }')
 BASED=$("$SLATES" --instance "$INSTANCE" volume create fsb-base --bounded 256MiB --base "$W/base/lower" \
-  | awk '$1 == "id" { print $2 }')
+  | awk '$1 == "id:" { print $2 }')
+[ -n "$PLAIN" ] || { echo "volume create printed no id for plain"; exit 1; }
+[ -n "$BASED" ] || { echo "volume create printed no id for based"; exit 1; }
 "$SLATES" --instance "$INSTANCE" mount "$PLAIN" "$W/slates" > /dev/null
 "$SLATES" --instance "$INSTANCE" mount "$BASED" "$W/slates-base" > /dev/null
 

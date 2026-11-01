@@ -50,7 +50,8 @@ done
 "$SLATES" --instance "$INSTANCE" bootstrap root > /dev/null 2>&1 || true
 # A bounded volume reserves its whole limit from its shard's share of the machine (about 1 GiB a shard on a
 # 16 GiB, four-core runner); a round holds about 6.5 MB, so 256 MiB fits every runner with room to spare.
-PLAIN=$("$SLATES" --instance "$INSTANCE" volume create fsb --bounded 256MiB | awk '$1 == "id" { print $2 }')
+PLAIN=$("$SLATES" --instance "$INSTANCE" volume create fsb --bounded 256MiB | awk '$1 == "id:" { print $2 }')
+[ -n "$PLAIN" ] || { echo "volume create printed no id for plain"; exit 1; }
 "$SLATES" --instance "$INSTANCE" mount "$PLAIN" "$W/slates" > /dev/null
 
 echo "# date $(date -u +%FT%TZ); macOS $(sw_vers -productVersion) ($(sw_vers -buildVersion)), $(uname -m); slates $(git -C "$ROOT" rev-parse --short HEAD 2> /dev/null || echo unknown), release"
