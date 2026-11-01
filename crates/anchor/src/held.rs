@@ -12,12 +12,16 @@
 //! - **Hold connection**: an accepted NFS connection, duplicated by `SCM_RIGHTS` before its first request is read, so
 //!   the kernel client never sees it close when a daemon dies — it sees a slow reply, and the next daemon answers it;
 //! - **Release connection**: the connection ended (the daemon shut it down first, since the anchor's copy would keep
-//!   it open); the anchor closes its copy.
+//!   it open); the anchor closes its copy;
+//! - **Hold copy**: a writable direct map's copy (A-186), duplicated by `SCM_RIGHTS` with its record (opaque here, at
+//!   most [`SESSION_CAP`] bytes: what the next daemon needs to adopt it, `slates_server`'s to define), sent before the
+//!   map is handed to its client, so a client never holds a copy the anchor was not given (A-197);
+//! - **Release copy**: the map was let go; the anchor closes its copy.
 //!
 //! The anchor applies them to [`Held`], each kind under its own bound with a typed refusal past it, and hands what it
-//! holds to every daemon it spawns ([`ENV_DEVICES`], [`ENV_CONNECTIONS`]; [`Held::env_value`],
-//! [`Held::connections_env_value`], read back by [`parse_env`] and [`parse_connections_env`]), each descriptor
-//! inherited as the NFS listener's is. The channel keeps each message whole and in order, and the anchor drains it
+//! holds to every daemon it spawns ([`ENV_DEVICES`], [`ENV_CONNECTIONS`], [`ENV_COPIES`]; [`Held::env_value`],
+//! [`Held::connections_env_value`], [`Held::copies_env_value`], read back by [`parse_env`], [`parse_connections_env`]
+//! and [`parse_copies_env`]), each descriptor inherited as the NFS listener's is. The channel keeps each message whole and in order, and the anchor drains it
 //! before any restart, so a release from the dead daemon is never applied after its successor started.
 //!
 //! Every message is a fixed [`MESSAGE_BYTES`]-byte body, checked by kind, length and descriptor count before
@@ -48,6 +52,11 @@ pub const ENV_DEVICES: &str = "SLATES_ANCHOR_DEVICES";
 /// in [`ENV_DEVICES`].
 pub const ENV_CONNECTIONS: &str = "SLATES_ANCHOR_CONNECTIONS";
 
+/// Format: the environment variable carrying every held writable copy to a spawned daemon (A-197): `ID_HEX:FD:RECORD_HEX`
+/// for each, joined by `;` (empty when none is held). The descriptors are inherited across the spawn; the channel itself
+/// rides in [`ENV_DEVICES`].
+pub const ENV_COPIES: &str = "SLATES_ANCHOR_COPIES";
+
 /// Format: the most session bytes a message carries. The FUSE session is two bytes
 /// (`slates_bridge_fuse::session::SESSION_BYTES`); the channel carries them opaque, with room for that
 /// encoding to grow without a channel change.
@@ -63,6 +72,10 @@ const KIND_RELEASE: u8 = 3;
 const KIND_HOLD_CONNECTION: u8 = 4;
 /// Format: see [`KIND_HOLD_CONNECTION`].
 const KIND_RELEASE_CONNECTION: u8 = 5;
+/// Format: see [`KIND_HOLD`]; the id field names the copy, and the session field carries its record (A-197).
+const KIND_HOLD_COPY: u8 = 6;
+/// Format: see [`KIND_HOLD_COPY`].
+const KIND_RELEASE_COPY: u8 = 7;
 /// Format: where the attachment id starts (after the kind byte), and its width.
 const AT_ATTACHMENT: usize = 1;
 /// Format: the attachment id's width.
@@ -154,6 +167,20 @@ pub enum Outgoing<'a> {
     /// The connection's id.
     connection: u64,
   },
+  /// Hold `object`, a writable direct map's copy (A-197), as `copy`, with `record`.
+  HoldCopy {
+    /// The copy's id, unique while it lives (the map's id).
+    copy: u64,
+    /// What the next daemon needs to adopt it, at most [`SESSION_CAP`] bytes and at least one.
+    record: &'a [u8],
+    /// The copy; the anchor receives a duplicate.
+    object: BorrowedFd<'a>,
+  },
+  /// `copy` was let go; close the anchor's copy.
+  ReleaseCopy {
+    /// The copy's id.
+    copy: u64,
+  },
 }
 
 /// What the anchor received.
@@ -189,6 +216,20 @@ pub enum Incoming {
   ReleaseConnection {
     /// The connection's id.
     connection: u64,
+  },
+  /// Hold `object` as `copy`, with `record`.
+  HoldCopy {
+    /// The copy's id.
+    copy: u64,
+    /// Its record's bytes.
+    record: Vec<u8>,
+    /// The anchor's copy of the object.
+    object: OwnedFd,
+  },
+  /// `copy` was let go.
+  ReleaseCopy {
+    /// The copy's id.
+    copy: u64,
   },
 }
 
@@ -258,6 +299,8 @@ fn encode(message: &Outgoing<'_>) -> Result<[u8; MESSAGE_BYTES], HoldRefusal> {
     Outgoing::Release { attachment } => (KIND_RELEASE, *attachment, &[]),
     Outgoing::HoldConnection { connection, .. } => (KIND_HOLD_CONNECTION, *connection, &[]),
     Outgoing::ReleaseConnection { connection } => (KIND_RELEASE_CONNECTION, *connection, &[]),
+    Outgoing::HoldCopy { copy, record, .. } => (KIND_HOLD_COPY, *copy, record),
+    Outgoing::ReleaseCopy { copy } => (KIND_RELEASE_COPY, *copy, &[]),
   };
   let length = u8::try_from(session.len())
     .ok()
@@ -285,6 +328,7 @@ pub fn send(socket: BorrowedFd<'_>, message: &Outgoing<'_>) -> Result<(), HoldRe
   let carried = match message {
     Outgoing::Hold { device, .. } => Some([*device]),
     Outgoing::HoldConnection { socket, .. } => Some([*socket]),
+    Outgoing::HoldCopy { object, .. } => Some([*object]),
     _ => None,
   };
   if let Some(carried) = carried.as_ref()
@@ -364,6 +408,23 @@ fn decode(body: &[u8; MESSAGE_BYTES], mut fds: Vec<OwnedFd>) -> Result<Incoming,
       })
     }
     KIND_RELEASE_CONNECTION => Err(malformed("a connection release carries nothing")),
+    KIND_HOLD_COPY if fds.len() == HOLD_FDS && !session.is_empty() => {
+      let object = fds
+        .pop()
+        .ok_or(malformed("a copy hold without its object"))?;
+      Ok(Incoming::HoldCopy {
+        copy: attachment,
+        record: session,
+        object,
+      })
+    }
+    KIND_HOLD_COPY => Err(malformed(
+      "a copy hold carries exactly one object and its record",
+    )),
+    KIND_RELEASE_COPY if fds.is_empty() && session.is_empty() => {
+      Ok(Incoming::ReleaseCopy { copy: attachment })
+    }
+    KIND_RELEASE_COPY => Err(malformed("a copy release carries nothing")),
     _ => Err(malformed("an unknown kind")),
   }
 }
@@ -410,23 +471,37 @@ pub struct HeldDevice {
   pub session: Option<Vec<u8>>,
 }
 
-/// The descriptors the anchor holds: devices by attachment id and connections by connection id, each under its bound.
+/// One held writable copy (A-197).
+#[derive(Debug)]
+pub struct HeldCopy {
+  /// The anchor's copy of the object.
+  pub object: OwnedFd,
+  /// Its record, as the daemon sent it.
+  pub record: Vec<u8>,
+}
+
+/// The descriptors the anchor holds: devices by attachment id, connections by connection id and writable copies by
+/// copy id, each under its bound.
 #[derive(Debug)]
 pub struct Held {
   held: BTreeMap<u64, HeldDevice>,
   bound: usize,
   connections: BTreeMap<u64, OwnedFd>,
   connection_bound: usize,
+  copies: BTreeMap<u64, HeldCopy>,
+  copy_bound: usize,
 }
 
 impl Held {
-  /// None held, at most `bound` devices and `connection_bound` connections.
-  pub fn new(bound: usize, connection_bound: usize) -> Held {
+  /// None held, at most `bound` devices, `connection_bound` connections and `copy_bound` copies.
+  pub fn new(bound: usize, connection_bound: usize, copy_bound: usize) -> Held {
     Held {
       held: BTreeMap::new(),
       bound,
       connections: BTreeMap::new(),
       connection_bound,
+      copies: BTreeMap::new(),
+      copy_bound,
     }
   }
 
@@ -471,8 +546,59 @@ impl Held {
       Incoming::ReleaseConnection { connection } => {
         self.connections.remove(&connection);
       }
+      Incoming::HoldCopy {
+        copy,
+        record,
+        object,
+      } => {
+        if !self.copies.contains_key(&copy) && self.copies.len() >= self.copy_bound {
+          return Err(HoldRefusal::Bound {
+            bound: self.copy_bound,
+          });
+        }
+        self.copies.insert(copy, HeldCopy { object, record });
+      }
+      Incoming::ReleaseCopy { copy } => {
+        self.copies.remove(&copy);
+      }
     }
     Ok(())
+  }
+
+  /// The copies held.
+  pub fn copies(&self) -> usize {
+    self.copies.len()
+  }
+
+  /// The copy bound.
+  pub fn copy_bound(&self) -> usize {
+    self.copy_bound
+  }
+
+  /// Each held copy, by id.
+  pub fn iter_copies(&self) -> impl Iterator<Item = (u64, &HeldCopy)> {
+    self.copies.iter().map(|(copy, held)| (*copy, held))
+  }
+
+  /// Forgets `copy` (its descriptor could not be handed over), closing the anchor's copy of it.
+  pub fn drop_copy(&mut self, copy: u64) {
+    self.copies.remove(&copy);
+  }
+
+  /// The [`ENV_COPIES`] value handing every held copy to a daemon.
+  pub fn copies_env_value(&self) -> String {
+    self
+      .copies
+      .iter()
+      .map(|(copy, held)| {
+        format!(
+          "{copy:x}:{}:{}",
+          held.object.as_fd().as_raw_fd(),
+          hex(&held.record)
+        )
+      })
+      .collect::<Vec<_>>()
+      .join(";")
   }
 
   /// The connections held.
@@ -679,6 +805,52 @@ fn parse_connection_entries(value: &str) -> Result<Vec<InheritedConnection>, Hol
     .collect()
 }
 
+/// One writable copy handed over in the environment: its id, its inherited descriptor number and its record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InheritedCopy {
+  /// The copy's id.
+  pub copy: u64,
+  /// The descriptor number inherited across the spawn.
+  pub fd: RawFd,
+  /// Its record's bytes.
+  pub record: Vec<u8>,
+}
+
+/// Reads an [`ENV_COPIES`] value back: each `ID_HEX:FD:RECORD_HEX`, the record at least one byte and at most
+/// [`SESSION_CAP`]. A value that does not parse, or names one id or one descriptor twice, is refused whole, so the
+/// daemon adopts no descriptor number it cannot account for.
+pub fn parse_copies_env(value: &str) -> Result<Vec<InheritedCopy>, HoldRefusal> {
+  let copies = value
+    .split(';')
+    .filter(|entry| !entry.is_empty())
+    .map(|entry| {
+      let mut fields = entry.split(':');
+      let (Some(copy), Some(fd), Some(record), None) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+      else {
+        return Err(malformed("a copy entry is not ID:FD:RECORD"));
+      };
+      let copy =
+        u64::from_str_radix(copy, HEX).map_err(|_| malformed("a copy id that is not hex"))?;
+      let fd = fd
+        .parse::<RawFd>()
+        .ok()
+        .filter(|fd| *fd >= 0)
+        .ok_or(malformed("a copy descriptor that is not a number"))?;
+      let record = unhex(record)
+        .filter(|record| !record.is_empty())
+        .ok_or(malformed("a copy's record"))?;
+      Ok(InheritedCopy { copy, fd, record })
+    })
+    .collect::<Result<Vec<_>, _>>()?;
+  let ids: std::collections::BTreeSet<u64> = copies.iter().map(|c| c.copy).collect();
+  let fds: std::collections::BTreeSet<RawFd> = copies.iter().map(|c| c.fd).collect();
+  if ids.len() != copies.len() || fds.len() != copies.len() {
+    return Err(malformed("a copy id or descriptor named twice"));
+  }
+  Ok(copies)
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -831,7 +1003,7 @@ mod tests {
   /// nothing.
   #[test]
   fn held_devices_keep_their_bound_and_ignore_what_they_do_not_hold() {
-    let mut held = Held::new(2, 2);
+    let mut held = Held::new(2, 2, 2);
     held
       .apply(Incoming::Hold {
         attachment: 1,
@@ -880,7 +1052,7 @@ mod tests {
   #[test]
   fn the_environment_handoff_round_trips() {
     let (_anchor, daemon) = channel().unwrap();
-    let mut held = Held::new(4, 4);
+    let mut held = Held::new(4, 4, 4);
     let first = pipe_end();
     let second = pipe_end();
     let (first_fd, second_fd) = (first.as_raw_fd(), second.as_raw_fd());
@@ -1026,7 +1198,7 @@ mod tests {
   /// devices, the re-hold replaces, the stray release changes nothing, and the release leaves only the first.
   #[test]
   fn held_connections_keep_their_own_bound() {
-    let mut held = Held::new(1, 2);
+    let mut held = Held::new(1, 2, 2);
     held
       .apply(Incoming::Hold {
         attachment: 1,
@@ -1074,7 +1246,7 @@ mod tests {
   /// one. Expect: both ids with their descriptor numbers, and nothing for the empty value.
   #[test]
   fn the_connections_handoff_round_trips() {
-    let mut held = Held::new(1, 4);
+    let mut held = Held::new(1, 4, 4);
     let first = pipe_end();
     let second = pipe_end();
     let (first_fd, second_fd) = (first.as_raw_fd(), second.as_raw_fd());
@@ -1104,6 +1276,179 @@ mod tests {
       ]
     );
     assert_eq!(parse_connections_env("").unwrap(), []);
+  }
+
+  /// A-197. Do: send a copy hold (a pipe's write end, with a record) and its release over a fresh channel; receive
+  /// each; send a copy hold with no record and one with two descriptors' worth of nothing. Expect: the hold arrives with
+  /// its id and record and the same pipe (bytes written through the received copy are read from the sender's read end),
+  /// then the release; a hold with no record is refused as malformed by the anchor.
+  #[test]
+  fn a_copy_hold_and_its_release_cross_the_channel() {
+    let (anchor, daemon) = channel().unwrap();
+    let (reader, writer) = rustix::pipe::pipe().unwrap();
+    let record = [7u8, 8, 9];
+    send(
+      daemon.as_fd(),
+      &Outgoing::HoldCopy {
+        copy: 0xC0FF,
+        record: &record,
+        object: writer.as_fd(),
+      },
+    )
+    .unwrap();
+    send(daemon.as_fd(), &Outgoing::ReleaseCopy { copy: 0xC0FF }).unwrap();
+    let Some(Incoming::HoldCopy {
+      copy,
+      record: received,
+      object,
+    }) = receive(anchor.as_fd()).unwrap()
+    else {
+      panic!("the copy hold arrives first");
+    };
+    assert_eq!((copy, received.as_slice()), (0xC0FF, &record[..]));
+    rustix::io::write(&object, b"x").unwrap();
+    let mut byte = [0u8; 1];
+    rustix::io::read(&reader, &mut byte).unwrap();
+    assert_eq!(&byte, b"x", "the received copy is the same object");
+    assert!(matches!(
+      receive(anchor.as_fd()).unwrap(),
+      Some(Incoming::ReleaseCopy { copy: 0xC0FF })
+    ));
+    send(
+      daemon.as_fd(),
+      &Outgoing::HoldCopy {
+        copy: 1,
+        record: &[],
+        object: writer.as_fd(),
+      },
+    )
+    .unwrap();
+    assert!(
+      matches!(receive(anchor.as_fd()), Err(HoldRefusal::Malformed { .. })),
+      "a copy hold with no record is refused"
+    );
+  }
+
+  /// A-197. Do: hold copies up to a bound of two while a device and a connection are held, then a third copy; hold the
+  /// first again; release one never held, then the second. Expect: the third refused `Bound` without touching the
+  /// others, the re-hold replaces, the stray release changes nothing, and only the first is left.
+  #[test]
+  fn held_copies_keep_their_own_bound() {
+    let mut held = Held::new(1, 1, 2);
+    held
+      .apply(Incoming::Hold {
+        attachment: 1,
+        device: pipe_end(),
+      })
+      .unwrap();
+    held
+      .apply(Incoming::HoldConnection {
+        connection: 5,
+        socket: pipe_end(),
+      })
+      .unwrap();
+    for copy in [20, 21] {
+      held
+        .apply(Incoming::HoldCopy {
+          copy,
+          record: vec![1],
+          object: pipe_end(),
+        })
+        .unwrap();
+    }
+    assert_eq!(
+      held.apply(Incoming::HoldCopy {
+        copy: 22,
+        record: vec![1],
+        object: pipe_end()
+      }),
+      Err(HoldRefusal::Bound { bound: 2 })
+    );
+    held
+      .apply(Incoming::HoldCopy {
+        copy: 20,
+        record: vec![2],
+        object: pipe_end(),
+      })
+      .unwrap();
+    held.apply(Incoming::ReleaseCopy { copy: 99 }).unwrap();
+    held.apply(Incoming::ReleaseCopy { copy: 21 }).unwrap();
+    assert_eq!(
+      held
+        .iter_copies()
+        .map(|(id, copy)| (id, copy.record.clone()))
+        .collect::<Vec<_>>(),
+      [(20, vec![2])]
+    );
+    assert_eq!(
+      (held.len(), held.connections()),
+      (1, 1),
+      "the others are untouched"
+    );
+  }
+
+  /// A-197. Do: write the copies environment value for two held copies and parse it back; parse an empty one. Expect:
+  /// both ids with their descriptor numbers and records, and nothing for the empty value.
+  #[test]
+  fn the_copies_handoff_round_trips() {
+    let mut held = Held::new(1, 1, 4);
+    let (first, second) = (pipe_end(), pipe_end());
+    let (first_fd, second_fd) = (first.as_raw_fd(), second.as_raw_fd());
+    held
+      .apply(Incoming::HoldCopy {
+        copy: 0xA1,
+        record: vec![0, 255],
+        object: first,
+      })
+      .unwrap();
+    held
+      .apply(Incoming::HoldCopy {
+        copy: 0xB2,
+        record: vec![9],
+        object: second,
+      })
+      .unwrap();
+    assert_eq!(
+      parse_copies_env(&held.copies_env_value()).unwrap(),
+      [
+        InheritedCopy {
+          copy: 0xA1,
+          fd: first_fd,
+          record: vec![0, 255]
+        },
+        InheritedCopy {
+          copy: 0xB2,
+          fd: second_fd,
+          record: vec![9]
+        },
+      ]
+    );
+    assert_eq!(parse_copies_env("").unwrap(), []);
+  }
+
+  /// A-197, hostile input. Do: parse malformed copies environment values. Expect: each refused whole.
+  #[test]
+  fn malformed_copy_handoffs_are_refused() {
+    let too_long = format!("1:4:{}", "ab".repeat(SESSION_CAP + 1));
+    for value in [
+      "x",
+      "1:4",
+      "1:4:",
+      "zz:4:00",
+      "1:-4:00",
+      "1:four:00",
+      "1:4:0",
+      "1:4:zz",
+      "1:4:00;1:5:00",
+      "1:4:00;2:4:00",
+      "1:4:00:00",
+      too_long.as_str(),
+    ] {
+      assert!(
+        matches!(parse_copies_env(value), Err(HoldRefusal::Malformed { .. })),
+        "{value:?} must be refused"
+      );
+    }
   }
 
   /// A-113, hostile input. Do: parse malformed connections environment values. Expect: each refused whole.

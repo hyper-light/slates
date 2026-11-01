@@ -59,6 +59,8 @@ const FIRST: u8 = 0x41;
 const SECOND: u8 = 0x42;
 /// See [`SEED`].
 const BEYOND: u8 = 0x5A;
+/// See [`SEED`]: the byte another path writes after a takeover.
+const THIRD: u8 = 0x43;
 /// Format: the exit status a shell gives a process ended by SIGTERM, which the launcher exits with when its VMM is.
 const ENDED_BY_SIGTERM: i32 = 128 + 15;
 /// Format: the words of `slates read`'s refusal of a file another write changed during the read.
@@ -66,8 +68,9 @@ const READ_CHANGED: &str = "changed while it was read";
 
 /// The stand-in VMM, when the launcher's command selects it (`ROLE_PATH` set); a plain run of the suite does nothing
 /// here. It opens the copy by name, maps all of it shared, prints its pid, the length it mapped and the size it sees,
-/// then follows its standard input: `store AT BYTE COUNT` stores COUNT copies of BYTE from AT and says so; `exit CODE`
-/// exits with CODE; the input's end exits 0.
+/// then follows its standard input: `store AT BYTE COUNT` stores COUNT copies of BYTE from AT and says so; `read AT
+/// COUNT` says what the map holds there, the one byte all of it holds or `mixed`; `exit CODE` exits with CODE; the
+/// input's end exits 0.
 #[test]
 #[allow(clippy::disallowed_methods)] // the role opens the copy it was handed: a memory object, never a file on disk
 fn pmem_vmm_role() {
@@ -117,6 +120,24 @@ fn pmem_vmm_role() {
           unsafe { std::ptr::write_volatile(map.add(offset), byte) };
         }
         println!("{ROLE_TAG} stored {count} at {at}");
+        std::io::stdout().flush().unwrap();
+      }
+      ["read", at, count] => {
+        let (at, count): (usize, usize) = (at.parse().unwrap(), count.parse().unwrap());
+        assert!(at + count <= len, "a read within the map");
+        let held: Vec<u8> = (at..at + count)
+          .map(|offset| {
+            // SAFETY: `offset` is below `len`, the length mapped above, and the map lives until the process ends; a
+            // volatile load holds no reference across the daemon's own writes into the copy.
+            unsafe { std::ptr::read_volatile(map.add(offset)) }
+          })
+          .collect();
+        match held.first() {
+          Some(first) if held.iter().all(|byte| byte == first) => {
+            println!("{ROLE_TAG} read {count} at {at} holds {first}");
+          }
+          _ => println!("{ROLE_TAG} read {count} at {at} mixed"),
+        }
         std::io::stdout().flush().unwrap();
       }
       ["exit", code] => std::process::exit(code.parse().unwrap()),
@@ -252,7 +273,7 @@ struct Rig {
   instance: String,
   volume: String,
   _sdk: Client,
-  _anchor: Anchor,
+  anchor: Anchor,
 }
 
 impl Rig {
@@ -277,7 +298,7 @@ impl Rig {
       instance,
       volume,
       _sdk: sdk,
-      _anchor: anchor,
+      anchor,
     }
   }
 
@@ -309,6 +330,22 @@ impl Rig {
       vm::pause();
     }
   }
+}
+
+/// Replaces the rig's file with `bytes` through a fresh SDK client's own write attachment: another path's write.
+fn sdk_write_whole(rig: &Rig, bytes: &[u8]) {
+  let deadlines = slates_client::Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get();
+  let mut sdk = Client::connect(&rig.instance, deadlines).unwrap();
+  let id = VolumeId {
+    bytes: u128::from_str_radix(&rig.volume, 16).unwrap().to_be_bytes(),
+  };
+  let writer = sdk.attach(id, None, Intent::Write).unwrap().attachment;
+  sdk.fs_write((id, writer), FILE, bytes, 0o644).unwrap();
+  sdk.detach(writer).unwrap();
 }
 
 /// The file the rig holds, with `byte` over `[at, at + count)` in each of `stores`.
@@ -434,4 +471,106 @@ fn a_pmem_launcher_passes_sigterm_to_its_vmm_and_compares_its_stores_back() {
     rig.file() == expected(&[(0, FIRST, page)]),
     "the file holds the page"
   );
+}
+
+/// Step 6.2 (A-197): a writable copy survives a daemon takeover under a live map. Do: run `slates pmem` with the
+/// stand-in VMM and have it store a page, unsynced; kill the daemon with SIGKILL and wait for the anchor's successor;
+/// then have the VMM store a second page and send the launcher SIGUSR1; then write a third page through the SDK and
+/// have the VMM read it from its map; then let it exit. Expect: the launcher syncs as soon as its daemon goes, and the
+/// successor, which took the copy back from the anchor, writes the unsynced page (`resynced`), so the file holds it;
+/// the SIGUSR1 writes the second page through the successor; the SDK's write after the takeover is in the VMM's map,
+/// written through by the successor; the exit releases the map with nothing left to write, and the launcher exits 0.
+#[test]
+fn a_pmem_vmms_copy_survives_a_daemon_takeover_with_its_unsynced_store() {
+  let rig = Rig::new("pmem-takeover");
+  let mut launch = Launch::start(&rig.instance, &rig.volume);
+  let _ = launch.expect(ROLE_TAG);
+  let page = usize::try_from(slates_client::page_bytes().unwrap()).unwrap();
+  let page_bytes = u64::try_from(page).unwrap();
+  let first = (0, FIRST, page);
+  launch.store(0, FIRST, page_bytes);
+  let (old, new) = vm::kill_the_daemon(&rig.anchor, &rig.instance);
+  assert_ne!(old, new, "the anchor's successor is a new daemon");
+  assert_eq!(
+    launch.value("resynced"),
+    page_bytes,
+    "the launcher's sync after its daemon went wrote the unsynced page through the successor"
+  );
+  assert!(
+    rig.file() == expected(&[first]),
+    "the file holds the page stored before the takeover"
+  );
+  let second = (2 * page, SECOND, page);
+  launch.store(u64::try_from(2 * page).unwrap(), SECOND, page_bytes);
+  launch.signal(rustix::process::Signal::USR1);
+  assert_eq!(
+    launch.value("synced"),
+    page_bytes,
+    "a sync through the successor"
+  );
+  let third = (4 * page, THIRD, page);
+  sdk_write_whole(&rig, &expected(&[first, second, third]));
+  writeln!(launch.input, "read {} {page}", 4 * page).unwrap();
+  launch.input.flush().unwrap();
+  let read = launch.expect(&format!("{ROLE_TAG} read {page} at {}", 4 * page));
+  assert!(
+    read.ends_with(&format!("holds {THIRD}")),
+    "the SDK's write after the takeover is in the VMM's map: {read}"
+  );
+  writeln!(launch.input, "exit 0").unwrap();
+  launch.input.flush().unwrap();
+  assert_eq!(
+    launch.value("released"),
+    0,
+    "nothing was left to write at the exit"
+  );
+  let status = launch.ended();
+  assert!(status.success(), "the launcher exits 0: {status}");
+  assert!(
+    rig.file() == expected(&[first, second, third]),
+    "the file holds every write"
+  );
+}
+
+/// Step 6.2 (A-197): a taken-back copy no holder claims is written back and let go. Do: run `slates pmem` with the
+/// stand-in VMM and have it store a page, unsynced; kill the daemon with SIGKILL and, before its successor answers, the
+/// launcher too (its VMM ends with it); wait for the anchor's successor. Expect: the successor took the copy back and,
+/// its holder never claiming it within the client's reconnect budget, writes it back through the kept attachment and
+/// lets it go, so the file comes to hold the page, counted (`dax.local_map_unclaimed_reclaimed`).
+#[test]
+fn a_copy_no_holder_claims_after_a_takeover_is_written_back_and_let_go() {
+  let rig = Rig::new("pmem-unclaimed");
+  let mut launch = Launch::start(&rig.instance, &rig.volume);
+  let _ = launch.expect(ROLE_TAG);
+  let page = usize::try_from(slates_client::page_bytes().unwrap()).unwrap();
+  launch.store(0, FIRST, u64::try_from(page).unwrap());
+  let old = vm::daemon_of(&rig.anchor).expect("the anchor runs a daemon");
+  rustix::process::kill_process(
+    rustix::process::Pid::from_raw(i32::try_from(old).unwrap()).unwrap(),
+    rustix::process::Signal::KILL,
+  )
+  .unwrap();
+  launch.signal(rustix::process::Signal::KILL);
+  let _ = launch.ended();
+  let started = Instant::now();
+  while vm::daemon_of(&rig.anchor).is_none_or(|pid| pid == old) {
+    assert!(
+      started.elapsed() < WAIT,
+      "the anchor restarted its daemon within {WAIT:?}"
+    );
+    vm::pause();
+  }
+  vm::await_steady(&rig.instance);
+  rig.holds_eventually(
+    (0, FIRST, page),
+    "the successor wrote the unclaimed copy back through its kept attachment",
+  );
+  let (code, out, err) = run(&rig.instance, &["status"]);
+  assert_eq!(code, 0, "slates status: {err}");
+  let reclaimed: u64 = String::from_utf8_lossy(&out)
+    .lines()
+    .filter_map(|line| line.split_once("dax.local_map_unclaimed_reclaimed: "))
+    .filter_map(|(_, count)| count.trim().parse::<u64>().ok())
+    .sum();
+  assert_eq!(reclaimed, 1, "one holder's copy was reclaimed, counted");
 }

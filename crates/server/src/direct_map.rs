@@ -129,7 +129,30 @@ const OFFER_WITHDRAWN: &str = "dax.local_map_offer_withdrawn";
 /// without its hand-off. Whether the copy was still kept.
 pub(crate) fn let_go(state: &mut ShardState, backing: Handle<ShardsBacking>) -> bool {
   withdraw_offer(state, backing);
+  #[cfg(target_os = "linux")]
+  release_held_copy(state, backing);
   state.store.shards_backings.remove(backing).is_some()
+}
+
+/// Tells the anchor a writable copy was let go, so it closes its copy of it (A-197; `crate::held_copy`), and forgets
+/// any claim it still owed. A read-only copy was never held.
+#[cfg(target_os = "linux")]
+fn release_held_copy(state: &mut ShardState, backing: Handle<ShardsBacking>) {
+  let writable = state
+    .store
+    .shards_backings
+    .get(backing)
+    .is_some_and(|kept| {
+      matches!(kept.object(), slates_vfs::shards_backing::BackingObject::Peer(object)
+        if object.access() == slates_mem::PeerAccess::ReadWrite)
+    });
+  if !writable {
+    return;
+  }
+  if let Some(copy) = crate::held_copy::copy_of(state, backing) {
+    crate::held_copy::release(copy);
+    state.direct_map.unclaimed.remove(&copy);
+  }
 }
 
 /// Withdraws the unclaimed offer of `backing`'s copy on the socket route, counted.
@@ -225,6 +248,8 @@ pub(crate) fn release_map(
   let Some(held) = held_by(state, client_id, backing) else {
     return refused(Refusal::NotFound);
   };
+  #[cfg(target_os = "linux")]
+  crate::held_copy::claimed(state, mapping_id);
   if held.writer.is_some() {
     return sync_then(state, client_id, principal, held, AfterSync::Release);
   }
@@ -315,6 +340,8 @@ pub(crate) fn map_sync(
 ) -> ReplyBody {
   match held_by(state, client_id, backing_of(mapping_id)) {
     Some(held) if held.writer.is_some_and(|(of, _)| of == volume) => {
+      #[cfg(target_os = "linux")]
+      crate::held_copy::claimed(state, mapping_id);
       sync_then(state, client_id, principal, held, AfterSync::Answer)
     }
     _ => refused(Refusal::NotFound),
@@ -707,6 +734,11 @@ pub(crate) struct DirectMapState {
   /// shard serves its client (A-188). A client is here only while it holds a copy, so the table is bounded by the
   /// shard's copies (`direct_maps_per_shard`).
   pub(crate) held: BTreeMap<u32, ClientMaps>,
+  /// The maps this shard took back from its anchor after a takeover that their holders have not claimed yet, by map id:
+  /// the holder's client id and the deadline past which the map is reclaimed (A-197; `crate::held_copy`). Bounded by
+  /// the copies the anchor handed back, at most its held-copy bound.
+  #[cfg(target_os = "linux")]
+  pub(crate) unclaimed: BTreeMap<u64, (u32, u64)>,
 }
 
 /// A retry of a map still being filled joins it: the verb does not run again, and the reply goes where this attempt
@@ -959,6 +991,9 @@ mod served {
     inode: InodeNo,
     /// The copy's size, fixed when it was made.
     object_bytes: u64,
+    /// A writable map's volume and write attachment, which the anchor's hold of the copy records (A-197).
+    #[cfg(target_os = "linux")]
+    writer: Option<(VolumeId, u64)>,
     /// The next byte of the copy to fill.
     next: u64,
     client_id: u32,
@@ -1077,6 +1112,8 @@ mod served {
         backing: Some(backing),
         inode,
         object_bytes,
+        #[cfg(target_os = "linux")]
+        writer,
         next: 0,
         client_id,
         request,
@@ -1399,6 +1436,18 @@ mod served {
       let _counted = crate::state::with_state(|s| s.count(FELL_BACK, 1));
       return refused(Refusal::MapUnavailable);
     };
+    // A writable copy goes to the anchor before its client gets it, so a takeover finds every one a client holds
+    // (A-197).
+    if let Some((_, attachment)) = fill.writer {
+      use std::os::fd::AsFd;
+      let record = crate::held_copy::CopyRecord {
+        inode: fill.inode.0,
+        attachment,
+      };
+      let _held = crate::state::with_state(|s| {
+        crate::held_copy::hold(s, mapping.mapping_id, record, descriptor.as_fd());
+      });
+    }
     let delivered = crate::xshard::call_within(
       here,
       home,

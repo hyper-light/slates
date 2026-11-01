@@ -1913,8 +1913,10 @@ pub(crate) fn run_pmem(request: &PmemRequest) -> Result<(), Failure> {
 }
 
 /// Waits for the VMM to exit, answering this process's signals meanwhile: a SIGUSR1 compares the copy back
-/// (`map_sync`) and announces what it wrote; SIGINT and SIGTERM are passed to the VMM. Waits on the VMM's pidfd and on
-/// the signal relay's pipe together, never on a timer. The VMM's exit code, or 128 and the signal that ended it.
+/// (`map_sync`) and announces what it wrote; SIGINT and SIGTERM are passed to the VMM. When the daemon goes, it syncs
+/// at once, reconnecting to its successor and claiming the map there before the successor's claim deadline (A-197).
+/// Waits on the VMM's pidfd, the signal relay's pipe and the client's daemon watch together, never on a timer. The VMM's
+/// exit code, or 128 and the signal that ended it.
 #[cfg(target_os = "linux")]
 fn serve_pmem(
   client: &mut Client,
@@ -1932,20 +1934,44 @@ fn serve_pmem(
         child.id()
       ))
     })?;
+  // Watched until a sync after the daemon's departure is refused, so a dead connection never spins the loop; the next
+  // SIGUSR1 tries again.
+  let mut watching = true;
   loop {
-    let mut fds = [
-      PollFd::new(&pidfd, PollFlags::IN),
-      PollFd::new(relay, PollFlags::IN),
-    ];
-    match poll(&mut fds, None) {
-      Ok(_) => {}
-      Err(rustix::io::Errno::INTR) => continue,
-      Err(e) => return Err(Failure::Failed(format!("pmem: waiting on the VMM: {e}"))),
-    }
-    let [vmm, signals] = &fds;
-    let (exited, signalled) = (!vmm.revents().is_empty(), !signals.revents().is_empty());
+    let (exited, signalled, departed) = {
+      let watch = if watching {
+        client.daemon_watch()
+      } else {
+        None
+      };
+      let mut fds = vec![
+        PollFd::new(&pidfd, PollFlags::IN),
+        PollFd::new(relay, PollFlags::IN),
+      ];
+      if let Some(watch) = watch.as_ref() {
+        fds.push(PollFd::new(watch, PollFlags::RDHUP));
+      }
+      match poll(&mut fds, None) {
+        Ok(_) => {}
+        Err(rustix::io::Errno::INTR) => continue,
+        Err(e) => return Err(Failure::Failed(format!("pmem: waiting on the VMM: {e}"))),
+      }
+      let fired = |at: usize| fds.get(at).is_some_and(|fd| !fd.revents().is_empty());
+      (fired(0), fired(1), fired(2))
+    };
     if signalled {
       answer_signals(client, mapped, (relay, json), pid);
+    }
+    if departed {
+      // The daemon went: a sync reconnects under this client's id and reaches its successor, which took the copy back
+      // from the anchor (A-197), and claims the map there.
+      match client.map_sync(mapped) {
+        Ok(written) => announce_pmem(&[("resynced", serde_json::json!(written))], json),
+        Err(e) => {
+          eprintln!("slates: pmem: the sync after the daemon went was refused: {e}");
+          watching = false;
+        }
+      }
     }
     if exited {
       break;

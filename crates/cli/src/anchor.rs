@@ -238,7 +238,11 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
   // a mount would then die with its daemon, which the anchor exists to prevent.
   #[cfg(unix)]
   supervisor
-    .hold_descriptors(config.held_device_bound(), config.held_connection_bound())
+    .hold_descriptors(
+      config.held_device_bound(),
+      config.held_connection_bound(),
+      config.held_copy_bound(),
+    )
     .map_err(|e| failed("hold channel", e))?;
   // The anchor holds a duplicate of every device and connection it is sent, so it needs the descriptors its bounds
   // name: raise its soft limit to the hard one, as the daemon does (no privilege needed).

@@ -692,6 +692,9 @@ impl Daemon {
     let mut inherited_fuse = crate::fuse_hold::split(handed.devices, shards.len()).into_iter();
     #[cfg(all(unix, not(target_os = "linux")))]
     release_devices_without_fuse(handed.devices);
+    // The writable copies (A-197), each moved to the shard that holds its map: Linux alone sends the anchor one.
+    #[cfg(target_os = "linux")]
+    let mut inherited_copies = crate::held_copy::split(handed.copies, shards.len()).into_iter();
     let handed_connections = handed.connections;
     for (index, shard) in shards.iter().enumerate() {
       let env = segment.handoff_env()?;
@@ -702,6 +705,8 @@ impl Daemon {
       let retained = retained.clone();
       #[cfg(target_os = "linux")]
       let held = inherited_fuse.next().unwrap_or_default();
+      #[cfg(target_os = "linux")]
+      let copies = inherited_copies.next().unwrap_or_default();
       runtime.spawn_on(*shard, async move {
         // How long a shard's start takes (its recovery included) is in the boot log: the control loop's first call to
         // each shard queues behind it (GAPS, boot, 2026-10-05).
@@ -720,7 +725,7 @@ impl Daemon {
           &all,
           retained,
           #[cfg(target_os = "linux")]
-          held,
+          (held, copies),
         );
         let took_us = started.elapsed().as_micros();
         match outcome {
@@ -3039,7 +3044,10 @@ fn init_shard(
   (partition, sealing): (u16, crate::seal_keys::RootState),
   config_shards: &[u16],
   retained: Option<crate::retention::Retained>,
-  #[cfg(target_os = "linux")] inherited_fuse: Vec<crate::fuse_hold::HeldDevice>,
+  #[cfg(target_os = "linux")] (inherited_fuse, inherited_copies): (
+    Vec<crate::fuse_hold::HeldDevice>,
+    Vec<crate::held_copy::InheritedCopy>,
+  ),
 ) -> Result<(), ServerError> {
   let (handoff, len) = handoff_of(env)?;
   let mut segment = AnchorSegment::attach(&handoff, len, identity)?;
@@ -3235,6 +3243,8 @@ fn init_shard(
     #[cfg(target_os = "linux")]
     inherited_fuse,
     #[cfg(target_os = "linux")]
+    inherited_copies,
+    #[cfg(target_os = "linux")]
     adopt_fuse: Vec::new(),
     snapshot_views: std::collections::BTreeMap::new(),
     #[cfg(unix)]
@@ -3393,7 +3403,7 @@ fn init_shard(
     // RAM (content, tree and snapshots restored, §4.8), the ones that could not be (refused, never
     // presented empty), and what the images did not carry and was reconciled out of the catalog.
     eprintln!(
-      "slates-server: shard {shard}: recovered {} volumes from their images ({} refused), {} merge volumes (green chains replayed, works reset), reconciled out {} unrecovered local snapshots and {} attachments, trimmed {} unacknowledged snapshots the images carried, completed {} destroys in flight, corrected {} clone pins, reclaimed {} orphans no holder survived, replayed {} logged writes",
+      "slates-server: shard {shard}: recovered {} volumes from their images ({} refused), {} merge volumes (green chains replayed, works reset), reconciled out {} unrecovered local snapshots and {} attachments, trimmed {} unacknowledged snapshots the images carried, completed {} destroys in flight, corrected {} clone pins, reclaimed {} orphans no holder survived, took back {} writable copies, replayed {} logged writes",
       rebuilt.volumes,
       rebuilt.skipped,
       rebuilt.merge_volumes,
@@ -3403,6 +3413,7 @@ fn init_shard(
       rebuilt.destroys_completed,
       rebuilt.pins_reconciled,
       rebuilt.orphans_reclaimed,
+      rebuilt.copies_adopted,
       rebuilt.writes_replayed
     );
     eprintln!(
@@ -3453,6 +3464,9 @@ async fn reap_loop() {
       let _ = verbs::step_destroys(s);
     });
     let reaped = crate::reap::sweep(cadence).await;
+    // The taken-back writable copies no holder claimed within the reconnect budget (A-197).
+    #[cfg(target_os = "linux")]
+    let _reclaimed = crate::held_copy::reclaim_unclaimed().await;
     if reaped > 0 {
       CLIENTS_REAPED.fetch_add(u64::try_from(reaped).unwrap_or(u64::MAX), Ordering::AcqRel);
     }

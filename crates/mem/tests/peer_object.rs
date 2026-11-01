@@ -464,3 +464,52 @@ fn a_read_only_copy_refuses_a_writable_view() {
     Err(MemError::OsRefused { .. })
   ));
 }
+
+/// Serves A-197 (a writable copy survives its daemon: the anchor holds it, and the successor takes it back). Do: make a
+/// writable copy, have its client store into it, keep a duplicate of its descriptor as the anchor would, and drop the
+/// object, as a dead daemon drops its own; adopt the duplicate; load the client's store through the adopted object and
+/// store through it in turn. Then try to adopt an unsealed memory object and a read-only copy. Expect: the adopted
+/// object has the copy's length and access, holds the client's store, and the client sees the adopted object's store;
+/// the unsealed object and the read-only copy are both refused, typed.
+#[test]
+#[cfg(target_os = "linux")]
+#[cfg_attr(miri, ignore)] // a shared memory object is not modelled by Miri, as at `shared_region.rs`
+fn a_writable_copy_is_taken_back_from_a_held_descriptor_and_nothing_else_is() {
+  let page = page();
+  let object = PeerObject::create("slates-peer-test", 2 * page, PeerAccess::ReadWrite).unwrap();
+  let client = PeerWriteView::map(handed(&object), object.len()).unwrap();
+  let theirs = pattern(64, 3);
+  client.store(page + 9, &theirs).unwrap();
+  let held = handed(&object);
+  let len = object.len();
+  drop(object);
+  let mut adopted = PeerObject::adopt(held).unwrap();
+  assert_eq!(
+    (adopted.len(), adopted.access()),
+    (len, PeerAccess::ReadWrite)
+  );
+  let mut seen = vec![0u8; theirs.len()];
+  adopted.load(page + 9, &mut seen).unwrap();
+  assert_eq!(seen, theirs, "the adopted copy holds the client's store");
+  let ours = pattern(32, 7);
+  adopted.store(11, &ours).unwrap();
+  let mut back = vec![0u8; ours.len()];
+  client.load(11, &mut back).unwrap();
+  assert_eq!(back, ours, "the client sees the adopted copy's store");
+  let unsealed =
+    rustix::fs::memfd_create("slates-unsealed", rustix::fs::MemfdFlags::CLOEXEC).unwrap();
+  #[allow(clippy::disallowed_methods)] // sizes a memory object, never a file on disk
+  rustix::fs::ftruncate(&unsealed, page).unwrap();
+  assert!(
+    matches!(PeerObject::adopt(unsealed), Err(MemError::OsRefused { .. })),
+    "an object a resize could shrink under the map is refused"
+  );
+  let reading = PeerObject::create("slates-peer-test", page, PeerAccess::Read).unwrap();
+  assert!(
+    matches!(
+      PeerObject::adopt(handed(&reading)),
+      Err(MemError::OsRefused { .. })
+    ),
+    "a read-only copy is not a writable one"
+  );
+}

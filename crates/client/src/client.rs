@@ -1986,6 +1986,16 @@ impl Client {
     self.deadlines
   }
 
+  /// A descriptor that reports, polled for `POLLRDHUP`, that the daemon this client is connected to has gone (Linux:
+  /// the control socket, whose peer end closes with the daemon's process): what a process that holds a writable map
+  /// waits on beside its own work, so it syncs, reconnecting under its id, soon after a takeover (`slates pmem`, A-197).
+  /// The next call reconnects; the descriptor is the new connection's after it.
+  #[cfg(target_os = "linux")]
+  #[must_use]
+  pub fn daemon_watch(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+    self.end.daemon_watch()
+  }
+
   /// The caller-owned operations the client admits at once ([`ClientError::TooManyOutstanding`]).
   pub fn outstanding_limit(&self) -> usize {
     self.awaited_cap

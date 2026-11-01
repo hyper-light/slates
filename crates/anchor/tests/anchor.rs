@@ -937,7 +937,7 @@ fn a_device_a_daemon_sent_is_held_across_its_restart_and_handed_to_its_successor
   };
   let mut supervisor = Supervisor::new(segment, &args, policy).unwrap();
   // Shape: room for this test's one device.
-  supervisor.hold_descriptors(4, 4).unwrap();
+  supervisor.hold_descriptors(4, 4, 4).unwrap();
   // SAFETY: the test is single-threaded here; the role is chosen by the child's args, so a parallel test's child
   // ignores this variable.
   unsafe {

@@ -8747,6 +8747,8 @@ pub struct Rebuilt {
   /// Unlinked-but-open files whose every holder died with the process, reclaimed as their volume's references
   /// were settled (A-61).
   pub orphans_reclaimed: usize,
+  /// Writable direct maps' copies the anchor held, taken back (A-197).
+  pub copies_adopted: usize,
   /// FUSE writes acknowledged after the last publication, replayed from the write log (A-63).
   pub writes_replayed: usize,
   /// Claimed blocks no rebuilt volume reaches, freed by the recovery sweep (A-64).
@@ -8909,6 +8911,9 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
   // The FUSE writes acknowledged after the last publication, back on top of the rebuilt volumes (A-63).
   #[cfg(target_os = "linux")]
   {
+    // The writable copies the anchor held are taken back first, so every write the replay applies is written into them
+    // by the volume's write boundary (A-197).
+    rebuilt.copies_adopted = crate::held_copy::adopt_inherited(state);
     rebuilt.writes_replayed = replay_writes(state);
   }
   // Hand out prefixes past every recovered one, so a new volume never collides with a recovered
@@ -10420,6 +10425,11 @@ fn reconcile_lost(state: &mut ShardState, record: &VolumeRecord) -> (usize, usiz
         }
         state.stale_fuse_mounts.push((a.id, path.to_owned()));
         return true;
+      }
+      // An SDK client's write attachment that writes back a copy the anchor held is kept, its copy taken back (A-197).
+      #[cfg(target_os = "linux")]
+      if crate::held_copy::keeps(&state.inherited_copies, a.id) {
+        return false;
       }
       // A WinFsp volume's file system was the dead process's own (§4.6 "Windows"): its drive went with it.
       matches!(a.consumer, Consumer::Sdk { .. } | Consumer::Guest)

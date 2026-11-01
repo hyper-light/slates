@@ -12760,7 +12760,13 @@ Applied in the same change to: A-186 (the copy's length), GAPS, `crates/ipc` (`p
 `stream.rs`: `spawn_bound`), `crates/server` (`direct_map.rs`: the granule checked and the copy sized by it;
 `verbs.rs`), `crates/client` (`map_write`'s granule, `page_bytes`; the granule test in `tests/client.rs`), `crates/cli`
 (`args.rs`: the `pmem` verb, `{pmem}` and `{len}`; `verbs.rs`: `run_pmem`; `signal.rs`: the signal relay;
-`tests/pmem.rs`, new), and `unsafe-budget.toml` (`slates-ipc` 104 → 105, `slates-cli` 5 → 7).
+`tests/pmem.rs`, new), and `unsafe-budget.toml` (`slates-ipc` 104 → 105, `slates-cli` 5 → 7). The takeover (Step 6.2):
+`crates/anchor` (`held.rs`: the copy kind, its bound and `ENV_COPIES`; `supervise.rs`), `crates/mem`
+(`PeerObject::adopt`), `crates/vfs` (`ShardsBackings::adopt_peer`), `crates/ipc` (`Liveness::watch`,
+`ClientEnd::daemon_watch`), `crates/client` (`Client::daemon_watch`), `crates/server` (`held_copy.rs`, new;
+`anchor_hold.rs`, `config.rs`: `held_copy_bound`, `daemon.rs`, `direct_map.rs`, `reap.rs`, `state.rs`, `verbs.rs`:
+recovery keeps a held copy's writer and takes its copy back before the write log's replay), `crates/cli` (the
+launcher's watch on its daemon; `anchor.rs`).
 - **What it answers.** A pmem VMM reached a slates volume only through a host mount: Firecracker, Cloud Hypervisor and
   QEMU map an image file shared as a virtio-pmem device's memory, and the file was a path through a slates mount (the
   image form's pmem route, A-160, A-165, A-189). Firecracker has no folder sharing at all, so its socket-route cell was
@@ -12803,10 +12809,42 @@ Applied in the same change to: A-186 (the copy's length), GAPS, `crates/ipc` (`p
     compared its page back; SIGTERM reached the VMM, the release wrote its page and the launcher exited 143.
     Red-checked in a copy of the tree: without the parent-death signal the VMM was alive 20 s after its launcher's
     kill; with SIGUSR1 answered by no sync, the sync wrote 0 bytes of 4,096.
-- **Owed** (GAPS): the copy surviving a daemon takeover under a live map (A-186's maps end with their daemon today:
-  `ReleaseMap` answers `NotFound` for "one from before a restart"); `guest_image.rs`'s three pmem tests over a handed
-  copy with Firecracker, Cloud Hypervisor and QEMU, and Firecracker on arm64; the adversarial and chaos tests; the DAX
-  matrix's cells.
+- **The copy survives a takeover** (Step 6.2). A-186's maps ended with their daemon: their records were the process's,
+  and recovery drops every SDK client's attachment ("the SDK's client attaches again"), so a successor answered a
+  holder's sync `NotFound`, and a guest's later stores never reached the file nor another path's change its map.
+  - **The anchor holds each writable copy** with a 16-byte record (the file's inode and the writer attachment; the
+    volume, the client and its principal come from the attachment's record, the length from the sealed object), sent
+    before the copy is handed to its client, released when it is let go: a new kind on A-61's hold channel, under its
+    own bound (`shards × direct_maps_per_shard`), handed to each daemon the anchor spawns in `SLATES_ANCHOR_COPIES`.
+  - **The successor takes each back while recovery rebuilds its shard.** It keeps the writer attachment, as it keeps a
+    FUSE mount whose device the anchor held; checks the object (sealed against shrinking, growing and new seals, not
+    against writes, a whole number of pages: `PeerObject::adopt`); adopts it at the exact slot and generation its
+    backing had (`ShardsBackings::adopt_peer`, over the slab's `insert_at`), so the map id its client holds names it
+    again; and holds the map under its client. Adoption precedes the write log's replay (A-63), so every write the
+    replay applies is written into the copy by the volume's write boundary, as every change is.
+  - **The holder claims it.** A client reconnects under its own id; `slates pmem` watches its control socket for its
+    daemon's departure (`Client::daemon_watch`, `POLLRDHUP`) and syncs at once, which reconnects and claims the map. A
+    map no holder claims within the client's reconnect budget (recovery 1 s + liveness 1 s), counted from the shard's
+    start, is written back through its kept attachment and let go with it, as a dead client's maps are reaped:
+    `dax.local_map_unclaimed_reclaimed`.
+  - **What it does not hold.** A change neither published nor logged when the daemon died, which the write boundary had
+    written into the copy, is in the copy and not in the successor's file; the next sync writes it back as the guest's
+    own, the bytes the guest's map already showed. Linux alone: a macOS copy keeps a second descriptor the anchor does
+    not hold, and Windows' anchor holds no descriptors.
+  - **Proven** (adacachy, 2026-11-01): `crates/cli/tests/pmem.rs`, `a_pmem_vmms_copy_survives_a_daemon_takeover_with_
+    its_unsynced_store` — the daemon killed under the stand-in VMM's unsynced page, the launcher's resync after its
+    departure wrote the page through the successor, a later SIGUSR1 synced through it, and an SDK write after the
+    takeover showed in the VMM's map; and `a_copy_no_holder_claims_after_a_takeover_is_written_back_and_let_go` — the
+    daemon and the launcher killed together, the successor wrote the unclaimed page back, counted once. Six of six in
+    each of three runs at load 46 to 52. Red-checked in a copy of the tree: with no hold sent to the anchor, and with
+    recovery taking no copy back, the takeover test found no resync within 20 s; with nothing reclaiming, the unclaimed
+    page never reached the file. `PeerObject::adopt` takes back a held copy's bytes both ways and refuses an unsealed
+    object and a read-only copy (`crates/mem/tests/peer_object.rs`); the hold channel's copy kind crosses whole, keeps
+    its bound and refuses malformed handoffs (`crates/anchor/src/held.rs`, 4 tests). The recovery oracle 43 of 43, the
+    anchor's suites and the client's on Linux; the client package once ran eight of its tests `Stalled` past the 1 s
+    reply deadline at load 50, and passed whole in each of three runs after.
+- **Owed** (GAPS): `guest_image.rs`'s three pmem tests over a handed copy with Firecracker, Cloud Hypervisor and QEMU,
+  and Firecracker on arm64; the adversarial and chaos tests; the DAX matrix's cells.
 
 ### A-196 — A guest's write through slates' own device or a Shards stream is answered once every FUSE mount of its volume has been told, and the device serves on while the reply waits (accepted and built 2026-11-01)
 Applied in the same change to: §4.6 ("Cache posture": the paragraph on when a mount is told), Phase 3's AC-3.3, A-191

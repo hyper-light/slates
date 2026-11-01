@@ -187,6 +187,10 @@ const MESSAGES_PER_DEVICE: usize = 3;
 #[cfg(unix)]
 /// Derived: one hold + one release per connection (A-113).
 const MESSAGES_PER_CONNECTION: usize = 2;
+/// The most messages one drain applies per copy the bound allows, as `MESSAGES_PER_DEVICE` is for devices.
+#[cfg(unix)]
+/// Derived: one hold + one release per writable copy (A-197).
+const MESSAGES_PER_COPY: usize = 2;
 
 impl std::fmt::Debug for Supervisor {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -237,20 +241,21 @@ impl Supervisor {
     })
   }
 
-  /// Holds the FUSE devices (A-61) and NFS loopback connections (A-113) daemons send, at most `device_bound` and
-  /// `connection_bound` at once: opens the hold channel, whose daemon end every daemon this supervisor spawns
-  /// inherits, with every descriptor held so far.
+  /// Holds the FUSE devices (A-61), NFS loopback connections (A-113) and writable direct maps' copies (A-197) daemons
+  /// send, at most `device_bound`, `connection_bound` and `copy_bound` at once: opens the hold channel, whose daemon end
+  /// every daemon this supervisor spawns inherits, with every descriptor held so far.
   #[cfg(unix)]
   pub fn hold_descriptors(
     &mut self,
     device_bound: usize,
     connection_bound: usize,
+    copy_bound: usize,
   ) -> Result<(), crate::held::HoldRefusal> {
     let (anchor_end, daemon_end) = crate::held::channel()?;
     self.devices = Some(DeviceHold {
       anchor_end,
       daemon_end,
-      held: crate::held::Held::new(device_bound, connection_bound),
+      held: crate::held::Held::new(device_bound, connection_bound, copy_bound),
       refused: 0,
     });
     Ok(())
@@ -283,6 +288,7 @@ impl Supervisor {
           .connection_bound()
           .saturating_mul(MESSAGES_PER_CONNECTION),
       )
+      .saturating_add(hold.held.copy_bound().saturating_mul(MESSAGES_PER_COPY))
       .max(1);
     let mut applied: usize = 0;
     for _ in 0..most {
@@ -362,6 +368,18 @@ impl Supervisor {
         reason: "a held connection could not be made inheritable",
       });
     }
+    let mut lost_copies = Vec::new();
+    for (copy, held) in hold.held.iter_copies() {
+      if inheritable(&held.object).is_err() {
+        lost_copies.push(copy);
+      }
+    }
+    for copy in lost_copies {
+      hold.held.drop_copy(copy);
+      hold.refuse(&crate::held::HoldRefusal::Malformed {
+        reason: "a held copy could not be made inheritable",
+      });
+    }
     let value = hold
       .held
       .env_value(std::os::fd::AsFd::as_fd(&hold.daemon_end));
@@ -370,6 +388,10 @@ impl Supervisor {
       (
         crate::held::ENV_CONNECTIONS.to_owned(),
         hold.held.connections_env_value(),
+      ),
+      (
+        crate::held::ENV_COPIES.to_owned(),
+        hold.held.copies_env_value(),
       ),
     ]
   }

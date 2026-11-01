@@ -142,7 +142,11 @@ async fn remove_on_owners(
 }
 
 /// A recorded removal releases its green pin but does not shorten its write lease (D-16).
-fn remove_batch(state: &mut ShardState, client: u32, attachments: &[u64]) -> Result<(), Refusal> {
+pub(crate) fn remove_batch(
+  state: &mut ShardState,
+  client: u32,
+  attachments: &[u64],
+) -> Result<(), Refusal> {
   let now = state.clock.monotonic_ns();
   for &id in attachments {
     if !state.db.partition().attachment(id).is_some_and(

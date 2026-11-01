@@ -367,6 +367,17 @@ impl ClientEnd {
     self.liveness.as_ref().is_none_or(|l| l.daemon_gone())
   }
 
+  /// A descriptor that reports the daemon's departure when polled for `POLLRDHUP` (`Liveness::watch`, Linux), or `None`
+  /// for an end with no liveness check.
+  #[cfg(target_os = "linux")]
+  #[must_use]
+  pub fn daemon_watch(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+    self
+      .liveness
+      .as_ref()
+      .map(crate::rendezvous::Liveness::watch)
+  }
+
   /// Receives a descriptor the daemon sent over the control socket (§4.6: a content map, A-135; a stream end,
   /// A-161), or `None` if none is waiting (or this end has no control socket). Non-blocking; the descriptor arrives
   /// by `SCM_RIGHTS` with what it is for and the request it answers.

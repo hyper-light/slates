@@ -520,6 +520,45 @@ impl ShardsBackings {
     }
   }
 
+  /// Keeps a writable copy a successor daemon took back from its anchor (A-197) at the exact `(index, generation)` its
+  /// backing had in the dead daemon, so the map id its client holds names it again; the copy is whole (every range of
+  /// it filled), and charged as [`ShardsBackings::insert_peer`] charges. Called while recovery rebuilds the shard,
+  /// before any other backing is kept, in ascending `index` order (the slab's [`Slab::insert_at`] contract). Refused, with
+  /// nothing kept or counted, past the budget, past the registry's slots, or out of order.
+  ///
+  /// [`Slab::insert_at`]: slates_mem::Slab::insert_at
+  pub fn adopt_peer(
+    &mut self,
+    object: PeerObject,
+    (volume, inode): (u16, InodeNo),
+    (index, generation): (u32, u32),
+  ) -> Result<Handle<ShardsBacking>, PeerRefusal> {
+    let object_bytes = object.len();
+    if !self.charge(object_bytes) {
+      return Err(PeerRefusal::Budget {
+        object_bytes,
+        charged: self.charged,
+        budget: self.budget,
+      });
+    }
+    let mut backing = ShardsBacking::for_peer(object, volume, inode);
+    let ranges = object_bytes.div_ceil(DAX_RANGE_BYTES);
+    backing.filled.extend(0..ranges);
+    let file = (volume, inode);
+    match self.slab.insert_at(index, generation, backing) {
+      Ok(handle) => {
+        self.by_file.entry(file).or_default().push(handle);
+        self.peers = self.peers.saturating_add(1);
+        self.peer_bytes = self.peer_bytes.saturating_add(object_bytes);
+        Ok(handle)
+      }
+      Err(full) => {
+        self.uncharge(object_bytes);
+        Err(PeerRefusal::Full(full))
+      }
+    }
+  }
+
   /// How many same-kernel clients' backings are held, and their objects' bytes.
   #[must_use]
   pub fn peers_held(&self) -> (usize, u64) {

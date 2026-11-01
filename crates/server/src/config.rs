@@ -488,6 +488,12 @@ impl DaemonConfig {
     usize::from(self.runtime.shards).saturating_mul(slates_bridge_core::authority::MAX_ATTACHMENTS)
   }
 
+  /// Derived: the writable direct maps' copies an anchor may hold for this daemon across a restart (A-197): every copy
+  /// its shards may hold at once, `shards × direct_maps_per_shard`, of which the writable ones are some.
+  pub fn held_copy_bound(&self) -> usize {
+    usize::from(self.runtime.shards).saturating_mul(self.direct_maps_per_shard)
+  }
+
   /// The configuration from a profile, for `instance`. An explicit shard count is selected
   /// before dividing the host's capacity (§4.2); otherwise the profile chooses the cores.
   /// Explicit counts are unpinned, as several daemons may share those cores in a test or VM.

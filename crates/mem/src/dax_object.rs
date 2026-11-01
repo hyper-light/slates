@@ -904,6 +904,49 @@ mod imp {
       })
     }
 
+    /// Takes back a writable copy a successor daemon inherits from its anchor (A-197): the object a dead daemon made
+    /// with [`PeerObject::create`] and handed a client, which the anchor held across the daemon's restart. Its length is
+    /// what `fstat` reports, never changed since it was made, since the object refuses any resize. Refused `OsRefused`
+    /// (`F_GET_SEALS`) where the object is not sealed against shrinking, growing and new seals or is sealed against
+    /// writes, as no writable copy is: a resize under slates' map would end the daemon on its next access; and
+    /// `OutOfRange` where its length is not a whole number of pages. Linux alone: a macOS copy keeps a second
+    /// descriptor the anchor does not hold.
+    #[cfg(target_os = "linux")]
+    pub fn adopt(fd: OwnedFd) -> Result<PeerObject, MemError> {
+      let fixed =
+        rustix::fs::SealFlags::SHRINK | rustix::fs::SealFlags::GROW | rustix::fs::SealFlags::SEAL;
+      let writes = rustix::fs::SealFlags::WRITE | rustix::fs::SealFlags::FUTURE_WRITE;
+      let seals = rustix::fs::fcntl_get_seals(&fd).map_err(|e| refused("fcntl_get_seals", e))?;
+      if !seals.contains(fixed) || seals.intersects(writes) {
+        return Err(MemError::OsRefused {
+          call: "F_GET_SEALS: not a writable copy's seals",
+          code: None,
+        });
+      }
+      let len = rustix::fs::fstat(&fd)
+        .map_err(|e| refused("fstat", e))
+        .and_then(|stat| {
+          u64::try_from(stat.st_size).map_err(|_| MemError::OsRefused {
+            call: "fstat: a negative size",
+            code: None,
+          })
+        })?;
+      let view_len = usize::try_from(len)
+        .ok()
+        .filter(|view_len| *view_len > 0 && PeerObject::bytes_for(len).ok() == Some(len))
+        .ok_or(MemError::OutOfRange {
+          offset: 0,
+          len: usize::try_from(len).unwrap_or(usize::MAX),
+        })?;
+      let view = RangeView::map(&fd, 0, view_len)?;
+      Ok(PeerObject {
+        fd,
+        view,
+        len,
+        access: PeerAccess::ReadWrite,
+      })
+    }
+
     /// The object's size in bytes, which never changes.
     #[must_use]
     pub fn len(&self) -> u64 {

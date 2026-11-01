@@ -10375,9 +10375,17 @@ compare the copy back, and the guest's own flush never reaches slates. Proven on
 `crates/cli/tests/pmem.rs` 3 of 3 in each of three runs, the granule test in `crates/client/tests/client.rs` on macOS
 and Linux; red-checked without the parent-death signal and without the sync.
 
+**Built (A-197, Step 6.2): the copy survives a takeover.** The anchor holds each writable copy with its record; the
+successor keeps its writer attachment, takes the copy back at the slot and generation its backing had, before the write
+log's replay, and holds the map under its client; `slates pmem` resyncs as soon as its daemon goes, and a copy no holder
+claims within the reconnect budget is written back and let go. Proven on adacachy (2026-11-01): `crates/cli/tests/
+pmem.rs` 6 of 6 in each of three runs, with the takeover and the unclaimed copy; red-checked without the hold, without
+the adoption, and without the reclaim. A client package run once stalled eight tests past the 1 s reply deadline at load
+50, and passed whole in three runs after.
+
 **Owed:**
-- the copy surviving a daemon takeover under a live map: A-186's writable maps end with their daemon today, so a
-  successor answers a holder's sync `NotFound` and a guest's later stores never reach the file;
+- macOS and Windows writable copies across a takeover: a macOS copy keeps a second descriptor the anchor does not hold,
+  and Windows' anchor holds no descriptors;
 - `crates/cli/tests/guest_image.rs`'s three pmem tests over a handed copy, no host mount as the backing, with
   Firecracker and Cloud Hypervisor on adacachy and QEMU on CI, and Firecracker on arm64 on the nested host Step 7
   builds;

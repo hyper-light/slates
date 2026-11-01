@@ -410,6 +410,10 @@ pub struct ShardState {
   /// takes each for its kept mount or closes it. Bounded by the anchor's held-device bound.
   #[cfg(target_os = "linux")]
   pub(crate) inherited_fuse: Vec<crate::fuse_hold::HeldDevice>,
+  /// The writable copies the anchor handed back for this shard's partition (A-197; `crate::held_copy`), until recovery
+  /// takes each back or lets it go. Bounded by the anchor's held-copy bound.
+  #[cfg(target_os = "linux")]
+  pub(crate) inherited_copies: Vec<crate::held_copy::InheritedCopy>,
   /// The FUSE mounts recovery kept because the anchor held their devices (A-61), each with its record, served
   /// again once the shard runs (`fuse::adopt_held`). Filled once at recovery and emptied by that step.
   #[cfg(target_os = "linux")]

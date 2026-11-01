@@ -585,6 +585,16 @@ impl Liveness {
     self.inner.daemon_gone()
   }
 
+  /// A descriptor that reports the daemon's departure when polled (Linux: the control socket, whose peer end closes
+  /// with the daemon's process, so `POLLRDHUP` and `POLLHUP` arrive), for a process that must notice a takeover without
+  /// a call in flight (`slates pmem`, A-197). The daemon's deliveries make it readable too, which `POLLRDHUP` alone does
+  /// not ask about.
+  #[cfg(target_os = "linux")]
+  #[must_use]
+  pub fn watch(&self) -> std::os::fd::BorrowedFd<'_> {
+    self.inner.watch()
+  }
+
   /// Receives a descriptor the daemon sent over the control socket (§4.6: a content map, A-135; a stream end,
   /// A-161), or `None` when none is waiting. Non-blocking. A platform without a control socket (macOS, Windows)
   /// never delivers one: a same-kernel client there reads through the copy path, and a stream end comes by the
@@ -989,6 +999,11 @@ pub mod platform {
   }
 
   impl Liveness {
+    /// The control socket, polled for the daemon's departure ([`super::Liveness::watch`]).
+    pub(super) fn watch(&self) -> std::os::fd::BorrowedFd<'_> {
+      std::os::fd::AsFd::as_fd(&self.socket)
+    }
+
     pub(super) fn daemon_gone(&self) -> bool {
       let mut probe = [0u8; 1];
       match rustix::net::recv(
