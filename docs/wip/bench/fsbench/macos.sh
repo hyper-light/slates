@@ -48,7 +48,9 @@ for _ in $(seq 1 600); do
 done
 # A fresh instance may need its consensus configuration made before it creates; one already made says so.
 "$SLATES" --instance "$INSTANCE" bootstrap root > /dev/null 2>&1 || true
-PLAIN=$("$SLATES" --instance "$INSTANCE" volume create fsb --bounded 1GiB | awk '$1 == "id" { print $2 }')
+# A bounded volume reserves its whole limit from its shard's share of the machine (about 1 GiB a shard on a
+# 16 GiB, four-core runner); a round holds about 6.5 MB, so 256 MiB fits every runner with room to spare.
+PLAIN=$("$SLATES" --instance "$INSTANCE" volume create fsb --bounded 256MiB | awk '$1 == "id" { print $2 }')
 "$SLATES" --instance "$INSTANCE" mount "$PLAIN" "$W/slates" > /dev/null
 
 echo "# date $(date -u +%FT%TZ); macOS $(sw_vers -productVersion) ($(sw_vers -buildVersion)), $(uname -m); slates $(git -C "$ROOT" rev-parse --short HEAD 2> /dev/null || echo unknown), release"

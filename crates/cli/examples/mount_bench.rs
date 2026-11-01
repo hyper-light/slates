@@ -17,7 +17,8 @@
 //!
 //! Each phase runs over all of a round's files before the next, so the directory holds them from the creates to the
 //! unlinks, as a tree being written does. Rounds interleave the arms and rotate which goes first, so a load that
-//! drifts during a run lands on every arm alike (the A/B rule: interleaved, fresh state, load recorded).
+//! drifts during a run lands on every arm alike (the A/B rule: interleaved, fresh state, load recorded). One untimed
+//! round per arm runs first, so first-use costs are in no pass's tail.
 //!
 //! Two passes:
 //! - **Quiet:** nothing added.
@@ -300,7 +301,13 @@ fn probe(stop: &AtomicBool) -> Vec<u64> {
 fn load_average() -> String {
   std::fs::read_to_string("/proc/loadavg").map_or_else(
     |e| format!("unread ({e})"),
-    |text| text.split_whitespace().take(3).collect::<Vec<_>>().join(" "),
+    |text| {
+      text
+        .split_whitespace()
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" ")
+    },
   )
 }
 
@@ -431,7 +438,10 @@ fn print_pass(arms: &[Arm], mut measured: Pass) {
     }
   }
   println!();
-  println!("**{}** ({load}). Each cell: p50 · p99 · p999 · max, µs.", measured.name);
+  println!(
+    "**{}** ({load}). Each cell: p50 · p99 · p999 · max, µs.",
+    measured.name
+  );
   println!();
   let names: Vec<&str> = arms.iter().map(|arm| arm.name.as_str()).collect();
   println!("| op | {} |", names.join(" | "));
@@ -521,8 +531,16 @@ fn remove_work_directories(made: Vec<PathBuf>) {
   }
 }
 
-/// Runs and prints each pass; the first failure ends the run.
+/// Runs and prints each pass after one untimed round per arm, so first-use costs (a daemon's first page faults, cold
+/// caches) land in no pass's tail; the first failure ends the run.
 fn run_passes(options: &Options, cores: usize, sweep: (usize, usize)) -> Result<(), String> {
+  for arm in &options.arms {
+    round(arm, "warm", 0, options.files, &mut Samples::default())?;
+  }
+  println!(
+    "# warm-up: one untimed round per arm ({} files each)",
+    options.files
+  );
   for name in &options.passes {
     let spinners = if *name == "contended" { cores } else { 0 };
     let measured = pass(
