@@ -20,6 +20,11 @@
 //! **Cloud Hypervisor (A-189)** likewise: its virtio-pmem device maps the image file shared (`--pmem
 //! file=…,discard_writes=off`), and its guest powers off at the end, since it reboots a guest that restarts. Its own
 //! virtio-fs device has no DAX ("it is not available in Cloud Hypervisor", its `docs/fs.md`).
+//! **crosvm** likewise (Step 7 of the VFS and DAX plan): `--pmem path=` maps the image file shared as a virtio-pmem
+//! device's memory, writable unless told `ro=true` (the crosvm book's "VirtIO Pmem"), its region rounded up to 2 MiB
+//! with padding of the file's own protection (`devices/device_virtio_pmem/src/lib.rs`), so a backing that is a 2 MiB
+//! multiple, as every image and handed copy here is, needs none; `--block path=` attaches the image as a virtio-blk
+//! drive. Its guest powers off at the end.
 //!
 //! Gated. It needs Linux and three files named in the environment for each VMM it runs; without them it skips loudly:
 //! - `SLATES_GUEST_FIRECRACKER`: a Firecracker binary, v1.17.0 or later (the release binary, its checksum verified
@@ -34,6 +39,8 @@
 //!   emulation where not.
 //! - `SLATES_GUEST_CLOUD_HYPERVISOR`, with `SLATES_GUEST_VMLINUX`: a Cloud Hypervisor binary (the release's static one,
 //!   its digest checked), booting the kernel by its PVH entry.
+//! - `SLATES_GUEST_CROSVM`, with `SLATES_GUEST_KERNEL`: a crosvm binary and the kernel it boots (a bzImage on x86_64,
+//!   the `Image` on arm64; a distribution's `vmlinuz` serves). Its sandbox stays on, as `tests/guest_dax.rs` says.
 //! - `SLATES_GUEST_PROBE`: the guest's `/init`, static (`tests/guest_dax.rs` says how to build it).
 //!
 //! The pmem test also needs `SLATES_GUEST_MODULES`, the guest kernel's module directory (`/lib/modules/<release>` of the
@@ -186,6 +193,10 @@ enum Vmm {
   /// PVH entry): it attaches the image as its command line says, a virtio-pmem device "bypassing the guest page cache"
   /// (its `docs/device_model.md`) or a virtio-blk disk. It reboots a guest that restarts, so its guest powers off.
   CloudHypervisor { binary: String, vmlinux: String },
+  /// crosvm (`SLATES_GUEST_CROSVM`, booting `SLATES_GUEST_KERNEL`): it attaches the image as its command line says, a
+  /// writable virtio-pmem device (`--pmem path=`) or a virtio-blk disk (`--block path=`), its guest's console on its
+  /// serial port; its guest powers off.
+  Crosvm { binary: String, kernel: String },
 }
 
 impl Vmm {
@@ -195,6 +206,7 @@ impl Vmm {
       Vmm::Firecracker { .. } => "firecracker",
       Vmm::Qemu { .. } => "qemu",
       Vmm::CloudHypervisor { .. } => "cloud-hypervisor",
+      Vmm::Crosvm { .. } => "crosvm",
     }
   }
 
@@ -204,6 +216,7 @@ impl Vmm {
       Vmm::Firecracker { .. } => "firecracker: ",
       Vmm::Qemu { .. } => "qemu: ",
       Vmm::CloudHypervisor { .. } => "cloud-hypervisor: ",
+      Vmm::Crosvm { .. } => "crosvm: ",
     }
   }
 }
@@ -230,6 +243,9 @@ impl Gate {
       named("SLATES_GUEST_CLOUD_HYPERVISOR")
         .zip(named("SLATES_GUEST_VMLINUX"))
         .map(|(binary, vmlinux)| Vmm::CloudHypervisor { binary, vmlinux }),
+      named("SLATES_GUEST_CROSVM")
+        .zip(named("SLATES_GUEST_KERNEL"))
+        .map(|(binary, kernel)| Vmm::Crosvm { binary, kernel }),
     ]
     .into_iter()
     .flatten()
@@ -246,8 +262,8 @@ impl Gate {
       _ => {
         eprintln!(
           "SKIP: the image test needs SLATES_GUEST_FIRECRACKER and SLATES_GUEST_VMLINUX, SLATES_GUEST_QEMU and \
-           SLATES_GUEST_KERNEL, or SLATES_GUEST_CLOUD_HYPERVISOR and SLATES_GUEST_VMLINUX, and SLATES_GUEST_PROBE \
-           (tests/guest_image.rs says what each is)"
+           SLATES_GUEST_KERNEL, SLATES_GUEST_CLOUD_HYPERVISOR and SLATES_GUEST_VMLINUX, or SLATES_GUEST_CROSVM and \
+           SLATES_GUEST_KERNEL, and SLATES_GUEST_PROBE (tests/guest_image.rs says what each is)"
         );
         Vec::new()
       }
@@ -505,6 +521,15 @@ impl Disk {
     }
   }
 
+  /// crosvm's arguments for the image at `image`: a writable virtio-blk disk, or the file mapped shared as a writable
+  /// virtio-pmem device's memory.
+  fn crosvm_device(&self, image: &str) -> Vec<String> {
+    match self {
+      Disk::Drive { .. } => vec!["--block".to_owned(), format!("path={image}")],
+      Disk::Pmem { .. } => vec!["--pmem".to_owned(), format!("path={image}")],
+    }
+  }
+
   /// What the guest's command line tells its probe to load and mount.
   fn guest_options(&self) -> String {
     match self {
@@ -637,6 +662,30 @@ fn cloud_hypervisor_arguments(
     "off".to_owned(),
   ];
   arguments.extend(disk.cloud_hypervisor_device(image));
+  arguments
+}
+
+/// crosvm's command line: the kernel, the initramfs, the image as `disk` presents it, a small machine, and the guest's
+/// console on its serial port, read and written on its standard streams. Its guest powers off at the end.
+fn crosvm_arguments(kernel: &str, initrd: &str, image: &str, disk: &Disk) -> Vec<String> {
+  let mut arguments = vec![
+    "run".to_owned(),
+    "-m".to_owned(),
+    GUEST_MEMORY_MIB.to_string(),
+    "--cpus".to_owned(),
+    GUEST_CPUS.to_string(),
+    "--initrd".to_owned(),
+    initrd.to_owned(),
+    "-p".to_owned(),
+    format!(
+      "console=ttyS0 panic=1 rdinit=/init quiet {}",
+      disk.guest_options()
+    ),
+    "--serial".to_owned(),
+    "type=stdout,hardware=serial,num=1,console,stdin".to_owned(),
+  ];
+  arguments.extend(disk.crosvm_device(image));
+  arguments.push(kernel.to_owned());
   arguments
 }
 
@@ -779,7 +828,7 @@ fn modules_needed(directory: &str, wanted: &[&str]) -> Vec<Module> {
 /// the millisecond, the vCPU meets the fallback first, a KVM shutdown exit Firecracker leaves unhandled and exits 1 for.
 /// Measured on the box at load 46-53 (2026-10-24): 1 run of 18. Either way the guest ended the VM by its own restart,
 /// after its flush; the merge that follows holds the bytes to it. QEMU (`-no-reboot`) exits 0 at the restart, and a
-/// Cloud Hypervisor guest powers off instead, which ends it with 0.
+/// Cloud Hypervisor or crosvm guest powers off instead, which ends either with 0.
 fn the_guest_ends_the_vm_by_its_restart(guest: &mut Guest) {
   let status = guest.quit();
   if !status.success() {
@@ -1107,6 +1156,11 @@ impl Rig {
       }
       Vmm::CloudHypervisor { binary, vmlinux } => Guest::spawn_on_terminal(
         vmm(binary).args(cloud_hypervisor_arguments(vmlinux, &initrd, &image, disk)),
+        gate.vmm.tag(),
+        MOST_BYTES,
+      ),
+      Vmm::Crosvm { binary, kernel } => Guest::spawn(
+        vmm(binary).args(crosvm_arguments(kernel, &initrd, &image, disk)),
         gate.vmm.tag(),
         MOST_BYTES,
       ),
