@@ -22,7 +22,7 @@
 //! - an NFS call's task awaits [`wait`] before its reply is queued;
 //! - a verb forwarded from another node awaits [`wait`] on the owner before its exchange answers;
 //! - a guest's request through slates' own virtio-fs device is held by its device, which serves the guest's later
-//!   requests meanwhile and waits on [`parked`] while idle (`crate::virtiofs`; A-196);
+//!   requests meanwhile and waits on `parked`, a Unix item, while idle (`crate::virtiofs`; A-196);
 //! - a guest's request over a Shards stream, whose VMM asks one request at a time, waits in its stream's task for
 //!   [`wait`] before its reply is sent (`crate::shards`; A-196).
 //!
