@@ -3151,6 +3151,11 @@ daemon through the rendezvous's socket file (A-187).
 >   by the image form, virtio-pmem over the image file through a slates mount, on Linux x86_64 (diagnostics run
 >   40883925064, red-checked with `dax=never`). QEMU builds virtio-pmem for x86 machines only, so arm64 has no such
 >   route.
+> - **Proven since (A-197, 2026-11-01):** a pmem VMM over a copy of the image file that `slates pmem` hands it at a
+>   descriptor, with no host mount, compared back at the launcher's sync points: Firecracker (its socket-route cell, until
+>   then impossible) and Cloud Hypervisor on Linux x86_64 (on adacachy, each pmem test of `guest_image.rs` three of three
+>   in three runs, and three tests of a hostile guest), and QEMU 11.1 by the same route beside slates' own device (CI,
+>   diagnostics runs 41307486734 and 41310124785). Firecracker on Linux arm64 by this route is owed (Step 6.6).
 > - **Ruled out by the platforms:** QEMU's vhost-user-fs device and virtiofsd have no window, so QEMU shares no file tree
 >   with DAX by its own device, its mount route is the image form, x86_64 only (it builds virtio-pmem for x86 machines
 >   alone), and Kata, which drives that device, has neither route; Cloud Hypervisor's fs device has none (its mount
@@ -12755,7 +12760,7 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
 
-### A-197 — pmem over a handed copy: a socket route for every pmem VMM (accepted 2026-11-01; building, Step 6 of the VFS and DAX plan)
+### A-197 — pmem over a handed copy: a socket route for every pmem VMM (accepted and built on Linux x86_64 2026-11-01, Step 6 of the VFS and DAX plan; Firecracker on arm64 owed)
 Applied in the same change to: A-186 (the copy's length), GAPS, `crates/ipc` (`protocol.rs`: `MapWrite`'s `granule`;
 `stream.rs`: `spawn_bound`), `crates/server` (`direct_map.rs`: the granule checked and the copy sized by it;
 `verbs.rs`), `crates/client` (`map_write`'s granule, `page_bytes`; the granule test in `tests/client.rs`), `crates/cli`
@@ -12770,7 +12775,8 @@ launcher's watch on its daemon; `anchor.rs`). The real VMMs (Step 6.3): `crates/
 test over both backings) and `tests/vm/mod.rs` (`Guest::expect_line`). The hostile guests (Step 6.4):
 `crates/guest-probe` (`protocol.rs`: `device`, `storm`, `sweep`, the `stormed` reply and `sweep_value`; `guest.rs`),
 `crates/cli/tests/guest_image.rs` (three tests over a handed copy), `tests/vm/mod.rs` (`Guest::last_line_holding`)
-and CI's image-form step (seven tests).
+and CI's image-form step (seven tests). The matrix (Step 6.5): `docs/wip/virtiofs.md` §8 (Firecracker's, Cloud
+Hypervisor's and QEMU's socket-route cells), §4.6 (the DAX matrix's status) and CLAUDE.md.
 - **What it answers.** A pmem VMM reached a slates volume only through a host mount: Firecracker, Cloud Hypervisor and
   QEMU map an image file shared as a virtio-pmem device's memory, and the file was a path through a slates mount (the
   image form's pmem route, A-160, A-165, A-189). Firecracker has no folder sharing at all, so its socket-route cell was
@@ -12897,7 +12903,12 @@ and CI's image-form step (seven tests).
     QEMU 11.1 on CI's ubuntu runner: seven of seven in each of three runs, 50 to 51 s a run (diagnostics run
     41310124785); its storms took 811 to 850 ms, each kill landed mid-sweep (sweeps 136 to 189, at bytes 3,670 to
     168,301), and each release at the VM's exit wrote 192,600 to 196,608 bytes.
-- **Owed** (GAPS): Firecracker on arm64; the DAX matrix's cells.
+- **The matrix** (Step 6.5). With no host mount in a pmem VMM's path, the copy `slates pmem` hands it is a socket
+  route: Firecracker's cell on Linux x86_64 turns from impossible to proven, Cloud Hypervisor's from impossible to proven
+  for an image (its fs device has no window, so a file tree still has no such route), and QEMU's, proven by slates' own
+  device (A-189), gains the same route for an image (`docs/wip/virtiofs.md` §8).
+- **Owed** (GAPS): Firecracker on arm64 over a handed copy (Step 6.6, on the nested arm64 KVM host Step 7 builds); a
+  writable copy across a takeover on macOS and Windows.
 
 ### A-196 — A guest's write through slates' own device or a Shards stream is answered once every FUSE mount of its volume has been told, and the device serves on while the reply waits (accepted and built 2026-11-01)
 Applied in the same change to: §4.6 ("Cache posture": the paragraph on when a mount is told), Phase 3's AC-3.3, A-191

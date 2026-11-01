@@ -205,6 +205,23 @@ Every test is written as "do X, expect Y" and names the acceptance criterion or 
       stores at the ingest and zeroed its map at the refill. The slice is derived from the machine, and every
       development machine derived one within the cap, so the oracle runs a whole range a slice too (`Slices` in
       `crates/server/tests/shards.rs`); only CI's runner had derived the regime that broke.
+  - A VMM handed a writable copy as its pmem backing, with no host mount: `crates/cli/src/verbs.rs` (`run_pmem`,
+    `serve_pmem`: the VMM spawned bound to its launcher by Linux's parent-death signal, `slates_ipc::stream::spawn_bound`;
+    a SIGUSR1 a compare-back, the VM's exit the last, its daemon's departure a resync) with
+    `crates/server/src/held_copy.rs` (the anchor holds the copy across a takeover, and the successor takes it back before
+    the write log's replay) and `crates/cli/tests/guest_image.rs` (each pmem test over the mount and over the copy, and
+    three hostile guests; A-197). Gotchas, each measured:
+    - The copy is the file's length rounded up to 2 MiB, so a guest's device runs past the file's end. Two guards keep
+      that tail out of the file, each enough alone: a compare-back stops at the file's length when it began
+      (`direct_map.rs`), and compares only as far as the file's bytes reach (`write_back_runs`). With one removed the
+      other held; with both, a guest's 128 KiB past the end grew the image to the copy's length.
+    - The guest's own flush never reaches slates: it is the VMM's sync of a copy with no file behind it. So a test syncs
+      through the launcher where over a mount the guest's flush would do, and QEMU's `size=` is the copy's length, not
+      the file's.
+    - The launcher must stay the VMM's parent to hold the map, so it cannot exec the VMM as `slates shards` does; the
+      parent-death signal is what keeps a VM from outliving its map's holder.
+    - `served=` in `slates status` counts every client request and no FUSE request, so "no slates I/O" is held by the
+      bytes as well: the same flush storm over a mount put the patch in slates, which the test refused.
   - A foreign-thread framework served by a shard: `crates/server/src/winfsp.rs` with `crates/bridge-winfsp/src/host.rs`
     (WinFsp's dispatcher threads send each request over a bounded channel and wake the mount's task; an owned mount
     thread holds the file system; `crates/cli/tests/winfsp.rs` on CI's Windows runner). Gotchas, each found on the

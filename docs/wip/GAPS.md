@@ -10366,7 +10366,7 @@ beside it (no unprivileged process sees a frame number), and L2's shift (no map 
   the backing. No test reaches a fill failing part-way. Placement does not widen it: a range is placed only once its
   fill finishes.
 
-### 2026-11-01: pmem over a handed copy, a socket route for every pmem VMM (A-197) — building
+### 2026-11-01: pmem over a handed copy, a socket route for every pmem VMM (A-197) — built on Linux x86_64
 
 **Built (A-197, Step 6.1 of the VFS and DAX plan).** `slates pmem ID FILE --fd N -- VMM` maps a file to write with a
 2 MiB granule (`MapWrite`'s `granule`, a power of two of at least the page, refused `BadRequest` otherwise) and runs the
@@ -10401,11 +10401,15 @@ Hypervisor on adacachy (2026-11-01), and with QEMU 11.1 on CI (diagnostics run 4
 past-end guards removed (the image grew to 33,554,432 bytes), the storm over a mount (the patch reached slates) and a
 release without its compare-back (0 bytes).
 
+**Closed (A-197, Step 6.5): the DAX matrix's pmem socket-route cells.** `docs/wip/virtiofs.md` §8: Firecracker's
+socket-route cell on Linux x86_64 turned from impossible to proven, Cloud Hypervisor's from impossible to proven for an
+image, and QEMU's, proven by slates' own device (A-189), gained the same route for an image; Firecracker's on Linux arm64
+turned from impossible to owed (Step 6.6).
+
 **Owed:**
 - macOS and Windows writable copies across a takeover: a macOS copy keeps a second descriptor the anchor does not hold,
   and Windows' anchor holds no descriptors;
-- Firecracker on arm64 over a handed copy, on the nested host Step 7 builds;
-- the DAX matrix's Firecracker socket-route cell, which stays "impossible" until the tests above pass.
+- Firecracker on arm64 over a handed copy, on the nested host Step 7 builds (Step 6.6).
 
 ### 2026-11-01: one window kind: the fd-sharing placer maps per-file backings, and the arena's windows are gone (A-195)
 
