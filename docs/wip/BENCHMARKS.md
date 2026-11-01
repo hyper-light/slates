@@ -7150,6 +7150,65 @@ the moments, not the arms, and are not read. What does compare: the least write 
 client's stale copy back over another path's write in every such case, silently, and through Apple's client it lost the
 other path's write in 9 runs of 9.
 
+## What placing a guest's DAX range in one huge page costs (A-193; 2026-10-31)
+
+**The question.** Each range of a backing a guest maps is placed in one huge page as its fill finishes (§4.6, the
+backed route's L1). This records what that costs: the memory a placed range holds against what the fill budget counts,
+and how long the fill step that places a range takes, when the kernel places it, when it declines, and where nothing is
+placed.
+
+**The commands.** Debug builds, as the tests run; `--nocapture` prints each measurement.
+- `cargo test -p slates-bridge-core --test dax_backing -- --nocapture each_range_a_guest_maps_is_one_huge_page_within_the_fill_budget`:
+  a one-page file's first range and a range wholly past its end, filled 16 KiB a slice. Each fill's longest step is the
+  one that finishes the range and places it.
+- `cargo test -p slates-bridge-virtiofs --test device -- --nocapture every_window_over_a_backing_is_one_huge_page_read_only_or_writable a_read_only_attachments_window_is_placed_and_its_writable_ask_refused`:
+  read-only and writable windows through slates' own device.
+
+Memory is the object's `st_blocks` by `fstat`, read through the descriptor the VMM is handed. Counted is what the
+backings count against the fill budget.
+
+**The machines.**
+- adacachy: 32 cores, 124 GiB, CachyOS, Linux 7.2.9-2-cachyos, x86_64, 4 KiB pages, THP `[always]`, `shmem_enabled`
+  `[advise]`. It is shared with other sessions and kiln's CI jobs, each run inside a `--user` systemd scope (`MemoryMax`
+  16G, `CPUWeight` 1, nice 19).
+- Apple M5 Max, macOS 26.4.1, for the no-placement baseline.
+
+| run | load | ranges | placed | refused | object bytes | counted bytes | budget |
+|---|---|---|---|---|---|---|---|
+| session test, adacachy (kiln run r4) | 47, no idle core | 2 | 2 | 0 | 4,194,304 | 4,194,304 | 16,777,216 |
+| device, read-only and writable windows, adacachy (r4) | 47, no idle core | 3 | 3 | 0 | 2,097,152 and 4,194,304 | 6,291,456 | 16,777,216 |
+| device, a read-only attachment's window, adacachy (r5) | no idle core | 1 | 1 | 0 | 2,097,152 | 2,097,152 | 16,777,216 |
+| session test, adacachy (r6, the memo not yet built) | 90 to 99 | 2 | 0 | 2 | 8,192 | 4,194,304 | 16,777,216 |
+| session test, CI `ubuntu-latest` (x86_64) | a 4-CPU runner | 2 | 2 | 0 | 4,194,304 | 4,194,304 | 16,777,216 |
+| device, read-only and writable windows, CI x86_64 | a 4-CPU runner | 3 | 3 | 0 | 2,097,152 and 4,194,304 | 6,291,456 | 16,777,216 |
+| device, a hostile guest's 17 maps over 2 ranges, CI x86_64 | a 4-CPU runner | 2 | 2 | 0 | not read | not read | 16,777,216 |
+| session test, CI `ubuntu-24.04-arm` (arm64) | a 4-CPU runner | 2 | 2 | 0 | 4,194,304 | 4,194,304 | 16,777,216 |
+| device, read-only and writable windows, CI arm64 | a 4-CPU runner | 3 | 3 | 0 | 2,097,152 and 4,194,304 | 6,291,456 | 16,777,216 |
+
+CI's runners (diagnostics run 41271016248, 2026-11-01 UTC): image ubuntu24 20261026.354.1 and ubuntu24-arm64
+20261026.166.1, 4 CPUs, 16 GiB, Linux 7.0.0-1017-azure, 4 KiB pages, THP `[madvise]`, `shmem_enabled` `[never]`.
+
+The longest fill step of each range's fill, the step that finishes the range and places it (one sample each):
+
+| machine | placement | range 0 (a page of data) | range 2 (past the end) |
+|---|---|---|---|
+| CI x86_64 | placed | 266 µs | 193 µs |
+| CI arm64 | placed | 359 µs | 191 µs |
+| adacachy, load 90 to 99 | declined | 2,832 µs | 1,954 µs |
+| Apple M5 Max, macOS 26.4.1 | none (`Unavailable`) | 158 µs | 39 µs |
+
+- **A placed range holds exactly 2 MiB, and the budget already counted it.** Every object held its placed ranges'
+  bytes and nothing more, by `st_blocks`, on both architectures; the fill budget counts 2 MiB for each filled range, so
+  placement made what was counted resident rather than adding to it. The cost lands on small files: a one-page file's
+  range holds 2 MiB where it held 4 KiB (the declined row's 8,192 bytes are two base pages).
+- **A step that places its range took 191 to 359 µs on CI's runners**, one sample each, debug builds; the collapse
+  zeroes the rest of the page and copies the pages the fill stored. What placement adds to a step is not separated
+  here: no run timed the same runner with placement off, and the macOS row is another machine. Not a gated number.
+- **A declined step costs milliseconds**, the kernel's compaction effort before it gives up: 1,954 and 2,832 µs on a
+  host at load 90. That is why a decline likely to hold is remembered until the daemon's reap tick (A-193): the shard
+  pays it once a tick, not once a range.
+- The `shmem_enabled` `[never]` runners show that the placement needs no host setting: `MADV_COLLAPSE` ignores it.
+
 ## Every platform's mount, like for like, quiet and under load (T-4.8; condition 12; 2026-11-01)
 
 Before any optimization of the mounts (step 2 of the VFS and DAX plan), one harness measured slates' host mount beside

@@ -147,11 +147,17 @@ pub const REFILLED: &str = "virtiofs.dax_refilled";
 pub const REFILL_REFUSED: &str = "virtiofs.dax_refill_refused";
 /// Format: the owner's status counter of writable ranges a refill passed over ([`Counts::refill_writable`]).
 pub const REFILL_WRITABLE: &str = "virtiofs.dax_refill_writable";
+/// Format: the owner's status counter of ranges placed in one huge page each as their fills finished
+/// ([`Counts::placed`]; §4.6, the backed route's L1; A-193).
+pub const PLACED: &str = "virtiofs.dax_placed";
+/// Format: the owner's status counter of ranges whose placement the kernel declined, served on base pages
+/// ([`Counts::placement_refused`]).
+pub const PLACEMENT_REFUSED: &str = "virtiofs.dax_placement_refused";
 
 impl BackedCounts {
   /// Every count with the name of the owner's status counter it adds to, in one order, so the serve loop can add what
   /// moved since its last report while the device runs (`serve.rs`).
-  pub fn named(&self) -> [(&'static str, u64); 13] {
+  pub fn named(&self) -> [(&'static str, u64); 15] {
     [
       (MAPS_SENT, self.maps_sent),
       (MAPS_KEPT, self.maps_kept),
@@ -166,6 +172,8 @@ impl BackedCounts {
       (REFILLED, self.session.refilled),
       (REFILL_REFUSED, self.session.refill_refused),
       (REFILL_WRITABLE, self.session.refill_writable),
+      (PLACED, self.session.placed),
+      (PLACEMENT_REFUSED, self.session.placement_refused),
     ]
   }
 
@@ -180,6 +188,10 @@ impl BackedCounts {
     summed.refill_writable = summed
       .refill_writable
       .saturating_add(counts.refill_writable);
+    summed.placed = summed.placed.saturating_add(counts.placed);
+    summed.placement_refused = summed
+      .placement_refused
+      .saturating_add(counts.placement_refused);
   }
 }
 

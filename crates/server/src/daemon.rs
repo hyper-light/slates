@@ -3470,8 +3470,13 @@ async fn reap_loop() {
     // §4.6 L1: ask the host once more for the sandboxes it refused. A refusal costs 53 µs of address-space
     // walking to re-learn (measured on fedora 6.19.10), so the shift loop must not ask at its own 16 ms
     // cadence — that is 0.33% of a core per window spent hearing the same no. The reap tick is the cadence
-    // the shard already does cold work at, so a host that frees memory gets its sandbox within one tick.
-    state::with_state(|s| s.store.dax_zones.rearm_refusals());
+    // the shard already does cold work at, so a host that frees memory gets its sandbox within one tick. The backed
+    // route's placements (A-193) re-arm with them: a declined collapse costs milliseconds of compaction, so a host out
+    // of huge pages is asked once a tick, not once a range.
+    state::with_state(|s| {
+      s.store.dax_zones.rearm_refusals();
+      s.store.shards_backings.rearm_placement();
+    });
   }
 }
 

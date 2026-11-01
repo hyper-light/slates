@@ -7596,7 +7596,9 @@ its own page table and never calls the daemon), so the defense had to be at the 
   two-phase revoke (`dax_revoke_pending` keeps the block pinned; `dax_release_after_unmap` unpins only after the VMM
   confirms the unmap + cross-core TLB flush); the map-storm/fault DoS is bounded three ways (registry cap, §4.9 credit
   window, cooperative serve loop). The Rowhammer layered defence is built in the VFS: **L0** writable DAX is a
-  per-volume opt-in (`Volume::enable_writable_dax`; read-only default, 4b411da9); **L2** the moving target
+  per-volume opt-in (`Volume::enable_writable_dax`; read-only default, 4b411da9; **its premise corrected 2026-10-31,
+  A-193:** reading alone hammers, so the read-only default bounds a guest's stores into the arena, not hammering; see
+  the 2026-10-31 entry below); **L2** the moving target
   (`Volume::dax_migrate` + `stripe_target`, bounded no-quarantine placement, measured 242 ns/migration, 68b4a9c5);
   **B2** the self-healing net for read-only content (`Store::dax_guard`/`dax_scrub`, BLAKE3 checksum + heal, 6922fcf2).
   **Owed:** **L1** physically-contiguous hugetlb zones + guard rows (the deployment layer that makes L2's shift move
@@ -10304,6 +10306,57 @@ Also recorded: the full precondition chain a harness meets on Linux, which nothi
 `slates mount --shared` needs `user_allow_other` in `/etc/fuse.conf` (`AllowOtherNotGranted`), and without a
 shared mount `attach --oci` refuses `MountNotShared`, and without a mount at all it refuses
 `ChosenPathUnavailable { NotAMountPoint }`. Every step surfaced as a typed refusal, which is the gate working.
+
+### 2026-10-31: reading alone hammers, and the route production serves carried no Rowhammer layer (A-193)
+
+**Found.** §4.6's L0 said a writable mapping is the only DAX mode a guest can hammer and read-only DAX cannot hammer a
+neighbour. The primary sources say a read hammers: Kim et al. corrupted nearby data "by reading from the same address
+in DRAM" (ISCA 2014), and Project Zero's exploit rests on "repeatedly accessing a row of memory" (2015). Under that
+premise the backed route (A-168, and the Shards route's same objects, A-163), which is every DAX window production
+serves, carried none of L1, L2 or B2. Those were built on the arena's blocks, read-only and writable windows alike.
+
+**Built (A-193).** Each range of a backing is placed in one huge page as its fill finishes, before the guest's ask is
+answered (`DaxObject::place_range`). A declined collapse is served on base pages and counted
+(`virtiofs.dax_placement_refused`, `shards.dax_placement_refused`), placements count `virtiofs.dax_placed` and
+`shards.dax_placed`, `ShardsBackings::placed_ranges` is the live gauge, and `ShardsBackings::placements` reads where each
+lies. A placed range is zeroed by stores, never a hole punch. A decline likely to hold is remembered until the daemon's
+reap tick re-arms it (`ShardsBackings::place`), since a declined fill step took 1,954 and 2,832 µs of the kernel's
+compaction effort on adacachy at load 90: a host out of huge pages is asked once a tick per shard, not once a range.
+
+**Proven** on adacachy (Linux 7.2.9, x86_64) and on CI's x86_64 and arm64 runners (Linux 7.0, diagnostics run
+41271016248), 2026-10-31:
+- `each_range_a_guest_maps_is_one_huge_page_within_the_fill_budget` and `a_declined_placement_is_remembered_until_re_armed`
+  (bridge-core), and three device tests;
+- red-checked on both runners, each mutation failing on its own assertion: placement off, a placed range punched rather
+  than zeroed by stores, and the decline memo off;
+- every range filled placed, none refused, each one PMD page in slates' view and in the front end's map, and a cut
+  keeping it so;
+- each object holding exactly its placed ranges' bytes, within the budget: 4,194,304 of 4,194,304 counted; 2,097,152
+  and 4,194,304 of 6,291,456; a 16,777,216-byte budget;
+- a hostile guest's 16 map, upgrade and removal cycles placing each range once;
+- the gauge and the budget back to zero once the node is forgotten.
+
+macOS and Windows have no huge page of a range's size for an unprivileged program, so placement there is
+`Unavailable` and the tests skip loudly.
+
+**Cannot apply to a backing (§4.6 says why):** guard rows in the range (a guest maps each 2 MiB range whole), guard rows
+beside it (no unprivileged process sees a frame number), and L2's shift (no map over a live window).
+
+**Owed:**
+- B2 over read-only backings: compare each with the volume on the reap tick, as B2 does the arena's guarded blocks.
+
+**Found on the way, reported, not changed here:**
+- The arena zone's guard is one 64 KiB slot (`GUARD_SLOTS`). What a guard of bytes is worth in DRAM rows depends on how
+  the memory controller interleaves channels, ranks and banks, which is undocumented (DRAMA, Pessl et al., 2016). A
+  64 KiB slot may hold less than one row across the banks it touches, so `daxzone.rs`'s "exceeds any published blast
+  radius" is unproven.
+- The forget test's REMOVEMAPPING body (`crates/bridge-virtiofs/tests/device.rs`) put four padding bytes after the
+  count, which the parser (`RemoveMappingIn`, as `fuse_removemapping_in` is laid out) reads as the entry. It read offset
+  0 only because the offset it meant was 0. Corrected in this change; a new helper copying it removed nothing at 2 MiB.
+- A fill that fails part-way unmarks its range but leaves the bytes it stored. A later fill copies only the volume's data
+  runs and pages that are not zero, so where the file has since become a hole or zeros, those stale bytes would stay in
+  the backing. No test reaches a fill failing part-way. Placement does not widen it: a range is placed only once its
+  fill finishes.
 
 ### 2026-10-20: a test helper that hung instead of refusing, and the R1/R10 arc it was blocking
 

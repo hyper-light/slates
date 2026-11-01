@@ -223,6 +223,15 @@ Every test is written as "do X, expect Y" and names the acceptance criterion or 
     task that finds its state by a shared key (the volume) takes a newer instance's state as its own when the first
     closes before the task runs, so each instance carries an identity its task checks (`Tracker::id`; the unit test
     leaked 8 of 8 rounds' keepers before).
+  - A defence the host may decline, counted and remembered: `ShardsBackings::place` in
+    `crates/vfs/src/shards_backing.rs` (each range a guest maps placed in one huge page as its fill finishes, A-193),
+    re-armed on the daemon's reap tick beside `DaxZones::rearm_refusals`. Gotchas, each found by a run:
+    - place only once the range is filled and charged, or a fill that fails part-way leaves a huge page nobody counts;
+    - a decline costs the shard milliseconds of the kernel's compaction (1,954 and 2,832 µs a step at load 90), so
+      remember it;
+    - a test that gets no huge page from a busy host skips loudly, while one that asked the kernel nothing fails;
+    - a stand-in vhost-user front end must acknowledge every unmap too, in order;
+    - `fuse_removemapping_in` is a bare count with no padding (`crates/bridge-virtiofs/tests/device.rs`).
 - **Keep design docs in sync with code.** Changing a subsystem's behaviour updates its design section, its status blockquote and the ledger in the same commit.
 - **Commit everything, in imperative area-prefixed summaries that carry the measured fact**, in vorpal's style: `merge: one graph tool over seven relations; deferred-schema cost measured`. Always `git add -A && git commit -m "<message>"`. Never `git checkout`, `git stash`, `git reset`, or any destructive git command.
 - **Debugging protocol.** Add logging to file first; consult the design section rather than assuming from code; confirm scope, intended behaviour, timing and frequency with Ada; after root cause is confirmed by logs and analysis, write `docs/bugs/<date>-<slug>.md` with description, root cause, impact and exact edits; fix in plan mode; touch nothing beyond the fix, but report every sibling inconsistency found; never preserve the behaviour that caused the bug.

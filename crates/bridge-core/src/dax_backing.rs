@@ -36,6 +36,14 @@
 //!   object, so every range of the file stays coherent however the device maps them.
 //! - Before a range's fill begins it is readied for the VMM's map (`DaxObject::prepare_range`): Windows commits it
 //!   whole, since a reserved section's page faults any view until committed; Unix pages come on touch.
+//! - As a range's fill finishes it is placed in one huge page, where the host has one of a range's size
+//!   (`DaxObject::place_range`; §4.6, the backed route's L1; A-193). A guest's reads of its window hammer the rows
+//!   behind it as surely as its stores (Kim et al., ISCA 2014), so a placed range lies on 2 MiB of contiguous memory of
+//!   its own, beside foreign rows only at its two ends where 2 MiB spans several DRAM rows of each bank (§4.6 says where
+//!   it buys less). A placement the kernel declines is counted, and the range is served on base
+//!   pages; a decline likely to hold is remembered until the daemon's reap tick (`ShardsBackings::place`), since each
+//!   costs the shard milliseconds of the kernel's compaction. A range is placed only once it is filled and counted, so
+//!   the placed bytes stay within the fill budget.
 //!
 //! **Ingest.** The guest's stores through a map reach the volume when the transport asks: before it serves a request
 //! that asks for them (a sync, a flush, a release, a read of the file, a forget of it) and before the attachment ends.
@@ -61,7 +69,7 @@
 
 use std::collections::{BTreeMap, VecDeque, btree_map::Entry};
 
-use slates_mem::{DAX_RANGE_BYTES, DaxObject, Handle, dax_object_bytes};
+use slates_mem::{DAX_RANGE_BYTES, DaxObject, Handle, Placement, dax_object_bytes};
 use slates_vfs::error::VfsError;
 use slates_vfs::ids::InodeNo;
 use slates_vfs::inode::Kind;
@@ -139,6 +147,11 @@ pub struct Counts {
   /// Ranges asked writable in a backing marked stale, which a refill passes over rather than lose the guest's stores:
   /// never expected, since a file is copied up before any writable ask of it.
   pub refill_writable: u64,
+  /// Ranges placed in one huge page each as their fills finished (§4.6, the backed route's L1; A-193).
+  pub placed: u64,
+  /// Ranges whose placement the kernel declined, or that a decline remembered since the daemon's last reap tick passed
+  /// over: they are served on base pages.
+  pub placement_refused: u64,
 }
 
 /// One slice of a fill, as it came out.
@@ -540,17 +553,31 @@ impl DaxBackingSession {
         pending.range_charge = delta;
       }
     }
-    if let Err(refused) = fill_slice(bridge, cx, handle, pending, slice_bytes) {
-      // A fill that failed part-way leaves the range unfilled and uncounted; the next ask fills it again.
-      if let Some(state) = bridge.dax_state() {
-        if let Some(target) = state.backings.get_mut(handle) {
-          target.unmark_filled(pending.next);
+    match fill_slice(bridge, cx, handle, pending, slice_bytes) {
+      Ok(placement) => self.count_placement(placement),
+      Err(refused) => {
+        // A fill that failed part-way leaves the range unfilled and uncounted; the next ask fills it again.
+        if let Some(state) = bridge.dax_state() {
+          if let Some(target) = state.backings.get_mut(handle) {
+            target.unmark_filled(pending.next);
+          }
+          state.backings.uncharge(pending.range_charge);
         }
-        state.backings.uncharge(pending.range_charge);
+        return Err(refused);
       }
-      return Err(refused);
     }
     Ok(false)
+  }
+
+  /// Counts how the placement of a range whose fill finished came out, if one finished.
+  fn count_placement(&mut self, placement: Option<Placement>) {
+    match placement {
+      Some(Placement::Placed) => self.counts.placed = self.counts.placed.saturating_add(1),
+      Some(Placement::Declined { .. }) => {
+        self.counts.placement_refused = self.counts.placement_refused.saturating_add(1);
+      }
+      Some(Placement::Kept | Placement::Unavailable) | None => {}
+    }
   }
 
   /// The fill is done: marks the ranges asked writable, and makes what the answer hands the VMM for the object.
@@ -1098,14 +1125,16 @@ fn witnessed(bridge: &mut dyn Bridge, cx: &OpContext, inode: u64) -> Result<u64,
 }
 
 /// One slice of the range `pending` is on: read from the volume (holes skipped), stored into the object (pages of zeros
-/// skipped), and the range finished when it is done.
+/// skipped), and the range placed and finished when it is done: how its placement came out, if it finished. A placement
+/// the OS refuses the range's view for fails the slice, the range not yet finished, so the caller unmarks it and gives
+/// its charge back as for any failed slice.
 fn fill_slice(
   bridge: &mut dyn Bridge,
   cx: &OpContext,
   handle: Handle<ShardsBacking>,
   pending: &mut Fill,
   slice_bytes: u64,
-) -> Result<(), Refused> {
+) -> Result<Option<Placement>, Refused> {
   let range_start = pending.next.saturating_mul(DAX_RANGE_BYTES);
   let range_bytes = pending
     .size
@@ -1139,20 +1168,33 @@ fn fill_slice(
         .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
         .saturating_sub(range_start);
       if pending.progress >= range_bytes {
-        finish_range(pending);
+        return finish_range(bridge, handle, pending).map(Some);
       }
+      Ok(None)
     }
     // No more data in the range, or the file ended early: the rest of the range reads zeros already.
-    _ => finish_range(pending),
+    _ => finish_range(bridge, handle, pending).map(Some),
   }
-  Ok(())
 }
 
-/// Moves a fill to its next range (the one done stays marked filled).
-fn finish_range(pending: &mut Fill) {
+/// Places the range a fill has just copied, then moves the fill to its next range (the one done stays marked filled):
+/// how the placement came out (§4.6, the backed route's L1; A-193). Placed once the range is filled, never before: a
+/// fill that fails part-way unmarks its range and gives its charge back, and a huge page placed before it would stay
+/// resident and uncounted. The collapse copies the pages the fill stored.
+fn finish_range(
+  bridge: &mut dyn Bridge,
+  handle: Handle<ShardsBacking>,
+  pending: &mut Fill,
+) -> Result<Placement, Refused> {
+  let state = bridge.dax_state().ok_or(Refused::Object)?;
+  let placement = state
+    .backings
+    .place(handle, pending.next)
+    .map_err(|_| Refused::Object)?;
   pending.next = pending.next.saturating_add(1);
   pending.progress = 0;
   pending.range_charge = 0;
+  Ok(placement)
 }
 
 /// Stores the pages of `bytes`, the file's from `at`, into the backing's object, skipping pages of zeros: an untouched

@@ -43,6 +43,17 @@
 //! write-back never takes an outsider's change for the guest's. `rewitness` refuses a file mapped to write
 //! ([`ShardsBackings::mapped_writable`]).
 //!
+//! **Placement** (§4.6, the backed route's L1; A-193). A Rowhammer aggressor needs only to read, so a guest reading its
+//! window hammers the rows behind it as surely as one storing. Each range of a VMM's backing is placed in one huge page
+//! as its fill finishes, where the host has a huge page of a range's size ([`BackingObject::place_range`]): a guest's
+//! range then lies on 2 MiB of contiguous memory of its own, beside foreign rows only at its two ends where 2 MiB spans
+//! several DRAM rows of each bank (§4.6 says where it buys less).
+//! [`ShardsBackings::placed_ranges`] counts the ranges placed now, and [`ShardsBackings::placements`] reads where each
+//! lies. A range is placed only once it is filled and counted, and a filled range stays filled while its backing lives,
+//! so the bytes the placed ranges hold never exceed what the backings count against the budget. A decline likely to
+//! hold is remembered until the daemon's reap tick re-arms it ([`ShardsBackings::place`]), since a declined collapse
+//! costs the shard milliseconds of the kernel's compaction effort.
+//!
 //! Bounded by the slab's capacity: the shard's chunk count, as the in-process DAX registry's. The registry also keeps
 //! its fill budget ([`ShardsBackings::set_budget`]), which the server sets from the shard's content reserve: a backing
 //! counts a range for each range it has filled, and at least one. A range is longer than a chunk, so the budget refuses
@@ -50,7 +61,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use slates_mem::{DAX_RANGE_BYTES, DaxObject, Handle, MemError, PeerAccess, PeerObject, Slab};
+use slates_mem::{
+  DAX_RANGE_BYTES, DaxObject, Handle, MemError, PeerAccess, PeerObject, Placement, Slab,
+};
 
 use crate::ids::InodeNo;
 
@@ -152,6 +165,18 @@ impl BackingObject {
     }
   }
 
+  /// Places range `range` of a VMM's object in one huge page, its fill done (§4.6, the backed route's L1; A-193; see
+  /// `slates_mem::DaxObject::place_range`). A peer's copy is never a guest's window, so it is refused.
+  pub fn place_range(&mut self, range: u64) -> Result<Placement, MemError> {
+    match self {
+      BackingObject::Vmm(object) => object.place_range(range),
+      BackingObject::Peer(_) => Err(MemError::OsRefused {
+        call: "placing a peer's copy",
+        code: None,
+      }),
+    }
+  }
+
   /// What a VMM's ask is answered with: a new descriptor of the object, read-write whatever the ask (HVF maps a shared
   /// range only from a descriptor opened to write, M17; the guest's stores reach the volume only by an ingest, which a
   /// read-only attachment never runs). A peer's copy is never a VMM's, so it is refused.
@@ -195,6 +220,19 @@ pub type HandedObject = std::os::fd::OwnedFd;
 /// What a VMM is handed for its object: a descriptor (Unix) or a section handle in this process (Windows).
 #[cfg(windows)]
 pub type HandedObject = std::os::windows::io::OwnedHandle;
+
+/// One placed range of a VMM's backing and where it lies, as [`ShardsBackings::placements`] reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RangePlacement {
+  /// The prefix of the volume the backing's file is of.
+  pub volume: u16,
+  /// The backing's file.
+  pub inode: InodeNo,
+  /// The range's index: it holds the file's bytes from `range × DAX_RANGE_BYTES`.
+  pub range: u64,
+  /// The bytes of slates' view of the range the kernel maps with PMD entries: the whole range where it is one huge page.
+  pub pmd_bytes: Option<u64>,
+}
 
 /// One file's backing for one holder: its object, the ranges filled from the volume, the ranges asked writable, and
 /// whether the disk has changed the file beneath it since.
@@ -350,6 +388,11 @@ pub struct ShardsBackings {
   /// Same-kernel clients' backings held, and their objects' bytes (A-171): what a released or reaped map gives back.
   peers: usize,
   peer_bytes: u64,
+  /// The host declined a placement since the last re-arm in a way likely to hold, so ranges are served unplaced
+  /// without asking again ([`ShardsBackings::place`]).
+  placement_declined: bool,
+  /// Collapses asked of the kernel, monotone: the non-vacuity counter that the memo above spares it.
+  placements_asked: u64,
 }
 
 impl std::fmt::Debug for ShardsBackings {
@@ -363,6 +406,8 @@ impl std::fmt::Debug for ShardsBackings {
       .field("budget", &self.budget)
       .field("peers", &self.peers)
       .field("peer_bytes", &self.peer_bytes)
+      .field("placement_declined", &self.placement_declined)
+      .field("placements_asked", &self.placements_asked)
       .finish()
   }
 }
@@ -382,6 +427,8 @@ impl ShardsBackings {
       budget: 0,
       peers: 0,
       peer_bytes: 0,
+      placement_declined: false,
+      placements_asked: 0,
     }
   }
 
@@ -476,6 +523,87 @@ impl ShardsBackings {
       .filter(|(_, backing)| matches!(backing.object, BackingObject::Vmm(_)))
       .count();
     (vmms, self.charged)
+  }
+
+  /// Places range `range` of the VMM's backing `handle` names in one huge page, its fill done (§4.6, the backed route's
+  /// L1; A-193), unless the host declined one since the last re-arm in a way likely to hold. A declined collapse costs
+  /// the shard the kernel's compaction effort first (measured 1,954 and 2,832 µs a step on adacachy at load 90), so a
+  /// host out of huge pages is asked once a re-arm ([`ShardsBackings::rearm_placement`]), not once a range, and a guest
+  /// churning its ranges cannot make the shard pay that again and again. A range the memo passes over is
+  /// [`Placement::Declined`], as the host's last answer was. A transient decline (`EAGAIN`) is not remembered. Refused
+  /// as the object refuses, and `OutOfRange` for a handle that names no backing.
+  pub fn place(
+    &mut self,
+    handle: Handle<ShardsBacking>,
+    range: u64,
+  ) -> Result<Placement, MemError> {
+    if self.placement_declined {
+      return Ok(Placement::Declined { transient: false });
+    }
+    let backing = self.slab.get_mut(handle)?;
+    let placement = backing.object.place_range(range)?;
+    if placement != Placement::Unavailable {
+      self.placements_asked = self.placements_asked.saturating_add(1);
+    }
+    if placement == (Placement::Declined { transient: false }) {
+      self.placement_declined = true;
+    }
+    Ok(placement)
+  }
+
+  /// Forgets that the host declined a placement, so the next range asks the kernel again: the daemon calls it on its
+  /// reap tick, the cadence the arena's zones re-arm at (`DaxZones::rearm_refusals`), so a host that frees memory
+  /// places ranges again within one tick.
+  pub fn rearm_placement(&mut self) {
+    self.placement_declined = false;
+  }
+
+  /// Whether a decline is remembered now, so ranges are served unplaced without asking.
+  #[must_use]
+  pub fn placement_declined(&self) -> bool {
+    self.placement_declined
+  }
+
+  /// Collapses asked of the kernel since the registry began.
+  #[must_use]
+  pub fn placements_asked(&self) -> u64 {
+    self.placements_asked
+  }
+
+  /// How many ranges of the VMMs' backings are placed in a huge page each now (§4.6, the backed route's L1; A-193): a
+  /// gauge, which falls back to zero as the backings are let go.
+  #[must_use]
+  pub fn placed_ranges(&self) -> usize {
+    self
+      .slab
+      .iter()
+      .map(|(_, backing)| match &backing.object {
+        BackingObject::Vmm(object) => object.placed_ranges(),
+        BackingObject::Peer(_) => 0,
+      })
+      .fold(0usize, usize::saturating_add)
+  }
+
+  /// Where each placed range of the VMMs' backings lies now (§4.6, the backed route's L1; A-193): for a test or an
+  /// operator to check that the placement holds. Each range's reading maps slates' view of it if none is held, as
+  /// `slates_mem::DaxObject::range_pmd_bytes` says; a reading the OS refused is `None`.
+  pub fn placements(&mut self) -> Vec<RangePlacement> {
+    let mut placements = Vec::new();
+    for (_, backing) in self.slab.iter_mut_all() {
+      let (volume, inode) = (backing.volume, backing.inode);
+      if let BackingObject::Vmm(object) = &mut backing.object {
+        let ranges: Vec<u64> = object.placed().collect();
+        for range in ranges {
+          placements.push(RangePlacement {
+            volume,
+            inode,
+            range,
+            pmd_bytes: object.range_pmd_bytes(range).ok().flatten(),
+          });
+        }
+      }
+    }
+    placements
   }
 
   /// The object's bytes of the same-kernel client's backing `handle` names, if it is one and live: what it counts
