@@ -16,7 +16,6 @@
 mod common;
 
 use common::{SimDriver, context, layout_at, message, reply_error, store, vid, volume};
-use proptest::prelude::*;
 use slates_bridge_core::{Bridge, ObjectId, OpContext, VolumeBridge};
 use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode, flags};
 use slates_bridge_fuse::bridge::dispatch;
@@ -1269,6 +1268,7 @@ fn the_copy_buffers_a_device_keeps_stay_charged_to_its_attachment() {
 mod backed {
   use super::*;
   use common::{dax_init_body, dax_setup_body};
+  use proptest::prelude::*;
   use slates_vfs::ids::InodeNo;
 
   /// Shape: the guest's DAX window in these tests, in 2 MiB ranges: room for the windows any of them maps at once.
