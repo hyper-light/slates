@@ -1,0 +1,27 @@
+name: DIAG A-195 the doc gate on Linux (not for main)
+
+# Step 4 (A-195): main's run 41285261464 failed CI's documentation step on a Linux-only module's link to a removed trait
+# method, which the Mac's doc gate never compiles. This runs that step exactly as CI does, on Linux, over the fix.
+
+on:
+  push:
+    branches: ['diag-a195-*']
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  docs:
+    name: the doc gate on ubuntu-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Documentation (every reference names something that exists)
+        env:
+          RUSTDOCFLAGS: -D warnings -A rustdoc::private_intra_doc_links
+        run: cargo doc --locked --workspace --no-deps --document-private-items
