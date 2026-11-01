@@ -3220,10 +3220,93 @@ daemon through the rendezvous's socket file (A-187).
 >    Row Refresh, and not co-locating untrusted tenants on adjacent rows. On top of that floor slates runs a layered
 >    software defence whose per-event cost is bounded and whose memory footprint stays **capped** — the agentic-scale
 >    answer to quarantine exhaustion (there is nothing to quarantine):
->    - **L0 — opt-in gate (built, 4b411da9).** A *writable* mapping is the only DAX mode a guest can hammer; it is off
->      by default and `Volume::dax_map_write` refuses `NotPermitted` until the owner opts in
->      (`Volume::enable_writable_dax`). Read-only DAX (immutable shared content, the common case) cannot hammer a
->      neighbour. Keeping the dangerous mode rare bounds how many blocks every layer below must cover.
+>    - **L0 — opt-in gate (built, 4b411da9; its premise corrected 2026-10-31, A-193).** Writable DAX into the arena is
+>      off by default, and `Volume::dax_map_write` refuses `NotPermitted` until the owner opts in
+>      (`Volume::enable_writable_dax`). **The gate bounds a guest's stores into slates' content. It does not bound
+>      hammering, because reading alone hammers.** The original study corrupted nearby data "by reading from the same
+>      address in DRAM", with a user-level loop of loads that flushes the cache line between them (Kim et al.,
+>      ISCA 2014, abstract and §1). Project Zero's exploit rests on the same fact: "repeatedly accessing a row of memory
+>      can cause bit flips in adjacent rows" (Seaborn and Dullien, 2015). So a read-only window is an aggressor too.
+>      Every window a guest maps reaches the rows behind it, and each layer below must cover read-only windows as well
+>      as writable ones.
+>      Until 2026-10-31 this paragraph said read-only DAX "cannot hammer a neighbour". Under that premise the route
+>      production serves (A-168's backings) carried none of the layers below, read-only and writable alike; its layer
+>      is now the next one. Keeping writable arena DAX rare still narrows something real: B2 below can heal only
+>      read-only content, since a writable block changes legitimately.
+>    - **L1 for the backed route — every range a guest maps is one huge page (built 2026-10-31, A-193).** Since A-168,
+>      slates' own device maps per-file backings, not the arena's blocks, and the Shards route maps the same objects
+>      (A-163). The layers L1, L2 and B2 below were built on the arena.
+>
+>      **How a range is placed.** Each range of a backing is placed as its fill finishes, before the guest's ask is
+>      answered (`DaxObject::place_range`, called by `crates/bridge-core/src/dax_backing.rs`):
+>      1. slates' view of the range is mapped congruent with the object, as the arena's views are (`crates/mem/src/shared.rs`);
+>      2. one byte of the range is read, so the object holds a page there, since a shmem collapse of a range holding no
+>         page stops at `SCAN_TRUNCATED` (`mm/khugepaged.c`);
+>      3. `MADV_COLLAPSE` is asked about the view's span, and its verdict decides, as it decides for the zones.
+>
+>      **What placement buys.** A placed range's rows are one physically contiguous 2 MiB page that holds nothing of
+>      anyone else's. The guest's reads and stores then reach foreign memory only past the page's two ends. A foreign
+>      row there is hammered from one side; hammering it from both sides takes another of the guest's ranges placed on
+>      its far side, which the guest cannot choose, only hope for by churning its ranges. Without placement a range lay
+>      on whatever pages the fault path gave: base pages where `shmem_enabled` is `never`, each beside whatever was
+>      there.
+>
+>      **Counted and visible.** A collapse the kernel declines is counted (`virtiofs.dax_placement_refused`,
+>      `shards.dax_placement_refused` in the status report), and the range is served on base pages. Placements count
+>      `virtiofs.dax_placed` and `shards.dax_placed`. `ShardsBackings::placed_ranges` is the live gauge, and
+>      `ShardsBackings::placements` reads where each placed range lies (its PMD mapping in `/proc/self/smaps`). A placed
+>      range is zeroed by stores, never a hole punch, which would split its page.
+>
+>      **A decline is remembered until the reap tick.** A declined collapse is not free: the kernel tries to compact
+>      memory first, and on adacachy at load 90 a fill step that was declined took 1,954 and 2,832 µs, where calm runs
+>      placed every range. Asked once a range, a host out of huge pages would charge the shard that much for every range
+>      a guest maps, and a guest churning its ranges could make it pay again and again. So a decline likely to hold is
+>      remembered, the next ranges are served on base pages without asking (counted as declined), and the daemon's reap
+>      tick re-arms it beside the zones' memo (`ShardsBackings::place`, `rearm_placement`). The kernel is asked at most
+>      once a tick per shard while it declines. A transient decline (`EAGAIN`, a page locked or held for the moment) is
+>      not remembered. Proven in a child process whose huge pages the kernel refuses (`PR_SET_THP_DISABLE`): three
+>      ranges ask the kernel once, and a re-arm asks again
+>      (`a_declined_placement_is_remembered_until_re_armed`, `crates/bridge-core/tests/dax_backing.rs`).
+>
+>      **The cost is a whole 2 MiB per range, however little the file fills.** A one-page file mapped costs 2 MiB, not a
+>      page. The fill budget already counts each filled range as 2 MiB, and a range is placed only once it is filled
+>      and counted, so the placed bytes never exceed what the budget counts. Measured on adacachy (Linux 7.2.9) with
+>      `fstat`'s `st_blocks`, 2026-10-31:
+>      - one object over two placed ranges held 4,194,304 bytes, against 4,194,304 counted;
+>      - three placed ranges across two files held 2,097,152 and 4,194,304 bytes, against 6,291,456 counted;
+>      - the budget was 16,777,216 bytes (BENCHMARKS).
+>
+>      Proven by `each_range_a_guest_maps_is_one_huge_page_within_the_fill_budget` (`crates/bridge-core/tests/dax_backing.rs`)
+>      and three device tests in `crates/bridge-virtiofs/tests/device.rs`:
+>      - read-only and writable windows, each placed range one PMD page in slates' view and in the front end's map, and
+>        a cut keeping it so;
+>      - a hostile guest's churn, with each range placed once however often it is mapped, and nothing left placed or
+>        held once the node is forgotten;
+>      - a read-only attachment's window placed, and its writable ask refused with nothing made.
+>
+>      **What cannot apply to a backing, and why.**
+>      - *Guard rows* in the range. A Linux guest asks for every mapping a whole range, `inarg.len = FUSE_DAX_SZ`,
+>        2 MiB (`fs/fuse/dax.c`, `fuse_setup_one_mapping`). The device must map the file's bytes into all of it, so the
+>        guest's rows include its page's edge rows.
+>      - *Guard rows* beside the range. These would need memory known to lie physically beside the page, which an
+>        unprivileged process can neither choose nor see. Since Linux 4.2 pagemap zeroes the frame number without
+>        `CAP_SYS_ADMIN`, because "information about PFNs helps in exploiting Rowhammer vulnerability"
+>        (`Documentation/admin-guide/mm/pagemap.rst`). A larger page than a PMD is hugetlb's, reserved by an
+>        administrator, which R10 refuses to require.
+>      - *L2's shift.* Moving a guest's range to other rows means mapping over its live window, which the vhost-user
+>        specification forbids. Unmapping first opens the zero-page gap a real guest read (A-168).
+>      - *B2's net.* A read-only range's backing could be compared with the volume on the reap tick, as B2 compares the
+>        arena's guarded blocks. Not built; owed (GAPS).
+>      - *Considered and rejected: a guard by splitting each range.* A guest's range could be served from the middles of
+>        two huge pages, each with guard space at its ends, by two maps. That costs twice a placed range's memory and
+>        breaks the identity layout the Shards protocol shares (A-163). Its guard is also only a count of bytes: what
+>        it is worth in rows depends on how the memory controller interleaves channels, ranks and banks, a mapping that
+>        is undocumented and learned only by reverse engineering (DRAMA, Pessl et al., USENIX Security 2016).
+>
+>      **The floor that remains is the host's.** It is ECC, and in-DRAM Target Row Refresh, which TRR-aware many-sided
+>      patterns defeat on 13 of 42 DDR4 modules (TRRespass, Frigo et al., IEEE S&P 2020), and not placing untrusted
+>      tenants on one host. Placement narrows what a guest's accesses reach to its own page's two ends. It does not make
+>      a guest unable to flip a neighbour's bit.
 >    - **L1 — zones + guard rows (built, `crates/vfs/src/daxzone.rs`).** A tenant's writable-DAX content is shifted
 >      only inside a sandbox reserved for that tenant: one transparent huge page of the content arena, **verified**
 >      to have actually been given as one, cut into slots that are therefore distinct physical rows of the same
@@ -3341,10 +3424,11 @@ daemon through the rendezvous's socket file (A-187).
 >      only thing that can find it. A guard whose mapping has gone is dropped as the pass reaches it, so the list
 >      stays bounded without a second sweep.
 >    The modern window is 16–32 ms and RowPress leaks across refresh windows, so the migration interval is derived
->    from the lowest hammer threshold, not the classic 64 ms. **All four layers are now built, driven and proven
->    by use** in `crates/vfs/tests/dax.rs`: L0 refuses the hammerable mode by default, L1 contains what is left
->    in a verified huge page with guard rows, L2 moves it every hammer window, and B2 finds and heals what got
->    through. Nothing in the set is a primitive without a caller. **The daemon→device half is settled and built** (2026-10-19). The earlier text left
+>    from the lowest hammer threshold, not the classic 64 ms. **The arena's four layers are built, driven and proven
+>    by use** in `crates/vfs/tests/dax.rs`: L0 refuses writable arena DAX by default, L1 contains a writable window
+>    in a verified huge page with guard rows, L2 moves it every hammer window, and B2 finds and heals a flip in
+>    read-only content. The backed route, which production serves, has its own placement (above) and none of the
+>    other three, for the reasons stated there. Nothing in the set is a primitive without a caller. **The daemon→device half is settled and built** (2026-10-19). The earlier text left
 >    a choice between a backend-initiated remap and "the revoke-and-refault path instead, and accept the tear"; the
 >    second is taken, because the objection recorded against it no longer holds. `Volume::dax_migrate` now enqueues
 >    `(inode, writable_only = true)` on the queue the device already drains every service pass
@@ -12525,6 +12609,82 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
 - **Arm64 Windows proven** since (2026-10-27): the direct-map client tests, 20 of 20, on CI's `windows-11-arm` (run
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
+
+### A-193 — Reading alone hammers: §4.6's read-only premise corrected, and every range a guest maps over a backing is placed in one huge page (accepted and built 2026-10-31)
+Applied in the same change to: §4.6 (Rowhammer: L0's premise corrected; the backed route's layer, its cost, its limits
+and the floor beneath it; the layers' summary), GAPS (the 2026-10-13 multi-tenancy entry's L0, and a 2026-10-31
+entry), `docs/wip/BENCHMARKS.md` (what a placement costs in memory and in a fill step), `CLAUDE.md` (the placement as a
+canonical example, with its gotchas), `crates/mem` (`dax_object.rs`:
+`Placement`, `DaxObject::place_range`, `placed_ranges`, `placed`, `range_pmd_bytes`, and a placed range zeroed by
+stores; `shared.rs`: `RangeView::collapse_huge` and `pmd_bytes`; `region.rs`: `collapse_huge` shared within the crate,
+saying whether a decline is transient; `lib.rs`), `crates/vfs/src/shards_backing.rs` (`BackingObject::place_range`,
+`ShardsBackings::place` with its memo, `rearm_placement`, `placement_declined`, `placements_asked`, `placed_ranges` and
+`placements`, `RangePlacement`; `volume.rs`: the writable-DAX gate's comment corrected), `crates/bridge-core/src/dax_backing.rs` (each range placed as its fill finishes;
+`Counts::placed` and `placement_refused`) with `tests/dax_backing.rs`, `crates/bridge-virtiofs` (`backed.rs`:
+`virtiofs.dax_placed` and `virtiofs.dax_placement_refused`; `tests/device.rs`: three tests, the stand-in front end's map
+placed congruent with the object, its unmaps acknowledged, and the forget test's REMOVEMAPPING body corrected), and
+`crates/server/src/shards/dax.rs` (`shards.dax_placed`, `shards.dax_placement_refused`), and
+`crates/server/src/daemon.rs` (the reap tick re-arms the placement memo).
+- **Corrects §4.6's L0.** It said a writable mapping is the only DAX mode a guest can hammer, and that read-only DAX
+  cannot hammer a neighbour. The primary sources say otherwise:
+  - Kim et al. corrupted nearby data "by reading from the same address in DRAM", with a user-level loop of loads that
+    flushes the line between them (ISCA 2014);
+  - Project Zero: "repeatedly accessing a row of memory can cause bit flips in adjacent rows" (Seaborn and Dullien,
+    2015).
+
+  The gate still bounds a guest's stores into the arena. It bounds no hammering.
+- **Adds the backed route's layer.** The windows production serves map per-file backings (A-168; the Shards route maps
+  the same objects, A-163), and L1, L2 and B2 were built on the arena, so every window production served carried no
+  Rowhammer layer. Each range of a backing is now placed in one huge page as its fill finishes, before the ask is
+  answered: slates' view placed congruent with the object, one byte read so the object holds a page there, and
+  `MADV_COLLAPSE` asked about the view's span. A placed range's rows are 2 MiB of its own, beside foreign memory only at
+  their two ends.
+- **Placed after the fill, never before.** A fill that fails part-way unmarks its range and gives its charge back, and a
+  huge page placed before it would stay resident and uncounted. Placed last, a placed range is always a filled one,
+  which the budget counts as 2 MiB, so the placed bytes never exceed what the budget counts. The price is a collapse
+  that copies the pages the fill stored, rather than stores into a page placed first.
+- **A declined collapse is served on base pages, counted, never refused.** A guest's access fails with its
+  SETUPMAPPING: `fuse_iomap_begin` returns `fuse_setup_new_dax_mapping`'s error to the access itself (`fs/fuse/dax.c`),
+  with no fallback to the queue. A defence that refused there would turn a fragmented host into a guest that cannot
+  read its files. The refusal shows in the status report (`virtiofs.dax_placement_refused`,
+  `shards.dax_placement_refused`), so an operator sees where the layer did not apply.
+- **A placed range is zeroed by stores.** A cut over it punched its pages, which splits a huge page (`mm/shmem.c`), so a
+  cut stores zeros over its whole pages instead, at the cost of the bytes zeroed.
+- **A decline likely to hold is remembered until the reap tick.** A declined collapse charges the shard the kernel's
+  compaction effort first: 1,954 and 2,832 µs a fill step on adacachy at load 90. So `ShardsBackings::place` remembers a
+  decline other than `EAGAIN`, serves the next ranges on base pages without asking, and the daemon's reap tick re-arms
+  it beside the arena zones' memo. A host out of huge pages is asked at most once a tick per shard, and a guest churning
+  its ranges cannot make the shard pay the compaction again and again. Proven in a child process whose huge pages the
+  kernel refuses (`a_declined_placement_is_remembered_until_re_armed`).
+- **Rejected:**
+  - *guard rows* in the range, since a Linux guest maps each range whole, `inarg.len = FUSE_DAX_SZ`, 2 MiB
+    (`fs/fuse/dax.c`), so its rows include the page's edge rows;
+  - *guard rows* beside it, which need memory known to lie physically beside the page: an unprivileged process sees no
+    frame number since Linux 4.2 (`pagemap.rst`: "information about PFNs helps in exploiting Rowhammer vulnerability"),
+    and a page larger than a PMD is hugetlb's, reserved by an administrator (R10);
+  - *a guard by splitting each range* over the middles of two huge pages: twice a placed range's memory, the identity
+    layout the Shards protocol shares broken (A-163), and a guard whose worth in rows depends on how the memory
+    controller interleaves channels, ranks and banks, which is undocumented and learned only by reverse engineering
+    (DRAMA, Pessl et al., USENIX Security 2016);
+  - *L2's shift*, which needs a map over a live window: the vhost-user specification forbids it, and unmapping first
+    opens the zero-page gap a real guest read (A-168).
+- **Measured** on adacachy (Linux 7.2.9, x86_64, 4 KiB pages, `shmem_enabled` `[advise]`), 2026-10-31: every range the
+  tests filled was placed, 2 of 2, 3 of 3, 1 of 1 and 2 of 2, none refused. Each object held exactly its placed ranges'
+  bytes by `fstat`'s `st_blocks`: 4,194,304 bytes against 4,194,304 counted, and 2,097,152 and 4,194,304 against
+  6,291,456 counted, of a 16,777,216-byte budget (BENCHMARKS).
+- **Proven** by `each_range_a_guest_maps_is_one_huge_page_within_the_fill_budget` (`crates/bridge-core/tests/dax_backing.rs`)
+  and three device tests (`crates/bridge-virtiofs/tests/device.rs`):
+  - `every_window_over_a_backing_is_one_huge_page_read_only_or_writable`, which reads each placed range's PMD mapping in
+    slates' view and in the front end's map, and holds it across a cut;
+  - `a_hostile_guests_churn_over_placed_backings_is_served_as_before_and_leaks_nothing`;
+  - `a_read_only_attachments_window_is_placed_and_its_writable_ask_refused`.
+
+  They skip loudly where a host's PMD page is not a range. macOS gives user programs no huge page (Appendix C), and
+  Windows' large pages need a privilege R10 refuses, so placement there is `Placement::Unavailable`.
+- **Owed:** B2 over read-only backings (compare each with the volume on the reap tick, as B2 compares the arena's
+  guarded blocks). Found on the way and reported, not changed here: the arena zone's guard slot (`GUARD_SLOTS`, one
+  64 KiB slot) is sized in bytes, and what a guard of bytes is worth in rows depends on the same undocumented
+  interleaving; a 64 KiB slot may hold less than one row across the banks it touches.
 
 ### A-192 — An NFS v3 write-back that would put stale bytes back over another path's newer change is refused: the winner of Ada's A/B against sync-point coherence (accepted and built 2026-10-31)
 Applied in the same change to: §4.6 (the macOS fallback: a stale write-back is refused, with its status), GAPS (the

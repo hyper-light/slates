@@ -1139,6 +1139,20 @@ mod platform {
     pub(crate) fn pages_mut(&mut self) -> &mut [u8] {
       &mut self.0
     }
+
+    /// Asks the kernel to make the whole view one huge page now (`MADV_COLLAPSE`, Linux 6.1), for a DAX object's range a
+    /// guest maps (§4.6, the backed route's L1). The pages are lent to that `madvise` alone, which reads and writes no
+    /// byte through them, as `RangeView::pages_mut` lends them to a hole punch on Linux. `Ok` where the kernel answered that
+    /// every huge-page-aligned span of the view is PMD-mapped; refused with why where it declined, and off Linux.
+    pub(crate) fn collapse_huge(&mut self) -> Result<(), crate::region::CollapseDeclined> {
+      crate::region::collapse_huge(&self.0)
+    }
+
+    /// The bytes of this view's mapping that the kernel maps with PMD entries, from `/proc/self/smaps`: a reading about
+    /// the view's own mapping, `None` where there is no such reading (off Linux, or no entry begins at the view).
+    pub(crate) fn pmd_bytes(&self) -> Option<u64> {
+      slates_machine::facts::huge_backed_bytes(self.0.window)
+    }
   }
 
   /// An object another process owns, mapped whole and read alone: a same-kernel client's view of the copy of one file a

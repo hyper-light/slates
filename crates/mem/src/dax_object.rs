@@ -146,6 +146,35 @@ pub enum PeerAccess {
   ReadWrite,
 }
 
+/// What placing a DAX object's range in one huge page came to (§4.6, the backed route's L1; A-193). A Rowhammer
+/// aggressor reaches the physical rows behind the pages it can load, read-only or not (Kim et al., ISCA 2014). A range
+/// on base pages lies on whatever frames the allocator found, each possibly beside another tenant's; a range that is one
+/// huge page lies on 2 MiB of contiguous memory of its own, beside foreign memory only at its two ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+  /// The range became one huge page: `MADV_COLLAPSE` said so of the range's own view.
+  Placed,
+  /// The range was placed already, and the kernel still answers that it is one huge page.
+  Kept,
+  /// The kernel declined: it could not find or compact 2 MiB of contiguous memory, its memory cgroup refused the charge,
+  /// or it predates `MADV_COLLAPSE` (Linux 6.1). The range is served on base pages.
+  Declined {
+    /// Whether the kernel said asking again may succeed (`EAGAIN`: a page locked or held for the moment), rather than
+    /// a decline likely to hold for a while.
+    transient: bool,
+  },
+  /// This host has no huge page of a range's size: off Linux (macOS gives user programs none; Windows' large pages need
+  /// a privilege R10 refuses to require), or a Linux kernel whose PMD page is not 2 MiB (512 MiB on a 64 KiB-paged
+  /// arm64 kernel).
+  Unavailable,
+}
+
+/// Whether this host can back a DAX object's range with one huge page: Linux, with a PMD page of exactly a range.
+#[cfg(unix)]
+fn ranges_can_be_huge() -> bool {
+  cfg!(target_os = "linux") && slates_machine::facts::huge_page_bytes() == Some(DAX_RANGE_BYTES)
+}
+
 /// `offset .. offset + count` as an offset into a peer object or view of `len` bytes, refused `OutOfRange` past it.
 #[cfg(any(unix, windows))]
 fn within_view(offset: u64, count: usize, len: u64) -> Result<usize, crate::error::MemError> {
@@ -288,12 +317,14 @@ mod racy {
 
 #[cfg(unix)]
 mod imp {
-  use std::collections::BTreeMap;
   use std::collections::btree_map::Entry;
+  use std::collections::{BTreeMap, BTreeSet};
   use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
   use super::racy::{Racy, RacyStore};
-  use super::{DAX_OBJECT_BYTES, DAX_RANGE_BYTES, PeerAccess, within_view};
+  use super::{
+    DAX_OBJECT_BYTES, DAX_RANGE_BYTES, PeerAccess, Placement, ranges_can_be_huge, within_view,
+  };
   use crate::error::MemError;
   use crate::shared::{RangeView, ReadView};
 
@@ -329,6 +360,9 @@ mod imp {
     fd: OwnedFd,
     views: BTreeMap<u64, RangeView>,
     most_views: usize,
+    /// The ranges placed in one huge page each ([`DaxObject::place_range`]). A placed range is zeroed by stores, never
+    /// by a hole punch, which would split its page.
+    placed: BTreeSet<u64>,
   }
 
   impl std::fmt::Debug for DaxObject {
@@ -336,6 +370,7 @@ mod imp {
       f.debug_struct("DaxObject")
         .field("views", &self.views.len())
         .field("most_views", &self.most_views)
+        .field("placed", &self.placed.len())
         .finish()
     }
   }
@@ -347,7 +382,62 @@ mod imp {
         fd: platform::create_object()?,
         views: BTreeMap::new(),
         most_views,
+        placed: BTreeSet::new(),
       })
+    }
+
+    /// Places range `range` in one huge page before a guest maps it (§4.6, the backed route's L1; A-193). The range's
+    /// view is placed where a huge page can form behind it (`crate::shared`'s congruent `mmap`); one byte of it is read,
+    /// so the object holds a page there (a shmem collapse of a range holding none stops at `SCAN_TRUNCATED`,
+    /// `mm/khugepaged.c`); and `MADV_COLLAPSE` is asked about the view's whole span, whose answer decides, as §4.6's L1
+    /// takes it for the arena's zones. The read changes no byte, so the range may hold the file's bytes already.
+    ///
+    /// [`Placement::Unavailable`] off Linux and where the host's PMD page is not a range; [`Placement::Declined`] where
+    /// the kernel would not, with whether it said asking again may succeed, and the range is then served on base pages.
+    /// Refused `OutOfRange` past the object and `ViewsExhausted` where the range cannot be viewed.
+    pub fn place_range(&mut self, range: u64) -> Result<Placement, MemError> {
+      if !ranges_can_be_huge() {
+        return Ok(Placement::Unavailable);
+      }
+      let view = self.view_mut(range)?;
+      let mut first = [0u8; 1];
+      view.load(0, &mut first)?;
+      match view.collapse_huge() {
+        Ok(()) => Ok(if self.placed.insert(range) {
+          Placement::Placed
+        } else {
+          Placement::Kept
+        }),
+        Err(declined) => {
+          self.placed.remove(&range);
+          Ok(Placement::Declined {
+            transient: declined == crate::region::CollapseDeclined::Transient,
+          })
+        }
+      }
+    }
+
+    /// How many of the object's ranges are placed in a huge page each.
+    #[must_use]
+    pub fn placed_ranges(&self) -> usize {
+      self.placed.len()
+    }
+
+    /// The indices of the ranges placed in a huge page each, in order.
+    pub fn placed(&self) -> impl Iterator<Item = u64> + '_ {
+      self.placed.iter().copied()
+    }
+
+    /// The bytes of slates' view of range `range` that the kernel maps with PMD entries (`/proc/self/smaps`): the whole
+    /// range where it is one huge page, as a placed range is on Linux. The view is mapped if slates holds none and one
+    /// byte of it is read, which changes nothing, so the reading is of the range's pages as they are now: a mapping
+    /// shows a PMD entry only for a huge page it has touched. `None` where the kernel gives no reading; refused as
+    /// [`DaxObject::place_range`] is.
+    pub fn range_pmd_bytes(&mut self, range: u64) -> Result<Option<u64>, MemError> {
+      let view = self.view_mut(range)?;
+      let mut first = [0u8; 1];
+      view.load(0, &mut first)?;
+      Ok(view.pmd_bytes())
     }
 
     /// The object's descriptor, to hand the VMM a duplicate of (`SCM_RIGHTS` duplicates what it carries).
@@ -450,6 +540,7 @@ mod imp {
         let left = usize::try_from(end.saturating_sub(at)).unwrap_or(usize::MAX);
         let (range, within, take) = piece(at, left)?;
         let within_end = within.saturating_add(take);
+        let placed = self.placed.contains(&range);
         let view = self.view_mut(range)?;
         // The whole pages of this piece, and the partial ones at its ends.
         let first_page = u64::try_from(within)
@@ -465,7 +556,13 @@ mod imp {
           .unwrap_or(first_page)
           .max(first_page);
         view.zero_bytes(within, first_page)?;
-        platform::zero_pages(view, first_page, last_page)?;
+        // A placed range keeps its huge page: a punch there would split it (`mm/shmem.c`), so its whole pages are zeroed
+        // by stores, at the cost of the bytes zeroed rather than of nothing.
+        if placed {
+          view.zero_bytes(first_page, last_page)?;
+        } else {
+          platform::zero_pages(view, first_page, last_page)?;
+        }
         view.zero_bytes(last_page, within_end)?;
         at = at.saturating_add(u64::try_from(take).unwrap_or(u64::MAX));
       }
@@ -1256,6 +1353,28 @@ mod imp {
     /// went.
     pub fn release_view(&mut self, range: u64) -> bool {
       self.views.remove(&range).is_some()
+    }
+
+    /// [`super::Placement::Unavailable`], always: Windows backs a section with large pages only under
+    /// `SeLockMemoryPrivilege`, which R10 refuses to require (§4.6, the backed route's L1).
+    pub fn place_range(&mut self, _range: u64) -> Result<super::Placement, MemError> {
+      Ok(super::Placement::Unavailable)
+    }
+
+    /// None: no range is ever placed here.
+    #[must_use]
+    pub fn placed_ranges(&self) -> usize {
+      0
+    }
+
+    /// None: no range is ever placed here.
+    pub fn placed(&self) -> impl Iterator<Item = u64> + '_ {
+      std::iter::empty()
+    }
+
+    /// None: Windows gives no reading of how a view is backed.
+    pub fn range_pmd_bytes(&mut self, _range: u64) -> Result<Option<u64>, MemError> {
+      Ok(None)
     }
 
     /// Commits range `range` whole, so a view of it anywhere may touch any byte: a range an ask covers is prepared

@@ -194,7 +194,7 @@ impl Region {
   /// before 6.1, on a shared object the kernel will not collapse, or when it could not compact enough memory.
   pub fn collapse_huge(&mut self, offset: usize, len: usize) -> bool {
     match self.backing.bytes().get(offset..offset.saturating_add(len)) {
-      Some(span) => collapse_huge(span),
+      Some(span) => collapse_huge(span).is_ok(),
       None => false,
     }
   }
@@ -400,16 +400,16 @@ fn advise_huge(map: &MmapMut) -> bool {
 /// shift onto base pages moves no physical rows — so when the preference is not honoured the kernel is asked to
 /// do the compaction work synchronously instead, and the caller measures again either way.
 ///
-/// `false` where the kernel declined (it could not compact enough free memory, the range is unsuitable, or the
-/// kernel predates 6.1 and answers `EINVAL`) — never a reason to assume the span is huge; the caller's
-/// measurement decides, as it does for the advice.
+/// Refused where the kernel declined (it could not compact enough free memory, the range is unsuitable, or the
+/// kernel predates 6.1 and answers `EINVAL`), with whether it said asking again may succeed — never a reason to
+/// assume the span is huge; the caller's measurement decides, as it does for the advice.
 #[cfg(target_os = "linux")]
-fn collapse_huge(span: &[u8]) -> bool {
+pub(crate) fn collapse_huge(span: &[u8]) -> Result<(), CollapseDeclined> {
   /// Format: `MADV_COLLAPSE` (`include/uapi/asm-generic/mman-common.h`, Linux 6.1). Written here rather than
   /// taken from `libc`, which defines it only for the GNU target, so a musl build sees the same number.
   const MADV_COLLAPSE: libc::c_int = 25;
   if span.is_empty() {
-    return false;
+    return Err(CollapseDeclined::Lasting);
   }
   // SAFETY: `span` is a live sub-slice of this mapping, so the pointer and length name mapped memory the map
   // owns for the call. `MADV_COLLAPSE` changes only how the kernel backs those pages — it never unmaps them,
@@ -422,13 +422,31 @@ fn collapse_huge(span: &[u8]) -> bool {
       MADV_COLLAPSE,
     )
   };
-  answer == 0
+  if answer == 0 {
+    return Ok(());
+  }
+  match std::io::Error::last_os_error().raw_os_error() {
+    Some(libc::EAGAIN) => Err(CollapseDeclined::Transient),
+    _ => Err(CollapseDeclined::Lasting),
+  }
 }
 
 /// The paired arm: no `MADV_COLLAPSE` to ask off Linux, so the span is whatever the OS made it.
 #[cfg(not(target_os = "linux"))]
-fn collapse_huge(_span: &[u8]) -> bool {
-  false
+pub(crate) fn collapse_huge(_span: &[u8]) -> Result<(), CollapseDeclined> {
+  Err(CollapseDeclined::Lasting)
+}
+
+/// Why the kernel declined to make a span one huge page (`madvise(2)`, `MADV_COLLAPSE`; `madvise_collapse_errno` in
+/// `mm/khugepaged.c` turns each scan result into one of these errnos).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CollapseDeclined {
+  /// `EAGAIN`: a page was locked, off the LRU or held elsewhere for the moment; asking again may succeed.
+  Transient,
+  /// Any other answer, likely to hold for a while: no huge page could be had (`ENOMEM`), the memory cgroup refused
+  /// its charge (`EBUSY`), the range or the process does not allow one, or the kernel predates 6.1 (`EINVAL`). Off
+  /// Linux there is no one to ask.
+  Lasting,
 }
 
 #[cfg(not(target_os = "linux"))]

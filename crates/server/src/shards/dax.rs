@@ -48,7 +48,9 @@
 //! An answered ask counts `shards.dax_answered`; an ingest's written runs `shards.dax_ingested`, and one the bridge
 //! refused `shards.dax_ingest_refused`. A refilled backing counts `shards.dax_refilled`; a range the volume refused to
 //! read for it `shards.dax_refill_refused` (the object keeps its bytes); a stale range asked writable, which is never
-//! expected, `shards.dax_refill_writable`.
+//! expected, `shards.dax_refill_writable`. A range placed in one huge page as its fill finished counts
+//! `shards.dax_placed`, and one whose placement the kernel declined, served on base pages, `shards.dax_placement_refused`
+//! (§4.6, the backed route's L1; A-193).
 
 use slates_bridge_core::dax_backing::{
   Ask, Counts, DaxBackingSession, Failure, FillStep, Ingested, Refused,
@@ -97,6 +99,11 @@ const REFILL_REFUSED: &str = "shards.dax_refill_refused";
 /// Format: the refusal-ledger name of a range asked writable in a backing marked stale, which a refill passes over
 /// rather than lose the guest's stores: never expected, since a file is copied up before any writable ask of it.
 const REFILL_WRITABLE: &str = "shards.dax_refill_writable";
+/// Format: the ledger name of each range placed in one huge page as its fill finished (§4.6, the backed route's L1;
+/// A-193).
+const PLACED: &str = "shards.dax_placed";
+/// Format: the refusal-ledger name of a range whose placement the kernel declined: it is served on base pages.
+const PLACEMENT_REFUSED: &str = "shards.dax_placement_refused";
 
 /// Format: the refusal-ledger name of a Windows ask whose named process does not hold this attachment's stream (another
 /// pipe's handle, no pipe's, a value naming nothing, a process gone or of another user): nothing is duplicated into it.
@@ -157,6 +164,8 @@ fn forward_counts(s: &mut ShardState, stream: &mut ShardsStream) {
     refilled,
     refill_refused,
     refill_writable,
+    placed,
+    placement_refused,
   } = stream.dax.take_counts();
   for (name, count) in [
     (ANSWERED, answered),
@@ -165,6 +174,8 @@ fn forward_counts(s: &mut ShardState, stream: &mut ShardsStream) {
     (REFILLED, refilled),
     (REFILL_REFUSED, refill_refused),
     (REFILL_WRITABLE, refill_writable),
+    (PLACED, placed),
+    (PLACEMENT_REFUSED, placement_refused),
   ] {
     if count > 0 {
       s.count(name, count);

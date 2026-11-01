@@ -51,7 +51,7 @@ pub mod words;
 pub use arena::{ChunkArena, Extent};
 pub use dax_object::{
   DAX_OBJECT_BYTES, DAX_RANGE_BYTES, DaxObject, PeerAccess, PeerObject, PeerView, PeerWriteView,
-  dax_object_bytes,
+  Placement, dax_object_bytes,
 };
 pub use error::{ExtentRefusal, LayoutRefusal, MemError};
 pub use handle::{Encoded, Handle};

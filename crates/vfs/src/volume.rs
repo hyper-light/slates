@@ -423,13 +423,13 @@ pub struct Volume {
   /// Whether the volume's content is locked in RAM (§4.2 D-12, a strict `--locked` volume): every block it allocates
   /// is locked, and only its blocks, so a plain volume beside it is never pinned by its neighbour's policy.
   pub(crate) locked: bool,
-  /// Whether this volume has **opted in to writable DAX** (§4.6 multi-tenancy L0, the Rowhammer threat model's
-  /// outermost gate). Read-only DAX — immutable, shared content a guest reaches but cannot hammer into a neighbour —
-  /// is the default and needs no opt-in; a *writable* mapping hands a guest a private page it can hammer, so
-  /// [`Volume::dax_map_write`] refuses `NotPermitted` unless the owner has enabled it here. Keeping the dangerous mode
-  /// off by default keeps it rare, so the moving-target and zone defences cover few blocks — bounded cost at agentic
-  /// scale (the quarantine-exhaustion worry is answered by there being little to quarantine). Default `false`; a clone
-  /// does not inherit it (the capability is each owner's own deliberate choice).
+  /// Whether this volume has **opted in to writable DAX** (§4.6 multi-tenancy L0). Read-only DAX is the default and
+  /// needs no opt-in; a *writable* mapping lets a guest's stores reach this volume's content blocks directly, so
+  /// [`Volume::dax_map_write`] refuses `NotPermitted` unless the owner has enabled it here. The gate bounds stores, not
+  /// hammering: reading alone hammers (Kim et al., ISCA 2014; A-193), so a read-only window reaches the rows behind it
+  /// as a writable one does. Keeping writable DAX rare keeps the zone and moving-target defences to few blocks, and
+  /// keeps B2's net, which can heal only read-only content, over the rest. Default `false`; a clone does not inherit it
+  /// (the capability is each owner's own deliberate choice).
   pub(crate) writable_dax: bool,
   /// Whether this volume's **read-only** DAX mappings are guarded by §4.6's B2 self-healing net: a clean
   /// BLAKE3 and a pinned clean copy taken at map time, so a periodic scrub can catch a bit flip the daemon

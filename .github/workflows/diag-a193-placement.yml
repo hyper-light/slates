@@ -1,0 +1,95 @@
+name: DIAG A-193 placement on Linux (not for main)
+
+# Step 3 of the VFS and DAX plan (2026-10-31): each range a guest maps over a backing is placed in one huge page (A-193).
+# Kiln's Linux runner was unreachable, so this runs the placement tests on both Linux architectures with their output
+# printed, then red-checks them in this throwaway checkout: with placement off, with a placed range punched rather than
+# zeroed by stores, and with the decline memo off, each must fail on its assertion. Each mutation compiles.
+
+on:
+  push:
+    branches: [diag-a193-placement]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    name: placement on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: The runner
+        run: |
+          echo "image $ImageOS $ImageVersion; $(nproc) CPUs; $(uname -srm); page $(getconf PAGESIZE)"
+          cat /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/shmem_enabled /sys/kernel/mm/transparent_hugepage/hpage_pmd_size
+          grep -E "MemTotal|MemFree|MemAvailable" /proc/meminfo
+      - name: Clippy on Linux
+        run: cargo clippy --locked -p slates-mem -p slates-vfs -p slates-bridge-core -p slates-bridge-virtiofs -p slates-server --all-targets -- -D warnings
+      - name: The session's placement tests
+        shell: bash
+        run: cargo test --locked -p slates-bridge-core --test dax_backing -- --nocapture --test-threads 1
+      - name: The device suite
+        shell: bash
+        run: cargo test --locked -p slates-bridge-virtiofs --test device -- --nocapture --test-threads 1
+      - name: Red-check, placement off
+        shell: bash
+        run: |
+          set -u
+          cp crates/mem/src/dax_object.rs /tmp/dax_object.rs
+          python3 - <<'EOF'
+          import pathlib
+          p = pathlib.Path("crates/mem/src/dax_object.rs")
+          t = p.read_text()
+          old = "      if !ranges_can_be_huge() {\n        return Ok(Placement::Unavailable);"
+          assert t.count(old) == 1
+          p.write_text(t.replace(old, "      if true {\n        return Ok(Placement::Unavailable);"))
+          EOF
+          failed=0
+          cargo test --locked -p slates-bridge-core --test dax_backing -- --test-threads 1 > m1-core.txt 2>&1 || failed=$((failed + 1))
+          cargo test --locked -p slates-bridge-virtiofs --test device -- --test-threads 1 every_window_over_a_backing a_hostile_guests_churn a_read_only_attachments_window > m1-device.txt 2>&1 || failed=$((failed + 1))
+          grep -E "panicked|test result|error\[" m1-core.txt m1-device.txt
+          cp /tmp/dax_object.rs crates/mem/src/dax_object.rs
+          [ "$failed" = 2 ] || { echo "RED-CHECK placement off: $failed of 2 suites failed, expected 2"; exit 1; }
+      - name: Red-check, a placed range punched rather than zeroed by stores
+        shell: bash
+        run: |
+          set -u
+          python3 - <<'EOF'
+          import pathlib
+          p = pathlib.Path("crates/mem/src/dax_object.rs")
+          t = p.read_text()
+          old = "        if placed {\n          view.zero_bytes(first_page, last_page)?;"
+          assert t.count(old) == 1
+          p.write_text(t.replace(old, "        if placed && DAX_RANGE_BYTES == 0 {\n          view.zero_bytes(first_page, last_page)?;"))
+          EOF
+          if cargo test --locked -p slates-bridge-virtiofs --test device -- --nocapture --test-threads 1 every_window_over_a_backing > m2.txt 2>&1; then
+            grep -E "SKIP|panicked|test result" m2.txt; echo "RED-CHECK punch: the cut test passed with placed ranges punched"; exit 1
+          fi
+          grep -E "panicked|test result|error\[" -A 2 m2.txt
+          cp /tmp/dax_object.rs crates/mem/src/dax_object.rs
+      - name: Red-check, the decline memo off
+        shell: bash
+        run: |
+          set -u
+          python3 - <<'EOF'
+          import pathlib
+          p = pathlib.Path("crates/vfs/src/shards_backing.rs")
+          t = p.read_text()
+          old = "    if self.placement_declined {\n      return Ok(Placement::Declined { transient: false });"
+          assert t.count(old) == 1
+          p.write_text(t.replace(old, "    if self.placement_declined && DAX_RANGE_BYTES == 0 {\n      return Ok(Placement::Declined { transient: false });"))
+          EOF
+          if cargo test --locked -p slates-bridge-core --test dax_backing -- --test-threads 1 a_declined_placement_is_remembered > m3.txt 2>&1; then
+            grep -E "SKIP|panicked|test result" m3.txt; echo "RED-CHECK memo: the memo test passed with the memo off"; exit 1
+          fi
+          grep -E "panicked|test result|error\[|asked" -A 2 m3.txt
