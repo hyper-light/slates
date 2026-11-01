@@ -7535,6 +7535,43 @@ Covering the conditions not re-touched by the landing rework, so the full 13-con
   competitor, the Linux kernel's NFS server, slates beats on read latency. A live Tectonic A/B is not possible (closed
   source); the comparison is against published figures with the workload-class caveat stated.
 
+### 2026-11-01: every platform's mount, like for like, quiet and under load (T-4.8, condition 12)
+
+Step 2 of the VFS and DAX plan measured slates' host mount beside each platform's own file system on all five platform
+cells (`docs/wip/bench/fsbench/`, `crates/cli/examples/mount_bench.rs`; BENCHMARKS, "Every platform's mount, like for
+like"). T-4.8 is recorded on every cell; Windows has no RAM VHD of its own, so its baseline is NTFS on the runner's disk.
+The x86_64 overlayfs leg the 2026-10-19 condition-12 entry left owed is done.
+
+Each platform's largest lever, named from its own numbers (BENCHMARKS has the tables):
+- **Linux x86_64 and arm64: the daemon's turn on a busy CPU.** With every core loaded, every call the daemon serves
+  reaches whole milliseconds at p99 (a create 3.7–6.0 ms on x86_64 and 1.1–5.3 ms on arm64, against overlayfs's
+  17–47 µs), in steps of a millisecond, while a read the page cache answers stays at 2.5–3.3 µs. Quiet, the next lever
+  is each mutating call's recovery publication before its reply (D-18), about 30 µs above an 11–15 µs round trip.
+- **macOS arm64: the calls Apple's NFS client makes for each change.** About 24 NFS calls a file cycle, 13 of them
+  LOOKUPs (the daemon's own count), make a create, rename or unlink 8–25× APFS on a RAM disk at the median and 4–9× at
+  p99 under load (5.2–6.4 ms for a rename). The 2026-10-06 diagnosis found these calls to be the client's, beyond a v3
+  server's reach; the owed transport with caching or delegation the macOS client keeps (2026-10-07) is this lever.
+- **Windows x86_64: the daemon's turn on a busy CPU, with a stall near 36 ms.** With every core loaded a create's p99
+  is 74–131 ms, against NTFS's 0.36–0.39 ms. Quiet, every run had a stall near 36 ms in a call's path through WinFsp
+  to the daemon, while the machine's own wake never took more than 2.3 ms.
+- **Windows arm64: a 4–5 ms wait on every open and close of a file the run had written** (an open 3,980–4,188 µs
+  against NTFS's 9 µs, in every run; 0.18–0.22 ms on x86_64). Under load those medians reach 4.5–15.8 ms.
+
+Owed from this measurement:
+- **The daemon's turn on a busy machine, every platform:** an unprivileged scheduling hint per OS, each verified
+  against R10 and then measured under load before any lands. Linux's EEVDF scheduler takes a requested slice through
+  `sched_setattr` (docs.kernel.org, "sched-eevdf"); macOS's QoS class was tried on 2026-10-07 and was inconclusive;
+  Windows' thread priority within the normal class is untried.
+- **Windows x86_64: the stall near 36 ms** in a call's path through WinFsp to the daemon, every quiet run: find it
+  with the daemon's own timing before any change.
+- **Windows arm64: the 4–5 ms wait on every open and close of a written file**, all three runs, not on x86_64. The
+  daemon's status named no WinFsp event, so no purge round ran, and `fsbench`'s open test (files never written) costs
+  1.2 ms an open and close there. Not yet explained: find whose wait it is with the daemon's own timing first.
+- **macOS: fewer calls per change**, the transport question owed since 2026-10-07.
+- **Linux, quiet: the mutating calls' publication** (about 30 µs a call).
+- **Bare metal:** every cell here is a CI VM; the bare-metal x86_64 reference stays the 2026-10-19 box run (a FUSE create
+  16 µs against overlayfs's 6 µs).
+
 ### 2026-10-12: the DAX mapping gate is built in the VFS (§4.6, A-9, AC-4.12)
 
 "Mapping isolation, pinning and teardown" — the invariants §4.6 requires before a VMM's DAX capability may be

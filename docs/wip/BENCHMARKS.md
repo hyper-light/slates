@@ -5332,7 +5332,9 @@ by the write path".
 **The harness is committed:** `docs/wip/bench/fsbench/` — `run.sh` (the container invocation), `inner.sh` (the
 three arms in one run over one base) and `fsync.py`. The superseded row cited this path and it did not exist;
 every number in the two tables above now comes from a command in the tree. It needs a **release** build in the
-`slates-linux-target` volume; the build line is in `run.sh`'s header.
+`slates-linux-target` volume; the build line is in `run.sh`'s header. (Replaced 2026-11-01 by the cross-platform
+harness of "Every platform's mount, like for like" below; `inner.sh` and `fsync.py`, which made these tables, are at
+commit 957cef9b: `git show 957cef9b:docs/wip/bench/fsbench/inner.sh`.)
 
 **One caveat the harness itself exposed, and it is a property worth knowing.** A verification run of the same
 script while a `cargo build` ran beside it in the same Docker VM read slates create p50 **130 µs** and stat
@@ -5347,8 +5349,9 @@ heavily in its p50.)
 the stale row implies against overlayfs. The in-design levers that attack the round trip — FUSE writeback
 caching and a larger `max_write` to batch, and virtio-fs + DAX to replace the round trip with a page-table
 access — are the ones that matter; the daemon-side work they would not touch is already half a microsecond.
-Owed: re-run the overlayfs leg so the three-way table is like-for-like again (this run had no overlayfs arm),
-and the same on x86_64.
+~~Owed: re-run the overlayfs leg so the three-way table is like-for-like again (this run had no overlayfs arm),
+and the same on x86_64.~~ **Done 2026-11-01:** "Every platform's mount, like for like" below runs tmpfs, overlayfs
+and slates in one interleaved run on x86_64 and arm64 Linux, quiet and contended.
 
 ### Condition 12, like-for-like: slates (FUSE) vs the kernel's overlayfs vs tmpfs (2026-10-11) — superseded above
 
@@ -7146,3 +7149,533 @@ the moments, not the arms, and are not read. What does compare: the least write 
 **Measured and rejected: arm A**, which costs nothing here and keeps nothing: in the adversarial suite it put the
 client's stale copy back over another path's write in every such case, silently, and through Apple's client it lost the
 other path's write in 9 runs of 9.
+
+## Every platform's mount, like for like, quiet and under load (T-4.8; condition 12; 2026-11-01)
+
+Before any optimization of the mounts (step 2 of the VFS and DAX plan), one harness measured slates' host mount beside
+each platform's own file system on all five platform cells, with nothing added and with every core loaded. This closes
+T-4.8 ("per-operation latency versus the RAM disk / RAM VHD on each platform") as far as each platform allows, and the
+x86_64 overlayfs leg the 2026-10-19 condition-12 entry left owed.
+
+**The harness.** `docs/wip/bench/fsbench/` holds one script per platform (`linux.sh`, `macos.sh`, `windows.sh`; `run.sh`
+runs `linux.sh` in a container), and each runs `crates/cli/examples/mount_bench.rs` over the arms it makes:
+- Linux: slates' FUSE mount of a plain volume beside tmpfs, and of a volume over a 500-file base beside an overlayfs
+  whose lower directory is the same base (the base, the upper directory and tmpfs are all on RAM);
+- macOS: slates' NFS mount beside APFS on a RAM disk (`hdiutil attach -nomount ram://`, the design's baseline) and APFS
+  on the boot disk;
+- Windows: slates' WinFsp drive beside NTFS on the runner's disk with the system cache in front of it (Windows ships no
+  RAM disk, so T-4.8's RAM VHD has no native form), then WinFsp's own benchmark, `fsbench`, in a directory of each
+  (built from WinFsp's tree at 4425d4807a, `tst/fsbench/fsbench.c` and `ext/tlib/testsuite.c`, since its installer does
+  not ship it).
+
+**The workload, per round and per arm:** 1,000 files of 4 KiB, every call timed on its own: create (an exclusive
+create), write (the 4 KiB in one call), fsync (std's `sync_all`: fsync(2) on Linux, `fcntl(F_FULLFSYNC)` on Apple
+platforms, `FlushFileBuffers` on Windows), close; stat; open, read (the bytes back, compared); rename within the
+directory; unlink. Each phase runs over all of a round's files before the next. Ten rounds a pass give 10,000 samples of
+each call per arm, so ten samples lie beyond each p999. The arms are interleaved round by round, and which goes first
+rotates; one untimed round per arm runs first, so a daemon's first page faults are in no pass's tail. Each cell ran the
+whole thing three times, each with a fresh daemon and fresh mounts: the full tables below are run 1, and a spread table
+gives every run's p50 and p99.
+
+**Two passes.** Quiet adds nothing. Contended runs one spinner thread per logical CPU, each sweeping a buffer of twice
+the largest L2 a cache line at a time (cores, caches and memory bandwidth all contended), for the whole pass. Each pass
+records the load it ran under: the load average where the OS keeps one (Windows keeps none), the spinners, and a wake-up
+probe, two threads trading a message every 5 ms for the whole pass, whose round trip is the scheduling delay that a file
+system served outside the kernel pays per request. The load average lags by minutes, so a quiet pass that follows a
+contended run starts with it still high; the probe, not the load average, says how quiet each pass was.
+
+**Where.** Every cell is a GitHub-hosted runner, so the five are the same class of machine: a virtual machine of 3 or 4
+vCPUs with no other job on it. A round trip in a VM costs more than on bare metal (the 2026-10-19 condition-12 runs: a
+FUSE create 16 µs on bare-metal x86_64 against 31 µs in Docker Desktop's VM), so the multiples travel and the absolutes
+are the runner's. slates ran as `slates anchor` starts it, no `--quick` and no `--shards`: the shard count and every
+budget derived from the runner.
+
+**The command, every cell:** `cargo build --release --locked -p slates-cli --bin slates --example mount_bench`, then
+`bash docs/wip/bench/fsbench/<platform>.sh` (Windows adds `FSBENCH=<fsbench.exe>`), three times, through the diagnostics
+workflow `.github/workflows/diag-fsbench.yml` on branch `diag-fsbench` (not for main), run 41262592019 at its commit
+`3e7dd1b`: main at `957cef9b` with this harness, which is the harness main carries. After each run the script prints the
+daemon's counters (`slates status`: NFS calls by procedure, FUSE and WinFsp events).
+
+**What each cell's numbers name** (ranges over the three runs; the sections below give every run):
+
+| cell | slates' costliest call, quiet p50 (the native file system's) | that call's p99 with every core loaded (native's) | largest lever |
+|---|---|---|---|
+| Linux x86_64 | create 41–50 µs (overlayfs 11 µs, tmpfs 5 µs) | 3.7–6.0 ms (overlayfs 39–47 µs) | the daemon's turn on a busy CPU; quiet, each mutation's recovery publication |
+| Linux arm64 | rename 42–44 µs (overlayfs 6 µs, tmpfs 3 µs) | 0.8–1.1 ms (overlayfs 14–15 µs) | the same |
+| macOS arm64 | rename 690–795 µs (APFS on a RAM disk 38–42 µs) | 5.2–6.4 ms (1.1–1.4 ms) | the calls Apple's NFS client makes for each change: about 24 a file cycle, 13 of them lookups |
+| Windows x86_64 | create 926–981 µs (NTFS 99–101 µs) | 74–131 ms (0.36–0.39 ms) | the daemon's turn on a busy CPU, and a stall near 36 ms in every quiet run |
+| Windows arm64 | close 4,688–4,916 µs (NTFS 49–53 µs) | 30–35 ms (0.10–0.11 ms) | a 4–5 ms wait on every open and close of a written file |
+
+### Linux x86_64 (GitHub's `ubuntu-latest`)
+
+Environment: AMD EPYC 9V74, 4 vCPUs, 15 GiB, Linux 7.0.0-1017-azure, a VM; slates `3e7dd1b` (main at `957cef9b` with
+this harness and the diagnostics workflow), release; 2026-11-01 01:51–01:53 UTC; diagnostics run 41262592019. Arms:
+tmpfs, overlayfs (lower: the 500-file base on tmpfs; upper and work on the same tmpfs), slates (a plain volume, FUSE)
+and slates-base (a volume over the same base, FUSE). Run 1 of 3:
+
+**quiet** (spinners 0 (one per logical CPU when contended); load average 1.46 1.03 0.44 at the start, 1.43 1.02 0.44 at the end; wake-up probe p50 23.7 µs, p99 117.6 µs, p999 227.9 µs, max 271.2 µs over 1184 probes; 6.0 s). Each cell: p50 · p99 · p999 · max, µs.
+
+| op | tmpfs | overlayfs | slates | slates-base |
+|---|---|---|---|---|
+| create | 4.5 · 11.8 · 40.1 · 129.4 | 10.6 · 21.9 · 249.6 · 504.4 | 50.1 · 106.3 · 420.1 · 1369.6 | 49.9 · 153.1 · 358.3 · 1274.5 |
+| write | 2.3 · 5.3 · 23.4 · 75.2 | 3.3 · 6.5 · 23.6 · 356.4 | 33.7 · 54.2 · 241.4 · 791.2 | 30.2 · 59.5 · 144.8 · 713.9 |
+| fsync | 0.4 · 0.5 · 1.1 · 49.4 | 0.5 · 0.6 · 1.5 · 251.2 | 13.4 · 48.0 · 202.4 · 627.0 | 13.0 · 46.0 · 272.6 · 833.9 |
+| close | 0.7 · 0.9 · 3.5 · 29.4 | 1.4 · 1.9 · 10.2 · 381.8 | 12.9 · 23.4 · 150.6 · 1608.9 | 12.8 · 25.0 · 96.2 · 259.8 |
+| stat | 1.7 · 2.2 · 11.0 · 75.9 | 2.3 · 3.0 · 16.6 · 187.5 | 13.0 · 24.5 · 48.6 · 128.2 | 13.6 · 43.7 · 103.8 · 141.6 |
+| open | 2.0 · 2.5 · 11.7 · 25.7 | 3.1 · 4.0 · 16.5 · 359.8 | 15.1 · 25.1 · 33.2 · 139.7 | 13.1 · 92.0 · 141.1 · 172.5 |
+| read | 1.3 · 1.6 · 9.7 · 14.8 | 1.6 · 2.1 · 9.4 · 59.5 | 1.3 · 1.8 · 4.0 · 14.0 | 1.3 · 2.5 · 32.6 · 121.1 |
+| rename | 4.5 · 11.1 · 20.1 · 39.2 | 10.3 · 18.7 · 121.6 · 314.6 | 45.7 · 79.3 · 458.5 · 823.5 | 55.6 · 106.5 · 487.1 · 1270.1 |
+| unlink | 4.6 · 7.6 · 37.9 · 169.8 | 8.6 · 15.2 · 292.0 · 639.4 | 36.8 · 102.6 · 369.3 · 665.7 | 41.8 · 89.0 · 390.2 · 852.1 |
+
+
+**contended** (spinners 4 (one per logical CPU when contended); load average 1.43 1.02 0.44 at the start, 2.66 1.33 0.56 at the end; wake-up probe p50 19.5 µs, p99 54.5 µs, p999 1988.6 µs, max 3934.6 µs over 4544 probes; 23.2 s). Each cell: p50 · p99 · p999 · max, µs.
+
+| op | tmpfs | overlayfs | slates | slates-base |
+|---|---|---|---|---|
+| create | 9.3 · 23.3 · 2098.4 · 5054.4 | 20.8 · 38.7 · 555.3 · 3116.0 | 104.4 · 3745.9 · 6000.4 · 11250.9 | 120.2 · 6996.2 · 9999.6 · 13565.5 |
+| write | 4.8 · 12.1 · 105.9 · 6016.7 | 6.5 · 15.3 · 174.9 · 2018.6 | 54.4 · 3286.7 · 4034.5 · 4954.0 | 57.3 · 3976.5 · 5983.7 · 7990.5 |
+| fsync | 0.5 · 0.6 · 6.6 · 935.2 | 0.7 · 0.9 · 2.4 · 120.9 | 26.8 · 1455.4 · 3899.1 · 4031.6 | 28.2 · 1998.9 · 3954.2 · 4023.7 |
+| close | 1.2 · 1.6 · 11.9 · 3027.9 | 2.6 · 3.1 · 21.5 · 3018.4 | 24.6 · 1006.9 · 3803.1 · 4007.8 | 25.8 · 2010.5 · 3995.2 · 4022.1 |
+| stat | 3.0 · 3.5 · 19.3 · 3016.3 | 3.9 · 5.0 · 106.6 · 2253.9 | 27.1 · 922.0 · 3810.0 · 4036.8 | 28.6 · 106.9 · 3754.9 · 4925.6 |
+| open | 3.8 · 6.3 · 42.7 · 3020.5 | 6.2 · 7.6 · 28.0 · 3019.8 | 38.0 · 947.5 · 3930.6 · 4048.4 | 40.5 · 1010.6 · 4029.6 · 4948.3 |
+| read | 2.1 · 2.6 · 18.3 · 5138.1 | 2.7 · 3.2 · 13.1 · 4015.9 | 1.8 · 2.7 · 12.0 · 14.9 | 1.8 · 2.7 · 12.4 · 45.9 |
+| rename | 7.8 · 19.4 · 1027.7 · 3089.1 | 18.6 · 36.3 · 935.0 · 3030.2 | 89.9 · 3263.2 · 4084.4 · 5351.6 | 108.5 · 3370.0 · 4126.5 · 5101.9 |
+| unlink | 7.8 · 17.1 · 1017.9 · 3113.7 | 15.7 · 31.1 · 2024.1 · 3665.3 | 72.6 · 3184.8 · 4025.4 · 4969.0 | 82.9 · 4134.3 · 6820.5 · 12014.4 |
+
+All three runs, each with a fresh daemon and mounts (p50 / p99, µs):
+
+quiet: p50 / p99 per run, µs (runs 1 to 3)
+
+| op | tmpfs | overlayfs | slates | slates-base |
+|---|---|---|---|---|
+| create | 4.5 / 11.9, 4.7 / 13.0, 4.5 / 11.8 | 10.6 / 21.9, 10.7 / 22.2, 10.6 / 22.4 | 50.2 / 106.3, 40.9 / 77.0, 40.8 / 76.9 | 49.9 / 153.1, 50.3 / 92.0, 48.1 / 85.7 |
+| write | 2.4 / 5.3, 2.5 / 6.4, 2.4 / 5.3 | 3.3 / 6.6, 3.4 / 6.5, 3.4 / 6.3 | 33.7 / 54.2, 24.5 / 42.7, 24.5 / 42.4 | 30.3 / 59.6, 26.9 / 48.5, 25.9 / 42.8 |
+| fsync | 0.4 / 0.5, 0.4 / 0.5, 0.4 / 0.5 | 0.5 / 0.7, 0.5 / 0.7, 0.5 / 0.6 | 13.4 / 48.0, 11.9 / 31.7, 11.9 / 33.6 | 13.0 / 46.0, 13.0 / 35.7, 12.7 / 33.6 |
+| close | 0.7 / 0.9, 0.8 / 1.0, 0.8 / 1.0 | 1.5 / 1.9, 1.5 / 1.9, 1.5 / 1.9 | 12.9 / 23.4, 11.8 / 20.5, 11.9 / 19.4 | 12.9 / 25.1, 12.7 / 25.0, 12.2 / 20.6 |
+| stat | 1.8 / 2.2, 1.8 / 2.5, 1.7 / 2.2 | 2.4 / 3.1, 2.4 / 3.1, 2.3 / 3.1 | 13.1 / 24.6, 12.8 / 21.3, 12.6 / 20.6 | 13.7 / 43.7, 13.7 / 32.7, 13.4 / 27.4 |
+| open | 2.0 / 2.6, 2.0 / 2.7, 2.0 / 2.4 | 3.1 / 4.1, 3.2 / 4.2, 3.1 / 4.0 | 15.1 / 25.1, 14.9 / 23.0, 14.7 / 22.0 | 13.2 / 92.1, 13.7 / 38.6, 12.6 / 32.1 |
+| read | 1.3 / 1.6, 1.4 / 1.8, 1.3 / 1.6 | 1.7 / 2.1, 1.7 / 2.1, 1.7 / 2.2 | 1.3 / 1.8, 1.3 / 1.8, 1.3 / 1.8 | 1.3 / 2.6, 1.3 / 1.8, 1.3 / 1.7 |
+| rename | 4.5 / 11.1, 4.5 / 11.3, 4.5 / 11.3 | 10.3 / 18.7, 10.3 / 19.0, 10.2 / 20.1 | 45.7 / 79.3, 41.2 / 67.8, 40.8 / 69.5 | 55.6 / 106.5, 50.8 / 93.0, 50.3 / 91.7 |
+| unlink | 4.7 / 7.7, 4.7 / 8.2, 4.7 / 7.6 | 8.7 / 15.3, 8.7 / 15.4, 8.6 / 15.5 | 36.8 / 102.6, 29.5 / 68.9, 29.5 / 63.9 | 41.9 / 89.1, 34.5 / 97.6, 34.6 / 76.7 |
+
+contended: p50 / p99 per run, µs (runs 1 to 3)
+
+| op | tmpfs | overlayfs | slates | slates-base |
+|---|---|---|---|---|
+| create | 9.3 / 23.3, 9.4 / 22.8, 9.2 / 21.3 | 20.9 / 38.7, 20.8 / 46.0, 20.3 / 47.2 | 104.4 / 3745.9, 93.5 / 5999.9, 94.2 / 6001.0 | 120.2 / 6996.3, 108.6 / 2373.1, 112.2 / 9997.4 |
+| write | 4.8 / 12.1, 4.9 / 11.5, 4.8 / 9.9 | 6.6 / 15.4, 6.6 / 13.6, 6.5 / 14.9 | 54.4 / 3286.8, 49.1 / 4976.1, 50.2 / 4987.0 | 57.4 / 3976.5, 52.1 / 1180.2, 53.1 / 4994.4 |
+| fsync | 0.5 / 0.7, 0.5 / 0.7, 0.5 / 0.7 | 0.8 / 0.9, 0.8 / 1.0, 0.8 / 1.0 | 26.8 / 1455.5, 24.4 / 1842.2, 24.1 / 3000.2 | 28.2 / 1999.0, 25.6 / 183.5, 25.7 / 3999.4 |
+| close | 1.2 / 1.6, 1.2 / 1.6, 1.2 / 1.5 | 2.6 / 3.1, 2.6 / 3.3, 2.6 / 3.2 | 24.6 / 1007.0, 21.8 / 2373.8, 22.2 / 3007.7 | 25.9 / 2010.6, 23.0 / 36.2, 24.2 / 4003.5 |
+| stat | 3.0 / 3.5, 3.0 / 3.6, 2.7 / 3.4 | 3.9 / 5.1, 4.0 / 4.6, 3.3 / 4.5 | 27.1 / 922.0, 23.3 / 334.3, 23.6 / 1001.8 | 28.6 / 106.9, 24.5 / 75.5, 25.2 / 3005.1 |
+| open | 3.8 / 6.3, 3.8 / 4.5, 3.6 / 4.4 | 6.3 / 7.7, 6.4 / 9.5, 5.7 / 7.8 | 38.1 / 947.6, 31.3 / 2988.7, 33.4 / 998.5 | 40.5 / 1010.6, 33.5 / 91.3, 36.9 / 2993.6 |
+| read | 2.1 / 2.7, 2.2 / 2.6, 2.0 / 2.5 | 2.8 / 3.2, 2.8 / 3.3, 2.7 / 3.1 | 1.9 / 2.7, 1.9 / 3.3, 1.9 / 2.5 | 1.9 / 2.7, 1.9 / 2.4, 1.9 / 2.8 |
+| rename | 7.8 / 19.5, 7.8 / 20.0, 7.4 / 18.2 | 18.7 / 36.4, 19.0 / 36.7, 18.0 / 34.5 | 90.0 / 3263.2, 82.4 / 3938.3, 82.4 / 7996.0 | 108.6 / 3370.1, 100.4 / 1619.4, 102.4 / 4027.5 |
+| unlink | 7.9 / 17.1, 8.0 / 17.5, 7.3 / 16.2 | 15.7 / 31.2, 15.9 / 32.7, 14.8 / 27.9 | 72.6 / 3184.8, 66.8 / 3143.3, 67.1 / 5005.2 | 83.0 / 4134.3, 75.8 / 2049.4, 77.1 / 3002.5 |
+
+### Linux arm64 (GitHub's `ubuntu-24.04-arm`)
+
+Environment: an aarch64 runner whose CPU model the profile reads as unknown, 4 vCPUs, 15 GiB, Linux 7.0.0-1017-azure, a
+VM; slates `3e7dd1b`, release; 2026-11-01 01:51–01:52 UTC; diagnostics run 41262592019. The same arms. Run 1 of 3:
+
+**quiet** (spinners 0 (one per logical CPU when contended); load average 1.42 0.98 0.43 at the start, 1.39 0.98 0.43 at the end; wake-up probe p50 16.2 µs, p99 27.7 µs, p999 47.9 µs, max 100.8 µs over 1005 probes; 5.1 s). Each cell: p50 · p99 · p999 · max, µs.
+
+| op | tmpfs | overlayfs | slates | slates-base |
+|---|---|---|---|---|
+| create | 2.6 · 9.0 · 34.9 · 73.2 | 6.1 · 15.3 · 121.7 · 528.4 | 39.4 · 66.2 · 383.0 · 939.9 | 50.7 · 84.3 · 331.9 · 1142.3 |
+| write | 1.6 · 5.0 · 15.3 · 94.8 | 2.0 · 5.9 · 16.9 · 312.6 | 26.2 · 35.5 · 68.7 · 507.9 | 28.4 · 39.0 · 71.0 · 1002.9 |
+| fsync | 0.2 · 0.4 · 1.0 · 50.4 | 0.3 · 0.6 · 1.3 · 117.8 | 14.6 · 32.4 · 167.4 · 789.3 | 15.5 · 33.7 · 252.7 · 337.9 |
+| close | 0.4 · 0.6 · 3.2 · 45.9 | 0.8 · 1.1 · 5.9 · 13.2 | 11.9 · 16.8 · 22.9 · 500.8 | 14.8 · 20.0 · 29.6 · 223.5 |
+| stat | 1.0 · 1.5 · 9.0 · 57.4 | 1.3 · 1.9 · 10.6 · 238.1 | 11.4 · 14.1 · 27.2 · 45.1 | 12.1 · 18.5 · 47.7 · 92.8 |
+| open | 1.2 · 1.6 · 8.3 · 52.0 | 1.6 · 2.2 · 10.8 · 201.0 | 13.0 · 16.1 · 22.9 · 96.6 | 11.9 · 28.7 · 51.5 · 1018.4 |
+| read | 1.2 · 1.7 · 5.7 · 16.9 | 1.4 · 1.8 · 7.6 · 205.5 | 1.4 · 1.9 · 5.6 · 6.6 | 1.4 · 1.9 · 5.3 · 8.9 |
+| rename | 2.6 · 8.2 · 20.2 · 35.0 | 6.1 · 13.2 · 67.7 · 267.8 | 42.3 · 58.6 · 404.4 · 466.2 | 55.2 · 89.6 · 418.3 · 453.5 |
+| unlink | 2.5 · 4.8 · 18.7 · 39.3 | 4.9 · 9.1 · 28.3 · 410.6 | 32.7 · 61.1 · 320.2 · 388.4 | 36.5 · 66.1 · 270.6 · 361.1 |
+
+
+**contended** (spinners 4 (one per logical CPU when contended); load average 1.39 0.98 0.43 at the start, 3.27 1.44 0.59 at the end; wake-up probe p50 10.0 µs, p99 19.0 µs, p999 1304.1 µs, max 1975.9 µs over 3746 probes; 19.1 s). Each cell: p50 · p99 · p999 · max, µs.
+
+| op | tmpfs | overlayfs | slates | slates-base |
+|---|---|---|---|---|
+| create | 2.6 · 9.3 · 34.7 · 1018.8 | 6.2 · 17.2 · 229.4 · 3084.8 | 61.9 · 5344.0 · 6543.0 · 7202.5 | 71.9 · 833.6 · 4318.8 · 4606.1 |
+| write | 1.6 · 5.1 · 17.7 · 823.6 | 2.0 · 6.3 · 96.3 · 5038.2 | 33.0 · 3988.4 · 4991.9 · 6702.0 | 35.8 · 787.1 · 4084.3 · 4642.5 |
+| fsync | 0.3 · 0.5 · 1.0 · 807.1 | 0.3 · 0.6 · 1.8 · 156.9 | 15.2 · 1999.1 · 3054.1 · 3998.6 | 16.5 · 315.0 · 3314.6 · 3872.6 |
+| close | 0.4 · 0.7 · 3.5 · 44.5 | 0.8 · 1.3 · 9.2 · 230.7 | 13.8 · 2008.1 · 3007.1 · 4012.4 | 15.0 · 32.8 · 3068.7 · 3882.6 |
+| stat | 1.0 · 1.5 · 8.2 · 46.5 | 1.3 · 2.0 · 15.3 · 3013.4 | 17.5 · 25.8 · 2895.6 · 3700.8 | 18.8 · 55.9 · 1062.3 · 3848.1 |
+| open | 1.2 · 1.6 · 10.0 · 27.4 | 1.7 · 2.4 · 22.2 · 3018.3 | 24.4 · 761.6 · 3301.8 · 3872.0 | 26.6 · 5979.9 · 8983.5 · 9013.6 |
+| read | 1.2 · 1.7 · 10.1 · 27.8 | 1.4 · 2.0 · 8.3 · 3027.3 | 2.0 · 2.7 · 9.3 · 748.6 | 2.1 · 4.3 · 11.3 · 747.8 |
+| rename | 2.6 · 8.6 · 21.6 · 31.1 | 6.4 · 15.2 · 122.3 · 5044.2 | 53.4 · 811.1 · 4305.0 · 4672.1 | 65.6 · 824.0 · 4132.9 · 4700.5 |
+| unlink | 2.5 · 4.8 · 26.9 · 74.3 | 5.0 · 10.6 · 214.1 · 3023.1 | 40.5 · 806.8 · 4255.8 · 4679.1 | 46.4 · 7678.5 · 8999.2 · 10016.7 |
+
+All three runs (p50 / p99, µs):
+
+quiet: p50 / p99 per run, µs (runs 1 to 3)
+
+| op | tmpfs | overlayfs | slates | slates-base |
+|---|---|---|---|---|
+| create | 2.6 / 9.0, 2.6 / 9.2, 2.6 / 9.4 | 6.1 / 15.4, 6.1 / 15.0, 6.2 / 15.9 | 39.4 / 66.3, 38.4 / 64.3, 39.8 / 67.7 | 50.8 / 84.3, 44.8 / 74.7, 47.1 / 81.1 |
+| write | 1.6 / 5.0, 1.6 / 5.1, 1.6 / 5.2 | 2.0 / 6.0, 2.0 / 5.9, 2.0 / 5.9 | 26.2 / 35.6, 25.3 / 34.5, 27.5 / 37.0 | 28.4 / 39.0, 27.5 / 37.2, 29.4 / 40.4 |
+| fsync | 0.3 / 0.4, 0.3 / 0.6, 0.3 / 0.6 | 0.3 / 0.6, 0.3 / 0.7, 0.3 / 0.6 | 14.6 / 32.5, 11.6 / 30.4, 11.9 / 29.9 | 15.6 / 33.8, 12.3 / 28.0, 16.0 / 35.4 |
+| close | 0.5 / 0.7, 0.5 / 0.7, 0.5 / 0.7 | 0.8 / 1.1, 0.8 / 1.2, 0.8 / 1.0 | 12.0 / 16.8, 10.8 / 15.5, 11.0 / 16.9 | 14.8 / 20.0, 11.5 / 16.7, 13.2 / 18.9 |
+| stat | 1.0 / 1.6, 1.1 / 1.6, 1.1 / 1.6 | 1.3 / 1.9, 1.3 / 1.9, 1.4 / 2.0 | 11.5 / 14.2, 11.5 / 14.3, 11.7 / 14.5 | 12.1 / 18.6, 12.2 / 18.7, 12.5 / 18.8 |
+| open | 1.2 / 1.7, 1.2 / 1.7, 1.3 / 1.7 | 1.6 / 2.3, 1.7 / 2.3, 1.7 / 2.3 | 13.0 / 16.2, 13.1 / 17.0, 13.0 / 16.4 | 11.9 / 28.7, 12.4 / 24.9, 11.9 / 29.2 |
+| read | 1.2 / 1.7, 1.3 / 1.7, 1.3 / 1.8 | 1.4 / 1.9, 1.5 / 2.0, 1.5 / 2.0 | 1.4 / 1.9, 1.4 / 2.0, 1.5 / 2.0 | 1.4 / 2.0, 1.5 / 2.0, 1.4 / 2.0 |
+| rename | 2.6 / 8.2, 2.6 / 8.7, 2.6 / 9.0 | 6.2 / 13.2, 6.3 / 14.0, 6.2 / 13.9 | 42.4 / 58.6, 41.5 / 58.4, 44.0 / 61.3 | 55.3 / 89.7, 50.4 / 84.5, 52.8 / 91.2 |
+| unlink | 2.6 / 4.8, 2.6 / 4.7, 2.6 / 4.8 | 5.0 / 9.1, 5.1 / 9.5, 5.0 / 9.3 | 32.7 / 61.2, 28.1 / 56.2, 33.4 / 65.9 | 36.5 / 66.1, 35.2 / 65.7, 37.7 / 66.3 |
+
+contended: p50 / p99 per run, µs (runs 1 to 3)
+
+| op | tmpfs | overlayfs | slates | slates-base |
+|---|---|---|---|---|
+| create | 2.6 / 9.3, 2.7 / 9.9, 2.7 / 9.7 | 6.2 / 17.2, 6.2 / 16.9, 6.2 / 16.9 | 61.9 / 5344.1, 60.8 / 2996.9, 62.5 / 1143.3 | 71.9 / 833.7, 71.2 / 264.7, 72.8 / 6997.0 |
+| write | 1.6 / 5.2, 1.6 / 5.4, 1.6 / 5.3 | 2.0 / 6.4, 2.0 / 6.0, 2.0 / 6.1 | 33.0 / 3988.5, 32.4 / 1995.0, 33.6 / 1006.0 | 35.8 / 787.1, 35.3 / 1092.5, 36.1 / 3990.6 |
+| fsync | 0.3 / 0.6, 0.3 / 0.6, 0.3 / 0.6 | 0.3 / 0.6, 0.3 / 0.6, 0.3 / 0.6 | 15.2 / 1999.1, 15.4 / 999.3, 15.8 / 380.2 | 16.6 / 315.0, 16.6 / 39.9, 16.9 / 1999.0 |
+| close | 0.5 / 0.8, 0.5 / 0.8, 0.5 / 0.8 | 0.8 / 1.3, 0.8 / 1.2, 0.8 / 1.2 | 13.8 / 2008.1, 14.3 / 1003.6, 14.5 / 34.5 | 15.1 / 32.8, 15.2 / 28.4, 15.3 / 2008.1 |
+| stat | 1.1 / 1.6, 1.1 / 1.6, 1.1 / 1.7 | 1.3 / 2.0, 1.4 / 2.0, 1.4 / 2.0 | 17.6 / 25.9, 17.4 / 23.9, 17.3 / 23.3 | 18.8 / 56.0, 18.1 / 50.7, 18.3 / 51.9 |
+| open | 1.2 / 1.7, 1.3 / 1.7, 1.3 / 1.8 | 1.7 / 2.4, 1.7 / 2.3, 1.7 / 2.3 | 24.4 / 761.7, 25.1 / 34.4, 24.6 / 36.8 | 26.7 / 5979.9, 26.4 / 60.2, 26.4 / 971.7 |
+| read | 1.2 / 1.8, 1.3 / 1.8, 1.2 / 1.8 | 1.5 / 2.0, 1.5 / 2.0, 1.5 / 2.0 | 2.1 / 2.8, 2.1 / 2.8, 2.1 / 2.8 | 2.1 / 4.4, 2.1 / 2.8, 2.1 / 2.9 |
+| rename | 2.6 / 8.6, 2.6 / 8.6, 2.7 / 9.0 | 6.4 / 15.3, 6.3 / 14.4, 6.4 / 14.7 | 53.4 / 811.1, 51.1 / 1056.9, 52.2 / 999.4 | 65.6 / 824.1, 64.0 / 123.3, 64.2 / 535.5 |
+| unlink | 2.6 / 4.8, 2.6 / 5.7, 2.6 / 5.5 | 5.0 / 10.6, 5.2 / 10.8, 5.0 / 10.6 | 40.5 / 806.9, 39.2 / 1037.2, 39.9 / 452.9 | 46.4 / 7678.6, 45.3 / 350.8, 45.5 / 997.7 |
+
+**What Linux's numbers name.** Quiet, every call that reaches the daemon costs one round trip: 12–15 µs on x86_64 and
+11–15 µs on arm64 for stat, open, close and fsync, where tmpfs and overlayfs answer in 0.4–3 µs. A read that the page
+cache answers costs what tmpfs's does (1.3–1.5 µs). A mutating call costs about 30 µs more than the round trip: create
+41–50 µs on x86_64 and 38–40 µs on arm64, and rename 41–46 µs and 42–44 µs, against overlayfs's 6–11 µs; over the base,
+overlayfs's own like (slates-base), create takes 48–50 µs on x86_64 and 45–51 µs on arm64, and rename 50–56 µs and 50–55
+µs. Each publishes its shard's recovery image before it replies, so the change survives a daemon's death (D-18;
+`crates/server/src/fuse.rs`, `reply`). A write costs 25–34 µs: it is logged before its reply (A-63), and that log also
+spares a close its publication (the daemon counted every such flush, `fuse.flush_logged`, 42,000 a run).
+
+Contended, slates' medians rise by under 3×, but every call the daemon serves reaches whole milliseconds at p99. A
+create takes 3.7–6.0 ms on x86_64 and 1.1–5.3 ms on arm64, against overlayfs's 39–47 µs and 17 µs. The p99s fall in
+steps of a millisecond (1.0, 2.0, 3.0, 4.0 and 6.0 ms recur), while reads stay at 2.5–3.3 µs. An in-kernel file system
+serves its caller in the caller's own time slice. slates' every call wakes a daemon thread and then the caller again,
+and on a busy core each wake can wait out a CPU-bound thread's slice: the probe's bare thread-to-thread wake reached
+1.3–2.0 ms at p999 in five of the six contended runs (49.5 µs in the sixth).
+
+**Linux's largest lever: the daemon's turn on a busy CPU.** At p99 under load a create waits 3.7–6.0 ms (x86_64),
+against the 41–50 µs that its round trip and publication cost on a quiet machine. Quiet, the next lever is the mutating
+calls' publication, about 30 µs a call. slates asks the scheduler for nothing (no call in `crates/rt` sets a thread's
+slice, priority or class). The kernel's EEVDF scheduler lets a task with a shorter requested slice preempt others
+("tasks can preempt others if their VD is earlier, and tasks can request specific time slices using the new
+sched_setattr() system call", docs.kernel.org/scheduler/sched-eevdf.html, read 2026-11-01). Whether an unprivileged
+daemon may request one is to verify before it is weighed (R10).
+
+### macOS arm64 (GitHub's `macos-latest`)
+
+Environment: Apple M1 (Virtual), 3 vCPUs, 7 GiB, macOS 26.6.2 (25G83), a VM; slates `3e7dd1b`, release; 2026-11-01
+01:52–02:00 UTC; diagnostics run 41262592019. Arms: APFS on a 1 GiB RAM disk (`hdiutil attach -nomount ram://`, then
+`diskutil erasevolume APFS`), APFS on the runner's boot disk, and slates' NFS mount of a plain volume (`slates mount`,
+NFSv3 over loopback, the mount every macOS user gets). fsync is std's `sync_all`, which on Apple platforms is
+`fcntl(F_FULLFSYNC)`: on APFS it flushes the device's own cache, and through the NFS mount it is the client's WRITE and
+COMMIT. This runner was not idle in its quiet passes: they began with the one-minute load average at 3.8–6.8, still
+falling from the build and from the run before, and the probe's p99 was 0.7–0.9 ms, against 0.03–0.12 ms on the Linux
+runners. The arms of a pass shared that, so the multiples hold; the absolutes are high. The validation run just before
+(diagnostics run 41261962569: the same program, its scripts printing no counters) had a quieter runner, probe p99 0.23
+ms, and read a create at 340 µs, a rename at 473 µs and an unlink at 419 µs against APFS's 44, 34 and 24 µs on the RAM
+disk. Run 1 of 3:
+
+**quiet** (spinners 0 (one per logical CPU when contended); load average 3.79 6.14 6.43 at the start, 3.07 5.53 6.19 at the end; wake-up probe p50 33.5 µs, p99 921.8 µs, p999 3600.7 µs, max 8514.2 µs over 2378 probes; 52.9 s). Each cell: p50 · p99 · p999 · max, µs.
+
+| op | apfs-ram | apfs | slates |
+|---|---|---|---|
+| create | 63.2 · 339.5 · 936.2 · 2088.7 | 90.2 · 383.2 · 845.3 · 5505.7 | 476.5 · 1342.2 · 3809.9 · 12917.1 |
+| write | 22.0 · 134.2 · 438.9 · 3040.5 | 60.6 · 198.2 · 546.1 · 2685.4 | 52.7 · 378.4 · 1200.9 · 2420.3 |
+| fsync | 497.9 · 1148.4 · 2788.6 · 7258.6 | 1022.7 · 3686.8 · 9033.9 · 48366.1 | 278.7 · 771.6 · 3051.6 · 12268.8 |
+| close | 6.6 · 55.2 · 287.9 · 802.7 | 11.6 · 50.3 · 228.5 · 1051.7 | 106.0 · 324.8 · 1242.4 · 5393.7 |
+| stat | 1.4 · 7.7 · 275.3 · 2356.4 | 1.5 · 10.0 · 29.4 · 60.7 | 4.7 · 215.7 · 393.2 · 977.0 |
+| open | 6.2 · 39.7 · 516.0 · 3768.2 | 6.4 · 43.8 · 118.9 · 196.5 | 123.4 · 518.3 · 3897.2 · 11247.6 |
+| read | 1.3 · 6.5 · 44.0 · 806.8 | 1.4 · 10.5 · 28.3 · 168.5 | 3.9 · 24.6 · 234.3 · 5147.5 |
+| rename | 39.0 · 378.7 · 1837.9 · 5846.7 | 46.7 · 454.2 · 2275.8 · 21108.4 | 726.0 · 3472.7 · 9358.0 · 23277.6 |
+| unlink | 30.1 · 331.5 · 1699.7 · 4300.6 | 40.2 · 409.2 · 2507.0 · 7416.1 | 751.2 · 2996.9 · 7383.4 · 55282.1 |
+
+
+**contended** (spinners 3 (one per logical CPU when contended); load average 3.07 5.53 6.19 at the start, 8.66 6.63 6.53 at the end; wake-up probe p50 33.2 µs, p99 7282.3 µs, p999 13144.1 µs, max 17878.2 µs over 4058 probes; 97.3 s). Each cell: p50 · p99 · p999 · max, µs.
+
+| op | apfs-ram | apfs | slates |
+|---|---|---|---|
+| create | 154.7 · 593.6 · 2286.7 · 4691.6 | 263.3 · 820.9 · 3599.5 · 4998.7 | 445.2 · 3978.7 · 12785.6 · 28139.6 |
+| write | 42.4 · 192.0 · 985.5 · 2591.5 | 59.2 · 337.7 · 2122.6 · 4701.0 | 72.9 · 345.1 · 1667.2 · 4979.0 |
+| fsync | 599.0 · 4807.8 · 10526.2 · 26328.1 | 2281.2 · 16414.9 · 26706.3 · 50895.2 | 284.7 · 2306.7 · 8279.0 · 24174.5 |
+| close | 20.8 · 107.7 · 298.0 · 2462.5 | 43.0 · 113.8 · 488.9 · 6292.8 | 78.4 · 1315.5 · 4297.6 · 6115.3 |
+| stat | 2.0 · 6.6 · 60.5 · 416.2 | 3.5 · 14.1 · 105.7 · 12585.1 | 14.7 · 364.7 · 1956.6 · 3217.4 |
+| open | 7.5 · 69.6 · 1011.8 · 20824.2 | 8.4 · 85.9 · 1352.3 · 8197.2 | 65.8 · 552.7 · 2538.5 · 4011.5 |
+| read | 2.6 · 13.2 · 56.3 · 7327.7 | 2.8 · 25.7 · 279.0 · 2895.3 | 3.2 · 20.8 · 124.3 · 2959.2 |
+| rename | 42.7 · 1245.5 · 6919.7 · 23527.3 | 48.8 · 1091.0 · 5053.7 · 19136.9 | 642.7 · 6424.3 · 25304.2 · 128833.7 |
+| unlink | 35.8 · 854.9 · 9918.3 · 24095.7 | 46.4 · 1626.2 · 10222.4 · 63772.6 | 1249.3 · 5727.0 · 14520.7 · 128588.3 |
+
+All three runs (p50 / p99, µs):
+
+quiet: p50 / p99 per run, µs (runs 1 to 3)
+
+| op | apfs-ram | apfs | slates |
+|---|---|---|---|
+| create | 63.2 / 339.6, 54.6 / 268.5, 67.8 / 333.7 | 90.2 / 383.2, 78.1 / 333.5, 117.4 / 403.2 | 476.5 / 1342.3, 491.6 / 1062.7, 577.8 / 1532.0 |
+| write | 22.0 / 134.2, 17.9 / 102.2, 22.8 / 129.2 | 60.7 / 198.3, 53.8 / 167.8, 88.3 / 193.5 | 52.7 / 378.4, 37.8 / 176.2, 51.3 / 243.2 |
+| fsync | 497.9 / 1148.4, 444.5 / 958.7, 516.6 / 1185.1 | 1022.8 / 3686.9, 927.4 / 3617.9, 1060.2 / 3540.5 | 278.8 / 771.7, 238.8 / 521.9, 283.7 / 884.0 |
+| close | 6.7 / 55.3, 5.2 / 42.2, 7.4 / 49.1 | 11.6 / 50.3, 9.2 / 44.2, 16.6 / 56.1 | 106.1 / 324.8, 87.9 / 234.2, 107.8 / 342.8 |
+| stat | 1.4 / 7.8, 1.4 / 3.6, 1.5 / 8.3 | 1.5 / 10.0, 1.5 / 4.7, 1.5 / 6.8 | 4.8 / 215.8, 2.2 / 157.7, 5.6 / 182.4 |
+| open | 6.3 / 39.7, 6.6 / 18.8, 6.9 / 52.4 | 6.5 / 43.9, 6.5 / 39.1, 6.6 / 46.8 | 123.5 / 518.4, 91.1 / 255.6, 107.9 / 343.9 |
+| read | 1.4 / 6.6, 1.4 / 5.9, 1.5 / 8.7 | 1.5 / 10.6, 1.4 / 9.5, 1.5 / 9.8 | 3.9 / 24.6, 2.8 / 22.9, 4.2 / 24.9 |
+| rename | 39.1 / 378.8, 37.7 / 324.7, 41.9 / 392.1 | 46.8 / 454.3, 47.7 / 433.7, 49.6 / 621.2 | 726.0 / 3472.7, 690.2 / 2397.1, 794.5 / 2897.9 |
+| unlink | 30.1 / 331.6, 28.2 / 246.1, 31.8 / 338.5 | 40.2 / 409.2, 37.7 / 384.8, 42.7 / 452.5 | 751.2 / 2997.0, 655.5 / 2187.9, 699.5 / 2008.3 |
+
+contended: p50 / p99 per run, µs (runs 1 to 3)
+
+| op | apfs-ram | apfs | slates |
+|---|---|---|---|
+| create | 154.8 / 593.6, 126.8 / 505.0, 155.0 / 575.8 | 263.4 / 820.9, 245.9 / 637.9, 270.1 / 715.3 | 445.2 / 3978.8, 500.2 / 4313.1, 524.8 / 3601.0 |
+| write | 42.5 / 192.0, 35.9 / 168.4, 40.5 / 179.4 | 59.3 / 337.7, 55.7 / 249.8, 59.0 / 257.5 | 72.9 / 345.2, 65.1 / 186.7, 76.2 / 248.6 |
+| fsync | 599.1 / 4807.8, 399.6 / 4340.2, 588.5 / 4526.8 | 2281.3 / 16414.9, 1940.4 / 11328.4, 2214.9 / 13073.4 | 284.8 / 2306.8, 276.3 / 2095.6, 293.2 / 2033.3 |
+| close | 20.9 / 107.8, 16.1 / 139.2, 20.8 / 139.9 | 43.1 / 113.8, 40.9 / 105.0, 44.5 / 108.5 | 78.4 / 1315.5, 75.8 / 1393.4, 79.3 / 1208.0 |
+| stat | 2.1 / 6.7, 2.0 / 10.3, 2.3 / 6.9 | 3.6 / 14.2, 1.9 / 7.0, 2.0 / 8.5 | 14.7 / 364.8, 3.2 / 229.4, 45.8 / 206.2 |
+| open | 7.6 / 69.7, 7.7 / 83.7, 7.8 / 70.9 | 8.4 / 86.0, 7.5 / 77.5, 8.2 / 59.8 | 65.9 / 552.8, 63.0 / 523.0, 64.1 / 391.9 |
+| read | 2.6 / 13.2, 2.7 / 17.4, 2.7 / 14.9 | 2.9 / 25.7, 2.6 / 15.4, 2.8 / 15.8 | 3.2 / 20.8, 3.2 / 17.9, 3.1 / 15.2 |
+| rename | 42.7 / 1245.6, 41.1 / 1097.5, 44.3 / 1441.8 | 48.9 / 1091.1, 47.4 / 731.2, 48.7 / 736.4 | 642.8 / 6424.3, 684.2 / 5202.7, 727.8 / 5512.2 |
+| unlink | 35.9 / 855.0, 32.0 / 1145.4, 36.5 / 986.5 | 46.5 / 1626.2, 39.9 / 692.5, 44.6 / 1256.3 | 1249.3 / 5727.1, 1367.5 / 5611.4, 1245.5 / 5806.5 |
+
+**What macOS's numbers name.** Through the NFS mount, a read and a stat stay within a few microseconds of APFS's (3–4 µs
+and 2–6 µs against 1.4–1.5 µs; the client's caches answer them). A write is buffered by the client (38–53 µs, against
+APFS's 18–23 µs on the RAM disk and 54–88 µs on disk). An fsync is the client's WRITE and COMMIT, faster than APFS's
+full flush (239–284 µs, against 445–517 µs and 927–1,060 µs). The changes are what cost. At the median a create takes
+477–578 µs, a rename 690–795 µs and an unlink 656–751 µs, against 28–68 µs on the APFS RAM disk: 8–25× in each run. With
+every core loaded they take 3.6–4.3 ms, 5.2–6.4 ms and 5.6–5.8 ms at p99, against 0.5–1.4 ms: 4–9×. Those three carry
+the whole of slates' excess over APFS in a cycle: an open and a close cost about 0.1 ms more each, and an fsync about
+0.2 ms less.
+
+The daemon counted what Apple's client sent (`slates status`, each run's 21,000 file cycles). A cycle sent 13.0 LOOKUPs,
+3.4–5.3 GETATTRs, and one each of CREATE, SETATTR, ACCESS, WRITE, COMMIT, REMOVE and RENAME: about 24 calls, more than
+half of them lookups. Each call is a trip through the client and the loopback socket to the daemon and back (an open,
+which sends one ACCESS, costs 91–124 µs), and under load each trip is one more wait for the daemon's turn and the
+client's. No create made an AppleDouble sidecar here: CREATE is 1.0 a cycle, where the 2026-10-06 diagnosis counted 2.0,
+one of them for a sidecar holding `com.apple.provenance`.
+
+**macOS's largest lever: the calls Apple's NFS client makes for each change.** At about 24 calls a file cycle, 13 of
+them lookups, a change costs 8–25× APFS at the median and 4–9× at p99 under load. The 2026-10-06 diagnosis found these
+calls to be the client's own, which a v3 server cannot remove ("macOS offers no way to turn them off": no `nocto`). So
+the lever is fewer calls, through a transport the macOS client speaks with caching or delegation it can keep (owed since
+2026-10-07), and a cheaper trip for each call. A QoS class on the shard threads was tried on 2026-10-07 and did not
+land: four writers improved, one writer's unlinks worsened ("Mixed read-write tails on macOS's own NFS client" above).
+
+### Windows x86_64 (GitHub's `windows-latest`)
+
+Environment: an AMD processor of family 25 (the profile reads `windows processor architecture 9 level 25 revision 257`),
+4 vCPUs, 15 GiB, Windows Server 2025 (10.0.26100.33650; image win25-vs2026 20261021.278.1), a VM; WinFsp 2.1.25156;
+slates `3e7dd1b`, release; 2026-11-01 01:55–02:08 UTC; diagnostics run 41262592019. Arms: NTFS on the runner's D: drive,
+with the system cache, and slates' WinFsp drive of a plain volume. Windows keeps no load average, so a pass's load is
+its spinners and the probe. Run 1 of 3:
+
+**quiet** (spinners 0 (one per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 38.8 µs, p99 76.9 µs, p999 212.5 µs, max 2309.9 µs over 8283 probes; 43.9 s). Each cell: p50 · p99 · p999 · max, µs.
+
+| op | ntfs | slates |
+|---|---|---|
+| create | 100.8 · 280.7 · 571.1 · 1789.0 | 980.7 · 2545.5 · 23311.9 · 270136.7 |
+| write | 41.6 · 98.0 · 179.9 · 3301.9 | 117.9 · 242.4 · 1523.4 · 78964.4 |
+| fsync | 265.7 · 1591.0 · 5058.7 · 15243.9 | 158.5 · 322.9 · 2079.7 · 77831.7 |
+| close | 16.3 · 42.6 · 73.7 · 711.0 | 69.6 · 161.2 · 842.4 · 94218.9 |
+| stat | 16.5 · 53.2 · 84.6 · 174.3 | 302.9 · 511.6 · 7699.4 · 159338.0 |
+| open | 8.7 · 60.4 · 143.9 · 715.2 | 218.2 · 514.8 · 7594.3 · 255022.2 |
+| read | 5.9 · 41.7 · 142.2 · 2628.1 | 13.5 · 147.3 · 378.8 · 160106.9 |
+| rename | 78.3 · 200.9 · 332.9 · 4068.7 | 694.2 · 1831.4 · 36121.0 · 145095.3 |
+| unlink | 84.9 · 183.9 · 668.5 · 7823.0 | 408.3 · 1242.0 · 23605.7 · 143392.4 |
+
+
+**contended** (spinners 4 (one per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 40.3 µs, p99 68.8 µs, p999 2039.2 µs, max 91050.0 µs over 25059 probes; 133.9 s). Each cell: p50 · p99 · p999 · max, µs.
+
+| op | ntfs | slates |
+|---|---|---|
+| create | 177.8 · 364.2 · 599.7 · 3292.2 | 1448.5 · 117413.5 · 395748.4 · 732145.7 |
+| write | 67.9 · 135.4 · 208.3 · 390.6 | 116.4 · 1791.4 · 66574.5 · 321674.1 |
+| fsync | 314.0 · 1167.0 · 4014.7 · 12485.5 | 180.5 · 421.5 · 40931.7 · 82006.0 |
+| close | 23.9 · 58.0 · 85.1 · 139.3 | 93.2 · 166.1 · 11169.8 · 79055.7 |
+| stat | 40.1 · 85.0 · 132.9 · 16393.1 | 346.3 · 33544.9 · 122713.9 · 1456290.6 |
+| open | 19.4 · 51.5 · 140.6 · 33747.9 | 233.5 · 982.5 · 46891.4 · 140487.7 |
+| read | 12.1 · 24.3 · 76.7 · 25016.0 | 121.0 · 202.6 · 42225.5 · 121890.3 |
+| rename | 158.0 · 320.4 · 18051.4 · 36567.7 | 817.6 · 30223.8 · 77669.1 · 163592.0 |
+| unlink | 156.8 · 355.3 · 17025.7 · 37615.6 | 465.5 · 32444.3 · 76672.8 · 157882.2 |
+
+All three runs (p50 / p99, µs):
+
+quiet: p50 / p99 per run, µs (runs 1 to 3)
+
+| op | ntfs | slates |
+|---|---|---|
+| create | 100.8 / 280.7, 98.6 / 260.0, 98.5 / 282.3 | 980.7 / 2545.5, 976.3 / 1624.5, 925.9 / 1641.2 |
+| write | 41.6 / 98.0, 40.0 / 85.5, 40.1 / 91.5 | 117.9 / 242.4, 117.7 / 491.1, 100.2 / 329.6 |
+| fsync | 265.7 / 1591.0, 250.8 / 1188.2, 250.5 / 917.1 | 158.5 / 322.9, 141.6 / 279.2, 138.4 / 384.2 |
+| close | 16.3 / 42.6, 15.6 / 37.6, 15.6 / 37.7 | 69.6 / 161.2, 61.6 / 521.7, 63.0 / 389.7 |
+| stat | 16.5 / 53.2, 15.8 / 43.1, 16.1 / 44.3 | 302.9 / 511.6, 325.3 / 482.0, 260.0 / 402.9 |
+| open | 8.7 / 60.4, 7.9 / 23.3, 8.3 / 23.5 | 218.2 / 514.8, 207.7 / 281.6, 181.0 / 292.3 |
+| read | 5.9 / 41.7, 5.6 / 17.6, 5.6 / 16.5 | 13.5 / 147.3, 114.7 / 167.4, 14.7 / 155.5 |
+| rename | 78.3 / 200.9, 69.6 / 140.2, 71.9 / 150.0 | 694.2 / 1831.4, 685.5 / 905.8, 572.6 / 861.4 |
+| unlink | 84.9 / 183.9, 81.4 / 148.8, 83.3 / 159.3 | 408.3 / 1242.0, 366.3 / 880.9, 329.2 / 753.3 |
+
+contended: p50 / p99 per run, µs (runs 1 to 3)
+
+| op | ntfs | slates |
+|---|---|---|
+| create | 177.8 / 364.2, 178.6 / 380.1, 174.3 / 390.0 | 1448.5 / 117413.5, 1571.3 / 131235.5, 1439.4 / 74444.1 |
+| write | 67.9 / 135.4, 68.7 / 140.0, 66.7 / 141.1 | 116.4 / 1791.4, 119.7 / 33415.5, 117.5 / 304.9 |
+| fsync | 314.0 / 1167.0, 319.1 / 2267.0, 318.6 / 750.2 | 180.5 / 421.5, 183.6 / 8622.1, 182.2 / 340.2 |
+| close | 23.9 / 58.0, 23.9 / 58.8, 23.5 / 57.2 | 93.2 / 166.1, 93.4 / 158.0, 93.5 / 168.2 |
+| stat | 40.1 / 85.0, 40.4 / 90.3, 39.7 / 88.4 | 346.3 / 33544.9, 345.5 / 12706.2, 345.4 / 19697.5 |
+| open | 19.4 / 51.5, 19.5 / 52.2, 19.5 / 55.1 | 233.5 / 982.5, 236.0 / 21963.2, 233.0 / 1246.4 |
+| read | 12.1 / 24.3, 12.1 / 26.5, 12.3 / 40.2 | 121.0 / 202.6, 122.7 / 9057.7, 121.9 / 209.3 |
+| rename | 158.0 / 320.4, 158.2 / 306.5, 156.8 / 313.6 | 817.6 / 30223.8, 826.0 / 32551.1, 816.7 / 32316.4 |
+| unlink | 156.8 / 355.3, 156.6 / 304.3, 155.5 / 311.1 | 465.5 / 32444.3, 471.1 / 33693.0, 463.8 / 27165.3 |
+
+WinFsp's `fsbench` after each run, in a directory of each, at its default counts (1,000 files for the file tests, 100
+passes over a 4 MiB file for the read and write tests, cached and not):
+
+| fsbench test | NTFS, s (runs 1, 2, 3) | slates, s (runs 1, 2, 3) | slates / NTFS (medians) |
+|---|---|---|---|
+| `file_create_test` | 0.10, 0.10, 0.10 | 0.99, 1.00, 0.96 | 9.9× |
+| `file_open_test` | 0.13, 0.13, 0.12 | 2.33, 2.43, 2.40 | 18.5× |
+| `file_overwrite_test` | 0.07, 0.07, 0.07 | 0.79, 0.79, 0.75 | 11.3× |
+| `file_attr_test` | 0.03, 0.04, 0.04 | 1.57, 1.57, 1.53 | 39.2× |
+| `file_list_test` | 0.03, 0.02, 0.04 | 0.52, 0.52, 0.50 | 17.3× |
+| `file_list_single_test` | 0.21, 0.22, 0.21 | 4.80, 4.85, 4.72 | 22.9× |
+| `file_list_none_test` | 0.19, 0.19, 0.18 | 8.56, 8.56, 8.50 | 45.1× |
+| `file_delete_test` | 0.06, 0.06, 0.06 | 0.32, 0.35, 0.33 | 5.5× |
+| `file_mkdir_test` | 0.09, 0.09, 0.09 | 0.91, 0.96, 0.96 | 10.7× |
+| `file_rmdir_test` | 0.06, 0.06, 0.06 | 0.30, 0.33, 0.34 | 5.5× |
+| `rdwr_cc_write_page_test` | 0.19, 0.20, 0.20 | 0.23, 0.25, 0.23 | 1.1× |
+| `rdwr_cc_read_page_test` | 0.16, 0.16, 0.16 | 0.18, 0.21, 0.18 | 1.1× |
+| `rdwr_cc_write_large_test` | 0.06, 0.06, 0.06 | 0.07, 0.07, 0.06 | 1.2× |
+| `rdwr_cc_read_large_test` | 0.04, 0.04, 0.04 | 0.04, 0.04, 0.04 | 1.0× |
+| `rdwr_nc_write_page_test` | 8.96, 9.38, 9.86 | 6.22, 6.38, 6.35 | 0.7× |
+| `rdwr_nc_read_page_test` | 17.09, 16.80, 15.78 | 5.20, 5.37, 5.23 | 0.3× |
+| `rdwr_nc_write_large_test` | 0.89, 0.87, 0.86 | 0.69, 0.71, 0.69 | 0.8× |
+| `rdwr_nc_read_large_test` | 1.54, 1.54, 1.44 | 0.61, 0.61, 0.63 | 0.4× |
+| `mmap_write_test` | 0.01, 0.01, 0.01 | 0.02, 0.02, 0.02 | 2.0× |
+| `mmap_read_test` | 0.04, 0.04, 0.04 | 0.05, 0.05, 0.05 | 1.2× |
+
+**What Windows x86_64's numbers name.** Every call that reaches slates crosses from the kernel to a WinFsp dispatcher
+thread in the daemon, from it to the volume's shard, and back. At the median a stat (an open, a query and a close on
+Windows) costs 260–325 µs and an open 181–218 µs, against NTFS's 16 µs and 8 µs. A create costs 926–981 µs against
+99–101 µs (9–10×), and a rename 573–694 µs against 70–78 µs. Cached reads and writes cost what NTFS's do (`fsbench`'s
+cached tests 1.0–1.2×), and uncached ones, which reach the disk on NTFS, are faster on slates (0.3–0.8×). WinFsp's own
+benchmark names the metadata as this one does: listing a directory by a pattern costs 23–45× NTFS, querying attributes
+39×, opening 18.5× and creating 9.9×.
+
+Two kinds of stall sit on top of that. Quiet, every run had one near 36 ms: several calls' maxima are 35.1–36.8 ms in
+runs 2 and 3, and 78–270 ms in run 1, while the probe's bare wake never took more than 2.3 ms. So the stall is in a
+call's path through WinFsp to the daemon, not in the machine's scheduling. With every core loaded, the calls' p99s reach
+tens of milliseconds: a create 74–131 ms, a rename 30–33 ms, an unlink 27–34 ms and a stat 13–34 ms, against NTFS's
+0.09–0.39 ms. On the same machine the probe's max reached 35–91 ms, so a thread that must be woken can wait out a long
+slice behind a CPU-bound one, and each slates call needs several such wakes.
+
+**Windows x86_64's largest lever: the daemon's turn on a busy CPU, with the stall near 36 ms.** Under load a create's
+p99 is 74–131 ms against NTFS's 0.36–0.39 ms, 190–350×; quiet, a stall near 36 ms sets every run's maximum. Next come
+the quiet medians: each call's crossing (a stat 16–21× NTFS), and above all a directory listed by a pattern (45×).
+
+### Windows arm64 (GitHub's `windows-11-arm`)
+
+Environment: an Arm processor (the profile reads `windows processor architecture 12 level 3401`), 4 vCPUs, 15 GiB,
+Windows 11 (10.0.26200.9711; image win11-vs2026-arm64 20261026.197.1), a VM; WinFsp 2.1.25156 with its arm64 driver;
+slates `3e7dd1b`, release, built for arm64 (the script's Git Bash is an x86_64 build emulated there, so its line reads
+AMD64); 2026-11-01 01:54–02:30 UTC; diagnostics run 41262592019. Arms: NTFS on the runner's C: drive (this image's
+temporary directory is there, not on a D: drive) and slates' WinFsp drive of a plain volume. Run 1 of 3:
+
+**quiet** (spinners 0 (one per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 23.6 µs, p99 42.3 µs, p999 445.4 µs, max 5857.2 µs over 34172 probes; 180.5 s). Each cell: p50 · p99 · p999 · max, µs.
+
+| op | ntfs | slates |
+|---|---|---|
+| create | 227.6 · 2235.4 · 4291.6 · 79818.5 | 203.5 · 313.4 · 1214.2 · 108328.7 |
+| write | 70.4 · 127.7 · 332.4 · 6094.8 | 96.9 · 261.2 · 10075.0 · 29647.4 |
+| fsync | 5864.1 · 31404.5 · 107775.3 · 515478.2 | 109.9 · 208.5 · 1271.9 · 16189.5 |
+| close | 53.2 · 104.9 · 703.3 · 5759.2 | 4886.4 · 6815.8 · 18259.0 · 34125.1 |
+| stat | 16.5 · 32.6 · 71.2 · 121.7 | 116.2 · 204.2 · 627.5 · 5236.5 |
+| open | 9.3 · 24.4 · 53.6 · 174.4 | 4187.8 · 5622.6 · 11702.1 · 121278.3 |
+| read | 6.8 · 13.8 · 36.5 · 49.1 | 47.9 · 102.4 · 183.2 · 2993.1 |
+| rename | 356.2 · 490.7 · 2812.4 · 27825.7 | 379.1 · 798.9 · 4852.0 · 42547.3 |
+| unlink | 108.9 · 191.7 · 39704.4 · 90937.3 | 243.1 · 418.1 · 2188.7 · 31395.3 |
+
+
+**contended** (spinners 4 (one per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 25.4 µs, p99 40.1 µs, p999 4061.4 µs, max 22507.3 µs over 72351 probes; 370.7 s). Each cell: p50 · p99 · p999 · max, µs.
+
+| op | ntfs | slates |
+|---|---|---|
+| create | 228.0 · 2500.6 · 4783.7 · 11846.0 | 236.1 · 681.0 · 15231.0 · 19892.3 |
+| write | 67.6 · 120.6 · 175.2 · 1954.7 | 100.9 · 350.1 · 16691.3 · 604778.6 |
+| fsync | 6390.7 · 12107.6 · 33900.2 · 58332.2 | 128.9 · 286.6 · 19745.0 · 315771.8 |
+| close | 52.0 · 100.7 · 173.2 · 13851.4 | 12681.6 · 33685.4 · 49771.3 · 91692.0 |
+| stat | 16.5 · 34.3 · 63.0 · 12013.4 | 149.5 · 770.2 · 21360.8 · 38060.8 |
+| open | 9.3 · 22.8 · 65.4 · 265.4 | 11801.0 · 38892.6 · 48046.2 · 65521.9 |
+| read | 6.9 · 13.3 · 65.0 · 7798.1 | 56.0 · 85.3 · 166.0 · 190.1 |
+| rename | 357.4 · 4535.6 · 14364.8 · 25272.2 | 438.6 · 14937.7 · 35510.4 · 85658.8 |
+| unlink | 102.9 · 238.9 · 43580.7 · 85116.1 | 302.2 · 8916.6 · 23820.9 · 90190.3 |
+
+All three runs (p50 / p99, µs):
+
+quiet: p50 / p99 per run, µs (runs 1 to 3)
+
+| op | ntfs | slates |
+|---|---|---|
+| create | 227.6 / 2235.4, 216.8 / 2313.9, 206.0 / 2181.1 | 203.5 / 313.4, 199.9 / 290.0, 185.7 / 257.4 |
+| write | 70.4 / 127.7, 65.8 / 120.8, 62.8 / 108.3 | 96.9 / 261.2, 95.6 / 219.8, 90.8 / 208.6 |
+| fsync | 5864.1 / 31404.5, 6050.5 / 11751.1, 5663.6 / 9608.5 | 109.9 / 208.5, 109.7 / 171.8, 106.4 / 155.1 |
+| close | 53.2 / 104.9, 50.3 / 94.4, 49.4 / 87.9 | 4886.4 / 6815.8, 4915.6 / 6451.0, 4688.0 / 5958.6 |
+| stat | 16.5 / 32.6, 16.6 / 32.2, 16.8 / 32.2 | 116.2 / 204.2, 116.2 / 194.7, 114.2 / 189.9 |
+| open | 9.3 / 24.4, 9.1 / 16.7, 9.1 / 17.8 | 4187.8 / 5622.6, 4155.0 / 5539.3, 3979.9 / 5528.4 |
+| read | 6.8 / 13.8, 6.6 / 16.0, 6.7 / 12.9 | 47.9 / 102.4, 46.6 / 71.2, 41.8 / 70.7 |
+| rename | 356.2 / 490.7, 314.5 / 432.7, 314.0 / 422.7 | 379.1 / 798.9, 384.4 / 867.5, 375.7 / 869.5 |
+| unlink | 108.9 / 191.7, 109.2 / 173.7, 107.8 / 171.3 | 243.1 / 418.1, 245.1 / 403.2, 244.1 / 409.8 |
+
+contended: p50 / p99 per run, µs (runs 1 to 3)
+
+| op | ntfs | slates |
+|---|---|---|
+| create | 228.0 / 2500.6, 233.8 / 2423.6, 240.6 / 2294.5 | 236.1 / 681.0, 228.9 / 1082.0, 254.4 / 573.2 |
+| write | 67.6 / 120.6, 70.3 / 125.7, 70.9 / 127.1 | 100.9 / 350.1, 104.1 / 528.3, 106.1 / 452.6 |
+| fsync | 6390.7 / 12107.6, 6297.0 / 11885.6, 5819.6 / 9666.6 | 128.9 / 286.6, 120.6 / 669.6, 140.1 / 380.7 |
+| close | 52.0 / 100.7, 54.0 / 99.5, 55.5 / 109.6 | 12681.6 / 33685.4, 5797.9 / 29626.5, 13213.4 / 34709.0 |
+| stat | 16.5 / 34.3, 16.6 / 33.5, 17.0 / 35.1 | 149.5 / 770.2, 149.9 / 371.5, 150.0 / 432.5 |
+| open | 9.3 / 22.8, 9.3 / 18.8, 9.4 / 19.1 | 11801.0 / 38892.6, 4495.5 / 25955.1, 15847.5 / 40391.1 |
+| read | 6.9 / 13.3, 6.7 / 13.5, 6.9 / 14.6 | 56.0 / 85.3, 52.2 / 88.2, 64.8 / 96.5 |
+| rename | 357.4 / 4535.6, 314.3 / 3153.0, 317.5 / 4051.6 | 438.6 / 14937.7, 442.7 / 14574.2, 451.3 / 16681.1 |
+| unlink | 102.9 / 238.9, 105.2 / 264.2, 107.2 / 257.0 | 302.2 / 8916.6, 307.4 / 8109.9, 312.4 / 10719.0 |
+
+WinFsp's `fsbench` after each run, at its default counts:
+
+| fsbench test | NTFS, s (runs 1, 2, 3) | slates, s (runs 1, 2, 3) | slates / NTFS (medians) |
+|---|---|---|---|
+| `file_create_test` | 0.26, 0.27, 0.24 | 0.23, 0.23, 0.25 | 0.9× |
+| `file_open_test` | 0.17, 0.20, 0.17 | 1.22, 1.17, 1.23 | 7.2× |
+| `file_overwrite_test` | 0.12, 0.11, 0.10 | 0.13, 0.14, 0.15 | 1.3× |
+| `file_attr_test` | 0.13, 0.15, 0.14 | 0.96, 0.96, 0.94 | 6.9× |
+| `file_list_test` | 0.10, 0.10, 0.10 | 0.41, 0.42, 0.43 | 4.2× |
+| `file_list_single_test` | 0.28, 0.32, 0.33 | 3.27, 3.24, 3.27 | 10.2× |
+| `file_list_none_test` | 0.24, 0.26, 0.19 | 6.63, 6.61, 6.75 | 27.6× |
+| `file_delete_test` | 0.11, 0.17, 0.11 | 0.27, 0.27, 0.27 | 2.5× |
+| `file_mkdir_test` | 0.27, 0.29, 0.24 | 0.20, 0.20, 0.23 | 0.7× |
+| `file_rmdir_test` | 0.11, 0.19, 0.11 | 0.16, 0.16, 0.16 | 1.5× |
+| `rdwr_cc_write_page_test` | 0.24, 0.24, 0.24 | 0.24, 0.24, 0.24 | 1.0× |
+| `rdwr_cc_read_page_test` | 0.21, 0.23, 0.22 | 0.21, 0.21, 0.21 | 1.0× |
+| `rdwr_cc_write_large_test` | 0.07, 0.07, 0.08 | 0.08, 0.09, 0.08 | 1.1× |
+| `rdwr_cc_read_large_test` | 0.05, 0.05, 0.05 | 0.05, 0.04, 0.06 | 1.0× |
+| `rdwr_nc_write_page_test` | 217.16, 184.15, 194.75 | 3.39, 3.27, 3.30 | 0.0× |
+| `rdwr_nc_read_page_test` | 33.11, 25.85, 30.92 | 4.15, 4.05, 4.11 | 0.1× |
+| `rdwr_nc_write_large_test` | 13.89, 13.31, 13.86 | 0.55, 0.54, 0.55 | 0.0× |
+| `rdwr_nc_read_large_test` | 2.17, 2.06, 2.12 | 0.52, 0.49, 0.50 | 0.2× |
+| `mmap_write_test` | 0.02, 0.02, 0.01 | 0.03, 0.04, 0.03 | 1.5× |
+| `mmap_read_test` | 0.04, 0.03, 0.02 | 0.06, 0.04, 0.05 | 1.7× |
+
+**What Windows arm64's numbers name.** Here NTFS sits on a slower drive than x86_64's. A create, a rename and a write
+cost about what NTFS's do (186–204 µs against 206–228 µs, 376–384 µs against 314–356 µs, 91–97 µs against 63–70 µs), a
+stat and a read about 7× (114–116 µs and 42–48 µs against 17 µs and 7 µs), an unlink 2.2× (243–245 µs against 108–109
+µs), and an fsync 106–110 µs against NTFS's 5.7–6.1 ms flush to that drive. Two calls do not. **Every open and every
+close of a file the run had written waits 4–5 ms**: an open 3,980–4,188 µs against NTFS's 9 µs, and a close 4,688–4,916
+µs against 49–53 µs, in all three runs. With every core loaded, their medians reach 4.5–15.8 ms and their p99s 26–40 ms.
+On x86_64 the same calls cost 181–218 µs and 62–70 µs, and `fsbench`'s open test, which opens files never written, costs
+1.2 ms an open and close on this runner. So the wait belongs to an arm64 path for a written file; this run does not say
+whose (the daemon's status named no WinFsp event after any run, so no purge round of A-190's ran). Under load the
+changes also reach 8–17 ms at p99 (a rename 14.6–16.7 ms, an unlink 8.1–10.7 ms, against NTFS's 3.2–4.5 ms and 0.24–0.26
+ms).
+
+**Windows arm64's largest lever: the 4–5 ms wait on every open and close of a written file.** It is 440–460× NTFS for an
+open at the median, it holds in every run, and in run 1 an open and a close are 9.07 ms of the 10.27 ms that slates'
+medians sum to for a file cycle (88%). Next, as on x86_64: the daemon's turn under load, and a directory listed by a
+pattern (`fsbench` 10–28×).
+
+
+

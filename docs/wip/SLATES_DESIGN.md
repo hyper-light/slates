@@ -7487,7 +7487,10 @@ form; the conformance and workload suites on both platforms.
   `EEXIST` on a folded duplicate.
 - T-4.7 (fault, Windows) Kill the daemon with open handles; expect the volume to disappear, the
   anchor to re-create it, and handles to error as documented.
-- T-4.8 (benchmark) Per-operation latency versus the RAM disk / RAM VHD on each platform.
+- T-4.8 (benchmark) Per-operation latency versus the RAM disk / RAM VHD on each platform. **Recorded 2026-11-01**
+  on all five platform cells, quiet and with every core loaded (`docs/wip/bench/fsbench/`; BENCHMARKS, "Every
+  platform's mount, like for like"): tmpfs and overlayfs on Linux, an APFS RAM disk and APFS on disk on macOS, and on
+  Windows, which ships no RAM disk, NTFS on the runner's disk.
 - T-4.9 (chaos, macOS) Sleep/wake the machine with an attached volume; expect reconnection and
   valid handles on both bridges.
 - T-4.10 (packaging) Fresh macOS machine: install the bundle, enable the extension, attach, run
