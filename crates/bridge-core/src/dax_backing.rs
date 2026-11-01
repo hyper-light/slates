@@ -19,8 +19,6 @@
 //! - The node is resolved and its attributes read through the bridge. A node it does not reach, or one that is not a
 //!   regular file, is refused.
 //! - A writable ask of an attachment that may not write is refused, as its writes are.
-//! - A file an in-process guest maps writable is refused: those stores go to the file's block past the write boundary,
-//!   where no backing could follow them (`Volume::dax_map_write` refuses the other way round).
 //! - A writable ask's file is copied up first (§4.6 DAX rights), as its first write would be. Beneath an overlay an
 //!   untouched file follows the disk (D-25), and an ingest comparing the guest's map against it would take each
 //!   outsider's edit for the guest's store.
@@ -120,8 +118,6 @@ pub enum Refused {
   Object,
   /// A writable ask whose file the bridge refused to copy up first: the bridge's refusal.
   Witness(VfsError),
-  /// A file an in-process guest maps writable.
-  Busy,
 }
 
 /// Why a write-back or a refill of one file did not happen.
@@ -455,16 +451,6 @@ impl DaxBackingSession {
       return Err(Refused::Malformed);
     }
     let (inode, size) = checked(bridge, cx, ask)?;
-    // An in-process guest storing into the file's own block bypasses the write boundary, so no backing of the file
-    // could be kept equal to the volume: the two routes exclude each other, refused before any effect.
-    if bridge
-      .dax_state()
-      .ok_or(Refused::Object)?
-      .registry
-      .has_writable_of(InodeNo(inode))
-    {
-      return Err(Refused::Busy);
-    }
     // A writable map's file is copied up first (§4.6 DAX rights), as its first write would be: what the volume serves
     // for it then changes only through the write boundary, so a write-back never takes an outsider's change for the
     // guest's. Its size is the witnessed file's.

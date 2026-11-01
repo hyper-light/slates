@@ -48,7 +48,7 @@ const PERMILLE: u64 = 1000;
 /// so a seal in progress never takes the whole step from the clients (the share a cooperative destroy
 /// takes, `verbs::DESTROY_SLICE_PERMILLE`).
 const ARCHIVE_SLICE_PERMILLE: u64 = 500;
-/// Shape: a slice of copy-bound work (§4.6 L2's periodic DAX shift; an image's build and merge, A-160) as a share of
+/// Shape: a slice of copy-bound work (a DAX backing's fill, ingest and refill, A-163; an image's build and merge, A-160) as a share of
 /// the shard's step budget, parts per thousand — the same half the archive walk and a granted landing take, and for
 /// the same reason: work in progress never takes the whole step from the clients.
 const COPY_SLICE_PERMILLE: u64 = 500;
@@ -63,13 +63,6 @@ const DESCRIPTORS_PER_COPY: u64 = 1;
 /// Format: the mappings one direct-map copy holds in the daemon: its view, placed inside a reservation one grain longer
 /// (`slates_mem::shared`), which the placement splits into at most three: the slack before, the view, the slack after.
 const MAPPINGS_PER_COPY: u64 = 3;
-/// How often §4.6 L2's moving target shifts a writable DAX window. §4.6 states the interval directly — "the
-/// modern window is 16–32 ms and RowPress leaks across refresh windows, so the migration interval is derived
-/// from the lowest hammer threshold, not the classic 64 ms". Slower than the window is a shift an attacker can
-/// hammer around; faster buys nothing, since the threshold is what it is.
-///
-/// Derived: the lowest hammer threshold of §4.6's stated 16–32 ms window, in nanoseconds.
-pub const DAX_SHIFT_CADENCE_NS: u64 = 16_000_000;
 /// Format: nanoseconds per second, to turn a bytes-per-second throughput into bytes per step.
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
 /// Shape: tasks a client may need across shards at once: its request forwarded to the owner
@@ -1131,8 +1124,8 @@ impl DaemonConfig {
     archive_slice_bytes(self.blake3_bytes_per_second, self.step_quantum_ns())
   }
 
-  /// The content bytes one slice of copy-bound work (§4.6 L2's periodic shift) may move on the calling shard now: half
-  /// its live step quantum at the machine's measured memcpy rate.
+  /// The content bytes one slice of copy-bound work (a DAX backing's fill, an image's build) may move on the calling
+  /// shard now: half its live step quantum at the machine's measured memcpy rate.
   pub fn copy_slice_bytes(&self) -> u64 {
     copy_slice_bytes(self.memcpy_bytes_per_second, self.step_quantum_ns())
   }

@@ -2904,16 +2904,19 @@ validated within derived caps before access. In-flight requests, mapped bytes, c
 replies consume the attachment's credits; cancellation and revocation reclaim them under an
 owned terminal step. Separate virtqueues alone do not provide §4.9's end-to-end QoS.
 
-DAX, if exposed, may map only verified immutable content while that version is pinned. Every
-page visible to a guest must contain only bytes it is authorized to see, including page padding
-and neighboring chunks; mappings must be revoked before reuse or `advance` completes. Mutable
-content goes through the VFS write boundary so witness, journal, quota and lease checks run.
-The baseline contract does not require DAX; a requested DAX capability cannot be advertised
-until mapping isolation, pinning and teardown have been established for that VMM.
+DAX, if exposed, maps a range of the file's backing: an object of the attachment's own that holds
+only that file's bytes, which the VFS write boundary keeps equal to the file before any change
+returns, so no window is ever revoked or reused under a guest (A-163, A-168, A-195). Every page
+visible to a guest must contain only bytes it is authorized to see, including page padding and
+neighbouring files' bytes, which a backing holds by construction; a moved view (`advance`) refills
+the backings before the guest sees anything more. A guest's stores through a writable window reach
+the volume only through the VFS write boundary, at its sync points, so witness, journal, quota and
+lease checks run. The baseline contract does not require DAX; a DAX capability is advertised only by
+a binding a live guest has run over these backings (AC-9.7).
 
 The same capability serves a **same-kernel** consumer — a host process, or a container or pod that shares the
-daemon's kernel — with no virtual machine and no copy (A-135). The content arena's pages are the same pages a guest
-reaches through DAX; a local reader `mmap`s them directly. The agent's volume is always co-located with the agent
+daemon's kernel — with no virtual machine and no copy (A-135). A per-file copy, the kind of object a guest's DAX
+window maps (A-168), is what a local reader `mmap`s directly (A-171). The agent's volume is always co-located with the agent
 (its arena DRAM is on the agent's own machine, §4.1), so this path is always physically available; it is negotiated
 at connect, never configured (R8, no mode switch): the daemon offers the direct map only to a peer the rendezvous
 authenticated as the **same uid** (`SO_PEERCRED`, §4.7), and then only if the descriptor it would send authorizes
@@ -3156,6 +3159,10 @@ daemon through the rendezvous's socket file (A-187).
 >   gate, so slates' own device under crosvm on arm64 is owed.
 > - **Owed:** every other cell, each to a named goal.
 
+> **Superseded 2026-11-01 (A-195).** The gate below is removed with every window over the arena's blocks: a guest's
+> window maps its file's backing (A-168), which needs no pin, registry or revoke. Kept as the record of what was built,
+> and of the escapes it closed.
+>
 > **Status (DAX gate, 2026-10-12).** Mapping isolation, pinning and teardown are **built in the VFS** and proven by
 > use (`crates/vfs/src/dax.rs`, `crates/vfs/tests/dax.rs`, 21 tests; `crates/mem/src/arena.rs` pin set, 6 tests,
 > Miri-clean; recovery oracle 39/0). **Pinning:** a mapped block is pinned in the arena
@@ -3177,6 +3184,13 @@ daemon through the rendezvous's socket file (A-187).
 > the version a mapping pins riding the fenced retention protocol) is recorded in `GAPS.md` and is the next step. DAX
 > stays unadvertised and a DAX request is refused `AttachmentUnsupported` until both are done.
 
+> **Amended 2026-11-01 (A-195).** No window maps the arena's blocks any more; each maps a per-file backing. Item 1's race
+> has nothing left to race: no window is torn down under a guest, and a backing lives while any window maps it (the
+> device keeps a backing whose window it could not unmap). Item 2's registry cap went with the registry: a guest's
+> windows are bounded by its window (one a granule at most), its backings by the shard's fill budget, and its requests
+> by the §4.9 credit window. Of item 3's layers, L0, L1's zones, L2 and B2 were the arena's and are removed; the backed
+> route's L1 stands.
+>
 > **DAX multi-tenancy threat model (2026-10-14).** With the strict per-volume spatial separation above, a guest
 > reaches only its own file's pinned, per-volume arena block (the inode number carries the volume prefix, distinct
 > and never reused across volumes), so cross-tenant *memory* leakage — the shared-host-page-cache hazard of naive
@@ -3220,7 +3234,8 @@ daemon through the rendezvous's socket file (A-187).
 >    Row Refresh, and not co-locating untrusted tenants on adjacent rows. On top of that floor slates runs a layered
 >    software defence whose per-event cost is bounded and whose memory footprint stays **capped** — the agentic-scale
 >    answer to quarantine exhaustion (there is nothing to quarantine):
->    - **L0 — opt-in gate (built, 4b411da9; its premise corrected 2026-10-31, A-193).** Writable DAX into the arena is
+>    - **L0 — opt-in gate (built, 4b411da9; its premise corrected 2026-10-31, A-193; removed 2026-11-01 with the arena
+>      windows, A-195).** Writable DAX into the arena is
 >      off by default, and `Volume::dax_map_write` refuses `NotPermitted` until the owner opts in
 >      (`Volume::enable_writable_dax`). **The gate bounds a guest's stores into slates' content. It does not bound
 >      hammering, because reading alone hammers.** The original study corrupted nearby data "by reading from the same
@@ -3241,7 +3256,7 @@ daemon through the rendezvous's socket file (A-187).
 >      in one huge page where the host can.
 >      - *slates' own device* tells its VMM where each piece of a window lies, so its backings are **guarded**: the file's
 >        bytes lie in the interiors of consecutive pages, and the first and last chunk window of every page (64 KiB on a
->        4 KiB-paged host, `slates_vfs::content::chunk_bytes`, the slot the arena's zones hold as guard rows) are held
+>        4 KiB-paged host, `slates_vfs::content::chunk_bytes`, the slot the arena's zones held as guard rows) are held
 >        empty. A guest's 2 MiB window is mapped as two pieces, each inside one page's interior (an interior is 1,920 KiB,
 >        fifteen 128 KiB parts, so every 2 MiB range is exactly two pieces), and no window ever maps a guard. Each placed
 >        page is then one huge page with its guard rows, CATT's shape (Brasser et al., USENIX Security 2017) as the
@@ -3258,7 +3273,7 @@ daemon through the rendezvous's socket file (A-187).
 >      1. slates' view of the page is mapped congruent with the object, as the arena's views are (`crates/mem/src/shared.rs`);
 >      2. one byte of the page is read, so the object holds a page there, since a shmem collapse of a range holding no
 >         page stops at `SCAN_TRUNCATED` (`mm/khugepaged.c`);
->      3. `MADV_COLLAPSE` is asked about the view's span, and its verdict decides, as it decides for the zones.
+>      3. `MADV_COLLAPSE` is asked about the view's span, and its verdict decides, as it decided for the zones.
 >
 >      The device then sends the window's pieces together, its ring's room asked for all of them first, answers the guest
 >      on the last acknowledgement, and unmaps each piece on its own, since a vhost-user unmap must name the whole of one
@@ -3280,7 +3295,7 @@ daemon through the rendezvous's socket file (A-187).
 >        page spans four rows a bank. Without a guard, a guest's window holds the page's edge rows, and the foreign rows
 >        beside them are hammered from one side. The guard keeps the guest off those edge rows wherever a guard slot
 >        covers a page's edge in each bank it touches. That holds where the interleaving lays 64 KiB in whole rows at the
->        page's ends, and it is the same bet the arena's zones make with the same slot.
+>        page's ends, and it is the same bet the arena's zones made with the same slot.
 >      - Where a row across every bank is 2 MiB or more, as with many channels, a placed page is less than a row of each
 >        bank. It buys no row isolation then, guard or not, only a bounded, contiguous set of rows the guest can reach.
 >
@@ -3298,7 +3313,7 @@ daemon through the rendezvous's socket file (A-187).
 >      placed every range. Asked once a range, a host out of huge pages would charge the shard that much for every range
 >      a guest maps, and a guest churning its ranges could make it pay again and again. So a decline likely to hold is
 >      remembered, the next ranges are served on base pages without asking (counted as declined), and the daemon's reap
->      tick re-arms it beside the zones' memo (`ShardsBackings::place`, `rearm_placement`). The kernel is asked at most
+>      tick re-arms it (`ShardsBackings::place`, `rearm_placement`). The kernel is asked at most
 >      once a tick per shard while it declines. A transient decline (`EAGAIN`, a page locked or held for the moment) is
 >      not remembered. Proven in a child process whose huge pages the kernel refuses (`PR_SET_THP_DISABLE`): three
 >      ranges ask the kernel once, and a re-arm asks again
@@ -3364,7 +3379,8 @@ daemon through the rendezvous's socket file (A-187).
 >      patterns defeat on 13 of 42 DDR4 modules (TRRespass, Frigo et al., IEEE S&P 2020), and not placing untrusted
 >      tenants on one host. Where a page spans several rows a bank, placement and the guard narrow what a guest's accesses
 >      reach to rows its own page holds. They never make a guest unable to flip a neighbour's bit.
->    - **L1 — zones + guard rows (built, `crates/vfs/src/daxzone.rs`).** A tenant's writable-DAX content is shifted
+>    - **L1 — zones + guard rows (built, `crates/vfs/src/daxzone.rs`; removed 2026-11-01 with the arena windows, A-195).**
+>      A tenant's writable-DAX content is shifted
 >      only inside a sandbox reserved for that tenant: one transparent huge page of the content arena, **verified**
 >      to have actually been given as one, cut into slots that are therefore distinct physical rows of the same
 >      page, with the first and last slot held by the zone as guard rows (CATT-style, Brasser et al., USENIX
@@ -3438,7 +3454,8 @@ daemon through the rendezvous's socket file (A-187).
 >      | Windows x86_64 (cross-lint, `x86_64-pc-windows-gnu`) | large pages need a privilege R10 refuses | refused | clippy clean over the Windows-buildable crates |
 >      A low-trust *sacrificial pool* may deliberately co-locate mutually-untrusted tenants so they absorb each
 >      other's leakage rather than the host — sound only paired with B2, and not built.
->    - **L2 — moving target (built, 68b4a9c5).** `Volume::dax_migrate` relocates a writable block to a physically
+>    - **L2 — moving target (built, 68b4a9c5; removed 2026-11-01 with the arena windows, A-195).** `Volume::dax_migrate`
+>      relocated a writable block to a physically
 >      different block under the two-phase revoke (the new block pinned and its mapping minted before the old is
 >      revoked-pending, the old held until the VMM confirms the unmap), so an attacker tracking physical rows loses
 >      the target; the inode follows, so non-DAX readers never see a stale block. Placement is a pseudo-random stride
@@ -3450,7 +3467,8 @@ daemon through the rendezvous's socket file (A-187).
 >      OS-shipped broker's PEBS/IBS, since a pure direct-write hammer is invisible to the daemon; this is why the
 >      strategy leans on *contain* (L1 zones) and *heal* (B2) over *detect*. slates is RAM-only, so the migration copy
 >      is DRAM↔DRAM with no write-endurance cost — the PMEM-endurance concern does not apply to slates' arena.
->    - **B2 — self-healing net (built, 6922fcf2; **wired 2026-10-19**).** `Store::dax_guard` records a read-only
+>    - **B2 — self-healing net (built, 6922fcf2; **wired 2026-10-19**; removed 2026-11-01 with the arena windows,
+>      A-195).** `Store::dax_guard` recorded a read-only
 >      mapping's clean BLAKE3 and a pinned clean copy; `Store::dax_scrub` catches a flip the daemon never saw and
 >      restores the block from the clean copy (`Healed`), or reports `Unhealable` if both are corrupt. Sound only
 >      for read-only content (a writable block changes legitimately, so a checksum cannot tell a flip from a
@@ -3481,11 +3499,11 @@ daemon through the rendezvous's socket file (A-187).
 >      only thing that can find it. A guard whose mapping has gone is dropped as the pass reaches it, so the list
 >      stays bounded without a second sweep.
 >    The modern window is 16–32 ms and RowPress leaks across refresh windows, so the migration interval is derived
->    from the lowest hammer threshold, not the classic 64 ms. **The arena's four layers are built, driven and proven
->    by use** in `crates/vfs/tests/dax.rs`: L0 refuses writable arena DAX by default, L1 contains a writable window
->    in a verified huge page with guard rows, L2 moves it every hammer window, and B2 finds and heals a flip in
->    read-only content. The backed route, which production serves, has its own placement (above) and none of the
->    other three, for the reasons stated there. Nothing in the set is a primitive without a caller. **The daemon→device half is settled and built** (2026-10-19). The earlier text left
+>    from the lowest hammer threshold, not the classic 64 ms. **The arena's four layers were built, driven and proven
+>    by use** in `crates/vfs/tests/dax.rs` until A-195 removed them with the arena windows (2026-11-01): L0 refused
+>    writable arena DAX by default, L1 contained a writable window in a verified huge page with guard rows, L2 moved it
+>    every hammer window, and B2 found and healed a flip in read-only content. The backed route, the only one now, has
+>    its own placement and guard rows (above) and none of the other three, for the reasons stated there. Nothing in the set is a primitive without a caller. **The daemon→device half is settled and built** (2026-10-19). The earlier text left
 >    a choice between a backend-initiated remap and "the revoke-and-refault path instead, and accept the tear"; the
 >    second is taken, because the objection recorded against it no longer holds. `Volume::dax_migrate` now enqueues
 >    `(inode, writable_only = true)` on the queue the device already drains every service pass
@@ -3500,7 +3518,7 @@ daemon through the rendezvous's socket file (A-187).
 >    `DaxPlacer::Message` a `SHMEM_MAP` parks the *guest's* chain and is finished by `complete_parked_map`, which
 >    exists to answer a guest request, so a daemon-initiated map needs a second, chain-less completion arm — new
 >    asynchronous state in the device's most delicate path, bought for one guest fault per shift.
->    **The trigger is built** (`daemon::dax_shift_loop`, 2026-10-19): once every hammer window — 16 ms, the lowest
+>    **The trigger was built** (`daemon::dax_shift_loop`, 2026-10-19; removed 2026-11-01, A-195): once every hammer window — 16 ms, the lowest
 >    of §4.6's stated 16–32 ms range — the shard shifts every live writable DAX window onto a different physical
 >    row of its tenant's sandbox, unconditionally, in cooperative slices of `copy_slice_bytes` (half the
 >    shard's live step quantum at the machine's measured memcpy rate) with a yield between them. Unconditional is
@@ -3517,6 +3535,10 @@ daemon through the rendezvous's socket file (A-187).
 >    The adaptive trigger from a privileged broker's PEBS/IBS — shifting only blocks showing a hammer signature,
 >    so honest agents pay nothing — is the optimization on top of this, not its precondition.
 
+> **Superseded 2026-11-01 (A-195).** The device no longer maps content blocks, so none of the revoke, recall or
+> re-validation below runs: both placers map per-file backings, a moved view refills them, and a snapshot recalls
+> nothing.
+>
 > **Status (DAX device-seam wiring, 2026-10-15).** The device side of the gate is built against the in-process
 > virtio-fs seam and proven by a simulated guest (no KVM): `crates/bridge-virtiofs` serves a real
 > SETUPMAPPING/REMOVEMAPPING over a `DaxCacheRegion` (the VMM cache fd overlaid with `MAP_FIXED`), and the three
@@ -3558,7 +3580,8 @@ daemon through the rendezvous's socket file (A-187).
 
 > **Status (slates' own device maps per-file backings for an out-of-process VMM, 2026-10-25, A-168).** For the
 > message placer (crosvm over vhost-user), this supersedes the content-block windows the records below describe:
-> pinning, the two-phase revoke and `reopen`-on-map now serve the fd-sharing placer and the in-process maps only. A
+> pinning, the two-phase revoke and `reopen`-on-map now serve the fd-sharing placer and the in-process maps only (until
+> A-195 removed them, 2026-11-01: both placers map backings now). A
 > real crosvm guest read stale bytes, then zeros, through the old windows after another path's write
 > (`docs/bugs/2026-10-24-slates-own-dax-window-shows-stale-bytes-then-zeros-after-another-paths-write.md`): a Linux guest
 > keeps the 2 MiB ranges it mapped and never asks again, the vhost-user specification forbids a map over a live one,
@@ -3583,6 +3606,52 @@ daemon through the rendezvous's socket file (A-187).
 > device adds what its windows do to the owner's status counters while it runs (`virtiofs.dax_*`, A-168). Killed under
 > the live map (step 4): a dead VM's unsynced stores land at the stream's end, and the daemon's death ends the VM with
 > nothing synced lost; the daemon kill found A-170.
+
+> **Status (one window kind: both placers map per-file backings, and no path maps the arena's blocks into a guest,
+> 2026-11-01, A-195).** The fd-sharing placer, an in-process VMM's window that the device overlays itself, maps per-file
+> backings as the message placer does: the same held SETUPMAPPING, fill, ingest, refill, placement and guarded layout
+> (`crates/bridge-virtiofs/src/backed.rs`, every Unix now). It overlays each piece of a window with `MAP_FIXED` of the
+> backing's object and acknowledges each at once, through the completion the message placer's acknowledgements use, so
+> a window is recorded whole or refused whole. A REMOVEMAPPING restores each piece's range to the inert reservation
+> before its answer. A piece whose unmap the host refuses keeps its window and its backing, which stays equal to the
+> file, counted `virtiofs.dax_unmaps_refused`: each overlay splits the reservation, so a process at `vm.max_map_count`
+> is refused `ENOMEM`.
+>
+> Everything only the arena's windows used is removed, not kept beside the backings (A-195 lists each): the VFS's DAX
+> gate (its registry, pins, two-phase revoke, `reopen`-on-map and reseal, and snapshot recall), the writable-DAX and
+> integrity-guard opt-ins, L1's zones, L2's shift, B2's net, the daemon's shift loop and scrub pass, the `Bridge`
+> trait's content-block methods, and the device's content-block map paths. The daemon starts no DAX loop of its own: its
+> reap tick re-arms placement and nothing else. A snapshot reader's `advance` marks the device's backings stale
+> (`Device::view_advanced`), and a snapshot recalls nothing. Admission still refuses DAX over the in-process seam, now
+> for the reason that holds: no in-process VMM has run a guest over it (AC-9.7).
+>
+> **Proven** 2026-11-01. The device suite's backed tests run over each placer a host has (`placers()` in
+> `crates/bridge-virtiofs/tests/device.rs`): the device's own window read and stored through for the fd-sharing placer,
+> and the stand-in front end for the message placer. The fixture holds every fd-sharing map and removal to the overlays
+> the device made and restored (`Device::dax_overlays`). The tests cover:
+> - every other path's change shown with no message;
+> - a guest's stores reaching the volume at FSYNC and at the device's end, and a refused write-back failing the FSYNC;
+> - one file's bytes and nothing else;
+> - hostile SETUPMAPPINGs refused with nothing made;
+> - a hostile front end's asks: overlapping SETUPMAPPINGs answered once the windows under them are unmapped, a map past
+>   the file's end reading zero, a removal of a range never mapped unmapping nothing, and a writable ask through a
+>   read-only attachment refused `EPERM`, with nothing held after;
+> - DESTROY and a disconnect unmapping every window and letting every backing go;
+> - the placement tests, which skip loudly where the PMD page is not a range;
+> - a property test: under random maps, removals, writes, cuts and seal sweeps, every live window equals the volume's
+>   bytes after every step, and nothing is held at the end.
+>
+> The admission suite drives the fd-sharing placer through the serve loop's own entry points (`dax_turn`, `service`,
+> `complete_barrier`, `reclaim`). On macOS, the fd-sharing placer alone: the virtio-fs suites 72 of 72 (device 33,
+> admission 10, serve 7, virtqueue 14, unit 8), the backed tests 15 run and the 3 placement tests skipped loudly; with
+> mem, vfs, bridge-core, bridge-fuse, the server's recovery oracle (41 of 41), shards (26, 1 ignored) and virtiofs (9)
+> suites and the client's shards suite (7), 774 tests passed and none failed. {{LINUX}} {{GUESTS}}
+>
+> **Superseded 2026-11-01 (A-195).** The records from here to the open-frontier decision's amendment describe windows
+> over the arena's blocks: the live binding of 2026-10-16, the multi-block limit, the open-frontier decision and its
+> `reopen`-on-map amendment. A-168 moved the message placer onto backings and A-195 the fd-sharing placer, and the code
+> they describe is removed. Sealing at rest no longer meets DAX: a backing is the attachment's own plaintext copy of the
+> file, kept equal to it and counted against the fill budget only while the attachment backs the file.
 
 > **Status (DAX: live vhost-user binding, inline files, and the at-rest-sealing limit, 2026-10-16).** The device-seam
 > wiring above is now proven against a *real* VMM, inline files map, and the file-shape scope with its one hard limit
@@ -12666,6 +12735,73 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
 - **Arm64 Windows proven** since (2026-10-27): the direct-map client tests, 20 of 20, on CI's `windows-11-arm` (run
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
+
+### A-195 — One window kind: the fd-sharing placer maps per-file backings as the message placer does, and every path that mapped the arena's blocks into a guest is removed (accepted and built 2026-11-01)
+Applied in the same change to: §4.6 (the DAX rule restated for backings; a status for the one window kind; the DAX
+gate's, the device-seam wiring's and the 2026-10-16 binding's records, and the open-frontier decision with its
+amendment, marked superseded; the threat model's arena layers L0, L1's zones, L2 and B2 marked removed, its first two
+residuals restated for backings, and the backed layer's wording no longer leaning on the zones), GAPS (the 2026-11-01
+entry; the gate checklist of 2026-10-18 and the gate's 2026-10-12 entry marked superseded), `docs/wip/BENCHMARKS.md`
+(the `dax_bench` and `dax_backing_ab` sections retired), `crates/vfs` (`dax.rs`, `daxzone.rs`, `tests/dax.rs` and the
+examples `dax_bench.rs` and `dax_backing_ab.rs` removed; `volume.rs`: the store's registry and zones, the writable-DAX
+and integrity-guard opt-ins, the revokes on write, truncate, snapshot and destroy, the reseal machinery and the
+pin-defers-seal check removed; `content.rs`: reopening in place, relocation and resealing removed; `error.rs`:
+`RecallInFlight` and `NoPhysicalIsolation` removed; `shards_backing.rs`: `of_file`; tests), `crates/mem` (`arena.rs`:
+the pin API and `block_backing` removed; `region.rs`: `backing_fd`, `backing_base`, `collapse_huge` and
+`huge_backed_bytes` removed; `error.rs`: `ExtentRefusal::NotPinned` removed; `shared.rs`: the placed mapping's and the
+huge-page advice's docs; tests), `crates/machine/src/facts.rs` (`huge_page_bytes`'s doc), `crates/bridge-core` (the
+`Bridge` trait's seven content-block methods and `DaxState::registry` removed, with their implementations in
+`volume_bridge.rs` and `scoped.rs`; `dax_backing.rs`: `Refused::Busy` removed; the scoped mount's confinement test moved
+onto the backed session), `crates/bridge-fuse` (the busy refusal's errno removed; docs), `crates/bridge-virtiofs`
+(`backed.rs` on every Unix; `device.rs`: both placers through one backed path, the fd-sharing placer's pieces overlaid
+and acknowledged at once, `view_advanced`, `dax_window_store`, `dax_overlays`, and the content-block windows, their
+teardown, the revoke drain and the remap rollback removed; `dax.rs`: `DaxCacheRegion::check_window`,
+`DaxPlacer::window_fits`; `admission.rs`: the revoke wrappers and `dax_window_revokes` removed, `view_advanced`,
+`dax_window_store`, the in-process gate's stated reason; `serve.rs`: the backed turn, the end's ingest and the counts on
+every Unix, a kick a moved view; `capability.rs`: the reason; tests: the backed fixture takes a placer, every backed test
+runs over both, a property test, and the admission test through the serve loop's entry points), and `crates/server`
+(`daemon.rs`: the shift loop and the scrub pass removed, the reap tick re-arming placement alone; `config.rs`:
+`DAX_SHIFT_CADENCE_NS` and the shift's mention in the copy slice removed; `verbs.rs`: the snapshot's recall removed;
+`direct_map.rs`: the exclusion with an in-process writable window removed; `shards/dax.rs`: `shards.dax_busy` removed;
+`virtiofs.rs`, `snapshot_view.rs`: the advance kick's docs).
+- **Decided by A-168**, for the day an in-process VMM ships: an fd-sharing window maps per-file backings as the message
+  placer's does. Built now, so production has one window kind and no path maps the arena's blocks into a guest.
+- **How the fd-sharing placer maps.** A SETUPMAPPING is held while its ranges fill a copy slice a turn, exactly as for
+  the message placer. The device then overlays each piece of the window (two under the guarded layout, A-194; one under
+  the identity) with `MAP_FIXED` of the backing's object, and acknowledges each at once through the completion the
+  message placer's acknowledgements use. A window is recorded whole or refused whole (`EIO`, the pieces that did map
+  unmapped again). A REMOVEMAPPING restores each piece's range to the inert reservation before its answer. Both placers
+  lay backings out guarded where ranges can be huge, since the device names each piece's place either way; the ingest,
+  the refill, placement and the fill budget are the same code for both.
+- **Removed, not layered** (CLAUDE.md banned item 7): everything only the arena's windows used.
+  - The VFS's DAX gate (`slates_vfs::dax`): the mapping registry; maps of the open frontier, of directories and of
+    inline files; the arena's pins and the two-phase revoke; `reopen`-on-map and its reseal; the snapshot recall and its
+    exclusion (`RecallInFlight`); the revokes on write, truncate, snapshot and destroy; B2's guards and scrub.
+  - The writable-DAX opt-in (L0) and the integrity-guard opt-in.
+  - L1's zones (`slates_vfs::daxzone`) and L2's shift (`dax_migrate`, `NoPhysicalIsolation`).
+  - The daemon's DAX loops: the shift loop, awake every 16 ms while any volume had writable DAX, and the scrub pass on
+    the reap tick. The shard's perpetual-task count (`LOOP_TASKS_PER_SHARD`, five) had never counted the shift loop.
+  - The arena's pin API, `ChunkArena::block_backing`, and the region accessors only those used.
+  - The `Bridge` trait's seven content-block methods, the device's content-block map paths, its revoke drain and remap
+    rollback, and admission's revoke wrappers.
+  - The backed session's refusal of a file an in-process guest mapped writable (`Refused::Busy`, `shards.dax_busy`) and
+    the direct map's matching exclusion: no such window exists any more.
+
+  14,237 lines of code and tests removed and 2,805 added (`git diff --shortstat`, 2026-11-01, before the docs).
+- **Kept:** the backed route whole (A-163, A-168, A-193, A-194); every shared object's congruent placement and the
+  huge-page advice, which a backing's views use (`crates/mem/src/shared.rs`); `region::collapse_huge`, which a placement
+  asks.
+- **What a moved view does now.** A snapshot reader's `advance` marks the device's backings stale, so each refills from
+  the new view before its guest sees anything more. No window is torn, for either placer.
+- **What the in-process seam still refuses.** Admission refuses DAX over the in-process seam (`DaxNotEstablished`), and
+  the capability report advertises none there. Isolation and teardown hold there by the same construction as over
+  vhost-user now, but no in-process VMM has run a guest over it, and a simulated driver cannot close a transport
+  guarantee (AC-9.7). The stated reason was "until mapping isolation, pinning and teardown have been established", which
+  this change made false; it now says what is missing.
+- **The unsafe budget** is unchanged: slates-vfs 0 of 0, slates-bridge-virtiofs 3 of 3, slates-mem 61 of 61
+  (`cargo xtask unsafe`).
+- **Proven** 2026-11-01 (§4.6 status): macOS's suites, CI's x86_64 and arm64 runners with both placers, three
+  red-checks of the fd-sharing placer, and real VMMs. {{AMEND}}
 
 ### A-194 — slates' own device lays its backings out guarded: the first and last chunk window of every page held empty, and each guest window mapped as two pieces from page interiors (accepted and built 2026-11-01)
 Applied in the same change to: §4.6 (the backed route's layer: the layout, what it buys, its cost, its limits),

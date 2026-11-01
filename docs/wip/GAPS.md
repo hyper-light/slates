@@ -7574,6 +7574,9 @@ Owed from this measurement:
 
 ### 2026-10-12: the DAX mapping gate is built in the VFS (§4.6, A-9, AC-4.12)
 
+**Superseded 2026-11-01 (A-195):** the gate is removed with every window over the arena's blocks; both placers map
+per-file backings (the 2026-11-01 entry). Kept as the record of what was built and the escapes it closed.
+
 "Mapping isolation, pinning and teardown" — the invariants §4.6 requires before a VMM's DAX capability may be
 advertised — are **built and proven by use**. An earlier experiment on this branch (`writable-dax`) demonstrated, with
 eight red tests, that *no daemon-side check can make writable DAX safe* (a hardware DAX guest accesses the page through
@@ -8591,6 +8594,11 @@ hierarchy's first question (need it at all, and that much?) and not a detail to 
 scrub:* a cadence with no anchor to derive from today, and inventing one would be a magic number (R3).
 
 ### 2026-10-18: what must be true before DAX is advertised — the gate checklist
+
+**Superseded 2026-11-01 (A-195):** rows 2 (B2) and 3 (L2) went with the arena windows they served, and the rest were
+closed before. DAX over the in-process seam now waits on one thing: a live in-process VMM's guest (AC-9.7). The
+commands below name suites that are gone (`crates/vfs/tests/dax.rs`, the device's `a_random_window_schedule`); the
+backed route's property is `every_live_window_shows_the_volumes_bytes_whatever_the_schedule`.
 
 Today's work closed several things and found several more, scattered across six records. This is the one place
 that answers "what is left before `admission::unsupported`'s `DaxNotEstablished` can be lifted", so the next
@@ -10357,6 +10365,31 @@ beside it (no unprivileged process sees a frame number), and L2's shift (no map 
   runs and pages that are not zero, so where the file has since become a hole or zeros, those stale bytes would stay in
   the backing. No test reaches a fill failing part-way. Placement does not widen it: a range is placed only once its
   fill finishes.
+
+### 2026-11-01: one window kind: the fd-sharing placer maps per-file backings, and the arena's windows are gone (A-195)
+
+**Built (A-195).** The fd-sharing placer (an in-process VMM's window, overlaid by the device itself) maps per-file
+backings through the same held SETUPMAPPING, fill, ingest, refill, placement and guarded layout as the message placer,
+each piece overlaid and acknowledged at once. Everything only the arena's windows used is removed: the VFS's DAX gate
+(registry, pins, two-phase revoke, `reopen`-on-map, snapshot recall), the writable-DAX and integrity-guard opt-ins,
+L1's zones, L2's shift, B2's net, the daemon's shift loop and scrub pass, the bridge trait's content-block methods and
+the device's content-block map paths: 14,237 lines of code and tests removed, 2,805 added. The unsafe budget is
+unchanged (slates-vfs 0, slates-bridge-virtiofs 3, slates-mem 61).
+
+**Closed by removal:**
+- the shift loop's wake: it polled at 16 ms while a volume held writable DAX, and the fix owed was for the opt-in to
+  wake it (§4.6, L2's trigger); neither the opt-in nor the loop exists now;
+- L2's device-side remap (2026-10-18), B2's wiring, and the pin ledger between the arena and the device: their
+  subjects are gone;
+- the in-process gate's stated reason, which named pinning as missing; it now names what is: a live guest (AC-9.7).
+
+**Proven** 2026-11-01 (§4.6 status). On macOS, the fd-sharing placer: the virtio-fs suites 72 of 72, with mem, vfs,
+bridge-core, bridge-fuse, the server's recovery oracle 41 of 41, its shards and virtiofs suites and the client's shards
+suite, 774 tests passed, none failed. {{GAPS}}
+
+**Owed:**
+- a live in-process VMM's guest over the fd-sharing placer, before admission lifts `DaxNotEstablished` (AC-9.7);
+- B2's net over backings and the Shards route's guard rows, as A-193 and A-194 left them.
 
 ### 2026-11-01: guard rows for the backings of slates' own device (A-194), and A-193 was wrong to call them impossible
 

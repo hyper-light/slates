@@ -185,8 +185,7 @@ pub trait VmmSeam {
 /// Why a requested form is unsupported (the `reason` of `AttachmentUnsupported`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnsupportedReason {
-  /// DAX was requested; the baseline contract does not require it and it cannot be advertised
-  /// until mapping isolation, pinning and teardown are established for the VMM (§4.6 A-9).
+  /// DAX was requested of a binding no live guest has run DAX over (§4.6 A-9, A-195; AC-9.7): the in-process seam.
   DaxNotEstablished,
   /// A notification queue was requested; `VIRTIO_FS_F_NOTIFICATION` is not offered.
   NotificationQueueNotOffered,
@@ -358,11 +357,6 @@ pub struct AdmissionCounters {
   pub passes: u64,
   /// Used-buffer notifications raised.
   pub notifications: u64,
-  /// Guest DAX windows torn down by a daemon-initiated revoke (§4.6 step 5): the non-vacuity counter for the
-  /// daemon→device coherence channel, so a silently-dead drain cannot pass for a working one. Bumped by
-  /// [`AdmittedDevice::request_revoke_inode`], whether called directly or from the per-pass drain in
-  /// [`AdmittedDevice::service`].
-  pub dax_window_revokes: u64,
 }
 
 /// A device admitted for one attachment: the seam, the device, the authority record, the credit
@@ -401,24 +395,14 @@ fn unsupported(request: &GuestAttachRequest) -> Option<UnsupportedReason> {
   if request.transport == GuestTransport::InheritedDescriptor && !cfg!(target_os = "linux") {
     return Some(UnsupportedReason::BindingNotBuilt);
   }
-  // The DAX advertisement gate. The message placer once sent the frontend the arena's WHOLE shared-object descriptor
-  // (`docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md`), then a `udmabuf` narrowed to
-  // the window (A-138). Since G-vhost it sends neither: a window maps the file's own backing, one object per attachment
-  // and file holding only that file's bytes (A-163's rule), so what a VMM is handed authorizes that file and nothing
-  // else by construction, with no host device needed (`crate::backed`, Linux).
-  //
-  // The fd-sharing placer's items: L1's zones are closed (2026-10-20 — they are transparent huge pages needing no
-  // privileged broker, and the two defects that kept them from forming are fixed). **B2's wiring and L2's device-side
-  // remap still block it.** The second is narrower
-  // than it sounds, and this comment overstated it on 2026-10-20 before being corrected the same day: a shift
-  // *is* delivered to the device — `dax_migrate` enqueues the inode on `pending_revokes`, a service pass
-  // drains it, the window is torn down under the two-phase revoke and the guest re-faults onto the row the
-  // content moved to (`a_shift_tells_the_device_so_the_guests_window_follows_the_content`). What is missing is
-  // the `MAP_FIXED` remap `dax_migrate`'s doc promised, so the cost is a fault per shifted window, not a guest
-  // left on a stale one.
-  // The checklist is `docs/wip/GAPS.md` (2026-10-18, "what must be true before DAX is advertised"), kept current.
-  // Read it before flipping this, not just the record above. DAX over the inherited-descriptor binding is the message
-  // placer's over backings (A-168), established; over the in-process seam it is the fd-sharing placer's, which is not.
+  // The DAX advertisement gate (§4.6; A-168, A-195). The message placer once sent the frontend the arena's WHOLE
+  // shared-object descriptor (`docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md`), then a
+  // `udmabuf` narrowed to the window (A-138). Since G-vhost it sends neither: a window maps the file's own backing, one
+  // object per attachment and file holding only that file's bytes (A-163's rule), so what a VMM is handed authorizes
+  // that file and nothing else by construction, with no host device needed (`crate::backed`). Since A-195 the
+  // fd-sharing placer maps the same backings in the same pieces, so isolation and teardown hold for the in-process seam
+  // by the same construction. What it lacks is a live guest: no in-process VMM has run one over it, and a simulated
+  // driver cannot close a transport guarantee (AC-9.7), so DAX over the in-process seam stays refused until one has.
   if request.dax && request.transport != GuestTransport::InheritedDescriptor {
     return Some(UnsupportedReason::DaxNotEstablished);
   }
@@ -551,6 +535,13 @@ impl<S: VmmSeam> AdmittedDevice<S> {
     &self.device
   }
 
+  /// Stores `bytes` into the DAX window at `moffset`, as the in-process guest's CPU stores through its page table
+  /// ([`Device::dax_window_store`]): whether the range lies in the fd-sharing placer's window. Unix only.
+  #[cfg(unix)]
+  pub fn dax_window_store(&mut self, moffset: u64, bytes: &[u8]) -> bool {
+    self.device.dax_window_store(moffset, bytes)
+  }
+
   /// The credit ledger.
   pub fn ledger(&self) -> &CreditLedger {
     &self.ledger
@@ -650,84 +641,27 @@ impl<S: VmmSeam> AdmittedDevice<S> {
       self.counters.notifications = self.counters.notifications.saturating_add(1);
     }
     self.counters.passes = self.counters.passes.saturating_add(1);
-    // §4.6 step 5: before the pass returns, honour any daemon-initiated DAX revokes the bridge enqueued since the
-    // last pass (a write, truncate or move of a mapped inode on this shard — [`slates_vfs::volume::Store`] enqueues
-    // the inode, and the bridge hands the queue over here). Draining in the same pass that served the guest's own
-    // requests tears each now-stale window down under this attachment's authority, with no separate wake channel for
-    // the in-process seam the device loop drives itself. Bounded: a mutation enqueues at most one inode, and each
-    // inode's live windows are finite. An empty queue — the common case, since DAX is unadvertised — is a no-op.
-    for (no, writable_only) in bridge.take_pending_dax_revokes() {
-      self.tear_down_inode_windows(no, writable_only, bridge, &cx);
-    }
     Ok(total)
   }
 
-  /// Revokes every live DAX window of inode `no` at the **daemon's** request (§4.6 step 5 — the daemon-initiated
-  /// counterpart of a guest's REMOVEMAPPING), under the attachment's authority (derived from `registry` as every
-  /// service pass derives it). Returns how many windows were torn down, or the registry's refusal if the
-  /// attachment's authority is gone. A no-op (`Ok(0)`) once the device is not live: a revoked device's windows are
-  /// swept by the terminal step ([`Self::reclaim`]). [`Self::service`] calls the same teardown from its per-pass
-  /// drain; this is the explicit verb a daemon (or a test) uses to force a revoke without a service pass.
-  pub fn request_revoke_inode(
-    &mut self,
-    no: u64,
-    bridge: &mut dyn Bridge,
-    registry: &Attachments,
-  ) -> Result<usize, ServeError> {
-    if self.state != AttachmentState::Live {
-      return Ok(0);
-    }
-    let cx = registry
-      .context(self.attachment)
-      .map_err(ServeError::Authority)?;
-    Ok(self.tear_down_inode_windows(no, false, bridge, &cx))
-  }
-
-  /// Re-validates the device's live DAX windows against its current view and tears any the view no longer backs
-  /// (§4.6 "revoke on advance"), under the attachment's authority. A snapshot reader's `advance` kicks its device
-  /// here, so its windows onto changed inodes are torn and the guest re-maps against the new view; a device whose
-  /// view did not change finds all windows current and tears none, so a volume-wide kick is self-scoping. Returns
-  /// how many were torn, or the registry's refusal if the attachment's authority is gone; `Ok(0)` once not live.
-  pub fn revalidate_windows(
+  /// The attachment's view moved (§4.6 "revoke on advance"; a snapshot reader's `advance` kicks its device here): every
+  /// backing is marked stale, so each is refilled from the new view before the guest sees anything more
+  /// ([`Device::view_advanced`]), under the attachment's authority. A device whose view did not change refills bytes
+  /// equal to what it holds, so a volume-wide kick is correct for every device it reaches. The registry's refusal if the
+  /// attachment's authority is gone; nothing to do once not live.
+  pub fn view_advanced(
     &mut self,
     bridge: &mut dyn Bridge,
     registry: &Attachments,
-  ) -> Result<usize, ServeError> {
+  ) -> Result<(), ServeError> {
     if self.state != AttachmentState::Live {
-      return Ok(0);
+      return Ok(());
     }
-    let cx = registry
+    registry
       .context(self.attachment)
       .map_err(ServeError::Authority)?;
-    let torn = self.device.revalidate_windows(bridge, &cx);
-    self.counters.dax_window_revokes = self
-      .counters
-      .dax_window_revokes
-      .saturating_add(u64::try_from(torn).unwrap_or(u64::MAX));
-    Ok(torn)
-  }
-
-  /// Tears down inode `no`'s live windows on the device under the already-derived `cx` and records them in the
-  /// non-vacuity counter. `writable_only` false tears every window (a write/truncate makes all stale), true tears
-  /// only the writable ones and keeps the read-only (a snapshot shares the block read-only). The shared core of the
-  /// per-pass drain and the explicit [`Self::request_revoke_inode`].
-  fn tear_down_inode_windows(
-    &mut self,
-    no: u64,
-    writable_only: bool,
-    bridge: &mut dyn Bridge,
-    cx: &OpContext,
-  ) -> usize {
-    let torn = if writable_only {
-      self.device.request_revoke_writable_inode(no, bridge, cx)
-    } else {
-      self.device.request_revoke_inode(no, bridge, cx)
-    };
-    self.counters.dax_window_revokes = self
-      .counters
-      .dax_window_revokes
-      .saturating_add(u64::try_from(torn).unwrap_or(u64::MAX));
-    torn
+    self.device.view_advanced(bridge);
+    Ok(())
   }
 
   /// Completes the chain a pass held for the owner's barrier (AUD-29-82): `captured` says whether the owner's
@@ -809,11 +743,11 @@ impl<S: VmmSeam> AdmittedDevice<S> {
     self.device.dax_map_ack_owed()
   }
 
-  /// One step of the message placer's backed DAX under the attachment's authority, before the service pass
+  /// One step of the device's backed DAX under the attachment's authority, before the service pass
   /// ([`Device::dax_turn`]): a refill, an ingest or a fill slice of at most `slice_bytes`, or a held chain answered,
   /// whose queue is notified when its driver asks. The serve loop serves no chain on a busy turn. Refused typed, and
-  /// nothing touched, once the device is revoked. Linux only.
-  #[cfg(target_os = "linux")]
+  /// nothing touched, once the device is revoked. Unix only.
+  #[cfg(unix)]
   pub fn dax_turn(
     &mut self,
     bridge: &mut dyn Bridge,
@@ -846,16 +780,16 @@ impl<S: VmmSeam> AdmittedDevice<S> {
   }
 
   /// Starts the ingest the guest's stores through its maps take before the device ends ([`Device::begin_end_ingest`]):
-  /// whether there is one. The serve loop runs it after its last pass and before the terminal step. Linux only.
-  #[cfg(target_os = "linux")]
+  /// whether there is one. The serve loop runs it after its last pass and before the terminal step. Unix only.
+  #[cfg(unix)]
   pub fn begin_end_ingest(&mut self, bridge: &mut dyn Bridge) -> bool {
     self.device.begin_end_ingest(bridge)
   }
 
   /// One slice of the end's ingest under the attachment's authority, of at most `slice_bytes`: `Some(wrote)` when it
   /// is done. Refused when the attachment's authority is gone (a revoked consumer's stores never land); the caller then
-  /// ends the ingest unwritten ([`AdmittedDevice::abort_end_ingest`]). Linux only.
-  #[cfg(target_os = "linux")]
+  /// ends the ingest unwritten ([`AdmittedDevice::abort_end_ingest`]). Unix only.
+  #[cfg(unix)]
   pub fn end_ingest_step(
     &mut self,
     bridge: &mut dyn Bridge,
@@ -868,15 +802,15 @@ impl<S: VmmSeam> AdmittedDevice<S> {
     Ok(self.device.end_ingest_step(bridge, &cx, slice_bytes))
   }
 
-  /// Ends the end's ingest unwritten, counted. Linux only.
-  #[cfg(target_os = "linux")]
+  /// Ends the end's ingest unwritten, counted. Unix only.
+  #[cfg(unix)]
   pub fn abort_end_ingest(&mut self) {
     self.device.abort_end_ingest();
   }
 
-  /// Lets every backing of the message placer go through the store's registry alone: the terminal step of a device
-  /// whose volume is gone ([`AdmittedDevice::abandon`]), which has no bridge to reach them through. Linux only.
-  #[cfg(target_os = "linux")]
+  /// Lets every backing go through the store's registry alone: the terminal step of a device whose volume is gone
+  /// ([`AdmittedDevice::abandon`]), which has no bridge to reach them through. Unix only.
+  #[cfg(unix)]
   pub fn release_backings(&mut self, backings: &mut slates_vfs::shards_backing::ShardsBackings) {
     self.device.release_backings(backings);
   }
@@ -923,12 +857,12 @@ impl<S: VmmSeam> AdmittedDevice<S> {
     let in_flight_at_revoke = self.revoke();
     let swept = match registry.context(self.attachment) {
       Ok(cx) => {
-        // Tear every live DAX window down (revoke, unmap, unpin) before the attachment sweep: a guest that
-        // disconnected or crashed without FUSE_DESTROY left its mapped blocks pinned, and only this terminal step
-        // still has the bridge to release them (§4.6 teardown). A clean unmount already drained them, so a device
-        // with no live window drains nothing here.
+        // Unmap every live DAX window and let every backing go before the attachment sweep: a guest that disconnected
+        // or crashed without FUSE_DESTROY left them, and only this terminal step still has the bridge to reach the
+        // store's backings through (§4.6 teardown). A clean unmount already released them, so a device with no live
+        // window releases nothing here.
         self.device.release_dax(bridge, &cx);
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         self.device.drain_dax_terminal();
         bridge.sweep_attachment(&cx).map_err(ReclaimError::Sweep)
       }
@@ -941,14 +875,9 @@ impl<S: VmmSeam> AdmittedDevice<S> {
   /// nothing to sweep — the references went with the volume — so the registry attachment is revoked and
   /// drained, the credits restored and the seam released, as [`AdmittedDevice::reclaim`] does after its sweep.
   ///
-  /// **Unlike [`AdmittedDevice::reclaim`], this cannot tear DAX windows down** — `release_dax` needs the bridge
-  /// this path does not have. Reached with live DAX windows it would leave the guest's page tables over blocks
-  /// that `Store::dax_revoke_volume` has already unpinned, which is the stale-TLB reuse the two-phase revoke
-  /// exists to prevent. **The destroy path cannot reach it that way today:** `destroy` revokes the volume's
-  /// devices first (AUD-29-68) and starts the volume teardown only once none serves the volume, so every device
-  /// has already run `reclaim` — with its bridge — before any block is unpinned. This is a note, not a defect:
-  /// whoever changes that ordering, or gives this path a bridge, has to keep it true. Gate checklist item 6 in
-  /// `docs/wip/GAPS.md`.
+  /// It cannot unmap DAX windows through a bridge, and needs not: a window maps its file's backing, an object of its own
+  /// that the window's mapping keeps alive whatever the volume does, so no window can reach another file's bytes. The
+  /// backings themselves go through the store alone ([`AdmittedDevice::release_backings`], the serve loop's end).
   pub fn abandon(&mut self, registry: &mut Attachments) -> Result<Reclaimed, ReclaimError> {
     if self.state == AttachmentState::Reclaimed {
       return Err(ReclaimError::AlreadyReclaimed);
