@@ -2861,6 +2861,15 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 > 0.5 ms, red-checked with no purge planned (the view stale for 10 s). The DAX matrix's Windows mount-route cells are
 > proven by it.
 
+> **Status (2026-11-01, Step 8 of the VFS and DAX plan: a purge is read back).** Under load a purge could count as done
+> and leave the view stale. Beside two CPU spinners a core and two I/O loops, 9 of 200 iterations on CI's x86_64 runner
+> (0 of 200 on arm64) kept the old bytes for 10 s with the purge made and nothing refused, since
+> `CcCoherencyFlushAndPurgeCache` reports a page it could not invalidate as a success status. Each purged piece is now
+> read back through Windows' cache and around it. A purge whose two reads differ is untaken (`winfsp.purges_untaken`)
+> and is made again on its own, after a wait that doubles from a tick, until it takes. One Windows keeps past the
+> volume's 300 s request timeout is given up and counted (`winfsp.purges_kept`). Under the same load after:
+> S8FIX_STATUS.
+
 **Base reads on macOS and Windows.** As on Linux, the daemon reads untouched base files through its own descriptor or
 handle into evictable cache chunks (one copy, `pread`/`ReadFile` on the owner shard's driver) and
 replies from arena pages as for any chunk. Listings use `getattrlistbulk` and
@@ -13412,6 +13421,43 @@ purge must be counted), `unsafe-budget.toml` (`slates-bridge-winfsp` 104 → 111
   page race, as any two writers of one page do; the flush the purge makes writes the program's page first.
 - **What it does not change.** The notification rounds (they still drop what Windows caches through handles), the
   mount's other requests, and every other transport.
+- **Amended 2026-11-01 (Step 8 of the VFS and DAX plan): a purge is read back, and one Windows did not take is made
+  again.** In main's Windows job the view once stayed stale for 10 s (run 41148561681, 2026-10-31). Beside two CPU
+  spinners a core and two I/O loops it stayed stale in 9 of 200 iterations on the x86_64 runner and in none of 200 on
+  arm64 (diagnostics runs 41326838360 and 41327264613). Each stale iteration made its purge, had its write dropped by
+  the host and refused nothing, and no read of the file reached the host after it; each of the 95 passing iterations of
+  the second run saw one. `CcCoherencyFlushAndPurgeCache` reports a page it could not invalidate as
+  `STATUS_CACHE_PAGE_LOCKED`, a success status, and WinFsp's `FspFileNodeFlushAndPurgeCache` turns it into
+  `STATUS_SUCCESS`, so a purge Windows did not take looked like one it took.
+  - **The check.** After each piece's write the purge reads the piece back through a cached open of the file and
+    through its own unbuffered open. A page Windows dropped is read from the host both times, so the two reads agree; a
+    page it kept answers the cached read with its old bytes. A piece whose reads differ makes the purge untaken, counted
+    `winfsp.purges_untaken`. A write that lands between the two reads makes them differ too, which costs one more
+    attempt, never a stale view.
+  - **The retry, and its bound.** The round stays taken. Only the untaken purge is owed again
+    (`slates_bridge_winfsp::retry`). Its first attempt waits one tick of the mount's pacing (the heartbeat over the
+    fleet's polls a period, 10 ms), and each next attempt waits twice as long as the one before. The task sends a
+    due purge to the mount thread as a purge-only command, one command (a round or a purge) out at a time, and waits
+    for the next due time or for any wake, so a wait never holds up a request.
+    - A purge is given up, counted `winfsp.purges_kept`, once its next attempt would come later than the volume's
+      request timeout after Windows first kept its page: 300 s, WinFsp's default, now set in the volume's parameters so
+      the horizon is the volume's own. WinFsp cancels a request left unanswered that long (`src/sys/ioq.c`), so by then
+      no I/O through the volume holds the page; what does is a program's own lock, which no purge can undo.
+    - With a 10 ms tick that is at most 14 attempts. The list holds at most one purge per open handle
+      (`MAX_OPEN_HANDLES`); an untaken purge past it is given up and counted kept.
+    - The first form of this fix put the round's cursor back and made the whole round again a tick later, without a
+      bound, as a deferred round is. It re-told every record, re-purged every file of the round, and a page a program
+      keeps locked would have been purged at full rate forever. It was replaced before it landed.
+  - **Applied in the same change to:** §4.6 ("Windows" and its status), GAPS, `crates/bridge-winfsp` (`purge.rs`:
+    `PurgeTarget`, `PurgeOutcome`, `purge_through`, tested on every host against a modelled file whose locked pages a
+    purge cannot drop; `retry.rs`, new: `PurgeRetries`, the doubling waits, the horizon and the bound, tested on every
+    host; `host.rs`: `DriveFile`, the purge's open made for reading too, each purge's outcome in `Purged`, the
+    purge-only command, the volume's request timeout set), `crates/bridge-core` (`MAX_OPEN_HANDLES` public),
+    `crates/server` (`winfsp.rs`: the retries, `winfsp.purges_untaken`, `winfsp.purges_kept`,
+    `winfsp.purge_retries`), `crates/cli` (`tests/winfsp.rs`: the purge count awaited, the untaken and kept purges
+    printed), `unsafe-budget.toml` (`slates-bridge-winfsp` 111 → 112, for the `ReadFile`), CLAUDE.md (the WinFsp
+    example's gotchas) and `docs/bugs/2026-11-01-a-winfsp-purge-windows-did-not-take-left-a-mapped-view-stale.md`.
+  - **Measured after,** under the same load (diagnostics run S8FIX_RUN): S8FIX_AMEND.
 
 ### A-189 — QEMU 11.1 maps the window of slates' own device: its generic vhost-user device takes the end by number, and the back end takes the memory tables QEMU sends as it maps (accepted and built 2026-10-29)
 Applied in the same change to: §4.6 (the DAX matrix's status and its list of what the platforms rule out), A-164 (the

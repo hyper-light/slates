@@ -1,0 +1,144 @@
+name: DIAG the WinFsp mapped view under load, the fix as it lands (Step 8.3, not for main)
+
+# Step 8.3 of the VFS and DAX plan: the mapped-view test alone, with the fix as it lands (each purge read back; one
+# Windows did not take made again on its own after a doubling wait, given up past the volume's request timeout), beside
+# the load that made 9 of 200 iterations stale on the x86_64 runner before the fix (two spinners a core, two I/O loops;
+# diagnostics runs 41326838360 and 41327264613) and beside a raised load (four spinners a core, four I/O loops of
+# 256 MiB, 60% of memory held resident), on both Windows runners. Every iteration's log is kept.
+
+on:
+  push:
+    branches: ['diag-s8-final-*']
+
+jobs:
+  loop:
+    name: the mapped-view test under the ${{ matrix.load }} load on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            load: base
+            iterations: 200
+          - runner: windows-11-arm
+            load: base
+            iterations: 100
+          - runner: windows-latest
+            load: raised
+            iterations: 100
+          - runner: windows-11-arm
+            load: raised
+            iterations: 100
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (x86_64)
+        if: runner.arch == 'X64'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl for the C the daemon links (arm64)
+        if: runner.arch == 'ARM64'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Install WinFsp, and check it installed
+        shell: pwsh
+        run: |
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            choco install winfsp -y --no-progress
+            if (Test-Path "C:\Program Files (x86)\WinFsp\bin") { break }
+            Start-Sleep -Seconds 30
+          }
+          if (-not (Test-Path "C:\Program Files (x86)\WinFsp\bin")) { Write-Error "WinFsp did not install"; exit 1 }
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Build the WinFsp tests
+        shell: bash
+        env:
+          AWS_LC_SYS_PREBUILT_NASM: "0"
+        run: cargo test -p slates-cli --test winfsp --no-run
+      - name: Load the runner, two spinners a core and two I/O loops
+        if: matrix.load == 'base'
+        shell: pwsh
+        run: |
+          $cores = [Environment]::ProcessorCount
+          for ($k = 0; $k -lt (2 * $cores); $k++) {
+            Start-Process -WindowStyle Hidden -FilePath pwsh -ArgumentList '-NoProfile', '-Command', 'while ($true) { }'
+          }
+          for ($k = 0; $k -lt 2; $k++) {
+            $file = Join-Path $env:RUNNER_TEMP "load-$k.bin"
+            $loop = "`$b = New-Object byte[] (64MB); while (`$true) { [IO.File]::WriteAllBytes('$file', `$b); [void][IO.File]::ReadAllBytes('$file') }"
+            Start-Process -WindowStyle Hidden -FilePath pwsh -ArgumentList '-NoProfile', '-Command', $loop
+          }
+          "started $(2 * $cores) spinners on $cores cores and 2 I/O loops"
+      - name: Load the runner, four spinners a core, four I/O loops and memory held resident
+        if: matrix.load == 'raised'
+        shell: pwsh
+        run: |
+          $cores = [Environment]::ProcessorCount
+          for ($k = 0; $k -lt (4 * $cores); $k++) {
+            Start-Process -WindowStyle Hidden -FilePath pwsh -ArgumentList '-NoProfile', '-Command', 'while ($true) { }'
+          }
+          for ($k = 0; $k -lt 4; $k++) {
+            $file = Join-Path $env:RUNNER_TEMP "load-$k.bin"
+            $loop = "`$b = New-Object byte[] (256MB); while (`$true) { [IO.File]::WriteAllBytes('$file', `$b); [void][IO.File]::ReadAllBytes('$file') }"
+            Start-Process -WindowStyle Hidden -FilePath pwsh -ArgumentList '-NoProfile', '-Command', $loop
+          }
+          $total = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
+          $hold = [int64]($total * 0.6)
+          $chunk = 256MB
+          $chunks = [int][math]::Floor($hold / $chunk)
+          $hog = "`$a = @(); for (`$i = 0; `$i -lt $chunks; `$i++) { `$a += ,(New-Object byte[] $chunk) }; while (`$true) { foreach (`$c in `$a) { for (`$j = 0; `$j -lt `$c.Length; `$j += 4096) { `$c[`$j] = 1 } }; Start-Sleep -Milliseconds 200 }"
+          Start-Process -WindowStyle Hidden -FilePath pwsh -ArgumentList '-NoProfile', '-Command', $hog
+          "started $(4 * $cores) spinners on $cores cores, 4 I/O loops, and $chunks x 256 MiB held of $([math]::Round($total / 1GB, 1)) GiB"
+      - name: The mapped-view test, the matrix's iterations
+        shell: bash
+        env:
+          SLATES_TEST_CLI: "1"
+          WINFSP_TEST_MOUNT: "1"
+          AWS_LC_SYS_PREBUILT_NASM: "0"
+        run: |
+          set +e
+          mkdir -p stale logs
+          stale=0
+          for i in $(seq 1 ${{ matrix.iterations }}); do
+            cargo test -p slates-cli --test winfsp -- --test-threads=1 --nocapture --exact \
+              a_mapped_view_through_a_winfsp_mount_after_another_paths_change > "logs/iteration-$i.log" 2>&1
+            code=$?
+            echo "== iteration $i exit $code: $(grep -E 'WINFSP MAPPED VIEW|WINFSP PURGES' "logs/iteration-$i.log" | tr '\n' ' ')"
+            if [ "$i" -eq 1 ]; then
+              echo "== iteration 1, every DIAG line:"
+              grep -E "DIAG|WINFSP" "logs/iteration-$i.log"
+            fi
+            if [ "$code" -ne 0 ]; then
+              stale=$((stale+1))
+              cp "logs/iteration-$i.log" "stale/iteration-$i.log"
+              grep -E "DIAG|WINFSP|panicked" "logs/iteration-$i.log"
+            fi
+          done
+          retried=$(grep -h "WINFSP PURGES" logs/iteration-*.log | grep -vc " 0 untaken and made again" || true)
+          kept=$(grep -h "WINFSP PURGES" logs/iteration-*.log | grep -vc " 0 given up" || true)
+          viewstale=$(grep -h "WINFSP MAPPED VIEW" logs/iteration-*.log | grep -c "MAPPED VIEW: stale" || true)
+          echo "== $stale of ${{ matrix.iterations }} iterations failed; $viewstale views stale; $retried had a purge untaken and made again; $kept had a purge given up"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stale-${{ matrix.load }}-${{ matrix.runner }}
+          path: stale/
+          if-no-files-found: ignore
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-${{ matrix.load }}-${{ matrix.runner }}
+          path: logs/
+          if-no-files-found: ignore
+          retention-days: 7

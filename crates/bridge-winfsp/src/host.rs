@@ -44,12 +44,14 @@ use slates_bridge_core::{Bridge, NodeAttr, ObjectId, OpContext, RenameFlags, Set
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::Kind;
 
-use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree};
+use windows_sys::Win32::Foundation::{
+  GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree,
+};
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::GetSecurityDescriptorLength;
 use windows_sys::Win32::Storage::FileSystem::{
-  CreateFileW, FILE_FLAG_NO_BUFFERING, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_DELETE, FILE_SHARE_READ,
-  FILE_SHARE_WRITE, OPEN_EXISTING, WriteFile,
+  CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_NO_BUFFERING, FILE_FLAG_WRITE_THROUGH,
+  FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile, WriteFile,
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
@@ -58,7 +60,7 @@ use crate::ffi::{
   PSecurityDescriptor, Pvoid, Pwstr, VolumeInfo, VolumeParams,
 };
 use crate::notify::OpenNames;
-use crate::purge::{Purge, pieces};
+use crate::purge::{Purge, PurgeOutcome, PurgeTarget, purge_through};
 use crate::{STATUS_SUCCESS, file_attributes, filetime_from_unix_ns, ntstatus};
 
 /// A typed WinFsp host failure (no panics; every refusal is a value).
@@ -129,8 +131,8 @@ const DISPATCHER_THREADS: u32 = 2;
 /// Derived: the requests that can wait in the channel to the shard: one per dispatcher thread, since each blocks for
 /// its reply before taking another.
 pub const REQUEST_BOUND: usize = DISPATCHER_THREADS as usize;
-/// Shape: the outcomes the mount thread can have unread at once: a notification round's (the task sends at most one
-/// round before reading its outcome) or the mount's, and the stop's after either.
+/// Shape: the outcomes the mount thread can have unread at once: a command's (the task sends at most one command, a
+/// round or a purge, before reading its outcome) or the mount's, and the stop's after either.
 const OUTCOME_BOUND: usize = 2;
 /// Shape: commands queued to the mount thread: one round out at a time.
 const COMMAND_BOUND: usize = 1;
@@ -1287,6 +1289,9 @@ impl Mounted {
     params.sectors_per_allocation_unit = SECTORS_PER_UNIT;
     params.max_component_length = MAX_COMPONENT_LENGTH;
     params.file_info_timeout = FILE_INFO_TIMEOUT_INFINITE;
+    // WinFsp's default, named here because a purge Windows did not take is made again until this passes
+    // (`crate::retry::REQUEST_TIMEOUT_MS`): the two are one number.
+    params.irp_timeout = crate::retry::REQUEST_TIMEOUT_MS;
     // A closed file's bytes are written back before its close's request (which publishes them) and its pages dropped:
     // a Windows program's write reaches every other path by its close, not at the cache manager's lazy write-back
     // seconds later. Without it, CI's first run (40249524066) read a file PowerShell had written and closed as 62 zero
@@ -1401,8 +1406,10 @@ impl Mounted {
   /// Purges each file's changed range from Windows' cache and from every view mapped of it (`crate::purge`): opens the
   /// file through the drive unbuffered and writes the range, a piece at a time, from a zeroed buffer. WinFsp flushes and
   /// purges each piece's range with `CcCoherencyFlushAndPurgeCache` before the write reaches the host, which answers the
-  /// write without applying it (its open is this process's, unbuffered). Nothing is purged where WinFsp cannot name an
-  /// open's process, since the host could then not tell a purge's write from a program's.
+  /// write without applying it (its open is this process's, unbuffered). Each piece is then read back through Windows'
+  /// cache and around it, and a purge whose pages Windows kept comes back untaken, for the server to owe it again
+  /// (`crate::retry`). Nothing is purged where WinFsp cannot name an open's process, since the host could then not tell
+  /// a purge's write from a program's.
   fn purge(&self, purges: &[Purge]) -> Purged {
     let count = u64::try_from(purges.len()).unwrap_or(u64::MAX);
     if purges.is_empty() {
@@ -1415,45 +1422,143 @@ impl Mounted {
       };
     }
     let piece = purge_piece();
-    let zeros = AlignedZeros::new(
-      usize::try_from(piece).unwrap_or(0),
-      usize::from(SECTOR_SIZE),
-    );
-    let done = purges
+    let piece_bytes = usize::try_from(piece).unwrap_or(0);
+    let zeros = AlignedBytes::new(piece_bytes, usize::from(SECTOR_SIZE));
+    let mut aligned = AlignedBytes::new(piece_bytes, usize::from(SECTOR_SIZE));
+    let outcomes = purges
       .iter()
-      .filter(|purge| self.purge_one(purge, zeros.bytes(), piece))
-      .count();
-    let done = u64::try_from(done).unwrap_or(u64::MAX);
+      .map(|purge| {
+        let outcome = self.purge_one(purge, zeros.bytes(), &mut aligned, piece);
+        (purge.clone(), outcome)
+      })
+      .collect();
     Purged {
-      done,
-      refused: count.saturating_sub(done),
+      outcomes,
       unavailable: 0,
     }
   }
 
-  /// One file's purge: whether its open and every write of its range succeeded.
-  fn purge_one(&self, purge: &Purge, zeros: &[u8], piece: u32) -> bool {
+  /// One file's purge (`crate::purge::purge_through`) through an unbuffered open of it, which writes the range and reads
+  /// it around Windows' cache, and a cached open made for the read through the cache.
+  fn purge_one(
+    &self,
+    purge: &Purge,
+    zeros: &[u8],
+    aligned: &mut AlignedBytes,
+    piece: u32,
+  ) -> PurgeOutcome {
     let path = wide_nul(&format!("\\\\?\\{}{}", self.mount_point, purge.path));
-    // SAFETY: `path` is a live NUL-terminated UTF-16 string for the call; no security attributes and no template.
-    let raw = unsafe {
-      CreateFileW(
-        path.as_ptr(),
-        GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        std::ptr::null(),
-        OPEN_EXISTING,
-        FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH,
-        std::ptr::null_mut(),
-      )
+    let Some(unbuffered) = open_through_drive(
+      &path,
+      GENERIC_READ | GENERIC_WRITE,
+      FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH,
+    ) else {
+      return PurgeOutcome::Refused;
     };
-    if raw == INVALID_HANDLE_VALUE || raw.is_null() {
-      return false;
-    }
-    // SAFETY: a handle the call above just opened and nothing else holds; owned from here and closed on drop.
-    let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
-    pieces(purge.offset, purge.len, piece)
-      .all(|(offset, len)| write_zeros_at(&handle, zeros, offset, len))
+    let mut file = DriveFile {
+      path: &path,
+      unbuffered,
+      cached: None,
+      zeros,
+      aligned,
+    };
+    purge_through(&mut file, purge, piece)
   }
+}
+
+/// Opens the file at `path` (a NUL-terminated UTF-16 path through the drive) with `access` and `flags`, sharing it
+/// whole: its handle, or `None` when Windows refused the open.
+fn open_through_drive(path: &[u16], access: u32, flags: u32) -> Option<OwnedHandle> {
+  // SAFETY: `path` is a live NUL-terminated UTF-16 string for the call; no security attributes and no template.
+  let raw = unsafe {
+    CreateFileW(
+      path.as_ptr(),
+      access,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+      std::ptr::null(),
+      OPEN_EXISTING,
+      flags,
+      std::ptr::null_mut(),
+    )
+  };
+  if raw == INVALID_HANDLE_VALUE || raw.is_null() {
+    return None;
+  }
+  // SAFETY: a handle the call above just opened and nothing else holds; owned from here and closed on drop.
+  Some(unsafe { OwnedHandle::from_raw_handle(raw) })
+}
+
+/// A file a purge works on through the drive ([`PurgeTarget`]): its unbuffered open, which writes the purge and reads
+/// around Windows' cache into a sector-aligned buffer, and a cached open for the read through the cache, made at the
+/// first such read.
+struct DriveFile<'p> {
+  path: &'p [u16],
+  unbuffered: OwnedHandle,
+  cached: Option<OwnedHandle>,
+  zeros: &'p [u8],
+  aligned: &'p mut AlignedBytes,
+}
+
+impl PurgeTarget for DriveFile<'_> {
+  fn write_zeros(&mut self, offset: u64, len: u32) -> bool {
+    write_zeros_at(&self.unbuffered, self.zeros, offset, len)
+  }
+
+  fn read_cached(&mut self, offset: u64, len: u32, out: &mut Vec<u8>) -> bool {
+    if self.cached.is_none() {
+      self.cached = open_through_drive(self.path, GENERIC_READ, FILE_ATTRIBUTE_NORMAL);
+    }
+    let Some(handle) = self.cached.as_ref() else {
+      return false;
+    };
+    out.clear();
+    out.resize(usize::try_from(len).unwrap_or(0), 0);
+    let Some(read) = read_at(handle, out, offset) else {
+      return false;
+    };
+    out.truncate(read);
+    true
+  }
+
+  fn read_uncached(&mut self, offset: u64, len: u32, out: &mut Vec<u8>) -> bool {
+    let Some(buffer) = usize::try_from(len)
+      .ok()
+      .and_then(|len| self.aligned.bytes_mut().get_mut(..len))
+    else {
+      return false;
+    };
+    let Some(read) = read_at(&self.unbuffered, buffer, offset) else {
+      return false;
+    };
+    out.clear();
+    out.extend_from_slice(buffer.get(..read).unwrap_or_default());
+    true
+  }
+}
+
+/// Reads into `buffer` at `offset` through `handle`, synchronously: how many bytes were read, or `None` when Windows
+/// refused the read.
+fn read_at(handle: &OwnedHandle, buffer: &mut [u8], offset: u64) -> Option<usize> {
+  let len = u32::try_from(buffer.len()).ok()?;
+  let mut overlapped = OVERLAPPED::default();
+  overlapped.Anonymous.Anonymous.Offset = u32::try_from(offset & u64::from(u32::MAX)).unwrap_or(0);
+  overlapped.Anonymous.Anonymous.OffsetHigh = u32::try_from(offset >> u32::BITS).unwrap_or(0);
+  let mut read = 0u32;
+  // SAFETY: a live handle opened synchronously, a buffer of `len` writable bytes, and an OVERLAPPED on this frame that
+  // only names the offset (a synchronous handle completes the read before the call returns).
+  let done = unsafe {
+    ReadFile(
+      handle.as_raw_handle(),
+      buffer.as_mut_ptr(),
+      len,
+      &mut read,
+      &mut overlapped,
+    )
+  };
+  if done == 0 {
+    return None;
+  }
+  usize::try_from(read).ok()
 }
 
 /// Format: the bytes of a purge write's piece when the system names no allocation granularity: one sector.
@@ -1472,20 +1577,21 @@ fn purge_piece() -> u32 {
     .unwrap_or(PURGE_PIECE_FLOOR)
 }
 
-/// A zeroed buffer whose first byte lies at a multiple of the alignment an unbuffered transfer asks (a sector), found
-/// within a larger allocation, so no allocator call needs to be unsafe.
-struct AlignedZeros {
+/// A buffer, zeroed when made, whose first byte lies at a multiple of the alignment an unbuffered transfer asks (a
+/// sector), found within a larger allocation, so no allocator call needs to be unsafe: a purge's zeros, and the bytes
+/// an unbuffered read lands in.
+struct AlignedBytes {
   storage: Vec<u8>,
   start: usize,
   len: usize,
 }
 
-impl AlignedZeros {
+impl AlignedBytes {
   /// `len` zeroed bytes aligned to `align`.
-  fn new(len: usize, align: usize) -> AlignedZeros {
+  fn new(len: usize, align: usize) -> AlignedBytes {
     let storage = vec![0u8; len.saturating_add(align)];
     let start = storage.as_ptr().align_offset(align).min(align);
-    AlignedZeros {
+    AlignedBytes {
       storage,
       start,
       len,
@@ -1498,6 +1604,12 @@ impl AlignedZeros {
       .storage
       .get(self.start..self.start.saturating_add(self.len))
       .unwrap_or(&[])
+  }
+
+  /// The aligned bytes, to write into (empty if the allocation could not hold them).
+  fn bytes_mut(&mut self) -> &mut [u8] {
+    let end = self.start.saturating_add(self.len);
+    self.storage.get_mut(self.start..end).unwrap_or_default()
   }
 }
 
@@ -1547,16 +1659,18 @@ impl Drop for Mounted {
 enum Command {
   /// Hand Windows this round of notification records, then purge these files' changed ranges (`crate::purge`).
   Notify { round: Vec<u8>, purges: Vec<Purge> },
+  /// Purge these ranges again, with no round: purges Windows did not take, now due again (`crate::retry`).
+  Purge { purges: Vec<Purge> },
 }
 
-/// What a round's purges came to (`Mounted::purge`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// What a command's purges came to (`Mounted::purge`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Purged {
-  /// Files whose ranges were written whole, so WinFsp purged them.
-  pub done: u64,
-  /// Files whose open or a write was refused (a file renamed or removed since the round, say).
-  pub refused: u64,
-  /// Files not purged because WinFsp cannot name an open's process, so the host could not tell a purge's write from a
+  /// Each purge made, in order, with what it came to: taken (Windows dropped the range's pages), untaken (a read through
+  /// Windows' cache served bytes the host no longer holds, so Windows kept a page and the purge is owed again,
+  /// `crate::retry`), or refused (its open, a write or a read back, as for a file renamed or removed since).
+  pub outcomes: Vec<(Purge, PurgeOutcome)>,
+  /// Purges not made because WinFsp cannot name an open's process, so the host could not tell a purge's write from a
   /// program's (`FspFileSystemOperationProcessIdF` absent).
   pub unavailable: u64,
 }
@@ -1568,6 +1682,8 @@ pub enum Outcome {
   /// A notification round's outcome, and what its purges came to (none when Windows did not take the round, which is
   /// gathered again).
   Notified(Result<Notified, WinFspError>, Purged),
+  /// What a purge-only command's purges came to.
+  Purged(Purged),
   /// The file system is unmounted and deleted; the thread is ending.
   Stopped,
 }
@@ -1630,6 +1746,15 @@ impl MountThread {
       .map_err(|_| WinFspError::MountThread)
   }
 
+  /// Sends the thread purges owed again, with no round; its [`Outcome::Purged`] follows. Refused when the thread is gone
+  /// or a command is already out (the caller sends one, a round or a purge, at a time).
+  pub fn purge(&self, purges: Vec<Purge>) -> Result<(), WinFspError> {
+    let commands = self.commands.as_ref().ok_or(WinFspError::MountThread)?;
+    commands
+      .try_send(Command::Purge { purges })
+      .map_err(|_| WinFspError::MountThread)
+  }
+
   /// Asks the thread to unmount and end: its [`Outcome::Stopped`] follows. The caller has dropped the request channel's
   /// receiver first, so no dispatcher thread waits on it while the dispatcher stops.
   pub fn stop(&mut self) {
@@ -1677,14 +1802,19 @@ fn run_mount(
       return;
     }
   };
-  while let Ok(Command::Notify { round, purges }) = commands.recv() {
-    let told = mounted.notify(&round);
-    let purged = if matches!(told, Ok(Notified::Taken)) {
-      mounted.purge(&purges)
-    } else {
-      Purged::default()
-    };
-    report(Outcome::Notified(told, purged));
+  while let Ok(command) = commands.recv() {
+    match command {
+      Command::Notify { round, purges } => {
+        let told = mounted.notify(&round);
+        let purged = if matches!(told, Ok(Notified::Taken)) {
+          mounted.purge(&purges)
+        } else {
+          Purged::default()
+        };
+        report(Outcome::Notified(told, purged));
+      }
+      Command::Purge { purges } => report(Outcome::Purged(mounted.purge(&purges))),
+    }
   }
   drop(mounted);
   report(Outcome::Stopped);

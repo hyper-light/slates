@@ -480,6 +480,24 @@ const PURGE_ECHOES: &str = "winfsp.purge_echoes";
 const PURGES_REFUSED: &str = "winfsp.purges_refused";
 /// Format: the daemon's counter of purges not made because WinFsp cannot name an open's process (A-190).
 const PURGES_UNAVAILABLE: &str = "winfsp.purges_unavailable";
+/// Format: the daemon's counter of purge attempts Windows did not take, each owed again (Step 8 of the VFS and DAX plan).
+const PURGES_UNTAKEN: &str = "winfsp.purges_untaken";
+/// Format: the daemon's counter of purges given up after Windows kept their page until the volume's request timeout.
+const PURGES_KEPT: &str = "winfsp.purges_kept";
+
+/// The daemon's counter `name` once it reaches `floor`, asked again until [`WAIT_FOR`] passes, else its last reading. A
+/// purge is counted after the view it purged has followed (its read back comes after its write), so a reading taken
+/// the moment the view follows can be early.
+fn counter_reaching(instance: &str, name: &str, floor: u64) -> u64 {
+  let started = Instant::now();
+  loop {
+    let count = counter(instance, name);
+    if count >= floor || started.elapsed() >= WAIT_FOR {
+      return count;
+    }
+    pause();
+  }
+}
 
 /// The daemon's counter `name`, summed over the shards `slates status` prints.
 fn counter(instance: &str, name: &str) -> u64 {
@@ -499,7 +517,9 @@ fn counter(instance: &str, name: &str) -> u64 {
 /// handle and open the file again. Expect: the view does what [`MAPPED_VIEW_FOLLOWS`] records (it follows), and so does
 /// the read through the second handle, since the purge drops the range from Windows' cache too; and the daemon counts a
 /// purge made and its write answered without being applied, so the view cannot follow by any other path. Before A-190
-/// both stayed stale for 10 s on CI's runner (runs 40249524066 and 40250856246).
+/// both stayed stale for 10 s on CI's runner (runs 40249524066 and 40250856246). A purge Windows did not take (a page it
+/// kept, read back stale through its cache) is counted untaken and made again on its own after a wait (Step 8 of the
+/// VFS and DAX plan): before that, 9 of 200 iterations under a CPU and I/O load stayed stale on CI's x86_64 runner.
 #[test]
 fn a_mapped_view_through_a_winfsp_mount_after_another_paths_change() {
   if !live_mount_runs() {
@@ -531,15 +551,18 @@ fn a_mapped_view_through_a_winfsp_mount_after_another_paths_change() {
   );
   // The purge's counters are read and printed before any assertion, so a failure carries what the mount did: no purge
   // planned, one refused, or one made that did not take (main's Windows job saw the view stale once, run 41148561681).
-  let (purges, echoes, refused, unavailable) = (
-    counter(&fixture.instance, PURGES_DONE),
+  // A purge is counted once its read back ends, after the view has followed, so the count of purges made is awaited.
+  let purges = counter_reaching(&fixture.instance, PURGES_DONE, 1);
+  let (echoes, refused, unavailable, untaken, kept) = (
     counter(&fixture.instance, PURGE_ECHOES),
     counter(&fixture.instance, PURGES_REFUSED),
     counter(&fixture.instance, PURGES_UNAVAILABLE),
+    counter(&fixture.instance, PURGES_UNTAKEN),
+    counter(&fixture.instance, PURGES_KEPT),
   );
   eprintln!(
     "WINFSP PURGES: {purges} made, {echoes} writes answered without being applied, {refused} refused, {unavailable} \
-     unavailable"
+     unavailable, {untaken} untaken and made again, {kept} given up"
   );
   assert_eq!(
     view_took.is_some(),

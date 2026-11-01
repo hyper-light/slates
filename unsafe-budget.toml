@@ -419,7 +419,10 @@ slates-bridge-fskit = 9
 # its call inside an open (which process made it); `CreateFileW` of a changed file through the drive, unbuffered, the
 # `OwnedHandle` taking its handle, and `WriteFile` of each piece, which make WinFsp purge coherently; the write callback's
 # out-parameters for a purge's write, answered without being applied; and the cleanup's read of a purge's open-file.
-slates-bridge-winfsp = 111
+# Raised 111 -> 112 on 2026-11-01 (Step 8 of the VFS and DAX plan, the purge Windows did not take): `ReadFile` of each
+# purged piece, through the purge's unbuffered open and a cached one, which tells a purge Windows took from one whose
+# page it kept (`CcCoherencyFlushAndPurgeCache`'s `STATUS_CACHE_PAGE_LOCKED`, which WinFsp reports as success).
+slates-bridge-winfsp = 112
 # Raised 3 -> 5 on 2026-10-19 for `udmabuf.rs` (the `UDMABUF_CREATE` ioctl and the descriptor it returns), which
 # confined a guest's DAX window to a descriptor covering only that window
 # (docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md). Lowered 5 -> 3 on 2026-10-25
