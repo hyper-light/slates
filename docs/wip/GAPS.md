@@ -731,6 +731,16 @@ missing, or impossible with its source, and the order of work. Two gaps underlay
    paired places, which change with it: `anchor_hold`'s Windows arm answers that no anchor holds, and a connection's
    inbox holds requests already read from the kernel, so holding a connection must carry the inbox's bytes. A held
    Shards stream also adds the guest term to the inode reserve (`guest_listing_entries`).
+   - **The WinFsp mount: designed 2026-11-01 (A-198), being built (Step 9 of the VFS and DAX plan).** The anchor is to
+     hold three handles per mount: the volume's control handle, the drive link's handle and the mount's ledger. WinFsp
+     deletes a volume when the last handle to its control file object closes (`src/sys/volume.c`) and a drive letter
+     with its link's last handle (`src/dll/mount.c`). The next daemon serves the held volume through a file system it
+     builds with `FspFileSystemCreate` and points at the held handle. Each open's context becomes a ledger slot naming
+     its file, so a request on an open from before the takeover still finds it. The successor answers the requests the
+     dead daemon had taken from the ledger's in-flight slots, before its dispatcher starts. A process that is not the
+     anchor's child is refused the right to duplicate the held handles. Owed: the hold on Windows (Step 9.2), the held
+     mount and its 20-kill test on CI's x86_64 and arm64 runners (9.3), and the in-flight and second-daemon tests
+     (9.4). The NFS listener and the fleet's sockets stay open under this entry.
 
 **Closed 2026-10-26 by A-183:** the MCP HTTP edge on Windows, and the Windows datagram socket's inheritance and
 exclusive address (A-182's sibling). Its first Windows run found that a refusal closed at once was erased by the reset

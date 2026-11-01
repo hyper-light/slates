@@ -12778,6 +12778,96 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
 
+### A-198 — A WinFsp mount outlives its daemon: the anchor holds the volume's control handle, the drive's link and the mount's ledger, and the next daemon serves the held volume (accepted 2026-11-01, Step 9 of the VFS and DAX plan; designed, being built)
+Applied in the same change to: GAPS (gap 2 of the platform inventory). The build applies it to §4.6 "Windows",
+`docs/wip/platforms.md`, `crates/anchor`, `crates/server` and `crates/bridge-winfsp`, each in its own change.
+- **What it answers.** A WinFsp mount dies with its daemon (A-177: "the file system is the dead process's own, so
+  recovery ends its record"), where a FUSE mount is held by the anchor (A-61). WinFsp deletes a volume at the cleanup
+  of its control file object, that is when the last handle to it closes (`src/sys/volume.c`, `FspVolumeDeleteNoLock`,
+  which asserts `IRP_MJ_CLEANUP`), and the daemon held the only handle. The drive letter goes the same way:
+  `FspMountSet_Drive` (`src/dll/mount.c`) makes the `\??\X:` link a temporary object and keeps its handle, so the link
+  dies with its last handle. WinFsp v2.1, the source read on 2026-11-01.
+- **What the anchor holds.** Per WinFsp mount, three handles, which the daemon duplicates into the anchor before the
+  attachment record commits (as a FUSE device is sent before its record):
+  1. the volume's control handle, which keeps the volume;
+  2. the drive link's handle, which keeps the drive letter;
+  3. the mount's ledger: an unnamed section backed by the paging file (nothing on disk, R1) that the daemon writes as it
+     serves.
+
+  A detach, a destroy or a stop releases all three before the file system is deleted, so a mount that ends still loses
+  its volume and its drive at once.
+- **The drive is the daemon's own.** The daemon defines the drive letter itself, as `FspMountSet_Drive` does: it calls
+  `DefineDosDeviceW` with `DDD_RAW_TARGET_PATH`, opens the link with `DELETE`, makes it temporary and keeps its handle.
+  It no longer calls `FspFileSystemSetMountPoint`, so the handle is the daemon's to duplicate, and every daemon removes
+  the drive the same way (`DDD_REMOVE_DEFINITION | DDD_EXACT_MATCH_ON_REMOVE`, then the handle closed). The file
+  system's `MountPoint` stays null, so `FspFileSystemDelete` removes nothing it did not make.
+- **The next daemon serves the held volume.** It inherits the three handles and nothing else (A-183), with the held
+  records naming each mount.
+  - For each restored WinFsp attachment with a held volume, it calls `FspFileSystemCreate` with the mount's parameters.
+    That call builds the file system and the DLL's dispatcher state, whose thread-local key is made there and nowhere
+    else (`src/dll/fs.c`, `InitOnceExecuteOnce`).
+  - It then closes the throwaway volume that call made, and puts the held handle and the held volume's name in the
+    structure's public fields. `FSP_FILE_SYSTEM` is public, and WinFsp's header asserts its size (792 bytes on 64-bit,
+    `winfsp.h`).
+  - `FspFileSystemStartDispatcher`'s threads transact on that handle (`src/dll/fs.c`), and the driver checks no caller
+    process (`src/sys/volume.c`, `FspVolumeTransact`).
+  - A killed daemon cannot stop the volume first. The DLL stops it (`FspFsctlStop0`) only when a dispatcher's transact
+    fails, which a terminated thread never reaches.
+- **Each open's context survives.** Each open's context (`UserContext2`, kept per file object: `src/sys/create.c`,
+  `FileDesc->UserContext2`) becomes a slot in the ledger, where it was a pointer into the daemon.
+  - The slot holds the open's record: the bridge's handle, the inode and generation, and whether it is this process's
+    purge open (A-190). A successor reads every record its predecessor left.
+  - A request on an open from before the takeover names its file through its record. Reads and writes address files by
+    identity (`slates_bridge_core::Bridge::read`), so the file is all they need. Its close releases the bridge's handle
+    by the file's inode, which a successor does not hold in its store, so it gives back an open the recovery restored
+    (A-152, A-148: `release_restored_open`).
+  - The per-file-node word (`UserContext`) cannot carry the file. WinFsp shares a file node by name and keeps the first
+    open's value (`src/sys/file.c`, `FspFileNodeOpen`, which inserts the node by its name and takes an existing one), so
+    after another path replaced an open file a new open of its name would read the replaced file's inode.
+  - A dead daemon's purge open keeps its mark, so a purge write queued at the kill is still dropped, never applied.
+  - The ledger holds one slot per open the bridge allows (`MAX_OPEN_HANDLES`), with a typed refusal past it.
+- **Requests in flight at the kill.**
+  - Requests the kernel queued while no daemon served wait in WinFsp's pending queue, and the successor serves them.
+  - Those the dead daemon had taken wait in the processing queue until a response names them by hint
+    (`FspIoqEndProcessingIrp`), or until the volume's request timeout cancels them (`src/sys/ioq.c`,
+    `FspIoqRemoveExpired`, with `STATUS_CANCELLED` from `src/sys/iop.c`).
+  - The ledger keeps one slot per dispatcher thread. A guard the mount sets in place of WinFsp's own
+    (`FspFileSystemSetOperationGuardF`, then WinFsp's exported `FspFileSystemOpEnter`) writes the slot as each request
+    is taken, before WinFsp's guard serializes it:
+    the hint and the kind, and a Close or a Cleanup whole (at most `FSP_FSCTL_TRANSACT_REQ_SIZEMAX`, 16 KiB less 64).
+  - Before its dispatcher starts, the successor answers each slot through `FspFileSystemSendResponse`. A Close or a
+    Cleanup is carried out (its handle released, a delete made) and answered. Any other request is refused
+    `STATUS_CANCELLED`, the status WinFsp's own timeout gives.
+  - A slot whose request was answered already names a hint no request in processing holds, and WinFsp skips it
+    (`FspVolumeFastTransact`, "BOGUS").
+  - The gap left is a request taken but not yet at the guard: the DLL's few instructions after the transact returns.
+    The timeout refuses it.
+- **Coherence at takeover.** The successor must tell Windows of changes the dead daemon never told it of. Its first
+  turn notifies and purges (A-190, read back) every inode A-158 names: the owner's restored references and the inodes
+  the write-log replay wrote. It reaches each by the paths the volume gives it (`Volume::path_of_inode`, and
+  `paths_of_inode_walk` for an inode of several links), and seeds the mount's open names from them.
+- **A second daemon is refused.**
+  - A held handle passes only by inheritance, to the anchor's own next daemon.
+  - Another process could take it only by duplicating it out of the anchor or the daemon, which needs
+    `PROCESS_DUP_HANDLE` on that process. So each sets its own security to refuse that right to every other process of
+    the user, through an owner-rights entry as A-175's sections use. The anchor hands its child a process handle with
+    the one right the child needs to send its handles.
+  - A second daemon on the instance is refused by the rendezvous's owner (A-176, A-178).
+- **Tests** (Step 9.2 to 9.4; the live mount runs on CI's Windows runners only, since jupiter has no WinFsp):
+  - the hold across real processes on Windows: duplicated in, inherited by the next daemon only;
+  - the daemon killed 20 times under an open handle and a mapped view: the drive stays, each next read through the
+    handle returns the file's bytes, and the view follows a change made after the takeover, on x86_64 and arm64;
+  - a red-check with the volume handle not held, which loses the drive;
+  - a request in flight at the kill, answered or refused typed;
+  - a process that is not the anchor's child duplicating a held handle (refused), and a second daemon on the
+    instance (refused).
+- **Rejected.**
+  - Answering in-flight requests by WinFsp's timeout alone: 60 s at least (`FspFsctlIrpTimeoutMinimum`), and a Close
+    so refused leaks its open.
+  - The per-node word for the file (see above).
+  - Rebuilding the successor's handle store from the ledger (`Slab::insert_at`): the bridge's release already settles a
+    predecessor's handle by its file, as for FUSE, so a rebuilt store would only duplicate that accounting.
+
 ### A-197 — pmem over a handed copy: a socket route for every pmem VMM (accepted and built on Linux x86_64 2026-11-01, Step 6 of the VFS and DAX plan; Firecracker on arm64 owed)
 Applied in the same change to: A-186 (the copy's length), GAPS, `crates/ipc` (`protocol.rs`: `MapWrite`'s `granule`;
 `stream.rs`: `spawn_bound`), `crates/server` (`direct_map.rs`: the granule checked and the copy sized by it;
