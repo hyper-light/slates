@@ -45,6 +45,7 @@ mod callgrind;
 mod capabilities;
 mod conformance;
 mod kind;
+mod named_tests;
 mod ratchet;
 mod toolchain;
 mod tsan;
@@ -531,6 +532,7 @@ mod structural {
       check_property_persistence(package, &mut violations)?;
     }
     check_design_table(&root, &mut violations)?;
+    crate::named_tests::check(&root, &mut violations)?;
     if violations.is_empty() {
       println!(
         "structural: ok ({} shipped crates)",

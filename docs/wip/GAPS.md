@@ -763,6 +763,33 @@ The rest of the list:
   2026-10-26: the client binary 20 of 20 and the async driver 2 of 2, the Shards form 11 of 11, `slates shards` through
   the CLI 1 of 1 (run 40525669353), and since 2026-10-27 the WinFsp mount 4 of 4 (diagnostics run 40570394717).
 
+**Reconciled 2026-10-31 (the VFS and DAX plan's step 1).** `platforms.md` was checked against main's CI run
+41249775368 (slates 9cf0cc31, every job green), the test list of each arm64 lane in that run, the conformance records
+and the DAX matrix's recorded runs. Each built cell now names its lane, test or run.
+- **Unrun or owed before, proven now:**
+  - Windows arm64: the verbs, the host mount, the network export, the Shards route and the direct map. Its lane runs
+    the client suite whole (31 and the driver's 2), the WinFsp mount 4 of 4, the NFS suites 17, 8 and 7, and the
+    Shards suites.
+  - Linux arm64: the export (diagnostics run 40580252064), `slates vhost-user` (A-189's QEMU run), the Shards route,
+    Firecracker's pmem and a mount taken over under a guest's live map (G-arm64-guest, 2026-10-27), and the
+    conformance suites, the hermeticity tracer and the granted landing it drives (recorded on Docker Desktop's arm64
+    kernel, 2026-09-20 and 2026-09-27).
+  - macOS: the hermeticity tracer runs in the `conformance` lane (CI's record of 2026-10-24), not by hand.
+- **Corrected the other way:**
+  - Crash dumps on macOS and Linux arm64 are unrun: the dump test is Linux x86_64's CLI flow.
+  - Linux arm64 runs the verbs only as far as the maps need them.
+  - `crates/cli/tests/nfs_held.rs`, the proof of macOS's mount across a restart, is gated and no lane runs it.
+- **Judged:**
+  - `slates vhost-user` is declined on macOS (Ada, 2026-10-30), and the DAX matrix's QEMU macOS socket cell says so.
+  - It is impossible on Windows. QEMU's `meson.build` at v11.1.0 refuses it. crosvm 678337f67d speaks vhost-user there
+    only over its own pipes, with no fs device. Hyper-V has no vhost-user device.
+  - A-145 on Windows is missing: the supervisor restarts by path with no identity check (owed below, 2026-10-21's
+    entry).
+- **Kept honest by a check:** `xtask/src/named_tests.rs` refuses a cell of `platforms.md` or of `virtiofs.md` §8 that
+  names a test or a path the tree lacks, giving its line. It runs in `cargo xtask structural` and `cargo test -p xtask`,
+  and each document carries a generated list of where each named test is defined (`--ignored
+  regenerate_the_named_tests`).
+
 `8a-win-dumps` stays Ada's call.
 
 ### 8a-win-overrun. A Windows shard's park woke before its deadline (2026-10-26, closed 2026-10-26)
@@ -5108,8 +5135,10 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
   (2,473 of 2,524). `slates export` now prints the port beside the path (`port: N`, and `"port"` in `--json`; A-73,
   proven against the kernel mount's own port in `slates_mount_establishes_a_real_kernel_mount_and_unmount_removes_it`).
   Owed: the OCI report should name the NFS-volume form for Docker Desktop.
-- **Owed:** the read pass over the NFSv4.2 volume is 2–9× the host bind's (1.7–4.3 s against 0.46–0.82 s for 2,524
-  files). Every open is a round trip. NFSv4 read delegations (RFC 8881 §10.4) are the standard remedy, to measure.
+- ~~**Owed:** the read pass over the NFSv4.2 volume is 2–9× the host bind's (1.7–4.3 s against 0.46–0.82 s for 2,524
+  files). Every open is a round trip. NFSv4 read delegations (RFC 8881 §10.4) are the standard remedy, to measure.~~
+  **Struck 2026-10-31:** read delegations are built (A-78, 2026-10-04; "B-2 done" below). The read pass itself has not
+  been measured again since; the cross-platform mount baselines of the VFS and DAX plan (its step 2) measure it.
 - **Done (A-72):** trie removal frees the nodes it empties, and the op log's ring is capped at its budget. Rounds 3 to
   24 now grow the daemon +0.66 MB, consistent with the 512 MiB volume's op log still filling toward its charged
   5.4 MB.

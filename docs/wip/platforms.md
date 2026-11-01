@@ -11,13 +11,27 @@ This is the inventory of where each function stands, made 2026-10-26 from four s
 - what CI's lanes build and run (`.github/workflows/ci.yml`);
 - the DAX matrix (`virtiofs.md` §8, A-164), which this does not repeat.
 
-Each cell says one of:
-- **built**: the code exists and a test or CI lane runs it;
-- **built, unrun**: the code exists, but no test runs it on that platform;
+Reconciled 2026-10-31 (plan step 1) with main's CI run 41249775368 (slates 9cf0cc31, every job green), the test lists
+of both arm64 lanes in that run, the conformance records (`conformance.md`) and the DAX matrix's recorded runs.
+
+Each cell says one of the following, and a cell may judge its parts separately:
+- **built**: the code exists, and a CI lane, a test or a recorded run proves it on that platform, named in the cell;
+- **built, unrun**: the code exists, but nothing has run it on that platform;
 - **missing**: no code for that platform;
-- **impossible**: with its source.
+- **impossible**: with the platform's own source;
+- **declined**: Ada decided it is not to be done, with the date.
 
 Platforms: mac = macOS arm64; lx = Linux x86_64; la = Linux arm64; wx = Windows x86_64; wa = Windows arm64.
+
+A lane is a job of `.github/workflows/ci.yml`, named by its key:
+- `gates`: macOS and Linux x86_64; `cargo test --workspace`, then the CLI flow (`crates/cli/tests/cli.rs` with
+  `SLATES_TEST_CLI=1`);
+- `windows-lint` and `windows-nightly`: Windows x86_64;
+- `windows-arm64` and `linux-arm64`: each runs a named list of suites;
+- `live-guest` (QEMU) and `kind`: Linux x86_64;
+- `conformance` and `sdk`: macOS and Linux x86_64.
+
+A recorded run is a CI diagnostics run, cited by its id, or a run on a named machine, cited by its date.
 
 ## Foundational gaps
 
@@ -38,26 +52,26 @@ Each of these blocks several functions below, so it comes first.
 
 | function | mac | lx | la | wx | wa |
 |---|---|---|---|---|---|
-| Daemon, client and the verbs over the ring (volumes, attach, read, write, versions, work and merge, status) | built | built | built, unrun except the direct-map and FUSE tests | built (the native Windows lanes drive the whole verb set) | built, unrun: the arm64 lane runs `slates-mem`, the rings and the rendezvous, no daemon |
-| Landing and grants (`slates land`, `grant`, `audit`) | built | built | built, unrun | missing: `crates/land/src/os.rs` is Unix-only. Being built: `os_windows.rs`, G-shards-windows step 5 (slates-36) | missing (same) |
-| Host mount | built (NFS loopback) | built (FUSE) | built (FUSE, CI's arm64 lane) | built (WinFsp, CI only: jupiter has no WinFsp) | built, unrun (G-mount) |
-| A mount that outlives a daemon restart | built (the anchor holds the NFS listener; A-113) | built (the anchor holds the FUSE device; A-61) | built, unrun | missing: foundational gap 2 | missing |
-| A daemon restarted from the anchor's own image after an in-place upgrade (A-145) | missing: the anchor refuses the restart, as macOS gives a process no link to its running image (`crates/cli/tests/cli.rs`, `a_daemon_killed_after_its_anchors_executable_is_replaced_restarts_from_the_anchors_own_image`) | built | built, unrun | unjudged: Windows locks a running image against replacement but lets it be renamed | unjudged |
-| The network export (`slates export`, a fleet node's NFS export, Kubernetes PersistentVolumes) | built | built | built (KIND lane is x86_64; arm64 owed) | built (A-184): the NFS server's hostile-client and RPC-with-TLS suites on jupiter and in both x86_64 Windows lanes; a connection frames requests in its own inbox. Owed: a real Linux kernel client mounting it | built, unrun: the arm64 lane builds no server |
-| MCP server | built (stdio, loopback HTTP) | built | built, unrun | built (A-183): stdio and the loopback HTTP edge, one code path. The MCP test passes through the HTTP edge on jupiter and stops at landing's `Unsupported`; it joins the Windows CI lanes when landing runs there | built, unrun: the arm64 lane lints five crates and runs no daemon |
-| Fleet node (consensus, transport over UDP, takeover) | built | built | built, unrun | partly: the daemon's transport runs over AFD UDP, on a socket no child inherits and no other socket can bind on any address (A-183), and serves its export (A-184), but the anchor holds no serve sockets (gap 2) | partly (same) |
-| `slates exec` (a program sees a volume at a path) | missing: "needs Linux user and mount namespaces" (`crates/cli/src/main.rs`) | built | built, unrun | missing | missing |
-| Container bind (the OCI attachment) | built (the NFS mount bound in) | built | built (CI's arm64 lane) | built, unrun for Docker Desktop's Linux containers: the export (A-184) is the way in, through `host.docker.internal`, and no Docker Desktop on Windows has mounted it yet; impossible for process-isolated containers, measured (G-mount step 4: Docker's engine cannot see a WinFsp drive) | missing (same) |
-| `slates oci-runtime` and `oci-check` (judging the engine and the bind source) | built | built | built, unrun | missing: "facilities this platform does not have" (`crates/cli/src/main.rs`) | missing |
-| `slates vhost-user` (a VMM attaches slates' own virtio-fs device) | missing; QEMU 9.1's `memory-backend-shm` exists for vhost-user off Linux (to confirm from QEMU's source) | built (crosvm, the box) | built, unrun (crosvm's window is x86_64 only, but the device itself is not) | impossible (unconfirmed): no VMM on Windows offers a vhost-user front end; to confirm | impossible (unconfirmed) |
-| Shards route (`slates shards`, the daemon's stream, DAX) | built | built | missing a run: G-arm64-guest | built and proven (G-shards-windows, 2026-10-27): the daemon's pipe (A-179), `slates shards` handing it as `{handle}` (A-181), the DAX answer (A-180), and Shards' device and WHP window (its `gpu` 3b1e52a4, bc032060). On GitHub's windows-2025 a guest mounts, reads and writes a volume (3 of 3, run 40455011746) and maps a file with DAX: it stores and syncs, sees another attachment's change and a cut's zeros (3 of 3 in each of runs 40503725694, 40505101140 and 40521211082), red-checked with the window off (run 40521211082) | the ipc hand-off test runs (`stream_spawn`); the CLI test does not, as the lane builds no `slates-cli` |
-| Direct map (A-135: a same-kernel process maps a file with no copy) | built (A-173) | built (A-171) | built (CI's arm64 lane) | built (A-175) | built, unrun: G-arm64-host |
-| Base overlay (a volume over a host directory, read only) | built | built | built, unrun | built (`crates/base/src/windows.rs`) | built, unrun |
-| Disk images (`slates image build`, `merge`) and Firecracker | image verbs: built, unrun (`crates/cli/tests/guest_image.rs` is Linux's); Firecracker: none (Linux KVM only) | built (A-160, A-165) | Firecracker pmem: owed, G-arm64-guest | image verbs: built, unrun; Firecracker: none | none |
-| Python and Node SDKs | built (by-use tests in CI) | built | built, unrun | built, unrun: Windows lanes clippy them, no by-use test | built, unrun |
-| Crash dumps keep no secret | built (`RLIMIT_CORE` 0) | built | built | weaker, and Ada's call (GAPS `8a-win-dumps`, OPEN): no unprivileged `RLIMIT_CORE`, so `exclude_from_dumps` is `Ok(())` (`crates/cli/src/dumps.rs`). Unprivileged steps exist for the decision: `WerSetFlags(WER_FAULT_REPORTING_FLAG_NOHEAP)`, and `WerRegisterExcludedMemoryBlock` for each region as it is made | weaker (same) |
-| Hermeticity tracer (no write outside a granted target) | built (`sudo eslogger`; root and Full Disk Access, run by hand: `xtask/src/conformance/hermeticity.rs`) | built | built, unrun | missing (a branch exists: `windows-hermeticity-tracer`) | missing |
-| Conformance suites | built (pjdfstest over NFS) | built (pjdfstest, fsx, fsstress over FUSE) | built, unrun | missing (WinFsp has its own suite, `winfsp-tests`) | missing |
+| Daemon, client and the verbs over the ring (volumes, attach, read, write, versions, work and merge, status) | built: `gates` (`crates/client/tests/client.rs`, the server's suites) | built: `gates` | built for what the maps need: `linux-arm64` runs the client suite's 20 map tests, `reap_map`'s 4, the namespace tests and 7 CLI tests, which create, attach, write, map and destroy; the hermeticity record on Docker Desktop's arm64 Linux kernel also took a snapshot (`conformance.md`, 2026-09-20). Unrun there: the lifecycle of the typed verbs (`the_typed_verbs_drive_the_lifecycle_and_refusals_are_typed`), work and merge | built: `windows-lint` and `windows-nightly` run the client suite whole, one test at a time (`crates/client/tests/client.rs`, `crates/client/tests/driver.rs`) | built: `windows-arm64` runs the same suite, 31 tests and the driver's 2 (run 41249775368) |
+| Landing and grants (`slates land`, `grant`, `audit`) | built: `gates` (`crates/land/tests/oracle.rs`, `crates/land/tests/os.rs`) | built: `gates`, and `os.rs` again in release with `kill -9` | built: a recorded run, the hermeticity record on Docker Desktop's arm64 Linux kernel (`conformance.md`, 2026-09-20): `slates land`, `grant` and `land --grant`, 6 of 6 entries landed and verified on disk. No lane runs it there | missing: `crates/land/src/os.rs` is Unix-only. Being built: `os_windows.rs`, G-shards-windows step 5 (slates-36) | missing (the same) |
+| Host mount | built (NFS loopback): `gates`' CLI flow and `conformance` | built (FUSE): `gates`' CLI flow and `conformance` | built (FUSE): `linux-arm64` (`a_read_only_map_through_a_mount_follows_another_paths_change`, `a_shared_map_through_a_mount_writes_back_and_follows_another_paths_change`) | built (WinFsp): `windows-lint` and `windows-nightly` (`crates/cli/tests/winfsp.rs`, `a_volume_mounted_through_winfsp_is_read_and_written_by_windows_programs`); jupiter has no WinFsp | built (WinFsp's arm64 driver): `windows-arm64` runs `crates/cli/tests/winfsp.rs`, 4 of 4 (run 41249775368) |
+| A mount that outlives a daemon restart | built: the anchor holds the NFS listener and every accepted connection (A-113, 2026-10-06); `crates/cli/tests/nfs_held.rs` (`an_nfs_connection_outlives_its_daemons_kill_and_every_request_is_answered`) kills daemons under a userspace NFS client, since a kernel mount meeting a dead daemon has panicked this Mac. It is gated on `SLATES_TEST_CLI=1` and no lane runs it | built: the anchor holds the FUSE device (A-61); `gates`' CLI flow (`a_replacement_the_dead_daemon_never_delivered_does_not_outlive_the_takeover`, `a_fuse_mount_whose_daemon_was_killed_is_ended_by_the_restarted_daemon`) | built: a recorded run on the nested arm64 KVM host (G-arm64-guest, 2026-10-27), `a_daemon_killed_under_a_pmem_guests_live_map_is_taken_over_and_the_guest_goes_on`: the daemon killed under a guest's live map of an image file in a FUSE mount and taken over, the host's next write in the guest's map 133 µs later. No lane runs it there | missing: foundational gap 2 | missing (the same) |
+| A daemon restarted from the anchor's own image after an in-place upgrade (A-145) | missing: the anchor refuses the restart (`ExecutableReplaced`), as macOS gives a process no link to its running image; `gates`' CLI flow asserts the refusal (`a_daemon_killed_after_its_anchors_executable_is_replaced_restarts_from_the_anchors_own_image`) | built: `gates`' CLI flow (the same test) | built, unrun | missing: the anchor restarts from the path and checks nothing, since a running executable can be renamed aside on Windows and std has no stable file identity to check it against (`crates/anchor/src/supervise.rs`, `own_image`; owed, GAPS) | missing (the same) |
+| The network export (`slates export`, a fleet node's NFS export, Kubernetes PersistentVolumes) | built: `gates` (`crates/server/tests/nfs_hostile.rs`, `crates/server/tests/nfs_tls.rs`); the loopback mount is the same server | built: `gates`, and `kind` (kubelet mounts it over RPC-with-TLS) | built: a recorded run, the KIND export leg on GitHub's `ubuntu-24.04-arm` (diagnostics run 40580252064, 2026-10-27; the DAX matrix's Kubernetes arm64 row). No lane on main runs it there | built (A-184): `windows-lint` and `windows-nightly` run the hostile-client, RPC-with-TLS and write-back suites (`nfs_hostile`, `nfs_tls`, `nfs_writeback`); a connection frames requests in its own inbox. Owed: a real Linux kernel client mounting it | built: `windows-arm64` runs the same three suites, 17, 8 and 7 tests (run 41249775368) |
+| MCP server | built (stdio, loopback HTTP): `gates` (`crates/mcp/tests/mcp.rs`) | built: `gates` | built, unrun | built (A-183): stdio and the loopback HTTP edge, one code path. A recorded run on jupiter, 2026-10-26: `crates/mcp/tests/mcp.rs` passes through the HTTP edge and stops at landing's `Unsupported`. It joins the Windows lanes when landing runs there | built, unrun: `windows-arm64` lints `slates-mcp`, and no Windows lane runs its test (wx's reason) |
+| Fleet node (consensus, transport over UDP, takeover) | built: `gates` (`crates/server/tests/fleet.rs`) | built: `gates` and `kind` | built, unrun | built in part: the daemon's transport runs over AFD UDP, on a socket no child inherits and no other socket can bind on any address (A-183; `crates/rt/tests/udp.rs` in `windows-lint` and `windows-nightly`), and serves its export (A-184). Unrun as a node: no fleet test runs on Windows. Missing: the anchor holds no serve sockets (gap 2) | the same as wx; `crates/rt/tests/udp.rs` runs in `windows-arm64` |
+| `slates exec` (a program sees a volume at a path) | missing: "needs Linux user and mount namespaces" (`crates/cli/src/main.rs`) | built: `gates`' CLI flow (`the_launcher_refuses_a_path_it_would_have_to_create_and_leaves_the_host_untouched`) | built, unrun | missing | missing |
+| Container bind (the OCI attachment) | built (the NFS mount bound in): recorded runs through Docker Desktop on this Mac (`conformance.md`'s OCI container row, 2026-10-01: pjdfstest, fsx, fsstress and the workloads through the bind). CI's macOS runner has no Docker, so the CLI flow's container leg skips loudly there (`an_oci_container_consumes_the_host_attachment_through_the_runtime_bind`) | built: `gates`' CLI flow (`a_container_maps_a_file_through_the_bound_mount_and_follows_another_paths_change`, `a_rootless_container_maps_a_file_through_the_mount_and_follows_another_paths_change`) | built: `linux-arm64` (the same two tests) | built, unrun for Docker Desktop's Linux containers: the export (A-184) is the way in, through `host.docker.internal`, and no Docker Desktop on Windows has mounted it yet. Impossible for process-isolated containers, measured: Docker's engine cannot see a WinFsp drive (G-mount step 4); `a_winfsp_folder_bound_into_a_process_isolated_container` asserts the refusal in `windows-lint` and `windows-nightly` | the same as wx, by the same sources; the refusal's test skips loudly in `windows-arm64`, whose image has no Docker engine (run 41249775368) |
+| `slates oci-runtime` and `oci-check` (judging the engine and the bind source) | built: `gates`' CLI flow (`a_verified_container_source_is_checked_again_before_it_is_bound`) | built: `gates`' CLI flow (`a_linux_container_reaches_the_shared_mount_as_its_own_ids`) | built, unrun | missing: "facilities this platform does not have" (`crates/cli/src/main.rs`) | missing |
+| `slates vhost-user` (a VMM attaches slates' own virtio-fs device) | declined (Ada, 2026-10-30): no vhost-user QEMU on this Mac. QEMU builds vhost-user on macOS only when asked (`meson.build`: off Linux it is off unless `--enable-vhost-user`), Homebrew's 11.1.3 does not ask, and the back end is Linux's (memfds, eventfds) | built: `live-guest` (`crates/cli/tests/guest_vhost.rs` in QEMU 11.1 with KVM), and crosvm on the box (gated) | built: a recorded run, `crates/cli/tests/guest_vhost.rs` 5 of 5 in QEMU 11.1.2 under its own emulation on GitHub's `ubuntu-24.04-arm` (A-189; diagnostics run 40883925064, job 123456468166). No lane on main runs it there | impossible: QEMU builds no vhost-user on Windows (`meson.build` at v11.1.0, lines 227–230: "vhost-user is not available on Windows"); crosvm speaks vhost-user there only over its own pipe transport, for block, gpu, sound and net devices, and has no fs device (its `src/sys/windows.rs` at 678337f67d, read 2026-10-31: "fs control tube not supported on Windows"); Hyper-V offers no vhost-user device (the DAX matrix's Hyper-V row) | impossible (the same) |
+| Shards route (`slates shards`, the daemon's stream, DAX) | built: `gates` (`crates/client/tests/shards.rs`), and a guest on this Mac (Shards' `a_microvm_maps_a_slates_file_with_dax_and_each_side_sees_the_others_writes`, the DAX matrix's Shards row) | built: `gates`, and a guest on adacachy (G-shards-linux) | built: a recorded run, Shards' `a_microvm_maps_a_slates_file_with_dax_and_each_side_sees_the_others_writes` over the daemon's stream on the nested arm64 KVM host (G-arm64-guest, 2026-10-27). No lane runs the Shards suites on arm64 Linux | built: `windows-lint` and `windows-nightly` run `crates/client/tests/shards.rs` and `crates/cli/tests/shards.rs`. Proven with a guest (G-shards-windows, 2026-10-27): the daemon's pipe (A-179), `slates shards` handing it as `{handle}` (A-181), the DAX answer (A-180), and Shards' device and WHP window (its `gpu` 3b1e52a4, bc032060). On GitHub's windows-2025 a guest mounts, reads and writes a volume (3 of 3, run 40455011746) and maps a file with DAX: it stores and syncs, sees another attachment's change and a cut's zeros (3 of 3 in each of runs 40503725694, 40505101140 and 40521211082), red-checked with the window off (run 40521211082) | built: `windows-arm64` runs `crates/client/tests/shards.rs` (11 tests) and the CLI's hand-off (`slates_shards_hands_a_program_a_working_handle_and_the_attachment_ends_with_it`; run 41249775368). No guest: Shards has no hypervisor backend on Windows arm64 (the DAX matrix's Shards row: none) |
+| Direct map (A-135: a same-kernel process maps a file with no copy) | built (A-173): `gates` (`crates/client/tests/client.rs`) | built (A-171): `gates` | built: `linux-arm64` (the client suite's 20 map tests and `reap_map`) | built (A-175): `windows-lint` and `windows-nightly` | built: `windows-arm64` (the client suite whole; its map tests first passed 20 of 20 in run 40525669353) |
+| Base overlay (a volume over a host directory, read only) | built: `gates` (`crates/base/tests/host.rs`) | built: `gates`, and `host.rs` again over the disk | built, unrun | built: `windows-lint` runs `cargo test -p slates-base` (`crates/base/src/windows.rs`) | built, unrun: `windows-arm64` lints `slates-base` and runs no test of it |
+| Disk images (`slates image build`, `merge`) and Firecracker | image verbs: built, unrun (`crates/cli/tests/guest_image.rs` is Linux's); Firecracker: none (Linux KVM only) | built (A-160, A-165): `live-guest` (`crates/cli/tests/guest_image.rs` in QEMU 11.1), and Firecracker and Cloud Hypervisor on the box (gated) | built: recorded runs, `crates/cli/tests/guest_image.rs` 4 of 4 with Firecracker v1.17.0 on the nested arm64 KVM host (G-arm64-guest, 2026-10-27), and its drive form in QEMU 11.1.2 on `ubuntu-24.04-arm` (diagnostics run 40883925064, job 123482450147). No lane runs it there | image verbs: built, unrun; Firecracker: none | image verbs: built, unrun; Firecracker: none |
+| Python and Node SDKs | built: `sdk` (the wheel and the addon, each by use over a live daemon) | built: `sdk` | built, unrun | built, unrun: `windows-lint` lints them; no by-use test | built, unrun |
+| Crash dumps keep no secret | built, unrun: `RLIMIT_CORE` 0 (`crates/cli/src/dumps.rs`); its test is Linux's | built: `gates`' CLI flow (`the_anchor_and_its_daemon_exclude_themselves_from_core_dumps`) | built, unrun | missing, and Ada's call (GAPS `8a-win-dumps`, OPEN): no unprivileged `RLIMIT_CORE`, so `exclude_from_dumps` is `Ok(())` (`crates/cli/src/dumps.rs`). Unprivileged steps exist for the decision: `WerSetFlags(WER_FAULT_REPORTING_FLAG_NOHEAP)`, and `WerRegisterExcludedMemoryBlock` for each region as it is made | missing (the same) |
+| Hermeticity tracer (no write outside a granted target) | built: `conformance`'s macOS leg (`sudo eslogger`, `xtask/src/conformance/hermeticity.rs`; CI's first record 2026-10-24) | built: `conformance` | built: recorded runs over FUSE and NFSv4.2 on Docker Desktop's arm64 Linux kernel (`conformance.md`, 2026-09-20 and 2026-09-27). No lane runs it there | missing (a branch exists: `windows-hermeticity-tracer`) | missing |
+| Conformance suites | built: `conformance` (pjdfstest over NFS, its non-root cases; fsx, fsstress, the workloads) | built: `conformance` (pjdfstest, fsx, fsstress, the workloads) | built: recorded runs on Docker Desktop's arm64 Linux kernel (`conformance.md`, 2026-09-20): fsx, fsstress and the workloads over FUSE, and pjdfstest limited, run through the NFS export by Linux's NFS client rather than over FUSE. No lane runs them there | missing (WinFsp has its own suite, `winfsp-tests`) | missing |
 
 ## Order of work
 
@@ -66,15 +80,47 @@ Each of these blocks several functions below, so it comes first.
    Linux kernel client mounting it (Docker Desktop's machine or WSL2).
 2. **Holding a restarted daemon's sockets and mounts on Windows** (gap 2): the fleet's serve sockets, then a WinFsp
    mount that outlives its daemon.
-3. **The macOS anchor's restart from its own image** (A-145), and crash dumps on Windows once Ada decides
-   `8a-win-dumps`.
+3. **The anchor's restart from its own image** (A-145) on macOS, and its check on Windows; crash dumps on Windows
+   once Ada decides `8a-win-dumps`.
 4. **`slates exec` on macOS and Windows**, and `oci-runtime`/`oci-check` on Windows.
-5. **Every built-but-unrun cell gets its run**: the daemon and CLI suites on Windows arm64 (its lane builds no
-   `slates-cli`) and Linux arm64, the SDKs' by-use tests on Windows, and the hermeticity tracer on Windows and a
-   conformance suite there.
-6. **`slates vhost-user` on macOS**, once QEMU's source confirms a front end there; the Windows cells confirmed or
-   built.
+5. **Every built-but-unrun cell gets its run**: on Linux arm64 the lifecycle test, work and merge, A-145's restart,
+   `slates exec`, `oci-runtime`, MCP, the fleet node, the base overlay, the SDKs and the crash-dump test, and a lane
+   for what only recorded runs prove there (landing, the mount across a restart, the export, `vhost-user`, the Shards
+   route, the image form, the conformance suites and the tracer); on Windows arm64 the base overlay and MCP; the image
+   verbs on macOS and Windows; the SDKs' by-use tests on Windows; `nfs_held.rs` in macOS's CLI flow; and the
+   hermeticity tracer and a conformance suite on Windows.
+6. **`slates vhost-user` off Linux: nothing to build.** Declined on macOS (Ada, 2026-10-30) and impossible on Windows
+   (the row's sources).
 
 Owners: G-shards-windows steps 2 and 5 are slates-00's and slates-36's (Ada, 2026-10-26); the rest of this list is
 slates-d7's unless Ada assigns it otherwise. Each item, as it lands, updates its row here, the gap ledger and its
 design section in the same change.
+
+## Tests the tables name (generated)
+
+Every test a cell above names, and where the tree defines it; another project's tests and paths are listed and not
+looked for. `cargo xtask structural` and `cargo test -p xtask` refuse a cell that names a test or a path the tree
+lacks, giving its line (`xtask/src/named_tests.rs`). After a named test moves,
+`cargo test -p xtask -- --ignored regenerate_the_named_tests` rewrites this list.
+
+<!-- named-tests:begin -->
+- `a_container_maps_a_file_through_the_bound_mount_and_follows_another_paths_change`: `crates/cli/tests/cli.rs`
+- `a_daemon_killed_after_its_anchors_executable_is_replaced_restarts_from_the_anchors_own_image`: `crates/cli/tests/cli.rs`
+- `a_daemon_killed_under_a_pmem_guests_live_map_is_taken_over_and_the_guest_goes_on`: `crates/cli/tests/guest_image.rs`
+- `a_fuse_mount_whose_daemon_was_killed_is_ended_by_the_restarted_daemon`: `crates/cli/tests/cli.rs`
+- `a_linux_container_reaches_the_shared_mount_as_its_own_ids`: `crates/cli/tests/cli.rs`
+- `a_read_only_map_through_a_mount_follows_another_paths_change`: `crates/cli/tests/cli.rs`
+- `a_replacement_the_dead_daemon_never_delivered_does_not_outlive_the_takeover`: `crates/cli/tests/cli.rs`
+- `a_rootless_container_maps_a_file_through_the_mount_and_follows_another_paths_change`: `crates/cli/tests/cli.rs`
+- `a_shared_map_through_a_mount_writes_back_and_follows_another_paths_change`: `crates/cli/tests/cli.rs`
+- `a_verified_container_source_is_checked_again_before_it_is_bound`: `crates/cli/tests/cli.rs`
+- `a_volume_mounted_through_winfsp_is_read_and_written_by_windows_programs`: `crates/cli/tests/winfsp.rs`
+- `a_winfsp_folder_bound_into_a_process_isolated_container`: `crates/cli/tests/winfsp.rs`
+- `an_nfs_connection_outlives_its_daemons_kill_and_every_request_is_answered`: `crates/cli/tests/nfs_held.rs`
+- `an_oci_container_consumes_the_host_attachment_through_the_runtime_bind`: `crates/cli/tests/cli.rs`
+- `slates_shards_hands_a_program_a_working_handle_and_the_attachment_ends_with_it`: `crates/cli/tests/shards.rs`
+- `the_anchor_and_its_daemon_exclude_themselves_from_core_dumps`: `crates/cli/tests/cli.rs`
+- `the_launcher_refuses_a_path_it_would_have_to_create_and_leaves_the_host_untouched`: `crates/cli/tests/cli.rs`
+- `the_typed_verbs_drive_the_lifecycle_and_refusals_are_typed`: `crates/client/tests/client.rs`
+- Shards' `a_microvm_maps_a_slates_file_with_dax_and_each_side_sees_the_others_writes`: another project's test, not looked for
+<!-- named-tests:end -->
