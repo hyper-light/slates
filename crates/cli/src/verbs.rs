@@ -16,7 +16,8 @@ use slates_server::landing::{enroll_proof, revoke_proof};
 
 use crate::Failure;
 use crate::args::{
-  ClientRequest, ProfileOptions, RunRequest, ShardsRequest, SharePrincipal, Verb, VhostUserRequest,
+  ClientRequest, PmemRequest, ProfileOptions, RunRequest, ShardsRequest, SharePrincipal, Verb,
+  VhostUserRequest,
 };
 use crate::format::volume_id_text;
 
@@ -1816,6 +1817,225 @@ fn exec_vmm(program: &str, _args: &[String], end: slates_client::StreamEnd) -> F
   Failure::Failed(format!(
     "vhost-user: {program} is not run with a device's end on this platform"
   ))
+}
+
+/// Format: the granule `pmem` asks its copy in, 2 MiB: Firecracker's virtio-pmem needs its region 2 MB aligned and pads a
+/// shorter backing with pages it never syncs ("requires for the guest exposed memory region to be 2MB aligned", its
+/// `docs/pmem.md`), and Cloud Hypervisor refuses a backing that is not a 2 MiB multiple (`size % 0x20_0000 != 0`, its
+/// `vmm/src/device_manager.rs`). QEMU takes any page multiple.
+#[cfg(target_os = "linux")]
+const PMEM_GRANULE: u64 = 2 << 20;
+
+/// `pmem ID FILE --fd N -- VMM [ARG ...]` (Step 6 of the VFS and DAX plan; A-186's writable copy as a pmem VMM's
+/// backing, with no host mount): takes its own write attachment of the volume, maps FILE to write with a 2 MiB granule
+/// ([`PMEM_GRANULE`]), and runs the VMM as its child with the copy at descriptor N, bound to this process
+/// (`slates_ipc::stream::spawn_bound`: the VMM ends when this process does, so no VM outlives its map's holder). Each
+/// `{pmem}` in the VMM's arguments names the copy as `/proc/self/fd/N`, each `{fd}` as N, each `{len}` as its length.
+///
+/// The guest's stores land in the copy, which the daemon keeps equal to the file as every other path changes it (A-163,
+/// A-186). They reach the file at this command's sync points: each SIGUSR1 compares the copy back (`map_sync`), and the
+/// VM's exit lets the map go, which compares it back a last time. The guest's own flush is the VMM's `msync` of the
+/// copy, which reaches no file, so it never reaches slates. SIGINT and SIGTERM are passed to the VMM. The command exits
+/// with the VMM's code, and fails if the last compare-back was refused, since the guest's last stores then did not all
+/// reach the file. Announces the attachment, the copy's name and length, each sync and the release, as lines or JSON.
+#[cfg(target_os = "linux")]
+pub(crate) fn run_pmem(request: &PmemRequest) -> Result<(), Failure> {
+  let (program, args) = request
+    .command
+    .split_first()
+    .ok_or_else(|| Failure::Failed("pmem needs a VMM".to_owned()))?;
+  let relay = crate::signal::relay().map_err(|e| Failure::Failed(format!("pmem: {e}")))?;
+  let mut client = connect(&request.instance)?;
+  let attachment = client
+    .attach(request.volume, None, Intent::Write)
+    .map_err(|e| failure_of(e, &request.instance))?
+    .attachment;
+  let mapped = match client.map_write((request.volume, attachment), &request.file, PMEM_GRANULE) {
+    Ok(mapped) => mapped,
+    Err(e) => {
+      let failure = failure_of(e, &request.instance);
+      if let Err(detach) = client.detach(attachment) {
+        eprintln!("slates: pmem: detaching {attachment} after the refused map: {detach}");
+      }
+      return Err(failure);
+    }
+  };
+  let named = format!("/proc/self/fd/{}", request.fd);
+  announce_pmem(
+    &[
+      ("attachment", serde_json::json!(attachment)),
+      ("pmem", serde_json::json!(named)),
+      ("length", serde_json::json!(mapped.mapped_len())),
+    ],
+    request.json,
+  );
+  let args: Vec<OsString> = args
+    .iter()
+    .map(|argument| {
+      OsString::from(
+        argument
+          .replace(crate::args::PMEM_PLACEHOLDER, &named)
+          .replace(crate::args::FD_PLACEHOLDER, &request.fd.to_string())
+          .replace(
+            crate::args::LEN_PLACEHOLDER,
+            &mapped.mapped_len().to_string(),
+          ),
+      )
+    })
+    .collect();
+  let served =
+    slates_ipc::stream::spawn_bound(OsStr::new(program), &args, mapped.descriptor(), request.fd)
+      .map_err(|e| {
+        Failure::Failed(format!(
+          "pmem: running {program} with the copy at descriptor {}: {e}",
+          request.fd
+        ))
+      })
+      .and_then(|child| serve_pmem(&mut client, &mapped, child, (&relay, request.json)));
+  let released = client.release_map_write(mapped);
+  if let Ok(written) = &released {
+    announce_pmem(&[("released", serde_json::json!(written))], request.json);
+  }
+  if let Err(e) = client.detach(attachment) {
+    eprintln!("slates: pmem: detaching {attachment}: {e}");
+  }
+  let code = served?;
+  released.map_err(|e| {
+    Failure::Failed(format!(
+      "pmem: the last compare-back was refused, so the guest's last stores did not all reach {}: {e}",
+      request.file
+    ))
+  })?;
+  match code {
+    0 => Ok(()),
+    code => Err(Failure::ChildExited { code }),
+  }
+}
+
+/// Waits for the VMM to exit, answering this process's signals meanwhile: a SIGUSR1 compares the copy back
+/// (`map_sync`) and announces what it wrote; SIGINT and SIGTERM are passed to the VMM. Waits on the VMM's pidfd and on
+/// the signal relay's pipe together, never on a timer. The VMM's exit code, or 128 and the signal that ended it.
+#[cfg(target_os = "linux")]
+fn serve_pmem(
+  client: &mut Client,
+  mapped: &slates_client::MappedWrite,
+  mut child: std::process::Child,
+  (relay, json): (&std::os::fd::OwnedFd, bool),
+) -> Result<i32, Failure> {
+  use rustix::event::{PollFd, PollFlags, poll};
+  use std::os::unix::process::ExitStatusExt;
+  let pid = rustix::process::Pid::from_child(&child);
+  let pidfd =
+    rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).map_err(|e| {
+      Failure::Failed(format!(
+        "pmem: watching the VMM (process {}): {e}",
+        child.id()
+      ))
+    })?;
+  loop {
+    let mut fds = [
+      PollFd::new(&pidfd, PollFlags::IN),
+      PollFd::new(relay, PollFlags::IN),
+    ];
+    match poll(&mut fds, None) {
+      Ok(_) => {}
+      Err(rustix::io::Errno::INTR) => continue,
+      Err(e) => return Err(Failure::Failed(format!("pmem: waiting on the VMM: {e}"))),
+    }
+    let [vmm, signals] = &fds;
+    let (exited, signalled) = (!vmm.revents().is_empty(), !signals.revents().is_empty());
+    if signalled {
+      answer_signals(client, mapped, (relay, json), pid);
+    }
+    if exited {
+      break;
+    }
+  }
+  let status = child.wait().map_err(|e| {
+    Failure::Failed(format!(
+      "pmem: reaping the VMM (process {}): {e}",
+      child.id()
+    ))
+  })?;
+  Ok(
+    status
+      .code()
+      .or_else(|| {
+        status
+          .signal()
+          .map(|signal| signal.saturating_add(SIGNALLED_EXIT))
+      })
+      .unwrap_or(SIGNALLED_EXIT),
+  )
+}
+
+/// Format: what a shell adds to the number of the signal that ended a process to make its exit status (POSIX `sh`,
+/// "Exit Status": "greater than 128").
+#[cfg(target_os = "linux")]
+const SIGNALLED_EXIT: i32 = 128;
+
+/// Reads every signal the relay holds and answers each kind once: a sync for SIGUSR1, the signal passed to the VMM for
+/// SIGINT and SIGTERM. A refused sync is reported, and the command goes on: the next sync, or the exit's, writes back
+/// whatever this one did not.
+#[cfg(target_os = "linux")]
+fn answer_signals(
+  client: &mut Client,
+  mapped: &slates_client::MappedWrite,
+  (relay, json): (&std::os::fd::OwnedFd, bool),
+  vmm: rustix::process::Pid,
+) {
+  let mut arrived = std::collections::BTreeSet::new();
+  let mut bytes = [0u8; crate::signal::RELAYED.len()];
+  while let Ok(read) = rustix::io::read(relay, &mut bytes) {
+    if read == 0 {
+      break;
+    }
+    arrived.extend(bytes.get(..read).unwrap_or_default().iter().copied());
+  }
+  for signal in arrived {
+    if i32::from(signal) == libc::SIGUSR1 {
+      match client.map_sync(mapped) {
+        Ok(written) => announce_pmem(&[("synced", serde_json::json!(written))], json),
+        Err(e) => eprintln!("slates: pmem: a sync was refused: {e}"),
+      }
+    } else if let Some(passed) = rustix::process::Signal::from_named_raw(i32::from(signal))
+      && let Err(e) = rustix::process::kill_process(vmm, passed)
+    {
+      eprintln!("slates: pmem: passing signal {signal} to the VMM: {e}");
+    }
+  }
+}
+
+/// Prints `fields` as `key: value` lines, or as one JSON object under `--json`, flushed ahead of the VMM's output on the
+/// same stream.
+#[cfg(target_os = "linux")]
+fn announce_pmem(fields: &[(&str, serde_json::Value)], json: bool) {
+  use std::io::Write;
+  if json {
+    let object: serde_json::Map<String, serde_json::Value> = fields
+      .iter()
+      .map(|(key, value)| ((*key).to_owned(), value.clone()))
+      .collect();
+    println!("{}", serde_json::Value::Object(object));
+  } else {
+    for (key, value) in fields {
+      match value {
+        serde_json::Value::String(text) => println!("{key}: {text}"),
+        other => println!("{key}: {other}"),
+      }
+    }
+  }
+  let _ = std::io::stdout().flush();
+}
+
+/// No VMM is handed a pmem copy off Linux: Firecracker, Cloud Hypervisor and QEMU's virtio-pmem run there alone (QEMU
+/// builds virtio-pmem for x86 machines only). Refused before anything is attached.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn run_pmem(request: &PmemRequest) -> Result<(), Failure> {
+  Err(Failure::Failed(format!(
+    "pmem: a VMM is handed a pmem copy on Linux alone; {} was not run",
+    request.command.first().map_or("the VMM", String::as_str)
+  )))
 }
 
 /// Prints the attachment a `shards` command runs under, before the command starts, so a human can find it in `status`

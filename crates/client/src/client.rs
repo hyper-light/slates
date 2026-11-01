@@ -700,6 +700,15 @@ fn shown_from(shown: u64, offset: u64, wanted: usize) -> usize {
   usize::try_from(take).unwrap_or(0)
 }
 
+/// The page, in bytes: the smallest granule a writable map takes ([`Client::map_write`]), and the one a process asks
+/// for a map it reads and writes itself. Refused as the system's page size is, which nothing on a supported platform
+/// refuses.
+#[cfg(any(unix, windows))]
+pub fn page_bytes() -> Result<u64, ClientError> {
+  slates_mem::PeerObject::bytes_for(1)
+    .map_err(|error| mapped_access_refused("the page size", &error))
+}
+
 /// A map's access the OS refused, as the client's typed error, naming `call`.
 #[cfg(any(unix, windows))]
 fn mapped_access_refused(call: &'static str, error: &slates_mem::MemError) -> ClientError {
@@ -1305,18 +1314,23 @@ impl Client {
   /// it as [`Client::map_read`]'s is: over the control socket on Linux, claimed on its socket route on macOS, duplicated
   /// into this process on Windows. Refused `MapUnavailable` where the daemon cannot hand one (another user, an
   /// overlay, a volume another shard owns, an in-process guest mapping the file to write), with no copied fallback;
-  /// `Forbidden` for an attachment this client may not write through; `MapShareExhausted` past this client's share. A
-  /// hand-off that fails here gives the copy back before the failure returns (A-174).
+  /// `Forbidden` for an attachment this client may not write through; `MapShareExhausted` past this client's share;
+  /// `BadRequest` for a `granule` that is not a power of two of at least the page. The copy is the file's length
+  /// rounded up to `granule`: the page ([`page_bytes`]) for a map this process reads and writes itself, 2 MiB for a
+  /// pmem VMM's backing (`slates pmem`); stores past the file's end are never written. A hand-off that fails here gives
+  /// the copy back before the failure returns (A-174).
   #[cfg(any(unix, windows))]
   pub fn map_write(
     &mut self,
     (volume, attachment): (VolumeId, u64),
     path: &str,
+    granule: u64,
   ) -> Result<MappedWrite, ClientError> {
     match self.call(&RequestBody::MapWrite {
       volume,
       attachment,
       path: path.to_owned(),
+      granule,
     })? {
       #[cfg(unix)]
       ReplyBody::Mapped {

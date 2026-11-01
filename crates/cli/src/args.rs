@@ -68,6 +68,11 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
             run VMM with slates' own virtio-fs device of the volume: {socket} in its arguments names the device's
             socket end (/proc/self/fd/N) and {fd} its descriptor (N), e.g. `crosvm run --vhost-user
             type=fs,socket={socket} ...` or `qemu-system-x86_64 -chardev socket,id=fs,fd={fd} ...` (Linux)
+  pmem ID FILE --fd N [--json] -- VMM [ARG ...]
+            run VMM with a writable copy of FILE (2 MiB multiples) at descriptor N as its pmem device's backing, with no
+            host mount: {pmem} in its arguments names the copy (/proc/self/fd/N), {fd} its descriptor (N), {len} its
+            length; SIGUSR1 compares the copy back into the file, as the VM's exit does; the guest's own flush does not
+            (Linux)
 ";
 
 /// Format: the usage notes: the size grammar's examples, the instance's discovery, the exit codes.
@@ -587,6 +592,25 @@ pub(crate) struct VhostUserRequest {
   pub command: Vec<String>,
 }
 
+/// A `slates pmem` request (Step 6 of the VFS and DAX plan; A-186's writable copy as a pmem VMM's backing): map a file of
+/// a volume to write with a 2 MiB granule and run a VMM as this process's child with the copy at descriptor `fd`, named
+/// in its arguments where `{pmem}`, `{fd}` or `{len}` stands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PmemRequest {
+  /// The instance.
+  pub instance: String,
+  /// The volume.
+  pub volume: slates_client::VolumeId,
+  /// The file the VMM's pmem device presents, in the volume.
+  pub file: String,
+  /// The descriptor number the VMM finds the copy at.
+  pub fd: i32,
+  /// Announce as JSON.
+  pub json: bool,
+  /// The VMM and its arguments.
+  pub command: Vec<String>,
+}
+
 /// The parsed command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Command {
@@ -598,6 +622,8 @@ pub(crate) enum Command {
   Shards(ShardsRequest),
   /// A VMM run with slates' own virtio-fs device's socket end.
   VhostUser(VhostUserRequest),
+  /// A VMM run with a writable copy of a file as its pmem device's backing.
+  Pmem(PmemRequest),
   /// The anchor.
   Anchor(ProcessOptions),
   /// The daemon.
@@ -837,7 +863,7 @@ fn handed_fd(taken: &Taken) -> Result<i32, ParseError> {
   let fd = taken
     .value("--fd")
     .ok_or(ParseError::Missing(
-      "--fd N (the descriptor number the command finds its stream end at)",
+      "--fd N (the descriptor number the command finds what it is handed at: a stream end, a pmem copy)",
     ))?
     .parse::<i32>()
     .map_err(|e| ParseError::BadValue {
@@ -867,6 +893,18 @@ pub(crate) const SOCKET_PLACEHOLDER: &str = "{socket}";
 /// becomes `N`, the end's descriptor in the VMM. QEMU takes an inherited socket this way (`-chardev socket,id=fs,fd=N`)
 /// and cannot take `/proc/self/fd/N`, which it would connect to as a path.
 pub(crate) const FD_PLACEHOLDER: &str = "{fd}";
+
+/// Format: where a `pmem` command's arguments name the writable copy: each occurrence becomes `/proc/self/fd/N`, the
+/// copy's descriptor in the VMM, which Firecracker (`path_on_host`), Cloud Hypervisor (`--pmem file=`) and QEMU
+/// (`memory-backend-file,mem-path=`) open as their backing. A Firecracker configuration file, which the launcher never
+/// rewrites, names `/proc/self/fd/N` itself. Linux alone runs a VMM with one.
+#[cfg(target_os = "linux")]
+pub(crate) const PMEM_PLACEHOLDER: &str = "{pmem}";
+
+/// Format: where a `pmem` command's arguments name the copy's length in bytes, which QEMU's memory backend is told
+/// (`size=`).
+#[cfg(target_os = "linux")]
+pub(crate) const LEN_PLACEHOLDER: &str = "{len}";
 
 /// Parses `vhost-user ID [--tag NAME] [--subtree DIR] [--read-only] [--dax-window SIZE] [--json] -- VMM ...`: one volume
 /// and the flags before `--`, the VMM after it, `{socket}` or `{fd}` in at least one of its arguments (the device is
@@ -908,6 +946,35 @@ fn parse_vhost_user(taken: &Taken, arguments: &[String]) -> Result<Command, Pars
     subtree: taken.value("--subtree").map(str::to_owned),
     read_only: taken.switch("--read-only"),
     dax_window,
+    json: taken.json(),
+    command,
+  }))
+}
+
+/// Parses `pmem ID FILE --fd N [--json] -- VMM ...`: one volume, the file in it, the descriptor number the VMM finds the
+/// copy at, and the VMM after `--`. No placeholder is required: a Firecracker configuration file names the copy's
+/// `/proc/self/fd/N` itself.
+fn parse_pmem(taken: &Taken, arguments: &[String]) -> Result<Command, ParseError> {
+  let command = command_after(arguments)?;
+  taken.only(&Spec {
+    values: &["--fd"],
+    switches: &[],
+  })?;
+  let (id, file) = match taken.words.as_slice() {
+    [_, id, file] => (id, file),
+    [_, _, _, extra, ..] => return Err(ParseError::Extra(extra.clone())),
+    [_, _] => {
+      return Err(ParseError::Missing(
+        "FILE, the file in the volume the VMM's pmem device presents",
+      ));
+    }
+    _ => return Err(ParseError::Missing("volume ID")),
+  };
+  Ok(Command::Pmem(PmemRequest {
+    instance: taken.instance(),
+    volume: volume(id)?,
+    file: file.clone(),
+    fd: handed_fd(taken)?,
     json: taken.json(),
     command,
   }))
@@ -1367,6 +1434,7 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
     Some("exec") => return parse_exec(&taken, arguments),
     Some("shards") => return parse_shards(&taken, arguments, hand_off),
     Some("vhost-user") => return parse_vhost_user(&taken, arguments),
+    Some("pmem") => return parse_pmem(&taken, arguments),
     _ if boundary.is_some() => return Err(ParseError::UnknownFlag("--".to_owned())),
     _ => {}
   }

@@ -9247,7 +9247,11 @@ fn container_write_probe(client: &mut slates_client::Client, volume: slates_clie
     .unwrap()
     .attachment;
   let mapped = client
-    .map_write((volume, attachment), DIRECT_PROBE_FILE)
+    .map_write(
+      (volume, attachment),
+      DIRECT_PROBE_FILE,
+      slates_client::page_bytes().unwrap(),
+    )
     .unwrap();
   let at = rustix::param::page_size() - DIRECT_WRITE_BEFORE_PAGE;
   mapped

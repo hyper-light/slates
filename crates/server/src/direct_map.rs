@@ -747,7 +747,7 @@ pub(crate) fn map_write(
   _client_id: u32,
   _principal: &slates_db::catalog::Principal,
   _target: (VolumeId, u64),
-  _path: &str,
+  _file: (&str, u64),
 ) -> ReplyBody {
   refused(Refusal::MapUnavailable)
 }
@@ -824,8 +824,18 @@ mod served {
         feature: "a direct map outside a recorded request".to_owned(),
       });
     };
+    let Ok(page) = PeerObject::bytes_for(1) else {
+      return refused(Refusal::MapUnavailable);
+    };
     let target = Target::Path(canonical_path(path));
-    match Fill::begin(state, handle, (client_id, principal), target, request, None) {
+    match Fill::begin(
+      state,
+      handle,
+      (client_id, principal),
+      (target, page),
+      request,
+      None,
+    ) {
       Ok(fill) => defer(state, fill),
       Err(Begun::Directory) => refused(Refusal::BadRequest {
         reason: "the path is a directory".to_owned(),
@@ -848,16 +858,27 @@ mod served {
   /// volume, for writing, not a snapshot's, its scope applied), makes the file's writable copy, and defers the reply to
   /// the task that fills and hands it over, as `MapRead`'s. `MapUnavailable` for every shape the direct map does not
   /// serve, and for a file an in-process guest maps writable; `Forbidden` or `NotFound` as the attachment's check
-  /// answers.
+  /// answers; `BadRequest` for a granule that is not a power of two of at least the page, before anything is made. The
+  /// copy is the file's length rounded up to the granule (`slates pmem` asks 2 MiB).
   pub(crate) fn map_write(
     state: &mut ShardState,
     client_id: u32,
     principal: &Principal,
     (volume, attachment): (VolumeId, u64),
-    path: &str,
+    (path, granule): (&str, u64),
   ) -> ReplyBody {
     if !is_the_daemons_user(principal) {
       return refused(Refusal::MapUnavailable);
+    }
+    let Ok(page) = PeerObject::bytes_for(1) else {
+      return refused(Refusal::MapUnavailable);
+    };
+    if !granule.is_power_of_two() || granule < page {
+      return refused(Refusal::BadRequest {
+        reason: format!(
+          "a granule of {granule} bytes is not a power of two of at least the page ({page} bytes)"
+        ),
+      });
     }
     let record = match find_record(state, volume) {
       Ok(record) => record,
@@ -883,7 +904,7 @@ mod served {
       state,
       handle,
       (client_id, principal),
-      Target::Inode(inode),
+      (Target::Inode(inode), granule),
       request,
       Some((volume, attachment)),
     ) {
@@ -957,14 +978,15 @@ mod served {
 
   impl Fill {
     /// Resolves the target, checks the client's share, makes the file's copy (writable where `writer` names the
-    /// attachment its stores are written back under, A-186) and keeps it in the store's backings, held from now on in
-    /// this shard's table under the client, whichever shard serves it (A-188), so the share counts copies still being
-    /// filled as well as those handed.
+    /// attachment its stores are written back under, A-186) the file's length rounded up to `granule` (the page, or
+    /// what `MapWrite` asked, checked there), and keeps it in the store's backings, held from now on in this shard's
+    /// table under the client, whichever shard serves it (A-188), so the share counts copies still being filled as well
+    /// as those handed.
     fn begin(
       state: &mut ShardState,
       volume: Handle<VolumeSlot>,
       (client_id, principal): (u32, &Principal),
-      target: Target<'_>,
+      (target, granule): (Target<'_>, u64),
       request: (u64, RequestId),
       writer: Option<(VolumeId, u64)>,
     ) -> Result<Fill, Begun> {
@@ -1015,7 +1037,10 @@ mod served {
         Target::Inode(inode) => inode,
       };
       let size = slot.volume.stat(store, inode).map_err(Begun::Vfs)?.size;
-      let object_bytes = PeerObject::bytes_for(size).map_err(|_| Begun::FellBack)?;
+      let object_bytes = size
+        .max(1)
+        .checked_next_multiple_of(granule)
+        .ok_or(Begun::FellBack)?;
       let held = holds(
         direct_map
           .held
@@ -1029,7 +1054,8 @@ mod served {
       if store.shards_backings.peers_held().0 >= most_copies {
         return Err(Begun::FellBack);
       }
-      let object = PeerObject::create(&name, size, access).map_err(|_| Begun::FellBack)?;
+      // Made `object_bytes` long, a whole number of pages, so past the file's end it holds zeros the fill never reads.
+      let object = PeerObject::create(&name, object_bytes, access).map_err(|_| Begun::FellBack)?;
       let backing = store
         .shards_backings
         .insert_peer(object, slot.volume.prefix(), inode)

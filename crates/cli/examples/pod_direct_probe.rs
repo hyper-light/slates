@@ -185,8 +185,9 @@ fn map_write(args: &[String]) -> Result<bool, String> {
     .attach(file.volume, None, Intent::Write)
     .map_err(|e| format!("attach for writing: {e}"))?
     .attachment;
+  let page = slates_client::page_bytes().map_err(|e| format!("the page size: {e}"))?;
   let mapped = client
-    .map_write((file.volume, attachment), &file.path)
+    .map_write((file.volume, attachment), &file.path, page)
     .map_err(|e| format!("map_write {}: {e}", file.path))?;
   let at = usize::try_from(slates_machine::facts::Facts::page_bytes())
     .map_err(|e| e.to_string())?

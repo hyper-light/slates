@@ -136,7 +136,13 @@ fn client_role() {
     .attach(volume, None, Intent::Write)
     .unwrap()
     .attachment;
-  let mapped = client.map_write((volume, attachment), "/f.bin").unwrap();
+  let mapped = client
+    .map_write(
+      (volume, attachment),
+      "/f.bin",
+      slates_client::page_bytes().unwrap(),
+    )
+    .unwrap();
   let mut shown = vec![0u8; FILE_BYTES];
   let read = mapped.read_at(0, &mut shown).unwrap();
   let shows_the_file = read == FILE_BYTES && shown == file_bytes();

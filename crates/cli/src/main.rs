@@ -72,6 +72,7 @@ fn main() -> ExitCode {
     Command::Run(request) => request.json,
     Command::Shards(request) => request.json,
     Command::VhostUser(request) => request.json,
+    Command::Pmem(request) => request.json,
     _ => false,
   };
   let outcome = match command {
@@ -84,6 +85,7 @@ fn main() -> ExitCode {
     Command::Run(request) => verbs::run_consumer(&request),
     Command::Shards(request) => verbs::run_shards(&request),
     Command::VhostUser(request) => verbs::run_vhost_user(&request),
+    Command::Pmem(request) => verbs::run_pmem(&request),
     Command::OciCheck(check) => verbs::oci_check(&check),
     Command::OciRuntime(runtime) => run_oci_runtime(&runtime),
   };

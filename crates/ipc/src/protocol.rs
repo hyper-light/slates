@@ -705,7 +705,8 @@ pub enum RequestBody {
   /// does (the reply is `Mapped`, `MapOffered` or `MapHanded`). The client's stores land in the copy and reach the file
   /// at its `MapSync`, its `ReleaseMap`, or its end, each written back through the attachment. Refused
   /// `MapUnavailable` for every shape `MapRead` refuses, with no paged fallback, since a copied map could not keep
-  /// another writer's bytes; `Forbidden` for an attachment the caller may not write through. Appended.
+  /// another writer's bytes; `Forbidden` for an attachment the caller may not write through; `BadRequest` for a
+  /// granule that is not a power of two of at least the page. Appended.
   MapWrite {
     /// The volume (routes the verb to its owner shard).
     volume: VolumeId,
@@ -713,6 +714,11 @@ pub enum RequestBody {
     attachment: u64,
     /// The file.
     path: String,
+    /// What the copy's length is rounded up to, from the file's: a power of two of at least the page. The page for a
+    /// map a process reads and writes itself; 2 MiB for a pmem VMM's backing, which Firecracker pads with pages it
+    /// never syncs and Cloud Hypervisor refuses unless whole (`slates pmem`). Stores past the file's end within the
+    /// copy are not the file's and are never written.
+    granule: u64,
   },
   /// Write the stores a writable direct map holds into its file (§4.6, A-186): the daemon compares the copy with the
   /// file up to the file's end and writes each run that differs through the map's attachment, then publishes before it

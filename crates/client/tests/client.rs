@@ -574,7 +574,13 @@ fn a_writable_maps_stores_reach_the_file_at_its_sync() {
   write_file(&mut client, id, "/f.bin", &old);
   let start = daemon.direct_map_copies().unwrap();
   let attachment = client.attach(id, None, Intent::Write).unwrap().attachment;
-  let mapped = client.map_write((id, attachment), "/f.bin").unwrap();
+  let mapped = client
+    .map_write(
+      (id, attachment),
+      "/f.bin",
+      slates_client::page_bytes().unwrap(),
+    )
+    .unwrap();
   assert_maps_the_file(&mapped, &old);
   let page = usize::try_from(page_span(1)).unwrap();
   let mut new = old.clone();
@@ -614,6 +620,93 @@ fn a_writable_maps_stores_reach_the_file_at_its_sync() {
   );
   client.detach(attachment).unwrap();
   assert_write_backs(&daemon, 3, differing_bytes(&old, &new));
+}
+
+/// Shape: the granule a pmem VMM's backing takes (`slates pmem`): 2 MiB, which Firecracker pads a shorter backing to
+/// with pages it never syncs, and short of which Cloud Hypervisor refuses one.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+const PMEM_GRANULE: u64 = 2 << 20;
+
+/// Step 6.1 (the pmem launcher's copy): a writable copy is its file's length rounded up to the granule its client
+/// names. Do: on a one-shard daemon, write a 100 KiB file, attach for writing and map it with a 2 MiB granule; store at
+/// its start and past its end; sync, and read the file through a second client; release. Map it again with the page
+/// granule; then ask for a granule of three pages and of half a page. Expect: the first map shows 2 MiB over the file's
+/// 100 KiB; the sync writes the store at the start and not the one past the end, which stays in the copy, and the file
+/// keeps its length; the page granule maps the page span, as every map did before; both odd granules are refused
+/// `BadRequest` with no copy made.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[test]
+fn a_writable_copy_is_its_files_length_rounded_up_to_its_granule() {
+  let (daemon, mut client, instance) = one_shard_daemon("mapg");
+  let mut reader = connect(&instance);
+  let len = 100 << 10;
+  let id = client.create(&room_for("mapg", len)).unwrap();
+  let old = pattern(len, 3);
+  write_file(&mut client, id, "/f.bin", &old);
+  let attachment = client.attach(id, None, Intent::Write).unwrap().attachment;
+  let mapped = client
+    .map_write((id, attachment), "/f.bin", PMEM_GRANULE)
+    .unwrap();
+  assert_eq!(
+    (mapped.len(), mapped.mapped_len()),
+    (u64::try_from(len).unwrap(), PMEM_GRANULE),
+    "the copy is 2 MiB over the file's 100 KiB"
+  );
+  let mut new = old.clone();
+  store_phrase(&mapped, &mut new, 0, b"head");
+  let beyond = b"never the file's";
+  let past_the_end = PMEM_GRANULE - u64::try_from(beyond.len()).unwrap();
+  assert_eq!(mapped.write_at(past_the_end, beyond).unwrap(), beyond.len());
+  assert_eq!(
+    client.map_sync(&mapped).unwrap(),
+    differing_bytes(&old, &new),
+    "the sync wrote the store at the start alone"
+  );
+  assert_file(
+    &mut reader,
+    id,
+    &new,
+    "the file holds the store at its start and keeps its length",
+  );
+  let mut kept = [0u8; 16];
+  assert_eq!(mapped.read_at(past_the_end, &mut kept).unwrap(), kept.len());
+  assert_eq!(&kept, beyond, "the store past the end stays in the copy");
+  client.release_map_write(mapped).unwrap();
+  the_page_granule_and_no_other((&daemon, &mut client), (id, attachment), len);
+  client.detach(attachment).unwrap();
+}
+
+/// A map of `/f.bin` (`len` bytes) with the page granule shows its page span; a granule of three pages or of half a
+/// page is refused `BadRequest`, with no copy made.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn the_page_granule_and_no_other(
+  (daemon, client): (&Daemon, &mut Client),
+  (id, attachment): (slates_client::VolumeId, u64),
+  len: usize,
+) {
+  let page = slates_client::page_bytes().unwrap();
+  let paged = client.map_write((id, attachment), "/f.bin", page).unwrap();
+  assert_eq!(
+    paged.mapped_len(),
+    page_span(len),
+    "the page granule maps the page span"
+  );
+  client.release_map_write(paged).unwrap();
+  let copies = daemon.direct_map_copies().unwrap();
+  for odd in [3 * page, page / 2] {
+    assert!(
+      matches!(
+        client.map_write((id, attachment), "/f.bin", odd),
+        Err(ClientError::Refused(Refusal::BadRequest { .. }))
+      ),
+      "a granule of {odd} bytes is refused"
+    );
+  }
+  assert_eq!(
+    daemon.direct_map_copies().unwrap(),
+    copies,
+    "no copy was made for a refused granule"
+  );
 }
 
 /// The map is zero-copy over `file`'s page span and shows `file`.
@@ -671,7 +764,13 @@ fn a_store_made_while_its_map_is_synced_is_never_undone() {
   let id = client.create(&room_for("mapwrace", 4 << 10)).unwrap();
   write_file(&mut client, id, "/f.bin", &pattern(4 << 10, 6));
   let attachment = client.attach(id, None, Intent::Write).unwrap().attachment;
-  let mapped = client.map_write((id, attachment), "/f.bin").unwrap();
+  let mapped = client
+    .map_write(
+      (id, attachment),
+      "/f.bin",
+      slates_client::page_bytes().unwrap(),
+    )
+    .unwrap();
   let stop = AtomicBool::new(false);
   let (undone, last) = std::thread::scope(|scope| {
     let storer = scope.spawn(|| {
@@ -725,7 +824,13 @@ fn a_writable_map_sees_another_paths_write_and_keeps_its_bytes() {
   let id = client.create(&room_for("mapwcoh", len)).unwrap();
   write_file(&mut client, id, "/f.bin", &pattern(len, 1));
   let attachment = client.attach(id, None, Intent::Write).unwrap().attachment;
-  let mapped = client.map_write((id, attachment), "/f.bin").unwrap();
+  let mapped = client
+    .map_write(
+      (id, attachment),
+      "/f.bin",
+      slates_client::page_bytes().unwrap(),
+    )
+    .unwrap();
   let mut lost = pattern(len, 1);
   store_phrase(&mapped, &mut lost, 1000, b"stored, then written over");
   let replacement = pattern(len, 2);
@@ -768,7 +873,13 @@ fn a_writable_maps_store_past_the_files_end_is_not_the_files() {
   let old = pattern(len, 3);
   write_file(&mut client, id, "/f.bin", &old);
   let attachment = client.attach(id, None, Intent::Write).unwrap().attachment;
-  let mapped = client.map_write((id, attachment), "/f.bin").unwrap();
+  let mapped = client
+    .map_write(
+      (id, attachment),
+      "/f.bin",
+      slates_client::page_bytes().unwrap(),
+    )
+    .unwrap();
   assert_eq!(mapped.mapped_len(), page_span(len));
   let phrase = b"past the end";
   let at = u64::try_from(len + 300).unwrap();
@@ -807,7 +918,13 @@ fn a_detach_waits_for_its_writable_maps_and_a_release_writes_back() {
   write_file(&mut client, id, "/f.bin", &old);
   let start = daemon.direct_map_copies().unwrap();
   let attachment = client.attach(id, None, Intent::Write).unwrap().attachment;
-  let mapped = client.map_write((id, attachment), "/f.bin").unwrap();
+  let mapped = client
+    .map_write(
+      (id, attachment),
+      "/f.bin",
+      slates_client::page_bytes().unwrap(),
+    )
+    .unwrap();
   let mut new = old.clone();
   store_phrase(&mapped, &mut new, 100, b"written back at the release");
   assert_eq!(
@@ -846,7 +963,13 @@ fn a_writable_map_follows_its_file_and_reaches_nothing_once_it_is_gone() {
   write_file(&mut client, id, "/f.bin", &old);
   let start = daemon.direct_map_copies().unwrap();
   let attachment = client.attach(id, None, Intent::Write).unwrap().attachment;
-  let mapped = client.map_write((id, attachment), "/f.bin").unwrap();
+  let mapped = client
+    .map_write(
+      (id, attachment),
+      "/f.bin",
+      slates_client::page_bytes().unwrap(),
+    )
+    .unwrap();
   let others = other.attach(id, None, Intent::Write).unwrap().attachment;
   other.fs_rename((id, others), "/f.bin", "/g.bin").unwrap();
   let mut new = old.clone();
@@ -913,7 +1036,13 @@ fn a_writable_maps_object_changes_one_files_bytes_and_nothing_else() {
   let bytes = pattern(MANY_CHUNKS_BYTES, 8);
   write_file(&mut client, mine, "/mine.bin", &bytes);
   let attachment = client.attach(mine, None, Intent::Write).unwrap().attachment;
-  let mapped = client.map_write((mine, attachment), "/mine.bin").unwrap();
+  let mapped = client
+    .map_write(
+      (mine, attachment),
+      "/mine.bin",
+      slates_client::page_bytes().unwrap(),
+    )
+    .unwrap();
   let mut all = vec![0u8; usize::try_from(mapped.mapped_len()).unwrap()];
   mapped.read_at(0, &mut all).unwrap();
   assert_eq!(markers(&all), 0, "no byte of the object is the neighbour's");
@@ -1062,7 +1191,13 @@ fn a_long_writable_map_is_waited_for_while_the_daemon_lives() {
     },
   )
   .unwrap();
-  let mapped = impatient.map_write((id, attachment), "/f.bin").unwrap();
+  let mapped = impatient
+    .map_write(
+      (id, attachment),
+      "/f.bin",
+      slates_client::page_bytes().unwrap(),
+    )
+    .unwrap();
   let mut new = old.clone();
   store_phrase(
     &mapped,
@@ -1103,26 +1238,38 @@ fn a_writable_map_needs_a_write_attachment_and_a_file() {
     other => panic!("refused expected: {other:?}"),
   };
   assert_eq!(
-    refused(client.map_write((id, u64::MAX), "/f.bin")),
+    refused(client.map_write(
+      (id, u64::MAX),
+      "/f.bin",
+      slates_client::page_bytes().unwrap()
+    )),
     Refusal::NotFound,
     "no such attachment"
   );
   assert!(
     matches!(
-      refused(client.map_write((id, reading), "/f.bin")),
+      refused(client.map_write(
+        (id, reading),
+        "/f.bin",
+        slates_client::page_bytes().unwrap()
+      )),
       Refusal::Forbidden { .. }
     ),
     "a read attachment"
   );
   assert!(
     matches!(
-      refused(client.map_write((id, writing), "/d")),
+      refused(client.map_write((id, writing), "/d", slates_client::page_bytes().unwrap())),
       Refusal::BadRequest { .. }
     ),
     "a directory"
   );
   assert_eq!(
-    refused(client.map_write((id, writing), "/missing")),
+    refused(client.map_write(
+      (id, writing),
+      "/missing",
+      slates_client::page_bytes().unwrap()
+    )),
     Refusal::NotFound,
     "a missing file"
   );
@@ -1437,7 +1584,13 @@ fn a_client_of_another_shard_maps_a_file_read_and_write() {
   assert!(read.to_vec().unwrap() == old, "and holds the file");
   client.release_map(read).unwrap();
   let attachment = client.attach(id, None, Intent::Write).unwrap().attachment;
-  let mapped = client.map_write((id, attachment), "/f.bin").unwrap();
+  let mapped = client
+    .map_write(
+      (id, attachment),
+      "/f.bin",
+      slates_client::page_bytes().unwrap(),
+    )
+    .unwrap();
   assert_maps_the_file(&mapped, &old);
   let page = usize::try_from(page_span(1)).unwrap();
   let mut new = old.clone();

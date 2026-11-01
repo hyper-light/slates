@@ -12755,6 +12755,59 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
 
+### A-197 — pmem over a handed copy: a socket route for every pmem VMM (accepted 2026-11-01; building, Step 6 of the VFS and DAX plan)
+Applied in the same change to: A-186 (the copy's length), GAPS, `crates/ipc` (`protocol.rs`: `MapWrite`'s `granule`;
+`stream.rs`: `spawn_bound`), `crates/server` (`direct_map.rs`: the granule checked and the copy sized by it;
+`verbs.rs`), `crates/client` (`map_write`'s granule, `page_bytes`; the granule test in `tests/client.rs`), `crates/cli`
+(`args.rs`: the `pmem` verb, `{pmem}` and `{len}`; `verbs.rs`: `run_pmem`; `signal.rs`: the signal relay;
+`tests/pmem.rs`, new), and `unsafe-budget.toml` (`slates-ipc` 104 → 105, `slates-cli` 5 → 7).
+- **What it answers.** A pmem VMM reached a slates volume only through a host mount: Firecracker, Cloud Hypervisor and
+  QEMU map an image file shared as a virtio-pmem device's memory, and the file was a path through a slates mount (the
+  image form's pmem route, A-160, A-165, A-189). Firecracker has no folder sharing at all, so its socket-route cell was
+  impossible. A-186's writable copy is what a pmem VMM needs instead of a path: a descriptor that authorizes changing
+  one file's copy and nothing else, which the daemon keeps equal to the file as every other path changes it.
+- **The launcher.** `slates pmem ID FILE --fd N -- VMM [ARG ...]` (Linux) takes its own write attachment of the volume,
+  maps FILE to write, and runs the VMM as its child with the copy at descriptor N. `{pmem}` in the VMM's arguments
+  names the copy as `/proc/self/fd/N` (Cloud Hypervisor's `--pmem file=`, QEMU's `memory-backend-file,mem-path=`),
+  `{fd}` as N, `{len}` as its length (QEMU's `size=`); a Firecracker configuration file names `/proc/self/fd/N` in its
+  `path_on_host` itself, since the launcher never rewrites a file.
+  - **2 MiB multiples.** `MapWrite` names a granule, a power of two of at least the page, and the copy is the file's
+    length rounded up to it; the launcher asks 2 MiB. Firecracker's virtio-pmem "requires for the guest exposed memory
+    region to be 2MB aligned" and pads a shorter backing with anonymous pages it never syncs (its `docs/pmem.md`);
+    Cloud Hypervisor refuses a backing that is not a 2 MiB multiple (`size % 0x20_0000 != 0`, its
+    `vmm/src/device_manager.rs`); QEMU takes any page multiple. So the whole region a guest sees is the copy, and the
+    part past the file's end is the copy's too: never written back, as A-186 holds for a copy's last page. A granule
+    that is not a power of two of at least the page is refused `BadRequest` before anything is made.
+  - **Sync points.** The guest's stores land in the copy. They reach the file when the launcher compares the copy
+    back: at each SIGUSR1 (`map_sync`) and at the VM's exit, when it lets the map go (the last compare-back). **The
+    guest's own flush never reaches slates**: a virtio-pmem flush is the VMM's `msync(MS_SYNC)` of its backing
+    (Firecracker's `docs/pmem.md`; QEMU's persistence asks the guest's `fsync` or `msync`), and a copy has no file to
+    write to. A store the guest flushed and the launcher has not yet compared back is in the copy alone.
+  - **No VM outlives its map's holder.** The launcher must stay the VMM's parent to hold the map and compare it back, so
+    it cannot replace itself with the VMM as `slates shards` and `slates vhost-user` do (`slates_ipc::stream::exec_with`,
+    whose reason is a waiting parent's kill leaving the program running). It spawns the VMM bound to itself instead
+    (`spawn_bound`): Linux's parent-death signal (`PR_SET_PDEATHSIG`, SIGKILL) ends the VMM when the launcher's thread
+    ends, and a child whose parent died before the signal was set ends itself before the exec. The daemon's reap of the
+    launcher's client then compares the copy back, as for any client that dies holding a writable map (A-186).
+  - **Signals.** The launcher waits on the VMM's pidfd and on a self-pipe its signal handler writes, never on a timer:
+    SIGUSR1 is a sync; SIGINT and SIGTERM are passed to the VMM, whose end the launcher then answers as an exit. It
+    exits with the VMM's code (128 and the signal for a VMM ended by one), and fails when the last compare-back was
+    refused.
+- **Proven so far** (adacachy: Linux 7.2.9, x86_64; 2026-11-01), by use:
+  - `crates/client/tests/client.rs`, `a_writable_copy_is_its_files_length_rounded_up_to_its_granule`: a 100 KiB file
+    mapped with a 2 MiB granule shows 2 MiB; its sync writes the store at the start and not the one past the end; the
+    page granule maps the page span; granules of three pages and of half a page are refused. On macOS and Linux.
+  - `crates/cli/tests/pmem.rs`, three runs of three tests each passing, with this test binary as the VMM: the copy is
+    2 MiB and the VMM maps and sees 2 MiB; a SIGUSR1 wrote the VMM's page and the file held it; the VM's exit released
+    the map, writing the second page and nothing past the end; the launcher's SIGKILL ended the VMM and the reap
+    compared its page back; SIGTERM reached the VMM, the release wrote its page and the launcher exited 143.
+    Red-checked in a copy of the tree: without the parent-death signal the VMM was alive 20 s after its launcher's
+    kill; with SIGUSR1 answered by no sync, the sync wrote 0 bytes of 4,096.
+- **Owed** (GAPS): the copy surviving a daemon takeover under a live map (A-186's maps end with their daemon today:
+  `ReleaseMap` answers `NotFound` for "one from before a restart"); `guest_image.rs`'s three pmem tests over a handed
+  copy with Firecracker, Cloud Hypervisor and QEMU, and Firecracker on arm64; the adversarial and chaos tests; the DAX
+  matrix's cells.
+
 ### A-196 — A guest's write through slates' own device or a Shards stream is answered once every FUSE mount of its volume has been told, and the device serves on while the reply waits (accepted and built 2026-11-01)
 Applied in the same change to: §4.6 ("Cache posture": the paragraph on when a mount is told), Phase 3's AC-3.3, A-191
 ("What it does not change"), GAPS (the AC-3.3 entry's owed guests), `crates/bridge-virtiofs` (`device.rs`: the told hold
@@ -13489,7 +13542,9 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph and i
   then reports that write-back), and before its reap removes its attachments. So a store outlives its client's process,
   as a store into a shared map of a file does. Other paths see a client's stores after its sync, as they see a guest's
   (A-163) and a mount's mapped stores after write-back. The client sees every other path's change at once, through the
-  copy. A store past the file's end within the copy's last page is not the file's and is never written. A later write
+  copy. A store past the file's end within the copy's last page is not the file's and is never written (since A-197
+  the copy is the file's length rounded up to a granule its client names, the page or 2 MiB for a pmem VMM, and the
+  same holds for all of it past the end). A later write
   over a store not yet synced wins, in the order the writes reached the copy.
 - **Authority.** `MapWrite` names the caller's own write attachment, and resolves the file through it, its scope
   applied, by the check every file verb takes (`crate::fs_verbs::with_writer`). Each write-back slice takes that check

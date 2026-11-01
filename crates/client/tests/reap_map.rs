@@ -144,7 +144,13 @@ fn writer() {
     .attach(volume, None, Intent::Write)
     .unwrap()
     .attachment;
-  let mapped = client.map_write((volume, attachment), "/f.bin").unwrap();
+  let mapped = client
+    .map_write(
+      (volume, attachment),
+      "/f.bin",
+      slates_client::page_bytes().unwrap(),
+    )
+    .unwrap();
   for at in STORED_AT {
     assert_eq!(mapped.write_at(at, STORED).unwrap(), STORED.len());
   }
@@ -175,7 +181,13 @@ fn cross_shard_writer() {
     .attach(volume, None, Intent::Write)
     .unwrap()
     .attachment;
-  let mapped = client.map_write((volume, attachment), "/f.bin").unwrap();
+  let mapped = client
+    .map_write(
+      (volume, attachment),
+      "/f.bin",
+      slates_client::page_bytes().unwrap(),
+    )
+    .unwrap();
   for at in STORED_AT {
     assert_eq!(mapped.write_at(at, STORED).unwrap(), STORED.len());
   }

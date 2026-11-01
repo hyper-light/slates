@@ -3454,7 +3454,14 @@ fn dispatch_inner(
       volume,
       attachment,
       path,
-    } => crate::direct_map::map_write(state, client_id, principal, (volume, attachment), &path),
+      granule,
+    } => crate::direct_map::map_write(
+      state,
+      client_id,
+      principal,
+      (volume, attachment),
+      (&path, granule),
+    ),
     RequestBody::MapSync { volume, mapping_id } => {
       crate::direct_map::map_sync(state, client_id, principal, (volume, mapping_id))
     }

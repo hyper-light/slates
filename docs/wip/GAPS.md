@@ -10366,6 +10366,25 @@ beside it (no unprivileged process sees a frame number), and L2's shift (no map 
   the backing. No test reaches a fill failing part-way. Placement does not widen it: a range is placed only once its
   fill finishes.
 
+### 2026-11-01: pmem over a handed copy, a socket route for every pmem VMM (A-197) — building
+
+**Built (A-197, Step 6.1 of the VFS and DAX plan).** `slates pmem ID FILE --fd N -- VMM` maps a file to write with a
+2 MiB granule (`MapWrite`'s `granule`, a power of two of at least the page, refused `BadRequest` otherwise) and runs the
+VMM as its child with the copy at descriptor N, bound by Linux's parent-death signal; SIGUSR1 and the VM's exit
+compare the copy back, and the guest's own flush never reaches slates. Proven on adacachy (Linux 7.2.9, 2026-11-01):
+`crates/cli/tests/pmem.rs` 3 of 3 in each of three runs, the granule test in `crates/client/tests/client.rs` on macOS
+and Linux; red-checked without the parent-death signal and without the sync.
+
+**Owed:**
+- the copy surviving a daemon takeover under a live map: A-186's writable maps end with their daemon today, so a
+  successor answers a holder's sync `NotFound` and a guest's later stores never reach the file;
+- `crates/cli/tests/guest_image.rs`'s three pmem tests over a handed copy, no host mount as the backing, with
+  Firecracker and Cloud Hypervisor on adacachy and QEMU on CI, and Firecracker on arm64 on the nested host Step 7
+  builds;
+- the adversarial and chaos tests: writes past the image's end, a flush storm with no slates I/O, a guest killed
+  mid-store;
+- the DAX matrix's Firecracker socket-route cell, which stays "impossible" until the tests above pass.
+
 ### 2026-11-01: one window kind: the fd-sharing placer maps per-file backings, and the arena's windows are gone (A-195)
 
 **Built (A-195).** The fd-sharing placer (an in-process VMM's window, overlaid by the device itself) maps per-file

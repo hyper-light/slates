@@ -312,7 +312,11 @@ slates-vfs = 0
 slates-land = 4
 slates-anchor = 6
 slates-db = 0
-slates-ipc = 104
+slates-ipc = 105
+# 2026-11-01 (+1, Step 6.1 of the VFS and DAX plan, `stream.rs` `spawn_bound` compiled only for Linux): `slates pmem`
+#   must stay its VMM's parent to hold the VMM's map and compare it back, so it spawns rather than replacing itself as
+#   `exec_with` does. `pre_exec` (unsafe by signature) whose closure sets the parent-death signal (`prctl`, through
+#   rustix), checks the parent is still the launcher (`getppid`) and makes one `dup2`, the shape of `exec_with`'s.
 # 2026-10-27 (+1, `peer.rs` compiled only for Linux; docs/bugs/2026-10-27-a-peer-whose-process-the-daemon-cannot-see-was-
 #   refused-by-undefined-behaviour.md): one `getsockopt(SOL_SOCKET, SO_PEERCRED)` into a `libc::ucred` of plain
 #   integers. rustix 1.1's `socket_peercred`, the safe wrapper it replaces at both of its call sites (the rendezvous and
@@ -357,7 +361,11 @@ slates-ipc = 104
 #   range) the layout keeps: the daemon's copies reach only the write log and image slots.
 slates-server = 6
 slates-client = 0
-slates-cli = 5
+slates-cli = 7
+# 2026-11-01 (+2, Step 6.1 of the VFS and DAX plan, `signal.rs` `relay` compiled only for Linux): `slates pmem` waits on
+#   its VMM's pidfd and on its signals together, so its signals arrive as bytes in a self-pipe: the handler's one
+#   `write(2)`, async-signal-safe, into the pipe's write end (1), and `signal(2)` installing that handler for SIGUSR1,
+#   SIGINT and SIGTERM (1).
 slates-wire = 4
 # slates-bridge-core (0): the operation layer is the trait, neutral data structs and the
 # volume-core implementation; no syscalls, no unsafe.

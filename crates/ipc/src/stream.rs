@@ -160,6 +160,65 @@ pub fn exec_with(
   }
 }
 
+/// Starts `program` with `args` as a child of this process, handing it `descriptor` at descriptor number `at`, and
+/// binds the child's life to this thread's: Linux's parent-death signal (`PR_SET_PDEATHSIG`, `SIGKILL`) ends it when
+/// the thread that started it ends, however that thread ends. What `slates pmem` needs, which must stay the VMM's parent
+/// to hold its map and compare it back, and so must not leave the VMM running when it is killed, which a waiting parent
+/// otherwise would ([`exec_with`]'s reason for replacing itself instead). Call it from a thread that lives as long as
+/// the child should (the launcher's main thread): the signal follows the thread, not the process.
+///
+/// Exactly one copy of `descriptor` reaches the program, at `at`, as in [`exec_with`]; this process keeps its own. A
+/// child whose parent had already died before the signal was set ends itself before the exec (its parent's process id
+/// is no longer this one's), so no child ever runs unbound. Refused before anything is spawned for a number below
+/// [`FIRST_HANDED_NUMBER`]; refused as the spawn is when the program cannot run.
+#[cfg(target_os = "linux")]
+pub fn spawn_bound(
+  program: &std::ffi::OsStr,
+  args: &[std::ffi::OsString],
+  descriptor: BorrowedFd<'_>,
+  at: i32,
+) -> Result<std::process::Child, IpcError> {
+  use std::os::fd::AsRawFd;
+  use std::os::unix::process::CommandExt;
+  if at < FIRST_HANDED_NUMBER {
+    return Err(IpcError::Layout {
+      reason: "a descriptor is handed past standard input, output and error",
+    });
+  }
+  // A close-on-exec copy at another number than `at`, which `dup2` copies from: a copy onto itself would leave
+  // close-on-exec set, and the exec would close it.
+  let source = rustix::io::fcntl_dupfd_cloexec(descriptor, at.saturating_add(1))
+    .map_err(|e| refused("fcntl_dupfd_cloexec", e))?;
+  let from = source.as_raw_fd();
+  let parent = rustix::process::getpid();
+  let mut command = std::process::Command::new(program);
+  command.args(args);
+  // SAFETY: the closure runs in the child just before `execvp`, after the standard library has reset the signal state
+  // it changes, and makes three system calls on values it copied (`prctl(PR_SET_PDEATHSIG)`, `getppid`, `dup2(from,
+  // at)`), reading errno on failure: no allocation, no lock, no other state, which is what `pre_exec` asks. `from` is
+  // open until the spawn returns, since `source` is dropped only after it; `dup2` places a copy at `at` with
+  // close-on-exec cleared, so the exec keeps that copy while `from`, close-on-exec, closes.
+  unsafe {
+    command.pre_exec(move || {
+      rustix::process::set_parent_process_death_signal(Some(rustix::process::Signal::KILL))
+        .map_err(std::io::Error::from)?;
+      if rustix::process::getppid() != Some(parent) {
+        return Err(std::io::Error::from(rustix::io::Errno::SRCH));
+      }
+      if libc::dup2(from, at) < 0 {
+        return Err(std::io::Error::last_os_error());
+      }
+      Ok(())
+    });
+  }
+  let spawned = command.spawn();
+  drop(source);
+  spawned.map_err(|error| IpcError::OsRefused {
+    call: "spawn",
+    code: error.raw_os_error(),
+  })
+}
+
 fn refused(call: &'static str, e: rustix::io::Errno) -> IpcError {
   IpcError::OsRefused {
     call,
