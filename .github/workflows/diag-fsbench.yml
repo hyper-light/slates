@@ -1,0 +1,135 @@
+name: DIAG the mount benchmark on every platform cell (not for main)
+
+# Step 2 of the VFS and DAX plan (2026-11-01): docs/wip/bench/fsbench on the five platform cells, quiet and with every
+# core loaded, for BENCHMARKS.md's like-for-like tables. Each job builds the release binaries, runs its platform's script,
+# prints what it measured and keeps it as an artifact. Linux: the FUSE mount against tmpfs and overlayfs. macOS: the NFS
+# mount against APFS on a RAM disk and on the boot disk. Windows: the WinFsp drive against NTFS, and WinFsp's fsbench,
+# built from WinFsp's tree at 4425d4807a since its installer does not ship it.
+
+on:
+  push:
+    branches: [diag-fsbench]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    name: fsbench on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: FUSE
+        run: |
+          command -v fusermount3 > /dev/null || { sudo apt-get update && sudo apt-get install -y fuse3; }
+          echo "image $ImageOS $ImageVersion; $(nproc) CPUs; $(uname -srm)"
+      - name: Build the release binaries
+        run: cargo build --release --locked -p slates-cli --bin slates --example mount_bench
+      - name: The mount benchmark
+        run: bash docs/wip/bench/fsbench/linux.sh 2>&1 | tee fsbench.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fsbench-${{ matrix.runner }}
+          path: fsbench.txt
+
+  macos:
+    name: fsbench on macos-latest
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: The runner
+        run: echo "image $ImageOS $ImageVersion; $(sysctl -n hw.ncpu) CPUs; $(sw_vers -productVersion); $(uname -m)"
+      - name: Build the release binaries
+        run: cargo build --release --locked -p slates-cli --bin slates --example mount_bench
+      - name: The mount benchmark
+        run: bash docs/wip/bench/fsbench/macos.sh 2>&1 | tee fsbench.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fsbench-macos-latest
+          path: fsbench.txt
+
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            msvc: x64
+          - runner: windows-11-arm
+            msvc: arm64
+    name: fsbench on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (x86_64)
+        if: matrix.msvc == 'x64'
+        uses: ilammy/setup-nasm@v1.5.2
+      # As CI's windows-arm64 lane: aws-lc-sys builds its C with clang-cl on this target.
+      - name: clang-cl (arm64)
+        if: matrix.msvc == 'arm64'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Install WinFsp, and check it installed
+        shell: pwsh
+        run: |
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            choco install winfsp -y --no-progress
+            if (Test-Path "C:\Program Files (x86)\WinFsp\bin") { break }
+            Start-Sleep -Seconds 30
+          }
+          if (-not (Test-Path "C:\Program Files (x86)\WinFsp\bin")) { Write-Error "WinFsp did not install"; exit 1 }
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "image $env:ImageOS $env:ImageVersion; $env:NUMBER_OF_PROCESSORS CPUs; $env:PROCESSOR_ARCHITECTURE"
+      - name: Build the release binaries
+        shell: bash
+        run: cargo build --release --locked -p slates-cli --bin slates --example mount_bench
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc }}
+      - name: Build WinFsp's fsbench (WinFsp 4425d4807a)
+        shell: pwsh
+        run: |
+          $base = "https://cdn.jsdelivr.net/gh/winfsp/winfsp@4425d4807aea4626affb151e38c1cc774ccd5e75"
+          New-Item -ItemType Directory -Force -Path winfsp-fsbench/tlib | Out-Null
+          Invoke-WebRequest "$base/tst/fsbench/fsbench.c" -OutFile winfsp-fsbench/fsbench.c
+          Invoke-WebRequest "$base/ext/tlib/testsuite.c" -OutFile winfsp-fsbench/tlib/testsuite.c
+          Invoke-WebRequest "$base/ext/tlib/testsuite.h" -OutFile winfsp-fsbench/tlib/testsuite.h
+          cl /nologo /O2 /DNDEBUG /D_CONSOLE /Iwinfsp-fsbench winfsp-fsbench/fsbench.c winfsp-fsbench/tlib/testsuite.c ntdll.lib advapi32.lib /Fe:winfsp-fsbench/fsbench.exe
+          if (-not (Test-Path winfsp-fsbench/fsbench.exe)) { Write-Error "fsbench did not build"; exit 1 }
+      - name: The mount benchmark and WinFsp's fsbench
+        shell: bash
+        run: FSBENCH="$(pwd)/winfsp-fsbench/fsbench.exe" bash docs/wip/bench/fsbench/windows.sh 2>&1 | tee fsbench.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fsbench-${{ matrix.runner }}
+          path: fsbench.txt
