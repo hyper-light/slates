@@ -536,6 +536,38 @@ impl Guest {
     }
   }
 
+  /// The next console line holding `words` within `within`, every line read kept in the transcript: a line the VM's
+  /// launcher prints on the same stream (`slates pmem`'s `synced:`), which is no probe reply. A reply read meanwhile is
+  /// kept, not answered: a caller expects none while it waits.
+  pub(crate) fn expect_line(&mut self, words: &str, within: Duration) -> String {
+    let deadline = Instant::now().checked_add(within).unwrap();
+    loop {
+      match self
+        .lines
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+      {
+        Ok(line) => {
+          self.keep(line.clone());
+          if line.contains(words) {
+            return line;
+          }
+        }
+        Err(RecvTimeoutError::Timeout) => {
+          panic!(
+            "no line holding `{words}` within {within:?}\n{}",
+            self.transcript()
+          )
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+          panic!(
+            "the VM's console closed before `{words}`\n{}",
+            self.transcript()
+          )
+        }
+      }
+    }
+  }
+
   /// Whether a line the transcript keeps holds `words`.
   pub(crate) fn said(&self, words: &str) -> bool {
     self.transcript.iter().any(|line| line.contains(words))

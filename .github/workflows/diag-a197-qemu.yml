@@ -1,0 +1,66 @@
+name: diag-a197-qemu
+# Diagnostics for A-197 (Step 6.3), never main: tests/guest_image.rs's three pmem tests in QEMU, each over the image
+# file through a slates mount and over a copy `slates pmem` hands QEMU, three runs; then a red-check copy whose guest
+# mounts with dax=never over the handed copy alone, which must fail at the DAX check.
+on:
+  push:
+    branches: ['diag-a197-qemu-*']
+jobs:
+  qemu-image:
+    name: guest_image pmem in QEMU over a handed copy (A-197)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Open KVM to the job
+        run: |
+          if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; fi
+          ls -l /dev/kvm || echo "no /dev/kvm: the guest runs under software emulation"
+      - name: Build the guest image
+        run: docker build -t slates-guest ci/guest
+      - name: The three pmem tests in QEMU, both backings, three runs
+        shell: bash
+        run: |
+          set -o pipefail
+          docker run --rm --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+            --device /dev/fuse --cap-add SYS_ADMIN \
+            $( [ -e /dev/kvm ] && echo --device /dev/kvm ) \
+            -v "$PWD":/src -w /src slates-guest sh -c \
+            'set -e; host=$(rustc -vV | sed -n "s/^host: //p"); \
+             RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -p slates-guest-probe \
+               --bin slates-guest-probe --target "$host" --target-dir target/probe; \
+             for n in 1 2 3; do echo "=== run $n"; \
+             SLATES_GUEST_QEMU=$(ls /usr/bin/qemu-system-x86_64 /usr/bin/qemu-system-aarch64 2>/dev/null | head -1) \
+             SLATES_GUEST_KERNEL=/guest/vmlinuz \
+             SLATES_GUEST_MODULES="/lib/modules/$(ls /lib/modules | head -1)" \
+             SLATES_GUEST_PROBE="/src/target/probe/$host/release/slates-guest-probe" \
+             cargo test -p slates-cli --test guest_image pmem -- --nocapture --test-threads=1; done' 2>&1 | tee guest-image.log
+          if grep -q "SKIP" guest-image.log; then echo "an image test was skipped"; exit 1; fi
+          grep -E "^=== run|test result|booted|resynced" guest-image.log
+          test "$(grep -c 'test result: ok. 3 passed' guest-image.log)" = 3
+      - name: Red-check, dax=never over the handed copy fails at the DAX check
+        shell: bash
+        run: |
+          set -o pipefail
+          sed -i 's/slates.dax=always slates.modules/slates.dax=never slates.modules/' crates/cli/tests/guest_image.rs
+          sed -i 's/^const BACKINGS: \[Backing; 2\] = \[Backing::Mount, Backing::Handed\];/const BACKINGS: [Backing; 1] = [Backing::Handed];/' crates/cli/tests/guest_image.rs
+          grep -n "slates.dax=never" crates/cli/tests/guest_image.rs
+          grep -n "^const BACKINGS: \[Backing; 1\] = \[Backing::Handed\];" crates/cli/tests/guest_image.rs
+          set +e
+          docker run --rm --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+            --device /dev/fuse --cap-add SYS_ADMIN \
+            $( [ -e /dev/kvm ] && echo --device /dev/kvm ) \
+            -v "$PWD":/src -w /src slates-guest sh -c \
+            'host=$(rustc -vV | sed -n "s/^host: //p"); \
+             SLATES_GUEST_QEMU=$(ls /usr/bin/qemu-system-x86_64 /usr/bin/qemu-system-aarch64 2>/dev/null | head -1) \
+             SLATES_GUEST_KERNEL=/guest/vmlinuz \
+             SLATES_GUEST_MODULES="/lib/modules/$(ls /lib/modules | head -1)" \
+             SLATES_GUEST_PROBE="/src/target/probe/$host/release/slates-guest-probe" \
+             cargo test -p slates-cli --test guest_image a_guest_maps_a_volume_image_with_dax_through_virtio_pmem \
+               -- --nocapture --test-threads=1' > red.log 2>&1
+          code=$?
+          set -e
+          grep -E "panicked|DAX is what|test result|mapped dax" red.log || true
+          echo "red-check exit $code"
+          test "$code" -ne 0
+          grep -q "Mapped { dax: false }: DAX is what this test is for" red.log
