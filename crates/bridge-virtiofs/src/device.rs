@@ -18,12 +18,14 @@
 //! knows the connection is up; `FUSE_DESTROY` is served by the codec (it sweeps the attachment's
 //! references) and observed here so the device knows the guest unmounted.
 //!
-//! DAX is not advertised. The codec's negotiation keeps only the flags it wants, and
-//! `FUSE_MAP_ALIGNMENT` — the flag a DAX-capable device sets, with `map_alignment` in
-//! `fuse_init_out` — is not among them, so a guest that offers DAX gets a reply without it and never
-//! sends `FUSE_SETUPMAPPING`. The contract's reason is recorded on the capability report: a DAX
-//! capability cannot be advertised until mapping isolation, pinning and teardown are established for
-//! the VMM (§4.6 A-9; AC-4.12).
+//! DAX is advertised only where the VMM shares a window and the device's bridge offers it
+//! (`Bridge::dax_offer`). A FUSE_SETUPMAPPING then maps a range of the file's backing, a per-file
+//! object the volume's single write boundary keeps equal to the file before any change returns
+//! (§4.6, A-163, A-168), so nothing the daemon does to the file ever needs a guest's mapping torn
+//! down. Either placer maps it: the fd-sharing cache region the device overlays itself, or the
+//! message placer that asks an out-of-process front end over vhost-user. Both map the same backings
+//! in the same pieces, and every step a backing takes (its fill, the ingest of the guest's stores,
+//! a refill after the disk changed) is the device's, a slice a turn (`crate::backed`, A-195).
 //!
 //! Two caps bound every request before access, derived below: the readable bytes from the FUSE
 //! connection's negotiated `max_write` (the largest request a guest kernel can send is one full
@@ -253,21 +255,21 @@ struct AwaitingBarrier {
 }
 
 /// What `serve_dax` did with a FUSE_SETUPMAPPING / FUSE_REMOVEMAPPING (§4.6): not a DAX verb (dispatch answers),
-/// a reply already in the out buffer, or — for the message placer's SETUPMAPPING — the window asked for, which the
-/// device holds the chain for while the window's backing is filled and its map acknowledged (`crate::backed`).
+/// a reply already in the out buffer, or — for a SETUPMAPPING — the window asked for, which the device holds the chain
+/// for while the window's backing is filled and its pieces mapped (`crate::backed`).
 enum DaxServed {
   /// Not a DAX verb, or no window offered: the FUSE codec's dispatch answers.
   NotHandled,
   /// This many reply bytes are in the out buffer; scatter and publish as usual.
   Replied(usize),
-  /// The message placer's SETUPMAPPING was taken: its chain is held for the fill and the front end's ack.
-  #[cfg(target_os = "linux")]
+  /// A SETUPMAPPING was taken: its chain is held for the fill and the placer's map.
+  #[cfg(unix)]
   MapHeld {
     /// The request's `unique`, which its reply carries.
     unique: u64,
     /// The window it asks for.
     window: crate::backed::BackedWindow,
-    /// Whether the window is sent to the front end once the fill is done.
+    /// Whether the window is mapped once the fill is done.
     sends: bool,
   },
 }
@@ -276,26 +278,26 @@ enum DaxServed {
 enum ChainOutcome {
   /// A reply was scattered into the guest's buffers; the used element's length.
   Replied(u32),
-  /// The message placer's SETUPMAPPING is held for its window's fill and the front end's ack.
-  #[cfg(target_os = "linux")]
+  /// A SETUPMAPPING is held for its window's fill and map.
+  #[cfg(unix)]
   DaxMapHeld,
   /// A request that asks for the guest's stores to reach the volume first is held, unserved, for their ingest.
-  #[cfg(target_os = "linux")]
+  #[cfg(unix)]
   IngestHeld,
 }
 
 /// How the ingest a held request asked for came out (§4.6, [`crate::backed`]): whether it wrote, so the request's reply
 /// waits for the owner's barrier as a mutation's does, and the errno of the first write-back the volume refused, which
 /// an FSYNC, FLUSH or READ answers in place of its own reply.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
 struct Ingested {
   wrote: bool,
   refused: Option<i32>,
 }
 
-/// What one step of the message placer's backed DAX did ([`Device::dax_turn`]).
-#[cfg(target_os = "linux")]
+/// What one step of the device's backed DAX did ([`Device::dax_turn`]).
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DaxTurned {
   /// Whether the pass is to serve no chain: the step did a slice of work, or a held request still waits.
@@ -463,20 +465,14 @@ pub struct Device {
   fault: Option<DeviceError>,
   awaiting: Option<AwaitingBarrier>,
   counters: DeviceCounters,
-  /// How the device places content blocks into the guest's DAX window ([`crate::dax::DaxPlacer`]), installed once at
-  /// admission ([`Device::install_dax_window`]); `None` when the VMM offered no window (then FUSE_SETUPMAPPING is
-  /// declined and DAX is not advertised). The fd-sharing form (`Local`) overlays blocks into a cache region the device
-  /// owns (§4.6); the message-based form is its sibling (Piece C). Unix only (the DAX window is a Linux/vhost-user feature).
+  /// How the device places a file's backing into the guest's DAX window ([`crate::dax::DaxPlacer`]), installed once at
+  /// admission ([`Device::install_dax_window`], or `Device::install_dax_message_placer` on Linux); `None` when the VMM offered
+  /// no window (then FUSE_SETUPMAPPING is declined and DAX is not advertised). Unix only.
   #[cfg(unix)]
   dax_placer: Option<crate::dax::DaxPlacer>,
-  /// The fd-sharing placer's live DAX windows over pinned content blocks, so REMOVEMAPPING (and the terminal teardown)
-  /// finds each mapping to revoke and its window range to unmap. Bounded by the cache region's pages; empty when no
-  /// window is offered or the message placer serves.
+  /// The windows over per-file backings, the backed session, and the request the device holds (§4.6,
+  /// [`crate::backed`]), whichever placer maps them. Empty when no placer serves.
   #[cfg(unix)]
-  dax_windows: Vec<DaxWindowEntry>,
-  /// The message placer's windows over per-file backings, its backed session, and the request it holds (§4.6,
-  /// [`crate::backed`]). Empty unless the message placer serves.
-  #[cfg(target_os = "linux")]
   backed: crate::backed::BackedDax,
 }
 
@@ -506,8 +502,6 @@ impl Device {
       #[cfg(unix)]
       dax_placer: None,
       #[cfg(unix)]
-      dax_windows: Vec::new(),
-      #[cfg(target_os = "linux")]
       backed: crate::backed::BackedDax::default(),
     }
   }
@@ -519,27 +513,34 @@ impl Device {
 
   /// Installs the fd-sharing DAX cache region the VMM offered (§4.6) as the device's placer
   /// ([`crate::dax::DaxPlacer::Local`]), once at admission; `None` leaves DAX unserved (SETUPMAPPING stays declined).
-  /// From here the device maps content blocks' pages into it per FUSE_SETUPMAPPING. Unix only.
+  /// From here the device overlays each window's pieces of the file's backing into it per FUSE_SETUPMAPPING. Unix only.
   #[cfg(unix)]
   pub fn install_dax_window(&mut self, cache: Option<crate::dax::DaxCacheRegion>) {
-    self.dax_placer = cache.map(crate::dax::DaxPlacer::Local);
+    if let Some(cache) = cache {
+      self.install_placer(crate::dax::DaxPlacer::Local(cache));
+    }
   }
 
   /// Installs a message-based DAX placer (§4.6): the device sends SHMEM_MAP/UNMAP over the front end's
-  /// back-end-request channel and completes each on its ack, in place of owning the window. Its windows map per-file
-  /// backings ([`crate::backed`]). An out-of-process VMM (crosvm) uses this instead of [`Device::install_dax_window`]; a
-  /// device gets one form or neither. Linux only.
+  /// back-end-request channel and completes each on its ack, in place of owning the window. An out-of-process VMM
+  /// (crosvm, QEMU) uses this instead of [`Device::install_dax_window`]; a device gets one form or neither. Linux only.
   #[cfg(target_os = "linux")]
   pub fn install_dax_message_placer(
     &mut self,
     placer: crate::vhost_user::MessagePlacer<crate::backed::BackedPiece>,
   ) {
-    // This device tells its VMM where each piece of a window lies, so its backings hold their files in guarded pages
-    // (§4.6, the backed route's L1; A-194).
+    self.install_placer(crate::dax::DaxPlacer::Message(placer));
+  }
+
+  /// Installs `placer` with a backed session laid out guarded where ranges can be huge: either placer names where each
+  /// piece of a window lies itself, so the device's backings hold their files in page interiors (§4.6, the backed
+  /// route's L1; A-194).
+  #[cfg(unix)]
+  fn install_placer(&mut self, placer: crate::dax::DaxPlacer) {
     self.backed.session = slates_bridge_core::dax_backing::DaxBackingSession::with_layout(
       slates_bridge_core::dax_backing::guarded_layout(),
     );
-    self.dax_placer = Some(crate::dax::DaxPlacer::Message(placer));
+    self.dax_placer = Some(placer);
   }
 
   /// Whether a held SETUPMAPPING's map is sent and awaits the front end's ack. Linux only.
@@ -549,8 +550,8 @@ impl Device {
     self.backed.acking()
   }
 
-  /// What the message placer's backed DAX did since the device began (non-vacuity for tests). Linux only.
-  #[cfg(target_os = "linux")]
+  /// What the device's backed DAX did since it began (non-vacuity for tests). Unix only.
+  #[cfg(unix)]
   #[must_use]
   pub fn dax_backed_counts(&self) -> crate::backed::BackedCounts {
     self.backed.counts
@@ -595,42 +596,58 @@ impl Device {
     cache.window_bytes(moffset, len).map(<[u8]>::to_vec)
   }
 
-  /// The live DAX window count, of either placer (non-vacuity for tests). Unix only.
+  /// Stores `bytes` into the DAX window at `moffset` — a diagnostic/test store of what a guest's CPU would store through
+  /// its page table (a live guest stores into the window directly, not through this): whether the range lies in the
+  /// fd-sharing placer's window. `false` without a window, for an out-of-window range, or with the message placer, which
+  /// keeps no local window. The caller stores only into a range it mapped writable (a `PROT_NONE` hole or a read-only
+  /// overlay faults). Unix only.
+  #[cfg(unix)]
+  pub fn dax_window_store(&mut self, moffset: u64, bytes: &[u8]) -> bool {
+    let Some(crate::dax::DaxPlacer::Local(cache)) = self.dax_placer.as_mut() else {
+      return false;
+    };
+    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    match cache.window_bytes_mut(moffset, len) {
+      Some(window) => {
+        window.copy_from_slice(bytes);
+        true
+      }
+      None => false,
+    }
+  }
+
+  /// The fd-sharing placer's overlays made and restored since the device began, `(mapped, unmapped)`: its cache region's
+  /// non-vacuity counters ([`crate::dax::DaxCacheRegion::mapped`]), one a piece of a window. `None` without that placer.
+  /// Unix only.
+  #[cfg(unix)]
+  #[must_use]
+  pub fn dax_overlays(&self) -> Option<(u64, u64)> {
+    match self.dax_placer.as_ref() {
+      Some(crate::dax::DaxPlacer::Local(cache)) => Some((cache.mapped(), cache.unmapped())),
+      _ => None,
+    }
+  }
+
+  /// The live DAX window count (non-vacuity for tests). Unix only.
   #[cfg(unix)]
   #[must_use]
   pub fn dax_window_count(&self) -> usize {
-    #[cfg(target_os = "linux")]
-    let backed = self.backed.windows.len();
-    #[cfg(not(target_os = "linux"))]
-    let backed = 0;
-    self.dax_windows.len().saturating_add(backed)
+    self.backed.windows.len()
   }
 
-  /// Tears every live DAX window down (§4.6 terminal teardown). The fd-sharing placer's windows take the two-phase
-  /// revoke per mapping, so no block is left pinned; the message placer's are unmapped and their backings let go. The
-  /// terminal step of a device whose guest never sent FUSE_DESTROY — a VMM that disconnected or crashed — calls this
-  /// with the attachment's bridge, which FUSE_DESTROY does for a clean unmount; the message placer's guest stores have
-  /// been ingested before it (the serve loop's end). Idempotent: a device with no live window drains nothing.
+  /// Unmaps every live DAX window and lets every backing go (§4.6 terminal teardown): the guest unmounted, or the device
+  /// ends. The terminal step of a device whose guest never sent FUSE_DESTROY — a VMM that disconnected or crashed —
+  /// calls this with the attachment's bridge, which FUSE_DESTROY does for a clean unmount; the guest's stores through its
+  /// maps have been ingested before it (the serve loop's end). A window whose unmap is refused is forgotten all the same:
+  /// its backing goes with the device, and the window range keeps the object alive behind the guest until the VMM drops
+  /// it. Idempotent: a device with no live window drains nothing.
   #[cfg(unix)]
   pub fn release_dax(
     &mut self,
     bridge: &mut dyn slates_bridge_core::Bridge,
-    cx: &slates_bridge_core::OpContext,
+    _cx: &slates_bridge_core::OpContext,
   ) {
-    let windows = std::mem::take(&mut self.dax_windows);
-    if let Some(crate::dax::DaxPlacer::Local(cache)) = self.dax_placer.as_mut() {
-      for entry in &windows {
-        teardown_dax_window(cache, bridge, cx, entry);
-      }
-    }
-    #[cfg(target_os = "linux")]
-    self.release_backed(bridge);
-  }
-
-  /// Unmaps every window over a backing and lets every backing go: the guest unmounted or the device ends. Linux only.
-  #[cfg(target_os = "linux")]
-  fn release_backed(&mut self, bridge: &mut dyn slates_bridge_core::Bridge) {
-    if let Some(crate::dax::DaxPlacer::Message(placer)) = self.dax_placer.as_mut() {
+    if let Some(placer) = self.dax_placer.as_mut() {
       let layout = self.backed.session.layout();
       for window in std::mem::take(&mut self.backed.windows) {
         unmap_backed(placer, &mut self.backed.counts, &window, layout);
@@ -641,10 +658,10 @@ impl Device {
     }
   }
 
-  /// Lets every backing of the message placer go, and its fill, ingest and refill under way, giving their charge back:
-  /// the device ends. The terminal step reaches the store's backings through this when the volume itself is gone
-  /// ([`crate::admission::AdmittedDevice::abandon`]'s sibling). Linux only.
-  #[cfg(target_os = "linux")]
+  /// Lets every backing go, and its fill, ingest and refill under way, giving their charge back: the device ends. The
+  /// terminal step reaches the store's backings through this when the volume itself is gone
+  /// ([`crate::admission::AdmittedDevice::abandon`]'s sibling). Unix only.
+  #[cfg(unix)]
   pub fn release_backings(&mut self, backings: &mut slates_vfs::shards_backing::ShardsBackings) {
     let held = u64::try_from(self.backed.session.len()).unwrap_or(u64::MAX);
     self.backed.session.release_all(backings);
@@ -660,149 +677,21 @@ impl Device {
   ) {
   }
 
-  /// Revokes every live DAX window of inode `no` at the **daemon's** request (§4.6 step 5 — the daemon-initiated
-  /// counterpart of a guest's REMOVEMAPPING). Before the daemon moves, writes, shares, lands or takes over an
-  /// inode's content it signals the device here, which munmaps the guest's window and completes the two-phase revoke
-  /// (unregister, unmap, then unpin) so the block is unmapped from the guest's page table **before** it is unpinned —
-  /// a reused block is never reachable through a stale TLB (the async-revoke hazard §4.6 #1 names). Returns how many
-  /// windows were torn down (0 if the inode has none). The daemon holds the inode's pin until this returns, so the
-  /// window never outlives the pin. This is the device half; the VFS half (`Store::dax_revoke_inode`) stays the
-  /// synchronous unpin for the no-live-window case, and the per-shard channel that routes a daemon revoke to this
-  /// (so a `Volume::write`/`truncate`/dir-mutation on a mapped inode calls it) is the remaining integration.
+  /// The attachment's view moved (§4.6 "revoke on advance"; a snapshot reader's `advance`): every backing is marked
+  /// stale, so each is refilled from the new view before the guest sees anything more ([`Device::dax_turn`]). No window
+  /// is torn down: each maps its file's backing, which the refill brings to the new view in place. Unix only.
   #[cfg(unix)]
-  pub fn request_revoke_inode(
-    &mut self,
-    no: u64,
-    bridge: &mut dyn slates_bridge_core::Bridge,
-    cx: &slates_bridge_core::OpContext,
-  ) -> usize {
-    self.revoke_inode_windows(no, bridge, cx, false)
-  }
-
-  /// Revokes only the **writable** live DAX windows of inode `no` at the daemon's request (§4.6): what a snapshot or
-  /// clone of the volume needs — a writable mapping of a block about to be shared-frozen must be torn down (its next
-  /// write would reach the frozen version), while **read-only** mappings survive (immutable shared content is the
-  /// gate's allowed DAX case, and read-only windows cannot corrupt a snapshot). Unlike [`Self::request_revoke_inode`]
-  /// (which tears every window, as a write or truncate makes all of them stale), this keeps the inode's read-only
-  /// windows. Returns how many writable windows were torn. The device half for the snapshot teardown path; the
-  /// synchronous server-side recall that drives it (so `snapshot` tears a live guest's writable windows before it
-  /// freezes) is the remaining cross-task integration (`docs/wip/GAPS.md`).
-  #[cfg(unix)]
-  pub fn request_revoke_writable_inode(
-    &mut self,
-    no: u64,
-    bridge: &mut dyn slates_bridge_core::Bridge,
-    cx: &slates_bridge_core::OpContext,
-  ) -> usize {
-    self.revoke_inode_windows(no, bridge, cx, true)
-  }
-
-  /// Tears down inode `no`'s live DAX windows — every one, or only the writable ones when `writable_only` — munmap
-  /// then unpin (the two-phase revoke), so each block is unmapped from the guest's page table before it is unpinned
-  /// (the async-revoke stale-TLB hazard §4.6 #1). The daemon holds each inode pin until this returns, so a window
-  /// never outlives its pin. Returns how many were torn.
-  #[cfg(unix)]
-  fn revoke_inode_windows(
-    &mut self,
-    no: u64,
-    bridge: &mut dyn slates_bridge_core::Bridge,
-    cx: &slates_bridge_core::OpContext,
-    writable_only: bool,
-  ) -> usize {
-    // A window over a backing is kept equal to the file by the write boundary, so nothing here revokes one: these are
-    // the fd-sharing placer's windows over pinned blocks alone.
-    let mut torn = 0usize;
-    if let Some(crate::dax::DaxPlacer::Local(cache)) = self.dax_placer.as_mut() {
-      let mut index = 0;
-      while index < self.dax_windows.len() {
-        match self.dax_windows.get(index).copied() {
-          Some(entry)
-            if entry.mapping.inode.0 == no && (!writable_only || entry.mapping.writable) =>
-          {
-            teardown_dax_window(cache, bridge, cx, &entry);
-            self.dax_windows.swap_remove(index);
-            torn = torn.saturating_add(1);
-          }
-          _ => index = index.saturating_add(1),
-        }
-      }
+  pub fn view_advanced(&mut self, bridge: &mut dyn slates_bridge_core::Bridge) {
+    if self.dax_placer.is_some()
+      && let Some(state) = bridge.dax_state()
+    {
+      self.backed.session.mark_all_stale(state.backings);
     }
-    torn
   }
 
-  /// Re-validates every live DAX window against the device's **current** view and tears any the view no longer backs
-  /// (§4.6 "revoke on advance"): after a snapshot reader advances, its windows onto inodes whose content changed
-  /// name blocks the new view does not hold, so [`slates_bridge_core::Bridge::dax_window_current`] fails and the
-  /// two-phase revoke (munmap then unpin) tears them — the guest re-maps against the new view — while windows onto
-  /// unchanged, block-shared content stay current and survive. Unlike [`Self::request_revoke_inode`] (a write's
-  /// inode-global teardown across every reader), this is the moving reader's own device re-checking its own windows,
-  /// so no other reader's are touched. Returns how many were torn.
-  ///
-  /// The message placer's windows are never torn: each maps its file's backing, and the view's move marks every
-  /// backing stale, so each is refilled from the new view before the guest sees anything more (`Device::dax_turn`).
-  #[cfg(unix)]
-  pub fn revalidate_windows(
-    &mut self,
-    bridge: &mut dyn slates_bridge_core::Bridge,
-    cx: &slates_bridge_core::OpContext,
-  ) -> usize {
-    let mut torn = 0usize;
-    match self.dax_placer.as_mut() {
-      Some(crate::dax::DaxPlacer::Local(cache)) => {
-        let mut index = 0;
-        while index < self.dax_windows.len() {
-          match self.dax_windows.get(index).copied() {
-            Some(entry) if !bridge.dax_window_current(&entry.mapping, cx) => {
-              teardown_dax_window(cache, bridge, cx, &entry);
-              self.dax_windows.swap_remove(index);
-              torn = torn.saturating_add(1);
-            }
-            _ => index = index.saturating_add(1),
-          }
-        }
-      }
-      #[cfg(target_os = "linux")]
-      Some(crate::dax::DaxPlacer::Message(_)) => {
-        if let Some(state) = bridge.dax_state() {
-          self.backed.session.mark_all_stale(state.backings);
-        }
-      }
-      None => {}
-    }
-    torn
-  }
-
-  /// No DAX window exists off Unix, so a daemon-initiated revoke tears nothing down.
+  /// No DAX window exists off Unix, so a moved view refills nothing.
   #[cfg(not(unix))]
-  pub fn request_revoke_inode(
-    &mut self,
-    _no: u64,
-    _bridge: &mut dyn slates_bridge_core::Bridge,
-    _cx: &slates_bridge_core::OpContext,
-  ) -> usize {
-    0
-  }
-
-  /// No DAX window exists off Unix, so a daemon-initiated writable revoke tears nothing down.
-  #[cfg(not(unix))]
-  pub fn request_revoke_writable_inode(
-    &mut self,
-    _no: u64,
-    _bridge: &mut dyn slates_bridge_core::Bridge,
-    _cx: &slates_bridge_core::OpContext,
-  ) -> usize {
-    0
-  }
-
-  /// No DAX window exists off Unix, so an advance re-validate tears nothing down.
-  #[cfg(not(unix))]
-  pub fn revalidate_windows(
-    &mut self,
-    _bridge: &mut dyn slates_bridge_core::Bridge,
-    _cx: &slates_bridge_core::OpContext,
-  ) -> usize {
-    0
-  }
+  pub fn view_advanced(&mut self, _bridge: &mut dyn slates_bridge_core::Bridge) {}
 
   /// Installs the driver's queue layouts — exactly the high-priority queue and the request queues
   /// the configuration publishes, in queue order — validating each (the ring walk's configuration
@@ -911,7 +800,7 @@ impl Device {
         barrier_owed: true,
       });
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     if self.backed.holds() {
       // A request is held for a DAX fill, an ack, an ingest or a refill: serve nothing until the turn completes it
       // ([`Device::dax_turn`]).
@@ -937,11 +826,11 @@ impl Device {
         memory,
         bridge,
         cx,
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         None,
       ) {
         Ok(ChainOutcome::Replied(written)) => written,
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         Ok(ChainOutcome::DaxMapHeld | ChainOutcome::IngestHeld) => {
           // The chain is held for a fill and an ack, or for an ingest; the pass ends, and the turns complete it.
           return Ok(Serviced {
@@ -967,7 +856,7 @@ impl Device {
           barrier_owed: true,
         });
       }
-      #[cfg(target_os = "linux")]
+      #[cfg(unix)]
       if self.refill_owed(bridge) {
         // Serving the request marked a backing stale (the disk changed beneath it): its reply could reveal the change
         // before the guest's map shows it, so its used element waits for the refill.
@@ -1104,7 +993,7 @@ impl Device {
       written = u32::try_from(n).unwrap_or(u32::MAX);
       self.counters.barriers_refused = self.counters.barriers_refused.saturating_add(1);
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     if captured && self.refill_owed(bridge) {
       // The reply could reveal the disk's change before the guest's map shows it: it waits for the refill too.
       self.hold_reply(held.queue, &held.chain, written);
@@ -1166,8 +1055,9 @@ impl Device {
   /// route's L1; A-194). Once the last is in, the window is recorded and the guest answered. If any piece was refused,
   /// the pieces that did map are unmapped again, so a window is mapped whole or not at all, and the guest is answered
   /// `EIO`; where the ring has no room for those unmaps, the window is kept, so the next request over its range unmaps
-  /// it. `None` until the last piece, and when no SETUPMAPPING is held.
-  #[cfg(target_os = "linux")]
+  /// it. `None` until the last piece, and when no SETUPMAPPING is held. The fd-sharing placer's pieces are acknowledged
+  /// here as it overlays them, the message placer's as the front end's acks arrive.
+  #[cfg(unix)]
   fn held_piece_acknowledged(
     &mut self,
     memory: &mut dyn GuestMemory,
@@ -1190,11 +1080,11 @@ impl Device {
     let window = held.window;
     if held.refused {
       let undo = std::mem::take(&mut held.mapped);
-      let unmapped = match self.dax_placer.as_mut() {
-        Some(crate::dax::DaxPlacer::Message(placer)) => unmap_pieces(placer, &undo),
-        _ => Unmapped::ChannelGone,
-      };
-      if unmapped == Unmapped::NoRoom {
+      let unmapped = self
+        .dax_placer
+        .as_mut()
+        .map_or(Unmapped::Done, |placer| unmap_pieces(placer, &undo));
+      if unmapped.keeps_the_window() {
         self.backed.windows.push(window);
       }
       return self.answer_held_map(memory, Some(EIO), admission);
@@ -1206,7 +1096,7 @@ impl Device {
   /// Answers the held SETUPMAPPING ([`crate::backed::HeldMap`]): success (`errno` `None`) or that errno. Scatters the
   /// reply and publishes the used element, as [`Device::complete_awaiting`] does for the barrier, and releases the
   /// charge the chain held since its service pass. `None` when no SETUPMAPPING is held.
-  #[cfg(target_os = "linux")]
+  #[cfg(unix)]
   fn answer_held_map(
     &mut self,
     memory: &mut dyn GuestMemory,
@@ -1237,14 +1127,15 @@ impl Device {
     }))
   }
 
-  /// The terminal drain for the message placer (§4.6 teardown): the guest is ending, so what the device holds of its
-  /// requests is dropped (the guest will not read them), and the requests still awaiting a reply-ack are forgotten,
-  /// since a window over a backing pins nothing.
-  #[cfg(target_os = "linux")]
+  /// The terminal drain (§4.6 teardown): the guest is ending, so what the device holds of its requests is dropped (the
+  /// guest will not read them), and the message placer's requests still awaiting a reply-ack are forgotten, since a
+  /// window over a backing pins nothing.
+  #[cfg(unix)]
   pub fn drain_dax_terminal(&mut self) {
     self.backed.map = None;
     self.backed.request = None;
     self.backed.reply = None;
+    #[cfg(target_os = "linux")]
     if let Some(crate::dax::DaxPlacer::Message(message)) = self.dax_placer.as_mut() {
       // Nothing waits on these acknowledgements: no block is pinned behind a window over a backing.
       drop(message.take_pending());
@@ -1278,8 +1169,8 @@ impl Device {
   }
 
   /// Serves one chain: the FUSE request is gathered, dispatched and its reply scattered; returns
-  /// the bytes written into the chain's writable buffers (the used element's length). With the message placer, a
-  /// request that asks for the guest's stores first is held unless `ingested` says how their ingest came out.
+  /// the bytes written into the chain's writable buffers (the used element's length). With a DAX placer, a request that
+  /// asks for the guest's stores first is held unless `ingested` says how their ingest came out.
   fn serve_chain(
     &mut self,
     queue: u16,
@@ -1287,7 +1178,7 @@ impl Device {
     memory: &mut dyn GuestMemory,
     bridge: &mut dyn Bridge,
     cx: &OpContext,
-    #[cfg(target_os = "linux")] ingested: Option<Ingested>,
+    #[cfg(unix)] ingested: Option<Ingested>,
   ) -> Result<ChainOutcome, DeviceError> {
     let hiprio = queue == HIPRIO_QUEUE;
     let header_len = u64::try_from(IN_HEADER_LEN).unwrap_or(u64::MAX);
@@ -1322,7 +1213,7 @@ impl Device {
     let opcode = header.as_ref().and_then(|h| Opcode::from_wire(h.opcode));
     // A request that asks for the guest's stores through its maps to reach the volume first is held, unserved, while
     // they are written back ([`crate::backed`]); the turn serves it when the ingest is done, with how it came out.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     if ingested.is_none() && self.hold_for_ingest(bridge, queue) {
       self.backed.request = Some(crate::backed::HeldRequest {
         queue,
@@ -1332,10 +1223,8 @@ impl Device {
       return Ok(ChainOutcome::IngestHeld);
     }
     self.observe(header.as_ref());
-    // The guest unmounting (FUSE_DESTROY) with live DAX windows: tear each down (revoke, unmap, unpin) so a block
-    // mapped and never explicitly REMOVEMAPPING'd is not left pinned — otherwise an unmount would leak every mapped
-    // block's pin and the deferred free could never reclaim it (§4.6 terminal teardown). The message placer's windows
-    // are unmapped and its backings let go, their stores ingested while the unmount was held.
+    // The guest unmounting (FUSE_DESTROY) with live DAX windows: each is unmapped and its backing let go, the guest's
+    // stores through its maps ingested while the unmount was held (§4.6 terminal teardown).
     #[cfg(unix)]
     if matches!(opcode, Some(Opcode::Destroy)) {
       self.release_dax(bridge, cx);
@@ -1351,8 +1240,8 @@ impl Device {
     let mut written = if room_short {
       0
     } else {
-      // On Unix, FUSE_SETUPMAPPING / FUSE_REMOVEMAPPING go through the DAX cache region when the VMM offered one
-      // (§4.6); every other opcode — and these when no window is offered — are answered by the FUSE codec's dispatch.
+      // On Unix, FUSE_SETUPMAPPING / FUSE_REMOVEMAPPING go through the DAX placer when the VMM offered one (§4.6);
+      // every other opcode — and these when no window is offered — are answered by the FUSE codec's dispatch.
       #[cfg(unix)]
       {
         match serve_dax(
@@ -1360,16 +1249,13 @@ impl Device {
           bridge,
           cx,
           &mut self.dax_placer,
-          &mut self.dax_windows,
-          #[cfg(target_os = "linux")]
           &mut self.backed,
           &mut self.reply,
         ) {
           DaxServed::NotHandled => dispatch(&self.request, bridge, cx, &mut self.reply),
           DaxServed::Replied(n) => n,
-          // The message placer's SETUPMAPPING was taken: hold the chain while its window's backing is filled and its
-          // map acknowledged. No reply is scattered now; the turn and the ack answer the guest.
-          #[cfg(target_os = "linux")]
+          // A SETUPMAPPING was taken: hold the chain while its window's backing is filled and its pieces mapped. No
+          // reply is scattered now; the turn (and the message placer's acks) answer the guest.
           DaxServed::MapHeld {
             unique,
             window,
@@ -1398,7 +1284,7 @@ impl Device {
     // A write-back the volume refused before this request is answered where its asker reads an answer, so a guest's
     // fsync or close fails rather than claim its stores durable (A-163's rule; a RELEASE's answer the kernel ignores,
     // and a FORGET has none).
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     if let Some(Ingested {
       refused: Some(errno),
       ..
@@ -1433,7 +1319,7 @@ impl Device {
         .saturating_add(reclaimed.references.saturating_add(reclaimed.handles));
       return Err(e);
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     if matches!(opcode, Some(Opcode::Forget | Opcode::BatchForget)) {
       self.release_forgotten(bridge);
     }
@@ -1478,19 +1364,20 @@ impl Device {
   }
 }
 
-/// The message placer's backed DAX, a step a turn (§4.6; [`crate::backed`]). Linux only.
-#[cfg(target_os = "linux")]
+/// The device's backed DAX, a step a turn (§4.6; [`crate::backed`]), whichever placer maps its windows. Unix only.
+#[cfg(unix)]
 impl Device {
-  /// One step of the message placer's backed DAX, taken before each service pass. In the order a guest must see them:
+  /// One step of the device's backed DAX, taken before each service pass. In the order a guest must see them:
   /// 1. a refill a backing owes (the disk changed beneath it), a slice of it, before anything more reaches the guest;
   /// 2. a reply held for that refill, published once it is done;
   /// 3. a request held for the ingest of the guest's stores, a slice of the ingest, then the request served;
-  /// 4. a SETUPMAPPING held for its backing's fill, a slice of the fill, then its map sent or its answer published;
-  /// 5. a map awaiting the front end's acknowledgement, which the loop awaits ([`Device::complete_dax_awaiting`]).
+  /// 4. a SETUPMAPPING held for its backing's fill, a slice of the fill, then its pieces mapped (the fd-sharing placer
+  ///    overlays them and answers at once; the message placer sends them) or its refusal published;
+  /// 5. a message placer's map awaiting the front end's acknowledgement, which the loop awaits
+  ///    (`Device::complete_dax_awaiting`, Linux).
   ///
   /// `busy` when the pass is to serve no chain; a completion names the queue to notify; `barrier_owed` when a request it
-  /// served waits for the owner's barrier. Each slice copies at most `slice_bytes`. Nothing to do without the message
-  /// placer.
+  /// served waits for the owner's barrier. Each slice copies at most `slice_bytes`. Nothing to do without a placer.
   pub fn dax_turn(
     &mut self,
     memory: &mut dyn GuestMemory,
@@ -1502,7 +1389,7 @@ impl Device {
     if let Some(fault) = &self.fault {
       return Err(fault.clone());
     }
-    if !matches!(self.dax_placer, Some(crate::dax::DaxPlacer::Message(_))) {
+    if self.dax_placer.is_none() {
       return Ok(DaxTurned::default());
     }
     let turned = self.backed_step(memory, bridge, cx, slice_bytes, admission);
@@ -1623,8 +1510,8 @@ impl Device {
     })
   }
 
-  /// A slice of the held SETUPMAPPING's fill; when it is done, its map sent to the front end, or the guest answered:
-  /// success for a window the front end maps as asked already, the refusal's errno for a fill refused.
+  /// A slice of the held SETUPMAPPING's fill; when it is done, its window's pieces mapped, or the guest answered:
+  /// success for a window the placer maps as asked already, the refusal's errno for a fill refused.
   fn fill_turn(
     &mut self,
     memory: &mut dyn GuestMemory,
@@ -1637,49 +1524,16 @@ impl Device {
       busy: true,
       ..DaxTurned::default()
     };
-    let layout = self.backed.session.layout();
     let answered = match self.backed.session.fill_step(bridge, cx, slice_bytes) {
       slates_bridge_core::dax_backing::FillStep::Filling => return Ok(busy),
       slates_bridge_core::dax_backing::FillStep::Done(descriptor) => {
-        match (self.backed.map.as_mut(), self.dax_placer.as_mut()) {
-          (Some(held), _) if !held.sends => {
+        match self.backed.map.as_ref() {
+          Some(held) if !held.sends => {
             self.backed.counts.maps_kept = self.backed.counts.maps_kept.saturating_add(1);
             None
           }
-          (Some(held), Some(crate::dax::DaxPlacer::Message(placer))) => {
-            use std::os::fd::AsFd as _;
-            // A window is its backing's pieces (§4.6, A-194): every one is sent, the ring's room asked for all first so
-            // a window is never half sent for want of it, and the guest is answered on the last acknowledgement.
-            let pieces = crate::backed::window_pieces(layout, &held.window);
-            let mut sent = 0usize;
-            if placer.has_room_for(pieces.len()) {
-              for piece in &pieces {
-                let begun = placer.begin_map(
-                  piece.moffset,
-                  piece.len,
-                  descriptor.as_fd(),
-                  piece.object_offset,
-                  held.window.writable,
-                  *piece,
-                );
-                if begun.is_err() {
-                  break;
-                }
-                sent = sent.saturating_add(1);
-              }
-            }
-            if sent == 0 {
-              Some(EIO)
-            } else {
-              held.sent = true;
-              held.pieces_left = sent;
-              held.refused = sent < pieces.len();
-              held.mapped.clear();
-              self.backed.counts.maps_sent = self.backed.counts.maps_sent.saturating_add(1);
-              return Ok(busy);
-            }
-          }
-          _ => Some(EIO),
+          Some(_) => return self.map_held_window(memory, &descriptor, admission),
+          None => Some(EIO),
         }
       }
       slates_bridge_core::dax_backing::FillStep::Refused(refused) => {
@@ -1689,6 +1543,97 @@ impl Device {
     };
     let completed = self.answer_held_map(memory, answered, admission)?;
     Ok(DaxTurned {
+      completed,
+      ..DaxTurned::default()
+    })
+  }
+
+  /// Maps the held SETUPMAPPING's window over the backing `descriptor` names, a piece at a time (§4.6, A-194): the
+  /// message placer sends every piece, the ring's room asked for all first so a window is never half sent for want of
+  /// it, and the guest is answered on the last acknowledgement; the fd-sharing placer overlays each piece itself and
+  /// acknowledges it at once, through the same completion, so a window it maps is whole or not at all there too.
+  fn map_held_window(
+    &mut self,
+    memory: &mut dyn GuestMemory,
+    descriptor: &slates_vfs::shards_backing::HandedObject,
+    admission: &mut dyn ChainAdmission,
+  ) -> Result<DaxTurned, DeviceError> {
+    use std::os::fd::AsFd as _;
+    let layout = self.backed.session.layout();
+    let (Some(held), Some(placer)) = (self.backed.map.as_mut(), self.dax_placer.as_mut()) else {
+      let completed = self.answer_held_map(memory, Some(EIO), admission)?;
+      return Ok(DaxTurned {
+        completed,
+        ..DaxTurned::default()
+      });
+    };
+    let pieces = crate::backed::window_pieces(layout, &held.window);
+    let writable = held.window.writable;
+    // What the fd-sharing placer made of each piece, acknowledged below once the placer's borrow ends.
+    let mut overlaid = Vec::new();
+    let sent = match placer {
+      crate::dax::DaxPlacer::Local(cache) => {
+        for piece in &pieces {
+          let mapped = cache
+            .map(
+              piece.moffset,
+              piece.len,
+              descriptor.as_fd(),
+              piece.object_offset,
+              writable,
+            )
+            .is_ok();
+          overlaid.push((*piece, mapped));
+          // A refused piece refuses the window: the rest are not asked for.
+          if !mapped {
+            break;
+          }
+        }
+        overlaid.len()
+      }
+      #[cfg(target_os = "linux")]
+      crate::dax::DaxPlacer::Message(placer) => {
+        let mut sent = 0usize;
+        if placer.has_room_for(pieces.len()) {
+          for piece in &pieces {
+            let begun = placer.begin_map(
+              piece.moffset,
+              piece.len,
+              descriptor.as_fd(),
+              piece.object_offset,
+              writable,
+              *piece,
+            );
+            if begun.is_err() {
+              break;
+            }
+            sent = sent.saturating_add(1);
+          }
+        }
+        sent
+      }
+    };
+    if sent == 0 {
+      let completed = self.answer_held_map(memory, Some(EIO), admission)?;
+      return Ok(DaxTurned {
+        completed,
+        ..DaxTurned::default()
+      });
+    }
+    held.sent = true;
+    held.pieces_left = sent;
+    held.refused = sent < pieces.len();
+    held.mapped.clear();
+    self.backed.counts.maps_sent = self.backed.counts.maps_sent.saturating_add(1);
+    let mut completed = None;
+    for (piece, mapped) in overlaid {
+      if let Some(done) = self.held_piece_acknowledged(memory, piece, mapped, admission)? {
+        completed = Some(done);
+      }
+    }
+    Ok(DaxTurned {
+      // The message placer's acks are awaited before anything more is served.
+      busy: completed.is_none(),
       completed,
       ..DaxTurned::default()
     })
@@ -1716,9 +1661,7 @@ impl Device {
   /// Begins the ingest the request just gathered asks for, if it is one that asks for the guest's stores first and any
   /// of the backings it names holds ranges asked writable ([`crate::backed::ingest_asked`]): whether one began.
   fn hold_for_ingest(&mut self, bridge: &mut dyn Bridge, queue: u16) -> bool {
-    if self.backed.session.is_empty()
-      || !matches!(self.dax_placer, Some(crate::dax::DaxPlacer::Message(_)))
-    {
+    if self.backed.session.is_empty() || self.dax_placer.is_none() {
       return false;
     }
     let Some(asked) = crate::backed::ingest_asked(&self.request) else {
@@ -1746,7 +1689,7 @@ impl Device {
       return;
     }
     let nodes = crate::backed::forgotten(&self.request, &[]);
-    let Some(crate::dax::DaxPlacer::Message(placer)) = self.dax_placer.as_mut() else {
+    let Some(placer) = self.dax_placer.as_mut() else {
       return;
     };
     let Some(state) = bridge.dax_state() else {
@@ -1779,8 +1722,8 @@ impl Device {
     }
   }
 
-  /// Whether the message placer owes its guest a refill before anything more: a backing of its marked stale (the disk
-  /// changed beneath it, or the view moved) or a refill under way.
+  /// Whether the device owes its guest a refill before anything more: a backing of its marked stale (the disk changed
+  /// beneath it, or the view moved) or a refill under way.
   fn refill_owed(&mut self, bridge: &mut dyn Bridge) -> bool {
     !self.backed.session.is_empty()
       && bridge
@@ -1801,7 +1744,7 @@ impl Device {
   /// Starts the ingest the guest's stores through its maps take before the device ends: every backing with ranges asked
   /// writable. A request held for an ingest goes with the guest, its ingest folded into this one. Whether there is one.
   pub fn begin_end_ingest(&mut self, bridge: &mut dyn Bridge) -> bool {
-    if !matches!(self.dax_placer, Some(crate::dax::DaxPlacer::Message(_))) {
+    if self.dax_placer.is_none() {
       return false;
     }
     self.backed.request = None;
@@ -1898,231 +1841,26 @@ fn scatter(
   Ok(())
 }
 
-/// A live window of the fd-sharing placer (§4.6): the guest-window offset and length it occupies, and the gate mapping
-/// whose pinned block it overlays — so REMOVEMAPPING (and a teardown) finds the mapping to revoke and the window range
-/// to unmap. Bounded by the cache region's pages (one per live SETUPMAPPING). The message placer's windows map per-file
-/// backings instead (`crate::backed::BackedWindow`).
-#[cfg(unix)]
-#[derive(Clone, Copy, Debug)]
-pub struct DaxWindowEntry {
-  /// The offset in the guest's DAX window.
-  moffset: u64,
-  /// The length mapped.
-  len: u64,
-  /// The gate mapping whose block backs the window range.
-  mapping: slates_vfs::dax::Mapping,
-}
-
 /// Linux errno values a DAX reply carries (a guest reads them as Linux, whatever the host).
 #[cfg(unix)]
 mod dax_errno {
-  pub(super) const ENOENT: i32 = 2;
-  pub(super) const EPERM: i32 = 1;
-  /// Format: the Linux errno ABI values a DAX reply carries — invalid argument, no space, unsupported
-  /// operation (a guest reads them as Linux, whatever the host).
+  /// Format: Linux `EINVAL`, a SETUPMAPPING or REMOVEMAPPING whose body or ranges do not parse or fit.
   pub(super) const EINVAL: i32 = 22;
-  pub(super) const ENOSPC: i32 = 28;
-  pub(super) const EOPNOTSUPP: i32 = 95;
   /// Format: Linux `EBUSY`, a window that cannot be unmapped yet, which a SETUPMAPPING over it waits for.
-  #[cfg(target_os = "linux")]
   pub(super) const EBUSY: i32 = 16;
 }
 
-/// The Linux errno a DAX reply carries for a volume-core refusal.
-#[cfg(unix)]
-fn vfs_dax_errno(e: &slates_vfs::error::VfsError) -> i32 {
-  use slates_vfs::error::VfsError as E;
-  match e {
-    E::NotPermitted | E::LinkProtected => dax_errno::EPERM,
-    E::NotFound | E::StaleHandle => dax_errno::ENOENT,
-    E::NoSpace | E::FileTooLarge => dax_errno::ENOSPC,
-    // Both are "this host will not do that", not "you asked wrongly": the second is §4.6 L1 refusing a shift on
-    // a host that cannot back a physically-contiguous sandbox for it.
-    E::SpecialFileOperation | E::NoPhysicalIsolation => dax_errno::EOPNOTSUPP,
-    _ => dax_errno::EINVAL,
-  }
-}
-
-/// Tears one of the fd-sharing placer's live DAX windows down (§4.6): the two-phase revoke — unregister so the hardware
-/// path is inert, unmap the window so the guest's page table loses it, then unpin the block so a deferred free can
-/// reclaim it. Shared by REMOVEMAPPING, a remap over the same window region, and the terminal teardown, so no path
-/// leaves a pinned block held.
-#[cfg(unix)]
-fn teardown_dax_window(
-  cache: &mut crate::dax::DaxCacheRegion,
-  bridge: &mut dyn slates_bridge_core::Bridge,
-  cx: &slates_bridge_core::OpContext,
-  entry: &DaxWindowEntry,
-) {
-  // Phase one: unregister so the hardware path is inert and no new access is authorized.
-  let _ = bridge.dax_revoke_pending(&entry.mapping, cx);
-  // Phase two now: the back end owns the window, so the munmap is synchronous, then the block is unpinned — **only if
-  // the unmap actually happened.** A refused unmap leaves the window still mapped to the block, and unpinning then
-  // returns a block a guest can still reach to the arena's free lists, for the next tenant to be given. That is the
-  // cross-tenant disclosure this two-phase revoke exists to prevent: never unpin before the window is gone.
-  //
-  // `DaxCacheRegion::unmap` overlays the slot with an anonymous `PROT_NONE` mapping, and `mmap(MAP_FIXED)` over a
-  // sub-range splits a VMA — so it can fail with `ENOMEM` once the process reaches `vm.max_map_count`, which a device
-  // with many live windows approaches by doing exactly this. On that path the pin is held instead: the block stays
-  // charged and unreusable, which leaks memory where unpinning would leak content.
-  if cache.unmap(entry.moffset, entry.len).is_ok() {
-    let _ = bridge.dax_release_after_unmap(&entry.mapping, cx);
-  }
-}
-
-/// Whether two window byte ranges `[off, off+len)` overlap, saturating so no bound can overflow.
-#[cfg(unix)]
-fn dax_ranges_overlap(a_off: u64, a_len: u64, b_off: u64, b_len: u64) -> bool {
-  a_off < b_off.saturating_add(b_len) && b_off < a_off.saturating_add(a_len)
-}
-
-/// Tears down every window a SETUPMAPPING mapped before it failed partway through its range (§4.6 N-map rollback), so a
-/// refused SETUPMAPPING backs nothing and leaks no pin: each of the fd-sharing placer's windows in `[win_off,
-/// win_off+win_len)` this request pushed is torn down.
-#[cfg(unix)]
-fn rollback_dax_setup(
-  cache: &mut crate::dax::DaxCacheRegion,
-  bridge: &mut dyn slates_bridge_core::Bridge,
-  cx: &slates_bridge_core::OpContext,
-  dax_windows: &mut Vec<DaxWindowEntry>,
-  win_off: u64,
-  win_len: u64,
-) {
-  let mut index = 0;
-  while index < dax_windows.len() {
-    match dax_windows.get(index).copied() {
-      Some(held) if dax_ranges_overlap(held.moffset, held.len, win_off, win_len) => {
-        teardown_dax_window(cache, bridge, cx, &held);
-        dax_windows.swap_remove(index);
-      }
-      _ => index = index.saturating_add(1),
-    }
-  }
-}
-
-/// What one chunk's map attempt did in the N-map loop (§4.6): advanced the cursor by `this` bytes, ran past the
-/// file's content (stop the loop), or refused with an errno (tear down and refuse the whole SETUPMAPPING).
-#[cfg(unix)]
-enum MapStep {
-  Advanced { this: usize },
-  PastFile,
-  Refused(i32),
-}
-
-/// The window offset, arena-object offset and mapped length for chunk `mapping` at file offset `cur` (§4.6): bounded
-/// to the chunk's authorized window (`file_len` rounded up to `granule`, capped at the block), and never past the
-/// request's `end`. `None` on any overflow (a hostile offset or length), which the caller turns into a refusal.
-#[cfg(unix)]
-#[allow(
-  clippy::too_many_arguments,
-  reason = "the per-chunk window geometry is a flat set of offsets and lengths; a struct would only move the same fields"
-)]
-fn chunk_map_params(
-  mapping: &slates_vfs::dax::Mapping,
-  region_off: usize,
-  block_len: usize,
-  cur: usize,
-  foffset: usize,
-  base_moffset: u64,
-  end: usize,
-  granule: usize,
-) -> Option<(u64, u64, u64)> {
-  let intra = cur.checked_sub(mapping.block_file_start)?;
-  let authorized = mapping
-    .file_len
-    .div_ceil(granule)
-    .saturating_mul(granule)
-    .min(block_len);
-  let room = authorized.checked_sub(intra).filter(|room| *room > 0)?;
-  let this = end.saturating_sub(cur).min(room);
-  let win_off = base_moffset.checked_add(u64::try_from(cur.saturating_sub(foffset)).ok()?)?;
-  let object_off = u64::try_from(region_off.checked_add(intra)?).ok()?;
-  let mapped_len = u64::try_from(this).ok()?;
-  Some((win_off, object_off, mapped_len))
-}
-
-/// Maps the one chunk covering file offset `cur` into the fd-sharing placer's window (§4.6 N-map loop): the gate returns
-/// the open chunk (zero-copy) or the arm's sealed-chunk backing, which the cache overlays synchronously. A `NotFound`
-/// or a chunk that does not cover `cur` (a writable single-block map re-returns block 0) means the range ran past the
-/// file's content — [`MapStep::PastFile`]. Any pin a refused step took is undone before it returns, so a refusal leaves
-/// nothing held for the caller to roll back beyond the earlier chunks.
-#[cfg(unix)]
-#[allow(
-  clippy::too_many_arguments,
-  reason = "the per-chunk map needs the window geometry, the cache, the bridge and the cursor; a struct would only move the same fields"
-)]
-fn map_chunk_at(
-  cache: &mut crate::dax::DaxCacheRegion,
-  bridge: &mut dyn slates_bridge_core::Bridge,
-  cx: &slates_bridge_core::OpContext,
-  dax_windows: &mut Vec<DaxWindowEntry>,
-  object: slates_bridge_core::ObjectId,
-  writable: bool,
-  cur: usize,
-  foffset: usize,
-  base_moffset: u64,
-  end: usize,
-  granule: usize,
-) -> MapStep {
-  let mapping = match bridge.dax_map(object, cx, writable, cur) {
-    Ok(mapping) => mapping,
-    // No chunk at this offset: the range ran past the file's content.
-    Err(slates_vfs::error::VfsError::NotFound) => return MapStep::PastFile,
-    Err(e) => return MapStep::Refused(vfs_dax_errno(&e)),
-  };
-  let Some((fd, region_off, block_len)) = bridge.dax_backing(&mapping) else {
-    let _ = bridge.dax_unmap(&mapping, cx);
-    return MapStep::Refused(dax_errno::EOPNOTSUPP);
-  };
-  // A chunk that does not cover `cur` (a writable single-block map re-returns block 0) means the range ran past the
-  // file's content.
-  if cur >= mapping.block_file_start.saturating_add(mapping.file_len) {
-    let _ = bridge.dax_unmap(&mapping, cx);
-    return MapStep::PastFile;
-  }
-  let Some((win_off, object_off, mapped_len)) = chunk_map_params(
-    &mapping,
-    region_off,
-    block_len,
-    cur,
-    foffset,
-    base_moffset,
-    end,
-    granule,
-  ) else {
-    let _ = bridge.dax_unmap(&mapping, cx);
-    return MapStep::Refused(dax_errno::EINVAL);
-  };
-  if cache
-    .map(win_off, mapped_len, fd, object_off, writable)
-    .is_err()
-  {
-    let _ = bridge.dax_unmap(&mapping, cx);
-    return MapStep::Refused(dax_errno::EINVAL);
-  }
-  dax_windows.push(DaxWindowEntry {
-    moffset: win_off,
-    len: mapped_len,
-    mapping,
-  });
-  MapStep::Advanced {
-    this: usize::try_from(mapped_len).unwrap_or(0),
-  }
-}
-
-/// Serves FUSE_SETUPMAPPING / FUSE_REMOVEMAPPING through the placer the VMM offered (§4.6): the fd-sharing cache region
-/// over pinned content blocks ([`serve_local_dax`]), or the message placer over per-file backings
-/// (`serve_backed_dax`, Linux). [`DaxServed::NotHandled`] when it is not a DAX verb or no window is offered — then the FUSE
-/// codec's `dispatch` answers (EOPNOTSUPP for setup, a no-op for remove). The guest reaches the bytes through its own
-/// page table after this; the daemon is not called per access.
+/// Serves FUSE_SETUPMAPPING / FUSE_REMOVEMAPPING through the placer the VMM offered (§4.6): a window maps a range of
+/// the file's backing, whichever placer maps it ([`serve_backed_dax`]). [`DaxServed::NotHandled`] when it is not a DAX
+/// verb or no window is offered — then the FUSE codec's `dispatch` answers (EOPNOTSUPP for setup, a no-op for remove).
+/// The guest reaches the bytes through its own page table after this; the daemon is not called per access.
 #[cfg(unix)]
 fn serve_dax(
   request: &[u8],
   bridge: &mut dyn slates_bridge_core::Bridge,
   cx: &slates_bridge_core::OpContext,
   dax_placer: &mut Option<crate::dax::DaxPlacer>,
-  dax_windows: &mut Vec<DaxWindowEntry>,
-  #[cfg(target_os = "linux")] backed: &mut crate::backed::BackedDax,
+  backed: &mut crate::backed::BackedDax,
   out: &mut [u8],
 ) -> DaxServed {
   use slates_bridge_fuse::request::Request;
@@ -2140,153 +1878,30 @@ fn serve_dax(
   if !matches!(opcode, Opcode::SetupMapping | Opcode::RemoveMapping) {
     return DaxServed::NotHandled;
   }
-  match placer {
-    crate::dax::DaxPlacer::Local(cache) => {
-      serve_local_dax(&req, opcode, bridge, cx, cache, dax_windows, out)
-    }
-    #[cfg(target_os = "linux")]
-    crate::dax::DaxPlacer::Message(message) => {
-      serve_backed_dax(&req, opcode, bridge, cx, (message, backed), out)
-    }
-  }
+  serve_backed_dax(&req, opcode, bridge, cx, (placer, backed), out)
 }
 
-/// The fd-sharing placer's SETUPMAPPING and REMOVEMAPPING (§4.6): the cache region overlays each content block of the
-/// range, pinned by the gate while mapped, and answers at once.
-#[cfg(unix)]
-fn serve_local_dax(
-  req: &slates_bridge_fuse::request::Request<'_>,
-  opcode: Opcode,
-  bridge: &mut dyn slates_bridge_core::Bridge,
-  cx: &slates_bridge_core::OpContext,
-  cache: &mut crate::dax::DaxCacheRegion,
-  dax_windows: &mut Vec<DaxWindowEntry>,
-  out: &mut [u8],
-) -> DaxServed {
-  use slates_bridge_core::ObjectId;
-  use slates_bridge_fuse::request::{RemoveMappingIn, SetupMappingIn};
-
-  let unique = req.header.unique;
-  let err = |errno: i32, out: &mut [u8]| {
-    DaxServed::Replied(ReplyHeader::write_error(unique, errno, out).unwrap_or(0))
-  };
-  match opcode {
-    Opcode::SetupMapping => {
-      let Ok(m) = SetupMappingIn::parse(Opcode::SetupMapping.to_wire(), req.body) else {
-        return err(dax_errno::EINVAL, out);
-      };
-      let writable = m.writable();
-      // Remap: this SETUPMAPPING may cover a window region that already holds mappings. Tear each overlapping one
-      // down (revoke, unmap, unpin) before establishing the new one — otherwise its pin leaks and its stale entry
-      // shadows the new mapping when REMOVEMAPPING looks the window offset up (adversarial: a guest remapping a
-      // window slot to another block). Done before the new block is pinned, so no backing descriptor is borrowed
-      // across the `&mut bridge` teardown calls.
-      let mut index = 0;
-      while index < dax_windows.len() {
-        match dax_windows.get(index).copied() {
-          Some(held) if dax_ranges_overlap(held.moffset, held.len, m.moffset, m.len) => {
-            teardown_dax_window(cache, bridge, cx, &held);
-            dax_windows.swap_remove(index);
-          }
-          _ => index = index.saturating_add(1),
-        }
-      }
-      let object = ObjectId::new(req.header.nodeid, 0);
-      let (Ok(foffset), Ok(requested)) = (usize::try_from(m.foffset), usize::try_from(m.len))
-      else {
-        return err(dax_errno::EINVAL, out);
-      };
-      let granule = cache.page().max(1);
-      // Map EVERY chunk covering [foffset, foffset+requested). A guest's window range can span several chunks, each a
-      // distinct arena block mapped at its own window sub-offset; a one-chunk map leaves the rest of the window stale
-      // (a multi-block guest mmap then mismatches, or SIGBUSes on a refused sealed head). So one SETUPMAPPING becomes
-      // N maps, answered as a whole (§4.6 "DAX maps the open frontier"; the N-map rule the live A/B surfaced). The
-      // gate backs each chunk — the open tail zero-copy, a sealed chunk per the arm.
-      let mut cur = foffset;
-      let end = foffset.saturating_add(requested);
-      // Whether at least one chunk has been mapped — so a later `NotFound` (the range ran past the file's content)
-      // ends the loop cleanly with what is backed, rather than refusing the whole request.
-      let mut mapped_any = false;
-      while cur < end {
-        match map_chunk_at(
-          cache,
-          bridge,
-          cx,
-          dax_windows,
-          object,
-          writable,
-          cur,
-          foffset,
-          m.moffset,
-          end,
-          granule,
-        ) {
-          MapStep::Advanced { this } => {
-            mapped_any = true;
-            cur = cur.saturating_add(this.max(1));
-          }
-          // The range ran past the file's content: answer with what is backed (the authorized-window cap leaves the
-          // rest unmapped). Nothing mapped yet means the request began past the file — refuse.
-          MapStep::PastFile => {
-            if mapped_any {
-              break;
-            }
-            rollback_dax_setup(cache, bridge, cx, dax_windows, m.moffset, m.len);
-            return err(dax_errno::EINVAL, out);
-          }
-          // A chunk within the file could not be backed: tear down what this request mapped and refuse the whole
-          // SETUPMAPPING — never a partially-backed window.
-          MapStep::Refused(errno) => {
-            rollback_dax_setup(cache, bridge, cx, dax_windows, m.moffset, m.len);
-            return err(errno, out);
-          }
-        }
-      }
-      // The whole range is mapped, each chunk synchronously: answer now. An empty range answers too.
-      DaxServed::Replied(ReplyHeader::write_ok(unique, &[], out).unwrap_or(0))
-    }
-    Opcode::RemoveMapping => {
-      let Ok(m) = RemoveMappingIn::parse(Opcode::RemoveMapping.to_wire(), req.body) else {
-        return err(dax_errno::EINVAL, out);
-      };
-      for one in &m.entries {
-        if let Some(index) = dax_windows.iter().position(|w| w.moffset == one.moffset) {
-          if let Some(entry) = dax_windows.get(index).copied() {
-            teardown_dax_window(cache, bridge, cx, &entry);
-          }
-          dax_windows.swap_remove(index);
-        }
-        // A range the device holds no mapping for is a no-op: nothing of the device's is mapped there.
-      }
-      DaxServed::Replied(ReplyHeader::write_ok(unique, &[], out).unwrap_or(0))
-    }
-    _ => DaxServed::NotHandled,
-  }
-}
-
-/// The message placer's SETUPMAPPING and REMOVEMAPPING (§4.6, [`crate::backed`]).
+/// A SETUPMAPPING and a REMOVEMAPPING over per-file backings, through either placer (§4.6, [`crate::backed`]).
 ///
 /// A SETUPMAPPING's window range must be whole granules inside the guest's window and its file range must start at a
 /// granule inside the backing's object, or it is refused `EINVAL`. Its node is asked of the backed session (which
 /// resolves it, checks it may be backed, copies a writable ask's file up, and leaves the asked ranges' fill pending),
 /// and a refusal answers that refusal's errno. Then the window is held:
-/// - a window the front end maps as asked already (a repeat, or a writable upgrade of a window mapped writable) is
-///   answered with no message once the fill is done;
-/// - any other window has every window over its range unmapped first, since no map may go over a live one, and is sent
-///   once the fill is done. A window that cannot be unmapped yet refuses the SETUPMAPPING `EBUSY`.
+/// - a window the placer maps as asked already (a repeat, or a writable upgrade of a window mapped writable) is
+///   answered with no map once the fill is done;
+/// - any other window has every window over its range unmapped first, since no map may go over a live one, and is
+///   mapped once the fill is done. A window that cannot be unmapped yet refuses the SETUPMAPPING `EBUSY`.
 ///
-/// A REMOVEMAPPING unmaps each window it names and answers at once: the front end takes the unmap before any later
-/// map on the same channel, and the guest has dropped the range from its page tables before it asks.
-#[cfg(target_os = "linux")]
+/// A REMOVEMAPPING unmaps each window it names and answers at once: the fd-sharing placer's unmap is made before the
+/// answer, and the front end takes the message placer's before any later map on the same channel; the guest has
+/// dropped the range from its page tables before it asks.
+#[cfg(unix)]
 fn serve_backed_dax(
   req: &slates_bridge_fuse::request::Request<'_>,
   opcode: Opcode,
   bridge: &mut dyn slates_bridge_core::Bridge,
   cx: &slates_bridge_core::OpContext,
-  (placer, backed): (
-    &mut crate::vhost_user::MessagePlacer<crate::backed::BackedPiece>,
-    &mut crate::backed::BackedDax,
-  ),
+  (placer, backed): (&mut crate::dax::DaxPlacer, &mut crate::backed::BackedDax),
   out: &mut [u8],
 ) -> DaxServed {
   use slates_bridge_fuse::request::{RemoveMappingIn, SetupMappingIn};
@@ -2301,7 +1916,7 @@ fn serve_backed_dax(
         return err(dax_errno::EINVAL, out);
       };
       let granule = u64::try_from(placer.page()).unwrap_or(u64::MAX);
-      if placer.check_window(m.moffset, m.len).is_err()
+      if !placer.window_fits(m.moffset, m.len)
         || !crate::backed::file_range_fits(m.foffset, m.len, granule, backed.session.layout())
       {
         return err(dax_errno::EINVAL, out);
@@ -2359,63 +1974,100 @@ fn serve_backed_dax(
   }
 }
 
-/// How asking the front end to unmap a window's pieces came out.
-#[cfg(target_os = "linux")]
+/// How unmapping a window's pieces came out.
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Unmapped {
-  /// An unmap was sent for every piece.
-  Sent,
-  /// The channel is gone, so nothing maps through it any more.
+  /// Every piece's unmap was made (the fd-sharing placer) or sent (the message placer).
+  Done,
+  /// The message placer's channel is gone, so nothing maps through it any more.
+  #[cfg(target_os = "linux")]
   ChannelGone,
-  /// The ring had no room for every piece's unmap; none was sent, or an unexpected refusal stopped part-way.
+  /// The message placer's ring had no room for every piece's unmap; none was sent, or an unexpected refusal stopped
+  /// part-way.
+  #[cfg(target_os = "linux")]
   NoRoom,
+  /// The fd-sharing placer's unmap of a piece was refused: each overlay splits the reservation, so the process can meet
+  /// `vm.max_map_count` (`ENOMEM`). The other pieces were unmapped.
+  Refused,
 }
 
-/// Asks the front end to unmap each of `pieces` (one SHMEM_UNMAP a piece, since an unmap must name the whole of one
-/// mapped region, vhost-user `VHOST_USER_BACKEND_SHMEM_UNMAP`), asking the ring's room for all of them first.
-#[cfg(target_os = "linux")]
-fn unmap_pieces(
-  placer: &mut crate::vhost_user::MessagePlacer<crate::backed::BackedPiece>,
-  pieces: &[crate::backed::BackedPiece],
-) -> Unmapped {
-  if !placer.has_room_for(pieces.len()) {
-    return Unmapped::NoRoom;
-  }
-  for piece in pieces {
-    match placer.begin_unmap(piece.moffset, piece.len, *piece) {
-      Ok(()) => {}
-      Err(crate::vhost_user::MessagePlaceError::Channel(_)) => return Unmapped::ChannelGone,
-      Err(_) => return Unmapped::NoRoom,
+#[cfg(unix)]
+impl Unmapped {
+  /// Whether the window still maps some of its backing, so the device keeps it and its unmap is asked again by
+  /// whatever needs it gone. Its backing stays equal to the file meanwhile.
+  fn keeps_the_window(self) -> bool {
+    match self {
+      Unmapped::Done => false,
+      #[cfg(target_os = "linux")]
+      Unmapped::ChannelGone => false,
+      #[cfg(target_os = "linux")]
+      Unmapped::NoRoom => true,
+      Unmapped::Refused => true,
     }
   }
-  Unmapped::Sent
 }
 
-/// Asks the front end to unmap `window`, a SHMEM_UNMAP for each of its pieces under `layout`: whether the device may
-/// forget it. Unmaps sent and a dead channel answer yes (nothing maps through a channel that is gone); a ring without
-/// room answers no, so the window is kept and its unmap asked again by whatever needs it gone. A window over a backing
-/// pins nothing, so nothing waits on the unmaps' acknowledgements.
-#[cfg(target_os = "linux")]
+/// Unmaps each of `pieces` through `placer`: the fd-sharing placer restores each piece's range to the inert reservation
+/// at once; the message placer sends one SHMEM_UNMAP a piece, since an unmap must name the whole of one mapped region
+/// (vhost-user `VHOST_USER_BACKEND_SHMEM_UNMAP`), asking the ring's room for all of them first.
+#[cfg(unix)]
+fn unmap_pieces(
+  placer: &mut crate::dax::DaxPlacer,
+  pieces: &[crate::backed::BackedPiece],
+) -> Unmapped {
+  match placer {
+    crate::dax::DaxPlacer::Local(cache) => {
+      let mut unmapped = Unmapped::Done;
+      for piece in pieces {
+        if cache.unmap(piece.moffset, piece.len).is_err() {
+          unmapped = Unmapped::Refused;
+        }
+      }
+      unmapped
+    }
+    #[cfg(target_os = "linux")]
+    crate::dax::DaxPlacer::Message(placer) => {
+      if !placer.has_room_for(pieces.len()) {
+        return Unmapped::NoRoom;
+      }
+      for piece in pieces {
+        match placer.begin_unmap(piece.moffset, piece.len, *piece) {
+          Ok(()) => {}
+          Err(crate::vhost_user::MessagePlaceError::Channel(_)) => return Unmapped::ChannelGone,
+          Err(_) => return Unmapped::NoRoom,
+        }
+      }
+      Unmapped::Done
+    }
+  }
+}
+
+/// Unmaps `window`, each of its pieces under `layout`: whether the device may forget it. Unmaps made or sent and a dead
+/// channel answer yes (nothing maps through a channel that is gone); a ring without room or a refused unmap answers no,
+/// so the window is kept and its unmap asked again by whatever needs it gone. A window over a backing pins nothing, so
+/// nothing waits on the message placer's acknowledgements.
+#[cfg(unix)]
 fn unmap_backed(
-  placer: &mut crate::vhost_user::MessagePlacer<crate::backed::BackedPiece>,
+  placer: &mut crate::dax::DaxPlacer,
   counts: &mut crate::backed::BackedCounts,
   window: &crate::backed::BackedWindow,
   layout: slates_mem::DaxLayout,
 ) -> bool {
-  match unmap_pieces(placer, &crate::backed::window_pieces(layout, window)) {
-    Unmapped::Sent => {
-      counts.unmaps_sent = counts.unmaps_sent.saturating_add(1);
-      true
-    }
-    Unmapped::ChannelGone => true,
-    Unmapped::NoRoom => false,
+  let unmapped = unmap_pieces(placer, &crate::backed::window_pieces(layout, window));
+  match unmapped {
+    Unmapped::Done => counts.unmaps_sent = counts.unmaps_sent.saturating_add(1),
+    Unmapped::Refused => counts.unmaps_refused = counts.unmaps_refused.saturating_add(1),
+    #[cfg(target_os = "linux")]
+    Unmapped::ChannelGone | Unmapped::NoRoom => {}
   }
+  !unmapped.keeps_the_window()
 }
 
 /// Unmaps every window over the guest's window range `[moffset, moffset + len)`: whether none is left there.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn unmap_overlapping(
-  placer: &mut crate::vhost_user::MessagePlacer<crate::backed::BackedPiece>,
+  placer: &mut crate::dax::DaxPlacer,
   backed: &mut crate::backed::BackedDax,
   moffset: u64,
   len: u64,

@@ -61,31 +61,6 @@ pub struct Region {
 }
 
 impl Region {
-  /// A borrow of the region's shared-object descriptor, or `None` for a private (anonymous) region — the virtio-fs
-  /// DAX window maps a content block's pages into a VMM's cache region from this fd, and only a shared-object-backed
-  /// region (anchor-owned content RAM, §4.7/§4.8) has one; a private region's pages are the process's own, with no
-  /// descriptor to hand a VMM. Unix only (the DAX window is Linux/vhost-user). No reference to the bytes is formed.
-  #[cfg(unix)]
-  pub fn backing_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
-    match &self.backing {
-      Backing::Shared(object) => Some(object.as_fd()),
-      Backing::Anon(_) => None,
-    }
-  }
-
-  /// The byte offset of this region's bytes within its `backing_fd` (Unix's arm): the shared
-  /// object is mapped as a sub-range (A-64, a shard's slice of the anchor content object), so a block's
-  /// offset in the descriptor is `backing_base() + the block's offset in this region`. Zero for a
-  /// private (anonymous) region, which has no descriptor.
-  #[cfg(unix)]
-  #[must_use]
-  pub fn backing_base(&self) -> usize {
-    match &self.backing {
-      Backing::Shared(object) => object.base(),
-      Backing::Anon(_) => 0,
-    }
-  }
-
   /// Maps `len` bytes (rounded up to whole pages of `page` bytes). `huge` asks the OS to back
   /// the region with transparent huge pages where that exists (Linux `MADV_HUGEPAGE`).
   pub fn map(len: usize, page: usize, huge: bool) -> Result<Region, MemError> {
@@ -172,31 +147,6 @@ impl Region {
   /// Whether the region is locked in RAM.
   pub const fn locked(&self) -> bool {
     self.locked
-  }
-
-  /// How many of this region's bytes the kernel has **actually** backed with huge pages, or `None` where the
-  /// question cannot be asked (off Linux).
-  ///
-  /// Not the same question as "was the advice accepted", which is why no `bool` is kept from `madvise`: on
-  /// Linux 7.2 a 64 KiB and a 1 MiB mapping both take `MADV_HUGEPAGE` with `OK` and receive none. §4.6's
-  /// moving target only moves physical rows where the backing is huge, so the gate that grants a writable DAX
-  /// window asks this. A cold path — it walks the process's mappings — so ask once and keep the answer.
-  #[must_use]
-  pub fn huge_backed_bytes(&self) -> Option<u64> {
-    slates_machine::facts::huge_backed_bytes(self.base() as usize)
-  }
-
-  /// Asks the kernel to make `[offset, offset + len)` one huge page **now** (`MADV_COLLAPSE`, Linux 6.1), for a
-  /// caller that needs physical contiguity rather than prefers it (§4.6's L1 sandbox).
-  ///
-  /// `true` only means the kernel accepted the work, not that the span is huge: that stays
-  /// [`Region::huge_backed_bytes`]'s question, and the caller asks it after. `false` off Linux, on a kernel
-  /// before 6.1, on a shared object the kernel will not collapse, or when it could not compact enough memory.
-  pub fn collapse_huge(&mut self, offset: usize, len: usize) -> bool {
-    match self.backing.bytes().get(offset..offset.saturating_add(len)) {
-      Some(span) => collapse_huge(span).is_ok(),
-      None => false,
-    }
   }
 
   /// The NUMA node the region was recorded on.
@@ -395,10 +345,10 @@ fn advise_huge(map: &MmapMut) -> bool {
 ///
 /// `MADV_HUGEPAGE` is a preference: the kernel grants it out of whatever contiguous memory it has at fault time,
 /// so the same span can come back huge on a quiet machine and base-paged on a busy one. Measured here
-/// 2026-10-19: with 59 tests mapping in parallel on a 32-core host with 81 GB free, two of four sandbox
-/// reservations that had succeeded moments before were declined. §4.6's L1 sandbox cannot be best-effort — a
-/// shift onto base pages moves no physical rows — so when the preference is not honoured the kernel is asked to
-/// do the compaction work synchronously instead, and the caller measures again either way.
+/// 2026-10-19: with 59 tests mapping in parallel on a 32-core host with 81 GB free, two of four reservations of
+/// §4.6's former L1 zones that had succeeded moments before were declined. A DAX backing's range is placed in one
+/// huge page as its fill finishes (A-193), which a preference cannot promise, so the kernel is asked to do the
+/// compaction work synchronously instead, and a decline is counted, never taken for a placement.
 ///
 /// Refused where the kernel declined (it could not compact enough free memory, the range is unsuitable, or the
 /// kernel predates 6.1 and answers `EINVAL`), with whether it said asking again may succeed — never a reason to
@@ -431,19 +381,19 @@ pub(crate) fn collapse_huge(span: &[u8]) -> Result<(), CollapseDeclined> {
   }
 }
 
-/// The paired arm: no `MADV_COLLAPSE` to ask off Linux, so the span is whatever the OS made it.
-#[cfg(not(target_os = "linux"))]
+/// The paired arm: no `MADV_COLLAPSE` to ask on the other Unix hosts, so the span is whatever the OS made it. Only the
+/// Unix DAX object asks (`crate::dax_object`), so Windows builds neither arm.
+#[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) fn collapse_huge(_span: &[u8]) -> Result<(), CollapseDeclined> {
   Err(CollapseDeclined::Lasting)
 }
 
 /// Why the kernel declined to make a span one huge page (`madvise(2)`, `MADV_COLLAPSE`; `madvise_collapse_errno` in
-/// `mm/khugepaged.c` turns each scan result into one of these errnos).
+/// `mm/khugepaged.c` turns each scan result into one of these errnos). Unix only, as its one asker is.
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CollapseDeclined {
   /// `EAGAIN`: a page was locked, off the LRU or held elsewhere for the moment; asking again may succeed.
-  // Made only where the kernel is asked (Linux) and compared only by the Unix DAX object, so Windows builds neither.
-  #[cfg_attr(not(unix), allow(dead_code))]
   Transient,
   /// Any other answer, likely to hold for a while: no huge page could be had (`ENOMEM`), the memory cgroup refused
   /// its charge (`EBUSY`), the range or the process does not allow one, or the kernel predates 6.1 (`EINVAL`). Off
@@ -793,49 +743,6 @@ mod tests {
     r.set_numa_node(1);
     assert_eq!(r.numa_node(), 1);
     assert!(!r.base().is_null());
-  }
-
-  /// §4.6 L1's escalation, exercised in the crate that owns the `unsafe`. `Region::collapse_huge` is the one
-  /// raw `madvise` in this module, and until 2026-10-20 nothing here called it — only `crates/vfs`'s zone
-  /// reservation did, so the block had no test in its own crate and none that pinned its **refusals**.
-  ///
-  /// Do: ask a mapping to collapse a range that is valid, one that runs past its end, and an empty one.
-  /// Expect: the out-of-range and empty asks answer `false` **without reaching the syscall** (the slice
-  /// lookup refuses first, which is what keeps the pointer handed to `madvise` inside the mapping the
-  /// `SAFETY` note claims); and the valid ask answers whatever the kernel says, which is `false` wherever
-  /// there is no `MADV_COLLAPSE` — never a panic, and never a claim that the span is huge, since only
-  /// [`Region::huge_backed_bytes`] answers that.
-  #[test]
-  fn a_collapse_refuses_a_range_outside_the_mapping_before_it_asks_the_kernel() {
-    let page = 4096;
-    let mut region = Region::map(page * 8, page, false).expect("a region maps");
-    let len = region.len();
-    assert!(
-      !region.collapse_huge(0, len.saturating_add(page)),
-      "a range past the end of the mapping is refused before the syscall"
-    );
-    assert!(
-      !region.collapse_huge(len, page),
-      "a range starting at the end is refused before the syscall"
-    );
-    assert!(!region.collapse_huge(0, 0), "an empty range asks nothing");
-    // A valid range reaches the syscall, which Miri cannot execute: it stops at "Miri does not support
-    // calls to madvise with advice other than MADV_NORMAL, MADV_RANDOM, MADV_SEQUENTIAL, or MADV_WILLNEED".
-    // **Shrink rather than skip** — under Miri the three refusals above still run, and they are the part
-    // that keeps the pointer inside the mapping, so Miri checks the slice lookup, the pointer derivation and
-    // the length and reaches the boundary without flagging anything. Verified on Linux nightly 2026-10-20:
-    // Miri accepted everything up to the call and stopped only there. What the syscall itself does is
-    // covered by the real-hardware runs (§4.6 L1's sandbox reservation on fedora, adacachy and aarch64).
-    if cfg!(miri) {
-      return;
-    }
-    // The answer is the kernel's, and either way it must not panic and must not be read as "this span is
-    // huge" — that question is `huge_backed_bytes`'s alone.
-    let answered = region.collapse_huge(0, page);
-    assert!(
-      answered || !answered,
-      "a valid range answers without panicking"
-    );
   }
 
   #[test]

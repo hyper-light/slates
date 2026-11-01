@@ -85,8 +85,6 @@ const ENAMETOOLONG: i32 = 36;
 const EMFILE: i32 = 24;
 /// Format: Linux ENOMEM, the answer to a DAX mapping past the shard's fill budget (A-163).
 const ENOMEM: i32 = 12;
-/// Format: Linux EBUSY, the answer to a DAX mapping of a file an in-process guest maps writable (A-163).
-const EBUSY: i32 = 16;
 /// Format: Linux ESTALE, a stale file handle: the node names a file no longer reachable (A-151: a base file that left
 /// its name with no descriptor held). A kernel's path walk that meets it looks the name up again.
 const ESTALE: i32 = 116;
@@ -177,12 +175,12 @@ pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, cx: &OpContext, out: &m
     // stepping channel serves it (`crate::allocate`, A-108), and a transport that only dispatches answers that it is
     // not supported, which glibc's `posix_fallocate` answers by writing zeros itself.
     Opcode::Fallocate => write_or_drop(ReplyHeader::write_error(unique, EOPNOTSUPP, out), out),
-    // SETUPMAPPING/REMOVEMAPPING are the virtio-fs DAX window verbs. The DAX gate (`slates_vfs::dax`) is built
-    // and hardened, but the device-side window is not yet wired, so DAX stays unadvertised in FUSE_INIT — a
-    // conformant guest never sends these. A guest that sends one anyway (unnegotiated, hostile or confused) is
-    // handled defensively: the body is parsed so a malformed one is refused before any effect, SETUPMAPPING is
-    // declined EOPNOTSUPP (the guest falls back to ordinary READ/WRITE) and REMOVEMAPPING of nothing is a success
-    // no-op. When the window is wired these route to the bridge's mapping verbs behind the gate.
+    // SETUPMAPPING/REMOVEMAPPING are the virtio-fs DAX window verbs, which a device with a window serves itself over
+    // per-file backings before they reach this dispatch (`slates_bridge_virtiofs::device`, A-195). A transport with
+    // no window never advertises DAX, so a conformant guest never sends these here. A guest that sends one anyway
+    // (unnegotiated, hostile or confused) is handled defensively: the body is parsed so a malformed one is refused
+    // before any effect, SETUPMAPPING is declined EOPNOTSUPP (the guest falls back to ordinary READ/WRITE) and
+    // REMOVEMAPPING of nothing is a success no-op.
     Opcode::SetupMapping => serve_setup_mapping(&request, out),
     Opcode::RemoveMapping => serve_remove_mapping(&request, out),
   }
@@ -684,7 +682,6 @@ pub fn dax_refused_errno(refused: &slates_bridge_core::dax_backing::Refused) -> 
     Refused::ReadOnly => EPERM,
     Refused::Budget => ENOMEM,
     Refused::Object => EIO,
-    Refused::Busy => EBUSY,
   }
 }
 

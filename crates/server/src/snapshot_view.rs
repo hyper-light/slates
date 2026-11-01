@@ -272,13 +272,11 @@ fn advanced(
   if let Some(old) = state.snapshot_views.insert(record.id, view) {
     close(state, old);
   }
-  // §4.6 "revoke on advance": the view has swapped, so kick this volume's guest devices to re-validate their DAX
-  // windows against the now-current view and tear any onto content that changed between the snapshots — the moving
-  // reader re-maps against the new view rather than reading stale bytes through a lingering window. A device whose
-  // view did not change finds every window current and tears none, so the volume-wide kick is self-scoping. A no-op
-  // in production while DAX is unadvertised (no live window to re-validate), and correct the moment it is.
-  // The guest-device transports are Unix-only (`virtiofs` is `#[cfg(unix)]`), so there is nothing to kick
-  // elsewhere.
+  // §4.6 "revoke on advance": the view has swapped, so kick this volume's guest devices to refill their DAX backings
+  // from their now-current views before their guests see anything more (A-195): a window maps its file's backing, which
+  // the refill brings to the new view in place, so no window is torn. A device whose view did not change refills bytes
+  // equal to what it holds, so the volume-wide kick is correct for every device it reaches. The guest-device transports
+  // are Unix-only (`virtiofs` is `#[cfg(unix)]`), so there is nothing to kick elsewhere.
   #[cfg(unix)]
   let _kicked = crate::virtiofs::kick_volume_devices(state, record.volume);
   Ok((target.value, invalidated))

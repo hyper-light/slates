@@ -1,0 +1,88 @@
+name: DIAG A-195 the fd-sharing placer's red-checks on Linux (not for main)
+
+
+# Step 4 of the VFS and DAX plan (A-195): the three red-checks of diagnostics run 41283211879 again, with the output pipe that
+# stopped the first after it had failed the suite as intended (grep's SIGPIPE under pipefail). The suites themselves passed in that run.
+
+on:
+  push:
+    branches: ['diag-a195-*']
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  suites:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    name: red-checks on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: The runner
+        run: |
+          echo "image $ImageOS $ImageVersion; $(nproc) CPUs; $(uname -srm); page $(getconf PAGESIZE)"
+          cat /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/shmem_enabled /sys/kernel/mm/transparent_hugepage/hpage_pmd_size
+      - name: Red-check, the fd-sharing placer overlays the window's own offset
+        shell: bash
+        run: |
+          set -u
+          cp crates/bridge-virtiofs/src/device.rs /tmp/device.rs
+          python3 - <<'EOF'
+          import pathlib
+          p = pathlib.Path("crates/bridge-virtiofs/src/device.rs")
+          t = p.read_text()
+          old = "              descriptor.as_fd(),\n              piece.object_offset,\n              writable,\n            )\n            .is_ok();"
+          assert t.count(old) == 1
+          p.write_text(t.replace(old, "              descriptor.as_fd(),\n              piece.moffset,\n              writable,\n            )\n            .is_ok();"))
+          EOF
+          if cargo test --locked -p slates-bridge-virtiofs --test device backed:: -- --test-threads 1 > r1.txt 2>&1; then
+            grep -E "^test |test result" r1.txt; echo "RED-CHECK offset: the device suite passed"; exit 1
+          fi
+          grep -E "panicked|left:|right:|test result" r1.txt > r1.grep || true
+          head -12 r1.grep
+          cp /tmp/device.rs crates/bridge-virtiofs/src/device.rs
+      - name: Red-check, the fd-sharing placer's REMOVEMAPPING leaves the overlays
+        shell: bash
+        run: |
+          set -u
+          python3 - <<'EOF'
+          import pathlib
+          p = pathlib.Path("crates/bridge-virtiofs/src/device.rs")
+          t = p.read_text()
+          old = "        if cache.unmap(piece.moffset, piece.len).is_err() {"
+          assert t.count(old) == 1
+          p.write_text(t.replace(old, "        if piece.len == 0 && cache.unmap(piece.moffset, piece.len).is_err() {"))
+          EOF
+          if cargo test --locked -p slates-bridge-virtiofs --test device backed:: -- --test-threads 1 > r2.txt 2>&1; then
+            grep -E "^test |test result" r2.txt; echo "RED-CHECK unmap: the device suite passed"; exit 1
+          fi
+          grep -E "panicked|left:|right:|test result" r2.txt > r2.grep || true
+          head -12 r2.grep
+          cp /tmp/device.rs crates/bridge-virtiofs/src/device.rs
+      - name: Red-check, a moved view refills nothing
+        shell: bash
+        run: |
+          set -u
+          python3 - <<'EOF'
+          import pathlib
+          p = pathlib.Path("crates/bridge-virtiofs/src/device.rs")
+          t = p.read_text()
+          old = "      self.backed.session.mark_all_stale(state.backings);\n    }\n  }"
+          assert t.count(old) == 1
+          p.write_text(t.replace(old, "      let _ = state;\n    }\n  }"))
+          EOF
+          if cargo test --locked -p slates-bridge-virtiofs --test device backed::an_advance -- --test-threads 1 > r3.txt 2>&1; then
+            grep -E "^test |test result" r3.txt; echo "RED-CHECK advance: the advance test passed"; exit 1
+          fi
+          grep -E "panicked|left:|right:|test result" r3.txt > r3.grep || true
+          head -12 r3.grep
+          cp /tmp/device.rs crates/bridge-virtiofs/src/device.rs

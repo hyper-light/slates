@@ -922,10 +922,10 @@ pub(crate) fn revoke_volume_devices(s: &ShardState, volume: DbVolumeId) -> usize
     .count()
 }
 
-/// Kicks every device loop serving volume `volume` to drain its pending DAX revokes now, without ending it (§4.6):
-/// a `snapshot` recall marks the volume's writable windows revoke-pending in the store and calls this so the device
-/// munmaps them promptly rather than on the guest's next doorbell kick. The number kicked (0 if the volume has no
-/// guest device here). A no-op in production while DAX is unadvertised (no live window, so no pending revoke).
+/// Kicks every device loop serving volume `volume` because a view of it moved, without ending any (§4.6 "revoke on
+/// advance"): a snapshot reader's `advance` swaps its view, and each kicked device marks its backings stale, so they are
+/// refilled from the device's own view before its guest sees anything more. The number kicked (0 if the volume has no
+/// guest device here).
 pub(crate) fn kick_volume_devices(s: &ShardState, volume: DbVolumeId) -> usize {
   let partition = s.db.partition();
   s.guest_devices

@@ -22,11 +22,12 @@
 //! creating a queue, mapping guest memory or publishing a tag; queue descriptors, scatter/gather
 //! ranges, arithmetic and chained lengths are validated within derived caps *before access*
 //! ([`virtqueue`]); in-flight requests, copy buffers and replies consume the attachment's credits,
-//! and cancellation and revocation reclaim them under one owned terminal step. DAX is **not
-//! advertised**: the baseline contract does not require it, and "a requested DAX capability cannot
-//! be advertised until mapping isolation, pinning and teardown have been established for that VMM"
-//! — the capability report says so with that reason (AC-4.12 "Do not advertise DAX without this
-//! gate").
+//! and cancellation and revocation reclaim them under one owned terminal step. A DAX window maps a
+//! range of the file's backing, a per-file object the volume's write boundary keeps equal to the
+//! file, through either placer (`dax`, `backed`, Unix; A-168, A-195). DAX is advertised only by a
+//! binding a live guest has run over these backings (AC-9.7): the vhost-user binding on Linux, not
+//! the in-process seam, whose capability report says so with the reason (AC-4.12 "Do not advertise
+//! DAX without this gate").
 //!
 //! Evidence: virtio 1.2 §2.7 "Split Virtqueues" and §5.11 "File System Device" (the wire formats,
 //! cited per constant as `Format:` lines); the Linux FUSE ABI (`include/uapi/linux/fuse.h`, spoken by
@@ -38,12 +39,12 @@
 //! memory the tests own), [`virtqueue`] (the split-virtqueue machine: layout validation, the chain
 //! walk with every check the contract names, the used ring), [`device`] (the FUSE-over-virtio
 //! request cycle: gather, dispatch through the FUSE codec onto the shared `Bridge`, scatter,
-//! publish; the hiprio queue; INIT/DESTROY; the derived caps; DAX not advertised), [`credit`] (the
+//! publish; the hiprio queue; INIT/DESTROY; the derived caps; DAX windows over backings), [`credit`] (the
 //! attachment's request and byte credits, derived from the shard's admission limit and the §4.9
 //! credit window, charged per chain before access), [`admission`] (the `VmmSeam`, the ordered
 //! admission that authenticates the consumer first, the admitted device's service pass, revocation
 //! and the owned terminal step), [`capability`] (the truthful transport report `attach` and
-//! `status` carry, DAX not advertised), `serve` (Unix: the perpetual device loop on the owning
+//! `status` carry, DAX only where a live guest has run it), `serve` (Unix: the perpetual device loop on the owning
 //! shard over `slates-rt`, woken by the doorbell descriptor, revoked by message, ending in the
 //! terminal step).
 
@@ -55,11 +56,11 @@
 pub mod admission;
 pub mod capability;
 pub mod credit;
-// The DAX cache region maps content blocks' pages into a guest's page table (`MAP_FIXED`), which is a Unix feature;
-// the primitive is exercised on macOS over an `shm` object, so it is `cfg(unix)`, not Linux-only.
-// The message placer's DAX windows over per-file backings (§4.6, goal G-vhost): what an out-of-process VMM maps stays
-// equal to the file with no message, and no window is torn down under a guest that holds it. Linux's, as vhost-user is.
-#[cfg(target_os = "linux")]
+// The device's DAX windows over per-file backings (§4.6, A-168, A-195): what a guest maps stays equal to the file with
+// no message, and no window is torn down under a guest that holds it. The fd-sharing cache region overlays them into a
+// guest's window (`MAP_FIXED`), which is a Unix feature exercised on macOS over a shared-memory object, so both modules
+// are `cfg(unix)`; the message placer that sends them to an out-of-process front end is Linux's, as vhost-user is.
+#[cfg(unix)]
 pub mod backed;
 #[cfg(unix)]
 pub mod dax;

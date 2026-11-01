@@ -39,13 +39,12 @@ use crate::admission::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DeviceId(u64);
 
-/// A loop's control entry: the waker to interrupt it with, whether revocation was asked for, and whether a daemon
-/// recall asked the loop to drain its pending DAX revokes now (a *kick*, distinct from a revoke — the loop drains
-/// and keeps serving).
+/// A loop's control entry: the waker to interrupt it with, whether revocation was asked for, and whether the
+/// attachment's view moved (a *kick*, distinct from a revoke — the loop marks its backings stale and keeps serving).
 struct LoopControl {
   waker: Option<Waker>,
   revoke: bool,
-  drain: bool,
+  advanced: bool,
 }
 
 thread_local! {
@@ -92,7 +91,7 @@ pub fn register(bound: usize) -> Result<DeviceId, LoopError> {
       LoopControl {
         waker: None,
         revoke: false,
-        drain: false,
+        advanced: false,
       },
     );
     Ok(DeviceId(id))
@@ -115,17 +114,17 @@ pub fn request_revoke(id: DeviceId) -> bool {
   })
 }
 
-/// Kicks the loop `id` to drain its pending DAX revokes on its next turn, without a guest doorbell kick and without
-/// ending it (§4.6: a daemon recall — e.g. a `snapshot`'s writable-window teardown — marks the inode revoke-pending
-/// and kicks the owning device loop so the munmap happens promptly, not on the guest's next kick). `false` when no
-/// such loop runs on this shard. Idempotent: a second kick before the loop drains is folded into the one flag.
+/// Kicks the loop `id` because its attachment's view moved (§4.6 "revoke on advance": a snapshot reader's `advance`),
+/// without a guest doorbell kick and without ending it: on its next turn the loop marks every backing stale, so each is
+/// refilled from the new view before the guest sees anything more. `false` when no such loop runs on this shard.
+/// Idempotent: a second kick before the loop takes it is folded into the one flag.
 pub fn kick(id: DeviceId) -> bool {
   CONTROL.with(|control| {
     let mut control = control.borrow_mut();
     let Some(entry) = control.get_mut(&id.0) else {
       return false;
     };
-    entry.drain = true;
+    entry.advanced = true;
     if let Some(waker) = entry.waker.take() {
       waker.wake();
     }
@@ -133,13 +132,13 @@ pub fn kick(id: DeviceId) -> bool {
   })
 }
 
-/// Reads and clears the drain request for loop `id` (a kick); whether one was pending.
-fn take_drain_requested(id: DeviceId) -> bool {
+/// Reads and clears the view-moved mark for loop `id` (a kick); whether one was pending.
+fn take_advance_requested(id: DeviceId) -> bool {
   CONTROL.with(|control| {
     control
       .borrow_mut()
       .get_mut(&id.0)
-      .is_some_and(|e| std::mem::take(&mut e.drain))
+      .is_some_and(|e| std::mem::take(&mut e.advanced))
   })
 }
 
@@ -180,13 +179,13 @@ pub fn abandon(id: DeviceId) {
   unregister(id);
 }
 
-/// Whether the shard has asked something of loop `id` that it has not taken yet: a revoke, or a kick to drain.
+/// Whether the shard has asked something of loop `id` that it has not taken yet: a revoke, or a kick for a moved view.
 fn request_pending(id: DeviceId) -> bool {
   CONTROL.with(|control| {
     control
       .borrow()
       .get(&id.0)
-      .is_some_and(|e| e.revoke || e.drain)
+      .is_some_and(|e| e.revoke || e.advanced)
   })
 }
 
@@ -363,7 +362,6 @@ async fn serve_until_idle<S: VmmSeam, B: BridgeAccess>(
           }
           more || driven.kicked
         };
-        #[cfg(target_os = "linux")]
         report_dax_counts(admitted, bridge, counters);
         if more {
           futures::yield_now().await;
@@ -381,14 +379,13 @@ async fn serve_until_idle<S: VmmSeam, B: BridgeAccess>(
 }
 
 /// One service pass and, when a mutation's reply waits for the owner's barrier, the barrier and the
-/// completion; whether more work is pending. With the message placer (Linux), its backed DAX takes a step first
+/// completion; whether more work is pending. With a DAX placer, the device's backed DAX takes a step first
 /// (`AdmittedDevice::dax_turn`); a busy step serves no chain this pass.
 fn one_pass<S: VmmSeam, B: BridgeAccess>(
   admitted: &mut AdmittedDevice<S>,
   bridge: &mut B,
   counters: &mut LoopCounters,
 ) -> Result<bool, ServeError> {
-  #[cfg(target_os = "linux")]
   {
     let slice = bridge.copy_slice_bytes();
     let turned = bridge
@@ -547,8 +544,7 @@ async fn drive_dax_acks<S: VmmSeam, B: BridgeAccess>(
 /// The ingest the guest's stores through its maps take before the device ends (§4.6, A-163): every backing with ranges
 /// asked writable is compared with the volume a slice at a time, yielding between slices, and what it wrote is published
 /// before the terminal step lets the backings go. It waits while the owner is fenced, as every pass does, and the
-/// guest's stores are lost, counted, only when the attachment's authority or its volume is gone. Linux only.
-#[cfg(target_os = "linux")]
+/// guest's stores are lost, counted, only when the attachment's authority or its volume is gone.
 async fn drive_end_ingest<S: VmmSeam, B: BridgeAccess>(
   admitted: &mut AdmittedDevice<S>,
   bridge: &mut B,
@@ -592,13 +588,11 @@ struct LoopCounters {
   passes: u64,
   fenced_waits: u64,
   /// The device's backed DAX counts as the loop last added them to the owner's status counters.
-  #[cfg(target_os = "linux")]
   dax_reported: crate::backed::BackedCounts,
 }
 
 /// Adds what the device's backed DAX did since the loop's last report to the owner's status counters (A-168): after
 /// every pass, and once more after the terminal step, so its end ingest and its releases count too.
-#[cfg(target_os = "linux")]
 fn report_dax_counts<S: VmmSeam, B: BridgeAccess>(
   admitted: &AdmittedDevice<S>,
   bridge: &mut B,
@@ -625,18 +619,13 @@ async fn serve_round<S: VmmSeam, B: BridgeAccess>(
     return Some(EndReason::Revoked);
   }
   RegisterWaker { id }.await;
-  // A daemon recall kicked the loop (§4.6; e.g. `snapshot` recalling a volume's writable DAX windows): drain the
-  // pending revokes now — munmap the guest windows the recall marked — without waiting for the guest's next
-  // doorbell kick, then resume. Additive to the doorbell path below (unchanged): a loop with no kick falls straight
-  // through to its doorbell wait.
-  if take_drain_requested(id) {
-    // An `advance` kick (§4.6 "revoke on advance") rides the same flag: before the drain, re-validate this device's
-    // windows against its now-current view and tear any it no longer backs (the moved reader's stale windows), so
-    // the guest re-maps against the new view. A device whose view did not change finds all windows current, so a
-    // volume-wide kick is self-scoping. Best-effort hardening: if the attachment's authority has just lapsed, the
-    // pending drain and the terminal reclaim still cover teardown, and the pass below surfaces the lapse — so the
-    // result is folded into that pass, not lost.
-    let _revalidated = bridge.with_bridge(|b, registry| admitted.revalidate_windows(b, registry));
+  // The attachment's view moved (§4.6 "revoke on advance": a snapshot reader's `advance` kicked the loop): mark every
+  // backing stale now, so each is refilled from the new view before the guest sees anything more, without waiting for
+  // the guest's next doorbell kick, then serve. A loop with no kick falls straight through to its doorbell wait.
+  if take_advance_requested(id) {
+    // If the attachment's authority has just lapsed, the pass below meets the same lapse and ends the loop on it, so
+    // the refusal here is folded into that pass, not lost.
+    let _advanced = bridge.with_bridge(|b, registry| admitted.view_advanced(b, registry));
     return serve_until_idle(id, admitted, bridge, counters).await;
   }
   let raw = match admitted.doorbell() {
@@ -646,7 +635,7 @@ async fn serve_round<S: VmmSeam, B: BridgeAccess>(
   match doorbell_or_request(id, raw).await {
     Err(error) => return Some(EndReason::DoorbellLost(error)),
     // The shard asked something of the loop while it waited: the next round takes it at its top (a revoke ends
-    // the loop, a kick drains its pending DAX revokes), with no guest kick needed.
+    // the loop, a kick marks its backings stale), with no guest kick needed.
     Ok(Woke::Request) => return None,
     Ok(Woke::Doorbell) => {}
   }
@@ -677,21 +666,18 @@ pub async fn serve_loop<S: VmmSeam, B: BridgeAccess>(
     }
   };
   // The guest's stores through its DAX maps reach the volume before anything of the attachment is let go.
-  #[cfg(target_os = "linux")]
   drive_end_ingest(&mut admitted, &mut bridge).await;
   // The terminal step always runs to its end (AUD-29-70): through the bridge when the volume is there, else
   // through the registry alone — the volume's references went with it — and the store's backings alone.
   let reclaimed = match bridge.with_bridge(|b, registry| admitted.reclaim(b, registry)) {
     Ok(reclaimed) => reclaimed,
     Err(gone) => {
-      #[cfg(target_os = "linux")]
       let _released = bridge.with_backings(|backings| admitted.release_backings(backings));
       bridge
         .with_registry(|registry| admitted.abandon(registry))
         .unwrap_or(Err(ReclaimError::Authority(gone)))
     }
   };
-  #[cfg(target_os = "linux")]
   report_dax_counts(&admitted, &mut bridge, &mut counters);
   unregister(id);
   ServeEnd {
@@ -705,34 +691,31 @@ pub async fn serve_loop<S: VmmSeam, B: BridgeAccess>(
 
 #[cfg(test)]
 mod tests {
-  use super::{DeviceId, kick, register, request_revoke, revoke_requested, take_drain_requested};
+  use super::{DeviceId, kick, register, request_revoke, revoke_requested, take_advance_requested};
 
-  /// §4.6 — a daemon recall *kick* marks a device loop to drain its pending DAX revokes once, read-and-cleared, and
-  /// is a separate flag from a revoke. Do: register a loop; kick it; read the drain request twice; then revoke it.
-  /// Expect: the kick finds the loop and marks it; the first take is true and the second false (one-shot, cleared);
-  /// a kick does not revoke; revoke is its own flag; and a kick of an unknown loop is false.
+  /// §4.6 — a kick for a moved view marks a device loop once, read-and-cleared, and is a separate flag from a revoke.
+  /// Do: register a loop; kick it; take the mark twice; then revoke it. Expect: the kick finds the loop and marks it;
+  /// the first take is true and the second false (one-shot, cleared); a kick does not revoke; revoke is its own flag;
+  /// and a kick of an unknown loop is false.
   #[test]
-  fn a_kick_marks_the_loop_to_drain_once_and_is_distinct_from_revoke() {
+  fn a_kick_marks_the_loop_once_and_is_distinct_from_revoke() {
     // A generous bound: this thread-local control map may hold loops from other tests sharing the thread.
     let id = register(1024).unwrap();
     assert!(
-      !take_drain_requested(id),
-      "no drain is pending before a kick"
+      !take_advance_requested(id),
+      "nothing is marked before a kick"
     );
     assert!(kick(id), "the kick finds the registered loop");
+    assert!(take_advance_requested(id), "the kick marked the loop");
     assert!(
-      take_drain_requested(id),
-      "the kick marked the loop to drain"
+      !take_advance_requested(id),
+      "the mark is one-shot — the take cleared it, so the loop takes it once per kick"
     );
-    assert!(
-      !take_drain_requested(id),
-      "the drain request is one-shot — the take cleared it, so the loop drains once per kick"
-    );
-    assert!(!revoke_requested(id), "a kick drains; it does not revoke");
+    assert!(!revoke_requested(id), "a kick does not revoke");
     assert!(request_revoke(id), "the same loop can be revoked");
     assert!(
       revoke_requested(id),
-      "revoke is its own flag, independent of the drain flag"
+      "revoke is its own flag, independent of the kick's"
     );
     assert!(
       !kick(DeviceId(u64::MAX)),

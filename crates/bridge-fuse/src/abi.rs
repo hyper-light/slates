@@ -92,9 +92,9 @@ pub enum Opcode {
   ReadDirPlus = 44,
   /// Format: FUSE_RENAME2 — rename with flags (`RENAME_EXCHANGE`, `RENAME_NOREPLACE`).
   Rename2 = 45,
-  /// Format: FUSE_SETUPMAPPING — map a file range into the virtio-fs DAX window so the guest reaches the content
-  /// arena's block through its own page table, with no per-access daemon call (§4.6 A-9, AC-4.12). Served only
-  /// behind the DAX gate (`slates_vfs::dax`); plain `/dev/fuse` has no window and the seam replies unsupported.
+  /// Format: FUSE_SETUPMAPPING — map a file range into the virtio-fs DAX window so the guest reaches the file's bytes
+  /// through its own page table, with no per-access daemon call (§4.6 A-9, A-168): a range of the file's backing,
+  /// served by a device with a window; plain `/dev/fuse` has no window and the seam replies unsupported.
   SetupMapping = 48,
   /// Format: FUSE_REMOVEMAPPING — tear down DAX window mappings the guest no longer holds.
   RemoveMapping = 49,

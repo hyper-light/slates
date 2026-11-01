@@ -874,12 +874,6 @@ mod served {
       Ok(inode) => InodeNo(inode),
       Err(refusal) => return refused(refusal),
     };
-    // An in-process guest storing into the file's own block bypasses the write boundary, so no copy of the file could
-    // be kept equal to it, nor compared back against it: the two exclude each other, as a Shards backing and such a
-    // window do (A-163; `Volume::dax_map_write` refuses the other way round).
-    if state.store.dax.has_writable_of(inode) {
-      return refused(Refusal::MapUnavailable);
-    }
     let Some(request) = state.current_request else {
       return refused(Refusal::Unsupported {
         feature: "a direct map outside a recorded request".to_owned(),

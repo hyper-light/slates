@@ -5778,6 +5778,10 @@ at scale.
 
 ### Writable+readable DAX: the per-access win that closes the FUSE write/read gap (§4.6 A-9; 2026-10-13)
 
+**Retired 2026-11-01 (A-195):** the route measured here, windows over the arena's blocks, is removed, and
+`crates/vfs/examples/dax_bench.rs` with it; the command runs at any commit up to 4e6cee7b. A window maps a per-file
+backing now (A-168), whose access is the same memory load and store; its setup is the backing's fill.
+
 Environment: Apple M5 Max, macOS 26.4.1, Rust 1.98.0, release profile; branch `writable-dax`. Command:
 `cargo run --release -p slates-vfs --example dax_bench`. Best-of-5, each the mean of 100,000 inner iterations;
 all runs shown. The DAX access and setup numbers are **measured here** on the real content arena block the gate
@@ -5854,6 +5858,10 @@ invisible to real workloads — and is what the DAX data path (measured separate
 its device window is wired behind a KVM-capable host.
 
 ## DAX sealed-chunk backing: view versus reopen, and the learned hold (2026-10-17)
+
+**Retired 2026-11-01 (A-195):** both arms backed windows over the arena's blocks, which are removed, and
+`crates/vfs/examples/dax_backing_ab.rs` with them; the command runs at any commit up to 4e6cee7b. A backing (A-163) is
+the attachment's own plaintext copy of the file, so no sealed chunk meets a window.
 
 A sealed chunk (ciphertext at rest, A-92/A-99) cannot be mapped into a guest's DAX window as it stands — the guest's
 MMU would read ciphertext, and refusing the SETUPMAPPING SIGBUSes a `dax=always` mmap. Two arms were built in full,
