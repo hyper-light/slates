@@ -573,6 +573,16 @@ impl Guest {
     self.transcript.iter().any(|line| line.contains(words))
   }
 
+  /// The last line the transcript keeps that holds `words`.
+  pub(crate) fn last_line_holding(&self, words: &str) -> Option<&str> {
+    self
+      .transcript
+      .iter()
+      .rev()
+      .map(String::as_str)
+      .find(|line| line.contains(words))
+  }
+
   /// Tells the guest to quit, and waits for the VM to power off: its exit status.
   pub(crate) fn quit(&mut self) -> std::process::ExitStatus {
     self.done(&Ask::Quit);

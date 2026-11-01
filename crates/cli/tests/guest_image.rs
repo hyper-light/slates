@@ -49,6 +49,13 @@
 //! launcher compares the copy back, at its SIGUSR1 and at the VM's exit, and the test syncs through the launcher where
 //! over the mount the guest's flush would do.
 //!
+//! **A hostile guest over a handed copy (A-197).** Three tests play a guest the launcher and the daemon must survive.
+//! One writes its block device past the image's end, into the part of the copy the 2 MiB rounding adds, which must
+//! never reach the file. One storms flushes, each the VMM's sync of a copy with no file behind it, which must ask
+//! nothing of slates (the daemon's served requests and synced maps, read from `slates status`, are the count). One is
+//! killed while it sweeps a file a byte at a time, which must leave every byte it stored compared back and lose only
+//! those it never stored.
+//!
 //! The initramfs and Firecracker's configuration are written into a volume of their own through its mount, so the
 //! test writes nothing to disk but its mount points.
 #![cfg(target_os = "linux")]
@@ -65,7 +72,7 @@ mod vm;
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 
-use slates_guest_probe::protocol::{Command as Ask, EntryKind, Reply, digest};
+use slates_guest_probe::protocol::{Command as Ask, EntryKind, Reply, digest, sweep_value};
 use vm::{
   Anchor, DELIVERY_MILLIS, Guest, Module, MountPoint, QUIT_WAIT, REPLY_WAIT, created_volume,
   initramfs, kill_the_daemon, run, start_anchor, write_at, write_whole,
@@ -110,6 +117,19 @@ impl Backing {
 
 /// Every backing each pmem test runs over.
 const BACKINGS: [Backing; 2] = [Backing::Mount, Backing::Handed];
+/// Format: the granule `slates pmem` rounds its copy up to: 2 MiB, the alignment Firecracker's and Cloud Hypervisor's
+/// virtio-pmem need (A-197).
+const COPY_GRANULE: u64 = 2 * MIB;
+/// Shape: an image capacity a mebibyte short of a 2 MiB multiple, so the copy `slates pmem` hands the VMM runs a
+/// mebibyte past the image file's end, and the guest's pmem device with it.
+const SHORT_CAPACITY: &str = "31MiB";
+/// Shape: the bytes the guest writes past the image's end at each place: 64 KiB of the patch's byte, a run nothing in
+/// the image holds.
+const PAST_END_RUN: usize = 1 << 16;
+/// Shape: the store-and-sync rounds of a flush storm, each a flush of the guest's pmem device.
+const STORM_ROUNDS: u64 = 10_000;
+/// Shape: the most launcher syncs the kill test makes while it waits for one to find the guest sweeping.
+const SWEEP_SYNCS: usize = 50;
 /// Format: Firecracker's exit code for a VM stopped by an error (`FcExitCode::GenericError`, as its log names it:
 /// "Firecracker exiting with error. exit_code=1").
 const FIRECRACKER_ERROR_EXIT: i32 = 1;
@@ -289,9 +309,14 @@ impl Source {
     sorted(entries)
   }
 
+  /// The large file's bytes, as the source holds them.
+  fn large(&self) -> &[u8] {
+    &self.files[1].1
+  }
+
   /// The large file as the guest leaves it: patched in its second chunk.
   fn patched(&self) -> Vec<u8> {
-    let mut bytes = self.files[1].1.clone();
+    let mut bytes = self.large().to_vec();
     let (at, len) = PATCH;
     bytes[self.chunk + at..self.chunk + at + len].fill(PATCH_BYTE);
     bytes
@@ -912,13 +937,18 @@ struct Rig {
   image: String,
   image_mount: MountPoint,
   boot_mount: MountPoint,
-  _source_mount: MountPoint,
+  source_mount: MountPoint,
   anchor: Anchor,
 }
 
 impl Rig {
   /// Starts a daemon for `instance`, writes the source tree into a volume, snapshots it and builds the image.
   fn new(instance: &str) -> Rig {
+    Rig::with_capacity(instance, CAPACITY)
+  }
+
+  /// [`Rig::new`], the image `capacity` long.
+  fn with_capacity(instance: &str, capacity: &str) -> Rig {
     let anchor = start_anchor(instance);
     let source = Source::new();
     let volume = created_volume(instance, "source");
@@ -936,7 +966,7 @@ impl Rig {
         &snapshot,
         "image",
         "--capacity",
-        CAPACITY,
+        capacity,
       ],
     );
     assert_eq!(code, 0, "image build: {err}");
@@ -950,7 +980,7 @@ impl Rig {
       image,
       image_mount,
       boot_mount,
-      _source_mount: source_mount,
+      source_mount,
       anchor,
     }
   }
@@ -964,6 +994,48 @@ impl Rig {
   #[allow(clippy::disallowed_methods)] // reads through the slates mount: RAM, not disk
   fn image_bytes(&self) -> Vec<u8> {
     std::fs::read(self.image_file()).unwrap()
+  }
+
+  /// The image file's length, read through its mount.
+  #[allow(clippy::disallowed_methods)] // reads through the slates mount: RAM, not disk
+  fn image_len(&self) -> u64 {
+    std::fs::metadata(self.image_file()).unwrap().len()
+  }
+
+  /// What the volumes beside the image hold: the source's tree and the boot files, each listed with its digest. A copy
+  /// is compared back into its own file alone, so a guest's stores must change neither.
+  fn other_volumes(&self) -> (Vec<Reply>, Vec<Reply>) {
+    (
+      volume_listing(&self.source_mount),
+      volume_listing(&self.boot_mount),
+    )
+  }
+
+  /// The image's volume holds the image file alone, `len` bytes long: a copy is compared back into its own file, within
+  /// the file's length, and nowhere else.
+  fn holds_the_image_alone(&self, len: u64, when: &str) {
+    let listing = volume_listing(&self.image_mount);
+    assert!(
+      matches!(listing.as_slice(), [Reply::Entry { path, size, .. }] if path == "image.ext2" && *size == len),
+      "{when}, the image's volume holds the image file alone, {len} bytes long: {listing:?}"
+    );
+  }
+
+  /// [`Rig::holds_the_image_alone`], and slates holds no run of [`PAST_END_RUN`] bytes in the image: a store past the
+  /// file's end in a copy is never the file's (A-186, A-197).
+  fn holds_nothing_past_its_end(&self, len: u64, when: &str) {
+    self.holds_the_image_alone(len, when);
+    let held = self.held_by_slates();
+    assert_eq!(
+      u64::try_from(held.len()).unwrap(),
+      len,
+      "{when}, slates holds the image file at its length"
+    );
+    assert_eq!(
+      run_of(&held, PAST_END_RUN),
+      None,
+      "{when}, slates holds none of the bytes the guest wrote past the image's end"
+    );
   }
 
   /// The image file's bytes as slates itself holds them, read past the kernel and its cache (`slates read`).
@@ -1022,9 +1094,11 @@ impl Rig {
         )
       }
       Vmm::Qemu { binary, kernel } => {
-        #[allow(clippy::disallowed_methods)]
-        // the image file's length, through the slates mount: RAM, not disk; a handed copy is as long (2 MiB multiples)
-        let len = std::fs::metadata(self.image_file()).unwrap().len();
+        // QEMU maps `size=` bytes of its backing: the file's length, or a handed copy's, rounded up to 2 MiB.
+        let len = match backing {
+          Backing::Mount => self.image_len(),
+          Backing::Handed => self.image_len().next_multiple_of(COPY_GRANULE),
+        };
         Guest::spawn(
           vmm(binary).args(qemu_arguments(kernel, &initrd, (&image, len), disk)),
           gate.vmm.tag(),
@@ -1573,7 +1647,8 @@ fn a_guest_killed_with_unsynced_stores(gate: &Gate) {
 
 /// Kills the VMM a handed copy's launcher runs, with `SIGKILL`, as a crashed VMM dies, and waits for the launcher to
 /// end: it lets the map go at the VM's exit, which compares the copy back (A-197), says so, and exits as its VMM did.
-fn kill_the_vmm_under_its_launcher(guest: &mut Guest) {
+/// The guest stored since the launcher's last sync, so that compare-back writes bytes: how many.
+fn kill_the_vmm_under_its_launcher(guest: &mut Guest) -> u64 {
   let launcher = guest.vm.id();
   #[allow(clippy::disallowed_methods)] // reads the kernel's process table: a query, never a write
   let children = std::fs::read_to_string(format!("/proc/{launcher}/task/{launcher}/children"))
@@ -1608,11 +1683,17 @@ fn kill_the_vmm_under_its_launcher(guest: &mut Guest) {
     "the launcher exits as its killed VMM did\n{}",
     guest.transcript()
   );
+  let released = guest
+    .last_line_holding(LAUNCHER_RELEASED)
+    .and_then(|line| line.rsplit_once(LAUNCHER_RELEASED))
+    .and_then(|(_, written)| written.trim().parse::<u64>().ok());
   assert!(
-    guest.said(LAUNCHER_RELEASED),
-    "the launcher let the map go at the VM's exit, comparing the copy back\n{}",
+    released.is_some_and(|written| written > 0),
+    "the launcher let the map go at the VM's exit, its compare-back writing what the guest stored since the last \
+     sync: {released:?}\n{}",
     guest.transcript()
   );
+  released.unwrap_or_default()
 }
 
 /// [`a_guest_killed_with_unsynced_stores`] over `backing`. Over a handed copy the VMM alone is killed: its launcher lets
@@ -1629,7 +1710,10 @@ fn a_guest_killed_with_unsynced_stores_over(gate: &Gate, disk: &Disk, backing: B
   guest_stores(&mut first, patch_at, PATCH.1);
   match backing {
     Backing::Mount => first.kill(),
-    Backing::Handed => kill_the_vmm_under_its_launcher(&mut first),
+    Backing::Handed => {
+      let released = kill_the_vmm_under_its_launcher(&mut first);
+      eprintln!("the launcher's compare-back at the VM's exit wrote {released} bytes");
+    }
   }
   patch_in(
     &rig.held_by_slates(),
@@ -1659,4 +1743,334 @@ fn a_guest_killed_with_unsynced_stores_over(gate: &Gate, disk: &Disk, backing: B
   let mut checked = patched;
   checked.push(directory("lost+found"));
   rig.merged_holds("merged", &sorted(checked), (1, 0, 0), rig.source.page);
+}
+
+/// What the daemon has served, read from `slates status`: the requests every shard answered (each records its
+/// completion, so every client request counts once, the status read's own among them) and the writable maps it synced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Served {
+  requests: u64,
+  synced: u64,
+}
+
+impl Served {
+  /// The daemon's counts now.
+  fn now(rig: &Rig) -> Served {
+    let (code, out, err) = run(&rig.instance, &["status"]);
+    assert_eq!(code, 0, "slates status: {err}");
+    let text = String::from_utf8_lossy(&out);
+    let mut served = Served {
+      requests: 0,
+      synced: 0,
+    };
+    for line in text.lines().filter(|line| line.starts_with("shard ")) {
+      if let Some(requests) = line
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix("served="))
+      {
+        served.requests += requests.parse::<u64>().unwrap();
+      }
+      if let Some((_, synced)) = line.split_once(" refused dax.local_map_synced: ") {
+        served.synced += synced.trim().parse::<u64>().unwrap();
+      }
+    }
+    served
+  }
+}
+
+/// A-197 by a hostile guest: the copy `slates pmem` hands a VMM is the image file's length rounded up to 2 MiB, so a
+/// guest's pmem device can run past the file's end. Do: build the image a mebibyte short of a 2 MiB multiple; boot a
+/// pmem guest over a handed copy; list and map; have the guest write 64 KiB of the patch's byte through its block device
+/// at the image's end and at the copy's last 64 KiB, each read back from the device with its cached pages dropped; sync
+/// through the launcher; end the VM; merge. Expect each write to read back from the device; the image file to keep its
+/// length, alone in its volume, and slates to hold none of those bytes, after the launcher's sync and after the VM's
+/// end; the merge to change nothing; and the source's and the boot volume's files to be as they were.
+#[test]
+fn a_pmem_guests_writes_past_its_images_end_stay_in_its_handed_copy() {
+  for gate in Gate::each_from_env() {
+    writes_past_the_images_end(&gate);
+  }
+}
+
+/// [`a_pmem_guests_writes_past_its_images_end_stay_in_its_handed_copy`] in the VMM `gate` names.
+fn writes_past_the_images_end(gate: &Gate) {
+  let Some(disk) = pmem_disk(gate) else {
+    return;
+  };
+  let rig = Rig::with_capacity(
+    &format!(
+      "guest-pmem-past-end-{}-{}",
+      gate.vmm.name(),
+      std::process::id()
+    ),
+    SHORT_CAPACITY,
+  );
+  let image_len = rig.image_len();
+  let copy_len = image_len.next_multiple_of(COPY_GRANULE);
+  assert!(
+    copy_len > image_len,
+    "the copy of a {image_len}-byte image runs past its end"
+  );
+  let run = u64::try_from(PAST_END_RUN).unwrap();
+  let mut guest = rig.boot_over(gate, &disk, Backing::Handed);
+  let others = rig.other_volumes();
+  lists_and_maps(&rig, &mut guest);
+  for at in [image_len, copy_len - run] {
+    guest.done(&Ask::Device {
+      at,
+      bytes: vec![PATCH_BYTE; PAST_END_RUN],
+    });
+  }
+  eprintln!(
+    "the guest wrote {PAST_END_RUN} bytes at {image_len} and at {} of its {copy_len}-byte device, past the \
+     {image_len}-byte image, each read back from the device",
+    copy_len - run
+  );
+  let synced = launcher_syncs(&mut guest);
+  eprintln!("the launcher's sync wrote {synced} bytes");
+  rig.holds_nothing_past_its_end(image_len, "after the launcher's sync");
+  the_guest_ends_the_vm_by_its_restart(&mut guest);
+  guest.drain(QUIT_WAIT);
+  assert!(
+    guest.said(LAUNCHER_RELEASED),
+    "the launcher let the map go at the VM's end\n{}",
+    guest.transcript()
+  );
+  rig.holds_nothing_past_its_end(image_len, "after the VM's end");
+  rig.merged_holds("merged", &rig.source.listing(), (0, 0, 0), 0);
+  assert_eq!(
+    rig.other_volumes(),
+    others,
+    "the source's and the boot volume's files are as they were"
+  );
+}
+
+/// A-197 by a hostile guest: a virtio-pmem flush is the VMM's sync of its backing, and a handed copy has no file behind
+/// it, so no flush reaches slates. Do: boot a pmem guest over a handed copy; list and map; read the daemon's served
+/// requests and synced maps twice, the second read's rise being what a read costs; have the guest store the patch and
+/// sync its map 10,000 times over, each sync a flush of its device; read the counts and slates' image; sync through the
+/// launcher; read them again; end the VM. Expect the storm to raise the served requests by what a read costs alone and
+/// the synced maps not at all, and slates to hold no run of the patch; then the launcher's one sync to raise both and
+/// to put the patch in slates.
+#[test]
+fn a_pmem_guests_flush_storm_over_a_handed_copy_makes_no_slates_io() {
+  for gate in Gate::each_from_env() {
+    flush_storm_over_a_handed_copy(&gate);
+  }
+}
+
+/// [`a_pmem_guests_flush_storm_over_a_handed_copy_makes_no_slates_io`] in the VMM `gate` names.
+fn flush_storm_over_a_handed_copy(gate: &Gate) {
+  let Some(disk) = pmem_disk(gate) else {
+    return;
+  };
+  let rig = Rig::new(&format!(
+    "guest-pmem-storm-{}-{}",
+    gate.vmm.name(),
+    std::process::id()
+  ));
+  let mut guest = rig.boot_over(gate, &disk, Backing::Handed);
+  let patch_at = lists_and_maps(&rig, &mut guest);
+  let first = Served::now(&rig);
+  let before = Served::now(&rig);
+  let read = before.requests - first.requests;
+  match guest.ask(
+    &Ask::Storm {
+      at: u64::try_from(patch_at).unwrap(),
+      len: u64::try_from(PATCH.1).unwrap(),
+      byte: PATCH_BYTE,
+      rounds: STORM_ROUNDS,
+    },
+    REPLY_WAIT,
+  ) {
+    Reply::Stormed { micros } => eprintln!(
+      "the guest stored and synced {STORM_ROUNDS} times over in {} ms",
+      micros / 1_000
+    ),
+    other => panic!("storm → {other:?}\n{}", guest.transcript()),
+  }
+  let stormed = Served::now(&rig);
+  assert_eq!(
+    (stormed.requests - before.requests, stormed.synced),
+    (read, before.synced),
+    "the guest's {STORM_ROUNDS} flushes asked nothing of slates: its served requests rose by a read's {read} \
+     alone, and no map was synced"
+  );
+  assert_eq!(
+    run_of(&rig.held_by_slates(), PATCH.1),
+    None,
+    "slates holds none of the stores the guest flushed"
+  );
+  let quiet = Served::now(&rig);
+  let written = launcher_syncs(&mut guest);
+  let synced = Served::now(&rig);
+  assert!(
+    written > 0 && synced.requests - quiet.requests > read && synced.synced == quiet.synced + 1,
+    "the launcher's one sync is a request and a synced map, and writes the stores: {written} bytes, {quiet:?} → \
+     {synced:?}"
+  );
+  patch_in(
+    &rig.held_by_slates(),
+    PATCH.1,
+    patch_at,
+    "slates itself, after the launcher's sync",
+  );
+  the_guest_ends_the_vm_by_its_restart(&mut guest);
+}
+
+/// The byte the sweep before stored, given a sweep's: in [`sweep_value`]'s cycle of 255, the sweep that stores `value`
+/// first is `value - 1`, and the one before it is 254 sweeps on.
+fn sweep_before(value: u8) -> u8 {
+  let sweep = u64::from(value) - 1;
+  sweep_value(sweep + u64::from(u8::MAX) - 1)
+}
+
+/// The swept bytes a VM killed during a sweep left in its file: one sweep's byte up to the point the sweep reached,
+/// and the byte of the sweep before after it. A processor that makes its stores visible in program order (x86's) leaves
+/// exactly that; one that may reorder stores (arm64's) leaves each byte past the point one of the two. The sweep's byte,
+/// the one before, and the point.
+fn sweep_left(bytes: &[u8]) -> (u8, u8, usize) {
+  let reached_byte = bytes[0];
+  let reached = bytes
+    .iter()
+    .position(|byte| *byte != reached_byte)
+    .unwrap_or(bytes.len());
+  let before = sweep_before(reached_byte);
+  let past = &bytes[reached..];
+  let left = if cfg!(target_arch = "x86_64") {
+    past.iter().all(|byte| *byte == before)
+  } else {
+    past
+      .iter()
+      .all(|byte| *byte == before || *byte == reached_byte)
+  };
+  assert!(
+    left,
+    "the swept bytes hold sweep byte {reached_byte} up to {reached} and the sweep before's, {before}, after it: \
+     {:?}",
+    longest_run(past)
+  );
+  (reached_byte, before, reached)
+}
+
+/// A-197 by a hostile guest killed during its stores. Do: boot a pmem guest over a handed copy; list; map the large
+/// file's whole pages; sync through the launcher, so only the guest's stores differ from slates after it; have the guest
+/// sweep the pages a byte at a time, sweep after sweep, each sweep's byte one more than the last's; sync through the
+/// launcher until a sync writes at least half a sweep's bytes, so the guest is storing; kill the VMM under its launcher;
+/// boot a second guest over a new copy, list, read the large file, end it. Expect the launcher's compare-back at the
+/// VM's exit to write what the guest stored since the last sync, and the launcher to exit 137; the swept bytes to hold
+/// one sweep's byte up to a point and the sweep before's after it, so every byte the guest stored before the kill was
+/// compared back and only those it never stored are lost; the
+/// file's last part and the other files as they were, the image alone in its volume at its length, and the source's
+/// and the boot volume's files as they were.
+#[test]
+fn a_pmem_guest_killed_mid_store_over_a_handed_copy_leaves_each_byte_compared_back_or_lost() {
+  for gate in Gate::each_from_env() {
+    killed_mid_store_over_a_handed_copy(&gate);
+  }
+}
+
+/// [`a_pmem_guest_killed_mid_store_over_a_handed_copy_leaves_each_byte_compared_back_or_lost`] in the VMM `gate` names.
+fn killed_mid_store_over_a_handed_copy(gate: &Gate) {
+  let Some(disk) = pmem_disk(gate) else {
+    return;
+  };
+  let rig = Rig::new(&format!(
+    "guest-pmem-mid-store-{}-{}",
+    gate.vmm.name(),
+    std::process::id()
+  ));
+  let page = rustix::param::page_size();
+  let large = rig.source.large();
+  let swept = large.len() / page * page;
+  let image_len = rig.image_len();
+  let mut first = rig.boot_over(gate, &disk, Backing::Handed);
+  let others = rig.other_volumes();
+  assert_eq!(listed(&mut first), rig.source.listing());
+  maps_the_large_file(&mut first, swept / page);
+  let settled = launcher_syncs(&mut first);
+  first.send(&Ask::Sweep {
+    len: u64::try_from(swept).unwrap(),
+    sweeps: u64::MAX,
+  });
+  let half_a_sweep = u64::try_from(swept / 2).unwrap();
+  let mut storing = None;
+  for _ in 0..SWEEP_SYNCS {
+    let written = launcher_syncs(&mut first);
+    if written >= half_a_sweep {
+      storing = Some(written);
+      break;
+    }
+  }
+  let storing = storing.unwrap_or_else(|| {
+    panic!(
+      "no launcher sync of {SWEEP_SYNCS} found the guest sweeping\n{}",
+      first.transcript()
+    )
+  });
+  eprintln!(
+    "the launcher's sync before the sweep wrote {settled} bytes; one during it wrote {storing} of the {swept} swept"
+  );
+  let released = kill_the_vmm_under_its_launcher(&mut first);
+  eprintln!("the launcher's compare-back at the VM's exit wrote {released} bytes");
+  let mut second = rig.boot_over(gate, &disk, Backing::Handed);
+  let listing = listed(&mut second);
+  maps_the_large_file(&mut second, large.len().div_ceil(page));
+  let read = match second.ask(
+    &Ask::Read {
+      at: 0,
+      len: u64::try_from(large.len()).unwrap(),
+    },
+    REPLY_WAIT,
+  ) {
+    Reply::Bytes(bytes) => bytes,
+    other => panic!("read → {other:?}\n{}", second.transcript()),
+  };
+  the_guest_ends_the_vm_by_its_restart(&mut second);
+  let (reached_byte, before, reached) = sweep_left(&read[..swept]);
+  eprintln!(
+    "the killed guest's sweep had stored {reached_byte} up to byte {reached} of {swept}; the sweep before, {before}, \
+     holds the rest"
+  );
+  assert_eq!(
+    &read[swept..],
+    &large[swept..],
+    "the large file past the swept pages is as it was"
+  );
+  let unswept: Vec<&Reply> = listing
+    .iter()
+    .filter(|entry| !matches!(entry, Reply::Entry { path, .. } if path == "docs/sub/b.bin"))
+    .collect();
+  let expected = rig.source.listing();
+  let others_expected: Vec<&Reply> = expected
+    .iter()
+    .filter(|entry| !matches!(entry, Reply::Entry { path, .. } if path == "docs/sub/b.bin"))
+    .collect();
+  assert_eq!(
+    unswept, others_expected,
+    "every other node of the image is as it was"
+  );
+  rig.holds_the_image_alone(image_len, "after the kill");
+  assert_eq!(
+    rig.other_volumes(),
+    others,
+    "the source's and the boot volume's files are as they were"
+  );
+}
+
+/// The guest maps the large file's first `pages` pages, with DAX.
+fn maps_the_large_file(guest: &mut Guest, pages: usize) {
+  match guest.ask(
+    &Ask::Map {
+      path: "docs/sub/b.bin".to_owned(),
+      pages: u64::try_from(pages).unwrap(),
+    },
+    REPLY_WAIT,
+  ) {
+    Reply::Mapped { dax: true } => {}
+    other => panic!(
+      "map docs/sub/b.bin {pages} → {other:?}: DAX is what this test is for\n{}",
+      guest.transcript()
+    ),
+  }
 }
