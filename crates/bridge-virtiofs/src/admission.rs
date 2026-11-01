@@ -165,9 +165,8 @@ pub trait VmmSeam {
 
   /// The DAX cache region this seam offers (§4.6): the VMM's cache-window descriptor and its length in bytes, or
   /// `None` when the VMM set up none — then DAX cannot be served and is not advertised. The device maps this fd once
-  /// to build a [`crate::dax::DaxCacheRegion`] and places content blocks' pages into it with `MAP_FIXED`. Asked once
-  /// at admission. Default: none (the in-process form and any seam that has not wired a cache region offer no DAX).
-  /// Unix only (the DAX window is a Linux/vhost-user feature).
+  /// to build a [`crate::dax::DaxCacheRegion`] and overlays the pieces of files' backings into it with `MAP_FIXED`.
+  /// Asked once at admission. Default: none (a seam that has not wired a cache region offers no DAX). Unix only.
   #[cfg(unix)]
   fn dax_window(&mut self) -> Option<(std::os::fd::BorrowedFd<'_>, u64)> {
     None

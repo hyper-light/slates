@@ -131,7 +131,7 @@ pub mod request {
 /// `SHMEM_MAP` from the back end). As crosvm's `vmm_vhost::message::BackendReq` numbers them (re-checked against
 /// the pinned VMM when the live guest runs); crosvm's older `FS_MAP` is `DEPRECATED__` and its `EXTERNAL_MAP`
 /// (1007) is the in-process `ptr` form slates does not use — the out-of-process back end sends `SHMEM_MAP` (9)
-/// with the arena descriptor, the standardized code QEMU and cloud-hypervisor also speak.
+/// with a file's backing (`crate::backed`), the standardized code QEMU and cloud-hypervisor also speak.
 pub mod backend_request {
   /// Format: `VHOST_USER_BACKEND_SHMEM_MAP` — ask the front end to map a descriptor's pages into a VIRTIO
   /// shared-memory region (the DAX cache window) at a given offset.
@@ -697,9 +697,9 @@ impl VhostUserSeam {
   }
 
   /// Enables DAX for this device: it will offer `BACKEND_REQ | SHMEM`, accept the back-end-request channel over
-  /// `SET_BACKEND_REQ_FD`, and (§4.6) ask the front end to place content blocks into a VIRTIO shared-memory region
-  /// of `region_bytes`. Gated by the caller to the DAX-authorized path; a device that never calls this behaves
-  /// exactly as a non-DAX one (production stays unadvertised). `region_bytes` is the caller's derived cache size.
+  /// `SET_BACKEND_REQ_FD`, and (§4.6) ask the front end to place the pieces of files' backings into a VIRTIO
+  /// shared-memory region of `region_bytes`. Called only for an attach that names a DAX window; a device that never
+  /// calls this behaves exactly as a non-DAX one. `region_bytes` is the caller's derived cache size.
   pub fn enable_dax(&mut self, region_bytes: u64) {
     self.dax_enabled = true;
     self.dax_region_bytes = region_bytes;
@@ -1436,18 +1436,17 @@ fn parse_ack(bytes: &[u8]) -> Result<(u32, u64), VhostError> {
   Ok((u32_at(bytes, 0)?, u64_at(bytes, HEADER_LEN)?))
 }
 
-/// Format: the one descriptor a `SHMEM_MAP` carries in ancillary data — the content arena's backing object.
+/// Format: the one descriptor a `SHMEM_MAP` carries in ancillary data — the file's backing object.
 pub const MAP_FDS: usize = 1;
 
 /// The back-end-request channel (§4.6, A-9): the stream socket the front end hands the back end over
-/// `VHOST_USER_SET_BACKEND_REQ_FD`, on which the back end asks the front end to place a content block's pages into
-/// a VIRTIO shared-memory region with [`BackendReqChannel::send_map`] (`SHMEM_MAP`) and to remove them with
+/// `VHOST_USER_SET_BACKEND_REQ_FD`, on which the back end asks the front end to place a piece of a file's backing into
+/// a VIRTIO shared-memory region with [`BackendReqChannel::send_map`] (`SHMEM_MAP`) and to remove it with
 /// [`BackendReqChannel::send_unmap`] (`SHMEM_UNMAP`). This is the **message-based** DAX delivery an out-of-process
 /// VMM (crosvm `--vhost-user-fs`, QEMU `vhost-user-fs-pci`, cloud-hypervisor) uses: the back end cannot reach the
-/// guest's BAR itself, so it hands the front end the arena descriptor
-/// ([`slates_bridge_core::Bridge::dax_backing`]) and the front end `mmap`s it into the region. (The fd-sharing
-/// form, where the back end maps a window it was handed, is [`crate::dax::DaxCacheRegion`], used by an in-process
-/// VMM like libkrun.)
+/// guest's BAR itself, so it hands the front end the backing's descriptor (`crate::backed`; A-168) and the front end
+/// `mmap`s it into the region. (The fd-sharing form, where the back end overlays a window it was handed, is
+/// [`crate::dax::DaxCacheRegion`], used by an in-process VMM like libkrun; A-195.)
 ///
 /// A map carries `NEED_REPLY`, so the front end acknowledges once the mapping is live; the caller reads the ack
 /// with [`parse_ack`] before answering the guest's `FUSE_SETUPMAPPING`, so the guest never faults a page the front
@@ -1702,8 +1701,9 @@ impl VmmSeam for VhostUserSeam {
 enum DaxOp {
   /// A `SHMEM_MAP` (FUSE_SETUPMAPPING): its ack lets the guest be told the window is live.
   Map,
-  /// A `SHMEM_UNMAP` (FUSE_REMOVEMAPPING, or a content-path teardown): its ack is the signal the front end has
-  /// removed the window from the guest's BAR, so the block may be unpinned (§4.6 phase two).
+  /// A `SHMEM_UNMAP` (FUSE_REMOVEMAPPING, an overlapping SETUPMAPPING, a forget or the device's end): its ack says the
+  /// front end removed the piece from the guest's BAR. Nothing waits on it, since a window over a backing pins
+  /// nothing.
   Unmap,
 }
 
@@ -1717,22 +1717,25 @@ struct OutstandingDax<T: Copy> {
 }
 
 /// What a drained reply-ack completed — the action the device loop now takes. `token` is the request's caller value
-/// (the device's DAX window entry). A map records the window and answers the guest; a refused map unpins and
-/// answers an errno; an unmap unpins the block (§4.6 phase two); a refused unmap is a front-end protocol fault.
+/// (the piece of a window it asked for). A window's last piece mapped records the window and answers the guest; a
+/// refused piece fails the window, which is unmapped whole, and answers an errno; an unmap settles nothing, since a
+/// window over a backing pins nothing; a refused unmap is counted.
 #[derive(Clone, Copy, Debug)]
 pub enum DaxCompletion<T: Copy> {
-  /// The front end mapped the window: the caller records it and answers the guest's SETUPMAPPING with success.
+  /// The front end mapped the piece: once every piece of the window is in, the caller records it and answers the
+  /// guest's SETUPMAPPING with success.
   Mapped(T),
-  /// The front end refused the map: the caller unpins the block (no window was established) and answers an errno.
+  /// The front end refused the piece: the caller unmaps the window's other pieces and answers an errno.
   MapRefused {
     /// The request's token.
     token: T,
     /// The front end's non-zero reply-ack status.
     status: u64,
   },
-  /// The front end removed the window: the caller unpins the block (phase two — safe now the guest cannot reach it).
+  /// The front end removed the piece: the guest no longer reaches it through the window.
   Unmapped(T),
-  /// The front end refused an unmap: a protocol fault; the block stays pinned and the caller faults the device.
+  /// The front end refused an unmap: the piece may still be mapped, so the caller counts it; the backing it maps stays
+  /// equal to the file meanwhile.
   UnmapRefused {
     /// The request's token.
     token: T,
@@ -1775,19 +1778,19 @@ impl std::fmt::Display for MessagePlaceError {
 
 impl std::error::Error for MessagePlaceError {}
 
-/// The **message-based** DAX placer (§4.6, A-9): the out-of-process form of placing content blocks into a guest's
-/// DAX window. Unlike the fd-sharing [`crate::dax::DaxCacheRegion`] (where the back end owns the window and overlays
-/// blocks itself, for an in-process VMM like libkrun), here the back end does not own the window — it asks the front
-/// end (crosvm `--vhost-user-fs`, QEMU, cloud-hypervisor) to place each block over the [`BackendReqChannel`]: a
-/// SETUPMAPPING is a [`BackendReqChannel::send_map`] whose reply-ack the device waits for before answering the guest
-/// (so the guest never faults a page the front end has not mapped), and a REMOVEMAPPING or a content-path teardown
-/// is a [`BackendReqChannel::send_unmap`] whose ack is the signal the window is gone, so the block may be unpinned —
-/// never before, or a stale guest page table could reach a reused block (§4.6 #1, phase two).
+/// The **message-based** DAX placer (§4.6, A-9, A-168): the out-of-process form of placing the pieces of files'
+/// backings into a guest's DAX window. Unlike the fd-sharing [`crate::dax::DaxCacheRegion`] (where the back end owns
+/// the window and overlays each piece itself, for an in-process VMM like libkrun), here the back end does not own the
+/// window — it asks the front end (crosvm `--vhost-user-fs`, QEMU, cloud-hypervisor) to place each piece over the
+/// [`BackendReqChannel`]: a SETUPMAPPING's pieces are [`BackendReqChannel::send_map`]s whose reply-acks the device waits
+/// for before answering the guest (so the guest never faults a page the front end has not mapped), and a REMOVEMAPPING
+/// is a [`BackendReqChannel::send_unmap`] a piece. A window over a backing pins nothing, so no unmap's ack is waited
+/// on.
 ///
 /// Requests are pipelined (sent as they arise) and their reply-acks matched FIFO, since the channel replies in send
 /// order. [`MessagePlacer::poll_acks`] drains the acks when the channel is readable and returns the completions the
-/// device acts on. `T` is the per-request token the device threads through (its DAX window entry); it is generic so
-/// the placer's wire and FIFO are proven by use with a plain marker, independent of the un-fabricable gate mapping.
+/// device acts on. `T` is the per-request token the device threads through (the piece of a window it asks for); it is
+/// generic so the placer's wire and FIFO are proven by use with a plain marker.
 pub struct MessagePlacer<T: Copy> {
   /// The back-end-request socket to the front end.
   channel: BackendReqChannel,
@@ -1835,8 +1838,7 @@ impl<T: Copy> MessagePlacer<T> {
     self.channel.fd()
   }
 
-  /// Whether any request still awaits a reply-ack — the loop keeps draining while true, and the terminal step
-  /// drains to empty before it unpins the last block.
+  /// Whether any request still awaits a reply-ack — the loop keeps draining while true.
   #[must_use]
   pub fn has_outstanding(&self) -> bool {
     !self.outstanding.is_empty()
@@ -1849,9 +1851,9 @@ impl<T: Copy> MessagePlacer<T> {
     std::os::fd::AsRawFd::as_raw_fd(&self.channel.fd())
   }
 
-  /// Drains every still-outstanding request, clearing the ring, as `(is_map, token)` pairs. The terminal step
-  /// takes these to release the blocks whose reply-ack never arrived (the front end is gone): a map's pin is
-  /// undone, an unmap's block is unpinned (§4.6 phase two), so no block is left pinned after the device ends.
+  /// Drains every still-outstanding request, clearing the ring, as `(is_map, token)` pairs: the terminal step's, for
+  /// requests whose reply-ack never arrived (the front end is gone). Nothing is held behind them, since a window over a
+  /// backing pins nothing.
   pub fn take_pending(&mut self) -> Vec<(bool, T)> {
     self
       .outstanding
@@ -1941,9 +1943,8 @@ impl<T: Copy> MessagePlacer<T> {
   }
 
   /// Sends a `SHMEM_UNMAP` removing the window at `[moffset, moffset+len)` and records the request awaiting the ack
-  /// under `token`. The block stays pinned until [`MessagePlacer::poll_acks`] yields this request's
-  /// [`DaxCompletion::Unmapped`], at which point the caller unpins it (§4.6 phase two). Send-before-record, as
-  /// [`MessagePlacer::begin_map`].
+  /// under `token`; [`MessagePlacer::poll_acks`] yields this request's [`DaxCompletion::Unmapped`] when the front end
+  /// answers. Send-before-record, as [`MessagePlacer::begin_map`].
   pub fn begin_unmap(&mut self, moffset: u64, len: u64, token: T) -> Result<(), MessagePlaceError> {
     self.check_window(moffset, len)?;
     self.room()?;
@@ -1980,11 +1981,11 @@ impl<T: Copy> MessagePlacer<T> {
         DaxOp::Map => backend_request::SHMEM_MAP,
         DaxOp::Unmap => backend_request::SHMEM_UNMAP,
       };
-      // The channel answers in order, so for a conforming front end this always holds. For one that does not,
-      // it is the whole of the safety: completing a map's ack against an outstanding *unmap* would report that
-      // window gone and the caller would unpin a block the guest still has in its page tables — the
-      // use-after-free the pin discipline exists to prevent (§4.6, A-99). A mismatch is the front end breaking
-      // the wire, which ends the device; it is never completed as though it answered the request we sent.
+      // The channel answers in order, so for a conforming front end this always holds. For one that does not, it
+      // is what keeps the device's books true: completing an ack against the wrong request would answer a guest's
+      // SETUPMAPPING before the front end has mapped its window, so the guest faults a page nothing maps, or take a
+      // refused map for a placed one. A mismatch is the front end breaking the wire, which ends the device; it is
+      // never completed as though it answered the request we sent.
       if request != expected {
         return Err(MessagePlaceError::Channel(protocol(
           "a reply-ack answering a back-end request other than the one awaiting it",
@@ -2282,10 +2283,9 @@ mod shmem_tests {
   /// outstanding, completed by nothing.
   ///
   /// The channel answers in order, so a conforming VMM never does this and the check costs a comparison. What it
-  /// buys is the case where the VMM is wrong: completing a map's ack against an outstanding unmap would report
-  /// that window removed, and the caller unpins on an `Unmapped` — handing a block back to the arena while the
-  /// guest still has it in its page tables (§4.6 phase two, A-99). Until 2026-10-18 the ack's request code was
-  /// parsed and discarded, so the two were indistinguishable.
+  /// buys is the case where the VMM is wrong: completing an ack against the wrong request would answer a guest's
+  /// SETUPMAPPING before its window is mapped, or take a refused map for a placed one. Until 2026-10-18 the ack's
+  /// request code was parsed and discarded, so the two were indistinguishable.
   #[test]
   fn a_reply_ack_for_a_request_that_is_not_the_one_awaiting_it_is_refused() {
     let (frontend, backend) = stream_pair();
@@ -2365,7 +2365,8 @@ mod shmem_tests {
 
   /// A non-zero reply-ack is a typed refusal the placer surfaces per request kind, never a silent success. Do: begin
   /// a map, have the front end refuse it with status 22. Expect: the completion is `MapRefused` carrying the token
-  /// and the status, and the ring empties (the device will unpin the block and answer the guest an errno).
+  /// and the status, and the ring empties (the device will unmap the window's other pieces and answer the guest an
+  /// errno).
   #[test]
   fn a_refused_map_ack_is_a_typed_map_refusal_completion() {
     let (frontend, backend) = stream_pair();

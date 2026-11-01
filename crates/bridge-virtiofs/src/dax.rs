@@ -283,12 +283,12 @@ mod tests {
     8 * page()
   }
 
-  /// §4.6 (the DAX cache region, fd-sharing form). Do: reserve a cache window, map a content block's descriptor into
-  /// it, read the window and write through it, then unmap. Expect: the window shows the block's bytes (a real shared
-  /// mapping — the guest would reach them through its own page table); a write through the window reaches the block;
-  /// the map/unmap counters move. This is the core DAX mechanic proven without a VMM.
+  /// §4.6 (the DAX cache region, fd-sharing form). Do: reserve a cache window, map a shared object's descriptor into
+  /// it, as a piece of a file's backing is mapped, read the window and write through it, then unmap. Expect: the window
+  /// shows the object's bytes (a real shared mapping — the guest would reach them through its own page table); a write
+  /// through the window reaches the object; the map/unmap counters move. The core DAX mechanic proven without a VMM.
   #[test]
-  fn the_window_maps_a_block_and_write_through_reaches_it() {
+  fn the_window_maps_an_object_and_write_through_reaches_it() {
     let (page, window) = (page(), window());
     let cache = SharedObject::create(&name("cache"), window, Words::new()).unwrap();
     let mut block = SharedObject::create(&name("block"), page, Words::new()).unwrap();
@@ -302,7 +302,7 @@ mod tests {
 
     // The window shows the block's bytes (shared mapping of the same object).
     let seen = region.window_bytes(page as u64, 64).unwrap();
-    assert_eq!(seen, &[0x5A; 64], "the window reaches the block's bytes");
+    assert_eq!(seen, &[0x5A; 64], "the window reaches the object's bytes");
 
     // A write through the window reaches the block (the guest's writable DAX).
     region
@@ -313,7 +313,7 @@ mod tests {
     block.read(0, &mut back).unwrap();
     assert_eq!(
       &back, b"HERE",
-      "a write through the window reached the block"
+      "a write through the window reached the object"
     );
 
     region.unmap(page as u64, page as u64).unwrap();
