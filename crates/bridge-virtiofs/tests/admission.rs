@@ -25,7 +25,9 @@ use slates_bridge_virtiofs::admission::{
 };
 use slates_bridge_virtiofs::capability::{Conformance, ReadWritePolicy, TargetPath};
 use slates_bridge_virtiofs::credit::{AttachmentCredits, CreditError, CreditKind};
-use slates_bridge_virtiofs::device::{DeviceConfig, DeviceError, FIRST_REQUEST_QUEUE, FsTag};
+use slates_bridge_virtiofs::device::{
+  DeviceConfig, DeviceError, FIRST_REQUEST_QUEUE, FsTag, Serviced,
+};
 use slates_bridge_virtiofs::memory::{GuestMemory, GuestRange};
 use slates_db::catalog::Principal;
 use slates_machine::derived;
@@ -258,6 +260,141 @@ fn requests_are_charged_against_the_credits_and_released_on_completion() {
   assert_eq!((third.served, third.more_pending), (1, false));
   assert_eq!(admitted.ledger().counters().charged, 5);
   assert_all_answered(&mut admitted, 5);
+}
+
+/// AC-3.3 (A-196): a pass notifies a queue only for the replies it published. Do: over a published volume holding a
+/// file, switch the device's told hold on; publish a write to the file and serve it while the volume's FUSE mounts are
+/// untold; then publish a GETATTR and serve it; then settle once with the mounts still untold and once told. Expect:
+/// the first pass serves the write, publishes nothing and notifies nothing; the second publishes the GETATTR's reply and
+/// notifies once, for it; the untold settle publishes and notifies nothing; the told settle publishes the write's reply
+/// and notifies once more. A notification with nothing new in the used ring wakes the guest for nothing, and a front end
+/// that reaps once per interrupt finds no reply: the daemon's vhost-user tests (`crates/server/tests/virtiofs.rs`,
+/// Linux) found the pass doing so.
+#[test]
+fn a_pass_notifies_a_queue_only_for_the_replies_it_published() {
+  let mut registry = Attachments::new();
+  let seam = SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 501 }));
+  let mut admitted = admit(
+    request(GuestTransport::InProcess),
+    seam,
+    config(),
+    roomy(),
+    rw,
+    &mut registry,
+  )
+  .unwrap();
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let root = vol.root_inode(&store).unwrap();
+  let node = vol
+    .create_file_no(&mut store, root, "told", 0o644)
+    .unwrap()
+    .0;
+  // Published, so no reply waits for the owner's barrier (D-18) and the write's goes straight to the told hold.
+  vol.mark_published(&store);
+  let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
+  admitted.hold_replies_for_told();
+
+  let write_head = submit_to_the_request_queue(&mut admitted, Opcode::Write, node, &write_body());
+  let (held, notified) = serve_one_pass(&mut admitted, &mut bridge, &registry);
+  assert_eq!(
+    (held.served, held.published, notified),
+    (1, 0, 0),
+    "the write served and its reply held: nothing published, nothing notified"
+  );
+  let getattr_head = submit_to_the_request_queue(&mut admitted, Opcode::GetAttr, node, &[0u8; 16]);
+  let (pass, notified) = serve_one_pass(&mut admitted, &mut bridge, &registry);
+  assert_eq!(
+    (pass.served, pass.published, notified),
+    (1, 1, 1),
+    "the GETATTR's reply published, and one notification for it"
+  );
+  assert_eq!(
+    reaped(&mut admitted),
+    vec![getattr_head],
+    "the write's reply still waits"
+  );
+  settles_notify_for_what_they_publish(&mut admitted, write_head);
+}
+
+/// A `fuse_write_in` with no handle, at the start, then its 64 bytes: fh, offset, size, write_flags, lock_owner, flags
+/// and padding.
+fn write_body() -> Vec<u8> {
+  let bytes = [0x5Au8; 64];
+  let mut write = 0u64.to_le_bytes().to_vec();
+  write.extend_from_slice(&0u64.to_le_bytes());
+  write.extend_from_slice(&u32::try_from(bytes.len()).unwrap().to_le_bytes());
+  write.extend_from_slice(&[0u8; 20]);
+  write.extend_from_slice(&bytes);
+  write
+}
+
+/// The guest publishes one `opcode` request on node `node` on the request queue: its chain's head.
+fn submit_to_the_request_queue(
+  admitted: &mut AdmittedDevice<SimVmm>,
+  opcode: Opcode,
+  node: u64,
+  body: &[u8],
+) -> u16 {
+  let unique = u64::from(opcode.to_wire());
+  admitted.seam_mut().guest_mut().submit(
+    usize::from(FIRST_REQUEST_QUEUE),
+    &message(opcode.to_wire(), unique, node, body),
+    REPLY_CAP,
+    1,
+  )
+}
+
+/// One service pass, and how many notifications it sent.
+fn serve_one_pass(
+  admitted: &mut AdmittedDevice<SimVmm>,
+  bridge: &mut VolumeBridge<'_>,
+  registry: &Attachments,
+) -> (Serviced, usize) {
+  let before = admitted.seam().notified().len();
+  let pass = admitted.service(bridge, registry).unwrap();
+  (pass, admitted.seam().notified().len() - before)
+}
+
+/// The heads of every used element the guest can reap on the request queue now.
+fn reaped(admitted: &mut AdmittedDevice<SimVmm>) -> Vec<u16> {
+  let guest = admitted.seam_mut().guest_mut();
+  std::iter::from_fn(|| guest.reap(usize::from(FIRST_REQUEST_QUEUE)))
+    .map(|(head, _)| head)
+    .collect()
+}
+
+/// Settles the held write's reply untold, then told: the first publishes and notifies nothing, the second publishes
+/// `write_head`'s reply, a success, and notifies once.
+fn settles_notify_for_what_they_publish(admitted: &mut AdmittedDevice<SimVmm>, write_head: u16) {
+  let before = admitted.seam().notified().len();
+  let untold = admitted.settle_told(&mut |_| false, (0, u64::MAX)).unwrap();
+  assert_eq!(
+    (
+      untold.completed.len(),
+      admitted.seam().notified().len() - before
+    ),
+    (0, 0),
+    "nothing published or notified while untold"
+  );
+  let told = admitted.settle_told(&mut |_| true, (1, u64::MAX)).unwrap();
+  assert_eq!(
+    (
+      told.completed.len(),
+      told.waited,
+      admitted.seam().notified().len() - before
+    ),
+    (1, 1, 1),
+    "the told settle publishes the write's reply and notifies for it"
+  );
+  let rq = usize::from(FIRST_REQUEST_QUEUE);
+  let guest = admitted.seam_mut().guest_mut();
+  let (head, len) = guest.reap(rq).expect("the write's reply, once told");
+  assert_eq!(
+    (head, reply_error(&guest.reply_of(rq, head, len))),
+    (write_head, 0),
+    "the write's reply, a success"
+  );
 }
 
 /// Every one of `count` requests on the request queue was answered with a reply larger than a

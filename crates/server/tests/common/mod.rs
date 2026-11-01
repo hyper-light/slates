@@ -6,6 +6,8 @@
 pub(crate) mod anchor;
 pub(crate) mod client;
 #[cfg(unix)]
+pub(crate) mod fuse_map;
+#[cfg(unix)]
 pub(crate) mod guest;
 // The landing plane's fixtures drive the Unix landing (the daemon lands nothing on Windows yet).
 #[cfg(unix)]

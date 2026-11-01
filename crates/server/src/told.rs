@@ -20,7 +20,11 @@
 //! meanwhile:
 //! - a verb's reply is held and sent by a task of the shard ([`hold_until_told`]);
 //! - an NFS call's task awaits [`wait`] before its reply is queued;
-//! - a verb forwarded from another node awaits [`wait`] on the owner before its exchange answers.
+//! - a verb forwarded from another node awaits [`wait`] on the owner before its exchange answers;
+//! - a guest's request through slates' own virtio-fs device is held by its device, which serves the guest's later
+//!   requests meanwhile and waits on [`parked`] while idle (`crate::virtiofs`; A-196);
+//! - a guest's request over a Shards stream, whose VMM asks one request at a time, waits in its stream's task for
+//!   [`wait`] before its reply is sent (`crate::shards`; A-196).
 //!
 //! **Why a FUSE writer does not wait.** A request through one FUSE mount holds its kernel's locks on what it touches —
 //! the pages of a read or a write, the directory of a lookup — until the daemon answers it. Another mount's notification
@@ -154,6 +158,34 @@ pub(crate) fn told(s: &ShardState, owed: Owed) -> bool {
   mounts_told(s, owed)
 }
 
+/// Whether every FUSE mount of `volume` has been told through journal record `seq` ([`told`]): what a guest device's
+/// held reply asks (A-196).
+#[cfg(unix)]
+pub(crate) fn told_through(s: &ShardState, volume: VolumeId, seq: u64) -> bool {
+  told(s, Owed { volume, seq })
+}
+
+/// A wait on this shard, the volume's owner, until every FUSE mount of `volume` has been told through journal record
+/// `seq`, holding no borrow; dropping it leaves nothing parked. Unbounded: a guest device races it with its held reply's
+/// bound (A-196).
+#[cfg(unix)]
+pub(crate) fn parked(volume: VolumeId, seq: u64) -> Parked {
+  Parked {
+    owed: Owed { volume, seq },
+    id: None,
+  }
+}
+
+/// Counts a guest device's settled replies on the writers' ledger (A-196): each a wait, and each published at the bound
+/// overdue as well, as [`wait`] counts a writer's.
+#[cfg(unix)]
+pub(crate) fn count_settled(s: &mut ShardState, waited: u64, overdue: u64) {
+  s.count(WAITED, waited.saturating_add(overdue));
+  if overdue > 0 {
+    s.count(OVERDUE, overdue);
+  }
+}
+
 /// Linux: asked of the shard's FUSE mounts.
 #[cfg(target_os = "linux")]
 fn mounts_told(s: &ShardState, owed: Owed) -> bool {
@@ -251,7 +283,7 @@ async fn deliver_to(route: ReplyRoute, reply: ReplyBody, here: u16) {
 /// One writer's wait: ready once every FUSE mount of the owed volume has been told; parked in the shard's
 /// [`ToldWaiters`] under `id` until then, and removed from them when dropped, so a wait that ends at its deadline leaves
 /// no waker behind.
-struct Parked {
+pub(crate) struct Parked {
   owed: Owed,
   id: Option<u64>,
 }

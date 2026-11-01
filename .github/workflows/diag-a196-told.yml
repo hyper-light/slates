@@ -1,0 +1,194 @@
+name: DIAG A-196 a guest's write waits for the volume's FUSE mounts (not for main)
+
+# Step 5 of the VFS and DAX plan (A-196): a guest's write through slates' own virtio-fs device or a Shards stream is
+# answered once every FUSE mount of its volume has been told; the device serves the guest's later requests meanwhile.
+# On both Linux architectures: Linux clippy over the crates the change touches; the virtio-fs suites; the server's
+# virtiofs, shards, fuse_told and recovery suites; the client's shards suite. Then three red-checks in this throwaway
+# checkout, each of which must fail its test: the device holds no reply; a Shards stream waits for nothing; a pass
+# notifies for every chain it served. The doc gate on Linux. Then QEMU 11.1 runs every test of tests/guest_vhost.rs
+# through slates' own device, and in a second job the told test over a copy whose device holds nothing.
+
+on:
+  push:
+    branches: ['diag-a196-*']
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  suites:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    name: suites and red-checks on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: The runner
+        run: |
+          echo "image $ImageOS $ImageVersion; $(nproc) CPUs; $(uname -srm)"
+          ls -l /dev/fuse; command -v fusermount3 || echo "no fusermount3"
+      - name: Clippy on Linux
+        run: cargo clippy --locked -p slates-bridge-virtiofs -p slates-server -p slates-client -p slates-cli --all-targets -- -D warnings
+      - name: The virtio-fs suites
+        run: cargo test --locked -p slates-bridge-virtiofs
+      - name: The server's virtiofs, shards, fuse_told and recovery suites
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked -p slates-server --test virtiofs --test shards --test fuse_told --test recovery -- --nocapture 2>&1 | tee server.txt
+          grep -E "AC-3.3|SKIP|test result" server.txt
+      - name: The client's shards suite
+        run: cargo test --locked -p slates-client --test shards
+      - name: Red-check, the device holds no reply for the volume's FUSE mounts
+        shell: bash
+        run: |
+          set -u
+          cp crates/bridge-virtiofs/src/serve.rs /tmp/serve.rs
+          python3 - <<'EOF'
+          import pathlib
+          p = pathlib.Path("crates/bridge-virtiofs/src/serve.rs")
+          t = p.read_text()
+          old = "  admitted.hold_replies_for_told();\n"
+          assert t.count(old) == 1
+          p.write_text(t.replace(old, "  // red-check: no hold\n"))
+          EOF
+          if cargo test --locked -p slates-bridge-virtiofs --test serve held_fuse_mount > r1.txt 2>&1; then
+            grep -E "^test |test result" r1.txt; echo "RED-CHECK hold: the told test passed"; exit 1
+          fi
+          grep -E "panicked|left:|right:|test result" r1.txt > r1.grep || true
+          head -12 r1.grep
+          cp /tmp/serve.rs crates/bridge-virtiofs/src/serve.rs
+      - name: Red-check, a Shards stream waits for nothing
+        shell: bash
+        run: |
+          set -u
+          cp crates/server/src/shards.rs /tmp/shards.rs
+          python3 - <<'EOF'
+          import pathlib
+          p = pathlib.Path("crates/server/src/shards.rs")
+          t = p.read_text()
+          old = "  stream.told = told_mark.and_then(|mark| crate::told::owed(s, mark));\n"
+          assert t.count(old) == 1
+          p.write_text(t.replace(old, "  let _ = told_mark;\n  stream.told = None;\n"))
+          EOF
+          if cargo test --locked -p slates-server --test shards a_guests_write_over_a_shards_stream -- --nocapture > r2.txt 2>&1; then
+            grep -E "AC-3.3|SKIP|^test |test result" r2.txt; echo "RED-CHECK stream: the Shards told test passed"; exit 1
+          fi
+          grep -E "AC-3.3|panicked|test result" r2.txt > r2.grep || true
+          head -12 r2.grep
+          cp /tmp/shards.rs crates/server/src/shards.rs
+      - name: Red-check, a pass notifies for every chain it served
+        shell: bash
+        run: |
+          set -u
+          cp crates/bridge-virtiofs/src/admission.rs /tmp/admission.rs
+          python3 - <<'EOF'
+          import pathlib
+          p = pathlib.Path("crates/bridge-virtiofs/src/admission.rs")
+          t = p.read_text()
+          old = "        if pass.published > 0 && pass.interrupt_wanted {\n"
+          assert t.count(old) == 1
+          p.write_text(t.replace(old, "        if pass.served > 0 && pass.interrupt_wanted {\n"))
+          EOF
+          if cargo test --locked -p slates-bridge-virtiofs --test admission a_pass_notifies > r3.txt 2>&1; then
+            grep -E "^test |test result" r3.txt; echo "RED-CHECK notify: the admission test passed"; exit 1
+          fi
+          grep -E "panicked|left:|right:|test result" r3.txt > r3.grep || true
+          head -12 r3.grep
+          cp /tmp/admission.rs crates/bridge-virtiofs/src/admission.rs
+
+  docs:
+    name: the doc gate on ubuntu-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Documentation (every reference names something that exists)
+        env:
+          RUSTDOCFLAGS: -D warnings -A rustdoc::private_intra_doc_links
+        run: cargo doc --locked --workspace --no-deps --document-private-items
+
+  qemu:
+    name: every guest_vhost test in QEMU 11.1
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Open KVM to the job
+        run: |
+          if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; fi
+          ls -l /dev/kvm || echo "no /dev/kvm: the guest runs under software emulation"
+      - name: Build the guest image
+        run: docker build -t slates-guest ci/guest
+      - name: slates' own device in QEMU
+        shell: bash
+        run: |
+          set -o pipefail
+          docker run --rm --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+            --device /dev/fuse --cap-add SYS_ADMIN \
+            $( [ -e /dev/kvm ] && echo --device /dev/kvm ) \
+            -v "$PWD":/src -w /src slates-guest sh -c \
+            'set -e; host=$(rustc -vV | sed -n "s/^host: //p"); \
+             RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -p slates-guest-probe \
+               --bin slates-guest-probe --target "$host" --target-dir target/probe; \
+             SLATES_GUEST_QEMU=$(ls /usr/bin/qemu-system-x86_64 /usr/bin/qemu-system-aarch64 2>/dev/null | head -1) \
+             SLATES_GUEST_KERNEL=/guest/vmlinuz \
+             SLATES_GUEST_PROBE="/src/target/probe/$host/release/slates-guest-probe" \
+             cargo test -p slates-cli --test guest_vhost -- --nocapture --test-threads=1' 2>&1 | tee guest-vhost.log
+          if grep -q "SKIP: the guest-over-slates" guest-vhost.log; then echo "the QEMU guest was skipped"; exit 1; fi
+          grep -E "AC-3.3|guest kill|guest kills|daemon .* killed|daemon kills|test result" guest-vhost.log > told.grep || true
+          cat told.grep
+
+  qemu-red:
+    name: the told test in QEMU 11.1 over a device that holds nothing
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Open KVM to the job
+        run: |
+          if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; fi
+          ls -l /dev/kvm || echo "no /dev/kvm: the guest runs under software emulation"
+      - name: The device holds no reply
+        run: |
+          python3 - <<'EOF'
+          import pathlib
+          p = pathlib.Path("crates/bridge-virtiofs/src/serve.rs")
+          t = p.read_text()
+          old = "  admitted.hold_replies_for_told();\n"
+          assert t.count(old) == 1
+          p.write_text(t.replace(old, "  // red-check: no hold\n"))
+          EOF
+      - name: Build the guest image
+        run: docker build -t slates-guest ci/guest
+      - name: The told test, which must fail
+        shell: bash
+        run: |
+          set -u
+          if docker run --rm --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+            --device /dev/fuse --cap-add SYS_ADMIN \
+            $( [ -e /dev/kvm ] && echo --device /dev/kvm ) \
+            -v "$PWD":/src -w /src slates-guest sh -c \
+            'set -e; host=$(rustc -vV | sed -n "s/^host: //p"); \
+             RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -p slates-guest-probe \
+               --bin slates-guest-probe --target "$host" --target-dir target/probe; \
+             SLATES_GUEST_QEMU=$(ls /usr/bin/qemu-system-x86_64 /usr/bin/qemu-system-aarch64 2>/dev/null | head -1) \
+             SLATES_GUEST_KERNEL=/guest/vmlinuz \
+             SLATES_GUEST_PROBE="/src/target/probe/$host/release/slates-guest-probe" \
+             cargo test -p slates-cli --test guest_vhost -- --nocapture --test-threads=1 a_guests_write_through_slates_own_device' > red.log 2>&1; then
+            grep -E "AC-3.3|test result" red.log; echo "RED-CHECK qemu: the told test passed"; exit 1
+          fi
+          grep -E "AC-3.3|panicked|test result|SKIP" red.log > red.grep || true
+          cat red.grep

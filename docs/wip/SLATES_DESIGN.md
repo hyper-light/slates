@@ -2351,10 +2351,12 @@ the mount happened to get a request — indefinitely for a shared map or DAX thr
 `docs/bugs/2026-10-21-a-fuse-mount-hears-of-another-paths-change-only-on-its-next-request.md`). "At once" was measured
 *after* the writer's reply: a shared map read the new bytes 52–193 µs after it, median 82 µs. **Since A-191 a writer
 outside FUSE is answered only once every FUSE mount of its volume has been told** — a verb over the typed channel (the
-SDKs, the CLI, MCP, the merge plane's verbs), an NFS call, a direct map's write-back. Each mount's told point is its
-coherence cursor, held back while a round is out (`ServeState::told_through`); the writer's reply waits on the volume's
-owner shard without blocking it, at most half the liveness budget, past which it is answered and the late mount
-counted. A write through a FUSE mount is still answered first, since requests on two mounts, each waiting for the
+SDKs, the CLI, MCP, the merge plane's verbs), an NFS call, a direct map's write-back — **and since A-196 so is a guest's
+write through slates' own virtio-fs device or a Shards stream**: the device holds the write's reply and serves the
+guest's later requests meanwhile, completing the held reply out of order, which virtio permits (virtio 1.2 §2.6), and a
+Shards stream, whose VMM sends one request at a time, holds its reply frame. Each mount's told point is its coherence
+cursor, held back while a round is out (`ServeState::told_through`); the writer's reply waits on the volume's owner shard
+without blocking it, at most half the liveness budget, past which it is answered and the late mount counted. A write through a FUSE mount is still answered first, since requests on two mounts, each waiting for the
 other mount's notification, could deadlock; AC-3.3 states that window. **What the kernel is told to
 drop is what changed** (A-146). A content change drops the cached pages holding the bytes it touched, never the whole
 file:
@@ -7549,7 +7551,8 @@ fd handoff through the anchor, `slates exec`, the conformance and workload harne
   the old bytes, measured at a median of 21–35 µs in seven runs and 1.7 ms in an eighth taken at a
   busier moment, at worst 40 ms (Linux 6.19, release builds, 2026-10-30,
   `crates/server/tests/fuse_told.rs`). A guest's write through slates' own virtio-fs device or a
-  Shards stream does not wait yet (GAPS) (catches: coherence bugs).
+  Shards stream waits the same way, the device serving the guest's later requests meanwhile
+  (A-196) (catches: coherence bugs).
 - AC-3.4 Daemon restart with the fd handoff leaves open files usable after the window; the
   window is measured and within the recovery budget (catches: lost mounts).
 - AC-3.5 The launcher creates no filesystem entries; `slates exec` refuses unsatisfiable chosen
@@ -13093,7 +13096,8 @@ an NFS call awaits its own; `direct_map.rs`: a write-back's reply; `lease_wait.r
   - Linux clippy `-D warnings` clean for `slates-bridge-fuse` and `slates-server`, every target.
 - **Cost** (`docs/wip/BENCHMARKS.md`): an SDK write to a volume a FUSE mount reads now waits for the mount's notify thread: with the mount, its p50 rose from about 28 µs to about 40 µs and its p90 from about 35 µs to about 53 µs; with no mount it is unchanged, about 13 µs (fedora-2, `write_round_ab`, release builds differing only in the wait, interleaved three times, load 19–20).
 - **What it does not change.** A write through a FUSE mount (the window above). A guest's write through slates' own
-  virtio-fs device or a Shards stream, answered by its device's loop in order, is not held yet (GAPS, owed). WinFsp
+  virtio-fs device or a Shards stream, answered by its device's loop in order, was not held yet (held since A-196,
+  its device completing the held reply out of order). WinFsp
   mounts are Windows' and never share a daemon with FUSE mounts. A retry of a held request is answered from its
   completion record at once.
 

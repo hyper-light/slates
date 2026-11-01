@@ -82,11 +82,21 @@ impl Drop for Anchor {
   }
 }
 
-/// Starts `slates anchor` for `instance`, waits until its daemon answers verbs steadily, and creates its consensus
-/// group.
+/// Shape: the shards of the daemon a test's anchor starts, unless the test names its own: two, so a client's verbs may
+/// arrive at a shard other than their volume's.
+pub(crate) const SHARDS: u16 = 2;
+
+/// Starts `slates anchor` for `instance` with a daemon of [`SHARDS`] shards: [`start_anchor_with`].
 pub(crate) fn start_anchor(instance: &str) -> Anchor {
+  start_anchor_with(instance, SHARDS)
+}
+
+/// Starts `slates anchor` for `instance` with a daemon of `shards` shards, waits until its daemon answers verbs
+/// steadily, and creates its consensus group.
+pub(crate) fn start_anchor_with(instance: &str, shards: u16) -> Anchor {
   let child = slates()
-    .args(["--instance", instance, "anchor", "--quick", "--shards", "2"])
+    .args(["--instance", instance, "anchor", "--quick", "--shards"])
+    .arg(shards.to_string())
     .stdout(Stdio::null())
     .spawn()
     .unwrap();
@@ -120,6 +130,13 @@ pub(crate) fn daemon_of(anchor: &Anchor) -> Option<u32> {
 /// the two process ids.
 pub(crate) fn kill_the_daemon(anchor: &Anchor, instance: &str) -> (u32, u32) {
   let old = daemon_of(anchor).expect("the anchor runs a daemon");
+  (old, kill_daemon(anchor, instance, old))
+}
+
+/// Kills daemon `old`, `anchor`'s, with `SIGKILL`, and waits until the anchor's successor answers `instance`'s verbs
+/// steadily: the successor's process id. A test that must kill at a chosen instant looks the daemon up first
+/// ([`daemon_of`] reads the whole process table).
+pub(crate) fn kill_daemon(anchor: &Anchor, instance: &str, old: u32) -> u32 {
   rustix::process::kill_process(
     rustix::process::Pid::from_raw(i32::try_from(old).unwrap()).unwrap(),
     rustix::process::Signal::KILL,
@@ -137,7 +154,7 @@ pub(crate) fn kill_the_daemon(anchor: &Anchor, instance: &str) -> (u32, u32) {
     }
   };
   await_steady(instance);
-  (old, new)
+  new
 }
 
 /// Waits until `instance`'s daemon answers [`STABLE_STREAK`] verbs in a row.
@@ -482,12 +499,17 @@ impl Guest {
 
   /// Sends one command and returns its reply.
   pub(crate) fn ask(&mut self, command: &Ask, within: Duration) -> Reply {
+    self.send(command);
+    self.next_reply(within)
+  }
+
+  /// Sends one command and leaves its reply unread: a test that kills the VM, or its daemon, while the command runs.
+  pub(crate) fn send(&mut self, command: &Ask) {
     let line = command.encode();
     writeln!(self.console, "{line}")
       .and_then(|()| self.console.flush())
       .unwrap_or_else(|e| panic!("the console: {e}\n{}", self.transcript()));
     self.keep(format!("> {line}"));
-    self.next_reply(within)
   }
 
   /// Asks, and expects [`Reply::Done`].

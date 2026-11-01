@@ -127,6 +127,9 @@ pub(crate) struct HeldRequest {
   pub(crate) queue: u16,
   /// The chain, gathered again when it is served.
   pub(crate) chain: DescriptorChain,
+  /// The volume's journal head when it was held, when its reply would wait for the volume's FUSE mounts: the records
+  /// its ingest and its serving make are then its own (AC-3.3).
+  pub(crate) mark: Option<u64>,
 }
 
 /// A served chain whose used element waits for a refill: its reply could reveal the disk's change (a size, a time)
@@ -139,6 +142,8 @@ pub(crate) struct HeldReply {
   pub(crate) chain: DescriptorChain,
   /// The reply's length, the used element's.
   pub(crate) written: u32,
+  /// The newest journal record its request made, which it waits to have been told through once refilled (AC-3.3).
+  pub(crate) owes: Option<u64>,
 }
 
 /// What the device's backed DAX did: non-vacuity witnesses for the tests and the status report.

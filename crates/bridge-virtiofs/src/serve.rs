@@ -9,6 +9,17 @@
 //! guest never runs past the shard's step budget), and repeats. It never polls: a shard with an
 //! idle guest parks.
 //!
+//! The loop settles the replies the device holds for the volume's FUSE mounts (AC-3.3, A-191,
+//! A-196): a write's reply waits until every FUSE mount of the volume has been told of the write,
+//! and the device serves the guest's later requests meanwhile, completing the held reply out of
+//! order, which virtio permits (virtio 1.2 §2.6; the device offers no `VIRTIO_F_IN_ORDER`). After
+//! every pass, and whenever the oldest held reply's wait on the mounts or its bound wakes it while
+//! the guest is idle, the loop publishes each held reply whose mounts were told and each that has
+//! waited the bound, counted overdue. Only this loop turns holding on
+//! ([`AdmittedDevice::hold_replies_for_told`]), so a caller that never settles never strands a
+//! reply; one still held when the loop ends goes unsent with the device, counted
+//! [`TOLD_ABANDONED`].
+//!
 //! The loop owns the device, so revocation reaches it as a message: [`request_revoke`] marks the
 //! loop's entry in a per-shard, thread-local control map (no lock, D-7) and wakes the loop with
 //! the waker it registered, and the loop runs the owned terminal step ([`AdmittedDevice::reclaim`])
@@ -34,6 +45,10 @@ use slates_vfs::error::VfsError;
 use crate::admission::{
   AdmittedDevice, Doorbell, Drained, ReclaimError, Reclaimed, ServeError, VmmSeam,
 };
+
+/// Format: the status counter of guest replies still held for the volume's FUSE mounts when their device ended (AC-3.3,
+/// A-196). Each one's write was applied; its reply goes unsent with the device, as every reply in flight at an end does.
+pub const TOLD_ABANDONED: &str = "virtiofs.told_abandoned";
 
 /// The identity of one device loop on this shard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -195,6 +210,8 @@ enum Woke {
   Doorbell,
   /// The shard asked for a revoke or a drain ([`request_revoke`], [`kick`]).
   Request,
+  /// The oldest reply waiting for the volume's FUSE mounts may be published: its mounts were told, or its bound passed.
+  Told,
 }
 
 /// Waits until the guest kicks the doorbell or the shard asks something of the loop. A request wakes the waker
@@ -214,6 +231,65 @@ async fn doorbell_or_request(id: DeviceId, raw: i32) -> Result<Woke, slates_rt::
       .map(|ready| ready.map(|()| Woke::Doorbell))
   })
   .await
+}
+
+/// Waits as [`doorbell_or_request`] does, and, while a reply waits for the volume's FUSE mounts (AC-3.3), until `told`
+/// — the oldest such reply's wait — is ready or its bound's remaining `left_ns` passes.
+async fn doorbell_request_or_told<T: Future<Output = ()>>(
+  id: DeviceId,
+  raw: i32,
+  told: Option<(T, u64)>,
+) -> Result<Woke, slates_rt::RtError> {
+  let Some((told, left_ns)) = told else {
+    return doorbell_or_request(id, raw).await;
+  };
+  let mut told = std::pin::pin!(told);
+  let mut either = std::pin::pin!(doorbell_or_request(id, raw));
+  let raced = futures::within(
+    left_ns,
+    std::future::poll_fn(|cx| {
+      if let Poll::Ready(woke) = either.as_mut().poll(cx) {
+        return Poll::Ready(woke);
+      }
+      told.as_mut().poll(cx).map(|()| Ok(Woke::Told))
+    }),
+  )
+  .await;
+  match raced {
+    Ok(Some(woke)) => woke,
+    // The bound passed: the settle that follows publishes the reply, overdue.
+    Ok(None) => Ok(Woke::Told),
+    Err(refused) => Err(refused),
+  }
+}
+
+/// Publishes the device's held replies whose volume's FUSE mounts were told, or whose bound passed (AC-3.3), and counts
+/// what it did.
+fn settle_told<S: VmmSeam, B: BridgeAccess>(
+  admitted: &mut AdmittedDevice<S>,
+  bridge: &mut B,
+) -> Result<(), ServeError> {
+  if admitted.told_oldest().is_none() {
+    return Ok(());
+  }
+  let bound = bridge.told_bound_ns();
+  let settled = admitted.settle_told(
+    &mut |seq| bridge.told_through(seq),
+    (futures::now_ns(), bound),
+  )?;
+  if settled.waited > 0 || settled.overdue > 0 {
+    bridge.told_settled(settled.waited, settled.overdue);
+  }
+  Ok(())
+}
+
+/// The reason a loop ends on a refusal of its service.
+fn end_of(refusal: ServeError) -> EndReason {
+  match refusal {
+    ServeError::Revoked => EndReason::Revoked,
+    ServeError::Authority(VfsError::NotFound) => EndReason::VolumeGone(VfsError::NotFound),
+    other => EndReason::Faulted(other),
+  }
 }
 
 /// A future that records the loop's current waker in its control entry, so a revoke request or a drain kick can
@@ -283,6 +359,26 @@ pub trait BridgeAccess {
   /// Adds `by` to the owner's status counter `name`: what the device's backed DAX did since the loop last reported it
   /// (`BackedCounts::named`, Linux), so a guest's use of its window shows while the device runs.
   fn count(&mut self, name: &'static str, by: u64);
+
+  /// What a reply waiting for the volume's FUSE mounts waits on (AC-3.3, A-191): a future ready once every FUSE mount of
+  /// the volume has been told through a journal record. It holds no borrow of the access, and dropping it leaves
+  /// nothing parked.
+  type Told: Future<Output = ()> + 'static;
+
+  /// Whether every FUSE mount of the volume has been told through journal record `seq`: `true` where the volume has none,
+  /// or where no mount's kernel holds anything yet.
+  fn told_through(&mut self, seq: u64) -> bool;
+
+  /// A wait for every FUSE mount of the volume to have been told through journal record `seq`.
+  fn told(&mut self, seq: u64) -> Self::Told;
+
+  /// How long a reply waits for the volume's FUSE mounts before it is published anyway, counted overdue: the owner's
+  /// bound for every writer that holds no kernel lock (A-191).
+  fn told_bound_ns(&mut self) -> u64;
+
+  /// Counts what one settle of the device's held replies did: replies that waited for the volume's FUSE mounts to be
+  /// told, and replies published at the bound with a mount untold.
+  fn told_settled(&mut self, waited: u64, overdue: u64);
 }
 
 /// Why the loop ended.
@@ -349,7 +445,11 @@ async fn serve_until_idle<S: VmmSeam, B: BridgeAccess>(
       }
       continue;
     }
-    match one_pass(admitted, bridge, counters) {
+    match one_pass(admitted, bridge, counters).and_then(|more| {
+      // A reply waiting for the volume's FUSE mounts is published as soon as they are told, often within the pass
+      // (AC-3.3).
+      settle_told(admitted, bridge).map(|()| more)
+    }) {
       Ok(more) => {
         // A message-based SETUPMAPPING may have parked for the front end's map-acks (§4.6); await them and answer
         // the guest, and settle any deferred unmap-acks. No-op without a message placer or outstanding request. A
@@ -369,11 +469,7 @@ async fn serve_until_idle<S: VmmSeam, B: BridgeAccess>(
           return None;
         }
       }
-      Err(ServeError::Revoked) => return Some(EndReason::Revoked),
-      Err(ServeError::Authority(VfsError::NotFound)) => {
-        return Some(EndReason::VolumeGone(VfsError::NotFound));
-      }
-      Err(e) => return Some(EndReason::Faulted(e)),
+      Err(refusal) => return Some(end_of(refusal)),
     }
   }
 }
@@ -632,11 +728,21 @@ async fn serve_round<S: VmmSeam, B: BridgeAccess>(
     Doorbell::InProcess => return Some(EndReason::NoDoorbell),
     Doorbell::Descriptor(raw) => raw,
   };
-  match doorbell_or_request(id, raw).await {
+  // While a reply waits for the volume's FUSE mounts, the round waits on the oldest's too, and on its bound (AC-3.3).
+  let told = admitted.told_oldest().map(|oldest| {
+    let bound = bridge.told_bound_ns();
+    let left = oldest.since_ns.map_or(bound, |since| {
+      bound.saturating_sub(futures::now_ns().saturating_sub(since))
+    });
+    (bridge.told(oldest.seq), left)
+  });
+  match doorbell_request_or_told(id, raw, told).await {
     Err(error) => return Some(EndReason::DoorbellLost(error)),
     // The shard asked something of the loop while it waited: the next round takes it at its top (a revoke ends
     // the loop, a kick marks its backings stale), with no guest kick needed.
     Ok(Woke::Request) => return None,
+    // A held reply's mounts were told, or its bound passed: it is published, and the next round waits again.
+    Ok(Woke::Told) => return settle_told(admitted, bridge).err().map(end_of),
     Ok(Woke::Doorbell) => {}
   }
   counters.wakes = counters.wakes.saturating_add(1);
@@ -660,11 +766,17 @@ pub async fn serve_loop<S: VmmSeam, B: BridgeAccess>(
   mut bridge: B,
 ) -> ServeEnd {
   let mut counters = LoopCounters::default();
+  // This loop settles the replies that wait for the volume's FUSE mounts, after every pass and while idle (AC-3.3).
+  admitted.hold_replies_for_told();
   let why = loop {
     if let Some(reason) = serve_round(id, &mut admitted, &mut bridge, &mut counters).await {
       break reason;
     }
   };
+  let abandoned = admitted.device().told_held();
+  if abandoned > 0 {
+    bridge.count(TOLD_ABANDONED, u64::try_from(abandoned).unwrap_or(u64::MAX));
+  }
   // The guest's stores through its DAX maps reach the volume before anything of the attachment is let go.
   drive_end_ingest(&mut admitted, &mut bridge).await;
   // The terminal step always runs to its end (AUD-29-70): through the bridge when the volume is there, else

@@ -12,7 +12,9 @@
 //! no writable buffer and no reply (the used element carries length 0), and `FUSE_INTERRUPT` is
 //! answered `ENOSYS` by the codec's unserved-opcode path, which is the ABI's "interrupts are not
 //! supported" signal (`fs/fuse/dev.c`, `fuse_dev_do_write`: an `ENOSYS` reply to an interrupt sets
-//! `no_interrupt`) — correct for a device that completes every request before it takes the next.
+//! `no_interrupt`) — correct for a device that applies every request before it takes the next. A
+//! reply the device holds for the volume's FUSE mounts (AC-3.3, A-196) is a request already applied,
+//! which an interrupt could not undo, and it waits at most the told bound.
 //! Queues 1..n are request queues; this device offers one (the derivation is on
 //! [`DeviceConfig::new`]). `FUSE_INIT` is negotiated by the codec and observed here so the device
 //! knows the connection is up; `FUSE_DESTROY` is served by the codec (it sweeps the attachment's
@@ -230,6 +232,10 @@ pub struct DeviceCounters {
 pub struct Serviced {
   /// Chains served in the pass.
   pub served: u32,
+  /// Used elements the pass published: the chains served whose replies went out. A reply held for the volume's FUSE
+  /// mounts (AC-3.3, A-196) is served, not published; its settle publishes it and notifies its queue
+  /// ([`Device::settle_told`]), so a queue is notified only for replies it can reap.
+  pub published: u32,
   /// Whether the driver has published more chains than the pass took (the caller yields and
   /// returns rather than running unbounded).
   pub more_pending: bool,
@@ -252,6 +258,44 @@ struct AwaitingBarrier {
   opcode: Option<Opcode>,
   nodeid: u64,
   unique: u64,
+  /// The newest journal record the request made, which its reply then waits to have been told through ([`ToldHeld`]).
+  owes: Option<u64>,
+}
+
+/// A chain answered whose used element waits for every FUSE mount of its volume to have been told of the change its
+/// request made (AC-3.3, A-191; [`Device::settle_told`]): its reply is in the guest's buffers, and the guest learns of it
+/// when the element is published. The device serves the guest's later chains meanwhile, which virtio permits: a used
+/// element names its chain, so a device may use descriptors in any order (virtio 1.2 §2.7.8). Its credit stays charged
+/// until it is published, as every chain's does.
+#[derive(Debug)]
+struct ToldHeld {
+  queue: u16,
+  chain: DescriptorChain,
+  written: u32,
+  /// The newest journal record the request made: every FUSE mount must have been told through it.
+  seq: u64,
+  /// When [`Device::settle_told`] first saw it, the start of its bound; `None` until then.
+  since_ns: Option<u64>,
+}
+
+/// The oldest reply held for the volume's FUSE mounts ([`Device::told_oldest`]): what the device loop waits on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ToldOldest {
+  /// The journal record it waits to have been told through. Every later held reply waits on a later one.
+  pub seq: u64,
+  /// When its bound began; `None` before the first [`Device::settle_told`] saw it.
+  pub since_ns: Option<u64>,
+}
+
+/// What one [`Device::settle_told`] published.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ToldSettled {
+  /// The held chains it published, each with whether its queue's driver asks to be interrupted.
+  pub completed: Vec<Completed>,
+  /// Replies published once their volume's FUSE mounts were told, having waited at least one settle for it.
+  pub waited: u64,
+  /// Replies published at the bound with a mount still untold.
+  pub overdue: u64,
 }
 
 /// What `serve_dax` did with a FUSE_SETUPMAPPING / FUSE_REMOVEMAPPING (§4.6): not a DAX verb (dispatch answers),
@@ -474,6 +518,13 @@ pub struct Device {
   /// [`crate::backed`]), whichever placer maps them. Empty when no placer serves.
   #[cfg(unix)]
   backed: crate::backed::BackedDax,
+  /// Whether a served chain's reply waits for the volume's FUSE mounts to have been told of its change (AC-3.3):
+  /// switched on by the loop that settles the waits ([`Device::hold_replies_for_told`]), so a device nothing settles
+  /// never holds a reply.
+  holds_for_told: bool,
+  /// The replies waiting for the volume's FUSE mounts, in the order they were served ([`ToldHeld`]). Bounded by the
+  /// configured queues' sizes, the most chains a driver can have outstanding at once ([`Device::told_capacity`]).
+  told: std::collections::VecDeque<ToldHeld>,
 }
 
 impl fmt::Debug for Device {
@@ -503,6 +554,8 @@ impl Device {
       dax_placer: None,
       #[cfg(unix)]
       backed: crate::backed::BackedDax::default(),
+      holds_for_told: false,
+      told: std::collections::VecDeque::new(),
     }
   }
 
@@ -795,6 +848,7 @@ impl Device {
       // Nothing is served past a held chain: its completion is the owner's next step.
       return Ok(Serviced {
         served: 0,
+        published: 0,
         more_pending: true,
         interrupt_wanted: false,
         barrier_owed: true,
@@ -806,12 +860,14 @@ impl Device {
       // ([`Device::dax_turn`]).
       return Ok(Serviced {
         served: 0,
+        published: 0,
         more_pending: true,
         interrupt_wanted: false,
         barrier_owed: false,
       });
     }
     let mut served: u32 = 0;
+    let mut published: u32 = 0;
     while served < batch {
       let Some(chain) = self.queue_at(index)?.peek(memory)? else {
         break;
@@ -820,6 +876,7 @@ impl Device {
         return Err(self.record_fault(refusal));
       }
       self.queue_at(index)?.advance();
+      let mark = self.journal_mark(bridge, cx);
       let written = match self.serve_chain(
         queue,
         &chain,
@@ -835,6 +892,7 @@ impl Device {
           // The chain is held for a fill and an ack, or for an ingest; the pass ends, and the turns complete it.
           return Ok(Serviced {
             served,
+            published,
             more_pending: true,
             interrupt_wanted: self.queue_at(index)?.interrupts_wanted(memory)?,
             barrier_owed: false,
@@ -842,8 +900,9 @@ impl Device {
         }
         Err(refusal) => return Err(self.record_fault(refusal)),
       };
+      let owes = Self::journal_owed(mark, bridge, cx);
       if let Some(awaiting) =
-        self.awaits_barrier(queue, &chain, written, bridge.awaits_publication())
+        self.awaits_barrier((queue, &chain, written), owes, bridge.awaits_publication())
       {
         // The reply is in the guest's buffers, but the guest learns of it only from the used element,
         // which waits for the owner's barrier (§4.8, D-18).
@@ -851,6 +910,7 @@ impl Device {
         self.counters.barriers_awaited = self.counters.barriers_awaited.saturating_add(1);
         return Ok(Serviced {
           served,
+          published,
           more_pending: true,
           interrupt_wanted: self.queue_at(index)?.interrupts_wanted(memory)?,
           barrier_owed: true,
@@ -860,20 +920,28 @@ impl Device {
       if self.refill_owed(bridge) {
         // Serving the request marked a backing stale (the disk changed beneath it): its reply could reveal the change
         // before the guest's map shows it, so its used element waits for the refill.
-        self.hold_reply(queue, &chain, written);
+        self.hold_reply(queue, &chain, written, owes);
         return Ok(Serviced {
           served,
+          published,
           more_pending: true,
           interrupt_wanted: self.queue_at(index)?.interrupts_wanted(memory)?,
           barrier_owed: false,
         });
       }
-      self.queue_at(index)?.push_used(memory, &chain, written)?;
-      admission.complete();
+      // A reply after a change waits, out of order, for the volume's FUSE mounts to have been told of it (AC-3.3); the
+      // pass serves on.
+      if self
+        .hold_or_publish(memory, (queue, &chain, written), owes, admission)?
+        .is_some()
+      {
+        published = published.saturating_add(1);
+      }
       served = served.saturating_add(1);
     }
     Ok(Serviced {
       served,
+      published,
       more_pending: self.queue_at(index)?.pending(memory)? > 0,
       interrupt_wanted: self.queue_at(index)?.interrupts_wanted(memory)?,
       barrier_owed: false,
@@ -932,9 +1000,8 @@ impl Device {
   /// open, A-154); `None` for every other chain (reads, unstable writes, refusals, the high-priority queue's FORGETs).
   fn awaits_barrier(
     &self,
-    queue: u16,
-    chain: &DescriptorChain,
-    written: u32,
+    (queue, chain, written): (u16, &DescriptorChain, u32),
+    owes: Option<u64>,
     awaits_publication: bool,
   ) -> Option<AwaitingBarrier> {
     let header = InHeader::parse(&self.request).ok()?;
@@ -950,6 +1017,7 @@ impl Device {
       opcode,
       nodeid: header.nodeid,
       unique: header.unique,
+      owes,
     })
   }
 
@@ -969,7 +1037,6 @@ impl Device {
     let Some(held) = self.awaiting.take() else {
       return Ok(None);
     };
-    let index = self.queue_index(held.queue)?;
     let mut written = held.written;
     if !captured {
       let reply = self
@@ -996,17 +1063,20 @@ impl Device {
     #[cfg(unix)]
     if captured && self.refill_owed(bridge) {
       // The reply could reveal the disk's change before the guest's map shows it: it waits for the refill too.
-      self.hold_reply(held.queue, &held.chain, written);
+      self.hold_reply(held.queue, &held.chain, written, held.owes);
       return Ok(None);
     }
-    self
-      .queue_at(index)?
-      .push_used(memory, &held.chain, written)?;
-    admission.complete();
-    Ok(Some(Completed {
-      queue: held.queue,
-      interrupt_wanted: self.queue_at(index)?.interrupts_wanted(memory)?,
+    // The change is in the volume whatever the barrier said, so its reply waits, out of order, for the volume's FUSE
+    // mounts to have been told of it (AC-3.3).
+    let published = self.hold_or_publish(
+      memory,
+      (held.queue, &held.chain, written),
+      held.owes,
+      admission,
+    )?;
+    Ok(published.map(|completed| Completed {
       refused: !captured,
+      ..completed
     }))
   }
 
@@ -1218,6 +1288,7 @@ impl Device {
       self.backed.request = Some(crate::backed::HeldRequest {
         queue,
         chain: chain.clone(),
+        mark: self.journal_mark(bridge, cx),
       });
       self.backed.counts.ingests_held = self.backed.counts.ingests_held.saturating_add(1);
       return Ok(ChainOutcome::IngestHeld);
@@ -1364,6 +1435,138 @@ impl Device {
   }
 }
 
+/// The replies that wait for the volume's FUSE mounts to have been told of their requests' changes (AC-3.3, A-191).
+impl Device {
+  /// Makes a served chain's reply wait for every FUSE mount of the volume to have been told of the change its request
+  /// made before its used element is published ([`Device::settle_told`]). The device loop switches it on, since it
+  /// settles the waits after every pass and waits on them while idle (`crate::serve`).
+  pub fn hold_replies_for_told(&mut self) {
+    self.holds_for_told = true;
+  }
+
+  /// The oldest reply waiting for the volume's FUSE mounts, if one does.
+  #[must_use]
+  pub fn told_oldest(&self) -> Option<ToldOldest> {
+    self.told.front().map(|held| ToldOldest {
+      seq: held.seq,
+      since_ns: held.since_ns,
+    })
+  }
+
+  /// How many replies wait for the volume's FUSE mounts now (non-vacuity for tests).
+  #[must_use]
+  pub fn told_held(&self) -> usize {
+    self.told.len()
+  }
+
+  /// Derived: the most replies the device holds for the volume's FUSE mounts: the configured queues' sizes, the most
+  /// chains a driver can have outstanding at once.
+  fn told_capacity(&self) -> usize {
+    self
+      .queues
+      .iter()
+      .map(|queue| usize::from(queue.layout().size))
+      .fold(0, usize::saturating_add)
+  }
+
+  /// The volume's journal head before a chain is served, when its reply would wait for the volume's FUSE mounts.
+  fn journal_mark(&self, bridge: &mut dyn Bridge, cx: &OpContext) -> Option<u64> {
+    self.holds_for_told.then(|| bridge.seen(cx).journal_seq)
+  }
+
+  /// The newest journal record a chain served since `mark` made, which its reply waits to have been told through:
+  /// `None` when it made none, since a writer that made no record waits on nothing (A-191).
+  fn journal_owed(mark: Option<u64>, bridge: &mut dyn Bridge, cx: &OpContext) -> Option<u64> {
+    let before = mark?;
+    let after = bridge.seen(cx).journal_seq;
+    (after > before).then_some(after)
+  }
+
+  /// Publishes the used element of a chain served, its reply already scattered, and releases its charge.
+  fn publish(
+    &mut self,
+    memory: &mut dyn GuestMemory,
+    queue: u16,
+    chain: &DescriptorChain,
+    written: u32,
+    admission: &mut dyn ChainAdmission,
+  ) -> Result<Completed, DeviceError> {
+    let index = self.queue_index(queue)?;
+    self.queue_at(index)?.push_used(memory, chain, written)?;
+    admission.complete();
+    Ok(Completed {
+      queue,
+      interrupt_wanted: self.queue_at(index)?.interrupts_wanted(memory)?,
+      refused: false,
+    })
+  }
+
+  /// Publishes `chain`'s used element now, or holds it until every FUSE mount of the volume has been told through
+  /// `owes`, the newest journal record its request made: `None` when it is held. A reply past the device's capacity
+  /// ([`Device::told_capacity`]) is published at once, which cannot happen while each held reply is a chain the driver
+  /// still has outstanding.
+  fn hold_or_publish(
+    &mut self,
+    memory: &mut dyn GuestMemory,
+    (queue, chain, written): (u16, &DescriptorChain, u32),
+    owes: Option<u64>,
+    admission: &mut dyn ChainAdmission,
+  ) -> Result<Option<Completed>, DeviceError> {
+    if let Some(seq) = owes
+      && self.told.len() < self.told_capacity()
+    {
+      self.told.push_back(ToldHeld {
+        queue,
+        chain: chain.clone(),
+        written,
+        seq,
+        since_ns: None,
+      });
+      return Ok(None);
+    }
+    self
+      .publish(memory, queue, chain, written, admission)
+      .map(Some)
+  }
+
+  /// Publishes every held reply whose volume's FUSE mounts have all been told through its record (`told_through`), or
+  /// whose bound has passed, `bound_ns` after this settle first saw it, as of `now_ns` (AC-3.3, A-191). A reply past the
+  /// bound is published all the same, its change applied and published, and counted overdue: it is never held for good.
+  /// A reply told at the first settle that saw it is published uncounted, as A-191's writers whose mounts were told
+  /// before they asked wait on nothing.
+  pub fn settle_told(
+    &mut self,
+    memory: &mut dyn GuestMemory,
+    told_through: &mut dyn FnMut(u64) -> bool,
+    (now_ns, bound_ns): (u64, u64),
+    admission: &mut dyn ChainAdmission,
+  ) -> Result<ToldSettled, DeviceError> {
+    let mut settled = ToldSettled::default();
+    let mut index = 0;
+    while let Some(held) = self.told.get_mut(index) {
+      let first_sight = held.since_ns.is_none();
+      let since = *held.since_ns.get_or_insert(now_ns);
+      let told = told_through(held.seq);
+      let due = now_ns.saturating_sub(since) >= bound_ns;
+      if !told && !due {
+        index = index.saturating_add(1);
+        continue;
+      }
+      let Some(held) = self.told.remove(index) else {
+        break;
+      };
+      let completed = self.publish(memory, held.queue, &held.chain, held.written, admission)?;
+      settled.completed.push(completed);
+      if !told {
+        settled.overdue = settled.overdue.saturating_add(1);
+      } else if !first_sight {
+        settled.waited = settled.waited.saturating_add(1);
+      }
+    }
+    Ok(settled)
+  }
+}
+
 /// The device's backed DAX, a step a turn (§4.6; [`crate::backed`]), whichever placer maps its windows. Unix only.
 #[cfg(unix)]
 impl Device {
@@ -1415,10 +1618,14 @@ impl Device {
       return Ok(busy);
     }
     if let Some(held) = self.backed.reply.take() {
-      let completed =
-        self.publish_held(memory, held.queue, &held.chain, held.written, admission)?;
+      let completed = self.hold_or_publish(
+        memory,
+        (held.queue, &held.chain, held.written),
+        held.owes,
+        admission,
+      )?;
       return Ok(DaxTurned {
-        completed: Some(completed),
+        completed,
         ..DaxTurned::default()
       });
     }
@@ -1466,11 +1673,13 @@ impl Device {
         Ok(ChainOutcome::DaxMapHeld | ChainOutcome::IngestHeld) => return Ok(busy),
         Err(refusal) => return Err(self.record_fault(refusal)),
       };
+    // The ingest's records count as the request's own: its reply acknowledges the guest's stores they wrote.
+    let owes = Self::journal_owed(held.mark, bridge, cx);
     self.after_served(
       memory,
       bridge,
       (held.queue, &held.chain, written),
-      ingested.wrote,
+      (ingested.wrote, owes),
       admission,
     )
   }
@@ -1482,12 +1691,14 @@ impl Device {
     memory: &mut dyn GuestMemory,
     bridge: &mut dyn Bridge,
     (queue, chain, written): (u16, &DescriptorChain, u32),
-    wrote: bool,
+    (wrote, owes): (bool, Option<u64>),
     admission: &mut dyn ChainAdmission,
   ) -> Result<DaxTurned, DeviceError> {
-    if let Some(awaiting) =
-      self.awaits_barrier(queue, chain, written, bridge.awaits_publication() || wrote)
-    {
+    if let Some(awaiting) = self.awaits_barrier(
+      (queue, chain, written),
+      owes,
+      bridge.awaits_publication() || wrote,
+    ) {
       self.awaiting = Some(awaiting);
       self.counters.barriers_awaited = self.counters.barriers_awaited.saturating_add(1);
       return Ok(DaxTurned {
@@ -1497,15 +1708,15 @@ impl Device {
       });
     }
     if self.refill_owed(bridge) {
-      self.hold_reply(queue, chain, written);
+      self.hold_reply(queue, chain, written, owes);
       return Ok(DaxTurned {
         busy: true,
         ..DaxTurned::default()
       });
     }
-    let completed = self.publish_held(memory, queue, chain, written, admission)?;
+    let completed = self.hold_or_publish(memory, (queue, chain, written), owes, admission)?;
     Ok(DaxTurned {
-      completed: Some(completed),
+      completed,
       ..DaxTurned::default()
     })
   }
@@ -1639,25 +1850,6 @@ impl Device {
     })
   }
 
-  /// Publishes the used element of a chain served out of turn, its reply already scattered, and releases its charge.
-  fn publish_held(
-    &mut self,
-    memory: &mut dyn GuestMemory,
-    queue: u16,
-    chain: &DescriptorChain,
-    written: u32,
-    admission: &mut dyn ChainAdmission,
-  ) -> Result<Completed, DeviceError> {
-    let index = self.queue_index(queue)?;
-    self.queue_at(index)?.push_used(memory, chain, written)?;
-    admission.complete();
-    Ok(Completed {
-      queue,
-      interrupt_wanted: self.queue_at(index)?.interrupts_wanted(memory)?,
-      refused: false,
-    })
-  }
-
   /// Begins the ingest the request just gathered asks for, if it is one that asks for the guest's stores first and any
   /// of the backings it names holds ranges asked writable ([`crate::backed::ingest_asked`]): whether one began.
   fn hold_for_ingest(&mut self, bridge: &mut dyn Bridge, queue: u16) -> bool {
@@ -1732,11 +1924,12 @@ impl Device {
   }
 
   /// Holds a served chain's used element until the refill its reply waits for is done.
-  fn hold_reply(&mut self, queue: u16, chain: &DescriptorChain, written: u32) {
+  fn hold_reply(&mut self, queue: u16, chain: &DescriptorChain, written: u32, owes: Option<u64>) {
     self.backed.reply = Some(crate::backed::HeldReply {
       queue,
       chain: chain.clone(),
       written,
+      owes,
     });
     self.backed.counts.replies_held = self.backed.counts.replies_held.saturating_add(1);
   }
