@@ -105,6 +105,17 @@ impl OpenNames {
     self.by_handle.is_empty()
   }
 
+  /// One next live context for the receiver's cooperative durable rename. The owner changes one name per request
+  /// and returns its token as the cursor, so a directory rename never scans every open in a single shard turn.
+  pub fn next_open(&self, after: Option<u64>) -> Option<(u64, u64)> {
+    let bound = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+    self
+      .by_handle
+      .range((bound, std::ops::Bound::Unbounded))
+      .next()
+      .map(|(context, (inode, _))| (*context, *inode))
+  }
+
   /// Every distinct inode Windows holds open: what a round that fell behind the journal purges whole (`crate::purge`).
   pub fn open_inodes(&self) -> Vec<u64> {
     let mut inodes: Vec<u64> = self.by_handle.values().map(|(ino, _)| *ino).collect();

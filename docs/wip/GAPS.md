@@ -731,14 +731,14 @@ missing, or impossible with its source, and the order of work. Two gaps underlay
    paired places, which change with it: `anchor_hold`'s Windows arm answers that no anchor holds, and a connection's
    inbox holds requests already read from the kernel, so holding a connection must carry the inbox's bytes. A held
    Shards stream also adds the guest term to the inode reserve (`guest_listing_entries`).
-   - **The WinFsp mount: designed 2026-11-01 (A-198), being built (Step 9 of the VFS and DAX plan).** The anchor is to
-     hold three handles per mount: the volume's control handle, the drive link's handle and the mount's ledger. WinFsp
+   - **The WinFsp mount: closed 2026-11-02 (A-198, Step 9 of the VFS and DAX plan).** The anchor holds
+     three handles per mount: the volume's control handle, the drive link's handle and the mount's ledger. WinFsp
      deletes a volume when the last handle to its control file object closes (`src/sys/volume.c`) and a drive letter
      with its link's last handle (`src/dll/mount.c`). The next daemon serves the held volume through a file system it
      builds with `FspFileSystemCreate` and points at the held handle. Each open's context becomes a ledger slot naming
      its file, so a request on an open from before the takeover still finds it. The successor answers the requests the
      dead daemon had taken from the ledger's in-flight slots, before its dispatcher starts. A process that is not the
-     anchor's child is to be refused the right to duplicate the held handles. **The hold transport is built and proven
+     anchor's child is refused the right to duplicate the held handles. **The hold transport is built and proven
      (2026-11-02, Step 9.2):** three process tests pass on jupiter and in three runs per CI architecture, with native
      clippy, docs and full anchor/IPC regressions green (run 41399665112). A child publishes only after the anchor's
      acknowledgement; its successor uses the inherited live object; an unrelated inheritable object is excluded.
@@ -747,11 +747,36 @@ missing, or impossible with its source, and the order of work. Two gaps underlay
      **Live mount wired (2026-11-02, Step 9.3):** the attachment commits after `Held`; normal detach deletes the file
      system after `Released`. The successor serves the held volume with opaque open tokens recovered from the unnamed
      ledger. Initial diagnostics 41415062574 lost zero drives of twenty on each architecture. Diagnostics [41422186336](https://github.com/hyper-light/slates/actions/runs/41422186336) lost zero drives of twenty on both architectures; every iteration required a restored-context read, and the last daemon counted four. All five live WinFsp tests, 36 bridge tests, 32 active anchor tests, native clippy and Windows docs passed on each runner. With only the control-handle hold omitted, the unchanged oracle failed its first post-kill read with Windows error 995 on both runners ([41422382101](https://github.com/hyper-light/slates/actions/runs/41422382101)); the still-held link alone left a dangling drive letter.
-     Owed (9.4): in-flight and second-daemon tests, safe close/cleanup settlement, the full reference/replay coherence
-     set and multiple links, and shutdown hold release. The NFS listener and fleet sockets remain open under this entry.
+     **Foreign process opens refused (2026-11-02, Step 9.4):** protected process descriptors apply at supervised
+     creation and before dedicated CLI roles acquire held objects. The normalized probe disables its own debugger
+     privilege on its thread, verifies that state, then restores it. Both architectures refuse all six separate
+     duplication/DACL/owner requests in [41432451084](https://github.com/hyper-light/slates/actions/runs/41432451084),
+     retaining zero lost drives of twenty; without protection the same probe obtains duplication on both
+     ([41432477849](https://github.com/hyper-light/slates/actions/runs/41432477849)). Existing authority and enabled
+     debugger privilege are outside this new-open policy. The real-supervisor creation check and held-object transfer
+     both pass. **Taken requests now settle (2026-11-02, Step 9.4 partial proof):** a single owned receiver retains
+     its direct-output batch and complete responses in the held section, settling that batch before any fresh receive
+     can reuse a kernel hint. The unchanged retained-read oracle first hung for 10.14 s on each architecture
+     ([41437374883](https://github.com/hyper-light/slates/actions/runs/41437374883)); with the replacement it returns
+     both original and fresh bytes, with one counted settlement, in 0.15 s on x86_64 and 0.16 s on arm64
+     ([41457226598](https://github.com/hyper-light/slates/actions/runs/41457226598)). The same run loses zero drives
+     of twenty on each architecture. An independent second daemon is refused with Windows error 183, CLI exit 4,
+     while the original drive still serves. Close/cleanup effects publish; reference reconciliation and torn-record
+     oracles pass. Original kernel names, including aliases, are now retained independently of namespace homes.
+     **Final Step 9.4 proof:** [41484542209](https://github.com/hyper-light/slates/actions/runs/41484542209) passes
+     nine untraced live CLI tests, zero drive losses of twenty, one counted captured read, both renamed-view cases,
+     six foreign-rights denials and the independent second-daemon refusal on each architecture. All 54 bridge tests,
+     32 active anchor tests, native clippy and private Windows docs pass. The held ledger now retains each original
+     kernel name, and private purges resolve its file by identity. The final live fix rearms the volume waker after an
+     empty round: its absence left an SDK rename's following write unheard until a new kernel request (41482946787).
+     The no-control-hold red-check loses the drive on both architectures (41422382101). The three Windows CI lanes
+     run both the bridge request-recovery suite with the driver and the CLI kill/view histories. The NFS listener and
+     fleet sockets remain separate open work under this entry.
      Source verification (2026-11-02) is in `research/winfsp-takeover.md`: the hold requires the anchor's acknowledgement
      after duplication, and the live tests must still validate held-volume substitution, torn ledger publication,
-     hint reuse and cleanup replay. The source review does not close this gap.
+     hint reuse and cleanup replay. A-198 corrects a source-reading error: WinFsp v2.1 disables processing-request
+     cancellation and expiry, so a guard-only journal's receive gap has no timeout. The source review alone does not
+     close it; the failed-then-passing retained-read oracle supplies the measured settlement evidence above.
 
 **Closed 2026-10-26 by A-183:** the MCP HTTP edge on Windows, and the Windows datagram socket's inheritance and
 exclusive address (A-182's sibling). Its first Windows run found that a refusal closed at once was erased by the reset

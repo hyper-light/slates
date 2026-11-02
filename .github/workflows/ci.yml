@@ -607,6 +607,14 @@ jobs:
       # outcome of a mapped view after it printed (the DAX matrix's Windows mount-route cell). One test at a time: each
       # takes a free drive letter and a daemon. Gated by `SLATES_TEST_CLI=1` and `WINFSP_TEST_MOUNT=1`; WinFsp is
       # installed above, and the daemon finds its library at run time, as WinFsp's own `FspLoad` does.
+      # A-198: retain a real taken request through a kill, then require its counted settlement and a fresh read.
+      # The same native suite covers captured batches, torn records, private-intent progress and kernel names.
+      - name: Test WinFsp request recovery and ledger oracles
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        env:
+          WINFSP_TEST_MOUNT: "1"
+        run: cargo test -p slates-bridge-winfsp --lib -- --test-threads=1 --nocapture
       - name: The WinFsp mount through the CLI (native Windows)
         if: ${{ !cancelled() }}
         timeout-minutes: 20
@@ -829,6 +837,14 @@ jobs:
         run: |
           choco install winfsp -y --no-progress
           "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      # A-198: retain a real taken request through a kill, then require its counted settlement and a fresh read.
+      # The same native suite covers captured batches, torn records, private-intent progress and kernel names.
+      - name: Test WinFsp request recovery and ledger oracles
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        env:
+          WINFSP_TEST_MOUNT: "1"
+        run: cargo test -p slates-bridge-winfsp --lib -- --test-threads=1 --nocapture
       - name: The WinFsp mount through the CLI (native arm64 Windows)
         if: ${{ !cancelled() }}
         timeout-minutes: 20
@@ -1038,6 +1054,14 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-client --test shards -- --test-threads=1
+      # A-198: retain a real taken request through a kill, then require its counted settlement and a fresh read.
+      # The same native suite covers captured batches, torn records, private-intent progress and kernel names.
+      - name: Test WinFsp request recovery and ledger oracles
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        env:
+          WINFSP_TEST_MOUNT: "1"
+        run: cargo test -p slates-bridge-winfsp --lib -- --test-threads=1 --nocapture
       - name: Test the WinFsp mount through the CLI (Windows, every push to main)
         if: ${{ !cancelled() }}
         timeout-minutes: 20

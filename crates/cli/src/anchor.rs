@@ -171,6 +171,9 @@ fn failed(what: &str, e: impl std::fmt::Display) -> Failure {
 
 /// Runs the anchor until a stop is requested or the daemon loops.
 pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
+  #[cfg(windows)]
+  slates_ipc::process_access::confine_current_holder()
+    .map_err(|error| failed("process handle authority", error))?;
   // Before the segment holds a byte: no core dump may carry it (AUD-29-41).
   crate::dumps::exclude_from_dumps()?;
   signal::install().map_err(Failure::Failed)?;

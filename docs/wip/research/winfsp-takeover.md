@@ -2,9 +2,9 @@
 
 Reviewed 2026-11-02 against WinFsp v2.1 and the slates tree based on `71cf09ac`.
 Kiln plan: `01a19979ace9754fa2e96d7f2deabb39`; research:
-`01a19979aceb7373acf761400ff8511f`. All 23 source quotations were found by kiln's
-checker. The grades below are kiln's evidence scores, not measured takeover success.
-The design remains unproven until the Windows kill tests pass.
+`01a19979aceb7373acf761400ff8511f`. The initial eight findings' 23 source quotations were found by kiln's
+checker. Subsequent findings and corrections are recorded below. The grades below are kiln's evidence scores, not measured takeover success.
+Source grades are separate from the live Windows measurements; the successful kill histories are recorded below.
 
 | Finding | Evidence and conclusion | Kiln grade |
 |---|---|---|
@@ -39,9 +39,111 @@ The design remains unproven until the Windows kill tests pass.
    user's system configuration. Run the required gates and main CI before closing
    the gap.
 
-The proposed guard records only requests it has observed. The DLL has a gap
-between returning from transact and entering that guard; the driver's timeout
-still bounds requests lost there. Cleanup and close replay need an idempotent
-terminal step. A later implementation may not treat an old hint, an old slab
-slot, or a partially published record as current merely because its numeric value
-matches.
+The proposed guard records only requests it has observed. The DLL has a gap between returning from transact and
+entering that guard. The source audit below corrects the initial timeout claim: a request lost there has no timeout
+under WinFsp v2.1's actual queue policy. Cleanup and close replay need an idempotent terminal step. A later
+implementation may not treat an old hint, an old slab slot, or a partially published record as current merely because
+its numeric value matches.
+
+
+## Step 9.4: process authority at creation (2026-11-02)
+
+The independent live-mount probe fails on both architectures before confinement: diagnostics
+[41426238795](https://github.com/hyper-light/slates/actions/runs/41426238795), on `fcc9aa4d`, grants a sibling
+`PROCESS_DUP_HANDLE` on a mount holder. The real-supervisor fixture on jupiter also grants a new duplication handle
+immediately after child creation. The child role has not changed its own DACL. These are measured failures, separate
+from the successful twenty-kill mount history.
+
+The process DACL belongs in `CreateProcessW`'s process attributes for supervised children, because the child already
+has its inherited handles before it executes. Microsoft documents that CreateProcess returns an all-access process
+handle to its caller; that already-issued handle remains the supervisor's duplication authority. The dedicated CLI
+anchor role also protects itself before holding objects. This is a process-object policy, not a privilege or a change
+to the user's account or system configuration. Evidence B:
+[process rights](https://learn.microsoft.com/en-us/windows/win32/procthread/process-security-and-access-rights),
+[process creation attributes](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw),
+[SetKernelObjectSecurity](https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-setkernelobjectsecurity).
+
+The general process-rights page describes the pseudo handle as DACL-dependent, while the API-specific
+[GetCurrentProcess](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getcurrentprocess)
+contract grants all access on supported Windows and limits the older behavior to XP and Server 2003. Use the specific
+contract and retain the real-process transfer oracle: after protection the holder must still duplicate its own
+objects, and its supervisor must still transfer them through its spawn handle. OWNER RIGHTS follows A-175's measured
+peer-section policy, which also suppresses the owner's implicit WRITE_DAC. The new probe separately requests
+WRITE_DAC and WRITE_OWNER so refusing duplication alone cannot hide an ACL rewrite.
+
+The initial probe did not control the caller's debugger privilege. Jupiter and both runner architectures actually
+have it enabled, which bypasses the process DACL. A restricted copy of the probe's own token now disables privileges
+on that thread only; PrivilegeCheck independently observes `during false`, and the helper checks restoration.
+With identical normalization, [the red run](https://github.com/hyper-light/slates/actions/runs/41432477849) still
+grants duplication on both architectures, while [the protected run](https://github.com/hyper-light/slates/actions/runs/41432451084)
+refuses duplication, DACL rewrite and owner change for both holders. The latter retains zero drive losses across
+twenty kills per architecture, all six live tests, all 32 active anchor tests, native lint and docs. This establishes
+new unprivileged process-open policy, not confinement of already-issued authority or enabled SeDebugPrivilege.
+Evidence B: [OpenProcess](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-openprocess),
+[restricted token](https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-createrestrictedtoken),
+[same-identity impersonation](https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-impersonateloggedonuser).
+
+## Step 9.4: processing requests do not time out (2026-11-02 source correction)
+
+WinFsp v2.1's [driver.h](https://raw.githubusercontent.com/winfsp/winfsp/v2.1/src/sys/driver.h) defines
+`FSP_IOQ_PROCESS_NO_CANCEL`. Under that definition [ioq.c](https://raw.githubusercontent.com/winfsp/winfsp/v2.1/src/sys/ioq.c)
+sets a processing request's timestamp to infinity, installs no cancellation routine, and excludes processing and
+retried requests from RemoveExpired. The previous claim that the transact-to-guard gap times out is wrong. A
+guard-only journal cannot establish bounded settlement of every taken request. This is a source finding (B), not a
+passing live-mount result.
+
+There is a second boundary: [the DLL dispatcher](https://raw.githubusercontent.com/winfsp/winfsp/v2.1/src/dll/fs.c)
+returns a response in its next transact. A guard leaving an operation does not prove the driver accepted that
+response. A saved hint can already have completed; another dispatcher can have taken a request at its reused IRP
+address. The driver matches only that address in its processing queue. Missing-hint behavior is insufficient.
+
+The new live oracle retains a real Request::Read after the production host delivers it, kills the serving process,
+and starts a successor on the same held controls and ledger. The reader must return bytes or
+ERROR_OPERATION_ABORTED within ten liveness budgets. Its first run must fail before request recovery is added.
+The fixture uses a fixed read-only file in each process to isolate transport settlement; the CLI's twenty-kill
+history remains the persistence and view-coherence oracle.
+
+
+## Step 9.4: receive boundary and coherence corrections (2026-11-02)
+
+These are kiln's current grades after source checking on 2026-11-02. An inference is named as such; its grade does
+not substitute for the live regression. The original guard-only design and timeout claim above are rejected.
+
+| Finding | Evidence and conclusion | Kiln grade |
+|---|---|---|
+| f9 | Processing requests never expire under `FSP_IOQ_PROCESS_NO_CANCEL`; a callback guard leaves an uncovered receive gap. [Driver configuration](https://raw.githubusercontent.com/winfsp/winfsp/v2.1/src/sys/driver.h), [queue implementation](https://raw.githubusercontent.com/winfsp/winfsp/v2.1/src/sys/ioq.c). | A, 90/100 |
+| f10 | Inference: retain the direct-output batch in held pages and settle it before any new receive, including after recovery, to prevent a recycled hint from matching a fresh processing request. [Transaction format](https://raw.githubusercontent.com/winfsp/winfsp/v2.1/inc/winfsp/fsctl.h), [direct I/O buffers](https://learn.microsoft.com/en-us/windows-hardware/drivers/kernel/buffer-descriptions-for-i-o-control-codes), [driver transaction](https://raw.githubusercontent.com/winfsp/winfsp/v2.1/src/sys/volume.c). | B, 79/100 |
+| f11 | Process termination requests cancellation of that process's pending I/O; the successor must await process exit before reading its receive journal. [TerminateProcess](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-terminateprocess). | A, 85/100 |
+| f12 | Inference: the shortest admitted TransactTimeout, 1000 ms, bounds an idle worker's join without stopping the held volume. This is distinct from processing-request lifetime. [Public limits](https://raw.githubusercontent.com/winfsp/winfsp/v2.1/inc/winfsp/fsctl.h). | B, 72/100 |
+| f13 | Inference: announce readiness with Transact0 before exposing the drive, matching current WinFsp's dispatcher. The older v2.1 tag omits the newer hardcoded early-request gate, so the difference is recorded rather than silently treating the tag as the installed driver. [Current dispatcher](https://raw.githubusercontent.com/winfsp/winfsp/master/src/dll/fs.c), [current volume gate](https://raw.githubusercontent.com/winfsp/winfsp/master/src/sys/volume.c). | B, 72/100 |
+| f14 | Inference confirmed by the failure traces: retain the original kernel name and target the private purge by file identity. A successful purge at the renamed namespace home does not reach the old cached node. [Exact-name kernel lookup](https://raw.githubusercontent.com/winfsp/winfsp/v2.1/src/sys/file.c), [diagnostic 41465398912](https://github.com/hyper-light/slates/actions/runs/41465398912). | B, 76/100 |
+| f15 | Inference: TokenId cannot survive a copied security context; a mount-specific restricting SID in a less privileged token survives that copy. Authenticate PID, marker and the bounded pending purge together. [Security-context copy](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-secreateclientsecurityfromsubjectcontext), [restricted tokens](https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-createrestrictedtoken). | C, 68/100 |
+| f16 | Inference: an owned auto-reset event wakes the private Begin/End receiver even when an open yields no callback. The control call remains owned until completion. [SetEvent](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-setevent), [WaitForMultipleObjects source](https://raw.githubusercontent.com/MicrosoftDocs/sdk-api/docs/sdk-api-src/content/synchapi/nf-synchapi-waitformultipleobjects.md). | C, 68/100 |
+| f17 | Inference confirmed by the stage log: an empty WinFsp round advanced its generation without registering for the next volume change. Rearm after delivery and before parking. [Waiter source](https://github.com/hyper-light/slates/blob/01923954cfa6137dba286f9972a85f1cc3e2d7ae/crates/vfs/src/volume.rs), [stage trace 41482946787](https://github.com/hyper-light/slates/actions/runs/41482946787), [bug record](../../bugs/2026-11-02-a-winfsp-empty-round-left-the-next-change-unheard.md). | B, 72/100 |
+
+The retained-read oracle first hangs for 10.14 s per architecture in
+[41437374883](https://github.com/hyper-light/slates/actions/runs/41437374883), even after a fresh successor read
+succeeds. With the single receiver, [41457226598](https://github.com/hyper-light/slates/actions/runs/41457226598)
+settles one counted request and returns both files' bytes in 0.15 s on x86_64 and 0.16 s on arm64. That run retains
+zero lost drives of twenty per architecture. No-hold and no-confinement red-checks are recorded in A-198 and the
+process-authority section above.
+
+The callback-free event oracle is independent: omitting only its signal fails with WAIT_TIMEOUT after 10.00 s on
+each architecture ([41480713447](https://github.com/hyper-light/slates/actions/runs/41480713447)). The real channel
+passes all 54 native bridge tests. The subsequent untraced suite still found the empty-round loss, establishing why
+passing callback traces could not close the whole change.
+
+## Final untraced verification (2026-11-02)
+
+Diagnostics [41484542209](https://github.com/hyper-light/slates/actions/runs/41484542209), commit
+`a7e5bce5c4ec70c9773a434887cc66c9b865a90e`, pass without operation traces on both Windows architectures. Each
+runner passes all nine live CLI tests and loses zero drives in twenty kills; every iteration requires the original
+handle's counted read and the original mapped view following the successor, with four restored reads in the final
+daemon. The live renamed view records one completed purge/echo; the renamed takeover records two. Neither revives
+the removed public name, and no purge is refused or kept. All six separate foreign process-rights requests are
+denied, and the independent second daemon is refused while its original owner still serves.
+
+The same run passes all 54 bridge tests, one separately enabled real-driver captured-read oracle (one counted
+settlement, 0.15 s on x86_64 and 0.19 s on arm64), all 32 active anchor tests, native clippy and private Windows
+documentation. The CLI histories take 41.51 s on x86_64 and 21.76 s on arm64. Mac formatting, workspace clippy,
+structural/literal/unsafe checks and private workspace documentation pass in 92.15 s on the same code.

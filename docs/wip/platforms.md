@@ -47,8 +47,20 @@ Each of these blocks several functions below, so it comes first.
    all `#[cfg(unix)]`). Windows fleet ports and the NFS listener are still unheld. The WinFsp mount's control,
    temporary drive-link and unnamed open-ledger handles now pass through the anchor (A-198, Step 9.3): the successor
    serves that same kernel volume and resolves old contexts by stable file identity. Diagnostics [41422186336](https://github.com/hyper-light/slates/actions/runs/41422186336) lost zero drives of twenty on both architectures; every iteration required a restored-context read, and the last daemon counted four. All five live WinFsp tests, 36 bridge tests, 32 active anchor tests, native clippy and Windows docs passed on each runner. With only the control-handle hold omitted, the unchanged oracle failed its first post-kill read with Windows error 995 on both runners ([41422382101](https://github.com/hyper-light/slates/actions/runs/41422382101)); the still-held link alone left a dangling drive letter.
-   Requests already taken at the kill, close/cleanup settlement, foreign/second-daemon refusal, full takeover
-   coherence and shutdown hold release remain Step 9.4. Windows socket inheritance remains separate work through
+   Step 9.4 now refuses new unprivileged process opens for duplication and ACL changes at both holders: all six
+   requests denied on each architecture, with the twenty-kill oracle retained ([41432451084](https://github.com/hyper-light/slates/actions/runs/41432451084));
+   the same normalized probe fails without protection ([41432477849](https://github.com/hyper-light/slates/actions/runs/41432477849)).
+   The single owned receiver now settles a retained request before any fresh receive, with one counted settlement,
+   original and fresh bytes returned in 0.15 s on x86_64 and 0.16 s on arm64
+   ([41457226598](https://github.com/hyper-light/slates/actions/runs/41457226598)); the same tree retains zero lost
+   drives of twenty per architecture. An independent second daemon is refused with Windows error 183. Final untraced diagnostics
+   [41484542209](https://github.com/hyper-light/slates/actions/runs/41484542209) pass nine live CLI tests per
+   architecture, zero drive losses of twenty, both renamed-view cases, six foreign-rights denials, one counted captured
+   read, all 54 bridge tests, 32 active anchor tests, native clippy and private Windows docs. Original kernel names are
+   held independently of namespace homes; private purges address their files by identity, and every completed round
+   rearms its volume subscription before parking. The WinFsp portion is closed; the three Windows CI lanes retain
+   these request-recovery and live-mount histories. The
+   source audit found that processing requests do not time out; A-198 rejects the guard-only receive journal. Windows socket inheritance remains separate work through
    `WSADuplicateSocketW` or an inherited handle list.
 
 ## Functions
