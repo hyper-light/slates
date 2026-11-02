@@ -11,6 +11,8 @@ description = "The Windows WinFsp bridge (§4.6, D-2; Phase 4): the refusal taxo
 [dependencies]
 slates-vfs = { workspace = true }
 slates-bridge-core = { workspace = true }
+slates-mem = { workspace = true }
+slates-wire = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # A direct dep so a cross-lint for the Windows target from a host with no MSVC assembler can enable
@@ -18,7 +20,7 @@ slates-bridge-core = { workspace = true }
 # Windows build uses the default SIMD C path. The host reads the machine's allocation granularity from it, which bounds
 # a purge's write (A-190).
 slates-machine = { workspace = true }
-windows-sys = { workspace = true }
+windows-sys = { workspace = true, features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_SystemServices"] }
 
 [lints]
 workspace = true

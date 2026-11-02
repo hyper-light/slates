@@ -402,6 +402,15 @@ pub struct ShardState {
   /// partition's attachment cap: one entry per live WinFsp attachment at most.
   #[cfg(windows)]
   pub(crate) winfsp_mounts: crate::winfsp::WinFspMounts,
+  /// Held Windows mounts not yet matched to catalog records, bounded by the anchor's admitted mount count.
+  #[cfg(windows)]
+  pub(crate) inherited_winfsp: Vec<crate::winfsp::InheritedMount>,
+  /// Catalog records whose held Windows volume will be served again after the shard's recovery.
+  #[cfg(windows)]
+  pub(crate) adopt_winfsp: Vec<(
+    slates_db::catalog::AttachmentRecord,
+    crate::winfsp::InheritedMount,
+  )>,
   /// The FUSE mounts recovery ended (attachment, mount point): their device died with the old process, so
   /// each dead mount is unmounted once the shard runs (`fuse::unmount_stale`). Filled once, at recovery, and
   /// emptied by that step; bounded by the partition's attachment cap.
