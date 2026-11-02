@@ -2877,7 +2877,8 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 > successor inheritance are built. A hold is acknowledged after duplication into the anchor, before the child publishes
 > its record. Three real-process tests pass on jupiter and on both CI architectures, three runs each there (run
 > 41399665112); discarding the acknowledged duplicate makes the same oracle fail on both (run 41399840638).
-> Wiring WinFsp's volume, drive link and ledger into this hold and measuring twenty kills remain Steps 9.3 and 9.4.
+> The live mount is now wired to the hold (Step 9.3, measurement below); the in-flight and foreign-successor
+> proof remains Step 9.4.
 
 **Base reads on macOS and Windows.** As on Linux, the daemon reads untouched base files through its own descriptor or
 handle into evictable cache chunks (one copy, `pread`/`ReadFile` on the owner shard's driver) and
@@ -12811,8 +12812,29 @@ This is a source-derived design; the held-volume substitution and crash boundari
     spawn API, cross-process duplication, process polling and message-mode pipe pair), `crates/cli` (open the Windows
     hold before the first spawn), CI's Windows test steps, and `unsafe-budget.toml` (anchor 6 → 10, IPC 105 → 109;
     the old six-site job-assignment implementation is replaced by IPC's existing creation-time job attribute).
-  - The live WinFsp attachment still needs the hold and takeover wiring. This transport result closes no live-mount,
-    in-flight-request or second-daemon criterion of Steps 9.3 and 9.4.
+  - The live WinFsp hold is now wired (Step 9.3 below). The transport tests alone establish no live-mount,
+    in-flight-request or second-daemon criterion.
+- **Live mount wiring (2026-11-02, Step 9.3).** The server awaits the anchor's `Held` before committing a WinFsp
+  attachment, and its normal detach awaits `Released` before deleting the file system. The mount owns its temporary
+  DOS link directly. A successor retains a matching attachment, substitutes the inherited control handle and volume
+  name into fresh DLL dispatcher state, and resolves per-open generation/slot tokens from the held RAM ledger.
+  The ledger's header is immutable; recovery derives its new epoch from valid live frames without rewriting shared
+  memory. A torn frame is quarantined, never recycled. The first round covers the ledger's live home names.
+  - Initial diagnostics run 41415062574 lost zero drives of twenty on each Windows architecture. The final oracle
+    also requires the old handle's first read after adoption, the mapped view following a fresh SDK write before an
+    uncached read, and a counted successful read through a restored context. Diagnostics [41419311603](https://github.com/hyper-light/slates/actions/runs/41419311603) lost zero drives of twenty on both architectures; every iteration required a restored-context read, and the last daemon counted five. All five live WinFsp tests, 35 bridge tests, 32 active anchor tests, native clippy and Windows docs passed on each runner. With only the control-handle hold omitted, the unchanged oracle failed its first post-kill read with Windows error 995 on both runners ([41419817575](https://github.com/hyper-light/slates/actions/runs/41419817575)); the still-held link alone left a dangling drive letter.
+  - `crates/bridge-winfsp/src/opens.rs` has four recovery/reuse/torn-frame tests; the complete native bridge suite
+    passes 35 tests. The recovery-with-no-writes test failed against the draft header rewrite before it was removed.
+    `held.rs` checks lengths before decoding the handoff and refuses malformed drive names, flags and UTF-16.
+  - **Still Step 9.4:** in-flight request settlement with safe hint handling; close/cleanup publication; foreign and
+    second-daemon refusal; the complete A-158 reference/replay set and multiple-link coherence; normal shutdown's
+    hold release. The twenty-kill history does not establish those cases. The sibling cleanup-by-current-name issue
+    is recorded in `docs/bugs/2026-11-02-a-winfsp-drive-died-with-its-daemon.md`.
+  - **Applied in the same change to:** §4.6's status, GAPS gap 2, `platforms.md`, the bug record, `crates/anchor`
+    (release acknowledgement), `crates/ipc` (clear inherited flags), `crates/mem` (unnamed held sections),
+    `crates/bridge-winfsp` (owned link, held dispatcher and open ledger), `crates/server` (hold, recovery and serving),
+    `crates/cli/tests/winfsp.rs` (the live oracle), and `unsafe-budget.toml` (bridge 112 → 104, IPC 109 → 110,
+    server 6 → 7; net six fewer sites).
 - **What it answers.** A WinFsp mount dies with its daemon (A-177: "the file system is the dead process's own, so
   recovery ends its record"), where a FUSE mount is held by the anchor (A-61). WinFsp deletes a volume at the cleanup
   of its control file object, that is when the last handle to it closes (`src/sys/volume.c`, `FspVolumeDeleteNoLock`,
@@ -13943,7 +13965,7 @@ Applied in the same change to: §4.6 ("Windows (own thin WinFsp binding)" and it
 - **Proven** on CI's Windows runner (Windows Server 2025, WinFsp 2.1.25156), run 40252840969, the CLI tests 3 of 3 (`crates/cli/tests/winfsp.rs`): Windows programs create, write, read, list and delete through the drive, and `slates read` returns their bytes; a cached read through a handle opened before an SDK write follows it in 20.7 ms (20.5 and 20.5 ms in runs 40249524066 and 40250856246). Red-checked twice with the mount handing Windows empty rounds (runs 40249528145 and 40250871529): the cached read stayed stale for 10 s and the test failed.
 - **Decided by the run: a mapped view does not follow** (superseded 2026-10-30 by A-190: the mount now makes WinFsp purge
   coherently, and the view follows; the measurements below stand). The view held its first byte for 10 s in every run. WinFsp's notification purges with `CcPurgeCacheSection` (research f8, `src/sys/file.c`), which "will not purge mapped files" (f9, Microsoft Learn); only `CcCoherencyFlushAndPurgeCache` invalidates user-mapped views (f9), and WinFsp does not call it (f10). So the DAX matrix's Windows mount-route cell is impossible through WinFsp. Worse, while the view stands a read through any other handle is stale too, and after the view and handles closed a fresh open read the change only 3.03 s later (GAPS: "A file mapped through the WinFsp mount…").
-- **Owed:** a scoped (`--subtree`) and a read-shared WinFsp mount; arm64 Windows; a WinFsp mount across a daemon restart (the file system is the dead process's own, so recovery ends its record); the attribute and AppleDouble-like calls (§4.6 status).
+- **Owed:** a scoped (`--subtree`) and a read-shared WinFsp mount; arm64 Windows; the remaining in-flight and foreign-successor WinFsp takeover cases (A-198; the twenty-kill open/view history is Step 9.3); the attribute and AppleDouble-like calls (§4.6 status).
 
 ### A-179 — The Shards route on Windows rides a duplex named pipe, which the runtime serves by completions (accepted 2026-10-26)
 Applied in the same change to: §4.3 (the drivers' status), GAPS, `crates/rt` (`pipe.rs` and `pipe_state.rs`, new;

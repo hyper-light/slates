@@ -44,9 +44,12 @@ Each of these blocks several functions below, so it comes first.
    lanes. The services on it are the next rows to build.
 2. **Handing sockets and handles to a restarted daemon on Windows.** The anchor holds the fleet's serve sockets, the
    NFS listener and the FUSE devices across a daemon restart by descriptor inheritance (`crates/cli/src/anchor.rs`,
-   all `#[cfg(unix)]`). On Windows none is held: a fleet node's ports are free between a stop and a restart, and a
-   WinFsp mount lives in the daemon's process and dies with it. Windows hands sockets on with `WSADuplicateSocketW`
-   (or an inherited handle list) and handles with `DuplicateHandle`.
+   all `#[cfg(unix)]`). Windows fleet ports and the NFS listener are still unheld. The WinFsp mount's control,
+   temporary drive-link and unnamed open-ledger handles now pass through the anchor (A-198, Step 9.3): the successor
+   serves that same kernel volume and resolves old contexts by stable file identity. Diagnostics [41419311603](https://github.com/hyper-light/slates/actions/runs/41419311603) lost zero drives of twenty on both architectures; every iteration required a restored-context read, and the last daemon counted five. All five live WinFsp tests, 35 bridge tests, 32 active anchor tests, native clippy and Windows docs passed on each runner. With only the control-handle hold omitted, the unchanged oracle failed its first post-kill read with Windows error 995 on both runners ([41419817575](https://github.com/hyper-light/slates/actions/runs/41419817575)); the still-held link alone left a dangling drive letter.
+   Requests already taken at the kill, close/cleanup settlement, foreign/second-daemon refusal, full takeover
+   coherence and shutdown hold release remain Step 9.4. Windows socket inheritance remains separate work through
+   `WSADuplicateSocketW` or an inherited handle list.
 
 ## Functions
 

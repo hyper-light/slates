@@ -268,7 +268,7 @@ impl Held {
 
   /// Applies one message from `daemon` (its process handle, which the anchor duplicates handles out of), and returns
   /// the answer to send back, if any: a hold is answered [`HandleMessage::Held`] or [`HandleMessage::Refused`]; a
-  /// release drops the entry and is not answered.
+  /// release drops the entry and answers only after every held handle has closed.
   pub fn apply(&mut self, daemon: HANDLE, message: HandleMessage) -> Option<HandleMessage> {
     match message {
       HandleMessage::Hold {
@@ -279,9 +279,11 @@ impl Held {
       } => Some(self.hold(daemon, id, what, &values, record)),
       HandleMessage::Release { id } => {
         self.entries.remove(&id);
-        None
+        Some(HandleMessage::Released { id })
       }
-      HandleMessage::Held { id } | HandleMessage::Refused { id, .. } => {
+      HandleMessage::Held { id }
+      | HandleMessage::Released { id }
+      | HandleMessage::Refused { id, .. } => {
         self.refused = self.refused.saturating_add(1);
         Some(HandleMessage::Refused {
           id,
@@ -541,7 +543,10 @@ mod tests {
       held.apply(myself(), hold(2, values, b"released")),
       Some(HandleMessage::Held { id: 2 })
     );
-    assert_eq!(held.apply(myself(), HandleMessage::Release { id: 2 }), None);
+    assert_eq!(
+      held.apply(myself(), HandleMessage::Release { id: 2 }),
+      Some(HandleMessage::Released { id: 2 })
+    );
     let handoff = held.handoff(&daemon).unwrap();
     let (_, entries) = crate::handles::parse_env(handoff.env(), 2).unwrap();
     assert_eq!(

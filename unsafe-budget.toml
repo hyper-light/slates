@@ -317,7 +317,9 @@ slates-anchor = 10
 slates-db = 0
 # 2026-11-02, A-198: one DuplicateHandle out of a child, two process-exit polling calls, and one message-mode pipe
 # setting call. The existing explicit handle-list spawn and kill-on-close job are reused.
-slates-ipc = 109
+# 2026-11-02 (+1, A-198 Step 9.3): `win_spawn::clear_inheritance` calls SetHandleInformation on the one owned
+# inherited handle before it can enter any later child. There is no safe Win32 wrapper for the inheritance flag.
+slates-ipc = 110
 # 2026-11-01 (+1, Step 6.1 of the VFS and DAX plan, `stream.rs` `spawn_bound` compiled only for Linux): `slates pmem`
 #   must stay its VMM's parent to hold the VMM's map and compare it back, so it spawns rather than replacing itself as
 #   `exec_with` does. `pre_exec` (unsafe by signature) whose closure sets the parent-death signal (`prctl`, through
@@ -364,7 +366,9 @@ slates-ipc = 109
 #   Raised 5 → 6 on 2026-10-03 for A-64 (content resident once): `daemon::arena_region` maps the shard's arena range of
 #   the anchor's content object through `ExclusiveObject::open_range`, whose promise (no other mapping reaches the
 #   range) the layout keeps: the daemon's copies reach only the write log and image slots.
-slates-server = 6
+# 2026-11-02 (+1, A-198 Step 9.3): `anchor_hold_windows::adopted` takes unique ownership of an explicitly inherited
+# handle after the bounded handoff parser checked nonzero values and aliasing; its inheritance flag is cleared in IPC.
+slates-server = 7
 slates-client = 0
 slates-cli = 7
 # 2026-11-01 (+2, Step 6.1 of the VFS and DAX plan, `signal.rs` `relay` compiled only for Linux): `slates pmem` waits on
@@ -427,7 +431,11 @@ slates-bridge-fskit = 9
 # Raised 111 -> 112 on 2026-11-01 (Step 8 of the VFS and DAX plan, the purge Windows did not take): `ReadFile` of each
 # purged piece, through the purge's unbuffered open and a cached one, which tells a purge Windows took from one whose
 # page it kept (`CcCoherencyFlushAndPurgeCache`'s `STATUS_CACHE_PAGE_LOCKED`, which WinFsp reports as success).
-slates-bridge-winfsp = 112
+# 2026-11-02 (112 -> 104, A-198 Step 9.3): opaque generation/slot contexts replace the per-open heap-pointer reads
+# and frees. New sites own the drive link (`DefineDosDeviceW`, `NtOpenSymbolicLinkObject`, `NtMakeTemporaryObject`
+# and the returned handle), remove that exact definition at drop, and substitute/duplicate the held control handle.
+# The safe ledger and held-record codecs have no unsafe sites. The net count falls by eight, measured by xtask.
+slates-bridge-winfsp = 104
 # Raised 3 -> 5 on 2026-10-19 for `udmabuf.rs` (the `UDMABUF_CREATE` ioctl and the descriptor it returns), which
 # confined a guest's DAX window to a descriptor covering only that window
 # (docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md). Lowered 5 -> 3 on 2026-10-25
