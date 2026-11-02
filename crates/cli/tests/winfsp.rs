@@ -16,6 +16,9 @@
   clippy::indexing_slicing
 )]
 
+#[path = "../../anchor/tests/windows_access/mod.rs"]
+mod windows_access;
+
 use std::io::BufRead;
 use std::os::windows::fs::FileExt;
 use std::process::{Child, Command, Stdio};
@@ -87,14 +90,14 @@ fn value_of(text: &str, key: &str) -> String {
     .to_owned()
 }
 
-/// The anchor process, killed and reaped on drop, so a failed assertion leaves no daemon behind (the daemon leaves
-/// when its anchor dies).
-struct AnchorProcess {
+/// A test-owned process, killed and reaped on drop. An anchor also owns a log-drain thread; a short-lived probe
+/// has no drain. Killing the anchor ends its daemon too, so an assertion leaves neither process behind.
+struct OwnedProcess {
   child: Child,
   drain: Option<std::thread::JoinHandle<()>>,
 }
 
-impl Drop for AnchorProcess {
+impl Drop for OwnedProcess {
   fn drop(&mut self) {
     let _ = self.child.kill();
     let _ = self.child.wait();
@@ -106,7 +109,7 @@ impl Drop for AnchorProcess {
 
 /// Starts `slates --instance INSTANCE anchor --quick --shards SHARDS`, waits for its daemon to serve and answer a
 /// streak of verbs, and bootstraps its consensus group.
-fn start_anchor(instance: &str) -> AnchorProcess {
+fn start_anchor(instance: &str) -> OwnedProcess {
   let mut child = slates()
     .args([
       "--instance",
@@ -135,7 +138,7 @@ fn start_anchor(instance: &str) -> AnchorProcess {
   let drain = std::thread::spawn(move || {
     let _ = std::io::copy(&mut stderr, &mut std::io::stderr());
   });
-  let anchor = AnchorProcess {
+  let anchor = OwnedProcess {
     child,
     drain: Some(drain),
   };
@@ -289,7 +292,7 @@ struct ChangedElsewhere {
   volume: slates_client::VolumeId,
   attachment: u64,
   file: String,
-  _anchor: AnchorProcess,
+  _anchor: OwnedProcess,
 }
 
 impl ChangedElsewhere {
@@ -651,6 +654,94 @@ fn a_winfsp_drive_handle_and_view_survive_twenty_killed_daemons() {
       "WINFSP TAKEOVER: completed {iteration}/{TAKEOVER_KILLS}, drives lost 0, restored reads {served}"
     );
   }
+}
+
+/// Format: target process ids passed to the independent test role, separated by a comma.
+const FOREIGN_TARGETS: &str = "SLATES_WINFSP_FOREIGN_TARGETS";
+/// Shape: a probe's successful exit differs from libtest's zero when an exact filter selected no test.
+const FOREIGN_EXIT: i32 = 3;
+
+/// Waits for a short-lived owned process, bounded by the same fixture deadline as a daemon takeover.
+fn waited_process(process: &mut OwnedProcess) -> std::process::ExitStatus {
+  use std::os::windows::io::AsRawHandle;
+  // SAFETY: the child owns a live process handle throughout the bounded wait.
+  let waited = unsafe {
+    windows_sys::Win32::System::Threading::WaitForSingleObject(
+      process.child.as_raw_handle(),
+      u32::try_from(WAIT_FOR.as_millis()).unwrap(),
+    )
+  };
+  assert_eq!(
+    waited,
+    windows_sys::Win32::Foundation::WAIT_OBJECT_0,
+    "the probe must exit within {WAIT_FOR:?}"
+  );
+  process.child.wait().unwrap()
+}
+
+/// A-198, Step 9.4. Do: ask a process outside the anchor's descendants to open new duplication and ACL-changing
+/// handles to both mount holders. Expect: Windows refuses each access with ERROR_ACCESS_DENIED, while the anchor
+/// continues to serve its original drive. The probe has no inherited process or mount handle.
+#[test]
+fn a_process_outside_the_anchor_cannot_take_either_holders_mount_handles() {
+  if !live_mount_runs() {
+    return;
+  }
+  let fixture = ChangedElsewhere::new("foreign", b'A');
+  let daemon = daemon_pid(&fixture.instance).unwrap();
+  let targets = format!("{},{}", fixture._anchor.child.id(), daemon);
+  let child = Command::new(std::env::current_exe().unwrap())
+    .args([
+      "--ignored",
+      "--exact",
+      "foreign_process_role",
+      "--nocapture",
+    ])
+    .env(FOREIGN_TARGETS, targets)
+    .spawn()
+    .unwrap();
+  let mut probe = OwnedProcess { child, drain: None };
+  assert_eq!(
+    waited_process(&mut probe).code(),
+    Some(FOREIGN_EXIT),
+    "the independent probe must execute and be refused"
+  );
+  assert_eq!(
+    std::fs::read(&fixture.file).unwrap(),
+    vec![b'A'; FILE_BYTES]
+  );
+}
+
+/// A-198. A sibling process of the anchor, selected by its parent through libtest's exact role name.
+#[test]
+#[ignore = "the independent Windows access probe, re-invoked by its parent"]
+fn foreign_process_role() {
+  use std::os::windows::io::{FromRawHandle, OwnedHandle};
+  use windows_sys::Win32::Storage::FileSystem::{WRITE_DAC, WRITE_OWNER};
+  use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_DUP_HANDLE};
+  let targets = std::env::var(FOREIGN_TARGETS).expect("the independent probe's targets");
+  windows_access::as_unprivileged(|| {
+    for target in targets.split(',') {
+      let pid: u32 = target.parse().unwrap();
+      for rights in [PROCESS_DUP_HANDLE, WRITE_DAC, WRITE_OWNER] {
+        // SAFETY: a pid from the public fixture; no inherited handle. The kernel checks access before opening it.
+        let raw = unsafe { OpenProcess(rights, 0, pid) };
+        if !raw.is_null() {
+          // SAFETY: OpenProcess returned a new handle owned by this role, closed before the failed assertion.
+          drop(unsafe { OwnedHandle::from_raw_handle(raw) });
+          panic!("WINFSP FOREIGN: process {pid} granted forbidden rights {rights:#x}");
+        }
+        let error = std::io::Error::last_os_error();
+        assert_eq!(
+          error.raw_os_error(),
+          Some(i32::try_from(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED).unwrap()),
+          "OpenProcess({pid}, {rights:#x}): {error}"
+        );
+        eprintln!("WINFSP FOREIGN: process {pid} refused rights {rights:#x}, access denied");
+      }
+    }
+  });
+  std::process::exit(FOREIGN_EXIT);
 }
 
 /// What a mapped view through the WinFsp mount does after another path's change, as the DAX matrix's Windows

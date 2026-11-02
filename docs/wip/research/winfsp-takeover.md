@@ -45,3 +45,29 @@ still bounds requests lost there. Cleanup and close replay need an idempotent
 terminal step. A later implementation may not treat an old hint, an old slab
 slot, or a partially published record as current merely because its numeric value
 matches.
+
+
+## Step 9.4: process authority at creation (2026-11-02)
+
+The independent live-mount probe fails on both architectures before confinement: diagnostics
+[41426238795](https://github.com/hyper-light/slates/actions/runs/41426238795), on `fcc9aa4d`, grants a sibling
+`PROCESS_DUP_HANDLE` on a mount holder. The real-supervisor fixture on jupiter also grants a new duplication handle
+immediately after child creation. The child role has not changed its own DACL. These are measured failures, separate
+from the successful twenty-kill mount history.
+
+The process DACL belongs in `CreateProcessW`'s process attributes for supervised children, because the child already
+has its inherited handles before it executes. Microsoft documents that CreateProcess returns an all-access process
+handle to its caller; that already-issued handle remains the supervisor's duplication authority. The dedicated CLI
+anchor role also protects itself before holding objects. This is a process-object policy, not a privilege or a change
+to the user's account or system configuration. Evidence B:
+[process rights](https://learn.microsoft.com/en-us/windows/win32/procthread/process-security-and-access-rights),
+[process creation attributes](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw),
+[SetKernelObjectSecurity](https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-setkernelobjectsecurity).
+
+The general process-rights page describes the pseudo handle as DACL-dependent, while the API-specific
+[GetCurrentProcess](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getcurrentprocess)
+contract grants all access on supported Windows and limits the older behavior to XP and Server 2003. Use the specific
+contract and retain the real-process transfer oracle: after protection the holder must still duplicate its own
+objects, and its supervisor must still transfer them through its spawn handle. OWNER RIGHTS follows A-175's measured
+peer-section policy, which also suppresses the owner's implicit WRITE_DAC. The new probe separately requests
+WRITE_DAC and WRITE_OWNER so refusing duplication alone cannot hide an ACL rewrite.
