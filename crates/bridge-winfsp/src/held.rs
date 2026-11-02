@@ -222,6 +222,11 @@ pub mod windows {
 
   impl Drop for Drive {
     fn drop(&mut self) {
+      // A successfully acquired link is temporary: closing only our copy preserves the anchor's hold. Remove the
+      // definition explicitly only to undo construction that failed before acquiring that temporary link.
+      if self.link.is_some() {
+        return;
+      }
       // SAFETY: the strings remain owned and terminated; EXACT_MATCH prevents removal of any other target's definition.
       if unsafe {
         DefineDosDeviceW(

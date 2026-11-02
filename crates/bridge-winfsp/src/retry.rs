@@ -158,7 +158,8 @@ impl PurgeRetries {
 /// Whether a taken purge `taken` covers the owed purge `owed`: the same path, and a range holding the owed one, so its
 /// write purged the owed range too.
 fn covers(taken: &Purge, owed: &Purge) -> bool {
-  taken.path == owed.path
+  taken.object == owed.object
+    && taken.path == owed.path
     && taken.offset <= owed.offset
     && owed.offset.saturating_add(owed.len) <= taken.offset.saturating_add(taken.len)
 }
@@ -179,6 +180,7 @@ mod tests {
 
   fn purge(path: &str, offset: u64, len: u64) -> Purge {
     Purge {
+      object: slates_bridge_core::ObjectId::new(1, 1),
       path: path.to_owned(),
       offset,
       len,

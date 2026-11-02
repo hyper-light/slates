@@ -8,12 +8,18 @@ use slates_bridge_core::ObjectId;
 use slates_mem::MemError;
 use slates_wire::crc32c::crc32c;
 
-/// Format: identifies version 1 of the Windows open ledger.
-const MAGIC: &[u8; 4] = b"WFO1";
+mod names;
+
+/// Format: identifies version 2 of the Windows ledger: the open records followed by the retained receive journal.
+const MAGIC: &[u8; 4] = b"WFO3";
 /// Format: the immutable header carries the first epoch, the slot count, and a CRC32C after the magic.
 const HEADER: usize = MAGIC.len() + size_of::<u64>() + size_of::<u32>() + size_of::<u32>();
-/// Format: generation, live/purge flags, daemon epoch, inode, inode generation and bridge handle, then CRC32C.
-const FRAME: usize = size_of::<u32>() + size_of::<u8>() + size_of::<u64>() * 4 + size_of::<u32>();
+/// Format: generation, live/purge flags, daemon epoch, inode, inode generation, bridge handle and request hint,
+/// then CRC32C and one confirmation byte. Confirming an issued context changes no checksummed identity bytes.
+const FRAME: usize =
+  size_of::<u32>() + size_of::<u8>() + size_of::<u64>() * 5 + size_of::<u32>() + size_of::<u8>();
+/// Format: the last byte is zero before the driver accepted the open, one afterwards. A one-byte store cannot tear.
+const CONFIRMED_AT: usize = FRAME - size_of::<u8>();
 /// Format: live is bit zero, purge is bit one; no other flag is defined.
 const LIVE: u8 = 1;
 /// Format: see [`LIVE`]. A purge's writes must never be applied, including after takeover.
@@ -72,6 +78,18 @@ impl Memory for slates_mem::SharedObject {
   }
 }
 
+impl Memory for slates_mem::SparseObject {
+  fn len(&self) -> usize {
+    self.len()
+  }
+  fn read(&self, at: usize, into: &mut [u8]) -> Result<(), Refusal> {
+    self.read(at, into).map_err(Refusal::Memory)
+  }
+  fn write(&mut self, at: usize, from: &[u8]) -> Result<(), Refusal> {
+    self.write(at, from).map_err(Refusal::Memory)
+  }
+}
+
 /// A file a kernel context still holds. An older daemon's bridge handle is returned as [`RESTORED_HANDLE`], so it cannot alias a
 /// handle the successor has issued. `Bridge::release` then returns the reference recovery restored for this inode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,16 +108,32 @@ struct Slot {
   epoch: u64,
   open: Option<Open>,
   quarantined: bool,
+  hint: u64,
+  confirmed: bool,
 }
 
-/// The bytes an open ledger needs. The bound is supplied by the bridge's admitted open-handle cap.
+/// The bytes an open ledger and its retained receive journal need. The bound is the bridge's admitted open cap.
 pub fn bytes(bound: usize) -> Result<usize, Refusal> {
+  capture_offset(bound)?
+    .checked_add(crate::inflight::capture::BYTES)
+    .ok_or(Refusal::Bound)
+}
+
+/// The retained receive region's first byte, after the fixed open frames and padding to the wire's eight-byte
+/// alignment. Only the receive worker touches that region; the shard's frame copies never overlap it.
+pub fn capture_offset(bound: usize) -> Result<usize, Refusal> {
   if bound == 0 || u32::try_from(bound).is_err() {
     return Err(Refusal::Bound);
   }
   bound
     .checked_mul(FRAME)
     .and_then(|body| body.checked_add(HEADER))
+    .and_then(|body| {
+      names::bytes(bound)
+        .ok()
+        .and_then(|names| body.checked_add(names))
+    })
+    .and_then(|body| body.checked_next_multiple_of(align_of::<u64>()))
     .ok_or(Refusal::Bound)
 }
 
@@ -111,6 +145,7 @@ pub struct Ledger<M> {
   free: Vec<usize>,
   epoch: u64,
   quarantined: usize,
+  pending: Option<(u64, u64)>,
 }
 
 impl<M: Memory> Ledger<M> {
@@ -131,6 +166,8 @@ impl<M: Memory> Ledger<M> {
         epoch: 0,
         open: None,
         quarantined: false,
+        hint: 0,
+        confirmed: false,
       });
       free.push(index);
     }
@@ -140,6 +177,7 @@ impl<M: Memory> Ledger<M> {
       free,
       epoch,
       quarantined: 0,
+      pending: None,
     })
   }
 
@@ -167,6 +205,7 @@ impl<M: Memory> Ledger<M> {
     slots.try_reserve_exact(bound).map_err(|_| Refusal::Bound)?;
     free.try_reserve_exact(bound).map_err(|_| Refusal::Bound)?;
     let mut quarantined = 0usize;
+    let mut pending = None;
     for index in 0..bound {
       let mut frame = [0; FRAME];
       memory.read(offset(index)?, &mut frame)?;
@@ -179,11 +218,19 @@ impl<M: Memory> Ledger<M> {
             epoch: 0,
             open: None,
             quarantined: true,
+            hint: 0,
+            confirmed: false,
           }
         }
       };
       if slot.open.is_none() && !slot.quarantined && slot.generation < u32::MAX {
         free.push(index);
+      }
+      if slot.open.is_some() && !slot.confirmed {
+        if pending.is_some() {
+          return Err(Refusal::Corrupt);
+        }
+        pending = Some((token(index, slot.generation)?, slot.hint));
       }
       slots.push(slot);
     }
@@ -204,16 +251,24 @@ impl<M: Memory> Ledger<M> {
       free,
       epoch,
       quarantined,
+      pending,
     })
   }
 
   /// Whether another open can be recorded before asking the bridge to allocate it.
   pub fn has_room(&self) -> bool {
-    !self.free.is_empty()
+    !self.free.is_empty() && self.pending.is_none()
   }
 
   /// Records an open before the context is handed to Windows. A full or exhausted ledger refuses admission.
-  pub fn opened(&mut self, open: Open) -> Result<u64, Refusal> {
+  pub fn opened(&mut self, open: Open, name: &str) -> Result<u64, Refusal> {
+    self.insert(open, name, 0, true)
+  }
+
+  fn insert(&mut self, open: Open, name: &str, hint: u64, confirmed: bool) -> Result<u64, Refusal> {
+    if self.pending.is_some() {
+      return Err(Refusal::Bound);
+    }
     let index = self.free.last().copied().ok_or(Refusal::Bound)?;
     let old = self.slots.get(index).ok_or(Refusal::Bound)?;
     let generation = old.generation.checked_add(1).ok_or(Refusal::Exhausted)?;
@@ -222,11 +277,80 @@ impl<M: Memory> Ledger<M> {
       epoch: self.epoch,
       open: Some(open),
       quarantined: false,
+      hint,
+      confirmed,
     };
+    names::initial(&mut self.memory, self.slots.len(), index, generation, name)?;
     self.memory.write(offset(index)?, &encode(slot)?)?;
     *self.slots.get_mut(index).ok_or(Refusal::Bound)? = slot;
     self.free.pop();
-    token(index, generation)
+    let context = token(index, generation)?;
+    if !confirmed {
+      self.pending = Some((context, hint));
+    }
+    Ok(context)
+  }
+
+  /// Records the one open whose kernel response has not yet been acknowledged, tied to that request's hint.
+  pub fn opened_for(&mut self, open: Open, name: &str, hint: u64) -> Result<u64, Refusal> {
+    if hint == 0 {
+      return Err(Refusal::Corrupt);
+    }
+    self.insert(open, name, hint, false)
+  }
+
+  /// The name of this open's kernel file node, independent of the file's current namespace home.
+  pub fn name(&self, context: u64) -> Result<String, Refusal> {
+    self.get(context)?;
+    let (index, generation) = unpack(context)?;
+    names::read(&self.memory, self.slots.len(), index, generation).map(|(_, name)| name)
+  }
+
+  /// Records one kernel-name change after the receiver saved a successful rename response. Two checksummed
+  /// versions keep its previous complete name through a torn copy; repeating the same update is harmless.
+  pub fn rename_name(&mut self, context: u64, from: &str, to: &str) -> Result<(), Refusal> {
+    self.get(context)?;
+    let (index, generation) = unpack(context)?;
+    names::rename(
+      &mut self.memory,
+      self.slots.len(),
+      index,
+      generation,
+      from,
+      to,
+    )
+  }
+
+  /// Marks an open handed only after its response was accepted by the driver, before another callback is admitted.
+  pub fn confirmed(&mut self, context: u64) -> Result<(), Refusal> {
+    self.get(context)?;
+    let (index, _) = unpack(context)?;
+    if self.slots.get(index).ok_or(Refusal::Stale)?.confirmed {
+      return Ok(());
+    }
+    if self.pending.map(|(pending, _)| pending) != Some(context) {
+      return Err(Refusal::Corrupt);
+    }
+    let at = offset(index)?
+      .checked_add(CONFIRMED_AT)
+      .ok_or(Refusal::Bound)?;
+    self.memory.write(at, &[1])?;
+    self.slots.get_mut(index).ok_or(Refusal::Stale)?.confirmed = true;
+    self.pending = None;
+    Ok(())
+  }
+
+  /// Before restoring reference counts, retain an unhanded open only when the journal has its successful response.
+  /// Otherwise retire its ledger context; its unpublished/local bridge handle is not a restored sibling's reference.
+  pub fn settle_pending(&mut self, saved_open: Option<(u64, u64)>) -> Result<(), Refusal> {
+    if let Some((context, hint)) = self.pending {
+      if saved_open == Some((hint, context)) {
+        self.confirmed(context)?;
+      } else {
+        self.closed(context)?;
+      }
+    }
+    Ok(())
   }
 
   /// Resolves the context on the shard. The returned bridge handle is usable only in the epoch that issued it.
@@ -252,9 +376,14 @@ impl<M: Memory> Ledger<M> {
       epoch: 0,
       open: None,
       quarantined: false,
+      hint: 0,
+      confirmed: false,
     };
     self.memory.write(offset(index)?, &encode(slot)?)?;
     *self.slots.get_mut(index).ok_or(Refusal::Stale)? = slot;
+    if self.pending.map(|(pending, _)| pending) == Some(context) {
+      self.pending = None;
+    }
     if generation < u32::MAX {
       self.free.push(index);
     }
@@ -347,10 +476,12 @@ fn encode(slot: Slot) -> Result<[u8; FRAME], Refusal> {
     open.object.inode,
     open.object.generation,
     open.fh,
+    slot.hint,
   ] {
     encoded.extend_from_slice(&value.to_le_bytes());
   }
   encoded.extend_from_slice(&crc32c(&encoded).to_le_bytes());
+  encoded.push(u8::from(slot.confirmed));
   encoded.try_into().map_err(|_| Refusal::Corrupt)
 }
 
@@ -361,9 +492,16 @@ fn decode(frame: &[u8; FRAME]) -> Result<Slot, Refusal> {
       epoch: 0,
       open: None,
       quarantined: false,
+      hint: 0,
+      confirmed: false,
     });
   }
-  checked(frame)?;
+  checked(frame.get(..CONFIRMED_AT).ok_or(Refusal::Corrupt)?)?;
+  let confirmed = match frame.get(CONFIRMED_AT) {
+    Some(0) => false,
+    Some(1) => true,
+    _ => return Err(Refusal::Corrupt),
+  };
   let generation = read_u32(frame, 0)?;
   let flags_at = size_of::<u32>();
   let flags = *frame.get(flags_at).ok_or(Refusal::Corrupt)?;
@@ -375,11 +513,19 @@ fn decode(frame: &[u8; FRAME]) -> Result<Slot, Refusal> {
   let inode = next_u64(frame, &mut at)?;
   let object_generation = next_u64(frame, &mut at)?;
   let fh = next_u64(frame, &mut at)?;
+  let hint = next_u64(frame, &mut at)?;
   if (flags & LIVE != 0 && epoch == 0)
     || (flags == 0
-      && [epoch, inode, object_generation, fh]
-        .iter()
-        .any(|value| *value != 0))
+      && [
+        epoch,
+        inode,
+        object_generation,
+        fh,
+        hint,
+        u64::from(confirmed),
+      ]
+      .iter()
+      .any(|value| *value != 0))
   {
     return Err(Refusal::Corrupt);
   }
@@ -392,6 +538,8 @@ fn decode(frame: &[u8; FRAME]) -> Result<Slot, Refusal> {
       purge: flags & PURGE != 0,
     }),
     quarantined: false,
+    hint,
+    confirmed,
   })
 }
 
@@ -464,6 +612,38 @@ mod tests {
     }
   }
 
+  /// A-198. Do: die after recording an open, before recording its kernel response. Expect: recovery retires only the
+  /// unhanded context, while a sibling open of the same file remains usable and releases independently.
+  #[test]
+  fn an_open_never_handed_to_the_kernel_cannot_pin_its_files_sibling() {
+    let memory = Ram(vec![0; bytes(3).unwrap()]);
+    let mut ledger = Ledger::create(memory, 3).unwrap();
+    let sibling = ledger.opened(file(10), "\\file.bin").unwrap();
+    let unhanded = ledger.opened_for(file(10), "\\file.bin", 41).unwrap();
+    let mut recovered = Ledger::recover(ledger.into_memory(), 3).unwrap();
+    recovered.settle_pending(None).unwrap();
+    assert_eq!(recovered.get(unhanded), Err(Refusal::Stale));
+    assert_eq!(recovered.get(sibling).unwrap().object, file(10).object);
+    recovered.closed(sibling).unwrap();
+    assert_eq!(recovered.live().count(), 0);
+  }
+
+  /// A-198. Do: die with a complete successful open response, then die again after its replay. Expect: the context
+  /// stays live across both recoveries; confirming it changes no checksummed identity bytes.
+  #[test]
+  fn a_saved_open_is_retained_and_a_confirmed_open_needs_no_old_hint() {
+    let mut ledger = Ledger::create(Ram(vec![0; bytes(2).unwrap()]), 2).unwrap();
+    let context = ledger.opened_for(file(10), "\\file.bin", 41).unwrap();
+    let mut recovered = Ledger::recover(ledger.into_memory(), 2).unwrap();
+    recovered.settle_pending(Some((41, context))).unwrap();
+    assert_eq!(recovered.get(context).unwrap().object, file(10).object);
+    let mut again = Ledger::recover(recovered.into_memory(), 2).unwrap();
+    again.settle_pending(None).unwrap();
+    assert_eq!(again.get(context).unwrap().object, file(10).object);
+    again.closed(context).unwrap();
+    assert_eq!(again.live().count(), 0);
+  }
+
   struct HeldReadOnly(Ram);
   impl Memory for HeldReadOnly {
     fn len(&self) -> usize {
@@ -482,9 +662,9 @@ mod tests {
   #[test]
   fn recovering_opens_never_rewrites_the_shared_header() {
     let mut first = Ledger::create(Ram(vec![0; bytes(2).unwrap()]), 2).unwrap();
-    let old = first.opened(file(11)).unwrap();
+    let old = first.opened(file(11), "\\file.bin").unwrap();
     let mut second = Ledger::recover(first.into_memory(), 2).unwrap();
-    let newer = second.opened(file(12)).unwrap();
+    let newer = second.opened(file(12), "\\file.bin").unwrap();
     let third = Ledger::recover(HeldReadOnly(second.into_memory()), 2).unwrap();
     assert_eq!(
       third.get(old).unwrap(),
@@ -507,7 +687,7 @@ mod tests {
   #[test]
   fn a_recovered_handle_cannot_name_the_successors_first_open_of_the_same_file() {
     let mut first = Ledger::create(Ram(vec![0; bytes(1).unwrap()]), 1).unwrap();
-    let context = first.opened(file(11)).unwrap();
+    let context = first.opened(file(11), "\\file.bin").unwrap();
     let recovered = Ledger::recover(first.into_memory(), 1).unwrap();
     let mut successor = slates_bridge_core::volume_bridge::new_handle_store();
     let fresh = successor.insert(11).unwrap();
@@ -528,12 +708,15 @@ mod tests {
   #[test]
   fn an_open_and_a_purge_open_survive_the_process_that_issued_them() {
     let mut first = Ledger::create(Ram(vec![0; bytes(2).unwrap()]), 2).unwrap();
-    let context = first.opened(file(11)).unwrap();
+    let context = first.opened(file(11), "\\file.bin").unwrap();
     let purge = first
-      .opened(Open {
-        purge: true,
-        ..file(12)
-      })
+      .opened(
+        Open {
+          purge: true,
+          ..file(12)
+        },
+        "\\purge.bin",
+      )
       .unwrap();
     let next = Ledger::recover(first.into_memory(), 2).unwrap();
     assert_eq!(
@@ -557,11 +740,11 @@ mod tests {
   #[test]
   fn a_reused_slot_never_revives_its_previous_context() {
     let mut ledger = Ledger::create(Ram(vec![0; bytes(1).unwrap()]), 1).unwrap();
-    let old = ledger.opened(file(11)).unwrap();
-    assert_eq!(ledger.opened(file(12)), Err(Refusal::Bound));
+    let old = ledger.opened(file(11), "\\file.bin").unwrap();
+    assert_eq!(ledger.opened(file(12), "\\file.bin"), Err(Refusal::Bound));
     ledger.closed(old).unwrap();
     let mut ledger = Ledger::recover(ledger.into_memory(), 1).unwrap();
-    let new = ledger.opened(file(12)).unwrap();
+    let new = ledger.opened(file(12), "\\file.bin").unwrap();
     assert_ne!(old, new);
     assert_eq!(ledger.get(old), Err(Refusal::Stale));
     assert_eq!(ledger.get(new).unwrap(), file(12));
@@ -573,7 +756,7 @@ mod tests {
   #[test]
   fn a_torn_record_is_quarantined_instead_of_becoming_some_other_open() {
     let mut ledger = Ledger::create(Ram(vec![0; bytes(1).unwrap()]), 1).unwrap();
-    let context = ledger.opened(file(11)).unwrap();
+    let context = ledger.opened(file(11), "\\file.bin").unwrap();
     let original = ledger.into_memory().0;
     for cut in 1..FRAME {
       let mut interrupted = original.clone();
