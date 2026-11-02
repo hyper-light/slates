@@ -1,0 +1,72 @@
+name: DIAG the Windows hold channel across processes (Step 9.2, not for main)
+
+# Step 9.2 of the VFS and DAX plan: the anchor's Windows hold channel (A-198) across real processes, with no WinFsp.
+# The test re-invokes itself as a sender and two checkers; it proves the anchor duplicates a handle out of a child,
+# holds it past the child's death, and a spawned successor inherits the live object, and red-checks that without the
+# hold the object is gone. Runs on both Windows runners with --nocapture so the SENDER/CHECKER lines show.
+
+on:
+  push:
+    branches: ['diag-s9-hold-*']
+
+jobs:
+  hold:
+    name: the hold channel across processes on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-latest, windows-11-arm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (x86_64)
+        if: runner.arch == 'X64'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl for the C the daemon links (arm64)
+        if: runner.arch == 'ARM64'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Clippy the anchor and ipc
+        id: lint
+        continue-on-error: true
+        shell: bash
+        env:
+          AWS_LC_SYS_PREBUILT_NASM: "0"
+        run: cargo clippy -p slates-anchor -p slates-ipc --all-targets -- -D warnings
+      - name: The hold channel test, three runs
+        shell: bash
+        env:
+          AWS_LC_SYS_PREBUILT_NASM: "0"
+        run: |
+          set +e
+          pass=0
+          for i in 1 2 3; do
+            cargo test -p slates-anchor --test handles_windows -- --nocapture --test-threads=1 > "run-$i.log" 2>&1
+            code=$?
+            echo "== run $i exit $code: $(grep -E 'test result' run-$i.log | tr '\n' ' ')"
+            grep -aE "SENDER:|CHECKER|panicked|no hold|exit so far|FAILED" "run-$i.log" | head -20
+            [ "$code" -eq 0 ] && pass=$((pass+1))
+          done
+          echo "== $pass of 3 runs passed"
+          [ "$pass" -eq 3 ]
+      - name: Require clippy success
+        if: always()
+        shell: bash
+        run: test "${{ steps.lint.outcome }}" = success
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hold-logs-${{ matrix.runner }}
+          path: run-*.log
+          if-no-files-found: ignore

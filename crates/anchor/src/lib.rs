@@ -26,8 +26,14 @@
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 pub mod error;
+// The Windows hold channel's formats (A-198): pure, so tested on every host; its transport is `held_windows`.
+pub mod handles;
 #[cfg(unix)]
 pub mod held;
+// The Windows hold channel's transport (A-198): the message-mode pipe and the duplication that moves a daemon's
+// handles into the anchor, the counterpart of `held` on Unix.
+#[cfg(windows)]
+pub mod held_windows;
 pub mod layout;
 pub mod segment;
 pub mod supervise;

@@ -652,7 +652,6 @@ mod platform {
   //! says why and how), `PeekNamedPipe` for a read that never blocks.
 
   use std::ffi::{OsStr, OsString};
-  use std::os::windows::ffi::OsStrExt;
   use std::ptr::{null, null_mut};
   use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -682,34 +681,13 @@ mod platform {
     refused, spawn,
   };
 
-  /// Whether two variable names are the same to the environment's reader (case-insensitively).
-  fn same_name(a: &OsStr, b: &OsStr) -> bool {
-    a.to_string_lossy().to_uppercase() == b.to_string_lossy().to_uppercase()
-  }
-
-  /// The child's environment block: this process's variables with `added` and the delivery variable
-  /// set (replacing any same-named one), sorted by name without regard to case as the block's reader
-  /// requires — `NAME=VALUE\0` per entry and a final `\0`.
+  /// The child's environment block: this process's variables with `added` and the delivery variable set
+  /// (`crate::win_spawn::environment_block`).
   fn environment_block(added: &[(&OsStr, &OsStr)], descriptor_name: &str) -> Vec<u16> {
-    let mut variables: Vec<(OsString, OsString)> = std::env::vars_os().collect();
-    let mut set = |name: &OsStr, value: OsString| {
-      variables.retain(|(existing, _)| !same_name(existing, name));
-      variables.push((name.to_os_string(), value));
-    };
-    for (name, value) in added {
-      set(name, (*value).to_os_string());
-    }
-    set(OsStr::new(ENV_CONSUMER_FD), OsString::from(descriptor_name));
-    variables.sort_by_cached_key(|(name, _)| name.to_string_lossy().to_uppercase());
-    let mut block: Vec<u16> = Vec::new();
-    for (name, value) in variables {
-      block.extend(name.encode_wide());
-      block.push(u16::from(b'='));
-      block.extend(value.encode_wide());
-      block.push(0);
-    }
-    block.push(0);
-    block
+    let descriptor = OsString::from(descriptor_name);
+    let mut all: Vec<(&OsStr, &OsStr)> = added.to_vec();
+    all.push((OsStr::new(ENV_CONSUMER_FD), descriptor.as_os_str()));
+    crate::win_spawn::environment_block(&all)
   }
 
   /// An anonymous pipe, both ends non-inheritable: (read end, write end).
