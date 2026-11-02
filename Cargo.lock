@@ -1408,7 +1408,9 @@ version = "0.1.0"
 dependencies = [
  "slates-bridge-core",
  "slates-machine",
+ "slates-mem",
  "slates-vfs",
+ "slates-wire",
  "windows-sys 0.60.2",
 ]
 

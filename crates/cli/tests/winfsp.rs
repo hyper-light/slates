@@ -356,6 +356,17 @@ fn read_page(handle: &std::fs::File) -> Vec<u8> {
   page
 }
 
+/// Format: the mount reports 4096-byte sectors. Both the address and transfer length of an unbuffered read are
+/// sector-aligned, so it must reach the successor rather than be answered by Windows' cached page.
+#[repr(align(4096))]
+struct SectorPage([u8; FILE_BYTES]);
+
+fn read_uncached_page(handle: &std::fs::File) -> std::io::Result<Vec<u8>> {
+  let mut page = SectorPage([0; FILE_BYTES]);
+  let read = handle.seek_read(&mut page.0, 0)?;
+  Ok(page.0[..read].to_vec())
+}
+
 /// Polls `look` until every byte it returns is `fill`, within [`WAIT_FOR`]; the time it took, or `None`.
 fn follows(fill: u8, mut look: impl FnMut() -> Vec<u8>) -> Option<Duration> {
   let started = Instant::now();
@@ -460,6 +471,174 @@ impl Drop for MappedView {
       windows_sys::Win32::System::Memory::UnmapViewOfFile(self.view);
       windows_sys::Win32::Foundation::CloseHandle(self.mapping);
     }
+  }
+}
+
+/// Shape: Step 9's requested kill budget: twenty deaths of the daemon under the same drive, open handle and view.
+const TAKEOVER_KILLS: u32 = 20;
+/// Format: WinFsp's maximum volume name, `FSP_FSCTL_VOLUME_NAME_SIZEMAX`: 64 volume-name units plus 192 prefix units.
+const VOLUME_NAME_UNITS: usize = 64 + 192;
+
+/// The kernel target of this drive letter, so a newly mounted replacement cannot stand in for the surviving volume.
+fn drive_target(drive: &str) -> Option<Vec<u16>> {
+  let name: Vec<_> = drive.encode_utf16().chain(Some(0)).collect();
+  let mut target = vec![0u16; VOLUME_NAME_UNITS];
+  // SAFETY: `name` is terminated and `target` has the reported writable capacity in UTF-16 units.
+  let length = unsafe {
+    windows_sys::Win32::Storage::FileSystem::QueryDosDeviceW(
+      name.as_ptr(),
+      target.as_mut_ptr(),
+      u32::try_from(target.len()).unwrap(),
+    )
+  };
+  if length == 0 {
+    return None;
+  }
+  target.truncate(usize::try_from(length).unwrap());
+  Some(target)
+}
+
+/// The serving process, through the command's public status response; absent while no daemon answers.
+fn daemon_pid(instance: &str) -> Option<u32> {
+  let (code, text, _) = run(instance, &["status", "--json"]);
+  if code != 0 {
+    return None;
+  }
+  let after = text.split("\"pid\":").nth(1)?;
+  after
+    .trim_start()
+    .split(|character: char| !character.is_ascii_digit())
+    .next()?
+    .parse()
+    .ok()
+}
+
+/// Terminates the daemon and observes its exit before checking the drive: no graceful shutdown may keep it alive.
+fn kill_daemon(pid: u32) {
+  use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+  use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+  use windows_sys::Win32::System::Threading::{
+    OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+  };
+  // SAFETY: the pid came from this fixture's status; request only termination and exit observation, no inheritance.
+  let process = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid) };
+  assert!(
+    !process.is_null(),
+    "OpenProcess({pid}): {}",
+    std::io::Error::last_os_error()
+  );
+  // SAFETY: this is the unique owned handle just returned by OpenProcess.
+  let process = unsafe { OwnedHandle::from_raw_handle(process) };
+  // SAFETY: `process` stays owned for the call, and the exit code carries no pointer.
+  assert_ne!(unsafe { TerminateProcess(process.as_raw_handle(), 1) }, 0);
+  // SAFETY: `process` stays owned until the bounded wait observes termination.
+  let waited = unsafe {
+    WaitForSingleObject(
+      process.as_raw_handle(),
+      u32::try_from(WAIT_FOR.as_millis()).unwrap(),
+    )
+  };
+  assert_eq!(
+    waited, WAIT_OBJECT_0,
+    "the killed daemon must exit before the drive is checked"
+  );
+}
+
+/// Waits for the held volume to be adopted, checking its drive target throughout the gap between daemons.
+fn wait_for_successor(instance: &str, drive: &str, original: &[u16], killed: u32, iteration: u32) {
+  let started = Instant::now();
+  loop {
+    let target = drive_target(drive);
+    eprintln!(
+      "WINFSP TAKEOVER: kill {iteration}/{TAKEOVER_KILLS}, pid {killed}, drive held {}",
+      target.as_deref() == Some(original)
+    );
+    assert_eq!(
+      target.as_deref(),
+      Some(original),
+      "the original drive must survive kill {iteration}"
+    );
+    if daemon_pid(instance).is_some_and(|pid| pid != killed)
+      && counter(instance, "winfsp.adopted") >= 1
+    {
+      break;
+    }
+    assert!(
+      started.elapsed() < WAIT_FOR,
+      "no successor served after kill {iteration}"
+    );
+    pause();
+  }
+}
+
+/// A-198, Step 9.3. Do: keep one handle and one mapped view open through twenty killed daemons. Expect: the same
+/// kernel volume target throughout; each successor serves the original handle, and its SDK write reaches the old
+/// mapped view. Dropping the volume's held control handle is the diagnostic red-check of this unchanged oracle.
+#[test]
+fn a_winfsp_drive_handle_and_view_survive_twenty_killed_daemons() {
+  use std::os::windows::fs::OpenOptionsExt;
+  use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING;
+  if !live_mount_runs() {
+    return;
+  }
+  let mut fixture = ChangedElsewhere::new("takeover", b'A');
+  let drive = fixture.file.get(..2).unwrap().to_owned();
+  let original = drive_target(&drive).expect("the mounted drive names a kernel volume");
+  let handle = std::fs::OpenOptions::new()
+    .read(true)
+    .custom_flags(FILE_FLAG_NO_BUFFERING)
+    .open(&fixture.file)
+    .unwrap();
+  let mapped_file = std::fs::File::open(&fixture.file).unwrap();
+  let view = MappedView::of(&mapped_file);
+  assert_eq!(read_uncached_page(&handle).unwrap(), vec![b'A'; FILE_BYTES]);
+  assert_eq!(view.page(), vec![b'A'; FILE_BYTES]);
+  for iteration in 1..=TAKEOVER_KILLS {
+    let killed = daemon_pid(&fixture.instance).expect("the daemon answers before the kill");
+    kill_daemon(killed);
+    wait_for_successor(&fixture.instance, &drive, &original, killed, iteration);
+    let next_read = read_uncached_page(&handle);
+    assert!(
+      next_read.is_ok(),
+      "the original drive must serve its old handle after kill {iteration}: {next_read:?}"
+    );
+    assert_eq!(
+      next_read.unwrap(),
+      vec![b'A' + u8::try_from(iteration - 1).unwrap(); FILE_BYTES]
+    );
+    // A previous SDK session's attachment ends at recovery. A fresh attachment changes the recovered volume.
+    let deadlines = slates_client::Deadlines::derive(
+      slates_server::daemon::LIVENESS_BUDGET_NS,
+      slates_db::replay::RECOVERY_BUDGET_NS,
+    )
+    .get();
+    fixture.writer = slates_client::Client::connect(&fixture.instance, deadlines).unwrap();
+    fixture.attachment = fixture
+      .writer
+      .attach(fixture.volume, None, slates_client::Intent::Write)
+      .unwrap()
+      .attachment;
+    let fill = b'A' + u8::try_from(iteration).unwrap();
+    fixture.change_through_slates(fill);
+    assert!(
+      follows(fill, || view.page()).is_some(),
+      "the original view must follow the successor after kill {iteration}"
+    );
+    let before = counter(&fixture.instance, "winfsp.restored_reads");
+    assert_eq!(
+      read_uncached_page(&handle).unwrap(),
+      vec![fill; FILE_BYTES],
+      "the original handle's next read must return the successor's bytes after kill {iteration}"
+    );
+    let served = counter_reaching(&fixture.instance, "winfsp.restored_reads", before + 1);
+    assert!(
+      served > before,
+      "the successor must serve the original open after kill {iteration}"
+    );
+    assert_eq!(drive_target(&drive).as_ref(), Some(&original));
+    eprintln!(
+      "WINFSP TAKEOVER: completed {iteration}/{TAKEOVER_KILLS}, drives lost 0, restored reads {served}"
+    );
   }
 }
 

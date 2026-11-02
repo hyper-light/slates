@@ -23,8 +23,8 @@ use std::os::windows::ffi::OsStrExt;
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
-  CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
-  WAIT_OBJECT_0, WAIT_TIMEOUT,
+  CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
+  INVALID_HANDLE_VALUE, SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::System::Console::{
   GetStdHandle, STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -61,6 +61,17 @@ pub(crate) fn refused(call: &'static str) -> IpcError {
 
 /// A handle this crate created or duplicated, closed when it goes out of scope.
 pub struct ClosedOnDrop(pub(crate) HANDLE);
+
+/// Clears inheritance on a handle a daemon adopted from its anchor (A-198). The one intended spawn already carried
+/// it; a later child of the daemon must inherit none of the held volume, drive link, ledger or hold channel.
+pub fn clear_inheritance(handle: &std::os::windows::io::OwnedHandle) -> Result<(), IpcError> {
+  use std::os::windows::io::AsRawHandle;
+  // SAFETY: `handle` remains owned for the call. This changes a flag in its handle-table entry and touches no bytes.
+  if unsafe { SetHandleInformation(handle.as_raw_handle(), HANDLE_FLAG_INHERIT, 0) } == 0 {
+    return Err(refused("SetHandleInformation (clear inheritance)"));
+  }
+  Ok(())
+}
 
 impl ClosedOnDrop {
   /// The handle, for a call that borrows it while this value holds it (a spawn's inherited list, a job).
