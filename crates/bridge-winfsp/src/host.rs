@@ -2087,3 +2087,7 @@ fn write_wide(field: &mut [u16], s: &str) {
     *slot = unit;
   }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/host.rs"]
+mod tests;

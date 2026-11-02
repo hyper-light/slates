@@ -16,6 +16,8 @@
   clippy::indexing_slicing
 )]
 
+mod windows_access;
+
 use std::ffi::{OsStr, OsString};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::time::{Duration, Instant};
@@ -82,6 +84,7 @@ fn spawn_role(test: &str, added: &[(&OsStr, &OsStr)], inherited: &[HANDLE]) -> C
     inherited,
     output: StandardOutput::Inherited,
     job: None,
+    process_security: None,
   })
   .unwrap();
   ChildProcess { process }
@@ -339,6 +342,9 @@ fn the_supervisor_acknowledges_the_hold_before_commit_and_hands_it_to_its_succes
     .0
     .hold_environment(EVENT_NAME, format!("{}-supervised", unique_event_name()));
   anchor.0.start(0).unwrap();
+  // This child role never changes its own process ACL. Refusal here therefore proves protection at creation,
+  // before it can run, while the supervisor's already-issued spawn handle still duplicates its held object below.
+  windows_access::as_unprivileged(|| refuse_new_duplicate_access(anchor.0.child_pid().unwrap()));
   let clock = Instant::now();
   let mut completed = false;
   while clock.elapsed() < Duration::from_millis(u64::from(WAIT_MS)) {
@@ -368,6 +374,33 @@ fn the_supervisor_acknowledges_the_hold_before_commit_and_hands_it_to_its_succes
       .unwrap()
       .as_deref(),
     Some(b"checked".as_slice())
+  );
+}
+
+/// A-198, Step 9.4: opening new duplication authority must fail even for another process of the same user.
+fn refuse_new_duplicate_access(pid: u32) {
+  use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_DUP_HANDLE};
+  eprintln!(
+    "WINDOWS ACCESS: caller {}, child {pid}, debug privilege enabled {}",
+    std::process::id(),
+    windows_access::debug_privilege_enabled()
+  );
+  // SAFETY: a child pid this test owns; no inheritance. The kernel checks the requested access against its DACL.
+  let raw = unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, pid) };
+  let error = std::io::Error::last_os_error();
+  let opened = if raw.is_null() {
+    None
+  } else {
+    // SAFETY: a newly opened process handle, uniquely owned here and closed if the assertion unwinds.
+    Some(unsafe { OwnedHandle::from_raw_handle(raw) })
+  };
+  assert!(
+    opened.is_none(),
+    "a newly created child granted foreign duplication authority"
+  );
+  assert_eq!(
+    error.raw_os_error(),
+    Some(i32::try_from(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED).unwrap())
   );
 }
 

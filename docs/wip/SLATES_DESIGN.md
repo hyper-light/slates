@@ -12886,32 +12886,31 @@ This is a source-derived design; the held-volume substitution and crash boundari
   - The ledger holds one slot per open the bridge allows (`MAX_OPEN_HANDLES`), with a typed refusal past it.
 - **Requests in flight at the kill.**
   - Requests the kernel queued while no daemon served wait in WinFsp's pending queue, and the successor serves them.
-  - Those the dead daemon had taken wait in the processing queue until a response names them by hint
-    (`FspIoqEndProcessingIrp`), or until the volume's request timeout cancels them (`src/sys/ioq.c`,
-    `FspIoqRemoveExpired`, with `STATUS_CANCELLED` from `src/sys/iop.c`).
-  - The ledger keeps one slot per dispatcher thread. A guard the mount sets in place of WinFsp's own
-    (`FspFileSystemSetOperationGuardF`, then WinFsp's exported `FspFileSystemOpEnter`) writes the slot as each request
-    is taken, before WinFsp's guard serializes it:
-    the hint and the kind, and a Close or a Cleanup whole (at most `FSP_FSCTL_TRANSACT_REQ_SIZEMAX`, 16 KiB less 64).
-  - Before its dispatcher starts, the successor answers each slot through `FspFileSystemSendResponse`. A Close or a
-    Cleanup is carried out (its handle released, a delete made) and answered. Any other request is refused
-    `STATUS_CANCELLED`, the status WinFsp's own timeout gives.
-  - A slot whose request was answered already names a hint no request in processing holds, and WinFsp skips it
-    (`FspVolumeFastTransact`, "BOGUS").
-    The implementation must also account for a hint's address being reused; the missing-hint behavior alone does not
-    establish that replaying an arbitrary saved response is safe. Cleanup and close must settle their effects once.
-  - The gap left is a request taken but not yet at the guard: the DLL's few instructions after the transact returns.
-    The timeout refuses it.
+  - Those the dead daemon had taken remain in the processing queue until a response names their hint
+    (`FspIoqEndProcessingIrp`). **Source correction, 2026-11-02:** `driver.h` defines
+    `FSP_IOQ_PROCESS_NO_CANCEL`; `ioq.c` sets their timestamp to infinity and excludes them from timeout removal.
+    The earlier timeout claim was wrong. A request lost between transact and an operation guard can hang indefinitely.
+  - A guard-only journal is therefore rejected. Request recovery must retain the receive buffer at the transact
+    boundary and distinguish a response returned by a callback from one accepted by the driver. The live taken-read
+    oracle is being built in Step 9.4; no in-flight settlement is established by the twenty-kill history.
+  - Replaying an arbitrary saved hint is also unsafe: it is an IRP address, and another dispatcher can take a new
+    request at that address after the first response completed. Missing hints being ignored (`FspVolumeFastTransact`,
+    "BOGUS") does not solve address reuse. The replacement must prevent that ambiguity before replay, and settle
+    cleanup and close effects once. Exact source and the test boundary are in `research/winfsp-takeover.md`.
 - **Coherence at takeover.** The successor must tell Windows of changes the dead daemon never told it of. Its first
   turn notifies and purges (A-190, read back) every inode A-158 names: the owner's restored references and the inodes
   the write-log replay wrote. It reaches each by the paths the volume gives it (`Volume::path_of_inode`, and
   `paths_of_inode_walk` for an inode of several links), and seeds the mount's open names from them.
 - **A second daemon is refused.**
   - A held handle passes only by inheritance, to the anchor's own next daemon.
-  - Another process could take it only by duplicating it out of the anchor or the daemon, which needs
+  - Another unprivileged process could take it only by duplicating it out of the anchor or the daemon, which needs
     `PROCESS_DUP_HANDLE` on that process. So each sets its own security to refuse that right to every other process of
     the user, through an owner-rights entry as A-175's sections use. The anchor's existing child-process handle lets it
     duplicate out of that child; the child is given no process handle for duplicating into the anchor.
+    The child's descriptor is applied by CreateProcessW before its first instruction; dedicated CLI holders protect
+    themselves before acquiring held resources. Existing handles and an enabled debugger privilege are outside this
+    new-open policy. Diagnostics 41432451084 and 41432477849 verify the same unprivileged probe with and without it
+    on both architectures (the test disables privileges only on its own thread and checks restoration).
   - A second daemon on the instance is refused by the rendezvous's owner (A-176, A-178).
 - **Tests** (Step 9.2 to 9.4; the live mount runs on CI's Windows runners only, since jupiter has no WinFsp):
   - the hold across real processes on Windows: duplicated in, inherited by the next daemon only;
