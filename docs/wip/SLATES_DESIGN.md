@@ -13712,6 +13712,13 @@ running rings, `ObjectIdentity`), `crates/server` (`tests/virtiofs.rs`: the test
 `tests/common/guest.rs`: a chain whose payload lies in another region), `ci/guest/Dockerfile` (QEMU from
 trixie-backports, fuse3), `.github/workflows/ci.yml` (the live-guest lane's QEMU leg), and
 `docs/bugs/2026-10-29-qemus-memory-table-after-a-map-ended-slates-own-device.md`.
+- **Shutdown diagnostics (2026-11-02).** Main CI 41487560076 passes 19/20 jobs but its eight `guest_vhost` cases
+  fail at clean poweroff in two attempts, after their functional histories finish. `Guest::quit` previously stopped
+  reading after the probe's Done reply, hiding the VMM's final stderr. The shared harness now retains bounded final
+  output after observing exit. A real-process oracle fails before that drain (0.03 s) and passes after (0.02 s), on
+  adacachy under the recorded resource cap. The clean-exit and data assertions are unchanged. This exposes the
+  QEMU shutdown cause for diagnosis; it does not claim that cause fixed. Record:
+  `docs/bugs/2026-11-02-a-vmm-exit-hid-its-final-diagnostic.md`.
 - **What it answers.** The DAX matrix ruled QEMU out on both routes: upstream's vhost-user-fs device has no window
   property, and the window is the front end's to offer. That holds of QEMU's vhost-user-fs-pci, which has no window in
   11.1 either, and was wrong of QEMU. 11.1.0 is the first release whose generic vhost-user device

@@ -586,9 +586,15 @@ impl Guest {
   /// Tells the guest to quit, and waits for the VM to power off: its exit status.
   pub(crate) fn quit(&mut self) -> std::process::ExitStatus {
     self.done(&Ask::Quit);
+    self.wait_for_exit()
+  }
+
+  /// Waits for an already-requested exit and retains its final stdout/stderr, including errors after the probe replied.
+  pub(crate) fn wait_for_exit(&mut self) -> std::process::ExitStatus {
     let started = Instant::now();
     loop {
       if let Some(status) = self.vm.try_wait().unwrap() {
+        self.drain(QUIT_WAIT);
         return status;
       }
       assert!(

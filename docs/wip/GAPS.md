@@ -11671,6 +11671,12 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     x86_64 job, 23 of 23, pjdfstest's 8,798 cases with no unlisted failure). On adacachy: the device's test of QEMU's
     tables failed before the fix and passes after; the virtio-fs suite 23 of 23; bridge-virtiofs's suites; the five
     crosvm tests 5 of 5; clippy of bridge-virtiofs, server and cli.
+  - **Open shutdown diagnosis (2026-11-02):** main CI 41487560076 passes the 23 server virtiofs cases but all eight
+    CLI guest-vhost cases fail only at clean poweroff, SIGABRT, in two attempts. The previous main run 41423577167
+    passes those eight cases with the same QEMU 11.1.2 Debian +4 package. The test harness now drains final stdout
+    and stderr after the probe's Done reply; a real-process oracle first lost that error (0.03 s), then retained it
+    (0.02 s). No exit or byte assertion is weakened. The underlying QEMU cause remains to be named from the exposed
+    diagnostic; see `docs/bugs/2026-11-02-a-vmm-exit-hid-its-final-diagnostic.md` and A-189.
   - **Red-checked:** the same QEMU with the device offered no window, all 5 refused at the guest's `dax=always` mount
     (job 123456467863).
   - **QEMU's mount route by the image form, proven on x86_64** (diagnostics run 40883925064): `guest_image.rs` 4 of 4
