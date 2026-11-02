@@ -1,6 +1,6 @@
 //! AC-9.7, §4.6, A-189: the VM harness must retain the VMM's final error after its probe reply. This real-process
 //! fixture uses the same serial protocol and stderr forwarding without requiring a hypervisor or a mount.
-#![cfg(unix)]
+#![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod vm;
