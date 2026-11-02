@@ -7,10 +7,10 @@
 //! twice as long as the one before, so a page Windows keeps for a time `T` costs about `log2(T / tick)` attempts.
 //!
 //! A purge is given up, and counted kept, once its next attempt would come later than the volume's request timeout
-//! after Windows first kept its page. WinFsp cancels any request through the volume left unanswered that long
-//! (`src/sys/ioq.c`, `FspIoqRemoveExpired`), so by then no I/O through the volume still holds the page. What holds it
-//! is a program's own lock (`VirtualLock` on a view, say), which no purge can undo. A later change to the file purges it
-//! again.
+//! after Windows first kept its page. This is a bounded retry budget anchored to the pending queue's deadline, not
+//! evidence that no I/O still holds the page: A-198's source review found that processing requests never expire
+//! (`FSP_IOQ_PROCESS_NO_CANCEL`). A program's own lock (`VirtualLock` on a view, say) can also keep a page. The kept
+//! outcome remains counted, and a later change to the file purges it again.
 //!
 //! The list holds at most `bound` purges: the caller passes the most purges a round can carry (one per open name of a
 //! changed file, so the open-handle cap). An untaken purge past it is given up and counted kept.
@@ -21,8 +21,8 @@ use crate::purge::{Purge, PurgeOutcome};
 
 /// Format: the request timeout the volume runs with, in milliseconds: WinFsp's default (`fsctl.h`,
 /// `FspFsctlIrpTimeoutDefault`; its minimum is 60,000 and its maximum 600,000), set in the volume's parameters
-/// (`crate::host`) so that this module's horizon is the volume's own. WinFsp completes a request left unanswered this
-/// long as cancelled (`src/sys/ioq.c`, `FspIoqRemoveExpired`; `src/sys/iop.c`, `STATUS_CANCELLED`).
+/// (`crate::host`) so that this module's finite retry horizon follows the pending queue's budget. Processing requests
+/// are excluded from expiry (`FSP_IOQ_PROCESS_NO_CANCEL`); this is not a deadline for every I/O on the volume.
 pub const REQUEST_TIMEOUT_MS: u32 = 300_000;
 /// Format: nanoseconds in a millisecond.
 const NANOS_PER_MILLI: u64 = 1_000_000;
@@ -158,7 +158,8 @@ impl PurgeRetries {
 /// Whether a taken purge `taken` covers the owed purge `owed`: the same path, and a range holding the owed one, so its
 /// write purged the owed range too.
 fn covers(taken: &Purge, owed: &Purge) -> bool {
-  taken.path == owed.path
+  taken.object == owed.object
+    && taken.path == owed.path
     && taken.offset <= owed.offset
     && owed.offset.saturating_add(owed.len) <= taken.offset.saturating_add(taken.len)
 }
@@ -179,6 +180,7 @@ mod tests {
 
   fn purge(path: &str, offset: u64, len: u64) -> Purge {
     Purge {
+      object: slates_bridge_core::ObjectId::new(1, 1),
       path: path.to_owned(),
       offset,
       len,

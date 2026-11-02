@@ -53,6 +53,71 @@ use slates_vfs::recover::{
 };
 use slates_vfs::volume::{Store, Volume, VolumeConfig};
 
+/// A-198/A-152/A-154. Do: publish two opens of an unlinked file, recover a held ledger with only one live context,
+/// reconcile, then close it. Expect: the survivor reads its bytes, and its final release reclaims the orphan; a stale
+/// generation cannot change counts. A ledger with an extra context restores that reference before either release.
+#[test]
+fn a_held_open_ledger_reconciles_the_images_open_count_without_consuming_a_sibling() {
+  for recorded in [1, 2] {
+    reconcile_held_open_count(recorded);
+  }
+}
+
+fn reconcile_held_open_count(recorded: u32) {
+  use slates_vfs::ids::RefOwner;
+  let mut src = store();
+  let mut vol = volume(&mut src, 1 << 30);
+  let root = vol.root_inode(&src).unwrap();
+  let file = vol.create_file_no(&mut src, root, "held", 0o644).unwrap();
+  vol.write(&mut src, file, 0, b"kept").unwrap();
+  // Format: the bridge's generation before generation-tracked inode reuse (§4.6).
+  let generation = 0_u64;
+  let owner = RefOwner::Attachment(42);
+  for _ in 0..recorded {
+    vol.reference_for(&src, file, owner).unwrap();
+    vol.open_for(file, owner);
+  }
+  vol.unlink_no(&mut src, root, "held").unwrap();
+  let image = vol.to_image(&src, None).unwrap();
+  let mut fresh = common::surviving(&src);
+  let claims = common::claims(&mut fresh, &[&image]);
+  let mut recovered = Volume::from_image(
+    &mut fresh,
+    &image,
+    &claims,
+    Box::new(StepClock::new(0, 1)),
+    1 << 16,
+    None,
+  )
+  .unwrap();
+  assert_eq!(
+    recovered.reconcile_restored_opens(
+      &mut fresh,
+      file,
+      owner,
+      Some((generation.wrapping_add(1), 1))
+    ),
+    Err(VfsError::StaleHandle)
+  );
+  let wanted = if recorded == 1 { 2 } else { 1 };
+  assert!(
+    recovered
+      .reconcile_restored_opens(&mut fresh, file, owner, Some((generation, wanted)))
+      .unwrap()
+  );
+  for _ in 0..wanted {
+    let mut bytes = [0; 4];
+    assert_eq!(recovered.read(&fresh, file, 0, &mut bytes).unwrap(), 4);
+    assert_eq!(&bytes, b"kept");
+    assert!(
+      recovered
+        .release_restored_open(&mut fresh, file, owner)
+        .unwrap()
+    );
+  }
+  assert_eq!(recovered.stat(&fresh, file), Err(VfsError::NotFound));
+}
+
 /// Shape: a content object comfortably larger than the built fixture's image (a 256 KiB file plus
 /// its metadata), so the frame fits with room to spare.
 const CONTENT_LEN: usize = 4 * 1024 * 1024;
