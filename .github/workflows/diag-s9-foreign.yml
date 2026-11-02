@@ -1,0 +1,85 @@
+name: DIAG renamed WinFsp view (Step 9.4)
+on:
+  push:
+    branches: ['diag-s9-rename-red-*']
+jobs:
+  takeover:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-latest, windows-11-arm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - uses: ilammy/setup-nasm@v1.5.2
+        if: runner.arch == 'X64'
+      - name: clang-cl on arm64
+        if: runner.arch == 'ARM64'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Install WinFsp as in the native Windows lane
+        shell: pwsh
+        run: |
+          choco install winfsp -y --no-progress
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Native lint and pure bridge tests
+        shell: bash
+        env:
+          AWS_LC_SYS_PREBUILT_NASM: '0'
+        run: |
+          cargo clippy -p slates-ipc -p slates-anchor -p slates-bridge-winfsp -p slates-server --all-targets -- -D warnings && cargo clippy -p slates-cli --test winfsp -- -D warnings && cargo test -p slates-bridge-winfsp --lib
+      - name: A read taken by the dead daemon finishes after takeover
+        shell: bash
+        env:
+          WINFSP_TEST_MOUNT: '1'
+          AWS_LC_SYS_PREBUILT_NASM: '0'
+        run: |
+          cargo test -p slates-bridge-winfsp --lib host::tests::a_read_taken_before_the_kill_is_settled_after_takeover -- --exact --nocapture --test-threads=1
+      - name: The original drive and contexts survive twenty killed daemons
+        shell: bash
+        env:
+          SLATES_TEST_CLI: '1'
+          WINFSP_TEST_MOUNT: '1'
+          AWS_LC_SYS_PREBUILT_NASM: '0'
+        run: |
+          set +e
+          cargo test -p slates-cli --test winfsp -- --nocapture --test-threads=1 --skip a_winfsp_view_of_a_renamed_file_follows_its_successor > takeover.log 2>&1
+          result=$?
+          cat takeover.log
+          test "$result" -eq 0 && grep -q 'completed 20/20, drives lost 0' takeover.log && test "$(grep -c 'WINFSP FOREIGN: process .* refused rights' takeover.log)" -eq 6 && grep -q 'during false' takeover.log && grep -q '7 passed; 0 failed' takeover.log
+      - name: The old cached name must follow a renamed file after takeover
+        shell: bash
+        env:
+          SLATES_TEST_CLI: '1'
+          WINFSP_TEST_MOUNT: '1'
+          AWS_LC_SYS_PREBUILT_NASM: '0'
+        run: |
+          set +e
+          cargo test -p slates-cli --test winfsp a_winfsp_view_of_a_renamed_file_follows_its_successor -- --exact --nocapture --test-threads=1 > renamed.log 2>&1
+          result=$?
+          cat renamed.log
+          test "$result" -ne 0 && grep -q 'the pre-takeover view kept bytes from its old pathname' renamed.log && grep -q '1 failed' renamed.log
+      - name: Anchor regression and Windows documentation
+        shell: bash
+        env:
+          AWS_LC_SYS_PREBUILT_NASM: '0'
+          RUSTDOCFLAGS: '-D warnings -A rustdoc::private_intra_doc_links'
+        run: |
+          cargo test -p slates-anchor -- --nocapture --test-threads=1 && cargo doc -p slates-anchor -p slates-bridge-winfsp -p slates-server --no-deps --document-private-items
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: takeover-${{ matrix.runner }}
+          path: |
+            takeover.log
+            renamed.log

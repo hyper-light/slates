@@ -68,6 +68,7 @@ use slates_mem::slab::Slab;
 use slates_rt::futures;
 use slates_vfs::clock::Clock;
 use slates_vfs::host::HostFs;
+use slates_vfs::ids::{InodeNo, RefOwner};
 
 use crate::state::{self, ShardState};
 
@@ -115,6 +116,8 @@ const PURGE_RETRIES: &str = "winfsp.purge_retries";
 const PURGE_ECHOES: &str = "winfsp.purge_echoes";
 /// Format: successful reads through an open the predecessor recorded. The takeover oracle requires it to move.
 const RESTORED_READS: &str = "winfsp.restored_reads";
+/// Format: kernel requests settled from the retained receive journal before taking a new batch (A-198).
+const CAPTURED_SETTLED: &str = "winfsp.captured_requests_settled";
 
 /// A mounted volume being served: the channel WinFsp's dispatcher threads send on, the mount's thread, the open-handle
 /// map that persists across requests, the registry attachment its requests are admitted under, what Windows holds
@@ -125,6 +128,8 @@ pub(crate) struct WinFspMount {
   ledger: Ledger<SharedObject>,
   seeds: VecDeque<(u64, Open)>,
   takeover: bool,
+  owner: RefOwner,
+  reconcile: Option<RestoredOpenCounts>,
   thread: MountThread,
   handles: Slab<u64>,
   registry: AttachmentId,
@@ -151,6 +156,13 @@ pub(crate) struct WinFspMount {
   /// A purge-only command is out at the mount thread: no round or other purge is sent until its outcome is read, so one
   /// command is out at a time.
   purge_out: bool,
+}
+
+/// The bounded held-ledger/image merge, one inode per owner turn. The held map has at most MAX_OPEN_HANDLES entries.
+struct RestoredOpenCounts {
+  held: BTreeMap<u64, (u64, u32)>,
+  after: Option<u64>,
+  changed: bool,
 }
 
 impl std::fmt::Debug for WinFspMount {
@@ -284,7 +296,9 @@ async fn await_mounted(
   loop {
     match thread.outcome() {
       Some(Outcome::Mounted(Ok(ready))) => return Ok((thread, *ready)),
-      Some(Outcome::Mounted(Err(error))) => return Err((error.to_string(), Some(thread))),
+      Some(Outcome::Mounted(Err(error)) | Outcome::Failed(error)) => {
+        return Err((error.to_string(), Some(thread)));
+      }
       Some(Outcome::Stopped) => {
         return Err((
           "the mount thread ended before mounting".to_owned(),
@@ -292,7 +306,9 @@ async fn await_mounted(
         ));
       }
       // No command (a round or a purge) is sent before the mount is up, so none can come back.
-      Some(Outcome::Notified(..) | Outcome::Purged(_)) | None => futures::idle().await,
+      Some(Outcome::Notified(..) | Outcome::Purged(_) | Outcome::Recovered(_)) | None => {
+        futures::idle().await
+      }
     }
   }
 }
@@ -441,6 +457,12 @@ fn keep(
       ledger: ready.ledger,
       seeds,
       takeover,
+      owner: RefOwner::Attachment(record.id),
+      reconcile: takeover.then_some(RestoredOpenCounts {
+        held: ready.open_counts,
+        after: None,
+        changed: false,
+      }),
       thread,
       handles: new_handle_store(),
       registry,
@@ -713,7 +735,12 @@ async fn reap(mut thread: MountThread, attachment: u64) {
         thread.join();
         return;
       }
-      Some(Outcome::Mounted(_) | Outcome::Notified(..) | Outcome::Purged(_)) => {}
+      Some(
+        Outcome::Mounted(_) | Outcome::Notified(..) | Outcome::Purged(_) | Outcome::Recovered(_),
+      ) => {}
+      Some(Outcome::Failed(error)) => {
+        eprintln!("slates-server: ending WinFsp receive worker: {error}")
+      }
       None => futures::idle().await,
     }
   }
@@ -743,6 +770,9 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
   let Some(&handle) = s.by_id.get(&mount.volume) else {
     return Turned::Ended;
   };
+  if let Some(turned) = reconcile_opens(s, mount) {
+    return turned;
+  }
   if let Some((context, open)) = mount.seeds.pop_front() {
     let store = &s.store;
     if let Ok(slot) = s.volumes.get(handle)
@@ -852,6 +882,62 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
   }
 }
 
+/// Settles the image's open-reference counts before taking a captured cleanup/close or any fresh operation. A missing
+/// unhanded context is retired in the ledger off-shard first, so this never consumes another context's restored open.
+fn reconcile_opens(s: &mut ShardState, mount: &mut WinFspMount) -> Option<Turned> {
+  let mut counts = mount.reconcile.take()?;
+  let result = s
+    .by_id
+    .get(&mount.volume)
+    .copied()
+    .and_then(|handle| s.volumes.get_mut(handle).ok())
+    .map_or(Err(slates_vfs::VfsError::StaleHandle), |slot| {
+      reconcile_one(&mut slot.volume, &mut s.store, mount.owner, &mut counts)
+    });
+  match result {
+    Ok(false) => {
+      mount.reconcile = Some(counts);
+      Some(Turned::Served)
+    }
+    Ok(true) => {
+      if counts.changed
+        && !crate::verbs::publish_shard(s).is_ok_and(|published| published.captured(mount.volume))
+      {
+        s.count(BARRIER_REFUSED, 1);
+        mount.ending = true;
+        return Some(Turned::Ended);
+      }
+      Some(Turned::Served)
+    }
+    Err(error) => {
+      eprintln!("slates-server: WinFsp open-reference recovery refused: {error}");
+      mount.ending = true;
+      Some(Turned::Ended)
+    }
+  }
+}
+
+fn reconcile_one(
+  volume: &mut slates_vfs::volume::Volume,
+  store: &mut slates_vfs::volume::Store,
+  owner: RefOwner,
+  counts: &mut RestoredOpenCounts,
+) -> Result<bool, slates_vfs::VfsError> {
+  let restored = volume
+    .next_restored_open(owner, counts.after)
+    .map(|(inode, _)| inode);
+  let held = counts.held.first_key_value().map(|(inode, _)| *inode);
+  let inode = match (restored, held) {
+    (None, None) => return Ok(true),
+    (Some(inode), None) | (None, Some(inode)) => inode,
+    (Some(restored), Some(held)) => restored.min(held),
+  };
+  let wanted = counts.held.remove(&inode);
+  counts.changed |= volume.reconcile_restored_opens(store, InodeNo(inode), owner, wanted)?;
+  counts.after = Some(inode);
+  Ok(false)
+}
+
 /// Reads what the mount thread reported since the last turn: a round taken, deferred or refused (the latter two put the
 /// cursor back, so the round is gathered again). `Ok(true)` when a rename deferred it; `Err` when the mount is gone.
 fn take_outcomes(s: &mut ShardState, mount: &mut WinFspMount) -> Result<bool, ()> {
@@ -884,6 +970,12 @@ fn take_outcomes(s: &mut ShardState, mount: &mut WinFspMount) -> Result<bool, ()
         record_purges(s, &mut mount.retries, &purged);
       }
       Outcome::Mounted(_) => {}
+      Outcome::Recovered(count) => s.count(CAPTURED_SETTLED, count),
+      Outcome::Failed(error) => {
+        eprintln!("slates-server: WinFsp receive worker failed: {error}");
+        mount.ending = true;
+        s.count(MOUNT_LOST, 1);
+      }
       Outcome::Stopped => {
         s.count(MOUNT_LOST, 1);
         return Err(());
@@ -1131,6 +1223,10 @@ pub(crate) fn end_all(s: &mut ShardState) {
     .into_iter()
     .filter_map(|attachment| ended(s, attachment))
     .collect();
+  // Start every cancellation before joining any receiver, so the finite control waits overlap across mounts.
+  for thread in &mut threads {
+    thread.stop();
+  }
   for thread in &mut threads {
     thread.join();
   }
@@ -1140,9 +1236,14 @@ pub(crate) fn end_all(s: &mut ShardState) {
 /// start's recovery.
 pub(crate) fn drop_all(s: &mut ShardState) {
   let mounts = std::mem::take(&mut s.winfsp_mounts);
+  let mut threads = Vec::with_capacity(mounts.len());
   for (_, mut mount) in mounts {
     mount.requests = None;
-    mount.thread.join();
+    mount.thread.stop();
+    threads.push(mount.thread);
+  }
+  for thread in &mut threads {
+    thread.join();
   }
 }
 
