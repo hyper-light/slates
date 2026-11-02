@@ -14562,6 +14562,13 @@ dispatch; `shards.rs` the end handoff shared), `crates/client` (`attach_vhost_us
   the fix (0.28 s) and passes after (0.27 s); the DAX in-flight/restart test passes (0.64 s), all 24 server cases pass,
   and all eight real QEMU guest histories pass (28.23 s), adacachy, 2026-11-02. Evidence: QEMU's vhost-user protocol,
   Ring states / Suspended device state / GET_VRING_BASE, and `hw/virtio/vhost.c::do_vhost_dev_stop`.
+- **Live-fixture inheritance corrected 2026-11-02.** The ring fix exposed the live QEMU harness clearing CLOEXEC
+  in its parent: sibling VMs inherited each other's frontend sockets, hiding peer close. It now changes that flag
+  only in the intended child's pre_exec. A two-child real-exec EOF test fails first (20.04 s), then passes (0.00 s);
+  the live mount/device-end case and fsx/fsstress case pass concurrently (6.74 s, adacachy). Applied together to
+  `crates/server/tests/virtiofs.rs`, GAPS and
+  `docs/bugs/2026-11-02-a-live-vm-test-exported-its-socket-to-sibling-vms.md`. Device and guest-exit assertions are
+  unchanged; no serial execution masks the lifetime rule.
 - **DAX.** The window's size is the request's; the device offers per-inode DAX while the shard's fill budget has room,
   and the admission's DAX gate is open for this binding, whose windows map per-file backings (A-168). The in-process
   binding's gate stays closed.

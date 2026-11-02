@@ -11683,6 +11683,12 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
     28.23 s in the existing image on adacachy. No exit or byte assertion is weakened. Records:
     `docs/bugs/2026-11-02-a-vmm-exit-hid-its-final-diagnostic.md` and
     `docs/bugs/2026-11-02-stopping-one-vhost-ring-closed-the-control-connection.md`.
+    The next main run, 41535967224, exposed its live fixture clearing CLOEXEC in the parent, so a sibling VM held
+    another's socket after its poweroff (device-end wait timed out). The shared spawn now clears it only in the
+    intended child: a real two-child EOF oracle fails first (20.04 s) and passes after (0.00 s); the live mount and
+    fsx/fsstress guests pass together (6.74 s). Record:
+    `docs/bugs/2026-11-02-a-live-vm-test-exported-its-socket-to-sibling-vms.md`. Unmeasured siblings: the fleet CLI
+    fixture's `inheritable` and `EnrolledFleet::start_anchor` also clear CLOEXEC in the parent (`crates/cli/tests/cli.rs`).
   - **Red-checked:** the same QEMU with the device offered no window, all 5 refused at the guest's `dax=always` mount
     (job 123456467863).
   - **QEMU's mount route by the image form, proven on x86_64** (diagnostics run 40883925064): `guest_image.rs` 4 of 4

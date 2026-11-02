@@ -82,6 +82,11 @@ and statically linked probe. The owned systemd unit and disposable container bot
 the unit plus build takes 98.80 s and removes its container on every terminal path. Log:
 `~/.cache/slates-s9-qemu-stop-fix.log`.
 
+Main CI 41535967224 then passed the two-stop and in-flight/restart cases but exposed a live-fixture socket leak:
+a sibling QEMU inherited the first VM's frontend because its CLOEXEC flag was cleared in the parent. The guest
+powered off, but its backend correctly waited for that remaining peer. The separate failing real-exec test and fix
+are recorded in `2026-11-02-a-live-vm-test-exported-its-socket-to-sibling-vms.md`; the device-end assertion stays intact.
+
 Sibling sweep: the module header and previous socket test encoded the same wrong device-wide stop rule; both are
 corrected. The old §6 credit paragraph assumed every reply completed before taking another; A-196 had already
 replaced that assumption, and the paragraph now records the held-reply path and its queue-derived bound. A newly

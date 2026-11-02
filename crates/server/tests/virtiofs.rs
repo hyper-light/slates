@@ -2376,8 +2376,6 @@ fn run_qemu_with(
   sample: &mut dyn FnMut(&[GuestMapping]),
 ) -> String {
   use std::os::fd::AsRawFd;
-  // The child inherits the descriptor at its own number (QEMU's `fd=` option names it).
-  rustix::io::fcntl_setfd(socket, rustix::io::FdFlags::empty()).unwrap();
   let chardev = format!("socket,id=vfs,fd={}", socket.as_raw_fd());
   let machine = GuestMachine::of_this_host();
   let append = format!(
@@ -2401,7 +2399,7 @@ fn run_qemu_with(
       "local,path=/,mount_tag=hostroot,security_model=none,readonly=on",
     ]);
   }
-  let mut child = command
+  command
     .args([
       "-machine",
       machine.machine,
@@ -2429,9 +2427,8 @@ fn run_qemu_with(
       "vhost-user-fs-pci,chardev=vfs,tag=slates",
     ])
     .stdout(std::process::Stdio::piped())
-    .stderr(std::process::Stdio::piped())
-    .spawn()
-    .unwrap();
+    .stderr(std::process::Stdio::piped());
+  let mut child = spawn_vm_command(command, socket);
   let started = Instant::now();
   let mut timed_out = false;
   while child.try_wait().unwrap().is_none() {
@@ -2455,6 +2452,152 @@ fn run_qemu_with(
     format!("(the guest did not power off within {bound:?})\n{console}")
   } else {
     console
+  }
+}
+
+/// Starts the VM with its socket inherited at its existing number, the number in QEMU's `fd=` argument.
+#[cfg(target_os = "linux")]
+fn spawn_vm_command(
+  mut command: std::process::Command,
+  socket: &std::os::fd::OwnedFd,
+) -> std::process::Child {
+  use std::os::fd::{AsRawFd, BorrowedFd};
+  use std::os::unix::process::CommandExt;
+
+  let raw = socket.as_raw_fd();
+  // SAFETY: `socket` stays owned and borrowed until spawn returns; the command is consumed here. Only the child
+  // clears CLOEXEC, using the async-signal-safe fcntl syscall and an allocation-free errno conversion after fork.
+  unsafe {
+    command.pre_exec(move || {
+      let socket = BorrowedFd::borrow_raw(raw);
+      rustix::io::fcntl_setfd(socket, rustix::io::FdFlags::empty()).map_err(std::io::Error::from)
+    });
+  }
+  command.spawn().unwrap()
+}
+
+/// A-169 / AC-4.12: real execs prove each VM inherits its own socket without keeping a sibling's volume attached.
+#[cfg(target_os = "linux")]
+mod vm_descriptor {
+  use std::io::Write;
+  use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+  use std::process::{Child, Command, Stdio};
+
+  use super::*;
+
+  /// Format: the child identifies its inherited socket through this role-only environment key.
+  const SOCKET_ENV: &str = "SLATES_TEST_VM_SOCKET";
+  /// Format: the child's single readiness byte proves exec completed and the intended descriptor survived.
+  const READY: u8 = b'R';
+
+  /// Owns the role until it exits or is killed and reaped, including an assertion's unwind.
+  struct Role(Child);
+
+  impl Drop for Role {
+    fn drop(&mut self) {
+      if self.0.try_wait().unwrap().is_none() {
+        self.0.kill().expect("kill the owned socket fixture");
+      }
+      self.0.wait().expect("reap the owned socket fixture");
+    }
+  }
+
+  impl Role {
+    fn finish(&mut self) {
+      self.0.stdin.as_mut().unwrap().write_all(b"quit\n").unwrap();
+      let started = Instant::now();
+      loop {
+        if let Some(status) = self.0.try_wait().unwrap() {
+          assert!(status.success(), "{status}");
+          break;
+        }
+        assert!(
+          started.elapsed() < common::guest::WAIT,
+          "the role did not exit"
+        );
+        std::thread::yield_now();
+      }
+    }
+  }
+
+  fn pair() -> (OwnedFd, OwnedFd) {
+    rustix::net::socketpair(
+      rustix::net::AddressFamily::UNIX,
+      rustix::net::SocketType::STREAM,
+      rustix::net::SocketFlags::CLOEXEC,
+      None,
+    )
+    .unwrap()
+  }
+
+  fn start(socket: &OwnedFd) -> Role {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+      .args([
+        "--ignored",
+        "--exact",
+        "vm_descriptor::socket_role",
+        "--nocapture",
+      ])
+      .env(SOCKET_ENV, socket.as_raw_fd().to_string())
+      .stdin(Stdio::piped())
+      .stdout(Stdio::null())
+      .stderr(Stdio::inherit());
+    Role(spawn_vm_command(command, socket))
+  }
+
+  /// A byte from the socket within the existing guest-test bound, or EOF while its peer belongs to no child.
+  fn next(socket: &OwnedFd) -> Option<u8> {
+    let mut fds = [rustix::event::PollFd::new(
+      socket,
+      rustix::event::PollFlags::IN,
+    )];
+    let bound = rustix::event::Timespec {
+      tv_sec: i64::try_from(common::guest::WAIT.as_secs()).unwrap(),
+      tv_nsec: 0,
+    };
+    assert_eq!(
+      rustix::event::poll(&mut fds, Some(&bound)).unwrap(),
+      1,
+      "the owning VM exited but a sibling kept its socket open"
+    );
+    let mut byte = [0u8; 1];
+    (rustix::io::read(socket, &mut byte).unwrap() != 0).then_some(byte[0])
+  }
+
+  /// A-169: start two VMs while the parent still holds both socket capabilities, then close the first VM and its
+  /// parent end. Expect EOF on that backend while the second VM still runs, and its own socket remains usable.
+  #[test]
+  fn a_vm_exiting_closes_its_socket_while_a_sibling_vm_keeps_running() {
+    let (first_backend, first_frontend) = pair();
+    let mut first = start(&first_frontend);
+    assert_eq!(next(&first_backend), Some(READY));
+    let (second_backend, second_frontend) = pair();
+    let mut second = start(&second_frontend);
+    assert_eq!(next(&second_backend), Some(READY));
+    drop(first_frontend);
+    first.finish();
+    assert_eq!(
+      next(&first_backend),
+      None,
+      "only the first VM owned its socket"
+    );
+    second.finish();
+    drop(second_frontend);
+    assert_eq!(next(&second_backend), None);
+  }
+
+  /// A-169: the parent's owned child. Its readiness travels on the inherited capability, not libtest's stdout banner.
+  #[test]
+  #[ignore]
+  fn socket_role() {
+    let raw = std::env::var(SOCKET_ENV).unwrap().parse().unwrap();
+    // SAFETY: the parent keeps this role's socket open across spawn and hands exactly this descriptor through exec.
+    let socket = unsafe { BorrowedFd::borrow_raw(raw) };
+    rustix::io::write(socket, &[READY]).unwrap();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).unwrap();
+    assert_eq!(line, "quit\n");
   }
 }
 
