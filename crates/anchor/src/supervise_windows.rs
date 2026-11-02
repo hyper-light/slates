@@ -80,6 +80,7 @@ pub(super) fn spawn(
     inherited: &handles,
     output: StandardOutput::Inherited,
     job: Some(job),
+    process_security: None,
   })?;
   Ok(Child { process })
 }
