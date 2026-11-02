@@ -73,6 +73,7 @@ pub(super) fn spawn(
     .collect();
   let env = environment_block(&env);
   let handles = handoff.map_or_else(Vec::new, Handoff::handles);
+  let process_security = slates_ipc::process_access::ProcessSecurity::handle_owner()?;
   let process = slates_ipc::win_spawn::spawn(&Spawn {
     program: OsStr::new(program),
     args: &args,
@@ -80,6 +81,7 @@ pub(super) fn spawn(
     inherited: &handles,
     output: StandardOutput::Inherited,
     job: Some(job),
+    process_security: Some(&process_security),
   })?;
   Ok(Child { process })
 }
