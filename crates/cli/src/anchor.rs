@@ -244,6 +244,10 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
       config.held_copy_bound(),
     )
     .map_err(|e| failed("hold channel", e))?;
+  #[cfg(windows)]
+  supervisor
+    .hold_handles(config.held_device_bound())
+    .map_err(|error| failed("hold channel", error))?;
   // The anchor holds a duplicate of every device and connection it is sent, so it needs the descriptors its bounds
   // name: raise its soft limit to the hard one, as the daemon does (no privilege needed).
   if let Some((was, now)) = slates_server::daemon::raise_descriptor_limit() {

@@ -472,9 +472,9 @@ impl DaemonConfig {
       .saturating_mul(usize::from(self.geometry.partitions.max(1)))
   }
 
-  /// Derived: the FUSE devices an anchor may hold for this daemon across a restart (A-61): one per live
+  /// Derived: the FUSE devices (A-61) or Windows mount holds (A-198) an anchor may keep across a restart: one per live
   /// attachment the daemon's shards can hold, `shards × slates_bridge_core::authority::MAX_ATTACHMENTS`, since a
-  /// FUSE mount is an attachment on its volume's owner shard.
+  /// mount is an attachment on its volume's owner shard.
   pub fn held_device_bound(&self) -> usize {
     usize::from(self.runtime.shards).saturating_mul(slates_bridge_core::authority::MAX_ATTACHMENTS)
   }

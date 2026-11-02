@@ -738,9 +738,17 @@ missing, or impossible with its source, and the order of work. Two gaps underlay
      builds with `FspFileSystemCreate` and points at the held handle. Each open's context becomes a ledger slot naming
      its file, so a request on an open from before the takeover still finds it. The successor answers the requests the
      dead daemon had taken from the ledger's in-flight slots, before its dispatcher starts. A process that is not the
-     anchor's child is refused the right to duplicate the held handles. Owed: the hold on Windows (Step 9.2), the held
-     mount and its 20-kill test on CI's x86_64 and arm64 runners (9.3), and the in-flight and second-daemon tests
+     anchor's child is to be refused the right to duplicate the held handles. **The hold transport is built and proven
+     (2026-11-02, Step 9.2):** three process tests pass on jupiter and in three runs per CI architecture, with native
+     clippy, docs and full anchor/IPC regressions green (run 41399665112). A child publishes only after the anchor's
+     acknowledgement; its successor uses the inherited live object; an unrelated inheritable object is excluded.
+     Discarding the duplicate makes the same oracle fail on both runners (41399840638). The Windows CLI opens this
+     hold before its first daemon; messages and handoffs are bounded and checksum-checked.
+     Owed: the WinFsp hold/takeover wiring and 20-kill test on CI's x86_64 and arm64 runners (9.3), and the in-flight and second-daemon tests
      (9.4). The NFS listener and the fleet's sockets stay open under this entry.
+     Source verification (2026-11-02) is in `research/winfsp-takeover.md`: the hold requires the anchor's acknowledgement
+     after duplication, and the live tests must still validate held-volume substitution, torn ledger publication,
+     hint reuse and cleanup replay. The source review does not close this gap.
 
 **Closed 2026-10-26 by A-183:** the MCP HTTP edge on Windows, and the Windows datagram socket's inheritance and
 exclusive address (A-182's sibling). Its first Windows run found that a refusal closed at once was erased by the reset

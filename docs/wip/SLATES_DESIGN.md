@@ -2873,6 +2873,12 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 > code before the fix kept 1 of 100 views stale, the fix kept 0 of 100 (diagnostics runs 41336524903 and 41346376630;
 > before, 41346373137).
 
+> **Status (2026-11-02, A-198, Step 9.2: Windows handle holding).** The anchor's Windows hold channel and explicit
+> successor inheritance are built. A hold is acknowledged after duplication into the anchor, before the child publishes
+> its record. Three real-process tests pass on jupiter and on both CI architectures, three runs each there (run
+> 41399665112); discarding the acknowledged duplicate makes the same oracle fail on both (run 41399840638).
+> Wiring WinFsp's volume, drive link and ledger into this hold and measuring twenty kills remain Steps 9.3 and 9.4.
+
 **Base reads on macOS and Windows.** As on Linux, the daemon reads untouched base files through its own descriptor or
 handle into evictable cache chunks (one copy, `pread`/`ReadFile` on the owner shard's driver) and
 replies from arena pages as for any chunk. Listings use `getattrlistbulk` and
@@ -12781,14 +12787,42 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
 ### A-198 — A WinFsp mount outlives its daemon: the anchor holds the volume's control handle, the drive's link and the mount's ledger, and the next daemon serves the held volume (accepted 2026-11-01, Step 9 of the VFS and DAX plan; designed, being built)
 Applied in the same change to: GAPS (gap 2 of the platform inventory). The build applies it to §4.6 "Windows",
 `docs/wip/platforms.md`, `crates/anchor`, `crates/server` and `crates/bridge-winfsp`, each in its own change.
+Source checks and remaining proof obligations are recorded in `docs/wip/research/winfsp-takeover.md` (2026-11-02).
+This is a source-derived design; the held-volume substitution and crash boundaries still require the live tests below.
+- **Hold transport built and proven (2026-11-02, Step 9.2).** `crates/anchor/src/handles.rs` defines the bounded,
+  CRC32C-checked channel messages and inherited-handle handoff; aliases of a handle or entry id are refused before
+  adoption. `held_windows.rs` implements the message-mode pipe and duplication; `supervise_windows.rs` integrates it
+  with the shared supervisor. A successor receives a fresh channel and explicitly listed inheritable duplicates,
+  while a pending acknowledgement remains bounded to one. The child joins the anchor's kill-on-close job at creation.
+  - `tests/handles_windows.rs` drives a held event across a sender's death, an excluded inheritable event, the
+    no-hold lifetime contrast, and the real supervisor: the child publishes its record only after acknowledgement,
+    and the successor uses the same live event and reads that record. Each child has a distinct successful exit code
+    so libtest selecting zero tests cannot pass the fixture; the parent owns and reaps each process.
+  - `cargo +1.98.1 test -p slates-anchor --test handles_windows -- --nocapture --test-threads=1`: three passed on
+    jupiter. On CI, three passed in each of three runs on x86_64 and arm64, with native clippy, documentation and the
+    full anchor/IPC regression suites green (run 41399665112). A separate diagnostic tree discards the duplicates
+    instead of holding them: the unchanged positive oracle fails on both architectures, `left: 0, right: 1`
+    (run 41399840638). The diagnostic mutation is absent from the implementation.
+  - The initial fixture selected `sender` where libtest required `sender_role`; the failure and sibling sweep are in
+    `docs/bugs/2026-11-02-a-windows-hold-test-ran-no-child-test.md`. Integrity and aliasing tests failed against the
+    unchecked draft before the channel checks were added.
+  - **Applied in the same change to:** §4.6's status, GAPS gap 2, the source record, `crates/anchor` (formats,
+    transport, Windows spawn, supervision and process tests), `crates/ipc` (shared environment builder, explicit
+    spawn API, cross-process duplication, process polling and message-mode pipe pair), `crates/cli` (open the Windows
+    hold before the first spawn), CI's Windows test steps, and `unsafe-budget.toml` (anchor 6 → 10, IPC 105 → 109;
+    the old six-site job-assignment implementation is replaced by IPC's existing creation-time job attribute).
+  - The live WinFsp attachment still needs the hold and takeover wiring. This transport result closes no live-mount,
+    in-flight-request or second-daemon criterion of Steps 9.3 and 9.4.
 - **What it answers.** A WinFsp mount dies with its daemon (A-177: "the file system is the dead process's own, so
   recovery ends its record"), where a FUSE mount is held by the anchor (A-61). WinFsp deletes a volume at the cleanup
   of its control file object, that is when the last handle to it closes (`src/sys/volume.c`, `FspVolumeDeleteNoLock`,
   which asserts `IRP_MJ_CLEANUP`), and the daemon held the only handle. The drive letter goes the same way:
   `FspMountSet_Drive` (`src/dll/mount.c`) makes the `\??\X:` link a temporary object and keeps its handle, so the link
   dies with its last handle. WinFsp v2.1, the source read on 2026-11-01.
-- **What the anchor holds.** Per WinFsp mount, three handles, which the daemon duplicates into the anchor before the
-  attachment record commits (as a FUSE device is sent before its record):
+- **What the anchor holds.** Per WinFsp mount, three handles. The daemon sends their values on the hold channel; the
+  anchor duplicates them out of its live child and acknowledges the hold before the attachment record commits.
+  Windows does not attach handles to a channel message as Unix's `SCM_RIGHTS` does, so sending the values alone is not
+  enough. The three handles are:
   1. the volume's control handle, which keeps the volume;
   2. the drive link's handle, which keeps the drive letter;
   3. the mount's ledger: an unnamed section backed by the paging file (nothing on disk, R1) that the daemon writes as it
@@ -12840,6 +12874,8 @@ Applied in the same change to: GAPS (gap 2 of the platform inventory). The build
     `STATUS_CANCELLED`, the status WinFsp's own timeout gives.
   - A slot whose request was answered already names a hint no request in processing holds, and WinFsp skips it
     (`FspVolumeFastTransact`, "BOGUS").
+    The implementation must also account for a hint's address being reused; the missing-hint behavior alone does not
+    establish that replaying an arbitrary saved response is safe. Cleanup and close must settle their effects once.
   - The gap left is a request taken but not yet at the guard: the DLL's few instructions after the transact returns.
     The timeout refuses it.
 - **Coherence at takeover.** The successor must tell Windows of changes the dead daemon never told it of. Its first
@@ -12850,8 +12886,8 @@ Applied in the same change to: GAPS (gap 2 of the platform inventory). The build
   - A held handle passes only by inheritance, to the anchor's own next daemon.
   - Another process could take it only by duplicating it out of the anchor or the daemon, which needs
     `PROCESS_DUP_HANDLE` on that process. So each sets its own security to refuse that right to every other process of
-    the user, through an owner-rights entry as A-175's sections use. The anchor hands its child a process handle with
-    the one right the child needs to send its handles.
+    the user, through an owner-rights entry as A-175's sections use. The anchor's existing child-process handle lets it
+    duplicate out of that child; the child is given no process handle for duplicating into the anchor.
   - A second daemon on the instance is refused by the rendezvous's owner (A-176, A-178).
 - **Tests** (Step 9.2 to 9.4; the live mount runs on CI's Windows runners only, since jupiter has no WinFsp):
   - the hold across real processes on Windows: duplicated in, inherited by the next daemon only;
@@ -12948,7 +12984,7 @@ Hypervisor's and QEMU's socket-route cells), §4.6 (the DAX matrix's status) and
   - **What it does not hold.** A change neither published nor logged when the daemon died, which the write boundary had
     written into the copy, is in the copy and not in the successor's file; the next sync writes it back as the guest's
     own, the bytes the guest's map already showed. Linux alone: a macOS copy keeps a second descriptor the anchor does
-    not hold, and Windows' anchor holds no descriptors.
+    not hold, and Windows' anchor does not yet hold writable copies.
   - **Proven** (adacachy, 2026-11-01): `crates/cli/tests/pmem.rs`, `a_pmem_vmms_copy_survives_a_daemon_takeover_with_
     its_unsynced_store` — the daemon killed under the stand-in VMM's unsynced page, the launcher's resync after its
     departure wrote the page through the successor, a later SIGUSR1 synced through it, and an SDK write after the
