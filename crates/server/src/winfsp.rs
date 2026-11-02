@@ -284,7 +284,9 @@ async fn await_mounted(
   loop {
     match thread.outcome() {
       Some(Outcome::Mounted(Ok(ready))) => return Ok((thread, *ready)),
-      Some(Outcome::Mounted(Err(error))) => return Err((error.to_string(), Some(thread))),
+      Some(Outcome::Mounted(Err(error)) | Outcome::Failed(error)) => {
+        return Err((error.to_string(), Some(thread)));
+      }
       Some(Outcome::Stopped) => {
         return Err((
           "the mount thread ended before mounting".to_owned(),
@@ -714,6 +716,9 @@ async fn reap(mut thread: MountThread, attachment: u64) {
         return;
       }
       Some(Outcome::Mounted(_) | Outcome::Notified(..) | Outcome::Purged(_)) => {}
+      Some(Outcome::Failed(error)) => {
+        eprintln!("slates-server: ending WinFsp receive worker: {error}")
+      }
       None => futures::idle().await,
     }
   }
@@ -884,6 +889,11 @@ fn take_outcomes(s: &mut ShardState, mount: &mut WinFspMount) -> Result<bool, ()
         record_purges(s, &mut mount.retries, &purged);
       }
       Outcome::Mounted(_) => {}
+      Outcome::Failed(error) => {
+        eprintln!("slates-server: WinFsp receive worker failed: {error}");
+        mount.ending = true;
+        s.count(MOUNT_LOST, 1);
+      }
       Outcome::Stopped => {
         s.count(MOUNT_LOST, 1);
         return Err(());

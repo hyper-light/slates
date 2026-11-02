@@ -59,8 +59,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
 use crate::ffi::{
-  self, Api, Boolean, DirInfo, FileInfo, FileSystem, GUARD_STRATEGY_COARSE, Interface, Ntstatus,
-  PSecurityDescriptor, Pvoid, Pwstr, VolumeInfo, VolumeParams,
+  self, Api, Boolean, DirInfo, FileInfo, FileSystem, Interface, Ntstatus, PSecurityDescriptor,
+  Pvoid, Pwstr, VolumeInfo, VolumeParams,
 };
 use crate::held::{
   Record,
@@ -93,6 +93,8 @@ pub enum WinFspError {
   Record(crate::held::Refusal),
   /// A checked open-ledger allocation, read or write was refused.
   Ledger(crate::opens::Refusal),
+  /// The retained direct-output receive journal was malformed or could not be settled.
+  Capture(crate::inflight::Refusal),
   /// A Windows object operation refused, preserving its system error code.
   Os {
     /// The Windows object operation.
@@ -114,6 +116,7 @@ impl std::fmt::Display for WinFspError {
       Self::MountThread => write!(f, "the mount thread could not run"),
       Self::Record(reason) => write!(f, "the held mount record was refused: {reason:?}"),
       Self::Ledger(reason) => write!(f, "{reason}"),
+      Self::Capture(reason) => write!(f, "{reason}"),
       Self::Os { call, code } => write!(f, "{call} refused: {code:?}"),
     }
   }
@@ -147,16 +150,11 @@ const VOLUME_INFO_TIMEOUT_MS: u32 = 0;
 /// Format: `VolumeInfoTimeoutValid`, bit 0 of the version-1 flag word (`fsctl.h`): the volume-information timeout is
 /// set apart from `FileInfoTimeout`.
 const VOLUME_INFO_TIMEOUT_VALID: u32 = 1 << 0;
-/// Derived: the dispatcher threads WinFsp runs for the mount: two. The COARSE guard admits one callback at a time and
-/// the owner shard serves one request at a time, so a second thread only takes the next request from the kernel while
-/// the first waits for its reply; a third would wait at the guard.
-const DISPATCHER_THREADS: u32 = 2;
-/// Derived: the requests that can wait in the channel to the shard: one per dispatcher thread, since each blocks for
-/// its reply before taking another.
-pub const REQUEST_BOUND: usize = DISPATCHER_THREADS as usize;
+/// Shape: the one receiver waits for its current callback's answer before sending another request to the shard.
+pub const REQUEST_BOUND: usize = 1;
 /// Shape: the outcomes the mount thread can have unread at once: a command's (the task sends at most one command, a
 /// round or a purge, before reading its outcome) or the mount's, and the stop's after either.
-const OUTCOME_BOUND: usize = 2;
+const OUTCOME_BOUND: usize = 3;
 /// Shape: commands queued to the mount thread: one round out at a time.
 const COMMAND_BOUND: usize = 1;
 /// Format: the default permission bits a created file takes (`rw-r--r--`); the mount presents Windows
@@ -990,11 +988,7 @@ extern "C" fn open_trampoline(
 /// (`FspFileSystemOperationProcessIdF`, the requester's id from its access token). Where WinFsp cannot name it, no open is
 /// this process's, and the mount thread makes no purge (`Mounted::purge`).
 fn opened_by_this_process() -> bool {
-  ffi::api()
-    .ok()
-    .and_then(|api| api.operation_process_id)
-    // SAFETY: called on a dispatcher thread inside the open WinFsp is serving, where the operation context is set.
-    .is_some_and(|requester| unsafe { requester() } == std::process::id())
+  crate::dispatcher::opened_by_this_process()
 }
 
 extern "C" fn overwrite(
@@ -1369,6 +1363,7 @@ struct Mounted {
   mount_point: String,
   drive: Option<Drive>,
   record: Record,
+  worker: Option<crate::dispatcher::Worker>,
 }
 
 /// What a notification round came to (§4.6 "Windows").
@@ -1424,6 +1419,7 @@ impl Mounted {
     // WinFsp's default, named here because a purge Windows did not take is made again until this passes
     // (`crate::retry::REQUEST_TIMEOUT_MS`): the two are one number.
     params.irp_timeout = crate::retry::REQUEST_TIMEOUT_MS;
+    params.transact_timeout = crate::dispatcher::TRANSACT_TIMEOUT_MS;
     // A closed file's bytes are written back before its close's request (which publishes them) and its pages dropped:
     // a Windows program's write reaches every other path by its close, not at the cache manager's lazy write-back
     // seconds later. Without it, CI's first run (40249524066) read a file PowerShell had written and closed as 62 zero
@@ -1471,11 +1467,16 @@ impl Mounted {
         drive,
         read_only,
       },
+      worker: None,
     };
     // SAFETY: `file_system` is the DLL's live full object. Only its stable public prefix is accessed here.
     unsafe {
       (*file_system).user_context = handler.cast::<c_void>();
-      (api.set_guard_strategy)(file_system, GUARD_STRATEGY_COARSE);
+    }
+    // SAFETY: the DLL returned a live initialized public prefix. Refuse an unknown full-object layout before using
+    // its operation table; both supported 64-bit architectures have the header's 792-byte version.
+    if unsafe { (*file_system).version } != crate::dispatcher::FILE_SYSTEM_BYTES {
+      return Err(WinFspError::NotInstalled);
     }
     if let Some((record, volume, link)) = inherited {
       if record.drive_text().map_err(WinFspError::Record)? != mount_point
@@ -1496,16 +1497,6 @@ impl Mounted {
       mounted.record = record;
     } else {
       mounted.drive = Some(Drive::create(&mounted.record)?);
-    }
-    // SAFETY: `file_system` is live and mounted; start its dispatcher threads.
-    let status = unsafe { (api.start_dispatcher)(file_system, DISPATCHER_THREADS) };
-    if status != 0 {
-      // The drop below removes the mount point and deletes the object; stopping a dispatcher that never started is a
-      // no-op in WinFsp.
-      return Err(WinFspError::Api {
-        call: "FspFileSystemStartDispatcher",
-        status,
-      });
     }
     Ok(mounted)
   }
@@ -1575,15 +1566,8 @@ impl Mounted {
   /// (`crate::retry`). Nothing is purged where WinFsp cannot name an open's process, since the host could then not tell
   /// a purge's write from a program's.
   fn purge(&self, purges: &[Purge]) -> Purged {
-    let count = u64::try_from(purges.len()).unwrap_or(u64::MAX);
     if purges.is_empty() {
       return Purged::default();
-    }
-    if self.api.operation_process_id.is_none() {
-      return Purged {
-        unavailable: count,
-        ..Purged::default()
-      };
     }
     let piece = purge_piece();
     let piece_bytes = usize::try_from(piece).unwrap_or(0);
@@ -1808,10 +1792,13 @@ impl Drop for Mounted {
     // SAFETY: `file_system` is live; stop the dispatcher (its threads joined, so no callback runs after), unmount, and
     // delete it. A dispatcher thread waiting for the shard's reply returns once the channel's receiver is dropped,
     // which the mount's owner does before it stops the thread.
-    unsafe {
-      (self.api.stop_dispatcher)(self.file_system);
-      (self.api.delete)(self.file_system);
+    if let Some(mut worker) = self.worker.take() {
+      if let Err(error) = worker.join() {
+        eprintln!("slates-winfsp: join receive worker: {error}");
+      }
     }
+    // SAFETY: the only receive/operation worker has been joined, so no callback can reach the DLL object again.
+    unsafe { (self.api.delete)(self.file_system) };
     // No callback can run now, so reclaim the handler.
     // SAFETY: the handler was leaked in `new` and the dispatcher is stopped, so this is the sole taker.
     drop(unsafe { Box::from_raw(self.handler) });
@@ -1873,6 +1860,8 @@ pub enum Outcome {
   Notified(Result<Notified, WinFspError>, Purged),
   /// What a purge-only command's purges came to.
   Purged(Purged),
+  /// The receive worker ended before the mount was intentionally stopped.
+  Failed(WinFspError),
   /// The file system is unmounted and deleted; the thread is ending.
   Stopped,
 }
@@ -2012,6 +2001,18 @@ fn run_mount(
       }
     };
     let mounted = Mounted::new(mount_point, read_only, requests, wake.clone(), inherited)?;
+    let value = ledger
+      .memory()
+      .handle_value()
+      .map_err(|error| WinFspError::Ledger(crate::opens::Refusal::Memory(error)))?;
+    let raw = usize::try_from(value).map_err(|_| WinFspError::MountThread)? as *mut c_void;
+    // SAFETY: the ledger owns this live section, and the borrowed handle lasts only until duplication returns.
+    let section = unsafe { BorrowedHandle::borrow_raw(raw) }
+      .try_clone_to_owned()
+      .map_err(|error| WinFspError::Os {
+        call: "duplicate receive section",
+        code: error.raw_os_error(),
+      })?;
     let offer = mounted.offer()?;
     let opens = ledger.live().collect();
     Ok::<_, WinFspError>((
@@ -2021,11 +2022,27 @@ fn run_mount(
         offer,
         opens,
       },
+      section,
     ))
   })();
   let mounted = match prepared {
-    Ok((mounted, ready)) => {
+    Ok((mut mounted, ready, section)) => {
       report(Outcome::Mounted(Ok(Box::new(ready))));
+      match crate::dispatcher::Worker::start(
+        mounted.file_system.addr(),
+        section,
+        open_bound,
+        outcomes.clone(),
+        wake.clone(),
+      ) {
+        Ok(worker) => mounted.worker = Some(worker),
+        Err(error) => {
+          report(Outcome::Failed(error));
+          drop(mounted);
+          report(Outcome::Stopped);
+          return;
+        }
+      }
       mounted
     }
     Err(error) => {
@@ -2087,3 +2104,7 @@ fn write_wide(field: &mut [u16], s: &str) {
     *slot = unit;
   }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/host.rs"]
+mod tests;

@@ -21,9 +21,9 @@ pub(crate) type PSecurityDescriptor = *mut c_void;
 /// WinFsp's `BOOLEAN` — a single byte, 0 or 1.
 pub(crate) type Boolean = u8;
 
-/// The public v2.1 `FSP_FILE_SYSTEM` prefix through `VolumeHandle` (A-198). WinFsp allocates the full 792-byte object;
-/// this layout reaches only the handler, the 256-unit volume name and the control handle, in header order. Creating
-/// the full object still belongs to the DLL, so its operation table and dispatcher TLS are initialized there.
+/// The public v2.1 `FSP_FILE_SYSTEM` prefix through its operation table (A-198). WinFsp allocates the full 792-byte
+/// object and initializes its operations. The owned receive worker invokes that table on an aligned working request;
+/// its retained kernel buffer is never lent mutably to a DLL operation.
 #[repr(C)]
 pub(crate) struct FileSystem {
   pub(crate) version: u16,
@@ -31,7 +31,19 @@ pub(crate) struct FileSystem {
   /// Format: `FSP_FSCTL_VOLUME_NAME_SIZEMAX / sizeof(WCHAR)`, 64 volume units plus 192 prefix units.
   pub(crate) volume_name: [u16; 64 + 192],
   pub(crate) volume_handle: windows_sys::Win32::Foundation::HANDLE,
+  pub(crate) enter_operation: Option<OperationFn>,
+  pub(crate) leave_operation: Option<OperationFn>,
+  /// Format: FspFsctlTransactKindCount slots in the public header's enum order, including reserved zero.
+  pub(crate) operations: [Option<OperationFn>; crate::inflight::KIND_COUNT as usize],
 }
+
+/// A v2.1 FSP_FILE_SYSTEM_OPERATION or OPERATION_GUARD. The request/response addresses point to aligned buffers of
+/// the checked protocol sizes, and FileSystem stays DLL-owned until the receiver has been joined.
+pub(crate) type OperationFn = unsafe extern "system" fn(
+  file_system: *mut FileSystem,
+  request: Pvoid,
+  response: Pvoid,
+) -> Ntstatus;
 
 /// `FSP_FSCTL_VOLUME_PARAMS` (504 bytes; header `static_assert`) — the mount parameters. The two
 /// bitfield words are held as raw `u32`s (`flags`/`flags_v1`) whose bits the host sets by constant, so
@@ -271,10 +283,6 @@ pub(crate) const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 pub(crate) const FILE_NO_INTERMEDIATE_BUFFERING: u32 = 0x0000_0008;
 /// Format: `FspCleanupDelete` — the Cleanup flag that means "delete this object now" (`winfsp.h`).
 pub(crate) const FSP_CLEANUP_DELETE: u32 = 0x01;
-/// Format: `FSP_FILE_SYSTEM_OPERATION_GUARD_STRATEGY_COARSE` — one mutually-exclusive lock around every
-/// callback, so the host's single-owner volume is never touched concurrently.
-pub(crate) const GUARD_STRATEGY_COARSE: i32 = 1;
-
 /// Format: `STATUS_CANT_WAIT` (`0xC000_00D8`, ntstatus.h) as WinFsp's `NTSTATUS`: `FspFileSystemNotifyBegin` with a zero
 /// timeout answers it while a rename is in progress, and the round is owed again.
 pub(crate) const STATUS_CANT_WAIT: Ntstatus = i32::from_ne_bytes(0xC000_00D8_u32.to_ne_bytes());
@@ -291,12 +299,6 @@ pub(crate) type CreateFn = unsafe extern "system" fn(
 /// `FspFileSystemDelete`, `FspFileSystemRemoveMountPoint` and `FspFileSystemStopDispatcher`: each takes the file
 /// system and returns nothing.
 pub(crate) type FileSystemFn = unsafe extern "system" fn(file_system: *mut FileSystem);
-/// `FspFileSystemStartDispatcher`.
-pub(crate) type StartDispatcherFn =
-  unsafe extern "system" fn(file_system: *mut FileSystem, thread_count: u32) -> Ntstatus;
-/// `FspFileSystemSetOperationGuardStrategyF`.
-pub(crate) type SetGuardStrategyFn =
-  unsafe extern "system" fn(file_system: *mut FileSystem, strategy: i32);
 /// `FspFileSystemAddDirInfo`.
 pub(crate) type AddDirInfoFn = unsafe extern "system" fn(
   dir_info: *mut DirInfo,
@@ -309,9 +311,6 @@ pub(crate) type NotifyBeginFn =
   unsafe extern "system" fn(file_system: *mut FileSystem, timeout: u32) -> Ntstatus;
 /// `FspFileSystemNotifyEnd`.
 pub(crate) type NotifyEndFn = unsafe extern "system" fn(file_system: *mut FileSystem) -> Ntstatus;
-/// `FspFileSystemOperationProcessIdF`: the process that made the create or open being served (its id from the request's
-/// access token, `winfsp.h` `FspFileSystemOperationProcessId`), zero for any other request.
-pub(crate) type OperationProcessIdFn = unsafe extern "system" fn() -> u32;
 /// `FspFileSystemNotify`: the records of a round (`FSP_FSCTL_NOTIFY_INFO`, built by `crate::notify`) and their size.
 pub(crate) type NotifyFn = unsafe extern "system" fn(
   file_system: *mut FileSystem,
@@ -328,15 +327,10 @@ pub(crate) type NotifyFn = unsafe extern "system" fn(
 pub(crate) struct Api {
   pub(crate) create: CreateFn,
   pub(crate) delete: FileSystemFn,
-  pub(crate) start_dispatcher: StartDispatcherFn,
-  pub(crate) stop_dispatcher: FileSystemFn,
-  pub(crate) set_guard_strategy: SetGuardStrategyFn,
   pub(crate) add_dir_info: AddDirInfoFn,
   pub(crate) notify_begin: NotifyBeginFn,
   pub(crate) notify_end: NotifyEndFn,
   pub(crate) notify: NotifyFn,
-  /// Absent from a WinFsp that predates it: the mount then makes no purge (`crate::purge`), and serves as before.
-  pub(crate) operation_process_id: Option<OperationProcessIdFn>,
 }
 
 /// Format: the library's name for this architecture (`FSP_DLLNAME`: `winfsp-` and `FSP_FSCTL_PRODUCT_FILE_ARCH`).
@@ -370,14 +364,10 @@ fn load() -> Result<Api, Ntstatus> {
   Ok(Api {
     create: symbol(module, c"FspFileSystemCreate")?,
     delete: symbol(module, c"FspFileSystemDelete")?,
-    start_dispatcher: symbol(module, c"FspFileSystemStartDispatcher")?,
-    stop_dispatcher: symbol(module, c"FspFileSystemStopDispatcher")?,
-    set_guard_strategy: symbol(module, c"FspFileSystemSetOperationGuardStrategyF")?,
     add_dir_info: symbol(module, c"FspFileSystemAddDirInfo")?,
     notify_begin: symbol(module, c"FspFileSystemNotifyBegin")?,
     notify_end: symbol(module, c"FspFileSystemNotifyEnd")?,
     notify: symbol(module, c"FspFileSystemNotify")?,
-    operation_process_id: symbol(module, c"FspFileSystemOperationProcessIdF").ok(),
   })
 }
 
@@ -448,13 +438,10 @@ fn wide(text: &str) -> Vec<u16> {
 trait Export: Copy {}
 impl Export for CreateFn {}
 impl Export for FileSystemFn {}
-impl Export for StartDispatcherFn {}
-impl Export for SetGuardStrategyFn {}
 impl Export for AddDirInfoFn {}
-// `NotifyBeginFn` has `StartDispatcherFn`'s shape (the file system and a `u32`), so the impl above covers it.
+impl Export for NotifyBeginFn {}
 impl Export for NotifyEndFn {}
 impl Export for NotifyFn {}
-impl Export for OperationProcessIdFn {}
 
 /// The export `name` of `module`, as the function-pointer type `T` the header gives it; refused when the library does not
 /// export it.
