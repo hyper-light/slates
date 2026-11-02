@@ -44,10 +44,15 @@ mod ffi;
 pub mod host;
 // What a mount tells Windows of another path's change: the names Windows holds open and the notification records
 // (§4.6 "Windows"). Pure, so it is tested on every host.
+#[cfg(windows)]
+mod dispatcher;
 pub mod held;
+pub mod inflight;
 pub mod notify;
 pub mod opens;
 pub mod purge;
+#[cfg(windows)]
+mod purge_token;
 // The purges Windows did not take, made again on a doubling wait until each takes or the volume's request timeout
 // passes (A-190 as amended 2026-11-01). Pure, so it is tested on every host.
 pub mod retry;

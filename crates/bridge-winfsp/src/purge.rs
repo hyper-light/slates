@@ -33,12 +33,40 @@ use slates_bridge_core::CachedBytes;
 /// beginning with `\`, as [`crate::notify::OpenNames`] holds it), and the byte range it writes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Purge {
+  /// The file's stable identity; its cached kernel name may no longer resolve in the live namespace.
+  pub object: slates_bridge_core::ObjectId,
   /// The path.
   pub path: String,
   /// The first byte, a whole number of sectors.
   pub offset: u64,
   /// How many bytes, a whole number of sectors.
   pub len: u64,
+}
+
+/// The path within a private purge's Create: its exact cached name, or an ancestor checked while traversing it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrivatePath {
+  /// Open the file by identity, preserving the name the kernel already cached.
+  File(slates_bridge_core::ObjectId),
+  /// A traversal-only directory check for the marked private operation, using the mount's fixed descriptor.
+  Ancestor,
+}
+
+/// Resolves only a previously authenticated private purge's path. Ordinary callers never use this function.
+/// A sibling prefix and a different path are refused, rather than becoming aliases in the public namespace.
+pub fn private_path(purge: &Purge, path: &str) -> Option<PrivatePath> {
+  if path == purge.path {
+    Some(PrivatePath::File(purge.object))
+  } else if path == "\\"
+    || purge
+      .path
+      .strip_prefix(path)
+      .is_some_and(|rest| rest.starts_with('\\'))
+  {
+    Some(PrivatePath::Ancestor)
+  } else {
+    None
+  }
 }
 
 /// What a purge of `changed` covers in a file of `size` bytes with sectors of `sector` bytes: the changed bytes widened
@@ -208,12 +236,29 @@ mod tests {
   fn purge_of(pages: u64) -> (Purge, u32) {
     (
       Purge {
+        object: slates_bridge_core::ObjectId::new(1, 1),
         path: "\\file.bin".to_owned(),
         offset: 0,
         len: pages * SECTOR,
       },
       u32::try_from(SECTOR).unwrap(),
     )
+  }
+
+  /// A-198. Do: authorize a private purge of an old kernel name. Expect: it addresses exactly that file identity,
+  /// permits only its traversal ancestors, and refuses a sibling component or unrelated name.
+  #[test]
+  fn a_private_purge_addresses_its_file_and_only_its_ancestors() {
+    let mut purge = purge_of(1).0;
+    purge.path = "\\old\\file.bin".to_owned();
+    assert_eq!(
+      private_path(&purge, "\\old\\file.bin"),
+      Some(PrivatePath::File(purge.object))
+    );
+    assert_eq!(private_path(&purge, "\\old"), Some(PrivatePath::Ancestor));
+    assert_eq!(private_path(&purge, "\\"), Some(PrivatePath::Ancestor));
+    assert_eq!(private_path(&purge, "\\ol"), None);
+    assert_eq!(private_path(&purge, "\\old\\other.bin"), None);
   }
 
   /// Step 8 of the VFS and DAX plan, A-190. Do: purge a changed page Windows drops. Expect the purge taken, and a read
