@@ -747,11 +747,20 @@ missing, or impossible with its source, and the order of work. Two gaps underlay
      **Live mount wired (2026-11-02, Step 9.3):** the attachment commits after `Held`; normal detach deletes the file
      system after `Released`. The successor serves the held volume with opaque open tokens recovered from the unnamed
      ledger. Initial diagnostics 41415062574 lost zero drives of twenty on each architecture. Diagnostics [41422186336](https://github.com/hyper-light/slates/actions/runs/41422186336) lost zero drives of twenty on both architectures; every iteration required a restored-context read, and the last daemon counted four. All five live WinFsp tests, 36 bridge tests, 32 active anchor tests, native clippy and Windows docs passed on each runner. With only the control-handle hold omitted, the unchanged oracle failed its first post-kill read with Windows error 995 on both runners ([41422382101](https://github.com/hyper-light/slates/actions/runs/41422382101)); the still-held link alone left a dangling drive letter.
-     Owed (9.4): in-flight and second-daemon tests, safe close/cleanup settlement, the full reference/replay coherence
+     **Foreign process opens refused (2026-11-02, Step 9.4):** protected process descriptors apply at supervised
+     creation and before dedicated CLI roles acquire held objects. The normalized probe disables its own debugger
+     privilege on its thread, verifies that state, then restores it. Both architectures refuse all six separate
+     duplication/DACL/owner requests in [41432451084](https://github.com/hyper-light/slates/actions/runs/41432451084),
+     retaining zero lost drives of twenty; without protection the same probe obtains duplication on both
+     ([41432477849](https://github.com/hyper-light/slates/actions/runs/41432477849)). Existing authority and enabled
+     debugger privilege are outside this new-open policy. The real-supervisor creation check and held-object transfer
+     both pass. Owed (9.4): in-flight and second-daemon tests, safe close/cleanup settlement, the full reference/replay coherence
      set and multiple links, and shutdown hold release. The NFS listener and fleet sockets remain open under this entry.
      Source verification (2026-11-02) is in `research/winfsp-takeover.md`: the hold requires the anchor's acknowledgement
      after duplication, and the live tests must still validate held-volume substitution, torn ledger publication,
-     hint reuse and cleanup replay. The source review does not close this gap.
+     hint reuse and cleanup replay. A-198 corrects a source-reading error: WinFsp v2.1 disables processing-request
+     cancellation and expiry, so a guard-only journal's receive gap has no timeout. The source review does not close
+     this gap; the new taken-read oracle must first fail, then pass with request recovery.
 
 **Closed 2026-10-26 by A-183:** the MCP HTTP edge on Windows, and the Windows datagram socket's inheritance and
 exclusive address (A-182's sibling). Its first Windows run found that a refusal closed at once was erased by the reset
