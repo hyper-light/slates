@@ -727,7 +727,7 @@ missing, or impossible with its source, and the order of work. Two gaps underlay
    edge, the NFS network export and a fleet node's export were missing there. Each is now built on it in turn.
 2. **Holding a restarted daemon's sockets and mounts on Windows (OPEN).** The anchor holds the fleet's serve sockets,
    the NFS listener and the FUSE devices by descriptor inheritance, all Unix-only; on Windows a fleet node's ports are
-   free across a restart and a WinFsp mount dies with its daemon. Since A-184 the Windows NFS server answers it in two
+   free across a restart; the WinFsp hold and its remaining proofs are listed below. Since A-184 the Windows NFS server answers it in two
    paired places, which change with it: `anchor_hold`'s Windows arm answers that no anchor holds, and a connection's
    inbox holds requests already read from the kernel, so holding a connection must carry the inbox's bytes. A held
    Shards stream also adds the guest term to the inode reserve (`guest_listing_entries`).
@@ -744,8 +744,11 @@ missing, or impossible with its source, and the order of work. Two gaps underlay
      acknowledgement; its successor uses the inherited live object; an unrelated inheritable object is excluded.
      Discarding the duplicate makes the same oracle fail on both runners (41399840638). The Windows CLI opens this
      hold before its first daemon; messages and handoffs are bounded and checksum-checked.
-     Owed: the WinFsp hold/takeover wiring and 20-kill test on CI's x86_64 and arm64 runners (9.3), and the in-flight and second-daemon tests
-     (9.4). The NFS listener and the fleet's sockets stay open under this entry.
+     **Live mount wired (2026-11-02, Step 9.3):** the attachment commits after `Held`; normal detach deletes the file
+     system after `Released`. The successor serves the held volume with opaque open tokens recovered from the unnamed
+     ledger. Initial diagnostics 41415062574 lost zero drives of twenty on each architecture. Diagnostics [41422186336](https://github.com/hyper-light/slates/actions/runs/41422186336) lost zero drives of twenty on both architectures; every iteration required a restored-context read, and the last daemon counted four. All five live WinFsp tests, 36 bridge tests, 32 active anchor tests, native clippy and Windows docs passed on each runner. With only the control-handle hold omitted, the unchanged oracle failed its first post-kill read with Windows error 995 on both runners ([41422382101](https://github.com/hyper-light/slates/actions/runs/41422382101)); the still-held link alone left a dangling drive letter.
+     Owed (9.4): in-flight and second-daemon tests, safe close/cleanup settlement, the full reference/replay coherence
+     set and multiple links, and shutdown hold release. The NFS listener and fleet sockets remain open under this entry.
      Source verification (2026-11-02) is in `research/winfsp-takeover.md`: the hold requires the anchor's acknowledgement
      after duplication, and the live tests must still validate held-volume substitution, torn ledger publication,
      hint reuse and cleanup replay. The source review does not close this gap.
