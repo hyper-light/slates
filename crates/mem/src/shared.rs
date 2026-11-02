@@ -69,6 +69,33 @@ impl std::fmt::Debug for SharedObject {
 }
 
 impl SharedObject {
+  /// Creates an unnamed Windows paging-file section (A-198). Only a held handle can hand it to a successor;
+  /// no process can find it by name. The layout has the same copy-only ownership discipline as every shared object.
+  #[cfg(windows)]
+  pub fn unnamed(len: usize, words: Words) -> Result<SharedObject, MemError> {
+    let words = words.layout(len)?;
+    let inner = platform::create_unnamed(len)?;
+    Ok(SharedObject { inner, len, words })
+  }
+
+  /// Maps a Windows section inherited from the supervising anchor, taking ownership of its handle (A-198).
+  #[cfg(windows)]
+  pub fn from_held_handle(
+    handle: std::os::windows::io::OwnedHandle,
+    len: usize,
+    words: Words,
+  ) -> Result<SharedObject, MemError> {
+    let words = words.layout(len)?;
+    let inner = platform::from_held_handle(handle, len)?;
+    Ok(SharedObject { inner, len, words })
+  }
+
+  /// The section handle's value, lent for the anchor to duplicate out of this process. This object keeps ownership.
+  #[cfg(windows)]
+  pub fn handle_value(&self) -> Result<u64, MemError> {
+    self.inner.handle_value()
+  }
+
   /// Creates an object of `len` bytes named `name` (the name matters on macOS and Windows,
   /// where it is the handoff; on Linux it is the descriptor's label), whose concurrent words are `words`.
   pub fn create(name: &str, len: usize, words: Words) -> Result<SharedObject, MemError> {
@@ -1400,17 +1427,36 @@ mod platform {
   }
 
   pub(super) fn create(name: &str, len: usize) -> Result<Inner, MemError> {
-    create_section(name, len, PAGE_READWRITE)
+    create_section(Some(name), len, PAGE_READWRITE)
+  }
+
+  pub(super) fn create_unnamed(len: usize) -> Result<Inner, MemError> {
+    create_section(None, len, PAGE_READWRITE)
+  }
+
+  pub(super) fn from_held_handle(
+    handle: std::os::windows::io::OwnedHandle,
+    len: usize,
+  ) -> Result<Inner, MemError> {
+    use std::os::windows::io::IntoRawHandle;
+    let handle = handle.into_raw_handle();
+    let view = view(handle, 0, len)?;
+    Ok(Inner {
+      handle: handle.expose_provenance(),
+      view: view.expose_provenance(),
+      len,
+      name: String::new(),
+    })
   }
 
   /// A section reserved, not committed: its pages are charged against the commit limit only as
   /// [`Commits::commit`] reaches them.
   pub(super) fn create_sparse(name: &str, len: usize) -> Result<Inner, MemError> {
-    create_section(name, len, PAGE_READWRITE | SEC_RESERVE)
+    create_section(Some(name), len, PAGE_READWRITE | SEC_RESERVE)
   }
 
   fn create_section(
-    name: &str,
+    name: Option<&str>,
     len: usize,
     protection: PAGE_PROTECTION_FLAGS,
   ) -> Result<Inner, MemError> {
@@ -1420,7 +1466,7 @@ mod platform {
     })?;
     let high = u32::try_from(size >> u32::BITS).unwrap_or(u32::MAX);
     let low = u32::try_from(size & u64::from(u32::MAX)).unwrap_or(u32::MAX);
-    let wide = wide(name);
+    let wide = name.map(wide);
     // SAFETY: a pagefile-backed section with a NUL-terminated wide name.
     let handle = unsafe {
       CreateFileMappingW(
@@ -1429,7 +1475,7 @@ mod platform {
         protection,
         high,
         low,
-        wide.as_ptr(),
+        wide.as_ref().map_or(std::ptr::null(), |name| name.as_ptr()),
       )
     };
     if handle.is_null() {
@@ -1450,7 +1496,7 @@ mod platform {
       handle: handle.expose_provenance(),
       view: view.expose_provenance(),
       len,
-      name: name.to_owned(),
+      name: name.unwrap_or_default().to_owned(),
     })
   }
 
@@ -1655,7 +1701,20 @@ mod platform {
     }
 
     pub(super) fn handoff(&self) -> Result<Handoff, MemError> {
+      if self.name.is_empty() {
+        return Err(MemError::OsRefused {
+          call: "an unnamed section needs a held-handle handoff",
+          code: None,
+        });
+      }
       Ok(Handoff::Name(self.name.clone()))
+    }
+
+    pub(super) fn handle_value(&self) -> Result<u64, MemError> {
+      u64::try_from(self.handle).map_err(|_| MemError::OsRefused {
+        call: "a section handle wider than u64",
+        code: None,
+      })
     }
   }
 }

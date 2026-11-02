@@ -72,7 +72,7 @@ pub(crate) struct Handed {
 /// device and every held connection. A value that does not parse adopts nothing of its kind and is reported, and a
 /// connection whose descriptor number the devices' variable also names is not adopted (its number has another owner);
 /// the daemon then runs without what it could not account for. Called once, at start.
-pub(crate) fn adopt() -> Handed {
+pub(crate) fn adopt(_mount_bound: usize) -> Handed {
   let mut handed = Handed::default();
   let Ok(value) = std::env::var(ENV_DEVICES) else {
     return handed;

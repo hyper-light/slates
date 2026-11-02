@@ -40,6 +40,8 @@ const KIND_RELEASE: u8 = 2;
 const KIND_HELD: u8 = 3;
 /// Format: see [`KIND_HOLD`]: the anchor's answer that it refused an entry, with the reason's byte.
 const KIND_REFUSED: u8 = 4;
+/// Format: the anchor's acknowledgement after closing every handle of an entry (A-198).
+const KIND_RELEASED: u8 = 5;
 
 /// Format: where the entry's id starts (after the kind byte).
 const AT_ID: usize = AT_KIND + 1;
@@ -188,6 +190,11 @@ pub enum HandleMessage {
     /// The entry's id.
     id: u64,
   },
+  /// The anchor closed entry `id` (or already held none), so normal teardown may delete the volume.
+  Released {
+    /// The entry's id.
+    id: u64,
+  },
   /// The anchor refused entry `id`.
   Refused {
     /// The entry's id.
@@ -205,6 +212,7 @@ pub fn encode(message: &HandleMessage) -> Result<[u8; MESSAGE_BYTES], HandleRefu
     HandleMessage::Hold { id, .. } => (KIND_HOLD, *id),
     HandleMessage::Release { id } => (KIND_RELEASE, *id),
     HandleMessage::Held { id } => (KIND_HELD, *id),
+    HandleMessage::Released { id } => (KIND_RELEASED, *id),
     HandleMessage::Refused { id, .. } => (KIND_REFUSED, *id),
   };
   put(&mut bytes, 0, MAGIC)?;
@@ -237,7 +245,8 @@ pub fn encode(message: &HandleMessage) -> Result<[u8; MESSAGE_BYTES], HandleRefu
       put(&mut bytes, AT_RECORD, record)?;
     }
     HandleMessage::Refused { reason, .. } => put(&mut bytes, AT_WHAT, &[reason.byte()])?,
-    HandleMessage::Release { .. } | HandleMessage::Held { .. } => {}
+    HandleMessage::Release { .. } | HandleMessage::Held { .. } | HandleMessage::Released { .. } => {
+    }
   }
   let checksum = slates_wire::crc32c::crc32c(field(&bytes, 0, AT_CHECKSUM)?);
   put(&mut bytes, AT_CHECKSUM, &checksum.to_le_bytes())?;
@@ -300,6 +309,7 @@ pub fn decode(bytes: &[u8]) -> Result<HandleMessage, HandleRefusal> {
   let (message, used) = match kind {
     KIND_HOLD => decode_hold(bytes, id)?,
     KIND_RELEASE => (HandleMessage::Release { id }, AT_WHAT),
+    KIND_RELEASED => (HandleMessage::Released { id }, AT_WHAT),
     KIND_HELD => (HandleMessage::Held { id }, AT_WHAT),
     KIND_REFUSED => {
       let reason =
@@ -517,6 +527,7 @@ mod tests {
     for message in [
       hold(),
       HandleMessage::Release { id: 7 },
+      HandleMessage::Released { id: 7 },
       HandleMessage::Held { id: u64::MAX },
       HandleMessage::Refused {
         id: 9,
