@@ -12886,32 +12886,70 @@ This is a source-derived design; the held-volume substitution and crash boundari
   - The ledger holds one slot per open the bridge allows (`MAX_OPEN_HANDLES`), with a typed refusal past it.
 - **Requests in flight at the kill.**
   - Requests the kernel queued while no daemon served wait in WinFsp's pending queue, and the successor serves them.
-  - Those the dead daemon had taken wait in the processing queue until a response names them by hint
-    (`FspIoqEndProcessingIrp`), or until the volume's request timeout cancels them (`src/sys/ioq.c`,
-    `FspIoqRemoveExpired`, with `STATUS_CANCELLED` from `src/sys/iop.c`).
-  - The ledger keeps one slot per dispatcher thread. A guard the mount sets in place of WinFsp's own
-    (`FspFileSystemSetOperationGuardF`, then WinFsp's exported `FspFileSystemOpEnter`) writes the slot as each request
-    is taken, before WinFsp's guard serializes it:
-    the hint and the kind, and a Close or a Cleanup whole (at most `FSP_FSCTL_TRANSACT_REQ_SIZEMAX`, 16 KiB less 64).
-  - Before its dispatcher starts, the successor answers each slot through `FspFileSystemSendResponse`. A Close or a
-    Cleanup is carried out (its handle released, a delete made) and answered. Any other request is refused
-    `STATUS_CANCELLED`, the status WinFsp's own timeout gives.
-  - A slot whose request was answered already names a hint no request in processing holds, and WinFsp skips it
-    (`FspVolumeFastTransact`, "BOGUS").
-    The implementation must also account for a hint's address being reused; the missing-hint behavior alone does not
-    establish that replaying an arbitrary saved response is safe. Cleanup and close must settle their effects once.
-  - The gap left is a request taken but not yet at the guard: the DLL's few instructions after the transact returns.
-    The timeout refuses it.
-- **Coherence at takeover.** The successor must tell Windows of changes the dead daemon never told it of. Its first
-  turn notifies and purges (A-190, read back) every inode A-158 names: the owner's restored references and the inodes
-  the write-log replay wrote. It reaches each by the paths the volume gives it (`Volume::path_of_inode`, and
-  `paths_of_inode_walk` for an inode of several links), and seeds the mount's open names from them.
+  - Those the dead daemon had taken remain in the processing queue until a response names their hint
+    (`FspIoqEndProcessingIrp`). **Source correction, 2026-11-02:** `driver.h` defines
+    `FSP_IOQ_PROCESS_NO_CANCEL`; `ioq.c` sets their timestamp to infinity and excludes them from timeout removal.
+    The earlier timeout claim was wrong. A request lost between transact and an operation guard can hang indefinitely.
+  - A guard-only journal is therefore rejected. Request recovery must retain the receive buffer at the transact
+    boundary and distinguish a response returned by a callback from one accepted by the driver. The live taken-read
+    oracle is being built in Step 9.4; no in-flight settlement is established by the twenty-kill history.
+  - Replaying an arbitrary saved hint is also unsafe: it is an IRP address, and another dispatcher can take a new
+    request at that address after the first response completed. Missing hints being ignored (`FspVolumeFastTransact`,
+    "BOGUS") does not solve address reuse. The replacement must prevent that ambiguity before replay, and settle
+    cleanup and close effects once. Exact source and the test boundary are in `research/winfsp-takeover.md`.
+  - **Replacement receiver (2026-11-02; Step 9.4's whole-change verification remains pending).** One owned receive worker uses the public
+    direct-output batch FSCTL, with its fixed receive buffer in the anchor-held unnamed ledger section. The driver
+    copies into that output before placing an IRP in processing. Adoption waits for complete predecessor exit,
+    including that process's own I/O completion. The DLL still supplies the operation table; its heap receive loop
+    is replaced, not retained beside another path.
+  - Responses are sent without receiving a new batch. The worker settles its entire captured batch before any new
+    receive, and recovery does the same before normal serving. No second receiver can put a reused hint into
+    processing meanwhile. A response saved before the driver accepted it is then safe to send again: the original
+    IRP remains in processing, or a recycled address is merely pending and does not match.
+  - Live diagnostics [41472709500](https://github.com/hyper-light/slates/actions/runs/41472709500) settle one counted
+    captured read in 0.17 s on x86_64 and 0.33 s on arm64. The same tree loses zero drives of twenty on each
+    architecture, with four restored-context reads in its final iteration. The whole suite then exposed a renamed-view
+    failure; that result is partial proof and does not close Step 9.4.
+  - A complete saved response has a CRC32C and is recorded before sending. Without one, a buffer-bearing operation
+    is refused STATUS_CANCELLED, never replayed through a dead process's buffer or token handle. Cleanup and close
+    settle by checked open identity. Pending open contexts are tied to the still-outstanding request; a context never
+    handed to the kernel is retired, while a saved successful open response is completed. Successful opens and closes
+    publish their reference changes. Recovery reconciles the attachment's restored open counts with its live ledger
+    contexts so a kill between ledger retirement and root publication cannot release a sibling open or pin an orphan.
+    A saved successful rename is also replayable: the driver's completion uses its original kernel-owned name buffer,
+    not an old user buffer. Before sending that result, the receiver updates one held context's kernel name per shard
+    turn. Replaying the saved success resumes a partially completed name update after another death.
+  - Intentional unmount still waits for the anchor's Released before stopping the volume and removing the drive.
+    Dropping a worker closes its stop channel, waits for its current finite control transaction and joins, then closes
+    only its own copies. The control wait is the API's minimum admitted TransactTimeout, 1000 ms; this is distinct
+    from processing-request expiry, which is disabled. It never stops the anchor-held volume or removes a successfully
+    acquired temporary drive link. The successor can resume the retained batch as after a kill.
+- **Coherence at takeover.** The successor must tell Windows of changes the dead daemon never told it of. The held
+  ledger records the original kernel name of every open, including each alias; it does not reconstruct that name
+  from the file's current namespace home. Each slot has two generation-checked UTF-16 name versions with CRC32C,
+  published one complete version at a time. The unnamed sparse section reserves the admitted open/path caps and
+  commits touched ranges only. Recovery seeds one context per owner turn from these records.
+  - Every WinFsp cache hangs off an open file node, including the Cache Manager's own file-object reference
+    (`bridge-winfsp/src/notify.rs` and WinFsp's `FspFileNodeInvalidateCachesAndNotifyChangeByName`). The first round
+    therefore notifies and purges every held kernel name, covering the A-158 set Windows can still cache. All aliases
+    of one inode are covered. A current namespace walk cannot substitute for that set after an SDK rename.
+  - A purge carries both that name and the file's stable identity. Its drive opens use a mount-specific restricting
+    SID in a less privileged copy of the daemon's own token; the receiver checks the PID and marker before resolving
+    the target by identity. Ordinary lookups still use the namespace, so an old removed name stays absent.
+  - A bounded Begin/End channel is woken by an owned event even when Windows refuses an open before a callback.
+    The receiver drains it while its overlapped control call is pending and before each callback. This replaces the
+    callback-only drain that could block the publisher. A failed wake/wait is typed, and the control call is settled
+    before any error can free its borrowed buffer. Final live verification of this correction remains owed.
 - **A second daemon is refused.**
   - A held handle passes only by inheritance, to the anchor's own next daemon.
-  - Another process could take it only by duplicating it out of the anchor or the daemon, which needs
+  - Another unprivileged process could take it only by duplicating it out of the anchor or the daemon, which needs
     `PROCESS_DUP_HANDLE` on that process. So each sets its own security to refuse that right to every other process of
     the user, through an owner-rights entry as A-175's sections use. The anchor's existing child-process handle lets it
     duplicate out of that child; the child is given no process handle for duplicating into the anchor.
+    The child's descriptor is applied by CreateProcessW before its first instruction; dedicated CLI holders protect
+    themselves before acquiring held resources. Existing handles and an enabled debugger privilege are outside this
+    new-open policy. Diagnostics 41432451084 and 41432477849 verify the same unprivileged probe with and without it
+    on both architectures (the test disables privileges only on its own thread and checks restoration).
   - A second daemon on the instance is refused by the rendezvous's owner (A-176, A-178).
 - **Tests** (Step 9.2 to 9.4; the live mount runs on CI's Windows runners only, since jupiter has no WinFsp):
   - the hold across real processes on Windows: duplicated in, inherited by the next daemon only;
@@ -13594,8 +13632,9 @@ purge must be counted), `unsafe-budget.toml` (`slates-bridge-winfsp` 104 → 111
     for the next due time or for any wake, so a wait never holds up a request.
     - A purge is given up, counted `winfsp.purges_kept`, once its next attempt would come later than the volume's
       request timeout after Windows first kept its page: 300 s, WinFsp's default, now set in the volume's parameters so
-      the horizon is the volume's own. WinFsp cancels a request left unanswered that long (`src/sys/ioq.c`), so by then
-      no I/O through the volume holds the page; what does is a program's own lock, which no purge can undo.
+      the horizon follows the pending queue's budget. **Source correction (A-198, 2026-11-02):** processing requests
+      never expire (`FSP_IOQ_PROCESS_NO_CANCEL`), so this deadline does not prove no I/O still holds a page. The kept
+      outcome is a finite retry policy and is counted; a program's own page lock can also outlive it.
     - With a 10 ms tick that is at most 14 attempts. The list holds at most one purge per open handle
       (`MAX_OPEN_HANDLES`); an untaken purge past it is given up and counted kept.
     - The first form of this fix put the round's cursor back and made the whole round again a tick later, without a

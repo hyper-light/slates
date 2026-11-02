@@ -360,6 +360,52 @@ impl std::fmt::Debug for SparseObject {
 }
 
 impl SparseObject {
+  /// Reserves an unnamed Windows section for bounded held records (A-198). Only touched ranges consume commit;
+  /// the anchor transfers the existing section by handle rather than publishing a name.
+  #[cfg(windows)]
+  pub fn unnamed(len: usize, words: Words) -> Result<Self, MemError> {
+    let words = words.layout(len)?;
+    let inner = platform::create_sparse_unnamed(len)?;
+    let commits = platform::Commits::new(len)?;
+    let page = platform::mapping_granule()?.max(1);
+    Ok(Self {
+      inner,
+      len,
+      words,
+      commits,
+      page,
+      reusable: possibly_marked(len, page),
+    })
+  }
+
+  /// Adopts the anchor's unnamed reserved section after its previous writer exited (A-198). Committing a range
+  /// already committed by that writer preserves its bytes, as for a named sparse object.
+  #[cfg(windows)]
+  pub fn from_held_handle(
+    handle: std::os::windows::io::OwnedHandle,
+    len: usize,
+    words: Words,
+  ) -> Result<Self, MemError> {
+    let words = words.layout(len)?;
+    let inner = platform::from_held_handle(handle, len)?;
+    let commits = platform::Commits::new(len)?;
+    let page = platform::mapping_granule()?.max(1);
+    Ok(Self {
+      inner,
+      len,
+      words,
+      commits,
+      page,
+      reusable: possibly_marked(len, page),
+    })
+  }
+
+  /// The owned Windows section's handle value, borrowed until an acknowledged duplicate or receive view is made.
+  #[cfg(windows)]
+  pub fn handle_value(&self) -> Result<u64, MemError> {
+    self.inner.handle_value()
+  }
+
   /// Creates a sparse object of `len` bytes named `name` (the name matters where it is the handoff),
   /// whose concurrent words are `words`.
   pub fn create(name: &str, len: usize, words: Words) -> Result<SparseObject, MemError> {
@@ -1453,6 +1499,10 @@ mod platform {
   /// [`Commits::commit`] reaches them.
   pub(super) fn create_sparse(name: &str, len: usize) -> Result<Inner, MemError> {
     create_section(Some(name), len, PAGE_READWRITE | SEC_RESERVE)
+  }
+
+  pub(super) fn create_sparse_unnamed(len: usize) -> Result<Inner, MemError> {
+    create_section(None, len, PAGE_READWRITE | SEC_RESERVE)
   }
 
   fn create_section(

@@ -2,21 +2,22 @@
 //! served by the daemon on the volume's owner shard, so a Windows program sees a slates volume as a normal drive — the
 //! Windows analogue of the FUSE mount (`slates-server`'s `fuse`).
 //!
-//! **Threading (D-7, D-9).** WinFsp answers the kernel from a pool of dispatcher threads in this process, which are not
-//! the runtime's; the volume lives on its owner shard and never leaves it. The design's rule is that "WinFsp requests
-//! arrive on WinFsp's threads and are routed to the owning shard by handle" (§4.3 "Drivers"): each callback packages
+//! **Threading (D-7, D-9, A-198).** One owned receiver answers the kernel through the DLL's operation table; the
+//! DLL's receive pool is replaced by the retained direct-output receiver (`crate::dispatcher`). The volume lives on
+//! its owner shard and never leaves it. Following §4.3's routing rule, each callback packages
 //! its request as a [`Request`], sends it over a bounded channel to the mount's task on that shard, wakes the task, and
 //! blocks its own thread for the reply. The task serves it whole, one request at a time, through the shared operation
 //! layer ([`Request::serve`] over any [`Bridge`]) and answers. No lock, no shared ownership (R2): one consumer of the
 //! channel, one reply channel per call. A dispatcher thread that finds the channel closed (the mount is being torn
 //! down) answers `STATUS_UNSUCCESSFUL` at once, never a hang.
 //!
-//! **The mount thread (A-198).** Each mount has one owned thread ([`MountThread`]) that creates the DLL's file system,
-//! defines the temporary drive link through `crate::held`, starts its dispatcher and sends notification rounds. The
+//! **The mount thread (A-198).** Each mount has one owned command thread ([`MountThread`]) that creates the DLL's file system,
+//! defines the temporary drive link through `crate::held`, starts the receiver and sends notification rounds. The
 //! anchor holds duplicates of the volume control, drive-link and open-ledger objects. After a death the successor
-//! creates fresh DLL dispatcher state and substitutes the inherited control handle and volume name; per-open contexts
-//! resolve through `crate::opens` on the shard. Normal teardown stops and deletes the file system and removes that
-//! exact drive definition. Raw framework pointers stay on the owned thread, which its owner joins on every exit.
+//! creates a fresh DLL operation table and substitutes the inherited control handle and volume name; per-open contexts
+//! and original kernel names resolve through `crate::opens` on the shard. Teardown joins the receiver before deleting
+//! the DLL object and closing this process's volume/link handles. The anchor's copies keep a killed daemon's volume
+//! and temporary link alive. Raw framework pointers remain owned until both threads have been joined.
 //!
 //! **Cache posture (§4.6 "Windows").** `FileInfoTimeout` is infinite: Windows keeps a file's attributes, listings and
 //! pages until told, and the mount tells it of every change made through any other path by `FspFileSystemNotify`
@@ -28,8 +29,10 @@
 //!
 //! **Mapped views (A-190, an experiment).** A notification's purge leaves a mapped file's pages (`crate::purge` says
 //! why), so after a round Windows took, the mount thread opens each changed file through the drive unbuffered and writes
-//! the changed range, which makes WinFsp purge coherently; the write reaches this host on an open the host knows as its
-//! own (this process, unbuffered) and is answered without being passed on.
+//! the changed range, which makes WinFsp purge coherently. A private restricting-SID marker distinguishes these opens
+//! from ordinary I/O by an embedding application. They address the held file by identity at its original cached name,
+//! even after another attachment renamed it; ordinary callers still resolve the namespace. The purge's write is an
+//! echo. A separate event carries Begin/End progress even when Windows refuses an open without calling the host.
 //!
 //! **Verification.** Every struct and export is hand-transcribed from winfsp's headers (`crate::ffi`) and cross-lints
 //! on the Windows target from any host; the live mount runs on the native Windows CI runner through the CLI
@@ -59,8 +62,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
 use crate::ffi::{
-  self, Api, Boolean, DirInfo, FileInfo, FileSystem, GUARD_STRATEGY_COARSE, Interface, Ntstatus,
-  PSecurityDescriptor, Pvoid, Pwstr, VolumeInfo, VolumeParams,
+  self, Api, Boolean, DirInfo, FileInfo, FileSystem, Interface, Ntstatus, PSecurityDescriptor,
+  Pvoid, Pwstr, VolumeInfo, VolumeParams,
 };
 use crate::held::{
   Record,
@@ -70,7 +73,7 @@ use crate::notify::OpenNames;
 use crate::opens::{Ledger, Open, RESTORED_HANDLE};
 use crate::purge::{Purge, PurgeOutcome, PurgeTarget, purge_through};
 use crate::{STATUS_SUCCESS, file_attributes, filetime_from_unix_ns, ntstatus};
-use slates_mem::SharedObject;
+use slates_mem::SparseObject;
 
 /// A typed WinFsp host failure (no panics; every refusal is a value).
 #[derive(Debug)]
@@ -93,6 +96,10 @@ pub enum WinFspError {
   Record(crate::held::Refusal),
   /// A checked open-ledger allocation, read or write was refused.
   Ledger(crate::opens::Refusal),
+  /// The retained direct-output receive journal was malformed or could not be settled.
+  Capture(crate::inflight::Refusal),
+  /// The loaded DLL exposes a future public filesystem format this operation table cannot serve.
+  UnsupportedAbi(u16),
   /// A Windows object operation refused, preserving its system error code.
   Os {
     /// The Windows object operation.
@@ -114,6 +121,10 @@ impl std::fmt::Display for WinFspError {
       Self::MountThread => write!(f, "the mount thread could not run"),
       Self::Record(reason) => write!(f, "the held mount record was refused: {reason:?}"),
       Self::Ledger(reason) => write!(f, "{reason}"),
+      Self::Capture(reason) => write!(f, "{reason}"),
+      Self::UnsupportedAbi(version) => {
+        write!(f, "WinFsp filesystem format {version} is unsupported")
+      }
       Self::Os { call, code } => write!(f, "{call} refused: {code:?}"),
     }
   }
@@ -147,16 +158,11 @@ const VOLUME_INFO_TIMEOUT_MS: u32 = 0;
 /// Format: `VolumeInfoTimeoutValid`, bit 0 of the version-1 flag word (`fsctl.h`): the volume-information timeout is
 /// set apart from `FileInfoTimeout`.
 const VOLUME_INFO_TIMEOUT_VALID: u32 = 1 << 0;
-/// Derived: the dispatcher threads WinFsp runs for the mount: two. The COARSE guard admits one callback at a time and
-/// the owner shard serves one request at a time, so a second thread only takes the next request from the kernel while
-/// the first waits for its reply; a third would wait at the guard.
-const DISPATCHER_THREADS: u32 = 2;
-/// Derived: the requests that can wait in the channel to the shard: one per dispatcher thread, since each blocks for
-/// its reply before taking another.
-pub const REQUEST_BOUND: usize = DISPATCHER_THREADS as usize;
+/// Shape: the one receiver waits for its current callback's answer before sending another request to the shard.
+pub const REQUEST_BOUND: usize = 1;
 /// Shape: the outcomes the mount thread can have unread at once: a command's (the task sends at most one command, a
 /// round or a purge, before reading its outcome) or the mount's, and the stop's after either.
-const OUTCOME_BOUND: usize = 2;
+const OUTCOME_BOUND: usize = 4;
 /// Shape: commands queued to the mount thread: one round out at a time.
 const COMMAND_BOUND: usize = 1;
 /// Format: the default permission bits a created file takes (`rw-r--r--`); the mount presents Windows
@@ -182,6 +188,16 @@ const CLEANUP_CHANGED: u32 = 0x01 | 0x02 | 0x10 | 0x40 | 0x80;
 /// One operation the owner shard runs on the volume, with the parameters marshalled from a WinFsp callback. Paths
 /// arrive as Rust `String`s (converted from WinFsp's UTF-16), so the whole `Op` crosses the channel.
 enum Op<T> {
+  /// One durable kernel-name update after a successful rename response was saved, before it reaches the driver.
+  RenameName {
+    after: Option<u64>,
+    from: String,
+    to: String,
+  },
+  /// The receiver has handed this context to the driver; its single-byte confirmation precedes another callback.
+  Confirm {
+    context: u64,
+  },
   VolumeInfo,
   /// Resolve a path to an object and its attributes (`GetSecurityByName`), or report it missing.
   Resolve {
@@ -190,7 +206,15 @@ enum Op<T> {
   /// Open an existing path (`Open`): resolve, then take a file or directory handle.
   Open {
     path: String,
-    purge: bool,
+  },
+  /// Resolve a private coherence open by identity, after its kernel token marker was checked.
+  PurgeResolve {
+    object: ObjectId,
+    ancestor: bool,
+  },
+  PurgeOpen {
+    path: String,
+    object: ObjectId,
   },
   /// Create a file or directory at a path (`Create`).
   Create {
@@ -253,7 +277,10 @@ impl<T> Op<T> {
   fn needs_barrier(&self) -> bool {
     matches!(
       self,
-      Op::Create { .. }
+      Op::Open { .. }
+        | Op::PurgeOpen { .. }
+        | Op::Release { .. }
+        | Op::Create { .. }
         | Op::SetSize { .. }
         | Op::Truncate { .. }
         | Op::Rename { .. }
@@ -265,6 +292,8 @@ impl<T> Op<T> {
 
 /// The shard's reply to an [`Op`].
 enum Reply {
+  /// The last context visited by a cooperative name update, or None when all live contexts were visited.
+  RenamedName(Option<u64>),
   Volume {
     total: u64,
     free: u64,
@@ -299,6 +328,7 @@ enum Reply {
 pub struct Request {
   op: Op<u64>,
   reply: SyncSender<Reply>,
+  hint: u64,
 }
 
 impl Request {
@@ -309,19 +339,47 @@ impl Request {
     bridge: &mut dyn Bridge,
     cx: &OpContext,
     names: &mut OpenNames,
-    ledger: &mut Ledger<SharedObject>,
+    ledger: &mut Ledger<SparseObject>,
+  ) -> Served {
+    if let Op::RenameName { after, from, to } = &self.op {
+      let reply = rename_one_name(names, ledger, *after, from, to);
+      return Served {
+        reply,
+        sender: self.reply,
+        barrier: false,
+        echo: false,
+        restored_read: false,
+      };
+    }
+    if let Op::Confirm { context } = &self.op {
+      let reply = confirm_reply(ledger, *context);
+      return Served {
+        reply,
+        sender: self.reply,
+        barrier: false,
+        echo: false,
+        restored_read: false,
+      };
+    }
+    self.serve_operation(bridge, cx, names, ledger)
+  }
+
+  /// Runs a filesystem operation after the receiver's confirmation messages have been handled above.
+  fn serve_operation(
+    self,
+    bridge: &mut dyn Bridge,
+    cx: &OpContext,
+    names: &mut OpenNames,
+    ledger: &mut Ledger<SparseObject>,
   ) -> Served {
     let opened = match &self.op {
-      Op::Open { path, purge } => Some((path.clone(), *purge)),
+      Op::Open { path } => Some((path.clone(), false)),
+      Op::PurgeOpen { path, .. } => Some((path.clone(), true)),
       Op::Create { path, .. } => Some((path.clone(), false)),
       _ => None,
     };
     let closed = match &self.op {
       Op::Release { object } => Some(*object),
-      _ => None,
-    };
-    let renamed = match &self.op {
-      Op::Rename { from, to } => Some((from.clone(), to.clone())),
       _ => None,
     };
     let bound = bind(self.op, ledger);
@@ -341,8 +399,8 @@ impl Request {
         Reply::Err(ntstatus(&VfsError::StaleHandle).as_i32())
       }
     };
-    reply = record_open_reply(reply, opened, bridge, cx, names, ledger);
-    reply = finish_context_effects(reply, closed, renamed, names, ledger);
+    reply = record_open_reply(reply, opened, self.hint, bridge, cx, names, ledger);
+    reply = finish_context_effects(reply, closed, names, ledger);
     Served {
       reply,
       sender: self.reply,
@@ -353,20 +411,56 @@ impl Request {
   }
 }
 
+fn confirm_reply(ledger: &mut Ledger<SparseObject>, context: u64) -> Reply {
+  match ledger.confirmed(context) {
+    Ok(()) => Reply::Ok,
+    Err(error) => {
+      eprintln!("slates-winfsp: open confirmation refused: {error}");
+      Reply::Err(ntstatus(&VfsError::RecoveryIncomplete).as_i32())
+    }
+  }
+}
+
+fn rename_one_name(
+  names: &mut OpenNames,
+  ledger: &mut Ledger<SparseObject>,
+  after: Option<u64>,
+  from: &str,
+  to: &str,
+) -> Reply {
+  let Some((context, inode)) = names.next_open(after) else {
+    return Reply::RenamedName(None);
+  };
+  let result = ledger
+    .rename_name(context, from, to)
+    .and_then(|()| ledger.name(context));
+  match result {
+    Ok(name) => {
+      names.opened(context, inode, &name);
+      Reply::RenamedName(Some(context))
+    }
+    Err(error) => {
+      eprintln!("slates-winfsp: durable kernel rename refused: {error}");
+      Reply::Err(ntstatus(&VfsError::RecoveryIncomplete).as_i32())
+    }
+  }
+}
+
 /// Records a new kernel context before returning it; a refused record releases the newly allocated bridge handle.
 fn record_open_reply(
   reply: Reply,
   opened: Option<(String, bool)>,
+  hint: u64,
   bridge: &mut dyn Bridge,
   cx: &OpContext,
   names: &mut OpenNames,
-  ledger: &mut Ledger<SharedObject>,
+  ledger: &mut Ledger<SparseObject>,
 ) -> Reply {
   let (Reply::Object { object, fh, info }, Some((path, purge))) = (&reply, opened) else {
     return reply;
   };
   let (object, fh, info) = (*object, *fh, *info);
-  match ledger.opened(Open { object, fh, purge }) {
+  match ledger.opened_for(Open { object, fh, purge }, &path, hint) {
     Ok(context) => {
       names.opened(context, object.inode, &path);
       Reply::Opened { context, info }
@@ -381,37 +475,37 @@ fn record_open_reply(
   }
 }
 
-/// Retires a successfully released context and applies a successful rename to the coherence names.
+/// Retires a released context. Kernel-name changes wait until the receiver has saved the complete rename result.
 fn finish_context_effects(
   reply: Reply,
   closed: Option<u64>,
-  renamed: Option<(String, String)>,
   names: &mut OpenNames,
-  ledger: &mut Ledger<SharedObject>,
+  ledger: &mut Ledger<SparseObject>,
 ) -> Reply {
-  if !matches!(reply, Reply::Ok) {
-    return reply;
-  }
   if let Some(context) = closed {
-    if let Err(error) = ledger.closed(context) {
-      eprintln!("slates-winfsp: close record refused: {error}");
-      return Reply::Err(ntstatus(&VfsError::RecoveryIncomplete).as_i32());
+    match ledger.closed(context) {
+      Ok(()) | Err(crate::opens::Refusal::Stale) => {}
+      Err(error) => {
+        eprintln!("slates-winfsp: close record refused: {error}");
+        return Reply::Err(ntstatus(&VfsError::RecoveryIncomplete).as_i32());
+      }
     }
     names.closed(context);
-  }
-  if let Some((from, to)) = renamed {
-    names.renamed(&from, &to);
   }
   reply
 }
 
 /// Binds opaque context tokens to their durable per-open records. The resulting operation cannot contain a pointer
 /// or a context that has not been checked against its generation.
-fn bind(op: Op<u64>, ledger: &Ledger<SharedObject>) -> Result<Op<Open>, crate::opens::Refusal> {
+fn bind(op: Op<u64>, ledger: &Ledger<SparseObject>) -> Result<Op<Open>, crate::opens::Refusal> {
   Ok(match op {
+    Op::RenameName { after, from, to } => Op::RenameName { after, from, to },
+    Op::Confirm { context } => Op::Confirm { context },
     Op::VolumeInfo => Op::VolumeInfo,
     Op::Resolve { path } => Op::Resolve { path },
-    Op::Open { path, purge } => Op::Open { path, purge },
+    Op::Open { path } => Op::Open { path },
+    Op::PurgeResolve { object, ancestor } => Op::PurgeResolve { object, ancestor },
+    Op::PurgeOpen { path, object } => Op::PurgeOpen { path, object },
     Op::Create { path, is_dir } => Op::Create { path, is_dir },
     Op::Read {
       object,
@@ -486,7 +580,7 @@ impl Served {
 
   /// Whether the request succeeded and changed what survives a restart: its reply waits for the shard's publication.
   pub fn needs_barrier(&self) -> bool {
-    self.barrier && !matches!(self.reply, Reply::Err(_))
+    self.barrier
   }
 
   /// The publication was refused: the reply becomes `STATUS_UNEXPECTED_IO_ERROR`, the effect being in the volume but not
@@ -548,6 +642,8 @@ fn object_reply(attr: &NodeAttr, fh: u64) -> Result<Reply, VfsError> {
 /// The operation body, returning `Result` so the `?` operator threads refusals; [`Request::serve`] maps them.
 fn run(bridge: &mut dyn Bridge, cx: &OpContext, op: Op<Open>) -> Result<Reply, VfsError> {
   Ok(match op {
+    Op::RenameName { .. } => return Err(VfsError::RecoveryIncomplete),
+    Op::Confirm { .. } => return Err(VfsError::RecoveryIncomplete),
     Op::VolumeInfo => {
       let root = bridge.root(cx)?;
       let stat = bridge.statfs(ObjectId::new(root, 0), cx)?;
@@ -559,7 +655,7 @@ fn run(bridge: &mut dyn Bridge, cx: &OpContext, op: Op<Open>) -> Result<Reply, V
       Ok(attr) => object_reply(&attr, 0)?,
       Err(e) => Reply::Err(ntstatus(&e).as_i32()),
     },
-    Op::Open { path, .. } => {
+    Op::Open { path } => {
       let attr = resolve(bridge, cx, &path)?;
       let object = ObjectId::new(attr.ino, attr.generation);
       let fh = if matches!(attr.kind, Kind::Dir) {
@@ -567,6 +663,19 @@ fn run(bridge: &mut dyn Bridge, cx: &OpContext, op: Op<Open>) -> Result<Reply, V
       } else {
         bridge.open(object, cx, 0)?
       };
+      object_reply(&attr, fh)?
+    }
+    Op::PurgeResolve { object, ancestor } => {
+      let object = if ancestor {
+        ObjectId::new(bridge.root(cx)?, 0)
+      } else {
+        object
+      };
+      object_reply(&bridge.getattr(object, cx)?, 0)?
+    }
+    Op::PurgeOpen { object, .. } => {
+      let attr = bridge.getattr(object, cx)?;
+      let fh = bridge.open(object, cx, 0)?;
       object_reply(&attr, fh)?
     }
     Op::Create { path, is_dir } => op_create(bridge, cx, &path, is_dir)?,
@@ -651,7 +760,7 @@ fn run(bridge: &mut dyn Bridge, cx: &OpContext, op: Op<Open>) -> Result<Reply, V
         Reply::Ok
       } else {
         match delete {
-          Some(path) => op_delete(bridge, cx, &path)?,
+          Some(path) => op_delete(bridge, cx, &path, object.object)?,
           None => Reply::Ok,
         }
       }
@@ -728,12 +837,24 @@ fn op_rename(
 }
 
 /// Deletes `path`: an empty directory (`rmdir`) or a file (`unlink`), decided by the resolved kind.
-fn op_delete(bridge: &mut dyn Bridge, cx: &OpContext, path: &str) -> Result<Reply, VfsError> {
+fn op_delete(
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  path: &str,
+  opened: ObjectId,
+) -> Result<Reply, VfsError> {
   let (name, parent_id) = match split_parent(bridge, cx, path)? {
     Ok(pair) => pair,
     Err(status) => return Ok(Reply::Err(status)),
   };
-  let target = bridge.lookup(parent_id, cx, name)?;
+  let target = match bridge.lookup(parent_id, cx, name) {
+    Ok(target) => target,
+    Err(VfsError::NotFound) => return Ok(Reply::Ok),
+    Err(error) => return Err(error),
+  };
+  if ObjectId::new(target.ino, target.generation) != opened {
+    return Err(VfsError::StaleHandle);
+  }
   if matches!(target.kind, Kind::Dir) {
     bridge.rmdir(parent_id, cx, name)?;
   } else {
@@ -773,7 +894,7 @@ fn read_all_entries(
 
 /// The handler stored in the file system's `UserContext`: the channel to the mount's task, the waker of that task, and
 /// the one reference security descriptor every object reports. `Send + Sync` (a `SyncSender`, a `Waker` and a byte
-/// vector), so WinFsp's dispatcher threads reach it soundly; the COARSE guard serializes them regardless.
+/// vector), so the owned receiver reaches it soundly. That single caller needs no DLL operation guard.
 struct Handler {
   requests: SyncSender<Request>,
   wake: Waker,
@@ -785,15 +906,77 @@ impl Handler {
   /// Sends `op` to the mount's task, wakes it, and blocks this dispatcher thread for its reply; a closed channel (the
   /// mount is being torn down) is `STATUS_UNSUCCESSFUL`, never a hang.
   fn call(&self, op: Op<u64>) -> Reply {
-    let (reply, answer) = sync_channel(1);
-    if self.requests.send(Request { op, reply }).is_err() {
-      return Reply::Err(crate::status_unsuccessful());
-    }
-    self.wake.wake_by_ref();
-    answer
-      .recv()
-      .unwrap_or(Reply::Err(crate::status_unsuccessful()))
+    call_on(&self.requests, &self.wake, op)
   }
+}
+
+fn call_on(requests: &SyncSender<Request>, wake: &Waker, op: Op<u64>) -> Reply {
+  let (reply, answer) = sync_channel(1);
+  if requests
+    .send(Request {
+      op,
+      reply,
+      hint: crate::dispatcher::current_hint(),
+    })
+    .is_err()
+  {
+    return Reply::Err(crate::status_unsuccessful());
+  }
+  wake.wake_by_ref();
+  answer
+    .recv()
+    .unwrap_or(Reply::Err(crate::status_unsuccessful()))
+}
+
+pub(crate) fn confirm_open(
+  requests: &SyncSender<Request>,
+  wake: &Waker,
+  context: u64,
+) -> Result<(), WinFspError> {
+  match call_on(requests, wake, Op::Confirm { context }) {
+    Reply::Ok => Ok(()),
+    Reply::Err(status) => Err(WinFspError::Api {
+      call: "confirm handed open",
+      status,
+    }),
+    _ => Err(WinFspError::Ledger(crate::opens::Refusal::Corrupt)),
+  }
+}
+
+/// Once the complete successful response is retained, update one context per owner turn. A second crash replays
+/// that response and finishes these idempotent updates before the kernel can rename its node or receive fresh work.
+pub(crate) fn rename_open_names(
+  requests: &SyncSender<Request>,
+  wake: &Waker,
+  from: &str,
+  to: &str,
+  bound: usize,
+) -> Result<(), WinFspError> {
+  let mut after = None;
+  for _ in 0..=bound {
+    match call_on(
+      requests,
+      wake,
+      Op::RenameName {
+        after,
+        from: from.to_owned(),
+        to: to.to_owned(),
+      },
+    ) {
+      Reply::RenamedName(None) => return Ok(()),
+      Reply::RenamedName(Some(context)) if after.is_none_or(|previous| previous < context) => {
+        after = Some(context)
+      }
+      Reply::Err(status) => {
+        return Err(WinFspError::Api {
+          call: "record kernel rename",
+          status,
+        });
+      }
+      _ => return Err(WinFspError::Ledger(crate::opens::Refusal::Corrupt)),
+    }
+  }
+  Err(WinFspError::Ledger(crate::opens::Refusal::Bound))
 }
 
 /// The handler behind a file system pointer, from its `UserContext`.
@@ -875,7 +1058,19 @@ extern "C" fn get_security_by_name(
   let handler = unsafe { handler(fs) };
   // SAFETY: `file_name` is a NUL-terminated UTF-16 path WinFsp owns for this call.
   let path = unsafe { wide_to_string(file_name) };
-  match handler.call(Op::Resolve { path }) {
+  let op = match crate::dispatcher::private_path(&path) {
+    Ok(None) => Op::Resolve { path },
+    Ok(Some(crate::purge::PrivatePath::File(object))) => Op::PurgeResolve {
+      object,
+      ancestor: false,
+    },
+    Ok(Some(crate::purge::PrivatePath::Ancestor)) => Op::PurgeResolve {
+      object: ObjectId::new(0, 0),
+      ancestor: true,
+    },
+    Err(status) => return status,
+  };
+  match handler.call(op) {
     Reply::Object { info, .. } => {
       if !p_file_attributes.is_null() {
         // SAFETY: non-null attributes out-parameter.
@@ -969,7 +1164,7 @@ extern "C" fn create(
 extern "C" fn open_trampoline(
   fs: *mut FileSystem,
   file_name: Pwstr,
-  create_options: u32,
+  _create_options: u32,
   _granted_access: u32,
   p_context: *mut Pvoid,
   p_info: *mut FileInfo,
@@ -978,23 +1173,16 @@ extern "C" fn open_trampoline(
   let handler = unsafe { handler(fs) };
   // SAFETY: `file_name` is a NUL-terminated UTF-16 path WinFsp owns for this call.
   let path = unsafe { wide_to_string(file_name) };
-  let purge = create_options & ffi::FILE_NO_INTERMEDIATE_BUFFERING != 0 && opened_by_this_process();
-  match handler.call(Op::Open { path, purge }) {
+  let op = match crate::dispatcher::private_path(&path) {
+    Ok(None) => Op::Open { path },
+    Ok(Some(crate::purge::PrivatePath::File(object))) => Op::PurgeOpen { path, object },
+    _ => return ntstatus(&VfsError::NotPermitted).as_i32(),
+  };
+  match handler.call(op) {
     Reply::Opened { context, info } => finish_open(context, info, p_context, p_info),
     Reply::Err(status) => status,
     _ => crate::status_object_name_not_found(),
   }
-}
-
-/// Whether the open being served was made by this process: WinFsp names the requester of a create or an open
-/// (`FspFileSystemOperationProcessIdF`, the requester's id from its access token). Where WinFsp cannot name it, no open is
-/// this process's, and the mount thread makes no purge (`Mounted::purge`).
-fn opened_by_this_process() -> bool {
-  ffi::api()
-    .ok()
-    .and_then(|api| api.operation_process_id)
-    // SAFETY: called on a dispatcher thread inside the open WinFsp is serving, where the operation context is set.
-    .is_some_and(|requester| unsafe { requester() } == std::process::id())
 }
 
 extern "C" fn overwrite(
@@ -1031,10 +1219,13 @@ extern "C" fn cleanup(fs: *mut FileSystem, context: Pvoid, file_name: Pwstr, fla
   });
   // Cleanup returns nothing to the kernel: a refused delete or publication leaves the file as it was, which the
   // caller sees at its next look; the shard counts what it refused.
-  let _ = handler.call(Op::Cleanup {
-    object: context_key(context),
-    delete,
-  });
+  report_terminal_reply(
+    "cleanup",
+    handler.call(Op::Cleanup {
+      object: context_key(context),
+      delete,
+    }),
+  );
 }
 
 extern "C" fn close(fs: *mut FileSystem, context: Pvoid) {
@@ -1043,9 +1234,19 @@ extern "C" fn close(fs: *mut FileSystem, context: Pvoid) {
   if context.is_null() {
     return;
   }
-  let _ = handler.call(Op::Release {
-    object: context_key(context),
-  });
+  report_terminal_reply(
+    "close",
+    handler.call(Op::Release {
+      object: context_key(context),
+    }),
+  );
+}
+
+fn report_terminal_reply(call: &'static str, reply: Reply) {
+  if let Reply::Err(status) = reply {
+    eprintln!("slates-winfsp: {call} refused with NTSTATUS {status:#010x}");
+    crate::dispatcher::record_terminal_refusal(status);
+  }
 }
 
 extern "C" fn read(
@@ -1360,7 +1561,7 @@ static INTERFACE: Interface = Interface {
 // ------------------------------------------------------------------------------- the mount lifecycle
 
 /// A live WinFsp file system: the object, the leaked handler, and the library's exports. Owned by the mount thread
-/// for its whole life; unmounts, stops the dispatcher, deletes the file system and reclaims the handler on drop.
+/// for its whole life; joins the receiver, closes its own held-object copies and reclaims the DLL object/handler on drop.
 struct Mounted {
   api: &'static Api,
   file_system: *mut FileSystem,
@@ -1369,6 +1570,9 @@ struct Mounted {
   mount_point: String,
   drive: Option<Drive>,
   record: Record,
+  worker: Option<crate::dispatcher::Worker>,
+  purge_token: crate::purge_token::PurgeToken,
+  purge_intents: crate::purge_intents::Sender,
 }
 
 /// What a notification round came to (§4.6 "Windows").
@@ -1391,6 +1595,8 @@ impl Mounted {
     requests: SyncSender<Request>,
     wake: Waker,
     inherited: Option<(Record, OwnedHandle, OwnedHandle)>,
+    purge_intents: crate::purge_intents::Sender,
+    private_opens: &mut crate::purge_intents::Intents,
   ) -> Result<Mounted, WinFspError> {
     let drive: [u16; 2] = mount_point
       .encode_utf16()
@@ -1406,6 +1612,7 @@ impl Mounted {
     {
       return Err(WinFspError::Record(crate::held::Refusal::Drive));
     }
+    let purge_token = crate::purge_token::PurgeToken::new()?;
     let api = ffi::api().map_err(|_| WinFspError::NotInstalled)?;
     let security_descriptor = everyone_security_descriptor()?;
     let handler = Box::into_raw(Box::new(Handler {
@@ -1424,6 +1631,7 @@ impl Mounted {
     // WinFsp's default, named here because a purge Windows did not take is made again until this passes
     // (`crate::retry::REQUEST_TIMEOUT_MS`): the two are one number.
     params.irp_timeout = crate::retry::REQUEST_TIMEOUT_MS;
+    params.transact_timeout = crate::dispatcher::TRANSACT_TIMEOUT_MS;
     // A closed file's bytes are written back before its close's request (which publishes them) and its pages dropped:
     // a Windows program's write reaches every other path by its close, not at the cache manager's lazy write-back
     // seconds later. Without it, CI's first run (40249524066) read a file PowerShell had written and closed as 62 zero
@@ -1471,11 +1679,19 @@ impl Mounted {
         drive,
         read_only,
       },
+      worker: None,
+      purge_token,
+      purge_intents,
     };
     // SAFETY: `file_system` is the DLL's live full object. Only its stable public prefix is accessed here.
     unsafe {
       (*file_system).user_context = handler.cast::<c_void>();
-      (api.set_guard_strategy)(file_system, GUARD_STRATEGY_COARSE);
+    }
+    // SAFETY: the DLL returned a live initialized public prefix. Its reserved version is zero in v2.1; the header's
+    // 792-byte full-object size is a separate static assertion, not the value of this reserved field.
+    let version = unsafe { (*file_system).version };
+    if version != crate::dispatcher::FILE_SYSTEM_VERSION {
+      return Err(WinFspError::UnsupportedAbi(version));
     }
     if let Some((record, volume, link)) = inherited {
       if record.drive_text().map_err(WinFspError::Record)? != mount_point
@@ -1494,18 +1710,13 @@ impl Mounted {
       }
       mounted.drive = Some(Drive::inherited(&record, link));
       mounted.record = record;
-    } else {
-      mounted.drive = Some(Drive::create(&mounted.record)?);
     }
-    // SAFETY: `file_system` is live and mounted; start its dispatcher threads.
-    let status = unsafe { (api.start_dispatcher)(file_system, DISPATCHER_THREADS) };
-    if status != 0 {
-      // The drop below removes the mount point and deletes the object; stopping a dispatcher that never started is a
-      // no-op in WinFsp.
-      return Err(WinFspError::Api {
-        call: "FspFileSystemStartDispatcher",
-        status,
-      });
+    // SAFETY: the DLL object now owns the final control handle (including substitution on adoption), and remains
+    // live throughout the zero-length readiness transaction. This never takes a request from the kernel.
+    let control = unsafe { (*file_system).volume_handle };
+    crate::dispatcher::announce_ready(control, private_opens)?;
+    if mounted.drive.is_none() {
+      mounted.drive = Some(Drive::create(&mounted.record)?);
     }
     Ok(mounted)
   }
@@ -1534,7 +1745,10 @@ impl Mounted {
   /// Hands Windows one round of notification records (`crate::notify::NotifyRound::bytes`).
   fn notify(&self, round: &[u8]) -> Result<Notified, WinFspError> {
     // SAFETY: `file_system` is live and its dispatcher started; a zero timeout never sleeps.
+    eprintln!("WINFSP STAGE: notify begin bytes={}", round.len());
+    // SAFETY: the live DLL object owns its final control handle throughout this zero-timeout call.
     let begun = unsafe { (self.api.notify_begin)(self.file_system, 0) };
+    eprintln!("WINFSP STAGE: notify begun {begun:#x}");
     if begun == ffi::STATUS_CANT_WAIT {
       return Ok(Notified::RenameInProgress);
     }
@@ -1553,7 +1767,10 @@ impl Mounted {
       )
     };
     // SAFETY: as above; ends the session the begin opened, whatever the notify answered.
+    eprintln!("WINFSP STAGE: notify told {told:#x}");
+    // SAFETY: ends the notification session on the same live DLL object.
     let ended = unsafe { (self.api.notify_end)(self.file_system) };
+    eprintln!("WINFSP STAGE: notify ended {ended:#x}");
     match (told, ended) {
       (0, 0) => Ok(Notified::Taken),
       (0, status) => Err(WinFspError::Api {
@@ -1570,20 +1787,13 @@ impl Mounted {
   /// Purges each file's changed range from Windows' cache and from every view mapped of it (`crate::purge`): opens the
   /// file through the drive unbuffered and writes the range, a piece at a time, from a zeroed buffer. WinFsp flushes and
   /// purges each piece's range with `CcCoherencyFlushAndPurgeCache` before the write reaches the host, which answers the
-  /// write without applying it (its open is this process's, unbuffered). Each piece is then read back through Windows'
+  /// write without applying it (its open carries the private restricting SID and expected file identity). Each piece is
+  /// then read back through Windows'
   /// cache and around it, and a purge whose pages Windows kept comes back untaken, for the server to owe it again
-  /// (`crate::retry`). Nothing is purged where WinFsp cannot name an open's process, since the host could then not tell
-  /// a purge's write from a program's.
-  fn purge(&self, purges: &[Purge]) -> Purged {
-    let count = u64::try_from(purges.len()).unwrap_or(u64::MAX);
+  /// (`crate::retry`). A missing or foreign private token never authorizes a purge write.
+  fn purge(&self, purges: &[Purge]) -> Result<Purged, WinFspError> {
     if purges.is_empty() {
-      return Purged::default();
-    }
-    if self.api.operation_process_id.is_none() {
-      return Purged {
-        unavailable: count,
-        ..Purged::default()
-      };
+      return Ok(Purged::default());
     }
     let piece = purge_piece();
     let piece_bytes = usize::try_from(piece).unwrap_or(0);
@@ -1592,14 +1802,20 @@ impl Mounted {
     let outcomes = purges
       .iter()
       .map(|purge| {
-        let outcome = self.purge_one(purge, zeros.bytes(), &mut aligned, piece);
-        (purge.clone(), outcome)
+        eprintln!("WINFSP STAGE: purge begin {purge:?}");
+        self.purge_intents.publish(Some(purge.clone()))?;
+        let outcome = self
+          .purge_token
+          .during(|| Ok(self.purge_one(purge, zeros.bytes(), &mut aligned, piece)));
+        eprintln!("WINFSP STAGE: purge done {outcome:?}");
+        self.purge_intents.publish(None)?;
+        outcome.map(|outcome| (purge.clone(), outcome))
       })
-      .collect();
-    Purged {
+      .collect::<Result<_, _>>()?;
+    Ok(Purged {
       outcomes,
       unavailable: 0,
-    }
+    })
   }
 
   /// One file's purge (`crate::purge::purge_through`) through an unbuffered open of it, which writes the range and reads
@@ -1633,6 +1849,7 @@ impl Mounted {
 /// Opens the file at `path` (a NUL-terminated UTF-16 path through the drive) with `access` and `flags`, sharing it
 /// whole: its handle, or `None` when Windows refused the open.
 fn open_through_drive(path: &[u16], access: u32, flags: u32) -> Option<OwnedHandle> {
+  eprintln!("WINFSP STAGE: open {:?} flags={flags:#x}", String::from_utf16_lossy(path));
   // SAFETY: `path` is a live NUL-terminated UTF-16 string for the call; no security attributes and no template.
   let raw = unsafe {
     CreateFileW(
@@ -1645,6 +1862,7 @@ fn open_through_drive(path: &[u16], access: u32, flags: u32) -> Option<OwnedHand
       std::ptr::null_mut(),
     )
   };
+  eprintln!("WINFSP STAGE: open returned {raw:?}");
   if raw == INVALID_HANDLE_VALUE || raw.is_null() {
     return None;
   }
@@ -1665,7 +1883,10 @@ struct DriveFile<'p> {
 
 impl PurgeTarget for DriveFile<'_> {
   fn write_zeros(&mut self, offset: u64, len: u32) -> bool {
-    write_zeros_at(&self.unbuffered, self.zeros, offset, len)
+    eprintln!("WINFSP STAGE: write zeros {offset} {len}");
+    let outcome = write_zeros_at(&self.unbuffered, self.zeros, offset, len);
+    eprintln!("WINFSP STAGE: wrote zeros {outcome}");
+    outcome
   }
 
   fn read_cached(&mut self, offset: u64, len: u32, out: &mut Vec<u8>) -> bool {
@@ -1808,10 +2029,13 @@ impl Drop for Mounted {
     // SAFETY: `file_system` is live; stop the dispatcher (its threads joined, so no callback runs after), unmount, and
     // delete it. A dispatcher thread waiting for the shard's reply returns once the channel's receiver is dropped,
     // which the mount's owner does before it stops the thread.
-    unsafe {
-      (self.api.stop_dispatcher)(self.file_system);
-      (self.api.delete)(self.file_system);
+    if let Some(mut worker) = self.worker.take()
+      && let Err(error) = worker.join()
+    {
+      eprintln!("slates-winfsp: join receive worker: {error}");
     }
+    // SAFETY: the only receive/operation worker has been joined, so no callback can reach the DLL object again.
+    unsafe { (self.api.delete)(self.file_system) };
     // No callback can run now, so reclaim the handler.
     // SAFETY: the handler was leaked in `new` and the dispatcher is stopped, so this is the sole taker.
     drop(unsafe { Box::from_raw(self.handler) });
@@ -1841,9 +2065,11 @@ pub struct Purged {
 /// The mounted volume's durable open ledger and the temporary duplicates used for its acknowledged anchor hold.
 pub struct Ready {
   /// Owned on the volume's shard after creation or recovery off the shard on the mount thread.
-  pub ledger: Ledger<SharedObject>,
+  pub ledger: Ledger<SparseObject>,
   /// Recovered contexts gathered off the shard, to seed names in cooperative turns.
-  pub opens: std::collections::VecDeque<(u64, Open)>,
+  pub opens: std::collections::VecDeque<(u64, Open, String)>,
+  /// The held contexts by file identity, computed off the shard. Recovery reconciles one file's reference count per turn.
+  pub open_counts: std::collections::BTreeMap<u64, (u64, u32)>,
   /// The volume and link duplicates, kept until the anchor owns its copies.
   pub offer: Offer,
 }
@@ -1873,6 +2099,10 @@ pub enum Outcome {
   Notified(Result<Notified, WinFspError>, Purged),
   /// What a purge-only command's purges came to.
   Purged(Purged),
+  /// The receive worker ended before the mount was intentionally stopped.
+  Failed(WinFspError),
+  /// The receive journal was settled before any fresh receive. The owner counts it; the taken-read oracle requires it.
+  Recovered(u64),
   /// The file system is unmounted and deleted; the thread is ending.
   Stopped,
 }
@@ -1986,16 +2216,26 @@ fn run_mount(
     }
     wake.wake_by_ref();
   };
+  let confirmations = requests.clone();
+  // Shape: the preceding purge's End and the next purge's Begin can be queued before a fresh kernel Create arrives.
+  let (purge_intents, mut private_opens) = match crate::purge_intents::channel() {
+    Ok(channel) => channel,
+    Err(error) => {
+      report(Outcome::Mounted(Err(error)));
+      report(Outcome::Stopped);
+      return;
+    }
+  };
   let prepared = (|| {
     let len = crate::opens::bytes(open_bound).map_err(WinFspError::Ledger)?;
-    let (ledger, inherited) = match inherited {
+    let (mut ledger, inherited) = match inherited {
       Some(Inherited {
         volume,
         link,
         ledger,
         record,
       }) => {
-        let memory = SharedObject::from_held_handle(ledger, len, slates_mem::Words::new())
+        let memory = SparseObject::from_held_handle(ledger, len, slates_mem::Words::new())
           .map_err(|error| WinFspError::Ledger(crate::opens::Refusal::Memory(error)))?;
         (
           Ledger::recover(memory, open_bound).map_err(WinFspError::Ledger)?,
@@ -2003,7 +2243,7 @@ fn run_mount(
         )
       }
       None => {
-        let memory = SharedObject::unnamed(len, slates_mem::Words::new())
+        let memory = SparseObject::unnamed(len, slates_mem::Words::new())
           .map_err(|error| WinFspError::Ledger(crate::opens::Refusal::Memory(error)))?;
         (
           Ledger::create(memory, open_bound).map_err(WinFspError::Ledger)?,
@@ -2011,21 +2251,94 @@ fn run_mount(
         )
       }
     };
-    let mounted = Mounted::new(mount_point, read_only, requests, wake.clone(), inherited)?;
+    let mut captured = vec![0; crate::inflight::capture::BYTES];
+    let at = crate::opens::capture_offset(open_bound).map_err(WinFspError::Ledger)?;
+    ledger
+      .memory()
+      .read(at, &mut captured)
+      .map_err(|error| WinFspError::Ledger(crate::opens::Refusal::Memory(error)))?;
+    let saved_open = crate::inflight::capture::Capture::new(&mut captured)
+      .map_err(WinFspError::Capture)?
+      .resume()
+      .map_err(WinFspError::Capture)?
+      .map(|batch| batch.saved_open())
+      .transpose()
+      .map_err(WinFspError::Capture)?
+      .flatten();
+    ledger
+      .settle_pending(saved_open)
+      .map_err(WinFspError::Ledger)?;
+    let mounted = Mounted::new(
+      mount_point,
+      read_only,
+      requests,
+      wake.clone(),
+      inherited,
+      purge_intents,
+      &mut private_opens,
+    )?;
+    let value = ledger
+      .memory()
+      .handle_value()
+      .map_err(|error| WinFspError::Ledger(crate::opens::Refusal::Memory(error)))?;
+    let raw = usize::try_from(value).map_err(|_| WinFspError::MountThread)? as *mut c_void;
+    // SAFETY: the ledger owns this live section, and the borrowed handle lasts only until duplication returns.
+    let section = unsafe { BorrowedHandle::borrow_raw(raw) }
+      .try_clone_to_owned()
+      .map_err(|error| WinFspError::Os {
+        call: "duplicate receive section",
+        code: error.raw_os_error(),
+      })?;
     let offer = mounted.offer()?;
-    let opens = ledger.live().collect();
+    let opens = ledger
+      .live()
+      .map(|(context, open)| ledger.name(context).map(|name| (context, open, name)))
+      .collect::<Result<_, _>>()
+      .map_err(WinFspError::Ledger)?;
+    let mut open_counts = std::collections::BTreeMap::<u64, (u64, u32)>::new();
+    for (_, open) in ledger.live() {
+      let entry = open_counts
+        .entry(open.object.inode)
+        .or_insert((open.object.generation, 0));
+      if entry.0 != open.object.generation {
+        return Err(WinFspError::Ledger(crate::opens::Refusal::Corrupt));
+      }
+      entry.1 = entry
+        .1
+        .checked_add(1)
+        .ok_or(WinFspError::Ledger(crate::opens::Refusal::Bound))?;
+    }
     Ok::<_, WinFspError>((
       mounted,
       Ready {
         ledger,
         offer,
         opens,
+        open_counts,
       },
+      section,
     ))
   })();
   let mounted = match prepared {
-    Ok((mounted, ready)) => {
+    Ok((mut mounted, ready, section)) => {
       report(Outcome::Mounted(Ok(Box::new(ready))));
+      match crate::dispatcher::Worker::start(
+        mounted.file_system.addr(),
+        section,
+        open_bound,
+        outcomes.clone(),
+        wake.clone(),
+        confirmations,
+        crate::dispatcher::PrivateOpens::new(mounted.purge_token.marker(), private_opens),
+      ) {
+        Ok(worker) => mounted.worker = Some(worker),
+        Err(error) => {
+          report(Outcome::Failed(error));
+          drop(mounted);
+          report(Outcome::Stopped);
+          return;
+        }
+      }
       mounted
     }
     Err(error) => {
@@ -2039,13 +2352,25 @@ fn run_mount(
       Command::Notify { round, purges } => {
         let told = mounted.notify(&round);
         let purged = if matches!(told, Ok(Notified::Taken)) {
-          mounted.purge(&purges)
+          match mounted.purge(&purges) {
+            Ok(purged) => purged,
+            Err(error) => {
+              report(Outcome::Failed(error));
+              break;
+            }
+          }
         } else {
           Purged::default()
         };
         report(Outcome::Notified(told, purged));
       }
-      Command::Purge { purges } => report(Outcome::Purged(mounted.purge(&purges))),
+      Command::Purge { purges } => match mounted.purge(&purges) {
+        Ok(purged) => report(Outcome::Purged(purged)),
+        Err(error) => {
+          report(Outcome::Failed(error));
+          break;
+        }
+      },
     }
   }
   drop(mounted);
@@ -2087,3 +2412,7 @@ fn write_wide(field: &mut [u16], s: &str) {
     *slot = unit;
   }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/host.rs"]
+mod tests;
