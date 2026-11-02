@@ -52,8 +52,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::{
-  ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
-  PIPE_TYPE_BYTE, PIPE_WAIT,
+  ConnectNamedPipe, CreateNamedPipeW, NAMED_PIPE_MODE, PIPE_READMODE_BYTE, PIPE_READMODE_MESSAGE,
+  PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_TYPE_MESSAGE, PIPE_WAIT,
+  SetNamedPipeHandleState,
 };
 use windows_sys::Win32::System::Threading::CreateEventW;
 
@@ -109,6 +110,36 @@ fn os(call: &'static str) -> IpcError {
 /// then reads its reply on one thread never finished its write (measured on jupiter 2026-10-26: this module's own
 /// round-trip test hung). Refused `Layout` for a size past what `CreateNamedPipeW` takes (a `u32`).
 pub fn pair(frame_bytes: usize) -> Result<(OwnedHandle, OwnedHandle), IpcError> {
+  pair_in(frame_bytes, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE)
+}
+
+/// [`pair`] in message mode: each write is one message, written whole or not at all, and each read returns one message
+/// at both ends, for a channel of fixed messages that two processes exchange (the anchor's hold channel on Windows,
+/// A-198). A write a reader is not taking can be cancelled without leaving part of a message behind.
+pub fn message_pair(frame_bytes: usize) -> Result<(OwnedHandle, OwnedHandle), IpcError> {
+  let (server, client) = pair_in(frame_bytes, PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE)?;
+  let mode: NAMED_PIPE_MODE = PIPE_READMODE_MESSAGE;
+  // SAFETY: the client end just opened, owned here; the mode is a live local; the two collection settings stay as they
+  // are (null). A client end opens in byte read mode whatever the pipe's type, so it is set to read messages too.
+  if unsafe {
+    SetNamedPipeHandleState(
+      client.as_raw_handle(),
+      &mode,
+      std::ptr::null(),
+      std::ptr::null(),
+    )
+  } == 0
+  {
+    return Err(os("SetNamedPipeHandleState"));
+  }
+  Ok((server, client))
+}
+
+/// The connected pair in `pipe_mode` (the pipe's type and its server end's read mode).
+fn pair_in(
+  frame_bytes: usize,
+  pipe_mode: NAMED_PIPE_MODE,
+) -> Result<(OwnedHandle, OwnedHandle), IpcError> {
   let buffer = u32::try_from(frame_bytes).map_err(|_| IpcError::Layout {
     reason: "a pipe buffer past what CreateNamedPipeW takes",
   })?;
@@ -126,7 +157,7 @@ pub fn pair(frame_bytes: usize) -> Result<(OwnedHandle, OwnedHandle), IpcError> 
     CreateNamedPipeW(
       wide.as_ptr(),
       PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
-      PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+      pipe_mode | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
       ONE_INSTANCE,
       buffer,
       buffer,

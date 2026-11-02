@@ -1,0 +1,55 @@
+name: DIAG the Windows hold channel across processes (Step 9.2, not for main)
+
+# Step 9.2 of the VFS and DAX plan: the anchor's Windows hold channel (A-198) across real processes, with no WinFsp.
+# The test re-invokes itself as a sender and two checkers; it proves the anchor duplicates a handle out of a child,
+# holds it past the child's death, and a spawned successor inherits the live object, and red-checks that without the
+# hold the object is gone. Runs on both Windows runners with --nocapture so the SENDER/CHECKER lines show.
+
+on:
+  push:
+    branches: ['diag-s9-hold-*']
+
+jobs:
+  hold:
+    name: the hold channel across processes on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-latest, windows-11-arm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (x86_64)
+        if: runner.arch == 'X64'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl for the C the daemon links (arm64)
+        if: runner.arch == 'ARM64'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: The same hold oracle must fail without the hold
+        shell: bash
+        run: |
+          set +e
+          cargo test -p slates-anchor --test handles_windows a_held_handle_outlives_its_sender_and_is_inherited_by_the_successor -- --exact --nocapture > red.log 2>&1
+          code=$?
+          cat red.log
+          test "$code" -ne 0 || exit 1
+          grep -F "1 failed" red.log || exit 1
+          grep -E "left: 0" red.log || exit 1
+          grep -E "right: 1" red.log || exit 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hold-red-${{ matrix.runner }}
+          path: red.log

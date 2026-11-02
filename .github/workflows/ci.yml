@@ -508,6 +508,10 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-ipc --test delivery
+      # A-198: acknowledged holds and explicit inheritance across real supervised processes; no WinFsp required.
+      - name: Test the Windows anchor hold and supervisor
+        if: ${{ !cancelled() }}
+        run: cargo test -p slates-anchor -- --test-threads=1
       # A Shards stream's end handed to a program by `spawn_with` (§4.6, A-181): the program writes through the handle its
       # arguments name; a child started afterwards inherits nothing of it, against an inheritable copy's contrast; the
       # launcher's copy stands until it lets the program go, and its kill-on-close job ends a program it drops.
@@ -754,6 +758,10 @@ jobs:
         run: cargo test -p slates-ipc --test rendezvous
       - name: Test the typed delivery (native arm64 Windows)
         run: cargo test -p slates-ipc --test delivery
+      # A-198: acknowledged holds and explicit inheritance across real supervised processes; no WinFsp required.
+      - name: Test the Windows anchor hold and supervisor
+        if: ${{ !cancelled() }}
+        run: cargo test -p slates-anchor -- --test-threads=1
       - name: Test the stream hand-off to a program (native arm64 Windows)
         run: cargo test -p slates-ipc --test stream_spawn
       - name: Test the IOCP driver's kick and no-op (native arm64 Windows)
@@ -988,6 +996,10 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-ipc --test delivery
+      # A-198: acknowledged holds and explicit inheritance across real supervised processes; no WinFsp required.
+      - name: Test the Windows anchor hold and supervisor
+        if: ${{ !cancelled() }}
+        run: cargo test -p slates-anchor -- --test-threads=1
       - name: Test the stream hand-off to a program (Windows, every push to main)
         if: ${{ !cancelled() }}
         timeout-minutes: 15

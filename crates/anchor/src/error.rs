@@ -69,6 +69,8 @@ pub enum AnchorError {
   },
   /// No daemon is running.
   NotRunning,
+  /// A Windows hold failed before the attachment could be committed or handed to a successor.
+  Hold(crate::handles::HandleRefusal),
 }
 
 impl fmt::Display for AnchorError {
@@ -112,6 +114,7 @@ impl fmt::Display for AnchorError {
         )
       }
       Self::NotRunning => f.write_str("no daemon is running"),
+      Self::Hold(error) => write!(f, "anchor hold: {error}"),
     }
   }
 }
@@ -121,5 +124,11 @@ impl std::error::Error for AnchorError {}
 impl From<MemError> for AnchorError {
   fn from(e: MemError) -> Self {
     Self::Memory(e)
+  }
+}
+
+impl From<crate::handles::HandleRefusal> for AnchorError {
+  fn from(error: crate::handles::HandleRefusal) -> Self {
+    Self::Hold(error)
   }
 }
