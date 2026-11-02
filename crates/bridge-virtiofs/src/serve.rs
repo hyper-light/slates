@@ -463,6 +463,9 @@ async fn serve_until_idle<S: VmmSeam, B: BridgeAccess>(
           }
           more || driven.kicked
         };
+        if let Err(refusal) = admitted.queues_suspended() {
+          return Some(end_of(refusal));
+        }
         report_dax_counts(admitted, bridge, counters);
         if more {
           futures::yield_now().await;
@@ -483,6 +486,9 @@ fn one_pass<S: VmmSeam, B: BridgeAccess>(
   bridge: &mut B,
   counters: &mut LoopCounters,
 ) -> Result<bool, ServeError> {
+  if admitted.queues_suspended()? {
+    return Ok(false);
+  }
   {
     let slice = bridge.copy_slice_bytes();
     let turned = bridge

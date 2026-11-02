@@ -122,6 +122,23 @@ pub struct QueueLayout {
   pub used_ring: GuestAddr,
 }
 
+/// The device's split-ring positions (virtio 1.2 §2.7). Both wrap modulo 2¹⁶. Their equality means every taken
+/// chain has a published used element: a queue holds at most its size, at most 32768, so a full wrap cannot hide work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueueProgress {
+  /// The next available descriptor the device would take, independent of the driver's available-ring index.
+  pub taken: u16,
+  /// The next used element the device would publish.
+  pub completed: u16,
+}
+
+impl QueueProgress {
+  /// Whether every chain the device took has completed, including replies held for publication, DAX or mount notice.
+  pub fn drained(self) -> bool {
+    self.taken == self.completed
+  }
+}
+
 impl QueueLayout {
   const fn base(&self, ring: Ring) -> GuestAddr {
     match ring {
@@ -488,6 +505,14 @@ impl Virtqueue {
   /// The layout.
   pub fn layout(&self) -> QueueLayout {
     self.layout
+  }
+
+  /// The positions owned by this device, never inferred from mutable guest memory (vhost-user `GET_VRING_BASE`).
+  pub fn progress(&self) -> QueueProgress {
+    QueueProgress {
+      taken: self.next_avail,
+      completed: self.next_used,
+    }
   }
 
   /// The caps.

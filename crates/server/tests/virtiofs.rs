@@ -981,6 +981,29 @@ mod vhost_front_end {
       let reply = self.reply().unwrap();
       u32::from_le_bytes(reply[4..8].try_into().unwrap())
     }
+
+    /// Stops every queue at its expected consumed position and checks that suspension keeps control connected.
+    pub(crate) fn assert_suspended(&self, positions: &[u32]) {
+      for (queue, position) in positions.iter().enumerate() {
+        assert_eq!(self.stop(u32::try_from(queue).unwrap()), *position);
+      }
+      assert_eq!(
+        self.get(request::GET_QUEUE_NUM),
+        u64::try_from(positions.len()).unwrap()
+      );
+    }
+
+    /// Restarts a stopped queue by handing its kick descriptor over again; no extra kick is required by the protocol.
+    pub(crate) fn restart(&self, queue: usize) {
+      assert_eq!(
+        self.set(
+          request::SET_VRING_KICK,
+          &u64::try_from(queue).unwrap().to_le_bytes(),
+          &[self.kicks[queue].as_fd()],
+        ),
+        0
+      );
+    }
   }
 
   /// The memory table: one region, the guest's RAM from guest address zero.
@@ -1039,6 +1062,15 @@ fn through_vhost(
 ) -> Vec<u8> {
   let head = guest.submit(request, common::guest::REPLY_CAP);
   front.kick_and_wait(1);
+  vhost_reply(guest, head)
+}
+
+/// Reaps the expected used chain after its interrupt and reads that chain's reply bytes.
+#[cfg(target_os = "linux")]
+fn vhost_reply(
+  guest: &mut common::guest::Guest<slates_bridge_virtiofs::vhost_user::GuestRegions>,
+  head: u16,
+) -> Vec<u8> {
   let (id, len) = guest.reap().expect("a used element after the interrupt");
   assert_eq!(id, head);
   guest.reply_of(head, len)
@@ -1072,11 +1104,11 @@ fn attach_vhost(
 /// AUD-29-68 (the inherited-descriptor binding). Do: provision a volume; hand the daemon one end of a
 /// socketpair as a vhost-user device; as the VMM, negotiate features, send a sealed memory object as the
 /// guest's RAM and configure both queues with eventfd kicks and calls; as the guest, CREATE, WRITE and RELEASE
-/// a file through the request queue, each kicked and its interrupt awaited; stop the ring (`GET_VRING_BASE`);
+/// a file through the request queue, each kicked and its interrupt awaited; stop both rings (`GET_VRING_BASE`);
 /// read the file back over the daemon's NFS port. Expect: every acknowledgement reports success; each request
 /// is answered through guest memory and its interrupt raised on the call eventfd; the stopped ring reports
-/// position 3 (three requests consumed); the device then ends through its terminal step with the doorbell hung
-/// up; the host reads the guest's bytes. Before 2026-10-01 this form was refused `BindingNotBuilt`.
+/// positions 0 and 3 (three requests consumed); control messages still work with both rings stopped; only closing
+/// the front end ends the device with the doorbell hung up; the host reads the guest's bytes (A-169).
 #[cfg(target_os = "linux")]
 #[test]
 fn a_vhost_user_front_end_drives_a_guest_whose_file_the_host_reads_back() {
@@ -1120,7 +1152,9 @@ fn a_vhost_user_front_end_drives_a_guest_whose_file_the_host_reads_back() {
     &message(Opcode::Release.to_wire(), 3, ino, &release_body(fh)),
   );
   assert_eq!(reply_error(&released), 0);
-  assert_eq!(front.stop(1), 3, "the ring's position is what it consumed");
+  front.assert_suspended(&[0, 3]);
+  assert!(ended.try_recv().is_err(), "a stopped ring is not a hangup");
+  drop(front);
   let outcome = ended
     .recv_timeout(common::guest::WAIT)
     .expect("the device ended");
@@ -1411,6 +1445,15 @@ mod vhost_form {
   /// A-194) on the back-end-request channel `backend`, places each at its offset in one region reserved for the window,
   /// as the front end does, and then acknowledges each, as a front end does once a map is placed.
   fn take_and_place_window(backend: &std::os::fd::OwnedFd, len: u64) -> WindowMap {
+    take_and_place_window_before_ack(backend, len, || {})
+  }
+
+  /// Places every piece, calls `before_ack` while the guest's SETUPMAPPING is still in flight, then acknowledges them.
+  fn take_and_place_window_before_ack(
+    backend: &std::os::fd::OwnedFd,
+    len: u64,
+    before_ack: impl FnOnce(),
+  ) -> WindowMap {
     use slates_bridge_virtiofs::vhost_user::{
       ACK_LEN, FLAG_REPLY, HEADER_AT_FLAGS, HEADER_AT_SIZE, HEADER_LEN, MMAP_FLAG_MAP_RW, VERSION,
       backend_request,
@@ -1475,6 +1518,7 @@ mod vhost_form {
       len,
       "the pieces cover the window once"
     );
+    before_ack();
     for _ in &placed {
       let mut ack = [0u8; HEADER_LEN + ACK_LEN];
       ack[0..4].copy_from_slice(&backend_request::SHMEM_MAP.to_le_bytes());
@@ -1562,6 +1606,99 @@ mod vhost_form {
       "the window shows the file"
     );
     (node, window)
+  }
+
+  /// A-169 / AC-4.12: stop a request queue while its SETUPMAPPING awaits map acknowledgements. Expect: control still
+  /// answers, the stop waits for the guest's completion and reports two taken chains, a posted third request remains
+  /// untouched while stopped, and SET_VRING_KICK alone restarts it. Stopping both queues keeps control alive until close.
+  #[test]
+  fn stopping_a_vhost_ring_drains_its_taken_request_and_leaves_new_work_until_restart() {
+    use slates_bridge_virtiofs::vhost_user::request;
+
+    let (daemon, mut client) = daemon_and_client("vhost-stop");
+    let volume = volume(&mut client, "stop");
+    let own = client
+      .attach(volume, None, Intent::Write)
+      .unwrap()
+      .attachment;
+    client
+      .fs_write(
+        (volume, own),
+        "/mapped.bin",
+        &vec![0x41; MAPPED_FILE_BYTES],
+        0o644,
+      )
+      .unwrap();
+    let device = client
+      .attach_vhost_user(volume, Intent::Write, ("slates", None), Some(WINDOW))
+      .unwrap();
+    let front = vhost_front_end::FrontEnd::over(device.end);
+    let ram = vhost_front_end::guest_ram(true);
+    let mut guest = vhost_front_end::guest_over(&ram);
+    let backend = front.negotiate_dax(&ram, WINDOW);
+    front.configure_queues(&guest);
+    let found = through_vhost(
+      &front,
+      &mut guest,
+      &message(Opcode::Lookup.to_wire(), 1, 1, b"mapped.bin\0"),
+    );
+    assert_eq!(reply_error(&found), 0);
+    let node = u64_at(&found, OUT_HEADER_LEN);
+    let head = guest.submit(
+      &message(
+        Opcode::SetupMapping.to_wire(),
+        2,
+        node,
+        &setup_body(0, DAX_RANGE, false, 0),
+      ),
+      common::guest::REPLY_CAP,
+    );
+    front.kick(1);
+    let window = take_and_place_window_before_ack(&backend, DAX_RANGE, || {
+      front.send(
+        request::GET_VRING_BASE,
+        0,
+        &vhost_front_end::FrontEnd::state(1, 0),
+        &[],
+      );
+      assert_eq!(
+        front.get(request::GET_QUEUE_NUM),
+        2,
+        "control works while the stop awaits its chain"
+      );
+      assert!(
+        guest.reap().is_none(),
+        "the map is not completed before its acknowledgements"
+      );
+    });
+    front.wait_call(1);
+    assert_eq!(reply_error(&vhost_reply(&mut guest, head)), 0);
+    let stopped = front
+      .reply()
+      .expect("the drained ring reports its position");
+    assert_eq!(u32::from_le_bytes(stopped[0..4].try_into().unwrap()), 1);
+    assert_eq!(u32::from_le_bytes(stopped[4..8].try_into().unwrap()), 2);
+    let next = guest.submit(
+      &message(Opcode::Lookup.to_wire(), 3, 1, b"mapped.bin\0"),
+      common::guest::REPLY_CAP,
+    );
+    front.kick(1);
+    assert_eq!(front.get(request::GET_QUEUE_NUM), 2);
+    assert!(
+      guest.reap().is_none(),
+      "a stopped queue consumes no newly posted chain"
+    );
+    front.restart(1);
+    front.wait_call(1);
+    assert_eq!(reply_error(&vhost_reply(&mut guest, next)), 0);
+    front.assert_suspended(&[0, 3]);
+    drop(window);
+    drop(front);
+    drop(backend);
+    client.detach(own).unwrap();
+    wait_for_attachments(&mut client, volume, 0);
+    drop(client);
+    drop(daemon);
   }
 
   /// G-vhost, the route by use through the daemon's real serve loop, with no VM: the client attaches the vhost-user form

@@ -13717,8 +13717,11 @@ trixie-backports, fuse3), `.github/workflows/ci.yml` (the live-guest lane's QEMU
   reading after the probe's Done reply, hiding the VMM's final stderr. The shared harness now retains bounded final
   output after observing exit. A real-process oracle fails before that drain (0.03 s) and passes after (0.02 s), on
   adacachy under the recorded resource cap. The clean-exit and data assertions are unchanged. This exposes the
-  QEMU shutdown cause for diagnosis; it does not claim that cause fixed. Record:
-  `docs/bugs/2026-11-02-a-vmm-exit-hid-its-final-diagnostic.md`.
+  QEMU shutdown cause: the backend closed control after the first ring stop, before QEMU could stop the second.
+  A-169's 2026-11-02 correction keeps control through suspension and drains the specified ring before reporting
+  its device-owned position. All eight guest histories pass in the existing QEMU image on adacachy (28.23 s).
+  Records: `docs/bugs/2026-11-02-a-vmm-exit-hid-its-final-diagnostic.md` and
+  `docs/bugs/2026-11-02-stopping-one-vhost-ring-closed-the-control-connection.md`.
 - **What it answers.** The DAX matrix ruled QEMU out on both routes: upstream's vhost-user-fs device has no window
   property, and the window is the front end's to offer. That holds of QEMU's vhost-user-fs-pci, which has no window in
   11.1 either, and was wrong of QEMU. 11.1.0 is the first release whose generic vhost-user device
@@ -14548,6 +14551,17 @@ dispatch; `shards.rs` the end handoff shared), `crates/client` (`attach_vhost_us
   (`serve::until_revoked` races the negotiation against the loop's revoke), and it ends when the VMM's end closes: the
   VM exited, never started, or closed it. A VM's boot is not slates' to bound (§4.6 "The harness owns VM and container
   creation"), and a front end that never speaks holds only its own attachment, within the shard's device bound.
+- **Ring lifetime corrected 2026-11-02.** GET_VRING_BASE stops the specified queue, waits for every chain it took to
+  have a published used element, then returns the device's next available index. Started/stopped is independent of
+  enabled/disabled; SET_VRING_KICK restarts a ring. With every ring stopped, the device is suspended: no new DAX turn
+  writes guest memory, and control messages still work. Socket close, not the first or last ring stop, ends the
+  device. This replaces the backend's wrong first-stop hangup, exposed by QEMU's queue-1 EOF and eventfd abort in
+  main CI 41529944478. Applied together to `bridge-virtiofs` (`virtqueue`, `device`, `admission`, `serve`,
+  `vhost_user`), the server's real-socket tests, `virtiofs.md` §6, A-189, GAPS and
+  `docs/bugs/2026-11-02-stopping-one-vhost-ring-closed-the-control-connection.md`. The two-stop test fails before
+  the fix (0.28 s) and passes after (0.27 s); the DAX in-flight/restart test passes (0.64 s), all 24 server cases pass,
+  and all eight real QEMU guest histories pass (28.23 s), adacachy, 2026-11-02. Evidence: QEMU's vhost-user protocol,
+  Ring states / Suspended device state / GET_VRING_BASE, and `hw/virtio/vhost.c::do_vhost_dev_stop`.
 - **DAX.** The window's size is the request's; the device offers per-inode DAX while the shard's fill budget has room,
   and the admission's DAX gate is open for this binding, whose windows map per-file backings (A-168). The in-process
   binding's gate stays closed.

@@ -23,6 +23,11 @@ It exits with code 3, distinct from libtest selecting zero tests. The parent mus
 the subsequent stderr. Its first protocol reply starts on a new line so libtest's unfinished role banner cannot
 hide it.
 
+The exposed QEMU error is now attributed and repaired separately: the backend closed control after the first ring
+stop, leaving queue 1's GET_VRING_BASE at EOF. See
+`2026-11-02-stopping-one-vhost-ring-closed-the-control-connection.md` for its failing protocol test and fix. The
+historical investigation and local-positive results below describe the diagnostic change, not that later fix.
+
 Before the fix, `cargo +1.98.1 test -p slates-cli --test vm_harness -- --nocapture` fails its diagnostic assertion on
 adacachy in 0.03 s, with the expected child exit code and the transcript ending at the second command. The build/test
 runs in an owned, bounded systemd unit with its own Cargo target; the diagnostic log is

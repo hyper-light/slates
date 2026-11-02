@@ -27,10 +27,10 @@
 //!   protocol refusal that ends the device.
 //! - **The device starts at index zero**: a queue whose starting index is not zero (a reconnect or a
 //!   migration) is refused at admission, since the device's ring position starts there.
-//! - **Stopping a ring ends the device**: `GET_VRING_BASE` is answered with the ring's position — the used
-//!   ring's index, which equals the next available index the device would read because the device completes
-//!   each request before it takes the next (`docs/wip/virtiofs.md` §6) — and the ring is stopped: the doorbell
-//!   reports a hangup, and the loop runs the terminal step. A new start is a new device.
+//! - **A ring stop keeps control connected** (A-169): `GET_VRING_BASE` stops taking chains on that queue, waits
+//!   for its taken chains to complete, then reports the device's next available index. All rings stopped means
+//!   suspension, not hangup; control messages still work. The VMM closing its socket ends the device. Closing on
+//!   the first ring stop made QEMU 11.1 abort stopping the second (main CI 41529944478, 2026-11-02).
 //! - **One doorbell**: an epoll descriptor holding the socket and every kick eventfd, so the loop waits on one
 //!   number; draining it serves pending control messages and consumes every kick.
 //!
@@ -55,7 +55,7 @@ use slates_mem::words::Words;
 use crate::admission::{Doorbell, Drained, SeamError, VmmSeam};
 use crate::device::DeviceConfig;
 use crate::memory::{Edge, GuestAddr, GuestMemory, GuestMemoryError, GuestRange};
-use crate::virtqueue::QueueLayout;
+use crate::virtqueue::{QueueLayout, QueueProgress};
 
 /// Format: vhost-user's message header: request (`u32`), flags (`u32`), payload size (`u32`).
 pub const HEADER_LEN: usize = 12;
@@ -576,6 +576,10 @@ struct Vring {
   kick: Option<OwnedFd>,
   call: Option<OwnedFd>,
   enabled: bool,
+  /// Ring state is independent of enabled state: SET_VRING_KICK starts it, GET_VRING_BASE stops it.
+  started: bool,
+  /// At most one stop awaiting completion per queue; a repeated request before its reply is a protocol refusal.
+  stop_reply: Option<Header>,
 }
 
 /// Format: the payload of a vring-state message: index (`u32`) and number (`u32`).
@@ -603,8 +607,6 @@ const VRING_AT_DESCRIPTOR: usize = 8;
 const VRING_AT_USED: usize = 16;
 /// Format: the available ring's address follows the used ring's.
 const VRING_AT_AVAILABLE: usize = 24;
-/// Format: virtio 1.2 §2.7.8 — the used ring's index follows its flags.
-const USED_IDX_OFFSET: u64 = 2;
 
 // ------------------------------------------------------------------------------------------ the seam
 
@@ -631,6 +633,8 @@ pub struct VhostUserSeam {
   config_tag: [u8; crate::device::TAG_LEN],
   /// The device's `num_request_queues`, captured at adopt for `GET_CONFIG` (the guest adds the high-priority queue).
   num_request_queues: u32,
+  /// Once layouts have been handed to the device, its positions decide when a stop may be answered.
+  admitted: bool,
   stopped: bool,
 }
 
@@ -692,6 +696,7 @@ impl VhostUserSeam {
       dax_region_bytes: 0,
       config_tag: config.tag.config_bytes(),
       num_request_queues: config.num_request_queues.get(),
+      admitted: false,
       stopped: false,
     })
   }
@@ -730,6 +735,7 @@ impl VhostUserSeam {
           && vring.addresses.is_some()
           && vring.kick.is_some()
           && vring.call.is_some()
+          && vring.started
           && (vring.enabled || !needs_enable)
       })
   }
@@ -740,7 +746,7 @@ impl VhostUserSeam {
   }
 
   /// Serves every control message already received, without blocking. `Ok(false)` once the front end has
-  /// closed its end or stopped a ring.
+  /// closed its end or the seam has been released. Stopping a ring keeps the control connection live.
   pub fn serve_control(&mut self) -> Result<bool, VhostError> {
     loop {
       if self.stopped {
@@ -910,7 +916,7 @@ impl VhostUserSeam {
     // Descriptors a message carried and its handler did not keep are closed with it.
     drop(self.take_fds());
     match outcome {
-      Ok(Answer::Replied) => Ok(()),
+      Ok(Answer::Replied | Answer::Deferred) => Ok(()),
       Ok(Answer::Acknowledge) => self.acknowledge(header, 0),
       Err(error) => {
         let _ = self.acknowledge(header, 1);
@@ -1181,26 +1187,30 @@ impl VhostUserSeam {
     Ok(Answer::Acknowledge)
   }
 
-  /// `GET_VRING_BASE`: the ring stops. Its position is the used ring's index (see the module's rules).
+  /// Stops taking new chains. Once admitted, the device reports its actual positions at its next boundary;
+  /// a held publication or DAX completion must finish before the reply, as the vhost-user protocol requires.
   fn get_vring_base(&mut self, header: Header, payload: &[u8]) -> Result<Answer, VhostError> {
-    let (vring, _) = self.vring_state(payload)?;
-    let used = vring.addresses.map(|addresses| addresses.used);
+    let admitted = self.admitted;
+    let (vring, reserved) = self.vring_state(payload)?;
+    if reserved != 0 || vring.stop_reply.is_some() {
+      return Err(protocol("a repeated ring stop or nonzero reserved field"));
+    }
+    vring.started = false;
+    if admitted {
+      vring.stop_reply = Some(header);
+      return Ok(Answer::Deferred);
+    }
+    let position = vring.base;
     let index = u32_at(payload, 0)?;
-    let position = used
-      .and_then(|used| self.memory.guest_of_user(used))
-      .and_then(|used| GuestRange::new(GuestAddr(used.0.checked_add(USED_IDX_OFFSET)?), 2).ok())
-      .and_then(|range| {
-        let mut bytes = [0u8; 2];
-        self.memory.read(range, &mut bytes).ok()?;
-        Some(u16::from_le_bytes(bytes))
-      })
-      .unwrap_or(0);
+    self.reply_vring_base(header, index, position)?;
+    Ok(Answer::Replied)
+  }
+
+  fn reply_vring_base(&self, header: Header, index: u32, position: u16) -> Result<(), VhostError> {
     let mut reply = Vec::with_capacity(VRING_STATE_LEN);
     reply.extend_from_slice(&index.to_le_bytes());
     reply.extend_from_slice(&u32::from(position).to_le_bytes());
-    self.reply(header, &reply)?;
-    self.stopped = true;
-    Ok(Answer::Replied)
+    self.reply(header, &reply)
   }
 
   fn set_vring_fd(&mut self, payload: &[u8], role: FdRole) -> Result<Answer, VhostError> {
@@ -1222,6 +1232,13 @@ impl VhostUserSeam {
     }
     match role {
       FdRole::Kick => {
+        if self
+          .vrings
+          .get(index)
+          .is_some_and(|vring| vring.stop_reply.is_some())
+        {
+          return Err(protocol("a ring restarted before its stop reply"));
+        }
         let fd = fd.ok_or(protocol(
           "a kick without a descriptor (polling is not served)",
         ))?;
@@ -1229,11 +1246,12 @@ impl VhostUserSeam {
         let key = u64::try_from(index).map_err(|_| protocol("queue index"))?;
         epoll::add(&self.doorbell, &fd, EventData::new_u64(key), EventFlags::IN)
           .map_err(os("epoll_ctl"))?;
-        if let Some(vring) = self.vrings.get_mut(index)
-          && let Some(old) = vring.kick.replace(fd)
-        {
-          // The registration is on the open file, which the front end still holds: remove it explicitly.
-          let _ = epoll::delete(&self.doorbell, &old);
+        if let Some(vring) = self.vrings.get_mut(index) {
+          vring.started = true;
+          if let Some(old) = vring.kick.replace(fd) {
+            // The registration is on the open file, which the front end still holds: remove it explicitly.
+            let _ = epoll::delete(&self.doorbell, &old);
+          }
         }
       }
       FdRole::Call => {
@@ -1270,6 +1288,8 @@ impl VhostUserSeam {
 enum Answer {
   /// It replied itself.
   Replied,
+  /// Its single bounded reply is owed until the device drains the queue.
+  Deferred,
   /// It succeeded; a reply-ack, if asked for, reports success.
   Acknowledge,
 }
@@ -1600,7 +1620,7 @@ impl VmmSeam for VhostUserSeam {
     if !self.ready() {
       return Err(SeamError::QueuesUnavailable);
     }
-    self
+    let layouts = self
       .vrings
       .iter()
       .map(|vring| {
@@ -1624,7 +1644,28 @@ impl VmmSeam for VhostUserSeam {
           used_ring: guest(addresses.used)?,
         })
       })
-      .collect()
+      .collect::<Result<Vec<_>, _>>()?;
+    self.admitted = true;
+    Ok(layouts)
+  }
+
+  fn queue_running(&mut self, queue: u16, progress: QueueProgress) -> Result<bool, SeamError> {
+    let vring = self
+      .vrings
+      .get_mut(usize::from(queue))
+      .ok_or(SeamError::QueuesUnavailable)?;
+    let reply = if progress.drained() {
+      vring.stop_reply.take()
+    } else {
+      None
+    };
+    let running = vring.started && (vring.enabled || self.features & F_PROTOCOL_FEATURES == 0);
+    if let Some(header) = reply {
+      self
+        .reply_vring_base(header, u32::from(queue), progress.taken)
+        .map_err(seam_refusal)?;
+    }
+    Ok(running)
   }
 
   /// The tag and queue count are the front end's to present (`vhost-user-fs` carries them in the VMM's own

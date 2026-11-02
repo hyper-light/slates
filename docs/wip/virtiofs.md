@@ -172,11 +172,17 @@ box shared with two other builds — timings are not benchmarks)
 - **`peek`/`advance` instead of "un-pop".** A chain is admitted against the credits after the
   walk validates it and before it is consumed; a refusal leaves the ring position untouched and
   faults the device. The alternative (pop, then push back) would re-walk or trust a cached chain.
-- **Credit backpressure is not modelled** because this device completes each request before it
-  takes the next: a credit refusal can only mean one chain alone exceeds the attachment's credit,
-  which is a hostile or misconfigured driver, so it faults rather than skips. An asynchronous
-  completion path (a cross-shard bridge call) would add backpressure then — and the ledger's
-  `charge`/`release` already carry the in-flight counts it needs.
+- **Credits include held completions.** A-196 permits replies to wait out of order for the volume's mounts, and DAX
+  can hold a taken chain for fills and acknowledgements. The ledger charges before taking a chain and releases on
+  its used element; the queue sizes bound held replies. The old assumption that used and available positions were
+  always equal is invalid. A ring stop reports the device's consumed position only after all its taken chains have
+  completed (A-169, corrected 2026-11-02).
+- **A ring stop is not a device hangup.** GET_VRING_BASE stops one ring and waits for its taken requests; both rings
+  stopped means suspension with control still connected. SET_VRING_KICK restarts it without needing a further kick.
+  The VMM closing its socket ends the device, as A-169 requires. The real-socket tests exercise both stops, a DAX
+  request held at its acknowledgements, and work posted while stopped. The previous first-stop hangup caused
+  QEMU's poweroff abort (main CI 41529944478); see
+  `docs/bugs/2026-11-02-stopping-one-vhost-ring-closed-the-control-connection.md`.
 - **Indirect descriptors are refused, not implemented**: `VIRTIO_F_INDIRECT_DESC` is not offered;
   the Linux virtiofs driver does not need it (its chains are direct); implementing it fully
   (a second table, its own bounds and loop checks) is a later leg if a VMM negotiates it.

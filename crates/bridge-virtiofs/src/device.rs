@@ -824,6 +824,16 @@ impl Device {
     self.queues.get(usize::from(queue)).map(Virtqueue::counters)
   }
 
+  /// The device's consumed and completed positions, for draining a stopped ring without touching guest memory.
+  pub fn queue_progress(&self, queue: u16) -> Result<crate::virtqueue::QueueProgress, DeviceError> {
+    let index = self.queue_index(queue)?;
+    self
+      .queues
+      .get(index)
+      .map(Virtqueue::progress)
+      .ok_or(DeviceError::NotConfigured)
+  }
+
   /// Serves up to `batch` chains available on `queue`, in ring order, each through `bridge` under
   /// `cx`: peek (the walk validates the chain), admit (the attachment's credits are charged, before
   /// any buffer is touched), advance, gather, dispatch, scatter, publish, complete (the charge is

@@ -45,7 +45,7 @@ use crate::capability::{TransportCapability, attached_capability};
 use crate::credit::{AttachmentCredits, CreditLedger};
 use crate::device::{Completed, Device, DeviceConfig, DeviceError, Serviced};
 use crate::memory::GuestMemory;
-use crate::virtqueue::QueueLayout;
+use crate::virtqueue::{QueueLayout, QueueProgress};
 
 /// The two forms of the VMM seam (D-2: "an in-process or inherited-descriptor integration seam").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,6 +150,12 @@ pub trait VmmSeam {
   fn memory(&mut self) -> Result<&mut dyn GuestMemory, SeamError>;
   /// The queue layouts the driver configured, in queue order.
   fn queues(&mut self) -> Result<Vec<QueueLayout>, SeamError>;
+  /// Reports the device's positions and asks whether it may take another chain on `queue`. A transport that can
+  /// stop rings answers its pending stop only once `progress` is drained. Called at service boundaries and after
+  /// completions; the in-process interface keeps its queues running until revocation.
+  fn queue_running(&mut self, _queue: u16, _progress: QueueProgress) -> Result<bool, SeamError> {
+    Ok(true)
+  }
   /// Publishes the configuration space — the tag and queue count — to the guest.
   fn publish(&mut self, config: &DeviceConfig) -> Result<(), SeamError>;
   /// Raises the used-buffer notification for `queue` (the interrupt, or the call eventfd).
@@ -576,6 +582,24 @@ impl<S: VmmSeam> AdmittedDevice<S> {
     self.seam.drain_doorbell()
   }
 
+  /// Settles drained queue stops and reports suspension. A stopping queue with a taken chain still needs completion
+  /// work; once all queues are stopped and drained no DAX turn may write guest memory (vhost-user suspended state).
+  pub fn queues_suspended(&mut self) -> Result<bool, ServeError> {
+    let mut suspended = true;
+    for queue in 0..self.device.queue_count() {
+      let progress = self
+        .device
+        .queue_progress(queue)
+        .map_err(ServeError::Device)?;
+      let running = self
+        .seam
+        .queue_running(queue, progress)
+        .map_err(ServeError::Seam)?;
+      suspended &= !running && progress.drained();
+    }
+    Ok(suspended)
+  }
+
   /// The authenticated context an operation would run under, or the registry's refusal (after
   /// reclaim, `NotPermitted`).
   pub fn context(&self, registry: &Attachments) -> Result<OpContext, VfsError> {
@@ -615,8 +639,19 @@ impl<S: VmmSeam> AdmittedDevice<S> {
     let mut total = Serviced::default();
     let mut to_notify: Vec<u16> = Vec::new();
     {
-      let memory = self.seam.memory().map_err(ServeError::Seam)?;
       for queue in 0..self.device.queue_count() {
+        let progress = self
+          .device
+          .queue_progress(queue)
+          .map_err(ServeError::Device)?;
+        if !self
+          .seam
+          .queue_running(queue, progress)
+          .map_err(ServeError::Seam)?
+        {
+          continue;
+        }
+        let memory = self.seam.memory().map_err(ServeError::Seam)?;
         let pass = self
           .device
           .service_queue(queue, memory, bridge, &cx, batch, &mut self.ledger)
