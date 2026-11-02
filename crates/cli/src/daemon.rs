@@ -112,6 +112,9 @@ fn name_this_process() {
 
 /// Runs the daemon.
 pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
+  #[cfg(windows)]
+  slates_ipc::process_access::confine_current_holder()
+    .map_err(|error| failed("process handle authority", error))?;
   // Before anything shows the process: its own name, not the kernel's `exe` from the anchor's restart (A-145).
   #[cfg(target_os = "linux")]
   name_this_process();

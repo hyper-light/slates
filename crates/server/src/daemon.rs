@@ -3964,7 +3964,6 @@ fn configure_windows_hold_owner(present: bool, shards: &[ShardId]) -> Result<(),
 /// call `ENOTCONN` until its user unmounts it, so no write by path reaches the disk beneath. Ended here, not by a
 /// question sent ahead of the shutdown, which waits behind whatever the shard is running and answers the questions
 /// queued before it.
-
 #[cfg(target_os = "linux")]
 struct EndMounts;
 
