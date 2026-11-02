@@ -8,8 +8,8 @@ use slates_bridge_core::ObjectId;
 use slates_mem::MemError;
 use slates_wire::crc32c::crc32c;
 
-/// Format: identifies version 1 of the Windows open ledger.
-const MAGIC: &[u8; 4] = b"WFO1";
+/// Format: identifies version 2 of the Windows ledger: the open records followed by the retained receive journal.
+const MAGIC: &[u8; 4] = b"WFO2";
 /// Format: the immutable header carries the first epoch, the slot count, and a CRC32C after the magic.
 const HEADER: usize = MAGIC.len() + size_of::<u64>() + size_of::<u32>() + size_of::<u32>();
 /// Format: generation, live/purge flags, daemon epoch, inode, inode generation and bridge handle, then CRC32C.
@@ -92,14 +92,23 @@ struct Slot {
   quarantined: bool,
 }
 
-/// The bytes an open ledger needs. The bound is supplied by the bridge's admitted open-handle cap.
+/// The bytes an open ledger and its retained receive journal need. The bound is the bridge's admitted open cap.
 pub fn bytes(bound: usize) -> Result<usize, Refusal> {
+  capture_offset(bound)?
+    .checked_add(crate::inflight::capture::BYTES)
+    .ok_or(Refusal::Bound)
+}
+
+/// The retained receive region's first byte, after the fixed open frames and padding to the wire's eight-byte
+/// alignment. Only the receive worker touches that region; the shard's frame copies never overlap it.
+pub fn capture_offset(bound: usize) -> Result<usize, Refusal> {
   if bound == 0 || u32::try_from(bound).is_err() {
     return Err(Refusal::Bound);
   }
   bound
     .checked_mul(FRAME)
     .and_then(|body| body.checked_add(HEADER))
+    .and_then(|body| body.checked_next_multiple_of(align_of::<u64>()))
     .ok_or(Refusal::Bound)
 }
 
