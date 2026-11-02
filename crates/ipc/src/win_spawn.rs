@@ -368,6 +368,9 @@ pub struct Spawn<'a> {
   pub output: StandardOutput<'a>,
   /// The job the child is a member of from its creation, if any.
   pub job: Option<HANDLE>,
+  /// The process object's descriptor at creation, or the creating token's default descriptor. A supervised holder
+  /// uses A-198's protected descriptor before it can execute with inherited handles; consumers choose their own.
+  pub process_security: Option<&'a crate::process_access::ProcessSecurity>,
 }
 
 /// Whether two variable names are the same to the environment's reader (case-insensitively).
@@ -427,17 +430,23 @@ pub fn spawn(spawn: &Spawn<'_>) -> Result<Process, IpcError> {
     Some(block) => (block.as_ptr().cast(), CREATE_UNICODE_ENVIRONMENT),
     None => (null(), 0),
   };
+  let process_security = spawn
+    .process_security
+    .map(crate::process_access::ProcessSecurity::attributes)
+    .transpose()?;
+  let process_attributes = process_security.as_ref().map_or(null(), std::ptr::from_ref);
   // SAFETY: a plain-data record the call fills.
   let mut information: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
   // SAFETY: the command line is a mutable null-terminated buffer (the call may edit it); the environment is null (this
   // process's) or a well-formed double-null-terminated wide block, and the flag says which; the startup record is the
   // extended form with its attribute list live, and the flag says so; inheritance is on, narrowed to the list by the
-  // attribute.
+  // attribute. The optional process attributes and their borrowed descriptor stay live through this synchronous
+  // create; their returned process handle is not inheritable.
   let ok = unsafe {
     CreateProcessW(
       null(),
       command_line.as_mut_ptr(),
-      null(),
+      process_attributes,
       null(),
       1,
       EXTENDED_STARTUPINFO_PRESENT | unicode,
