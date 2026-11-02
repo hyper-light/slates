@@ -16,6 +16,9 @@
   clippy::indexing_slicing
 )]
 
+#[path = "../../anchor/tests/windows_access/mod.rs"]
+mod windows_access;
+
 use std::io::BufRead;
 use std::os::windows::fs::FileExt;
 use std::process::{Child, Command, Stdio};
@@ -39,6 +42,11 @@ const SERVING_LINE: &str = "slates daemon: instance ";
 const FILE_BYTES: usize = 4096;
 /// Format: the permission bits the SDK gives the file (`rw-r--r--`, `slates write`'s default).
 const FILE_MODE: u32 = 0o644;
+/// Format: the CLI's EXIT_FAILED (main.rs): startup failed before the process could serve the existing instance.
+const EXIT_FAILED: i32 = 4;
+/// Shape: the fixture admits one startup trace of at most 64 KiB. Reaching the cap is a failed test, never a pass
+/// caused by a discarded error or a child blocked writing its output.
+const STARTUP_TRACE_BYTES: u64 = 64 * 1024;
 
 fn pause() {
   // The test harness paces its polls; shipped code parks on its driver (D-9).
@@ -87,14 +95,14 @@ fn value_of(text: &str, key: &str) -> String {
     .to_owned()
 }
 
-/// The anchor process, killed and reaped on drop, so a failed assertion leaves no daemon behind (the daemon leaves
-/// when its anchor dies).
-struct AnchorProcess {
+/// A test-owned process, killed and reaped on drop. An anchor also owns a log-drain thread; a short-lived probe
+/// has no drain. Killing the anchor ends its daemon too, so an assertion leaves neither process behind.
+struct OwnedProcess {
   child: Child,
   drain: Option<std::thread::JoinHandle<()>>,
 }
 
-impl Drop for AnchorProcess {
+impl Drop for OwnedProcess {
   fn drop(&mut self) {
     let _ = self.child.kill();
     let _ = self.child.wait();
@@ -106,7 +114,7 @@ impl Drop for AnchorProcess {
 
 /// Starts `slates --instance INSTANCE anchor --quick --shards SHARDS`, waits for its daemon to serve and answer a
 /// streak of verbs, and bootstraps its consensus group.
-fn start_anchor(instance: &str) -> AnchorProcess {
+fn start_anchor(instance: &str) -> OwnedProcess {
   let mut child = slates()
     .args([
       "--instance",
@@ -135,7 +143,7 @@ fn start_anchor(instance: &str) -> AnchorProcess {
   let drain = std::thread::spawn(move || {
     let _ = std::io::copy(&mut stderr, &mut std::io::stderr());
   });
-  let anchor = AnchorProcess {
+  let anchor = OwnedProcess {
     child,
     drain: Some(drain),
   };
@@ -272,7 +280,7 @@ fn a_volume_mounted_through_winfsp_is_read_and_written_by_windows_programs() {
   let (code, _, err) = run(&instance, &["unmount", &drive]);
   assert_eq!(code, 0, "unmount: {err}");
   let started = Instant::now();
-  while std::fs::metadata(&root).is_ok() {
+  while std::fs::metadata(&root).is_ok() || drive_target(&drive).is_some() {
     assert!(
       started.elapsed() < WAIT_FOR,
       "the drive is gone after the unmount"
@@ -289,7 +297,7 @@ struct ChangedElsewhere {
   volume: slates_client::VolumeId,
   attachment: u64,
   file: String,
-  _anchor: AnchorProcess,
+  _anchor: OwnedProcess,
 }
 
 impl ChangedElsewhere {
@@ -651,6 +659,269 @@ fn a_winfsp_drive_handle_and_view_survive_twenty_killed_daemons() {
       "WINFSP TAKEOVER: completed {iteration}/{TAKEOVER_KILLS}, drives lost 0, restored reads {served}"
     );
   }
+}
+
+/// A-198/A-158. Do: keep a view of a file open, rename it through the SDK, kill the daemon, then write the renamed
+/// file through the successor. Expect: the original view follows its file even though its old pathname is gone.
+#[test]
+fn a_winfsp_view_of_a_renamed_file_follows_its_successor() {
+  if !live_mount_runs() {
+    return;
+  }
+  let mut fixture = ChangedElsewhere::new("renamed-takeover", b'A');
+  let mapped_file = std::fs::File::open(&fixture.file).unwrap();
+  let view = MappedView::of(&mapped_file);
+  assert_eq!(view.page(), vec![b'A'; FILE_BYTES]);
+  fixture
+    .writer
+    .fs_rename(
+      (fixture.volume, fixture.attachment),
+      "file.bin",
+      "renamed.bin",
+    )
+    .unwrap();
+  let drive = fixture.file.get(..2).unwrap().to_owned();
+  let original = drive_target(&drive).unwrap();
+  let killed = daemon_pid(&fixture.instance).unwrap();
+  kill_daemon(killed);
+  wait_for_successor(&fixture.instance, &drive, &original, killed, 1);
+  let deadlines = slates_client::Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get();
+  fixture.writer = slates_client::Client::connect(&fixture.instance, deadlines).unwrap();
+  fixture.attachment = fixture
+    .writer
+    .attach(fixture.volume, None, slates_client::Intent::Write)
+    .unwrap()
+    .attachment;
+  fixture
+    .writer
+    .fs_write(
+      (fixture.volume, fixture.attachment),
+      "renamed.bin",
+      &[b'B'; FILE_BYTES],
+      FILE_MODE,
+    )
+    .unwrap();
+  let followed = follows(b'B', || view.page()).is_some();
+  renamed_purge_counters(&fixture.instance);
+  assert!(std::fs::File::open(&fixture.file).is_err(), "a private purge must not revive the removed public name");
+  assert!(
+    followed,
+    "the pre-takeover view kept bytes from its old pathname after the file was renamed"
+  );
+}
+
+/// A-190/A-198. Do: rename a viewed file through the SDK and write it at its new name, without killing its daemon.
+/// Expect: the old view follows its file; the cache purge must reach the kernel node under its old name.
+#[test]
+fn a_winfsp_view_follows_its_file_after_an_sdk_rename() {
+  if !live_mount_runs() {
+    return;
+  }
+  let mut fixture = ChangedElsewhere::new("renamed-live", b'A');
+  let mapped_file = std::fs::File::open(&fixture.file).unwrap();
+  let view = MappedView::of(&mapped_file);
+  assert_eq!(view.page(), vec![b'A'; FILE_BYTES]);
+  fixture
+    .writer
+    .fs_rename(
+      (fixture.volume, fixture.attachment),
+      "file.bin",
+      "renamed.bin",
+    )
+    .unwrap();
+  fixture
+    .writer
+    .fs_write(
+      (fixture.volume, fixture.attachment),
+      "renamed.bin",
+      &[b'B'; FILE_BYTES],
+      FILE_MODE,
+    )
+    .unwrap();
+  let followed = follows(b'B', || view.page()).is_some();
+  renamed_purge_counters(&fixture.instance);
+  assert!(std::fs::File::open(&fixture.file).is_err(), "a private purge must not revive the removed public name");
+  assert!(
+    followed,
+    "the live view kept bytes from its old pathname after the file was renamed"
+  );
+}
+
+fn renamed_purge_counters(instance: &str) {
+  for name in [
+    PURGES_DONE,
+    PURGES_REFUSED,
+    PURGES_UNAVAILABLE,
+    PURGES_UNTAKEN,
+    PURGES_KEPT,
+    PURGE_ECHOES,
+  ] {
+    eprintln!("WINFSP RENAMED: {name} = {}", counter(instance, name));
+  }
+}
+
+/// Format: target process ids passed to the independent test role, separated by a comma.
+const FOREIGN_TARGETS: &str = "SLATES_WINFSP_FOREIGN_TARGETS";
+/// Shape: a probe's successful exit differs from libtest's zero when an exact filter selected no test.
+const FOREIGN_EXIT: i32 = 3;
+
+/// Waits for a short-lived owned process, bounded by the same fixture deadline as a daemon takeover.
+fn waited_process(process: &mut OwnedProcess) -> std::process::ExitStatus {
+  use std::os::windows::io::AsRawHandle;
+  // SAFETY: the child owns a live process handle throughout the bounded wait.
+  let waited = unsafe {
+    windows_sys::Win32::System::Threading::WaitForSingleObject(
+      process.child.as_raw_handle(),
+      u32::try_from(WAIT_FOR.as_millis()).unwrap(),
+    )
+  };
+  assert_eq!(
+    waited,
+    windows_sys::Win32::Foundation::WAIT_OBJECT_0,
+    "the probe must exit within {WAIT_FOR:?}"
+  );
+  process.child.wait().unwrap()
+}
+
+/// Captures one bounded startup trace while the test-owned process runs, with the same bounded wait and reaping
+/// guard as the independent access probe. The one-result channel cannot block its owned drain thread.
+fn startup_failure(command: &mut Command) -> (std::process::ExitStatus, String) {
+  use std::io::Read;
+  let (send, receive) = std::sync::mpsc::sync_channel(1);
+  let mut process = OwnedProcess {
+    child: command.stderr(Stdio::piped()).spawn().unwrap(),
+    drain: None,
+  };
+  let stderr = process.child.stderr.take().unwrap();
+  process.drain = Some(std::thread::spawn(move || {
+    let mut bytes = Vec::new();
+    let result = stderr.take(STARTUP_TRACE_BYTES).read_to_end(&mut bytes);
+    send.send((result, bytes)).unwrap();
+  }));
+  let exit = waited_process(&mut process);
+  let (result, bytes) = receive.recv_timeout(WAIT_FOR).unwrap();
+  result.unwrap();
+  assert!(
+    u64::try_from(bytes.len()).unwrap() < STARTUP_TRACE_BYTES,
+    "startup trace reached its bound"
+  );
+  let text = String::from_utf8(bytes).unwrap();
+  eprint!("{text}");
+  (exit, text)
+}
+
+/// A-198, Step 9.4. Do: ask a process outside the anchor's descendants to open new duplication and ACL-changing
+/// handles to both mount holders. Expect: Windows refuses each access with ERROR_ACCESS_DENIED, while the anchor
+/// continues to serve its original drive. The probe has no inherited process or mount handle.
+#[test]
+fn a_process_outside_the_anchor_cannot_take_either_holders_mount_handles() {
+  if !live_mount_runs() {
+    return;
+  }
+  let fixture = ChangedElsewhere::new("foreign", b'A');
+  let daemon = daemon_pid(&fixture.instance).unwrap();
+  let targets = format!("{},{}", fixture._anchor.child.id(), daemon);
+  let child = Command::new(std::env::current_exe().unwrap())
+    .args([
+      "--ignored",
+      "--exact",
+      "foreign_process_role",
+      "--nocapture",
+    ])
+    .env(FOREIGN_TARGETS, targets)
+    .spawn()
+    .unwrap();
+  let mut probe = OwnedProcess { child, drain: None };
+  assert_eq!(
+    waited_process(&mut probe).code(),
+    Some(FOREIGN_EXIT),
+    "the independent probe must execute and be refused"
+  );
+  assert_eq!(
+    std::fs::read(&fixture.file).unwrap(),
+    vec![b'A'; FILE_BYTES]
+  );
+}
+
+/// A-198, Step 9.4. Do: start an independent daemon for the mounted instance without an anchor handoff. Expect:
+/// the CLI's typed failure exit, the original daemon still serving, and the original drive still returning its file.
+#[test]
+fn a_second_daemon_cannot_take_an_instance_with_a_live_winfsp_drive() {
+  if !live_mount_runs() {
+    return;
+  }
+  let fixture = ChangedElsewhere::new("second", b'A');
+  let owner = daemon_pid(&fixture.instance).unwrap();
+  let mut command = slates();
+  command.args([
+    "--instance",
+    &fixture.instance,
+    "daemon",
+    "--quick",
+    "--shards",
+    SHARDS,
+  ]);
+  // This process is an independent claimant, never a successor handed the live anchor's authority.
+  for variable in [
+    slates_anchor::segment::ENV_HANDOFF,
+    slates_anchor::segment::ENV_LEN,
+    slates_anchor::segment::ENV_CONTENT,
+    slates_anchor::segment::ENV_CONTENT_LEN,
+  ] {
+    command.env_remove(variable);
+  }
+  let (exit, error) = startup_failure(&mut command);
+  assert_eq!(
+    exit.code(),
+    Some(EXIT_FAILED),
+    "the foreign daemon must return the CLI's startup failure exit"
+  );
+  assert!(
+    error.contains("the name is already a live section") && error.contains("Some(183)"),
+    "the second daemon must reach and fail the existing-instance ownership check: {error}"
+  );
+  assert_eq!(daemon_pid(&fixture.instance), Some(owner));
+  assert_eq!(
+    std::fs::read(&fixture.file).unwrap(),
+    vec![b'A'; FILE_BYTES]
+  );
+  eprintln!("WINFSP FOREIGN: second daemon refused; original owner {owner} still serves");
+}
+
+/// A-198. A sibling process of the anchor, selected by its parent through libtest's exact role name.
+#[test]
+#[ignore = "the independent Windows access probe, re-invoked by its parent"]
+fn foreign_process_role() {
+  use std::os::windows::io::{FromRawHandle, OwnedHandle};
+  use windows_sys::Win32::Storage::FileSystem::{WRITE_DAC, WRITE_OWNER};
+  use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_DUP_HANDLE};
+  let targets = std::env::var(FOREIGN_TARGETS).expect("the independent probe's targets");
+  windows_access::as_unprivileged(|| {
+    for target in targets.split(',') {
+      let pid: u32 = target.parse().unwrap();
+      for rights in [PROCESS_DUP_HANDLE, WRITE_DAC, WRITE_OWNER] {
+        // SAFETY: a pid from the public fixture; no inherited handle. The kernel checks access before opening it.
+        let raw = unsafe { OpenProcess(rights, 0, pid) };
+        if !raw.is_null() {
+          // SAFETY: OpenProcess returned a new handle owned by this role, closed before the failed assertion.
+          drop(unsafe { OwnedHandle::from_raw_handle(raw) });
+          panic!("WINFSP FOREIGN: process {pid} granted forbidden rights {rights:#x}");
+        }
+        let error = std::io::Error::last_os_error();
+        assert_eq!(
+          error.raw_os_error(),
+          Some(i32::try_from(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED).unwrap()),
+          "OpenProcess({pid}, {rights:#x}): {error}"
+        );
+        eprintln!("WINFSP FOREIGN: process {pid} refused rights {rights:#x}, access denied");
+      }
+    }
+  });
+  std::process::exit(FOREIGN_EXIT);
 }
 
 /// What a mapped view through the WinFsp mount does after another path's change, as the DAX matrix's Windows
