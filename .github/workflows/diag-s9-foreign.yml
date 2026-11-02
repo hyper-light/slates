@@ -1,0 +1,51 @@
+name: DIAG foreign process authority before confinement (Step 9.4)
+on:
+  push:
+    branches: ['diag-s9-foreign-*']
+jobs:
+  takeover:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-latest, windows-11-arm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - uses: ilammy/setup-nasm@v1.5.2
+        if: runner.arch == 'X64'
+      - name: clang-cl on arm64
+        if: runner.arch == 'ARM64'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Install WinFsp as in the native Windows lane
+        shell: pwsh
+        run: |
+          choco install winfsp -y --no-progress
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: An independent process cannot take a holders handles
+        shell: bash
+        env:
+          SLATES_TEST_CLI: '1'
+          WINFSP_TEST_MOUNT: '1'
+          AWS_LC_SYS_PREBUILT_NASM: '0'
+        run: |
+          set +e
+          cargo test -p slates-cli --test winfsp a_process_outside_the_anchor_cannot_take_either_holders_mount_handles -- --exact --nocapture --test-threads=1 > foreign.log 2>&1
+          result=$?
+          cat foreign.log
+          test "$result" -ne 0 && grep -Eq 'WINFSP FOREIGN: process .* granted forbidden rights 0x40' foreign.log && grep -q '1 failed' foreign.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: foreign-${{ matrix.runner }}
+          path: foreign.log
