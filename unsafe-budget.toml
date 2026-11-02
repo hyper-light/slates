@@ -319,7 +319,10 @@ slates-db = 0
 # setting call. The existing explicit handle-list spawn and kill-on-close job are reused.
 # 2026-11-02 (+1, A-198 Step 9.3): `win_spawn::clear_inheritance` calls SetHandleInformation on the one owned
 # inherited handle before it can enter any later child. There is no safe Win32 wrapper for the inheritance flag.
-slates-ipc = 110
+# 2026-11-02 (+3, A-198 Step 9.4): the holder's process descriptor is converted from SDDL, applied before acquiring
+# held objects, and freed with LocalFree (`process_access.rs`). CreateProcessW borrows that same descriptor at birth;
+# these Win32 security calls have no safe wrapper and add no file or privilege requirement.
+slates-ipc = 113
 # 2026-11-01 (+1, Step 6.1 of the VFS and DAX plan, `stream.rs` `spawn_bound` compiled only for Linux): `slates pmem`
 #   must stay its VMM's parent to hold the VMM's map and compare it back, so it spawns rather than replacing itself as
 #   `exec_with` does. `pre_exec` (unsafe by signature) whose closure sets the parent-death signal (`prctl`, through
