@@ -10431,6 +10431,18 @@ fn reconcile_lost(state: &mut ShardState, record: &VolumeRecord) -> (usize, usiz
       if crate::held_copy::keeps(&state.inherited_copies, a.id) {
         return false;
       }
+      #[cfg(windows)]
+      if matches!(a.form, AttachForm::WinFspMount { .. }) {
+        if let Some(at) = state
+          .inherited_winfsp
+          .iter()
+          .position(|held| held.attachment == a.id && held.matches(a))
+        {
+          let held = state.inherited_winfsp.swap_remove(at);
+          state.adopt_winfsp.push(((**a).clone(), held));
+          return false;
+        }
+      }
       // A WinFsp volume's file system was the dead process's own (§4.6 "Windows"): its drive went with it.
       matches!(a.consumer, Consumer::Sdk { .. } | Consumer::Guest)
         || matches!(a.form, AttachForm::WinFspMount { .. })

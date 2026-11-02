@@ -687,7 +687,7 @@ impl Daemon {
     crate::lock_ledger::reset(shards.first().map_or(0, |shard| shard.0));
     // What the anchor held across the restart (A-61, A-113): the FUSE devices, each moved to the shard that owns its
     // mount, and the NFS loopback connections, served again on the listener's shard below.
-    let handed = crate::anchor_hold::adopt();
+    let handed = crate::anchor_hold::adopt(config.held_device_bound());
     #[cfg(target_os = "linux")]
     let mut inherited_fuse = crate::fuse_hold::split(handed.devices, shards.len()).into_iter();
     #[cfg(all(unix, not(target_os = "linux")))]
@@ -695,6 +695,16 @@ impl Daemon {
     // The writable copies (A-197), each moved to the shard that holds its map: Linux alone sends the anchor one.
     #[cfg(target_os = "linux")]
     let mut inherited_copies = crate::held_copy::split(handed.copies, shards.len()).into_iter();
+    #[cfg(windows)]
+    let mut inherited_winfsp = crate::winfsp::split_held(handed.mounts, shards.len()).into_iter();
+    #[cfg(windows)]
+    let mut windows_channel = handed.channel;
+    #[cfg(windows)]
+    if windows_channel.is_some() {
+      let owner = shards.first().ok_or(ServerError::NotOnShard)?.0;
+      crate::anchor_hold::set_owner(owner)
+        .map_err(|error| ServerError::Anchor(slates_anchor::AnchorError::Hold(error)))?;
+    }
     let handed_connections = handed.connections;
     for (index, shard) in shards.iter().enumerate() {
       let env = segment.handoff_env()?;
@@ -707,6 +717,15 @@ impl Daemon {
       let held = inherited_fuse.next().unwrap_or_default();
       #[cfg(target_os = "linux")]
       let copies = inherited_copies.next().unwrap_or_default();
+      #[cfg(windows)]
+      let windows_holds = (
+        inherited_winfsp.next().unwrap_or_default(),
+        if index == 0 {
+          windows_channel.take()
+        } else {
+          None
+        },
+      );
       runtime.spawn_on(*shard, async move {
         // How long a shard's start takes (its recovery included) is in the boot log: the control loop's first call to
         // each shard queues behind it (GAPS, boot, 2026-10-05).
@@ -726,6 +745,8 @@ impl Daemon {
           retained,
           #[cfg(target_os = "linux")]
           (held, copies),
+          #[cfg(windows)]
+          windows_holds,
         );
         let took_us = started.elapsed().as_micros();
         match outcome {
@@ -3048,6 +3069,10 @@ fn init_shard(
     Vec<crate::fuse_hold::HeldDevice>,
     Vec<crate::held_copy::InheritedCopy>,
   ),
+  #[cfg(windows)] (inherited_winfsp, windows_channel): (
+    Vec<crate::winfsp::InheritedMount>,
+    Option<std::os::windows::io::OwnedHandle>,
+  ),
 ) -> Result<(), ServerError> {
   let (handoff, len) = handoff_of(env)?;
   let mut segment = AnchorSegment::attach(&handoff, len, identity)?;
@@ -3239,6 +3264,10 @@ fn init_shard(
     fuse_mounts: std::collections::BTreeMap::new(),
     #[cfg(windows)]
     winfsp_mounts: std::collections::BTreeMap::new(),
+    #[cfg(windows)]
+    inherited_winfsp,
+    #[cfg(windows)]
+    adopt_winfsp: Vec::new(),
     stale_fuse_mounts: Vec::new(),
     #[cfg(target_os = "linux")]
     inherited_fuse,
@@ -3426,11 +3455,19 @@ fn init_shard(
       }
     );
   }
+  #[cfg(windows)]
+  crate::anchor_hold::install(
+    windows_channel,
+    *config_shards.first().ok_or(ServerError::NotOnShard)?,
+  )
+  .map_err(crate::anchor_hold::HoldRefusal::into_server)?;
   state::install(state);
   // The FUSE mounts whose devices the anchor held, served again (A-61); then the dead ones of a killed
   // predecessor counted and left for their users to unmount (AUD-29-64, A-102).
   #[cfg(target_os = "linux")]
   crate::fuse::adopt_held();
+  #[cfg(windows)]
+  crate::winfsp::adopt_held();
   #[cfg(target_os = "linux")]
   crate::fuse::leave_stale();
   // Detached: the loop lives as long as the shard; nothing joins it (a joinable task stays in

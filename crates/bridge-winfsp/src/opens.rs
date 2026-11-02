@@ -1,0 +1,510 @@
+//! Opens that survive a daemon (A-198, §4.6 Windows). A kernel context is a generation and a slot, never a pointer.
+//! The owning shard alone reads or changes the ledger; dispatcher threads send the context to it. The anchor holds
+//! the backing memory without mapping it, and a successor opens it only after its predecessor has exited. This is
+//! ownership by move, with no per-open atomic or lock. Each fixed record has a CRC32C; a torn record is quarantined,
+//! never recycled beneath a kernel context. The live mount oracle is `crates/cli/tests/winfsp.rs` (Step 9.3).
+
+use slates_bridge_core::ObjectId;
+use slates_mem::MemError;
+use slates_wire::crc32c::crc32c;
+
+/// Format: identifies version 1 of the Windows open ledger.
+const MAGIC: &[u8; 4] = b"WFO1";
+/// Format: the header carries the daemon epoch, the slot count, and a CRC32C after the magic.
+const HEADER: usize = MAGIC.len() + size_of::<u64>() + size_of::<u32>() + size_of::<u32>();
+/// Format: generation, live/purge flags, daemon epoch, inode, inode generation and bridge handle, then CRC32C.
+const FRAME: usize = size_of::<u32>() + size_of::<u8>() + size_of::<u64>() * 4 + size_of::<u32>();
+/// Format: live is bit zero, purge is bit one; no other flag is defined.
+const LIVE: u8 = 1;
+/// Format: see [`LIVE`]. A purge's writes must never be applied, including after takeover.
+const PURGE: u8 = 2;
+
+/// A typed refusal at the open-ledger boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+  /// The requested slot count, allocation, or byte range cannot be represented.
+  Bound,
+  /// A header or record has an invalid checksum or shape.
+  Corrupt,
+  /// The kernel context is closed, quarantined, or belongs to an older generation.
+  Stale,
+  /// A generation or daemon epoch cannot advance without reuse.
+  Exhausted,
+  /// The memory backing refused a checked copy.
+  Memory(MemError),
+}
+
+impl std::fmt::Display for Refusal {
+  fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(out, "open ledger: {self:?}")
+  }
+}
+
+impl std::error::Error for Refusal {}
+
+/// The copy-only backing. The active daemon is its only reader and writer; a held handle alone grants no borrow.
+pub trait Memory {
+  /// Its fixed byte capacity.
+  fn len(&self) -> usize;
+  /// Whether it has no storage.
+  fn is_empty(&self) -> bool {
+    self.len() == 0
+  }
+  /// Copies a checked span out.
+  fn read(&self, at: usize, into: &mut [u8]) -> Result<(), Refusal>;
+  /// Replaces a checked span.
+  fn write(&mut self, at: usize, from: &[u8]) -> Result<(), Refusal>;
+}
+
+impl Memory for slates_mem::SharedObject {
+  fn len(&self) -> usize {
+    self.len()
+  }
+  fn read(&self, at: usize, into: &mut [u8]) -> Result<(), Refusal> {
+    self.read(at, into).map_err(Refusal::Memory)
+  }
+  fn write(&mut self, at: usize, from: &[u8]) -> Result<(), Refusal> {
+    self.write(at, from).map_err(Refusal::Memory)
+  }
+}
+
+/// A file a kernel context still holds. An older daemon's bridge handle is returned as zero, so it cannot alias a
+/// handle the successor has issued. `Bridge::release` then returns the reference recovery restored for this inode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Open {
+  /// Stable file identity, including an unlinked file.
+  pub object: ObjectId,
+  /// This daemon's bridge handle, or zero for a predecessor's open.
+  pub fh: u64,
+  /// This open belongs to a coherent purge, whose write is only an echo.
+  pub purge: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Slot {
+  generation: u32,
+  epoch: u64,
+  open: Option<Open>,
+  quarantined: bool,
+}
+
+/// The bytes an open ledger needs. The bound is supplied by the bridge's admitted open-handle cap.
+pub fn bytes(bound: usize) -> Result<usize, Refusal> {
+  if bound == 0 || u32::try_from(bound).is_err() {
+    return Err(Refusal::Bound);
+  }
+  bound
+    .checked_mul(FRAME)
+    .and_then(|body| body.checked_add(HEADER))
+    .ok_or(Refusal::Bound)
+}
+
+/// The bounded ledger, with process-local free slots and a checksum-protected frame for every issued context.
+/// Create and recovery run off the shard on the mount's already owned thread; serving moves this value to the shard.
+pub struct Ledger<M> {
+  memory: M,
+  slots: Vec<Slot>,
+  free: Vec<usize>,
+  epoch: u64,
+  quarantined: usize,
+}
+
+impl<M: Memory> Ledger<M> {
+  /// Uses freshly zeroed memory; only the header is written. New paging-file sections are zero-filled by Windows.
+  pub fn create(mut memory: M, bound: usize) -> Result<Self, Refusal> {
+    if memory.len() != bytes(bound)? {
+      return Err(Refusal::Bound);
+    }
+    let epoch = 1;
+    memory.write(0, &header(bound, epoch)?)?;
+    let mut slots = Vec::new();
+    let mut free = Vec::new();
+    slots.try_reserve_exact(bound).map_err(|_| Refusal::Bound)?;
+    free.try_reserve_exact(bound).map_err(|_| Refusal::Bound)?;
+    for index in 0..bound {
+      slots.push(Slot {
+        generation: 0,
+        epoch: 0,
+        open: None,
+        quarantined: false,
+      });
+      free.push(index);
+    }
+    Ok(Self {
+      memory,
+      slots,
+      free,
+      epoch,
+      quarantined: 0,
+    })
+  }
+
+  /// Recovers the held memory after the old daemon exited. An invalid slot stays occupied and reports a stale
+  /// context; it is never silently reused. An invalid header refuses the whole ledger.
+  pub fn recover(mut memory: M, bound: usize) -> Result<Self, Refusal> {
+    if memory.len() != bytes(bound)? {
+      return Err(Refusal::Bound);
+    }
+    let mut head = [0; HEADER];
+    memory.read(0, &mut head)?;
+    checked(&head)?;
+    if head.get(..MAGIC.len()) != Some(MAGIC.as_slice())
+      || read_u32(&head, MAGIC.len().saturating_add(size_of::<u64>()))?
+        != u32::try_from(bound).map_err(|_| Refusal::Bound)?
+    {
+      return Err(Refusal::Corrupt);
+    }
+    let epoch = read_u64(&head, MAGIC.len())?
+      .checked_add(1)
+      .ok_or(Refusal::Exhausted)?;
+    if epoch <= 1 {
+      return Err(Refusal::Corrupt);
+    }
+    let mut slots = Vec::new();
+    let mut free = Vec::new();
+    slots.try_reserve_exact(bound).map_err(|_| Refusal::Bound)?;
+    free.try_reserve_exact(bound).map_err(|_| Refusal::Bound)?;
+    let mut quarantined = 0usize;
+    for index in 0..bound {
+      let mut frame = [0; FRAME];
+      memory.read(offset(index)?, &mut frame)?;
+      let slot = match decode(&frame) {
+        Ok(slot) => slot,
+        Err(_) => {
+          quarantined = quarantined.saturating_add(1);
+          Slot {
+            generation: 0,
+            epoch: 0,
+            open: None,
+            quarantined: true,
+          }
+        }
+      };
+      if slot.open.is_none() && !slot.quarantined && slot.generation < u32::MAX {
+        free.push(index);
+      }
+      slots.push(slot);
+    }
+    memory.write(0, &header(bound, epoch)?)?;
+    Ok(Self {
+      memory,
+      slots,
+      free,
+      epoch,
+      quarantined,
+    })
+  }
+
+  /// Whether another open can be recorded before asking the bridge to allocate it.
+  pub fn has_room(&self) -> bool {
+    !self.free.is_empty()
+  }
+
+  /// Records an open before the context is handed to Windows. A full or exhausted ledger refuses admission.
+  pub fn opened(&mut self, open: Open) -> Result<u64, Refusal> {
+    let index = self.free.last().copied().ok_or(Refusal::Bound)?;
+    let old = self.slots.get(index).ok_or(Refusal::Bound)?;
+    let generation = old.generation.checked_add(1).ok_or(Refusal::Exhausted)?;
+    let slot = Slot {
+      generation,
+      epoch: self.epoch,
+      open: Some(open),
+      quarantined: false,
+    };
+    self.memory.write(offset(index)?, &encode(slot)?)?;
+    *self.slots.get_mut(index).ok_or(Refusal::Bound)? = slot;
+    self.free.pop();
+    token(index, generation)
+  }
+
+  /// Resolves the context on the shard. The returned bridge handle is usable only in the epoch that issued it.
+  pub fn get(&self, context: u64) -> Result<Open, Refusal> {
+    let (index, generation) = unpack(context)?;
+    let slot = self.slots.get(index).ok_or(Refusal::Stale)?;
+    if slot.generation != generation || slot.quarantined {
+      return Err(Refusal::Stale);
+    }
+    let mut open = slot.open.ok_or(Refusal::Stale)?;
+    if slot.epoch != self.epoch {
+      open.fh = 0;
+    }
+    Ok(open)
+  }
+
+  /// Retires a context after its bridge release succeeded. Repeated closes and old generations are typed misses.
+  pub fn closed(&mut self, context: u64) -> Result<(), Refusal> {
+    self.get(context)?;
+    let (index, generation) = unpack(context)?;
+    let slot = Slot {
+      generation,
+      epoch: 0,
+      open: None,
+      quarantined: false,
+    };
+    self.memory.write(offset(index)?, &encode(slot)?)?;
+    *self.slots.get_mut(index).ok_or(Refusal::Stale)? = slot;
+    if generation < u32::MAX {
+      self.free.push(index);
+    }
+    Ok(())
+  }
+
+  /// Live contexts, including those issued before the takeover, for rebuilding the mount's coherence names.
+  pub fn live(&self) -> impl Iterator<Item = (u64, Open)> + '_ {
+    self.slots.iter().enumerate().filter_map(|(index, slot)| {
+      let context = token(index, slot.generation).ok()?;
+      self.get(context).ok().map(|open| (context, open))
+    })
+  }
+
+  /// Torn records kept out of reuse; the owner counts them as recovery refusals.
+  pub fn quarantined(&self) -> usize {
+    self.quarantined
+  }
+
+  /// Returns the owned storage when this process stops using the ledger.
+  pub fn into_memory(self) -> M {
+    self.memory
+  }
+
+  /// Its storage, lent only while the ledger owns it; used to ask the anchor to hold the section.
+  pub fn memory(&self) -> &M {
+    &self.memory
+  }
+}
+
+fn token(index: usize, generation: u32) -> Result<u64, Refusal> {
+  let slot = u32::try_from(index)
+    .ok()
+    .and_then(|index| index.checked_add(1))
+    .ok_or(Refusal::Bound)?;
+  if generation == 0 {
+    return Err(Refusal::Stale);
+  }
+  Ok((u64::from(generation) << u32::BITS) | u64::from(slot))
+}
+
+fn unpack(context: u64) -> Result<(usize, u32), Refusal> {
+  let slot = u32::try_from(context & u64::from(u32::MAX)).map_err(|_| Refusal::Stale)?;
+  let index = slot
+    .checked_sub(1)
+    .and_then(|slot| usize::try_from(slot).ok())
+    .ok_or(Refusal::Stale)?;
+  let generation = u32::try_from(context >> u32::BITS).map_err(|_| Refusal::Stale)?;
+  if generation == 0 {
+    return Err(Refusal::Stale);
+  }
+  Ok((index, generation))
+}
+
+fn offset(index: usize) -> Result<usize, Refusal> {
+  index
+    .checked_mul(FRAME)
+    .and_then(|at| at.checked_add(HEADER))
+    .ok_or(Refusal::Bound)
+}
+
+fn header(bound: usize, epoch: u64) -> Result<[u8; HEADER], Refusal> {
+  let mut encoded = Vec::with_capacity(HEADER);
+  encoded.extend_from_slice(MAGIC);
+  encoded.extend_from_slice(&epoch.to_le_bytes());
+  encoded.extend_from_slice(
+    &u32::try_from(bound)
+      .map_err(|_| Refusal::Bound)?
+      .to_le_bytes(),
+  );
+  encoded.extend_from_slice(&crc32c(&encoded).to_le_bytes());
+  encoded.try_into().map_err(|_| Refusal::Corrupt)
+}
+
+fn encode(slot: Slot) -> Result<[u8; FRAME], Refusal> {
+  let mut encoded = Vec::with_capacity(FRAME);
+  encoded.extend_from_slice(&slot.generation.to_le_bytes());
+  let open = slot.open.unwrap_or(Open {
+    object: ObjectId::new(0, 0),
+    fh: 0,
+    purge: false,
+  });
+  encoded.push(if slot.open.is_some() {
+    LIVE | if open.purge { PURGE } else { 0 }
+  } else {
+    0
+  });
+  for value in [
+    slot.epoch,
+    open.object.inode,
+    open.object.generation,
+    open.fh,
+  ] {
+    encoded.extend_from_slice(&value.to_le_bytes());
+  }
+  encoded.extend_from_slice(&crc32c(&encoded).to_le_bytes());
+  encoded.try_into().map_err(|_| Refusal::Corrupt)
+}
+
+fn decode(frame: &[u8; FRAME]) -> Result<Slot, Refusal> {
+  if frame.iter().all(|byte| *byte == 0) {
+    return Ok(Slot {
+      generation: 0,
+      epoch: 0,
+      open: None,
+      quarantined: false,
+    });
+  }
+  checked(frame)?;
+  let generation = read_u32(frame, 0)?;
+  let flags_at = size_of::<u32>();
+  let flags = *frame.get(flags_at).ok_or(Refusal::Corrupt)?;
+  if generation == 0 || flags & !(LIVE | PURGE) != 0 || flags == PURGE {
+    return Err(Refusal::Corrupt);
+  }
+  let mut at = flags_at.saturating_add(1);
+  let epoch = next_u64(frame, &mut at)?;
+  let inode = next_u64(frame, &mut at)?;
+  let object_generation = next_u64(frame, &mut at)?;
+  let fh = next_u64(frame, &mut at)?;
+  if (flags & LIVE != 0 && epoch == 0)
+    || (flags == 0
+      && [epoch, inode, object_generation, fh]
+        .iter()
+        .any(|value| *value != 0))
+  {
+    return Err(Refusal::Corrupt);
+  }
+  Ok(Slot {
+    generation,
+    epoch,
+    open: (flags & LIVE != 0).then_some(Open {
+      object: ObjectId::new(inode, object_generation),
+      fh,
+      purge: flags & PURGE != 0,
+    }),
+    quarantined: false,
+  })
+}
+
+fn checked(frame: &[u8]) -> Result<(), Refusal> {
+  let at = frame
+    .len()
+    .checked_sub(size_of::<u32>())
+    .ok_or(Refusal::Corrupt)?;
+  if crc32c(frame.get(..at).ok_or(Refusal::Corrupt)?) != read_u32(frame, at)? {
+    return Err(Refusal::Corrupt);
+  }
+  Ok(())
+}
+
+fn read_u32(bytes: &[u8], at: usize) -> Result<u32, Refusal> {
+  let end = at.checked_add(size_of::<u32>()).ok_or(Refusal::Corrupt)?;
+  Ok(u32::from_le_bytes(
+    bytes
+      .get(at..end)
+      .and_then(|bytes| bytes.try_into().ok())
+      .ok_or(Refusal::Corrupt)?,
+  ))
+}
+
+fn read_u64(bytes: &[u8], at: usize) -> Result<u64, Refusal> {
+  let end = at.checked_add(size_of::<u64>()).ok_or(Refusal::Corrupt)?;
+  Ok(u64::from_le_bytes(
+    bytes
+      .get(at..end)
+      .and_then(|bytes| bytes.try_into().ok())
+      .ok_or(Refusal::Corrupt)?,
+  ))
+}
+
+fn next_u64(bytes: &[u8], at: &mut usize) -> Result<u64, Refusal> {
+  let value = read_u64(bytes, *at)?;
+  *at = at.checked_add(size_of::<u64>()).ok_or(Refusal::Corrupt)?;
+  Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+  #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+  use super::*;
+
+  struct Ram(Vec<u8>);
+  impl Memory for Ram {
+    fn len(&self) -> usize {
+      self.0.len()
+    }
+    fn read(&self, at: usize, into: &mut [u8]) -> Result<(), Refusal> {
+      into.copy_from_slice(self.0.get(at..at + into.len()).ok_or(Refusal::Bound)?);
+      Ok(())
+    }
+    fn write(&mut self, at: usize, from: &[u8]) -> Result<(), Refusal> {
+      self
+        .0
+        .get_mut(at..at + from.len())
+        .ok_or(Refusal::Bound)?
+        .copy_from_slice(from);
+      Ok(())
+    }
+  }
+
+  fn file(inode: u64) -> Open {
+    Open {
+      object: ObjectId::new(inode, 7),
+      fh: 42,
+      purge: false,
+    }
+  }
+
+  /// A-198. Do: record two opens, reopen their memory in a successor. Expect: file identity and purge marking
+  /// survive, while the old process's bridge handles cannot alias any successor handle.
+  #[test]
+  fn an_open_and_a_purge_open_survive_the_process_that_issued_them() {
+    let mut first = Ledger::create(Ram(vec![0; bytes(2).unwrap()]), 2).unwrap();
+    let context = first.opened(file(11)).unwrap();
+    let purge = first
+      .opened(Open {
+        purge: true,
+        ..file(12)
+      })
+      .unwrap();
+    let next = Ledger::recover(first.into_memory(), 2).unwrap();
+    assert_eq!(next.get(context).unwrap(), Open { fh: 0, ..file(11) });
+    assert_eq!(
+      next.get(purge).unwrap(),
+      Open {
+        fh: 0,
+        purge: true,
+        ..file(12)
+      }
+    );
+  }
+
+  /// A-198. Do: close, reuse and restart a slot. Expect: its former contexts stay stale and a full ledger refuses.
+  #[test]
+  fn a_reused_slot_never_revives_its_previous_context() {
+    let mut ledger = Ledger::create(Ram(vec![0; bytes(1).unwrap()]), 1).unwrap();
+    let old = ledger.opened(file(11)).unwrap();
+    assert_eq!(ledger.opened(file(12)), Err(Refusal::Bound));
+    ledger.closed(old).unwrap();
+    let mut ledger = Ledger::recover(ledger.into_memory(), 1).unwrap();
+    let new = ledger.opened(file(12)).unwrap();
+    assert_ne!(old, new);
+    assert_eq!(ledger.get(old), Err(Refusal::Stale));
+    assert_eq!(ledger.get(new).unwrap(), file(12));
+    assert_eq!(ledger.closed(old), Err(Refusal::Stale));
+  }
+
+  /// A-198. Do: interrupt each prefix of a changed record. Expect: a complete old or new record, or a quarantined
+  /// context; no interrupted frame resolves to a different file or re-enters the free list.
+  #[test]
+  fn a_torn_record_is_quarantined_instead_of_becoming_some_other_open() {
+    let mut ledger = Ledger::create(Ram(vec![0; bytes(1).unwrap()]), 1).unwrap();
+    let context = ledger.opened(file(11)).unwrap();
+    let original = ledger.into_memory().0;
+    for cut in 1..FRAME {
+      let mut interrupted = original.clone();
+      interrupted[HEADER..HEADER + cut].fill(0xff);
+      let resumed = Ledger::recover(Ram(interrupted), 1).unwrap();
+      assert_eq!(resumed.get(context), Err(Refusal::Stale));
+      assert!(!resumed.has_room());
+      assert_eq!(resumed.quarantined(), 1);
+    }
+  }
+}
