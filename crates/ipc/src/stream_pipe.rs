@@ -520,6 +520,7 @@ pub fn spawn_with(
     inherited: &[inherited.0],
     output: StandardOutput::Inherited,
     job: Some(job.0),
+    process_security: None,
   });
   drop(inherited);
   let process = spawned?;
