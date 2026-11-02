@@ -1406,7 +1406,10 @@ dependencies = [
 name = "slates-bridge-winfsp"
 version = "0.1.0"
 dependencies = [
+ "slates-anchor",
  "slates-bridge-core",
+ "slates-db",
+ "slates-ipc",
  "slates-machine",
  "slates-mem",
  "slates-vfs",

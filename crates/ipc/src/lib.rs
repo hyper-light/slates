@@ -80,6 +80,8 @@ pub mod wake;
 // Starting a child that inherits exactly the handles named for it (the delivery's read end, a Shards stream's end, the
 // anchor's held handles, A-198).
 #[cfg(windows)]
+pub mod process_access;
+#[cfg(windows)]
 pub mod win_spawn;
 
 pub use delivery::{Capability, Delivered, Delivery, DeliveryFault};
