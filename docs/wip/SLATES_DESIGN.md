@@ -12781,14 +12781,18 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
 ### A-198 — A WinFsp mount outlives its daemon: the anchor holds the volume's control handle, the drive's link and the mount's ledger, and the next daemon serves the held volume (accepted 2026-11-01, Step 9 of the VFS and DAX plan; designed, being built)
 Applied in the same change to: GAPS (gap 2 of the platform inventory). The build applies it to §4.6 "Windows",
 `docs/wip/platforms.md`, `crates/anchor`, `crates/server` and `crates/bridge-winfsp`, each in its own change.
+Source checks and remaining proof obligations are recorded in `docs/wip/research/winfsp-takeover.md` (2026-11-02).
+This is a source-derived design; the held-volume substitution and crash boundaries still require the live tests below.
 - **What it answers.** A WinFsp mount dies with its daemon (A-177: "the file system is the dead process's own, so
   recovery ends its record"), where a FUSE mount is held by the anchor (A-61). WinFsp deletes a volume at the cleanup
   of its control file object, that is when the last handle to it closes (`src/sys/volume.c`, `FspVolumeDeleteNoLock`,
   which asserts `IRP_MJ_CLEANUP`), and the daemon held the only handle. The drive letter goes the same way:
   `FspMountSet_Drive` (`src/dll/mount.c`) makes the `\??\X:` link a temporary object and keeps its handle, so the link
   dies with its last handle. WinFsp v2.1, the source read on 2026-11-01.
-- **What the anchor holds.** Per WinFsp mount, three handles, which the daemon duplicates into the anchor before the
-  attachment record commits (as a FUSE device is sent before its record):
+- **What the anchor holds.** Per WinFsp mount, three handles. The daemon sends their values on the hold channel; the
+  anchor duplicates them out of its live child and acknowledges the hold before the attachment record commits.
+  Windows does not attach handles to a channel message as Unix's `SCM_RIGHTS` does, so sending the values alone is not
+  enough. The three handles are:
   1. the volume's control handle, which keeps the volume;
   2. the drive link's handle, which keeps the drive letter;
   3. the mount's ledger: an unnamed section backed by the paging file (nothing on disk, R1) that the daemon writes as it
@@ -12840,6 +12844,8 @@ Applied in the same change to: GAPS (gap 2 of the platform inventory). The build
     `STATUS_CANCELLED`, the status WinFsp's own timeout gives.
   - A slot whose request was answered already names a hint no request in processing holds, and WinFsp skips it
     (`FspVolumeFastTransact`, "BOGUS").
+    The implementation must also account for a hint's address being reused; the missing-hint behavior alone does not
+    establish that replaying an arbitrary saved response is safe. Cleanup and close must settle their effects once.
   - The gap left is a request taken but not yet at the guard: the DLL's few instructions after the transact returns.
     The timeout refuses it.
 - **Coherence at takeover.** The successor must tell Windows of changes the dead daemon never told it of. Its first
@@ -12850,8 +12856,8 @@ Applied in the same change to: GAPS (gap 2 of the platform inventory). The build
   - A held handle passes only by inheritance, to the anchor's own next daemon.
   - Another process could take it only by duplicating it out of the anchor or the daemon, which needs
     `PROCESS_DUP_HANDLE` on that process. So each sets its own security to refuse that right to every other process of
-    the user, through an owner-rights entry as A-175's sections use. The anchor hands its child a process handle with
-    the one right the child needs to send its handles.
+    the user, through an owner-rights entry as A-175's sections use. The anchor's existing child-process handle lets it
+    duplicate out of that child; the child is given no process handle for duplicating into the anchor.
   - A second daemon on the instance is refused by the rendezvous's owner (A-176, A-178).
 - **Tests** (Step 9.2 to 9.4; the live mount runs on CI's Windows runners only, since jupiter has no WinFsp):
   - the hold across real processes on Windows: duplicated in, inherited by the next daemon only;

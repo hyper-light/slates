@@ -1,5 +1,6 @@
 //! Windows: starting a child that inherits exactly the handles it is meant to, and nothing else of this process (the
-//! consumer delivery's read end, `crate::delivery`, §4.13; a Shards stream's end, `crate::stream::spawn_with`, A-179).
+//! consumer delivery's read end, `crate::delivery`, §4.13; a Shards stream's end, `crate::stream::spawn_with`, A-179;
+//! the anchor's daemon and the handles the anchor holds for it, A-198).
 //!
 //! `CreateProcessW` with inheritance on hands a child every inheritable handle of the process, so a handle that is
 //! inheritable for one spawn reaches every child another thread spawns meanwhile. The
@@ -14,7 +15,8 @@
 //! standard handles are inheritable duplicates of this process's, so this process's own handles are never made
 //! inheritable at all. The window Win32 leaves every handle list remains: a `CreateProcess` from another thread of this
 //! process that inherits handles without a list of its own, between the duplicate and the create, would carry the
-//! duplicate along (Chen \[D\]). The callers are single-threaded at the spawn (the `slates` command, a harness).
+//! duplicate along (Chen \[D\]). The callers are single-threaded at the spawn (the `slates` command, a harness, the
+//! anchor's supervision loop).
 
 use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::OsStrExt;
@@ -22,7 +24,7 @@ use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
   CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
-  WAIT_OBJECT_0,
+  WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::System::Console::{
   GetStdHandle, STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -58,7 +60,20 @@ pub(crate) fn refused(call: &'static str) -> IpcError {
 }
 
 /// A handle this crate created or duplicated, closed when it goes out of scope.
-pub(crate) struct ClosedOnDrop(pub(crate) HANDLE);
+pub struct ClosedOnDrop(pub(crate) HANDLE);
+
+impl ClosedOnDrop {
+  /// The handle, for a call that borrows it while this value holds it (a spawn's inherited list, a job).
+  pub fn raw(&self) -> HANDLE {
+    self.0
+  }
+
+  /// Takes the handle out, giving up ownership without closing it: the caller closes it instead (by wrapping it in an
+  /// `OwnedHandle`, say). Uses `ManuallyDrop` rather than `mem::forget` so the transfer is explicit.
+  pub fn into_raw(self) -> HANDLE {
+    std::mem::ManuallyDrop::new(self).0
+  }
+}
 
 impl Drop for ClosedOnDrop {
   fn drop(&mut self) {
@@ -108,8 +123,42 @@ pub(crate) fn duplicate(
 }
 
 /// An inheritable duplicate of `handle` in this process, which the caller closes after the spawn.
-pub(crate) fn duplicate_inheritable(handle: HANDLE) -> Result<ClosedOnDrop, IpcError> {
+pub fn duplicate_inheritable(handle: HANDLE) -> Result<ClosedOnDrop, IpcError> {
   duplicate(handle, Inheritance::Inheritable)
+}
+
+/// A duplicate in this process of `handle`, a handle in `source` (another process this one may duplicate out of — one
+/// it spawned, whose process handle carries `PROCESS_DUP_HANDLE`): the same object, a new handle this process owns and
+/// closes. The anchor duplicates a daemon's WinFsp handles out of it this way to hold them (A-198). Non-inheritable: a
+/// held handle is made inheritable only as a fresh duplicate for the one spawn that hands it on.
+///
+/// `handle` is often a value another process named (a daemon's message, A-198): a `HANDLE` is an opaque index into a
+/// process's handle table, not a pointer this code dereferences, and `DuplicateHandle` returns an error for a value
+/// that names no handle of `source` rather than touching memory — so an arbitrary value is safe to pass, not a
+/// precondition the caller must uphold, and the function is not `unsafe`.
+#[allow(
+  clippy::not_unsafe_ptr_arg_deref,
+  reason = "a HANDLE is an opaque kernel handle validated by DuplicateHandle, never dereferenced"
+)]
+pub fn duplicate_from(source: HANDLE, handle: HANDLE) -> Result<ClosedOnDrop, IpcError> {
+  let mut duplicate: HANDLE = null_mut();
+  // SAFETY: `source` is a live process handle with PROCESS_DUP_HANDLE, `handle` a handle in it; the target is this
+  // process's pseudo-handle, which needs no closing; the out-pointer is a local the call fills.
+  let ok = unsafe {
+    DuplicateHandle(
+      source,
+      handle,
+      GetCurrentProcess(),
+      &mut duplicate,
+      0,
+      0,
+      DUPLICATE_SAME_ACCESS,
+    )
+  };
+  if ok == 0 {
+    return Err(refused("DuplicateHandle out of the source process"));
+  }
+  Ok(ClosedOnDrop(duplicate))
 }
 
 /// An inheritable duplicate of one of this process's standard handles, or none when the process has no such handle (no
@@ -210,7 +259,7 @@ impl Drop for AttributeList {
 /// by this process alone: when this process ends, by any means, the kernel closes the handle and the job's processes
 /// end with it. The anchor holds its daemon the same way (`crates/anchor/src/supervise.rs`). A process in this job may
 /// make jobs of its own beneath it (nested jobs, Windows 8 and later).
-pub(crate) fn kill_on_close_job() -> Result<ClosedOnDrop, IpcError> {
+pub fn kill_on_close_job() -> Result<ClosedOnDrop, IpcError> {
   // SAFETY: no security attributes (not inheritable) and no name; the answer is checked below.
   let job = unsafe { CreateJobObjectW(null(), null()) };
   if job.is_null() {
@@ -287,7 +336,7 @@ fn command_line_of(program: &OsStr, args: &[OsString]) -> Vec<u16> {
 }
 
 /// What a child's standard output is: this process's, or the write end of a pipe the caller reads.
-pub(crate) enum StandardOutput<'a> {
+pub enum StandardOutput<'a> {
   /// This process's standard output, when it has one.
   Inherited,
   /// The write end of a pipe this process reads back; the child inherits a duplicate of it.
@@ -295,25 +344,50 @@ pub(crate) enum StandardOutput<'a> {
 }
 
 /// What a spawn hands its child.
-pub(crate) struct Spawn<'a> {
+pub struct Spawn<'a> {
   /// The program, resolved as a shell would.
-  pub(crate) program: &'a OsStr,
+  pub program: &'a OsStr,
   /// Its arguments.
-  pub(crate) args: &'a [OsString],
+  pub args: &'a [OsString],
   /// The child's environment block (`NAME=VALUE\0` per entry, sorted, and a final `\0`), or `None` for this process's.
-  pub(crate) environment: Option<&'a [u16]>,
+  pub environment: Option<&'a [u16]>,
   /// The handles the child inherits beyond its standard three, each already inheritable, at the same values.
-  pub(crate) inherited: &'a [HANDLE],
+  pub inherited: &'a [HANDLE],
   /// Where its standard output goes.
-  pub(crate) output: StandardOutput<'a>,
+  pub output: StandardOutput<'a>,
   /// The job the child is a member of from its creation, if any.
-  pub(crate) job: Option<HANDLE>,
+  pub job: Option<HANDLE>,
+}
+
+/// Whether two variable names are the same to the environment's reader (case-insensitively).
+fn same_name(a: &OsStr, b: &OsStr) -> bool {
+  a.to_string_lossy().to_uppercase() == b.to_string_lossy().to_uppercase()
+}
+
+/// A child's environment block: this process's variables with `added` set (replacing any same-named one), sorted by
+/// name without regard to case as the block's reader requires — `NAME=VALUE\0` per entry and a final `\0`.
+pub fn environment_block(added: &[(&OsStr, &OsStr)]) -> Vec<u16> {
+  let mut variables: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+  for (name, value) in added {
+    variables.retain(|(existing, _)| !same_name(existing, name));
+    variables.push((name.to_os_string(), (*value).to_os_string()));
+  }
+  variables.sort_by_cached_key(|(name, _)| name.to_string_lossy().to_uppercase());
+  let mut block: Vec<u16> = Vec::new();
+  for (name, value) in variables {
+    block.extend(name.encode_wide());
+    block.push(u16::from(b'='));
+    block.extend(value.encode_wide());
+    block.push(0);
+  }
+  block.push(0);
+  block
 }
 
 /// Starts the child `spawn` describes: it inherits `spawn.inherited` and inheritable duplicates of this process's
 /// standard handles, and nothing else of this process. The duplicates of the standard handles are closed before this
 /// returns, whether or not the child started; the caller's inherited handles are the caller's to close.
-pub(crate) fn spawn(spawn: &Spawn<'_>) -> Result<Process, IpcError> {
+pub fn spawn(spawn: &Spawn<'_>) -> Result<Process, IpcError> {
   let stdin = standard_handle_inheritable(STD_INPUT_HANDLE)?;
   let stdout = match spawn.output {
     StandardOutput::Into(write_end) => Some(duplicate_inheritable(write_end.0)?),
@@ -382,19 +456,43 @@ pub(crate) fn spawn(spawn: &Spawn<'_>) -> Result<Process, IpcError> {
 }
 
 /// A child [`spawn`] started, held by its process handle.
-pub(crate) struct Process {
+pub struct Process {
   handle: ClosedOnDrop,
   id: u32,
 }
 
 impl Process {
   /// The child's process id.
-  pub(crate) fn id(&self) -> u32 {
+  pub fn id(&self) -> u32 {
     self.id
   }
 
+  /// The child's process handle, for a wait on it or a duplicate out of it, while this struct holds it.
+  pub fn raw_handle(&self) -> HANDLE {
+    self.handle.0
+  }
+
+  /// The child's exit code if it has ended, `None` while it runs; never waits.
+  pub fn try_wait(&mut self) -> Result<Option<i32>, IpcError> {
+    // SAFETY: a live process handle this struct owns; a zero timeout only samples its state.
+    let waited = unsafe { WaitForSingleObject(self.handle.0, 0) };
+    if waited == WAIT_TIMEOUT {
+      return Ok(None);
+    }
+    if waited != WAIT_OBJECT_0 {
+      return Err(refused("WaitForSingleObject"));
+    }
+    let mut code = 0u32;
+    // SAFETY: the out-pointer is a live local; the handle is the process's, which has ended.
+    let ok = unsafe { GetExitCodeProcess(self.handle.0, &mut code) };
+    if ok == 0 {
+      return Err(refused("GetExitCodeProcess"));
+    }
+    Ok(Some(i32::from_ne_bytes(code.to_ne_bytes())))
+  }
+
   /// Waits for the child to end: its exit code.
-  pub(crate) fn wait(&mut self) -> Result<Option<i32>, IpcError> {
+  pub fn wait(&mut self) -> Result<Option<i32>, IpcError> {
     // SAFETY: a live process handle this struct owns; the wait returns when the process ends.
     let waited = unsafe { WaitForSingleObject(self.handle.0, INFINITE) };
     if waited != WAIT_OBJECT_0 {
@@ -410,7 +508,7 @@ impl Process {
   }
 
   /// Ends the child now.
-  pub(crate) fn kill(&mut self) -> Result<(), IpcError> {
+  pub fn kill(&mut self) -> Result<(), IpcError> {
     // SAFETY: the process handle this struct owns.
     let ok = unsafe { TerminateProcess(self.handle.0, 1) };
     if ok == 0 {

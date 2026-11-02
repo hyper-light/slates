@@ -12,7 +12,13 @@
 use std::collections::VecDeque;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
+#[cfg(unix)]
 use std::process::Child;
+#[cfg(windows)]
+use windows::Child;
+#[cfg(windows)]
+#[path = "supervise_windows.rs"]
+mod windows;
 
 use slates_machine::{Derived, derived};
 
@@ -165,6 +171,9 @@ pub struct Supervisor {
   /// [`crate::held`]). Linux only, as FUSE is.
   #[cfg(unix)]
   devices: Option<DeviceHold>,
+  /// Windows handles acknowledged into the anchor and handed only to its own successors (A-198).
+  #[cfg(windows)]
+  windows_handles: Option<windows::Hold>,
 }
 
 /// The device channel's two ends, what has been received over it, and the refusals counted.
@@ -238,6 +247,8 @@ impl Supervisor {
       fleet_serve: None,
       #[cfg(unix)]
       devices: None,
+      #[cfg(windows)]
+      windows_handles: None,
     })
   }
 
@@ -259,6 +270,43 @@ impl Supervisor {
       refused: 0,
     });
     Ok(())
+  }
+
+  /// Opens the Windows hold channel before the first child is spawned. `bound` is the number of live attachments
+  /// this daemon can admit, as for Unix's device bound (A-198). Acknowledgement follows duplication into the anchor.
+  #[cfg(windows)]
+  pub fn hold_handles(&mut self, bound: usize) -> Result<(), crate::handles::HandleRefusal> {
+    if self.child.is_some() || self.windows_handles.is_some() {
+      return Err(crate::handles::HandleRefusal::Malformed {
+        reason: "the Windows hold must be configured once before starting",
+      });
+    }
+    self.windows_handles = Some(windows::Hold::new(bound)?);
+    Ok(())
+  }
+
+  /// Applies a bounded turn of Windows hold messages without waiting. A reply whose quota is full remains pending.
+  #[cfg(windows)]
+  pub fn drain_handles(&mut self) -> Result<usize, crate::handles::HandleRefusal> {
+    match (&mut self.windows_handles, &self.child) {
+      (Some(hold), Some(child)) => hold.drain(child.raw()),
+      _ => Ok(0),
+    }
+  }
+
+  /// Entries held for the Windows daemon's successors, observed through the same hold that the spawn uses.
+  #[cfg(windows)]
+  pub fn held_handles(&self) -> usize {
+    self.windows_handles.as_ref().map_or(0, windows::Hold::len)
+  }
+
+  /// Windows holds refused by shape, source-handle validation or the attachment-derived bound.
+  #[cfg(windows)]
+  pub fn handle_refusals(&self) -> u64 {
+    self
+      .windows_handles
+      .as_ref()
+      .map_or(0, windows::Hold::refusals)
   }
 
   /// The anchor's end of the hold channel, to wait on: readable when a daemon sent a message, so the owner's loop
@@ -468,14 +516,7 @@ impl Supervisor {
     #[cfg(unix)]
     env.extend(self.device_env());
     env.extend(self.environment.iter().cloned());
-    let child = own_image::command(&self.program, self.image)?
-      .args(&self.args)
-      .envs(env)
-      .spawn()
-      .map_err(|e| AnchorError::Spawn {
-        code: e.raw_os_error(),
-      })?;
-    self.lifetime.tie(&child)?;
+    let child = self.spawn_child(env)?;
     let restart = self.segment.supervision()?.generation() > 0;
     self
       .segment
@@ -485,12 +526,50 @@ impl Supervisor {
     Ok(())
   }
 
+  /// Unix retains its descriptor-based spawn and the existing executable-identity check (A-145).
+  #[cfg(unix)]
+  fn spawn_child(&mut self, env: Vec<(String, String)>) -> Result<Child, AnchorError> {
+    let child = own_image::command(&self.program, self.image)?
+      .args(&self.args)
+      .envs(env)
+      .spawn()
+      .map_err(|error| AnchorError::Spawn {
+        code: error.raw_os_error(),
+      })?;
+    self.lifetime.tie(&child)?;
+    Ok(child)
+  }
+
+  /// Windows replaces broad inheritance with one explicit handle list, including its job at creation (A-198).
+  #[cfg(windows)]
+  fn spawn_child(&mut self, mut env: Vec<(String, String)>) -> Result<Child, AnchorError> {
+    // Windows' own-image identity remains unchecked as A-145 records; this transport change adds no new check.
+    let _identity = self.image;
+    let handoff = self
+      .windows_handles
+      .as_mut()
+      .map(windows::Hold::handoff)
+      .transpose()?;
+    env.push((
+      crate::handles::ENV_HANDLES.to_owned(),
+      handoff
+        .as_ref()
+        .map_or("", crate::held_windows::Handoff::env)
+        .to_owned(),
+    ));
+    let job = self.lifetime.job()?;
+    windows::spawn(&self.program, &self.args, &env, handoff.as_ref(), job)
+      .map_err(|error| AnchorError::Hold(crate::handles::HandleRefusal::Ipc(error)))
+  }
+
   /// Polls the daemon once: running, restarted after an exit, or refused as a crash loop.
   pub fn step(&mut self, now_ns: u64) -> Result<Step, AnchorError> {
     // Every step takes what the daemon sent, so a device it established is held within a step of its send,
     // and everything a dead daemon sent is applied before its successor starts.
     #[cfg(unix)]
     self.drain_devices();
+    #[cfg(windows)]
+    self.drain_handles()?;
     if let Some(retry_at_ns) = self.retry_at_ns {
       if now_ns < retry_at_ns {
         return Ok(Step::BackingOff { retry_at_ns });
@@ -660,7 +739,7 @@ impl Supervisor {
   /// The running daemon's pid, if one runs: what the owner watches for its exit, so a death is restarted as it happens
   /// rather than at the next observation.
   pub fn child_pid(&self) -> Option<u32> {
-    self.child.as_ref().map(std::process::Child::id)
+    self.child.as_ref().map(Child::id)
   }
 
   /// The policy.
@@ -671,89 +750,31 @@ impl Supervisor {
 
 #[cfg(windows)]
 mod lifetime {
-  //! Windows: a job object with `KILL_ON_JOB_CLOSE`; the daemon is assigned to it right after
-  //! the spawn, so the anchor's death (the last handle closing) ends the daemon.
+  //! Windows' kill-on-close job (§2.5, A-198), passed in the creation attribute list. The job is assigned before the
+  //! child can run; its non-inheritable handle stays owned by the anchor.
 
-  use std::process::Child;
+  use crate::{AnchorError, handles::HandleRefusal};
+  use slates_ipc::win_spawn::{ClosedOnDrop, kill_on_close_job};
+  use windows_sys::Win32::Foundation::HANDLE;
 
-  use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-  use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject,
-  };
-
-  use crate::error::AnchorError;
-
-  /// The job object, created once per supervisor.
   pub(super) struct Tie {
-    job: HANDLE,
-  }
-
-  fn spawn_error() -> AnchorError {
-    AnchorError::Spawn {
-      code: std::io::Error::last_os_error().raw_os_error(),
-    }
+    job: Option<ClosedOnDrop>,
   }
 
   impl Tie {
     pub(super) fn new() -> Tie {
-      Tie {
-        job: std::ptr::null_mut(),
-      }
+      Tie { job: None }
     }
 
-    fn create(&mut self) -> Result<(), AnchorError> {
-      if !self.job.is_null() {
-        return Ok(());
+    pub(super) fn job(&mut self) -> Result<HANDLE, AnchorError> {
+      if let Some(job) = &self.job {
+        return Ok(job.raw());
       }
-      // SAFETY: an anonymous job object; the handle is checked before use and closed on drop.
-      let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-      if job.is_null() {
-        return Err(spawn_error());
-      }
-      let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION =
-        // SAFETY: a plain-data record the call fills; every zero is a valid field value.
-        unsafe { std::mem::zeroed() };
-      limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-      let size = u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()).unwrap_or(0);
-      // SAFETY: `limits` is the record the information class names, of the size passed.
-      let ok = unsafe {
-        SetInformationJobObject(
-          job,
-          JobObjectExtendedLimitInformation,
-          std::ptr::from_ref(&limits).cast(),
-          size,
-        )
-      };
-      if ok == 0 {
-        // SAFETY: a handle this function created and nobody else holds.
-        unsafe { CloseHandle(job) };
-        return Err(spawn_error());
-      }
-      self.job = job;
-      Ok(())
-    }
-
-    pub(super) fn tie(&mut self, child: &Child) -> Result<(), AnchorError> {
-      use std::os::windows::io::AsRawHandle;
-      self.create()?;
-      // SAFETY: both handles are live: the job is ours and the child's is held by `child`.
-      let ok = unsafe { AssignProcessToJobObject(self.job, child.as_raw_handle().cast()) };
-      if ok == 0 {
-        return Err(spawn_error());
-      }
-      Ok(())
-    }
-  }
-
-  impl Drop for Tie {
-    fn drop(&mut self) {
-      if !self.job.is_null() {
-        // SAFETY: the handle this object created; closing the last handle ends the job's
-        // processes, which is the point.
-        unsafe { CloseHandle(self.job) };
-      }
+      let job =
+        kill_on_close_job().map_err(|error| AnchorError::Hold(HandleRefusal::Ipc(error)))?;
+      let raw = job.raw();
+      self.job = Some(job);
+      Ok(raw)
     }
   }
 }
@@ -787,6 +808,7 @@ mod lifetime {
 /// was not a daemon) or refused `ENOENT` (the anchor then ended, the instance with it). One function per platform, one
 /// signature.
 mod own_image {
+  #[cfg(unix)]
   use std::process::Command;
 
   use crate::error::AnchorError;
@@ -858,12 +880,6 @@ mod own_image {
     if (now.st_dev, now.st_ino) != (identity.device, identity.inode) {
       return Err(replaced());
     }
-    Ok(Command::new(path))
-  }
-
-  /// Windows: `path`, unchecked (the check is owed, as [`Identity`] says).
-  #[cfg(windows)]
-  pub(super) fn command(path: &str, _identity: Identity) -> Result<Command, AnchorError> {
     Ok(Command::new(path))
   }
 }
