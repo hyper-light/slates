@@ -310,9 +310,14 @@ slates-rt = 95
 slates-base = 10
 slates-vfs = 0
 slates-land = 4
-slates-anchor = 6
+# 2026-11-02, A-198: retire the six supervisor job/assignment sites in favor of IPC's existing creation-time job
+# attribute. The hold transport has ten Win32 ownership/I/O sites: last-error read, event create/adopt, read/write,
+# event wait, cancellation and join on timeout or failed wait, and adoption of a duplicated handle. No unsafe sharing.
+slates-anchor = 10
 slates-db = 0
-slates-ipc = 105
+# 2026-11-02, A-198: one DuplicateHandle out of a child, two process-exit polling calls, and one message-mode pipe
+# setting call. The existing explicit handle-list spawn and kill-on-close job are reused.
+slates-ipc = 109
 # 2026-11-01 (+1, Step 6.1 of the VFS and DAX plan, `stream.rs` `spawn_bound` compiled only for Linux): `slates pmem`
 #   must stay its VMM's parent to hold the VMM's map and compare it back, so it spawns rather than replacing itself as
 #   `exec_with` does. `pre_exec` (unsafe by signature) whose closure sets the parent-death signal (`prctl`, through

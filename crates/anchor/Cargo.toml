@@ -15,6 +15,10 @@ slates-wire = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
+# The Windows hold channel (A-198): a message-mode named-pipe pair (`slates_ipc::stream::message_pair`) and the
+# child-spawn helpers that hand exactly the held handles to the next daemon (`slates_ipc::win_spawn`). ipc does not
+# depend on anchor, so this edge is acyclic.
+slates-ipc = { workspace = true }
 
 # The hold channel (A-61, A-113): a socketpair and `SCM_RIGHTS`, through rustix's safe wrappers.
 [target.'cfg(unix)'.dependencies]

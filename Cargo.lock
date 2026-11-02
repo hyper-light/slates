@@ -1287,6 +1287,7 @@ name = "slates-anchor"
 version = "0.1.0"
 dependencies = [
  "rustix",
+ "slates-ipc",
  "slates-machine",
  "slates-mem",
  "slates-rt",
