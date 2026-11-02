@@ -891,6 +891,7 @@ mod platform {
           None => StandardOutput::Inherited,
         },
         job: None,
+        process_security: None,
       });
       // The duplicates and this process's own read end are closed now: the child holds its own
       // copies, and nothing of the delivery stays open here.

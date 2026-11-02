@@ -22,5 +22,10 @@ slates-wire = { workspace = true }
 slates-machine = { workspace = true }
 windows-sys = { workspace = true, features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_SystemServices"] }
 
+[target.'cfg(windows)'.dev-dependencies]
+slates-anchor = { workspace = true }
+slates-ipc = { workspace = true }
+slates-db = { workspace = true }
+
 [lints]
 workspace = true

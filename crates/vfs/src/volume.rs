@@ -5541,6 +5541,62 @@ impl Volume {
     Ok(true)
   }
 
+  /// Reconciles one recovered attachment/file's open references to the surviving kernel contexts (A-198). The
+  /// optional pair is the checked inode generation and wanted count; absence means no context remains. This changes
+  /// only open references, preserving lookup references and every sibling attachment, and is published before serving.
+  pub fn reconcile_restored_opens(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    owner: RefOwner,
+    wanted: Option<(u64, u32)>,
+  ) -> Result<bool, VfsError> {
+    let RefOwner::Attachment(attachment) = owner else {
+      return Err(VfsError::RecoveryIncomplete);
+    };
+    let count = match wanted {
+      Some((generation, count)) => {
+        if u64::from(self.namespace_inode(store, no)?.generation) != generation {
+          return Err(VfsError::StaleHandle);
+        }
+        count
+      }
+      None => 0,
+    };
+    let restored = self.restored_opens.get(&(owner, no)).copied().unwrap_or(0);
+    if self.attachment_open_count(attachment, no) != restored {
+      return Err(VfsError::RecoveryIncomplete);
+    }
+    if count > restored {
+      let added = count.saturating_sub(restored);
+      self.restore_references(store, attachment, no, added, added)?;
+    } else if count < restored {
+      let removed = restored.saturating_sub(count);
+      if count == 0 {
+        self.restored_opens.remove(&(owner, no));
+      } else {
+        self.restored_opens.insert((owner, no), count);
+      }
+      self.close_many_for(no, owner, removed);
+      self.forget_for(store, no, owner, u64::from(removed))?;
+    }
+    Ok(count != restored)
+  }
+
+  /// The next restored open count of this attachment, in inode order. The caller merges it with its held ledger and
+  /// reconciles one inode per cooperative turn; this scans neither another attachment nor the prior entries.
+  pub fn next_restored_open(&self, owner: RefOwner, after: Option<u64>) -> Option<(u64, u32)> {
+    use std::ops::Bound;
+    let start = after.map_or(Bound::Included((owner, InodeNo(u64::MIN))), |after| {
+      Bound::Excluded((owner, InodeNo(after)))
+    });
+    self
+      .restored_opens
+      .range((start, Bound::Included((owner, InodeNo(u64::MAX)))))
+      .next()
+      .map(|((_, no), count)| (no.0, *count))
+  }
+
   /// Records an open handle of `attachment` on inode `no` (the transport's open, which also took a
   /// reference): while any handle is open, a base file keeps serving the file it opened when the disk's
   /// name is replaced by another ([`Volume::is_open`]). Bounded by the transport's handle table.
@@ -5561,6 +5617,10 @@ impl Volume {
   /// Releases one open handle of `attachment` on inode `no` ([`Volume::open_for`]); an unknown one is a
   /// no-op (a transport may release a handle it already dropped).
   pub fn close_for(&mut self, no: InodeNo, attachment: RefOwner) {
+    self.close_many_for(no, attachment, 1);
+  }
+
+  fn close_many_for(&mut self, no: InodeNo, attachment: RefOwner, removed: u32) {
     let Some(inodes) = self.attachment_opens.get_mut(&attachment) else {
       return;
     };
@@ -5568,7 +5628,8 @@ impl Volume {
     let Some(count) = inodes.get_mut(&no) else {
       return;
     };
-    *count = count.saturating_sub(1);
+    let removed = removed.min(*count);
+    *count = count.saturating_sub(removed);
     let live = *count;
     if live == 0 {
       inodes.remove(&no);
@@ -5576,7 +5637,7 @@ impl Volume {
     if inodes.is_empty() {
       self.attachment_opens.remove(&attachment);
     }
-    self.unpin_open(no, 1);
+    self.unpin_open(no, removed);
     // A release that leaves fewer opens than the committed publication counts waits for the next publication before
     // its reply (A-154): the kernel never resends a release its daemon answered, so a daemon that died before
     // publishing would leave a successor restoring an open nothing ever gives back. An open and release both since the
