@@ -40,7 +40,7 @@
 //! stops the dispatcher, removes the drive and deletes the file system, and is joined. The WinFsp file system is this
 //! process's own, so a dead daemon's mount died with it and recovery ends its record.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
 
 use slates_bridge_core::delivery::{Coherence, Delivered};
@@ -49,13 +49,17 @@ use slates_bridge_core::{
   AttachmentId, Bridge, CachedBytes, Invalidation, InvalidationCursor, ObjectId, Rights, View,
   VolumeBridge,
 };
+use slates_bridge_winfsp::held::{Record as HeldRecord, windows::Inherited};
+use slates_bridge_winfsp::host::Ready;
 use slates_bridge_winfsp::host::{MountThread, Notified, Outcome, Purged, REQUEST_BOUND, Request};
 use slates_bridge_winfsp::notify::{NotifyRound, OpenNames};
+use slates_bridge_winfsp::opens::{Ledger, Open};
 use slates_bridge_winfsp::purge::{Purge, purge_range};
 use slates_bridge_winfsp::retry::{PurgeRetries, REQUEST_TIMEOUT_NS, Recorded};
 use slates_db::Op;
 use slates_db::catalog::{AttachmentRecord, VolumeId};
 use slates_ipc::protocol::{AttachmentCapability, Established, Refusal, ReplyBody};
+use slates_mem::SharedObject;
 use slates_mem::slab::Slab;
 use slates_rt::futures;
 use slates_vfs::clock::Clock;
@@ -105,6 +109,8 @@ const PURGES_KEPT: &str = "winfsp.purges_kept";
 const PURGE_RETRIES: &str = "winfsp.purge_retries";
 /// Format: purge writes the host answered without applying them: the count that shows purges reached the host.
 const PURGE_ECHOES: &str = "winfsp.purge_echoes";
+/// Format: successful reads through an open the predecessor recorded. The takeover oracle requires it to move.
+const RESTORED_READS: &str = "winfsp.restored_reads";
 
 /// A mounted volume being served: the channel WinFsp's dispatcher threads send on, the mount's thread, the open-handle
 /// map that persists across requests, the registry attachment its requests are admitted under, what Windows holds
@@ -112,6 +118,9 @@ const PURGE_ECHOES: &str = "winfsp.purge_echoes";
 pub(crate) struct WinFspMount {
   /// The requests WinFsp's dispatcher threads hand the shard; dropped first at the end, so none waits on it.
   requests: Option<Receiver<Request>>,
+  ledger: Ledger<SharedObject>,
+  seeds: VecDeque<(u64, Open)>,
+  takeover: bool,
   thread: MountThread,
   handles: Slab<u64>,
   registry: AttachmentId,
@@ -200,16 +209,38 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
       .unwrap_or_default()
       .to_owned();
     let (sender, requests) = sync_channel::<Request>(REQUEST_BOUND);
-    let mounted =
-      match MountThread::start(&mount_point, !pending.rights.write, sender, waker.clone()) {
-        Ok(thread) => await_mounted(thread).await,
-        Err(error) => Err((error.to_string(), None)),
-      };
+    let mounted = match MountThread::start(
+      &mount_point,
+      !pending.rights.write,
+      sender,
+      waker.clone(),
+      MAX_OPEN_HANDLES,
+      None,
+    ) {
+      Ok(thread) => await_mounted(thread).await,
+      Err(error) => Err((error.to_string(), None)),
+    };
+    let mounted = match mounted {
+      Ok((thread, ready)) => {
+        let held = match (ready.handle_values(), ready.offer.record.encode()) {
+          (Ok(values), Ok(record)) => crate::anchor_hold::hold_mount(attachment, values, record)
+            .await
+            .map_err(|error| error.to_string()),
+          (Err(error), _) => Err(error.to_string()),
+          (_, Err(error)) => Err(format!("held mount record: {error:?}")),
+        };
+        match held {
+          Ok(()) => Ok((thread, ready)),
+          Err(error) => Err((error, Some(thread))),
+        }
+      }
+      Err(error) => Err(error),
+    };
     let served = state::with_state_counted(|s| {
       let mut reaped = None;
       let reply = complete(s, request, cause, attachment, |s| match mounted {
-        Ok(thread) => {
-          let (reply, refused_thread) = established(s, pending, thread, requests, waker);
+        Ok((thread, ready)) => {
+          let (reply, refused_thread) = established(s, pending, thread, requests, waker, ready);
           reaped = refused_thread;
           reply
         }
@@ -226,7 +257,7 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
       reaped
     });
     match served {
-      Some(Some(thread)) => reap(thread).await,
+      Some(Some(thread)) => reap(thread, attachment).await,
       Some(None) => serve(attachment).await,
       // The shard's state could not be borrowed (counted): the mount, if it was kept, is ended with the shard.
       None => {}
@@ -245,10 +276,10 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
 /// not with the thread to reap.
 async fn await_mounted(
   mut thread: MountThread,
-) -> Result<MountThread, (String, Option<MountThread>)> {
+) -> Result<(MountThread, Ready), (String, Option<MountThread>)> {
   loop {
     match thread.outcome() {
-      Some(Outcome::Mounted(Ok(()))) => return Ok(thread),
+      Some(Outcome::Mounted(Ok(ready))) => return Ok((thread, *ready)),
       Some(Outcome::Mounted(Err(error))) => return Err((error.to_string(), Some(thread))),
       Some(Outcome::Stopped) => {
         return Err((
@@ -323,9 +354,9 @@ fn established(
   thread: MountThread,
   requests: Receiver<Request>,
   waker: std::task::Waker,
+  ready: Ready,
 ) -> (ReplyBody, Option<MountThread>) {
   let attachment = pending.record.id;
-  let volume = pending.record.volume;
   let mount_point = pending
     .record
     .form
@@ -340,51 +371,15 @@ fn established(
     crate::verbs::release_unrecorded_lease(s, &pending.record);
     crate::verbs::refused(refusal)
   };
-  let registry = match s.attachments.attach(
-    volume,
-    View::Current,
-    pending.record.principal.clone(),
-    pending.rights,
-  ) {
-    Ok(registry) => registry,
-    Err(e) => {
-      drop(requests);
-      return (refused(s, crate::error::refusal_of_vfs(&e)), Some(thread));
-    }
-  };
-  // The task delivers the volume's invalidations before each request and whenever the volume changes through any
-  // other path (AUD-29-79; §4.6 cache posture).
-  s.attachments
-    .set_coherence(registry, slates_bridge_core::CacheCoherence::Invalidated);
-  s.attachments.set_owner(registry, attachment);
-  s.winfsp_mounts.insert(
-    attachment,
-    WinFspMount {
-      requests: Some(requests),
-      thread,
-      handles: new_handle_store(),
-      registry,
-      volume,
-      mount_point: mount_point.clone(),
-      names: OpenNames::new(),
-      coherence: Coherence::new(),
-      round_out: None,
-      owed: false,
-      seen: 0,
-      ending: false,
-      waker,
-      told: 0,
-      retries: PurgeRetries::new(MAX_OPEN_HANDLES, tick_ns(), REQUEST_TIMEOUT_NS),
-      purge_out: false,
-    },
-  );
+  if let Err((refusal, thread)) = keep(s, &pending.record, thread, requests, waker, ready, false) {
+    return (refused(s, refusal), Some(thread));
+  }
   if let Err(e) = s.db.mutate(&mut s.segment, &op, now) {
     if let Some(mount) = s.winfsp_mounts.get_mut(&attachment) {
       mount.ending = true;
     }
     return (refused(s, crate::error::refusal_of_db(&e)), None);
   }
-  open_journal_reader(s, volume, registry);
   let reply = ReplyBody::Attached {
     attachment,
     lease_epoch: pending.lease_epoch,
@@ -395,6 +390,234 @@ fn established(
     token: Some(pending.token),
   };
   (reply, None)
+}
+
+/// The same live mount state for an establishment and an adoption: only the record publication differs.
+fn keep(
+  s: &mut ShardState,
+  record: &AttachmentRecord,
+  thread: MountThread,
+  requests: Receiver<Request>,
+  waker: std::task::Waker,
+  ready: Ready,
+  takeover: bool,
+) -> Result<(), (Refusal, MountThread)> {
+  let registry = match s.attachments.attach(
+    record.volume,
+    View::Current,
+    record.principal.clone(),
+    Rights {
+      read: record.rights.read,
+      write: record.rights.write,
+    },
+  ) {
+    Ok(registry) => registry,
+    Err(error) => {
+      drop(requests);
+      return Err((crate::error::refusal_of_vfs(&error), thread));
+    }
+  };
+  s.attachments
+    .set_coherence(registry, slates_bridge_core::CacheCoherence::Invalidated);
+  s.attachments.set_owner(registry, record.id);
+  let seeds = if takeover {
+    ready.opens
+  } else {
+    VecDeque::new()
+  };
+  s.count(
+    "winfsp.ledger_quarantined",
+    u64::try_from(ready.ledger.quarantined()).unwrap_or(u64::MAX),
+  );
+  drop(ready.offer);
+  s.winfsp_mounts.insert(
+    record.id,
+    WinFspMount {
+      requests: Some(requests),
+      ledger: ready.ledger,
+      seeds,
+      takeover,
+      thread,
+      handles: new_handle_store(),
+      registry,
+      volume: record.volume,
+      mount_point: record.form.mount_point().unwrap_or_default().to_owned(),
+      names: OpenNames::new(),
+      coherence: Coherence::new(),
+      round_out: None,
+      owed: takeover,
+      seen: 0,
+      ending: false,
+      waker,
+      told: 0,
+      retries: PurgeRetries::new(MAX_OPEN_HANDLES, tick_ns(), REQUEST_TIMEOUT_NS),
+      purge_out: false,
+    },
+  );
+  open_journal_reader(s, record.volume, registry);
+  Ok(())
+}
+
+/// A checked held mount, routed by the attachment's durable partition rather than a process-local shard id.
+pub(crate) struct InheritedMount {
+  pub(crate) attachment: u64,
+  held: Option<Inherited>,
+}
+
+impl InheritedMount {
+  pub(crate) fn matches(&self, record: &AttachmentRecord) -> bool {
+    self.held.as_ref().is_some_and(|held| {
+      held.record.drive_text().ok().as_deref() == record.form.mount_point()
+        && held.record.read_only == !record.rights.write
+    })
+  }
+}
+
+/// Splits all inherited objects by their durable owner. Unmatched or invalid records are released by the control
+/// shard's adoption task, never kept after their catalog attachment ended.
+pub(crate) fn split_held(
+  handed: Vec<crate::anchor_hold::HandedMount>,
+  partitions: usize,
+) -> Vec<Vec<InheritedMount>> {
+  let mut split: Vec<Vec<InheritedMount>> = (0..partitions).map(|_| Vec::new()).collect();
+  for mount in handed {
+    let attachment = mount.attachment;
+    let held = InheritedMount {
+      attachment,
+      held: checked_inherited(mount),
+    };
+    let partition = usize::from(crate::verbs::owner_of_attachment(attachment));
+    let target = if partition < partitions { partition } else { 0 };
+    if let Some(slot) = split.get_mut(target) {
+      slot.push(held);
+    } else {
+      eprintln!(
+        "slates-server: no shard can adopt held mount {}",
+        attachment
+      );
+    }
+  }
+  split
+}
+
+/// A rejected mount retains its id for release, while every partial set of inherited handles closes here.
+fn checked_inherited(mount: crate::anchor_hold::HandedMount) -> Option<Inherited> {
+  if !mount.adoptable {
+    return None;
+  }
+  let record = match HeldRecord::decode(&mount.record) {
+    Ok(record) => record,
+    Err(error) => {
+      eprintln!(
+        "slates-server: held mount {} record refused: {error:?}",
+        mount.attachment
+      );
+      return None;
+    }
+  };
+  let mut handles = mount.handles.into_iter();
+  let (Some(volume), Some(link), Some(ledger)) = (handles.next(), handles.next(), handles.next())
+  else {
+    eprintln!(
+      "slates-server: held mount {} has fewer than three handles",
+      mount.attachment
+    );
+    return None;
+  };
+  Some(Inherited {
+    volume,
+    link,
+    ledger,
+    record,
+  })
+}
+
+/// Starts one owned adoption task per matched mount. An acknowledged but uncommitted hold is released, and an
+/// adoption refusal ends its catalog record before the anchor's objects and the mount thread are released.
+pub(crate) fn adopt_held() {
+  let (kept, orphaned) = state::with_state(|s| {
+    (
+      std::mem::take(&mut s.adopt_winfsp),
+      std::mem::take(&mut s.inherited_winfsp),
+    )
+  })
+  .unwrap_or_default();
+  if !orphaned.is_empty()
+    && let Err(error) = futures::spawn(async move {
+      for orphan in orphaned {
+        release_hold(orphan.attachment).await;
+      }
+    })
+    .and_then(futures::detach)
+  {
+    eprintln!("slates-server: orphaned mount release task refused: {error}");
+  }
+  for (record, held) in kept {
+    if let Err(error) = futures::spawn(adopt_mount(record, held)).and_then(futures::detach) {
+      eprintln!("slates-server: mount adoption task refused: {error}");
+    }
+  }
+}
+
+async fn adopt_mount(record: AttachmentRecord, held: InheritedMount) {
+  let attachment = record.id;
+  let Some(held) = held.held else {
+    let _ = state::with_state_counted(|s| {
+      refuse_adoption(s, &record, "the held mount record is unusable")
+    });
+    release_hold(attachment).await;
+    return;
+  };
+  let waker = std::future::poll_fn(|cx| std::task::Poll::Ready(cx.waker().clone())).await;
+  let (sender, requests) = sync_channel(REQUEST_BOUND);
+  let mounted = match MountThread::start(
+    record.form.mount_point().unwrap_or_default(),
+    !record.rights.write,
+    sender,
+    waker.clone(),
+    MAX_OPEN_HANDLES,
+    Some(held),
+  ) {
+    Ok(thread) => await_mounted(thread).await,
+    Err(error) => Err((error.to_string(), None)),
+  };
+  let adopted = state::with_state_counted(|s| match mounted {
+    Ok((thread, ready)) => match keep(s, &record, thread, requests, waker, ready, true) {
+      Ok(()) => {
+        s.count("winfsp.adopted", 1);
+        Ok(())
+      }
+      Err((error, thread)) => {
+        refuse_adoption(s, &record, &format!("{error:?}"));
+        Err(Some(thread))
+      }
+    },
+    Err((why, thread)) => {
+      refuse_adoption(s, &record, &why);
+      Err(thread)
+    }
+  });
+  match adopted {
+    Some(Ok(())) => serve(attachment).await,
+    Some(Err(Some(thread))) => reap(thread, attachment).await,
+    Some(Err(None)) | None => release_hold(attachment).await,
+  }
+}
+
+fn refuse_adoption(s: &mut ShardState, record: &AttachmentRecord, why: &str) {
+  eprintln!("slates-server: mount {} adoption refused: {why}", record.id);
+  s.count("winfsp.adopt_refused", 1);
+  if let Err(error) = crate::verbs::end_attachment(s, record, crate::verbs::Ending::Otherwise) {
+    eprintln!("slates-server: refused mount end failed: {error:?}");
+    s.count(END_REFUSED, 1);
+  }
+}
+
+async fn release_hold(attachment: u64) {
+  if let Err(error) = crate::anchor_hold::release_mount(attachment).await {
+    let _ = state::with_state_counted(|s| s.count("winfsp.hold_release_refused", 1));
+    eprintln!("slates-server: mount {attachment} hold release refused: {error}");
+  }
 }
 
 /// Derived: one tick of the mount's pacing, the daemon's heartbeat over the fleet's polls a period: a deferred round's
@@ -444,7 +667,7 @@ async fn serve(attachment: u64) {
     match state::with_state(|s| turn(s, attachment)) {
       Some(Turned::Ended) | None => {
         if let Some(Some(thread)) = state::with_state_counted(|s| ended(s, attachment)) {
-          reap(thread).await;
+          reap(thread, attachment).await;
         }
         return;
       }
@@ -477,7 +700,8 @@ async fn wait_after(turned: Turned) {
 /// Waits for a stopped mount thread's last outcome and joins it, without holding the shard: the thread has only to
 /// stop WinFsp's dispatcher (whose threads return at once, the request channel's receiver being dropped) and remove the
 /// drive.
-async fn reap(mut thread: MountThread) {
+async fn reap(mut thread: MountThread, attachment: u64) {
+  release_hold(attachment).await;
   thread.stop();
   loop {
     match thread.outcome() {
@@ -515,6 +739,19 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
   let Some(&handle) = s.by_id.get(&mount.volume) else {
     return Turned::Ended;
   };
+  if let Some((context, open)) = mount.seeds.pop_front() {
+    let store = &s.store;
+    if let Ok(slot) = s.volumes.get(handle)
+      && let Some(path) = slot
+        .volume
+        .path_of_inode(store, slates_vfs::ids::InodeNo(open.object.inode))
+    {
+      mount
+        .names
+        .opened(context, open.object.inode, &path.replace('/', "\\"));
+    }
+    return Turned::Served;
+  }
   if crate::verbs::live_tree_fenced(s, mount.volume) {
     return Turned::Fenced;
   }
@@ -545,6 +782,8 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
       let WinFspMount {
         handles,
         names,
+        ledger,
+        takeover,
         coherence,
         round_out,
         purge_out,
@@ -572,10 +811,11 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
           owed,
           thread,
           told,
+          takeover,
         },
       );
       let served = request.map(|request| {
-        let served = request.serve(&mut bridge, &cx, names);
+        let served = request.serve(&mut bridge, &cx, names, ledger);
         coherence.served_own_request(&mut bridge, &cx, delivered.delivered);
         served
       });
@@ -615,6 +855,9 @@ fn take_outcomes(s: &mut ShardState, mount: &mut WinFspMount) -> Result<bool, ()
   while let Some(outcome) = mount.thread.outcome() {
     match outcome {
       Outcome::Notified(told, purged) => {
+        if matches!(&told, Ok(Notified::Taken)) {
+          mount.takeover = false;
+        }
         record_purges(s, &mut mount.retries, &purged);
         let before = mount.round_out.take().flatten();
         match told {
@@ -703,6 +946,7 @@ struct Rounds<'m> {
   owed: &'m mut bool,
   thread: &'m MountThread,
   told: &'m mut u64,
+  takeover: &'m mut bool,
 }
 
 /// Delivers the owed round when none is out: every invalidation since the cursor, as records naming what Windows holds
@@ -743,10 +987,18 @@ fn deliver_owed(
   if delivered.gather_refused {
     return refused;
   }
+  if *mount.takeover {
+    round.add(&Invalidation::Everything, names);
+  }
   *mount.owed = false;
   let too_long = round.too_long();
   if !round.is_empty() {
-    let purges = purges_owed(bridge, cx, names, (&changed, overruns > 0));
+    let purges = purges_owed(
+      bridge,
+      cx,
+      names,
+      (&changed, overruns > 0 || *mount.takeover),
+    );
     if mount.thread.notify(round.bytes().to_vec(), purges).is_ok() {
       *mount.round_out = Some(before);
       *mount.told = mount
@@ -821,6 +1073,9 @@ fn purges_owed(
 
 /// Publishes when the served request needs it, then sends its reply.
 fn answer(s: &mut ShardState, mount: &WinFspMount, mut served: slates_bridge_winfsp::host::Served) {
+  if served.is_restored_read() {
+    s.count(RESTORED_READS, 1);
+  }
   if served.is_purge_echo() {
     s.count(PURGE_ECHOES, 1);
   }
@@ -851,7 +1106,6 @@ fn ended(s: &mut ShardState, attachment: u64) -> Option<MountThread> {
   {
     s.count(END_REFUSED, 1);
   }
-  mount.thread.stop();
   Some(mount.thread)
 }
 
