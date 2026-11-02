@@ -1,0 +1,45 @@
+name: DIAG private intent missed wake red check
+on:
+  push:
+    branches: ['diag-s9-intent-red-*']
+jobs:
+  takeover:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-latest, windows-11-arm]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - uses: ilammy/setup-nasm@v1.5.2
+        if: runner.arch == 'X64'
+      - name: clang-cl on arm64
+        if: runner.arch == 'ARM64'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: The unchanged intent oracle must fail with its wake omitted
+        shell: bash
+        env:
+          AWS_LC_SYS_PREBUILT_NASM: '0'
+        run: |
+          set +e
+          cargo test -p slates-bridge-winfsp --lib purge_intents::tests::private_purges_make_progress_without_a_kernel_callback -- --exact --nocapture > intent-red.log 2>&1
+          result=$?
+          cat intent-red.log
+          test "$result" -ne 0 && grep -q 'the private publisher must wake an idle receiver' intent-red.log && grep -q '1 failed' intent-red.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: takeover-${{ matrix.runner }}
+          path: |
+            intent-red.log

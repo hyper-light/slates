@@ -39,9 +39,66 @@ The design remains unproven until the Windows kill tests pass.
    user's system configuration. Run the required gates and main CI before closing
    the gap.
 
-The proposed guard records only requests it has observed. The DLL has a gap
-between returning from transact and entering that guard; the driver's timeout
-still bounds requests lost there. Cleanup and close replay need an idempotent
-terminal step. A later implementation may not treat an old hint, an old slab
-slot, or a partially published record as current merely because its numeric value
-matches.
+The proposed guard records only requests it has observed. The DLL has a gap between returning from transact and
+entering that guard. The source audit below corrects the initial timeout claim: a request lost there has no timeout
+under WinFsp v2.1's actual queue policy. Cleanup and close replay need an idempotent terminal step. A later
+implementation may not treat an old hint, an old slab slot, or a partially published record as current merely because
+its numeric value matches.
+
+
+## Step 9.4: process authority at creation (2026-11-02)
+
+The independent live-mount probe fails on both architectures before confinement: diagnostics
+[41426238795](https://github.com/hyper-light/slates/actions/runs/41426238795), on `fcc9aa4d`, grants a sibling
+`PROCESS_DUP_HANDLE` on a mount holder. The real-supervisor fixture on jupiter also grants a new duplication handle
+immediately after child creation. The child role has not changed its own DACL. These are measured failures, separate
+from the successful twenty-kill mount history.
+
+The process DACL belongs in `CreateProcessW`'s process attributes for supervised children, because the child already
+has its inherited handles before it executes. Microsoft documents that CreateProcess returns an all-access process
+handle to its caller; that already-issued handle remains the supervisor's duplication authority. The dedicated CLI
+anchor role also protects itself before holding objects. This is a process-object policy, not a privilege or a change
+to the user's account or system configuration. Evidence B:
+[process rights](https://learn.microsoft.com/en-us/windows/win32/procthread/process-security-and-access-rights),
+[process creation attributes](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw),
+[SetKernelObjectSecurity](https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-setkernelobjectsecurity).
+
+The general process-rights page describes the pseudo handle as DACL-dependent, while the API-specific
+[GetCurrentProcess](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getcurrentprocess)
+contract grants all access on supported Windows and limits the older behavior to XP and Server 2003. Use the specific
+contract and retain the real-process transfer oracle: after protection the holder must still duplicate its own
+objects, and its supervisor must still transfer them through its spawn handle. OWNER RIGHTS follows A-175's measured
+peer-section policy, which also suppresses the owner's implicit WRITE_DAC. The new probe separately requests
+WRITE_DAC and WRITE_OWNER so refusing duplication alone cannot hide an ACL rewrite.
+
+The initial probe did not control the caller's debugger privilege. Jupiter and both runner architectures actually
+have it enabled, which bypasses the process DACL. A restricted copy of the probe's own token now disables privileges
+on that thread only; PrivilegeCheck independently observes `during false`, and the helper checks restoration.
+With identical normalization, [the red run](https://github.com/hyper-light/slates/actions/runs/41432477849) still
+grants duplication on both architectures, while [the protected run](https://github.com/hyper-light/slates/actions/runs/41432451084)
+refuses duplication, DACL rewrite and owner change for both holders. The latter retains zero drive losses across
+twenty kills per architecture, all six live tests, all 32 active anchor tests, native lint and docs. This establishes
+new unprivileged process-open policy, not confinement of already-issued authority or enabled SeDebugPrivilege.
+Evidence B: [OpenProcess](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-openprocess),
+[restricted token](https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-createrestrictedtoken),
+[same-identity impersonation](https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-impersonateloggedonuser).
+
+## Step 9.4: processing requests do not time out (2026-11-02 source correction)
+
+WinFsp v2.1's [driver.h](https://raw.githubusercontent.com/winfsp/winfsp/v2.1/src/sys/driver.h) defines
+`FSP_IOQ_PROCESS_NO_CANCEL`. Under that definition [ioq.c](https://raw.githubusercontent.com/winfsp/winfsp/v2.1/src/sys/ioq.c)
+sets a processing request's timestamp to infinity, installs no cancellation routine, and excludes processing and
+retried requests from RemoveExpired. The previous claim that the transact-to-guard gap times out is wrong. A
+guard-only journal cannot establish bounded settlement of every taken request. This is a source finding (B), not a
+passing live-mount result.
+
+There is a second boundary: [the DLL dispatcher](https://raw.githubusercontent.com/winfsp/winfsp/v2.1/src/dll/fs.c)
+returns a response in its next transact. A guard leaving an operation does not prove the driver accepted that
+response. A saved hint can already have completed; another dispatcher can have taken a request at its reused IRP
+address. The driver matches only that address in its processing queue. Missing-hint behavior is insufficient.
+
+The new live oracle retains a real Request::Read after the production host delivers it, kills the serving process,
+and starts a successor on the same held controls and ledger. The reader must return bytes or
+ERROR_OPERATION_ABORTED within ten liveness budgets. Its first run must fail before request recovery is added.
+The fixture uses a fixed read-only file in each process to isolate transport settlement; the CLI's twenty-kill
+history remains the persistence and view-coherence oracle.
