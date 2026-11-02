@@ -21,14 +21,16 @@ pub(crate) type PSecurityDescriptor = *mut c_void;
 /// WinFsp's `BOOLEAN` — a single byte, 0 or 1.
 pub(crate) type Boolean = u8;
 
-/// The opaque `FSP_FILE_SYSTEM`, accessed only through its stable leading fields (`Version`, then the
-/// `UserContext` a host stores its handler pointer in). A prefix struct is a sound view of the real
-/// object's head under `#[repr(C)]` — the two fields sit at the same offsets (0 and, `PVOID`-aligned,
-/// 8 on 64-bit) as in the full 792-byte struct, and the host never reads past them.
+/// The public v2.1 `FSP_FILE_SYSTEM` prefix through `VolumeHandle` (A-198). WinFsp allocates the full 792-byte object;
+/// this layout reaches only the handler, the 256-unit volume name and the control handle, in header order. Creating
+/// the full object still belongs to the DLL, so its operation table and dispatcher TLS are initialized there.
 #[repr(C)]
 pub(crate) struct FileSystem {
   pub(crate) version: u16,
   pub(crate) user_context: Pvoid,
+  /// Format: `FSP_FSCTL_VOLUME_NAME_SIZEMAX / sizeof(WCHAR)`, 64 volume units plus 192 prefix units.
+  pub(crate) volume_name: [u16; 64 + 192],
+  pub(crate) volume_handle: windows_sys::Win32::Foundation::HANDLE,
 }
 
 /// `FSP_FSCTL_VOLUME_PARAMS` (504 bytes; header `static_assert`) — the mount parameters. The two
@@ -289,9 +291,6 @@ pub(crate) type CreateFn = unsafe extern "system" fn(
 /// `FspFileSystemDelete`, `FspFileSystemRemoveMountPoint` and `FspFileSystemStopDispatcher`: each takes the file
 /// system and returns nothing.
 pub(crate) type FileSystemFn = unsafe extern "system" fn(file_system: *mut FileSystem);
-/// `FspFileSystemSetMountPoint`.
-pub(crate) type SetMountPointFn =
-  unsafe extern "system" fn(file_system: *mut FileSystem, mount_point: Pwstr) -> Ntstatus;
 /// `FspFileSystemStartDispatcher`.
 pub(crate) type StartDispatcherFn =
   unsafe extern "system" fn(file_system: *mut FileSystem, thread_count: u32) -> Ntstatus;
@@ -329,8 +328,6 @@ pub(crate) type NotifyFn = unsafe extern "system" fn(
 pub(crate) struct Api {
   pub(crate) create: CreateFn,
   pub(crate) delete: FileSystemFn,
-  pub(crate) set_mount_point: SetMountPointFn,
-  pub(crate) remove_mount_point: FileSystemFn,
   pub(crate) start_dispatcher: StartDispatcherFn,
   pub(crate) stop_dispatcher: FileSystemFn,
   pub(crate) set_guard_strategy: SetGuardStrategyFn,
@@ -373,8 +370,6 @@ fn load() -> Result<Api, Ntstatus> {
   Ok(Api {
     create: symbol(module, c"FspFileSystemCreate")?,
     delete: symbol(module, c"FspFileSystemDelete")?,
-    set_mount_point: symbol(module, c"FspFileSystemSetMountPoint")?,
-    remove_mount_point: symbol(module, c"FspFileSystemRemoveMountPoint")?,
     start_dispatcher: symbol(module, c"FspFileSystemStartDispatcher")?,
     stop_dispatcher: symbol(module, c"FspFileSystemStopDispatcher")?,
     set_guard_strategy: symbol(module, c"FspFileSystemSetOperationGuardStrategyF")?,
@@ -453,7 +448,6 @@ fn wide(text: &str) -> Vec<u16> {
 trait Export: Copy {}
 impl Export for CreateFn {}
 impl Export for FileSystemFn {}
-impl Export for SetMountPointFn {}
 impl Export for StartDispatcherFn {}
 impl Export for SetGuardStrategyFn {}
 impl Export for AddDirInfoFn {}
