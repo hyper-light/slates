@@ -1,5 +1,13 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Fleet setup failure still unattributed (2026-11-02, §4.8 Lookup).** Main CI 41538865390 on `8a3fdc63` passes
+> Windows and QEMU but its Linux fleet target passes 85/86 active histories: the returning-session location case
+> gets an unexpected Create reply while choosing its routing candidate. The helper discarded that reply, so its
+> failure now prints the candidate name and complete typed verdict. The same fleet source passes on parent
+> `663e4df8`; the exact isolated case passes once on adacachy in 5.25 s. Neither result names the original verdict
+> or cause. Keep the failure open for that evidence; no retry or weaker assertion is added. Record:
+> `docs/bugs/2026-11-02-a-fleet-routing-fixture-discarded-its-unexpected-create-reply.md`.
+
 > **A forward waits for the owner's session (2026-09-25, §4.8 Lookup).** A forward refused the client
 > `HomedElsewhere` at once whenever a coordinator dispatch or a discovery page had the owner's session out;
 > the copyset history failed about once in fourteen runs that way (CI run 36191789379). It now waits inside

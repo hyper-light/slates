@@ -5605,8 +5605,9 @@ fn choose_copyset_routing_case(
   const OBJECTS: usize = 128;
   for sequence in 0..OBJECTS {
     let name = format!("copyset-route-{sequence}");
-    let ReplyBody::Created { id } = local.call(&scratch(&name)) else {
-      panic!("create routing candidate")
+    let created = local.call(&scratch(&name));
+    let ReplyBody::Created { id } = created else {
+      panic!("create routing candidate {name}: {created:?}")
     };
     let object = ObjectId(id.bytes);
     let candidates = candidates_for(
