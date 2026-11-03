@@ -12922,8 +12922,10 @@ and failed-then-passing oracles distinguish those results from the initial sourc
     processing meanwhile. A response saved before the driver accepted it is then safe to send again: the original
     IRP remains in processing, or a recycled address is merely pending and does not match.
   - Live diagnostics [41472709500](https://github.com/hyper-light/slates/actions/runs/41472709500) settle one counted
-    captured read in 0.17 s on x86_64 and 0.33 s on arm64. The same tree loses zero drives of twenty on each
-    architecture, with four restored-context reads in its final iteration. That partial result still exposed the
+    captured read in 0.33 s on x86_64 (`windows-latest`) and 0.17 s on arm64 (`windows-11-arm`). The same tree loses
+    zero drives of twenty on each architecture, with four restored-context reads in its final iteration. The run's
+    conclusion is `cancelled`; both takeover jobs had finished these tests first. (Corrected 2026-11-03 by the audit
+    of this step's record: the two times were given the wrong way round.) That partial result still exposed the
     renamed-view failures corrected below; the final untraced verification is 41484542209.
   - A complete saved response has a CRC32C and is recorded before sending. Without one, a buffer-bearing operation
     is refused STATUS_CANCELLED, never replayed through a dead process's buffer or token handle. Cleanup and close

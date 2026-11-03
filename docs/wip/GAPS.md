@@ -1,5 +1,33 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Audit of 2dc9f3eb..98000d56 (2026-11-03): defects open, Step 9's evidence holds.** Nine commits made on
+> 2026-11-01 and 2026-11-02 were read line by line against this file's rules and Step 9's acceptance. Every CI run they
+> cite was read again: each shows what it is cited for, except one pair of timings A-198 gave the wrong way
+> round (corrected there). Zero drives were lost in twenty kills on both Windows architectures, and main CI
+> 41565834374 passed 20 of 20 jobs. Open, each owed a failing test first (kiln plan
+> 01a1a34bf7e973069e94f773afdea44a, steps 2–8):
+> - **vhost-user ring restart (A-169, `663e4df8`).** A ring started again after `GET_VRING_BASE` is served from the
+>   size, addresses and position it was admitted with; a later `SET_VRING_NUM`, `SET_VRING_ADDR` or `SET_VRING_BASE`
+>   only updates the seam's record (`crates/bridge-virtiofs/src/vhost_user.rs`). QEMU sends all three on every ring
+>   start, so a guest reboot or a driver rebind would be served from the old ring.
+> - **The Windows anchor ends on one malformed or short hold message (A-198).** The refusal propagates out of
+>   `Supervisor::step` and ends the anchor, whose kill-on-close job then takes every held drive. Unix counts such
+>   refusals.
+> - **A refused hold release leaves a held drive (A-198).** The unmount deletes the file system after the release is
+>   refused, so the anchor keeps the volume and its drive letter with no daemon serving them
+>   (`crates/server/src/winfsp.rs`, `release_hold` and `reap`).
+> - **A refused view leaks the held section's handle** (`crates/mem/src/shared.rs`, Windows `from_held_handle`).
+> - **The receiver's WinFsp guard checks a field WinFsp always zeroes** (`FileSystem.Version`), not the DLL's version
+>   (`FspVersion`). Also, an open whose path is longer than 1024 UTF-16 units is now refused, because every open records
+>   its kernel name in the held ledger (`crates/bridge-winfsp/src/opens/names.rs`).
+> - **The receiver that replaced WinFsp's dispatcher is unmeasured.** It is one thread with a new event per control
+>   transaction, where the DLL dispatcher ran two threads; BENCHMARKS has no entry for it.
+> - **Two failures recorded open below are still unfixed**: the wake-learning fixture under load and the fleet routing
+>   Create reply.
+>
+> Twenty goals of this plan's stack, Steps 10–15 among them, were closed in 2–4 s each with no work. They are
+> restored in order after these fixes.
+
 > **Empty-wake fixture corrected (2026-11-02, §4.7).** TSan job 125662475876 in main run 41558297045 fails the
 > existing unanswered-wake case at its five-second guards. An armed flag can precede the client's wake snapshot,
 > so an empty notification there can be coalesced with no reply for the ring recheck. The injector now waits for
