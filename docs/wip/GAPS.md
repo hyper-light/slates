@@ -6,10 +6,11 @@
 > round (corrected there). Zero drives were lost in twenty kills on both Windows architectures, and main CI
 > 41565834374 passed 20 of 20 jobs. Open, each owed a failing test first (kiln plan
 > 01a1a34bf7e973069e94f773afdea44a, steps 2–8):
-> - **vhost-user ring restart (A-169, `663e4df8`).** A ring started again after `GET_VRING_BASE` is served from the
->   size, addresses and position it was admitted with; a later `SET_VRING_NUM`, `SET_VRING_ADDR` or `SET_VRING_BASE`
->   only updates the seam's record (`crates/bridge-virtiofs/src/vhost_user.rs`). QEMU sends all three on every ring
->   start, so a guest reboot or a driver rebind would be served from the old ring.
+> - **vhost-user ring restart (A-169, `663e4df8`): fixed 2026-11-03.** A ring started again after `GET_VRING_BASE`
+>   was served from the size, addresses and position it was admitted with. Now a restart resumes only over its
+>   admitted layout at its stopped index; a reset driver's restart is refused and ends the device; a running ring is
+>   never moved. Two tests failed first and pass after. Owed: an in-place reset, so a rebooted guest keeps its device.
+>   Record: `docs/bugs/2026-11-03-a-restarted-vhost-ring-was-served-from-its-old-layout.md`.
 > - **The Windows anchor ends on one malformed or short hold message (A-198).** The refusal propagates out of
 >   `Supervisor::step` and ends the anchor, whose kill-on-close job then takes every held drive. Unix counts such
 >   refusals.

@@ -183,6 +183,11 @@ box shared with two other builds — timings are not benchmarks)
   request held at its acknowledgements, and work posted while stopped. The previous first-stop hangup caused
   QEMU's poweroff abort (main CI 41529944478); see
   `docs/bugs/2026-11-02-stopping-one-vhost-ring-closed-the-control-connection.md`.
+- **A restart resumes; a reset is a new device.** A stopped ring takes a new size, addresses or base, and its kick
+  restarts it only over the layout it was admitted with, at the index it stopped at (QEMU after a pause or a stop).
+  A guest whose driver started over (a reboot, a rebind: new rings, base zero) has its restart refused, which ends the
+  device: the device cannot yet take a new FUSE session over in place. A running ring is never moved. See
+  `docs/bugs/2026-11-03-a-restarted-vhost-ring-was-served-from-its-old-layout.md`.
 - **Indirect descriptors are refused, not implemented**: `VIRTIO_F_INDIRECT_DESC` is not offered;
   the Linux virtiofs driver does not need it (its chains are direct); implementing it fully
   (a second table, its own bounds and loop checks) is a later leg if a VMM negotiates it.

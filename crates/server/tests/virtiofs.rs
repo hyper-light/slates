@@ -993,6 +993,47 @@ mod vhost_front_end {
       );
     }
 
+    /// Restarts a stopped `queue` as QEMU's `vhost_virtqueue_start` does after the guest reset its driver: the ring's
+    /// size, its base (QEMU's last available index, zero after a reset), the driver's new ring addresses, then its kick.
+    /// The first three acknowledgements must report success (a stopped ring may be reconfigured); the kick's is
+    /// returned.
+    pub(crate) fn restart_after_reset(
+      &self,
+      queue: usize,
+      layout: &slates_bridge_virtiofs::virtqueue::QueueLayout,
+    ) -> u64 {
+      let index = u32::try_from(queue).unwrap();
+      let acks = [
+        self.set(
+          request::SET_VRING_NUM,
+          &Self::state(index, u32::from(layout.size)),
+          &[],
+        ),
+        self.set(request::SET_VRING_BASE, &Self::state(index, 0), &[]),
+        self.set(request::SET_VRING_ADDR, &ring_addresses(index, layout), &[]),
+      ];
+      assert_eq!(
+        acks, [0; 3],
+        "queue {queue}'s stopped ring took its new layout"
+      );
+      self.set(
+        request::SET_VRING_KICK,
+        &u64::from(index).to_le_bytes(),
+        &[self.kicks[queue].as_fd()],
+      )
+    }
+
+    /// Readdresses a running `queue` to `layout` (a hostile front end: the protocol stops a ring before moving it);
+    /// the acknowledgement's status.
+    pub(crate) fn readdress(
+      &self,
+      queue: usize,
+      layout: &slates_bridge_virtiofs::virtqueue::QueueLayout,
+    ) -> u64 {
+      let index = u32::try_from(queue).unwrap();
+      self.set(request::SET_VRING_ADDR, &ring_addresses(index, layout), &[])
+    }
+
     /// Restarts a stopped queue by handing its kick descriptor over again; no extra kick is required by the protocol.
     pub(crate) fn restart(&self, queue: usize) {
       assert_eq!(
@@ -1174,6 +1215,122 @@ fn a_vhost_user_front_end_drives_a_guest_whose_file_the_host_reads_back() {
   let root = mount(&mut stream, &capability, 1);
   let file = lookup(&mut stream, &root, "from-vhost.txt", 2);
   assert_eq!(read(&mut stream, &file, 3), PAYLOAD);
+  drop(client);
+  drop(daemon);
+}
+
+/// Shape: where the reset guest's driver puts its new rings: past the first rings, below the buffers.
+#[cfg(target_os = "linux")]
+const RESET_RING_BASE: u64 = 0x21000;
+
+/// A vhost-user device admitted over a configured front end with the request queue at one consumed request: what a
+/// guest reset or a hostile front end meets. The daemon, the client, the front end, the guest and the device's end.
+#[cfg(target_os = "linux")]
+fn vhost_device_after_one_request(
+  name: &str,
+) -> (
+  Daemon,
+  Client,
+  vhost_front_end::FrontEnd,
+  common::guest::Guest<slates_bridge_virtiofs::vhost_user::GuestRegions>,
+  std::sync::mpsc::Receiver<GuestDeviceOutcome>,
+  std::os::fd::OwnedFd,
+) {
+  let (daemon, instance) = single_shard_daemon(name);
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch(name)) else {
+    panic!("the volume was not created");
+  };
+  let (front, socket) = vhost_front_end::pair();
+  let ended = attach_vhost(&daemon, id, (socket, HANDSHAKE_NS));
+  let ram = vhost_front_end::guest_ram(true);
+  let mut guest = vhost_front_end::guest_over(&ram);
+  assert_eq!(front.negotiate_memory(&ram), 0);
+  front.configure_queues(&guest);
+  let created = through_vhost(
+    &front,
+    &mut guest,
+    &message(Opcode::Create.to_wire(), 1, 1, &create_body("before.txt")),
+  );
+  assert_eq!(reply_error(&created), 0);
+  (daemon, client, front, guest, ended, ram)
+}
+
+/// The device's end after a refusal: it ended faulted (a protocol refusal), and its terminal step ran.
+#[cfg(target_os = "linux")]
+fn assert_ended_faulted(ended: &std::sync::mpsc::Receiver<GuestDeviceOutcome>) {
+  let outcome = ended
+    .recv_timeout(common::guest::WAIT)
+    .expect("the device ended");
+  let GuestDeviceOutcome::Ended(end) = outcome else {
+    panic!("the device did not serve: {outcome:?}");
+  };
+  assert!(
+    matches!(end.why, EndReason::Faulted(_)),
+    "a protocol refusal ends the device faulted, not {:?}",
+    end.why
+  );
+  assert!(
+    end
+      .reclaimed
+      .expect("the terminal step ran")
+      .references_swept
+  );
+}
+
+/// A-169 (vhost-user "Ring states"; QEMU's `vhost_virtqueue_start`). Do: serve one request, stop both rings, then let
+/// the guest's driver start over on new rings and restart each ring as QEMU does after a guest reset (size, base
+/// zero, the new addresses, kick), posting a request on the new request ring. Expect: the stopped rings take the new
+/// settings, but the restart is refused (its kick's acknowledgement fails) and the device ends faulted; the request on
+/// the new ring is never consumed. A reset starts a new FUSE session the device cannot yet take over in place (the old
+/// session's references and windows would be left behind), so it is a new device. Before this, the restart was
+/// accepted and the device went on serving the ring it was admitted with, at its old position.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_vhost_ring_restarted_after_a_guest_reset_is_refused_not_served_from_its_old_ring() {
+  let (daemon, client, front, mut guest, ended, _ram) =
+    vhost_device_after_one_request("vhost-reset");
+  front.assert_suspended(&[0, 1]);
+  guest.start_over_at(RESET_RING_BASE);
+  let layouts = guest.layouts().to_vec();
+  let head = guest.submit(
+    &message(Opcode::Lookup.to_wire(), 2, 1, b"before.txt\0"),
+    common::guest::REPLY_CAP,
+  );
+  assert_ne!(
+    front.restart_after_reset(0, &layouts[0]),
+    0,
+    "a ring restarted over a reset driver is refused"
+  );
+  front.kick(1);
+  assert_ended_faulted(&ended);
+  assert!(
+    guest.reap().is_none(),
+    "the new ring's request {head} was never consumed"
+  );
+  drop(front);
+  drop(client);
+  drop(daemon);
+}
+
+/// A-169 (vhost-user: a ring is moved only while stopped). Do: as a hostile front end, readdress the running request
+/// ring to the rings a reset driver would use. Expect: refused (the acknowledgement fails) and the device ends
+/// faulted. Before this, the new addresses were taken into the seam's record silently while the device kept serving
+/// the old ring.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_running_vhost_ring_cannot_be_readdressed() {
+  let (daemon, client, front, mut guest, ended, _ram) =
+    vhost_device_after_one_request("vhost-readdress");
+  guest.start_over_at(RESET_RING_BASE);
+  let layouts = guest.layouts().to_vec();
+  assert_ne!(
+    front.readdress(1, &layouts[1]),
+    0,
+    "a running ring is not readdressed"
+  );
+  assert_ended_faulted(&ended);
+  drop(front);
   drop(client);
   drop(daemon);
 }

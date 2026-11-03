@@ -105,6 +105,30 @@ impl<M: GuestMemory> Guest<M> {
     &self.layouts
   }
 
+  /// The driver starts over, as a guest's does after a reset or a reboot: fresh rings from `ring_base` (zeroed, each
+  /// queue `RING_STRIDE` apart, below the buffers), every index back at zero, no request outstanding.
+  pub(crate) fn start_over_at(&mut self, ring_base: u64) {
+    self.layouts = QUEUE_SIZES
+      .iter()
+      .enumerate()
+      .map(|(queue, size)| {
+        layout_at(
+          ring_base + u64::try_from(queue).unwrap() * RING_STRIDE,
+          *size,
+        )
+      })
+      .collect();
+    assert!(ring_base + RING_STRIDE * 2 <= BUFFER_BASE);
+    for queue in 0..self.layouts.len() {
+      let start = self.layouts[queue].descriptor_table.0;
+      self.write(start, &vec![0u8; usize::try_from(RING_STRIDE).unwrap()]);
+    }
+    self.avail_idx = 0;
+    self.used_seen = 0;
+    self.next_desc = 0;
+    self.writable.clear();
+  }
+
   fn write(&mut self, at: u64, bytes: &[u8]) {
     let range = GuestRange::new(GuestAddr(at), u64::try_from(bytes.len()).unwrap()).unwrap();
     self.memory.write(range, bytes).unwrap();

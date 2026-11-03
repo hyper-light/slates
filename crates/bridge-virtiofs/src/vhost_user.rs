@@ -31,6 +31,13 @@
 //!   for its taken chains to complete, then reports the device's next available index. All rings stopped means
 //!   suspension, not hangup; control messages still work. The VMM closing its socket ends the device. Closing on
 //!   the first ring stop made QEMU 11.1 abort stopping the second (main CI 41529944478, 2026-11-02).
+//! - **A restart resumes or is refused** (A-169): the reported index becomes the stopped ring's base, and only a
+//!   stopped ring takes a new size, addresses or base (a running ring moved is a protocol refusal). A kick restarts it
+//!   only over the layout it was admitted with, at the index it stopped at: QEMU's restart after a pause or a stop.
+//!   A driver that started over (a guest reset: new rings, base zero) opens a new FUSE session this device cannot
+//!   take over in place, so that restart is refused and ends the device. Before 2026-11-03 such a restart was
+//!   accepted and served from the old ring at its old index
+//!   (`docs/bugs/2026-11-03-a-restarted-vhost-ring-was-served-from-its-old-layout.md`).
 //! - **One doorbell**: an epoll descriptor holding the socket and every kick eventfd, so the loop waits on one
 //!   number; draining it serves pending control messages and consumes every kick.
 //!
@@ -580,6 +587,9 @@ struct Vring {
   started: bool,
   /// At most one stop awaiting completion per queue; a repeated request before its reply is a protocol refusal.
   stop_reply: Option<Header>,
+  /// The position the device reported when the admitted ring last stopped: the ring's base until a SET_VRING_BASE,
+  /// and the only position its restart may resume at. `None` while it runs.
+  stopped_at: Option<u16>,
 }
 
 /// Format: the payload of a vring-state message: index (`u32`) and number (`u32`).
@@ -635,6 +645,8 @@ pub struct VhostUserSeam {
   num_request_queues: u32,
   /// Once layouts have been handed to the device, its positions decide when a stop may be answered.
   admitted: bool,
+  /// The layouts the device was admitted with, in queue order: a restarted ring must describe its queue's again.
+  admitted_layouts: Vec<QueueLayout>,
   stopped: bool,
 }
 
@@ -697,6 +709,7 @@ impl VhostUserSeam {
       config_tag: config.tag.config_bytes(),
       num_request_queues: config.num_request_queues.get(),
       admitted: false,
+      admitted_layouts: Vec::new(),
       stopped: false,
     })
   }
@@ -955,14 +968,18 @@ impl VhostUserSeam {
       request::SET_OWNER | request::RESET_OWNER => Ok(Answer::Acknowledge),
       request::SET_MEM_TABLE => self.set_mem_table(payload),
       request::SET_VRING_NUM => {
+        let admitted = self.admitted;
         let (vring, num) = self.vring_state(payload)?;
+        reconfigurable(vring, admitted)?;
         let size = u16::try_from(num).map_err(|_| protocol("a queue size past 16 bits"))?;
         vring.size = Some(size);
         Ok(Answer::Acknowledge)
       }
       request::SET_VRING_ADDR => self.set_vring_addr(payload),
       request::SET_VRING_BASE => {
+        let admitted = self.admitted;
         let (vring, num) = self.vring_state(payload)?;
+        reconfigurable(vring, admitted)?;
         vring.base = u16::try_from(num).map_err(|_| protocol("a ring index past 16 bits"))?;
         Ok(Answer::Acknowledge)
       }
@@ -1179,16 +1196,60 @@ impl VhostUserSeam {
       used: u64_at(payload, VRING_AT_USED)?,
       available: u64_at(payload, VRING_AT_AVAILABLE)?,
     };
+    let admitted = self.admitted;
     let vring = self
       .vrings
       .get_mut(index)
       .ok_or(protocol("a queue index past the device's queues"))?;
+    reconfigurable(vring, admitted)?;
     vring.addresses = Some(addresses);
     Ok(Answer::Acknowledge)
   }
 
   /// Stops taking new chains. Once admitted, the device reports its actual positions at its next boundary;
   /// a held publication or DAX completion must finish before the reply, as the vhost-user protocol requires.
+  /// The layout `vring` describes in guest addresses, once its size and addresses are set and the memory table holds
+  /// each ring: what the device is admitted with, and what a restart must describe again.
+  fn layout_of(&self, vring: &Vring) -> Option<QueueLayout> {
+    let (size, addresses) = (vring.size?, vring.addresses?);
+    Some(QueueLayout {
+      size,
+      descriptor_table: self.memory.guest_of_user(addresses.descriptor)?,
+      available_ring: self.memory.guest_of_user(addresses.available)?,
+      used_ring: self.memory.guest_of_user(addresses.used)?,
+    })
+  }
+
+  /// Whether a kick may start ring `index` (vhost-user "Ring states": SET_VRING_KICK starts a stopped ring). Before
+  /// admission, and for a ring already running, it may. An admitted ring that stopped resumes only over the layout it
+  /// was admitted with and at the position it stopped at, which is what QEMU sends after a pause or a stop. Anything
+  /// else is a driver that started over (a guest reset or reboot: new rings, base zero), a new FUSE session the device
+  /// cannot take over in place, since the old session's references and windows would be left behind. It is refused,
+  /// which ends the device: a reset is a new device.
+  fn check_resume(&self, index: usize) -> Result<(), VhostError> {
+    let vring = self
+      .vrings
+      .get(index)
+      .ok_or(protocol("a queue index past the device's queues"))?;
+    if !self.admitted || vring.started {
+      return Ok(());
+    }
+    let stopped_at = vring
+      .stopped_at
+      .ok_or(protocol("an admitted ring restarted without a stop"))?;
+    let admitted = self.admitted_layouts.get(index).copied();
+    if vring.base == stopped_at
+      && self
+        .layout_of(vring)
+        .is_some_and(|layout| admitted == Some(layout))
+    {
+      return Ok(());
+    }
+    Err(protocol(
+      "a ring restarted at another layout or position: a reset is a new device",
+    ))
+  }
+
   fn get_vring_base(&mut self, header: Header, payload: &[u8]) -> Result<Answer, VhostError> {
     let admitted = self.admitted;
     let (vring, reserved) = self.vring_state(payload)?;
@@ -1239,6 +1300,7 @@ impl VhostUserSeam {
         {
           return Err(protocol("a ring restarted before its stop reply"));
         }
+        self.check_resume(index)?;
         let fd = fd.ok_or(protocol(
           "a kick without a descriptor (polling is not served)",
         ))?;
@@ -1248,6 +1310,7 @@ impl VhostUserSeam {
           .map_err(os("epoll_ctl"))?;
         if let Some(vring) = self.vrings.get_mut(index) {
           vring.started = true;
+          vring.stopped_at = None;
           if let Some(old) = vring.kick.replace(fd) {
             // The registration is on the open file, which the front end still holds: remove it explicitly.
             let _ = epoll::delete(&self.doorbell, &old);
@@ -1337,6 +1400,16 @@ impl Header {
 /// A vhost-user refusal as the device seam reports it, keeping the words the wire produced (§4.6, CLAUDE.md #9:
 /// no refusal is swallowed). [`VhostError::Closed`] never reaches here — a clean close is a hang-up, not a refusal,
 /// and its caller answers it before asking for this.
+/// Whether a ring's size, addresses or base may change: before admission, always; after it, only while the ring is
+/// stopped and its stop answered (vhost-user "Ring states": a stopped ring is not processed at all). A running ring
+/// moved under the device would be served from memory the driver no longer reads as its ring.
+fn reconfigurable(vring: &Vring, admitted: bool) -> Result<(), VhostError> {
+  if admitted && (vring.started || vring.stop_reply.is_some()) {
+    return Err(protocol("a running ring's size, addresses or base changed"));
+  }
+  Ok(())
+}
+
 fn seam_refusal(error: VhostError) -> SeamError {
   match error {
     VhostError::PeerUnverified => SeamError::ConsumerUnverified,
@@ -1624,28 +1697,15 @@ impl VmmSeam for VhostUserSeam {
       .vrings
       .iter()
       .map(|vring| {
-        let (Some(size), Some(addresses)) = (vring.size, vring.addresses) else {
-          return Err(SeamError::QueuesUnavailable);
-        };
         // The device's ring position starts at zero; a ring resumed elsewhere is not this device's.
         if vring.base != 0 {
           return Err(SeamError::QueuesUnavailable);
         }
-        let guest = |user| {
-          self
-            .memory
-            .guest_of_user(user)
-            .ok_or(SeamError::QueuesUnavailable)
-        };
-        Ok(QueueLayout {
-          size,
-          descriptor_table: guest(addresses.descriptor)?,
-          available_ring: guest(addresses.available)?,
-          used_ring: guest(addresses.used)?,
-        })
+        self.layout_of(vring).ok_or(SeamError::QueuesUnavailable)
       })
       .collect::<Result<Vec<_>, _>>()?;
     self.admitted = true;
+    self.admitted_layouts.clone_from(&layouts);
     Ok(layouts)
   }
 
@@ -1660,6 +1720,11 @@ impl VmmSeam for VhostUserSeam {
       None
     };
     let running = vring.started && (vring.enabled || self.features & F_PROTOCOL_FEATURES == 0);
+    if reply.is_some() {
+      // The reported position becomes the ring's base: a restart without a SET_VRING_BASE resumes there.
+      vring.base = progress.taken;
+      vring.stopped_at = Some(progress.taken);
+    }
     if let Some(header) = reply {
       self
         .reply_vring_base(header, u32::from(queue), progress.taken)

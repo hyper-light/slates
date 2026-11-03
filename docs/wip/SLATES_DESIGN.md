@@ -14572,6 +14572,18 @@ dispatch; `shards.rs` the end handoff shared), `crates/client` (`attach_vhost_us
   the fix (0.28 s) and passes after (0.27 s); the DAX in-flight/restart test passes (0.64 s), all 24 server cases pass,
   and all eight real QEMU guest histories pass (28.23 s), adacachy, 2026-11-02. Evidence: QEMU's vhost-user protocol,
   Ring states / Suspended device state / GET_VRING_BASE, and `hw/virtio/vhost.c::do_vhost_dev_stop`.
+- **A restart resumes or ends the device (corrected 2026-11-03).** The ring-lifetime correction left a restart
+  served from the layout and index the device was admitted with: after admission, `SET_VRING_NUM`, `SET_VRING_ADDR`
+  and `SET_VRING_BASE` only updated the seam's record, though QEMU's `vhost_virtqueue_start` sends all three before
+  every kick (its base is the last available index, zero after a guest reset). Now a drained stop's index becomes the
+  ring's base; only a stopped, answered ring takes new settings (a running ring moved is refused); and a kick
+  restarts a ring only over its admitted layout at the index it stopped at, which is QEMU's restart after a pause
+  or a stop. A driver that started over opens a new FUSE session that the device cannot take over in place, since
+  the old session's references and windows would stay behind; its restart is refused and ends the device, so a reset
+  is a new device. Owed: an in-place reset that sweeps the old session and re-admits every queue. Two tests failed
+  first and pass after (`a_vhost_ring_restarted_after_a_guest_reset_is_refused_not_served_from_its_old_ring`,
+  `a_running_vhost_ring_cannot_be_readdressed`); the virtiofs suite passes 27 of 27, adacachy, 2026-11-03. Record:
+  `docs/bugs/2026-11-03-a-restarted-vhost-ring-was-served-from-its-old-layout.md`.
 - **Live-fixture inheritance corrected 2026-11-02.** The ring fix exposed the live QEMU harness clearing CLOEXEC
   in its parent: sibling VMs inherited each other's frontend sockets, hiding peer close. It now changes that flag
   only in the intended child's pre_exec. A two-child real-exec EOF test fails first (20.04 s), then passes (0.00 s);
