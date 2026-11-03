@@ -4061,6 +4061,14 @@ root-relative path as an explicit alternative; it does not report that the reque
 
 ### 4.7 IPC and the provisioning fast path (D-10)
 
+> **Test fixture correction (2026-11-02, A-31).** The armed flag precedes the client's wake-word snapshot; it is
+> not a kernel-sleeper acknowledgement. An empty wake there may be coalesced, unlike a real reply that the ring
+> recheck finds. The unanswered-wake fixture now waits for `wake_one` to confirm a sleeper on Linux/macOS;
+> Windows' Event retains an early signal. The original deadline and reply/count assertions stay in force. The
+> instrumented CI case first fails at 5.01 s; 100 corrected native Linux runs and all nine ring cases pass, as do
+> all nine on macOS (0.53 s). Record:
+> `docs/bugs/2026-11-02-an-empty-wake-test-mistook-an-armed-client-for-a-sleeper.md`.
+
 > **Status (2026-09-20, A-28).** Client retirement reserves the dead client's seat and id
 > until every owner shard has removed its SDK attachments. Unsent forwards are cancelled;
 > read-only gathers follow already-admitted synchronous attachment verbs, and removal names

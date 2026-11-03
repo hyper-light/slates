@@ -293,16 +293,21 @@ fn a_hostile_slot_is_refused_and_the_ring_keeps_flowing() {
   assert_eq!(daemon.try_take().unwrap().unwrap().payload, b"next");
 }
 
-/// Raises the region's wake with no reply behind it — what a spurious return from the OS wait, or a
-/// previous reply's wake landing late, looks like to a parked client.
+/// Wakes an actual sleeper without a reply. The parked flag includes preparation before the wake-word snapshot;
+/// an empty wake then can be coalesced, with no reply for the mandatory ring recheck to find (§4.7, A-31).
+#[cfg(not(windows))]
 fn wake_without_reply(region: &ClientRegion) {
-  #[cfg(not(windows))]
-  {
-    let word = region.wake_word().unwrap();
-    word.fetch_add(1, Ordering::AcqRel);
-    slates_ipc::wake::wake_one(word).unwrap();
-  }
-  #[cfg(windows)]
+  let word = region.wake_word().unwrap();
+  take_within(
+    || slates_ipc::wake::wake_one(word).unwrap().then_some(()),
+    "a client asleep on its wake word",
+  );
+  eprintln!("IPC EMPTY WAKE: the kernel confirmed a sleeper");
+}
+
+/// The auto-reset Event retains an early signal, so Windows needs no wake-word snapshot or sleeper confirmation.
+#[cfg(windows)]
+fn wake_without_reply(region: &ClientRegion) {
   region.wake_signal().unwrap();
 }
 
@@ -361,7 +366,7 @@ fn await_region(region: &ClientRegion, what: &str, holds: impl Fn(&ClientRegion)
 
 /// AC-2.1 (§4.7 "Wake strategy"; docs/bugs/2026-09-28-the-client-tests-judged-a-live-daemon-by-a-shorter-clock.md):
 /// a wake that brings no reply sends the client back to park and is counted, and the reply that follows
-/// still ends the wait. The peer wakes the parked client with nothing in the ring, waits until the client
+/// still ends the wait. The peer delivers an empty wake, waits until the client
 /// has parked again (its reply stamp cleared over the peer's marker), then replies: exactly one unanswered
 /// wake, the reply delivered, and every park accounted for by a reply or an unanswered wake. Non-vacuous
 /// for the client tests' park assertion, which counted a spurious wake as a broken rule before.
@@ -390,8 +395,14 @@ fn a_wake_without_a_reply_is_counted_and_the_client_parks_again() {
       .unwrap();
   });
   client.send(&Slot::inline(9, b"?").unwrap()).unwrap();
-  let reply = client.wait(Some(REPLY_DEADLINE_NS)).unwrap();
-  server.join().unwrap();
+  let reply = client.wait(Some(REPLY_DEADLINE_NS));
+  let joined = server.join();
+  assert!(
+    joined.is_ok(),
+    "peer {joined:?}; client error {:?}",
+    reply.as_ref().err()
+  );
+  let reply = reply.unwrap();
   assert_eq!(reply.request, 9);
   assert_eq!(reply.payload, b"after");
   assert_eq!(client.unanswered_wakes(), 1, "the empty wake was counted");

@@ -1,5 +1,21 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Empty-wake fixture corrected (2026-11-02, §4.7).** TSan job 125662475876 in main run 41558297045 fails the
+> existing unanswered-wake case at its five-second guards. An armed flag can precede the client's wake snapshot,
+> so an empty notification there can be coalesced with no reply for the ring recheck. The injector now waits for
+> kernel confirmation of a sleeper, using its existing bound; Windows keeps its retained Event. Reply, count and
+> deadline assertions are preserved, and the peer is joined on a client error. Native Linux: 100 runs and all nine
+> ring cases pass; macOS: nine pass in 0.53 s. The before-fix native 100-run sample passed too; the failing evidence
+> is the instrumented CI job. Record:
+> `docs/bugs/2026-11-02-an-empty-wake-test-mistook-an-armed-client-for-a-sleeper.md`.
+
+> **Wake-learning fixture's timing assumption still open (2026-11-02, A-31).** A later capped all-ring run on
+> adacachy (zero of 32 cores idle) passes the corrected empty-wake case but fails the unchanged learning case:
+> 7 of 32 samples, below its required 16, with all 32 replies delivered. Its one-millisecond delay after arming
+> does not establish a kernel sleeper under preemption. Eight of nine cases pass in 0.53 s; the unit exits 101
+> in 7.858 s. Keep the sample assertion and this failure recorded; the whole main CI target remains required.
+> Record: `docs/bugs/2026-11-02-an-empty-wake-test-mistook-an-armed-client-for-a-sleeper.md`.
+
 > **Fleet setup failure still unattributed (2026-11-02, §4.8 Lookup).** Main CI 41538865390 on `8a3fdc63` passes
 > Windows and QEMU but its Linux fleet target passes 85/86 active histories: the returning-session location case
 > gets an unexpected Create reply while choosing its routing candidate. The helper discarded that reply, so its
