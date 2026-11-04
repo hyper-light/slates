@@ -58,6 +58,13 @@ test a_vhost_user_front_end_drives_a_guest_whose_file_the_host_reads_back ... ok
 test vhost_form::stopping_a_vhost_ring_drains_its_taken_request_and_leaves_new_work_until_restart ... ok
 ```
 
+A third test, added with the fix, holds a SETUPMAPPING taken at its map acknowledgements, stops its ring and then
+readdresses it: `vhost_form::a_vhost_ring_whose_stop_awaits_its_chain_cannot_be_moved`. Red-checked on adacachy in a
+copy of the tree whose `vhost_user.rs` is `14290a8a`'s: all three tests fail (each acknowledgement 0); on the fixed
+tree the virtiofs suite passes 28 of 28, with one test ignored, a role run by its parent.
+
+Main CI 41732529738 on `3dd4e933`: the live QEMU lane (eight real guest histories) passes over the changed seam.
+
 ## Siblings
 
 - The in-process seam (`VmmSeam`'s default `queue_running`) has no ring stops, so it has nothing to resume.

@@ -1611,10 +1611,16 @@ mod vhost_form {
     len: u64,
     before_ack: impl FnOnce(),
   ) -> WindowMap {
-    use slates_bridge_virtiofs::vhost_user::{
-      ACK_LEN, FLAG_REPLY, HEADER_AT_FLAGS, HEADER_AT_SIZE, HEADER_LEN, MMAP_FLAG_MAP_RW, VERSION,
-      backend_request,
-    };
+    let window = place_window_unacknowledged(backend, len);
+    before_ack();
+    ack_window_maps(backend, &window);
+    window
+  }
+
+  /// Takes the device's map requests for a `len`-byte range from `backend` and places each piece over a fresh
+  /// reservation, as a front end does, acknowledging none: the device's chain stays taken until `ack_window_maps`.
+  fn place_window_unacknowledged(backend: &std::os::fd::OwnedFd, len: u64) -> WindowMap {
+    use slates_bridge_virtiofs::vhost_user::MMAP_FLAG_MAP_RW;
     let pieces = slates_bridge_core::dax_backing::guarded_layout()
       .pieces(0, len)
       .count();
@@ -1675,8 +1681,19 @@ mod vhost_form {
       len,
       "the pieces cover the window once"
     );
-    before_ack();
-    for _ in &placed {
+    WindowMap {
+      pieces: placed,
+      at,
+      len: window_len,
+    }
+  }
+
+  /// Acknowledges each placed piece of `window` on `backend`, as a front end does once it has mapped them.
+  fn ack_window_maps(backend: &std::os::fd::OwnedFd, window: &WindowMap) {
+    use slates_bridge_virtiofs::vhost_user::{
+      ACK_LEN, FLAG_REPLY, HEADER_AT_FLAGS, HEADER_AT_SIZE, HEADER_LEN, VERSION, backend_request,
+    };
+    for _ in &window.pieces {
       let mut ack = [0u8; HEADER_LEN + ACK_LEN];
       ack[0..4].copy_from_slice(&backend_request::SHMEM_MAP.to_le_bytes());
       ack[HEADER_AT_FLAGS..HEADER_AT_FLAGS + 4]
@@ -1690,11 +1707,6 @@ mod vhost_form {
         rustix::net::SendFlags::NOSIGNAL,
       )
       .unwrap();
-    }
-    WindowMap {
-      pieces: placed,
-      at,
-      len: window_len,
     }
   }
 
@@ -1763,6 +1775,81 @@ mod vhost_form {
       "the window shows the file"
     );
     (node, window)
+  }
+
+  /// Audit plan 01a1a34bf7e973069e94f773afdea44a, step 2 (A-169). Do: hold a SETUPMAPPING taken on the request queue
+  /// at its map acknowledgements, stop that ring (its stop now waits for the chain), then readdress the ring to the rings
+  /// a reset driver would use. Expect: the move is refused (its acknowledgement fails), the device ends (its socket
+  /// closes) and its terminal step releases its attachment, leaving the client's own. A ring whose stop awaits its chain
+  /// is still being served; before the fix the move was taken into the seam's record silently.
+  #[test]
+  fn a_vhost_ring_whose_stop_awaits_its_chain_cannot_be_moved() {
+    use slates_bridge_virtiofs::vhost_user::request;
+
+    let (daemon, mut client) = daemon_and_client("vhost-stop-move");
+    let volume = volume(&mut client, "stopmove");
+    let own = client
+      .attach(volume, None, Intent::Write)
+      .unwrap()
+      .attachment;
+    client
+      .fs_write(
+        (volume, own),
+        "/mapped.bin",
+        &vec![0x41; MAPPED_FILE_BYTES],
+        0o644,
+      )
+      .unwrap();
+    let device = client
+      .attach_vhost_user(volume, Intent::Write, ("slates", None), Some(WINDOW))
+      .unwrap();
+    let front = vhost_front_end::FrontEnd::over(device.end);
+    let ram = vhost_front_end::guest_ram(true);
+    let mut guest = vhost_front_end::guest_over(&ram);
+    let backend = front.negotiate_dax(&ram, WINDOW);
+    front.configure_queues(&guest);
+    wait_for_attachments(&mut client, volume, 2);
+    let found = through_vhost(
+      &front,
+      &mut guest,
+      &message(Opcode::Lookup.to_wire(), 1, 1, b"mapped.bin\0"),
+    );
+    assert_eq!(reply_error(&found), 0);
+    let node = u64_at(&found, OUT_HEADER_LEN);
+    guest.submit(
+      &message(
+        Opcode::SetupMapping.to_wire(),
+        2,
+        node,
+        &setup_body(0, DAX_RANGE, false, 0),
+      ),
+      common::guest::REPLY_CAP,
+    );
+    front.kick(1);
+    let window = place_window_unacknowledged(&backend, DAX_RANGE);
+    front.send(
+      request::GET_VRING_BASE,
+      0,
+      &vhost_front_end::FrontEnd::state(1, 0),
+      &[],
+    );
+    guest.start_over_at(super::RESET_RING_BASE);
+    let moved = guest.layouts()[1];
+    assert_ne!(
+      front.readdress(1, &moved),
+      0,
+      "a ring whose stop awaits its chain is not moved"
+    );
+    front.send(request::GET_QUEUE_NUM, 0, &[], &[]);
+    assert!(front.reply().is_none(), "the refused device closed its end");
+    wait_for_attachments(&mut client, volume, 1);
+    drop(window);
+    drop(front);
+    drop(backend);
+    client.detach(own).unwrap();
+    wait_for_attachments(&mut client, volume, 0);
+    drop(client);
+    drop(daemon);
   }
 
   /// A-169 / AC-4.12: stop a request queue while its SETUPMAPPING awaits map acknowledgements. Expect: control still

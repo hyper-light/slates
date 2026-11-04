@@ -9,7 +9,8 @@
 > - **vhost-user ring restart (A-169, `663e4df8`): fixed 2026-11-03.** A ring started again after `GET_VRING_BASE`
 >   was served from the size, addresses and position it was admitted with. Now a restart resumes only over its
 >   admitted layout at its stopped index; a reset driver's restart is refused and ends the device; a running ring is
->   never moved. Two tests failed first and pass after. Owed: an in-place reset, so a rebooted guest keeps its device.
+>   never moved, nor one whose stop awaits its chain. Three tests fail on the old seam and pass after; main CI's live
+>   QEMU lane passes (41732529738). Owed: an in-place reset, so a rebooted guest keeps its device.
 >   Record: `docs/bugs/2026-11-03-a-restarted-vhost-ring-was-served-from-its-old-layout.md`.
 > - **The Windows anchor ends on one malformed or short hold message (A-198).** The refusal propagates out of
 >   `Supervisor::step` and ends the anchor, whose kill-on-close job then takes every held drive. Unix counts such

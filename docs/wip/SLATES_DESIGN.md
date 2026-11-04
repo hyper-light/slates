@@ -14580,9 +14580,10 @@ dispatch; `shards.rs` the end handoff shared), `crates/client` (`attach_vhost_us
   restarts a ring only over its admitted layout at the index it stopped at, which is QEMU's restart after a pause
   or a stop. A driver that started over opens a new FUSE session that the device cannot take over in place, since
   the old session's references and windows would stay behind; its restart is refused and ends the device, so a reset
-  is a new device. Owed: an in-place reset that sweeps the old session and re-admits every queue. Two tests failed
-  first and pass after (`a_vhost_ring_restarted_after_a_guest_reset_is_refused_not_served_from_its_old_ring`,
-  `a_running_vhost_ring_cannot_be_readdressed`); the virtiofs suite passes 27 of 27, adacachy, 2026-11-03. Record:
+  is a new device. Owed: an in-place reset that sweeps the old session and re-admits every queue. Three tests fail on
+  the old seam and pass after (`a_vhost_ring_restarted_after_a_guest_reset_is_refused_not_served_from_its_old_ring`,
+  `a_running_vhost_ring_cannot_be_readdressed`, `a_vhost_ring_whose_stop_awaits_its_chain_cannot_be_moved`); the
+  virtiofs suite passes 28 of 28, adacachy, 2026-11-03, and main CI's live QEMU lane passes (41732529738). Record:
   `docs/bugs/2026-11-03-a-restarted-vhost-ring-was-served-from-its-old-layout.md`.
 - **Live-fixture inheritance corrected 2026-11-02.** The ring fix exposed the live QEMU harness clearing CLOEXEC
   in its parent: sibling VMs inherited each other's frontend sockets, hiding peer close. It now changes that flag
