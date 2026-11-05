@@ -968,3 +968,487 @@ WINFSP TRACE pass=contended phase=unlink kind=Cleanup n=10000 arrived_busy=0 wai
 WINFSP TRACE pass=contended phase=unlink kind=Close n=10278 arrived_busy=0 wait_mean=194.0 wait_p50=1.7 wait_p90=2.2 service_mean=150.7 service_p50=27.6 service_p90=59.4
 WINFSP TRACE pass=contended phase=unlink kind=SetInformation n=10000 arrived_busy=0 wait_mean=2.1 wait_p50=2.0 wait_p90=2.4 service_mean=154.5 service_p50=9.7 service_p90=11.3
 ## run 2 of 3 done, 2026-11-05T20:17:05Z
+To https://github.com/hyper-light/slates
+   9ab269f..3893182  3893182ec153f5b0dfdb26599e04125f68b52f88 -> diag-winfsp-overlap-results-42097182526-windows-11-arm
+## run 3 of 3, 2026-11-05T20:17:07Z
+# a212 started first: a212=S: a215=T:
+# host: windows 0x23f00206 on windows processor architecture 12 level 3401 revision 0 (aarch64), 4 logical CPUs (4 available to this process), 15 GiB, page 4096 B; largest L2 1048576 B, cache line 64 B
+# workload: 10 rounds of 1000 files of 4096 B per arm and pass, arms interleaved, first arm rotating
+# arm a212: S:/d
+# arm a215: T:/d
+# warm-up: one untimed round per arm (1000 files each)
+# pass quiet: spinners 0 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 22.9 µs, p99 38.0 µs, p999 731.4 µs, max 5469.1 µs over 26240 probes; 138.7 s
+fsbench	quiet	a212	create	10000	198300	306700	1773300	17892300
+fsbench	quiet	a212	write	10000	84700	229100	516700	15921600
+fsbench	quiet	a212	fsync	10000	117600	198500	555200	17582600
+fsbench	quiet	a212	close	10000	3809400	6313100	17522800	95093000
+fsbench	quiet	a212	stat	10000	158800	248300	600400	13498800
+fsbench	quiet	a212	open	10000	918800	4799400	16475700	86647400
+fsbench	quiet	a212	read	10000	38400	53600	133800	174800
+fsbench	quiet	a212	rename	10000	461300	941000	2232100	10541700
+fsbench	quiet	a212	unlink	10000	284300	518600	820800	18703200
+fsbench	quiet	a215	create	10000	183500	260000	1032600	17633200
+fsbench	quiet	a215	write	10000	87300	212600	617700	17419400
+fsbench	quiet	a215	fsync	10000	103300	174900	386100	3378000
+fsbench	quiet	a215	close	10000	3909500	5957600	17556300	24404400
+fsbench	quiet	a215	stat	10000	157800	234800	632100	16003800
+fsbench	quiet	a215	open	10000	3739500	4924800	18727000	113134100
+fsbench	quiet	a215	read	10000	36700	54500	137300	1071400
+fsbench	quiet	a215	rename	10000	439700	817300	2168200	25192100
+fsbench	quiet	a215	unlink	10000	265000	538600	770700	164095100
+
+**quiet** (spinners 0 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 22.9 µs, p99 38.0 µs, p999 731.4 µs, max 5469.1 µs over 26240 probes; 138.7 s). Each cell: p50 · p99 · p999 · max, µs.
+
+| op | a212 | a215 |
+|---|---|---|
+| create | 198.3 · 306.7 · 1773.3 · 17892.3 | 183.5 · 260.0 · 1032.6 · 17633.2 |
+| write | 84.7 · 229.1 · 516.7 · 15921.6 | 87.3 · 212.6 · 617.7 · 17419.4 |
+| fsync | 117.6 · 198.5 · 555.2 · 17582.6 | 103.3 · 174.9 · 386.1 · 3378.0 |
+| close | 3809.4 · 6313.1 · 17522.8 · 95093.0 | 3909.5 · 5957.6 · 17556.3 · 24404.4 |
+| stat | 158.8 · 248.3 · 600.4 · 13498.8 | 157.8 · 234.8 · 632.1 · 16003.8 |
+| open | 918.8 · 4799.4 · 16475.7 · 86647.4 | 3739.5 · 4924.8 · 18727.0 · 113134.1 |
+| read | 38.4 · 53.6 · 133.8 · 174.8 | 36.7 · 54.5 · 137.3 · 1071.4 |
+| rename | 461.3 · 941.0 · 2232.1 · 10541.7 | 439.7 · 817.3 · 2168.2 · 25192.1 |
+| unlink | 284.3 · 518.6 · 820.8 · 18703.2 | 265.0 · 538.6 · 770.7 · 164095.1 |
+
+# pass contended: spinners 8 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 22.4 µs, p99 37.0 µs, p999 19805.6 µs, max 61836.3 µs over 64098 probes; 332.1 s
+fsbench	contended	a212	create	10000	178200	637000	32260200	57327200
+fsbench	contended	a212	write	10000	184000	589600	27320300	46139900
+fsbench	contended	a212	fsync	10000	102600	228800	33828500	66639600
+fsbench	contended	a212	close	10000	4228600	37953200	55352200	85328100
+fsbench	contended	a212	stat	10000	152600	747700	38188800	100851300
+fsbench	contended	a212	open	10000	3723000	38096600	71360000	190938700
+fsbench	contended	a212	read	10000	40800	73400	137500	177900
+fsbench	contended	a212	rename	10000	491600	35931500	63327900	167648200
+fsbench	contended	a212	unlink	10000	333400	24730500	87890300	422501200
+fsbench	contended	a215	create	10000	183900	609100	23382400	40293700
+fsbench	contended	a215	write	10000	182400	309600	32353700	48956300
+fsbench	contended	a215	fsync	10000	107500	251400	37783100	64721300
+fsbench	contended	a215	close	10000	4317500	38100700	55703900	68936700
+fsbench	contended	a215	stat	10000	151200	799100	42779600	116314800
+fsbench	contended	a215	open	10000	3778600	37912800	89290200	254414200
+fsbench	contended	a215	read	10000	40200	63600	130700	246100
+fsbench	contended	a215	rename	10000	483100	34755200	68471600	127419100
+fsbench	contended	a215	unlink	10000	329800	25014500	70360100	316985200
+
+**contended** (spinners 8 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 22.4 µs, p99 37.0 µs, p999 19805.6 µs, max 61836.3 µs over 64098 probes; 332.1 s). Each cell: p50 · p99 · p999 · max, µs.
+
+| op | a212 | a215 |
+|---|---|---|
+| create | 178.2 · 637.0 · 32260.2 · 57327.2 | 183.9 · 609.1 · 23382.4 · 40293.7 |
+| write | 184.0 · 589.6 · 27320.3 · 46139.9 | 182.4 · 309.6 · 32353.7 · 48956.3 |
+| fsync | 102.6 · 228.8 · 33828.5 · 66639.6 | 107.5 · 251.4 · 37783.1 · 64721.3 |
+| close | 4228.6 · 37953.2 · 55352.2 · 85328.1 | 4317.5 · 38100.7 · 55703.9 · 68936.7 |
+| stat | 152.6 · 747.7 · 38188.8 · 100851.3 | 151.2 · 799.1 · 42779.6 · 116314.8 |
+| open | 3723.0 · 38096.6 · 71360.0 · 190938.7 | 3778.6 · 37912.8 · 89290.2 · 254414.2 |
+| read | 40.8 · 73.4 · 137.5 · 177.9 | 40.2 · 63.6 · 130.7 · 246.1 |
+| rename | 491.6 · 35931.5 · 63327.9 · 167648.2 | 483.1 · 34755.2 · 68471.6 · 127419.1 |
+| unlink | 333.4 · 24730.5 · 87890.3 · 422501.2 | 329.8 · 25014.5 · 70360.1 · 316985.2 |
+
+unmounted: S:
+unmounted: T:
+# fsb-688-3-old's error output, 185 lines:
+slates anchor: instance fsb-688-3-old up; daemon pid 3484; 3 shards
+slates anchor: issuer surface: export SLATES_ANCHOR=slates-seg-fsb-688-3-old SLATES_ANCHOR_LEN=10969415680 SLATES_ANCHOR_CONTENT=slates-con-fsb-688-3-old SLATES_ANCHOR_CONTENT_LEN=24323555328
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: effective_capacity_bytes = 17169387520: min(memory.total, the OS/job/cgroup bound when one is set) (anchors ["memory.total", "memory.limit"])
+slates daemon: reserve_per_shard = 1907709724: memory capacity / shards / classes (anchors ["mem.capacity", "rt.shards", "mem.classes"])
+slates daemon: lock_capacity_bytes = 1413120: the OS's lock limit when a confirming lock succeeded, else 0 (anchors ["mem.lock_capacity", "mem.lock_confirmed"])
+slates daemon: table_bytes = 476927431: reserve_per_shard × TABLE_SHARE_PERMILLE / 1000 (anchors ["mem.lock_capacity", "GAPS §5 table share"])
+slates daemon: volumes_per_shard = 1568840: table_bytes / size_of::<VolumeRecord>() (anchors ["table_bytes"])
+slates daemon: slots_per_ring = 32: requests one client may hold in flight (Little's law: request rate × p99 service time), rounded up to a power of two (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: spin_ns = 783: the expected (mean) cost of parking, the 2-competitive spin threshold (anchors ["wake.mean_ns"])
+slates daemon: log_bytes_per_partition = 476927431: table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve (anchors ["table_bytes", "page"])
+slates daemon: snapshot_bytes_per_partition = 953854862: twice the table bytes (the whole partition encoded, with growth headroom) (anchors ["table_bytes"])
+slates daemon: archive_slice_bytes = 572: blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000 (anchors ["hash.blake3_bytes_per_second", "rt.step_budget_ns"])
+slates daemon: memcpy_bytes_per_second = 32922323390: memcpy bytes per second at the largest measured copy size (at least one) (anchors ["memcpy"])
+slates daemon: copy_slice_bytes = 12889: memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000 (anchors ["memcpy", "rt.step_budget_ns"])
+slates daemon: codec = lz4 true, zstd levels [1, 3, 9, 19], byte worth 30 scaled ns: the profile's measured codec points, a byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors ["codecs", "memcpy.bytes_per_second"])
+slates daemon: seal_key_slots = 384: page.base / 32 × shards (one page of key slots per shard) (anchors ["page.base", "shards"])
+slates daemon: telemetry_spans_per_reply = 50: (bulk chunk bytes − encoded fixed report bytes) / encoded span record bytes (anchors ["ipc.bulk_chunk_bytes", "wire.TelemetryReport", "wire.SpanRecord"])
+slates daemon: max_inodes = 827999: metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.inode_unit_bytes"])
+slates daemon: max_dirs = 624659: metadata_class / (Slot<DirNode> + a smallest-class directory block's page share) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.directory_unit_bytes"])
+slates daemon: max_chunks = 465749: reserve_per_shard / content_granule (one chunk per granule at least) (anchors ["reserve_per_shard", "page"])
+slates daemon: metadata_class_bytes = 1907709724: the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM (anchors ["reserve_per_shard", "MEMORY_CLASSES"])
+slates daemon: digest_cache_entries = 77624: max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>() (anchors ["store.max_inodes", "reserve_per_shard"])
+slates daemon: spin_shift = 20: ⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the probe's ±5 % at 95 % (anchors ["wake.sd_ns", "wake.mean_ns"])
+slates daemon: clients_per_shard = 1764: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes (anchors ["reserve_per_shard", "region_bytes"])
+slates daemon: direct_maps_per_shard = 465749: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"])
+slates daemon: landings_awaiting_per_shard = 5292: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 3533: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: idle_window_ns = 78300: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: guest_listing_entries = 0: none: a Windows guest's stream ends with its daemon, so no number it holds outlives a restart (anchors [])
+slates daemon: inode_reserve = 18876: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 1754: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 238463715: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 2483997: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 2483997: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates-server: shard 0 initialized in 1815 µs
+slates-server: shard 1 initialized in 1832 µs
+slates daemon: instance fsb-688-3-old serving on 3 shards under the anchor
+slates-server: shard 2 initialized in 2302 µs
+slates-winfsp: reply spin window = 9000 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+WINFSP TRACE pass=quiet phase=create rounds=10 busy_us=2969316 queued_us=0 wall_us=137058079 receives=50031 receive_p50=73.7 receive_p90=3670.0 batches0..4+=[8, 50003, 2, 1, 17]
+WINFSP TRACE pass=quiet phase=create idle n=55251 mean=1909.5 p50=90.1 p90=3538.9
+WINFSP TRACE pass=quiet phase=create stage=BE n=55251 mean=53.2 p50=15.9 p90=53.2
+WINFSP TRACE pass=quiet phase=create stage=ES n=55251 mean=0.9 p50=0.7 p90=1.5
+WINFSP TRACE pass=quiet phase=create stage=SR n=55251 mean=12.7 p50=11.3 p90=20.5
+WINFSP TRACE pass=quiet phase=create stage=RB n=5228 mean=0.4 p50=0.4 p90=0.5
+WINFSP TRACE pass=quiet phase=create stage=RC n=50023 mean=2.0 p50=0.6 p90=4.1
+WINFSP TRACE pass=quiet phase=create stage=CV n=50031 mean=604.5 p50=69.6 p90=3670.0
+WINFSP TRACE pass=quiet phase=create stage=VB n=50023 mean=3.7 p50=3.2 p90=6.4
+WINFSP TRACE pass=quiet phase=create stage=VC n=8 mean=0.7 p50=0.6 p90=1.0
+WINFSP TRACE pass=quiet phase=create kind=Create n=10010 arrived_busy=0 wait_mean=5.4 wait_p50=5.1 wait_p90=6.4 service_mean=67.8 service_p50=51.2 service_p90=69.6
+WINFSP TRACE pass=quiet phase=create kind=Cleanup n=10000 arrived_busy=0 wait_mean=3.2 wait_p50=2.7 wait_p90=3.5 service_mean=164.0 service_p50=38.9 service_p90=63.5
+WINFSP TRACE pass=quiet phase=create kind=Close n=5241 arrived_busy=0 wait_mean=2286.7 wait_p50=1507.3 wait_p90=4718.6 service_mean=8.9 service_p50=4.4 service_p90=9.7
+WINFSP TRACE pass=quiet phase=create kind=Write n=10000 arrived_busy=0 wait_mean=2.1 wait_p50=2.0 wait_p90=2.9 service_mean=24.1 service_p50=15.4 service_p90=32.8
+WINFSP TRACE pass=quiet phase=create kind=SetInformation n=10000 arrived_busy=0 wait_mean=2.3 wait_p50=2.2 wait_p90=2.8 service_mean=25.2 service_p50=12.8 service_p90=38.9
+WINFSP TRACE pass=quiet phase=create kind=FlushBuffers n=10000 arrived_busy=0 wait_mean=2.0 wait_p50=2.0 wait_p90=2.7 service_mean=11.1 service_p50=8.7 service_p90=11.8
+WINFSP TRACE pass=quiet phase=stat rounds=10 busy_us=250303 queued_us=0 wall_us=135177856 receives=40009 receive_p50=25.6 receive_p90=30.7 batches0..4+=[24, 39957, 25, 0, 3]
+WINFSP TRACE pass=quiet phase=stat idle n=41010 mean=35.0 p50=36.9 p90=45.1
+WINFSP TRACE pass=quiet phase=stat stage=BE n=41010 mean=5.7 p50=4.6 p90=9.7
+WINFSP TRACE pass=quiet phase=stat stage=ES n=41010 mean=0.4 p50=0.5 p90=0.6
+WINFSP TRACE pass=quiet phase=stat stage=SR n=41010 mean=8.1 p50=8.7 p90=10.8
+WINFSP TRACE pass=quiet phase=stat stage=RB n=1025 mean=0.5 p50=0.4 p90=0.5
+WINFSP TRACE pass=quiet phase=stat stage=RC n=39985 mean=1.2 p50=0.5 p90=2.9
+WINFSP TRACE pass=quiet phase=stat stage=CV n=40009 mean=23.8 p50=25.6 p90=30.7
+WINFSP TRACE pass=quiet phase=stat stage=VB n=39985 mean=2.5 p50=2.4 p90=2.9
+WINFSP TRACE pass=quiet phase=stat stage=VC n=24 mean=0.6 p50=0.5 p90=0.9
+WINFSP TRACE pass=quiet phase=stat kind=Create n=10010 arrived_busy=0 wait_mean=2.7 wait_p50=2.0 wait_p90=3.2 service_mean=10.9 service_p50=9.7 service_p90=11.8
+WINFSP TRACE pass=quiet phase=stat kind=Cleanup n=10000 arrived_busy=0 wait_mean=2.1 wait_p50=2.0 wait_p90=2.3 service_mean=0.6 service_p50=0.6 service_p90=0.7
+WINFSP TRACE pass=quiet phase=stat kind=Close n=11000 arrived_busy=0 wait_mean=161.1 wait_p50=2.0 wait_p90=2.3 service_mean=6.9 service_p50=4.9 service_p90=5.9
+WINFSP TRACE pass=quiet phase=stat kind=QueryVolumeInformation n=10000 arrived_busy=0 wait_mean=2.7 wait_p50=2.0 wait_p90=2.3 service_mean=5.9 service_p50=5.4 service_p90=6.1
+WINFSP TRACE pass=quiet phase=open rounds=10 busy_us=1307067 queued_us=0 wall_us=135660346 receives=30028 receive_p50=73.7 receive_p90=3145.7 batches0..4+=[16, 29978, 11, 0, 23]
+WINFSP TRACE pass=quiet phase=open idle n=37207 mean=549.2 p50=81.9 p90=3014.7
+WINFSP TRACE pass=quiet phase=open stage=BE n=37207 mean=34.6 p50=9.7 p90=63.5
+WINFSP TRACE pass=quiet phase=open stage=ES n=37207 mean=0.8 p50=0.6 p90=1.7
+WINFSP TRACE pass=quiet phase=open stage=SR n=37207 mean=11.4 p50=11.8 p90=20.5
+WINFSP TRACE pass=quiet phase=open stage=RB n=7195 mean=0.4 p50=0.4 p90=0.4
+WINFSP TRACE pass=quiet phase=open stage=RC n=30012 mean=7.5 p50=0.7 p90=4.1
+WINFSP TRACE pass=quiet phase=open stage=CV n=30028 mean=654.5 p50=73.7 p90=3145.7
+WINFSP TRACE pass=quiet phase=open stage=VB n=30012 mean=4.0 p50=3.8 p90=5.6
+WINFSP TRACE pass=quiet phase=open stage=VC n=16 mean=0.8 p50=0.6 p90=1.3
+WINFSP TRACE pass=quiet phase=open kind=Create n=10010 arrived_busy=0 wait_mean=4.9 wait_p50=4.4 wait_p90=5.6 service_mean=77.0 service_p50=34.8 service_p90=73.7
+WINFSP TRACE pass=quiet phase=open kind=Cleanup n=10000 arrived_busy=0 wait_mean=3.4 wait_p50=2.8 wait_p90=3.5 service_mean=0.9 service_p50=0.9 service_p90=1.3
+WINFSP TRACE pass=quiet phase=open kind=Close n=11283 arrived_busy=0 wait_mean=1362.5 wait_p50=852.0 wait_p90=3538.9 service_mean=15.5 service_p50=4.6 service_p90=41.0
+WINFSP TRACE pass=quiet phase=open kind=Read n=5914 arrived_busy=0 wait_mean=3.3 wait_p50=2.2 wait_p90=3.3 service_mean=59.6 service_p50=32.8 service_p90=41.0
+WINFSP TRACE pass=quiet phase=rename rounds=10 busy_us=1166570 queued_us=0 wall_us=135932131 receives=69991 receive_p50=31.7 receive_p90=61.4 batches0..4+=[2274, 65421, 2294, 0, 2]
+WINFSP TRACE pass=quiet phase=rename idle n=70727 mean=52.1 p50=43.0 p90=90.1
+WINFSP TRACE pass=quiet phase=rename stage=BE n=70727 mean=16.0 p50=12.3 p90=36.9
+WINFSP TRACE pass=quiet phase=rename stage=ES n=70727 mean=2.5 p50=0.5 p90=11.8
+WINFSP TRACE pass=quiet phase=rename stage=SR n=70727 mean=11.1 p50=11.8 p90=15.9
+WINFSP TRACE pass=quiet phase=rename stage=RB n=3009 mean=1.2 p50=1.3 p90=2.0
+WINFSP TRACE pass=quiet phase=rename stage=RC n=67717 mean=2.1 p50=0.7 p90=3.2
+WINFSP TRACE pass=quiet phase=rename stage=CV n=69991 mean=34.1 p50=30.7 p90=61.4
+WINFSP TRACE pass=quiet phase=rename stage=VB n=67718 mean=3.2 p50=2.7 p90=5.4
+WINFSP TRACE pass=quiet phase=rename stage=VC n=2274 mean=0.6 p50=0.5 p90=0.7
+WINFSP TRACE pass=quiet phase=rename kind=Create n=20010 arrived_busy=0 wait_mean=4.3 wait_p50=4.4 wait_p90=5.4 service_mean=15.5 service_p50=13.3 service_p90=15.9
+WINFSP TRACE pass=quiet phase=rename kind=Cleanup n=20000 arrived_busy=0 wait_mean=8.6 wait_p50=2.0 wait_p90=13.3 service_mean=0.6 service_p50=0.6 service_p90=0.8
+WINFSP TRACE pass=quiet phase=rename kind=Close n=20717 arrived_busy=0 wait_mean=65.1 wait_p50=2.0 wait_p90=2.4 service_mean=24.6 service_p50=9.2 service_p90=38.9
+WINFSP TRACE pass=quiet phase=rename kind=SetInformation n=10000 arrived_busy=0 wait_mean=2.5 wait_p50=2.2 wait_p90=2.6 service_mean=33.4 service_p50=31.7 service_p90=36.9
+WINFSP TRACE pass=quiet phase=unlink rounds=10 busy_us=1028883 queued_us=0 wall_us=135769473 receives=40075 receive_p50=36.9 receive_p90=57.3 batches0..4+=[110, 39910, 49, 0, 6]
+WINFSP TRACE pass=quiet phase=unlink idle n=41530 mean=116.4 p50=51.2 p90=73.7
+WINFSP TRACE pass=quiet phase=unlink stage=BE n=41530 mean=24.3 p50=12.8 p90=41.0
+WINFSP TRACE pass=quiet phase=unlink stage=ES n=41530 mean=0.6 p50=0.5 p90=1.1
+WINFSP TRACE pass=quiet phase=unlink stage=SR n=41530 mean=10.3 p50=10.8 p90=14.8
+WINFSP TRACE pass=quiet phase=unlink stage=RB n=1566 mean=0.6 p50=0.4 p90=0.5
+WINFSP TRACE pass=quiet phase=unlink stage=RC n=39965 mean=1.6 p50=0.6 p90=3.1
+WINFSP TRACE pass=quiet phase=unlink stage=CV n=40075 mean=1859.4 p50=34.8 p90=57.3
+WINFSP TRACE pass=quiet phase=unlink stage=VB n=39964 mean=3.2 p50=2.9 p90=4.4
+WINFSP TRACE pass=quiet phase=unlink stage=VC n=110 mean=3.1 p50=3.5 p90=4.4
+WINFSP TRACE pass=quiet phase=unlink kind=Create n=10010 arrived_busy=0 wait_mean=4.1 wait_p50=3.6 wait_p90=4.9 service_mean=16.9 service_p50=13.8 service_p90=16.4
+WINFSP TRACE pass=quiet phase=unlink kind=Cleanup n=10000 arrived_busy=0 wait_mean=2.7 wait_p50=2.0 wait_p90=3.1 service_mean=21.2 service_p50=13.8 service_p90=38.9
+WINFSP TRACE pass=quiet phase=unlink kind=Close n=11520 arrived_busy=0 wait_mean=903.3 wait_p50=2.2 wait_p90=1310.7 service_mean=48.8 service_p50=34.8 service_p90=114.7
+WINFSP TRACE pass=quiet phase=unlink kind=SetInformation n=10000 arrived_busy=0 wait_mean=2.5 wait_p50=2.3 wait_p90=3.2 service_mean=8.5 service_p50=7.2 service_p90=8.2
+WINFSP TRACE pass=contended phase=create rounds=10 busy_us=42472013 queued_us=0 wall_us=326048112 receives=50056 receive_p50=53.2 receive_p90=3538.9 batches0..4+=[16, 49987, 7, 1, 45]
+WINFSP TRACE pass=contended phase=create idle n=58917 mean=3394.4 p50=86.0 p90=3538.9
+WINFSP TRACE pass=contended phase=create stage=BE n=58917 mean=720.4 p50=31.7 p90=458.8
+WINFSP TRACE pass=contended phase=create stage=ES n=58917 mean=0.9 p50=0.8 p90=1.9
+WINFSP TRACE pass=contended phase=create stage=SR n=58917 mean=13.0 p50=10.8 p90=21.5
+WINFSP TRACE pass=contended phase=create stage=RB n=8877 mean=0.5 p50=0.4 p90=0.5
+WINFSP TRACE pass=contended phase=create stage=RC n=50040 mean=36.4 p50=0.8 p90=69.6
+WINFSP TRACE pass=contended phase=create stage=CV n=50056 mean=636.2 p50=53.2 p90=3538.9
+WINFSP TRACE pass=contended phase=create stage=VB n=50040 mean=3.1 p50=2.7 p90=5.1
+WINFSP TRACE pass=contended phase=create stage=VC n=16 mean=0.7 p50=0.6 p90=1.0
+WINFSP TRACE pass=contended phase=create kind=Create n=10010 arrived_busy=0 wait_mean=5.0 wait_p50=4.6 wait_p90=5.9 service_mean=151.1 service_p50=53.2 service_p90=73.7
+WINFSP TRACE pass=contended phase=create kind=Cleanup n=10000 arrived_busy=0 wait_mean=6.7 wait_p50=2.4 wait_p90=2.7 service_mean=3841.2 service_p50=458.8 service_p90=16252.9
+WINFSP TRACE pass=contended phase=create kind=Close n=8907 arrived_busy=0 wait_mean=4238.9 wait_p50=1114.1 wait_p90=17825.8 service_mean=28.6 service_p50=4.4 service_p90=7.7
+WINFSP TRACE pass=contended phase=create kind=Write n=10000 arrived_busy=0 wait_mean=2.3 wait_p50=2.2 wait_p90=2.3 service_mean=54.9 service_p50=18.4 service_p90=34.8
+WINFSP TRACE pass=contended phase=create kind=SetInformation n=10000 arrived_busy=0 wait_mean=1.7 wait_p50=1.6 wait_p90=1.9 service_mean=116.8 service_p50=102.4 service_p90=131.1
+WINFSP TRACE pass=contended phase=create kind=FlushBuffers n=10000 arrived_busy=0 wait_mean=4.8 wait_p50=1.7 wait_p90=1.8 service_mean=57.5 service_p50=9.7 service_p90=14.8
+WINFSP TRACE pass=contended phase=stat rounds=10 busy_us=1723080 queued_us=0 wall_us=312198927 receives=39970 receive_p50=14.8 receive_p90=18.4 batches0..4+=[7, 39910, 47, 0, 6]
+WINFSP TRACE pass=contended phase=stat idle n=40843 mean=62.6 p50=24.6 p90=43.0
+WINFSP TRACE pass=contended phase=stat stage=BE n=40843 mean=42.0 p50=6.1 p90=25.6
+WINFSP TRACE pass=contended phase=stat stage=ES n=40843 mean=0.3 p50=0.3 p90=0.4
+WINFSP TRACE pass=contended phase=stat stage=SR n=40843 mean=5.7 p50=5.4 p90=8.2
+WINFSP TRACE pass=contended phase=stat stage=RB n=880 mean=0.8 p50=0.4 p90=0.5
+WINFSP TRACE pass=contended phase=stat stage=RC n=39963 mean=28.5 p50=0.3 p90=28.7
+WINFSP TRACE pass=contended phase=stat stage=CV n=39970 mean=27.6 p50=14.8 p90=18.4
+WINFSP TRACE pass=contended phase=stat stage=VB n=39963 mean=1.8 p50=1.8 p90=2.0
+WINFSP TRACE pass=contended phase=stat stage=VC n=7 mean=0.6 p50=0.5 p90=1.0
+WINFSP TRACE pass=contended phase=stat kind=Create n=10010 arrived_busy=0 wait_mean=22.6 wait_p50=1.7 wait_p90=2.4 service_mean=30.9 service_p50=13.3 service_p90=15.4
+WINFSP TRACE pass=contended phase=stat kind=Cleanup n=10000 arrived_busy=0 wait_mean=1.6 wait_p50=1.6 wait_p90=1.7 service_mean=0.3 service_p50=0.3 service_p90=0.4
+WINFSP TRACE pass=contended phase=stat kind=Close n=10833 arrived_busy=0 wait_mean=72.4 wait_p50=1.6 wait_p90=1.8 service_mean=81.2 service_p50=25.6 service_p90=28.7
+WINFSP TRACE pass=contended phase=stat kind=QueryVolumeInformation n=10000 arrived_busy=0 wait_mean=1.7 wait_p50=1.6 wait_p90=1.7 service_mean=53.2 service_p50=4.9 service_p90=5.6
+WINFSP TRACE pass=contended phase=open rounds=10 busy_us=26616061 queued_us=0 wall_us=314677180 receives=30033 receive_p50=344.1 receive_p90=3407.9 batches0..4+=[5, 29996, 1, 0, 31]
+WINFSP TRACE pass=contended phase=open idle n=36867 mean=896.1 p50=294.9 p90=3276.8
+WINFSP TRACE pass=contended phase=open stage=BE n=36867 mean=721.4 p50=26.6 p90=65.5
+WINFSP TRACE pass=contended phase=open stage=ES n=36867 mean=1.1 p50=1.0 p90=1.9
+WINFSP TRACE pass=contended phase=open stage=SR n=36867 mean=14.8 p50=15.4 p90=22.5
+WINFSP TRACE pass=contended phase=open stage=RB n=6839 mean=0.4 p50=0.4 p90=0.5
+WINFSP TRACE pass=contended phase=open stage=RC n=30028 mean=68.4 p50=0.9 p90=65.5
+WINFSP TRACE pass=contended phase=open stage=CV n=30033 mean=1008.8 p50=344.1 p90=3407.9
+WINFSP TRACE pass=contended phase=open stage=VB n=30028 mean=3.9 p50=3.3 p90=5.9
+WINFSP TRACE pass=contended phase=open stage=VC n=5 mean=0.8 p50=0.7 p90=1.3
+WINFSP TRACE pass=contended phase=open kind=Create n=10010 arrived_busy=0 wait_mean=5.3 wait_p50=4.9 wait_p90=5.6 service_mean=2307.3 service_p50=61.4 service_p90=10485.8
+WINFSP TRACE pass=contended phase=open kind=Cleanup n=10000 arrived_busy=0 wait_mean=3.2 wait_p50=2.6 wait_p90=3.1 service_mean=0.9 service_p50=0.8 service_p90=1.1
+WINFSP TRACE pass=contended phase=open kind=Close n=6857 arrived_busy=0 wait_mean=9384.6 wait_p50=2031.6 wait_p90=5767.2 service_mean=26.2 service_p50=4.4 service_p90=8.7
+WINFSP TRACE pass=contended phase=open kind=Read n=10000 arrived_busy=0 wait_mean=2.8 wait_p50=1.9 wait_p90=2.4 service_mean=333.2 service_p50=38.9 service_p90=49.2
+WINFSP TRACE pass=contended phase=rename rounds=10 busy_us=6513272 queued_us=0 wall_us=296962303 receives=69952 receive_p50=17.4 receive_p90=43.0 batches0..4+=[2847, 64189, 2907, 0, 9]
+WINFSP TRACE pass=contended phase=rename idle n=73221 mean=104.9 p50=43.0 p90=90.1
+WINFSP TRACE pass=contended phase=rename stage=BE n=73221 mean=88.6 p50=16.4 p90=45.1
+WINFSP TRACE pass=contended phase=rename stage=ES n=73221 mean=7.3 p50=0.5 p90=12.3
+WINFSP TRACE pass=contended phase=rename stage=SR n=73221 mean=9.7 p50=9.2 p90=14.3
+WINFSP TRACE pass=contended phase=rename stage=RB n=6116 mean=0.9 p50=0.5 p90=1.9
+WINFSP TRACE pass=contended phase=rename stage=RC n=67105 mean=40.4 p50=0.6 p90=55.3
+WINFSP TRACE pass=contended phase=rename stage=CV n=69952 mean=50.8 p50=17.4 p90=43.0
+WINFSP TRACE pass=contended phase=rename stage=VB n=67105 mean=2.9 p50=2.3 p90=3.6
+WINFSP TRACE pass=contended phase=rename stage=VC n=2847 mean=0.5 p50=0.5 p90=0.7
+WINFSP TRACE pass=contended phase=rename kind=Create n=20010 arrived_busy=0 wait_mean=36.3 wait_p50=2.7 wait_p90=3.6 service_mean=65.0 service_p50=16.4 service_p90=57.3
+WINFSP TRACE pass=contended phase=rename kind=Cleanup n=20000 arrived_busy=0 wait_mean=48.2 wait_p50=2.2 wait_p90=19.5 service_mean=0.7 service_p50=0.7 service_p90=0.9
+WINFSP TRACE pass=contended phase=rename kind=Close n=23211 arrived_busy=0 wait_mean=1203.3 wait_p50=1.9 wait_p90=983.0 service_mean=151.2 service_p50=30.7 service_p90=41.0
+WINFSP TRACE pass=contended phase=rename kind=SetInformation n=10000 arrived_busy=0 wait_mean=2.2 wait_p50=1.0 wait_p90=1.7 service_mean=168.9 service_p50=32.8 service_p90=55.3
+WINFSP TRACE pass=contended phase=unlink rounds=10 busy_us=6310835 queued_us=0 wall_us=296656405 receives=40121 receive_p50=19.5 receive_p90=41.0 batches0..4+=[163, 39900, 54, 0, 4]
+WINFSP TRACE pass=contended phase=unlink idle n=40441 mean=128.5 p50=47.1 p90=86.0
+WINFSP TRACE pass=contended phase=unlink stage=BE n=40441 mean=155.6 p50=31.7 p90=49.2
+WINFSP TRACE pass=contended phase=unlink stage=ES n=40441 mean=0.8 p50=0.9 p90=1.3
+WINFSP TRACE pass=contended phase=unlink stage=SR n=40441 mean=12.2 p50=11.3 p90=20.5
+WINFSP TRACE pass=contended phase=unlink stage=RB n=483 mean=1.4 p50=0.4 p90=4.9
+WINFSP TRACE pass=contended phase=unlink stage=RC n=39958 mean=46.1 p50=0.7 p90=57.3
+WINFSP TRACE pass=contended phase=unlink stage=CV n=40121 mean=4189.9 p50=19.5 p90=41.0
+WINFSP TRACE pass=contended phase=unlink stage=VB n=39958 mean=2.8 p50=2.6 p90=3.7
+WINFSP TRACE pass=contended phase=unlink stage=VC n=163 mean=4.7 p50=4.1 p90=4.6
+WINFSP TRACE pass=contended phase=unlink kind=Create n=10010 arrived_busy=0 wait_mean=60.5 wait_p50=3.2 wait_p90=4.1 service_mean=165.8 service_p50=45.1 service_p90=51.2
+WINFSP TRACE pass=contended phase=unlink kind=Cleanup n=10000 arrived_busy=0 wait_mean=2.5 wait_p50=2.3 wait_p90=2.7 service_mean=145.8 service_p50=38.9 service_p90=49.2
+WINFSP TRACE pass=contended phase=unlink kind=Close n=10431 arrived_busy=0 wait_mean=7413.5 wait_p50=1.9 wait_p90=2.2 service_mean=211.8 service_p50=31.7 service_p90=61.4
+WINFSP TRACE pass=contended phase=unlink kind=SetInformation n=10000 arrived_busy=0 wait_mean=10.8 wait_p50=1.6 wait_p90=2.0 service_mean=98.3 service_p50=6.4 service_p90=7.9
+# fsb-688-3-new's error output, 217 lines:
+slates anchor: instance fsb-688-3-new up; daemon pid 4204; 3 shards
+slates anchor: issuer surface: export SLATES_ANCHOR=slates-seg-fsb-688-3-new SLATES_ANCHOR_LEN=10969415680 SLATES_ANCHOR_CONTENT=slates-con-fsb-688-3-new SLATES_ANCHOR_CONTENT_LEN=24323555328
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: effective_capacity_bytes = 17169387520: min(memory.total, the OS/job/cgroup bound when one is set) (anchors ["memory.total", "memory.limit"])
+slates daemon: reserve_per_shard = 1907709724: memory capacity / shards / classes (anchors ["mem.capacity", "rt.shards", "mem.classes"])
+slates daemon: lock_capacity_bytes = 1413120: the OS's lock limit when a confirming lock succeeded, else 0 (anchors ["mem.lock_capacity", "mem.lock_confirmed"])
+slates daemon: table_bytes = 476927431: reserve_per_shard × TABLE_SHARE_PERMILLE / 1000 (anchors ["mem.lock_capacity", "GAPS §5 table share"])
+slates daemon: volumes_per_shard = 1568840: table_bytes / size_of::<VolumeRecord>() (anchors ["table_bytes"])
+slates daemon: slots_per_ring = 32: requests one client may hold in flight (Little's law: request rate × p99 service time), rounded up to a power of two (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: spin_ns = 855: the expected (mean) cost of parking, the 2-competitive spin threshold (anchors ["wake.mean_ns"])
+slates daemon: log_bytes_per_partition = 476927431: table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve (anchors ["table_bytes", "page"])
+slates daemon: snapshot_bytes_per_partition = 953854862: twice the table bytes (the whole partition encoded, with growth headroom) (anchors ["table_bytes"])
+slates daemon: archive_slice_bytes = 623: blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000 (anchors ["hash.blake3_bytes_per_second", "rt.step_budget_ns"])
+slates daemon: memcpy_bytes_per_second = 32819280125: memcpy bytes per second at the largest measured copy size (at least one) (anchors ["memcpy"])
+slates daemon: copy_slice_bytes = 14030: memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000 (anchors ["memcpy", "rt.step_budget_ns"])
+slates daemon: codec = lz4 true, zstd levels [1, 3, 9, 19], byte worth 30 scaled ns: the profile's measured codec points, a byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors ["codecs", "memcpy.bytes_per_second"])
+slates daemon: seal_key_slots = 384: page.base / 32 × shards (one page of key slots per shard) (anchors ["page.base", "shards"])
+slates daemon: telemetry_spans_per_reply = 50: (bulk chunk bytes − encoded fixed report bytes) / encoded span record bytes (anchors ["ipc.bulk_chunk_bytes", "wire.TelemetryReport", "wire.SpanRecord"])
+slates daemon: max_inodes = 827999: metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.inode_unit_bytes"])
+slates daemon: max_dirs = 624659: metadata_class / (Slot<DirNode> + a smallest-class directory block's page share) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.directory_unit_bytes"])
+slates daemon: max_chunks = 465749: reserve_per_shard / content_granule (one chunk per granule at least) (anchors ["reserve_per_shard", "page"])
+slates daemon: metadata_class_bytes = 1907709724: the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM (anchors ["reserve_per_shard", "MEMORY_CLASSES"])
+slates daemon: digest_cache_entries = 77624: max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>() (anchors ["store.max_inodes", "reserve_per_shard"])
+slates daemon: spin_shift = 20: ⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the probe's ±5 % at 95 % (anchors ["wake.sd_ns", "wake.mean_ns"])
+slates daemon: clients_per_shard = 1764: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes (anchors ["reserve_per_shard", "region_bytes"])
+slates daemon: direct_maps_per_shard = 465749: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"])
+slates daemon: landings_awaiting_per_shard = 5292: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 3533: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: idle_window_ns = 85500: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: guest_listing_entries = 0: none: a Windows guest's stream ends with its daemon, so no number it holds outlives a restart (anchors [])
+slates daemon: inode_reserve = 18876: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 1754: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 238463715: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 2483997: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 2483997: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates-server: shard 1 initialized in 1243 µs
+slates-server: shard 0 initialized in 1870 µs
+slates-server: shard 2 initialized in 1784 µs
+slates daemon: instance fsb-688-3-new serving on 3 shards under the anchor
+slates-winfsp: reply spin window = 6700 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+WINFSP TRACE pass=quiet phase=create rounds=10 busy_us=2957831 queued_us=0 wall_us=125663806 receives=50037 receive_p50=81.9 receive_p90=3801.1 batches0..4+=[8, 50002, 1, 0, 26]
+WINFSP TRACE pass=quiet phase=create idle n=56070 mean=1614.2 p50=86.0 p90=3670.0
+WINFSP TRACE pass=quiet phase=create stage=BE n=56070 mean=52.3 p50=20.5 p90=53.2
+WINFSP TRACE pass=quiet phase=create stage=ES n=6041 mean=0.2 p50=0.2 p90=0.2
+WINFSP TRACE pass=quiet phase=create stage=EH n=50029 mean=1.4 p50=1.1 p90=2.8
+WINFSP TRACE pass=quiet phase=create stage=SR n=6041 mean=1.5 p50=1.2 p90=1.6
+WINFSP TRACE pass=quiet phase=create stage=RB n=6041 mean=0.5 p50=0.4 p90=0.5
+WINFSP TRACE pass=quiet phase=create stage=CV n=8 mean=460.0 p50=81.9 p90=1835.0
+WINFSP TRACE pass=quiet phase=create stage=VB n=13 mean=8.6 p50=6.4 p90=16.4
+WINFSP TRACE pass=quiet phase=create stage=VP n=50029 mean=0.6 p50=0.4 p90=1.2
+WINFSP TRACE pass=quiet phase=create stage=PB n=50016 mean=4.7 p50=4.1 p90=7.2
+WINFSP TRACE pass=quiet phase=create stage=PC n=8 mean=0.9 p50=0.8 p90=1.3
+WINFSP TRACE pass=quiet phase=create stage=HV n=50029 mean=655.5 p50=81.9 p90=3801.1
+WINFSP TRACE pass=quiet phase=create kind=Create n=10010 arrived_busy=0 wait_mean=4.4 wait_p50=4.1 wait_p90=5.4 service_mean=60.5 service_p50=51.2 service_p90=69.6
+WINFSP TRACE pass=quiet phase=create kind=Cleanup n=10000 arrived_busy=0 wait_mean=3.2 wait_p50=2.3 wait_p90=2.8 service_mean=173.1 service_p50=36.9 service_p90=51.2
+WINFSP TRACE pass=quiet phase=create kind=Close n=6060 arrived_busy=0 wait_mean=2544.0 wait_p50=1638.4 wait_p90=5767.2 service_mean=9.9 service_p50=4.4 service_p90=10.2
+WINFSP TRACE pass=quiet phase=create kind=Write n=10000 arrived_busy=0 wait_mean=1.7 wait_p50=1.8 wait_p90=2.4 service_mean=19.7 service_p50=13.8 service_p90=30.7
+WINFSP TRACE pass=quiet phase=create kind=SetInformation n=10000 arrived_busy=0 wait_mean=2.1 wait_p50=2.0 wait_p90=2.4 service_mean=27.1 service_p50=12.8 service_p90=38.9
+WINFSP TRACE pass=quiet phase=create kind=FlushBuffers n=10000 arrived_busy=0 wait_mean=1.4 wait_p50=1.6 wait_p90=2.0 service_mean=9.3 service_p50=7.4 service_p90=9.7
+WINFSP TRACE pass=quiet phase=stat rounds=10 busy_us=255974 queued_us=0 wall_us=123898399 receives=40011 receive_p50=31.7 receive_p90=41.0 batches0..4+=[17, 39972, 18, 0, 4]
+WINFSP TRACE pass=quiet phase=stat idle n=41278 mean=34.5 p50=34.8 p90=47.1
+WINFSP TRACE pass=quiet phase=stat stage=BE n=41278 mean=5.8 p50=4.4 p90=10.2
+WINFSP TRACE pass=quiet phase=stat stage=ES n=1284 mean=0.2 p50=0.2 p90=0.2
+WINFSP TRACE pass=quiet phase=stat stage=EH n=39994 mean=0.8 p50=0.7 p90=1.0
+WINFSP TRACE pass=quiet phase=stat stage=SR n=1284 mean=1.8 p50=1.2 p90=1.3
+WINFSP TRACE pass=quiet phase=stat stage=RB n=1284 mean=0.5 p50=0.4 p90=0.5
+WINFSP TRACE pass=quiet phase=stat stage=CV n=17 mean=31.3 p50=31.7 p90=38.9
+WINFSP TRACE pass=quiet phase=stat stage=VB n=17 mean=3.5 p50=3.5 p90=4.9
+WINFSP TRACE pass=quiet phase=stat stage=VP n=39994 mean=0.4 p50=0.3 p90=0.8
+WINFSP TRACE pass=quiet phase=stat stage=PB n=39977 mean=3.2 p50=2.8 p90=4.1
+WINFSP TRACE pass=quiet phase=stat stage=PC n=17 mean=1.4 p50=1.1 p90=2.7
+WINFSP TRACE pass=quiet phase=stat stage=HV n=39994 mean=31.6 p50=31.7 p90=43.0
+WINFSP TRACE pass=quiet phase=stat kind=Create n=10010 arrived_busy=0 wait_mean=2.6 wait_p50=2.2 wait_p90=3.5 service_mean=12.2 service_p50=10.2 service_p90=12.3
+WINFSP TRACE pass=quiet phase=stat kind=Cleanup n=10000 arrived_busy=0 wait_mean=1.7 wait_p50=1.7 wait_p90=1.8 service_mean=0.6 service_p50=0.5 service_p90=0.7
+WINFSP TRACE pass=quiet phase=stat kind=Close n=11268 arrived_busy=0 wait_mean=250.4 wait_p50=2.0 wait_p90=278.5 service_mean=6.6 service_p50=5.4 service_p90=6.4
+WINFSP TRACE pass=quiet phase=stat kind=QueryVolumeInformation n=10000 arrived_busy=0 wait_mean=2.2 wait_p50=1.8 wait_p90=2.0 service_mean=5.4 service_p50=4.4 service_p90=4.9
+WINFSP TRACE pass=quiet phase=open rounds=10 busy_us=1646686 queued_us=0 wall_us=128036666 receives=30027 receive_p50=106.5 receive_p90=3276.8 batches0..4+=[5, 30000, 0, 0, 22]
+WINFSP TRACE pass=quiet phase=open idle n=36543 mean=701.7 p50=94.2 p90=3145.7
+WINFSP TRACE pass=quiet phase=open stage=BE n=36543 mean=44.5 p50=15.9 p90=65.5
+WINFSP TRACE pass=quiet phase=open stage=ES n=6521 mean=0.2 p50=0.2 p90=0.2
+WINFSP TRACE pass=quiet phase=open stage=EH n=30022 mean=1.9 p50=1.3 p90=3.2
+WINFSP TRACE pass=quiet phase=open stage=SR n=6521 mean=1.4 p50=1.2 p90=1.3
+WINFSP TRACE pass=quiet phase=open stage=RB n=6521 mean=0.4 p50=0.4 p90=0.4
+WINFSP TRACE pass=quiet phase=open stage=CV n=5 mean=732.7 p50=589.8 p90=1966.1
+WINFSP TRACE pass=quiet phase=open stage=VB n=5 mean=4.7 p50=3.3 p90=7.7
+WINFSP TRACE pass=quiet phase=open stage=VP n=30022 mean=6.5 p50=0.6 p90=1.6
+WINFSP TRACE pass=quiet phase=open stage=PB n=30017 mean=5.3 p50=4.9 p90=7.2
+WINFSP TRACE pass=quiet phase=open stage=PC n=5 mean=1.3 p50=1.2 p90=1.7
+WINFSP TRACE pass=quiet phase=open stage=HV n=30022 mean=840.6 p50=106.5 p90=3276.8
+WINFSP TRACE pass=quiet phase=open kind=Create n=10010 arrived_busy=0 wait_mean=4.2 wait_p50=4.1 wait_p90=5.4 service_mean=89.0 service_p50=65.5 service_p90=81.9
+WINFSP TRACE pass=quiet phase=open kind=Cleanup n=10000 arrived_busy=0 wait_mean=3.6 wait_p50=2.3 wait_p90=2.9 service_mean=1.0 service_p50=0.8 service_p90=1.0
+WINFSP TRACE pass=quiet phase=open kind=Close n=9301 arrived_busy=0 wait_mean=3035.9 wait_p50=1048.6 wait_p90=4718.6 service_mean=18.8 service_p50=4.4 service_p90=36.9
+WINFSP TRACE pass=quiet phase=open kind=Read n=7232 arrived_busy=0 wait_mean=2.4 wait_p50=2.0 wait_p90=2.7 service_mean=79.0 service_p50=45.1 service_p90=49.2
+WINFSP TRACE pass=quiet phase=rename rounds=10 busy_us=1135827 queued_us=0 wall_us=128276755 receives=70006 receive_p50=38.9 receive_p90=77.8 batches0..4+=[1572, 66855, 1574, 1, 4]
+WINFSP TRACE pass=quiet phase=rename idle n=71732 mean=49.4 p50=45.1 p90=86.0
+WINFSP TRACE pass=quiet phase=rename stage=BE n=71732 mean=15.4 p50=11.3 p90=32.8
+WINFSP TRACE pass=quiet phase=rename stage=ES n=3298 mean=0.4 p50=0.2 p90=0.6
+WINFSP TRACE pass=quiet phase=rename stage=EH n=68434 mean=3.0 p50=0.9 p90=12.3
+WINFSP TRACE pass=quiet phase=rename stage=SR n=3298 mean=2.4 p50=1.5 p90=4.0
+WINFSP TRACE pass=quiet phase=rename stage=RB n=3298 mean=0.9 p50=0.5 p90=1.6
+WINFSP TRACE pass=quiet phase=rename stage=CV n=1572 mean=31.8 p50=29.7 p90=38.9
+WINFSP TRACE pass=quiet phase=rename stage=VB n=1572 mean=2.1 p50=2.0 p90=3.5
+WINFSP TRACE pass=quiet phase=rename stage=VP n=68434 mean=0.5 p50=0.3 p90=1.1
+WINFSP TRACE pass=quiet phase=rename stage=PB n=66862 mean=3.9 p50=3.6 p90=5.1
+WINFSP TRACE pass=quiet phase=rename stage=PC n=1572 mean=0.8 p50=0.8 p90=1.1
+WINFSP TRACE pass=quiet phase=rename stage=HV n=68434 mean=43.9 p50=41.0 p90=77.8
+WINFSP TRACE pass=quiet phase=rename kind=Create n=20010 arrived_busy=0 wait_mean=4.4 wait_p50=3.2 wait_p90=4.1 service_mean=14.8 service_p50=12.3 service_p90=14.8
+WINFSP TRACE pass=quiet phase=rename kind=Cleanup n=20000 arrived_busy=0 wait_mean=6.9 wait_p50=2.0 wait_p90=2.6 service_mean=0.6 service_p50=0.6 service_p90=0.9
+WINFSP TRACE pass=quiet phase=rename kind=Close n=21722 arrived_busy=0 wait_mean=679.6 wait_p50=2.0 wait_p90=2.8 service_mean=22.9 service_p50=8.2 service_p90=34.8
+WINFSP TRACE pass=quiet phase=rename kind=SetInformation n=10000 arrived_busy=0 wait_mean=1.9 wait_p50=1.9 wait_p90=2.0 service_mean=33.0 service_p50=29.7 service_p90=36.9
+WINFSP TRACE pass=quiet phase=unlink rounds=10 busy_us=1359108 queued_us=0 wall_us=129100816 receives=40075 receive_p50=38.9 receive_p90=69.6 batches0..4+=[80, 39969, 19, 0, 7]
+WINFSP TRACE pass=quiet phase=unlink idle n=41659 mean=148.6 p50=43.0 p90=73.7
+WINFSP TRACE pass=quiet phase=unlink stage=BE n=41659 mean=32.2 p50=12.3 p90=38.9
+WINFSP TRACE pass=quiet phase=unlink stage=ES n=1664 mean=0.2 p50=0.2 p90=0.3
+WINFSP TRACE pass=quiet phase=unlink stage=EH n=39995 mean=0.9 p50=0.7 p90=1.5
+WINFSP TRACE pass=quiet phase=unlink stage=SR n=1664 mean=1.6 p50=1.3 p90=2.0
+WINFSP TRACE pass=quiet phase=unlink stage=RB n=1664 mean=0.5 p50=0.4 p90=0.6
+WINFSP TRACE pass=quiet phase=unlink stage=CV n=80 mean=720049.7 p50=973078.5 p90=1006633.0
+WINFSP TRACE pass=quiet phase=unlink stage=VB n=22 mean=3.9 p50=4.0 p90=4.9
+WINFSP TRACE pass=quiet phase=unlink stage=VC n=53 mean=5.7 p50=4.6 p90=5.9
+WINFSP TRACE pass=quiet phase=unlink stage=VP n=39995 mean=2.0 p50=0.3 p90=1.1
+WINFSP TRACE pass=quiet phase=unlink stage=PB n=39973 mean=3.8 p50=3.2 p90=5.6
+WINFSP TRACE pass=quiet phase=unlink stage=PC n=27 mean=1.5 p50=0.8 p90=5.1
+WINFSP TRACE pass=quiet phase=unlink stage=HV n=39995 mean=162.7 p50=38.9 p90=69.6
+WINFSP TRACE pass=quiet phase=unlink kind=Create n=10010 arrived_busy=0 wait_mean=3.3 wait_p50=3.2 wait_p90=4.4 service_mean=33.2 service_p50=13.8 service_p90=18.4
+WINFSP TRACE pass=quiet phase=unlink kind=Cleanup n=10000 arrived_busy=0 wait_mean=1.9 wait_p50=1.7 wait_p90=1.9 service_mean=32.8 service_p50=13.3 service_p90=36.9
+WINFSP TRACE pass=quiet phase=unlink kind=Close n=11649 arrived_busy=0 wait_mean=412.7 wait_p50=2.3 wait_p90=1048.6 service_mean=43.3 service_p50=31.7 service_p90=118.8
+WINFSP TRACE pass=quiet phase=unlink kind=SetInformation n=10000 arrived_busy=0 wait_mean=2.0 wait_p50=1.9 wait_p90=2.4 service_mean=19.4 service_p50=6.1 service_p90=7.7
+WINFSP TRACE pass=contended phase=create rounds=10 busy_us=45183336 queued_us=0 wall_us=276386707 receives=50066 receive_p50=81.9 receive_p90=3670.0 batches0..4+=[14, 49996, 3, 1, 52]
+WINFSP TRACE pass=contended phase=create idle n=59122 mean=3166.4 p50=81.9 p90=3538.9
+WINFSP TRACE pass=contended phase=create stage=BE n=59122 mean=763.7 p50=31.7 p90=458.8
+WINFSP TRACE pass=contended phase=create stage=ES n=9070 mean=0.2 p50=0.2 p90=0.2
+WINFSP TRACE pass=contended phase=create stage=EH n=50052 mean=1.5 p50=1.5 p90=2.2
+WINFSP TRACE pass=contended phase=create stage=SR n=9070 mean=1.3 p50=1.2 p90=1.3
+WINFSP TRACE pass=contended phase=create stage=RB n=9070 mean=0.4 p50=0.4 p90=0.5
+WINFSP TRACE pass=contended phase=create stage=CV n=14 mean=868.8 p50=81.9 p90=3145.7
+WINFSP TRACE pass=contended phase=create stage=VB n=19 mean=7.7 p50=5.4 p90=13.8
+WINFSP TRACE pass=contended phase=create stage=VP n=50052 mean=1.8 p50=0.4 p90=1.2
+WINFSP TRACE pass=contended phase=create stage=PB n=50033 mean=4.6 p50=4.0 p90=6.9
+WINFSP TRACE pass=contended phase=create stage=PC n=14 mean=0.6 p50=0.6 p90=0.7
+WINFSP TRACE pass=contended phase=create stage=HV n=50052 mean=666.0 p50=81.9 p90=3670.0
+WINFSP TRACE pass=contended phase=create kind=Create n=10010 arrived_busy=0 wait_mean=4.9 wait_p50=4.6 wait_p90=5.6 service_mean=146.9 service_p50=53.2 service_p90=73.7
+WINFSP TRACE pass=contended phase=create kind=Cleanup n=10000 arrived_busy=0 wait_mean=2.7 wait_p50=2.2 wait_p90=2.4 service_mean=4030.8 service_p50=458.8 service_p90=16777.2
+WINFSP TRACE pass=contended phase=create kind=Close n=9112 arrived_busy=0 wait_mean=2337.3 wait_p50=1015.8 wait_p90=3014.7 service_mean=22.3 service_p50=4.1 service_p90=5.4
+WINFSP TRACE pass=contended phase=create kind=Write n=10000 arrived_busy=0 wait_mean=1.8 wait_p50=1.8 wait_p90=2.2 service_mean=89.8 service_p50=21.5 service_p90=34.8
+WINFSP TRACE pass=contended phase=create kind=SetInformation n=10000 arrived_busy=0 wait_mean=1.9 wait_p50=2.0 wait_p90=2.2 service_mean=170.6 service_p50=114.7 service_p90=131.1
+WINFSP TRACE pass=contended phase=create kind=FlushBuffers n=10000 arrived_busy=0 wait_mean=1.5 wait_p50=1.7 wait_p90=1.8 service_mean=59.7 service_p50=10.8 service_p90=21.5
+WINFSP TRACE pass=contended phase=stat rounds=10 busy_us=2122582 queued_us=0 wall_us=267055782 receives=40011 receive_p50=23.6 receive_p90=32.8 batches0..4+=[38, 39933, 38, 0, 2]
+WINFSP TRACE pass=contended phase=stat idle n=40307 mean=56.6 p50=26.6 p90=34.8
+WINFSP TRACE pass=contended phase=stat stage=BE n=40307 mean=52.4 p50=11.8 p90=25.6
+WINFSP TRACE pass=contended phase=stat stage=ES n=334 mean=0.3 p50=0.2 p90=0.4
+WINFSP TRACE pass=contended phase=stat stage=EH n=39973 mean=0.6 p50=0.5 p90=0.9
+WINFSP TRACE pass=contended phase=stat stage=SR n=334 mean=2.2 p50=1.2 p90=3.3
+WINFSP TRACE pass=contended phase=stat stage=RB n=334 mean=1.3 p50=0.4 p90=2.7
+WINFSP TRACE pass=contended phase=stat stage=CV n=38 mean=33.5 p50=21.5 p90=53.2
+WINFSP TRACE pass=contended phase=stat stage=VB n=38 mean=2.3 p50=2.2 p90=3.2
+WINFSP TRACE pass=contended phase=stat stage=VP n=39973 mean=0.3 p50=0.1 p90=0.7
+WINFSP TRACE pass=contended phase=stat stage=PB n=39935 mean=2.4 p50=2.2 p90=2.7
+WINFSP TRACE pass=contended phase=stat stage=PC n=38 mean=1.2 p50=0.9 p90=2.2
+WINFSP TRACE pass=contended phase=stat stage=HV n=39973 mean=54.0 p50=24.6 p90=32.8
+WINFSP TRACE pass=contended phase=stat kind=Create n=10010 arrived_busy=0 wait_mean=35.5 wait_p50=1.7 wait_p90=2.8 service_mean=32.0 service_p50=13.3 service_p90=16.4
+WINFSP TRACE pass=contended phase=stat kind=Cleanup n=10000 arrived_busy=0 wait_mean=1.4 wait_p50=1.6 wait_p90=1.7 service_mean=0.4 service_p50=0.4 service_p90=0.5
+WINFSP TRACE pass=contended phase=stat kind=Close n=10297 arrived_busy=0 wait_mean=318.4 wait_p50=1.6 wait_p90=1.7 service_mean=93.0 service_p50=24.6 service_p90=27.6
+WINFSP TRACE pass=contended phase=stat kind=QueryVolumeInformation n=10000 arrived_busy=0 wait_mean=1.5 wait_p50=1.7 wait_p90=1.8 service_mean=84.2 service_p50=6.7 service_p90=7.7
+WINFSP TRACE pass=contended phase=open rounds=10 busy_us=27819686 queued_us=0 wall_us=271945373 receives=30038 receive_p50=442.4 receive_p90=3407.9 batches0..4+=[5, 29998, 0, 2, 33]
+WINFSP TRACE pass=contended phase=open idle n=36901 mean=884.6 p50=294.9 p90=3276.8
+WINFSP TRACE pass=contended phase=open stage=BE n=36901 mean=753.3 p50=36.9 p90=65.5
+WINFSP TRACE pass=contended phase=open stage=ES n=6868 mean=0.2 p50=0.2 p90=0.2
+WINFSP TRACE pass=contended phase=open stage=EH n=30033 mean=2.0 p50=2.0 p90=2.7
+WINFSP TRACE pass=contended phase=open stage=SR n=6868 mean=1.4 p50=1.2 p90=1.5
+WINFSP TRACE pass=contended phase=open stage=RB n=6868 mean=0.4 p50=0.4 p90=0.5
+WINFSP TRACE pass=contended phase=open stage=CV n=5 mean=4401.9 p50=69.6 p90=20971.5
+WINFSP TRACE pass=contended phase=open stage=VB n=5 mean=6.1 p50=5.6 p90=8.7
+WINFSP TRACE pass=contended phase=open stage=VP n=30033 mean=13.0 p50=0.6 p90=1.7
+WINFSP TRACE pass=contended phase=open stage=PB n=30028 mean=5.5 p50=5.1 p90=7.4
+WINFSP TRACE pass=contended phase=open stage=PC n=5 mean=0.8 p50=0.8 p90=1.2
+WINFSP TRACE pass=contended phase=open stage=HV n=30033 mean=1066.1 p50=442.4 p90=3407.9
+WINFSP TRACE pass=contended phase=open kind=Create n=10010 arrived_busy=0 wait_mean=4.8 wait_p50=4.6 wait_p90=5.4 service_mean=2296.4 service_p50=61.4 service_p90=10485.8
+WINFSP TRACE pass=contended phase=open kind=Cleanup n=10000 arrived_busy=0 wait_mean=3.0 wait_p50=2.3 wait_p90=2.7 service_mean=0.9 service_p50=0.9 service_p90=1.1
+WINFSP TRACE pass=contended phase=open kind=Close n=6891 arrived_busy=0 wait_mean=10166.4 wait_p50=1638.4 wait_p90=11534.3 service_mean=31.3 service_p50=4.4 service_p90=6.4
+WINFSP TRACE pass=contended phase=open kind=Read n=10000 arrived_busy=0 wait_mean=2.1 wait_p50=1.9 wait_p90=2.2 service_mean=460.8 service_p50=38.9 service_p90=45.1
+WINFSP TRACE pass=contended phase=rename rounds=10 busy_us=6405746 queued_us=0 wall_us=264446249 receives=69999 receive_p50=41.0 receive_p90=73.7 batches0..4+=[1351, 58281, 10360, 0, 7]
+WINFSP TRACE pass=contended phase=rename idle n=72698 mean=93.4 p50=45.1 p90=86.0
+WINFSP TRACE pass=contended phase=rename stage=BE n=72698 mean=87.7 p50=18.4 p90=43.0
+WINFSP TRACE pass=contended phase=rename stage=ES n=4050 mean=0.5 p50=0.2 p90=1.2
+WINFSP TRACE pass=contended phase=rename stage=EH n=68648 mean=8.4 p50=0.9 p90=12.8
+WINFSP TRACE pass=contended phase=rename stage=SR n=4050 mean=2.9 p50=1.3 p90=6.4
+WINFSP TRACE pass=contended phase=rename stage=RB n=4050 mean=1.3 p50=0.4 p90=2.0
+WINFSP TRACE pass=contended phase=rename stage=CV n=1351 mean=85.1 p50=21.5 p90=34.8
+WINFSP TRACE pass=contended phase=rename stage=VB n=1351 mean=1.9 p50=2.0 p90=2.7
+WINFSP TRACE pass=contended phase=rename stage=VP n=68648 mean=0.8 p50=0.4 p90=1.0
+WINFSP TRACE pass=contended phase=rename stage=PB n=67297 mean=4.0 p50=3.5 p90=5.4
+WINFSP TRACE pass=contended phase=rename stage=PC n=1351 mean=1.0 p50=1.0 p90=1.3
+WINFSP TRACE pass=contended phase=rename stage=HV n=68648 mean=84.3 p50=41.0 p90=73.7
+WINFSP TRACE pass=contended phase=rename kind=Create n=20010 arrived_busy=0 wait_mean=21.8 wait_p50=2.9 wait_p90=4.0 service_mean=90.2 service_p50=19.5 service_p90=49.2
+WINFSP TRACE pass=contended phase=rename kind=Cleanup n=20000 arrived_busy=0 wait_mean=27.5 wait_p50=1.8 wait_p90=2.7 service_mean=0.7 service_p50=0.7 service_p90=0.9
+WINFSP TRACE pass=contended phase=rename kind=Close n=22688 arrived_busy=0 wait_mean=504.4 wait_p50=2.0 wait_p90=655.4 service_mean=140.5 service_p50=24.6 service_p90=36.9
+WINFSP TRACE pass=contended phase=rename kind=SetInformation n=10000 arrived_busy=0 wait_mean=1.7 wait_p50=1.7 wait_p90=2.0 service_mean=140.1 service_p50=34.8 service_p90=49.2
+WINFSP TRACE pass=contended phase=unlink rounds=10 busy_us=6386198 queued_us=0 wall_us=264136393 receives=40140 receive_p50=47.1 receive_p90=73.7 batches0..4+=[164, 39928, 41, 0, 7]
+WINFSP TRACE pass=contended phase=unlink idle n=41022 mean=105.5 p50=51.2 p90=81.9
+WINFSP TRACE pass=contended phase=unlink stage=BE n=41022 mean=155.2 p50=28.7 p90=47.1
+WINFSP TRACE pass=contended phase=unlink stage=ES n=1046 mean=0.3 p50=0.2 p90=0.3
+WINFSP TRACE pass=contended phase=unlink stage=EH n=39976 mean=1.3 p50=1.2 p90=2.2
+WINFSP TRACE pass=contended phase=unlink stage=SR n=1046 mean=2.0 p50=1.3 p90=2.2
+WINFSP TRACE pass=contended phase=unlink stage=RB n=1046 mean=0.8 p50=0.4 p90=0.7
+WINFSP TRACE pass=contended phase=unlink stage=CV n=164 mean=765951.2 p50=1006633.0 p90=1040187.4
+WINFSP TRACE pass=contended phase=unlink stage=VB n=41 mean=2.9 p50=2.9 p90=3.6
+WINFSP TRACE pass=contended phase=unlink stage=VC n=118 mean=37.0 p50=4.6 p90=5.1
+WINFSP TRACE pass=contended phase=unlink stage=VP n=39976 mean=7.4 p50=0.3 p90=1.2
+WINFSP TRACE pass=contended phase=unlink stage=PB n=39935 mean=4.0 p50=3.6 p90=5.4
+WINFSP TRACE pass=contended phase=unlink stage=PC n=46 mean=1.7 p50=1.7 p90=2.6
+WINFSP TRACE pass=contended phase=unlink stage=HV n=39976 mean=146.2 p50=47.1 p90=73.7
+WINFSP TRACE pass=contended phase=unlink kind=Create n=10010 arrived_busy=0 wait_mean=38.7 wait_p50=2.7 wait_p90=3.7 service_mean=166.6 service_p50=41.0 service_p90=47.1
+WINFSP TRACE pass=contended phase=unlink kind=Cleanup n=10000 arrived_busy=0 wait_mean=2.4 wait_p50=2.3 wait_p90=2.7 service_mean=150.2 service_p50=36.9 service_p90=49.2
+WINFSP TRACE pass=contended phase=unlink kind=Close n=11012 arrived_busy=0 wait_mean=14168.6 wait_p50=1.8 wait_p90=2.6 service_mean=202.2 service_p50=26.6 service_p90=57.3
+WINFSP TRACE pass=contended phase=unlink kind=SetInformation n=10000 arrived_busy=0 wait_mean=2.1 wait_p50=2.0 wait_p90=2.3 service_mean=99.0 service_p50=9.7 service_p90=10.8
+## run 3 of 3 done, 2026-11-05T20:25:16Z
