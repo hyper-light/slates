@@ -1741,7 +1741,7 @@ struct DirNode { born: Epoch, entries: DirEntries, parent: Option<InodeNo> /* re
                  inode: InodeNo, name: Box<str> /* its own name in the parent */,
                  base: BaseDirState /* None | Merged{listing: ListingRef} | Opaque */,
                  origin: Option<PathKey> /* redirect: the base path this directory was renamed from */ }
-enum DirEntries { Small(InlineArray<Entry, 2> /* names inline, the measured cut-over */), Indexed(Tree /* CoW B+-tree of 4 KiB slotted blocks in the store's block slab, keyed by (hash, folded name); A-7 */) }
+enum DirEntries { Small(InlineArray<Entry, 2> /* names inline, the measured cut-over */), Indexed(Tree /* CoW B+-tree of slotted blocks keyed by (hash, folded name), A-7; each block the smallest of 17 size classes, 256 B to 4 KiB four to a doubling, that holds its entries, in the store's block pages (A-203) */) }
 struct Entry { name_hash: u64, name: NameRef /* into the node or the block */, kind: Kind /* Dir | File | Symlink | Fifo | Socket | Whiteout */, child: Handle<DirNode> | InodeNo }
 enum Body { …, Directory(Handle<DirNode>) /* a directory inode names its current node (A-7) */ }
 struct Inode { no: InodeNo, gen: u32, kind, mode, uid, gid, nlink, size, atime, mtime, ctime, btime,
@@ -2880,6 +2880,15 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 > attempt, and none was given up. On arm64, 0 of 100 stayed stale at that load. Beside 40% of memory held, where the
 > code before the fix kept 1 of 100 views stale, the fix kept 0 of 100 (diagnostics runs 41336524903 and 41346376630;
 > before, 41346373137).
+
+> **Status (2026-11-05, A-209: Windows conformance).** WinFsp's own suites run over the drive in `windows-lint` and
+> `windows-arm64`. winfstest's 628 cases give the same verdicts on x86_64 and arm64; every failure is on the reviewed
+> list with one of five stated differences (attribute bits, security descriptors, a settable creation time, reparse
+> points and symbolic links, named streams). Four Win32 bugs it found are fixed with failing tests first
+> (`crates/cli/tests/winfsp_semantics.rs`): a move not asked to replace, a directory holding a file, `SetFileTime`, and
+> an open with `TRUNCATE_EXISTING` (WinFsp's allocation below a file's size truncates it). Open: the fsx port wedges at an
+> extension after a cached write past a hole and a shrink, inside Windows below the single receiver; it is a listed
+> failure (`fsx-seed-1-unfinished:10000`) until fixed.
 
 > **Status (2026-11-02, A-198, Step 9.2: Windows handle holding).** The anchor's Windows hold channel and explicit
 > successor inheritance are built. A hold is acknowledged after duplication into the anchor, before the child publishes
@@ -7010,6 +7019,15 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > identity is a set hash over the green's entries, brought up to date when read, so a record at `f > 0` costs what its
 > version changed. Owed: the rebase's whole restatement.
 
+> **Status (2026-11-04, A-201: a green's head lands through a checkout).** `checkout GREEN VOLUME ATTACHMENT
+> --snapshot N` writes the green's head into the volume it was created from (the server's overlay of the directory
+> it lands into), checked to be that base and unchanged since, and `land` lands the volume under a grant; a green
+> itself is still refused `land`. Proven by `crates/server/tests/checkout.rs` (a real daemon over a real directory:
+> two merged pushes and an overlapping one refused with its window; the granted landing writes every merged byte; an
+> outsider's edit of a merged file is the presentation's only conflict; a wrong or moved base refused; three of three
+> red with the base check and the writes removed) and across a container by the fs-server lab (the client on the
+> host, the green's node in Docker, everything up to the grant; see A-201).
+
 **Role.** Let many agents work on clones of one shared volume and fold their work back into it
 with no locks, no last-writer-wins, and no inferred merge. Each agent's work becomes an
 increment of declared operations; the green volume's merge task maps the increment through
@@ -8423,7 +8441,7 @@ field.
 | Differential | Prove parity with the host filesystem | Same sequences on tmpfs / APFS RAM disk / NTFS RAM VHD; Metis-style abstract-state hashes | The abstract state after every step matches except where the reviewed equivalence policy allows (timestamps by order, inode numbers ignored, errno within the platform's allowed set) | CI (Linux), nightly (macOS, Windows) |
 | Landing oracle | Prove the one path that writes disk | an executable model of (disk, overlay, witnesses); outsider edits and crashes injected at every step; real filesystems on RAM-backed targets | Verdicts match the table; every entry old or new; every collision reported; re-runs idempotent; writes proportional to the delta | CI (Linux tmpfs), nightly (APFS, NTFS) |
 | Merge oracle | Prove the verdict, the splice and rebase | an executable model of (chain, work volumes, declared operations); proptest with shrinking; instrumented counters | Verdicts match the oracle with zero false accepts or rejects; spliced versions byte-identical; no content read on the common path; windows byte-exact | CI |
-| Conformance | Prove POSIX behaviour through each bridge | pjdfstest, fsx, fsstress (CI); xfstests generic, LTP (nightly) | All tests pass except the reviewed expected-failure list for that bridge, and the list only shrinks | CI / nightly |
+| Conformance | Prove POSIX behaviour through each bridge, and Win32 behaviour through the WinFsp drive | pjdfstest, fsx, fsstress (CI, x86_64 and arm64 Linux); WinFsp's fsx port and winfstest (CI, x86_64 and arm64 Windows; A-209); xfstests generic, LTP (nightly) | All tests pass except the reviewed expected-failure list for that bridge, and the list only shrinks | CI / nightly |
 | Real workloads | Prove tools work | vendored git, cargo, npm, python, rg, rsync, sqlite, editors, watchers | Exit codes 0; outputs byte-identical to the host run; `git status` clean; incremental builds reuse artifacts | nightly, release |
 | Unit and property | Prove each core structure | proptest, oracle tests (serial spec vs implementation), non-vacuity counters | Properties hold; counters prove the fast paths ran | CI |
 | Hostile input | Prove parsers never crash or over-allocate | cargo-fuzz corpora for wire, FUSE, NFS/XDR, WinFsp, archive, MCP | No panic, no UB, bounded time and memory on every input | CI smoke, nightly long |
@@ -11444,7 +11462,7 @@ Applied in the same change to: GAPS (boot entry closed, the control-shard siblin
 `crates/server/src/{daemon,config,lib}.rs`, `crates/server/tests/recovery.rs`.
 
 ### A-101 — Directory blocks of 1 KiB, chosen on real trees (2026-10-05)
-Status: built 2026-10-05.
+Status: built 2026-10-05; the one block size is replaced by A-203's size classes (2026-11-05).
 - What: a directory's B+-tree block (`dirtree::BLOCK_BYTES`, §4.5 D-4 `Indexed`) is the smallest power of two that holds
   three entries at the longest name, `3 × (24 + 255)` → 1,024 bytes, where it was a 4 KiB page. `MAX_HEIGHT` follows (at
   least 3 entries a block, `3^21 > u32::MAX`: 21).
@@ -12865,6 +12883,98 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
 
+### A-209 — Windows conformance is WinFsp's own two suites over the slates drive in both Windows lanes, with a reviewed list and stated differences; the POSIX suites run on arm64 Linux (accepted 2026-11-05, Step 10 of the VFS and DAX plan)
+Applied in the same change to: Part 6 ("Conformance"), §4.6 ("Windows" and its status), GAPS, `docs/wip/platforms.md`,
+`docs/wip/conformance.md`, `crates/conformance` (the `winfstest` suite, its reply parser, the capability table, the WinFsp
+fsx verdict), `xtask/src/conformance` (the WinFsp mount step, the MSVC builds, the winfstest transcription and runner),
+`crates/bridge-winfsp` (the three bugs below), `crates/cli/tests/winfsp_semantics.rs`, CI's `windows-lint`,
+`windows-arm64` and `linux-arm64` jobs, and `unsafe-budget.toml`.
+- **The decision.** Phase 4 task 5 named Windows' suites: "the WinFsp fsx port and WinFsp's own tests on Windows". They
+  are WinFsp's own CI's (`tools/run-tests.bat` at WinFsp v2.1, `memfs-x64-disk-fsx` and `memfs-x64-disk-winfstest`),
+  from `billziss-gh/secfs.test@6ac65cd`, the commit WinFsp v2.1 pins. `cargo xtask conformance run --suite fsx` and
+  `--suite winfstest` mount a volume as a drive (`slates mount ID E:`), build each suite's C from its pinned source with
+  MSVC (`cl.exe` found as build scripts find it), run it in a fresh directory on the drive, and write a record. They
+  run in `windows-lint` (x86_64) and `windows-arm64`. pjdfstest and fsstress stay inapplicable on Windows (POSIX C);
+  winfstest is inapplicable to every other transport.
+- **winfstest without Python.** Upstream drives its twenty scripts from Python 2.7, which no CI runner carries and
+  which CLAUDE.md's banned item 13 keeps out of CI. The harness carries a Rust transcription of the scripts
+  (`xtask/src/conformance/winfstest/scripts.rs`, under winfstest's BSD-3 notice) that runs upstream's C driver one call
+  a process, prints upstream's TAP, and is judged as pjdfstest is: every failure on the reviewed list
+  (`docs/wip/conformance/expected-failures/native-windows-winfsp.winfstest.txt`), every listed case still failing, every
+  script finishing its plan. A golden recorded from the unchanged upstream scripts under a stand-in `winfstest.py`
+  (733 cases, 577 calls, in order) holds the transcription: one expectation changed fails it.
+- **What the drive claims, and the stated differences.** The drive keeps Win32 namespace semantics: the create
+  dispositions, delete and delete-pending, directory removal, rename with and without replacement, share modes, file
+  size and truncation, directory listing, and the access, write and change times a caller sets. It does not keep, and
+  slates does not claim, five Windows features, each a reason on the reviewed list:
+  - **ATTRIBUTES**: no Windows attribute bits. Every file reports `FILE_ATTRIBUTE_NORMAL` and every directory
+    `FILE_ATTRIBUTE_DIRECTORY`; READONLY, HIDDEN, SYSTEM and ARCHIVE are neither reported nor enforced (the volume's
+    permission is POSIX's mode).
+  - **SECURITY**: no per-file security descriptor. Every object reports the volume's one descriptor and access is the
+    volume's own rule; a DACL set or asked for at create is not kept.
+  - **CREATION-TIME**: no settable birth time. The bridge's attributes carry none (creation time reports the change
+    time), and POSIX has no setter.
+  - **REPARSE and SYMLINK**: no reparse points, so no Windows symbolic links through the drive
+    (`ERROR_INVALID_FUNCTION`).
+  - **STREAMS**: no named streams (`ERROR_INVALID_NAME`; stream enumeration refused).
+- **Bugs the suites found, each fixed with a failing test first** (`crates/cli/tests/winfsp_semantics.rs`; the record
+  `docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md`): a move not asked to replace replaced a
+  taken name and a move asked to replace replaced a directory (`rename` dropped WinFsp's `ReplaceIfExists`); a
+  directory holding a file answered its removal with success (`CanDelete` answered success unread, and Cleanup's refusal
+  reached no program); `SetFileTime` answered success and kept nothing (`SetBasicInfo` applied no time); and an open
+  with `TRUNCATE_EXISTING` kept the file's bytes (it arrives as `SetFileSize` with an allocation of zero, which WinFsp's
+  contract says truncates, and the bridge ignored every allocation). Red on main's bridge in run 41989370753, green in
+  run 42046112993, on x86_64 and arm64; with them winfstest's failures fell from 384 to 374 of 628, all listed.
+- **fsx's open wedge, and how a failed run is judged.** The WinFsp port wedges at an extension that follows a cached
+  write past a hole and a shrink below it (seed 1: operations 41 to 43 in run 42057887707, 162 to 164 earlier, 238 on
+  main's bridge; the point moves, so it is a race), on both architectures. Operations 1 to 42 took 295 ms, then no
+  request reached the bridge for 299.9 s, so the wait is inside Windows' write path below the single receiver (A-198);
+  owed to the dispatcher's owners. Every fsx run now has a wall bound (pjdfstest's per-file 300 s, about five times the
+  slowest recorded run) and is judged against the transport's reviewed fsx list, as winfstest's cases are: a run that
+  fails its own verification by the operation it fails at (`fsx-seed-1:N`, stable for a seed), one its bound ended as
+  `fsx-seed-1-unfinished:10000`; a pass with a listed failure fails until the line is struck.
+- **arm64 Linux.** `linux-arm64` runs fsx, fsstress and pjdfstest over the three Linux transports, judged against the
+  x86_64 lane's lists: the first run found exactly the listed failures (diagnostics run 41975493604, 2026-11-05, Ubuntu
+  24.04.5 aarch64: pjdfstest 8,798 cases a transport with 0 unexpected and 0 listed passing; fsx 10,000 operations and
+  fsstress 4 × 500 passed on each).
+### A-208 — Shards are counted and fixed by physical core: the facts name each CPU's core, and a core's second hardware thread runs no shard; and a shard's content keys are bounded by what names them (accepted and built 2026-11-05)
+Applied in the same change to: §4.1 (its status), `crates/machine` (`facts.rs`: `CoreFacts::physical`, read from Linux
+`topology/thread_siblings_list` and the Windows `RelationProcessorCore` mask; `placement.rs`: `Placement::of`;
+`profile.rs`: `PROFILE_VERSION` 4), the tests that build facts by hand (`probes.rs`, `wake.rs`,
+`crates/server/tests/daemon.rs`), GAPS, `docs/bugs/2026-11-05-shards-counted-hardware-threads-as-cores.md`.
+- **Why.** §4.1 says "shard count = performance-class physical cores minus one control core", but the facts had one
+  entry per logical CPU and nothing that named a core, so the placement counted hardware threads. jupiter's 16
+  two-thread cores ran 31 shards, most cores carried two spinning shards, and the clients spinning for their replies had
+  one thread between them: provisioning p99 123.6 µs against R9's 50 µs (2026-11-05, Windows x86_64).
+- **The rule.** The fastest class is reduced to one logical CPU per physical core, the lowest id the process may run
+  on, before the shards are counted and fixed. Control takes the first core's first thread, and each shard the first
+  thread of another core. The second threads run no shard: they are left to the clients, the bridges and the OS, and
+  two shards never share one core's pipeline. A CPU whose OS gives no topology counts as its own core, with a note.
+  A cpuset, a quota and ownership are judged as before (A-41's rule), and the quota still buys CPUs of time.
+- **Proven.** `hardware_threads_of_one_core_count_as_one_core_and_only_its_first_runs_a_shard` (16 cores × 2 threads,
+  in Windows' and in Linux's numbering) failed before the fix (31 against 15) and passes after. The placement oracle
+  draws three sibling layouts and checks that no two shards share a core, that none shares control's, and that each
+  fixed CPU is its core's first. With the old counting, both fail.
+- **Owed.** The interleaved before/after of `provision_bench` on a machine with two threads a core, and Windows core
+  classes (still `Unknown`, so a hybrid Windows machine counts every core as the fastest class).
+- **What it does not change.** Apple silicon, which runs one thread a core; the machine identity, which still counts
+  the logical CPUs the process may use; and pinning only on cores the process owns.
+- **Second part (2026-11-05): a shard's content keys are bounded by what names them.** Applied in the same change to
+  §4.2's cipher (`crates/server/src/content_cipher.rs`, its module doc), `crates/vfs/src/content.rs` (`ChunkCipher`'s
+  `hold`, `release` and `keys_held`; `ChunkStore` holds a sealed record's key at its insert and releases it at its
+  free), `crates/server/src/verbs.rs` (`release_slot_credits` lets the volume's hold go), `Daemon::content_keys_held`,
+  GAPS and `docs/bugs/2026-11-05-a-shards-content-keys-were-never-let-go.md`.
+  - Why: the cipher kept a key for every volume it had ever keyed and found each by a linear scan. 64 volumes made,
+    written and destroyed left 64 keys behind, and over the provisioning histogram's ~440,000 creates the scan held
+    24,052 of the 26,986 samples inside the server's create (macOS arm64). Its doc claimed a bound nothing kept.
+  - The rule: a key is held once for its volume's life and once by each sealed chunk record that names it, and goes
+    with its last hold. Its slot is reused by the next new key. Keys are found through an identity-to-slot index.
+    Held keys are therefore at most the shard's live volumes plus its sealed records, plus the keys a recovery image
+    named whose chunk was then not adopted.
+  - Proven: the create-and-destroy loop returns to its floor, red before (64 against 0); and a key outlives its volume's
+    life while a chunk sealed under it lives, across a restart, and goes with its last chunk. Red before, and
+    red-checked against each half of the fix.
+
 ### A-202 — A submit's cost follows what it changed, not what the green holds; a work is a delta over its base (accepted and built 2026-11-04, Ada's goal of 2026-11-04: a full edit and merge under 1 ms, preferably under 50 µs)
 Applied in the same change to: §4.16 (status), A-84 (what a work keeps and when its charge can be refused),
 `crates/server/src/{work_files,work_charge,verbs,merge_service,listing,state,lib}.rs`, `crates/merge/src/{engine,
@@ -12961,44 +13071,6 @@ Applied in the same change to: §4.16 (status), `docs/wip/merge-service.md` (the
   scratch at every read (red with the fold's guard removed: the first generated case failed); one state reached in
   two orders has one identity; a byte, a mode bit or a kind changes it and restoring the byte restores it. The
   fleet's holder-recompute, mismatch and takeover tests pass unchanged (BENCHMARKS, GAPS).
-
-### A-208 — Shards are counted and fixed by physical core: the facts name each CPU's core, and a core's second hardware thread runs no shard; and a shard's content keys are bounded by what names them (accepted and built 2026-11-05)
-Applied in the same change to: §4.1 (its status), `crates/machine` (`facts.rs`: `CoreFacts::physical`, read from Linux
-`topology/thread_siblings_list` and the Windows `RelationProcessorCore` mask; `placement.rs`: `Placement::of`;
-`profile.rs`: `PROFILE_VERSION` 4), the tests that build facts by hand (`probes.rs`, `wake.rs`,
-`crates/server/tests/daemon.rs`), GAPS, `docs/bugs/2026-11-05-shards-counted-hardware-threads-as-cores.md`.
-- **Why.** §4.1 says "shard count = performance-class physical cores minus one control core", but the facts had one
-  entry per logical CPU and nothing that named a core, so the placement counted hardware threads. jupiter's 16
-  two-thread cores ran 31 shards, most cores carried two spinning shards, and the clients spinning for their replies had
-  one thread between them: provisioning p99 123.6 µs against R9's 50 µs (2026-11-05, Windows x86_64).
-- **The rule.** The fastest class is reduced to one logical CPU per physical core, the lowest id the process may run
-  on, before the shards are counted and fixed. Control takes the first core's first thread, and each shard the first
-  thread of another core. The second threads run no shard: they are left to the clients, the bridges and the OS, and
-  two shards never share one core's pipeline. A CPU whose OS gives no topology counts as its own core, with a note.
-  A cpuset, a quota and ownership are judged as before (A-41's rule), and the quota still buys CPUs of time.
-- **Proven.** `hardware_threads_of_one_core_count_as_one_core_and_only_its_first_runs_a_shard` (16 cores × 2 threads,
-  in Windows' and in Linux's numbering) failed before the fix (31 against 15) and passes after. The placement oracle
-  draws three sibling layouts and checks that no two shards share a core, that none shares control's, and that each
-  fixed CPU is its core's first. With the old counting, both fail.
-- **Owed.** The interleaved before/after of `provision_bench` on a machine with two threads a core, and Windows core
-  classes (still `Unknown`, so a hybrid Windows machine counts every core as the fastest class).
-- **What it does not change.** Apple silicon, which runs one thread a core; the machine identity, which still counts
-  the logical CPUs the process may use; and pinning only on cores the process owns.
-- **Second part (2026-11-05): a shard's content keys are bounded by what names them.** Applied in the same change to
-  §4.2's cipher (`crates/server/src/content_cipher.rs`, its module doc), `crates/vfs/src/content.rs` (`ChunkCipher`'s
-  `hold`, `release` and `keys_held`; `ChunkStore` holds a sealed record's key at its insert and releases it at its
-  free), `crates/server/src/verbs.rs` (`release_slot_credits` lets the volume's hold go), `Daemon::content_keys_held`,
-  GAPS and `docs/bugs/2026-11-05-a-shards-content-keys-were-never-let-go.md`.
-  - Why: the cipher kept a key for every volume it had ever keyed and found each by a linear scan. 64 volumes made,
-    written and destroyed left 64 keys behind, and over the provisioning histogram's ~440,000 creates the scan held
-    24,052 of the 26,986 samples inside the server's create (macOS arm64). Its doc claimed a bound nothing kept.
-  - The rule: a key is held once for its volume's life and once by each sealed chunk record that names it, and goes
-    with its last hold. Its slot is reused by the next new key. Keys are found through an identity-to-slot index.
-    Held keys are therefore at most the shard's live volumes plus its sealed records, plus the keys a recovery image
-    named whose chunk was then not adopted.
-  - Proven: the create-and-destroy loop returns to its floor, red before (64 against 0); and a key outlives its volume's
-    life while a chunk sealed under it lives, across a restart, and goes with its last chunk. Red before, and
-    red-checked against each half of the fix.
 
 ### A-211 — A DAX ask is refused where no view could begin (accepted and built 2026-11-04)
 Applied in the same change to: §4.6 by reference, `docs/wip/shards/dax-protocol.md` ("Windows"), GAPS,
@@ -13245,10 +13317,114 @@ removing it means changing that crash rule, which this amendment does not do.
 quiet p50: a stat 1.50×, a rename 1.35×, an fsync 1.21×), but the receiver stays worse beyond the spread at the p50, by about
 20 µs a request, on both architectures. Open: that remainder, of which the response call explains 11–13 µs; hops for Open and
 Release about 2× the DLL arm's on arm64, and SetSize about 4× under load, which accounts for an arm64 write under load at
-2.09×. A longer shard spin did not change them (run 41989038309), and they are not explained.
+2.09×.
+
+**The hops, and the reply spin (2026-11-05).** Timed stage by stage, the slower Open and Release hops are the waiting thread
+parking: A-198's publish, about 1 µs and required, pushes the reply past the spin inside `std`'s `recv`. The receive thread now
+spins for as long as a wake costs and then parks, the 2-competitive rule the shards use (§4.3). The window is measured once on
+that thread as it starts, the median of 15 one-way wakes through the same kind of channel, since `wake.mean_ns` is far below this
+wake's cost. Against parking (run 42052991563, five interleaved runs on both runners): arm64 quiet an fsync 0.88×, a stat 0.89×, a
+rename 0.90×; x86_64 loaded a rename and a stat 0.77×, an fsync 0.80×. Cost: arm64's loaded rename 1.15×. No request or crash
+rule changes: only how long a thread waits before it sleeps. Loaded SetSize is a different cause: a shard that has just answered
+is preempted, and raising its thread's priority removes the wait (run 42059294312), but those arms shared a machine, so that
+is not yet a measured gain and no priority has been changed.
+Applied in the same change to: GAPS, BENCHMARKS, `crates/bridge-winfsp/src/reply.rs`, `host.rs`, `dispatcher.rs` and `lib.rs`.
 
 Applied in the same change to: GAPS (the audit entry's unmeasured-receiver item); `crates/bridge-winfsp/src/dispatcher.rs`,
 `inflight/capture.rs`, `purge_intents.rs`, `notify.rs` and `host.rs`.
+
+### A-203 — Directory blocks in size classes: each block the smallest of 17 classes, 256 B to 4 KiB, that holds its entries, each class a list of 64 KiB pages from one slab (accepted and built 2026-11-05, Step 13 of the VFS and DAX plan)
+Applied in the same change to: §4.5 (data model), `crates/vfs/src/{dirblocks,dirtree,dir,volume,snapshot,recover}.rs`,
+`crates/vfs/tests/model.rs`, `crates/vfs/examples/{vfs_bench,tree_heap}.rs`, the server's boot-log formula
+(`crates/server/src/config.rs`), BENCHMARKS ("Directory blocks in size classes"), GAPS.
+- What: a directory's B+-tree block (D-4 `Indexed`) is the smallest size class that holds its live entries. The classes
+  run from 256 bytes to 4 KiB, four to a doubling (256, 320, 384, 448, 512, …, 3,584, 4,096: seventeen). A block that
+  cannot take an insert grows to the class that can, one copy into a fresh block. A full 4 KiB block splits by bytes,
+  and both halves go to the class that fits them. A removal that leaves a block under half its class shrinks it, and
+  a block under a quarter of 4 KiB merges with its right sibling, whenever the store has a block to give: a removal
+  never needs room. So every block is at most twice the class that fits it. A-101's single 1 KiB block size is
+  replaced.
+- Storage (`crates/vfs/src/dirblocks.rs`): each class is a list of 64 KiB pages of its slots, and every page comes from
+  one slab of pages (Bonwick's slab cache over a page pool [A: Bonwick USENIX'94]). A page with a free slot is on its
+  class's list, intrusively linked. A page whose last block is freed goes back to the slab, where any class takes it
+  again. So the classes share memory, and nothing reaches the global allocator per block. A block is named by its
+  page's handle, its slot (one byte: a page has at most 256 slots) and the slot's generation (24 bits, retired at its
+  limit for the page's life, AUD-29-11's rule). An index entry carries the slot word in the packed word's spare high
+  half, so the entry format keeps its 24 bytes.
+- Bounds: the live blocks are at most the store's block cap (`max_dir_blocks`), so the refusal sweep still steps a
+  block at a time. The pages are at most that cap's smallest-class bytes in whole pages, plus a page for every class
+  (`BlockStore::max_pages`). A directory's metadata unit is its node and a smallest block's share of a page
+  (`directory_unit_bytes`): the median real directory's block is that class (A-101's medians of 4 to 6 entries).
+  Admission reserves a page for every block a mutation can make, and two new blocks a level for a cascade (a grown
+  block, or a split's sibling and its fitted other half) plus a new root.
+- Why the class spacing: power-of-two classes cannot beat a 4 KiB block on the measured directory (36 entries of
+  49-byte names, 2,644 bytes, take the 4 KiB class). This was the 2026-10-05 heap-buffer experiment's 352,721,118 B.
+  Four to a doubling bounds a block's slack at a fifth and copies a growing block a constant number of times a byte
+  [C: jemalloc `sc.h`, `SC_LG_NGROUP` 2].
+- Evidence (BENCHMARKS, "Directory blocks in size classes", 2026-11-05): AC-1.5 at 10^6 files 350,460,030 → 292,914,814 B (1 KiB blocks → classes, 23 runs each, every run identical; under the 4 KiB-block figure of 352,335,998); the real trees
+  (`tree_heap`, 64 copies each) npm 300 → 260 heap bytes an entry, pip 336 → 275, cargo 386 → 293; `vfs_bench`'s lookup, readdir and create rows at least as good at their best and inside the 1 KiB spread at p50 and
+  p99 (best of 10, interleaved, load 11 to 22), the burst's best 2,323 → 2,966 ns a file inside its spread, and the raw tree's
+  insert and remove 25 to 30% slower at 2 and 4 entries, inside its spread, faster from 8 up.
+- Oracles: the store against a map model on generated histories (`dirblocks::tests`); the tree against an ordered map
+  with the class rule after every operation (`dirtree::tests`); and the volume oracle (`crates/vfs/tests/model.rs`
+  `check_blocks`), which after every step compares the store with every block the volume reaches: the head's, the
+  snapshots' and their deadlists'. The comparison is block for block, the class census matches, the class lists are
+  sound, and every block is within the class rule. Also, a removed name that is the block's lowest gives its bytes back at
+  once (`a_name_removed_after_it_was_written_leaves_no_hole`): a fitted block's slack is a few dozen bytes, and the first
+  build compacted on every few rounds of a create and unlink. A fixed history grows one directory through ten classes, splits
+  it, snapshots it and shrinks it, and must see eight classes, the largest among them.
+
+### A-201 — A green's head lands through a checkout: written into the volume the green was created from, which lands under a grant like any volume (accepted and built 2026-11-04)
+
+- **What it answers.** §4.16 ends a merge at a green version and §4.15 writes disk only through a landing, but nothing
+  joined them: `land` on a green was refused `Unsupported { "landing a merge volume" }` (owed "with the extent-backed
+  green"). So work pushed to a server through `work`, `edit` and `submit` (from its own host, or from another fleet
+  node, whose submissions route to the green's owner, §4.10) could never reach the server's disk. Found by the
+  fs-server lab of 2026-11-04: a client on the host pushed three edits into a green on a node in a Docker container,
+  version 2 was accepted, and `land` refused it on both nodes.
+- **Decided: `checkout GREEN VOLUME ATTACHMENT --snapshot N`.** The green's head is written into `VOLUME`, the volume
+  the green was created from (on a server, its overlay of the directory the work lands into), through `ATTACHMENT`, the
+  caller's own write attachment of it, by the typed file verbs' one checked path (`fs_verbs::with_writer` over the
+  shared operation layer, so the overlay's copy-up and witness rules hold, and the attachment is checked again at
+  every step). What is written is the head's difference from the green's origin: paths the origin held and the head
+  does not are removed, deepest first; then directories the head adds are made and files it adds or changes are
+  written whole, parents first; then each mode the head changed is set. The volume then lands with the existing
+  `land` and `grant`: the verdict is the landing's own (§4.15), so a file the merge changed that an outsider also
+  changed on disk since the base's witness is a conflict, an equal one is accepted by identity, and nothing is
+  inferred (D-26, D-27).
+- **The base is checked, not trusted.** The green records only its origin's bytes (`GreenOriginated`), not which
+  snapshot they came from, so the checkout names the base and is refused `ConsistentBaseUnavailable` unless the
+  snapshot's origin, captured the way `green --base` captures it, encodes byte for byte to the green's recorded
+  origin. An equal path is not evidence of an equal source (§4.10 "Overlay volumes in a fleet"). A scratch green has
+  no base to write into and is refused the same way.
+- **The volume must still be the base.** It is refused `Unsupported` unless every op-log record since the snapshot
+  is a snapshot's own and none was dropped (`Volume::unchanged_since`), so nothing the volume gained since is
+  overwritten by the head without a word.
+- **The diff is against the origin, not the history.** The origin is durable and never folded, while the chain's
+  histories fold under the retention budget (AUD-16), so the head-against-origin difference is exact at any fold.
+- **Running.** As `image merge` (A-160): checked at once, then deferred to a task of the volume's owner shard (also the
+  green's, since `green --base` runs there), one step a unit in slices of `copy_slice_ns`, a retry joining it; the
+  volume is published before the completion is recorded. The steps are not one atom: a refusal midway leaves the
+  steps before it written and names the path, as a refused file verb leaves what it wrote; the base snapshot still
+  holds the state before the checkout.
+- **Not in this change, refused typed.** A head whose difference from the origin includes a symbolic link, a hard
+  link, an extended attribute or a FIFO/socket is refused `Unsupported` naming the path; those dimensions are owed. The
+  checkout of an older version is owed (the head only). The origin capture and the difference are computed in one
+  unit, unsliced, as `green --base` already captures its origin (owed with the extent-backed green).
+- **Rejected: a clone of the base snapshot holding the head** (the first form of this amendment, the same day). The
+  daemon cannot clone an overlay volume: every clone is admitted with no host (`verbs::admit_clone`), while an
+  overlay's base names its directories by its own host's handles, so the clone of the server's overlay was refused
+  `ContentUnavailable`, pinned or not, on a fleet node and on a standalone daemon alike (the volume core's own overlay
+  clone, `a_clone_of_an_overlay_snapshot_reads_the_same_base`, is not reachable through the daemon). Recorded in GAPS.
+- **Rejected: `land GREEN TARGET` building a hidden view.** A grant binds a presented manifest, and the presentation
+  and the granted landing are two calls; a view rebuilt for each would need its manifest proven stable, and a kept one
+  would be state the user never named.
+- **Rejected: composing it in the client** (`write` per path). It checks nothing about the base and costs a round trip
+  a path.
+- **Where the grant comes from.** Unchanged: a human at the server's anchor (R10). On Linux the anchor's issuer
+  segment is a descriptor only its children hold, so no separate `slates grant` can be issued there (the Linux issuer
+  surface is owed, §4.13); the lab's container node therefore stops at the presentation.
+Applied in the same change to: §4.16 (status), GAPS (top blockquote).
 
 ### A-198 — A WinFsp mount outlives its daemon: the anchor holds the volume's control handle, the drive's link and the mount's ledger, and the next daemon serves the held volume (accepted 2026-11-01, Step 9 of the VFS and DAX plan; built and measured 2026-11-02)
 Applied in the same change to: GAPS (gap 2 of the platform inventory). The build applies it to §4.6 "Windows",

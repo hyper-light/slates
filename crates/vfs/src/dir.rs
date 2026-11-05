@@ -11,9 +11,9 @@
 //! copied one root-to-leaf path at a time as it is written (§4.5, D-5).
 
 use slates_mem::Handle;
-use slates_mem::slab::Slab;
 
-use crate::dirtree::{DirBlock, Retired, Tree, TreeCursor};
+use crate::dirblocks::{BlockRef, BlockStore};
+use crate::dirtree::{Retired, Tree, TreeCursor};
 use crate::error::VfsError;
 use crate::ids::{Epoch, InodeNo};
 use crate::names::NameEquivalence;
@@ -314,7 +314,7 @@ impl DirNode {
   }
 
   /// The entries that are not whiteouts.
-  pub fn live_len(&self, blocks: &Slab<DirBlock>) -> usize {
+  pub fn live_len(&self, blocks: &BlockStore) -> usize {
     self
       .iter(blocks)
       .filter(|e| e.child != Child::Whiteout)
@@ -329,7 +329,7 @@ impl DirNode {
   /// The entry for `name` under `policy`.
   pub fn lookup<'a>(
     &'a self,
-    blocks: &'a Slab<DirBlock>,
+    blocks: &'a BlockStore,
     policy: NameEquivalence,
     name: &str,
   ) -> Option<EntryRef<'a>> {
@@ -361,7 +361,7 @@ impl DirNode {
   #[allow(clippy::too_many_arguments)]
   pub fn insert(
     &mut self,
-    blocks: &mut Slab<DirBlock>,
+    blocks: &mut BlockStore,
     epoch: Epoch,
     retired: &mut Retired,
     policy: NameEquivalence,
@@ -383,7 +383,14 @@ impl DirNode {
       // Move to the tree, then insert there. The tree is built beside the small form and published
       // only once it holds every entry; a refusal partway gives its blocks back and leaves the small
       // form as it was (AUD-29-40: a refused move kept the blocks it had taken).
-      let mut tree = Tree::new(blocks, epoch)?;
+      let names: usize = s
+        .entries()
+        .iter()
+        .map(|e| s.name(*e).len())
+        .sum::<usize>()
+        .saturating_add(name.len());
+      let entries = usize::from(s.count).saturating_add(1);
+      let mut tree = Tree::holding_entries(blocks, epoch, entries, names)?;
       let mut built = Ok(());
       for e in s.entries() {
         built = tree.insert(blocks, epoch, retired, policy, s.name(*e), e.child);
@@ -411,7 +418,7 @@ impl DirNode {
   /// is at or below half the cut-over and the names fit (the hysteresis of §4.5).
   pub fn remove(
     &mut self,
-    blocks: &mut Slab<DirBlock>,
+    blocks: &mut BlockStore,
     epoch: Epoch,
     retired: &mut Retired,
     policy: NameEquivalence,
@@ -454,7 +461,7 @@ impl DirNode {
   /// while the name fits; the move to a tree, one; a tree, its insert's copies and worst-case split.
   pub fn insert_blocks(
     &self,
-    blocks: &Slab<DirBlock>,
+    blocks: &BlockStore,
     epoch: Epoch,
     policy: NameEquivalence,
     name: &str,
@@ -472,7 +479,7 @@ impl DirNode {
   /// inline, the path's copies in a tree.
   pub fn change_blocks(
     &self,
-    blocks: &Slab<DirBlock>,
+    blocks: &BlockStore,
     epoch: Epoch,
     policy: NameEquivalence,
     name: &str,
@@ -486,7 +493,7 @@ impl DirNode {
   /// The most directory blocks a respelling of `old` as `new` can take.
   pub fn respell_blocks(
     &self,
-    blocks: &Slab<DirBlock>,
+    blocks: &BlockStore,
     epoch: Epoch,
     policy: NameEquivalence,
     old: &str,
@@ -515,7 +522,7 @@ impl DirNode {
   #[allow(clippy::too_many_arguments)]
   pub fn respell(
     &mut self,
-    blocks: &mut Slab<DirBlock>,
+    blocks: &mut BlockStore,
     epoch: Epoch,
     retired: &mut Retired,
     policy: NameEquivalence,
@@ -557,7 +564,7 @@ impl DirNode {
   /// Replaces the child of an existing entry.
   pub fn set_child(
     &mut self,
-    blocks: &mut Slab<DirBlock>,
+    blocks: &mut BlockStore,
     epoch: Epoch,
     retired: &mut Retired,
     policy: NameEquivalence,
@@ -581,10 +588,7 @@ impl DirNode {
   }
 
   /// The entries in canonical `(hash, folded name)` order.
-  pub fn iter<'a>(
-    &'a self,
-    blocks: &'a Slab<DirBlock>,
-  ) -> Box<dyn Iterator<Item = EntryRef<'a>> + 'a> {
+  pub fn iter<'a>(&'a self, blocks: &'a BlockStore) -> Box<dyn Iterator<Item = EntryRef<'a>> + 'a> {
     match &self.entries {
       DirEntries::Small(s) => Box::new(s.entries().iter().map(move |e| EntryRef {
         hash: e.hash,
@@ -601,7 +605,7 @@ impl DirNode {
   }
 
   /// A cursor at the first entry in canonical order, for [`DirNode::next_entry`].
-  pub fn cursor(&self, blocks: &Slab<DirBlock>) -> DirCursor {
+  pub fn cursor(&self, blocks: &BlockStore) -> DirCursor {
     match &self.entries {
       DirEntries::Small(_) => DirCursor::Small(0),
       DirEntries::Indexed(t) => DirCursor::Indexed(Box::new(t.iter(blocks).cursor())),
@@ -616,7 +620,7 @@ impl DirNode {
   /// [`DirNode::len`], since a block that can no longer be read ends the walk.
   pub fn next_entry<'a>(
     &'a self,
-    blocks: &'a Slab<DirBlock>,
+    blocks: &'a BlockStore,
     cursor: &mut DirCursor,
   ) -> Option<EntryRef<'a>> {
     match (&self.entries, cursor) {
@@ -644,7 +648,7 @@ impl DirNode {
   /// its capacity) — §4.5; AUD-29-86.
   pub fn iter_from_hash<'a>(
     &'a self,
-    blocks: &'a Slab<DirBlock>,
+    blocks: &'a BlockStore,
     hash: u64,
   ) -> Box<dyn Iterator<Item = EntryRef<'a>> + 'a> {
     match &self.entries {
@@ -663,12 +667,7 @@ impl DirNode {
   }
 
   /// The name of the entry with hash `hash` whose child is inode `no`, for a file's home.
-  pub fn name_of<'a>(
-    &'a self,
-    blocks: &'a Slab<DirBlock>,
-    hash: u64,
-    no: InodeNo,
-  ) -> Option<&'a str> {
+  pub fn name_of<'a>(&'a self, blocks: &'a BlockStore, hash: u64, no: InodeNo) -> Option<&'a str> {
     let wanted = |c: Child| matches!(c, Child::File(n) | Child::Symlink(n) if n == no);
     match &self.entries {
       DirEntries::Small(s) => s
@@ -681,7 +680,7 @@ impl DirNode {
   }
 
   /// The tree blocks this node reaches, with their birth epochs (none for the small form).
-  pub fn blocks(&self, blocks: &Slab<DirBlock>, out: &mut Vec<(Handle<DirBlock>, Epoch)>) {
+  pub fn blocks(&self, blocks: &BlockStore, out: &mut Vec<(BlockRef, Epoch)>) {
     if let DirEntries::Indexed(t) = &self.entries {
       t.blocks(blocks, out);
     }
@@ -690,9 +689,9 @@ impl DirNode {
   /// The tree blocks born after `since` (a pruned walk for a clone's destroy).
   pub fn blocks_since(
     &self,
-    blocks: &Slab<DirBlock>,
+    blocks: &BlockStore,
     since: Option<Epoch>,
-    out: &mut Vec<(Handle<DirBlock>, Epoch)>,
+    out: &mut Vec<(BlockRef, Epoch)>,
   ) {
     if let DirEntries::Indexed(t) = &self.entries {
       t.blocks_since(blocks, since, out);
@@ -704,11 +703,11 @@ impl DirNode {
 mod tests {
   use super::*;
 
-  fn blocks() -> Slab<DirBlock> {
-    Slab::new(8, 1024)
+  fn blocks() -> BlockStore {
+    BlockStore::new(4, 1024)
   }
 
-  fn ten_entries(blocks: &mut Slab<DirBlock>, policy: NameEquivalence) -> DirNode {
+  fn ten_entries(blocks: &mut BlockStore, policy: NameEquivalence) -> DirNode {
     let mut d = DirNode::new(Epoch(0), None, InodeNo(1), "ten");
     let mut retired = Retired::new();
     for i in 0..10u64 {

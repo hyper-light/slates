@@ -234,7 +234,7 @@ fn unix_uid(principal: &Principal) -> Option<u32> {
 }
 
 /// Runs `op` on `bridge` under `cx`: the changed object's size.
-fn run(bridge: &mut dyn Bridge, cx: &OpContext, op: FsOp<'_>) -> Result<u64, VfsError> {
+pub(crate) fn run(bridge: &mut dyn Bridge, cx: &OpContext, op: FsOp<'_>) -> Result<u64, VfsError> {
   match op {
     FsOp::Write { path, bytes, mode } => {
       let (parent, name) = parent_of(bridge, cx, path)?;
@@ -317,7 +317,7 @@ fn write_file(
 
 /// The directory that holds `path`'s last component, walked from the attachment's root, and that component. A path
 /// is `/`-separated components, none of them `.` or `..`, and names at least one.
-fn parent_of<'p>(
+pub(crate) fn parent_of<'p>(
   bridge: &mut dyn Bridge,
   cx: &OpContext,
   path: &'p str,

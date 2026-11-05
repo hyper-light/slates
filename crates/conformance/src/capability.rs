@@ -10,8 +10,9 @@
 //! FUSE mount (`slates mount` on Linux, `crates/server/src/fuse.rs`, proven on a real kernel mount by
 //! `crates/server/tests/fuse_mount.rs`), but the Linux lane still reaches the daemon through a root
 //! `mount -t nfs` adapter — running the suites over the FUSE mount itself is owed (pjdfstest's root cases
-//! need `allow_other`, an operator's `user_allow_other`); the Windows WinFsp host is proven live by
-//! `crates/bridge-winfsp/tests/mount.rs` (create, write, read, list, delete) and nothing more;
+//! need `allow_other`, an operator's `user_allow_other`); on Windows (A-209, 2026-11-05) the harness mounts the
+//! volume as a WinFsp drive (`slates mount ID E:`) and runs WinFsp's own two suites over it, the fsx port and
+//! winfstest, each built from its pinned source with MSVC, on both Windows lanes;
 //! virtio-fs runs a live Linux guest through QEMU's vhost-user-fs, which mounts the tag and runs the workload
 //! roster identically on slates and on its RAM (`crates/server/tests/virtiofs.rs`), while the other suites have
 //! no guest leg yet; the OCI container
@@ -148,6 +149,8 @@ const LINUX_MOUNT_TOOLS: &[&str] = &["mount", "umount", "sh", "sudo"];
 pub fn availability(transport: Transport, suite: Suite) -> Availability {
   match (transport, suite) {
     (_, Suite::Pressure | Suite::Failure) => Availability::Owed(NO_PRESSURE_OR_FAILURE_SUITE),
+    (Transport::NativeWindowsWinfsp, suite) => native_windows(suite),
+    (_, Suite::Winfstest) => Availability::NotApplicable(WINFSTEST_IS_WINDOWS_ONLY),
     (Transport::VirtioFs, Suite::Workloads) => {
       Availability::Owed(VIRTIOFS_WORKLOADS_IN_THE_GUEST_TEST)
     }
@@ -200,7 +203,6 @@ pub fn availability(transport: Transport, suite: Suite) -> Availability {
     (Transport::NativeLinuxFuse, suite) => native_linux(suite, Some(LINUX_NFS_ADAPTER)),
     // The daemon's own NFSv4.2 server under the kernel client: a transport, not an adapter.
     (Transport::NativeLinuxNfs4, suite) => native_linux(suite, None),
-    (Transport::NativeWindowsWinfsp, suite) => native_windows(suite),
   }
 }
 
@@ -237,6 +239,7 @@ fn native_macos(suite: Suite) -> Availability {
       ),
       adapter: None,
     },
+    Suite::Winfstest => Availability::NotApplicable(WINFSTEST_IS_WINDOWS_ONLY),
     Suite::Pressure | Suite::Failure => Availability::Owed(NO_PRESSURE_OR_FAILURE_SUITE),
   }
 }
@@ -272,24 +275,43 @@ fn native_linux(suite: Suite, adapter: Option<Adapter>) -> Availability {
       ),
       adapter,
     },
+    Suite::Winfstest => Availability::NotApplicable(WINFSTEST_IS_WINDOWS_ONLY),
     Suite::Pressure | Suite::Failure => Availability::Owed(NO_PRESSURE_OR_FAILURE_SUITE),
   }
 }
 
+/// The reason winfstest applies to the Windows transport alone.
+const WINFSTEST_IS_WINDOWS_ONLY: &str = concat!(
+  "winfstest drives the Win32 file API (CreateFile, MoveFileEx, security descriptors, reparse points, named ",
+  "streams) through a Windows drive; it has no POSIX build, and pjdfstest is the POSIX transports' conformance suite"
+);
+
+/// Format: WinFsp's user-mode library for this harness's architecture, which the WinFsp package puts in its `bin`
+/// directory and the lanes add to the `PATH` (`winfsp-x64.dll`, `winfsp-a64.dll`); the daemon loads it by that name.
+#[cfg(target_arch = "aarch64")]
+const WINFSP_LIBRARY: &str = "winfsp-a64.dll";
+/// Format: the x86_64 library's name.
+#[cfg(not(target_arch = "aarch64"))]
+const WINFSP_LIBRARY: &str = "winfsp-x64.dll";
+
 fn native_windows(suite: Suite) -> Availability {
+  let on = HostOs::Windows;
   match suite {
     Suite::Pjdfstest | Suite::Fsstress => Availability::NotApplicable(
       "a POSIX C suite with no Windows build (pjdfstest and fsstress use fork, uid switching and \
        POSIX namespace calls)",
     ),
-    Suite::Fsx => Availability::Owed(
-      "the WinFsp fsx port (Phase 4 task 5) is not wired into the harness, and the harness has no \
-       WinFsp mount step",
-    ),
+    // The WinFsp fsx port and winfstest, over `slates mount ID E:` (A-209): each built from its pinned source with
+    // MSVC, as WinFsp's own CI runs them. The daemon and the suites run as the runner's own user.
+    Suite::Fsx | Suite::Winfstest => Availability::Runnable {
+      on,
+      tools: &[WINFSP_LIBRARY, "curl"],
+      root: RootNeed::None,
+      adapter: None,
+    },
     Suite::Workloads => Availability::Owed(
-      "the harness has no WinFsp mount step; the live WinFsp mount test \
-       (crates/bridge-winfsp/tests/mount.rs, gated WINFSP_TEST_MOUNT=1 on windows-latest) proves \
-       create/write/read/list/delete through the kernel and nothing more",
+      "the harness mounts the drive (A-209), but the roster's tools and their byte-identity comparison are POSIX's \
+       (git over a mode-keeping tree, cargo, rsync, sqlite, a watcher) and no Windows roster is defined yet",
     ),
     Suite::Hermeticity => Availability::Owed("no ETW filesystem-write tracer is wired for Windows"),
     Suite::Pressure | Suite::Failure => Availability::Owed(NO_PRESSURE_OR_FAILURE_SUITE),
@@ -350,7 +372,8 @@ mod tests {
   /// container over the OCI bind (AUD-29-78), and is owed for every other suite.
   #[test]
   fn the_guest_is_owed_and_the_container_runs_only_its_built_leg() {
-    for suite in Suite::ALL {
+    // winfstest is the Windows transport's alone (A-209), so it is no guest's or container's to owe.
+    for suite in Suite::ALL.into_iter().filter(|s| *s != Suite::Winfstest) {
       assert!(matches!(
         availability(Transport::VirtioFs, suite),
         Availability::Owed(_)
@@ -372,6 +395,45 @@ mod tests {
       if built { runnable } else { owed },
       "{suite:?}: {container:?}"
     );
+  }
+
+  /// A-209: the Windows transport runs fsx and winfstest on the Windows lane with no root and no adapter.
+  #[test]
+  fn windows_runs_fsx_and_winfstest() {
+    for suite in [Suite::Fsx, Suite::Winfstest] {
+      assert!(
+        matches!(
+          availability(Transport::NativeWindowsWinfsp, suite),
+          Availability::Runnable {
+            on: HostOs::Windows,
+            root: RootNeed::None,
+            adapter: None,
+            ..
+          }
+        ),
+        "{suite:?}"
+      );
+    }
+  }
+
+  /// A-209: winfstest applies to no other transport, and pjdfstest and fsstress do not apply to Windows.
+  #[test]
+  fn winfstest_is_windows_only_and_the_posix_suites_are_not_windows() {
+    for suite in [Suite::Pjdfstest, Suite::Fsstress] {
+      assert!(matches!(
+        availability(Transport::NativeWindowsWinfsp, suite),
+        Availability::NotApplicable(_)
+      ));
+    }
+    for transport in Transport::ALL
+      .into_iter()
+      .filter(|t| *t != Transport::NativeWindowsWinfsp)
+    {
+      assert!(matches!(
+        availability(transport, Suite::Winfstest),
+        Availability::NotApplicable(_)
+      ));
+    }
   }
 
   /// The pressure and failure columns are owed on every transport.
