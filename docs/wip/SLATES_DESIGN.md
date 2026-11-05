@@ -5667,8 +5667,27 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > durable at its head with nothing owed the moment the last returns; five `FILE_SYNC` NFS writes each waited
 > (`fleet.live.resolved`), the log durable at each write's own position right after its reply (1, 2, 3, 4, 5), none
 > late. Red-checked: with the control-verb wait removed the last write returned at head 1, durable none, owed
-> (3 of 3); with the NFS wait removed the counter is zero and the race shows an undurable reply in 2 of 3. Not yet:
-> FUSE `fsync`; a candidate's copy does not survive its own daemon's restart; takeover does not read it.
+> (3 of 3); with the NFS wait removed the counter is zero and the race shows an undurable reply in 2 of 3.
+>
+> **Slice three (2026-11-05): takeover from the live log.** The whole-state kind (23) carries a successor's fetch beside
+> installs, by tag (`slates_db::live::Fetch`). A takeover that adopts a live-shipped volume's head runs phase one for
+> its log (`live_ship::fetch`): every candidate of the head's placement raises its fence to the head's placed epoch,
+> takes the successor as owner, and answers with its head and the sealed entries it keeps; the greatest head among at
+> least `f + 1` answers is adopted (`slates_db::live::adopt`). Whole entries carry the volume's lineage key wrapped for
+> each neighbour (the `sealing` a head carries), so the successor opens the log whether or not the volume ever sealed;
+> it replays the whole image and the deltas after it (`VolumeImage::apply`) and serves the volume as an archive of
+> that image and the content runs (`live_ship::archive_from_live`, the export's layout), through the same
+> `materialize_taken_over` a seal's takeover uses. A log that cannot be rebuilt whole is refused, counted
+> (`fleet.live.takeover_refused`), never silently replaced by an older seal. The successor keeps the volume
+> live-shipped (its catalog carries the flag) and ships under the head's epoch, above the dead owner's. Across three
+> real daemon processes (`a_live_volumes_acknowledged_writes_survive_its_owners_death`): five writes, each answered at
+> durability, no snapshot ever taken, the owner killed with SIGKILL; a survivor serves all five files byte for byte
+> after 2.27, 2.05, 1.85 and 1.83 s (4 of 4). Red-checked: with the live log not read, the successor serves the volume
+> empty (every file `NotFound`), the loss the log closes. Found on the way, owed: a volume whose owner dies before its
+> creation head is placed at `f + 1` (the record period, up to 100 ms) is unknown to any takeover, so its first live
+> write must wait for that placement too; the test waits for it before the kill. Also owed: FUSE `fsync`, a
+> candidate's copy across its own daemon's restart, hard links (an archive carries each name as its own file), and
+> extended attributes in the rebuilt volume.
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
 writer's ring to its local owner shard is the latency floor. When write-intent attachments from

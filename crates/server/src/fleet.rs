@@ -1383,12 +1383,12 @@ async fn serve_peer_records(
               crate::live_ship::serve_entry(s, local, peer_host, &request)
             })
             .unwrap_or_default(),
-            slates_cluster::live::LIVE_INSTALL_STREAM => state::with_state(|s| {
+            slates_cluster::live::LIVE_STATE_STREAM => state::with_state(|s| {
               let peer_host = s
                 .learned_members
                 .get(&peer_anchor)
                 .map_or(seed, |learned| learned.host);
-              crate::live_ship::serve_install(s, local, peer_host, &request)
+              crate::live_ship::serve_state(s, local, peer_host, &request)
             })
             .unwrap_or_default(),
             crate::mirror::MIRROR_RECORD_STREAM => state::with_state(|s| {
@@ -3613,6 +3613,28 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
     }
     None => return,
   };
+  // A live-shipped volume is served from its live log, which holds every acknowledged write (A-200): phase one over its
+  // candidates under the takeover's epoch, the greatest head adopted. A volume whose log was never shipped has none and
+  // is served from its placed seal as before.
+  let live = if catalog.live_shipped {
+    let mut candidates = placed.placement.candidates.clone();
+    let current =
+      state::with_state(|s| s.fleet.configuration().place(object).candidates).unwrap_or_default();
+    for host in current {
+      if !candidates.contains(&host) {
+        candidates.push(host);
+      }
+    }
+    match crate::live_ship::fetch(object, placed.epoch, candidates).await {
+      Ok(fetched) => fetched,
+      Err(waits) => {
+        count_refusal(waits);
+        return;
+      }
+    }
+  } else {
+    None
+  };
   let region = head.content_holders.clone();
   // The successor's own copy of the volume's lineage key (A-92 piece 4c), unwrapped here on the control shard, which
   // holds the pair keys, and handed to the owner shard wrapped under this node's root.
@@ -3645,6 +3667,17 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
         }
         adopted
       });
+      // The live log, when the volume has one: it is the volume as acknowledged, rebuilt here (A-200).
+      if let Some(fetched) = &live {
+        let rebuilt = crate::live_ship::archive_from_live(s, id, &catalog.owner, fetched)?;
+        past_the_pressure_hold(s, |s| {
+          verbs::materialize_taken_over(s, id, &taken, region, Some(&rebuilt))
+        })
+        .map_err(|refusal| materialize_refusal_counter(&refusal))?;
+        s.placed_heads.insert(object, placed);
+        s.placed_heads.insert(object.catalog(), catalog_placed);
+        return Ok(());
+      }
       // Open a content archive (a sealed one needs the lineage key); a contentless volume has none to open.
       let opened = match archive {
         Some(archive) => match opened_archive(s, id, &catalog.owner, adopted, archive) {

@@ -27,9 +27,10 @@ use crate::{CommitBudget, DispatchWait, Reply, Stragglers, reply_channel, reques
 /// Format: a request kind (the low bits of each exchange's stream id), distinct from every other kind of the fleet
 /// plane (`RECORD_STREAM` 1 … the mirror's 21); records' class, `Control`.
 pub const LIVE_ENTRY_STREAM: u64 = 22;
-/// The request kind an install rides.
-/// Format: as [`LIVE_ENTRY_STREAM`]; an install is a whole state, so it rides the `Bulk` class.
-pub const LIVE_INSTALL_STREAM: u64 = 23;
+/// The request kind a whole-state message rides: an owner's install, or a successor's takeover fetch (A-200), told
+/// apart by their tag (`slates_db::live::is_fetch`), never by guessing at the bytes.
+/// Format: as [`LIVE_ENTRY_STREAM`]; a whole state is large, so it rides the `Bulk` class.
+pub const LIVE_STATE_STREAM: u64 = 23;
 
 /// What one dispatch left: the sessions that answered, for the next write, and those still in flight.
 pub struct Shipped {
@@ -41,7 +42,7 @@ pub struct Shipped {
   pub timed_out: bool,
 }
 
-/// Sends `message` (an encoded entry on [`LIVE_ENTRY_STREAM`], or an install on [`LIVE_INSTALL_STREAM`]) to each holder
+/// Sends `message` (an encoded entry on [`LIVE_ENTRY_STREAM`], or an install on [`LIVE_STATE_STREAM`]) to each holder
 /// over its session, always, and folds the replies into `shipper` until position `until` is durable (a write waits for
 /// its durability alone, A-200), or with `until` `None` until every holder has answered (a catch-up, whose position is
 /// usually durable already), or until the budget runs out. Returns the sessions.
@@ -98,7 +99,7 @@ pub async fn exchange(
       timed_out: false,
     };
   }
-  let priority = if stream == LIVE_INSTALL_STREAM {
+  let priority = if stream == LIVE_STATE_STREAM {
     Priority::Bulk
   } else {
     Priority::Control

@@ -690,3 +690,53 @@ fn hostile_replies_are_refused() {
     assert_eq!(decode_reply(&reply), Err(LiveError::Malformed));
   }
 }
+
+/// Hostile input on the whole-state kind: a fetch round-trips; every truncation of it, an install tag where a fetch is
+/// read, and a fetch with bytes after it are refused, never a panic.
+#[test]
+fn hostile_fetches_are_refused() {
+  use slates_db::live::{Fetch, is_fetch, object_of_state};
+  let fetch = Fetch {
+    object: OBJECT,
+    epoch: HostEpoch(3),
+  };
+  let bytes = fetch.encode();
+  assert!(is_fetch(&bytes));
+  assert_eq!(object_of_state(&bytes), Some(OBJECT));
+  assert_eq!(Fetch::decode(&bytes), Ok(fetch));
+  for length in 0..bytes.len() {
+    assert_eq!(Fetch::decode(&bytes[..length]), Err(LiveError::Malformed));
+  }
+  let mut longer = bytes.clone();
+  longer.push(0);
+  assert_eq!(Fetch::decode(&longer), Err(LiveError::Malformed));
+  let mut install_tag = bytes.clone();
+  install_tag[0] = 1;
+  assert_eq!(Fetch::decode(&install_tag), Err(LiveError::Malformed));
+}
+
+/// Hostile input on a fetched reply: it round-trips; a payload over the cap is refused, and no cut of it decodes whole.
+#[test]
+fn hostile_fetched_replies_are_refused() {
+  use slates_db::live::{decode_fetched, encode_fetched};
+  let head = Head {
+    epoch: HostEpoch(2),
+    position: 7,
+    identity: [4; 32],
+  };
+  let payloads = vec![vec![1, 2, 3], vec![9; 40]];
+  let reply = encode_fetched(&Ok(Some(head)), &payloads);
+  assert_eq!(
+    decode_fetched(&reply, CAP),
+    Ok((Some(head), payloads.clone()))
+  );
+  assert_eq!(decode_fetched(&reply, 8), Err(LiveError::Malformed));
+  for length in 0..reply.len() {
+    if let Ok((_, decoded)) = decode_fetched(&reply[..length], CAP) {
+      assert!(
+        decoded.len() < payloads.len(),
+        "a cut reply never decodes whole"
+      );
+    }
+  }
+}

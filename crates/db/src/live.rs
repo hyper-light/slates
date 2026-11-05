@@ -52,6 +52,10 @@ const ENTRY_PREFIX_BYTES: usize =
 /// state's length (u32 LE); the state follows.
 const INSTALL_PREFIX_BYTES: usize =
   2 * size_of::<u64>() + OBJECT_BYTES + HEAD_BYTES + size_of::<u32>();
+/// Format: a whole-state message's first byte: an install (owner to holder).
+const TAG_INSTALL: u8 = 1;
+/// Format: a whole-state message's first byte: a takeover's fetch (successor to holder).
+const TAG_FETCH: u8 = 2;
 /// Format: a reply's first byte: a head held, a holder with nothing, or a fence refusal.
 const REPLY_HEAD: u8 = 1;
 /// Format: see [`REPLY_HEAD`].
@@ -204,9 +208,14 @@ pub struct Install {
 }
 
 impl Install {
-  /// The canonical bytes.
+  /// The canonical bytes: its tag (it rides the whole-state kind with [`Fetch`]), then its fields.
   pub fn encode(&self) -> Vec<u8> {
-    let mut out = Vec::with_capacity(INSTALL_PREFIX_BYTES.saturating_add(self.state.len()));
+    let mut out = Vec::with_capacity(
+      INSTALL_PREFIX_BYTES
+        .saturating_add(self.state.len())
+        .saturating_add(1),
+    );
+    out.push(TAG_INSTALL);
     out.extend_from_slice(&self.owner.0.to_le_bytes());
     out.extend_from_slice(&self.object.0);
     out.extend_from_slice(&self.epoch.0.to_le_bytes());
@@ -220,6 +229,9 @@ impl Install {
   /// Parses bytes that crossed the network, refusing a state longer than `state_cap` before allocating it.
   pub fn decode(bytes: &[u8], state_cap: usize) -> Result<Install, LiveError> {
     let mut reader = Reader { bytes };
+    if reader.byte()? != TAG_INSTALL {
+      return Err(LiveError::Malformed);
+    }
     let owner = HostId(reader.word()?);
     let object = reader.object()?;
     let epoch = HostEpoch(reader.word()?);
@@ -241,6 +253,92 @@ pub fn object_of(bytes: &[u8]) -> Option<ObjectId> {
   let mut reader = Reader { bytes };
   reader.word().ok()?;
   reader.object().ok()
+}
+
+/// The object a whole-state message (an [`Install`] or a [`Fetch`]) names, read without decoding the rest. `None` for
+/// bytes too short or of another tag.
+pub fn object_of_state(bytes: &[u8]) -> Option<ObjectId> {
+  let mut reader = Reader { bytes };
+  match reader.byte().ok()? {
+    TAG_INSTALL => {
+      reader.word().ok()?;
+      reader.object().ok()
+    }
+    TAG_FETCH => reader.object().ok(),
+    _ => None,
+  }
+}
+
+/// Whether a whole-state message is a [`Fetch`] (otherwise an [`Install`], or malformed).
+pub fn is_fetch(bytes: &[u8]) -> bool {
+  bytes.first() == Some(&TAG_FETCH)
+}
+
+/// A takeover's phase one for a live volume (A-200): the successor asks a holder to raise its fence to `epoch` and send
+/// its head and what it keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fetch {
+  /// The volume.
+  pub object: ObjectId,
+  /// The epoch the successor ships under.
+  pub epoch: HostEpoch,
+}
+
+impl Fetch {
+  /// The canonical bytes: its tag, the object, the epoch.
+  pub fn encode(&self) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(TAG_FETCH);
+    out.extend_from_slice(&self.object.0);
+    out.extend_from_slice(&self.epoch.0.to_le_bytes());
+    out
+  }
+
+  /// Parses bytes that crossed the network.
+  pub fn decode(bytes: &[u8]) -> Result<Fetch, LiveError> {
+    let mut reader = Reader { bytes };
+    if reader.byte()? != TAG_FETCH {
+      return Err(LiveError::Malformed);
+    }
+    let fetch = Fetch {
+      object: reader.object()?,
+      epoch: HostEpoch(reader.word()?),
+    };
+    if reader.bytes.is_empty() {
+      Ok(fetch)
+    } else {
+      Err(LiveError::Malformed)
+    }
+  }
+}
+
+/// A holder's answer to a [`Fetch`]: its reply (the head, or the fence refusing a stale successor) and the payloads it
+/// keeps, in order, each `u32`-length-prefixed.
+pub fn encode_fetched(reply: &Result<Option<Head>, LiveError>, payloads: &[Vec<u8>]) -> Vec<u8> {
+  let head = encode_reply(reply);
+  let mut out = Vec::new();
+  out.extend_from_slice(&u32::try_from(head.len()).unwrap_or(u32::MAX).to_le_bytes());
+  out.extend_from_slice(&head);
+  for payload in payloads {
+    out.extend_from_slice(
+      &u32::try_from(payload.len())
+        .unwrap_or(u32::MAX)
+        .to_le_bytes(),
+    );
+    out.extend_from_slice(payload);
+  }
+  out
+}
+
+/// Parses a holder's answer to a [`Fetch`], refusing any payload over `cap` before it is copied.
+pub fn decode_fetched(bytes: &[u8], cap: usize) -> Result<(Option<Head>, Vec<Vec<u8>>), LiveError> {
+  let mut reader = Reader { bytes };
+  let head = decode_reply(&reader.prefixed(cap)?)?;
+  let mut payloads = Vec::new();
+  while !reader.bytes.is_empty() {
+    payloads.push(reader.prefixed(cap)?);
+  }
+  Ok((head, payloads))
 }
 
 /// A holder's answer to an entry or an install: the head it holds after it (`Ok(None)`: nothing), or a refusal.
@@ -322,6 +420,17 @@ impl<'a> Reader<'a> {
         .try_into()
         .map_err(|_| LiveError::Malformed)?,
     ))
+  }
+
+  /// A u32-length-prefixed body, refused over `cap` before it is copied; more may follow.
+  fn prefixed(&mut self, cap: usize) -> Result<Vec<u8>, LiveError> {
+    let length = self.take(size_of::<u32>())?;
+    let length = u32::from_le_bytes(length.try_into().map_err(|_| LiveError::Malformed)?);
+    let length = usize::try_from(length).map_err(|_| LiveError::Malformed)?;
+    if length > cap {
+      return Err(LiveError::Malformed);
+    }
+    Ok(self.take(length)?.to_vec())
   }
 
   /// A u32-length-prefixed body that must be the rest of the bytes, refused over `cap` before it is copied.

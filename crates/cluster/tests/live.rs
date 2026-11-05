@@ -11,7 +11,7 @@ use rustix::net::{Ipv4Addr, SocketAddrV4};
 use rustls::pki_types::PrivateKeyDer;
 use slates_cluster::CommitBudget;
 use slates_cluster::live::{
-  LIVE_ENTRY_STREAM, LIVE_INSTALL_STREAM, fold_late, serve_entry, serve_install, ship,
+  LIVE_ENTRY_STREAM, LIVE_STATE_STREAM, fold_late, serve_entry, serve_install, ship,
 };
 use slates_db::live::{Next, Replica, Shipper};
 use slates_db::register::{HostEpoch, HostId, ObjectId, Quorum};
@@ -101,7 +101,7 @@ async fn holder(
             state.extend_from_slice(&entry.payload);
             true
           })
-        } else if kind == LIVE_INSTALL_STREAM {
+        } else if kind == LIVE_STATE_STREAM {
           serve_install(&mut replica, &request, CAP, |install| {
             state.clone_from(&install.state);
             true
@@ -280,7 +280,7 @@ fn a_holder_that_joins_late_is_installed_and_then_follows() {
               Next::Install => {
                 installs += 1;
                 (
-                  LIVE_INSTALL_STREAM,
+                  LIVE_STATE_STREAM,
                   shipper.install(written.clone()).unwrap().encode(),
                 )
               }

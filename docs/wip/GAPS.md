@@ -386,6 +386,8 @@
 > **Replication latency (raft, 2026-11-04): a commit returns at its quorum; live shipping's log built, its wiring owed.** Every quorum
 
 > **Replication latency (raft, 2026-11-04): a commit returns at its quorum; live shipping's log built and on the transport, its daemon wiring owed.** Every quorum
+
+> **Replication latency (raft, 2026-11-04): a commit returns at its quorum; live shipping in the daemon: writes durable on a candidate before their reply, takeover serves them.** Every quorum
 > collector in `slates-cluster` slept its whole poll after its quorum had answered, so a cross-node record commit cost
 > the daemon's 10 ms poll (10,125–10,194 µs at the median) over a 12 µs loopback round trip. Each reply now wakes its
 > collector: 18.9–19.9 µs at the median, p99 28.8–32.9 µs, worst 44.7 µs at the daemon's poll
@@ -404,10 +406,14 @@
 > (`crates/server/tests/live_ship.rs`). The daemon ships (2026-11-05, §4.10 status "slice one"): across three real
 > daemon processes a live volume's writes reach both candidates and become durable (`crates/cli/tests/live_fleet.rs`,
 > 4 of 4). Barriers wait (§4.10 status "slice two"): a recorded verb and a stable NFS write or `COMMIT` on a live
-> volume are answered only once a candidate holds them, red-checked across real processes. Open, toward a filesystem
+> volume are answered only once a candidate holds them, red-checked across real processes. Takeover reads the live
+> log (§4.10 status "slice three"): a never-sealed live volume's five acknowledged writes survive its owner's SIGKILL,
+> served whole by a survivor in 1.8–2.3 s (4 of 4), empty without the log. Open: a volume whose owner dies before its
+> creation head is placed (up to one 100 ms record period) is unknown to any takeover, so the first live write owes a
+> wait for that placement; hard links and extended attributes in the rebuilt volume. Open, toward a filesystem
 > server replicated per write in under 1 ms: FUSE `fsync` answered at durability (AC-8.3's "live-shipped volumes
-> report none", AC-8.9's credit backpressure); a candidate's copy kept across its own restart; phase one in the takeover
-> round; real-process chaos. `put_wal` and the
+> report none", AC-8.9's credit backpressure); a candidate's copy kept across its own restart; real-process chaos
+> (partitions, injected latency, volume failure, client disconnect). `put_wal` and the
 > loss-window report are unbuilt; a head still waits up to the 100 ms record period before its commit starts.
 
 > **VFS plan step 14, Shards' WHP window's three edge cases (2026-11-05): done, patches with the owner's folder.** Six
