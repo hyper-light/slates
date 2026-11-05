@@ -44,8 +44,12 @@
 >   which `eprintln!` turns into a panic, and `panic = "abort"` makes that an abort. The smoke test's own first
 >   version stopped reading the anchor's stderr after the serving line, and 8 of 10 runs aborted. Owed, in
 >   `crates/cli`: a failing test, then diagnostics that survive a closed stderr.
-> - **Not yet:** reproducibility from the tag (AC-9.5: nothing builds twice and compares); the macOS `Slates.app`
->   bundle, code signing and notarization (B.7; they need an Apple Developer identity); `cargo-binstall` metadata.
+> - **Reproducible from the tag (2026-11-05, AC-9.5).** Every target is built twice on separate runners, and the
+>   release is refused unless the two copies are the same bytes. The four Linux binaries already were. The Windows
+>   ones differed in 20 bytes, the linker's timestamps and PDB GUID (run 42046848954), until `/Brepro`; with it, all six
+>   pairs match (run 42049001999). The numbers are in A-210.
+> - **Not yet:** the macOS `Slates.app` bundle, code signing and notarization (B.7; they need an Apple Developer
+>   identity); `cargo-binstall` metadata.
 
 > **WinFsp's hold release, DLL version and long paths fixed (2026-11-04, A-206; audit steps 4 and 6).** Run
 > [41978665514](https://github.com/hyper-light/slates/actions/runs/41978665514), `windows-latest` and `windows-11-arm`,

@@ -105,6 +105,10 @@ jobs:
           - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
     steps:
       - uses: actions/checkout@v4
+      # The build is native inside Alpine, so the linker is its own cc. napi names `aarch64-linux-musl-gcc` for the
+      # arm64 musl target as if cross-building, which Alpine has not ("linker not found": dry run 42048576607); the
+      # environment outranks it (Appendix B.2, the LINKER=cc override). Nothing inside the single-quoted script below
+      # may contain a single quote: a comment there ended it (dry run 42054307287, "syntax error near `)`").
       - name: Build the .node in node:24-alpine (native musl)
         run: |
           docker run --rm -v "$PWD:/w" -w /w node:24-alpine sh -c '
@@ -114,9 +118,6 @@ jobs:
               | sh -s -- -y --default-toolchain 1.98.1 --profile minimal
             . "$HOME/.cargo/env"
             rustup target add ${{ matrix.target }}
-            # Native inside Alpine, so the linker is its own cc. napi names `aarch64-linux-musl-gcc` for the arm64 musl
-            # target as if cross-building, which Alpine has not ("linker `aarch64-linux-musl-gcc` not found": dry run
-            # 42048576607); the environment outranks it (Appendix B.2's LINKER=cc override).
             export "CARGO_TARGET_$(echo ${{ matrix.target }} | tr a-z- A-Z_)_LINKER=cc"
             npm install -g @napi-rs/cli@${{ env.NAPI_CLI_VERSION }}
             cd crates/sdk-node

@@ -8655,7 +8655,8 @@ Evidence: `research/survey-vorpal.md` §0–§9.
 > `slates-provenance.json` and a Sigstore attestation bundle to a **draft** release. Publishing the draft is the
 > maintainer's one approved step (`docs/publish.md`, "The binary release"). The proof by use on a test tag is recorded
 > in A-210: test tag `v0.1.0-test.1`, run 41983664060, a draft with all seven binaries whose checksums and attestation
-> verify. Reproducibility from the tag (AC-9.5's first clause) is not yet shown: no lane builds twice and compares.
+> verify. Since 2026-11-05 every target is built twice on separate runners, and the release is refused unless the two
+> copies are the same bytes (AC-9.5; A-210 records the measurements).
 
 | target | runner | asset name |
 |---|---|---|
@@ -12974,7 +12975,17 @@ Applied in the same change to: Appendix B.2 (body and status), Phase 9 task 5's 
     for AWS-LC, as the binary release does.
   - The binary check (npm) and `twine check --strict` (PyPI) moved out of the tag-only publish jobs, so a
     `workflow_dispatch` dry run proves them and publishes nothing.
-- **Not yet.** Reproducibility from the tag (AC-9.5): no lane builds twice and compares. The macOS `Slates.app` bundle
+- **Reproducible from the tag (AC-9.5, 2026-11-05).** The lane builds every target twice, each copy on a runner of its
+  own (`copy: build` and `copy: rebuild`). The artifacts task refuses a release whose two copies differ, naming the
+  count of differing bytes and their first offsets (`a_target_whose_rebuild_differs_is_not_reproducible`). Measured:
+  - Run 42046848954 built each Linux and Windows target twice exactly as the lane did. All four Linux binaries, glibc
+    and musl, were byte for byte the same. Both Windows binaries differed in 20 bytes, every one a field MSVC's linker
+    takes from the clock: the PE header's timestamp, the three debug-directory timestamps and the 16-byte PDB GUID.
+  - With `-C link-arg=/Brepro` (run 42049001999) all six pairs are the same. The four Linux digests also equal the
+    previous run's, so one source gave one binary on four separate runners (for example `slates-linux-arm64`
+    `f8fb335c…61eb7f`, `slates-windows-x64.exe` `3a48be20…44740d`).
+  - The test tag that runs both copies of all seven targets, macOS included, is recorded below.
+- **Not yet.** Code signing and notarization (B.7; they need Ada's Apple Developer identity). The macOS `Slates.app` bundle
   (B.7), code signing and notarization (they need Ada's Apple Developer identity). `cargo-binstall` metadata.
 
 ### A-206 — A WinFsp file system is deleted only after the anchor releases its hold, the DLL's version is checked, and slates refuses no path the driver passes (accepted 2026-11-04, audit plan 01a1a34bf7e973069e94f773afdea44a, steps 4 and 6)

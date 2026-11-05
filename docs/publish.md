@@ -73,6 +73,10 @@ installing it would do:
 6. The volume is destroyed.
 7. When the anchor is stopped, the daemon leaves with it.
 
+Every target is built twice, each copy on a runner of its own, and the release is refused unless the two copies are
+the same bytes (AC-9.5). The Windows binaries are linked with `/Brepro`, so MSVC's linker takes its timestamps and
+PDB GUID from the content, not the clock.
+
 The smoke test records the binary's SHA-256 and BLAKE3, its `rustc -vV`, the runner image and
 each step's time. Two more checks run on some targets. The musl binaries must pass a staticness
 gate (`ldd`). The Windows x86_64 binary must start in a process-isolated
