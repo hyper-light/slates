@@ -1,0 +1,835 @@
+# old 3ea600afbcba627d8e8f2c6ab745d9482f044fa0, new f14bc79a2fbca46700632e26021864f68f1fd292, 2026-11-05T07:36:49Z
+image win11-vs2026-arm64 20261101.203.1; 4 CPUs; ARM64
+Microsoft Windows [Version 10.0.26200.9725]
+#### pass quiet
+## run 1 of 1, 2026-11-05T07:36:50Z
+# dll started first: dll=S: receiver=T:
+# host: windows 0x23f00206 on windows processor architecture 12 level 3401 revision 0 (aarch64), 4 logical CPUs (4 available to this process), 15 GiB, page 4096 B; largest L2 1048576 B, cache line 64 B
+# workload: 3 rounds of 1000 files of 4096 B per arm and pass, arms interleaved, first arm rotating
+# arm dll: S:/d
+# arm receiver: T:/d
+# warm-up: one untimed round per arm (1000 files each)
+# pass quiet: spinners 0 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 24.8 µs, p99 41.4 µs, p999 598.1 µs, max 1661.4 µs over 8631 probes; 45.6 s
+fsbench	quiet	dll	create	3000	213000	328300	994200	1010600
+fsbench	quiet	dll	write	3000	99200	240800	896900	3976100
+fsbench	quiet	dll	fsync	3000	117200	172200	388100	8917900
+fsbench	quiet	dll	close	3000	4264700	6061000	6832900	8171500
+fsbench	quiet	dll	stat	3000	127800	207200	334200	637600
+fsbench	quiet	dll	open	3000	1035200	5499500	6322000	13768400
+fsbench	quiet	dll	read	3000	38500	71500	156800	182600
+fsbench	quiet	dll	rename	3000	426500	805700	5491100	14818100
+fsbench	quiet	dll	unlink	3000	266600	448800	597700	1351200
+fsbench	quiet	receiver	create	3000	250000	366500	1012500	6586700
+fsbench	quiet	receiver	write	3000	112200	249600	753400	2296700
+fsbench	quiet	receiver	fsync	3000	144700	199300	591700	3441900
+fsbench	quiet	receiver	close	3000	4340600	6293300	10834300	17586600
+fsbench	quiet	receiver	stat	3000	199700	289900	636600	18663900
+fsbench	quiet	receiver	open	3000	4002600	5610200	8377400	11673400
+fsbench	quiet	receiver	read	3000	46900	80600	149000	177200
+fsbench	quiet	receiver	rename	3000	606400	1350200	2306500	14294500
+fsbench	quiet	receiver	unlink	3000	334200	552600	1439400	3528500
+
+**quiet** (spinners 0 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 24.8 µs, p99 41.4 µs, p999 598.1 µs, max 1661.4 µs over 8631 probes; 45.6 s). Each cell: p50 · p99 · p999 · max, µs.
+
+| op | dll | receiver |
+|---|---|---|
+| create | 213.0 · 328.3 · 994.2 · 1010.6 | 250.0 · 366.5 · 1012.5 · 6586.7 |
+| write | 99.2 · 240.8 · 896.9 · 3976.1 | 112.2 · 249.6 · 753.4 · 2296.7 |
+| fsync | 117.2 · 172.2 · 388.1 · 8917.9 | 144.7 · 199.3 · 591.7 · 3441.9 |
+| close | 4264.7 · 6061.0 · 6832.9 · 8171.5 | 4340.6 · 6293.3 · 10834.3 · 17586.6 |
+| stat | 127.8 · 207.2 · 334.2 · 637.6 | 199.7 · 289.9 · 636.6 · 18663.9 |
+| open | 1035.2 · 5499.5 · 6322.0 · 13768.4 | 4002.6 · 5610.2 · 8377.4 · 11673.4 |
+| read | 38.5 · 71.5 · 156.8 · 182.6 | 46.9 · 80.6 · 149.0 · 177.2 |
+| rename | 426.5 · 805.7 · 5491.1 · 14818.1 | 606.4 · 1350.2 · 2306.5 · 14294.5 |
+| unlink | 266.6 · 448.8 · 597.7 · 1351.2 | 334.2 · 552.6 · 1439.4 · 3528.5 |
+
+unmounted: S:
+unmounted: T:
+# fsb-337-1-old's error output, 64 lines:
+slates anchor: instance fsb-337-1-old up; daemon pid 7632; 3 shards
+slates anchor: issuer surface: export SLATES_ANCHOR=slates-seg-fsb-337-1-old SLATES_ANCHOR_LEN=10969415680 SLATES_ANCHOR_CONTENT=slates-con-fsb-337-1-old SLATES_ANCHOR_CONTENT_LEN=24323555328
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: effective_capacity_bytes = 17169387520: min(memory.total, the OS/job/cgroup bound when one is set) (anchors ["memory.total", "memory.limit"])
+slates daemon: reserve_per_shard = 1907709724: memory capacity / shards / classes (anchors ["mem.capacity", "rt.shards", "mem.classes"])
+slates daemon: lock_capacity_bytes = 1413120: the OS's lock limit when a confirming lock succeeded, else 0 (anchors ["mem.lock_capacity", "mem.lock_confirmed"])
+slates daemon: table_bytes = 476927431: reserve_per_shard × TABLE_SHARE_PERMILLE / 1000 (anchors ["mem.lock_capacity", "GAPS §5 table share"])
+slates daemon: volumes_per_shard = 1568840: table_bytes / size_of::<VolumeRecord>() (anchors ["table_bytes"])
+slates daemon: slots_per_ring = 32: requests one client may hold in flight (Little's law: request rate × p99 service time), rounded up to a power of two (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: spin_ns = 1186: the expected (mean) cost of parking, the 2-competitive spin threshold (anchors ["wake.mean_ns"])
+slates daemon: log_bytes_per_partition = 476927431: table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve (anchors ["table_bytes", "page"])
+slates daemon: snapshot_bytes_per_partition = 953854862: twice the table bytes (the whole partition encoded, with growth headroom) (anchors ["table_bytes"])
+slates daemon: archive_slice_bytes = 858: blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000 (anchors ["hash.blake3_bytes_per_second", "rt.step_budget_ns"])
+slates daemon: memcpy_bytes_per_second = 33013018496: memcpy bytes per second at the largest measured copy size (at least one) (anchors ["memcpy"])
+slates daemon: copy_slice_bytes = 19576: memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000 (anchors ["memcpy", "rt.step_budget_ns"])
+slates daemon: codec = lz4 true, zstd levels [1, 3, 9, 19], byte worth 30 scaled ns: the profile's measured codec points, a byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors ["codecs", "memcpy.bytes_per_second"])
+slates daemon: seal_key_slots = 384: page.base / 32 × shards (one page of key slots per shard) (anchors ["page.base", "shards"])
+slates daemon: telemetry_spans_per_reply = 50: (bulk chunk bytes − encoded fixed report bytes) / encoded span record bytes (anchors ["ipc.bulk_chunk_bytes", "wire.TelemetryReport", "wire.SpanRecord"])
+slates daemon: max_inodes = 827999: metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.inode_unit_bytes"])
+slates daemon: max_dirs = 245333: metadata_class / (Slot<DirNode> + Slot<DirBlock>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.directory_unit_bytes"])
+slates daemon: max_chunks = 465749: reserve_per_shard / content_granule (one chunk per granule at least) (anchors ["reserve_per_shard", "page"])
+slates daemon: metadata_class_bytes = 1907709724: the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM (anchors ["reserve_per_shard", "MEMORY_CLASSES"])
+slates daemon: digest_cache_entries = 77624: max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>() (anchors ["store.max_inodes", "reserve_per_shard"])
+slates daemon: spin_shift = 20: ⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the probe's ±5 % at 95 % (anchors ["wake.sd_ns", "wake.mean_ns"])
+slates daemon: clients_per_shard = 1764: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes (anchors ["reserve_per_shard", "region_bytes"])
+slates daemon: direct_maps_per_shard = 465749: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"])
+slates daemon: landings_awaiting_per_shard = 5292: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 3533: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: idle_window_ns = 118600: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: guest_listing_entries = 0: none: a Windows guest's stream ends with its daemon, so no number it holds outlives a restart (anchors [])
+slates daemon: inode_reserve = 18876: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 1754: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 238463715: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 2483997: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 2483997: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates-server: shard 2 initialized in 1981 µs
+slates daemon: instance fsb-337-1-old serving on 3 shards under the anchor
+slates-server: shard 0 initialized in 2563 µs
+slates-server: shard 1 initialized in 3151 µs
+winfsp-phase	Cleanup	1	8001	p50 34000	p99 863700	mean 65600
+winfsp-phase	Cleanup	2	8001	p50 2900	p99 9900	mean 2899
+winfsp-phase	Create	1	4001	p50 31500	p99 59900	mean 32975
+winfsp-phase	Create	2	4001	p50 9500	p99 33600	mean 10550
+winfsp-phase	Flush	1	4000	p50 17200	p99 43500	mean 18468
+winfsp-phase	Flush	2	4000	p50 100	p99 200	mean 139
+winfsp-phase	Info	1	8001	p50 4100	p99 21500	mean 4959
+winfsp-phase	Info	2	8001	p50 200	p99 300	mean 168
+winfsp-phase	Open	1	20005	p50 8800	p99 28900	mean 10523
+winfsp-phase	Open	2	20005	p50 1900	p99 5800	mean 2097
+winfsp-phase	Read	1	3062	p50 45700	p99 69400	mean 46975
+winfsp-phase	Read	2	3062	p50 4100	p99 8800	mean 4148
+winfsp-phase	Release	1	24006	p50 5900	p99 129500	mean 19434
+winfsp-phase	Release	2	24006	p50 700	p99 5100	mean 1181
+winfsp-phase	Rename	1	4000	p50 35000	p99 54400	mean 36621
+winfsp-phase	Rename	2	4000	p50 11100	p99 20700	mean 11720
+winfsp-phase	Resolve	1	32014	p50 6200	p99 52200	mean 13807
+winfsp-phase	Resolve	2	32014	p50 1400	p99 4400	mean 1708
+winfsp-phase	SetSize	1	4000	p50 33000	p99 151600	mean 39433
+winfsp-phase	SetSize	2	4000	p50 1700	p99 2900	mean 1774
+winfsp-phase	Write	1	4000	p50 23000	p99 52000	mean 24766
+winfsp-phase	Write	2	4000	p50 5400	p99 16400	mean 6412
+winfsp-phase	other	1	4004	p50 4800	p99 17900	mean 5333
+winfsp-phase	other	2	4004	p50 1100	p99 1700	mean 1125
+# fsb-337-1-new's error output, 721 lines:
+slates anchor: instance fsb-337-1-new up; daemon pid 7524; 3 shards
+slates anchor: issuer surface: export SLATES_ANCHOR=slates-seg-fsb-337-1-new SLATES_ANCHOR_LEN=10969415680 SLATES_ANCHOR_CONTENT=slates-con-fsb-337-1-new SLATES_ANCHOR_CONTENT_LEN=24323555328
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: effective_capacity_bytes = 17169387520: min(memory.total, the OS/job/cgroup bound when one is set) (anchors ["memory.total", "memory.limit"])
+slates daemon: reserve_per_shard = 1907709724: memory capacity / shards / classes (anchors ["mem.capacity", "rt.shards", "mem.classes"])
+slates daemon: lock_capacity_bytes = 1413120: the OS's lock limit when a confirming lock succeeded, else 0 (anchors ["mem.lock_capacity", "mem.lock_confirmed"])
+slates daemon: table_bytes = 476927431: reserve_per_shard × TABLE_SHARE_PERMILLE / 1000 (anchors ["mem.lock_capacity", "GAPS §5 table share"])
+slates daemon: volumes_per_shard = 1568840: table_bytes / size_of::<VolumeRecord>() (anchors ["table_bytes"])
+slates daemon: slots_per_ring = 32: requests one client may hold in flight (Little's law: request rate × p99 service time), rounded up to a power of two (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: spin_ns = 1044: the expected (mean) cost of parking, the 2-competitive spin threshold (anchors ["wake.mean_ns"])
+slates daemon: log_bytes_per_partition = 476927431: table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve (anchors ["table_bytes", "page"])
+slates daemon: snapshot_bytes_per_partition = 953854862: twice the table bytes (the whole partition encoded, with growth headroom) (anchors ["table_bytes"])
+slates daemon: archive_slice_bytes = 753: blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000 (anchors ["hash.blake3_bytes_per_second", "rt.step_budget_ns"])
+slates daemon: memcpy_bytes_per_second = 28797143837: memcpy bytes per second at the largest measured copy size (at least one) (anchors ["memcpy"])
+slates daemon: copy_slice_bytes = 15032: memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000 (anchors ["memcpy", "rt.step_budget_ns"])
+slates daemon: codec = lz4 true, zstd levels [1, 3, 9, 19], byte worth 34 scaled ns: the profile's measured codec points, a byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors ["codecs", "memcpy.bytes_per_second"])
+slates daemon: seal_key_slots = 384: page.base / 32 × shards (one page of key slots per shard) (anchors ["page.base", "shards"])
+slates daemon: telemetry_spans_per_reply = 50: (bulk chunk bytes − encoded fixed report bytes) / encoded span record bytes (anchors ["ipc.bulk_chunk_bytes", "wire.TelemetryReport", "wire.SpanRecord"])
+slates daemon: max_inodes = 827999: metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.inode_unit_bytes"])
+slates daemon: max_dirs = 245333: metadata_class / (Slot<DirNode> + Slot<DirBlock>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.directory_unit_bytes"])
+slates daemon: max_chunks = 465749: reserve_per_shard / content_granule (one chunk per granule at least) (anchors ["reserve_per_shard", "page"])
+slates daemon: metadata_class_bytes = 1907709724: the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM (anchors ["reserve_per_shard", "MEMORY_CLASSES"])
+slates daemon: digest_cache_entries = 77624: max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>() (anchors ["store.max_inodes", "reserve_per_shard"])
+slates daemon: spin_shift = 19: ⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the probe's ±5 % at 95 % (anchors ["wake.sd_ns", "wake.mean_ns"])
+slates daemon: clients_per_shard = 1764: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes (anchors ["reserve_per_shard", "region_bytes"])
+slates daemon: direct_maps_per_shard = 465749: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"])
+slates daemon: landings_awaiting_per_shard = 5292: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 3533: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: idle_window_ns = 104400: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: guest_listing_entries = 0: none: a Windows guest's stream ends with its daemon, so no number it holds outlives a restart (anchors [])
+slates daemon: inode_reserve = 18876: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 1754: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 238463715: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 2483997: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 2483997: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates-server: shard 2 initialized in 1627 µs
+slates daemon: instance fsb-337-1-new serving on 3 shards under the anchor
+slates-server: shard 1 initialized in 2276 µs
+slates-server: shard 0 initialized in 1299 µs
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+slates-winfsp: close refused with NTSTATUS 0xc0000001
+winfsp-phase	Cleanup	1	8001	p50 28700	p99 877800	mean 88181
+winfsp-phase	Cleanup	2	8001	p50 2900	p99 7600	mean 2713
+winfsp-phase	Confirm	1	24005	p50 3900	p99 55800	mean 5677
+winfsp-phase	Confirm	2	24005	p50 100	p99 400	mean 166
+winfsp-phase	Create	1	4001	p50 35000	p99 66700	mean 37246
+winfsp-phase	Create	2	4001	p50 14400	p99 41700	mean 16210
+winfsp-phase	Flush	1	4000	p50 18400	p99 48000	mean 19228
+winfsp-phase	Flush	2	4000	p50 300	p99 600	mean 351
+winfsp-phase	Info	1	4001	p50 5300	p99 19400	mean 6568
+winfsp-phase	Info	2	4001	p50 200	p99 400	mean 246
+winfsp-phase	Open	1	20004	p50 18300	p99 44200	mean 20126
+winfsp-phase	Open	2	20004	p50 3400	p99 16300	mean 3993
+winfsp-phase	Read	1	4000	p50 35900	p99 56400	mean 36892
+winfsp-phase	Read	2	4000	p50 4500	p99 15200	mean 4897
+winfsp-phase	Release	1	24005	p50 14100	p99 639100	mean 37587
+winfsp-phase	Release	2	23406	p50 1200	p99 5700	mean 1843
+winfsp-phase	Rename	1	4000	p50 28000	p99 45400	mean 29666
+winfsp-phase	Rename	2	4000	p50 9600	p99 14400	mean 10405
+winfsp-phase	RenameName	1	10132	p50 13000	p99 24800	mean 11093
+winfsp-phase	RenameName	2	10132	p50 2500	p99 5900	mean 2473
+winfsp-phase	Resolve	1	32013	p50 7900	p99 48700	mean 15512
+winfsp-phase	Resolve	2	32013	p50 1400	p99 4400	mean 1831
+winfsp-phase	SetSize	1	4000	p50 24200	p99 138200	mean 33043
+winfsp-phase	SetSize	2	4000	p50 1700	p99 3100	mean 1851
+winfsp-phase	Write	1	4000	p50 23900	p99 48600	mean 26437
+winfsp-phase	Write	2	4000	p50 5600	p99 13100	mean 6591
+winfsp-phase	batch_frames	0	92024	p50 45300	p99 4794700	mean 627244
+winfsp-phase	batch_frames	1	3	p50 599000	p99 3364800	mean 1338333
+winfsp-phase	batch_frames	2	1	p50 309500	p99 309500	mean 309500
+winfsp-phase	batch_frames	3	1	p50 37600	p99 37600	mean 37600
+winfsp-phase	batch_frames	4	4	p50 3876800	p99 4618000	mean 2152650
+winfsp-phase	batch_frames	5	1	p50 2696900	p99 2696900	mean 2696900
+winfsp-phase	batch_frames	6	2	p50 3962800	p99 3962800	mean 2027800
+winfsp-phase	batch_frames	7	2	p50 346852900	p99 346852900	mean 173461200
+winfsp-phase	batch_frames	8	1	p50 72200	p99 72200	mean 72200
+winfsp-phase	batch_frames	9	1	p50 77200	p99 77200	mean 77200
+winfsp-phase	batch_frames	10	1	p50 82900	p99 82900	mean 82900
+winfsp-phase	batch_frames	11	7	p50 143700	p99 7798900	mean 2342157
+winfsp-phase	begin_clear	0	92049	p50 100	p99 300	mean 95
+winfsp-phase	callback	1	24013	p50 41100	p99 118500	mean 51632
+winfsp-phase	callback	3	24005	p50 200	p99 819900	mean 30058
+winfsp-phase	callback	4	24005	p50 15100	p99 640200	mean 38462
+winfsp-phase	callback	5	4000	p50 37100	p99 58300	mean 38116
+winfsp-phase	callback	6	4000	p50 25900	p99 51000	mean 28560
+winfsp-phase	callback	8	12001	p50 25900	p99 127800	mean 27640
+winfsp-phase	callback	11	4000	p50 19200	p99 49200	mean 20039
+winfsp-phase	callback	12	4003	p50 6300	p99 19200	mean 8085
+winfsp-phase	confirm	0	24005	p50 4300	p99 57000	mean 6020
+winfsp-phase	dioc_recv_done	0	92049	p50 43700	p99 4799700	mean 640863
+winfsp-phase	dioc_resp_done	0	100028	p50 11500	p99 28200	mean 11757
+winfsp-phase	other	1	4003	p50 5800	p99 18300	mean 7428
+winfsp-phase	other	2	4003	p50 1200	p99 1900	mean 1216
+winfsp-phase	packet_clear	0	100027	p50 600	p99 800	mean 531
+winfsp-phase	parse	0	92048	p50 1200	p99 3800	mean 1361
+winfsp-phase	settle_batch	0	1017	p50 200	p99 1700	mean 326
+winfsp-phase	settle_batch	1	89996	p50 40000	p99 609900	mean 56827
+winfsp-phase	settle_batch	2	1006	p50 54400	p99 714500	mean 121145
+winfsp-phase	settle_batch	11	1	p50 415800	p99 415800	mean 415800
+winfsp-phase	settle_batch	35	1	p50 2102600	p99 2102600	mean 2102600
+winfsp-phase	settle_batch	36	1	p50 3218700	p99 3218700	mean 3218700
+winfsp-phase	settle_batch	39	1	p50 786300	p99 786300	mean 786300
+winfsp-phase	settle_batch	42	1	p50 695500	p99 695500	mean 695500
+winfsp-phase	settle_batch	54	1	p50 4025400	p99 4025400	mean 4025400
+winfsp-phase	settle_batch	56	1	p50 4130700	p99 4130700	mean 4130700
+winfsp-phase	settle_batch	85	1	p50 1482700	p99 1482700	mean 1482700
+winfsp-phase	settle_batch	126	1	p50 3625400	p99 3625400	mean 3625400
+winfsp-phase	settle_batch	154	1	p50 2553500	p99 2553500	mean 2553500
+winfsp-phase	settle_batch	214	1	p50 2810700	p99 2810700	mean 2810700
+winfsp-phase	settle_batch	226	1	p50 2238700	p99 2238700	mean 2238700
+winfsp-phase	settle_batch	229	1	p50 5500600	p99 5500600	mean 5500600
+winfsp-phase	settle_batch	232	1	p50 4768200	p99 4768200	mean 4768200
+winfsp-phase	settle_batch	249	1	p50 5030800	p99 5030800	mean 5030800
+winfsp-phase	settle_batch	294	1	p50 4463500	p99 4463500	mean 4463500
+winfsp-phase	settle_batch	304	1	p50 6540000	p99 6540000	mean 6540000
+winfsp-phase	settle_batch	346	1	p50 6131800	p99 6131800	mean 6131800
+winfsp-phase	settle_batch	367	1	p50 7614500	p99 7614500	mean 7614500
+winfsp-phase	settle_batch	401	1	p50 4978000	p99 4978000	mean 4978000
+winfsp-phase	settle_batch	430	1	p50 6157800	p99 6157800	mean 6157800
+winfsp-phase	settle_batch	490	1	p50 4681700	p99 4681700	mean 4681700
+winfsp-phase	settle_batch	513	1	p50 8218500	p99 8218500	mean 8218500
+winfsp-phase	settle_batch	514	5	p50 9438100	p99 10168600	mean 8171160
+winfsp-phase	settle_batch	516	1	p50 10434100	p99 10434100	mean 10434100
+## run 1 of 1 done, 2026-11-05T07:38:00Z
