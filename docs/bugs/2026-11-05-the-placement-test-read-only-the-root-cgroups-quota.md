@@ -36,13 +36,20 @@ container cgroup seen without a cgroup namespace) failed the owned case and skip
   process's cgroup and every ancestor, v2 `cpu.max` or v1 `cpu.cfs_quota_us` over `cpu.cfs_period_us`, as the facts do,
   reading the kernel's files itself (`budget_at`, `share_at_most`). Nothing else changes.
 
-## Red check (adacachy, owed until kiln reconnects)
+## Red check (adacachy, 2026-11-05 23:15 UTC, load 21.7)
 
-Main and the fix, each in a `systemd-run --user` unit with and without `CPUQuota=1200%`. Expected: main fails the owned
-case under the quota and passes without; the fix skips the owned case under the quota (loudly), runs the quota case and
-passes, and passes the owned case without.
+Main (a7804447's test, unchanged on b502cf96) and the fix (b7d66ddc), each built in its own target dir and run three
+times in each of two `systemd-run --user` units:
+
+| unit | main | the fix |
+|---|---|---|
+| `CPUQuota=1200%` (unit `cpu.max` `1200000 100000`, root absent) | owned case **failed 3 of 3**: "shard 0 may run on [0, …, 31], not one core of its owned set"; quota case skipped ("None over 32 CPUs") | 2 passed, 3 of 3: owned case skipped loudly ("Some((1200000, 100000)) over 32 CPUs"), quota case ran and passed |
+| no quota (unit `cpu.max` `max 100000`) | 2 passed, 3 of 3: owned case ran and passed | 2 passed, 3 of 3: owned case ran and passed |
+
+The runs without a quota are also the Linux SMT sibling check: on adacachy's 16 cores × 2 threads each shard is fixed
+to one core of its owned set, each to its own.
 
 ## Siblings
 
 - The Windows and macOS placement paths take no cgroup; the test skips loudly there. The same SMT placement on Windows
-  (jupiter, 16 cores × 2 threads) is owed a check that each shard is fixed to one core's first thread.
+  (jupiter) is owed a check that each shard is fixed to one core's first thread.
