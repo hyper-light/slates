@@ -10,6 +10,9 @@
 //! - An open with `TRUNCATE_EXISTING` must leave the file empty (`t/base/05.t` case 12); the drive kept its bytes.
 //! - `SetFileTime`'s access and write times must be kept (`t/base/06.t` case 6); the drive answered success and kept
 //!   neither. A creation time is not kept: the volume records no settable birth time (A-214's stated difference).
+//! - A file shrunk and then extended must reach its new size: the WinFsp fsx port wedged at its operation 164, a
+//!   `TRUNCATE UP` from 158,132 to 246,956 bytes right after a `TRUNCATE DOWN` (seed 1; diagnostics run 41989365843).
+//!   The port extends through the C runtime's `_chsize`, which writes zeros from the end until the size is reached.
 //!
 //! Windows only, and gated on `SLATES_TEST_CLI=1` and `WINFSP_TEST_MOUNT=1`, as `tests/winfsp.rs` is; without them
 //! each test skips loudly and passes. CI's Windows lanes install WinFsp and set both.
@@ -21,6 +24,9 @@
   clippy::panic,
   clippy::indexing_slicing
 )]
+// Every `std::fs` call here is a Windows program's call on the slates drive (a RAM volume behind `E:`), which is what
+// the tests are for; none touches the host's disk (R1).
+#![allow(clippy::disallowed_methods)]
 
 use std::io::BufRead;
 use std::os::windows::ffi::OsStrExt;
@@ -52,6 +58,22 @@ const FILE_BYTES: usize = 42;
 const SET_MODIFIED_SECONDS: u64 = 4_102_444_800;
 /// Format: the access time the times test sets: an hour after [`SET_MODIFIED_SECONDS`], so the two cannot be confused.
 const SET_ACCESSED_SECONDS: u64 = SET_MODIFIED_SECONDS + 3_600;
+/// Format: the file sizes and the write of fsx's operations 157 to 164 at seed 1, which wedged the drive at 164: the
+/// size before (157), the shrink (161), the write past the end that leaves a hole (162: 28,320 bytes at 205,924), the
+/// second shrink (163) and the extension (164).
+const FSX_SIZE_BEFORE: u64 = 196_692;
+/// Format: see [`FSX_SIZE_BEFORE`].
+const FSX_SHRUNK: u64 = 41_688;
+/// Format: see [`FSX_SIZE_BEFORE`].
+const FSX_WRITE_AT: u64 = 205_924;
+/// Format: see [`FSX_SIZE_BEFORE`].
+const FSX_WRITE_BYTES: usize = 28_320;
+/// Format: see [`FSX_SIZE_BEFORE`].
+const FSX_SHRUNK_AGAIN: u64 = 158_132;
+/// Format: see [`FSX_SIZE_BEFORE`].
+const FSX_EXTENDED: u64 = 246_956;
+/// Format: the zero block the C runtime's `_chsize` extends a file with (its `_INTERNAL_BUFSIZ`, 4096 bytes).
+const CHSIZE_BLOCK: usize = 4096;
 /// Format: `TRUNCATE_EXISTING`, CreateFile's disposition (fileapi.h): open an existing file and empty it.
 const TRUNCATE_EXISTING: u32 = 5;
 
@@ -253,8 +275,7 @@ fn move_file(from: &str, to: &str, flags: u32) -> Result<(), i32> {
 /// A-214, `t/base/04.t` cases 7 and 23. Do: make two files with different bytes on the drive, and move the first onto
 /// the second with `MoveFileExW` and no `MOVEFILE_REPLACE_EXISTING`. Expect: `ERROR_ALREADY_EXISTS`, and both files
 /// still there with their own bytes, through Windows and through slates; then with `MOVEFILE_REPLACE_EXISTING` the
-/// move succeeds and the target holds the source's bytes; and asked to replace a directory, the move is refused
-/// `ERROR_ACCESS_DENIED` and the directory stays (`t/base/04.t` case 26), as Windows never replaces one.
+/// move succeeds and the target holds the source's bytes.
 #[test]
 fn a_move_not_asked_to_replace_refuses_a_taken_name_and_leaves_both_files() {
   if !live_mount_runs() {
@@ -286,6 +307,16 @@ fn a_move_not_asked_to_replace_refuses_a_taken_name_and_leaves_both_files() {
   assert_eq!(replaced, Ok(()), "asked to replace, the move succeeds");
   assert_eq!(std::fs::read(drive.path("to.txt")).unwrap(), b"the source");
   assert!(std::fs::metadata(drive.path("from.txt")).is_err());
+}
+
+/// A-214, `t/base/04.t` case 26. Do: make two directories on the drive and move one onto the other with
+/// `MOVEFILE_REPLACE_EXISTING`. Expect: `ERROR_ACCESS_DENIED`, as Windows never replaces a directory, and both stay.
+#[test]
+fn a_move_asked_to_replace_a_directory_is_refused() {
+  if !live_mount_runs() {
+    return;
+  }
+  let drive = Drive::mount("movedir");
   std::fs::create_dir(drive.path("dir")).unwrap();
   std::fs::create_dir(drive.path("other")).unwrap();
   let onto_a_directory = move_file(
@@ -415,5 +446,96 @@ fn a_files_write_and_access_times_set_through_the_drive_are_kept() {
     seen.accessed().unwrap(),
     accessed,
     "the access time set is kept"
+  );
+}
+
+/// Runs `steps` on a thread and waits [`WAIT_FOR`] for its answer: a call that wedges the drive fails the test with
+/// `what` instead of holding it forever. A wedged thread is left behind holding its handle; the test has failed.
+fn within_wait<T: Send + 'static>(what: &str, steps: impl FnOnce() -> T + Send + 'static) -> T {
+  let (done, answer) = std::sync::mpsc::channel();
+  std::thread::spawn(move || {
+    let _ = done.send(steps());
+  });
+  answer
+    .recv_timeout(WAIT_FOR)
+    .unwrap_or_else(|_| panic!("{what} did not answer within {WAIT_FOR:?}"))
+}
+
+/// fsx's operations 157 to 163 at seed 1 on `path`: the file at its size, shrunk, written past its end, shrunk again.
+fn fsx_shrink_write_shrink(path: &str) -> std::fs::File {
+  use std::os::windows::fs::FileExt;
+  let file = std::fs::OpenOptions::new()
+    .read(true)
+    .write(true)
+    .create(true)
+    .truncate(true)
+    .open(path)
+    .unwrap();
+  file.set_len(FSX_SIZE_BEFORE).unwrap();
+  file.set_len(FSX_SHRUNK).unwrap();
+  assert_eq!(
+    file
+      .seek_write(&[b'w'; FSX_WRITE_BYTES], FSX_WRITE_AT)
+      .unwrap(),
+    FSX_WRITE_BYTES
+  );
+  file.set_len(FSX_SHRUNK_AGAIN).unwrap();
+  file
+}
+
+/// A-214, fsx's operation 164 by `SetEndOfFile`. Do: fsx's operations 157 to 163 on a file on the drive, then extend it
+/// to 246,956 bytes with `File::set_len`. Expect: the extension answers within the wait, and the file reports the size.
+#[test]
+fn a_file_shrunk_then_extended_by_its_end_reaches_the_size() {
+  if !live_mount_runs() {
+    return;
+  }
+  let drive = Drive::mount("extend");
+  let path = drive.path("fsx.bin");
+  let file = fsx_shrink_write_shrink(&path);
+  let len = within_wait("the extension by SetEndOfFile", move || {
+    file.set_len(FSX_EXTENDED).unwrap();
+    file.metadata().unwrap().len()
+  });
+  assert_eq!(len, FSX_EXTENDED);
+  assert_eq!(std::fs::metadata(&path).unwrap().len(), FSX_EXTENDED);
+}
+
+/// A-214, fsx's operation 164 as the port makes it. Do: fsx's operations 157 to 163 on a file on the drive, then extend
+/// it to 246,956 bytes as the C runtime's `_chsize` does, writing 4096-byte blocks of zeros from the end. Expect: every
+/// write answers the bytes it was given (a write answering none would loop `_chsize` forever), the extension answers
+/// within the wait, the file reports the size, and the extended range reads as zeros.
+#[test]
+fn a_file_shrunk_then_extended_by_zero_writes_reaches_the_size() {
+  if !live_mount_runs() {
+    return;
+  }
+  let drive = Drive::mount("chsize");
+  let path = drive.path("fsx.bin");
+  let file = fsx_shrink_write_shrink(&path);
+  let file = within_wait("the extension by zero writes", move || {
+    use std::os::windows::fs::FileExt;
+    let mut at = file.metadata().unwrap().len();
+    while at < FSX_EXTENDED {
+      let block = usize::try_from(FSX_EXTENDED - at)
+        .unwrap()
+        .min(CHSIZE_BLOCK);
+      let wrote = file.seek_write(&[0u8; CHSIZE_BLOCK][..block], at).unwrap();
+      assert_eq!(
+        wrote, block,
+        "a write at {at} answered {wrote} of {block} bytes"
+      );
+      at += wrote as u64;
+    }
+    file
+  });
+  assert_eq!(file.metadata().unwrap().len(), FSX_EXTENDED);
+  drop(file);
+  let bytes = std::fs::read(&path).unwrap();
+  assert_eq!(bytes.len() as u64, FSX_EXTENDED);
+  let extended = &bytes[usize::try_from(FSX_SHRUNK_AGAIN).unwrap()..];
+  assert!(
+    extended.iter().all(|byte| *byte == 0),
+    "the extension reads as zeros"
   );
 }

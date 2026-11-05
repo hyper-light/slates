@@ -1116,6 +1116,7 @@ mod tests {
 
   /// Shape: how long the stop may take in the held-stream history: the tracer's own exit bound
   /// ([`MOUNT_WAIT`]) twice over, far past a stop that does not wait on the stream's end.
+  #[cfg(unix)]
   const STOP_BOUND: std::time::Duration = MOUNT_WAIT.saturating_mul(2);
 
   /// Signals the fixture's process group directly (the tests run no privileged tracer).
