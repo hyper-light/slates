@@ -5066,9 +5066,29 @@ fn a_location_round_asks_a_peer_whose_session_was_out_once_it_returns() {
     .iter()
     .find(|daemon| daemon.instance() == foreign_instance)
     .unwrap();
+  // The foreign node's record links (each peer, and whether its session is out) before the hold and after the
+  // lookup, so a refused lookup shows whether the link to the successor was out, gone, or never there.
+  // The lookup runs its location round only once the foreign node holds the dead owner dead. With no cached route the
+  // volume's creator is its owner until then, and the lookup forwards there without a round, refused
+  // `OwnerUnreachable` once the takeover bound passes (§4.8 Lookup; the round this history examines never ran:
+  // docs/bugs/2026-11-05-a-lookup-before-the-owners-death-was-known-never-ran-its-round.md).
+  let owner_known_dead = audit_wait(|| {
+    foreign_daemon.fleet_member_state(owner).map(|held| {
+      held.is_some_and(|held| held.liveness == slates_cluster::membership::Liveness::Dead)
+    })
+  });
+  assert!(
+    owner_known_dead,
+    "the foreign node holds the dead owner dead: {:?}",
+    foreign_daemon.fleet_member_state(owner)
+  );
+  let links_before = foreign_daemon.fleet_record_links();
+  // What the foreign node holds about the dead owner as the lookup starts (dead, by the wait above).
+  let owner_at_foreign = foreign_daemon.fleet_member_state(owner);
   let held = foreign_daemon.hold_record_session(successor, SESSION_HOLD_NS);
   let mut foreign = Client::connect(&foreign_instance);
   let looked_up = foreign.call(&RequestBody::Status { volume: id });
+  let links_after = foreign_daemon.fleet_record_links();
   let counters = foreign_daemon.fleet_refusals();
   let successor_counters = successor_daemon
     .fleet_refusals()
@@ -5100,10 +5120,20 @@ fn a_location_round_asks_a_peer_whose_session_was_out_once_it_returns() {
     matches!(looked_up, ReplyBody::Status { .. }),
     "the round asked the successor once its session returned: {looked_up:?}; location counters at the \
      foreign node {:?} and the successor {successor_counters:?}; home-region (is the successor, \
-     (installed, council) versions) {versions:?}",
+     (installed, council) versions) {versions:?}; the dead owner {owner:?} as the foreign node held it \
+     {owner_at_foreign:?}; the successor {successor:?}, the hold {held:?}, the foreign \
+     node's record links (peer, out) before the hold {links_before:?} and after the lookup {links_after:?}, \
+     and its link and dial counters {:?}",
     counters
       .as_ref()
-      .map(|counters| location_counters(counters))
+      .map(|counters| location_counters(counters)),
+    counters.as_ref().map(|counters| counters
+      .iter()
+      .filter(|(name, _)| name.starts_with("fleet.link")
+        || name.starts_with("fleet.dial")
+        || name.starts_with("fleet.discovery")
+        || name.starts_with("fleet.accept"))
+      .collect::<Vec<_>>())
   );
   let counters = counters.expect("the foreign node's counters were read");
   assert!(
