@@ -98,7 +98,7 @@ jobs:
             tr -d '\r\000' < image.txt | sed 's/^\xef\xbb\xbf//' 
             cmd //c ver | tr -d '\r' | grep -v '^$'
             OLD_SLATES=ab-bin/old/slates.exe NEW_SLATES=ab-bin/new/slates.exe BENCH=ab-bin/mount_bench.exe \
-              OLD_NAME=dll NEW_NAME=receiver RUNS=2 ROUNDS=3 SPINNERS_PER_CPU=2 AFTER_RUN="$RUNNER_TEMP/publish.sh" \
+              OLD_NAME=dll NEW_NAME=receiver RUNS=1 ROUNDS=3 SPINNERS_PER_CPU=2 AFTER_RUN="$RUNNER_TEMP/publish.sh" \
               bash docs/wip/bench/fsbench/windows-ab.sh
           } 2>&1 | tee ab.txt
       - name: Publish whatever was measured

@@ -28,6 +28,7 @@ teardown() {
   set +e
   if [ -n "$OLD_DRIVE" ] && [ -e "$OLD_DRIVE/" ]; then "$OLD_SLATES" --instance "$OLD_INSTANCE" unmount "$OLD_DRIVE"; fi
   if [ -n "$NEW_DRIVE" ] && [ -e "$NEW_DRIVE/" ]; then "$NEW_SLATES" --instance "$NEW_INSTANCE" unmount "$NEW_DRIVE"; fi
+  sleep 3 # DIAG: the receive worker sees its stop within a transaction timeout, then prints its phases
   if [ -n "$OLD_ANCHOR" ]; then kill "$OLD_ANCHOR" 2>/dev/null; wait "$OLD_ANCHOR" 2>/dev/null; fi
   if [ -n "$NEW_ANCHOR" ]; then kill "$NEW_ANCHOR" 2>/dev/null; wait "$NEW_ANCHOR" 2>/dev/null; fi
   OLD_ANCHOR= NEW_ANCHOR= OLD_DRIVE= NEW_DRIVE=
