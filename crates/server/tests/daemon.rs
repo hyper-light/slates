@@ -280,6 +280,7 @@ fn shard_selection_daemon(name: &str, shards: u16) -> (Daemon, String) {
       level: 0,
       numa: 0,
       l2_bytes: 0,
+      physical: id,
     })
     .collect();
   let instance = format!("srv-shards-{name}-{}", std::process::id());
