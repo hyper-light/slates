@@ -29,9 +29,6 @@ const TRANSACT_READY: u32 = (9 << 16) | ((0x800 + b'T' as u32) << 2);
 pub(crate) const TRANSACT_TIMEOUT_MS: u32 = 1000;
 /// Shape: the stop channel carries no messages; dropping its sender is the worker's cancellation signal.
 const STOP_BOUND: usize = 0;
-/// Format: the public FileSystem.Version is reserved zero in v2.1; dll/fs.c zeroes the object and never sets it.
-/// The header's separate static assertion gives the full object's 792-byte size, not this field's value.
-pub(crate) const FILE_SYSTEM_VERSION: u16 = 0;
 /// Format: status and size offsets in the checked response header (fsctl.h).
 const STATUS_AT: usize = 20;
 /// Format: the status occupies the final word of the common response header.

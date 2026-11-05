@@ -10,9 +10,9 @@ use slates_wire::crc32c::crc32c;
 
 mod names;
 
-/// Format: identifies version 3 of the Windows ledger: open records, two checked kernel-name versions per slot,
-/// then the retained receive journal. The unnamed sparse section commits touched ranges only.
-const MAGIC: &[u8; 4] = b"WFO3";
+/// Format: identifies version 4 of the Windows ledger: open records, two checked kernel-name versions per slot, their
+/// long-name tails, then the retained receive journal. The unnamed sparse section commits touched ranges only.
+const MAGIC: &[u8; 4] = b"WFO4";
 /// Format: the immutable header carries the first epoch, the slot count, and a CRC32C after the magic.
 const HEADER: usize = MAGIC.len() + size_of::<u64>() + size_of::<u32>() + size_of::<u32>();
 /// Format: generation, live/purge flags, daemon epoch, inode, inode generation, bridge handle and request hint,
