@@ -217,15 +217,6 @@ pub struct ShardState {
   /// The content arena's allocation count at the last reap tick: unchanged at the next means the shard allocated
   /// nothing in between, so its free blocks can go back to the OS (A-105, `daemon::purge_if_idle`).
   pub(crate) purge_seen_allocations: u64,
-  /// The content arena's allocation count and allocated bytes at the last idle reap tick (A-214), `None` before the
-  /// first: a later idle tick with another count ends a busy period, whose net growth is the allocated bytes' rise.
-  pub(crate) burst_seen: Option<(u64, usize)>,
-  /// The net growth of the content arena's allocated bytes over its last busy period (A-214): the write burst an idle
-  /// shard keeps free pages pre-faulted for (`daemon::purge_if_idle`).
-  pub(crate) last_burst: usize,
-  /// The content arena's allocation count when the reserve's refill last found nothing to fault (A-214): until the
-  /// arena allocates again, or the burst measure moves, an idle moment's refill has nothing to do.
-  pub(crate) refill_settled: Option<u64>,
   /// The journal generation whose dead recovery memory an idle shard last gave back (A-117,
   /// `daemon::return_dead_recovery`): a later publication moves the generation and re-arms the return.
   pub(crate) recovery_returned_at: Option<u64>,
@@ -524,9 +515,15 @@ pub struct ShardState {
   /// Daemon status requests in flight: by request word, the client slot, the shards still
   /// to answer, and the parts so far.
   pub status_scatters: BTreeMap<u64, (u32, usize, Vec<slates_ipc::protocol::ShardReport>)>,
-  /// Acknowledgements in flight: by request word, the client slot, the shards still to
-  /// answer, and the reply so far.
-  pub ack_scatters: BTreeMap<u64, (u32, usize, ReplyBody)>,
+  /// Acknowledgements whose other shards' releases are still out (A-216): by request word, the shards still to
+  /// answer. The acknowledgement itself was answered when this shard released; an entry goes when its last part is
+  /// back. Bounded by [`crate::verbs::ack_scatter_bound`]: past it the other shards' parts are not sent, and are
+  /// counted refused and left to the next watermark.
+  pub ack_scatters: BTreeMap<u64, usize>,
+  /// The listings, grants and status scatters a part of which could not be sent, by request word, and the first shard
+  /// it was for: the scatter answers `Overloaded { shard }` when its last part is settled. Bounded by those three
+  /// tables, whose entries it follows.
+  pub scatter_refusals: BTreeMap<u64, u16>,
   /// When this shard last did work for a client (served, forwarded, or ran a forwarded verb);
   /// the server loop polls for the idle window past it before parking (§4.7).
   pub last_work_ns: u64,

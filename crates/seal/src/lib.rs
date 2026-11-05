@@ -18,6 +18,8 @@
 //! and a recorded connection opens under no later one's keys.
 
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero; test builds are exempt.
+// The panic rule: a print macro panics on a refused write; lines go through `slates_machine::log_line!` (A-213).
+#![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};

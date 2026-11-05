@@ -342,46 +342,6 @@ impl Buddy {
     })
   }
 
-  /// The blocks the next allocations of `len` bytes would take, in the order they would take them, until `bytes` are
-  /// named, as `(offset, block_len)` (A-214): read off the free lists without changing them. The lists are LIFO and a
-  /// split hands its lowest piece out and links the rest at the heads of the smaller orders, so the next allocations
-  /// take the free blocks of their own order in list order, then each larger free block's pieces in ascending order,
-  /// the smallest order with a free block first. The reading holds while only allocations of this size come; a free, or
-  /// an allocation of another size, in between changes what follows. Empty when `len` is no block's size here.
-  pub fn upcoming(&self, len: usize, bytes: usize) -> Vec<(usize, usize)> {
-    let Ok(order) = self.order_for(len) else {
-      return Vec::new();
-    };
-    let block = self.order_bytes(order);
-    // Each order's next unread entry in its list.
-    let mut cursors: Vec<u32> = (0..=self.max_order).map(|at| self.head_of(at)).collect();
-    let mut named = Vec::new();
-    let mut total = 0usize;
-    while total < bytes {
-      let Some((found, index)) = (order..=self.max_order).find_map(|at| {
-        let index = cursors.get(usize::try_from(at).ok()?).copied()?;
-        (index != NONE).then_some((at, index))
-      }) else {
-        break;
-      };
-      if let Some(cursor) = usize::try_from(found)
-        .ok()
-        .and_then(|at| cursors.get_mut(at))
-      {
-        *cursor = Self::link_at(&self.next, index);
-      }
-      let start = usize::try_from(index).unwrap_or(usize::MAX) << self.granule_shift;
-      let span = self.order_bytes(found);
-      let mut at = 0usize;
-      while at < span && total < bytes {
-        named.push((start.saturating_add(at), block));
-        total = total.saturating_add(block);
-        at = at.saturating_add(block);
-      }
-    }
-    named
-  }
-
   /// Every free block at or after byte `from`, as `(offset, len)`, in address order: the same head walk as
   /// [`Buddy::allocated`], keeping the free heads instead (A-105: what an idle purge gives back to the OS). A cold path.
   pub fn free_blocks(&self, from: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
@@ -1576,37 +1536,6 @@ mod tests {
 
   fn overlaps(a: (usize, usize), b: (usize, usize)) -> bool {
     a.0 < b.0 + b.1 && b.0 < a.0 + a.1
-  }
-
-  /// A-214. Do: build random populations (allocations of mixed sizes, some freed), read the blocks the next
-  /// allocations of one size would take (`upcoming`), then make those allocations. Expect them to take exactly those
-  /// blocks, in that order, for every size and population, and the reading to leave the allocator unchanged.
-  #[test]
-  fn upcoming_names_the_blocks_the_next_allocations_of_a_size_take() {
-    let granule = 4096;
-    let mut rng = Xorshift::new(Xorshift::SEED);
-    for _ in 0..64 {
-      let (mut buddy, _live) = random_population(granule, &mut rng);
-      let len = granule << rng.below(4);
-      let want = (rng.below(16) + 1) * len;
-      let free_before = buddy.free_bytes();
-      let named = buddy.upcoming(len, want);
-      assert_eq!(buddy.free_bytes(), free_before, "reading changed nothing");
-      for &(offset, block) in &named {
-        let taken = buddy.alloc(len).expect("a named block is free");
-        assert_eq!(
-          (taken.offset, taken.len),
-          (offset, block),
-          "the allocation took the named block"
-        );
-      }
-      if named.iter().map(|(_, block)| block).sum::<usize>() < want {
-        assert!(
-          buddy.alloc(len).is_err(),
-          "fewer blocks named only when no more are free"
-        );
-      }
-    }
   }
 
   /// A random population: blocks allocated and some freed again, in an allocator of 1,024 granules.

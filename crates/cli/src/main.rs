@@ -19,6 +19,8 @@
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
 // are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
 // workspace-wide.
+// The panic rule: a print macro panics on a refused write; lines go through `slates_machine::log_line!` (A-213).
+#![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 use std::process::ExitCode;
@@ -57,11 +59,11 @@ fn main() -> ExitCode {
   let command = match args::parse(&arguments) {
     Ok(command) => command,
     Err(ParseError::Help) => {
-      println!("{}\n{}", args::USAGE, args::USAGE_NOTES);
-      return ExitCode::SUCCESS;
+      slates_machine::out_line!("{}\n{}", args::USAGE, args::USAGE_NOTES);
+      return output_delivered();
     }
     Err(e) => {
-      eprintln!("slates: {e}\n\n{}\n{}", args::USAGE, args::USAGE_NOTES);
+      slates_machine::log_line!("slates: {e}\n\n{}\n{}", args::USAGE, args::USAGE_NOTES);
       return ExitCode::from(EXIT_USAGE);
     }
   };
@@ -80,7 +82,7 @@ fn main() -> ExitCode {
     Command::Daemon(options) => daemon::run(&options),
     Command::Profile(options) => verbs::profile(&options),
     Command::Version => {
-      println!("slates {}", env!("CARGO_PKG_VERSION"));
+      slates_machine::out_line!("slates {}", env!("CARGO_PKG_VERSION"));
       Ok(())
     }
     Command::Mcp(options) => verbs::mcp(&options),
@@ -94,8 +96,21 @@ fn main() -> ExitCode {
     Command::OciRuntime(runtime) => run_oci_runtime(&runtime),
   };
   match outcome {
-    Ok(()) => ExitCode::SUCCESS,
+    Ok(()) => output_delivered(),
     Err(failure) => report_failure(&failure, json),
+  }
+}
+
+/// The exit of a command that succeeded: success, unless some of its output could not be written (its standard output
+/// closed, or a pipe whose reader went away), which is the command's failure, since its caller did not get what it
+/// asked for (A-213). Before, the first such line panicked the command (exit 134 in a release build).
+fn output_delivered() -> ExitCode {
+  match slates_machine::log::out_lines_refused() {
+    0 => ExitCode::SUCCESS,
+    refused => {
+      slates_machine::log_line!("slates: {refused} lines of output could not be written");
+      ExitCode::from(EXIT_FAILED)
+    }
   }
 }
 
@@ -110,7 +125,7 @@ fn report_failure(failure: &Failure, json: bool) -> ExitCode {
     return match u8::try_from(*code) {
       Ok(code) => ExitCode::from(code),
       Err(_) => {
-        eprintln!("slates: the command exited with code {code}");
+        slates_machine::log_line!("slates: the command exited with code {code}");
         ExitCode::from(EXIT_FAILED)
       }
     };
@@ -128,20 +143,22 @@ fn report_failure(failure: &Failure, json: bool) -> ExitCode {
       }
       Failure::ChildExited { code } => format!("the command exited with code {code}"),
     };
-    eprintln!(
+    slates_machine::log_line!(
       "{}",
       serde_json::json!({ "error": { "kind": kind, "message": message } })
     );
   } else {
     match failure {
-      Failure::Refused(text) => eprintln!("slates: refused: {text}"),
+      Failure::Refused(text) => slates_machine::log_line!("slates: refused: {text}"),
       Failure::Unavailable { instance, cause } => {
-        eprintln!(
+        slates_machine::log_line!(
           "slates: no daemon at instance {instance}: {cause} (is `slates anchor` running?)"
         );
       }
-      Failure::Failed(text) => eprintln!("slates: {text}"),
-      Failure::ChildExited { code } => eprintln!("slates: the command exited with code {code}"),
+      Failure::Failed(text) => slates_machine::log_line!("slates: {text}"),
+      Failure::ChildExited { code } => {
+        slates_machine::log_line!("slates: the command exited with code {code}")
+      }
     }
   }
   ExitCode::from(code)

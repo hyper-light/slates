@@ -242,7 +242,7 @@ impl ScopedToken {
 impl Drop for ScopedToken {
   fn drop(&mut self) {
     if let Err(error) = self.restore() {
-      eprintln!("slates-winfsp: {error}");
+      slates_machine::log_line!("slates-winfsp: {error}");
     }
   }
 }

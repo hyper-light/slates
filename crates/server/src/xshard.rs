@@ -252,6 +252,30 @@ pub fn run_on_waiting(
   }
 }
 
+/// Sends `message` to `target`, waiting out a full channel for at most `budget_ns`, asked again every
+/// [`REPLY_PACE_NS`]: whether it was sent. `false` past the budget, or at once for a shard gone. A scatter's part waits
+/// this way (`crate::verbs::send_part`), within a budget its client can still hear the answer in.
+pub(crate) async fn given_room_within(target: u16, mut message: Control, budget_ns: u64) -> bool {
+  let attempts = budget_ns
+    .checked_div(REPLY_PACE_NS)
+    .unwrap_or(0)
+    .saturating_add(1);
+  for _ in 0..attempts {
+    match registry::send_control_or_return(target, message) {
+      Ok(()) => return true,
+      Err(registry::RefusedControl {
+        error: RtError::ControlFull { .. },
+        message: Some(unsent),
+      }) => {
+        message = unsent;
+        let _ = slates_rt::futures::sleep(REPLY_PACE_NS).await;
+      }
+      Err(_) => return false,
+    }
+  }
+  false
+}
+
 /// Shape: the pace of a reply's retries for room — a tenth of a coordinator period, the collection loops' cadence
 /// (`crate::fleet::POLL_PER_PERIOD`), so a waiting reply asks about as often as the shard's loops turn.
 const REPLY_PACE_NS: u64 = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;

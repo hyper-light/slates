@@ -5525,6 +5525,26 @@ provisioning is therefore safe to retry after any failure.
 > unretried, which holds its acknowledgement back; it retries that id first. Regression
 > `a_client_that_never_acknowledges_is_refused_at_its_bound_and_served_once_it_acknowledges`.
 
+> **Status (2026-11-05, A-216: an acknowledgement is answered once its own shard has released).** An `Acknowledge
+> { up_to }` releases the client's records at or below `up_to` on every partition that may hold them. Its reply now
+> promises one thing: the client's own shard has released them. The other shards' releases run as tasks the shard
+> tracks (`ShardState::ack_scatters`, one entry per acknowledgement until every part is back). A part refused, or
+> never sent because its shard's control channel was full, is counted (`ack.release_refused`, in `slates status`).
+> It is retried by the next acknowledgement, whose watermark covers it. Before A-216 the reply waited for every
+> shard. So one sync call in every half-ring paid the slowest shard's turn, and a shard held past the reply deadline
+> failed it `Stalled`.
+>
+> Why exactly-once holds. A lagging release concerns only records at or below `up_to`. Every new request carries a
+> sequence above it, since a client's sequences only grow, never wrap (`LAST_SEQUENCE`, AUD-29-21), and a new
+> client never takes an id another has used (the listener assigns above every id any shard retains,
+> `restore_client_ids`). So the only requests that can meet such a record are retries of ids already answered, and
+> meeting their record, or the acknowledged window once it is released, is what exactly-once asks. The bound still
+> holds: a release lagging on one shard is the "one lost acknowledgement" `2 × slots` already budgets for, and past
+> the bound a new request is refused `AcknowledgementOwed` as before. And a lagging release is never overtaken: a
+> client's later request to another shard is forwarded on that shard's control channel, the same channel and kind
+> of message as the release, sent by the client's own shard after it, so it queues behind the release. A request can
+> only find a release refused, which is counted.
+
 **Flow control.** Credit-based, absolute offsets per stream; windows derived from the measured
 bandwidth-delay product and the class's latency budget; the sender never exceeds credit; a
 stalled receiver stalls only its own class.
@@ -5988,7 +6008,7 @@ the format floor.
 > `node:24-alpine`), refuses to publish if any platform package lacks its binary, and publishes
 > through npm trusted publishing from the `npm` environment — after the one-time 0.0.0 stub publish
 > of each name that npm requires before a trusted publisher can be attached (npm/cli#8544;
-> `cargo xtask npm-reserve` derives the ten stubs from the same manifests). CI's `sdk` job
+> `cargo xtask npm-reserve` derives one stub per name from the same manifests: eight names since A-210, ten before). CI's `sdk` job
 > installs the wheel into a fresh venv after `twine check --strict`, packs and installs the two npm
 > tarballs into a fresh project, and runs both SDK suites and the packaged smoke test over a live
 > daemon on Linux and macOS. **Proven by use on this host** (macOS 26.4.1, Apple M5 Max,
@@ -5998,8 +6018,7 @@ the format floor.
 > through the optional-dependency loader, dry-run publishes clean; the ten stubs packed and dry-run
 > clean. **Owed:** the stub publish and the two trusted-publisher registrations (a maintainer's
 > login), then the first tag; this section's `abi3-py312` and `cp314t` wheels (PyO3 0.22 has no
-> free-threaded build; the wheel is cp39-abi3 today); Windows arm64 and ia32 wheels (the napi lane
-> ships those platforms; maturin's Windows cross builds are not exercised); and the SDK surface
+> free-threaded build; the wheel is cp39-abi3 today); and the SDK surface
 > this section names beyond packaging (async iterators, `AbortSignal`, `memoryview` reads, the
 > typed exception hierarchy).
 
@@ -8691,7 +8710,8 @@ Evidence: `research/survey-vorpal.md` §0–§9.
 > `slates-provenance.json` and a Sigstore attestation bundle to a **draft** release. Publishing the draft is the
 > maintainer's one approved step (`docs/publish.md`, "The binary release"). The proof by use on a test tag is recorded
 > in A-210: test tag `v0.1.0-test.1`, run 41983664060, a draft with all seven binaries whose checksums and attestation
-> verify. Reproducibility from the tag (AC-9.5's first clause) is not yet shown: no lane builds twice and compares.
+> verify. Since 2026-11-05 every target is built twice on separate runners, and the release is refused unless the two
+> copies are the same bytes (AC-9.5; A-210 records the measurements).
 
 | target | runner | asset name |
 |---|---|---|
@@ -8737,8 +8757,9 @@ Recipes to copy verbatim:
 
 ### B.3 Packaging for the SDKs (shape copied from vorpal; SDK details in §4.12)
 
-- npm: a scoped CLI package with `optionalDependencies` on eight platform packages named in
-  napi-rs convention (`darwin-arm64`, `linux-x64-gnu`, `linux-arm64-musl`, `win32-ia32-msvc`, ...),
+- npm: a scoped package with `optionalDependencies` on seven platform packages, one per shipped target
+  (`xtask/src/targets.rs`, A-210), named in napi-rs convention (`darwin-arm64`, `linux-x64-gnu`,
+  `linux-arm64-musl`, `win32-arm64-msvc`, ...),
   each declaring `os`, `cpu`, and Linux `libc`; a postinstall that resolves the package with
   `detect-libc` and hard-links the binary into place; trusted publishing (OIDC) after a one-time
   bootstrap publish. [C: vorpal npm/package.json, npm/postinstall.js:6-27, release.yml:234-281]
@@ -12886,67 +12907,25 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
 
-### A-214 — An idle shard keeps its last write burst's worth of free content pages pre-faulted (accepted 2026-11-05, VFS plan step 11; amends A-105)
-Status: accepted 2026-11-05 (Ada's decision through the supervisor: option (a) of GAPS' large-file write gap); built
-2026-11-05. It amends A-105's "every free block back at the first idle tick". Applied in the same change to:
-`crates/mem/src/buddy.rs` (`Buddy::upcoming`), `crates/mem/src/arena.rs` (`upcoming`, `purge_keeping`, `prefault`,
-`KeptRun`, `Prefaulted`), `crates/rt/src/shard.rs` (`set_idle_work`), `crates/server/src/daemon.rs` (`purge_if_idle`,
-`refill_slice`, `note_burst`, `prefault_reserve`), `crates/server/src/config.rs` (`page_fault_ns`,
-`prefault_slice_pages`), `crates/server/src/state.rs`, the tests named below, `crates/cli/examples/nfs_large_write.rs`,
-A-105's entry, BENCHMARKS, GAPS.
-- **Why.** A large write through Linux's NFSv4.2 client spends 41.5% of the volume's shard faulting in fresh pages of
-  the anchor's shared content object, one 4 KiB `shmem_fault` a page (CI run 41986870989). The same write over pages
-  still resident matches the kernel's nfsd (2,047–2,190 against 2,148–2,218 MiB/s, run 41978355633); after A-105's
-  purge has given them back it runs at 874–957. A host whose `shmem_enabled` is `never` (CI's runners) backs the
-  object with base pages only, and the per-page cost cannot be batched away or moved to another thread (run
-  41987962954: `MADV_POPULATE_WRITE` per 64 KiB or 1 MiB 1,221–1,269 MiB/s, a second thread 972–1,006, plain faults
-  1,293–1,305). What remains is to fault the pages before the write needs them: at idle, off the write path.
-- **What.** At each reap tick that finds the shard idle (A-105's test: its arena allocated nothing since the last):
-  1. **The burst.** The shard's last write burst is the net growth of its arena's allocated bytes over its last busy
-     period: the allocated bytes at this idle tick less those at the idle tick before it, at least zero. A file written
-     and deleted in one busy period nets zero; a file kept nets its size.
-  2. **The reserve.** Derived: `reserve = min(last burst, reserve_per_shard, the arena's free bytes)`, the burst
-     bounded by the shard's memory share and by what the arena holds free. Its ranges are the free blocks the next
-     allocations of one chunk window would take, read off the buddy's free lists without changing them
-     (`Buddy::upcoming`): the lists are LIFO and a split hands out its pieces in ascending order, so the reading is
-     exact for allocations of that size and only drifts when others interleave, which then land on resident pages
-     anyway.
-  3. **The purge** gives back every resident free block except the reserve's (A-105 otherwise unchanged).
-  4. **The refill** faults the reserve's pages that are not resident, in slices of `quantum / page_fault_ns` pages
-     (§4.2's pre-fault batch, the profile's measured base-page fault). It is the shard's idle work
-     (`ShardContext::set_idle_work`, `crates/rt/src/shard.rs`): when a step finds nothing to do and the idle spin has
-     run out, the run loop does one slice and looks for work again, and parks once the refill has nothing left. So it
-     runs in the shard's idle moments, a request waits at most one slice, and it is never on the write path. The
-     reap tick's idle purge refills too. The pages are charged where A-105 charges a freed block kept resident (the
-     arena's resident free bytes), and counted (`content.prefaulted_bytes`).
-  5. **Before the tick closes the burst.** The reserve's size is the larger of the last burst and the growth since the
-     last idle tick, so an idle moment inside a burst, or right after it, refills for what the burst has grown so far.
-     The incumbent harness pauses slates for about a second between rounds (nfsd's and tmpfs's turns): its volume's
-     shard reached no idle tick in a whole run (`content.ticks.idle` 0, `content.ticks.sealing` 2,
-     `content.ticks.busy` 1 on the M5 Max, 2026-11-05), so a refill gated on the tick never ran there.
-- **Counted:** each reap tick's outcome, `content.ticks.sealing`, `content.ticks.deferred`, `content.ticks.busy` and
-  `content.ticks.idle`.
-- **The idle test's tick.** A-105 asks whether the arena allocated since the previous tick, but the count was recorded
-  only when the purge ran, and a tick that seals or publishes returns before it. So the first purge after a burst saw
-  the sweep's own allocations and waited a whole tick more. Now every tick records the count. Measured in process
-  (`crates/cli/examples/nfs_large_write.rs`, kept 64 MiB files over NFSv4.2 after an idle pause, kiln-a094a12d):
-  - before the fix, three idle ticks were too few: 1,366–1,460 MiB/s and nothing pre-faulted;
-  - after it, three ticks were enough: 2,249–2,300 MiB/s after the first file (whose burst had no predecessor),
-    about 64 MiB pre-faulted before each, against 1,340 for the first;
-  - two ticks were mostly too few (one of four).
-  The incumbent harness leaves slates idle about four seconds between its rounds (nfsd's and tmpfs's turns).
-- **The trade.** Each shard holds up to its last burst's net growth of free pages resident while idle, at most its
-  memory share; a shard whose last busy period grew nothing holds none. In exchange a burst like the last lands on
-  resident pages. Measured (BENCHMARKS, "an idle shard keeps its last write burst's pages pre-faulted"):
-  - the cost: a 16,777,200-byte burst held 16,711,680 bytes pre-faulted at idle; in the incumbent harness the volume's
-    shard faulted 342 MiB in over a run of three 64 MiB rounds; the bound on the Mac's daemon was 1,073,741,824 bytes a
-    shard;
-  - the gain: the incumbent harness on the M5 Max wrote its 64 MiB file at up to 1,286.0 MiB/s, against 1,033.9 before
-    (beyond the spread at 4 and 16 workers; six interleaved rounds), with write p99s overlapping.
-  - through Linux's NFSv4.2 client on CI (run 42064893088, interleaved), the 4- and 16-worker writes went from
-    602–641 to 1,003–1,064 MiB/s, level with nfsd on that runner.
-- **Not done:** decaying the reserve over time. A-105's reason (a daemon kept its high-water mark forever) does not
-  apply: the reserve follows the last busy period, so a delete or a quiet period that grew nothing returns it.
+### A-216 — An acknowledgement is answered once the client's own shard has released its records (accepted 2026-11-05)
+Applied in the same change to: §4.9 (its status), `crates/server/src/verbs.rs` (`scatter_acknowledge`,
+`gather_acknowledge`), `crates/server/src/state.rs` (`ack_scatters`), `Daemon::flood_control_channel_on` (test
+support), GAPS, `docs/bugs/2026-11-05-a-call-waited-for-its-acknowledgements-scatter.md`, and the tests named below.
+- **Why.** The synchronous client acknowledges every half-ring of replies before its next request and waits for the
+  reply. The daemon answered only after every shard had released the client's records, so the call that carried the
+  acknowledgement paid the slowest shard's turn. On macOS 133 of 2,000 single-client creates (6.7%) carried one,
+  median 2,497 µs against 169 µs, so they set the p99. Windows arm64's single-client p99 was 65.4 / 59.4 / 57.9 µs
+  with the wait, against 47.8 / 45.5 / 44.3 µs without it (diag run 42056768929). With another shard held for a
+  second, the call failed `Stalled`. Sending the acknowledgement unawaited instead (a6c3bc16) put two replies in
+  flight on the sync client and met a whole-daemon pause after client churn, so it was reverted. This keeps one
+  reply in flight.
+- **The rule.** The reply is sent once the client's own shard has released (or refused, which is the reply). The other
+  shards' parts run as tracked tasks; a refused or unsent part is counted `ack.release_refused` and is retried by the
+  next acknowledgement's watermark.
+- **Why exactly-once holds:** §4.9's status, proven by the tests below.
+- **What it does not change.** The bound (`2 × slots`), `AcknowledgementOwed`, the client's cadence and its watermark,
+  and an acknowledgement's own refusal on the client's shard, which is still its reply.
+- **Next lever (C, GAPS):** carry the watermark in every request, so no separate acknowledgement is needed at all.
 
 ### A-209 — Windows conformance is WinFsp's own two suites over the slates drive in both Windows lanes, with a reviewed list and stated differences; the POSIX suites run on arm64 Linux (accepted 2026-11-05, Step 10 of the VFS and DAX plan)
 Applied in the same change to: Part 6 ("Conformance"), §4.6 ("Windows" and its status), GAPS, `docs/wip/platforms.md`,
@@ -13137,6 +13116,72 @@ Applied in the same change to: §4.16 (status), `docs/wip/merge-service.md` (the
   two orders has one identity; a byte, a mode bit or a kind changes it and restoring the byte restores it. The
   fleet's holder-recompute, mismatch and takeover tests pass unchanged (BENCHMARKS, GAPS).
 
+### A-214 — An idle shard keeps its last write burst's worth of free content pages pre-faulted (accepted 2026-11-05, VFS plan step 11; amends A-105)
+
+> **Status (2026-11-05): reverted from main.** Its reserve kept deleted files' pages resident, against A-205's
+> give-back on both Windows lanes, and its arena test fails under Miri (main CI 42119714654; GAPS). Re-landing owed.
+
+Status: accepted 2026-11-05 (Ada's decision through the supervisor: option (a) of GAPS' large-file write gap); built
+2026-11-05. It amends A-105's "every free block back at the first idle tick". Applied in the same change to:
+`crates/mem/src/buddy.rs` (`Buddy::upcoming`), `crates/mem/src/arena.rs` (`upcoming`, `purge_keeping`, `prefault`,
+`KeptRun`, `Prefaulted`), `crates/rt/src/shard.rs` (`set_idle_work`), `crates/server/src/daemon.rs` (`purge_if_idle`,
+`refill_slice`, `note_burst`, `prefault_reserve`), `crates/server/src/config.rs` (`page_fault_ns`,
+`prefault_slice_pages`), `crates/server/src/state.rs`, the tests named below, `crates/cli/examples/nfs_large_write.rs`,
+A-105's entry, BENCHMARKS, GAPS.
+- **Why.** A large write through Linux's NFSv4.2 client spends 41.5% of the volume's shard faulting in fresh pages of
+  the anchor's shared content object, one 4 KiB `shmem_fault` a page (CI run 41986870989). The same write over pages
+  still resident matches the kernel's nfsd (2,047–2,190 against 2,148–2,218 MiB/s, run 41978355633); after A-105's
+  purge has given them back it runs at 874–957. A host whose `shmem_enabled` is `never` (CI's runners) backs the
+  object with base pages only, and the per-page cost cannot be batched away or moved to another thread (run
+  41987962954: `MADV_POPULATE_WRITE` per 64 KiB or 1 MiB 1,221–1,269 MiB/s, a second thread 972–1,006, plain faults
+  1,293–1,305). What remains is to fault the pages before the write needs them: at idle, off the write path.
+- **What.** At each reap tick that finds the shard idle (A-105's test: its arena allocated nothing since the last):
+  1. **The burst.** The shard's last write burst is the net growth of its arena's allocated bytes over its last busy
+     period: the allocated bytes at this idle tick less those at the idle tick before it, at least zero. A file written
+     and deleted in one busy period nets zero; a file kept nets its size.
+  2. **The reserve.** Derived: `reserve = min(last burst, reserve_per_shard, the arena's free bytes)`, the burst
+     bounded by the shard's memory share and by what the arena holds free. Its ranges are the free blocks the next
+     allocations of one chunk window would take, read off the buddy's free lists without changing them
+     (`Buddy::upcoming`): the lists are LIFO and a split hands out its pieces in ascending order, so the reading is
+     exact for allocations of that size and only drifts when others interleave, which then land on resident pages
+     anyway.
+  3. **The purge** gives back every resident free block except the reserve's (A-105 otherwise unchanged).
+  4. **The refill** faults the reserve's pages that are not resident, in slices of `quantum / page_fault_ns` pages
+     (§4.2's pre-fault batch, the profile's measured base-page fault). It is the shard's idle work
+     (`ShardContext::set_idle_work`, `crates/rt/src/shard.rs`): when a step finds nothing to do and the idle spin has
+     run out, the run loop does one slice and looks for work again, and parks once the refill has nothing left. So it
+     runs in the shard's idle moments, a request waits at most one slice, and it is never on the write path. The
+     reap tick's idle purge refills too. The pages are charged where A-105 charges a freed block kept resident (the
+     arena's resident free bytes), and counted (`content.prefaulted_bytes`).
+  5. **Before the tick closes the burst.** The reserve's size is the larger of the last burst and the growth since the
+     last idle tick, so an idle moment inside a burst, or right after it, refills for what the burst has grown so far.
+     The incumbent harness pauses slates for about a second between rounds (nfsd's and tmpfs's turns): its volume's
+     shard reached no idle tick in a whole run (`content.ticks.idle` 0, `content.ticks.sealing` 2,
+     `content.ticks.busy` 1 on the M5 Max, 2026-11-05), so a refill gated on the tick never ran there.
+- **Counted:** each reap tick's outcome, `content.ticks.sealing`, `content.ticks.deferred`, `content.ticks.busy` and
+  `content.ticks.idle`.
+- **The idle test's tick.** A-105 asks whether the arena allocated since the previous tick, but the count was recorded
+  only when the purge ran, and a tick that seals or publishes returns before it. So the first purge after a burst saw
+  the sweep's own allocations and waited a whole tick more. Now every tick records the count. Measured in process
+  (`crates/cli/examples/nfs_large_write.rs`, kept 64 MiB files over NFSv4.2 after an idle pause, kiln-a094a12d):
+  - before the fix, three idle ticks were too few: 1,366–1,460 MiB/s and nothing pre-faulted;
+  - after it, three ticks were enough: 2,249–2,300 MiB/s after the first file (whose burst had no predecessor),
+    about 64 MiB pre-faulted before each, against 1,340 for the first;
+  - two ticks were mostly too few (one of four).
+  The incumbent harness leaves slates idle about four seconds between its rounds (nfsd's and tmpfs's turns).
+- **The trade.** Each shard holds up to its last burst's net growth of free pages resident while idle, at most its
+  memory share; a shard whose last busy period grew nothing holds none. In exchange a burst like the last lands on
+  resident pages. Measured (BENCHMARKS, "an idle shard keeps its last write burst's pages pre-faulted"):
+  - the cost: a 16,777,200-byte burst held 16,711,680 bytes pre-faulted at idle; in the incumbent harness the volume's
+    shard faulted 342 MiB in over a run of three 64 MiB rounds; the bound on the Mac's daemon was 1,073,741,824 bytes a
+    shard;
+  - the gain: the incumbent harness on the M5 Max wrote its 64 MiB file at up to 1,286.0 MiB/s, against 1,033.9 before
+    (beyond the spread at 4 and 16 workers; six interleaved rounds), with write p99s overlapping.
+  - through Linux's NFSv4.2 client on CI (run 42064893088, interleaved), the 4- and 16-worker writes went from
+    602–641 to 1,003–1,064 MiB/s, level with nfsd on that runner.
+- **Not done:** decaying the reserve over time. A-105's reason (a daemon kept its high-water mark forever) does not
+  apply: the reserve follows the last busy period, so a delete or a quiet period that grew nothing returns it.
+
 ### A-211 — A DAX ask is refused where no view could begin (accepted and built 2026-11-04)
 Applied in the same change to: §4.6 by reference, `docs/wip/shards/dax-protocol.md` ("Windows"), GAPS,
 `crates/bridge-core/src/dax_backing.rs` (`DaxBackingSession::ask`), `crates/server/src/shards/dax.rs` (`MALFORMED`'s
@@ -13160,7 +13205,8 @@ posted read, `supervise_windows.rs` and `supervise.rs` the Windows wait,
 `supervise.rs` the device hold's log and the published count, `layout.rs` and `segment.rs` the new supervision word),
 `crates/ipc` (`DaemonReport::anchor_hold_refusals`, appended), `crates/server` (`verbs.rs`, the daemon report),
 `crates/cli` (`slates status`'s line; `anchor.rs` the Windows loop's wait; `examples/hold_latency_ab.rs`), `crates/mcp`
-(the daemon status JSON). Bug record:
+(the daemon status JSON), and for the print sweep `crates/machine` (`log.rs`), every shipped crate's root and print site,
+`clippy.toml` and `crates/cluster/Cargo.toml`. Bug record:
 `docs/bugs/2026-11-04-the-unix-device-hold-logged-every-refusal.md`.
 - **The Unix device hold's log is bounded.** A-61's hold counted each refused device message and logged a line for each.
   It now logs through the same `RefusalLog` as A-198's Windows hold: each distinct refusal once over the anchor's life,
@@ -13175,6 +13221,18 @@ posted read, `supervise_windows.rs` and `supervise.rs` the Windows wait,
   A block an older anchor wrote holds zero there.
 - **Rejected:** a status surface on the anchor itself (a second rendezvous and a second protocol for one number), and the
   daemon counting refusals it caused (it cannot see what the anchor refused).
+- **No line a process writes can end it (2026-11-05, found by the release agent).** `eprintln!` and `println!` panic
+  when their write is refused, and a write into a pipe whose reader has gone is refused (Rust ignores `SIGPIPE`). So
+  `slates anchor 2>&1 >/dev/null | head -n 1` aborted the anchor once `head` had its line, and the anchor took its daemon
+  with it. Every line now goes through `slates_machine::log`: a log line that cannot be written is counted and dropped,
+  and supervision goes on.
+  - The counts show in `slates status`: the daemon's own as `log_lines_refused`, and the anchor's, written to the
+    supervision block at offset 200 (`SUP_LOG_REFUSALS`), as `anchor_log_lines_refused`.
+  - A command's output line that cannot be written is the command's failure: it exits 4 and says why.
+  - Every shipped crate's root denies `clippy::print_stdout` and `clippy::print_stderr`; `clippy.toml` allows them in
+    tests.
+  - Rejected: restoring `SIGPIPE`'s default, which would end the anchor silently instead of with a panic.
+  - Bug record: `docs/bugs/2026-11-05-a-closed-log-pipe-ended-the-anchor.md`.
 - **The Windows anchor wakes on its hold channel (2026-11-04, the sibling of A-206's record).** The Windows loop parked
   between supervision steps, up to half the liveness budget (500 ms), and looked at the channel only then, so each WinFsp
   mount's hold and each unmount's release waited up to that long on a healthy anchor; the Unix loop polls its channel.
@@ -13253,7 +13311,41 @@ Applied in the same change to: Appendix B.2 (body and status), Phase 9 task 5's 
   - The smoke test's own first version stopped reading the anchor's stderr after the serving line, and 8 of 10 runs
     on this Mac aborted the anchor (the GAPS entry: an anchor whose stderr closes aborts). Fixed in the harness: 10 of
     10 after.
-- **Not yet.** Reproducibility from the tag (AC-9.5): no lane builds twice and compares. The macOS `Slates.app` bundle
+- **The SDK lanes ship the same targets (2026-11-05).** Before this change, `napi.targets` and `crates/sdk-node/npm/`
+  named nine platforms, two of them no longer shipped (`x86_64-apple-darwin`, `i686-pc-windows-msvc`), while
+  `publish-node.yml` built seven. Its tag-only check that every platform package holds its binary would have
+  refused the first publish. The PyPI lane built no Windows arm64 wheel, and its header named a macOS x86_64 wheel
+  it never built.
+  - The shipped targets are now one table (`xtask/src/targets.rs`). The binary release's assets come from it, and
+    `cargo xtask version` refuses a `napi.targets` that names a target outside it (`UnknownTarget`) or leaves a
+    shipped one out (`ShippedTargetMissing`). Test: `napi_targets_name_exactly_the_shipped_targets`.
+  - Both SDK lanes build Windows natively: x86_64 on windows-2025 with NASM, arm64 on windows-11-arm with clang-cl
+    for AWS-LC, as the binary release does.
+  - The binary check (npm) and `twine check --strict` (PyPI) moved out of the tag-only publish jobs, so a
+    `workflow_dispatch` dry run proves them and publishes nothing.
+  - Dry runs on `agents/release` (2026-11-05), each with its publish job skipped:
+    - PyPI run 42048582138 built seven cp39-abi3 wheels (manylinux and musllinux x86_64 and aarch64, macOS arm64,
+      Windows x64 and arm64) and the sdist, and `twine check --strict` passed over all eight artifacts.
+    - npm run 42055543098 built all seven addons (699 KB on arm64 Windows to 3.98 MB on x86_64 musl). It answered "7
+      platform packages hold their binary", and `npm pack --dry-run` packed eight packages.
+    - It took two fixes first. The arm64 musl build in node:24-alpine failed, "linker `aarch64-linux-musl-gcc` not
+      found" (42048576607), because napi names a cross linker for a native build; B.2's `LINKER=cc` override now
+      sets it. And an apostrophe in a comment inside the single-quoted container script ended it (42054307287).
+- **Reproducible from the tag (AC-9.5, 2026-11-05).** The lane builds every target twice, each copy on a runner of its
+  own (`copy: build` and `copy: rebuild`). The artifacts task refuses a release whose two copies differ, naming the
+  count of differing bytes and their first offsets (`a_target_whose_rebuild_differs_is_not_reproducible`). Measured:
+  - Run 42046848954 built each Linux and Windows target twice exactly as the lane did. All four Linux binaries, glibc
+    and musl, were byte for byte the same. Both Windows binaries differed in 20 bytes, every one a field MSVC's linker
+    takes from the clock: the PE header's timestamp, the three debug-directory timestamps and the 16-byte PDB GUID.
+  - With `-C link-arg=/Brepro` (run 42049001999) all six pairs are the same. The four Linux digests also equal the
+    previous run's, so one source gave one binary on four separate runners (for example `slates-linux-arm64`
+    `f8fb335c…61eb7f`, `slates-windows-x64.exe` `3a48be20…44740d`).
+  - Test tag `v0.1.0-test.2` (commit a41c5e71, run 42054339412, 2026-11-05) built and smoke-tested both copies of all
+    seven targets, macOS included, 14 jobs. The release job accepted every pair, and the draft's provenance records
+    each rebuild's digest equal to its build's, for example `slates-macos-arm64` `25e3bab5…` and
+    `slates-windows-x64.exe` `9f1d6832…`. The macOS pair matched across two runner images (20261026.0455.2 and
+    20261102.0473.1); the other pairs ran on one image each.
+- **Not yet.** Code signing and notarization (B.7; they need Ada's Apple Developer identity). The macOS `Slates.app` bundle
   (B.7), code signing and notarization (they need Ada's Apple Developer identity). `cargo-binstall` metadata.
 
 ### A-206 — A WinFsp file system is deleted only after the anchor releases its hold, the DLL's version is checked, and slates refuses no path the driver passes (accepted 2026-11-04, audit plan 01a1a34bf7e973069e94f773afdea44a, steps 4 and 6)
@@ -13371,7 +13463,13 @@ The largest costs were two things A-198's first form did that its crash rules do
   it is done, however many opens the mount holds. A rename onto itself moves nothing and returns at once.
 
 Each worker also reuses one completion event: control transactions run one at a time, and creating and closing an event
-for each cost 0.9 µs at the p50 twice a request.
+for each cost 0.9 µs at the p50 twice a request. **Since 2026-11-05 each worker also makes its two operation packets
+once for its life** (`dispatcher.rs`'s `Owned`). Each request had made a fresh 16 KiB working copy and a fresh 16 KiB
+response packet, and zero-filled the packet again: 2.6–4.4 µs an IRP on arm64 and 1.7–2.0 µs on x86_64 (diagnostics run
+42091919319). Only the response's fixed 128 bytes are cleared now, as WinFsp's own dispatcher clears only the header
+(`src/dll/fs.c:303-305`). `inflight::finish_response` clears the padding its size rounding adds, so no byte of an earlier
+response is sent. With it, every x86_64 quiet call is within the DLL's spread at the p50 (BENCHMARKS, "Where the WinFsp
+receiver's time goes").
 
 **Not changed: a response and the next receive stay two calls.** The DLL carried both in one call. A-198 keeps them apart
 so that captured requests settle before any new receive, which is what stops a reused IRP address naming another
@@ -13397,29 +13495,6 @@ Applied in the same change to: GAPS, BENCHMARKS, `crates/bridge-winfsp/src/reply
 
 Applied in the same change to: GAPS (the audit entry's unmeasured-receiver item); `crates/bridge-winfsp/src/dispatcher.rs`,
 `inflight/capture.rs`, `purge_intents.rs`, `notify.rs` and `host.rs`.
-
-### A-204 — An NFS connection's turn takes only the records its quantum can reach (accepted and built 2026-11-05, VFS plan step 11)
-Applied in the same change to: `crates/server/src/nfs.rs` (`read_head`, `turn_copy_budget`, counter
-`nfs.turn.left_queued`), `crates/server/src/config.rs` (`DaemonConfig::quantum_copy_bytes`),
-`crates/server/tests/nfs_hostile.rs`, `crates/cli/examples/nfs_large_write.rs`, A-74's entry, BENCHMARKS, GAPS.
-Status: built 2026-11-05. It amends A-74's turn.
-- Why: a turn copied every whole record its peek found out of the stream buffer, then served them until its quantum
-  was spent. A 256 KiB WRITE outlasts any quantum, so its turn also copied the WRITE queued behind it and dropped it,
-  and the next turn peeked and copied that one again. Profiled through Linux's NFSv4.2 client (CI's runner,
-  diagnostics run 41986870989), the peek and the copies out of it were 12.4% of the busy shard's samples during a
-  large write.
-- What: serving a record copies its bytes at least once, so once the records taken hold more bytes than the shard's
-  quantum copies at the measured memcpy rate (`quantum_copy_bytes`), no later record is reached in this turn. Those
-  stay in the kernel's queue, unassembled, for the next turn's peek. The record that crosses the budget is taken, so a
-  turn always has one. A call refused without reading its bytes only ends its turn early. Small pipelined calls still
-  share a turn and a write: their bytes are far below the budget.
-- Proven: `pipelined_writes_past_a_turns_copy_budget_wait_queued_and_every_byte_lands` (failed first: the counter did
-  not exist), and A-74's pipelined-READ test still batches.
-- Measured (BENCHMARKS, "The large-file NFS write profiled"): through Linux's NFSv4.2 client on the incumbent harness,
-  interleaved on one CI runner (run 41989095517), the large write's best of nine went 441.3 → 472.2 MiB/s and +26% at
-  16 workers, with write p99s no worse; in process, 1,644–1,799 → 1,780–1,984 MiB/s over NFSv4.2.
-- On the incumbent client (Docker on the M5 Max, six interleaved rounds at load 23–38) the medians rose 7–9% and the
-  arms overlapped: best of eighteen 1,019.0 on main, 1,007.8 with the change.
 
 ### A-203 — Directory blocks in size classes: each block the smallest of 17 classes, 256 B to 4 KiB, that holds its entries, each class a list of 64 KiB pages from one slab (accepted and built 2026-11-05, Step 13 of the VFS and DAX plan)
 Applied in the same change to: §4.5 (data model), `crates/vfs/src/{dirblocks,dirtree,dir,volume,snapshot,recover}.rs`,
@@ -13461,6 +13536,35 @@ Applied in the same change to: §4.5 (data model), `crates/vfs/src/{dirblocks,di
   once (`a_name_removed_after_it_was_written_leaves_no_hole`): a fitted block's slack is a few dozen bytes, and the first
   build compacted on every few rounds of a create and unlink. A fixed history grows one directory through ten classes, splits
   it, snapshots it and shrinks it, and must see eight classes, the largest among them.
+
+### A-217 — A green's origin is a reference to the base snapshot it holds, not a copy of the tree in the partition (accepted 2026-11-05, the supervisor's decision (a))
+
+> **Status (2026-11-05): reverted from main, with A-207's port.** Checkout (A-201) compares the recorded origin's
+> bytes, so every checkout was refused `ConsistentBaseUnavailable` (main CI 42119714654; GAPS). Re-landing owed.
+
+Applied in the same change to: §4.16's status, A-9's "recorded durably" (now: recorded as a reference and held), GAPS
+(the load-test blockquote), BENCHMARKS, `crates/db` (`Op::GreenOriginHeld`, `OriginRef`,
+`PartitionSnapshot::green_origin_refs`), `crates/server` (`verbs.rs`: `create_green`, `hold_origin_snapshot`,
+`release_origin_snapshot`, `replay_green`, `recorded_pins`, the recovery order, `destroy`; `merge_service.rs`:
+`origin_identity`, `walk_held_origin`, `inputs_of`, `destroy_merge_volume`, `GreenFence::OriginUnavailable`) and
+`crates/server/tests/recovery.rs` (`a_greens_base_snapshot_is_held_and_its_origin_recovered_from_it`).
+- **What was there.** `CreateGreen { base }` walked the snapshot into an origin and recorded its encoded bytes in the
+  partition (`GreenOriginated`), counted against the partition's merge byte budget and rewritten by every partition
+  snapshot; nothing held the snapshot, so its destroy succeeded under a green that came from it. Content is RAM-only, and
+  a kernel-sized origin copied per green cannot reach the scale the load test drives.
+- **The rule.** The partition records the base volume, the snapshot, and the BLAKE3 of the origin's canonical encoding
+  (`GreenOriginHeld`). The green pins the snapshot in its base volume at create, as a clone pins its origin; the
+  snapshot's destroy is refused while the pin stands, and so is the base volume's destroy while any green names one of
+  its snapshots. The pin is released when the green's destroy is recorded. Recovery rebuilds plain volumes first, then
+  greens, then works; a green walks its held snapshot again, refuses (fences) a walk whose identity differs
+  (`OriginCorrupt`) or a base not recovered (`OriginUnavailable`), and recovery's pin reconciliation counts the green's
+  pin with clones' and image volumes'. A record placed at f > 0 encodes version 0's inputs from the held snapshot when it
+  is placed.
+- **Measured** (BENCHMARKS): one client over the kernel's `fs/` (48 MB), interleaved best of three, peak RSS 549,520 KiB
+  before and 225,776 KiB after; `CreateGreen` 415,498,814 ns before and 157,915,124 ns after.
+- **Owed.** A green taken over by another host still records its origin as bytes (the successor holds no base snapshot;
+  raft's fleet path). The engine still holds the origin twice (current content and history), and the overlay holds the
+  pinned copy.
 
 ### A-201 — A green's head lands through a checkout: written into the volume the green was created from, which lands under a grant like any volume (accepted and built 2026-11-04)
 
@@ -13513,6 +13617,29 @@ Applied in the same change to: §4.5 (data model), `crates/vfs/src/{dirblocks,di
   segment is a descriptor only its children hold, so no separate `slates grant` can be issued there (the Linux issuer
   surface is owed, §4.13); the lab's container node therefore stops at the presentation.
 Applied in the same change to: §4.16 (status), GAPS (top blockquote).
+
+### A-204 — An NFS connection's turn takes only the records its quantum can reach (accepted and built 2026-11-05, VFS plan step 11)
+Applied in the same change to: `crates/server/src/nfs.rs` (`read_head`, `turn_copy_budget`, counter
+`nfs.turn.left_queued`), `crates/server/src/config.rs` (`DaemonConfig::quantum_copy_bytes`),
+`crates/server/tests/nfs_hostile.rs`, `crates/cli/examples/nfs_large_write.rs`, A-74's entry, BENCHMARKS, GAPS.
+Status: built 2026-11-05. It amends A-74's turn.
+- Why: a turn copied every whole record its peek found out of the stream buffer, then served them until its quantum
+  was spent. A 256 KiB WRITE outlasts any quantum, so its turn also copied the WRITE queued behind it and dropped it,
+  and the next turn peeked and copied that one again. Profiled through Linux's NFSv4.2 client (CI's runner,
+  diagnostics run 41986870989), the peek and the copies out of it were 12.4% of the busy shard's samples during a
+  large write.
+- What: serving a record copies its bytes at least once, so once the records taken hold more bytes than the shard's
+  quantum copies at the measured memcpy rate (`quantum_copy_bytes`), no later record is reached in this turn. Those
+  stay in the kernel's queue, unassembled, for the next turn's peek. The record that crosses the budget is taken, so a
+  turn always has one. A call refused without reading its bytes only ends its turn early. Small pipelined calls still
+  share a turn and a write: their bytes are far below the budget.
+- Proven: `pipelined_writes_past_a_turns_copy_budget_wait_queued_and_every_byte_lands` (failed first: the counter did
+  not exist), and A-74's pipelined-READ test still batches.
+- Measured (BENCHMARKS, "The large-file NFS write profiled"): through Linux's NFSv4.2 client on the incumbent harness,
+  interleaved on one CI runner (run 41989095517), the large write's best of nine went 441.3 → 472.2 MiB/s and +26% at
+  16 workers, with write p99s no worse; in process, 1,644–1,799 → 1,780–1,984 MiB/s over NFSv4.2.
+- On the incumbent client (Docker on the M5 Max, six interleaved rounds at load 23–38) the medians rose 7–9% and the
+  arms overlapped: best of eighteen 1,019.0 on main, 1,007.8 with the change.
 
 ### A-198 — A WinFsp mount outlives its daemon: the anchor holds the volume's control handle, the drive's link and the mount's ledger, and the next daemon serves the held volume (accepted 2026-11-01, Step 9 of the VFS and DAX plan; built and measured 2026-11-02)
 Applied in the same change to: GAPS (gap 2 of the platform inventory). The build applies it to §4.6 "Windows",

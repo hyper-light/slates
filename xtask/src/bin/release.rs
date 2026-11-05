@@ -19,6 +19,8 @@ use std::process::ExitCode;
 mod release;
 #[path = "../tag.rs"]
 mod tag;
+#[path = "../targets.rs"]
+mod targets;
 
 /// A task failure with a plain-English message; printed and turned into a non-zero exit code.
 #[derive(Debug)]

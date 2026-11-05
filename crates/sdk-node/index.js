@@ -35,12 +35,11 @@ function isMusl() {
 function triple() {
   const { platform, arch } = process
   if (platform === 'darwin') {
-    return arch === 'arm64' ? 'darwin-arm64' : arch === 'x64' ? 'darwin-x64' : null
+    return arch === 'arm64' ? 'darwin-arm64' : null
   }
   if (platform === 'win32') {
     if (arch === 'x64') return 'win32-x64-msvc'
     if (arch === 'arm64') return 'win32-arm64-msvc'
-    if (arch === 'ia32') return 'win32-ia32-msvc'
     return null
   }
   if (platform === 'linux') {

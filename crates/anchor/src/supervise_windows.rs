@@ -200,7 +200,7 @@ impl Hold {
   fn refuse(&mut self, refusal: &HandleRefusal) {
     self.channel_refusals = self.channel_refusals.saturating_add(1);
     if self.logged.first_sighting(refusal) {
-      eprintln!("slates anchor: a hold message was refused: {refusal}");
+      slates_machine::log_line!("slates anchor: a hold message was refused: {refusal}");
     }
   }
 }

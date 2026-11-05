@@ -1,5 +1,76 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A-214, A-217 and A-207's port reverted from main (2026-11-05, by the supervisor); their re-landing is owed.** Main CI
+> 42119714654 on b502cf96 failed six jobs, all from this pairing of landed changes, each green on its own branch:
+> - **A-217 against A-201's checkout.** A-217 records a green's origin as a reference to its base snapshot, and
+>   `checkout` (`crates/server/src/checkout.rs`) compares the recorded origin's bytes with a fresh `seed_origin`'s
+>   encoding, so every checkout was refused `ConsistentBaseUnavailable`: `crates/server/tests/checkout.rs`, 3 of 3 on
+>   Linux and macOS. A-207's port (`661b41b2`) and the load record (`21240d01`) use A-217's ops, so they go with it.
+> - **A-214 against A-205's give-back.** The reserve keeps a write burst's worth of freed content pages pre-faulted,
+>   so `a_deleted_files_memory_leaves_the_working_set_and_recreating_it_reads_every_byte` failed on windows-latest and
+>   windows-11-arm; and A-214's own `arena::tests::an_idle_purge_keeps_the_reserve_and_gives_back_the_rest` fails
+>   under Miri.
+> The reverted tree passes the checkout, mem, rt, merge, recovery and daemon suites on macOS. Owed: nfs-write re-lands
+> A-214 reconciled with A-205's give-back (a reserve the give-back test accounts for, or one that decays) and green
+> under Miri; loadtest re-lands A-217 and A-207 with checkout comparing the base by what A-217 records. Both must run
+> `crates/server/tests/checkout.rs`, the Windows give-back test and Miri before they are handed over. A-204, the
+> harness (`93483514`), the merge windows fix (`d0389720`) and winfsp-overlap-3 stay on main.
+
+> **A private purge's intent can wait up to the 1 s transaction timeout (found 2026-11-05, audit step 7; open).**
+> WinFsp's transact never goes pending: the control dispatch calls `FspVolumeTransact` inline (v2.1 `src/sys/fsctl.c:95-99`),
+> which waits for a request inside the call (`src/sys/volume.c:1171`). So `purge_intents::Intents::wait`, which drains
+> intents while a call is pending, never runs; 0 of 161,073 receives went pending on arm64 (BENCHMARKS, run 41977769822).
+> Intents are drained only after a call returns. `Sender::publish` blocks when its two-message channel is full: a previous
+> End and the next Begin are queued, and that Begin's drive open was refused before any request reached slates. It then
+> waits for the receiver's next return, which on an idle drive is the 1,000 ms transaction timeout. **Planned fix, after
+> audit step 7 lands, as its own change with a failing test first** (a purge whose Begin's open is refused while the
+> drive is idle must not wait out the transaction timeout): a publisher that would block cancels the receive thread's
+> call (`CancelSynchronousIo`), retrying while the cancel finds no call in progress. WinFsp ends a cancelled wait with
+> nothing delivered (`src/sys/driver.h:954-955`, `src/sys/ioq.c:617`, `volume.c:1181-1185`), provided the receiver reads
+> the cancellation as "nothing delivered".
+
+> **WinFsp: a second receive thread would win arm64's remaining ~9 us an IRP and cost x86_64 ~7, and needs a crash
+> proof first (2026-11-05, audit step 7; lever, not planned).** Measured with the open-cost harness (run 42123092900,
+> BENCHMARKS "What a successful open costs under each serving pattern"). arm64: two waiting threads serve a client's
+> open-and-close in 671.9-688.2 us against one thread's 700.9-714.7 us, 8-10 us an IRP. That is the remainder against
+> the DLL, whose two dispatchers wait in turn. x86_64: 146.3-149.3 us against 124.3-134.9 us, about 7 us an IRP slower.
+> Earlier finding, same entry: Tracing every IRP on both arms (diagnostics runs 42086968194, 42091919319 and
+> 42097182526) rejected the two-worker hypothesis for create, stat and open. 71cf09ac's DLL runs one operation at a time
+> under its coarse guard (WinFsp v2.1 `src/dll/fsop.c:80-82`). It saw a request arrive while another was served for about
+> 1 in 10,000 Creates in create and open, and 46 of 10,010 in stat (arm64, quiet). Our receiver got 39,918 of its 39,999
+> stat-phase receives as one request. Rename and unlink do overlap on the DLL arm: arm64 quiet rename Cleanups 9,318 of
+> 20,000, unlink Creates 2,127 of 10,000. A second worker could serve those. **It needs the multi-worker crash proof
+> first:** with two journals, a completed request in one and a newer, live request at the same reused address in the
+> other cannot be told apart. The candidate is a stamp from the system-wide monotonic clock taken right after each receive
+> returns, with recovery answering only the newest delivery at each address. It is unbuilt and unproven. BENCHMARKS, "Where
+> the receiver's time goes".
+
+> **WinFsp on x86_64: in some VM runs our Create and Close services are up to 13x the DLL arm's (2026-11-05, audit step 7;
+> owner winfsp-bench).** In the traced run 42086968194, three runs on `windows-latest`, quiet stat phase, p50: our Close's
+> service was 24.6, 18.4 and 3.5 us against the DLL arm's 1.9-2.7 us. Our Create's was 10.2, 10.2 and 6.4 us against
+> 5.4-5.9 us. In run 42091919319 on another VM the services were level. Our Close does more on the shard than the DLL
+> arm's (the bridge's release, the ledger's retire and the open-name update). The split between runs fits the reply spin
+> (main's `reply.rs`) sometimes missing the shard's answer and paying a park and a wake. Unmeasured; for winfsp-bench,
+> relayed by the supervisor.
+
+> **Correction (2026-11-05, clients): one macOS A/B measured one binary three times.** The macOS arms of
+> 15:47–15:56 UTC (main c0c8d28c, A-208 89382153, a6c3bc16) were built from `git archive` copies into one shared
+> target dir. `git archive` stamps files with their commit's time, older than the outputs already there, so cargo
+> rebuilt nothing after the first. All three binaries are one, main c0c8d28c: identical MD5s. The instrumented
+> `a6c3bc16` bench builds were affected the same way: only the edited bench was rebuilt, so their client library was
+> main's.
+> - **Wrong:** "2 of the 4 parked forms that ran with [a6c3bc16] stalled … without it, none of 15 did", and "the
+>   instrumented bench caught" the churn pause "with a6c3bc16". These are on main through 8d7c6a10 and in
+>   `docs/bugs/2026-11-05-a-call-waited-for-its-acknowledgements-scatter.md`.
+> - **Right:** a6c3bc16 stalled 1 of 9 runs on jupiter, where each arm has its own target dir. On macOS main itself
+>   stalled 1 of 4 parked forms, and the ~1.77 s pause after 64 clients churned was main's code. So the pause, and
+>   the `Stalled` aborts under load, are main's. They fit a defect of main's found since: a scatter whose part's spawn
+>   a full control channel refuses never answers (recorded with A-216).
+> - **Unaffected:** CI and jupiter build each arm in its own target dir, checked, so every CI run and jupiter A/B
+>   stands.
+>
+> Every macOS arm is now built in its own target dir, and arms are compared by MD5 before they run.
+
 > **The large-file NFS write gap (VFS plan step 11, 2026-11-05): closed on the incumbent harness by A-204 and A-214.**
 > The incumbent harness on the M5 Max (six interleaved rounds, load 6–10, 2026-11-05 16:23Z) writes the 64 MiB file
 > at up to 1,286.0 MiB/s with A-214, against 1,033.9 before it and step 11's 967, beyond the spread at 4 and 16
@@ -19,6 +90,26 @@
 > - **Tried and not taken:** populating fresh pages in batches or from a second thread (run 41987962954); filling them
 >   by `pwrite` into the content object (1.9× per fresh page), which R1's lint wall forbids.
 
+> **The many-client load test (loadtest; 2026-11-04 and 2026-11-05): built, its faults fixed or open below.**
+> `crates/client/examples/load_bench.rs` drives N clients over one green seeded from Linux v7.4-rc1 (commit 6628e7d4,
+> 97,242 files, 1.8 GB): overlapping slot edits, a non-idempotent append per client, submits, the corrective path on
+> every conflict, a daemon restart ridden by reconnect and resend; an offline oracle judges every verdict, the green's
+> bytes and each client's own file. Fixed, each with a failing test first: every conflicting window of a file is named
+> (it was the first); a pinned large-class file reads across its extents (no green could start from the kernel tree);
+> A-217, a green's origin is a reference to the base snapshot it holds (peak RSS over `fs/` 549,520 to 225,776 KiB,
+> `CreateGreen` 415 to 158 ms, best of three; `a_greens_base_snapshot_is_held_and_its_origin_recovered_from_it`). Open:
+> - **A volume promised the whole version slab is refused at recovery** (bug record of 2026-11-05): a recovered
+>   snapshot rebuilds its directories privately, one retained version slot each the live volume did not hold (465,831
+>   committed slots before a restart, 465,832 after). Fix owed in `crates/vfs/src/recover.rs`.
+> - **Pinning a tree of many files grows memory far faster than its files, in one unsliced verb**: `kernel/` (754
+>   files) 86,848 KiB, `fs/` (2,365) about 226,000 KiB in 3 of 3 runs, `Documentation/` (11,608, 59 MB) past 12 GB and
+>   `arch/` (18,944, 127 MB) past 9.9 GB inside the pin, which also outlasts the client's 1 s reply deadline; the whole
+>   kernel is killed at a 24 GB cap in its pin. Not root-caused; samples show `Overlay::read_whole` → `copy_up`.
+> - **Memory grows 20 to 29 MB a same-machine connection** (the per-client ring region): the 10k-100k levels go over
+>   the network transport instead (the supervisor's decision (b), 2026-11-05), not yet run.
+
+
+
 > **Merge: the same edit from two works was one increment; fixed 2026-11-04 (§4.16, agents/perf).** The increment's
 > identity left out its work and its base, so a second work's byte-identical edit from the same base was answered from
 > the retry cache with the first work's version, even where the green had since changed that range: a conflict reported
@@ -26,14 +117,17 @@
 > `crates/client/tests/merge_identity.rs`. Record: `docs/bugs/2026-11-04-the-same-edit-from-two-works-was-one-increment.md`.
 > Found by the edit-and-merge latency harness's oracle (`crates/client/examples/edit_merge_bench.rs`).
 >
-> **Merge: a full edit and merge is 51–69 µs at the median whatever the green holds (A-202, 2026-11-04, agents/perf).**
+> **Merge: a full edit and merge is 12–21 µs at the median on quiet Linux CI and 51–69 µs on the shared Mac, whatever the
+> green holds (A-202, 2026-11-04, agents/perf).**
 > A submit's cost had followed the green's size: 14 ms at 1,000 files of 4 KiB. The merge record's identities are now
 > made only for a record that goes to holders, the deriver composes over the base restricted to the journal's paths,
 > and a work holds only the files it changed since its base. Loaded Mac (load 5–11, informational): p50 51–69 µs and
 > p99 0.15–0.36 ms at 10, 1,000 and 10,000 files, every form, but for one run's 1.81 ms (conflict, 10,000 files; BENCHMARKS, "A full edit and merge"). Racing clients'
 > verdicts are judged against the rule (`crates/client/tests/merge_chaos.rs`). 100,000 files: accept p50 60 µs, p99
 > 199 µs on the Mac; CI's 3-core macOS runner (quiet): p50 67–150 µs at 10 to 10,000 files, its partition budget refuses a
-> 400 MB green (chain checkpointing owed). **Open:** the Linux CI numbers; the preferred 50 µs (the fixed cost of the two round trips); the two-machine path (fs-server); the rebase
+> 400 MB green (chain checkpointing owed). Quiet Linux CI (load 1.1–1.6): p50 12–21 µs, p99 43–98 µs at
+> 10 to 100,000 files on x86_64 and aarch64, against main's 4.0–66 ms (BENCHMARKS). **Open:** p99/p999 tails up to 1.1 ms
+> and one 570 ms max on CI; the preferred 50 µs on the shared Mac (the fixed cost of the two round trips); the two-machine path (fs-server); the rebase
 > restates whole. Since A-202 (2026-11-05) the head identity a holder recomputes is a set hash brought up to date when
 > read, so a record at `f > 0` costs what its version changed; its format changed (golden vector in
 > `crates/merge/tests/origin.rs`), so records written before it would not match a newer holder. A daemon `SIGKILL`ed six times mid-merge
@@ -58,19 +152,58 @@
 > Windows' write path below the single WinFsp receiver (A-198); the operations replayed alone pass. Listed as
 > `fsx-seed-1-unfinished:10000`; recorded in the same bug file; owed to the WinFsp dispatcher's owners.
 
-> **Shards counted hardware threads as cores (2026-11-05, A-208, §4.1, R9; fixed, its A/B owed).** §4.1 counts shards in
+> **A call waited for its acknowledgement's scatter (2026-11-05, §4.9, R9; fixed by A-216, its A/B owed).** The
+> synchronous `Client::call` acknowledges every half-ring of replies before its own request, and the daemon answered
+> only after every shard had released the client's records. One call in every half-ring paid the slowest shard's
+> turn. On macOS 133 of 2,000 single-client creates (6.7%) carried one, median 2,497 µs against 169 µs. Windows arm64's
+> single-client p99 was 65.4 / 59.4 / 57.9 µs with the wait and 47.8 / 45.5 / 44.3 µs without it (diag run
+> 42056768929). With another shard held for a second, the call failed `Stalled`. Sending it unawaited (a6c3bc16) put
+> two replies in flight on the sync client and stalled 1 of 9 runs on jupiter, so it was reverted. The macOS stalls
+> once counted against it were main's (the correction at the top). Since A-216 the
+> daemon answers once the client's own shard has released. The other shards' releases run as tracked tasks, and a
+> refused one is counted `ack.release_refused` and taken over by the next watermark. The client still has one reply
+> in flight. Tests, each failing first:
+> - `a_call_is_never_held_behind_the_periodic_acknowledgement` (`Stalled` before);
+> - `a_lagging_release_is_never_met_by_a_request_as_new` (1.197 s before; red-checked);
+> - `a_refused_release_is_counted_and_the_next_watermark_takes_it_over` (never answered before; red-checked).
+>
+> Measured on all five platforms (BENCHMARKS, "The acknowledgement answered once its own shard has released"). On CI
+> (diag run 42082464886), R9's single-client gate is green in every round on Linux x86_64 and arm64 and Windows x86_64
+> and arm64, where main failed five rounds of twelve; Windows arm64 went from 79.0 / 53.7 / 49.1 µs to 42.7 / 42.4 /
+> 43.0 µs. Open and not the acknowledgement:
+> - **jupiter's single-client p99.** It stays red with A-216: its runs range from 65 µs to 3.8 ms, as main's do
+>   (2026-11-05 18:24–18:27 UTC).
+> - **macOS's single-client create.** Its p50 is 60–75 µs in both arms.
+> - **The bench's 8- and 64-client forms aborting `Stalled` at load 23–36 on macOS,** and the ~1.77 s pause after 64
+>   clients churned. Both are main's code; the lost-reply defect below is one cause that fits.
+>
+> Record: `docs/bugs/2026-11-05-a-call-waited-for-its-acknowledgements-scatter.md`.
+>
+> **Next lever (C): do we need the separate acknowledgement at all?** Carry the watermark in every request, so each
+> owner shard releases a client's records when its next request arrives there. No scatter and no extra request.
+> That is a protocol change to the request slot and §4.9.
 
-> **A call waits for its acknowledgement's scatter (2026-11-05, §4.9, R9; OPEN).** The synchronous
-> `Client::call` acknowledges every half-ring of replies before its own request and waits for the reply, which the
-> daemon gives only after every shard has released the client's records. On macOS, 133 of 2,000 single-client creates
-> (6.7%) carried one, median 2,497 µs against 169 µs (a loaded run whose boot probe measured a 2.5 ms wake). That share
-> sets the single-client p99. With another shard held for a second, such a call fails `Stalled`. Sending it unawaited,
-> as the async path does (a6c3bc16), passed its test (Stalled before, 3.62 s after) and the whole client package.
-> But 2 of the 4 parked `provision_bench` forms that ran with it stalled a create past the 1 s reply deadline: one on
-> quiet jupiter, one on macOS. Without it, none of 15 did. Reverted in the next commit, cause not found. Owed:
-> the stall's cause, with a test that reproduces it, before the change returns. Also open, from the same macOS runs at
-> load 23–36: the bench's 8- and 64-client forms aborted `Stalled` in every arm, a live daemon slower than the reply
-> deadline. Record: `docs/bugs/2026-11-05-a-call-waited-for-its-acknowledgements-scatter.md`.
+> **A scatter whose part could not be sent never answered (2026-11-05, §4.9, §4.14; fixed).** `scatter_acknowledge`,
+> `scatter_list`, `scatter_grants` and `scatter_status`, the server's four scatter tables, settled a part whose spawn
+> the other shard's full control channel refused by calling their gather inside `serve`. The nested state borrow is
+> refused without running it, so the reply was never delivered and the entry never removed. Each call, with the other
+> shard's channel filled, was never answered (5 s, main 8d7c6a10's code). Fixed:
+> - **The acknowledgement**, by A-216: the reply is its own shard's, and a refused part is counted `ack.release_refused`.
+> - **A full channel:** the part waits for room for half the client's reply deadline, then the listing, grants or
+>   status answers `Overloaded { shard }`, counted by name.
+> - **A shard gone,** which happens only while the daemon stops: the scatter is removed and counted
+>   (`scatter.shard_gone`), and the client's resend to the next daemon answers it. The driver's restart test needs
+>   that: 15 of 15 with it, where answering `Overloaded` at once failed its first run in every loop.
+>
+> Tests, each failing first:
+> - `a_refused_release_is_counted_and_the_next_watermark_takes_it_over`;
+> - `a_listing_whose_part_cannot_be_sent_is_refused_overloaded`;
+> - `a_grants_listing_whose_part_cannot_be_sent_is_refused_overloaded`;
+> - `a_daemon_status_whose_part_cannot_be_sent_is_refused_overloaded`.
+>
+> Reported, not changed: the three read scatters still settle a part whose *remote* state borrow is refused as empty,
+> so an answer can omit a shard's part as if complete. Record:
+> `docs/bugs/2026-11-05-a-scatter-whose-part-could-not-be-sent-never-answered.md`.
 
 > **Shards counted hardware threads as cores (2026-11-05, A-208, §4.1, R9; fixed and measured).** §4.1 counts shards in
 > physical cores, but the placement counted logical CPUs. jupiter's 16 two-thread cores therefore ran 31 shards and
@@ -125,6 +258,19 @@
 > - AC-1.3 (snapshot and clone flat with size) failed at load 11 to 52 in 3 to 5 of 10 runs on both arms. The gate's
 >   noise allowance does not cover this host's load. It is not caused by the blocks, but it is open.
 
+> **No print macro panics on a closed pipe (2026-11-05, A-213; found by the release agent).** `slates anchor 2>&1
+> >/dev/null | head -n 1` exited 134 once `head` had its line: `eprintln!` and `println!` panic on a refused write, and a
+> pipe whose reader has gone refuses with `EPIPE`. Every shipped site, 266 in all, now writes through
+> `slates_machine::log_line!` or `out_line!`. A refused write is counted and dropped. Both counts show in `slates status`:
+> `log_lines_refused`, the daemon's own, and `anchor_log_lines_refused`, which the anchor writes to the segment. A command
+> whose output was refused exits 4. Every shipped crate's root denies `clippy::print_stdout` and `clippy::print_stderr`
+> outside tests. adacachy, 2026-11-05: the real anchor whose log reader went away ended with exit 101 (debug build) before
+> the fix, and after it kept supervising a killed daemon's successor. On CI's `ubuntu-latest` and `macos-latest` both
+> tests fail without the fix (the anchor exits 101; `slates --help` panics in std's `stdio.rs`; run 42048872612) and pass
+> with it on c0c8d28c, with workspace clippy there and the Windows lint on both Windows lanes (run 42052731305). **Owed:** `xtask` (148 sites),
+> `slates-guest-probe` (11) and `slates-test-seeds` (1) keep their print macros. They do not ship, and a closed pipe still
+> panics them. Record: `docs/bugs/2026-11-05-a-closed-log-pipe-ended-the-anchor.md`.
+
 > **The anchor's hold refusals: a bounded Unix log, and a count in `slates status` (2026-11-04, A-213; siblings of
 > audit step 3).** The Unix device hold logged a line per refused message, unbounded; it now logs each distinct refusal
 > once (`RefusalLog`, as the Windows hold does) and counts every one. Every refusal on either platform's hold channel
@@ -157,6 +303,12 @@
 >   seven binaries, `SHA256SUMS`, the provenance and the attestation bundle. After download, all seven checksums
 >   verified, `gh attestation verify` passed (SLSA v1, seven subjects, `release.yml` at the tag) and refused a
 >   tampered copy, and no SDK lane started. Every number is in A-210.
+> - **The SDK lanes ship the same seven targets (2026-11-05, A-210).** `napi.targets` and the npm platform packages
+>   named `x86_64-apple-darwin` and `i686-pc-windows-msvc`, which are not shipped. `publish-node.yml` built only
+>   seven addons, so its tag-only completeness check would have refused the first publish. The PyPI lane built no
+>   Windows arm64 wheel. Both lanes are now held to `xtask/src/targets.rs` and build Windows natively, and their
+>   checks run on the dry run. Dry runs on 2026-11-05 published nothing: seven wheels and the sdist passed `twine
+>   check` (run 42048582138), and seven addons each landed in their package (run 42055543098).
 > - **Owed to Ada:** a release is published only when a maintainer pushes a real tag `v<version>` and publishes its
 >   draft (`docs/publish.md`). The test draft is never to be published.
 > - **Open, found by the smoke test: the anchor aborts when its stderr closes.** `slates anchor 2>&1 >/dev/null | head
@@ -164,8 +316,13 @@
 >   which `eprintln!` turns into a panic, and `panic = "abort"` makes that an abort. The smoke test's own first
 >   version stopped reading the anchor's stderr after the serving line, and 8 of 10 runs aborted. Owed, in
 >   `crates/cli`: a failing test, then diagnostics that survive a closed stderr.
-> - **Not yet:** reproducibility from the tag (AC-9.5: nothing builds twice and compares); the macOS `Slates.app`
->   bundle, code signing and notarization (B.7; they need an Apple Developer identity); `cargo-binstall` metadata.
+> - **Reproducible from the tag (2026-11-05, AC-9.5).** Every target is built twice on separate runners, and the
+>   release is refused unless the two copies are the same bytes. The four Linux binaries already were. The Windows
+>   ones differed in 20 bytes, the linker's timestamps and PDB GUID (run 42046848954), until `/Brepro`; with it, all six
+>   pairs match (run 42049001999). On the test tag `v0.1.0-test.2` (run 42054339412), all seven pairs matched, macOS
+>   included, and the draft carries both digests of each. The numbers are in A-210.
+> - **Not yet:** the macOS `Slates.app` bundle, code signing and notarization (B.7; they need an Apple Developer
+>   identity); `cargo-binstall` metadata.
 
 > **WinFsp's hold release, DLL version and long paths fixed (2026-11-04, A-206; audit steps 4 and 6).** Run
 > [41978665514](https://github.com/hyper-light/slates/actions/runs/41978665514), `windows-latest` and `windows-11-arm`,
