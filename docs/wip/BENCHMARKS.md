@@ -2154,7 +2154,68 @@ cargo `target/release`, 64 copies each, every heap byte counted), heap bytes an 
 203–250, a 36-entry readdir 479–604 → 510–687, the create burst 1,663–1,697 → 1,765–1,818 ns a file, AC-1.8 destroy
 slices within budget either way, AC-1.5 352,335,998 → 383,350,910 B (the bench's 36-entry directories). Still owed: owed instead: size-classed block slabs (256 B … 4 KiB buffers, each class a slab whose slots are never returned per
 item), a block naming its buffer by class and handle: XFS's progression from in-inode to one block to leaf and node
-forms (Sweeney et al., USENIX 1996) without the global allocator.
+forms (Sweeney et al., USENIX 1996) without the global allocator. Built 2026-11-05 (A-203, "Directory blocks in size
+classes" above): AC-1.5 350,460,030 → 292,914,814 B.
+
+### Directory blocks in size classes (§4.5, AC-1.5, AC-1.8, A-203; 2026-11-05) — adopted
+
+Owed since "Directory blocks against real trees" below. A block is the smallest of 17 classes, 256 B to 4 KiB, four to
+a doubling, that holds its entries. Each class is a list of 64 KiB pages from one slab (`crates/vfs/src/dirblocks.rs`).
+A (1 KiB blocks): main at `21da6e57`. B (classes): `agents/slabs` at `0e16c44a`. Both are release builds of
+`cargo build --release -p slates-vfs --example vfs_bench --example tree_heap` (B's vfs_bench rebuilt at `0e16c44a`).
+Runs are interleaved A B A B…, each run's 1-minute load recorded before it. Apple M5 Max, 18 cores, 128 GB,
+macOS 26.4.1, shared with other agents' builds.
+
+Memory, which no load moves (every run returned the same bytes):
+- AC-1.5 at 10^6 files and 27,842 directories, 46 runs here: A 350,460,030 B in all 23 of its runs (budget
+  366,741,224); B 292,914,814 B in all 23 of its runs (budget 293,620,336). B's 23 include 13 runs of its first build
+  (before the fix below), which holds the same bytes. That is 16.4% less, and under the 4 KiB-block figure of
+  2026-10-05 (352,335,998). The measured directory (36 entries of 49-byte names, 2,644 bytes) is one 3,072-byte block,
+  where it was three 1 KiB leaves and an index. B's budget counts each slab's true slot bytes and the group
+  directories' blocks, which the old block term's slack had hidden.
+- Real trees (`tree_heap`, 64 copies each, every heap byte counted), heap bytes an entry A → B: npm 300 → 260, pip
+  336 → 275, cargo 386 → 293 (13 to 24% less). The 1 KiB block of A-101 had been 332 / 368 / 418 before the inode
+  shrank.
+
+Time, `vfs_bench` best of 10 a row per arm, at loads 11.3 to 21.9 (1-minute average before each run); all ten medians
+in ns, sorted:
+
+| row | A (1 KiB) | B (classes) |
+|---|---|---|
+| lookup one name in a 36-entry dir of a 10^3-file tree | 338 341 343 348 383 411 666 687 687 692 | 223 224 348 348 354 411 567 567 697 708 |
+| same, p99s | 349 354 354 354 421 655 697 708 708 708 | 229 229 354 359 369 421 578 583 708 4,792 |
+| lookup one name in a 36-entry dir of a 10^5-file tree | 343 348 359 395 401 406 562 567 687 692 | 213 354 364 364 401 406 406 665 703 708 |
+| readdir of a 36-entry dir (10^3) | 1,062 1,093 1,229 1,666 1,823 2,125 2,125 2,146 2,187 2,271 | 729 1,062 1,083 1,083 1,250 1,270 1,271 1,567 2,291 2,729 |
+| same, p99s | 2,198 3,042 3,937 4,770 5,000 5,812 6,042 6,833 13,416 14,354 | 2,208 3,000 3,167 3,271 3,459 3,875 4,291 6,562 7,125 17,354 |
+| readdir of a 36-entry dir (10^5) | 1,062 1,083 1,104 1,208 1,250 1,364 1,802 2,104 2,104 2,125 | 666 1,005 1,042 1,062 1,062 1,208 1,218 2,083 2,083 2,198 |
+| create and unlink in a 10^3-file tree | 3,916 3,958 3,958 4,000 4,500 7,584 7,833 7,959 8,000 8,000 | 2,375 2,416 3,875 3,875 3,959 4,625 6,208 6,250 7,213 13,083 |
+| same, p99s | 4,666 4,708 5,167 6,792 7,750 8,666 11,042 14,125 14,709 20,167 | 2,875 4,209 4,667 7,625 7,625 8,750 9,084 11,500 19,390 84,937 |
+| create and unlink in a 10^5-file tree | 3,875 3,916 3,917 4,459 4,583 4,958 6,458 6,542 7,750 7,792 | 2,292 3,791 3,792 3,792 4,291 4,375 4,375 7,375 7,417 7,541 |
+| create burst of 190,000 files, per file (each run's best of 3) | 2,323 2,941 3,268 3,600 3,797 4,502 4,520 4,710 5,744 6,466 | 2,966 3,472 3,609 4,045 4,194 4,248 4,369 5,006 5,915 6,287 |
+| insert and remove, raw tree of 2 | 197 203 205 208 231 234 276 395 403 523 | 247 247 250 255 260 283 481 486 499 520 |
+| insert and remove, raw tree of 8 | 200 200 200 203 231 231 260 395 399 403 | 156 252 255 257 296 359 507 510 520 536 |
+| insert and remove, raw tree of 32 | 351 354 364 369 442 494 708 729 734 750 | 171 177 276 281 286 312 317 562 588 932 |
+| insert and remove, raw tree of 128 | 364 375 380 395 427 494 742 744 750 750 | 323 323 497 541 552 625 1,041 1,041 1,062 1,104 |
+
+Every lookup, readdir and create row is at least as good at its best, and every B p50 and p99 is inside A's spread.
+The burst's best is 28% slower (2,323 → 2,966 ns). Its mid is even (4,150 → 4,221), and B's best is inside A's
+spread. The raw tree probe is 25 to 30% slower at 2 and 4 entries (197 → 247 and 197 → 260 ns), inside A's spread
+(to 523 and 395). That is the two-level reference (page, then slot) on a path of a few dozen instructions. From 8
+entries up it is faster. AC-1.8 (destroy slices) passed in all 23 B runs, no slice past budget. AC-1.3 (snapshot and
+clone independent of size) failed at this load on both arms in both 10-round sets, A 3 and 3 of 10, B 5 and 2 of 10
+(B's first build, then this one), and passed in the rest. Neither
+operation touches a block.
+
+Found on the way and fixed, red test first (`a_name_removed_after_it_was_written_leaves_no_hole`): a fitted block has
+only a few dozen bytes of slack. So a create and unlink of one name, which left the removed name's bytes as a hole,
+compacted the whole block every few rounds. The first B build measured the raw insert and remove at 159 to 333 ns
+best of 13, against A's 119 to 125. The name written last is the lowest in the name area, and its removal now hands
+the bytes back at once.
+
+Not usable, and recorded so it is not repeated: the same binaries on adas-mac-studio-3.local (M4 Max) through
+`kiln run` ran at priority band 4 beside a CI job. `tree_heap` took 143 s of wall time on 3.5 s of CPU, and the
+vfs_bench create burst came out 180 to 280 µs a file on both arms. Only that run's AC-1.5 bytes, identical to the local
+ones, are kept.
 
 ### An idle daemon's cost, and the real workloads again under a TCP-exhausted Docker VM (2026-10-05, afternoon)
 

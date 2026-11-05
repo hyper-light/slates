@@ -1,5 +1,21 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Directory blocks in size classes (A-203, 2026-11-05): VFS plan step 13 done.** A directory's block is the smallest
+> of 17 classes, 256 B to 4 KiB, four to a doubling, that holds its entries. Each class is a list of 64 KiB pages from
+> one slab, and a page that empties goes back for any class (`crates/vfs/src/dirblocks.rs`). AC-1.5 at 10^6 files is
+> 350,460,030 → 292,914,814 B (1 KiB blocks → classes, 23 runs each, identical every run), under the 4 KiB-block figure
+> of 352,335,998. The real trees take 13 to 24% less heap (npm 300 → 260 bytes an entry, pip 336 → 275, cargo
+> 386 → 293). Lookup, readdir and create are at least as good at their best and inside the old spread at p50 and p99
+> (BENCHMARKS "Directory blocks in size classes"). The volume oracle compares the block store with every block the
+> volume reaches after every step (`check_blocks` in `crates/vfs/tests/model.rs`). Open, each measured:
+> - The raw tree's insert and remove at 2 and 4 entries is 25 to 30% slower at the best (197 → 247 ns), inside the
+>   1 KiB spread: the two-level reference (page, then slot).
+> - A store's pages can strand in partly used pages after churn across classes: a block is refused (typed, `SlabFull`)
+>   when no page of its class has a slot and the page cap is reached, though other classes' pages have free slots.
+>   Bonwick's design accepts this; nothing here measures how often it happens.
+> - AC-1.3 (snapshot and clone flat with size) failed at load 11 to 52 in 3 to 5 of 10 runs on both arms. The gate's
+>   noise allowance does not cover this host's load. It is not caused by the blocks, but it is open.
+
 > **The anchor's hold refusals: a bounded Unix log, and a count in `slates status` (2026-11-04, A-213; siblings of
 > audit step 3).** The Unix device hold logged a line per refused message, unbounded; it now logs each distinct refusal
 > once (`RefusalLog`, as the Windows hold does) and counts every one. Every refusal on either platform's hold channel
@@ -5608,7 +5624,8 @@ whole 4,112-byte block, about 400 heap bytes an entry for a pip venv; heap-alloc
 rejected (destroy slices into milliseconds of `dealloc`); blocks are now 1 KiB (A-101): real trees 28–44% less heap
 (npm 332, pip 368, cargo 418 bytes an entry; then 316, 352, 402 with `attribute_of` and `Home`'s parent kept as
 non-zero words, so their `Option`s cost no tag: `Inode` 200 → 184 B); size-classed block slabs, which would fit both small and full
-directories, are owed. Next, each measured: `Option<InodeNo>` 16 B
+directories, were built 2026-11-05 (A-203: npm 300 → 260, pip 336 → 275, cargo 386 → 293 bytes an entry; AC-1.5
+350,460,030 → 292,914,814 B). Next, each measured: `Option<InodeNo>` 16 B
 where a niche gives 8, `Home` 24 B, and directory entries and trie nodes per file. A billion-file volume at even 100 B a
 file is 100 GB on one host: billion-file namespaces need a volume's metadata spread across shards and hosts (a design
 item, not yet decided).

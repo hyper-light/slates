@@ -11425,7 +11425,7 @@ Applied in the same change to: GAPS (boot entry closed, the control-shard siblin
 `crates/server/src/{daemon,config,lib}.rs`, `crates/server/tests/recovery.rs`.
 
 ### A-101 — Directory blocks of 1 KiB, chosen on real trees (2026-10-05)
-Status: built 2026-10-05.
+Status: built 2026-10-05; the one block size is replaced by A-203's size classes (2026-11-05).
 - What: a directory's B+-tree block (`dirtree::BLOCK_BYTES`, §4.5 D-4 `Indexed`) is the smallest power of two that holds
   three entries at the longest name, `3 × (24 + 255)` → 1,024 bytes, where it was a 4 KiB page. `MAX_HEIGHT` follows (at
   least 3 entries a block, `3^21 > u32::MAX`: 21).
@@ -13095,6 +13095,47 @@ Release about 2× the DLL arm's on arm64, and SetSize about 4× under load, whic
 
 Applied in the same change to: GAPS (the audit entry's unmeasured-receiver item); `crates/bridge-winfsp/src/dispatcher.rs`,
 `inflight/capture.rs`, `purge_intents.rs`, `notify.rs` and `host.rs`.
+
+### A-203 — Directory blocks in size classes: each block the smallest of 17 classes, 256 B to 4 KiB, that holds its entries, each class a list of 64 KiB pages from one slab (accepted and built 2026-11-05, Step 13 of the VFS and DAX plan)
+Applied in the same change to: §4.5 (data model), `crates/vfs/src/{dirblocks,dirtree,dir,volume,snapshot,recover}.rs`,
+`crates/vfs/tests/model.rs`, `crates/vfs/examples/{vfs_bench,tree_heap}.rs`, the server's boot-log formula
+(`crates/server/src/config.rs`), BENCHMARKS ("Directory blocks in size classes"), GAPS.
+- What: a directory's B+-tree block (D-4 `Indexed`) is the smallest size class that holds its live entries. The classes
+  run from 256 bytes to 4 KiB, four to a doubling (256, 320, 384, 448, 512, …, 3,584, 4,096: seventeen). A block that
+  cannot take an insert grows to the class that can, one copy into a fresh block. A full 4 KiB block splits by bytes,
+  and both halves go to the class that fits them. A removal that leaves a block under half its class shrinks it, and
+  a block under a quarter of 4 KiB merges with its right sibling, whenever the store has a block to give: a removal
+  never needs room. So every block is at most twice the class that fits it. A-101's single 1 KiB block size is
+  replaced.
+- Storage (`crates/vfs/src/dirblocks.rs`): each class is a list of 64 KiB pages of its slots, and every page comes from
+  one slab of pages (Bonwick's slab cache over a page pool [A: Bonwick USENIX'94]). A page with a free slot is on its
+  class's list, intrusively linked. A page whose last block is freed goes back to the slab, where any class takes it
+  again. So the classes share memory, and nothing reaches the global allocator per block. A block is named by its
+  page's handle, its slot (one byte: a page has at most 256 slots) and the slot's generation (24 bits, retired at its
+  limit for the page's life, AUD-29-11's rule). An index entry carries the slot word in the packed word's spare high
+  half, so the entry format keeps its 24 bytes.
+- Bounds: the live blocks are at most the store's block cap (`max_dir_blocks`), so the refusal sweep still steps a
+  block at a time. The pages are at most that cap's smallest-class bytes in whole pages, plus a page for every class
+  (`BlockStore::max_pages`). A directory's metadata unit is its node and a smallest block's share of a page
+  (`directory_unit_bytes`): the median real directory's block is that class (A-101's medians of 4 to 6 entries).
+  Admission reserves a page for every block a mutation can make, and two new blocks a level for a cascade (a grown
+  block, or a split's sibling and its fitted other half) plus a new root.
+- Why the class spacing: power-of-two classes cannot beat a 4 KiB block on the measured directory (36 entries of
+  49-byte names, 2,644 bytes, take the 4 KiB class). This was the 2026-10-05 heap-buffer experiment's 352,721,118 B.
+  Four to a doubling bounds a block's slack at a fifth and copies a growing block a constant number of times a byte
+  [C: jemalloc `sc.h`, `SC_LG_NGROUP` 2].
+- Evidence (BENCHMARKS, "Directory blocks in size classes", 2026-11-05): AC-1.5 at 10^6 files 350,460,030 → 292,914,814 B (1 KiB blocks → classes, 23 runs each, every run identical; under the 4 KiB-block figure of 352,335,998); the real trees
+  (`tree_heap`, 64 copies each) npm 300 → 260 heap bytes an entry, pip 336 → 275, cargo 386 → 293; `vfs_bench`'s lookup, readdir and create rows at least as good at their best and inside the 1 KiB spread at p50 and
+  p99 (best of 10, interleaved, load 11 to 22), the burst's best 2,323 → 2,966 ns a file inside its spread, and the raw tree's
+  insert and remove 25 to 30% slower at 2 and 4 entries, inside its spread, faster from 8 up.
+- Oracles: the store against a map model on generated histories (`dirblocks::tests`); the tree against an ordered map
+  with the class rule after every operation (`dirtree::tests`); and the volume oracle (`crates/vfs/tests/model.rs`
+  `check_blocks`), which after every step compares the store with every block the volume reaches: the head's, the
+  snapshots' and their deadlists'. The comparison is block for block, the class census matches, the class lists are
+  sound, and every block is within the class rule. Also, a removed name that is the block's lowest gives its bytes back at
+  once (`a_name_removed_after_it_was_written_leaves_no_hole`): a fitted block's slack is a few dozen bytes, and the first
+  build compacted on every few rounds of a create and unlink. A fixed history grows one directory through ten classes, splits
+  it, snapshots it and shrinks it, and must see eight classes, the largest among them.
 
 ### A-198 — A WinFsp mount outlives its daemon: the anchor holds the volume's control handle, the drive's link and the mount's ledger, and the next daemon serves the held volume (accepted 2026-11-01, Step 9 of the VFS and DAX plan; built and measured 2026-11-02)
 Applied in the same change to: GAPS (gap 2 of the platform inventory). The build applies it to §4.6 "Windows",
