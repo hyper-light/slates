@@ -285,16 +285,12 @@ impl Supervisor {
     Ok(())
   }
 
-  /// Applies a bounded turn of Windows hold messages without waiting; the number applied. A reply whose quota is full
-  /// remains pending. A message the channel refuses (short, a checksum that does not match, an unknown shape), or a
-  /// reply it cannot write, is counted in `handle_refusals` and dropped, as the Unix device hold counts its refusals:
-  /// what a daemon sends never ends supervision. Before 2026-11-03 one malformed message made `step` fail, which ended
-  /// the anchor and, through its kill-on-close job, the daemon and every held drive.
+  /// Applies a bounded turn of Windows hold messages without waiting. A reply whose quota is full remains pending.
   #[cfg(windows)]
-  pub fn drain_handles(&mut self) -> usize {
+  pub fn drain_handles(&mut self) -> Result<usize, crate::handles::HandleRefusal> {
     match (&mut self.windows_handles, &self.child) {
       (Some(hold), Some(child)) => hold.drain(child.raw()),
-      _ => 0,
+      _ => Ok(0),
     }
   }
 
@@ -304,8 +300,7 @@ impl Supervisor {
     self.windows_handles.as_ref().map_or(0, windows::Hold::len)
   }
 
-  /// Windows holds refused by shape, source-handle validation or the attachment-derived bound, and the channel's own
-  /// refusals: a message it could not read whole or decode, or a reply it could not write.
+  /// Windows holds refused by shape, source-handle validation or the attachment-derived bound.
   #[cfg(windows)]
   pub fn handle_refusals(&self) -> u64 {
     self
@@ -574,7 +569,7 @@ impl Supervisor {
     #[cfg(unix)]
     self.drain_devices();
     #[cfg(windows)]
-    self.drain_handles();
+    self.drain_handles()?;
     if let Some(retry_at_ns) = self.retry_at_ns {
       if now_ns < retry_at_ns {
         return Ok(Step::BackingOff { retry_at_ns });

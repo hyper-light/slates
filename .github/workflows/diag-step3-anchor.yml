@@ -1,0 +1,35 @@
+name: diag-step3-anchor
+on:
+  push:
+    branches: ['diag-step3-anchor-*']
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  anchor:
+    name: anchor hold red (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: The hold tests on the old sources, three runs, each result as an annotation
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          status=0
+          for run in 1 2 3; do
+            cargo test -p slates-anchor --test handles_windows -- --test-threads=1 --nocapture > out.log 2>&1 || status=1
+            cat out.log
+            grep -E "^test result|ended supervision|^  left|^ right|: Ok\(|: Err\(" out.log | while read -r line; do
+              echo "::notice title=run $run::$line"
+            done
+          done
+          exit $status

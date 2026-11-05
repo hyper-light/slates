@@ -92,9 +92,6 @@ pub(super) struct Hold {
   daemon: Channel,
   held: Held,
   pending: Option<HandleMessage>,
-  /// Messages the channel refused (not read whole or not decoded) and replies it could not write, over the anchor's
-  /// life; the holdings' own refusals are `held`'s.
-  channel_refusals: u64,
 }
 
 impl Hold {
@@ -105,7 +102,6 @@ impl Hold {
       daemon,
       held: Held::new(bound),
       pending: None,
-      channel_refusals: 0,
     })
   }
 
@@ -123,61 +119,39 @@ impl Hold {
     self.held.len()
   }
   pub(super) fn refusals(&self) -> u64 {
-    self.held.refusals().saturating_add(self.channel_refusals)
+    self.held.refusals()
   }
 
   /// A drain admits at most a hold and release per slot. Reads and reply writes have zero wait; a full reply quota
-  /// leaves the one pending acknowledgement for the next turn instead of blocking supervision. A message the channel
-  /// refuses is counted and dropped, and the drain reads on, since the next message may be whole; any other refusal of a
-  /// read is counted and ends this turn's drain. A reply the channel cannot write is counted and dropped: its daemon's
-  /// own wait ends at its deadline, a typed refusal there. Nothing a daemon sends ends supervision.
-  pub(super) fn drain(&mut self, daemon: HANDLE) -> usize {
+  /// leaves the one pending acknowledgement for the next turn instead of blocking supervision.
+  pub(super) fn drain(&mut self, daemon: HANDLE) -> Result<usize, HandleRefusal> {
     let mut applied = 0usize;
     for _ in 0..self.held.bound().saturating_mul(MESSAGES_PER_ENTRY).max(1) {
-      if !self.reply() {
+      if !self.reply()? {
         break;
       }
-      match self.anchor.recv(0) {
-        Ok(None) => break,
-        Ok(Some(message)) => {
-          self.pending = self.held.apply(daemon, message);
-          applied = applied.saturating_add(1);
-        }
-        Err(refusal) => {
-          self.refuse(&refusal);
-          if !matches!(refusal, HandleRefusal::Malformed { .. }) {
-            break;
-          }
-        }
-      }
+      let Some(message) = self.anchor.recv(0)? else {
+        break;
+      };
+      self.pending = self.held.apply(daemon, message);
+      applied = applied.saturating_add(1);
     }
-    self.reply();
-    applied
+    self.reply()?;
+    Ok(applied)
   }
 
-  /// Sends the pending reply, if any: `false` while the peer's quota is full (it stays pending for the next turn).
-  fn reply(&mut self) -> bool {
+  fn reply(&mut self) -> Result<bool, HandleRefusal> {
     let Some(message) = self.pending.as_ref() else {
-      return true;
+      return Ok(true);
     };
     match self.anchor.send(message, 0) {
       Ok(()) => {
         self.pending = None;
-        true
+        Ok(true)
       }
-      Err(HandleRefusal::TimedOut) => false,
-      Err(refusal) => {
-        self.pending = None;
-        self.refuse(&refusal);
-        true
-      }
+      Err(HandleRefusal::TimedOut) => Ok(false),
+      Err(error) => Err(error),
     }
-  }
-
-  /// Counts a refusal of the channel and says what it was; the holdings are untouched.
-  fn refuse(&mut self, refusal: &HandleRefusal) {
-    self.channel_refusals = self.channel_refusals.saturating_add(1);
-    eprintln!("slates-anchor: hold channel refused: {refusal}");
   }
 }
 
