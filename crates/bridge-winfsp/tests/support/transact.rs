@@ -19,7 +19,7 @@ use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 use windows_sys::Win32::Foundation::{
-  CloseHandle, ERROR_IO_PENDING, GENERIC_READ, INVALID_HANDLE_VALUE,
+  CloseHandle, ERROR_IO_PENDING, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, OPEN_EXISTING};
 use windows_sys::Win32::System::IO::{DeviceIoControl, GetOverlappedResult, OVERLAPPED};
@@ -191,6 +191,171 @@ fn ranks(samples: &mut [u64]) -> String {
   )
 }
 
+/// The memory each mode's output lies in: private pages, and a pagefile section's view as the held one is.
+struct Buffers {
+  private: *mut core::ffi::c_void,
+  section: HANDLE,
+  view: MEMORY_MAPPED_VIEW_ADDRESS,
+}
+
+impl Buffers {
+  fn new() -> Self {
+    // SAFETY: a fresh private allocation of LARGEST bytes, released in drop.
+    let private = unsafe {
+      VirtualAlloc(
+        std::ptr::null(),
+        LARGEST,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE,
+      )
+    };
+    assert!(!private.is_null());
+    // SAFETY: an unnamed pagefile-backed section of LARGEST bytes; closed in drop.
+    let section = unsafe {
+      CreateFileMappingW(
+        INVALID_HANDLE_VALUE,
+        std::ptr::null(),
+        PAGE_READWRITE,
+        0,
+        LARGEST as u32,
+        std::ptr::null(),
+      )
+    };
+    assert!(!section.is_null());
+    // SAFETY: the section just made, viewed whole; unmapped in drop.
+    let view = unsafe { MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, LARGEST) };
+    assert!(!view.Value.is_null());
+    Self {
+      private,
+      section,
+      view,
+    }
+  }
+
+  /// The output for `mode`, lent until the next call.
+  fn output(&mut self, mode: &Mode) -> &mut [u8] {
+    let base = if mode.section {
+      self.view.Value.cast::<u8>()
+    } else {
+      self.private.cast::<u8>()
+    };
+    // SAFETY: both regions are LARGEST bytes, owned here, touched by this thread alone; a mode's length is at most that.
+    unsafe { std::slice::from_raw_parts_mut(base, mode.bytes.min(LARGEST)) }
+  }
+}
+
+impl Drop for Buffers {
+  fn drop(&mut self) {
+    // SAFETY: the regions and handle made in new, each released once; no call is outstanding.
+    unsafe {
+      UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+        Value: self.view.Value,
+      });
+      CloseHandle(self.section);
+      VirtualFree(self.private, 0, MEM_RELEASE);
+    }
+  }
+}
+
+/// The driver must refuse a batch output under its minimum, before any wait.
+fn refusals(control: HANDLE, event: HANDLE, buffers: &mut Buffers) {
+  for refused in [16 * 1024, 4 * 1024] {
+    let mode = Mode {
+      name: "refused",
+      code: TRANSACT_BATCH,
+      bytes: refused,
+      section: true,
+    };
+    let answer = transact(control, event, TRANSACT_BATCH, &[], buffers.output(&mode));
+    eprintln!(
+      "WINFSP TRANSACT batch output {refused} bytes: {answer:?} (Win32 122 is the driver's STATUS_BUFFER_TOO_SMALL)"
+    );
+    assert!(
+      answer.is_err(),
+      "the driver must refuse a batch output under its minimum"
+    );
+  }
+}
+
+/// One client opening absent names until `stop`, each open's time kept under the mode it began and ended in.
+fn client(drive: &str, mode: &AtomicUsize, stop: &AtomicBool) -> Vec<Vec<u64>> {
+  let mut opens: Vec<Vec<u64>> = MODES.iter().map(|_| Vec::new()).collect();
+  let mut number = 0u64;
+  while !stop.load(Ordering::Relaxed) {
+    let path: Vec<u16> = format!("{drive}\\absent-{number}")
+      .encode_utf16()
+      .chain(Some(0))
+      .collect();
+    number += 1;
+    let before = mode.load(Ordering::Relaxed);
+    let started = Instant::now();
+    // SAFETY: a NUL-terminated path; the handle, if any, is closed at once.
+    let handle = unsafe {
+      CreateFileW(
+        path.as_ptr(),
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        std::ptr::null(),
+        OPEN_EXISTING,
+        0,
+        std::ptr::null_mut(),
+      )
+    };
+    let took = started.elapsed().as_nanos() as u64;
+    if handle != INVALID_HANDLE_VALUE {
+      // SAFETY: the handle just opened.
+      unsafe { CloseHandle(handle) };
+    }
+    if mode.load(Ordering::Relaxed) == before {
+      opens[before].push(took);
+    }
+  }
+  opens
+}
+
+/// Serves PER_ROUND Creates in `index`'s mode, keeping each call's time unless warming up.
+fn serve(
+  control: HANDLE,
+  event: HANDLE,
+  buffers: &mut Buffers,
+  index: usize,
+  responses: &mut Vec<u8>,
+  calls: Option<&mut Vec<u64>>,
+) {
+  let chosen = &MODES[index];
+  let mut kept = calls;
+  let mut served = 0;
+  while served < PER_ROUND {
+    let output = buffers.output(chosen);
+    let started = Instant::now();
+    let delivered = transact(control, event, chosen.code, responses, output).unwrap();
+    let took = started.elapsed().as_nanos() as u64;
+    let creates = answer(&output[..delivered], responses);
+    if creates > 0 {
+      if let Some(calls) = kept.as_mut() {
+        calls.push(took);
+      }
+    }
+    served += creates;
+  }
+}
+
+/// Answers whatever the client sent until it has stopped, so its last open is refused and it sees `stop`.
+fn drain(
+  control: HANDLE,
+  event: HANDLE,
+  buffers: &mut Buffers,
+  responses: &mut Vec<u8>,
+  client: &std::thread::ScopedJoinHandle<'_, Vec<Vec<u64>>>,
+) {
+  while !client.is_finished() {
+    let output = buffers.output(&MODES[2]);
+    if let Ok(delivered) = transact(control, event, TRANSACT_BATCH, responses, output) {
+      answer(&output[..delivered], responses);
+    }
+  }
+}
+
 /// Audit step 7. Do: mount a WinFsp volume answered by this test's own loop, open absent names from one client, and
 /// make the transaction each round in every mode in turn. Expect: each mode's call and client latencies printed with
 /// every rank; a batch output under the driver's minimum is refused, before any wait.
@@ -221,143 +386,37 @@ fn transact_cost() {
   // SAFETY: an unnamed manual-reset event; no borrowed descriptor or name.
   let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
   assert!(!event.is_null());
-  // SAFETY: a fresh private allocation of LARGEST bytes, released below.
-  let private = unsafe {
-    VirtualAlloc(
-      std::ptr::null(),
-      LARGEST,
-      MEM_COMMIT | MEM_RESERVE,
-      PAGE_READWRITE,
-    )
-  };
-  assert!(!private.is_null());
-  // SAFETY: an unnamed pagefile-backed section of LARGEST bytes, viewed whole; both closed below.
-  let section = unsafe {
-    CreateFileMappingW(
-      INVALID_HANDLE_VALUE,
-      std::ptr::null(),
-      PAGE_READWRITE,
-      0,
-      LARGEST as u32,
-      std::ptr::null(),
-    )
-  };
-  assert!(!section.is_null());
-  // SAFETY: as above.
-  let view = unsafe { MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, LARGEST) };
-  assert!(!view.Value.is_null());
-  // SAFETY: both regions are LARGEST bytes, owned here, and only this thread touches them until they are freed.
-  let (private_bytes, section_bytes) = unsafe {
-    (
-      std::slice::from_raw_parts_mut(private.cast::<u8>(), LARGEST),
-      std::slice::from_raw_parts_mut(view.Value.cast::<u8>(), LARGEST),
-    )
-  };
-  for refused in [16 * 1024, 4 * 1024] {
-    let answer = transact(
-      control,
-      event,
-      TRANSACT_BATCH,
-      &[],
-      &mut section_bytes[..refused],
-    );
-    eprintln!(
-      "WINFSP TRANSACT batch output {refused} bytes: {answer:?} (Win32 122 is the driver's STATUS_BUFFER_TOO_SMALL)"
-    );
-    assert!(
-      answer.is_err(),
-      "the driver must refuse a batch output under its minimum"
-    );
-  }
+  let mut buffers = Buffers::new();
+  refusals(control, event, &mut buffers);
   let mode = AtomicUsize::new(0);
   let stop = AtomicBool::new(false);
   let mut calls: Vec<Vec<u64>> = MODES.iter().map(|_| Vec::new()).collect();
-  let client = std::thread::scope(|scope| {
-    let client = scope.spawn(|| {
-      let mut opens: Vec<Vec<u64>> = MODES.iter().map(|_| Vec::new()).collect();
-      let mut number = 0u64;
-      while !stop.load(Ordering::Relaxed) {
-        let path: Vec<u16> = format!("{drive}\\absent-{number}")
-          .encode_utf16()
-          .chain(Some(0))
-          .collect();
-        number += 1;
-        let before = mode.load(Ordering::Relaxed);
-        let started = Instant::now();
-        // SAFETY: a NUL-terminated path; the handle, if any, is closed at once.
-        let handle = unsafe {
-          CreateFileW(
-            path.as_ptr(),
-            GENERIC_READ,
-            FILE_SHARE_READ,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            0,
-            std::ptr::null_mut(),
-          )
-        };
-        let took = started.elapsed().as_nanos() as u64;
-        if handle != INVALID_HANDLE_VALUE {
-          // SAFETY: the handle just opened.
-          unsafe { CloseHandle(handle) };
-        }
-        if mode.load(Ordering::Relaxed) == before {
-          opens[before].push(took);
-        }
-      }
-      opens
-    });
+  let opens = std::thread::scope(|scope| {
+    let running = scope.spawn(|| client(&drive, &mode, &stop));
     let mut responses = Vec::new();
-    let mut warm = true;
     for round in 0..=ROUNDS {
       for offset in 0..MODES.len() {
         let index = (round + offset) % MODES.len();
-        let chosen = &MODES[index];
         mode.store(index, Ordering::Relaxed);
-        let mut served = 0;
-        while served < PER_ROUND {
-          let output = if chosen.section {
-            &mut section_bytes[..chosen.bytes]
-          } else {
-            &mut private_bytes[..chosen.bytes]
-          };
-          let started = Instant::now();
-          let delivered = transact(control, event, chosen.code, &responses, output).unwrap();
-          let took = started.elapsed().as_nanos() as u64;
-          let creates = answer(&output[..delivered], &mut responses);
-          if creates > 0 && !warm {
-            calls[index].push(took);
-          }
-          served += creates;
-        }
+        let kept = (round > 0).then(|| &mut calls[index]);
+        serve(control, event, &mut buffers, index, &mut responses, kept);
       }
-      warm = false;
     }
     stop.store(true, Ordering::Relaxed);
-    // Answer whatever the client's last open sent, so it can see its refusal and stop.
-    while !client.is_finished() {
-      let output = &mut section_bytes[..BATCH_MIN];
-      if let Ok(delivered) = transact(control, event, TRANSACT_BATCH, &responses, output) {
-        answer(&output[..delivered], &mut responses);
-      }
-    }
-    client.join().unwrap()
+    drain(control, event, &mut buffers, &mut responses, &running);
+    running.join().unwrap()
   });
   for (index, chosen) in MODES.iter().enumerate() {
-    let mut opens = client[index].clone();
+    let mut client_opens = opens[index].clone();
     eprintln!(
       "WINFSP TRANSACT mode={} call {} | client open {}",
       chosen.name,
       ranks(&mut calls[index]),
-      ranks(&mut opens)
+      ranks(&mut client_opens)
     );
   }
-  // SAFETY: the regions and handles made above, each released once; no call is outstanding.
-  unsafe {
-    UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.Value });
-    CloseHandle(section);
-    VirtualFree(private, 0, MEM_RELEASE);
-    CloseHandle(event);
-  }
+  drop(buffers);
+  // SAFETY: the event made above, closed once; no call is outstanding.
+  unsafe { CloseHandle(event) };
   drop(mounted);
 }
