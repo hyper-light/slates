@@ -621,7 +621,7 @@ pub(crate) fn split_held(
     if let Some(slot) = split.get_mut(target) {
       slot.push(held);
     } else {
-      eprintln!(
+      slates_machine::log_line!(
         "slates-server: no shard can adopt held mount {}",
         attachment
       );
@@ -638,7 +638,7 @@ fn checked_inherited(mount: crate::anchor_hold::HandedMount) -> Option<Inherited
   let record = match HeldRecord::decode(&mount.record) {
     Ok(record) => record,
     Err(error) => {
-      eprintln!(
+      slates_machine::log_line!(
         "slates-server: held mount {} record refused: {error:?}",
         mount.attachment
       );
@@ -648,7 +648,7 @@ fn checked_inherited(mount: crate::anchor_hold::HandedMount) -> Option<Inherited
   let mut handles = mount.handles.into_iter();
   let (Some(volume), Some(link), Some(ledger)) = (handles.next(), handles.next(), handles.next())
   else {
-    eprintln!(
+    slates_machine::log_line!(
       "slates-server: held mount {} has fewer than three handles",
       mount.attachment
     );
@@ -680,11 +680,11 @@ pub(crate) fn adopt_held() {
     })
     .and_then(futures::detach)
   {
-    eprintln!("slates-server: orphaned mount release task refused: {error}");
+    slates_machine::log_line!("slates-server: orphaned mount release task refused: {error}");
   }
   for (record, held) in kept {
     if let Err(error) = futures::spawn(adopt_mount(record, held)).and_then(futures::detach) {
-      eprintln!("slates-server: mount adoption task refused: {error}");
+      slates_machine::log_line!("slates-server: mount adoption task refused: {error}");
     }
   }
 }
@@ -735,10 +735,10 @@ async fn adopt_mount(record: AttachmentRecord, held: InheritedMount) {
 }
 
 fn refuse_adoption(s: &mut ShardState, record: &AttachmentRecord, why: &str) {
-  eprintln!("slates-server: mount {} adoption refused: {why}", record.id);
+  slates_machine::log_line!("slates-server: mount {} adoption refused: {why}", record.id);
   s.count("winfsp.adopt_refused", 1);
   if let Err(error) = crate::verbs::end_attachment(s, record, crate::verbs::Ending::Otherwise) {
-    eprintln!("slates-server: refused mount end failed: {error:?}");
+    slates_machine::log_line!("slates-server: refused mount end failed: {error:?}");
     s.count(END_REFUSED, 1);
   }
 }
@@ -782,7 +782,9 @@ async fn release_hold(attachment: u64) {
   let mut told = false;
   while let Err(error) = release_attempt(attachment).await {
     if !told {
-      eprintln!("slates-server: mount {attachment} hold release refused: {error}; repeating it");
+      slates_machine::log_line!(
+        "slates-server: mount {attachment} hold release refused: {error}; repeating it"
+      );
       told = true;
     }
     crate::daemon::pace(tick_ns()).await;
@@ -885,7 +887,7 @@ async fn reap(mut thread: MountThread, attachment: u64, released: bool) {
         Outcome::Mounted(_) | Outcome::Notified(..) | Outcome::Purged(_) | Outcome::Recovered(_),
       ) => {}
       Some(Outcome::Failed(error)) => {
-        eprintln!("slates-server: ending WinFsp receive worker: {error}")
+        slates_machine::log_line!("slates-server: ending WinFsp receive worker: {error}")
       }
       None => futures::idle().await,
     }
@@ -1050,7 +1052,7 @@ fn reconcile_opens(s: &mut ShardState, mount: &mut WinFspMount) -> Option<Turned
       Some(Turned::Served)
     }
     Err(error) => {
-      eprintln!("slates-server: WinFsp open-reference recovery refused: {error}");
+      slates_machine::log_line!("slates-server: WinFsp open-reference recovery refused: {error}");
       mount.ending = true;
       Some(Turned::Ended)
     }
@@ -1112,7 +1114,7 @@ fn take_outcomes(s: &mut ShardState, mount: &mut WinFspMount) -> Result<bool, ()
       Outcome::Mounted(_) => {}
       Outcome::Recovered(count) => s.count(CAPTURED_SETTLED, count),
       Outcome::Failed(error) => {
-        eprintln!("slates-server: WinFsp receive worker failed: {error}");
+        slates_machine::log_line!("slates-server: WinFsp receive worker failed: {error}");
         mount.ending = true;
         s.count(MOUNT_LOST, 1);
       }

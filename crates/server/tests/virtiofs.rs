@@ -753,6 +753,24 @@ mod vhost_front_end {
       assert_eq!(sent, message.len());
     }
 
+    /// Whether the back end has closed its end, probed with a `GET_QUEUE_NUM`: a device that ends on a refusal may
+    /// close its socket before the probe is sent (the send is refused `EPIPE` or `ECONNRESET`) or after (the probe is
+    /// never answered), and both mean closed. Main CI 42083757327 met the first: the probe's send panicked `EPIPE`.
+    pub(crate) fn closed(&self) -> bool {
+      let mut message = Vec::new();
+      message.extend_from_slice(&request::GET_QUEUE_NUM.to_le_bytes());
+      message.extend_from_slice(&VERSION.to_le_bytes());
+      message.extend_from_slice(&0u32.to_le_bytes());
+      match rustix::net::send(&self.socket, &message, SendFlags::NOSIGNAL) {
+        Err(rustix::io::Errno::PIPE | rustix::io::Errno::CONNRESET) => true,
+        Err(other) => panic!("probing the back end: {other}"),
+        Ok(sent) => {
+          assert_eq!(sent, message.len());
+          self.reply().is_none()
+        }
+      }
+    }
+
     /// The next reply's payload, or `None` when the back end closed its end.
     pub(crate) fn reply(&self) -> Option<Vec<u8>> {
       let mut header = [0u8; HEADER_LEN];
@@ -1840,8 +1858,7 @@ mod vhost_form {
       0,
       "a ring whose stop awaits its chain is not moved"
     );
-    front.send(request::GET_QUEUE_NUM, 0, &[], &[]);
-    assert!(front.reply().is_none(), "the refused device closed its end");
+    assert!(front.closed(), "the refused device closed its end");
     wait_for_attachments(&mut client, volume, 1);
     drop(window);
     drop(front);

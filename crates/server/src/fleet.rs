@@ -948,7 +948,7 @@ pub async fn run_membership(transport: FleetTransport) {
   // `Daemon::council_timing` / `slates status` read the live values.
   let floor = ElectionTiming::floor();
   let round = consensus_budget(None);
-  eprintln!(
+  slates_machine::log_line!(
     "slates-server: fleet timing: election timeout = {} × max(broadcast RTT tail over the voters, heartbeat {} ns) = {} periods at the floor (span the same over the tail's spread: {} periods); round budget base = max(heartbeat, tail) = {} ns, stall = max({} periods, tail) = {} ns, extensions {} × {} ns; no path measured yet",
     slates_cluster::timing::ELECTION_MARGIN,
     HEARTBEAT_NS,
@@ -1068,7 +1068,7 @@ async fn run_demux(demux: DemuxId) {
     // Counted for `status`, and said once in the log with its reason: a node that silently stopped
     // accepting sessions on a plane is a mesh that never forms with nothing to read but a count.
     count_refusal(SERVE_REFUSED);
-    eprintln!("slates-server: fleet: a serve socket's receive loop ended: {e:?}");
+    slates_machine::log_line!("slates-server: fleet: a serve socket's receive loop ended: {e:?}");
   }
 }
 
@@ -1136,7 +1136,7 @@ pub(crate) async fn resolve_peer_address(
           // The first refusal of each kind is logged once, so an operator's first look at the daemon's log
           // names the cause; the counts in `status` carry the rest.
           if count_refusal(resolve_refusal(&e)) == 1 {
-            eprintln!("slates-server: fleet: resolving `{host}`: {e}");
+            slates_machine::log_line!("slates-server: fleet: resolving `{host}`: {e}");
           }
           return None;
         }
@@ -1222,7 +1222,7 @@ async fn establish_session(
       Err(EndpointError::NotReady) => {
         // Counted, and said once: a dialer that keeps dialing afresh names the peer it cannot reach.
         if count_refusal(DIAL_REDIAL) == 1 {
-          eprintln!(
+          slates_machine::log_line!(
             "slates-server: fleet: no reply from {address} through {ESTABLISH_BUDGETS_BEFORE_REDIAL} handshake budgets; dialing afresh from a new port"
           );
         }
@@ -1230,7 +1230,9 @@ async fn establish_session(
       }
       Err(e) => {
         if count_refusal(DIAL_FAULT) == 1 {
-          eprintln!("slates-server: fleet: the handshake to {address} faulted: {e:?}");
+          slates_machine::log_line!(
+            "slates-server: fleet: the handshake to {address} faulted: {e:?}"
+          );
         }
         (None, None)
       }
@@ -3915,7 +3917,9 @@ fn count_accept_failure(error: &EndpointError, plane: &str) {
     _ => ACCEPT_HANDSHAKE_REFUSED,
   };
   if count_refusal(counter) == 1 {
-    eprintln!("slates-server: fleet: a dialer's {plane}-plane handshake ended: {error:?}");
+    slates_machine::log_line!(
+      "slates-server: fleet: a dialer's {plane}-plane handshake ended: {error:?}"
+    );
   }
 }
 

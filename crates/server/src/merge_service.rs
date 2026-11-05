@@ -485,6 +485,35 @@ pub(crate) fn seed_origin(
   walk_origin(&slot.volume, &state.store, snapshot).map_err(|e| refusal_of_vfs(&e))
 }
 
+/// The identity a held origin is recorded under and checked against at recovery (A-217): the BLAKE3 of the origin's
+/// canonical encoding (`Origin::encode`, sorted and length-prefixed), so the same snapshot walked again reproduces it.
+pub(crate) fn origin_identity(origin: &Origin) -> [u8; 32] {
+  *blake3::hash(&origin.encode()).as_bytes()
+}
+
+/// The origin a green holds as a reference (A-217), walked again from its base snapshot on this shard: `NotFound` when
+/// the base volume or its snapshot is not here, `ContentUnavailable` when the walk no longer gives the origin the
+/// green was created from (its identity differs).
+pub(crate) fn walk_held_origin(
+  state: &ShardState,
+  held: &slates_db::partition::OriginRef,
+) -> Result<Origin, Refusal> {
+  let handle = state
+    .by_id
+    .get(&held.volume)
+    .copied()
+    .ok_or(Refusal::NotFound)?;
+  let slot = state.volumes.get(handle).map_err(|_| Refusal::NotFound)?;
+  let snapshot = core_snapshot(SnapshotId {
+    value: held.snapshot.value,
+  });
+  let origin = walk_origin(&slot.volume, &state.store, snapshot).map_err(|e| refusal_of_vfs(&e))?;
+  if origin_identity(&origin) != held.identity {
+    return Err(Refusal::ContentUnavailable);
+  }
+  Ok(origin)
+}
+
 /// Walks a complete snapshot into an [`Origin`]: every file with its bytes, every directory, every
 /// mode, every symlink, and every further name of a multiply-linked inode as a hard link to the
 /// first name met. Paths are the snapshot's absolute paths without the leading slash, as the ops
@@ -1041,6 +1070,8 @@ pub(crate) fn destroy_merge_volume(
     return Some(forbidden("destroy"));
   }
   let now = state.clock.monotonic_ns();
+  // The snapshot a green holds as its origin (A-217), given back once its destroy is recorded.
+  let held = state.db.partition().green_origin_ref(id).copied();
   let attachments: Vec<u64> = state
     .db
     .partition()
@@ -1078,6 +1109,7 @@ pub(crate) fn destroy_merge_volume(
     crate::work_charge::release(state, work.charged);
     let _ = settle_green_retention(state, work.green);
   }
+  crate::verbs::release_origin_snapshot(state, held.as_ref());
   if state.greens.remove(&id).is_some() {
     state.merge.attachments.retain(|_, pin| pin.green != id);
     release_green_retention(state, id);
@@ -1307,6 +1339,9 @@ pub enum GreenFence {
     /// The version the replay accepted it as.
     accepted: u64,
   },
+  /// The origin is held as a reference to a base snapshot (A-217) that recovery did not bring back: the base volume
+  /// or its snapshot is not on this shard.
+  OriginUnavailable,
   /// The retention the rebuilt histories hold could not be charged: `short` bytes past the budget.
   Retention {
     /// The bytes the budget could not cover.
@@ -1451,6 +1486,12 @@ impl MergeShardState {
 /// scratch green), the increment's chain entry for version N.
 fn inputs_of(state: &ShardState, green: DbVolumeId, version: u64) -> Option<Vec<u8>> {
   if version == 0 {
+    // A held origin (A-217) is encoded from its snapshot when a record is placed, never kept as bytes.
+    if let Some(held) = state.db.partition().green_origin_ref(green) {
+      return walk_held_origin(state, held)
+        .ok()
+        .map(|origin| origin.encode());
+    }
     return state.db.partition().green_origin(green).map(<[u8]>::to_vec);
   }
   let index = usize::try_from(version.checked_sub(1)?).ok()?;
@@ -2232,7 +2273,7 @@ pub(crate) fn accept_merge_record(
       if reason == RECOMPUTE_MISMATCH {
         state.merge.refused.insert(object);
         state.merge.replicas.remove(&object);
-        eprintln!(
+        slates_machine::log_line!(
           "slates-server: merge record for green {} version {} from {:?}: the recomputed identity does not match the record; the green is refused on this holder",
           hex(&object.0),
           value.version,
