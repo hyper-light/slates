@@ -3997,6 +3997,55 @@ fresh-page fault on the anchor's shared content object (41.5%), which slates can
 having pages resident before the write arrives, or by filling them through the kernel's write path; both are design
 decisions put to Ada (GAPS). Sealing at rest (21%) is condition 9's.
 
+### Landed: an idle shard keeps its last write burst's pages pre-faulted (A-214; VFS plan step 11; 2026-11-05)
+
+The fresh-page fault was 41.5% of the large write's samples (the entry below). A-214 keeps the free blocks the next
+allocations will take resident, as many bytes as the shard's last write burst grew its content by, and faults any that
+are not in the shard's idle moments (`crates/server/src/daemon.rs`, `refill_slice`).
+
+**The incumbent harness on the incumbent client.** `docs/wip/bench/mixed/linux_vs_nfsd.sh 400 64`, a privileged
+`rust:1.98` container per run, Apple M5 Max, Docker Desktop's 6.12.76-linuxkit, Linux release builds from their own
+target volumes. A is the branch before A-214, B is `d2adcf7d`. Six rounds, each A then B, 2026-11-05 16:23–16:28Z,
+load 6–10. The large 64 MiB write, MiB/s at 1, 4 and 16 workers:
+
+| round | A | B | nfsd in A's run | nfsd in B's run |
+|---|---|---|---|---|
+| 1 | 913.6 / 918.2 / 937.5 | 882.5 / 1,195.8 / 1,015.1 | 1,538 / 1,743 / 1,767 | 1,796 / 1,782 / 1,931 |
+| 2 | 1,018.7 / 935.0 / 921.7 | 919.8 / 1,166.7 / 1,020.8 | 1,790 / 1,458 / 1,820 | 1,779 / 1,724 / 1,831 |
+| 3 | 923.2 / 996.5 / 925.3 | 958.9 / 1,272.7 / 1,032.8 | 1,595 / 1,791 / 1,952 | 1,792 / 1,753 / 1,776 |
+| 4 | 951.3 / 1,033.9 / 890.8 | 970.4 / 1,281.1 / 1,286.0 | 1,555 / 1,760 / 1,872 | 1,791 / 1,817 / 2,077 |
+| 5 | 988.5 / 1,020.6 / 921.9 | 970.5 / 1,270.1 / 1,117.0 | 1,675 / 1,862 / 1,908 | 1,784 / 1,838 / 2,016 |
+| 6 | 956.6 / 1,017.7 / 922.5 | 962.7 / 1,219.7 / 1,107.7 | 1,674 / 1,821 / 2,030 | 1,709 / 1,867 / 2,081 |
+
+- Best of eighteen: B 1,286.0 MiB/s, A 1,033.9. Step 11 asks 967.
+- B beats A beyond the spread at 4 workers (B's lowest 1,166.7 against A's highest 1,033.9) and at 16 (1,015.1 against
+  937.5). At 1 worker the arms overlap: the harness's first large write follows no earlier burst, so there is nothing
+  to keep for it.
+- Write p99 at 16 workers, µs (create / overwrite / append): A 3,110–4,197 / 1,314–2,193 / 1,357–2,659; B 2,999–3,687 /
+  1,487–2,315 / 1,496–2,332. The ranges overlap with no direction: B's create p99 is lower in four rounds of six, its
+  overwrite higher in five.
+- nfsd wrote 1,458–2,081 MiB/s. The gap to it at 4 and 16 workers fell from about 1.8× to about 1.5×.
+- The volume's shard counted `content.prefaulted_bytes` 358,875,136 in every B run and nothing in A.
+
+**The resident cost per shard.** An idle shard holds at most its last burst's net growth of free pages, and never more
+than its memory share (`reserve_per_shard`: 1,073,741,824 bytes on the Mac's daemon, logged at boot). A shard whose
+last busy period grew nothing holds none: a written and deleted file nets zero, and A-105's give-back test passes
+unchanged (`a_deleted_files_memory_goes_back_to_the_os`). Measured:
+- `a_burst_after_idle_lands_on_pages_the_idle_shard_prefaulted`: a 16,777,200-byte burst left 16,711,680 bytes
+  pre-faulted at idle, and the content object grew 184,320 bytes during the next 16 MiB write, against 16,961,536
+  without A-214;
+- in the harness, the volume's shard faulted 342 MiB in over a run of three 64 MiB rounds and their mixed phases.
+
+**How the refill finds idle time.** A first build refilled at the reap tick only. On the Mac the harness pauses slates
+for about a second between rounds, and the volume's shard reached no idle tick in a whole run (`content.ticks.idle`
+0, `.sealing` 2, `.busy` 1; the other shards 3 idle ticks each), so that build was no faster (six rounds 15:49–15:53Z:
+812.8–1,016.2 against 829.4–1,041.5 MiB/s). The refill is now the shard's idle work in the runtime
+(`ShardContext::set_idle_work`): a slice of `quantum / page_fault_ns` pages whenever a step finds nothing and the idle
+spin has run out. In process (`cargo build --release -p slates-cli --example nfs_large_write`, kept 64 MiB files over
+NFSv4.2 on fresh memory after a one-second pause, kiln-a094a12d, load 36–42, three interleaved runs), kept rounds 1–4
+ran 681–1,103 MiB/s at the tick-only build and 1,524–1,797 with the idle work in runs 2 and 3 (281–1,701 in run 1,
+under load spikes). The burst rounds did not slow: NFSv4.2 best 1,817 / 1,902 / 1,915 against 1,717 / 1,896 / 1,962.
+
 ### Mixed read-write tails on macOS's own NFS client, and a shard QoS class measured (condition 12; 2026-10-07)
 
 Command: `bash docs/wip/bench/mixed/mixed_mac.sh <release slates> <out dir> OPS LARGE_MIB`. It runs a release anchor
