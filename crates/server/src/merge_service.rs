@@ -491,6 +491,22 @@ pub(crate) fn origin_identity(origin: &Origin) -> [u8; 32] {
   *blake3::hash(&origin.encode()).as_bytes()
 }
 
+/// The identity green `green`'s origin is recorded under, whichever form the record takes: a held reference's
+/// (A-217), or for an origin kept as bytes (a green taken over from another host) the BLAKE3 of those bytes, which is
+/// [`origin_identity`] of the same canonical encoding. `None` for a green created from scratch. What a checkout
+/// compares the snapshot it is named with against (A-201), so both forms are judged by one rule.
+pub(crate) fn recorded_origin_identity(state: &ShardState, green: DbVolumeId) -> Option<[u8; 32]> {
+  let partition = state.db.partition();
+  partition
+    .green_origin_ref(green)
+    .map(|held| held.identity)
+    .or_else(|| {
+      partition
+        .green_origin(green)
+        .map(|bytes| *blake3::hash(bytes).as_bytes())
+    })
+}
+
 /// The origin a green holds as a reference (A-217), walked again from its base snapshot on this shard: `NotFound` when
 /// the base volume or its snapshot is not here, `ContentUnavailable` when the walk no longer gives the origin the
 /// green was created from (its identity differs).

@@ -290,15 +290,21 @@ pub(crate) fn checkout_verb(
   if !rights_of(&base_record, principal).write {
     return forbidden("checkout");
   }
-  let Some(recorded) = state
-    .db
-    .partition()
-    .green_origin(record.id)
-    .map(<[u8]>::to_vec)
-  else {
+  // The origin is judged by the identity it is recorded under (A-217 records a reference to the base snapshot and
+  // the origin's identity, never its bytes; a taken-over green keeps the bytes, judged by the same identity).
+  let Some(recorded) = crate::merge_service::recorded_origin_identity(state, record.id) else {
     // A scratch green has no base to write into: it is created over none.
     return refused(Refusal::ConsistentBaseUnavailable);
   };
+  // A held origin names the volume the green was created from; a checkout writes into that volume only.
+  if state
+    .db
+    .partition()
+    .green_origin_ref(record.id)
+    .is_some_and(|held| held.volume != base_record.id)
+  {
+    return refused(Refusal::ConsistentBaseUnavailable);
+  }
   let unchanged = match state.volumes.get(handle) {
     Ok(slot) => slot.volume.unchanged_since(core_snapshot(base.snapshot)),
     Err(_) => return refused(Refusal::NotFound),
@@ -318,7 +324,7 @@ pub(crate) fn checkout_verb(
     Ok(origin) => origin,
     Err(refusal) => return refused(refusal),
   };
-  if origin.encode() != recorded {
+  if crate::merge_service::origin_identity(&origin) != recorded {
     return refused(Refusal::ConsistentBaseUnavailable);
   }
   let Some(engine) = state.greens.get(&record.id) else {

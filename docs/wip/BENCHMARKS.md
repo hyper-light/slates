@@ -1273,6 +1273,7 @@ as they stand when it is accepted. RFC 9289 §5.2.1 says a server SHOULD re-chec
 path a kernel NFS client takes once per mount or reconnect, since it holds one TCP connection per server. The
 cost would be slates-level shared ownership and trust anchors fixed at the listener's start.
 
+
 ### A scoped export's per-request check, and a scoped listing page (2026-10-03, AUD-29-76 follow-up)
 
 `cargo run --release -p slates-vfs --example scope_diff_bench` measures the volume's check
@@ -1726,6 +1727,7 @@ rebuild after touching `crates/vfs/src/lib.rs`. Apple M5 Max, load average 15–
 - **Where the build's writes go:** 4,178 WRITEs carried 746 MB (about 180 KB each) at 2.99 ms per call. That is
   queue and RTT while the build saturates the VM's CPUs; the same path streams a 256 MiB `dd … conv=fsync` in
   197–216 ms (1.3 GB/s), against 1.6–2.7 s on the host bind.
+
 
 ### Delegations against the kernels (A-78, A-79; 2026-10-04)
 
@@ -2477,6 +2479,7 @@ last in `python:3.12-slim-trixie`). Docker Desktop 6.12 kernel, Apple M5 Max, lo
     - `TCP_QUICKACK` after every read: `fsync` 621–626 ms, `dd` 1.2 MB/s.
     Neither is in the tree.
 
+
 ## Session-plane ready sets: a fresh frame no longer walks idle streams (2026-10-06)
 
 **What changed.** The connection's fresh-frame scheduler (strict priority by class, round-robin within one)
@@ -2697,6 +2700,7 @@ own filesystem and tmpfs.
   daemon, and reads it back. With logging disabled the file comes back empty, the mutation check.
 - **The next lever is the create's own publication.** An intent log for namespace changes, as ZFS's ZIL does, would
   let a create reply after one append. It is a design change to §4.8's barrier, recorded in GAPS, not built.
+
 
 ### 2026-10-06: the no-panic sweep costs nothing measurable on the hot paths
 
@@ -7658,6 +7662,7 @@ and slates-base (a volume over the same base, FUSE). Run 1 of 3:
 | rename | 4.5 · 11.1 · 20.1 · 39.2 | 10.3 · 18.7 · 121.6 · 314.6 | 45.7 · 79.3 · 458.5 · 823.5 | 55.6 · 106.5 · 487.1 · 1270.1 |
 | unlink | 4.6 · 7.6 · 37.9 · 169.8 | 8.6 · 15.2 · 292.0 · 639.4 | 36.8 · 102.6 · 369.3 · 665.7 | 41.8 · 89.0 · 390.2 · 852.1 |
 
+
 **contended** (spinners 4 (one per logical CPU when contended); load average 1.43 1.02 0.44 at the start, 2.66 1.33 0.56 at the end; wake-up probe p50 19.5 µs, p99 54.5 µs, p999 1988.6 µs, max 3934.6 µs over 4544 probes; 23.2 s). Each cell: p50 · p99 · p999 · max, µs.
 
 | op | tmpfs | overlayfs | slates | slates-base |
@@ -7720,6 +7725,7 @@ VM; slates `3e7dd1b`, release; 2026-11-01 01:51–01:52 UTC; diagnostics run 412
 | read | 1.2 · 1.7 · 5.7 · 16.9 | 1.4 · 1.8 · 7.6 · 205.5 | 1.4 · 1.9 · 5.6 · 6.6 | 1.4 · 1.9 · 5.3 · 8.9 |
 | rename | 2.6 · 8.2 · 20.2 · 35.0 | 6.1 · 13.2 · 67.7 · 267.8 | 42.3 · 58.6 · 404.4 · 466.2 | 55.2 · 89.6 · 418.3 · 453.5 |
 | unlink | 2.5 · 4.8 · 18.7 · 39.3 | 4.9 · 9.1 · 28.3 · 410.6 | 32.7 · 61.1 · 320.2 · 388.4 | 36.5 · 66.1 · 270.6 · 361.1 |
+
 
 **contended** (spinners 4 (one per logical CPU when contended); load average 1.39 0.98 0.43 at the start, 3.27 1.44 0.59 at the end; wake-up probe p50 10.0 µs, p99 19.0 µs, p999 1304.1 µs, max 1975.9 µs over 3746 probes; 19.1 s). Each cell: p50 · p99 · p999 · max, µs.
 
@@ -7817,6 +7823,7 @@ disk. Run 1 of 3:
 | rename | 39.0 · 378.7 · 1837.9 · 5846.7 | 46.7 · 454.2 · 2275.8 · 21108.4 | 726.0 · 3472.7 · 9358.0 · 23277.6 |
 | unlink | 30.1 · 331.5 · 1699.7 · 4300.6 | 40.2 · 409.2 · 2507.0 · 7416.1 | 751.2 · 2996.9 · 7383.4 · 55282.1 |
 
+
 **contended** (spinners 3 (one per logical CPU when contended); load average 3.07 5.53 6.19 at the start, 8.66 6.63 6.53 at the end; wake-up probe p50 33.2 µs, p99 7282.3 µs, p999 13144.1 µs, max 17878.2 µs over 4058 probes; 97.3 s). Each cell: p50 · p99 · p999 · max, µs.
 
 | op | apfs-ram | apfs | slates |
@@ -7905,6 +7912,7 @@ its spinners and the probe. Run 1 of 3:
 | read | 5.9 · 41.7 · 142.2 · 2628.1 | 13.5 · 147.3 · 378.8 · 160106.9 |
 | rename | 78.3 · 200.9 · 332.9 · 4068.7 | 694.2 · 1831.4 · 36121.0 · 145095.3 |
 | unlink | 84.9 · 183.9 · 668.5 · 7823.0 | 408.3 · 1242.0 · 23605.7 · 143392.4 |
+
 
 **contended** (spinners 4 (one per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 40.3 µs, p99 68.8 µs, p999 2039.2 µs, max 91050.0 µs over 25059 probes; 133.9 s). Each cell: p50 · p99 · p999 · max, µs.
 
@@ -8017,6 +8025,7 @@ temporary directory is there, not on a D: drive) and slates' WinFsp drive of a p
 | rename | 356.2 · 490.7 · 2812.4 · 27825.7 | 379.1 · 798.9 · 4852.0 · 42547.3 |
 | unlink | 108.9 · 191.7 · 39704.4 · 90937.3 | 243.1 · 418.1 · 2188.7 · 31395.3 |
 
+
 **contended** (spinners 4 (one per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 25.4 µs, p99 40.1 µs, p999 4061.4 µs, max 22507.3 µs over 72351 probes; 370.7 s). Each cell: p50 · p99 · p999 · max, µs.
 
 | op | ntfs | slates |
@@ -8102,6 +8111,9 @@ ms).
 open at the median, it holds in every run, and in run 1 an open and a close are 9.07 ms of the 10.27 ms that slates'
 medians sum to for a file cycle (88%). Next, as on x86_64: the daemon's turn under load, and a directory listed by a
 pattern (`fsbench` 10–28×).
+
+
+
 
 ## What a write costs on pages given back on Windows (A-205; VFS plan step 12; 2026-11-04)
 
@@ -8673,6 +8685,7 @@ p999 and max per run:
 - **The DLL arm died where the receiver arm survived.** Two spinners a core lapsed both daemons in run 3 of all three x86_64
   jobs that reached it, and only the DLL arm's drive was lost each time. A daemon killed by the anchor for a late heartbeat on
   a loaded 4-vCPU VM is itself worth a look: arm64 logged no lapse.
+
 
 ## Provisioning by physical core, and a shard's content keys bounded (A-208; R9; 2026-11-05)
 
@@ -9440,6 +9453,7 @@ p999 and max per run:
   crash-safe receive: direct output at the minimum costs at most 0.5 µs an IRP.
 - **Where it is:** on the kernel's and the application's side of each of our responses, and not explained.
 
+
 ## The acknowledgement answered once its own shard has released (A-216; R9; 2026-11-05)
 
 A-216 makes the daemon answer a client's periodic `Acknowledge` once the client's own shard has released its
@@ -9634,4 +9648,3 @@ could not see this.
 A second receiver cannot simply be added: two journals need the multi-worker crash proof (GAPS), which is not built. A
 second worker would also make x86_64 slower unless it ran on arm64 alone, and a mode chosen per architecture would need
 a derivation the rules accept.
-
