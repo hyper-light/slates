@@ -1464,12 +1464,12 @@ impl Green {
     inc: &Increment,
     path: &str,
     ops: &[Op],
-  ) -> Result<Option<Effect>, ConflictWindow> {
+  ) -> Result<Option<Effect>, Vec<ConflictWindow>> {
     if !self.content.contains_key(path) {
       if self.occupied_by_nonfile(path) {
-        return Err(Green::window(path, MergeConflictClass::TypeChanged));
+        return Err(vec![Green::window(path, MergeConflictClass::TypeChanged)]);
       }
-      return Err(Green::window(path, MergeConflictClass::DeleteModify));
+      return Err(vec![Green::window(path, MergeConflictClass::DeleteModify)]);
     }
     let base_changed = self.last_changed.get(path).copied().unwrap_or(0);
     let unchanged = base_changed <= inc.base;
@@ -1517,16 +1517,20 @@ impl Green {
       if agent_final == current {
         return Ok(None);
       }
-      return Err(ConflictWindow {
+      return Err(vec![ConflictWindow {
         path: path.to_owned(),
         range,
         class: MergeConflictClass::Overlap,
-      });
+      }]);
     }
 
     // Pass two: each overlapping overwrite must reproduce, byte for byte, what the intervening
     // change already placed at that span; a differing span is a byte-exact conflict. An identical
-    // span is a no-op (the green already holds those bytes), so it is not added to `mapped`.
+    // span is a no-op (the green already holds those bytes), so it is not added to `mapped`. Every differing span of
+    // the file is named (the reply is the windows the agent rebases against, §4.16), in the ops' order, which is the
+    // file's: until 2026-11-04 the first one ended the verdict, so an agent learned of a file's conflicts one rebase at
+    // a time.
+    let mut differing: Vec<ConflictWindow> = Vec::new();
     for op in &candidates {
       let span = touched_range(op);
       let head_start = match crate::map::map_range(&intervening, Range::new(span.start, 0)) {
@@ -1545,12 +1549,15 @@ impl Green {
       let end = start.saturating_add(agent_bytes.len());
       let identical = current.get(start..end) == Some(agent_bytes);
       if !identical {
-        return Err(ConflictWindow {
+        differing.push(ConflictWindow {
           path: path.to_owned(),
           range: span,
           class: MergeConflictClass::Overlap,
         });
       }
+    }
+    if !differing.is_empty() {
+      return Err(differing);
     }
 
     // Every op accepted. When only identical overlaps remained (nothing disjoint to apply), the
@@ -1854,8 +1861,11 @@ impl Green {
       if r.creates.contains(path) || r.renames.contains_key(path) {
         continue; // content of a created or renamed-into file is handled with that effect
       }
-      let result = self.merge_content(inc, path, ops);
-      record(effects, windows, result);
+      match self.merge_content(inc, path, ops) {
+        Ok(Some(effect)) => effects.push(effect),
+        Ok(None) => {}
+        Err(mut found) => windows.append(&mut found),
+      }
     }
   }
 
