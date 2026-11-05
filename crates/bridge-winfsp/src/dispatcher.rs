@@ -503,7 +503,7 @@ impl Server<'_> {
   }
 
   /// Serves a fresh batch. Every response but the last is saved, sent alone and acknowledged. The last is saved, then
-  /// sent by the call that receives the next batch into the other buffer (A-215), and its open is confirmed after.
+  /// sent by the call that receives the next batch into the other buffer (A-215), its open confirmed during the call.
   fn serve(
     &mut self,
     batch: Batch<'_>,
@@ -513,6 +513,12 @@ impl Server<'_> {
     let Some(mut hand_off) = self.answer_all_but_the_last(batch, fill)? else {
       return Ok(Next::Receive);
     };
+    // The open this response hands the kernel is confirmed while the call waits for the next request: posted before the
+    // call, its answer taken after. Once the hand-off is recorded, every death still hands the kernel this context (the
+    // call consumed the response, or recovery sends the saved Create again), so confirming early is safe (A-215).
+    let confirming = inflight::opened_context(hand_off.response())
+      .map_err(WinFspError::Capture)?
+      .map(|(_, context)| crate::host::post_confirm(self.confirmations, self.wake, context));
     let (response, buffer) = hand_off.transaction();
     let reported = transaction(
       self.control,
@@ -521,15 +527,12 @@ impl Server<'_> {
       buffer,
       &mut self.private.intents,
     )?;
-    // A hand-off returned while stopping is the successor's: it keeps the open this response handed over and settles
-    // whatever the call delivered.
+    if let Some(confirming) = confirming {
+      confirming.finish()?;
+    }
+    // A hand-off returned while stopping is the successor's: it settles whatever the call delivered.
     if is_stopped(stopped) {
       return Ok(Next::Stop);
-    }
-    if let Some((_, context)) =
-      inflight::opened_context(hand_off.response()).map_err(WinFspError::Capture)?
-    {
-      crate::host::confirm_open(self.confirmations, self.wake, context)?;
     }
     Ok(Next::Take(reported))
   }
