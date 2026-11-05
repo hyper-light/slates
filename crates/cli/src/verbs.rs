@@ -918,6 +918,39 @@ fn emit_image_build(
 }
 
 /// `image merge`: the clone's id and what the merge did, as text lines or JSON `{ "id", "report": {...} }`.
+/// `checkout GREEN VOLUME ATTACHMENT --snapshot N` (§4.16 A-201): the version written and what changed, by kind.
+fn emit_checkout(
+  client: &mut Client,
+  green: VolumeId,
+  base: slates_client::GreenBase,
+  attachment: u64,
+  json: bool,
+) -> Result<(), ClientError> {
+  let (version, report) = client.checkout(green, base, attachment)?;
+  let counts = [
+    ("written", report.written),
+    ("made", report.made),
+    ("removed", report.removed),
+    ("moded", report.moded),
+  ];
+  if json {
+    let report: serde_json::Map<String, serde_json::Value> = counts
+      .iter()
+      .map(|(key, value)| ((*key).to_owned(), serde_json::Value::from(*value)))
+      .collect();
+    println!(
+      "{}",
+      serde_json::json!({ "version": version, "report": report })
+    );
+  } else {
+    println!("version: {version}");
+    for (key, value) in counts {
+      println!("{key}: {value}");
+    }
+  }
+  Ok(())
+}
+
 fn emit_image_merge(
   client: &mut Client,
   image: VolumeId,
@@ -1365,6 +1398,11 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
       capacity,
     } => emit_image_build(client, (*volume, *snapshot), name, *capacity, json)?,
     Verb::ImageMerge { image, name } => emit_image_merge(client, *image, name, json)?,
+    Verb::Checkout {
+      green,
+      base,
+      attachment,
+    } => emit_checkout(client, *green, *base, *attachment, json)?,
     Verb::Resize { volume, size } => {
       client.resize(*volume, *size)?;
       emit_ok("ok", json);

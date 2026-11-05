@@ -1229,6 +1229,18 @@ impl Daemon {
     Ok(held)
   }
 
+  /// The content keys this daemon's shards hold, summed (A-208): one for each volume alive and each key a sealed chunk
+  /// still names, so a create-and-destroy loop returns it to where it started. An observation the daemon could not make
+  /// is its typed refusal.
+  pub fn content_keys_held(&self) -> Result<usize, ObserveError> {
+    let mut held = 0usize;
+    for shard in self.shards.iter().copied() {
+      held =
+        held.saturating_add(self.observe(Some(shard), |s| s.store.content.cipher_keys_held())?);
+    }
+    Ok(held)
+  }
+
   /// The VMMs' DAX backings this daemon holds, on every shard, and what every backing counts against the shards' fill
   /// budgets (§4.6, A-163, A-180): what a stream's end lets go, for a test or an operator to hold to its starting value.
   /// An observation the daemon could not make is its typed refusal.

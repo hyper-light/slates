@@ -8,11 +8,11 @@ use std::time::Instant;
 
 use slates_ipc::delivery::{Capability, Delivered, DeliveryFault, attest_proof};
 use slates_ipc::protocol::{
-  AttachRequest, AttachmentCapability, AuditEntry, DaemonReport, Direction, Established, Filter,
-  GrantScope, GrantSummary, GreenBase, ImageMergeReport, Intent, LandingOutcome, LandingSummary,
-  MergeWindow, NamePolicy, Principal, ReadAt, ReplyBody, RequestBody, Rights, Scope, SizeClass,
-  SnapshotCoverage, SnapshotId, StatusReport, TelemetryReport, VolumeId, VolumeSummary, WorkOp,
-  pack, unpack,
+  AttachRequest, AttachmentCapability, AuditEntry, CheckoutReport, DaemonReport, Direction,
+  Established, Filter, GrantScope, GrantSummary, GreenBase, ImageMergeReport, Intent,
+  LandingOutcome, LandingSummary, MergeWindow, NamePolicy, Principal, ReadAt, ReplyBody,
+  RequestBody, Rights, Scope, SizeClass, SnapshotCoverage, SnapshotId, StatusReport,
+  TelemetryReport, VolumeId, VolumeSummary, WorkOp, pack, unpack,
 };
 #[cfg(unix)]
 use slates_ipc::rendezvous::ControlDelivery;
@@ -102,6 +102,9 @@ pub fn defers_reply(body: &RequestBody) -> bool {
         // An image's build and merge run in slices on the owner shard, as long as the image takes (A-160).
         | RequestBody::ImageBuild { .. }
         | RequestBody::ImageMerge { .. }
+        // A green's checkout writes its base volume in slices on the owner shard, as long as the difference takes
+        // (A-201).
+        | RequestBody::Checkout { .. }
         // A direct map's copy is filled in slices on the owner shard, as long as the file takes (A-171).
         | RequestBody::MapRead { .. }
         // A writable map's copy is filled the same way, and its stores are compared back into the file in slices at
@@ -3383,6 +3386,25 @@ impl Client {
       _ => Err(ClientError::UnexpectedReply {
         verb: "image_merge",
       }),
+    }
+  }
+
+  /// Checks green `green`'s head out into the volume and snapshot it was created from, `base`, through the caller's
+  /// write `attachment` of that volume (§4.16 A-201): the version the volume now holds and what the checkout changed.
+  /// The volume then lands under a grant like any other. Waits for the checkout, which the daemon runs in slices.
+  pub fn checkout(
+    &mut self,
+    green: VolumeId,
+    base: GreenBase,
+    attachment: u64,
+  ) -> Result<(u64, CheckoutReport), ClientError> {
+    match self.call(&RequestBody::Checkout {
+      green,
+      base,
+      attachment,
+    })? {
+      ReplyBody::CheckedOut { version, report } => Ok((version, report)),
+      _ => Err(ClientError::UnexpectedReply { verb: "checkout" }),
     }
   }
 

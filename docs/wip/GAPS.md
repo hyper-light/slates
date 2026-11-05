@@ -1,5 +1,113 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+
+
+> **Merge: the same edit from two works was one increment; fixed 2026-11-04 (§4.16, agents/perf).** The increment's
+> identity left out its work and its base, so a second work's byte-identical edit from the same base was answered from
+> the retry cache with the first work's version, even where the green had since changed that range: a conflict reported
+> as an accept. The identity now names the work and the base as §4.16's data model says. Failing first, passing after:
+> `crates/client/tests/merge_identity.rs`. Record: `docs/bugs/2026-11-04-the-same-edit-from-two-works-was-one-increment.md`.
+> Found by the edit-and-merge latency harness's oracle (`crates/client/examples/edit_merge_bench.rs`).
+>
+> **Merge: a full edit and merge is 51–69 µs at the median whatever the green holds (A-202, 2026-11-04, agents/perf).**
+> A submit's cost had followed the green's size: 14 ms at 1,000 files of 4 KiB. The merge record's identities are now
+> made only for a record that goes to holders, the deriver composes over the base restricted to the journal's paths,
+> and a work holds only the files it changed since its base. Loaded Mac (load 5–11, informational): p50 51–69 µs and
+> p99 0.15–0.36 ms at 10, 1,000 and 10,000 files, every form, but for one run's 1.81 ms (conflict, 10,000 files; BENCHMARKS, "A full edit and merge"). Racing clients'
+> verdicts are judged against the rule (`crates/client/tests/merge_chaos.rs`). 100,000 files: accept p50 60 µs, p99
+> 199 µs on the Mac; CI's 3-core macOS runner (quiet): p50 67–150 µs at 10 to 10,000 files, its partition budget refuses a
+> 400 MB green (chain checkpointing owed). **Open:** the Linux CI numbers; the preferred 50 µs (the fixed cost of the two round trips); the two-machine path (fs-server); the rebase
+> restates whole. Since A-202 (2026-11-05) the head identity a holder recomputes is a set hash brought up to date when
+> read, so a record at `f > 0` costs what its version changed; its format changed (golden vector in
+> `crates/merge/tests/origin.rs`), so records written before it would not match a newer holder. A daemon `SIGKILL`ed six times mid-merge
+> loses no told version and tells none twice (`crates/cli/tests/merge_kill.rs`, red with the durable append removed).
+>
+
+> **Windows conformance runs, and the arm64 Linux suites (2026-11-05, A-209; VFS plan step 10).** WinFsp's own two
+> suites run over the slates drive (`slates mount ID E:`) through `cargo xtask conformance` in `windows-lint` and
+> `windows-arm64`: winfstest (a Rust transcription of its Python 2.7 scripts, held to them by a golden of 733 cases)
+> and the WinFsp fsx port, each built from `billziss-gh/secfs.test@6ac65cd` with MSVC. winfstest: 628 cases, the same
+> verdicts on x86_64 and arm64 (254 pass; diagnostics run 42061904713, every step green), every failure on the reviewed list
+> (`docs/wip/conformance/expected-failures/native-windows-winfsp.winfstest.txt`) with its reason, the five Windows
+> features the drive does not keep (attribute bits, security descriptors, a settable creation time, reparse points and
+> symbolic links, named streams). The suites found four Win32 bugs in `crates/bridge-winfsp`, each fixed with a failing
+> test first (`crates/cli/tests/winfsp_semantics.rs`; `docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md`):
+> a move not asked to replace replaced a taken name (and one asked replaced a directory), a directory holding a file
+> answered its removal with success, `SetFileTime` kept nothing, and an open with `TRUNCATE_EXISTING` kept the file.
+> `linux-arm64` runs fsx, fsstress and pjdfstest over the three Linux transports with the x86_64 lists: 0 unexpected
+> and 0 listed passing (diagnostics run 41975493604). **Open:** fsx over the drive wedges at an extension after a cached
+> write past a hole and a shrink below it (seed 1; operations 41 to 43 or 162 to 164, the point moving between runs,
+> on both architectures): no request reaches the bridge for the 300 s until the bound's kill, so the wait is inside
+> Windows' write path below the single WinFsp receiver (A-198); the operations replayed alone pass. Listed as
+> `fsx-seed-1-unfinished:10000`; recorded in the same bug file; owed to the WinFsp dispatcher's owners.
+
+> **Shards counted hardware threads as cores (2026-11-05, A-208, §4.1, R9; fixed, its A/B owed).** §4.1 counts shards in
+
+> **A call waits for its acknowledgement's scatter (2026-11-05, §4.9, R9; OPEN).** The synchronous
+> `Client::call` acknowledges every half-ring of replies before its own request and waits for the reply, which the
+> daemon gives only after every shard has released the client's records. On macOS, 133 of 2,000 single-client creates
+> (6.7%) carried one, median 2,497 µs against 169 µs (a loaded run whose boot probe measured a 2.5 ms wake). That share
+> sets the single-client p99. With another shard held for a second, such a call fails `Stalled`. Sending it unawaited,
+> as the async path does (a6c3bc16), passed its test (Stalled before, 3.62 s after) and the whole client package.
+> But 2 of the 4 parked `provision_bench` forms that ran with it stalled a create past the 1 s reply deadline: one on
+> quiet jupiter, one on macOS. Without it, none of 15 did. Reverted in the next commit, cause not found. Owed:
+> the stall's cause, with a test that reproduces it, before the change returns. Also open, from the same macOS runs at
+> load 23–36: the bench's 8- and 64-client forms aborted `Stalled` in every arm, a live daemon slower than the reply
+> deadline. Record: `docs/bugs/2026-11-05-a-call-waited-for-its-acknowledgements-scatter.md`.
+
+> **Shards counted hardware threads as cores (2026-11-05, A-208, §4.1, R9; fixed and measured).** §4.1 counts shards in
+> physical cores, but the placement counted logical CPUs. jupiter's 16 two-thread cores therefore ran 31 shards and
+> left its spinning clients one thread: provisioning p99 123.6 µs against R9's 50 µs (Windows x86_64, 06:35 UTC). The
+> facts now name each CPU's physical core (`CoreFacts::physical`), and the placement fixes one shard per core, on its
+> first thread. A unit test failed before the fix (31 against 15) and passes after, and the placement oracle covers
+> three sibling layouts. Measured (BENCHMARKS, "Provisioning by physical core"): R9's single-client p99 went from
+> 41.5–190.1 µs to 21.8–40.7 µs on both CI SMT runners, all rounds green with part 2. On jupiter the millisecond
+> tails are gone, but its p99 is still 80–252 µs, red. Owed: a quiet Linux SMT run (adacachy's was at load 52), the
+> macOS arm (no SMT, expected unchanged), and Windows core classes, still unread. Record: `docs/bugs/2026-11-05-shards-counted-hardware-threads-as-cores.md`.
+
+> **A create's cost grows with its shard's volumes (2026-11-05, R9).** Both measured on macOS arm64 by `xctrace` on
+> `provision_bench`.
+> - **Every mutating verb re-walks its shard (OPEN).** `publish_delta_into` (`crates/server/src/verbs.rs`) sorts and
+>   checks every volume on the shard and rebuilds the id sets of all of them. With creates kept alive (2,000 a run over
+>   5 shards), a create's median climbs from 76–95 µs over the first 200 to 154–157 µs over the last 200, and
+>   `publish_shard` holds 1,591 of the 1,820 samples in `run_recorded`. The function's doc already names an
+>   incremental publish as owed (`recovery.md`).
+> - **Every new volume scanned every key its shard ever made (FIXED, A-208's second part).** `ShardCipher` kept a key
+>   per volume ever keyed and found each by a linear scan. 64 volumes made, written and destroyed left 64 keys, and
+>   the scan held 24,052 of the 26,986 samples inside the server's create over the full histogram. A key is now held
+>   for its volume's life and by each sealed record naming it, goes with its last hold, and is found through an index.
+>   Both tests failed before the fix and pass after. The parked provisioning p50 fell from 277–780 µs to 37–49 µs on
+>   Linux and 154–331 µs on Windows (CI run 42049944560). Record:
+>   `docs/bugs/2026-11-05-a-shards-content-keys-were-never-let-go.md`.
+>
+> The 1-client spinning row is flat across a run (first-200 and last-200 medians 45–80 µs). There the server's create
+> is about 7 µs of service, and the rest of its 65 µs median is time no thread is serving it. That is open too.
+
+> **A lookup before the owner's death was known never ran its round: fixed (2026-11-05, §4.8 Lookup).** Main CI
+> 41990139505 (macOS) and 1 of 50 runs on one busy CPU (2026-11-04) failed
+> `a_location_round_asks_a_peer_whose_session_was_out_once_it_returns` with `OwnerUnreachable`. The foreign node did
+> not yet hold the dead owner dead, so the volume's creator was its known owner: the lookup forwarded there without a
+> location round (`owner_location.direct` 1, `forward.no_session`), as §4.8 specifies for a takeover's window. Not
+> the quorum collector's change: `4a221524` 1/50, `21da6e57` 0/50 on one busy CPU. The test now waits until the
+> foreign node holds the owner dead; no assertion changed. Interleaved on one busy CPU: before 2/150, after 0/150.
+> Record: `docs/bugs/2026-11-05-a-lookup-before-the-owners-death-was-known-never-ran-its-round.md`.
+
+> **Directory blocks in size classes (A-203, 2026-11-05): VFS plan step 13 done.** A directory's block is the smallest
+> of 17 classes, 256 B to 4 KiB, four to a doubling, that holds its entries. Each class is a list of 64 KiB pages from
+> one slab, and a page that empties goes back for any class (`crates/vfs/src/dirblocks.rs`). AC-1.5 at 10^6 files is
+> 350,460,030 → 292,914,814 B (1 KiB blocks → classes, 23 runs each, identical every run), under the 4 KiB-block figure
+> of 352,335,998. The real trees take 13 to 24% less heap (npm 300 → 260 bytes an entry, pip 336 → 275, cargo
+> 386 → 293). Lookup, readdir and create are at least as good at their best and inside the old spread at p50 and p99
+> (BENCHMARKS "Directory blocks in size classes"). The volume oracle compares the block store with every block the
+> volume reaches after every step (`check_blocks` in `crates/vfs/tests/model.rs`). Open, each measured:
+> - The raw tree's insert and remove at 2 and 4 entries is 25 to 30% slower at the best (197 → 247 ns), inside the
+>   1 KiB spread: the two-level reference (page, then slot).
+> - A store's pages can strand in partly used pages after churn across classes: a block is refused (typed, `SlabFull`)
+>   when no page of its class has a slot and the page cap is reached, though other classes' pages have free slots.
+>   Bonwick's design accepts this; nothing here measures how often it happens.
+> - AC-1.3 (snapshot and clone flat with size) failed at load 11 to 52 in 3 to 5 of 10 runs on both arms. The gate's
+>   noise allowance does not cover this host's load. It is not caused by the blocks, but it is open.
+
 > **The anchor's hold refusals: a bounded Unix log, and a count in `slates status` (2026-11-04, A-213; siblings of
 > audit step 3).** The Unix device hold logged a line per refused message, unbounded; it now logs each distinct refusal
 > once (`RefusalLog`, as the Windows hold does) and counts every one. Every refusal on either platform's hold channel
@@ -86,7 +194,10 @@
 > unchanged code and 200 with the close removed (`crates/mem/tests/held_section.rs`); the adoption now maps first anyway.
 > Numbers and CI runs: BENCHMARKS, "What a write costs on pages given back on Windows".
 
-> **A merge's cost grows with its green's file count (2026-11-05, RQ-4, §4.16; OPEN, perf's).** The new
+> **Fixed 2026-11-05 (A-202, agents/perf):** a submit no longer clones, walks or hashes the whole green; every verdict
+> form's median is 51–69 µs at 10 to 10,000 files (BENCHMARKS, "A full edit and merge"). The record below stays as found.
+>
+> **A merge's cost grows with its green's file count (2026-11-05, RQ-4, §4.16; found open).** The new
 > `crates/client/examples/edit_merge_bench.rs` measures, on macOS arm64 at load 9, an accepted submit's median at
 > 25–161 µs over a green's first hundred versions and 529–684 µs over its last hundred (six runs). Each version adds a
 > file. One file replaced 1,000 times shows no growth, and an edit shows none in either form. Every submit clones
@@ -147,6 +258,29 @@
 > 41987826160, the second on the patches as delivered. Owed: the
 > owner's review.
 >
+
+> **A green's head reaches the disk (fs-server, 2026-11-04, A-201).** `slates checkout GREEN VOLUME ATTACHMENT --snapshot
+> N` writes a green's head into the volume it was created from, and that volume lands under a grant. Proven by
+> `crates/server/tests/checkout.rs` (3 of 3, red 3 of 3 with the base check and the writes removed) and, across a
+> Docker container on adacachy, by the fs-server lab up to the grant: a client on the host read the server's green,
+> pushed two increments of four files (accepted as versions 1 and 2), a third overlapping push was refused with its
+> window `src/one.txt [0..3]`, and the server's checkout wrote 4 files and presented a landing of 1 create and 3
+> replaces. Open, found on the way:
+> - **The daemon cannot clone an overlay volume.** `admit_clone` gives every clone no host, so `volume clone` of an
+>   overlay is refused `ContentUnavailable` (pinned or not; fleet and standalone), though the volume core can.
+> - **No grant can be issued on Linux from the CLI.** The anchor's issuer segment is a descriptor only its children
+>   hold (`PRINTS_ISSUER_SURFACE` in `crates/cli/tests/cli.rs`), so a Linux server's landing stops at its
+>   presentation. Needs a decision on the Linux issuer surface (§4.13).
+> - **Remote attach is owed (§4.10):** another node's `attach` is refused `NotFound`, so a client on another node
+>   pushes through a green, never through a write attachment.
+> - **A self-signed fleet certificate must be a leaf.** OpenSSL's default (`CA:TRUE`) is refused
+>   `CaUsedAsEndEntity`; the manifest's documentation does not say so.
+
+> **A green can be shared (fs-server, 2026-11-04).** `share` on a green answered `NotFound`, since it looked the volume up
+> by a slot no green has, so only a green's creator could read, work or submit to it: no second consumer, and no user
+> of another fleet node. Fixed with its failing test first; record `docs/bugs/2026-11-04-a-green-could-not-be-shared.md`.
+> Open, reported there: a green's (and a volume's) name is unique per shard only.
+
 > **Audit of 2dc9f3eb..98000d56 (2026-11-03): defects open, Step 9's evidence holds.** Nine commits made on
 > 2026-11-01 and 2026-11-02 were read line by line against this file's rules and Step 9's acceptance. Every CI run they
 > cite was read again: each shows what it is cited for, except one pair of timings A-198 gave the wrong way
@@ -182,13 +316,15 @@
 >   50.1 µs on x86_64, run 41977769822), and a rename took a shard turn per live open (about 106). After (run 41989009852):
 >   arm64 a stat 1.50×, a rename 1.35×, an fsync 1.21×; x86_64 loaded a stat and an open 1.18–1.20×, its quiet runs overlapping. Some loaded tails are far
 >   better than the DLL's (x86_64 stat p99 114–133 ms against 0.51–0.60 ms). **Open:** it stays worse beyond the spread at
->   the p50 by about 20 µs a request. The separate response call explains 11–13 µs, and removing it would change A-198's
->   crash rule. Hops for Open and Release about 2× and for SetSize about 4× under load on arm64 are measured and not explained
->   (a longer shard spin did not change them, run 41989038309); that SetSize hop is an arm64 write under load at 2.09×. Also:
->   under two spinners a core on a 4-vCPU x86_64 VM the anchor killed both daemons for a late heartbeat in run 3 of all
->   three jobs that reached it.
+>   the p50 by about 20 µs a request. The separate response call explains 11–13 µs (winfsp-overlap studies it under A-198's crash
+>   rule). **The hops, 2026-11-05:** Open and Release's about 2× was the waiting thread parking; the reply spin cuts arm64 quiet to
+>   an fsync 0.88×, a stat 0.89×, a rename 0.90× and x86_64 loaded to 0.77–0.90×, against parking (run 42052991563); its cost is
+>   arm64's loaded rename at 1.15×. **Still open:** loaded SetSize's about 4× (the write gap) is a shard preempted just after it
+>   answers. Raising shard threads above normal priority removed it (run 42059294312), on arms sharing a machine, so the gain is
+>   not yet measured, and it is a whole-daemon change. Also: under two spinners a core on a 4-vCPU x86_64 VM the anchor killed both
+>   daemons for a late heartbeat in run 3 of all three jobs that reached it.
 > - **Two failures recorded open below**: the wake-learning case under load (fixed 2026-11-04, A-199) and the fleet
->   routing Create reply (fixed 2026-11-04 in its fixture; a second, rarer failure of that history stays open).
+>   routing Create reply (fixed 2026-11-04 in its fixture; its second, rarer failure fixed 2026-11-05).
 >
 > Twenty goals of this plan's stack, Steps 10–15 among them, were closed in 2–4 s each with no work. They are
 > restored in order after these fixes.
@@ -228,9 +364,9 @@
 > after a root learner's import. A create on every node right after the settle was refused once in 40 fleets on two
 > busy CPUs (1 in 340 fleets in all). The settle step now also waits for every node's readiness
 > (`Daemon::consensus_ready`); the new test `a_settled_fleet_admits_a_create_on_every_node` passed 100/100 after, the
-> history 50/50 on two busy CPUs, and the whole fleet target 87/87. No assertion changed. Still open: on one CPU the
-> same history failed once in 50 another way, its lookup refused `OwnerUnreachable` with the held session never
-> back within the forward's wait (`session_never_returned` 4), not attributed. Record:
+> history 50/50 on two busy CPUs, and the whole fleet target 87/87. No assertion changed. Its other failure (one CPU,
+> 1 in 50: `OwnerUnreachable`, `session_never_returned` 4) is attributed and fixed since (2026-11-05, the lookup
+> before the owner's death was known). Record:
 > `docs/bugs/2026-11-04-a-settled-fleet-refused-its-first-create.md`.
 
 > **A forward waits for the owner's session (2026-09-25, §4.8 Lookup).** A forward refused the client
@@ -5639,7 +5775,8 @@ whole 4,112-byte block, about 400 heap bytes an entry for a pip venv; heap-alloc
 rejected (destroy slices into milliseconds of `dealloc`); blocks are now 1 KiB (A-101): real trees 28–44% less heap
 (npm 332, pip 368, cargo 418 bytes an entry; then 316, 352, 402 with `attribute_of` and `Home`'s parent kept as
 non-zero words, so their `Option`s cost no tag: `Inode` 200 → 184 B); size-classed block slabs, which would fit both small and full
-directories, are owed. Next, each measured: `Option<InodeNo>` 16 B
+directories, were built 2026-11-05 (A-203: npm 300 → 260, pip 336 → 275, cargo 386 → 293 bytes an entry; AC-1.5
+350,460,030 → 292,914,814 B). Next, each measured: `Option<InodeNo>` 16 B
 where a niche gives 8, `Home` 24 B, and directory entries and trie nodes per file. A billion-file volume at even 100 B a
 file is 100 GB on one host: billion-file namespaces need a volume's metadata spread across shards and hosts (a design
 item, not yet decided).

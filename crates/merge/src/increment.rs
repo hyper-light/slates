@@ -224,6 +224,31 @@ impl VolumeOp {
     }
   }
 
+  /// Every path this operation names: its path, a rename's two ends, and a hard link's target. A
+  /// symlink's target is a string the link holds, not a path the composition looks up, so it is not
+  /// named. What the deriver reads of a base is exactly these paths' entries (and the hard links
+  /// aimed at them), so a base restricted to them composes the same document ([`compose_volume`]).
+  pub fn names(&self) -> [Option<&str>; 2] {
+    match self {
+      VolumeOp::Overwrite { path, .. }
+      | VolumeOp::Extend { path, .. }
+      | VolumeOp::Truncate { path, .. }
+      | VolumeOp::Insert { path, .. }
+      | VolumeOp::Delete { path, .. }
+      | VolumeOp::Create { path }
+      | VolumeOp::Mknod { path, .. }
+      | VolumeOp::Unlink { path }
+      | VolumeOp::Mkdir { path }
+      | VolumeOp::Rmdir { path }
+      | VolumeOp::SetMode { path, .. }
+      | VolumeOp::Symlink { path, .. }
+      | VolumeOp::SetXattr { path, .. }
+      | VolumeOp::RemoveXattr { path, .. } => [Some(path), None],
+      VolumeOp::Rename { from, to } => [Some(from), Some(to)],
+      VolumeOp::Link { path, target } => [Some(path), Some(target)],
+    }
+  }
+
   /// Whether this is a directory operation (`Mkdir` or `Rmdir`).
   fn is_directory(&self) -> bool {
     matches!(self, VolumeOp::Mkdir { .. } | VolumeOp::Rmdir { .. })

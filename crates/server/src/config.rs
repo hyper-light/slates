@@ -729,7 +729,7 @@ impl DaemonConfig {
       )
       .unwrap_or(usize::MAX)
       .max(1),
-      "metadata_class / (Slot<DirNode> + Slot<DirBlock>) / STORE_TABLE_DIVISOR",
+      "metadata_class / (Slot<DirNode> + a smallest-class directory block's page share) / STORE_TABLE_DIVISOR",
       ["reserve_per_shard", "vfs.directory_unit_bytes"]
     );
     derivations.push(note("max_dirs", &max_dirs));

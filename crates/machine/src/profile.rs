@@ -29,9 +29,11 @@ use crate::{derived, probes, wake};
 /// the facts' cores are the ones this process may run on, by the OS's ids, beside the CPU budget a cgroup
 /// grants it, and the wake probe is placed by [`crate::placement`] (unpinned, `Scheduled`, where the
 /// process shares its cores in time); version 2 listed `0..available_parallelism()`
-/// (docs/bugs/2026-09-29-every-daemon-under-a-cpu-quota-pinned-its-shard-to-cpu-1.md).
+/// (docs/bugs/2026-09-29-every-daemon-under-a-cpu-quota-pinned-its-shard-to-cpu-1.md). 4 (2026-11-05): each
+/// core names the physical core it is a hardware thread of ([`crate::facts::CoreFacts::physical`]), and the
+/// placement counts shards in physical cores, as §4.1 says (A-208); version 3 counted every hardware thread.
 /// Format: the version this build writes and the only one it reads.
-pub const PROFILE_VERSION: u32 = 3;
+pub const PROFILE_VERSION: u32 = 4;
 
 /// How to take a profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
