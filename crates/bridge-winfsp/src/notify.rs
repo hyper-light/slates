@@ -456,7 +456,7 @@ mod tests {
     assert_eq!(walk(round.bytes())[0].2, longest);
   }
 
-  /// A-198 (2026-11-04). Do: hold open a name at the driver's limit beneath `\dir`, then ask about renames of `\dir` that
+  /// A-206 (2026-11-04). Do: hold open a name at the driver's limit beneath `\dir`, then ask about renames of `\dir` that
   /// shorten it, keep its length, lengthen it by a unit, and of another directory. Expect: only the lengthening rename
   /// of its own directory does not fit, since the driver would rename the node without a check and the ledger could not
   /// record it.
@@ -473,7 +473,7 @@ mod tests {
     assert!(names.rename_fits("\\dirx", "\\dirxy"), "not a component");
   }
 
-  /// A-198. Do: hold open a name of 1,025 units, past `FSP_FSCTL_TRANSACT_PATH_SIZEMAX`. Expect: it is told, whole. Before
+  /// A-206. Do: hold open a name of 1,025 units, past `FSP_FSCTL_TRANSACT_PATH_SIZEMAX`. Expect: it is told, whole. Before
   /// 2026-11-04 any name past 1,024 units was left out, so another path's change never reached its node.
   #[test]
   fn a_name_past_a_thousand_units_is_told() {

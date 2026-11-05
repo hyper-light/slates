@@ -342,7 +342,7 @@ mod tests {
     ));
   }
 
-  /// A-198 (2026-11-04). Do: read a successful rename whose names are 2,000 units each. Expect: both whole. Before, a name
+  /// A-206 (2026-11-04). Do: read a successful rename whose names are 2,000 units each. Expect: both whole. Before, a name
   /// past 1,025 units refused the parse, and that refusal ended the mount's receive worker.
   #[test]
   fn a_rename_of_a_long_path_is_read_whole() {

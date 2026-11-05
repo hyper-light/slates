@@ -411,7 +411,7 @@ slates-sdk-node = 0
 # the Swift FSVolume handler a C ABI over `serve` — sanctioned FFI unsafe, each block with a SAFETY
 # note. The shipped crate (no `test-harness` feature) builds none of it; the count is a text scan.
 slates-bridge-fskit = 9
-# slates-bridge-winfsp (131 since 2026-11-04: A-198's `FspVersion` export type and its one call in `checked_dll`, the DLL's
+# slates-bridge-winfsp (131 since 2026-11-04: A-206's `FspVersion` export type and its one call in `checked_dll`, the DLL's
 # version check, replacing the read of the reserved field that check once looked at, so a net one more).
 # slates-bridge-winfsp (104): the VfsError->NTSTATUS refusal taxonomy and the notification records stay safe Rust
 # (lib.rs, notify.rs: 0). The WinFsp mount host is Windows-only FFI, hand-transcribed from winfsp's headers (like the

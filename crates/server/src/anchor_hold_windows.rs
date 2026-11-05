@@ -389,7 +389,7 @@ mod tests {
     }
   }
 
-  /// A-198 (2026-11-04), the exchange against a stand-in anchor on a real pipe and shard, with no WinFsp. Do: leave a
+  /// A-206 (2026-11-04), the exchange against a stand-in anchor on a real pipe and shard, with no WinFsp. Do: leave a
   /// release unanswered until its deadline passes; answer it late, then answer a hold; then refuse a release and answer
   /// its repeat. Expect: the deadline passes within its budget, not the daemon's uptime; the channel survives it, so the
   /// hold is served and the late answer passed over; the refusal is typed and the repeat served. Before: the deadline

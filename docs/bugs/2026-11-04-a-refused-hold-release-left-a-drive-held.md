@@ -1,4 +1,5 @@
 # A refused hold release left a drive held, with nobody serving it
+n**Amendment:** A-206 (corrects A-198).
 
 **Found by:** the audit of 2dc9f3eb..98000d56 (2026-11-03), step 4 of plan 01a1a34bf7e973069e94f773afdea44a.
 

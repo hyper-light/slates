@@ -810,7 +810,7 @@ const REFUSED_MOUNTS: u32 = 3;
 /// daemon that has just started. Before 2026-11-04 the deadline was the daemon's uptime plus a second.
 const FIRST_SILENCE: Duration = Duration::from_secs(20);
 
-/// A-198 (2026-11-04), audit step 4. Do: mount a drive beside the one under test; stop the anchor's process, unmount, and
+/// A-206 (2026-11-04), audit step 4. Do: mount a drive beside the one under test; stop the anchor's process, unmount, and
 /// read through the drive; resume the anchor; repeat with a fresh mount twenty times, the first with the anchor silent
 /// past any deadline, and unmount the drive beside it after that first. Expect: every unmount is answered a typed
 /// refusal while the drive it asked about still serves; once the anchor answers, the drive goes; every mount after a
@@ -888,7 +888,7 @@ fn a_release_the_anchor_does_not_answer_leaves_no_drive_held() {
   );
 }
 
-/// A-198 (2026-11-04), audit step 4. Do: stop the anchor's process and mount, three times in one daemon's life, resuming
+/// A-206 (2026-11-04), audit step 4. Do: stop the anchor's process and mount, three times in one daemon's life, resuming
 /// the anchor after each. Expect: each mount is a typed refusal naming the hold; once the anchor answers, nothing is left
 /// mounted at the drive; and a mount and unmount after that succeed, so the channel outlived the refusals.
 #[test]
@@ -1037,7 +1037,7 @@ fn long_path_round_trip(root: &str, units: usize) -> std::io::Result<String> {
   std::fs::read_to_string(&path)
 }
 
-/// A-198 (2026-11-04), the goal's criterion as the supervisor restated it: slates refuses no path the WinFsp driver
+/// A-206 (2026-11-04), the goal's criterion as the supervisor restated it: slates refuses no path the WinFsp driver
 /// passes. Do: measure the driver's limit on this driver by halving. Expect: it is the limit the name reserve is derived
 /// from (`MAX_PATH_UNITS`); a file one unit under it, and at every length on a ladder from 1,025, is created, written,
 /// read back and opened again through slates; at the limit, an open with every parent in place is answered the driver's
@@ -1098,7 +1098,7 @@ fn opens_past_a_thousand_units_are_refused_only_by_the_winfsp_driver() {
   );
 }
 
-/// A-198 (2026-11-04). Do: through the drive, create a file whose kernel name is 2,000 UTF-16 units, write and read it,
+/// A-206 (2026-11-04). Do: through the drive, create a file whose kernel name is 2,000 UTF-16 units, write and read it,
 /// keep a handle and a view of it; kill the daemon; then through the successor read the old handle, change the file
 /// through the SDK and watch the old view and a fresh open. Expect: the bytes each time, the same drive throughout, and
 /// a read counted through the restored context, so the 2,000-unit name was retained and told across the takeover.

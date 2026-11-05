@@ -14,7 +14,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # WinFsp, pinned (A-198): the receiver is written from this version and refuses any other, so an unpinned install would
+  # WinFsp, pinned (A-206): the receiver is written from this version and refuses any other, so an unpinned install would
   # turn every Windows lane red the day upstream ships a release. The hash is the one GitHub publishes for the release
   # asset, and matched the file downloaded on 2026-11-04. Raising it is a review of the receiver's layout.
   WINFSP_MSI_URL: https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi

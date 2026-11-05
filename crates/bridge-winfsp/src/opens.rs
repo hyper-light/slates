@@ -646,7 +646,7 @@ mod tests {
     counters.quota_paged_pool
   }
 
-  /// A-198 (2026-11-04), the name reserve's cost. Do: make the real section and ledger a mount makes, at
+  /// A-206 (2026-11-04), the name reserve's cost. Do: make the real section and ledger a mount makes, at
   /// `MAX_OPEN_HANDLES`, and keep a name at the driver's limit in its last slots' reach. Expect: the name reads back whole;
   /// the figures are printed: the reserve, what making it took and the paged pool charged for it.
   #[cfg(windows)]

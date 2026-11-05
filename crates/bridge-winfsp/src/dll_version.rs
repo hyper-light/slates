@@ -1,4 +1,4 @@
-//! Which WinFsp DLL this host may drive (A-198, §4.6 "Windows"). The receiver (`crate::dispatcher`) writes
+//! Which WinFsp DLL this host may drive (A-206, §4.6 "Windows"). The receiver (`crate::dispatcher`) writes
 //! `FSP_FILE_SYSTEM` fields and calls its operation table by offset, transcribed from WinFsp v2.1's `winfsp.h`, and it
 //! replaces the DLL's own receive loop. Neither is a promise WinFsp's public interface makes across versions, so the
 //! DLL's version is checked before anything touches that layout, and any other version is refused with its number in
@@ -49,13 +49,13 @@ mod tests {
   #![allow(clippy::unwrap_used)]
   use super::*;
 
-  /// A-198. Do: ask about the checked version. Expect: admitted.
+  /// A-206. Do: ask about the checked version. Expect: admitted.
   #[test]
   fn the_version_the_receiver_was_written_from_is_admitted() {
     assert_eq!(check((2 << 16) | 1), Ok(()));
   }
 
-  /// A-198. Do: ask about every neighbour of the checked version, and zero, which is what the reserved field the old
+  /// A-206. Do: ask about every neighbour of the checked version, and zero, which is what the reserved field the old
   /// guard read always holds. Expect: each refused, with its number in the refusal's words.
   #[test]
   fn any_other_version_is_refused_with_its_number() {

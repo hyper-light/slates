@@ -367,7 +367,7 @@ mod tests {
     path
   }
 
-  /// A-198. Do: record names of 1, 1,024, 1,025, 2,000, 8,000 and the driver's limit in UTF-16 units, in the last slot of three. Expect:
+  /// A-206. Do: record names of 1, 1,024, 1,025, 2,000, 8,000 and the driver's limit in UTF-16 units, in the last slot of three. Expect:
   /// each reads back whole and unchanged; the neighbouring slots' names are untouched, tails included.
   #[test]
   fn names_up_to_the_drivers_limit_are_kept_whole() {
@@ -393,7 +393,7 @@ mod tests {
     }
   }
 
-  /// A-198. Do: kill every 97th byte of a long name's replacement, one that starts and ends past the first region, and
+  /// A-206. Do: kill every 97th byte of a long name's replacement, one that starts and ends past the first region, and
   /// resume it. Expect: the old or the new name whole, never a mix of their tails.
   #[test]
   fn a_torn_rename_of_a_long_name_keeps_a_complete_name() {
@@ -413,7 +413,7 @@ mod tests {
     }
   }
 
-  /// A-198. Do: flip one byte of a long name's tail. Expect: the checksum refuses it, so a torn or corrupt tail is never
+  /// A-206. Do: flip one byte of a long name's tail. Expect: the checksum refuses it, so a torn or corrupt tail is never
   /// taken for the kernel's name.
   #[test]
   fn a_corrupt_tail_is_refused() {
@@ -424,7 +424,7 @@ mod tests {
     assert_eq!(read(&memory, 1, 0, 1), Err(Refusal::Corrupt));
   }
 
-  /// A-198, Windows' commit by the granule. Do: record and read a short name in the first of 16 slots. Expect: nothing is
+  /// A-206, Windows' commit by the granule. Do: record and read a short name in the first of 16 slots. Expect: nothing is
   /// read past the first region: a short path's open reaches none of the long-name reserve, so it commits none of it.
   #[test]
   fn a_short_name_never_reaches_the_tail_region() {
