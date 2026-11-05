@@ -15,6 +15,10 @@
 )]
 #![cfg(unix)]
 
+#[path = "../../server/tests/common/nfs.rs"]
+#[allow(dead_code)]
+mod nfs;
+
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -403,8 +407,9 @@ fn wait_caught_up(
 }
 
 /// A-200, AC-8.3's precondition: do turn a volume on one daemon process live-shipped and write files to it. Expect
-/// the owner's log, once the writes stop, durable at its head with nothing owed (every write shipped, as its own entry
-/// or coalesced into a whole record when a burst outran the credit), and both other processes holding that head.
+/// each write answered only once durable on a candidate (the owner's log durable at its head with nothing owed the
+/// moment the last write returns), every write shipped (as its own entry or coalesced into a whole record when a burst
+/// outran the credit), and both other processes then holding that head.
 #[test]
 fn three_daemon_processes_ship_a_live_volumes_writes_to_both_candidates() {
   if std::env::var_os("SLATES_TEST_CLI").is_none() {
@@ -421,8 +426,12 @@ fn three_daemon_processes_ship_a_live_volumes_writes_to_both_candidates() {
     .filter(|instance| *instance != owner)
     .collect();
   let id = write_live_volume(owner, FILES);
+  // The barrier: each write was answered only once durable on a candidate, so the moment the last one returns the
+  // owner's log is durable at its head, with nothing owed, without any wait here.
+  let at_return = live_line(owner, "shipping", &id);
   let (caught_up, shipping, held) = wait_caught_up(owner, &others, &id);
   let appended = counter(owner, "fleet.live.appended");
+  let awaited = counter(owner, "fleet.live.awaited");
   let refused = counter(owner, "fleet.live.refused");
   let hold_refused: Vec<u64> = others
     .iter()
@@ -435,10 +444,20 @@ fn three_daemon_processes_ship_a_live_volumes_writes_to_both_candidates() {
      hold_refused={hold_refused:?}"
   );
   assert!(
+    at_return
+      .as_ref()
+      .is_some_and(|(head, durable, owed)| head == durable && owed == "false"),
+    "the last write returned only once durable: {at_return:?}"
+  );
+  assert!(
     caught_up,
     "both candidates hold the owner's durable head: {shipping:?} {held:?}"
   );
   assert!(appended >= 1, "the owner appended entries: {appended}");
+  assert!(
+    awaited >= u64::try_from(FILES).unwrap(),
+    "each write's reply was deferred to durability: {awaited}"
+  );
 }
 
 /// The `live` status line of `role` (`shipping` or `held`) for `volume` on `instance`: its head, durable and owed
@@ -462,4 +481,77 @@ fn live_line(instance: &str, role: &str, volume: &str) -> Option<LiveLine> {
       .find_map(|field| field.strip_prefix("owed="))?;
     Some((head.to_owned(), durable.to_owned(), owed.to_owned()))
   })
+}
+
+fn json_field(text: &str, key: &str) -> String {
+  let needle = format!("\"{key}\":");
+  let after = text
+    .split(&needle)
+    .nth(1)
+    .unwrap_or_else(|| panic!("{key} in {text}"));
+  let after = after.trim_start();
+  if let Some(quoted) = after.strip_prefix('"') {
+    quoted.split('"').next().unwrap().to_owned()
+  } else {
+    after.split([',', '}']).next().unwrap().trim().to_owned()
+  }
+}
+
+/// A-200 through a real NFS client: do turn a volume on one daemon process live-shipped, export it, and send it
+/// stable (`FILE_SYNC`) writes over NFS. Expect each answered only once a candidate holds it: the moment the last one
+/// returns, the owner's log is durable at its head with nothing owed, without any wait here.
+#[test]
+fn a_stable_nfs_write_to_a_live_volume_is_answered_once_a_candidate_holds_it() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping NFS flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-nfs");
+  let owner = &fleet.instances[(fleet.bootstrap + 1) % fleet.instances.len()];
+  let id = value_of(
+    &run_ready(
+      owner,
+      &["volume", "create", "nfs-shipped", "--bounded", "8MiB"],
+    ),
+    "id",
+  );
+  let (code, _, err) = run(owner, &["live-ship", &id]);
+  assert_eq!(code, 0, "live-ship: {err}");
+  let (code, out, err) = run(owner, &["export", &id, "--json"]);
+  assert_eq!(code, 0, "export: {err}");
+  let (path, port) = (json_field(&out, "path"), json_field(&out, "port"));
+  let mut stream =
+    std::net::TcpStream::connect(("127.0.0.1", port.parse::<u16>().unwrap())).unwrap();
+  stream.set_read_timeout(Some(FLEET_WAIT)).unwrap();
+  let root = nfs::mount(&mut stream, &path, 1);
+  let file = nfs::create(&mut stream, &root, "stable", 2);
+  let mut lines = Vec::new();
+  for (xid, write) in (10u32..).zip(0..FILES) {
+    let data = format!("stable NFS write {write}, durable on a candidate before its reply");
+    nfs::write(&mut stream, &file, data.as_bytes(), xid);
+    lines.push(live_line(owner, "shipping", &id));
+  }
+  let late = counter(owner, "fleet.live.durable_late");
+  let waited = counter(owner, "fleet.live.resolved");
+  drop(stream);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!("live nfs: after each write {lines:?} late={late}");
+  for line in &lines {
+    assert!(
+      line
+        .as_ref()
+        .is_some_and(|(head, durable, owed)| head == durable && owed == "false"),
+      "each stable write returned only once durable: {lines:?}"
+    );
+  }
+  assert_eq!(late, 0, "no write waited out its bound");
+  // The non-vacuity counter: every stable write's reply went through the durable wait (with it removed this is zero,
+  // where the race above, against a status call that takes milliseconds, catches it only some of the time).
+  assert!(
+    waited >= u64::try_from(FILES).unwrap(),
+    "each stable write waited for durability: {waited}"
+  );
 }

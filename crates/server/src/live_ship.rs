@@ -17,8 +17,13 @@
 //! seal refused) leaves the volume owing a whole record: its next publication ships the volume's whole image, and that
 //! entry is the checkpoint an install is made from ([`Shipper::mark_checkpoint`]).
 //!
-//! Not yet: a barrier's reply does not wait for durability (A-200's next slice), a holder's replicas do not survive its
-//! own daemon's restart, and a takeover does not read them.
+//! **The barrier (A-200).** A recorded verb on a live volume commits its effects but neither records its completion nor
+//! answers until the log is durable where its publication put it ([`durable_target`], [`defer`]); then both follow
+//! ([`resolve`]), and a retry meanwhile joins the wait ([`join`]), so no client reads a success that `f` candidates
+//! do not hold. Holders that never answer make the writer wait: backpressure, never a false success.
+//!
+//! Not yet: NFS `COMMIT` and FUSE `fsync` replies do not wait yet, a holder's replicas do not survive its own daemon's
+//! restart, and a takeover does not read them.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -123,6 +128,280 @@ pub(crate) struct LiveState {
   /// The live volumes the publication in progress recorded, with their record (`None`: the publication was a
   /// checkpoint, so the whole image ships): shipped once it commits ([`ship_captured`]), dropped if it is refused.
   pub(crate) captured: Vec<(slates_db::catalog::VolumeId, Option<Vec<u8>>)>,
+  /// Verbs whose reply waits for their volume's log to be durable at a position (A-200's barrier): by volume and
+  /// position, each with where to reply, its completion key and the reply. Bounded as the told waits are
+  /// ([`awaiting_bound`]).
+  awaiting: BTreeMap<([u8; 16], u64), Vec<Awaiting>>,
+  /// The awaiting verbs by request, so a retry joins its wait ([`join`]).
+  awaiting_by_request: BTreeMap<(u64, u32, u32), ([u8; 16], u64)>,
+  /// What the transport barrier that just ran on this shard published of a live volume, for its caller to wait on
+  /// ([`note_barrier`], [`take_barrier`]): set and taken within one synchronous serve.
+  barrier: Option<(slates_db::catalog::VolumeId, u64)>,
+  /// The transport replies parked until a volume is durable, by volume: their wakers, woken as it advances.
+  parked: BTreeMap<[u8; 16], Vec<std::task::Waker>>,
+}
+
+/// Notes, after a transport's barrier published `volume`, the position its reply must wait for ([`wait_durable`]).
+pub(crate) fn note_barrier(state: &mut ShardState, volume: slates_db::catalog::VolumeId) {
+  state.live.barrier = durable_target(state, volume).map(|target| (volume, target));
+}
+
+/// Takes what [`note_barrier`] noted.
+pub(crate) fn take_barrier(state: &mut ShardState) -> Option<(slates_db::catalog::VolumeId, u64)> {
+  state.live.barrier.take()
+}
+
+/// Derived: how long a transport's reply waits for durability before it is answered "try again" (NFS `JUKEBOX`): the
+/// daemon's liveness budget, past which a holder that has not answered is not a live one to wait for.
+const DURABLE_WAIT_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS;
+
+/// Waits on this (the volume's owner) shard, without blocking it, until `volume`'s log is durable at `target`, or
+/// [`DURABLE_WAIT_NS`] has passed: whether it became durable. The caller answers a stable write or `COMMIT` only then,
+/// and otherwise tells the client to try again: a barrier never claims what `f` candidates do not hold.
+pub(crate) async fn wait_durable(volume: slates_db::catalog::VolumeId, target: u64) -> bool {
+  let parked = std::future::poll_fn(|cx| {
+    let done = state::with_state(|s| {
+      let durable = s.live.shipping.get(&volume.bytes).is_none_or(|live| {
+        !live.owes_whole
+          && live
+            .shipper
+            .durable()
+            .is_some_and(|durable| durable >= target)
+      });
+      done_or_park(s, volume.bytes, durable, cx.waker())
+    })
+    .unwrap_or(true);
+    if done {
+      std::task::Poll::Ready(())
+    } else {
+      std::task::Poll::Pending
+    }
+  });
+  let durable = matches!(
+    slates_rt::futures::within(DURABLE_WAIT_NS, parked).await,
+    Ok(Some(()))
+  );
+  let _ = state::with_state(|s| {
+    s.count(
+      if durable {
+        LIVE_RESOLVED
+      } else {
+        LIVE_DURABLE_LATE
+      },
+      1,
+    );
+  });
+  durable
+}
+
+/// Counter: a transport reply whose volume did not become durable within [`DURABLE_WAIT_NS`]; it was answered "try
+/// again".
+const LIVE_DURABLE_LATE: &str = "fleet.live.durable_late";
+
+/// Whether the wait is over (`durable`); if not, parks `waker` on the volume, within the bound on parked replies (past
+/// it the reply is not parked, so it waits out [`DURABLE_WAIT_NS`] and answers "try again").
+fn done_or_park(
+  state: &mut ShardState,
+  volume: [u8; 16],
+  durable: bool,
+  waker: &std::task::Waker,
+) -> bool {
+  if durable {
+    return true;
+  }
+  let held: usize = state.live.parked.values().map(Vec::len).sum();
+  let parked = state.live.parked.entry(volume).or_default();
+  if !parked.iter().any(|known| known.will_wake(waker)) {
+    if held >= awaiting_bound_of(&state.config) {
+      return false;
+    }
+    parked.push(waker.clone());
+  }
+  false
+}
+
+/// Wakes every reply parked on `volume`; each asks again and parks again if its position is not durable yet.
+fn wake_parked(state: &mut ShardState, volume: [u8; 16]) {
+  if let Some(parked) = state.live.parked.remove(&volume) {
+    for waker in parked {
+      waker.wake();
+    }
+  }
+}
+
+/// A verb's reply held until its volume's log is durable where its publication put it.
+#[derive(Debug)]
+struct Awaiting {
+  route: Option<crate::merge_service::ReplyRoute>,
+  origin: u64,
+  id: slates_wire::request::RequestId,
+  reply: slates_ipc::protocol::ReplyBody,
+}
+
+/// Counter: verbs whose reply waited for durability.
+const LIVE_AWAITED: &str = "fleet.live.awaited";
+/// Counter: verbs answered once durable.
+const LIVE_RESOLVED: &str = "fleet.live.resolved";
+/// Counter: a resolved verb's completion that could not be recorded (its retry runs the verb again).
+const LIVE_UNRECORDED: &str = "fleet.live.unrecorded";
+/// Counter: a resolved verb's reply that could not be handed to its client's shard (the completion answers the retry).
+const LIVE_UNDELIVERED: &str = "fleet.live.undelivered";
+/// Counter: a verb refused `Overloaded` because the replies waiting for durability were at their bound.
+const LIVE_OVER_BOUND: &str = "fleet.live.over_bound";
+
+/// Derived: the replies a shard may hold for durability: one per request its clients may have in flight, the bound the
+/// told waits use (`told::held_bound`: clients per shard times ring slots).
+fn awaiting_bound(state: &ShardState) -> usize {
+  awaiting_bound_of(&state.config)
+}
+
+fn awaiting_bound_of(config: &crate::config::DaemonConfig) -> usize {
+  config
+    .clients_per_shard
+    .saturating_mul(usize::try_from(config.region.slots).unwrap_or(1))
+}
+
+/// The position `volume`'s log must be durable at before a verb that just published it may answer, or `None` when it
+/// need not wait (not live-shipped, or durable there already). A publication that owed a whole record waits for the
+/// next position, where that record will be appended.
+pub(crate) fn durable_target(
+  state: &ShardState,
+  volume: slates_db::catalog::VolumeId,
+) -> Option<u64> {
+  let live = state.live.shipping.get(&volume.bytes)?;
+  let head = live.shipper.head().map(|head| head.position);
+  let target = if live.owes_whole {
+    head.map_or(Some(0), |head| head.checked_add(1))?
+  } else {
+    head?
+  };
+  let durable = live.shipper.durable();
+  if !live.owes_whole && durable.is_some_and(|durable| durable >= target) {
+    return None;
+  }
+  Some(target)
+}
+
+/// Holds a verb's reply until `volume`'s log is durable at `target` (A-200): its effects are committed, its completion
+/// is recorded and its reply delivered then ([`resolve`]): `None`. The reply to give now instead, `Overloaded`
+/// (counted, nothing recorded, so a retry runs the verb again), when the shard already holds its bound of such
+/// replies.
+pub(crate) fn defer(
+  state: &mut ShardState,
+  (volume, target): (slates_db::catalog::VolumeId, u64),
+  (origin, id): (u64, slates_wire::request::RequestId),
+  route: Option<crate::merge_service::ReplyRoute>,
+  reply: slates_ipc::protocol::ReplyBody,
+) -> Option<slates_ipc::protocol::ReplyBody> {
+  let held: usize = state.live.awaiting.values().map(Vec::len).sum();
+  if held >= awaiting_bound(state) {
+    state.count(LIVE_OVER_BOUND, 1);
+    return Some(slates_ipc::protocol::ReplyBody::Refused {
+      refusal: slates_ipc::protocol::Refusal::Overloaded { shard: state.shard },
+    });
+  }
+  state
+    .live
+    .awaiting
+    .entry((volume.bytes, target))
+    .or_default()
+    .push(Awaiting {
+      route,
+      origin,
+      id,
+      reply,
+    });
+  state
+    .live
+    .awaiting_by_request
+    .insert((origin, id.client, id.sequence), (volume.bytes, target));
+  state.count(LIVE_AWAITED, 1);
+  None
+}
+
+/// A retry of a verb whose reply still waits for durability joins the wait, answered with the same reply when it comes.
+pub(crate) fn join(
+  state: &mut ShardState,
+  origin: u64,
+  id: slates_wire::request::RequestId,
+) -> bool {
+  let Some(key) = state
+    .live
+    .awaiting_by_request
+    .get(&(origin, id.client, id.sequence))
+    .copied()
+  else {
+    return false;
+  };
+  let route = state.reply_route.take();
+  if let (Some(waiting), Some(route)) = (state.live.awaiting.get_mut(&key), route)
+    && let Some(first) = waiting.first()
+  {
+    let (origin, id, reply) = (first.origin, first.id, first.reply.clone());
+    waiting.push(Awaiting {
+      route: Some(route),
+      origin,
+      id,
+      reply,
+    });
+  }
+  true
+}
+
+/// Answers every verb waiting on `volume` at or below its durable position: its completion recorded on this partition
+/// (one durable step, so a retry after meets it) and its reply delivered to its client's shard, as a green's accepted
+/// submit is (`merge_service::resolve_accepted`).
+fn resolve(state: &mut ShardState, volume: [u8; 16]) {
+  wake_parked(state, volume);
+  let Some(durable) = state
+    .live
+    .shipping
+    .get(&volume)
+    .and_then(|live| live.shipper.durable())
+  else {
+    return;
+  };
+  let keys: Vec<([u8; 16], u64)> = state
+    .live
+    .awaiting
+    .range((volume, 0)..=(volume, durable))
+    .map(|(key, _)| *key)
+    .collect();
+  for key in keys {
+    let Some(waiting) = state.live.awaiting.remove(&key) else {
+      continue;
+    };
+    for entry in waiting {
+      state
+        .live
+        .awaiting_by_request
+        .remove(&(entry.origin, entry.id.client, entry.id.sequence));
+      state.db.begin();
+      let recorded = crate::verbs::record_completion(state, entry.origin, entry.id, entry.reply);
+      if state.db.commit(&mut state.segment).is_err() {
+        state.count(LIVE_UNRECORDED, 1);
+        continue;
+      }
+      state.count(LIVE_RESOLVED, 1);
+      let Some(route) = entry.route else {
+        continue;
+      };
+      let delivery = slates_rt::task::SpawnRequest::new(
+        Box::pin(async move {
+          crate::state::deliver(route.client_index, route.request, recorded, true);
+        }),
+        None,
+      );
+      if slates_rt::registry::send_control(
+        route.shard,
+        slates_rt::control::Control::Spawn(Box::new(delivery)),
+      )
+      .is_err()
+      {
+        state.count(LIVE_UNDELIVERED, 1);
+      }
+    }
+  }
 }
 
 /// Notes each live-shipped volume of a committed checkpoint, whose whole image ships ([`ship_captured`]).
@@ -221,6 +500,7 @@ pub(crate) fn published(
         live.whole = Some((head, payload));
       }
       state.count(LIVE_APPENDED, 1);
+      resolve(state, id.bytes);
       let sends = pending_sends(state, id.bytes);
       dispatch(state, sends);
     }
@@ -488,6 +768,7 @@ fn fold_into(state: &mut ShardState, replies: Vec<(ObjectId, HostId, Vec<u8>)>) 
     }
     if live.shipper.durable() > before {
       state.count(LIVE_DURABLE, 1);
+      resolve(state, object.0);
     }
     if progressed && !touched.contains(&object.0) {
       touched.push(object.0);

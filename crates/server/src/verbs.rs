@@ -1893,6 +1893,7 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
       // with the committed result when the version places, never a success from memory. A retry of a
       // granted landing still running joins it the same way (AUD-29-03).
       if crate::merge_service::join_awaiting(state, origin, id)
+        || crate::live_ship::join(state, origin, id)
         || crate::landing::join_in_flight(state, origin, id)
         || crate::image::join_in_flight(state, origin, id)
         || crate::direct_map::join_in_flight(state, origin, id)
@@ -2167,6 +2168,7 @@ fn run_recorded(
   let mark = body
     .volume()
     .and_then(|volume| crate::told::mark(state, to_db_volume(volume)));
+  let live_volume = body.volume().map(to_db_volume);
   let reply = dispatch(state, client_id, principal, body);
   state.current_request = None;
   let route = state.reply_route.take();
@@ -2174,7 +2176,15 @@ fn run_recorded(
   // effects now but records no completion and gets no reply here: both follow the commit at the
   // quorum (`merge_service::resolve_accepted`), so a retry meanwhile joins the wait, never reads a
   // success the quorum has not committed.
-  let deferred = std::mem::take(&mut state.acceptance_deferred);
+  let mut deferred = std::mem::take(&mut state.acceptance_deferred);
+  // A verb on a live-shipped volume answers once its publication is durable on `f` candidates (A-200): like a deferred
+  // acceptance, its effects commit now and its completion and reply follow (`crate::live_ship::resolve`).
+  let live_target = live_volume
+    .filter(|_| label == 1 && !deferred && !matches!(reply, ReplyBody::Refused { .. }))
+    .and_then(|volume| {
+      crate::live_ship::durable_target(state, volume).map(|target| (volume, target))
+    });
+  deferred |= live_target.is_some();
   let reply = if deferred {
     reply
   } else {
@@ -2204,6 +2214,11 @@ fn run_recorded(
   let partition_label = u32::from(state.partition);
   crate::telemetry::emit(state, op.end(label, end_ns));
   crate::telemetry::emit(state, append.end(partition_label, end_ns));
+  if let Some(live_target) = live_target
+    && !matches!(reply, ReplyBody::Refused { .. })
+  {
+    return crate::live_ship::defer(state, live_target, (origin, id), route, reply);
+  }
   if deferred && !matches!(reply, ReplyBody::Refused { .. }) {
     return None;
   }
@@ -2252,6 +2267,7 @@ fn run_forwarded(
       // A retry of a submit whose acceptance still waits for its commit joins the wait, as does a retry
       // of a granted landing still running (AUD-29-03).
       if crate::merge_service::join_awaiting(state, origin, id)
+        || crate::live_ship::join(state, origin, id)
         || crate::landing::join_in_flight(state, origin, id)
         || crate::image::join_in_flight(state, origin, id)
         || crate::direct_map::join_in_flight(state, origin, id)
