@@ -815,3 +815,5 @@ slates-server: shard 0 initialized in 1590 µs
 slates daemon: instance fsb-566-5-new serving on 3 shards under the anchor
 slates-server: shard 2 initialized in 633 µs
 ## run 5 of 5 done, 2026-11-05T07:23:43Z
+To https://github.com/hyper-light/slates
+   58c3568..b0cde95  b0cde9527de1a04cb5ecce9133cdad2d9c6e8f68 -> diag-winfsp-bench-results-41980761370-windows-11-arm
