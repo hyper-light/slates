@@ -47,6 +47,7 @@ pub mod pjdfstest;
 pub mod record;
 pub mod tap;
 pub mod trace;
+pub mod winfstest;
 pub mod workload;
 
 pub use record::{Counts, Host, Outcome, Privilege, Record, SkipReason, Suite, Transport};
