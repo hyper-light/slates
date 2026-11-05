@@ -13884,7 +13884,11 @@ Applied in the same change to: §4.16's status, A-9's "recorded durably" (now: r
   snapshot they came from, so the checkout names the base and is refused `ConsistentBaseUnavailable` unless the
   snapshot's origin, captured the way `green --base` captures it, encodes byte for byte to the green's recorded
   origin. An equal path is not evidence of an equal source (§4.10 "Overlay volumes in a fleet"). A scratch green has
-  no base to write into and is refused the same way.
+  no base to write into and is refused the same way. **Since A-217 (2026-11-05)** a based green records a reference
+  to its base snapshot with the origin's BLAKE3 identity instead of the bytes, so the check compares identities: the
+  named snapshot's origin against the reference's, or against the BLAKE3 of the bytes a taken-over green still records.
+  A-217 landed with the byte comparison in place, and every checkout of a based green was refused until this was
+  changed (`docs/bugs/2026-11-05-a-held-origin-refused-every-checkout.md`).
 - **The volume must still be the base.** It is refused `Unsupported` unless every op-log record since the snapshot
   is a snapshot's own and none was dropped (`Volume::unchanged_since`), so nothing the volume gained since is
   overwritten by the head without a word.
