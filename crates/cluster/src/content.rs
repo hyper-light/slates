@@ -2318,13 +2318,13 @@ fn dispatch_round(
   stream: u64,
   deadline_ns: u64,
 ) -> Result<Receiver<Reply>, (RtError, Receiver<Reply>)> {
-  let (tx, rx) = channel::<Reply>();
+  let (tx, rx) = crate::reply_channel();
   for (host, endpoint, bytes) in requests {
     let reply_tx = tx.clone();
     let spawned = spawn_child(async move {
       let (reply, endpoint) =
         request_within(endpoint, stream, Priority::Bulk, &bytes, deadline_ns).await;
-      let _ = reply_tx.send(Reply(host, reply, Box::new(endpoint)));
+      reply_tx.send(Reply(host, reply, Box::new(endpoint)));
     });
     match spawned {
       // Detach at once so the task's slot is reaped when it terminates, not held (joinable) until this
@@ -2515,7 +2515,7 @@ struct Round<'a> {
   shape: Placement,
   started_ns: u64,
   deadline_ns: u64,
-  transfer_tx: std::sync::mpsc::Sender<Reply>,
+  transfer_tx: crate::ReplyTx,
   acked: Vec<HostId>,
   reusable: Vec<(HostId, Endpoint)>,
   latencies_ns: Vec<(HostId, u64)>,
@@ -2556,7 +2556,7 @@ impl Round<'_> {
         let spawned = spawn_child(async move {
           let (reply, endpoint) =
             transfer_chunks(*endpoint, requests, host, binding, span_ns).await;
-          let _ = tx.send(Reply(host, reply, Box::new(endpoint)));
+          tx.send(Reply(host, reply, Box::new(endpoint)));
         });
         let Ok(task) = spawned else {
           return false;
@@ -2691,7 +2691,7 @@ pub async fn put_content(
       };
     }
   };
-  let (transfer_tx, transfers) = channel::<Reply>();
+  let (transfer_tx, transfers) = crate::reply_channel();
   let mut round = Round {
     archive,
     binding: (object, sequence, archive.manifest_identity()),

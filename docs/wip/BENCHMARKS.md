@@ -7913,3 +7913,51 @@ What it means:
   measured next (GAPS, the client's per-platform record).
 - The p99 and longer rows here are the load of the shared laptop, not code properties. A quiet machine's record is
   owed; this laptop had no quiet window this day.
+
+## Replication latency: what a cross-node commit costs (§4.8, §4.10; 2026-11-04)
+
+**Hardware:** adacachy, AMD Ryzen 9 9950X3D2 (16 cores, 32 threads), 122 GiB. **Load:** load average 36–42 on 32
+threads (other agents' builds); every run in its own `systemd-run --user` unit with `CPUWeight=1`, `Nice=19` and a
+quota of a quarter of the cores. **Command (the contract):**
+`cargo run --release -p slates-cluster --example replication_bench 1000 0`.
+
+**Setup.** Three nodes on one runtime, one shard each, configured as the daemon configures itself
+(`RuntimeConfig::from_profile` over a full measured profile, 50 µs latency budget, unpinned). Real endpoints (TLS 1.3,
+packet protection, the clocked connection) over real loopback UDP. Each row is 1,000 sequential operations after a
+200-operation warm-up (100 at the 10 ms poll):
+
+- `round-trip`: one 64-byte request and its reply on a warm session to one holder, the floor any per-write replication
+  over the fleet transport sits on.
+- `commit poll=<ns>`: `commit_record` of a fresh record from owner `1` to holders `2` and `3` (`f = 1`), placed at
+  the owner's hold plus the first holder's binding acknowledgement. The daemon's poll is 10 ms.
+
+Five rounds, interleaved, A = origin/main `76b450a1`, B = the collector woken by its replies (A then B in each round;
+every run is a row). Microseconds:
+
+| build | round trip p50 / p99 | commit, 10 ms poll: p50 / p99 / max | commit, 100 µs poll: p50 / p99 / p999 / max |
+|---|---|---|---|
+| A r1 | 13.6 / 54.2 | 10,141.6 / 10,955.9 / 11,364.7 | 1,115.5 / 1,637.3 / 2,496.1 / 4,934.0 |
+| B r1 | 11.9 / 23.0 | 19.7 / 32.5 / 36.3 | 18.1 / 31.0 / 54.1 / 77.4 |
+| A r2 | 13.4 / 36.3 | 10,125.8 / 10,237.5 / 10,241.9 | 1,106.8 / 1,156.9 / 1,371.5 / 1,913.5 |
+| B r2 | 13.4 / 17.7 | 19.9 / 32.6 / 39.6 | 19.2 / 35.7 / 57.3 / 101.7 |
+| A r3 | 13.0 / 24.1 | 10,124.6 / 10,197.3 / 10,219.5 | 1,112.1 / 1,151.9 / 1,321.0 / 1,619.5 |
+| B r3 | 10.8 / 19.2 | 19.0 / 30.0 / 38.6 | 20.1 / 30.1 / 41.4 / 86.9 |
+| A r4 | 12.6 / 39.9 | 10,159.8 / 10,672.7 / 10,749.5 | 1,112.1 / 1,256.2 / 2,090.1 / 2,112.9 |
+| B r4 | 13.2 / 26.9 | 19.2 / 32.9 / 44.7 | 19.9 / 40.7 / 62.7 / 64.8 |
+| A r5 | 14.0 / 61.7 | 10,193.8 / 10,798.2 / 11,069.1 | 1,114.6 / 1,160.1 / 1,294.3 / 1,391.4 |
+| B r5 | 12.6 / 34.5 | 18.9 / 28.8 / 36.6 | 20.1 / 51.0 / 64.4 / 1,043.1 |
+
+**Reading.** Before, a commit cost its collector's poll: the replies landed in about 12 µs and the collector slept
+on (`docs/bugs/2026-11-04-a-quorum-collector-waited-out-its-poll.md`). After, it costs about one and a half round
+trips: 18.9–19.9 µs at the median and under 33 µs at p99 at the daemon's own poll, about 530 times faster. The one
+sample over 1 ms among B's 10,500 (B r5's max, 1,043 µs) is in the 100 µs-poll row, where the bare round trip's
+own tail in that run reached 404 µs; the machine was oversubscribed.
+
+**Measured and rejected (harness):** a first version of this bench ran the shards on the hand-set configuration other
+transport benches use (a one-second step budget) and waited for each straggler by yielding in a loop. A busy shard
+harvests its sockets only once a step budget has passed (`Shard::run`), so the spin starved the very replies it
+waited for: tails of 18–93 ms and one run that never finished. The bench now derives the daemon's configuration and
+waits parked.
+
+**Not in these rows.** The daemon ships a head only on its 100 ms record period, so a head still waits up to a
+period before this commit begins; and nothing replicates a file's writes per write yet (§4.10 live shipping is owed).

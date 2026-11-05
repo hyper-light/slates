@@ -4823,6 +4823,16 @@ reconnaissance because the touched partitions are named up front).
    cadence; a volume with policy `live-shipped` additionally ships its op log to f+1 of its
    candidates and is acknowledged at f+1.
 
+> **Status (2026-11-04, a commit returns at its quorum).** Every quorum dispatch (record commits, ledger promotions,
+> group rounds, content puts) is collected by a loop that is woken by each reply, not only by its poll: a dispatch
+> task sends its reply and wakes the collector (`ReplyTx`, `DispatchWait::keep_waiting` in `crates/cluster/src/lib.rs`).
+> Before, the collector slept a whole poll after its quorum had answered. Measured over real loopback endpoints with
+> the daemon's derived runtime (`replication_bench`, five interleaved rounds at load 36–42): a record commit at f=1
+> took 10,125–10,194 µs at the median at the daemon's 10 ms poll, and takes 18.9–19.9 µs (p99 28.8–32.9 µs) now,
+> about one and a half 12 µs round trips. Record: `docs/bugs/2026-11-04-a-quorum-collector-waited-out-its-poll.md`.
+> Still owed for per-write replication: live shipping itself (§4.10) and the 100 ms record period a head waits for
+> before its commit begins.
+
 
 > **Consensus enhancements: the explorer and leadership transfer (2026-09-28;
 > `docs/wip/research/consensus-enhancements.md`).** The configuration groups' dialect is now explored
