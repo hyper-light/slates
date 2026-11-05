@@ -4,9 +4,9 @@
 //!
 //! Regions are the only memory the chunk arena hands out. The mapping is `memmap2`'s
 //! `MmapMut`, whose anonymous map, advice, lock and byte access are safe functions over the same
-//! `mmap`, `madvise` and `mlock` calls D-12 cites, so this module holds no unsafe code on Unix;
-//! Windows locking (`VirtualLock` after raising the working set) is the one place a raw call
-//! remains. A region knows its NUMA node when the OS says (recorded, not acted on until Phase 8
+//! `mmap`, `madvise` and `mlock` calls D-12 cites, so this module holds little unsafe code on Unix;
+//! Windows locking (`VirtualLock` after raising the working set) and its discard
+//! (`DiscardVirtualMemory`) are raw calls. A region knows its NUMA node when the OS says (recorded, not acted on until Phase 8
 //! measures a placement policy). Locking is a separate step ([`Region::lock`]) so the locking
 //! sequence of [`crate::lock`] can run it in priority order and report refusals per region (D-12:
 //! "RAM-only policy per OS with honest degradation").
@@ -55,8 +55,8 @@ pub struct Region {
   page: usize,
   locked: bool,
   numa_node: u16,
-  /// The ranges whose pages may carry the OS's reusable mark (A-110, macOS), cleared by [`Region::prepare`] before
-  /// any of them is handed out. Empty on every platform whose discard leaves no mark.
+  /// The ranges whose pages may carry the OS's reusable mark (A-110, macOS) or undefined contents (Windows), cleared by
+  /// [`Region::prepare`] before any of them is handed out. Empty on every platform whose discard leaves no mark.
   reusable: crate::ranges::UnitSet,
 }
 
@@ -94,11 +94,11 @@ impl Region {
   /// The object is an [`ExclusiveObject`]: the region hands out references to its bytes, which only
   /// storage no other process reaches may do (AUD-29-09).
   ///
-  /// Where a discard leaves the kernel's reusable mark (macOS, A-110), the whole region is recorded as possibly
-  /// marked: the marks are on the object's pages and outlive the process or shard that set them, so a range of the
-  /// content object another holder or an earlier daemon purged may carry them. Each block's first allocation clears
-  /// its own range ([`Region::prepare`]), a few microseconds, instead of one call over the region at mapping time
-  /// (2 to 37 ms over 2 GiB, measured), which would stall the write that claimed the region.
+  /// Where a discard leaves the kernel's reusable mark (macOS, A-110) or undefined contents (Windows), the whole region
+  /// is recorded as possibly marked: the marks are on the object's pages and outlive the process or shard that set them,
+  /// so a range of the content object another holder or an earlier daemon purged may carry them. Each block's first
+  /// allocation clears its own range ([`Region::prepare`]), a few microseconds, instead of one call over the region at
+  /// mapping time (2 to 37 ms over 2 GiB, measured), which would stall the write that claimed the region.
   pub fn shared(object: ExclusiveObject, page: usize) -> Region {
     let page = page.max(1);
     let len = object.bytes().len();
@@ -209,7 +209,9 @@ impl Region {
   /// to the OS and zeroes any partial page at either end, so the block's RAM is freed rather than kept resident full
   /// of zeros. On Linux the pages become a hole that reads zeros. On macOS they are marked reusable (A-110): they read
   /// their zeros until the kernel takes them, then zero pages, and the range is recorded so [`Region::prepare`] clears
-  /// the mark before the block is handed out again. `false`, the bytes unchanged, where the OS takes no pages back (see
+  /// the mark before the block is handed out again. On Windows they leave the working set (`DiscardVirtualMemory`) and
+  /// their contents are undefined until written, so the range is recorded the same way and [`Region::prepare`] writes
+  /// its zeros before the block is handed out again. `false`, the bytes unchanged, where the OS takes no pages back (see
   /// `os::discard_slice`), the block holds no whole page, or the range lies outside the region.
   pub fn discard(&mut self, offset: usize, len: usize) -> bool {
     let page = self.page.max(1);
@@ -239,19 +241,26 @@ impl Region {
   }
 
   /// Clears the reusable mark from every page of `offset .. offset + len` that may carry one (A-110), before the range is
-  /// handed out: the bytes cleared, zero when none was recorded (every platform but macOS, and a range never
-  /// discarded). The record is a page's bit, so whole pages are cleared. Refused, with the uncleared pages still
-  /// recorded, when the OS refuses: the caller must not hand the range out. Allocates nothing (the arena's hot path).
+  /// handed out: the bytes cleared, zero when none was recorded (Linux, and a range never discarded). On Windows clearing
+  /// is writing zeros over the range's recorded pages, since a discarded page's contents are undefined. The record is a
+  /// page's bit, so whole pages are cleared. Refused, with the uncleared pages still recorded, when the OS refuses: the
+  /// caller must not hand the range out. Allocates nothing (the arena's hot path).
   pub fn prepare(&mut self, offset: usize, len: usize) -> Result<usize, MemError> {
     if self.reusable.is_empty() {
       return Ok(0);
     }
     let size = self.len();
-    // The range is widened to whole words of the record, within each recorded run: one call clears a word of pages
-    // (1 MiB of 16 KiB pages) for about what one block's call costs. Measured on a fresh daemon's 512 MiB write through
-    // the NFS mount: one call per 64 KiB block cost a fifth of the throughput (964-978 against 1,197-1,240 MB/s). A
-    // neighbour's mark cleared early only counts its page in the footprint again.
-    let word = self.reusable.word_bytes().max(1);
+    // Where clearing keeps the bytes (macOS), the range is widened to whole words of the record, within each recorded
+    // run: one call clears a word of pages (1 MiB of 16 KiB pages) for about what one block's call costs. Measured on a
+    // fresh daemon's 512 MiB write through the NFS mount: one call per 64 KiB block cost a fifth of the throughput
+    // (964-978 against 1,197-1,240 MB/s). A neighbour's mark cleared early only counts its page in the footprint again.
+    // Where clearing writes zeros (Windows), it costs no call and must reach no byte outside this block: a recorded
+    // neighbour may be a block a recovery has yet to claim.
+    let word = if os::CLEARING_KEEPS_THE_BYTES {
+      self.reusable.word_bytes().max(1)
+    } else {
+      1
+    };
     let start = offset.saturating_sub(offset.checked_rem(word).unwrap_or(0));
     let end = offset
       .saturating_add(len)
@@ -605,6 +614,13 @@ mod os {
   /// Whether a discard here leaves a mark the pages keep until cleared (macOS's reusable mark, A-110).
   pub(crate) const DISCARD_LEAVES_A_MARK: bool = cfg!(all(target_os = "macos", not(miri)));
 
+  /// Whether a written page stays the kernel's to take until its mark is cleared, so a shared object's every write
+  /// clears first: yes wherever a discard leaves a mark here (measured on macOS, A-110).
+  pub(crate) const A_WRITE_NEEDS_THE_MARK_CLEARED: bool = DISCARD_LEAVES_A_MARK;
+
+  /// Whether clearing a mark leaves the page's bytes as they are: `madvise(MADV_FREE_REUSE)` only changes the accounting.
+  pub(crate) const CLEARING_KEEPS_THE_BYTES: bool = true;
+
   /// What a discard did to a range's pages.
   #[derive(Clone, Copy, Debug, PartialEq, Eq)]
   pub(crate) enum Discarded {
@@ -619,8 +635,9 @@ mod os {
   }
 }
 
-/// What the shared content object discards with too (A-117 on macOS): the same advice and its mark.
-pub(crate) use os::{DISCARD_LEAVES_A_MARK, Discarded, discard_slice, reuse_slice};
+/// What the shared content object discards with too (A-117 on macOS; Windows gives its pages back by its own view's
+/// committed runs): the same advice and its mark.
+pub(crate) use os::{A_WRITE_NEEDS_THE_MARK_CLEARED, Discarded, discard_slice, reuse_slice};
 #[cfg(unix)]
 pub(crate) use os::{lock_bytes_range, lock_bytes_whole};
 
@@ -629,7 +646,7 @@ mod os {
   use super::MemError;
   use memmap2::MmapMut;
   use std::ffi::c_void;
-  use windows_sys::Win32::System::Memory::{VirtualLock, VirtualUnlock};
+  use windows_sys::Win32::System::Memory::{DiscardVirtualMemory, VirtualLock, VirtualUnlock};
   use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetProcessWorkingSetSize, SetProcessWorkingSetSize,
   };
@@ -689,19 +706,40 @@ mod os {
     unsafe { VirtualUnlock(bytes.as_mut_ptr().cast::<c_void>(), bytes.len()) };
   }
 
-  /// No page goes back here yet (`DiscardVirtualMemory` leaves the contents undefined, not zero, so it would still need
-  /// the zeroing it saves; owed with a measurement): the caller keeps them.
-  pub(crate) fn discard_slice(_bytes: &mut [u8], _shared: bool) -> Discarded {
-    Discarded::Refused
+  /// Gives the pages of `bytes` (whole pages of a region's own, unlocked view) back to the OS (A-105):
+  /// `DiscardVirtualMemory` takes them out of the working set at once and drops their contents, and the
+  /// region's commit stays charged. Measured on jupiter on 2026-11-04 over a 256 MiB pagefile section: the working set
+  /// fell from 260 to 4 MiB; `MEM_RESET` alone left it at 260 MiB, and needs `VirtualUnlock`, which answers
+  /// `ERROR_NOT_LOCKED` when it works, to fall as far. The caller records the range: the contents are now undefined, so
+  /// [`reuse_slice`] writes the zeros before the block is handed out.
+  pub(crate) fn discard_slice(bytes: &mut [u8], _shared: bool) -> Discarded {
+    // SAFETY: `bytes` is a live, page-aligned run of whole pages of the region's own view, borrowed mutably for the
+    // call, and unlocked; the call changes the contents of those pages and nothing else, and the caller holds only zeros
+    // there and writes them again before anything reads them as a block's.
+    let refused = unsafe { DiscardVirtualMemory(bytes.as_mut_ptr().cast::<c_void>(), bytes.len()) };
+    if refused == 0 {
+      Discarded::Marked
+    } else {
+      Discarded::Refused
+    }
   }
 
-  /// Nothing to clear where a discard leaves no mark.
-  pub(crate) fn reuse_slice(_bytes: &mut [u8]) -> Result<(), Option<i32>> {
+  /// Writes zeros over `bytes`, pages a discard may have left undefined, before they are handed out.
+  pub(crate) fn reuse_slice(bytes: &mut [u8]) -> Result<(), Option<i32>> {
+    bytes.fill(0);
     Ok(())
   }
 
-  /// Whether a discard here leaves a mark the pages keep until cleared: no page goes back on Windows yet.
-  pub(crate) const DISCARD_LEAVES_A_MARK: bool = false;
+  /// A discard leaves a page's contents undefined until it is written, and the page does not say so: the arena records
+  /// it and clears it before handing it out.
+  pub(crate) const DISCARD_LEAVES_A_MARK: bool = true;
+
+  /// A write keeps the page it wrote, so a shared object's write has nothing to clear: its reader reads only what was
+  /// written after the discard, and clearing would zero the bytes around the write.
+  pub(crate) const A_WRITE_NEEDS_THE_MARK_CLEARED: bool = false;
+
+  /// Clearing is writing zeros.
+  pub(crate) const CLEARING_KEEPS_THE_BYTES: bool = false;
 
   /// What a discard did to a range's pages.
   #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -711,8 +749,7 @@ mod os {
     /// The pages are a hole that reads zeros and costs nothing.
     #[allow(dead_code)]
     Hole,
-    /// The pages are marked reusable and must be cleared before reuse.
-    #[allow(dead_code)]
+    /// The pages left the working set and must be cleared before reuse.
     Marked,
   }
 }

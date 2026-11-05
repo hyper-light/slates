@@ -582,18 +582,30 @@ fn retire_learned_seeds(state: &mut ShardState) -> Vec<(HostId, MemberState)> {
   retired
 }
 
+/// The control shard's turn of [`fold_membership`]: retires the manifest seeds now known by their real ids, tells the
+/// detector the deaths the fleet learned outside it, and folds the detector's changed beliefs into this shard's
+/// `FleetNode` under [`admit_beliefs`]. Returns what this shard folded, for the other shards to apply. A belief the
+/// admission rule did not take — an id not yet learned on contact — is not recorded as folded, so it is offered again
+/// next turn: learn-on-contact makes the id alive on this shard alone, and the detector's belief, unchanged, is then
+/// the only way it reaches the others (before 2026-11-04 it never did, and a survivor's other shard held its live
+/// peer nowhere).
+fn fold_on_control(state: &mut ShardState) -> Vec<(HostId, MemberState)> {
+  let mut folded = retire_learned_seeds(state);
+  tell_detector_of_deaths(state);
+  let changed = changed_members(state);
+  let admitted = admit_beliefs(state, &changed);
+  for (member, _) in changed.iter().filter(|belief| !admitted.contains(belief)) {
+    state.plane.folded.remove(member);
+  }
+  folded.extend(admitted);
+  folded
+}
+
 /// Folds the detector's changed beliefs into every shard's `FleetNode` (the control shard's first, then each other
 /// owner's, D-7) under [`admit_beliefs`], after telling the detector the deaths the fleet learned outside it, and
 /// retires the manifest seeds of peers now known by their real ids.
 async fn fold_membership(origin: u16, shards: &[u16]) {
-  let changed = state::with_state(|state| {
-    let mut folded = retire_learned_seeds(state);
-    tell_detector_of_deaths(state);
-    let changed = changed_members(state);
-    folded.extend(admit_beliefs(state, &changed));
-    folded
-  })
-  .unwrap_or_default();
+  let changed = state::with_state(fold_on_control).unwrap_or_default();
   if changed.is_empty() {
     return;
   }
@@ -929,5 +941,47 @@ mod tests {
     let mut long = bytes.to_vec();
     long.push(0);
     assert_eq!(Announcement::decode(&long), None);
+  }
+
+  /// §4.8 "Membership" (the bug record of 2026-11-04, CI run 41774055498): every shard of a node holds a live peer
+  /// alive, whichever comes first, the detector's word or learn-on-contact. Do: on the control shard, let the detector
+  /// hold a peer alive before learn-on-contact has authenticated its id, fold; then learn the peer on contact and fold
+  /// again with the detector's belief unchanged. Expect: the second fold hands the peer, alive, to the other shards.
+  /// Before the fix the first fold recorded the belief folded though it admitted nothing, so the peer was alive on the
+  /// control shard alone, and a survivor's other shard reported itself the only member after a third node died.
+  #[test]
+  fn a_peer_the_detector_knew_before_learn_on_contact_reaches_every_shard() {
+    let (first, second) = crate::daemon::audit_on_shard(|state| {
+      let local = state.fleet.host();
+      let plane = MemberPlane::new(
+        local,
+        0,
+        NonZeroUsize::MIN.saturating_add(2),
+        std::time::Duration::from_nanos(slates_machine::clock::resolution_ns()),
+        lease_renewal(),
+        std::time::Duration::from_nanos(crate::lease::horizon_ns()),
+      )
+      .unwrap();
+      state.plane.plane = Some(plane);
+      let anchor = HostId(local.0.wrapping_add(1));
+      let peer = crate::deploy::member_id(anchor, 1);
+      let alive = state_of(Liveness::Alive, 0);
+      state.plane.plane.as_mut().unwrap().apply(peer, alive);
+      let first = fold_on_control(state);
+      crate::fleet::learn_member(state, anchor, 1, peer);
+      let second = fold_on_control(state);
+      (
+        first.contains(&(peer, alive)),
+        second.contains(&(peer, alive)),
+      )
+    });
+    assert!(
+      !first,
+      "an id not yet learned on contact is not folded alive anywhere"
+    );
+    assert!(
+      second,
+      "once learned on contact, the detector's unchanged belief reaches the other shards"
+    );
   }
 }
