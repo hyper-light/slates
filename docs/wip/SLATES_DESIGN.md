@@ -6958,6 +6958,15 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > work reads one position per holder rather than rescanning the retained chain. Transfer to a new
 > candidate set and full green takeover remain owed (AUD-14).
 
+> **Status (2026-11-04, A-199: a green's head lands through a checkout).** `checkout GREEN VOLUME ATTACHMENT
+> --snapshot N` writes the green's head into the volume it was created from (the server's overlay of the directory
+> it lands into), checked to be that base and unchanged since, and `land` lands the volume under a grant; a green
+> itself is still refused `land`. Proven by `crates/server/tests/checkout.rs` (a real daemon over a real directory:
+> two merged pushes and an overlapping one refused with its window; the granted landing writes every merged byte; an
+> outsider's edit of a merged file is the presentation's only conflict; a wrong or moved base refused; three of three
+> red with the base check and the writes removed) and across a container by the fs-server lab (the client on the
+> host, the green's node in Docker, everything up to the grant; see A-199).
+
 **Role.** Let many agents work on clones of one shared volume and fold their work back into it
 with no locks, no last-writer-wins, and no inferred merge. Each agent's work becomes an
 increment of declared operations; the green volume's merge task maps the increment through
@@ -12794,6 +12803,58 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
 - **Arm64 Windows proven** since (2026-10-27): the direct-map client tests, 20 of 20, on CI's `windows-11-arm` (run
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
+
+### A-199 — A green's head lands through a checkout: written into the volume the green was created from, which lands under a grant like any volume (accepted and built 2026-11-04)
+
+- **What it answers.** §4.16 ends a merge at a green version and §4.15 writes disk only through a landing, but nothing
+  joined them: `land` on a green was refused `Unsupported { "landing a merge volume" }` (owed "with the extent-backed
+  green"). So work pushed to a server through `work`, `edit` and `submit` (from its own host, or from another fleet
+  node, whose submissions route to the green's owner, §4.10) could never reach the server's disk. Found by the
+  fs-server lab of 2026-11-04: a client on the host pushed three edits into a green on a node in a Docker container,
+  version 2 was accepted, and `land` refused it on both nodes.
+- **Decided: `checkout GREEN VOLUME ATTACHMENT --snapshot N`.** The green's head is written into `VOLUME`, the volume
+  the green was created from (on a server, its overlay of the directory the work lands into), through `ATTACHMENT`, the
+  caller's own write attachment of it, by the typed file verbs' one checked path (`fs_verbs::with_writer` over the
+  shared operation layer, so the overlay's copy-up and witness rules hold, and the attachment is checked again at
+  every step). What is written is the head's difference from the green's origin: paths the origin held and the head
+  does not are removed, deepest first; then directories the head adds are made and files it adds or changes are
+  written whole, parents first; then each mode the head changed is set. The volume then lands with the existing
+  `land` and `grant`: the verdict is the landing's own (§4.15), so a file the merge changed that an outsider also
+  changed on disk since the base's witness is a conflict, an equal one is accepted by identity, and nothing is
+  inferred (D-26, D-27).
+- **The base is checked, not trusted.** The green records only its origin's bytes (`GreenOriginated`), not which
+  snapshot they came from, so the checkout names the base and is refused `ConsistentBaseUnavailable` unless the
+  snapshot's origin, captured the way `green --base` captures it, encodes byte for byte to the green's recorded
+  origin. An equal path is not evidence of an equal source (§4.10 "Overlay volumes in a fleet"). A scratch green has
+  no base to write into and is refused the same way.
+- **The volume must still be the base.** It is refused `Unsupported` unless every op-log record since the snapshot
+  is a snapshot's own and none was dropped (`Volume::unchanged_since`), so nothing the volume gained since is
+  overwritten by the head without a word.
+- **The diff is against the origin, not the history.** The origin is durable and never folded, while the chain's
+  histories fold under the retention budget (AUD-16), so the head-against-origin difference is exact at any fold.
+- **Running.** As `image merge` (A-160): checked at once, then deferred to a task of the volume's owner shard (also the
+  green's, since `green --base` runs there), one step a unit in slices of `copy_slice_ns`, a retry joining it; the
+  volume is published before the completion is recorded. The steps are not one atom: a refusal midway leaves the
+  steps before it written and names the path, as a refused file verb leaves what it wrote; the base snapshot still
+  holds the state before the checkout.
+- **Not in this change, refused typed.** A head whose difference from the origin includes a symbolic link, a hard
+  link, an extended attribute or a FIFO/socket is refused `Unsupported` naming the path; those dimensions are owed. The
+  checkout of an older version is owed (the head only). The origin capture and the difference are computed in one
+  unit, unsliced, as `green --base` already captures its origin (owed with the extent-backed green).
+- **Rejected: a clone of the base snapshot holding the head** (the first form of this amendment, the same day). The
+  daemon cannot clone an overlay volume: every clone is admitted with no host (`verbs::admit_clone`), while an
+  overlay's base names its directories by its own host's handles, so the clone of the server's overlay was refused
+  `ContentUnavailable`, pinned or not, on a fleet node and on a standalone daemon alike (the volume core's own overlay
+  clone, `a_clone_of_an_overlay_snapshot_reads_the_same_base`, is not reachable through the daemon). Recorded in GAPS.
+- **Rejected: `land GREEN TARGET` building a hidden view.** A grant binds a presented manifest, and the presentation
+  and the granted landing are two calls; a view rebuilt for each would need its manifest proven stable, and a kept one
+  would be state the user never named.
+- **Rejected: composing it in the client** (`write` per path). It checks nothing about the base and costs a round trip
+  a path.
+- **Where the grant comes from.** Unchanged: a human at the server's anchor (R10). On Linux the anchor's issuer
+  segment is a descriptor only its children hold, so no separate `slates grant` can be issued there (the Linux issuer
+  surface is owed, §4.13); the lab's container node therefore stops at the presentation.
+Applied in the same change to: §4.16 (status), GAPS (top blockquote).
 
 ### A-198 — A WinFsp mount outlives its daemon: the anchor holds the volume's control handle, the drive's link and the mount's ledger, and the next daemon serves the held volume (accepted 2026-11-01, Step 9 of the VFS and DAX plan; built and measured 2026-11-02)
 Applied in the same change to: GAPS (gap 2 of the platform inventory). The build applies it to §4.6 "Windows",

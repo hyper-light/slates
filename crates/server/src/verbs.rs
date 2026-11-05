@@ -3533,6 +3533,11 @@ fn dispatch_inner(
     RequestBody::ImageMerge { image, name } => {
       crate::image::merge_verb(state, principal, image, name)
     }
+    RequestBody::Checkout {
+      green,
+      base,
+      attachment,
+    } => crate::checkout::checkout_verb(state, principal, green, base, attachment),
     RequestBody::Attach {
       volume,
       snapshot,

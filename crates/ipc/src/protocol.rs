@@ -731,6 +731,20 @@ pub enum RequestBody {
     /// The mapping id the map's hand-off named.
     mapping_id: u64,
   },
+  /// Check a green's head out into the volume it was created from (§4.16, A-199): `base` names that volume and the
+  /// snapshot the green's origin was taken from, refused unless the snapshot's origin is the green's own and the volume
+  /// is unchanged since it. The head's difference from the origin is written through `attachment`, the caller's write
+  /// attachment of the volume, as the file verbs write. The volume then lands under a grant like any other, so the
+  /// landing's verdict judges the merge's files against the disk. The reply waits for the checkout, which runs in
+  /// slices on the volume's owner shard. Appended.
+  Checkout {
+    /// The green.
+    green: VolumeId,
+    /// The volume and snapshot the green was created from.
+    base: GreenBase,
+    /// The caller's write attachment of `base.volume`.
+    attachment: u64,
+  },
 }
 
 /// Format: the name of the image file in an image volume's root (§4.6, A-160): what a VMM is pointed at.
@@ -1284,6 +1298,8 @@ impl RequestBody {
       | RequestBody::Land { volume, .. }
       | RequestBody::ImageBuild { volume, .. }
       | RequestBody::ImageMerge { image: volume, .. } => Some(*volume),
+      // A checkout writes its green's base volume, on the owner shard of both (`green --base` runs there).
+      RequestBody::Checkout { base, .. } => Some(base.volume),
       // A green over a base is born on the base volume's owner shard, where the snapshot is walked.
       RequestBody::CreateGreen { base, .. } => base.map(|b| b.volume),
       RequestBody::Create { .. }
@@ -1335,6 +1351,7 @@ impl RequestBody {
         | RequestBody::FsRemove { .. }
         | RequestBody::FsRename { .. }
         | RequestBody::FsMkdir { .. }
+        | RequestBody::Checkout { .. }
     )
   }
 
@@ -3203,6 +3220,27 @@ pub enum ReplyBody {
     /// The file's length when the comparison began: the copy's bytes past it within its last page are not the file's.
     file_len: u64,
   },
+  /// A green's head was checked out into the volume it was created from (`Checkout`, §4.16 A-199). Appended.
+  CheckedOut {
+    /// The green version the volume now holds: the head when the checkout began.
+    version: u64,
+    /// What the checkout changed in the clone of the base, by kind.
+    report: CheckoutReport,
+  },
+}
+
+/// What a checkout changed in its green's base volume (§4.16 A-199): the head's difference from the origin, by
+/// kind. A path counts once, under the first kind that applied to it.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct CheckoutReport {
+  /// Files written whole: new, or holding other bytes than the origin's.
+  pub written: u64,
+  /// Directories made.
+  pub made: u64,
+  /// Paths removed: files and directories the origin held and the head does not.
+  pub removed: u64,
+  /// Paths whose mode alone changed.
+  pub moded: u64,
 }
 
 /// One entry of a directory listing (`ReadDir`).

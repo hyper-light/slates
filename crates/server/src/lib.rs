@@ -60,6 +60,7 @@ mod fuse;
 #[cfg(target_os = "linux")]
 mod fuse_hold;
 // A writable direct map's copy that outlives its daemon: held by the anchor, taken back by the successor (A-197).
+mod checkout;
 pub mod head;
 #[cfg(target_os = "linux")]
 mod held_copy;
