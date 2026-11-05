@@ -1,0 +1,43 @@
+name: diag-fixtures
+
+on:
+  push:
+    branches: ['diag-fixtures-*']
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rings:
+    name: ipc clippy + rings (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, windows-11-arm, ubuntu-24.04-arm, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        if: ${{ matrix.os == 'windows-latest' }}
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Clippy slates-ipc
+        run: cargo clippy -p slates-ipc --all-targets -- -D warnings
+      - name: The rings, 50 times
+        shell: bash
+        run: |
+          cargo test -p slates-ipc --test rings --no-run
+          fail=0
+          for n in $(seq 1 50); do
+            cargo test -q -p slates-ipc --test rings > out.txt 2>&1 || { fail=$((fail+1)); echo "run $n failed"; grep -E "panicked|estimate|FAILED" out.txt | head -5; }
+          done
+          echo "failures $fail of 50"
+          test $fail -eq 0
+      - name: Test the ipc crate
+        run: cargo test -p slates-ipc
