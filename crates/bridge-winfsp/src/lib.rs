@@ -137,7 +137,7 @@ pub fn filetime_from_unix_ns(ns: i64) -> u64 {
 }
 
 /// Format: the `FILETIME` a `SetBasicInfo` call passes for a time it leaves alone (WinFsp's `SetBasicInfo`: "0 if
-/// [it] should not be changed"), and the all-ones value Windows' `SetFileTime` documents as "stop updating it for this
+/// the time should not be changed"), and the all-ones value Windows' `SetFileTime` documents as "stop updating it for this
 /// handle", which a volume that keeps no per-handle update policy also leaves alone.
 const FILETIME_UNCHANGED: [u64; 2] = [0, u64::MAX];
 
