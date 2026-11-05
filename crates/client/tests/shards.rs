@@ -884,6 +884,8 @@ mod delivered {
     const HOLDING_TAG: &str = "SHARDS-HOLDING";
     /// Format: Linux `EACCES`, a claimant that does not hold the stream.
     const EACCES: i32 = 13;
+    /// Format: Linux `EINVAL`, an ask no view can begin at.
+    const EINVAL: i32 = 22;
     /// Format: a DAX range, 2 MiB (`FUSE_DAX_SZ`), the span every ask here maps.
     const RANGE: u64 = 2 << 20;
     /// Shape: the file the guest maps, two pages and a part, so its end falls inside a page of the range.
@@ -975,13 +977,18 @@ mod delivered {
 
     impl Mapped {
       fn map(section: &OwnedHandle, access: u32) -> Result<Mapped, u32> {
+        Mapped::map_at(section, access, 0)
+      }
+
+      /// A view of one range's length of `section` from `offset`, as a VMM's window places one.
+      fn map_at(section: &OwnedHandle, access: u32, offset: u64) -> Result<Mapped, u32> {
         // SAFETY: a view at an address the system chooses of a live section handle; refused views are null.
         let view = unsafe {
           MapViewOfFile(
             section.as_raw_handle(),
             access,
-            0,
-            0,
+            u32::try_from(offset >> 32).unwrap(),
+            u32::try_from(offset & u64::from(u32::MAX)).unwrap(),
             usize::try_from(RANGE).unwrap(),
           )
         };
@@ -1033,10 +1040,22 @@ mod delivered {
         pid: u32,
         stream: u64,
       ) -> Result<u64, i32> {
+        self.descriptor_from(node, writable, 0, pid, stream)
+      }
+
+      /// As [`Guest::descriptor`], for the range from `offset` in the file.
+      fn descriptor_from(
+        &mut self,
+        node: u64,
+        writable: bool,
+        offset: u64,
+        pid: u32,
+        stream: u64,
+      ) -> Result<u64, i32> {
         let mut ask = vec![ASK_DESCRIPTOR];
         ask.extend_from_slice(&node.to_le_bytes());
         ask.push(u8::from(writable));
-        ask.extend_from_slice(&0u64.to_le_bytes());
+        ask.extend_from_slice(&offset.to_le_bytes());
         ask.extend_from_slice(&RANGE.to_le_bytes());
         ask.extend_from_slice(&pid.to_le_bytes());
         ask.extend_from_slice(&stream.to_le_bytes());
@@ -1176,6 +1195,71 @@ mod delivered {
       (0..FILE_BYTES)
         .map(|at| u8::try_from(at % 251).unwrap())
         .collect()
+    }
+
+    /// T-shards-windows-5.6. Do: ask for a file's slice from each of a range's granules (the system's allocation
+    /// granularity, where a section's view must begin), a view of it placed from there as a VMM's window places one; and
+    /// from four offsets between granules. Expect each view to hold the file's bytes at its offset, then zeros to its
+    /// last byte, which lies in the next range when its offset is past the first (committed and filled before the
+    /// answer); and each ask between granules refused `EINVAL` and counted malformed, nothing handed, since no view could
+    /// begin there.
+    #[test]
+    fn a_slice_is_handed_from_each_granule_and_refused_between_them() {
+      let granule = slates_machine::facts::Facts::allocation_granularity();
+      let (daemon, mut client) = start("dax-granule");
+      let id = volume(&mut client, "dax-granule");
+      let mut guest = Guest::over(client.attach_shards(id, Intent::Write, None).unwrap());
+      let file: Vec<u8> = (0..2 * granule + 100)
+        .map(|at| u8::try_from(at % 251).unwrap())
+        .collect();
+      guest.write_file("granules.bin", &file);
+      let (node, _fh) = guest.open_rw("granules.bin");
+      let (pid, stream) = (std::process::id(), guest.stream_value());
+      let range = usize::try_from(RANGE).unwrap();
+      let granules = RANGE / granule;
+      for offset in (0..granules).map(|index| index * granule) {
+        let value = guest
+          .descriptor_from(node, false, offset, pid, stream)
+          .unwrap_or_else(|errno| panic!("from {offset:#x}: errno {errno}"));
+        // SAFETY: the value the daemon duplicated into this process, taken as this test's own.
+        let section = unsafe {
+          OwnedHandle::from_raw_handle(std::ptr::with_exposed_provenance_mut(
+            usize::try_from(value).unwrap(),
+          ))
+        };
+        let map = Mapped::map_at(&section, FILE_MAP_READ, offset)
+          .unwrap_or_else(|error| panic!("a view from {offset:#x}: error {error}"));
+        let held = file.len().saturating_sub(usize::try_from(offset).unwrap());
+        assert_eq!(
+          map.read(0, held),
+          file[file.len() - held..],
+          "from {offset:#x}: the file's bytes"
+        );
+        assert!(
+          map.read(held, range - held).iter().all(|&byte| byte == 0),
+          "from {offset:#x}: zeros to its last byte"
+        );
+      }
+      let between = [1, 4096, granule / 2, granule + 4096];
+      for offset in between {
+        assert_eq!(
+          guest.descriptor_from(node, false, offset, pid, stream),
+          Err(EINVAL),
+          "from {offset:#x}"
+        );
+      }
+      let refusals = daemon.refusals_on_every_shard().unwrap();
+      assert_eq!(
+        refusals.get("shards.dax_answered"),
+        Some(&granules),
+        "{refusals:?}"
+      );
+      assert_eq!(
+        refusals.get("shards.dax_malformed"),
+        Some(&u64::try_from(between.len()).unwrap()),
+        "{refusals:?}"
+      );
+      drop((guest, client, daemon));
     }
 
     /// T-shards-windows-5.4. Do: on a stream, ask for a file's section naming, in turn, a holder process that holds

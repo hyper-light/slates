@@ -166,22 +166,31 @@ fn malformed(reason: &'static str) -> HandleRefusal {
   HandleRefusal::Malformed { reason }
 }
 
-/// Shape: how many distinct refusals an anchor's log remembers. This module and the channel name about 40 reasons, and
-/// an OS refusal differs by its code as well, so the table is above every kind a channel meets in practice; past it a
-/// new kind is counted and not logged, so the log still has a bound whatever a daemon or the OS does.
+/// Shape: how many distinct refusals an anchor's log remembers. This module and the Windows channel name about 40
+/// reasons, the Unix device channel (`crate::held`) about 25, and an OS refusal differs by its code as well, so the
+/// table is above every kind a channel meets in practice; past it a new kind is counted and not logged, so the log
+/// still has a bound whatever a daemon or the OS does.
 const REFUSALS_REMEMBERED: usize = 64;
 
 /// Which refusals the anchor has already logged: each distinct refusal once over the anchor's life, in a bounded table.
 /// Logging on a change of kind would not be enough, since a daemon alternating two bad messages changes kind at every
-/// message and the log would grow without bound. Every refusal is still counted by its caller.
-#[derive(Debug, Default)]
-pub struct RefusalLog {
-  logged: Vec<HandleRefusal>,
+/// message and the log would grow without bound. Every refusal is still counted by its caller. One table serves each
+/// hold channel's refusals: the Windows hold's [`HandleRefusal`] and the Unix device hold's `held::HoldRefusal`
+/// (A-213).
+#[derive(Debug)]
+pub struct RefusalLog<Refusal> {
+  logged: Vec<Refusal>,
 }
 
-impl RefusalLog {
+impl<Refusal> Default for RefusalLog<Refusal> {
+  fn default() -> Self {
+    RefusalLog { logged: Vec::new() }
+  }
+}
+
+impl<Refusal: PartialEq + Clone> RefusalLog<Refusal> {
   /// Whether `refusal` should be logged now: true the first time it is met, while the table has room.
-  pub fn first_sighting(&mut self, refusal: &HandleRefusal) -> bool {
+  pub fn first_sighting(&mut self, refusal: &Refusal) -> bool {
     if self.logged.len() >= REFUSALS_REMEMBERED || self.logged.contains(refusal) {
       return false;
     }

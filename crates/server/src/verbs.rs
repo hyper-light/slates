@@ -3125,7 +3125,7 @@ fn demux_sum(
 /// every shard's part.
 fn daemon_report(state: &mut ShardState, shards: Vec<ShardReport>) -> ReplyBody {
   let now = state.clock.monotonic_ns();
-  let (generation, restarts, heartbeat_age_ns) = state
+  let (generation, restarts, heartbeat_age_ns, anchor_hold_refusals) = state
     .segment
     .supervision()
     .map(|s| {
@@ -3133,9 +3133,10 @@ fn daemon_report(state: &mut ShardState, shards: Vec<ShardReport>) -> ReplyBody 
         s.generation(),
         s.restarts(),
         now.saturating_sub(s.heartbeat_ns()),
+        s.hold_refusals(),
       )
     })
-    .unwrap_or((0, 0, 0));
+    .unwrap_or((0, 0, 0, 0));
   let fleet = fleet_report(state, &shards);
   // The node's recipient lives on the control shard: its part carries the id, whichever shard answers.
   let control_recipient = shards
@@ -3154,6 +3155,7 @@ fn daemon_report(state: &mut ShardState, shards: Vec<ShardReport>) -> ReplyBody 
       shards,
       fleet,
       seal: seal_report(state, control_recipient),
+      anchor_hold_refusals,
     }),
   }
 }

@@ -4,7 +4,7 @@
 //! request. WinFsp v2.1 sys/volume.c, sys/ioq.c and dll/fs.c define this order; the live taken-read oracle checks it.
 
 use std::cell::{Cell, RefCell};
-use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsRawHandle, BorrowedHandle, OwnedHandle};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::thread::JoinHandle;
 
@@ -13,7 +13,6 @@ use windows_sys::Win32::System::IO::{DeviceIoControl, GetOverlappedResult, OVERL
 use windows_sys::Win32::System::Memory::{
   FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
 };
-use windows_sys::Win32::System::Threading::CreateEventW;
 
 use crate::ffi::FileSystem;
 use crate::host::WinFspError;
@@ -239,7 +238,7 @@ impl Drop for CaptureView {
   }
 }
 
-/// One Win32 transaction, including completion if the direct request pends. All borrowed buffers and the event remain
+/// One Win32 transaction, including completion if the direct request pends. All borrowed buffers and the worker's completion event remain
 /// owned until GetOverlappedResult settles it. The finite transaction wait lets an idle receiver return and observe
 /// cancellation without stopping the held volume. The mount owner joins before deleting its own file system.
 fn transaction(
@@ -249,15 +248,8 @@ fn transaction(
   output: &mut [u8],
   intents: &mut crate::purge_intents::Intents,
 ) -> Result<usize, WinFspError> {
-  // SAFETY: unnamed manual-reset event; no security descriptor or initial owner is borrowed.
-  let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
-  if event.is_null() {
-    return Err(os_error("create transaction completion event"));
-  }
-  // SAFETY: CreateEventW returned a fresh handle; this value takes its ownership exactly once.
-  let event = unsafe { OwnedHandle::from_raw_handle(event) };
   let mut overlapped = OVERLAPPED {
-    hEvent: event.as_raw_handle(),
+    hEvent: intents.completion_event(),
     ..OVERLAPPED::default()
   };
   let mut done = 0;
@@ -294,7 +286,7 @@ fn transaction(
         code: error.raw_os_error(),
       });
     }
-    let progress = intents.wait(event.as_handle());
+    let progress = intents.wait();
     // SAFETY: this is the same outstanding overlapped I/O, with all its buffers and event still owned. Waiting settles
     // the request before any return can free them; an idle receive has the volume's finite transaction wait.
     if unsafe { GetOverlappedResult(control, &overlapped, &mut done, 1) } == 0 {
@@ -567,12 +559,14 @@ fn receive_loop(
   }
   // SAFETY: the mount owner cannot delete this DLL object until the receive thread is joined.
   let control = unsafe { (*file_system).volume_handle };
+  // What this owner's last batch filled; its first receive clears the whole buffer.
+  let mut used = None;
   loop {
     if is_stopped(&stopped) {
       return Ok(());
     }
-    let mut receiving = view.capture()?.begin().map_err(WinFspError::Capture)?;
-    transaction(
+    let mut receiving = view.capture()?.begin(used).map_err(WinFspError::Capture)?;
+    let reported = transaction(
       control,
       TRANSACT_BATCH,
       &[],
@@ -583,7 +577,8 @@ fn receive_loop(
     if is_stopped(&stopped) {
       return Ok(());
     }
-    let mut batch = receiving.received().map_err(WinFspError::Capture)?;
+    used = Some(inflight::capture::filled(reported).map_err(WinFspError::Capture)?);
+    let mut batch = receiving.received(reported).map_err(WinFspError::Capture)?;
     settle(
       file_system,
       &mut batch,

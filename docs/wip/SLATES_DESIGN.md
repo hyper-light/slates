@@ -2885,6 +2885,12 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 > left a drive held on each Windows lane, with the anchor stopped (run 41978665514). A DLL other than 2.1 is refused at
 > mount. Slates refuses no path the WinFsp driver passes: the driver refuses from 8,116 UTF-16 units, measured live on both
 > lanes, and the name reserve is derived from that limit.
+> **Status (2026-11-04, A-213).** Every refusal of the hold channel is published in the segment and shown by
+> `slates status` as `anchor_hold_refusals`, so a refusal past its kind's first log line is still seen; the Unix device
+> hold's log is bounded as the Windows hold's is.
+> The Windows anchor wakes on its hold channel's posted read and on the daemon's exit, where it parked up to 500 ms between
+> looks: five holds under a 4 s pause were answered in 3,990–4,020 ms before, on both CI lanes, and under 1 ms after
+> (runs 41984349301 and 41985213489).
 
 **Base reads on macOS and Windows.** As on Linux, the daemon reads untouched base files through its own descriptor or
 handle into evictable cache chunks (one copy, `pread`/`ReadFile` on the owner shard's driver) and
@@ -8323,8 +8329,9 @@ ship.
    and landing containment; the tracer run for hermeticity across the whole matrix; power-fail
    landings on real machines (dm-flakey on Linux, a pulled RAM VHD on Windows, a forced restart
    on macOS) checked against the oracle.
-5. Release engineering: the nine-target release, npm and PyPI publishing, plugin package, docs
-   (user docs short in `docs/`, this design and the specs in `docs/wip` promoted).
+5. Release engineering: the seven-target binary release (B.2, A-210; built, smoke-tested and attached to a draft
+   by `release.yml` since 2026-11-04), npm and PyPI publishing, plugin package, docs (user docs short in `docs/`,
+   this design and the specs in `docs/wip` promoted).
 6. The gap ledger reconciled: every open item either closed or carried with an owner.
 
 **Acceptance criteria.**
@@ -8642,21 +8649,27 @@ Evidence: `research/survey-vorpal.md` §0–§9.
   an ABI contract is version-specific, each with a comment saying why; heavy optional features
   documented as "NEVER a default". [C: vorpal crates/ann/Cargo.toml:20-28, crates/index/Cargo.toml:58-61]
 
-### B.2 Target matrix and release recipes (identical to vorpal's)
+### B.2 Target matrix and release recipes (from vorpal's, amended by A-210)
+
+> **Status (2026-11-04, A-210).** `.github/workflows/release.yml` builds the seven targets below natively, smoke-tests
+> each built binary on its own runner (`cargo run -p xtask --bin release -- smoke`), and attaches the binaries, `SHA256SUMS`,
+> `slates-provenance.json` and a Sigstore attestation bundle to a **draft** release. Publishing the draft is the
+> maintainer's one approved step (`docs/publish.md`, "The binary release"). The proof by use on a test tag is recorded
+> in A-210: test tag `v0.1.0-test.1`, run 41983664060, a draft with all seven binaries whose checksums and attestation
+> verify. Reproducibility from the tag (AC-9.5's first clause) is not yet shown: no lane builds twice and compares.
 
 | target | runner | asset name |
 |---|---|---|
 | `aarch64-apple-darwin` | macos-latest | `slates-macos-arm64` |
-| `x86_64-apple-darwin` | macos-latest (cross via `--target`) | `slates-macos-x64` |
 | `x86_64-unknown-linux-gnu` | ubuntu-latest | `slates-linux-x64` |
 | `aarch64-unknown-linux-gnu` | ubuntu-24.04-arm | `slates-linux-arm64` |
-| `x86_64-unknown-linux-musl` | ubuntu-latest, `rust:1.98-alpine` container | `slates-linux-x64-musl` |
-| `aarch64-unknown-linux-musl` | ubuntu-24.04-arm, `rust:1.98-alpine` container | `slates-linux-arm64-musl` |
-| `x86_64-pc-windows-msvc` | windows-latest | `slates-windows-x64.exe` |
-| `aarch64-pc-windows-msvc` | windows-latest (cross via `--target`) | `slates-windows-arm64.exe` |
-| `i686-pc-windows-msvc` | windows-latest (cross via `--target`) | `slates-windows-x86.exe` |
+| `x86_64-unknown-linux-musl` | ubuntu-latest, `rust:1.98.1-alpine` container | `slates-linux-x64-musl` |
+| `aarch64-unknown-linux-musl` | ubuntu-24.04-arm, `rust:1.98.1-alpine` container | `slates-linux-arm64-musl` |
+| `x86_64-pc-windows-msvc` | windows-2025 | `slates-windows-x64.exe` |
+| `aarch64-pc-windows-msvc` | windows-11-arm (native) | `slates-windows-arm64.exe` |
 
-[C: vorpal .github/workflows/release.yml:64-74]
+[C: vorpal .github/workflows/release.yml:64-74; Mac Intel and i686 dropped 2026-10-20 (`eca9423f`); arm64 Windows
+native since GitHub's `windows-11-arm` image (actions/runner-images#14592)]
 
 Recipes to copy verbatim:
 - One raw binary per platform attached to the GitHub release, no archive; `cargo-binstall`
@@ -8670,10 +8683,20 @@ Recipes to copy verbatim:
 - cdylib bindings for musl are built with `-C target-feature=-crt-static` because `+crt-static`
   is rejected for a cdylib; the container is launched with `docker run`, not `container:`, so
   checkout/upload stay on the host. [C: publish-node.yml:60-66]
-- A `guard` job asserts the git tag equals the workspace version. [C: release.yml:40-45]
-- `cargo xtask release-artifacts` writes `SHA256SUMS`, a provenance JSON (git commit, rustc
-  version, per-file sha256, blake3, size), and an ed25519 signature when a CI-secret key is
-  present. [C: xtask/src/main.rs:79-160]
+- A `guard` job asserts the git tag equals the workspace version, or names a test of the lane
+  (`v<version>-test.N`, accepted by the release lane alone; A-210). [C: release.yml:40-45]
+- Windows binaries link the C runtime statically (`+crt-static`), and the x86_64 one must start in a
+  process-isolated Nano Server container, which has no Visual C++ runtime (A-210).
+- The release smoke task (`cargo run -p xtask --bin release -- smoke`) runs each built binary on its own runner before it may ship: version,
+  anchor and daemon start, bootstrap, a volume provisioned, a file written and read by one MCP
+  client and read by a second client, the volume destroyed, the daemon gone with its anchor. It
+  records the digests of the bytes it ran (A-210).
+- The release artifacts task (`cargo run -p xtask --bin release -- artifacts`) refuses a release missing a target or carrying bytes no smoke
+  test ran, and writes `SHA256SUMS` and a provenance JSON (tag, commit, run, and per target the
+  sha256, blake3, size, rustc version, runner image and smoke timings). The signature is GitHub's
+  artifact attestation, keyless through Sigstore with the job's OIDC identity, not an ed25519 key
+  held as a CI secret (A-210). [C: xtask/src/main.rs:79-160, amended]
+- The lane never publishes: it creates a draft release, and a maintainer publishes it (A-210).
 - Weekly scheduled audit re-verifies vendored sources against pinned upstream commits and opens
   one tracking issue on drift; it never edits the tree. [C: grammar-audit.yml:1-13]
 
@@ -12824,6 +12847,125 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
 
+### A-211 — A DAX ask is refused where no view could begin (accepted and built 2026-11-04)
+Applied in the same change to: §4.6 by reference, `docs/wip/shards/dax-protocol.md` ("Windows"), GAPS,
+`crates/bridge-core/src/dax_backing.rs` (`DaxBackingSession::ask`), `crates/server/src/shards/dax.rs` (`MALFORMED`'s
+doc), `crates/client/tests/shards.rs`, `crates/server/tests/shards.rs`, `docs/wip/shards-patches/`.
+- **What was there.** An ask's range was checked against the object's end alone. So an offset that no view of a section can
+  begin at was committed, filled and handed, and the VMM's map then failed. Measured on jupiter (Windows 10.0.26200,
+  2026-11-04): an ask from offset 1 was answered with a section, `Ok(932)`.
+- **The rule.** A ranged ask's offset is a multiple of `Facts::allocation_granularity()`: 64 KiB on Windows, the page
+  elsewhere. Anything else is `Refused::Malformed` (`EINVAL`, counted `shards.dax_malformed`) before anything is made or
+  filled. One check on every platform; a Linux guest asks whole 2 MiB ranges, so it never meets the refusal.
+- **Proven.** `a_slice_is_handed_from_each_granule_and_refused_between_them` (`crates/client/tests/shards.rs`,
+  T-shards-windows-5.6) failed first as above. With the rule, each of a range's 32 granules is answered and a view placed
+  from it holds the file's bytes then zeros, and 4 offsets between granules are refused and counted; the suite 12 of 12 in
+  each of 3 runs on jupiter and once on windows-2025 (CI run 41981896876). `malformed_asks_are_refused` (`crates/server/tests/shards.rs`)
+  holds Unix's route to the same refusal: the suite passes on Ubuntu (22) and macOS (26), the same run.
+
+### A-213 — The anchor's hold refusals: a bounded log on every platform, and a count the operator reads in `slates status` (accepted 2026-11-04, siblings of audit step 3)
+Applied in the same change to: GAPS, A-198's status in §4.6, BENCHMARKS (the Windows wake's part), `unsafe-budget.toml`
+(anchor 10 → 14, the Windows wake's part), `crates/anchor` (`handles.rs` `RefusalLog` generic, `held_windows.rs` the
+posted read, `supervise_windows.rs` and `supervise.rs` the Windows wait,
+`supervise.rs` the device hold's log and the published count, `layout.rs` and `segment.rs` the new supervision word),
+`crates/ipc` (`DaemonReport::anchor_hold_refusals`, appended), `crates/server` (`verbs.rs`, the daemon report),
+`crates/cli` (`slates status`'s line; `anchor.rs` the Windows loop's wait; `examples/hold_latency_ab.rs`), `crates/mcp`
+(the daemon status JSON). Bug record:
+`docs/bugs/2026-11-04-the-unix-device-hold-logged-every-refusal.md`.
+- **The Unix device hold's log is bounded.** A-61's hold counted each refused device message and logged a line for each.
+  It now logs through the same `RefusalLog` as A-198's Windows hold: each distinct refusal once over the anchor's life,
+  in a table of 64, every refusal counted. Logging on a change of kind was rejected for the Windows hold on a
+  measurement (two kinds alternating log a line a message), and the reason holds here.
+- **The count reaches the operator.** With the log saying each kind once, the count is the only record of the rest. The
+  anchor has no surface of its own: an operator asks the daemon (`slates status`), and the daemon knows its anchor
+  through the segment's supervision block. So the block gains one word, `SUP_HOLD_REFUSALS`, at offset 192, the first
+  cache line past the sealing root. The supervisor writes every refusal its hold channel has counted (the Unix device
+  hold's, or the Windows hold's channel and holdings) there in each step, when the count has moved. The daemon copies it
+  into its status report as `anchor_hold_refusals`, which `slates status`, its `--json` and the MCP daemon status print.
+  A block an older anchor wrote holds zero there.
+- **Rejected:** a status surface on the anchor itself (a second rendezvous and a second protocol for one number), and the
+  daemon counting refusals it caused (it cannot see what the anchor refused).
+- **The Windows anchor wakes on its hold channel (2026-11-04, the sibling of A-206's record).** The Windows loop parked
+  between supervision steps, up to half the liveness budget (500 ms), and looked at the channel only then, so each WinFsp
+  mount's hold and each unmount's release waited up to that long on a healthy anchor; the Unix loop polls its channel.
+  The anchor's end now keeps one read posted (`held_windows::ReadingEnd`): the drain takes messages through it, and
+  `Supervisor::await_work` waits on its event and on the daemon's process handle together, with the step's pause as the
+  timeout, so a hold is answered when it arrives and a daemon's exit is seen when it happens. The read lives in a box of
+  its own, its `OVERLAPPED` and buffer fixed in place while the kernel may write them, and the end's drop cancels it and
+  waits for it to settle; a successor's new channel drops the old end that way, and with it an unread message, as before.
+  While a reply waits for the daemon to read its last one, the loop waits out its step instead: a message already taken
+  behind it would signal at once, and a daemon that never reads could spin the anchor. Held by
+  `a_hold_is_answered_at_its_channels_wake_not_at_the_supervisors_pause` (`crates/anchor/tests/handles_windows.rs`):
+  five holds through the real supervisor under a 4 s pause. Measured in BENCHMARKS ("What a WinFsp mount and unmount wait
+  for the Windows anchor").
+
+### A-210 — The binary release: seven native targets, each smoke-tested where it was built, attached with checksums and keyless provenance to a draft (accepted 2026-11-04)
+Applied in the same change to: Appendix B.2 (body and status), Phase 9 task 5's status, GAPS (the release row and
+"The Windows binary needs the Visual C++ runtime"), `docs/publish.md`, `.github/workflows/release.yml`,
+`version-guard.yml`, `publish-python.yml`, `publish-node.yml`, `xtask/src/release.rs` and `version.rs`, and
+`crates/cli` (`slates version`).
+- **Why.** `release.yml` had never run (no tag existed, GAPS 2026-10-21): it built the whole workspace for seven
+  triples and attached nothing. Three targets had never been built whole, arm64 Windows was cross-compiled on an
+  x86_64 runner, and the Windows binaries needed a Visual C++ runtime Nano Server lacks.
+- **Natively, per target.** Each target builds on a runner of its own architecture and system (table above), so the
+  binary that ships is also the binary that ran there. Only `-p slates-cli` is built: the binary asks for the codec
+  probe itself (GAPS 2026-10-20), so the product is the same however it is built.
+- **Run before shipped.** The release smoke task (`cargo run -p xtask --bin release -- smoke`) drives the built bytes as a fresh-machine install would
+  (Phase 9's install test, without the attach and tool run, which need a mount bridge not every runner has). The
+  write and the read go through one MCP client, because a `slates attach` and a `slates write` made by two processes
+  race the reaper (GAPS, "A CLI attachment ends about a second after the `slates attach` that made it").
+- **Only tested bytes ship.** The smoke test digests the binary it ran. `release-artifacts` refuses a binary whose
+  SHA-256 differs from its record, and a release missing any target. A partial release cannot be made.
+- **Provenance without a secret.** The ed25519 key B.2 first named would be a secret someone must create and
+  guard. GitHub's artifact attestation signs SLSA build provenance through Sigstore with the job's OIDC identity, and
+  anyone can check it with `gh attestation verify`. `slates-provenance.json` records what the attestation does not:
+  the runner image, the toolchain and the smoke test's steps.
+- **A draft, never a publication.** The lane's last step creates a draft. Publishing it is a maintainer's act, as a
+  landing is a grant's (R10): `gh release edit <tag> --draft=false`.
+- **A test of the lane.** A tag `v<version>-test.N` runs the whole lane on the real code and makes a draft
+  pre-release titled as a test. The SDK publish lanes exclude such tags in their triggers, and their guard refuses
+  them, so a test publishes nothing anywhere.
+- **Proof by use (2026-11-05).** Each binary's smoke steps on its own runner, in ms: version, start to serving,
+  steady answers, bootstrap, provision, the MCP attach–write–read, the second client's read, destroy, departure.
+  - Run 41982329895 (`diag-release-3`, the lane's build matrix without macOS):
+
+    | asset | steps (ms) |
+    |---|---|
+    | `slates-linux-x64` | 20, 326, 387, 20, 20, 24, 20, 20, 27 |
+    | `slates-linux-arm64` | 20, 275, 385, 20, 20, 22, 20, 20, 25 |
+    | `slates-linux-x64-musl` | 20, 340, 387, 20, 20, 22, 20, 20, 26 |
+    | `slates-linux-arm64-musl` | 20, 290, 385, 20, 20, 22, 20, 20, 25 |
+    | `slates-windows-x64.exe` | 25, 1064, 427, 42, 22, 61, 23, 22, 24 |
+    | `slates-windows-arm64.exe` | 35, 590, 414, 26, 25, 41, 26, 26, 27 |
+
+    The Linux rows are from run 41980547276, whose Linux jobs passed and whose Windows jobs failed; they passed again
+    in 41982329895. `ldd` answered "statically linked" (x86_64 musl) and "not a dynamic executable" (arm64 musl), and
+    `slates version` answered `slates 0.1.0` in a process-isolated `nanoserver:ltsc2025`.
+  - macOS arm64 ran on the supervisor's Mac (M5 Max, 2026-11-04, load 12–24): 10 of 10 smoke runs of the release
+    binary passed, start to serving 1.7–2.1 s, provision 184–192 ms, the MCP round trip 213–231 ms. The per-verb cost
+    there (about 200 ms against CI Linux's 20 ms) is the launch of each `slates` process on macOS; it is not measured
+    further here.
+  - **End to end on the test tag `v0.1.0-test.1`** (commit 50bf1a99, run 41983664060, 2026-11-05): guard, the seven
+    builds and the draft release job all passed, and macOS ran on CI too (`macos26` image 20261102.0473.1; steps 28,
+    830, 2030, 162, 81, 132, 98, 172, 87 ms). The draft "TEST v0.1.0-test.1 — test 1 of the release lane, not a
+    release" (draft, pre-release) carries the seven binaries (10,678,272–17,681,808 bytes), `SHA256SUMS`,
+    `slates-provenance.json` and `slates-attestation.sigstore.json`. Downloaded with `gh release download`:
+    - `shasum -a 256 -c SHA256SUMS` answered OK for all seven, and the macOS binary answered `slates 0.1.0`.
+    - `gh attestation verify <file> --repo hyper-light/slates` exited 0, online and with `--bundle`. It verified an
+      SLSA v1 provenance over seven subjects, signed by `release.yml@refs/tags/v0.1.0-test.1` at 50bf1a99.
+    - The same check of a copy with one byte appended exited 1.
+    - The SDK publish lanes did not start on the tag.
+  - This is the first run of the CLI's anchor, volume and MCP path on Windows: `crates/cli/tests/cli.rs` is
+    `cfg(unix)`.
+  - The first Windows run (41980547276) failed in the lane's own tooling. The `xtask` binary does not build on
+    Windows (12 errors: its conformance and KIND tasks use `rustix` and `std::os::unix`), so the release tasks became
+    their own binary, `cargo run -p xtask --bin release`.
+  - The smoke test's own first version stopped reading the anchor's stderr after the serving line, and 8 of 10 runs
+    on this Mac aborted the anchor (the GAPS entry: an anchor whose stderr closes aborts). Fixed in the harness: 10 of
+    10 after.
+- **Not yet.** Reproducibility from the tag (AC-9.5): no lane builds twice and compares. The macOS `Slates.app` bundle
+  (B.7), code signing and notarization (they need Ada's Apple Developer identity). `cargo-binstall` metadata.
+
 ### A-206 — A WinFsp file system is deleted only after the anchor releases its hold, the DLL's version is checked, and slates refuses no path the driver passes (accepted 2026-11-04, audit plan 01a1a34bf7e973069e94f773afdea44a, steps 4 and 6)
 Applied in the same change to: GAPS (the audit entry), §4.6's status through A-198's corrections, `docs/wip/platforms.md`,
 `crates/server` (`winfsp.rs`, `anchor_hold_windows.rs`, `verbs.rs`), `crates/client` (`defers_reply`),
@@ -12915,6 +13057,45 @@ Status: built 2026-11-04. It closes the Windows owed items of A-105, A-110 and A
   leaked the handle. It did not: `view` closed it. 200 refused adoptions moved the handle count by 0 on unchanged code,
   and by 200 with that close removed (`crates/mem/tests/held_section.rs`). The adoption now maps first and takes
   ownership only of a view that exists, so `view` no longer closes what it was lent.
+
+### A-212 — What a live WinFsp receive reads and clears, and what a rename visits (2026-11-05)
+
+A-198's receiver replaced WinFsp's DLL dispatcher with no benchmark. Measured against it (`docs/wip/BENCHMARKS.md`, "The
+WinFsp receiver against the DLL dispatcher"), every call that reached the daemon cost more: on arm64 a stat 2.55×, a
+rename 2.90×, an fsync 1.74× at the quiet p50, the arms' five runs not overlapping. Each phase of a request was timed on
+both architectures (diagnostics run 41977769822). The ledger's own work costs at most about 1.5 µs of service a request.
+The largest costs were two things A-198's first form did that its crash rules do not need:
+
+- **Every live receive read and cleared the whole buffer.** The batch parser checked each byte of the 64 KiB tail, 26.4 µs
+  at the p50 on arm64 and 50.1 µs on x86_64, per receive. The driver reports how many bytes it wrote, and everything past
+  them was zeroed before the receive began. So a live receive reads only the reported bytes. **Recovery still checks the
+  whole buffer**: it knows no count, and it is what the tail's rule protects. Clearing follows the same reasoning: an
+  owner's first receive clears the whole buffer, since a predecessor may have died part-way; afterwards only the bytes the
+  last batch filled are cleared, so the whole-buffer check still finds zeros after a crash. Of the saved response only the
+  header is cleared: its state word says whether a body exists, and no reader passes a body's own length.
+- **Every rename visited every live open.** Before the kernel may rename its node, each open's held name is updated, one
+  per shard turn: 741,896 turns over 7,000 renames on arm64, about 106 each, for opens under other names that a rename
+  cannot change. `OpenNames` now also keeps its names in order, so the first open at or beneath a path is found without a
+  walk and no constant bounds a scan. Updating an open moves it out from beneath the old path, so the next turn finds the
+  next, and a repeat after a crash finds what is left. A rename of one file takes one turn for its open and one to learn
+  it is done, however many opens the mount holds. A rename onto itself moves nothing and returns at once.
+
+Each worker also reuses one completion event: control transactions run one at a time, and creating and closing an event
+for each cost 0.9 µs at the p50 twice a request.
+
+**Not changed: a response and the next receive stay two calls.** The DLL carried both in one call. A-198 keeps them apart
+so that captured requests settle before any new receive, which is what stops a reused IRP address naming another
+processing request after a death. The separate response call costs 10.9 µs at the p50 on arm64 and 12.5 µs on x86_64;
+removing it means changing that crash rule, which this amendment does not do.
+
+**Result (2026-11-05, five interleaved runs on both Windows runners, run 41989009852).** Most of the regression is gone (arm64
+quiet p50: a stat 1.50×, a rename 1.35×, an fsync 1.21×), but the receiver stays worse beyond the spread at the p50, by about
+20 µs a request, on both architectures. Open: that remainder, of which the response call explains 11–13 µs; hops for Open and
+Release about 2× the DLL arm's on arm64, and SetSize about 4× under load, which accounts for an arm64 write under load at
+2.09×. A longer shard spin did not change them (run 41989038309), and they are not explained.
+
+Applied in the same change to: GAPS (the audit entry's unmeasured-receiver item); `crates/bridge-winfsp/src/dispatcher.rs`,
+`inflight/capture.rs`, `purge_intents.rs`, `notify.rs` and `host.rs`.
 
 ### A-204 — An NFS connection's turn takes only the records its quantum can reach (accepted and built 2026-11-05, VFS plan step 11)
 Applied in the same change to: `crates/server/src/nfs.rs` (`read_head`, `turn_copy_budget`, counter
