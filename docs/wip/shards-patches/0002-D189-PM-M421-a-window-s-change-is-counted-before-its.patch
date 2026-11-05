@@ -1,0 +1,50 @@
+From da2d9fbe58dbdea90a0db680cb329ff034368ba7 Mon Sep 17 00:00:00 2001
+From: Ada Lundhe <adalundhe@lundhe.audio>
+Date: Wed, 4 Nov 2026 23:42:01 -0800
+Subject: [PATCH 2/3] D189, PM M421: a window's change is counted before its
+ lock is let go. A vCPU's fault that waited for the lock read the old count,
+ and a second fault at one address at that count was taken for the guest's
+ own: a live range's load read a bus's 0xff and its store was lost
+
+Window::reconcile and evict counted after dropping the table; map, map_zeros and unmap already counted under it. On jupiter, 3 runs: 0 fell through at 2, 4 and 8 vCPUs in 6,400 followings each, 7,347 to 13,640 faults run again. Reaches a share's own file alone, as a server's section is never followed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/vmm/src/devices/virtio/fs/window_whp.rs | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/crates/vmm/src/devices/virtio/fs/window_whp.rs b/crates/vmm/src/devices/virtio/fs/window_whp.rs
+index 489d52fb..8fe9973f 100644
+--- a/crates/vmm/src/devices/virtio/fs/window_whp.rs
++++ b/crates/vmm/src/devices/virtio/fs/window_whp.rs
+@@ -865,9 +865,13 @@ impl Window {
+                 changed = true;
+             }
+         }
+-        drop(table);
++        // Counted before the lock goes: a vCPU whose fault waited for it must read a count past
++        // this change, or it takes a live range's fault for the guest's own (PM M421).
+         if changed {
+             self.changes.fetch_add(1, Ordering::AcqRel);
++        }
++        drop(table);
++        if changed {
+             self.restored.notify_all();
+         }
+     }
+@@ -898,10 +902,11 @@ impl Window {
+             e.evicted = true;
+             changed = true;
+         }
+-        drop(table);
++        // Counted before the lock goes, as [`Window::reconcile`] does.
+         if changed {
+             self.changes.fetch_add(1, Ordering::AcqRel);
+         }
++        drop(table);
+     }
+ 
+     /// A guest's access to memory the host could not give, at `gpa`, which WHP's memory
+-- 
+2.56.0.windows.2
+

@@ -33,6 +33,8 @@ blake3 = { workspace = true }
 hyper-seal = { workspace = true }
 
 [dev-dependencies]
+# the measured machine profile the replication bench derives the daemon's runtime configuration from.
+slates-machine = { workspace = true }
 # self-signed enrolled identities for the holder-and-owner sessions in the tests.
 rcgen = { workspace = true }
 rustls = { workspace = true }

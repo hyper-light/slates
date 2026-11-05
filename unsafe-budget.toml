@@ -209,7 +209,9 @@
 #   by BLAKE3.
 
 [budget]
-slates-machine = 51
+slates-machine = 53
+# 2026-11-04 (+2, A-205, compiled only for Windows): `Facts::resident_now` reads the working set: the zeroed record and
+#   `K32GetProcessMemoryInfo`, which has no safe wrapper.
 #   Raised 19 → 22 on 2026-09-30 for AUD-29-09 (a shared object hands out no reference to its bytes):
 #   the two plain copies across the mapping's raw pointer (`copy_out`, `copy_in`), the two racy copies
 #   through `AtomicU8` for seqlock payloads (`racy_out`, `racy_in`), and `ExclusiveObject::new`, the one
@@ -237,7 +239,10 @@ slates-machine = 51
 # has no Darwin advice, so they are `libc::madvise`); and the test-only footprint reader `test_serial::footprint`
 # (`proc_pid_rusage` into a buffer of its struct's size and the `assume_init` after it succeeded, 2), with which the
 # give-back's tests observe what macOS counts.
-slates-mem = 61
+slates-mem = 63
+# 2026-11-04 (+2, A-205, Windows gives freed pages back, compiled only for Windows): `DiscardVirtualMemory` over a
+#   region's block (`region.rs`, `os::discard_slice`) and over a sparse object's committed run (`shared.rs`,
+#   `Inner::discard`). The call has no safe wrapper.
 # 2026-10-26 (+1, §4.6 A-180, a Shards DAX object on Windows, `dax_object.rs` compiled only for Windows): the object is
 #   a reserved section committed a range at a time, `VirtualAlloc(MEM_COMMIT)` over a range's fresh view (1). Its view
 #   at an offset shares the map's one `MapViewOfFile` site, and the handed duplicate and the peer's read-only one share
@@ -313,7 +318,10 @@ slates-land = 4
 # 2026-11-02, A-198: retire the six supervisor job/assignment sites in favor of IPC's existing creation-time job
 # attribute. The hold transport has ten Win32 ownership/I/O sites: last-error read, event create/adopt, read/write,
 # event wait, cancellation and join on timeout or failed wait, and adoption of a duplicated handle. No unsafe sharing.
-slates-anchor = 10
+# 2026-11-04 (+4, A-213): the anchor's end keeps a read posted so its loop wakes on the channel: the read posted, its
+# result taken without waiting, its cancellation and join at the channel's drop, and the supervisor's wait on the read's
+# event and the daemon's process handle together. The completion event's two sites are shared with the timed reads.
+slates-anchor = 14
 slates-db = 0
 # 2026-11-02, A-198: one DuplicateHandle out of a child, two process-exit polling calls, and one message-mode pipe
 # setting call. The existing explicit handle-list spawn and kill-on-close job are reused.
@@ -411,6 +419,8 @@ slates-sdk-node = 0
 # the Swift FSVolume handler a C ABI over `serve` — sanctioned FFI unsafe, each block with a SAFETY
 # note. The shipped crate (no `test-harness` feature) builds none of it; the count is a text scan.
 slates-bridge-fskit = 9
+# slates-bridge-winfsp (131 since 2026-11-04: A-206's `FspVersion` export type and its one call in `checked_dll`, the DLL's
+# version check, replacing the read of the reserved field that check once looked at, so a net one more).
 # slates-bridge-winfsp (104): the VfsError->NTSTATUS refusal taxonomy and the notification records stay safe Rust
 # (lib.rs, notify.rs: 0). The WinFsp mount host is Windows-only FFI, hand-transcribed from winfsp's headers (like the
 # rt AFD reactor from the WDK) and compiled only for Windows, each block with a `// SAFETY:` line (clippy
@@ -454,7 +464,7 @@ slates-bridge-fskit = 9
 # 2026-11-02 (126 -> 130): an owned auto-reset event wakes the receiver for private Begin/End messages even when
 # Windows rejects an open without a callback. The four sites create/own/signal that event and wait for it beside
 # the control completion event. Every control operation is still settled before its borrowed buffers can be freed.
-slates-bridge-winfsp = 130
+slates-bridge-winfsp = 131
 # Raised 3 -> 5 on 2026-10-19 for `udmabuf.rs` (the `UDMABUF_CREATE` ioctl and the descriptor it returns), which
 # confined a guest's DAX window to a descriptor covering only that window
 # (docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md). Lowered 5 -> 3 on 2026-10-25

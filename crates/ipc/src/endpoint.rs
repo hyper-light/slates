@@ -17,7 +17,10 @@ use std::time::Instant;
 use slates_machine::wake::WakeEstimate;
 
 use crate::error::IpcError;
-use crate::region::{ClientRegion, REPLY_STAMP_CONFIRMED};
+use crate::region::{
+  ClientRegion, PARKED_STAMP_SLOT_ONE, PARKED_STAMP_SLOT_ZERO, REPLY_STAMP_CONFIRMED,
+  REPLY_STAMP_SLOTS,
+};
 use crate::slot::{Slot, SlotKind};
 // The word-based wake serves Linux/macOS; Windows waits on and signals the region's named Event
 // instead (`ClientRegion::wake_wait`/`wake_signal`), so this import is dead there.
@@ -76,9 +79,13 @@ pub struct ClientEnd {
   wake: WakeEstimate,
   /// Parks whose wake fed the estimate (a non-vacuity count).
   wake_samples: u64,
-  /// A park a reply ended, as `(waiting_ns, returned_ns)`, whose stamp the daemon had not yet confirmed
-  /// when the client read it: settled at the next wait, before the stamp is cleared.
-  unsettled: Option<(u64, u64)>,
+  /// Parks a reply ended, as `(waiting_ns, returned_ns)` by the reply stamp slot each named, whose stamp
+  /// the daemon had not yet confirmed when the client read it: settled at a later park's arming, and given
+  /// up when the slot is armed again (`region::REPLY_STAMP_SLOTS`).
+  unsettled: [Option<(u64, u64)>; REPLY_STAMP_SLOTS],
+  /// The reply stamp slot the next park names: the slots alternate, so a confirmation that lands after
+  /// the next park armed finds its own slot intact.
+  next_stamp_slot: usize,
   /// The completion fd an async SDK event loop polls for reply-readiness (§4.7, D-19): the daemon
   /// makes it readable when it writes a reply to a parked client, so an `asyncio`/`uv_poll` loop wakes
   /// without spinning. `None` for the sync client (it parks on the wake word) and where the platform
@@ -117,7 +124,8 @@ impl ClientEnd {
     ClientEnd {
       wake,
       wake_samples: 0,
-      unsettled: None,
+      unsettled: [None; REPLY_STAMP_SLOTS],
+      next_stamp_slot: 0,
       region,
       doorbell: None,
       liveness: None,
@@ -349,7 +357,11 @@ impl ClientEnd {
   /// ([`crate::park::after_arming`]) orders that re-check after the flag, so a reply it misses is one the
   /// daemon sees the flag for and wakes on (before 2026-09-29 there was no fence, and both could miss).
   pub fn arm_async(&self) -> Result<(), IpcError> {
-    self.region.client_parked()?.store(1, Ordering::Release);
+    // The async path times no wake, so its stamp slot is never read: slot 0's flag only marks it armed.
+    self
+      .region
+      .client_parked()?
+      .store(PARKED_STAMP_SLOT_ZERO, Ordering::Release);
     crate::park::after_arming();
     Ok(())
   }
@@ -488,14 +500,22 @@ impl ClientEnd {
       // Park: the flag first, the word's value (Linux/macOS), then the re-check that closes the race
       // with a reply written between the last poll and the wait. On Linux/macOS the wait returns at
       // once if the wake word moved past the value read here; on Windows the named auto-reset Event
-      // carries a signal made before the wait, so no separate value is needed. The reply stamp is
-      // cleared before the flag goes up (the flag's release orders it), so the stamp read after the
-      // wake is the first one the daemon took for this park; a previous park's unconfirmed stamp is
-      // settled first.
-      self.settle_wake()?;
-      self.unsettled = None;
-      self.region.reply_stamp()?.store(0, Ordering::Relaxed);
-      self.region.client_parked()?.store(1, Ordering::Release);
+      // carries a signal made before the wait, so no separate value is needed. The park's reply stamp
+      // slot is cleared before the flag names it (the flag's release orders it), so the stamp read after
+      // the wake is the first one the daemon took for this park. Earlier parks' unconfirmed stamps are
+      // settled first; the one in this slot is given up, as one daemon serves the ring in order and its
+      // reply call returned before the reply this client took since.
+      let slot = self.next_stamp_slot;
+      self.next_stamp_slot = usize::from(slot == 0);
+      self.settle_wakes()?;
+      if let Some(given_up) = self.unsettled.get_mut(slot) {
+        *given_up = None;
+      }
+      self.region.reply_stamp(slot)?.store(0, Ordering::Relaxed);
+      self
+        .region
+        .client_parked()?
+        .store(parked_flag(slot), Ordering::Release);
       // The park protocol's client half: the word's value and the re-check below are ordered after the
       // flag, so a reply the re-check misses is one the daemon sees the flag for (§4.7; `crate::park`).
       crate::park::after_arming();
@@ -515,8 +535,10 @@ impl ClientEnd {
       let returned_ns = slates_machine::clock::monotonic_ns();
       self.region.client_parked()?.store(0, Ordering::Release);
       if woken {
-        self.unsettled = Some((waiting_ns, returned_ns));
-        self.settle_wake()?;
+        if let Some(unsettled) = self.unsettled.get_mut(slot) {
+          *unsettled = Some((waiting_ns, returned_ns));
+        }
+        self.settle_wakes()?;
         if let Some(reply) = self.try_take()? {
           return Ok(reply);
         }
@@ -538,29 +560,48 @@ impl ClientEnd {
 /// uses there too (`WakeLatency::asleep_confirmed`).
 const WAKER_CONFIRMS: bool = !cfg!(windows);
 
+/// The client's parked flag for a park that names `slot`.
+fn parked_flag(slot: usize) -> u32 {
+  if slot == 0 {
+    PARKED_STAMP_SLOT_ZERO
+  } else {
+    PARKED_STAMP_SLOT_ONE
+  }
+}
+
+/// The reply stamp slot a parked flag's value names (any armed value other than slot one's names slot 0).
+fn stamp_slot(parked: u32) -> usize {
+  usize::from(parked == PARKED_STAMP_SLOT_ONE)
+}
+
 impl ClientEnd {
-  /// Folds the unsettled park's wake into the estimate once its stamp can be judged: the daemon's reply
+  /// Folds each unsettled park's wake into the estimate once its stamp can be judged: the daemon's reply
   /// stamp to the client's return, when the daemon confirmed its wake found the client asleep and the
   /// stamp falls inside the wait — a sleeper woken, the event the boot probe times. A reply that landed
   /// while the park was being set up met a waiter not yet asleep: its wake finds no sleeper and is never
   /// confirmed, and timing it would teach a wake that never happened (measured: the bench's daemon,
   /// replying the instant the flag rose, taught 611–974 ns against the boot probe's 2.0–3.3 µs, macOS,
-  /// 2026-09-25). A stamp not yet confirmed stays unsettled for the next wait: the daemon confirms after
-  /// its wake call returns, which the woken client can outrun.
-  fn settle_wake(&mut self) -> Result<(), IpcError> {
-    let Some((waiting_ns, returned_ns)) = self.unsettled else {
-      return Ok(());
-    };
-    let stamp = self.region.reply_stamp()?.load(Ordering::Acquire);
-    let confirmed = stamp & REPLY_STAMP_CONFIRMED != 0;
-    if WAKER_CONFIRMS && !confirmed {
-      return Ok(());
-    }
-    self.unsettled = None;
-    let sent_ns = stamp & !REPLY_STAMP_CONFIRMED;
-    if waiting_ns <= sent_ns && sent_ns <= returned_ns {
-      self.wake.record(returned_ns.saturating_sub(sent_ns));
-      self.wake_samples = self.wake_samples.saturating_add(1);
+  /// 2026-09-25). A stamp not yet confirmed stays unsettled: the daemon confirms after its wake call
+  /// returns, which the woken client can outrun by a whole further park under load (measured: 26 to 29 of
+  /// 32 parks on two busy CPUs, 2026-11-04), so it stays in its slot until that slot is armed again.
+  fn settle_wakes(&mut self) -> Result<(), IpcError> {
+    for slot in 0..REPLY_STAMP_SLOTS {
+      let Some(Some((waiting_ns, returned_ns))) = self.unsettled.get(slot).copied() else {
+        continue;
+      };
+      let stamp = self.region.reply_stamp(slot)?.load(Ordering::Acquire);
+      let confirmed = stamp & REPLY_STAMP_CONFIRMED != 0;
+      if WAKER_CONFIRMS && !confirmed {
+        continue;
+      }
+      if let Some(settled) = self.unsettled.get_mut(slot) {
+        *settled = None;
+      }
+      let sent_ns = stamp & !REPLY_STAMP_CONFIRMED;
+      if waiting_ns <= sent_ns && sent_ns <= returned_ns {
+        self.wake.record(returned_ns.saturating_sub(sent_ns));
+        self.wake_samples = self.wake_samples.saturating_add(1);
+      }
     }
     Ok(())
   }
@@ -654,33 +695,43 @@ impl DaemonEnd {
     let word = self.region.wake_word()?;
     word.fetch_add(1, Ordering::AcqRel);
     let parked = self.region.client_parked()?;
+    let mut armed = 0;
     // The park protocol's daemon half (`crate::park`): the flag is read after the reply's publication in
     // the order the client's fence takes part in, so a parked client whose re-check missed this reply is
     // seen here and woken. Before 2026-09-29 this read had no fence, and a client's re-check and this read
-    // could both miss.
-    if crate::park::after_publishing_armed(|| parked.load(Ordering::Relaxed) != 0) {
+    // could both miss. The value read names the park's reply stamp slot.
+    if crate::park::after_publishing_armed(|| {
+      armed = parked.load(Ordering::Relaxed);
+      armed != 0
+    }) {
       // A second advance for the wake: a bridge between two waits has already taken the first advance
       // into the value its next wait compares against, and this one makes that wait return.
       word.fetch_add(1, Ordering::AcqRel);
       // The first wake of this park stamps the host clock, so the client can time its own wake (§4.7);
       // a later reply to the same park keeps the first stamp.
-      let stamp = self.region.reply_stamp()?;
+      let stamp = self.region.reply_stamp(stamp_slot(armed))?;
+      let sent_ns = slates_machine::clock::monotonic_ns() & !REPLY_STAMP_CONFIRMED;
       let stamped = stamp
-        .compare_exchange(
-          0,
-          slates_machine::clock::monotonic_ns() & !REPLY_STAMP_CONFIRMED,
-          Ordering::Relaxed,
-          Ordering::Relaxed,
-        )
+        .compare_exchange(0, sent_ns, Ordering::Relaxed, Ordering::Relaxed)
         .is_ok();
       // Wake the parked client: the wake word on Linux/macOS (a spinning client never parked, so it
       // pays no wake), the named auto-reset Event on Windows. Where the wake reports a sleeper found,
-      // the stamp it timed is confirmed for the client.
+      // the stamp it timed is confirmed for the client — that stamp only, in its own slot. The woken client
+      // can arm its next park before this confirmation lands; that park names the other slot, so this one
+      // is intact (the bug record of 2026-11-04: with one slot the next park cleared it, and the
+      // confirmation then left a bare confirmed bit that refused the following park's stamp).
       #[cfg(windows)]
       self.region.wake_signal()?;
       #[cfg(not(windows))]
       if wake::wake_one(word)? && stamped {
-        stamp.fetch_or(REPLY_STAMP_CONFIRMED, Ordering::Release);
+        // A failed exchange is this slot armed again before the confirmation, which the ring's order
+        // rules out but for a client that gave the reply up past its deadline: nothing left to confirm.
+        let _ = stamp.compare_exchange(
+          sent_ns,
+          sent_ns | REPLY_STAMP_CONFIRMED,
+          Ordering::Release,
+          Ordering::Relaxed,
+        );
       }
       #[cfg(windows)]
       let _ = stamped;

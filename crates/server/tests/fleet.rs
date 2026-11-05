@@ -2934,7 +2934,10 @@ fn bootstrap_mesh(
 }
 
 /// Initial membership is committed before a fixture may remove any voter. Probe formation
-/// alone cannot establish this precondition (§4.8, AUD-07).
+/// alone cannot establish this precondition (§4.8, AUD-07). Nor can the committed membership alone establish that
+/// every node admits a placement write: a node's readiness follows its council and root one coordinator period
+/// later, and a root learner's only after its import, and until then it refuses `ConsensusNotInitialized`
+/// (docs/bugs/2026-11-04-a-settled-fleet-refused-its-first-create.md). So every node is settled ready as well.
 fn settle_initial_consensus(
   daemons: &[Daemon],
   seeds: &[HostId],
@@ -2979,9 +2982,10 @@ fn settle_initial_consensus(
     daemons
       .iter()
       .map(|daemon| format!(
-        "host={:?} council={:?} voters={:?} root={:?} leaders={:?}/{:?} alive={:?} meshed={:?} \
+        "host={:?} ready={:?} council={:?} voters={:?} root={:?} leaders={:?}/{:?} alive={:?} meshed={:?} \
          record_links(host, out)={:?} council_state={:?} refusals={:?}",
         daemon.member_identity(),
+        daemon.consensus_ready(),
         daemon.council_members(),
         daemon.council_voters(),
         daemon.root_voters(),
@@ -3034,7 +3038,7 @@ fn initial_member_committed(
     || daemon
       .root_voters()?
       .is_some_and(|known| same_voters(&known, root_voters));
-  Ok(members_known && voters_known && root_known)
+  Ok(members_known && voters_known && root_known && daemon.consensus_ready()?)
 }
 
 fn same_voters(known: &[HostId], expected: &[HostId]) -> bool {
@@ -13323,4 +13327,46 @@ fn the_announcement_pass_lends_a_session_only_to_announce_on_it() {
     "each node announced on its session: {sent:?}"
   );
   assert_eq!(lends, sent, "a session lent only to announce on it");
+}
+
+/// §4.8 (the bug record of 2026-11-04, main CI 41538865390): a fleet the fixture hands over as settled admits a
+/// placement write on every node at once. Do: start the copyset routing history's five-node, two-region fleet and,
+/// the moment the fixture returns, create a volume through every node. Expect: every node answers `Created`. Before
+/// the fixture waited for each node's consensus readiness it returned once every council and root reported the
+/// committed membership, and a node whose readiness had not yet caught up (one coordinator period later, or a root
+/// learner's import still owed) refused `ConsensusNotInitialized`: 1 of 200 creates on two busy CPUs, and the routing
+/// history's first create in main CI.
+#[test]
+fn a_settled_fleet_admits_a_create_on_every_node() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c", "d", "foreign"];
+  let nodes: Vec<_> = names.iter().map(|name| fleet_node(name)).collect();
+  let seeds: Vec<_> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<_> = nodes
+    .iter()
+    .map(|(_, _, identity)| identity.certificate())
+    .collect();
+  let regions = seeds
+    .iter()
+    .enumerate()
+    .map(|(index, host)| (*host, RegionId(u64::from(index == names.len() - 1))))
+    .collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh_with_regions(nodes, &seeds, &certs, &serve, 1, &regions);
+  let replies: Vec<_> = daemons
+    .iter()
+    .zip(names)
+    .map(|(daemon, name)| {
+      Client::connect(daemon.instance()).call(&scratch(&format!("settled-{name}")))
+    })
+    .collect();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    replies
+      .iter()
+      .all(|reply| matches!(reply, ReplyBody::Created { .. })),
+    "every node of the settled fleet admits a create: {replies:?}"
+  );
 }

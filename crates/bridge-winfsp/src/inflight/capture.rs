@@ -63,13 +63,27 @@ impl<'a> Capture<'a> {
   }
 
   /// Clears an already-settled buffer, then records the new receive before lending it to the driver. A dropped
-  /// unfinished batch stays RECEIVING, so it cannot be silently replaced by a fresh receive.
-  pub fn begin(self) -> Result<Receiving<'a>, Refusal> {
+  /// unfinished batch stays RECEIVING, so it cannot be silently replaced by a fresh receive. `used` is what this owner's
+  /// last batch filled ([`filled`]); `None`, an owner's first receive, clears all of it, since a predecessor may have
+  /// died part-way through. Only the saved response's header is cleared: its state word says whether a body exists, and
+  /// no reader goes past a body's own length (A-212).
+  pub fn begin(self, used: Option<usize>) -> Result<Receiving<'a>, Refusal> {
     if self.phase.first() != Some(&0) {
       return Err(Refusal::Unsettled);
     }
-    self.request.fill(0);
-    self.saved.fill(0);
+    match used {
+      Some(filled) => self
+        .request
+        .get_mut(..filled)
+        .ok_or(Refusal::Length)?
+        .fill(0),
+      None => self.request.fill(0),
+    }
+    self
+      .saved
+      .get_mut(..SAVED_HEADER)
+      .ok_or(Refusal::Length)?
+      .fill(0);
     *self.phase.first_mut().ok_or(Refusal::Length)? = RECEIVING;
     Ok(Receiving { capture: self })
   }
@@ -80,7 +94,7 @@ impl<'a> Capture<'a> {
     if self.phase.first() == Some(&0) {
       return Ok(None);
     }
-    Batch::checked(self).map(Some)
+    Batch::checked(self, BATCH_BYTES).map(Some)
   }
 }
 
@@ -95,9 +109,20 @@ impl<'a> Receiving<'a> {
     self.capture.request
   }
   /// Validates the bytes after kernel I/O completion, preserving their original order and any complete saved result.
-  pub fn received(self) -> Result<Batch<'a>, Refusal> {
-    Batch::checked(self.capture)
+  /// `reported` is the transfer the driver counted. Only those bytes are read: [`Capture::begin`] cleared the rest, and
+  /// recovery, which knows no count, still checks the whole buffer (A-212).
+  pub fn received(self, reported: usize) -> Result<Batch<'a>, Refusal> {
+    Batch::checked(self.capture, filled(reported)?)
   }
+}
+
+/// The bytes of the receive buffer a driver's reported transfer filled: the whole frames it counts. A frame's stride is
+/// aligned, so a count that stops at the end of a frame's bytes rounds up over its zero padding.
+pub fn filled(reported: usize) -> Result<usize, Refusal> {
+  reported
+    .checked_next_multiple_of(super::ALIGNMENT)
+    .filter(|filled| *filled <= BATCH_BYTES)
+    .ok_or(Refusal::Length)
 }
 
 /// One received batch. Its original request bytes stay immutable; DLL operations use an aligned working copy.
@@ -119,8 +144,9 @@ impl<'a> Batch<'a> {
       None => Ok(None),
     }
   }
-  fn checked(capture: Capture<'a>) -> Result<Self, Refusal> {
-    let pending = requests(capture.request)?;
+  fn checked(capture: Capture<'a>, filled: usize) -> Result<Self, Refusal> {
+    let frames: &'a [u8] = capture.request;
+    let pending = requests(frames.get(..filled).ok_or(Refusal::Length)?)?;
     let saved = saved_response(capture.saved)?;
     let saved_first = match saved {
       Some(saved) => {
@@ -323,11 +349,11 @@ mod tests {
     let mut memory = vec![0; BYTES];
     let mut kernel = BTreeMap::from([(0x1000, "first"), (0x2000, "second")]);
     {
-      let mut receive = Capture::new(&mut memory).unwrap().begin().unwrap();
+      let mut receive = Capture::new(&mut memory).unwrap().begin(None).unwrap();
       receive
         .buffer_mut()
         .copy_from_slice(&reads(&[0x1000, 0x2000]));
-      let mut batch = receive.received().unwrap();
+      let mut batch = receive.received(BATCH_BYTES).unwrap();
       let request = batch.next_request().unwrap().unwrap();
       let response = request.cancelled_response().unwrap();
       batch.record_response(&request, &response).unwrap();
@@ -335,7 +361,7 @@ mod tests {
       // The process dies here: no acknowledgement and no next receive.
     }
     assert!(matches!(
-      Capture::new(&mut memory).unwrap().begin(),
+      Capture::new(&mut memory).unwrap().begin(None),
       Err(Refusal::Unsettled)
     ));
     let mut pending = BTreeMap::from([(0x1000, "new caller")]);
@@ -356,7 +382,7 @@ mod tests {
       batch.acknowledge(request.hint()).unwrap();
       assert!(batch.next_request().unwrap().is_none());
     }
-    assert!(Capture::new(&mut memory).unwrap().begin().is_ok());
+    assert!(Capture::new(&mut memory).unwrap().begin(None).is_ok());
     kernel.append(&mut pending);
     assert_eq!(kernel.into_values().collect::<Vec<_>>(), vec!["new caller"]);
   }
@@ -368,11 +394,11 @@ mod tests {
     let mut memory = vec![0; BYTES];
     let mut kernel = BTreeMap::from([(0x1000, "first"), (0x2000, "second"), (0x3000, "third")]);
     {
-      let mut receive = Capture::new(&mut memory).unwrap().begin().unwrap();
+      let mut receive = Capture::new(&mut memory).unwrap().begin(None).unwrap();
       receive
         .buffer_mut()
         .copy_from_slice(&reads(&[0x1000, 0x2000, 0x3000]));
-      let mut batch = receive.received().unwrap();
+      let mut batch = receive.received(BATCH_BYTES).unwrap();
       let first = batch.next_request().unwrap().unwrap();
       let response = first.cancelled_response().unwrap();
       batch.record_response(&first, &response).unwrap();
@@ -419,7 +445,7 @@ mod tests {
         batch.acknowledge(request.hint()).unwrap();
       }
     }
-    assert!(Capture::new(&mut memory).unwrap().begin().is_ok());
+    assert!(Capture::new(&mut memory).unwrap().begin(None).is_ok());
     kernel.append(&mut new_pending);
     assert_eq!(
       kernel.into_values().collect::<Vec<_>>(),
@@ -433,9 +459,9 @@ mod tests {
   fn an_unpublished_or_foreign_acknowledgement_cannot_admit_a_new_receive() {
     let mut memory = vec![0; BYTES];
     {
-      let mut receive = Capture::new(&mut memory).unwrap().begin().unwrap();
+      let mut receive = Capture::new(&mut memory).unwrap().begin(None).unwrap();
       receive.buffer_mut().copy_from_slice(&reads(&[0x1000]));
-      let mut batch = receive.received().unwrap();
+      let mut batch = receive.received(BATCH_BYTES).unwrap();
       let request = batch.next_request().unwrap().unwrap();
       assert_eq!(batch.acknowledge(request.hint()), Err(Refusal::Unsettled));
       assert!(matches!(batch.next_request(), Err(Refusal::Unsettled)));
@@ -445,7 +471,7 @@ mod tests {
       batch.acknowledge(request.hint()).unwrap();
       assert_eq!(batch.acknowledge(request.hint()), Err(Refusal::Unsettled));
     }
-    assert!(Capture::new(&mut memory).unwrap().begin().is_ok());
+    assert!(Capture::new(&mut memory).unwrap().begin(None).is_ok());
   }
 
   /// A-198. Do: crash at every byte of clearing the prior request header after its response was acknowledged.
@@ -454,9 +480,12 @@ mod tests {
   fn a_crash_while_clearing_a_settled_buffer_cannot_revive_its_requests() {
     let mut complete_memory = vec![0; BYTES];
     {
-      let mut receive = Capture::new(&mut complete_memory).unwrap().begin().unwrap();
+      let mut receive = Capture::new(&mut complete_memory)
+        .unwrap()
+        .begin(None)
+        .unwrap();
       receive.buffer_mut().copy_from_slice(&reads(&[0x1000]));
-      let mut batch = receive.received().unwrap();
+      let mut batch = receive.received(BATCH_BYTES).unwrap();
       let request = batch.next_request().unwrap().unwrap();
       batch
         .record_response(&request, &request.cancelled_response().unwrap())
@@ -473,7 +502,79 @@ mod tests {
           .unwrap()
           .is_none()
       );
-      assert!(Capture::new(&mut memory).unwrap().begin().is_ok());
+      assert!(Capture::new(&mut memory).unwrap().begin(None).is_ok());
     }
+  }
+
+  /// A-212. Do: receive one request of a reported length, with a byte past that length set. Expect: the live receive
+  /// reads only the reported bytes, and a crash's recovery, which knows no length, still refuses the whole buffer.
+  /// Before A-212 every live receive scanned all 64 KiB (26.4 µs at p50 on arm64, run 41977769822).
+  #[test]
+  fn a_live_receive_reads_only_the_bytes_the_driver_reported() {
+    let mut memory = vec![0; BYTES];
+    let mut bytes = reads(&[0x1000]);
+    *bytes.last_mut().unwrap() = 1;
+    {
+      let mut receive = Capture::new(&mut memory).unwrap().begin(None).unwrap();
+      receive.buffer_mut().copy_from_slice(&bytes);
+      let mut batch = receive.received(super::super::REQUEST_BASE).unwrap();
+      assert_eq!(batch.next_request().unwrap().unwrap().hint(), 0x1000);
+      assert!(batch.pending.is_empty());
+    }
+    assert!(matches!(
+      Capture::new(&mut memory).unwrap().resume(),
+      Err(Refusal::Tail)
+    ));
+  }
+
+  /// A-212. Do: settle a batch of three with a saved response, begin with what it used, take a batch of one, and crash.
+  /// Expect: recovery finds exactly the one request and no saved response: clearing only the used bytes leaves nothing
+  /// of the longer batch for a whole-buffer scan to refuse or replay.
+  #[test]
+  fn a_shorter_batch_after_a_longer_one_recovers_alone() {
+    let mut memory = vec![0; BYTES];
+    let used = 3 * super::super::REQUEST_BASE;
+    {
+      let mut receive = Capture::new(&mut memory).unwrap().begin(None).unwrap();
+      receive
+        .buffer_mut()
+        .copy_from_slice(&reads(&[0x1000, 0x2000, 0x3000]));
+      let mut batch = receive.received(used).unwrap();
+      while let Some(request) = batch.next_request().unwrap() {
+        batch
+          .record_response(&request, &request.cancelled_response().unwrap())
+          .unwrap();
+        batch.acknowledge(request.hint()).unwrap();
+      }
+    }
+    {
+      let mut receive = Capture::new(&mut memory)
+        .unwrap()
+        .begin(Some(used))
+        .unwrap();
+      let one = reads(&[0x4000]);
+      receive.buffer_mut()[..super::super::REQUEST_BASE]
+        .copy_from_slice(&one[..super::super::REQUEST_BASE]);
+    }
+    let mut batch = Capture::new(&mut memory)
+      .unwrap()
+      .resume()
+      .unwrap()
+      .unwrap();
+    let request = batch.next_request().unwrap().unwrap();
+    assert_eq!(request.hint(), 0x4000);
+    assert!(batch.response_for(&request).unwrap().is_none());
+    assert!(batch.pending.is_empty());
+  }
+
+  /// A-212. Do: report more than the buffer holds. Expect: a typed refusal, before any byte is read.
+  #[test]
+  fn a_reported_length_past_the_buffer_is_refused() {
+    let mut memory = vec![0; BYTES];
+    let receive = Capture::new(&mut memory).unwrap().begin(None).unwrap();
+    assert!(matches!(
+      receive.received(BATCH_BYTES + 1),
+      Err(Refusal::Length)
+    ));
   }
 }

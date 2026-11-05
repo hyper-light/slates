@@ -26,7 +26,7 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
 use slates_ipc::win_spawn::{ClosedOnDrop, duplicate_from, duplicate_inheritable};
 use windows_sys::Win32::Foundation::{
-  ERROR_IO_PENDING, GetLastError, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+  ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, GetLastError, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
@@ -56,6 +56,104 @@ pub struct Channel {
   end: OwnedHandle,
 }
 
+/// The anchor's end of the hold channel, read through a read it keeps posted (A-213): the read's event is signalled when
+/// a message arrives, so the anchor's loop waits on it beside its step timer and answers a hold at once. This end is
+/// read only this way, never by [`Channel::recv`] too, since two reads in flight on one end would take its messages in
+/// either order. Its own type, so the plain [`Channel`] stays shareable between threads: the posted read's
+/// `OVERLAPPED` holds raw pointers.
+pub struct ReadingEnd {
+  channel: Channel,
+  /// The read kept posted, once one has been ([`ReadingEnd::posted_recv`]).
+  posted: Option<Box<PostedRead>>,
+}
+
+/// A read left in flight on a channel end. Boxed, so its `OVERLAPPED` and buffer keep their address for as long as the
+/// kernel may write them: until the read is taken ([`ReadingEnd::posted_recv`]) or cancelled and waited for (the
+/// channel's drop).
+struct PostedRead {
+  overlapped: OVERLAPPED,
+  buffer: [u8; MESSAGE_BYTES],
+  /// The read's manual-reset event, which `ReadFile` resets as the read starts and the kernel signals as it ends.
+  event: OwnedHandle,
+  /// Whether a read is in flight: posted and not yet taken.
+  in_flight: bool,
+}
+
+impl Drop for ReadingEnd {
+  /// Cancels a posted read and waits for it to settle before its buffer is freed. A message it had taken is dropped
+  /// with the channel, as an unread message is at a successor's new channel (A-206's record): it has no reader now.
+  fn drop(&mut self) {
+    let handle = self.channel.raw();
+    if let Some(posted) = self.posted.as_mut()
+      && posted.in_flight
+    {
+      let mut moved = 0u32;
+      // SAFETY: cancels the one read this channel posted with its boxed OVERLAPPED on this still-open handle, then
+      // waits for it to settle, so the kernel no longer writes the box when it is freed after this.
+      unsafe {
+        CancelIoEx(handle, &posted.overlapped);
+        GetOverlappedResult(handle, &posted.overlapped, &mut moved, 1);
+      }
+      posted.in_flight = false;
+    }
+  }
+}
+
+impl ReadingEnd {
+  /// The anchor's end `channel`, with no read posted yet.
+  pub fn new(channel: Channel) -> ReadingEnd {
+    ReadingEnd {
+      channel,
+      posted: None,
+    }
+  }
+
+  /// The end itself, to send on.
+  pub fn channel(&self) -> &Channel {
+    &self.channel
+  }
+
+  /// Receives one message without waiting, through a read kept posted on this end: the message if one has arrived;
+  /// `None` if not, with the read left posted, so [`ReadingEnd::posted_event`] is signalled when one does; refused, with
+  /// nothing left posted, on a gone peer or a malformed message (a long one's remainder is refused at the next call).
+  pub fn posted_recv(&mut self) -> Result<Option<HandleMessage>, HandleRefusal> {
+    let handle = self.channel.raw();
+    let posted = self.posted_read()?;
+    if !posted.in_flight {
+      post(handle, posted)?;
+    }
+    take(handle, posted)
+  }
+
+  /// The event of the read posted on this end, posting one if none is in flight: signalled once a message has arrived
+  /// (at once, if one waited). Refused as [`ReadingEnd::posted_recv`] is, when the read cannot be posted.
+  pub fn posted_event(&mut self) -> Result<HANDLE, HandleRefusal> {
+    let handle = self.channel.raw();
+    let posted = self.posted_read()?;
+    if !posted.in_flight {
+      post(handle, posted)?;
+    }
+    Ok(posted.event.as_raw_handle())
+  }
+
+  /// This end's posted read, made the first time it is asked for.
+  fn posted_read(&mut self) -> Result<&mut PostedRead, HandleRefusal> {
+    if self.posted.is_none() {
+      // Owned by the posted read, and closed after the channel's drop has settled it.
+      let event = completion_event()?;
+      self.posted = Some(Box::new(PostedRead {
+        overlapped: OVERLAPPED::default(),
+        buffer: [0; MESSAGE_BYTES],
+        event,
+        in_flight: false,
+      }));
+    }
+    self.posted.as_deref_mut().ok_or(HandleRefusal::Malformed {
+      reason: "the posted read was not made",
+    })
+  }
+}
+
 impl Channel {
   /// Wraps a pipe end (from [`channel`] or inherited and adopted by a daemon).
   pub fn adopt(end: OwnedHandle) -> Channel {
@@ -71,7 +169,7 @@ impl Channel {
   pub fn send(&self, message: &HandleMessage, timeout_ms: u32) -> Result<(), HandleRefusal> {
     let bytes = encode(message)?;
     let moved = self.overlapped(Way::Write, &mut { bytes }, timeout_ms)?;
-    if moved != MESSAGE_BYTES {
+    if moved != Some(MESSAGE_BYTES) {
       return Err(HandleRefusal::Malformed {
         reason: "a short write of a hold message",
       });
@@ -80,13 +178,13 @@ impl Channel {
   }
 
   /// Receives one message, waiting at most `timeout_ms`: the message, `None` on a timeout (nothing waited), refused on a
-  /// gone peer or a malformed message.
+  /// gone peer or a malformed message. A message of no bytes is a short message, not a timeout: a message-mode pipe
+  /// delivers a zero-length write as a read of zero bytes.
   pub fn recv(&self, timeout_ms: u32) -> Result<Option<HandleMessage>, HandleRefusal> {
     let mut bytes = [0u8; MESSAGE_BYTES];
-    let moved = self.overlapped(Way::Read, &mut bytes, timeout_ms)?;
-    if moved == 0 {
+    let Some(moved) = self.overlapped(Way::Read, &mut bytes, timeout_ms)? else {
       return Ok(None);
-    }
+    };
     if moved != MESSAGE_BYTES {
       return Err(HandleRefusal::Malformed {
         reason: "a short read of a hold message",
@@ -97,20 +195,16 @@ impl Channel {
 
   /// One overlapped read or write of `buffer` on the end, waited for on an event of its own for at most `timeout_ms`
   /// supplied by the caller. A timed-out operation is cancelled and settled before either its buffer or OVERLAPPED
-  /// leaves this frame. A read timeout returns zero; a write timeout is a typed refusal.
+  /// leaves this frame. The bytes moved; `None` for a read timeout (nothing was read); a write timeout is a typed
+  /// refusal.
   fn overlapped(
     &self,
     way: Way,
     buffer: &mut [u8],
     timeout_ms: u32,
-  ) -> Result<usize, HandleRefusal> {
-    // SAFETY: a nameless manual-reset event, unsignalled, not inheritable; owned and closed below.
-    let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
-    if event.is_null() {
-      return Err(os("CreateEventW"));
-    }
-    // SAFETY: the event just made, owned here and closed on drop after the operation it waits for has settled.
-    let event = unsafe { OwnedHandle::from_raw_handle(event) };
+  ) -> Result<Option<usize>, HandleRefusal> {
+    // Owned here and closed on drop after the operation it waits for has settled.
+    let event = completion_event()?;
     let mut overlapped = OVERLAPPED {
       hEvent: event.as_raw_handle(),
       ..OVERLAPPED::default()
@@ -167,14 +261,78 @@ impl Channel {
       let code = last_error();
       if waited == WAIT_TIMEOUT && is_cancelled(code) {
         return match way {
-          Way::Read => Ok(0),
+          Way::Read => Ok(None),
           Way::Write => Err(HandleRefusal::TimedOut),
         };
       }
       return gone_or_refused(code, way);
     }
-    Ok(usize::try_from(moved).unwrap_or(0))
+    Ok(Some(usize::try_from(moved).unwrap_or(0)))
   }
+}
+
+/// A nameless manual-reset event, unsignalled and not inheritable, for one overlapped operation's completion.
+fn completion_event() -> Result<OwnedHandle, HandleRefusal> {
+  // SAFETY: creates a nameless event with no security attributes; the handle is checked and owned below.
+  let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+  if event.is_null() {
+    return Err(os("CreateEventW"));
+  }
+  // SAFETY: the event just made, owned once here; the caller keeps it until its operation has settled.
+  Ok(unsafe { OwnedHandle::from_raw_handle(event) })
+}
+
+/// Posts a read of one message on `handle` into `posted`'s box. A read that completes at once is in flight all the
+/// same: [`take`] collects it, and its event is already signalled. One refused at once (a gone peer; a message longer
+/// than a hold message, whose remainder stays in the pipe) leaves nothing in flight.
+fn post(handle: HANDLE, posted: &mut PostedRead) -> Result<(), HandleRefusal> {
+  posted.overlapped = OVERLAPPED {
+    hEvent: posted.event.as_raw_handle(),
+    ..OVERLAPPED::default()
+  };
+  let length = u32::try_from(MESSAGE_BYTES).unwrap_or(u32::MAX);
+  // SAFETY: the buffer holds `length` bytes, and it and the OVERLAPPED are boxed and stay in place until this read
+  // settles: [`take`] collects it, or the channel's drop cancels and waits for it.
+  let started = unsafe {
+    ReadFile(
+      handle,
+      posted.buffer.as_mut_ptr(),
+      length,
+      std::ptr::null_mut(),
+      &mut posted.overlapped,
+    )
+  };
+  let code = if started == 0 { last_error() } else { 0 };
+  if started != 0 || code == ERROR_IO_PENDING {
+    posted.in_flight = true;
+    return Ok(());
+  }
+  gone_or_refused(code, Way::Read).map(|_| ())
+}
+
+/// The message a posted read took, without waiting: `None` while it is still in flight.
+fn take(handle: HANDLE, posted: &mut PostedRead) -> Result<Option<HandleMessage>, HandleRefusal> {
+  if !posted.in_flight {
+    return Ok(None);
+  }
+  let mut moved = 0u32;
+  // SAFETY: asks, without waiting, after the read posted on this live handle with this boxed OVERLAPPED.
+  let finished = unsafe { GetOverlappedResult(handle, &posted.overlapped, &mut moved, 0) };
+  if finished == 0 {
+    let code = last_error();
+    if code == ERROR_IO_INCOMPLETE {
+      return Ok(None);
+    }
+    posted.in_flight = false;
+    return gone_or_refused(code, Way::Read).map(|_| None);
+  }
+  posted.in_flight = false;
+  if usize::try_from(moved).ok() != Some(MESSAGE_BYTES) {
+    return Err(HandleRefusal::Malformed {
+      reason: "a short read of a hold message",
+    });
+  }
+  decode(&posted.buffer).map(Some)
 }
 
 /// A read or a write.
@@ -189,12 +347,18 @@ fn is_cancelled(code: u32) -> bool {
   code == windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED
 }
 
-/// A refused or failed operation with `code`: a read of a gone peer is zero bytes (its end closed), as on Unix;
-/// anything else is refused.
-fn gone_or_refused(code: u32, way: Way) -> Result<usize, HandleRefusal> {
+/// A refused or failed operation with `code`: a gone peer is [`HandleRefusal::Closed`]; a message longer than a hold
+/// message is malformed (the pipe keeps its remainder, which the next read takes as a short message); anything else is
+/// refused by the OS.
+fn gone_or_refused(code: u32, way: Way) -> Result<Option<usize>, HandleRefusal> {
   use windows_sys::Win32::Foundation::{
-    ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED,
+    ERROR_BROKEN_PIPE, ERROR_MORE_DATA, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED,
   };
+  if matches!(way, Way::Read) && code == ERROR_MORE_DATA {
+    return Err(HandleRefusal::Malformed {
+      reason: "a long read of a hold message",
+    });
+  }
   let gone = matches!(
     code,
     ERROR_BROKEN_PIPE | ERROR_NO_DATA | ERROR_PIPE_NOT_CONNECTED

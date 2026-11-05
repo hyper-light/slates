@@ -22,6 +22,122 @@
 > of another fleet node. Fixed with its failing test first; record `docs/bugs/2026-11-04-a-green-could-not-be-shared.md`.
 > Open, reported there: a green's (and a volume's) name is unique per shard only.
 
+> **The anchor's hold refusals: a bounded Unix log, and a count in `slates status` (2026-11-04, A-213; siblings of
+> audit step 3).** The Unix device hold logged a line per refused message, unbounded; it now logs each distinct refusal
+> once (`RefusalLog`, as the Windows hold does) and counts every one. Every refusal on either platform's hold channel
+> is published in the segment's supervision block and reported by `slates status` as `anchor_hold_refusals`. adacachy,
+> 2026-11-04: 20 bad device messages gave 20 counted and 20 log lines before the change, 20 and 2 after; through a real
+> supervisor over the real `slates daemon`, `slates status` says `anchor_hold_refusals: 20`. On CI's `ubuntu-latest` and
+> `macos-latest`, both tests fail on main's sources (20 log lines; no `anchor_hold_refusals` line; run 41984065875) and
+> pass with the fix (run 41984065750). Record: `docs/bugs/2026-11-04-the-unix-device-hold-logged-every-refusal.md`.
+> - **The Windows anchor wakes on its hold channel**, a read it keeps posted, and on its daemon's exit, where it parked up
+>   to 500 ms between looks at the channel (A-206's owed item). Five holds through the real supervisor under a 4 s pause:
+>   3,990 to 4,020 ms each before, on `windows-latest` and `windows-11-arm`, 3 runs each (run 41984349301); under 1 ms each
+>   after, 3 runs each (run 41985213489), with the 20-bad-message tests (0 anchor exits) green in the same runs. A WinFsp
+>   mount's median fell from 487 to 10.5 ms on x86_64 and from 445 to 15.8 ms on arm64, an unmount's from 505 to 15.7 ms
+>   and from 507 to 27.0 ms, 20 interleaved rounds per build (run 41985454044; BENCHMARKS, "What a WinFsp mount and unmount
+>   wait for the Windows anchor").
+
+> **The binary release lane (2026-11-04, A-210, Appendix B.2).** `release.yml` now builds `slates` natively for
+> seven targets: macOS arm64, Linux x86_64 and arm64 (glibc, and static musl), and Windows x86_64 and arm64 with the C
+> runtime linked statically. It runs each built binary on its own runner (`cargo run -p xtask --bin release -- smoke`: version,
+> anchor and daemon start, bootstrap, a volume provisioned, a file written and read by one MCP client and read by a second
+> client, the volume destroyed, the daemon gone with its anchor). It then attaches the seven binaries, `SHA256SUMS`,
+> `slates-provenance.json` and a Sigstore attestation bundle to a **draft** release. Publishing the draft is the
+> maintainer's step (`docs/publish.md`, "The binary release").
+> - Proven by use (2026-11-05). Every Linux and Windows binary passed every smoke step on its own CI runner (run
+>   41982329895): provision 20–25 ms, the MCP round trip 22–61 ms, start to serving 275–1064 ms. Both musl binaries
+>   are static, and the Windows x86_64 binary answered in Nano Server. The macOS binary passed 10 of 10 runs on this
+>   Mac (M5 Max, 18 cores, 2026-11-04, load 12–24; `cargo run -p xtask --bin release -- smoke --binary <release build>
+>   --target aarch64-apple-darwin --record <file>`).
+> - End to end on the test tag `v0.1.0-test.1` (run 41983664060; macOS on CI too). It made a draft pre-release with all
+>   seven binaries, `SHA256SUMS`, the provenance and the attestation bundle. After download, all seven checksums
+>   verified, `gh attestation verify` passed (SLSA v1, seven subjects, `release.yml` at the tag) and refused a
+>   tampered copy, and no SDK lane started. Every number is in A-210.
+> - **Owed to Ada:** a release is published only when a maintainer pushes a real tag `v<version>` and publishes its
+>   draft (`docs/publish.md`). The test draft is never to be published.
+> - **Open, found by the smoke test: the anchor aborts when its stderr closes.** `slates anchor 2>&1 >/dev/null | head
+>   -n 1` exits 134 (SIGABRT) once `head` has exited (2026-11-04, this Mac). The next diagnostic line meets EPIPE,
+>   which `eprintln!` turns into a panic, and `panic = "abort"` makes that an abort. The smoke test's own first
+>   version stopped reading the anchor's stderr after the serving line, and 8 of 10 runs aborted. Owed, in
+>   `crates/cli`: a failing test, then diagnostics that survive a closed stderr.
+> - **Not yet:** reproducibility from the tag (AC-9.5: nothing builds twice and compares); the macOS `Slates.app`
+>   bundle, code signing and notarization (B.7; they need an Apple Developer identity); `cargo-binstall` metadata.
+
+> **WinFsp's hold release, DLL version and long paths fixed (2026-11-04, A-206; audit steps 4 and 6).** Run
+> [41978665514](https://github.com/hyper-light/slates/actions/runs/41978665514), `windows-latest` and `windows-11-arm`,
+> with WinFsp 2.1.25156 installed from its pinned URL and SHA-256. Each lane: the whole live suite 13 passed, 1 ignored.
+> - **An unmount the anchor does not answer:** 0 drives held after their unmount of 20 unmounts on each lane, 0 successes
+>   answered while held, 0 mounts refused after a silence, 60 release attempts refused (the test stops the real anchor's
+>   process). A refused mount-time hold is a typed refusal with nothing left mounted, 3 of 3 in one daemon's life, and the
+>   next mount succeeds. On main's code the same tests fail: run 41975090109, `Refused holds` failed on x86_64 and was still
+>   running on arm64 when read, and that run printed no counts. Dropping the pipe at a deadline fails the native channel
+>   test on jupiter. Record: `docs/bugs/2026-11-04-a-refused-hold-release-left-a-drive-held.md`.
+> - **The DLL's version:** a DLL other than 2.1 is refused at mount with its version in the words. Red-check run
+>   [41977593496](https://github.com/hyper-light/slates/actions/runs/41977593496), `CHECKED_VERSION` changed to 2.2:
+>   `the WinFsp DLL's version 2.1 is not 2.2`, on the real DLL. Record:
+>   `docs/bugs/2026-11-04-the-winfsp-guard-read-a-field-winfsp-always-zeroes.md`.
+> - **Long paths, criterion restated by the supervisor on 2026-11-04.** The goal asked for 0 refused between 1,025 and
+>   32,767 units. The driver itself refuses part of that range, so it now reads: **slates refuses no path the WinFsp driver
+>   passes.** Measured live by halving, on both lanes: **the driver refuses from 8,116 UTF-16 units.** 8,115 units and the
+>   ladder 1,025, 1,026, 2,000, 4,000 and 8,000 are created, read back and reopened through slates. 8,116 with its parents
+>   in place answers the driver's `os error 87`, where slates could only answer not found. The reserve's
+>   `MAX_PATH_UNITS` is derived from the driver's request bound, and the test holds it equal to the measurement. 32,761
+>   units, the longest a drive letter can name, answers 206 above the driver. A 2,000-unit path is created, opened, read
+>   and kept through a killed daemon on both lanes, its old view following the successor's change. Main's code fails the
+>   long-path step on both lanes (41975090109). Reserve at 65,536 slots on jupiter, 3 of 3: 2,133,147,696 bytes of
+>   section, about 2.2 ms to make, 4,166,312 bytes of paged pool per mount. Record:
+>   `docs/bugs/2026-11-04-a-winfsp-open-past-1024-units-was-refused.md`.
+> - **Owed:** a live test of the rename a held name would outgrow (unit-tested only, `rename_fits`: the driver also limits
+>   renames over open descendants, so a live case is not dependable). The Windows anchor's 500 ms between looks at the
+>   hold channel is closed by A-213 (above).
+> - **Changed for everyone:** a detach of a WinFsp drive can now answer `TargetUnavailable`, and CI's WinFsp is pinned: a new
+>   minor version is refused until the receiver's layout is reviewed. Gates: Ubuntu job of 41978665514 (fmt, workspace
+>   clippy, `xtask check`, docs).
+
+> **`cargo xtask` does not compile on Windows (2026-11-04, tooling).** On jupiter, `cargo +1.98.1 xtask check` stops
+> with 12 errors in `xtask/src`: `std::os::unix` and `Permissions::mode` in `conformance/workloads.rs`,
+> `std::os::unix` and `Permissions::from_mode` in `kind_export.rs`, and `rustix` in `conformance/hermeticity.rs`. So
+> no structural, literal or unsafe-budget check runs on a Windows machine; a Windows change takes those gates on
+> Linux or macOS, through CI or another machine. Open; no fix attempted.
+
+> **Windows gives freed content pages back (A-205, 2026-11-04), and the audit's held-section leak was not one.** A deleted
+> file's pages leave a Windows daemon's working set at the idle purge, and a block reusing them is zeroed before it is
+> handed out. The section's commit stays charged, by design: Windows has no decommit for a view of a section. The audit's
+> "a refused view leaks the held section's handle" was wrong: `view` closed it, 0 handles in 200 refused adoptions on
+> unchanged code and 200 with the close removed (`crates/mem/tests/held_section.rs`); the adoption now maps first anyway.
+> Numbers and CI runs: BENCHMARKS, "What a write costs on pages given back on Windows".
+
+> **A merge's cost grows with its green's file count (2026-11-05, RQ-4, §4.16; OPEN, perf's).** The new
+> `crates/client/examples/edit_merge_bench.rs` measures, on macOS arm64 at load 9, an accepted submit's median at
+> 25–161 µs over a green's first hundred versions and 529–684 µs over its last hundred (six runs). Each version adds a
+> file. One file replaced 1,000 times shows no growth, and an edit shows none in either form. Every submit clones
+> each path of the green (`Green::current_base`), walks each base file (`compose_volume`), and hashes each byte of the
+> green (`Green::head_identity` in `merge_service::enqueue_record`). That puts RQ-4's millisecond out of reach for a
+> repository-sized green. The fix is the perf agent's. The clients agent re-measures merge on every platform once it
+> lands. Also open from the same runs: a sevenfold p50 split between two invocations on this Mac (edit 18.8 against
+> 2.5 µs). Record: `BENCHMARKS.md`, "The client's edit and merge latency".
+
+> **Replication latency (raft, 2026-11-04): a commit returns at its quorum; live shipping still owed.** Every quorum
+> collector in `slates-cluster` slept its whole poll after its quorum had answered, so a cross-node record commit cost
+> the daemon's 10 ms poll (10,125–10,194 µs at the median) over a 12 µs loopback round trip. Each reply now wakes its
+> collector: 18.9–19.9 µs at the median, p99 28.8–32.9 µs, worst 44.7 µs at the daemon's poll
+> (`replication_bench`, five interleaved rounds at load 36–42, `docs/wip/BENCHMARKS.md`; failing test first:
+> `a_commit_returns_at_its_quorum_not_at_its_poll`; record:
+> `docs/bugs/2026-11-04-a-quorum-collector-waited-out-its-poll.md`). Open, toward a filesystem server replicated per
+> write in under 1 ms: §4.10 live shipping (the owner's publication stream shipped to its candidates and acknowledged
+> at f+1, AC-8.3's "live-shipped volumes report none", AC-8.9's credit backpressure) is unbuilt, as are `put_wal`
+> and the loss-window report; a head still waits up to the 100 ms record period before its commit starts.
+
+> **VFS plan step 14, Shards' WHP window's three edge cases (2026-11-05): done, patches with the owner's folder.** Six
+> real-guest tests and one fix for Shards' owner, in `docs/wip/shards-patches/` (never pushed to Shards; README there), and
+> PM M421 with them. A view shorter than its range and 64 KiB granules hold. Several vCPUs at a section's replace hold (0 stale,
+> 0 lost in 20,000 replaces, up to 158,573 faults run again at 8 vCPUs on jupiter, 47,708 at 4 on windows-2025). At a share's
+> own file followed they did not: 2 to 38 live accesses taken for the guest's a run on jupiter, 201 to 797 on windows-2025
+> (10 of 10), and 0 after the fix on both. slates refuses an ask no view can begin at (A-211). CI runs 41981896876 and
+> 41987826160, the second on the patches as delivered. Owed: the
+> owner's review.
+>
 > **Audit of 2dc9f3eb..98000d56 (2026-11-03): defects open, Step 9's evidence holds.** Nine commits made on
 > 2026-11-01 and 2026-11-02 were read line by line against this file's rules and Step 9's acceptance. Every CI run they
 > cite was read again: each shows what it is cited for, except one pair of timings A-198 gave the wrong way
@@ -34,20 +150,36 @@
 >   never moved, nor one whose stop awaits its chain. Three tests fail on the old seam and pass after; main CI's live
 >   QEMU lane passes (41732529738). Owed: an in-place reset, so a rebooted guest keeps its device.
 >   Record: `docs/bugs/2026-11-03-a-restarted-vhost-ring-was-served-from-its-old-layout.md`.
-> - **The Windows anchor ends on one malformed or short hold message (A-198).** The refusal propagates out of
->   `Supervisor::step` and ends the anchor, whose kill-on-close job then takes every held drive. Unix counts such
->   refusals.
-> - **A refused hold release leaves a held drive (A-198).** The unmount deletes the file system after the release is
->   refused, so the anchor keeps the volume and its drive letter with no daemon serving them
->   (`crates/server/src/winfsp.rs`, `release_hold` and `reap`).
-> - **A refused view leaks the held section's handle** (`crates/mem/src/shared.rs`, Windows `from_held_handle`).
-> - **The receiver's WinFsp guard checks a field WinFsp always zeroes** (`FileSystem.Version`), not the DLL's version
->   (`FspVersion`). Also, an open whose path is longer than 1024 UTF-16 units is now refused, because every open records
->   its kernel name in the held ledger (`crates/bridge-winfsp/src/opens/names.rs`).
-> - **The receiver that replaced WinFsp's dispatcher is unmeasured.** It is one thread with a new event per control
->   transaction, where the DLL dispatcher ran two threads; BENCHMARKS has no entry for it.
-> - **Two failures recorded open below are still unfixed**: the wake-learning fixture under load and the fleet routing
->   Create reply.
+> - **The Windows anchor ended on one malformed or short hold message (A-198): fixed 2026-11-05.** A refusal propagated
+>   out of `Supervisor::step` and ended the anchor, whose kill-on-close job then took every held drive. Now it is
+>   counted and supervision goes on: 0 anchor exits from 20 bad messages, 20 refusals counted, both holds kept and
+>   inherited live, 3 runs each on CI's Windows x86_64 and arm64 (run 41976042550); red on main's sources in run
+>   41974533851. The log says each distinct refusal once. A live drive is not sent bad messages, since only the daemon
+>   reaches the channel; the live lane passes over the changed drain. Open: the Unix device hold still logs per refusal,
+>   and nothing outside the tests reads the refusal count.
+>   Record: `docs/bugs/2026-11-03-one-malformed-hold-message-ended-the-windows-anchor.md`.
+> - **A refused hold release leaves a held drive (A-198): fixed 2026-11-04 (A-206, run 41978665514; the entry above).** The
+>   unmount deleted the file system after the release was refused, so the anchor kept the volume and its drive letter
+>   with no daemon serving them (`crates/server/src/winfsp.rs`, `release_hold` and `reap`).
+> - **A refused view leaks the held section's handle**: wrong; `view` closed it, and A-205 records the count (see the top of this file).
+> - **The receiver's WinFsp guard checks a field WinFsp always zeroes: fixed 2026-11-04 (A-206, runs 41978665514 and
+>   41977593496; the entry above).** It read `FileSystem.Version`, not the DLL's version (`FspVersion`). Also, an open whose
+>   path was longer than 1024 UTF-16 units was refused, because every open records its kernel name in the held ledger
+>   (`crates/bridge-winfsp/src/opens/names.rs`); now slates refuses no path the driver passes.
+> - **The receiver that replaced WinFsp's dispatcher: measured, most of its regression fixed, a remainder open (A-212,
+>   2026-11-05).** Interleaved on CI's runners against `71cf09ac` (BENCHMARKS, "The WinFsp receiver against the DLL
+>   dispatcher", every run), it was worse beyond the spread (arm64 quiet p50: a stat 2.55×, a rename 2.90×, an fsync 1.74×;
+>   run 41973314087). Two causes were timed and fixed: a live receive scanned the whole 64 KiB batch tail (26.4 µs on arm64,
+>   50.1 µs on x86_64, run 41977769822), and a rename took a shard turn per live open (about 106). After (run 41989009852):
+>   arm64 a stat 1.50×, a rename 1.35×, an fsync 1.21×; x86_64 loaded a stat and an open 1.18–1.20×, its quiet runs overlapping. Some loaded tails are far
+>   better than the DLL's (x86_64 stat p99 114–133 ms against 0.51–0.60 ms). **Open:** it stays worse beyond the spread at
+>   the p50 by about 20 µs a request. The separate response call explains 11–13 µs, and removing it would change A-198's
+>   crash rule. Hops for Open and Release about 2× and for SetSize about 4× under load on arm64 are measured and not explained
+>   (a longer shard spin did not change them, run 41989038309); that SetSize hop is an arm64 write under load at 2.09×. Also:
+>   under two spinners a core on a 4-vCPU x86_64 VM the anchor killed both daemons for a late heartbeat in run 3 of all
+>   three jobs that reached it.
+> - **Two failures recorded open below**: the wake-learning case under load (fixed 2026-11-04, A-199) and the fleet
+>   routing Create reply (fixed 2026-11-04 in its fixture; a second, rarer failure of that history stays open).
 >
 > Twenty goals of this plan's stack, Steps 10–15 among them, were closed in 2–4 s each with no work. They are
 > restored in order after these fixes.
@@ -61,20 +193,36 @@
 > is the instrumented CI job. Record:
 > `docs/bugs/2026-11-02-an-empty-wake-test-mistook-an-armed-client-for-a-sleeper.md`.
 
-> **Wake-learning fixture's timing assumption still open (2026-11-02, A-31).** A later capped all-ring run on
-> adacachy (zero of 32 cores idle) passes the corrected empty-wake case but fails the unchanged learning case:
-> 7 of 32 samples, below its required 16, with all 32 replies delivered. Its one-millisecond delay after arming
-> does not establish a kernel sleeper under preemption. Eight of nine cases pass in 0.53 s; the unit exits 101
-> in 7.858 s. Keep the sample assertion and this failure recorded; the whole main CI target remains required.
-> Record: `docs/bugs/2026-11-02-an-empty-wake-test-mistook-an-armed-client-for-a-sleeper.md`.
+> **Wake-learning failure fixed (2026-11-04, A-199; opened 2026-11-02, A-31).** It was the product, not the fixture's
+> one-millisecond delay. A woken client outran its waker, which was preempted between its wake and its
+> confirmation. The client's next park cleared the one reply stamp, so the sample was given up, and the late
+> confirmation set a bare confirmed bit there that refused the following park's stamp. Logs: in every failing run
+> the zero-time out-of-window stamps matched the given-up ones one for one (15 and 15 of 32 at worst). The region
+> now holds two stamps, the parks alternate between them, and the parked flag's value names the slot (layout
+> version 3). The assertion is unchanged (16 of 32). Interleaved on adacachy, 100 runs each: before 100/100 and
+> 89/100 failures on one and two busy CPUs, after 0/100 and 0/100; all nine ring cases on two busy CPUs 95/100
+> before, 0/100 after. Record: `docs/bugs/2026-11-04-a-late-wake-confirmation-cost-the-client-two-samples.md`.
 
-> **Fleet setup failure still unattributed (2026-11-02, §4.8 Lookup).** Main CI 41538865390 on `8a3fdc63` passes
-> Windows and QEMU but its Linux fleet target passes 85/86 active histories: the returning-session location case
-> gets an unexpected Create reply while choosing its routing candidate. The helper discarded that reply, so its
-> failure now prints the candidate name and complete typed verdict. The same fleet source passes on parent
-> `663e4df8`; the exact isolated case passes once on adacachy in 5.25 s. Neither result names the original verdict
-> or cause. Keep the failure open for that evidence; no retry or weaker assertion is added. Record:
-> `docs/bugs/2026-11-02-a-fleet-routing-fixture-discarded-its-unexpected-create-reply.md`.
+> **A survivor's other shard never held its live peer: fixed (2026-11-04, §4.8 Membership).** Main CI 41774055498
+> failed the CLI fleet deployment test: after the owner's death one survivor's `status` listed only itself. The
+> control shard recorded a detector belief as folded before its admission rule refused it (the peer's id not yet
+> learned on contact), so learn-on-contact later made the peer alive on the control shard alone and no other shard
+> ever held it; all four failing logs show the peer folded on the control shard once and on the other shard never.
+> A refused belief is now offered again next turn (`fold_on_control`, `crates/server/src/member_task.rs`); a unit
+> test fails on the old fold. Interleaved on two busy CPUs, 50 runs each: before 1 failure, after 0. Record:
+> `docs/bugs/2026-11-04-a-survivors-other-shard-never-held-its-live-peer.md`.
+
+> **Fleet setup failure attributed and fixed (2026-11-04; opened 2026-11-02, §4.8 Lookup).** The routing history's
+> first create was answered at once (0.000 s in main CI 41538865390): the owner refused `ConsensusNotInitialized`.
+> The fixture's settle step checked the committed membership through the council and root (the root only on root
+> voters), but a node admits a placement write only once its own readiness follows, one coordinator period later or
+> after a root learner's import. A create on every node right after the settle was refused once in 40 fleets on two
+> busy CPUs (1 in 340 fleets in all). The settle step now also waits for every node's readiness
+> (`Daemon::consensus_ready`); the new test `a_settled_fleet_admits_a_create_on_every_node` passed 100/100 after, the
+> history 50/50 on two busy CPUs, and the whole fleet target 87/87. No assertion changed. Still open: on one CPU the
+> same history failed once in 50 another way, its lookup refused `OwnerUnreachable` with the held session never
+> back within the forward's wait (`session_never_returned` 4), not attributed. Record:
+> `docs/bugs/2026-11-04-a-settled-fleet-refused-its-first-create.md`.
 
 > **A forward waits for the owner's session (2026-09-25, §4.8 Lookup).** A forward refused the client
 > `HomedElsewhere` at once whenever a coordinator dispatch or a discovery page had the owner's session out;
@@ -12412,8 +12560,9 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   `.cargo/config.toml` nor `release.yml` sets `+crt-static` for Windows), `slates.exe` needs `vcruntime140.dll`, which
   Windows does not ship and Nano Server and Server Core images lack: in a process-isolated `nanoserver:ltsc2025` container
   it exits `0xC0000135`, `STATUS_DLL_NOT_FOUND`, before any code runs (CI's `windows-2025`, run 40580524733). Built with
-  `-C target-feature=+crt-static` it runs there whole, the daemon included (run 40582122662). Owed: the release's Windows
-  binaries built with the C runtime linked statically, and a by-use test that the published binary starts in Nano Server.
+  `-C target-feature=+crt-static` it runs there whole, the daemon included (run 40582122662). **Addressed 2026-11-04
+  (A-210):** `release.yml` builds both Windows binaries with `+crt-static`, and the x86_64 one must answer `slates
+  version` in a process-isolated `nanoserver:ltsc2025` container before it may ship. The CI run is recorded in A-210.
 - **A CLI attachment ends about a second after the `slates attach` that made it (open, seen 2026-10-27).** The reaper
   removes a dead client's attachments at the liveness cadence (`crates/server/src/reap.rs`, every 1 s), and each `slates`
   run is a client of its own. So `slates attach`, then `slates write`, then `slates detach`, each a process, races the

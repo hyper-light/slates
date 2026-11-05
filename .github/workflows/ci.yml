@@ -14,6 +14,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # WinFsp, pinned (A-206): the receiver is written from this version and refuses any other, so an unpinned install would
+  # turn every Windows lane red the day upstream ships a release. The hash is the one GitHub publishes for the release
+  # asset, and matched the file downloaded on 2026-11-04. Raising it is a review of the receiver's layout.
+  WINFSP_MSI_URL: https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
+  WINFSP_MSI_SHA256: 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
 
 jobs:
   gates:
@@ -420,7 +425,12 @@ jobs:
       # directory the MSI records in the registry, as WinFsp's own `FspLoad` does.
       - name: Install WinFsp
         run: |
-          choco install winfsp -y --no-progress
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp.msi'
+          Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile $msi
+          $found = (Get-FileHash $msi -Algorithm SHA256).Hash
+          if ($found -ne $env:WINFSP_MSI_SHA256) { throw "WinFsp's installer hashes $found, not $env:WINFSP_MSI_SHA256" }
+          $install = Start-Process msiexec -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
           "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       # `--workspace` cannot build here: the NFS-mount and FUSE/FSKit crates (bridge-nfs, cli,
       # bridge-fuse, bridge-fskit) are macOS/Linux-only — Windows mounts through WinFsp, and the fleet
@@ -577,6 +587,11 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-server --test observe
+      # A-205: a deleted file's pages leave the working set and read back through the files recreated over them.
+      - name: Test a deleted file's memory going back to the OS (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-server --test give_back -- --nocapture
       # The client binary whole on Windows, and the async driver: an in-process `slates-server` daemon found through the
       # Win32 rendezvous bootstrap object, driven over the rings through the whole lifecycle; the same-kernel direct map
       # by handle duplication (§4.6, A-175: zero copy asserted, the hostile holder's escalations refused, the neighbour's
@@ -817,6 +832,11 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 20
         run: cargo test -p slates-client --test shards -- --test-threads=1
+      # A-205: as on x86_64, the pages of a deleted file leave the working set.
+      - name: Test a deleted file's memory going back to the OS (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-server --test give_back -- --nocapture
       - name: Test the NFS server, its write-back judgment and the network export (native arm64 Windows)
         if: ${{ !cancelled() }}
         timeout-minutes: 20
@@ -835,7 +855,12 @@ jobs:
       - name: Install WinFsp (native arm64 Windows)
         if: ${{ !cancelled() }}
         run: |
-          choco install winfsp -y --no-progress
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp.msi'
+          Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile $msi
+          $found = (Get-FileHash $msi -Algorithm SHA256).Hash
+          if ($found -ne $env:WINFSP_MSI_SHA256) { throw "WinFsp's installer hashes $found, not $env:WINFSP_MSI_SHA256" }
+          $install = Start-Process msiexec -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
           "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       # A-198: retain a real taken request through a kill, then require its counted settlement and a fresh read.
       # The same native suite covers captured batches, torn records, private-intent progress and kernel names.
@@ -974,7 +999,12 @@ jobs:
       # `windows-lint` job covers, plus the WinFsp mount host, whose live mount needs WinFsp installed.
       - name: Install WinFsp
         run: |
-          choco install winfsp -y --no-progress
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp.msi'
+          Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile $msi
+          $found = (Get-FileHash $msi -Algorithm SHA256).Hash
+          if ($found -ne $env:WINFSP_MSI_SHA256) { throw "WinFsp's installer hashes $found, not $env:WINFSP_MSI_SHA256" }
+          $install = Start-Process msiexec -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
           "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - name: Clippy the Windows-buildable crates
         run: cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-sdk-node -p slates-sdk-python -p slates-anchor -p slates-mcp --all-targets -- -D warnings

@@ -315,6 +315,9 @@ pub(crate) type NotifyFn = unsafe extern "system" fn(
   size: usize,
 ) -> Ntstatus;
 
+/// `FspVersion` (`winfsp.h`): the DLL's file version, major in the high 16 bits and minor in the low.
+pub(crate) type VersionFn = unsafe extern "system" fn(version: *mut u32) -> Ntstatus;
+
 /// The `FSP_API` exports the host calls, found in `winfsp-x64.dll` at run time rather than linked through its import
 /// library. Linked, a daemon on a Windows machine without WinFsp could not start at all (`STATUS_DLL_NOT_FOUND` at
 /// load), though WinFsp is only its mount transport; loaded, the daemon starts everywhere and reports the WinFsp
@@ -328,6 +331,7 @@ pub(crate) struct Api {
   pub(crate) notify_begin: NotifyBeginFn,
   pub(crate) notify_end: NotifyEndFn,
   pub(crate) notify: NotifyFn,
+  pub(crate) version: VersionFn,
 }
 
 /// Format: the library's name for this architecture (`FSP_DLLNAME`: `winfsp-` and `FSP_FSCTL_PRODUCT_FILE_ARCH`).
@@ -365,6 +369,7 @@ fn load() -> Result<Api, Ntstatus> {
     notify_begin: symbol(module, c"FspFileSystemNotifyBegin")?,
     notify_end: symbol(module, c"FspFileSystemNotifyEnd")?,
     notify: symbol(module, c"FspFileSystemNotify")?,
+    version: symbol(module, c"FspVersion")?,
   })
 }
 
@@ -439,6 +444,7 @@ impl Export for AddDirInfoFn {}
 impl Export for NotifyBeginFn {}
 impl Export for NotifyEndFn {}
 impl Export for NotifyFn {}
+impl Export for VersionFn {}
 
 /// The export `name` of `module`, as the function-pointer type `T` the header gives it; refused when the library does not
 /// export it.

@@ -24,11 +24,12 @@
 //! **The record.** `FSP_FSCTL_NOTIFY_INFO` (`fsctl.h`, `static_assert` 12 bytes): `UINT16 Size`, two bytes of padding,
 //! `UINT32 Filter`, `UINT32 Action`, then the name in UTF-16 with no terminator; `Size` counts the head and the name,
 //! and each record starts at the next multiple of `FSP_FSCTL_DEFAULT_ALIGNMENT` (8), as the kernel walks them
-//! (`FspVolumeNotifyWork`, `src/sys/volume.c`). WinFsp paths are at most `FSP_FSCTL_TRANSACT_PATH_SIZEMAX` (1024 UTF-16
-//! units), so a record always fits its 16-bit size; a longer name than any WinFsp path is refused, counted, and left
-//! out rather than truncated into a different name.
+//! (`FspVolumeNotifyWork`, `src/sys/volume.c`). A name past what the 16-bit size can count ([`MAX_NOTIFY_UNITS`], far
+//! past any name the driver passes) is refused, counted, and left out rather than truncated into a different name.
+//! `FSP_FSCTL_TRANSACT_PATH_SIZEMAX` (1024 units) does not limit an absolute name here: that kernel
+//! buffer holds only a name relative to the record before it, which this module never sends.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use slates_bridge_core::Invalidation;
 
@@ -57,9 +58,18 @@ const EVERYTHING_FILTER: u32 = INODE_FILTER | ENTRY_FILTER;
 pub const NOTIFY_INFO_HEAD: usize = 12;
 /// Format: `FSP_FSCTL_DEFAULT_ALIGNMENT` (`fsctl.h`): each record starts at a multiple of it.
 pub const NOTIFY_INFO_ALIGNMENT: usize = 8;
-/// Format: `FSP_FSCTL_TRANSACT_PATH_SIZEMAX / sizeof(WCHAR)` (`fsctl.h`): the longest path WinFsp hands a file system,
-/// in UTF-16 units. A name longer than this was never handed out, so it is never told.
-pub const MAX_PATH_UNITS: usize = 1024;
+/// Derived: the longest name the WinFsp driver passes to a file system, in UTF-16 units: a request's maximum less its
+/// fixed part and the name's terminator (`FspIopCreateRequestFunnel`, `src/sys/iop.c`). Measured live against the driver
+/// on both Windows lanes (`opens_past_a_thousand_units_are_refused_only_by_the_winfsp_driver` in
+/// `crates/cli/tests/winfsp.rs`, which asserts this value: 8,115, refused from 8,116, run 41978665514), so the name reserve
+/// follows the driver and not a guess. `FSP_FSCTL_TRANSACT_PATH_SIZEMAX`'s 1024 units limits only a response's normalized
+/// name and a relative notification, neither of which this host sends. The driver checks no length when a directory's
+/// rename lengthens the names beneath it, so a rename that would pass this is refused ([`OpenNames::rename_fits`]).
+pub const MAX_PATH_UNITS: usize =
+  (crate::inflight::REQUEST_MAX - crate::inflight::REQUEST_BASE - size_of::<u16>())
+    / size_of::<u16>();
+/// Derived: the longest name a record's 16-bit `Size` can count after its head, in UTF-16 units.
+pub const MAX_NOTIFY_UNITS: usize = ((u16::MAX as usize) - NOTIFY_INFO_HEAD) / size_of::<u16>();
 
 /// The names Windows holds open on a WinFsp mount, by the bridge's open handle: each the inode it names and the path it
 /// was opened by, as the kernel's file node is named. See the module docs for why these are what Windows can hold stale.
@@ -67,6 +77,9 @@ pub const MAX_PATH_UNITS: usize = 1024;
 pub struct OpenNames {
   /// Open handle → (inode, path from the volume's root, `\`-separated, as WinFsp names it).
   by_handle: BTreeMap<u64, (u64, String)>,
+  /// The same names in order, each with its handle, so the opens at or beneath a path are found without walking the
+  /// rest (A-212).
+  by_name: BTreeSet<(String, u64)>,
 }
 
 impl OpenNames {
@@ -77,22 +90,46 @@ impl OpenNames {
 
   /// Handle `handle` was opened on inode `ino` by `path`.
   pub fn opened(&mut self, handle: u64, ino: u64, path: &str) {
-    self.by_handle.insert(handle, (ino, path.to_owned()));
+    if let Some((_, old)) = self.by_handle.insert(handle, (ino, path.to_owned())) {
+      self.by_name.remove(&(old, handle));
+    }
+    self.by_name.insert((path.to_owned(), handle));
   }
 
   /// Handle `handle` was closed: Windows no longer holds its node through it.
   pub fn closed(&mut self, handle: u64) {
-    self.by_handle.remove(&handle);
+    if let Some((_, old)) = self.by_handle.remove(&handle) {
+      self.by_name.remove(&(old, handle));
+    }
   }
 
   /// A rename through the mount moved `from` to `to`: WinFsp renames the open node `from` and every node beneath it, so
   /// the names Windows holds under the old path are now under the new.
   pub fn renamed(&mut self, from: &str, to: &str) {
-    for (_, path) in self.by_handle.values_mut() {
+    for (handle, (_, path)) in &mut self.by_handle {
       if let Some(rest) = beneath(path, from) {
-        *path = format!("{to}{rest}");
+        let moved = format!("{to}{rest}");
+        self
+          .by_name
+          .remove(&(std::mem::replace(path, moved.clone()), *handle));
+        self.by_name.insert((moved, *handle));
       }
     }
+  }
+
+  /// Whether every name Windows holds beneath `from` stays within [`MAX_PATH_UNITS`] once `from` becomes `to`. Such a name
+  /// could not be recorded for a successor, nor opened again through the driver. Looks at each open once, and a rename
+  /// is a rare request; a rename that shortens its names need look at none.
+  pub fn rename_fits(&self, from: &str, to: &str) -> bool {
+    let grows = to
+      .encode_utf16()
+      .count()
+      .saturating_sub(from.encode_utf16().count());
+    grows == 0
+      || self.by_handle.values().all(|(_, path)| {
+        beneath(path, from).is_none()
+          || path.encode_utf16().count().saturating_add(grows) <= MAX_PATH_UNITS
+      })
   }
 
   /// How many handles Windows holds open.
@@ -105,15 +142,26 @@ impl OpenNames {
     self.by_handle.is_empty()
   }
 
-  /// One next live context for the receiver's cooperative durable rename. The owner changes one name per request
-  /// and returns its token as the cursor, so a directory rename never scans every open in a single shard turn.
-  pub fn next_open(&self, after: Option<u64>) -> Option<(u64, u64)> {
-    let bound = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
-    self
-      .by_handle
-      .range((bound, std::ops::Bound::Unbounded))
+  /// One open at or beneath `from`, for the receiver's cooperative durable rename: its context and inode. The owner
+  /// changes one name per request, after which that open is no longer beneath `from`, so the next request finds the
+  /// next; a repeat after a crash finds what is left. Opens under other names are never visited: a rename of one file
+  /// takes one shard turn and one more to learn it is done, however many opens the mount holds (A-212).
+  pub fn first_beneath(&self, from: &str) -> Option<(u64, u64)> {
+    let exact = self
+      .by_name
+      .range((from.to_owned(), 0)..)
       .next()
-      .map(|(context, (inode, _))| (*context, *inode))
+      .filter(|(name, _)| name == from);
+    // Between a name and its children sort its siblings (`\dir.txt` before `\dir\a`), so children have their own range.
+    let children = format!("{from}\\");
+    let child = self
+      .by_name
+      .range((children.clone(), 0)..)
+      .next()
+      .filter(|(name, _)| name.starts_with(&children));
+    let (_, context) = exact.or(child)?;
+    let (inode, _) = self.by_handle.get(context)?;
+    Some((*context, *inode))
   }
 
   /// Every distinct inode Windows holds open: what a round that fell behind the journal purges whole (`crate::purge`).
@@ -220,7 +268,7 @@ impl NotifyRound {
       .len()
       .checked_mul(std::mem::size_of::<u16>())
       .and_then(|name| name.checked_add(NOTIFY_INFO_HEAD))
-      .filter(|_| units.len() <= MAX_PATH_UNITS)
+      .filter(|_| units.len() <= MAX_NOTIFY_UNITS)
       .and_then(|size| u16::try_from(size).ok())
     else {
       self.too_long = self.too_long.saturating_add(1);
@@ -415,13 +463,13 @@ mod tests {
     assert_eq!(bytes.len(), 24 + 16);
   }
 
-  /// Format: `FSP_FSCTL_TRANSACT_PATH_SIZEMAX`. Do: hold open a name of 1024 units and one of 1025. Expect: the first is
-  /// told and the second left out and counted, never truncated into another name.
+  /// Format: the record's 16-bit `Size`. Do: hold open a name of [`MAX_NOTIFY_UNITS`] units and one a unit longer. Expect:
+  /// the first is told and the second left out and counted, never truncated into another name.
   #[test]
-  fn a_name_longer_than_any_winfsp_path_is_counted_not_truncated() {
+  fn a_name_longer_than_a_record_can_count_is_counted_not_truncated() {
     let mut names = OpenNames::new();
-    let longest = format!("\\{}", "x".repeat(MAX_PATH_UNITS - 1));
-    let longer = format!("\\{}", "y".repeat(MAX_PATH_UNITS));
+    let longest = format!("\\{}", "x".repeat(MAX_NOTIFY_UNITS - 1));
+    let longer = format!("\\{}", "y".repeat(MAX_NOTIFY_UNITS));
     names.opened(1, 1, &longest);
     names.opened(2, 2, &longer);
     let mut round = NotifyRound::new();
@@ -429,5 +477,89 @@ mod tests {
     assert_eq!(round.records(), 1);
     assert_eq!(round.too_long(), 1);
     assert_eq!(walk(round.bytes())[0].2, longest);
+  }
+
+  /// A-206 (2026-11-04). Do: hold open a name at the driver's limit beneath `\dir`, then ask about renames of `\dir` that
+  /// shorten it, keep its length, lengthen it by a unit, and of another directory. Expect: only the lengthening rename
+  /// of its own directory does not fit, since the driver would rename the node without a check and the ledger could not
+  /// record it.
+  #[test]
+  fn a_rename_that_would_lengthen_a_held_name_past_the_limit_does_not_fit() {
+    let mut names = OpenNames::new();
+    let held = format!("\\dir\\{}", "x".repeat(MAX_PATH_UNITS - 5));
+    assert_eq!(held.len(), MAX_PATH_UNITS);
+    names.opened(1, 1, &held);
+    assert!(names.rename_fits("\\dir", "\\di"));
+    assert!(names.rename_fits("\\dir", "\\new"));
+    assert!(!names.rename_fits("\\dir", "\\dirs"));
+    assert!(names.rename_fits("\\other", "\\others"));
+    assert!(names.rename_fits("\\dirx", "\\dirxy"), "not a component");
+  }
+
+  /// A-206. Do: hold open a name of 1,025 units, past `FSP_FSCTL_TRANSACT_PATH_SIZEMAX`. Expect: it is told, whole. Before
+  /// 2026-11-04 any name past 1,024 units was left out, so another path's change never reached its node.
+  #[test]
+  fn a_name_past_a_thousand_units_is_told() {
+    let mut names = OpenNames::new();
+    let long = format!("\\{}", "x".repeat(1024));
+    names.opened(1, 1, &long);
+    let mut round = NotifyRound::new();
+    round.add(&Invalidation::Everything, &names);
+    assert_eq!(round.records(), 1);
+    assert_eq!(round.too_long(), 0);
+    assert_eq!(walk(round.bytes())[0].2, long);
+  }
+
+  /// A-212. Do: hold a thousand opens, rename one file, and ask for each open to update until none is left, moving each
+  /// as the receiver does. Expect: one answer, for the file renamed. Before A-212 a rename took a shard turn per live
+  /// open whatever its name: 741,896 turns over 7,000 renames, about 106 each (run 41977769822).
+  #[test]
+  fn a_rename_visits_only_the_opens_it_renames() {
+    let mut names = OpenNames::new();
+    for handle in 0..1000u64 {
+      names.opened(handle, handle, &format!("\\f{handle}"));
+    }
+    let mut visits = Vec::new();
+    for _ in 0..=names.len() {
+      let Some((context, inode)) = names.first_beneath("\\f500") else {
+        break;
+      };
+      visits.push(context);
+      names.opened(context, inode, "\\moved");
+    }
+    assert_eq!(visits, vec![500]);
+  }
+
+  /// A-212. Do: hold a directory's name, its children, an alias, and siblings that share its name as a string prefix or
+  /// sort between its name and its children. Expect: every open at or beneath it is visited, and no sibling.
+  #[test]
+  fn a_directory_rename_visits_everything_beneath_it_and_no_sibling() {
+    let mut names = OpenNames::new();
+    let held = [
+      (1, "\\dir"),
+      (2, "\\dir\\a"),
+      (3, "\\dir\\b\\c"),
+      (4, "\\dir"),
+      (5, "\\dir.txt"),
+      (6, "\\dir2"),
+      (7, "\\dir!"),
+      (8, "\\di"),
+    ];
+    for (handle, path) in held {
+      names.opened(handle, handle, path);
+    }
+    let mut visits = Vec::new();
+    for _ in 0..=names.len() {
+      let Some((context, inode)) = names.first_beneath("\\dir") else {
+        break;
+      };
+      visits.push(context);
+      names.opened(context, inode, &format!("\\moved{context}"));
+    }
+    visits.sort_unstable();
+    assert_eq!(visits, vec![1, 2, 3, 4]);
+    names.closed(5);
+    assert_eq!(names.first_beneath("\\dir.txt"), None);
+    assert_eq!(names.first_beneath("\\dir2"), Some((6, 6)));
   }
 }

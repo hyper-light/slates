@@ -2881,6 +2881,16 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 > nine live CLI tests, one counted captured-request settlement and zero lost drives of twenty on both architectures.
 > The original handle and mapped view follow every successor; both renamed-view cases and all six foreign-rights
 > refusals pass. The native Windows CI lanes permanently run the bridge recovery oracles beside the CLI history.
+> **Status (2026-11-04, A-206).** A file system is deleted only after the anchor answers its release: 0 of 20 unmounts
+> left a drive held on each Windows lane, with the anchor stopped (run 41978665514). A DLL other than 2.1 is refused at
+> mount. Slates refuses no path the WinFsp driver passes: the driver refuses from 8,116 UTF-16 units, measured live on both
+> lanes, and the name reserve is derived from that limit.
+> **Status (2026-11-04, A-213).** Every refusal of the hold channel is published in the segment and shown by
+> `slates status` as `anchor_hold_refusals`, so a refusal past its kind's first log line is still seen; the Unix device
+> hold's log is bounded as the Windows hold's is.
+> The Windows anchor wakes on its hold channel's posted read and on the daemon's exit, where it parked up to 500 ms between
+> looks: five holds under a 4 s pause were answered in 3,990–4,020 ms before, on both CI lanes, and under 1 ms after
+> (runs 41984349301 and 41985213489).
 
 **Base reads on macOS and Windows.** As on Linux, the daemon reads untouched base files through its own descriptor or
 handle into evictable cache chunks (one copy, `pread`/`ReadFile` on the owner shard's driver) and
@@ -4132,8 +4142,9 @@ root-relative path as an explicit alternative; it does not report that the reque
 ```rust
 #[repr(C, align(64))] struct Slot { seq: AtomicU64, kind: u16, len: u16, payload: [u8; 44], pad: [u8; 4] }
 struct Ring { slots: [Slot; N], head: CachePadded<AtomicU64>, tail: CachePadded<AtomicU64> }
-struct ClientRegion { magic, version /* 2 */, client_id, shard: u16, cmd: Ring, cpl: Ring, wake: WakeWord, parked: AtomicU32,
-                     spin_ns: u32, spin_shift: u32, reply_stamp: AtomicU64 /* bit 63: the wake found a sleeper */ }
+struct ClientRegion { magic, version /* 3 */, client_id, shard: u16, cmd: Ring, cpl: Ring, wake: WakeWord, parked: AtomicU32,
+                     spin_ns: u32, spin_shift: u32,
+                     reply_stamp: [AtomicU64; 2] /* one per park parity; bit 63: the wake found a sleeper */ }
 ```
 Ownership: the daemon creates the region (memfd / shm_open object / pagefile section), locks it,
 and hands it to one client; the client writes only `cmd` slots and the `parked` flag; the daemon
@@ -4215,12 +4226,13 @@ a slot kind.
 
 **Wake strategy.** Client: write slot, publish `tail` (release), read `cpl` head with acquire in a
 loop for its wake estimate (seeded with `spin_ns`, the daemon-published measured wake cost, and
-refined from the client's own parks, A-31), then clear the reply stamp, set `parked = 1`, fence
+refined from the client's own parks, A-31), then clear the reply stamp slot this park names (the two
+slots alternate park by park, A-199), set `parked` to that slot's value (1 or 2), fence
 (`SeqCst`; the park protocol, A-44), re-check the reply (to close the race), and wait on the wake word
 (futex / `os_sync_wait_on_address(SHARED)` / the Event). Daemon: after writing a reply and advancing
 the wake word, fence and read `parked`; if set, advance the word once more, stamp the host clock into
-`reply_stamp` (the first reply of the park only), wake (futex wake / wake by address / `SetEvent`),
-mark the stamp confirmed when the wake reports it found a sleeper (Linux and macOS; Windows' Event
+the `reply_stamp` slot the flag's value names (the first reply of the park only), wake (futex wake / wake by address / `SetEvent`),
+mark that stamp confirmed when the wake reports it found a sleeper (Linux and macOS; Windows' Event
 cannot tell, so there a stamp inside the wait is taken unconfirmed), and, for SDK event loops, signal
 the completion fd (eventfd / pipe / socket) so `add_reader`/`uv_poll` fires. Where no descriptor can be
 shared (macOS, Windows), a client-local bridge thread makes its pipe or socket readable after every
@@ -4241,6 +4253,19 @@ drops.
 > **Status (2026-09-22, the client ring follows Little's law).** The client ring was not sized by the formula below: `slots_per_ring` reused the runtime's inbound-ring depth, `wake.p99 / syscall.median` from one boot probe, and each client's bulk area scales with it. The probe's tail is unstable (the pod image's own profile gave wake p99 from 667 ns to 511,042 ns across runs a minute apart, often from 64 samples), so three KIND pods of one image derived 16384, 8 and 256 slots and seated 1, 1285 and 41 clients; the one-seat pod refused the lane's `bootstrap` while its readiness probe held the seat, and CI's macOS runner seated two clients and refused the restart test's third. The ring is now `next_power_of_two(requests_in_flight_per_shard)`, this Little's law value (32 slots); every pod of a two-CPU fresh-cluster run logs 32 slots and 330 client seats. Owed: the admission value rests on two stated assumptions rather than measured rates. (The wake probe's two events and unconverged tail, and `spin_ns` reading the p50, were closed on 2026-09-25: §4.1's status.) Record: `docs/bugs/2026-09-22-client-ring-sized-by-the-wake-tail-not-littles-law.md`.
 
 > **Status (2026-09-25, A-31: the client learns its own wake).** A client spun for the daemon's boot mean for its whole life. It now spins for an online estimate seeded with that mean (`spin_ns`, weighted over about `2^spin_shift` wakes) and refined from its own parks: the daemon stamps the host clock into the region's `reply_stamp` before it wakes a parked client, marks it confirmed when its wake call reports a sleeper found (`futex_wake`'s count; `os_sync_wake_by_address_any` refuses `ENOENT` when none), and the client folds a confirmed stamp inside its wait into the estimate (`ClientEnd::wait`, `wake_samples`); a confirmation that lands after the woken client read the stamp is settled at its next wait. The region's layout goes to version 2 (a client of another version is refused by name, as before). Confirmation is not decoration: without it, a daemon replying the instant the parked flag rose taught the client 611–974 ns on Apple silicon against the boot probe's 2.0–3.3 µs for confirmed sleepers, because such a reply lands while the client's wait is being set up and the wait returns without sleeping. The same evidence corrects a benchmark: `ipc_bench`'s `ring_round_trip_parked_and_woken` row (ratcheted at 1,233 ns here) is mostly that race — of 2,000 parked trips per run only 2, 18, 11, 1 and 1 slept on Apple silicon and 1–3 on Linux (503–545 ns, against a confirmed-sleeper mean of 15–17 µs there); the bench now prints the count, and `docs/wip/BENCHMARKS.md` records the correction. Proven by use in `crates/ipc/tests/rings.rs` (`a_client_learns_its_wake_from_the_parks_a_reply_ended`; a client that never parked learns nothing and keeps the published window). Record: `docs/bugs/2026-09-25-wake-estimate-frozen-at-boot-and-preemptions-counted-as-long-steps.md`.
+
+> **Status (2026-11-04, A-199: a late confirmation keeps its own stamp).** The woken client can outrun its waker:
+> the daemon is preempted between its wake call and the confirmation, and the client takes its reply, sends the
+> next request and arms its next park first. With one stamp that park cleared the word, so the sample was given
+> up, and the late confirmation then set a bare confirmed bit on the cleared word, which refused the following
+> park's stamp: one late confirmation cost two samples. Measured on adacachy, 2026-11-04, the learning case pinned
+> to two busy CPUs taught 0–14 of 32 parks; in every failing run the out-of-window stamps (all zero) matched the
+> given-up ones one for one. Now the region holds two stamps, the parks alternate between them, and the parked
+> flag's value (1 or 2) names the slot; the confirmation is an exchange on the exact stamp the wake timed. One
+> daemon serves a ring in order, so by the time the client arms a slot again the reply call that stamped it has
+> returned and its confirmation is final. The region's layout goes to version 3. Interleaved, 100 runs each, the
+> learning case failed 100 of 100 before and 0 of 100 after on one CPU with two busy loops, and 89 and 0 on two
+> CPUs with four. Record: `docs/bugs/2026-11-04-a-late-wake-confirmation-cost-the-client-two-samples.md`.
 
 > **Status (2026-09-29, A-42: the idle spin is opened by client activity and ends with its window).** The
 > daemon set a shard "active" at its first client's handoff and nothing cleared it, so from then on every
@@ -4803,6 +4828,16 @@ reconnaissance because the touched partitions are named up front).
    on the owner (and in its anchor segment). The `seal_schedule` seals each volume at its derived
    cadence; a volume with policy `live-shipped` additionally ships its op log to f+1 of its
    candidates and is acknowledged at f+1.
+
+> **Status (2026-11-04, a commit returns at its quorum).** Every quorum dispatch (record commits, ledger promotions,
+> group rounds, content puts) is collected by a loop that is woken by each reply, not only by its poll: a dispatch
+> task sends its reply and wakes the collector (`ReplyTx`, `DispatchWait::keep_waiting` in `crates/cluster/src/lib.rs`).
+> Before, the collector slept a whole poll after its quorum had answered. Measured over real loopback endpoints with
+> the daemon's derived runtime (`replication_bench`, five interleaved rounds at load 36–42): a record commit at f=1
+> took 10,125–10,194 µs at the median at the daemon's 10 ms poll, and takes 18.9–19.9 µs (p99 28.8–32.9 µs) now,
+> about one and a half 12 µs round trips. Record: `docs/bugs/2026-11-04-a-quorum-collector-waited-out-its-poll.md`.
+> Still owed for per-write replication: live shipping itself (§4.10) and the 100 ms record period a head waits for
+> before its commit begins.
 
 
 > **Consensus enhancements: the explorer and leadership transfer (2026-09-28;
@@ -8303,8 +8338,9 @@ ship.
    and landing containment; the tracer run for hermeticity across the whole matrix; power-fail
    landings on real machines (dm-flakey on Linux, a pulled RAM VHD on Windows, a forced restart
    on macOS) checked against the oracle.
-5. Release engineering: the nine-target release, npm and PyPI publishing, plugin package, docs
-   (user docs short in `docs/`, this design and the specs in `docs/wip` promoted).
+5. Release engineering: the seven-target binary release (B.2, A-210; built, smoke-tested and attached to a draft
+   by `release.yml` since 2026-11-04), npm and PyPI publishing, plugin package, docs (user docs short in `docs/`,
+   this design and the specs in `docs/wip` promoted).
 6. The gap ledger reconciled: every open item either closed or carried with an owner.
 
 **Acceptance criteria.**
@@ -8622,21 +8658,27 @@ Evidence: `research/survey-vorpal.md` §0–§9.
   an ABI contract is version-specific, each with a comment saying why; heavy optional features
   documented as "NEVER a default". [C: vorpal crates/ann/Cargo.toml:20-28, crates/index/Cargo.toml:58-61]
 
-### B.2 Target matrix and release recipes (identical to vorpal's)
+### B.2 Target matrix and release recipes (from vorpal's, amended by A-210)
+
+> **Status (2026-11-04, A-210).** `.github/workflows/release.yml` builds the seven targets below natively, smoke-tests
+> each built binary on its own runner (`cargo run -p xtask --bin release -- smoke`), and attaches the binaries, `SHA256SUMS`,
+> `slates-provenance.json` and a Sigstore attestation bundle to a **draft** release. Publishing the draft is the
+> maintainer's one approved step (`docs/publish.md`, "The binary release"). The proof by use on a test tag is recorded
+> in A-210: test tag `v0.1.0-test.1`, run 41983664060, a draft with all seven binaries whose checksums and attestation
+> verify. Reproducibility from the tag (AC-9.5's first clause) is not yet shown: no lane builds twice and compares.
 
 | target | runner | asset name |
 |---|---|---|
 | `aarch64-apple-darwin` | macos-latest | `slates-macos-arm64` |
-| `x86_64-apple-darwin` | macos-latest (cross via `--target`) | `slates-macos-x64` |
 | `x86_64-unknown-linux-gnu` | ubuntu-latest | `slates-linux-x64` |
 | `aarch64-unknown-linux-gnu` | ubuntu-24.04-arm | `slates-linux-arm64` |
-| `x86_64-unknown-linux-musl` | ubuntu-latest, `rust:1.98-alpine` container | `slates-linux-x64-musl` |
-| `aarch64-unknown-linux-musl` | ubuntu-24.04-arm, `rust:1.98-alpine` container | `slates-linux-arm64-musl` |
-| `x86_64-pc-windows-msvc` | windows-latest | `slates-windows-x64.exe` |
-| `aarch64-pc-windows-msvc` | windows-latest (cross via `--target`) | `slates-windows-arm64.exe` |
-| `i686-pc-windows-msvc` | windows-latest (cross via `--target`) | `slates-windows-x86.exe` |
+| `x86_64-unknown-linux-musl` | ubuntu-latest, `rust:1.98.1-alpine` container | `slates-linux-x64-musl` |
+| `aarch64-unknown-linux-musl` | ubuntu-24.04-arm, `rust:1.98.1-alpine` container | `slates-linux-arm64-musl` |
+| `x86_64-pc-windows-msvc` | windows-2025 | `slates-windows-x64.exe` |
+| `aarch64-pc-windows-msvc` | windows-11-arm (native) | `slates-windows-arm64.exe` |
 
-[C: vorpal .github/workflows/release.yml:64-74]
+[C: vorpal .github/workflows/release.yml:64-74; Mac Intel and i686 dropped 2026-10-20 (`eca9423f`); arm64 Windows
+native since GitHub's `windows-11-arm` image (actions/runner-images#14592)]
 
 Recipes to copy verbatim:
 - One raw binary per platform attached to the GitHub release, no archive; `cargo-binstall`
@@ -8650,10 +8692,20 @@ Recipes to copy verbatim:
 - cdylib bindings for musl are built with `-C target-feature=-crt-static` because `+crt-static`
   is rejected for a cdylib; the container is launched with `docker run`, not `container:`, so
   checkout/upload stay on the host. [C: publish-node.yml:60-66]
-- A `guard` job asserts the git tag equals the workspace version. [C: release.yml:40-45]
-- `cargo xtask release-artifacts` writes `SHA256SUMS`, a provenance JSON (git commit, rustc
-  version, per-file sha256, blake3, size), and an ed25519 signature when a CI-secret key is
-  present. [C: xtask/src/main.rs:79-160]
+- A `guard` job asserts the git tag equals the workspace version, or names a test of the lane
+  (`v<version>-test.N`, accepted by the release lane alone; A-210). [C: release.yml:40-45]
+- Windows binaries link the C runtime statically (`+crt-static`), and the x86_64 one must start in a
+  process-isolated Nano Server container, which has no Visual C++ runtime (A-210).
+- The release smoke task (`cargo run -p xtask --bin release -- smoke`) runs each built binary on its own runner before it may ship: version,
+  anchor and daemon start, bootstrap, a volume provisioned, a file written and read by one MCP
+  client and read by a second client, the volume destroyed, the daemon gone with its anchor. It
+  records the digests of the bytes it ran (A-210).
+- The release artifacts task (`cargo run -p xtask --bin release -- artifacts`) refuses a release missing a target or carrying bytes no smoke
+  test ran, and writes `SHA256SUMS` and a provenance JSON (tag, commit, run, and per target the
+  sha256, blake3, size, rustc version, runner image and smoke timings). The signature is GitHub's
+  artifact attestation, keyless through Sigstore with the job's OIDC identity, not an ed25519 key
+  held as a CI secret (A-210). [C: xtask/src/main.rs:79-160, amended]
+- The lane never publishes: it creates a draft release, and a maintainer publishes it (A-210).
 - Weekly scheduled audit re-verifies vendored sources against pinned upstream commits and opens
   one tracking issue on drift; it never edits the tree. [C: grammar-audit.yml:1-13]
 
@@ -11489,7 +11541,7 @@ Applied in the same change to:
   `an_idle_purge_resumes_across_calls_and_leaves_freed_bytes_zero` (`crates/mem/src/arena.rs`);
 - BENCHMARKS, GAPS.
 
-Status: built 2026-10-06, Linux. macOS and Windows keep their pages (owed below).
+Status: built 2026-10-06, Linux; macOS by A-110, Windows by A-205.
 - What: A-99's zero-on-free is unchanged. A released block is zeroed in place at once, so its plaintext is gone,
   and its pages stay resident for the allocations that follow. The arena counts those zeroed free bytes.
   - At a reap tick (`LIVENESS_BUDGET_NS`), a shard whose content arena allocated nothing since the previous tick gives
@@ -11515,8 +11567,7 @@ Status: built 2026-10-06, Linux. macOS and Windows keep their pages (owed below)
   back.
 - Owed:
   - macOS: built by A-110 (2026-10-06).
-  - Windows: `DiscardVirtualMemory` leaves the contents undefined, so it needs its own zeroing step and a
-    measurement.
+  - Windows: built by A-205 (2026-11-04): `DiscardVirtualMemory`, with its zeroing step at reuse, measured.
 
 ### A-106 — Extended attributes through the Linux mount (2026-10-06)
 Applied in the same change to:
@@ -11668,7 +11719,7 @@ Applied in the same change to:
   - `a_deleted_files_memory_goes_back_to_the_os`, now macOS too, on one shard;
 - `unsafe-budget.toml` (+4), A-105's owed list, GAPS, BENCHMARKS.
 
-Status: built 2026-10-06. Windows remains owed (A-105).
+Status: built 2026-10-06. Windows was owed (A-105) and is built by A-205.
 - What: the A-105 idle purge on macOS marks freed pages `MADV_FREE_REUSABLE`.
   - The footprint (what memory pressure and jetsam count) drops at once.
   - The kernel may take the pages without paging them; a taken page reads zeros, as the zeroed block did.
@@ -11913,8 +11964,8 @@ Applied in the same change to:
 - the test `recovery_memory_no_restart_reads_goes_back_and_a_restart_recovers_every_file`
   (`crates/server/tests/recovery.rs`), `docs/wip/bench/mem/per_entry.sh` (an idle reading), BENCHMARKS.
 
-Status: built 2026-10-08 (Linux by hole punch; macOS by the reusable mark since the same day, below; Windows keeps the
-pages, its content object having no page to give back yet, `SparseObject::discard`).
+Status: built 2026-10-08 (Linux by hole punch; macOS by the reusable mark since the same day, below; Windows by
+`DiscardVirtualMemory` since 2026-11-04, A-205).
 - macOS (same day): the content object's discard marks the pages `MADV_FREE_REUSABLE`, as the arena's does (A-110),
   and records them; every write clears the mark first (`MADV_FREE_REUSE`), since a marked page that is written stays
   out of the footprint and the kernel's to take. The record starts as the whole object at creation and at opening:
@@ -12856,6 +12907,256 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
   surface is owed, §4.13); the lab's container node therefore stops at the presentation.
 Applied in the same change to: §4.16 (status), GAPS (top blockquote).
 
+### A-211 — A DAX ask is refused where no view could begin (accepted and built 2026-11-04)
+Applied in the same change to: §4.6 by reference, `docs/wip/shards/dax-protocol.md` ("Windows"), GAPS,
+`crates/bridge-core/src/dax_backing.rs` (`DaxBackingSession::ask`), `crates/server/src/shards/dax.rs` (`MALFORMED`'s
+doc), `crates/client/tests/shards.rs`, `crates/server/tests/shards.rs`, `docs/wip/shards-patches/`.
+- **What was there.** An ask's range was checked against the object's end alone. So an offset that no view of a section can
+  begin at was committed, filled and handed, and the VMM's map then failed. Measured on jupiter (Windows 10.0.26200,
+  2026-11-04): an ask from offset 1 was answered with a section, `Ok(932)`.
+- **The rule.** A ranged ask's offset is a multiple of `Facts::allocation_granularity()`: 64 KiB on Windows, the page
+  elsewhere. Anything else is `Refused::Malformed` (`EINVAL`, counted `shards.dax_malformed`) before anything is made or
+  filled. One check on every platform; a Linux guest asks whole 2 MiB ranges, so it never meets the refusal.
+- **Proven.** `a_slice_is_handed_from_each_granule_and_refused_between_them` (`crates/client/tests/shards.rs`,
+  T-shards-windows-5.6) failed first as above. With the rule, each of a range's 32 granules is answered and a view placed
+  from it holds the file's bytes then zeros, and 4 offsets between granules are refused and counted; the suite 12 of 12 in
+  each of 3 runs on jupiter and once on windows-2025 (CI run 41981896876). `malformed_asks_are_refused` (`crates/server/tests/shards.rs`)
+  holds Unix's route to the same refusal: the suite passes on Ubuntu (22) and macOS (26), the same run.
+
+### A-213 — The anchor's hold refusals: a bounded log on every platform, and a count the operator reads in `slates status` (accepted 2026-11-04, siblings of audit step 3)
+Applied in the same change to: GAPS, A-198's status in §4.6, BENCHMARKS (the Windows wake's part), `unsafe-budget.toml`
+(anchor 10 → 14, the Windows wake's part), `crates/anchor` (`handles.rs` `RefusalLog` generic, `held_windows.rs` the
+posted read, `supervise_windows.rs` and `supervise.rs` the Windows wait,
+`supervise.rs` the device hold's log and the published count, `layout.rs` and `segment.rs` the new supervision word),
+`crates/ipc` (`DaemonReport::anchor_hold_refusals`, appended), `crates/server` (`verbs.rs`, the daemon report),
+`crates/cli` (`slates status`'s line; `anchor.rs` the Windows loop's wait; `examples/hold_latency_ab.rs`), `crates/mcp`
+(the daemon status JSON). Bug record:
+`docs/bugs/2026-11-04-the-unix-device-hold-logged-every-refusal.md`.
+- **The Unix device hold's log is bounded.** A-61's hold counted each refused device message and logged a line for each.
+  It now logs through the same `RefusalLog` as A-198's Windows hold: each distinct refusal once over the anchor's life,
+  in a table of 64, every refusal counted. Logging on a change of kind was rejected for the Windows hold on a
+  measurement (two kinds alternating log a line a message), and the reason holds here.
+- **The count reaches the operator.** With the log saying each kind once, the count is the only record of the rest. The
+  anchor has no surface of its own: an operator asks the daemon (`slates status`), and the daemon knows its anchor
+  through the segment's supervision block. So the block gains one word, `SUP_HOLD_REFUSALS`, at offset 192, the first
+  cache line past the sealing root. The supervisor writes every refusal its hold channel has counted (the Unix device
+  hold's, or the Windows hold's channel and holdings) there in each step, when the count has moved. The daemon copies it
+  into its status report as `anchor_hold_refusals`, which `slates status`, its `--json` and the MCP daemon status print.
+  A block an older anchor wrote holds zero there.
+- **Rejected:** a status surface on the anchor itself (a second rendezvous and a second protocol for one number), and the
+  daemon counting refusals it caused (it cannot see what the anchor refused).
+- **The Windows anchor wakes on its hold channel (2026-11-04, the sibling of A-206's record).** The Windows loop parked
+  between supervision steps, up to half the liveness budget (500 ms), and looked at the channel only then, so each WinFsp
+  mount's hold and each unmount's release waited up to that long on a healthy anchor; the Unix loop polls its channel.
+  The anchor's end now keeps one read posted (`held_windows::ReadingEnd`): the drain takes messages through it, and
+  `Supervisor::await_work` waits on its event and on the daemon's process handle together, with the step's pause as the
+  timeout, so a hold is answered when it arrives and a daemon's exit is seen when it happens. The read lives in a box of
+  its own, its `OVERLAPPED` and buffer fixed in place while the kernel may write them, and the end's drop cancels it and
+  waits for it to settle; a successor's new channel drops the old end that way, and with it an unread message, as before.
+  While a reply waits for the daemon to read its last one, the loop waits out its step instead: a message already taken
+  behind it would signal at once, and a daemon that never reads could spin the anchor. Held by
+  `a_hold_is_answered_at_its_channels_wake_not_at_the_supervisors_pause` (`crates/anchor/tests/handles_windows.rs`):
+  five holds through the real supervisor under a 4 s pause. Measured in BENCHMARKS ("What a WinFsp mount and unmount wait
+  for the Windows anchor").
+
+### A-210 — The binary release: seven native targets, each smoke-tested where it was built, attached with checksums and keyless provenance to a draft (accepted 2026-11-04)
+Applied in the same change to: Appendix B.2 (body and status), Phase 9 task 5's status, GAPS (the release row and
+"The Windows binary needs the Visual C++ runtime"), `docs/publish.md`, `.github/workflows/release.yml`,
+`version-guard.yml`, `publish-python.yml`, `publish-node.yml`, `xtask/src/release.rs` and `version.rs`, and
+`crates/cli` (`slates version`).
+- **Why.** `release.yml` had never run (no tag existed, GAPS 2026-10-21): it built the whole workspace for seven
+  triples and attached nothing. Three targets had never been built whole, arm64 Windows was cross-compiled on an
+  x86_64 runner, and the Windows binaries needed a Visual C++ runtime Nano Server lacks.
+- **Natively, per target.** Each target builds on a runner of its own architecture and system (table above), so the
+  binary that ships is also the binary that ran there. Only `-p slates-cli` is built: the binary asks for the codec
+  probe itself (GAPS 2026-10-20), so the product is the same however it is built.
+- **Run before shipped.** The release smoke task (`cargo run -p xtask --bin release -- smoke`) drives the built bytes as a fresh-machine install would
+  (Phase 9's install test, without the attach and tool run, which need a mount bridge not every runner has). The
+  write and the read go through one MCP client, because a `slates attach` and a `slates write` made by two processes
+  race the reaper (GAPS, "A CLI attachment ends about a second after the `slates attach` that made it").
+- **Only tested bytes ship.** The smoke test digests the binary it ran. `release-artifacts` refuses a binary whose
+  SHA-256 differs from its record, and a release missing any target. A partial release cannot be made.
+- **Provenance without a secret.** The ed25519 key B.2 first named would be a secret someone must create and
+  guard. GitHub's artifact attestation signs SLSA build provenance through Sigstore with the job's OIDC identity, and
+  anyone can check it with `gh attestation verify`. `slates-provenance.json` records what the attestation does not:
+  the runner image, the toolchain and the smoke test's steps.
+- **A draft, never a publication.** The lane's last step creates a draft. Publishing it is a maintainer's act, as a
+  landing is a grant's (R10): `gh release edit <tag> --draft=false`.
+- **A test of the lane.** A tag `v<version>-test.N` runs the whole lane on the real code and makes a draft
+  pre-release titled as a test. The SDK publish lanes exclude such tags in their triggers, and their guard refuses
+  them, so a test publishes nothing anywhere.
+- **Proof by use (2026-11-05).** Each binary's smoke steps on its own runner, in ms: version, start to serving,
+  steady answers, bootstrap, provision, the MCP attach–write–read, the second client's read, destroy, departure.
+  - Run 41982329895 (`diag-release-3`, the lane's build matrix without macOS):
+
+    | asset | steps (ms) |
+    |---|---|
+    | `slates-linux-x64` | 20, 326, 387, 20, 20, 24, 20, 20, 27 |
+    | `slates-linux-arm64` | 20, 275, 385, 20, 20, 22, 20, 20, 25 |
+    | `slates-linux-x64-musl` | 20, 340, 387, 20, 20, 22, 20, 20, 26 |
+    | `slates-linux-arm64-musl` | 20, 290, 385, 20, 20, 22, 20, 20, 25 |
+    | `slates-windows-x64.exe` | 25, 1064, 427, 42, 22, 61, 23, 22, 24 |
+    | `slates-windows-arm64.exe` | 35, 590, 414, 26, 25, 41, 26, 26, 27 |
+
+    The Linux rows are from run 41980547276, whose Linux jobs passed and whose Windows jobs failed; they passed again
+    in 41982329895. `ldd` answered "statically linked" (x86_64 musl) and "not a dynamic executable" (arm64 musl), and
+    `slates version` answered `slates 0.1.0` in a process-isolated `nanoserver:ltsc2025`.
+  - macOS arm64 ran on the supervisor's Mac (M5 Max, 2026-11-04, load 12–24): 10 of 10 smoke runs of the release
+    binary passed, start to serving 1.7–2.1 s, provision 184–192 ms, the MCP round trip 213–231 ms. The per-verb cost
+    there (about 200 ms against CI Linux's 20 ms) is the launch of each `slates` process on macOS; it is not measured
+    further here.
+  - **End to end on the test tag `v0.1.0-test.1`** (commit 50bf1a99, run 41983664060, 2026-11-05): guard, the seven
+    builds and the draft release job all passed, and macOS ran on CI too (`macos26` image 20261102.0473.1; steps 28,
+    830, 2030, 162, 81, 132, 98, 172, 87 ms). The draft "TEST v0.1.0-test.1 — test 1 of the release lane, not a
+    release" (draft, pre-release) carries the seven binaries (10,678,272–17,681,808 bytes), `SHA256SUMS`,
+    `slates-provenance.json` and `slates-attestation.sigstore.json`. Downloaded with `gh release download`:
+    - `shasum -a 256 -c SHA256SUMS` answered OK for all seven, and the macOS binary answered `slates 0.1.0`.
+    - `gh attestation verify <file> --repo hyper-light/slates` exited 0, online and with `--bundle`. It verified an
+      SLSA v1 provenance over seven subjects, signed by `release.yml@refs/tags/v0.1.0-test.1` at 50bf1a99.
+    - The same check of a copy with one byte appended exited 1.
+    - The SDK publish lanes did not start on the tag.
+  - This is the first run of the CLI's anchor, volume and MCP path on Windows: `crates/cli/tests/cli.rs` is
+    `cfg(unix)`.
+  - The first Windows run (41980547276) failed in the lane's own tooling. The `xtask` binary does not build on
+    Windows (12 errors: its conformance and KIND tasks use `rustix` and `std::os::unix`), so the release tasks became
+    their own binary, `cargo run -p xtask --bin release`.
+  - The smoke test's own first version stopped reading the anchor's stderr after the serving line, and 8 of 10 runs
+    on this Mac aborted the anchor (the GAPS entry: an anchor whose stderr closes aborts). Fixed in the harness: 10 of
+    10 after.
+- **Not yet.** Reproducibility from the tag (AC-9.5): no lane builds twice and compares. The macOS `Slates.app` bundle
+  (B.7), code signing and notarization (they need Ada's Apple Developer identity). `cargo-binstall` metadata.
+
+### A-206 — A WinFsp file system is deleted only after the anchor releases its hold, the DLL's version is checked, and slates refuses no path the driver passes (accepted 2026-11-04, audit plan 01a1a34bf7e973069e94f773afdea44a, steps 4 and 6)
+Applied in the same change to: GAPS (the audit entry), §4.6's status through A-198's corrections, `docs/wip/platforms.md`,
+`crates/server` (`winfsp.rs`, `anchor_hold_windows.rs`, `verbs.rs`), `crates/client` (`defers_reply`),
+`crates/bridge-winfsp` (`dll_version.rs`, `opens/names.rs`, `notify.rs`, `inflight.rs`, `host.rs`, `ffi.rs`),
+`crates/cli/tests/winfsp.rs`, `.github/workflows/ci.yml` (WinFsp pinned by hash) and `unsafe-budget.toml` (bridge 130 → 131).
+Measurements and run ids are in the GAPS entry.
+- **A release the anchor does not answer.** The file system is deleted only after the anchor has answered the release.
+  Bug record: `docs/bugs/2026-11-04-a-refused-hold-release-left-a-drive-held.md`.
+  - The hold channel outlives a missed deadline: the pipe goes back for the next exchange, whose read passes over any
+    answer that is not its own. Before, the deadline's pass closed the daemon's only pipe, and every later hold and
+    release was refused for that daemon's life. That deadline was also the clock's reading plus the budget given to a
+    wait that takes a span, so it lasted the daemon's uptime.
+  - A hold waits at most the recovery budget plus the liveness budget (2 s), which covers the anchor's own wait of at
+    most half the liveness budget between looks at the channel. A release attempt waits the liveness budget (1 s).
+  - A `detach` asks while the mount serves on and repeats for the same 2 s. An answer ends the attachment and the mount.
+    Past it the detach answers `TargetUnavailable` and the drive stays served and held. The request stands, because it
+    may already be in the pipe for the anchor's next turn, so the drive goes when the anchor answers. A killed daemon
+    in that window has its attachment adopted if the anchor still holds it, and ended if not.
+  - A destroy, a revocation, a refused adoption and a lost mount have ended the attachment already, so the mount stops
+    serving and waits for the same answer before deleting. A refused mount-time hold answers its typed refusal first, then
+    the same; the objects its message names stay open until the answer, and nothing stays mounted after it.
+  - The wait has no bound in time, since an anchor that never answers leaves nothing safe to delete. It holds one task
+    and one message per mount, and ends at the answer or the shard's stop. An anchor's death takes the daemon by its job.
+- **The DLL's version is checked.** The receiver writes `FSP_FILE_SYSTEM` fields and calls its operation table by offset,
+  so a mount refuses any DLL whose `FspVersion` is not 2.1, before it touches that object, with the number in the refusal
+  (`crates/bridge-winfsp/src/dll_version.rs`). The earlier guard read `FSP_FILE_SYSTEM.Version`, which v2.1 always zeroes.
+  A new WinFsp minor version therefore refuses every mount until the layout is reviewed and the constant raised, so CI
+  installs WinFsp from an exact release URL checked against its SHA-256. Bug record:
+  `docs/bugs/2026-11-04-the-winfsp-guard-read-a-field-winfsp-always-zeroes.md`.
+- **Slates refuses no path the driver passes.** The goal's first wording, no refusal up to 32,767 units, was restated by the
+  supervisor on 2026-11-04, because the driver itself refuses a request past `FSP_FSCTL_TRANSACT_REQ_SIZEMAX`.
+  Bug record: `docs/bugs/2026-11-04-a-winfsp-open-past-1024-units-was-refused.md`.
+  - A record's cap, `notify::MAX_PATH_UNITS` (8,115 units), is derived from what the driver passes and held equal, live, to
+    the limit a test measures on the driver: it refuses from 8,116 units on `windows-latest` and `windows-11-arm`, with
+    `os error 87` (run 41978665514). At `MAX_OPEN_HANDLES` the reserve is 2,133,147,696 bytes of a `SEC_RESERVE` section per
+    mount, made in about 2.2 ms for 4,166,312 bytes of paged pool (jupiter, 3 of 3).
+  - Windows commits by the 64 KiB granule, so a record keeps its first 1,024 units in place and the rest in a second
+    region: a short path commits what it did.
+  - The driver checks no length when a directory's rename lengthens the names beneath it (`FspFileNodeRename`), so a
+    rename that would take a held name past the cap is refused `STATUS_NAME_TOO_LONG` before it has any effect.
+
+### A-205 — Windows gives freed content pages back: `DiscardVirtualMemory`, cleared before reuse (2026-11-04)
+Applied in the same change to:
+- `crates/mem/src/region.rs` (`os::discard_slice`, `os::reuse_slice` and the mark's three constants on Windows;
+  `Region::prepare` widens only where clearing keeps the bytes);
+- `crates/mem/src/shared.rs` (the Windows `Inner::discard`, over committed runs; `Commits` knows the page);
+- `crates/machine/src/facts.rs` (`Facts::resident_now` on Windows, the working set);
+- the tests `crates/mem/tests/give_back.rs` and `crates/server/tests/give_back.rs`, and the bench
+  `crates/mem/examples/give_back_bench.rs`;
+- `unsafe-budget.toml` (mem +2, machine +2), the Windows CI lanes, A-105, A-110, A-117, GAPS, BENCHMARKS.
+
+Status: built 2026-11-04. It closes the Windows owed items of A-105, A-110 and A-117.
+- What: at the idle purge a freed block's pages and the recovery memory no restart reads go back through
+  `DiscardVirtualMemory`. They leave the working set at once, and their contents are dropped rather than paged out
+  (Microsoft's documentation of the call; the working set is what is measured here).
+- Why this call, measured on jupiter over a 256 MiB pagefile section, committed `SEC_RESERVE` and plain alike
+  (a scratch probe, 2026-11-04, the working set before and after):
+  - `DiscardVirtualMemory`: 260 to 4 MiB, in one call that answers success.
+  - `MEM_RESET` alone: 260 to 260 MiB. It only spares the pages a write to the paging file until the OS wants them.
+  - `MEM_RESET` then `VirtualUnlock`: 260 to 4 MiB, but the unlock answers `ERROR_NOT_LOCKED` when it works, so its
+    failure and its success look alike.
+  - `VirtualUnlock` alone: 260 to 4 MiB, but the pages stay dirty, so the OS would page out bytes nobody will read
+    (from the documentation of the working set; not measured here).
+- What does not change: the section's commit. Windows has no decommit for a view of a section, so the commit limit
+  keeps the charge; what goes back is the RAM. The daemon's working set is what this amendment answers for.
+- The arena (`Region`), on the macOS model:
+  - The contents of a discarded page are undefined until it is written (Microsoft's documentation of the call), so its
+    range is recorded and [`Region::prepare`] writes zeros over its recorded pages before the block is handed out. A
+    mapped shared region's record starts whole, because a discard's effect is on the object's pages, and a range an
+    earlier daemon or another shard gave back may carry it.
+  - Clearing writes bytes here, so it never widens past the block as macOS's does: a recorded neighbour may be a block
+    a recovery has yet to claim, and clearing costs no system call to save.
+  - A recovery's claim forgets the record, by A-110's argument: an image names only blocks live at its commit.
+- The content object (`SparseObject`): no record.
+  - A written page simply keeps what was written, and every reader there reads only what was written after the discard
+    (A-117's rule), so a write clears nothing. Zeroing there would destroy the bytes around the write, since a word of
+    the record spans live bytes.
+  - It discards only granules this process committed. The call refuses a range holding a reserved page, and committing
+    a dead range to discard it would charge the commit limit for nothing. A granule only another process committed has
+    no page in this working set.
+- Cost, a first write: writing zeros over a block makes all of it resident on its first allocation, where before only
+  the pages written were. BENCHMARKS prices a never-used block's clear at 1.5–9% best against best; a tiny file's tail pages
+  count until its block is next purged or reused.
+- Proven (BENCHMARKS, "What a write costs on pages given back on Windows") on jupiter and on CI's two Windows
+  architectures, and red-checked there. The working set alone cannot credit the purge: with every discard refused it
+  still fell 25% and 69% over 120 s, Windows trimming it unasked, though 0% in the first 5 s and 0 bytes by the daemon's
+  count. A write on pages given back cost 14–20% less than on never-used pages on the runners.
+- A held section's adoption (the audit's plan step 5) was checked in the same change. The audit said a refused view
+  leaked the handle. It did not: `view` closed it. 200 refused adoptions moved the handle count by 0 on unchanged code,
+  and by 200 with that close removed (`crates/mem/tests/held_section.rs`). The adoption now maps first and takes
+  ownership only of a view that exists, so `view` no longer closes what it was lent.
+
+### A-212 — What a live WinFsp receive reads and clears, and what a rename visits (2026-11-05)
+
+A-198's receiver replaced WinFsp's DLL dispatcher with no benchmark. Measured against it (`docs/wip/BENCHMARKS.md`, "The
+WinFsp receiver against the DLL dispatcher"), every call that reached the daemon cost more: on arm64 a stat 2.55×, a
+rename 2.90×, an fsync 1.74× at the quiet p50, the arms' five runs not overlapping. Each phase of a request was timed on
+both architectures (diagnostics run 41977769822). The ledger's own work costs at most about 1.5 µs of service a request.
+The largest costs were two things A-198's first form did that its crash rules do not need:
+
+- **Every live receive read and cleared the whole buffer.** The batch parser checked each byte of the 64 KiB tail, 26.4 µs
+  at the p50 on arm64 and 50.1 µs on x86_64, per receive. The driver reports how many bytes it wrote, and everything past
+  them was zeroed before the receive began. So a live receive reads only the reported bytes. **Recovery still checks the
+  whole buffer**: it knows no count, and it is what the tail's rule protects. Clearing follows the same reasoning: an
+  owner's first receive clears the whole buffer, since a predecessor may have died part-way; afterwards only the bytes the
+  last batch filled are cleared, so the whole-buffer check still finds zeros after a crash. Of the saved response only the
+  header is cleared: its state word says whether a body exists, and no reader passes a body's own length.
+- **Every rename visited every live open.** Before the kernel may rename its node, each open's held name is updated, one
+  per shard turn: 741,896 turns over 7,000 renames on arm64, about 106 each, for opens under other names that a rename
+  cannot change. `OpenNames` now also keeps its names in order, so the first open at or beneath a path is found without a
+  walk and no constant bounds a scan. Updating an open moves it out from beneath the old path, so the next turn finds the
+  next, and a repeat after a crash finds what is left. A rename of one file takes one turn for its open and one to learn
+  it is done, however many opens the mount holds. A rename onto itself moves nothing and returns at once.
+
+Each worker also reuses one completion event: control transactions run one at a time, and creating and closing an event
+for each cost 0.9 µs at the p50 twice a request.
+
+**Not changed: a response and the next receive stay two calls.** The DLL carried both in one call. A-198 keeps them apart
+so that captured requests settle before any new receive, which is what stops a reused IRP address naming another
+processing request after a death. The separate response call costs 10.9 µs at the p50 on arm64 and 12.5 µs on x86_64;
+removing it means changing that crash rule, which this amendment does not do.
+
+**Result (2026-11-05, five interleaved runs on both Windows runners, run 41989009852).** Most of the regression is gone (arm64
+quiet p50: a stat 1.50×, a rename 1.35×, an fsync 1.21×), but the receiver stays worse beyond the spread at the p50, by about
+20 µs a request, on both architectures. Open: that remainder, of which the response call explains 11–13 µs; hops for Open and
+Release about 2× the DLL arm's on arm64, and SetSize about 4× under load, which accounts for an arm64 write under load at
+2.09×. A longer shard spin did not change them (run 41989038309), and they are not explained.
+
+Applied in the same change to: GAPS (the audit entry's unmeasured-receiver item); `crates/bridge-winfsp/src/dispatcher.rs`,
+`inflight/capture.rs`, `purge_intents.rs`, `notify.rs` and `host.rs`.
+
 ### A-198 — A WinFsp mount outlives its daemon: the anchor holds the volume's control handle, the drive's link and the mount's ledger, and the next daemon serves the held volume (accepted 2026-11-01, Step 9 of the VFS and DAX plan; built and measured 2026-11-02)
 Applied in the same change to: GAPS (gap 2 of the platform inventory). The build applies it to §4.6 "Windows",
 `docs/wip/platforms.md`, `crates/anchor`, `crates/server` and `crates/bridge-winfsp`, each in its own change.
@@ -12886,6 +13187,15 @@ and failed-then-passing oracles distinguish those results from the initial sourc
     the old six-site job-assignment implementation is replaced by IPC's existing creation-time job attribute).
   - The live WinFsp hold is now wired (Step 9.3 below). The transport tests alone establish no live-mount,
     in-flight-request or second-daemon criterion.
+- **What a daemon sends never ends supervision (2026-11-05, audit step 3).** A message the hold channel refuses, or a
+  reply it cannot write, is counted in `Supervisor::handle_refusals` and dropped, and the holdings are untouched, as the
+  Unix device hold counts its refusals. `Supervisor::step` can no longer fail on the channel. A message of no bytes is a
+  short message, not "nothing waited"; a long one is malformed, and its remainder is refused too. The log says each
+  distinct refusal once (`handles::RefusalLog`, a table of 64), since logging on a change of kind still grows without
+  bound when two kinds alternate. Held by `crates/anchor/tests/handles_windows.rs`: 20 bad messages between two real
+  holds give 0 anchor exits, 20 refusals, 2 log lines and both holds inherited live, on CI's Windows x86_64 and arm64
+  (run 41976042550; red on the old sources in run 41974533851). A live drive is not sent bad messages, since only the
+  daemon reaches the channel. Record: `docs/bugs/2026-11-03-one-malformed-hold-message-ended-the-windows-anchor.md`.
 - **Live mount wiring (2026-11-02, Step 9.3).** The server awaits the anchor's `Held` before committing a WinFsp
   attachment, and its normal detach awaits `Released` before deleting the file system. The mount owns its temporary
   DOS link directly. A successor retains a matching attachment, substitutes the inherited control handle and volume
@@ -12926,7 +13236,8 @@ and failed-then-passing oracles distinguish those results from the initial sourc
      serves.
 
   A detach, a destroy or a stop releases all three before the file system is deleted, so a mount that ends still loses
-  its volume and its drive at once.
+  its volume and its drive at once. **Corrected by A-206 (2026-11-04):** this sentence was not true of a release the
+  anchor refused or did not answer.
 - **The drive is the daemon's own.** The daemon defines the drive letter itself, as `FspMountSet_Drive` does: it calls
   `DefineDosDeviceW` with `DDD_RAW_TARGET_PATH`, opens the link with `DELETE`, makes it temporary and keeps its handle.
   It no longer calls `FspFileSystemSetMountPoint`, so the handle is the daemon's to duplicate. A successful mount
@@ -13007,6 +13318,7 @@ and failed-then-passing oracles distinguish those results from the initial sourc
   from the file's current namespace home. Each slot has two generation-checked UTF-16 name versions with CRC32C,
   published one complete version at a time. The unnamed sparse section reserves the admitted open/path caps and
   commits touched ranges only. Recovery seeds one context per owner turn from these records.
+  **Corrected by A-206 (2026-11-04):** a record's cap is the longest name the WinFsp driver passes, not 1,024 units.
   - Every WinFsp cache hangs off an open file node, including the Cache Manager's own file-object reference
     (`bridge-winfsp/src/notify.rs` and WinFsp's `FspFileNodeInvalidateCachesAndNotifyChangeByName`). The first round
     therefore notifies and purges every held kernel name, covering the A-158 set Windows can still cache. All aliases
@@ -13071,6 +13383,27 @@ and failed-then-passing oracles distinguish those results from the initial sourc
   - The per-node word for the file (see above).
   - Rebuilding the successor's handle store from the ledger (`Slab::insert_at`): the bridge's release already settles a
     predecessor's handle by its file, as for FUSE, so a rebuilt store would only duplicate that accounting.
+
+### A-199 — A client's reply stamps alternate by park, so a late confirmation is never lost (accepted 2026-11-04)
+
+A-31's client learns a wake only when the daemon's wake call confirms a sleeper, and it said a confirmation that
+lands after the woken client read the stamp is settled at its next wait. Under load it is not: the waker is
+preempted between its wake and its confirmation while the woken client runs on, takes its reply, sends the next
+request and arms its next park, which cleared the one stamp. The late confirmation then set a bare confirmed bit
+there, so the following park's stamp was refused too. Replace the one stamp with two: the client's parks
+alternate between them, the parked flag's value names the park's slot (1 for slot 0, 2 for slot 1; zero is not
+parked, and any other armed value names slot 0, so a hostile client chooses only which of its own slots is
+stamped), and the daemon confirms by an exchange on the exact stamp it wrote. One daemon serves a ring in order,
+so the slot a park arms was last stamped by a reply call that returned before the reply the client took since.
+An unconfirmed stamp is held in its slot until that slot is armed again, then given up. The async path arms slot
+0 and times nothing. Rejected: a client-side sleep signal (a futex wait's zero return), which macOS's wait does
+not give, and would make the two platforms learn by different rules.
+
+Applied in the same change to: §4.7 (data model, wake strategy, status); `slates-ipc` (region layout version 3,
+`REPLY_STAMP_SLOTS`, `PARKED_STAMP_SLOT_ZERO`/`ONE`, `ClientRegion::reply_stamp(slot)`, `ClientEnd::wait`'s park
+and settle, `DaemonEnd::reply`'s stamp and confirmation) and `crates/ipc/tests/rings.rs`; GAPS. Evidence:
+`docs/bugs/2026-11-04-a-late-wake-confirmation-cost-the-client-two-samples.md`. A client and a daemon of
+different layout versions refuse each other by name; no consensus rule or capability changes.
 
 ### A-197 — pmem over a handed copy: a socket route for every pmem VMM (accepted and built on Linux x86_64 2026-11-01, Step 6 of the VFS and DAX plan; Firecracker on arm64 owed)
 Applied in the same change to: A-186 (the copy's length), GAPS, `crates/ipc` (`protocol.rs`: `MapWrite`'s `granule`;
