@@ -1070,3 +1070,147 @@ fn racing_claimants_take_each_pool_extent_exactly_once_and_the_claims_outlive_th
     );
   }
 }
+
+/// Format: the environment variable naming the role the re-invoked binary plays in the device-refusal fixture: the
+/// anchor ([`DEVICE_REFUSALS_ANCHOR`]) or the daemon it supervises ([`DEVICE_GARBLER`]).
+#[cfg(unix)]
+const DEVICE_REFUSAL_ROLE: &str = "SLATES_ANCHOR_TEST_DEVICE_REFUSAL_ROLE";
+/// Format: the anchor role's test name, which is also its role value.
+#[cfg(unix)]
+const DEVICE_REFUSALS_ANCHOR: &str = "device_refusals_anchor";
+/// Format: the garbling daemon's test name, which is also its role value.
+#[cfg(unix)]
+const DEVICE_GARBLER: &str = "device_garbler";
+/// Shape: the bad device messages the garbling daemon sends, half of each kind.
+#[cfg(unix)]
+const BAD_DEVICE_MESSAGES: usize = 20;
+/// Shape: the distinct refusals those messages make (a message of the wrong length, and one of an unknown kind).
+#[cfg(unix)]
+const BAD_DEVICE_KINDS: usize = 2;
+/// Format: the kind byte no device message has.
+#[cfg(unix)]
+const UNKNOWN_KIND: u8 = 0xff;
+/// Format: the tag before the count the anchor role prints on stdout, found anywhere in a line (libtest's banner may
+/// come glued to it).
+#[cfg(unix)]
+const DEVICE_REFUSALS_TAG: &str = "ANCHOR_DEVICE_REFUSALS=";
+/// Format: the words of the anchor's log line for a refused hold message.
+#[cfg(unix)]
+const DEVICE_REFUSAL_LINE: &str = "a hold message was refused";
+/// Format: the garbling daemon's exit code, distinct from libtest's, so a run that selected no test cannot pass.
+#[cfg(unix)]
+const GARBLER_EXIT: i32 = 9;
+/// Format: the anchor role's exit code, for the same reason.
+#[cfg(unix)]
+const DEVICE_ANCHOR_EXIT: i32 = 11;
+
+/// The garbling daemon: adopts the hold channel it inherited and sends [`BAD_DEVICE_MESSAGES`] bad messages, a
+/// message of half a message's length and a whole one of an unknown kind in turn, then exits [`GARBLER_EXIT`]. Run by
+/// [`device_refusals_anchor`] with `--ignored --exact`.
+#[cfg(unix)]
+#[test]
+#[ignore = "the garbling daemon of the device-refusal fixture; run by the anchor role with --ignored"]
+fn device_garbler() {
+  use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+  if std::env::var(DEVICE_REFUSAL_ROLE).as_deref() != Ok(DEVICE_GARBLER) {
+    return;
+  }
+  let handed =
+    std::env::var(slates_anchor::held::ENV_DEVICES).expect("the anchor handed the channel over");
+  let inherited = slates_anchor::held::parse_env(&handed).unwrap();
+  // SAFETY: the anchor made the channel's daemon end inheritable and named its number in the environment; this
+  // process adopts it once, here, so the `OwnedFd` is its single owner.
+  let channel = unsafe { OwnedFd::from_raw_fd(inherited.channel) };
+  let short = vec![0u8; slates_anchor::held::MESSAGE_BYTES / 2];
+  let mut unknown = vec![0u8; slates_anchor::held::MESSAGE_BYTES];
+  unknown[0] = UNKNOWN_KIND;
+  for message in 0..BAD_DEVICE_MESSAGES {
+    let bytes = if message % 2 == 0 { &short } else { &unknown };
+    let sent = rustix::net::send(channel.as_fd(), bytes, rustix::net::SendFlags::empty()).unwrap();
+    assert_eq!(sent, bytes.len(), "a datagram is sent whole");
+  }
+  std::process::exit(GARBLER_EXIT);
+}
+
+/// The anchor role: a real supervisor holding descriptors over [`device_garbler`], stepped until that daemon's exit
+/// is seen and its messages drained; prints the refusals counted, tagged, and exits [`DEVICE_ANCHOR_EXIT`]. Its log is
+/// this process's stderr, which the parent reads.
+#[cfg(unix)]
+#[test]
+#[ignore = "the anchor of the device-refusal fixture; run by the parent with --ignored"]
+fn device_refusals_anchor() {
+  if std::env::var(DEVICE_REFUSAL_ROLE).as_deref() != Ok(DEVICE_REFUSALS_ANCHOR) {
+    return;
+  }
+  let segment = AnchorSegment::create(
+    &unique_name("slates-anchor-test-device-refusals"),
+    &identity(),
+    geometry(),
+  )
+  .unwrap();
+  let args = ["--ignored", "--exact", DEVICE_GARBLER, "--nocapture"].map(str::to_owned);
+  // Shape: no restart in the window, so the garbler's one exit ends the fixture's observation (a crash loop backs off
+  // rather than starting a second garbler).
+  let policy = RestartPolicy {
+    window_ns: 60_000_000_000,
+    max_restarts: 0,
+  };
+  let mut supervisor = Supervisor::new(segment, &args, policy).unwrap();
+  // Shape: a drain of 28 messages a step (4 devices × 3 + 4 connections × 2 + 4 copies × 2), above the garbler's 20.
+  supervisor.hold_descriptors(4, 4, 4).unwrap();
+  supervisor.hold_environment(DEVICE_REFUSAL_ROLE, DEVICE_GARBLER.to_owned());
+  let clock = Instant::now();
+  supervisor.start(now_ns(clock)).unwrap();
+  let deadline = Duration::from_millis(CHILD_WAIT_MS);
+  while clock.elapsed() < deadline {
+    match supervisor.step(now_ns(clock)).unwrap() {
+      Step::Running => {
+        // The test harness paces the poll; shipped code parks on its driver (D-9).
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(Duration::from_micros(POLL_US));
+      }
+      _ => break,
+    }
+  }
+  // The step that saw the exit drained first; one more drain takes anything sent after it.
+  supervisor.drain_devices();
+  println!("{DEVICE_REFUSALS_TAG}{};", supervisor.device_refusals());
+  supervisor.stop().ok();
+  std::process::exit(DEVICE_ANCHOR_EXIT);
+}
+
+/// A-213, the rule against unbounded growth (the sibling of A-198's Windows fix). Do: run a real anchor as a process
+/// of its own over a daemon sending 20 bad device messages, two kinds in turn. Expect: all 20 counted, and the anchor's
+/// log says each kind once, so 2 lines, not one a message.
+#[cfg(unix)]
+#[test]
+fn every_bad_device_message_is_counted_and_the_log_says_each_kind_once() {
+  let output = std::process::Command::new(std::env::current_exe().unwrap())
+    .args([
+      "--ignored",
+      "--exact",
+      DEVICE_REFUSALS_ANCHOR,
+      "--nocapture",
+    ])
+    .env(DEVICE_REFUSAL_ROLE, DEVICE_REFUSALS_ANCHOR)
+    .output()
+    .unwrap();
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert_eq!(
+    output.status.code(),
+    Some(DEVICE_ANCHOR_EXIT),
+    "the anchor role ran: {stdout}\n{stderr}"
+  );
+  let counted = stdout
+    .split(DEVICE_REFUSALS_TAG)
+    .nth(1)
+    .and_then(|rest| rest.split(';').next())
+    .and_then(|count| count.parse::<usize>().ok());
+  assert_eq!(counted, Some(BAD_DEVICE_MESSAGES), "{stdout}\n{stderr}");
+  assert_eq!(
+    stderr.matches(DEVICE_REFUSAL_LINE).count(),
+    BAD_DEVICE_KINDS,
+    "one line per kind: {stderr}"
+  );
+}

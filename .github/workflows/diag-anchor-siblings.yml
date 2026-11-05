@@ -1,0 +1,77 @@
+name: diag-anchor-siblings
+on:
+  push:
+    branches: ['diag-anchor-siblings-*']
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  unix:
+    name: hold refusals (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: The device hold's refusals and log, as an anchor process
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          status=0
+          cargo test -p slates-anchor --test anchor -- every_bad_device_message --test-threads=1 > out.log 2>&1 || status=1
+          cat out.log
+          grep -E "^test result|^  left|^ right|panicked|one line per kind" out.log | head -8 | while read -r line; do
+            echo "::notice title=anchor log::$line"
+          done
+          echo "::notice title=anchor log lines::$(grep -c 'a hold message was refused' out.log)"
+          exit $status
+      - name: The anchor's refusals through slates status
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        shell: bash
+        env:
+          SLATES_TEST_CLI: "1"
+        run: |
+          status=0
+          cargo test -p slates-cli --test cli -- a_real_anchors_hold_refusals --test-threads=1 --nocapture > out.log 2>&1 || status=1
+          cat out.log
+          grep -E "^test result|^  left|^ right|panicked|anchor_hold_refusals" out.log | head -8 | while read -r line; do
+            echo "::notice title=status::$line"
+          done
+          exit $status
+  windows:
+    name: anchor on Windows (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy the anchor (its Windows hold changed)
+        timeout-minutes: 40
+        run: cargo clippy -p slates-anchor --all-targets -- -D warnings
+      - name: The anchor crate's tests
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          status=0
+          cargo test -p slates-anchor -- --test-threads=1 > out.log 2>&1 || status=1
+          cat out.log
+          grep -E "^test result|panicked" out.log | while read -r line; do
+            echo "::notice title=anchor tests::$line"
+          done
+          exit $status
