@@ -209,7 +209,9 @@
 #   by BLAKE3.
 
 [budget]
-slates-machine = 51
+slates-machine = 53
+# 2026-11-04 (+2, A-199, compiled only for Windows): `Facts::resident_now` reads the working set: the zeroed record and
+#   `K32GetProcessMemoryInfo`, which has no safe wrapper.
 #   Raised 19 → 22 on 2026-09-30 for AUD-29-09 (a shared object hands out no reference to its bytes):
 #   the two plain copies across the mapping's raw pointer (`copy_out`, `copy_in`), the two racy copies
 #   through `AtomicU8` for seqlock payloads (`racy_out`, `racy_in`), and `ExclusiveObject::new`, the one
@@ -237,7 +239,10 @@ slates-machine = 51
 # has no Darwin advice, so they are `libc::madvise`); and the test-only footprint reader `test_serial::footprint`
 # (`proc_pid_rusage` into a buffer of its struct's size and the `assume_init` after it succeeded, 2), with which the
 # give-back's tests observe what macOS counts.
-slates-mem = 61
+slates-mem = 63
+# 2026-11-04 (+2, A-199, Windows gives freed pages back, compiled only for Windows): `DiscardVirtualMemory` over a
+#   region's block (`region.rs`, `os::discard_slice`) and over a sparse object's committed run (`shared.rs`,
+#   `Inner::discard`). The call has no safe wrapper.
 # 2026-10-26 (+1, §4.6 A-180, a Shards DAX object on Windows, `dax_object.rs` compiled only for Windows): the object is
 #   a reserved section committed a range at a time, `VirtualAlloc(MEM_COMMIT)` over a range's fresh view (1). Its view
 #   at an offset shares the map's one `MapViewOfFile` site, and the handed duplicate and the peer's read-only one share

@@ -577,6 +577,11 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-server --test observe
+      # A-199: a deleted file's pages leave the working set and read back through the files recreated over them.
+      - name: Test a deleted file's memory going back to the OS (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-server --test give_back -- --nocapture
       # The client binary whole on Windows, and the async driver: an in-process `slates-server` daemon found through the
       # Win32 rendezvous bootstrap object, driven over the rings through the whole lifecycle; the same-kernel direct map
       # by handle duplication (§4.6, A-175: zero copy asserted, the hostile holder's escalations refused, the neighbour's
@@ -817,6 +822,11 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 20
         run: cargo test -p slates-client --test shards -- --test-threads=1
+      # A-199: as on x86_64, the pages of a deleted file leave the working set.
+      - name: Test a deleted file's memory going back to the OS (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-server --test give_back -- --nocapture
       - name: Test the NFS server, its write-back judgment and the network export (native arm64 Windows)
         if: ${{ !cancelled() }}
         timeout-minutes: 20

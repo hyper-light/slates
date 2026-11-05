@@ -1,5 +1,12 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Windows gives freed content pages back (A-199, 2026-11-04), and the audit's held-section leak was not one.** A deleted
+> file's pages leave a Windows daemon's working set at the idle purge, and a block reusing them is zeroed before it is
+> handed out. The section's commit stays charged, by design: Windows has no decommit for a view of a section. The audit's
+> "a refused view leaks the held section's handle" was wrong: `view` closed it, 0 handles in 200 refused adoptions on
+> unchanged code and 200 with the close removed (`crates/mem/tests/held_section.rs`); the adoption now maps first anyway.
+> Numbers and CI runs: BENCHMARKS, "What a write costs on pages given back on Windows".
+
 > **Audit of 2dc9f3eb..98000d56 (2026-11-03): defects open, Step 9's evidence holds.** Nine commits made on
 > 2026-11-01 and 2026-11-02 were read line by line against this file's rules and Step 9's acceptance. Every CI run they
 > cite was read again: each shows what it is cited for, except one pair of timings A-198 gave the wrong way
@@ -18,7 +25,7 @@
 > - **A refused hold release leaves a held drive (A-198).** The unmount deletes the file system after the release is
 >   refused, so the anchor keeps the volume and its drive letter with no daemon serving them
 >   (`crates/server/src/winfsp.rs`, `release_hold` and `reap`).
-> - **A refused view leaks the held section's handle** (`crates/mem/src/shared.rs`, Windows `from_held_handle`).
+> - **A refused view leaks the held section's handle**: wrong; `view` closed it, and A-199 records the count (see the top of this file).
 > - **The receiver's WinFsp guard checks a field WinFsp always zeroes** (`FileSystem.Version`), not the DLL's version
 >   (`FspVersion`). Also, an open whose path is longer than 1024 UTF-16 units is now refused, because every open records
 >   its kernel name in the held ledger (`crates/bridge-winfsp/src/opens/names.rs`).
