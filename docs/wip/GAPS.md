@@ -24,6 +24,8 @@
 >
 
 > **Windows conformance runs, and the arm64 Linux suites (2026-11-05, A-214; VFS plan step 10).** WinFsp's own two
+
+> **Windows conformance runs, and the arm64 Linux suites (2026-11-05, A-209; VFS plan step 10).** WinFsp's own two
 > suites run over the slates drive (`slates mount ID E:`) through `cargo xtask conformance` in `windows-lint` and
 > `windows-arm64`: winfstest (a Rust transcription of its Python 2.7 scripts, held to them by a golden of 733 cases)
 > and the WinFsp fsx port, each built from `billziss-gh/secfs.test@6ac65cd` with MSVC. winfstest: 628 cases, the same

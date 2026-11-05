@@ -1,4 +1,4 @@
-//! Win32 file semantics through the WinFsp drive that winfstest found broken (A-214; §4.6 "Windows";
+//! Win32 file semantics through the WinFsp drive that winfstest found broken (A-209; §4.6 "Windows";
 //! `docs/bugs/2026-11-05-winfstest-found-three-win32-semantics-the-drive-broke.md`). winfstest's base scripts, run over
 //! `slates mount ID E:` on both Windows lanes (diagnostics run 41982130174), found three calls whose answer a Windows
 //! program acts on and which the drive answered wrongly. Each test here makes the call a program makes and checks the
@@ -9,7 +9,7 @@
 //!   (`t/base/03.t` case 3); the drive answered success.
 //! - An open with `TRUNCATE_EXISTING` must leave the file empty (`t/base/05.t` case 12); the drive kept its bytes.
 //! - `SetFileTime`'s access and write times must be kept (`t/base/06.t` case 6); the drive answered success and kept
-//!   neither. A creation time is not kept: the volume records no settable birth time (A-214's stated difference).
+//!   neither. A creation time is not kept: the volume records no settable birth time (A-209's stated difference).
 //! - A file shrunk and then extended must reach its new size: the WinFsp fsx port wedges at an extension that follows
 //!   a cached write past a hole and a shrink below it (its operations 162 to 164 at seed 1 in diagnostics run
 //!   41989365843, 41 to 43 in later runs). The port extends through the C runtime's `_chsize`, which writes zeros from
@@ -273,7 +273,7 @@ fn move_file(from: &str, to: &str, flags: u32) -> Result<(), i32> {
   }
 }
 
-/// A-214, `t/base/04.t` cases 7 and 23. Do: make two files with different bytes on the drive, and move the first onto
+/// A-209, `t/base/04.t` cases 7 and 23. Do: make two files with different bytes on the drive, and move the first onto
 /// the second with `MoveFileExW` and no `MOVEFILE_REPLACE_EXISTING`. Expect: `ERROR_ALREADY_EXISTS`, and both files
 /// still there with their own bytes, through Windows and through slates; then with `MOVEFILE_REPLACE_EXISTING` the
 /// move succeeds and the target holds the source's bytes.
@@ -310,7 +310,7 @@ fn a_move_not_asked_to_replace_refuses_a_taken_name_and_leaves_both_files() {
   assert!(std::fs::metadata(drive.path("from.txt")).is_err());
 }
 
-/// A-214, `t/base/04.t` case 26. Do: make two directories on the drive and move one onto the other with
+/// A-209, `t/base/04.t` case 26. Do: make two directories on the drive and move one onto the other with
 /// `MOVEFILE_REPLACE_EXISTING`. Expect: `ERROR_ACCESS_DENIED`, as Windows never replaces a directory, and both stay.
 #[test]
 fn a_move_asked_to_replace_a_directory_is_refused() {
@@ -334,7 +334,7 @@ fn a_move_asked_to_replace_a_directory_is_refused() {
   assert!(std::fs::metadata(drive.path("other")).unwrap().is_dir());
 }
 
-/// A-214, `t/base/03.t` case 3. Do: make a directory holding a file on the drive and remove the directory
+/// A-209, `t/base/03.t` case 3. Do: make a directory holding a file on the drive and remove the directory
 /// (`RemoveDirectoryW`, as `std::fs::remove_dir` does). Expect: `ERROR_DIR_NOT_EMPTY`, and the directory and its file
 /// still there, through Windows and through slates; once the file is deleted, the directory removes.
 #[test]
@@ -389,7 +389,7 @@ fn create_file(path: &str, disposition: u32) -> Result<(), i32> {
   Ok(())
 }
 
-/// A-214, `t/base/05.t` case 12. Do: as the script does, make a file on the drive, extend it to 42 bytes
+/// A-209, `t/base/05.t` case 12. Do: as the script does, make a file on the drive, extend it to 42 bytes
 /// (`SetEndOfFile`, `File::set_len`), then open it with `TRUNCATE_EXISTING` and close it. Expect: the file is empty,
 /// through Windows and through slates.
 #[test]
@@ -417,7 +417,7 @@ fn an_open_that_truncates_leaves_the_file_empty() {
   assert_eq!(drive.read_through_slates("file.bin").as_deref(), Some(""));
 }
 
-/// A-214, `t/base/06.t` case 6. Do: make a file on the drive and set its write and access times through its handle
+/// A-209, `t/base/06.t` case 6. Do: make a file on the drive and set its write and access times through its handle
 /// (`SetFileTime`, `File::set_times`), close it, and read its times back through a fresh look. Expect: the times set,
 /// to the second.
 #[test]
@@ -484,7 +484,7 @@ fn fsx_shrink_write_shrink(path: &str) -> std::fs::File {
   file
 }
 
-/// A-214, fsx's operation 164 by `SetEndOfFile`. Do: fsx's operations 157 to 163 on a file on the drive, then extend it
+/// A-209, fsx's operation 164 by `SetEndOfFile`. Do: fsx's operations 157 to 163 on a file on the drive, then extend it
 /// to 246,956 bytes with `File::set_len`. Expect: the extension answers within the wait, and the file reports the size.
 #[test]
 fn a_file_shrunk_then_extended_by_its_end_reaches_the_size() {
@@ -502,7 +502,7 @@ fn a_file_shrunk_then_extended_by_its_end_reaches_the_size() {
   assert_eq!(std::fs::metadata(&path).unwrap().len(), FSX_EXTENDED);
 }
 
-/// A-214, fsx's operation 164 as the port makes it. Do: fsx's operations 157 to 163 on a file on the drive, then extend
+/// A-209, fsx's operation 164 as the port makes it. Do: fsx's operations 157 to 163 on a file on the drive, then extend
 /// it to 246,956 bytes as the C runtime's `_chsize` does, writing 4096-byte blocks of zeros from the end. Expect: every
 /// write answers the bytes it was given (a write answering none would loop `_chsize` forever), the extension answers
 /// within the wait, the file reports the size, and the extended range reads as zeros.

@@ -1,4 +1,4 @@
-//! winfstest's twenty scripts, transcribed from Python 2 into calls on [`Script`] (A-214). Each function is one upstream
+//! winfstest's twenty scripts, transcribed from Python 2 into calls on [`Script`] (A-209). Each function is one upstream
 //! file at `billziss-gh/secfs.test@6ac65cd` (the commit WinFsp v2.1 pins), named by its path and the SHA-256 of the
 //! file it was transcribed from, and makes the same calls with the same expectations in the same order, so a case's
 //! number here is its number upstream. The transcription was made by a one-time tool and reviewed by hand; it is held

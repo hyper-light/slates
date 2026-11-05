@@ -108,7 +108,7 @@ pub enum Suite {
   Fsx,
   /// The randomized namespace stress (mkdir/create/rename/link/unlink/… across processes).
   Fsstress,
-  /// Windows conformance: WinFsp's winfstest over the Win32 file API, with the reviewed expected-failure list (A-214).
+  /// Windows conformance: WinFsp's winfstest over the Win32 file API, with the reviewed expected-failure list (A-209).
   Winfstest,
   /// Real tools inside the mount, byte-identical to the host.
   Workloads,

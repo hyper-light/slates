@@ -10,7 +10,7 @@
 //! FUSE mount (`slates mount` on Linux, `crates/server/src/fuse.rs`, proven on a real kernel mount by
 //! `crates/server/tests/fuse_mount.rs`), but the Linux lane still reaches the daemon through a root
 //! `mount -t nfs` adapter — running the suites over the FUSE mount itself is owed (pjdfstest's root cases
-//! need `allow_other`, an operator's `user_allow_other`); on Windows (A-214, 2026-11-05) the harness mounts the
+//! need `allow_other`, an operator's `user_allow_other`); on Windows (A-209, 2026-11-05) the harness mounts the
 //! volume as a WinFsp drive (`slates mount ID E:`) and runs WinFsp's own two suites over it, the fsx port and
 //! winfstest, each built from its pinned source with MSVC, on both Windows lanes;
 //! virtio-fs runs a live Linux guest through QEMU's vhost-user-fs, which mounts the tag and runs the workload
@@ -301,7 +301,7 @@ fn native_windows(suite: Suite) -> Availability {
       "a POSIX C suite with no Windows build (pjdfstest and fsstress use fork, uid switching and \
        POSIX namespace calls)",
     ),
-    // The WinFsp fsx port and winfstest, over `slates mount ID E:` (A-214): each built from its pinned source with
+    // The WinFsp fsx port and winfstest, over `slates mount ID E:` (A-209): each built from its pinned source with
     // MSVC, as WinFsp's own CI runs them. The daemon and the suites run as the runner's own user.
     Suite::Fsx | Suite::Winfstest => Availability::Runnable {
       on,
@@ -310,7 +310,7 @@ fn native_windows(suite: Suite) -> Availability {
       adapter: None,
     },
     Suite::Workloads => Availability::Owed(
-      "the harness mounts the drive (A-214), but the roster's tools and their byte-identity comparison are POSIX's \
+      "the harness mounts the drive (A-209), but the roster's tools and their byte-identity comparison are POSIX's \
        (git over a mode-keeping tree, cargo, rsync, sqlite, a watcher) and no Windows roster is defined yet",
     ),
     Suite::Hermeticity => Availability::Owed("no ETW filesystem-write tracer is wired for Windows"),
@@ -372,7 +372,7 @@ mod tests {
   /// container over the OCI bind (AUD-29-78), and is owed for every other suite.
   #[test]
   fn the_guest_is_owed_and_the_container_runs_only_its_built_leg() {
-    // winfstest is the Windows transport's alone (A-214), so it is no guest's or container's to owe.
+    // winfstest is the Windows transport's alone (A-209), so it is no guest's or container's to owe.
     for suite in Suite::ALL.into_iter().filter(|s| *s != Suite::Winfstest) {
       assert!(matches!(
         availability(Transport::VirtioFs, suite),
@@ -397,7 +397,7 @@ mod tests {
     );
   }
 
-  /// A-214: the Windows transport runs fsx and winfstest on the Windows lane with no root and no adapter.
+  /// A-209: the Windows transport runs fsx and winfstest on the Windows lane with no root and no adapter.
   #[test]
   fn windows_runs_fsx_and_winfstest() {
     for suite in [Suite::Fsx, Suite::Winfstest] {
@@ -416,7 +416,7 @@ mod tests {
     }
   }
 
-  /// A-214: winfstest applies to no other transport, and pjdfstest and fsstress do not apply to Windows.
+  /// A-209: winfstest applies to no other transport, and pjdfstest and fsstress do not apply to Windows.
   #[test]
   fn winfstest_is_windows_only_and_the_posix_suites_are_not_windows() {
     for suite in [Suite::Pjdfstest, Suite::Fsstress] {

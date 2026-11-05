@@ -1,4 +1,4 @@
-//! winfstest's reply, parsed (A-214; Part 6 "Conformance" on Windows; §4.6 "Windows"). winfstest is WinFsp's own
+//! winfstest's reply, parsed (A-209; Part 6 "Conformance" on Windows; §4.6 "Windows"). winfstest is WinFsp's own
 //! conformance suite over the Win32 file API: a C driver (`winfstest.c`) makes one call per process and prints its
 //! outcome, and twenty scripts (`t/base`, `t/reparse`, `t/streams`) state what each call must answer. Upstream drives
 //! the scripts from Python 2.7 (`winfstest.py`, `simpletap.py`), which no CI runner carries and which slates may not

@@ -15,7 +15,7 @@
     "kind": "skipped",
     "reason": {
       "kind": "owed",
-      "reason": "the harness mounts the drive (A-214), but the roster's tools and their byte-identity comparison are POSIX's (git over a mode-keeping tree, cargo, rsync, sqlite, a watcher) and no Windows roster is defined yet"
+      "reason": "the harness mounts the drive (A-209), but the roster's tools and their byte-identity comparison are POSIX's (git over a mode-keeping tree, cargo, rsync, sqlite, a watcher) and no Windows roster is defined yet"
     }
   },
   "expected_failure_list": null,

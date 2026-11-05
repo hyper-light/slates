@@ -263,21 +263,21 @@ enum Op<T> {
     object: T,
   },
   /// `MoveFileEx` and its kin: `replace` is WinFsp's `ReplaceIfExists`, the caller's `MOVEFILE_REPLACE_EXISTING`
-  /// (A-214: a move not asked to replace must refuse a taken name, `t/base/04.t`).
+  /// (A-209: a move not asked to replace must refuse a taken name, `t/base/04.t`).
   Rename {
     from: String,
     to: String,
     replace: bool,
   },
   /// `SetFileSize` with `SetAllocationSize`: an allocation below the file's size truncates the file to it (WinFsp's
-  /// contract for `SetFileSize`; an open with `TRUNCATE_EXISTING` arrives so, A-214, `t/base/05.t`), and any other
+  /// contract for `SetFileSize`; an open with `TRUNCATE_EXISTING` arrives so, A-209, `t/base/05.t`), and any other
   /// allocation changes nothing the volume keeps.
   SetAllocation {
     object: T,
     new_size: u64,
   },
   /// `SetBasicInfo`'s times (`SetFileTime`): each `Some` is applied to the volume's access, modification or change
-  /// time (A-214, `t/base/06.t`); WinFsp passes a creation time too, which the volume does not keep settable.
+  /// time (A-209, `t/base/06.t`); WinFsp passes a creation time too, which the volume does not keep settable.
   SetTimes {
     object: T,
     atime: Option<i64>,
@@ -285,7 +285,7 @@ enum Op<T> {
     ctime: Option<i64>,
   },
   /// `CanDelete`: whether a delete asked of an open object may be granted, decided before Windows marks it for
-  /// deletion. A directory with any child refuses (A-214, `t/base/03.t`): the delete itself runs in Cleanup, which
+  /// deletion. A directory with any child refuses (A-209, `t/base/03.t`): the delete itself runs in Cleanup, which
   /// answers the kernel nothing, so a refusal there reached no program.
   CanDelete {
     object: T,
@@ -1551,8 +1551,8 @@ extern "C" fn set_basic_info(
   change_time: u64,
   p_info: *mut FileInfo,
 ) -> Ntstatus {
-  // The access, write and change times are applied (A-214); the attribute bits and the creation time are not kept by
-  // the volume (A-214's stated differences), and the object's live info is returned so the caller sees what it holds.
+  // The access, write and change times are applied (A-209); the attribute bits and the creation time are not kept by
+  // the volume (A-209's stated differences), and the object's live info is returned so the caller sees what it holds.
   // SAFETY: our file system and a live open-file context.
   let handler = unsafe { handler(fs) };
   let object = context_key(context);
@@ -1583,7 +1583,7 @@ extern "C" fn set_file_size(
   let handler = unsafe { handler(fs) };
   let object = context_key(context);
   // An allocation below the file's size truncates it, as WinFsp's `SetFileSize` contract says (an open with
-  // `TRUNCATE_EXISTING` arrives as an allocation of zero); any other allocation leaves the file as it is (A-214).
+  // `TRUNCATE_EXISTING` arrives as an allocation of zero); any other allocation leaves the file as it is (A-209).
   let op = if set_allocation_size != 0 {
     Op::SetAllocation { object, new_size }
   } else {
