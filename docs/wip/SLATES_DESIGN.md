@@ -5640,6 +5640,23 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > already durable, so the owner's period never caught a holder up; it always sends now, and a late holder is
 > installed once and then follows. Owed: the daemon's publications shipped through it, with barriers answered at
 > durability and phase one in the takeover round; real-process chaos.
+>
+> **In the daemon, slice one (2026-11-05): the owner ships and the candidates keep.** `crates/server/src/live_ship.rs`.
+> Each publication of a live-shipped volume that commits (`publish_shard`) is appended on the volume's own shard, so
+> positions follow publication order inside the barrier; its payload is the record the journal took (or the whole
+> image after a checkpoint) and the content of every extent it names, read through `Volume::read` and sealed under
+> the lineage key. A task of that shard sends what each candidate lacks over the control shard's sessions
+> (`slates_cluster::live::exchange`) and folds the replies there. Candidates check chain and fence, keep the sealed
+> entries since the last whole one within twice the volume's size, and answer with their head (record kinds 22, 23).
+> A publication that cannot become an entry (the credit full, a read or seal refused) leaves the volume owing a whole
+> record, which the next publication or the record period appends. `status` reports each live log
+> (`shard N live shipping|held VOLUME head= durable= owed=`). Across three real daemon processes
+> (`crates/cli/tests/live_fleet.rs`, `SLATES_TEST_CLI=1`), five writes end with the owner durable at its head, nothing
+> owed and both candidates at that head, 4 of 4 runs. Two defects that run found are fixed in the slice: a refusal was
+> re-shipped at once, so a holder that did not hold the volume's catalog yet looped with its owner (982 and 5,501
+> refusals in one five-write run, 0 to 20 after); and a burst that outran the credit left its last writes unshipped
+> until another write came. Not yet: barriers do not wait for durability; a candidate's copy does not survive its own
+> daemon's restart; takeover does not read it.
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
 writer's ring to its local owner shard is the latency floor. When write-intent attachments from

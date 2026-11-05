@@ -3139,6 +3139,7 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     detector_pool: detector_pool_report(state),
     detector_relays: detector_relay_report(state),
     registry_attachments: u64::try_from(state.attachments.live()).unwrap_or(u64::MAX),
+    live: crate::live_ship::reports(state),
   }
 }
 
@@ -9657,11 +9658,16 @@ pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::Vf
       // short sets the flag again at its next number.
       state.store.counters_low = false;
       state.store.content.arena_mut().commit_capture();
+      crate::live_ship::ship_captured(state);
       // The committed image names no block of a wholly free extent, and no deferred free holds one: it goes back to
       // the pool for any shard to claim (A-98).
       state.store.release_idle();
     }
-    Err(_) => state.store.content.arena_mut().abandon_capture(),
+    Err(_) => {
+      state.store.content.arena_mut().abandon_capture();
+      // Nothing of a refused publication ships; the volumes stay dirty and publish again.
+      state.live.captured.clear();
+    }
   }
   outcome
 }
@@ -9965,6 +9971,8 @@ fn stream_checkpoint(
     Ok(frame_bytes) => published.frame_bytes = frame_bytes,
     Err(e) => return Ok(Streamed::Refused(e)),
   }
+  // A checkpoint ships each live-shipped volume's whole image once it commits (A-200, `crate::live_ship`).
+  crate::live_ship::note_checkpoint(state, &published.volumes);
   Ok(Streamed::Committed(published))
 }
 
@@ -10023,6 +10031,18 @@ fn publish_delta_into(
         published.volumes.push(id);
         recorded.push(*handle);
         count = count.saturating_add(1);
+        // A live-shipped volume's record ships once the publication commits (A-200, `crate::live_ship`).
+        if state
+          .db
+          .partition()
+          .volume(id)
+          .is_some_and(|volume| volume.policy.live_shipped)
+        {
+          let record = encoded
+            .get(mark.saturating_add(id.bytes.len())..)
+            .map(<[u8]>::to_vec);
+          state.live.captured.push((id, record));
+        }
       }
       Err(e) => {
         encoded.truncate(mark);

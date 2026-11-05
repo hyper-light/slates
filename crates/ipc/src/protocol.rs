@@ -1195,6 +1195,27 @@ pub struct ShardReport {
   /// The attachments this shard's registry holds: admitted and not yet drained, by every transport. One that outlives
   /// its transport is a slot no later attach can take. Appended.
   pub registry_attachments: u64,
+  /// Live shipping on this shard (A-200): each live volume it ships, and on the control shard each it holds as a
+  /// candidate. Appended.
+  pub live: Vec<LiveReport>,
+}
+
+/// One live-shipped volume's log as a shard sees it (A-200): as its owner (`holding` false: the head it appended and
+/// the position the owner and `f` candidates hold) or as a candidate (`holding` true: the head it holds; `durable` is
+/// then unknown, `None`).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct LiveReport {
+  /// The volume.
+  pub volume: VolumeId,
+  /// Whether this is a candidate's copy, not the owner's log.
+  pub holding: bool,
+  /// The head position (`None`: nothing yet).
+  pub head: Option<u64>,
+  /// The durable position, on the owner.
+  pub durable: Option<u64>,
+  /// On the owner: publications are owed to the log (a burst outran the credit, or one could not be shipped), so its
+  /// head is behind the volume until the whole record it owes is appended.
+  pub owed: bool,
 }
 
 /// The daemon's place in its fleet (§4.8; §2.6 boot step 6), as the verbs' placement authority sees it.

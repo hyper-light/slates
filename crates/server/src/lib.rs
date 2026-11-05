@@ -71,6 +71,7 @@ mod image;
 pub mod landing;
 pub mod lease;
 mod lease_wait;
+mod live_ship;
 mod member_task;
 pub mod merge_service;
 mod mirror;

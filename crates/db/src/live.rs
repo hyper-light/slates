@@ -235,6 +235,14 @@ impl Install {
   }
 }
 
+/// The object an encoded entry or install names, read without decoding the rest: both begin with the owner's word and
+/// then the object (the formats above). `None` for bytes too short to hold it.
+pub fn object_of(bytes: &[u8]) -> Option<ObjectId> {
+  let mut reader = Reader { bytes };
+  reader.word().ok()?;
+  reader.object().ok()
+}
+
 /// A holder's answer to an entry or an install: the head it holds after it (`Ok(None)`: nothing), or a refusal.
 pub fn encode_reply(reply: &Result<Option<Head>, LiveError>) -> Vec<u8> {
   let mut out = Vec::with_capacity(1 + HEAD_BYTES);
@@ -518,6 +526,9 @@ pub struct Shipper {
   held: BTreeMap<HostId, Head>,
   /// The highest position held by the owner and `f` holders.
   durable: Option<u64>,
+  /// The head of the last whole state the owner shipped ([`Shipper::mark_checkpoint`]): on the chain, and what an
+  /// install names, so a holder installed there is credited even once the retained tail no longer reaches it.
+  checkpoint: Option<Head>,
 }
 
 impl Shipper {
@@ -548,9 +559,15 @@ impl Shipper {
       retained: VecDeque::new(),
       held: BTreeMap::new(),
       durable: None,
+      checkpoint: None,
     };
     shipper.durable = shipper.recompute_durable();
     shipper
+  }
+
+  /// The owner it ships as.
+  pub fn owner(&self) -> HostId {
+    self.owner
   }
 
   /// The owner's head.
@@ -689,9 +706,22 @@ impl Shipper {
     }
   }
 
-  /// Whether `head` is on this owner's chain: its head, its start, or a retained entry.
+  /// Records `head` as the last whole state shipped: the entry at it carries the owner's whole state, which an install
+  /// sends to a holder off the chain or behind the retained tail. Ignored unless it is the owner's head now.
+  pub fn mark_checkpoint(&mut self, head: Head) {
+    if Some(head) == self.head {
+      self.checkpoint = Some(head);
+    }
+  }
+
+  /// The last whole state shipped ([`Shipper::mark_checkpoint`]).
+  pub fn checkpoint(&self) -> Option<Head> {
+    self.checkpoint
+  }
+
+  /// Whether `head` is on this owner's chain: its head, its start, its last checkpoint, or a retained entry.
   fn on_chain(&self, head: &Head) -> bool {
-    if Some(*head) == self.head || Some(*head) == self.start {
+    if Some(*head) == self.head || Some(*head) == self.start || Some(*head) == self.checkpoint {
       return true;
     }
     self

@@ -56,11 +56,43 @@ pub async fn ship(
   sessions: Vec<(HostId, Endpoint)>,
   budget: CommitBudget,
 ) -> Shipped {
-  let durable = |shipper: &Shipper| {
+  let exchanged = exchange((stream, message), sessions, budget, |host, reply| {
+    let _ = shipper.on_reply(host, decode_reply(reply));
     until.is_some_and(|until| shipper.durable().is_some_and(|durable| durable >= until))
-  };
+  })
+  .await;
+  Shipped {
+    reusable: exchanged.reusable,
+    stragglers: exchanged.stragglers,
+    timed_out: exchanged.timed_out,
+  }
+}
+
+/// What [`exchange`] gathered: every reply that came back before it returned, in arrival order, with the sessions.
+pub struct Exchanged {
+  /// The replies, each with the holder that sent it.
+  pub replies: Vec<(HostId, Vec<u8>)>,
+  /// The sessions whose holders answered.
+  pub reusable: Vec<(HostId, Endpoint)>,
+  /// The holders still in flight.
+  pub stragglers: Stragglers,
+  /// Whether the budget ran out first.
+  pub timed_out: bool,
+}
+
+/// Sends `message` to every holder over its session and gathers the replies until `enough` (shown each reply as it
+/// lands) says so, every holder has answered, or the budget runs out. The transport half of [`ship`], for a caller whose
+/// [`Shipper`] lives on another shard than its sessions (the daemon: the volume's shard appends, the control shard
+/// sends): it decides from the raw replies, and the owner folds them where its shipper is.
+pub async fn exchange(
+  (stream, message): (u64, &[u8]),
+  sessions: Vec<(HostId, Endpoint)>,
+  budget: CommitBudget,
+  mut enough: impl FnMut(HostId, &[u8]) -> bool,
+) -> Exchanged {
   if sessions.is_empty() {
-    return Shipped {
+    return Exchanged {
+      replies: Vec::new(),
       reusable: sessions,
       stragglers: Stragglers::none(),
       timed_out: false,
@@ -73,7 +105,6 @@ pub async fn ship(
   };
   let (tx, rx) = reply_channel();
   let deadline_ns = budget.max_deadline_ns();
-  let mut reusable = Vec::new();
   for (host, endpoint) in sessions {
     let tx = tx.clone();
     let bytes = message.to_vec();
@@ -81,37 +112,40 @@ pub async fn ship(
       let (reply, endpoint) = request_within(endpoint, stream, priority, &bytes, deadline_ns).await;
       tx.send(Reply(host, reply, Box::new(endpoint)));
     });
-    // A refused spawn drops that holder's session with its future; the others still decide durability.
+    // A refused spawn drops that holder's session with its future; the others still decide.
     if let Ok(task) = spawned {
       let _ = detach(task);
     }
   }
   drop(tx);
   let mut wait = DispatchWait::new(budget, now_ns());
-  let mut timed_out = false;
-  let mut answered = 0usize;
-  while !durable(shipper) {
-    // A catch-up waits for every answer; the channel's disconnection below ends it.
+  let mut exchanged = Exchanged {
+    replies: Vec::new(),
+    reusable: Vec::new(),
+    stragglers: Stragglers::none(),
+    timed_out: false,
+  };
+  loop {
     match rx.try_recv() {
       Ok(Reply(host, reply, endpoint)) => {
-        answered = answered.saturating_add(1);
-        let _ = shipper.on_reply(host, decode_reply(&reply.bytes));
-        reusable.push((host, *endpoint));
+        exchanged.reusable.push((host, *endpoint));
+        let done = enough(host, &reply.bytes);
+        exchanged.replies.push((host, reply.bytes));
+        if done {
+          break;
+        }
       }
       Err(std::sync::mpsc::TryRecvError::Empty) => {
-        if !wait.keep_waiting(answered).await {
-          timed_out = true;
+        if !wait.keep_waiting(exchanged.replies.len()).await {
+          exchanged.timed_out = true;
           break;
         }
       }
       Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
     }
   }
-  Shipped {
-    reusable,
-    stragglers: Stragglers::pending(rx),
-    timed_out,
-  }
+  exchanged.stragglers = Stragglers::pending(rx);
+  exchanged
 }
 
 /// Folds the late replies of an earlier dispatch's stragglers into `shipper`, returning their sessions and whether

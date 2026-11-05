@@ -2620,6 +2620,17 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
       "shard {} registry_attachments: {}\n",
       shard.partition, shard.registry_attachments
     ));
+    for live in &shard.live {
+      out.push_str(&format!(
+        "shard {} live {} {} head={} durable={} owed={}\n",
+        shard.partition,
+        if live.holding { "held" } else { "shipping" },
+        volume_id_text(live.volume),
+        option_text(live.head),
+        option_text(live.durable),
+        live.owed
+      ));
+    }
     if let Some(batch) = telemetry
       .iter()
       .find(|batch| batch.partition == shard.partition)
