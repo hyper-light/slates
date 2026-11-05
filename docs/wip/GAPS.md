@@ -1,5 +1,10 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A green can be shared (fs-server, 2026-11-04).** `share` on a green answered `NotFound`, since it looked the volume up
+> by a slot no green has, so only a green's creator could read, work or submit to it: no second consumer, and no user
+> of another fleet node. Fixed with its failing test first; record `docs/bugs/2026-11-04-a-green-could-not-be-shared.md`.
+> Open, reported there: a green's (and a volume's) name is unique per shard only.
+
 > **Audit of 2dc9f3eb..98000d56 (2026-11-03): defects open, Step 9's evidence holds.** Nine commits made on
 > 2026-11-01 and 2026-11-02 were read line by line against this file's rules and Step 9's acceptance. Every CI run they
 > cite was read again: each shows what it is cited for, except one pair of timings A-198 gave the wrong way

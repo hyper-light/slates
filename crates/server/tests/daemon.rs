@@ -2706,6 +2706,106 @@ fn a_foreign_principal_cannot_drive_another_accounts_merge() {
   daemon.stop();
 }
 
+/// §4.13 access lists on a green (§4.16): an owner shares its green with another principal, which then reads
+/// it, works over it and lands its own increment, as a user on another fleet node reaches a green that node
+/// forwards to (the fs-server lab of 2026-11-04 met it first: `slates share GREEN uid:1000` on the green's
+/// node answered `NotFound`). Before the share the second principal is refused `Forbidden`; the share must
+/// answer `Shared`, and after it the principal's version read, file read, work, edit and submit all answer,
+/// the submit advancing the green to version 2 over the owner's version 1.
+#[test]
+fn a_shared_green_is_read_and_worked_by_the_principal_it_names() {
+  let (daemon, instance) = daemon("merge-share");
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let account = current_uid();
+  let mut owner = Client::connect(&instance);
+  let mut sharer = Client::connect(&instance);
+  let (consumer, capability) = enroll(&mut owner, &secret, account);
+  let proof = slates_server::landing::attest_proof(&capability, sharer.client);
+  assert!(matches!(
+    sharer.call(&RequestBody::Attest { consumer, proof }),
+    ReplyBody::Attested
+  ));
+  let (green, work) = owner_green_and_work(&mut owner);
+  assert!(matches!(
+    owner.call(&RequestBody::Submit {
+      work,
+      evidence: Vec::new(),
+    }),
+    ReplyBody::Submitted {
+      version: Some(1),
+      ..
+    }
+  ));
+  assert_foreign_merge_refused(sharer.call(&RequestBody::Versions { green }));
+  share_green_for_reading(&mut owner, green, account, consumer);
+  the_sharer_reads_and_works_the_green(&mut sharer, green);
+  daemon.stop();
+}
+
+/// The owner shares `green` with the consumer for reading, and the share answers `Shared`.
+fn share_green_for_reading(owner: &mut Client, green: VolumeId, account: u32, consumer: u64) {
+  let shared = owner.call(&RequestBody::Share {
+    volume: green,
+    principal: slates_ipc::protocol::Principal::Consumer { account, consumer },
+    rights: slates_ipc::protocol::Rights {
+      read: true,
+      write: false,
+      admin: false,
+    },
+  });
+  assert_eq!(shared, ReplyBody::Shared, "the owner shares its green");
+}
+
+/// The principal a green was shared with reads its head and file, works over it and submits an increment the green
+/// accepts as version 2.
+fn the_sharer_reads_and_works_the_green(sharer: &mut Client, green: VolumeId) {
+  assert_eq!(
+    sharer.call(&RequestBody::Versions { green }),
+    ReplyBody::Versions { head: 1 }
+  );
+  assert_eq!(
+    sharer.call(&RequestBody::Read {
+      volume: green,
+      path: "f".to_owned(),
+      at: ReadAt::Head,
+    }),
+    ReplyBody::ReadBytes {
+      bytes: b"owned".to_vec()
+    }
+  );
+  let ReplyBody::WorkCreated { id: own, base } = sharer.call(&RequestBody::CreateWork {
+    green,
+    name: "shared-work".to_owned(),
+  }) else {
+    panic!("the principal the green is shared with creates a work over it");
+  };
+  assert_eq!(base, 1, "the work is based on the owner's version");
+  assert!(matches!(
+    sharer.call(&RequestBody::Edit {
+      work: own,
+      path: "g".to_owned(),
+      at: 0,
+      delete_len: 0,
+      bytes: b"theirs".to_vec(),
+    }),
+    ReplyBody::Edited
+  ));
+  let submitted = sharer.call(&RequestBody::Submit {
+    work: own,
+    evidence: Vec::new(),
+  });
+  assert!(
+    matches!(
+      submitted,
+      ReplyBody::Submitted {
+        version: Some(2),
+        ..
+      }
+    ),
+    "the shared principal's increment is accepted as version 2, got {submitted:?}"
+  );
+}
+
 /// The merge submit flow and the verdict (§4.16 Phase 6 Task 6): two agents create work volumes over
 /// a green, both based on version 0. The first's edit merges on the fast path (the chain advances to
 /// version 1); the second, still based on version 0, declared the same file the first just committed,
