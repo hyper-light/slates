@@ -10,7 +10,7 @@ use std::process::ExitStatus;
 use slates_ipc::win_spawn::{Process, Spawn, StandardOutput, environment_block};
 use windows_sys::Win32::Foundation::HANDLE;
 
-use crate::handles::{HandleMessage, HandleRefusal};
+use crate::handles::{HandleMessage, HandleRefusal, RefusalLog};
 use crate::held_windows::{Channel, Handoff, Held, channel};
 
 /// Maps an IPC refusal into the process seam's OS error without losing its original cause.
@@ -95,6 +95,8 @@ pub(super) struct Hold {
   /// Messages the channel refused (not read whole or not decoded) and replies it could not write, over the anchor's
   /// life; the holdings' own refusals are `held`'s.
   channel_refusals: u64,
+  /// Which of those refusals the log has said, so that the log stays bounded while the count goes on.
+  logged: RefusalLog,
 }
 
 impl Hold {
@@ -106,6 +108,7 @@ impl Hold {
       held: Held::new(bound),
       pending: None,
       channel_refusals: 0,
+      logged: RefusalLog::default(),
     })
   }
 
@@ -174,10 +177,14 @@ impl Hold {
     }
   }
 
-  /// Counts a refusal of the channel and says so on the anchor's log, once per refusal; the holdings are untouched.
+  /// Counts every refusal of the channel, and says so on the anchor's log the first time each distinct refusal is met
+  /// ([`RefusalLog`]), so a read the OS keeps refusing or a daemon sending garbage cannot grow the log without bound. The
+  /// holdings are untouched.
   fn refuse(&mut self, refusal: &HandleRefusal) {
     self.channel_refusals = self.channel_refusals.saturating_add(1);
-    eprintln!("slates anchor: a hold message was refused: {refusal}");
+    if self.logged.first_sighting(refusal) {
+      eprintln!("slates anchor: a hold message was refused: {refusal}");
+    }
   }
 }
 

@@ -52,6 +52,17 @@ const ROLE_GARBLING: &str = "garbling_role";
 /// Format: the supervised child whose first process writes one message longer than a hold message between two real
 /// holds.
 const ROLE_OVERSIZING: &str = "oversizing_role";
+/// Format: the supervised child whose short and corrupted messages take turns between two real holds.
+const ROLE_ALTERNATING: &str = "alternating_role";
+/// Format: the anchor run as a process of its own, whose log its parent reads.
+const ROLE_ANCHOR: &str = "anchor_role";
+/// Format: the variable naming the child role the anchor role supervises.
+const ANCHORED_ROLE: &str = "SLATES_HANDLE_TEST_ANCHORED_ROLE";
+/// Format: the tag before the count the anchor role prints, found anywhere in a line: libtest's own output comes
+/// glued to a role's first line.
+const REFUSALS_TAG: &str = "ANCHOR_REFUSALS=";
+/// Format: the words of the anchor's log line for a refused message, counted by the log's test.
+const REFUSAL_LINE: &str = "a hold message was refused";
 /// Shape: how many short and how many corrupted hold messages the garbling child writes (each kind this many).
 const GARBLED_EACH: usize = 10;
 /// Shape: the entries a garbling child holds: one before its bad messages, so they must leave it held, and one after,
@@ -412,6 +423,39 @@ fn an_oversized_hold_message_is_refused_and_counted_and_supervision_goes_on() {
   assert_eq!(refusals_while_supervising(ROLE_OVERSIZING), 2);
 }
 
+/// A-198, the rule against unbounded growth. Do: run the anchor as a process of its own over a child writing 20 bad
+/// messages of two kinds, first in two runs and then taking turns. Expect: its count reaches 20 both times and its log
+/// says each kind once, so 2 lines, not one a message and not one a change of kind.
+#[test]
+fn every_refusal_is_counted_and_the_log_says_each_kind_once() {
+  for role in [ROLE_GARBLING, ROLE_ALTERNATING] {
+    let output = std::process::Command::new(own_exe())
+      .args(role_args(ROLE_ANCHOR))
+      .env(ROLE, ROLE_ANCHOR)
+      .env(ANCHORED_ROLE, role)
+      .output()
+      .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+      output.status.code(),
+      Some(ROLE_EXIT),
+      "{role}: the anchor role ran: {stdout}\n{stderr}"
+    );
+    let counted = stdout
+      .split(REFUSALS_TAG)
+      .nth(1)
+      .and_then(|rest| rest.split(';').next())
+      .and_then(|count| count.parse::<usize>().ok());
+    assert_eq!(counted, Some(GARBLED_EACH * 2), "{role}: {stdout}");
+    assert_eq!(
+      stderr.matches(REFUSAL_LINE).count(),
+      2,
+      "{role}: one line per kind: {stderr}"
+    );
+  }
+}
+
 /// A-198, the channel's reads over the real pipe. Do: write a message of no bytes, then one half as long again as a
 /// hold message. Expect: the empty message is a malformed short message, not "nothing waited" (which ends the anchor's
 /// drain with the message uncounted); the long one and its remainder are each malformed, not an OS refusal (which ends
@@ -617,14 +661,50 @@ fn garbling_role() {
   assert_eq!(std::env::var(ROLE).as_deref(), Ok(ROLE_GARBLING));
   garbled_body(|channel, bytes| {
     for tenth in 0..GARBLED_EACH {
-      write_raw(channel, &bytes[..bytes.len() * tenth / GARBLED_EACH]);
+      write_short(channel, bytes, tenth);
     }
     for corrupted_byte in 0..GARBLED_EACH {
-      let mut corrupted = bytes.to_vec();
-      corrupted[bytes.len() - 1 - corrupted_byte] ^= 0xff;
-      write_raw(channel, &corrupted);
+      write_corrupted(channel, bytes, corrupted_byte);
     }
   });
+}
+
+/// The alternating supervised child: as the garbling child, with its short and corrupted messages taking turns, so the
+/// kind of refusal changes at every message.
+#[test]
+#[ignore = "the alternating hold fixture; run by its parent"]
+fn alternating_role() {
+  assert_eq!(std::env::var(ROLE).as_deref(), Ok(ROLE_ALTERNATING));
+  garbled_body(|channel, bytes| {
+    for turn in 0..GARBLED_EACH {
+      write_short(channel, bytes, turn);
+      write_corrupted(channel, bytes, turn);
+    }
+  });
+}
+
+/// Writes the first `tenths` tenths of `bytes` as one short message; zero tenths is a message of no bytes.
+fn write_short(channel: &Channel, bytes: &[u8], tenths: usize) {
+  write_raw(channel, &bytes[..bytes.len() * tenths / GARBLED_EACH]);
+}
+
+/// Writes `bytes` with one of its last bytes flipped, so its checksum does not match.
+fn write_corrupted(channel: &Channel, bytes: &[u8], from_the_end: usize) {
+  let mut corrupted = bytes.to_vec();
+  corrupted[bytes.len() - 1 - from_the_end] ^= 0xff;
+  write_raw(channel, &corrupted);
+}
+
+/// The anchor as a process of its own, so its parent can read the log it writes: supervises the child role that
+/// `ANCHORED_ROLE` names and prints the count it reached, tagged.
+#[test]
+#[ignore = "the anchor whose log is read; run by its parent"]
+fn anchor_role() {
+  assert_eq!(std::env::var(ROLE).as_deref(), Ok(ROLE_ANCHOR));
+  let role = std::env::var(ANCHORED_ROLE).unwrap();
+  let refusals = refusals_while_supervising(&role);
+  println!("{REFUSALS_TAG}{refusals};");
+  std::process::exit(ROLE_EXIT);
 }
 
 /// The oversizing supervised child: its first process writes one message half as long again as a hold message between
