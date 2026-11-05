@@ -894,7 +894,10 @@ mod plain_path_tests {
   #[test]
   fn a_verbatim_drive_path_becomes_plain_and_nothing_else_changes() {
     assert_eq!(plain_path(Path::new(r"\\?\C:\a\b")), r"C:\a\b");
-    assert_eq!(plain_path(Path::new(r"\\?\UNC\host\share")), r"\\?\UNC\host\share");
+    assert_eq!(
+      plain_path(Path::new(r"\\?\UNC\host\share")),
+      r"\\?\UNC\host\share"
+    );
     assert_eq!(plain_path(Path::new(r"C:\a")), r"C:\a");
     assert_eq!(plain_path(Path::new("/home/a")), "/home/a");
   }
