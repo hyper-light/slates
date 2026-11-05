@@ -274,6 +274,15 @@ pub(crate) const FSX_LENGTH_FLAG: &str = "-l";
 #[cfg(windows)]
 pub(crate) const FSX_LENGTH_FLAG: &str = "-F";
 
+/// Format: how quietly fsx runs: `-q` for FreeBSD's fsx, whose trace the harness does not read (a stopped run's
+/// operation is then unknown and reported as 1).
+#[cfg(not(windows))]
+pub(crate) const FSX_TRACE_FLAG: &str = "-q";
+/// Format: the WinFsp port runs `-v`, printing each operation as it completes, so a run ended at its wall bound names
+/// the operation it stopped at for the reviewed list (A-214).
+#[cfg(windows)]
+pub(crate) const FSX_TRACE_FLAG: &str = "-v";
+
 /// MSVC's `cl.exe` for this process's own architecture, with the environment the Visual Studio installation gives it
 /// (`INCLUDE`, `LIB`, `PATH`), found as the `cc` crate finds it for every build script, so no developer prompt is needed.
 #[cfg(windows)]
