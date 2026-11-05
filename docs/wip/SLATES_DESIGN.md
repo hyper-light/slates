@@ -2902,7 +2902,9 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 > **Status (2026-11-05, A-215).** A batch's last response rides the call that receives the next batch, into the receive
 > journal's second buffer, as WinFsp's own dispatcher carries a response with its next receive. Crash safety rests on
 > the driver's order (responses before delivery, each request written into the held pages before it is processing). The
-> model oracle holds it over 7,483 crash scenarios. The live kill oracle and the A/B against the DLL dispatcher are owed.
+> model oracle holds it over 8,373 crash scenarios, and the live oracle loses 0 and answers 0 wrongly over 40 kills on each
+> Windows lane (run 42065967137). The receiver stays worse than the DLL dispatcher beyond the spread at the p50 on
+> several calls on both lanes. A-215 alone is better on arm64 and 2–5% worse on x86_64 than A-212 (BENCHMARKS).
 
 **Base reads on macOS and Windows.** As on Linux, the daemon reads untouched base files through its own descriptor or
 handle into evictable cache chunks (one copy, `pread`/`ReadFile` on the owner shard's driver) and
@@ -13187,6 +13189,28 @@ protocol, including inside the combined call between its responses and its deliv
 call returns. A successor then recovers and serves to the end. Every IRP must be completed exactly once, and every
 success must carry its own request's identity. The live oracle (`crates/bridge-winfsp/tests/support/host.rs`) kills a
 serving process repeatedly under readers on CI's Windows lanes. The numbers and red-checks are under **Result** below.
+
+**Result (2026-11-05).**
+- **Crash safety: proven.** The model oracle, on macOS: 8,373 scenarios over 91 steps, two deaths deep, with 0 lost,
+  0 wrong, 0 completed twice and 0 wrong contexts. Breaking each recovery rule turns it red. Answering a delivered
+  hand-off's old batch again gives 300 wrong and 1,266 lost; leaving an undelivered one unsettled loses 1,128; keeping
+  its saved response refuses recovery.
+- **Live, on CI's two Windows lanes** (run 42065967137 on `948e7469`): 40 kills a lane under three reader processes,
+  each read going to the server. 0 lost and 0 wrong: 2,149 and 1,405 reads returned their own file's bytes, and 50 and 26
+  were cancelled by the driver. Kills inside a combined call: 6 on x86_64 (1 before delivery, 5 after) and 11 on arm64
+  (4 and 7). The whole live suites pass, 71 bridge tests and 13 CLI tests on each lane, the twenty-kill history among
+  them. The first form passed the same oracle in run 42054677662.
+- **Speed: A-215 does not bring the receiver within the DLL dispatcher's spread** (BENCHMARKS, "The WinFsp receiver with
+  A-215"). Against the DLL at the p50 it stays worse beyond the spread on arm64 (quiet stat 1.44×, rename 1.24×,
+  fsync 1.15×, unlink 1.15×; loaded write 1.74×) and on x86_64 (quiet close 1.15×, unlink 1.20×; loaded 1.04–1.18× on
+  eight of nine calls). Against A-212 alone it is better on arm64 (quiet fsync 0.90×, rename 0.93×, unlink 0.95×; loaded
+  write 0.66×). On x86_64 it is worse by 2–5% (quiet stat 1.04×, fsync 1.04×; loaded write, fsync, close and read
+  1.04–1.05×).
+- **So the separate response call was not most of A-212's remaining 20 µs.** The driver completes the application's IRP
+  at the start of a transact, so the rest of that call had overlapped the application's turnaround. The gap left is in
+  the calls that open and close files (A-212's Open and Release hops), which this amendment does not touch.
+- **Measured and rejected:** the first form, which confirmed the open after the call. It put a shard round trip after
+  the next request's arrival, and opening calls under load were 1.04–1.08× A-212's.
 
 Applied in the same change to: A-198's receive rule and A-212's "Not changed" (pointers here); §4.6's Windows status;
 GAPS; `docs/wip/research/winfsp-takeover.md` (the source record); `crates/bridge-winfsp/src/inflight/capture.rs`,

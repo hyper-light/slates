@@ -175,3 +175,6 @@ step, twice over, of a ten-IRP history whose freed addresses go to the next IRP.
 - leaving an undelivered hand-off's batch unsettled: 1,128 lost;
 - keeping the saved response when the delivered batch is taken: recovery refuses (`Refusal::Hint`).
 
+The second form (`948e7469`) posts a hand-off's open confirmation before the call and takes its answer after; the model
+then also kills the owner between the two. 91 steps, 8,373 scenarios: 0 lost, 0 wrong, 0 twice, 0 wrong contexts.
+
