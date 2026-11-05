@@ -12823,6 +12823,22 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
 
+### A-211 — A DAX ask is refused where no view could begin (accepted and built 2026-11-04)
+Applied in the same change to: §4.6 by reference, `docs/wip/shards/dax-protocol.md` ("Windows"), GAPS,
+`crates/bridge-core/src/dax_backing.rs` (`DaxBackingSession::ask`), `crates/server/src/shards/dax.rs` (`MALFORMED`'s
+doc), `crates/client/tests/shards.rs`, `crates/server/tests/shards.rs`, `docs/wip/shards-patches/`.
+- **What was there.** An ask's range was checked against the object's end alone. So an offset that no view of a section can
+  begin at was committed, filled and handed, and the VMM's map then failed. Measured on jupiter (Windows 10.0.26200,
+  2026-11-04): an ask from offset 1 was answered with a section, `Ok(932)`.
+- **The rule.** A ranged ask's offset is a multiple of `Facts::allocation_granularity()`: 64 KiB on Windows, the page
+  elsewhere. Anything else is `Refused::Malformed` (`EINVAL`, counted `shards.dax_malformed`) before anything is made or
+  filled. One check on every platform; a Linux guest asks whole 2 MiB ranges, so it never meets the refusal.
+- **Proven.** `a_slice_is_handed_from_each_granule_and_refused_between_them` (`crates/client/tests/shards.rs`,
+  T-shards-windows-5.6) failed first as above. With the rule, each of a range's 32 granules is answered and a view placed
+  from it holds the file's bytes then zeros, and 4 offsets between granules are refused and counted; the suite 12 of 12 in
+  each of 3 runs on jupiter and once on windows-2025 (CI run 41981896876). `malformed_asks_are_refused` (`crates/server/tests/shards.rs`)
+  holds Unix's route to the same refusal: the suite passes on Ubuntu (22) and macOS (26), the same run.
+
 ### A-206 — A WinFsp file system is deleted only after the anchor releases its hold, the DLL's version is checked, and slates refuses no path the driver passes (accepted 2026-11-04, audit plan 01a1a34bf7e973069e94f773afdea44a, steps 4 and 6)
 Applied in the same change to: GAPS (the audit entry), §4.6's status through A-198's corrections, `docs/wip/platforms.md`,
 `crates/server` (`winfsp.rs`, `anchor_hold_windows.rs`, `verbs.rs`), `crates/client` (`defers_reply`),

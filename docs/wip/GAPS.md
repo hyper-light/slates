@@ -65,6 +65,15 @@
 > at f+1, AC-8.3's "live-shipped volumes report none", AC-8.9's credit backpressure) is unbuilt, as are `put_wal`
 > and the loss-window report; a head still waits up to the 100 ms record period before its commit starts.
 
+> **VFS plan step 14, Shards' WHP window's three edge cases (2026-11-05): done, patches with the owner's folder.** Six
+> real-guest tests and one fix for Shards' owner, in `docs/wip/shards-patches/` (never pushed to Shards; README there), and
+> PM M421 with them. A view shorter than its range and 64 KiB granules hold. Several vCPUs at a section's replace hold (0 stale,
+> 0 lost in 20,000 replaces, up to 158,573 faults run again at 8 vCPUs on jupiter, 47,708 at 4 on windows-2025). At a share's
+> own file followed they did not: 2 to 38 live accesses taken for the guest's a run on jupiter, 201 to 797 on windows-2025
+> (10 of 10), and 0 after the fix on both. slates refuses an ask no view can begin at (A-211). CI runs 41981896876 and
+> 41987826160, the second on the patches as delivered. Owed: the
+> owner's review.
+>
 > **Audit of 2dc9f3eb..98000d56 (2026-11-03): defects open, Step 9's evidence holds.** Nine commits made on
 > 2026-11-01 and 2026-11-02 were read line by line against this file's rules and Step 9's acceptance. Every CI run they
 > cite was read again: each shows what it is cited for, except one pair of timings A-198 gave the wrong way
