@@ -1,0 +1,62 @@
+name: DIAG nfs-write, A-214's re-landing against A-205's give-back and Miri (not for main)
+
+# Diagnostics, never merged (VFS plan step 11). Main CI 42119714654 failed A-214 in two places: A-205's give-back test
+# on both Windows lanes, and the arena test under Miri. This runs exactly those, as ci.yml runs them, on the
+# re-landing.
+
+on:
+  push:
+    branches: ['diag-nfs-write-*']
+
+jobs:
+  give-back-x64:
+    name: give-back (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: Install NASM
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Test a deleted file's memory going back to the OS (native Windows)
+        timeout-minutes: 45
+        run: cargo test -p slates-server --test give_back -- --nocapture
+  give-back-arm64:
+    name: give-back (windows-11-arm)
+    runs-on: windows-11-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: clang-cl for the C the daemon links (native arm64 Windows)
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          & $clang --version
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Test a deleted file's memory going back to the OS (native arm64 Windows)
+        timeout-minutes: 45
+        run: cargo test -p slates-server --test give_back -- --nocapture
+  miri:
+    name: miri (mem, wire, rt)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - name: "Miri (memory and wire: leak check on)"
+        run: cargo +nightly miri test -p slates-mem -p slates-wire --lib
+      - name: "Miri (runtime: simulation tests, intentional leaks ignored)"
+        run: MIRIFLAGS="-Zmiri-ignore-leaks" cargo +nightly miri test -p slates-rt --lib --test differential --test ownership --test timers --test readiness
