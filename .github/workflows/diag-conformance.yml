@@ -1,0 +1,55 @@
+# Diagnostics for the conformance agent: never on main. Triggered only by pushes to diag-conformance-* branches.
+name: diag-conformance
+
+on:
+  push:
+    branches: ['diag-conformance-*']
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux-arm64-conformance:
+    name: conformance on aarch64 linux (pjdfstest, fsx, fsstress)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Suite tools (Linux arm64)
+        run: |
+          sudo apt-get update && sudo apt-get install -y strace nfs-common fuse3
+          grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
+          uname -a
+          docker version --format 'docker {{.Server.Version}} {{.Server.Os}}/{{.Server.Arch}}' || true
+      - name: fsx
+        if: ${{ !cancelled() }}
+        run: cargo xtask conformance run --suite fsx --records target/conformance-records --scratch target/conformance-scratch --keep
+      - name: fsstress
+        if: ${{ !cancelled() }}
+        run: cargo xtask conformance run --suite fsstress --records target/conformance-records --scratch target/conformance-scratch --keep
+      - name: pjdfstest
+        if: ${{ !cancelled() }}
+        run: cargo xtask conformance run --suite pjdfstest --records target/conformance-records --scratch target/conformance-scratch --keep
+      - name: Upload the records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-records-linux-arm64
+          path: target/conformance-records
+      - name: Upload pjdfstest's per-file output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pjdfstest-output-linux-arm64
+          path: target/conformance-scratch/*/pjdfstest-output
+          if-no-files-found: ignore
+      - name: Upload the anchor logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-anchor-logs-linux-arm64
+          path: target/conformance-scratch/*/*.log
+          if-no-files-found: ignore
