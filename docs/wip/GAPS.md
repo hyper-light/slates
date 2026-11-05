@@ -80,7 +80,8 @@
 > 43.0 µs. Open and not the acknowledgement:
 > - **jupiter's single-client p99.** It stays red with A-216: its runs range from 65 µs to 3.8 ms, as main's do
 >   (2026-11-05 18:24–18:27 UTC).
-> - **macOS's single-client create.** Its p50 is 60–75 µs in both arms.
+> - **macOS's single-client create.** Its p50 was 60–75 µs in both arms. Since the next entry's fix it is
+>   19.8–22.0 µs (main 67.5–75.4 µs); its p99 is still red (97.1–167.2 µs).
 > - **The bench's 8- and 64-client forms aborting `Stalled` at load 23–36 on macOS,** and the ~1.77 s pause after 64
 >   clients churned. Both are main's code; the lost-reply defect below is one cause that fits.
 >
@@ -89,6 +90,30 @@
 > **Next lever (C): do we need the separate acknowledgement at all?** Carry the watermark in every request, so each
 > owner shard releases a client's records when its next request arrives there. No scatter and no extra request.
 > That is a protocol change to the request slot and §4.9.
+
+> **A spinning shard gave its core up on every turn (2026-11-05, §4.3, §4.7, R9; macOS; fixed, measured).** The
+> idle spin polls the driver on every turn, and the macOS driver polled with `kevent` and a zero timeout. On this
+> Mac (M5 Max, macOS 26.4.1) that call slept about 15 µs, one involuntary switch a call, where
+> `KEVENT_FLAG_IMMEDIATE` takes about 180 ns and none. A cross-shard round trip between spinning shards cost what one
+> between parked shards did (main 6.4–8.0 µs spinning, 6.0–7.5 µs parked). Now every call on the queue is `kevent64`
+> and a poll is the immediate flag. The spinning round trip is 625–666 ns over five interleaved rounds.
+> `provision_bench`, three interleaved rounds:
+> - single-client p50 75.4 / 67.5 / 68.5 → 19.8 / 20.8 / 22.0 µs;
+> - single-client p99 157.8 / 166.7 / 170.8 → 97.1 / 134.5 / 167.2 µs, **still red against R9's 50 µs**;
+> - parks a thousand creates 94–161 → 18–44.
+>
+> Test, failing first: `a_spinning_shard_answers_sooner_than_a_parked_one` (`crates/rt/tests/spin_keeps_core.rs`).
+> Record: `docs/bugs/2026-11-05-a-spinning-shard-gave-its-core-up-on-every-turn.md`; BENCHMARKS, "A spinning shard
+> keeps its core".
+>
+> **Open, exposed by it:** a truly spinning shard learns a wake mean of 26–55 µs in the bench's oversubscribed
+> 64-client form (main: 4.6–14 µs, its spin mostly asleep). The idle window is that mean × `IDLE_WINDOW_RATIO` (100),
+> so after the form every shard spins 3–5 ms after each request. The parked form that follows in the same daemon
+> measured a p99 of 7.8 / 12.6 / 15.0 ms against main's 2.0 / 0.50 / 1.1 ms (load 12–16). Alone on a fresh daemon the
+> parked form is no worse: p99 1.48 / 0.43 / 0.95 / 0.85 ms against 2.33 / 0.66 / 1.22 / 0.70 ms. The ratio itself is
+> still "ratified until the spin-to-park ratio is measured against the histogram's parked form"
+> (`crates/server/src/config.rs`). That measurement is now owed with a spin that keeps its core, and so is a rule for
+> an estimate learned while the machine was oversubscribed.
 
 > **A scatter whose part could not be sent never answered (2026-11-05, §4.9, §4.14; fixed).** `scatter_acknowledge`,
 > `scatter_list`, `scatter_grants` and `scatter_status`, the server's four scatter tables, settled a part whose spawn
@@ -101,6 +126,8 @@
 > - **A shard gone,** which happens only while the daemon stops: the scatter is removed and counted
 >   (`scatter.shard_gone`), and the client's resend to the next daemon answers it. The driver's restart test needs
 >   that: 15 of 15 with it, where answering `Overloaded` at once failed its first run in every loop.
+>   Possible refinement, not needed now (the supervisor, 2026-11-05): a typed "reconnect and resend" refusal in that
+>   case, so the client hears why its reply is not coming instead of meeting its deadline before the resend.
 >
 > Tests, each failing first:
 > - `a_refused_release_is_counted_and_the_next_watermark_takes_it_over`;

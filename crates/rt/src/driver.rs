@@ -53,7 +53,7 @@ pub enum Kick {
   #[cfg(target_os = "linux")]
   Eventfd(KickFd),
   /// Trigger the `EVFILT_USER` event on a kqueue (macOS / BSD).
-  #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+  #[cfg(target_os = "macos")]
   Kqueue(KickFd),
   /// Post a completion packet to a completion port (Windows) the registry owns.
   #[cfg(target_os = "windows")]
@@ -138,7 +138,7 @@ impl Kick {
       Kick::Eventfd(fd) => {
         let _ = fd.with(|fd| rustix::io::write(fd, &1u64.to_ne_bytes()));
       }
-      #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+      #[cfg(target_os = "macos")]
       Kick::Kqueue(kq) => crate::kqueue::trigger(kq),
       #[cfg(target_os = "windows")]
       Kick::Iocp(port) => {
@@ -315,7 +315,7 @@ pub fn os_driver() -> Result<Prepared, RtError> {
 }
 
 /// Prepares the OS driver for this platform.
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+#[cfg(target_os = "macos")]
 pub fn os_driver() -> Result<Prepared, RtError> {
   Ok(Prepared {
     kick_fd: Some(crate::kqueue::prepare()?),

@@ -8798,3 +8798,70 @@ What it means:
   p50 is 60–75 µs in both arms, the create cost GAPS already records.
 - **A-216 cuts the parked tail on both:** jupiter's parked p99 falls 2.1–4.6×, macOS's 8-client p99 1.6–23×. A
   parked or contended acknowledgement no longer waits on every other shard.
+
+## A spinning shard keeps its core (§4.3, §4.7, R9; macOS; 2026-11-05)
+
+The macOS driver's poll, which the idle spin makes on every turn, was `kevent` with a zero timeout. That call slept
+about 15 µs, one involuntary switch a call. The fix is `kevent64` for every call on the queue, with
+`KEVENT_FLAG_IMMEDIATE` for a poll (`docs/bugs/2026-11-05-a-spinning-shard-gave-its-core-up-on-every-turn.md`).
+
+Hardware and discipline: Apple M5 Max, 18 cores, macOS 26.4.1 (25E253), 5 shards; other agents' builds beside it,
+load as given; 2026-11-05 UTC. Main is a7804447; the fix is this change. Each arm was built in its own target dir and
+the binaries compared by MD5 before any run (`rt_bench` main 461d05b0…, fix fa2ae984…; `provision_bench` main
+d6a73787…, fix ca119a14…). Arms are interleaved round by round. Commands:
+
+```
+cargo +1.98.1 build --release -p slates-rt --example rt_bench            # then run the binary, no arguments
+cargo +1.98.1 build --release -p slates-client --example provision_bench # then run the binary, no arguments
+```
+
+**The poll alone** (a scratch probe outside the tree, each form on a fresh queue, every return checked, 5,000 calls a
+round, 20:11 UTC, load 6):
+
+| form | ns a call, rounds 1 / 2 / 3 | involuntary switches a call |
+|---|---|---|
+| `kevent`, zero timespec | 14,752 / 14,866 / 14,737 | 1.01 / 1.02 / 1.01 |
+| `kevent64`, zero timespec | 14,598 / 14,757 / 15,524 | 1.00 / 1.00 / 1.07 |
+| `kevent64`, `KEVENT_FLAG_IMMEDIATE` | 186 / 182 / 180 | 0.00 / 0.00 / 0.00 |
+
+**`rt_bench`, cross-shard wake round trip,** median ns, five rounds (20:14 UTC, load 5.7–6.0; `driver_errors` 0 in
+every run of both arms):
+
+| row | main | fix |
+|---|---|---|
+| both shards spinning | 7,792 / 7,667 / 8,000 / 6,375 / 7,000 | 625 / 666 / 625 / 666 / 625 |
+| both shards parking | 7,125 / 7,542 / 7,208 / 5,959 / 7,125 | 7,166 / 6,458 / 7,041 / 7,583 / 6,833 |
+| foreign spawn, shard spinning (a channel's wake on the test thread dominates) | 11,958 / 9,583 / 8,583 / 8,834 / 8,541 | 9,500 / 8,542 / 9,208 / 9,666 / 8,437 |
+
+**`provision_bench`, the whole histogram,** three rounds (20:19–20:22 UTC, load 12.5–16.0). Each round: the bench's
+three runs, then their median:
+
+| row | main | fix |
+|---|---|---|
+| spinning 1-client p50 | [75.4, 75.2, 77.3] 75.4 · [66.0, 67.5, 71.2] 67.5 · [65.5, 68.5, 71.8] 68.5 µs | [20.1, 18.4, 19.8] 19.8 · [21.6, 20.8, 20.7] 20.8 · [22.0, 22.3, 18.5] 22.0 µs |
+| spinning 1-client p99 (R9: 50 µs) | [163.4, 157.8, 136.3] 157.8 · [146.9, 188.5, 166.7] 166.7 · [170.8, 159.7, 182.2] 170.8 µs | [97.1, 77.5, 142.9] 97.1 · [159.7, 114.5, 134.5] 134.5 · [129.9, 167.2, 212.5] 167.2 µs |
+| parks a thousand creates, 1 client | 97–134 · 108–161 · 94–137 | 18–26 · 20–30 · 27–44 |
+| spinning 8-client p99 | [239.1, 214.9, 219.5] 219.5 · [309.4, 284.4, 336.1] 309.4 · [241.0, 275.5, 347.3] 275.5 µs | [204.8, 157.3, 441.9] 204.8 · [158.8, 183.9, 142.9] 158.8 · [93.0, 74.7, 102.4] 93.0 µs |
+| status p50 (the channel and the record alone) | 20.9 · 20.7 · 20.6 µs | 6.5 · 3.7 · 7.2 µs |
+| parked p50 | [110.2, 128.0, 131.8] 128.0 · [129.6, 137.8, 126.2] 129.6 · [119.0, 137.7, 142.8] 137.7 µs | [84.5, 85.0, 87.4] 85.0 · [89.4, 92.3, 86.5] 89.4 · [91.0, 89.3, 105.4] 91.0 µs |
+| parked p99 | [2.02, 0.57, 3.56] 2.02 · [0.50, 11.21, 0.45] 0.50 · [23.45, 1.09, 1.11] 1.11 ms | [7.81, 4.94, 10.38] 7.81 · [12.62, 17.64, 7.98] 12.62 · [19.97, 7.22, 15.00] 15.00 ms |
+| shards' wake mean after the 64-client form | 4.6–14.1 µs | 29.2–55.1 µs |
+
+**The parked form alone** on a fresh daemon: the same binaries with the spinning forms skipped by a temporary edit
+made identically in both trees and taken out after (main 6d2fccd7…, fix d733da75…). Four rounds, 20:26–20:27 UTC,
+load 5.3–5.9:
+
+| row | main | fix |
+|---|---|---|
+| parked p50 | [123.2, 128.0, 124.1] 124.1 · [129.9, 124.5, 128.7] 128.7 · [124.3, 118.0, 119.5] 119.5 · [125.5, 136.0, 115.8] 125.5 µs | [106.6, 111.0, 108.6] 108.6 · [98.6, 113.4, 114.1] 113.4 · [97.8, 113.5, 109.3] 109.3 · [101.1, 100.1, 112.1] 101.1 µs |
+| parked p99 | [0.78, 2.33, 15.55] 2.33 · [0.66, 0.46, 1.54] 0.66 · [1.22, 0.60, 17.47] 1.22 · [0.70, 1.89, 0.45] 0.70 ms | [12.94, 1.48, 1.35] 1.48 · [0.40, 0.43, 0.70] 0.43 · [0.50, 5.93, 0.95] 0.95 · [0.46, 0.85, 12.10] 0.85 ms |
+
+What it means:
+- **On macOS the spin now saves the wake it exists to save.** A round trip between spinning shards fell from about
+  7 µs, what a parked one costs, to about 0.65 µs, and the single-client create's p50 from 67.5–75.4 µs to
+  19.8–22.0 µs.
+- **R9's single-client gate is still red on macOS**: p99 97.1–167.2 µs. The p99 is the next thing to find.
+- **The parked form is no worse alone, but worse after the 64-client form:** that form, oversubscribed, teaches a
+  truly spinning shard a wake mean of 29–55 µs, and the idle window (100 times the mean) then keeps every shard
+  spinning for milliseconds after each request (GAPS, open). Main's shards slept in their spin, so their estimate
+  stayed low.

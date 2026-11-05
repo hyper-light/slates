@@ -917,7 +917,7 @@ mod tests {
     let (descriptor, _write) = rustix::pipe::pipe().unwrap();
     #[cfg(target_os = "linux")]
     let form = Kick::Eventfd;
-    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    #[cfg(target_os = "macos")]
     let form = Kick::Kqueue;
     let (shard, _control) =
       register_slot(2, 1, RegisterKick::Descriptor(descriptor, form)).unwrap();
@@ -925,7 +925,7 @@ mod tests {
     let descriptor = match kick {
       #[cfg(target_os = "linux")]
       Kick::Eventfd(descriptor) => descriptor,
-      #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+      #[cfg(target_os = "macos")]
       Kick::Kqueue(descriptor) => descriptor,
       _ => panic!("registered descriptor"),
     };

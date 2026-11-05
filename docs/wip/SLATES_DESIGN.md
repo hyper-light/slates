@@ -1304,7 +1304,10 @@ served ring request, forwarded verb, mount call or guest pass; a timer's work op
 the shard's wake estimate — asking the rings, the pollers, the timers and the driver on each turn (a socket's
 readiness is known only to the driver, so the spin polls it without blocking; A-39), then park in
 the driver. Every non-blocking harvest is one that never sleeps: on epoll that is `epoll_wait` with a
-zero timeout (A-39; the same rule held for io_uring's `io_uring_enter` before A-136 removed it).
+zero timeout (A-39; the same rule held for io_uring's `io_uring_enter` before A-136 removed it); on kqueue it is
+`kevent64` with `KEVENT_FLAG_IMMEDIATE`, since a zero-valued timeout slept about 15 µs a call on macOS 26.4.1, and
+every call on the queue is `kevent64`, since XNU refuses mixing the two record formats on one queue
+(`docs/bugs/2026-11-05-a-spinning-shard-gave-its-core-up-on-every-turn.md`).
 Cancellation: dropping a future releases nothing it did not own (resources live in arenas
 keyed by handle and are released by the owning operation's terminal step), so every operation is
 cancel-safe by construction; a cancellation request is a message that guarantees a terminal

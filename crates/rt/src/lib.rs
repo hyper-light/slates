@@ -71,7 +71,7 @@ mod afd;
 pub mod epoll;
 #[cfg(target_os = "windows")]
 pub mod iocp;
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+#[cfg(target_os = "macos")]
 pub mod kqueue;
 
 pub use driver::{Driver, DriverKind};
