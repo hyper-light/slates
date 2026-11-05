@@ -8773,10 +8773,26 @@ beside it; 2026-11-05 18:45–18:55 UTC; main 8d7c6a10 MD5 403787fa…, A-216 93
 | parked p50 | 313 / 199 / 159 µs | 194 / 195 / 164 µs |
 | parked p99 | 63.1 / 62.8 / 36.2 ms | 39.4 / 51.5 / 39.2 ms |
 
+**CI** (diag run 42082464886, 2026-11-05 18:21–18:31 UTC, 4-vCPU GitHub VMs; main 8d7c6a10, A-216 93ee9f49, each in
+its own target dir). Single-client spinning p99, the bench's three runs for each round, then the round's median:
+
+| runner | main, rounds 1 / 2 / 3 | A-216, rounds 1 / 2 / 3 |
+|---|---|---|
+| windows-latest (x86_64) | [20.6, 28.3, 26.3] 26.3 · [18.2, 16.3, 20.3] 18.2 · [133.9, 107.5, 17.3] **107.5** µs | [17.8, 17.6, 18.5] 17.8 · [28.2, 22.3, 23.2] 23.2 · [17.7, 20.5, 22.4] 20.5 µs |
+| ubuntu-24.04-arm (Linux arm64) | [706.3, 30.8, 79.1] **79.1** · [130.5, 73.0, 75.7] **75.7** · [41.1, 29.6, 35.1] 35.1 µs | [126.7, 24.3, 27.1] 27.1 · [219.8, 23.0, 24.8] 24.8 · [75.2, 27.6, 25.2] 27.6 µs |
+| ubuntu-latest (Linux x86_64) | [26.6, 21.4, 16.6] 21.4 · [26.4, 16.5, 16.6] 16.6 · [28.3, 24.4, 16.8] 24.4 µs | [18.8, 24.6, 16.2] 18.8 · [27.3, 24.6, 23.7] 24.6 · [21.9, 16.6, 16.5] 16.6 µs |
+| windows-11-arm (Windows arm64) | [79.0, 97.0, 53.6] **79.0** · [64.2, 53.7, 39.2] **53.7** · [66.1, 49.1, 42.1] 49.1 µs | [49.6, 42.7, 41.5] 42.7 · [50.4, 42.0, 42.4] 42.4 · [87.3, 43.0, 41.4] 43.0 µs |
+
+Bold rounds fail R9's 50 µs. **With A-216, R9's single-client gate is green in every round on all four CI
+platforms**, where main failed five rounds of twelve, Linux arm64 and Windows arm64 among them. The single-client p50
+is unchanged within noise: 9.0–9.6 µs on Windows x86_64, 13.6–13.9 µs on Linux arm64, 9.3–13.9 µs on Linux x86_64,
+16.6–18.3 µs on Windows arm64.
+
 Main's first macOS round ran after its boot probe measured a 1.2 ms wake (the spin window it printed, 1,232,348 ns):
 a loaded machine, not the code.
 
 What it means:
+- **On CI, A-216 turns R9's single-client gate green on every platform and round** (above).
 - **R9's single-client gate stays red on jupiter and macOS in both arms.** On jupiter both arms' runs range from
   65 µs to 6.4 ms: an outlier tail the acknowledgement does not explain (GAPS, open). On macOS the single-client
   p50 is 60–75 µs in both arms, the create cost GAPS already records.
