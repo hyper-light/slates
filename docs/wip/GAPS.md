@@ -1,5 +1,25 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **WinFsp: a second receive worker would help only rename and unlink, and needs a crash proof first (2026-11-05, audit
+> step 7; lever, not planned).** Tracing every IRP on both arms (diagnostics runs 42086968194, 42091919319 and
+> 42097182526) rejected the two-worker hypothesis for create, stat and open. 71cf09ac's DLL runs one operation at a time
+> under its coarse guard (WinFsp v2.1 `src/dll/fsop.c:80-82`). It saw a request arrive while another was served for about
+> 1 in 10,000 Creates in create and open, and 46 of 10,010 in stat (arm64, quiet). Our receiver got 39,918 of its 39,999
+> stat-phase receives as one request. Rename and unlink do overlap on the DLL arm: arm64 quiet rename Cleanups 9,318 of
+> 20,000, unlink Creates 2,127 of 10,000. A second worker could serve those. **It needs the multi-worker crash proof
+> first:** with two journals, a completed request in one and a newer, live request at the same reused address in the
+> other cannot be told apart. The candidate is a stamp from the system-wide monotonic clock taken right after each receive
+> returns, with recovery answering only the newest delivery at each address. It is unbuilt and unproven. BENCHMARKS, "Where
+> the receiver's time goes".
+
+> **WinFsp on x86_64: in some VM runs our Create and Close services are up to 13x the DLL arm's (2026-11-05, audit step 7;
+> owner winfsp-bench).** In the traced run 42086968194, three runs on `windows-latest`, quiet stat phase, p50: our Close's
+> service was 24.6, 18.4 and 3.5 us against the DLL arm's 1.9-2.7 us. Our Create's was 10.2, 10.2 and 6.4 us against
+> 5.4-5.9 us. In run 42091919319 on another VM the services were level. Our Close does more on the shard than the DLL
+> arm's (the bridge's release, the ledger's retire and the open-name update). The split between runs fits the reply spin
+> (main's `reply.rs`) sometimes missing the shard's answer and paying a park and a wake. Unmeasured; for winfsp-bench,
+> relayed by the supervisor.
+
 
 
 > **Merge: the same edit from two works was one increment; fixed 2026-11-04 (§4.16, agents/perf).** The increment's
