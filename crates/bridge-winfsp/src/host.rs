@@ -395,7 +395,7 @@ impl Request {
       Op::Release { object } => Some(*object),
       _ => None,
     };
-    let too_long = matches!(&self.op, Op::Rename { from, to } if !names.rename_fits(from, to));
+    let refused = admission_refusal(&self.op, names, ledger);
     let bound = bind(self.op, ledger);
     let barrier = bound.as_ref().is_ok_and(|op| {
       op.needs_barrier() && !matches!(op, Op::Cleanup { object, .. } if object.purge)
@@ -403,13 +403,12 @@ impl Request {
     let echo = matches!(&bound, Ok(Op::Write { object, .. }) if object.purge);
     let restored_read =
       matches!(&bound, Ok(Op::Read { object, .. }) if object.fh == RESTORED_HANDLE);
-    let mut reply = match bound {
-      Ok(_op) if opened.is_some() && !ledger.has_room() => {
-        Reply::Err(ntstatus(&VfsError::NoSpace).as_i32())
+    let mut reply = match (bound, refused) {
+      (Ok(_op), Some(refusal)) => Reply::Err(ntstatus(&refusal).as_i32()),
+      (Ok(op), None) => {
+        run(bridge, cx, op).unwrap_or_else(|error| Reply::Err(ntstatus(&error).as_i32()))
       }
-      Ok(_op) if too_long => Reply::Err(ntstatus(&VfsError::NameTooLong).as_i32()),
-      Ok(op) => run(bridge, cx, op).unwrap_or_else(|error| Reply::Err(ntstatus(&error).as_i32())),
-      Err(error) => {
+      (Err(error), _) => {
         eprintln!("slates-winfsp: context refused: {error}");
         Reply::Err(ntstatus(&VfsError::StaleHandle).as_i32())
       }
@@ -458,6 +457,22 @@ fn rename_one_name(
       eprintln!("slates-winfsp: durable kernel rename refused: {error}");
       Reply::Err(ntstatus(&VfsError::RecoveryIncomplete).as_i32())
     }
+  }
+}
+
+/// Why `op` must not run, decided before it has any effect: an open with no ledger slot left, or a rename that would
+/// lengthen a name Windows holds past what the ledger records ([`OpenNames::rename_fits`]).
+fn admission_refusal(
+  op: &Op,
+  names: &OpenNames,
+  ledger: &Ledger<SparseObject>,
+) -> Option<VfsError> {
+  match op {
+    Op::Open { .. } | Op::PurgeOpen { .. } | Op::Create { .. } if !ledger.has_room() => {
+      Some(VfsError::NoSpace)
+    }
+    Op::Rename { from, to } if !names.rename_fits(from, to) => Some(VfsError::NameTooLong),
+    _ => None,
   }
 }
 
