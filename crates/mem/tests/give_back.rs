@@ -1,4 +1,4 @@
-//! Windows gives freed content pages back (A-105, A-117): by use, through the process's own memory counter. This is its
+//! Windows gives freed content pages back (A-205; A-105, A-117): by use, through the process's own memory counter. This is its
 //! own test binary, with one test in it, because the working set is the whole process's: a test running beside it would
 //! move the reading by more than the margin it holds.
 // Test harness code: an unwrap here is a failed test.

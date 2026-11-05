@@ -1,4 +1,4 @@
-//! Adopting a Windows section held by the anchor (A-198): a refused adoption gives its handle back to the OS. This is
+//! Adopting a Windows section held by the anchor (A-198, A-205): a refused adoption gives its handle back to the OS. This is
 //! its own test binary, with one test in it, because the count it reads is the whole process's: a test running beside
 //! it would open and close handles of its own.
 // Test harness code: an unwrap here is a failed test.

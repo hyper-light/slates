@@ -12834,10 +12834,12 @@ Status: built 2026-11-04. It closes the Windows owed items of A-105, A-110 and A
     a dead range to discard it would charge the commit limit for nothing. A granule only another process committed has
     no page in this working set.
 - Cost, a first write: writing zeros over a block makes all of it resident on its first allocation, where before only
-  the pages written were. BENCHMARKS puts a never-used block's clear inside the spread; a tiny file's tail pages
+  the pages written were. BENCHMARKS prices a never-used block's clear at 1.5–9% best against best; a tiny file's tail pages
   count until its block is next purged or reused.
-- Proven (BENCHMARKS, "What a write costs on pages given back on Windows"), with CI's two Windows architectures in
-  the same section.
+- Proven (BENCHMARKS, "What a write costs on pages given back on Windows") on jupiter and on CI's two Windows
+  architectures, and red-checked there. The working set alone cannot credit the purge: with every discard refused it
+  still fell 25% and 69% over 120 s, Windows trimming it unasked, though 0% in the first 5 s and 0 bytes by the daemon's
+  count. A write on pages given back cost 14–20% less than on never-used pages on the runners.
 - A held section's adoption (the audit's plan step 5) was checked in the same change. The audit said a refused view
   leaked the handle. It did not: `view` closed it. 200 refused adoptions moved the handle count by 0 on unchanged code,
   and by 200 with that close removed (`crates/mem/tests/held_section.rs`). The adoption now maps first and takes
