@@ -52,7 +52,7 @@ pub(crate) fn read_dir(
     },
     slates_db::catalog::Role::Work { .. } => match at {
       ReadAt::Head => match state.works.get(&record.id) {
-        Some(work) => match listed(work_paths(work), dir) {
+        Some(work) => match listed(work_paths(work, state.greens.get(&work.green)), dir) {
           Some(entries) => page_of_sorted(entries, cursor, room),
           None => refused(Refusal::NotFound),
         },
@@ -153,7 +153,10 @@ fn listed(paths: Vec<(String, EntryKind, u64)>, dir: &str) -> Option<Vec<DirEntr
 
 /// Every path a work holds: its files, and the directories and symlinks its journal declared and did not later
 /// remove.
-fn work_paths(work: &crate::state::WorkState) -> Vec<(String, EntryKind, u64)> {
+fn work_paths(
+  work: &crate::state::WorkState,
+  green: Option<&slates_merge::engine::Green>,
+) -> Vec<(String, EntryKind, u64)> {
   let mut dirs: BTreeSet<String> = BTreeSet::new();
   let mut symlinks: BTreeSet<String> = BTreeSet::new();
   for op in &work.journal {
@@ -181,13 +184,17 @@ fn work_paths(work: &crate::state::WorkState) -> Vec<(String, EntryKind, u64)> {
       _ => {}
     }
   }
-  let files = work.content.iter().map(|(path, bytes)| {
-    (
-      path.clone(),
-      EntryKind::File,
-      u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-    )
-  });
+  let files = work
+    .content
+    .merged(green, work.base_version)
+    .into_iter()
+    .map(|(path, bytes)| {
+      (
+        path.to_owned(),
+        EntryKind::File,
+        u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+      )
+    });
   files
     .chain(dirs.into_iter().map(|path| (path, EntryKind::Dir, 0)))
     .chain(

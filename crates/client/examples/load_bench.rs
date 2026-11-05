@@ -46,7 +46,7 @@ use slates_ipc::protocol::{EntryKind, GreenBase, MergeWindow, Refusal, ReplyBody
 use slates_machine::{MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
-/// Shape: rounds of edit-and-submit each client runs.
+/// Shape: rounds of edit-and-submit each client runs, unless `--rounds` says otherwise.
 const ROUNDS: usize = 3;
 /// Shape: slots each round edits.
 const EDITS_PER_ROUND: usize = 4;
@@ -339,6 +339,11 @@ impl Agent {
     };
     let replied_ns = ns_since(epoch);
     self.inflight = None;
+    // The daemon keeps every reply's completion record until the client acknowledges it, and refuses a client that
+    // owes too many (`AcknowledgementOwed`): an async caller acknowledges as it goes, unawaited.
+    if let Err(e) = self.client.begin_ack_if_due() {
+      return self.give_up(tally, &format!("acknowledge: {e}"));
+    }
     self.advance(reply, (sent_ns, replied_ns, kind), tally);
   }
 
@@ -809,7 +814,7 @@ fn level(
   instance: &str,
   green: VolumeId,
   files: &[(String, u64)],
-  n: usize,
+  (n, rounds): (usize, usize),
   workers: usize,
 ) -> u64 {
   let eligible: Vec<(String, u64)> = files
@@ -823,7 +828,7 @@ fn level(
     .collect();
   let plans: Vec<Vec<Vec<Slot>>> = (0..n)
     .map(|agent| {
-      (0..ROUNDS)
+      (0..rounds)
         .map(|round| plan_round(&mut rng, &eligible, &hot, agent, round))
         .collect()
     })
@@ -948,6 +953,7 @@ fn main() {
   let cpus = profile.facts.cpus_at_once();
   let workers: usize =
     arg("--workers").map_or((cpus / 4).max(1), |w| w.parse().expect("--workers n"));
+  let rounds: usize = arg("--rounds").map_or(ROUNDS, |r| r.parse().expect("--rounds n"));
   let instance = format!("load-bench-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, None);
   println!(
@@ -977,7 +983,7 @@ fn main() {
   );
   let mut failures = 0;
   for n in levels {
-    failures += level(&instance, green, &files, n, workers.min(n));
+    failures += level(&instance, green, &files, (n, rounds), workers.min(n));
   }
   drop(setup);
   daemon.stop();

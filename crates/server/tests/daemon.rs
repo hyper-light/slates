@@ -4293,8 +4293,10 @@ fn a_contended_wake_tail_does_not_shrink_the_client_seats() {
 
 /// §4.2 (a work's charge), banned item 8: do create a work, edit it, then withhold the shard's whole admittable
 /// capacity (the memory-pressure hold) and edit again; expect the edit refused `BudgetExceeded` with the file
-/// unchanged, and a new work of the (now non-empty) green refused too (its seeded copy is charged). Release the
-/// hold; expect the edit to succeed.
+/// unchanged. A new work of the (now non-empty) green is a clone that holds nothing of its own (§4.16, D-5; since
+/// 2026-11-04 it is no longer a copy of the green), so it is created under the hold, and its first edit of the green's
+/// file, which takes its own copy of that file, is refused `BudgetExceeded`. Release the hold; expect both edits to
+/// succeed.
 /// A work's content and journal live in the owner shard's memory, so they are charged like a volume's growth, never
 /// kept for free.
 #[test]
@@ -4363,21 +4365,45 @@ fn a_works_edits_are_charged_and_refused_typed_when_the_budget_cannot_hold_them(
     },
     "the refused edit changed nothing"
   );
-  let second = client.call(&RequestBody::CreateWork {
+  let overwrite = a_clone_is_admitted_under_the_hold_and_its_first_copy_refused(&mut client, green);
+  daemon.inject_pressure_hold(0).unwrap();
+  assert_eq!(edit(&mut client, b"after "), ReplyBody::Edited);
+  assert_eq!(overwrite(&mut client), ReplyBody::Edited);
+  drop(client);
+  daemon.stop();
+}
+
+/// Under the memory-pressure hold: a new work of `green` is created (a clone holds nothing of its own), and its first
+/// overwrite of the green's `f.txt` is refused `BudgetExceeded` (the copy it takes is charged). Returns the overwrite,
+/// to be made again once the hold is released.
+fn a_clone_is_admitted_under_the_hold_and_its_first_copy_refused(
+  client: &mut Client,
+  green: VolumeId,
+) -> impl Fn(&mut Client) -> ReplyBody + use<> {
+  let ReplyBody::WorkCreated { id: second, .. } = client.call(&RequestBody::CreateWork {
     green,
     name: "charge-w2".to_owned(),
-  });
+  }) else {
+    panic!("a new work holds nothing of its own, so the hold admits it");
+  };
+  let overwrite = move |client: &mut Client| {
+    client.call(&RequestBody::Edit {
+      work: second,
+      path: "f.txt".to_owned(),
+      at: 0,
+      delete_len: 1,
+      bytes: b"B".to_vec(),
+    })
+  };
+  let copied = overwrite(client);
   assert!(
     matches!(
-      second,
+      copied,
       ReplyBody::Refused {
         refusal: slates_ipc::protocol::Refusal::BudgetExceeded { .. }
       }
     ),
-    "a new work's seeded copy is charged: {second:?}"
+    "the copy a first change of a green file takes is charged: {copied:?}"
   );
-  daemon.inject_pressure_hold(0).unwrap();
-  assert_eq!(edit(&mut client, b"after "), ReplyBody::Edited);
-  drop(client);
-  daemon.stop();
+  overwrite
 }

@@ -4925,12 +4925,6 @@ fn create_work(
     return refused(Refusal::NotFound);
   };
   let base = engine.head();
-  // Seed the work with the green's current content, so an edit to a base file splices what the file
-  // holds rather than looking like a fresh create.
-  let seeded: std::collections::BTreeMap<String, Vec<u8>> = engine
-    .files()
-    .map(|(path, bytes)| (path.to_owned(), bytes.to_vec()))
-    .collect();
   if let Some(existing) = state.db.partition().volume_by_name(name) {
     return refused(Refusal::AlreadyExists {
       existing: to_wire_volume(existing.id),
@@ -4972,7 +4966,9 @@ fn create_work(
   {
     return refused(refusal_of_db(&e));
   }
-  // The seeded copy of the green is charged before the work exists; refused, nothing is created.
+  // The work is a clone of the green at its head (§4.16, D-5): it holds nothing of its own yet, so it is charged
+  // nothing until it changes a file (`crate::work_files`).
+  let seeded = crate::work_files::WorkFiles::default();
   let charged = crate::work_charge::footprint(&seeded, &[]);
   if state.store.grow(charged).is_err() {
     return refused(Refusal::BudgetExceeded {
@@ -5144,7 +5140,9 @@ fn edit(
   let Some(w) = state.works.get(&work_id) else {
     return refused(Refusal::NotFound);
   };
-  let old = w.content.get(path);
+  let old = w
+    .content
+    .get(state.greens.get(&w.green), w.base_version, path);
   let old_len = old.map_or(0, |c| c.len() as u64);
   // The journal operations this edit records, built before anything changes so its charge is exact.
   let mut ops = Vec::new();
@@ -5178,10 +5176,17 @@ fn edit(
   }
   // The work is charged for what the edit adds before it changes anything (`crate::work_charge`).
   let (added, removed) = crate::work_charge::edit_delta(
-    old.map(Vec::as_slice),
+    (old, w.content.entry_cost(path)),
     (path, at, delete_len, bytes.len()),
     &ops,
   );
+  // The file's bytes as the work sees them, copied only when the work does not hold its own yet: its first change
+  // of a green file takes a copy of that file, never of the tree (`crate::work_files`).
+  let seed = if w.content.owns(path) {
+    Vec::new()
+  } else {
+    old.map(<[u8]>::to_vec).unwrap_or_default()
+  };
   if let Err(available) = crate::work_charge::grow(state, work_id, added) {
     return refused(Refusal::BudgetExceeded { available });
   }
@@ -5189,7 +5194,7 @@ fn edit(
     return refused(Refusal::NotFound);
   };
   {
-    let content = w.content.entry(path.to_owned()).or_default();
+    let content = w.content.make_own(path, seed);
     let start = usize::try_from(at).unwrap_or(usize::MAX).min(content.len());
     let del = usize::try_from(delete_len)
       .unwrap_or(usize::MAX)
@@ -5270,7 +5275,15 @@ fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: Wo
     },
   };
   // The work is charged for what the declaration adds before it changes anything (`crate::work_charge`).
-  let (added, removed) = crate::work_charge::declare_delta(&w.content, &volume_op);
+  let seen = (state.greens.get(&w.green), w.base_version);
+  let (added, removed) = crate::work_charge::declare_delta(&w.content, seen, &volume_op);
+  // A rename moves the bytes the work sees at its old path, the green's when the work has not changed it.
+  let moved = match &volume_op {
+    VolumeOp::Rename { from, to } if from != to => {
+      w.content.get(seen.0, seen.1, from).map(<[u8]>::to_vec)
+    }
+    _ => None,
+  };
   if let Err(available) = crate::work_charge::grow(state, work_id, added) {
     return refused(Refusal::BudgetExceeded { available });
   }
@@ -5282,8 +5295,9 @@ fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: Wo
       w.content.remove(path);
     }
     VolumeOp::Rename { from, to } => {
-      if let Some(bytes) = w.content.remove(from) {
-        w.content.insert(to.clone(), bytes);
+      if let Some(bytes) = moved {
+        w.content.set(to, bytes);
+        w.content.remove(from);
       }
     }
     _ => {}
@@ -5316,7 +5330,7 @@ fn declared_xattr<'a>(journal: &'a [VolumeOp], path: &str, name: &str) -> Option
 /// identity check compares two agents' values, so it must be laid in, not left zero.
 fn assemble_post_state(
   doc: &slates_merge::ops_doc::OpsDoc,
-  content: &std::collections::BTreeMap<String, Vec<u8>>,
+  content: &dyn Fn(&str) -> Option<Vec<u8>>,
   journal: &[VolumeOp],
 ) -> Vec<u8> {
   use slates_merge::ops_doc::OpKind;
@@ -5339,12 +5353,14 @@ fn assemble_post_state(
       continue;
     };
     let encoded_node;
+    let held_file;
     // The bytes this op contributes, and the offset into them: a file's slice, or an xattr's value.
     let (source, source_at): (&[u8], u64) = if is_file_content(op.kind) {
-      let Some(file) = content.get(path) else {
+      let Some(file) = content(path) else {
         continue;
       };
-      (file.as_slice(), op.at)
+      held_file = file;
+      (held_file.as_slice(), op.at)
     } else if op.kind == OpKind::Mknod {
       let Some(node) = journal.iter().rev().find_map(|entry| match entry {
         VolumeOp::Mknod {
@@ -5425,7 +5441,9 @@ fn build_increment(
       });
     }
   };
-  let post_state = assemble_post_state(&doc, &w.content, &w.journal);
+  let green = state.greens.get(&green_id);
+  let read = |path: &str| w.content.get(green, base_version, path).map(<[u8]>::to_vec);
+  let post_state = assemble_post_state(&doc, &read, &w.journal);
   let id = increment_identity(work_id, base_version, &doc.encode(), &post_state);
   Ok((
     green_id,
@@ -5527,31 +5545,17 @@ fn submit(
     return refused(Refusal::NotFound);
   };
   let secured = u64::try_from(engine.history_reservation(&inc)).unwrap_or(u64::MAX);
-  // An accepted work is reset to the green's content at the new version, at most the green's files now and the
-  // work's own: that bound is charged to the work first, so a refusal changes nothing (`crate::work_charge`), and
-  // the settle after the verdict trues it up.
-  let reset_bound = engine
-    .files()
-    .map(|(path, bytes)| crate::work_charge::file_footprint(path, bytes.len()))
-    .fold(0u64, u64::saturating_add);
-  if let Err(available) = crate::work_charge::grow(state, work_id, reset_bound) {
-    report_first_budget_refusal(state, "work", reset_bound, available);
-    return refused(Refusal::BudgetExceeded { available });
-  }
   // Make room first: fold whatever the retention budget allows (never a live reader's version).
   if let Err(available) = crate::merge_service::settle_green_retention(state, green_id) {
-    crate::work_charge::shrink(state, work_id, reset_bound);
     return refused(Refusal::BudgetExceeded { available });
   }
   if let Err(available) = crate::merge_service::secure_green_retention(state, green_id, secured) {
-    crate::work_charge::shrink(state, work_id, reset_bound);
     report_first_budget_refusal(state, "retention", secured, available);
     return refused(Refusal::BudgetExceeded { available });
   }
   let verdict_start = state.clock.monotonic_ns();
   let outcome = {
     let Some(engine) = state.greens.get_mut(&green_id) else {
-      crate::work_charge::shrink(state, work_id, reset_bound);
       return refused(Refusal::NotFound);
     };
     engine.submit(&inc)
@@ -5586,7 +5590,6 @@ fn submit(
       if chain_len < version
         && let Err(e) = state.db.mutate(&mut state.segment, &record, now)
       {
-        crate::work_charge::shrink(state, work_id, reset_bound);
         return refused(refusal_of_db(&e));
       }
       reset_accepted_work(state, (green_id, work_id), version);
@@ -5620,8 +5623,6 @@ fn submit(
       }
     }
     slates_merge::engine::Outcome::Conflict { windows } => {
-      // The work is not reset: the bound secured for a reset is released.
-      crate::work_charge::shrink(state, work_id, reset_bound);
       settle_after_conflict(state, green_id, &inc.id);
       ReplyBody::Submitted {
         version: None,
@@ -5632,22 +5633,19 @@ fn submit(
 }
 
 /// An accepted work now equals its green at `version` (§4.16 "Submission"): its journal is consumed (the increment
-/// holds it), its base moves to the version and its content is the green's, so a later edit declares against what
-/// the green holds (a work with `stream` submits at every auto-seal on exactly this footing; without the reset a
-/// second submit would re-declare the already-merged operations against the old base). Its charge is then trued up
-/// to what it keeps, within the bound the submit secured before the verdict (`crate::work_charge`).
+/// holds it), its base moves to the version and it holds nothing of its own, so it reads the green there and a later
+/// edit declares against what the green holds (a work with `stream` submits at every auto-seal on exactly this
+/// footing; without the reset a second submit would re-declare the already-merged operations against the old base).
+/// Its charge then falls to its journal-free, change-free footprint (`crate::work_charge`, `crate::work_files`).
 fn reset_accepted_work(
   state: &mut ShardState,
   (green_id, work_id): (DbVolumeId, DbVolumeId),
   version: u64,
 ) {
-  if let (Some(engine), Some(w)) = (state.greens.get(&green_id), state.works.get_mut(&work_id)) {
+  if let (Some(_), Some(w)) = (state.greens.get(&green_id), state.works.get_mut(&work_id)) {
     w.base_version = version;
     w.journal.clear();
-    w.content = engine
-      .files()
-      .map(|(path, bytes)| (path.to_owned(), bytes.to_vec()))
-      .collect();
+    w.content.clear();
     w.revision = w.revision.wrapping_add(1);
   }
   if let Some(w) = state.works.get(&work_id) {
@@ -5694,6 +5692,7 @@ fn rebase(state: &mut ShardState, principal: &Principal, work: VolumeId) -> Repl
     } => {
       // The work moves onto the head; the green is untouched. Its new footprint is charged first: refused, the
       // work stays where it was. `build_increment` proved the work exists, so this lookup finds it.
+      let files = crate::work_files::WorkFiles::from_changed(files);
       let wanted = crate::work_charge::footprint(&files, &journal);
       if let Err(available) = crate::work_charge::set_to(state, work_id, wanted) {
         return refused(Refusal::BudgetExceeded { available });
@@ -9201,10 +9200,7 @@ fn rebuild_work(state: &mut ShardState, record: &VolumeRecord, green: DbVolumeId
     return;
   };
   let base_version = engine.head();
-  let content: std::collections::BTreeMap<String, Vec<u8>> = engine
-    .files()
-    .map(|(path, bytes)| (path.to_owned(), bytes.to_vec()))
-    .collect();
+  let content = crate::work_files::WorkFiles::default();
   // Charged like a fresh work; a budget that cannot hold it leaves the work unbuilt (its verbs answer NotFound)
   // and counted, never kept uncharged.
   let charged = crate::work_charge::footprint(&content, &[]);

@@ -176,3 +176,96 @@ fn a_conflict_names_every_overlapping_window_of_a_file() {
   drop(client);
   daemon.stop();
 }
+
+/// The bytes every shard has committed against its budget (§4.2), from the daemon's status.
+fn committed(client: &mut Client) -> u64 {
+  client
+    .daemon_status()
+    .unwrap()
+    .shards
+    .iter()
+    .map(|shard| shard.committed_bytes)
+    .sum()
+}
+
+/// §4.16 ("a work volume is only ever a clone of a green version") and D-5 (clones by reference), measured by §4.2's
+/// all-cost admission (found 2026-11-04 by the load test: one client's `CreateWork` took 4.2 ms over 16 MB of the
+/// Linux kernel, and a hundred clients' median 441 ms, since each work was a copy of its green). Do: a green holding
+/// `FILES` files of `FILE_LEN` bytes; create `WORKS` works over it, edit one slot of one file in each, and submit
+/// each. Expect the shards' committed bytes to grow by less than one copy of the green's files across all the works
+/// (each work holds the one file it changed), the edits to be accepted at versions 2 through `WORKS + 1`, and every
+/// work after its accepted submit to read the green's bytes of a file it never changed. Before: each work was
+/// charged a whole copy at create and again at every reset, `WORKS` copies in all.
+#[test]
+fn works_over_a_green_share_its_files() {
+  /// Shape: the green's files.
+  const FILES: usize = 32;
+  /// Shape: each file's length, so the green holds one mebibyte.
+  const FILE_LEN: usize = 32 * 1024;
+  /// Shape: the works created over it.
+  const WORKS: usize = 64;
+  let (daemon, instance) = daemon("share");
+  let mut client = common::client::connect(&instance);
+  let green = client.create_green("g", false).unwrap();
+  let (seed, _) = client.create_work(green, "seed").unwrap();
+  for file in 0..FILES {
+    client
+      .edit(
+        seed,
+        &format!("f{file}"),
+        0,
+        0,
+        &vec![b'0' + u8::try_from(file % 10).unwrap(); FILE_LEN],
+      )
+      .unwrap();
+  }
+  assert_eq!(client.submit(seed).unwrap(), Submitted::Accepted(1));
+  let before = committed(&mut client);
+  let mut works = Vec::new();
+  for n in 0..WORKS {
+    let (work, base) = client.create_work(green, &format!("w{n}")).unwrap();
+    assert_eq!(base, 1);
+    works.push(work);
+  }
+  let grown = committed(&mut client).saturating_sub(before);
+  let one_copy = u64::try_from(FILES * FILE_LEN).unwrap();
+  assert!(
+    grown < one_copy,
+    "{WORKS} works grew the committed bytes by {grown}, at least one copy of the green's {one_copy}"
+  );
+  for (n, work) in works.iter().enumerate() {
+    let at = u64::try_from(n).unwrap() * SLOT_LEN;
+    client.edit(*work, "f0", at, SLOT_LEN, &slot(b'w')).unwrap();
+    assert_eq!(
+      client.submit(*work).unwrap(),
+      Submitted::Accepted(u64::try_from(n).unwrap() + 2)
+    );
+  }
+  reads_after_resets(&mut client, &works, FILE_LEN);
+  drop(client);
+  daemon.stop();
+}
+
+/// After `works_over_a_green_share_its_files`' submits: the last work was reset to the head, every work's slot merged
+/// into it; an earlier work stays at its own version.
+fn reads_after_resets(client: &mut Client, works: &[VolumeId], file_len: usize) {
+  let newest = works[works.len() - 1];
+  let unchanged = client.read(newest, "f7", ReadAt::Head).unwrap();
+  assert_eq!(
+    unchanged,
+    vec![b'7'; file_len],
+    "a work reads the green's bytes of a file it never changed"
+  );
+  let changed = client.read(newest, "f0", ReadAt::Head).unwrap();
+  let slots = usize::try_from(u64::try_from(works.len()).unwrap() * SLOT_LEN).unwrap();
+  assert!(
+    changed[..slots].iter().all(|byte| *byte == b'w'),
+    "and the head's, every work's slot, after its reset"
+  );
+  let first = client.read(works[0], "f0", ReadAt::Head).unwrap();
+  assert_eq!(
+    first[usize::try_from(SLOT_LEN).unwrap()],
+    b'0',
+    "the first work stays at its own version, 2"
+  );
+}

@@ -6967,7 +6967,10 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > It had hashed only the ops document and post-state, so a rebased resubmit met its cached conflict and two works'
 > identical changes shared one result. A conflict reply now names every differing span of a file, not the first.
 > Measured by `crates/client/examples/load_bench.rs` over Linux v7.4-rc1 (GAPS, the load-test blockquote; bug records
-> of 2026-11-04). Owed: a work as a clone that shares the green's content (each work copies the green whole today).
+> of 2026-11-04). A work is now a clone of its green version: it holds only the files it changed (or removed) and
+> reads the rest from the green at its base, which the green never folds past (`crates/server/src/work_files.rs`); a
+> rebase answers only the files it changes. The head identity is computed only for a merge record that is sent.
+> Owed: an incremental identity for f > 0, the origin kept as a reference rather than bytes in the partition.
 
 **Role.** Let many agents work on clones of one shared volume and fold their work back into it
 with no locks, no last-writer-wins, and no inferred merge. Each agent's work becomes an

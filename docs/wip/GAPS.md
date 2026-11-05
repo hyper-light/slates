@@ -47,12 +47,23 @@
 > cached conflict forever (448 refusals, 7 of 10 clients starved); a conflict named one window per file (572 extra
 > rebases at 100 clients). Over the kernel's `kernel/` directory (16 MB) the oracle now passes at 10 and 100 clients:
 > 300 accepted, 851 conflicts, 0 failures, 0 starved. Open:
-> - **A work copies its green whole, at create and at every accepted submit** (`create_work` and
->   `reset_accepted_work` in `crates/server/src/verbs.rs`), and every submit rebuilds the whole base (`base_at`,
->   `compose_volume`) and walks every file for its charge bound. Measured with one client over 16 MB: `CreateWork`
->   4.2 ms, an accepted submit 14.1 ms, an edit 9 µs. At 100 clients the p50 `CreateWork` was 441 ms and the p50 edit
->   29 ms, queued behind those verbs on the green's owner shard. Over the whole kernel tree a work is a 1.8 GB copy.
->   §4.16's work is a clone of a green version (D-5): it must share the green's content and hold only its own changes.
+> - **Fixed the same day: a work copied its green whole**, at create and at every accepted submit. A work is now a
+>   clone that holds only what it changed and reads the rest from its green at its base (`crates/server/src/work_files.rs`;
+>   `works_over_a_green_share_its_files`: 64 works over a 1 MiB green grew the committed bytes by 67,114,368 before,
+>   under one copy after). And the head identity, a BLAKE3 of the green's whole state, was computed for every accepted
+>   submit and discarded at f = 0; it is now computed only for a record that is sent. One client over the kernel's
+>   `fs/` (48 MB): `CreateWork` 11,981,704 ns to 44,917 ns; accepted submit p50 54.8 ms to 1.33 ms over 300 submits.
+> - **A partition snapshot rewrites the whole green origin, synchronously, inside a verb** (`Db::commit` →
+>   `Db::snapshot`, `crates/db/src/replay.rs`): the origin's bytes are recorded in the partition (A-9), so every
+>   `bytes_between_snapshots` of log the shard publishes them all again. 33 of 40 stack samples of a 3,000-submit run
+>   over `fs/`; the accepted submit's p99 stays near 100 ms there. Owed: the origin as a reference to the base
+>   snapshot's durable content, or a sliced snapshot.
+> - **The head identity is still whole-state** where it is used: every record sent at f > 0 and every holder's
+>   recomputation. Owed: an incremental Merkle identity (D-5), before one primary and two replicas are measured.
+> - **Pinning the whole kernel tree needs more than 24 GB**: one client over the 1.8 GB tree was killed by a 24 GB cap
+>   during the pin; `fs/` (48 MB) peaks at 617 MB RSS, about 13 times its bytes (the overlay's pinned copy, the
+>   origin in the partition and its snapshot, the engine's current content and its history each hold the tree).
+> - **Each submit still walks every path**: `base_at` rebuilds the whole base and `compose_volume` passes over it.
 > - **A sync client gives up on a live, overloaded daemon after its reply deadline** (89 calls at 100 clients:
 >   `no reply within 1000000000 ns`).
 > - The 1,000, 10k and 100k levels, the full kernel tree, a separate daemon process, and the remote primary with two

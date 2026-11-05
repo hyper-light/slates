@@ -720,9 +720,12 @@ pub(crate) fn read(
   match record.policy.role {
     Role::Green { .. } => read_green(state, record.id, key, at),
     Role::Work { .. } => match at {
-      ReadAt::Head => match state.works.get(&record.id).and_then(|w| w.content.get(key)) {
+      ReadAt::Head => match state.works.get(&record.id).and_then(|w| {
+        w.content
+          .get(state.greens.get(&w.green), w.base_version, key)
+      }) {
         Some(bytes) => ReplyBody::ReadBytes {
-          bytes: bytes.clone(),
+          bytes: bytes.to_vec(),
         },
         None => refused(Refusal::NotFound),
       },
@@ -785,7 +788,10 @@ pub(crate) fn read_window(
     Role::Green { .. } => read_green_range(state, record.id, key, at, (offset, want)),
     Role::Work { .. } => match at {
       ReadAt::Head => match state.works.get(&record.id) {
-        Some(w) => match w.content.get(key) {
+        Some(w) => match w
+          .content
+          .get(state.greens.get(&w.green), w.base_version, key)
+        {
           Some(bytes) => page_of(bytes, (offset, want), w.revision),
           None => refused(Refusal::NotFound),
         },
@@ -1094,7 +1100,12 @@ pub(crate) fn status_merge_volume(
     }),
     MergeRole::Work { .. } => state.works.get(&id).map_or((0, 0), |work| {
       (
-        work.content.values().map(|bytes| bytes.len() as u64).sum(),
+        work
+          .content
+          .merged(state.greens.get(&work.green), work.base_version)
+          .iter()
+          .map(|(_, bytes)| bytes.len() as u64)
+          .sum(),
         work.base_version,
       )
     }),
@@ -1456,6 +1467,27 @@ pub(crate) fn enqueue_record(
   // flight (§4.8 "joint writes"), so every version it commits stays at `f + 1` of the cohort a takeover
   // recovers through.
   let shape = config.place(object);
+  let local_hold = Placement {
+    acked: vec![local],
+    mirror_acked: None,
+    ..shape.clone()
+  };
+  if local_hold.placed(quorum) {
+    // The laptop degenerate (R8): the owner is the quorum, the append was the commit.
+    let placed = state.merge.placed.entry(object).or_insert(version);
+    *placed = (*placed).max(version);
+    if *placed == version {
+      state
+        .merge
+        .placed_holders
+        .insert(object, (version, local_hold.acked));
+    }
+    return;
+  }
+  // The record's identities and what a successor needs, computed only for a record that will be sent: the head
+  // identity hashes the green's whole state (`Green::head_identity`), which the laptop's own quorum never reads.
+  // Computed before the return above, it cost every accepted submit at f = 0 a hash of every file (measured
+  // 2026-11-04: 5 of 7 stack samples inside a submit over the kernel's `fs/`, 48 MB, about 40 ms a submit).
   let identity = state
     .greens
     .get(&green)
@@ -1482,23 +1514,6 @@ pub(crate) fn enqueue_record(
       )
     })
     .unwrap_or_else(|| (String::new(), false, Principal::Uid { uid: 0 }));
-  let local_hold = Placement {
-    acked: vec![local],
-    mirror_acked: None,
-    ..shape.clone()
-  };
-  if local_hold.placed(quorum) {
-    // The laptop degenerate (R8): the owner is the quorum, the append was the commit.
-    let placed = state.merge.placed.entry(object).or_insert(version);
-    *placed = (*placed).max(version);
-    if *placed == version {
-      state
-        .merge
-        .placed_holders
-        .insert(object, (version, local_hold.acked));
-    }
-    return;
-  }
   state.merge.pending.entry(object).or_default().insert(
     version,
     PendingMergeRecord {

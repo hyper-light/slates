@@ -726,7 +726,7 @@ fn rebase_maps_a_clean_work_forward_and_commits_nothing() {
   };
   assert_eq!(version, 2, "the work is now based on the head");
   assert_eq!(
-    files.get("f").map(Vec::as_slice),
+    files.get("f").cloned().flatten().as_deref(),
     Some(b"AB01234567YY".as_slice()),
     "the head's file with the tail overwrite mapped two bytes forward"
   );

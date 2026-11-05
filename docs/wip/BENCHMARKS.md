@@ -7789,3 +7789,19 @@ The oracle passed at 10 (30 accepted, 10 conflicts) and 100 (300 accepted, 851 c
 whole-green copy and the submit's whole-base rebuild (GAPS, the load-test blockquote), every one served on the green's
 owner shard; an edit queues behind them.
 
+### A work as a clone of its green, and the identity off the laptop's path (2026-11-04)
+
+Same command and machine as above. One client over the kernel's `fs/` (2,365 files, 48,376,238 bytes); one run each,
+before and after, the load average 28 to 42 (the box shared with CI). Nanoseconds:
+
+| Build | CreateWork | Accepted submit p50 / p99 / max (submits) |
+|---|---|---|
+| `cf25e61b` (each work a copy of the green) | 11,981,704 | 54,837,307 / 54,837,307 / 67,222,956 (3) |
+| work as a clone | 44,917 | 40,262,606 / 40,262,606 / 40,305,673 (3) |
+| work as a clone, `--rounds 300` | 49,566 | 41,743,448 / 152,486,794 / 184,131,478 (300) |
+| and the head identity computed only for a record that is sent, `--rounds 300` | 38,789 | 1,331,202 / 97,844,327 / 108,601,967 (300) |
+
+The remaining tail is the partition snapshot that rewrites the green's origin (GAPS). One client over `kernel/` at
+load 675 (a CI storm; the 10- and 100-client rows of that run are scheduler noise and not recorded): `CreateWork`
+140,732, edit p50 10,966, accepted submit p50 483,085.
+

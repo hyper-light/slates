@@ -173,14 +173,17 @@ pub enum Outcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Rebased {
   /// The work's pending operations all mapped cleanly onto the head. The work's base becomes
-  /// `version`, its full content becomes `files` (the head's content with the work's mapped edits
-  /// re-applied), and its declared operations are restated in head coordinates as `journal` (so the
-  /// next submit composes against the new base with no further mapping).
+  /// `version`, its content becomes the head's with `files` laid over it (each file the work's mapped
+  /// edits change, or remove), and its declared operations are restated in head coordinates as
+  /// `journal` (so the next submit composes against the new base with no further mapping).
   Rebased {
     /// The head the work is now based on.
     version: u64,
-    /// The work's full content per path after the rebase (the head's files with the work's edits).
-    files: BTreeMap<String, Vec<u8>>,
+    /// The files the work's edits change relative to the head: a file's bytes after the rebase, or
+    /// `None` for a file the work removes. Every other file is the head's, read from the green (a work
+    /// is a clone of a green version, D-5; until 2026-11-04 this was a copy of every file of the head,
+    /// the whole tree a rebase).
+    files: BTreeMap<String, Option<Vec<u8>>>,
     /// The work's declared operations restated relative to the new base.
     journal: Vec<crate::increment::VolumeOp>,
   },
@@ -900,6 +903,36 @@ impl Green {
         .find(|(recorded, _)| *recorded <= version)
         .and_then(|(_, bytes)| bytes.clone())
     })
+  }
+
+  /// A file's bytes as of `version`, borrowed: the current bytes at or past the head, else the history's
+  /// value then ([`Green::content_ref_at`]). What a work reads for a file it has not changed: a work is a
+  /// clone of its base version (D-5), and the green never folds its history past a live work's base
+  /// (the service's reachable floor), so the value is always there. Cost: one map lookup and a scan of
+  /// that path's own history.
+  pub fn file_at(&self, path: &str, version: u64) -> Option<&[u8]> {
+    if version >= self.head() {
+      return self.content.get(path).map(Vec::as_slice);
+    }
+    self.content_ref_at(path, version)
+  }
+
+  /// Every file present as of `version`, with its bytes, in path order: the current files at or past the
+  /// head, else each path's history value then. Cost: every path the green has held; a listing's, never
+  /// a verb's on the merge path.
+  pub fn files_at(&self, version: u64) -> Vec<(&str, &[u8])> {
+    if version >= self.head() {
+      return self.files().collect();
+    }
+    self
+      .content_history
+      .keys()
+      .filter_map(|path| {
+        self
+          .content_ref_at(path, version)
+          .map(|bytes| (path.as_str(), bytes))
+      })
+      .collect()
   }
 
   /// A file's bytes at `version`, borrowed ([`Green::content_at`] without the copy): what a paged read slices.
@@ -2053,7 +2086,7 @@ impl Green {
   /// head is created first). The green is not touched.
   fn rebased_from(&self, effects: Vec<Effect>, to: u64) -> Rebased {
     use crate::increment::VolumeOp;
-    let mut files = self.content.clone();
+    let mut files: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
     let mut journal: Vec<VolumeOp> = Vec::new();
     for effect in effects {
       match effect {
@@ -2074,11 +2107,11 @@ impl Green {
               journal.push(volume_op);
             }
           }
-          files.insert(path, bytes);
+          files.insert(path, Some(bytes));
         }
         Effect::RemoveContent(path) => {
           journal.push(VolumeOp::Unlink { path: path.clone() });
-          files.remove(&path);
+          files.insert(path, None);
         }
         Effect::MakeDir(path) => journal.push(VolumeOp::Mkdir { path }),
         Effect::RemoveDir(path) => journal.push(VolumeOp::Rmdir { path }),

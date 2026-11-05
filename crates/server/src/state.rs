@@ -895,9 +895,10 @@ pub struct WorkState {
   pub base_version: u64,
   /// The declared operations, in order.
   pub journal: Vec<VolumeOp>,
-  /// The work's current content per file path — the post-state the increment's content ops name by
-  /// range (a mounted work would keep this in its VFS tree; here `edit` maintains it directly).
-  pub content: BTreeMap<String, Vec<u8>>,
+  /// What the work changed of its green, by path (`crate::work_files`): the post-state the increment's content
+  /// ops name by range is read through it, every unchanged file being the green's at `base_version` (a mounted
+  /// work would keep this in its VFS tree; here `edit` maintains it directly).
+  pub content: crate::work_files::WorkFiles,
   /// Bumped by every change to `content` (an edit, a namespace declaration, a submit or rebase moving the work):
   /// the stamp a paged read of the work's head compares between pages (`ReadRange`).
   pub revision: u64,
