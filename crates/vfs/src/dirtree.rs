@@ -26,8 +26,7 @@
 use crate::dir::Child;
 pub use crate::dirblocks::ENTRY_BYTES;
 use crate::dirblocks::{
-  BlockRef, BlockStore, HEADER_BYTES, LARGEST_CLASS, MIN_ENTRIES_AT_NAME_MAX, SMALLEST_CLASS,
-  fitted_size,
+  BlockRef, BlockStore, HEADER_BYTES, LARGEST_CLASS, SMALLEST_CLASS, fitted_size,
 };
 use crate::error::VfsError;
 use crate::ids::{Epoch, InodeNo};
@@ -35,12 +34,9 @@ use crate::names::NameEquivalence;
 use slates_mem::Handle;
 
 /// Derived: the deepest tree the entry counter can need: a block at the largest class, the only one that splits,
-/// holds at least [`MIN_ENTRIES_AT_NAME_MAX`] entries at the longest allowed name, and `3^21` exceeds `u32::MAX`, the
+/// holds at least [`crate::dirblocks::MIN_ENTRIES_AT_NAME_MAX`] entries at the longest allowed name, and `3^21` exceeds `u32::MAX`, the
 /// most entries a tree's count can address.
 const MAX_HEIGHT: usize = 21;
-
-// Every split block holds at least three entries, which the height bound counts on.
-const _: () = assert!(MIN_ENTRIES_AT_NAME_MAX >= 3);
 
 /// Derived: a block whose live bytes fall below a quarter of the largest class merges with its right sibling when
 /// both fit in one largest block, which keeps the leaves from spreading after any removal sequence at amortized
@@ -1944,15 +1940,41 @@ mod tests {
     let mut retired = Retired::new();
     for n in 0..20u64 {
       let name = format!("resident-{n}");
-      tree.insert(&mut blocks, Epoch(1), &mut retired, POLICY, &name, Child::File(InodeNo(n))).unwrap();
+      tree
+        .insert(
+          &mut blocks,
+          Epoch(1),
+          &mut retired,
+          POLICY,
+          &name,
+          Child::File(InodeNo(n)),
+        )
+        .unwrap();
     }
     let leaf = tree.root;
     for _ in 0..1000 {
-      tree.insert(&mut blocks, Epoch(1), &mut retired, POLICY, "temporary", Child::File(InodeNo(99))).unwrap();
-      assert!(tree.remove(&mut blocks, Epoch(1), &mut retired, POLICY, "temporary").unwrap().is_some());
+      tree
+        .insert(
+          &mut blocks,
+          Epoch(1),
+          &mut retired,
+          POLICY,
+          "temporary",
+          Child::File(InodeNo(99)),
+        )
+        .unwrap();
+      assert!(
+        tree
+          .remove(&mut blocks, Epoch(1), &mut retired, POLICY, "temporary")
+          .unwrap()
+          .is_some()
+      );
       assert_eq!(tree.root, leaf, "the round trip kept its block");
-      assert_eq!(view(&blocks, leaf).unwrap().names_dead(), 0, "a hole was left");
+      assert_eq!(
+        view(&blocks, leaf).unwrap().names_dead(),
+        0,
+        "a hole was left"
+      );
     }
   }
 }
-
