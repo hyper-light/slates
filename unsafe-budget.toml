@@ -456,7 +456,10 @@ slates-bridge-fskit = 9
 # 2026-11-02 (126 -> 130): an owned auto-reset event wakes the receiver for private Begin/End messages even when
 # Windows rejects an open without a callback. The four sites create/own/signal that event and wait for it beside
 # the control completion event. Every control operation is still settled before its borrowed buffers can be freed.
-slates-bridge-winfsp = 131
+# 2026-11-05 (131 -> 132, A-214): the `CanDelete` callback reads the handler from the file system's user context, as every
+# other callback does (`host.rs`, `can_delete`), so a directory with a child refuses before Windows marks it for
+# deletion; it had answered success unread (winfstest `t/base/03.t` case 3).
+slates-bridge-winfsp = 132
 # Raised 3 -> 5 on 2026-10-19 for `udmabuf.rs` (the `UDMABUF_CREATE` ioctl and the descriptor it returns), which
 # confined a guest's DAX window to a descriptor covering only that window
 # (docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md). Lowered 5 -> 3 on 2026-10-25

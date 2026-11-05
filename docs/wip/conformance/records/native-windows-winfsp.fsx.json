@@ -8,14 +8,14 @@
     "arch": "arm64",
     "privilege": "unprivileged"
   },
-  "date": "2026-09-14",
+  "date": "2026-11-05",
   "command": "",
   "bound": "",
   "outcome": {
     "kind": "skipped",
     "reason": {
-      "kind": "owed",
-      "reason": "the WinFsp fsx port (Phase 4 task 5) is not wired into the harness, and the harness has no WinFsp mount step"
+      "kind": "lane",
+      "reason": "runs in the Windows lane, not on macOS"
     }
   },
   "expected_failure_list": null,
