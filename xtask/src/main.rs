@@ -52,6 +52,7 @@ mod kind;
 mod named_tests;
 mod ratchet;
 mod tag;
+mod targets;
 mod toolchain;
 mod tsan;
 mod unsafe_budget;

@@ -284,6 +284,11 @@
 >   seven binaries, `SHA256SUMS`, the provenance and the attestation bundle. After download, all seven checksums
 >   verified, `gh attestation verify` passed (SLSA v1, seven subjects, `release.yml` at the tag) and refused a
 >   tampered copy, and no SDK lane started. Every number is in A-210.
+> - **The SDK lanes ship the same seven targets (2026-11-05, A-210).** `napi.targets` and the npm platform packages
+>   named `x86_64-apple-darwin` and `i686-pc-windows-msvc`, which are not shipped. `publish-node.yml` built only
+>   seven addons, so its tag-only completeness check would have refused the first publish. The PyPI lane built no
+>   Windows arm64 wheel. Both lanes are now held to `xtask/src/targets.rs` and build Windows natively, and their
+>   checks run on the dry run. The dry-run evidence is in A-210.
 > - **Owed to Ada:** a release is published only when a maintainer pushes a real tag `v<version>` and publishes its
 >   draft (`docs/publish.md`). The test draft is never to be published.
 > - **Open, found by the smoke test: the anchor aborts when its stderr closes.** `slates anchor 2>&1 >/dev/null | head

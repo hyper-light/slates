@@ -6008,7 +6008,7 @@ the format floor.
 > `node:24-alpine`), refuses to publish if any platform package lacks its binary, and publishes
 > through npm trusted publishing from the `npm` environment — after the one-time 0.0.0 stub publish
 > of each name that npm requires before a trusted publisher can be attached (npm/cli#8544;
-> `cargo xtask npm-reserve` derives the ten stubs from the same manifests). CI's `sdk` job
+> `cargo xtask npm-reserve` derives one stub per name from the same manifests: eight names since A-210, ten before). CI's `sdk` job
 > installs the wheel into a fresh venv after `twine check --strict`, packs and installs the two npm
 > tarballs into a fresh project, and runs both SDK suites and the packaged smoke test over a live
 > daemon on Linux and macOS. **Proven by use on this host** (macOS 26.4.1, Apple M5 Max,
@@ -6018,8 +6018,7 @@ the format floor.
 > through the optional-dependency loader, dry-run publishes clean; the ten stubs packed and dry-run
 > clean. **Owed:** the stub publish and the two trusted-publisher registrations (a maintainer's
 > login), then the first tag; this section's `abi3-py312` and `cp314t` wheels (PyO3 0.22 has no
-> free-threaded build; the wheel is cp39-abi3 today); Windows arm64 and ia32 wheels (the napi lane
-> ships those platforms; maturin's Windows cross builds are not exercised); and the SDK surface
+> free-threaded build; the wheel is cp39-abi3 today); and the SDK surface
 > this section names beyond packaging (async iterators, `AbortSignal`, `memoryview` reads, the
 > typed exception hierarchy).
 
@@ -8757,8 +8756,9 @@ Recipes to copy verbatim:
 
 ### B.3 Packaging for the SDKs (shape copied from vorpal; SDK details in §4.12)
 
-- npm: a scoped CLI package with `optionalDependencies` on eight platform packages named in
-  napi-rs convention (`darwin-arm64`, `linux-x64-gnu`, `linux-arm64-musl`, `win32-ia32-msvc`, ...),
+- npm: a scoped package with `optionalDependencies` on seven platform packages, one per shipped target
+  (`xtask/src/targets.rs`, A-210), named in napi-rs convention (`darwin-arm64`, `linux-x64-gnu`,
+  `linux-arm64-musl`, `win32-arm64-msvc`, ...),
   each declaring `os`, `cpu`, and Linux `libc`; a postinstall that resolves the package with
   `detect-libc` and hard-links the binary into place; trusted publishing (OIDC) after a one-time
   bootstrap publish. [C: vorpal npm/package.json, npm/postinstall.js:6-27, release.yml:234-281]
@@ -13306,6 +13306,18 @@ Applied in the same change to: Appendix B.2 (body and status), Phase 9 task 5's 
   - The smoke test's own first version stopped reading the anchor's stderr after the serving line, and 8 of 10 runs
     on this Mac aborted the anchor (the GAPS entry: an anchor whose stderr closes aborts). Fixed in the harness: 10 of
     10 after.
+- **The SDK lanes ship the same targets (2026-11-05).** Before this change, `napi.targets` and `crates/sdk-node/npm/`
+  named nine platforms, two of them no longer shipped (`x86_64-apple-darwin`, `i686-pc-windows-msvc`), while
+  `publish-node.yml` built seven. Its tag-only check that every platform package holds its binary would have
+  refused the first publish. The PyPI lane built no Windows arm64 wheel, and its header named a macOS x86_64 wheel
+  it never built.
+  - The shipped targets are now one table (`xtask/src/targets.rs`). The binary release's assets come from it, and
+    `cargo xtask version` refuses a `napi.targets` that names a target outside it (`UnknownTarget`) or leaves a
+    shipped one out (`ShippedTargetMissing`). Test: `napi_targets_name_exactly_the_shipped_targets`.
+  - Both SDK lanes build Windows natively: x86_64 on windows-2025 with NASM, arm64 on windows-11-arm with clang-cl
+    for AWS-LC, as the binary release does.
+  - The binary check (npm) and `twine check --strict` (PyPI) moved out of the tag-only publish jobs, so a
+    `workflow_dispatch` dry run proves them and publishes nothing.
 - **Not yet.** Reproducibility from the tag (AC-9.5): no lane builds twice and compares. The macOS `Slates.app` bundle
   (B.7), code signing and notarization (they need Ada's Apple Developer identity). `cargo-binstall` metadata.
 

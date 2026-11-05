@@ -1,14 +1,15 @@
 # The Node SDK's release lane (§2.4 "`@hyper-light/slates` on npm"; docs/publish.md). On a pushed tag
 # `v<version>`: build the napi addon `slates.<platform>.node` of crates/sdk-node for every target in
-# package.json `napi.targets` — natively per platform (glibc Linux, macOS, Windows, aarch64 on the
-# native arm64 runners, Windows arm64 and ia32 by MSVC's cross tools on the x64 runner) and musl
-# inside node:24-alpine — then publish the nine platform packages and the main package to npm through
-# TRUSTED PUBLISHING: OIDC from the `npm` environment's id-token; no NPM_TOKEN anywhere. npm attaches
-# a trusted publisher only to a package that already exists (npm/cli#8544 — no PyPI-style pending
-# publishers), so each of the ten names is created once by a maintainer's 0.0.0 stub publish
+# package.json `napi.targets`, which `cargo xtask version` holds to exactly the targets slates ships (A-210: macOS
+# arm64, Linux x86_64 and arm64 with glibc and musl, Windows x86_64 and arm64) — each natively on a runner of its own
+# platform (glibc Linux, macOS and Windows on their runners, arm64 on the arm64 runners) and musl inside
+# node:24-alpine — then check that every platform package holds its binary, and on a tag publish the seven platform
+# packages and the main package to npm through TRUSTED PUBLISHING: OIDC from the `npm` environment's id-token; no
+# NPM_TOKEN anywhere. npm attaches a trusted publisher only to a package that already exists (npm/cli#8544 — no
+# PyPI-style pending publishers), so each of the eight names is created once by a maintainer's 0.0.0 stub publish
 # (`cargo xtask npm-reserve`), then given its trusted publisher on npmjs.com (org hyper-light, repo
-# slates, workflow publish-node.yml); tag runs then publish tokenless. workflow_dispatch is a
-# build-only dry run.
+# slates, workflow publish-node.yml); tag runs then publish tokenless. workflow_dispatch is a dry run: it builds every
+# addon and assembles every package, and publishes nothing (the publish job runs on a tag only).
 #
 # The versions are the workspace's: `cargo xtask version --write` derives every package.json from it
 # and the shared guard refuses a tag on any drift.
@@ -28,9 +29,8 @@ jobs:
   guard:
     uses: ./.github/workflows/version-guard.yml
 
-  # Non-musl targets build natively (glibc Linux, macOS, Windows); aarch64 Linux on the native arm64
-  # runner, macOS x86_64 and the Windows arm64/ia32 pair by the host toolchain's cross targets —
-  # the same targets release.yml already builds the workspace for.
+  # Non-musl targets build natively (glibc Linux, macOS, Windows), each on a runner of its own architecture, as
+  # release.yml builds the binary (A-210): arm64 Linux on ubuntu-24.04-arm, arm64 Windows on windows-11-arm.
   build:
     name: napi ${{ matrix.target }}
     needs: guard
@@ -42,14 +42,33 @@ jobs:
           - { target: aarch64-apple-darwin, os: macos-latest }
           - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
           - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
-          - { target: x86_64-pc-windows-msvc, os: windows-latest }
-          - { target: aarch64-pc-windows-msvc, os: windows-latest }
+          - { target: x86_64-pc-windows-msvc, os: windows-2025, nasm: true }
+          - { target: aarch64-pc-windows-msvc, os: windows-11-arm, clang_cl: true }
+    env:
+      # The addon links AWS-LC (slates-client's seal). Its Windows x86 assembly is built from its NASM source, never the
+      # prebuilt objects, as release.yml and CI build it (ignored elsewhere).
+      AWS_LC_SYS_PREBUILT_NASM: "0"
     steps:
       - uses: actions/checkout@v4
+      - name: Install NASM
+        if: ${{ matrix.nasm }}
+        uses: ilammy/setup-nasm@v1.5.2
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
           targets: ${{ matrix.target }}
+      # As release.yml: aws-lc-sys refuses cl.exe for aarch64-pc-windows-msvc and builds with clang-cl.
+      - name: clang-cl for the C the addon links (arm64 Windows)
+        if: ${{ matrix.clang_cl }}
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          & $clang --version
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - uses: Swatinem/rust-cache@v2
         with:
           key: napi-${{ matrix.target }}
@@ -107,10 +126,56 @@ jobs:
           path: crates/sdk-node/slates.*.node
           if-no-files-found: error
 
+  # Every run, the dry run too: each binary moved into its platform package and every package checked to hold one, so
+  # a missing addon fails here, before any tag, and not halfway through a publish.
+  assemble:
+    name: every platform package holds its binary
+    needs: [build, build-musl]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install the napi CLI
+        run: npm install -g @napi-rs/cli@${{ env.NAPI_CLI_VERSION }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: crates/sdk-node/artifacts
+      - name: Move every binary into its platform package
+        working-directory: crates/sdk-node
+        run: napi artifacts
+      # `napi prepublish` skips a platform package whose binary is missing with a warning, which
+      # would publish a main package that cannot load on that platform; refuse instead.
+      - name: Every platform package must hold its binary
+        working-directory: crates/sdk-node
+        run: |
+          set -euo pipefail
+          missing=0
+          count=0
+          for dir in npm/*/; do
+            main=$(node -p "require('./${dir}package.json').main")
+            if [ ! -f "${dir}${main}" ]; then
+              echo "missing: ${dir}${main}"
+              missing=1
+            else
+              count=$((count + 1))
+              ls -l "${dir}${main}"
+            fi
+          done
+          echo "${count} platform packages hold their binary"
+          test "$missing" = 0
+      - name: Pack every package (what npm would publish; nothing is uploaded)
+        working-directory: crates/sdk-node
+        run: |
+          set -euo pipefail
+          for dir in npm/*/; do (cd "$dir" && npm pack --dry-run 2>&1 | tail -4); done
+          npm pack --dry-run --ignore-scripts 2>&1 | tail -6
+
   publish:
     name: Publish @hyper-light/slates to npm (trusted publishing)
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [build, build-musl]
+    needs: [assemble]
     runs-on: ubuntu-latest
     environment: npm
     permissions:
