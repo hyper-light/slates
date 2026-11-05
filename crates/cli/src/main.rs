@@ -82,7 +82,7 @@ fn main() -> ExitCode {
     Command::Daemon(options) => daemon::run(&options),
     Command::Profile(options) => verbs::profile(&options),
     Command::Version => {
-      println!("slates {}", env!("CARGO_PKG_VERSION"));
+      slates_machine::out_line!("slates {}", env!("CARGO_PKG_VERSION"));
       Ok(())
     }
     Command::Mcp(options) => verbs::mcp(&options),
