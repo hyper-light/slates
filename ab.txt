@@ -1317,3 +1317,600 @@ WINFSP TRACE pass=contended phase=unlink kind=Close n=2000 arrived_busy=0 wait_m
 WINFSP TRACE pass=contended phase=unlink kind=SetInformation n=2000 arrived_busy=0 wait_mean=1.9 wait_p50=1.6 wait_p90=1.9 service_mean=6116.3 service_p50=10.2 service_p90=13.8
 WINFSP TRACE pass=contended phase=unlink kind=SetSecurity n=2000 arrived_busy=0 wait_mean=1.9 wait_p50=1.7 wait_p90=1.9 service_mean=0.6 service_p50=0.5 service_p90=0.7
 ## run 2 of 3 done, 2026-11-05T20:20:25Z
+To https://github.com/hyper-light/slates
+   e0817ee..6cf11c2  6cf11c2a9754dffb3282b7d65b8a7bd103923880 -> diag-winfsp-overlap-results-42097182526-windows-latest
+## run 3 of 3, 2026-11-05T20:20:27Z
+# a212 started first: a212=S: a215=T:
+# host: windows 0x23f00206 on windows processor architecture 9 level 25 revision 257 (x86_64), 4 logical CPUs (4 available to this process), 15 GiB, page 4096 B; largest L2 524288 B, cache line 64 B
+# workload: 10 rounds of 1000 files of 4096 B per arm and pass, arms interleaved, first arm rotating
+# arm a212: S:/d
+# arm a215: T:/d
+# warm-up: one untimed round per arm (1000 files each)
+# pass quiet: spinners 0 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 39.9 µs, p99 65.7 µs, p999 122.3 µs, max 2142.0 µs over 11707 probes; 61.8 s
+fsbench	quiet	a212	create	10000	936900	1513500	1899300	65909000
+fsbench	quiet	a212	write	10000	103200	189700	427900	36627400
+fsbench	quiet	a212	fsync	10000	128500	238300	446900	26070600
+fsbench	quiet	a212	close	10000	69300	143400	422000	36652600
+fsbench	quiet	a212	stat	10000	284000	427900	13300000	65192600
+fsbench	quiet	a212	open	10000	196100	292600	709300	33550700
+fsbench	quiet	a212	read	10000	13900	129700	182300	7409700
+fsbench	quiet	a212	rename	10000	618900	895000	1490000	37807800
+fsbench	quiet	a212	unlink	10000	355200	845700	1295300	37610600
+fsbench	quiet	a215	create	10000	963400	1566500	2000300	37766400
+fsbench	quiet	a215	write	10000	102900	190200	419400	29238500
+fsbench	quiet	a215	fsync	10000	152200	255700	504500	36783900
+fsbench	quiet	a215	close	10000	71800	158600	388500	31273200
+fsbench	quiet	a215	stat	10000	335700	447800	977900	65659300
+fsbench	quiet	a215	open	10000	195700	287700	906800	36783300
+fsbench	quiet	a215	read	10000	12300	20100	48000	57000
+fsbench	quiet	a215	rename	10000	701800	1018200	3805400	50957100
+fsbench	quiet	a215	unlink	10000	386900	902600	24544500	37291300
+
+**quiet** (spinners 0 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 39.9 µs, p99 65.7 µs, p999 122.3 µs, max 2142.0 µs over 11707 probes; 61.8 s). Each cell: p50 · p99 · p999 · max, µs.
+
+| op | a212 | a215 |
+|---|---|---|
+| create | 936.9 · 1513.5 · 1899.3 · 65909.0 | 963.4 · 1566.5 · 2000.3 · 37766.4 |
+| write | 103.2 · 189.7 · 427.9 · 36627.4 | 102.9 · 190.2 · 419.4 · 29238.5 |
+| fsync | 128.5 · 238.3 · 446.9 · 26070.6 | 152.2 · 255.7 · 504.5 · 36783.9 |
+| close | 69.3 · 143.4 · 422.0 · 36652.6 | 71.8 · 158.6 · 388.5 · 31273.2 |
+| stat | 284.0 · 427.9 · 13300.0 · 65192.6 | 335.7 · 447.8 · 977.9 · 65659.3 |
+| open | 196.1 · 292.6 · 709.3 · 33550.7 | 195.7 · 287.7 · 906.8 · 36783.3 |
+| read | 13.9 · 129.7 · 182.3 · 7409.7 | 12.3 · 20.1 · 48.0 · 57.0 |
+| rename | 618.9 · 895.0 · 1490.0 · 37807.8 | 701.8 · 1018.2 · 3805.4 · 50957.1 |
+| unlink | 355.2 · 845.7 · 1295.3 · 37610.6 | 386.9 · 902.6 · 24544.5 · 37291.3 |
+
+# pass contended: spinners 8 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 36.6 µs, p99 60.9 µs, p999 92.3 µs, max 132925.4 µs over 52800 probes; 285.1 s
+fsbench	contended	a212	create	10000	1428900	79200800	156227900	212718600
+fsbench	contended	a212	write	10000	89700	308300	68826100	99354800
+fsbench	contended	a212	fsync	10000	138600	306300	71027100	146576600
+fsbench	contended	a212	close	10000	72200	190100	63392200	156737500
+fsbench	contended	a212	stat	10000	266600	10164400	67584100	147823800
+fsbench	contended	a212	open	10000	196800	1317500	65534900	96096200
+fsbench	contended	a212	read	10000	95000	208900	55229000	100298800
+fsbench	contended	a212	rename	10000	637500	45880600	113956000	1659906500
+fsbench	contended	a212	unlink	10000	365300	32270200	1394441600	2975819300
+fsbench	contended	a215	create	10000	1478200	93082600	165296900	352664200
+fsbench	contended	a215	write	10000	93200	27429300	84562200	134807800
+fsbench	contended	a215	fsync	10000	144900	547500	74892700	161194100
+fsbench	contended	a215	close	10000	76000	193700	51165200	129325100
+fsbench	contended	a215	stat	10000	296400	10684100	93270100	162731300
+fsbench	contended	a215	open	10000	203600	620600	65483600	96751700
+fsbench	contended	a215	read	10000	97700	222300	65773200	122574900
+fsbench	contended	a215	rename	10000	687600	45549200	151634300	1239966900
+fsbench	contended	a215	unlink	10000	380800	31999300	1123741000	2129118900
+
+**contended** (spinners 8 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 36.6 µs, p99 60.9 µs, p999 92.3 µs, max 132925.4 µs over 52800 probes; 285.1 s). Each cell: p50 · p99 · p999 · max, µs.
+
+| op | a212 | a215 |
+|---|---|---|
+| create | 1428.9 · 79200.8 · 156227.9 · 212718.6 | 1478.2 · 93082.6 · 165296.9 · 352664.2 |
+| write | 89.7 · 308.3 · 68826.1 · 99354.8 | 93.2 · 27429.3 · 84562.2 · 134807.8 |
+| fsync | 138.6 · 306.3 · 71027.1 · 146576.6 | 144.9 · 547.5 · 74892.7 · 161194.1 |
+| close | 72.2 · 190.1 · 63392.2 · 156737.5 | 76.0 · 193.7 · 51165.2 · 129325.1 |
+| stat | 266.6 · 10164.4 · 67584.1 · 147823.8 | 296.4 · 10684.1 · 93270.1 · 162731.3 |
+| open | 196.8 · 1317.5 · 65534.9 · 96096.2 | 203.6 · 620.6 · 65483.6 · 96751.7 |
+| read | 95.0 · 208.9 · 55229.0 · 100298.8 | 97.7 · 222.3 · 65773.2 · 122574.9 |
+| rename | 637.5 · 45880.6 · 113956.0 · 1659906.5 | 687.6 · 45549.2 · 151634.3 · 1239966.9 |
+| unlink | 365.3 · 32270.2 · 1394441.6 · 2975819.3 | 380.8 · 31999.3 · 1123741.0 · 2129118.9 |
+
+unmounted: S:
+unmounted: T:
+# fsb-145-3-old's error output, 243 lines:
+slates anchor: instance fsb-145-3-old up; daemon pid 4540; 1 shards
+slates anchor: issuer surface: export SLATES_ANCHOR=slates-seg-fsb-145-3-old SLATES_ANCHOR_LEN=18605613056 SLATES_ANCHOR_CONTENT=slates-con-fsb-145-3-old SLATES_ANCHOR_CONTENT_LEN=24330436608
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: effective_capacity_bytes = 17174360064: min(memory.total, the OS/job/cgroup bound when one is set) (anchors ["memory.total", "memory.limit"])
+slates daemon: reserve_per_shard = 5724786688: memory capacity / shards / classes (anchors ["mem.capacity", "rt.shards", "mem.classes"])
+slates daemon: lock_capacity_bytes = 1413120: the OS's lock limit when a confirming lock succeeded, else 0 (anchors ["mem.lock_capacity", "mem.lock_confirmed"])
+slates daemon: table_bytes = 1431196672: reserve_per_shard × TABLE_SHARE_PERMILLE / 1000 (anchors ["mem.lock_capacity", "GAPS §5 table share"])
+slates daemon: volumes_per_shard = 4707883: table_bytes / size_of::<VolumeRecord>() (anchors ["table_bytes"])
+slates daemon: slots_per_ring = 32: requests one client may hold in flight (Little's law: request rate × p99 service time), rounded up to a power of two (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: spin_ns = 400: the expected (mean) cost of parking, the 2-competitive spin threshold (anchors ["wake.mean_ns"])
+slates daemon: log_bytes_per_partition = 1431196672: table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve (anchors ["table_bytes", "page"])
+slates daemon: snapshot_bytes_per_partition = 2862393344: twice the table bytes (the whole partition encoded, with growth headroom) (anchors ["table_bytes"])
+slates daemon: archive_slice_bytes = 831: blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000 (anchors ["hash.blake3_bytes_per_second", "rt.step_budget_ns"])
+slates daemon: memcpy_bytes_per_second = 24202562031: memcpy bytes per second at the largest measured copy size (at least one) (anchors ["memcpy"])
+slates daemon: copy_slice_bytes = 4840: memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000 (anchors ["memcpy", "rt.step_budget_ns"])
+slates daemon: codec = lz4 true, zstd levels [1, 3, 9, 19], byte worth 41 scaled ns: the profile's measured codec points, a byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors ["codecs", "memcpy.bytes_per_second"])
+slates daemon: seal_key_slots = 128: page.base / 32 × shards (one page of key slots per shard) (anchors ["page.base", "shards"])
+slates daemon: telemetry_spans_per_reply = 50: (bulk chunk bytes − encoded fixed report bytes) / encoded span record bytes (anchors ["ipc.bulk_chunk_bytes", "wire.TelemetryReport", "wire.SpanRecord"])
+slates daemon: max_inodes = 2484716: metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.inode_unit_bytes"])
+slates daemon: max_dirs = 1874520: metadata_class / (Slot<DirNode> + a smallest-class directory block's page share) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.directory_unit_bytes"])
+slates daemon: max_chunks = 1397653: reserve_per_shard / content_granule (one chunk per granule at least) (anchors ["reserve_per_shard", "page"])
+slates daemon: metadata_class_bytes = 5724786688: the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM (anchors ["reserve_per_shard", "MEMORY_CLASSES"])
+slates daemon: digest_cache_entries = 232942: max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>() (anchors ["store.max_inodes", "reserve_per_shard"])
+slates daemon: spin_shift = 21: ⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the probe's ±5 % at 95 % (anchors ["wake.sd_ns", "wake.mean_ns"])
+slates daemon: clients_per_shard = 5294: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes (anchors ["reserve_per_shard", "region_bytes"])
+slates daemon: direct_maps_per_shard = 1397653: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"])
+slates daemon: landings_awaiting_per_shard = 5294: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 10593: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: idle_window_ns = 40000: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: guest_listing_entries = 0: none: a Windows guest's stream ends with its daemon, so no number it holds outlives a restart (anchors [])
+slates daemon: inode_reserve = 18876: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 5264: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 715598336: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 2484716: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 2484716: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates-server: shard 0 initialized in 1877 µs
+slates daemon: instance fsb-145-3-old serving on 1 shards under the anchor
+slates-winfsp: reply spin window = 17600 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+WINFSP TRACE pass=quiet phase=create rounds=10 busy_us=5290215 queued_us=0 wall_us=60201558 receives=115455 receive_p50=38.9 receive_p90=65.5 batches0..4+=[532, 114366, 549, 0, 8]
+WINFSP TRACE pass=quiet phase=create idle n=117651 mean=358.0 p50=61.4 p90=90.1
+WINFSP TRACE pass=quiet phase=create stage=BE n=117651 mean=44.7 p50=9.2 p90=155.6
+WINFSP TRACE pass=quiet phase=create stage=ES n=117651 mean=0.5 p50=0.4 p90=0.7
+WINFSP TRACE pass=quiet phase=create stage=SR n=117651 mean=20.6 p50=17.4 p90=36.9
+WINFSP TRACE pass=quiet phase=create stage=RB n=2728 mean=1.1 p50=0.6 p90=2.6
+WINFSP TRACE pass=quiet phase=create stage=RC n=114923 mean=1.4 p50=0.7 p90=3.5
+WINFSP TRACE pass=quiet phase=create stage=CV n=115455 mean=39.9 p50=38.9 p90=65.5
+WINFSP TRACE pass=quiet phase=create stage=VB n=114923 mean=2.2 p50=2.0 p90=2.6
+WINFSP TRACE pass=quiet phase=create stage=VC n=532 mean=0.9 p50=0.8 p90=1.0
+WINFSP TRACE pass=quiet phase=create kind=Create n=20010 arrived_busy=0 wait_mean=4.3 wait_p50=2.2 wait_p90=2.6 service_mean=32.2 service_p50=28.7 service_p90=38.9
+WINFSP TRACE pass=quiet phase=create kind=Cleanup n=20000 arrived_busy=0 wait_mean=2.3 wait_p50=1.6 wait_p90=1.9 service_mean=7.0 service_p50=3.6 service_p90=7.4
+WINFSP TRACE pass=quiet phase=create kind=Close n=12181 arrived_busy=0 wait_mean=899.9 wait_p50=1.3 wait_p90=3670.0 service_mean=40.0 service_p50=27.6 service_p90=55.3
+WINFSP TRACE pass=quiet phase=create kind=Write n=10000 arrived_busy=0 wait_mean=3.0 wait_p50=1.8 wait_p90=2.0 service_mean=17.7 service_p50=12.3 service_p90=31.7
+WINFSP TRACE pass=quiet phase=create kind=SetInformation n=10000 arrived_busy=0 wait_mean=1.7 wait_p50=1.6 wait_p90=1.9 service_mean=35.6 service_p50=26.6 service_p90=55.3
+WINFSP TRACE pass=quiet phase=create kind=FlushBuffers n=10000 arrived_busy=0 wait_mean=2.8 wait_p50=1.6 wait_p90=1.8 service_mean=11.2 service_p50=6.1 service_p90=10.2
+WINFSP TRACE pass=quiet phase=create kind=QueryDirectory n=15460 arrived_busy=0 wait_mean=1.5 wait_p50=1.6 wait_p90=1.8 service_mean=217.6 service_p50=221.2 service_p90=294.9
+WINFSP TRACE pass=quiet phase=create kind=SetSecurity n=20000 arrived_busy=0 wait_mean=1.8 wait_p50=1.8 wait_p90=2.0 service_mean=0.5 service_p50=0.5 service_p90=0.6
+WINFSP TRACE pass=quiet phase=stat rounds=10 busy_us=871521 queued_us=0 wall_us=59205133 receives=49997 receive_p50=28.7 receive_p90=45.1 batches0..4+=[148, 49686, 161, 0, 2]
+WINFSP TRACE pass=quiet phase=stat idle n=50918 mean=49.3 p50=51.2 p90=65.5
+WINFSP TRACE pass=quiet phase=stat stage=BE n=50918 mean=16.8 p50=3.8 p90=25.6
+WINFSP TRACE pass=quiet phase=stat stage=ES n=50918 mean=0.4 p50=0.4 p90=0.6
+WINFSP TRACE pass=quiet phase=stat stage=SR n=50918 mean=15.8 p50=16.4 p90=22.5
+WINFSP TRACE pass=quiet phase=stat stage=RB n=1068 mean=0.9 p50=0.6 p90=2.2
+WINFSP TRACE pass=quiet phase=stat stage=RC n=49849 mean=1.4 p50=0.7 p90=3.3
+WINFSP TRACE pass=quiet phase=stat stage=CV n=49997 mean=30.3 p50=28.7 p90=45.1
+WINFSP TRACE pass=quiet phase=stat stage=VB n=49850 mean=2.2 p50=2.0 p90=2.4
+WINFSP TRACE pass=quiet phase=stat stage=VC n=148 mean=0.8 p50=0.8 p90=1.0
+WINFSP TRACE pass=quiet phase=stat kind=Create n=10010 arrived_busy=0 wait_mean=3.1 wait_p50=2.0 wait_p90=2.4 service_mean=21.0 service_p50=11.3 service_p90=14.3
+WINFSP TRACE pass=quiet phase=stat kind=Cleanup n=10000 arrived_busy=0 wait_mean=1.7 wait_p50=1.7 wait_p90=1.9 service_mean=0.6 service_p50=0.6 service_p90=0.6
+WINFSP TRACE pass=quiet phase=stat kind=Close n=10908 arrived_busy=0 wait_mean=349.1 wait_p50=1.6 wait_p90=2.2 service_mean=43.2 service_p50=16.4 service_p90=53.2
+WINFSP TRACE pass=quiet phase=stat kind=QueryVolumeInformation n=10000 arrived_busy=0 wait_mean=1.6 wait_p50=1.5 wait_p90=1.8 service_mean=17.9 service_p50=4.1 service_p90=23.6
+WINFSP TRACE pass=quiet phase=stat kind=SetSecurity n=10000 arrived_busy=0 wait_mean=1.7 wait_p50=1.7 wait_p90=1.9 service_mean=0.5 service_p50=0.4 service_p90=0.5
+WINFSP TRACE pass=quiet phase=open rounds=10 busy_us=698490 queued_us=0 wall_us=59117770 receives=40010 receive_p50=45.1 receive_p90=57.3 batches0..4+=[131, 39748, 131, 0, 0]
+WINFSP TRACE pass=quiet phase=open idle n=40010 mean=58.9 p50=69.6 p90=81.9
+WINFSP TRACE pass=quiet phase=open stage=BE n=40010 mean=17.2 p50=4.0 p90=51.2
+WINFSP TRACE pass=quiet phase=open stage=ES n=40010 mean=0.5 p50=0.4 p90=0.8
+WINFSP TRACE pass=quiet phase=open stage=SR n=40010 mean=15.9 p50=17.4 p90=23.6
+WINFSP TRACE pass=quiet phase=open stage=RB n=132 mean=2.8 p50=2.6 p90=3.2
+WINFSP TRACE pass=quiet phase=open stage=RC n=39879 mean=1.6 p50=0.7 p90=3.5
+WINFSP TRACE pass=quiet phase=open stage=CV n=40010 mean=39.0 p50=45.1 p90=57.3
+WINFSP TRACE pass=quiet phase=open stage=VB n=39878 mean=2.2 p50=2.2 p90=2.7
+WINFSP TRACE pass=quiet phase=open stage=VC n=131 mean=0.9 p50=0.9 p90=1.1
+WINFSP TRACE pass=quiet phase=open kind=Create n=10010 arrived_busy=0 wait_mean=3.2 wait_p50=2.3 wait_p90=2.6 service_mean=21.1 service_p50=15.9 service_p90=32.8
+WINFSP TRACE pass=quiet phase=open kind=Cleanup n=10000 arrived_busy=0 wait_mean=1.7 wait_p50=1.7 wait_p90=2.0 service_mean=0.5 service_p50=0.5 service_p90=0.6
+WINFSP TRACE pass=quiet phase=open kind=Close n=8911 arrived_busy=0 wait_mean=1.4 wait_p50=1.3 wait_p90=1.7 service_mean=50.8 service_p50=51.2 service_p90=57.3
+WINFSP TRACE pass=quiet phase=open kind=Read n=1089 arrived_busy=0 wait_mean=1.7 wait_p50=1.7 wait_p90=1.9 service_mean=22.8 service_p50=7.4 service_p90=28.7
+WINFSP TRACE pass=quiet phase=open kind=SetSecurity n=10000 arrived_busy=0 wait_mean=1.8 wait_p50=1.8 wait_p90=1.9 service_mean=0.5 service_p50=0.5 service_p90=0.5
+WINFSP TRACE pass=quiet phase=rename rounds=10 busy_us=1413619 queued_us=0 wall_us=59444677 receives=89995 receive_p50=32.8 receive_p90=55.3 batches0..4+=[332, 89316, 347, 0, 0]
+WINFSP TRACE pass=quiet phase=rename idle n=90010 mean=57.0 p50=55.3 p90=81.9
+WINFSP TRACE pass=quiet phase=rename stage=BE n=90010 mean=15.4 p50=5.6 p90=36.9
+WINFSP TRACE pass=quiet phase=rename stage=ES n=90010 mean=2.1 p50=0.5 p90=12.8
+WINFSP TRACE pass=quiet phase=rename stage=SR n=90010 mean=16.7 p50=17.4 p90=23.6
+WINFSP TRACE pass=quiet phase=rename stage=RB n=347 mean=2.0 p50=1.6 p90=2.9
+WINFSP TRACE pass=quiet phase=rename stage=RC n=89663 mean=1.5 p50=0.7 p90=3.5
+WINFSP TRACE pass=quiet phase=rename stage=CV n=89995 mean=34.8 p50=32.8 p90=55.3
+WINFSP TRACE pass=quiet phase=rename stage=VB n=89663 mean=2.2 p50=2.0 p90=2.8
+WINFSP TRACE pass=quiet phase=rename stage=VC n=332 mean=0.8 p50=0.8 p90=0.9
+WINFSP TRACE pass=quiet phase=rename kind=Create n=20010 arrived_busy=0 wait_mean=2.8 wait_p50=2.4 wait_p90=2.8 service_mean=32.1 service_p50=13.8 service_p90=63.5
+WINFSP TRACE pass=quiet phase=rename kind=Cleanup n=20000 arrived_busy=0 wait_mean=1.9 wait_p50=1.5 wait_p90=1.8 service_mean=0.4 service_p50=0.5 service_p90=0.6
+WINFSP TRACE pass=quiet phase=rename kind=Close n=20000 arrived_busy=0 wait_mean=1.7 wait_p50=1.6 wait_p90=1.9 service_mean=19.5 service_p50=6.7 service_p90=47.1
+WINFSP TRACE pass=quiet phase=rename kind=SetInformation n=10000 arrived_busy=0 wait_mean=1.4 wait_p50=1.3 wait_p90=1.7 service_mean=36.4 service_p50=22.5 service_p90=51.2
+WINFSP TRACE pass=quiet phase=rename kind=SetSecurity n=20000 arrived_busy=0 wait_mean=1.8 wait_p50=1.7 wait_p90=2.0 service_mean=0.4 service_p50=0.4 service_p90=0.5
+WINFSP TRACE pass=quiet phase=unlink rounds=10 busy_us=1173292 queued_us=0 wall_us=59118204 receives=50052 receive_p50=41.0 receive_p90=47.1 batches0..4+=[203, 49646, 176, 1, 26]
+WINFSP TRACE pass=quiet phase=unlink idle n=57010 mean=60.2 p50=59.4 p90=73.7
+WINFSP TRACE pass=quiet phase=unlink stage=BE n=57010 mean=20.3 p50=11.3 p90=26.6
+WINFSP TRACE pass=quiet phase=unlink stage=ES n=57010 mean=0.4 p50=0.4 p90=0.7
+WINFSP TRACE pass=quiet phase=unlink stage=SR n=57010 mean=16.0 p50=17.4 p90=23.6
+WINFSP TRACE pass=quiet phase=unlink stage=RB n=7161 mean=0.8 p50=0.6 p90=1.0
+WINFSP TRACE pass=quiet phase=unlink stage=RC n=49849 mean=1.5 p50=0.8 p90=3.3
+WINFSP TRACE pass=quiet phase=unlink stage=CV n=50052 mean=674.8 p50=41.0 p90=47.1
+WINFSP TRACE pass=quiet phase=unlink stage=VB n=49849 mean=2.3 p50=2.2 p90=2.4
+WINFSP TRACE pass=quiet phase=unlink stage=VC n=203 mean=1.6 p50=0.9 p90=4.1
+WINFSP TRACE pass=quiet phase=unlink kind=Create n=10010 arrived_busy=0 wait_mean=4.0 wait_p50=2.0 wait_p90=2.3 service_mean=26.8 service_p50=14.8 service_p90=20.5
+WINFSP TRACE pass=quiet phase=unlink kind=Cleanup n=10000 arrived_busy=0 wait_mean=3.1 wait_p50=1.7 wait_p90=1.9 service_mean=26.5 service_p50=17.4 service_p90=43.0
+WINFSP TRACE pass=quiet phase=unlink kind=Close n=17000 arrived_busy=0 wait_mean=2349.9 wait_p50=1.8 wait_p90=8388.6 service_mean=24.6 service_p50=10.2 service_p90=16.4
+WINFSP TRACE pass=quiet phase=unlink kind=SetInformation n=10000 arrived_busy=0 wait_mean=1.7 wait_p50=1.7 wait_p90=1.9 service_mean=21.7 service_p50=9.2 service_p90=51.2
+WINFSP TRACE pass=quiet phase=unlink kind=SetSecurity n=10000 arrived_busy=0 wait_mean=2.6 wait_p50=1.8 wait_p90=1.9 service_mean=0.5 service_p50=0.5 service_p90=0.6
+slates daemon: a heartbeat came 513 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 4 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 271 ms and its timer overrun 14 ms
+slates daemon: a heartbeat came 580 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 5 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 4 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 313 ms and its timer overrun 14 ms
+slates daemon: a heartbeat came 642 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 4 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 407 ms and its timer overrun 14 ms
+slates daemon: a heartbeat came 582 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 4 steps and 7 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 5 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 407 ms and its timer overrun 14 ms
+slates daemon: a heartbeat came 551 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 407 ms and its timer overrun 58 ms
+slates daemon: a heartbeat came 639 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 407 ms and its timer overrun 58 ms
+slates daemon: a heartbeat came 582 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 407 ms and its timer overrun 58 ms
+slates daemon: a heartbeat came 687 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 1833 steps and 1294 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 343 unattributed), fired 2 timers, waited 1 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 407 ms and its timer overrun 41 ms
+slates daemon: a heartbeat came 540 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 4 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 407 ms and its timer overrun 41 ms
+slates daemon: a heartbeat came 640 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 4 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 407 ms and its timer overrun 41 ms
+slates daemon: a heartbeat came 539 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 6 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 6 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 407 ms and its timer overrun 27 ms
+slates daemon: a heartbeat came 835 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 442 ms and its timer overrun 35 ms
+slates daemon: a heartbeat came 762 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 442 ms and its timer overrun 35 ms
+slates daemon: a heartbeat came 545 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 442 ms and its timer overrun 35 ms
+slates daemon: a heartbeat came 794 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 35 ms
+slates daemon: a heartbeat came 630 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 35 ms
+slates daemon: a heartbeat came 593 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 484 steps and 342 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 123 unattributed), fired 2 timers, waited 1 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 15 ms
+slates daemon: a heartbeat came 529 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 15 ms
+slates daemon: a heartbeat came 578 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 4 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 15 ms
+slates daemon: a heartbeat came 532 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 6 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 5 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 15 ms
+slates daemon: a heartbeat came 670 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 845 steps and 622 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 188 unattributed), fired 2 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 19 ms
+slates daemon: a heartbeat came 503 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 1578 steps and 1114 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 285 unattributed), fired 2 timers, waited 1 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 51 ms
+slates daemon: a heartbeat came 632 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 11 ms
+slates daemon: a heartbeat came 587 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 34 ms
+slates daemon: a heartbeat came 632 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 5 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 34 ms
+slates daemon: a heartbeat came 667 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 6 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 5 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 34 ms
+slates daemon: a heartbeat came 650 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 6 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 6 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 34 ms
+slates daemon: a heartbeat came 882 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 5 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 32 ms
+slates daemon: a heartbeat came 880 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 32 ms
+slates daemon: a heartbeat came 911 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 32 ms
+slates daemon: a heartbeat came 743 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 32 ms
+slates daemon: a heartbeat came 508 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 44 ms
+slates daemon: a heartbeat came 608 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 22 ms
+slates daemon: a heartbeat came 643 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 22 ms
+slates daemon: a heartbeat came 520 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 1372 steps and 1009 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 148 unattributed), fired 2 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 28 ms
+slates daemon: a heartbeat came 641 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 1469 steps and 1038 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 272 unattributed), fired 2 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 39 ms
+slates daemon: a heartbeat came 566 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 5 steps and 8 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 5 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 39 ms
+slates daemon: a heartbeat came 508 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 4 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 39 ms
+slates daemon: a heartbeat came 898 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 1 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 2 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 110 ms
+slates daemon: a heartbeat came 771 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 110 ms
+slates daemon: a heartbeat came 761 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 110 ms
+slates daemon: a heartbeat came 844 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 110 ms
+slates daemon: a heartbeat came 752 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 110 ms
+slates daemon: a heartbeat came 545 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 20 ms
+slates daemon: a heartbeat came 557 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 20 ms
+slates daemon: a heartbeat came 540 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 6 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 6 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 20 ms
+slates daemon: a heartbeat came 501 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 4 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 20 ms
+slates daemon: a heartbeat came 590 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 476 ms and its timer overrun 20 ms
+WINFSP TRACE pass=contended phase=create rounds=10 busy_us=40406528 queued_us=0 wall_us=276585909 receives=116260 receive_p50=41.0 receive_p90=69.6 batches0..4+=[305, 115593, 333, 0, 29]
+WINFSP TRACE pass=contended phase=create idle n=124901 mean=1372.7 p50=63.5 p90=118.8
+WINFSP TRACE pass=contended phase=create stage=BE n=124901 mean=323.1 p50=11.3 p90=311.3
+WINFSP TRACE pass=contended phase=create stage=ES n=124901 mean=0.6 p50=0.6 p90=0.8
+WINFSP TRACE pass=contended phase=create stage=SR n=124901 mean=29.2 p50=18.4 p90=59.4
+WINFSP TRACE pass=contended phase=create stage=RB n=8946 mean=1.5 p50=1.3 p90=1.5
+WINFSP TRACE pass=contended phase=create stage=RC n=115955 mean=10.5 p50=0.6 p90=5.4
+WINFSP TRACE pass=contended phase=create stage=CV n=116260 mean=80.1 p50=41.0 p90=69.6
+WINFSP TRACE pass=contended phase=create stage=VB n=115955 mean=2.9 p50=2.3 p90=3.3
+WINFSP TRACE pass=contended phase=create stage=VC n=305 mean=0.9 p50=0.8 p90=1.3
+WINFSP TRACE pass=contended phase=create kind=Create n=20010 arrived_busy=0 wait_mean=117.1 wait_p50=2.9 wait_p90=3.2 service_mean=170.4 service_p50=41.0 service_p90=73.7
+WINFSP TRACE pass=contended phase=create kind=Cleanup n=20000 arrived_busy=0 wait_mean=2.0 wait_p50=2.0 wait_p90=2.2 service_mean=64.1 service_p50=5.1 service_p90=8.7
+WINFSP TRACE pass=contended phase=create kind=Close n=18621 arrived_busy=0 wait_mean=5758.6 wait_p50=1.8 wait_p90=23068.7 service_mean=726.4 service_p50=11.3 service_p90=22.5
+WINFSP TRACE pass=contended phase=create kind=Write n=10000 arrived_busy=0 wait_mean=9.2 wait_p50=2.0 wait_p90=2.0 service_mean=132.4 service_p50=14.3 service_p90=20.5
+WINFSP TRACE pass=contended phase=create kind=SetInformation n=10000 arrived_busy=0 wait_mean=1.9 wait_p50=1.9 wait_p90=2.0 service_mean=213.9 service_p50=11.8 service_p90=15.9
+WINFSP TRACE pass=contended phase=create kind=FlushBuffers n=10000 arrived_busy=0 wait_mean=9.1 wait_p50=1.9 wait_p90=2.0 service_mean=120.3 service_p50=10.2 service_p90=13.3
+WINFSP TRACE pass=contended phase=create kind=QueryDirectory n=16270 arrived_busy=0 wait_mean=8.2 wait_p50=1.9 wait_p90=2.2 service_mean=1076.3 service_p50=426.0 service_p90=557.1
+WINFSP TRACE pass=contended phase=create kind=SetSecurity n=20000 arrived_busy=0 wait_mean=2.2 wait_p50=2.0 wait_p90=2.2 service_mean=0.5 service_p50=0.5 service_p90=0.6
+WINFSP TRACE pass=contended phase=stat rounds=10 busy_us=3352393 queued_us=0 wall_us=266228027 receives=49855 receive_p50=28.7 receive_p90=41.0 batches0..4+=[28, 49644, 183, 0, 0]
+WINFSP TRACE pass=contended phase=stat idle n=50010 mean=80.8 p50=49.2 p90=63.5
+WINFSP TRACE pass=contended phase=stat stage=BE n=50010 mean=66.7 p50=6.1 p90=20.5
+WINFSP TRACE pass=contended phase=stat stage=ES n=50010 mean=0.5 p50=0.5 p90=0.6
+WINFSP TRACE pass=contended phase=stat stage=SR n=50010 mean=16.5 p50=17.4 p90=23.6
+WINFSP TRACE pass=contended phase=stat stage=RB n=183 mean=3.5 p50=3.1 p90=3.7
+WINFSP TRACE pass=contended phase=stat stage=RC n=49827 mean=6.6 p50=0.6 p90=5.1
+WINFSP TRACE pass=contended phase=stat stage=CV n=49855 mean=55.4 p50=27.6 p90=41.0
+WINFSP TRACE pass=contended phase=stat stage=VB n=49827 mean=2.4 p50=2.2 p90=3.2
+WINFSP TRACE pass=contended phase=stat stage=VC n=28 mean=1.1 p50=0.8 p90=1.8
+WINFSP TRACE pass=contended phase=stat kind=Create n=10010 arrived_busy=0 wait_mean=41.4 wait_p50=2.8 wait_p90=3.2 service_mean=57.6 service_p50=20.5 service_p90=23.6
+WINFSP TRACE pass=contended phase=stat kind=Cleanup n=10000 arrived_busy=0 wait_mean=1.9 wait_p50=1.9 wait_p90=2.0 service_mean=0.6 service_p50=0.6 service_p90=0.7
+WINFSP TRACE pass=contended phase=stat kind=Close n=10000 arrived_busy=0 wait_mean=1.6 wait_p50=1.5 wait_p90=1.6 service_mean=144.3 service_p50=10.2 service_p90=43.0
+WINFSP TRACE pass=contended phase=stat kind=QueryVolumeInformation n=10000 arrived_busy=0 wait_mean=1.9 wait_p50=1.9 wait_p90=2.0 service_mean=132.3 service_p50=6.7 service_p90=7.9
+WINFSP TRACE pass=contended phase=stat kind=SetSecurity n=10000 arrived_busy=0 wait_mean=1.7 wait_p50=1.6 wait_p90=1.9 service_mean=0.4 service_p50=0.4 service_p90=0.5
+WINFSP TRACE pass=contended phase=open rounds=10 busy_us=3720690 queued_us=0 wall_us=266465769 receives=40015 receive_p50=51.2 receive_p90=69.6 batches0..4+=[22, 39958, 22, 0, 13]
+WINFSP TRACE pass=contended phase=open idle n=44117 mean=127.6 p50=77.8 p90=98.3
+WINFSP TRACE pass=contended phase=open stage=BE n=44117 mean=84.0 p50=8.7 p90=27.6
+WINFSP TRACE pass=contended phase=open stage=ES n=44117 mean=0.5 p50=0.5 p90=0.7
+WINFSP TRACE pass=contended phase=open stage=SR n=44117 mean=18.7 p50=18.4 p90=24.6
+WINFSP TRACE pass=contended phase=open stage=RB n=4124 mean=1.3 p50=1.3 p90=1.3
+WINFSP TRACE pass=contended phase=open stage=RC n=39993 mean=9.0 p50=0.7 p90=5.4
+WINFSP TRACE pass=contended phase=open stage=CV n=40015 mean=107.9 p50=51.2 p90=69.6
+WINFSP TRACE pass=contended phase=open stage=VB n=39993 mean=2.8 p50=2.4 p90=4.1
+WINFSP TRACE pass=contended phase=open stage=VC n=22 mean=0.9 p50=0.9 p90=1.3
+WINFSP TRACE pass=contended phase=open kind=Create n=10010 arrived_busy=0 wait_mean=12.5 wait_p50=3.6 wait_p90=3.7 service_mean=209.0 service_p50=26.6 service_p90=34.8
+WINFSP TRACE pass=contended phase=open kind=Cleanup n=10000 arrived_busy=0 wait_mean=7.3 wait_p50=1.9 wait_p90=2.0 service_mean=0.6 service_p50=0.6 service_p90=0.7
+WINFSP TRACE pass=contended phase=open kind=Close n=4861 arrived_busy=0 wait_mean=12454.5 wait_p50=3801.1 wait_p90=52428.8 service_mean=74.0 service_p50=9.2 service_p90=11.3
+WINFSP TRACE pass=contended phase=open kind=Read n=9246 arrived_busy=0 wait_mean=1.9 wait_p50=1.9 wait_p90=2.0 service_mean=136.0 service_p50=10.8 service_p90=13.8
+WINFSP TRACE pass=contended phase=open kind=SetSecurity n=10000 arrived_busy=0 wait_mean=6.8 wait_p50=2.0 wait_p90=2.2 service_mean=0.5 service_p50=0.5 service_p90=0.5
+WINFSP TRACE pass=contended phase=rename rounds=10 busy_us=10448812 queued_us=0 wall_us=267278421 receives=89996 receive_p50=31.7 receive_p90=57.3 batches0..4+=[416, 89136, 431, 0, 13]
+WINFSP TRACE pass=contended phase=rename idle n=95272 mean=108.0 p50=51.2 p90=86.0
+WINFSP TRACE pass=contended phase=rename stage=BE n=95272 mean=109.3 p50=9.2 p90=31.7
+WINFSP TRACE pass=contended phase=rename stage=ES n=95272 mean=8.6 p50=0.5 p90=14.8
+WINFSP TRACE pass=contended phase=rename stage=SR n=95272 mean=17.1 p50=17.4 p90=24.6
+WINFSP TRACE pass=contended phase=rename stage=RB n=5692 mean=1.4 p50=1.3 p90=1.5
+WINFSP TRACE pass=contended phase=rename stage=RC n=89580 mean=15.9 p50=0.6 p90=5.1
+WINFSP TRACE pass=contended phase=rename stage=CV n=89996 mean=69.0 p50=31.7 p90=57.3
+WINFSP TRACE pass=contended phase=rename stage=VB n=89580 mean=2.5 p50=2.2 p90=3.8
+WINFSP TRACE pass=contended phase=rename stage=VC n=416 mean=0.7 p50=0.7 p90=0.8
+WINFSP TRACE pass=contended phase=rename kind=Create n=20010 arrived_busy=0 wait_mean=12.2 wait_p50=3.2 wait_p90=3.6 service_mean=238.2 service_p50=23.6 service_p90=29.7
+WINFSP TRACE pass=contended phase=rename kind=Cleanup n=20000 arrived_busy=0 wait_mean=17.7 wait_p50=1.7 wait_p90=2.0 service_mean=0.5 service_p50=0.5 service_p90=0.6
+WINFSP TRACE pass=contended phase=rename kind=Close n=25262 arrived_busy=0 wait_mean=2041.6 wait_p50=1.5 wait_p90=4980.7 service_mean=115.7 service_p50=10.2 service_p90=14.8
+WINFSP TRACE pass=contended phase=rename kind=SetInformation n=10000 arrived_busy=0 wait_mean=2.0 wait_p50=1.9 wait_p90=2.0 service_mean=274.1 service_p50=55.3 service_p90=69.6
+WINFSP TRACE pass=contended phase=rename kind=SetSecurity n=20000 arrived_busy=0 wait_mean=3.2 wait_p50=1.8 wait_p90=2.0 service_mean=0.5 service_p50=0.5 service_p90=0.5
+WINFSP TRACE pass=contended phase=unlink rounds=10 busy_us=27385579 queued_us=0 wall_us=270510397 receives=50143 receive_p50=36.9 receive_p90=47.1 batches0..4+=[335, 49599, 203, 0, 6]
+WINFSP TRACE pass=contended phase=unlink idle n=52266 mean=156.8 p50=59.4 p90=77.8
+WINFSP TRACE pass=contended phase=unlink stage=BE n=52266 mean=523.6 p50=13.3 p90=23.6
+WINFSP TRACE pass=contended phase=unlink stage=ES n=52266 mean=0.6 p50=0.5 p90=0.7
+WINFSP TRACE pass=contended phase=unlink stage=SR n=52266 mean=17.6 p50=18.4 p90=24.6
+WINFSP TRACE pass=contended phase=unlink stage=RB n=2458 mean=1.5 p50=1.3 p90=1.7
+WINFSP TRACE pass=contended phase=unlink stage=RC n=49808 mean=69.8 p50=0.6 p90=5.1
+WINFSP TRACE pass=contended phase=unlink stage=CV n=50143 mean=3201.5 p50=36.9 p90=47.1
+WINFSP TRACE pass=contended phase=unlink stage=VB n=49808 mean=2.6 p50=2.3 p90=3.2
+WINFSP TRACE pass=contended phase=unlink stage=VC n=335 mean=2.8 p50=1.0 p90=5.1
+WINFSP TRACE pass=contended phase=unlink kind=Create n=10010 arrived_busy=0 wait_mean=32.9 wait_p50=2.9 wait_p90=3.2 service_mean=748.6 service_p50=19.5 service_p90=25.6
+WINFSP TRACE pass=contended phase=unlink kind=Cleanup n=10000 arrived_busy=0 wait_mean=1.9 wait_p50=1.9 wait_p90=2.0 service_mean=468.6 service_p50=19.5 service_p90=49.2
+WINFSP TRACE pass=contended phase=unlink kind=Close n=12256 arrived_busy=0 wait_mean=154723.1 wait_p50=1.6 wait_p90=25165.8 service_mean=643.6 service_p50=13.3 service_p90=47.1
+WINFSP TRACE pass=contended phase=unlink kind=SetInformation n=10000 arrived_busy=0 wait_mean=1.9 wait_p50=1.9 wait_p90=2.0 service_mean=731.3 service_p50=10.8 service_p90=12.8
+WINFSP TRACE pass=contended phase=unlink kind=SetSecurity n=10000 arrived_busy=0 wait_mean=2.0 wait_p50=2.0 wait_p90=2.0 service_mean=0.5 service_p50=0.5 service_p90=0.5
+# fsb-145-3-new's error output, 272 lines:
+slates anchor: instance fsb-145-3-new up; daemon pid 8076; 1 shards
+slates anchor: issuer surface: export SLATES_ANCHOR=slates-seg-fsb-145-3-new SLATES_ANCHOR_LEN=18605613056 SLATES_ANCHOR_CONTENT=slates-con-fsb-145-3-new SLATES_ANCHOR_CONTENT_LEN=24330436608
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: effective_capacity_bytes = 17174360064: min(memory.total, the OS/job/cgroup bound when one is set) (anchors ["memory.total", "memory.limit"])
+slates daemon: reserve_per_shard = 5724786688: memory capacity / shards / classes (anchors ["mem.capacity", "rt.shards", "mem.classes"])
+slates daemon: lock_capacity_bytes = 1413120: the OS's lock limit when a confirming lock succeeded, else 0 (anchors ["mem.lock_capacity", "mem.lock_confirmed"])
+slates daemon: table_bytes = 1431196672: reserve_per_shard × TABLE_SHARE_PERMILLE / 1000 (anchors ["mem.lock_capacity", "GAPS §5 table share"])
+slates daemon: volumes_per_shard = 4707883: table_bytes / size_of::<VolumeRecord>() (anchors ["table_bytes"])
+slates daemon: slots_per_ring = 32: requests one client may hold in flight (Little's law: request rate × p99 service time), rounded up to a power of two (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: spin_ns = 536: the expected (mean) cost of parking, the 2-competitive spin threshold (anchors ["wake.mean_ns"])
+slates daemon: log_bytes_per_partition = 1431196672: table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve (anchors ["table_bytes", "page"])
+slates daemon: snapshot_bytes_per_partition = 2862393344: twice the table bytes (the whole partition encoded, with growth headroom) (anchors ["table_bytes"])
+slates daemon: archive_slice_bytes = 1108: blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000 (anchors ["hash.blake3_bytes_per_second", "rt.step_budget_ns"])
+slates daemon: memcpy_bytes_per_second = 23871963574: memcpy bytes per second at the largest measured copy size (at least one) (anchors ["memcpy"])
+slates daemon: copy_slice_bytes = 6397: memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000 (anchors ["memcpy", "rt.step_budget_ns"])
+slates daemon: codec = lz4 true, zstd levels [1, 3, 9, 19], byte worth 41 scaled ns: the profile's measured codec points, a byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors ["codecs", "memcpy.bytes_per_second"])
+slates daemon: seal_key_slots = 128: page.base / 32 × shards (one page of key slots per shard) (anchors ["page.base", "shards"])
+slates daemon: telemetry_spans_per_reply = 50: (bulk chunk bytes − encoded fixed report bytes) / encoded span record bytes (anchors ["ipc.bulk_chunk_bytes", "wire.TelemetryReport", "wire.SpanRecord"])
+slates daemon: max_inodes = 2484716: metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.inode_unit_bytes"])
+slates daemon: max_dirs = 1874520: metadata_class / (Slot<DirNode> + a smallest-class directory block's page share) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.directory_unit_bytes"])
+slates daemon: max_chunks = 1397653: reserve_per_shard / content_granule (one chunk per granule at least) (anchors ["reserve_per_shard", "page"])
+slates daemon: metadata_class_bytes = 5724786688: the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM (anchors ["reserve_per_shard", "MEMORY_CLASSES"])
+slates daemon: digest_cache_entries = 232942: max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>() (anchors ["store.max_inodes", "reserve_per_shard"])
+slates daemon: spin_shift = 23: ⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the probe's ±5 % at 95 % (anchors ["wake.sd_ns", "wake.mean_ns"])
+slates daemon: clients_per_shard = 5294: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes (anchors ["reserve_per_shard", "region_bytes"])
+slates daemon: direct_maps_per_shard = 1397653: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"])
+slates daemon: landings_awaiting_per_shard = 5294: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 10593: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: idle_window_ns = 53600: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: guest_listing_entries = 0: none: a Windows guest's stream ends with its daemon, so no number it holds outlives a restart (anchors [])
+slates daemon: inode_reserve = 18876: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 5264: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 715598336: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 2484716: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 2484716: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: instance fsb-145-3-new serving on 1 shards under the anchor
+slates-server: shard 0 initialized in 1880 µs
+slates-winfsp: reply spin window = 15100 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+WINFSP TRACE pass=quiet phase=create rounds=10 busy_us=5867387 queued_us=0 wall_us=53913002 receives=115469 receive_p50=57.3 receive_p90=86.0 batches0..4+=[332, 99344, 333, 0, 15460]
+WINFSP TRACE pass=quiet phase=create idle n=115470 mean=298.1 p50=61.4 p90=90.1
+WINFSP TRACE pass=quiet phase=create stage=BE n=115470 mean=50.5 p50=26.6 p90=172.0
+WINFSP TRACE pass=quiet phase=create stage=ES n=333 mean=0.9 p50=0.6 p90=1.0
+WINFSP TRACE pass=quiet phase=create stage=EH n=115137 mean=0.8 p50=0.7 p90=1.1
+WINFSP TRACE pass=quiet phase=create stage=SR n=333 mean=4.8 p50=3.8 p90=5.4
+WINFSP TRACE pass=quiet phase=create stage=RB n=333 mean=2.6 p50=2.3 p90=3.2
+WINFSP TRACE pass=quiet phase=create stage=CV n=332 mean=56.2 p50=53.2 p90=63.5
+WINFSP TRACE pass=quiet phase=create stage=VB n=337 mean=2.5 p50=2.3 p90=2.7
+WINFSP TRACE pass=quiet phase=create stage=VP n=115137 mean=0.4 p50=0.3 p90=1.2
+WINFSP TRACE pass=quiet phase=create stage=PB n=114800 mean=2.9 p50=2.7 p90=3.3
+WINFSP TRACE pass=quiet phase=create stage=PC n=332 mean=1.3 p50=1.3 p90=1.6
+WINFSP TRACE pass=quiet phase=create stage=HV n=115137 mean=61.4 p50=57.3 p90=86.0
+WINFSP TRACE pass=quiet phase=create kind=Create n=20010 arrived_busy=0 wait_mean=4.8 wait_p50=2.0 wait_p90=2.3 service_mean=39.5 service_p50=29.7 service_p90=51.2
+WINFSP TRACE pass=quiet phase=create kind=Cleanup n=20000 arrived_busy=0 wait_mean=1.4 wait_p50=1.3 wait_p90=1.6 service_mean=8.7 service_p50=4.0 service_p90=21.5
+WINFSP TRACE pass=quiet phase=create kind=Close n=10000 arrived_busy=0 wait_mean=1.3 wait_p50=1.3 wait_p90=1.5 service_mean=44.2 service_p50=29.7 service_p90=55.3
+WINFSP TRACE pass=quiet phase=create kind=Write n=10000 arrived_busy=0 wait_mean=1.5 wait_p50=1.5 wait_p90=1.7 service_mean=30.2 service_p50=25.6 service_p90=49.2
+WINFSP TRACE pass=quiet phase=create kind=SetInformation n=10000 arrived_busy=0 wait_mean=1.2 wait_p50=1.2 wait_p90=1.3 service_mean=44.7 service_p50=28.7 service_p90=53.2
+WINFSP TRACE pass=quiet phase=create kind=FlushBuffers n=10000 arrived_busy=0 wait_mean=1.5 wait_p50=1.3 wait_p90=1.6 service_mean=15.8 service_p50=7.2 service_p90=13.8
+WINFSP TRACE pass=quiet phase=create kind=QueryDirectory n=15460 arrived_busy=0 wait_mean=1.2 wait_p50=1.2 wait_p90=1.3 service_mean=229.2 service_p50=237.6 service_p90=294.9
+WINFSP TRACE pass=quiet phase=create kind=SetSecurity n=20000 arrived_busy=0 wait_mean=1.5 wait_p50=1.5 wait_p90=1.7 service_mean=0.5 service_p50=0.5 service_p90=0.6
+WINFSP TRACE pass=quiet phase=stat rounds=10 busy_us=1129650 queued_us=0 wall_us=52937574 receives=50009 receive_p50=49.2 receive_p90=63.5 batches0..4+=[165, 49678, 166, 0, 0]
+WINFSP TRACE pass=quiet phase=stat idle n=50010 mean=50.6 p50=53.2 p90=65.5
+WINFSP TRACE pass=quiet phase=stat stage=BE n=50010 mean=22.3 p50=12.8 p90=47.1
+WINFSP TRACE pass=quiet phase=stat stage=ES n=166 mean=0.7 p50=0.6 p90=1.0
+WINFSP TRACE pass=quiet phase=stat stage=EH n=49844 mean=0.7 p50=0.6 p90=1.0
+WINFSP TRACE pass=quiet phase=stat stage=SR n=166 mean=4.7 p50=4.0 p90=5.6
+WINFSP TRACE pass=quiet phase=stat stage=RB n=166 mean=2.5 p50=2.3 p90=3.2
+WINFSP TRACE pass=quiet phase=stat stage=CV n=165 mean=31.3 p50=29.7 p90=34.8
+WINFSP TRACE pass=quiet phase=stat stage=VB n=165 mean=2.2 p50=2.2 p90=2.4
+WINFSP TRACE pass=quiet phase=stat stage=VP n=49844 mean=0.4 p50=0.3 p90=1.1
+WINFSP TRACE pass=quiet phase=stat stage=PB n=49679 mean=2.8 p50=2.7 p90=3.2
+WINFSP TRACE pass=quiet phase=stat stage=PC n=165 mean=1.2 p50=1.1 p90=1.5
+WINFSP TRACE pass=quiet phase=stat stage=HV n=49844 mean=47.0 p50=49.2 p90=63.5
+WINFSP TRACE pass=quiet phase=stat kind=Create n=10010 arrived_busy=0 wait_mean=2.9 wait_p50=2.0 wait_p90=2.2 service_mean=19.1 service_p50=12.8 service_p90=15.4
+WINFSP TRACE pass=quiet phase=stat kind=Cleanup n=10000 arrived_busy=0 wait_mean=1.6 wait_p50=1.5 wait_p90=1.7 service_mean=0.6 service_p50=0.6 service_p90=0.7
+WINFSP TRACE pass=quiet phase=stat kind=Close n=10000 arrived_busy=0 wait_mean=1.3 wait_p50=1.2 wait_p90=1.5 service_mean=43.2 service_p50=25.6 service_p90=53.2
+WINFSP TRACE pass=quiet phase=stat kind=QueryVolumeInformation n=10000 arrived_busy=0 wait_mean=1.3 wait_p50=1.2 wait_p90=1.5 service_mean=49.6 service_p50=43.0 service_p90=47.1
+WINFSP TRACE pass=quiet phase=stat kind=SetSecurity n=10000 arrived_busy=0 wait_mean=1.5 wait_p50=1.3 wait_p90=1.6 service_mean=0.5 service_p50=0.5 service_p90=0.6
+WINFSP TRACE pass=quiet phase=open rounds=10 busy_us=844000 queued_us=0 wall_us=52966146 receives=40009 receive_p50=59.4 receive_p90=73.7 batches0..4+=[112, 39784, 113, 0, 0]
+WINFSP TRACE pass=quiet phase=open idle n=40010 mean=55.5 p50=61.4 p90=77.8
+WINFSP TRACE pass=quiet phase=open stage=BE n=40010 mean=20.8 p50=6.4 p90=49.2
+WINFSP TRACE pass=quiet phase=open stage=ES n=113 mean=1.4 p50=0.9 p90=1.1
+WINFSP TRACE pass=quiet phase=open stage=EH n=39897 mean=0.7 p50=0.6 p90=1.2
+WINFSP TRACE pass=quiet phase=open stage=SR n=113 mean=5.3 p50=4.6 p90=5.9
+WINFSP TRACE pass=quiet phase=open stage=RB n=112 mean=2.7 p50=2.7 p90=3.1
+WINFSP TRACE pass=quiet phase=open stage=CV n=112 mean=48.9 p50=47.1 p90=51.2
+WINFSP TRACE pass=quiet phase=open stage=VB n=112 mean=2.5 p50=2.3 p90=2.8
+WINFSP TRACE pass=quiet phase=open stage=VP n=39897 mean=1.4 p50=0.2 p90=1.2
+WINFSP TRACE pass=quiet phase=open stage=PB n=39786 mean=2.8 p50=2.7 p90=3.3
+WINFSP TRACE pass=quiet phase=open stage=PC n=112 mean=1.4 p50=1.3 p90=1.6
+WINFSP TRACE pass=quiet phase=open stage=HV n=39897 mean=50.9 p50=59.4 p90=73.7
+WINFSP TRACE pass=quiet phase=open kind=Create n=10010 arrived_busy=0 wait_mean=6.3 wait_p50=2.0 wait_p90=2.2 service_mean=21.5 service_p50=16.4 service_p90=19.5
+WINFSP TRACE pass=quiet phase=open kind=Cleanup n=10000 arrived_busy=0 wait_mean=1.3 wait_p50=1.2 wait_p90=1.5 service_mean=0.4 service_p50=0.4 service_p90=0.6
+WINFSP TRACE pass=quiet phase=open kind=Close n=10000 arrived_busy=0 wait_mean=1.3 wait_p50=1.3 wait_p90=1.5 service_mean=61.9 service_p50=45.1 service_p90=55.3
+WINFSP TRACE pass=quiet phase=open kind=SetSecurity n=10000 arrived_busy=0 wait_mean=1.6 wait_p50=1.5 wait_p90=1.8 service_mean=0.5 service_p50=0.5 service_p90=0.6
+WINFSP TRACE pass=quiet phase=rename rounds=10 busy_us=2214990 queued_us=0 wall_us=53326019 receives=90006 receive_p50=55.3 receive_p90=69.6 batches0..4+=[393, 89216, 397, 0, 0]
+WINFSP TRACE pass=quiet phase=rename idle n=90010 mean=57.9 p50=59.4 p90=81.9
+WINFSP TRACE pass=quiet phase=rename stage=BE n=90010 mean=24.3 p50=7.2 p90=65.5
+WINFSP TRACE pass=quiet phase=rename stage=ES n=397 mean=0.8 p50=0.7 p90=1.1
+WINFSP TRACE pass=quiet phase=rename stage=EH n=89613 mean=3.0 p50=0.7 p90=14.3
+WINFSP TRACE pass=quiet phase=rename stage=SR n=397 mean=5.5 p50=4.1 p90=6.9
+WINFSP TRACE pass=quiet phase=rename stage=RB n=397 mean=2.2 p50=2.0 p90=2.9
+WINFSP TRACE pass=quiet phase=rename stage=CV n=393 mean=39.2 p50=43.0 p90=49.2
+WINFSP TRACE pass=quiet phase=rename stage=VB n=393 mean=2.3 p50=2.2 p90=2.6
+WINFSP TRACE pass=quiet phase=rename stage=VP n=89613 mean=0.5 p50=0.3 p90=1.2
+WINFSP TRACE pass=quiet phase=rename stage=PB n=89220 mean=2.9 p50=2.8 p90=3.5
+WINFSP TRACE pass=quiet phase=rename stage=PC n=393 mean=1.2 p50=1.2 p90=1.5
+WINFSP TRACE pass=quiet phase=rename stage=HV n=89613 mean=52.0 p50=55.3 p90=69.6
+WINFSP TRACE pass=quiet phase=rename kind=Create n=20010 arrived_busy=0 wait_mean=2.8 wait_p50=2.2 wait_p90=2.7 service_mean=41.0 service_p50=36.9 service_p90=63.5
+WINFSP TRACE pass=quiet phase=rename kind=Cleanup n=20000 arrived_busy=0 wait_mean=1.9 wait_p50=1.3 wait_p90=1.7 service_mean=0.5 service_p50=0.5 service_p90=0.6
+WINFSP TRACE pass=quiet phase=rename kind=Close n=20000 arrived_busy=0 wait_mean=1.4 wait_p50=1.3 wait_p90=1.6 service_mean=31.4 service_p50=17.4 service_p90=51.2
+WINFSP TRACE pass=quiet phase=rename kind=SetInformation n=10000 arrived_busy=0 wait_mean=1.3 wait_p50=1.2 wait_p90=1.3 service_mean=74.7 service_p50=69.6 service_p90=90.1
+WINFSP TRACE pass=quiet phase=rename kind=SetSecurity n=20000 arrived_busy=0 wait_mean=1.5 wait_p50=1.5 wait_p90=1.7 service_mean=0.5 service_p50=0.4 service_p90=0.5
+WINFSP TRACE pass=quiet phase=unlink rounds=10 busy_us=1472204 queued_us=0 wall_us=53070407 receives=50036 receive_p50=57.3 receive_p90=73.7 batches0..4+=[245, 49538, 222, 0, 31]
+WINFSP TRACE pass=quiet phase=unlink idle n=60010 mean=50.3 p50=59.4 p90=77.8
+WINFSP TRACE pass=quiet phase=unlink stage=BE n=60010 mean=24.3 p50=12.8 p90=47.1
+WINFSP TRACE pass=quiet phase=unlink stage=ES n=10219 mean=0.2 p50=0.2 p90=0.3
+WINFSP TRACE pass=quiet phase=unlink stage=EH n=49791 mean=0.7 p50=0.6 p90=1.0
+WINFSP TRACE pass=quiet phase=unlink stage=SR n=10219 mean=3.2 p50=1.9 p90=2.8
+WINFSP TRACE pass=quiet phase=unlink stage=RB n=10220 mean=0.7 p50=0.6 p90=0.9
+WINFSP TRACE pass=quiet phase=unlink stage=CV n=245 mean=88076.5 p50=51.2 p90=69.6
+WINFSP TRACE pass=quiet phase=unlink stage=VB n=222 mean=2.4 p50=2.2 p90=2.7
+WINFSP TRACE pass=quiet phase=unlink stage=VC n=18 mean=4.9 p50=4.4 p90=6.4
+WINFSP TRACE pass=quiet phase=unlink stage=VP n=49791 mean=0.6 p50=0.3 p90=1.2
+WINFSP TRACE pass=quiet phase=unlink stage=PB n=49568 mean=2.9 p50=2.8 p90=3.3
+WINFSP TRACE pass=quiet phase=unlink stage=PC n=227 mean=1.3 p50=1.2 p90=1.6
+WINFSP TRACE pass=quiet phase=unlink stage=HV n=49791 mean=156.5 p50=57.3 p90=73.7
+WINFSP TRACE pass=quiet phase=unlink kind=Create n=10010 arrived_busy=0 wait_mean=4.1 wait_p50=2.0 wait_p90=2.6 service_mean=18.7 service_p50=13.3 service_p90=19.5
+WINFSP TRACE pass=quiet phase=unlink kind=Cleanup n=10000 arrived_busy=0 wait_mean=2.7 wait_p50=1.5 wait_p90=1.7 service_mean=33.6 service_p50=19.5 service_p90=55.3
+WINFSP TRACE pass=quiet phase=unlink kind=Close n=20000 arrived_busy=0 wait_mean=2723.8 wait_p50=4.4 wait_p90=8388.6 service_mean=24.2 service_p50=9.7 service_p90=32.8
+WINFSP TRACE pass=quiet phase=unlink kind=SetInformation n=10000 arrived_busy=0 wait_mean=2.1 wait_p50=1.2 wait_p90=1.3 service_mean=46.0 service_p50=28.7 service_p90=49.2
+WINFSP TRACE pass=quiet phase=unlink kind=SetSecurity n=10000 arrived_busy=0 wait_mean=3.1 wait_p50=1.5 wait_p90=1.8 service_mean=0.5 service_p50=0.5 service_p90=0.6
+slates daemon: a heartbeat came 636 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 199 steps and 147 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 57 unattributed), fired 2 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 333 ms and its timer overrun 20 ms
+slates daemon: a heartbeat came 629 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 6 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 6 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 395 ms and its timer overrun 20 ms
+slates daemon: a heartbeat came 561 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 4 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 395 ms and its timer overrun 20 ms
+slates daemon: a heartbeat came 657 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 5 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 4 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 395 ms and its timer overrun 63 ms
+slates daemon: a heartbeat came 580 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 5 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 5 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 395 ms and its timer overrun 52 ms
+slates daemon: a heartbeat came 571 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 4 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 395 ms and its timer overrun 52 ms
+slates daemon: a heartbeat came 508 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 6 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 6 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 395 ms and its timer overrun 52 ms
+slates daemon: a heartbeat came 555 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 4 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 395 ms and its timer overrun 52 ms
+slates daemon: a heartbeat came 573 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 6 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 6 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 395 ms and its timer overrun 52 ms
+slates daemon: a heartbeat came 791 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 4 steps and 6 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 4 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 406 ms and its timer overrun 64 ms
+slates daemon: a heartbeat came 802 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 418 ms and its timer overrun 64 ms
+slates daemon: a heartbeat came 869 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 531 ms and its timer overrun 64 ms
+slates daemon: a heartbeat came 955 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 531 ms and its timer overrun 64 ms
+slates daemon: a heartbeat came 787 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 531 ms and its timer overrun 64 ms
+slates daemon: a heartbeat came 606 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 943 steps and 721 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 276 unattributed), fired 2 timers, waited 1 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 531 ms and its timer overrun 23 ms
+slates daemon: a heartbeat came 602 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 4 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 531 ms and its timer overrun 27 ms
+slates daemon: a heartbeat came 590 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 6 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 6 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 531 ms and its timer overrun 27 ms
+slates daemon: a heartbeat came 980 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 427 steps and 312 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 88 unattributed), fired 2 timers, waited 1 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 531 ms and its timer overrun 53 ms
+slates daemon: a heartbeat came 872 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 531 ms and its timer overrun 53 ms
+slates daemon: a heartbeat came 779 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 531 ms and its timer overrun 53 ms
+slates daemon: a heartbeat came 654 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 4 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 531 ms and its timer overrun 15 ms
+slates daemon: a heartbeat came 534 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 4 steps and 6 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 4 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 531 ms and its timer overrun 15 ms
+slates daemon: a heartbeat came 622 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 4 steps and 6 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 531 ms and its timer overrun 15 ms
+slates daemon: a heartbeat came 506 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 5 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 4 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 531 ms and its timer overrun 15 ms
+slates daemon: a heartbeat came 507 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 6 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 5 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 531 ms and its timer overrun 15 ms
+slates daemon: a heartbeat came 602 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 2 unattributed), fired 2 timers, waited 1 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 531 ms and its timer overrun 91 ms
+slates daemon: a heartbeat came 856 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 531 ms and its timer overrun 91 ms
+slates daemon: a heartbeat came 887 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 531 ms and its timer overrun 91 ms
+slates daemon: a heartbeat came 787 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 531 ms and its timer overrun 91 ms
+slates daemon: a heartbeat came 733 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 531 ms and its timer overrun 91 ms
+slates daemon: a heartbeat came 691 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 5 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 531 ms and its timer overrun 36 ms
+slates daemon: a heartbeat came 523 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 4 steps and 5 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 5 unattributed), fired 2 timers, waited 1 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 531 ms and its timer overrun 25 ms
+slates daemon: a heartbeat came 715 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 531 ms and its timer overrun 25 ms
+slates daemon: a heartbeat came 568 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 4 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 531 ms and its timer overrun 25 ms
+slates daemon: a heartbeat came 628 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 531 ms and its timer overrun 54 ms
+slates daemon: a heartbeat came 651 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 1423 steps and 1042 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 313 unattributed), fired 2 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 531 ms and its timer overrun 20 ms
+slates daemon: a heartbeat came 601 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 6 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 6 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 531 ms and its timer overrun 20 ms
+slates daemon: a heartbeat came 928 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 2 timers, waited 1 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 531 ms and its timer overrun 69 ms
+slates daemon: a heartbeat came 893 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 531 ms and its timer overrun 69 ms
+slates daemon: a heartbeat came 602 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 2 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 2 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 601 ms and its timer overrun 69 ms
+slates daemon: a heartbeat came 609 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 1095 steps and 804 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 228 unattributed), fired 2 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 601 ms and its timer overrun 26 ms
+slates daemon: a heartbeat came 570 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 4 steps and 8 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 5 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 601 ms and its timer overrun 26 ms
+slates daemon: a heartbeat came 594 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 6 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 5 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 601 ms and its timer overrun 26 ms
+slates daemon: a heartbeat came 596 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 323 steps and 248 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 88 unattributed), fired 2 timers, waited 1 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 601 ms and its timer overrun 38 ms
+slates daemon: a heartbeat came 540 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 4 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 601 ms and its timer overrun 38 ms
+slates daemon: a heartbeat came 737 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 601 ms and its timer overrun 47 ms
+WINFSP TRACE pass=contended phase=create rounds=10 busy_us=68617518 queued_us=0 wall_us=245687937 receives=116293 receive_p50=63.5 receive_p90=114.7 batches0..4+=[273, 99451, 273, 0, 16296]
+WINFSP TRACE pass=contended phase=create idle n=123922 mean=1048.8 p50=65.5 p90=118.8
+WINFSP TRACE pass=contended phase=create stage=BE n=123922 mean=553.3 p50=11.3 p90=327.7
+WINFSP TRACE pass=contended phase=create stage=ES n=7902 mean=0.5 p50=0.4 p90=0.5
+WINFSP TRACE pass=contended phase=create stage=EH n=116020 mean=1.0 p50=0.8 p90=1.6
+WINFSP TRACE pass=contended phase=create stage=SR n=7902 mean=8.8 p50=3.6 p90=4.4
+WINFSP TRACE pass=contended phase=create stage=RB n=7902 mean=1.4 p50=1.3 p90=1.3
+WINFSP TRACE pass=contended phase=create stage=CV n=273 mean=61.8 p50=51.2 p90=81.9
+WINFSP TRACE pass=contended phase=create stage=VB n=278 mean=3.1 p50=2.7 p90=3.2
+WINFSP TRACE pass=contended phase=create stage=VP n=116020 mean=4.5 p50=0.3 p90=1.1
+WINFSP TRACE pass=contended phase=create stage=PB n=115742 mean=3.3 p50=3.1 p90=4.0
+WINFSP TRACE pass=contended phase=create stage=PC n=273 mean=1.4 p50=1.2 p90=2.4
+WINFSP TRACE pass=contended phase=create stage=HV n=116020 mean=116.1 p50=63.5 p90=114.7
+WINFSP TRACE pass=contended phase=create kind=Create n=20010 arrived_busy=0 wait_mean=109.5 wait_p50=2.7 wait_p90=3.2 service_mean=245.4 service_p50=41.0 service_p90=81.9
+WINFSP TRACE pass=contended phase=create kind=Cleanup n=20000 arrived_busy=0 wait_mean=1.8 wait_p50=1.7 wait_p90=1.9 service_mean=61.6 service_p50=5.4 service_p90=9.7
+WINFSP TRACE pass=contended phase=create kind=Close n=17642 arrived_busy=0 wait_mean=6502.2 wait_p50=1.5 wait_p90=31457.3 service_mean=1565.1 service_p50=10.8 service_p90=43.0
+WINFSP TRACE pass=contended phase=create kind=Write n=10000 arrived_busy=0 wait_mean=1.8 wait_p50=1.7 wait_p90=1.9 service_mean=239.2 service_p50=14.3 service_p90=23.6
+WINFSP TRACE pass=contended phase=create kind=SetInformation n=10000 arrived_busy=0 wait_mean=1.7 wait_p50=1.7 wait_p90=1.8 service_mean=580.7 service_p50=11.8 service_p90=17.4
+WINFSP TRACE pass=contended phase=create kind=FlushBuffers n=10000 arrived_busy=0 wait_mean=1.6 wait_p50=1.6 wait_p90=1.8 service_mean=114.9 service_p50=10.8 service_p90=14.3
+WINFSP TRACE pass=contended phase=create kind=QueryDirectory n=16270 arrived_busy=0 wait_mean=13.1 wait_p50=1.7 wait_p90=1.9 service_mean=1567.5 service_p50=409.6 service_p90=557.1
+WINFSP TRACE pass=contended phase=create kind=SetSecurity n=20000 arrived_busy=0 wait_mean=1.8 wait_p50=1.7 wait_p90=1.9 service_mean=0.6 service_p50=0.5 service_p90=0.7
+WINFSP TRACE pass=contended phase=stat rounds=10 busy_us=3618075 queued_us=0 wall_us=213755055 receives=50011 receive_p50=49.2 receive_p90=61.4 batches0..4+=[182, 49646, 182, 0, 1]
+WINFSP TRACE pass=contended phase=stat idle n=50392 mean=86.3 p50=53.2 p90=65.5
+WINFSP TRACE pass=contended phase=stat stage=BE n=50392 mean=71.5 p50=6.4 p90=20.5
+WINFSP TRACE pass=contended phase=stat stage=ES n=563 mean=0.6 p50=0.5 p90=1.0
+WINFSP TRACE pass=contended phase=stat stage=EH n=49829 mean=0.8 p50=0.7 p90=1.1
+WINFSP TRACE pass=contended phase=stat stage=SR n=563 mean=4.5 p50=3.7 p90=5.4
+WINFSP TRACE pass=contended phase=stat stage=RB n=563 mean=2.1 p50=1.3 p90=3.5
+WINFSP TRACE pass=contended phase=stat stage=CV n=182 mean=29.8 p50=27.6 p90=34.8
+WINFSP TRACE pass=contended phase=stat stage=VB n=182 mean=2.6 p50=2.4 p90=3.2
+WINFSP TRACE pass=contended phase=stat stage=VP n=49829 mean=1.1 p50=0.3 p90=1.0
+WINFSP TRACE pass=contended phase=stat stage=PB n=49647 mean=3.1 p50=2.8 p90=3.6
+WINFSP TRACE pass=contended phase=stat stage=PC n=182 mean=1.1 p50=1.0 p90=1.2
+WINFSP TRACE pass=contended phase=stat stage=HV n=49829 mean=82.4 p50=49.2 p90=61.4
+WINFSP TRACE pass=contended phase=stat kind=Create n=10010 arrived_busy=0 wait_mean=28.6 wait_p50=2.7 wait_p90=3.1 service_mean=57.6 service_p50=20.5 service_p90=23.6
+WINFSP TRACE pass=contended phase=stat kind=Cleanup n=10000 arrived_busy=0 wait_mean=1.7 wait_p50=1.7 wait_p90=1.8 service_mean=0.5 service_p50=0.5 service_p90=0.6
+WINFSP TRACE pass=contended phase=stat kind=Close n=10382 arrived_busy=0 wait_mean=111.4 wait_p50=1.3 wait_p90=1.5 service_mean=174.4 service_p50=10.2 service_p90=43.0
+WINFSP TRACE pass=contended phase=stat kind=QueryVolumeInformation n=10000 arrived_busy=0 wait_mean=1.6 wait_p50=1.6 wait_p90=1.8 service_mean=122.1 service_p50=6.7 service_p90=8.2
+WINFSP TRACE pass=contended phase=stat kind=SetSecurity n=10000 arrived_busy=0 wait_mean=1.7 wait_p50=1.6 wait_p90=1.8 service_mean=0.5 service_p50=0.5 service_p90=0.5
+WINFSP TRACE pass=contended phase=open rounds=10 busy_us=4588624 queued_us=0 wall_us=213978918 receives=40015 receive_p50=77.8 receive_p90=94.2 batches0..4+=[6, 39989, 6, 0, 14]
+WINFSP TRACE pass=contended phase=open idle n=45488 mean=114.0 p50=77.8 p90=98.3
+WINFSP TRACE pass=contended phase=open stage=BE n=45488 mean=100.5 p50=8.7 p90=27.6
+WINFSP TRACE pass=contended phase=open stage=ES n=5479 mean=0.4 p50=0.4 p90=0.5
+WINFSP TRACE pass=contended phase=open stage=EH n=40009 mean=0.9 p50=0.7 p90=1.3
+WINFSP TRACE pass=contended phase=open stage=SR n=5479 mean=4.3 p50=3.7 p90=4.1
+WINFSP TRACE pass=contended phase=open stage=RB n=5479 mean=1.4 p50=1.3 p90=1.3
+WINFSP TRACE pass=contended phase=open stage=CV n=6 mean=53.0 p50=43.0 p90=94.2
+WINFSP TRACE pass=contended phase=open stage=VB n=6 mean=3.1 p50=2.6 p90=5.4
+WINFSP TRACE pass=contended phase=open stage=VP n=40009 mean=1.8 p50=0.3 p90=1.1
+WINFSP TRACE pass=contended phase=open stage=PB n=40003 mean=3.6 p50=3.2 p90=4.6
+WINFSP TRACE pass=contended phase=open stage=PC n=6 mean=1.2 p50=1.0 p90=2.2
+WINFSP TRACE pass=contended phase=open stage=HV n=40009 mean=122.8 p50=77.8 p90=94.2
+WINFSP TRACE pass=contended phase=open kind=Create n=10010 arrived_busy=0 wait_mean=5.0 wait_p50=3.2 wait_p90=3.5 service_mean=255.4 service_p50=26.6 service_p90=34.8
+WINFSP TRACE pass=contended phase=open kind=Cleanup n=10000 arrived_busy=0 wait_mean=1.8 wait_p50=1.7 wait_p90=1.9 service_mean=0.6 service_p50=0.6 service_p90=0.7
+WINFSP TRACE pass=contended phase=open kind=Close n=5781 arrived_busy=0 wait_mean=10947.3 wait_p50=4194.3 wait_p90=31457.3 service_mean=51.4 service_p50=9.2 service_p90=10.8
+WINFSP TRACE pass=contended phase=open kind=Read n=9697 arrived_busy=0 wait_mean=1.7 wait_p50=1.7 wait_p90=1.8 service_mean=177.7 service_p50=10.8 service_p90=14.3
+WINFSP TRACE pass=contended phase=open kind=SetSecurity n=10000 arrived_busy=0 wait_mean=1.8 wait_p50=1.7 wait_p90=1.9 service_mean=0.5 service_p50=0.5 service_p90=0.6
+WINFSP TRACE pass=contended phase=rename rounds=10 busy_us=12392181 queued_us=0 wall_us=216321250 receives=90009 receive_p50=55.3 receive_p90=77.8 batches0..4+=[450, 80094, 9450, 0, 15]
+WINFSP TRACE pass=contended phase=rename idle n=95136 mean=114.0 p50=59.4 p90=90.1
+WINFSP TRACE pass=contended phase=rename stage=BE n=95136 mean=129.9 p50=9.7 p90=53.2
+WINFSP TRACE pass=contended phase=rename stage=ES n=5577 mean=0.5 p50=0.4 p90=0.5
+WINFSP TRACE pass=contended phase=rename stage=EH n=89559 mean=22.4 p50=0.7 p90=16.4
+WINFSP TRACE pass=contended phase=rename stage=SR n=5577 mean=4.6 p50=3.7 p90=4.4
+WINFSP TRACE pass=contended phase=rename stage=RB n=5577 mean=1.4 p50=1.3 p90=1.5
+WINFSP TRACE pass=contended phase=rename stage=CV n=450 mean=42.2 p50=41.0 p90=55.3
+WINFSP TRACE pass=contended phase=rename stage=VB n=450 mean=2.4 p50=2.2 p90=2.7
+WINFSP TRACE pass=contended phase=rename stage=VP n=89559 mean=1.2 p50=0.3 p90=1.1
+WINFSP TRACE pass=contended phase=rename stage=PB n=89109 mean=3.3 p50=2.9 p90=4.4
+WINFSP TRACE pass=contended phase=rename stage=PC n=450 mean=1.1 p50=1.0 p90=1.2
+WINFSP TRACE pass=contended phase=rename stage=HV n=89559 mean=94.0 p50=55.3 p90=77.8
+WINFSP TRACE pass=contended phase=rename kind=Create n=20010 arrived_busy=0 wait_mean=25.5 wait_p50=2.9 wait_p90=3.3 service_mean=217.6 service_p50=23.6 service_p90=30.7
+WINFSP TRACE pass=contended phase=rename kind=Cleanup n=20000 arrived_busy=0 wait_mean=49.9 wait_p50=1.5 wait_p90=1.8 service_mean=0.5 service_p50=0.5 service_p90=0.6
+WINFSP TRACE pass=contended phase=rename kind=Close n=25126 arrived_busy=0 wait_mean=1537.3 wait_p50=1.3 wait_p90=3932.2 service_mean=210.9 service_p50=10.2 service_p90=17.4
+WINFSP TRACE pass=contended phase=rename kind=SetInformation n=10000 arrived_busy=0 wait_mean=1.7 wait_p50=1.7 wait_p90=1.8 service_mean=271.9 service_p50=57.3 service_p90=73.7
+WINFSP TRACE pass=contended phase=rename kind=SetSecurity n=20000 arrived_busy=0 wait_mean=1.7 wait_p50=1.7 wait_p90=1.8 service_mean=0.5 service_p50=0.5 service_p90=0.6
+WINFSP TRACE pass=contended phase=unlink rounds=10 busy_us=24024736 queued_us=0 wall_us=216224069 receives=50113 receive_p50=59.4 receive_p90=77.8 batches0..4+=[296, 49619, 195, 0, 3]
+WINFSP TRACE pass=contended phase=unlink idle n=51079 mean=162.1 p50=63.5 p90=81.9
+WINFSP TRACE pass=contended phase=unlink stage=BE n=51079 mean=470.0 p50=13.3 p90=23.6
+WINFSP TRACE pass=contended phase=unlink stage=ES n=1262 mean=0.6 p50=0.5 p90=0.8
+WINFSP TRACE pass=contended phase=unlink stage=EH n=49817 mean=0.9 p50=0.8 p90=1.2
+WINFSP TRACE pass=contended phase=unlink stage=SR n=1262 mean=4.3 p50=3.8 p90=5.4
+WINFSP TRACE pass=contended phase=unlink stage=RB n=1262 mean=1.7 p50=1.3 p90=3.2
+WINFSP TRACE pass=contended phase=unlink stage=CV n=296 mean=352942.7 p50=51.2 p90=1040187.4
+WINFSP TRACE pass=contended phase=unlink stage=VB n=195 mean=2.7 p50=2.7 p90=2.8
+WINFSP TRACE pass=contended phase=unlink stage=VC n=96 mean=6.7 p50=5.1 p90=6.4
+WINFSP TRACE pass=contended phase=unlink stage=VP n=49817 mean=62.1 p50=0.3 p90=1.1
+WINFSP TRACE pass=contended phase=unlink stage=PB n=49622 mean=3.3 p50=3.1 p90=3.7
+WINFSP TRACE pass=contended phase=unlink stage=PC n=200 mean=1.3 p50=1.0 p90=1.2
+WINFSP TRACE pass=contended phase=unlink stage=HV n=49817 mean=205.7 p50=59.4 p90=77.8
+WINFSP TRACE pass=contended phase=unlink kind=Create n=10010 arrived_busy=0 wait_mean=34.1 wait_p50=2.8 wait_p90=3.1 service_mean=787.1 service_p50=19.5 service_p90=23.6
+WINFSP TRACE pass=contended phase=unlink kind=Cleanup n=10000 arrived_busy=0 wait_mean=1.7 wait_p50=1.7 wait_p90=1.8 service_mean=347.1 service_p50=19.5 service_p90=49.2
+WINFSP TRACE pass=contended phase=unlink kind=Close n=11069 arrived_busy=0 wait_mean=48106.3 wait_p50=1.3 wait_p90=3.3 service_mean=412.4 service_p50=13.3 service_p90=51.2
+WINFSP TRACE pass=contended phase=unlink kind=SetInformation n=10000 arrived_busy=0 wait_mean=1.7 wait_p50=1.7 wait_p90=1.8 service_mean=810.5 service_p50=10.2 service_p90=13.3
+WINFSP TRACE pass=contended phase=unlink kind=SetSecurity n=10000 arrived_busy=0 wait_mean=1.8 wait_p50=1.7 wait_p90=1.9 service_mean=0.5 service_p50=0.5 service_p90=0.6
+## run 3 of 3 done, 2026-11-05T20:26:23Z
