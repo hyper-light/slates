@@ -8042,7 +8042,8 @@ pub(crate) fn materialize_taken_over(
       names: catalog.names,
       require_locked: catalog.require_locked,
       role: Role::Plain,
-      live_shipped: false,
+      // A live-shipped volume stays live-shipped under its successor (A-200): its catalog carries the flag.
+      live_shipped: catalog.live_shipped,
     },
     // Placed content is always whole in RAM (an overlay's base-backed bodies are never sealed), so the
     // successor serves it with no base beneath.

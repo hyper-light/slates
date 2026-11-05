@@ -63,6 +63,8 @@ const LIVE_REFUSED: &str = "fleet.live.refused";
 const LIVE_APPENDED: &str = "fleet.live.appended";
 /// Counter: entries a holder refused to keep (over its bound, unauthorized, malformed).
 const LIVE_HOLD_REFUSED: &str = "fleet.live.hold_refused";
+/// Counter: takeover fetches this node answered with what it holds.
+const LIVE_FETCHED: &str = "fleet.live.fetched";
 /// Counter: entries and installs this node kept as a candidate.
 const LIVE_HELD: &str = "fleet.live.held";
 /// Counter: advances of a live volume's durable position on this owner shard (held by the owner and `f` candidates).
@@ -88,9 +90,13 @@ struct LivePublication {
   runs: Vec<LiveRun>,
 }
 
-/// A sealed body: the sealed chunk's keyed name and bytes (`slates_cluster::sealed`).
+/// A sealed body: the sealed chunk's keyed name and bytes (`slates_cluster::sealed`), and on a whole entry the volume's
+/// lineage key wrapped for each neighbour (the `sealing` a head carries, A-92 piece 4c), so a successor can open the log
+/// whether or not the volume ever sealed a snapshot.
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 struct SealedBody {
+  /// The lineage key for successors, on a whole entry.
+  sealing: Option<crate::head::HeadSealing>,
   /// The keyed name.
   name: Vec<u8>,
   /// The sealed bytes.
@@ -458,7 +464,13 @@ pub(crate) fn published(
     .into_iter()
     .filter(|host| *host != local)
     .collect();
-  let (epoch, quorum) = (configuration.host_epoch, configuration.quorum);
+  // The volume's epoch is its head's: a successor ships under the epoch its takeover placed the head at, which is above
+  // the dead owner's, whatever its own host's epoch (heads use the same rule, `fleet::owed_record`).
+  let placed = state.placed_heads.get(&object).map(|placed| placed.epoch);
+  let epoch = placed.map_or(configuration.host_epoch, |placed| {
+    placed.max(configuration.host_epoch)
+  });
+  let quorum = configuration.quorum;
   let live = state
     .live
     .shipping
@@ -551,9 +563,16 @@ fn payload(
   let chunk = slates_archive::Archive::raw_chunk(body);
   let segment = u32::try_from(rustix::param::page_size()).ok()?;
   let sealed = slates_cluster::sealed::seal_chunk(&lineage, &namer, &chunk, segment).ok()?;
+  let sealing = if whole {
+    let owner = state.db.partition().volume(id)?.owner.clone();
+    crate::seal_keys::head_sealing(state, id, &owner)
+  } else {
+    None
+  };
   let mut payload = vec![kind, BODY_SEALED];
   payload.extend_from_slice(
     &SealedBody {
+      sealing,
       name: sealed.name.to_vec(),
       bytes: sealed.bytes,
     }
@@ -641,7 +660,7 @@ fn pending_sends(state: &ShardState, volume: [u8; 16]) -> Vec<Send> {
           sends.push(Send {
             object,
             holder: *holder,
-            stream: slates_cluster::live::LIVE_INSTALL_STREAM,
+            stream: slates_cluster::live::LIVE_STATE_STREAM,
             bytes: install.encode(),
           });
         }
@@ -893,7 +912,12 @@ pub(crate) fn serve_install(
   peer: HostId,
   request: &[u8],
 ) -> Vec<u8> {
-  let Some(bound) = admitted(state, local, peer, slates_db::live::object_of(request)) else {
+  let Some(bound) = admitted(
+    state,
+    local,
+    peer,
+    slates_db::live::object_of_state(request),
+  ) else {
     state.count(LIVE_HOLD_REFUSED, 1);
     return encode_reply(&Err(LiveError::Unauthorized));
   };
@@ -939,12 +963,70 @@ fn admitted(
   .flatten()
 }
 
+/// The holder's copy of `object`, kept for `owner`: the configuration names `owner` the volume's acting owner (the caller
+/// checked it, [`admitted`]), so a successor takes the copy over; the fence still refuses any stale epoch.
 fn held_entry(state: &mut ShardState, owner: HostId, object: ObjectId) -> &mut Held {
-  state.live.held.entry(object).or_insert_with(|| Held {
+  let held = state.live.held.entry(object).or_insert_with(|| Held {
     replica: Replica::new(owner, object),
     entries: VecDeque::new(),
     bytes: 0,
-  })
+  });
+  held.replica.reassign(owner);
+  held
+}
+
+/// A candidate's answer to a successor's takeover fetch (A-200): authorized as a read of the object
+/// (`fleet::content_authorized`: the acting owner, a candidate, or a recovery cohort), the fence raised to the
+/// successor's epoch, and the head and the sealed entries kept. A stale successor is refused by the fence.
+pub(crate) fn serve_fetch(
+  state: &mut ShardState,
+  local: HostId,
+  peer: HostId,
+  request: &[u8],
+) -> Vec<u8> {
+  let Ok(fetch) = slates_db::live::Fetch::decode(request) else {
+    state.count(LIVE_HOLD_REFUSED, 1);
+    return slates_db::live::encode_fetched(&Err(LiveError::Malformed), &[]);
+  };
+  let regional = state.council.configuration();
+  let reading = slates_cluster::content::ContentAccess::Read;
+  if !crate::fleet::content_authorized(
+    regional,
+    &state.holder_records,
+    local,
+    peer,
+    reading,
+    fetch.object,
+  ) {
+    state.count(LIVE_HOLD_REFUSED, 1);
+    return slates_db::live::encode_fetched(&Err(LiveError::Unauthorized), &[]);
+  }
+  let Some(held) = state.live.held.get_mut(&fetch.object) else {
+    return slates_db::live::encode_fetched(&Ok(None), &[]);
+  };
+  match held.replica.prepare(fetch.epoch) {
+    Ok(head) => {
+      held.replica.reassign(peer);
+      let entries: Vec<Vec<u8>> = held.entries.iter().cloned().collect();
+      state.count(LIVE_FETCHED, 1);
+      slates_db::live::encode_fetched(&Ok(head), &entries)
+    }
+    Err(refusal) => slates_db::live::encode_fetched(&Err(refusal), &[]),
+  }
+}
+
+/// A candidate's answer on the whole-state kind: a fetch or an install, by its tag.
+pub(crate) fn serve_state(
+  state: &mut ShardState,
+  local: HostId,
+  peer: HostId,
+  request: &[u8],
+) -> Vec<u8> {
+  if slates_db::live::is_fetch(request) {
+    serve_fetch(state, local, peer, request)
+  } else {
+    serve_install(state, local, peer, request)
+  }
 }
 
 /// Keeps `payload` after what is held (a whole one first drops what came before it), within `bound`.
@@ -963,4 +1045,339 @@ fn keep(held: &mut Held, payload: &[u8], bound: usize) -> Result<(), LiveError> 
   held.entries.push_back(payload.to_vec());
   held.bytes = bytes;
   Ok(())
+}
+
+// ── Takeover from a live log (A-200 "Takeover") ─────────────────────────────────────────────────────────────────────
+
+/// Counter: a takeover of a live volume that could not rebuild it from the adopted log (its first entry not whole, an
+/// entry that would not open or apply, or content missing for an extent): the volume is not served from it.
+const LIVE_TAKEOVER_REFUSED: &str = "fleet.live.takeover_refused";
+/// Counter: a taken-over live volume rebuilt from the adopted log.
+const LIVE_TAKEN_OVER: &str = "fleet.live.taken_over";
+
+/// What a takeover fetched of a live volume: the adopted head's payloads (a whole one first), and the
+/// successor's copy of the lineage key the first carries (A-92 piece 4c), unwrapped on this control shard.
+pub(crate) struct Fetched {
+  pub(crate) payloads: Vec<Vec<u8>>,
+  pub(crate) lineage: Option<([u8; 16], Vec<u8>)>,
+  pub(crate) naming: Option<crate::head::HeadNaming>,
+}
+
+/// Phase one for a live volume (A-200), on the control shard: raises this node's own copy's fence to `epoch`, asks every
+/// other candidate in `candidates` to do the same over its session, and adopts the greatest head among the answers
+/// (`slates_db::live::adopt`, at least `f + 1` of them). `Ok(None)` when no candidate holds any of the volume's log
+/// (it was never shipped); `Err` with what the takeover waits for when too few answered.
+pub(crate) async fn fetch(
+  object: ObjectId,
+  epoch: slates_db::register::HostEpoch,
+  candidates: Vec<HostId>,
+) -> Result<Option<Fetched>, &'static str> {
+  let local = state::with_state(|s| s.fleet.configuration().owner)
+    .ok_or("fleet.live.takeover_waits_state")?;
+  let quorum = state::with_state(|s| s.fleet.configuration().quorum)
+    .ok_or("fleet.live.takeover_waits_state")?;
+  let cap = state::with_state(|s| hold_bound(s, object))
+    .flatten()
+    .ok_or("fleet.live.takeover_waits_catalog")?;
+  let mut reports: Vec<(HostId, Option<Head>)> = Vec::new();
+  let mut kept: BTreeMap<HostId, Vec<Vec<u8>>> = BTreeMap::new();
+  if let Some(Some(own)) = state::with_state(|s| {
+    let held = s.live.held.get_mut(&object)?;
+    let head = held.replica.prepare(epoch).ok()?;
+    held.replica.reassign(local);
+    Some((head, held.entries.iter().cloned().collect::<Vec<_>>()))
+  }) {
+    reports.push((local, own.0));
+    kept.insert(local, own.1);
+  }
+  let others: Vec<HostId> = candidates
+    .into_iter()
+    .filter(|host| *host != local)
+    .collect();
+  let sessions =
+    crate::fleet::take_sessions("fleet.lent_to.live_takeover", |host| others.contains(&host));
+  let request = slates_db::live::Fetch { object, epoch }.encode();
+  let exchanged = slates_cluster::live::exchange(
+    (slates_cluster::live::LIVE_STATE_STREAM, &request),
+    sessions,
+    crate::fleet::live_budget(),
+    |_, _| false,
+  )
+  .await;
+  crate::fleet::return_sessions(exchanged.reusable);
+  settle_stragglers(
+    state::with_state(|s| s.shard).unwrap_or_default(),
+    object,
+    exchanged.stragglers,
+  );
+  for (host, bytes) in exchanged.replies {
+    if let Ok((head, payloads)) = slates_db::live::decode_fetched(&bytes, cap) {
+      reports.push((host, head));
+      kept.insert(host, payloads);
+    }
+  }
+  let needed = usize::try_from(quorum.f)
+    .ok()
+    .and_then(|f| f.checked_add(1))
+    .unwrap_or(usize::MAX);
+  if reports.len() < needed {
+    return Err("fleet.live.takeover_waits_quorum");
+  }
+  let Some((holder, _)) = slates_db::live::adopt(&reports, quorum) else {
+    return Ok(None);
+  };
+  let payloads = kept.remove(&holder).unwrap_or_default();
+  let sealing = payloads
+    .first()
+    .and_then(|first| sealed_body(first))
+    .and_then(|body| body.sealing);
+  let lineage = sealing.as_ref().and_then(|sealing| {
+    state::with_state(|s| crate::seal_keys::successor_lineage(s, sealing)).flatten()
+  });
+  let naming = sealing.and_then(|sealing| sealing.naming);
+  Ok(Some(Fetched {
+    payloads,
+    lineage,
+    naming,
+  }))
+}
+
+/// A payload's sealed body, when it is sealed.
+fn sealed_body(payload: &[u8]) -> Option<SealedBody> {
+  let (header, body) = payload.split_at_checked(2)?;
+  if header.get(1) != Some(&BODY_SEALED) {
+    return None;
+  }
+  <SealedBody as Wire>::decode(&mut &body[..]).ok()
+}
+
+/// The volume a live log describes, rebuilt as a takeover's archive on the volume's new owner shard (A-200): the
+/// lineage key adopted, every payload opened, the deltas applied in order to the whole image, and the result laid out
+/// as `materialize_taken_over` restores (directories and files, a symlink as a file of its target, as the export lays
+/// it out). Refused, counted, when the log cannot be rebuilt whole: the volume is then not served from it.
+pub(crate) fn archive_from_live(
+  state: &mut ShardState,
+  id: slates_db::catalog::VolumeId,
+  owner: &slates_db::catalog::Principal,
+  fetched: &Fetched,
+) -> Result<slates_archive::Archive, &'static str> {
+  let rebuilt = rebuild(state, id, owner, fetched);
+  match &rebuilt {
+    Ok(_) => state.count(LIVE_TAKEN_OVER, 1),
+    Err(_) => state.count(LIVE_TAKEOVER_REFUSED, 1),
+  }
+  rebuilt
+}
+
+fn rebuild(
+  state: &mut ShardState,
+  id: slates_db::catalog::VolumeId,
+  owner: &slates_db::catalog::Principal,
+  fetched: &Fetched,
+) -> Result<slates_archive::Archive, &'static str> {
+  if let Some(lineage) = fetched.lineage.clone() {
+    crate::seal_keys::adopt_lineage(state, id, owner, lineage, fetched.naming.as_ref())
+      .map_err(|_| LIVE_TAKEOVER_REFUSED)?;
+  }
+  let mut publications = Vec::new();
+  for payload in &fetched.payloads {
+    publications.push(open_payload(state, id, owner, payload).ok_or(LIVE_TAKEOVER_REFUSED)?);
+  }
+  let mut image = None;
+  let mut runs: BTreeMap<(u64, u64), Vec<u8>> = BTreeMap::new();
+  for publication in publications {
+    let record = <VolumeRecord as Wire>::decode(&mut &publication.record[..])
+      .map_err(|_| LIVE_TAKEOVER_REFUSED)?;
+    match (record, image.as_mut()) {
+      (VolumeRecord::Full { image: whole }, _) => {
+        image = Some(whole);
+        runs.clear();
+      }
+      (VolumeRecord::Delta { delta }, Some(image)) => {
+        slates_vfs::recover::VolumeImage::apply(image, &delta)
+          .map_err(|_| LIVE_TAKEOVER_REFUSED)?;
+      }
+      (VolumeRecord::Delta { .. }, None) => return Err(LIVE_TAKEOVER_REFUSED),
+    }
+    for run in publication.runs {
+      runs.insert((run.inode, run.offset), run.bytes);
+    }
+  }
+  let image = image.ok_or(LIVE_TAKEOVER_REFUSED)?;
+  archive_of(&image, &runs, ObjectId(id.bytes).local())
+}
+
+/// One payload's body, opened under the volume's lineage key when sealed.
+fn open_payload(
+  state: &mut ShardState,
+  id: slates_db::catalog::VolumeId,
+  owner: &slates_db::catalog::Principal,
+  payload: &[u8],
+) -> Option<LivePublication> {
+  let (header, body) = payload.split_at_checked(2)?;
+  let bytes = if header.get(1) == Some(&BODY_SEALED) {
+    let sealed = <SealedBody as Wire>::decode(&mut &body[..]).ok()?;
+    let account = crate::seal_keys::tenant_of(owner);
+    let lineage = crate::seal_keys::lineage(state, id, account).ok()?;
+    let namer = crate::seal_keys::namer(state, id, account).ok()?;
+    let chunk = slates_cluster::sealed::SealedChunk {
+      name: sealed.name.as_slice().try_into().ok()?,
+      bytes: sealed.bytes,
+    };
+    slates_cluster::sealed::open_chunk(&lineage, &namer, &chunk)
+      .ok()?
+      .payload
+  } else {
+    body.to_vec()
+  };
+  // A sealed body was sealed from a raw chunk of the publication's bytes (`payload`), so the opened chunk's payload is
+  // those bytes.
+  <LivePublication as Wire>::decode(&mut &bytes[..]).ok()
+}
+
+/// A volume image and the content its extents name, laid out as an archive (the export's layout,
+/// `slates_vfs::export`): each directory's entries under it, each file's extents over chunks of their bytes, a
+/// symlink as a file of its target; holes stay holes. `volume_id` is the archive's header field: the volume's
+/// per-creator number (`ObjectId::local`), informational to a restore.
+fn archive_of(
+  image: &slates_vfs::recover::VolumeImage,
+  runs: &BTreeMap<(u64, u64), Vec<u8>>,
+  volume_id: u64,
+) -> Result<slates_archive::Archive, &'static str> {
+  let inodes: BTreeMap<u64, &InodeImage> =
+    image.inodes.iter().map(|inode| (inode.no, inode)).collect();
+  let mut chunks = Vec::new();
+  let root = inodes.get(&image.root_no).ok_or(LIVE_TAKEOVER_REFUSED)?;
+  let root_meta = meta_of(root);
+  let mut visiting = Vec::new();
+  let manifest = node_of(root, &inodes, runs, &mut chunks, &mut visiting)?;
+  let chunk_max = chunks
+    .iter()
+    .map(|chunk: &slates_archive::Chunk| u32::try_from(chunk.raw_len).unwrap_or(u32::MAX))
+    .max()
+    .unwrap_or(0);
+  Ok(slates_archive::Archive {
+    base_page_size: u32::try_from(rustix::param::page_size()).unwrap_or(u32::MAX),
+    chunk_min: chunk_max,
+    chunk_max,
+    created_unix: 0,
+    volume_id,
+    snapshot_id: 0,
+    name_policy_id: 0,
+    unicode_version: 0,
+    root_meta,
+    manifest,
+    chunks,
+  })
+}
+
+/// The manifest node of `inode`, its children walked; a directory reached again along its own path (a cycle no valid
+/// image holds) is refused.
+fn node_of(
+  inode: &InodeImage,
+  inodes: &BTreeMap<u64, &InodeImage>,
+  runs: &BTreeMap<(u64, u64), Vec<u8>>,
+  chunks: &mut Vec<slates_archive::Chunk>,
+  visiting: &mut Vec<u64>,
+) -> Result<slates_archive::Node, &'static str> {
+  match &inode.body {
+    BodyImage::Directory { entries, .. } => {
+      if visiting.contains(&inode.no) {
+        return Err(LIVE_TAKEOVER_REFUSED);
+      }
+      visiting.push(inode.no);
+      let mut children = Vec::new();
+      for entry in entries {
+        let Some(child) = entry.child.and_then(|no| inodes.get(&no)) else {
+          continue;
+        };
+        children.push(slates_archive::Entry {
+          name: entry.name.clone(),
+          meta: meta_of(child),
+          node: node_of(child, inodes, runs, chunks, visiting)?,
+        });
+      }
+      visiting.pop();
+      Ok(slates_archive::Node::Directory(children))
+    }
+    BodyImage::Inline { bytes } => Ok(slates_archive::Node::File(whole_file(
+      bytes.clone(),
+      chunks,
+    ))),
+    BodyImage::Symlink { target } | BodyImage::BaseLink { target } => Ok(
+      slates_archive::Node::File(whole_file(target.as_bytes().to_vec(), chunks)),
+    ),
+    BodyImage::Chunked { extents, open } => {
+      let mut laid = Vec::new();
+      let spans = extents
+        .iter()
+        .filter(|extent| matches!(extent.source, ExtentSourceImage::Chunk { .. }))
+        .map(|extent| (extent.offset, extent.len))
+        .chain(open.iter().map(|open| (open.offset, open.len)));
+      for (offset, len) in spans {
+        let bytes = runs.get(&(inode.no, offset)).ok_or(LIVE_TAKEOVER_REFUSED)?;
+        if u64::try_from(bytes.len()).ok() != Some(len) {
+          return Err(LIVE_TAKEOVER_REFUSED);
+        }
+        let chunk = slates_archive::Archive::raw_chunk(bytes.clone());
+        laid.push(slates_archive::Extent {
+          offset,
+          len,
+          chunk: chunk.identity,
+          chunk_offset: 0,
+        });
+        chunks.push(chunk);
+      }
+      Ok(slates_archive::Node::File(laid))
+    }
+    _ => Ok(slates_archive::Node::File(Vec::new())),
+  }
+}
+
+/// A file of `bytes` from offset zero, one chunk (none when empty).
+fn whole_file(
+  bytes: Vec<u8>,
+  chunks: &mut Vec<slates_archive::Chunk>,
+) -> Vec<slates_archive::Extent> {
+  if bytes.is_empty() {
+    return Vec::new();
+  }
+  let chunk = slates_archive::Archive::raw_chunk(bytes);
+  let extent = slates_archive::Extent {
+    offset: 0,
+    len: chunk.raw_len,
+    chunk: chunk.identity,
+    chunk_offset: 0,
+  };
+  chunks.push(chunk);
+  vec![extent]
+}
+
+/// An inode's manifest metadata: its attributes with its kind's type bits, as the export writes them.
+fn meta_of(inode: &InodeImage) -> slates_archive::NodeMeta {
+  use slates_vfs::export::{
+    MODE_DIRECTORY, MODE_FIFO, MODE_FILE, MODE_SOCKET, MODE_SYMLINK, permissions_of_mode,
+  };
+  use slates_vfs::recover::KindImage;
+  let type_bits = match inode.kind {
+    KindImage::File => MODE_FILE,
+    KindImage::Dir => MODE_DIRECTORY,
+    KindImage::Symlink => MODE_SYMLINK,
+    KindImage::Fifo => MODE_FIFO,
+    KindImage::Socket => MODE_SOCKET,
+  };
+  let attrs = &inode.attrs;
+  slates_archive::NodeMeta {
+    ino: inode.no,
+    mode: permissions_of_mode(attrs.mode) | type_bits,
+    atime_ns: attrs.atime,
+    mtime_ns: attrs.mtime,
+    ctime_ns: attrs.ctime,
+    btime_ns: attrs.btime,
+    size: attrs.size,
+    nlink: attrs.nlink,
+    uid: attrs.uid,
+    gid: attrs.gid,
+    xattrs: Vec::new(),
+  }
 }

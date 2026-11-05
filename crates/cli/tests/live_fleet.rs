@@ -369,7 +369,7 @@ fn write_live_volume(owner: &str, files: usize) -> String {
   assert!(out.contains("live-shipped"), "{out}");
   let attachment = value_of(&run_ready(owner, &["attach", &id, "--write"]), "attachment");
   for file in 0..files {
-    let body = format!("live write {file} on the owner, kept by both candidates");
+    let body = live_body(file);
     let path = format!("/file-{file}");
     let (code, err) = run_with_stdin(owner, &["write", &id, &attachment, &path], body.as_bytes());
     assert_eq!(code, 0, "write {path}: {err}");
@@ -553,5 +553,108 @@ fn a_stable_nfs_write_to_a_live_volume_is_answered_once_a_candidate_holds_it() {
   assert!(
     waited >= u64::try_from(FILES).unwrap(),
     "each stable write waited for durability: {waited}"
+  );
+}
+
+/// Waits until `volume`'s creation head is placed at `f + 1` (`volume stat`'s `placed`).
+fn wait_head_placed(owner: &str, volume: &str) {
+  let deadline = Instant::now() + FLEET_WAIT;
+  loop {
+    let (code, out, _) = run(owner, &["volume", "stat", volume]);
+    if code == 0 && value_of(&out, "placed") == "true" {
+      return;
+    }
+    assert!(Instant::now() < deadline, "the creation head placed: {out}");
+    pause();
+  }
+}
+
+/// The body `write_live_volume` writes to `/file-N`.
+fn live_body(file: usize) -> String {
+  format!("live write {file} on the owner, kept by both candidates")
+}
+
+/// Waits until a survivor serves `volume` with every file `write_live_volume` wrote, byte for byte; that survivor and
+/// how long it took from now. Fails, showing every survivor's status, at the fleet wait.
+fn wait_served_whole(survivors: &[&String], volume: &str, files: usize) -> (String, Duration) {
+  let began = Instant::now();
+  let deadline = began + FLEET_WAIT;
+  loop {
+    for survivor in survivors {
+      let (code, listed, _) = run(survivor, &["volume", "list"]);
+      if code != 0 || !listed.contains(volume) {
+        continue;
+      }
+      let whole = (0..files).all(|file| {
+        let (code, out, _) = run(survivor, &["read", volume, &format!("/file-{file}")]);
+        code == 0 && out == live_body(file)
+      });
+      if whole {
+        return ((*survivor).clone(), began.elapsed());
+      }
+    }
+    if Instant::now() >= deadline {
+      let states: Vec<String> = survivors
+        .iter()
+        .map(|survivor| {
+          let (_, status, _) = run(survivor, &["status"]);
+          let reads: Vec<String> = (0..files)
+            .map(|file| {
+              let (code, out, err) = run(survivor, &["read", volume, &format!("/file-{file}")]);
+              format!("file-{file}: {code} {out:?} {}", err.trim())
+            })
+            .collect();
+          format!("--- {survivor}: {reads:?}\n{status}")
+        })
+        .collect();
+      panic!(
+        "a survivor serves every acknowledged write: {}",
+        states.join("\n")
+      );
+    }
+    pause();
+  }
+}
+
+/// A-200, AC-8.3 ("live-shipped volumes report none"): do write five files to a live-shipped volume, each answered only
+/// once durable on a candidate, never snapshot it, then kill its owner's process (SIGKILL). Expect a survivor to take
+/// the volume over and serve all five files byte for byte: no acknowledged write is lost, where a takeover from the
+/// placed seal alone would serve an empty volume (it was never sealed).
+#[test]
+fn a_live_volumes_acknowledged_writes_survive_its_owners_death() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping takeover flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let mut fleet = start_fleet("live-takeover");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = fleet.instances[owner_index].clone();
+  let id = write_live_volume(&owner, FILES);
+  // The fleet learns a volume exists from its creation head, placed at `f + 1` on the record period; a volume whose
+  // owner dies before that is not one a takeover can find (GAPS: the first live write is owed a wait for it).
+  wait_head_placed(&owner, &id);
+  let survivors: Vec<&String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| **instance != owner)
+    .collect();
+  // The owner dies as a crash kills it, with no seal ever taken.
+  drop(fleet.daemons.remove(owner_index));
+  let (successor, took) = wait_served_whole(&survivors, &id, FILES);
+  let taken_over = counter(&successor, "fleet.live.taken_over");
+  let fetched: u64 = survivors
+    .iter()
+    .map(|survivor| counter(survivor, "fleet.live.fetched"))
+    .sum();
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!(
+    "live takeover: served whole by {successor} after {took:?}; taken_over={taken_over} fetched={fetched}"
+  );
+  assert!(
+    taken_over >= 1,
+    "the successor rebuilt the volume from the live log: {taken_over}"
   );
 }
