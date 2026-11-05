@@ -70,7 +70,8 @@ What later runs showed (macOS arm64, 2026-11-05 16:00–16:57 UTC):
   - Alone, it never stalled: 2,000 creates, twice.
   - After a prelude of 64 concurrent clients, each dropped with an acknowledgement still in flight, it stalled in 1
     run of 10: 3 creates, numbers 1,713, 1,715 and 1,716.
-- **The one stall caught with the bench instrumented** (the a6c3bc16 tree, a stall reported instead of aborted) was
+- **The one stall caught with the bench instrumented** (a stall reported instead of aborted; its client library was
+  main's, as the correction above says) was
   not in the parked form. All 64 clients of the 64-client form's second run stalled at once, at their 7th to 10th
   create, each after about 1.767 s. The daemon answered nobody for that long, right after 64 clients were dropped
   and 64 others connected. So the stall is a whole-daemon pause after client churn, and the parked form only met it.

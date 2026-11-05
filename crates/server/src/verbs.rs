@@ -2594,11 +2594,8 @@ fn scatter_list(
       }),
       None,
     );
-    if slates_rt::registry::send_control(shard, Control::Spawn(Box::new(task))).is_err() {
-      // Settled on the state this verb holds (a gather through a second borrow never ran): the listing is refused,
-      // typed, and a part already sent finds no entry when it comes back.
-      state.scatters.remove(&request);
-      return Served::Reply(part_unsent(state, shard));
+    if let Some(reply) = send_part(state, shard, task, ScatterKind::List, request) {
+      return Served::Reply(reply);
     }
   }
   Served::Forwarded
@@ -2648,10 +2645,8 @@ fn scatter_grants(
       }),
       None,
     );
-    if slates_rt::registry::send_control(shard, Control::Spawn(Box::new(task))).is_err() {
-      // As `scatter_list`: refused, typed, on the state this verb holds.
-      state.grant_scatters.remove(&request);
-      return Served::Reply(part_unsent(state, shard));
+    if let Some(reply) = send_part(state, shard, task, ScatterKind::Grants, request) {
+      return Served::Reply(reply);
     }
   }
   Served::Forwarded
@@ -2665,15 +2660,19 @@ fn gather_grants(request: u64, part: Vec<slates_ipc::protocol::GrantSummary>) {
     entry.2.extend(part);
     entry.1 = entry.1.saturating_sub(1);
     if entry.1 == 0 {
-      s.grant_scatters.remove(&request)
+      let refused_for = s.scatter_refusals.remove(&request);
+      s.grant_scatters
+        .remove(&request)
+        .map(|entry| (entry, refused_for.map(|shard| part_unsent(s, shard))))
     } else {
       None
     }
   })
   .flatten();
-  if let Some((client_index, _, mut grants)) = done {
+  if let Some(((client_index, _, mut grants), unsent)) = done {
     grants.sort_by_key(|g| g.id);
-    crate::state::deliver(client_index, request, ReplyBody::Grants { grants }, false);
+    let reply = unsent.unwrap_or(ReplyBody::Grants { grants });
+    crate::state::deliver(client_index, request, reply, false);
   }
 }
 
@@ -2708,18 +2707,150 @@ fn scatter_status(state: &mut ShardState, client_index: u32, request: u64) -> Se
       }),
       None,
     );
-    if slates_rt::registry::send_control(shard, Control::Spawn(Box::new(task))).is_err() {
-      // As `scatter_list`: refused, typed, on the state this verb holds.
-      state.status_scatters.remove(&request);
-      return Served::Reply(part_unsent(state, shard));
+    if let Some(reply) = send_part(state, shard, task, ScatterKind::Status, request) {
+      return Served::Reply(reply);
     }
   }
   Served::Forwarded
 }
 
-/// The answer a scatter gives when its part for `shard` cannot be sent, the shard's control channel full: the typed
-/// `Overloaded`, counted by its name. Before 2026-11-05 the part was settled through a nested state borrow that never
-/// ran, and the scatter was never answered (`docs/bugs/2026-11-05-a-scatter-whose-part-could-not-be-sent-never-answered.md`).
+/// Which scatter a part belongs to, so a part that cannot be sent is settled in its own table.
+#[derive(Clone, Copy)]
+enum ScatterKind {
+  /// `scatter_list`, its entry in [`ShardState::scatters`].
+  List,
+  /// `scatter_grants`, in [`ShardState::grant_scatters`].
+  Grants,
+  /// `scatter_status`, in [`ShardState::status_scatters`].
+  Status,
+  /// `scatter_acknowledge`, in [`ShardState::ack_scatters`] (A-216).
+  Acknowledge,
+}
+
+/// How long a scatter's part waits for room in a full control channel before it is refused (A-216's sibling sweep).
+/// Derived: half the client's reply deadline (the liveness budget, which `slates_client::Deadlines` waits a reply for),
+/// so the typed `Overloaded` reaches the client before it gives the reply up; a burst, such as the resends after a
+/// daemon's restart, drains well within it.
+const PART_ROOM_BUDGET_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS / 2;
+
+/// Sends a scatter's part, `task`, to `shard`. A control channel full at once hands the part to a task of this shard
+/// that waits for room for [`PART_ROOM_BUDGET_NS`] (`xshard::given_room_within`). Past that wait, or at once for a shard
+/// gone or a waiting task that cannot be spawned, the part is settled as refused ([`settle_refused`]): the scatter then
+/// answers `Overloaded { shard }`, typed, when its last part is in. Before 2026-11-05 a refused part was settled through
+/// a nested state borrow that never ran, and the scatter was never answered
+/// (`docs/bugs/2026-11-05-a-scatter-whose-part-could-not-be-sent-never-answered.md`). The reply, when this refusal
+/// settled the scatter's last part now: the caller answers it.
+fn send_part(
+  state: &mut ShardState,
+  shard: u16,
+  task: SpawnRequest,
+  kind: ScatterKind,
+  request: u64,
+) -> Option<ReplyBody> {
+  let unsent =
+    match slates_rt::registry::send_control_or_return(shard, Control::Spawn(Box::new(task))) {
+      Ok(()) => return None,
+      Err(slates_rt::registry::RefusedControl {
+        error: slates_rt::RtError::ControlFull { .. },
+        message: Some(unsent),
+      }) => unsent,
+      // A shard is gone only while its daemon stops: the scatter is left for the client's resend after it reconnects,
+      // as every request in flight at a stop is (the scatter re-runs under its id on the next daemon), and an answer
+      // from here would race the stop and end the call with no reason the next daemon would give.
+      Err(slates_rt::registry::RefusedControl {
+        error: slates_rt::RtError::ShardGone { .. },
+        ..
+      }) => {
+        settle_gone(state, kind, request);
+        return None;
+      }
+      Err(_) => return settle_refused(state, kind, request, shard).map(|(_, reply, _)| reply),
+    };
+  let waiting = slates_rt::futures::spawn(async move {
+    if !crate::xshard::given_room_within(shard, unsent, PART_ROOM_BUDGET_NS).await {
+      // Settled in its own borrow, and delivered after it: `deliver` borrows the state itself.
+      if let Some(Some((client_index, reply, paged))) =
+        crate::state::with_state_counted(|s| settle_refused(s, kind, request, shard))
+      {
+        crate::state::deliver(client_index, request, reply, paged);
+      }
+    }
+  })
+  .and_then(slates_rt::futures::detach);
+  match waiting {
+    Ok(()) => None,
+    Err(_) => settle_refused(state, kind, request, shard).map(|(_, reply, _)| reply),
+  }
+}
+
+/// Settles a part that could not be sent to `shard`: an acknowledgement's release is counted ([`release_part_back`]);
+/// a listing's, grants' or status' part marks its scatter refused and counts down. When that was the scatter's last
+/// part, the entry goes and the scatter's answer is returned, `Overloaded` for the first refused shard, counted, with
+/// its client slot and whether it is paged.
+fn settle_refused(
+  state: &mut ShardState,
+  kind: ScatterKind,
+  request: u64,
+  shard: u16,
+) -> Option<(u32, ReplyBody, bool)> {
+  let (done, paged) = match kind {
+    ScatterKind::Acknowledge => {
+      release_part_back(state, request, &refused(Refusal::NotFound));
+      return None;
+    }
+    ScatterKind::List => (count_down(&mut state.scatters, request), false),
+    ScatterKind::Grants => (count_down(&mut state.grant_scatters, request), false),
+    ScatterKind::Status => (count_down(&mut state.status_scatters, request), true),
+  };
+  let first = *state.scatter_refusals.entry(request).or_insert(shard);
+  let client_index = done?;
+  state.scatter_refusals.remove(&request);
+  Some((client_index, part_unsent(state, first), paged))
+}
+
+/// Format: the count of scatters left unanswered because a shard they needed was gone, its daemon stopping
+/// ([`send_part`]): each is answered by the client's resend to the next daemon.
+const SCATTER_SHARD_GONE: &str = "scatter.shard_gone";
+
+/// Settles a scatter whose part's shard is gone, its daemon stopping: the entry goes, so nothing is left behind, and
+/// it is counted ([`SCATTER_SHARD_GONE`]); the reply is the next daemon's, to the client's resend.
+fn settle_gone(state: &mut ShardState, kind: ScatterKind, request: u64) {
+  match kind {
+    ScatterKind::Acknowledge => {
+      state.ack_scatters.remove(&request);
+    }
+    ScatterKind::List => {
+      state.scatters.remove(&request);
+    }
+    ScatterKind::Grants => {
+      state.grant_scatters.remove(&request);
+    }
+    ScatterKind::Status => {
+      state.status_scatters.remove(&request);
+    }
+  }
+  state.scatter_refusals.remove(&request);
+  state.count(SCATTER_SHARD_GONE, 1);
+}
+
+/// Counts one part of a scatter in `table` down; its client slot when that was the last part (the entry is gone).
+fn count_down<T>(
+  table: &mut std::collections::BTreeMap<u64, (u32, usize, Vec<T>)>,
+  request: u64,
+) -> Option<u32> {
+  let entry = table.get_mut(&request)?;
+  entry.1 = entry.1.saturating_sub(1);
+  if entry.1 == 0 {
+    table
+      .remove(&request)
+      .map(|(client_index, _, _)| client_index)
+  } else {
+    None
+  }
+}
+
+/// The answer a scatter gives when its part for `shard` could not be sent, the shard's control channel full past a
+/// wait for room: the typed `Overloaded`, counted by its name.
 fn part_unsent(state: &mut ShardState, shard: u16) -> ReplyBody {
   let refusal = Refusal::Overloaded { shard };
   state.count(refusal_name(&refusal), 1);
@@ -2792,10 +2923,8 @@ fn scatter_acknowledge(
       }),
       None,
     );
-    if slates_rt::registry::send_control(shard, Control::Spawn(Box::new(task))).is_err() {
-      // Settled here, on the state this verb holds: a gather through another borrow would be refused and lose it.
-      release_part_back(state, request, &refused(Refusal::NotFound));
-    }
+    // The reply is this shard's (below); a part that cannot be sent is counted when it is settled.
+    let _ = send_part(state, shard, task, ScatterKind::Acknowledge, request);
   }
   Served::Reply(mine)
 }
@@ -2825,16 +2954,22 @@ fn gather_status(request: u64, part: Option<ShardReport>) {
     entry.2.extend(part);
     entry.1 = entry.1.saturating_sub(1);
     if entry.1 == 0 {
-      s.status_scatters.remove(&request)
+      let refused_for = s.scatter_refusals.remove(&request);
+      s.status_scatters
+        .remove(&request)
+        .map(|entry| (entry, refused_for.map(|shard| part_unsent(s, shard))))
     } else {
       None
     }
   })
   .flatten();
-  if let Some((client_index, _, mut shards)) = done {
+  if let Some(((client_index, _, mut shards), unsent)) = done {
     shards.sort_by_key(|r| r.partition);
-    let reply = crate::state::with_state(|s| daemon_report(s, shards))
-      .unwrap_or_else(|| refused(Refusal::NotFound));
+    let reply = match unsent {
+      Some(unsent) => unsent,
+      None => crate::state::with_state(|s| daemon_report(s, shards))
+        .unwrap_or_else(|| refused(Refusal::NotFound)),
+    };
     // A status capture is ephemeral; paging never appends the full report to the op log.
     crate::state::deliver(client_index, request, reply, true);
   }
@@ -3222,15 +3357,19 @@ fn gather(request: u64, part: Vec<VolumeSummary>) {
     entry.2.extend(part);
     entry.1 = entry.1.saturating_sub(1);
     if entry.1 == 0 {
-      s.scatters.remove(&request)
+      let refused_for = s.scatter_refusals.remove(&request);
+      s.scatters
+        .remove(&request)
+        .map(|entry| (entry, refused_for.map(|shard| part_unsent(s, shard))))
     } else {
       None
     }
   })
   .flatten();
-  if let Some((client_index, _, mut volumes)) = done {
+  if let Some(((client_index, _, mut volumes), unsent)) = done {
     volumes.sort_by(|a, b| a.name.cmp(&b.name));
-    crate::state::deliver(client_index, request, ReplyBody::Listed { volumes }, false);
+    let reply = unsent.unwrap_or(ReplyBody::Listed { volumes });
+    crate::state::deliver(client_index, request, reply, false);
   }
 }
 

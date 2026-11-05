@@ -446,20 +446,22 @@ fn scattered_with_the_other_shard_full(
   (shard, reply, took)
 }
 
-/// The answer a scatter must give when a part cannot be sent to `shard`: the typed refusal, inside the hold.
+/// The answer a scatter must give when a part cannot be sent to `shard`: the typed refusal, inside the hold. The part
+/// waits for room for half the liveness budget first, so the answer comes after that and before the hold ends.
 fn check_typed_refusal(verb: &str, (other, reply, took): (usize, ReplyBody, Duration)) {
   assert!(
     matches!(reply, ReplyBody::Refused { refusal: Refusal::Overloaded { shard } } if usize::from(shard) == other),
     "{verb} with the other shard's control channel full: {reply:?}"
   );
   assert!(
-    took < HOLD / 2,
-    "{verb} was answered in {took:?}, against a {HOLD:?} hold of the other shard"
+    took >= HOLD / 2 && took < HOLD,
+    "{verb} was answered in {took:?}: after its part waited half the liveness budget for room, inside the {HOLD:?} hold"
   );
 }
 
 /// §4.14, A-216's sibling sweep. Do: on a two-shard daemon, hold the other shard and fill its control channel, then
-/// list the volumes. Expect: `Overloaded { shard }` naming the other shard, in under half the hold. Before, the
+/// list the volumes. Expect: `Overloaded { shard }` naming the other shard, once its part has waited half the liveness
+/// budget for room and inside the hold. Before, the
 /// listing's part for that shard was settled through a nested state borrow that never ran, and the listing was never
 /// answered.
 #[test]
@@ -471,7 +473,7 @@ fn a_listing_whose_part_cannot_be_sent_is_refused_overloaded() {
 }
 
 /// §4.8 grants, A-216's sibling sweep. Do: as the listing test, but ask for the grants. Expect: `Overloaded { shard }`,
-/// in under half the hold; before, never answered.
+/// after the wait for room and inside the hold; before, never answered.
 #[test]
 fn a_grants_listing_whose_part_cannot_be_sent_is_refused_overloaded() {
   check_typed_refusal(
@@ -481,7 +483,7 @@ fn a_grants_listing_whose_part_cannot_be_sent_is_refused_overloaded() {
 }
 
 /// §4.14 `slates.status`, A-216's sibling sweep. Do: as the listing test, but ask for the daemon's status. Expect:
-/// `Overloaded { shard }`, in under half the hold; before, never answered.
+/// `Overloaded { shard }`, after the wait for room and inside the hold; before, never answered.
 #[test]
 fn a_daemon_status_whose_part_cannot_be_sent_is_refused_overloaded() {
   check_typed_refusal(
