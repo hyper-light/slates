@@ -18,6 +18,25 @@
 >
 > Every macOS arm is now built in its own target dir, and arms are compared by MD5 before they run.
 
+> **The large-file NFS write gap (VFS plan step 11, 2026-11-05): closed on the incumbent harness by A-204 and A-214.**
+> The incumbent harness on the M5 Max (six interleaved rounds, load 6–10, 2026-11-05 16:23Z) writes the 64 MiB file
+> at up to 1,286.0 MiB/s with A-214, against 1,033.9 before it and step 11's 967, beyond the spread at 4 and 16
+> workers. Write p99s at 16 workers overlap with no direction. Profiled through Linux's NFSv4.2 client on CI (run
+> 41986870989), the one busy shard had spent 41.5% of its samples faulting in fresh pages of the anchor's shared
+> content object, 21.0% sealing at rest and 12.4% peeking and copying records. BENCHMARKS, "The large-file NFS write
+> profiled" and "an idle shard keeps its last write burst's pages pre-faulted".
+> - **A-204:** a turn takes only the records its quantum can reach (CI best of nine 441.3 → 472.2 MiB/s, +26% at 16
+>   workers; even on the Mac).
+> - **A-214 (Ada's option (a)):** an idle shard keeps its last write burst's net growth of free pages pre-faulted,
+>   refilled in its idle moments, at most its memory share. A first build refilled only at the reap tick, which the
+>   harness's second-long pauses never reached on the volume's shard; the refill is now the runtime's idle work.
+> - **Open:** the gap to nfsd remains about 1.5× at 4 and 16 workers (nfsd 1,458–2,081 MiB/s), and at 1 worker, where the
+>   first large write follows no earlier burst, A-214 does not apply. Sealing at rest (21%) is condition 9's. On CI
+>   (run 42064893088, interleaved) A-214 took the 4- and 16-worker writes from 602–641 to 1,003–1,064 MiB/s, level
+>   with nfsd there.
+> - **Tried and not taken:** populating fresh pages in batches or from a second thread (run 41987962954); filling them
+>   by `pwrite` into the content object (1.9× per fresh page), which R1's lint wall forbids.
+
 
 
 > **Merge: the same edit from two works was one increment; fixed 2026-11-04 (§4.16, agents/perf).** The increment's
