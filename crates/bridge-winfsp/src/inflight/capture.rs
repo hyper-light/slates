@@ -1216,9 +1216,10 @@ mod tests {
           None => None,
           Some(mut hand_off) => {
             budget.step()?;
+            confirm(hand_off.response(), opens);
+            budget.step()?;
             let (input, output) = hand_off.transaction();
             let reported = transact(kernel, budget, input, Some(output))?;
-            confirm(hand_off.response(), opens);
             budget.step()?;
             Some(reported)
           }
