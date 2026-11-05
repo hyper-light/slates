@@ -1741,7 +1741,7 @@ struct DirNode { born: Epoch, entries: DirEntries, parent: Option<InodeNo> /* re
                  inode: InodeNo, name: Box<str> /* its own name in the parent */,
                  base: BaseDirState /* None | Merged{listing: ListingRef} | Opaque */,
                  origin: Option<PathKey> /* redirect: the base path this directory was renamed from */ }
-enum DirEntries { Small(InlineArray<Entry, 2> /* names inline, the measured cut-over */), Indexed(Tree /* CoW B+-tree of 4 KiB slotted blocks in the store's block slab, keyed by (hash, folded name); A-7 */) }
+enum DirEntries { Small(InlineArray<Entry, 2> /* names inline, the measured cut-over */), Indexed(Tree /* CoW B+-tree of slotted blocks keyed by (hash, folded name), A-7; each block the smallest of 17 size classes, 256 B to 4 KiB four to a doubling, that holds its entries, in the store's block pages (A-203) */) }
 struct Entry { name_hash: u64, name: NameRef /* into the node or the block */, kind: Kind /* Dir | File | Symlink | Fifo | Socket | Whiteout */, child: Handle<DirNode> | InodeNo }
 enum Body { …, Directory(Handle<DirNode>) /* a directory inode names its current node (A-7) */ }
 struct Inode { no: InodeNo, gen: u32, kind, mode, uid, gid, nlink, size, atime, mtime, ctime, btime,
