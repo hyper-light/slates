@@ -1,5 +1,14 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Merge: the same edit from two works was one increment; fixed 2026-11-04 (§4.16, agents/perf).** The increment's
+> identity left out its work and its base, so a second work's byte-identical edit from the same base was answered from
+> the retry cache with the first work's version, even where the green had since changed that range: a conflict reported
+> as an accept. The identity now names the work and the base as §4.16's data model says. Failing first, passing after:
+> `crates/client/tests/merge_identity.rs`. Record: `docs/bugs/2026-11-04-the-same-edit-from-two-works-was-one-increment.md`.
+> Found by the edit-and-merge latency harness's oracle (`crates/client/examples/merge_bench.rs`), whose numbers are owed
+> to BENCHMARKS.
+>
+
 > **The anchor's hold refusals: a bounded Unix log, and a count in `slates status` (2026-11-04, A-213; siblings of
 > audit step 3).** The Unix device hold logged a line per refused message, unbounded; it now logs each distinct refusal
 > once (`RefusalLog`, as the Windows hold does) and counts every one. Every refusal on either platform's hold channel

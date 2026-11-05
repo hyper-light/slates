@@ -5428,7 +5428,16 @@ fn build_increment(
     }
   };
   let post_state = assemble_post_state(&doc, &w.content, &w.journal);
+  // The identity names the work and its base before the post-state and the document (§4.16 data model:
+  // `blake3(work_volume, base, post_state, ops_doc, filter)`), so the engine's retry cache answers only a
+  // retry of this work's increment. Without them, a second work's identical edit from the same base was
+  // answered with the first work's version even when the green had since changed that range, a conflict
+  // reported as an accept (`docs/bugs/2026-11-04-the-same-edit-from-two-works-was-one-increment.md`).
+  // Both are fixed widths, so the concatenation is unambiguous. Every work volume of a green is under one
+  // exclusion filter today (none), so the filter adds nothing yet.
   let mut hasher = blake3::Hasher::new();
+  hasher.update(&work_id.bytes);
+  hasher.update(&base_version.to_le_bytes());
   hasher.update(&doc.encode());
   hasher.update(&post_state);
   let id = *hasher.finalize().as_bytes();
