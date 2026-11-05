@@ -1,4 +1,4 @@
-//! Live shipping's log (§4.10 "Live shipping", A-199; §4.8 the register rules it rides): the owner of a
+//! Live shipping's log (§4.10 "Live shipping", A-200; §4.8 the register rules it rides): the owner of a
 //! `live-shipped` volume ships each of its publications to the volume's other candidates as a fenced, hash-chained log,
 //! and a publication is durable once the owner and `f` holders hold it. This module is the protocol alone — sans-io,
 //! deterministic, no clock — so the same code is the laptop (`f = 0`: no holders, every entry durable at once) and the
@@ -25,7 +25,7 @@
 //!
 //! **Bounds.** The owner holds at most `credit` entries not yet durable ([`LiveError::NoCredit`] past it: the writer
 //! waits, AC-8.9) and retains at most `retain` entries for laggards; a holder behind the retained tail is installed.
-//! Both are the caller's to derive (A-199: Little's law over the measured apply rate and holder round trip).
+//! Both are the caller's to derive (A-200: Little's law over the measured apply rate and holder round trip).
 //!
 //! Guard-then-apply, as `crate::partition`: [`Replica::check`] refuses before the caller applies a payload, and
 //! [`Replica::commit`] is unconditional, so a payload the caller could not apply leaves the replica unchanged.
@@ -470,7 +470,7 @@ impl Replica {
   }
 }
 
-/// Phase one's choice (A-199): among the reports of at least `f + 1` candidates (each holder's head; `None` for one
+/// Phase one's choice (A-200): among the reports of at least `f + 1` candidates (each holder's head; `None` for one
 /// that holds nothing), the holder whose head ranks highest, and that head. `None` when too few reported, or when
 /// every report is empty (nothing was ever shipped).
 pub fn adopt(reports: &[(HostId, Option<Head>)], quorum: Quorum) -> Option<(HostId, Head)> {
@@ -564,7 +564,7 @@ impl Shipper {
   }
 
   /// The highest position the owner and `f` holders hold (`None`: none yet). A barrier covering an entry at or below
-  /// it may answer (A-199).
+  /// it may answer (A-200).
   pub fn durable(&self) -> Option<u64> {
     self.durable
   }

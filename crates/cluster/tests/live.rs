@@ -1,4 +1,4 @@
-//! Live shipping over the fleet transport (A-199, §4.10; `slates_cluster::live`), on the simulated UDP fabric with
+//! Live shipping over the fleet transport (A-200, §4.10; `slates_cluster::live`), on the simulated UDP fabric with
 //! real endpoints (TLS 1.3, packet protection): an owner and two holders at `f = 1`. Test by use (R5).
 
 // Test harness: an unwrap here is a failed test.
@@ -236,7 +236,7 @@ fn shipper(credit: u64, retain: usize) -> Shipper {
   )
 }
 
-/// A-199: a holder that joins late (it held nothing while six writes became durable through the other holder alone) is
+/// A-200: a holder that joins late (it held nothing while six writes became durable through the other holder alone) is
 /// told behind, is installed at the owner's head by the owner's period (`Shipper::pending`), and from then on applies
 /// entries; both holders end holding exactly the owner's state. Over real endpoints on the simulated fabric.
 #[test]

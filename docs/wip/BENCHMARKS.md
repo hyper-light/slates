@@ -7820,7 +7820,7 @@ waits parked.
 **Not in these rows.** The daemon ships a head only on its 100 ms record period, so a head still waits up to a
 period before this commit begins.
 
-### Live shipping over the transport (A-199; 2026-11-04)
+### Live shipping over the transport (A-200; 2026-11-04)
 
 Same bench, same hardware, later the same evening: `live ship <n> B` rows, one live-shipped write at a time (a credit of
 one): `Shipper::append`, then `slates_cluster::live::ship` to both holders, which apply it through `serve_entry`,

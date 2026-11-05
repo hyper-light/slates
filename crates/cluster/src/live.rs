@@ -1,4 +1,4 @@
-//! Live shipping over the fleet transport (§4.10, A-199): the owner's dispatch of its log's entries and installs to
+//! Live shipping over the fleet transport (§4.10, A-200): the owner's dispatch of its log's entries and installs to
 //! its holders, and the holder's answer to each. The protocol is `slates_db::live` (the chain, the fence, the credit,
 //! the durable position); this module only moves its messages and folds the replies, so the simulation that checks the
 //! protocol checks what runs here.
@@ -43,7 +43,7 @@ pub struct Shipped {
 
 /// Sends `message` (an encoded entry on [`LIVE_ENTRY_STREAM`], or an install on [`LIVE_INSTALL_STREAM`]) to each holder
 /// over its session, always, and folds the replies into `shipper` until position `until` is durable (a write waits for
-/// its durability alone, A-199), or with `until` `None` until every holder has answered (a catch-up, whose position is
+/// its durability alone, A-200), or with `until` `None` until every holder has answered (a catch-up, whose position is
 /// usually durable already), or until the budget runs out. Returns the sessions.
 ///
 /// Until 2026-11-04 a message whose position was already durable was not sent at all, so the owner's period never

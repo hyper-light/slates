@@ -20,7 +20,7 @@
 //! [`record`] (the log record format over the segment's ring), [`register`] (the register
 //! primitives of §4.8 — the quorum, the fence, rendezvous placement, the configuration oracle),
 //! [`ledger`] (the fenced ledger register: the register over time, commit at `f + 1`, and takeover
-//! by phase-one adoption), [`live`] (live shipping's fenced, hash-chained log of an owner's publications, A-199), [`mirror`] (asynchronous mirroring of the committed prefix to a second
+//! by phase-one adoption), [`live`] (live shipping's fenced, hash-chained log of an owner's publications, A-200), [`mirror`] (asynchronous mirroring of the committed prefix to a second
 //! region in epoch order with an exposed lag), [`reconfig`] (changing a register's holder set by
 //! joint consensus, preserving ReadSafety and NoLoss), [`replay`] (recovery and the snapshot
 //! policy), [`error`].

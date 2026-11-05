@@ -6,7 +6,7 @@
 > collector: 18.9–19.9 µs at the median, p99 28.8–32.9 µs, worst 44.7 µs at the daemon's poll
 > (`replication_bench`, five interleaved rounds at load 36–42, `docs/wip/BENCHMARKS.md`; failing test first:
 > `a_commit_returns_at_its_quorum_not_at_its_poll`; record:
-> `docs/bugs/2026-11-04-a-quorum-collector-waited-out-its-poll.md`). Live shipping's log (A-199) is built and checked
+> `docs/bugs/2026-11-04-a-quorum-collector-waited-out-its-poll.md`). Live shipping's log (A-200) is built and checked
 > as a pure module (`crates/db/src/live.rs`; the nemesis in `crates/db/tests/live.rs`: 200 seeds × 3,000 steps at f=1
 > and f=2, Agreement, NoLoss, StaleNeverCommits and Convergence held, each check red under a mutation; §4.10 status).
 > Over the fleet transport (`crates/cluster/src/live.rs`) a live-shipped write is durable on two hosts in 17–20 µs at
