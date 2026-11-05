@@ -10,9 +10,10 @@
 //! - An open with `TRUNCATE_EXISTING` must leave the file empty (`t/base/05.t` case 12); the drive kept its bytes.
 //! - `SetFileTime`'s access and write times must be kept (`t/base/06.t` case 6); the drive answered success and kept
 //!   neither. A creation time is not kept: the volume records no settable birth time (A-214's stated difference).
-//! - A file shrunk and then extended must reach its new size: the WinFsp fsx port wedged at its operation 164, a
-//!   `TRUNCATE UP` from 158,132 to 246,956 bytes right after a `TRUNCATE DOWN` (seed 1; diagnostics run 41989365843).
-//!   The port extends through the C runtime's `_chsize`, which writes zeros from the end until the size is reached.
+//! - A file shrunk and then extended must reach its new size: the WinFsp fsx port wedges at an extension that follows
+//!   a cached write past a hole and a shrink below it (its operations 162 to 164 at seed 1 in diagnostics run
+//!   41989365843, 41 to 43 in later runs). The port extends through the C runtime's `_chsize`, which writes zeros from
+//!   the end until the size is reached. These two replays pass: alone, the operations do not wedge (an open bug).
 //!
 //! Windows only, and gated on `SLATES_TEST_CLI=1` and `WINFSP_TEST_MOUNT=1`, as `tests/winfsp.rs` is; without them
 //! each test skips loudly and passes. CI's Windows lanes install WinFsp and set both.

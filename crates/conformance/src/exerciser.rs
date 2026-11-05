@@ -85,11 +85,18 @@ pub fn fsx_last_operation(output: &str) -> Option<u64> {
     .max()
 }
 
-/// The reviewed-list id of an fsx run that stopped short: `fsx-seed-<seed>:<the operation it stopped at>`, the operation
-/// after the last one its trace shows done. Ids have the `file:number` form the reviewed lists take.
+/// The reviewed-list id of an fsx run that failed its own verification: `fsx-seed-<seed>:<the operation it failed at>`,
+/// the operation after the last one its trace shows done; fsx stops at the same one every run of a seed. Ids have the
+/// `file:number` form the reviewed lists take.
 pub fn fsx_stop_id(seed: u64, output: &str) -> String {
   let stopped_at = fsx_last_operation(output).unwrap_or(0).saturating_add(1);
   format!("fsx-seed-{seed}:{stopped_at}")
+}
+
+/// The reviewed-list id of an fsx run its wall bound ended: `fsx-seed-<seed>-unfinished:<operations asked>`. Where the
+/// bound falls depends on the host's pace, so the operation a cut run reached is no stable fact and is not the id.
+pub fn fsx_unfinished_id(seed: u64, operations: u64) -> String {
+  format!("fsx-seed-{seed}-unfinished:{operations}")
 }
 
 /// fsstress's verdict: the exit status, and the operations its log shows.
@@ -177,6 +184,7 @@ mod tests {
     assert_eq!(fsx_last_operation(trace), Some(163));
     assert_eq!(fsx_stop_id(1, trace), "fsx-seed-1:164");
     assert_eq!(fsx_stop_id(7, "Seed set to 7\n"), "fsx-seed-7:1");
+    assert_eq!(fsx_unfinished_id(1, 10_000), "fsx-seed-1-unfinished:10000");
   }
 
   /// fsstress's real `-v` lines (a 40-operation, two-process run on this host, 2026-09-14) are

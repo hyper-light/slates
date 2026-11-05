@@ -2886,8 +2886,9 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 > list with one of five stated differences (attribute bits, security descriptors, a settable creation time, reparse
 > points and symbolic links, named streams). Four Win32 bugs it found are fixed with failing tests first
 > (`crates/cli/tests/winfsp_semantics.rs`): a move not asked to replace, a directory holding a file, `SetFileTime`, and
-> an open with `TRUNCATE_EXISTING` (WinFsp's allocation below a file's size truncates it). Open: the fsx port wedges at
-> its operation 164 inside Windows, below the single receiver; it is a listed failure until fixed.
+> an open with `TRUNCATE_EXISTING` (WinFsp's allocation below a file's size truncates it). Open: the fsx port wedges at an
+> extension after a cached write past a hole and a shrink, inside Windows below the single receiver; it is a listed
+> failure (`fsx-seed-1-unfinished:10000`) until fixed.
 
 > **Status (2026-11-02, A-198, Step 9.2: Windows handle holding).** The anchor's Windows hold channel and explicit
 > successor inheritance are built. A hold is acknowledged after duplication into the anchor, before the child publishes
@@ -12904,12 +12905,14 @@ fsx verdict), `xtask/src/conformance` (the WinFsp mount step, the MSVC builds, t
   with `TRUNCATE_EXISTING` kept the file's bytes (it arrives as `SetFileSize` with an allocation of zero, which WinFsp's
   contract says truncates, and the bridge ignored every allocation). Red on main's bridge in run 41989370753, green in
   run 42046112993, on x86_64 and arm64; with them winfstest's failures fell from 384 to 374 of 628, all listed.
-- **fsx's open wedge, and how a stopped run is judged.** The WinFsp port wedges at its operation 164 (seed 1), a
-  `TRUNCATE UP` after a `TRUNCATE DOWN`, on both architectures; the bridge receives nothing after the shrink, so the
-  wait is inside Windows below the single receiver (A-198), owed to the dispatcher's owners. Every fsx run now has a
-  wall bound (pjdfstest's per-file 300 s, about five times the slowest recorded run), and a run that stops short is
-  named by the operation it stopped at (`fsx-seed-1:164`) and judged against the transport's reviewed fsx list, as
-  winfstest's cases are; a pass with a listed stop fails until the line is struck.
+- **fsx's open wedge, and how a failed run is judged.** The WinFsp port wedges at an extension that follows a cached
+  write past a hole and a shrink below it (seed 1: operations 41 to 43 in run 42057887707, 162 to 164 earlier, 238 on
+  main's bridge; the point moves, so it is a race), on both architectures. Operations 1 to 42 took 295 ms, then no
+  request reached the bridge for 299.9 s, so the wait is inside Windows' write path below the single receiver (A-198);
+  owed to the dispatcher's owners. Every fsx run now has a wall bound (pjdfstest's per-file 300 s, about five times the
+  slowest recorded run) and is judged against the transport's reviewed fsx list, as winfstest's cases are: a run that
+  fails its own verification by the operation it fails at (`fsx-seed-1:N`, stable for a seed), one its bound ended as
+  `fsx-seed-1-unfinished:10000`; a pass with a listed failure fails until the line is struck.
 - **arm64 Linux.** `linux-arm64` runs fsx, fsstress and pjdfstest over the three Linux transports, judged against the
   x86_64 lane's lists: the first run found exactly the listed failures (diagnostics run 41975493604, 2026-11-05, Ubuntu
   24.04.5 aarch64: pjdfstest 8,798 cases a transport with 0 unexpected and 0 listed passing; fsx 10,000 operations and

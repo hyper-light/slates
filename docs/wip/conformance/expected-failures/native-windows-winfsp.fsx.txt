@@ -1,7 +1,9 @@
 # Reviewed expectation: the WinFsp fsx port over the slates WinFsp drive (`slates mount ID E:`), A-214.
-# An fsx run that stops short is named by the operation it stopped at: `fsx-seed-<seed>:<operation>`, the operation
-# after the last one its `-v` trace shows done, under the harness's bounds (10,000 operations, seed 1, 262,144 bytes).
+# An fsx run that fails its own verification is named by the operation it failed at (`fsx-seed-<seed>:<operation>`);
+# one its wall bound ended is named unfinished (`fsx-seed-<seed>-unfinished:<operations asked>`), since where a bound
+# falls is no stable fact. The harness's bounds: 10,000 operations, seed 1, 262,144 bytes, 300 s a run.
 # A run that passes while a line is listed fails the gate: strike the line with the fix. The list only shrinks.
-# First review: 2026-11-05, from diagnostics runs 41984660605, 41989365843 and 41993895943 (x86_64 and arm64).
+# First review: 2026-11-05, from diagnostics runs 41984660605, 41989365843, 41993895943 and 42053543593 (x86_64 and
+# arm64, every one wedged).
 
-fsx-seed-1:164  BUG (open, A-214): fsx wedges at its operation 164, a TRUNCATE UP from 158,132 to 246,956 bytes by the C runtime's _chsize after a TRUNCATE DOWN, on x86_64 and arm64; the bridge receives no request after the shrink, so the wait is inside Windows below the single WinFsp receiver (A-198). Record docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md, "Open: fsx over the drive wedges at its operation 164".
+fsx-seed-1-unfinished:10000  BUG (open, A-214): fsx wedges over the drive after a cached write past a hole, a shrink below it, and an extension by the C runtime's _chsize (operations 41 to 43, or 162 to 164, at seed 1; the point moves between runs: 238 on main's bridge, 164, then 43), on x86_64 and arm64. No request reaches the bridge between the shrink's SetFileSize and the bound's kill 300 s later, so the wait is inside Windows' write path, below the single WinFsp receiver (A-198). Record docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md, "Open: fsx wedges over the drive".
