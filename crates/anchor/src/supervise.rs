@@ -174,8 +174,9 @@ pub struct Supervisor {
   /// Windows handles acknowledged into the anchor and handed only to its own successors (A-198).
   #[cfg(windows)]
   windows_handles: Option<windows::Hold>,
-  /// The hold refusals last written to the segment (`layout::SUP_HOLD_REFUSALS`), so a step writes only a change.
-  published_refusals: u64,
+  /// The hold refusals and refused log lines last written to the segment (`layout::SUP_HOLD_REFUSALS`,
+  /// `SUP_LOG_REFUSALS`), so a step writes only a change.
+  published_refusals: (u64, u64),
 }
 
 /// The device channel's two ends, what has been received over it, and the refusals counted.
@@ -253,7 +254,7 @@ impl Supervisor {
       devices: None,
       #[cfg(windows)]
       windows_handles: None,
-      published_refusals: 0,
+      published_refusals: (0, 0),
     })
   }
 
@@ -366,15 +367,20 @@ impl Supervisor {
     self.handle_refusals()
   }
 
-  /// Writes [`Supervisor::hold_refusals`] to the segment when it moved since the last write. A segment whose
+  /// Writes [`Supervisor::hold_refusals`] and the log lines this process could not write
+  /// (`slates_machine::log::log_lines_refused`) to the segment when either moved since the last write. A segment whose
   /// supervision block cannot be reached is left as it is; the next step tries again.
-  fn publish_hold_refusals(&mut self) {
-    let refusals = self.hold_refusals();
+  fn publish_refusals(&mut self) {
+    let refusals = (
+      self.hold_refusals(),
+      slates_machine::log::log_lines_refused(),
+    );
     if refusals == self.published_refusals {
       return;
     }
     if let Ok(supervision) = self.segment.supervision() {
-      supervision.record_hold_refusals(refusals);
+      supervision.record_hold_refusals(refusals.0);
+      supervision.record_log_refusals(refusals.1);
       self.published_refusals = refusals;
     }
   }
@@ -640,7 +646,7 @@ impl Supervisor {
     self.drain_devices();
     #[cfg(windows)]
     self.drain_handles();
-    self.publish_hold_refusals();
+    self.publish_refusals();
     if let Some(retry_at_ns) = self.retry_at_ns {
       if now_ns < retry_at_ns {
         return Ok(Step::BackingOff { retry_at_ns });
@@ -969,7 +975,7 @@ impl DeviceHold {
   fn refuse(&mut self, refusal: &crate::held::HoldRefusal) {
     self.refused = self.refused.saturating_add(1);
     if self.logged.first_sighting(refusal) {
-      eprintln!("slates anchor: a hold message was refused: {refusal}");
+      slates_machine::log_line!("slates anchor: a hold message was refused: {refusal}");
     }
   }
 }

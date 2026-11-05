@@ -80,7 +80,9 @@ pub(crate) fn adopt(_mount_bound: usize) -> Handed {
   let inherited = match held::parse_env(&value) {
     Ok(inherited) => inherited,
     Err(refusal) => {
-      eprintln!("slates-server: the anchor's device handoff was refused: {refusal}");
+      slates_machine::log_line!(
+        "slates-server: the anchor's device handoff was refused: {refusal}"
+      );
       return handed;
     }
   };
@@ -88,7 +90,9 @@ pub(crate) fn adopt(_mount_bound: usize) -> Handed {
   taken.extend(inherited.devices.iter().map(|device| device.fd));
   let channel = adopted(inherited.channel);
   if CHANNEL.set(channel).is_err() {
-    eprintln!("slates-server: the anchor's hold channel was adopted twice; the second is closed");
+    slates_machine::log_line!(
+      "slates-server: the anchor's hold channel was adopted twice; the second is closed"
+    );
   }
   handed.devices = inherited
     .devices
@@ -104,7 +108,7 @@ pub(crate) fn adopt(_mount_bound: usize) -> Handed {
     Ok(connections) => {
       for connection in connections {
         if taken.contains(&connection.fd) {
-          eprintln!(
+          slates_machine::log_line!(
             "slates-server: held connection {:x} names a descriptor the device handoff owns; it is not adopted",
             connection.connection
           );
@@ -117,7 +121,9 @@ pub(crate) fn adopt(_mount_bound: usize) -> Handed {
       }
     }
     Err(refusal) => {
-      eprintln!("slates-server: the anchor's connection handoff was refused: {refusal}");
+      slates_machine::log_line!(
+        "slates-server: the anchor's connection handoff was refused: {refusal}"
+      );
     }
   }
   #[cfg(target_os = "linux")]
@@ -138,7 +144,7 @@ fn adopt_copies(handed: &mut Handed, mut taken: Vec<RawFd>) {
     Ok(copies) => {
       for copy in copies {
         if taken.contains(&copy.fd) {
-          eprintln!(
+          slates_machine::log_line!(
             "slates-server: held copy {:x} names a descriptor another handoff owns; it is not adopted",
             copy.copy
           );
@@ -152,7 +158,7 @@ fn adopt_copies(handed: &mut Handed, mut taken: Vec<RawFd>) {
       }
     }
     Err(refusal) => {
-      eprintln!("slates-server: the anchor's copy handoff was refused: {refusal}");
+      slates_machine::log_line!("slates-server: the anchor's copy handoff was refused: {refusal}");
     }
   }
 }
@@ -162,7 +168,9 @@ fn adopt_copies(handed: &mut Handed, mut taken: Vec<RawFd>) {
 fn adopted(raw: RawFd) -> OwnedFd {
   let owned = crate::fleet::inherited_descriptor(raw);
   if let Err(errno) = rustix::io::fcntl_setfd(&owned, rustix::io::FdFlags::CLOEXEC) {
-    eprintln!("slates-server: an inherited descriptor could not be made close-on-exec: {errno}");
+    slates_machine::log_line!(
+      "slates-server: an inherited descriptor could not be made close-on-exec: {errno}"
+    );
   }
   owned
 }

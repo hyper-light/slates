@@ -84,3 +84,5 @@ disallowed-methods = [
   { path = "std::env::temp_dir", reason = "R1: no /tmp, ever; tests use RAM-backed directories they name." },
   { path = "std::thread::sleep", reason = "D-9: no blocking sleeps in shipped code; time goes through the timing wheel. Tests and the machine probes may allow it in place with a reason." },
 ]
+# Tests print freely: their output is libtest's, captured, and a test that panics is a failed test (A-213).
+allow-print-in-tests = true

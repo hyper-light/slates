@@ -238,7 +238,9 @@ pub(crate) fn publish_authorization(state: &mut ShardState) -> Result<(), Anchor
   if let Err(error) = &outcome {
     state.consensus_failure = Some(error.clone());
     state.consensus_ready = false;
-    eprintln!("slates-server: consensus retention refused; control shard stopped: {error}");
+    slates_machine::log_line!(
+      "slates-server: consensus retention refused; control shard stopped: {error}"
+    );
   }
   outcome
 }

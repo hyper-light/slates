@@ -74,10 +74,14 @@ pub fn explore(name: &str, model: impl Fn() + Send + Sync + 'static) -> u64 {
   }));
   let count = explored.load(Ordering::Relaxed);
   if let Err(failure) = outcome {
-    eprintln!("loom: {name}: failed at interleaving {count} (preemption bound {PREEMPTION_BOUND})");
+    slates_machine::log_line!(
+      "loom: {name}: failed at interleaving {count} (preemption bound {PREEMPTION_BOUND})"
+    );
     std::panic::resume_unwind(failure);
   }
-  eprintln!("loom: {name}: explored {count} interleavings (preemption bound {PREEMPTION_BOUND})");
+  slates_machine::log_line!(
+    "loom: {name}: explored {count} interleavings (preemption bound {PREEMPTION_BOUND})"
+  );
   assert!(count > 0, "loom: {name}: explored no interleaving");
   count
 }

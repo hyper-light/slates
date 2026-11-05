@@ -70,10 +70,12 @@ pub(crate) fn answered(s: &mut ShardState, call: &RecordedCall) -> Option<Vec<u8
       let seen = s.refusals.entry(REPLAY_DIVERGED).or_insert(0);
       *seen = seen.saturating_add(1);
       if *seen == 1 {
-        eprintln!(
+        slates_machine::log_line!(
           "slates-server: partition {}: a retried compound's call met its record under another digest (procedure {}, \
            occurrence {}); served again (first on this shard; later ones are counted as {REPLAY_DIVERGED})",
-          s.partition, call.key.procedure, call.key.occurrence
+          s.partition,
+          call.key.procedure,
+          call.key.occurrence
         );
       }
     }
