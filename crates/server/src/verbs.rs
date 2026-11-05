@@ -5069,6 +5069,19 @@ fn create_green(
   let Some(id) = fresh_volume_id(state) else {
     return refused(ids_exhausted());
   };
+  // A base-seeded green holds its base snapshot for as long as it lives (A-217): pinned in the base volume first, so
+  // nothing the green names can be freed under it, and given back if a later step refuses.
+  let held = match (base, &origin) {
+    (Some(base), Some(origin)) => match hold_origin_snapshot(state, base) {
+      Ok(()) => Some(slates_db::partition::OriginRef {
+        volume: to_db_volume(base.volume),
+        snapshot: to_db_snapshot(base.snapshot),
+        identity: crate::merge_service::origin_identity(origin),
+      }),
+      Err(refusal) => return refused(refusal),
+    },
+    _ => None,
+  };
   let record = VolumeRecord {
     id,
     name: name.to_owned(),
@@ -5100,23 +5113,25 @@ fn create_green(
     .db
     .mutate(&mut state.segment, &Op::VolumeCreated { record }, now)
   {
+    release_origin_snapshot(state, held.as_ref());
     return refused(refusal_of_db(&e));
   }
-  // A base-seeded green records its origin durably — guarded (the chain budget) before the engine
-  // is seeded, so a refused origin leaves no engine ahead of its log — and replays it before the
-  // chain on recovery (`rebuild_green`).
-  let engine = match origin {
-    None => slates_merge::engine::Green::new(),
-    Some(origin) => {
-      let record = Op::GreenOriginated {
+  // A base-seeded green records its origin as the reference it holds (A-217: the snapshot and the origin's
+  // identity, never the tree's bytes), before the engine is seeded, so a refused record leaves no engine ahead of its
+  // log; recovery walks the held snapshot again before the chain (`rebuild_green`).
+  let engine = match (origin, held) {
+    (Some(origin), Some(held)) => {
+      let record = Op::GreenOriginHeld {
         green: id,
-        origin: origin.encode(),
+        origin: held,
       };
       if let Err(e) = state.db.mutate(&mut state.segment, &record, now) {
+        release_origin_snapshot(state, Some(&held));
         return refused(refusal_of_db(&e));
       }
       slates_merge::engine::Green::with_origin(&origin)
     }
+    _ => slates_merge::engine::Green::new(),
   };
   let mut engine = engine;
   engine.set_rejected_budget(crate::merge_service::rejected_cache_budget(state));
@@ -5125,6 +5140,46 @@ fn create_green(
   crate::merge_service::enqueue_record(state, id, 0, [0u8; 32], 0, Vec::new());
   ReplyBody::GreenCreated {
     id: to_wire_volume(id),
+  }
+}
+
+/// Pins `base`'s snapshot in its volume for a green that names it (A-217), as a clone pins its origin: its destroy is
+/// then refused until the green is gone.
+fn hold_origin_snapshot(
+  state: &mut ShardState,
+  base: slates_ipc::protocol::GreenBase,
+) -> Result<(), Refusal> {
+  let (handle, _) = find(state, base.volume).map_err(|reply| match *reply {
+    ReplyBody::Refused { refusal } => refusal,
+    _ => Refusal::NotFound,
+  })?;
+  let slot = state
+    .volumes
+    .get_mut(handle)
+    .map_err(|_| Refusal::NotFound)?;
+  slot
+    .volume
+    .pin(core_snapshot(base.snapshot))
+    .map_err(|e| refusal_of_vfs(&e))
+}
+
+/// Gives back the pin a green held on its origin's snapshot (A-217): at the green's destroy, or when its creation was
+/// refused after the pin.
+pub(crate) fn release_origin_snapshot(
+  state: &mut ShardState,
+  held: Option<&slates_db::partition::OriginRef>,
+) {
+  let Some(held) = held else {
+    return;
+  };
+  if let Some(handle) = state.by_id.get(&held.volume).copied() {
+    unpin_origin(
+      state,
+      handle,
+      SnapshotId {
+        value: held.snapshot.value,
+      },
+    );
   }
 }
 
@@ -7448,6 +7503,16 @@ fn destroy(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> R
   if !rights_of(&record, principal).admin {
     return forbidden("destroy");
   }
+  // A volume whose snapshot a green names as its origin is held with it (A-217): the green's recovery walks that
+  // snapshot, so the volume is refused as the pinned snapshot's own destroy is, until the green is gone.
+  if state
+    .db
+    .partition()
+    .green_origin_refs()
+    .any(|(_, held)| held.volume == record.id)
+  {
+    return refused(refusal_of_vfs(&slates_vfs::VfsError::Pinned));
+  }
   let now = state.clock.monotonic_ns();
   let ops = [
     Op::VolumeStateChanged {
@@ -9157,21 +9222,24 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
     rebuilt.records = crate::content_holder::restore_held_registers(state, local, held);
   }
   let mut max_prefix = state.next_prefix;
-  // Greens first, so a work can seed from a rebuilt green (§4.16): a green's merge chain is replayed
-  // into a fresh engine, restoring its content and versions.
-  for record in &records {
-    if matches!(record.policy.role, Role::Green { .. }) {
-      rebuild_green(state, record);
-      rebuilt.merge_volumes = rebuilt.merge_volumes.saturating_add(1);
-    }
-  }
-  // Origins before their clones (A-64): a clone is rebuilt over its recovered origin's snapshot.
+  // Plain volumes first, origins before their clones (A-64: a clone is rebuilt over its recovered origin's snapshot);
+  // then greens, whose held origin is walked from a plain volume's snapshot (A-217); then works, each replayed over its
+  // rebuilt green (§4.16, A-207). Every record is then reconciled the same way.
   let mut records = records;
-  records.sort_by_key(|record| lineage_depth(state, record.id));
+  records.sort_by_key(|record| {
+    let pass = match record.policy.role {
+      Role::Plain => 0u8,
+      Role::Green { .. } => 1,
+      Role::Work { .. } => 2,
+    };
+    (pass, lineage_depth(state, record.id))
+  });
   for record in &records {
     match record.policy.role {
-      // Rebuilt in the pass above; here only its content-less attachments are reconciled out.
-      Role::Green { .. } => {}
+      Role::Green { .. } => {
+        rebuild_green(state, record);
+        rebuilt.merge_volumes = rebuilt.merge_volumes.saturating_add(1);
+      }
       Role::Work { green, .. } => {
         rebuild_work(state, record, green);
         rebuilt.merge_volumes = rebuilt.merge_volumes.saturating_add(1);
@@ -9336,8 +9404,9 @@ pub(crate) fn retire_local_tombstones(state: &mut ShardState) {
 /// ahead would refuse the snapshot's destroy forever; one left behind would free a clone's shared
 /// tree. An image volume pins the snapshot it was built from as a clone does (A-160), and is counted with the clones.
 /// Returns how many pins were changed.
-fn reconcile_clone_pins(state: &mut ShardState) -> usize {
-  // The catalog's live clones and image volumes per (origin volume, origin snapshot).
+/// The pins the catalog records per (origin volume, origin snapshot): its live clones, its image volumes (A-160) and
+/// its greens' held origins (A-217). What recovery brings each rebuilt snapshot's pins up to.
+fn recorded_pins(state: &ShardState) -> std::collections::BTreeMap<([u8; 16], u64), u32> {
   let mut recorded: std::collections::BTreeMap<([u8; 16], u64), u32> =
     std::collections::BTreeMap::new();
   for record in state.db.partition().volumes() {
@@ -9358,7 +9427,19 @@ fn reconcile_clone_pins(state: &mut ShardState) -> usize {
       let count = recorded.entry((volume.bytes, snapshot.value)).or_insert(0);
       *count = count.saturating_add(1);
     }
+    // So does a green its origin's snapshot (A-217).
+    if let Some(held) = state.db.partition().green_origin_ref(record.id) {
+      let count = recorded
+        .entry((held.volume.bytes, held.snapshot.value))
+        .or_insert(0);
+      *count = count.saturating_add(1);
+    }
   }
+  recorded
+}
+
+fn reconcile_clone_pins(state: &mut ShardState) -> usize {
+  let recorded = recorded_pins(state);
   let rebuilt: Vec<(DbVolumeId, Handle<VolumeSlot>)> =
     state.by_id.iter().map(|(id, h)| (*id, *h)).collect();
   let mut changed: usize = 0;
@@ -9421,11 +9502,19 @@ fn replay_green(
   id: DbVolumeId,
 ) -> Result<slates_merge::engine::Green, crate::merge_service::GreenFence> {
   use crate::merge_service::GreenFence;
-  let mut green = match state.db.partition().green_origin(id) {
-    None => slates_merge::engine::Green::new(),
-    Some(bytes) => slates_merge::origin::Origin::decode(bytes)
+  let partition = state.db.partition();
+  let mut green = match (partition.green_origin_ref(id), partition.green_origin(id)) {
+    // A held origin (A-217) is walked again from its base snapshot, rebuilt before any green, and must give the
+    // origin the green was created from.
+    (Some(held), _) => match crate::merge_service::walk_held_origin(state, held) {
+      Ok(origin) => slates_merge::engine::Green::with_origin(&origin),
+      Err(Refusal::ContentUnavailable) => return Err(GreenFence::OriginCorrupt),
+      Err(_) => return Err(GreenFence::OriginUnavailable),
+    },
+    (None, Some(bytes)) => slates_merge::origin::Origin::decode(bytes)
       .map(|origin| slates_merge::engine::Green::with_origin(&origin))
       .map_err(|_| GreenFence::OriginCorrupt)?,
+    (None, None) => slates_merge::engine::Green::new(),
   };
   for (index, bytes) in state.db.partition().green_chain(id).iter().enumerate() {
     let version = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
