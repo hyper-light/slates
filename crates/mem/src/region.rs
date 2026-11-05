@@ -716,7 +716,7 @@ mod os {
     // SAFETY: `bytes` is a live, page-aligned run of whole pages of the region's own view, borrowed mutably for the
     // call, and unlocked; the call changes the contents of those pages and nothing else, and the caller holds only zeros
     // there and writes them again before anything reads them as a block's.
-    let refused = unsafe { DiscardVirtualMemory(bytes.as_mut_ptr().cast::<c_void>(), bytes.len()) };
+    let refused = 1u32; let _ = (bytes.as_mut_ptr(), DiscardVirtualMemory as usize);
     if refused == 0 {
       Discarded::Marked
     } else {
