@@ -147,3 +147,31 @@ The same run passes all 54 bridge tests, one separately enabled real-driver capt
 settlement, 0.15 s on x86_64 and 0.19 s on arm64), all 32 active anchor tests, native clippy and private Windows
 documentation. The CLI histories take 41.51 s on x86_64 and 21.76 s on arm64. Mac formatting, workspace clippy,
 structural/literal/unsafe checks and private workspace documentation pass in 92.15 s on the same code.
+
+## A-215: what one transact does, for a response that rides a receive (2026-11-05)
+
+Read in WinFsp v2.1 (tag `v2.1`, commit `ddca7bd`, cloned from `github.com/winfsp/winfsp`), the version CI pins. Each
+line below is the source's own, graded B (deployed code read at its source).
+
+| Question | Answer and citation |
+|---|---|
+| In one transact, are responses finished before requests are delivered? | Yes. `FspVolumeFastTransact` runs the response loop (`src/sys/volume.c:1079–1114`), then retried IRPs (1116–1139), then the wait (1167–1186), then delivery (1188–1271). |
+| How is the receive buffer transferred? | `FSP_FSCTL_TRANSACT_BATCH` is `METHOD_OUT_DIRECT` (`inc/winfsp/fsctl.h:104`). The driver writes through `MmGetMdlVirtualAddress`, the caller's own locked address (`volume.c:1147–1149`). The input is the I/O manager's buffered copy (`volume.c:1024`). |
+| Is a request written before it is processing? | Yes: `RtlCopyMemory` (1224), then `FspIoqStartProcessingIrp` (1228). |
+| What does the single-request code transfer? | `FSP_FSCTL_TRANSACT` is `METHOD_BUFFERED` (`fsctl.h:100`), which the DLL's dispatcher uses (`src/dll/fs.c:288`). Its output reaches user memory only when the call completes, so a process killed after delivery would lose requests the driver had put in processing. No crash-safe receive can use it. |
+| What does a dying caller's wait do? | The wait is `FspQeventCancellableWait`, an alertable kernel wait. It returns `STATUS_THREAD_IS_TERMINATING` when the thread is terminating (`src/sys/driver.h:941–966`). That maps to `FspIoqCancelled` (`src/sys/ioq.c:617`), and the call returns having delivered nothing (`volume.c:1181–1185`). |
+| How is a response matched to its IRP? | By address alone, in the processing queue's table (`FspIoqEndProcessingIrp`, `ioq.c:673–680`; the peek, 349–383). The hint check at `volume.c:1099` is a debug-build assertion. Completion is chosen by the IRP's major function, not the response's kind (`src/sys/iop.c:414–427`). An address not in processing is dropped as BOGUS (`volume.c:1093`). |
+| What happens to processing IRPs when the transacting process dies? | Nothing. `FSP_IOQ_PROCESS_NO_CANCEL` (`driver.h:970`) gives them no cancel routine and keeps them out of expiry (`ioq.c:574`). Only `FspIoqStop` (`ioq.c:535–552`) ends them, at the cleanup of the volume's control file, which the anchor's duplicate handle keeps open (A-198). |
+| Can a response's completion put the same IRP back to be delivered? | Yes. A Create completion can post an Overwrite request on the same IRP (`src/sys/create.c:1211`, retried through `FspIopRetryPrepareIrp`, 825). It arrives as a new request carrying its own hint and is answered as one. |
+
+The candidate (the supervisor's, 2026-11-05) holds with one change. The batch being answered and the batch being received
+cannot share a buffer: recovery needs the answered batch whole when the call delivered nothing. So the journal has two
+receive buffers (A-215). The model oracle in `crates/bridge-winfsp/src/inflight/capture.rs` kills the owner at every
+step, twice over, of a ten-IRP history whose freed addresses go to the next IRP. On 2026-11-05 on macOS
+(`cargo +1.98.1 test -p slates-bridge-winfsp --lib every_irp -- --nocapture`), 7,483 scenarios gave 0 lost, 0 wrong,
+0 completed twice and 0 wrong contexts. 1,227 kills fell in a delivered hand-off and 2,367 in an undelivered one, and
+6,392 deliveries reused an address freed in the same call. Red-checks, each run once:
+- answering a delivered hand-off's old batch again (A-198's hazard): 300 wrong and 1,266 lost;
+- leaving an undelivered hand-off's batch unsettled: 1,128 lost;
+- keeping the saved response when the delivered batch is taken: recovery refuses (`Refusal::Hint`).
+

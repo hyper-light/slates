@@ -2267,14 +2267,10 @@ fn run_mount(
       .memory()
       .read(at, &mut captured)
       .map_err(|error| WinFspError::Ledger(crate::opens::Refusal::Memory(error)))?;
+    // The open the kernel has or will be sent: a batch in hand's saved response, or a hand-off's (A-215).
     let saved_open = crate::inflight::capture::Capture::new(&mut captured)
-      .map_err(WinFspError::Capture)?
-      .resume()
-      .map_err(WinFspError::Capture)?
-      .map(|batch| batch.saved_open())
-      .transpose()
-      .map_err(WinFspError::Capture)?
-      .flatten();
+      .and_then(crate::inflight::capture::Capture::retained_open)
+      .map_err(WinFspError::Capture)?;
     ledger
       .settle_pending(saved_open)
       .map_err(WinFspError::Ledger)?;

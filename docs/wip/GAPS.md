@@ -1,5 +1,11 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **The WinFsp receiver's response rides its next receive (2026-11-05, A-215; audit step 7).** A batch's last response
+> is sent by the call that receives the next batch, into the journal's second buffer. A request found there after a
+> death proves the driver consumed that response (WinFsp v2.1 source, `docs/wip/research/winfsp-takeover.md`). Model
+> oracle: 7,483 crash scenarios, 0 lost, 0 wrong; red without each recovery rule. **Owed:** the live kill oracle on
+> both Windows lanes and the interleaved A/B against the DLL dispatcher, both on diagnostics branches.
+
 > **WinFsp's hold release, DLL version and long paths fixed (2026-11-04, A-206; audit steps 4 and 6).** Run
 > [41978665514](https://github.com/hyper-light/slates/actions/runs/41978665514), `windows-latest` and `windows-11-arm`,
 > with WinFsp 2.1.25156 installed from its pinned URL and SHA-256. Each lane: the whole live suite 13 passed, 1 ignored.
