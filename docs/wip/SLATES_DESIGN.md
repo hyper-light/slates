@@ -6148,7 +6148,7 @@ the format floor.
 > `node:24-alpine`), refuses to publish if any platform package lacks its binary, and publishes
 > through npm trusted publishing from the `npm` environment — after the one-time 0.0.0 stub publish
 > of each name that npm requires before a trusted publisher can be attached (npm/cli#8544;
-> `cargo xtask npm-reserve` derives the ten stubs from the same manifests). CI's `sdk` job
+> `cargo xtask npm-reserve` derives one stub per name from the same manifests: eight names since A-210, ten before). CI's `sdk` job
 > installs the wheel into a fresh venv after `twine check --strict`, packs and installs the two npm
 > tarballs into a fresh project, and runs both SDK suites and the packaged smoke test over a live
 > daemon on Linux and macOS. **Proven by use on this host** (macOS 26.4.1, Apple M5 Max,
@@ -6158,8 +6158,7 @@ the format floor.
 > through the optional-dependency loader, dry-run publishes clean; the ten stubs packed and dry-run
 > clean. **Owed:** the stub publish and the two trusted-publisher registrations (a maintainer's
 > login), then the first tag; this section's `abi3-py312` and `cp314t` wheels (PyO3 0.22 has no
-> free-threaded build; the wheel is cp39-abi3 today); Windows arm64 and ia32 wheels (the napi lane
-> ships those platforms; maturin's Windows cross builds are not exercised); and the SDK surface
+> free-threaded build; the wheel is cp39-abi3 today); and the SDK surface
 > this section names beyond packaging (async iterators, `AbortSignal`, `memoryview` reads, the
 > typed exception hierarchy).
 
@@ -8851,7 +8850,8 @@ Evidence: `research/survey-vorpal.md` §0–§9.
 > `slates-provenance.json` and a Sigstore attestation bundle to a **draft** release. Publishing the draft is the
 > maintainer's one approved step (`docs/publish.md`, "The binary release"). The proof by use on a test tag is recorded
 > in A-210: test tag `v0.1.0-test.1`, run 41983664060, a draft with all seven binaries whose checksums and attestation
-> verify. Reproducibility from the tag (AC-9.5's first clause) is not yet shown: no lane builds twice and compares.
+> verify. Since 2026-11-05 every target is built twice on separate runners, and the release is refused unless the two
+> copies are the same bytes (AC-9.5; A-210 records the measurements).
 
 | target | runner | asset name |
 |---|---|---|
@@ -8897,8 +8897,9 @@ Recipes to copy verbatim:
 
 ### B.3 Packaging for the SDKs (shape copied from vorpal; SDK details in §4.12)
 
-- npm: a scoped CLI package with `optionalDependencies` on eight platform packages named in
-  napi-rs convention (`darwin-arm64`, `linux-x64-gnu`, `linux-arm64-musl`, `win32-ia32-msvc`, ...),
+- npm: a scoped package with `optionalDependencies` on seven platform packages, one per shipped target
+  (`xtask/src/targets.rs`, A-210), named in napi-rs convention (`darwin-arm64`, `linux-x64-gnu`,
+  `linux-arm64-musl`, `win32-arm64-msvc`, ...),
   each declaring `os`, `cpu`, and Linux `libc`; a postinstall that resolves the package with
   `detect-libc` and hard-links the binary into place; trusted publishing (OIDC) after a one-time
   bootstrap publish. [C: vorpal npm/package.json, npm/postinstall.js:6-27, release.yml:234-281]
@@ -13446,7 +13447,41 @@ Applied in the same change to: Appendix B.2 (body and status), Phase 9 task 5's 
   - The smoke test's own first version stopped reading the anchor's stderr after the serving line, and 8 of 10 runs
     on this Mac aborted the anchor (the GAPS entry: an anchor whose stderr closes aborts). Fixed in the harness: 10 of
     10 after.
-- **Not yet.** Reproducibility from the tag (AC-9.5): no lane builds twice and compares. The macOS `Slates.app` bundle
+- **The SDK lanes ship the same targets (2026-11-05).** Before this change, `napi.targets` and `crates/sdk-node/npm/`
+  named nine platforms, two of them no longer shipped (`x86_64-apple-darwin`, `i686-pc-windows-msvc`), while
+  `publish-node.yml` built seven. Its tag-only check that every platform package holds its binary would have
+  refused the first publish. The PyPI lane built no Windows arm64 wheel, and its header named a macOS x86_64 wheel
+  it never built.
+  - The shipped targets are now one table (`xtask/src/targets.rs`). The binary release's assets come from it, and
+    `cargo xtask version` refuses a `napi.targets` that names a target outside it (`UnknownTarget`) or leaves a
+    shipped one out (`ShippedTargetMissing`). Test: `napi_targets_name_exactly_the_shipped_targets`.
+  - Both SDK lanes build Windows natively: x86_64 on windows-2025 with NASM, arm64 on windows-11-arm with clang-cl
+    for AWS-LC, as the binary release does.
+  - The binary check (npm) and `twine check --strict` (PyPI) moved out of the tag-only publish jobs, so a
+    `workflow_dispatch` dry run proves them and publishes nothing.
+  - Dry runs on `agents/release` (2026-11-05), each with its publish job skipped:
+    - PyPI run 42048582138 built seven cp39-abi3 wheels (manylinux and musllinux x86_64 and aarch64, macOS arm64,
+      Windows x64 and arm64) and the sdist, and `twine check --strict` passed over all eight artifacts.
+    - npm run 42055543098 built all seven addons (699 KB on arm64 Windows to 3.98 MB on x86_64 musl). It answered "7
+      platform packages hold their binary", and `npm pack --dry-run` packed eight packages.
+    - It took two fixes first. The arm64 musl build in node:24-alpine failed, "linker `aarch64-linux-musl-gcc` not
+      found" (42048576607), because napi names a cross linker for a native build; B.2's `LINKER=cc` override now
+      sets it. And an apostrophe in a comment inside the single-quoted container script ended it (42054307287).
+- **Reproducible from the tag (AC-9.5, 2026-11-05).** The lane builds every target twice, each copy on a runner of its
+  own (`copy: build` and `copy: rebuild`). The artifacts task refuses a release whose two copies differ, naming the
+  count of differing bytes and their first offsets (`a_target_whose_rebuild_differs_is_not_reproducible`). Measured:
+  - Run 42046848954 built each Linux and Windows target twice exactly as the lane did. All four Linux binaries, glibc
+    and musl, were byte for byte the same. Both Windows binaries differed in 20 bytes, every one a field MSVC's linker
+    takes from the clock: the PE header's timestamp, the three debug-directory timestamps and the 16-byte PDB GUID.
+  - With `-C link-arg=/Brepro` (run 42049001999) all six pairs are the same. The four Linux digests also equal the
+    previous run's, so one source gave one binary on four separate runners (for example `slates-linux-arm64`
+    `f8fb335c…61eb7f`, `slates-windows-x64.exe` `3a48be20…44740d`).
+  - Test tag `v0.1.0-test.2` (commit a41c5e71, run 42054339412, 2026-11-05) built and smoke-tested both copies of all
+    seven targets, macOS included, 14 jobs. The release job accepted every pair, and the draft's provenance records
+    each rebuild's digest equal to its build's, for example `slates-macos-arm64` `25e3bab5…` and
+    `slates-windows-x64.exe` `9f1d6832…`. The macOS pair matched across two runner images (20261026.0455.2 and
+    20261102.0473.1); the other pairs ran on one image each.
+- **Not yet.** Code signing and notarization (B.7; they need Ada's Apple Developer identity). The macOS `Slates.app` bundle
   (B.7), code signing and notarization (they need Ada's Apple Developer identity). `cargo-binstall` metadata.
 
 ### A-206 — A WinFsp file system is deleted only after the anchor releases its hold, the DLL's version is checked, and slates refuses no path the driver passes (accepted 2026-11-04, audit plan 01a1a34bf7e973069e94f773afdea44a, steps 4 and 6)

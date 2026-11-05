@@ -101,14 +101,17 @@
 > `crates/client/tests/merge_identity.rs`. Record: `docs/bugs/2026-11-04-the-same-edit-from-two-works-was-one-increment.md`.
 > Found by the edit-and-merge latency harness's oracle (`crates/client/examples/edit_merge_bench.rs`).
 >
-> **Merge: a full edit and merge is 51–69 µs at the median whatever the green holds (A-202, 2026-11-04, agents/perf).**
+> **Merge: a full edit and merge is 12–21 µs at the median on quiet Linux CI and 51–69 µs on the shared Mac, whatever the
+> green holds (A-202, 2026-11-04, agents/perf).**
 > A submit's cost had followed the green's size: 14 ms at 1,000 files of 4 KiB. The merge record's identities are now
 > made only for a record that goes to holders, the deriver composes over the base restricted to the journal's paths,
 > and a work holds only the files it changed since its base. Loaded Mac (load 5–11, informational): p50 51–69 µs and
 > p99 0.15–0.36 ms at 10, 1,000 and 10,000 files, every form, but for one run's 1.81 ms (conflict, 10,000 files; BENCHMARKS, "A full edit and merge"). Racing clients'
 > verdicts are judged against the rule (`crates/client/tests/merge_chaos.rs`). 100,000 files: accept p50 60 µs, p99
 > 199 µs on the Mac; CI's 3-core macOS runner (quiet): p50 67–150 µs at 10 to 10,000 files, its partition budget refuses a
-> 400 MB green (chain checkpointing owed). **Open:** the Linux CI numbers; the preferred 50 µs (the fixed cost of the two round trips); the two-machine path (fs-server); the rebase
+> 400 MB green (chain checkpointing owed). Quiet Linux CI (load 1.1–1.6): p50 12–21 µs, p99 43–98 µs at
+> 10 to 100,000 files on x86_64 and aarch64, against main's 4.0–66 ms (BENCHMARKS). **Open:** p99/p999 tails up to 1.1 ms
+> and one 570 ms max on CI; the preferred 50 µs on the shared Mac (the fixed cost of the two round trips); the two-machine path (fs-server); the rebase
 > restates whole. Since A-202 (2026-11-05) the head identity a holder recomputes is a set hash brought up to date when
 > read, so a record at `f > 0` costs what its version changed; its format changed (golden vector in
 > `crates/merge/tests/origin.rs`), so records written before it would not match a newer holder. A daemon `SIGKILL`ed six times mid-merge
@@ -284,6 +287,12 @@
 >   seven binaries, `SHA256SUMS`, the provenance and the attestation bundle. After download, all seven checksums
 >   verified, `gh attestation verify` passed (SLSA v1, seven subjects, `release.yml` at the tag) and refused a
 >   tampered copy, and no SDK lane started. Every number is in A-210.
+> - **The SDK lanes ship the same seven targets (2026-11-05, A-210).** `napi.targets` and the npm platform packages
+>   named `x86_64-apple-darwin` and `i686-pc-windows-msvc`, which are not shipped. `publish-node.yml` built only
+>   seven addons, so its tag-only completeness check would have refused the first publish. The PyPI lane built no
+>   Windows arm64 wheel. Both lanes are now held to `xtask/src/targets.rs` and build Windows natively, and their
+>   checks run on the dry run. Dry runs on 2026-11-05 published nothing: seven wheels and the sdist passed `twine
+>   check` (run 42048582138), and seven addons each landed in their package (run 42055543098).
 > - **Owed to Ada:** a release is published only when a maintainer pushes a real tag `v<version>` and publishes its
 >   draft (`docs/publish.md`). The test draft is never to be published.
 > - **Open, found by the smoke test: the anchor aborts when its stderr closes.** `slates anchor 2>&1 >/dev/null | head
@@ -291,8 +300,13 @@
 >   which `eprintln!` turns into a panic, and `panic = "abort"` makes that an abort. The smoke test's own first
 >   version stopped reading the anchor's stderr after the serving line, and 8 of 10 runs aborted. Owed, in
 >   `crates/cli`: a failing test, then diagnostics that survive a closed stderr.
-> - **Not yet:** reproducibility from the tag (AC-9.5: nothing builds twice and compares); the macOS `Slates.app`
->   bundle, code signing and notarization (B.7; they need an Apple Developer identity); `cargo-binstall` metadata.
+> - **Reproducible from the tag (2026-11-05, AC-9.5).** Every target is built twice on separate runners, and the
+>   release is refused unless the two copies are the same bytes. The four Linux binaries already were. The Windows
+>   ones differed in 20 bytes, the linker's timestamps and PDB GUID (run 42046848954), until `/Brepro`; with it, all six
+>   pairs match (run 42049001999). On the test tag `v0.1.0-test.2` (run 42054339412), all seven pairs matched, macOS
+>   included, and the draft carries both digests of each. The numbers are in A-210.
+> - **Not yet:** the macOS `Slates.app` bundle, code signing and notarization (B.7; they need an Apple Developer
+>   identity); `cargo-binstall` metadata.
 
 > **WinFsp's hold release, DLL version and long paths fixed (2026-11-04, A-206; audit steps 4 and 6).** Run
 > [41978665514](https://github.com/hyper-light/slates/actions/runs/41978665514), `windows-latest` and `windows-11-arm`,
