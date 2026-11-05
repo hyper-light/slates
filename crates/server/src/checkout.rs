@@ -1,4 +1,4 @@
-//! A green's head checked out into the volume it was created from (§4.16, A-199): the step between a merge and a
+//! A green's head checked out into the volume it was created from (§4.16, A-201): the step between a merge and a
 //! landing. A green's versions live in its merge engine, which no landing reads, and a green is refused `land`; so the
 //! head's difference from the green's origin is written into the green's base volume, and that volume — the server's
 //! overlay of the directory it lands into — lands under a grant like any other (§4.15). The landing's verdict is then
@@ -480,7 +480,7 @@ mod tests {
     }
   }
 
-  /// A-199: removals come deepest first, then directories and files parents first, then modes; an unchanged file is
+  /// A-201: removals come deepest first, then directories and files parents first, then modes; an unchanged file is
   /// not written, a mode-only change is counted as one.
   #[test]
   fn the_plan_removes_deepest_first_then_makes_parents_first_then_sets_modes() {
@@ -528,7 +528,7 @@ mod tests {
     );
   }
 
-  /// A-199: a file that became a directory is removed, then made again as a directory.
+  /// A-201: a file that became a directory is removed, then made again as a directory.
   #[test]
   fn a_file_that_became_a_directory_is_removed_then_made() {
     let origin = head(&[("p", "file")], &[], &[]);
@@ -544,7 +544,7 @@ mod tests {
     );
   }
 
-  /// A-199: a difference in a dimension a checkout does not write is refused, naming the path; an equal one is not.
+  /// A-201: a difference in a dimension a checkout does not write is refused, naming the path; an equal one is not.
   #[test]
   fn a_symlink_difference_is_refused_by_path() {
     let mut origin = head(&[], &[], &[]);

@@ -918,7 +918,7 @@ fn emit_image_build(
 }
 
 /// `image merge`: the clone's id and what the merge did, as text lines or JSON `{ "id", "report": {...} }`.
-/// `checkout GREEN VOLUME ATTACHMENT --snapshot N` (§4.16 A-199): the version written and what changed, by kind.
+/// `checkout GREEN VOLUME ATTACHMENT --snapshot N` (§4.16 A-201): the version written and what changed, by kind.
 fn emit_checkout(
   client: &mut Client,
   green: VolumeId,

@@ -1,6 +1,6 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
-> **A green's head reaches the disk (fs-server, 2026-11-04, A-199).** `slates checkout GREEN VOLUME ATTACHMENT --snapshot
+> **A green's head reaches the disk (fs-server, 2026-11-04, A-201).** `slates checkout GREEN VOLUME ATTACHMENT --snapshot
 > N` writes a green's head into the volume it was created from, and that volume lands under a grant. Proven by
 > `crates/server/tests/checkout.rs` (3 of 3, red 3 of 3 with the base check and the writes removed) and, across a
 > Docker container on adacachy, by the fs-server lab up to the grant: a client on the host read the server's green,

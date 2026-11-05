@@ -93,7 +93,7 @@ pub(crate) fn sliced<T>(
 }
 
 /// The image builds and merges running on this shard (§4.6, A-160), and the green checkouts, which defer the same way
-/// (§4.16 A-199, `crate::checkout`).
+/// (§4.16 A-201, `crate::checkout`).
 #[derive(Default)]
 pub(crate) struct ImageState {
   /// The requests a build or merge runs for, by origin, client and sequence, with where its reply goes: the newest
