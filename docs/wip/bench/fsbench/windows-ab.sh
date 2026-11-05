@@ -9,7 +9,7 @@
 #   OLD_SLATES=old/slates.exe NEW_SLATES=new/slates.exe BENCH=new/mount_bench.exe \
 #     OLD_NAME=dll NEW_NAME=receiver RUNS=5 SPINNERS_PER_CPU=2 bash docs/wip/bench/fsbench/windows-ab.sh
 #
-# Each run ends with the line `## run N of M done`, and AFTER_RUN, if set, is a command run then (CI publishes the
+# Each run ends with the line `## run N of M done` (or `FAILED`), and AFTER_RUN, if set, is a command run then (CI publishes the
 # output so far with it). FILES and ROUNDS shrink the workload for a smoke run; recorded numbers use the program's
 # defaults. Each daemon's error output is printed after its run.
 set -euo pipefail
@@ -114,14 +114,18 @@ for run in $(seq 1 "$RUNS"); do
     start_old "$run"
     echo "# $NEW_NAME started first: $OLD_NAME=$OLD_DRIVE $NEW_NAME=$NEW_DRIVE"
   fi
+  # A run that fails is said to have failed and its logs printed, and the next run goes on: under load the anchor may
+  # kill a daemon that missed its heartbeat, and a failed run is a result to record, not a reason to lose the rest.
+  outcome=done
   "$BENCH" --arm "$OLD_NAME=$OLD_DRIVE/" --arm "$NEW_NAME=$NEW_DRIVE/" --spinners-per-cpu "$SPINNERS_PER_CPU" \
-    ${FILES:+--files "$FILES"} ${ROUNDS:+--rounds "$ROUNDS"}
+    ${FILES:+--files "$FILES"} ${ROUNDS:+--rounds "$ROUNDS"} || outcome=FAILED
+  # After the teardown, so a daemon's last words are in it.
+  teardown
   for side in "$OLD_INSTANCE" "$NEW_INSTANCE"; do
     echo "# $side's error output, $(wc -l < "$W/$side.err") lines:"
     cat "$W/$side.err"
   done
-  teardown
   rm -f "$W/$OLD_INSTANCE.err" "$W/$NEW_INSTANCE.err"
-  echo "## run $run of $RUNS done, $(date -u +%FT%TZ)"
+  echo "## run $run of $RUNS $outcome, $(date -u +%FT%TZ)"
   if [ -n "${AFTER_RUN:-}" ]; then "$AFTER_RUN"; fi
 done
