@@ -1,0 +1,57 @@
+name: diag-clients
+
+# Diagnostics only, never on main: the client's provisioning histogram and its edit and merge latency on every
+# platform the clients agent cannot reach from its own machine (macOS is measured natively there), each bench
+# interleaved with the other, three rounds.
+on:
+  push:
+    branches: ["diag-clients-*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: client benches (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Build the benches (release)
+        run: cargo build --release --locked -p slates-client --example provision_bench --example edit_merge_bench
+      - name: The runner
+        run: |
+          uname -a || true
+          date -u
+          if command -v nproc >/dev/null; then nproc; fi
+          if [ -r /proc/cpuinfo ]; then grep -m1 -E 'model name|CPU part' /proc/cpuinfo || true; fi
+          if command -v sysctl >/dev/null; then sysctl -n machdep.cpu.brand_string hw.ncpu 2>/dev/null || true; fi
+          if command -v powershell >/dev/null; then
+            powershell -NoProfile -Command "(Get-CimInstance Win32_Processor).Name; (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors"
+          fi
+          uptime || true
+      - name: Three rounds, the benches interleaved
+        run: |
+          for round in 1 2 3; do
+            for bench in provision_bench edit_merge_bench; do
+              echo "== round $round: $bench at $(date -u +%H:%M:%S) UTC; $(uptime 2>/dev/null || echo 'no load average')"
+              status=0
+              target/release/examples/$bench || status=$?
+              echo "== round $round: $bench exit $status"
+            done
+          done
