@@ -1156,3 +1156,5 @@ slates daemon: nfs_v4_opens = 2484716: max_inodes × shards (anchors ["max_inode
 slates daemon: nfs_v4_locks = 2484716: max_inodes × shards (anchors ["max_inodes", "shards"])
 slates daemon: instance fsb-161-5-new serving on 1 shards under the anchor
 ## run 5 of 5 done, 2026-11-05T21:34:41Z
+To https://github.com/hyper-light/slates
+   7f31560..c77bcf6  c77bcf64111062ae34302dfb1eff5a12b46aeb55 -> diag-winfsp-overlap-results-42100630998-windows-latest
