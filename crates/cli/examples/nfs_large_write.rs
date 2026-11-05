@@ -6,9 +6,9 @@
 //! NFSv4.1 session of [`IN_FLIGHT`] slots, each WRITE a `SEQUENCE, PUTFH, WRITE` compound under the anonymous state
 //! id, as the kernel client's NFSv4.2 mount sends them), and removes both.
 //!
-//! Then [`KEPT_ROUNDS`] rounds of the incumbent harness's pattern: a new [`KEPT_MIB`] MiB file over NFSv4.2, kept, after
-//! the shard has been idle [`IDLE_TICKS`] reap ticks, so each lands on fresh memory unless the idle shard prepared it
-//! (A-214). Rows `nfs_kept_after_idle\t<round>\t<MiB/s>\t<prefaulted bytes so far>\t<purged bytes so far>`.
+//! Then, once the idle purge has given the removed rounds' pages back, [`KEPT_ROUNDS`] rounds of the incumbent harness's
+//! pattern: a new [`KEPT_MIB`] MiB file over NFSv4.2, kept, after an idle pause of [`IDLE_TICKS`] reap ticks, so each
+//! lands on fresh memory unless the idle shard prepared it (A-214). Rows `nfs_kept_after_idle\t<round>\t<MiB/s>\t<prefaulted bytes so far>\t<purged bytes so far>`.
 //!
 //! Rows are `nfs_large_write\t<v3|v4>\t<round>\t<MiB/s>\t<process cpu ns per MiB>\t<load>`, then per version
 //! `nfs_large_write_best\t<v3|v4>\t<MiB/s>\t<every round's MiB/s>`. The process CPU is the daemon's and the client thread's
@@ -52,9 +52,9 @@ const FILE_MIB: usize = 512;
 const KEPT_MIB: usize = 64;
 /// Shape: kept-after-idle rounds.
 const KEPT_ROUNDS: usize = 5;
-/// Shape: the idle pause before each kept round: three reap ticks (`LIVENESS_BUDGET_NS`), one to see no allocation and
-/// two for the idle work (A-105's purge, A-214's refill).
-const IDLE_TICKS: u32 = 3;
+/// Shape: the idle pause before each kept round: one reap tick (`LIVENESS_BUDGET_NS`), about the pause the incumbent
+/// harness leaves slates between its rounds (nfsd's and tmpfs's turns).
+const IDLE_TICKS: u32 = 1;
 /// Shape: rounds; every round is shown and the best reported (BENCHMARKS.md best-of-N).
 const ROUNDS: usize = 7;
 /// Shape: the volume's quota — room for one round's file twice over.
@@ -517,6 +517,14 @@ fn main() {
       .copied()
       .unwrap_or(0)
   };
+  // The removed rounds' pages go back first (A-105's idle purge), so the kept rounds start on fresh memory.
+  let purged = counter("content.purged_bytes");
+  let settled = Instant::now();
+  while counter("content.purged_bytes") == purged && settled.elapsed() < WAIT {
+    #[allow(clippy::disallowed_methods)]
+    // the bench waits out the daemon's reap ticks, which run on their own clock
+    std::thread::sleep(Duration::from_nanos(LIVENESS_BUDGET_NS));
+  }
   let mut kept = Vec::with_capacity(KEPT_ROUNDS);
   for round in 0..KEPT_ROUNDS {
     #[allow(clippy::disallowed_methods)]

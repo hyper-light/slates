@@ -223,6 +223,9 @@ pub struct ShardState {
   /// The net growth of the content arena's allocated bytes over its last busy period (A-214): the write burst an idle
   /// shard keeps free pages pre-faulted for (`daemon::purge_if_idle`).
   pub(crate) last_burst: usize,
+  /// The content arena's allocation count when the reserve's refill last found nothing to fault (A-214): until the
+  /// arena allocates again, or the burst measure moves, an idle moment's refill has nothing to do.
+  pub(crate) refill_settled: Option<u64>,
   /// The journal generation whose dead recovery memory an idle shard last gave back (A-117,
   /// `daemon::return_dead_recovery`): a later publication moves the generation and re-arms the return.
   pub(crate) recovery_returned_at: Option<u64>,

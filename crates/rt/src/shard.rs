@@ -257,6 +257,9 @@ pub struct ShardInner {
   fired: Vec<u64>,
   completions: Vec<Completion>,
   pollers: Vec<Poller>,
+  /// Work the shard does in its idle time, a slice a call, before it parks ([`ShardContext::set_idle_work`]): `None`
+  /// when none is registered, and while a slice of it runs.
+  idle_work: Option<Box<dyn FnMut() -> bool>>,
   /// The consumer of the entry's foreign wake ring, claimed at build and held for the context's life (the
   /// ring's only consumer, AUD-29-33); `None` for a context with no entry.
   foreign: Option<slates_mem::mpsc::Consumer<'static>>,
@@ -512,6 +515,7 @@ impl ShardContext {
         counters: Counters::default(),
         shutting_down: false,
         pollers: Vec::new(),
+        idle_work: None,
         foreign,
         timer_waiters: std::collections::VecDeque::new(),
         timer_waiter_queued: Vec::new(),
@@ -1123,6 +1127,11 @@ impl ShardContext {
       if self.spin_after_activity(outcome.next_deadline_ns) {
         continue;
       }
+      // Idle: one slice of the registered idle work, then the loop looks for work again; it parks once the idle
+      // work has none left (§4.2, "the shard schedules a pre-fault task on its idle time").
+      if self.idle_slice() {
+        continue;
+      }
       self.park(outcome.next_deadline_ns);
       last_wait_ns = self.now_ns();
     }
@@ -1573,6 +1582,33 @@ impl ShardContext {
       }
     }
     any
+  }
+
+  /// Registers `work` as this shard's idle work (§4.2's pre-fault task on idle time; the daemon's reserve refill,
+  /// A-214), replacing any before it. When a step finds nothing to do and the idle spin has run out, the loop calls it
+  /// once, and looks for work again before it calls it next; `work` does a slice bounded by the shard's quantum and
+  /// says whether it did anything, and the shard parks once it says no. It runs outside every task, so it may not
+  /// await. Refused off the shard's thread.
+  pub fn set_idle_work(&self, work: Box<dyn FnMut() -> bool>) -> Result<(), RtError> {
+    self
+      .with_inner(|inner| inner.idle_work = Some(work))
+      .ok_or(RtError::NotOnShardThread)
+  }
+
+  /// One slice of the registered idle work: whether it did anything. The work is taken out of the shard's state while
+  /// it runs, so it may use the shard's other services without a nested borrow, and put back after unless it was
+  /// replaced meanwhile.
+  fn idle_slice(&self) -> bool {
+    let Some(mut work) = self.with_inner(|inner| inner.idle_work.take()).flatten() else {
+      return false;
+    };
+    let did = work();
+    self.with_inner(|inner| {
+      if inner.idle_work.is_none() {
+        inner.idle_work = Some(work);
+      }
+    });
+    did
   }
 
   /// Registers `task` as a poller with `ready`; the loop wakes it whenever `ready` says so.

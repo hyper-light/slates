@@ -12850,8 +12850,13 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
 
 ### A-214 — An idle shard keeps its last write burst's worth of free content pages pre-faulted (accepted 2026-11-05, VFS plan step 11; amends A-105)
-Status: accepted 2026-11-05 (Ada's decision through the supervisor: option (a) of GAPS' large-file write gap); being
-built. It amends A-105's "every free block back at the first idle tick".
+Status: accepted 2026-11-05 (Ada's decision through the supervisor: option (a) of GAPS' large-file write gap); built
+2026-11-05. It amends A-105's "every free block back at the first idle tick". Applied in the same change to:
+`crates/mem/src/buddy.rs` (`Buddy::upcoming`), `crates/mem/src/arena.rs` (`upcoming`, `purge_keeping`, `prefault`,
+`KeptRun`, `Prefaulted`), `crates/rt/src/shard.rs` (`set_idle_work`), `crates/server/src/daemon.rs` (`purge_if_idle`,
+`refill_slice`, `note_burst`, `prefault_reserve`), `crates/server/src/config.rs` (`page_fault_ns`,
+`prefault_slice_pages`), `crates/server/src/state.rs`, the tests named below, `crates/cli/examples/nfs_large_write.rs`,
+A-105's entry, BENCHMARKS, GAPS.
 - **Why.** A large write through Linux's NFSv4.2 client spends 41.5% of the volume's shard faulting in fresh pages of
   the anchor's shared content object, one 4 KiB `shmem_fault` a page (CI run 41986870989). The same write over pages
   still resident matches the kernel's nfsd (2,047–2,190 against 2,148–2,218 MiB/s, run 41978355633); after A-105's
@@ -12871,9 +12876,19 @@ built. It amends A-105's "every free block back at the first idle tick".
      anyway.
   3. **The purge** gives back every resident free block except the reserve's (A-105 otherwise unchanged).
   4. **The refill** faults the reserve's pages that are not resident, in slices of `quantum / page_fault_ns` pages
-     (§4.2's pre-fault batch, the profile's measured base-page fault), yielding between slices and stopping when a
-     request makes the shard busy. Never on the write path. The pages are charged where A-105 charges a freed block
-     kept resident (the arena's resident free bytes), and counted (`content.prefaulted_bytes`).
+     (§4.2's pre-fault batch, the profile's measured base-page fault). It is the shard's idle work
+     (`ShardContext::set_idle_work`, `crates/rt/src/shard.rs`): when a step finds nothing to do and the idle spin has
+     run out, the run loop does one slice and looks for work again, and parks once the refill has nothing left. So it
+     runs in the shard's idle moments, a request waits at most one slice, and it is never on the write path. The
+     reap tick's idle purge refills too. The pages are charged where A-105 charges a freed block kept resident (the
+     arena's resident free bytes), and counted (`content.prefaulted_bytes`).
+  5. **Before the tick closes the burst.** The reserve's size is the larger of the last burst and the growth since the
+     last idle tick, so an idle moment inside a burst, or right after it, refills for what the burst has grown so far.
+     The incumbent harness pauses slates for about a second between rounds (nfsd's and tmpfs's turns): its volume's
+     shard reached no idle tick in a whole run (`content.ticks.idle` 0, `content.ticks.sealing` 2,
+     `content.ticks.busy` 1 on the M5 Max, 2026-11-05), so a refill gated on the tick never ran there.
+- **Counted:** each reap tick's outcome, `content.ticks.sealing`, `content.ticks.deferred`, `content.ticks.busy` and
+  `content.ticks.idle`.
 - **The idle test's tick.** A-105 asks whether the arena allocated since the previous tick, but the count was recorded
   only when the purge ran, and a tick that seals or publishes returns before it. So the first purge after a burst saw
   the sweep's own allocations and waited a whole tick more. Now every tick records the count. Measured in process
