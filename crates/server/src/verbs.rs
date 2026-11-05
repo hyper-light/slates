@@ -2595,7 +2595,10 @@ fn scatter_list(
       None,
     );
     if slates_rt::registry::send_control(shard, Control::Spawn(Box::new(task))).is_err() {
-      gather(request, Vec::new());
+      // Settled on the state this verb holds (a gather through a second borrow never ran): the listing is refused,
+      // typed, and a part already sent finds no entry when it comes back.
+      state.scatters.remove(&request);
+      return Served::Reply(part_unsent(state, shard));
     }
   }
   Served::Forwarded
@@ -2646,7 +2649,9 @@ fn scatter_grants(
       None,
     );
     if slates_rt::registry::send_control(shard, Control::Spawn(Box::new(task))).is_err() {
-      gather_grants(request, Vec::new());
+      // As `scatter_list`: refused, typed, on the state this verb holds.
+      state.grant_scatters.remove(&request);
+      return Served::Reply(part_unsent(state, shard));
     }
   }
   Served::Forwarded
@@ -2704,10 +2709,21 @@ fn scatter_status(state: &mut ShardState, client_index: u32, request: u64) -> Se
       None,
     );
     if slates_rt::registry::send_control(shard, Control::Spawn(Box::new(task))).is_err() {
-      gather_status(request, None);
+      // As `scatter_list`: refused, typed, on the state this verb holds.
+      state.status_scatters.remove(&request);
+      return Served::Reply(part_unsent(state, shard));
     }
   }
   Served::Forwarded
+}
+
+/// The answer a scatter gives when its part for `shard` cannot be sent, the shard's control channel full: the typed
+/// `Overloaded`, counted by its name. Before 2026-11-05 the part was settled through a nested state borrow that never
+/// ran, and the scatter was never answered (`docs/bugs/2026-11-05-a-scatter-whose-part-could-not-be-sent-never-answered.md`).
+fn part_unsent(state: &mut ShardState, shard: u16) -> ReplyBody {
+  let refusal = Refusal::Overloaded { shard };
+  state.count(refusal_name(&refusal), 1);
+  refused(refusal)
 }
 
 /// Format: the count of an acknowledgement's releases on other shards that were refused or never sent (A-216); each
