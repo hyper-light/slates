@@ -288,7 +288,8 @@
 >   named `x86_64-apple-darwin` and `i686-pc-windows-msvc`, which are not shipped. `publish-node.yml` built only
 >   seven addons, so its tag-only completeness check would have refused the first publish. The PyPI lane built no
 >   Windows arm64 wheel. Both lanes are now held to `xtask/src/targets.rs` and build Windows natively, and their
->   checks run on the dry run. The dry-run evidence is in A-210.
+>   checks run on the dry run. Dry runs on 2026-11-05 published nothing: seven wheels and the sdist passed `twine
+>   check` (run 42048582138), and seven addons each landed in their package (run 42055543098).
 > - **Owed to Ada:** a release is published only when a maintainer pushes a real tag `v<version>` and publishes its
 >   draft (`docs/publish.md`). The test draft is never to be published.
 > - **Open, found by the smoke test: the anchor aborts when its stderr closes.** `slates anchor 2>&1 >/dev/null | head
@@ -299,7 +300,8 @@
 > - **Reproducible from the tag (2026-11-05, AC-9.5).** Every target is built twice on separate runners, and the
 >   release is refused unless the two copies are the same bytes. The four Linux binaries already were. The Windows
 >   ones differed in 20 bytes, the linker's timestamps and PDB GUID (run 42046848954), until `/Brepro`; with it, all six
->   pairs match (run 42049001999). The numbers are in A-210.
+>   pairs match (run 42049001999). On the test tag `v0.1.0-test.2` (run 42054339412), all seven pairs matched, macOS
+>   included, and the draft carries both digests of each. The numbers are in A-210.
 > - **Not yet:** the macOS `Slates.app` bundle, code signing and notarization (B.7; they need an Apple Developer
 >   identity); `cargo-binstall` metadata.
 

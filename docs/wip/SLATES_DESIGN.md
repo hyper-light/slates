@@ -13319,6 +13319,14 @@ Applied in the same change to: Appendix B.2 (body and status), Phase 9 task 5's 
     for AWS-LC, as the binary release does.
   - The binary check (npm) and `twine check --strict` (PyPI) moved out of the tag-only publish jobs, so a
     `workflow_dispatch` dry run proves them and publishes nothing.
+  - Dry runs on `agents/release` (2026-11-05), each with its publish job skipped:
+    - PyPI run 42048582138 built seven cp39-abi3 wheels (manylinux and musllinux x86_64 and aarch64, macOS arm64,
+      Windows x64 and arm64) and the sdist, and `twine check --strict` passed over all eight artifacts.
+    - npm run 42055543098 built all seven addons (699 KB on arm64 Windows to 3.98 MB on x86_64 musl). It answered "7
+      platform packages hold their binary", and `npm pack --dry-run` packed eight packages.
+    - It took two fixes first. The arm64 musl build in node:24-alpine failed, "linker `aarch64-linux-musl-gcc` not
+      found" (42048576607), because napi names a cross linker for a native build; B.2's `LINKER=cc` override now
+      sets it. And an apostrophe in a comment inside the single-quoted container script ended it (42054307287).
 - **Reproducible from the tag (AC-9.5, 2026-11-05).** The lane builds every target twice, each copy on a runner of its
   own (`copy: build` and `copy: rebuild`). The artifacts task refuses a release whose two copies differ, naming the
   count of differing bytes and their first offsets (`a_target_whose_rebuild_differs_is_not_reproducible`). Measured:
@@ -13328,7 +13336,11 @@ Applied in the same change to: Appendix B.2 (body and status), Phase 9 task 5's 
   - With `-C link-arg=/Brepro` (run 42049001999) all six pairs are the same. The four Linux digests also equal the
     previous run's, so one source gave one binary on four separate runners (for example `slates-linux-arm64`
     `f8fb335c…61eb7f`, `slates-windows-x64.exe` `3a48be20…44740d`).
-  - The test tag that runs both copies of all seven targets, macOS included, is recorded below.
+  - Test tag `v0.1.0-test.2` (commit a41c5e71, run 42054339412, 2026-11-05) built and smoke-tested both copies of all
+    seven targets, macOS included, 14 jobs. The release job accepted every pair, and the draft's provenance records
+    each rebuild's digest equal to its build's, for example `slates-macos-arm64` `25e3bab5…` and
+    `slates-windows-x64.exe` `9f1d6832…`. The macOS pair matched across two runner images (20261026.0455.2 and
+    20261102.0473.1); the other pairs ran on one image each.
 - **Not yet.** Code signing and notarization (B.7; they need Ada's Apple Developer identity). The macOS `Slates.app` bundle
   (B.7), code signing and notarization (they need Ada's Apple Developer identity). `cargo-binstall` metadata.
 
