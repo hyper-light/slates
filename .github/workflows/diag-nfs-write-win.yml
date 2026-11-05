@@ -1,0 +1,30 @@
+name: DIAG nfs-write, Windows lint and NFS suites (not for main)
+
+# Diagnostics, never merged (VFS plan step 11): the turn copy budget touches the Windows arm of the NFS connection's
+# head (its inbox), so the Windows-buildable crates are linted natively and the NFS server suites run, as ci.yml's
+# windows-lint job does.
+
+on:
+  push:
+    branches: ['diag-nfs-write-*']
+
+jobs:
+  windows:
+    name: native clippy + NFS suites (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - name: Install NASM
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Clippy, the Windows-buildable crates (ci.yml's set)
+        run: cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-sdk-node -p slates-sdk-python -p slates-anchor -p slates-mcp --all-targets -- -D warnings
+      - name: The NFS server, its write-back judgment and the network export (native Windows)
+        timeout-minutes: 30
+        run: cargo test -p slates-server --test nfs_hostile --test nfs_tls --test nfs_writeback -- --test-threads=1
