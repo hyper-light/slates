@@ -475,3 +475,5 @@ winfsp-phase	settle_batch	403	1	p50 6505000	p99 6505000	mean 6505000
 winfsp-phase	settle_batch	514	1	p50 7420400	p99 7420400	mean 7420400
 winfsp-phase	settle_batch	515	1	p50 8505700	p99 8505700	mean 8505700
 ## run 1 of 1 done, 2026-11-05T07:56:06Z
+To https://github.com/hyper-light/slates
+   06ffd23..8593095  8593095adb243c8822775260a51a45e9e262f80c -> diag-winfsp-bench-results-41989038309-windows-11-arm
