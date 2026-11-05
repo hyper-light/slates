@@ -1,5 +1,18 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A private purge's intent can wait up to the 1 s transaction timeout (found 2026-11-05, audit step 7; open).**
+> WinFsp's transact never goes pending: the control dispatch calls `FspVolumeTransact` inline (v2.1 `src/sys/fsctl.c:95-99`),
+> which waits for a request inside the call (`src/sys/volume.c:1171`). So `purge_intents::Intents::wait`, which drains
+> intents while a call is pending, never runs; 0 of 161,073 receives went pending on arm64 (BENCHMARKS, run 41977769822).
+> Intents are drained only after a call returns. `Sender::publish` blocks when its two-message channel is full: a previous
+> End and the next Begin are queued, and that Begin's drive open was refused before any request reached slates. It then
+> waits for the receiver's next return, which on an idle drive is the 1,000 ms transaction timeout. **Planned fix, after
+> audit step 7 lands, as its own change with a failing test first** (a purge whose Begin's open is refused while the
+> drive is idle must not wait out the transaction timeout): a publisher that would block cancels the receive thread's
+> call (`CancelSynchronousIo`), retrying while the cancel finds no call in progress. WinFsp ends a cancelled wait with
+> nothing delivered (`src/sys/driver.h:954-955`, `src/sys/ioq.c:617`, `volume.c:1181-1185`), provided the receiver reads
+> the cancellation as "nothing delivered".
+
 > **WinFsp: a second receive worker would help only rename and unlink, and needs a crash proof first (2026-11-05, audit
 > step 7; lever, not planned).** Tracing every IRP on both arms (diagnostics runs 42086968194, 42091919319 and
 > 42097182526) rejected the two-worker hypothesis for create, stat and open. 71cf09ac's DLL runs one operation at a time

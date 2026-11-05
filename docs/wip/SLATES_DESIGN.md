@@ -13424,7 +13424,13 @@ The largest costs were two things A-198's first form did that its crash rules do
   it is done, however many opens the mount holds. A rename onto itself moves nothing and returns at once.
 
 Each worker also reuses one completion event: control transactions run one at a time, and creating and closing an event
-for each cost 0.9 µs at the p50 twice a request.
+for each cost 0.9 µs at the p50 twice a request. **Since 2026-11-05 each worker also makes its two operation packets
+once for its life** (`dispatcher.rs`'s `Owned`). Each request had made a fresh 16 KiB working copy and a fresh 16 KiB
+response packet, and zero-filled the packet again: 2.6–4.4 µs an IRP on arm64 and 1.7–2.0 µs on x86_64 (diagnostics run
+42091919319). Only the response's fixed 128 bytes are cleared now, as WinFsp's own dispatcher clears only the header
+(`src/dll/fs.c:303-305`). `inflight::finish_response` clears the padding its size rounding adds, so no byte of an earlier
+response is sent. With it, every x86_64 quiet call is within the DLL's spread at the p50 (BENCHMARKS, "Where the WinFsp
+receiver's time goes").
 
 **Not changed: a response and the next receive stay two calls.** The DLL carried both in one call. A-198 keeps them apart
 so that captured requests settle before any new receive, which is what stops a reused IRP address naming another
