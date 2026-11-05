@@ -1745,6 +1745,14 @@ impl Daemon {
       .collect()
   }
 
+  /// Whether this daemon admits a write that changes its shard image — a `Create`, a `Snapshot` — or refuses it
+  /// `ConsensusNotInitialized` (§4.8): its control shard has imported both groups it belongs to, the root and its
+  /// region's council, and is a member of the council's configuration. A fleet test's settled fleet waits for it on
+  /// every node, since the council's membership can be committed while a learner's root import is still owed.
+  pub fn consensus_ready(&self) -> Result<bool, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| s.consensus_ready)
+  }
+
   /// Whether this daemon leads the **root group** across regions (§4.8, D-14 — the root master). A one-shot
   /// control-shard question ([`Self::observation`]); an observation the daemon could not make is its typed
   /// refusal — unknown, never "not the leader". Exposed so a fleet test can prove the root group elected a

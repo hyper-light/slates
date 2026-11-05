@@ -44,3 +44,8 @@ The workspace gate chain passes in 10.005 s in the same capped unit: `cargo +1.9
 cargo +1.98.1 clippy --locked --workspace --all-targets -- -D warnings && cargo +1.98.1 xtask check &&
 RUSTDOCFLAGS="-D warnings -A rustdoc::private_intra_doc_links" cargo +1.98.1 doc --locked --workspace --no-deps
 --document-private-items`. Log: `~/.cache/slates-s9-fleet-diagnostic-gates.log`.
+
+## Attributed (2026-11-04)
+
+The reply was `ConsensusNotInitialized`: the fixture handed over a fleet before every node was ready to admit a
+placement write. Cause, reproduction and fix: `docs/bugs/2026-11-04-a-settled-fleet-refused-its-first-create.md`.
