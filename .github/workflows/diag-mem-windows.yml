@@ -1,0 +1,105 @@
+name: diag-mem-windows
+on:
+  push:
+    branches: ['diag-mem-windows-*']
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: The held section's refused adoption
+        if: ${{ !cancelled() }}
+        run: cargo test -p slates-mem --test held_section -- --nocapture
+      - name: The crate's give-back
+        if: ${{ !cancelled() }}
+        run: cargo test -p slates-mem --test give_back -- --nocapture
+      - name: The whole mem crate
+        if: ${{ !cancelled() }}
+        run: cargo test -p slates-mem
+      - name: A daemon's give-back
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-server --test give_back -- --nocapture
+      - name: The cost of a write after reuse
+        if: ${{ !cancelled() }}
+        run: cargo run --release -p slates-mem --example give_back_bench
+  windows-arm64:
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clang-cl
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: The held section's refused adoption
+        if: ${{ !cancelled() }}
+        run: cargo test -p slates-mem --test held_section -- --nocapture
+      - name: The crate's give-back
+        if: ${{ !cancelled() }}
+        run: cargo test -p slates-mem --test give_back -- --nocapture
+      - name: The whole mem crate
+        if: ${{ !cancelled() }}
+        run: cargo test -p slates-mem
+      - name: A daemon's give-back
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-server --test give_back -- --nocapture
+      - name: The cost of a write after reuse
+        if: ${{ !cancelled() }}
+        run: cargo run --release -p slates-mem --example give_back_bench
+  unix-gates:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        if: ${{ !cancelled() }}
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Docs
+        if: ${{ !cancelled() }}
+        env:
+          RUSTDOCFLAGS: -D warnings -A rustdoc::private_intra_doc_links
+        run: cargo doc --workspace --no-deps --document-private-items
+      - name: xtask check
+        if: ${{ !cancelled() }}
+        run: cargo xtask check
+      - name: The mem crate
+        if: ${{ !cancelled() }}
+        run: cargo test -p slates-mem
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - name: Miri over the mem crate's tests
+        run: cargo +nightly miri test -p slates-mem --lib
