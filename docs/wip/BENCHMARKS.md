@@ -7242,6 +7242,68 @@ pages. The same commands, on adacachy (Linux 7.2.9, at load 90 to 218 from other
 - **The placing step now places two pages**, and took 264 to 579 µs, one sample each in debug builds. Not separated from
   the step's other work, as above.
 
+## A full edit and merge: the client's edit through the green's verdict (A-220; 2026-11-04 local, 2026-11-05 UTC)
+
+**The question.** Ada's goal of 2026-11-04: a full edit and merge under 1 ms, preferably under 50 µs. One sample is
+what an agent pays to change a file and learn the green's verdict: the client's `edit` of its work volume (64 bytes
+of a 4 KiB file), then its `submit` through the server's verdict to the reply, over the real rendezvous and rings to
+an in-process daemon (client and server are one binary, `slates`, as they run). Forms: `accept` (the work's base is
+the head: the fast path), `ranged` (the base lags the head by another work's accept on the same file; a disjoint
+range is mapped and swept), `identical` (the lagging work writes the head's own bytes there), `conflict` (it writes
+different bytes there). Every answer is checked against a model of the green (the verdict, the head, the edited
+file read back) and a wrong one ends the run with exit 1 — the harness's first run found
+`docs/bugs/2026-11-04-the-same-edit-from-two-works-was-one-increment.md` that way.
+
+Environment: adas-macbook-pro-2 (Apple M5 Max, 18 cores, 128 GiB, macOS 26.4), shared with other agents' builds:
+load 5 to 11 through every run below, so these numbers are informational; the quiet runs are owed (kiln's Mac
+Studios were unreachable this day; CI runners next). Rust 1.98.1, release, daemon derived for the machine (5 shards),
+client spinning up to 1 ms for its reply.
+
+Command (each arm a saved release binary of `crates/client/examples/merge_bench.rs` at the tree named; arms run
+interleaved A B A B A B; each run 3 × 1,000 samples per form and shape, a run stopping at 20 s with at least 200;
+the scripts `ab1.sh`..`ab3.sh` under the agent's scratch, their loop is the line below):
+
+```
+for round in 1 2 3; do for arm in A B; do uptime; ./merge_bench_$arm --quiet-only --files N.. --form F..; done; done
+```
+
+Total (edit + submit), p50 of each run's three runs' medians, then p99, per round:
+
+| Arm (what it adds) | Shape, form | Round 1 | Round 2 | Round 3 |
+|---|---|---|---|---|
+| A: `3f5e8483` (the identity fix only) | 1,000 files, accept | 13.99 ms (p99 17.7 ms) | 14.82 ms (18.3 ms) | 13.93 ms (18.3 ms) |
+| B: the merge record's identities only for holders | 1,000 files, accept | 0.97 ms (1.59 ms) | 0.93 ms (1.63 ms) | 0.99 ms (3.06 ms) |
+| A | 10 files, accept | 209 µs (390 µs) | 210 µs (374 µs) | 117 µs (251 µs) |
+| B | 10 files, accept | 64 µs (174 µs) | 66 µs (316 µs) | 65 µs (178 µs) |
+| A | 1,000 files, conflict | 875 µs (59.8 ms) | 990 µs (58.9 ms) | 915 µs (55.5 ms) |
+| B | 1,000 files, conflict | 903 µs (1.61 ms) | 849 µs (1.12 ms) | 888 µs (1.75 ms) |
+| B | 10,000 files, conflict | 9.62 ms (15.4 ms) | 9.40 ms (16.8 ms) | 8.91 ms (16.1 ms) |
+| C: B + the restricted base, the retention totals | 10,000 files, conflict | 174 µs (715 µs) | 189 µs (2.76 ms) | 187 µs (1.22 ms) |
+| B | 1,000 files, accept | 921 µs (1.19 ms) | 906 µs (1.54 ms) | 907 µs (1.43 ms) |
+| C | 1,000 files, accept | 549 µs (921 µs) | 609 µs (1.49 ms) | 552 µs (902 µs) |
+| C (second A/B, against D) | 10,000 files, accept | 3.32 ms (32.0 ms) | 5.24 ms (8.10 ms) | 4.11 ms (6.69 ms) |
+| D: C + the work as a delta over its base | 10,000 files, accept | 57 µs (196 µs) | 58 µs (180 µs) | 60 µs (166 µs) |
+| C | 10,000 files, conflict | 170 µs (596 µs) | 172 µs (854 µs) | 177 µs (1.88 ms) |
+| D | 10,000 files, conflict | 57 µs (166 µs) | 56 µs (167 µs) | 58 µs (164 µs) |
+| C | 1,000 files, accept | 559 µs (5.44 ms) | 555 µs (907 µs) | 556 µs (945 µs) |
+| D | 1,000 files, accept | 59 µs (216 µs) | 59 µs (199 µs) | 61 µs (179 µs) |
+
+D's p999 at 1,000 and 10,000 files, accept and conflict, was 0.23 to 0.66 ms in every run (max 0.35 ms to 9.7 ms);
+C's and B's were 2 to 74 ms. D, every form, one run each (load 8.6): p50 51 to 69 µs at 10, 1,000 and 10,000 files
+(accept 59/63/60 µs, ranged 68/69/69 µs, identical 58/58/51 µs, conflict 55/58/68 µs), p99 152 to 364 µs, except
+conflict at 10,000 files, p99 1.81 ms in that run and 0.16 to 0.17 ms in the three A/B runs above.
+
+**What decided it** (`sample` of the shard threads during a run): at 1,000 files, 113 of 120 submit samples were
+`Green::head_identity`, a BLAKE3 of every byte of the green, made for a merge record at `f = 0` and dropped (B); then,
+at 10,000 files, 64 of 88 were `reset_accepted_work`, the work's whole copy of the green made again after every
+accept (D), and the rest the deriver's whole base and the settle's sums (C). Each is O(what the green holds); after
+D a submit's cost follows what it changed.
+
+**What it means.** The required 1 ms holds at p99 at every shape measured on a loaded box; the preferred 50 µs does
+not yet: the median is 51 to 69 µs, of which the edit's round trip is about 17 µs and the submit's about 37 µs at one
+file (the fixed cost, measured before these changes, same box). Owed: the quiet and CI runs, 100,000 files, the
+two-machine path (fs-server's remote client), the head identity at `f > 0` in O(changed), and the fixed cost.
+
 ## Every platform's mount, like for like, quiet and under load (T-4.8; condition 12; 2026-11-01)
 
 Before any optimization of the mounts (step 2 of the VFS and DAX plan), one harness measured slates' host mount beside

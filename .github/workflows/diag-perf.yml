@@ -1,0 +1,58 @@
+name: diag-perf
+
+# The edit-and-merge latency harness (`crates/client/examples/merge_bench.rs`, A-220) on CI's runners: a diagnostics
+# lane run only from `diag-perf-*` branches (never main), so a measurement can come from a machine quieter than a
+# shared development box. Each job builds the harness twice, at the pushed tree and at `BASE` (the harness copied in),
+# and runs the two binaries interleaved, printing the runner's load before every run.
+
+on:
+  push:
+    branches: ["diag-perf-*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  merge-bench:
+    name: merge bench (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the harness at the pushed tree
+        run: |
+          cargo build --release -p slates-client --example merge_bench
+          mkdir -p "$RUNNER_TEMP/bin"
+          cp target/release/examples/merge_bench "$RUNNER_TEMP/bin/merge_bench_new"
+      - name: Build the harness at the base
+        run: |
+          base=$(cat .github/diag-perf-base)
+          git worktree add "$RUNNER_TEMP/base" "$base"
+          cp crates/client/examples/merge_bench.rs "$RUNNER_TEMP/base/crates/client/examples/merge_bench.rs"
+          (cd "$RUNNER_TEMP/base" && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo build --release -p slates-client --example merge_bench)
+          cp target/release/examples/merge_bench "$RUNNER_TEMP/bin/merge_bench_base"
+      - name: Interleaved runs
+        run: |
+          # The base answers the identical form wrongly (the bug A-220's change fixed), so the base runs the other forms.
+          forms="--form accept --form ranged --form conflict"
+          shapes="--files 10 --files 1000 --files 10000"
+          for round in 1 2 3; do
+            for arm in base new; do
+              echo "== round $round arm $arm $(date -u +%FT%TZ) $(uptime)"
+              "$RUNNER_TEMP/bin/merge_bench_$arm" --quiet-only $forms $shapes | grep goal
+            done
+          done
+      - name: The new arm, every form, quiet and loaded, with every row
+        run: |
+          echo "== $(date -u +%FT%TZ) $(uptime)"
+          "$RUNNER_TEMP/bin/merge_bench_new" --files 10 --files 1000 --files 10000 --files 100000

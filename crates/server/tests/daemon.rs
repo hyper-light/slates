@@ -4294,10 +4294,12 @@ fn a_contended_wake_tail_does_not_shrink_the_client_seats() {
 
 /// §4.2 (a work's charge), banned item 8: do create a work, edit it, then withhold the shard's whole admittable
 /// capacity (the memory-pressure hold) and edit again; expect the edit refused `BudgetExceeded` with the file
-/// unchanged, and a new work of the (now non-empty) green refused too (its seeded copy is charged). Release the
-/// hold; expect the edit to succeed.
-/// A work's content and journal live in the owner shard's memory, so they are charged like a volume's growth, never
-/// kept for free.
+/// unchanged. A new work of the (now non-empty) green holds nothing of its own (§4.16: a work is a delta over its
+/// base, `crates/server/src/work_files.rs`), so it is created under the hold; its first edit of the green's file
+/// copies the file into the work and is refused `BudgetExceeded`, its view of the file unchanged. Release the hold;
+/// expect both edits to succeed.
+/// What a work keeps (the files it changed and its journal) lives in the owner shard's memory, so it is charged like
+/// a volume's growth, never kept for free.
 #[test]
 fn a_works_edits_are_charged_and_refused_typed_when_the_budget_cannot_hold_them() {
   use slates_ipc::protocol::ReadAt;
@@ -4364,21 +4366,74 @@ fn a_works_edits_are_charged_and_refused_typed_when_the_budget_cannot_hold_them(
     },
     "the refused edit changed nothing"
   );
-  let second = client.call(&RequestBody::CreateWork {
+  let second = a_new_work_under_the_hold(&mut client, green);
+  daemon.inject_pressure_hold(0).unwrap();
+  assert_eq!(edit(&mut client, b"after "), ReplyBody::Edited);
+  the_new_works_edit_once_released(&mut client, second);
+  drop(client);
+  daemon.stop();
+}
+
+/// A one-byte insert at the start of `f.txt` in `work`.
+fn edit_first_byte(client: &mut Client, work: slates_ipc::protocol::VolumeId) -> ReplyBody {
+  client.call(&RequestBody::Edit {
+    work,
+    path: "f.txt".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"x".to_vec(),
+  })
+}
+
+/// `f.txt` as `work` sees it.
+fn read_f(client: &mut Client, work: slates_ipc::protocol::VolumeId) -> ReplyBody {
+  client.call(&RequestBody::Read {
+    volume: work,
+    path: "f.txt".to_owned(),
+    at: slates_ipc::protocol::ReadAt::Head,
+  })
+}
+
+/// Under the pressure hold: a new work of `green` is created (it holds nothing of its own), and its first edit of the
+/// green's file, which copies the file into it, is refused `BudgetExceeded` with its view unchanged.
+fn a_new_work_under_the_hold(
+  client: &mut Client,
+  green: slates_ipc::protocol::VolumeId,
+) -> slates_ipc::protocol::VolumeId {
+  let ReplyBody::WorkCreated { id: second, .. } = client.call(&RequestBody::CreateWork {
     green,
     name: "charge-w2".to_owned(),
-  });
+  }) else {
+    panic!("a new work holds nothing of its own, so the hold does not refuse it")
+  };
+  let refused = edit_first_byte(client, second);
   assert!(
     matches!(
-      second,
+      refused,
       ReplyBody::Refused {
         refusal: slates_ipc::protocol::Refusal::BudgetExceeded { .. }
       }
     ),
-    "a new work's seeded copy is charged: {second:?}"
+    "the copy a first edit makes of the green's file is charged: {refused:?}"
   );
-  daemon.inject_pressure_hold(0).unwrap();
-  assert_eq!(edit(&mut client, b"after "), ReplyBody::Edited);
-  drop(client);
-  daemon.stop();
+  assert_eq!(
+    read_f(client, second),
+    ReplyBody::ReadBytes {
+      bytes: b"before".to_vec()
+    },
+    "the new work sees the green's file, unchanged by the refused edit"
+  );
+  second
+}
+
+/// Once the hold is released, the new work's edit splices the green's file.
+fn the_new_works_edit_once_released(client: &mut Client, second: slates_ipc::protocol::VolumeId) {
+  assert_eq!(edit_first_byte(client, second), ReplyBody::Edited);
+  assert_eq!(
+    read_f(client, second),
+    ReplyBody::ReadBytes {
+      bytes: b"xbefore".to_vec()
+    },
+    "the new work's edit spliced the green's file"
+  );
 }

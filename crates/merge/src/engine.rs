@@ -889,6 +889,123 @@ impl Green {
     }
   }
 
+  /// The base of `version` that composing `journal` reads (§4.16 "Composition at seal"): every
+  /// dimension's entry at each path the journal names
+  /// ([`VolumeOp::names`](crate::increment::VolumeOp::names)), and the hard links aimed at those
+  /// paths, as [`Green::base_at`] would give them. The deriver reads a base only at the paths its
+  /// journal names, so [`compose_volume`](crate::increment::compose_volume) over this base equals it
+  /// over the whole one (the oracle in `crates/merge/tests/base_for.rs`), and a submit's cost follows
+  /// what it changed rather than what the green holds: the whole base, every path's name cloned, was
+  /// built on every submit before (2026-11-04).
+  pub fn base_for(
+    &self,
+    version: u64,
+    journal: &[crate::increment::VolumeOp],
+  ) -> crate::increment::Base {
+    let named: BTreeSet<&str> = journal.iter().flat_map(|op| op.names()).flatten().collect();
+    let mut base = crate::increment::Base::of_files(Vec::new());
+    let at_head = version >= self.head();
+    for path in &named {
+      if at_head {
+        self.head_entries(path, &mut base);
+      } else {
+        self.entries_at(path, version, &mut base);
+      }
+    }
+    // A link named by the journal, or one aimed at a path it names (an unlink of a primary path is refused while
+    // aliases survive). Hard links are few, and no index by target exists yet.
+    let named_link = |link: &str, target: &str| named.contains(link) || named.contains(target);
+    if at_head {
+      for (link, target) in &self.hardlinks {
+        if named_link(link, target) {
+          base.hardlinks.push((link.clone(), target.clone()));
+        }
+      }
+    } else {
+      for (link, history) in &self.hardlink_history {
+        if let Some(target) = history_at(history, version)
+          && named_link(link, &target)
+        {
+          base.hardlinks.push((link.clone(), target));
+        }
+      }
+    }
+    base
+  }
+
+  /// Every dimension's entry at `path` at the head but hard links, added to `base` ([`Green::base_for`]).
+  fn head_entries(&self, path: &str, base: &mut crate::increment::Base) {
+    if let Some(bytes) = self.content.get(path) {
+      base.files.push((path.to_owned(), bytes.len() as u64));
+    }
+    if let Some(node) = self.specials.get(path) {
+      base.specials.push((path.to_owned(), *node));
+    }
+    if self.dirs.contains(path) {
+      base.dirs.push(path.to_owned());
+    }
+    if let Some(mode) = self.modes.get(path) {
+      base.modes.push((path.to_owned(), *mode));
+    }
+    if let Some(target) = self.symlinks.get(path) {
+      base.symlinks.push((path.to_owned(), target.clone()));
+    }
+    let from = (path.to_owned(), String::new());
+    for ((attr_path, name), value) in self.xattrs.range(from..) {
+      if attr_path != path {
+        break;
+      }
+      base
+        .xattrs
+        .push((attr_path.clone(), name.clone(), value.clone()));
+    }
+  }
+
+  /// Every dimension's entry at `path` at the earlier `version` but hard links, from the histories, added to `base`
+  /// ([`Green::base_for`]).
+  fn entries_at(&self, path: &str, version: u64, base: &mut crate::increment::Base) {
+    if let Some(bytes) = self.content_ref_at(path, version) {
+      base.files.push((path.to_owned(), bytes.len() as u64));
+    }
+    if let Some(node) = self
+      .special_history
+      .get(path)
+      .and_then(|history| history_at(history, version))
+    {
+      base.specials.push((path.to_owned(), node));
+    }
+    if self
+      .dir_history
+      .get(path)
+      .is_some_and(|history| present_at(history, version))
+    {
+      base.dirs.push(path.to_owned());
+    }
+    if let Some(mode) = self
+      .mode_history
+      .get(path)
+      .and_then(|history| history_at(history, version))
+    {
+      base.modes.push((path.to_owned(), mode));
+    }
+    if let Some(target) = self
+      .symlink_history
+      .get(path)
+      .and_then(|history| history_at(history, version))
+    {
+      base.symlinks.push((path.to_owned(), target));
+    }
+    let from = (path.to_owned(), String::new());
+    for ((attr_path, name), history) in self.xattr_history.range(from..) {
+      if attr_path != path {
+        break;
+      }
+      if let Some(value) = history_at(history, version) {
+        base.xattrs.push((attr_path.clone(), name.clone(), value));
+      }
+    }
+  }
+
   /// A file's bytes at `version`, reconstructed from its history — the latest recorded value at or
   /// before `version`, or `None` when the file was absent then. What a version-pinned attachment
   /// reads (§4.16 "Attachments and versions": a reader's view moves only by `advance`).
@@ -900,6 +1017,23 @@ impl Green {
         .find(|(recorded, _)| *recorded <= version)
         .and_then(|(_, bytes)| bytes.clone())
     })
+  }
+
+  /// Every file at `version` with its bytes, borrowed, in path order: the head's files, or each path's history
+  /// at an earlier version. What a work based at `version` lists (its untouched files are the green's there).
+  pub fn files_at(&self, version: u64) -> Vec<(&str, &[u8])> {
+    if version >= self.head() {
+      return self.files().collect();
+    }
+    self
+      .content_history
+      .keys()
+      .filter_map(|path| {
+        self
+          .content_ref_at(path, version)
+          .map(|bytes| (path.as_str(), bytes))
+      })
+      .collect()
   }
 
   /// A file's bytes at `version`, borrowed ([`Green::content_at`] without the copy): what a paged read slices.
@@ -1899,8 +2033,15 @@ impl Green {
     })
   }
 
-  /// What the green holds in memory beyond its durable chain ([`RetainedBytes`]): read off running
-  /// totals, never a walk.
+  /// What the green charges as retention (AUD-16): the content and IPC histories' bytes and the
+  /// rejected-result cache's, both running totals, so the settle after every submit costs nothing that
+  /// follows the green's size. [`Green::retained_bytes`] also sums the current files, a report's figure.
+  pub fn retention_charge(&self) -> usize {
+    self.history_bytes.saturating_add(self.rejected_bytes)
+  }
+
+  /// What the green holds in memory beyond its durable chain ([`RetainedBytes`]): the history and
+  /// rejected figures read off running totals; the current files' figure is a walk of them.
   pub fn retained_bytes(&self) -> RetainedBytes {
     RetainedBytes {
       content: self

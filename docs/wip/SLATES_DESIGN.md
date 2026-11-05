@@ -7001,6 +7001,14 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > work reads one position per holder rather than rescanning the retained chain. Transfer to a new
 > candidate set and full green takeover remain owed (AUD-14).
 
+> **Status (2026-11-04, A-220: a submit's cost follows what it changed).** A work holds only the files it changed
+> since its base and reads the rest from the green's history there; an accept moves its base and clears that, in
+> O(1). The deriver composes over the base restricted to the journal's paths, and the merge record's identities are
+> made only for a record that goes to holders. An increment's identity names its work and its base, as the data model
+> below says (it had left both out, and a second work's identical edit was answered with the first work's version;
+> `docs/bugs/2026-11-04-the-same-edit-from-two-works-was-one-increment.md`). Owed: the head identity at `f > 0` in
+> O(changed), the rebase's whole restatement.
+
 **Role.** Let many agents work on clones of one shared volume and fold their work back into it
 with no locks, no last-writer-wins, and no inferred merge. Each agent's work becomes an
 increment of declared operations; the green volume's merge task maps the increment through
@@ -10697,6 +10705,8 @@ work volumes are owed.
   the staging unit tests.
 
 ### A-84 — A work volume is charged for what it keeps (2026-10-05)
+Amended by A-220 (2026-11-04): a work keeps only the files it changed since its base, so a create or a recovered
+rebuild is charged nothing and cannot be refused, and a submit secures no bound for the reset.
 Applied in the same change to: `crates/server/src/work_charge.rs` (new), `crates/merge/src/increment.rs`
 (`VolumeOp::footprint`), `crates/server/src/{verbs,merge_service,state}.rs` (`WorkState::charged`; edit, declare,
 create, submit, rebase, destroy, prune, recovery), `crates/server/tests/daemon.rs`, `crates/server/Cargo.toml`
@@ -12891,6 +12901,56 @@ Applied in the same change to: §4.1 (its status), `crates/machine` (`facts.rs`:
   - Proven: the create-and-destroy loop returns to its floor, red before (64 against 0); and a key outlives its volume's
     life while a chunk sealed under it lives, across a restart, and goes with its last chunk. Red before, and
     red-checked against each half of the fix.
+
+### A-220 — A submit's cost follows what it changed, not what the green holds; a work is a delta over its base (accepted and built 2026-11-04, Ada's goal of 2026-11-04: a full edit and merge under 1 ms, preferably under 50 µs)
+Applied in the same change to: §4.16 (status), A-84 (what a work keeps and when its charge can be refused),
+`crates/server/src/{work_files,work_charge,verbs,merge_service,listing,state,lib}.rs`, `crates/merge/src/{engine,
+increment}.rs`, `crates/merge/tests/base_for.rs` (new), `crates/server/tests/daemon.rs`, `crates/client/examples/
+merge_bench.rs` (new), `crates/client/tests/merge_identity.rs` (new), BENCHMARKS, GAPS.
+- **Why.** The edit-and-merge harness (`crates/client/examples/merge_bench.rs`: a client's `edit` of its work, then
+  `submit` to the green's verdict, over the real rings to an in-process daemon, every answer checked against a model)
+  measured an accept on a green of 1,000 files of 4 KiB at 14 ms at the median, and the cost grew with the files the
+  green holds, not with the edit. `sample` named the work, in order: the merge record's head identity, a BLAKE3 of
+  every byte the green holds, made on every accept (113 of 120 submit samples at 1,000 files); then the work's whole
+  copy of the green, copied back into the work after every accept (64 of 88 samples at 10,000 files); then the
+  deriver's base, every path of the green cloned for every submit; and the retention settle's sum of every file's
+  length, twice per submit.
+- **What.**
+  - The merge record's identities (the head identity and the inputs' identity) are made only for a record that goes
+    to holders (§4.16 "Apply on holders"). At `f = 0` the owner is the only holder, the append is the commit, and no
+    one compares them: they had been made and dropped. This is the same code at every `f` (R8): the laptop's branch
+    already returned before the record was built, and only what that branch never read moved past it.
+  - A submit composes its journal over `Green::base_for(version, journal)`, the base restricted to the paths the
+    journal names and the hard links aimed at them. The deriver reads a base only by those paths (each of its reads
+    is a lookup or a membership test of a named path), so the document is the same; a generated oracle holds it
+    equal to the whole base's, refusals included, at every version of generated greens.
+  - The retention settle reads the green's running history and rejected-cache totals (`Green::retention_charge`).
+  - **A work is a delta over its base** (§4.16 "Role": an agent works on a clone; D-5: a clone shares what it did not
+    change). A work holds only the files it changed since its base version, each as its bytes or as removed; every
+    other file is the green's at that version, read from the green's history, which the reachable floor already
+    keeps for every work's base. An accept moves the base to the new version and clears the delta, so the reset is
+    O(1); a rebase keeps what differs from the head. A work is charged for what it holds (A-84's rule, unchanged):
+    a new or recovered work holds nothing, so its creation and its rebuild after a restart are charged nothing and
+    cannot be refused (the `merge.work_rebuild_refused` count is gone with the case); its first edit of a green's file
+    copies that file and is charged for it, and refused `BudgetExceeded` when the budget cannot hold it. A submit
+    secures no bound for the reset (A-84 secured the green's files). A work whose green is gone cannot read its base:
+    a file it did not change answers `UnknownBase`, as its submit does, and the files it changed stay readable.
+- **Measured** (adas-macbook-pro-2, macOS arm64, 18 cores, shared, load 5 to 9; release `merge_bench --quiet-only`,
+  1,000 samples a run, three runs a binary, binaries interleaved A B A B A B; total of edit and submit, p50; all
+  runs in BENCHMARKS): accept at 1,000 files 14.0, 14.8, 13.9 ms → 0.97, 0.93, 0.99 ms with the identity deferred →
+  0.55, 0.61, 0.55 ms with the restricted base; conflict at 10,000 files 9.6, 9.4, 8.9 ms → 0.17, 0.19, 0.19 ms;
+  with the work a delta, accept at 10,000 files 3.3, 5.2, 4.1 ms → 57, 58, 60 µs (p99 196, 180, 166 µs), and every
+  form's median 51 to 69 µs at 10, 1,000 and 10,000 files alike.
+- **Proven.** `crates/merge/tests/base_for.rs` (20,000 generated cases, the restricted base composes as the whole
+  one); `the_incremental_charge_equals_a_recount_after_every_step` in `crates/server/src/work_charge.rs` (a work's
+  charge equals a recount and its view equals a plain map after every step of a generated history over a green);
+  `a_works_edits_are_charged_and_refused_typed_when_the_budget_cannot_hold_them` (live daemon, the pressure hold);
+  every answer of the harness checked against its model.
+- **Owed.** At `f > 0` every accept still makes the head identity over every byte: an identity holders recompute
+  in O(changed) needs its own amendment first (a set hash over per-entry digests, LtHash, Lewi et al. 2019, IACR
+  ePrint 2019/227, kept byte-identical to a full recompute by an oracle). The rebase's restatement is whole (the
+  engine returns every file). `PathTable::intern` searches linearly, so composing one increment of n paths is O(n²).
+  The engine keeps each current file twice (its content map and its history).
 
 ### A-211 — A DAX ask is refused where no view could begin (accepted and built 2026-11-04)
 Applied in the same change to: §4.6 by reference, `docs/wip/shards/dax-protocol.md` ("Windows"), GAPS,
