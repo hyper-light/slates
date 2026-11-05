@@ -2597,3 +2597,7 @@ fn write_wide(field: &mut [u16], s: &str) {
 #[cfg(test)]
 #[path = "../tests/support/host.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests/support/transact.rs"]
+mod transact_bench;
