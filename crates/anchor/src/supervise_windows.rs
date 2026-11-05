@@ -96,7 +96,7 @@ pub(super) struct Hold {
   /// life; the holdings' own refusals are `held`'s.
   channel_refusals: u64,
   /// Which of those refusals the log has said, so that the log stays bounded while the count goes on.
-  logged: RefusalLog,
+  logged: RefusalLog<HandleRefusal>,
 }
 
 impl Hold {

@@ -174,6 +174,8 @@ pub struct Supervisor {
   /// Windows handles acknowledged into the anchor and handed only to its own successors (A-198).
   #[cfg(windows)]
   windows_handles: Option<windows::Hold>,
+  /// The hold refusals last written to the segment (`layout::SUP_HOLD_REFUSALS`), so a step writes only a change.
+  published_refusals: u64,
 }
 
 /// The device channel's two ends, what has been received over it, and the refusals counted.
@@ -184,6 +186,8 @@ struct DeviceHold {
   daemon_end: OwnedFd,
   held: crate::held::Held,
   refused: u64,
+  /// Which refusals the log has said, so that the log stays bounded while the count goes on (A-213).
+  logged: crate::handles::RefusalLog<crate::held::HoldRefusal>,
 }
 
 /// The most messages one drain applies per device the bound allows: a hold, its session and its release are
@@ -249,6 +253,7 @@ impl Supervisor {
       devices: None,
       #[cfg(windows)]
       windows_handles: None,
+      published_refusals: 0,
     })
   }
 
@@ -268,6 +273,7 @@ impl Supervisor {
       daemon_end,
       held: crate::held::Held::new(device_bound, connection_bound, copy_bound),
       refused: 0,
+      logged: crate::handles::RefusalLog::default(),
     });
     Ok(())
   }
@@ -312,6 +318,34 @@ impl Supervisor {
       .windows_handles
       .as_ref()
       .map_or(0, windows::Hold::refusals)
+  }
+
+  /// Every message the hold channel refused over the anchor's life: [`Supervisor::device_refusals`] on Unix,
+  /// `Supervisor::handle_refusals` on Windows. Each step publishes it in the segment (`layout::SUP_HOLD_REFUSALS`),
+  /// where the daemon's status reads it (A-213): the log says each distinct refusal once, so this count is where an
+  /// operator sees the rest.
+  #[cfg(unix)]
+  pub fn hold_refusals(&self) -> u64 {
+    self.device_refusals()
+  }
+
+  /// See the Unix arm: the Windows hold's refusals, the channel's and the holdings' own.
+  #[cfg(windows)]
+  pub fn hold_refusals(&self) -> u64 {
+    self.handle_refusals()
+  }
+
+  /// Writes [`Supervisor::hold_refusals`] to the segment when it moved since the last write. A segment whose
+  /// supervision block cannot be reached is left as it is; the next step tries again.
+  fn publish_hold_refusals(&mut self) {
+    let refusals = self.hold_refusals();
+    if refusals == self.published_refusals {
+      return;
+    }
+    if let Ok(supervision) = self.segment.supervision() {
+      supervision.record_hold_refusals(refusals);
+      self.published_refusals = refusals;
+    }
   }
 
   /// The anchor's end of the hold channel, to wait on: readable when a daemon sent a message, so the owner's loop
@@ -575,6 +609,7 @@ impl Supervisor {
     self.drain_devices();
     #[cfg(windows)]
     self.drain_handles();
+    self.publish_hold_refusals();
     if let Some(retry_at_ns) = self.retry_at_ns {
       if now_ns < retry_at_ns {
         return Ok(Step::BackingOff { retry_at_ns });
@@ -896,9 +931,14 @@ impl DeviceHold {
     self.held.bound()
   }
 
-  /// Counts `refusal` and says so on the anchor's log, once per refusal.
+  /// Counts every refusal, and says so on the anchor's log the first time each distinct refusal is met
+  /// ([`crate::handles::RefusalLog`]), as the Windows hold does, so a daemon sending garbage or a call the OS keeps
+  /// refusing cannot grow the log without bound (A-213). Before 2026-11-04 every refusal wrote a line: 20 bad device
+  /// messages logged 20 lines.
   fn refuse(&mut self, refusal: &crate::held::HoldRefusal) {
     self.refused = self.refused.saturating_add(1);
-    eprintln!("slates anchor: a hold message was refused: {refusal}");
+    if self.logged.first_sighting(refusal) {
+      eprintln!("slates anchor: a hold message was refused: {refusal}");
+    }
   }
 }

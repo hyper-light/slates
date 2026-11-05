@@ -1,5 +1,13 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **The anchor's hold refusals: a bounded Unix log, and a count in `slates status` (2026-11-04, A-213; siblings of
+> audit step 3).** The Unix device hold logged a line per refused message, unbounded; it now logs each distinct refusal
+> once (`RefusalLog`, as the Windows hold does) and counts every one. Every refusal on either platform's hold channel
+> is published in the segment's supervision block and reported by `slates status` as `anchor_hold_refusals`. adacachy,
+> 2026-11-04: 20 bad device messages gave 20 counted and 20 log lines before the change, 20 and 2 after; through a real
+> supervisor over the real `slates daemon`, `slates status` says `anchor_hold_refusals: 20`. CI run ids for Linux and
+> macOS: pending. Record: `docs/bugs/2026-11-04-the-unix-device-hold-logged-every-refusal.md`.
+
 > **WinFsp's hold release, DLL version and long paths fixed (2026-11-04, A-206; audit steps 4 and 6).** Run
 > [41978665514](https://github.com/hyper-light/slates/actions/runs/41978665514), `windows-latest` and `windows-11-arm`,
 > with WinFsp 2.1.25156 installed from its pinned URL and SHA-256. Each lane: the whole live suite 13 passed, 1 ignored.
