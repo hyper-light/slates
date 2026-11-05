@@ -492,7 +492,10 @@ fn main() {
   for (version, rates) in ["v3", "v4"].into_iter().zip(rates.iter()) {
     let best = rates.iter().copied().fold(0.0f64, f64::max);
     let all: Vec<String> = rates.iter().map(|rate| format!("{rate:.1}")).collect();
-    println!("nfs_large_write_best\t{version}\t{best:.1}\t{}", all.join(" "));
+    println!(
+      "nfs_large_write_best\t{version}\t{best:.1}\t{}",
+      all.join(" ")
+    );
   }
   drop(session);
   drop(client);
