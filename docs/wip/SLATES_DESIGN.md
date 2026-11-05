@@ -12860,8 +12860,8 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
 Applied in the same change to: §4.16 (status), A-84 (what a work keeps and when its charge can be refused),
 `crates/server/src/{work_files,work_charge,verbs,merge_service,listing,state,lib}.rs`, `crates/merge/src/{engine,
 increment}.rs`, `crates/merge/tests/base_for.rs` (new), `crates/server/tests/daemon.rs`, `crates/client/examples/
-merge_bench.rs` (new), `crates/client/tests/merge_identity.rs` (new), BENCHMARKS, GAPS.
-- **Why.** The edit-and-merge harness (`crates/client/examples/merge_bench.rs`: a client's `edit` of its work, then
+edit_merge_bench.rs` (its verdict forms), `crates/client/tests/merge_identity.rs` (new), BENCHMARKS, GAPS.
+- **Why.** The edit-and-merge harness (`crates/client/examples/edit_merge_bench.rs`: a client's `edit` of its work, then
   `submit` to the green's verdict, over the real rings to an in-process daemon, every answer checked against a model)
   measured an accept on a green of 1,000 files of 4 KiB at 14 ms at the median, and the cost grew with the files the
   green holds, not with the edit. `sample` named the work, in order: the merge record's head identity, a BLAKE3 of
@@ -12889,7 +12889,7 @@ merge_bench.rs` (new), `crates/client/tests/merge_identity.rs` (new), BENCHMARKS
     copies that file and is charged for it, and refused `BudgetExceeded` when the budget cannot hold it. A submit
     secures no bound for the reset (A-84 secured the green's files). A work whose green is gone cannot read its base:
     a file it did not change answers `UnknownBase`, as its submit does, and the files it changed stay readable.
-- **Measured** (adas-macbook-pro-2, macOS arm64, 18 cores, shared, load 5 to 9; release `merge_bench --quiet-only`,
+- **Measured** (adas-macbook-pro-2, macOS arm64, 18 cores, shared, load 5 to 9; release harness `--quiet-only` (then `merge_bench`),
   1,000 samples a run, three runs a binary, binaries interleaved A B A B A B; total of edit and submit, p50; all
   runs in BENCHMARKS): accept at 1,000 files 14.0, 14.8, 13.9 ms → 0.97, 0.93, 0.99 ms with the identity deferred →
   0.55, 0.61, 0.55 ms with the restricted base; conflict at 10,000 files 9.6, 9.4, 8.9 ms → 0.17, 0.19, 0.19 ms;
@@ -12899,11 +12899,21 @@ merge_bench.rs` (new), `crates/client/tests/merge_identity.rs` (new), BENCHMARKS
   one); `the_incremental_charge_equals_a_recount_after_every_step` in `crates/server/src/work_charge.rs` (a work's
   charge equals a recount and its view equals a plain map after every step of a generated history over a green);
   `a_works_edits_are_charged_and_refused_typed_when_the_budget_cannot_hold_them` (live daemon, the pressure hold);
-  every answer of the harness checked against its model.
+  every answer of the harness checked against its model. Adversarial: `crates/client/tests/merge_chaos.rs` (eight
+  clients race overwrites of four blocks of three files; every accept and conflict judged against the rule, every
+  version read back; 355 accepts and 125 conflicts in one run; red with the work's base copy removed) and
+  `crates/cli/tests/merge_kill.rs` (a real anchor and daemon, the daemon `SIGKILL`ed six times as submits leave the
+  client; every version told to exactly one submit and read back; 200 rounds, 6 crossing a restart, 0 errors, on
+  adas-macbook-pro-2 2026-11-05 with `SLATES_TEST_CLI=1`; red with the accepted version's durable append removed,
+  where the successor's chain was empty and versions 1 to 20 had each been told six times).
 - **Owed.** At `f > 0` every accept still makes the head identity over every byte: an identity holders recompute
   in O(changed) needs its own amendment first (a set hash over per-entry digests, LtHash, Lewi et al. 2019, IACR
   ePrint 2019/227, kept byte-identical to a full recompute by an oracle). The rebase's restatement is whole (the
   engine returns every file). `PathTable::intern` searches linearly, so composing one increment of n paths is O(n²).
+  The engine keeps each current file twice (its content map and its history). The growth forms of
+  `edit_merge_bench` (the clients agent's, folded into one harness with these forms) no longer grow: the last hundred
+  of a thousand new-file merges' medians 6.8 to 22.5 µs at load 23 to 25, against 529 to 684 µs before.
+
   The engine keeps each current file twice (its content map and its history).
 
 ### A-211 — A DAX ask is refused where no view could begin (accepted and built 2026-11-04)

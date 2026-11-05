@@ -5,7 +5,7 @@
 > the retry cache with the first work's version, even where the green had since changed that range: a conflict reported
 > as an accept. The identity now names the work and the base as §4.16's data model says. Failing first, passing after:
 > `crates/client/tests/merge_identity.rs`. Record: `docs/bugs/2026-11-04-the-same-edit-from-two-works-was-one-increment.md`.
-> Found by the edit-and-merge latency harness's oracle (`crates/client/examples/merge_bench.rs`).
+> Found by the edit-and-merge latency harness's oracle (`crates/client/examples/edit_merge_bench.rs`).
 >
 > **Merge: a full edit and merge is 51–69 µs at the median whatever the green holds (A-220, 2026-11-04, agents/perf).**
 > A submit's cost had followed the green's size: 14 ms at 1,000 files of 4 KiB. The merge record's identities are now
@@ -14,7 +14,8 @@
 > p99 0.15–0.36 ms at 10, 1,000 and 10,000 files, every form, but for one run's 1.81 ms (conflict, 10,000 files; BENCHMARKS, "A full edit and merge"). Racing clients'
 > verdicts are judged against the rule (`crates/client/tests/merge_chaos.rs`). **Open:** quiet and CI numbers; 100,000
 > files; the preferred 50 µs (the fixed cost of the two round trips); the two-machine path (fs-server); at `f > 0` the
-> head identity is still O(green) per accept; a daemon killed mid-merge is not yet tested; the rebase restates whole.
+> head identity is still O(green) per accept; the rebase restates whole. A daemon `SIGKILL`ed six times mid-merge
+> loses no told version and tells none twice (`crates/cli/tests/merge_kill.rs`, red with the durable append removed).
 >
 
 > **The anchor's hold refusals: a bounded Unix log, and a count in `slates status` (2026-11-04, A-213; siblings of
@@ -103,7 +104,10 @@
 > unchanged code and 200 with the close removed (`crates/mem/tests/held_section.rs`); the adoption now maps first anyway.
 > Numbers and CI runs: BENCHMARKS, "What a write costs on pages given back on Windows".
 
-> **A merge's cost grows with its green's file count (2026-11-05, RQ-4, §4.16; OPEN, perf's).** The new
+> **Fixed 2026-11-05 (A-220, agents/perf):** a submit no longer clones, walks or hashes the whole green; every verdict
+> form's median is 51–69 µs at 10 to 10,000 files (BENCHMARKS, "A full edit and merge"). The record below stays as found.
+>
+> **A merge's cost grows with its green's file count (2026-11-05, RQ-4, §4.16; found open).** The new
 > `crates/client/examples/edit_merge_bench.rs` measures, on macOS arm64 at load 9, an accepted submit's median at
 > 25–161 µs over a green's first hundred versions and 529–684 µs over its last hundred (six runs). Each version adds a
 > file. One file replaced 1,000 times shows no growth, and an edit shows none in either form. Every submit clones
