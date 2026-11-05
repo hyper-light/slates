@@ -12973,6 +12973,39 @@ Status: built 2026-11-04. It closes the Windows owed items of A-105, A-110 and A
   and by 200 with that close removed (`crates/mem/tests/held_section.rs`). The adoption now maps first and takes
   ownership only of a view that exists, so `view` no longer closes what it was lent.
 
+### A-212 — What a live WinFsp receive reads and clears, and what a rename visits (2026-11-05)
+
+A-198's receiver replaced WinFsp's DLL dispatcher with no benchmark. Measured against it (`docs/wip/BENCHMARKS.md`, "The
+WinFsp receiver against the DLL dispatcher"), every call that reached the daemon cost more: on arm64 a stat 2.55×, a
+rename 2.90×, an fsync 1.74× at the quiet p50, the arms' five runs not overlapping. Each phase of a request was timed on
+both architectures (diagnostics runs 41977769822). The cause was neither the ledger nor the shard hop, whose medians sit
+within a few microseconds of the old arm's; it was two things A-198's first form did that its crash rules do not need:
+
+- **Every live receive read and cleared the whole buffer.** The batch parser checked each byte of the 64 KiB tail, 26.4 µs
+  at the p50 on arm64 and 50.1 µs on x86_64, per receive. The driver reports how many bytes it wrote, and everything past
+  them was zeroed before the receive began. So a live receive reads only the reported bytes. **Recovery still checks the
+  whole buffer**: it knows no count, and it is what the tail's rule protects. Clearing follows the same reasoning: an
+  owner's first receive clears the whole buffer, since a predecessor may have died part-way; afterwards only the bytes the
+  last batch filled are cleared, so the whole-buffer check still finds zeros after a crash. Of the saved response only the
+  header is cleared: its state word says whether a body exists, and no reader passes a body's own length.
+- **Every rename visited every live open.** Before the kernel may rename its node, each open's held name is updated, one
+  per shard turn: 741,896 turns over 7,000 renames on arm64, about 106 each, for opens under other names that a rename
+  cannot change. `OpenNames` now also keeps its names in order, so the first open at or beneath a path is found without a
+  walk and no constant bounds a scan. Updating an open moves it out from beneath the old path, so the next turn finds the
+  next, and a repeat after a crash finds what is left. A rename of one file takes one turn for its open and one to learn
+  it is done, however many opens the mount holds. A rename onto itself moves nothing and returns at once.
+
+Each worker also reuses one completion event: control transactions run one at a time, and creating and closing an event
+for each cost 0.9 µs at the p50 twice a request.
+
+**Not changed: a response and the next receive stay two calls.** The DLL carried both in one call. A-198 keeps them apart
+so that captured requests settle before any new receive, which is what stops a reused IRP address naming another
+processing request after a death. The separate response call costs 10.9 µs at the p50 on arm64 and 12.5 µs on x86_64;
+removing it means changing that crash rule, which this amendment does not do.
+
+Applied in the same change to: GAPS (the audit entry's unmeasured-receiver item); `crates/bridge-winfsp/src/dispatcher.rs`,
+`inflight/capture.rs`, `purge_intents.rs`, `notify.rs` and `host.rs`.
+
 ### A-198 — A WinFsp mount outlives its daemon: the anchor holds the volume's control handle, the drive's link and the mount's ledger, and the next daemon serves the held volume (accepted 2026-11-01, Step 9 of the VFS and DAX plan; built and measured 2026-11-02)
 Applied in the same change to: GAPS (gap 2 of the platform inventory). The build applies it to §4.6 "Windows",
 `docs/wip/platforms.md`, `crates/anchor`, `crates/server` and `crates/bridge-winfsp`, each in its own change.

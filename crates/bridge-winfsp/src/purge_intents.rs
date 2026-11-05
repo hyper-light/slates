@@ -6,9 +6,9 @@
 
 use crate::host::WinFspError;
 use crate::purge::Purge;
-use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
-use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Threading::{
   CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects,
 };
@@ -26,17 +26,26 @@ pub(crate) struct Sender {
 pub(crate) struct Intents {
   messages: Receiver<Option<Purge>>,
   event: OwnedHandle,
+  /// The one completion event of this receiver's control transactions, which run one at a time. Every transaction
+  /// names it in its OVERLAPPED, and the system clears it as each begins, so none makes its own (A-212).
+  completed: OwnedHandle,
   current: Option<Purge>,
 }
 
-pub(crate) fn channel() -> Result<(Sender, Intents), WinFspError> {
-  // SAFETY: a new unnamed auto-reset event, initially unsignalled; no borrowed descriptor or name.
-  let raw = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+/// A new unnamed event, initially unsignalled, its reset automatic or by hand as `manual_reset` says.
+fn new_event(manual_reset: i32, call: &'static str) -> Result<OwnedHandle, WinFspError> {
+  // SAFETY: no borrowed descriptor or name; the flags are plain values.
+  let raw = unsafe { CreateEventW(std::ptr::null(), manual_reset, 0, std::ptr::null()) };
   if raw.is_null() {
-    return Err(os_error("create private-intent event"));
+    return Err(os_error(call));
   }
   // SAFETY: the successful call returned this one newly owned handle.
-  let event = unsafe { OwnedHandle::from_raw_handle(raw) };
+  Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
+}
+
+pub(crate) fn channel() -> Result<(Sender, Intents), WinFspError> {
+  let event = new_event(0, "create private-intent event")?;
+  let completed = new_event(1, "create transaction completion event")?;
   let producer = event
     .as_handle()
     .try_clone_to_owned()
@@ -53,6 +62,7 @@ pub(crate) fn channel() -> Result<(Sender, Intents), WinFspError> {
     Intents {
       messages,
       event,
+      completed,
       current: None,
     },
   ))
@@ -106,10 +116,16 @@ impl Intents {
     Ok(received)
   }
 
-  /// Waits for the caller's control event while servicing private intents. The caller must still settle its I/O
-  /// before returning on an error here: this method owns neither its OVERLAPPED nor its borrowed kernel buffers.
-  pub(crate) fn wait(&mut self, completed: BorrowedHandle<'_>) -> Result<(), WinFspError> {
-    let events = [completed.as_raw_handle(), self.event.as_raw_handle()];
+  /// The event a control transaction names in its OVERLAPPED. It stays valid as long as this value, which outlives
+  /// every transaction: the worker owns both and settles each before the next.
+  pub(crate) fn completion_event(&self) -> HANDLE {
+    self.completed.as_raw_handle()
+  }
+
+  /// Waits for the control transaction's completion event while servicing private intents. The caller must still settle
+  /// its I/O before returning on an error here: this method owns neither its OVERLAPPED nor its borrowed kernel buffers.
+  pub(crate) fn wait(&mut self) -> Result<(), WinFspError> {
+    let events = [self.completed.as_raw_handle(), self.event.as_raw_handle()];
     let count = u32::try_from(events.len()).map_err(|_| WinFspError::MountThread)?;
     loop {
       // SAFETY: both handles remain owned throughout this wait; these are events, not abandoned mutex objects.
