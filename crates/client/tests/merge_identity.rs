@@ -13,7 +13,7 @@
 
 use std::time::{Duration, Instant};
 
-use slates_client::{Client, ClientError, Deadlines, ReadAt, Submitted};
+use slates_client::{Client, ClientError, Deadlines, ReadAt, Submitted, VolumeId};
 use slates_machine::{MachineProfile, ProfileOptions};
 use slates_server::daemon::LIVENESS_BUDGET_NS;
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
@@ -43,7 +43,8 @@ fn start(tag: &str) -> (Daemon, Client) {
   )
   .unwrap();
   daemon.bootstrap(true).unwrap();
-  let deadlines = Deadlines::derive(LIVENESS_BUDGET_NS, slates_db::replay::RECOVERY_BUDGET_NS).get();
+  let deadlines =
+    Deadlines::derive(LIVENESS_BUDGET_NS, slates_db::replay::RECOVERY_BUDGET_NS).get();
   let started = Instant::now();
   let client = loop {
     match Client::connect(&instance, deadlines) {
@@ -68,12 +69,20 @@ fn start(tag: &str) -> (Daemon, Client) {
 #[test]
 fn the_same_edit_from_two_works_is_two_increments() {
   let (daemon, mut client) = start("same-edit");
+  let (green, late) = a_green_at_three_and_a_late_work(&mut client);
+  the_late_copy_of_the_first_edit_conflicts(&mut client, green, late);
+  the_heads_own_bytes_accept_at_a_version_of_their_own(&mut client, green);
+  daemon.stop();
+}
+
+/// A green at version 3: seeded `aaaaaaaa` at 1; `first` (based on 1) wrote `XXXX` over `f[0..4)` at 2; `third`
+/// (based on 2) wrote `ZZZZ` there at 3. Returns the green and `late`, a work also based on 1.
+fn a_green_at_three_and_a_late_work(client: &mut Client) -> (VolumeId, VolumeId) {
   let green = client.create_green("g", false).unwrap();
   let (seed, _) = client.create_work(green, "seed").unwrap();
   client.edit(seed, "f", 0, 0, b"aaaaaaaa").unwrap();
   assert_eq!(client.submit(seed).unwrap(), Submitted::Accepted(1));
-  let (first, base) = client.create_work(green, "first").unwrap();
-  assert_eq!(base, 1);
+  let (first, _) = client.create_work(green, "first").unwrap();
   let (late, base) = client.create_work(green, "late").unwrap();
   assert_eq!(base, 1);
   client.edit(first, "f", 0, 4, b"XXXX").unwrap();
@@ -82,7 +91,12 @@ fn the_same_edit_from_two_works_is_two_increments() {
   assert_eq!(base, 2);
   client.edit(third, "f", 0, 4, b"ZZZZ").unwrap();
   assert_eq!(client.submit(third).unwrap(), Submitted::Accepted(3));
-  // `late` writes exactly what `first` wrote, from the same base: the same ops document and post-state.
+  (green, late)
+}
+
+/// `late` writes exactly what `first` wrote, from the same base (the same ops document and post-state): it is judged,
+/// a conflict on the range the third work changed, and the head keeps the third work's bytes.
+fn the_late_copy_of_the_first_edit_conflicts(client: &mut Client, green: VolumeId, late: VolumeId) {
   client.edit(late, "f", 0, 4, b"XXXX").unwrap();
   match client.submit(late).unwrap() {
     Submitted::Conflict(windows) => assert!(
@@ -96,9 +110,11 @@ fn the_same_edit_from_two_works_is_two_increments() {
     b"ZZZZaaaa".to_vec()
   );
   assert_eq!(client.versions(green).unwrap(), 3);
-  // Identical: `again` is based on 3 and writes the head's own bytes there; and a work based on 1
-  // writing `first`'s bytes over a range nobody else touched since is judged too, never answered as
-  // `first`'s retry.
+}
+
+/// `again`, based on 3, writes the head's own bytes there (the third work's ops document and post-state): an
+/// identical accept at a version of its own, 4, not the third work's 3.
+fn the_heads_own_bytes_accept_at_a_version_of_their_own(client: &mut Client, green: VolumeId) {
   let (again, base) = client.create_work(green, "again").unwrap();
   assert_eq!(base, 3);
   client.edit(again, "f", 0, 4, b"ZZZZ").unwrap();
@@ -107,5 +123,4 @@ fn the_same_edit_from_two_works_is_two_increments() {
     client.read(green, "f", ReadAt::Head).unwrap(),
     b"ZZZZaaaa".to_vec()
   );
-  daemon.stop();
 }

@@ -54,9 +54,14 @@ const SAMPLES: usize = 1_000;
 const EDIT_BYTES: usize = 64;
 /// Shape: each green file's length: a small source file, room for two disjoint edit ranges.
 const FILE_BYTES: usize = 4_096;
-/// Shape: the green shapes measured, as file counts: a single file, and a repository of small files
-/// (the submit's cost may scale with what the green holds, which this pair exposes).
-const GREEN_FILES: &[usize] = &[1, 1_024];
+/// Shape: the green shapes measured, as file counts, a decade apart from a handful of files to a large
+/// repository (§4.16's worked example is a 300k-file repository): a submit's cost must not follow them.
+const GREEN_FILES: &[usize] = &[10, 1_000, 10_000, 100_000];
+/// Shape: the wall time one run of one form may take before it stops sampling (at least [`MIN_SAMPLES`]),
+/// so a shape whose merge is slow still finishes and prints its numbers with their sample count.
+const RUN_BUDGET: Duration = Duration::from_secs(20);
+/// Shape: the fewest samples a run takes whatever its budget: enough that its p99 is a sample, not the max.
+const MIN_SAMPLES: usize = 200;
 /// Shape: Ada's preferred bound for a full edit and merge (2026-11-04).
 const GOAL_PREFERRED_NS: u64 = 50_000;
 /// Shape: Ada's required bound for a full edit and merge (2026-11-04).
@@ -191,7 +196,9 @@ impl Fixture {
     }
     match client.submit(seed).unwrap() {
       Submitted::Accepted(1) => {}
-      other => wrong(&format!("the seed submit answered {other:?}, not Accepted(1)")),
+      other => wrong(&format!(
+        "the seed submit answered {other:?}, not Accepted(1)"
+      )),
     }
     client.destroy(seed).unwrap();
     let (leader, _) = client.create_work(green, &format!("{tag}-w0")).unwrap();
@@ -225,7 +232,10 @@ impl Fixture {
   /// of `path`, and the follower's base now lags the head by it.
   fn lead(&mut self, path: &str, bytes: &[u8]) {
     let leader = self.leader;
-    self.client.edit(leader, path, 0, EDIT_BYTES as u64, bytes).unwrap();
+    self
+      .client
+      .edit(leader, path, 0, EDIT_BYTES as u64, bytes)
+      .unwrap();
     let answer = self.client.submit(leader).unwrap();
     self.expect_accept(answer, "the leader's edit");
     self.model_overwrite(path, 0, bytes);
@@ -235,7 +245,9 @@ impl Fixture {
     let wanted = self.head + 1;
     match answer {
       Submitted::Accepted(version) if version == wanted => self.head = version,
-      other => wrong(&format!("{what} answered {other:?}, not Accepted({wanted})")),
+      other => wrong(&format!(
+        "{what} answered {other:?}, not Accepted({wanted})"
+      )),
     }
   }
 
@@ -244,7 +256,10 @@ impl Fixture {
   fn check(&mut self, path: &str) {
     let head = self.client.versions(self.green).unwrap();
     if head != self.head {
-      wrong(&format!("the green's head is {head}, the model's {}", self.head));
+      wrong(&format!(
+        "the green's head is {head}, the model's {}",
+        self.head
+      ));
     }
     let read = self.client.read(self.green, path, ReadAt::Head).unwrap();
     if Some(&read) != self.model.get(path) {
@@ -259,7 +274,10 @@ impl Fixture {
     let name = format!("{}-w{}", self.tag, self.made);
     let (follower, base) = self.client.create_work(self.green, &name).unwrap();
     if base != self.head {
-      wrong(&format!("a new work is based on {base}, the head is {}", self.head));
+      wrong(&format!(
+        "a new work is based on {base}, the head is {}",
+        self.head
+      ));
     }
     self.follower = follower;
   }
@@ -272,7 +290,10 @@ impl Fixture {
         let bytes = fresh_bytes(self.next_stamp());
         let leader = self.leader;
         let started = Instant::now();
-        self.client.edit(leader, &path, 0, EDIT_BYTES as u64, &bytes).unwrap();
+        self
+          .client
+          .edit(leader, &path, 0, EDIT_BYTES as u64, &bytes)
+          .unwrap();
         let edited = Instant::now();
         let answer = self.client.submit(leader).unwrap();
         let done = Instant::now();
@@ -310,7 +331,10 @@ impl Fixture {
         self.lead(&path, &lead);
         let follower = self.follower;
         let started = Instant::now();
-        self.client.edit(follower, &path, 0, EDIT_BYTES as u64, &lead).unwrap();
+        self
+          .client
+          .edit(follower, &path, 0, EDIT_BYTES as u64, &lead)
+          .unwrap();
         let edited = Instant::now();
         let answer = self.client.submit(follower).unwrap();
         let done = Instant::now();
@@ -328,7 +352,10 @@ impl Fixture {
         let bytes = fresh_bytes(self.next_stamp());
         let follower = self.follower;
         let started = Instant::now();
-        self.client.edit(follower, &path, 0, EDIT_BYTES as u64, &bytes).unwrap();
+        self
+          .client
+          .edit(follower, &path, 0, EDIT_BYTES as u64, &bytes)
+          .unwrap();
         let edited = Instant::now();
         let answer = self.client.submit(follower).unwrap();
         let done = Instant::now();
@@ -377,12 +404,20 @@ fn measure(instance: &str, form: Form, files: usize, load: &str) -> BTreeMap<Str
     let mut edits = Vec::with_capacity(SAMPLES);
     let mut submits = Vec::with_capacity(SAMPLES);
     let mut totals = Vec::with_capacity(SAMPLES);
+    let started = Instant::now();
     for n in 0..SAMPLES {
+      if n >= MIN_SAMPLES && started.elapsed() > RUN_BUDGET {
+        break;
+      }
       let sample = fixture.sample(form, n % files);
       edits.push(sample.edit);
       submits.push(sample.submit);
       totals.push(sample.edit.saturating_add(sample.submit));
     }
+    rows
+      .entry("samples".to_owned())
+      .or_default()
+      .push(u64::try_from(totals.len()).unwrap_or(u64::MAX));
     for (part, samples) in [("edit", edits), ("submit", submits), ("total", totals)] {
       for (pct, value) in percentiles(samples) {
         rows.entry(format!("{part}_{pct}")).or_default().push(value);
@@ -399,7 +434,11 @@ fn print_rows(key: &str, rows: &BTreeMap<String, Vec<u64>>) {
   for (name, values) in rows {
     let mut sorted = values.clone();
     sorted.sort_unstable();
-    let (lower, median, upper) = (sorted[0], sorted[sorted.len() / 2], sorted[sorted.len() - 1]);
+    let (lower, median, upper) = (
+      sorted[0],
+      sorted[sorted.len() / 2],
+      sorted[sorted.len() - 1],
+    );
     println!("ratchet-info\tmerge.{key}_{name}\t{lower}\t{median}\t{upper}\t{values:?}");
   }
 }
@@ -410,10 +449,58 @@ fn median_of(rows: &BTreeMap<String, Vec<u64>>, name: &str) -> u64 {
   sorted[sorted.len() / 2]
 }
 
-/// Runs every form over every shape, under `load`.
-fn sweep(instance: &str, load: &str) {
-  for files in GREEN_FILES {
-    for form in Form::ALL {
+/// What the command line selects: the shapes and forms to run, and whether to run the loaded sweep.
+struct Selection {
+  shapes: Vec<usize>,
+  forms: Vec<Form>,
+  loaded: bool,
+}
+
+impl Selection {
+  /// `--quiet-only`, `--files N` (repeatable; the shapes instead of [`GREEN_FILES`]) and `--form NAME`
+  /// (repeatable; `accept`, `ranged`, `identical`, `conflict`): a profile run selects one form on one shape.
+  fn parse() -> Selection {
+    let mut selection = Selection {
+      shapes: Vec::new(),
+      forms: Vec::new(),
+      loaded: true,
+    };
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+      match arg.as_str() {
+        "--quiet-only" => selection.loaded = false,
+        "--files" => selection.shapes.push(
+          args
+            .next()
+            .and_then(|n| n.parse().ok())
+            .expect("--files takes a count"),
+        ),
+        "--form" => {
+          let name = args.next().expect("--form takes a name");
+          selection.forms.push(
+            Form::ALL
+              .into_iter()
+              .find(|form| form.key() == name)
+              .expect("--form is accept, ranged, identical or conflict"),
+          );
+        }
+        other => panic!("unknown argument {other}"),
+      }
+    }
+    if selection.shapes.is_empty() {
+      selection.shapes = GREEN_FILES.to_vec();
+    }
+    if selection.forms.is_empty() {
+      selection.forms = Form::ALL.to_vec();
+    }
+    selection
+  }
+}
+
+/// Runs every selected form over every selected shape, under `load`.
+fn sweep(instance: &str, load: &str, selection: &Selection) {
+  for files in &selection.shapes {
+    for form in selection.forms.iter().copied() {
       let rows = measure(instance, form, *files, load);
       let key = format!("{}_f{files}_{load}", form.key());
       print_rows(&key, &rows);
@@ -426,7 +513,8 @@ fn sweep(instance: &str, load: &str) {
         "OVER the required 1 ms"
       };
       println!(
-        "goal\tmerge.{key}: total p50 {} ns, p99 {p99} ns, p999 {} ns, max {} ns: {verdict}",
+        "goal\tmerge.{key}: {:?} samples, total p50 {} ns, p99 {p99} ns, p999 {} ns, max {} ns: {verdict}",
+        rows["samples"],
         median_of(&rows, "total_p50"),
         median_of(&rows, "total_p999"),
         median_of(&rows, "total_max"),
@@ -460,9 +548,9 @@ fn main() {
   println!(
     "merge bench: {shards} shards, {cores} cores, {SAMPLES} samples x {RUNS} runs, edits of {EDIT_BYTES} B in files of {FILE_BYTES} B"
   );
-  let only_quiet = std::env::args().any(|arg| arg == "--quiet-only");
-  sweep(&instance, "quiet");
-  if !only_quiet {
+  let selection = Selection::parse();
+  sweep(&instance, "quiet", &selection);
+  if selection.loaded {
     // The loaded form: one spinning thread per core this process can run, owned and joined here.
     let stop = AtomicBool::new(false);
     std::thread::scope(|scope| {
@@ -473,7 +561,7 @@ fn main() {
           }
         });
       }
-      sweep(&instance, "loaded");
+      sweep(&instance, "loaded", &selection);
       stop.store(true, Ordering::Relaxed);
     });
   }

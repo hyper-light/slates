@@ -5,8 +5,16 @@
 > the retry cache with the first work's version, even where the green had since changed that range: a conflict reported
 > as an accept. The identity now names the work and the base as §4.16's data model says. Failing first, passing after:
 > `crates/client/tests/merge_identity.rs`. Record: `docs/bugs/2026-11-04-the-same-edit-from-two-works-was-one-increment.md`.
-> Found by the edit-and-merge latency harness's oracle (`crates/client/examples/merge_bench.rs`), whose numbers are owed
-> to BENCHMARKS.
+> Found by the edit-and-merge latency harness's oracle (`crates/client/examples/merge_bench.rs`).
+>
+> **Merge: a full edit and merge is 51–69 µs at the median whatever the green holds (A-220, 2026-11-04, agents/perf).**
+> A submit's cost had followed the green's size: 14 ms at 1,000 files of 4 KiB. The merge record's identities are now
+> made only for a record that goes to holders, the deriver composes over the base restricted to the journal's paths,
+> and a work holds only the files it changed since its base. Loaded Mac (load 5–11, informational): p50 51–69 µs and
+> p99 0.15–0.36 ms at 10, 1,000 and 10,000 files, every form, but for one run's 1.81 ms (conflict, 10,000 files; BENCHMARKS, "A full edit and merge"). Racing clients'
+> verdicts are judged against the rule (`crates/client/tests/merge_chaos.rs`). **Open:** quiet and CI numbers; 100,000
+> files; the preferred 50 µs (the fixed cost of the two round trips); the two-machine path (fs-server); at `f > 0` the
+> head identity is still O(green) per accept; a daemon killed mid-merge is not yet tested; the rebase restates whole.
 >
 
 > **The anchor's hold refusals: a bounded Unix log, and a count in `slates status` (2026-11-04, A-213; siblings of
