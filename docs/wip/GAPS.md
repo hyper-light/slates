@@ -14,11 +14,18 @@
 > nothing delivered (`src/sys/driver.h:954–955`, `src/sys/ioq.c:617`, `volume.c:1181–1185`). Under A-215 that is an
 > undelivered hand-off, already proven safe, provided the receiver reads the cancellation as "nothing delivered".
 
-> **The WinFsp receiver's response rides its next receive (2026-11-05, A-215; audit step 7).** A batch's last response
-> is sent by the call that receives the next batch, into the journal's second buffer. A request found there after a
-> death proves the driver consumed that response (WinFsp v2.1 source, `docs/wip/research/winfsp-takeover.md`). Model
-> oracle: 7,483 crash scenarios, 0 lost, 0 wrong; red without each recovery rule. **Owed:** the live kill oracle on
-> both Windows lanes and the interleaved A/B against the DLL dispatcher, both on diagnostics branches.
+> **The WinFsp receiver's response rides its next receive (2026-11-05, A-215; audit step 7). Crash-safe, proven; the
+> receiver is still slower than the DLL dispatcher.** A batch's last response is sent by the call that receives the next
+> batch, into the journal's second buffer, and its open is confirmed while that call waits. A request found there after a
+> death proves the driver consumed that response (WinFsp v2.1 source, `docs/wip/research/winfsp-takeover.md`).
+> - **Proof:** the model oracle loses 0 and answers 0 wrongly over 8,373 crash scenarios, and turns red without each
+>   recovery rule. The live oracle loses 0 and answers 0 wrongly over 40 kills a lane, 6 and 11 of them inside a combined
+>   call (run 42065967137).
+> - **Still open, audit step 7:** against the DLL dispatcher the receiver stays worse beyond the spread at the p50: on
+>   arm64, quiet stat 1.44×, rename 1.24× and loaded write 1.74×; on x86_64, quiet close 1.15× and unlink 1.20×, and
+>   1.04–1.18× on eight of nine calls loaded. A-215 alone moved the p50 by −34% to +5% against A-212: better on arm64,
+>   2–5% worse on x86_64 (BENCHMARKS, "The WinFsp receiver with A-215"). The separate response call was not the cause;
+>   the gap left is in the calls that open and close files, A-212's Open and Release hops, owned by winfsp-bench.
 
 
 
