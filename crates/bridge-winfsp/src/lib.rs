@@ -40,6 +40,7 @@ use slates_vfs::inode::Kind;
 // it cross-lints on the Windows target from any host, and the live mount runs on the Windows runner.
 #[cfg(windows)]
 mod ffi;
+pub(crate) mod phase;
 #[cfg(windows)]
 pub mod host;
 // What a mount tells Windows of another path's change: the names Windows holds open and the notification records

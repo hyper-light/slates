@@ -169,7 +169,7 @@ struct OpenFile {
 
 /// One operation the owner shard runs on the volume, with the parameters marshalled from a WinFsp callback. Paths
 /// arrive as Rust `String`s (converted from WinFsp's UTF-16), so the whole `Op` crosses the channel.
-enum Op {
+pub(crate) enum Op {
   VolumeInfo,
   /// Resolve a path to an object and its attributes (`GetSecurityByName`), or report it missing.
   Resolve {
@@ -295,6 +295,14 @@ impl Request {
   /// mount's notifications name ([`crate::notify`]) — in step with its opens, closes and renames. The reply is not sent
   /// yet: the caller publishes first when [`Served::needs_barrier`] says so.
   pub fn serve(self, bridge: &mut dyn Bridge, cx: &OpContext, names: &mut OpenNames) -> Served {
+    let serve_started = std::time::Instant::now();
+    let serve_name = crate::phase::op_name(&self.op);
+    let served = self.serve_inner(bridge, cx, names);
+    crate::phase::note(serve_name, 2, serve_started);
+    served
+  }
+
+  fn serve_inner(self, bridge: &mut dyn Bridge, cx: &OpContext, names: &mut OpenNames) -> Served {
     let barrier = self.op.needs_barrier();
     let echo = matches!(self.op, Op::PurgeEcho { .. });
     let opened = match &self.op {
@@ -631,6 +639,14 @@ impl Handler {
   /// Sends `op` to the mount's task, wakes it, and blocks this dispatcher thread for its reply; a closed channel (the
   /// mount is being torn down) is `STATUS_UNSUCCESSFUL`, never a hang.
   fn call(&self, op: Op) -> Reply {
+    let hop_started = std::time::Instant::now();
+    let hop_name = crate::phase::op_name(&op);
+    let answered = self.call_inner(op);
+    crate::phase::note(hop_name, 1, hop_started);
+    answered
+  }
+
+  fn call_inner(&self, op: Op) -> Reply {
     let (reply, answer) = sync_channel(1);
     if self.requests.send(Request { op, reply }).is_err() {
       return Reply::Err(crate::status_unsuccessful());
@@ -1646,6 +1662,7 @@ impl Drop for Mounted {
     // which the mount's owner does before it stops the thread.
     unsafe {
       (self.api.stop_dispatcher)(self.file_system);
+      crate::phase::dump();
       (self.api.remove_mount_point)(self.file_system);
       (self.api.delete)(self.file_system);
     }
