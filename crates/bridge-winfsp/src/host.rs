@@ -98,8 +98,8 @@ pub enum WinFspError {
   Ledger(crate::opens::Refusal),
   /// The retained direct-output receive journal was malformed or could not be settled.
   Capture(crate::inflight::Refusal),
-  /// The loaded DLL is not the version this host's receiver was written from (`crate::dll_version`).
-  UnsupportedDll(crate::dll_version::UnsupportedVersion),
+  /// The loaded DLL exposes a future public filesystem format this operation table cannot serve.
+  UnsupportedAbi(u16),
   /// A Windows object operation refused, preserving its system error code.
   Os {
     /// The Windows object operation.
@@ -122,25 +122,12 @@ impl std::fmt::Display for WinFspError {
       Self::Record(reason) => write!(f, "the held mount record was refused: {reason:?}"),
       Self::Ledger(reason) => write!(f, "{reason}"),
       Self::Capture(reason) => write!(f, "{reason}"),
-      Self::UnsupportedDll(refusal) => write!(f, "{refusal}"),
+      Self::UnsupportedAbi(version) => {
+        write!(f, "WinFsp filesystem format {version} is unsupported")
+      }
       Self::Os { call, code } => write!(f, "{call} refused: {code:?}"),
     }
   }
-}
-
-/// Refuses a DLL other than the version the receiver was written from, before anything touches its layout
-/// (`crate::dll_version`). `FspVersion` itself takes no file system.
-fn checked_dll(api: &ffi::Api) -> Result<(), WinFspError> {
-  let mut found = 0u32;
-  // SAFETY: the export was found by name in the loaded library, and `found` is a writable word for the call.
-  let status = unsafe { (api.version)(&mut found) };
-  if status != 0 {
-    return Err(WinFspError::Api {
-      call: "FspVersion",
-      status,
-    });
-  }
-  crate::dll_version::check(found).map_err(WinFspError::UnsupportedDll)
 }
 
 /// Whether WinFsp's library loads on this host: the fact the daemon's transport report states (`WinFspNotInstalled`
@@ -263,9 +250,26 @@ enum Op<T> {
   Truncate {
     object: T,
   },
+  /// `MoveFileEx` and its kin: `replace` is WinFsp's `ReplaceIfExists`, the caller's `MOVEFILE_REPLACE_EXISTING`
+  /// (A-214: a move not asked to replace must refuse a taken name, `t/base/04.t`).
   Rename {
     from: String,
     to: String,
+    replace: bool,
+  },
+  /// `SetBasicInfo`'s times (`SetFileTime`): each `Some` is applied to the volume's access, modification or change
+  /// time (A-214, `t/base/06.t`); WinFsp passes a creation time too, which the volume does not keep settable.
+  SetTimes {
+    object: T,
+    atime: Option<i64>,
+    mtime: Option<i64>,
+    ctime: Option<i64>,
+  },
+  /// `CanDelete`: whether a delete asked of an open object may be granted, decided before Windows marks it for
+  /// deletion. A directory with any child refuses (A-214, `t/base/03.t`): the delete itself runs in Cleanup, which
+  /// answers the kernel nothing, so a refusal there reached no program.
+  CanDelete {
+    object: T,
   },
   /// `FlushFileBuffers` on a handle: the bridge's flush, then the publication that makes it durable.
   Flush {
@@ -296,6 +300,7 @@ impl<T> Op<T> {
         | Op::Create { .. }
         | Op::SetSize { .. }
         | Op::Truncate { .. }
+        | Op::SetTimes { .. }
         | Op::Rename { .. }
         | Op::Flush { .. }
         | Op::Cleanup { .. }
@@ -395,7 +400,6 @@ impl Request {
       Op::Release { object } => Some(*object),
       _ => None,
     };
-    let refused = admission_refusal(&self.op, names, ledger);
     let bound = bind(self.op, ledger);
     let barrier = bound.as_ref().is_ok_and(|op| {
       op.needs_barrier() && !matches!(op, Op::Cleanup { object, .. } if object.purge)
@@ -403,12 +407,12 @@ impl Request {
     let echo = matches!(&bound, Ok(Op::Write { object, .. }) if object.purge);
     let restored_read =
       matches!(&bound, Ok(Op::Read { object, .. }) if object.fh == RESTORED_HANDLE);
-    let mut reply = match (bound, refused) {
-      (Ok(_op), Some(refusal)) => Reply::Err(ntstatus(&refusal).as_i32()),
-      (Ok(op), None) => {
-        run(bridge, cx, op).unwrap_or_else(|error| Reply::Err(ntstatus(&error).as_i32()))
+    let mut reply = match bound {
+      Ok(_op) if opened.is_some() && !ledger.has_room() => {
+        Reply::Err(ntstatus(&VfsError::NoSpace).as_i32())
       }
-      (Err(error), _) => {
+      Ok(op) => run(bridge, cx, op).unwrap_or_else(|error| Reply::Err(ntstatus(&error).as_i32())),
+      Err(error) => {
         eprintln!("slates-winfsp: context refused: {error}");
         Reply::Err(ntstatus(&VfsError::StaleHandle).as_i32())
       }
@@ -457,22 +461,6 @@ fn rename_one_name(
       eprintln!("slates-winfsp: durable kernel rename refused: {error}");
       Reply::Err(ntstatus(&VfsError::RecoveryIncomplete).as_i32())
     }
-  }
-}
-
-/// Why `op` must not run, decided before it has any effect: an open with no ledger slot left, or a rename that would
-/// lengthen a name Windows holds past what the ledger records ([`OpenNames::rename_fits`]).
-fn admission_refusal<C>(
-  op: &Op<C>,
-  names: &OpenNames,
-  ledger: &Ledger<SparseObject>,
-) -> Option<VfsError> {
-  match op {
-    Op::Open { .. } | Op::PurgeOpen { .. } | Op::Create { .. } if !ledger.has_room() => {
-      Some(VfsError::NoSpace)
-    }
-    Op::Rename { from, to } if !names.rename_fits(from, to) => Some(VfsError::NameTooLong),
-    _ => None,
   }
 }
 
@@ -572,7 +560,21 @@ fn bind(op: Op<u64>, ledger: &Ledger<SparseObject>) -> Result<Op<Open>, crate::o
     Op::Truncate { object } => Op::Truncate {
       object: ledger.get(object)?,
     },
-    Op::Rename { from, to } => Op::Rename { from, to },
+    Op::Rename { from, to, replace } => Op::Rename { from, to, replace },
+    Op::CanDelete { object } => Op::CanDelete {
+      object: ledger.get(object)?,
+    },
+    Op::SetTimes {
+      object,
+      atime,
+      mtime,
+      ctime,
+    } => Op::SetTimes {
+      object: ledger.get(object)?,
+      atime,
+      mtime,
+      ctime,
+    },
     Op::Flush { object } => Op::Flush {
       object: ledger.get(object)?,
     },
@@ -780,7 +782,30 @@ fn run(bridge: &mut dyn Bridge, cx: &OpContext, op: Op<Open>) -> Result<Reply, V
       )?;
       object_reply(&attr, 0)?
     }
-    Op::Rename { from, to } => op_rename(bridge, cx, &from, &to)?,
+    Op::Rename { from, to, replace } => op_rename(bridge, cx, &from, &to, replace)?,
+    Op::CanDelete { object } => op_can_delete(bridge, cx, object.object, object.fh)?,
+    Op::SetTimes {
+      object,
+      atime,
+      mtime,
+      ctime,
+    } => {
+      let attr = if atime.is_none() && mtime.is_none() && ctime.is_none() {
+        bridge.getattr(object.object, cx)?
+      } else {
+        bridge.setattr(
+          object.object,
+          cx,
+          SetAttr {
+            atime,
+            mtime,
+            ctime,
+            ..SetAttr::default()
+          },
+        )?
+      };
+      object_reply(&attr, 0)?
+    }
     Op::Flush { object } => {
       bridge.flush(object.object, cx, object.fh)?;
       object_reply(&bridge.getattr(object.object, cx)?, 0)?
@@ -846,6 +871,7 @@ fn op_rename(
   cx: &OpContext,
   from: &str,
   to: &str,
+  replace: bool,
 ) -> Result<Reply, VfsError> {
   let (from_name, old_parent) = match split_parent(bridge, cx, from)? {
     Ok(pair) => pair,
@@ -861,8 +887,33 @@ fn op_rename(
     cx,
     from_name,
     to_name,
-    RenameFlags::default(),
+    RenameFlags {
+      no_replace: !replace,
+      ..RenameFlags::default()
+    },
   )?;
+  Ok(Reply::Ok)
+}
+
+/// Format: the most entries `CanDelete` reads of a directory: its `.` and `..`, which the bridge's `readdir` lists
+/// first, and one child, which is enough to refuse.
+const DOTS_AND_ONE_CHILD: usize = 3;
+
+/// Whether `object` may be deleted: a directory refuses `NotEmpty` (`STATUS_DIRECTORY_NOT_EMPTY`) while it has any child,
+/// read from the first few entries of its listing; any other object may.
+fn op_can_delete(
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  object: ObjectId,
+  fh: u64,
+) -> Result<Reply, VfsError> {
+  if !matches!(bridge.getattr(object, cx)?.kind, Kind::Dir) {
+    return Ok(Reply::Ok);
+  }
+  let rows = bridge.readdir(object, cx, fh, 0, DOTS_AND_ONE_CHILD)?;
+  if rows.iter().any(|row| row.name != "." && row.name != "..") {
+    return Err(VfsError::NotEmpty);
+  }
   Ok(Reply::Ok)
 }
 
@@ -1395,17 +1446,22 @@ extern "C" fn set_basic_info(
   context: Pvoid,
   _file_attributes: u32,
   _creation_time: u64,
-  _last_access_time: u64,
-  _last_write_time: u64,
-  _change_time: u64,
+  last_access_time: u64,
+  last_write_time: u64,
+  change_time: u64,
   p_info: *mut FileInfo,
 ) -> Ntstatus {
-  // Times and attribute bits are accepted and reported from the current object (the volume keeps POSIX times, set
-  // through its own writes); the object's live info is returned so the caller sees what the volume holds.
+  // The access, write and change times are applied (A-214); the attribute bits and the creation time are not kept by
+  // the volume (A-214's stated differences), and the object's live info is returned so the caller sees what it holds.
   // SAFETY: our file system and a live open-file context.
   let handler = unsafe { handler(fs) };
   let object = context_key(context);
-  match handler.call(Op::Info { object }) {
+  match handler.call(Op::SetTimes {
+    object,
+    atime: crate::unix_ns_from_filetime(last_access_time),
+    mtime: crate::unix_ns_from_filetime(last_write_time),
+    ctime: crate::unix_ns_from_filetime(change_time),
+  }) {
     Reply::Object { info, .. } => {
       // SAFETY: `p_info` writable.
       unsafe { put_info(p_info, info) };
@@ -1443,11 +1499,18 @@ extern "C" fn set_file_size(
   }
 }
 
-extern "C" fn can_delete(_fs: *mut FileSystem, _context: Pvoid, _file_name: Pwstr) -> Ntstatus {
-  // The delete itself happens in Cleanup; here we only confirm deletability. An empty-directory check
-  // is enforced by the volume core's `rmdir` at delete time (NotEmpty → the mapped NTSTATUS), so this
-  // reports success and lets the real check run then.
-  STATUS_SUCCESS.as_i32()
+extern "C" fn can_delete(fs: *mut FileSystem, context: Pvoid, _file_name: Pwstr) -> Ntstatus {
+  // The delete itself happens in Cleanup, which answers the kernel nothing, so the refusal a program must see (a
+  // directory with a child, `ERROR_DIR_NOT_EMPTY`) is decided here, before Windows marks the object for deletion.
+  // SAFETY: our file system and a live open-file context.
+  let handler = unsafe { handler(fs) };
+  match handler.call(Op::CanDelete {
+    object: context_key(context),
+  }) {
+    Reply::Ok => STATUS_SUCCESS.as_i32(),
+    Reply::Err(status) => status,
+    _ => crate::status_unsuccessful(),
+  }
 }
 
 extern "C" fn rename(
@@ -1455,7 +1518,7 @@ extern "C" fn rename(
   _context: Pvoid,
   file_name: Pwstr,
   new_file_name: Pwstr,
-  _replace: Boolean,
+  replace: Boolean,
 ) -> Ntstatus {
   // SAFETY: our file system; both names are paths.
   let handler = unsafe { handler(fs) };
@@ -1463,7 +1526,11 @@ extern "C" fn rename(
   let from = unsafe { wide_to_string(file_name) };
   // SAFETY: `new_file_name` is a NUL-terminated UTF-16 path WinFsp owns for this call.
   let to = unsafe { wide_to_string(new_file_name) };
-  match handler.call(Op::Rename { from, to }) {
+  match handler.call(Op::Rename {
+    from,
+    to,
+    replace: replace != 0,
+  }) {
     Reply::Ok => STATUS_SUCCESS.as_i32(),
     Reply::Err(status) => status,
     _ => crate::status_unsuccessful(),
@@ -1642,9 +1709,8 @@ impl Mounted {
     {
       return Err(WinFspError::Record(crate::held::Refusal::Drive));
     }
-    let api = ffi::api().map_err(|_| WinFspError::NotInstalled)?;
-    checked_dll(api)?;
     let purge_token = crate::purge_token::PurgeToken::new()?;
+    let api = ffi::api().map_err(|_| WinFspError::NotInstalled)?;
     let security_descriptor = everyone_security_descriptor()?;
     let handler = Box::into_raw(Box::new(Handler {
       requests,
@@ -1717,6 +1783,12 @@ impl Mounted {
     // SAFETY: `file_system` is the DLL's live full object. Only its stable public prefix is accessed here.
     unsafe {
       (*file_system).user_context = handler.cast::<c_void>();
+    }
+    // SAFETY: the DLL returned a live initialized public prefix. Its reserved version is zero in v2.1; the header's
+    // 792-byte full-object size is a separate static assertion, not the value of this reserved field.
+    let version = unsafe { (*file_system).version };
+    if version != crate::dispatcher::FILE_SYSTEM_VERSION {
+      return Err(WinFspError::UnsupportedAbi(version));
     }
     if let Some((record, volume, link)) = inherited {
       if record.drive_text().map_err(WinFspError::Record)? != mount_point

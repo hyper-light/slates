@@ -81,6 +81,84 @@ const FSSTRESS_TST_COMMON_H: Pin = Pin {
   upstream: "linux-test-project/ltp@6af38cf include/tst_common.h",
 };
 
+/// Format: the commit of `billziss-gh/secfs.test` WinFsp v2.1 pins as its `ext/test` submodule
+/// (`winfsp/winfsp@ddca7bd`, `git ls-tree HEAD ext/test`): the WinFsp fsx port and winfstest, as WinFsp's own CI runs
+/// them (`tools/run-tests.bat`, `memfs-x64-disk-fsx`, `memfs-x64-disk-winfstest`).
+pub(crate) const SECFS_TEST_COMMIT: &str = "6ac65cda46abc2be39c7b137debf9521052edbaf";
+
+/// Format: the WinFsp fsx port (Apple's fsx with a Windows build: `fstools/src/fsx/fsx.c`).
+#[cfg(windows)]
+const WINFSP_FSX_C: Pin = Pin {
+  name: "fsx.c",
+  url: "https://raw.githubusercontent.com/billziss-gh/secfs.test/6ac65cda46abc2be39c7b137debf9521052edbaf/fstools/src/fsx/fsx.c",
+  sha256: "440742597d18b69edfea6ca49fd1905fbad4926953e446957e2ed1377ebe584c",
+  license: "APSL 2.0",
+  upstream: "billziss-gh/secfs.test@6ac65cd fstools/src/fsx/fsx.c",
+};
+/// Format: the port's `getopt` for MSVC (`fstools/src/fsx/win/getopt.c`).
+#[cfg(windows)]
+const WINFSP_FSX_GETOPT_C: Pin = Pin {
+  name: "getopt.c",
+  url: "https://raw.githubusercontent.com/billziss-gh/secfs.test/6ac65cda46abc2be39c7b137debf9521052edbaf/fstools/src/fsx/win/getopt.c",
+  sha256: "bf89b68bef0b8d4dd590f3a0233ec1d9492bd4f243a0e776c913b678af5027cd",
+  license: "AT&T public domain getopt",
+  upstream: "billziss-gh/secfs.test@6ac65cd fstools/src/fsx/win/getopt.c",
+};
+/// Format: its header.
+#[cfg(windows)]
+const WINFSP_FSX_GETOPT_H: Pin = Pin {
+  name: "getopt.h",
+  url: "https://raw.githubusercontent.com/billziss-gh/secfs.test/6ac65cda46abc2be39c7b137debf9521052edbaf/fstools/src/fsx/win/getopt.h",
+  sha256: "dd3d66a1ae81ed1b972450a0a92849654f3c1b05a631b36c7e7b83d160f61ef1",
+  license: "AT&T public domain getopt",
+  upstream: "billziss-gh/secfs.test@6ac65cd fstools/src/fsx/win/getopt.h",
+};
+/// Format: the port's `mmap` over file mappings (`fstools/src/fsx/win/mman.c`, mman-win32).
+#[cfg(windows)]
+const WINFSP_FSX_MMAN_C: Pin = Pin {
+  name: "mman.c",
+  url: "https://raw.githubusercontent.com/billziss-gh/secfs.test/6ac65cda46abc2be39c7b137debf9521052edbaf/fstools/src/fsx/win/mman.c",
+  sha256: "013f0bbef39562ba2c9c6015d79bdc38d990d05c4e824864e6f466f5192b2792",
+  license: "MIT",
+  upstream: "billziss-gh/secfs.test@6ac65cd fstools/src/fsx/win/mman.c",
+};
+/// Format: its header.
+#[cfg(windows)]
+const WINFSP_FSX_MMAN_H: Pin = Pin {
+  name: "mman.h",
+  url: "https://raw.githubusercontent.com/billziss-gh/secfs.test/6ac65cda46abc2be39c7b137debf9521052edbaf/fstools/src/fsx/win/mman.h",
+  sha256: "5a09cb0e39bf837b1d61eaf68e7d381b9943eef910fa94cc53a745be2ed73bf9",
+  license: "MIT",
+  upstream: "billziss-gh/secfs.test@6ac65cd fstools/src/fsx/win/mman.h",
+};
+/// Format: the port's `random` (BSD's, `fstools/src/fsx/win/random.c`).
+#[cfg(windows)]
+const WINFSP_FSX_RANDOM_C: Pin = Pin {
+  name: "random.c",
+  url: "https://raw.githubusercontent.com/billziss-gh/secfs.test/6ac65cda46abc2be39c7b137debf9521052edbaf/fstools/src/fsx/win/random.c",
+  sha256: "a6f77f3282b5f38692210bee1773128038a2110d0698cee3b016428690233566",
+  license: "BSD-3-Clause",
+  upstream: "billziss-gh/secfs.test@6ac65cd fstools/src/fsx/win/random.c",
+};
+/// Format: winfstest's driver, one Win32 call per process (`winfstest/winfstest.c`).
+#[cfg(windows)]
+pub(crate) const WINFSTEST_C: Pin = Pin {
+  name: "winfstest.c",
+  url: "https://raw.githubusercontent.com/billziss-gh/secfs.test/6ac65cda46abc2be39c7b137debf9521052edbaf/winfstest/winfstest.c",
+  sha256: "7a1ddf128b02a38145a1f3230fed5a64ffda6dc64c096b8a67da89be17632c94",
+  license: "BSD-3-Clause",
+  upstream: "billziss-gh/secfs.test@6ac65cd winfstest/winfstest.c",
+};
+/// Format: the driver's table of Win32 error names (`winfstest/winerror.i`, included by `winfstest.c`).
+#[cfg(windows)]
+const WINFSTEST_WINERROR_I: Pin = Pin {
+  name: "winerror.i",
+  url: "https://raw.githubusercontent.com/billziss-gh/secfs.test/6ac65cda46abc2be39c7b137debf9521052edbaf/winfstest/winerror.i",
+  sha256: "87cabf8c439eaf8f5b9a0cd97c2cd1010a6d0bf526013dcda8eb20faa603a22b",
+  license: "BSD-3-Clause",
+  upstream: "billziss-gh/secfs.test@6ac65cd winfstest/winerror.i",
+};
+
 /// Format: the pjdfstest commit the tarball is pinned at.
 pub(crate) const PJDFSTEST_COMMIT: &str = slates_conformance::pjdfstest::COMMIT;
 
@@ -135,7 +213,9 @@ pub(crate) fn fetch(pin: &Pin, dir: &Path) -> Result<PathBuf, Failure> {
   let bytes = std::fs::read(&path)?;
   let found = sha256_hex(&bytes);
   if found != pin.sha256 {
-    let _ = Command::new("rm").arg("-f").arg(&path).output();
+    #[allow(clippy::disallowed_methods)]
+    // the development tool's own scratch: a refused fetch leaves nothing
+    let _ = std::fs::remove_file(&path);
     return Err(Failure(format!(
       "{} digest mismatch: pinned {}, fetched {found}; re-pin deliberately or refuse",
       pin.upstream, pin.sha256
@@ -165,6 +245,7 @@ pub(crate) struct Built {
 }
 
 /// Fetches and builds fsx.
+#[cfg(not(windows))]
 pub(crate) fn build_fsx(dir: &Path) -> Result<Built, Failure> {
   fetch(&FSX_C, dir)?;
   // `-include time.h` for `clock_gettime` (the FreeBSD copy omits it); `-include stdint.h` for
@@ -181,6 +262,109 @@ pub(crate) fn build_fsx(dir: &Path) -> Result<Built, Failure> {
     note: format!(
       "fsx: {} ({}), sha256 {}, built `cc -O2 -w -include time.h -include stdint.h` (source unchanged)",
       FSX_C.upstream, FSX_C.license, FSX_C.sha256
+    ),
+  })
+}
+
+/// Format: the flag that bounds fsx's file length: `-l` in FreeBSD's fsx, `-F` in the WinFsp port (Apple's fsx,
+/// whose `-l` names an XILog file instead).
+#[cfg(not(windows))]
+pub(crate) const FSX_LENGTH_FLAG: &str = "-l";
+/// Format: the flag that bounds fsx's file length in the WinFsp port (`-F flen`, its usage text).
+#[cfg(windows)]
+pub(crate) const FSX_LENGTH_FLAG: &str = "-F";
+
+/// MSVC's `cl.exe` for this process's own architecture, with the environment the Visual Studio installation gives it
+/// (`INCLUDE`, `LIB`, `PATH`), found as the `cc` crate finds it for every build script, so no developer prompt is needed.
+#[cfg(windows)]
+fn msvc_cl() -> Result<Command, Failure> {
+  let target = format!("{}-pc-windows-msvc", std::env::consts::ARCH);
+  cc::windows_registry::find_tool(&target, "cl.exe")
+    .map(|tool| tool.to_command())
+    .ok_or_else(|| Failure(format!("no MSVC cl.exe for {target} on this host")))
+}
+
+/// Runs `cl` with the given arguments in `dir`, failing with its diagnostics (cl prints them on stdout).
+#[cfg(windows)]
+fn cl(dir: &Path, args: &[&str]) -> Result<(), Failure> {
+  let output = msvc_cl()?.args(args).current_dir(dir).output()?;
+  if output.status.success() {
+    Ok(())
+  } else {
+    Err(Failure(format!(
+      "cl {} failed:\n{}{}",
+      args.join(" "),
+      String::from_utf8_lossy(&output.stdout),
+      String::from_utf8_lossy(&output.stderr)
+    )))
+  }
+}
+
+/// Fetches and builds the WinFsp fsx port with MSVC, as its `Nmakefile` does (`cl /MT /W2 fsx.c win/*.c ntdll.lib`):
+/// the port's own Windows shims (`win/`), the source unchanged.
+#[cfg(windows)]
+pub(crate) fn build_fsx(dir: &Path) -> Result<Built, Failure> {
+  fetch(&WINFSP_FSX_C, dir)?;
+  let win = dir.join("win");
+  for pin in [
+    &WINFSP_FSX_GETOPT_C,
+    &WINFSP_FSX_GETOPT_H,
+    &WINFSP_FSX_MMAN_C,
+    &WINFSP_FSX_MMAN_H,
+    &WINFSP_FSX_RANDOM_C,
+  ] {
+    fetch(pin, &win)?;
+  }
+  let args = [
+    "/nologo",
+    "/MT",
+    "/W2",
+    "fsx.c",
+    "win\\getopt.c",
+    "win\\mman.c",
+    "win\\random.c",
+    "ntdll.lib",
+    "/Fe:fsx.exe",
+    "/link",
+    "/subsystem:console",
+  ];
+  cl(dir, &args)?;
+  Ok(Built {
+    binary: dir.join("fsx.exe"),
+    note: format!(
+      "fsx: the WinFsp port, {} ({}), sha256 {}, with its win/ shims at the same commit, built `cl {}` (source unchanged)",
+      WINFSP_FSX_C.upstream,
+      WINFSP_FSX_C.license,
+      WINFSP_FSX_C.sha256,
+      args.join(" ")
+    ),
+  })
+}
+
+/// Fetches and builds winfstest's driver with MSVC, as its `Nmakefile` does (`cl /MT /W2 winfstest.c advapi32.lib`).
+#[cfg(windows)]
+pub(crate) fn build_winfstest(dir: &Path) -> Result<Built, Failure> {
+  fetch(&WINFSTEST_C, dir)?;
+  fetch(&WINFSTEST_WINERROR_I, dir)?;
+  let args = [
+    "/nologo",
+    "/MT",
+    "/W2",
+    "winfstest.c",
+    "advapi32.lib",
+    "/Fe:winfstest.exe",
+    "/link",
+    "/subsystem:console",
+  ];
+  cl(dir, &args)?;
+  Ok(Built {
+    binary: dir.join("winfstest.exe"),
+    note: format!(
+      "winfstest: {} ({}), sha256 {}, with winerror.i at the same commit, built `cl {}` (source unchanged)",
+      WINFSTEST_C.upstream,
+      WINFSTEST_C.license,
+      WINFSTEST_C.sha256,
+      args.join(" ")
     ),
   })
 }
