@@ -13,6 +13,7 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   anchor   [--quick] [--shards N] [--fleet PATH --node NAME]   run the anchor: own the segment, supervise the daemon
   daemon   [--quick] [--shards N] [--fleet PATH --node NAME]   run the daemon (alone, or as the anchor's child)
   profile  [--quick] [--json]                      measure and print the machine profile
+  version                                          print this binary's version (`slates VERSION`)
   mcp [--instance NAME] [--http PORT]               serve the MCP tools (stdio, or loopback HTTP)
 
   volume create NAME (--bounded SIZE | --dynamic MAX) [--fold] [--locked] [--base DIR] [--json]
@@ -630,6 +631,8 @@ pub(crate) enum Command {
   Daemon(ProcessOptions),
   /// The profile.
   Profile(ProfileOptions),
+  /// The binary's version.
+  Version,
   /// The MCP server (stdio, or Streamable HTTP on a loopback port).
   Mcp(McpOptions),
   /// A client verb.
@@ -1474,6 +1477,10 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
       }))
     }
     ["oci-runtime", runtime] => Ok(Command::OciRuntime((*runtime).to_owned())),
+    ["version"] => {
+      taken.only(&NONE)?;
+      Ok(Command::Version)
+    }
     ["profile"] => {
       taken.only(&Spec {
         values: &[],
@@ -1834,7 +1841,15 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
     [verb, rest @ ..]
       if matches!(
         *verb,
-        "anchor" | "daemon" | "profile" | "mcp" | "attach" | "detach" | "status" | "enroll"
+        "anchor"
+          | "daemon"
+          | "profile"
+          | "mcp"
+          | "attach"
+          | "detach"
+          | "status"
+          | "enroll"
+          | "version"
       ) =>
     {
       Err(ParseError::Extra(

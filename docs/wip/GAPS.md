@@ -1,5 +1,23 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **The binary release lane (2026-11-04, A-199, Appendix B.2).** `release.yml` now builds `slates` natively for
+> seven targets: macOS arm64, Linux x86_64 and arm64 (glibc, and static musl), and Windows x86_64 and arm64 with the C
+> runtime linked statically. It runs each built binary on its own runner (`cargo xtask release-smoke`: version, anchor
+> and daemon start, bootstrap, a volume provisioned, a file written and read by one MCP client and read by a second
+> client, the volume destroyed, the daemon gone with its anchor). It then attaches the seven binaries, `SHA256SUMS`,
+> `slates-provenance.json` and a Sigstore attestation bundle to a **draft** release. Publishing the draft is the
+> maintainer's step (`docs/publish.md`, "The binary release").
+> - Proven on this Mac (M5 Max, 18 cores, 2026-11-04, load 12–24): the release binary passed 10 of 10 smoke runs.
+>   Start to serving took 1.8 s, a provision 184 ms and the MCP round trip 231 ms (`cargo xtask release-smoke --binary
+>   <release build> --target aarch64-apple-darwin --record <file>`). The proof on a test tag is recorded in A-199.
+> - **Open, found by the smoke test: the anchor aborts when its stderr closes.** `slates anchor 2>&1 >/dev/null | head
+>   -n 1` exits 134 (SIGABRT) once `head` has exited (2026-11-04, this Mac). The next diagnostic line meets EPIPE,
+>   which `eprintln!` turns into a panic, and `panic = "abort"` makes that an abort. The smoke test's own first
+>   version stopped reading the anchor's stderr after the serving line, and 8 of 10 runs aborted. Owed, in
+>   `crates/cli`: a failing test, then diagnostics that survive a closed stderr.
+> - **Not yet:** reproducibility from the tag (AC-9.5: nothing builds twice and compares); the macOS `Slates.app`
+>   bundle, code signing and notarization (B.7; they need an Apple Developer identity); `cargo-binstall` metadata.
+
 > **Audit of 2dc9f3eb..98000d56 (2026-11-03): defects open, Step 9's evidence holds.** Nine commits made on
 > 2026-11-01 and 2026-11-02 were read line by line against this file's rules and Step 9's acceptance. Every CI run they
 > cite was read again: each shows what it is cited for, except one pair of timings A-198 gave the wrong way
@@ -12390,8 +12408,9 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   `.cargo/config.toml` nor `release.yml` sets `+crt-static` for Windows), `slates.exe` needs `vcruntime140.dll`, which
   Windows does not ship and Nano Server and Server Core images lack: in a process-isolated `nanoserver:ltsc2025` container
   it exits `0xC0000135`, `STATUS_DLL_NOT_FOUND`, before any code runs (CI's `windows-2025`, run 40580524733). Built with
-  `-C target-feature=+crt-static` it runs there whole, the daemon included (run 40582122662). Owed: the release's Windows
-  binaries built with the C runtime linked statically, and a by-use test that the published binary starts in Nano Server.
+  `-C target-feature=+crt-static` it runs there whole, the daemon included (run 40582122662). **Addressed 2026-11-04
+  (A-199):** `release.yml` builds both Windows binaries with `+crt-static`, and the x86_64 one must answer `slates
+  version` in a process-isolated `nanoserver:ltsc2025` container before it may ship. The CI run is recorded in A-199.
 - **A CLI attachment ends about a second after the `slates attach` that made it (open, seen 2026-10-27).** The reaper
   removes a dead client's attachments at the liveness cadence (`crates/server/src/reap.rs`, every 1 s), and each `slates`
   run is a client of its own. So `slates attach`, then `slates write`, then `slates detach`, each a process, races the

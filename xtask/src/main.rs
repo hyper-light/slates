@@ -17,7 +17,8 @@
 //!   carries it (see `version.rs`): the workspace version is the only hand-edited one; the Python
 //!   wheel derives it through maturin; the Node main package, its platform packages and its
 //!   `optionalDependencies` pins must equal it and are re-derived by `--write`; `--expect-tag` is
-//!   the release guard (the tag must be `v` + the version).
+//!   the release guard (the tag must be `v` + the version; with `--allow-test-tag`, also `v` + the version +
+//!   `-test.N`, a test of the release lane).
 //! - `cargo xtask npm-reserve --out DIR` — the 0.0.0 stub packages a maintainer publishes once to
 //!   create each npm name, derived from the same manifests (see `version.rs`).
 //! - `cargo xtask toolchain` — every image, build and workflow pin names `rust-toolchain.toml`'s channel (see
@@ -29,6 +30,10 @@
 //!   [--scratch DIR] [--keep]` — the conformance evidence harness (see `conformance/mod.rs`).
 //! - `cargo xtask kind (image | smoke) [--tag TAG] [--keep]` — the KIND fleet lane: the image, one node
 //!   of it in Docker (see `kind.rs`; docs/wip/kind-lane.md).
+//! - `cargo xtask release-smoke --binary PATH --target TRIPLE --record FILE` and `cargo xtask release-artifacts
+//!   --dist DIR --records DIR --notes DIR --tag TAG --commit SHA --run-url URL` — the release lane: one built binary run as a
+//!   person installing it would, and the checksums, provenance and notes of a release whose every binary passed
+//!   (see `release.rs`; Appendix B.2).
 //! - `cargo xtask tsan` — the ThreadSanitizer lane: the race canary must be reported, then the
 //!   threaded crates' tests run instrumented and any report fails (see `tsan.rs`; needs nightly
 //!   with `rust-src`).
@@ -47,6 +52,7 @@ mod conformance;
 mod kind;
 mod named_tests;
 mod ratchet;
+mod release;
 mod toolchain;
 mod tsan;
 mod unsafe_budget;
@@ -141,9 +147,11 @@ fn main() -> ExitCode {
       kind::run(&root, &options)
     }),
     "tsan" => workspace_root().and_then(|root| tsan::run(&root)),
+    "release-smoke" => workspace_root().and_then(|root| release::smoke(&root, &args[1..])),
+    "release-artifacts" => release::artifacts(&args[1..]),
     "toolchain" => workspace_root().and_then(|root| toolchain::run(&root)),
     other => Err(Failure(format!(
-      "unknown task `{other}`; tasks: structural, literals, unsafe, version, toolchain, npm-reserve, check, capabilities, callgrind, ratchet, conformance, kind, tsan"
+      "unknown task `{other}`; tasks: structural, literals, unsafe, version, toolchain, npm-reserve, check, capabilities, callgrind, ratchet, conformance, kind, tsan, release-smoke, release-artifacts"
     ))),
   };
   match outcome {

@@ -1,7 +1,7 @@
-# Publishing the SDKs
+# Publishing slates: the binary and the SDKs
 
-How a release of the Python SDK (`slates` on PyPI) and the Node SDK (`@hyper-light/slates` on
-npm) is cut, what the tag does, the one-time setup a maintainer performs once, and the local
+How a release of the `slates` binary (GitHub releases), the Python SDK (`slates` on PyPI) and the Node SDK
+(`@hyper-light/slates` on npm) is cut, what the tag does, the one-time setup a maintainer performs once, and the local
 proof recorded for this lane. The design is §2.4 and §4.12 of
 [the unified design](wip/SLATES_DESIGN.md); the ledger row is "SDK publishing" in
 [GAPS.md](wip/GAPS.md) §1.
@@ -29,11 +29,70 @@ proof recorded for this lane. The design is §2.4 and §4.12 of
 3. Commit, then tag and push the tag: `git tag v0.2.0 && git push origin v0.2.0`. Pushing the tag
    is the human's act; nothing else publishes.
 4. The tag starts three workflows, each beginning with the shared guard:
-   - `release.yml` — the nine-target workspace build (the CLI binaries, Appendix B.2).
+   - `release.yml` — the `slates` binary for seven targets, each smoke-tested on its own platform, attached
+     with checksums and signed provenance to a **draft** release (below, "The binary release").
    - `publish-python.yml` — wheels and sdist to PyPI.
    - `publish-node.yml` — the addon for nine platforms and the ten packages to npm.
-5. `workflow_dispatch` on either publish lane is a build-only dry run: nothing is published
+5. `workflow_dispatch` on any of the three lanes is a build-only dry run: nothing is published
    without a tag.
+6. Publish the binary release: check the draft (its seven binaries, `SHA256SUMS`,
+   `slates-provenance.json`, `slates-attestation.sigstore.json`), then
+   `gh release edit v0.2.0 --draft=false --latest` or "Publish release" on the draft. That is
+   the binary release's one approved step; until it, the draft is visible to maintainers only.
+
+## The binary release
+
+One `slates` binary is the anchor, the daemon and every client verb, so a release is one raw
+binary per platform, no archive (Appendix B.2):
+
+| Platform | Target | Runner | File |
+|---|---|---|---|
+| macOS arm64 | `aarch64-apple-darwin` | `macos-latest` | `slates-macos-arm64` |
+| Linux x86_64, glibc | `x86_64-unknown-linux-gnu` | `ubuntu-latest` | `slates-linux-x64` |
+| Linux arm64, glibc | `aarch64-unknown-linux-gnu` | `ubuntu-24.04-arm` | `slates-linux-arm64` |
+| Linux x86_64, static | `x86_64-unknown-linux-musl` | `ubuntu-latest`, in `rust:1.98.1-alpine` | `slates-linux-x64-musl` |
+| Linux arm64, static | `aarch64-unknown-linux-musl` | `ubuntu-24.04-arm`, in `rust:1.98.1-alpine` | `slates-linux-arm64-musl` |
+| Windows x86_64 | `x86_64-pc-windows-msvc` | `windows-2025` | `slates-windows-x64.exe` |
+| Windows arm64 | `aarch64-pc-windows-msvc` | `windows-11-arm` | `slates-windows-arm64.exe` |
+
+Every target is built natively on its own runner. The Windows binaries link the C runtime
+statically (`+crt-static`), so they need no Visual C++ runtime. The musl binaries are static.
+The glibc binaries need the glibc of the runner's Ubuntu or newer.
+
+For each built binary, `cargo xtask release-smoke` runs on the same runner and does what a person
+installing it would do:
+
+1. `slates version` names the workspace version.
+2. `slates anchor` starts with the full machine profile, and its daemon serves.
+3. The consensus group is bootstrapped and a 64 MiB volume is provisioned.
+4. One MCP client (`slates mcp`) attaches for writing, writes a file and reads it back.
+5. A second client (`slates read`) reads the same bytes.
+6. The volume is destroyed.
+7. When the anchor is stopped, the daemon leaves with it.
+
+The smoke test records the binary's SHA-256 and BLAKE3, its `rustc -vV`, the runner image and
+each step's time. Two more checks run on some targets. The musl binaries must pass a staticness
+gate (`ldd`). The Windows x86_64 binary must start in a process-isolated
+`nanoserver:ltsc2025` container, which has no Visual C++ runtime.
+
+On a tag, `cargo xtask release-artifacts` refuses a release that lacks a target, or whose binary
+is not the one its smoke test digested. It writes:
+
+- `SHA256SUMS`, in `sha256sum`'s format.
+- `slates-provenance.json`: the tag, the commit, the run, and every target's record.
+
+GitHub's artifact attestation (`actions/attest-build-provenance`) then signs SLSA build
+provenance for every binary named in `SHA256SUMS`. It signs keylessly through Sigstore with the
+job's OIDC identity, so no key or secret exists. Everything is attached to a **draft** release.
+Verify a download with `sha256sum -c SHA256SUMS --ignore-missing` (on macOS
+`shasum -a 256 -c`) and `gh attestation verify <file> --repo hyper-light/slates`.
+
+**A test of the lane** is a tag `v<version>-test.<N>` (e.g. `v0.1.0-test.1`). The release lane's
+guard accepts it (`cargo xtask version --expect-tag TAG --allow-test-tag`) and makes a draft
+pre-release titled `TEST … not a release`. Two things keep the SDK publish lanes from publishing
+on a test tag. Their triggers exclude `v*-test.*`, and their guard (without `--allow-test-tag`)
+refuses such a tag. A test's draft is never published. Delete it with
+`gh release delete <tag> --yes` when it is no longer needed.
 
 ## What the tag does
 

@@ -10794,3 +10794,22 @@ fn an_image_built_through_the_cli_passes_e2fsck_through_a_mount_and_merges_a_gue
   fuse_mount_and_check(&instance, &value_of(&out, "id"), &merged_mount.path);
   the_clone_holds_the_edits(&merged_mount.path, &files);
 }
+
+/// The release lane's first question of a built binary (`xtask/src/release.rs`, Appendix B.2): do run `slates
+/// version`, expect `slates` and the workspace version on stdout and exit 0, with no daemon asked; do give it an
+/// argument, expect the usage refusal (exit 2).
+#[test]
+fn the_binary_names_its_version() {
+  let slates = env!("CARGO_BIN_EXE_slates");
+  let output = Command::new(slates).arg("version").output().unwrap();
+  assert!(output.status.success(), "{output:?}");
+  assert_eq!(
+    String::from_utf8_lossy(&output.stdout),
+    format!("slates {}\n", env!("CARGO_PKG_VERSION"))
+  );
+  let refused = Command::new(slates)
+    .args(["version", "extra"])
+    .output()
+    .unwrap();
+  assert_eq!(refused.status.code(), Some(2), "{refused:?}");
+}
