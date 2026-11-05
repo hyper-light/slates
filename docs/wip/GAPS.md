@@ -307,9 +307,14 @@
 > replaces. The same held across two machines on 2026-11-05 (client on adacachy, server on kiln-a094a12d, 11:37 UTC),
 > and the flow is now a CI test through the real binary: `crates/cli/tests/fs_server.rs`, two `slates daemon --fleet`
 > processes, in the gated CLI step (5 of 5 on adacachy at load 26, 0.44–0.48 s; red with the checkout's writes
-> removed). The granted landing across machines waits on a macOS server node: two Mac Studios froze it (the kiln
-> runner's headroom guard, the anchor in state `T`), and adas-macbook-pro-2 answered no ping at 192.168.1.71 on
-> 2026-11-05. Open, found on the way:
+> removed). **The granted landing across two machines is done** (2026-11-05 22:04–22:05 UTC): the client on
+> adacachy (Linux x86_64) read the green on adas-macbook-pro-2 (macOS arm64, the server, under its anchor at load
+> 41–45), pushed two increments over four files (accepted 1 and 2; the late overlap refused with `src/one.txt
+> [0..3]`); the server shared the green with the client's `uid:1000` (its own user is 501), checked out version 2 (4
+> written), presented 1 create and 3 replaces (manifest `06ca7f70…`), the human's `slates grant` at the Mac's anchor
+> issued grant 1, and the landing ended `done`: 4 written, 74 bytes, data and 2 directories synced; the Mac's disk
+> held every merged byte. Two Mac Studios had frozen the server earlier the same day (the kiln runner's headroom
+> guard, the anchor in state `T`); the MacBook did not. Open, found on the way:
 > - **The daemon cannot clone an overlay volume.** `admit_clone` gives every clone no host, so `volume clone` of an
 >   overlay is refused `ContentUnavailable` (pinned or not; fleet and standalone), though the volume core can.
 > - **No grant can be issued on Linux from the CLI.** The anchor's issuer segment is a descriptor only its children
