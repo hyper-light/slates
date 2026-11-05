@@ -462,8 +462,8 @@ jobs:
         run: cargo clippy -p slates-cli -- -D warnings
       # The binary's one Windows test target, the WinFsp mount through the command, linted on its own for the same
       # reason: the rest of its targets are Unix by nature.
-      - name: Clippy the WinFsp CLI test (native Windows)
-        run: cargo clippy -p slates-cli --test winfsp -- -D warnings
+      - name: Clippy the WinFsp CLI tests (native Windows)
+        run: cargo clippy -p slates-cli --test winfsp --test winfsp_semantics -- -D warnings
       - name: Clippy the Shards hand-off CLI test (native Windows)
         run: cargo clippy -p slates-cli --test shards -- -D warnings
       # The other half of the documentation gate in `gates`. That one runs on ubuntu and macos, so it checks
@@ -857,7 +857,7 @@ jobs:
           -p slates-bridge-winfsp -p slates-mcp --all-targets -- -D warnings
       - name: Clippy the shipped binary and its Shards and WinFsp tests natively on arm64 Windows
         if: ${{ !cancelled() }}
-        run: cargo clippy -p slates-cli --bin slates --test shards --test winfsp -- -D warnings
+        run: cargo clippy -p slates-cli --bin slates --test shards --test winfsp --test winfsp_semantics -- -D warnings
       # The daemon on a weak memory model: an in-process daemon found through the rendezvous, its verbs over the rings,
       # the async driver; one test at a time, as on x86_64 (each daemon is sized from the whole machine).
       - name: Test the client binary and the async driver, one test at a time (native arm64 Windows)
