@@ -588,10 +588,7 @@ impl DirNode {
   }
 
   /// The entries in canonical `(hash, folded name)` order.
-  pub fn iter<'a>(
-    &'a self,
-    blocks: &'a BlockStore,
-  ) -> Box<dyn Iterator<Item = EntryRef<'a>> + 'a> {
+  pub fn iter<'a>(&'a self, blocks: &'a BlockStore) -> Box<dyn Iterator<Item = EntryRef<'a>> + 'a> {
     match &self.entries {
       DirEntries::Small(s) => Box::new(s.entries().iter().map(move |e| EntryRef {
         hash: e.hash,
@@ -670,12 +667,7 @@ impl DirNode {
   }
 
   /// The name of the entry with hash `hash` whose child is inode `no`, for a file's home.
-  pub fn name_of<'a>(
-    &'a self,
-    blocks: &'a BlockStore,
-    hash: u64,
-    no: InodeNo,
-  ) -> Option<&'a str> {
+  pub fn name_of<'a>(&'a self, blocks: &'a BlockStore, hash: u64, no: InodeNo) -> Option<&'a str> {
     let wanted = |c: Child| matches!(c, Child::File(n) | Child::Symlink(n) if n == no);
     match &self.entries {
       DirEntries::Small(s) => s

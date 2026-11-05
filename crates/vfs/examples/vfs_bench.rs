@@ -22,11 +22,13 @@ use slates_machine::{Derived, derived};
 use slates_mem::Handle;
 use slates_mem::arena::ChunkArena;
 use slates_mem::region::Region;
+use slates_mem::slab::Slab;
 use slates_vfs::VfsError;
 use slates_vfs::clock::HostClock;
 use slates_vfs::dir::{Child, DirNode, MEASURED_CUTOVER};
 use slates_vfs::dirblocks::{
-  BlockStore, CLASSES, ENTRY_BYTES, HEADER_BYTES, PAGE_BYTES, SMALLEST_CLASS, fitted_size,
+  BlockStore, CLASSES, ENTRY_BYTES, HEADER_BYTES, LARGEST_CLASS, PAGE_BYTES, SMALLEST_CLASS,
+  fitted_size,
 };
 use slates_vfs::dirtree::Retired;
 use slates_vfs::ids::{Epoch, InodeNo};
@@ -283,10 +285,12 @@ const PATH_PREFIX_BYTES: usize = 12;
 /// tree, so every size pays the same eviction on each mutation and the size comparison is fair.
 const JOURNAL_BYTES: usize = 1 << 16;
 
-/// Derived: the heap budget of a tree (AC-1.5), counted object by object: an inode record per
+/// Derived: the heap budget of a tree (AC-1.5), counted object by object at each slab's true slot cost (the value, its
+/// generation and its vacancy tag, `Slab::slot_bytes`): an inode record per
 /// file and per directory; a directory node per directory (its two inline entries and their
 /// names included); for every leaf directory its one block, of the class that fits it, at its share of a page's slab
-/// slot, and a page of slack for every class (A-203); the trie's nodes (one per
+/// slot, the group directories' blocks (split leaves at least half full, an index block each), and a page of slack for
+/// every class (A-203); the trie's nodes (one per
 /// `FANOUT` inodes at the leaf level and the levels above, `FANOUT / (FANOUT − 1)` per `FANOUT`
 /// inodes, plus the spine); one slab segment of slack per slab (blocks: sixty-four pages); and
 /// the op log's records, one per create and mkdir with its path and up to twice for the
@@ -294,19 +298,26 @@ const JOURNAL_BYTES: usize = 1 << 16;
 fn heap_budget(files: usize, dirs: usize, page: usize, journal_bytes: usize) -> Derived<usize> {
   let fanout = FANOUT.max(2);
   let records = files + dirs;
-  let inodes = records * size_of::<Inode>();
-  let nodes = dirs * size_of::<DirNode>();
+  let inodes = records * Slab::<Inode>::slot_bytes();
+  let nodes = dirs * Slab::<DirNode>::slot_bytes();
+  let leaf_dirs = files.div_ceil(FILES_PER_DIR);
   let per_page = PAGE_BYTES / leaf_block_bytes();
-  let pages = files.div_ceil(FILES_PER_DIR).div_ceil(per_page) + CLASSES;
+  // The group directories and the root list every leaf directory once: their split leaves at least half full, and an
+  // index block apiece.
+  let group_name = format!("d{leaf_dirs}").len();
+  let groups = (2 * leaf_dirs * (ENTRY_BYTES + group_name) + (GROUPS + 1) * LARGEST_CLASS)
+    .div_ceil(PAGE_BYTES);
+  let pages = leaf_dirs.div_ceil(per_page) + groups + CLASSES;
   let blocks = pages * BlockStore::page_slot_bytes();
   let levels = usize::try_from(LEVELS).unwrap_or(0);
-  let trie = (records.div_ceil(fanout) * fanout / (fanout - 1) + levels) * size_of::<TrieNode>();
+  let trie =
+    (records.div_ceil(fanout) * fanout / (fanout - 1) + levels) * Slab::<TrieNode>::slot_bytes();
   let slack = 3 * page + 64 * page;
   let record = 2 * size_of::<OpRecord>() + PATH_PREFIX_BYTES + NAME_BYTES;
   let journal = journal_bytes.min(records * record);
   derived!(
     inodes + nodes + blocks + trie + slack + journal,
-    "(files + dirs) × size_of::<Inode>() + dirs × size_of::<DirNode>() + (ceil(leaf dirs / (PAGE_BYTES / fitted class of FILES_PER_DIR entries)) + CLASSES) × page slot + ((files + dirs) / FANOUT × FANOUT / (FANOUT − 1) + LEVELS) × size_of::<TrieNode>() + 67 × page + min(journal_bytes, (files + dirs) × (2 × size_of::<OpRecord>() + path))",
+    "(files + dirs) × Slot<Inode> + dirs × Slot<DirNode> + (ceil(leaf dirs / (PAGE_BYTES / fitted class of FILES_PER_DIR entries)) + ceil((2 × leaf dirs × (ENTRY_BYTES + group entry name) + (GROUPS + 1) × LARGEST_CLASS) / PAGE_BYTES) + CLASSES) × page slot + ((files + dirs) / FANOUT × FANOUT / (FANOUT − 1) + LEVELS) × Slot<TrieNode> + 67 × page + min(journal_bytes, (files + dirs) × (2 × size_of::<OpRecord>() + path))",
     [
       "struct sizes",
       "the block classes",

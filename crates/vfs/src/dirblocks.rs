@@ -47,8 +47,10 @@ pub const SMALLEST_CLASS: usize = (HEADER_BYTES
 /// to a power of two), and at least three entries at the longest name (`16 + 3 × (24 + 255)` = 853), which a B+-tree
 /// block needs to split and still take an insert.
 pub const LARGEST_CLASS: usize = max(
-  (HEADER_BYTES + MEASURED_DIR_ENTRIES * (ENTRY_BYTES + crate::dir::MEASURED_NAME_BYTES)).next_power_of_two(),
-  (HEADER_BYTES + MIN_ENTRIES_AT_NAME_MAX * (ENTRY_BYTES + crate::names::NAME_MAX)).next_power_of_two(),
+  (HEADER_BYTES + MEASURED_DIR_ENTRIES * (ENTRY_BYTES + crate::dir::MEASURED_NAME_BYTES))
+    .next_power_of_two(),
+  (HEADER_BYTES + MIN_ENTRIES_AT_NAME_MAX * (ENTRY_BYTES + crate::names::NAME_MAX))
+    .next_power_of_two(),
 );
 
 /// Shape: the entries a full block holds at the longest name, at the least: two to split, three so a block left by a
@@ -266,7 +268,10 @@ impl Page {
     let Some(generation) = self.generations.get_mut(usize::from(slot)) else {
       return;
     };
-    match generation.checked_add(1).filter(|next| *next <= GENERATION_LIMIT) {
+    match generation
+      .checked_add(1)
+      .filter(|next| *next <= GENERATION_LIMIT)
+    {
       Some(next) => {
         *generation = next;
         let head = self.free_head;
@@ -296,10 +301,7 @@ impl BlockRef {
   pub fn words(self) -> (u64, u32) {
     let page =
       (u64::from(self.page.index()) << HANDLE_INDEX_SHIFT) | u64::from(self.page.generation());
-    (
-      page,
-      u32::from(self.slot) | (self.generation << SLOT_BITS),
-    )
+    (page, u32::from(self.slot) | (self.generation << SLOT_BITS))
   }
 
   /// The reference two words name ([`BlockRef::words`]).
@@ -358,9 +360,7 @@ impl BlockStore {
   /// real directory's block), in whole pages, and a page for every class beside them, so a store holds a block of every
   /// class at once at any cap (`ceil(max_blocks × 256 / 65,536) + 17`).
   pub fn max_pages(max_blocks: usize) -> usize {
-    max_blocks
-      .div_ceil(SLOTS_MAX)
-      .saturating_add(CLASSES)
+    max_blocks.div_ceil(SLOTS_MAX).saturating_add(CLASSES)
   }
 
   /// The bytes one block of the cap costs at its bound: a page slot's bytes over the smallest class's slots in it.
@@ -455,7 +455,11 @@ impl BlockStore {
     let slot = held.take().ok_or(MemError::SlabFull {
       capacity: held.slots(),
     })?;
-    let generation = held.generations.get(usize::from(slot)).copied().unwrap_or(RETIRED);
+    let generation = held
+      .generations
+      .get(usize::from(slot))
+      .copied()
+      .unwrap_or(RETIRED);
     let full = !held.has_free();
     if full {
       self.unlink(page)?;
@@ -597,7 +601,8 @@ impl BlockStore {
     let mut at = self.heads.get(class).copied()?;
     while let Some(page) = self.handle_at(at) {
       let held = self.pages.get(page).ok()?;
-      let sound = usize::from(held.class) == class && held.has_free() && held.listed && held.prev == prev;
+      let sound =
+        usize::from(held.class) == class && held.has_free() && held.listed && held.prev == prev;
       if !sound || count > self.pages.len() {
         return None;
       }
@@ -624,7 +629,8 @@ mod tests {
     assert_eq!(
       (0..CLASSES).map(class_bytes).collect::<Vec<_>>(),
       vec![
-        256, 320, 384, 448, 512, 640, 768, 896, 1024, 1280, 1536, 1792, 2048, 2560, 3072, 3584, 4096
+        256, 320, 384, 448, 512, 640, 768, 896, 1024, 1280, 1536, 1792, 2048, 2560, 3072, 3584,
+        4096
       ]
     );
     assert_eq!(class_for(2644).map(class_bytes), Some(3072));
@@ -696,7 +702,10 @@ mod tests {
       Op::Stale(at) => {
         if let Some(block) = model.dead.get(at % model.dead.len().max(1)) {
           assert!(store.get(*block).is_err(), "a freed block still resolves");
-          assert!(store.discard(*block).is_err(), "a freed block discards twice");
+          assert!(
+            store.discard(*block).is_err(),
+            "a freed block discards twice"
+          );
         }
       }
       Op::Rewrite(at, fill) => {
@@ -713,16 +722,25 @@ mod tests {
     for (block, class, fill) in model.live.values() {
       let bytes = store.get(*block).unwrap();
       assert_eq!(bytes.len(), class_bytes(*class));
-      assert!(bytes.iter().all(|b| b == fill), "a block's bytes were overwritten");
+      assert!(
+        bytes.iter().all(|b| b == fill),
+        "a block's bytes were overwritten"
+      );
     }
     let census = store.census();
     for (class, counted) in census.iter().enumerate() {
       let expected = model.live.values().filter(|(_, c, _)| *c == class).count();
       assert_eq!(counted.blocks, expected, "class {class}'s blocks");
       // An emptied page goes back to the slab, so every page held holds a block.
-      assert!(counted.pages <= counted.blocks, "class {class}: an empty page kept");
+      assert!(
+        counted.pages <= counted.blocks,
+        "class {class}: an empty page kept"
+      );
     }
-    assert!(store.lists_are_sound(), "the class lists drifted from the pages");
+    assert!(
+      store.lists_are_sound(),
+      "the class lists drifted from the pages"
+    );
   }
 
   proptest! {
@@ -750,7 +768,9 @@ mod tests {
   fn an_emptied_page_serves_another_class() {
     let mut store = BlockStore::new(4, 1 << 12);
     let small = vec![1u8; class_bytes(0)];
-    let first: Vec<BlockRef> = (0..slots_per_page(0)).map(|_| store.insert(&small).unwrap()).collect();
+    let first: Vec<BlockRef> = (0..slots_per_page(0))
+      .map(|_| store.insert(&small).unwrap())
+      .collect();
     let second = store.insert(&small).unwrap();
     assert_eq!(store.pages(), 2);
     for block in first {

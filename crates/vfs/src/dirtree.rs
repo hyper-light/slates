@@ -23,12 +23,12 @@
 //! the root); a block is at most twice the class that fits its live bytes while the store has room; blocks the head
 //! replaces or drops go to the caller as `(block, born)` pairs for the epoch rule of §4.5.
 
+use crate::dir::Child;
 pub use crate::dirblocks::ENTRY_BYTES;
 use crate::dirblocks::{
   BlockRef, BlockStore, HEADER_BYTES, LARGEST_CLASS, MIN_ENTRIES_AT_NAME_MAX, SMALLEST_CLASS,
   fitted_size,
 };
-use crate::dir::Child;
 use crate::error::VfsError;
 use crate::ids::{Epoch, InodeNo};
 use crate::names::NameEquivalence;
@@ -456,29 +456,41 @@ impl BlockMut<'_> {
     slot.name_off = u16::try_from(name_start).unwrap_or(0);
     slot.name_len = u8::try_from(len).unwrap_or(u8::MAX);
     // Both ranges end at or below `entry_at(count + 1) <= name_start`, inside the block.
-    self
-      .bytes
-      .copy_within(entry_at(at)..entry_at(count), entry_at(at.saturating_add(1)));
+    self.bytes.copy_within(
+      entry_at(at)..entry_at(count),
+      entry_at(at.saturating_add(1)),
+    );
     self.set_slot(at, slot);
     self.set_half(COUNT_AT, count.saturating_add(1));
   }
 
-  /// Removes entry `at`, leaving its name bytes as a hole that a later compaction reclaims.
+  /// Removes entry `at`: its name bytes go back at once when they are the lowest in the name area, and are otherwise
+  /// left as a hole that a later compaction reclaims.
   fn remove_at(&mut self, at: usize) -> Slot {
     let block = self.read();
     let (count, slot) = (block.count(), block.slot(at));
     if at >= count {
       return slot;
     }
-    let dead = block.names_dead().saturating_add(usize::from(slot.name_len));
-    let used = block.names_used();
+    let len = usize::from(slot.name_len);
+    let mut used = block.names_used();
+    let mut dead = block.names_dead();
+    // Names are written downward from the block's end, so the name written last is the lowest: its bytes go back at
+    // once, and a create and unlink of the same name never leaves a hole for a compaction (A-203).
+    if usize::from(slot.name_off) == block.size().saturating_sub(used) {
+      used = used.saturating_sub(len);
+      self.set_half(NAMES_USED_AT, used);
+    } else {
+      dead = dead.saturating_add(len);
+    }
     // `at < count`, so both ranges lie inside the slot area.
-    self
-      .bytes
-      .copy_within(entry_at(at.saturating_add(1))..entry_at(count), entry_at(at));
+    self.bytes.copy_within(
+      entry_at(at.saturating_add(1))..entry_at(count),
+      entry_at(at),
+    );
     self.set_half(COUNT_AT, count.saturating_sub(1));
     self.set_half(NAMES_DEAD_AT, dead);
-    if dead >= used.saturating_sub(dead) {
+    if dead > 0 && dead >= used.saturating_sub(dead) {
       self.compact_names();
     }
     slot
@@ -649,7 +661,9 @@ impl Tree {
     Self::holding(
       blocks,
       epoch,
-      entries.saturating_mul(ENTRY_BYTES).saturating_add(name_bytes),
+      entries
+        .saturating_mul(ENTRY_BYTES)
+        .saturating_add(name_bytes),
     )
   }
 
@@ -878,9 +892,7 @@ impl Tree {
     if fits {
       0
     } else {
-      usize::from(self.height)
-        .saturating_mul(2)
-        .saturating_add(1)
+      usize::from(self.height).saturating_mul(2).saturating_add(1)
     }
   }
 
@@ -1170,7 +1182,9 @@ impl Tree {
   ) -> Result<(), VfsError> {
     if depth == 0 {
       self.collapse_root(blocks, retired)?;
-      return self.shrink_if_sparse(blocks, retired, path, 0, self.root).map(drop);
+      return self
+        .shrink_if_sparse(blocks, retired, path, 0, self.root)
+        .map(drop);
     }
     let (block, _) = step(path, Some(depth))?;
     let (parent, parent_at) = step(path, depth.checked_sub(1))?;
@@ -1642,7 +1656,12 @@ mod tests {
       assert_eq!(removed, f.model.remove(&keyed(POLICY, name)));
     }
     assert_equal_to_model(&f);
-    let held: usize = f.tree.block_sizes(&f.blocks).iter().map(|(_, size, _)| size).sum();
+    let held: usize = f
+      .tree
+      .block_sizes(&f.blocks)
+      .iter()
+      .map(|(_, size, _)| size)
+      .sum();
     assert!(
       held < 4 * f.model.len() * (ENTRY_BYTES + 60),
       "merges keep the blocks from spreading: {held} bytes of block for {} entries",
@@ -1835,16 +1854,32 @@ mod tests {
       let name = format!("{n:0>42}.rlib.d");
       assert_eq!(name.len(), crate::dir::MEASURED_NAME_BYTES);
       tree
-        .insert(&mut blocks, Epoch(1), &mut retired, POLICY, &name, Child::File(InodeNo(u64::try_from(n).unwrap())))
+        .insert(
+          &mut blocks,
+          Epoch(1),
+          &mut retired,
+          POLICY,
+          &name,
+          Child::File(InodeNo(u64::try_from(n).unwrap())),
+        )
         .unwrap();
-      sizes.extend(tree.block_sizes(&blocks).into_iter().map(|(_, size, _)| size));
+      sizes.extend(
+        tree
+          .block_sizes(&blocks)
+          .into_iter()
+          .map(|(_, size, _)| size),
+      );
     }
     let held = tree.block_sizes(&blocks);
     assert_eq!(held.len(), 1, "one block: {held:?}");
     assert_eq!(held[0].1, 3072);
     assert_eq!(tree.height, 1);
     assert!(sizes.len() >= 10, "grew through the classes: {sizes:?}");
-    assert_eq!(retired.len(), sizes.len() - 1, "each growth retired the block it replaced");
+    assert_eq!(
+      retired.len(),
+      sizes.len() - 1,
+      "each growth retired the block it replaced"
+    );
   }
 
   /// A-203. Do: insert 600 names, then remove all but ten, at one epoch. Expect: the tree lists the model at every
@@ -1856,27 +1891,68 @@ mod tests {
     let mut tree = Tree::new(&mut blocks, Epoch(1)).unwrap();
     let mut retired = Retired::new();
     let mut model = Model::new();
-    let names: Vec<String> = (0..600).map(|n| format!("file-{n}-{}", "z".repeat(n % 23))).collect();
+    let names: Vec<String> = (0..600)
+      .map(|n| format!("file-{n}-{}", "z".repeat(n % 23)))
+      .collect();
     for (n, name) in names.iter().enumerate() {
       let child = Child::File(InodeNo(u64::try_from(n).unwrap()));
-      tree.insert(&mut blocks, Epoch(1), &mut retired, POLICY, name, child).unwrap();
+      tree
+        .insert(&mut blocks, Epoch(1), &mut retired, POLICY, name, child)
+        .unwrap();
       model.insert(keyed(POLICY, name), child);
     }
-    let full: usize = tree.block_sizes(&blocks).iter().map(|(_, size, _)| size).sum();
+    let full: usize = tree
+      .block_sizes(&blocks)
+      .iter()
+      .map(|(_, size, _)| size)
+      .sum();
     assert!(tree.height >= 2, "split");
     for name in names.iter().skip(10) {
-      tree.remove(&mut blocks, Epoch(1), &mut retired, POLICY, name).unwrap();
+      tree
+        .remove(&mut blocks, Epoch(1), &mut retired, POLICY, name)
+        .unwrap();
       model.remove(&keyed(POLICY, name));
       assert_classes_fit(&tree, &blocks);
     }
     let expected: Vec<(u64, String)> = model.keys().cloned().collect();
     assert_eq!(listed(&tree, &blocks), expected);
-    let left: usize = tree.block_sizes(&blocks).iter().map(|(_, size, _)| size).sum();
-    assert!(left <= 1024, "{left} bytes of block left for ten entries (full: {full})");
+    let left: usize = tree
+      .block_sizes(&blocks)
+      .iter()
+      .map(|(_, size, _)| size)
+      .sum();
+    assert!(
+      left <= 1024,
+      "{left} bytes of block left for ten entries (full: {full})"
+    );
     // Every block the tree replaced or dropped is retired, and the store holds exactly the tree's own.
     for (block, _) in retired.drain(..) {
       blocks.discard(block).unwrap();
     }
     assert_eq!(blocks.len(), tree.block_sizes(&blocks).len());
   }
+
+  /// A-203 (the measured insert-and-remove regression). Do: fill a tree's one leaf with 20 names, then insert and
+  /// remove one more name 1,000 times, as a create and unlink of a temporary file does. Expect: the leaf is the same
+  /// block throughout and holds no dead name bytes afterwards: the name written last is the lowest in the name area,
+  /// so its removal hands its bytes back at once, and the round trip never compacts the block (before: every few
+  /// rounds, since a fitted block's slack is a few dozen bytes).
+  #[test]
+  fn a_name_removed_after_it_was_written_leaves_no_hole() {
+    let mut blocks = slab();
+    let mut tree = Tree::new(&mut blocks, Epoch(1)).unwrap();
+    let mut retired = Retired::new();
+    for n in 0..20u64 {
+      let name = format!("resident-{n}");
+      tree.insert(&mut blocks, Epoch(1), &mut retired, POLICY, &name, Child::File(InodeNo(n))).unwrap();
+    }
+    let leaf = tree.root;
+    for _ in 0..1000 {
+      tree.insert(&mut blocks, Epoch(1), &mut retired, POLICY, "temporary", Child::File(InodeNo(99))).unwrap();
+      assert!(tree.remove(&mut blocks, Epoch(1), &mut retired, POLICY, "temporary").unwrap().is_some());
+      assert_eq!(tree.root, leaf, "the round trip kept its block");
+      assert_eq!(view(&blocks, leaf).unwrap().names_dead(), 0, "a hole was left");
+    }
+  }
 }
+
