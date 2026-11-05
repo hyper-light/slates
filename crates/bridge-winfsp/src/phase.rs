@@ -12,6 +12,8 @@ static REPLY_SENT: AtomicU64 = AtomicU64::new(0);
 thread_local! {
   /// The operation the shard is answering, and when its last stage ended.
   static SHARD: Cell<(&'static str, Option<Instant>)> = const { Cell::new(("none", None)) };
+  /// When this shard last finished answering.
+  static LAST_ANSWER: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 pub const HOP: u32 = 1;
 pub const SERVICE: u32 = 2;
@@ -22,9 +24,9 @@ pub const SERVED_TO_ANSWER: u32 = 6;
 pub const PUBLISH: u32 = 7;
 pub const REPLY_SEND: u32 = 8;
 pub const REPLY_WAKE: u32 = 9;
-const STAGES: [&str; 10] = [
+const STAGES: [&str; 15] = [
   "other", "hop", "service", "send_and_wake", "queue", "before_service", "served_to_answer", "publish", "reply_send",
-  "reply_wake",
+  "reply_wake", "queue_idle_under_20us", "queue_idle_under_50us", "queue_idle_under_200us", "queue_idle_under_1ms", "queue_idle_longer",
 ];
 pub fn note(name: &'static str, kind: u32, started: Instant) {
   let elapsed = u32::try_from(started.elapsed().as_nanos()).unwrap_or(u32::MAX);
@@ -38,6 +40,18 @@ fn now_ns() -> u64 {
 /// The shard took a request sent at `sent`.
 pub fn picked(name: &'static str, sent: Instant) {
   note(name, QUEUE, sent);
+  // The queue wait by how long the shard had been idle when the request was sent.
+  if let Some(last) = LAST_ANSWER.get() {
+    let idle = sent.saturating_duration_since(last).as_micros();
+    let bucket = match idle {
+      0..20 => 10,
+      20..50 => 11,
+      50..200 => 12,
+      200..1000 => 13,
+      _ => 14,
+    };
+    note(name, bucket, sent);
+  }
   SHARD.set((name, Some(Instant::now())));
 }
 /// The shard's service of the picked request begins; returns when, for its end.
@@ -77,6 +91,7 @@ pub fn replied() {
   if let Some(stage) = stage {
     note(name, REPLY_SEND, stage);
   }
+  LAST_ANSWER.set(Some(Instant::now()));
 }
 /// The waiting thread has the reply.
 pub fn reply_woke(name: &'static str) {
