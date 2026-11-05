@@ -304,6 +304,37 @@ impl Supervisor {
     }
   }
 
+  /// Waits out `pause` between supervision steps, or less (A-213): until a daemon sends on the hold channel or the
+  /// daemon exits, as the Unix anchor polls its channel and the daemon's exit. The channel's wake is the event of a read
+  /// the hold keeps posted; the exit's is the daemon's process handle. Before 2026-11-04 the Windows anchor parked the
+  /// whole pause (up to half the liveness budget, 500 ms), so each WinFsp mount's hold and each unmount's release
+  /// waited for it. With nothing to wait on, or a wait the OS refuses, the pause is parked out, so the loop never spins.
+  #[cfg(windows)]
+  pub fn await_work(&mut self, pause: std::time::Duration) {
+    use windows_sys::Win32::Foundation::{HANDLE, WAIT_FAILED};
+    use windows_sys::Win32::System::Threading::{INFINITE, WaitForMultipleObjects};
+    /// Format: nanoseconds in a millisecond, to round the pause up to the wait's unit.
+    const NS_PER_MS: u128 = 1_000_000;
+    let hold = self.windows_handles.as_mut().and_then(windows::Hold::wake);
+    let exit = self.child.as_ref().map(Child::raw);
+    let waits: Vec<HANDLE> = hold.into_iter().chain(exit).collect();
+    let count = u32::try_from(waits.len()).unwrap_or(0);
+    // Rounded up, so a pause under a millisecond is not a wait of none; below INFINITE, which never times out.
+    let timeout = u32::try_from(pause.as_nanos().div_ceil(NS_PER_MS))
+      .unwrap_or(u32::MAX)
+      .min(INFINITE.saturating_sub(1));
+    if count == 0 {
+      std::thread::park_timeout(pause);
+      return;
+    }
+    // SAFETY: `waits` holds `count` live handles this supervisor owns (the posted read's event, the daemon's process
+    // handle), and nothing here closes them during the call; any one of them signalled ends the wait.
+    let waited = unsafe { WaitForMultipleObjects(count, waits.as_ptr(), 0, timeout) };
+    if waited == WAIT_FAILED {
+      std::thread::park_timeout(pause);
+    }
+  }
+
   /// Entries held for the Windows daemon's successors, observed through the same hold that the spawn uses.
   #[cfg(windows)]
   pub fn held_handles(&self) -> usize {
