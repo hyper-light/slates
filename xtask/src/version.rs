@@ -83,22 +83,28 @@ pub(crate) struct Platform {
   /// The Rust target triple (`aarch64-apple-darwin`).
   pub(crate) triple: String,
   /// napi's platform id: the platform directory and the package suffix (`darwin-arm64`,
-  /// `linux-x64-gnu`, `win32-ia32-msvc`).
+  /// `linux-x64-gnu`, `win32-arm64-msvc`).
   pub(crate) id: String,
   /// Node's `process.platform` value (`darwin`, `linux`, `win32`).
   pub(crate) os: &'static str,
-  /// Node's `process.arch` value (`arm64`, `x64`, `ia32`).
+  /// Node's `process.arch` value (`arm64`, `x64`).
   pub(crate) cpu: &'static str,
   /// The C library npm's `libc` field names on Linux (`glibc`, `musl`); none elsewhere.
   pub(crate) libc: Option<&'static str>,
 }
 
 /// napi's rule for a target triple (Node's platform and arch names plus the C library), restricted
-/// to the systems slates ships; anything else is an unknown target, never a guess.
+/// to the targets slates ships (`targets::ASSETS`); anything else is an unknown target, never a guess.
 pub(crate) fn platform_of(triple: &str) -> Result<Platform, Finding> {
   let unknown = || Finding::UnknownTarget {
     triple: triple.to_owned(),
   };
+  if !crate::targets::ASSETS
+    .iter()
+    .any(|(shipped, _)| *shipped == triple)
+  {
+    return Err(unknown());
+  }
   let parts: Vec<&str> = triple.split('-').collect();
   let (cpu_part, system, abi) = match parts.as_slice() {
     [cpu, _vendor, system] => (*cpu, *system, None),
@@ -125,7 +131,6 @@ fn node_arch(cpu: &str) -> Option<&'static str> {
   match cpu {
     "x86_64" => Some("x64"),
     "aarch64" => Some("arm64"),
-    "i686" => Some("ia32"),
     _ => None,
   }
 }
@@ -139,6 +144,15 @@ fn node_platform(system: &str, abi: Option<&str>) -> Option<(&'static str, Optio
     ("windows", Some("msvc")) => Some(("win32", None)),
     _ => None,
   }
+}
+
+/// The shipped triples, comma-separated, for a refusal's message.
+fn shipped_triples() -> String {
+  crate::targets::ASSETS
+    .iter()
+    .map(|(triple, _)| *triple)
+    .collect::<Vec<_>>()
+    .join(", ")
 }
 
 /// The facts the audit judges, read once from the tree (or built by a test).
@@ -229,8 +243,10 @@ pub(crate) enum Finding {
     found: String,
     expected: String,
   },
-  /// A `napi.targets` entry names a system slates does not ship.
+  /// A `napi.targets` entry names a target slates does not ship.
   UnknownTarget { triple: String },
+  /// A target slates ships that `napi.targets` does not name: the npm package would not load there.
+  ShippedTargetMissing { triple: String },
   /// A `napi.targets` entry has no platform directory.
   MissingPlatformDirectory { platform: String, triple: String },
   /// A platform directory names no `napi.targets` entry.
@@ -292,7 +308,12 @@ impl fmt::Display for Finding {
       ),
       Self::UnknownTarget { triple } => write!(
         f,
-        "{NODE_PACKAGE}: napi.targets names `{triple}`, which is not a system slates ships (darwin, linux-gnu, linux-musl, windows-msvc on x86_64, aarch64 or i686)"
+        "{NODE_PACKAGE}: napi.targets names `{triple}`, which is not a target slates ships ({})",
+        shipped_triples()
+      ),
+      Self::ShippedTargetMissing { triple } => write!(
+        f,
+        "{NODE_PACKAGE}: napi.targets does not name `{triple}`, a target slates ships; add it, create its directory with `napi create-npm-dirs` in crates/sdk-node, then `cargo xtask version --write`"
       ),
       Self::MissingPlatformDirectory { platform, triple } => write!(
         f,
@@ -400,6 +421,13 @@ fn audit_platforms(truth: &Truth, findings: &mut Vec<Finding>) {
           Some(package) => audit_platform(package, &platform, truth, findings),
         }
       }
+    }
+  }
+  for (shipped, _) in crate::targets::ASSETS {
+    if !truth.root.targets.iter().any(|triple| triple == shipped) {
+      findings.push(Finding::ShippedTargetMissing {
+        triple: (*shipped).to_owned(),
+      });
     }
   }
   for dir in &truth.platform_dirs {
@@ -986,8 +1014,8 @@ mod tests {
 
   use super::*;
 
-  /// The nine triples slates ships, with napi's platform id and npm's selection fields for each.
-  const SHIPPED: [(&str, &str, &str, &str, Option<&str>); 9] = [
+  /// The seven triples slates ships, with napi's platform id and npm's selection fields for each.
+  const SHIPPED: [(&str, &str, &str, &str, Option<&str>); 7] = [
     (
       "aarch64-apple-darwin",
       "darwin-arm64",
@@ -995,7 +1023,6 @@ mod tests {
       "arm64",
       None,
     ),
-    ("x86_64-apple-darwin", "darwin-x64", "darwin", "x64", None),
     (
       "x86_64-unknown-linux-gnu",
       "linux-x64-gnu",
@@ -1036,13 +1063,6 @@ mod tests {
       "win32-arm64-msvc",
       "win32",
       "arm64",
-      None,
-    ),
-    (
-      "i686-pc-windows-msvc",
-      "win32-ia32-msvc",
-      "win32",
-      "ia32",
       None,
     ),
   ];
@@ -1110,6 +1130,9 @@ mod tests {
       "wasm32-wasi",
       "aarch64-linux-android",
       "x86_64-pc-windows-gnu",
+      // napi names these, and slates shipped them until 2026-10-20: Mac Intel and 32-bit Windows.
+      "x86_64-apple-darwin",
+      "i686-pc-windows-msvc",
       "nonsense",
     ] {
       assert_eq!(
@@ -1120,6 +1143,37 @@ mod tests {
         "{stranger}"
       );
     }
+  }
+
+  /// A-210: do drop a shipped target from `napi.targets` (and its directory and pin, as `napi` would), and add one
+  /// slates no longer ships; expect the missing one named and the stranger refused, so the npm lane builds exactly the
+  /// targets the binary release ships.
+  #[test]
+  fn napi_targets_name_exactly_the_shipped_targets() {
+    let mut truth = consistent("@hyper-light/slates", "0.1.0");
+    truth
+      .root
+      .targets
+      .retain(|triple| triple != "aarch64-pc-windows-msvc");
+    truth.platforms.remove("win32-arm64-msvc");
+    truth.platform_dirs.retain(|dir| dir != "win32-arm64-msvc");
+    truth
+      .root
+      .optional_dependencies
+      .remove("@hyper-light/slates-win32-arm64-msvc");
+    truth.root.targets.push("i686-pc-windows-msvc".to_owned());
+    let findings = audit(&truth);
+    assert_eq!(
+      findings,
+      vec![
+        Finding::UnknownTarget {
+          triple: "i686-pc-windows-msvc".to_owned()
+        },
+        Finding::ShippedTargetMissing {
+          triple: "aarch64-pc-windows-msvc".to_owned()
+        },
+      ]
+    );
   }
 
   #[test]
@@ -1135,13 +1189,13 @@ mod tests {
     package.version = "0.0.9".to_owned();
     package.name = "slates-linux-x64-musl".to_owned();
     truth.root.optional_dependencies.insert(
-      "@hyper-light/slates-win32-ia32-msvc".to_owned(),
+      "@hyper-light/slates-win32-arm64-msvc".to_owned(),
       "0.0.1".to_owned(),
     );
     truth
       .root
       .optional_dependencies
-      .remove("@hyper-light/slates-darwin-x64");
+      .remove("@hyper-light/slates-darwin-arm64");
     truth.root.optional_dependencies.insert(
       "@hyper-light/slates-freebsd-x64".to_owned(),
       "0.1.0".to_owned(),
@@ -1163,12 +1217,12 @@ mod tests {
       expected: "@hyper-light/slates-linux-x64-musl".to_owned(),
     }));
     assert!(findings.contains(&Finding::OptionalDependencyDrift {
-      name: "@hyper-light/slates-win32-ia32-msvc".to_owned(),
+      name: "@hyper-light/slates-win32-arm64-msvc".to_owned(),
       found: "0.0.1".to_owned(),
       expected: "0.1.0".to_owned(),
     }));
     assert!(findings.contains(&Finding::OptionalDependencyMissing {
-      name: "@hyper-light/slates-darwin-x64".to_owned(),
+      name: "@hyper-light/slates-darwin-arm64".to_owned(),
     }));
     assert!(findings.contains(&Finding::OptionalDependencyStray {
       name: "@hyper-light/slates-freebsd-x64".to_owned(),
@@ -1328,7 +1382,7 @@ mod tests {
     let (darwin, _) = stub_platform(
       &truth.root,
       &source,
-      &platform_of("x86_64-apple-darwin").unwrap(),
+      &platform_of("aarch64-apple-darwin").unwrap(),
     );
     assert!(darwin.get("libc").is_none());
   }

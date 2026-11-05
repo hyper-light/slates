@@ -17,8 +17,8 @@ the thin synchronous facade.
 npm install @hyper-light/slates
 ```
 
-`@hyper-light/slates` ships a prebuilt native addon per platform (macOS arm64/x64; Linux glibc and
-musl, x64/arm64; Windows x64/arm64/ia32), resolved for your `process.platform`/`arch` as an
+`@hyper-light/slates` ships a prebuilt native addon per platform (macOS arm64; Linux glibc and
+musl, x64/arm64; Windows x64/arm64), resolved for your `process.platform`/`arch` as an
 `optionalDependency` (`@hyper-light/slates-<platform>`) — no build toolchain is needed to install.
 Node 18 or newer. From a source checkout instead: `npm run build` (napi; needs a Rust toolchain)
 produces the platform `.node` next to `index.js`, which the loader prefers. How a release is cut and
