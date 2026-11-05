@@ -13491,11 +13491,26 @@ the second wins. The crash rule is extended to keep A-198's guarantee across wor
 8. **A death during recovery.** Passing over writes nothing, and the plan depends only on stamps and addresses. So a
    second recovery plans the same. Answering follows A-198's save-then-send.
 
-**The count is derived, never named per architecture** (R3, R8). At the first mount in a process, the receiver measures the
-open-and-close hand-off on a hidden probe volume with one waiting worker and with two, in interleaved rounds. It takes two
-only where every two-worker round's p50 is below every one-worker round's p50, so beyond the spread, and one otherwise. It
-logs the rounds and the count. On run 42123092900's data that gives two on arm64 and one on x86_64, without the code naming
-either.
+**The count is derived, never named per architecture** (R3, R8). At the first mount in a process the receiver measures
+the hand-off itself (`crates/bridge-winfsp/src/probe.rs`). It makes a hidden WinFsp volume with no drive and no file
+system behind it, created with a mount's own parameters. It serves it with one waiting worker and then with two, through the
+worker's own receive and send calls and its own journal, in five interleaved rounds of each whose order rotates. A client
+on the probing thread opens an absent name through the volume's device path (`\\?\GLOBALROOT\Device\Volume{...}`),
+200 timed opens a round after 20 untimed, each Create answered "not found" at once. So the rounds differ only in how many
+workers wait. A transact waits inside the call (`src/sys/fsctl.c:95-99`), so a round ends its workers by requests, not
+by cancelling their waits. After the timed opens the client keeps opening until every worker has ended; a worker ends
+once it answers a request received after that point, and counts itself ending before it sends that response, so no open
+is made with no worker left to receive it. The count is the larger only where every one of its rounds'
+medians is below every round's median with fewer (`capture::workers_beyond_spread`, tested on every host), so beyond both
+spreads, and one otherwise. The probe logs every round's median and the count, and the process keeps the count. Any other
+answer to a probe open refuses the mount, since the probe would be timing something else. The library's own tests run
+every mount with the most workers, so the live kill oracle proves the two-worker recovery on both lanes whatever their
+probe derives. The CLI's tests and the A/B run the derived count. On run 42123092900's data the rule gives two on arm64
+and one on x86_64, without the code naming either.
+
+**No operation guard.** Two workers call the DLL's operation table at once, as the DLL's own dispatcher threads do.
+WinFsp's guard (`src/dll/fsop.c`, `FspFileSystemOpEnter`) orders only a file system's own namespace work. Each slates
+callback is one message to the shard, which serves one at a time, so the guard would order nothing more.
 
 **Proof obligations.**
 - A model oracle: two workers interleaved over one serial model of the driver's queues, a freed address handed to the next

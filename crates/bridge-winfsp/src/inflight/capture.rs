@@ -406,6 +406,30 @@ fn saved_response(bytes: &[u8]) -> Result<Option<&[u8]>, Refusal> {
   Ok(Some(response))
 }
 
+/// How many receive workers to run, from the probe's medians (A-219): `medians[n]` holds each round's median with `n + 1`
+/// workers waiting. One, unless a larger count's every round beats every round of the count chosen so far, so a second
+/// worker is taken only where it wins beyond the spread of both. A count with no rounds is never chosen.
+pub fn workers_beyond_spread(medians: &[Vec<u64>]) -> usize {
+  let mut chosen = 1;
+  let mut chosen_best = medians
+    .first()
+    .and_then(|rounds| rounds.iter().min().copied());
+  for (index, rounds) in medians
+    .iter()
+    .enumerate()
+    .skip(1)
+    .take(MAX_WORKERS.saturating_sub(1))
+  {
+    if let (Some(worst), Some(best)) = (rounds.iter().max().copied(), chosen_best)
+      && worst < best
+    {
+      chosen = index.saturating_add(1);
+      chosen_best = rounds.iter().min().copied();
+    }
+  }
+  chosen
+}
+
 pub(super) fn check_response(bytes: &[u8]) -> Result<(), Refusal> {
   if !(RESPONSE_BASE..=RESPONSE_MAX).contains(&bytes.len())
     || !bytes.len().is_multiple_of(super::ALIGNMENT)
@@ -698,5 +722,31 @@ mod tests {
       receive.received(BATCH_BYTES + 1, 1),
       Err(Refusal::Length)
     ));
+  }
+
+  /// A-219. Do: derive the worker count from probe rounds where two waiting workers win beyond the spread, overlap it,
+  /// lose, or have no rounds. Expect: two only where every two-worker round beats every one-worker round, one otherwise.
+  #[test]
+  fn a_second_worker_is_taken_only_where_every_round_beats_every_round_of_one() {
+    let one = vec![700, 705, 712, 701, 714];
+    assert_eq!(
+      workers_beyond_spread(&[one.clone(), vec![672, 688, 680, 675, 684]]),
+      2
+    );
+    assert_eq!(
+      workers_beyond_spread(&[one.clone(), vec![672, 688, 680, 702, 684]]),
+      1
+    );
+    assert_eq!(
+      workers_beyond_spread(&[one.clone(), vec![700, 690, 680, 675, 684]]),
+      1
+    );
+    assert_eq!(
+      workers_beyond_spread(&[vec![124, 130, 135], vec![146, 149, 147]]),
+      1
+    );
+    assert_eq!(workers_beyond_spread(&[one.clone(), Vec::new()]), 1);
+    assert_eq!(workers_beyond_spread(&[Vec::new(), vec![1, 2]]), 1);
+    assert_eq!(workers_beyond_spread(&[one]), 1);
   }
 }

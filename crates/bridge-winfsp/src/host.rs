@@ -130,7 +130,7 @@ impl std::fmt::Display for WinFspError {
 
 /// Refuses a DLL other than the version the receiver was written from, before anything touches its layout
 /// (`crate::dll_version`). `FspVersion` itself takes no file system.
-fn checked_dll(api: &ffi::Api) -> Result<(), WinFspError> {
+pub(crate) fn checked_dll(api: &ffi::Api) -> Result<(), WinFspError> {
   let mut found = 0u32;
   // SAFETY: the export was found by name in the loaded library, and `found` is a writable word for the call.
   let status = unsafe { (api.version)(&mut found) };
@@ -1819,52 +1819,15 @@ impl Mounted {
       wake,
       security_descriptor,
     }));
-    // SAFETY: an all-zero VolumeParams is a valid, empty parameter block; the fields below fill it.
-    let mut params: VolumeParams = unsafe { std::mem::zeroed() };
-    // Version-1 parameters (the version is the struct's size), so the volume-information timeout is set apart.
-    params.version = u16::try_from(std::mem::size_of::<VolumeParams>()).unwrap_or(0);
-    params.sector_size = SECTOR_SIZE;
-    params.sectors_per_allocation_unit = SECTORS_PER_UNIT;
-    params.max_component_length = MAX_COMPONENT_LENGTH;
-    params.file_info_timeout = FILE_INFO_TIMEOUT_INFINITE;
-    // WinFsp's default, named here because a purge Windows did not take is made again until this passes
-    // (`crate::retry::REQUEST_TIMEOUT_MS`): the two are one number.
-    params.irp_timeout = crate::retry::REQUEST_TIMEOUT_MS;
-    params.transact_timeout = crate::dispatcher::TRANSACT_TIMEOUT_MS;
-    // A closed file's bytes are written back before its close's request (which publishes them) and its pages dropped:
-    // a Windows program's write reaches every other path by its close, not at the cache manager's lazy write-back
-    // seconds later. Without it, CI's first run (40249524066) read a file PowerShell had written and closed as 62 zero
-    // bytes through slates: its size had reached the shard, and its bytes were still in Windows' cache.
-    params.flags = ffi::VOLUME_FLAG_CASE_SENSITIVE_SEARCH
-      | ffi::VOLUME_FLAG_CASE_PRESERVED_NAMES
-      | ffi::VOLUME_FLAG_UNICODE_ON_DISK
-      | ffi::VOLUME_FLAG_PERSISTENT_ACLS
-      | ffi::VOLUME_FLAG_FLUSH_AND_PURGE_ON_CLEANUP
-      // Each open's `FileContext` is its own ledger token (A-198), retired by its own Close. Without this flag the
-      // file node supplies its first open's context to every later open. The old boxed-context implementation freed
-      // that first box twice (run 40251802164); a stable token would likewise name the wrong open.
-      | ffi::VOLUME_FLAG_FILE_CONTEXT_PER_OPEN;
-    if read_only {
-      params.flags |= ffi::VOLUME_FLAG_READ_ONLY_VOLUME;
-    }
-    params.flags_v1 = VOLUME_INFO_TIMEOUT_VALID;
-    params.volume_info_timeout = VOLUME_INFO_TIMEOUT_MS;
-    write_wide(&mut params.file_system_name, "slates");
-
-    let mut file_system: *mut FileSystem = std::ptr::null_mut();
-    let mut device = wide_nul("WinFsp.Disk");
-    // SAFETY: `device`/`params`/`INTERFACE` are live for the call; `file_system` is a writable out-ptr.
-    let status =
-      unsafe { (api.create)(device.as_mut_ptr(), &params, &INTERFACE, &mut file_system) };
-    if status != 0 {
-      // Nothing was created; no callback can reach the handler.
-      // SAFETY: `handler` was just leaked and nothing else holds it.
-      drop(unsafe { Box::from_raw(handler) });
-      return Err(WinFspError::Api {
-        call: "FspFileSystemCreate",
-        status,
-      });
-    }
+    let file_system = match create_file_system(api, &volume_params(read_only), &INTERFACE) {
+      Ok(file_system) => file_system,
+      Err(error) => {
+        // Nothing was created; no callback can reach the handler.
+        // SAFETY: `handler` was just leaked and nothing else holds it.
+        drop(unsafe { Box::from_raw(handler) });
+        return Err(error);
+      }
+    };
     // SAFETY: FspFileSystemCreate returned this initialized public prefix, including the terminated volume name.
     let volume = unsafe { (*file_system).volume_name };
     let mut mounted = Mounted {
@@ -2398,8 +2361,9 @@ fn run_mount(
     wake.wake_by_ref();
   };
   let confirmations = requests.clone();
-  // Shape: the preceding purge's End and the next purge's Begin can be queued before a fresh kernel Create arrives.
-  let (purge_intents, mut private_opens) = match crate::purge_intents::channel() {
+  // How many receive workers, measured once a process (A-219), and one intent channel for each.
+  let channels = crate::probe::receive_workers().and_then(crate::purge_intents::channel);
+  let (purge_intents, mut readers) = match channels {
     Ok(channel) => channel,
     Err(error) => {
       report(Outcome::Mounted(Err(error)));
@@ -2460,7 +2424,7 @@ fn run_mount(
       wake.clone(),
       inherited,
       purge_intents,
-      &mut private_opens,
+      readers.first_mut().ok_or(WinFspError::MountThread)?,
     )?;
     let value = ledger
       .memory()
@@ -2514,7 +2478,12 @@ fn run_mount(
         outcomes.clone(),
         wake.clone(),
         confirmations,
-        crate::dispatcher::PrivateOpens::new(mounted.purge_token.marker(), private_opens),
+        readers
+          .into_iter()
+          .map(|intents| {
+            crate::dispatcher::PrivateOpens::new(mounted.purge_token.marker(), intents)
+          })
+          .collect(),
       ) {
         Ok(worker) => mounted.worker = Some(worker),
         Err(error) => {
@@ -2560,6 +2529,61 @@ fn run_mount(
   }
   drop(mounted);
   report(Outcome::Stopped);
+}
+
+/// The parameters every slates volume is created with, the receive-worker probe's (A-219) as well as a mount's.
+pub(crate) fn volume_params(read_only: bool) -> VolumeParams {
+  // SAFETY: an all-zero VolumeParams is a valid, empty parameter block; the fields below fill it.
+  let mut params: VolumeParams = unsafe { std::mem::zeroed() };
+  // Version-1 parameters (the version is the struct's size), so the volume-information timeout is set apart.
+  params.version = u16::try_from(std::mem::size_of::<VolumeParams>()).unwrap_or(0);
+  params.sector_size = SECTOR_SIZE;
+  params.sectors_per_allocation_unit = SECTORS_PER_UNIT;
+  params.max_component_length = MAX_COMPONENT_LENGTH;
+  params.file_info_timeout = FILE_INFO_TIMEOUT_INFINITE;
+  // WinFsp's default, named here because a purge Windows did not take is made again until this passes
+  // (`crate::retry::REQUEST_TIMEOUT_MS`): the two are one number.
+  params.irp_timeout = crate::retry::REQUEST_TIMEOUT_MS;
+  params.transact_timeout = crate::dispatcher::TRANSACT_TIMEOUT_MS;
+  // A closed file's bytes are written back before its close's request (which publishes them) and its pages dropped:
+  // a Windows program's write reaches every other path by its close, not at the cache manager's lazy write-back
+  // seconds later. Without it, CI's first run (40249524066) read a file PowerShell had written and closed as 62 zero
+  // bytes through slates: its size had reached the shard, and its bytes were still in Windows' cache.
+  params.flags = ffi::VOLUME_FLAG_CASE_SENSITIVE_SEARCH
+    | ffi::VOLUME_FLAG_CASE_PRESERVED_NAMES
+    | ffi::VOLUME_FLAG_UNICODE_ON_DISK
+    | ffi::VOLUME_FLAG_PERSISTENT_ACLS
+    | ffi::VOLUME_FLAG_FLUSH_AND_PURGE_ON_CLEANUP
+    // Each open's `FileContext` is its own ledger token (A-198), retired by its own Close. Without this flag the
+    // file node supplies its first open's context to every later open. The old boxed-context implementation freed
+    // that first box twice (run 40251802164); a stable token would likewise name the wrong open.
+    | ffi::VOLUME_FLAG_FILE_CONTEXT_PER_OPEN;
+  if read_only {
+    params.flags |= ffi::VOLUME_FLAG_READ_ONLY_VOLUME;
+  }
+  params.flags_v1 = VOLUME_INFO_TIMEOUT_VALID;
+  params.volume_info_timeout = VOLUME_INFO_TIMEOUT_MS;
+  write_wide(&mut params.file_system_name, "slates");
+  params
+}
+
+/// Creates a WinFsp disk file system over `interface`, not yet mounted or dispatched. The caller deletes it.
+pub(crate) fn create_file_system(
+  api: &'static Api,
+  params: &VolumeParams,
+  interface: &'static ffi::Interface,
+) -> Result<*mut FileSystem, WinFspError> {
+  let mut file_system: *mut FileSystem = std::ptr::null_mut();
+  let mut device = wide_nul("WinFsp.Disk");
+  // SAFETY: `device`/`params`/`interface` are live for the call; `file_system` is a writable out-ptr.
+  let status = unsafe { (api.create)(device.as_mut_ptr(), params, interface, &mut file_system) };
+  if status != 0 || file_system.is_null() {
+    return Err(WinFspError::Api {
+      call: "FspFileSystemCreate",
+      status,
+    });
+  }
+  Ok(file_system)
 }
 
 /// Builds the "allow Everyone" reference security descriptor as self-relative bytes, from [`EVERYONE_SDDL`].

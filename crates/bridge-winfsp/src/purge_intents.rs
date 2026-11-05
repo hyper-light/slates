@@ -18,9 +18,10 @@ const BOUND: usize = 2;
 /// Format: the intent event follows the control completion event in WaitForMultipleObjects' array.
 const INTENT_READY: u32 = WAIT_OBJECT_0 + 1;
 
+/// The command thread's end: one bounded channel and wake event per receive worker, since any worker may receive the
+/// private Create (A-219).
 pub(crate) struct Sender {
-  messages: SyncSender<Option<Purge>>,
-  event: OwnedHandle,
+  workers: Vec<(SyncSender<Option<Purge>>, OwnedHandle)>,
 }
 
 pub(crate) struct Intents {
@@ -43,56 +44,60 @@ fn new_event(manual_reset: i32, call: &'static str) -> Result<OwnedHandle, WinFs
   Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
 }
 
-pub(crate) fn channel() -> Result<(Sender, Intents), WinFspError> {
-  let event = new_event(0, "create private-intent event")?;
-  let completed = new_event(1, "create transaction completion event")?;
-  let producer = event
-    .as_handle()
-    .try_clone_to_owned()
-    .map_err(|error| WinFspError::Os {
-      call: "duplicate private-intent event",
-      code: error.raw_os_error(),
-    })?;
-  let (sender, messages) = sync_channel(BOUND);
-  Ok((
-    Sender {
-      messages: sender,
-      event: producer,
-    },
-    Intents {
+/// One intent channel for each of `workers` receive workers, all fed by the one [`Sender`].
+pub(crate) fn channel(workers: usize) -> Result<(Sender, Vec<Intents>), WinFspError> {
+  let mut ends = Vec::with_capacity(workers);
+  let mut readers = Vec::with_capacity(workers);
+  for _ in 0..workers {
+    let event = new_event(0, "create private-intent event")?;
+    let completed = new_event(1, "create transaction completion event")?;
+    let producer = event
+      .as_handle()
+      .try_clone_to_owned()
+      .map_err(|error| WinFspError::Os {
+        call: "duplicate private-intent event",
+        code: error.raw_os_error(),
+      })?;
+    let (sender, messages) = sync_channel(BOUND);
+    ends.push((sender, producer));
+    readers.push(Intents {
       messages,
       event,
       completed,
       current: None,
-    },
-  ))
+    });
+  }
+  Ok((Sender { workers: ends }, readers))
 }
 
 impl Sender {
+  /// Publishes `intent` to every worker, in turn; each worker drains its own bounded channel.
   pub(crate) fn publish(&self, intent: Option<Purge>) -> Result<(), WinFspError> {
-    match self.messages.try_send(intent) {
-      Ok(()) => {}
-      Err(TrySendError::Full(intent)) => {
-        // Wake before a blocking send: a rejected drive open may have produced no callback at all.
-        self.signal()?;
-        self
-          .messages
-          .send(intent)
-          .map_err(|_| WinFspError::MountThread)?;
+    for (messages, event) in &self.workers {
+      match messages.try_send(intent.clone()) {
+        Ok(()) => {}
+        Err(TrySendError::Full(intent)) => {
+          // Wake before a blocking send: a rejected drive open may have produced no callback at all.
+          signal(event)?;
+          messages
+            .send(intent)
+            .map_err(|_| WinFspError::MountThread)?;
+        }
+        Err(TrySendError::Disconnected(_)) => return Err(WinFspError::MountThread),
       }
-      Err(TrySendError::Disconnected(_)) => return Err(WinFspError::MountThread),
-    }
-    // Signal after publication as well: the reader may have drained the prior full queue before this send finished.
-    self.signal()
-  }
-
-  fn signal(&self) -> Result<(), WinFspError> {
-    // SAFETY: this producer owns the event with modification rights for the whole synchronous call.
-    if unsafe { SetEvent(self.event.as_raw_handle()) } == 0 {
-      return Err(os_error("signal private intents"));
+      // Signal after publication as well: the reader may have drained the prior full queue before this send finished.
+      signal(event)?;
     }
     Ok(())
   }
+}
+
+fn signal(event: &OwnedHandle) -> Result<(), WinFspError> {
+  // SAFETY: this producer owns the event with modification rights for the whole synchronous call.
+  if unsafe { SetEvent(event.as_raw_handle()) } == 0 {
+    return Err(os_error("signal private intents"));
+  }
+  Ok(())
 }
 
 impl Intents {
@@ -162,7 +167,8 @@ mod tests {
   #[test]
   fn private_purges_make_progress_without_a_kernel_callback() {
     std::thread::scope(|scope| {
-      let (sender, mut intents) = channel().unwrap();
+      let (sender, mut readers) = channel(1).unwrap();
+      let mut intents = readers.pop().unwrap();
       let publisher = scope.spawn(move || {
         for _ in 0..PURGES {
           sender.publish(Some(Purge {
@@ -196,5 +202,28 @@ mod tests {
       assert!(published.is_ok(), "all private messages must be published");
       assert_eq!(received, PURGES * BOUND);
     });
+  }
+
+  /// A-219. Do: publish a Begin and an End to two workers' intents. Expect: each worker reads both, in order, so the
+  /// private Create is authenticated whichever worker receives it.
+  #[test]
+  fn every_worker_reads_every_private_intent() {
+    let (sender, mut readers) = channel(2).unwrap();
+    let purge = Purge {
+      object: slates_bridge_core::ObjectId::new(1, 0),
+      path: "\\file".to_owned(),
+      offset: 0,
+      len: 4096,
+    };
+    sender.publish(Some(purge.clone())).unwrap();
+    for intents in &mut readers {
+      assert_eq!(intents.progress().unwrap(), 1);
+      assert_eq!(intents.current(), Some(&purge));
+    }
+    sender.publish(None).unwrap();
+    for intents in &mut readers {
+      assert_eq!(intents.progress().unwrap(), 1);
+      assert_eq!(intents.current(), None);
+    }
   }
 }

@@ -4,6 +4,11 @@
 //! or ERROR_OPERATION_ABORTED after the successor starts. Each role has a distinct exit, and every process is reaped.
 //! The small volume is reconstructed with the same fixed file in each role: this tests transport settlement, while
 //! CLI's twenty-kill oracle establishes persistence and mapped-view coherence through the real daemon.
+//!
+//! A-219's oracle runs the same fixture under load, served by two receive workers (the library's tests run every mount
+//! with the most, `crate::probe`): reader processes read their own files without the cache while the parent kills the
+//! serving process again and again. Each successor first reports which workers' journals the kill left a batch in, so
+//! the run shows that kills fell while the second worker held one.
 #![allow(
   clippy::unwrap_used,
   clippy::expect_used,
@@ -14,6 +19,7 @@
 use super::*;
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
+use std::os::windows::fs::OpenOptionsExt;
 use std::time::{Duration, Instant};
 
 use slates_anchor::handles::{ENV_HANDLES, HandleMessage, WHAT_WINFSP_MOUNT, parse_env};
@@ -30,7 +36,8 @@ use slates_vfs::names::NameEquivalence;
 use slates_vfs::quota::Quota;
 use slates_vfs::volume::{Store, StoreConfig, Volume, VolumeConfig};
 use windows_sys::Win32::Foundation::{ERROR_OPERATION_ABORTED, WAIT_OBJECT_0, WAIT_TIMEOUT};
-use windows_sys::Win32::System::Threading::WaitForSingleObject;
+use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING;
+use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
 
 /// Format: the role selected by this fixture, the inherited channel's hex handle and its drive text.
 const ROLE: &str = "SLATES_WINFSP_REQUEST_ROLE";
@@ -59,6 +66,29 @@ const ENTRY: u64 = 1;
 const READ_TAKEN: u64 = ENTRY + 1;
 /// Format: a private Released marker: the successor has started on the held control handle.
 const SUCCESSOR_READY: u64 = READ_TAKEN + 1;
+/// Shape: kills in A-219's oracle, twice the takeover history's twenty, so each lane's kills fall in every part of both
+/// workers' cycles.
+const OVERLAP_KILLS: u32 = 40;
+/// Shape: reader processes in A-219's oracle, more than one so both workers hold requests at once.
+const OVERLAP_READERS: usize = 3;
+/// Shape: the files each reader cycles over, so an open's wrong context reads another file's bytes.
+const OVERLAP_FILES: usize = 4;
+/// Shape: the steps of the pause before each kill, in POLLs, so kills fall at different points of a cycle.
+const OVERLAP_PAUSES: u32 = 4;
+/// Format: a private Released marker base: a successor's reading of which journals the kill left a batch in, plus a
+/// set with bit `n` for worker `n`'s journal.
+const LANDING: u64 = SUCCESSOR_READY + 1;
+/// Format: every set of journals holding a batch, one bit a worker.
+const LANDINGS: usize = 1 << crate::inflight::capture::MAX_WORKERS;
+/// Format: a reader's inherited stop event, as a hex handle value, and the index of its first file.
+const STOP: &str = "SLATES_WINFSP_REQUEST_STOP";
+/// Format: see STOP.
+const FIRST_FILE: &str = "SLATES_WINFSP_REQUEST_FIRST_FILE";
+/// Shape: a reader's exits when a request waited past WAIT, and when one was answered with another's bytes or an error
+/// other than the driver's cancellation.
+const LOST_EXIT: i32 = ROLE_EXIT + 1;
+/// Shape: see LOST_EXIT.
+const WRONG_EXIT: i32 = ROLE_EXIT + 2;
 /// Format: this module's full libtest role name; exact filtering must execute it, never zero tests.
 const ROLE_TEST: &str = "host::tests::request_role";
 
@@ -129,6 +159,7 @@ struct Scenario {
   held: Option<Held>,
   reader: Option<Child>,
   probe: Option<Child>,
+  readers: Vec<Child>,
 }
 
 impl Drop for Scenario {
@@ -137,7 +168,12 @@ impl Drop for Scenario {
       server.kill_and_reap();
     }
     self.held = None;
-    for reader in self.reader.iter_mut().chain(self.probe.iter_mut()) {
+    for reader in self
+      .reader
+      .iter_mut()
+      .chain(self.probe.iter_mut())
+      .chain(self.readers.iter_mut())
+    {
       reader.kill_and_reap();
     }
   }
@@ -178,6 +214,7 @@ fn a_read_taken_before_the_kill_is_settled_after_takeover() {
     held: Some(Held::new(1)),
     reader: None,
     probe: None,
+    readers: Vec::new(),
   };
   scenario.servers.push(spawn(
     "first",
@@ -267,11 +304,30 @@ fn fixed_volume(store: &mut Store) -> (Volume, OpContext) {
     bridge.write(object, &cx, 0, &[b'A'; PAGE]).unwrap();
     bridge.release(object, &cx, handle).unwrap();
   }
+  for index in 0..OVERLAP_READERS * OVERLAP_FILES {
+    let (file, handle) = bridge
+      .create(ObjectId::new(root, 0), &cx, &overlap_name(index), 0o644, 0)
+      .unwrap();
+    let object = ObjectId::new(file.ino, file.generation);
+    bridge
+      .write(object, &cx, 0, &[overlap_byte(index); PAGE])
+      .unwrap();
+    bridge.release(object, &cx, handle).unwrap();
+  }
   (volume, cx)
 }
 
+fn overlap_name(index: usize) -> String {
+  format!("overlap{index}")
+}
+
+/// Each overlap file's byte, distinct for every file.
+fn overlap_byte(index: usize) -> u8 {
+  b'a' + u8::try_from(index).unwrap()
+}
+
 fn inherited_controls(role: &str) -> (Channel, Option<Inherited>) {
-  if role == "first" {
+  if role == "first" || role == "serving" {
     let value = u64::from_str_radix(&std::env::var(CHANNEL).unwrap(), 16).unwrap();
     (Channel::adopt(inherited_handle(value)), None)
   } else {
@@ -308,6 +364,17 @@ fn await_ready(mount: &mut MountThread) -> Box<Ready> {
 
 fn serve(role: &str, drive: &str) -> ! {
   let (channel, inherited) = inherited_controls(role);
+  if role == "taking" {
+    let landing = journals_holding_a_batch(&inherited.as_ref().unwrap().ledger);
+    channel
+      .send(
+        &HandleMessage::Released {
+          id: LANDING + landing,
+        },
+        WAIT_MS,
+      )
+      .unwrap();
+  }
   let mut store = fixed_store();
   let (mut volume, cx) = fixed_volume(&mut store);
   let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut volume, &mut store);
@@ -353,7 +420,7 @@ fn serve_mounted(
   cx: &OpContext,
 ) -> ! {
   let mut ready = await_ready(mount);
-  if role == "first" {
+  if role == "first" || role == "serving" {
     channel
       .send(
         &HandleMessage::Hold {
@@ -501,6 +568,9 @@ fn cleanup_once(
 fn request_role() {
   let role = std::env::var(ROLE).unwrap();
   let drive = std::env::var(DRIVE).unwrap();
+  if role == "hammer" {
+    hammer(&drive);
+  }
   if role != "reader" && role != "probe" {
     serve(&role, &drive);
   }
@@ -526,4 +596,251 @@ fn request_role() {
     }
   }
   std::process::exit(ROLE_EXIT);
+}
+
+/// Which workers' journals the dead server left holding a batch, read from a copy before this successor adopts them
+/// (A-219): bit `n` for worker `n`.
+fn journals_holding_a_batch(ledger: &OwnedHandle) -> u64 {
+  let bound = slates_bridge_core::volume_bridge::MAX_OPEN_HANDLES;
+  let memory = SparseObject::from_held_handle(
+    ledger.try_clone().unwrap(),
+    crate::opens::bytes(bound).unwrap(),
+    slates_mem::Words::new(),
+  )
+  .unwrap();
+  let mut holding = 0;
+  for worker in 0..crate::inflight::capture::MAX_WORKERS {
+    let mut captured = vec![0; crate::inflight::capture::BYTES];
+    memory
+      .read(
+        crate::opens::journal_offset(bound, worker).unwrap(),
+        &mut captured,
+      )
+      .unwrap();
+    if crate::inflight::capture::Capture::new(&mut captured)
+      .unwrap()
+      .resume()
+      .unwrap()
+      .is_some()
+    {
+      holding |= 1 << worker;
+    }
+  }
+  holding
+}
+
+/// A sector-aligned page for an unbuffered read, which goes to the server every time.
+#[repr(align(4096))]
+struct AlignedPage([u8; PAGE]);
+
+/// What one read of a reader's own file came to.
+enum Answer {
+  Own,
+  Cancelled,
+  Wrong(String),
+  Stopped,
+}
+
+fn read_own(path: &str, expected: u8) -> Answer {
+  let aborted = |error: &std::io::Error| {
+    error.raw_os_error() == Some(i32::try_from(ERROR_OPERATION_ABORTED).unwrap())
+  };
+  let mut file = match std::fs::OpenOptions::new()
+    .read(true)
+    .custom_flags(FILE_FLAG_NO_BUFFERING)
+    .open(path)
+  {
+    Ok(file) => file,
+    Err(error) if aborted(&error) => return Answer::Cancelled,
+    Err(error) => return Answer::Wrong(format!("open {path}: {error}")),
+  };
+  let mut page = AlignedPage([0; PAGE]);
+  match file.read(&mut page.0) {
+    Ok(PAGE) if page.0.iter().all(|byte| *byte == expected) => Answer::Own,
+    Ok(PAGE) => Answer::Wrong(format!(
+      "{path} read another file's bytes, first {:#x}",
+      page.0[0]
+    )),
+    Ok(short) => Answer::Wrong(format!("{path} read {short} bytes")),
+    Err(error) if aborted(&error) => Answer::Cancelled,
+    Err(error) => Answer::Wrong(format!("read {path}: {error}")),
+  }
+}
+
+/// A-219's reader: reads its own files without the cache until the parent's stop event, each read reported to a
+/// watcher that ends the process LOST_EXIT if one waits past WAIT.
+fn hammer(drive: &str) -> ! {
+  let stop = inherited_handle(u64::from_str_radix(&std::env::var(STOP).unwrap(), 16).unwrap());
+  let first: usize = std::env::var(FIRST_FILE).unwrap().parse().unwrap();
+  let drive = drive.to_owned();
+  let (report, reports) = sync_channel(1);
+  let _reader = std::thread::spawn(move || {
+    let mut turn = 0usize;
+    loop {
+      // SAFETY: the stop event stays owned by this thread for the whole poll.
+      if unsafe { WaitForSingleObject(stop.as_raw_handle(), 0) } == WAIT_OBJECT_0 {
+        let _ = report.send(Answer::Stopped);
+        return;
+      }
+      let index = first + turn % OVERLAP_FILES;
+      turn += 1;
+      let path = format!("{drive}\\{}", overlap_name(index));
+      if report.send(read_own(&path, overlap_byte(index))).is_err() {
+        return;
+      }
+    }
+  });
+  let (mut own, mut cancelled) = (0u64, 0u64);
+  loop {
+    match reports.recv_timeout(WAIT) {
+      Ok(Answer::Own) => own += 1,
+      Ok(Answer::Cancelled) => cancelled += 1,
+      Ok(Answer::Stopped) => break,
+      Ok(Answer::Wrong(why)) => {
+        eprintln!("WINFSP OVERLAP READER {first}: WRONG after {own} reads: {why}");
+        std::process::exit(WRONG_EXIT);
+      }
+      Err(_) => {
+        eprintln!("WINFSP OVERLAP READER {first}: a read waited past {WAIT:?} after {own} reads");
+        std::process::exit(LOST_EXIT);
+      }
+    }
+  }
+  eprintln!(
+    "WINFSP OVERLAP READER {first}: {own} reads returned their own bytes, {cancelled} were cancelled"
+  );
+  std::process::exit(ROLE_EXIT);
+}
+
+/// A-219. Do: keep three processes reading their own files through the held drive, each read going to the server's
+/// two receive workers, and kill the serving process forty times, each successor taking over the held volume and both
+/// journals. Expect: every read returns its own file's bytes or the driver's cancellation, none waits past WAIT, and
+/// some kills left the second worker's journal holding a batch, as each successor reports from the journals it adopts.
+#[test]
+fn every_request_is_answered_with_its_own_response_across_kills_of_two_receive_workers() {
+  if std::env::var_os("WINFSP_TEST_MOUNT").is_none() {
+    eprintln!("SKIP: the two-worker kill oracle needs WINFSP_TEST_MOUNT=1 and WinFsp installed");
+    return;
+  }
+  let drive = free_drive();
+  let (anchor, daemon) = channel().unwrap();
+  let inherited = duplicate_inheritable(daemon.raw()).unwrap();
+  let value = format!("{:x}", handle_value(inherited.raw()));
+  let mut scenario = Scenario {
+    servers: Vec::new(),
+    held: Some(Held::new(1)),
+    reader: None,
+    probe: None,
+    readers: Vec::new(),
+  };
+  scenario.servers.push(spawn(
+    "serving",
+    &drive,
+    &[(OsStr::new(CHANNEL), OsStr::new(&value))],
+    &[inherited.raw()],
+  ));
+  drop(inherited);
+  hold_first_mount(&mut scenario, &anchor);
+  // SAFETY: an unnamed manual-reset event; no security descriptor or name is borrowed.
+  let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+  assert!(!event.is_null(), "the readers' stop event");
+  // SAFETY: CreateEventW returned this fresh handle; the value takes its ownership once.
+  let stop = unsafe { OwnedHandle::from_raw_handle(event) };
+  start_readers(&mut scenario, &stop, &drive);
+  let mut landings = [0u32; LANDINGS];
+  for kill in 1..=OVERLAP_KILLS {
+    let landing = kill_and_take_over(&mut scenario, &anchor, &daemon, &drive, kill);
+    landings[landing] += 1;
+  }
+  // SAFETY: the event is owned and live.
+  assert_ne!(unsafe { SetEvent(stop.as_raw_handle()) }, 0);
+  for reader in &mut scenario.readers {
+    assert_eq!(
+      reader.wait(),
+      Some(ROLE_EXIT),
+      "a reader saw a request lost (exit {LOST_EXIT}) or answered wrong (exit {WRONG_EXIT})"
+    );
+  }
+  eprintln!(
+    "WINFSP OVERLAP: {OVERLAP_KILLS} kills by the journals left holding a batch (bit n: worker n): {:?}; every \
+     reader's requests answered with their own bytes or cancelled",
+    landings.iter().enumerate().collect::<Vec<_>>()
+  );
+  let second = landings
+    .iter()
+    .enumerate()
+    .filter(|(set, _)| set & 2 != 0)
+    .map(|(_, kills)| *kills)
+    .sum::<u32>();
+  assert!(
+    second > 0,
+    "no kill left the second worker holding a batch, so this run proves nothing about it"
+  );
+}
+
+fn hold_first_mount(scenario: &mut Scenario, anchor: &Channel) {
+  let message = anchor
+    .recv(WAIT_MS)
+    .unwrap()
+    .expect("the first mount's hold");
+  let answer = scenario
+    .held
+    .as_mut()
+    .unwrap()
+    .apply(scenario.servers[0].process.raw_handle(), message);
+  assert_eq!(answer, Some(HandleMessage::Held { id: ENTRY }));
+  anchor.send(&answer.unwrap(), WAIT_MS).unwrap();
+}
+
+fn start_readers(scenario: &mut Scenario, stop: &OwnedHandle, drive: &str) {
+  for reader in 0..OVERLAP_READERS {
+    let shared = duplicate_inheritable(stop.as_raw_handle()).unwrap();
+    let stop_value = format!("{:x}", handle_value(shared.raw()));
+    let first = (reader * OVERLAP_FILES).to_string();
+    scenario.readers.push(spawn(
+      "hammer",
+      drive,
+      &[
+        (OsStr::new(STOP), OsStr::new(&stop_value)),
+        (OsStr::new(FIRST_FILE), OsStr::new(&first)),
+      ],
+      &[shared.raw()],
+    ));
+  }
+}
+
+/// Kills the serving process after a pause that varies with the kill, starts its successor on the held handles, and
+/// returns the landing code the successor read from the journal it adopts.
+fn kill_and_take_over(
+  scenario: &mut Scenario,
+  anchor: &Channel,
+  daemon: &Channel,
+  drive: &str,
+  kill: u32,
+) -> usize {
+  #[allow(clippy::disallowed_methods)]
+  std::thread::sleep(POLL * (kill % OVERLAP_PAUSES));
+  scenario.servers.last_mut().unwrap().kill_and_reap();
+  let handoff = scenario.held.as_ref().unwrap().handoff(daemon).unwrap();
+  scenario.servers.push(spawn(
+    "taking",
+    drive,
+    &[(OsStr::new(ENV_HANDLES), OsStr::new(handoff.env()))],
+    &handoff.handles(),
+  ));
+  drop(handoff);
+  let landing = match anchor.recv(WAIT_MS).unwrap() {
+    Some(HandleMessage::Released { id }) if (LANDING..LANDING + LANDINGS as u64).contains(&id) => {
+      usize::try_from(id - LANDING).unwrap()
+    }
+    other => panic!("kill {kill}: the successor's landing, got {other:?}"),
+  };
+  assert_eq!(
+    anchor.recv(WAIT_MS).unwrap(),
+    Some(HandleMessage::Released {
+      id: SUCCESSOR_READY
+    }),
+    "kill {kill}: the successor must serve"
+  );
+  landing
 }

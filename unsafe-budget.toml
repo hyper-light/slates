@@ -467,7 +467,11 @@ slates-bridge-fskit = 9
 # 2026-11-05 (131 -> 132, A-209): the `CanDelete` callback reads the handler from the file system's user context, as every
 # other callback does (`host.rs`, `can_delete`), so a directory with a child refuses before Windows marks it for
 # deletion; it had answered success unread (winfstest `t/base/03.t` case 3).
-slates-bridge-winfsp = 132
+# 2026-11-05 (132 -> 135, A-219): each receive worker stamps its delivery with `QueryPerformanceCounter`
+# (`dispatcher.rs`, `performance_counter`), and the receive-worker probe (`probe.rs`) reads its hidden volume's control
+# handle and name once, deletes the volume, and opens its absent name with `CreateFileW`, closing a handle that should
+# never come back.
+slates-bridge-winfsp = 135
 # Raised 3 -> 5 on 2026-10-19 for `udmabuf.rs` (the `UDMABUF_CREATE` ioctl and the descriptor it returns), which
 # confined a guest's DAX window to a descriptor covering only that window
 # (docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md). Lowered 5 -> 3 on 2026-10-25

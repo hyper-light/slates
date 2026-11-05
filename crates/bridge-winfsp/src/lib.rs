@@ -56,6 +56,9 @@ pub mod inflight;
 pub mod notify;
 pub mod opens;
 pub mod purge;
+// How many receive workers a mount runs, measured once a process on a hidden volume of its own (A-219).
+#[cfg(windows)]
+mod probe;
 #[cfg(windows)]
 mod purge_intents;
 #[cfg(windows)]

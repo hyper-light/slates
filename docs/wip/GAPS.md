@@ -1,15 +1,15 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
-> **WinFsp: two receive workers (A-219, accepted 2026-11-05; audit step 7). Proof built; the runtime owed.** Each worker owns
+> **WinFsp: two receive workers (A-219, accepted 2026-11-05; audit step 7). Proof and runtime built; the live runs owed.** Each worker owns
 > a journal; a receive's stamp, the system-wide performance counter, orders deliveries across journals; recovery answers
 > only each address's newest delivery and passes the older ones over. The two-worker model oracle kills the daemon at
 > every step of every worker, alone and twice, under four schedules: 4,255 scenarios, 0 lost, 0 wrong, 0 twice, 0 wrong
 > contexts. It saw 16,713 cross-worker address reuses, 2,533 pass-overs and 1,045 unstamped batches. Red: answering
 > every journal whole gives 202 wrong, keeping the oldest delivery 415. The ledger keeps one unconfirmed open a worker.
-> **Owed:**
-> - the second worker in the dispatcher, with recovery across journals before any worker receives;
-> - purge intents to every worker;
-> - the count derived at the first mount;
+> Built since: the workers in the dispatcher, worker 0 recovering every journal before any worker receives; purge
+> intents to every worker; and the count, derived at a process's first mount by `crate::probe`, which times one waiting
+> worker against two on a hidden volume of its own and takes two only beyond both spreads. **Owed:**
+> - the probe's first rounds and counts on both lanes;
 > - the live 40-kill oracle with two workers on both lanes;
 > - the final A/B against 71cf09ac.
 

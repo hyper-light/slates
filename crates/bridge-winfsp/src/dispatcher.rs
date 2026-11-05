@@ -28,6 +28,8 @@ const TRANSACT_READY: u32 = (9 << 16) | ((0x800 + b'T' as u32) << 2);
 pub(crate) const TRANSACT_TIMEOUT_MS: u32 = 1000;
 /// Shape: the stop channel carries no messages; dropping its sender is the worker's cancellation signal.
 const STOP_BOUND: usize = 0;
+/// Shape: worker 0 releases each other worker once, after recovery; a release waits for nobody.
+const RELEASE_BOUND: usize = 1;
 /// Format: the status offset in the checked response header (fsctl.h).
 const STATUS_AT: usize = 20;
 /// Format: the status occupies the final word of the common response header.
@@ -111,13 +113,16 @@ pub(crate) fn announce_ready(
   transaction(control, TRANSACT_READY, &[], &mut [], intents).map(|_| ())
 }
 
-/// The only receive thread. Its owner closes the stop channel and joins before freeing the DLL object.
+/// The receive workers (A-219), each on its own thread with its own journal. Their owner closes every stop channel and joins
+/// every thread before freeing the DLL object. Worker 0 recovers every journal before any worker receives, then releases
+/// the others.
 pub(crate) struct Worker {
-  stop: Option<SyncSender<()>>,
-  thread: Option<JoinHandle<Result<(), WinFspError>>>,
+  stops: Vec<SyncSender<()>>,
+  threads: Vec<JoinHandle<Result<(), WinFspError>>>,
 }
 
 impl Worker {
+  /// Starts one worker for each of `privates`, at most [`inflight::capture::MAX_WORKERS`].
   pub(crate) fn start(
     file_system: usize,
     section: OwnedHandle,
@@ -125,64 +130,106 @@ impl Worker {
     outcomes: std::sync::mpsc::SyncSender<crate::host::Outcome>,
     wake: std::task::Waker,
     confirmations: SyncSender<crate::host::Request>,
-    private: PrivateOpens,
+    privates: Vec<PrivateOpens>,
   ) -> Result<Self, WinFspError> {
-    let (stop, stopped) = sync_channel(STOP_BOUND);
-    let thread = std::thread::Builder::new()
-      .name("slates-winfsp-receive".to_owned())
-      .spawn(move || {
-        if let Err(error) = crate::reply::measure().and_then(|()| {
-          receive_loop(
-            file_system,
-            section,
-            bound,
-            Receive {
-              stopped,
-              confirmations: &confirmations,
-              wake: &wake,
-              outcomes: &outcomes,
-              private,
-            },
-          )
-        }) {
-          slates_machine::log_line!("slates-winfsp: receive worker ended: {error}");
-          if outcomes.send(crate::host::Outcome::Failed(error)).is_err() {
-            slates_machine::log_line!(
-              "slates-winfsp: receive worker's owner ended before its failure was reported"
-            );
+    if privates.is_empty() || privates.len() > inflight::capture::MAX_WORKERS {
+      return Err(WinFspError::Capture(Refusal::Length));
+    }
+    let mut worker = Self {
+      stops: Vec::with_capacity(privates.len()),
+      threads: Vec::with_capacity(privates.len()),
+    };
+    let mut releases = Vec::new();
+    let mut waits = Vec::new();
+    for _ in 1..privates.len() {
+      let (release, wait) = sync_channel(RELEASE_BOUND);
+      releases.push(release);
+      waits.push(wait);
+    }
+    let mut waits = waits.into_iter();
+    let mut releases = Some(releases);
+    for (index, private) in privates.into_iter().enumerate() {
+      let (stop, stopped) = sync_channel(STOP_BOUND);
+      let section = section.try_clone().map_err(|error| WinFspError::Os {
+        call: "duplicate the held receive section",
+        code: error.raw_os_error(),
+      })?;
+      let start = if index == 0 {
+        Start::Recover(releases.take().unwrap_or_default())
+      } else {
+        Start::Wait(waits.next().ok_or(WinFspError::MountThread)?)
+      };
+      let (outcomes, wake, confirmations) = (outcomes.clone(), wake.clone(), confirmations.clone());
+      let thread = std::thread::Builder::new()
+        .name(format!("slates-winfsp-receive-{index}"))
+        .spawn(move || {
+          if let Err(error) = crate::reply::measure().and_then(|()| {
+            receive_loop(
+              file_system,
+              section,
+              bound,
+              Receive {
+                worker: index,
+                start,
+                stopped,
+                confirmations: &confirmations,
+                wake: &wake,
+                outcomes: &outcomes,
+                private,
+              },
+            )
+          }) {
+            slates_machine::log_line!("slates-winfsp: receive worker {index} ended: {error}");
+            if outcomes.send(crate::host::Outcome::Failed(error)).is_err() {
+              slates_machine::log_line!(
+                "slates-winfsp: receive worker's owner ended before its failure was reported"
+              );
+            }
+            wake.wake_by_ref();
           }
-          wake.wake_by_ref();
-        }
-        Ok(())
-      })
-      .map_err(|_| WinFspError::MountThread)?;
-    Ok(Self {
-      stop: Some(stop),
-      thread: Some(thread),
-    })
+          Ok(())
+        })
+        .map_err(|_| WinFspError::MountThread)?;
+      worker.stops.push(stop);
+      worker.threads.push(thread);
+    }
+    Ok(worker)
   }
 
   pub(crate) fn join(&mut self) -> Result<(), WinFspError> {
-    self.stop = None;
-    match self.thread.take() {
-      Some(thread) => thread.join().map_err(|_| WinFspError::MountThread)?,
-      None => Ok(()),
+    self.stops.clear();
+    let mut outcome = Ok(());
+    for thread in self.threads.drain(..) {
+      if let Err(error) = thread
+        .join()
+        .map_err(|_| WinFspError::MountThread)
+        .and_then(|joined| joined)
+      {
+        outcome = Err(error);
+      }
     }
+    outcome
   }
+}
+
+/// How a worker begins: worker 0 recovers every journal and then releases the others; each other worker waits for that
+/// release (or for worker 0's end, which drops it) before its first receive (A-219).
+enum Start {
+  Recover(Vec<SyncSender<()>>),
+  Wait(Receiver<()>),
 }
 
 /// A view of the held section. Only the receive suffix is borrowed: the shard independently owns the disjoint open
 /// frames before it. The old process has exited before this view is adopted; no live worker shares this region.
 struct CaptureView {
   address: usize,
-  offset: usize,
+  bound: usize,
   _section: OwnedHandle,
 }
 
 impl CaptureView {
   fn new(section: OwnedHandle, bound: usize) -> Result<Self, WinFspError> {
     let length = crate::opens::bytes(bound).map_err(WinFspError::Ledger)?;
-    let offset = crate::opens::journal_offset(bound, 0).map_err(WinFspError::Ledger)?;
     // SAFETY: this owned section was created/adopted with exactly the checked ledger length. The view is released
     // only after the synchronous/owned overlapped transactions using its suffix have completed.
     let view = unsafe {
@@ -199,15 +246,18 @@ impl CaptureView {
     }
     Ok(Self {
       address: view.Value.addr(),
-      offset,
+      bound,
       _section: section,
     })
   }
 
-  fn capture(&mut self) -> Result<Capture<'_>, WinFspError> {
+  /// Worker `worker`'s journal (A-219). Each worker lends only its own region; recovery, on one thread before any worker
+  /// receives, lends each region in turn.
+  fn capture(&mut self, worker: usize) -> Result<Capture<'_>, WinFspError> {
+    let offset = crate::opens::journal_offset(self.bound, worker).map_err(WinFspError::Ledger)?;
     let address = self
       .address
-      .checked_add(self.offset)
+      .checked_add(offset)
       .ok_or(WinFspError::Capture(Refusal::Length))?;
     // SAFETY: new checked the whole section and suffix offset. Only this worker touches the suffix, and the mutable
     // borrow ends before any other capture borrow. No Rust slice covers the shard-owned prefix.
@@ -295,6 +345,25 @@ fn transaction(
   usize::try_from(done).map_err(|_| WinFspError::Capture(Refusal::Length))
 }
 
+/// Receives a batch of requests into `output`, a worker's direct-output journal buffer. The call waits for a request
+/// up to the volume's transaction timeout and returns zero bytes at it.
+pub(crate) fn receive_batch(
+  control: HANDLE,
+  output: &mut [u8],
+  intents: &mut crate::purge_intents::Intents,
+) -> Result<usize, WinFspError> {
+  transaction(control, TRANSACT_BATCH, &[], output, intents)
+}
+
+/// Sends one response alone: a response never receives another batch (A-198).
+pub(crate) fn send_response(
+  control: HANDLE,
+  response: &[u8],
+  intents: &mut crate::purge_intents::Intents,
+) -> Result<(), WinFspError> {
+  transaction(control, TRANSACT_BATCH, response, &mut [], intents).map(|_| ())
+}
+
 /// Aligned working copies, as required by WinFsp's native request/response structs. The immutable captured original
 /// is never passed to a callback that may adjust request fields.
 #[repr(align(8))]
@@ -345,8 +414,10 @@ fn operation(
     .ok_or(WinFspError::Capture(Refusal::Length))?
     .copy_from_slice(&header);
   let index = usize::try_from(request.kind()).map_err(|_| WinFspError::Capture(Refusal::Kind))?;
-  // SAFETY: the owner created and ABI-checked this DLL object and keeps it alive until this worker joins. There is
-  // exactly one operation caller, so the operation table needs no DLL guard or lock.
+  // SAFETY: the owner created and ABI-checked this DLL object and keeps it alive until this worker joins. Each worker
+  // calls the table on its own packets, as the DLL's own dispatcher threads do. WinFsp's guard (dll/fsop.c,
+  // FspFileSystemOpEnter) orders only a file system's namespace work; each of these callbacks is one message to the
+  // shard, which serves one at a time (A-219).
   let callback = unsafe { (*file_system).operations.get(index).copied().flatten() };
   let Some(callback) = callback else {
     return Ok(RESPONSE_BASE);
@@ -389,96 +460,36 @@ fn operation(
   inflight::finish_response(&mut packet.0, status).map_err(WinFspError::Capture)
 }
 
+/// What a worker's operations reach the shard through: the request channel, its waker, and the ledger's open bound.
+struct Shard<'a> {
+  confirmations: &'a SyncSender<crate::host::Request>,
+  wake: &'a std::task::Waker,
+  bound: usize,
+}
+
+/// Settles every request of `batch`: live, each is served and answered; in recovery (`recovered` names the addresses
+/// a newer delivery in another journal holds), each is passed over or answered as A-198 settles a dead worker's batch.
 fn settle(
   file_system: *mut FileSystem,
   batch: &mut inflight::capture::Batch<'_>,
-  recovered: bool,
-  confirmations: &SyncSender<crate::host::Request>,
-  wake: &std::task::Waker,
+  recovered: Option<&std::collections::BTreeSet<u64>>,
+  shard: &Shard<'_>,
   owned: &mut Owned,
-  bound: usize,
 ) -> Result<u64, WinFspError> {
   // SAFETY: same owner/worker lifetime as operation; volume control remains owned by the DLL object.
   let control = unsafe { (*file_system).volume_handle };
   let mut count = 0u64;
   while let Some(request) = batch.next_request().map_err(WinFspError::Capture)? {
-    if recovered {
-      let saved = batch.response_for(&request).map_err(WinFspError::Capture)?;
-      // Only Create's saved result is needed to preserve a possibly issued context. Read completion can reference
-      // an old process mapping (sys/read.c), so all other buffer-bearing operations cancel without dereferencing it.
-      if let Some(saved) = replayable_response(&request, saved, confirmations, wake, bound)? {
-        transaction(
-          control,
-          TRANSACT_BATCH,
-          saved,
-          &mut [],
-          &mut owned.private.intents,
-        )?;
-      } else if matches!(
-        request.kind(),
-        inflight::CLEANUP_KIND | inflight::CLOSE_KIND
-      ) {
-        let length = operation(file_system, &request, owned)?;
-        let response = owned
-          .response
-          .0
-          .get(..length)
-          .ok_or(WinFspError::Capture(Refusal::Length))?;
-        if saved.is_none() {
-          batch
-            .record_response(&request, response)
-            .map_err(WinFspError::Capture)?;
-        }
-        transaction(
-          control,
-          TRANSACT_BATCH,
-          response,
-          &mut [],
-          &mut owned.private.intents,
-        )?;
-      } else {
-        let response = request.cancelled_response().map_err(WinFspError::Capture)?;
-        if saved.is_none() {
-          batch
-            .record_response(&request, &response)
-            .map_err(WinFspError::Capture)?;
-        }
-        transaction(
-          control,
-          TRANSACT_BATCH,
-          &response,
-          &mut [],
-          &mut owned.private.intents,
-        )?;
+    match recovered {
+      // A newer delivery at this address sits in another worker's journal, so this request is completed (A-219).
+      Some(passed) if passed.contains(&request.hint()) => {
+        batch
+          .pass_over(request.hint())
+          .map_err(WinFspError::Capture)?;
+        continue;
       }
-    } else {
-      let length = operation(file_system, &request, owned)?;
-      let response = owned
-        .response
-        .0
-        .get(..length)
-        .ok_or(WinFspError::Capture(Refusal::Length))?;
-      batch
-        .record_response(&request, response)
-        .map_err(WinFspError::Capture)?;
-      if let Some((from, to)) = request
-        .successful_rename(response)
-        .map_err(WinFspError::Capture)?
-      {
-        crate::host::rename_open_names(confirmations, wake, &from, &to, bound)?;
-      }
-      transaction(
-        control,
-        TRANSACT_BATCH,
-        response,
-        &mut [],
-        &mut owned.private.intents,
-      )?;
-      if let Some((_, context)) =
-        inflight::opened_context(response).map_err(WinFspError::Capture)?
-      {
-        crate::host::confirm_open(confirmations, wake, context)?;
-      }
+      Some(_) => settle_recovered(file_system, control, batch, &request, shard, owned)?,
+      None => serve_live(file_system, control, batch, &request, shard, owned)?,
     }
     batch
       .acknowledge(request.hint())
@@ -486,6 +497,82 @@ fn settle(
     count = count.saturating_add(1);
   }
   Ok(count)
+}
+
+/// Answers one request a dead worker's journal held: its saved response where that is safe to replay, a Cleanup or Close
+/// served again, anything else cancelled.
+fn settle_recovered(
+  file_system: *mut FileSystem,
+  control: HANDLE,
+  batch: &mut inflight::capture::Batch<'_>,
+  request: &Request<'_>,
+  shard: &Shard<'_>,
+  owned: &mut Owned,
+) -> Result<(), WinFspError> {
+  let saved = batch.response_for(request).map_err(WinFspError::Capture)?;
+  // Only Create's saved result is needed to preserve a possibly issued context. Read completion can reference
+  // an old process mapping (sys/read.c), so all other buffer-bearing operations cancel without dereferencing it.
+  if let Some(saved) =
+    replayable_response(request, saved, shard.confirmations, shard.wake, shard.bound)?
+  {
+    return send_response(control, saved, &mut owned.private.intents);
+  }
+  if matches!(
+    request.kind(),
+    inflight::CLEANUP_KIND | inflight::CLOSE_KIND
+  ) {
+    let length = operation(file_system, request, owned)?;
+    let response = owned
+      .response
+      .0
+      .get(..length)
+      .ok_or(WinFspError::Capture(Refusal::Length))?;
+    if saved.is_none() {
+      batch
+        .record_response(request, response)
+        .map_err(WinFspError::Capture)?;
+    }
+    return send_response(control, response, &mut owned.private.intents);
+  }
+  let response = request.cancelled_response().map_err(WinFspError::Capture)?;
+  if saved.is_none() {
+    batch
+      .record_response(request, &response)
+      .map_err(WinFspError::Capture)?;
+  }
+  send_response(control, &response, &mut owned.private.intents)
+}
+
+/// Serves one fresh request: the operation, its response saved in the journal before it is sent, then the open's
+/// confirmation or the rename's name update.
+fn serve_live(
+  file_system: *mut FileSystem,
+  control: HANDLE,
+  batch: &mut inflight::capture::Batch<'_>,
+  request: &Request<'_>,
+  shard: &Shard<'_>,
+  owned: &mut Owned,
+) -> Result<(), WinFspError> {
+  let length = operation(file_system, request, owned)?;
+  let response = owned
+    .response
+    .0
+    .get(..length)
+    .ok_or(WinFspError::Capture(Refusal::Length))?;
+  batch
+    .record_response(request, response)
+    .map_err(WinFspError::Capture)?;
+  if let Some((from, to)) = request
+    .successful_rename(response)
+    .map_err(WinFspError::Capture)?
+  {
+    crate::host::rename_open_names(shard.confirmations, shard.wake, &from, &to, shard.bound)?;
+  }
+  send_response(control, response, &mut owned.private.intents)?;
+  if let Some((_, context)) = inflight::opened_context(response).map_err(WinFspError::Capture)? {
+    crate::host::confirm_open(shard.confirmations, shard.wake, context)?;
+  }
+  Ok(())
 }
 
 /// Saved Create and successful Rename responses refer only to kernel-owned state. Other buffer-bearing responses
@@ -515,6 +602,8 @@ fn replayable_response<'a>(
 
 /// The receive worker's owned control channels and immutable reporting endpoints.
 struct Receive<'a> {
+  worker: usize,
+  start: Start,
   stopped: Receiver<()>,
   confirmations: &'a SyncSender<crate::host::Request>,
   wake: &'a std::task::Waker,
@@ -529,6 +618,8 @@ fn receive_loop(
   channels: Receive<'_>,
 ) -> Result<(), WinFspError> {
   let Receive {
+    worker,
+    start,
     stopped,
     confirmations,
     wake,
@@ -538,61 +629,114 @@ fn receive_loop(
   let mut owned = Owned::new(private);
   let file_system = file_system as *mut FileSystem;
   let mut view = CaptureView::new(section, bound)?;
-  if let Some(mut batch) = view.capture()?.resume().map_err(WinFspError::Capture)? {
-    let count = settle(
-      file_system,
-      &mut batch,
-      true,
-      confirmations,
-      wake,
-      &mut owned,
-      bound,
-    )?;
-    slates_machine::log_line!("slates-winfsp: settled {count} captured requests before receiving");
-    outcomes
-      .send(crate::host::Outcome::Recovered(count))
-      .map_err(|_| WinFspError::MountThread)?;
-    wake.wake_by_ref();
+  let shard = Shard {
+    confirmations,
+    wake,
+    bound,
+  };
+  match start {
+    Start::Recover(releases) => {
+      if let Some(count) = recover(file_system, &mut view, &shard, &mut owned)? {
+        slates_machine::log_line!(
+          "slates-winfsp: settled {count} captured requests before receiving"
+        );
+        outcomes
+          .send(crate::host::Outcome::Recovered(count))
+          .map_err(|_| WinFspError::MountThread)?;
+        wake.wake_by_ref();
+      }
+      for release in releases {
+        release.send(()).map_err(|_| WinFspError::MountThread)?;
+      }
+    }
+    Start::Wait(wait) => {
+      // Worker 0 dropping the release without sending it ended the mount first: nothing to serve.
+      if wait.recv().is_err() {
+        return Ok(());
+      }
+    }
   }
-  // SAFETY: the mount owner cannot delete this DLL object until the receive thread is joined.
+  serve_loop(file_system, &mut view, worker, &stopped, &shard, &mut owned)
+}
+
+/// Recovers every worker's journal before any worker receives (A-219). For an address in more than one unsettled batch,
+/// only the newest delivery is answered; each batch then settles as A-198 settles one. `None` when no journal held a batch.
+fn recover(
+  file_system: *mut FileSystem,
+  view: &mut CaptureView,
+  shard: &Shard<'_>,
+  owned: &mut Owned,
+) -> Result<Option<u64>, WinFspError> {
+  let mut journals = Vec::with_capacity(inflight::capture::MAX_WORKERS);
+  let mut any = false;
+  for worker in 0..inflight::capture::MAX_WORKERS {
+    match view
+      .capture(worker)?
+      .resume()
+      .map_err(WinFspError::Capture)?
+    {
+      Some(batch) => {
+        any = true;
+        journals.push((batch.stamp(), batch.hints()));
+      }
+      None => journals.push((None, Vec::new())),
+    }
+  }
+  if !any {
+    return Ok(None);
+  }
+  let passed = inflight::capture::superseded(&journals).map_err(WinFspError::Capture)?;
+  let mut count = 0u64;
+  for (worker, passed) in passed.iter().enumerate() {
+    if let Some(mut batch) = view
+      .capture(worker)?
+      .resume()
+      .map_err(WinFspError::Capture)?
+    {
+      let settled = settle(file_system, &mut batch, Some(passed), shard, owned)?;
+      count = count.saturating_add(settled);
+    }
+  }
+  Ok(Some(count))
+}
+
+/// One worker's live serving on its own journal: receive, stamp, settle, until told to stop.
+fn serve_loop(
+  file_system: *mut FileSystem,
+  view: &mut CaptureView,
+  worker: usize,
+  stopped: &Receiver<()>,
+  shard: &Shard<'_>,
+  owned: &mut Owned,
+) -> Result<(), WinFspError> {
+  // SAFETY: the mount owner cannot delete this DLL object until every receive thread is joined.
   let control = unsafe { (*file_system).volume_handle };
-  // What this owner's last batch filled; its first receive clears the whole buffer.
+  // What this worker's last batch filled; its first receive clears the whole buffer.
   let mut used = None;
   loop {
-    if is_stopped(&stopped) {
+    if is_stopped(stopped) {
       return Ok(());
     }
-    let mut receiving = view.capture()?.begin(used).map_err(WinFspError::Capture)?;
-    let reported = transaction(
-      control,
-      TRANSACT_BATCH,
-      &[],
-      receiving.buffer_mut(),
-      &mut owned.private.intents,
-    )?;
+    let mut receiving = view
+      .capture(worker)?
+      .begin(used)
+      .map_err(WinFspError::Capture)?;
+    let reported = receive_batch(control, receiving.buffer_mut(), &mut owned.private.intents)?;
     // Keep a batch taken while stopping intact for the successor, without invoking another operation on this owner.
-    if is_stopped(&stopped) {
+    if is_stopped(stopped) {
       return Ok(());
     }
     used = Some(inflight::capture::filled(reported).map_err(WinFspError::Capture)?);
     let mut batch = receiving
       .received(reported, performance_counter()?)
       .map_err(WinFspError::Capture)?;
-    settle(
-      file_system,
-      &mut batch,
-      false,
-      confirmations,
-      wake,
-      &mut owned,
-      bound,
-    )?;
+    settle(file_system, &mut batch, None, shard, owned)?;
   }
 }
 
 /// The system-wide performance counter, a receive's delivery stamp (A-219). It is consistent across processors and
 /// processes, so a successor orders a dead daemon's journals by it; Windows never reports zero for it.
-fn performance_counter() -> Result<u64, WinFspError> {
+pub(crate) fn performance_counter() -> Result<u64, WinFspError> {
   let mut count = 0i64;
   // SAFETY: the out-parameter is a live local i64, the counter's own type.
   if unsafe { windows_sys::Win32::System::Performance::QueryPerformanceCounter(&mut count) } == 0 {

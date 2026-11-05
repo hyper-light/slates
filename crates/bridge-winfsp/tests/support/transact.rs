@@ -370,7 +370,8 @@ fn transact_cost() {
   }
   let drive = free_drive();
   let (requests, _unused) = sync_channel(REQUEST_BOUND);
-  let (purge_intents, mut private_opens) = crate::purge_intents::channel().unwrap();
+  let (purge_intents, mut readers) = crate::purge_intents::channel(1).unwrap();
+  let private_opens = readers.first_mut().unwrap();
   let mounted = Mounted::new(
     &drive,
     true,
@@ -378,7 +379,7 @@ fn transact_cost() {
     Waker::noop().clone(),
     None,
     purge_intents,
-    &mut private_opens,
+    private_opens,
   )
   .unwrap();
   // SAFETY: the DLL object is live until `mounted` drops at the end, after the client has stopped.
