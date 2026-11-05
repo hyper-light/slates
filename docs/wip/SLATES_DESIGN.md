@@ -8399,7 +8399,7 @@ field.
 | Differential | Prove parity with the host filesystem | Same sequences on tmpfs / APFS RAM disk / NTFS RAM VHD; Metis-style abstract-state hashes | The abstract state after every step matches except where the reviewed equivalence policy allows (timestamps by order, inode numbers ignored, errno within the platform's allowed set) | CI (Linux), nightly (macOS, Windows) |
 | Landing oracle | Prove the one path that writes disk | an executable model of (disk, overlay, witnesses); outsider edits and crashes injected at every step; real filesystems on RAM-backed targets | Verdicts match the table; every entry old or new; every collision reported; re-runs idempotent; writes proportional to the delta | CI (Linux tmpfs), nightly (APFS, NTFS) |
 | Merge oracle | Prove the verdict, the splice and rebase | an executable model of (chain, work volumes, declared operations); proptest with shrinking; instrumented counters | Verdicts match the oracle with zero false accepts or rejects; spliced versions byte-identical; no content read on the common path; windows byte-exact | CI |
-| Conformance | Prove POSIX behaviour through each bridge | pjdfstest, fsx, fsstress (CI); xfstests generic, LTP (nightly) | All tests pass except the reviewed expected-failure list for that bridge, and the list only shrinks | CI / nightly |
+| Conformance | Prove POSIX behaviour through each bridge, and Win32 behaviour through the WinFsp drive | pjdfstest, fsx, fsstress (CI, x86_64 and arm64 Linux); WinFsp's fsx port and winfstest (CI, x86_64 and arm64 Windows; A-214); xfstests generic, LTP (nightly) | All tests pass except the reviewed expected-failure list for that bridge, and the list only shrinks | CI / nightly |
 | Real workloads | Prove tools work | vendored git, cargo, npm, python, rg, rsync, sqlite, editors, watchers | Exit codes 0; outputs byte-identical to the host run; `git status` clean; incremental builds reuse artifacts | nightly, release |
 | Unit and property | Prove each core structure | proptest, oracle tests (serial spec vs implementation), non-vacuity counters | Properties hold; counters prove the fast paths ran | CI |
 | Hostile input | Prove parsers never crash or over-allocate | cargo-fuzz corpora for wire, FUSE, NFS/XDR, WinFsp, archive, MCP | No panic, no UB, bounded time and memory on every input | CI smoke, nightly long |
@@ -12823,6 +12823,49 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
 
+### A-214 — Windows conformance is WinFsp's own two suites over the slates drive in both Windows lanes, with a reviewed list and stated differences; the POSIX suites run on arm64 Linux (accepted 2026-11-05, Step 10 of the VFS and DAX plan)
+Applied in the same change to: Part 6 ("Conformance"), §4.6 ("Windows" and its status), GAPS, `docs/wip/platforms.md`,
+`docs/wip/conformance.md`, `crates/conformance` (the `winfstest` suite, its reply parser, the capability table, the WinFsp
+fsx verdict), `xtask/src/conformance` (the WinFsp mount step, the MSVC builds, the winfstest transcription and runner),
+`crates/bridge-winfsp` (the three bugs below), `crates/cli/tests/winfsp_semantics.rs`, CI's `windows-lint`,
+`windows-arm64` and `linux-arm64` jobs, and `unsafe-budget.toml`.
+- **The decision.** Phase 4 task 5 named Windows' suites: "the WinFsp fsx port and WinFsp's own tests on Windows". They
+  are WinFsp's own CI's (`tools/run-tests.bat` at WinFsp v2.1, `memfs-x64-disk-fsx` and `memfs-x64-disk-winfstest`),
+  from `billziss-gh/secfs.test@6ac65cd`, the commit WinFsp v2.1 pins. `cargo xtask conformance run --suite fsx` and
+  `--suite winfstest` mount a volume as a drive (`slates mount ID E:`), build each suite's C from its pinned source with
+  MSVC (`cl.exe` found as build scripts find it), run it in a fresh directory on the drive, and write a record. They
+  run in `windows-lint` (x86_64) and `windows-arm64`. pjdfstest and fsstress stay inapplicable on Windows (POSIX C);
+  winfstest is inapplicable to every other transport.
+- **winfstest without Python.** Upstream drives its twenty scripts from Python 2.7, which no CI runner carries and
+  which CLAUDE.md's banned item 13 keeps out of CI. The harness carries a Rust transcription of the scripts
+  (`xtask/src/conformance/winfstest/scripts.rs`, under winfstest's BSD-3 notice) that runs upstream's C driver one call
+  a process, prints upstream's TAP, and is judged as pjdfstest is: every failure on the reviewed list
+  (`docs/wip/conformance/expected-failures/native-windows-winfsp.winfstest.txt`), every listed case still failing, every
+  script finishing its plan. A golden recorded from the unchanged upstream scripts under a stand-in `winfstest.py`
+  (733 cases, 577 calls, in order) holds the transcription: one expectation changed fails it.
+- **What the drive claims, and the stated differences.** The drive keeps Win32 namespace semantics: the create
+  dispositions, delete and delete-pending, directory removal, rename with and without replacement, share modes, file
+  size and truncation, directory listing, and the access, write and change times a caller sets. It does not keep, and
+  slates does not claim, five Windows features, each a reason on the reviewed list:
+  - **ATTRIBUTES**: no Windows attribute bits. Every file reports `FILE_ATTRIBUTE_NORMAL` and every directory
+    `FILE_ATTRIBUTE_DIRECTORY`; READONLY, HIDDEN, SYSTEM and ARCHIVE are neither reported nor enforced (the volume's
+    permission is POSIX's mode).
+  - **SECURITY**: no per-file security descriptor. Every object reports the volume's one descriptor and access is the
+    volume's own rule; a DACL set or asked for at create is not kept.
+  - **CREATION-TIME**: no settable birth time. The bridge's attributes carry none (creation time reports the change
+    time), and POSIX has no setter.
+  - **REPARSE and SYMLINK**: no reparse points, so no Windows symbolic links through the drive
+    (`ERROR_INVALID_FUNCTION`).
+  - **STREAMS**: no named streams (`ERROR_INVALID_NAME`; stream enumeration refused).
+- **Bugs the suites found, each fixed with a failing test first** (`crates/cli/tests/winfsp_semantics.rs`; the record
+  `docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md`): a move not asked to replace replaced a
+  taken name and a move asked to replace replaced a directory (`rename` dropped WinFsp's `ReplaceIfExists`); a
+  directory holding a file answered its removal with success (`CanDelete` answered success unread, and Cleanup's refusal
+  reached no program); and `SetFileTime` answered success and kept nothing (`SetBasicInfo` applied no time).
+- **arm64 Linux.** `linux-arm64` runs fsx, fsstress and pjdfstest over the three Linux transports, judged against the
+  x86_64 lane's lists: the first run found exactly the listed failures (diagnostics run 41975493604, 2026-11-05, Ubuntu
+  24.04.5 aarch64: pjdfstest 8,798 cases a transport with 0 unexpected and 0 listed passing; fsx 10,000 operations and
+  fsstress 4 × 500 passed on each).
 ### A-206 — A WinFsp file system is deleted only after the anchor releases its hold, the DLL's version is checked, and slates refuses no path the driver passes (accepted 2026-11-04, audit plan 01a1a34bf7e973069e94f773afdea44a, steps 4 and 6)
 Applied in the same change to: GAPS (the audit entry), §4.6's status through A-198's corrections, `docs/wip/platforms.md`,
 `crates/server` (`winfsp.rs`, `anchor_hold_windows.rs`, `verbs.rs`), `crates/client` (`defers_reply`),

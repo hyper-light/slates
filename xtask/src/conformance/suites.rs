@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use slates_conformance::exerciser::{judge_fsstress, judge_fsx};
+#[cfg(not(windows))]
+use slates_conformance::exerciser::judge_fsx;
+use slates_conformance::exerciser::{ExerciserVerdict, judge_fsstress};
 use slates_conformance::expected::{ExpectedFailures, judge};
 use slates_conformance::record::{Counts, ListDigest, Outcome, Privilege};
 pub(crate) use slates_conformance::tap::Runner;
@@ -45,7 +47,7 @@ fn run_capturing(program: &Path, args: &[String], cwd: &Path) -> Result<(bool, S
 }
 
 /// The outcome for counts: `RAN` unless the lane runs through an adapter or at reduced scope.
-fn outcome_for(
+pub(crate) fn outcome_for(
   run: &Run<'_>,
   suite: Suite,
   counts: Counts,
@@ -71,6 +73,18 @@ fn outcome_for(
   }
 }
 
+/// FreeBSD's fsx's verdict: its exit and its success line.
+#[cfg(not(windows))]
+fn fsx_verdict(success: bool, output: &str, _operations: u64) -> ExerciserVerdict {
+  judge_fsx(success, output)
+}
+
+/// The WinFsp port's verdict: its exit and its own success line, naming the operations asked for.
+#[cfg(windows)]
+fn fsx_verdict(success: bool, output: &str, operations: u64) -> ExerciserVerdict {
+  slates_conformance::exerciser::judge_winfsp_fsx(success, output, operations)
+}
+
 /// fsx over the mount.
 pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let tools = run.scratch.shared("tools")?;
@@ -84,17 +98,17 @@ pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     bounds.fsx_operations.to_string(),
     "-S".to_owned(),
     bounds.fsx_seed.to_string(),
-    "-l".to_owned(),
+    fetch::FSX_LENGTH_FLAG.to_owned(),
     bounds.fsx_file_length.to_string(),
     "-q".to_owned(),
     "-P".to_owned(),
-    logs.display().to_string(),
+    super::plain_path(&logs),
     // Relative to the work directory: fsx names its .fsxgood/.fsxlog files `<-P dir>/<fname>.…`,
     // so an absolute fname would nest one absolute path under another.
     "fsx.bin".to_owned(),
   ];
   let (success, output) = run_capturing(&built.binary, &args, &work)?;
-  let verdict = judge_fsx(success, &output);
+  let verdict = fsx_verdict(success, &output, bounds.fsx_operations);
   let mut notes = vec![
     built.note,
     "the exerciser's .fsxlog/.fsxgood files were kept outside the mount (-P)".to_owned(),
@@ -320,7 +334,7 @@ fn shape_lines(cases: &[TapCase]) -> (String, Vec<String>) {
 }
 
 /// The failures by shape as one note.
-fn shape_note(cases: &[TapCase]) -> String {
+pub(crate) fn shape_note(cases: &[TapCase]) -> String {
   let (heading, rows) = shape_lines(cases);
   format!("{heading}: {}", rows.join("; "))
 }
@@ -405,17 +419,17 @@ pub(crate) fn tally_outputs(
 }
 
 /// The aggregate counts of the parsed files.
-struct Tally {
-  files: u32,
-  cases: Vec<TapCase>,
-  passed: u32,
-  failed: u32,
-  needs_root: u32,
-  todo: u32,
-  incomplete: Vec<String>,
+pub(crate) struct Tally {
+  pub(crate) files: u32,
+  pub(crate) cases: Vec<TapCase>,
+  pub(crate) passed: u32,
+  pub(crate) failed: u32,
+  pub(crate) needs_root: u32,
+  pub(crate) todo: u32,
+  pub(crate) incomplete: Vec<String>,
 }
 
-fn tally(parsed: &[TapFile]) -> Tally {
+pub(crate) fn tally(parsed: &[TapFile]) -> Tally {
   let mut out = Tally {
     files: u32::try_from(parsed.len()).unwrap_or(u32::MAX),
     cases: Vec::new(),
@@ -464,6 +478,15 @@ fn expected_list(
       Privilege::Unprivileged => ".unprivileged",
     }
   );
+  reviewed_list(root, relative)
+}
+
+/// The reviewed list at `relative` (from the workspace root), or an empty one when no file exists yet, with the
+/// digest a record carries.
+pub(crate) fn reviewed_list(
+  root: &Path,
+  relative: String,
+) -> Result<(ExpectedFailures, ListDigest), Failure> {
   let text = std::fs::read_to_string(root.join(&relative)).unwrap_or_default();
   let list = ExpectedFailures::parse(&text).map_err(|e| Failure(format!("{relative}: {e}")))?;
   let digest = ListDigest {

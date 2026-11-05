@@ -53,6 +53,22 @@ pub fn judge_fsx(exit_success: bool, output: &str) -> ExerciserVerdict {
   }
 }
 
+/// The WinFsp fsx port's success line for a run of `operations` (Apple's fsx as `secfs.test` carries it: `prt("All
+/// operations - %lu - completed A-OK!\n", testcalls)` at the end of `main`, `fstools/src/fsx/fsx.c` at 6ac65cd).
+pub fn winfsp_fsx_success(operations: u64) -> String {
+  format!("All operations - {operations} - completed A-OK!")
+}
+
+/// The WinFsp fsx port passed when it exited 0 and printed its success line naming exactly the operations asked for
+/// (`-N`), so a run that stopped short cannot pass.
+pub fn judge_winfsp_fsx(exit_success: bool, output: &str, operations: u64) -> ExerciserVerdict {
+  let line = winfsp_fsx_success(operations);
+  ExerciserVerdict {
+    ok: exit_success && output.lines().any(|candidate| candidate.trim() == line),
+    detail: tail(output),
+  }
+}
+
 /// fsstress's verdict: the exit status, and the operations its log shows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FsstressVerdict {
@@ -106,6 +122,26 @@ mod tests {
     let verdict = judge_fsx(true, bad);
     assert!(!verdict.ok);
     assert!(verdict.detail.contains("READ BAD DATA"));
+  }
+
+  /// The WinFsp port's line passes only with the operation count asked for and a clean exit; FreeBSD's line, a short
+  /// count or a failed exit fail it.
+  #[test]
+  fn the_winfsp_port_needs_its_own_line_with_the_count_asked_for() {
+    let good = "Seed set to 1\r\nAll operations - 10000 - completed A-OK!\r\n";
+    assert!(judge_winfsp_fsx(true, good, 10_000).ok);
+    assert!(
+      !judge_winfsp_fsx(false, good, 10_000).ok,
+      "a failed exit is a failure"
+    );
+    assert!(
+      !judge_winfsp_fsx(true, good, 20_000).ok,
+      "a run of other length is not this run"
+    );
+    assert!(!judge_winfsp_fsx(true, "All operations completed A-OK!\n", 10_000).ok);
+    let bad =
+      "READ BAD DATA: offset = 0x1000, size = 0x2000\nAll operations - 10000 - completed A-OK!x\n";
+    assert!(!judge_winfsp_fsx(true, bad, 10_000).ok);
   }
 
   /// fsstress's real `-v` lines (a 40-operation, two-process run on this host, 2026-09-14) are

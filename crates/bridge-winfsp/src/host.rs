@@ -263,9 +263,26 @@ enum Op<T> {
   Truncate {
     object: T,
   },
+  /// `MoveFileEx` and its kin: `replace` is WinFsp's `ReplaceIfExists`, the caller's `MOVEFILE_REPLACE_EXISTING`
+  /// (A-214: a move not asked to replace must refuse a taken name, `t/base/04.t`).
   Rename {
     from: String,
     to: String,
+    replace: bool,
+  },
+  /// `SetBasicInfo`'s times (`SetFileTime`): each `Some` is applied to the volume's access, modification or change
+  /// time (A-214, `t/base/06.t`); WinFsp passes a creation time too, which the volume does not keep settable.
+  SetTimes {
+    object: T,
+    atime: Option<i64>,
+    mtime: Option<i64>,
+    ctime: Option<i64>,
+  },
+  /// `CanDelete`: whether a delete asked of an open object may be granted, decided before Windows marks it for
+  /// deletion. A directory with any child refuses (A-214, `t/base/03.t`): the delete itself runs in Cleanup, which
+  /// answers the kernel nothing, so a refusal there reached no program.
+  CanDelete {
+    object: T,
   },
   /// `FlushFileBuffers` on a handle: the bridge's flush, then the publication that makes it durable.
   Flush {
@@ -296,6 +313,7 @@ impl<T> Op<T> {
         | Op::Create { .. }
         | Op::SetSize { .. }
         | Op::Truncate { .. }
+        | Op::SetTimes { .. }
         | Op::Rename { .. }
         | Op::Flush { .. }
         | Op::Cleanup { .. }
@@ -572,7 +590,21 @@ fn bind(op: Op<u64>, ledger: &Ledger<SparseObject>) -> Result<Op<Open>, crate::o
     Op::Truncate { object } => Op::Truncate {
       object: ledger.get(object)?,
     },
-    Op::Rename { from, to } => Op::Rename { from, to },
+    Op::Rename { from, to, replace } => Op::Rename { from, to, replace },
+    Op::CanDelete { object } => Op::CanDelete {
+      object: ledger.get(object)?,
+    },
+    Op::SetTimes {
+      object,
+      atime,
+      mtime,
+      ctime,
+    } => Op::SetTimes {
+      object: ledger.get(object)?,
+      atime,
+      mtime,
+      ctime,
+    },
     Op::Flush { object } => Op::Flush {
       object: ledger.get(object)?,
     },
@@ -780,7 +812,30 @@ fn run(bridge: &mut dyn Bridge, cx: &OpContext, op: Op<Open>) -> Result<Reply, V
       )?;
       object_reply(&attr, 0)?
     }
-    Op::Rename { from, to } => op_rename(bridge, cx, &from, &to)?,
+    Op::Rename { from, to, replace } => op_rename(bridge, cx, &from, &to, replace)?,
+    Op::CanDelete { object } => op_can_delete(bridge, cx, object.object, object.fh)?,
+    Op::SetTimes {
+      object,
+      atime,
+      mtime,
+      ctime,
+    } => {
+      let attr = if atime.is_none() && mtime.is_none() && ctime.is_none() {
+        bridge.getattr(object.object, cx)?
+      } else {
+        bridge.setattr(
+          object.object,
+          cx,
+          SetAttr {
+            atime,
+            mtime,
+            ctime,
+            ..SetAttr::default()
+          },
+        )?
+      };
+      object_reply(&attr, 0)?
+    }
     Op::Flush { object } => {
       bridge.flush(object.object, cx, object.fh)?;
       object_reply(&bridge.getattr(object.object, cx)?, 0)?
@@ -846,6 +901,7 @@ fn op_rename(
   cx: &OpContext,
   from: &str,
   to: &str,
+  replace: bool,
 ) -> Result<Reply, VfsError> {
   let (from_name, old_parent) = match split_parent(bridge, cx, from)? {
     Ok(pair) => pair,
@@ -855,14 +911,64 @@ fn op_rename(
     Ok(pair) => pair,
     Err(status) => return Ok(Reply::Err(status)),
   };
+  if replace && replaces_a_directory(bridge, cx, (old_parent, from_name), (new_parent, to_name))? {
+    return Err(VfsError::NotPermitted);
+  }
   bridge.rename(
     old_parent,
     new_parent,
     cx,
     from_name,
     to_name,
-    RenameFlags::default(),
+    RenameFlags {
+      no_replace: !replace,
+      ..RenameFlags::default()
+    },
   )?;
+  Ok(Reply::Ok)
+}
+
+/// Whether a rename asked to replace would replace a directory other than its own source: Windows never does
+/// (`MoveFileEx` with `MOVEFILE_REPLACE_EXISTING` onto a directory answers `ERROR_ACCESS_DENIED`, WinFsp's memfs refuses
+/// it so; `t/base/04.t` case 26), where POSIX `rename` replaces an empty one. A name that resolves to the source itself (a
+/// rename of case alone) replaces nothing.
+fn replaces_a_directory(
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  (old_parent, from_name): (ObjectId, &str),
+  (new_parent, to_name): (ObjectId, &str),
+) -> Result<bool, VfsError> {
+  let target = match bridge.lookup(new_parent, cx, to_name) {
+    Ok(target) => target,
+    Err(VfsError::NotFound) => return Ok(false),
+    Err(error) => return Err(error),
+  };
+  if !matches!(target.kind, Kind::Dir) {
+    return Ok(false);
+  }
+  let source = bridge.lookup(old_parent, cx, from_name)?;
+  Ok((source.ino, source.generation) != (target.ino, target.generation))
+}
+
+/// Format: the most entries `CanDelete` reads of a directory: its `.` and `..`, which the bridge's `readdir` lists
+/// first, and one child, which is enough to refuse.
+const DOTS_AND_ONE_CHILD: usize = 3;
+
+/// Whether `object` may be deleted: a directory refuses `NotEmpty` (`STATUS_DIRECTORY_NOT_EMPTY`) while it has any child,
+/// read from the first few entries of its listing; any other object may.
+fn op_can_delete(
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  object: ObjectId,
+  fh: u64,
+) -> Result<Reply, VfsError> {
+  if !matches!(bridge.getattr(object, cx)?.kind, Kind::Dir) {
+    return Ok(Reply::Ok);
+  }
+  let rows = bridge.readdir(object, cx, fh, 0, DOTS_AND_ONE_CHILD)?;
+  if rows.iter().any(|row| row.name != "." && row.name != "..") {
+    return Err(VfsError::NotEmpty);
+  }
   Ok(Reply::Ok)
 }
 
@@ -1395,17 +1501,22 @@ extern "C" fn set_basic_info(
   context: Pvoid,
   _file_attributes: u32,
   _creation_time: u64,
-  _last_access_time: u64,
-  _last_write_time: u64,
-  _change_time: u64,
+  last_access_time: u64,
+  last_write_time: u64,
+  change_time: u64,
   p_info: *mut FileInfo,
 ) -> Ntstatus {
-  // Times and attribute bits are accepted and reported from the current object (the volume keeps POSIX times, set
-  // through its own writes); the object's live info is returned so the caller sees what the volume holds.
+  // The access, write and change times are applied (A-214); the attribute bits and the creation time are not kept by
+  // the volume (A-214's stated differences), and the object's live info is returned so the caller sees what it holds.
   // SAFETY: our file system and a live open-file context.
   let handler = unsafe { handler(fs) };
   let object = context_key(context);
-  match handler.call(Op::Info { object }) {
+  match handler.call(Op::SetTimes {
+    object,
+    atime: crate::unix_ns_from_filetime(last_access_time),
+    mtime: crate::unix_ns_from_filetime(last_write_time),
+    ctime: crate::unix_ns_from_filetime(change_time),
+  }) {
     Reply::Object { info, .. } => {
       // SAFETY: `p_info` writable.
       unsafe { put_info(p_info, info) };
@@ -1443,11 +1554,18 @@ extern "C" fn set_file_size(
   }
 }
 
-extern "C" fn can_delete(_fs: *mut FileSystem, _context: Pvoid, _file_name: Pwstr) -> Ntstatus {
-  // The delete itself happens in Cleanup; here we only confirm deletability. An empty-directory check
-  // is enforced by the volume core's `rmdir` at delete time (NotEmpty → the mapped NTSTATUS), so this
-  // reports success and lets the real check run then.
-  STATUS_SUCCESS.as_i32()
+extern "C" fn can_delete(fs: *mut FileSystem, context: Pvoid, _file_name: Pwstr) -> Ntstatus {
+  // The delete itself happens in Cleanup, which answers the kernel nothing, so the refusal a program must see (a
+  // directory with a child, `ERROR_DIR_NOT_EMPTY`) is decided here, before Windows marks the object for deletion.
+  // SAFETY: our file system and a live open-file context.
+  let handler = unsafe { handler(fs) };
+  match handler.call(Op::CanDelete {
+    object: context_key(context),
+  }) {
+    Reply::Ok => STATUS_SUCCESS.as_i32(),
+    Reply::Err(status) => status,
+    _ => crate::status_unsuccessful(),
+  }
 }
 
 extern "C" fn rename(
@@ -1455,7 +1573,7 @@ extern "C" fn rename(
   _context: Pvoid,
   file_name: Pwstr,
   new_file_name: Pwstr,
-  _replace: Boolean,
+  replace: Boolean,
 ) -> Ntstatus {
   // SAFETY: our file system; both names are paths.
   let handler = unsafe { handler(fs) };
@@ -1463,7 +1581,11 @@ extern "C" fn rename(
   let from = unsafe { wide_to_string(file_name) };
   // SAFETY: `new_file_name` is a NUL-terminated UTF-16 path WinFsp owns for this call.
   let to = unsafe { wide_to_string(new_file_name) };
-  match handler.call(Op::Rename { from, to }) {
+  match handler.call(Op::Rename {
+    from,
+    to,
+    replace: replace != 0,
+  }) {
     Reply::Ok => STATUS_SUCCESS.as_i32(),
     Reply::Err(status) => status,
     _ => crate::status_unsuccessful(),
