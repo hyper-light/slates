@@ -53,7 +53,7 @@ impl DaemonWatch {
 /// dies — a kill cost up to a whole pause (100 ms) of detection before its restart could begin, time every kernel client
 /// of a held mount waited. A signal ends the wait early, as it ended the park.
 #[cfg(unix)]
-fn await_observation(supervisor: &Supervisor, watch: &mut DaemonWatch, pause: Duration) {
+fn await_observation(supervisor: &mut Supervisor, watch: &mut DaemonWatch, pause: Duration) {
   use std::os::fd::BorrowedFd;
   let exit = watch
     .on(supervisor.child_pid())
@@ -84,10 +84,10 @@ fn await_observation(supervisor: &Supervisor, watch: &mut DaemonWatch, pause: Du
 #[derive(Default)]
 struct DaemonWatch {}
 
-/// See the Unix arm: no hold channel off Unix.
-#[cfg(not(unix))]
-fn await_observation(_supervisor: &Supervisor, _watch: &mut DaemonWatch, pause: Duration) {
-  std::thread::park_timeout(pause);
+/// See the Unix arm: the Windows supervisor waits itself ([`Supervisor::await_work`]).
+#[cfg(windows)]
+fn await_observation(supervisor: &mut Supervisor, _watch: &mut DaemonWatch, pause: Duration) {
+  supervisor.await_work(pause);
 }
 
 /// Binds the NFS loopback listener the anchor holds across daemon restarts (§4.6) and hands it to

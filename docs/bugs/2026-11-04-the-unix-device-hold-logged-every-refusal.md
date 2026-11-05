@@ -55,7 +55,7 @@ Commands, 2026-11-04, adacachy (Linux x86_64, inside a capped `systemd-run --use
 | `16510b30` with the anchor test | `cargo +1.98.1 test -p slates-anchor --test anchor -- every_bad_device_message --test-threads=1` | fails: 20 counted, `left: 20, right: 2` log lines |
 | The fix | the same, then `SLATES_TEST_CLI=1 cargo +1.98.1 test -p slates-cli --test cli -- a_real_anchors_hold_refusals --test-threads=1 --nocapture` | both pass; the anchor logged 2 lines, `wrong length` and `unknown kind` |
 
-CI run ids for Linux and macOS, red and green, are in the GAPS entry.
+On CI, `ubuntu-latest` and `macos-latest`: both tests fail on main's sources (20 log lines; no `anchor_hold_refusals` line) in run 41984065875, and pass with the fix in run 41984065750.
 
 ## Siblings
 

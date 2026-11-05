@@ -2888,6 +2888,9 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 > **Status (2026-11-04, A-213).** Every refusal of the hold channel is published in the segment and shown by
 > `slates status` as `anchor_hold_refusals`, so a refusal past its kind's first log line is still seen; the Unix device
 > hold's log is bounded as the Windows hold's is.
+> The Windows anchor wakes on its hold channel's posted read and on the daemon's exit, where it parked up to 500 ms between
+> looks: five holds under a 4 s pause were answered in 3,990–4,020 ms before, on both CI lanes, and under 1 ms after
+> (runs 41984349301 and 41985213489).
 
 **Base reads on macOS and Windows.** As on Linux, the daemon reads untouched base files through its own descriptor or
 handle into evictable cache chunks (one copy, `pread`/`ReadFile` on the owner shard's driver) and
@@ -12843,10 +12846,13 @@ doc), `crates/client/tests/shards.rs`, `crates/server/tests/shards.rs`, `docs/wi
   holds Unix's route to the same refusal: the suite passes on Ubuntu (22) and macOS (26), the same run.
 
 ### A-213 — The anchor's hold refusals: a bounded log on every platform, and a count the operator reads in `slates status` (accepted 2026-11-04, siblings of audit step 3)
-Applied in the same change to: GAPS, A-198's status in §4.6, `crates/anchor` (`handles.rs` `RefusalLog` generic,
+Applied in the same change to: GAPS, A-198's status in §4.6, BENCHMARKS (the Windows wake's part), `unsafe-budget.toml`
+(anchor 10 → 14, the Windows wake's part), `crates/anchor` (`handles.rs` `RefusalLog` generic, `held_windows.rs` the
+posted read, `supervise_windows.rs` and `supervise.rs` the Windows wait,
 `supervise.rs` the device hold's log and the published count, `layout.rs` and `segment.rs` the new supervision word),
 `crates/ipc` (`DaemonReport::anchor_hold_refusals`, appended), `crates/server` (`verbs.rs`, the daemon report),
-`crates/cli` (`slates status`'s line), `crates/mcp` (the daemon status JSON). Bug record:
+`crates/cli` (`slates status`'s line; `anchor.rs` the Windows loop's wait; `examples/hold_latency_ab.rs`), `crates/mcp`
+(the daemon status JSON). Bug record:
 `docs/bugs/2026-11-04-the-unix-device-hold-logged-every-refusal.md`.
 - **The Unix device hold's log is bounded.** A-61's hold counted each refused device message and logged a line for each.
   It now logs through the same `RefusalLog` as A-198's Windows hold: each distinct refusal once over the anchor's life,
@@ -12861,6 +12867,19 @@ Applied in the same change to: GAPS, A-198's status in §4.6, `crates/anchor` (`
   A block an older anchor wrote holds zero there.
 - **Rejected:** a status surface on the anchor itself (a second rendezvous and a second protocol for one number), and the
   daemon counting refusals it caused (it cannot see what the anchor refused).
+- **The Windows anchor wakes on its hold channel (2026-11-04, the sibling of A-206's record).** The Windows loop parked
+  between supervision steps, up to half the liveness budget (500 ms), and looked at the channel only then, so each WinFsp
+  mount's hold and each unmount's release waited up to that long on a healthy anchor; the Unix loop polls its channel.
+  The anchor's end now keeps one read posted (`held_windows::ReadingEnd`): the drain takes messages through it, and
+  `Supervisor::await_work` waits on its event and on the daemon's process handle together, with the step's pause as the
+  timeout, so a hold is answered when it arrives and a daemon's exit is seen when it happens. The read lives in a box of
+  its own, its `OVERLAPPED` and buffer fixed in place while the kernel may write them, and the end's drop cancels it and
+  waits for it to settle; a successor's new channel drops the old end that way, and with it an unread message, as before.
+  While a reply waits for the daemon to read its last one, the loop waits out its step instead: a message already taken
+  behind it would signal at once, and a daemon that never reads could spin the anchor. Held by
+  `a_hold_is_answered_at_its_channels_wake_not_at_the_supervisors_pause` (`crates/anchor/tests/handles_windows.rs`):
+  five holds through the real supervisor under a 4 s pause. Measured in BENCHMARKS ("What a WinFsp mount and unmount wait
+  for the Windows anchor").
 
 ### A-206 — A WinFsp file system is deleted only after the anchor releases its hold, the DLL's version is checked, and slates refuses no path the driver passes (accepted 2026-11-04, audit plan 01a1a34bf7e973069e94f773afdea44a, steps 4 and 6)
 Applied in the same change to: GAPS (the audit entry), §4.6's status through A-198's corrections, `docs/wip/platforms.md`,

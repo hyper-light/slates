@@ -5,8 +5,16 @@
 > once (`RefusalLog`, as the Windows hold does) and counts every one. Every refusal on either platform's hold channel
 > is published in the segment's supervision block and reported by `slates status` as `anchor_hold_refusals`. adacachy,
 > 2026-11-04: 20 bad device messages gave 20 counted and 20 log lines before the change, 20 and 2 after; through a real
-> supervisor over the real `slates daemon`, `slates status` says `anchor_hold_refusals: 20`. CI run ids for Linux and
-> macOS: pending. Record: `docs/bugs/2026-11-04-the-unix-device-hold-logged-every-refusal.md`.
+> supervisor over the real `slates daemon`, `slates status` says `anchor_hold_refusals: 20`. On CI's `ubuntu-latest` and
+> `macos-latest`, both tests fail on main's sources (20 log lines; no `anchor_hold_refusals` line; run 41984065875) and
+> pass with the fix (run 41984065750). Record: `docs/bugs/2026-11-04-the-unix-device-hold-logged-every-refusal.md`.
+> - **The Windows anchor wakes on its hold channel**, a read it keeps posted, and on its daemon's exit, where it parked up
+>   to 500 ms between looks at the channel (A-206's owed item). Five holds through the real supervisor under a 4 s pause:
+>   3,990 to 4,020 ms each before, on `windows-latest` and `windows-11-arm`, 3 runs each (run 41984349301); under 1 ms each
+>   after, 3 runs each (run 41985213489), with the 20-bad-message tests (0 anchor exits) green in the same runs. A WinFsp
+>   mount's median fell from 487 to 10.5 ms on x86_64 and from 445 to 15.8 ms on arm64, an unmount's from 505 to 15.7 ms
+>   and from 507 to 27.0 ms, 20 interleaved rounds per build (run 41985454044; BENCHMARKS, "What a WinFsp mount and unmount
+>   wait for the Windows anchor").
 
 > **WinFsp's hold release, DLL version and long paths fixed (2026-11-04, A-206; audit steps 4 and 6).** Run
 > [41978665514](https://github.com/hyper-light/slates/actions/runs/41978665514), `windows-latest` and `windows-11-arm`,
@@ -33,8 +41,8 @@
 >   section, about 2.2 ms to make, 4,166,312 bytes of paged pool per mount. Record:
 >   `docs/bugs/2026-11-04-a-winfsp-open-past-1024-units-was-refused.md`.
 > - **Owed:** a live test of the rename a held name would outgrow (unit-tested only, `rename_fits`: the driver also limits
->   renames over open descendants, so a live case is not dependable). The Windows anchor parks up to 500 ms between looks at
->   the hold channel, where Unix wakes on it, so each mount and unmount can wait that long on a healthy anchor.
+>   renames over open descendants, so a live case is not dependable). The Windows anchor's 500 ms between looks at the
+>   hold channel is closed by A-213 (above).
 > - **Changed for everyone:** a detach of a WinFsp drive can now answer `TargetUnavailable`, and CI's WinFsp is pinned: a new
 >   minor version is refused until the receiver's layout is reviewed. Gates: Ubuntu job of 41978665514 (fmt, workspace
 >   clippy, `xtask check`, docs).
