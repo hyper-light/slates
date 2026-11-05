@@ -3737,8 +3737,8 @@ kept out of the tree.
 **Owed:**
 - Tail rounding: done by A-118 (a sealed chunk's block trimmed to its pages): block rounding 88.6 → 44.3 MB on
   `/usr`, the daemon 34–39 MB smaller at idle, copy time unchanged (the A/B is A-118's table).
-- Windows: the content object gives no page back there (`SparseObject::discard`), so A-117 does nothing on that host;
-  a measured decommit is owed. macOS marks the pages reusable since 2026-10-08 (A-117's macOS note).
+- Windows: built by A-199 (2026-11-04): `DiscardVirtualMemory` over the committed runs. macOS marks the pages reusable
+  since 2026-10-08 (A-117's macOS note).
 
 ### Measured and rejected: no write delegation for an open that creates (condition 12; 2026-10-08)
 
@@ -7771,3 +7771,34 @@ pattern (`fsbench` 10–28×).
 
 
 
+
+## What a write costs on pages given back on Windows (A-199; VFS plan step 12; 2026-11-04)
+
+jupiter (AMD Ryzen AI MAX+ 395, 32 threads, 124 GiB, Windows 11 Pro 10.0.26200), load average 20 to 30 from other agents'
+builds and tests on the box, rustc 1.98.1, release. The rounds interleave the rows; all 11 are shown.
+
+`cargo +1.98.1 run --release -p slates-mem --example give_back_bench` (256 MiB written as 64 KiB chunks, µs per MiB):
+
+| Pages | Best | All 11 rounds |
+|---|---|---|
+| never used, nothing to clear | 293.8 | 401.9 339.3 319.9 322.6 370.6 354.1 293.8 459.2 579.3 524.9 490.2 |
+| never used, cleared on allocation | 363.6 | 363.6 377.5 422.3 364.9 402.4 421.5 450.3 556.9 585.9 538.3 537.8 |
+| given back, cleared on allocation | 267.1 | 300.7 291.4 320.0 291.8 346.9 267.1 471.4 550.3 526.3 494.2 454.1 |
+| kept resident, zeroed on free | 30.1 | 33.8 30.9 30.5 30.1 34.2 32.4 36.6 44.9 62.2 37.8 43.6 |
+
+So a write on pages given back costs what a write on never-used pages costs: each row's own spread (a factor of about 2
+across the load here) is larger than the gap between them. Both cost about ten times a write on pages kept resident, which
+is why the give-back is an idle purge (A-105) and not a step of every free.
+
+Freed bytes that left the process's working set (`Facts::resident_now`, `K32GetProcessMemoryInfo`):
+
+| Test, jupiter | Freed | Left the working set |
+|---|---|---|
+| `cargo +1.98.1 test -p slates-mem --test give_back -- --nocapture`, private region | 64 MiB | 99% |
+| the same, shared region | 64 MiB | 100% |
+| the same, sparse content object | 64 MiB | 100% |
+| `cargo +1.98.1 test -p slates-server --test give_back -- --nocapture`, a daemon, round 1 | 128 MiB of files | 101% |
+| the same, round 2, over pages already reused once | 128 MiB of files | 101% |
+
+The daemon's share is over 100% because its recovery memory goes back as well (A-117). In both rounds every byte of the
+recreated files read back as written, and the working set climbed by the files' size again.

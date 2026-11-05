@@ -1229,9 +1229,23 @@ mod platform {
     None
   }
 
-  /// No reading, as for available memory: the pressure sampler holds nothing back here.
+  /// This process's working set: the pages of its own the OS is holding in RAM for it.
   pub(super) fn resident_bytes() -> Option<u64> {
-    None
+    use windows_sys::Win32::System::ProcessStatus::{
+      K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    // SAFETY: an all-zero PROCESS_MEMORY_COUNTERS is a valid, if empty, value for the call below to fill.
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    let size = u32::try_from(size_of::<PROCESS_MEMORY_COUNTERS>()).ok()?;
+    // SAFETY: the current process's pseudo-handle and a writable record of the size passed; both are live for the call.
+    let answered = unsafe {
+      K32GetProcessMemoryInfo(
+        windows_sys::Win32::System::Threading::GetCurrentProcess(),
+        &raw mut counters,
+        size,
+      )
+    };
+    (answered != 0).then(|| u64::try_from(counters.WorkingSetSize).unwrap_or(u64::MAX))
   }
 
   use super::{CACHE_LINE_FALLBACK, CoreClass, CoreFacts, MemoryFacts, PageFacts, PowerState};
