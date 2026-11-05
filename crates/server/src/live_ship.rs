@@ -209,36 +209,19 @@ const DURABLE_WAIT_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS;
 /// and otherwise tells the client to try again: a barrier never claims what `f` candidates do not hold.
 pub(crate) async fn wait_durable(volume: slates_db::catalog::VolumeId, target: u64) -> bool {
   let parked = std::future::poll_fn(|cx| {
-    let done = state::with_state(|s| {
-      if fenced(s, volume.bytes).is_some() {
-        return true;
-      }
-      if !s.by_id.contains_key(&volume) {
-        // Destroyed while it waited ([`forget`]): nothing of it becomes durable.
-        return true;
-      }
-      let durable = head_placed(s, volume.bytes)
-        && s.live.shipping.get(&volume.bytes).is_none_or(|live| {
-          !live.owes_whole
-            && live
-              .shipper
-              .durable()
-              .is_some_and(|durable| durable >= target)
-        });
-      done_or_park(s, volume.bytes, durable, cx.waker())
-    })
-    .unwrap_or(true);
-    if done {
-      std::task::Poll::Ready(())
-    } else {
+    let settled = state::with_state(|s| durability(s, volume, target, Some(cx.waker())))
+      .unwrap_or(Durability::Never);
+    if settled == Durability::Pending {
       std::task::Poll::Pending
+    } else {
+      std::task::Poll::Ready(())
     }
   });
   let durable =
     matches!(
       slates_rt::futures::within(DURABLE_WAIT_NS, parked).await,
       Ok(Some(()))
-    ) && state::with_state(|s| s.by_id.contains_key(&volume) && fenced(s, volume.bytes).is_none())
+    ) && state::with_state(|s| durability(s, volume, target, None) == Durability::Durable)
       .unwrap_or(false);
   let _ = state::with_state(|s| {
     s.count(
@@ -251,6 +234,53 @@ pub(crate) async fn wait_durable(volume: slates_db::catalog::VolumeId, target: u
     );
   });
   durable
+}
+
+/// Where a reply waiting for a live volume's log to be durable at a position stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Durability {
+  /// The owner and `f` candidates hold it (or the volume is no longer live-shipped).
+  Durable,
+  /// Not yet: the waker given was parked on the volume, woken as its log advances.
+  Pending,
+  /// It never will be here: the volume was destroyed, or this owner was superseded.
+  Never,
+}
+
+/// Whether `volume`'s log is durable at `target` on this (its owner) shard; when it is not yet and `waker` is given,
+/// parks it on the volume. Shared by every transport that holds a reply for durability: an NFS stable write or `COMMIT`
+/// ([`wait_durable`]) and a FUSE `fsync` (`crate::fuse`).
+pub(crate) fn durability(
+  state: &mut ShardState,
+  volume: slates_db::catalog::VolumeId,
+  target: u64,
+  waker: Option<&std::task::Waker>,
+) -> Durability {
+  if !state.by_id.contains_key(&volume) || fenced(state, volume.bytes).is_some() {
+    // Destroyed while it waited ([`forget`]), or superseded: nothing of it becomes durable here.
+    return Durability::Never;
+  }
+  let durable = head_placed(state, volume.bytes)
+    && state.live.shipping.get(&volume.bytes).is_none_or(|live| {
+      !live.owes_whole
+        && live
+          .shipper
+          .durable()
+          .is_some_and(|durable| durable >= target)
+    });
+  if durable {
+    return Durability::Durable;
+  }
+  if let Some(waker) = waker {
+    done_or_park(state, volume.bytes, false, waker);
+  }
+  Durability::Pending
+}
+
+/// Derived: how long a held reply waits for durability before its transport answers that it is not (NFS `JUKEBOX`,
+/// FUSE `EIO`): [`DURABLE_WAIT_NS`].
+pub(crate) const fn durable_wait_ns() -> u64 {
+  DURABLE_WAIT_NS
 }
 
 /// Counter: a transport reply whose volume did not become durable within [`DURABLE_WAIT_NS`]; it was answered "try
@@ -324,6 +354,12 @@ const LIVE_OVER_BOUND: &str = "fleet.live.over_bound";
 /// Derived: the replies a shard may hold for durability: one per request its clients may have in flight, the bound the
 /// told waits use (`told::held_bound`: clients per shard times ring slots).
 fn awaiting_bound(state: &ShardState) -> usize {
+  awaiting_bound_of(&state.config)
+}
+
+/// Derived: the replies one FUSE mount may hold for durability: the bound a shard's held verbs use
+/// ([`awaiting_bound`]).
+pub(crate) fn reply_hold_bound(state: &ShardState) -> usize {
   awaiting_bound_of(&state.config)
 }
 

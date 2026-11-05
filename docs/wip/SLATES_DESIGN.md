@@ -5742,6 +5742,19 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > - *A destroyed volume's shipper was kept on its owner*, with a whole copy of the volume (`live_ship::forget` at the
 >   teardown's end and in the orphan sweep: waiting verbs refused `NotFound`, parked replies woken to "not durable").
 >   The destroy flow now holds the owner to it too (red first, 1 of 1).
+>
+> **FUSE `fsync` at durability (2026-11-05).** A FUSE mount answered `fsync` at the owner's own barrier, so on a
+> live-shipped volume it claimed what no candidate held: with both candidates' processes stopped it returned success in
+> 19 µs (`a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it`, red first). An `fsync` (or `fsyncdir`)
+> whose barrier published a live volume not yet durable is now held on its mount (`fuse::hold_fsync`), and the mount's
+> task serves the kernel's other requests meanwhile. FUSE answers a request out of order, and an `fsync` reply grants the
+> kernel nothing, so the held reply is sent from its own bytes. The task answers it once the log is durable where the
+> barrier put it, or `EIO` once the liveness budget has passed or the volume is destroyed or its owner superseded
+> (`fuse::settle_held`; the check is `live_ship::durability`, which the NFS wait now uses too). Unlike `crate::told`'s
+> wait it cannot deadlock: it waits on candidates over the network, never on another mount's kernel lock. Held replies
+> are bounded per mount by the shard's bound on held verbs; past it an `fsync` is answered `EIO`, counted. Measured in
+> the flow: with both candidates stopped the `fsync` fails `EIO` after 1.0006 s (the liveness budget); healthy and after
+> the candidates resume, it succeeds.
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
