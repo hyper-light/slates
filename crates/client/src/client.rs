@@ -1165,14 +1165,13 @@ impl Client {
 
   /// Sends `body` as the next request and returns the reply body, refusals typed.
   pub fn call(&mut self, body: &RequestBody) -> Result<ReplyBody, ClientError> {
-    // Every `ack_every` replies, the client acknowledges them (one request), so the daemon's retained records stay
-    // bounded without the caller's help (§4.9) — up to the watermark, which an unpublished id not yet retried holds
-    // back. The acknowledgement is sent and not waited for, as the async path sends it: its reply is a scatter over every
-    // shard, so a call that waited for it first paid the slowest shard's turn (a parked shard's wake, which set the
-    // single-client provisioning p99), and a shard held past the reply deadline failed this unrelated call `Stalled`
-    // (`crates/client/tests/acknowledge.rs`). Its reply is dropped when it arrives; a lost one only means the daemon
-    // holds the records until the next acknowledgement, whose watermark covers them.
-    self.begin_ack_if_due()?;
+    // Every `ack_every` replies, the client acknowledges them first (one request), so the
+    // daemon's retained records stay bounded without the caller's help (§4.9) — up to the
+    // watermark, which an unpublished id not yet retried holds back.
+    let up_to = self.ack_watermark();
+    if up_to.saturating_sub(self.acknowledged) >= self.ack_every {
+      self.acknowledge(up_to)?;
+    }
     if matches!(body, RequestBody::DaemonStatus) {
       let capacity = slates_ipc::status::snapshot_capacity(self.end.region());
       return slates_ipc::status::collect(capacity, |request| self.call_plain(request));

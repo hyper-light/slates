@@ -4232,12 +4232,6 @@ sequence)`; the daemon keeps a completion record per client until acknowledged (
 after a lost reply returns the original result; deadlines are remaining budgets; cancellation is
 a slot kind.
 
-> **Status (2026-11-05, the acknowledgement is never waited for).** A client acknowledges every half-ring of replies by
-> a watermark, and the daemon answers only after every shard has released the records below it. Both the sync and the
-> async client now send it without waiting: a lost reply only delays the release until the next watermark. The sync
-> client had waited, so one call in every half-ring paid the slowest shard's turn, and a shard held past the reply
-> deadline failed it `Stalled`. Record: `docs/bugs/2026-11-05-a-call-waited-for-its-acknowledgements-scatter.md`.
-
 **Wake strategy.** Client: write slot, publish `tail` (release), read `cpl` head with acquire in a
 loop for its wake estimate (seeded with `spin_ns`, the daemon-published measured wake cost, and
 refined from the client's own parks, A-31), then clear the reply stamp slot this park names (the two

@@ -1,12 +1,16 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
-> **A call waited for its acknowledgement's scatter (2026-11-05, §4.9, R9; fixed, its A/B owed).** The synchronous
-> `Client::call` acknowledged every half-ring of replies before its own request and waited for the reply, which the
+> **A call waits for its acknowledgement's scatter (2026-11-05, §4.9, R9; OPEN).** The synchronous
+> `Client::call` acknowledges every half-ring of replies before its own request and waits for the reply, which the
 > daemon gives only after every shard has released the client's records. On macOS, 133 of 2,000 single-client creates
 > (6.7%) carried one, median 2,497 µs against 169 µs (a loaded run whose boot probe measured a 2.5 ms wake). That share
-> set the p99. With another shard held for a second, such a call failed `Stalled`. It is now sent unawaited, as the
-> async path sends it. Red before, green after (`crates/client/tests/acknowledge.rs`). Owed: the interleaved
-> `provision_bench` A/B on every platform. Record: `docs/bugs/2026-11-05-a-call-waited-for-its-acknowledgements-scatter.md`.
+> sets the single-client p99. With another shard held for a second, such a call fails `Stalled`. Sending it unawaited,
+> as the async path does (a6c3bc16), passed its test (Stalled before, 3.62 s after) and the whole client package.
+> But 2 of the 4 parked `provision_bench` forms that ran with it stalled a create past the 1 s reply deadline: one on
+> quiet jupiter, one on macOS. Without it, none of 15 did. Reverted in the next commit, cause not found. Owed:
+> the stall's cause, with a test that reproduces it, before the change returns. Also open, from the same macOS runs at
+> load 23–36: the bench's 8- and 64-client forms aborted `Stalled` in every arm, a live daemon slower than the reply
+> deadline. Record: `docs/bugs/2026-11-05-a-call-waited-for-its-acknowledgements-scatter.md`.
 
 > **Shards counted hardware threads as cores (2026-11-05, A-208, §4.1, R9; fixed and measured).** §4.1 counts shards in
 > physical cores, but the placement counted logical CPUs. jupiter's 16 two-thread cores therefore ran 31 shards and

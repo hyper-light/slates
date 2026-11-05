@@ -8393,5 +8393,5 @@ What it means:
   create scanned all of that shard's keys. With keys bounded and indexed, the parked p50 falls 8–20× on Linux (to
   37–49 µs) and 2–5× on Windows.
 - **Still red:** windows-11-arm's single-client p99 (green in 1 of 3 rounds) and jupiter's (80–252 µs). Windows'
-  parked p50 is 154–700 µs. The periodic acknowledgement's scatter (a6c3bc16, GAPS) is the next lever on the
-  single-client tail, and its A/B is `diag-clients-4`.
+  parked p50 is 154–700 µs. The periodic acknowledgement's scatter is the next lever on the single-client tail
+  (GAPS). Sending it unawaited (a6c3bc16) stalled 2 of 4 parked forms, and it was reverted.

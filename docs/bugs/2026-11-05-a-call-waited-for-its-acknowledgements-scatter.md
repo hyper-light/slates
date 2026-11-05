@@ -1,4 +1,4 @@
-# A call waited for its acknowledgement's scatter (2026-11-05, §4.9, R9)
+# A call waits for its acknowledgement's scatter (2026-11-05, §4.9, R9; open, the first fix reverted)
 
 ## Description
 
@@ -30,13 +30,32 @@ every `ack_every` waited for the slowest shard. On an idle daemon whose other sh
 of them, and so the single-client provisioning p99 sat at many times its p50 (jupiter: p50 20 µs, p99 80–650 µs). A
 shard busy past the reply deadline made an unrelated call fail.
 
-## Edits
+## Edits, then reverted
 
-`Client::call` sends a due acknowledgement with `begin_ack_if_due`, as the async path does. Its reply is dropped on
-arrival and counted (`unawaited_dropped`), and the watermark rule that holds an unpublished id's record back is
-unchanged. `Client::acknowledge`, the explicit form, still waits.
+a6c3bc16 made `Client::call` send a due acknowledgement with `begin_ack_if_due`, as the async path does. Its reply
+was dropped on arrival and counted (`unawaited_dropped`), and the watermark rule that holds an unpublished id's record
+back was unchanged.
 
-## Tests
+`a_call_is_never_held_behind_the_periodic_acknowledgement` (`crates/client/tests/acknowledge.rs`) failed before it
+(`Stalled` after 1 s) and passed after (3.62 s, macOS arm64), and the whole `slates-client` package passed.
 
-`a_call_is_never_held_behind_the_periodic_acknowledgement`: red before (`Stalled` after 1 s), green after (1 passed,
-3.62 s, macOS arm64). The whole `slates-client` package runs with it.
+**Then the interleaved `provision_bench` A/B found a stall.** With a6c3bc16, a parked-form create (one idle client,
+paced a millisecond apart) went unanswered past the 1 s reply deadline:
+- on jupiter, in 1 of 3 runs (15:45 UTC, the processor 9% busy);
+- on macOS, in 1 of 3 runs (15:51 UTC, load 8–14).
+
+Without it, every parked form that ran completed: 12 on jupiter and 3 on macOS that day. The change was taken back
+out by a new commit, and the test with it, since the test asserts the change's behaviour. Its source is kept to
+return failing-first with the real fix.
+
+What is known of the stall: the daemon serves every ready request of a client in a round (`serve_client`, no
+in-flight limit), and it publishes replies in completion order, which the client takes in that order. So the
+unawaited acknowledgement's reply cannot hold the create's reply back by position. The difference the change makes is
+two of the client's requests in flight at once, the acknowledgement's scatter spawned on every other shard, all parked
+in this form, while the create (or its forward) runs. Not found yet.
+
+## Also found
+
+At load 23–36 on macOS the bench's 8- and 64-client forms aborted `Stalled` in every arm, main included: a live
+daemon slower than the reply deadline. The client returns `Stalled` for a live daemon once the deadline passes
+(`Client::round_trip`). That is a separate robustness gap.
