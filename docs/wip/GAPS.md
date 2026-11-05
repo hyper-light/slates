@@ -380,7 +380,8 @@
 > inflated, now the liveness budget with dead links redialed. A superseded owner resumed after its takeover never has a
 > write acknowledged; writers killed mid-write leave the log whole and no reply held; a destroyed volume's copies are
 > let go (three defects found and fixed on the way: §4.10 status "Chaos, continued"). Open: hard links and extended
-> attributes in the rebuilt volume; FUSE `fsync` at durability; a candidate's copy across its own daemon's restart.
+> attributes in the rebuilt volume; a candidate's copy across its own daemon's restart. FUSE `fsync` on a live volume is
+> answered at durability since 2026-11-05 (`EIO` past the liveness budget; §4.10 status "FUSE `fsync` at durability").
 > Measured in the daemon (release, BENCHMARKS "What live shipping adds to a stable NFS write"): a live 4 KiB `FILE_SYNC`
 > write costs 90–114 µs more than a plain one at the median, p99 217–398 µs, p999 0.44–1.27 ms, worst 0.47–1.87 ms at
 > load 8–30 (2026-11-05). The rare 100 ms tail is explained and removed (two waits for the record period; and a
@@ -388,8 +389,8 @@
 > status "The tail and three more defects"). Open: the added median is the cross-shard dispatch round (50 µs not met);
 > p999 under 1 ms at load 30. Open: one exchange per message to every holder starved the second holder (never
 > accepted an entry, in six of nine process flows) and was rejected; why is not pinned down. Open, toward a filesystem
-> server replicated per write in under 1 ms: FUSE `fsync` answered at durability (AC-8.3's "live-shipped volumes
-> report none", AC-8.9's credit backpressure); a candidate's copy kept across its own restart; real-process chaos
+> server replicated per write in under 1 ms: AC-8.9's credit backpressure; a candidate's copy kept across its own
+> restart; real-process chaos
 > (partitions, injected latency, volume failure, client disconnect). `put_wal` and the
 > loss-window report are unbuilt; a head still waits up to the 100 ms record period before its commit starts.
 

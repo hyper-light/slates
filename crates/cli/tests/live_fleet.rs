@@ -1174,3 +1174,78 @@ fn measure_what_live_shipping_adds_to_a_stable_nfs_write() {
   );
   assert_eq!(late, 0, "no stable write waited out its bound");
 }
+
+/// A-200, AC-8.3 ("live-shipped volumes report none") through a FUSE mount: do mount a live-shipped volume, write and
+/// `fsync` a file, then stop both candidates' processes (SIGSTOP), write and `fsync` again, resume them and `fsync` once
+/// more. Expect the first `fsync` to succeed, the one made with no candidate able to hold the write to fail (`EIO`)
+/// rather than claim durability, and the last to succeed once the candidates are back. Until 2026-11-05 FUSE answered
+/// `fsync` at the owner's own barrier, so the second one succeeded with nothing off the owner.
+#[cfg(target_os = "linux")]
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it() {
+  use std::io::Write;
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping FUSE fsync flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  if !std::path::Path::new("/dev/fuse").exists() {
+    eprintln!("skipping the live-shipping FUSE fsync flow: no /dev/fuse on this host");
+    return;
+  }
+  let fleet = start_fleet("live-fsync");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = fleet.instances[owner_index].clone();
+  let id = create_live_volume(&owner, "fsynced");
+  let mount = format!("{}/mount", fleet.scratch.path);
+  std::fs::create_dir_all(&mount).unwrap();
+  let (code, _, err) = run(&owner, &["mount", &id, &mount]);
+  assert_eq!(code, 0, "mount: {err}");
+  let path = format!("{mount}/synced");
+  let mut file = std::fs::File::create(&path).unwrap();
+  file.write_all(b"held by a candidate").unwrap();
+  let healthy = file.sync_all();
+  let candidates: Vec<usize> = (0..fleet.daemons.len())
+    .filter(|index| *index != owner_index)
+    .collect();
+  for index in &candidates {
+    signal(&fleet.daemons[*index], rustix::process::Signal::STOP);
+  }
+  file.write_all(b", then by no one").unwrap();
+  let began = Instant::now();
+  let alone = file.sync_all();
+  let alone_took = began.elapsed();
+  for index in &candidates {
+    signal(&fleet.daemons[*index], rustix::process::Signal::CONT);
+  }
+  let resumed = file.sync_all();
+  drop(file);
+  let unmounted = Command::new("fusermount3").args(["-u", &mount]).status();
+  if !unmounted.is_ok_and(|status| status.success()) {
+    let _ = Command::new("fusermount3")
+      .args(["-u", "-z", &mount])
+      .status();
+  }
+  let counters = live_counters(&owner);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!(
+    "live fsync: healthy {healthy:?}; candidates stopped {alone:?} after {alone_took:?}; resumed {resumed:?}; \
+     owner's live counters {counters:?}"
+  );
+  assert!(
+    healthy.is_ok(),
+    "an fsync a candidate holds succeeds: {healthy:?}"
+  );
+  assert_eq!(
+    alone.as_ref().err().and_then(std::io::Error::raw_os_error),
+    Some(rustix::io::Errno::IO.raw_os_error()),
+    "an fsync no candidate can hold fails EIO, not success: {alone:?}"
+  );
+  assert!(
+    resumed.is_ok(),
+    "once the candidates are back, fsync succeeds: {resumed:?}"
+  );
+}

@@ -165,7 +165,25 @@ pub(crate) struct FuseMount {
   /// The volume's change generation as of this mount's last turn (`Volume::change_generation`): the task parks on the
   /// volume past it, so a change made through any other path wakes it to deliver.
   seen: u64,
+  /// `fsync` replies held until the live-shipped volume's log is durable where their barrier put it (A-200), oldest
+  /// first, bounded by `live_ship::reply_hold_bound` ([`settle_held`]).
+  held: std::collections::VecDeque<HeldFsync>,
 }
+
+/// An `fsync` reply held for durability (A-200): the reply as written, the log position it waits for and when it
+/// gives up. An `fsync` reply grants the kernel nothing, so it is sent from these bytes alone.
+struct HeldFsync {
+  unique: u64,
+  reply: Vec<u8>,
+  target: u64,
+  deadline_ns: u64,
+}
+
+/// Counter: `fsync` replies held until their live volume was durable.
+const LIVE_FSYNC_HELD: &str = "fuse.live_fsync_held";
+/// Counter: held `fsync` replies answered `EIO`: the wait passed, the volume was destroyed or its owner superseded, or
+/// the mount already held its bound of them.
+const LIVE_FSYNC_REFUSED: &str = "fuse.live_fsync_refused";
 
 impl std::fmt::Debug for FuseMount {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -450,6 +468,7 @@ fn established(s: &mut ShardState, pending: PendingAttach, mount: Mount) -> Repl
       lost: LostWrites::default(),
       change,
       seen: 0,
+      held: std::collections::VecDeque::new(),
     },
   );
   if futures::spawn(serve(attachment))
@@ -497,6 +516,8 @@ enum Woke {
   Request,
   /// The volume changed past what this mount last delivered, or a finished round of notifications signalled.
   Change,
+  /// A held `fsync` reply's wait passed ([`settle_held`] answers it).
+  Held,
 }
 
 /// Which work a turn does.
@@ -561,7 +582,27 @@ async fn wait_for_work(
 ) -> Result<Woke, slates_rt::RtError> {
   let mut device = std::pin::pin!(slates_rt::readiness::readable(device));
   let mut signal = std::pin::pin!(slates_rt::readiness::readable(signal));
+  // The earliest held `fsync`'s give-up, armed as this wait begins: holds are only added in turns, between waits.
+  let earliest = state::with_state(|s| {
+    s.fuse_mounts
+      .get(&attachment)
+      .and_then(|mount| mount.held.iter().map(|held| held.deadline_ns).min())
+  })
+  .flatten();
+  let mut give_up = std::pin::pin!(async move {
+    match earliest {
+      Some(deadline) => {
+        let _ = futures::sleep(deadline.saturating_sub(futures::now_ns())).await;
+      }
+      None => std::future::pending::<()>().await,
+    }
+  });
   std::future::poll_fn(|cx| {
+    // Held `fsync` replies whose volume became durable (or never will) are answered first; the rest park on it.
+    let _ = state::with_state(|s| settle_held(s, attachment, Some(cx.waker())));
+    if give_up.as_mut().poll(cx).is_ready() {
+      return std::task::Poll::Ready(Ok(Woke::Held));
+    }
     if let std::task::Poll::Ready(ready) = device.as_mut().poll(cx) {
       return std::task::Poll::Ready(ready.map(|()| Woke::Request));
     }
@@ -600,6 +641,10 @@ async fn serve(attachment: u64) {
         return;
       }
     };
+    if matches!(woke, Woke::Held) {
+      // Settled at the next wait's start, which arms the next give-up.
+      continue;
+    }
     if matches!(woke, Woke::Change) {
       match state::with_state(|s| turn(s, attachment, TurnKind::Change)) {
         Some(Turned::Fenced) => crate::daemon::pace(crate::daemon::HEARTBEAT_NS).await,
@@ -855,6 +900,12 @@ fn reply(
   if refuse.is_some() {
     reclaim(s, mount, dispatched);
   }
+  // An `fsync` of a live-shipped volume is answered once its log is durable on `f` candidates too (A-200; AC-8.3):
+  // held here and sent by the mount's task ([`settle_held`]), which serves the kernel's other requests meanwhile.
+  if refuse.is_none() && hold_fsync(s, mount, dispatched) {
+    s.pending_replies.remove(&attachment);
+    return Turned::Served;
+  }
   let sent = send_reply(&mount.channel, &mut mount.serve, dispatched, refuse);
   // A refused reply told the caller the change failed while it was applied: the kernel is told what changed, now
   // that the caller's directory lock is released (`redeliver_after_refusal`).
@@ -878,6 +929,72 @@ fn reply(
       Turned::Ended
     }
   }
+}
+
+/// Holds `dispatched`'s reply when it is an `fsync` whose barrier published a live-shipped volume not yet durable there
+/// (A-200): whether it was held. Past the mount's bound it is not held but answered `EIO`, counted, since an `fsync`
+/// must not claim what the candidates do not hold.
+fn hold_fsync(s: &mut ShardState, mount: &mut FuseMount, dispatched: &Dispatched) -> bool {
+  use slates_bridge_fuse::abi::Opcode;
+  if !matches!(dispatched.opcode(), Some(Opcode::FSync | Opcode::FSyncDir)) {
+    return false;
+  }
+  let Some(target) = crate::live_ship::durable_target(s, mount.volume) else {
+    return false;
+  };
+  if mount.held.len() >= crate::live_ship::reply_hold_bound(s) {
+    s.count(LIVE_FSYNC_REFUSED, 1);
+    let _ = send_reply(&mount.channel, &mut mount.serve, dispatched, Some(EIO));
+    return true;
+  }
+  mount.held.push_back(HeldFsync {
+    unique: dispatched.unique(),
+    reply: dispatched.reply(&mount.serve).to_vec(),
+    target,
+    deadline_ns: futures::now_ns().saturating_add(crate::live_ship::durable_wait_ns()),
+  });
+  s.count(LIVE_FSYNC_HELD, 1);
+  true
+}
+
+/// Answers each held `fsync` of `attachment`'s mount that is settled: its reply once its volume is durable at its
+/// position, `EIO` once its wait has passed or it never will be (destroyed, superseded). The rest stay held, `waker`
+/// parked on the volume. A reply the kernel no longer wants (its caller was interrupted) or a device that fails is
+/// dropped here; the mount's next turn meets the failure.
+fn settle_held(s: &mut ShardState, attachment: u64, waker: Option<&std::task::Waker>) {
+  let Some(mut mount) = s.fuse_mounts.remove(&attachment) else {
+    return;
+  };
+  let now = futures::now_ns();
+  let mut kept = std::collections::VecDeque::new();
+  while let Some(held) = mount.held.pop_front() {
+    let settled = crate::live_ship::durability(s, mount.volume, held.target, waker);
+    let answer = match settled {
+      crate::live_ship::Durability::Durable => Some(None),
+      crate::live_ship::Durability::Never => Some(Some(EIO)),
+      crate::live_ship::Durability::Pending if now >= held.deadline_ns => Some(Some(EIO)),
+      crate::live_ship::Durability::Pending => None,
+    };
+    match answer {
+      None => kept.push_back(held),
+      Some(None) => {
+        let _ = mount.channel.write_reply(&held.reply);
+      }
+      Some(Some(errno)) => {
+        s.count(LIVE_FSYNC_REFUSED, 1);
+        let mut header = [0u8; slates_bridge_fuse::abi::OUT_HEADER_LEN];
+        if let Ok(length) =
+          slates_bridge_fuse::ReplyHeader::write_error(held.unique, errno, &mut header)
+        {
+          let _ = mount
+            .channel
+            .write_reply(header.get(..length).unwrap_or(&[]));
+        }
+      }
+    }
+  }
+  mount.held = kept;
+  s.fuse_mounts.insert(attachment, mount);
 }
 
 /// Gives back what `dispatched`'s success reply granted — its lookup references and open handle — over a
@@ -1105,6 +1222,7 @@ fn adopt_one(s: &mut ShardState, record: AttachmentRecord, held: crate::fuse_hol
       lost: LostWrites::new(std::collections::BTreeSet::new(), s.writes_lost),
       change,
       seen: 0,
+      held: std::collections::VecDeque::new(),
     },
   );
   if futures::spawn(serve(attachment))
