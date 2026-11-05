@@ -1,7 +1,7 @@
-From 699baf6c7573b03b0048d1dd777ea385680ee0b7 Mon Sep 17 00:00:00 2001
+From 1b8bfd1f1aad8ca69294f3fd9ff67c1b95451877 Mon Sep 17 00:00:00 2001
 From: Ada Lundhe <adalundhe@lundhe.audio>
-Date: Wed, 4 Nov 2026 21:38:28 -0800
-Subject: [PATCH 2/2] D189, PM M421: a window's change is counted before its
+Date: Wed, 4 Nov 2026 23:31:02 -0800
+Subject: [PATCH 2/3] D189, PM M421: a window's change is counted before its
  lock is let go. A vCPU's fault that waited for the lock read the old count,
  and a second fault at one address at that count was taken for the guest's
  own: a live range's load read a bus's 0xff and its store was lost

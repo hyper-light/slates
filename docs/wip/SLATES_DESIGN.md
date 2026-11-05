@@ -12808,8 +12808,8 @@ doc), `crates/client/tests/shards.rs`, `crates/server/tests/shards.rs`, `docs/wi
 - **Proven.** `a_slice_is_handed_from_each_granule_and_refused_between_them` (`crates/client/tests/shards.rs`,
   T-shards-windows-5.6) failed first as above. With the rule, each of a range's 32 granules is answered and a view placed
   from it holds the file's bytes then zeros, and 4 offsets between granules are refused and counted; the suite 12 of 12 in
-  each of 3 runs on jupiter. `malformed_asks_are_refused` (`crates/server/tests/shards.rs`) holds Unix's route to the same
-  refusal.
+  each of 3 runs on jupiter and once on windows-2025 (CI run 41981896876). `malformed_asks_are_refused` (`crates/server/tests/shards.rs`)
+  holds Unix's route to the same refusal: the suite passes on Ubuntu (22) and macOS (26), the same run.
 
 ### A-198 — A WinFsp mount outlives its daemon: the anchor holds the volume's control handle, the drive's link and the mount's ledger, and the next daemon serves the held volume (accepted 2026-11-01, Step 9 of the VFS and DAX plan; built and measured 2026-11-02)
 Applied in the same change to: GAPS (gap 2 of the platform inventory). The build applies it to §4.6 "Windows",
