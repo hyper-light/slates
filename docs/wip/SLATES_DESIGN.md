@@ -10461,6 +10461,22 @@ Status: built 2026-10-04.
 - Signals: `nfs.local_p50_ns`, `nfs.local_p99_ns`, `nfs.local_off_cpu_p99_ns` and `nfs.forwarded_p99_ns` (since
   boot; absent means unknown). They showed the serve at a 2–3 µs median while the client saw about 1 ms, which is
   what located the cost outside the serve.
+- **Amended 2026-11-05 (VFS plan step 11): a turn takes only the records it can reach.** Applied in the same change to
+  `crates/server/src/nfs.rs` (`read_head`, `turn_copy_budget`, counter `nfs.turn.left_queued`),
+  `crates/server/src/config.rs` (`DaemonConfig::quantum_copy_bytes`), `crates/server/tests/nfs_hostile.rs`,
+  `crates/cli/examples/nfs_large_write.rs`, BENCHMARKS, GAPS.
+  - Why: a turn copied every whole record its peek found out of the stream buffer, then served them until its quantum
+    was spent. A 256 KiB WRITE outlasts any quantum, so its turn also copied the WRITE queued behind it and dropped
+    it, and the next turn peeked and copied that one again. Profiled through Linux's NFSv4.2 client (CI's runner,
+    diagnostics run 41986870989), the peek and the copies out of it were 12.4% of the busy shard's samples during a
+    large write.
+  - What: serving a record copies its bytes at least once, so once the records taken hold more bytes than the shard's
+    quantum copies at the measured memcpy rate (`quantum_copy_bytes`), no later record is reached in this turn. Those
+    stay in the kernel's queue, unassembled, for the next turn's peek. The record that crosses the budget is taken,
+    so a turn always has one. Small pipelined calls still share a turn and a write: their bytes are far below the
+    budget.
+  - Proven: `pipelined_writes_past_a_turns_copy_budget_wait_queued_and_every_byte_lands` (failed first: the counter
+    did not exist), and the pipelined-READ test above still batches.
 
 ### A-75 — An NFSv4.1 session is granted one client's in-flight bound in slots (2026-10-04)
 Applied in the same change to: `crates/server/src/config.rs` (`nfs_v4_caps`), `crates/server/tests/nfs_mount.rs`,

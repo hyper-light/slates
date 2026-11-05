@@ -1136,6 +1136,19 @@ impl DaemonConfig {
     copy_slice_bytes(self.memcpy_bytes_per_second, self.step_quantum_ns())
   }
 
+  /// Derived: the bytes the calling shard can copy in one whole step quantum now, at the measured memcpy rate
+  /// (`memcpy_bytes_per_second × step_quantum_ns / 1e9`), at least one. A lower bound on what a quantum's work must
+  /// copy past: work that copies more bytes than this cannot finish within the quantum. An NFS connection's turn stops
+  /// taking records there (`crate::nfs`, `read_head`).
+  pub fn quantum_copy_bytes(&self) -> u64 {
+    self
+      .memcpy_bytes_per_second
+      .saturating_mul(self.step_quantum_ns())
+      .checked_div(NANOS_PER_SECOND)
+      .unwrap_or(0)
+      .max(1)
+  }
+
   /// [`DaemonConfig::copy_slice_bytes`] in whole host pages, at least one: the slice a DAX backing's fill, ingest or
   /// refill copies on the calling shard now (A-163), since a backing is stored and compared a page at a time.
   pub fn copy_slice_page_bytes(&self) -> u64 {
