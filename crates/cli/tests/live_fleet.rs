@@ -1022,3 +1022,107 @@ fn a_superseded_owner_resumed_after_its_takeover_is_fenced() {
     "the superseded owner's write never reached the volume: {out:?}"
   );
 }
+
+/// A stable-write NFS session to a fresh volume's export on `owner`: the stream, the file, and the volume's id.
+fn stable_session(owner: &str, name: &str, live: bool) -> (std::net::TcpStream, Vec<u8>, String) {
+  let id = value_of(
+    &run_ready(owner, &["volume", "create", name, "--bounded", "64MiB"]),
+    "id",
+  );
+  if live {
+    let (code, _, err) = run(owner, &["live-ship", &id]);
+    assert_eq!(code, 0, "live-ship: {err}");
+  }
+  let (code, out, err) = run(owner, &["export", &id, "--json"]);
+  assert_eq!(code, 0, "export: {err}");
+  let (path, port) = (json_field(&out, "path"), json_field(&out, "port"));
+  let mut stream =
+    std::net::TcpStream::connect(("127.0.0.1", port.parse::<u16>().unwrap())).unwrap();
+  stream.set_read_timeout(Some(FLEET_WAIT)).unwrap();
+  stream.set_nodelay(true).unwrap();
+  let root = nfs::mount(&mut stream, &path, 1);
+  let file = nfs::create(&mut stream, &root, "timed", 2);
+  (stream, file, id)
+}
+
+/// Nearest-rank percentiles of `samples` in microseconds: p50, p99, p999, max.
+fn percentiles_us(samples: &mut [Duration]) -> (f64, f64, f64, f64) {
+  samples.sort();
+  let at = |per_mille: usize| {
+    let rank = (samples.len() * per_mille).div_ceil(1000).max(1) - 1;
+    samples[rank].as_secs_f64() * 1e6
+  };
+  (
+    at(500),
+    at(990),
+    at(999),
+    samples[samples.len() - 1].as_secs_f64() * 1e6,
+  )
+}
+
+/// A-200's cost inside the daemon, measured (not a gate): on one owner process, two volumes, one plain and one
+/// live-shipped, each sent 4 KiB `FILE_SYNC` NFS writes by a real NFS client over TCP, in interleaved rounds. A stable
+/// write to the plain volume is answered after the owner's own barrier; to the live one, also after a candidate holds
+/// it. Prints each one's p50, p99, p999 and max; the difference is what replication adds per stable write. Run it
+/// release (`cargo test --release`), at `SLATES_TEST_CLI=1` and `SLATES_TEST_MEASURE=1`.
+#[test]
+fn measure_what_live_shipping_adds_to_a_stable_nfs_write() {
+  /// Shape: interleaved rounds, and the writes of each volume per round.
+  const ROUNDS: usize = 5;
+  /// Shape: see [`ROUNDS`].
+  const PER_ROUND: usize = 400;
+  /// Shape: each write's bytes, a page.
+  const WRITE_BYTES: usize = 4096;
+  if std::env::var_os("SLATES_TEST_CLI").is_none()
+    || std::env::var_os("SLATES_TEST_MEASURE").is_none()
+  {
+    eprintln!(
+      "skipping the live-shipping measurement: set SLATES_TEST_CLI=1 and SLATES_TEST_MEASURE=1 (release)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-measure");
+  let owner = &fleet.instances[(fleet.bootstrap + 1) % fleet.instances.len()];
+  let (mut plain, plain_file, _) = stable_session(owner, "plain", false);
+  let (mut live, live_file, live_id) = stable_session(owner, "live", true);
+  let data = vec![0x5a_u8; WRITE_BYTES];
+  let mut xid = 100u32;
+  // Warm both: sessions, the live log's first whole record, the candidates' install.
+  for _ in 0..50 {
+    xid += 1;
+    nfs::write(&mut plain, &plain_file, &data, xid);
+    xid += 1;
+    nfs::write(&mut live, &live_file, &data, xid);
+  }
+  let (mut plain_times, mut live_times) = (Vec::new(), Vec::new());
+  for _ in 0..ROUNDS {
+    for (stream, file, times) in [
+      (&mut plain, &plain_file, &mut plain_times),
+      (&mut live, &live_file, &mut live_times),
+    ] {
+      for _ in 0..PER_ROUND {
+        xid += 1;
+        let began = Instant::now();
+        nfs::write(stream, file, &data, xid);
+        times.push(began.elapsed());
+      }
+    }
+  }
+  let caught = live_line(owner, "shipping", &live_id);
+  let late = counter(owner, "fleet.live.durable_late");
+  let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+  drop((plain, live));
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  let (p50, p99, p999, max) = percentiles_us(&mut plain_times);
+  let (l50, l99, l999, lmax) = percentiles_us(&mut live_times);
+  eprintln!(
+    "measure: {} writes each of {WRITE_BYTES} B FILE_SYNC, {ROUNDS} interleaved rounds; load {}\n  plain p50 {p50:.1} \
+     p99 {p99:.1} p999 {p999:.1} max {max:.1} us\n  live  p50 {l50:.1} p99 {l99:.1} p999 {l999:.1} max {lmax:.1} us\n  \
+     added at p50 {:.1} us; live log at the end {caught:?}; late {late}",
+    plain_times.len(),
+    load.trim(),
+    l50 - p50
+  );
+  assert_eq!(late, 0, "no stable write waited out its bound");
+}

@@ -111,6 +111,7 @@ pub async fn exchange(
   };
   let (tx, rx) = reply_channel();
   let deadline_ns = budget.max_deadline_ns();
+  let mut refused = Vec::new();
   for (host, endpoint) in sessions {
     let tx = tx.clone();
     let bytes = message.to_vec();
@@ -118,9 +119,13 @@ pub async fn exchange(
       let (reply, endpoint) = request_within(endpoint, stream, priority, &bytes, deadline_ns).await;
       tx.send(Reply(host, reply, Box::new(endpoint)));
     });
-    // A refused spawn drops that holder's session with its future; the others still decide.
-    if let Ok(task) = spawned {
-      let _ = detach(task);
+    // A refused spawn drops that holder's session with its future; the others still decide, and the holder is reported
+    // unanswered so its link is dialed afresh rather than left lent with no session behind it.
+    match spawned {
+      Ok(task) => {
+        let _ = detach(task);
+      }
+      Err(_) => refused.push(host),
     }
   }
   drop(tx);
@@ -128,7 +133,7 @@ pub async fn exchange(
   let mut exchanged = Exchanged {
     replies: Vec::new(),
     reusable: Vec::new(),
-    unanswered: Vec::new(),
+    unanswered: refused,
     stragglers: Stragglers::none(),
     timed_out: false,
   };
