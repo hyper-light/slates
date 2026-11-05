@@ -11,7 +11,7 @@
 //!   `<ns>` between checks unless a reply wakes it. The daemon parks a tenth of its 100 ms heartbeat
 //!   (`fleet::POLL_PER_PERIOD`), 10 ms; the second poll is a hundredth of that.
 //!
-//! - `live ship <n> B`: one live-shipped write (A-199) of an `n`-byte publication: `Shipper::append`, then `ship` to
+//! - `live ship <n> B`: one live-shipped write (A-200) of an `n`-byte publication: `Shipper::append`, then `ship` to
 //!   both holders, each applying it through `serve_entry`, until it is durable (the owner and one holder hold it).
 //!   One write at a time (a credit of one), at the daemon's poll.
 //!

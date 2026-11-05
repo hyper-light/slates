@@ -1,4 +1,4 @@
-//! Live shipping's log under a nemesis (A-199; §4.10; AC-8.3, AC-8.9): the owner ships publications to its `2f`
+//! Live shipping's log under a nemesis (A-200; §4.10; AC-8.3, AC-8.9): the owner ships publications to its `2f`
 //! holders over a network that loses, duplicates and reorders messages and partitions pairs of hosts; holders crash
 //! for good; owners are lost and taken over by phase one; a superseded owner keeps shipping as if nothing happened.
 //! The register invariants are history checks, after every step:
@@ -590,7 +590,7 @@ fn run_seeds(f: u64) -> (u64, u64, u64, u64) {
   totals
 }
 
-/// A-199, AC-8.3: under loss, duplication, reordering, partitions, holder crashes, owner loss with takeover and a
+/// A-200, AC-8.3: under loss, duplication, reordering, partitions, holder crashes, owner loss with takeover and a
 /// superseded owner shipping on, at `f = 1` and `f = 2`, every history holds Agreement, NoLoss, StaleNeverCommits and
 /// Convergence. The counters are the non-vacuity check: takeovers happened, installs caught holders up, superseded
 /// owners were refused by fences, and writes became durable.

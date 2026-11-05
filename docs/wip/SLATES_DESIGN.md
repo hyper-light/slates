@@ -5612,12 +5612,12 @@ first window after attach (window derived from the measured attach-to-first-buil
 next attach of the same base prefetches that set in the background, bounded by the attachment's
 budget; the policy is observe-first until a minimum number of attaches has been seen.
 
-**Live shipping (opt-in; A-199 states the log, its acknowledgement and its takeover).** A volume created with policy `live-shipped` ships its op log to f+1
+**Live shipping (opt-in; A-200 states the log, its acknowledgement and its takeover).** A volume created with policy `live-shipped` ships its op log to f+1
 of its candidates and acknowledges writes at f+1; the backups apply entries in order and the
 takeover successor is one of them, so promotion has no loss window; replica lag beyond a window
 derived from the measured apply rate applies credit backpressure to that volume's writers only.
 
-> **Status (2026-11-04, the log built and checked; not yet on the wire or in the daemon).** A-199's log is
+> **Status (2026-11-04, the log built and checked; not yet on the wire or in the daemon).** A-200's log is
 > `crates/db/src/live.rs`: `Shipper` (the owner's chain, credit, retained tail and durable position), `Replica` (a
 > holder's fence and head, guard-then-apply), `adopt` (phase one's choice), and the entry, install and reply
 > encodings with hostile-input tests. `crates/db/tests/live.rs` runs it under a nemesis (loss, duplication,
@@ -13668,6 +13668,8 @@ Status: built 2026-11-05. It amends A-74's turn.
   arms overlapped: best of eighteen 1,019.0 on main, 1,007.8 with the change.
 
 ### A-199 — Live shipping ships the owner's publications as a fenced, hash-chained log, acknowledged when f holders and the owner hold it (accepted 2026-11-04; Ada's goal of 2026-11-04, "run replicas of the filesystem server … replication <1 ms")
+
+### A-200 — Live shipping ships the owner's publications as a fenced, hash-chained log, acknowledged when f holders and the owner hold it (accepted 2026-11-04; Ada's goal of 2026-11-04, "run replicas of the filesystem server … replication <1 ms")
 
 **Why.** §4.10 says a `live-shipped` volume "ships its op log to f+1 of its candidates and acknowledges writes at f+1",
 and AC-8.3 holds such a volume to no loss window. The design does not say what the op log is, what an
