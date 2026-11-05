@@ -354,6 +354,18 @@ fn run_worker(
   core: Option<u32>,
   ready: std::sync::mpsc::SyncSender<(u16, Result<(), RtError>)>,
 ) -> Result<Counters, RtError> {
+  // DIAG: shard threads above normal priority. THREAD_PRIORITY_ABOVE_NORMAL is 1; no privilege is needed.
+  #[cfg(windows)]
+  {
+    unsafe extern "system" {
+      fn GetCurrentThread() -> *mut core::ffi::c_void;
+      fn SetThreadPriority(thread: *mut core::ffi::c_void, priority: i32) -> i32;
+    }
+    // SAFETY: diagnostics only; the pseudo-handle names this thread.
+    unsafe {
+      SetThreadPriority(GetCurrentThread(), 1);
+    }
+  }
   let id = seed.id;
   let pinned = core.map(|core| (core, slates_machine::probes::pin_current_thread(core)));
   let ctx = match ShardContext::build(seed) {
