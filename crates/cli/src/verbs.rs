@@ -939,14 +939,14 @@ fn emit_checkout(
       .iter()
       .map(|(key, value)| ((*key).to_owned(), serde_json::Value::from(*value)))
       .collect();
-    println!(
+    slates_machine::out_line!(
       "{}",
       serde_json::json!({ "version": version, "report": report })
     );
   } else {
-    println!("version: {version}");
+    slates_machine::out_line!("version: {version}");
     for (key, value) in counts {
-      println!("{key}: {value}");
+      slates_machine::out_line!("{key}: {value}");
     }
   }
   Ok(())
