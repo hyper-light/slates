@@ -2788,7 +2788,7 @@ fn head(connection: &mut Connection) -> Head {
   if connection.inbox.ended && connection.inbox.held == 0 {
     return Head::Ended;
   }
-  read_head(connection.inbox.held())
+  read_head(connection.inbox.held(), turn_copy_budget())
 }
 
 /// Whether a connection waiting for the rest of a record will never get it, its client having closed: on Unix, asked
@@ -2858,21 +2858,50 @@ fn peek_head(stream: &TcpStream) -> Head {
     match stream.peek_now(&mut buffer) {
       Err(_) | Ok(Some(0)) => Head::Ended,
       Ok(None) => Head::Waiting(1),
-      Ok(Some(queued)) => read_head(buffer.get(..queued).unwrap_or_default()),
+      Ok(Some(queued)) => read_head(buffer.get(..queued).unwrap_or_default(), turn_copy_budget()),
     }
   })
 }
 
-/// The whole records at the head of `queued`, or how many bytes the first needs.
-fn read_head(queued: &[u8]) -> Head {
+/// Counter: turns that stopped taking records at their copy budget with more bytes queued behind ([`read_head`]), left
+/// unassembled for a later turn's peek: the budget's non-vacuity count (A-204).
+const TURN_LEFT_QUEUED: &str = "nfs.turn.left_queued";
+
+/// Derived: the record bytes one turn can reach on this shard now, [`DaemonConfig::quantum_copy_bytes`] (the bytes its
+/// step quantum copies at the measured memcpy rate); no bound off a shard. See [`read_head`].
+///
+/// [`DaemonConfig::quantum_copy_bytes`]: crate::config::DaemonConfig::quantum_copy_bytes
+fn turn_copy_budget() -> usize {
+  state::with_state(|s| s.config.quantum_copy_bytes()).map_or(usize::MAX, |bytes| {
+    usize::try_from(bytes).unwrap_or(usize::MAX)
+  })
+}
+
+/// The whole records at the head of `queued` that one turn can reach, or how many bytes the first needs (A-204).
+///
+/// A turn serves its records in order until its step quantum is spent ([`serve_turn`]), and serving a record copies
+/// its bytes at least once (a WRITE's data into the volume), so once the records taken hold more than `budget` bytes,
+/// the bytes the quantum copies, no later record is reached in this turn. Those are left queued, unassembled, and a
+/// later turn's peek takes them (counted, [`TURN_LEFT_QUEUED`]). The record that crosses the budget is taken, so a
+/// turn always has at least one. A record served faster than its bytes copy (a call refused unread) only ends its turn
+/// early. Before (VFS plan step 11, 2026-11-05), every whole record peeked was copied out, and a large WRITE's turn
+/// copied the WRITE queued behind it too, then dropped it: about 6% of a large write's throughput in process
+/// (`crates/cli/examples/nfs_large_write.rs`, BENCHMARKS).
+fn read_head(queued: &[u8], budget: usize) -> Head {
   let mut reader = RecordReader::default();
   let mut at = 0usize;
+  let mut taken = 0usize;
   let mut records = Vec::new();
   while let Some(rest) = queued.get(at..).filter(|rest| !rest.is_empty()) {
+    if taken >= budget {
+      note(TURN_LEFT_QUEUED);
+      break;
+    }
     match reader.read(rest) {
       Err(_) => return Head::Refused,
       Ok((Some(body), used)) => {
         at = at.saturating_add(used);
+        taken = taken.saturating_add(body.len());
         records.push(Inbound { body, end: at });
       }
       Ok((None, used)) => {

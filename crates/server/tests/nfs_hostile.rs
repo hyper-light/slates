@@ -671,6 +671,87 @@ fn pipelined_calls_are_answered_in_order_and_their_replies_share_writes() {
   assert!(batched > 0, "pipelined replies shared writes: {refusals:?}");
 }
 
+/// Shape: WRITEs a client pipelines in one write for the turn-budget test.
+const PIPELINED_WRITES: usize = 8;
+/// Shape: each pipelined WRITE's data: larger than the turn's copy budget under [`ONE_NANOSECOND`], and small enough
+/// that two of them sit in a connection's receive buffer together.
+const PIPELINED_WRITE_BYTES: usize = 32 * 1024;
+/// Shape: the pinned step quantum of the turn-budget test: a turn's copy budget is then a few bytes on any machine, less
+/// than one WRITE.
+const ONE_NANOSECOND: u64 = 1;
+
+/// §4.6 (A-74, A-204; VFS plan step 11): do pipeline [`PIPELINED_WRITES`] FILE_SYNC WRITEs of [`PIPELINED_WRITE_BYTES`] each
+/// to one file in a single write on one connection (the volume on the other shard, so the connection moves first), with
+/// the shard's quantum pinned at [`ONE_NANOSECOND`]; expect every reply in request order, each a success, every byte read
+/// back, and turns that left records queued past their copy budget (`nfs.turn.left_queued` moved). A turn serves its
+/// records until its quantum is spent, and serving a WRITE copies its data at least once, so a record past the bytes
+/// the quantum can copy is never reached in that turn: it stays queued in the kernel, unassembled, for the next turn's
+/// peek. Before, every turn copied every whole record its peek found, and a large WRITE's turn copied the next WRITE
+/// too, only to drop it.
+#[test]
+fn pipelined_writes_past_a_turns_copy_budget_wait_queued_and_every_byte_lands() {
+  let (daemon, instance) = two_shard_daemon_with("turnbudget", |config| {
+    config.runtime.wake_tracking = None;
+    config.runtime.step_budget_ns = ONE_NANOSECOND;
+  });
+  let name = provision_remote_volume(&instance);
+  let export = daemon.mount_capability(&name).unwrap().unwrap();
+  let port = daemon.nfs_port().unwrap();
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = mount(&mut stream, &export, 1);
+  let file = create(&mut stream, &root, "pipelined", 2);
+  let pieces: Vec<Vec<u8>> = (0..PIPELINED_WRITES)
+    .map(|piece| {
+      (0..PIPELINED_WRITE_BYTES)
+        .map(|at| u8::try_from((at * 31 + piece * 7) % 251).unwrap())
+        .collect()
+    })
+    .collect();
+  let mut burst = Vec::new();
+  for (piece, data) in pieces.iter().enumerate() {
+    let mut args = Vec::new();
+    opaque(&file, &mut args);
+    args.extend_from_slice(
+      &u64::try_from(piece * PIPELINED_WRITE_BYTES)
+        .unwrap()
+        .to_be_bytes(),
+    );
+    args.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
+    args.extend_from_slice(&2u32.to_be_bytes()); // FILE_SYNC
+    opaque(data, &mut args);
+    burst.extend_from_slice(&record(
+      NFSPROC3_WRITE,
+      &args,
+      100 + u32::try_from(piece).unwrap(),
+    ));
+  }
+  stream.write_all(&burst).unwrap();
+  for piece in 0..PIPELINED_WRITES {
+    let reply = reply_record(&mut stream).expect("the daemon answers every pipelined WRITE");
+    assert_eq!(
+      word(&reply, 0),
+      Some(100 + u32::try_from(piece).unwrap()),
+      "reply {piece} answers WRITE {piece}"
+    );
+    // The accepted reply's header: xid, REPLY, MSG_ACCEPTED, an empty verifier, SUCCESS; then the WRITE's status.
+    assert_eq!(word(&reply, 24), Some(0), "WRITE {piece} succeeded");
+  }
+  let written = common::nfs::read_whole(&mut stream, &file, 200);
+  let refusals = daemon.refusals_on_every_shard().unwrap();
+  let left_queued = refusals.get("nfs.turn.left_queued").copied().unwrap_or(0);
+  drop(stream);
+  drop(daemon);
+  assert_eq!(
+    written,
+    pieces.concat(),
+    "every pipelined byte landed in order"
+  );
+  assert!(
+    left_queued > 0,
+    "turns left records past their copy budget queued: {refusals:?}"
+  );
+}
+
 /// A one-shard daemon, so every volume this test provisions shares one shard's volume set — the
 /// co-located-tenant case a cross-volume forgery would exploit.
 fn single_shard_daemon(name: &str) -> (Daemon, String) {

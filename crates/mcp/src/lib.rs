@@ -22,6 +22,8 @@
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
 // are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
 // workspace-wide.
+// The panic rule: a print macro panics on a refused write; lines go through `slates_machine::log_line!` (A-213).
+#![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 use serde_json::{Value, json};
@@ -1974,6 +1976,8 @@ pub fn daemon_json(r: &DaemonReport, telemetry: &[TelemetryReport]) -> Value {
     "generation": r.generation,
     "restarts": r.restarts,
     "anchor_hold_refusals": r.anchor_hold_refusals,
+    "anchor_log_lines_refused": r.anchor_log_lines_refused,
+    "log_lines_refused": r.log_lines_refused,
     "heartbeat_age_ns": r.heartbeat_age_ns,
     "clients_reaped": r.clients_reaped,
     "clients_refused": r.clients_refused,

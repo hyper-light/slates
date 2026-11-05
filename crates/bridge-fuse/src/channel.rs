@@ -388,7 +388,7 @@ impl Drop for Notifier {
     if let Some(thread) = self.thread.take()
       && thread.join().is_err()
     {
-      eprintln!("slates-bridge-fuse: a notify thread panicked");
+      slates_machine::log_line!("slates-bridge-fuse: a notify thread panicked");
     }
   }
 }

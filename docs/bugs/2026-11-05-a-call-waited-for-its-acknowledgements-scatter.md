@@ -1,4 +1,4 @@
-# A call waits for its acknowledgement's scatter (2026-11-05, §4.9, R9; open, the first fix reverted)
+# A call waited for its acknowledgement's scatter (2026-11-05, §4.9, R9; the first fix reverted, fixed by A-216)
 
 ## Description
 
@@ -30,6 +30,15 @@ every `ack_every` waited for the slowest shard. On an idle daemon whose other sh
 of them, and so the single-client provisioning p99 sat at many times its p50 (jupiter: p50 20 µs, p99 80–650 µs). A
 shard busy past the reply deadline made an unrelated call fail.
 
+## Correction (2026-11-05, later the same day)
+
+The macOS arms below were one binary: built from `git archive` copies into one shared target dir, cargo rebuilt nothing
+after the first (main c0c8d28c), since the archives' files carry their commits' old times. So the macOS stall counted
+against a6c3bc16 here was main's, and so was the instrumented bench's caught pause. a6c3bc16's own record is 1 stall in
+9 runs on jupiter, where each arm has its own target dir. Main stalled 1 of its 4 parked forms on macOS. The
+`Stalled` under load fits a defect of main's found later: a scatter whose part's spawn a full control channel refuses
+never answers (recorded with A-216).
+
 ## Edits, then reverted
 
 a6c3bc16 made `Client::call` send a due acknowledgement with `begin_ack_if_due`, as the async path does. Its reply
@@ -54,8 +63,46 @@ unawaited acknowledgement's reply cannot hold the create's reply back by positio
 two of the client's requests in flight at once, the acknowledgement's scatter spawned on every other shard, all parked
 in this form, while the create (or its forward) runs. Not found yet.
 
+What later runs showed (macOS arm64, 2026-11-05 16:00–16:57 UTC):
+- **It reproduces on main's own client code.** A test (kept out of the tree until its fix, since it fails only
+  intermittently) put two replies in flight on the sync client without a6c3bc16. It begun an acknowledgement and
+  abandoned it, then called a create, paced 1 ms apart, on a daemon derived for the machine.
+  - Alone, it never stalled: 2,000 creates, twice.
+  - After a prelude of 64 concurrent clients, each dropped with an acknowledgement still in flight, it stalled in 1
+    run of 10: 3 creates, numbers 1,713, 1,715 and 1,716.
+- **The one stall caught with the bench instrumented** (a stall reported instead of aborted; its client library was
+  main's, as the correction above says) was
+  not in the parked form. All 64 clients of the 64-client form's second run stalled at once, at their 7th to 10th
+  create, each after about 1.767 s. The daemon answered nobody for that long, right after 64 clients were dropped
+  and 64 others connected. So the stall is a whole-daemon pause after client churn, and the parked form only met it.
+- It came at load 8–14 and did not come in 10 instrumented runs at load 4–8. The pulse dump that would name the
+  shard and its longest step has not caught one yet.
+
 ## Also found
 
 At load 23–36 on macOS the bench's 8- and 64-client forms aborted `Stalled` in every arm, main included: a live
 daemon slower than the reply deadline. The client returns `Stalled` for a live daemon once the deadline passes
 (`Client::round_trip`). That is a separate robustness gap.
+
+## Fixed by A-216
+
+The supervisor chose to answer the acknowledgement once the client's own shard has released its records, with the
+other shards' releases run as tracked tasks (A-216, §4.9's status). The client keeps one reply in flight.
+
+Exactly-once holds:
+- a client's own shard advances its window before the reply, and every request passes that window first;
+- a client's sequences only grow and never wrap;
+- a new client never takes a used id;
+- a later request to another shard queues behind the release on that shard's control channel.
+
+Tests, each failing first:
+- `a_call_is_never_held_behind_the_periodic_acknowledgement` (`crates/client/tests/acknowledge.rs`): `Stalled` before;
+  after, the call returns in under half a 1 s hold, with no second reply in flight.
+- `a_lagging_release_is_never_met_by_a_request_as_new` (`crates/server/tests/ack_release.rs`): the acknowledgement
+  took 1.197 s before. After, it and a retry inside the hold are answered at once (the retry `DuplicateRequest` by the
+  client's own shard), and a new create makes a new volume. Red-checked: with the own shard's release skipped, the
+  retry waited 1.19 s.
+- `a_refused_release_is_counted_and_the_next_watermark_takes_it_over`: never answered before (a sibling defect,
+  `docs/bugs/2026-11-05-a-scatter-whose-part-could-not-be-sent-never-answered.md`). After, it is answered, the refusal is
+  counted, `AcknowledgementOwed` is met at the bound, and the next watermark serves again. Red-checked: with the count
+  removed, 0 before and 0 after.

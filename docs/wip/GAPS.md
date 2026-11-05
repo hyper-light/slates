@@ -1,5 +1,97 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A private purge's intent can wait up to the 1 s transaction timeout (found 2026-11-05, audit step 7; open).**
+> WinFsp's transact never goes pending: the control dispatch calls `FspVolumeTransact` inline (v2.1 `src/sys/fsctl.c:95-99`),
+> which waits for a request inside the call (`src/sys/volume.c:1171`). So `purge_intents::Intents::wait`, which drains
+> intents while a call is pending, never runs; 0 of 161,073 receives went pending on arm64 (BENCHMARKS, run 41977769822).
+> Intents are drained only after a call returns. `Sender::publish` blocks when its two-message channel is full: a previous
+> End and the next Begin are queued, and that Begin's drive open was refused before any request reached slates. It then
+> waits for the receiver's next return, which on an idle drive is the 1,000 ms transaction timeout. **Planned fix, after
+> audit step 7 lands, as its own change with a failing test first** (a purge whose Begin's open is refused while the
+> drive is idle must not wait out the transaction timeout): a publisher that would block cancels the receive thread's
+> call (`CancelSynchronousIo`), retrying while the cancel finds no call in progress. WinFsp ends a cancelled wait with
+> nothing delivered (`src/sys/driver.h:954-955`, `src/sys/ioq.c:617`, `volume.c:1181-1185`), provided the receiver reads
+> the cancellation as "nothing delivered".
+
+> **WinFsp: a second receive worker would help only rename and unlink, and needs a crash proof first (2026-11-05, audit
+> step 7; lever, not planned).** Tracing every IRP on both arms (diagnostics runs 42086968194, 42091919319 and
+> 42097182526) rejected the two-worker hypothesis for create, stat and open. 71cf09ac's DLL runs one operation at a time
+> under its coarse guard (WinFsp v2.1 `src/dll/fsop.c:80-82`). It saw a request arrive while another was served for about
+> 1 in 10,000 Creates in create and open, and 46 of 10,010 in stat (arm64, quiet). Our receiver got 39,918 of its 39,999
+> stat-phase receives as one request. Rename and unlink do overlap on the DLL arm: arm64 quiet rename Cleanups 9,318 of
+> 20,000, unlink Creates 2,127 of 10,000. A second worker could serve those. **It needs the multi-worker crash proof
+> first:** with two journals, a completed request in one and a newer, live request at the same reused address in the
+> other cannot be told apart. The candidate is a stamp from the system-wide monotonic clock taken right after each receive
+> returns, with recovery answering only the newest delivery at each address. It is unbuilt and unproven. BENCHMARKS, "Where
+> the receiver's time goes".
+
+> **WinFsp on x86_64: in some VM runs our Create and Close services are up to 13x the DLL arm's (2026-11-05, audit step 7;
+> owner winfsp-bench).** In the traced run 42086968194, three runs on `windows-latest`, quiet stat phase, p50: our Close's
+> service was 24.6, 18.4 and 3.5 us against the DLL arm's 1.9-2.7 us. Our Create's was 10.2, 10.2 and 6.4 us against
+> 5.4-5.9 us. In run 42091919319 on another VM the services were level. Our Close does more on the shard than the DLL
+> arm's (the bridge's release, the ledger's retire and the open-name update). The split between runs fits the reply spin
+> (main's `reply.rs`) sometimes missing the shard's answer and paying a park and a wake. Unmeasured; for winfsp-bench,
+> relayed by the supervisor.
+
+> **Correction (2026-11-05, clients): one macOS A/B measured one binary three times.** The macOS arms of
+> 15:47–15:56 UTC (main c0c8d28c, A-208 89382153, a6c3bc16) were built from `git archive` copies into one shared
+> target dir. `git archive` stamps files with their commit's time, older than the outputs already there, so cargo
+> rebuilt nothing after the first. All three binaries are one, main c0c8d28c: identical MD5s. The instrumented
+> `a6c3bc16` bench builds were affected the same way: only the edited bench was rebuilt, so their client library was
+> main's.
+> - **Wrong:** "2 of the 4 parked forms that ran with [a6c3bc16] stalled … without it, none of 15 did", and "the
+>   instrumented bench caught" the churn pause "with a6c3bc16". These are on main through 8d7c6a10 and in
+>   `docs/bugs/2026-11-05-a-call-waited-for-its-acknowledgements-scatter.md`.
+> - **Right:** a6c3bc16 stalled 1 of 9 runs on jupiter, where each arm has its own target dir. On macOS main itself
+>   stalled 1 of 4 parked forms, and the ~1.77 s pause after 64 clients churned was main's code. So the pause, and
+>   the `Stalled` aborts under load, are main's. They fit a defect of main's found since: a scatter whose part's spawn
+>   a full control channel refuses never answers (recorded with A-216).
+> - **Unaffected:** CI and jupiter build each arm in its own target dir, checked, so every CI run and jupiter A/B
+>   stands.
+>
+> Every macOS arm is now built in its own target dir, and arms are compared by MD5 before they run.
+
+> **The large-file NFS write gap (VFS plan step 11, 2026-11-05): closed on the incumbent harness by A-204 and A-214.**
+> The incumbent harness on the M5 Max (six interleaved rounds, load 6–10, 2026-11-05 16:23Z) writes the 64 MiB file
+> at up to 1,286.0 MiB/s with A-214, against 1,033.9 before it and step 11's 967, beyond the spread at 4 and 16
+> workers. Write p99s at 16 workers overlap with no direction. Profiled through Linux's NFSv4.2 client on CI (run
+> 41986870989), the one busy shard had spent 41.5% of its samples faulting in fresh pages of the anchor's shared
+> content object, 21.0% sealing at rest and 12.4% peeking and copying records. BENCHMARKS, "The large-file NFS write
+> profiled" and "an idle shard keeps its last write burst's pages pre-faulted".
+> - **A-204:** a turn takes only the records its quantum can reach (CI best of nine 441.3 → 472.2 MiB/s, +26% at 16
+>   workers; even on the Mac).
+> - **A-214 (Ada's option (a)):** an idle shard keeps its last write burst's net growth of free pages pre-faulted,
+>   refilled in its idle moments, at most its memory share. A first build refilled only at the reap tick, which the
+>   harness's second-long pauses never reached on the volume's shard; the refill is now the runtime's idle work.
+> - **Open:** the gap to nfsd remains about 1.5× at 4 and 16 workers (nfsd 1,458–2,081 MiB/s), and at 1 worker, where the
+>   first large write follows no earlier burst, A-214 does not apply. Sealing at rest (21%) is condition 9's. On CI
+>   (run 42064893088, interleaved) A-214 took the 4- and 16-worker writes from 602–641 to 1,003–1,064 MiB/s, level
+>   with nfsd there.
+> - **Tried and not taken:** populating fresh pages in batches or from a second thread (run 41987962954); filling them
+>   by `pwrite` into the content object (1.9× per fresh page), which R1's lint wall forbids.
+
+> **The many-client load test (loadtest; 2026-11-04 and 2026-11-05): built, its faults fixed or open below.**
+> `crates/client/examples/load_bench.rs` drives N clients over one green seeded from Linux v7.4-rc1 (commit 6628e7d4,
+> 97,242 files, 1.8 GB): overlapping slot edits, a non-idempotent append per client, submits, the corrective path on
+> every conflict, a daemon restart ridden by reconnect and resend; an offline oracle judges every verdict, the green's
+> bytes and each client's own file. Fixed, each with a failing test first: every conflicting window of a file is named
+> (it was the first); a pinned large-class file reads across its extents (no green could start from the kernel tree);
+> A-217, a green's origin is a reference to the base snapshot it holds (peak RSS over `fs/` 549,520 to 225,776 KiB,
+> `CreateGreen` 415 to 158 ms, best of three; `a_greens_base_snapshot_is_held_and_its_origin_recovered_from_it`). Open:
+> - **Fixed (A-207): a work's acknowledged edits were lost at a daemon restart.** A work's changes are logged in the
+>   partition and replayed at recovery (`acknowledged_work_edits_survive_a_daemon_restart`, red on main). Chaos on the
+>   branch it comes from: twenty daemon kills under the anchor at 10 and 100 clients, every client reconnected and
+>   resent its request in flight under its own id, the oracle and each client's own file 0 failures in every run.
+> - **A volume promised the whole version slab is refused at recovery** (bug record of 2026-11-05): a recovered
+>   snapshot rebuilds its directories privately, one retained version slot each the live volume did not hold (465,831
+>   committed slots before a restart, 465,832 after). Fix owed in `crates/vfs/src/recover.rs`.
+> - **Pinning a tree of many files grows memory far faster than its files, in one unsliced verb**: `kernel/` (754
+>   files) 86,848 KiB, `fs/` (2,365) about 226,000 KiB in 3 of 3 runs, `Documentation/` (11,608, 59 MB) past 12 GB and
+>   `arch/` (18,944, 127 MB) past 9.9 GB inside the pin, which also outlasts the client's 1 s reply deadline; the whole
+>   kernel is killed at a 24 GB cap in its pin. Not root-caused; samples show `Overlay::read_whole` → `copy_up`.
+> - **Memory grows 20 to 29 MB a same-machine connection** (the per-client ring region): the 10k-100k levels go over
+>   the network transport instead (the supervisor's decision (b), 2026-11-05), not yet run.
+
 
 
 > **Merge: the same edit from two works was one increment; fixed 2026-11-04 (§4.16, agents/perf).** The increment's
@@ -41,19 +133,58 @@
 > Windows' write path below the single WinFsp receiver (A-198); the operations replayed alone pass. Listed as
 > `fsx-seed-1-unfinished:10000`; recorded in the same bug file; owed to the WinFsp dispatcher's owners.
 
-> **Shards counted hardware threads as cores (2026-11-05, A-208, §4.1, R9; fixed, its A/B owed).** §4.1 counts shards in
+> **A call waited for its acknowledgement's scatter (2026-11-05, §4.9, R9; fixed by A-216, its A/B owed).** The
+> synchronous `Client::call` acknowledges every half-ring of replies before its own request, and the daemon answered
+> only after every shard had released the client's records. One call in every half-ring paid the slowest shard's
+> turn. On macOS 133 of 2,000 single-client creates (6.7%) carried one, median 2,497 µs against 169 µs. Windows arm64's
+> single-client p99 was 65.4 / 59.4 / 57.9 µs with the wait and 47.8 / 45.5 / 44.3 µs without it (diag run
+> 42056768929). With another shard held for a second, the call failed `Stalled`. Sending it unawaited (a6c3bc16) put
+> two replies in flight on the sync client and stalled 1 of 9 runs on jupiter, so it was reverted. The macOS stalls
+> once counted against it were main's (the correction at the top). Since A-216 the
+> daemon answers once the client's own shard has released. The other shards' releases run as tracked tasks, and a
+> refused one is counted `ack.release_refused` and taken over by the next watermark. The client still has one reply
+> in flight. Tests, each failing first:
+> - `a_call_is_never_held_behind_the_periodic_acknowledgement` (`Stalled` before);
+> - `a_lagging_release_is_never_met_by_a_request_as_new` (1.197 s before; red-checked);
+> - `a_refused_release_is_counted_and_the_next_watermark_takes_it_over` (never answered before; red-checked).
+>
+> Measured on all five platforms (BENCHMARKS, "The acknowledgement answered once its own shard has released"). On CI
+> (diag run 42082464886), R9's single-client gate is green in every round on Linux x86_64 and arm64 and Windows x86_64
+> and arm64, where main failed five rounds of twelve; Windows arm64 went from 79.0 / 53.7 / 49.1 µs to 42.7 / 42.4 /
+> 43.0 µs. Open and not the acknowledgement:
+> - **jupiter's single-client p99.** It stays red with A-216: its runs range from 65 µs to 3.8 ms, as main's do
+>   (2026-11-05 18:24–18:27 UTC).
+> - **macOS's single-client create.** Its p50 is 60–75 µs in both arms.
+> - **The bench's 8- and 64-client forms aborting `Stalled` at load 23–36 on macOS,** and the ~1.77 s pause after 64
+>   clients churned. Both are main's code; the lost-reply defect below is one cause that fits.
+>
+> Record: `docs/bugs/2026-11-05-a-call-waited-for-its-acknowledgements-scatter.md`.
+>
+> **Next lever (C): do we need the separate acknowledgement at all?** Carry the watermark in every request, so each
+> owner shard releases a client's records when its next request arrives there. No scatter and no extra request.
+> That is a protocol change to the request slot and §4.9.
 
-> **A call waits for its acknowledgement's scatter (2026-11-05, §4.9, R9; OPEN).** The synchronous
-> `Client::call` acknowledges every half-ring of replies before its own request and waits for the reply, which the
-> daemon gives only after every shard has released the client's records. On macOS, 133 of 2,000 single-client creates
-> (6.7%) carried one, median 2,497 µs against 169 µs (a loaded run whose boot probe measured a 2.5 ms wake). That share
-> sets the single-client p99. With another shard held for a second, such a call fails `Stalled`. Sending it unawaited,
-> as the async path does (a6c3bc16), passed its test (Stalled before, 3.62 s after) and the whole client package.
-> But 2 of the 4 parked `provision_bench` forms that ran with it stalled a create past the 1 s reply deadline: one on
-> quiet jupiter, one on macOS. Without it, none of 15 did. Reverted in the next commit, cause not found. Owed:
-> the stall's cause, with a test that reproduces it, before the change returns. Also open, from the same macOS runs at
-> load 23–36: the bench's 8- and 64-client forms aborted `Stalled` in every arm, a live daemon slower than the reply
-> deadline. Record: `docs/bugs/2026-11-05-a-call-waited-for-its-acknowledgements-scatter.md`.
+> **A scatter whose part could not be sent never answered (2026-11-05, §4.9, §4.14; fixed).** `scatter_acknowledge`,
+> `scatter_list`, `scatter_grants` and `scatter_status`, the server's four scatter tables, settled a part whose spawn
+> the other shard's full control channel refused by calling their gather inside `serve`. The nested state borrow is
+> refused without running it, so the reply was never delivered and the entry never removed. Each call, with the other
+> shard's channel filled, was never answered (5 s, main 8d7c6a10's code). Fixed:
+> - **The acknowledgement**, by A-216: the reply is its own shard's, and a refused part is counted `ack.release_refused`.
+> - **A full channel:** the part waits for room for half the client's reply deadline, then the listing, grants or
+>   status answers `Overloaded { shard }`, counted by name.
+> - **A shard gone,** which happens only while the daemon stops: the scatter is removed and counted
+>   (`scatter.shard_gone`), and the client's resend to the next daemon answers it. The driver's restart test needs
+>   that: 15 of 15 with it, where answering `Overloaded` at once failed its first run in every loop.
+>
+> Tests, each failing first:
+> - `a_refused_release_is_counted_and_the_next_watermark_takes_it_over`;
+> - `a_listing_whose_part_cannot_be_sent_is_refused_overloaded`;
+> - `a_grants_listing_whose_part_cannot_be_sent_is_refused_overloaded`;
+> - `a_daemon_status_whose_part_cannot_be_sent_is_refused_overloaded`.
+>
+> Reported, not changed: the three read scatters still settle a part whose *remote* state borrow is refused as empty,
+> so an answer can omit a shard's part as if complete. Record:
+> `docs/bugs/2026-11-05-a-scatter-whose-part-could-not-be-sent-never-answered.md`.
 
 > **Shards counted hardware threads as cores (2026-11-05, A-208, §4.1, R9; fixed and measured).** §4.1 counts shards in
 > physical cores, but the placement counted logical CPUs. jupiter's 16 two-thread cores therefore ran 31 shards and
@@ -107,6 +238,19 @@
 >   Bonwick's design accepts this; nothing here measures how often it happens.
 > - AC-1.3 (snapshot and clone flat with size) failed at load 11 to 52 in 3 to 5 of 10 runs on both arms. The gate's
 >   noise allowance does not cover this host's load. It is not caused by the blocks, but it is open.
+
+> **No print macro panics on a closed pipe (2026-11-05, A-213; found by the release agent).** `slates anchor 2>&1
+> >/dev/null | head -n 1` exited 134 once `head` had its line: `eprintln!` and `println!` panic on a refused write, and a
+> pipe whose reader has gone refuses with `EPIPE`. Every shipped site, 266 in all, now writes through
+> `slates_machine::log_line!` or `out_line!`. A refused write is counted and dropped. Both counts show in `slates status`:
+> `log_lines_refused`, the daemon's own, and `anchor_log_lines_refused`, which the anchor writes to the segment. A command
+> whose output was refused exits 4. Every shipped crate's root denies `clippy::print_stdout` and `clippy::print_stderr`
+> outside tests. adacachy, 2026-11-05: the real anchor whose log reader went away ended with exit 101 (debug build) before
+> the fix, and after it kept supervising a killed daemon's successor. On CI's `ubuntu-latest` and `macos-latest` both
+> tests fail without the fix (the anchor exits 101; `slates --help` panics in std's `stdio.rs`; run 42048872612) and pass
+> with it on c0c8d28c, with workspace clippy there and the Windows lint on both Windows lanes (run 42052731305). **Owed:** `xtask` (148 sites),
+> `slates-guest-probe` (11) and `slates-test-seeds` (1) keep their print macros. They do not ship, and a closed pipe still
+> panics them. Record: `docs/bugs/2026-11-05-a-closed-log-pipe-ended-the-anchor.md`.
 
 > **The anchor's hold refusals: a bounded Unix log, and a count in `slates status` (2026-11-04, A-213; siblings of
 > audit step 3).** The Unix device hold logged a line per refused message, unbounded; it now logs each distinct refusal
