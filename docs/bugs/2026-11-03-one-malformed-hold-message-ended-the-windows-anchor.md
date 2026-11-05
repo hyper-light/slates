@@ -36,16 +36,44 @@ tests send only well-formed messages.
   cannot write is counted and dropped, and its daemon's own wait ends at its deadline as a typed refusal.
 - `Supervisor::drain_handles` returns the number applied, and `step` no longer fails on it.
 - `Supervisor::handle_refusals` counts the channel's refusals with the holdings' own.
+- `Channel::recv` tells a timeout from a message of no bytes. A message-mode pipe delivers a zero-length write as a read
+  of zero bytes, which was taken for "nothing waited": uncounted, and the end of that turn's drain. It is now a refused
+  short message.
+- A message longer than a hold message is malformed, not an OS refusal (`ERROR_MORE_DATA`, error 234). The pipe keeps its
+  remainder, which the next read refuses as a short message, so one such message counts two refusals.
 
 ## Failing test first
 
-`crates/anchor/tests/handles_windows.rs`, `a_malformed_hold_message_is_refused_and_counted_and_supervision_goes_on`:
-a real supervised child (`garbling_role`) writes a short hold message and one with a corrupted checksum before its real
-hold. The test requires every step of the real supervisor to succeed, both messages counted as refusals, the real hold
-kept, and the successor to inherit the same live object.
+`crates/anchor/tests/handles_windows.rs`:
 
-Evidence is recorded in GAPS and A-198 with the CI runs that show it: the test fails without the fix and passes with it
-on CI's Windows x86_64 and arm64 runners.
+- `a_malformed_hold_message_is_refused_and_counted_and_supervision_goes_on`: a real supervised child (`garbling_role`)
+  holds one event, writes 10 short messages (0 bytes up to nine tenths of a message) and 10 with a corrupted checksum,
+  holds a second event, commits and exits. The test requires every step of the real supervisor to succeed, exactly 20
+  refusals, both holds kept, and the successor to inherit both live objects.
+- `an_oversized_hold_message_is_refused_and_counted_and_supervision_goes_on`: the same with one message half as long
+  again as a hold message; exactly 2 refusals.
+- `a_read_tells_no_message_from_a_message_of_no_bytes_and_refuses_a_long_one`: the channel's reads over the real pipe.
+
+The supervisor here is the real state machine in the test's process and the daemon is a real child process. A failing
+`step` is what ends the anchor: `crates/cli/src/anchor.rs` returns on it.
+
+## Evidence
+
+Command: `cargo +1.98.1 test -p slates-anchor --test handles_windows -- --test-threads=1`, 2026-11-04.
+
+| Sources | Where | Result |
+|---|---|---|
+| `crates/anchor/src` of `76b450a1` with the new tests | jupiter, Windows x86_64 | 3 of 6 fail: "a bad hold message ended supervision: anchor hold: malformed hold message: a short read of a hold message"; the oversized test with "ReadFile of a hold message refused: error 234"; the read test with "no bytes: Ok(None)" |
+| The same | CI run 41974533851, windows-latest and windows-11-arm, 3 runs each | the same 3 of 6 fail, with the same messages. Annotations show runs 1 and 2 whole on each lane; the 10-annotation cap cut off run 3's result line, and the step exited 1 |
+| The drain fix with the old `held_windows.rs` | jupiter, Windows x86_64 | 2 of 6 fail: 19 refusals counted of 20, and "no bytes: Ok(None)" |
+| The whole fix | jupiter, Windows x86_64, 3 runs of `-p slates-anchor` | 6 of 6 in `handles_windows` each run, 14 of 14 in `anchor`, 15 of 15 in the unit tests |
+
+The whole fix on CI's two Windows lanes is owed: diagnostics branch `diag-step3-anchor-3` is running.
+
+Not shown: a live WinFsp drive receiving bad messages. The channel's daemon end reaches only the daemon, by an explicit
+handle list, and the real daemon sends only well-formed messages, so a live test would need a test-only way to make it
+garble, which the project's rules ban. What is shown is that the holdings are untouched by a refusal and the successor
+inherits them live. The live WinFsp lane over the changed drain is owed with the run above.
 
 ## Siblings
 
@@ -53,3 +81,7 @@ on CI's Windows x86_64 and arm64 runners.
   typed mount refusal.
 - A hold whose reply is dropped leaves its daemon's mount refused typed; the holding itself, if applied, is released
   with the next successor's handoff or the anchor's exit.
+- A read the OS keeps refusing is counted and logged once per supervision step, as the Unix hold logs once per refusal.
+  Each drain's reads stay bounded; the log has no cap of its own on either platform. Not changed here; reported.
+- `cargo xtask check` does not compile on Windows (`std::os::unix` and `rustix` in `xtask/src`), so jupiter cannot run
+  that gate; the diagnostics run takes it on Linux and macOS. Not changed here; reported.

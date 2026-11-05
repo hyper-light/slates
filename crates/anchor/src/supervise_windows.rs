@@ -174,10 +174,10 @@ impl Hold {
     }
   }
 
-  /// Counts a refusal of the channel and says what it was; the holdings are untouched.
+  /// Counts a refusal of the channel and says so on the anchor's log, once per refusal; the holdings are untouched.
   fn refuse(&mut self, refusal: &HandleRefusal) {
     self.channel_refusals = self.channel_refusals.saturating_add(1);
-    eprintln!("slates-anchor: hold channel refused: {refusal}");
+    eprintln!("slates anchor: a hold message was refused: {refusal}");
   }
 }
 
