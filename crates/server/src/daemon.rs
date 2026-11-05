@@ -3854,7 +3854,7 @@ fn register_idle_refill(shard: u16) {
   if let Some(Err(refusal)) =
     registry::with_current(|ctx| ctx.set_idle_work(Box::new(refill_slice)))
   {
-    eprintln!(
+    slates_machine::log_line!(
       "slates-server: shard {shard}: the reserve's idle refill was refused ({refusal}); it refills at reap ticks only"
     );
   }
