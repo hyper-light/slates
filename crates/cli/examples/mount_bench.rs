@@ -22,9 +22,9 @@
 //!
 //! Two passes:
 //! - **Quiet:** nothing added.
-//! - **Contended:** one spinner thread per logical CPU, each sweeping a buffer of twice the largest L2 the machine
-//!   profile reports, one cache line at a time, as `vfs_tails.rs` loads a machine; cores, caches and memory bandwidth
-//!   are all contended.
+//! - **Contended:** [`SPINNERS_PER_CPU`] spinner threads per logical CPU (`--spinners-per-cpu` asks for more), each
+//!   sweeping a buffer of twice the largest L2 the machine profile reports, one cache line at a time, as `vfs_tails.rs`
+//!   loads a machine; cores, caches and memory bandwidth are all contended.
 //!
 //! Each pass records the load it ran under: the load average where the OS keeps one, the spinners, and a wake-up
 //! probe. The probe is two threads trading a message every [`PROBE_EVERY`] for the whole pass. Its round trip is the
@@ -69,6 +69,9 @@ const FILE_BYTES: usize = 4 << 10;
 const WORK_DIR: &str = "d";
 /// Shape: the pause between two wake-up probes, about 200 a second: a few thousand per pass, too few to load anything.
 const PROBE_EVERY: Duration = Duration::from_millis(5);
+/// Shape: spinner threads per logical CPU in the contended pass, unless `--spinners-per-cpu` names another count: one
+/// fills every core, so a thread that must be woken waits its turn behind a CPU-bound one.
+const SPINNERS_PER_CPU: usize = 1;
 /// Shape: the L2 assumed when the profile reports none (the largest per-core L2 on the supported targets).
 const FALLBACK_L2_BYTES: u64 = 16 << 20;
 /// Derived: a spinner's sweep is this many times the largest L2, so every pass of it spills its core's cache.
@@ -397,7 +400,8 @@ fn pass(
 fn print_pass(arms: &[Arm], mut measured: Pass) {
   let probe = summary(&mut measured.probe);
   let load = format!(
-    "spinners {} (one per logical CPU when contended); load average {} at the start, {} at the end; wake-up probe \
+    "spinners {} (none when quiet; a count per logical CPU when contended); load average {} at the start, {} at the \
+     end; wake-up probe \
      p50 {} µs, p99 {} µs, p999 {} µs, max {} µs over {} probes; {:.1} s",
     measured.spinners,
     measured.load_before,
@@ -457,6 +461,7 @@ struct Options {
   arms: Vec<Arm>,
   rounds: usize,
   files: usize,
+  spinners_per_cpu: usize,
   passes: Vec<&'static str>,
 }
 
@@ -465,6 +470,7 @@ fn options() -> Result<Options, String> {
     arms: Vec::new(),
     rounds: ROUNDS,
     files: FILES_PER_ROUND,
+    spinners_per_cpu: SPINNERS_PER_CPU,
     passes: vec!["quiet", "contended"],
   };
   let mut arguments = std::env::args().skip(1);
@@ -487,6 +493,11 @@ fn options() -> Result<Options, String> {
       }
       "--rounds" => parsed.rounds = value()?.parse().map_err(|e| format!("--rounds: {e}"))?,
       "--files" => parsed.files = value()?.parse().map_err(|e| format!("--files: {e}"))?,
+      "--spinners-per-cpu" => {
+        parsed.spinners_per_cpu = value()?
+          .parse()
+          .map_err(|e| format!("--spinners-per-cpu: {e}"))?;
+      }
       "--pass" => {
         parsed.passes = match value()?.as_str() {
           "quiet" => vec!["quiet"],
@@ -542,7 +553,11 @@ fn run_passes(options: &Options, cores: usize, sweep: (usize, usize)) -> Result<
     options.files
   );
   for name in &options.passes {
-    let spinners = if *name == "contended" { cores } else { 0 };
+    let spinners = if *name == "contended" {
+      cores.saturating_mul(options.spinners_per_cpu)
+    } else {
+      0
+    };
     let measured = pass(
       name,
       spinners,

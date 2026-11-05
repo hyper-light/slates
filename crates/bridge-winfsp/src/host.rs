@@ -203,7 +203,6 @@ const CLEANUP_CHANGED: u32 = 0x01 | 0x02 | 0x10 | 0x40 | 0x80;
 enum Op<T> {
   /// One durable kernel-name update after a successful rename response was saved, before it reaches the driver.
   RenameName {
-    after: Option<u64>,
     from: String,
     to: String,
   },
@@ -354,8 +353,8 @@ impl Request {
     names: &mut OpenNames,
     ledger: &mut Ledger<SparseObject>,
   ) -> Served {
-    if let Op::RenameName { after, from, to } = &self.op {
-      let reply = rename_one_name(names, ledger, *after, from, to);
+    if let Op::RenameName { from, to } = &self.op {
+      let reply = rename_one_name(names, ledger, from, to);
       return Served {
         reply,
         sender: self.reply,
@@ -409,7 +408,7 @@ impl Request {
         run(bridge, cx, op).unwrap_or_else(|error| Reply::Err(ntstatus(&error).as_i32()))
       }
       (Err(error), _) => {
-        eprintln!("slates-winfsp: context refused: {error}");
+        slates_machine::log_line!("slates-winfsp: context refused: {error}");
         Reply::Err(ntstatus(&VfsError::StaleHandle).as_i32())
       }
     };
@@ -429,7 +428,7 @@ fn confirm_reply(ledger: &mut Ledger<SparseObject>, context: u64) -> Reply {
   match ledger.confirmed(context) {
     Ok(()) => Reply::Ok,
     Err(error) => {
-      eprintln!("slates-winfsp: open confirmation refused: {error}");
+      slates_machine::log_line!("slates-winfsp: open confirmation refused: {error}");
       Reply::Err(ntstatus(&VfsError::RecoveryIncomplete).as_i32())
     }
   }
@@ -438,11 +437,10 @@ fn confirm_reply(ledger: &mut Ledger<SparseObject>, context: u64) -> Reply {
 fn rename_one_name(
   names: &mut OpenNames,
   ledger: &mut Ledger<SparseObject>,
-  after: Option<u64>,
   from: &str,
   to: &str,
 ) -> Reply {
-  let Some((context, inode)) = names.next_open(after) else {
+  let Some((context, inode)) = names.first_beneath(from) else {
     return Reply::RenamedName(None);
   };
   let result = ledger
@@ -454,7 +452,7 @@ fn rename_one_name(
       Reply::RenamedName(Some(context))
     }
     Err(error) => {
-      eprintln!("slates-winfsp: durable kernel rename refused: {error}");
+      slates_machine::log_line!("slates-winfsp: durable kernel rename refused: {error}");
       Reply::Err(ntstatus(&VfsError::RecoveryIncomplete).as_i32())
     }
   }
@@ -496,9 +494,9 @@ fn record_open_reply(
       Reply::Opened { context, info }
     }
     Err(error) => {
-      eprintln!("slates-winfsp: open record refused: {error}");
+      slates_machine::log_line!("slates-winfsp: open record refused: {error}");
       if let Err(release) = bridge.release(object, cx, fh) {
-        eprintln!("slates-winfsp: refused open cleanup failed: {release}");
+        slates_machine::log_line!("slates-winfsp: refused open cleanup failed: {release}");
       }
       Reply::Err(ntstatus(&VfsError::RecoveryIncomplete).as_i32())
     }
@@ -516,7 +514,7 @@ fn finish_context_effects(
     match ledger.closed(context) {
       Ok(()) | Err(crate::opens::Refusal::Stale) => {}
       Err(error) => {
-        eprintln!("slates-winfsp: close record refused: {error}");
+        slates_machine::log_line!("slates-winfsp: close record refused: {error}");
         return Reply::Err(ntstatus(&VfsError::RecoveryIncomplete).as_i32());
       }
     }
@@ -529,7 +527,7 @@ fn finish_context_effects(
 /// or a context that has not been checked against its generation.
 fn bind(op: Op<u64>, ledger: &Ledger<SparseObject>) -> Result<Op<Open>, crate::opens::Refusal> {
   Ok(match op {
-    Op::RenameName { after, from, to } => Op::RenameName { after, from, to },
+    Op::RenameName { from, to } => Op::RenameName { from, to },
     Op::Confirm { context } => Op::Confirm { context },
     Op::VolumeInfo => Op::VolumeInfo,
     Op::Resolve { path } => Op::Resolve { path },
@@ -982,21 +980,22 @@ pub(crate) fn rename_open_names(
   to: &str,
   bound: usize,
 ) -> Result<(), WinFspError> {
-  let mut after = None;
+  // A rename onto itself moves no open, so no open would ever stop being beneath `from`.
+  if from == to {
+    return Ok(());
+  }
+  let mut previous = None;
   for _ in 0..=bound {
     match call_on(
       requests,
       wake,
       Op::RenameName {
-        after,
         from: from.to_owned(),
         to: to.to_owned(),
       },
     ) {
       Reply::RenamedName(None) => return Ok(()),
-      Reply::RenamedName(Some(context)) if after.is_none_or(|previous| previous < context) => {
-        after = Some(context)
-      }
+      Reply::RenamedName(Some(context)) if previous != Some(context) => previous = Some(context),
       Reply::Err(status) => {
         return Err(WinFspError::Api {
           call: "record kernel rename",
@@ -1274,7 +1273,7 @@ extern "C" fn close(fs: *mut FileSystem, context: Pvoid) {
 
 fn report_terminal_reply(call: &'static str, reply: Reply) {
   if let Reply::Err(status) = reply {
-    eprintln!("slates-winfsp: {call} refused with NTSTATUS {status:#010x}");
+    slates_machine::log_line!("slates-winfsp: {call} refused with NTSTATUS {status:#010x}");
     crate::dispatcher::record_terminal_refusal(status);
   }
 }
@@ -2043,7 +2042,7 @@ impl Drop for Mounted {
     if let Some(mut worker) = self.worker.take()
       && let Err(error) = worker.join()
     {
-      eprintln!("slates-winfsp: join receive worker: {error}");
+      slates_machine::log_line!("slates-winfsp: join receive worker: {error}");
     }
     // SAFETY: the only receive/operation worker has been joined, so no callback can reach the DLL object again.
     unsafe { (self.api.delete)(self.file_system) };
@@ -2223,7 +2222,9 @@ fn run_mount(
 ) {
   let report = |outcome: Outcome| {
     if outcomes.send(outcome).is_err() {
-      eprintln!("slates-winfsp: the mount's outcome receiver closed before its owner joined");
+      slates_machine::log_line!(
+        "slates-winfsp: the mount's outcome receiver closed before its owner joined"
+      );
     }
     wake.wake_by_ref();
   };

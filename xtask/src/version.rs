@@ -50,8 +50,14 @@ pub(crate) enum Mode {
   Check,
   /// Re-derive every npm copy from the workspace version and the main package, then check.
   Write,
-  /// The release guard: nothing may drift, and the tag must be `v` + the workspace version.
-  ExpectTag(String),
+  /// The release guard: nothing may drift, and the tag must be `v` + the workspace version — or, when `allow_test`
+  /// (the binary release lane only), `v` + the version + `-test.N`, a test of that lane (`release.rs`).
+  ExpectTag {
+    /// The tag pushed.
+    tag: String,
+    /// Whether a test tag of the release lane is accepted; the SDK publish lanes never accept one.
+    allow_test: bool,
+  },
 }
 
 /// Parses the task's arguments (`--write`, `--expect-tag TAG`).
@@ -62,7 +68,10 @@ pub(crate) fn mode_from(args: &[String]) -> Result<Mode, Failure> {
   match args.iter().position(|a| a == "--expect-tag") {
     Some(index) => args
       .get(index + 1)
-      .map(|tag| Mode::ExpectTag(tag.clone()))
+      .map(|tag| Mode::ExpectTag {
+        tag: tag.clone(),
+        allow_test: args.iter().any(|a| a == "--allow-test-tag"),
+      })
       .ok_or_else(|| Failure("--expect-tag needs the tag (`v0.1.0`)".to_owned())),
     None => Ok(Mode::Check),
   }
@@ -677,12 +686,18 @@ pub(crate) fn run(root: &Path, mode: &Mode) -> Result<(), Failure> {
       findings.len()
     )));
   }
-  if let Mode::ExpectTag(tag) = mode {
+  if let Mode::ExpectTag { tag, allow_test } = mode {
     let expected = format!("v{}", truth.workspace_version);
-    if *tag != expected {
-      return Err(Failure(format!(
-        "tag `{tag}` does not name the workspace version (expected `{expected}`); bump `[workspace.package] version`, run `cargo xtask version --write`, commit, then tag"
-      )));
+    match crate::tag::tag_kind(tag, &truth.workspace_version) {
+      Ok(crate::tag::TagKind::Release) => {}
+      Ok(crate::tag::TagKind::Test { number }) if *allow_test => {
+        println!("version: `{tag}` is test {number} of the release lane at {expected}");
+      }
+      Ok(crate::tag::TagKind::Test { .. }) | Err(_) => {
+        return Err(Failure(format!(
+          "tag `{tag}` does not name the workspace version (expected `{expected}`); bump `[workspace.package] version`, run `cargo xtask version --write`, commit, then tag"
+        )));
+      }
     }
   }
   println!(
@@ -951,6 +966,24 @@ fn write_stub(dir: &Path, (manifest, readme): &(Value, String)) -> Result<(), Fa
 
 #[cfg(test)]
 mod tests {
+  /// Do run the release guard over this tree with a test tag of its version; expect the binary release lane's guard
+  /// (`--allow-test-tag`) to accept it and the SDK publish lanes' guard to refuse it, and both to accept the release
+  /// tag — so a test of the release lane can never publish an SDK.
+  #[test]
+  fn only_the_release_lane_accepts_a_test_tag() {
+    let Ok(root) = crate::workspace_root() else {
+      panic!("no workspace root")
+    };
+    let version = env!("CARGO_PKG_VERSION");
+    let guard =
+      |tag: String, allow_test: bool| run(&root, &Mode::ExpectTag { tag, allow_test }).is_ok();
+    assert!(guard(format!("v{version}-test.1"), true));
+    assert!(!guard(format!("v{version}-test.1"), false));
+    assert!(guard(format!("v{version}"), false));
+    assert!(guard(format!("v{version}"), true));
+    assert!(!guard(format!("v{version}-rc.9"), true));
+  }
+
   use super::*;
 
   /// The nine triples slates ships, with napi's platform id and npm's selection fields for each.

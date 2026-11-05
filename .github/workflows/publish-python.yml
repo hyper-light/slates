@@ -12,7 +12,8 @@ name: Publish Python SDK
 
 on:
   push:
-    tags: ["v*"]
+    # Never on a test of the binary release lane (`v<version>-test.N`, release.yml): a test publishes nothing.
+    tags: ["v*", "!v*-test.*"]
   workflow_dispatch:
 
 env:

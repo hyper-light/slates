@@ -34,6 +34,8 @@
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
 // are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
 // workspace-wide.
+// The panic rule: a print macro panics on a refused write; lines go through `slates_machine::log_line!` (A-213).
+#![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 pub mod config_group;
@@ -53,7 +55,8 @@ pub mod routing;
 pub mod sealed;
 pub mod timing;
 
-use std::sync::mpsc::{TryRecvError, channel};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::task::Waker;
 
 use slates_db::ledger::{self, LedgerAcceptor, LedgerPromise};
 use slates_db::register::{
@@ -61,7 +64,7 @@ use slates_db::register::{
   decode_refusal, encode_refusal,
 };
 use slates_rt::error::RtError;
-use slates_rt::futures::{cancel, detach, now_ns, sleep, spawn_child};
+use slates_rt::futures::{cancel, detach, idle, now_ns, spawn_child, within};
 use slates_transport::connection::Priority;
 use slates_transport::endpoint::Endpoint;
 
@@ -279,12 +282,19 @@ impl DispatchWait {
   /// sleep always returns `true` so the caller drains replies delivered during that sleep
   /// before judging expiration again. Otherwise a reply already in the channel loses to
   /// the timer (§4.8; `docs/bugs/2026-09-20-collectors-expire-before-reading-queued-replies.md`).
+  ///
+  /// The park ends at the poll interval or at the first wake, whichever comes first: every dispatch task
+  /// wakes its collector once it has handed its reply over ([`ReplyTx::send`]), so a quorum is seen the
+  /// moment its last acknowledgement lands rather than at the next poll. Parked a whole interval, a commit
+  /// over loopback cost the interval however fast the holders answered: 10.1 ms at the median at the daemon's
+  /// 10 ms poll and 1.08 ms at a 100 µs one, over a 11.5 µs round trip (`replication_bench`, 2026-11-04). A
+  /// wake from anything else only ends the park early; the caller drains, judges and parks again.
   pub async fn keep_waiting(&mut self, gathered: usize) -> bool {
     if !self.judge(gathered, now_ns()) {
       return false;
     }
-    // A sleep refused (off a shard) cannot time the wait: the dispatch stops waiting rather than spin.
-    sleep(self.poll_interval_ns).await.is_ok()
+    // A park that cannot be timed (off a shard) cannot bound the wait: the dispatch stops waiting rather than spin.
+    within(self.poll_interval_ns, idle()).await.is_ok()
   }
 
   /// The decision [`keep_waiting`](DispatchWait::keep_waiting) takes before parking,
@@ -338,6 +348,37 @@ pub struct TimedReply {
 /// retry, RFC 9000 §12.3. The deadline is no longer a message: it is the collection loop's own
 /// progress-extension decision ([`DispatchWait`]), so a report is always a holder's reply.
 pub struct Reply(pub HostId, pub TimedReply, pub Box<Endpoint>);
+
+/// The sending end of a dispatch's reply channel: each dispatch task sends its [`Reply`] here and then wakes the
+/// task that made the channel — the collecting loop, parked in [`DispatchWait::keep_waiting`] — so the loop reads
+/// the reply now, not at its next poll. The waker is the collector's own task word ([`slates_rt::waker`]), copied,
+/// with no reference count; a wake that reaches a task which has moved on is a spurious wake its waits absorb, and
+/// one that reaches a task which has ended misses on the slot's generation. Off a shard there is no task to wake
+/// and the channel behaves as a plain one.
+#[derive(Clone)]
+pub(crate) struct ReplyTx {
+  tx: Sender<Reply>,
+  collector: Option<Waker>,
+}
+
+impl ReplyTx {
+  /// Hands `reply` to the collector and wakes it. A collector that has gone (the receiver dropped) loses
+  /// nothing it still wanted.
+  pub(crate) fn send(&self, reply: Reply) {
+    let _ = self.tx.send(reply);
+    if let Some(collector) = &self.collector {
+      collector.wake_by_ref();
+    }
+  }
+}
+
+/// A reply channel whose sends wake the task calling this — the dispatch's collector ([`ReplyTx`]).
+pub(crate) fn reply_channel() -> (ReplyTx, Receiver<Reply>) {
+  let (tx, rx) = channel::<Reply>();
+  let collector =
+    slates_rt::futures::current_task().map(|task| slates_rt::waker::waker_for(task.0));
+  (ReplyTx { tx, collector }, rx)
+}
 
 /// The holder replies still in flight when a dispatch returned at quorum (or timed out): the receiving end
 /// of the dispatch's reply channel, kept open so each straggler task — bounded by the dispatch's full span
@@ -656,14 +697,14 @@ pub async fn broadcast(
     return (Vec::new(), Stragglers::none());
   }
   let deadline_ns = budget.max_deadline_ns();
-  let (tx, rx) = channel::<Reply>();
+  let (tx, rx) = reply_channel();
   let mut tasks = Vec::new();
   for (host, request, endpoint) in requests {
     let tx = tx.clone();
     if let Ok(task) = spawn_child(async move {
       let (reply, endpoint) =
         request_within(endpoint, stream, priority, &request, deadline_ns).await;
-      let _ = tx.send(Reply(host, reply, Box::new(endpoint)));
+      tx.send(Reply(host, reply, Box::new(endpoint)));
     }) {
       tasks.push(task);
     }
@@ -855,7 +896,7 @@ pub async fn commit_record_on(
   // Dispatch each remote holder in its own task, reporting to one channel; the collection loop below
   // bounds the wait itself (its progress-extension policy), so no deadline task is needed. Children of
   // the calling task, so they end with it (no orphans), and each is bounded by the dispatch's span.
-  let (tx, mut rx) = channel::<Reply>();
+  let (tx, mut rx) = reply_channel();
   let record_bytes = record.encode();
   let deadline_ns = budget.max_deadline_ns();
   let mut tasks = Vec::new();
@@ -868,7 +909,7 @@ pub async fn commit_record_on(
       // is cancelled — the caller can then retry a load-timed-out commit over the same warm session.
       let (reply, endpoint) =
         request_within(endpoint, stream, Priority::Control, &bytes, deadline_ns).await;
-      let _ = tx.send(Reply(host, reply, Box::new(endpoint)));
+      tx.send(Reply(host, reply, Box::new(endpoint)));
     });
     match spawned {
       Ok(task) => tasks.push(task),
@@ -1135,7 +1176,7 @@ pub async fn promote_ledger_record(
   // Dispatch each remote holder in its own task, reporting to one channel; the collection loop bounds the
   // wait itself (its progress-extension policy). Children of the calling task, so they end with it (no
   // orphans), each bounded by the dispatch's span.
-  let (tx, mut rx) = channel::<Reply>();
+  let (tx, mut rx) = reply_channel();
   let prepare_bytes = prepare.encode();
   let deadline_ns = budget.max_deadline_ns();
   let mut tasks = Vec::new();
@@ -1152,7 +1193,7 @@ pub async fn promote_ledger_record(
         deadline_ns,
       )
       .await;
-      let _ = tx.send(Reply(host, reply, Box::new(endpoint)));
+      tx.send(Reply(host, reply, Box::new(endpoint)));
     });
     match spawned {
       Ok(task) => tasks.push(task),

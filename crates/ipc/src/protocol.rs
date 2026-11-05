@@ -1524,6 +1524,11 @@ pub struct DaemonReport {
   /// Every message the anchor's hold channel refused over its life, as the anchor last wrote it to the segment
   /// (A-213); the anchor's log says each distinct refusal once, so this is where the rest show. Appended.
   pub anchor_hold_refusals: u64,
+  /// Log lines the daemon could not write over its life (its standard error closed, or a pipe whose reader went away),
+  /// each counted and dropped (A-213). Appended.
+  pub log_lines_refused: u64,
+  /// Log lines the anchor could not write over its life, as it last wrote the count to the segment (A-213). Appended.
+  pub anchor_log_lines_refused: u64,
 }
 
 /// The node's sealing at rest (A-92): how its root came (`unavailable`, `minted`, `minted-daemon-only` or

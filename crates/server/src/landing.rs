@@ -1117,7 +1117,7 @@ impl BarrierThread {
     if let Some(thread) = self.thread.take()
       && thread.join().is_err()
     {
-      eprintln!("slates-server: a landing barrier thread panicked");
+      slates_machine::log_line!("slates-server: a landing barrier thread panicked");
     }
   }
 }

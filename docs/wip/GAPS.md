@@ -1,5 +1,18 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **No print macro panics on a closed pipe (2026-11-05, A-213; found by the release agent).** `slates anchor 2>&1
+> >/dev/null | head -n 1` exited 134 once `head` had its line: `eprintln!` and `println!` panic on a refused write, and a
+> pipe whose reader has gone refuses with `EPIPE`. Every shipped site, 266 in all, now writes through
+> `slates_machine::log_line!` or `out_line!`. A refused write is counted and dropped. Both counts show in `slates status`:
+> `log_lines_refused`, the daemon's own, and `anchor_log_lines_refused`, which the anchor writes to the segment. A command
+> whose output was refused exits 4. Every shipped crate's root denies `clippy::print_stdout` and `clippy::print_stderr`
+> outside tests. adacachy, 2026-11-05: the real anchor whose log reader went away ended with exit 101 (debug build) before
+> the fix, and after it kept supervising a killed daemon's successor. On CI's `ubuntu-latest` and `macos-latest` both
+> tests fail without the fix (the anchor exits 101; `slates --help` panics in std's `stdio.rs`; run 42048872612) and pass
+> with it on c0c8d28c, with workspace clippy there and the Windows lint on both Windows lanes (run 42052731305). **Owed:** `xtask` (148 sites),
+> `slates-guest-probe` (11) and `slates-test-seeds` (1) keep their print macros. They do not ship, and a closed pipe still
+> panics them. Record: `docs/bugs/2026-11-05-a-closed-log-pipe-ended-the-anchor.md`.
+
 > **The anchor's hold refusals: a bounded Unix log, and a count in `slates status` (2026-11-04, A-213; siblings of
 > audit step 3).** The Unix device hold logged a line per refused message, unbounded; it now logs each distinct refusal
 > once (`RefusalLog`, as the Windows hold does) and counts every one. Every refusal on either platform's hold channel
@@ -15,6 +28,32 @@
 >   mount's median fell from 487 to 10.5 ms on x86_64 and from 445 to 15.8 ms on arm64, an unmount's from 505 to 15.7 ms
 >   and from 507 to 27.0 ms, 20 interleaved rounds per build (run 41985454044; BENCHMARKS, "What a WinFsp mount and unmount
 >   wait for the Windows anchor").
+
+> **The binary release lane (2026-11-04, A-210, Appendix B.2).** `release.yml` now builds `slates` natively for
+> seven targets: macOS arm64, Linux x86_64 and arm64 (glibc, and static musl), and Windows x86_64 and arm64 with the C
+> runtime linked statically. It runs each built binary on its own runner (`cargo run -p xtask --bin release -- smoke`: version,
+> anchor and daemon start, bootstrap, a volume provisioned, a file written and read by one MCP client and read by a second
+> client, the volume destroyed, the daemon gone with its anchor). It then attaches the seven binaries, `SHA256SUMS`,
+> `slates-provenance.json` and a Sigstore attestation bundle to a **draft** release. Publishing the draft is the
+> maintainer's step (`docs/publish.md`, "The binary release").
+> - Proven by use (2026-11-05). Every Linux and Windows binary passed every smoke step on its own CI runner (run
+>   41982329895): provision 20–25 ms, the MCP round trip 22–61 ms, start to serving 275–1064 ms. Both musl binaries
+>   are static, and the Windows x86_64 binary answered in Nano Server. The macOS binary passed 10 of 10 runs on this
+>   Mac (M5 Max, 18 cores, 2026-11-04, load 12–24; `cargo run -p xtask --bin release -- smoke --binary <release build>
+>   --target aarch64-apple-darwin --record <file>`).
+> - End to end on the test tag `v0.1.0-test.1` (run 41983664060; macOS on CI too). It made a draft pre-release with all
+>   seven binaries, `SHA256SUMS`, the provenance and the attestation bundle. After download, all seven checksums
+>   verified, `gh attestation verify` passed (SLSA v1, seven subjects, `release.yml` at the tag) and refused a
+>   tampered copy, and no SDK lane started. Every number is in A-210.
+> - **Owed to Ada:** a release is published only when a maintainer pushes a real tag `v<version>` and publishes its
+>   draft (`docs/publish.md`). The test draft is never to be published.
+> - **Open, found by the smoke test: the anchor aborts when its stderr closes.** `slates anchor 2>&1 >/dev/null | head
+>   -n 1` exits 134 (SIGABRT) once `head` has exited (2026-11-04, this Mac). The next diagnostic line meets EPIPE,
+>   which `eprintln!` turns into a panic, and `panic = "abort"` makes that an abort. The smoke test's own first
+>   version stopped reading the anchor's stderr after the serving line, and 8 of 10 runs aborted. Owed, in
+>   `crates/cli`: a failing test, then diagnostics that survive a closed stderr.
+> - **Not yet:** reproducibility from the tag (AC-9.5: nothing builds twice and compares); the macOS `Slates.app`
+>   bundle, code signing and notarization (B.7; they need an Apple Developer identity); `cargo-binstall` metadata.
 
 > **WinFsp's hold release, DLL version and long paths fixed (2026-11-04, A-206; audit steps 4 and 6).** Run
 > [41978665514](https://github.com/hyper-light/slates/actions/runs/41978665514), `windows-latest` and `windows-11-arm`,
@@ -60,6 +99,36 @@
 > unchanged code and 200 with the close removed (`crates/mem/tests/held_section.rs`); the adoption now maps first anyway.
 > Numbers and CI runs: BENCHMARKS, "What a write costs on pages given back on Windows".
 
+> **A merge's cost grows with its green's file count (2026-11-05, RQ-4, §4.16; OPEN, perf's).** The new
+> `crates/client/examples/edit_merge_bench.rs` measures, on macOS arm64 at load 9, an accepted submit's median at
+> 25–161 µs over a green's first hundred versions and 529–684 µs over its last hundred (six runs). Each version adds a
+> file. One file replaced 1,000 times shows no growth, and an edit shows none in either form. Every submit clones
+> each path of the green (`Green::current_base`), walks each base file (`compose_volume`), and hashes each byte of the
+> green (`Green::head_identity` in `merge_service::enqueue_record`). That puts RQ-4's millisecond out of reach for a
+> repository-sized green. The fix is the perf agent's. The clients agent re-measures merge on every platform once it
+> lands. Also open from the same runs: a sevenfold p50 split between two invocations on this Mac (edit 18.8 against
+> 2.5 µs). Record: `BENCHMARKS.md`, "The client's edit and merge latency".
+
+> **Replication latency (raft, 2026-11-04): a commit returns at its quorum; live shipping still owed.** Every quorum
+> collector in `slates-cluster` slept its whole poll after its quorum had answered, so a cross-node record commit cost
+> the daemon's 10 ms poll (10,125–10,194 µs at the median) over a 12 µs loopback round trip. Each reply now wakes its
+> collector: 18.9–19.9 µs at the median, p99 28.8–32.9 µs, worst 44.7 µs at the daemon's poll
+> (`replication_bench`, five interleaved rounds at load 36–42, `docs/wip/BENCHMARKS.md`; failing test first:
+> `a_commit_returns_at_its_quorum_not_at_its_poll`; record:
+> `docs/bugs/2026-11-04-a-quorum-collector-waited-out-its-poll.md`). Open, toward a filesystem server replicated per
+> write in under 1 ms: §4.10 live shipping (the owner's publication stream shipped to its candidates and acknowledged
+> at f+1, AC-8.3's "live-shipped volumes report none", AC-8.9's credit backpressure) is unbuilt, as are `put_wal`
+> and the loss-window report; a head still waits up to the 100 ms record period before its commit starts.
+
+> **VFS plan step 14, Shards' WHP window's three edge cases (2026-11-05): done, patches with the owner's folder.** Six
+> real-guest tests and one fix for Shards' owner, in `docs/wip/shards-patches/` (never pushed to Shards; README there), and
+> PM M421 with them. A view shorter than its range and 64 KiB granules hold. Several vCPUs at a section's replace hold (0 stale,
+> 0 lost in 20,000 replaces, up to 158,573 faults run again at 8 vCPUs on jupiter, 47,708 at 4 on windows-2025). At a share's
+> own file followed they did not: 2 to 38 live accesses taken for the guest's a run on jupiter, 201 to 797 on windows-2025
+> (10 of 10), and 0 after the fix on both. slates refuses an ask no view can begin at (A-211). CI runs 41981896876 and
+> 41987826160, the second on the patches as delivered. Owed: the
+> owner's review.
+>
 > **Audit of 2dc9f3eb..98000d56 (2026-11-03): defects open, Step 9's evidence holds.** Nine commits made on
 > 2026-11-01 and 2026-11-02 were read line by line against this file's rules and Step 9's acceptance. Every CI run they
 > cite was read again: each shows what it is cited for, except one pair of timings A-198 gave the wrong way
@@ -88,8 +157,18 @@
 >   41977593496; the entry above).** It read `FileSystem.Version`, not the DLL's version (`FspVersion`). Also, an open whose
 >   path was longer than 1024 UTF-16 units was refused, because every open records its kernel name in the held ledger
 >   (`crates/bridge-winfsp/src/opens/names.rs`); now slates refuses no path the driver passes.
-> - **The receiver that replaced WinFsp's dispatcher is unmeasured.** It is one thread with a new event per control
->   transaction, where the DLL dispatcher ran two threads; BENCHMARKS has no entry for it.
+> - **The receiver that replaced WinFsp's dispatcher: measured, most of its regression fixed, a remainder open (A-212,
+>   2026-11-05).** Interleaved on CI's runners against `71cf09ac` (BENCHMARKS, "The WinFsp receiver against the DLL
+>   dispatcher", every run), it was worse beyond the spread (arm64 quiet p50: a stat 2.55×, a rename 2.90×, an fsync 1.74×;
+>   run 41973314087). Two causes were timed and fixed: a live receive scanned the whole 64 KiB batch tail (26.4 µs on arm64,
+>   50.1 µs on x86_64, run 41977769822), and a rename took a shard turn per live open (about 106). After (run 41989009852):
+>   arm64 a stat 1.50×, a rename 1.35×, an fsync 1.21×; x86_64 loaded a stat and an open 1.18–1.20×, its quiet runs overlapping. Some loaded tails are far
+>   better than the DLL's (x86_64 stat p99 114–133 ms against 0.51–0.60 ms). **Open:** it stays worse beyond the spread at
+>   the p50 by about 20 µs a request. The separate response call explains 11–13 µs, and removing it would change A-198's
+>   crash rule. Hops for Open and Release about 2× and for SetSize about 4× under load on arm64 are measured and not explained
+>   (a longer shard spin did not change them, run 41989038309); that SetSize hop is an arm64 write under load at 2.09×. Also:
+>   under two spinners a core on a 4-vCPU x86_64 VM the anchor killed both daemons for a late heartbeat in run 3 of all
+>   three jobs that reached it.
 > - **Two failures recorded open below**: the wake-learning case under load (fixed 2026-11-04, A-199) and the fleet
 >   routing Create reply (fixed 2026-11-04 in its fixture; a second, rarer failure of that history stays open).
 >
@@ -12472,8 +12551,9 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   `.cargo/config.toml` nor `release.yml` sets `+crt-static` for Windows), `slates.exe` needs `vcruntime140.dll`, which
   Windows does not ship and Nano Server and Server Core images lack: in a process-isolated `nanoserver:ltsc2025` container
   it exits `0xC0000135`, `STATUS_DLL_NOT_FOUND`, before any code runs (CI's `windows-2025`, run 40580524733). Built with
-  `-C target-feature=+crt-static` it runs there whole, the daemon included (run 40582122662). Owed: the release's Windows
-  binaries built with the C runtime linked statically, and a by-use test that the published binary starts in Nano Server.
+  `-C target-feature=+crt-static` it runs there whole, the daemon included (run 40582122662). **Addressed 2026-11-04
+  (A-210):** `release.yml` builds both Windows binaries with `+crt-static`, and the x86_64 one must answer `slates
+  version` in a process-isolated `nanoserver:ltsc2025` container before it may ship. The CI run is recorded in A-210.
 - **A CLI attachment ends about a second after the `slates attach` that made it (open, seen 2026-10-27).** The reaper
   removes a dead client's attachments at the liveness cadence (`crates/server/src/reap.rs`, every 1 s), and each `slates`
   run is a client of its own. So `slates attach`, then `slates write`, then `slates detach`, each a process, races the
