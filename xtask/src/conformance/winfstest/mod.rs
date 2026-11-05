@@ -448,6 +448,41 @@ mod tests {
     assert_eq!(cases.len(), want_cases.len(), "cases");
   }
 
+  /// A-214. Do: read the reviewed list. Expect: it parses, and every case it names is a case a transcribed script can
+  /// report: its script is one of the twenty, and its number is within that script's cases under the golden.
+  #[test]
+  fn the_reviewed_list_names_only_cases_the_scripts_have() {
+    let text = include_str!(
+      "../../../../docs/wip/conformance/expected-failures/native-windows-winfsp.winfstest.txt"
+    );
+    let list = slates_conformance::expected::ExpectedFailures::parse(text).unwrap();
+    assert!(!list.is_empty());
+    let golden = include_str!("golden.tsv");
+    for entry in list.entries() {
+      let (path, number) = entry.id.rsplit_once(':').unwrap();
+      let number: usize = number.parse().unwrap();
+      let cases = golden
+        .lines()
+        .filter(|line| line.starts_with(&format!("{path}\tcase\t")))
+        .count();
+      assert!(
+        scripts::SCRIPTS.iter().any(|script| script.path == path),
+        "{} names no transcribed script",
+        entry.id
+      );
+      assert!(
+        (1..=cases).contains(&number),
+        "{} is past the {cases} cases of {path}",
+        entry.id
+      );
+      assert!(
+        !entry.reason.trim().is_empty(),
+        "{} has no reason",
+        entry.id
+      );
+    }
+  }
+
   /// A script whose driver call fails ends there: no later case is reported and no plan is printed, so its file is
   /// incomplete and the run cannot pass, as upstream's `CalledProcessError` ends the Python script.
   #[test]

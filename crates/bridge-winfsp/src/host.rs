@@ -269,6 +269,13 @@ enum Op<T> {
     to: String,
     replace: bool,
   },
+  /// `SetFileSize` with `SetAllocationSize`: an allocation below the file's size truncates the file to it (WinFsp's
+  /// contract for `SetFileSize`; an open with `TRUNCATE_EXISTING` arrives so, A-214, `t/base/05.t`), and any other
+  /// allocation changes nothing the volume keeps.
+  SetAllocation {
+    object: T,
+    new_size: u64,
+  },
   /// `SetBasicInfo`'s times (`SetFileTime`): each `Some` is applied to the volume's access, modification or change
   /// time (A-214, `t/base/06.t`); WinFsp passes a creation time too, which the volume does not keep settable.
   SetTimes {
@@ -313,6 +320,7 @@ impl<T> Op<T> {
         | Op::SetSize { .. }
         | Op::Truncate { .. }
         | Op::SetTimes { .. }
+        | Op::SetAllocation { .. }
         | Op::Rename { .. }
         | Op::Flush { .. }
         | Op::Cleanup { .. }
@@ -592,6 +600,10 @@ fn bind(op: Op<u64>, ledger: &Ledger<SparseObject>) -> Result<Op<Open>, crate::o
     Op::CanDelete { object } => Op::CanDelete {
       object: ledger.get(object)?,
     },
+    Op::SetAllocation { object, new_size } => Op::SetAllocation {
+      object: ledger.get(object)?,
+      new_size,
+    },
     Op::SetTimes {
       object,
       atime,
@@ -812,6 +824,22 @@ fn run(bridge: &mut dyn Bridge, cx: &OpContext, op: Op<Open>) -> Result<Reply, V
     }
     Op::Rename { from, to, replace } => op_rename(bridge, cx, &from, &to, replace)?,
     Op::CanDelete { object } => op_can_delete(bridge, cx, object.object, object.fh)?,
+    Op::SetAllocation { object, new_size } => {
+      let attr = bridge.getattr(object.object, cx)?;
+      let attr = if new_size < attr.size {
+        bridge.setattr(
+          object.object,
+          cx,
+          SetAttr {
+            size: Some(new_size),
+            ..SetAttr::default()
+          },
+        )?
+      } else {
+        attr
+      };
+      object_reply(&attr, 0)?
+    }
     Op::SetTimes {
       object,
       atime,
@@ -1536,9 +1564,10 @@ extern "C" fn set_file_size(
   // SAFETY: our file system and a live open-file context.
   let handler = unsafe { handler(fs) };
   let object = context_key(context);
-  // Setting only the allocation size does not change the file size; report the current info unchanged.
+  // An allocation below the file's size truncates it, as WinFsp's `SetFileSize` contract says (an open with
+  // `TRUNCATE_EXISTING` arrives as an allocation of zero); any other allocation leaves the file as it is (A-214).
   let op = if set_allocation_size != 0 {
-    Op::Info { object }
+    Op::SetAllocation { object, new_size }
   } else {
     Op::SetSize { object, new_size }
   };
