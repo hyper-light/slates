@@ -8,13 +8,15 @@
 > async path sends it. Red before, green after (`crates/client/tests/acknowledge.rs`). Owed: the interleaved
 > `provision_bench` A/B on every platform. Record: `docs/bugs/2026-11-05-a-call-waited-for-its-acknowledgements-scatter.md`.
 
-> **Shards counted hardware threads as cores (2026-11-05, A-208, §4.1, R9; fixed, its A/B owed).** §4.1 counts shards in
+> **Shards counted hardware threads as cores (2026-11-05, A-208, §4.1, R9; fixed and measured).** §4.1 counts shards in
 > physical cores, but the placement counted logical CPUs. jupiter's 16 two-thread cores therefore ran 31 shards and
 > left its spinning clients one thread: provisioning p99 123.6 µs against R9's 50 µs (Windows x86_64, 06:35 UTC). The
 > facts now name each CPU's physical core (`CoreFacts::physical`), and the placement fixes one shard per core, on its
 > first thread. A unit test failed before the fix (31 against 15) and passes after, and the placement oracle covers
-> three sibling layouts. Owed: the interleaved before/after `provision_bench` on a two-thread-per-core machine. Also
-> owed: Windows core classes, still unread. Record: `docs/bugs/2026-11-05-shards-counted-hardware-threads-as-cores.md`.
+> three sibling layouts. Measured (BENCHMARKS, "Provisioning by physical core"): R9's single-client p99 went from
+> 41.5–190.1 µs to 21.8–40.7 µs on both CI SMT runners, all rounds green with part 2. On jupiter the millisecond
+> tails are gone, but its p99 is still 80–252 µs, red. Owed: a quiet Linux SMT run (adacachy's was at load 52), the
+> macOS arm (no SMT, expected unchanged), and Windows core classes, still unread. Record: `docs/bugs/2026-11-05-shards-counted-hardware-threads-as-cores.md`.
 
 > **A create's cost grows with its shard's volumes (2026-11-05, R9).** Both measured on macOS arm64 by `xctrace` on
 > `provision_bench`.
@@ -27,7 +29,8 @@
 >   per volume ever keyed and found each by a linear scan. 64 volumes made, written and destroyed left 64 keys, and
 >   the scan held 24,052 of the 26,986 samples inside the server's create over the full histogram. A key is now held
 >   for its volume's life and by each sealed record naming it, goes with its last hold, and is found through an index.
->   Both tests failed before the fix and pass after. Owed: the interleaved `provision_bench` A/B. Record:
+>   Both tests failed before the fix and pass after. The parked provisioning p50 fell from 277–780 µs to 37–49 µs on
+>   Linux and 154–331 µs on Windows (CI run 42049944560). Record:
 >   `docs/bugs/2026-11-05-a-shards-content-keys-were-never-let-go.md`.
 >
 > The 1-client spinning row is flat across a run (first-200 and last-200 medians 45–80 µs). There the server's create
