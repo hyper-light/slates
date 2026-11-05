@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use slates_conformance::exerciser::{judge_fsstress, judge_fsx};
+#[cfg(not(windows))]
+use slates_conformance::exerciser::judge_fsx;
+use slates_conformance::exerciser::{ExerciserVerdict, judge_fsstress};
 use slates_conformance::expected::{ExpectedFailures, judge};
 use slates_conformance::record::{Counts, ListDigest, Outcome, Privilege};
 pub(crate) use slates_conformance::tap::Runner;
@@ -45,7 +47,7 @@ fn run_capturing(program: &Path, args: &[String], cwd: &Path) -> Result<(bool, S
 }
 
 /// The outcome for counts: `RAN` unless the lane runs through an adapter or at reduced scope.
-fn outcome_for(
+pub(crate) fn outcome_for(
   run: &Run<'_>,
   suite: Suite,
   counts: Counts,
@@ -71,6 +73,18 @@ fn outcome_for(
   }
 }
 
+/// FreeBSD's fsx's verdict: its exit and its success line.
+#[cfg(not(windows))]
+fn fsx_verdict(success: bool, output: &str, _operations: u64) -> ExerciserVerdict {
+  judge_fsx(success, output)
+}
+
+/// The WinFsp port's verdict: its exit and its own success line, naming the operations asked for.
+#[cfg(windows)]
+fn fsx_verdict(success: bool, output: &str, operations: u64) -> ExerciserVerdict {
+  slates_conformance::exerciser::judge_winfsp_fsx(success, output, operations)
+}
+
 /// fsx over the mount.
 pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let tools = run.scratch.shared("tools")?;
@@ -84,21 +98,57 @@ pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     bounds.fsx_operations.to_string(),
     "-S".to_owned(),
     bounds.fsx_seed.to_string(),
-    "-l".to_owned(),
+    fetch::FSX_LENGTH_FLAG.to_owned(),
     bounds.fsx_file_length.to_string(),
-    "-q".to_owned(),
+    fetch::FSX_TRACE_FLAG.to_owned(),
     "-P".to_owned(),
-    logs.display().to_string(),
+    super::plain_path(&logs),
     // Relative to the work directory: fsx names its .fsxgood/.fsxlog files `<-P dir>/<fname>.…`,
     // so an absolute fname would nest one absolute path under another.
     "fsx.bin".to_owned(),
   ];
-  let (success, output) = run_capturing(&built.binary, &args, &work)?;
-  let verdict = judge_fsx(success, &output);
+  let (success, output, ended) = run_bounded(&built.binary, &args, &work, FSX_WALL_BOUND)?;
+  let verdict = fsx_verdict(success, &output, bounds.fsx_operations);
+  // A run that failed is judged against the transport's reviewed list (A-209): one that failed its own verification by
+  // the operation it failed at, one its wall bound ended as unfinished. A listed failure is expected, any other is not,
+  // and a pass with a listed failure must strike it.
+  let (list, digest) = reviewed_list(
+    run.root,
+    format!(
+      "docs/wip/conformance/expected-failures/{}.fsx.txt",
+      run.transport.slug()
+    ),
+  )?;
+  let cases: Vec<TapCase> = if verdict.ok {
+    Vec::new()
+  } else {
+    let id = if ended {
+      slates_conformance::exerciser::fsx_stop_id(bounds.fsx_seed, &output)
+    } else {
+      slates_conformance::exerciser::fsx_unfinished_id(bounds.fsx_seed, bounds.fsx_operations)
+    };
+    let (file, number) = id.rsplit_once(':').unwrap_or((id.as_str(), "0"));
+    vec![TapCase {
+      id: slates_conformance::tap::TestId {
+        file: file.to_owned(),
+        number: number.parse().unwrap_or(0),
+      },
+      status: CaseStatus::Fail {
+        detail: verdict.detail.clone(),
+      },
+    }]
+  };
+  let judgement = judge(&list, &cases);
   let mut notes = vec![
     built.note,
     "the exerciser's .fsxlog/.fsxgood files were kept outside the mount (-P)".to_owned(),
+    judgement.describe(),
   ];
+  if !ended {
+    notes.push(format!(
+      "fsx was ended at its wall bound of {FSX_WALL_BOUND:?}"
+    ));
+  }
   if !verdict.ok {
     notes.push(format!("fsx output tail: {}", verdict.detail));
   }
@@ -122,13 +172,79 @@ pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
       command_line(&built.binary, &args)
     ),
     bound: format!(
-      "{} operations, seed {}, file length {} bytes",
+      "{} operations, seed {}, file length {} bytes, {FSX_WALL_BOUND:?} a run",
       bounds.fsx_operations, bounds.fsx_seed, bounds.fsx_file_length
     ),
-    expected_failure_list: None,
+    expected_failure_list: Some(digest),
     notes,
-    ok: verdict.ok,
+    ok: judgement.acceptable(),
   })
+}
+
+/// Derived: the wall bound of a whole fsx run: pjdfstest's per-file bound
+/// (`slates_conformance::pjdfstest::FILE_BOUND_SECONDS`, 300 s), about five times the slowest recorded fsx run of the
+/// default bounds (62.6 s, `native-linux-fuse` on arm64, diagnostics run 41975493604). A run still going then is ended
+/// and judged as unfinished (the WinFsp port's operations take seconds each over the drive, A-209).
+const FSX_WALL_BOUND: Duration = PJDFSTEST_FILE_BOUND;
+
+/// Runs a suite binary until it exits or `bound` passes, capturing both streams together; past the bound it is killed.
+/// Whether it succeeded, its output, and whether it ended by itself.
+fn run_bounded(
+  program: &Path,
+  args: &[String],
+  cwd: &Path,
+  bound: Duration,
+) -> Result<(bool, String, bool), Failure> {
+  let mut child = Command::new(program)
+    .args(args)
+    .current_dir(cwd)
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .map_err(|e| Failure(format!("running {}: {e}", program.display())))?;
+  let stdout = drain_stream(child.stdout.take())?;
+  let stderr = drain_stream(child.stderr.take())?;
+  let started = Instant::now();
+  let (success, ended) = loop {
+    if let Some(status) = child.try_wait()? {
+      break (status.success(), true);
+    }
+    if started.elapsed() > bound {
+      let _ = child.kill();
+      let _ = child.wait();
+      break (false, false);
+    }
+    pause();
+  };
+  let mut text = joined_stream(stdout)?;
+  text.push_str(&joined_stream(stderr)?);
+  Ok((success, text, ended))
+}
+
+/// A child's stream read to its end on a thread the caller joins.
+fn drain_stream<R: std::io::Read + Send + 'static>(
+  stream: Option<R>,
+) -> Result<std::thread::JoinHandle<std::io::Result<Vec<u8>>>, Failure> {
+  let mut stream = stream.ok_or_else(|| Failure("a suite stream was not piped".to_owned()))?;
+  std::thread::Builder::new()
+    .name("suite-stream".to_owned())
+    .spawn(move || {
+      let mut bytes = Vec::new();
+      stream.read_to_end(&mut bytes).map(|_| bytes)
+    })
+    .map_err(|e| Failure(format!("starting a suite stream's reader: {e}")))
+}
+
+/// The text a drained stream read; the child has ended, so the reader reaches the end.
+fn joined_stream(
+  drain: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+) -> Result<String, Failure> {
+  let bytes = drain
+    .join()
+    .map_err(|_| Failure("a suite stream's reader panicked".to_owned()))?
+    .map_err(|e| Failure(format!("reading a suite stream: {e}")))?;
+  Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// fsstress over the mount.
@@ -320,7 +436,7 @@ fn shape_lines(cases: &[TapCase]) -> (String, Vec<String>) {
 }
 
 /// The failures by shape as one note.
-fn shape_note(cases: &[TapCase]) -> String {
+pub(crate) fn shape_note(cases: &[TapCase]) -> String {
   let (heading, rows) = shape_lines(cases);
   format!("{heading}: {}", rows.join("; "))
 }
@@ -405,17 +521,17 @@ pub(crate) fn tally_outputs(
 }
 
 /// The aggregate counts of the parsed files.
-struct Tally {
-  files: u32,
-  cases: Vec<TapCase>,
-  passed: u32,
-  failed: u32,
-  needs_root: u32,
-  todo: u32,
-  incomplete: Vec<String>,
+pub(crate) struct Tally {
+  pub(crate) files: u32,
+  pub(crate) cases: Vec<TapCase>,
+  pub(crate) passed: u32,
+  pub(crate) failed: u32,
+  pub(crate) needs_root: u32,
+  pub(crate) todo: u32,
+  pub(crate) incomplete: Vec<String>,
 }
 
-fn tally(parsed: &[TapFile]) -> Tally {
+pub(crate) fn tally(parsed: &[TapFile]) -> Tally {
   let mut out = Tally {
     files: u32::try_from(parsed.len()).unwrap_or(u32::MAX),
     cases: Vec::new(),
@@ -464,6 +580,15 @@ fn expected_list(
       Privilege::Unprivileged => ".unprivileged",
     }
   );
+  reviewed_list(root, relative)
+}
+
+/// The reviewed list at `relative` (from the workspace root), or an empty one when no file exists yet, with the
+/// digest a record carries.
+pub(crate) fn reviewed_list(
+  root: &Path,
+  relative: String,
+) -> Result<(ExpectedFailures, ListDigest), Failure> {
   let text = std::fs::read_to_string(root.join(&relative)).unwrap_or_default();
   let list = ExpectedFailures::parse(&text).map_err(|e| Failure(format!("{relative}: {e}")))?;
   let digest = ListDigest {

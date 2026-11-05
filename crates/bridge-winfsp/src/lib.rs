@@ -58,6 +58,9 @@ pub mod purge;
 mod purge_intents;
 #[cfg(windows)]
 mod purge_token;
+// How the receive thread waits for a shard's reply: spin for what a wake costs, then park (A-212).
+#[cfg(windows)]
+mod reply;
 // The purges Windows did not take, made again on a doubling wait until each takes or the volume's request timeout
 // passes (A-190 as amended 2026-11-01). Pure, so it is tested on every host.
 pub mod retry;
@@ -134,6 +137,23 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 pub fn filetime_from_unix_ns(ns: i64) -> u64 {
   let ns = u64::try_from(ns).unwrap_or(0);
   (ns / FILETIME_TICK_NS).saturating_add(FILETIME_UNIX_EPOCH_OFFSET)
+}
+
+/// Format: the `FILETIME` a `SetBasicInfo` call passes for a time it leaves alone (WinFsp's `SetBasicInfo`: "0 if
+/// the time should not be changed"), and the all-ones value Windows' `SetFileTime` documents as "stop updating it for this
+/// handle", which a volume that keeps no per-handle update policy also leaves alone.
+const FILETIME_UNCHANGED: [u64; 2] = [0, u64::MAX];
+
+/// Converts a Windows `FILETIME` a caller set (`SetFileTime`, `SetFileInformationByHandle`) to a Unix time in
+/// nanoseconds, the form the volume keeps (A-209): `None` for a time the call leaves alone ([`FILETIME_UNCHANGED`]),
+/// and a time before 1970 negative, as the volume's signed times hold it. A time past what nanoseconds since 1970 hold
+/// in an `i64` (the year 2262) is `None` too: the volume cannot keep it, and the call keeps the old one.
+pub fn unix_ns_from_filetime(filetime: u64) -> Option<i64> {
+  if FILETIME_UNCHANGED.contains(&filetime) {
+    return None;
+  }
+  let ticks = i128::from(filetime).checked_sub(i128::from(FILETIME_UNIX_EPOCH_OFFSET))?;
+  i64::try_from(ticks.checked_mul(i128::from(FILETIME_TICK_NS))?).ok()
 }
 
 /// The Windows file-attribute bits for a node kind (§4.6) — a directory, an ordinary file, or a symlink
@@ -302,6 +322,28 @@ mod tests {
       FILETIME_UNIX_EPOCH_OFFSET,
       "a negative time clamps to the epoch"
     );
+  }
+
+  /// A-209: a `FILETIME` a caller set converts back to the volume's Unix nanoseconds and round-trips through
+  /// [`filetime_from_unix_ns`]; the two "leave it" values convert to nothing, a time before 1970 is negative, and one past
+  /// what the volume's `i64` holds is nothing rather than a wrapped time.
+  #[test]
+  fn a_set_filetime_converts_to_the_volumes_time() {
+    assert_eq!(unix_ns_from_filetime(0), None, "zero leaves the time alone");
+    assert_eq!(
+      unix_ns_from_filetime(u64::MAX),
+      None,
+      "all ones leaves it alone"
+    );
+    assert_eq!(unix_ns_from_filetime(FILETIME_UNIX_EPOCH_OFFSET), Some(0));
+    let set = 4_102_444_800_000_000_000_i64;
+    assert_eq!(unix_ns_from_filetime(filetime_from_unix_ns(set)), Some(set));
+    assert_eq!(
+      unix_ns_from_filetime(FILETIME_UNIX_EPOCH_OFFSET - 10_000_000),
+      Some(-1_000_000_000),
+      "a second before 1970 is negative"
+    );
+    assert_eq!(unix_ns_from_filetime(u64::MAX - 1), None, "past 2262");
   }
 
   /// Each node kind maps to its Windows file-attribute bit — a directory, an ordinary file, and a

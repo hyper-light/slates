@@ -31,6 +31,7 @@
 
 pub mod derive;
 pub mod engine;
+mod identity;
 pub mod increment;
 pub mod map;
 pub mod ops_doc;

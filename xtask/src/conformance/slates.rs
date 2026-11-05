@@ -301,6 +301,7 @@ impl Anchor {
   /// The command line this instance's daemon runs under, which names it among every process on the host:
   /// a pid can be reused once the daemon leaves, and the instance is this run's own.
   /// The anchor's command line, as `pkill -f` matches it.
+  #[cfg(unix)]
   fn anchor_command(&self) -> String {
     format!("slates --instance {} anchor", self.instance)
   }
@@ -349,6 +350,30 @@ impl Anchor {
   /// its log for its own violations
   /// (`docs/bugs/2026-09-29-a-suites-departing-daemon-wrote-into-the-next-suites-trace.md`). Whether the
   /// daemon left.
+  #[cfg(windows)]
+  fn end(&mut self) -> bool {
+    // On Windows the anchor holds its daemon in a job that ends with it (`crates/anchor`), so the anchor's kill takes
+    // the daemon along; its departure shows as the end of the log's pipe, which the drain reads to the end then.
+    let _ = self.child.kill();
+    let _ = self.child.wait();
+    let started = Instant::now();
+    while self
+      .drain
+      .as_ref()
+      .is_some_and(|drain| !drain.is_finished())
+    {
+      if started.elapsed() > START_WAIT {
+        return false;
+      }
+      pause();
+    }
+    if let Some(drain) = self.drain.take() {
+      let _ = drain.join();
+    }
+    true
+  }
+
+  #[cfg(unix)]
   fn end(&mut self) -> bool {
     let _ = self.child.kill();
     // Under a root tracer (`sudo strace -u USER`) the child is `sudo`, not ours to signal: the anchor it runs is,
@@ -375,6 +400,7 @@ impl Anchor {
 }
 
 /// Polls until no process runs `command`, for at most [`START_WAIT`]; whether none does.
+#[cfg(unix)]
 fn none_running(command: &str) -> bool {
   let started = Instant::now();
   loop {
@@ -493,6 +519,15 @@ enum MountMethod {
   /// `slates mount --shared` on Linux: the daemon's FUSE mount a container runtime binds; unmade with
   /// `fusermount3 -u -z` (no privilege).
   SharedFuse,
+  /// `slates mount ID E:` on Windows: the daemon's WinFsp drive; unmade with `slates unmount E:`.
+  WinFsp {
+    /// The binary that made it.
+    binary: PathBuf,
+    /// The instance whose daemon serves it.
+    instance: String,
+    /// The drive (`E:`).
+    drive: String,
+  },
 }
 
 /// A live kernel mount: force-unmounted and its directory removed on drop.
@@ -527,13 +562,40 @@ impl Drop for Mount {
           .arg(&self.path)
           .output();
       }
+      MountMethod::WinFsp {
+        ref binary,
+        ref instance,
+        ref drive,
+      } => {
+        let _ = Command::new(binary)
+          .args(["--instance", instance, "unmount", drive])
+          .output();
+        // A drive letter is no directory of the harness's: nothing to remove.
+        return;
+      }
     }
     drop(self.export.take());
     let _ = Command::new("rmdir").arg(&self.path).output();
   }
 }
 
+/// Whether the drive answers: Windows keeps no mount table a user lists, and a WinFsp drive's root answers a look-up
+/// once it serves (`crates/cli/tests/winfsp.rs`, `wait_ready`).
+#[cfg(windows)]
+fn is_mounted(path: &Path) -> bool {
+  std::fs::metadata(path).is_ok()
+}
+
+/// The first drive letter from `E:` to `Z:` whose root answers nothing, as `crates/cli/tests/winfsp.rs` picks one.
+fn free_drive() -> Result<String, Failure> {
+  ('E'..='Z')
+    .map(|letter| format!("{letter}:"))
+    .find(|drive| std::fs::metadata(format!("{drive}\\")).is_err())
+    .ok_or_else(|| Failure("no drive letter from E: to Z: is free".to_owned()))
+}
+
 /// Whether the mount table lists `path`.
+#[cfg(unix)]
 fn is_mounted(path: &Path) -> bool {
   let listed = stdout_of("mount", &[]);
   listed
@@ -558,9 +620,25 @@ pub(crate) fn mount_volume(
   id: &str,
   name: &str,
 ) -> Result<Mount, Failure> {
-  let point = fresh_mount_point()?;
   let mount = match run.os {
+    // WinFsp mounts at a drive letter (§4.6 "Windows", A-177): no directory is made.
+    HostOs::Windows => {
+      let drive = free_drive()?;
+      binary
+        .run(instance, &["mount", id, &drive])?
+        .expect_ok("slates mount")?;
+      Mount {
+        path: PathBuf::from(format!("{drive}\\")),
+        method: MountMethod::WinFsp {
+          binary: binary.path().to_path_buf(),
+          instance: instance.to_owned(),
+          drive,
+        },
+        export: None,
+      }
+    }
     HostOs::Macos => {
+      let point = fresh_mount_point()?;
       binary
         .run(instance, &["mount", id, &point.display().to_string()])?
         .expect_ok("slates mount")?;
@@ -572,6 +650,7 @@ pub(crate) fn mount_volume(
     }
     // The Linux container form binds the daemon's own shared FUSE mount: no privilege, no adapter.
     HostOs::Linux if run.transport == Transport::OciLinux => {
+      let point = fresh_mount_point()?;
       binary
         .run(
           instance,
@@ -585,6 +664,7 @@ pub(crate) fn mount_volume(
       }
     }
     HostOs::Linux => {
+      let point = fresh_mount_point()?;
       // Own cleanup before invoking the helper: a failed mount must not leave its durable
       // attachment (or its write lease) behind. UMNT may already have detached it on success.
       let mut mount = Mount {
@@ -624,7 +704,6 @@ pub(crate) fn mount_volume(
       }
       mount
     }
-    HostOs::Windows => return Err(Failure("the harness has no WinFsp mount step".to_owned())),
   };
   let started = Instant::now();
   while !is_mounted(&mount.path) {

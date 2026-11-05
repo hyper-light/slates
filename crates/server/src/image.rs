@@ -73,7 +73,7 @@ const ONE_UNIT: u64 = 1;
 /// Runs `unit` — one unit of a phase, `Some` once the phase is whole — until the phase is whole or the slice's time is
 /// spent: [`crate::config::DaemonConfig::copy_slice_ns`], half the live step quantum, as a granted landing's slice. The
 /// clock is read after every unit, so a slice overruns its budget by its last unit at most.
-fn sliced<T>(
+pub(crate) fn sliced<T>(
   state: &mut ShardState,
   mut unit: impl FnMut(&mut ShardState) -> Result<Option<T>, Refusal>,
 ) -> Result<Option<T>, Refusal> {
@@ -92,7 +92,8 @@ fn sliced<T>(
   }
 }
 
-/// The image builds and merges running on this shard (§4.6, A-160).
+/// The image builds and merges running on this shard (§4.6, A-160), and the green checkouts, which defer the same way
+/// (§4.16 A-201, `crate::checkout`).
 #[derive(Default)]
 pub(crate) struct ImageState {
   /// The requests a build or merge runs for, by origin, client and sequence, with where its reply goes: the newest
@@ -143,7 +144,9 @@ fn unreachable() -> Refusal {
 }
 
 /// Runs `step` on the shard's state, or refuses when the state is unreachable.
-fn with<R>(step: impl FnOnce(&mut ShardState) -> Result<R, Refusal>) -> Result<R, Refusal> {
+pub(crate) fn with<R>(
+  step: impl FnOnce(&mut ShardState) -> Result<R, Refusal>,
+) -> Result<R, Refusal> {
   match crate::state::with_state(step) {
     Some(result) => result,
     None => {
@@ -161,7 +164,7 @@ fn deferred() -> ReplyBody {
 
 /// Defers the current request's reply to `task`, spawned as an owned task of this shard: the request becomes
 /// in flight, so a retry joins it. `Overloaded` when the shard's task arena is full.
-fn defer(state: &mut ShardState, task: impl Future<Output = ()> + 'static) -> ReplyBody {
+pub(crate) fn defer(state: &mut ShardState, task: impl Future<Output = ()> + 'static) -> ReplyBody {
   let Some((origin, id)) = state.current_request else {
     return refused(Refusal::Unsupported {
       feature: "an image verb outside a recorded request".to_owned(),
@@ -183,7 +186,7 @@ fn defer(state: &mut ShardState, task: impl Future<Output = ()> + 'static) -> Re
 
 /// Commits a task's outcome as one atom — its effects (`produce`), the publication they need, and the request's
 /// completion record — and returns the reply with where it goes.
-fn complete(
+pub(crate) fn complete(
   state: &mut ShardState,
   (origin, id): (u64, RequestId),
   produce: impl FnOnce(&mut ShardState) -> ReplyBody,
@@ -212,7 +215,7 @@ fn complete(
 
 /// Hands a task's reply to where its request waits, on its client's shard. A request with no route (a forward from
 /// another node) reads its completion record instead.
-fn deliver(state: &mut ShardState, reply: ReplyBody, route: Option<ReplyRoute>) {
+pub(crate) fn deliver(state: &mut ShardState, reply: ReplyBody, route: Option<ReplyRoute>) {
   let Some(route) = route else {
     return;
   };

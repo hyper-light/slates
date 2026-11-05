@@ -31,6 +31,7 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   edit WORK PATH AT DELETE TEXT [--json]           declare an edit (a splice)
   submit WORK [--evidence HEX] [--json]            submit a work's increment
   rebase WORK [--json]                             rebase a work onto its green's head
+  checkout GREEN VOLUME ATTACHMENT --snapshot N [--json]   write a green's head into the volume it was made from
   advance ATTACHMENT [VERSION] [--json]            re-pin a green attachment (the head when no VERSION)
   read VOLUME PATH [--version N | --attachment A]  a file's bytes at a view (raw bytes)
   write VOLUME ATTACHMENT PATH [--mode OCTAL] [--json]   replace a plain volume's file with stdin's bytes
@@ -345,6 +346,16 @@ pub(crate) enum Verb {
   Rebase {
     /// The work volume.
     work: slates_client::VolumeId,
+  },
+  /// Check a green's head out into the volume and snapshot it was created from, through the caller's write
+  /// attachment of that volume (§4.16 A-201); the volume then lands like any other.
+  Checkout {
+    /// The green.
+    green: slates_client::VolumeId,
+    /// The volume and snapshot the green was created from.
+    base: GreenBase,
+    /// The caller's write attachment of the volume.
+    attachment: u64,
   },
   /// Await a durability scope (`volume placed`).
   Placed {
@@ -1838,6 +1849,27 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
         },
       ))
     }
+    ["checkout", green, base, attachment] => {
+      taken.only(&Spec {
+        values: &["--snapshot"],
+        switches: &[],
+      })?;
+      let Some(snap) = taken.value("--snapshot") else {
+        return Err(ParseError::Missing("--snapshot N"));
+      };
+      Ok(client(
+        &taken,
+        Verb::Checkout {
+          green: volume(green)?,
+          base: GreenBase {
+            volume: volume(base)?,
+            snapshot: snapshot(snap)?,
+          },
+          attachment: number(attachment)?,
+        },
+      ))
+    }
+    ["checkout", ..] => Err(ParseError::Missing("GREEN VOLUME ATTACHMENT --snapshot N")),
     [verb, rest @ ..]
       if matches!(
         *verb,

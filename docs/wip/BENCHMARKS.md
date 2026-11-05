@@ -2154,7 +2154,68 @@ cargo `target/release`, 64 copies each, every heap byte counted), heap bytes an 
 203–250, a 36-entry readdir 479–604 → 510–687, the create burst 1,663–1,697 → 1,765–1,818 ns a file, AC-1.8 destroy
 slices within budget either way, AC-1.5 352,335,998 → 383,350,910 B (the bench's 36-entry directories). Still owed: owed instead: size-classed block slabs (256 B … 4 KiB buffers, each class a slab whose slots are never returned per
 item), a block naming its buffer by class and handle: XFS's progression from in-inode to one block to leaf and node
-forms (Sweeney et al., USENIX 1996) without the global allocator.
+forms (Sweeney et al., USENIX 1996) without the global allocator. Built 2026-11-05 (A-203, "Directory blocks in size
+classes" above): AC-1.5 350,460,030 → 292,914,814 B.
+
+### Directory blocks in size classes (§4.5, AC-1.5, AC-1.8, A-203; 2026-11-05) — adopted
+
+Owed since "Directory blocks against real trees" below. A block is the smallest of 17 classes, 256 B to 4 KiB, four to
+a doubling, that holds its entries. Each class is a list of 64 KiB pages from one slab (`crates/vfs/src/dirblocks.rs`).
+A (1 KiB blocks): main at `21da6e57`. B (classes): `agents/slabs` at `0e16c44a`. Both are release builds of
+`cargo build --release -p slates-vfs --example vfs_bench --example tree_heap` (B's vfs_bench rebuilt at `0e16c44a`).
+Runs are interleaved A B A B…, each run's 1-minute load recorded before it. Apple M5 Max, 18 cores, 128 GB,
+macOS 26.4.1, shared with other agents' builds.
+
+Memory, which no load moves (every run returned the same bytes):
+- AC-1.5 at 10^6 files and 27,842 directories, 46 runs here: A 350,460,030 B in all 23 of its runs (budget
+  366,741,224); B 292,914,814 B in all 23 of its runs (budget 293,620,336). B's 23 include 13 runs of its first build
+  (before the fix below), which holds the same bytes. That is 16.4% less, and under the 4 KiB-block figure of
+  2026-10-05 (352,335,998). The measured directory (36 entries of 49-byte names, 2,644 bytes) is one 3,072-byte block,
+  where it was three 1 KiB leaves and an index. B's budget counts each slab's true slot bytes and the group
+  directories' blocks, which the old block term's slack had hidden.
+- Real trees (`tree_heap`, 64 copies each, every heap byte counted), heap bytes an entry A → B: npm 300 → 260, pip
+  336 → 275, cargo 386 → 293 (13 to 24% less). The 1 KiB block of A-101 had been 332 / 368 / 418 before the inode
+  shrank.
+
+Time, `vfs_bench` best of 10 a row per arm, at loads 11.3 to 21.9 (1-minute average before each run); all ten medians
+in ns, sorted:
+
+| row | A (1 KiB) | B (classes) |
+|---|---|---|
+| lookup one name in a 36-entry dir of a 10^3-file tree | 338 341 343 348 383 411 666 687 687 692 | 223 224 348 348 354 411 567 567 697 708 |
+| same, p99s | 349 354 354 354 421 655 697 708 708 708 | 229 229 354 359 369 421 578 583 708 4,792 |
+| lookup one name in a 36-entry dir of a 10^5-file tree | 343 348 359 395 401 406 562 567 687 692 | 213 354 364 364 401 406 406 665 703 708 |
+| readdir of a 36-entry dir (10^3) | 1,062 1,093 1,229 1,666 1,823 2,125 2,125 2,146 2,187 2,271 | 729 1,062 1,083 1,083 1,250 1,270 1,271 1,567 2,291 2,729 |
+| same, p99s | 2,198 3,042 3,937 4,770 5,000 5,812 6,042 6,833 13,416 14,354 | 2,208 3,000 3,167 3,271 3,459 3,875 4,291 6,562 7,125 17,354 |
+| readdir of a 36-entry dir (10^5) | 1,062 1,083 1,104 1,208 1,250 1,364 1,802 2,104 2,104 2,125 | 666 1,005 1,042 1,062 1,062 1,208 1,218 2,083 2,083 2,198 |
+| create and unlink in a 10^3-file tree | 3,916 3,958 3,958 4,000 4,500 7,584 7,833 7,959 8,000 8,000 | 2,375 2,416 3,875 3,875 3,959 4,625 6,208 6,250 7,213 13,083 |
+| same, p99s | 4,666 4,708 5,167 6,792 7,750 8,666 11,042 14,125 14,709 20,167 | 2,875 4,209 4,667 7,625 7,625 8,750 9,084 11,500 19,390 84,937 |
+| create and unlink in a 10^5-file tree | 3,875 3,916 3,917 4,459 4,583 4,958 6,458 6,542 7,750 7,792 | 2,292 3,791 3,792 3,792 4,291 4,375 4,375 7,375 7,417 7,541 |
+| create burst of 190,000 files, per file (each run's best of 3) | 2,323 2,941 3,268 3,600 3,797 4,502 4,520 4,710 5,744 6,466 | 2,966 3,472 3,609 4,045 4,194 4,248 4,369 5,006 5,915 6,287 |
+| insert and remove, raw tree of 2 | 197 203 205 208 231 234 276 395 403 523 | 247 247 250 255 260 283 481 486 499 520 |
+| insert and remove, raw tree of 8 | 200 200 200 203 231 231 260 395 399 403 | 156 252 255 257 296 359 507 510 520 536 |
+| insert and remove, raw tree of 32 | 351 354 364 369 442 494 708 729 734 750 | 171 177 276 281 286 312 317 562 588 932 |
+| insert and remove, raw tree of 128 | 364 375 380 395 427 494 742 744 750 750 | 323 323 497 541 552 625 1,041 1,041 1,062 1,104 |
+
+Every lookup, readdir and create row is at least as good at its best, and every B p50 and p99 is inside A's spread.
+The burst's best is 28% slower (2,323 → 2,966 ns). Its mid is even (4,150 → 4,221), and B's best is inside A's
+spread. The raw tree probe is 25 to 30% slower at 2 and 4 entries (197 → 247 and 197 → 260 ns), inside A's spread
+(to 523 and 395). That is the two-level reference (page, then slot) on a path of a few dozen instructions. From 8
+entries up it is faster. AC-1.8 (destroy slices) passed in all 23 B runs, no slice past budget. AC-1.3 (snapshot and
+clone independent of size) failed at this load on both arms in both 10-round sets, A 3 and 3 of 10, B 5 and 2 of 10
+(B's first build, then this one), and passed in the rest. Neither
+operation touches a block.
+
+Found on the way and fixed, red test first (`a_name_removed_after_it_was_written_leaves_no_hole`): a fitted block has
+only a few dozen bytes of slack. So a create and unlink of one name, which left the removed name's bytes as a hole,
+compacted the whole block every few rounds. The first B build measured the raw insert and remove at 159 to 333 ns
+best of 13, against A's 119 to 125. The name written last is the lowest in the name area, and its removal now hands
+the bytes back at once.
+
+Not usable, and recorded so it is not repeated: the same binaries on adas-mac-studio-3.local (M4 Max) through
+`kiln run` ran at priority band 4 beside a CI job. `tree_heap` took 143 s of wall time on 3.5 s of CPU, and the
+vfs_bench create burst came out 180 to 280 µs a file on both arms. Only that run's AC-1.5 bytes, identical to the local
+ones, are kept.
 
 ### An idle daemon's cost, and the real workloads again under a TCP-exhausted Docker VM (2026-10-05, afternoon)
 
@@ -7410,6 +7471,100 @@ pages. The same commands, on adacachy (Linux 7.2.9, at load 90 to 218 from other
 - **The placing step now places two pages**, and took 264 to 579 µs, one sample each in debug builds. Not separated from
   the step's other work, as above.
 
+## A full edit and merge: the client's edit through the green's verdict (A-202; 2026-11-04 local, 2026-11-05 UTC)
+
+**The question.** Ada's goal of 2026-11-04: a full edit and merge under 1 ms, preferably under 50 µs. One sample is
+what an agent pays to change a file and learn the green's verdict: the client's `edit` of its work volume (64 bytes
+of a 4 KiB file), then its `submit` through the server's verdict to the reply, over the real rendezvous and rings to
+an in-process daemon (client and server are one binary, `slates`, as they run). Forms: `accept` (the work's base is
+the head: the fast path), `ranged` (the base lags the head by another work's accept on the same file; a disjoint
+range is mapped and swept), `identical` (the lagging work writes the head's own bytes there), `conflict` (it writes
+different bytes there). Every answer is checked against a model of the green (the verdict, the head, the edited
+file read back) and a wrong one ends the run with exit 1 — the harness's first run found
+`docs/bugs/2026-11-04-the-same-edit-from-two-works-was-one-increment.md` that way.
+
+Environment: adas-macbook-pro-2 (Apple M5 Max, 18 cores, 128 GiB, macOS 26.4), shared with other agents' builds:
+load 5 to 11 through every run below, so these numbers are informational; the quiet runs are owed (kiln's Mac
+Studios were unreachable this day; CI runners next). Rust 1.98.1, release, daemon derived for the machine (5 shards),
+client spinning up to 1 ms for its reply.
+
+Command (each arm a saved release binary of `crates/client/examples/merge_bench.rs` at the tree named, folded into
+`edit_merge_bench.rs` on 2026-11-05 with the same forms and output; arms run
+interleaved A B A B A B; each run 3 × 1,000 samples per form and shape, a run stopping at 20 s with at least 200;
+the scripts `ab1.sh`..`ab3.sh` under the agent's scratch, their loop is the line below):
+
+```
+for round in 1 2 3; do for arm in A B; do uptime; ./merge_bench_$arm --quiet-only --files N.. --form F..; done; done
+```
+
+Total (edit + submit), p50 of each run's three runs' medians, then p99, per round:
+
+| Arm (what it adds) | Shape, form | Round 1 | Round 2 | Round 3 |
+|---|---|---|---|---|
+| A: `3f5e8483` (the identity fix only) | 1,000 files, accept | 13.99 ms (p99 17.7 ms) | 14.82 ms (18.3 ms) | 13.93 ms (18.3 ms) |
+| B: the merge record's identities only for holders | 1,000 files, accept | 0.97 ms (1.59 ms) | 0.93 ms (1.63 ms) | 0.99 ms (3.06 ms) |
+| A | 10 files, accept | 209 µs (390 µs) | 210 µs (374 µs) | 117 µs (251 µs) |
+| B | 10 files, accept | 64 µs (174 µs) | 66 µs (316 µs) | 65 µs (178 µs) |
+| A | 1,000 files, conflict | 875 µs (59.8 ms) | 990 µs (58.9 ms) | 915 µs (55.5 ms) |
+| B | 1,000 files, conflict | 903 µs (1.61 ms) | 849 µs (1.12 ms) | 888 µs (1.75 ms) |
+| B | 10,000 files, conflict | 9.62 ms (15.4 ms) | 9.40 ms (16.8 ms) | 8.91 ms (16.1 ms) |
+| C: B + the restricted base, the retention totals | 10,000 files, conflict | 174 µs (715 µs) | 189 µs (2.76 ms) | 187 µs (1.22 ms) |
+| B | 1,000 files, accept | 921 µs (1.19 ms) | 906 µs (1.54 ms) | 907 µs (1.43 ms) |
+| C | 1,000 files, accept | 549 µs (921 µs) | 609 µs (1.49 ms) | 552 µs (902 µs) |
+| C (second A/B, against D) | 10,000 files, accept | 3.32 ms (32.0 ms) | 5.24 ms (8.10 ms) | 4.11 ms (6.69 ms) |
+| D: C + the work as a delta over its base | 10,000 files, accept | 57 µs (196 µs) | 58 µs (180 µs) | 60 µs (166 µs) |
+| C | 10,000 files, conflict | 170 µs (596 µs) | 172 µs (854 µs) | 177 µs (1.88 ms) |
+| D | 10,000 files, conflict | 57 µs (166 µs) | 56 µs (167 µs) | 58 µs (164 µs) |
+| C | 1,000 files, accept | 559 µs (5.44 ms) | 555 µs (907 µs) | 556 µs (945 µs) |
+| D | 1,000 files, accept | 59 µs (216 µs) | 59 µs (199 µs) | 61 µs (179 µs) |
+
+D's p999 at 1,000 and 10,000 files, accept and conflict, was 0.23 to 0.66 ms in every run (max 0.35 ms to 9.7 ms);
+C's and B's were 2 to 74 ms. D, every form, one run each (load 8.6): p50 51 to 69 µs at 10, 1,000 and 10,000 files
+(accept 59/63/60 µs, ranged 68/69/69 µs, identical 58/58/51 µs, conflict 55/58/68 µs), p99 152 to 364 µs, except
+conflict at 10,000 files, p99 1.81 ms in that run and 0.16 to 0.17 ms in the three A/B runs above.
+
+**100,000 files** (the development Mac, 2026-11-05 16:06 to 16:14 UTC, load 7 to 16, the A-202 tree, `edit_merge_bench
+--quiet-only --files 100000 --form accept --form conflict`, 3 × 1,000 samples): accept p50 60 µs, p99 199 µs, p999
+3.2 ms; conflict p50 48 µs, p99 153 µs, p999 0.30 ms. The same as at 10 files: a submit no longer reads what the green
+holds. This machine's derived partition budget holds a 400 MB green; CI's runner's does not (below).
+
+**A quieter machine: CI's macOS runner** (diag run 42052891076, job 127333404829, `macos-26-arm64` image
+20261026.0455.2, 3 cores, the daemon derived 2 shards; load 1.6 to 2.2 for rounds 2 and 3, 8.1 at round 1's start;
+2026-11-05 15:23 to 15:43 UTC). Arms: `main` at `21da6e57` with this harness copied in (base) and `487aee8e` (new),
+interleaved, 3 × 1,000 samples a run (at most 20 s a run: the base's 10,000-file rows stopped at 200 to 280). Total
+p50 per round, base → new:
+
+| Form | 10 files | 1,000 files | 10,000 files |
+|---|---|---|---|
+| accept | 194, 139, 289 µs → 83, 77, 148 µs | 7.30, 6.96, 8.75 ms → 86, 134, 150 µs | 72.5, 73.8, 72.0 ms → 100, 136, 137 µs |
+| ranged | 227, 136, 291 µs → 83, 128, 121 µs | 7.50, 8.18, 8.89 ms → 87, 133, 145 µs | 70.3, 79.4, 70.5 ms → 87, 129, 100 µs |
+| conflict | 109, 82, 139 µs → 60, 128, 128 µs | 993, 737, 734 µs → 69, 110, 130 µs | 4.20, 5.45, 4.73 ms → 115, 131, 65 µs |
+
+New, every form, one more run (15:43 UTC, load 1.7): p50 67 to 137 µs and p99 0.29 to 0.94 ms at 10, 1,000 and
+10,000 files. At 100,000 files of 4 KiB the seed's submit was refused `green_chains at capacity`: a green's durable
+chain lives in its partition's metadata budget, derived from the runner's memory (`crates/server/src/config.rs`), and
+a 400 MB seed exceeds it there; folding old chain entries (checkpointing) is owed in §4.16. The harness now reports such
+a shape as refused at capacity and goes on. Two shards and a spinning client on three cores leave no core spare, which
+is why this runner's medians sit above the development Mac's.
+
+**The head identity holders recompute (A-202; 2026-11-05 UTC, the same box).** The identity became a set hash over the
+green's entries (LtHash16). Kept up to date in every commit (G) against none (F), load 21 to 37, interleaved: accept at
+10 files 44, 60, 51 µs (F) against 78, 91, 101 µs (G), conflicts alike; measured-and-rejected, since only a holder
+reads it. Brought up to date when read (H, built), load 23 to 31: accept at 10 files 31, 53, 56 µs (F) against 62, 50,
+45 µs (H); at 1,000 files 59, 63, 48 µs against 60, 61, 44 µs; dead even. Isolated on that box under that load, a
+4 KiB BLAKE3 took 13 µs and a 2 KiB extendable output 15 µs (a temporary test, 20,000 each).
+
+**What decided it** (`sample` of the shard threads during a run): at 1,000 files, 113 of 120 submit samples were
+`Green::head_identity`, a BLAKE3 of every byte of the green, made for a merge record at `f = 0` and dropped (B); then,
+at 10,000 files, 64 of 88 were `reset_accepted_work`, the work's whole copy of the green made again after every
+accept (D), and the rest the deriver's whole base and the settle's sums (C). Each is O(what the green holds); after
+D a submit's cost follows what it changed.
+
+**What it means.** The required 1 ms holds at p99 at every shape measured on a loaded box; the preferred 50 µs does
+not yet: the median is 51 to 69 µs, of which the edit's round trip is about 17 µs and the submit's about 37 µs at one
+file (the fixed cost, measured before these changes, same box). Owed: the quiet and CI runs, 100,000 files, the
+two-machine path (fs-server's remote client), the head identity at `f > 0` in O(changed), and the fixed cost.
+
 ## Every platform's mount, like for like, quiet and under load (T-4.8; condition 12; 2026-11-01)
 
 Before any optimization of the mounts (step 2 of the VFS and DAX plan), one harness measured slates' host mount beside
@@ -8081,6 +8236,10 @@ What it means:
   measured next (GAPS, the client's per-platform record).
 - The p99 and longer rows here are the load of the shared laptop, not code properties. A quiet machine's record is
   owed; this laptop had no quiet window this day.
+- **Since 2026-11-05** (A-202) the growth a merge showed here is gone: a submit no longer clones, walks or hashes the
+  whole green (BENCHMARKS, "A full edit and merge"). The example now also holds the verdict forms of that section, and
+  its client spins up to 1 ms for a reply where these rows spun 50 µs, so rows from before and after that day are not
+  comparable at their tails.
 
 ## Replication latency: what a cross-node commit costs (§4.8, §4.10; 2026-11-04)
 
@@ -8356,8 +8515,10 @@ and 174,028 responses on arm64 (run 41977769822).
 **Measured and rejected, 2026-11-05: the shard's spin as the cause of the slower hops.** The hypothesis was that the
 receiver's longer gaps let the shard park, so those hops pay a wake. Run 41989038309 (`diag-winfsp-bench-8`) raised the
 receiver arm's spin prior sixteenfold; the estimate moves by 2^-19 to 2^-20 a wake, so the raise held for the run. Nothing
-moved: SetSize loaded 96.1 to 99.0 µs, Open quiet 18.3 to 17.8 µs, Release quiet 14.1 to 14.8 µs. The slower Open, Release
-and loaded SetSize hops are **measured and not explained**.
+moved: SetSize loaded 96.1 to 99.0 µs, Open quiet 18.3 to 17.8 µs, Release quiet 14.1 to 14.8 µs. (Corrected the same day:
+this entry first called the test fair. `spin_before_park_ns` is only 0.15–1.2 µs on these runners, so sixteenfold is a
+window of at most about 18 µs, a weak test. The rejection rests on the idle buckets below, where a shard idle long enough to
+park answers in about 7 µs.) The hops are explained in "The WinFsp receiver's hops explained" below.
 
 ### After A-212: `71cf09ac` against the fix
 
@@ -8563,3 +8724,180 @@ What it means:
 - **Still red:** windows-11-arm's single-client p99 (green in 1 of 3 rounds) and jupiter's (80–252 µs). Windows'
   parked p50 is 154–700 µs. The periodic acknowledgement's scatter is the next lever on the single-client tail
   (GAPS). Sending it unawaited (a6c3bc16) stalled 2 of 4 parked forms, and it was reverted.
+
+## The WinFsp receiver's hops explained, and the reply spin (A-212; 2026-11-05)
+
+The slower hops above were timed stage by stage on both arms (diagnostics run 42047111024, `diag-winfsp-bench-9` over
+`diag-winfsp-bench-old-2`, arm64, 3 rounds a pass, quiet and loaded apart; instrumented, so for attribution only). p50, µs, DLL
+then receiver:
+
+| Stage | Quiet Release | Quiet Open | Quiet Flush | Loaded SetSize |
+|---|---|---|---|---|
+| Whole hop | 6.3, 15.7 | 12.2, 18.6 | 18.2, 19.4 | 29.1, 110.3 |
+| Queue, sent to taken | 2.6, 2.5 | 1.8, 1.9 | 2.4, 3.1 | 6.0, 20.6 |
+| Service | 0.6, 1.2 | 1.8, 2.7 | 0.2, 0.4 | 3.3, 3.8 |
+| Publish barrier | none, 1.4 | none, 1.1 | 3.6, 3.3 | 3.6, 5.0 |
+| Reply into its channel | 0.9, 4.0 | 3.9, 4.7 | 3.8, 4.7 | 6.2, 6.1 |
+| Reply sent to the thread having it | 1.0, 7.7 | 5.9, 10.3 | 9.7, 10.4 | 8.2, 9.2 |
+
+**Open and Release: the waiting thread parks.** A-198 made opens and closes publish, about 1 µs, and that stays: it is what
+makes them survive a kill. It costs more than itself because it pushes the reply past the spin inside `std`'s `recv`, so the
+thread parks and must be woken. Flush publishes on both arms and shows no jump. Run 42049771150 (`diag-winfsp-bench-10`, one
+run, instrumented) tested it: the same receiver on both arms, one spinning 20 µs on each reply before parking. Quiet: reply
+wake for an open 10.3 to 0.4 µs; hops for an open 18.4 to 8.0 µs, a release 15.3 to 7.8 µs, a flush 19.4 to 10.1 µs.
+
+**Kept: the reply spin.** `crates/bridge-winfsp/src/reply.rs`: the receive thread spins for as long as a wake costs and then
+parks, the 2-competitive rule the shards use (§4.3). The window is the median of 15 one-way wakes through the same kind of
+channel, timed on that thread as it starts, because the profile's `wake.mean_ns` is far below this wake's cost. It measured
+5.4–10.0 µs on arm64 and 3.8–11.3 µs on x86_64 across these runs, and each run's daemon logs its own.
+
+Diagnostics run 42052991563 (`diag-winfsp-bench-11`, new arm `3b7b6f55`, old arm `c0c8d28c`), 2026-11-05 15:32–16:20 UTC on arm64,
+15:30–15:53 UTC on x86_64, with the hardware and the command above but `OLD_NAME=parks NEW_NAME=spins`. Five runs each, none
+failed and no heartbeat lapsed. The live oracles ran first and passed on both: 73 of 73 bridge tests and 13 of 13 CLI mount
+tests. Each cell lists runs 1 to 5.
+
+Arm64:
+
+**quiet** (runs 1, 2, 3, 4, 5; parks / spins; µs)
+
+| op | p50, parks | p50, spins | p50 ratio (medians) | p99, parks | p99, spins |
+|---|---|---|---|---|---|
+| create | 238.6, 218.2, 245.6, 261.0, 235.9 | 240.9, 213.6, 234.9, 255.5, 222.3 | 0.98× | 365.8, 312.0, 398.3, 360.8, 494.6 | 530.0, 374.6, 354.2, 374.9, 335.6 |
+| write | 109.5, 102.3, 109.0, 112.4, 106.9 | 103.7, 97.0, 101.5, 102.3, 101.6 | 0.93× | 239.3, 221.7, 238.5, 244.9, 237.5 | 244.0, 235.8, 236.0, 241.3, 235.3 |
+| fsync | 143.0, 139.0, 143.0, 143.7, 140.8 | 129.6, 125.9, 125.6, 124.3, 129.5 | 0.88× | 194.8, 191.0, 200.0, 197.5, 196.9 | 199.4, 202.8, 198.8, 191.5, 198.6 |
+| close | 4429.0, 4061.2, 4476.6, 4666.2, 4315.2 | 4556.4, 4185.7, 4552.4, 4776.0, 4448.1 | 1.03× | 15211.3, 5992.1, 8592.3, 6663.5, 6960.9 | 7403.5, 6628.4, 6536.7, 6881.8, 6692.6 |
+| stat | 175.9, 184.5, 184.0, 188.2, 175.6 | 165.6, 160.1, 163.4, 165.5, 159.1 | 0.89× | 255.1, 269.3, 270.9, 269.5, 259.0 | 247.2, 240.2, 250.5, 248.7, 245.8 |
+| open | 4090.2, 3833.7, 4059.6, 4340.8, 3812.4 | 4363.0, 3841.0, 4232.5, 4421.1, 4106.5 | 1.04× | 5621.2, 5386.6, 5705.0, 5761.5, 5620.8 | 6011.4, 5547.0, 5917.2, 5815.3, 5922.5 |
+| read | 49.7, 47.1, 51.4, 56.3, 47.4 | 51.0, 44.3, 50.9, 57.4, 48.2 | 1.02× | 81.4, 75.3, 87.3, 83.4, 78.5 | 82.2, 79.6, 82.8, 85.9, 83.3 |
+| rename | 548.1, 533.7, 555.3, 553.0, 544.0 | 496.7, 474.7, 495.1, 498.4, 488.6 | 0.90× | 1337.9, 1337.0, 1380.1, 1390.4, 1370.6 | 1271.6, 1040.5, 1251.2, 1242.4, 1206.2 |
+| unlink | 316.6, 309.8, 313.9, 321.8, 310.3 | 297.2, 289.9, 300.7, 301.5, 298.6 | 0.95× | 559.5, 509.1, 550.7, 600.4, 545.4 | 558.3, 493.8, 522.6, 595.0, 566.8 |
+
+p999 and max per run:
+
+| op | p999, parks | p999, spins | max, parks | max, spins |
+|---|---|---|---|---|
+| create | 4189.0, 1044.3, 16183.7, 6347.0, 1312.8 | 3104.5, 1886.6, 1041.5, 16125.8, 3824.2 | 17912.1, 17663.7, 17922.4, 17983.6, 17427.6 | 17933.7, 17647.5, 3460.7, 17925.6, 17909.7 |
+| write | 610.4, 559.6, 529.7, 731.4, 1072.3 | 758.2, 1057.1, 567.8, 547.3, 623.4 | 16260.2, 3588.1, 9782.4, 11734.3, 17147.8 | 3710.2, 5515.5, 4055.9, 17643.3, 6930.0 |
+| fsync | 480.2, 421.1, 641.8, 615.5, 544.3 | 920.3, 1133.6, 637.0, 600.5, 556.2 | 17388.0, 1058.7, 17537.6, 18934.7, 5243.4 | 17717.5, 3033.1, 12195.4, 17704.3, 17607.2 |
+| close | 17541.0, 17495.0, 18103.0, 17439.9, 19238.8 | 17493.4, 18279.5, 17496.4, 17884.9, 17476.1 | 23673.0, 20743.6, 23902.6, 37295.6, 22460.6 | 25218.5, 101153.0, 22199.4, 21587.6, 34376.6 |
+| stat | 746.9, 857.4, 618.3, 625.7, 658.8 | 570.8, 628.0, 592.5, 632.4, 622.9 | 21673.1, 16792.8, 4073.6, 5399.6, 18360.6 | 1089.9, 13492.3, 13851.8, 11916.8, 14628.0 |
+| open | 12035.7, 11457.7, 13601.1, 8994.2, 7992.8 | 11364.5, 7393.7, 22508.5, 8530.2, 11171.9 | 177545.9, 86904.5, 103337.8, 103808.3, 106847.9 | 104392.2, 118389.7, 111910.2, 107298.3, 107302.5 |
+| read | 147.2, 146.1, 157.5, 163.4, 132.5 | 152.5, 121.1, 156.6, 164.7, 162.6 | 988.0, 5446.1, 190.7, 1051.6, 177.5 | 320.7, 172.9, 199.6, 179.1, 1377.4 |
+| rename | 2179.8, 2384.6, 2080.4, 2253.3, 2877.8 | 3208.2, 2551.5, 2347.9, 2026.6, 2213.7 | 83597.8, 19568.4, 83693.2, 145303.4, 83890.8 | 84004.8, 63316.2, 21788.3, 145430.6, 83696.5 |
+| unlink | 3675.1, 3712.9, 1756.3, 1677.7, 1267.2 | 1774.2, 2506.9, 1962.3, 2307.7, 14302.2 | 124912.2, 166062.9, 126349.8, 124203.1, 63557.1 | 84325.5, 124948.4, 186141.8, 165252.1, 146413.8 |
+
+**contended** (runs 1, 2, 3, 4, 5; parks / spins; µs)
+
+| op | p50, parks | p50, spins | p50 ratio (medians) | p99, parks | p99, spins |
+|---|---|---|---|---|---|
+| create | 226.7, 247.2, 259.8, 265.7, 235.2 | 225.1, 242.4, 255.9, 262.1, 233.7 | 0.98× | 792.8, 965.8, 1001.0, 1866.3, 1016.5 | 858.2, 884.5, 1130.6, 991.3, 965.0 |
+| write | 206.2, 214.9, 219.0, 223.8, 206.6 | 211.6, 218.2, 223.2, 229.6, 215.0 | 1.02× | 2243.4, 732.3, 3165.4, 2282.7, 2122.9 | 5764.0, 6304.1, 10010.6, 10997.6, 6309.0 |
+| fsync | 126.2, 130.4, 132.4, 132.8, 126.2 | 124.0, 127.6, 126.3, 126.1, 124.2 | 0.97× | 287.4, 308.9, 295.7, 373.0, 368.5 | 375.9, 353.1, 342.8, 651.8, 294.6 |
+| close | 4827.4, 5201.2, 5339.7, 5488.2, 4907.7 | 5023.9, 5273.1, 5486.3, 5612.7, 5199.4 | 1.01× | 38134.4, 39747.5, 42998.8, 40845.4, 38139.8 | 39250.4, 39428.8, 40111.3, 39540.7, 39393.4 |
+| stat | 195.2, 192.0, 192.5, 195.1, 193.7 | 164.9, 167.7, 165.3, 165.1, 165.5 | 0.85× | 15304.9, 10533.1, 16478.9, 14361.4, 15236.2 | 13271.4, 3737.2, 713.7, 758.9, 6680.1 |
+| open | 3971.9, 4256.7, 4393.9, 4518.1, 4049.6 | 4174.0, 4318.4, 4494.0, 4597.7, 4332.8 | 1.02× | 37669.8, 39561.1, 40313.5, 41185.8, 35239.4 | 41123.0, 39830.4, 40832.2, 40466.5, 39411.0 |
+| read | 51.9, 57.8, 60.0, 62.1, 52.7 | 53.5, 56.8, 60.2, 63.0, 55.6 | 0.98× | 92.7, 104.1, 99.5, 100.8, 101.5 | 97.9, 96.6, 101.2, 100.4, 92.9 |
+| rename | 482.7, 489.2, 493.9, 497.3, 482.6 | 556.8, 563.6, 593.6, 610.1, 559.5 | 1.15× | 30673.2, 33373.3, 34070.4, 34393.4, 30634.7 | 35338.7, 36039.6, 37262.4, 38029.1, 35405.3 |
+| unlink | 342.2, 347.3, 350.9, 354.0, 343.5 | 345.1, 346.0, 361.3, 364.4, 348.0 | 1.00× | 23988.2, 28178.4, 27825.5, 27976.2, 26902.3 | 23903.2, 30201.8, 28795.8, 30126.4, 29426.9 |
+
+p999 and max per run:
+
+| op | p999, parks | p999, spins | max, parks | max, spins |
+|---|---|---|---|---|
+| create | 33653.2, 34502.3, 34265.6, 35208.7, 41231.1 | 33277.3, 34480.5, 34102.7, 35483.3, 38958.2 | 62622.6, 49738.3, 50267.7, 52943.6, 59085.7 | 42626.3, 43056.6, 53605.5, 62120.0, 51213.0 |
+| write | 32516.6, 25870.1, 32427.6, 28934.5, 33375.3 | 33148.4, 36703.8, 33931.8, 34742.1, 33887.0 | 53400.8, 51935.4, 40625.5, 51122.1, 48720.6 | 61708.7, 102974.8, 58035.9, 59707.0, 52679.1 |
+| fsync | 33309.3, 28741.8, 37660.8, 32527.9, 32803.1 | 34050.3, 35046.6, 31597.4, 35232.7, 33736.2 | 60917.4, 60567.0, 55486.3, 59518.0, 56281.3 | 59323.6, 68563.0, 70941.6, 58127.9, 51518.1 |
+| close | 57555.0, 66997.8, 64921.1, 65572.0, 56607.8 | 60242.5, 55911.9, 61627.6, 61380.1, 60601.8 | 104117.6, 111977.3, 93040.9, 119879.3, 109277.9 | 246409.4, 87261.7, 82781.5, 91428.6, 92959.6 |
+| stat | 48814.6, 41633.2, 42263.6, 42999.7, 44677.5 | 37953.6, 42478.9, 43543.4, 40074.2, 48633.7 | 83520.7, 70959.3, 130311.3, 86592.3, 81901.5 | 68681.5, 108677.0, 54614.1, 53402.0, 115899.3 |
+| open | 71223.4, 100469.3, 86136.5, 111003.2, 71442.3 | 87665.2, 116303.3, 128703.8, 114683.8, 88842.2 | 201506.8, 258092.4, 253202.5, 320611.2, 225163.6 | 283324.5, 197364.0, 247095.4, 317913.7, 204291.4 |
+| read | 151.3, 169.5, 168.2, 190.1, 169.1 | 173.3, 181.0, 172.8, 177.9, 177.1 | 195.8, 237.8, 1157.3, 286.2, 1586.8 | 408.9, 1244.0, 321.1, 258.5, 1478.4 |
+| rename | 69014.5, 72579.7, 72997.5, 81170.3, 67221.4 | 76613.4, 67615.0, 84416.1, 81931.9, 67066.3 | 334448.9, 138948.6, 224232.4, 196450.4, 112390.5 | 154862.9, 129472.1, 151786.1, 173618.0, 349147.2 |
+| unlink | 103200.7, 118679.9, 111919.4, 130268.8, 105170.3 | 67870.5, 88886.6, 96351.7, 124224.6, 141837.4 | 281409.8, 325182.9, 432760.4, 549498.9, 405888.2 | 357307.2, 305416.7, 283301.9, 586184.7, 268253.8 |
+
+x86_64:
+
+**quiet** (runs 1, 2, 3, 4, 5; parks / spins; µs)
+
+| op | p50, parks | p50, spins | p50 ratio (medians) | p99, parks | p99, spins |
+|---|---|---|---|---|---|
+| create | 674.5, 643.8, 674.1, 647.0, 678.1 | 687.9, 687.4, 622.7, 642.7, 695.4 | 1.02× | 1455.0, 1263.0, 1212.6, 1239.0, 1210.0 | 1280.9, 1302.0, 1255.4, 1468.8, 1287.7 |
+| write | 65.5, 64.0, 69.7, 64.3, 71.0 | 80.1, 80.3, 57.5, 66.0, 87.4 | 1.22× | 316.0, 285.6, 270.9, 283.7, 289.1 | 289.0, 425.9, 313.0, 380.3, 402.4 |
+| fsync | 95.2, 91.2, 99.5, 91.6, 100.5 | 86.0, 83.2, 80.7, 89.8, 94.2 | 0.90× | 347.4, 189.5, 226.7, 212.6, 231.5 | 185.8, 218.5, 190.5, 365.5, 359.9 |
+| close | 41.2, 41.1, 41.7, 41.2, 45.7 | 42.0, 41.7, 41.0, 41.6, 41.8 | 1.01× | 339.7, 395.6, 373.4, 344.8, 372.0 | 373.8, 492.7, 449.0, 419.9, 434.6 |
+| stat | 166.4, 165.6, 173.1, 171.0, 172.5 | 164.9, 168.9, 163.1, 173.3, 183.8 | 0.99× | 394.7, 560.3, 596.2, 716.1, 518.9 | 481.1, 805.2, 864.0, 743.5, 277.6 |
+| open | 130.5, 113.6, 119.7, 112.7, 123.1 | 125.6, 130.3, 100.6, 106.5, 122.6 | 1.02× | 396.1, 197.5, 214.7, 191.8, 209.0 | 230.6, 200.4, 758.1, 215.1, 190.8 |
+| read | 9.6, 9.6, 9.7, 9.5, 9.6 | 31.7, 36.5, 9.1, 9.6, 11.2 | 1.17× | 185.9, 86.6, 97.3, 83.8, 98.6 | 132.2, 107.5, 72.3, 88.6, 108.2 |
+| rename | 352.5, 353.8, 369.7, 348.8, 372.2 | 377.5, 361.3, 326.1, 338.3, 401.3 | 1.02× | 561.4, 565.6, 575.7, 578.3, 619.7 | 784.1, 548.0, 539.7, 534.8, 608.1 |
+| unlink | 223.9, 223.4, 225.9, 222.4, 227.0 | 218.6, 204.5, 186.4, 202.9, 223.6 | 0.91× | 531.9, 582.7, 603.9, 550.4, 574.1 | 562.5, 584.8, 494.7, 516.6, 559.9 |
+
+p999 and max per run:
+
+| op | p999, parks | p999, spins | max, parks | max, spins |
+|---|---|---|---|---|
+| create | 13356.6, 30120.1, 2939.3, 12608.0, 3004.3 | 5321.2, 5781.9, 8961.8, 15548.2, 15344.6 | 45417.0, 55754.4, 30622.1, 67613.9, 30542.6 | 30074.9, 33706.8, 36699.9, 30704.4, 56271.3 |
+| write | 700.1, 846.6, 827.1, 722.1, 669.3 | 666.7, 873.2, 851.6, 707.6, 707.9 | 33192.6, 32187.7, 30163.4, 29427.7, 16988.1 | 18096.9, 2108.3, 33285.8, 10636.3, 29232.8 |
+| fsync | 640.4, 881.5, 824.9, 768.5, 666.4 | 628.5, 874.8, 842.9, 721.0, 696.0 | 23732.9, 33288.3, 2705.5, 34951.5, 29416.9 | 29352.7, 29661.4, 17486.0, 29360.9, 25485.8 |
+| close | 622.4, 833.4, 791.5, 805.7, 663.0 | 615.8, 879.0, 812.8, 671.7, 678.5 | 1142.5, 4268.1, 862.3, 29250.5, 7333.4 | 1184.4, 968.3, 29372.5, 880.0, 29225.8 |
+| stat | 4994.4, 982.2, 1116.0, 931.5, 835.3 | 1471.1, 1962.4, 1014.8, 1022.0, 771.6 | 66395.2, 64011.7, 47989.4, 36543.8, 41596.3 | 34198.2, 43585.6, 29750.8, 32250.8, 35316.5 |
+| open | 1639.0, 580.1, 554.7, 1034.1, 538.5 | 560.9, 538.8, 6123.0, 911.4, 510.3 | 32909.7, 33073.0, 20102.5, 33266.5, 29469.6 | 29327.2, 29557.0, 18018.5, 29505.1, 18593.3 |
+| read | 383.8, 207.3, 169.2, 221.3, 174.2 | 307.7, 253.7, 177.8, 280.2, 160.4 | 31949.4, 33193.7, 701.0, 29577.1, 29247.9 | 29450.1, 893.9, 13322.8, 13296.6, 661.4 |
+| rename | 985.2, 993.4, 938.6, 978.9, 1097.8 | 1112.4, 935.5, 2266.5, 906.7, 1155.0 | 30085.7, 31108.2, 30089.2, 32044.3, 29817.9 | 29910.6, 30539.6, 33772.1, 31276.0, 29893.3 |
+| unlink | 716.8, 743.3, 829.3, 721.2, 1068.4 | 1132.0, 783.8, 645.7, 627.5, 778.3 | 29396.4, 29656.4, 30391.1, 15223.1, 29899.3 | 56050.4, 28374.7, 15864.5, 1769.1, 29538.4 |
+
+**contended** (runs 1, 2, 3, 4, 5; parks / spins; µs)
+
+| op | p50, parks | p50, spins | p50 ratio (medians) | p99, parks | p99, spins |
+|---|---|---|---|---|---|
+| create | 1142.4, 1011.5, 1013.2, 1002.5, 1005.0 | 1140.5, 1083.2, 933.8, 988.8, 970.3 | 0.98× | 132542.9, 60145.3, 64594.3, 64995.4, 65963.5 | 144887.9, 134030.1, 62089.8, 57914.5, 83397.5 |
+| write | 85.1, 83.4, 83.2, 81.9, 82.0 | 76.9, 73.3, 69.5, 80.0, 68.9 | 0.88× | 707.9, 213.5, 232.3, 204.7, 191.1 | 23852.6, 24725.4, 227.5, 206.7, 234.5 |
+| fsync | 126.7, 124.4, 124.6, 123.5, 124.5 | 112.8, 99.2, 96.4, 111.7, 96.6 | 0.80× | 10567.3, 231.8, 224.0, 229.5, 221.6 | 32530.6, 32663.6, 188.8, 209.4, 229.5 |
+| close | 62.8, 62.6, 62.3, 62.0, 62.3 | 52.9, 51.5, 50.7, 50.9, 50.5 | 0.82× | 116.5, 130.2, 117.7, 120.6, 119.9 | 460.4, 160.4, 107.8, 109.4, 113.8 |
+| stat | 254.2, 256.6, 253.7, 257.3, 256.4 | 213.8, 194.6, 197.5, 215.1, 195.2 | 0.77× | 482.5, 603.9, 499.5, 753.2, 598.2 | 517.5, 483.6, 519.1, 496.5, 354.6 |
+| open | 186.6, 186.5, 184.8, 185.2, 185.2 | 168.9, 153.3, 152.6, 170.0, 151.4 | 0.83× | 25358.3, 411.8, 344.0, 321.9, 358.5 | 32552.1, 32619.7, 375.3, 325.1, 293.1 |
+| read | 85.9, 85.6, 85.1, 84.5, 84.4 | 73.1, 71.7, 71.7, 82.0, 70.9 | 0.84× | 164.4, 186.5, 169.8, 147.7, 156.1 | 163.9, 166.7, 163.2, 145.2, 148.7 |
+| rename | 607.1, 618.8, 614.2, 611.7, 615.1 | 508.7, 473.6, 472.4, 541.5, 471.2 | 0.77× | 33141.5, 32962.2, 33311.0, 32680.9, 32959.0 | 32530.4, 31884.3, 32639.8, 32283.0, 31732.1 |
+| unlink | 334.3, 349.8, 340.0, 341.6, 343.0 | 308.0, 293.0, 309.2, 323.3, 297.9 | 0.90× | 1398.2, 1535.1, 1519.9, 1425.5, 1411.8 | 1432.0, 1352.7, 1538.0, 1409.3, 1829.7 |
+
+p999 and max per run:
+
+| op | p999, parks | p999, spins | max, parks | max, spins |
+|---|---|---|---|---|
+| create | 202019.0, 135682.0, 152902.4, 146670.4, 162192.4 | 215805.3, 207993.7, 140531.0, 131876.9, 159574.7 | 286202.2, 167309.1, 250212.9, 200641.9, 274742.8 | 307580.2, 349299.5, 216986.1, 197292.2, 281372.3 |
+| write | 65442.7, 38832.8, 65430.8, 37983.0, 32082.5 | 65384.9, 66070.8, 41975.8, 58757.0, 52754.9 | 111277.7, 92208.4, 129669.5, 109576.1, 98643.3 | 113375.9, 114486.5, 77393.5, 101425.4, 127820.0 |
+| fsync | 65459.4, 47555.4, 67338.3, 65948.3, 61281.8 | 101275.8, 101038.2, 57538.3, 65620.9, 85981.9 | 144615.4, 111833.1, 164513.5, 147994.5, 151336.1 | 151807.8, 193422.8, 173768.1, 127457.6, 198650.6 |
+| close | 31660.8, 31686.8, 21439.5, 5397.6, 32453.7 | 65143.2, 63642.7, 19681.2, 861.1, 2683.9 | 100164.4, 72985.6, 109351.9, 145074.2, 123217.7 | 99611.7, 136796.4, 140439.5, 130932.3, 84310.2 |
+| stat | 97597.0, 74386.3, 89849.7, 82873.6, 66425.9 | 84672.1, 65845.0, 81421.9, 96403.8, 72990.7 | 131476.5, 170139.6, 163899.1, 113678.6, 130633.5 | 185765.2, 136493.8, 223103.4, 164111.2, 131812.8 |
+| open | 72490.2, 66472.3, 65619.9, 67255.1, 65587.2 | 83965.5, 93787.1, 60547.9, 68627.2, 63342.5 | 133495.6, 121439.5, 208519.0, 133906.6, 148766.7 | 127152.7, 142675.3, 122299.8, 124440.5, 121985.1 |
+| read | 32466.5, 52356.6, 25168.5, 50044.2, 32195.3 | 34111.1, 65313.3, 56948.2, 32739.9, 57271.5 | 121694.5, 145425.6, 122002.8, 129930.2, 91463.9 | 93075.2, 115716.6, 124358.0, 129185.2, 101306.3 |
+| rename | 113414.4, 106398.9, 100612.1, 101411.7, 97795.8 | 98943.1, 124871.5, 107962.5, 112872.9, 99236.4 | 171113.1, 160631.4, 164002.2, 227322.6, 196919.2 | 185062.4, 212279.1, 170469.6, 158470.0, 186204.2 |
+| unlink | 167817.8, 104222.5, 116133.5, 93632.4, 99062.0 | 97594.7, 97486.8, 97699.9, 105727.5, 97530.7 | 364734.0, 284941.7, 323851.5, 428197.3, 496870.5 | 184009.7, 249610.6, 209067.1, 481003.1, 205986.0 |
+
+**What it bought and cost.** Arm64 quiet p50: an fsync 139–144 to 124–130 µs (0.88×), a stat 176–188 to 159–166 µs (0.89×), a
+rename 534–555 to 475–498 µs (0.90×), a write 0.93×, an unlink 0.95×. x86_64 loaded p50, ranges apart: a rename 607–619 to
+471–542 µs (0.77×), a stat 254–257 to 195–215 µs (0.77×), an fsync 0.80×, a close 0.82×, an open 0.83×, a read 0.84×, a write
+0.88×, an unlink 0.90×. Costs, kept in view: **arm64's loaded rename rose 1.15×** (483–497 to 557–610 µs, ranges apart), and its
+loaded write p99 rose from 0.7–3.2 ms to 5.8–11.0 ms; x86_64's loaded fsync and open p99 reached 32 ms in two of five runs where
+parking's reached 10.6–25 ms in one. x86_64's quiet write and read are bimodal between runs (a read 9.1–11.2 µs in three and 32–37
+µs in two; parking's stayed at 9.5–9.7 µs), and their cause is not known. Arm64's loaded stat p99 fell from 10.5–16.5 ms to
+0.7–13.3 ms.
+
+**Loaded SetSize: the shard is preempted just after it answers.** Run 42049771150's idle buckets split the queue wait by how long
+the shard had been idle when the request was sent. Arm64 loaded p50: under 20 µs, 89 µs for SetSize; 50–200 µs, 6.9 µs. A shard
+long idle wakes fast; one that has just answered does not. Run 42059294312 (`diag-winfsp-bench-12`, arm64, one run of 3 rounds,
+instrumented) raised one arm's shard threads to `THREAD_PRIORITY_ABOVE_NORMAL`, the other's left normal, both with the spin:
+
+| Loaded, p50, µs | Normal | Above normal |
+|---|---|---|
+| SetSize hop | 67.6 | 15.7 |
+| SetSize queue | 40.9 | 4.8 |
+| Confirm hop | 32.7 | 5.2 |
+| Confirm queue | 28.0 | 1.9 |
+| Release hop | 18.7 | 7.5 |
+| A write | 238.2 | 100.2 |
+| A close | 8,070.8 | 4,399.8 |
+| A rename | 776.5 | 561.7 |
+
+That names the cause: SetSize is the first request after an open's Confirm, so on the receiver it lands in that window, which on
+the DLL arm it mostly missed. **It is not yet a measured gain:** the two arms share the machine, so the raised arm takes CPU from
+the other and this table flatters it. It needs arms run apart, and it is a whole-daemon change, so it has not been made.
+
