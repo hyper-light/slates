@@ -124,9 +124,9 @@ impl RuntimeConfig {
       pin: !cores.is_empty(),
       cores,
       page_bytes: usize::try_from(profile.facts.page.base).unwrap_or(1),
-      spin_ns: d.spin_before_park_ns.get(),
+      spin_ns: d.spin_before_park_ns.get().saturating_mul(16), // DIAG: is the wake the cost?
       wake_tracking: Some(WakeTracking {
-        prior_ns: d.spin_before_park_ns.get(),
+        prior_ns: d.spin_before_park_ns.get().saturating_mul(16),
         shift: profile.wake.estimate_shift(),
         idle_ratio: 1,
       }),
