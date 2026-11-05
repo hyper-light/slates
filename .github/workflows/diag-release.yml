@@ -1,0 +1,148 @@
+# DIAG, not for main: release.yml's guard and build matrix on a diag-release-* branch, without the release job.
+# The binary release (Appendix B.2; AC-9.5; docs/publish.md "The binary release"). One `slates` binary serves as the
+# anchor, the daemon and every client verb, so a release is one raw binary per platform, built natively on that
+# platform, started there before it is attached, and described by checksums and signed build provenance:
+#
+#   1. `guard` — the shared version guard: the tag must be `v` + the workspace version (a release) or that + `-test.N`
+#      (a test of this lane; `cargo xtask version --allow-test-tag`). The SDK publish lanes never start on a test tag.
+#   2. `build` — each target natively on its own runner: macOS arm64, Linux x86_64 and arm64 (glibc, and static musl
+#      inside the official rust:alpine image), Windows x86_64 and arm64 with the C runtime linked statically. Then
+#      `cargo xtask release-smoke` runs the built bytes as a person installing them would (the binary names its
+#      version, the anchor starts and its daemon serves, a volume provisions, a file round-trips through one client and
+#      reads back through another, the daemon leaves with its anchor) and records their digests and each step's time.
+#      The musl binaries must be static; the Windows x86_64 binary must start in Nano Server, which has no Visual C++
+#      runtime.
+#   3. `release` (tags only) — `cargo xtask release-artifacts` refuses a release missing a target or carrying bytes no
+#      smoke test ran, and writes SHA256SUMS, slates-provenance.json and the notes; GitHub's artifact attestation signs
+#      SLSA build provenance for every binary (Sigstore, through this job's OIDC identity: no key or secret exists); and
+#      the binaries, the checksums, the provenance and the attestation bundle are attached to a DRAFT release.
+#
+# Nothing here publishes. A draft is visible only to the repository's maintainers until one of them publishes it
+# (`gh release edit vX.Y.Z --draft=false`, or "Publish release" on the draft) — that is the one approved step. A test
+# tag's draft is a pre-release titled as a test, and is never published.
+#
+# workflow_dispatch runs guard and build as a dry run (no tag, so no release job).
+name: DIAG release lane (not for main)
+
+on:
+  push:
+    branches: ["diag-release-*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  guard:
+    uses: ./.github/workflows/version-guard.yml
+    with:
+      allow-test-tag: true
+
+  build:
+    name: ${{ matrix.asset }}
+    needs: [guard]
+    strategy:
+      fail-fast: false
+      matrix:
+        # The asset names are `ASSETS` in xtask/src/release.rs; `release-artifacts` refuses a release that lacks one.
+        include:
+          # macOS is smoke-tested natively on the supervisor's Mac; the macOS queue is backed up (supervisor, 2026-11-05).
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-latest, asset: slates-linux-x64 }
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, asset: slates-linux-arm64 }
+          - { target: x86_64-unknown-linux-musl, runner: ubuntu-latest, asset: slates-linux-x64-musl, musl: true }
+          - { target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm, asset: slates-linux-arm64-musl, musl: true }
+          # windows-2025, not windows-latest: Nano Server ltsc2025 runs process-isolated only on a 2025 host.
+          - { target: x86_64-pc-windows-msvc, runner: windows-2025, asset: slates-windows-x64.exe, windows: true, nasm: true }
+          # Native arm64 Windows (GitHub's windows-11-arm image), where aws-lc-sys builds with clang-cl.
+          - { target: aarch64-pc-windows-msvc, runner: windows-11-arm, asset: slates-windows-arm64.exe, windows: true, clang_cl: true }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      # AWS-LC's Windows x86 assembly is built from its NASM source, never the prebuilt objects (ignored elsewhere).
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install NASM
+        if: ${{ matrix.nasm }}
+        uses: ilammy/setup-nasm@v1.5.2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+          targets: ${{ matrix.target }}
+      # As CI's windows-arm64 lane: aws-lc-sys refuses cl.exe for aarch64-pc-windows-msvc and builds with clang-cl.
+      - name: clang-cl for the C the binary links (arm64 Windows)
+        if: ${{ matrix.clang_cl }}
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          & $clang --version
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Build (macOS, Linux glibc)
+        if: ${{ !matrix.musl && !matrix.windows }}
+        run: cargo build --release --locked -p slates-cli --target ${{ matrix.target }}
+      # The C runtime linked statically: Windows does not ship vcruntime140.dll and Nano Server and Server Core lack it,
+      # where a dynamically linked slates.exe exits 0xC0000135 before any code runs (GAPS, CI run 40580524733).
+      - name: Build (Windows, the C runtime linked statically)
+        if: ${{ matrix.windows }}
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --release --locked -p slates-cli --target ${{ matrix.target }}
+      # musl builds inside the official rust:alpine image, native per arch, +crt-static for the binary (the workspace's
+      # -crt-static in .cargo/config.toml is for cdylibs; RUSTFLAGS outranks it). `docker run`, not `container:`, so the
+      # checkout and the uploads stay on the host (Appendix B.2).
+      - name: Build (musl, in the rust:1.98.1-alpine image)
+        if: ${{ matrix.musl }}
+        run: |
+          docker run --rm -v "$PWD":/work -w /work rust:1.98.1-alpine sh -c '
+            apk add --no-cache build-base &&
+            RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --locked -p slates-cli --target ${{ matrix.target }}'
+          sudo chown -R "$(id -u):$(id -g)" target
+      - name: Stage the binary
+        shell: bash
+        run: |
+          mkdir -p dist records
+          suffix=""
+          if [ "${{ matrix.windows }}" = "true" ]; then suffix=".exe"; fi
+          cp "target/${{ matrix.target }}/release/slates$suffix" "dist/${{ matrix.asset }}"
+          ls -l dist
+      # A static binary is what lets one file run on every Linux. glibc's ldd says "not a dynamic executable" for a
+      # classic static binary (aarch64) and "statically linked" for a static PIE (x86_64 since rustc 1.85).
+      - name: The musl binary is static
+        if: ${{ matrix.musl }}
+        run: |
+          answer="$(ldd "dist/${{ matrix.asset }}" 2>&1 || true)"
+          echo "ldd: $answer"
+          case "$answer" in
+            *"not a dynamic executable"*|*"statically linked"*) ;;
+            *) echo "dist/${{ matrix.asset }} is not static"; exit 1 ;;
+          esac
+      - name: Smoke test (the binary starts, a volume provisions, a file round-trips)
+        timeout-minutes: 30
+        run: >-
+          cargo xtask release-smoke --binary dist/${{ matrix.asset }} --target ${{ matrix.target }}
+          --record records/${{ matrix.asset }}.record.json
+      # Nano Server has no Visual C++ runtime, so a binary that starts there carries its C runtime (GAPS, "The Windows
+      # binary needs the Visual C++ runtime"). Process isolation needs a host of the image's own build: windows-2025.
+      - name: The Windows binary starts in Nano Server
+        if: ${{ matrix.nasm }}
+        shell: pwsh
+        run: |
+          docker pull --quiet mcr.microsoft.com/windows/nanoserver:ltsc2025
+          $dist = (Resolve-Path dist).Path
+          $answer = docker run --rm --isolation=process -v "${dist}:C:\dist:ro" mcr.microsoft.com/windows/nanoserver:ltsc2025 "C:\dist\${{ matrix.asset }}" version
+          if ($LASTEXITCODE -ne 0) { throw "slates version exited $LASTEXITCODE in Nano Server" }
+          Write-Output "Nano Server: $answer"
+          if (-not ("$answer" -like "slates *")) { throw "unexpected answer: $answer" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            dist/${{ matrix.asset }}
+            records/${{ matrix.asset }}.record.json
+          if-no-files-found: error
