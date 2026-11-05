@@ -378,7 +378,12 @@
 > Docker container on adacachy, by the fs-server lab up to the grant: a client on the host read the server's green,
 > pushed two increments of four files (accepted as versions 1 and 2), a third overlapping push was refused with its
 > window `src/one.txt [0..3]`, and the server's checkout wrote 4 files and presented a landing of 1 create and 3
-> replaces. Open, found on the way:
+> replaces. The same held across two machines on 2026-11-05 (client on adacachy, server on kiln-a094a12d, 11:37 UTC),
+> and the flow is now a CI test through the real binary: `crates/cli/tests/fs_server.rs`, two `slates daemon --fleet`
+> processes, in the gated CLI step (5 of 5 on adacachy at load 26, 0.44–0.48 s; red with the checkout's writes
+> removed). The granted landing across machines waits on a macOS server node: two Mac Studios froze it (the kiln
+> runner's headroom guard, the anchor in state `T`), and adas-macbook-pro-2 answered no ping at 192.168.1.71 on
+> 2026-11-05. Open, found on the way:
 > - **The daemon cannot clone an overlay volume.** `admit_clone` gives every clone no host, so `volume clone` of an
 >   overlay is refused `ContentUnavailable` (pinned or not; fleet and standalone), though the volume core can.
 > - **No grant can be issued on Linux from the CLI.** The anchor's issuer segment is a descriptor only its children
