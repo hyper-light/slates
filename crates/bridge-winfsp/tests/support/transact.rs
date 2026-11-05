@@ -481,6 +481,35 @@ const SERVINGS: [Serving; 4] = [
   },
 ];
 
+/// A successful open's response, in place: a 4,096-byte file, granted what the request asked (MAXIMUM_ALLOWED as all
+/// access, as the DLL's check grants), its per-open context a heap-like address or a small token.
+fn opened(response: &mut [u8; RESPONSE], request: &[u8], pointer: bool, next: &mut u64) {
+  *next += 1;
+  let context = if pointer {
+    0x0000_01F0_0000_0000 + *next * 64
+  } else {
+    *next
+  };
+  let desired = u32::from_le_bytes(
+    request[DESIRED_ACCESS_AT..DESIRED_ACCESS_AT + 4]
+      .try_into()
+      .unwrap(),
+  );
+  let granted = if desired & MAXIMUM_ALLOWED != 0 {
+    FILE_ALL_ACCESS
+  } else {
+    desired
+  };
+  response[16..20].copy_from_slice(&FILE_OPENED.to_le_bytes());
+  response[CONTEXT2_AT..CONTEXT2_AT + 8].copy_from_slice(&context.to_le_bytes());
+  response[GRANTED_AT..GRANTED_AT + 4].copy_from_slice(&granted.to_le_bytes());
+  let info = &mut response[FILE_INFO_AT..FILE_INFO_AT + 72];
+  info[0..4].copy_from_slice(&ARCHIVE.to_le_bytes());
+  info[8..16].copy_from_slice(&OPENED_BYTES.to_le_bytes());
+  info[16..24].copy_from_slice(&OPENED_BYTES.to_le_bytes());
+  info[56..64].copy_from_slice(&(*next).to_le_bytes());
+}
+
 /// Successful answers to every request in `delivered`: a Create opened as a 4,096-byte file, a Cleanup and a Close
 /// done, anything else "invalid request". Returns the kinds answered, in order.
 fn answer_open(delivered: &[u8], into: &mut Vec<u8>, pointer: bool, next: &mut u64) -> Vec<u32> {
@@ -498,32 +527,7 @@ fn answer_open(delivered: &[u8], into: &mut Vec<u8>, pointer: bool, next: &mut u
     response[4..8].copy_from_slice(&kind.to_le_bytes());
     response[8..16].copy_from_slice(&delivered[at + 8..at + 16]);
     match kind {
-      CREATE => {
-        *next += 1;
-        let context = if pointer {
-          0x0000_01F0_0000_0000 + *next * 64
-        } else {
-          *next
-        };
-        let desired = u32::from_le_bytes(
-          delivered[at + DESIRED_ACCESS_AT..at + DESIRED_ACCESS_AT + 4]
-            .try_into()
-            .unwrap(),
-        );
-        let granted = if desired & MAXIMUM_ALLOWED != 0 {
-          FILE_ALL_ACCESS
-        } else {
-          desired
-        };
-        response[16..20].copy_from_slice(&FILE_OPENED.to_le_bytes());
-        response[CONTEXT2_AT..CONTEXT2_AT + 8].copy_from_slice(&context.to_le_bytes());
-        response[GRANTED_AT..GRANTED_AT + 4].copy_from_slice(&granted.to_le_bytes());
-        let info = &mut response[FILE_INFO_AT..FILE_INFO_AT + 72];
-        info[0..4].copy_from_slice(&ARCHIVE.to_le_bytes());
-        info[8..16].copy_from_slice(&OPENED_BYTES.to_le_bytes());
-        info[16..24].copy_from_slice(&OPENED_BYTES.to_le_bytes());
-        info[56..64].copy_from_slice(&(*next).to_le_bytes());
-      }
+      CREATE => opened(&mut response, &delivered[at..at + size], pointer, next),
       CLEANUP | CLOSE => {}
       _ => response[20..24].copy_from_slice(&INVALID.to_le_bytes()),
     }
@@ -532,6 +536,17 @@ fn answer_open(delivered: &[u8], into: &mut Vec<u8>, pointer: bool, next: &mut u
     at += size.next_multiple_of(8);
   }
   kinds
+}
+
+/// Keeps one call's time under the kind of the first request it delivered: Create, Cleanup or Close.
+fn keep(calls: &mut [Vec<u64>; 3], first: Option<u32>, took: u64) {
+  let slot = match first {
+    Some(CREATE) => 0,
+    Some(CLEANUP) => 1,
+    Some(CLOSE) => 2,
+    _ => return,
+  };
+  calls[slot].push(took);
 }
 
 /// One serving thread: until `stop`, transact on `control` and answer every request, keeping each call that delivered a
@@ -568,12 +583,7 @@ fn serve_opens(
       serving.context_pointer,
       &mut next,
     );
-    match kinds.first() {
-      Some(&CREATE) => calls[0].push(took),
-      Some(&CLEANUP) => calls[1].push(took),
-      Some(&CLOSE) => calls[2].push(took),
-      _ => {}
-    }
+    keep(&mut calls, kinds.first().copied(), took);
     served.fetch_add(kinds.len(), Ordering::Relaxed);
   }
   // Send what was answered last, so no request is left processing when the volume is deleted.
@@ -634,13 +644,13 @@ fn measure_serving(serving: &Serving, opens: usize) {
   )
   .unwrap();
   // SAFETY: the DLL object is live until `mounted` drops, after every thread here has joined.
-  let control = unsafe { (*mounted.file_system).volume_handle };
+  let control = unsafe { (*mounted.file_system).volume_handle } as usize;
   let stop_servers = AtomicBool::new(false);
   let stop_client = AtomicBool::new(false);
   let served = AtomicUsize::new(0);
   let (calls, times) = std::thread::scope(|scope| {
     let servers: Vec<_> = (0..serving.threads)
-      .map(|_| scope.spawn(|| serve_opens(control as usize, serving, &stop_servers, &served)))
+      .map(|_| scope.spawn(|| serve_opens(control, serving, &stop_servers, &served)))
       .collect();
     let client = scope.spawn(|| open_and_close(&drive, &stop_client));
     // Three IRPs an open-and-close; the first tenth is a warm-up, cut from the client's times below.
