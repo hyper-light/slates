@@ -1360,8 +1360,10 @@ extern "C" fn overwrite(
   // SAFETY: our file system and a live open-file context.
   let handler = unsafe { handler(fs) };
   let object = context_key(context);
+  eprintln!("DIAG overwrite: context {object}");
   match handler.call(Op::Truncate { object }) {
     Reply::Object { info, .. } => {
+      eprintln!("DIAG overwrite: answered size {}", info.file_size);
       // SAFETY: `p_info` handled by put_info.
       unsafe { put_info(p_info, info) };
       STATUS_SUCCESS.as_i32()
@@ -1472,6 +1474,7 @@ extern "C" fn write(
     constrained: constrained != 0,
   }) {
     Reply::Wrote { written, info } => {
+      eprintln!("DIAG write: context {object} offset {offset} length {length} to_end {write_to_end} constrained {constrained} wrote {written} size {}", info.file_size);
       // SAFETY: `p_bytes` writable; `p_info` handled by put_info.
       unsafe {
         *p_bytes = written;
@@ -1567,6 +1570,7 @@ extern "C" fn set_file_size(
   let object = context_key(context);
   // An allocation below the file's size truncates it, as WinFsp's `SetFileSize` contract says (an open with
   // `TRUNCATE_EXISTING` arrives as an allocation of zero); any other allocation leaves the file as it is (A-214).
+  eprintln!("DIAG set_file_size: context {object} new_size {new_size} allocation {set_allocation_size}");
   let op = if set_allocation_size != 0 {
     Op::SetAllocation { object, new_size }
   } else {
