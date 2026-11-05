@@ -420,3 +420,286 @@ fn transact_cost() {
   unsafe { CloseHandle(event) };
   drop(mounted);
 }
+
+/// Format: FspFsctlTransactCleanupKind and FspFsctlTransactCloseKind.
+const CLEANUP: u32 = 3;
+/// Format: see CLEANUP.
+const CLOSE: u32 = 4;
+/// Format: FILE_OPENED, a successful open's IoStatus.Information.
+const FILE_OPENED: u32 = 1;
+/// Format: MAXIMUM_ALLOWED, and FILE_ALL_ACCESS which it is answered with, as the DLL's access check grants.
+const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+/// Format: see MAXIMUM_ALLOWED.
+const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
+/// Format: offsets in a Create request (Req.Create.DesiredAccess) and in its response (Rsp.Create.Opened), fsctl.h.
+const DESIRED_ACCESS_AT: usize = 48;
+/// Format: see DESIRED_ACCESS_AT.
+const CONTEXT2_AT: usize = 32;
+/// Format: see DESIRED_ACCESS_AT.
+const GRANTED_AT: usize = 40;
+/// Format: see DESIRED_ACCESS_AT.
+const FILE_INFO_AT: usize = 48;
+/// Format: FILE_ATTRIBUTE_ARCHIVE, a regular file's attributes as slates reports them.
+const ARCHIVE: u32 = 0x20;
+/// Shape: the opened file's size, mount_bench's 4,096-byte files.
+const OPENED_BYTES: u64 = 4096;
+
+/// How the harness's server serves: how many threads transact, whether a response rides the next receive, and what a
+/// successful open's per-open context looks like.
+struct Serving {
+  name: &'static str,
+  threads: usize,
+  combined: bool,
+  /// The UserContext2 of an open: a heap address, as the DLL arm's boxed open, or a small ledger token, as ours.
+  context_pointer: bool,
+}
+
+const SERVINGS: [Serving; 4] = [
+  Serving {
+    name: "one-thread-combined-pointer",
+    threads: 1,
+    combined: true,
+    context_pointer: true,
+  },
+  Serving {
+    name: "one-thread-combined-token",
+    threads: 1,
+    combined: true,
+    context_pointer: false,
+  },
+  Serving {
+    name: "one-thread-separate-token",
+    threads: 1,
+    combined: false,
+    context_pointer: false,
+  },
+  Serving {
+    name: "two-threads-combined-pointer",
+    threads: 2,
+    combined: true,
+    context_pointer: true,
+  },
+];
+
+/// A successful open's response, in place: a 4,096-byte file, granted what the request asked (MAXIMUM_ALLOWED as all
+/// access, as the DLL's check grants), its per-open context a heap-like address or a small token.
+fn opened(response: &mut [u8; RESPONSE], request: &[u8], pointer: bool, next: &mut u64) {
+  *next += 1;
+  let context = if pointer {
+    0x0000_01F0_0000_0000 + *next * 64
+  } else {
+    *next
+  };
+  let desired = u32::from_le_bytes(
+    request[DESIRED_ACCESS_AT..DESIRED_ACCESS_AT + 4]
+      .try_into()
+      .unwrap(),
+  );
+  let granted = if desired & MAXIMUM_ALLOWED != 0 {
+    FILE_ALL_ACCESS
+  } else {
+    desired
+  };
+  response[16..20].copy_from_slice(&FILE_OPENED.to_le_bytes());
+  response[CONTEXT2_AT..CONTEXT2_AT + 8].copy_from_slice(&context.to_le_bytes());
+  response[GRANTED_AT..GRANTED_AT + 4].copy_from_slice(&granted.to_le_bytes());
+  let info = &mut response[FILE_INFO_AT..FILE_INFO_AT + 72];
+  info[0..4].copy_from_slice(&ARCHIVE.to_le_bytes());
+  info[8..16].copy_from_slice(&OPENED_BYTES.to_le_bytes());
+  info[16..24].copy_from_slice(&OPENED_BYTES.to_le_bytes());
+  info[56..64].copy_from_slice(&(*next).to_le_bytes());
+}
+
+/// Successful answers to every request in `delivered`: a Create opened as a 4,096-byte file, a Cleanup and a Close
+/// done, anything else "invalid request". Returns the kinds answered, in order.
+fn answer_open(delivered: &[u8], into: &mut Vec<u8>, pointer: bool, next: &mut u64) -> Vec<u32> {
+  into.clear();
+  let mut kinds = Vec::new();
+  let mut at = 0;
+  while at + 16 <= delivered.len() {
+    let size = usize::from(u16::from_le_bytes([delivered[at + 2], delivered[at + 3]]));
+    if size == 0 {
+      break;
+    }
+    let kind = u32::from_le_bytes(delivered[at + 4..at + 8].try_into().unwrap());
+    let mut response = [0u8; RESPONSE];
+    response[2..4].copy_from_slice(&(RESPONSE as u16).to_le_bytes());
+    response[4..8].copy_from_slice(&kind.to_le_bytes());
+    response[8..16].copy_from_slice(&delivered[at + 8..at + 16]);
+    match kind {
+      CREATE => opened(&mut response, &delivered[at..at + size], pointer, next),
+      CLEANUP | CLOSE => {}
+      _ => response[20..24].copy_from_slice(&INVALID.to_le_bytes()),
+    }
+    into.extend_from_slice(&response);
+    kinds.push(kind);
+    at += size.next_multiple_of(8);
+  }
+  kinds
+}
+
+/// Keeps one call's time under the kind of the first request it delivered: Create, Cleanup or Close.
+fn keep(calls: &mut [Vec<u64>; 3], first: Option<u32>, took: u64) {
+  let slot = match first {
+    Some(CREATE) => 0,
+    Some(CLEANUP) => 1,
+    Some(CLOSE) => 2,
+    _ => return,
+  };
+  calls[slot].push(took);
+}
+
+/// One serving thread: until `stop`, transact on `control` and answer every request, keeping each call that delivered a
+/// request under the kind of its first one (Create, Cleanup, Close). Separate serving sends a batch's responses alone,
+/// then receives.
+fn serve_opens(
+  control: usize,
+  serving: &Serving,
+  stop: &AtomicBool,
+  served: &AtomicUsize,
+) -> [Vec<u64>; 3] {
+  // A handle is a value, carried between threads as one.
+  let control = control as HANDLE;
+  // SAFETY: an unnamed manual-reset event for this thread's calls; closed at the end.
+  let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+  assert!(!event.is_null());
+  let mut output = vec![0u8; BATCH_MIN];
+  let mut responses = Vec::new();
+  let mut next = 0u64;
+  let mut calls: [Vec<u64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+  while !stop.load(Ordering::Relaxed) {
+    if !serving.combined && !responses.is_empty() {
+      transact(control, event, TRANSACT_BATCH, &responses, &mut []).unwrap();
+      responses.clear();
+    }
+    let started = Instant::now();
+    let Ok(delivered) = transact(control, event, TRANSACT_BATCH, &responses, &mut output) else {
+      break;
+    };
+    let took = started.elapsed().as_nanos() as u64;
+    let kinds = answer_open(
+      &output[..delivered],
+      &mut responses,
+      serving.context_pointer,
+      &mut next,
+    );
+    keep(&mut calls, kinds.first().copied(), took);
+    served.fetch_add(kinds.len(), Ordering::Relaxed);
+  }
+  // Send what was answered last, so no request is left processing when the volume is deleted.
+  if !responses.is_empty() {
+    let _ = transact(control, event, TRANSACT_BATCH, &responses, &mut []);
+  }
+  // SAFETY: the event made above, closed once; this thread's calls have settled.
+  unsafe { CloseHandle(event) };
+  calls
+}
+
+/// One client opening an existing name and closing it again until `stop`; each open-and-close timed.
+fn open_and_close(drive: &str, stop: &AtomicBool) -> (Vec<u64>, u64) {
+  let mut times = Vec::new();
+  let mut refused = 0u64;
+  let path: Vec<u16> = format!("{drive}\\file")
+    .encode_utf16()
+    .chain(Some(0))
+    .collect();
+  while !stop.load(Ordering::Relaxed) {
+    let started = Instant::now();
+    // SAFETY: a NUL-terminated path; the handle, if any, is closed at once.
+    let handle = unsafe {
+      CreateFileW(
+        path.as_ptr(),
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        std::ptr::null(),
+        OPEN_EXISTING,
+        0,
+        std::ptr::null_mut(),
+      )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+      refused += 1;
+    } else {
+      // SAFETY: the handle just opened.
+      unsafe { CloseHandle(handle) };
+    }
+    times.push(started.elapsed().as_nanos() as u64);
+  }
+  (times, refused)
+}
+
+/// One serving pattern on a fresh volume: one client for `opens` open-and-closes after a warm-up, every call kept.
+fn measure_serving(serving: &Serving, opens: usize) {
+  let drive = free_drive();
+  let (requests, _unused) = sync_channel(REQUEST_BOUND);
+  let (purge_intents, mut private_opens) = crate::purge_intents::channel().unwrap();
+  let mounted = Mounted::new(
+    &drive,
+    true,
+    requests,
+    Waker::noop().clone(),
+    None,
+    purge_intents,
+    &mut private_opens,
+  )
+  .unwrap();
+  // SAFETY: the DLL object is live until `mounted` drops, after every thread here has joined.
+  let control = unsafe { (*mounted.file_system).volume_handle } as usize;
+  let stop_servers = AtomicBool::new(false);
+  let stop_client = AtomicBool::new(false);
+  let served = AtomicUsize::new(0);
+  let (calls, times) = std::thread::scope(|scope| {
+    let servers: Vec<_> = (0..serving.threads)
+      .map(|_| scope.spawn(|| serve_opens(control, serving, &stop_servers, &served)))
+      .collect();
+    let client = scope.spawn(|| open_and_close(&drive, &stop_client));
+    // Three IRPs an open-and-close; the first tenth is a warm-up, cut from the client's times below.
+    while served.load(Ordering::Relaxed) < opens * 3 + opens / 10 * 3 {
+      std::thread::yield_now();
+    }
+    stop_client.store(true, Ordering::Relaxed);
+    let times = client.join().unwrap();
+    stop_servers.store(true, Ordering::Relaxed);
+    let calls: Vec<[Vec<u64>; 3]> = servers
+      .into_iter()
+      .map(|server| server.join().unwrap())
+      .collect();
+    (calls, times)
+  });
+  let mut by_kind: [Vec<u64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+  for thread in calls {
+    for (kind, mut kept) in thread.into_iter().enumerate() {
+      by_kind[kind].append(&mut kept);
+    }
+  }
+  let (times, refused) = times;
+  let mut client_times: Vec<u64> = times.into_iter().skip(opens / 10).collect();
+  eprintln!(
+    "WINFSP OPENCOST serving={} refused={refused} client open+close {} | call before Create {} | before Cleanup {} | before Close {}",
+    serving.name,
+    ranks(&mut client_times),
+    ranks(&mut by_kind[0]),
+    ranks(&mut by_kind[1]),
+    ranks(&mut by_kind[2])
+  );
+  drop(mounted);
+}
+
+/// Audit step 7. Do: serve one client's open-and-close loop on a WinFsp volume this test answers itself, each serving
+/// pattern on a fresh volume, rotated: one thread combining each response with the next receive and an open's context a
+/// pointer (the DLL's form) or a token (ours), one thread sending responses apart (the receiver's form), and two threads
+/// combining (the DLL's two dispatchers). Expect: each pattern's client latency and per-IRP call times printed, every rank.
+#[test]
+#[ignore = "a timing harness, run by name in release on a machine with WinFsp"]
+fn open_cost() {
+  if std::env::var_os("WINFSP_TEST_MOUNT").is_none() {
+    eprintln!("SKIP: the open-cost harness needs WINFSP_TEST_MOUNT=1 and WinFsp installed");
+    return;
+  }
+  for round in 0..2 {
+    for offset in 0..SERVINGS.len() {
+      let serving = &SERVINGS[(round + offset) % SERVINGS.len()];
+      measure_serving(serving, PER_ROUND * 5);
+    }
+  }
+}

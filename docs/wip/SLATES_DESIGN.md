@@ -13257,6 +13257,10 @@ Applied in the same change to: §4.16 (status), `docs/wip/merge-service.md` (the
   fleet's holder-recompute, mismatch and takeover tests pass unchanged (BENCHMARKS, GAPS).
 
 ### A-214 — An idle shard keeps its last write burst's worth of free content pages pre-faulted (accepted 2026-11-05, VFS plan step 11; amends A-105)
+
+> **Status (2026-11-05): reverted from main.** Its reserve kept deleted files' pages resident, against A-205's
+> give-back on both Windows lanes, and its arena test fails under Miri (main CI 42119714654; GAPS). Re-landing owed.
+
 Status: accepted 2026-11-05 (Ada's decision through the supervisor: option (a) of GAPS' large-file write gap); built
 2026-11-05. It amends A-105's "every free block back at the first idle tick". Applied in the same change to:
 `crates/mem/src/buddy.rs` (`Buddy::upcoming`), `crates/mem/src/arena.rs` (`upcoming`, `purge_keeping`, `prefault`,
@@ -13759,27 +13763,11 @@ Applied in the same change to: §4.5 (data model), `crates/vfs/src/{dirblocks,di
   build compacted on every few rounds of a create and unlink. A fixed history grows one directory through ten classes, splits
   it, snapshots it and shrinks it, and must see eight classes, the largest among them.
 
-### A-207 — A work volume's state is durable at the process boundary: every change is logged in the partition and replayed at recovery (accepted 2026-11-04, the many-client load test)
-Applied in the same change to: §4.16's status, GAPS (the load-test blockquote), `crates/db` (`Op::WorkLogged`,
-`Op::WorkRestated`, `PartitionSnapshot::work_logs`), `crates/server` (`work_log.rs`; `work_files.rs`:
-`changed_entries`, `from_changed`; `verbs.rs`: `edit`, `declare`, `submit`, `rebase`, `rebuild_work`) and
-`crates/server/tests/merge_load.rs` (`acknowledged_work_edits_survive_a_daemon_restart`). A work as a delta over its
-green's base, the other half of the load test's first finding, is A-202's.
-- **What was there.** D-18 promises daemon-restart survival to a local acknowledgement only when what it acknowledged is
-  recoverable from anchor-owned RAM. A work's edits, declarations, base and journal lived in shard memory alone, and
-  recovery rebuilt every work as a fresh clone of its green's head, so an edit answered `Edited` read back as the
-  green's bytes after a restart and the next submit would have been accepted without it.
-- **The rule.** Every change to a work is recorded in a per-work log in the partition, in the verb's own transaction,
-  checked before the work changes: an edit or a declaration appends an entry; an accepted submit or a rebase restates the
-  work whole (its base, the files it holds of its own, its journal), checked before the verdict or the restatement.
-  Recovery replays the log over the recovered green through the verbs' own change path (`WorkFiles::splice`,
-  `WorkFiles::declare`, the one journal builder). The log counts against the partition's merge byte budget, so it is
-  bounded and refused typed at the bound, and is reclaimed with the work.
-- **Unchanged:** a work's state is owner-local and lost with its host (D-18's host boundary), not placed at f + 1.
-- **Cost (measured on the branch it comes from):** every edit now appends to the partition log, so the partition's
-  snapshots come at the rate edits arrive.
-
 ### A-217 — A green's origin is a reference to the base snapshot it holds, not a copy of the tree in the partition (accepted 2026-11-05, the supervisor's decision (a))
+
+> **Status (2026-11-05): reverted from main, with A-207's port.** Checkout (A-201) compares the recorded origin's
+> bytes, so every checkout was refused `ConsistentBaseUnavailable` (main CI 42119714654; GAPS). Re-landing owed.
+
 Applied in the same change to: §4.16's status, A-9's "recorded durably" (now: recorded as a reference and held), GAPS
 (the load-test blockquote), BENCHMARKS, `crates/db` (`Op::GreenOriginHeld`, `OriginRef`,
 `PartitionSnapshot::green_origin_refs`), `crates/server` (`verbs.rs`: `create_green`, `hold_origin_snapshot`,

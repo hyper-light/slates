@@ -3246,9 +3246,6 @@ fn init_shard(
     peer_recipients: std::collections::BTreeMap::new(),
     content,
     purge_seen_allocations: 0,
-    burst_seen: None,
-    last_burst: 0,
-    refill_settled: None,
     recovery_returned_at: None,
     content_range,
     delta_range: delta_range(config, partition, content_range),
@@ -3492,7 +3489,6 @@ fn init_shard(
       }
     );
   }
-  start_burst_measure(&mut state);
   #[cfg(windows)]
   crate::anchor_hold::install(
     windows_channel,
@@ -3500,7 +3496,6 @@ fn init_shard(
   )
   .map_err(crate::anchor_hold::HoldRefusal::into_server)?;
   state::install(state);
-  register_idle_refill(shard);
   // The FUSE mounts whose devices the anchor held, served again (A-61); then the dead ones of a killed
   // predecessor counted and left for their users to unmount (AUD-29-64, A-102).
   #[cfg(target_os = "linux")]
@@ -3666,20 +3661,6 @@ async fn seal_idle_content() {
     state::with_state(|s| s.store.content.arena().deferred_bytes() > 0).unwrap_or(false);
   if sealed_this_tick > 0 || deferred {
     let _ = state::with_state_counted(crate::verbs::publish_shard);
-    // The idle test asks whether the arena allocated since the previous tick, so this tick, which ends here, records
-    // what it saw (A-214): read only when the purge next ran, it charged the sweep's own allocations to the next tick,
-    // and an idle shard reached its purge and its reserve's refill a whole tick later than its idleness.
-    let _ = state::with_state(|s| {
-      s.purge_seen_allocations = s.store.content.arena().allocations();
-      s.count(
-        if sealed_this_tick > 0 {
-          TICKS_SEALING
-        } else {
-          TICKS_DEFERRED
-        },
-        1,
-      );
-    });
     return;
   }
   purge_if_idle().await;
@@ -3755,12 +3736,6 @@ fn return_dead_recovery(s: &mut ShardState) -> usize {
 /// a quiet interval: a busy shard keeps its zeroed free blocks resident for the allocations that follow, an idle one
 /// stops costing RAM for what it no longer holds. Before 2026-10-06 nothing ever went back: a deleted 128 MiB file left
 /// the content object at 168 MiB allocated.
-///
-/// Except its reserve (A-214): the free blocks the next allocations of a chunk window would take, as many bytes as the
-/// shard's last write burst grew its content by ([`prefault_reserve`]). The purge keeps them, and once it is done the
-/// refill faults in those of them not resident, a slice of `quantum / page_fault_ns` pages at a time, so a burst after
-/// idle writes onto resident pages: a large write over fresh pages spent 41.5% of the shard faulting them in (CI run
-/// 41986870989). The work stops as soon as a request makes the shard allocate.
 async fn purge_if_idle() {
   loop {
     let step = state::with_state(|s| {
@@ -3768,22 +3743,14 @@ async fn purge_if_idle() {
       let idle = allocations == s.purge_seen_allocations;
       s.purge_seen_allocations = allocations;
       if !idle {
-        s.count(TICKS_BUSY, 1);
         return None;
       }
-      s.count(TICKS_IDLE, 1);
-      note_burst(s, allocations);
-      let keep = prefault_reserve(s);
       let slice_blocks = usize::try_from(s.config.archive_slice_bytes())
         .unwrap_or(usize::MAX)
         .checked_div(s.config.discard_from_bytes.max(1))
         .unwrap_or(0)
         .max(1);
-      let purged = s
-        .store
-        .content
-        .arena_mut()
-        .purge_keeping(slice_blocks, &keep);
+      let purged = s.store.content.arena_mut().purge(slice_blocks);
       let log = if purged.more {
         0
       } else {
@@ -3791,16 +3758,7 @@ async fn purge_if_idle() {
       };
       let bytes = purged.bytes.saturating_add(log);
       s.count(CONTENT_PURGED, u64::try_from(bytes).unwrap_or(u64::MAX));
-      if purged.more {
-        return Some(true);
-      }
-      let pages = s.config.prefault_slice_pages();
-      let refilled = s.store.content.arena_mut().prefault(&keep, pages);
-      s.count(
-        CONTENT_PREFAULTED,
-        u64::try_from(refilled.bytes).unwrap_or(u64::MAX),
-      );
-      Some(refilled.more)
+      Some(purged.more)
     })
     .flatten();
     if step != Some(true) {
@@ -3808,105 +3766,6 @@ async fn purge_if_idle() {
     }
     futures::yield_now().await;
   }
-}
-
-/// Counter: reap ticks whose idle sweep sealed content, and so published and left the purge for a later tick (A-105).
-pub const TICKS_SEALING: &str = "content.ticks.sealing";
-/// Counter: reap ticks that found frees deferred behind the committed image, and so published and left the purge for a
-/// later tick (A-64, A-105).
-pub const TICKS_DEFERRED: &str = "content.ticks.deferred";
-/// Counter: reap ticks that reached the purge and found the arena had allocated since the previous tick (A-105).
-pub const TICKS_BUSY: &str = "content.ticks.busy";
-/// Counter: reap ticks that found the shard idle: the purge ran, and the reserve's refill (A-105, A-214).
-pub const TICKS_IDLE: &str = "content.ticks.idle";
-
-/// Counter: free content bytes an idle shard faulted in for its reserve (A-214), the refill's non-vacuity count.
-pub const CONTENT_PREFAULTED: &str = "content.prefaulted_bytes";
-
-/// Ends a busy period at an idle reap tick (A-214): when the arena allocated since the last idle tick, the shard's last
-/// write burst is the net rise of its allocated bytes since then (zero when it fell: a busy period that freed as much
-/// as it wrote, a written file deleted, grew nothing). The measure starts when the shard has recovered (`init_shard`);
-/// without one, the first idle tick only takes it.
-fn note_burst(s: &mut ShardState, allocations: u64) {
-  let allocated = s.store.content.arena().allocated_bytes();
-  match s.burst_seen {
-    Some((seen, _)) if seen == allocations => {}
-    Some((_, before)) => {
-      s.last_burst = allocated.saturating_sub(before);
-      s.burst_seen = Some((allocations, allocated));
-      s.refill_settled = None;
-    }
-    None => s.burst_seen = Some((allocations, allocated)),
-  }
-}
-
-/// Starts the burst measure from the content the shard holds once recovered (A-214): what a restart adopted is not a
-/// write burst, and a write made before the first idle tick is.
-fn start_burst_measure(state: &mut ShardState) {
-  state.burst_seen = Some((
-    state.store.content.arena().allocations(),
-    state.store.content.arena().allocated_bytes(),
-  ));
-}
-
-/// Registers the reserve's refill as shard `shard`'s idle work (A-214). Refused, it still refills at each idle reap
-/// tick, and says so.
-fn register_idle_refill(shard: u16) {
-  if let Some(Err(refusal)) =
-    registry::with_current(|ctx| ctx.set_idle_work(Box::new(refill_slice)))
-  {
-    slates_machine::log_line!(
-      "slates-server: shard {shard}: the reserve's idle refill was refused ({refusal}); it refills at reap ticks only"
-    );
-  }
-}
-
-/// The shard's idle work (A-214, registered with the runtime at the shard's start): one slice of its reserve's refill,
-/// `quantum / page_fault_ns` pages, whenever the shard has nothing else to do and its idle spin has run out, so a
-/// burst's pages are faulted in the moment the shard goes quiet rather than at the next reap tick, which the incumbent
-/// harness's second-long pauses never reached (A-105's test needs a whole quiet tick). Whether it faulted anything or
-/// has more to fault; once it finds nothing it stays quiet until the arena allocates again.
-fn refill_slice() -> bool {
-  state::with_state(|s| {
-    let allocations = s.store.content.arena().allocations();
-    if s.refill_settled == Some(allocations) {
-      return false;
-    }
-    let keep = prefault_reserve(s);
-    let pages = s.config.prefault_slice_pages();
-    let refilled = s.store.content.arena_mut().prefault(&keep, pages);
-    s.count(
-      CONTENT_PREFAULTED,
-      u64::try_from(refilled.bytes).unwrap_or(u64::MAX),
-    );
-    if !refilled.more {
-      s.refill_settled = Some(allocations);
-    }
-    refilled.bytes > 0 || refilled.more
-  })
-  .unwrap_or(false)
-}
-
-/// Derived (A-214): an idle shard's reserve, `min(max(last write burst, the growth since the last idle tick),
-/// reserve_per_shard, the arena's free bytes)`, as the
-/// free blocks the next allocations of a chunk window would take (`ChunkArena::upcoming`): the burst bounded by the
-/// shard's memory share and by what its arena holds free.
-fn prefault_reserve(s: &ShardState) -> Vec<slates_mem::arena::KeptRun> {
-  let arena = s.store.content.arena();
-  // The busy period under way counts as soon as it has grown past the last one: an idle moment inside it, or right
-  // after it, comes before the reap tick that closes it.
-  let running = s.burst_seen.map_or(0, |(_, before)| {
-    arena.allocated_bytes().saturating_sub(before)
-  });
-  let bytes = s
-    .last_burst
-    .max(running)
-    .min(usize::try_from(s.config.reserve_per_shard).unwrap_or(usize::MAX))
-    .min(arena.free_bytes());
-  if bytes == 0 {
-    return Vec::new();
-  }
-  arena.upcoming(s.store.content.chunk_bytes(), bytes)
 }
 
 /// The pressure hold across a daemon's shards (§4.2, admission.md §5.5), from the host's free memory at the daemon's
