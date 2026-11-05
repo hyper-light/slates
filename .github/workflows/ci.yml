@@ -648,6 +648,42 @@ jobs:
         env:
           SLATES_TEST_CLI: "1"
         run: cargo test -p slates-cli --test shards -- --nocapture
+      # A-214: Win32 semantics through the drive that winfstest found broken (a move not asked to replace, a directory
+      # holding a file, SetFileTime's times, an open that truncates), then WinFsp's own two suites over the drive through
+      # the harness: the fsx port and winfstest, each built from billziss-gh/secfs.test@6ac65cd with MSVC; winfstest is
+      # judged against its reviewed list (docs/wip/conformance/expected-failures/native-windows-winfsp.winfstest.txt).
+      - name: Clippy the conformance harness (native Windows)
+        if: ${{ !cancelled() }}
+        run: cargo clippy -p xtask --all-targets -- -D warnings
+      - name: Win32 semantics through the WinFsp drive (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        env:
+          SLATES_TEST_CLI: "1"
+          WINFSP_TEST_MOUNT: "1"
+        run: cargo test -p slates-cli --test winfsp_semantics -- --test-threads=1 --nocapture
+      - name: fsx over the WinFsp drive (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: cargo xtask conformance run --suite fsx --records target/conformance-records --scratch target/conformance-scratch --keep
+      - name: winfstest over the WinFsp drive, against the reviewed list (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        run: cargo xtask conformance run --suite winfstest --records target/conformance-records --scratch target/conformance-scratch --keep
+      - name: Upload the Windows conformance records (native Windows)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-records-windows-x86_64
+          path: target/conformance-records
+          if-no-files-found: ignore
+      - name: Upload winfstest's per-script output (the expected-failure review input, native Windows)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: winfstest-output-windows-x86_64
+          path: target/conformance-scratch/*/winfstest-output
+          if-no-files-found: ignore
 
   # D-20: instruction-count gates. callgrind counts are deterministic for a given binary, so
   # they see the one-percent change the wall clock cannot. valgrind is non-Rust tooling, admitted
@@ -877,6 +913,42 @@ jobs:
           SLATES_TEST_CLI: "1"
           WINFSP_TEST_MOUNT: "1"
         run: cargo test -p slates-cli --test winfsp -- --test-threads=1 --nocapture
+      # A-214: Win32 semantics through the drive that winfstest found broken (a move not asked to replace, a directory
+      # holding a file, SetFileTime's times, an open that truncates), then WinFsp's own two suites over the drive through
+      # the harness: the fsx port and winfstest, each built from billziss-gh/secfs.test@6ac65cd with MSVC; winfstest is
+      # judged against its reviewed list (docs/wip/conformance/expected-failures/native-windows-winfsp.winfstest.txt).
+      - name: Clippy the conformance harness (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        run: cargo clippy -p xtask --all-targets -- -D warnings
+      - name: Win32 semantics through the WinFsp drive (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        env:
+          SLATES_TEST_CLI: "1"
+          WINFSP_TEST_MOUNT: "1"
+        run: cargo test -p slates-cli --test winfsp_semantics -- --test-threads=1 --nocapture
+      - name: fsx over the WinFsp drive (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: cargo xtask conformance run --suite fsx --records target/conformance-records --scratch target/conformance-scratch --keep
+      - name: winfstest over the WinFsp drive, against the reviewed list (native arm64 Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        run: cargo xtask conformance run --suite winfstest --records target/conformance-records --scratch target/conformance-scratch --keep
+      - name: Upload the Windows conformance records (native arm64 Windows)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-records-windows-arm64
+          path: target/conformance-records
+          if-no-files-found: ignore
+      - name: Upload winfstest's per-script output (the expected-failure review input, native arm64 Windows)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: winfstest-output-windows-arm64
+          path: target/conformance-scratch/*/winfstest-output
+          if-no-files-found: ignore
 
   # Linux arm64, run natively (G-arm64-host): the same-kernel direct map, the FUSE mount's maps and the containers that
   # map through either, on GitHub's `ubuntu-24.04-arm` image, free for a public repository as `windows-11-arm` is. The
