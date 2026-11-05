@@ -49,6 +49,11 @@ const PRERELEASE: &str = "prerelease";
 const PROVENANCE_FORMAT: &str = "slates-release-provenance/1";
 /// Format: a record's file name is the asset's name followed by this.
 const RECORD_SUFFIX: &str = ".record.json";
+/// Format: the record of the same target's second build, on a separate runner (AC-9.5), is named so.
+const REBUILD_SUFFIX: &str = ".rebuild.record.json";
+/// Shape: how many differing offsets a refused rebuild names; enough to tell a timestamp's few bytes from code that
+/// differs, and short enough to read in a CI log.
+const DIFFERENCES_SHOWN: usize = 8;
 
 /// Shape: how long the anchor may take from its spawn until its daemon says it serves. The full profile is measured
 /// at start (seconds; the anchor's greeting came 3.6–5.4 s after the spawn at load 25–110 on an 18-core Mac,
@@ -113,8 +118,8 @@ fn required<'a>(args: &'a [String], name: &str, usage: &str) -> Result<&'a str, 
 /// Format: the smoke task's usage.
 const SMOKE_USAGE: &str = "release smoke --binary PATH --target TRIPLE --record FILE";
 /// Format: the artifacts task's usage.
-const ARTIFACTS_USAGE: &str =
-  "release artifacts --dist DIR --records DIR --notes DIR --tag TAG --commit SHA --run-url URL";
+const ARTIFACTS_USAGE: &str = "release artifacts --dist DIR --rebuild DIR --records DIR --notes DIR --tag TAG --commit SHA \
+   --run-url URL";
 
 /// The smoke task: `cargo run -p xtask --bin release -- smoke`.
 pub(crate) fn smoke(root: &Path, args: &[String]) -> Result<(), Failure> {
@@ -708,6 +713,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 pub(crate) fn artifacts(args: &[String]) -> Result<(), Failure> {
   let dist = PathBuf::from(required(args, "--dist", ARTIFACTS_USAGE)?);
   let records_dir = PathBuf::from(required(args, "--records", ARTIFACTS_USAGE)?);
+  let rebuild_dir = PathBuf::from(required(args, "--rebuild", ARTIFACTS_USAGE)?);
   let notes_dir = PathBuf::from(required(args, "--notes", ARTIFACTS_USAGE)?);
   let tag = required(args, "--tag", ARTIFACTS_USAGE)?;
   let commit = required(args, "--commit", ARTIFACTS_USAGE)?;
@@ -730,10 +736,25 @@ pub(crate) fn artifacts(args: &[String]) -> Result<(), Failure> {
         dist.display()
       ))
     })?;
+    let rebuild_path = records_dir.join(format!("{asset}{REBUILD_SUFFIX}"));
+    let rebuild_text = std::fs::read_to_string(&rebuild_path).map_err(|e| {
+      Failure(format!(
+        "release-artifacts: no rebuild record for {asset} ({}: {e}); every target is built twice (AC-9.5)",
+        rebuild_path.display()
+      ))
+    })?;
+    let rebuild_bytes = std::fs::read(rebuild_dir.join(asset)).map_err(|e| {
+      Failure(format!(
+        "release-artifacts: no rebuilt binary {asset} in {}: {e}",
+        rebuild_dir.display()
+      ))
+    })?;
     records.push(Gathered {
       asset,
       record,
       bytes,
+      rebuild: serde_json::from_str(&rebuild_text)?,
+      rebuild_bytes,
     });
   }
   let documents = release_documents(
@@ -782,11 +803,50 @@ pub(crate) fn artifacts(args: &[String]) -> Result<(), Failure> {
   Ok(())
 }
 
-/// One target's smoke record and the binary bytes the release would ship for it.
+/// One target's smoke record and the binary bytes the release would ship for it, and the same of its second build
+/// on a separate runner.
 struct Gathered {
   asset: &'static str,
   record: Value,
   bytes: Vec<u8>,
+  rebuild: Value,
+  rebuild_bytes: Vec<u8>,
+}
+
+/// Where two builds of one target differ: the count of differing bytes (a length difference counts every byte past
+/// the shorter) and the first [`DIFFERENCES_SHOWN`] offsets.
+fn differences(first: &[u8], second: &[u8]) -> (usize, Vec<usize>) {
+  let mut count = first.len().abs_diff(second.len());
+  let mut shown = Vec::new();
+  for (offset, (a, b)) in first.iter().zip(second).enumerate() {
+    if a != b {
+      count = count.saturating_add(1);
+      if shown.len() < DIFFERENCES_SHOWN {
+        shown.push(offset);
+      }
+    }
+  }
+  (count, shown)
+}
+
+/// Refuses a record that does not name `asset` and `bytes` (its smoke test ran other bytes), saying which `build`.
+fn check_record(asset: &str, build: &str, record: &Value, bytes: &[u8]) -> Result<String, Failure> {
+  let sha256 = sha256_hex(bytes);
+  let recorded = |key: &str| record.get(key).and_then(Value::as_str);
+  if recorded("asset") != Some(asset) {
+    return Err(Failure(format!(
+      "release-artifacts: {asset}'s {build} record names asset {:?}",
+      recorded("asset")
+    )));
+  }
+  if recorded("sha256") != Some(sha256.as_str()) {
+    return Err(Failure(format!(
+      "release-artifacts: {asset} ({build}) is not the binary its smoke test ran (sha256 {sha256}, the record {:?}); \
+       only tested bytes ship",
+      recorded("sha256")
+    )));
+  }
+  Ok(sha256)
 }
 
 /// What the release is: its tag and what the tag names, the version, the commit and the run that built it.
@@ -813,25 +873,23 @@ fn release_documents(gathered: &[Gathered], release: &Release<'_>) -> Result<Doc
   let mut checksums = String::new();
   let mut assets = Vec::new();
   for entry in gathered {
-    let sha256 = sha256_hex(&entry.bytes);
-    let recorded = |key: &str| entry.record.get(key).and_then(Value::as_str);
-    if recorded("asset") != Some(entry.asset) {
+    let sha256 = check_record(entry.asset, "build", &entry.record, &entry.bytes)?;
+    let rebuilt = check_record(entry.asset, "rebuild", &entry.rebuild, &entry.rebuild_bytes)?;
+    if rebuilt != sha256 {
+      let (count, shown) = differences(&entry.bytes, &entry.rebuild_bytes);
       return Err(Failure(format!(
-        "release-artifacts: {}'s record names asset {:?}",
+        "release-artifacts: {} is not reproducible from the tag (AC-9.5): its rebuild on a separate runner differs in \
+         {count} of {} bytes (sha256 {sha256} and {rebuilt}), first at offsets {shown:?}",
         entry.asset,
-        recorded("asset")
-      )));
-    }
-    if recorded("sha256") != Some(sha256.as_str()) {
-      return Err(Failure(format!(
-        "release-artifacts: {} is not the binary its smoke test ran (sha256 {sha256}, the record {:?}); only \
-         tested bytes ship",
-        entry.asset,
-        recorded("sha256")
+        entry.bytes.len()
       )));
     }
     checksums.push_str(&format!("{sha256}  {}\n", entry.asset));
-    assets.push(entry.record.clone());
+    let mut asset = entry.record.clone();
+    if let Some(fields) = asset.as_object_mut() {
+      fields.insert("rebuild".to_owned(), entry.rebuild.clone());
+    }
+    assets.push(asset);
   }
   let test = match release.kind {
     TagKind::Release => None,
@@ -867,7 +925,9 @@ fn release_documents(gathered: &[Gathered], release: &Release<'_>) -> Result<Doc
   notes.push_str(&format!(
     "Each binary was started on its own platform before it was attached here: the anchor and daemon served, a \
      volume provisioned, a file was written and read back by one client and read again by another, and the daemon \
-     left with its anchor (`cargo run -p xtask --bin release -- smoke`; each step's time is in `{PROVENANCE}`).\n\nVerify a \
+     left with its anchor (`cargo run -p xtask --bin release -- smoke`; each step's time is in `{PROVENANCE}`). \
+     Each was also built a second time on a separate runner, from the same tag, and the two builds are byte for byte \
+     the same.\n\nVerify a \
      download with `sha256sum -c {CHECKSUMS} --ignore-missing` (on macOS `shasum -a 256 -c`), and its build \
      provenance with `gh attestation verify <file> --repo hyper-light/slates`. Built by {}.\n",
     release.run_url
@@ -898,7 +958,46 @@ mod tests {
       asset,
       record: json!({ "asset": asset, "sha256": sha256, "smoke": [] }),
       bytes: bytes.to_vec(),
+      rebuild: json!({ "asset": asset, "sha256": sha256_hex(bytes), "smoke": [] }),
+      rebuild_bytes: bytes.to_vec(),
     }
+  }
+
+  /// AC-9.5: do gather a target whose second build differs from its first in its 4-byte link timestamp and its
+  /// 16-byte PDB GUID (the 20 bytes MSVC's linker varied between two runners without `/Brepro`, run 42046848954); expect
+  /// the release refused, naming the asset, the 20 differing bytes and their first offsets. Do gather two identical
+  /// builds; expect the release made, with the rebuild in the provenance.
+  #[test]
+  fn a_target_whose_rebuild_differs_is_not_reproducible() {
+    let kind = TagKind::Release;
+    let first: Vec<u8> = (0..4096u32).map(|at| (at % 251) as u8).collect();
+    let mut second = first.clone();
+    for offset in (256..260).chain(3000..3016) {
+      second[offset] ^= 0xff;
+    }
+    let mut entry = gathered("slates-windows-x64.exe", &first, None);
+    entry.rebuild = json!({ "asset": entry.asset, "sha256": sha256_hex(&second) });
+    entry.rebuild_bytes = second;
+    match release_documents(&[entry], &release(&kind)) {
+      Ok(_) => panic!("a differing rebuild was accepted"),
+      Err(Failure(message)) => {
+        assert!(message.contains("slates-windows-x64.exe"), "{message}");
+        assert!(message.contains("differs in 20 of 4096 bytes"), "{message}");
+        assert!(
+          message.contains("[256, 257, 258, 259, 3000, 3001, 3002, 3003]"),
+          "{message}"
+        );
+      }
+    }
+    let same = gathered("slates-windows-x64.exe", &first, None);
+    let Ok(documents) = release_documents(&[same], &release(&kind)) else {
+      panic!("identical builds were refused")
+    };
+    let provenance: Value = serde_json::from_str(&documents.provenance).unwrap_or(Value::Null);
+    assert_eq!(
+      provenance["assets"][0]["rebuild"]["sha256"],
+      sha256_hex(&first)
+    );
   }
 
   fn release<'a>(kind: &'a TagKind) -> Release<'a> {
