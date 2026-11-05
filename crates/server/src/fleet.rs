@@ -820,10 +820,18 @@ fn consensus_budget(slowest_tail_ns: Option<u64>) -> CommitBudget {
   round_budget(&ROUND_ANCHORS, slowest_tail_ns)
 }
 
-/// The budget a live-shipped entry's exchange runs under (A-200): the consensus round's, derived from the slowest
-/// measured path, the same rule a record commit's round runs under.
+/// The budget a live-shipped entry's exchange runs under (A-200): a hard deadline of the daemon's liveness budget, past
+/// which a holder that has not answered is not a live one to wait for (its link is dropped and dialed afresh,
+/// `live_ship::lose_links`), with the record plane's poll between wake-ups (a reply wakes the collector at once).
+/// Derived: `LIVENESS_BUDGET_NS`, `HEARTBEAT_NS / POLL_PER_PERIOD`. Not the consensus round's budget: that is derived
+/// from the slowest path's tail, which a paused holder inflates, so one exchange to it held the holder's only session
+/// past a 40 s wait and the resumed holder never caught up (2026-11-05, `live_fleet`, 1 of 2 runs). A holder is not a
+/// voter; each answers on its own.
 pub(crate) fn live_budget() -> CommitBudget {
-  consensus_budget(slowest_path_tail_ns())
+  CommitBudget::hard(
+    crate::daemon::LIVENESS_BUDGET_NS,
+    (HEARTBEAT_NS / POLL_PER_PERIOD).max(1),
+  )
 }
 
 /// The bound on one record-plane exchange: the measured control-plane round budget's full span, the bound every

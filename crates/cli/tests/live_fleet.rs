@@ -644,3 +644,177 @@ fn a_live_volumes_acknowledged_writes_survive_its_owners_death() {
     "the successor rebuilt the volume from the live log: {taken_over}"
   );
 }
+
+// ── Chaos (A-200; Ada's goal of 2026-11-04): candidates paused, latency injected, the owner paused past its takeover,
+// clients cut off mid-write. SIGSTOP is the unprivileged partition: a stopped process answers nothing, its sockets keep
+// their ports, and SIGCONT returns it with every timer late, as a healed partition or a long scheduling stall does.
+
+/// Sends `signal` to a fleet daemon's process.
+fn signal(process: &FleetProcess, signal: rustix::process::Signal) {
+  rustix::process::kill_process(rustix::process::Pid::from_child(&process.child), signal).unwrap();
+}
+
+/// Creates a live-shipped volume on `owner` and attaches it for writing: its id and the attachment.
+fn create_live_volume(owner: &str, name: &str) -> (String, String) {
+  let id = value_of(
+    &run_ready(owner, &["volume", "create", name, "--bounded", "8MiB"]),
+    "id",
+  );
+  let (code, _, err) = run(owner, &["live-ship", &id]);
+  assert_eq!(code, 0, "live-ship: {err}");
+  let attachment = value_of(&run_ready(owner, &["attach", &id, "--write"]), "attachment");
+  (id, attachment)
+}
+
+/// Writes `/file-N` for each N in `files` through `slates write`; each write's latency as the client saw it.
+fn write_files(
+  owner: &str,
+  (id, attachment): (&str, &str),
+  files: std::ops::Range<usize>,
+) -> Vec<Duration> {
+  files
+    .map(|file| {
+      let began = Instant::now();
+      let (code, err) = run_with_stdin(
+        owner,
+        &["write", id, attachment, &format!("/file-{file}")],
+        live_body(file).as_bytes(),
+      );
+      assert_eq!(code, 0, "write /file-{file}: {err}");
+      began.elapsed()
+    })
+    .collect()
+}
+
+/// A-200 under a partition: do stop one candidate's process, keep writing, then resume it. Expect every write
+/// answered (durable through the other candidate, the owner's log durable at its head the moment the last returns),
+/// and the stopped candidate, resumed, caught up to the owner's head.
+#[test]
+fn a_paused_candidate_neither_stops_writes_nor_stays_behind() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping chaos flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-pause");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = &fleet.instances[owner_index];
+  let paused_index = (owner_index + 1) % fleet.instances.len();
+  let others: Vec<&String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| *instance != owner)
+    .collect();
+  let (id, attachment) = create_live_volume(owner, "paused");
+  write_files(owner, (&id, &attachment), 0..1);
+  signal(&fleet.daemons[paused_index], rustix::process::Signal::STOP);
+  let latencies = write_files(owner, (&id, &attachment), 1..FILES);
+  let at_return = live_line(owner, "shipping", &id);
+  signal(&fleet.daemons[paused_index], rustix::process::Signal::CONT);
+  let (caught_up, shipping, held) = wait_caught_up(owner, &others, &id);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!(
+    "live pause: writes while paused {latencies:?}; at return {at_return:?}; then {shipping:?} {held:?}"
+  );
+  assert!(
+    at_return
+      .as_ref()
+      .is_some_and(|(head, durable, owed)| head == durable && owed == "false"),
+    "writes stayed durable through the live candidate: {at_return:?}"
+  );
+  assert!(
+    caught_up,
+    "the resumed candidate caught up: {shipping:?} {held:?}"
+  );
+}
+
+/// A-200 under injected latency: do stop each candidate's process for `STALL` of every `2 × STALL`, out of phase, so for
+/// part of each period both are stopped, while writing `WRITES_UNDER_STALLS` files. Expect every write answered and durable
+/// (some waiting out a stall: both candidates stopped means no durability until one resumes), none refused, and both
+/// candidates holding the owner's head once the stalls stop.
+#[test]
+fn writes_stay_durable_through_injected_candidate_stalls() {
+  /// Shape: how long a candidate is stopped at a time: tens of milliseconds, a long scheduling stall or a congested
+  /// path's queueing, far under the fleet's death detection (seconds).
+  const STALL: Duration = Duration::from_millis(30);
+  /// Shape: the writes made through the stalls.
+  const WRITES_UNDER_STALLS: usize = 30;
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping stall flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-stall");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = fleet.instances[owner_index].clone();
+  let others: Vec<&String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| **instance != owner)
+    .collect();
+  let (id, attachment) = create_live_volume(&owner, "stalled");
+  write_files(&owner, (&id, &attachment), 0..1);
+  let pids: Vec<rustix::process::Pid> = (0..fleet.daemons.len())
+    .filter(|index| *index != owner_index)
+    .map(|index| rustix::process::Pid::from_child(&fleet.daemons[index].child))
+    .collect();
+  let stalling = std::sync::atomic::AtomicBool::new(true);
+  let latencies = std::thread::scope(|scope| {
+    scope.spawn(|| {
+      // Out of phase: the first candidate stops at 0 and resumes at STALL; the second stops at STALL / 2 and resumes
+      // at 3 STALL / 2 — so both are stopped for STALL / 2 of every period.
+      while stalling.load(std::sync::atomic::Ordering::Acquire) {
+        for (pid, stop) in [
+          (pids[0], true),
+          (pids[1], true),
+          (pids[0], false),
+          (pids[1], false),
+        ] {
+          let sent = if stop {
+            rustix::process::Signal::STOP
+          } else {
+            rustix::process::Signal::CONT
+          };
+          let _ = rustix::process::kill_process(pid, sent);
+          #[allow(clippy::disallowed_methods)]
+          std::thread::sleep(STALL / 2);
+        }
+      }
+      for pid in &pids {
+        let _ = rustix::process::kill_process(*pid, rustix::process::Signal::CONT);
+      }
+    });
+    let latencies = write_files(&owner, (&id, &attachment), 1..1 + WRITES_UNDER_STALLS);
+    stalling.store(false, std::sync::atomic::Ordering::Release);
+    latencies
+  });
+  let at_return = live_line(&owner, "shipping", &id);
+  let (caught_up, shipping, held) = wait_caught_up(&owner, &others, &id);
+  let late = counter(&owner, "fleet.live.over_bound");
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  let mut sorted = latencies.clone();
+  sorted.sort();
+  eprintln!(
+    "live stall: {} writes, client-seen latency p50 {:?} p90 {:?} max {:?}; at return {at_return:?}; then {shipping:?} \
+     {held:?}; over_bound={late}",
+    sorted.len(),
+    sorted[sorted.len() / 2],
+    sorted[sorted.len() * 9 / 10],
+    sorted[sorted.len() - 1]
+  );
+  assert!(
+    at_return
+      .as_ref()
+      .is_some_and(|(head, durable, owed)| head == durable && owed == "false"),
+    "every write answered durable through the stalls: {at_return:?}"
+  );
+  assert!(
+    caught_up,
+    "both candidates caught up once the stalls stopped: {shipping:?} {held:?}"
+  );
+  assert_eq!(late, 0, "no write was refused for want of room to wait");
+}

@@ -77,7 +77,11 @@
 > log (§4.10 status "slice three"): a never-sealed live volume's five acknowledged writes survive its owner's SIGKILL,
 > served whole by a survivor in 1.8–2.3 s, empty without the log; a live write also waits for its volume's head
 > placement, so an owner killed the moment its last write returns loses nothing (3 of 3; 2 of 2 lost everything
-> before). Open: hard links and extended attributes in the rebuilt volume. Open, toward a filesystem
+> before). Chaos across real processes (§4.10 status): a candidate partitioned away (SIGSTOP) and healed, and both
+> candidates stalled in overlapping 30 ms windows through 30 writes, each write durable at its return (stall p90
+> 33 ms, max 47 ms) and every candidate caught up after; the partition found a live exchange budget a stopped peer
+> inflated, now the liveness budget with dead links redialed. Open: hard links and extended attributes in the rebuilt
+> volume; a superseded owner resumed after its takeover, and clients cut off mid-write, under the same harness. Open, toward a filesystem
 > server replicated per write in under 1 ms: FUSE `fsync` answered at durability (AC-8.3's "live-shipped volumes
 > report none", AC-8.9's credit backpressure); a candidate's copy kept across its own restart; real-process chaos
 > (partitions, injected latency, volume failure, client disconnect). `put_wal` and the

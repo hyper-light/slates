@@ -75,6 +75,10 @@ pub struct Exchanged {
   pub replies: Vec<(HostId, Vec<u8>)>,
   /// The sessions whose holders answered.
   pub reusable: Vec<(HostId, Endpoint)>,
+  /// The holders whose exchange ended with no answer at all (its deadline, or a transport fault: no round trip), their
+  /// sessions not among `reusable`: a session a peer stopped answering on may be dead at the peer's end, so the caller
+  /// lets its link be dialed afresh rather than lend it again.
+  pub unanswered: Vec<HostId>,
   /// The holders still in flight.
   pub stragglers: Stragglers,
   /// Whether the budget ran out first.
@@ -95,6 +99,7 @@ pub async fn exchange(
     return Exchanged {
       replies: Vec::new(),
       reusable: sessions,
+      unanswered: Vec::new(),
       stragglers: Stragglers::none(),
       timed_out: false,
     };
@@ -123,12 +128,17 @@ pub async fn exchange(
   let mut exchanged = Exchanged {
     replies: Vec::new(),
     reusable: Vec::new(),
+    unanswered: Vec::new(),
     stragglers: Stragglers::none(),
     timed_out: false,
   };
   loop {
     match rx.try_recv() {
       Ok(Reply(host, reply, endpoint)) => {
+        if reply.round_trip_ns.is_none() {
+          exchanged.unanswered.push(host);
+          continue;
+        }
         exchanged.reusable.push((host, *endpoint));
         let done = enough(host, &reply.bytes);
         exchanged.replies.push((host, reply.bytes));
