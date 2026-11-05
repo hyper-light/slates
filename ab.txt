@@ -264,3 +264,9 @@ winfsp-phase	response	19	49005	p50 14400	p99 34200	mean 15113
 winfsp-phase	txn_recv_total	0	241822	p50 30400	p99 105100	mean 1330926
 winfsp-phase	txn_resp_total	0	252690	p50 14000	p99 93700	mean 16402
 ## run 1 of 1 done, 2026-11-05T06:21:52Z
+remote: 
+remote: Create a pull request for 'diag-winfsp-bench-results-41977769822-windows-latest' on GitHub by visiting:        
+remote:      https://github.com/hyper-light/slates/pull/new/diag-winfsp-bench-results-41977769822-windows-latest        
+remote: 
+To https://github.com/hyper-light/slates
+ * [new branch]      8d537a714c3814775ce9c351a99e59fa3c35c657 -> diag-winfsp-bench-results-41977769822-windows-latest
