@@ -1,0 +1,92 @@
+name: diag-clients
+
+# Diagnostics only, never on main (A-218, the spin policy): the provisioning histogram, quiet and with one spinning
+# shell loop per CPU (forced oversubscription), on every platform the clients agent cannot reach from its machine.
+# Three arms alternate, three rounds a condition: main (MAIN_SHA), the macOS kqueue fix with the idle window at 100
+# times the wake estimate (FIX_SHA), and the fix with the window at the wake estimate alone (R1_SHA, the competitive
+# spin). Each job pushes its result lines to diag-results/clients-8-<os> with the Actions token, so they are read by
+# git fetch and cost no API quota.
+on:
+  push:
+    branches: ["diag-clients-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  MAIN_SHA: a7804447
+  FIX_SHA: a75f9213
+  R1_SHA: 513f32e2
+
+jobs:
+  ab:
+    name: spin policy main/fix/r1 (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Build the three arms
+        run: |
+          mkdir -p ../arms
+          for arm in main fix r1; do
+            case $arm in main) sha=$MAIN_SHA;; fix) sha=$FIX_SHA;; r1) sha=$R1_SHA;; esac
+            git worktree add "../src-$arm" "$sha"
+            ( cd "../src-$arm" && CARGO_TARGET_DIR="../target-$arm" cargo build --release --locked -p slates-client --example provision_bench )
+            for exe in "../target-$arm/release/examples/provision_bench" "../target-$arm/release/examples/provision_bench.exe"; do
+              if [ -f "$exe" ]; then cp "$exe" "../arms/$arm${exe##*provision_bench}"; fi
+            done
+          done
+          ls -la ../arms
+      - name: Quiet and busy, three rounds each, the arms alternating
+        run: |
+          R=../results.txt
+          cpus=$(nproc 2>/dev/null || echo "$NUMBER_OF_PROCESSORS")
+          echo "runner ${{ matrix.os }}, $cpus CPUs, $(date -u)" > $R
+          for cond in quiet busy; do
+            for round in 1 2 3; do
+              for arm in main fix r1; do
+                pids=""
+                if [ $cond = busy ]; then
+                  for i in $(seq 1 "$cpus"); do ( while :; do :; done ) & pids="$pids $!"; done
+                fi
+                echo "== $cond round $round: $arm at $(date -u +%H:%M:%S) UTC; $(uptime 2>/dev/null || echo 'no load average')" | tee -a $R
+                status=0
+                ../arms/$arm > ../run.log 2>&1 || status=$?
+                for p in $pids; do kill "$p" 2>/dev/null || true; done
+                wait 2>/dev/null || true
+                grep -E 'provisioning histogram|^  provision\.(spinning_1_p50|spinning_1_p99|spinning_8_p50|spinning_8_p99|parked_1_p50|parked_1_p99):|ac-2.1: 1 client spinning' ../run.log | tee -a $R
+                echo "== $cond round $round: $arm exit $status" | tee -a $R
+              done
+            done
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/clients-8-${{ matrix.os }}"
+          git config user.name "diag-clients"
+          git config user.email "diag-clients@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-clients-8 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
