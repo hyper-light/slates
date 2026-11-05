@@ -222,7 +222,7 @@ const IDENTITY_TAG_HARDLINK: &[u8] = b"L";
 const IDENTITY_TAG_XATTR: &[u8] = b"X";
 /// Format: IPC metadata has a separate identity domain from regular files and links.
 const IDENTITY_TAG_SPECIAL: &[u8] = b"I";
-/// A key of the green's state whose identity entry a commit changed (A-221): which dimension, and its path (and an
+/// A key of the green's state whose identity entry a commit changed (A-202): which dimension, and its path (and an
 /// attribute's name).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum IdentityKey {
@@ -294,7 +294,7 @@ const SPECIAL_NODE_BYTES: usize = size_of::<SpecialNode>();
 /// history holds the bytes; the namespace dimensions' histories hold presence or the value.
 #[derive(Debug, Default)]
 pub struct Green {
-  /// The set hash of every entry at `identity_version` (`crate::identity`, A-221): brought to the head only when
+  /// The set hash of every entry at `identity_version` (`crate::identity`, A-202): brought to the head only when
   /// the identity is read ([`Green::head_identity`]), by the keys in `identity_dirty`.
   identity: crate::identity::SetHash,
   /// The version `identity` is the set hash of.
@@ -621,7 +621,7 @@ enum Effect {
 }
 
 impl Effect {
-  /// The one key of the green's state this effect sets or removes (A-221).
+  /// The one key of the green's state this effect sets or removes (A-202).
   fn identity_key(&self) -> IdentityKey {
     match self {
       Effect::Special(path, _) | Effect::RemoveSpecial(path) => IdentityKey::Special(path.clone()),
@@ -719,7 +719,7 @@ impl Green {
   /// dimension — every field length-prefixed and tagged by kind — so two engines that
   /// applied the same increments to the same origin hash to the same identity, and a single
   /// differing byte anywhere (a file's content, a mode, a link target, an attribute) changes it.
-  /// A function of the state alone; it reads no clock. Since A-221 it is the set hash of every
+  /// A function of the state alone; it reads no clock. Since A-202 it is the set hash of every
   /// entry (`crate::identity`), brought up to date here by the keys changed since it was last read,
   /// so a read costs what changed since the last one, not what the green holds, and a commit pays
   /// nothing for it; it equals [`Green::head_identity_from_scratch`] in every state (it hashed every
@@ -1978,7 +1978,7 @@ impl Green {
     // Content removes are staged before sets so a rename's source removal never deletes a file the
     // same increment recreates or renames into at that path.
     for effect in effects {
-      // Every key an effect touches is marked once; the identity is brought up to date only when it is read (A-221).
+      // Every key an effect touches is marked once; the identity is brought up to date only when it is read (A-202).
       self.identity_dirty.insert(effect.identity_key());
       match effect {
         Effect::Special(path, node) => self.commit_special(path, node, version),
@@ -2319,7 +2319,7 @@ impl Green {
       return 0;
     }
     // The identity reads its keys' values at the version it was last brought to, so it is brought to the head
-    // before the history below the floor goes (A-221).
+    // before the history below the floor goes (A-202).
     if self.identity_version < floor {
       self.fold_identity();
     }

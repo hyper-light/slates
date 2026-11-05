@@ -7001,12 +7001,12 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > work reads one position per holder rather than rescanning the retained chain. Transfer to a new
 > candidate set and full green takeover remain owed (AUD-14).
 
-> **Status (2026-11-04, A-220: a submit's cost follows what it changed).** A work holds only the files it changed
+> **Status (2026-11-04, A-202: a submit's cost follows what it changed).** A work holds only the files it changed
 > since its base and reads the rest from the green's history there; an accept moves its base and clears that, in
 > O(1). The deriver composes over the base restricted to the journal's paths, and the merge record's identities are
 > made only for a record that goes to holders. An increment's identity names its work and its base, as the data model
 > below says (it had left both out, and a second work's identical edit was answered with the first work's version;
-> `docs/bugs/2026-11-04-the-same-edit-from-two-works-was-one-increment.md`). Since A-221 (2026-11-05) the head
+> `docs/bugs/2026-11-04-the-same-edit-from-two-works-was-one-increment.md`). Since A-202 (2026-11-05) the head
 > identity is a set hash over the green's entries, brought up to date when read, so a record at `f > 0` costs what its
 > version changed. Owed: the rebase's whole restatement.
 
@@ -10706,7 +10706,7 @@ work volumes are owed.
   the staging unit tests.
 
 ### A-84 — A work volume is charged for what it keeps (2026-10-05)
-Amended by A-220 (2026-11-04): a work keeps only the files it changed since its base, so a create or a recovered
+Amended by A-202 (2026-11-04): a work keeps only the files it changed since its base, so a create or a recovered
 rebuild is charged nothing and cannot be refused, and a submit secures no bound for the reset.
 Applied in the same change to: `crates/server/src/work_charge.rs` (new), `crates/merge/src/increment.rs`
 (`VolumeOp::footprint`), `crates/server/src/{verbs,merge_service,state}.rs` (`WorkState::charged`; edit, declare,
@@ -12903,47 +12903,7 @@ Applied in the same change to: §4.1 (its status), `crates/machine` (`facts.rs`:
     life while a chunk sealed under it lives, across a restart, and goes with its last chunk. Red before, and
     red-checked against each half of the fix.
 
-### A-221 — A green's head identity is a set hash over its entries, brought up to date when it is read (accepted and built 2026-11-05; the identity holders recompute, §4.16 "Apply on holders")
-Applied in the same change to: §4.16 (status), `docs/wip/merge-service.md` (the golden vector),
-`crates/merge/src/{identity,engine,lib}.rs`, `crates/merge/tests/{identity,origin,special,base_for}.rs`,
-`crates/merge/tests/common/{mod,generated}.rs`, `crates/server/src/{merge_service,verbs}.rs`, BENCHMARKS, GAPS.
-- **Why.** Every merge record at `f > 0` carries the green's head identity, which every holder recomputes and
-  compares before it serves the version. It was the BLAKE3 of every table of the green in key order, every byte of
-  every file included, so each accept at `f > 0` cost a pass over everything the green holds (113 of 120 submit
-  samples at 1,000 files, A-220). A-220 took it off the laptop's path only.
-- **What.** The identity is a set hash: each entry of the green's state (a file and its bytes, a directory, a mode,
-  a symlink, a hard link, an attribute, a FIFO/socket inode), encoded as before (its kind's tag, every field
-  length-prefixed), is expanded by BLAKE3's extendable output into 1,024 sixteen-bit lanes; the green's sum adds those
-  vectors lane by lane modulo 2^16; the identity is the BLAKE3 of the sum (`crates/merge/src/identity.rs`). This is
-  LtHash16 (Lewi, Kim, Maykov and Weis, IACR ePrint 2019/227, tier A; at least 200 bits of collision resistance at
-  these parameters; Bellare and Micciancio, EUROCRYPT 1997, for incremental hashing). Addition is commutative and
-  invertible, so the sum after any sequence of changes equals the sum over the final state, exactly. A commit only
-  marks the keys it changed; reading the identity (`Green::head_identity`, now `&mut self`) brings the sum up to
-  date from the version it was last read at, subtracting each marked key's entry there (from the per-dimension
-  histories) and adding its current one. A history fold first brings the identity up to the head, so the values it
-  subtracts are always still held. A key changed many times between reads costs one update, and a read at `f = 0`
-  never happens, so the laptop pays nothing. At `f > 0` each version's record reads it once: O(the keys that version
-  changed).
-- **Rejected, measured.** Keeping the sum up to date in every commit: on the loaded development Mac (load 21 to 37,
-  interleaved F G F G F G, 3 × 1,000 samples) accept at 10 files went from 44, 60, 51 µs to 78, 91, 101 µs at the
-  median, conflicts (no commit) unchanged, because each commit expanded two entries (a 4 KiB BLAKE3 took 13 µs and a
-  2 KiB extendable output 15 µs on that box under that load) that only a holder ever reads.
-- **Measured, the form built.** Brought up to date when read, against no running identity at all (the same box, load
-  23 to 31, interleaved F H F H F H): accept at 10 files 31, 53, 56 µs against 62, 50, 45 µs; at 1,000 files 59, 63,
-  48 µs against 60, 61, 44 µs; conflicts alike. No cost the shared box can show; the quiet runs are owed with the rest.
-- **The format changed.** The fixed origin's golden vector is now
-  `d6caa3225c45d46abd0a0df26a956a59479af07bcabd8f6ce1cec61f293e4146` (`crates/merge/tests/origin.rs`; it was
-  `1fe971c0…ab50d8`). A merge record written by a daemon before this change carries the old form, so a holder or a
-  successor built after it would find every such version a recomputation mismatch and refuse the green loudly, as
-  §4.16 requires of a mismatch. slates has no deployed fleet whose records outlive an upgrade; one that had would need
-  its records re-issued.
-- **Proven.** `crates/merge/tests/identity.rs`: over 20,000 generated histories in every dimension, with the identity
-  read at some steps and the history folded below the head at others, the running identity equals a recount from
-  scratch at every read (red with the fold's guard removed: the first generated case failed); one state reached in
-  two orders has one identity; a byte, a mode bit or a kind changes it and restoring the byte restores it. The
-  fleet's holder-recompute, mismatch and takeover tests pass unchanged (BENCHMARKS, GAPS).
-
-### A-220 — A submit's cost follows what it changed, not what the green holds; a work is a delta over its base (accepted and built 2026-11-04, Ada's goal of 2026-11-04: a full edit and merge under 1 ms, preferably under 50 µs)
+### A-202 — A submit's cost follows what it changed, not what the green holds; a work is a delta over its base (accepted and built 2026-11-04, Ada's goal of 2026-11-04: a full edit and merge under 1 ms, preferably under 50 µs)
 Applied in the same change to: §4.16 (status), A-84 (what a work keeps and when its charge can be refused),
 `crates/server/src/{work_files,work_charge,verbs,merge_service,listing,state,lib}.rs`, `crates/merge/src/{engine,
 increment}.rs`, `crates/merge/tests/base_for.rs` (new), `crates/server/tests/daemon.rs`, `crates/client/examples/
@@ -12993,15 +12953,52 @@ edit_merge_bench.rs` (its verdict forms), `crates/client/tests/merge_identity.rs
   client; every version told to exactly one submit and read back; 200 rounds, 6 crossing a restart, 0 errors, on
   adas-macbook-pro-2 2026-11-05 with `SLATES_TEST_CLI=1`; red with the accepted version's durable append removed,
   where the successor's chain was empty and versions 1 to 20 had each been told six times).
-- **Owed.** At `f > 0` every accept still makes the head identity over every byte: an identity holders recompute
-  in O(changed) needs its own amendment first (a set hash over per-entry digests, LtHash, Lewi et al. 2019, IACR
-  ePrint 2019/227, kept byte-identical to a full recompute by an oracle). The rebase's restatement is whole (the
+- **Owed.** At `f > 0` every accept still made the head identity over every byte (part 2 below makes it
+  O(changed)). The rebase's restatement is whole (the
   engine returns every file). `PathTable::intern` searches linearly, so composing one increment of n paths is O(n²).
   The engine keeps each current file twice (its content map and its history). The growth forms of
   `edit_merge_bench` (the clients agent's, folded into one harness with these forms) no longer grow: the last hundred
   of a thousand new-file merges' medians 6.8 to 22.5 µs at load 23 to 25, against 529 to 684 µs before.
 
-  The engine keeps each current file twice (its content map and its history).
+**Part 2 — A green's head identity is a set hash over its entries, brought up to date when it is read (accepted and built 2026-11-05; the identity holders recompute, §4.16 "Apply on holders").**
+Applied in the same change to: §4.16 (status), `docs/wip/merge-service.md` (the golden vector),
+`crates/merge/src/{identity,engine,lib}.rs`, `crates/merge/tests/{identity,origin,special,base_for}.rs`,
+`crates/merge/tests/common/{mod,generated}.rs`, `crates/server/src/{merge_service,verbs}.rs`, BENCHMARKS, GAPS.
+- **Why.** Every merge record at `f > 0` carries the green's head identity, which every holder recomputes and
+  compares before it serves the version. It was the BLAKE3 of every table of the green in key order, every byte of
+  every file included, so each accept at `f > 0` cost a pass over everything the green holds (113 of 120 submit
+  samples at 1,000 files, part 1). Part 1 took it off the laptop's path only.
+- **What.** The identity is a set hash: each entry of the green's state (a file and its bytes, a directory, a mode,
+  a symlink, a hard link, an attribute, a FIFO/socket inode), encoded as before (its kind's tag, every field
+  length-prefixed), is expanded by BLAKE3's extendable output into 1,024 sixteen-bit lanes; the green's sum adds those
+  vectors lane by lane modulo 2^16; the identity is the BLAKE3 of the sum (`crates/merge/src/identity.rs`). This is
+  LtHash16 (Lewi, Kim, Maykov and Weis, IACR ePrint 2019/227, tier A; at least 200 bits of collision resistance at
+  these parameters; Bellare and Micciancio, EUROCRYPT 1997, for incremental hashing). Addition is commutative and
+  invertible, so the sum after any sequence of changes equals the sum over the final state, exactly. A commit only
+  marks the keys it changed; reading the identity (`Green::head_identity`, now `&mut self`) brings the sum up to
+  date from the version it was last read at, subtracting each marked key's entry there (from the per-dimension
+  histories) and adding its current one. A history fold first brings the identity up to the head, so the values it
+  subtracts are always still held. A key changed many times between reads costs one update, and a read at `f = 0`
+  never happens, so the laptop pays nothing. At `f > 0` each version's record reads it once: O(the keys that version
+  changed).
+- **Rejected, measured.** Keeping the sum up to date in every commit: on the loaded development Mac (load 21 to 37,
+  interleaved F G F G F G, 3 × 1,000 samples) accept at 10 files went from 44, 60, 51 µs to 78, 91, 101 µs at the
+  median, conflicts (no commit) unchanged, because each commit expanded two entries (a 4 KiB BLAKE3 took 13 µs and a
+  2 KiB extendable output 15 µs on that box under that load) that only a holder ever reads.
+- **Measured, the form built.** Brought up to date when read, against no running identity at all (the same box, load
+  23 to 31, interleaved F H F H F H): accept at 10 files 31, 53, 56 µs against 62, 50, 45 µs; at 1,000 files 59, 63,
+  48 µs against 60, 61, 44 µs; conflicts alike. No cost the shared box can show; the quiet runs are owed with the rest.
+- **The format changed.** The fixed origin's golden vector is now
+  `d6caa3225c45d46abd0a0df26a956a59479af07bcabd8f6ce1cec61f293e4146` (`crates/merge/tests/origin.rs`; it was
+  `1fe971c0…ab50d8`). A merge record written by a daemon before this change carries the old form, so a holder or a
+  successor built after it would find every such version a recomputation mismatch and refuse the green loudly, as
+  §4.16 requires of a mismatch. slates has no deployed fleet whose records outlive an upgrade; one that had would need
+  its records re-issued.
+- **Proven.** `crates/merge/tests/identity.rs`: over 20,000 generated histories in every dimension, with the identity
+  read at some steps and the history folded below the head at others, the running identity equals a recount from
+  scratch at every read (red with the fold's guard removed: the first generated case failed); one state reached in
+  two orders has one identity; a byte, a mode bit or a kind changes it and restoring the byte restores it. The
+  fleet's holder-recompute, mismatch and takeover tests pass unchanged (BENCHMARKS, GAPS).
 
 ### A-211 — A DAX ask is refused where no view could begin (accepted and built 2026-11-04)
 Applied in the same change to: §4.6 by reference, `docs/wip/shards/dax-protocol.md` ("Windows"), GAPS,

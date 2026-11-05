@@ -1,4 +1,4 @@
-//! The head identity's oracle (A-221; §4.16 "Apply on holders"): the identity a green keeps as its entries change
+//! The head identity's oracle (A-202; §4.16 "Apply on holders"): the identity a green keeps as its entries change
 //! equals the identity recounted from scratch over its state, after every step of generated histories in every
 //! dimension; two greens that reach one state by different orders have one identity; and a single differing byte
 //! anywhere gives another. A holder recomputes the identity by replaying the increments through the same engine, so
@@ -17,7 +17,7 @@ use slates_merge::origin::Origin;
 
 proptest! {
   #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
-  /// A-221: do apply generated increments (files, directories, modes, symlinks, hard links, attributes, renames and
+  /// A-202: do apply generated increments (files, directories, modes, symlinks, hard links, attributes, renames and
   /// removals; some conflict and change nothing) to a green over a generated origin, after one create that always
   /// commits, reading the identity at some steps and folding the history below the head at others; expect the
   /// running identity to equal the from-scratch one at every read.
@@ -54,7 +54,7 @@ proptest! {
   }
 }
 
-/// A-221 (order independence, what a holder relies on): do build one state twice, the same disjoint edits applied in
+/// A-202 (order independence, what a holder relies on): do build one state twice, the same disjoint edits applied in
 /// opposite orders; expect one identity, equal to the recount.
 #[test]
 fn one_state_reached_in_two_orders_has_one_identity() {
@@ -88,7 +88,7 @@ fn one_state_reached_in_two_orders_has_one_identity() {
   );
 }
 
-/// A-221 (sensitivity): do change one byte of one file, one mode bit, or a file into a directory of the same name;
+/// A-202 (sensitivity): do change one byte of one file, one mode bit, or a file into a directory of the same name;
 /// expect a different identity each time, and the same identity back when the byte is restored.
 #[test]
 fn one_differing_byte_anywhere_changes_the_identity() {
