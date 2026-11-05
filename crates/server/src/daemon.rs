@@ -39,7 +39,9 @@ use crate::verbs;
 pub(crate) async fn pace(ns: u64) {
   if let Err(refusal) = slates_rt::futures::sleep(ns).await {
     if crate::fleet::count_refusal(SLEEP_REFUSED) == 1 {
-      eprintln!("slates-server: a periodic loop's sleep was refused ({refusal}); the loop stops");
+      slates_machine::log_line!(
+        "slates-server: a periodic loop's sleep was refused ({refusal}); the loop stops"
+      );
     }
     std::future::pending::<()>().await;
   }
@@ -382,7 +384,7 @@ pub(crate) fn release_client_id(client_id: u32, control: u16) {
   if let Err(e) = registry::send_control(control, Control::Spawn(forget))
     && RELEASE_LOST.fetch_add(1, Ordering::AcqRel) == 0
   {
-    eprintln!(
+    slates_machine::log_line!(
       "slates-server: client {client_id}'s id could not be given back to the control shard: {e} (first \
        occurrence; later ones are counted)"
     );
@@ -418,7 +420,7 @@ impl Drop for Admission {
     }
     release_client_id(self.client_id, self.control);
     if HANDOFF_LOST.fetch_add(1, Ordering::AcqRel) == 0 {
-      eprintln!(
+      slates_machine::log_line!(
         "slates-server: client {}'s seat was refused by its shard; its id is given back (first \
          occurrence; later ones are counted)",
         self.client_id
@@ -678,7 +680,7 @@ impl Daemon {
     // the anchor's locked page; sealing reports itself unavailable, never unlocked, where the OS refuses the lock.
     let sealing = crate::seal_keys::init(&mut segment, config.seal_key_slots);
     if let Some((was, now)) = limits::raise_descriptor_limit() {
-      eprintln!("slates-server: descriptor limit raised from {was} to {now}");
+      slates_machine::log_line!("slates-server: descriptor limit raised from {was} to {now}");
     }
     let retained = crate::retention::load(&segment)?;
     let runtime = Runtime::start(&config.runtime)?;
@@ -746,10 +748,12 @@ impl Daemon {
         );
         let took_us = started.elapsed().as_micros();
         match outcome {
-          Ok(()) => eprintln!("slates-server: shard {partition} initialized in {took_us} µs"),
+          Ok(()) => slates_machine::log_line!(
+            "slates-server: shard {partition} initialized in {took_us} µs"
+          ),
           Err(e) => {
             INIT_FAILURES.fetch_add(1, Ordering::AcqRel);
-            eprintln!(
+            slates_machine::log_line!(
               "slates-server: shard {partition} failed to initialize after {took_us} µs: {e}"
             );
           }
@@ -792,7 +796,7 @@ impl Daemon {
       // cross-shard reply registrations, which must never migrate between threads.
       if task.and_then(futures::detach).is_err() {
         INIT_FAILURES.fetch_add(1, Ordering::AcqRel);
-        eprintln!("slates-server: the control loop could not be seated");
+        slates_machine::log_line!("slates-server: the control loop could not be seated");
       }
     })?;
     // In a fleet (§4.8, boot step 6): the control shard runs the membership loop over the fleet transport,
@@ -2741,7 +2745,7 @@ impl Daemon {
     if let Some(runtime) = self.runtime.take()
       && let Err(error) = runtime.shutdown()
     {
-      eprintln!("slates-server: stopping the daemon's shards: {error}");
+      slates_machine::log_line!("slates-server: stopping the daemon's shards: {error}");
     }
   }
 }
@@ -3419,7 +3423,9 @@ fn init_shard(
     state.seal_recipient = match crate::seal_keys::recipient(&mut state) {
       Ok(recipient) => Some(recipient),
       Err(e) => {
-        eprintln!("slates-server: the node's sealing recipient is unavailable: {e:?}");
+        slates_machine::log_line!(
+          "slates-server: the node's sealing recipient is unavailable: {e:?}"
+        );
         None
       }
     };
@@ -3435,7 +3441,7 @@ fn init_shard(
     // Say what recovery did, not more: volumes rebuilt from their recovery images in anchor-owned
     // RAM (content, tree and snapshots restored, §4.8), the ones that could not be (refused, never
     // presented empty), and what the images did not carry and was reconciled out of the catalog.
-    eprintln!(
+    slates_machine::log_line!(
       "slates-server: shard {shard}: recovered {} volumes from their images ({} refused), {} merge volumes (green chains replayed, works reset), reconciled out {} unrecovered local snapshots and {} attachments, trimmed {} unacknowledged snapshots the images carried, completed {} destroys in flight, corrected {} clone pins, reclaimed {} orphans no holder survived, took back {} writable copies, replayed {} logged writes",
       rebuilt.volumes,
       rebuilt.skipped,
@@ -3449,7 +3455,7 @@ fn init_shard(
       rebuilt.copies_adopted,
       rebuilt.writes_replayed
     );
-    eprintln!(
+    slates_machine::log_line!(
       "slates-server: shard {shard}: held {} replicas again from the image{}",
       rebuilt.replicas,
       if rebuilt.replicas_refused {
@@ -4076,7 +4082,7 @@ async fn restore_client_ids(listener: &mut Listener, origin: u16, shards: &[Shar
   for shard in shards {
     let Some(retained) = retained_client_ids(origin, shard.0).await else {
       INIT_FAILURES.fetch_add(1, Ordering::AcqRel);
-      eprintln!(
+      slates_machine::log_line!(
         "slates-server: client identity recovery refused on shard {}",
         shard.0
       );
@@ -4121,7 +4127,7 @@ async fn retained_client_ids(origin: u16, shard: u16) -> Option<u32> {
         if now.is_none() || now == progress {
           return None;
         }
-        eprintln!(
+        slates_machine::log_line!(
           "slates-server: shard {shard} is still starting; the control loop waits a further window"
         );
         progress = now;
@@ -4203,7 +4209,7 @@ async fn control_loop(
     crate::fleet::count_refusal(LOOP_SPAWN_REFUSED);
   }
   if !restore_client_ids(&mut listener, control, &shards).await {
-    eprintln!(
+    slates_machine::log_line!(
       "slates-server: the boot is refused; the heartbeat stops so the anchor restarts this daemon"
     );
     return;
@@ -4267,7 +4273,7 @@ async fn control_loop(
         slates_ipc::IpcError::HandoffLost { client_id, cause } => {
           state::with_handed(|h| h.remove(&client_id));
           if HANDOFF_LOST.fetch_add(1, Ordering::AcqRel) == 0 {
-            eprintln!(
+            slates_machine::log_line!(
               "slates-server: client {client_id}'s handoff failed after admission: {cause} (first \
                occurrence; later ones are counted)"
             );
@@ -4275,7 +4281,7 @@ async fn control_loop(
         }
         refusal => {
           if CLAIMS_REFUSED.fetch_add(1, Ordering::AcqRel) == 0 {
-            eprintln!(
+            slates_machine::log_line!(
               "slates-server: a client's claim was refused: {refusal} (first occurrence; later ones \
                are counted)"
             );
@@ -4286,7 +4292,7 @@ async fn control_loop(
     if let Some(failure) = round.ended
       && ACCEPTS_FAILED.fetch_add(1, Ordering::AcqRel) == 0
     {
-      eprintln!(
+      slates_machine::log_line!(
         "slates-server: a rendezvous accept round ended early: {failure} (first occurrence; later \
          ones are counted)"
       );
@@ -4334,7 +4340,9 @@ async fn control_loop(
               }) {
                 Ok(_) => admission.seat(),
                 Err(e) => {
-                  eprintln!("slates-server: client {client_id} refused by the shard's table: {e}");
+                  slates_machine::log_line!(
+                    "slates-server: client {client_id} refused by the shard's table: {e}"
+                  );
                 }
               }
               s.server_task
@@ -4346,7 +4354,9 @@ async fn control_loop(
               Some(None) => {}
               None => {
                 HANDOFF_LOST.fetch_add(1, Ordering::AcqRel);
-                eprintln!("slates-server: client {client_id} handed to a shard without state");
+                slates_machine::log_line!(
+                  "slates-server: client {client_id} handed to a shard without state"
+                );
               }
             }
           }),
@@ -4354,7 +4364,7 @@ async fn control_loop(
         ));
         if let Err(e) = registry::send_control(shard.0, Control::Spawn(request)) {
           HANDOFF_LOST.fetch_add(1, Ordering::AcqRel);
-          eprintln!(
+          slates_machine::log_line!(
             "slates-server: client {client_id} could not be handed to shard {}: {e}",
             shard.0
           );
@@ -4363,7 +4373,7 @@ async fn control_loop(
     }
     if let Err(error) = wait_for_rendezvous(&listener).await {
       ACCEPTS_FAILED.fetch_add(1, Ordering::AcqRel);
-      eprintln!("slates-server: rendezvous readiness failed: {error}");
+      slates_machine::log_line!("slates-server: rendezvous readiness failed: {error}");
       return;
     }
   }
@@ -4527,7 +4537,7 @@ fn log_late_beat(
   }
   let delta =
     |field: fn(&slates_rt::shard::Counters) -> u64| field(after).saturating_sub(field(before));
-  eprintln!(
+  slates_machine::log_line!(
     "slates daemon: a heartbeat came {} ms after the last (the anchor's budget is {} ms): in the gap the shard \
      ran {} steps and {} polls ({} long in a task, {} blocked in the kernel, {} preempted by the host, {} \
      unattributed), fired {} timers, waited {} times, spawned {} tasks and finished {}; {} tasks live; its \
@@ -4624,7 +4634,7 @@ fn start_shards_route(
   let listener = match slates_ipc::route::Listener::bind(&config.instance) {
     Ok(listener) => listener,
     Err(error) => {
-      eprintln!(
+      slates_machine::log_line!(
         "slates-server: the Shards stream route did not bind ({error}); a Shards attach is refused"
       );
       crate::fleet::count_refusal(SHARDS_ROUTE_UNBOUND);
@@ -4660,7 +4670,7 @@ fn release_devices_without_fuse(devices: Vec<crate::anchor_hold::HandedDevice>) 
     session,
   } in devices
   {
-    eprintln!(
+    slates_machine::log_line!(
       "slates-server: the anchor handed back FUSE device {attachment:x} ({}), which this platform cannot serve; released",
       if session.is_some() {
         "negotiated"
