@@ -1139,7 +1139,7 @@ impl DaemonConfig {
   /// Derived: the bytes the calling shard can copy in one whole step quantum now, at the measured memcpy rate
   /// (`memcpy_bytes_per_second × step_quantum_ns / 1e9`), at least one. A lower bound on what a quantum's work must
   /// copy past: work that copies more bytes than this cannot finish within the quantum. An NFS connection's turn stops
-  /// taking records there (`crate::nfs`, `read_head`).
+  /// taking records there (`crate::nfs`, `read_head`; A-204).
   pub fn quantum_copy_bytes(&self) -> u64 {
     self
       .memcpy_bytes_per_second
