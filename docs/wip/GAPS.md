@@ -1,5 +1,15 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A merge's cost grows with its green's file count (2026-11-05, RQ-4, §4.16; OPEN, perf's).** The new
+> `crates/client/examples/edit_merge_bench.rs` measures, on macOS arm64 at load 9, an accepted submit's median at
+> 25–161 µs over a green's first hundred versions and 529–684 µs over its last hundred (six runs). Each version adds a
+> file. One file replaced 1,000 times shows no growth, and an edit shows none in either form. Every submit clones
+> each path of the green (`Green::current_base`), walks each base file (`compose_volume`), and hashes each byte of the
+> green (`Green::head_identity` in `merge_service::enqueue_record`). That puts RQ-4's millisecond out of reach for a
+> repository-sized green. The fix is the perf agent's. The clients agent re-measures merge on every platform once it
+> lands. Also open from the same runs: a sevenfold p50 split between two invocations on this Mac (edit 18.8 against
+> 2.5 µs). Record: `BENCHMARKS.md`, "The client's edit and merge latency".
+
 > **Audit of 2dc9f3eb..98000d56 (2026-11-03): defects open, Step 9's evidence holds.** Nine commits made on
 > 2026-11-01 and 2026-11-02 were read line by line against this file's rules and Step 9's acceptance. Every CI run they
 > cite was read again: each shows what it is cited for, except one pair of timings A-198 gave the wrong way
