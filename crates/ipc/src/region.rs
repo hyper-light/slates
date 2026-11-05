@@ -14,8 +14,9 @@ use crate::slot::Ring;
 /// Format: the region's magic, `SLCR` in little-endian ASCII.
 pub const MAGIC: u32 = 0x5243_4C53;
 /// Format: the layout version. Version 2 (2026-09-25) added the spin estimate's shift to the header and
-/// the reply stamp to the words block (§4.7, the client's online wake estimate).
-pub const LAYOUT_VERSION: u32 = 2;
+/// the reply stamp to the words block (§4.7, the client's online wake estimate). Version 3 (2026-11-04)
+/// made the reply stamp two, one per park parity, named by the client's parked flag's value.
+pub const LAYOUT_VERSION: u32 = 3;
 /// Format: the header's size (two cache lines): magic (4), version (4), client id (4), shard
 /// (2), padding (2), slots per ring (4), spin ns (4), command ring offset (8), completion
 /// ring offset (8), bulk offset (8), bulk length (8), spin shift (4), padding.
@@ -45,8 +46,9 @@ const AT_SPIN_SHIFT: usize = 56;
 /// Format: the words block after the header, one cache line each: the wake word (the daemon
 /// bumps it per reply), the client's parked flag, the daemon's parked flag (a shard parked
 /// in its driver), the client's doorbell (the client bumps it per request when the daemon is
-/// parked; the doorbell thread or the eventfd carries it on), and the reply stamp (the host clock
-/// when the daemon first woke the parked client; the client clears it before it parks).
+/// parked; the doorbell thread or the eventfd carries it on), and the two reply stamps (the host clock
+/// when the daemon first woke the parked client, in the slot the park's parity names; the client clears
+/// that slot before it parks).
 pub const WORDS_OFFSET: usize = HEADER_BYTES;
 /// Format: the wake word's offset.
 const AT_WAKE: usize = WORDS_OFFSET;
@@ -56,8 +58,20 @@ const AT_CLIENT_PARKED: usize = WORDS_OFFSET + 64;
 const AT_DAEMON_PARKED: usize = WORDS_OFFSET + 128;
 /// Format: the doorbell's offset.
 const AT_DOORBELL: usize = WORDS_OFFSET + 192;
-/// Format: the reply stamp's offset.
+/// Format: the reply stamps' offset: two `u64` slots, side by side in one cache line.
 const AT_REPLY_STAMP: usize = WORDS_OFFSET + 256;
+/// Shape: reply stamp slots. A park's confirmation can land after the woken client has armed its next
+/// park (the waker is preempted between its wake and its confirmation), so that next park stamps the other
+/// slot; one daemon serves a ring in order, so by the park after that the first slot's reply call has
+/// returned and its stamp is final. One slot cost a sample per late confirmation (the bug record of
+/// 2026-11-04).
+pub const REPLY_STAMP_SLOTS: usize = 2;
+/// Format: the client's parked flag while it waits in a park that stamps slot 0. Zero is not parked; any
+/// other value the daemon reads names slot 0, so a hostile client chooses only which of its own slots
+/// is stamped.
+pub const PARKED_STAMP_SLOT_ZERO: u32 = 1;
+/// Format: the client's parked flag while it waits in a park that stamps slot 1.
+pub const PARKED_STAMP_SLOT_ONE: u32 = 2;
 /// Format: the reply stamp's confirmed bit, the top one: set by the daemon after its wake found the
 /// client asleep in its wait (the kernel had a sleeper to wake), so the stamp times a sleeper woken — the
 /// event the boot probe measures. The low 63 bits are the stamp's nanoseconds (292 years of uptime).
@@ -112,13 +126,19 @@ impl RegionGeometry {
   }
 }
 
-/// The region's own words, each a run of one: wake, the two parked flags, the doorbell, the reply stamp.
+/// The region's own words: wake, the two parked flags and the doorbell, each a run of one, and the run of
+/// reply stamps.
 const REGION_WORDS: [WordRun; 5] = [
   WordRun::one(AT_WAKE, Width::U32),
   WordRun::one(AT_CLIENT_PARKED, Width::U32),
   WordRun::one(AT_DAEMON_PARKED, Width::U32),
   WordRun::one(AT_DOORBELL, Width::U32),
-  WordRun::one(AT_REPLY_STAMP, Width::U64),
+  WordRun::strided(
+    AT_REPLY_STAMP,
+    Width::U64.bytes(),
+    REPLY_STAMP_SLOTS,
+    Width::U64,
+  ),
 ];
 
 /// The region's own words, resolved once in its object so every wait and wake reaches them in constant
@@ -260,9 +280,11 @@ impl ClientRegion {
     for id in [ids.wake, ids.client_parked, ids.daemon_parked, ids.doorbell] {
       object.run_u32(id, 0)?.store(0, Ordering::Release);
     }
-    object
-      .run_u64(ids.reply_stamp, 0)?
-      .store(0, Ordering::Release);
+    for slot in 0..REPLY_STAMP_SLOTS {
+      object
+        .run_u64(ids.reply_stamp, slot)?
+        .store(0, Ordering::Release);
+    }
     #[cfg(windows)]
     let wake_event = windows_wake_event(&object)?;
     Ok(ClientRegion {
@@ -439,11 +461,12 @@ impl ClientRegion {
     Ok(self.object.run_u32(self.ids.doorbell, 0)?)
   }
 
-  /// The reply stamp: the host clock (`slates_machine::clock::monotonic_ns`) when the daemon first woke
-  /// the parked client, with [`REPLY_STAMP_CONFIRMED`] set once that wake found the client asleep; zero
-  /// once the client has cleared it.
-  pub fn reply_stamp(&self) -> Result<&AtomicU64, IpcError> {
-    Ok(self.object.run_u64(self.ids.reply_stamp, 0)?)
+  /// A reply stamp slot (`0` or `1`, below [`REPLY_STAMP_SLOTS`]): the host clock
+  /// (`slates_machine::clock::monotonic_ns`) when the daemon first woke a park that named this slot, with
+  /// [`REPLY_STAMP_CONFIRMED`] set once that wake found the client asleep; zero once the client has
+  /// cleared it. A slot past the run is refused by the run's bound.
+  pub fn reply_stamp(&self, slot: usize) -> Result<&AtomicU64, IpcError> {
+    Ok(self.object.run_u64(self.ids.reply_stamp, slot)?)
   }
 
   /// The bulk area's bytes.

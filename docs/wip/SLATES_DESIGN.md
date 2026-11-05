@@ -4136,8 +4136,9 @@ root-relative path as an explicit alternative; it does not report that the reque
 ```rust
 #[repr(C, align(64))] struct Slot { seq: AtomicU64, kind: u16, len: u16, payload: [u8; 44], pad: [u8; 4] }
 struct Ring { slots: [Slot; N], head: CachePadded<AtomicU64>, tail: CachePadded<AtomicU64> }
-struct ClientRegion { magic, version /* 2 */, client_id, shard: u16, cmd: Ring, cpl: Ring, wake: WakeWord, parked: AtomicU32,
-                     spin_ns: u32, spin_shift: u32, reply_stamp: AtomicU64 /* bit 63: the wake found a sleeper */ }
+struct ClientRegion { magic, version /* 3 */, client_id, shard: u16, cmd: Ring, cpl: Ring, wake: WakeWord, parked: AtomicU32,
+                     spin_ns: u32, spin_shift: u32,
+                     reply_stamp: [AtomicU64; 2] /* one per park parity; bit 63: the wake found a sleeper */ }
 ```
 Ownership: the daemon creates the region (memfd / shm_open object / pagefile section), locks it,
 and hands it to one client; the client writes only `cmd` slots and the `parked` flag; the daemon
@@ -4219,12 +4220,13 @@ a slot kind.
 
 **Wake strategy.** Client: write slot, publish `tail` (release), read `cpl` head with acquire in a
 loop for its wake estimate (seeded with `spin_ns`, the daemon-published measured wake cost, and
-refined from the client's own parks, A-31), then clear the reply stamp, set `parked = 1`, fence
+refined from the client's own parks, A-31), then clear the reply stamp slot this park names (the two
+slots alternate park by park, A-199), set `parked` to that slot's value (1 or 2), fence
 (`SeqCst`; the park protocol, A-44), re-check the reply (to close the race), and wait on the wake word
 (futex / `os_sync_wait_on_address(SHARED)` / the Event). Daemon: after writing a reply and advancing
 the wake word, fence and read `parked`; if set, advance the word once more, stamp the host clock into
-`reply_stamp` (the first reply of the park only), wake (futex wake / wake by address / `SetEvent`),
-mark the stamp confirmed when the wake reports it found a sleeper (Linux and macOS; Windows' Event
+the `reply_stamp` slot the flag's value names (the first reply of the park only), wake (futex wake / wake by address / `SetEvent`),
+mark that stamp confirmed when the wake reports it found a sleeper (Linux and macOS; Windows' Event
 cannot tell, so there a stamp inside the wait is taken unconfirmed), and, for SDK event loops, signal
 the completion fd (eventfd / pipe / socket) so `add_reader`/`uv_poll` fires. Where no descriptor can be
 shared (macOS, Windows), a client-local bridge thread makes its pipe or socket readable after every
@@ -4245,6 +4247,19 @@ drops.
 > **Status (2026-09-22, the client ring follows Little's law).** The client ring was not sized by the formula below: `slots_per_ring` reused the runtime's inbound-ring depth, `wake.p99 / syscall.median` from one boot probe, and each client's bulk area scales with it. The probe's tail is unstable (the pod image's own profile gave wake p99 from 667 ns to 511,042 ns across runs a minute apart, often from 64 samples), so three KIND pods of one image derived 16384, 8 and 256 slots and seated 1, 1285 and 41 clients; the one-seat pod refused the lane's `bootstrap` while its readiness probe held the seat, and CI's macOS runner seated two clients and refused the restart test's third. The ring is now `next_power_of_two(requests_in_flight_per_shard)`, this Little's law value (32 slots); every pod of a two-CPU fresh-cluster run logs 32 slots and 330 client seats. Owed: the admission value rests on two stated assumptions rather than measured rates. (The wake probe's two events and unconverged tail, and `spin_ns` reading the p50, were closed on 2026-09-25: §4.1's status.) Record: `docs/bugs/2026-09-22-client-ring-sized-by-the-wake-tail-not-littles-law.md`.
 
 > **Status (2026-09-25, A-31: the client learns its own wake).** A client spun for the daemon's boot mean for its whole life. It now spins for an online estimate seeded with that mean (`spin_ns`, weighted over about `2^spin_shift` wakes) and refined from its own parks: the daemon stamps the host clock into the region's `reply_stamp` before it wakes a parked client, marks it confirmed when its wake call reports a sleeper found (`futex_wake`'s count; `os_sync_wake_by_address_any` refuses `ENOENT` when none), and the client folds a confirmed stamp inside its wait into the estimate (`ClientEnd::wait`, `wake_samples`); a confirmation that lands after the woken client read the stamp is settled at its next wait. The region's layout goes to version 2 (a client of another version is refused by name, as before). Confirmation is not decoration: without it, a daemon replying the instant the parked flag rose taught the client 611–974 ns on Apple silicon against the boot probe's 2.0–3.3 µs for confirmed sleepers, because such a reply lands while the client's wait is being set up and the wait returns without sleeping. The same evidence corrects a benchmark: `ipc_bench`'s `ring_round_trip_parked_and_woken` row (ratcheted at 1,233 ns here) is mostly that race — of 2,000 parked trips per run only 2, 18, 11, 1 and 1 slept on Apple silicon and 1–3 on Linux (503–545 ns, against a confirmed-sleeper mean of 15–17 µs there); the bench now prints the count, and `docs/wip/BENCHMARKS.md` records the correction. Proven by use in `crates/ipc/tests/rings.rs` (`a_client_learns_its_wake_from_the_parks_a_reply_ended`; a client that never parked learns nothing and keeps the published window). Record: `docs/bugs/2026-09-25-wake-estimate-frozen-at-boot-and-preemptions-counted-as-long-steps.md`.
+
+> **Status (2026-11-04, A-199: a late confirmation keeps its own stamp).** The woken client can outrun its waker:
+> the daemon is preempted between its wake call and the confirmation, and the client takes its reply, sends the
+> next request and arms its next park first. With one stamp that park cleared the word, so the sample was given
+> up, and the late confirmation then set a bare confirmed bit on the cleared word, which refused the following
+> park's stamp: one late confirmation cost two samples. Measured on adacachy, 2026-11-04, the learning case pinned
+> to two busy CPUs taught 0–14 of 32 parks; in every failing run the out-of-window stamps (all zero) matched the
+> given-up ones one for one. Now the region holds two stamps, the parks alternate between them, and the parked
+> flag's value (1 or 2) names the slot; the confirmation is an exchange on the exact stamp the wake timed. One
+> daemon serves a ring in order, so by the time the client arms a slot again the reply call that stamped it has
+> returned and its confirmation is final. The region's layout goes to version 3. Interleaved, 100 runs each, the
+> learning case failed 100 of 100 before and 0 of 100 after on one CPU with two busy loops, and 89 and 0 on two
+> CPUs with four. Record: `docs/bugs/2026-11-04-a-late-wake-confirmation-cost-the-client-two-samples.md`.
 
 > **Status (2026-09-29, A-42: the idle spin is opened by client activity and ends with its window).** The
 > daemon set a shard "active" at its first client's handoff and nothing cleared it, so from then on every
@@ -13116,6 +13131,27 @@ and failed-then-passing oracles distinguish those results from the initial sourc
   - The per-node word for the file (see above).
   - Rebuilding the successor's handle store from the ledger (`Slab::insert_at`): the bridge's release already settles a
     predecessor's handle by its file, as for FUSE, so a rebuilt store would only duplicate that accounting.
+
+### A-199 — A client's reply stamps alternate by park, so a late confirmation is never lost (accepted 2026-11-04)
+
+A-31's client learns a wake only when the daemon's wake call confirms a sleeper, and it said a confirmation that
+lands after the woken client read the stamp is settled at its next wait. Under load it is not: the waker is
+preempted between its wake and its confirmation while the woken client runs on, takes its reply, sends the next
+request and arms its next park, which cleared the one stamp. The late confirmation then set a bare confirmed bit
+there, so the following park's stamp was refused too. Replace the one stamp with two: the client's parks
+alternate between them, the parked flag's value names the park's slot (1 for slot 0, 2 for slot 1; zero is not
+parked, and any other armed value names slot 0, so a hostile client chooses only which of its own slots is
+stamped), and the daemon confirms by an exchange on the exact stamp it wrote. One daemon serves a ring in order,
+so the slot a park arms was last stamped by a reply call that returned before the reply the client took since.
+An unconfirmed stamp is held in its slot until that slot is armed again, then given up. The async path arms slot
+0 and times nothing. Rejected: a client-side sleep signal (a futex wait's zero return), which macOS's wait does
+not give, and would make the two platforms learn by different rules.
+
+Applied in the same change to: §4.7 (data model, wake strategy, status); `slates-ipc` (region layout version 3,
+`REPLY_STAMP_SLOTS`, `PARKED_STAMP_SLOT_ZERO`/`ONE`, `ClientRegion::reply_stamp(slot)`, `ClientEnd::wait`'s park
+and settle, `DaemonEnd::reply`'s stamp and confirmation) and `crates/ipc/tests/rings.rs`; GAPS. Evidence:
+`docs/bugs/2026-11-04-a-late-wake-confirmation-cost-the-client-two-samples.md`. A client and a daemon of
+different layout versions refuse each other by name; no consensus rule or capability changes.
 
 ### A-197 — pmem over a handed copy: a socket route for every pmem VMM (accepted and built on Linux x86_64 2026-11-01, Step 6 of the VFS and DAX plan; Firecracker on arm64 owed)
 Applied in the same change to: A-186 (the copy's length), GAPS, `crates/ipc` (`protocol.rs`: `MapWrite`'s `granule`;
