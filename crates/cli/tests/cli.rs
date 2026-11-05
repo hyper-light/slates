@@ -10945,3 +10945,76 @@ fn a_real_anchors_hold_refusals_show_in_slates_status() {
     "slates status reports the anchor's refusals; last status: {last}"
   );
 }
+
+/// The panic rule (CLAUDE.md §2, item 6). Do: start the real anchor with its log piped, wait for its daemon to serve,
+/// close the log's reader, as `slates anchor 2>&1 >/dev/null | head -n 1` does once `head` has its line, then kill the
+/// daemon, so the anchor and its next daemon both write log lines into a pipe nobody reads. Expect: the anchor is still
+/// running, and a new daemon answers. Before, the anchor's next log line panicked on the broken pipe and the process
+/// aborted (exit 134), taking its daemon and every held mount with it.
+#[test]
+fn an_anchor_whose_log_reader_went_away_keeps_supervising() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the anchor with a closed log: set SLATES_TEST_CLI=1 to run it (an anchor and its daemon)"
+    );
+    return;
+  }
+  let instance = format!("cli-closed-log-{}", std::process::id());
+  let (mut anchor, mut stderr) = spawn_anchor(&instance, &[]);
+  await_serving(&mut stderr, &instance, false);
+  // The log's only reader goes away: every later write to the anchor's stderr and its daemons' is refused `EPIPE`.
+  drop(stderr);
+  let alive_and_answering = |anchor: &mut AnchorProcess, unlike: Option<u32>| {
+    let started = Instant::now();
+    let mut streak = 0u32;
+    let mut answered = None;
+    while started.elapsed() < START_WAIT && streak < STABLE_STREAK {
+      if let Some(status) = anchor.child.try_wait().unwrap() {
+        panic!("the anchor ended after its log's reader went away: {status}");
+      }
+      answered = daemon_pid(&instance).filter(|pid| Some(*pid) != unlike);
+      streak = if answered.is_some() { streak + 1 } else { 0 };
+      pause();
+    }
+    answered.expect("a daemon answers a streak of verbs with its log's reader gone")
+  };
+  let killed = alive_and_answering(&mut anchor, None);
+  assert!(
+    Command::new("kill")
+      .args(["-9", &killed.to_string()])
+      .status()
+      .unwrap()
+      .success()
+  );
+  let successor = alive_and_answering(&mut anchor, Some(killed));
+  assert_ne!(successor, killed, "a new daemon answers");
+  assert!(
+    anchor.child.try_wait().unwrap().is_none(),
+    "the anchor still supervises"
+  );
+}
+
+/// The panic rule, for a command's output (A-213). Do: run `slates --help` with its standard output a pipe whose reader
+/// has already gone, as `slates status | head -n 1` leaves a command once `head` has its line. Expect: exit 4 (failed),
+/// with a line saying the output could not be written, not a panic.
+#[test]
+fn a_command_whose_output_reader_went_away_fails_without_a_panic() {
+  let (reader, writer) = rustix::pipe::pipe().unwrap();
+  drop(reader);
+  let output = slates()
+    .arg("--help")
+    .stdout(Stdio::from(writer))
+    .stderr(Stdio::piped())
+    .output()
+    .unwrap();
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert_eq!(
+    output.status.code(),
+    Some(i32::from(4u8)),
+    "a failed exit, not a panic: {stderr}"
+  );
+  assert!(
+    stderr.contains("could not be written"),
+    "the failure says why: {stderr}"
+  );
+}

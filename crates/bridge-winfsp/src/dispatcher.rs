@@ -150,9 +150,9 @@ impl Worker {
             private,
           },
         ) {
-          eprintln!("slates-winfsp: receive worker ended: {error}");
+          slates_machine::log_line!("slates-winfsp: receive worker ended: {error}");
           if outcomes.send(crate::host::Outcome::Failed(error)).is_err() {
-            eprintln!(
+            slates_machine::log_line!(
               "slates-winfsp: receive worker's owner ended before its failure was reported"
             );
           }
@@ -231,7 +231,7 @@ impl Drop for CaptureView {
       })
     } == 0
     {
-      eprintln!(
+      slates_machine::log_line!(
         "slates-winfsp: {}",
         os_error("unmap the held receive buffer")
       );
@@ -341,7 +341,7 @@ fn operation(
   let purge = match private.authenticate(request) {
     Ok(purge) => purge,
     Err(error) => {
-      eprintln!("slates-winfsp: private open refused: {error}");
+      slates_machine::log_line!("slates-winfsp: private open refused: {error}");
       packet
         .0
         .get_mut(STATUS_AT..STATUS_END)
@@ -559,7 +559,7 @@ fn receive_loop(
       &mut private,
       bound,
     )?;
-    eprintln!("slates-winfsp: settled {count} captured requests before receiving");
+    slates_machine::log_line!("slates-winfsp: settled {count} captured requests before receiving");
     outcomes
       .send(crate::host::Outcome::Recovered(count))
       .map_err(|_| WinFspError::MountThread)?;

@@ -11,8 +11,8 @@ use crate::layout::{
   Geometry, HEADER_BYTES, IDENTITY_BYTES, ISSUER_SECRET_BYTES, LAYOUT_VERSION, MAGIC,
   PAYLOAD_BYTES, PAYLOAD_GENERATION, PAYLOAD_LEN, RING_CAPACITY, RING_HEAD, RING_SEQ_BASE,
   RING_TAIL, RegionKind, RegionSpec, SEAL_ROOT_ID_BYTES, SEAL_ROOT_KEY_BYTES, SUP_GENERATION,
-  SUP_HEARTBEAT, SUP_HOLD_REFUSALS, SUP_ISSUER, SUP_PID, SUP_RESTARTS, SUP_SEAL_PRESENT,
-  SUP_SEAL_ROOT, SUP_STARTED, SUP_STATE, SUP_STOP, SUP_STOP_BY, State,
+  SUP_HEARTBEAT, SUP_HOLD_REFUSALS, SUP_ISSUER, SUP_LOG_REFUSALS, SUP_PID, SUP_RESTARTS,
+  SUP_SEAL_PRESENT, SUP_SEAL_ROOT, SUP_STARTED, SUP_STATE, SUP_STOP, SUP_STOP_BY, State,
 };
 
 /// The node's sealing root as the anchor holds it (A-92): its key id and its key bytes.
@@ -70,6 +70,10 @@ fn segment_words(geometry: &Geometry) -> Words {
         ))
         .with(WordRun::one(
           at.saturating_add(SUP_HOLD_REFUSALS),
+          Width::U64,
+        ))
+        .with(WordRun::one(
+          at.saturating_add(SUP_LOG_REFUSALS),
           Width::U64,
         )),
       // The content pool's owner words (A-98), each claimed by compare-and-swap.
@@ -135,6 +139,7 @@ pub struct Supervision<'a> {
   stop: &'a AtomicU64,
   stop_by: &'a AtomicU64,
   hold_refusals: &'a AtomicU64,
+  log_refusals: &'a AtomicU64,
 }
 
 impl Supervision<'_> {
@@ -217,6 +222,16 @@ impl Supervision<'_> {
   /// The messages the anchor's hold channel has refused over its life, as it last published them (A-213).
   pub fn hold_refusals(&self) -> u64 {
     self.hold_refusals.load(Ordering::Acquire)
+  }
+
+  /// The anchor publishes the log lines it could not write over its life (`layout::SUP_LOG_REFUSALS`).
+  pub fn record_log_refusals(&self, refusals: u64) {
+    self.log_refusals.store(refusals, Ordering::Release);
+  }
+
+  /// The log lines the anchor could not write over its life, as it last published them (A-213).
+  pub fn log_refusals(&self) -> u64 {
+    self.log_refusals.load(Ordering::Acquire)
   }
 
   /// The anchor records an exit.
@@ -533,6 +548,7 @@ impl AnchorSegment {
       stop: self.word_at(spec, SUP_STOP)?,
       stop_by: self.word_at(spec, SUP_STOP_BY)?,
       hold_refusals: self.word_at(spec, SUP_HOLD_REFUSALS)?,
+      log_refusals: self.word_at(spec, SUP_LOG_REFUSALS)?,
     })
   }
 

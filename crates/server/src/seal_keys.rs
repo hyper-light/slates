@@ -83,21 +83,23 @@ pub fn init(segment: &mut AnchorSegment, slots: usize) -> RootState {
   match hyper_seal::lock_keys(slots) {
     Ok(()) => {}
     Err(hyper_seal::SealError::AlreadyLocked { slots: held }) => {
-      eprintln!(
+      slates_machine::log_line!(
         "slates-server: sealing unavailable: this process's key region holds {held} keys, fewer than the {slots} \
          this daemon needs"
       );
       return RootState::Unavailable;
     }
     Err(e) => {
-      eprintln!(
+      slates_machine::log_line!(
         "slates-server: sealing unavailable: a key region of {slots} keys could not be locked: {e}"
       );
       return RootState::Unavailable;
     }
   }
   if segment.protect_seal_page().is_err() {
-    eprintln!("slates-server: sealing unavailable: the anchor's key page could not be locked");
+    slates_machine::log_line!(
+      "slates-server: sealing unavailable: the anchor's key page could not be locked"
+    );
     return RootState::Unavailable;
   }
   if matches!(segment.seal_root(), Ok(Some(_))) {
@@ -111,7 +113,9 @@ pub fn init(segment: &mut AnchorSegment, slots: usize) -> RootState {
   if published {
     RootState::Minted
   } else {
-    eprintln!("slates-server: sealing unavailable: the root could not be made or published");
+    slates_machine::log_line!(
+      "slates-server: sealing unavailable: the root could not be made or published"
+    );
     RootState::Unavailable
   }
 }
