@@ -93,13 +93,18 @@
 >   41977593496; the entry above).** It read `FileSystem.Version`, not the DLL's version (`FspVersion`). Also, an open whose
 >   path was longer than 1024 UTF-16 units was refused, because every open records its kernel name in the held ledger
 >   (`crates/bridge-winfsp/src/opens/names.rs`); now slates refuses no path the driver passes.
-> - **The receiver that replaced WinFsp's dispatcher: measured, the regression found and cut, a remainder open
->   (A-212, 2026-11-05).** Against `71cf09ac`, interleaved on CI's runners, it was worse beyond the spread on arm64 (quiet
->   p50: a stat 2.55×, a rename 2.90×, an fsync 1.74×; run 41973314087). Two causes, each timed: a live receive scanned
->   the whole 64 KiB batch tail (26.4 µs on arm64, 50.1 µs on x86_64, run 41977769822), and a rename visited every
->   live open (about 106 shard turns each). With both fixed (run 41980761370, arm64, five runs) a stat is 1.53×, a rename
->   1.40× and an fsync 1.23×. **Open:** about 25 µs a request remains on arm64, and an arm64 write under load is 2.15×;
->   neither is attributed yet. BENCHMARKS, "The WinFsp receiver against the DLL dispatcher", is the record as it fills.
+> - **The receiver that replaced WinFsp's dispatcher: measured, most of its regression fixed, a remainder open (A-212,
+>   2026-11-05).** Interleaved on CI's runners against `71cf09ac` (BENCHMARKS, "The WinFsp receiver against the DLL
+>   dispatcher", every run), it was worse beyond the spread (arm64 quiet p50: a stat 2.55×, a rename 2.90×, an fsync 1.74×;
+>   run 41973314087). Two causes were timed and fixed: a live receive scanned the whole 64 KiB batch tail (26.4 µs on arm64,
+>   50.1 µs on x86_64, run 41977769822), and a rename took a shard turn per live open (about 106). After (run 41989009852):
+>   arm64 a stat 1.50×, a rename 1.35×, an fsync 1.21×; x86_64 loaded a stat and an open 1.18–1.20×, its quiet runs overlapping. Some loaded tails are far
+>   better than the DLL's (x86_64 stat p99 114–133 ms against 0.51–0.60 ms). **Open:** it stays worse beyond the spread at
+>   the p50 by about 20 µs a request. The separate response call explains 11–13 µs, and removing it would change A-198's
+>   crash rule. Hops for Open and Release about 2× and for SetSize about 4× under load on arm64 are measured and not explained
+>   (a longer shard spin did not change them, run 41989038309); that SetSize hop is an arm64 write under load at 2.09×. Also:
+>   under two spinners a core on a 4-vCPU x86_64 VM the anchor killed both daemons for a late heartbeat in run 3 of all
+>   three jobs that reached it.
 > - **Two failures recorded open below**: the wake-learning case under load (fixed 2026-11-04, A-199) and the fleet
 >   routing Create reply (fixed 2026-11-04 in its fixture; a second, rarer failure of that history stays open).
 >

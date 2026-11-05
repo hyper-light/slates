@@ -12920,8 +12920,8 @@ Status: built 2026-11-04. It closes the Windows owed items of A-105, A-110 and A
 A-198's receiver replaced WinFsp's DLL dispatcher with no benchmark. Measured against it (`docs/wip/BENCHMARKS.md`, "The
 WinFsp receiver against the DLL dispatcher"), every call that reached the daemon cost more: on arm64 a stat 2.55×, a
 rename 2.90×, an fsync 1.74× at the quiet p50, the arms' five runs not overlapping. Each phase of a request was timed on
-both architectures (diagnostics runs 41977769822). The cause was neither the ledger nor the shard hop, whose medians sit
-within a few microseconds of the old arm's; it was two things A-198's first form did that its crash rules do not need:
+both architectures (diagnostics run 41977769822). The ledger's own work costs at most about 1.5 µs of service a request.
+The largest costs were two things A-198's first form did that its crash rules do not need:
 
 - **Every live receive read and cleared the whole buffer.** The batch parser checked each byte of the 64 KiB tail, 26.4 µs
   at the p50 on arm64 and 50.1 µs on x86_64, per receive. The driver reports how many bytes it wrote, and everything past
@@ -12944,6 +12944,12 @@ for each cost 0.9 µs at the p50 twice a request.
 so that captured requests settle before any new receive, which is what stops a reused IRP address naming another
 processing request after a death. The separate response call costs 10.9 µs at the p50 on arm64 and 12.5 µs on x86_64;
 removing it means changing that crash rule, which this amendment does not do.
+
+**Result (2026-11-05, five interleaved runs on both Windows runners, run 41989009852).** Most of the regression is gone (arm64
+quiet p50: a stat 1.50×, a rename 1.35×, an fsync 1.21×), but the receiver stays worse beyond the spread at the p50, by about
+20 µs a request, on both architectures. Open: that remainder, of which the response call explains 11–13 µs; hops for Open and
+Release about 2× the DLL arm's on arm64, and SetSize about 4× under load, which accounts for an arm64 write under load at
+2.09×. A longer shard spin did not change them (run 41989038309), and they are not explained.
 
 Applied in the same change to: GAPS (the audit entry's unmeasured-receiver item); `crates/bridge-winfsp/src/dispatcher.rs`,
 `inflight/capture.rs`, `purge_intents.rs`, `notify.rs` and `host.rs`.
