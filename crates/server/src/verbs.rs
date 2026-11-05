@@ -6854,6 +6854,11 @@ fn detach(state: &mut ShardState, principal: &Principal, attachment: u64) -> Rep
   if maps > 0 {
     return refused(Refusal::MapsHeld { maps });
   }
+  // A WinFsp mount serves on until the anchor has released its hold: its file system is deleted only after that.
+  #[cfg(windows)]
+  if let Some(deferred) = crate::winfsp::defer_detach(state, &record) {
+    return deferred;
+  }
   match end_attachment(state, &record, Ending::Detached) {
     Ok(()) => ReplyBody::Detached,
     Err(e) => refused(refusal_of_db(&e)),

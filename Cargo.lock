@@ -1432,6 +1432,7 @@ dependencies = [
  "slates-bridge-nfs",
  "slates-bridge-oci",
  "slates-bridge-virtiofs",
+ "slates-bridge-winfsp",
  "slates-client",
  "slates-db",
  "slates-guest-probe",

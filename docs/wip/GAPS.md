@@ -1,5 +1,42 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **WinFsp's hold release, DLL version and long paths fixed (2026-11-04, A-206; audit steps 4 and 6).** Run
+> [41978665514](https://github.com/hyper-light/slates/actions/runs/41978665514), `windows-latest` and `windows-11-arm`,
+> with WinFsp 2.1.25156 installed from its pinned URL and SHA-256. Each lane: the whole live suite 13 passed, 1 ignored.
+> - **An unmount the anchor does not answer:** 0 drives held after their unmount of 20 unmounts on each lane, 0 successes
+>   answered while held, 0 mounts refused after a silence, 60 release attempts refused (the test stops the real anchor's
+>   process). A refused mount-time hold is a typed refusal with nothing left mounted, 3 of 3 in one daemon's life, and the
+>   next mount succeeds. On main's code the same tests fail: run 41975090109, `Refused holds` failed on x86_64 and was still
+>   running on arm64 when read, and that run printed no counts. Dropping the pipe at a deadline fails the native channel
+>   test on jupiter. Record: `docs/bugs/2026-11-04-a-refused-hold-release-left-a-drive-held.md`.
+> - **The DLL's version:** a DLL other than 2.1 is refused at mount with its version in the words. Red-check run
+>   [41977593496](https://github.com/hyper-light/slates/actions/runs/41977593496), `CHECKED_VERSION` changed to 2.2:
+>   `the WinFsp DLL's version 2.1 is not 2.2`, on the real DLL. Record:
+>   `docs/bugs/2026-11-04-the-winfsp-guard-read-a-field-winfsp-always-zeroes.md`.
+> - **Long paths, criterion restated by the supervisor on 2026-11-04.** The goal asked for 0 refused between 1,025 and
+>   32,767 units. The driver itself refuses part of that range, so it now reads: **slates refuses no path the WinFsp driver
+>   passes.** Measured live by halving, on both lanes: **the driver refuses from 8,116 UTF-16 units.** 8,115 units and the
+>   ladder 1,025, 1,026, 2,000, 4,000 and 8,000 are created, read back and reopened through slates. 8,116 with its parents
+>   in place answers the driver's `os error 87`, where slates could only answer not found. The reserve's
+>   `MAX_PATH_UNITS` is derived from the driver's request bound, and the test holds it equal to the measurement. 32,761
+>   units, the longest a drive letter can name, answers 206 above the driver. A 2,000-unit path is created, opened, read
+>   and kept through a killed daemon on both lanes, its old view following the successor's change. Main's code fails the
+>   long-path step on both lanes (41975090109). Reserve at 65,536 slots on jupiter, 3 of 3: 2,133,147,696 bytes of
+>   section, about 2.2 ms to make, 4,166,312 bytes of paged pool per mount. Record:
+>   `docs/bugs/2026-11-04-a-winfsp-open-past-1024-units-was-refused.md`.
+> - **Owed:** a live test of the rename a held name would outgrow (unit-tested only, `rename_fits`: the driver also limits
+>   renames over open descendants, so a live case is not dependable). The Windows anchor parks up to 500 ms between looks at
+>   the hold channel, where Unix wakes on it, so each mount and unmount can wait that long on a healthy anchor.
+> - **Changed for everyone:** a detach of a WinFsp drive can now answer `TargetUnavailable`, and CI's WinFsp is pinned: a new
+>   minor version is refused until the receiver's layout is reviewed. Gates: Ubuntu job of 41978665514 (fmt, workspace
+>   clippy, `xtask check`, docs).
+
+> **`cargo xtask` does not compile on Windows (2026-11-04, tooling).** On jupiter, `cargo +1.98.1 xtask check` stops
+> with 12 errors in `xtask/src`: `std::os::unix` and `Permissions::mode` in `conformance/workloads.rs`,
+> `std::os::unix` and `Permissions::from_mode` in `kind_export.rs`, and `rustix` in `conformance/hermeticity.rs`. So
+> no structural, literal or unsafe-budget check runs on a Windows machine; a Windows change takes those gates on
+> Linux or macOS, through CI or another machine. Open; no fix attempted.
+
 > **The many-client load test (2026-11-04): built; three merge faults fixed; the O(tree) work copy owed.**
 > `crates/client/examples/load_bench.rs` drives N clients, each its own connection, each creating a work volume over one
 > green seeded from Linux v7.4-rc1 (commit 6628e7d4, 97,242 files, 1.8 GB), editing slots with deliberate overlaps,
@@ -33,16 +70,22 @@
 >   never moved, nor one whose stop awaits its chain. Three tests fail on the old seam and pass after; main CI's live
 >   QEMU lane passes (41732529738). Owed: an in-place reset, so a rebooted guest keeps its device.
 >   Record: `docs/bugs/2026-11-03-a-restarted-vhost-ring-was-served-from-its-old-layout.md`.
-> - **The Windows anchor ends on one malformed or short hold message (A-198).** The refusal propagates out of
->   `Supervisor::step` and ends the anchor, whose kill-on-close job then takes every held drive. Unix counts such
->   refusals.
-> - **A refused hold release leaves a held drive (A-198).** The unmount deletes the file system after the release is
->   refused, so the anchor keeps the volume and its drive letter with no daemon serving them
->   (`crates/server/src/winfsp.rs`, `release_hold` and `reap`).
+> - **The Windows anchor ended on one malformed or short hold message (A-198): fixed 2026-11-05.** A refusal propagated
+>   out of `Supervisor::step` and ended the anchor, whose kill-on-close job then took every held drive. Now it is
+>   counted and supervision goes on: 0 anchor exits from 20 bad messages, 20 refusals counted, both holds kept and
+>   inherited live, 3 runs each on CI's Windows x86_64 and arm64 (run 41976042550); red on main's sources in run
+>   41974533851. The log says each distinct refusal once. A live drive is not sent bad messages, since only the daemon
+>   reaches the channel; the live lane passes over the changed drain. Open: the Unix device hold still logs per refusal,
+>   and nothing outside the tests reads the refusal count.
+>   Record: `docs/bugs/2026-11-03-one-malformed-hold-message-ended-the-windows-anchor.md`.
+> - **A refused hold release leaves a held drive (A-198): fixed 2026-11-04 (A-206, run 41978665514; the entry above).** The
+>   unmount deleted the file system after the release was refused, so the anchor kept the volume and its drive letter
+>   with no daemon serving them (`crates/server/src/winfsp.rs`, `release_hold` and `reap`).
 > - **A refused view leaks the held section's handle** (`crates/mem/src/shared.rs`, Windows `from_held_handle`).
-> - **The receiver's WinFsp guard checks a field WinFsp always zeroes** (`FileSystem.Version`), not the DLL's version
->   (`FspVersion`). Also, an open whose path is longer than 1024 UTF-16 units is now refused, because every open records
->   its kernel name in the held ledger (`crates/bridge-winfsp/src/opens/names.rs`).
+> - **The receiver's WinFsp guard checks a field WinFsp always zeroes: fixed 2026-11-04 (A-206, runs 41978665514 and
+>   41977593496; the entry above).** It read `FileSystem.Version`, not the DLL's version (`FspVersion`). Also, an open whose
+>   path was longer than 1024 UTF-16 units was refused, because every open records its kernel name in the held ledger
+>   (`crates/bridge-winfsp/src/opens/names.rs`); now slates refuses no path the driver passes.
 > - **The receiver that replaced WinFsp's dispatcher is unmeasured.** It is one thread with a new event per control
 >   transaction, where the DLL dispatcher ran two threads; BENCHMARKS has no entry for it.
 > - **Two failures recorded open below are still unfixed**: the wake-learning fixture under load and the fleet routing
@@ -265,7 +308,6 @@
 > all 48 fleet histories, the real CLI lifecycle and 13 installed SDK cases; see
 > [the diagnosis](../bugs/2026-09-20-explicit-shards-keep-the-automatic-memory-split.md).
 
-
 Rubric per item: research on file? spec section exists? test matrix? acceptance criteria? laptop
 degenerate stated? open decisions named? Classification: `undesigned | designed-unspecced |
 specced-untested | decision-open | drift (owed-and-forgotten)`. A stale ledger is itself a gap.
@@ -304,7 +346,6 @@ Sections §8a–§8h preserve dated implementation records. An earlier "gated" c
 to the named test and its original scope; it does not close the A-9 integration or correctness
 gaps. The TLA runs in §10 are historical, bounded model evidence, not a proof of current Rust.
 
-
 > **Remote owner location (2026-09-17).** The foreign-home lookup no longer ranks every live
 > home-region member, which could select a node outside the object's actual copyset. A bounded
 > read-only exchange asks home-region peers for their held-object routes; one hint per live
@@ -315,7 +356,6 @@ gaps. The TLA runs in §10 are historical, bounded model evidence, not a proof o
 > lease, configuration state-transfer or native conformance gaps. Record:
 > `docs/bugs/2026-09-17-remote-lookup-guesses-outside-the-copyset.md`.
 
-
 > **Runner identity correction (2026-09-17).** Ubuntu job 105312670403 ran pjdfstest as uid 1001
 > while reporting root: passwordless sudo availability was mistaken for the caller's effective
 > identity, suppressing elevation. The invocation now derives elevation from the actual caller,
@@ -325,7 +365,6 @@ gaps. The TLA runs in §10 are historical, bounded model evidence, not a proof o
 > rerun or closure of the 6202 reported failures is claimed. No expected-failure list changed.
 > Record: `docs/bugs/2026-09-17-conformance-confuses-available-and-effective-root.md`.
 
-
 > **Shared clock domain (2026-09-17).** HostClock now reads one OS monotonic boot/time domain
 > shared by the anchor, daemon, shards and warm restarts; constructing a clock never resets time.
 > Linux BOOTTIME, Darwin MONOTONIC and Windows precise interrupt time include suspend. Local
@@ -334,7 +373,6 @@ gaps. The TLA runs in §10 are historical, bounded model evidence, not a proof o
 > format 2 before recovery because its timestamps used per-instance origins. Two supervised
 > child generations reproduce the old bug (0.12 s) and pass with the common clock. Record:
 > `docs/bugs/2026-09-17-heartbeats-use-different-clock-origins.md`.
-
 
 > **Takeover placement retention (2026-09-17).** Accepted held records retain their owner's bounded
 > candidate set and quorum. Retirement selects among those candidates still in committed membership,
@@ -3014,7 +3052,6 @@ the fixed mounted scenario passes in 0.13 s on the same kernel. Its cfg-free own
 regression runs even in root-owned containers. The earlier root-run proof did not establish
 ordinary-user access. Record: `docs/bugs/2026-09-19-fuse-coherence-fixture-root-owner.md`.
 
-
 **Follow-up source audit (2026-09-14, `291907b`):**
 [2026-09-14_AUDIT.md](../bugs/2026-09-14_AUDIT.md) records 18 open findings (14 P1,
 4 P2) and one unconfirmed KIND rejoin explanation. Mount authorization/coherence and
@@ -3183,7 +3220,6 @@ the session (`fleet.probe.broken`), a dial still in its handshake is dropped at 
 (`fleet.dial.stale_dropped`; proven by the retire-mid-dial, return-at-new-addresses test), and the
 restart test asserts the returned node does not serve its predecessor's volume while the successor does.
 
-
 Separate workspace work advanced HEAD through archive commit `540fb5b` and ledger fix
 `d9cb6e5` during this pass. BUG-12 is fixed there with recorded before/after regression evidence;
 BUG-13's reachability restriction is removed, but direct adoption-value/message-level checks
@@ -3288,7 +3324,6 @@ invariant was stronger than Paxos promises (a record partially acknowledged befo
 still complete; the correct property is Continuity: the successor's base is at least as new as any
 such record). Both are recorded so the implementer knows exactly what the models guarantee.
 
-
 ### 2026-09-15: retained voters, explicit recovery, enrollment and overlay images
 
 AUD-07's warm-state gap is implemented: both Raft groups and their voter identity survive in
@@ -3343,7 +3378,6 @@ formation, placement, takeover and mounted read-back: 8.90 s. This closes the tw
 in job 105312670519, not the other jobs still running in that workflow.
 Evidence and commands: [CLI gate](../bugs/2026-09-17-cli-process-gate.md).
 
-
 ### 2026-09-28: open — one CI failure of the warm-restart fleet test, unexplained
 
 CI run 36498699200 (`95f79ba`, macOS runner) failed `a_warm_fleet_restart_recovers_its_root_and_regional_quorums`
@@ -3355,7 +3389,6 @@ earlier failed CI runs show no failure of this test. The assertion now prints ev
 the next occurrence names its cause; no cause is claimed until one does. A candidate found since: the election
 jitter kept two congruent survivors in lockstep (split votes every round; fixed below), and a warm restart resets
 both timers — unconfirmed until a failure's dump shows the lockstep.
-
 
 ### 2026-09-28: a stale delivery name took a process's own pipe — fixed
 
@@ -3372,7 +3405,6 @@ nothing:
 `NotANumber` became `Malformed`. The failing test (a consumer's own pipe at the freed number lost its probe,
 its flags and its descriptor) now passes on macOS and Linux; the Windows arm is proven by both Windows CI
 lanes. [Bug record](../bugs/2026-09-28-a-stale-delivery-name-took-a-process-s-own-pipe.md).
-
 
 ### 2026-09-29: the three-process CLI fleet test's takeover wait ran out — a member that missed its promotion refused every election, fixed; a takeover stalled when a survivor never received the head, fixed
 
@@ -4156,7 +4188,6 @@ the fleet's Vivaldi integration is incomplete. Each probe task owns a
 coordinate engine fed by its one peer, and the coordinate a node announces comes from an engine no sample
 feeds. So priority uses measured paths, not coordinates.
 
-
 ### 2026-09-28: learners with catch-up rounds — built
 
 A member promoted into a council or root seat joined the joint configuration at once, with whatever prefix
@@ -4176,7 +4207,6 @@ it held — the availability gap of the thesis's Figure 4.4. Now:
   survivor led within 40 s in the CLI test, before this commit). `voters()` is now the voter set, and
   `replication_targets()` is what the drive replicates to.
 
-
 ### 2026-09-28: the delivery test read a reused handle value as the decoy — fixed (its sibling: next entry)
 
 CI run 36500813478's Windows nightly job failed the delivery test with exit 13 ("the decoy came along"), one
@@ -4188,7 +4218,6 @@ at the number `SLATES_CONSUMER_FD` names. A consumer's subprocess inherits the v
 descriptor, so it would take and close its own descriptor. On macOS a dead pipe's `(st_dev, st_ino)` is
 reused by the next pipe 1,999 times in 2,000 (measured), so the fix needs a stronger identity than that.
 [Bug record](../bugs/2026-09-28-the-delivery-test-read-a-reused-handle-value-as-the-decoy.md).
-
 
 ### 2026-09-28: the consensus groups' logs are never compacted, and an append carries the whole lag — fixed
 
@@ -4234,14 +4263,12 @@ unbounded growth (banned item 8) with a guaranteed end. Owed, in order:
   same state), triggered by a derived committed-entry budget;
 - then learner catch-up rounds over it.
 
-
 ### 2026-09-28: correlated election jitter livelocked a split vote — fixed
 
 The pre-vote audit on the timed simulation found survivors of a leader loss splitting the vote for up to 19 s
 on the multi-region profile: the timer's `(id + attempt) mod span` draw keeps two congruent nodes congruent
 forever. The draw is now an independent splitmix64 mix of id and attempt; a successor is elected in 3.0–3.6 s
 (one seed 8.3 s). [Bug record](../bugs/2026-09-28-correlated-election-jitter-livelocked-a-split-vote.md).
-
 
 ### 2026-09-28: consensus enhancements — explorer and leadership transfer built
 
@@ -4255,7 +4282,6 @@ processes. Open, in build order: pre-vote audit under partitions, learners with 
 priority elections, ParallelRaft-CE, Fast Raft (counterexample first), MLRaft, and the graceful drain and
 WAN/KIND measurements.
 
-
 ### 2026-09-28: a cleared control flag stranded a shutdown — fixed
 
 A full in-process fleet suite hung for over 90 minutes in `Daemon::stop` → `Runtime::shutdown`: a shard sent
@@ -4266,7 +4292,6 @@ could sit undrained while the shard parked for good. Both are read-modify-writes
 A new loom model drives the real code: the old halves deadlock at interleavings 1 and 207; the fixed protocol
 passes 5,204 interleavings. [Bug record](../bugs/2026-09-28-a-cleared-control-flag-stranded-a-shutdown.md).
 
-
 ### 2026-09-28: a gossiped seed death split a fresh fleet — fixed
 
 CI run 36462066595 (`fd4f0ef`) failed the KIND lane's five-replica formation, and the local lane reproduced
@@ -4275,7 +4300,6 @@ record was published) received that peer's **seed** death by gossip from a node 
 its probe on the seed, and never dialed again; the other side did the same, so the pair never meshed. The
 direct-contact rule now keeps contact with an unlearned seed until the real id is learned. KIND scale: 10 of
 10 after the fix. [Bug record](../bugs/2026-09-28-a-gossiped-seed-death-stranded-an-unreached-peer.md).
-
 
 ### 2026-09-17: KIND rejoin status reconciled
 
@@ -4287,7 +4311,6 @@ and rejoin in 2.2 s (takeover in 1.8 s). The older §4.8 wording calling this di
 is superseded. This is evidence from `a4fe23a`, before the fairness change above; it is not
 validation of later unpushed code. Safe rolling upgrade and mounted read-back in a pod
 remain separate items. [KIND record](kind-lane.md).
-
 
 ### 2026-09-17: scheduler quantum exercised under OS pressure
 
@@ -4312,7 +4335,6 @@ reported 6202 unexpected pjdfstest failures out of 8798 cases, editor workload b
 output disagreement, and hermeticity startup timing out after 60 s while the anchor repeatedly
 reported a missed first heartbeat. Other eight workload comparisons were identical. These remain
 open; neither the CLI repair nor the scheduler proof claims to fix them.
-
 
 ### 2026-09-17: Linux fixture connection lifetime corrected
 
@@ -4628,7 +4650,6 @@ root-caused and measured across laptop, single-cluster and multi-region deployme
   re-measured next on top of the adaptive tolerance.
 - **Open: the thin-link tail** (Copa's standing queue on thin lossless links). The same prototype halved
   the 64 kbit/s, 20 ms steady p99.
-
 
 ### 2026-09-29: comprehensive product, safety and global-scale audit
 
@@ -5321,7 +5342,6 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
   Linux client merged a new daemon with a dead one and hung its mount
   (`docs/bugs/2026-10-04-every-daemon-announced-one-nfs-server-owner.md`).
 
-
 ### 2026-10-05: MCP speaks 2026-07-28, dual era (A-81; condition 13, first piece)
 
 - **Done:**
@@ -5588,7 +5608,6 @@ Condition 11/12, 2026-10-05 (BENCHMARKS "The daemon under a container memory cap
   window) is the shared cause. Why slates meets it thrice is not yet known: `SO_RCVBUF` and `TCP_QUICKACK` were measured
   and rejected. A warmed mount writes at 241–471 MB/s.
 
-
 ### 2026-10-06: a strict volume locks only its own content (condition 3; AUD-29-77; GAP-A9-1's refinement)
 
 The capability table's one owed row, `--locked` ("records the intent only"), was half stale: since 2026-09-13 a strict
@@ -5741,7 +5760,6 @@ write log holds every write.
 The established lever is an intent log for namespace changes, like the write log for data and ZFS's ZIL: the change
 replies after one append, and a successor replays it. That changes §4.8's barrier contract and the A-61 reply-replay
 rule, so it needs its own design pass. BENCHMARKS, "Per-operation latency on a Linux FUSE mount", has the numbers.
-
 
 ### 2026-10-06: the macOS NFS client panicked the kernel when its server was killed (fixed on macOS; A-113)
 
@@ -5936,7 +5954,6 @@ test passed 3/3 and the rejoin test 3/3. Their failures are specific to the runn
      3/3.
 
    It is specific to CI's x86_64 runner, where the remaining evidence must come from.
-
 
 ### 2026-10-07: two regions on two networks — the lease fixed, three gaps found (condition 10)
 
@@ -8838,7 +8855,6 @@ miss `crates/cli/src/verbs.rs`, because its tests live in the source file; and a
 would rate a one-call-site file safe when that site sits in a helper every test calls. The question that finds
 them is "how many times does this run in one process", which is `#[test]` count × call sites, not either alone.
 
-
 ### 2026-10-18: the quick profile's 5 ms probe cannot survive a busy machine, and production uses it
 
 Chasing the test flake above to its cause found a product defect. The bound that is refused is
@@ -9050,7 +9066,6 @@ in 250 ms still refuses, and `serve_mcp_http` still declines to start on one. Th
 makes the refusal rarer, not impossible, and the remaining question — whether a caller that can afford to wait
 should retry, or `wake()` should take a wall ceiling from its caller — is a design call, not a detail. Flakes
 1, 2 and 6 all have this one root.
-
 
 ### 2026-10-18: the busy-machine wake test now asserts the extension, not the measurement
 
@@ -10983,7 +10998,6 @@ plain WRITE or READ under a **special** state id, so a read-only-mode owner can 
 way. Deliberate NFS owner-override policy, not this escape.
 (`docs/bugs/2026-10-21-one-open-owner-pooled-two-users-access.md`.)
 
-
 ### 2026-10-21: the same escape had a second door — a lock state id carried another user's open access
 
 Putting the acting uid in the open key closed the pooled open-owner and nothing else. `check_io`
@@ -11020,7 +11034,6 @@ Those two are CI's, and they are what confirms a real client's per-credential op
 no-op for it rather than splitting opens it expects to share.
 (`docs/bugs/2026-10-21-one-open-owner-pooled-two-users-access.md`.)
 
-
 ### 2026-10-21: the threat model under today's NFSv4 fixes, and a third shape deliberately left alone
 
 Today's two NFSv4 fixes (`e9fc5977`, `bdb73ec9`) were written up as privilege escapes before asking where
@@ -11046,7 +11059,6 @@ id, both refused and the file unchanged, red-checked by disabling the stranger g
 No test had driven a stranger through a delegation before. The truncate stays strict under a delegation
 because a real client launders truncates and none is known to launder writes.
 (`docs/bugs/2026-10-21-one-open-owner-pooled-two-users-access.md`.)
-
 
 ### 2026-10-21: `slates run`'s consumer lifetime — what a real run proved, and what it could not
 
@@ -11088,7 +11100,6 @@ Decisions owed to Ada before building anything, because each changes behaviour a
 3. **Should a revoke of a revoked consumer say so?** Idempotent success is a fair API choice, but it leaves
    a human no way to learn whether a consumer was still live.
 
-
 ### 2026-10-21: DAX in production is not one switch away — superseded the same day: volumes reach VMs as mounts
 
 > **Superseded (2026-10-21, Ada's decision).** The plan below — a descriptor handoff so VMs connect to slates
@@ -11116,7 +11127,6 @@ between unrelated processes today; a Mach-port route is unverified; an on-disk s
 exists" and Ada's call). The DAX window is launcher-supplied (VHOST_USER_GET_SHMEM_CONFIG asks the back end; R3
 forbids a fixed number; the guest pays page records for it), capped by the volume's capacity and the content arena.
 Building it, Linux first, with Ada's yes.
-
 
 ### 2026-10-21: a FUSE mount heard of another path's change only on its next request — fixed, found by proving the mount route
 

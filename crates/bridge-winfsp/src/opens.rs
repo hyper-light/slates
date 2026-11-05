@@ -10,9 +10,9 @@ use slates_wire::crc32c::crc32c;
 
 mod names;
 
-/// Format: identifies version 3 of the Windows ledger: open records, two checked kernel-name versions per slot,
-/// then the retained receive journal. The unnamed sparse section commits touched ranges only.
-const MAGIC: &[u8; 4] = b"WFO3";
+/// Format: identifies version 4 of the Windows ledger: open records, two checked kernel-name versions per slot, their
+/// long-name tails, then the retained receive journal. The unnamed sparse section commits touched ranges only.
+const MAGIC: &[u8; 4] = b"WFO4";
 /// Format: the immutable header carries the first epoch, the slot count, and a CRC32C after the magic.
 const HEADER: usize = MAGIC.len() + size_of::<u64>() + size_of::<u32>() + size_of::<u32>();
 /// Format: generation, live/purge flags, daemon epoch, inode, inode generation, bridge handle and request hint,
@@ -611,6 +611,61 @@ mod tests {
       fh: 42,
       purge: false,
     }
+  }
+
+  /// The paged pool charged to this process (`PROCESS_MEMORY_COUNTERS.QuotaPagedPoolUsage`), where a section's bookkeeping
+  /// is charged. The call's own layout, since nothing else here needs `Win32_System_ProcessStatus`.
+  #[cfg(windows)]
+  fn paged_pool_bytes() -> usize {
+    #[repr(C)]
+    #[derive(Default)]
+    struct Counters {
+      size: u32,
+      page_faults: u32,
+      peak_working_set: usize,
+      working_set: usize,
+      quota_peak_paged_pool: usize,
+      quota_paged_pool: usize,
+      quota_peak_non_paged_pool: usize,
+      quota_non_paged_pool: usize,
+      pagefile: usize,
+      peak_pagefile: usize,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+      fn K32GetProcessMemoryInfo(process: isize, counters: *mut Counters, size: u32) -> i32;
+    }
+    let mut counters = Counters {
+      size: u32::try_from(size_of::<Counters>()).unwrap(),
+      ..Counters::default()
+    };
+    let size = counters.size;
+    // SAFETY: -1 is this process's pseudo-handle, and `counters` is writable for the `size` bytes named.
+    let answered = unsafe { K32GetProcessMemoryInfo(-1, &mut counters, size) };
+    assert_ne!(answered, 0);
+    counters.quota_paged_pool
+  }
+
+  /// A-206 (2026-11-04), the name reserve's cost. Do: make the real section and ledger a mount makes, at
+  /// `MAX_OPEN_HANDLES`, and keep a name at the driver's limit in its last slots' reach. Expect: the name reads back whole;
+  /// the figures are printed: the reserve, what making it took and the paged pool charged for it.
+  #[cfg(windows)]
+  #[test]
+  fn the_whole_name_reserve_of_a_mount_is_made_and_used() {
+    let bound = slates_bridge_core::volume_bridge::MAX_OPEN_HANDLES;
+    let len = bytes(bound).unwrap();
+    let pool = paged_pool_bytes();
+    let began = std::time::Instant::now();
+    let memory = slates_mem::SparseObject::unnamed(len, slates_mem::Words::new()).unwrap();
+    let mut ledger = Ledger::create(memory, bound).unwrap();
+    let took = began.elapsed();
+    let charged = paged_pool_bytes().saturating_sub(pool);
+    let name = format!("\\{}", "n".repeat(crate::notify::MAX_PATH_UNITS - 1));
+    let context = ledger.opened(file(11), &name).unwrap();
+    assert_eq!(ledger.name(context).unwrap(), name);
+    eprintln!(
+      "WINFSP RESERVE: {len} bytes of section at {bound} slots, made in {took:?}, {charged} bytes of paged pool charged"
+    );
   }
 
   /// A-198. Do: die after recording an open, before recording its kernel response. Expect: recovery retires only the
