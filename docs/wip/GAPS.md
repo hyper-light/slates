@@ -7,7 +7,9 @@
 > `log_lines_refused`, the daemon's own, and `anchor_log_lines_refused`, which the anchor writes to the segment. A command
 > whose output was refused exits 4. Every shipped crate's root denies `clippy::print_stdout` and `clippy::print_stderr`
 > outside tests. adacachy, 2026-11-05: the real anchor whose log reader went away ended with exit 101 (debug build) before
-> the fix, and after it kept supervising a killed daemon's successor. CI run ids: pending. **Owed:** `xtask` (148 sites),
+> the fix, and after it kept supervising a killed daemon's successor. On CI's `ubuntu-latest` and `macos-latest` both
+> tests fail without the fix (the anchor exits 101; `slates --help` panics in std's `stdio.rs`; run 42048872612) and pass
+> with it on c0c8d28c, with workspace clippy there and the Windows lint on both Windows lanes (run 42052731305). **Owed:** `xtask` (148 sites),
 > `slates-guest-probe` (11) and `slates-test-seeds` (1) keep their print macros. They do not ship, and a closed pipe still
 > panics them. Record: `docs/bugs/2026-11-05-a-closed-log-pipe-ended-the-anchor.md`.
 

@@ -50,7 +50,13 @@ against them, so 266 such sites sat in shipped code.
 
 ## Evidence
 
-The red and green runs, with the command and its date, are recorded in the GAPS entry and the commit.
+Command: `SLATES_TEST_CLI=1 cargo +1.98.1 test -p slates-cli --test cli -- an_anchor_whose_log_reader a_command_whose_output_reader --test-threads=1`.
+
+| Sources | Where | Result |
+|---|---|---|
+| `bb5f3dce`, the tests only | adacachy (Linux x86_64), 2026-11-05 | the anchor ends: `exit status: 101` |
+| The same | CI run 42048872612, `ubuntu-latest` and `macos-latest` | both tests fail: the anchor exits 101; `slates --help` panics in std's `stdio.rs` and exits 101, not 4 |
+| The fix on c0c8d28c (`a0d1372c`) | CI run 42052731305 | both tests pass on Linux and macOS; `cargo clippy --workspace --all-targets -- -D warnings` passes on both; the Windows crates' clippy and the binary's pass on `windows-latest` and `windows-11-arm` |
 
 ## Not changed here (not shipped)
 
