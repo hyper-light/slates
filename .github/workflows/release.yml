@@ -6,12 +6,12 @@
 #      (a test of this lane; `cargo xtask version --allow-test-tag`). The SDK publish lanes never start on a test tag.
 #   2. `build` — each target natively on its own runner: macOS arm64, Linux x86_64 and arm64 (glibc, and static musl
 #      inside the official rust:alpine image), Windows x86_64 and arm64 with the C runtime linked statically. Then
-#      `cargo xtask release-smoke` runs the built bytes as a person installing them would (the binary names its
+#      the release lane's smoke task (`cargo run -p xtask --bin release -- smoke`) runs the built bytes as a person installing them would (the binary names its
 #      version, the anchor starts and its daemon serves, a volume provisions, a file round-trips through one client and
 #      reads back through another, the daemon leaves with its anchor) and records their digests and each step's time.
 #      The musl binaries must be static; the Windows x86_64 binary must start in Nano Server, which has no Visual C++
 #      runtime.
-#   3. `release` (tags only) — `cargo xtask release-artifacts` refuses a release missing a target or carrying bytes no
+#   3. `release` (tags only) — the artifacts task (`--bin release -- artifacts`) refuses a release missing a target or carrying bytes no
 #      smoke test ran, and writes SHA256SUMS, slates-provenance.json and the notes; GitHub's artifact attestation signs
 #      SLSA build provenance for every binary (Sigstore, through this job's OIDC identity: no key or secret exists); and
 #      the binaries, the checksums, the provenance and the attestation bundle are attached to a DRAFT release.
@@ -125,7 +125,7 @@ jobs:
       - name: Smoke test (the binary starts, a volume provisions, a file round-trips)
         timeout-minutes: 30
         run: >-
-          cargo xtask release-smoke --binary dist/${{ matrix.asset }} --target ${{ matrix.target }}
+          cargo run --locked -p xtask --bin release -- smoke --binary dist/${{ matrix.asset }} --target ${{ matrix.target }}
           --record records/${{ matrix.asset }}.record.json
       # Nano Server has no Visual C++ runtime, so a binary that starts there carries its C runtime (GAPS, "The Windows
       # binary needs the Visual C++ runtime"). Process isolation needs a host of the image's own build: windows-2025.
@@ -167,7 +167,7 @@ jobs:
           merge-multiple: true
       - name: Checksums, provenance and notes (every target, only tested bytes)
         run: >-
-          cargo xtask release-artifacts --dist gathered/dist --records gathered/records --notes notes
+          cargo run --locked -p xtask --bin release -- artifacts --dist gathered/dist --records gathered/records --notes notes
           --tag "${GITHUB_REF_NAME}" --commit "${GITHUB_SHA}"
           --run-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
       - name: Sign build provenance for every binary

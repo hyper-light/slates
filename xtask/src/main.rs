@@ -30,10 +30,9 @@
 //!   [--scratch DIR] [--keep]` — the conformance evidence harness (see `conformance/mod.rs`).
 //! - `cargo xtask kind (image | smoke) [--tag TAG] [--keep]` — the KIND fleet lane: the image, one node
 //!   of it in Docker (see `kind.rs`; docs/wip/kind-lane.md).
-//! - `cargo xtask release-smoke --binary PATH --target TRIPLE --record FILE` and `cargo xtask release-artifacts
-//!   --dist DIR --records DIR --notes DIR --tag TAG --commit SHA --run-url URL` — the release lane: one built binary run as a
-//!   person installing it would, and the checksums, provenance and notes of a release whose every binary passed
-//!   (see `release.rs`; Appendix B.2).
+//! - The release lane's tasks are a binary of their own, `release` (`src/bin/release.rs`, `release.rs`; Appendix
+//!   B.2, A-210), because they must build on Windows and the conformance and KIND tasks here reach Unix-only calls:
+//!   `cargo run -p xtask --bin release -- smoke ...` and `... -- artifacts ...`.
 //! - `cargo xtask tsan` — the ThreadSanitizer lane: the race canary must be reported, then the
 //!   threaded crates' tests run instrumented and any report fails (see `tsan.rs`; needs nightly
 //!   with `rust-src`).
@@ -52,7 +51,7 @@ mod conformance;
 mod kind;
 mod named_tests;
 mod ratchet;
-mod release;
+mod tag;
 mod toolchain;
 mod tsan;
 mod unsafe_budget;
@@ -147,11 +146,9 @@ fn main() -> ExitCode {
       kind::run(&root, &options)
     }),
     "tsan" => workspace_root().and_then(|root| tsan::run(&root)),
-    "release-smoke" => workspace_root().and_then(|root| release::smoke(&root, &args[1..])),
-    "release-artifacts" => release::artifacts(&args[1..]),
     "toolchain" => workspace_root().and_then(|root| toolchain::run(&root)),
     other => Err(Failure(format!(
-      "unknown task `{other}`; tasks: structural, literals, unsafe, version, toolchain, npm-reserve, check, capabilities, callgrind, ratchet, conformance, kind, tsan, release-smoke, release-artifacts"
+      "unknown task `{other}`; tasks: structural, literals, unsafe, version, toolchain, npm-reserve, check, capabilities, callgrind, ratchet, conformance, kind, tsan; the release lane's tasks are the `release` binary (`cargo run -p xtask --bin release -- smoke | artifacts`)"
     ))),
   };
   match outcome {

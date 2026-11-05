@@ -688,12 +688,12 @@ pub(crate) fn run(root: &Path, mode: &Mode) -> Result<(), Failure> {
   }
   if let Mode::ExpectTag { tag, allow_test } = mode {
     let expected = format!("v{}", truth.workspace_version);
-    match crate::release::tag_kind(tag, &truth.workspace_version) {
-      Ok(crate::release::TagKind::Release) => {}
-      Ok(crate::release::TagKind::Test { number }) if *allow_test => {
+    match crate::tag::tag_kind(tag, &truth.workspace_version) {
+      Ok(crate::tag::TagKind::Release) => {}
+      Ok(crate::tag::TagKind::Test { number }) if *allow_test => {
         println!("version: `{tag}` is test {number} of the release lane at {expected}");
       }
-      Ok(crate::release::TagKind::Test { .. }) | Err(_) => {
+      Ok(crate::tag::TagKind::Test { .. }) | Err(_) => {
         return Err(Failure(format!(
           "tag `{tag}` does not name the workspace version (expected `{expected}`); bump `[workspace.package] version`, run `cargo xtask version --write`, commit, then tag"
         )));
@@ -966,6 +966,24 @@ fn write_stub(dir: &Path, (manifest, readme): &(Value, String)) -> Result<(), Fa
 
 #[cfg(test)]
 mod tests {
+  /// Do run the release guard over this tree with a test tag of its version; expect the binary release lane's guard
+  /// (`--allow-test-tag`) to accept it and the SDK publish lanes' guard to refuse it, and both to accept the release
+  /// tag — so a test of the release lane can never publish an SDK.
+  #[test]
+  fn only_the_release_lane_accepts_a_test_tag() {
+    let Ok(root) = crate::workspace_root() else {
+      panic!("no workspace root")
+    };
+    let version = env!("CARGO_PKG_VERSION");
+    let guard =
+      |tag: String, allow_test: bool| run(&root, &Mode::ExpectTag { tag, allow_test }).is_ok();
+    assert!(guard(format!("v{version}-test.1"), true));
+    assert!(!guard(format!("v{version}-test.1"), false));
+    assert!(guard(format!("v{version}"), false));
+    assert!(guard(format!("v{version}"), true));
+    assert!(!guard(format!("v{version}-rc.9"), true));
+  }
+
   use super::*;
 
   /// The nine triples slates ships, with napi's platform id and npm's selection fields for each.

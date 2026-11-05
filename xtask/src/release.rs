@@ -1,14 +1,14 @@
 //! The release lane's tasks (Appendix B.2, AC-9.5, Phase 9's fresh-machine install test; `docs/publish.md`
 //! "The binary release").
 //!
-//! - `cargo xtask release-smoke --binary PATH --asset NAME --target TRIPLE --record FILE` runs one built `slates`
+//! - `cargo run -p xtask --bin release -- smoke --binary PATH --target TRIPLE --record FILE` runs one built `slates`
 //!   binary the way a person installing it would: it says its version, which must be the workspace's; it starts as the
 //!   anchor (the full machine profile, no test switches), the daemon serves, the consensus group is bootstrapped, a
 //!   volume is provisioned from the command line, a file is written and read back by one MCP client, read again by a
 //!   second client, the volume is destroyed, and when the anchor is stopped the daemon goes with it. Every step is
 //!   timed and the binary is digested; the record names the bytes that were tested, so the release can refuse any
 //!   other bytes.
-//! - `cargo xtask release-artifacts --dist DIR --records DIR --notes DIR --tag TAG --commit SHA --run-url URL`
+//! - `cargo run -p xtask --bin release -- artifacts --dist DIR --records DIR --notes DIR --tag TAG --commit SHA --run-url URL`
 //!   gathers the records of every target, refuses a release missing a target or carrying bytes no smoke test ran,
 //!   writes `SHA256SUMS` and the provenance document beside the binaries, and the draft's notes, title and kind into
 //!   the notes directory.
@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::Failure;
+use crate::tag::{TagKind, tag_kind};
 
 /// What a release ships: one raw binary per target, named as Appendix B.2 names it. The release lane's matrix
 /// builds exactly these, and `release-artifacts` refuses a release that lacks one or carries another.
@@ -59,8 +60,6 @@ const PRERELEASE: &str = "prerelease";
 const PROVENANCE_FORMAT: &str = "slates-release-provenance/1";
 /// Format: a record's file name is the asset's name followed by this.
 const RECORD_SUFFIX: &str = ".record.json";
-/// Format: the suffix that makes a tag a test of the release lane rather than a release: `v0.1.0-test.3`.
-const TEST_TAG_INFIX: &str = "-test.";
 
 /// Shape: how long the anchor may take from its spawn until its daemon says it serves. The full profile is measured
 /// at start (seconds; the anchor's greeting came 3.6–5.4 s after the spawn at load 25–110 on an 18-core Mac,
@@ -93,40 +92,6 @@ const VOLUME_SIZE: &str = "64MiB";
 /// Format: the file the smoke test writes, read and read again.
 const SMOKE_PATH: &str = "/release-smoke.txt";
 
-/// What a tag names.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum TagKind {
-  /// A release of the workspace version.
-  Release,
-  /// A test of the release lane at the workspace version: its draft is a pre-release titled as a test.
-  Test {
-    /// The test's number (`v0.1.0-test.3` is 3); each test run takes a new one.
-    number: u64,
-  },
-}
-
-/// What `tag` names when the workspace version is `version`: `v` + the version is a release, `v` + the version +
-/// `-test.N` a test of the lane; anything else is refused with the forms it would accept.
-pub(crate) fn tag_kind(tag: &str, version: &str) -> Result<TagKind, Failure> {
-  let release = format!("v{version}");
-  if tag == release {
-    return Ok(TagKind::Release);
-  }
-  let number = tag
-    .strip_prefix(&release)
-    .and_then(|rest| rest.strip_prefix(TEST_TAG_INFIX))
-    .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
-    .and_then(|digits| digits.parse::<u64>().ok());
-  match number {
-    Some(number) => Ok(TagKind::Test { number }),
-    None => Err(Failure(format!(
-      "tag `{tag}` does not name the workspace version: a release is `{release}` and a test of the release lane \
-       `{release}{TEST_TAG_INFIX}N`; bump `[workspace.package] version`, run `cargo xtask version --write`, commit, \
-       then tag"
-    ))),
-  }
-}
-
 /// The asset name of `target`, or a refusal naming the targets slates ships.
 fn asset_of(target: &str) -> Result<&'static str, Failure> {
   ASSETS
@@ -157,12 +122,12 @@ fn required<'a>(args: &'a [String], name: &str, usage: &str) -> Result<&'a str, 
 }
 
 /// Format: the smoke task's usage.
-const SMOKE_USAGE: &str = "release-smoke --binary PATH --target TRIPLE --record FILE";
+const SMOKE_USAGE: &str = "release smoke --binary PATH --target TRIPLE --record FILE";
 /// Format: the artifacts task's usage.
 const ARTIFACTS_USAGE: &str =
-  "release-artifacts --dist DIR --records DIR --notes DIR --tag TAG --commit SHA --run-url URL";
+  "release artifacts --dist DIR --records DIR --notes DIR --tag TAG --commit SHA --run-url URL";
 
-/// `cargo xtask release-smoke`.
+/// The smoke task: `cargo run -p xtask --bin release -- smoke`.
 pub(crate) fn smoke(root: &Path, args: &[String]) -> Result<(), Failure> {
   let binary = PathBuf::from(required(args, "--binary", SMOKE_USAGE)?);
   let target = required(args, "--target", SMOKE_USAGE)?;
@@ -750,7 +715,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     .collect()
 }
 
-/// `cargo xtask release-artifacts`.
+/// The artifacts task: `cargo run -p xtask --bin release -- artifacts`.
 pub(crate) fn artifacts(args: &[String]) -> Result<(), Failure> {
   let dist = PathBuf::from(required(args, "--dist", ARTIFACTS_USAGE)?);
   let records_dir = PathBuf::from(required(args, "--records", ARTIFACTS_USAGE)?);
@@ -759,7 +724,7 @@ pub(crate) fn artifacts(args: &[String]) -> Result<(), Failure> {
   let commit = required(args, "--commit", ARTIFACTS_USAGE)?;
   let run_url = required(args, "--run-url", ARTIFACTS_USAGE)?;
   let version = env!("CARGO_PKG_VERSION");
-  let kind = tag_kind(tag, version)?;
+  let kind = tag_kind(tag, version).map_err(Failure)?;
   let mut records = Vec::new();
   for (_, asset) in ASSETS {
     let path = records_dir.join(format!("{asset}{RECORD_SUFFIX}"));
@@ -913,7 +878,7 @@ fn release_documents(gathered: &[Gathered], release: &Release<'_>) -> Result<Doc
   notes.push_str(&format!(
     "Each binary was started on its own platform before it was attached here: the anchor and daemon served, a \
      volume provisioned, a file was written and read back by one client and read again by another, and the daemon \
-     left with its anchor (`cargo xtask release-smoke`; each step's time is in `{PROVENANCE}`).\n\nVerify a \
+     left with its anchor (`cargo run -p xtask --bin release -- smoke`; each step's time is in `{PROVENANCE}`).\n\nVerify a \
      download with `sha256sum -c {CHECKSUMS} --ignore-missing` (on macOS `shasum -a 256 -c`), and its build \
      provenance with `gh attestation verify <file> --repo hyper-light/slates`. Built by {}.\n",
     release.run_url
@@ -937,36 +902,6 @@ fn release_documents(gathered: &[Gathered], release: &Release<'_>) -> Result<Doc
 #[cfg(test)]
 mod tests {
   use super::*;
-
-  /// Do name a tag by the workspace version, expect a release; with `-test.N`, expect test N; expect every other
-  /// form refused (another version, a test with no number or a signed one, a stray suffix, no `v`).
-  #[test]
-  fn a_tag_is_a_release_or_a_numbered_test_of_the_workspace_version() {
-    assert_eq!(tag_kind("v0.1.0", "0.1.0").ok(), Some(TagKind::Release));
-    assert_eq!(
-      tag_kind("v0.1.0-test.3", "0.1.0").ok(),
-      Some(TagKind::Test { number: 3 })
-    );
-    assert_eq!(
-      tag_kind("v0.2.0-rc.1-test.12", "0.2.0-rc.1").ok(),
-      Some(TagKind::Test { number: 12 })
-    );
-    for refused in [
-      "v0.1.1",
-      "0.1.0",
-      "v0.1.0-test.",
-      "v0.1.0-test.-1",
-      "v0.1.0-test.1a",
-      "v0.1.0-rc.1",
-      "v0.1.0-test",
-      "v0.1.0.test.1",
-    ] {
-      assert!(
-        tag_kind(refused, "0.1.0").is_err(),
-        "{refused} must be refused"
-      );
-    }
-  }
 
   fn gathered(asset: &'static str, bytes: &[u8], recorded_sha: Option<String>) -> Gathered {
     let sha256 = recorded_sha.unwrap_or_else(|| sha256_hex(bytes));
@@ -1051,24 +986,5 @@ mod tests {
       Ok(asset) => panic!("i686 is not shipped, yet named {asset}"),
       Err(Failure(message)) => assert!(message.contains("x86_64-unknown-linux-gnu"), "{message}"),
     }
-  }
-
-  /// Do run the release guard over this tree with a test tag of its version; expect the binary release lane's guard
-  /// (`--allow-test-tag`) to accept it and the SDK publish lanes' guard to refuse it, and both to accept the release
-  /// tag — so a test of the release lane can never publish an SDK.
-  #[test]
-  fn only_the_release_lane_accepts_a_test_tag() {
-    let Ok(root) = crate::workspace_root() else {
-      panic!("no workspace root")
-    };
-    let version = env!("CARGO_PKG_VERSION");
-    let guard = |tag: String, allow_test: bool| {
-      crate::version::run(&root, &crate::version::Mode::ExpectTag { tag, allow_test }).is_ok()
-    };
-    assert!(guard(format!("v{version}-test.1"), true));
-    assert!(!guard(format!("v{version}-test.1"), false));
-    assert!(guard(format!("v{version}"), false));
-    assert!(guard(format!("v{version}"), true));
-    assert!(!guard(format!("v{version}-rc.9"), true));
   }
 }

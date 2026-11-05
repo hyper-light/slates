@@ -59,7 +59,7 @@ Every target is built natively on its own runner. The Windows binaries link the 
 statically (`+crt-static`), so they need no Visual C++ runtime. The musl binaries are static.
 The glibc binaries need the glibc of the runner's Ubuntu or newer.
 
-For each built binary, `cargo xtask release-smoke` runs on the same runner and does what a person
+For each built binary, the release smoke task (`cargo run -p xtask --bin release -- smoke`) runs on the same runner and does what a person
 installing it would do:
 
 1. `slates version` names the workspace version.
@@ -75,7 +75,7 @@ each step's time. Two more checks run on some targets. The musl binaries must pa
 gate (`ldd`). The Windows x86_64 binary must start in a process-isolated
 `nanoserver:ltsc2025` container, which has no Visual C++ runtime.
 
-On a tag, `cargo xtask release-artifacts` refuses a release that lacks a target, or whose binary
+On a tag, the release artifacts task (`cargo run -p xtask --bin release -- artifacts`) refuses a release that lacks a target, or whose binary
 is not the one its smoke test digested. It writes:
 
 - `SHA256SUMS`, in `sha256sum`'s format.

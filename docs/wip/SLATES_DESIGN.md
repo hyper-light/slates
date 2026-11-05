@@ -8617,7 +8617,7 @@ Evidence: `research/survey-vorpal.md` §0–§9.
 ### B.2 Target matrix and release recipes (from vorpal's, amended by A-210)
 
 > **Status (2026-11-04, A-210).** `.github/workflows/release.yml` builds the seven targets below natively, smoke-tests
-> each built binary on its own runner (`cargo xtask release-smoke`), and attaches the binaries, `SHA256SUMS`,
+> each built binary on its own runner (`cargo run -p xtask --bin release -- smoke`), and attaches the binaries, `SHA256SUMS`,
 > `slates-provenance.json` and a Sigstore attestation bundle to a **draft** release. Publishing the draft is the
 > maintainer's one approved step (`docs/publish.md`, "The binary release"). The proof by use on a test tag is recorded
 > in A-210. Reproducibility from the tag (AC-9.5's first clause) is not yet shown: no lane builds twice and compares.
@@ -8651,11 +8651,11 @@ Recipes to copy verbatim:
   (`v<version>-test.N`, accepted by the release lane alone; A-210). [C: release.yml:40-45]
 - Windows binaries link the C runtime statically (`+crt-static`), and the x86_64 one must start in a
   process-isolated Nano Server container, which has no Visual C++ runtime (A-210).
-- `cargo xtask release-smoke` runs each built binary on its own runner before it may ship: version,
+- The release smoke task (`cargo run -p xtask --bin release -- smoke`) runs each built binary on its own runner before it may ship: version,
   anchor and daemon start, bootstrap, a volume provisioned, a file written and read by one MCP
   client and read by a second client, the volume destroyed, the daemon gone with its anchor. It
   records the digests of the bytes it ran (A-210).
-- `cargo xtask release-artifacts` refuses a release missing a target or carrying bytes no smoke
+- The release artifacts task (`cargo run -p xtask --bin release -- artifacts`) refuses a release missing a target or carrying bytes no smoke
   test ran, and writes `SHA256SUMS` and a provenance JSON (tag, commit, run, and per target the
   sha256, blake3, size, rustc version, runner image and smoke timings). The signature is GitHub's
   artifact attestation, keyless through Sigstore with the job's OIDC identity, not an ed25519 key
@@ -12822,7 +12822,7 @@ Applied in the same change to: Appendix B.2 (body and status), Phase 9 task 5's 
 - **Natively, per target.** Each target builds on a runner of its own architecture and system (table above), so the
   binary that ships is also the binary that ran there. Only `-p slates-cli` is built: the binary asks for the codec
   probe itself (GAPS 2026-10-20), so the product is the same however it is built.
-- **Run before shipped.** `cargo xtask release-smoke` drives the built bytes as a fresh-machine install would
+- **Run before shipped.** The release smoke task (`cargo run -p xtask --bin release -- smoke`) drives the built bytes as a fresh-machine install would
   (Phase 9's install test, without the attach and tool run, which need a mount bridge not every runner has). The
   write and the read go through one MCP client, because a `slates attach` and a `slates write` made by two processes
   race the reaper (GAPS, "A CLI attachment ends about a second after the `slates attach` that made it").

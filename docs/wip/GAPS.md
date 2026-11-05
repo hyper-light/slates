@@ -2,13 +2,13 @@
 
 > **The binary release lane (2026-11-04, A-210, Appendix B.2).** `release.yml` now builds `slates` natively for
 > seven targets: macOS arm64, Linux x86_64 and arm64 (glibc, and static musl), and Windows x86_64 and arm64 with the C
-> runtime linked statically. It runs each built binary on its own runner (`cargo xtask release-smoke`: version, anchor
-> and daemon start, bootstrap, a volume provisioned, a file written and read by one MCP client and read by a second
+> runtime linked statically. It runs each built binary on its own runner (`cargo run -p xtask --bin release -- smoke`: version,
+> anchor and daemon start, bootstrap, a volume provisioned, a file written and read by one MCP client and read by a second
 > client, the volume destroyed, the daemon gone with its anchor). It then attaches the seven binaries, `SHA256SUMS`,
 > `slates-provenance.json` and a Sigstore attestation bundle to a **draft** release. Publishing the draft is the
 > maintainer's step (`docs/publish.md`, "The binary release").
 > - Proven on this Mac (M5 Max, 18 cores, 2026-11-04, load 12–24): the release binary passed 10 of 10 smoke runs.
->   Start to serving took 1.8 s, a provision 184 ms and the MCP round trip 231 ms (`cargo xtask release-smoke --binary
+>   Start to serving took 1.8 s, a provision 184 ms and the MCP round trip 231 ms (`cargo run -p xtask --bin release -- smoke --binary
 >   <release build> --target aarch64-apple-darwin --record <file>`). The proof on a test tag is recorded in A-210.
 > - **Open, found by the smoke test: the anchor aborts when its stderr closes.** `slates anchor 2>&1 >/dev/null | head
 >   -n 1` exits 134 (SIGABRT) once `head` has exited (2026-11-04, this Mac). The next diagnostic line meets EPIPE,
