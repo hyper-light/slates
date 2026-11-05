@@ -63,6 +63,20 @@ unawaited acknowledgement's reply cannot hold the create's reply back by positio
 two of the client's requests in flight at once, the acknowledgement's scatter spawned on every other shard, all parked
 in this form, while the create (or its forward) runs. Not found yet.
 
+What later runs showed (macOS arm64, 2026-11-05 16:00–16:57 UTC):
+- **It reproduces on main's own client code.** A test (kept out of the tree until its fix, since it fails only
+  intermittently) put two replies in flight on the sync client without a6c3bc16. It begun an acknowledgement and
+  abandoned it, then called a create, paced 1 ms apart, on a daemon derived for the machine.
+  - Alone, it never stalled: 2,000 creates, twice.
+  - After a prelude of 64 concurrent clients, each dropped with an acknowledgement still in flight, it stalled in 1
+    run of 10: 3 creates, numbers 1,713, 1,715 and 1,716.
+- **The one stall caught with the bench instrumented** (the a6c3bc16 tree, a stall reported instead of aborted) was
+  not in the parked form. All 64 clients of the 64-client form's second run stalled at once, at their 7th to 10th
+  create, each after about 1.767 s. The daemon answered nobody for that long, right after 64 clients were dropped
+  and 64 others connected. So the stall is a whole-daemon pause after client churn, and the parked form only met it.
+- It came at load 8–14 and did not come in 10 instrumented runs at load 4–8. The pulse dump that would name the
+  shard and its longest step has not caught one yet.
+
 ## Also found
 
 At load 23–36 on macOS the bench's 8- and 64-client forms aborted `Stalled` in every arm, main included: a live
