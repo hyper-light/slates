@@ -8745,3 +8745,53 @@ the A-217 build, same machine, load 30 to 34, each under `systemd-run --user --s
 
 Best of three: 549,520 to 225,776 KiB (59 % less, about 7 times the tree's 48,376,238 bytes), CreateGreen 415 ms to
 158 ms. The oracle passed in all six runs.
+
+### The many-client load test on main's A-202 design, with A-207 and A-217 ported (2026-11-05)
+
+`load_bench --tree <linux-v7.4-rc1>/kernel --clients 10,100 --hot-files 80` (release, `systemd-run --user --scope -p
+MemoryMax=24G nice -n 5`), Intel Core i9-14900HX, 32 CPUs, load 30 to 35, branch `agents/loadtest-r1` over main
+`698c64a2`. Three runs, all shown; nanoseconds, p50:
+
+| Clients | Edit, runs 1 / 2 / 3 | Accepted submit, runs 1 / 2 / 3 | CreateWork, runs 1 / 2 / 3 | Oracle |
+|---|---|---|---|---|
+| 10 | 60,684 / 107,206 / 51,806 | 328,299 / 406,470 / 238,005 | 910,762 / 427,513 / 693,569 | 30 accepted, 4 to 5 conflicts, 0 failures each |
+| 100 | 44,003,129 / 42,976,492 / 40,026,033 | 45,629,493 / 35,148,031 / 40,038,176 | 2,218,353 / 3,665,850 / 2,234,027 | 300 accepted, 223 to 238 conflicts, 0 failures each |
+
+At 100 clients every verb queues on the green's one owner shard, and every edit appends to the partition log (A-207),
+whose snapshots that brings. Every client's own file held its accepted rounds' records once each in all six levels.
+
+Chaos on the same tree: `chaos.sh` (below) at 10 clients × 200 rounds and 100 × 20, the daemon SIGKILLed 0.5,
+1.5, 2.5, 3.5 and 5 s into the run phase. Every run: 2,000 accepted, 0 oracle and 0 own-file failures, 0 refusals, no
+volume left unrebuilt and no green fenced (A-217's held origin walked again at every restart). Reconnected and resent:
+10, 10, 10, 8, 9 of 10 (the rest had finished) and 100 of 100 each; longest outage 1,358,102 to 43,168,971 ns at 10
+clients and 54,390,873 to 1,915,679,352 ns at 100.
+
+The chaos procedure, `chaos.sh <tree> <clients> <rounds> <tag> <delay> [harness arguments]` (kept in the agent's scratch,
+not the tree, since it is not Rust; every process it starts is killed by pid; the harness rides the restart by
+reconnecting under its client id and resending its request in flight under that request's id):
+
+```sh
+#!/bin/bash
+# Chaos run: an anchor supervising a daemon, the load harness against it, and the daemon SIGKILLed once the harness's
+# run phase has started. Usage: chaos.sh <tree> <clients> <rounds> <tag>. Everything this starts is killed by pid.
+set -u
+tree=$1; clients=$2; rounds=$3; tag=$4; delay=${5:-1}
+bin=$HOME/.cache/slates-agents-target-loadtest/release
+dir=$HOME/.cache/slates-agents-scratch/loadtest
+instance=lt-chaos-$tag-$$
+$bin/slates --instance $instance anchor --quick --shards 4 2> $dir/chaos-$tag-anchor.log &
+anchor=$!
+for try in $(seq 1 50); do $bin/slates --instance $instance volume list >/dev/null 2>&1 && break; sleep 0.2; done
+$bin/slates --instance $instance bootstrap root >> $dir/chaos-$tag-anchor.log 2>&1
+$bin/examples/load_bench --instance $instance --tree $tree --clients $clients --rounds $rounds "${@:6}" > $dir/chaos-$tag.log 2>&1 &
+bench=$!
+until grep -q '^level' $dir/chaos-$tag.log 2>/dev/null || ! kill -0 $bench 2>/dev/null; do sleep 0.2; done
+sleep $delay
+daemon=$(pgrep -P $anchor | head -1)
+echo "anchor=$anchor daemon=$daemon bench=$bench" > $dir/chaos-$tag.pids
+if [ -n "$daemon" ]; then kill -9 $daemon; echo "killed daemon $daemon at $(date +%T.%N)" >> $dir/chaos-$tag.pids; fi
+wait $bench; echo "bench exit $?" >> $dir/chaos-$tag.pids
+kill $anchor 2>/dev/null; sleep 1; kill -9 $anchor 2>/dev/null
+for p in $(pgrep -f "instance $instance"); do kill -9 $p 2>/dev/null; done
+sleep 0.5; echo "left: $(pgrep -f "instance $instance" | tr '\n' ' ')" >> $dir/chaos-$tag.pids
+```
