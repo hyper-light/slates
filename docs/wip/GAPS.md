@@ -202,11 +202,13 @@
 >   50.1 µs on x86_64, run 41977769822), and a rename took a shard turn per live open (about 106). After (run 41989009852):
 >   arm64 a stat 1.50×, a rename 1.35×, an fsync 1.21×; x86_64 loaded a stat and an open 1.18–1.20×, its quiet runs overlapping. Some loaded tails are far
 >   better than the DLL's (x86_64 stat p99 114–133 ms against 0.51–0.60 ms). **Open:** it stays worse beyond the spread at
->   the p50 by about 20 µs a request. The separate response call explains 11–13 µs, and removing it would change A-198's
->   crash rule. Hops for Open and Release about 2× and for SetSize about 4× under load on arm64 are measured and not explained
->   (a longer shard spin did not change them, run 41989038309); that SetSize hop is an arm64 write under load at 2.09×. Also:
->   under two spinners a core on a 4-vCPU x86_64 VM the anchor killed both daemons for a late heartbeat in run 3 of all
->   three jobs that reached it.
+>   the p50 by about 20 µs a request. The separate response call explains 11–13 µs (winfsp-overlap studies it under A-198's crash
+>   rule). **The hops, 2026-11-05:** Open and Release's about 2× was the waiting thread parking; the reply spin cuts arm64 quiet to
+>   an fsync 0.88×, a stat 0.89×, a rename 0.90× and x86_64 loaded to 0.77–0.90×, against parking (run 42052991563); its cost is
+>   arm64's loaded rename at 1.15×. **Still open:** loaded SetSize's about 4× (the write gap) is a shard preempted just after it
+>   answers. Raising shard threads above normal priority removed it (run 42059294312), on arms sharing a machine, so the gain is
+>   not yet measured, and it is a whole-daemon change. Also: under two spinners a core on a 4-vCPU x86_64 VM the anchor killed both
+>   daemons for a late heartbeat in run 3 of all three jobs that reached it.
 > - **Two failures recorded open below**: the wake-learning case under load (fixed 2026-11-04, A-199) and the fleet
 >   routing Create reply (fixed 2026-11-04 in its fixture; its second, rarer failure fixed 2026-11-05).
 >

@@ -951,9 +951,7 @@ fn call_on(requests: &SyncSender<Request>, wake: &Waker, op: Op<u64>) -> Reply {
     return Reply::Err(crate::status_unsuccessful());
   }
   wake.wake_by_ref();
-  answer
-    .recv()
-    .unwrap_or(Reply::Err(crate::status_unsuccessful()))
+  crate::reply::await_reply(&answer).unwrap_or(Reply::Err(crate::status_unsuccessful()))
 }
 
 pub(crate) fn confirm_open(
