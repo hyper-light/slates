@@ -1,5 +1,19 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A private purge's intent can wait up to the 1 s transaction timeout (found 2026-11-05 checking A-215; open).**
+> WinFsp's transact never goes pending: the control dispatch calls `FspVolumeTransact` inline (v2.1 `src/sys/fsctl.c:95–99`),
+> which waits for a request inside the call (`src/sys/volume.c:1171`). So `purge_intents::Intents::wait`, which drains
+> intents while a call is pending, never runs; 0 of 161,073 receives went pending on arm64 (BENCHMARKS, run 41977769822).
+> Intents are drained only after a call returns. `Sender::publish` blocks when its two-message channel is full: a previous
+> End and the next Begin are queued, and that Begin's drive open was refused before any request reached slates. It then
+> waits for the receiver's next return, which on an idle drive is the 1,000 ms transaction timeout. The same bound held
+> before A-215; the combined call keeps one kernel wait per idle period, so it does not change it. **Planned fix, after
+> audit step 7 lands, as its own change with a failing test first** (a purge whose Begin's open is refused while the
+> drive is idle must not wait out the transaction timeout): a publisher that would block cancels the receive thread's
+> call (`CancelSynchronousIo`), retrying while the cancel finds no call in progress. WinFsp ends a cancelled wait with
+> nothing delivered (`src/sys/driver.h:954–955`, `src/sys/ioq.c:617`, `volume.c:1181–1185`). Under A-215 that is an
+> undelivered hand-off, already proven safe, provided the receiver reads the cancellation as "nothing delivered".
+
 > **The WinFsp receiver's response rides its next receive (2026-11-05, A-215; audit step 7).** A batch's last response
 > is sent by the call that receives the next batch, into the journal's second buffer. A request found there after a
 > death proves the driver consumed that response (WinFsp v2.1 source, `docs/wip/research/winfsp-takeover.md`). Model
