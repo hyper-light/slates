@@ -1,0 +1,39 @@
+name: DIAG the supervisor's landing gates on Linux (not for main)
+
+# The supervisor's landing 8 on Linux x86_64 and arm64 while kiln is unreachable: ci.yml's lint gates, and the
+# Linux-only vhost-user test whose close probe this landing fixes, run thirty times.
+on:
+  push:
+    branches: ['diag-land-gates-[0-9]*']
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  gates:
+    name: fmt + clippy + docs + xtask
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: azure/setup-helm@v4
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy (the lint wall)
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Documentation
+        env:
+          RUSTDOCFLAGS: -D warnings -A rustdoc::private_intra_doc_links
+        run: cargo doc --locked --workspace --no-deps --document-private-items
+      - name: Xtask check
+        run: cargo xtask check
+      - name: xtask tests
+        run: cargo test --locked -p xtask
