@@ -13140,6 +13140,15 @@ built. It amends A-105's "every free block back at the first idle tick".
      (§4.2's pre-fault batch, the profile's measured base-page fault), yielding between slices and stopping when a
      request makes the shard busy. Never on the write path. The pages are charged where A-105 charges a freed block
      kept resident (the arena's resident free bytes), and counted (`content.prefaulted_bytes`).
+- **The idle test's tick.** A-105 asks whether the arena allocated since the previous tick, but the count was recorded
+  only when the purge ran, and a tick that seals or publishes returns before it. So the first purge after a burst saw
+  the sweep's own allocations and waited a whole tick more. Now every tick records the count. Measured in process
+  (`crates/cli/examples/nfs_large_write.rs`, kept 64 MiB files over NFSv4.2 after an idle pause, kiln-a094a12d):
+  - before the fix, three idle ticks were too few: 1,366–1,460 MiB/s and nothing pre-faulted;
+  - after it, three ticks were enough: 2,249–2,300 MiB/s after the first file (whose burst had no predecessor),
+    about 64 MiB pre-faulted before each, against 1,340 for the first;
+  - two ticks were mostly too few (one of four).
+  The incumbent harness leaves slates idle about four seconds between its rounds (nfsd's and tmpfs's turns).
 - **The trade.** Each shard holds up to its last burst's net growth of free pages resident while idle, at most its
   memory share; a shard whose last busy period grew nothing holds none. In exchange a burst like the last lands on
   resident pages. (The measured resident cost per shard and the throughput won are recorded in BENCHMARKS when built.)
