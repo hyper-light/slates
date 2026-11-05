@@ -13137,7 +13137,18 @@ removing it means changing that crash rule, which this amendment does not do.
 quiet p50: a stat 1.50×, a rename 1.35×, an fsync 1.21×), but the receiver stays worse beyond the spread at the p50, by about
 20 µs a request, on both architectures. Open: that remainder, of which the response call explains 11–13 µs; hops for Open and
 Release about 2× the DLL arm's on arm64, and SetSize about 4× under load, which accounts for an arm64 write under load at
-2.09×. A longer shard spin did not change them (run 41989038309), and they are not explained.
+2.09×.
+
+**The hops, and the reply spin (2026-11-05).** Timed stage by stage, the slower Open and Release hops are the waiting thread
+parking: A-198's publish, about 1 µs and required, pushes the reply past the spin inside `std`'s `recv`. The receive thread now
+spins for as long as a wake costs and then parks, the 2-competitive rule the shards use (§4.3). The window is measured once on
+that thread as it starts, the median of 15 one-way wakes through the same kind of channel, since `wake.mean_ns` is far below this
+wake's cost. Against parking (run 42052991563, five interleaved runs on both runners): arm64 quiet an fsync 0.88×, a stat 0.89×, a
+rename 0.90×; x86_64 loaded a rename and a stat 0.77×, an fsync 0.80×. Cost: arm64's loaded rename 1.15×. No request or crash
+rule changes: only how long a thread waits before it sleeps. Loaded SetSize is a different cause: a shard that has just answered
+is preempted, and raising its thread's priority removes the wait (run 42059294312), but those arms shared a machine, so that
+is not yet a measured gain and no priority has been changed.
+Applied in the same change to: GAPS, BENCHMARKS, `crates/bridge-winfsp/src/reply.rs`, `host.rs`, `dispatcher.rs` and `lib.rs`.
 
 Applied in the same change to: GAPS (the audit entry's unmeasured-receiver item); `crates/bridge-winfsp/src/dispatcher.rs`,
 `inflight/capture.rs`, `purge_intents.rs`, `notify.rs` and `host.rs`.
