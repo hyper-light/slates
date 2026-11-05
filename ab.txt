@@ -445,3 +445,77 @@ unmounted: S:
 slates-winfsp: reply spin window = 4600 ns: the median one-way channel wake of 15 (the 2-competitive spin)
 slates anchor: daemon exited (Some(143)); restarted (1 in the window)
 ## run 3 of 5 arm raised done, 2026-11-05T18:51:39Z
+To https://github.com/hyper-light/slates
+   5055b7a..3596a83  3596a83a2409b55016e88c66e9b90aaaf89eb78b -> diag-winfsp-bench-results-42080252187-windows-latest
+## run 3 of 5 arm dll, 2026-11-05T18:51:43Z
+# host: windows 0x23f00206 on windows processor architecture 9 level 25 revision 4353 (x86_64), 4 logical CPUs (4 available to this process), 15 GiB, page 4096 B; largest L2 1048576 B, cache line 64 B
+# workload: 10 rounds of 1000 files of 4096 B per arm and pass, arms interleaved, first arm rotating
+# arm dll: S:/d
+# warm-up: one untimed round per arm (1000 files each)
+# pass quiet: spinners 0 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 12.2 µs, p99 37.9 µs, p999 102.9 µs, max 408.1 µs over 3833 probes; 19.9 s
+fsbench	quiet	dll	create	10000	660100	1110500	1355400	30862000
+fsbench	quiet	dll	write	10000	77200	476500	661800	2333300
+fsbench	quiet	dll	fsync	10000	113500	386600	711700	29215300
+fsbench	quiet	dll	close	10000	54400	420900	648400	29132900
+fsbench	quiet	dll	stat	10000	183900	256400	502900	16448700
+fsbench	quiet	dll	open	10000	108900	175200	242800	3546500
+fsbench	quiet	dll	read	10000	8900	93100	220400	16378200
+fsbench	quiet	dll	rename	10000	408100	661300	1286600	30862900
+fsbench	quiet	dll	unlink	10000	223700	532200	917400	28540300
+
+**quiet** (spinners 0 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 12.2 µs, p99 37.9 µs, p999 102.9 µs, max 408.1 µs over 3833 probes; 19.9 s). Each cell: p50 · p99 · p999 · max, µs.
+
+| op | dll |
+|---|---|
+| create | 660.1 · 1110.5 · 1355.4 · 30862.0 |
+| write | 77.2 · 476.5 · 661.8 · 2333.3 |
+| fsync | 113.5 · 386.6 · 711.7 · 29215.3 |
+| close | 54.4 · 420.9 · 648.4 · 29132.9 |
+| stat | 183.9 · 256.4 · 502.9 · 16448.7 |
+| open | 108.9 · 175.2 · 242.8 · 3546.5 |
+| read | 8.9 · 93.1 · 220.4 · 16378.2 |
+| rename | 408.1 · 661.3 · 1286.6 · 30862.9 |
+| unlink | 223.7 · 532.2 · 917.4 · 28540.3 |
+
+mount_bench: remove S:/d: The system cannot find the path specified. (os error 3)
+mount_bench: dll: create S:/d\contended-r8-f813: The I/O operation has been aborted because of either a thread exit or an application request. (os error 995)
+# dll's error output, heartbeat lines and lapses:
+slates daemon: a heartbeat came 510 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 23 steps and 17 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the ho
+slates daemon: a heartbeat came 541 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 27 steps and 19 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the ho
+slates daemon: a heartbeat came 559 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 6 steps and 8 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host
+slates daemon: a heartbeat came 511 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 6 steps and 5 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host
+slates daemon: a heartbeat came 624 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 23 steps and 17 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the ho
+slates daemon: a heartbeat came 656 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 29 steps and 20 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the ho
+slates daemon: a heartbeat came 546 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 4 steps and 5 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host
+slates daemon: a heartbeat came 578 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 29 steps and 20 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the ho
+slates daemon: a heartbeat came 500 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 346 steps and 269 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the 
+slates daemon: a heartbeat came 521 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 6 steps and 10 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the hos
+slates daemon: a heartbeat came 516 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2610 steps and 1806 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by th
+slates daemon: a heartbeat came 593 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 16 steps and 11 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the ho
+slates daemon: a heartbeat came 594 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 10 steps and 9 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the hos
+slates daemon: a heartbeat came 627 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 10 steps and 9 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the hos
+slates daemon: a heartbeat came 521 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 2 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host
+slates daemon: a heartbeat came 824 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2790 steps and 1922 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by th
+slates daemon: a heartbeat came 578 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 2 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host
+slates daemon: a heartbeat came 732 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 16 steps and 12 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the ho
+slates daemon: a heartbeat came 682 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 17 steps and 12 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the ho
+slates daemon: a heartbeat came 650 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 41 steps and 29 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the ho
+slates daemon: a heartbeat came 706 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 28 steps and 20 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the ho
+slates daemon: a heartbeat came 526 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 13 steps and 11 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the ho
+slates daemon: a heartbeat came 595 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 26 steps and 19 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the ho
+slates daemon: a heartbeat came 904 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 18 steps and 13 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the ho
+slates daemon: a heartbeat came 628 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 26 steps and 20 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the ho
+slates daemon: a heartbeat came 597 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 30 steps and 21 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the ho
+slates daemon: a heartbeat came 514 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 28 steps and 20 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the ho
+slates daemon: a heartbeat came 708 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 2 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host
+slates daemon: a heartbeat came 575 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 2 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host
+slates daemon: a heartbeat came 516 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 2 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host
+slates daemon: a heartbeat came 582 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 2 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host
+slates daemon: a heartbeat came 560 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 28 steps and 20 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the ho
+slates daemon: a heartbeat came 563 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 60 steps and 41 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the ho
+slates daemon: a heartbeat came 602 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 23 steps and 17 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the ho
+slates daemon: a heartbeat came 500 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 27 steps and 19 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the ho
+slates daemon: a heartbeat came 509 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host
+slates anchor: the daemon's heartbeat lapsed; killing it
+slates anchor: daemon exited (Some(1)); restarted (1 in the window)
+## run 3 of 5 arm dll FAILED, 2026-11-05T19:02:45Z
