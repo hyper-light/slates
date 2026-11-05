@@ -9720,3 +9720,40 @@ cores. Measured inside the daemon at load 48 (temporary counters, removed): an e
 encode, seal) and its dispatch round (owner shard to control shard, the exchange, back) 90.7 µs on average, against
 about 25 µs for the exchange alone (`replication_bench`): the cross-shard hops and the session borrow are most of it.
 Owed: the same command on a quiet machine; the round's hops measured apart; the rare 100 ms tail explained.
+
+**The 100 ms tail, explained and removed (2026-11-05).** The same command, with the owner's `fleet.live.*` counters
+printed at the end. Two causes, each found by its counter and each a wait for the next record period (100 ms):
+
+1. *A send that found its holder's session lent was dropped.* Two in three sends of a run found the session out (to
+   the previous write's dispatch or a straggler): 2,724 sends with no session, all 2,724 unanswered. The write then
+   waited for whichever later dispatch carried its entry, at worst the period's re-ship. Fixed: the send waits for the
+   session one timer tick at a time, within the liveness budget (`live_ship::borrow_session`); `unanswered` went to 0.
+2. *A write the credit turned away waited for the period.* With two entries in flight, the next publication cannot be
+   an entry; it marks the volume as owing a whole record, which only the next write or the period appended: 270 of
+   2,285 publications turned away, and the last of a burst waited. Fixed: the reply that frees the credit appends the
+   owed whole record at once (`fold_into`, `owes_whole_within_credit`).
+
+adacachy as above, 2,000 writes each, p50 / p99 / p999 / max in µs, all runs shown in order:
+
+| code | load | plain | live | live writes over 50 ms |
+|---|---|---|---|---|
+| before both fixes | 39.7 | 16.1 / 789.4 / 3,304.2 / 6,835.8 | 113.2 / 3,498.5 / 96,777.8 / 276,392.8 | 5 |
+| send waits for the session | 28.1 | 13.6 / 45.5 / 65.3 / 78.1 | 118.1 / 347.8 / 41,511.3 / 85,701.9 | 2 |
+| send waits for the session | 28.1 | 12.7 / 43.7 / 55.2 / 72.5 | 113.1 / 267.6 / 45,636.2 / 86,772.6 | 1 |
+| send waits for the session | 27.8 | 12.5 / 47.3 / 156.8 / 248.6 | 111.6 / 368.3 / 1,461.6 / 46,654.3 | 0 |
+| send waits for the session | 27.6 | 13.5 / 45.4 / 73.1 / 271.9 | 111.4 / 285.8 / 46,488.9 / 88,590.2 | 2 |
+| both fixes | 29.6 | 15.4 / 62.5 / 81.2 / 106.2 | 127.4 / 397.5 / 1,266.2 / 1,869.1 | 0 |
+| both fixes | 29.6 | 14.5 / 58.7 / 129.1 / 256.4 | 117.0 / 262.8 / 481.1 / 806.5 | 0 |
+| both fixes | 29.3 | 16.5 / 59.4 / 80.3 / 249.3 | 130.5 / 264.4 / 882.0 / 1,840.3 | 0 |
+| both fixes, with the fence and destroy fixes | 8.0 | 12.4 / 53.2 / 106.8 / 887.0 | 102.5 / 216.7 / 436.0 / 465.4 | 0 |
+| both fixes, with the fence and destroy fixes | 30.0 | 17.7 / 59.8 / 83.2 / 168.7 | 112.0 / 223.4 / 449.5 / 760.6 | 0 |
+| both fixes, with the fence and destroy fixes | 30.0 | 14.2 / 57.3 / 64.7 / 127.2 | 114.4 / 249.2 / 1,150.0 / 1,424.1 | 0 |
+
+The unit was never throttled (`cpu.stat` `nr_throttled` 0 across a run), so the tail was not the cap's 100 ms quota
+period. The old code on a second machine (kiln-a094a12d, x86-64, load 13–17, 05:56) showed the same tail: live p50
+312.3, p99 754.4, p999 98,709.0, max 100,527.5 µs.
+
+**Reading.** With both fixes, live shipping adds 90–114 µs to a stable 4 KiB write at the median. The live p99 is
+217–398 µs, the p999 0.44–1.27 ms and the worst write 0.47–1.87 ms, at load 8–30, against 86–276 ms before: every write
+of the run at load 8 was under 1 ms. The goal's 50 µs is not met: the added median is the cross-shard dispatch round
+measured above. Owed: that round's hops measured apart, and the p999 under 1 ms at load 30.

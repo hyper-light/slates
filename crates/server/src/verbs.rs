@@ -7517,6 +7517,7 @@ pub(crate) fn reconcile_unpublished_effects(state: &mut ShardState) -> usize {
       release_slot_credits(state, &slot);
     }
     state.by_id.remove(id);
+    crate::live_ship::forget(state, *id);
   }
   let partition = state.db.partition();
   state.greens.retain(|id, _| partition.volume(*id).is_some());
@@ -7657,6 +7658,7 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
         release_slot_credits(state, &slot);
       }
       state.by_id.remove(&id);
+      crate::live_ship::forget(state, id);
       retire_local_tombstones(state);
     }
   }

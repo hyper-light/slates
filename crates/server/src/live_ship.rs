@@ -30,7 +30,7 @@ use std::collections::{BTreeMap, VecDeque};
 use slates_db::live::{
   Admitted, Entry, Head, Install, LiveError, Next, Replica, Shipper, decode_reply, encode_reply,
 };
-use slates_db::register::{HostId, ObjectId};
+use slates_db::register::{HostEpoch, HostId, ObjectId};
 use slates_vfs::delta::VolumeRecord;
 use slates_vfs::ids::InodeNo;
 use slates_vfs::recover::{BodyImage, ExtentSourceImage, InodeImage};
@@ -74,6 +74,23 @@ const LIVE_LET_GO: &str = "fleet.live.let_go";
 
 /// Lets this candidate's copy of `object`'s live log go: its tombstone was accepted, so no owner will ship to it again.
 /// Kept, it was a store that only grew (found 2026-11-05 by the destroy flow, `live_fleet`).
+/// The owner's side of a destroy (A-200): the destroyed volume's shipper goes, with the whole copy and the entries it
+/// retained; every verb still waiting on its durability is refused `NotFound` (the volume is gone, and what it wrote
+/// never will be durable), and every parked transport reply is woken to answer "not durable" ([`wait_durable`]). Kept
+/// before, each destroyed live volume's shipper held a whole copy of it on its owner for good.
+pub(crate) fn forget(state: &mut ShardState, id: slates_db::catalog::VolumeId) {
+  if state.live.shipping.remove(&id.bytes).is_none() {
+    return;
+  }
+  let gone = slates_ipc::protocol::ReplyBody::Refused {
+    refusal: slates_ipc::protocol::Refusal::NotFound,
+  };
+  for entry in take_awaiting(state, id.bytes) {
+    answer(state, entry, gone.clone());
+  }
+  wake_parked(state, id.bytes);
+}
+
 pub(crate) fn let_go(state: &mut ShardState, object: ObjectId) {
   if state.live.held.remove(&object).is_some() {
     state.count(LIVE_LET_GO, 1);
@@ -128,6 +145,11 @@ pub(crate) struct LiveVolume {
   owes_whole: bool,
   /// The last whole entry's payload, and its head: what an install sends.
   whole: Option<(Head, Vec<u8>)>,
+  /// The later epoch a holder answered with: this owner was superseded (a takeover placed the volume elsewhere), ships
+  /// no more of it, and refuses every write waiting on it or made after (`Refusal::StaleEpoch`). Kept, not dropped with
+  /// the shipper: dropped, the writes waiting on it were never answered (the resumed old owner held one for the fence
+  /// flow's whole 40 s wait), and a stable NFS write parked there read "no shipper" as nothing to wait for.
+  fenced: Option<HostEpoch>,
 }
 
 /// What a candidate keeps of one live volume.
@@ -188,6 +210,13 @@ const DURABLE_WAIT_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS;
 pub(crate) async fn wait_durable(volume: slates_db::catalog::VolumeId, target: u64) -> bool {
   let parked = std::future::poll_fn(|cx| {
     let done = state::with_state(|s| {
+      if fenced(s, volume.bytes).is_some() {
+        return true;
+      }
+      if !s.by_id.contains_key(&volume) {
+        // Destroyed while it waited ([`forget`]): nothing of it becomes durable.
+        return true;
+      }
       let durable = head_placed(s, volume.bytes)
         && s.live.shipping.get(&volume.bytes).is_none_or(|live| {
           !live.owes_whole
@@ -205,10 +234,12 @@ pub(crate) async fn wait_durable(volume: slates_db::catalog::VolumeId, target: u
       std::task::Poll::Pending
     }
   });
-  let durable = matches!(
-    slates_rt::futures::within(DURABLE_WAIT_NS, parked).await,
-    Ok(Some(()))
-  );
+  let durable =
+    matches!(
+      slates_rt::futures::within(DURABLE_WAIT_NS, parked).await,
+      Ok(Some(()))
+    ) && state::with_state(|s| s.by_id.contains_key(&volume) && fenced(s, volume.bytes).is_none())
+      .unwrap_or(false);
   let _ = state::with_state(|s| {
     s.count(
       if durable {
@@ -311,6 +342,10 @@ pub(crate) fn durable_target(
 ) -> Option<u64> {
   let live = state.live.shipping.get(&volume.bytes)?;
   let head = live.shipper.head().map(|head| head.position);
+  if live.fenced.is_some() {
+    // Nothing this owner holds becomes durable again: the caller defers, and the deferral refuses.
+    return Some(head.unwrap_or(0));
+  }
   if !head_placed(state, volume.bytes) {
     // The fleet does not know the volume yet: a takeover could not find it, so nothing written to it is durable.
     return head;
@@ -338,6 +373,10 @@ pub(crate) fn defer(
   route: Option<crate::merge_service::ReplyRoute>,
   reply: slates_ipc::protocol::ReplyBody,
 ) -> Option<slates_ipc::protocol::ReplyBody> {
+  if let Some(current) = fenced(state, volume.bytes) {
+    state.count(LIVE_FENCED, 1);
+    return Some(stale_epoch(current));
+  }
   let held: usize = state.live.awaiting.values().map(Vec::len).sum();
   if held >= awaiting_bound(state) {
     state.count(LIVE_OVER_BOUND, 1);
@@ -420,35 +459,85 @@ pub(crate) fn resolve(state: &mut ShardState, volume: [u8; 16]) {
       continue;
     };
     for entry in waiting {
-      state
-        .live
-        .awaiting_by_request
-        .remove(&(entry.origin, entry.id.client, entry.id.sequence));
-      state.db.begin();
-      let recorded = crate::verbs::record_completion(state, entry.origin, entry.id, entry.reply);
-      if state.db.commit(&mut state.segment).is_err() {
-        state.count(LIVE_UNRECORDED, 1);
-        continue;
-      }
-      state.count(LIVE_RESOLVED, 1);
-      let Some(route) = entry.route else {
-        continue;
-      };
-      let delivery = slates_rt::task::SpawnRequest::new(
-        Box::pin(async move {
-          crate::state::deliver(route.client_index, route.request, recorded, true);
-        }),
-        None,
-      );
-      if slates_rt::registry::send_control(
-        route.shard,
-        slates_rt::control::Control::Spawn(Box::new(delivery)),
-      )
-      .is_err()
-      {
-        state.count(LIVE_UNDELIVERED, 1);
-      }
+      let reply = entry.reply.clone();
+      answer(state, entry, reply);
     }
+  }
+}
+
+/// Refuses every verb waiting on `volume` `StaleEpoch` once a holder has fenced its owner at `current`: each refusal is
+/// recorded as the verb's completion, so a retry meets it, and delivered as a resolved reply is.
+fn refuse_awaiting(state: &mut ShardState, volume: [u8; 16], current: HostEpoch) {
+  for entry in take_awaiting(state, volume) {
+    state.count(LIVE_FENCED, 1);
+    answer(state, entry, stale_epoch(current));
+  }
+}
+
+/// Takes every verb waiting on `volume`, at any position.
+fn take_awaiting(state: &mut ShardState, volume: [u8; 16]) -> Vec<Awaiting> {
+  let keys: Vec<([u8; 16], u64)> = state
+    .live
+    .awaiting
+    .range((volume, 0)..=(volume, u64::MAX))
+    .map(|(key, _)| *key)
+    .collect();
+  keys
+    .into_iter()
+    .filter_map(|key| state.live.awaiting.remove(&key))
+    .flatten()
+    .collect()
+}
+
+/// The refusal a superseded owner gives a write to the volume it lost.
+fn stale_epoch(current: HostEpoch) -> slates_ipc::protocol::ReplyBody {
+  slates_ipc::protocol::ReplyBody::Refused {
+    refusal: slates_ipc::protocol::Refusal::StaleEpoch { current: current.0 },
+  }
+}
+
+/// The epoch `volume`'s owner here was fenced at, if it was.
+fn fenced(state: &ShardState, volume: [u8; 16]) -> Option<HostEpoch> {
+  state
+    .live
+    .shipping
+    .get(&volume)
+    .and_then(|live| live.fenced)
+}
+
+/// Counter: a write refused `StaleEpoch` because its owner here was superseded.
+const LIVE_FENCED: &str = "fleet.live.fenced";
+
+/// Answers one waiting verb with `reply`: its completion recorded on this partition (one durable step, so a retry after
+/// meets it) and the reply delivered to its client's shard.
+fn answer(state: &mut ShardState, entry: Awaiting, reply: slates_ipc::protocol::ReplyBody) {
+  state
+    .live
+    .awaiting_by_request
+    .remove(&(entry.origin, entry.id.client, entry.id.sequence));
+  state.db.begin();
+  let recorded = crate::verbs::record_completion(state, entry.origin, entry.id, reply);
+  if state.db.commit(&mut state.segment).is_err() {
+    state.count(LIVE_UNRECORDED, 1);
+    return;
+  }
+  state.count(LIVE_RESOLVED, 1);
+  let Some(route) = entry.route else {
+    return;
+  };
+  let delivery = slates_rt::task::SpawnRequest::new(
+    Box::pin(async move {
+      crate::state::deliver(route.client_index, route.request, recorded, true);
+    }),
+    None,
+  );
+  if slates_rt::registry::send_control(
+    route.shard,
+    slates_rt::control::Control::Spawn(Box::new(delivery)),
+  )
+  .is_err()
+  {
+    state.count(LIVE_UNDELIVERED, 1);
   }
 }
 
@@ -497,6 +586,10 @@ pub(crate) fn published(
     state.live.shipping.remove(&id.bytes);
     return;
   }
+  if fenced(state, id.bytes).is_some() {
+    // Superseded here: nothing more ships, and the write that published this is refused (`defer`).
+    return;
+  }
   let object = ObjectId(id.bytes);
   let configuration = state.fleet.configuration();
   let local = configuration.owner;
@@ -527,6 +620,7 @@ pub(crate) fn published(
       ),
       owes_whole: true,
       whole: None,
+      fenced: None,
     });
   let whole = live.owes_whole || record.is_none();
   let built = if whole {
@@ -771,11 +865,7 @@ async fn send_from_control(
       drain_stragglers();
       let mut replies = Vec::new();
       for send in sends {
-        let sessions =
-          crate::fleet::take_sessions("fleet.lent_to.live_ship", |host| host == send.holder);
-        if sessions.is_empty() {
-          let _ = state::with_state(|s| s.count(LIVE_NO_SESSION, 1));
-        }
+        let sessions = borrow_session(send.holder, budget.max_deadline_ns()).await;
         let exchanged =
           slates_cluster::live::exchange((send.stream, &send.bytes), sessions, budget, |_, _| true)
             .await;
@@ -798,6 +888,39 @@ async fn send_from_control(
   )
   .await
   .unwrap_or_default()
+}
+
+/// Borrows `holder`'s record session, waiting for it while another dispatch has it out, one timer tick at a time,
+/// within `deadline_ns`: empty when it never came back (counted, and the period re-ships). Dropped at the first miss, a
+/// write's message waited for whichever later dispatch carried it, at worst the next record period: two in three sends of
+/// a stable-write run found the session out, and the rare write took about 100 ms (2026-11-05, BENCHMARKS "What live
+/// shipping adds to a stable NFS write"). The forward path learned the same (`fleet::forward_over_leader_session`).
+async fn borrow_session(
+  holder: HostId,
+  deadline_ns: u64,
+) -> Vec<(HostId, slates_transport::endpoint::Endpoint)> {
+  let began = slates_rt::futures::now_ns();
+  let mut missed = false;
+  loop {
+    let sessions = crate::fleet::take_sessions("fleet.lent_to.live_ship", |host| host == holder);
+    let present = state::with_state(|s| s.record_sessions.contains_key(&holder)).unwrap_or(false);
+    // A session out on loan comes back; no link at all (never formed, or dropped to be dialed afresh) is left to the
+    // period.
+    if !sessions.is_empty()
+      || !present
+      || slates_rt::futures::now_ns().saturating_sub(began) >= deadline_ns
+    {
+      if sessions.is_empty() || missed {
+        let _ = state::with_state(|s| s.count(LIVE_NO_SESSION, 1));
+      }
+      return sessions;
+    }
+    missed = true;
+    // Shape: one tick of the shard's timer wheel, the finest park there is (`sleep` rounds up to it).
+    if slates_rt::futures::sleep(1).await.is_err() {
+      return Vec::new();
+    }
+  }
 }
 
 /// Queues a dispatch's stragglers on this (the control) shard, where they hold their holders' sessions until each
@@ -870,9 +993,12 @@ fn fold_into(state: &mut ShardState, replies: Vec<(ObjectId, HostId, Vec<u8>)>) 
     let before = live.shipper.durable();
     let held_before = live.shipper.held_by(host);
     let reply = decode_reply(&bytes);
-    if let Next::Fenced(_) = live.shipper.on_reply(host, reply) {
-      // A later epoch holds the volume: this owner was superseded and ships no more of it.
-      state.live.shipping.remove(&object.0);
+    if let Next::Fenced(current) = live.shipper.on_reply(host, reply) {
+      // A later epoch holds the volume: this owner was superseded, ships no more of it, and tells every write waiting
+      // on it so.
+      live.fenced = Some(current);
+      refuse_awaiting(state, object.0, current);
+      wake_parked(state, object.0);
       continue;
     }
     // Only an answer that moved the holder forward on the chain is followed at once; anything else (a refusal, a holder
@@ -890,9 +1016,27 @@ fn fold_into(state: &mut ShardState, replies: Vec<(ObjectId, HostId, Vec<u8>)>) 
   }
   let mut sends = Vec::new();
   for volume in touched {
+    // A write the credit turned away waits for the whole record it left owed; the answer that freed the credit appends
+    // it. Left to the next write or the record period, the last turned-away write of a burst waited up to that period:
+    // 270 of 2,285 publications turned away and 2 writes over 50 ms in a 2,000-write run (2026-11-05, BENCHMARKS "What
+    // live shipping adds to a stable NFS write"). `published` ships what the holders lack itself.
+    if owes_whole_within_credit(state, volume) {
+      published(state, slates_db::catalog::VolumeId { bytes: volume }, None);
+      continue;
+    }
     sends.extend(pending_sends(state, volume));
   }
   dispatch(state, sends);
+}
+
+/// Whether `volume` owes a whole record and its credit allows one now (a checkpoint may go one past it,
+/// `Shipper::append_checkpoint`).
+fn owes_whole_within_credit(state: &ShardState, volume: [u8; 16]) -> bool {
+  state
+    .live
+    .shipping
+    .get(&volume)
+    .is_some_and(|live| live.owes_whole && live.shipper.in_flight() <= CREDIT)
 }
 
 /// The record period's turn on `shard` (run from the control shard): re-ships what each holder of each live volume
@@ -907,12 +1051,7 @@ pub(crate) async fn period(origin: u16, shard: u16) {
       // A volume that owes a whole record ships one once its credit allows: a burst that outran the credit left its
       // last writes unshipped until another write came, and none might (three of five writes, `live_fleet`).
       for volume in &volumes {
-        let owed = s
-          .live
-          .shipping
-          .get(volume)
-          .is_some_and(|live| live.owes_whole && live.shipper.in_flight() <= CREDIT);
-        if owed {
+        if owes_whole_within_credit(s, *volume) {
           published(s, slates_db::catalog::VolumeId { bytes: *volume }, None);
         }
       }
@@ -979,9 +1118,14 @@ pub(crate) fn serve_entry(
   peer: HostId,
   request: &[u8],
 ) -> Vec<u8> {
-  let Some(bound) = admitted(state, local, peer, slates_db::live::object_of(request)) else {
+  let object = slates_db::live::object_of(request);
+  let Some(bound) = admitted(state, local, peer, object) else {
     state.count(LIVE_HOLD_REFUSED, 1);
-    return encode_reply(&Err(LiveError::Unauthorized));
+    return encode_reply(&Err(not_served(
+      state,
+      object,
+      slates_db::live::epoch_of(request),
+    )));
   };
   let reply = Entry::decode(request, bound).and_then(|entry| {
     let held = held_entry(state, peer, entry.object);
@@ -1008,14 +1152,14 @@ pub(crate) fn serve_install(
   peer: HostId,
   request: &[u8],
 ) -> Vec<u8> {
-  let Some(bound) = admitted(
-    state,
-    local,
-    peer,
-    slates_db::live::object_of_state(request),
-  ) else {
+  let object = slates_db::live::object_of_state(request);
+  let Some(bound) = admitted(state, local, peer, object) else {
     state.count(LIVE_HOLD_REFUSED, 1);
-    return encode_reply(&Err(LiveError::Unauthorized));
+    return encode_reply(&Err(not_served(
+      state,
+      object,
+      slates_db::live::epoch_of_install(request),
+    )));
   };
   let reply = Install::decode(request, bound).and_then(|install| {
     let held = held_entry(state, peer, install.object);
@@ -1038,6 +1182,20 @@ pub(crate) fn serve_install(
 }
 
 /// The bound for a message naming `object`, when `peer` may place it on this node.
+/// Why a holder will not serve a message about `object` made under `epoch`: below the fence its copy has promised it is
+/// `StaleEpoch`, which tells a superseded owner to stop (`Shipper::on_reply` answers `Fenced`) and refuse what waits on
+/// it; otherwise `Unauthorized`. Refused as a stranger, a resumed old owner could not tell its loss from a passing
+/// refusal and held its write unanswered for the fence flow's whole 40 s wait (2026-11-05, `live_fleet`).
+fn not_served(state: &ShardState, object: Option<ObjectId>, epoch: Option<HostEpoch>) -> LiveError {
+  let fence = object
+    .and_then(|object| state.live.held.get(&object))
+    .map(|held| held.replica.fence());
+  match (fence, epoch) {
+    (Some(current), Some(epoch)) if epoch < current => LiveError::StaleEpoch { current },
+    _ => LiveError::Unauthorized,
+  }
+}
+
 fn admitted(
   state: &ShardState,
   local: HostId,

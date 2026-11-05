@@ -5723,6 +5723,25 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > - *A live volume destroyed*: its candidates let their copy of its log go once the tombstone reaches them
 >   (`live_ship::let_go`); before, they kept it forever (red without the release, 1 of 1).
 > All eight flows pass together in 55 s.
+>
+> **The tail and three more defects (2026-11-05).** All nine process flows pass together in 4.1–4.2 s (twice), each
+> flow's fleet in its own directory: one directory per test process had let parallel fleets overwrite each other's
+> manifest, and eight of nine daemons were handed another fleet's ports.
+> - *The rare 100 ms write*: two causes, each a wait for the record period. A send that found its holder's session lent
+>   was dropped (`borrow_session` now waits for it, within the liveness budget). A write the credit turned away waited
+>   for the next write or the period to append the whole record it owed (the reply that frees the credit now appends
+>   it). The worst live stable write went from 86–276 ms to 0.47–1.87 ms (BENCHMARKS "The 100 ms tail").
+> - *A superseded owner was never told*: after the takeover the configuration names the successor, so a holder refused
+>   the old owner's entries `Unauthorized` before it reached the fence. The old owner could not tell that from a
+>   passing refusal and held the write unanswered for the whole 40 s wait. A holder now answers a message below the fence
+>   its copy promised `StaleEpoch` (`not_served`, read from the header by `live::epoch_of`). The owner keeps the
+>   volume marked fenced: it refuses every write waiting on it and every later one `StaleEpoch`, and a parked stable NFS
+>   write answers "try again", never "durable". Before, the fence dropped the shipper, and a parked reply read "no
+>   shipper" as nothing to wait for. The flow now requires the refusal: the stale write exits 1 at once, and the flow
+>   takes 3.9 s instead of 43 s.
+> - *A destroyed volume's shipper was kept on its owner*, with a whole copy of the volume (`live_ship::forget` at the
+>   teardown's end and in the orphan sweep: waiting verbs refused `NotFound`, parked replies woken to "not durable").
+>   The destroy flow now holds the owner to it too (red first, 1 of 1).
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
