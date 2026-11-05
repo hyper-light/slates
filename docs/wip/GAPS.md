@@ -70,9 +70,12 @@
 > nine writes, `crates/cluster/tests/live.rs`), which the real runtime does not show; it is unexplained and owes a
 > failing test in the transport. The policy is built: `slates live-ship ID [--off]` records it on the owner partition,
 > `list` shows it, the catalog register carries it, and the db model test recovers it
-> (`crates/server/tests/live_ship.rs`). Open, toward a filesystem server replicated per write in under 1 ms: the
-> daemon's publications shipped through it with barriers answered at durability (AC-8.3's "live-shipped volumes
-> report none", AC-8.9's credit backpressure); phase one in the takeover round; real-process chaos. `put_wal` and the
+> (`crates/server/tests/live_ship.rs`). The daemon ships (2026-11-05, §4.10 status "slice one"): across three real
+> daemon processes a live volume's writes reach both candidates and become durable (`crates/cli/tests/live_fleet.rs`,
+> 4 of 4). Open, toward a filesystem server replicated per write in under 1 ms: barriers
+> answered at durability (AC-8.3's "live-shipped volumes
+> report none", AC-8.9's credit backpressure); a candidate's copy kept across its own restart; phase one in the takeover
+> round; real-process chaos. `put_wal` and the
 > loss-window report are unbuilt; a head still waits up to the 100 ms record period before its commit starts.
 
 > **Audit of 2dc9f3eb..98000d56 (2026-11-03): defects open, Step 9's evidence holds.** Nine commits made on

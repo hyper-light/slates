@@ -820,6 +820,12 @@ fn consensus_budget(slowest_tail_ns: Option<u64>) -> CommitBudget {
   round_budget(&ROUND_ANCHORS, slowest_tail_ns)
 }
 
+/// The budget a live-shipped entry's exchange runs under (A-200): the consensus round's, derived from the slowest
+/// measured path, the same rule a record commit's round runs under.
+pub(crate) fn live_budget() -> CommitBudget {
+  consensus_budget(slowest_path_tail_ns())
+}
+
 /// The bound on one record-plane exchange: the measured control-plane round budget's full span, the bound every
 /// record-plane exchange runs under.
 pub(crate) fn record_exchange_budget_ns() -> u64 {
@@ -1365,6 +1371,22 @@ async fn serve_peer_records(
                 .get(&peer_anchor)
                 .map_or(seed, |learned| learned.host);
               crate::mirror::serve_promise(s, local, peer_host, &request)
+            })
+            .unwrap_or_default(),
+            slates_cluster::live::LIVE_ENTRY_STREAM => state::with_state(|s| {
+              let peer_host = s
+                .learned_members
+                .get(&peer_anchor)
+                .map_or(seed, |learned| learned.host);
+              crate::live_ship::serve_entry(s, local, peer_host, &request)
+            })
+            .unwrap_or_default(),
+            slates_cluster::live::LIVE_INSTALL_STREAM => state::with_state(|s| {
+              let peer_host = s
+                .learned_members
+                .get(&peer_anchor)
+                .map_or(seed, |learned| learned.host);
+              crate::live_ship::serve_install(s, local, peer_host, &request)
             })
             .unwrap_or_default(),
             crate::mirror::MIRROR_RECORD_STREAM => state::with_state(|s| {
@@ -6545,6 +6567,9 @@ async fn run_record_period(
   }
   deliver_pairs(origin, shard, local, budget).await;
   ship_shard_heads(origin, shard, local, budget, owner_acceptor, in_flight).await;
+  // Live volumes' entries a holder still lacks (A-200): writes ship at their barrier; this catches up a lost message or
+  // a holder that was away.
+  crate::live_ship::period(origin, shard).await;
   // Record durably each seal whose content and head have both placed.
   crate::xshard::run_on_counted(origin, shard, record_placed_seals);
   crate::xshard::run_on_counted(origin, shard, record_mirrored_seals);
