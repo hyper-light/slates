@@ -377,3 +377,65 @@ fsbench	contended	dll	unlink	10000	320000	37682400	48533800	86806200
 unmounted: S:
 # dll's error output, heartbeat lines and lapses:
 ## run 2 of 5 arm dll done, 2026-11-05T18:49:20Z
+To https://github.com/hyper-light/slates
+   bf721e7..529105f  529105ffdf1b51143d3994ca965b374d8858e338 -> diag-winfsp-bench-results-42080252187-windows-11-arm
+## run 3 of 5 arm raised, 2026-11-05T18:49:24Z
+# host: windows 0x23f00206 on windows processor architecture 12 level 3401 revision 0 (aarch64), 4 logical CPUs (4 available to this process), 15 GiB, page 4096 B; largest L2 1048576 B, cache line 64 B
+# workload: 10 rounds of 1000 files of 4096 B per arm and pass, arms interleaved, first arm rotating
+# arm raised: S:/d
+# warm-up: one untimed round per arm (1000 files each)
+# pass quiet: spinners 0 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 26.1 µs, p99 51.0 µs, p999 385.5 µs, max 3814.5 µs over 19336 probes; 102.3 s
+fsbench	quiet	raised	create	10000	227900	321300	1003200	3371300
+fsbench	quiet	raised	write	10000	91500	211100	521800	5616300
+fsbench	quiet	raised	fsync	10000	115100	177400	473500	3631800
+fsbench	quiet	raised	close	10000	4599900	6242600	8280900	12685600
+fsbench	quiet	raised	stat	10000	161400	265000	662800	2393700
+fsbench	quiet	raised	open	10000	4426800	6133700	62378600	103038100
+fsbench	quiet	raised	read	10000	52700	82700	157000	2859500
+fsbench	quiet	raised	rename	10000	470100	681300	2152700	19112300
+fsbench	quiet	raised	unlink	10000	280500	459400	749800	124638400
+
+**quiet** (spinners 0 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 26.1 µs, p99 51.0 µs, p999 385.5 µs, max 3814.5 µs over 19336 probes; 102.3 s). Each cell: p50 · p99 · p999 · max, µs.
+
+| op | raised |
+|---|---|
+| create | 227.9 · 321.3 · 1003.2 · 3371.3 |
+| write | 91.5 · 211.1 · 521.8 · 5616.3 |
+| fsync | 115.1 · 177.4 · 473.5 · 3631.8 |
+| close | 4599.9 · 6242.6 · 8280.9 · 12685.6 |
+| stat | 161.4 · 265.0 · 662.8 · 2393.7 |
+| open | 4426.8 · 6133.7 · 62378.6 · 103038.1 |
+| read | 52.7 · 82.7 · 157.0 · 2859.5 |
+| rename | 470.1 · 681.3 · 2152.7 · 19112.3 |
+| unlink | 280.5 · 459.4 · 749.8 · 124638.4 |
+
+# pass contended: spinners 8 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 30.5 µs, p99 52.7 µs, p999 30330.9 µs, max 63473.9 µs over 25407 probes; 135.2 s
+fsburn	contended	raised	79796.345	51576.346	135.240	4
+fsbench	contended	raised	create	10000	248900	906500	26564200	58583400
+fsbench	contended	raised	write	10000	97000	238100	22243800	55405600
+fsbench	contended	raised	fsync	10000	126700	275500	42194500	85982000
+fsbench	contended	raised	close	10000	4977500	7029600	28765800	57989000
+fsbench	contended	raised	stat	10000	158600	698200	42098500	66626400
+fsbench	contended	raised	open	10000	4541200	25620200	66723800	132433800
+fsbench	contended	raised	read	10000	57400	86200	156900	392500
+fsbench	contended	raised	rename	10000	516200	25273300	65698200	83883200
+fsbench	contended	raised	unlink	10000	305800	18958500	47371700	164788900
+
+**contended** (spinners 8 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 30.5 µs, p99 52.7 µs, p999 30330.9 µs, max 63473.9 µs over 25407 probes; 135.2 s). Each cell: p50 · p99 · p999 · max, µs.
+
+| op | raised |
+|---|---|
+| create | 248.9 · 906.5 · 26564.2 · 58583.4 |
+| write | 97.0 · 238.1 · 22243.8 · 55405.6 |
+| fsync | 126.7 · 275.5 · 42194.5 · 85982.0 |
+| close | 4977.5 · 7029.6 · 28765.8 · 57989.0 |
+| stat | 158.6 · 698.2 · 42098.5 · 66626.4 |
+| open | 4541.2 · 25620.2 · 66723.8 · 132433.8 |
+| read | 57.4 · 86.2 · 156.9 · 392.5 |
+| rename | 516.2 · 25273.3 · 65698.2 · 83883.2 |
+| unlink | 305.8 · 18958.5 · 47371.7 · 164788.9 |
+
+unmounted: S:
+# raised's error output, heartbeat lines and lapses:
+slates-winfsp: reply spin window = 10600 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+## run 3 of 5 arm raised done, 2026-11-05T18:53:46Z
