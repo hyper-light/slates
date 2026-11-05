@@ -382,15 +382,20 @@
 > 2.5 µs). Record: `BENCHMARKS.md`, "The client's edit and merge latency".
 
 > **Replication latency (raft, 2026-11-04): a commit returns at its quorum; live shipping still owed.** Every quorum
+
+> **Replication latency (raft, 2026-11-04): a commit returns at its quorum; live shipping's log built, its wiring owed.** Every quorum
 > collector in `slates-cluster` slept its whole poll after its quorum had answered, so a cross-node record commit cost
 > the daemon's 10 ms poll (10,125–10,194 µs at the median) over a 12 µs loopback round trip. Each reply now wakes its
 > collector: 18.9–19.9 µs at the median, p99 28.8–32.9 µs, worst 44.7 µs at the daemon's poll
 > (`replication_bench`, five interleaved rounds at load 36–42, `docs/wip/BENCHMARKS.md`; failing test first:
 > `a_commit_returns_at_its_quorum_not_at_its_poll`; record:
-> `docs/bugs/2026-11-04-a-quorum-collector-waited-out-its-poll.md`). Open, toward a filesystem server replicated per
-> write in under 1 ms: §4.10 live shipping (the owner's publication stream shipped to its candidates and acknowledged
-> at f+1, AC-8.3's "live-shipped volumes report none", AC-8.9's credit backpressure) is unbuilt, as are `put_wal`
-> and the loss-window report; a head still waits up to the 100 ms record period before its commit starts.
+> `docs/bugs/2026-11-04-a-quorum-collector-waited-out-its-poll.md`). Live shipping's log (A-199) is built and checked
+> as a pure module (`crates/db/src/live.rs`; the nemesis in `crates/db/tests/live.rs`: 200 seeds × 3,000 steps at f=1
+> and f=2, Agreement, NoLoss, StaleNeverCommits and Convergence held, each check red under a mutation; §4.10 status).
+> Open, toward a filesystem server replicated per write in under 1 ms: the log over the fleet transport, measured;
+> the daemon's publications shipped through it with barriers answered at durability (AC-8.3's "live-shipped volumes
+> report none", AC-8.9's credit backpressure); phase one in the takeover round; real-process chaos. `put_wal` and the
+> loss-window report are unbuilt; a head still waits up to the 100 ms record period before its commit starts.
 
 > **VFS plan step 14, Shards' WHP window's three edge cases (2026-11-05): done, patches with the owner's folder.** Six
 > real-guest tests and one fix for Shards' owner, in `docs/wip/shards-patches/` (never pushed to Shards; README there), and
