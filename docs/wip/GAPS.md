@@ -14,8 +14,10 @@
 > holder dead (BENCHMARKS "Live shipping over the transport"). Open, found on the way: on the simulated fabric one
 > session's round trip grew about 1.7 times an exchange over sequential exchanges (9, 14, 23 … 621 ms of virtual time,
 > nine writes, `crates/cluster/tests/live.rs`), which the real runtime does not show; it is unexplained and owes a
-> failing test in the transport. Open, toward a filesystem server replicated per write in under 1 ms: the daemon's
-> publications shipped through it with barriers answered at durability (AC-8.3's "live-shipped volumes
+> failing test in the transport. The policy is built: `slates live-ship ID [--off]` records it on the owner partition,
+> `list` shows it, the catalog register carries it, and the db model test recovers it
+> (`crates/server/tests/live_ship.rs`). Open, toward a filesystem server replicated per write in under 1 ms: the
+> daemon's publications shipped through it with barriers answered at durability (AC-8.3's "live-shipped volumes
 > report none", AC-8.9's credit backpressure); phase one in the takeover round; real-process chaos. `put_wal` and the
 > loss-window report are unbuilt; a head still waits up to the 100 ms record period before its commit starts.
 

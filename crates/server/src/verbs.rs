@@ -3660,6 +3660,10 @@ fn dispatch_inner(
       principal: subject,
       rights,
     } => share(state, principal, volume, &subject, rights),
+    RequestBody::LiveShip {
+      volume,
+      live_shipped,
+    } => live_ship(state, principal, volume, live_shipped),
     // Served in `serve` as tasks that cross shards; neither reaches the dispatch.
     RequestBody::Attest { .. } | RequestBody::Revoke { .. } => refused(Refusal::BadRequest {
       reason: "attest and revoke are served on the channel".to_owned(),
@@ -3858,6 +3862,36 @@ fn share(
     now,
   ) {
     Ok(_) => ReplyBody::Shared,
+    Err(e) => refused(refusal_of_db(&e)),
+  }
+}
+
+/// Turns a volume's live shipping on or off (§4.10, A-200), as one recorded operation on its owner partition; `admin`
+/// on the volume is required, as for its access list. The flag rides the volume's catalog register, so a successor
+/// keeps shipping.
+fn live_ship(
+  state: &mut ShardState,
+  principal: &Principal,
+  volume: VolumeId,
+  live_shipped: bool,
+) -> ReplyBody {
+  let (_, record) = match find(state, volume) {
+    Ok(x) => x,
+    Err(r) => return *r,
+  };
+  if !rights_of(&record, principal).admin {
+    return forbidden("live-ship");
+  }
+  let now = state.clock.monotonic_ns();
+  match state.db.mutate(
+    &mut state.segment,
+    &Op::LiveShippingChanged {
+      id: to_db_volume(volume),
+      live_shipped,
+    },
+    now,
+  ) {
+    Ok(_) => ReplyBody::LiveShippingSet { live_shipped },
     Err(e) => refused(refusal_of_db(&e)),
   }
 }
@@ -4225,6 +4259,7 @@ fn create(
       },
       require_locked,
       role: Role::Plain,
+      live_shipped: false,
     },
     base: match base {
       None => BaseRecord::Scratch,
@@ -4828,6 +4863,7 @@ fn create_green(
         require_evidence,
         head_version: 0,
       },
+      live_shipped: false,
     },
     base: BaseRecord::Scratch,
     head: DbSnapshotId::default(),
@@ -4952,6 +4988,7 @@ fn create_work(
         base_version: base,
         stream: false,
       },
+      live_shipped: false,
     },
     base: BaseRecord::Scratch,
     head: DbSnapshotId::default(),
@@ -7715,6 +7752,7 @@ pub(crate) fn materialize_taken_over_green(
           require_evidence: recovery.require_evidence,
           head_version: recovery.head,
         },
+        live_shipped: false,
       },
       base: BaseRecord::Scratch,
       head: DbSnapshotId::default(),
@@ -7982,6 +8020,7 @@ pub(crate) fn materialize_taken_over(
       names: catalog.names,
       require_locked: catalog.require_locked,
       role: Role::Plain,
+      live_shipped: false,
     },
     // Placed content is always whole in RAM (an overlay's base-backed bodies are never sealed), so the
     // successor serves it with no base beneath.
@@ -8265,6 +8304,7 @@ fn list(state: &mut ShardState, principal: &Principal) -> ReplyBody {
         .and_then(|h| state.volumes.get(*h).ok())
         .map_or(v.unique_bytes, |s| s.volume.accounting().unique_bytes),
       overlay: matches!(v.base, BaseRecord::Path { .. }),
+      live_shipped: v.policy.live_shipped,
     })
     .collect();
   ReplyBody::Listed { volumes }
@@ -11383,6 +11423,7 @@ mod tests {
       owner: Principal::Uid { uid: 501 },
       require_locked: false,
       access: Vec::new(),
+      live_shipped: false,
     }
   }
 

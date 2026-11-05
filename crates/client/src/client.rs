@@ -3771,6 +3771,19 @@ impl Client {
     }
   }
 
+  /// Turns a volume's live shipping on or off (§4.10, A-200; `admin` on the volume is required): while on, each of its
+  /// publications is shipped to its candidates and a barrier answers once the owner and `f` of them hold it. Returns
+  /// the setting the daemon recorded.
+  pub fn live_ship(&mut self, volume: VolumeId, live_shipped: bool) -> Result<bool, ClientError> {
+    match self.call(&RequestBody::LiveShip {
+      volume,
+      live_shipped,
+    })? {
+      ReplyBody::LiveShippingSet { live_shipped } => Ok(live_shipped),
+      _ => Err(ClientError::UnexpectedReply { verb: "live-ship" }),
+    }
+  }
+
   /// The caller's grants.
   pub fn grants(&mut self) -> Result<Vec<GrantSummary>, ClientError> {
     match self.call(&RequestBody::Grants)? {

@@ -731,6 +731,15 @@ pub enum RequestBody {
     /// The mapping id the map's hand-off named.
     mapping_id: u64,
   },
+  /// Turn a volume's live shipping on or off (§4.10, A-200): while on, each publication of the volume is shipped to its
+  /// candidates and a barrier answers only once the owner and `f` of them hold it. `admin` on the volume is required.
+  /// Appended.
+  LiveShip {
+    /// The volume.
+    volume: VolumeId,
+    /// Whether it is live-shipped from now on.
+    live_shipped: bool,
+  },
 }
 
 /// Format: the name of the image file in an image volume's root (§4.6, A-160): what a VMM is pointed at.
@@ -1305,7 +1314,7 @@ impl RequestBody {
       | RequestBody::Enroll { .. }
       | RequestBody::Attest { .. }
       | RequestBody::Revoke { .. } => None,
-      RequestBody::Share { volume, .. } => Some(*volume),
+      RequestBody::Share { volume, .. } | RequestBody::LiveShip { volume, .. } => Some(*volume),
     }
   }
 
@@ -1328,6 +1337,7 @@ impl RequestBody {
         | RequestBody::Snapshot { .. }
         | RequestBody::DestroySnapshot { .. }
         | RequestBody::Share { .. }
+        | RequestBody::LiveShip { .. }
         | RequestBody::Enroll { .. }
         | RequestBody::Revoke { .. }
         | RequestBody::FsWrite { .. }
@@ -1654,6 +1664,8 @@ pub struct VolumeSummary {
   pub unique_bytes: u64,
   /// Whether it is an overlay.
   pub overlay: bool,
+  /// Whether it is live-shipped (A-200). Appended.
+  pub live_shipped: bool,
 }
 
 /// A merge conflict window (§4.16): the file, the range in base coordinates that met an intervening
@@ -3202,6 +3214,11 @@ pub enum ReplyBody {
     written: u64,
     /// The file's length when the comparison began: the copy's bytes past it within its last page are not the file's.
     file_len: u64,
+  },
+  /// A volume's live shipping was set (`LiveShip`, A-200). Appended.
+  LiveShippingSet {
+    /// Whether it is live-shipped now.
+    live_shipped: bool,
   },
 }
 
