@@ -12,9 +12,12 @@
 > made only for a record that goes to holders, the deriver composes over the base restricted to the journal's paths,
 > and a work holds only the files it changed since its base. Loaded Mac (load 5–11, informational): p50 51–69 µs and
 > p99 0.15–0.36 ms at 10, 1,000 and 10,000 files, every form, but for one run's 1.81 ms (conflict, 10,000 files; BENCHMARKS, "A full edit and merge"). Racing clients'
-> verdicts are judged against the rule (`crates/client/tests/merge_chaos.rs`). **Open:** quiet and CI numbers; 100,000
-> files; the preferred 50 µs (the fixed cost of the two round trips); the two-machine path (fs-server); at `f > 0` the
-> head identity is still O(green) per accept; the rebase restates whole. A daemon `SIGKILL`ed six times mid-merge
+> verdicts are judged against the rule (`crates/client/tests/merge_chaos.rs`). 100,000 files: accept p50 60 µs, p99
+> 199 µs on the Mac; CI's 3-core macOS runner (quiet): p50 67–150 µs at 10 to 10,000 files, its partition budget refuses a
+> 400 MB green (chain checkpointing owed). **Open:** the Linux CI numbers; the preferred 50 µs (the fixed cost of the two round trips); the two-machine path (fs-server); the rebase
+> restates whole. Since A-221 (2026-11-05) the head identity a holder recomputes is a set hash brought up to date when
+> read, so a record at `f > 0` costs what its version changed; its format changed (golden vector in
+> `crates/merge/tests/origin.rs`), so records written before it would not match a newer holder. A daemon `SIGKILL`ed six times mid-merge
 > loses no told version and tells none twice (`crates/cli/tests/merge_kill.rs`, red with the durable append removed).
 >
 

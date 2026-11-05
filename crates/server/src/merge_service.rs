@@ -1526,7 +1526,7 @@ pub(crate) fn enqueue_record(
   // every accept and dropped (113 of 120 profile samples of a 1,000-file green's submit, 2026-11-04).
   let identity = state
     .greens
-    .get(&green)
+    .get_mut(&green)
     .map(Green::head_identity)
     .unwrap_or_default();
   let inputs_identity = inputs_of(state, green, version)
@@ -2315,7 +2315,7 @@ fn recompute(
   }
   // Version 0 of a green this holder already replicates: accepted only if it is the same origin.
   if value.version == 0
-    && let Some(existing) = state.merge.replicas.get(&object)
+    && let Some(existing) = state.merge.replicas.get_mut(&object)
     && existing.head_identity() != value.identity
   {
     return Err(OUT_OF_ORDER);

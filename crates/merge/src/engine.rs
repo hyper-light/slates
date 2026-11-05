@@ -222,6 +222,67 @@ const IDENTITY_TAG_HARDLINK: &[u8] = b"L";
 const IDENTITY_TAG_XATTR: &[u8] = b"X";
 /// Format: IPC metadata has a separate identity domain from regular files and links.
 const IDENTITY_TAG_SPECIAL: &[u8] = b"I";
+/// A key of the green's state whose identity entry a commit changed (A-221): which dimension, and its path (and an
+/// attribute's name).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum IdentityKey {
+  /// A file.
+  File(String),
+  /// A FIFO/socket inode.
+  Special(String),
+  /// A directory.
+  Dir(String),
+  /// A path's mode.
+  Mode(String),
+  /// A symlink.
+  Symlink(String),
+  /// A hard link.
+  Hardlink(String),
+  /// An extended attribute: its path and name.
+  Xattr(String, String),
+}
+
+/// A FIFO/socket inode's identity entry: its tag, path and canonical metadata.
+fn special_entry(path: &str, node: &SpecialNode) -> crate::identity::Entry {
+  crate::identity::Entry::new(IDENTITY_TAG_SPECIAL)
+    .field(path.as_bytes())
+    .field(&node.encode())
+}
+
+/// A file's identity entry: its tag, path and bytes.
+fn file_entry(path: &str, bytes: &[u8]) -> crate::identity::Entry {
+  crate::identity::Entry::new(IDENTITY_TAG_FILE)
+    .field(path.as_bytes())
+    .field(bytes)
+}
+
+/// A directory's identity entry: its tag and path.
+fn dir_entry(path: &str) -> crate::identity::Entry {
+  crate::identity::Entry::new(IDENTITY_TAG_DIR).field(path.as_bytes())
+}
+
+/// A mode's identity entry: its tag, path and the mode's four bytes.
+fn mode_entry(path: &str, mode: u32) -> crate::identity::Entry {
+  crate::identity::Entry::new(IDENTITY_TAG_MODE)
+    .field(path.as_bytes())
+    .fixed(&mode.to_le_bytes())
+}
+
+/// A symlink's or hard link's identity entry: its kind's tag, path and target.
+fn link_entry(tag: &[u8], path: &str, target: &str) -> crate::identity::Entry {
+  crate::identity::Entry::new(tag)
+    .field(path.as_bytes())
+    .field(target.as_bytes())
+}
+
+/// An extended attribute's identity entry: its tag, path, name and value.
+fn xattr_entry(path: &str, name: &str, value: &[u8]) -> crate::identity::Entry {
+  crate::identity::Entry::new(IDENTITY_TAG_XATTR)
+    .field(path.as_bytes())
+    .field(name.as_bytes())
+    .field(value)
+}
+
 /// Derived: a retained IPC metadata payload occupies its Rust value's size, including alignment
 /// padding. Anchor: the actual `SpecialNode` layout on the target, measured by `size_of`.
 const SPECIAL_NODE_BYTES: usize = size_of::<SpecialNode>();
@@ -233,6 +294,14 @@ const SPECIAL_NODE_BYTES: usize = size_of::<SpecialNode>();
 /// history holds the bytes; the namespace dimensions' histories hold presence or the value.
 #[derive(Debug, Default)]
 pub struct Green {
+  /// The set hash of every entry at `identity_version` (`crate::identity`, A-221): brought to the head only when
+  /// the identity is read ([`Green::head_identity`]), by the keys in `identity_dirty`.
+  identity: crate::identity::SetHash,
+  /// The version `identity` is the set hash of.
+  identity_version: u64,
+  /// The keys whose entries any commit after `identity_version` changed: bounded by the keys the green's histories
+  /// hold, each once however often it changed.
+  identity_dirty: BTreeSet<IdentityKey>,
   content: BTreeMap<String, Vec<u8>>,
   content_history: ContentHistory,
   specials: BTreeMap<String, SpecialNode>,
@@ -551,6 +620,27 @@ enum Effect {
   RemoveXattr(String, String),
 }
 
+impl Effect {
+  /// The one key of the green's state this effect sets or removes (A-221).
+  fn identity_key(&self) -> IdentityKey {
+    match self {
+      Effect::Special(path, _) | Effect::RemoveSpecial(path) => IdentityKey::Special(path.clone()),
+      Effect::SetContent(path, _, _) | Effect::RemoveContent(path) => {
+        IdentityKey::File(path.clone())
+      }
+      Effect::MakeDir(path) | Effect::RemoveDir(path) => IdentityKey::Dir(path.clone()),
+      Effect::Mode(path, _) => IdentityKey::Mode(path.clone()),
+      Effect::Symlink(path, _) | Effect::RemoveSymlink(path) => IdentityKey::Symlink(path.clone()),
+      Effect::Hardlink(path, _) | Effect::RemoveHardlink(path) => {
+        IdentityKey::Hardlink(path.clone())
+      }
+      Effect::SetXattr(path, name, _) | Effect::RemoveXattr(path, name) => {
+        IdentityKey::Xattr(path.clone(), name.clone())
+      }
+    }
+  }
+}
+
 impl Green {
   /// An empty green volume at version 0.
   pub fn new() -> Green {
@@ -569,35 +659,47 @@ impl Green {
     let mut canonical = origin.clone();
     canonical.canonicalize();
     for (path, node) in canonical.specials {
+      green.identity.add(&special_entry(&path, &node));
       green.specials.insert(path.clone(), node);
       green.special_changed.insert(path.clone(), 0);
       green.special_history.insert(path, vec![(0, Some(node))]);
     }
     for (path, bytes) in canonical.files {
+      green.identity.add(&file_entry(&path, &bytes));
       green.content.insert(path.clone(), bytes.clone());
       green.last_changed.insert(path.clone(), 0);
       green.content_history.insert(path, vec![(0, Some(bytes))]);
     }
     for path in canonical.dirs {
-      green.dirs.insert(path.clone());
+      if green.dirs.insert(path.clone()) {
+        green.identity.add(&dir_entry(&path));
+      }
       green.dir_history.insert(path, vec![(0, true)]);
     }
     for (path, mode) in canonical.modes {
+      green.identity.add(&mode_entry(&path, mode));
       green.modes.insert(path.clone(), mode);
       green.mode_changed.insert(path.clone(), 0);
       green.mode_history.insert(path, vec![(0, Some(mode))]);
     }
     for (path, target) in canonical.symlinks {
+      green
+        .identity
+        .add(&link_entry(IDENTITY_TAG_SYMLINK, &path, &target));
       green.symlinks.insert(path.clone(), target.clone());
       green.symlink_changed.insert(path.clone(), 0);
       green.symlink_history.insert(path, vec![(0, Some(target))]);
     }
     for (path, target) in canonical.hardlinks {
+      green
+        .identity
+        .add(&link_entry(IDENTITY_TAG_HARDLINK, &path, &target));
       green.hardlinks.insert(path.clone(), target.clone());
       green.hardlink_changed.insert(path.clone(), 0);
       green.hardlink_history.insert(path, vec![(0, Some(target))]);
     }
     for (path, name, value) in canonical.xattrs {
+      green.identity.add(&xattr_entry(&path, &name, &value));
       let key = (path, name);
       green.xattrs.insert(key.clone(), value.clone());
       green.xattr_changed.insert(key.clone(), 0);
@@ -613,55 +715,142 @@ impl Green {
 
   /// The identity of the green's state at the head (§4.16 "the manifest identity": what a holder
   /// "recomputes … before serving the version" and "compares … with the record at every version",
-  /// D-27 "mismatch fatal-and-loud"): the BLAKE3 of a canonical encoding of every dimension — each
-  /// table in key order, every field length-prefixed and tagged by kind — so two engines that
+  /// D-27 "mismatch fatal-and-loud"): a hash of a canonical encoding of every entry of every
+  /// dimension — every field length-prefixed and tagged by kind — so two engines that
   /// applied the same increments to the same origin hash to the same identity, and a single
   /// differing byte anywhere (a file's content, a mode, a link target, an attribute) changes it.
-  /// Pure: a function of the state alone; it reads no clock and allocates only the hasher's
-  /// scratch. Cost is proportional to the state (it hashes every file), which is the laptop-honest
-  /// form; the design's incremental Merkle identity over shared extents is the measured refinement.
-  pub fn head_identity(&self) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    let field = |hasher: &mut blake3::Hasher, bytes: &[u8]| {
-      hasher.update(&(bytes.len() as u64).to_le_bytes());
-      hasher.update(bytes);
-    };
+  /// A function of the state alone; it reads no clock. Since A-221 it is the set hash of every
+  /// entry (`crate::identity`), brought up to date here by the keys changed since it was last read,
+  /// so a read costs what changed since the last one, not what the green holds, and a commit pays
+  /// nothing for it; it equals [`Green::head_identity_from_scratch`] in every state (it hashed every
+  /// byte the green holds on each call before). Mutable only to keep that running sum.
+  pub fn head_identity(&mut self) -> [u8; 32] {
+    self.fold_identity();
+    self.identity.identity()
+  }
+
+  /// Brings the set hash from `identity_version` to the head: for each key a commit changed since, its entry at
+  /// `identity_version` (read from the histories, which hold every version at or above the fold floor, kept at or
+  /// below `identity_version` by [`Green::fold_history_before`]) is subtracted and its current entry added. O(the keys
+  /// changed since the identity was last read), each once however often it changed.
+  fn fold_identity(&mut self) {
+    let since = self.identity_version;
+    for key in std::mem::take(&mut self.identity_dirty) {
+      let (old, new) = self.entries_of(&key, since);
+      if let Some(old) = old {
+        self.identity.remove(&old);
+      }
+      if let Some(new) = new {
+        self.identity.add(&new);
+      }
+    }
+    self.identity_version = self.head();
+  }
+
+  /// `key`'s identity entry at version `since` and at the head (`None` where it was absent).
+  fn entries_of(
+    &self,
+    key: &IdentityKey,
+    since: u64,
+  ) -> (
+    Option<crate::identity::Entry>,
+    Option<crate::identity::Entry>,
+  ) {
+    let target_at =
+      |history: Option<&Vec<(u64, Option<String>)>>| history.and_then(|h| history_at(h, since));
+    match key {
+      IdentityKey::File(path) => (
+        self
+          .content_ref_at(path, since)
+          .map(|bytes| file_entry(path, bytes)),
+        self.content.get(path).map(|bytes| file_entry(path, bytes)),
+      ),
+      IdentityKey::Special(path) => (
+        self
+          .special_history
+          .get(path)
+          .and_then(|h| history_at(h, since))
+          .map(|node| special_entry(path, &node)),
+        self
+          .specials
+          .get(path)
+          .map(|node| special_entry(path, node)),
+      ),
+      IdentityKey::Dir(path) => (
+        self
+          .dir_history
+          .get(path)
+          .is_some_and(|h| present_at(h, since))
+          .then(|| dir_entry(path)),
+        self.dirs.contains(path).then(|| dir_entry(path)),
+      ),
+      IdentityKey::Mode(path) => (
+        self
+          .mode_history
+          .get(path)
+          .and_then(|h| history_at(h, since))
+          .map(|mode| mode_entry(path, mode)),
+        self.modes.get(path).map(|mode| mode_entry(path, *mode)),
+      ),
+      IdentityKey::Symlink(path) => (
+        target_at(self.symlink_history.get(path))
+          .map(|target| link_entry(IDENTITY_TAG_SYMLINK, path, &target)),
+        self
+          .symlinks
+          .get(path)
+          .map(|target| link_entry(IDENTITY_TAG_SYMLINK, path, target)),
+      ),
+      IdentityKey::Hardlink(path) => (
+        target_at(self.hardlink_history.get(path))
+          .map(|target| link_entry(IDENTITY_TAG_HARDLINK, path, &target)),
+        self
+          .hardlinks
+          .get(path)
+          .map(|target| link_entry(IDENTITY_TAG_HARDLINK, path, target)),
+      ),
+      IdentityKey::Xattr(path, name) => {
+        let key = (path.clone(), name.clone());
+        (
+          self
+            .xattr_history
+            .get(&key)
+            .and_then(|h| history_at(h, since))
+            .map(|value| xattr_entry(path, name, &value)),
+          self
+            .xattrs
+            .get(&key)
+            .map(|value| xattr_entry(path, name, value)),
+        )
+      }
+    }
+  }
+
+  /// [`Green::head_identity`] recounted from scratch over every current entry: the oracle the running set hash is
+  /// held equal to (`crates/merge/tests/identity.rs`), O(everything the green holds).
+  pub fn head_identity_from_scratch(&self) -> [u8; 32] {
+    let mut set = crate::identity::SetHash::default();
     for (path, node) in &self.specials {
-      hasher.update(IDENTITY_TAG_SPECIAL);
-      field(&mut hasher, path.as_bytes());
-      field(&mut hasher, &node.encode());
+      set.add(&special_entry(path, node));
     }
     for (path, bytes) in &self.content {
-      hasher.update(IDENTITY_TAG_FILE);
-      field(&mut hasher, path.as_bytes());
-      field(&mut hasher, bytes);
+      set.add(&file_entry(path, bytes));
     }
     for path in &self.dirs {
-      hasher.update(IDENTITY_TAG_DIR);
-      field(&mut hasher, path.as_bytes());
+      set.add(&dir_entry(path));
     }
     for (path, mode) in &self.modes {
-      hasher.update(IDENTITY_TAG_MODE);
-      field(&mut hasher, path.as_bytes());
-      hasher.update(&mode.to_le_bytes());
+      set.add(&mode_entry(path, *mode));
     }
     for (path, target) in &self.symlinks {
-      hasher.update(IDENTITY_TAG_SYMLINK);
-      field(&mut hasher, path.as_bytes());
-      field(&mut hasher, target.as_bytes());
+      set.add(&link_entry(IDENTITY_TAG_SYMLINK, path, target));
     }
     for (path, target) in &self.hardlinks {
-      hasher.update(IDENTITY_TAG_HARDLINK);
-      field(&mut hasher, path.as_bytes());
-      field(&mut hasher, target.as_bytes());
+      set.add(&link_entry(IDENTITY_TAG_HARDLINK, path, target));
     }
     for ((path, name), value) in &self.xattrs {
-      hasher.update(IDENTITY_TAG_XATTR);
-      field(&mut hasher, path.as_bytes());
-      field(&mut hasher, name.as_bytes());
-      field(&mut hasher, value);
+      set.add(&xattr_entry(path, name, value));
     }
-    *hasher.finalize().as_bytes()
+    set.identity()
   }
 
   /// The paths any dimension of which changed at a version in `(from, to]` (§4.16 "`advance` …
@@ -1742,11 +1931,13 @@ impl Green {
 
   /// Remove the live inode and its metadata while retaining their historical values.
   fn remove_special(&mut self, path: String, version: u64) {
+    // The inode's own key is marked by its effect; its mode and attributes go with it and are marked here.
     if self.specials.remove(&path).is_some() {
       self.history_bytes = self.history_bytes.saturating_add(SPECIAL_NODE_BYTES);
     }
     self.special_changed.insert(path.clone(), version);
     if self.modes.remove(&path).is_some() {
+      self.identity_dirty.insert(IdentityKey::Mode(path.clone()));
       self.mode_changed.insert(path.clone(), version);
       self
         .mode_history
@@ -1762,6 +1953,9 @@ impl Green {
       .collect();
     for key in attributes {
       self.xattrs.remove(&key);
+      self
+        .identity_dirty
+        .insert(IdentityKey::Xattr(key.0.clone(), key.1.clone()));
       self.xattr_changed.insert(key.clone(), version);
       self
         .xattr_history
@@ -1784,6 +1978,8 @@ impl Green {
     // Content removes are staged before sets so a rename's source removal never deletes a file the
     // same increment recreates or renames into at that path.
     for effect in effects {
+      // Every key an effect touches is marked once; the identity is brought up to date only when it is read (A-221).
+      self.identity_dirty.insert(effect.identity_key());
       match effect {
         Effect::Special(path, node) => self.commit_special(path, node, version),
         Effect::RemoveSpecial(path) => self.remove_special(path, version),
@@ -2121,6 +2317,11 @@ impl Green {
   pub fn fold_history_before(&mut self, floor: u64) -> usize {
     if floor <= self.folded_below {
       return 0;
+    }
+    // The identity reads its keys' values at the version it was last brought to, so it is brought to the head
+    // before the history below the floor goes (A-221).
+    if self.identity_version < floor {
+      self.fold_identity();
     }
     self.folded_below = floor;
     let mut released = 0usize;

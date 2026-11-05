@@ -35,6 +35,7 @@
 // Bench harness code: an unwrap here is a failed run.
 #![allow(
   clippy::unwrap_used,
+  clippy::unwrap_in_result,
   clippy::expect_used,
   clippy::panic,
   clippy::indexing_slicing
@@ -180,7 +181,9 @@ fn wrong(what: &str) -> ! {
 }
 
 impl Fixture {
-  fn new(instance: &str, tag: &str, files: usize) -> Fixture {
+  /// A green of `files` files and its two works, or the daemon's typed refusal of a green that size (its partition's
+  /// chain or the shard's budget cannot hold the seed): a measured answer, printed in the shape's place.
+  fn new(instance: &str, tag: &str, files: usize) -> Result<Fixture, String> {
     let mut client = connect(instance);
     client.spin_for(Some(SPIN_NS));
     let green = client.create_green(&format!("{tag}-green"), false).unwrap();
@@ -194,11 +197,20 @@ impl Fixture {
         stamp = stamp.wrapping_add(1);
       }
       bytes.truncate(FILE_BYTES);
-      client.edit(seed, &path_of(index), 0, 0, &bytes).unwrap();
+      if let Err(refused) = client.edit(seed, &path_of(index), 0, 0, &bytes) {
+        client.destroy(seed).unwrap();
+        client.destroy(green).unwrap();
+        return Err(format!("the seed's edit {index} of {files}: {refused}"));
+      }
       model.insert(path_of(index), bytes);
     }
-    match client.submit(seed).unwrap() {
-      Submitted::Accepted(1) => {}
+    match client.submit(seed) {
+      Ok(Submitted::Accepted(1)) => {}
+      Err(ClientError::Refused(refusal)) => {
+        client.destroy(seed).unwrap();
+        client.destroy(green).unwrap();
+        return Err(format!("the seed's submit of {files} files: {refusal:?}"));
+      }
       other => wrong(&format!(
         "the seed submit answered {other:?}, not Accepted(1)"
       )),
@@ -206,7 +218,7 @@ impl Fixture {
     client.destroy(seed).unwrap();
     let (leader, _) = client.create_work(green, &format!("{tag}-w0")).unwrap();
     let (follower, _) = client.create_work(green, &format!("{tag}-w1")).unwrap();
-    Fixture {
+    Ok(Fixture {
       client,
       green,
       head: 1,
@@ -216,7 +228,7 @@ impl Fixture {
       made: 2,
       stamp: 0,
       tag: tag.to_owned(),
-    }
+    })
   }
 
   fn next_stamp(&mut self) -> u64 {
@@ -399,11 +411,16 @@ fn percentiles(mut samples: Vec<u64>) -> Vec<(&'static str, u64)> {
 }
 
 /// One form on one green shape: per part, per percentile, the per-run values.
-fn measure(instance: &str, form: Form, files: usize, load: &str) -> BTreeMap<String, Vec<u64>> {
+fn measure(
+  instance: &str,
+  form: Form,
+  files: usize,
+  load: &str,
+) -> Result<BTreeMap<String, Vec<u64>>, String> {
   let mut rows: BTreeMap<String, Vec<u64>> = BTreeMap::new();
   for run in 0..RUNS {
     let tag = format!("{}-{files}-{load}-{run}", form.key());
-    let mut fixture = Fixture::new(instance, &tag, files);
+    let mut fixture = Fixture::new(instance, &tag, files)?;
     let mut edits = Vec::with_capacity(SAMPLES);
     let mut submits = Vec::with_capacity(SAMPLES);
     let mut totals = Vec::with_capacity(SAMPLES);
@@ -430,7 +447,7 @@ fn measure(instance: &str, form: Form, files: usize, load: &str) -> BTreeMap<Str
     fixture.client.destroy(fixture.follower).unwrap();
     fixture.client.destroy(fixture.green).unwrap();
   }
-  rows
+  Ok(rows)
 }
 
 fn print_rows(key: &str, rows: &BTreeMap<String, Vec<u64>>) {
@@ -643,8 +660,14 @@ impl Selection {
 fn sweep(instance: &str, load: &str, selection: &Selection) {
   for files in &selection.shapes {
     for form in selection.forms.iter().copied() {
-      let rows = measure(instance, form, *files, load);
       let key = format!("{}_f{files}_{load}", form.key());
+      let rows = match measure(instance, form, *files, load) {
+        Ok(rows) => rows,
+        Err(refused) => {
+          println!("goal\tmerge.{key}: refused at capacity, not measured: {refused}");
+          continue;
+        }
+      };
       print_rows(&key, &rows);
       let p99 = median_of(&rows, "total_p99");
       let verdict = against_goal(p99);

@@ -7006,8 +7006,9 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > O(1). The deriver composes over the base restricted to the journal's paths, and the merge record's identities are
 > made only for a record that goes to holders. An increment's identity names its work and its base, as the data model
 > below says (it had left both out, and a second work's identical edit was answered with the first work's version;
-> `docs/bugs/2026-11-04-the-same-edit-from-two-works-was-one-increment.md`). Owed: the head identity at `f > 0` in
-> O(changed), the rebase's whole restatement.
+> `docs/bugs/2026-11-04-the-same-edit-from-two-works-was-one-increment.md`). Since A-221 (2026-11-05) the head
+> identity is a set hash over the green's entries, brought up to date when read, so a record at `f > 0` costs what its
+> version changed. Owed: the rebase's whole restatement.
 
 **Role.** Let many agents work on clones of one shared volume and fold their work back into it
 with no locks, no last-writer-wins, and no inferred merge. Each agent's work becomes an
@@ -12863,6 +12864,46 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
 - **Arm64 Windows proven** since (2026-10-27): the direct-map client tests, 20 of 20, on CI's `windows-11-arm` (run
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
+
+### A-221 — A green's head identity is a set hash over its entries, brought up to date when it is read (accepted and built 2026-11-05; the identity holders recompute, §4.16 "Apply on holders")
+Applied in the same change to: §4.16 (status), `docs/wip/merge-service.md` (the golden vector),
+`crates/merge/src/{identity,engine,lib}.rs`, `crates/merge/tests/{identity,origin,special,base_for}.rs`,
+`crates/merge/tests/common/{mod,generated}.rs`, `crates/server/src/{merge_service,verbs}.rs`, BENCHMARKS, GAPS.
+- **Why.** Every merge record at `f > 0` carries the green's head identity, which every holder recomputes and
+  compares before it serves the version. It was the BLAKE3 of every table of the green in key order, every byte of
+  every file included, so each accept at `f > 0` cost a pass over everything the green holds (113 of 120 submit
+  samples at 1,000 files, A-220). A-220 took it off the laptop's path only.
+- **What.** The identity is a set hash: each entry of the green's state (a file and its bytes, a directory, a mode,
+  a symlink, a hard link, an attribute, a FIFO/socket inode), encoded as before (its kind's tag, every field
+  length-prefixed), is expanded by BLAKE3's extendable output into 1,024 sixteen-bit lanes; the green's sum adds those
+  vectors lane by lane modulo 2^16; the identity is the BLAKE3 of the sum (`crates/merge/src/identity.rs`). This is
+  LtHash16 (Lewi, Kim, Maykov and Weis, IACR ePrint 2019/227, tier A; at least 200 bits of collision resistance at
+  these parameters; Bellare and Micciancio, EUROCRYPT 1997, for incremental hashing). Addition is commutative and
+  invertible, so the sum after any sequence of changes equals the sum over the final state, exactly. A commit only
+  marks the keys it changed; reading the identity (`Green::head_identity`, now `&mut self`) brings the sum up to
+  date from the version it was last read at, subtracting each marked key's entry there (from the per-dimension
+  histories) and adding its current one. A history fold first brings the identity up to the head, so the values it
+  subtracts are always still held. A key changed many times between reads costs one update, and a read at `f = 0`
+  never happens, so the laptop pays nothing. At `f > 0` each version's record reads it once: O(the keys that version
+  changed).
+- **Rejected, measured.** Keeping the sum up to date in every commit: on the loaded development Mac (load 21 to 37,
+  interleaved F G F G F G, 3 × 1,000 samples) accept at 10 files went from 44, 60, 51 µs to 78, 91, 101 µs at the
+  median, conflicts (no commit) unchanged, because each commit expanded two entries (a 4 KiB BLAKE3 took 13 µs and a
+  2 KiB extendable output 15 µs on that box under that load) that only a holder ever reads.
+- **Measured, the form built.** Brought up to date when read, against no running identity at all (the same box, load
+  23 to 31, interleaved F H F H F H): accept at 10 files 31, 53, 56 µs against 62, 50, 45 µs; at 1,000 files 59, 63,
+  48 µs against 60, 61, 44 µs; conflicts alike. No cost the shared box can show; the quiet runs are owed with the rest.
+- **The format changed.** The fixed origin's golden vector is now
+  `d6caa3225c45d46abd0a0df26a956a59479af07bcabd8f6ce1cec61f293e4146` (`crates/merge/tests/origin.rs`; it was
+  `1fe971c0…ab50d8`). A merge record written by a daemon before this change carries the old form, so a holder or a
+  successor built after it would find every such version a recomputation mismatch and refuse the green loudly, as
+  §4.16 requires of a mismatch. slates has no deployed fleet whose records outlive an upgrade; one that had would need
+  its records re-issued.
+- **Proven.** `crates/merge/tests/identity.rs`: over 20,000 generated histories in every dimension, with the identity
+  read at some steps and the history folded below the head at others, the running identity equals a recount from
+  scratch at every read (red with the fold's guard removed: the first generated case failed); one state reached in
+  two orders has one identity; a byte, a mode bit or a kind changes it and restoring the byte restores it. The
+  fleet's holder-recompute, mismatch and takeover tests pass unchanged (BENCHMARKS, GAPS).
 
 ### A-220 — A submit's cost follows what it changed, not what the green holds; a work is a delta over its base (accepted and built 2026-11-04, Ada's goal of 2026-11-04: a full edit and merge under 1 ms, preferably under 50 µs)
 Applied in the same change to: §4.16 (status), A-84 (what a work keeps and when its charge can be refused),

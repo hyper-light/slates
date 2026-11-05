@@ -38,7 +38,8 @@
   remaining bytes before allocation).
 - `Green::with_origin` seeds every dimension at version 0 with a history entry, head stays 0.
 - `Green::head_identity`: BLAKE3 of a tagged canonical encoding of every dimension — what a holder
-  recomputes and compares. Golden vector `1fe971c080517dbe400bfbacca80db3df1fc451d8b4c934a9e947c7ed2ab50d8`
+  recomputes and compares. Golden vector `1fe971c080517dbe400bfbacca80db3df1fc451d8b4c934a9e947c7ed2ab50d8` (since A-221, 2026-11-05, the set hash's
+  `d6caa3225c45d46abd0a0df26a956a59479af07bcabd8f6ce1cec61f293e4146`)
   for the fixed origin in `crates/merge/tests/origin.rs`.
 - `Green::changed_between(from, to)`: the paths any dimension changed at a version in `(from, to]`,
   read off the histories (the last-changed index alone misses a path changed inside the span and
