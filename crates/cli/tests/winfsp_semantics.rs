@@ -315,6 +315,27 @@ fn a_directory_holding_a_file_is_not_removed() {
   std::fs::write(drive.path("dir\\kept.txt"), b"kept").unwrap();
   let refused = std::fs::remove_dir(drive.path("dir"));
   assert_eq!(
+    refused.as_ref().map_err(std::io::Error::raw_os_error),
+    Err(Some(ERROR_DIR_NOT_EMPTY)),
+    "a directory with a file in it is not removed: {refused:?}"
+  );
+  assert!(std::fs::metadata(drive.path("dir")).unwrap().is_dir());
+  assert!(std::fs::metadata(drive.path("other")).unwrap().is_dir());
+}
+
+/// A-214, `t/base/03.t` case 3. Do: make a directory holding a file on the drive and remove the directory
+/// (`RemoveDirectoryW`, as `std::fs::remove_dir` does). Expect: `ERROR_DIR_NOT_EMPTY`, and the directory and its file
+/// still there, through Windows and through slates; once the file is deleted, the directory removes.
+#[test]
+fn a_directory_holding_a_file_is_not_removed() {
+  if !live_mount_runs() {
+    return;
+  }
+  let drive = Drive::mount("rmdir");
+  std::fs::create_dir(drive.path("dir")).unwrap();
+  std::fs::write(drive.path("dir\\kept.txt"), b"kept").unwrap();
+  let refused = std::fs::remove_dir(drive.path("dir"));
+  assert_eq!(
     refused.as_ref().map_err(|e| e.raw_os_error()),
     Err(&Some(ERROR_DIR_NOT_EMPTY)),
     "a directory with a file in it is not removed: {refused:?}"
