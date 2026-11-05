@@ -8733,6 +8733,538 @@ That names the cause: SetSize is the first request after an open's Confirm, so o
 the DLL arm it mostly missed. **It is not yet a measured gain:** the two arms share the machine, so the raised arm takes CPU from
 the other and this table flatters it. It needs arms run apart, and it is a whole-daemon change, so it has not been made.
 
+## Where the WinFsp receiver's time goes, and what each fix bought (audit step 7; 2026-11-05)
+
+A-212 left the receiver worse than WinFsp's DLL dispatcher (`71cf09ac`) beyond the spread at the p50, by about 20 µs a request.
+This section records the search for that time and each result, kept or rejected.
+
+**Verdict.**
+- **Kept:** the receive worker makes its two operation packets once for its life (`ba96d65d`). With it, every x86_64 quiet
+  call is within the DLL's spread at the p50.
+- **Not explained:** arm64 stays worse beyond the spread on quiet stat (1.32×), rename (1.21×), unlink (1.18×) and fsync
+  (1.07×), and on loaded write (2.10×). The traces put that time on the kernel's and the application's side of each of our
+  responses, not in the receiver's own work, the transaction mechanism or the mount's configuration.
+- **Rejected, each with its numbers below:** two receive workers, A-215's combined call (as a speed fix) and the batch
+  FSCTL's direct output as a cost.
+
+### Two receive workers: hypothesis rejected for create, stat and open
+
+**The hypothesis (the supervisor's, 2026-11-05).** One receive thread serialises the several IRPs a user operation makes,
+where the DLL serves them on two threads.
+
+**How it was measured.** Diagnostics runs 42086968194 (main `2972a702`), 42091919319 (main `698c64a2` with per-stage timing)
+and 42097182526 (A-215 against main, both staged); three runs each on both lanes. Every operation was traced on both arms,
+one source file (`trace.rs` on the `diag-winfsp-overlap-5` to `-9` branches):
+- the DLL arm around WinFsp's operation guard, before and after its lock;
+- the receiver around its operation call, and at each of its stages;
+- `mount_bench` naming each phase by opening an absent marker name.
+
+The timers cost time, so these runs attribute; they are not the record.
+
+**What it showed.**
+- **The DLL never runs two operations at once.** `71cf09ac` sets WinFsp's coarse guard, which takes one exclusive lock for
+  every operation (`src/dll/fsop.c:80-82`).
+- **Requests rarely arrive at the DLL while another is in service.** Arm64 quiet, run 1: 46 of 10,010 stat Creates, 1 of
+  10,000 open Creates, 1 of 10,000 create-phase Creates. x86_64 runs 1–3: 108–8,230 of 10,000 Creates in stat and open, varying by VM.
+- **Our receiver got 39,918 of its 39,999 arm64 stat-phase receives as one request.**
+- **Overlap exists only under rename and unlink:** arm64 quiet rename Cleanups 9,318 of 20,000, unlink Creates 2,127 of 10,000.
+
+So a second worker could serve only those two phases. It needs a crash proof that does not exist yet (GAPS); it was not built.
+
+**IRPs per operation** (arm64 quiet, either arm):
+- stat: Create, QueryVolumeInformation, Cleanup and Close, one each (Close 1.00 on the DLL arm, 1.22 on ours, the extra
+  lazy Closes of the create phase);
+- open: Create, Cleanup and Close (Read only when the cache misses);
+- rename: two Creates, a SetInformation, two Cleanups and two Closes;
+- unlink: Create, SetInformation, Cleanup and Close.
+
+**Per IRP, where the time goes** (p50, µs; arm64 run 1 of 42091919319, quiet):
+
+| phase | DLL service | DLL idle | our service | our idle | response call | receive wait | prologue |
+|---|---|---|---|---|---|---|---|
+| create | 28.7 | 81.9 | 26.6 | 98.3 | 11.3 | 77.8 | 3.3 |
+| open | 17.4 | 102.4 | 16.4 | 102.4 | 12.8 | 102.4 | 4.1 |
+| rename | 12.3 | 36.9 | 12.8 | 45.1 | 11.8 | 32.8 | 2.9 |
+| stat | 4.4 | 24.6 | 4.6 | 38.9 | 9.2 | 24.6 | 2.6 |
+| unlink | 20.5 | 36.9 | 13.3 | 53.2 | 11.3 | 38.9 | 2.9 |
+
+"Idle" is from one service's end to the next one's begin. Ours is the sum of the last three columns and about 1 µs of
+saving and acknowledging. The services are level, and our receive wait alone is about the DLL's whole idle.
+
+On x86_64 (runs 1–2 of 42091919319, quiet) our idle exceeded the DLL's by 0–6 µs. The response call (10.2–11.8 µs)
+overlapped the application's turnaround there, so our receive wait was shorter than the DLL's idle.
+
+In some x86_64 VM runs our Create and Close services were slower: in 42086968194 the stat Close p50 was 24.6, 18.4 and
+3.5 µs against 1.9–2.7 µs. That fits the reply spin missing, and goes to winfsp-bench (GAPS).
+
+### A-215's combined call: measured and rejected as a speed fix
+
+A-215 sends a batch's last response in the call that receives the next batch. It is crash-safe and proven (A-215, on
+branch `agents/winfsp-overlap-2`; its 40-kill oracle loses 0 and answers 0 wrongly on both lanes). Staged against main in
+run 42097182526, quiet stat, p50:
+
+| lane | main's response call | main's receive wait | A-215's combined call |
+|---|---|---|---|
+| arm64 | 9.2 µs | 26.6 µs | 34.8 µs |
+| x86_64 | 16.4 µs | 28.7 µs | 49.2 µs |
+
+The combined call costs what the two calls did. The response call's time is the kernel completing the IRP, which it pays
+in either form; merging the calls saves one system call, 1–2 µs an IRP on arm64 and nothing on x86_64. In the A/B below,
+A-215 with the prologue change was better than the prologue change alone on arm64 (quiet fsync 0.90×, rename 1.08× the
+DLL), but worse on x86_64 (quiet stat 1.18×, rename 1.20×, with four p99s worse beyond the spread). It does not win on both
+architectures, so it does not land. The earlier A/Bs are on branch `agents/winfsp-overlap-2`'s BENCHMARKS, "The WinFsp receiver with A-215".
+
+### The batch FSCTL's direct output: hypothesis rejected
+
+**The hypothesis.** The receiver's `FSP_FSCTL_TRANSACT_BATCH` is `METHOD_OUT_DIRECT`, so the I/O manager probes and locks
+the whole output buffer each call. The DLL's `FSP_FSCTL_TRANSACT` is `METHOD_BUFFERED` (`inc/winfsp/fsctl.h:100,104`).
+Direct output into the held section is required (A-198): a buffered output can lose requests the driver delivered, at a
+death.
+
+**The driver's minimums.**
+- A batch output under `FSP_FSCTL_TRANSACT_BATCH_BUFFER_SIZEMIN`, 64 KiB (`fsctl.h:142`), is refused with
+  `STATUS_BUFFER_TOO_SMALL` before any wait (`src/sys/volume.c:1028-1032`).
+- The single-request minimum is 16,320 bytes (`fsctl.h:143`).
+- WinFsp reads only the MDL's address (`volume.c:1147-1149`); the probe and lock are the I/O manager's (Microsoft,
+  "Buffer Descriptions for I/O Control Codes", `METHOD_OUT_DIRECT`).
+- So a smaller direct output is not available. The bench's batches never needed more: its largest receives fell in the
+  "4 or more" bucket of the traces, a few a phase.
+
+**The command.**
+
+```
+WINFSP_TEST_MOUNT=1 cargo +1.98.1 test --release -p slates-bridge-winfsp --lib -- --ignored --exact \
+  host::transact_bench::transact_cost --nocapture
+```
+
+`crates/bridge-winfsp/tests/support/transact.rs` mounts a real WinFsp volume with no file system behind it. Its own loop
+answers every request at once and sends each response in the call that receives the next request, as the DLL does. One
+client opens absent names, and the modes rotate each round. Diagnostics run 42114236343 (`diag-winfsp-overlap-15`, tree
+`a93faf64`), five runs on each runner.
+
+**Arm64 (`windows-11-arm`).** image win11-vs2026-arm64 20261101.203.1; 4 CPUs; ARM64 ARMv8 (64-bit) Family 8 Model D49 Revision   0, MICROSOFT CORPORATION; WinFsp 2.1.25156; Microsoft Windows [Version 10.0.26200.9725]. Five runs from 2026-11-05T21:38:13Z; each mode serves 10 timed rounds of 2,000 requests, after one untimed round. Each cell: the runs' values in order, µs.
+
+| mode | call p50 | call p99 | call p999 | call max | client open p50 | client open p99 |
+|---|---|---|---|---|---|---|
+| single-buffered-16320 | 22.2, 22.0, 21.9, 22.0, 21.7 | 45.5, 46.6, 47.9, 45.2, 44.0 | 87.8, 86.1, 90.0, 85.5, 86.0 | 129.3, 167.4, 195.4, 376.5, 158.0 | 21.3, 21.0, 21.0, 21.0, 20.8 | 52.4, 51.8, 52.4, 53.8, 50.6 |
+| batch-direct-64k-private | 22.9, 22.7, 22.6, 22.6, 22.4 | 48.3, 46.6, 48.4, 45.5, 44.7 | 84.3, 90.5, 77.4, 93.7, 75.9 | 214.9, 2186.3, 136.1, 1944.4, 1963.4 | 22.1, 21.7, 21.6, 21.6, 21.5 | 48.2, 45.9, 47.8, 46.4, 44.7 |
+| batch-direct-64k-section | 22.6, 22.5, 22.6, 22.5, 22.4 | 47.6, 45.8, 46.5, 47.0, 47.8 | 87.6, 94.4, 83.5, 93.0, 89.3 | 2111.9, 186.6, 179.8, 138.1, 139.2 | 21.8, 21.6, 21.6, 21.5, 21.5 | 49.1, 46.2, 46.5, 47.3, 47.5 |
+| batch-direct-128k-section | 24.1, 23.8, 23.9, 23.7, 23.8 | 49.3, 49.9, 52.5, 58.3, 53.8 | 88.8, 95.1, 95.8, 117.6, 86.3 | 247.5, 375.6, 208.5, 638.7, 1177.9 | 23.2, 22.8, 22.9, 22.8, 22.8 | 49.4, 49.5, 53.2, 56.5, 52.0 |
+| batch-direct-256k-section | 26.3, 25.7, 25.7, 25.5, 25.7 | 52.5, 55.0, 52.4, 54.5, 58.2 | 104.0, 96.8, 102.0, 112.6, 86.9 | 157.2, 187.8, 1177.2, 1038.6, 452.2 | 25.5, 24.7, 24.7, 24.5, 24.7 | 52.6, 54.9, 53.2, 53.5, 55.9 |
+
+Refused in every run: 10 of 10 calls with a batch output of 16,384 or 4,096 bytes returned Win32 error 122, the driver's `STATUS_BUFFER_TOO_SMALL`.
+
+**x86_64 (`windows-latest`).** image win25-vs2026 20261030.294.1; 4 CPUs; AMD64 AMD64 Family 25 Model 1 Stepping 1, AuthenticAMD; WinFsp 2.1.25156; Microsoft Windows [Version 10.0.26100.33674]. Five runs from 2026-11-05T21:38:16Z; each mode serves 10 timed rounds of 2,000 requests, after one untimed round. Each cell: the runs' values in order, µs.
+
+| mode | call p50 | call p99 | call p999 | call max | client open p50 | client open p99 |
+|---|---|---|---|---|---|---|
+| single-buffered-16320 | 50.6, 50.6, 49.8, 50.6, 50.3 | 97.0, 93.1, 88.8, 94.6, 92.8 | 133.3, 146.9, 137.1, 147.7, 126.0 | 454.0, 356.3, 617.9, 297.5, 591.0 | 49.7, 49.5, 48.8, 49.5, 49.3 | 99.7, 91.5, 93.0, 93.7, 92.4 |
+| batch-direct-64k-private | 50.2, 50.2, 49.8, 50.7, 50.2 | 92.3, 88.4, 90.1, 96.6, 94.2 | 127.8, 115.9, 125.8, 152.6, 130.9 | 1338.8, 1285.0, 674.1, 282.9, 250.6 | 49.3, 49.1, 48.8, 49.6, 49.1 | 92.1, 86.4, 90.5, 93.7, 91.4 |
+| batch-direct-64k-section | 50.3, 50.3, 49.8, 50.5, 50.3 | 90.7, 91.0, 93.9, 96.4, 92.4 | 127.2, 130.4, 141.3, 157.0, 127.9 | 279.5, 1091.0, 1156.9, 1282.9, 314.9 | 49.2, 49.1, 48.8, 49.3, 49.3 | 90.2, 89.0, 92.7, 95.2, 90.4 |
+| batch-direct-128k-section | 51.5, 51.3, 50.7, 51.3, 51.2 | 92.6, 95.4, 94.8, 95.7, 96.8 | 134.2, 132.6, 141.3, 185.0, 140.3 | 319.7, 406.6, 991.0, 970.4, 828.0 | 50.5, 50.3, 49.7, 50.1, 50.2 | 90.1, 93.6, 93.4, 92.4, 96.2 |
+| batch-direct-256k-section | 53.5, 52.5, 52.4, 52.6, 52.6 | 100.0, 95.0, 95.6, 99.6, 95.4 | 141.1, 130.1, 139.9, 165.5, 127.0 | 1373.2, 1430.2, 577.9, 1192.6, 317.2 | 52.6, 51.4, 51.4, 51.5, 51.5 | 96.2, 91.9, 93.6, 96.8, 91.9 |
+
+Refused in every run: 10 of 10 calls with a batch output of 16,384 or 4,096 bytes returned Win32 error 122, the driver's `STATUS_BUFFER_TOO_SMALL`.
+
+**Result.** At the driver's 64 KiB minimum, direct output costs about 0.5 µs a call more than the DLL's buffered call on
+arm64, and nothing measurable on x86_64. Each further 64 KiB adds about 1.2 µs on arm64 and 1 µs on x86_64. A private
+buffer and a pagefile section cost the same. So crash-safe receive costs at most about 0.5 µs an IRP.
+
+**What remains.** With this harness's "not found" answers, completion, the client's turnaround and the next delivery took
+about 22 µs a request on arm64, close to the DLL arm's whole idle in the mount (24.6 µs). With our real responses in the
+mount, they took 34–36 µs. The volume parameters of `71cf09ac` and main are the same but for an explicit transaction
+timeout. So the arm64 remainder is on the kernel's and the application's side of our responses: about 10 µs an IRP,
+measured and not explained.
+
+### Three arms against the DLL dispatcher (`71cf09ac`), five runs each
+
+The command is `windows-ab.sh` as in the sections above (`OLD_NAME=dll NEW_NAME=receiver RUNS=5 SPINNERS_PER_CPU=2`), after
+the live oracles: Windows clippy, the bridge suite and the CLI WinFsp suite, all passing on both lanes in each arm. Each arm
+ran on its own VMs, so arms are compared through their ratios to their own DLL arm. In two arms, x86_64 run 3 lost the
+DLL arm's drive under load: the anchor killed its daemon for a lapsed heartbeat (`os error 995`), and that run has a quiet
+pass only.
+
+**Arm 1: today's main (`698c64a2`).** Diagnostics run 42100630998 (`diag-winfsp-overlap-10`).
+
+**Arm64 (`windows-11-arm`).** image win11-vs2026-arm64 20261101.203.1; 4 CPUs; ARM64 ARMv8 (64-bit) Family 8 Model D49 Revision   0, MICROSOFT CORPORATION; WinFsp 2.1.25156; Microsoft Windows [Version 10.0.26200.9725]. host: windows 0x23f00206 on windows processor architecture 12 level 3401 revision 0 (aarch64), 4 logical CPUs (4 available to this process), 15 GiB, page 4096 B; largest L2 1048576 B, cache line 64 B. Runs: run 1 of 5 done, 2026-11-05T20:34:32Z; run 2 of 5 done, 2026-11-05T20:44:45Z; run 3 of 5 done, 2026-11-05T20:54:10Z; run 4 of 5 done, 2026-11-05T21:03:14Z; run 5 of 5 done, 2026-11-05T21:12:29Z.
+Wake-up probe, quiet: p50 24.3–26.4 µs, max 3.6–6.9 ms; pass 165–174 s.
+Wake-up probe, contended: p50 25.8–26.9 µs, max 50.6–76.9 ms; pass 349–424 s.
+
+**quiet** (5 runs; DLL / receiver; µs)
+
+| op | p50, DLL | p50, receiver | p50 ratio (medians) | p50 | p99, DLL | p99, receiver | p99 |
+|---|---|---|---|---|---|---|---|
+| create | 197.5, 200.6, 215.4, 202.3, 198.7 | 220.6, 225.0, 232.8, 221.6, 211.1 | 1.10× | overlap | 308.4, 294.5, 319.1, 453.0, 321.6 | 319.5, 326.9, 337.7, 318.6, 317.9 | overlap |
+| write | 95.9, 95.8, 99.1, 95.7, 94.3 | 98.9, 99.4, 102.7, 100.6, 98.4 | 1.04× | overlap | 240.5, 227.0, 236.9, 228.9, 247.3 | 235.5, 249.0, 249.3, 238.4, 254.3 | overlap |
+| fsync | 109.7, 108.7, 113.5, 111.7, 111.6 | 122.0, 120.1, 122.4, 124.4, 120.2 | 1.09× | worse | 182.9, 174.3, 179.7, 167.6, 242.8 | 187.7, 187.3, 190.0, 190.4, 193.2 | overlap |
+| close | 4378.3, 4477.3, 4625.0, 4449.1, 4461.5 | 4612.2, 4565.0, 4713.7, 4754.3, 4592.8 | 1.03× | overlap | 6500.5, 6421.2, 7480.5, 14803.2, 13976.9 | 6248.6, 6052.1, 6407.4, 6273.4, 6118.0 | better |
+| stat | 117.0, 115.7, 119.0, 117.0, 117.6 | 160.7, 155.0, 160.4, 161.8, 160.9 | 1.37× | worse | 194.3, 194.3, 224.4, 194.9, 194.6 | 247.0, 294.8, 235.3, 264.6, 313.0 | worse |
+| open | 3850.5, 3922.8, 4074.8, 3938.5, 3927.5 | 4116.4, 4202.1, 4243.4, 4187.2, 4038.2 | 1.07× | overlap | 5200.7, 5340.2, 5538.7, 5463.1, 5240.9 | 5448.2, 6064.5, 5544.7, 5520.6, 6778.3 | overlap |
+| read | 40.1, 45.5, 46.1, 46.3, 46.6 | 48.6, 45.1, 48.3, 50.2, 45.3 | 1.05× | overlap | 63.2, 67.4, 78.7, 77.5, 72.8 | 71.7, 72.4, 72.7, 82.2, 68.3 | overlap |
+| rename | 382.8, 382.4, 390.2, 387.4, 386.3 | 473.8, 471.3, 485.7, 482.6, 473.8 | 1.23× | worse | 824.2, 826.0, 774.3, 846.6, 1125.7 | 1106.6, 1381.1, 1188.4, 1207.4, 1350.7 | overlap |
+| unlink | 242.8, 248.0, 249.0, 247.3, 245.3 | 287.5, 290.9, 286.6, 293.5, 290.6 | 1.18× | worse | 438.2, 420.6, 443.0, 440.1, 432.4 | 573.1, 499.3, 605.1, 536.2, 561.2 | worse |
+
+p999 and max per run:
+
+| op | p999, DLL | p999, receiver | max, DLL | max, receiver |
+|---|---|---|---|---|
+| create | 1573.9, 987.9, 2023.1, 1618.9, 1864.4 | 799.2, 741.5, 1119.3, 963.1, 2231.0 | 13125.8, 6975.9, 4776.2, 10500.5, 16127.3 | 6954.5, 3957.1, 3761.0, 3627.1, 11678.4 |
+| write | 1064.4, 469.6, 526.1, 583.9, 824.3 | 543.3, 566.4, 575.3, 663.1, 704.2 | 4176.6, 7804.3, 6607.3, 2778.4, 9876.7 | 17595.3, 3217.2, 147864.4, 243128.1, 3593.6 |
+| fsync | 859.5, 383.5, 502.0, 463.6, 2987.8 | 505.4, 482.8, 414.2, 466.5, 429.2 | 17422.9, 17760.9, 3945.3, 3372.2, 122811.9 | 1507.0, 2576.7, 3245.9, 13022.0, 1778.6 |
+| close | 17539.6, 17576.2, 17889.2, 18273.9, 19012.8 | 8512.6, 8704.3, 8453.9, 8436.0, 10435.4 | 44417.8, 78333.2, 23876.9, 22286.1, 646877.7 | 23533.4, 33611.0, 89918.1, 16794.2, 23286.9 |
+| stat | 405.5, 378.2, 777.4, 283.1, 243.4 | 727.9, 707.7, 608.9, 615.2, 3040.0 | 9987.7, 3222.5, 3747.5, 778.6, 3789.5 | 13302.6, 14338.0, 11964.2, 16826.4, 8775.2 |
+| open | 6345.4, 7099.1, 7263.2, 6945.3, 7655.8 | 10649.5, 17553.3, 9329.2, 46696.9, 45984.8 | 10624.6, 280634.1, 9442.2, 10454.7, 85892.6 | 105308.1, 194749.7, 102611.5, 102812.5, 335580.8 |
+| read | 130.1, 114.0, 155.5, 138.4, 125.4 | 144.9, 148.8, 147.8, 153.5, 140.0 | 489.0, 160.2, 1194.3, 172.2, 160.7 | 177.6, 561.1, 180.1, 1343.2, 180.3 |
+| rename | 3061.8, 23814.2, 3529.8, 9689.1, 9399.0 | 2323.5, 6373.0, 2760.8, 2950.8, 3803.0 | 56813.0, 85192.7, 60275.9, 79611.2, 57834.4 | 42336.0, 40784.9, 63037.8, 83710.4, 62900.7 |
+| unlink | 904.5, 934.8, 730.4, 872.4, 769.1 | 21071.6, 1341.2, 2628.4, 4761.7, 3759.3 | 3453.6, 36322.8, 1882.3, 32756.2, 3378.7 | 185099.6, 125615.6, 145889.2, 165315.9, 164653.5 |
+
+**contended** (5 runs; DLL / receiver; µs)
+
+| op | p50, DLL | p50, receiver | p50 ratio (medians) | p50 | p99, DLL | p99, receiver | p99 |
+|---|---|---|---|---|---|---|---|
+| create | 235.5, 237.5, 225.5, 223.4, 213.6 | 230.3, 253.0, 230.3, 226.6, 211.0 | 1.02× | overlap | 835.8, 842.8, 745.2, 813.1, 759.0 | 1279.4, 829.6, 918.7, 1183.6, 873.9 | overlap |
+| write | 98.8, 99.6, 98.2, 96.1, 95.8 | 208.1, 217.4, 207.2, 207.3, 200.4 | 2.11× | worse | 438.8, 424.0, 320.5, 597.0, 311.4 | 7477.9, 3699.3, 9306.3, 5350.7, 2555.7 | worse |
+| fsync | 130.3, 129.6, 125.8, 125.8, 122.7 | 115.6, 121.7, 116.1, 119.9, 111.3 | 0.92× | better | 353.6, 679.2, 332.4, 466.0, 326.2 | 352.3, 321.0, 363.1, 335.7, 379.2 | overlap |
+| close | 5213.3, 5218.4, 5034.7, 4981.1, 4892.6 | 5161.0, 5919.3, 5147.3, 5072.2, 4894.4 | 1.02× | overlap | 39495.2, 39526.8, 39807.5, 38762.3, 39459.0 | 38559.4, 39940.6, 38072.9, 39209.1, 38388.5 | overlap |
+| stat | 148.7, 147.9, 145.4, 145.4, 146.3 | 153.9, 152.6, 154.8, 153.1, 150.9 | 1.05× | worse | 18550.7, 28438.8, 24381.2, 28330.9, 22823.4 | 745.2, 709.2, 697.7, 1035.0, 1373.5 | better |
+| open | 4165.8, 4227.2, 4054.8, 3977.2, 3900.0 | 4305.5, 4550.1, 4289.4, 4161.9, 4124.9 | 1.06× | overlap | 37945.7, 37820.7, 38521.7, 35714.3, 37933.9 | 39884.2, 45435.1, 39646.7, 40492.4, 41148.8 | worse |
+| read | 53.6, 55.7, 51.6, 51.1, 47.9 | 54.3, 57.2, 54.8, 52.0, 50.2 | 1.05× | overlap | 88.1, 87.0, 87.2, 88.2, 80.2 | 87.0, 92.7, 89.9, 89.3, 86.1 | overlap |
+| rename | 446.7, 454.0, 445.9, 446.8, 436.5 | 541.3, 542.6, 537.6, 525.1, 510.8 | 1.20× | worse | 23064.5, 25345.5, 22367.3, 25496.2, 25255.2 | 35465.7, 35752.2, 37075.2, 36072.1, 35409.4 | worse |
+| unlink | 307.1, 307.6, 301.8, 302.0, 296.9 | 339.9, 345.1, 338.1, 331.3, 334.3 | 1.12× | worse | 37018.5, 34476.3, 29558.4, 33770.6, 37787.4 | 28521.9, 31561.2, 28874.3, 27211.8, 28622.1 | overlap |
+
+p999 and max per run:
+
+| op | p999, DLL | p999, receiver | max, DLL | max, receiver |
+|---|---|---|---|---|
+| create | 32845.8, 33315.1, 27276.0, 33678.2, 34030.3 | 34378.0, 29691.9, 34006.8, 39176.9, 34141.9 | 50782.9, 46333.9, 46023.6, 55849.5, 50457.3 | 58122.1, 71819.4, 48351.7, 51959.9, 43501.3 |
+| write | 23507.9, 34361.3, 23510.3, 32594.9, 25924.0 | 33835.2, 26310.3, 35789.8, 29402.8, 32314.3 | 49809.2, 49804.3, 47439.9, 48963.0, 48726.4 | 66600.1, 44559.6, 50518.1, 40209.3, 81066.2 |
+| fsync | 36920.5, 39475.6, 37730.4, 39878.9, 45039.2 | 39170.1, 29672.2, 33257.3, 33377.6, 33872.8 | 56913.7, 70307.9, 54782.9, 61112.9, 84215.4 | 86260.8, 48442.3, 71858.8, 75839.5, 74535.6 |
+| close | 57719.2, 64831.4, 56737.4, 60523.1, 56478.6 | 61562.8, 55609.5, 55630.1, 57133.7, 56238.5 | 99888.9, 88051.7, 91560.0, 83602.2, 75280.2 | 102949.7, 77429.0, 82945.9, 73582.9, 79573.6 |
+| stat | 43589.8, 47152.4, 49971.8, 44172.5, 50519.8 | 40229.6, 46546.4, 40586.9, 41375.6, 38521.9 | 59444.1, 77845.4, 69755.4, 72596.3, 95248.0 | 62195.3, 153416.4, 61733.9, 119386.4, 78526.4 |
+| open | 58189.1, 58558.4, 62912.6, 59690.9, 65062.0 | 104225.7, 116178.5, 104462.5, 80881.9, 97217.5 | 96202.6, 95545.3, 143280.1, 109000.1, 83025.6 | 214588.9, 316583.0, 245758.1, 243331.0, 233880.9 |
+| read | 160.3, 165.2, 167.3, 163.0, 177.0 | 165.5, 180.9, 166.2, 164.5, 179.2 | 186.2, 193.0, 823.1, 341.7, 1091.9 | 336.6, 719.7, 293.2, 427.2, 755.5 |
+| rename | 69109.5, 68620.4, 71876.5, 71302.0, 71254.0 | 72273.1, 67215.3, 76387.9, 78930.7, 65046.9 | 168866.9, 160260.2, 155505.8, 161077.5, 147183.4 | 323079.6, 124919.6, 145983.6, 325524.6, 127731.5 |
+| unlink | 52263.7, 52842.2, 51358.7, 50694.9, 55809.4 | 101687.3, 126854.5, 119805.1, 115200.1, 127252.2 | 89140.5, 99981.6, 82879.0, 93136.7, 94443.9 | 365599.1, 448463.0, 402631.9, 348644.9, 344866.5 |
+
+**x86_64 (`windows-latest`).** image win25-vs2026 20261030.294.1; 4 CPUs; AMD64 AMD64 Family 25 Model 1 Stepping 1, AuthenticAMD; WinFsp 2.1.25156; Microsoft Windows [Version 10.0.26100.33674]. host: windows 0x23f00206 on windows processor architecture 9 level 25 revision 257 (x86_64), 4 logical CPUs (4 available to this process), 15 GiB, page 4096 B; largest L2 524288 B, cache line 64 B. Runs: run 1 of 5 done, 2026-11-05T20:43:39Z; run 2 of 5 done, 2026-11-05T20:59:54Z; run 3 of 5 FAILED, 2026-11-05T21:02:46Z; run 4 of 5 done, 2026-11-05T21:19:53Z; run 5 of 5 done, 2026-11-05T21:34:41Z.
+Wake-up probe, quiet: p50 37.6–39.4 µs, max 0.3–2.3 ms; pass 59–73 s.
+Wake-up probe, contended: p50 37.6–38.8 µs, max 157.1–212.2 ms; pass 817–938 s.
+
+**quiet** (5 runs; DLL / receiver; µs)
+
+| op | p50, DLL | p50, receiver | p50 ratio (medians) | p50 | p99, DLL | p99, receiver | p99 |
+|---|---|---|---|---|---|---|---|
+| create | 887.2, 915.8, 968.3, 940.7, 967.6 | 985.2, 944.5, 999.7, 1090.7, 931.1 | 1.05× | overlap | 1484.7, 1510.6, 1894.6, 1869.9, 1557.1 | 1578.9, 1543.3, 2649.6, 2754.4, 1508.5 | overlap |
+| write | 90.0, 94.6, 114.5, 100.2, 112.6 | 120.4, 128.1, 121.9, 88.8, 96.6 | 1.20× | overlap | 178.1, 197.7, 239.9, 176.8, 185.2 | 198.2, 195.9, 260.9, 1005.2, 190.5 | overlap |
+| fsync | 133.8, 131.2, 145.1, 159.3, 177.5 | 161.8, 143.9, 169.2, 136.4, 128.9 | 0.99× | overlap | 219.5, 213.9, 411.5, 254.7, 264.0 | 262.5, 246.2, 395.0, 305.0, 224.6 | overlap |
+| close | 61.5, 61.2, 61.6, 72.4, 93.4 | 69.7, 69.6, 72.3, 71.5, 68.9 | 1.13× | overlap | 131.9, 129.3, 204.9, 134.8, 143.2 | 161.7, 151.8, 217.0, 159.1, 143.0 | overlap |
+| stat | 255.5, 257.1, 323.9, 298.3, 342.4 | 319.0, 301.9, 320.4, 272.1, 275.0 | 1.01× | overlap | 378.6, 406.7, 529.8, 420.9, 442.2 | 440.6, 425.2, 469.6, 586.6, 389.3 | overlap |
+| open | 153.2, 184.4, 197.9, 187.0, 198.3 | 187.3, 200.3, 191.4, 176.7, 193.9 | 1.02× | overlap | 253.0, 278.4, 285.9, 280.8, 287.9 | 297.9, 315.6, 759.5, 1130.5, 284.5 | overlap |
+| read | 12.7, 13.0, 12.6, 13.3, 12.3 | 14.2, 14.4, 14.0, 14.2, 14.2 | 1.12× | worse | 120.2, 146.0, 141.9, 107.2, 20.3 | 21.0, 158.5, 30.1, 148.8, 148.3 | overlap |
+| rename | 549.3, 562.1, 681.2, 634.3, 707.8 | 710.4, 670.2, 711.2, 592.8, 597.1 | 1.06× | overlap | 819.6, 822.1, 1027.6, 939.7, 900.7 | 1067.8, 940.9, 2009.9, 1565.8, 854.2 | overlap |
+| unlink | 322.5, 322.8, 367.6, 386.5, 413.7 | 410.4, 378.4, 415.0, 352.6, 343.0 | 1.03× | overlap | 748.6, 745.0, 878.3, 618.3, 775.2 | 919.8, 876.3, 1169.9, 902.2, 832.7 | overlap |
+
+p999 and max per run:
+
+| op | p999, DLL | p999, receiver | max, DLL | max, receiver |
+|---|---|---|---|---|
+| create | 1880.2, 16712.8, 3700.8, 26067.8, 2110.4 | 4482.5, 2873.2, 11989.1, 121975.7, 9738.5 | 37932.1, 37851.7, 41391.9, 270573.6, 37659.1 | 38000.1, 38620.0, 37920.6, 347479.4, 38408.4 |
+| write | 737.3, 653.2, 1122.1, 782.5, 435.4 | 412.5, 518.4, 824.8, 1153.9, 482.4 | 36657.2, 36564.4, 29776.1, 282929.7, 2204.8 | 36495.3, 36604.5, 2051.5, 219007.0, 12491.8 |
+| fsync | 626.4, 569.9, 801.2, 745.2, 615.6 | 568.3, 490.5, 1534.2, 1909.9, 516.2 | 45577.0, 12481.9, 36557.8, 170791.5, 2016.5 | 1493.1, 40832.9, 31465.3, 235215.0, 36660.0 |
+| close | 634.9, 548.8, 407.4, 551.3, 447.7 | 388.5, 416.9, 718.2, 1021.0, 476.8 | 36466.0, 9957.7, 3834.2, 31870.8, 36569.7 | 849.9, 4920.7, 27720.6, 32414.3, 36416.6 |
+| stat | 502.4, 848.8, 2814.1, 1053.5, 993.1 | 889.8, 947.6, 1514.6, 1286.1, 843.2 | 37117.5, 37123.2, 31338.6, 231338.1, 36970.0 | 37126.8, 36892.4, 15574.9, 173709.3, 45148.8 |
+| open | 524.4, 849.7, 961.7, 810.0, 604.7 | 783.9, 1133.5, 2650.7, 3264.3, 791.4 | 36612.3, 36741.0, 36723.1, 296170.7, 36649.0 | 36650.4, 36583.8, 37186.0, 124074.9, 36567.8 |
+| read | 157.6, 210.1, 167.4, 142.3, 47.0 | 40.4, 198.8, 105.5, 1054.9, 221.3 | 36414.5, 755.4, 379.0, 5328.7, 63.7 | 72.0, 334.9, 216.4, 79316.7, 1363.5 |
+| rename | 1338.4, 1294.2, 2591.2, 37554.2, 1450.9 | 4441.1, 1474.3, 5674.0, 35067.3, 1351.8 | 37527.3, 37408.6, 37708.6, 388898.9, 37695.6 | 38358.2, 37929.0, 37053.0, 187912.6, 37620.8 |
+| unlink | 1013.1, 1062.6, 9379.2, 1841.2, 15590.2 | 22330.6, 22146.2, 11002.3, 3066.1, 1204.2 | 21016.9, 37041.9, 38326.5, 62797.2, 41432.5 | 73212.1, 36994.0, 80055.2, 318824.9, 36758.7 |
+
+**contended** (4 runs; DLL / receiver; µs)
+
+| op | p50, DLL | p50, receiver | p50 ratio (medians) | p50 | p99, DLL | p99, receiver | p99 |
+|---|---|---|---|---|---|---|---|
+| create | 1593.5, 1607.5, 1617.6, 1681.9 | 1670.1, 1651.8, 1578.7, 1586.4 | 1.02× | overlap | 229569.1, 242395.9, 247888.6, 237453.5 | 77669.5, 87374.5, 98779.4, 75670.4 | better |
+| write | 124.1, 125.2, 124.7, 124.7 | 128.4, 103.0, 103.0, 100.6 | 0.83× | overlap | 456.5, 462.9, 440.4, 24473.4 | 518.4, 482.8, 1095.9, 354.0 | overlap |
+| fsync | 190.2, 191.9, 190.3, 190.7 | 207.5, 156.9, 156.2, 155.8 | 0.82× | overlap | 321.0, 353.9, 340.7, 407.5 | 988.2, 426.2, 1130.7, 425.9 | worse |
+| close | 97.0, 97.7, 97.2, 97.0 | 83.0, 80.7, 80.8, 80.0 | 0.83× | better | 167.1, 180.2, 171.6, 163.1 | 200.8, 210.5, 300.1, 210.1 | worse |
+| stat | 365.6, 367.4, 362.5, 359.0 | 347.7, 297.2, 291.5, 298.3 | 0.82× | better | 125070.6, 130404.7, 110783.2, 114227.9 | 14006.3, 16766.0, 23748.2, 13867.9 | better |
+| open | 243.8, 241.6, 240.0, 241.1 | 252.4, 222.3, 218.2, 219.3 | 0.92× | overlap | 3740.2, 373.6, 388.5, 1278.1 | 3090.6, 1797.3, 1683.3, 1618.1 | overlap |
+| read | 126.1, 125.9, 125.0, 125.7 | 110.9, 107.1, 107.1, 106.0 | 0.85× | better | 222.9, 199.6, 208.2, 217.8 | 227.3, 245.8, 1039.3, 239.6 | worse |
+| rename | 845.0, 836.1, 831.8, 830.7 | 868.6, 725.5, 686.8, 717.6 | 0.87× | overlap | 61617.9, 61895.5, 56501.9, 66242.2 | 60828.6, 51872.8, 64596.8, 41981.0 | overlap |
+| unlink | 506.7, 496.2, 512.9, 498.9 | 487.0, 408.0, 400.4, 421.7 | 0.83× | better | 129363.1, 140666.4, 141839.1, 135034.7 | 32226.0, 32506.1, 32052.3, 32477.9 | better |
+
+p999 and max per run:
+
+| op | p999, DLL | p999, receiver | max, DLL | max, receiver |
+|---|---|---|---|---|
+| create | 299627.5, 331916.8, 334547.4, 304894.4 | 160811.2, 150067.5, 159712.6, 163377.5 | 382581.8, 483130.8, 398834.6, 390650.3 | 218576.2, 185519.7, 229130.2, 251329.5 |
+| write | 64226.1, 64368.2, 61248.8, 86558.5 | 65681.0, 65055.2, 72592.8, 61648.1 | 172985.8, 145603.9, 119031.4, 131756.0 | 98680.4, 135897.9, 97909.6, 299933.9 |
+| fsync | 72242.5, 70743.2, 66266.9, 66391.4 | 66543.5, 68197.2, 77725.2, 66951.8 | 152957.4, 184845.4, 129848.6, 103985.1 | 99389.3, 109078.0, 121204.6, 198203.0 |
+| close | 56216.8, 41169.7, 37864.7, 31452.6 | 33413.7, 44371.5, 37891.5, 51107.3 | 141755.3, 73257.8, 113873.3, 101477.9 | 79912.6, 70974.5, 101316.1, 79002.2 |
+| stat | 179099.3, 179606.2, 172350.8, 175180.4 | 73100.1, 95548.4, 79515.8, 88513.4 | 233890.8, 229903.8, 339081.5, 261872.3 | 100059.9, 122927.7, 133101.8, 133543.6 |
+| open | 95447.2, 83301.5, 87731.3, 92093.7 | 66616.5, 65700.0, 66931.2, 64040.6 | 140160.9, 138057.8, 133740.1, 154363.1 | 123162.6, 119834.3, 138539.7, 82061.5 |
+| read | 79233.5, 65898.9, 97313.4, 72142.2 | 34249.7, 65954.3, 65835.2, 64882.4 | 127104.9, 157682.8, 263689.9, 188589.2 | 83816.3, 92754.1, 120931.5, 106591.7 |
+| rename | 152393.3, 158121.1, 142431.7, 162895.4 | 205733.4, 129706.9, 252939.4, 111646.1 | 250145.2, 216925.4, 247309.4, 218856.8 | 2102368.9, 1540170.9, 2152116.2, 1585550.6 |
+| unlink | 190931.3, 192993.0, 195487.8, 189041.1 | 1043341.3, 1185418.7, 956329.5, 639291.7 | 251278.8, 238682.6, 249533.9, 250151.9 | 2423882.2, 2974335.5, 1938139.4, 2117982.6 |
+
+**Arm 2: main with the worker's packets made once (`ba96d65d`), kept.** Diagnostics run 42100636103 (`diag-winfsp-overlap-11`).
+Each request had made a fresh 16 KiB working copy and a fresh 16 KiB response packet, and zero-filled that packet again:
+2.6–4.4 µs an IRP on arm64 and 1.7–2.0 µs on x86_64 (the prologue column above). WinFsp's own dispatcher clears only the
+response header (`src/dll/fs.c:303-305`).
+- **x86_64:** every quiet call within the DLL's spread at the p50, and its ratios below arm 1's (quiet write 0.96× against
+  1.20×, fsync 0.87× against 0.99×, stat 0.95× against 1.01×, rename 1.00× against 1.06×).
+- **arm64:** slightly better (stat 1.32× against 1.37×, rename 1.21× against 1.23×, loaded rename 1.13× against 1.20×), but
+  quiet read was 1.17× against 1.05×. Differences of a few percent between arms are within the noise of separate VMs.
+
+**Arm64 (`windows-11-arm`).** image win11-vs2026-arm64 20261101.203.1; 4 CPUs; ARM64 ARMv8 (64-bit) Family 8 Model D49 Revision   0, MICROSOFT CORPORATION; WinFsp 2.1.25156; Microsoft Windows [Version 10.0.26200.9725]. host: windows 0x23f00206 on windows processor architecture 12 level 3401 revision 0 (aarch64), 4 logical CPUs (4 available to this process), 15 GiB, page 4096 B; largest L2 1048576 B, cache line 64 B. Runs: run 1 of 5 done, 2026-11-05T20:35:00Z; run 2 of 5 done, 2026-11-05T20:43:58Z; run 3 of 5 done, 2026-11-05T20:52:41Z; run 4 of 5 done, 2026-11-05T21:01:49Z; run 5 of 5 done, 2026-11-05T21:10:31Z.
+Wake-up probe, quiet: p50 23.6–25.4 µs, max 3.8–27.6 ms; pass 138–164 s.
+Wake-up probe, contended: p50 25.5–26.1 µs, max 71.5–82.3 ms; pass 349–416 s.
+
+**quiet** (5 runs; DLL / receiver; µs)
+
+| op | p50, DLL | p50, receiver | p50 ratio (medians) | p50 | p99, DLL | p99, receiver | p99 |
+|---|---|---|---|---|---|---|---|
+| create | 210.6, 194.9, 191.3, 197.2, 194.7 | 235.9, 217.2, 206.9, 219.0, 219.9 | 1.12× | overlap | 424.0, 317.4, 336.1, 345.9, 373.5 | 428.3, 459.5, 337.4, 453.8, 439.7 | overlap |
+| write | 95.9, 91.4, 91.3, 92.1, 92.6 | 93.8, 94.2, 88.8, 93.7, 95.4 | 1.02× | overlap | 227.4, 209.1, 211.9, 213.8, 224.5 | 219.9, 258.8, 205.4, 230.8, 224.4 | overlap |
+| fsync | 112.2, 108.2, 108.2, 109.4, 110.6 | 115.3, 117.5, 114.0, 119.6, 121.2 | 1.07× | worse | 164.1, 159.7, 165.9, 170.7, 170.1 | 179.8, 219.3, 177.3, 182.6, 185.2 | worse |
+| close | 4341.4, 4114.4, 4063.1, 4145.1, 4108.7 | 4519.5, 4258.8, 4154.4, 4278.3, 4322.4 | 1.04× | overlap | 6071.5, 6083.7, 5995.0, 6215.1, 7629.0 | 6195.1, 6548.5, 5791.1, 5774.5, 5801.0 | overlap |
+| stat | 117.9, 116.9, 115.3, 115.8, 117.8 | 155.6, 173.8, 151.9, 153.4, 154.8 | 1.32× | worse | 196.1, 190.4, 209.6, 187.1, 195.6 | 242.9, 405.9, 225.1, 227.8, 238.4 | worse |
+| open | 4050.2, 3581.3, 1040.9, 3545.1, 3731.2 | 4132.5, 3928.9, 3667.4, 3909.9, 3996.9 | 1.10× | overlap | 5496.9, 5096.6, 5155.3, 5373.3, 5148.5 | 5718.7, 6159.0, 5510.4, 5305.8, 5400.1 | overlap |
+| read | 41.5, 37.7, 37.5, 38.1, 38.1 | 45.8, 44.4, 38.7, 43.7, 45.6 | 1.17× | overlap | 70.1, 65.0, 64.6, 70.2, 63.9 | 78.2, 78.1, 70.3, 65.7, 67.0 | overlap |
+| rename | 398.9, 390.4, 384.8, 387.3, 385.3 | 473.6, 472.8, 456.4, 468.6, 468.1 | 1.21× | worse | 737.0, 760.3, 841.6, 772.4, 840.0 | 945.4, 1051.5, 875.4, 890.2, 894.9 | worse |
+| unlink | 250.0, 244.4, 242.5, 244.6, 243.9 | 291.7, 291.0, 283.2, 284.3, 289.5 | 1.18× | worse | 419.5, 406.0, 401.9, 410.0, 427.2 | 465.6, 475.8, 478.0, 472.9, 481.6 | worse |
+
+p999 and max per run:
+
+| op | p999, DLL | p999, receiver | max, DLL | max, receiver |
+|---|---|---|---|---|
+| create | 16122.3, 2994.1, 919.2, 1295.7, 2701.1 | 969.2, 1078.4, 680.0, 774.8, 892.7 | 17926.0, 17942.1, 17655.4, 17932.5, 17938.6 | 3730.4, 2717.1, 3132.3, 3384.5, 3839.3 |
+| write | 1057.8, 1434.1, 1018.0, 676.9, 1580.5 | 481.1, 565.5, 416.9, 640.1, 501.4 | 17795.2, 17798.4, 17363.8, 17352.8, 17681.0 | 3163.2, 3389.7, 3159.2, 3163.1, 3889.2 |
+| fsync | 477.0, 473.8, 532.8, 462.4, 771.7 | 459.7, 568.2, 523.4, 489.9, 540.7 | 16047.2, 5226.3, 2411.2, 4555.7, 17207.5 | 939.4, 3774.4, 39953.0, 1626.7, 3323.1 |
+| close | 17365.2, 17600.1, 17500.9, 17583.7, 17616.7 | 7902.7, 10984.5, 7727.7, 7700.7, 8050.1 | 20103.1, 34207.1, 20847.3, 22366.5, 33490.6 | 10649.2, 57777.7, 16428.3, 16050.1, 42449.2 |
+| stat | 1085.6, 264.3, 431.4, 283.5, 360.5 | 658.5, 1298.9, 567.0, 574.7, 590.8 | 13780.4, 8515.1, 15059.8, 14689.5, 11412.0 | 12271.7, 3279.1, 4030.1, 1252.8, 7988.2 |
+| open | 7377.3, 6293.4, 7109.5, 11753.1, 6558.8 | 10972.8, 24463.8, 17019.0, 10730.1, 8309.0 | 12693.1, 14868.9, 12485.4, 52270.2, 15489.0 | 103248.3, 113599.4, 101964.6, 103089.6, 124570.7 |
+| read | 140.8, 123.1, 127.3, 132.0, 123.8 | 146.4, 142.3, 112.0, 116.2, 143.8 | 220.0, 176.2, 3440.8, 201.1, 171.0 | 174.6, 4231.4, 160.1, 185.0, 303.6 |
+| rename | 7710.0, 3478.0, 3684.0, 4938.8, 4039.2 | 3755.2, 2276.4, 3749.6, 2195.9, 3135.2 | 58464.8, 38049.3, 71134.4, 75573.6, 64101.0 | 63214.3, 16050.8, 21565.5, 20903.7, 15869.3 |
+| unlink | 1533.0, 678.7, 1122.0, 864.4, 1387.6 | 780.4, 1824.9, 771.3, 1288.7, 762.0 | 17102.3, 2067.8, 16023.2, 3363.2, 63209.6 | 13856.7, 185267.2, 144870.1, 184565.7, 4353.8 |
+
+**contended** (5 runs; DLL / receiver; µs)
+
+| op | p50, DLL | p50, receiver | p50 ratio (medians) | p50 | p99, DLL | p99, receiver | p99 |
+|---|---|---|---|---|---|---|---|
+| create | 243.5, 224.9, 217.3, 232.6, 219.3 | 219.6, 219.4, 211.4, 230.4, 226.4 | 0.98× | overlap | 746.0, 800.0, 748.9, 1279.7, 847.8 | 807.9, 860.8, 748.7, 844.3, 796.4 | overlap |
+| write | 99.7, 96.6, 94.7, 98.0, 94.9 | 206.2, 203.1, 201.2, 206.9, 201.2 | 2.10× | worse | 565.5, 497.2, 332.0, 665.8, 494.9 | 4717.8, 1495.1, 2191.0, 7800.8, 697.8 | worse |
+| fsync | 134.2, 125.7, 123.7, 127.8, 121.4 | 110.2, 111.3, 111.4, 116.8, 118.1 | 0.89× | better | 351.6, 468.5, 330.2, 2770.9, 361.1 | 307.2, 334.3, 263.3, 348.8, 273.2 | overlap |
+| close | 6355.7, 5078.8, 4979.5, 5102.8, 4910.2 | 5072.0, 5049.1, 4950.4, 5229.8, 5115.2 | 1.00× | overlap | 40184.5, 39511.0, 38448.7, 39608.6, 38332.1 | 38033.7, 38255.9, 38906.8, 38877.0, 39421.8 | overlap |
+| stat | 148.3, 146.8, 145.8, 148.2, 148.9 | 149.9, 151.0, 150.5, 151.1, 151.3 | 1.02× | worse | 32108.6, 22208.7, 32120.4, 32219.8, 30209.2 | 2232.4, 648.0, 614.7, 639.1, 12602.9 | better |
+| open | 4321.2, 3979.5, 3996.6, 4100.5, 3899.6 | 4194.5, 4171.2, 4173.3, 4267.4, 4120.1 | 1.04× | overlap | 40843.2, 37322.2, 38502.8, 37474.5, 34732.1 | 38786.9, 39061.4, 39183.3, 39779.5, 39532.5 | overlap |
+| read | 54.5, 49.9, 49.7, 51.9, 48.9 | 52.5, 51.3, 50.7, 54.4, 50.4 | 1.03× | overlap | 87.8, 82.7, 82.9, 85.7, 82.3 | 86.2, 82.9, 84.4, 88.1, 84.0 | overlap |
+| rename | 448.5, 441.0, 447.2, 452.3, 443.3 | 506.7, 507.2, 501.6, 520.5, 510.2 | 1.13× | worse | 23527.7, 23467.0, 23036.1, 29257.3, 22923.1 | 36286.6, 36714.1, 35442.7, 36709.5, 34831.1 | worse |
+| unlink | 302.1, 299.8, 298.8, 303.2, 299.5 | 346.2, 336.7, 337.8, 336.5, 330.4 | 1.12× | worse | 33395.1, 35601.2, 35834.6, 35191.2, 37691.6 | 28465.3, 30720.9, 27896.7, 28585.3, 27225.0 | better |
+
+p999 and max per run:
+
+| op | p999, DLL | p999, receiver | max, DLL | max, receiver |
+|---|---|---|---|---|
+| create | 24895.8, 32156.8, 24338.7, 51203.6, 30782.5 | 33687.7, 34611.8, 33404.7, 30803.8, 28312.7 | 44509.9, 47942.9, 90782.0, 290560.4, 49700.7 | 44019.9, 97227.4, 49008.0, 45165.5, 49564.1 |
+| write | 25449.5, 31161.8, 21669.0, 27217.4, 33995.3 | 29233.6, 33536.3, 34109.4, 32313.1, 27917.9 | 88238.0, 63385.9, 43770.2, 93879.3, 52133.8 | 52846.0, 57186.1, 51096.9, 253082.9, 39571.1 |
+| fsync | 40385.3, 37451.8, 37590.5, 54445.1, 40198.3 | 39583.3, 37814.7, 29789.7, 36718.5, 32932.7 | 53774.2, 64198.8, 65353.5, 82091.4, 72046.3 | 56386.9, 65895.1, 60126.2, 63584.7, 48765.9 |
+| close | 56367.5, 65000.4, 55591.3, 58313.0, 55507.7 | 54540.6, 56410.6, 56234.9, 55387.0, 67696.5 | 81265.7, 90362.2, 78242.2, 459549.5, 71906.3 | 73661.1, 91669.5, 84699.0, 66544.7, 328709.9 |
+| stat | 49035.7, 45463.3, 50176.7, 50707.3, 50744.8 | 42829.9, 39110.9, 39970.5, 40486.8, 46253.6 | 79695.1, 56840.9, 90319.6, 67309.7, 80356.0 | 135850.9, 98692.0, 114756.3, 85919.5, 84702.5 |
+| open | 81117.3, 69227.1, 69985.2, 65439.4, 57170.9 | 96239.5, 110093.3, 89379.4, 99036.3, 134906.2 | 147680.8, 334358.9, 156283.8, 91609.7, 116040.4 | 237865.2, 228582.2, 268848.2, 237025.7, 552191.4 |
+| read | 166.8, 156.4, 171.5, 169.4, 159.6 | 163.8, 156.0, 151.4, 166.4, 173.5 | 328.5, 186.3, 291.0, 204.2, 402.6 | 303.0, 189.5, 191.1, 779.3, 376.2 |
+| rename | 74828.9, 72551.0, 69576.4, 81006.0, 70220.1 | 71804.5, 74033.6, 69146.0, 71788.6, 73348.1 | 161623.1, 187448.1, 118356.0, 327946.5, 142227.3 | 259045.4, 149440.2, 244585.9, 283501.0, 163400.5 |
+| unlink | 50460.0, 55450.3, 53944.2, 50329.6, 58418.9 | 124978.5, 121553.7, 126358.8, 76361.0, 100073.8 | 88768.7, 110174.0, 83583.9, 86822.7, 88808.9 | 399400.8, 430273.4, 432506.5, 453179.8, 338752.2 |
+
+**x86_64 (`windows-latest`).** image win25-vs2026 20261103.298.1; 4 CPUs; AMD64 AMD64 Family 25 Model 1 Stepping 1, AuthenticAMD; WinFsp 2.1.25156; Microsoft Windows [Version 10.0.26100.33674]. host: windows 0x23f00206 on windows processor architecture 9 level 25 revision 257 (x86_64), 4 logical CPUs (4 available to this process), 15 GiB, page 4096 B; largest L2 524288 B, cache line 64 B. Runs: run 1 of 5 done, 2026-11-05T20:45:13Z; run 2 of 5 done, 2026-11-05T21:03:08Z; run 3 of 5 done, 2026-11-05T21:18:24Z; run 4 of 5 done, 2026-11-05T21:35:28Z; run 5 of 5 done, 2026-11-05T21:51:50Z.
+Wake-up probe, quiet: p50 37.7–40.2 µs, max 0.4–1.2 ms; pass 58–80 s.
+Wake-up probe, contended: p50 39.1–41.8 µs, max 127.1–170.9 ms; pass 820–1000 s.
+
+**quiet** (5 runs; DLL / receiver; µs)
+
+| op | p50, DLL | p50, receiver | p50 ratio (medians) | p50 | p99, DLL | p99, receiver | p99 |
+|---|---|---|---|---|---|---|---|
+| create | 957.6, 994.5, 998.0, 900.1, 972.8 | 917.8, 950.0, 1050.6, 944.9, 965.0 | 0.98× | overlap | 1558.8, 1623.8, 1964.6, 1532.4, 1579.0 | 1561.1, 1602.4, 1912.1, 1612.6, 1607.6 | overlap |
+| write | 114.9, 113.2, 103.4, 89.0, 113.5 | 89.7, 127.2, 108.5, 105.9, 118.2 | 0.96× | overlap | 197.6, 204.7, 201.5, 196.0, 179.0 | 208.1, 208.2, 191.9, 225.4, 212.2 | overlap |
+| fsync | 146.4, 173.5, 162.6, 132.6, 165.8 | 122.8, 141.6, 163.7, 128.1, 147.0 | 0.87× | overlap | 250.0, 276.9, 275.1, 235.9, 250.5 | 239.0, 255.8, 274.0, 264.4, 273.2 | overlap |
+| close | 62.4, 64.0, 84.3, 62.0, 62.8 | 66.6, 67.9, 74.2, 67.3, 67.6 | 1.08× | overlap | 137.4, 142.4, 148.5, 137.8, 138.7 | 163.4, 155.3, 159.5, 160.3, 169.4 | worse |
+| stat | 314.7, 341.1, 313.7, 256.2, 334.5 | 262.1, 302.5, 326.6, 280.1, 299.6 | 0.95× | overlap | 427.8, 498.7, 445.0, 391.7, 445.7 | 384.0, 437.5, 504.4, 538.5, 502.4 | overlap |
+| open | 193.0, 197.3, 200.5, 158.2, 191.0 | 185.2, 195.2, 201.5, 191.9, 184.4 | 0.99× | overlap | 309.9, 296.2, 317.7, 313.7, 292.0 | 288.5, 301.6, 345.2, 299.7, 378.9 | overlap |
+| read | 12.5, 12.8, 14.4, 13.2, 12.8 | 14.1, 14.1, 14.1, 14.3, 13.8 | 1.10× | overlap | 149.4, 28.0, 153.1, 129.0, 20.4 | 145.1, 38.7, 108.4, 151.4, 146.1 | overlap |
+| rename | 672.9, 716.5, 671.4, 555.8, 700.1 | 577.5, 673.1, 674.1, 633.7, 683.4 | 1.00× | overlap | 864.6, 1003.0, 947.1, 830.5, 907.3 | 854.4, 959.3, 1183.5, 946.9, 1013.7 | overlap |
+| unlink | 372.5, 387.5, 396.7, 322.3, 385.1 | 325.1, 377.1, 411.3, 354.7, 386.1 | 0.98× | overlap | 788.7, 712.1, 792.2, 817.6, 915.9 | 864.1, 1000.0, 758.0, 958.1, 952.2 | overlap |
+
+p999 and max per run:
+
+| op | p999, DLL | p999, receiver | max, DLL | max, receiver |
+|---|---|---|---|---|
+| create | 4903.4, 9524.1, 115622.8, 2408.2, 2222.1 | 9861.4, 4642.2, 78698.5, 12917.4, 17134.2 | 37499.2, 42938.0, 499957.2, 38134.2, 38496.4 | 47163.5, 57148.8, 422565.3, 37727.3, 38958.6 |
+| write | 488.2, 493.1, 5130.0, 710.0, 399.1 | 692.7, 497.3, 453.3, 528.6, 422.1 | 36547.7, 8146.4, 286968.5, 36545.2, 36533.7 | 36348.4, 36386.0, 146370.4, 36455.4, 36606.2 |
+| fsync | 793.9, 546.7, 644.4, 741.2, 438.7 | 801.1, 535.5, 1069.8, 586.6, 562.1 | 37440.0, 23140.8, 124035.8, 12604.4, 36682.7 | 20032.2, 36595.5, 206014.7, 10167.1, 25970.4 |
+| close | 429.4, 422.0, 537.3, 669.2, 445.0 | 751.3, 510.4, 473.3, 430.0, 404.8 | 546.4, 528.9, 15428.7, 3951.4, 1150.2 | 10740.2, 36471.8, 188370.5, 14248.5, 36428.6 |
+| stat | 767.8, 764.3, 21159.9, 649.9, 1074.3 | 786.3, 866.1, 8745.3, 971.2, 927.9 | 37081.1, 8082.1, 316593.7, 15795.3, 37150.4 | 15942.0, 37081.6, 47361.0, 37113.2, 12361.4 |
+| open | 686.9, 808.1, 7922.6, 1047.1, 803.4 | 946.8, 801.4, 4709.1, 769.4, 783.3 | 36971.4, 36809.9, 207253.5, 36746.8, 6014.9 | 36543.2, 36966.4, 141687.8, 36828.4, 1236.9 |
+| read | 252.6, 48.7, 294.6, 227.4, 45.1 | 206.1, 158.1, 143.3, 220.0, 191.1 | 1330.3, 85.9, 205539.1, 36431.6, 77.5 | 8878.3, 192.2, 330.5, 1902.0, 339.9 |
+| rename | 1447.8, 1545.0, 59574.6, 1818.4, 1604.6 | 1638.9, 1524.8, 38884.1, 1697.2, 1492.7 | 37699.0, 37603.6, 474240.3, 37782.4, 37785.7 | 37642.1, 38522.9, 374840.1, 37920.1, 37513.5 |
+| unlink | 9040.8, 10786.3, 19238.4, 1030.1, 12712.7 | 1163.0, 5568.1, 2726.0, 1449.0, 13154.3 | 33505.6, 37121.8, 173974.7, 37019.6, 37233.9 | 37218.3, 37231.4, 44370.0, 32466.6, 38015.1 |
+
+**contended** (5 runs; DLL / receiver; µs)
+
+| op | p50, DLL | p50, receiver | p50 ratio (medians) | p50 | p99, DLL | p99, receiver | p99 |
+|---|---|---|---|---|---|---|---|
+| create | 1602.3, 1670.0, 1596.2, 1632.9, 1606.8 | 1606.6, 1650.3, 1638.0, 1604.6, 1609.9 | 1.00× | overlap | 236894.3, 240446.4, 255777.6, 235562.5, 240519.6 | 78717.7, 91408.3, 91153.6, 76962.9, 74152.2 | better |
+| write | 123.9, 123.9, 124.5, 124.7, 123.7 | 101.5, 103.5, 127.9, 100.9, 103.2 | 0.83× | overlap | 536.9, 31818.4, 480.8, 487.3, 1796.1 | 369.8, 685.7, 410.4, 541.9, 390.3 | overlap |
+| fsync | 188.5, 188.9, 188.1, 190.0, 188.5 | 152.7, 153.7, 203.0, 151.9, 177.7 | 0.82× | overlap | 352.6, 511.9, 386.3, 353.8, 355.9 | 367.0, 1680.8, 362.1, 363.2, 369.3 | overlap |
+| close | 95.7, 95.8, 95.6, 96.0, 96.1 | 78.5, 78.7, 80.9, 78.6, 78.9 | 0.82× | better | 168.0, 192.9, 171.6, 172.3, 160.4 | 203.5, 233.8, 210.8, 202.9, 196.2 | worse |
+| stat | 357.0, 359.6, 354.2, 361.8, 356.7 | 286.1, 289.2, 337.5, 293.2, 315.5 | 0.82× | better | 124172.9, 132537.5, 105859.9, 130174.0, 109798.6 | 14848.3, 17859.6, 22087.0, 12419.2, 16739.9 | better |
+| open | 241.7, 239.7, 240.2, 241.4, 240.2 | 219.1, 219.5, 247.5, 217.8, 244.8 | 0.91× | overlap | 515.5, 435.2, 420.8, 749.3, 462.9 | 996.5, 1979.2, 1181.3, 1735.7, 2298.9 | worse |
+| read | 124.4, 123.6, 124.8, 125.5, 124.6 | 105.3, 105.4, 109.0, 105.0, 106.0 | 0.85× | better | 220.7, 227.3, 225.4, 226.3, 210.1 | 285.7, 252.6, 236.7, 243.4, 241.9 | worse |
+| rename | 828.3, 829.0, 831.7, 826.6, 827.5 | 709.5, 710.9, 859.2, 713.0, 778.9 | 0.86× | overlap | 59160.7, 52379.7, 64588.8, 65437.7, 64764.2 | 61669.7, 52751.2, 59280.3, 45516.7, 45676.9 | overlap |
+| unlink | 523.5, 514.3, 491.7, 501.8, 508.6 | 407.5, 400.6, 476.0, 406.0, 475.5 | 0.80× | better | 148361.2, 141333.6, 142205.4, 136476.1, 148123.9 | 32543.7, 32248.4, 32505.3, 30988.5, 33106.6 | better |
+
+p999 and max per run:
+
+| op | p999, DLL | p999, receiver | max, DLL | max, receiver |
+|---|---|---|---|---|
+| create | 326334.0, 340052.0, 336958.3, 325888.3, 329909.8 | 165854.7, 165936.3, 157050.6, 159240.5, 163706.6 | 393040.0, 399730.4, 381168.8, 375501.7, 410195.3 | 198770.1, 203067.1, 287009.6, 217973.0, 243282.9 |
+| write | 65502.5, 85481.9, 64325.3, 68041.7, 70839.4 | 63584.5, 46625.1, 49762.6, 64901.5, 50645.8 | 105243.8, 170609.7, 111865.1, 135302.6, 139015.3 | 98049.7, 89788.6, 126776.8, 99314.7, 71836.5 |
+| fsync | 67046.8, 74483.5, 74474.8, 73139.8, 68605.1 | 68297.3, 66219.8, 65624.9, 66926.1, 53413.8 | 143573.7, 122332.2, 140190.5, 134336.8, 118873.7 | 121886.3, 123950.2, 100325.6, 129274.4, 195908.5 |
+| close | 33448.0, 63452.5, 25227.5, 48203.6, 11972.9 | 37335.6, 36259.6, 50949.1, 43713.5, 33058.1 | 133980.2, 149545.7, 103128.6, 131819.6, 78390.8 | 71077.7, 107714.9, 81872.2, 106091.2, 96543.7 |
+| stat | 179202.7, 188289.9, 159226.2, 180254.2, 170596.6 | 73286.8, 91259.2, 71255.3, 79954.9, 72348.4 | 263830.0, 274069.1, 210659.5, 293350.2, 242377.1 | 113218.5, 200525.7, 100174.4, 132842.8, 149031.8 |
+| open | 99937.8, 93259.1, 94218.7, 87115.3, 99770.4 | 55884.5, 65540.2, 64450.1, 63622.9, 69019.2 | 162336.6, 150232.5, 147262.2, 196074.8, 152611.9 | 97006.2, 119643.9, 133534.9, 134289.0, 93694.8 |
+| read | 72163.5, 88894.1, 85547.5, 81766.8, 80294.0 | 72972.1, 64738.7, 64496.4, 66070.8, 56033.7 | 148600.1, 191494.9, 159292.9, 140642.7, 158829.1 | 121657.5, 133941.0, 102270.7, 99256.4, 95134.0 |
+| rename | 133951.1, 145203.2, 147829.0, 163187.3, 149191.5 | 253932.8, 145908.6, 139341.0, 131318.7, 116548.7 | 189412.6, 202075.7, 241164.6, 258379.6, 232331.3 | 1822579.8, 1680723.8, 1408385.7, 2005004.0, 1532222.3 |
+| unlink | 203384.4, 199961.8, 196182.0, 194731.4, 200621.7 | 968547.7, 963585.7, 1088520.5, 1230637.6, 1387385.9 | 301674.3, 236802.9, 248833.2, 255810.3, 337317.2 | 2060486.3, 2039853.5, 2369338.2, 2376297.1, 2516274.2 |
+
+**Arm 3: A-215 with the worker's packets made once (`ce0051a2`), rejected.** Diagnostics run 42100645436
+(`diag-winfsp-overlap-12`). Its 40-kill oracle: 0 lost, 0 wrong on both lanes; 9 kills on arm64 and 4 on x86_64 inside a
+combined call.
+
+**Arm64 (`windows-11-arm`).** image win11-vs2026-arm64 20261101.203.1; 4 CPUs; ARM64 ARMv8 (64-bit) Family 8 Model D49 Revision   0, MICROSOFT CORPORATION; WinFsp 2.1.25156; Microsoft Windows [Version 10.0.26200.9725]. host: windows 0x23f00206 on windows processor architecture 12 level 3401 revision 0 (aarch64), 4 logical CPUs (4 available to this process), 15 GiB, page 4096 B; largest L2 1048576 B, cache line 64 B. Runs: run 1 of 5 done, 2026-11-05T20:33:34Z; run 2 of 5 done, 2026-11-05T20:42:53Z; run 3 of 5 done, 2026-11-05T20:52:44Z; run 4 of 5 done, 2026-11-05T21:00:53Z; run 5 of 5 done, 2026-11-05T21:10:30Z.
+Wake-up probe, quiet: p50 22.8–25.0 µs, max 3.9–7.5 ms; pass 129–185 s.
+Wake-up probe, contended: p50 25.5–27.3 µs, max 69.3–86.8 ms; pass 340–418 s.
+
+**quiet** (5 runs; DLL / receiver; µs)
+
+| op | p50, DLL | p50, receiver | p50 ratio (medians) | p50 | p99, DLL | p99, receiver | p99 |
+|---|---|---|---|---|---|---|---|
+| create | 195.6, 197.2, 247.6, 175.5, 187.7 | 194.4, 215.5, 260.9, 182.1, 185.8 | 0.99× | overlap | 305.0, 333.7, 392.5, 402.4, 379.5 | 301.0, 360.6, 425.5, 270.8, 328.4 | overlap |
+| write | 95.7, 96.9, 110.1, 89.5, 92.1 | 95.8, 104.7, 113.7, 90.5, 97.3 | 1.02× | overlap | 224.0, 227.1, 246.7, 202.0, 220.2 | 226.3, 247.8, 256.0, 207.3, 222.3 | overlap |
+| fsync | 111.8, 113.9, 120.7, 107.7, 111.1 | 100.8, 107.4, 111.3, 100.2, 98.0 | 0.90× | overlap | 169.1, 183.4, 180.0, 169.9, 166.3 | 177.8, 209.8, 196.7, 169.7, 169.9 | overlap |
+| close | 4128.6, 4140.7, 4822.4, 3802.1, 3894.3 | 4249.0, 4424.8, 4973.8, 3921.6, 4195.3 | 1.03× | overlap | 6136.5, 6344.3, 7071.3, 6523.9, 5834.4 | 5745.9, 6021.4, 6939.0, 5290.9, 5971.6 | overlap |
+| stat | 118.6, 119.5, 123.3, 113.5, 119.4 | 150.0, 152.7, 159.8, 146.5, 142.7 | 1.26× | worse | 189.5, 205.0, 208.0, 187.4, 192.0 | 225.5, 229.0, 244.7, 210.8, 210.1 | worse |
+| open | 3685.1, 3820.2, 4570.8, 813.9, 1023.2 | 3877.5, 3983.2, 4755.0, 888.7, 3610.3 | 1.05× | overlap | 5137.5, 5532.1, 6054.1, 5670.0, 4955.0 | 5448.2, 5436.6, 6075.1, 4903.1, 5059.3 | overlap |
+| read | 42.2, 35.7, 55.3, 29.1, 31.3 | 43.0, 41.0, 60.4, 33.0, 34.8 | 1.15× | overlap | 73.3, 66.2, 86.7, 72.6, 58.4 | 73.2, 67.1, 88.2, 55.4, 63.5 | overlap |
+| rename | 392.7, 399.9, 431.2, 379.9, 388.6 | 422.0, 444.6, 449.0, 424.7, 416.4 | 1.08× | overlap | 809.9, 1515.6, 1350.7, 939.1, 830.2 | 870.1, 881.8, 902.2, 808.0, 882.7 | overlap |
+| unlink | 249.4, 254.8, 267.1, 242.4, 250.3 | 262.5, 262.3, 277.8, 251.6, 266.2 | 1.05× | overlap | 429.8, 518.1, 474.2, 404.1, 411.3 | 489.8, 481.3, 609.2, 498.2, 471.8 | overlap |
+
+p999 and max per run:
+
+| op | p999, DLL | p999, receiver | max, DLL | max, receiver |
+|---|---|---|---|---|
+| create | 1038.4, 2029.9, 2227.7, 727.8, 1062.8 | 710.5, 907.9, 1175.7, 781.6, 759.8 | 17915.2, 17908.6, 17924.8, 2499.5, 17896.0 | 1483.0, 6441.9, 103991.9, 5584.7, 3154.8 |
+| write | 1590.7, 898.6, 1146.3, 557.7, 920.3 | 542.5, 979.0, 1413.3, 521.7, 513.8 | 17743.9, 17792.5, 17638.1, 2995.5, 15931.6 | 3711.7, 8496.3, 303860.4, 5285.1, 3582.4 |
+| fsync | 649.9, 640.5, 457.5, 439.3, 485.6 | 417.4, 686.2, 628.9, 385.9, 588.4 | 15411.6, 63706.0, 3364.3, 17786.3, 17497.4 | 3079.0, 10967.7, 20776.7, 3687.5, 3277.6 |
+| close | 17867.3, 17845.4, 17603.7, 17626.7, 17541.9 | 8073.1, 8713.5, 8803.2, 7386.9, 7641.4 | 34874.3, 139299.5, 21965.7, 19557.3, 20362.7 | 11497.8, 23891.2, 31519.3, 22122.5, 12339.2 |
+| stat | 241.2, 266.8, 313.4, 320.5, 294.9 | 562.3, 619.8, 581.0, 581.1, 546.3 | 8250.4, 7323.2, 6184.5, 726.6, 13391.9 | 3719.1, 14809.0, 3109.2, 888.1, 627.2 |
+| open | 6561.0, 7854.9, 8115.2, 6680.4, 5844.6 | 10016.6, 11240.2, 11392.5, 10193.4, 8017.3 | 12413.0, 13053.2, 16682.9, 34776.5, 14834.0 | 102770.0, 126100.0, 88010.8, 86477.8, 87441.9 |
+| read | 130.6, 130.5, 169.0, 104.4, 105.5 | 137.2, 143.3, 170.8, 103.4, 120.0 | 3431.8, 1094.9, 201.2, 601.8, 161.9 | 4884.8, 859.1, 196.3, 159.1, 303.2 |
+| rename | 9658.5, 15358.6, 3766.7, 15915.9, 5763.3 | 5747.5, 3963.2, 3983.1, 2334.5, 4262.2 | 46816.8, 79947.7, 49760.3, 91215.4, 69068.1 | 44240.4, 30403.8, 45247.1, 33922.1, 50636.7 |
+| unlink | 914.7, 1942.3, 854.1, 1460.5, 764.3 | 1061.2, 1195.3, 20725.9, 1850.4, 748.6 | 19974.8, 91998.1, 21148.5, 61708.7, 50900.1 | 124355.5, 145148.8, 316485.1, 63388.8, 124365.2 |
+
+**contended** (5 runs; DLL / receiver; µs)
+
+| op | p50, DLL | p50, receiver | p50 ratio (medians) | p50 | p99, DLL | p99, receiver | p99 |
+|---|---|---|---|---|---|---|---|
+| create | 215.2, 226.2, 225.1, 251.1, 220.1 | 219.3, 236.1, 231.5, 266.8, 234.0 | 1.04× | overlap | 780.7, 858.2, 812.6, 950.7, 747.3 | 863.4, 910.6, 889.6, 1202.0, 893.7 | overlap |
+| write | 103.9, 104.2, 107.3, 105.4, 104.6 | 203.9, 201.0, 204.7, 210.5, 203.8 | 1.95× | worse | 442.9, 1853.8, 405.0, 3926.6, 386.6 | 467.4, 662.1, 11658.8, 8487.8, 601.3 | overlap |
+| fsync | 115.4, 119.9, 120.5, 126.2, 118.6 | 119.3, 125.1, 125.0, 129.8, 125.0 | 1.04× | overlap | 394.7, 343.9, 359.7, 350.8, 820.4 | 301.5, 333.7, 308.3, 371.8, 321.4 | overlap |
+| close | 4874.3, 5154.4, 4950.4, 5332.4, 4879.5 | 4861.8, 5275.4, 5099.6, 5490.1, 5464.4 | 1.07× | overlap | 39280.3, 39283.7, 39495.0, 38255.4, 39682.3 | 37469.2, 38981.4, 38790.5, 38485.1, 39153.3 | overlap |
+| stat | 151.8, 149.1, 148.1, 150.3, 150.4 | 155.5, 157.7, 156.8, 158.3, 156.6 | 1.04× | worse | 32102.6, 30316.1, 22849.5, 24463.1, 33746.7 | 696.5, 3387.9, 8334.1, 9432.5, 3105.8 | better |
+| open | 4088.8, 4214.8, 4065.8, 4374.9, 3991.3 | 4116.8, 4405.1, 4306.2, 4577.6, 4527.7 | 1.08× | overlap | 38159.3, 37746.9, 38650.6, 30494.4, 37932.4 | 36327.0, 39563.8, 40098.5, 38453.1, 49017.5 | overlap |
+| read | 49.5, 51.1, 50.3, 59.0, 49.5 | 49.2, 52.7, 52.5, 60.1, 52.8 | 1.05× | overlap | 81.4, 96.1, 99.5, 93.1, 85.8 | 84.5, 86.0, 91.0, 106.1, 95.0 | overlap |
+| rename | 440.4, 450.2, 456.3, 466.8, 440.3 | 529.2, 550.5, 545.9, 569.3, 549.6 | 1.22× | worse | 22685.1, 22107.8, 22805.2, 25076.7, 26989.4 | 34835.0, 35424.7, 35789.8, 36162.5, 35973.2 | worse |
+| unlink | 314.1, 320.6, 316.7, 328.8, 315.1 | 360.8, 361.4, 363.2, 369.4, 363.6 | 1.15× | worse | 35780.5, 37282.8, 38790.3, 37841.3, 35195.7 | 30405.2, 27846.1, 29393.1, 26911.0, 28368.3 | better |
+
+p999 and max per run:
+
+| op | p999, DLL | p999, receiver | max, DLL | max, receiver |
+|---|---|---|---|---|
+| create | 24338.6, 32197.0, 29448.7, 33991.0, 37585.6 | 34895.3, 28132.6, 37132.2, 35461.9, 32714.3 | 45706.5, 38765.1, 50123.3, 50310.2, 86667.0 | 63153.1, 52660.9, 79022.3, 48389.1, 182459.3 |
+| write | 23570.9, 32244.5, 30184.7, 32841.2, 29980.5 | 33904.1, 32852.3, 40133.9, 36226.1, 33281.9 | 49247.4, 42425.9, 52644.1, 56047.2, 65843.8 | 58683.6, 46098.1, 63999.4, 73873.0, 244623.8 |
+| fsync | 38462.1, 37999.6, 38197.5, 39923.5, 38665.6 | 37676.1, 33128.1, 38186.1, 33083.3, 34042.9 | 56682.2, 60135.3, 55835.8, 65648.5, 50932.5 | 66445.9, 61254.1, 55822.8, 60023.8, 62622.4 |
+| close | 58125.1, 57039.4, 55433.9, 55694.5, 60821.9 | 54377.6, 60192.8, 55563.5, 55612.8, 56722.7 | 90082.6, 85730.1, 72300.6, 74922.6, 99936.5 | 72444.1, 89386.3, 83479.9, 98993.8, 156607.3 |
+| stat | 52371.2, 47631.7, 44475.7, 48917.0, 50679.2 | 39376.0, 39789.5, 46583.9, 41116.4, 38201.7 | 74260.2, 68406.9, 68527.4, 94472.8, 64195.3 | 64304.4, 76045.1, 119294.3, 84283.6, 87558.3 |
+| open | 67426.9, 70525.2, 64037.1, 50654.3, 63766.1 | 90837.8, 96105.9, 128108.0, 93135.3, 119335.6 | 113081.3, 104136.7, 82505.0, 89363.2, 117271.6 | 251739.3, 231213.3, 296489.4, 370736.4, 215413.4 |
+| read | 151.1, 167.6, 176.2, 164.4, 170.2 | 158.6, 169.1, 164.1, 175.4, 183.0 | 202.2, 216.9, 223.7, 1073.1, 211.5 | 828.9, 936.4, 223.9, 245.9, 316.8 |
+| rename | 71979.5, 68337.8, 73570.1, 76340.7, 77682.7 | 67256.0, 87144.8, 71218.2, 80993.6, 71570.2 | 157447.5, 154344.1, 143169.5, 250949.3, 168637.2 | 121628.4, 157361.2, 251750.5, 113247.4, 221342.5 |
+| unlink | 50063.1, 52231.3, 59924.5, 55304.9, 54052.2 | 149806.4, 132870.2, 89550.7, 104092.8, 118981.5 | 92015.9, 96046.6, 128185.9, 95640.1, 115501.4 | 384433.4, 411666.5, 407133.9, 530075.4, 428521.8 |
+
+**x86_64 (`windows-latest`).** image win25-vs2026 20261030.294.1; 4 CPUs; AMD64 AMD64 Family 25 Model 1 Stepping 1, AuthenticAMD; WinFsp 2.1.25156; Microsoft Windows [Version 10.0.26100.33674]. host: windows 0x23f00206 on windows processor architecture 9 level 25 revision 257 (x86_64), 4 logical CPUs (4 available to this process), 15 GiB, page 4096 B; largest L2 524288 B, cache line 64 B. Runs: run 1 of 5 done, 2026-11-05T20:43:01Z; run 2 of 5 done, 2026-11-05T21:01:11Z; run 3 of 5 FAILED, 2026-11-05T21:09:22Z; run 4 of 5 done, 2026-11-05T21:27:02Z; run 5 of 5 done, 2026-11-05T21:43:15Z.
+Wake-up probe, quiet: p50 37.4–38.7 µs, max 0.3–1.3 ms; pass 59–70 s.
+Wake-up probe, contended: p50 40.5–40.7 µs, max 149.4–160.0 ms; pass 811–1019 s.
+
+**quiet** (5 runs; DLL / receiver; µs)
+
+| op | p50, DLL | p50, receiver | p50 ratio (medians) | p50 | p99, DLL | p99, receiver | p99 |
+|---|---|---|---|---|---|---|---|
+| create | 957.0, 903.5, 876.6, 929.2, 961.1 | 984.6, 951.0, 987.0, 986.0, 982.2 | 1.06× | overlap | 1567.7, 1497.2, 1535.9, 1794.2, 1636.5 | 1566.0, 1543.7, 1566.1, 1847.6, 1575.1 | overlap |
+| write | 111.6, 79.2, 83.1, 98.1, 111.1 | 115.7, 125.5, 114.7, 106.0, 113.2 | 1.17× | overlap | 182.9, 188.3, 188.8, 198.1, 195.4 | 191.9, 202.2, 188.5, 219.5, 190.8 | overlap |
+| fsync | 167.8, 129.6, 131.0, 154.1, 170.3 | 174.5, 135.9, 163.6, 139.6, 170.4 | 1.06× | overlap | 247.9, 217.8, 226.9, 260.5, 258.6 | 276.4, 265.2, 274.1, 256.7, 278.4 | overlap |
+| close | 62.4, 60.6, 60.6, 69.3, 62.4 | 79.2, 68.9, 69.6, 72.1, 71.7 | 1.15× | overlap | 135.9, 132.6, 129.8, 139.9, 143.8 | 171.0, 154.6, 157.8, 165.4, 170.1 | worse |
+| stat | 326.5, 252.8, 249.5, 277.3, 327.6 | 325.7, 334.3, 329.6, 288.6, 326.7 | 1.18× | overlap | 428.2, 399.2, 370.8, 441.2, 430.2 | 476.9, 451.9, 442.2, 448.7, 458.2 | worse |
+| open | 187.8, 184.6, 150.7, 181.1, 181.3 | 182.5, 193.2, 182.2, 208.1, 179.9 | 1.01× | overlap | 280.1, 288.3, 257.0, 316.9, 279.8 | 296.5, 280.0, 296.5, 327.5, 294.6 | overlap |
+| read | 12.4, 13.0, 12.5, 12.8, 12.5 | 12.1, 12.4, 12.4, 15.1, 12.3 | 0.99× | overlap | 136.6, 157.0, 119.9, 108.8, 19.8 | 18.1, 20.7, 20.4, 182.8, 19.6 | overlap |
+| rename | 685.8, 543.5, 543.8, 589.1, 683.9 | 714.1, 709.4, 713.8, 636.9, 708.5 | 1.20× | overlap | 899.0, 869.6, 782.7, 926.6, 920.1 | 993.8, 976.8, 950.1, 975.7, 960.7 | worse |
+| unlink | 376.5, 318.8, 317.2, 361.5, 377.7 | 408.2, 377.4, 394.1, 378.8, 411.0 | 1.09× | overlap | 832.3, 731.5, 738.5, 702.7, 854.4 | 923.3, 957.0, 906.7, 896.2, 955.1 | worse |
+
+p999 and max per run:
+
+| op | p999, DLL | p999, receiver | max, DLL | max, receiver |
+|---|---|---|---|---|
+| create | 2155.8, 2063.9, 17423.3, 44700.7, 8388.4 | 4165.4, 5680.7, 6737.9, 53135.8, 2377.1 | 38156.1, 38012.1, 60313.1, 241012.4, 38202.3 | 38253.2, 38311.6, 37923.5, 393964.0, 37736.4 |
+| write | 414.8, 662.0, 795.4, 1894.1, 459.9 | 524.4, 469.4, 400.7, 738.5, 466.8 | 10263.8, 36607.8, 36421.2, 111588.6, 1742.3 | 36524.3, 20369.5, 3284.9, 40905.7, 36356.3 |
+| fsync | 455.5, 750.5, 657.6, 634.0, 808.1 | 377.7, 710.0, 383.5, 751.3, 511.1 | 2005.9, 37008.3, 6398.2, 36758.8, 2516.4 | 1552.9, 36571.5, 2093.1, 36727.7, 2315.5 |
+| close | 430.4, 667.3, 685.2, 539.5, 453.7 | 391.6, 412.3, 427.4, 614.4, 443.4 | 2133.1, 36466.6, 1137.6, 47279.4, 36424.8 | 1084.8, 36489.1, 821.6, 282132.2, 40427.2 |
+| stat | 670.4, 537.3, 611.6, 1369.3, 768.9 | 1100.7, 861.4, 934.7, 1345.9, 917.1 | 37341.2, 36981.2, 1419.7, 314160.5, 36885.6 | 36934.2, 37001.8, 37308.5, 189446.1, 36721.2 |
+| open | 509.9, 559.7, 580.9, 1636.7, 510.9 | 720.7, 734.3, 717.6, 841.8, 718.5 | 36565.5, 7895.9, 36791.2, 340840.4, 36725.0 | 36796.3, 36818.4, 1278.0, 78199.4, 36502.7 |
+| read | 169.4, 227.6, 183.2, 165.2, 45.9 | 41.7, 46.9, 47.4, 399.5, 43.2 | 989.2, 36452.0, 11739.7, 36826.1, 78.3 | 90.6, 78.9, 64.3, 320465.0, 57.2 |
+| rename | 1406.5, 1537.6, 1340.9, 22763.0, 2159.6 | 1572.1, 2887.6, 1517.8, 37274.1, 1438.5 | 37119.2, 37687.6, 37628.2, 204694.7, 37366.7 | 37501.8, 37426.2, 38064.5, 219361.5, 37483.2 |
+| unlink | 10909.0, 1074.6, 1007.8, 2289.9, 10104.1 | 17902.4, 26613.2, 18293.9, 2083.4, 22393.1 | 39645.6, 37010.8, 37297.8, 249636.8, 18827.9 | 54631.0, 36909.5, 37158.8, 38142.1, 56579.7 |
+
+**contended** (4 runs; DLL / receiver; µs)
+
+| op | p50, DLL | p50, receiver | p50 ratio (medians) | p50 | p99, DLL | p99, receiver | p99 |
+|---|---|---|---|---|---|---|---|
+| create | 1646.4, 1654.6, 1642.8, 1619.2 | 1685.2, 1660.3, 1629.5, 1709.8 | 1.02× | overlap | 238327.3, 255664.2, 248822.1, 240489.5 | 85517.7, 98286.8, 91182.9, 98655.0 | better |
+| write | 122.4, 123.5, 122.7, 121.6 | 106.5, 103.3, 103.2, 128.2 | 0.87× | overlap | 8713.4, 35580.3, 530.8, 1409.0 | 6235.1, 27395.3, 13485.0, 27748.3 | overlap |
+| fsync | 187.3, 188.9, 187.6, 186.0 | 184.1, 157.4, 158.9, 190.9 | 0.98× | overlap | 426.9, 345.2, 328.0, 426.1 | 486.0, 659.6, 461.9, 5720.8 | worse |
+| close | 95.2, 95.1, 95.3, 95.2 | 82.8, 82.1, 82.3, 84.3 | 0.87× | better | 170.3, 166.7, 162.8, 159.5 | 207.7, 225.6, 216.5, 205.2 | worse |
+| stat | 353.8, 358.9, 354.4, 350.8 | 351.2, 316.7, 318.7, 354.0 | 0.99× | overlap | 120847.5, 128671.3, 132403.8, 108816.5 | 16267.4, 15661.4, 12456.6, 22745.6 | better |
+| open | 238.4, 238.2, 237.4, 236.6 | 252.9, 224.1, 225.4, 252.0 | 1.06× | overlap | 1130.6, 678.6, 707.4, 33521.5 | 1223.5, 423.2, 633.4, 529.9 | overlap |
+| read | 123.5, 123.7, 123.9, 123.7 | 109.7, 107.5, 107.9, 109.1 | 0.88× | better | 216.0, 218.7, 216.2, 209.9 | 250.0, 261.1, 270.3, 246.0 | worse |
+| rename | 824.7, 823.3, 821.1, 815.6 | 797.3, 748.0, 749.7, 859.3 | 0.97× | overlap | 62552.5, 64674.6, 58660.7, 58205.1 | 52356.4, 56118.8, 57800.7, 52363.9 | better |
+| unlink | 490.6, 502.2, 506.9, 499.2 | 489.6, 416.3, 428.4, 487.8 | 0.97× | better | 134877.8, 145574.4, 147955.2, 147754.9 | 29904.8, 32388.7, 30838.5, 29839.8 | better |
+
+p999 and max per run:
+
+| op | p999, DLL | p999, receiver | max, DLL | max, receiver |
+|---|---|---|---|---|
+| create | 316658.0, 338616.1, 325705.8, 323954.3 | 167145.9, 156524.7, 165541.5, 163167.0 | 366020.0, 393016.3, 360946.0, 382153.3 | 206307.7, 198174.5, 867549.7, 251361.9 |
+| write | 75226.5, 104079.0, 65906.8, 85436.5 | 64325.9, 71478.0, 63175.9, 78348.9 | 150199.7, 170933.2, 165232.7, 267287.6 | 147922.4, 95995.2, 110797.6, 187655.1 |
+| fsync | 73255.5, 71574.9, 38831.5, 73028.7 | 67368.4, 68406.9, 66202.3, 65772.0 | 171967.7, 210906.4, 96918.2, 160189.2 | 100590.1, 127142.8, 103277.1, 118542.2 |
+| close | 42593.7, 47677.7, 16612.9, 1116.1 | 33193.1, 32608.6, 65196.6, 41505.7 | 103569.3, 107665.4, 126321.0, 127636.9 | 97373.5, 99315.6, 88714.6, 129677.7 |
+| stat | 186934.1, 190706.9, 197570.8, 179484.6 | 104034.7, 95083.4, 99901.5, 108346.9 | 255407.6, 297627.6, 261636.6, 248026.1 | 186982.1, 148433.4, 144536.1, 164562.2 |
+| open | 93496.5, 97163.7, 87687.0, 104743.2 | 64149.3, 55783.7, 65614.1, 74713.5 | 131826.1, 201478.4, 155551.6, 206378.5 | 103481.1, 97673.9, 131959.3, 93194.1 |
+| read | 98248.3, 73487.7, 68287.1, 71094.0 | 67588.9, 52545.0, 61635.3, 65622.7 | 159034.8, 112373.5, 110233.0, 123169.7 | 98917.5, 129667.9, 111620.0, 100404.0 |
+| rename | 163242.7, 144160.1, 160810.4, 140823.8 | 167786.6, 142781.0, 180111.8, 189345.1 | 200445.2, 276686.5, 231921.1, 184083.4 | 2049347.5, 1861342.0, 1861360.9, 2132690.5 |
+| unlink | 198068.0, 201280.4, 204592.2, 203027.1 | 1075555.8, 911056.9, 800678.0, 1164459.0 | 236019.4, 264453.9, 237513.9, 267162.8 | 2181978.9, 2385283.7, 2142098.5, 2146294.2 |
+
+**The remainder, per IRP, for Ada.** On x86_64 the receiver with arm 2 is within the DLL's spread at every quiet p50.
+- **What remains on x86_64:** quiet close's p99, and some loaded p99s (close, read, fsync).
+- **What remains on arm64:** about 10 µs an IRP at the p50, from quiet stat (1.32×) to loaded write (2.10×). It is not the
+  crash-safe receive: direct output at the minimum costs at most 0.5 µs an IRP.
+- **Where it is:** on the kernel's and the application's side of each of our responses, and not explained.
+
 
 ## The acknowledgement answered once its own shard has released (A-216; R9; 2026-11-05)
 
