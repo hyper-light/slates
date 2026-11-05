@@ -63,7 +63,7 @@ fn emit_recovery_plan(
     )));
   };
   if json {
-    println!(
+    slates_machine::out_line!(
       "{}",
       serde_json::json!({
         "member": plan.member, "previous_group": hex32(&plan.previous), "plan": hex32(&plan.digest),
@@ -73,7 +73,7 @@ fn emit_recovery_plan(
       })
     );
   } else {
-    println!(
+    slates_machine::out_line!(
       "plan {}\nmember {}\nprevious group {}\ncommitted position {}\nlast log position {}\nconfiguration version {}\nknown former voters {:?}",
       hex32(&plan.digest),
       plan.member,
@@ -84,9 +84,9 @@ fn emit_recovery_plan(
       plan.voters
     );
     if let Some(target) = plan.target {
-      println!("join group {}", hex32(&target));
+      slates_machine::out_line!("join group {}", hex32(&target));
     }
-    println!(
+    slates_machine::out_line!(
       "Compare the retained copies before choosing one. Fence the entire former group before recovery; unreachable copies may contain newer committed state. Confirm only after accepting that possible loss."
     );
   }
@@ -117,12 +117,12 @@ fn emit_recovery(
     return Err(Failure::Refused(format!("recovery refused: {reply:?}")));
   };
   if json {
-    println!(
+    slates_machine::out_line!(
       "{}",
       serde_json::json!({"group": hex32(&group), "joining": joining})
     );
   } else {
-    println!(
+    slates_machine::out_line!(
       "{} {}",
       if joining {
         "joining recovery group"
@@ -167,14 +167,14 @@ fn export_verb(
   // The port the export is served on, beside the path: an NFS volume made from it (a Docker `type=nfs` volume, a
   // PersistentVolume) names both (A-73). `None` only where the daemon serves no NFS (Windows mounts through WinFsp).
   if json {
-    println!(
+    slates_machine::out_line!(
       "{}",
       serde_json::json!({ "attachment": attachment.attachment, "path": path, "port": report.nfs_port })
     );
   } else {
-    println!("export: {path}");
+    slates_machine::out_line!("export: {path}");
     if let Some(port) = report.nfs_port {
-      println!("port: {port}");
+      slates_machine::out_line!("port: {port}");
     }
   }
   Ok(())
@@ -236,7 +236,7 @@ fn mount_verb(
       )),
     });
   }
-  println!("mounted: {mounted}");
+  slates_machine::out_line!("mounted: {mounted}");
   Ok(())
 }
 
@@ -268,7 +268,7 @@ fn mount_verb(
     (None, false) => client.attach_fuse(volume, intent, &real),
   }
   .map_err(|e| failure_of(e, instance))?;
-  println!("mounted: {}", attachment.path.unwrap_or(real));
+  slates_machine::out_line!("mounted: {}", attachment.path.unwrap_or(real));
   Ok(())
 }
 
@@ -297,7 +297,7 @@ fn mount_verb(
   let attachment = client
     .attach_winfsp(volume, intent, path)
     .map_err(|e| failure_of(e, instance))?;
-  println!(
+  slates_machine::out_line!(
     "mounted: {}",
     attachment.path.unwrap_or_else(|| path.to_owned())
   );
@@ -348,7 +348,7 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
   // a stale mount is unmountable even after its daemon has gone. A WinFsp drive is the daemon's to remove.
   if let Verb::Unmount { path } = &request.verb {
     unmount_verb(&request.instance, path)?;
-    println!("unmounted: {path}");
+    slates_machine::out_line!("unmounted: {path}");
     return Ok(());
   }
   let mut client = connect(&request.instance)?;
@@ -388,7 +388,7 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
       .map_err(|error| failure_of(error, "bootstrap"))?;
     return match reply {
       slates_ipc::protocol::ReplyBody::Acknowledged => {
-        println!(
+        slates_machine::out_line!(
           "{}",
           if request.json {
             "{\"bootstrapped\":true}"
@@ -514,7 +514,7 @@ fn serve_mcp_http(server: slates_mcp::McpServer, port: u16, instance: &str) -> R
       .reply_ns,
     connections: config.clients_per_shard,
   };
-  eprintln!(
+  slates_machine::log_line!(
     "slates mcp: http://127.0.0.1:{bound}{} (Authorization: Bearer {})",
     slates_mcp::http::ENDPOINT_PATH,
     edge.bearer_hex()
@@ -593,9 +593,9 @@ fn merge_green(
     Some(base) => client.create_green_over(name, evidence, base)?,
   };
   if json {
-    println!("{}", serde_json::json!({ "id": volume_id_text(id) }));
+    slates_machine::out_line!("{}", serde_json::json!({ "id": volume_id_text(id) }));
   } else {
-    println!("id: {}", volume_id_text(id));
+    slates_machine::out_line!("id: {}", volume_id_text(id));
   }
   Ok(())
 }
@@ -609,13 +609,13 @@ fn merge_work(
 ) -> Result<(), ClientError> {
   let (id, base) = client.create_work(green, name)?;
   if json {
-    println!(
+    slates_machine::out_line!(
       "{}",
       serde_json::json!({ "id": volume_id_text(id), "base": base })
     );
   } else {
-    println!("id: {}", volume_id_text(id));
-    println!("base: {base}");
+    slates_machine::out_line!("id: {}", volume_id_text(id));
+    slates_machine::out_line!("base: {base}");
   }
   Ok(())
 }
@@ -632,9 +632,9 @@ fn merge_edit(
 ) -> Result<(), ClientError> {
   client.edit(work, path, at, delete_len, bytes)?;
   if json {
-    println!("{}", serde_json::json!({ "edited": true }));
+    slates_machine::out_line!("{}", serde_json::json!({ "edited": true }));
   } else {
-    println!("edited");
+    slates_machine::out_line!("edited");
   }
   Ok(())
 }
@@ -649,14 +649,14 @@ fn merge_advance(
 ) -> Result<(), ClientError> {
   let advanced = client.advance(attachment, version)?;
   if json {
-    println!(
+    slates_machine::out_line!(
       "{}",
       serde_json::json!({ "version": advanced.version, "invalidated": advanced.invalidated })
     );
   } else {
-    println!("version: {}", advanced.version);
+    slates_machine::out_line!("version: {}", advanced.version);
     for path in advanced.invalidated {
-      println!("{path}");
+      slates_machine::out_line!("{path}");
     }
   }
   Ok(())
@@ -684,18 +684,18 @@ fn serve_merge(client: &mut Client, verb: &Verb, json: bool) -> Result<(), Clien
     Verb::Versions { green } => {
       let head = client.versions(*green)?;
       if json {
-        println!("{}", serde_json::json!({ "head": head }));
+        slates_machine::out_line!("{}", serde_json::json!({ "head": head }));
       } else {
-        println!("head: {head}");
+        slates_machine::out_line!("head: {head}");
       }
     }
     Verb::ChangedSince { green, version } => {
       let paths = client.changed_since(*green, *version)?;
       if json {
-        println!("{}", serde_json::json!({ "paths": paths }));
+        slates_machine::out_line!("{}", serde_json::json!({ "paths": paths }));
       } else {
         for path in paths {
-          println!("{path}");
+          slates_machine::out_line!("{path}");
         }
       }
     }
@@ -710,10 +710,10 @@ fn serve_merge(client: &mut Client, verb: &Verb, json: bool) -> Result<(), Clien
     Verb::Submit { work, evidence } => {
       let outcome = client.submit_with_evidence(*work, evidence)?;
       if json {
-        println!("{}", submit_json(&outcome));
+        slates_machine::out_line!("{}", submit_json(&outcome));
       } else {
         match outcome {
-          Submitted::Accepted(version) => println!("accepted: {version}"),
+          Submitted::Accepted(version) => slates_machine::out_line!("accepted: {version}"),
           Submitted::Conflict(windows) => print_windows(&windows),
         }
       }
@@ -721,10 +721,10 @@ fn serve_merge(client: &mut Client, verb: &Verb, json: bool) -> Result<(), Clien
     Verb::Rebase { work } => {
       let outcome = client.rebase(*work)?;
       if json {
-        println!("{}", rebase_json(&outcome));
+        slates_machine::out_line!("{}", rebase_json(&outcome));
       } else {
         match outcome {
-          Rebased::Rebased(version) => println!("rebased: {version}"),
+          Rebased::Rebased(version) => slates_machine::out_line!("rebased: {version}"),
           Rebased::Conflict(windows) => print_windows(&windows),
         }
       }
@@ -758,9 +758,9 @@ fn rebase_json(outcome: &Rebased) -> serde_json::Value {
 
 /// Prints merge conflict windows, one per line: the path, the byte range, and the conflict class.
 fn print_windows(windows: &[slates_ipc::protocol::MergeWindow]) {
-  println!("conflict:");
+  slates_machine::out_line!("conflict:");
   for window in windows {
-    println!(
+    slates_machine::out_line!(
       "  {} [{}..{}] class {}",
       window.path,
       window.at,
@@ -775,10 +775,10 @@ fn emit_list(client: &mut Client, json: bool) -> Result<(), ClientError> {
   let volumes = client.list()?;
   if json {
     let array = serde_json::Value::Array(volumes.iter().map(slates_mcp::summary_json).collect());
-    println!("{array}");
+    slates_machine::out_line!("{array}");
   } else {
     for volume in &volumes {
-      println!("{}", summary_line(volume));
+      slates_machine::out_line!("{}", summary_line(volume));
     }
   }
   Ok(())
@@ -789,9 +789,9 @@ fn emit_list(client: &mut Client, json: bool) -> Result<(), ClientError> {
 fn emit_daemon_status(client: &mut Client, json: bool) -> Result<(), ClientError> {
   let (report, telemetry) = slates_mcp::gather_daemon_status(client)?;
   if json {
-    println!("{}", slates_mcp::daemon_json(&report, &telemetry));
+    slates_machine::out_line!("{}", slates_mcp::daemon_json(&report, &telemetry));
   } else {
-    print!("{}", daemon_status_text(&report, &telemetry));
+    slates_machine::out_text!("{}", daemon_status_text(&report, &telemetry));
   }
   Ok(())
 }
@@ -806,13 +806,13 @@ fn emit_status(
 ) -> Result<(), ClientError> {
   let report = client.status(volume)?;
   if json {
-    println!("{}", slates_mcp::status_json(&report));
+    slates_machine::out_line!("{}", slates_mcp::status_json(&report));
   } else if drift {
     for path in &report.drifted {
-      println!("{path}");
+      slates_machine::out_line!("{path}");
     }
   } else {
-    print!("{}", status_text(&report));
+    slates_machine::out_text!("{}", status_text(&report));
   }
   Ok(())
 }
@@ -822,10 +822,10 @@ fn emit_status(
 fn emit_create(client: &mut Client, spec: &CreateSpec, json: bool) -> Result<(), ClientError> {
   let id = client.create(spec)?;
   if json {
-    println!("{}", serde_json::json!({ "id": volume_id_text(id) }));
+    slates_machine::out_line!("{}", serde_json::json!({ "id": volume_id_text(id) }));
   } else {
-    println!("id: {}", volume_id_text(id));
-    println!("path: (none until a bridge exists)");
+    slates_machine::out_line!("id: {}", volume_id_text(id));
+    slates_machine::out_line!("path: (none until a bridge exists)");
   }
   Ok(())
 }
@@ -851,7 +851,7 @@ fn emit_snapshot(client: &mut Client, volume: VolumeId, json: bool) -> Result<()
     slates_client::SnapshotBoundary::ServerVisible => "server_visible",
   };
   if json {
-    println!(
+    slates_machine::out_line!(
       "{}",
       serde_json::json!({
         "snapshot": snapshot.value,
@@ -860,9 +860,10 @@ fn emit_snapshot(client: &mut Client, volume: VolumeId, json: bool) -> Result<()
       })
     );
   } else {
-    println!(
+    slates_machine::out_line!(
       "snapshot: {}\ncoverage: {boundary}\nattachments_closed: {}",
-      snapshot.value, coverage.attachments_closed
+      snapshot.value,
+      coverage.attachments_closed
     );
   }
   Ok(())
@@ -879,9 +880,9 @@ fn emit_clone(
 ) -> Result<(), ClientError> {
   let id = client.clone_snapshot(volume, snapshot, name)?;
   if json {
-    println!("{}", serde_json::json!({ "id": volume_id_text(id) }));
+    slates_machine::out_line!("{}", serde_json::json!({ "id": volume_id_text(id) }));
   } else {
-    println!("id: {}", volume_id_text(id));
+    slates_machine::out_line!("id: {}", volume_id_text(id));
   }
   Ok(())
 }
@@ -897,7 +898,7 @@ fn emit_image_build(
 ) -> Result<(), ClientError> {
   let built = client.image_build(volume, snapshot, name, capacity)?;
   if json {
-    println!(
+    slates_machine::out_line!(
       "{}",
       serde_json::json!({
         "id": volume_id_text(built.id),
@@ -908,11 +909,11 @@ fn emit_image_build(
       })
     );
   } else {
-    println!("id: {}", volume_id_text(built.id));
-    println!("file: {}", slates_client::IMAGE_FILE);
-    println!("image_bytes: {}", built.image_bytes);
-    println!("blocks_used: {}", built.blocks_used);
-    println!("inodes_used: {}", built.inodes_used);
+    slates_machine::out_line!("id: {}", volume_id_text(built.id));
+    slates_machine::out_line!("file: {}", slates_client::IMAGE_FILE);
+    slates_machine::out_line!("image_bytes: {}", built.image_bytes);
+    slates_machine::out_line!("blocks_used: {}", built.blocks_used);
+    slates_machine::out_line!("inodes_used: {}", built.inodes_used);
   }
   Ok(())
 }
@@ -975,14 +976,14 @@ fn emit_image_merge(
       .iter()
       .map(|(key, value)| ((*key).to_owned(), serde_json::Value::from(*value)))
       .collect();
-    println!(
+    slates_machine::out_line!(
       "{}",
       serde_json::json!({ "id": volume_id_text(id), "report": report })
     );
   } else {
-    println!("id: {}", volume_id_text(id));
+    slates_machine::out_line!("id: {}", volume_id_text(id));
     for (key, value) in counts {
-      println!("{key}: {value}");
+      slates_machine::out_line!("{key}: {value}");
     }
   }
   Ok(())
@@ -999,13 +1000,13 @@ fn emit_placed(
 ) -> Result<(), ClientError> {
   let (placed, mirror_age_ns) = client.await_placed(volume, snapshot, scope)?;
   if json {
-    println!(
+    slates_machine::out_line!(
       "{}",
       serde_json::json!({ "placed": placed, "mirror_age_ns": mirror_age_ns })
     );
   } else {
-    println!("placed: {placed}");
-    println!("mirror_age_ns: {}", option_text(mirror_age_ns));
+    slates_machine::out_line!("placed: {placed}");
+    slates_machine::out_line!("mirror_age_ns: {}", option_text(mirror_age_ns));
   }
   Ok(())
 }
@@ -1024,18 +1025,18 @@ fn emit_attach(
 ) -> Result<(), ClientError> {
   let attached = client.attach_with(volume, snapshot, intent, form)?;
   if json {
-    println!("{}", slates_mcp::attachment_json(&attached));
+    slates_machine::out_line!("{}", slates_mcp::attachment_json(&attached));
   } else {
-    println!("attachment: {}", attached.attachment);
-    println!("lease_epoch: {}", option_text(attached.lease_epoch));
-    println!(
+    slates_machine::out_line!("attachment: {}", attached.attachment);
+    slates_machine::out_line!("lease_epoch: {}", option_text(attached.lease_epoch));
+    slates_machine::out_line!(
       "path: {}",
       attached
         .path
         .unwrap_or_else(|| "(none until a bridge exists)".to_owned())
     );
-    print!("{}", established_text(&attached.established));
-    print!("{}", capability_text(&attached.capability));
+    slates_machine::out_text!("{}", established_text(&attached.established));
+    slates_machine::out_text!("{}", capability_text(&attached.capability));
   }
   Ok(())
 }
@@ -1099,7 +1100,7 @@ pub(crate) fn oci_check(check: &crate::args::OciCheck) -> Result<(), Failure> {
   };
   match slates_bridge_oci::verify::source_unchanged(&table, &check.source, verified, live) {
     Ok(()) => {
-      println!("unchanged: {}", check.source);
+      slates_machine::out_line!("unchanged: {}", check.source);
       Ok(())
     }
     Err(slates_bridge_oci::verify::SourceChange::Missing) => Err(Failure::Refused(format!(
@@ -1155,10 +1156,10 @@ fn emit_rewitness(
 ) -> Result<(), ClientError> {
   let rewitnessed = client.rewitness(volume, paths)?;
   if json {
-    println!("{}", serde_json::json!({ "paths": rewitnessed }));
+    slates_machine::out_line!("{}", serde_json::json!({ "paths": rewitnessed }));
   } else {
     for path in rewitnessed {
-      println!("{path}");
+      slates_machine::out_line!("{path}");
     }
   }
   Ok(())
@@ -1174,9 +1175,9 @@ fn emit_pin(
 ) -> Result<(), ClientError> {
   let pinned = client.pin(volume, paths)?;
   if json {
-    println!("{}", serde_json::json!({ "pinned": pinned }));
+    slates_machine::out_line!("{}", serde_json::json!({ "pinned": pinned }));
   } else {
-    println!("pinned: {pinned}");
+    slates_machine::out_line!("pinned: {pinned}");
   }
   Ok(())
 }
@@ -1187,10 +1188,10 @@ fn emit_grants(client: &mut Client, json: bool) -> Result<(), ClientError> {
   let grants = client.grants()?;
   if json {
     let array = serde_json::Value::Array(grants.iter().map(grant_json).collect());
-    println!("{array}");
+    slates_machine::out_line!("{array}");
   } else {
     for grant in &grants {
-      println!(
+      slates_machine::out_line!(
         "{} {} {} {:?} {}",
         grant.id,
         volume_id_text(grant.volume),
@@ -1220,12 +1221,17 @@ fn emit_audit(client: &mut Client, since: u64, json: bool) -> Result<(), ClientE
   let records = client.audit(since)?;
   if json {
     let array = serde_json::Value::Array(records.iter().map(audit_json).collect());
-    println!("{array}");
+    slates_machine::out_line!("{array}");
   } else {
     for record in &records {
-      println!(
+      slates_machine::out_line!(
         "{} {} {} grant={:?} landing={:?} outcome={:?}",
-        record.seq, record.at_ns, record.kind, record.grant, record.landing, record.outcome
+        record.seq,
+        record.at_ns,
+        record.kind,
+        record.grant,
+        record.landing,
+        record.outcome
       );
     }
   }
@@ -1251,7 +1257,7 @@ fn audit_json(record: &AuditEntry) -> serde_json::Value {
 /// and the `slates grant` command a human runs).
 fn emit_landing(landing: Landing, json: bool) {
   if json {
-    println!("{}", landing_json(&landing));
+    slates_machine::out_line!("{}", landing_json(&landing));
   } else {
     print_landing(landing);
   }
@@ -1315,9 +1321,9 @@ fn emit_write(
   }
   let size = client.fs_write((volume, attachment), path, &bytes, mode)?;
   if json {
-    println!("{}", serde_json::json!({ "path": path, "size": size }));
+    slates_machine::out_line!("{}", serde_json::json!({ "path": path, "size": size }));
   } else {
-    println!("wrote {size} bytes to {path}");
+    slates_machine::out_line!("wrote {size} bytes to {path}");
   }
   Ok(())
 }
@@ -1327,9 +1333,9 @@ fn emit_write(
 /// a snapshot), so a script tests `.ok` uniformly.
 fn emit_ok(message: &str, json: bool) {
   if json {
-    println!("{}", serde_json::json!({ "ok": true }));
+    slates_machine::out_line!("{}", serde_json::json!({ "ok": true }));
   } else {
-    println!("{message}");
+    slates_machine::out_line!("{message}");
   }
 }
 
@@ -1433,10 +1439,10 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
     Verb::Digest { volume, path } => {
       let digest = client.digest(*volume, path)?;
       if json {
-        println!("{}", digest_json(path, &digest));
+        slates_machine::out_line!("{}", digest_json(path, &digest));
       } else {
-        println!("identity: {}", hex32(&digest.identity));
-        println!("size: {}", digest.size);
+        slates_machine::out_line!("identity: {}", hex32(&digest.identity));
+        slates_machine::out_line!("size: {}", digest.size);
       }
     }
     Verb::Rewitness { volume, paths } => emit_rewitness(client, *volume, paths.clone(), json)?,
@@ -1493,14 +1499,14 @@ fn emit_enroll(client: &mut Client, account: Option<u32>, json: bool) -> Result<
     .enroll(account, enroll_proof(&secret, account))
     .map_err(|e| failure_of(e, "enroll"))?;
   if json {
-    println!(
+    slates_machine::out_line!(
       "{}",
       serde_json::json!({ "consumer": consumer, "account": account, "capability": hex32(&capability) })
     );
   } else {
-    println!("consumer: {consumer}");
-    println!("account: {account}");
-    println!("capability: {}", hex32(&capability));
+    slates_machine::out_line!("consumer: {consumer}");
+    slates_machine::out_line!("account: {account}");
+    slates_machine::out_line!("capability: {}", hex32(&capability));
   }
   Ok(())
 }
@@ -1616,9 +1622,9 @@ fn spawn_as_ephemeral_consumer(
 fn announce_consumer(consumer: u64, json: bool) {
   use std::io::Write;
   if json {
-    println!("{}", serde_json::json!({ "consumer": consumer }));
+    slates_machine::out_line!("{}", serde_json::json!({ "consumer": consumer }));
   } else {
-    println!("consumer: {consumer}");
+    slates_machine::out_line!("consumer: {consumer}");
   }
   let _ = std::io::stdout().flush();
 }
@@ -1893,7 +1899,9 @@ pub(crate) fn run_pmem(request: &PmemRequest) -> Result<(), Failure> {
     Err(e) => {
       let failure = failure_of(e, &request.instance);
       if let Err(detach) = client.detach(attachment) {
-        eprintln!("slates: pmem: detaching {attachment} after the refused map: {detach}");
+        slates_machine::log_line!(
+          "slates: pmem: detaching {attachment} after the refused map: {detach}"
+        );
       }
       return Err(failure);
     }
@@ -1935,7 +1943,7 @@ pub(crate) fn run_pmem(request: &PmemRequest) -> Result<(), Failure> {
     announce_pmem(&[("released", serde_json::json!(written))], request.json);
   }
   if let Err(e) = client.detach(attachment) {
-    eprintln!("slates: pmem: detaching {attachment}: {e}");
+    slates_machine::log_line!("slates: pmem: detaching {attachment}: {e}");
   }
   let code = served?;
   released.map_err(|e| {
@@ -2006,7 +2014,9 @@ fn serve_pmem(
       match client.map_sync(mapped) {
         Ok(written) => announce_pmem(&[("resynced", serde_json::json!(written))], json),
         Err(e) => {
-          eprintln!("slates: pmem: the sync after the daemon went was refused: {e}");
+          slates_machine::log_line!(
+            "slates: pmem: the sync after the daemon went was refused: {e}"
+          );
           watching = false;
         }
       }
@@ -2060,12 +2070,12 @@ fn answer_signals(
     if i32::from(signal) == libc::SIGUSR1 {
       match client.map_sync(mapped) {
         Ok(written) => announce_pmem(&[("synced", serde_json::json!(written))], json),
-        Err(e) => eprintln!("slates: pmem: a sync was refused: {e}"),
+        Err(e) => slates_machine::log_line!("slates: pmem: a sync was refused: {e}"),
       }
     } else if let Some(passed) = rustix::process::Signal::from_named_raw(i32::from(signal))
       && let Err(e) = rustix::process::kill_process(vmm, passed)
     {
-      eprintln!("slates: pmem: passing signal {signal} to the VMM: {e}");
+      slates_machine::log_line!("slates: pmem: passing signal {signal} to the VMM: {e}");
     }
   }
 }
@@ -2080,12 +2090,12 @@ fn announce_pmem(fields: &[(&str, serde_json::Value)], json: bool) {
       .iter()
       .map(|(key, value)| ((*key).to_owned(), value.clone()))
       .collect();
-    println!("{}", serde_json::Value::Object(object));
+    slates_machine::out_line!("{}", serde_json::Value::Object(object));
   } else {
     for (key, value) in fields {
       match value {
-        serde_json::Value::String(text) => println!("{key}: {text}"),
-        other => println!("{key}: {other}"),
+        serde_json::Value::String(text) => slates_machine::out_line!("{key}: {text}"),
+        other => slates_machine::out_line!("{key}: {other}"),
       }
     }
   }
@@ -2107,9 +2117,9 @@ pub(crate) fn run_pmem(request: &PmemRequest) -> Result<(), Failure> {
 fn announce_attachment(attachment: u64, json: bool) {
   use std::io::Write;
   if json {
-    println!("{}", serde_json::json!({ "attachment": attachment }));
+    slates_machine::out_line!("{}", serde_json::json!({ "attachment": attachment }));
   } else {
-    println!("attachment: {attachment}");
+    slates_machine::out_line!("attachment: {attachment}");
   }
   let _ = std::io::stdout().flush();
 }
@@ -2134,9 +2144,9 @@ fn emit_grant(
     .grant(landing, manifest, scope, term_ns, proof)
     .map_err(|e| failure_of(e, "grant"))?;
   if json {
-    println!("{}", serde_json::json!({ "grant": grant }));
+    slates_machine::out_line!("{}", serde_json::json!({ "grant": grant }));
   } else {
-    println!("grant: {grant}");
+    slates_machine::out_line!("grant: {grant}");
   }
   Ok(())
 }
@@ -2173,16 +2183,16 @@ fn issuer_secret() -> Result<[u8; slates_anchor::layout::ISSUER_SECRET_BYTES], F
 fn print_landing(landing: slates_client::Landing) {
   match landing {
     slates_client::Landing::Landed(outcome) => {
-      println!("landing: {}", outcome.landing);
-      println!("state: {}", outcome.state);
-      println!("written: {}", outcome.written);
-      println!("skipped: {}", outcome.skipped);
-      println!("conflicts: {}", outcome.conflicts);
-      println!("failed: {}", outcome.failed);
-      println!("bytes_written: {}", outcome.bytes_written);
-      println!("held: {}", outcome.held);
+      slates_machine::out_line!("landing: {}", outcome.landing);
+      slates_machine::out_line!("state: {}", outcome.state);
+      slates_machine::out_line!("written: {}", outcome.written);
+      slates_machine::out_line!("skipped: {}", outcome.skipped);
+      slates_machine::out_line!("conflicts: {}", outcome.conflicts);
+      slates_machine::out_line!("failed: {}", outcome.failed);
+      slates_machine::out_line!("bytes_written: {}", outcome.bytes_written);
+      slates_machine::out_line!("held: {}", outcome.held);
       let durability = &outcome.durability;
-      println!(
+      slates_machine::out_line!(
         "durability: data_synced {} dirs_synced {} ({} synced) media {} (requested {})",
         durability.data_synced,
         durability.dirs_synced,
@@ -2191,9 +2201,9 @@ fn print_landing(landing: slates_client::Landing) {
         durability.media_requested
       );
       for degradation in &outcome.degraded {
-        println!("degraded: {}", slates_mcp::degradation_json(degradation));
+        slates_machine::out_line!("degraded: {}", slates_mcp::degradation_json(degradation));
       }
-      println!("barriers: {}", outcome.barriers);
+      slates_machine::out_line!("barriers: {}", outcome.barriers);
     }
     slates_client::Landing::GrantRequired {
       landing,
@@ -2201,17 +2211,17 @@ fn print_landing(landing: slates_client::Landing) {
       summary,
       conflicts,
     } => {
-      println!("landing: {landing}");
-      println!("manifest: {}", hex32(&manifest));
+      slates_machine::out_line!("landing: {landing}");
+      slates_machine::out_line!("manifest: {}", hex32(&manifest));
       for action in &summary.by_action {
-        println!("action {}: {}", action.action, action.count);
+        slates_machine::out_line!("action {}: {}", action.action, action.count);
       }
-      println!("bytes: {}", summary.bytes);
-      println!("filtered_out: {}", summary.filtered_out);
+      slates_machine::out_line!("bytes: {}", summary.bytes);
+      slates_machine::out_line!("filtered_out: {}", summary.filtered_out);
       for path in &conflicts {
-        println!("conflict: {path}");
+        slates_machine::out_line!("conflict: {path}");
       }
-      println!("grant with: slates grant {landing}");
+      slates_machine::out_line!("grant with: slates grant {landing}");
     }
   }
 }
@@ -2444,11 +2454,13 @@ fn takeover_text(report: &slates_client::TakeoverReport) -> String {
 fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> String {
   let members: Vec<String> = report.fleet.members.iter().map(u64::to_string).collect();
   let mut out = format!(
-    "pid: {}\ngeneration: {}\nrestarts: {}\nanchor_hold_refusals: {}\nheartbeat_age_ns: {}\nclients_reaped: {}\nclients_refused: {}\nshards: {}\nfleet_host: {}\nfleet_f: {}\nfleet_host_epoch: {}\nfleet_members: {}\nfleet_peers_probed: {}\nfleet_unknown_id: {}\nfleet_inbox_full: {}\nfleet_sessions_refused: {}\nfleet_replaced: {}\nfleet_held_records: {}\nfleet_takeovers_pending: {}\nfleet_configuration_version: {}\n",
+    "pid: {}\ngeneration: {}\nrestarts: {}\nanchor_hold_refusals: {}\nanchor_log_lines_refused: {}\nlog_lines_refused: {}\nheartbeat_age_ns: {}\nclients_reaped: {}\nclients_refused: {}\nshards: {}\nfleet_host: {}\nfleet_f: {}\nfleet_host_epoch: {}\nfleet_members: {}\nfleet_peers_probed: {}\nfleet_unknown_id: {}\nfleet_inbox_full: {}\nfleet_sessions_refused: {}\nfleet_replaced: {}\nfleet_held_records: {}\nfleet_takeovers_pending: {}\nfleet_configuration_version: {}\n",
     report.pid,
     report.generation,
     report.restarts,
     report.anchor_hold_refusals,
+    report.anchor_log_lines_refused,
+    report.log_lines_refused,
     report.heartbeat_age_ns,
     report.clients_reaped,
     report.clients_refused,
@@ -2610,23 +2622,23 @@ pub(crate) fn profile(options: &ProfileOptions) -> Result<(), Failure> {
     let json = profile
       .to_json()
       .map_err(|e| Failure::Failed(e.to_string()))?;
-    println!("{json}");
+    slates_machine::out_line!("{json}");
     return Ok(());
   }
-  println!("{}", profile.facts.identity.line());
-  println!("quick: {}", profile.quick);
-  println!("elapsed_ns: {}", profile.elapsed_ns);
+  slates_machine::out_line!("{}", profile.facts.identity.line());
+  slates_machine::out_line!("quick: {}", profile.quick);
+  slates_machine::out_line!("elapsed_ns: {}", profile.elapsed_ns);
   let derived = profile.derived();
-  println!("spin_before_park_ns: {}", derived.spin_before_park_ns.get());
-  println!("arena_region_bytes: {}", derived.arena_region_bytes.get());
-  println!("timer_tick_ns: {}", derived.timer_tick_ns.get());
-  println!("task_step_budget_ns: {}", derived.task_step_budget_ns.get());
-  println!(
+  slates_machine::out_line!("spin_before_park_ns: {}", derived.spin_before_park_ns.get());
+  slates_machine::out_line!("arena_region_bytes: {}", derived.arena_region_bytes.get());
+  slates_machine::out_line!("timer_tick_ns: {}", derived.timer_tick_ns.get());
+  slates_machine::out_line!("task_step_budget_ns: {}", derived.task_step_budget_ns.get());
+  slates_machine::out_line!(
     "copy_versus_remap_bytes: {}",
     derived.copy_versus_remap_bytes.get()
   );
-  println!("discard_from_bytes: {}", derived.discard_from_bytes.get());
-  println!("ring_entries: {}", derived.ring_entries.get());
+  slates_machine::out_line!("discard_from_bytes: {}", derived.discard_from_bytes.get());
+  slates_machine::out_line!("ring_entries: {}", derived.ring_entries.get());
   Ok(())
 }
 

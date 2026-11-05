@@ -108,6 +108,17 @@
 > - AC-1.3 (snapshot and clone flat with size) failed at load 11 to 52 in 3 to 5 of 10 runs on both arms. The gate's
 >   noise allowance does not cover this host's load. It is not caused by the blocks, but it is open.
 
+> **No print macro panics on a closed pipe (2026-11-05, A-213; found by the release agent).** `slates anchor 2>&1
+> >/dev/null | head -n 1` exited 134 once `head` had its line: `eprintln!` and `println!` panic on a refused write, and a
+> pipe whose reader has gone refuses with `EPIPE`. Every shipped site, 266 in all, now writes through
+> `slates_machine::log_line!` or `out_line!`. A refused write is counted and dropped. Both counts show in `slates status`:
+> `log_lines_refused`, the daemon's own, and `anchor_log_lines_refused`, which the anchor writes to the segment. A command
+> whose output was refused exits 4. Every shipped crate's root denies `clippy::print_stdout` and `clippy::print_stderr`
+> outside tests. adacachy, 2026-11-05: the real anchor whose log reader went away ended with exit 101 (debug build) before
+> the fix, and after it kept supervising a killed daemon's successor. CI run ids: pending. **Owed:** `xtask` (148 sites),
+> `slates-guest-probe` (11) and `slates-test-seeds` (1) keep their print macros. They do not ship, and a closed pipe still
+> panics them. Record: `docs/bugs/2026-11-05-a-closed-log-pipe-ended-the-anchor.md`.
+
 > **The anchor's hold refusals: a bounded Unix log, and a count in `slates status` (2026-11-04, A-213; siblings of
 > audit step 3).** The Unix device hold logged a line per refused message, unbounded; it now logs each distinct refusal
 > once (`RefusalLog`, as the Windows hold does) and counts every one. Every refusal on either platform's hold channel

@@ -117,6 +117,11 @@ pub const SEAL_ROOT_KEY_BYTES: usize = 32;
 /// Format: the byte offset inside the supervision block, the first cache line past the sealing root's record
 /// (136 + 16 + 32 = 184, so 192), so it shares no line with the root or with the heartbeat.
 pub const SUP_HOLD_REFUSALS: usize = 192;
+/// The anchor's **refused log lines** word (A-213): the log lines the anchor could not write over its life (its standard
+/// error closed, or a pipe whose reader went away), each counted and dropped (`slates_machine::log`), which the daemon
+/// reports as `anchor_log_lines_refused` in `slates status`. Zero in a block an older anchor wrote.
+/// Format: the byte offset inside the supervision block, the word after the hold refusals.
+pub const SUP_LOG_REFUSALS: usize = 200;
 
 /// Format: a published payload's words (the profile, a snapshot slot, a landing slot): the
 /// generation (odd while a writer is inside) then the length, then the bytes.
