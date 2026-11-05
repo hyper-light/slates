@@ -6962,7 +6962,7 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > work reads one position per holder rather than rescanning the retained chain. Transfer to a new
 > candidate set and full green takeover remain owed (AUD-14).
 
-> **Status (2026-11-04, the many-client load test).** The service's increment identity is now the data model's:
+> **Status (2026-11-04, the many-client load test; A-207).** The service's increment identity is now the data model's:
 > BLAKE3 of the work volume, the base, the ops document and the post-state (the service has no exclusion filter yet).
 > It had hashed only the ops document and post-state, so a rebased resubmit met its cached conflict and two works'
 > identical changes shared one result. A conflict reply now names every differing span of a file, not the first.
@@ -6970,7 +6970,11 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > of 2026-11-04). A work is now a clone of its green version: it holds only the files it changed (or removed) and
 > reads the rest from the green at its base, which the green never folds past (`crates/server/src/work_files.rs`); a
 > rebase answers only the files it changes. The head identity is computed only for a merge record that is sent.
-> Owed: an incremental identity for f > 0, the origin kept as a reference rather than bytes in the partition.
+> A work's state is durable at the process boundary (D-18): each edit and declaration is recorded in a per-work log in
+> the partition in the verb's transaction, an accepted submit or a rebase restates the work, and recovery replays the
+> log over the recovered green (`crates/server/src/work_log.rs`); a work had been rebuilt as a fresh clone of the head.
+> Owed: an incremental identity for f > 0, the origin kept as a reference rather than bytes in the partition, and
+> checkpoint folding of the chain (its byte budget fills at about 750 versions in the 1,000-client run).
 
 **Role.** Let many agents work on clones of one shared volume and fold their work back into it
 with no locks, no last-writer-wins, and no inferred merge. Each agent's work becomes an
@@ -12808,6 +12812,30 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
 - **Arm64 Windows proven** since (2026-10-27): the direct-map client tests, 20 of 20, on CI's `windows-11-arm` (run
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
+
+### A-207 — A work volume is a clone of its green version that holds only what it changed, and its state is durable at the process boundary (accepted 2026-11-04, the many-client load test)
+Applied in the same change to: §4.16's status, GAPS (the load-test blockquote), `crates/server` (`work_files.rs`,
+`work_log.rs`, `work_charge.rs`, `verbs.rs`, `merge_service.rs`, `listing.rs`), `crates/merge` (`Rebased::Rebased`,
+`Green::file_at`, `Green::files_at`), `crates/db` (`Op::WorkLogged`, `Op::WorkRestated`, `PartitionSnapshot::work_logs`)
+and `crates/server/tests/merge_load.rs`. Measurements are in the GAPS entry and BENCHMARKS.
+- **A work is a clone, not a copy.** §4.16 says a work is "only ever a clone of a green version"; the service had seeded
+  each work with a copy of every file of its green, at create and again at every accepted submit. A work now holds only
+  the files it changed (its whole bytes, copied from the green on the first change) and the files it removed; every
+  other file is read from the green at the work's base, which the green never folds past (the reachable floor already
+  named every work's base). A rebase answers only the files it changes relative to the head. The charge (§4.2) counts
+  exactly what the work holds; the green's bytes are the green's charge. 64 works over a 1 MiB green grew the committed
+  bytes by 67,114,368 before and by less than one copy after (`works_over_a_green_share_its_files`).
+- **A work's state survives a daemon restart (D-18).** D-18 promises daemon-restart survival to a local acknowledgement
+  only when what it acknowledged is recoverable from anchor-owned RAM; a work's edits, declarations, base and journal
+  lived in shard memory alone, and recovery rebuilt every work as a fresh clone of the head, so an acknowledged edit
+  vanished and the next submit was accepted without it. Every change to a work is now recorded in a per-work log in the
+  partition, in the verb's own transaction and checked before the work changes: an edit or a declaration appends an
+  entry, an accepted submit or a rebase restates the work whole (its base, its own files, its journal). Recovery replays
+  the log over the recovered green through the verbs' own change path. The log is counted against the partition's merge
+  byte budget the green chains use, so it is bounded and refused typed at the bound, and is reclaimed with the work
+  (`acknowledged_work_edits_survive_a_daemon_restart`, red before).
+- **Unchanged:** a work's state is still owner-local and lost with its host (D-18's host boundary), and is not placed at
+  f + 1; a work is still not a VFS volume (GAP-A9-14).
 
 ### A-206 — A WinFsp file system is deleted only after the anchor releases its hold, the DLL's version is checked, and slates refuses no path the driver passes (accepted 2026-11-04, audit plan 01a1a34bf7e973069e94f773afdea44a, steps 4 and 6)
 Applied in the same change to: GAPS (the audit entry), §4.6's status through A-198's corrections, `docs/wip/platforms.md`,

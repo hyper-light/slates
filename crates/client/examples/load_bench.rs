@@ -50,7 +50,8 @@ use slates_server::{Daemon, DaemonConfig, SegmentSource};
 const ROUNDS: usize = 3;
 /// Shape: slots each round edits.
 const EDITS_PER_ROUND: usize = 4;
-/// Shape: the hot files every client may pick, where collisions happen.
+/// Shape: the hot files every client may pick, where collisions happen, unless `--hot-files` says otherwise (a run at
+/// a larger N scales the hot set with N to hold the conflict rate a client meets).
 const HOT_FILES: usize = 8;
 /// Shape: slots per file a client picks among (slot-aligned, so overlaps are exact).
 const SLOTS_PER_FILE: u64 = 4;
@@ -121,6 +122,12 @@ enum Step {
   CreateWork,
   Edit(usize),
   Submit,
+  /// A conflict's resolution: the green's head version, read first so every window is read at one version.
+  ResolveVersion,
+  /// The window `n`'s bytes at that version (one `ReadRange` page: a window is a slot, far below a page).
+  ResolveRead(usize),
+  /// Window `n` written over in the work with the green's bytes, so pass two finds it identical.
+  ResolveEdit(usize),
   Rebase,
   Reedit(usize),
   Destroy,
@@ -129,6 +136,8 @@ enum Step {
 
 /// One client and its script.
 struct Agent {
+  /// The green's version a resolution reads its windows at, and the window bytes it read.
+  resolving: (u64, Vec<u8>),
   id: usize,
   client: Client,
   green: VolumeId,
@@ -294,6 +303,35 @@ impl Agent {
         },
         Kind::SubmitAccepted,
       ),
+      Step::ResolveVersion => (RequestBody::Versions { green: self.green }, Kind::ReadHead),
+      Step::ResolveRead(n) => {
+        let window = &self.windows[n];
+        (
+          RequestBody::ReadRange {
+            volume: self.green,
+            path: window.path.clone(),
+            at: ReadAt::Version {
+              version: self.resolving.0,
+            },
+            offset: window.at,
+            max: window.len,
+          },
+          Kind::ReadHead,
+        )
+      }
+      Step::ResolveEdit(n) => {
+        let window = &self.windows[n];
+        (
+          RequestBody::Edit {
+            work: work?,
+            path: window.path.clone(),
+            at: window.at,
+            delete_len: window.len,
+            bytes: self.resolving.1.clone(),
+          },
+          Kind::Edit,
+        )
+      }
       Step::Rebase => (RequestBody::Rebase { work: work? }, Kind::Rebase),
       Step::Destroy => (RequestBody::Destroy { volume: work? }, Kind::Destroy),
       Step::Done => return None,
@@ -333,7 +371,24 @@ impl Agent {
       return;
     };
     let reply = match self.client.poll_reply_word(word) {
-      Ok(None) => return,
+      Ok(None) => {
+        // A reply not taken within the client's own derived reply deadline (the anchor's liveness budget) is lost to
+        // this client: counted and named, never waited on for ever.
+        if ns_since(epoch).saturating_sub(sent_ns)
+          > self
+            .client
+            .deadlines()
+            .reply_ns
+            .saturating_mul(reply_patience())
+        {
+          let gone = self.client.daemon_gone();
+          return self.give_up(
+            tally,
+            &format!("no reply to {kind:?} within the reply deadline (daemon gone: {gone})"),
+          );
+        }
+        return;
+      }
       Ok(Some(reply)) => reply,
       Err(e) => return self.give_up(tally, &format!("poll {kind:?}: {e}")),
     };
@@ -372,6 +427,27 @@ impl Agent {
       }
       (Step::Submit, ReplyBody::Submitted { version, conflicts }) => {
         self.submitted(version, conflicts, (sent_ns, replied_ns), tally);
+      }
+      (Step::ResolveVersion, ReplyBody::Versions { head }) => {
+        record(tally, kind, elapsed);
+        self.resolving.0 = head;
+        self.step = Step::ResolveRead(0);
+      }
+      (Step::ResolveRead(n), ReplyBody::ReadPage { bytes, .. }) => {
+        record(tally, kind, elapsed);
+        if bytes.len() != usize::try_from(self.windows[n].len).unwrap() {
+          return self.give_up(tally, "a window's read came back short of the window");
+        }
+        self.resolving.1 = bytes;
+        self.step = Step::ResolveEdit(n);
+      }
+      (Step::ResolveEdit(n), ReplyBody::Edited) => {
+        record(tally, kind, elapsed);
+        self.step = if n + 1 < self.windows.len() {
+          Step::ResolveRead(n + 1)
+        } else {
+          Step::Rebase
+        };
       }
       (Step::Rebase, ReplyBody::Rebased { version, conflicts }) => {
         record(tally, kind, elapsed);
@@ -450,72 +526,16 @@ impl Agent {
           return;
         }
         self.windows = conflicts;
-        self.resolve(tally);
+        self.resolve();
       }
     }
   }
 
-  /// Resolves every window (the design's corrective path): for each, the green's head bytes of the window's file
-  /// are read (paged, so a large file is read whole) and written over the window in the work; then the rebase is
-  /// sent. Both are synchronous here and timed as a read and an edit.
-  fn resolve(&mut self, tally: &mut Tally) {
-    for n in 0..self.windows.len() {
-      let started = Instant::now();
-      // The head's version first, then the file at that version: a version never changes, so a paged read of a large
-      // file cannot meet a submit landing between its pages (a head read refuses that as changed, as it must).
-      let version = match self.client.versions(self.green) {
-        Ok(version) => version,
-        Err(e) => return self.give_up(tally, &format!("resolve versions: {e}")),
-      };
-      let head = match self.client.read(
-        self.green,
-        &self.windows[n].path.clone(),
-        ReadAt::Version { version },
-      ) {
-        Ok(bytes) => bytes,
-        Err(e) => return self.give_up(tally, &format!("resolve read: {e}")),
-      };
-      record(
-        tally,
-        Kind::ReadHead,
-        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-      );
-      if !self.resolve_with(n, &head, tally) {
-        return;
-      }
-    }
-    self.step = Step::Rebase;
-  }
-
-  /// Writes the green's head bytes over window `n` in the work, synchronously (the edit is the resolution's own
-  /// step; its latency is recorded as an edit). False when the client gave up.
-  fn resolve_with(&mut self, n: usize, head: &[u8], tally: &mut Tally) -> bool {
-    let window = self.windows[n].clone();
-    let start = usize::try_from(window.at).unwrap();
-    let end = start + usize::try_from(window.len).unwrap();
-    let Some(bytes) = head.get(start..end) else {
-      self.give_up(tally, "a window lies past the head file's end");
-      return false;
-    };
-    let started = Instant::now();
-    match self.client.edit(
-      self.work.unwrap(),
-      &window.path,
-      window.at,
-      window.len,
-      bytes,
-    ) {
-      Ok(()) => record(
-        tally,
-        Kind::Edit,
-        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-      ),
-      Err(e) => {
-        self.give_up(tally, &format!("resolve edit: {e}"));
-        return false;
-      }
-    }
-    true
+  /// Resolves every window (the design's corrective path), one request at a time like every other step: the green's
+  /// head version, then each window's bytes at that version (a version never changes, so no submit landing meanwhile
+  /// can tear the read), each written over its window in the work; then the rebase.
+  fn resolve(&mut self) {
+    self.step = Step::ResolveVersion;
   }
 
   fn rebased(&mut self, version: Option<u64>, conflicts: Vec<MergeWindow>, tally: &mut Tally) {
@@ -525,10 +545,17 @@ impl Agent {
         self.step = Step::Reedit(0);
       }
       None => {
-        // The head moved again between the read and the rebase: resolve the new windows.
+        // The head moved again between the read and the rebase: resolve the new windows, within the same bound as a
+        // submit's conflicts, so a client under endless contention is counted starved rather than looping.
         tally.rebase_conflicts += 1;
+        self.resolutions += 1;
+        if self.resolutions > MAX_RESOLUTIONS || conflicts.is_empty() {
+          tally.starved += 1;
+          self.step = Step::Destroy;
+          return;
+        }
         self.windows = conflicts;
-        self.resolve(tally);
+        self.resolve();
       }
     }
   }
@@ -538,9 +565,22 @@ fn record(tally: &mut Tally, kind: Kind, elapsed: u64) {
   tally.latencies.entry(kind).or_default().push(elapsed);
 }
 
-/// One worker: its agents, each with one request in flight, swept until every one is done.
-fn drive(mut agents: Vec<Agent>, epoch: Instant) -> Tally {
+/// How many of the client's reply deadlines a request may wait past its send before the harness counts its reply lost:
+/// one, unless `--reply-patience <n>` asks more (to tell a late reply from one never sent).
+fn reply_patience() -> u64 {
+  arg("--reply-patience").map_or(1, |n| n.parse().expect("--reply-patience n"))
+}
+
+/// Shape: the unfinished clients a progress report names, each with its step and the request it waits on.
+const PROGRESS_NAMED: usize = 4;
+/// Shape: how often a worker prints its progress, so a long or stuck level shows where it is.
+const PROGRESS_EVERY: Duration = Duration::from_secs(5);
+
+/// One worker: its agents, each with one request in flight, swept until every one is done. Every `PROGRESS_EVERY` it
+/// prints how many of its agents are done and the submits it has seen.
+fn drive(mut agents: Vec<Agent>, epoch: Instant, worker: usize) -> Tally {
   let mut tally = Tally::default();
+  let mut reported = Instant::now();
   while agents.iter().any(|agent| agent.step != Step::Done) {
     let sweep = Instant::now();
     for agent in agents.iter_mut().filter(|agent| agent.step != Step::Done) {
@@ -549,6 +589,35 @@ fn drive(mut agents: Vec<Agent>, epoch: Instant) -> Tally {
     tally.max_sweep_ns = tally
       .max_sweep_ns
       .max(u64::try_from(sweep.elapsed().as_nanos()).unwrap_or(u64::MAX));
+    if reported.elapsed() >= PROGRESS_EVERY {
+      reported = Instant::now();
+      let done = agents
+        .iter()
+        .filter(|agent| agent.step == Step::Done)
+        .count();
+      for agent in agents
+        .iter()
+        .filter(|agent| agent.step != Step::Done)
+        .take(PROGRESS_NAMED)
+      {
+        let age = agent
+          .inflight
+          .map(|(_, sent, kind)| (kind, ns_since(epoch).saturating_sub(sent)));
+        println!(
+          "pending\t{worker}\tagent\t{}\tstep\t{:?}\tround\t{}\tinflight\t{age:?}\toutstanding\t{}",
+          agent.id,
+          agent.step,
+          agent.round,
+          agent.client.outstanding().len()
+        );
+      }
+      println!(
+        "progress\t{worker}\t{}\tdone\t{done}\tof\t{}\tsubmits\t{}",
+        epoch.elapsed().as_secs(),
+        agents.len(),
+        tally.submits.len()
+      );
+    }
   }
   tally
 }
@@ -814,7 +883,7 @@ fn level(
   instance: &str,
   green: VolumeId,
   files: &[(String, u64)],
-  (n, rounds): (usize, usize),
+  (n, rounds, hot_files): (usize, usize, usize),
   workers: usize,
 ) -> u64 {
   let eligible: Vec<(String, u64)> = files
@@ -823,7 +892,7 @@ fn level(
     .cloned()
     .collect();
   let mut rng = Rng(SEED ^ n as u64);
-  let hot: Vec<usize> = (0..HOT_FILES)
+  let hot: Vec<usize> = (0..hot_files)
     .map(|_| usize::try_from(rng.below(eligible.len() as u64)).unwrap())
     .collect();
   let plans: Vec<Vec<Vec<Slot>>> = (0..n)
@@ -856,6 +925,7 @@ fn level(
       round: 0,
       step: Step::CreateWork,
       windows: Vec::new(),
+      resolving: (0, Vec::new()),
       resolutions: 0,
       inflight: None,
     })
@@ -872,7 +942,8 @@ fn level(
   let tallies: Vec<Tally> = std::thread::scope(|scope| {
     let handles: Vec<_> = groups
       .into_iter()
-      .map(|group| scope.spawn(move || drive(group, epoch)))
+      .enumerate()
+      .map(|(worker, group)| scope.spawn(move || drive(group, epoch, worker)))
       .collect();
     handles
       .into_iter()
@@ -954,23 +1025,36 @@ fn main() {
   let workers: usize =
     arg("--workers").map_or((cpus / 4).max(1), |w| w.parse().expect("--workers n"));
   let rounds: usize = arg("--rounds").map_or(ROUNDS, |r| r.parse().expect("--rounds n"));
-  let instance = format!("load-bench-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance, None);
-  println!(
-    "daemon\tshards\t{}\tclients_per_shard\t{}\tcpus\t{cpus}",
-    config.runtime.shards, config.clients_per_shard
-  );
-  let daemon = Daemon::start(
-    &profile,
-    config,
-    SegmentSource::Create {
-      name: format!("slates-seg-{instance}"),
-    },
-  )
-  .unwrap();
-  daemon
-    .bootstrap(true)
-    .expect("the fixture explicitly creates its local consensus group");
+  let hot_files: usize =
+    arg("--hot-files").map_or(HOT_FILES, |h| h.parse().expect("--hot-files n"));
+  // `--instance <name>` drives a daemon already running under its own anchor (`slates --instance <name> anchor`), so a
+  // chaos script can kill the daemon process mid-run and the anchor restart it; without it the daemon is in-process.
+  let external = arg("--instance");
+  let instance = external
+    .clone()
+    .unwrap_or_else(|| format!("load-bench-{}", std::process::id()));
+  let daemon = if external.is_some() {
+    println!("daemon\texternal\t{instance}\tcpus\t{cpus}");
+    None
+  } else {
+    let config = DaemonConfig::derive(&profile, &instance, None);
+    println!(
+      "daemon\tshards\t{}\tclients_per_shard\t{}\tcpus\t{cpus}",
+      config.runtime.shards, config.clients_per_shard
+    );
+    let daemon = Daemon::start(
+      &profile,
+      config,
+      SegmentSource::Create {
+        name: format!("slates-seg-{instance}"),
+      },
+    )
+    .unwrap();
+    daemon
+      .bootstrap(true)
+      .expect("the fixture explicitly creates its local consensus group");
+    Some(daemon)
+  };
   let mut setup = connect(&instance).unwrap();
   let green = seed_green(&mut setup, &tree, "load");
   let step = Instant::now();
@@ -983,10 +1067,18 @@ fn main() {
   );
   let mut failures = 0;
   for n in levels {
-    failures += level(&instance, green, &files, (n, rounds), workers.min(n));
+    failures += level(
+      &instance,
+      green,
+      &files,
+      (n, rounds, hot_files),
+      workers.min(n),
+    );
   }
   drop(setup);
-  daemon.stop();
+  if let Some(daemon) = daemon {
+    daemon.stop();
+  }
   if failures > 0 {
     std::process::exit(1);
   }

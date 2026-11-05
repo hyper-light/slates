@@ -47,7 +47,7 @@
 > cached conflict forever (448 refusals, 7 of 10 clients starved); a conflict named one window per file (572 extra
 > rebases at 100 clients). Over the kernel's `kernel/` directory (16 MB) the oracle now passes at 10 and 100 clients:
 > 300 accepted, 851 conflicts, 0 failures, 0 starved. Open:
-> - **Fixed the same day: a work copied its green whole**, at create and at every accepted submit. A work is now a
+> - **Fixed the same day (A-207): a work copied its green whole**, at create and at every accepted submit. A work is now a
 >   clone that holds only what it changed and reads the rest from its green at its base (`crates/server/src/work_files.rs`;
 >   `works_over_a_green_share_its_files`: 64 works over a 1 MiB green grew the committed bytes by 67,114,368 before,
 >   under one copy after). And the head identity, a BLAKE3 of the green's whole state, was computed for every accepted
@@ -64,6 +64,17 @@
 >   during the pin; `fs/` (48 MB) peaks at 617 MB RSS, about 13 times its bytes (the overlay's pinned copy, the
 >   origin in the partition and its snapshot, the engine's current content and its history each hold the tree).
 > - **Each submit still walks every path**: `base_at` rebuilds the whole base and `compose_volume` passes over it.
+> - **Fixed the same day (A-207): a work's acknowledged edits were lost at a daemon restart** (D-18). Every change to a work
+>   is now recorded in a per-work log in the partition in the verb's transaction and replayed at recovery
+>   (`crates/server/src/work_log.rs`; `acknowledged_work_edits_survive_a_daemon_restart`, red on `a364b03c`).
+> - **At 1,000 clients over `kernel/`** (800 hot files, load 13 to 28): the oracle passes (762 accepted, 1,761
+>   conflicts, 0 failures), every reply arrives within 60 s, and three walls show. The partition's merge byte budget
+>   fills (`green_chains at capacity`, 26 to 48 submits a run), refused as an untyped `BadRequest`; checkpoint folding of
+>   the chain is owed. The green's whole-file history exhausts the owner shard's budget while the slowest work's base
+>   pins the fold floor (`BudgetExceeded`, up to 664 submits a run). And every merge verb queues on the green's one
+>   owner shard, so replies pass the client's 1 s reply deadline (136 `CreateWork` at a 1 s harness deadline). The
+>   harness's conflict resolution is still synchronous (a worker's sweep reached 4.9 s), so its latencies at this
+>   level are not recorded.
 > - **A sync client gives up on a live, overloaded daemon after its reply deadline** (89 calls at 100 clients:
 >   `no reply within 1000000000 ns`).
 > - The 1,000, 10k and 100k levels, the full kernel tree, a separate daemon process, and the remote primary with two

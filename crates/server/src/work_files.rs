@@ -1,4 +1,4 @@
-//! A work volume's files as a clone of its green version (§4.16 "a work volume is only ever a clone of a green
+//! A work volume's files as a clone of its green version (A-207; §4.16 "a work volume is only ever a clone of a green
 //! version"; D-5, clones by reference; §4.2 all-cost admission). A work holds only what it changed: a file it edited
 //! or renamed into place (its whole bytes, copied from the green on its first change), or the removal of one. Every
 //! other file is the green's as of the work's base version, read from the green's engine
@@ -65,6 +65,14 @@ impl WorkFiles {
   /// Holds `bytes` as the work's own file at `path`.
   pub(crate) fn set(&mut self, path: &str, bytes: Vec<u8>) {
     self.own.insert(path.to_owned(), Some(bytes));
+  }
+
+  /// What the work holds of its own, in path order: each file's bytes, or none for a removal.
+  pub(crate) fn own_entries(&self) -> impl Iterator<Item = (&str, Option<&[u8]>)> {
+    self
+      .own
+      .iter()
+      .map(|(path, entry)| (path.as_str(), entry.as_deref()))
   }
 
   /// Forgets every change: the work equals its green at its (new) base.
