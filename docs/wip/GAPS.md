@@ -45,6 +45,10 @@
 > (it was the first); a pinned large-class file reads across its extents (no green could start from the kernel tree);
 > A-217, a green's origin is a reference to the base snapshot it holds (peak RSS over `fs/` 549,520 to 225,776 KiB,
 > `CreateGreen` 415 to 158 ms, best of three; `a_greens_base_snapshot_is_held_and_its_origin_recovered_from_it`). Open:
+> - **Fixed (A-207): a work's acknowledged edits were lost at a daemon restart.** A work's changes are logged in the
+>   partition and replayed at recovery (`acknowledged_work_edits_survive_a_daemon_restart`, red on main). Chaos on the
+>   branch it comes from: twenty daemon kills under the anchor at 10 and 100 clients, every client reconnected and
+>   resent its request in flight under its own id, the oracle and each client's own file 0 failures in every run.
 > - **A volume promised the whole version slab is refused at recovery** (bug record of 2026-11-05): a recovered
 >   snapshot rebuilds its directories privately, one retained version slot each the live volume did not hold (465,831
 >   committed slots before a restart, 465,832 after). Fix owed in `crates/vfs/src/recover.rs`.
