@@ -462,8 +462,8 @@ fn rename_one_name(
 
 /// Why `op` must not run, decided before it has any effect: an open with no ledger slot left, or a rename that would
 /// lengthen a name Windows holds past what the ledger records ([`OpenNames::rename_fits`]).
-fn admission_refusal(
-  op: &Op,
+fn admission_refusal<C>(
+  op: &Op<C>,
   names: &OpenNames,
   ledger: &Ledger<SparseObject>,
 ) -> Option<VfsError> {

@@ -1026,15 +1026,14 @@ fn driver_limit(root: &str) -> usize {
   refused
 }
 
-/// Creates, writes, reads back and opens again a file of `units` units through the drive.
-fn long_path_round_trips(root: &str, units: usize) -> std::io::Result<()> {
+/// Creates, writes and opens again a file of `units` units through the drive, whose bytes name its length: what it
+/// reads back.
+fn long_path_round_trip(root: &str, units: usize) -> std::io::Result<String> {
   let parts = long_components(units);
   let path = long_parents(root, &parts)?;
-  let bytes = format!("{units}");
-  write_through_drive(&path, bytes.as_bytes())?;
-  assert_eq!(std::fs::read_to_string(&path)?, bytes, "{units} units");
+  write_through_drive(&path, format!("{units}").as_bytes())?;
   drop(std::fs::File::open(&path)?);
-  Ok(())
+  std::fs::read_to_string(&path)
 }
 
 /// A-198 (2026-11-04), the goal's criterion as the supervisor restated it: slates refuses no path the WinFsp driver
@@ -1063,9 +1062,13 @@ fn opens_past_a_thousand_units_are_refused_only_by_the_winfsp_driver() {
   let limit = driver_limit(&drive);
   eprintln!("WINFSP LONG PATH: first refusal: the driver refuses from {limit} units");
   for units in [1025, 1026, 2000, 4000, 8000, limit - 1] {
-    let made = long_path_round_trips(&drive, units);
-    eprintln!("WINFSP LONG PATH: {units} units: {made:?}");
-    made.unwrap_or_else(|error| panic!("{units} units, under the driver's limit: {error}"));
+    let read = long_path_round_trip(&drive, units);
+    eprintln!("WINFSP LONG PATH: {units} units read back {read:?}");
+    assert_eq!(
+      read.unwrap_or_else(|error| panic!("{units} units, under the driver's limit: {error}")),
+      format!("{units}"),
+      "{units} units read back whole"
+    );
   }
   let parts = long_components(limit);
   let at_the_limit = long_parents(&drive, &parts).unwrap();
