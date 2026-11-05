@@ -551,3 +551,46 @@ slates-server: shard 0: held 0 replicas again from the image
 slates-server: shard 0 initialized in 10944 µs
 slates-winfsp: settled 0 captured requests before receiving
 ## run 3 of 5 FAILED, 2026-11-05T16:25:32Z
+To https://github.com/hyper-light/slates
+   0bfd73f..dd43169  dd431696c86cfb180734cd84373e03811dc1ff0a -> diag-winfsp-overlap-results-42054677662-windows-latest
+## run 4 of 5, 2026-11-05T16:25:34Z
+# receiver started first: dll=T: receiver=S:
+# host: windows 0x23f00206 on windows processor architecture 9 level 25 revision 4353 (x86_64), 4 logical CPUs (4 available to this process), 15 GiB, page 4096 B; largest L2 1048576 B, cache line 64 B
+# workload: 10 rounds of 1000 files of 4096 B per arm and pass, arms interleaved, first arm rotating
+# arm dll: T:/d
+# arm receiver: S:/d
+# warm-up: one untimed round per arm (1000 files each)
+# pass quiet: spinners 0 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 21.2 µs, p99 44.8 µs, p999 121.5 µs, max 3136.5 µs over 9127 probes; 47.7 s
+fsbench	quiet	dll	create	10000	653900	1348400	30585400	221516900
+fsbench	quiet	dll	write	10000	64100	340600	752400	32355000
+fsbench	quiet	dll	fsync	10000	94500	200600	729700	126522900
+fsbench	quiet	dll	close	10000	40300	293800	635000	15361400
+fsbench	quiet	dll	stat	10000	152100	231900	349700	203153400
+fsbench	quiet	dll	open	10000	90200	173300	636700	205378200
+fsbench	quiet	dll	read	10000	8400	84300	144700	5079900
+fsbench	quiet	dll	rename	10000	342500	589500	15143300	95720600
+fsbench	quiet	dll	unlink	10000	200400	513100	810000	388958000
+fsbench	quiet	receiver	create	10000	736900	1376100	42775700	267571000
+fsbench	quiet	receiver	write	10000	73800	231900	634400	206621700
+fsbench	quiet	receiver	fsync	10000	117600	194200	714400	252552700
+fsbench	quiet	receiver	close	10000	50300	145300	594400	25490100
+fsbench	quiet	receiver	stat	10000	211700	338300	1115500	125121200
+fsbench	quiet	receiver	open	10000	160100	271500	1984300	174439600
+fsbench	quiet	receiver	read	10000	9300	109600	185800	31051200
+fsbench	quiet	receiver	rename	10000	475400	839200	16845700	64759700
+fsbench	quiet	receiver	unlink	10000	264900	721000	9400500	189720500
+
+**quiet** (spinners 0 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 21.2 µs, p99 44.8 µs, p999 121.5 µs, max 3136.5 µs over 9127 probes; 47.7 s). Each cell: p50 · p99 · p999 · max, µs.
+
+| op | dll | receiver |
+|---|---|---|
+| create | 653.9 · 1348.4 · 30585.4 · 221516.9 | 736.9 · 1376.1 · 42775.7 · 267571.0 |
+| write | 64.1 · 340.6 · 752.4 · 32355.0 | 73.8 · 231.9 · 634.4 · 206621.7 |
+| fsync | 94.5 · 200.6 · 729.7 · 126522.9 | 117.6 · 194.2 · 714.4 · 252552.7 |
+| close | 40.3 · 293.8 · 635.0 · 15361.4 | 50.3 · 145.3 · 594.4 · 25490.1 |
+| stat | 152.1 · 231.9 · 349.7 · 203153.4 | 211.7 · 338.3 · 1115.5 · 125121.2 |
+| open | 90.2 · 173.3 · 636.7 · 205378.2 | 160.1 · 271.5 · 1984.3 · 174439.6 |
+| read | 8.4 · 84.3 · 144.7 · 5079.9 | 9.3 · 109.6 · 185.8 · 31051.2 |
+| rename | 342.5 · 589.5 · 15143.3 · 95720.6 | 475.4 · 839.2 · 16845.7 · 64759.7 |
+| unlink | 200.4 · 513.1 · 810.0 · 388958.0 | 264.9 · 721.0 · 9400.5 · 189720.5 |
+
