@@ -67,6 +67,15 @@ impl ChunkCipher for Cipher {
   fn key_for_volume(&mut self, _: [u8; 16]) -> Result<u32, VfsError> {
     Ok(0)
   }
+  fn hold(&mut self, _: u32) -> Result<(), VfsError> {
+    Ok(())
+  }
+  fn release(&mut self, _: u32) -> Result<(), VfsError> {
+    Ok(())
+  }
+  fn keys_held(&self) -> usize {
+    1
+  }
 }
 
 /// A store holding `CONTENT` bytes in full chunks, sealed when `sealed`; its extents, and the nanoseconds the seals

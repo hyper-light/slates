@@ -7389,6 +7389,10 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
 /// over-offered), its records' metadata reservation, and the growth a dynamic volume acquired from
 /// the shard budget as it wrote.
 fn release_slot_credits(state: &mut ShardState, slot: &VolumeSlot) {
+  // The volume's hold on its seal key goes with it (A-208); its sealed chunks hold the key while any of them lives.
+  if !crate::content_cipher::release_seal_key(&mut state.store, slot.volume.seal_key()) {
+    state.count(crate::content_cipher::KEY_RELEASE_REFUSED, 1);
+  }
   // The copies of its files the direct map handed out stop following them (§4.6, A-171), so a prefix a new volume is
   // given once the count wraps never writes into a map of a file it does not hold. Each copy stays held, and charged,
   // until its client releases it or is reaped: the client's own map keeps the object's pages, which the daemon wrote.
