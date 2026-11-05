@@ -388,7 +388,9 @@
 > written), presented 1 create and 3 replaces (manifest `06ca7f70…`), the human's `slates grant` at the Mac's anchor
 > issued grant 1, and the landing ended `done`: 4 written, 74 bytes, data and 2 directories synced; the Mac's disk
 > held every merged byte. Two Mac Studios had frozen the server earlier the same day (the kiln runner's headroom
-> guard, the anchor in state `T`); the MacBook did not. Open, found on the way:
+> guard, the anchor in state `T`); the MacBook did not. On main b502cf96 A-217's held origin made every checkout of a
+> based green refuse `ConsistentBaseUnavailable` (3 of 3 checkout tests red on main); fixed by comparing identities
+> (`docs/bugs/2026-11-05-a-held-origin-refused-every-checkout.md`). Open, found on the way:
 > - **The daemon cannot clone an overlay volume.** `admit_clone` gives every clone no host, so `volume clone` of an
 >   overlay is refused `ContentUnavailable` (pinned or not; fleet and standalone), though the volume core can.
 > - **No grant can be issued on Linux from the CLI.** The anchor's issuer segment is a descriptor only its children
