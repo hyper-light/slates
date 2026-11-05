@@ -3,22 +3,35 @@
   "suite": "fsx",
   "transport": "native-windows-winfsp",
   "host": {
-    "os": "macOS 26.4.1 (25E253)",
-    "kernel": "Darwin 25.4.0",
-    "arch": "arm64",
-    "privilege": "unprivileged"
+    "os": "Microsoft Windows [Version 10.0.26100.33674]",
+    "kernel": "Microsoft Windows [Version 10.0.26100.33674]",
+    "arch": "x86_64",
+    "privilege": "root"
   },
   "date": "2026-11-05",
-  "command": "",
-  "bound": "",
+  "command": "cd <mount>/conformance-<pid>/fsx && <scratch>\\tools\\fsx.exe -N 10000 -S 1 -F 262144 -v -P D:\\a\\slates\\slates\\target\\conformance-scratch\\native-windows-winfsp\\fsx-logs fsx.bin",
+  "bound": "10000 operations, seed 1, file length 262144 bytes, 300s a run",
   "outcome": {
-    "kind": "skipped",
-    "reason": {
-      "kind": "lane",
-      "reason": "runs in the Windows lane, not on macOS"
+    "kind": "ran",
+    "counts": {
+      "suite": "fsx",
+      "operations": 10000,
+      "seed": 1,
+      "file_length": 262144,
+      "ok": false
     }
   },
-  "expected_failure_list": null,
-  "duration_ms": 0,
-  "notes": []
+  "expected_failure_list": {
+    "path": "docs/wip/conformance/expected-failures/native-windows-winfsp.fsx.txt",
+    "blake3": "65eb035e56313fe31f8da91ddeee0e61b6600554cedb75c747e426547635824d",
+    "entries": 1
+  },
+  "duration_ms": 629508,
+  "notes": [
+    "fsx: the WinFsp port, billziss-gh/secfs.test@6ac65cd fstools/src/fsx/fsx.c (APSL 2.0), sha256 440742597d18b69edfea6ca49fd1905fbad4926953e446957e2ed1377ebe584c, with its win/ shims at the same commit, built `cl /nologo /MT /W2 fsx.c win\\getopt.c win\\mman.c win\\random.c ntdll.lib /Fe:fsx.exe /link /subsystem:console` (source unchanged)",
+    "the exerciser's .fsxlog/.fsxgood files were kept outside the mount (-P)",
+    "1 expected failures; 0 unlisted failures; 0 listed now passing; 0 listed absent",
+    "fsx was ended at its wall bound of 300s",
+    "fsx output tail: 35: MAPWRITE        0x5824 (22564) thru 0xf423 (62499)\t(0x9c00 (39936) bytes)\n36: WRITE           0x15e80 (89728) thru 0x1d2db (119515)\t(0x745c (29788) bytes)\n37: READ            0x1c3c4 (115652) thru 0x22d53 (142675)\t(0x6990 (27024) bytes)\n38: MAPREAD         0x42cc (17100) thru 0x58e7 (22759)\t(0x161c (5660) bytes)\n39: READ            0xc9c (3228) thru 0x1008f (65679)\t(0xf3f4 (62452) bytes)\n40: TRUNCATE DOWN   from 0x40000 (262144) to 0x57c (1404)\n41: WRITE           0x2bbcc (179148) thru 0x33dcf (212431)\t…"
+  ]
 }

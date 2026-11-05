@@ -3,22 +3,40 @@
   "suite": "winfstest",
   "transport": "native-windows-winfsp",
   "host": {
-    "os": "macOS 26.4.1 (25E253)",
-    "kernel": "Darwin 25.4.0",
-    "arch": "arm64",
-    "privilege": "unprivileged"
+    "os": "Microsoft Windows [Version 10.0.26100.33674]",
+    "kernel": "Microsoft Windows [Version 10.0.26100.33674]",
+    "arch": "x86_64",
+    "privilege": "root"
   },
   "date": "2026-11-05",
-  "command": "",
-  "bound": "",
+  "command": "cd <drive>\\conformance-<pid>\\winfstest && <the transcribed scripts, each call `winfstest.exe ARGS`>",
+  "bound": "every script at billziss-gh/secfs.test@6ac65cda46abc2be39c7b137debf9521052edbaf (20 scripts), 300s a call",
   "outcome": {
-    "kind": "skipped",
-    "reason": {
-      "kind": "lane",
-      "reason": "runs in the Windows lane, not on macOS"
+    "kind": "ran",
+    "counts": {
+      "suite": "pjdfstest",
+      "files": 20,
+      "cases": 628,
+      "passed": 254,
+      "failed": 374,
+      "needs_root": 0,
+      "todo": 0,
+      "expected_failures": 374,
+      "unexpected_failures": 0,
+      "listed_now_passing": 0
     }
   },
-  "expected_failure_list": null,
-  "duration_ms": 0,
-  "notes": []
+  "expected_failure_list": {
+    "path": "docs/wip/conformance/expected-failures/native-windows-winfsp.winfstest.txt",
+    "blake3": "6ab614f40283810760a229f47bddae532b5264843ccb0575481a858dc11738a4",
+    "entries": 374
+  },
+  "duration_ms": 13276,
+  "notes": [
+    "winfstest: billziss-gh/secfs.test@6ac65cd winfstest/winfstest.c (BSD-3-Clause), sha256 7a1ddf128b02a38145a1f3230fed5a64ffda6dc64c096b8a67da89be17632c94, with winerror.i at the same commit, built `cl /nologo /MT /W2 winfstest.c advapi32.lib /Fe:winfstest.exe /link /subsystem:console` (source unchanged)",
+    "374 expected failures; 0 unlisted failures; 0 listed now passing; 0 listed absent",
+    "the scripts: a Rust transcription of winfstest's 20 scripts at billziss-gh/secfs.test@6ac65cda46abc2be39c7b137debf9521052edbaf (each upstream file's sha256 in xtask/src/conformance/winfstest/scripts.rs), held to them by a golden of their calls and cases",
+    "run in E:\\conformance-3320\\winfstest on the drive, each call one winfstest.exe process, 300s a call",
+    "failures by shape (12 of 215 shapes; names folded to N, inode numbers to <inode>): 100 × testeval(\":strm%s:$DATA\" % i in s); 6 × testeval(r[0][\"FileIndex\"] == s[0][\"FileIndex\"]); 4 × expect \"GetFileInformation 00000012:foo\" 0 - got ERROR_INVALID_NAME; 4 × expect \"GetFileSecurity 00000015:strm DACL_SECURITY_INFORMATION\" 0 - got ERROR_INVALID_NAME; 4 × expect \"SetReparsePoint 0000000c 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} 1A 2B 3C 4D 5F\" 0 - got ERROR_INVALID_FUNCTION; 4 × expect \"SetReparsePoint 0000000d 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} 1A 2B 3C 4D 5F\" 0 - got ERROR_INVALID_FUNCTION; 4 × testeval(\":bar:$DATA\" in s); 4 × testeval(\":foo:$DATA\" in s); 3 × expect \"DeleteFile 00000014\" 0 - got ERROR_FILE_NOT_FOUND; 3 × expect \"FindStreams 00000014\" 0 - got ERROR_FILE_NOT_FOUND; 3 × expect \"FindStreams 00000014\" 0 - got ERROR_INVALID_PARAMETER; 3 × expect \"GetReparsePoint 0000000c\" 0 - got ERROR_INVALID_FUNCTION"
+  ]
 }

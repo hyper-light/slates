@@ -91,8 +91,9 @@ pub fn cell(record: Option<&Record>) -> String {
   };
   match &record.outcome {
     Outcome::Ran { counts } => format!(
-      "RAN({}; {}; {})",
+      "RAN({}{}; {}; {})",
       summary(counts),
+      judged_against(record, counts),
       record.date,
       record.host.os
     ),
@@ -107,6 +108,17 @@ pub fn cell(record: Option<&Record>) -> String {
       record.host.os
     ),
     Outcome::Skipped { reason } => format!("SKIPPED({}: {})", reason.class(), reason.text()),
+  }
+}
+
+/// For an fsx run judged against a reviewed list (A-214), the list it was judged against, so a failed cell that the
+/// list expects reads as such; nothing for any other run (pjdfstest's and winfstest's counts carry their judgement).
+fn judged_against(record: &Record, counts: &Counts) -> String {
+  match (counts, &record.expected_failure_list) {
+    (Counts::Fsx { .. }, Some(list)) if list.entries > 0 => {
+      format!(", judged against `{}` ({} listed)", list.path, list.entries)
+    }
+    _ => String::new(),
   }
 }
 
