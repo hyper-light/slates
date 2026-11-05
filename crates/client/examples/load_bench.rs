@@ -874,8 +874,20 @@ fn read_files(
 ) -> BTreeMap<String, Vec<u8>> {
   paths
     .iter()
-    .map(|path| (path.clone(), client.read(green, path, at).unwrap()))
+    .map(|path| (path.clone(), read_patiently(client, green, path, at)))
     .collect()
+}
+
+/// A file read that a busy daemon may stall past one reply deadline: tried again up to `reply_patience` times (the
+/// oracle's reads come after every client is done, so a stall here is the daemon draining, never a lost answer).
+fn read_patiently(client: &mut Client, green: VolumeId, path: &str, at: ReadAt) -> Vec<u8> {
+  let mut tries = 0;
+  loop {
+    match client.read(green, path, at) {
+      Err(ClientError::Stalled { .. }) if tries < reply_patience() => tries += 1,
+      other => return other.unwrap(),
+    }
+  }
 }
 
 /// One load level: `n` clients over the green, `workers` threads sweeping them. Returns the oracle's failures.

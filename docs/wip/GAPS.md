@@ -75,6 +75,17 @@
 >   owner shard, so replies pass the client's 1 s reply deadline (136 `CreateWork` at a 1 s harness deadline). The
 >   harness's conflict resolution is still synchronous (a worker's sweep reached 4.9 s), so its latencies at this
 >   level are not recorded.
+> - **A-207 moved the bottleneck to the partition log** (2026-11-05, async harness, load 7 to 18): every edit now
+>   appends to the partition log, and every `bytes_between_snapshots` of log the shard publishes a whole partition
+>   snapshot, origin included. 10 clients: edit p50 2.1 ms. 100 clients: every operation's p50 64 to 76 ms with the
+>   harness's worst sweep 0.75 ms (the shard serves about 0.85 ms an operation). The work logs share the merge byte
+>   budget, so at 300 clients 184 verbs and at 1,000 clients 644 were refused `green_chains at capacity`. The fix is the
+>   same as the origin's: the origin out of the partition (owed, needs Ada), then checkpoint folding.
+> - **Memory grows about 20 to 29 MB per connected client** (peak RSS 2.9 GB at 100 clients, 8.7 GB at 300, OOM at a
+>   24 GB cap at 1,000; 6.1 GB at 300 on `a364b03c`, before A-207). The per-connection IPC region (`slots × 2 × 4 KiB`
+>   of bulk, the slots derived from the machine), mapped by the daemon and the client in this one process, accounts for
+>   the order of it. That bounds one host at a few thousand concurrent connections, far below 100k: 100k clients need
+>   many logical clients per connection, or rings sized for them (a design decision for Ada).
 > - **A sync client gives up on a live, overloaded daemon after its reply deadline** (89 calls at 100 clients:
 >   `no reply within 1000000000 ns`).
 > - The 1,000, 10k and 100k levels, the full kernel tree, a separate daemon process, and the remote primary with two

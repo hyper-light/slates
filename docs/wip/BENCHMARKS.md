@@ -7995,3 +7995,19 @@ waits parked.
 
 **Not in these rows.** The daemon ships a head only on its 100 ms record period, so a head still waits up to a
 period before this commit begins; and nothing replicates a file's writes per write yet (§4.10 live shipping is owed).
+
+### Work durability (A-207) and the asynchronous harness, 10 to 1,000 clients (2026-11-05)
+
+`load_bench --tree <linux-v7.4-rc1>/kernel --clients 10,100,1000 --hot-files 800 --reply-patience 60`, same machine,
+load 7 to 18, one run. Nanoseconds, p50 / p99 / max:
+
+| Clients | CreateWork | Edit | Submit (accepted) | Oracle |
+|---|---|---|---|---|
+| 10 | 319,137 / 769,795 / 1,022,493 | 2,078,465 / 40,258,103 / 40,797,436 | 4,021,344 / 40,023,106 / 42,780,339 | 30 accepted, 2 conflicts, 0 failures |
+| 100 | 528,802 / 9,414,748 / 9,482,262 | 63,962,344 / 192,021,928 / 225,104,507 | 70,691,224 / 194,883,121 / 226,597,387 | 300 accepted, 136 conflicts, 0 failures |
+| 1,000 | 291,311,217 / 686,353,804 / 693,995,942 | 81,024,595 / 1,481,346,067 / 1,734,711,501 | 343,767,358 / 1,537,454,008 / 1,626,920,977 | not reached: OOM-killed at the 24 GB cap |
+
+The harness's worst sweep was 0.23 ms at 10 clients and 0.75 ms at 100, so these are the daemon's: the 100-client
+operations queue on the green's owner shard, which publishes a whole partition snapshot (origin included) every
+`bytes_between_snapshots` of the log every edit now appends to (GAPS). Peak RSS: 2.9 GB at 100 clients, 8.7 GB at 300.
+
