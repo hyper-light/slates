@@ -1,0 +1,50 @@
+name: DIAG nfs-write, the incumbent harness A/B through Linux's NFS client (not for main)
+
+# Diagnostics, never merged (VFS plan step 11). Arm A is main (76b450a1), arm B this branch's change; both built on one
+# runner, then the 2026-10-08 incumbent harness (docs/wip/bench/mixed/linux_vs_nfsd.sh 400 64, as of main) run in a
+# privileged container per arm, alternating A, B three times. Each run measures slates, the kernel's nfsd and tmpfs.
+
+on:
+  push:
+    branches: ['diag-nfs-write-*']
+
+jobs:
+  ab:
+    name: incumbent harness, A/B interleaved (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: 76b450a1a7fd39cb3ea1d31ff7c6ade6b6c6ba70
+          path: arm-a
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: The machine
+        run: uname -a && nproc && lscpu | grep -E 'Model name' && free -g && cat /proc/loadavg
+      - name: Build arm B (this branch)
+        run: cargo build --release -p slates-cli --bin slates && mkdir -p "$RUNNER_TEMP/b/release" && cp target/release/slates "$RUNNER_TEMP/b/release/"
+      - name: Build arm A (main)
+        run: cd arm-a && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-a" cargo build --release -p slates-cli --bin slates && mkdir -p "$RUNNER_TEMP/a/release" && cp "$GITHUB_WORKSPACE/target-a/release/slates" "$RUNNER_TEMP/a/release/"
+      - name: Pull the harness image and load the NFS modules
+        run: docker pull -q rust:1.98 && sudo modprobe nfsd && sudo modprobe nfs
+      - name: The incumbent harness, A B A B A B
+        timeout-minutes: 60
+        run: |
+          for run in 1 2 3; do
+            for arm in a b; do
+              out="$RUNNER_TEMP/out-$arm-$run"; mkdir -p "$out"
+              echo "=== run $run arm $arm $(date -u +%T) load $(cut -d' ' -f1-3 /proc/loadavg)"
+              timeout 900 docker run --rm --privileged -v "$RUNNER_TEMP/$arm":/target:ro \
+                -v "$GITHUB_WORKSPACE/arm-a/docs/wip/bench/mixed":/m:ro -v "$out":/out rust:1.98 \
+                bash /m/linux_vs_nfsd.sh 400 64 > "$out/run.txt" 2>&1 || echo "run $run arm $arm exited $?"
+              grep -E '^== |^large|MISMATCH|^create|^overwrite|^append' "$out/run.txt"
+            done
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nfs-write-ab
+          path: ${{ runner.temp }}/out-*
