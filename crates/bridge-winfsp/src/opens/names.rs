@@ -4,10 +4,10 @@
 //! are complete. A killed copy leaves the other version readable. The section reserves the format's maximum names
 //! but commits only touched ranges; no path-sized allocation or namespace walk runs during a normal read.
 //!
-//! **Two regions, because Windows commits by the 64 KiB granule** (`slates_mem::SparseObject`). Windows' own limit on a
-//! file node's name is 32,767 UTF-16 units: `UNICODE_STRING.Length` is a `USHORT` counting bytes. One record that long
-//! per version would put every slot's two heads more than a granule apart, so each open would commit at least two
-//! granules of its own; with the record a short name needs, neighbouring slots share theirs. So a record keeps its
+//! **Two regions, because Windows commits by the 64 KiB granule** (`slates_mem::SparseObject`). A record must hold the
+//! longest name the WinFsp driver passes ([`crate::notify::MAX_PATH_UNITS`]). One record that long per version would
+//! spread every slot's heads over a third of a granule, so few slots would share one; with the record a short name
+//! needs, about thirty share each. So a record keeps its
 //! first [`INLINE_BYTES`] in place, and only a longer name touches its tail in the second region, where each slot and
 //! version has the rest of the limit reserved. A short path commits what it did before this split, a long one what
 //! its length needs, and the reserve is bounded by the slot count (`bytes`). Until 2026-11-04 the record ended at 1,024
@@ -38,7 +38,7 @@ const LENGTH_AT: usize = REVISION_AT + size_of::<u64>();
 /// Format: the checksum follows the byte length, and covers everything after the publication byte but itself.
 const CHECKSUM_AT: usize = LENGTH_AT + size_of::<u16>();
 
-/// The reserve of `bound` slots: every version's record and its tail. At `MAX_OPEN_HANDLES` this is 8.6 GiB of a
+/// The reserve of `bound` slots: every version's record and its tail. At `MAX_OPEN_HANDLES` this is 2.0 GiB of a
 /// `SEC_RESERVE` section per mount, charged to nothing until touched.
 pub(super) fn bytes(bound: usize) -> Result<usize, Refusal> {
   bound
@@ -332,7 +332,7 @@ mod tests {
   }
 
   /// A-198. Do: reuse a slot, then rename a different path prefix. Expect: no former generation or partial component
-  /// becomes the new open's name, and a path past Windows' own limit is refused without disturbing the complete name.
+  /// becomes the new open's name, and a path past the driver's limit is refused without disturbing the complete name.
   #[test]
   fn names_follow_slot_generations_and_component_boundaries() {
     let mut memory = Ram::of(1);
@@ -367,10 +367,10 @@ mod tests {
     path
   }
 
-  /// A-198. Do: record names of 1, 1,024, 1,025, 2,000, 8,000 and 32,767 UTF-16 units in the last slot of three. Expect:
+  /// A-198. Do: record names of 1, 1,024, 1,025, 2,000, 8,000 and the driver's limit in UTF-16 units, in the last slot of three. Expect:
   /// each reads back whole and unchanged; the neighbouring slots' names are untouched, tails included.
   #[test]
-  fn names_up_to_windows_own_limit_are_kept_whole() {
+  fn names_up_to_the_drivers_limit_are_kept_whole() {
     for units in [1, 1024, 1025, 2000, 8000, crate::notify::MAX_PATH_UNITS] {
       let mut memory = Ram::of(3);
       let name = path_of(units);

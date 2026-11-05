@@ -395,6 +395,7 @@ impl Request {
       Op::Release { object } => Some(*object),
       _ => None,
     };
+    let too_long = matches!(&self.op, Op::Rename { from, to } if !names.rename_fits(from, to));
     let bound = bind(self.op, ledger);
     let barrier = bound.as_ref().is_ok_and(|op| {
       op.needs_barrier() && !matches!(op, Op::Cleanup { object, .. } if object.purge)
@@ -406,6 +407,7 @@ impl Request {
       Ok(_op) if opened.is_some() && !ledger.has_room() => {
         Reply::Err(ntstatus(&VfsError::NoSpace).as_i32())
       }
+      Ok(_op) if too_long => Reply::Err(ntstatus(&VfsError::NameTooLong).as_i32()),
       Ok(op) => run(bridge, cx, op).unwrap_or_else(|error| Reply::Err(ntstatus(&error).as_i32())),
       Err(error) => {
         eprintln!("slates-winfsp: context refused: {error}");

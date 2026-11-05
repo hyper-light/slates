@@ -24,9 +24,9 @@
 //! **The record.** `FSP_FSCTL_NOTIFY_INFO` (`fsctl.h`, `static_assert` 12 bytes): `UINT16 Size`, two bytes of padding,
 //! `UINT32 Filter`, `UINT32 Action`, then the name in UTF-16 with no terminator; `Size` counts the head and the name,
 //! and each record starts at the next multiple of `FSP_FSCTL_DEFAULT_ALIGNMENT` (8), as the kernel walks them
-//! (`FspVolumeNotifyWork`, `src/sys/volume.c`). A name past what the 16-bit size can count ([`MAX_NOTIFY_UNITS`]; only
-//! a directory rename can lengthen a held name that far) is refused, counted, and left out rather than truncated into
-//! a different name. `FSP_FSCTL_TRANSACT_PATH_SIZEMAX` (1024 units) does not limit an absolute name here: that kernel
+//! (`FspVolumeNotifyWork`, `src/sys/volume.c`). A name past what the 16-bit size can count ([`MAX_NOTIFY_UNITS`], far
+//! past any name the driver passes) is refused, counted, and left out rather than truncated into a different name.
+//! `FSP_FSCTL_TRANSACT_PATH_SIZEMAX` (1024 units) does not limit an absolute name here: that kernel
 //! buffer holds only a name relative to the record before it, which this module never sends.
 
 use std::collections::BTreeMap;
@@ -58,11 +58,16 @@ const EVERYTHING_FILTER: u32 = INODE_FILTER | ENTRY_FILTER;
 pub const NOTIFY_INFO_HEAD: usize = 12;
 /// Format: `FSP_FSCTL_DEFAULT_ALIGNMENT` (`fsctl.h`): each record starts at a multiple of it.
 pub const NOTIFY_INFO_ALIGNMENT: usize = 8;
-/// Format: Windows' own limit on a name, in UTF-16 units: `UNICODE_STRING.Length` is a `USHORT` counting bytes, whose
-/// largest even value is 65,534. WinFsp's file node name is one (`src/sys/file.c`), so a held name never exceeds this
-/// however far renames lengthen it. `FSP_FSCTL_TRANSACT_PATH_SIZEMAX`'s 1024 units limits only a response's normalized
-/// name and a relative notification, neither of which this host sends.
-pub const MAX_PATH_UNITS: usize = (u16::MAX as usize) / size_of::<u16>();
+/// Derived: the longest name the WinFsp driver passes to a file system, in UTF-16 units: a request's maximum less its
+/// fixed part and the name's terminator (`FspIopCreateRequestFunnel`, `src/sys/iop.c`). Measured live against the driver
+/// on both Windows lanes (`opens_past_a_thousand_units_are_refused_only_by_the_winfsp_driver` in
+/// `crates/cli/tests/winfsp.rs`, which asserts this value; the runs are in `docs/wip/GAPS.md`), so the name reserve
+/// follows the driver and not a guess. `FSP_FSCTL_TRANSACT_PATH_SIZEMAX`'s 1024 units limits only a response's normalized
+/// name and a relative notification, neither of which this host sends. The driver checks no length when a directory's
+/// rename lengthens the names beneath it, so a rename that would pass this is refused ([`OpenNames::rename_fits`]).
+pub const MAX_PATH_UNITS: usize =
+  (crate::inflight::REQUEST_MAX - crate::inflight::REQUEST_BASE - size_of::<u16>())
+    / size_of::<u16>();
 /// Derived: the longest name a record's 16-bit `Size` can count after its head, in UTF-16 units.
 pub const MAX_NOTIFY_UNITS: usize = ((u16::MAX as usize) - NOTIFY_INFO_HEAD) / size_of::<u16>();
 
@@ -98,6 +103,21 @@ impl OpenNames {
         *path = format!("{to}{rest}");
       }
     }
+  }
+
+  /// Whether every name Windows holds beneath `from` stays within [`MAX_PATH_UNITS`] once `from` becomes `to`. Such a name
+  /// could not be recorded for a successor, nor opened again through the driver. Looks at each open once, and a rename
+  /// is a rare request; a rename that shortens its names need look at none.
+  pub fn rename_fits(&self, from: &str, to: &str) -> bool {
+    let grows = to
+      .encode_utf16()
+      .count()
+      .saturating_sub(from.encode_utf16().count());
+    grows == 0
+      || self.by_handle.values().all(|(_, path)| {
+        beneath(path, from).is_none()
+          || path.encode_utf16().count().saturating_add(grows) <= MAX_PATH_UNITS
+      })
   }
 
   /// How many handles Windows holds open.
@@ -434,6 +454,23 @@ mod tests {
     assert_eq!(round.records(), 1);
     assert_eq!(round.too_long(), 1);
     assert_eq!(walk(round.bytes())[0].2, longest);
+  }
+
+  /// A-198 (2026-11-04). Do: hold open a name at the driver's limit beneath `\dir`, then ask about renames of `\dir` that
+  /// shorten it, keep its length, lengthen it by a unit, and of another directory. Expect: only the lengthening rename
+  /// of its own directory does not fit, since the driver would rename the node without a check and the ledger could not
+  /// record it.
+  #[test]
+  fn a_rename_that_would_lengthen_a_held_name_past_the_limit_does_not_fit() {
+    let mut names = OpenNames::new();
+    let held = format!("\\dir\\{}", "x".repeat(MAX_PATH_UNITS - 5));
+    assert_eq!(held.len(), MAX_PATH_UNITS);
+    names.opened(1, 1, &held);
+    assert!(names.rename_fits("\\dir", "\\di"));
+    assert!(names.rename_fits("\\dir", "\\new"));
+    assert!(!names.rename_fits("\\dir", "\\dirs"));
+    assert!(names.rename_fits("\\other", "\\others"));
+    assert!(names.rename_fits("\\dirx", "\\dirxy"), "not a component");
   }
 
   /// A-198. Do: hold open a name of 1,025 units, past `FSP_FSCTL_TRANSACT_PATH_SIZEMAX`. Expect: it is told, whole. Before

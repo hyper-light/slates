@@ -40,7 +40,7 @@ the top of `docs/wip/GAPS.md` for the measured figure and run ids.
 
 ## Evidence
 
-`names_up_to_windows_own_limit_are_kept_whole`, `a_torn_rename_of_a_long_name_keeps_a_complete_name`,
+`names_up_to_the_drivers_limit_are_kept_whole`, `a_torn_rename_of_a_long_name_keeps_a_complete_name`,
 `a_corrupt_tail_is_refused`, `a_short_name_never_reaches_the_tail_region` (`opens/names.rs`),
 `a_name_past_a_thousand_units_is_told` (`notify.rs`) and `a_rename_of_a_long_path_is_read_whole` (`inflight.rs`) run on any
 host. Live on CI's Windows lanes: `opens_past_a_thousand_units_are_refused_only_by_the_winfsp_driver` and

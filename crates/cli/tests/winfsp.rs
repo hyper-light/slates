@@ -982,13 +982,68 @@ fn long_parents(root: &str, parts: &[String]) -> std::io::Result<String> {
   Ok(path)
 }
 
-/// A-198 (2026-11-04). Do: on a mounted drive, walk a ladder of kernel-name lengths from 1,024 to the longest a drive
-/// letter can reach, and at each create a file, write it, read it back and open it again. Expect: every length the
-/// WinFsp driver admits is created and read back whole, and a length it does not admit is refused by the driver itself:
-/// the daemon's own refusal count does not move, since the request never reached it. Before this every open past 1,024
-/// units was refused by the daemon, for the ledger's name record.
+/// Format: `ERROR_INVALID_PARAMETER`, what `STATUS_INVALID_PARAMETER` becomes: the WinFsp driver's answer to a request
+/// too long to build (`FspIopCreateRequestFunnel`, `src/sys/iop.c`).
+const DRIVER_REFUSED: i32 = 87;
+/// Format: `ERROR_FILE_NOT_FOUND` and `ERROR_PATH_NOT_FOUND`: the file system's answer to a name it does not have, which
+/// shows the request reached it.
+const REACHED_THE_VOLUME: [i32; 2] = [2, 3];
+
+/// Whether an open of a name of `units` units, which the volume does not have, reached the file system. The two answers
+/// tell the driver from slates with nothing else to read: slates could only answer that the name is not there.
+fn open_reaches_the_volume(root: &str, units: usize) -> bool {
+  let path = format!("\\\\?\\{root}\\{}", long_components(units).join("\\"));
+  let error = std::fs::File::open(&path).expect_err("a name the volume does not have");
+  let code = error.raw_os_error().unwrap_or(-1);
+  assert!(
+    code == DRIVER_REFUSED || REACHED_THE_VOLUME.contains(&code),
+    "an open of {units} units answered neither the driver's refusal nor the volume's: {error}"
+  );
+  code != DRIVER_REFUSED
+}
+
+/// The smallest length the driver refuses, found by halving between a length that reaches the volume and one that does
+/// not, on the live driver.
+fn driver_limit(root: &str) -> usize {
+  let mut reaches = 1025;
+  let mut refused = (u16::MAX as usize) / 2 - VERBATIM_DRIVE_UNITS;
+  assert!(
+    open_reaches_the_volume(root, reaches),
+    "1,025 units reach the volume"
+  );
+  assert!(
+    !open_reaches_the_volume(root, refused),
+    "the longest name a drive letter can reach is refused by the driver"
+  );
+  while refused - reaches > 1 {
+    let middle = reaches + (refused - reaches) / 2;
+    if open_reaches_the_volume(root, middle) {
+      reaches = middle;
+    } else {
+      refused = middle;
+    }
+  }
+  refused
+}
+
+/// Creates, writes, reads back and opens again a file of `units` units through the drive.
+fn long_path_round_trips(root: &str, units: usize) -> std::io::Result<()> {
+  let parts = long_components(units);
+  let path = long_parents(root, &parts)?;
+  let bytes = format!("{units}");
+  write_through_drive(&path, bytes.as_bytes())?;
+  assert_eq!(std::fs::read_to_string(&path)?, bytes, "{units} units");
+  drop(std::fs::File::open(&path)?);
+  Ok(())
+}
+
+/// A-198 (2026-11-04), the goal's criterion as the supervisor restated it: slates refuses no path the WinFsp driver
+/// passes. Do: measure the driver's limit on this driver by halving. Expect: it is the limit the name reserve is derived
+/// from (`MAX_PATH_UNITS`); a file one unit under it, and at every length on a ladder from 1,025, is created, written,
+/// read back and opened again through slates; at the limit, an open with every parent in place is answered the driver's
+/// status, and not the not-found that slates would answer. Before this every open past 1,024 units was refused by the
+/// daemon, for the ledger's name record.
 #[test]
-#[allow(clippy::cognitive_complexity)]
 fn opens_past_a_thousand_units_are_refused_only_by_the_winfsp_driver() {
   if !live_mount_runs() {
     return;
@@ -1005,35 +1060,26 @@ fn opens_past_a_thousand_units_are_refused_only_by_the_winfsp_driver() {
   let (code, _, err) = run(&instance, &["mount", &id, &drive]);
   assert_eq!(code, 0, "mount: {err}");
   wait_ready(&format!("{drive}\\"));
-  let longest = (u16::MAX as usize) / 2 - VERBATIM_DRIVE_UNITS;
-  let mut refused_by_the_driver = None;
-  for units in [
-    1024, 1025, 1026, 2000, 4000, 8000, 8100, 8120, 8140, 8160, 8180, 8200, 16000, longest,
-  ] {
-    let parts = long_components(units);
-    let written = long_parents(&drive, &parts).and_then(|path| {
-      write_through_drive(&path, format!("{units}").as_bytes())?;
-      let read = std::fs::read_to_string(&path)?;
-      Ok((path, read))
-    });
-    match written {
-      Ok((path, read)) => {
-        assert_eq!(read, format!("{units}"), "{units} units read back whole");
-        let kept = std::fs::File::open(&path).unwrap();
-        drop(kept);
-        eprintln!("WINFSP LONG PATH: {units} units created, read back and opened again");
-      }
-      Err(error) => {
-        eprintln!("WINFSP LONG PATH: {units} units refused: {error}");
-        refused_by_the_driver.get_or_insert((units, error.raw_os_error()));
-      }
-    }
+  let limit = driver_limit(&drive);
+  eprintln!("WINFSP LONG PATH: first refusal: the driver refuses from {limit} units");
+  for units in [1025, 1026, 2000, 4000, 8000, limit - 1] {
+    let made = long_path_round_trips(&drive, units);
+    eprintln!("WINFSP LONG PATH: {units} units: {made:?}");
+    made.unwrap_or_else(|error| panic!("{units} units, under the driver's limit: {error}"));
   }
-  eprintln!("WINFSP LONG PATH: first refusal {refused_by_the_driver:?}");
-  let (first, _) = refused_by_the_driver.unwrap_or((usize::MAX, None));
-  assert!(
-    first > 8000,
-    "the driver admits requests up to FSP_FSCTL_TRANSACT_REQ_SIZEMAX, so 8,000 units must reach the file: first refusal {first}"
+  let parts = long_components(limit);
+  let at_the_limit = long_parents(&drive, &parts).unwrap();
+  let refused = std::fs::File::open(&at_the_limit).unwrap_err();
+  eprintln!("WINFSP LONG PATH: {limit} units with its parents in place: {refused}");
+  assert_eq!(
+    refused.raw_os_error(),
+    Some(DRIVER_REFUSED),
+    "at the limit the refusal is the driver's"
+  );
+  assert_eq!(
+    limit,
+    slates_bridge_winfsp::notify::MAX_PATH_UNITS + 1,
+    "the name reserve is derived from what the driver passes"
   );
 }
 

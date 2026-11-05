@@ -45,6 +45,10 @@ rustix = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
 
+[target.'cfg(windows)'.dev-dependencies]
+# `notify::MAX_PATH_UNITS`: the name reserve the live ladder holds equal to the limit it measures on the driver (A-198).
+slates-bridge-winfsp = { workspace = true }
+
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 # The names of the status counters slates' own virtio-fs device adds while a guest uses its DAX window, which the real
 # guest test holds non-vacuous (`tests/guest_vhost.rs`, A-168).
