@@ -187,10 +187,9 @@ const CLEANUP_CHANGED: u32 = 0x01 | 0x02 | 0x10 | 0x40 | 0x80;
 
 /// One operation the owner shard runs on the volume, with the parameters marshalled from a WinFsp callback. Paths
 /// arrive as Rust `String`s (converted from WinFsp's UTF-16), so the whole `Op` crosses the channel.
-enum Op<T> {
+pub(crate) enum Op<T> {
   /// One durable kernel-name update after a successful rename response was saved, before it reaches the driver.
   RenameName {
-    after: Option<u64>,
     from: String,
     to: String,
   },
@@ -341,8 +340,22 @@ impl Request {
     names: &mut OpenNames,
     ledger: &mut Ledger<SparseObject>,
   ) -> Served {
-    if let Op::RenameName { after, from, to } = &self.op {
-      let reply = rename_one_name(names, ledger, *after, from, to);
+    let serve_started = std::time::Instant::now();
+    let serve_name = crate::phase::op_name(&self.op);
+    let served = self.serve_inner(bridge, cx, names, ledger);
+    crate::phase::note(serve_name, 2, serve_started);
+    served
+  }
+
+  fn serve_inner(
+    self,
+    bridge: &mut dyn Bridge,
+    cx: &OpContext,
+    names: &mut OpenNames,
+    ledger: &mut Ledger<SparseObject>,
+  ) -> Served {
+    if let Op::RenameName { from, to } = &self.op {
+      let reply = rename_one_name(names, ledger, from, to);
       return Served {
         reply,
         sender: self.reply,
@@ -424,11 +437,10 @@ fn confirm_reply(ledger: &mut Ledger<SparseObject>, context: u64) -> Reply {
 fn rename_one_name(
   names: &mut OpenNames,
   ledger: &mut Ledger<SparseObject>,
-  after: Option<u64>,
   from: &str,
   to: &str,
 ) -> Reply {
-  let Some((context, inode)) = names.next_open(after) else {
+  let Some((context, inode)) = names.first_beneath(from) else {
     return Reply::RenamedName(None);
   };
   let result = ledger
@@ -499,7 +511,7 @@ fn finish_context_effects(
 /// or a context that has not been checked against its generation.
 fn bind(op: Op<u64>, ledger: &Ledger<SparseObject>) -> Result<Op<Open>, crate::opens::Refusal> {
   Ok(match op {
-    Op::RenameName { after, from, to } => Op::RenameName { after, from, to },
+    Op::RenameName { from, to } => Op::RenameName { from, to },
     Op::Confirm { context } => Op::Confirm { context },
     Op::VolumeInfo => Op::VolumeInfo,
     Op::Resolve { path } => Op::Resolve { path },
@@ -911,6 +923,14 @@ impl Handler {
 }
 
 fn call_on(requests: &SyncSender<Request>, wake: &Waker, op: Op<u64>) -> Reply {
+  let hop_started = std::time::Instant::now();
+  let hop_name = crate::phase::op_name(&op);
+  let answered = call_on_inner(requests, wake, op);
+  crate::phase::note(hop_name, 1, hop_started);
+  answered
+}
+
+fn call_on_inner(requests: &SyncSender<Request>, wake: &Waker, op: Op<u64>) -> Reply {
   let (reply, answer) = sync_channel(1);
   if requests
     .send(Request {
@@ -952,21 +972,22 @@ pub(crate) fn rename_open_names(
   to: &str,
   bound: usize,
 ) -> Result<(), WinFspError> {
-  let mut after = None;
+  // A rename onto itself moves no open, so no open would ever stop being beneath `from`.
+  if from == to {
+    return Ok(());
+  }
+  let mut previous = None;
   for _ in 0..=bound {
     match call_on(
       requests,
       wake,
       Op::RenameName {
-        after,
         from: from.to_owned(),
         to: to.to_owned(),
       },
     ) {
       Reply::RenamedName(None) => return Ok(()),
-      Reply::RenamedName(Some(context)) if after.is_none_or(|previous| previous < context) => {
-        after = Some(context)
-      }
+      Reply::RenamedName(Some(context)) if previous != Some(context) => previous = Some(context),
       Reply::Err(status) => {
         return Err(WinFspError::Api {
           call: "record kernel rename",

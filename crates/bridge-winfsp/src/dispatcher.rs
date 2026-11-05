@@ -4,7 +4,7 @@
 //! request. WinFsp v2.1 sys/volume.c, sys/ioq.c and dll/fs.c define this order; the live taken-read oracle checks it.
 
 use std::cell::{Cell, RefCell};
-use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle};
+use std::os::windows::io::{AsRawHandle, BorrowedHandle, OwnedHandle};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::thread::JoinHandle;
 
@@ -13,7 +13,6 @@ use windows_sys::Win32::System::IO::{DeviceIoControl, GetOverlappedResult, OVERL
 use windows_sys::Win32::System::Memory::{
   FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
 };
-use windows_sys::Win32::System::Threading::CreateEventW;
 
 use crate::ffi::FileSystem;
 use crate::host::WinFspError;
@@ -161,6 +160,7 @@ impl Worker {
           }
           wake.wake_by_ref();
         }
+        crate::phase::dump();
         Ok(())
       })
       .map_err(|_| WinFspError::MountThread)?;
@@ -242,7 +242,7 @@ impl Drop for CaptureView {
   }
 }
 
-/// One Win32 transaction, including completion if the direct request pends. All borrowed buffers and the event remain
+/// One Win32 transaction, including completion if the direct request pends. All borrowed buffers and the worker's completion event remain
 /// owned until GetOverlappedResult settles it. The finite transaction wait lets an idle receiver return and observe
 /// cancellation without stopping the held volume. The mount owner joins before deleting its own file system.
 fn transaction(
@@ -252,21 +252,17 @@ fn transaction(
   output: &mut [u8],
   intents: &mut crate::purge_intents::Intents,
 ) -> Result<usize, WinFspError> {
-  // SAFETY: unnamed manual-reset event; no security descriptor or initial owner is borrowed.
-  let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
-  if event.is_null() {
-    return Err(os_error("create transaction completion event"));
-  }
-  // SAFETY: CreateEventW returned a fresh handle; this value takes its ownership exactly once.
-  let event = unsafe { OwnedHandle::from_raw_handle(event) };
+  let event_started = std::time::Instant::now();
+  let is_response = output.is_empty();
   let mut overlapped = OVERLAPPED {
-    hEvent: event.as_raw_handle(),
+    hEvent: intents.completion_event(),
     ..OVERLAPPED::default()
   };
   let mut done = 0;
   let input_len = u32::try_from(input.len()).map_err(|_| WinFspError::Capture(Refusal::Length))?;
   let output_len =
     u32::try_from(output.len()).map_err(|_| WinFspError::Capture(Refusal::Length))?;
+  let call_started = std::time::Instant::now();
   // SAFETY: all buffers and overlapped storage remain alive and unmoved until the transaction has completed below;
   // the control belongs to the live DLL object, which cannot be deleted before this worker is joined.
   let accepted = unsafe {
@@ -289,6 +285,7 @@ fn transaction(
       &mut overlapped,
     )
   };
+  crate::phase::note(if accepted != 0 { if is_response { "dioc_resp_done" } else { "dioc_recv_done" } } else if is_response { "dioc_resp_pending" } else { "dioc_recv_pending" }, 0, call_started);
   if accepted == 0 {
     let error = std::io::Error::last_os_error();
     if error.raw_os_error() != i32::try_from(ERROR_IO_PENDING).ok() {
@@ -297,7 +294,7 @@ fn transaction(
         code: error.raw_os_error(),
       });
     }
-    let progress = intents.wait(event.as_handle());
+    let progress = intents.wait();
     // SAFETY: this is the same outstanding overlapped I/O, with all its buffers and event still owned. Waiting settles
     // the request before any return can free them; an idle receive has the volume's finite transaction wait.
     if unsafe { GetOverlappedResult(control, &overlapped, &mut done, 1) } == 0 {
@@ -321,6 +318,7 @@ fn operation(
   packet: &mut Packet,
   private: &mut PrivateOpens,
 ) -> Result<usize, WinFspError> {
+  let clear_started = std::time::Instant::now();
   let mut working = Packet([0; RESPONSE_MAX]);
   working
     .0
@@ -328,6 +326,7 @@ fn operation(
     .ok_or(WinFspError::Capture(Refusal::Length))?
     .copy_from_slice(request.bytes());
   packet.0.fill(0);
+  crate::phase::note("packet_clear", 0, clear_started);
   let header = request.cancelled_response().map_err(WinFspError::Capture)?;
   packet
     .0
@@ -359,6 +358,7 @@ fn operation(
   };
   PRIVATE_PURGE.set(purge);
   CURRENT_HINT.set(request.hint());
+  let callback_started = std::time::Instant::now();
   // SAFETY: callback is the DLL's initialized operation for this checked kind; both packet addresses have native
   // eight-byte alignment and protocol maximum capacity, and file_system stays live throughout the synchronous call.
   let callback_status = unsafe {
@@ -368,6 +368,7 @@ fn operation(
       packet.0.as_mut_ptr().cast(),
     )
   };
+  crate::phase::note("callback", request.kind(), callback_started);
   let terminal_status = TERMINAL_REFUSAL.replace(0);
   let status = if callback_status == 0 {
     terminal_status
@@ -492,7 +493,9 @@ fn settle(
       if let Some((_, context)) =
         inflight::opened_context(response).map_err(WinFspError::Capture)?
       {
+        let confirm_started = std::time::Instant::now();
         crate::host::confirm_open(confirmations, wake, context)?;
+        crate::phase::note("confirm", 0, confirm_started);
       }
     }
     batch
@@ -570,12 +573,16 @@ fn receive_loop(
   }
   // SAFETY: the mount owner cannot delete this DLL object until the receive thread is joined.
   let control = unsafe { (*file_system).volume_handle };
+  // What this owner's last batch filled; its first receive clears the whole buffer.
+  let mut used = None;
   loop {
     if is_stopped(&stopped) {
       return Ok(());
     }
-    let mut receiving = view.capture()?.begin().map_err(WinFspError::Capture)?;
-    transaction(
+    let begin_started = std::time::Instant::now();
+    let mut receiving = view.capture()?.begin(used).map_err(WinFspError::Capture)?;
+    crate::phase::note("begin_clear", 0, begin_started);
+    let reported = transaction(
       control,
       TRANSACT_BATCH,
       &[],
@@ -586,8 +593,13 @@ fn receive_loop(
     if is_stopped(&stopped) {
       return Ok(());
     }
-    let mut batch = receiving.received().map_err(WinFspError::Capture)?;
-    settle(
+    crate::phase::note("batch_frames", u32::try_from(reported / 4096).unwrap_or(99), begin_started);
+    let parse_started = std::time::Instant::now();
+    used = Some(inflight::capture::filled(reported).map_err(WinFspError::Capture)?);
+    let mut batch = receiving.received(reported).map_err(WinFspError::Capture)?;
+    crate::phase::note("parse", 0, parse_started);
+    let settle_started = std::time::Instant::now();
+    let settled = settle(
       file_system,
       &mut batch,
       false,
@@ -596,6 +608,7 @@ fn receive_loop(
       &mut private,
       bound,
     )?;
+    crate::phase::note("settle_batch", u32::try_from(settled).unwrap_or(99), settle_started);
   }
 }
 
