@@ -110,6 +110,13 @@ pub const SUP_SEAL_ROOT: usize = 136;
 pub const SEAL_ROOT_ID_BYTES: usize = 16;
 /// Format: the sealing root key's width (AES-256).
 pub const SEAL_ROOT_KEY_BYTES: usize = 32;
+/// The anchor's **hold refusals** word (A-213): every message the anchor's hold channel refused over its life (the Unix
+/// device hold's and the Windows hold's), which the anchor writes when the count moves and the daemon reports as
+/// `anchor_hold_refusals` in `slates status`. The anchor's log says each distinct refusal once, so past a kind's first
+/// line this count is where an operator sees the rest. Zero in a block an older anchor wrote.
+/// Format: the byte offset inside the supervision block, the first cache line past the sealing root's record
+/// (136 + 16 + 32 = 184, so 192), so it shares no line with the root or with the heartbeat.
+pub const SUP_HOLD_REFUSALS: usize = 192;
 
 /// Format: a published payload's words (the profile, a snapshot slot, a landing slot): the
 /// generation (odd while a writer is inside) then the length, then the bytes.

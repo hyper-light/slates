@@ -1,5 +1,21 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **The anchor's hold refusals: a bounded Unix log, and a count in `slates status` (2026-11-04, A-213; siblings of
+> audit step 3).** The Unix device hold logged a line per refused message, unbounded; it now logs each distinct refusal
+> once (`RefusalLog`, as the Windows hold does) and counts every one. Every refusal on either platform's hold channel
+> is published in the segment's supervision block and reported by `slates status` as `anchor_hold_refusals`. adacachy,
+> 2026-11-04: 20 bad device messages gave 20 counted and 20 log lines before the change, 20 and 2 after; through a real
+> supervisor over the real `slates daemon`, `slates status` says `anchor_hold_refusals: 20`. On CI's `ubuntu-latest` and
+> `macos-latest`, both tests fail on main's sources (20 log lines; no `anchor_hold_refusals` line; run 41984065875) and
+> pass with the fix (run 41984065750). Record: `docs/bugs/2026-11-04-the-unix-device-hold-logged-every-refusal.md`.
+> - **The Windows anchor wakes on its hold channel**, a read it keeps posted, and on its daemon's exit, where it parked up
+>   to 500 ms between looks at the channel (A-206's owed item). Five holds through the real supervisor under a 4 s pause:
+>   3,990 to 4,020 ms each before, on `windows-latest` and `windows-11-arm`, 3 runs each (run 41984349301); under 1 ms each
+>   after, 3 runs each (run 41985213489), with the 20-bad-message tests (0 anchor exits) green in the same runs. A WinFsp
+>   mount's median fell from 487 to 10.5 ms on x86_64 and from 445 to 15.8 ms on arm64, an unmount's from 505 to 15.7 ms
+>   and from 507 to 27.0 ms, 20 interleaved rounds per build (run 41985454044; BENCHMARKS, "What a WinFsp mount and unmount
+>   wait for the Windows anchor").
+
 > **The binary release lane (2026-11-04, A-210, Appendix B.2).** `release.yml` now builds `slates` natively for
 > seven targets: macOS arm64, Linux x86_64 and arm64 (glibc, and static musl), and Windows x86_64 and arm64 with the C
 > runtime linked statically. It runs each built binary on its own runner (`cargo run -p xtask --bin release -- smoke`: version,
@@ -56,8 +72,8 @@
 >   section, about 2.2 ms to make, 4,166,312 bytes of paged pool per mount. Record:
 >   `docs/bugs/2026-11-04-a-winfsp-open-past-1024-units-was-refused.md`.
 > - **Owed:** a live test of the rename a held name would outgrow (unit-tested only, `rename_fits`: the driver also limits
->   renames over open descendants, so a live case is not dependable). The Windows anchor parks up to 500 ms between looks at
->   the hold channel, where Unix wakes on it, so each mount and unmount can wait that long on a healthy anchor.
+>   renames over open descendants, so a live case is not dependable). The Windows anchor's 500 ms between looks at the
+>   hold channel is closed by A-213 (above).
 > - **Changed for everyone:** a detach of a WinFsp drive can now answer `TargetUnavailable`, and CI's WinFsp is pinned: a new
 >   minor version is refused until the receiver's layout is reviewed. Gates: Ubuntu job of 41978665514 (fmt, workspace
 >   clippy, `xtask check`, docs).
@@ -96,6 +112,15 @@
 > at f+1, AC-8.3's "live-shipped volumes report none", AC-8.9's credit backpressure) is unbuilt, as are `put_wal`
 > and the loss-window report; a head still waits up to the 100 ms record period before its commit starts.
 
+> **VFS plan step 14, Shards' WHP window's three edge cases (2026-11-05): done, patches with the owner's folder.** Six
+> real-guest tests and one fix for Shards' owner, in `docs/wip/shards-patches/` (never pushed to Shards; README there), and
+> PM M421 with them. A view shorter than its range and 64 KiB granules hold. Several vCPUs at a section's replace hold (0 stale,
+> 0 lost in 20,000 replaces, up to 158,573 faults run again at 8 vCPUs on jupiter, 47,708 at 4 on windows-2025). At a share's
+> own file followed they did not: 2 to 38 live accesses taken for the guest's a run on jupiter, 201 to 797 on windows-2025
+> (10 of 10), and 0 after the fix on both. slates refuses an ask no view can begin at (A-211). CI runs 41981896876 and
+> 41987826160, the second on the patches as delivered. Owed: the
+> owner's review.
+>
 > **Audit of 2dc9f3eb..98000d56 (2026-11-03): defects open, Step 9's evidence holds.** Nine commits made on
 > 2026-11-01 and 2026-11-02 were read line by line against this file's rules and Step 9's acceptance. Every CI run they
 > cite was read again: each shows what it is cited for, except one pair of timings A-198 gave the wrong way
@@ -124,8 +149,18 @@
 >   41977593496; the entry above).** It read `FileSystem.Version`, not the DLL's version (`FspVersion`). Also, an open whose
 >   path was longer than 1024 UTF-16 units was refused, because every open records its kernel name in the held ledger
 >   (`crates/bridge-winfsp/src/opens/names.rs`); now slates refuses no path the driver passes.
-> - **The receiver that replaced WinFsp's dispatcher is unmeasured.** It is one thread with a new event per control
->   transaction, where the DLL dispatcher ran two threads; BENCHMARKS has no entry for it.
+> - **The receiver that replaced WinFsp's dispatcher: measured, most of its regression fixed, a remainder open (A-212,
+>   2026-11-05).** Interleaved on CI's runners against `71cf09ac` (BENCHMARKS, "The WinFsp receiver against the DLL
+>   dispatcher", every run), it was worse beyond the spread (arm64 quiet p50: a stat 2.55×, a rename 2.90×, an fsync 1.74×;
+>   run 41973314087). Two causes were timed and fixed: a live receive scanned the whole 64 KiB batch tail (26.4 µs on arm64,
+>   50.1 µs on x86_64, run 41977769822), and a rename took a shard turn per live open (about 106). After (run 41989009852):
+>   arm64 a stat 1.50×, a rename 1.35×, an fsync 1.21×; x86_64 loaded a stat and an open 1.18–1.20×, its quiet runs overlapping. Some loaded tails are far
+>   better than the DLL's (x86_64 stat p99 114–133 ms against 0.51–0.60 ms). **Open:** it stays worse beyond the spread at
+>   the p50 by about 20 µs a request. The separate response call explains 11–13 µs, and removing it would change A-198's
+>   crash rule. Hops for Open and Release about 2× and for SetSize about 4× under load on arm64 are measured and not explained
+>   (a longer shard spin did not change them, run 41989038309); that SetSize hop is an arm64 write under load at 2.09×. Also:
+>   under two spinners a core on a 4-vCPU x86_64 VM the anchor killed both daemons for a late heartbeat in run 3 of all
+>   three jobs that reached it.
 > - **Two failures recorded open below**: the wake-learning case under load (fixed 2026-11-04, A-199) and the fleet
 >   routing Create reply (fixed 2026-11-04 in its fixture; a second, rarer failure of that history stays open).
 >

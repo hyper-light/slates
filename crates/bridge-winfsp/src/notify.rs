@@ -29,7 +29,7 @@
 //! `FSP_FSCTL_TRANSACT_PATH_SIZEMAX` (1024 units) does not limit an absolute name here: that kernel
 //! buffer holds only a name relative to the record before it, which this module never sends.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use slates_bridge_core::Invalidation;
 
@@ -77,6 +77,9 @@ pub const MAX_NOTIFY_UNITS: usize = ((u16::MAX as usize) - NOTIFY_INFO_HEAD) / s
 pub struct OpenNames {
   /// Open handle → (inode, path from the volume's root, `\`-separated, as WinFsp names it).
   by_handle: BTreeMap<u64, (u64, String)>,
+  /// The same names in order, each with its handle, so the opens at or beneath a path are found without walking the
+  /// rest (A-212).
+  by_name: BTreeSet<(String, u64)>,
 }
 
 impl OpenNames {
@@ -87,20 +90,29 @@ impl OpenNames {
 
   /// Handle `handle` was opened on inode `ino` by `path`.
   pub fn opened(&mut self, handle: u64, ino: u64, path: &str) {
-    self.by_handle.insert(handle, (ino, path.to_owned()));
+    if let Some((_, old)) = self.by_handle.insert(handle, (ino, path.to_owned())) {
+      self.by_name.remove(&(old, handle));
+    }
+    self.by_name.insert((path.to_owned(), handle));
   }
 
   /// Handle `handle` was closed: Windows no longer holds its node through it.
   pub fn closed(&mut self, handle: u64) {
-    self.by_handle.remove(&handle);
+    if let Some((_, old)) = self.by_handle.remove(&handle) {
+      self.by_name.remove(&(old, handle));
+    }
   }
 
   /// A rename through the mount moved `from` to `to`: WinFsp renames the open node `from` and every node beneath it, so
   /// the names Windows holds under the old path are now under the new.
   pub fn renamed(&mut self, from: &str, to: &str) {
-    for (_, path) in self.by_handle.values_mut() {
+    for (handle, (_, path)) in &mut self.by_handle {
       if let Some(rest) = beneath(path, from) {
-        *path = format!("{to}{rest}");
+        let moved = format!("{to}{rest}");
+        self
+          .by_name
+          .remove(&(std::mem::replace(path, moved.clone()), *handle));
+        self.by_name.insert((moved, *handle));
       }
     }
   }
@@ -130,15 +142,26 @@ impl OpenNames {
     self.by_handle.is_empty()
   }
 
-  /// One next live context for the receiver's cooperative durable rename. The owner changes one name per request
-  /// and returns its token as the cursor, so a directory rename never scans every open in a single shard turn.
-  pub fn next_open(&self, after: Option<u64>) -> Option<(u64, u64)> {
-    let bound = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
-    self
-      .by_handle
-      .range((bound, std::ops::Bound::Unbounded))
+  /// One open at or beneath `from`, for the receiver's cooperative durable rename: its context and inode. The owner
+  /// changes one name per request, after which that open is no longer beneath `from`, so the next request finds the
+  /// next; a repeat after a crash finds what is left. Opens under other names are never visited: a rename of one file
+  /// takes one shard turn and one more to learn it is done, however many opens the mount holds (A-212).
+  pub fn first_beneath(&self, from: &str) -> Option<(u64, u64)> {
+    let exact = self
+      .by_name
+      .range((from.to_owned(), 0)..)
       .next()
-      .map(|(context, (inode, _))| (*context, *inode))
+      .filter(|(name, _)| name == from);
+    // Between a name and its children sort its siblings (`\dir.txt` before `\dir\a`), so children have their own range.
+    let children = format!("{from}\\");
+    let child = self
+      .by_name
+      .range((children.clone(), 0)..)
+      .next()
+      .filter(|(name, _)| name.starts_with(&children));
+    let (_, context) = exact.or(child)?;
+    let (inode, _) = self.by_handle.get(context)?;
+    Some((*context, *inode))
   }
 
   /// Every distinct inode Windows holds open: what a round that fell behind the journal purges whole (`crate::purge`).
@@ -485,5 +508,58 @@ mod tests {
     assert_eq!(round.records(), 1);
     assert_eq!(round.too_long(), 0);
     assert_eq!(walk(round.bytes())[0].2, long);
+  }
+
+  /// A-212. Do: hold a thousand opens, rename one file, and ask for each open to update until none is left, moving each
+  /// as the receiver does. Expect: one answer, for the file renamed. Before A-212 a rename took a shard turn per live
+  /// open whatever its name: 741,896 turns over 7,000 renames, about 106 each (run 41977769822).
+  #[test]
+  fn a_rename_visits_only_the_opens_it_renames() {
+    let mut names = OpenNames::new();
+    for handle in 0..1000u64 {
+      names.opened(handle, handle, &format!("\\f{handle}"));
+    }
+    let mut visits = Vec::new();
+    for _ in 0..=names.len() {
+      let Some((context, inode)) = names.first_beneath("\\f500") else {
+        break;
+      };
+      visits.push(context);
+      names.opened(context, inode, "\\moved");
+    }
+    assert_eq!(visits, vec![500]);
+  }
+
+  /// A-212. Do: hold a directory's name, its children, an alias, and siblings that share its name as a string prefix or
+  /// sort between its name and its children. Expect: every open at or beneath it is visited, and no sibling.
+  #[test]
+  fn a_directory_rename_visits_everything_beneath_it_and_no_sibling() {
+    let mut names = OpenNames::new();
+    let held = [
+      (1, "\\dir"),
+      (2, "\\dir\\a"),
+      (3, "\\dir\\b\\c"),
+      (4, "\\dir"),
+      (5, "\\dir.txt"),
+      (6, "\\dir2"),
+      (7, "\\dir!"),
+      (8, "\\di"),
+    ];
+    for (handle, path) in held {
+      names.opened(handle, handle, path);
+    }
+    let mut visits = Vec::new();
+    for _ in 0..=names.len() {
+      let Some((context, inode)) = names.first_beneath("\\dir") else {
+        break;
+      };
+      visits.push(context);
+      names.opened(context, inode, &format!("\\moved{context}"));
+    }
+    visits.sort_unstable();
+    assert_eq!(visits, vec![1, 2, 3, 4]);
+    names.closed(5);
+    assert_eq!(names.first_beneath("\\dir.txt"), None);
+    assert_eq!(names.first_beneath("\\dir2"), Some((6, 6)));
   }
 }

@@ -2885,6 +2885,12 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 > left a drive held on each Windows lane, with the anchor stopped (run 41978665514). A DLL other than 2.1 is refused at
 > mount. Slates refuses no path the WinFsp driver passes: the driver refuses from 8,116 UTF-16 units, measured live on both
 > lanes, and the name reserve is derived from that limit.
+> **Status (2026-11-04, A-213).** Every refusal of the hold channel is published in the segment and shown by
+> `slates status` as `anchor_hold_refusals`, so a refusal past its kind's first log line is still seen; the Unix device
+> hold's log is bounded as the Windows hold's is.
+> The Windows anchor wakes on its hold channel's posted read and on the daemon's exit, where it parked up to 500 ms between
+> looks: five holds under a 4 s pause were answered in 3,990–4,020 ms before, on both CI lanes, and under 1 ms after
+> (runs 41984349301 and 41985213489).
 
 **Base reads on macOS and Windows.** As on Linux, the daemon reads untouched base files through its own descriptor or
 handle into evictable cache chunks (one copy, `pread`/`ReadFile` on the owner shard's driver) and
@@ -12840,6 +12846,58 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
 
+### A-211 — A DAX ask is refused where no view could begin (accepted and built 2026-11-04)
+Applied in the same change to: §4.6 by reference, `docs/wip/shards/dax-protocol.md` ("Windows"), GAPS,
+`crates/bridge-core/src/dax_backing.rs` (`DaxBackingSession::ask`), `crates/server/src/shards/dax.rs` (`MALFORMED`'s
+doc), `crates/client/tests/shards.rs`, `crates/server/tests/shards.rs`, `docs/wip/shards-patches/`.
+- **What was there.** An ask's range was checked against the object's end alone. So an offset that no view of a section can
+  begin at was committed, filled and handed, and the VMM's map then failed. Measured on jupiter (Windows 10.0.26200,
+  2026-11-04): an ask from offset 1 was answered with a section, `Ok(932)`.
+- **The rule.** A ranged ask's offset is a multiple of `Facts::allocation_granularity()`: 64 KiB on Windows, the page
+  elsewhere. Anything else is `Refused::Malformed` (`EINVAL`, counted `shards.dax_malformed`) before anything is made or
+  filled. One check on every platform; a Linux guest asks whole 2 MiB ranges, so it never meets the refusal.
+- **Proven.** `a_slice_is_handed_from_each_granule_and_refused_between_them` (`crates/client/tests/shards.rs`,
+  T-shards-windows-5.6) failed first as above. With the rule, each of a range's 32 granules is answered and a view placed
+  from it holds the file's bytes then zeros, and 4 offsets between granules are refused and counted; the suite 12 of 12 in
+  each of 3 runs on jupiter and once on windows-2025 (CI run 41981896876). `malformed_asks_are_refused` (`crates/server/tests/shards.rs`)
+  holds Unix's route to the same refusal: the suite passes on Ubuntu (22) and macOS (26), the same run.
+
+### A-213 — The anchor's hold refusals: a bounded log on every platform, and a count the operator reads in `slates status` (accepted 2026-11-04, siblings of audit step 3)
+Applied in the same change to: GAPS, A-198's status in §4.6, BENCHMARKS (the Windows wake's part), `unsafe-budget.toml`
+(anchor 10 → 14, the Windows wake's part), `crates/anchor` (`handles.rs` `RefusalLog` generic, `held_windows.rs` the
+posted read, `supervise_windows.rs` and `supervise.rs` the Windows wait,
+`supervise.rs` the device hold's log and the published count, `layout.rs` and `segment.rs` the new supervision word),
+`crates/ipc` (`DaemonReport::anchor_hold_refusals`, appended), `crates/server` (`verbs.rs`, the daemon report),
+`crates/cli` (`slates status`'s line; `anchor.rs` the Windows loop's wait; `examples/hold_latency_ab.rs`), `crates/mcp`
+(the daemon status JSON). Bug record:
+`docs/bugs/2026-11-04-the-unix-device-hold-logged-every-refusal.md`.
+- **The Unix device hold's log is bounded.** A-61's hold counted each refused device message and logged a line for each.
+  It now logs through the same `RefusalLog` as A-198's Windows hold: each distinct refusal once over the anchor's life,
+  in a table of 64, every refusal counted. Logging on a change of kind was rejected for the Windows hold on a
+  measurement (two kinds alternating log a line a message), and the reason holds here.
+- **The count reaches the operator.** With the log saying each kind once, the count is the only record of the rest. The
+  anchor has no surface of its own: an operator asks the daemon (`slates status`), and the daemon knows its anchor
+  through the segment's supervision block. So the block gains one word, `SUP_HOLD_REFUSALS`, at offset 192, the first
+  cache line past the sealing root. The supervisor writes every refusal its hold channel has counted (the Unix device
+  hold's, or the Windows hold's channel and holdings) there in each step, when the count has moved. The daemon copies it
+  into its status report as `anchor_hold_refusals`, which `slates status`, its `--json` and the MCP daemon status print.
+  A block an older anchor wrote holds zero there.
+- **Rejected:** a status surface on the anchor itself (a second rendezvous and a second protocol for one number), and the
+  daemon counting refusals it caused (it cannot see what the anchor refused).
+- **The Windows anchor wakes on its hold channel (2026-11-04, the sibling of A-206's record).** The Windows loop parked
+  between supervision steps, up to half the liveness budget (500 ms), and looked at the channel only then, so each WinFsp
+  mount's hold and each unmount's release waited up to that long on a healthy anchor; the Unix loop polls its channel.
+  The anchor's end now keeps one read posted (`held_windows::ReadingEnd`): the drain takes messages through it, and
+  `Supervisor::await_work` waits on its event and on the daemon's process handle together, with the step's pause as the
+  timeout, so a hold is answered when it arrives and a daemon's exit is seen when it happens. The read lives in a box of
+  its own, its `OVERLAPPED` and buffer fixed in place while the kernel may write them, and the end's drop cancels it and
+  waits for it to settle; a successor's new channel drops the old end that way, and with it an unread message, as before.
+  While a reply waits for the daemon to read its last one, the loop waits out its step instead: a message already taken
+  behind it would signal at once, and a daemon that never reads could spin the anchor. Held by
+  `a_hold_is_answered_at_its_channels_wake_not_at_the_supervisors_pause` (`crates/anchor/tests/handles_windows.rs`):
+  five holds through the real supervisor under a 4 s pause. Measured in BENCHMARKS ("What a WinFsp mount and unmount wait
+  for the Windows anchor").
+
 ### A-210 — The binary release: seven native targets, each smoke-tested where it was built, attached with checksums and keyless provenance to a draft (accepted 2026-11-04)
 Applied in the same change to: Appendix B.2 (body and status), Phase 9 task 5's status, GAPS (the release row and
 "The Windows binary needs the Visual C++ runtime"), `docs/publish.md`, `.github/workflows/release.yml`,
@@ -13010,6 +13068,45 @@ Status: built 2026-11-04. It closes the Windows owed items of A-105, A-110 and A
   leaked the handle. It did not: `view` closed it. 200 refused adoptions moved the handle count by 0 on unchanged code,
   and by 200 with that close removed (`crates/mem/tests/held_section.rs`). The adoption now maps first and takes
   ownership only of a view that exists, so `view` no longer closes what it was lent.
+
+### A-212 — What a live WinFsp receive reads and clears, and what a rename visits (2026-11-05)
+
+A-198's receiver replaced WinFsp's DLL dispatcher with no benchmark. Measured against it (`docs/wip/BENCHMARKS.md`, "The
+WinFsp receiver against the DLL dispatcher"), every call that reached the daemon cost more: on arm64 a stat 2.55×, a
+rename 2.90×, an fsync 1.74× at the quiet p50, the arms' five runs not overlapping. Each phase of a request was timed on
+both architectures (diagnostics run 41977769822). The ledger's own work costs at most about 1.5 µs of service a request.
+The largest costs were two things A-198's first form did that its crash rules do not need:
+
+- **Every live receive read and cleared the whole buffer.** The batch parser checked each byte of the 64 KiB tail, 26.4 µs
+  at the p50 on arm64 and 50.1 µs on x86_64, per receive. The driver reports how many bytes it wrote, and everything past
+  them was zeroed before the receive began. So a live receive reads only the reported bytes. **Recovery still checks the
+  whole buffer**: it knows no count, and it is what the tail's rule protects. Clearing follows the same reasoning: an
+  owner's first receive clears the whole buffer, since a predecessor may have died part-way; afterwards only the bytes the
+  last batch filled are cleared, so the whole-buffer check still finds zeros after a crash. Of the saved response only the
+  header is cleared: its state word says whether a body exists, and no reader passes a body's own length.
+- **Every rename visited every live open.** Before the kernel may rename its node, each open's held name is updated, one
+  per shard turn: 741,896 turns over 7,000 renames on arm64, about 106 each, for opens under other names that a rename
+  cannot change. `OpenNames` now also keeps its names in order, so the first open at or beneath a path is found without a
+  walk and no constant bounds a scan. Updating an open moves it out from beneath the old path, so the next turn finds the
+  next, and a repeat after a crash finds what is left. A rename of one file takes one turn for its open and one to learn
+  it is done, however many opens the mount holds. A rename onto itself moves nothing and returns at once.
+
+Each worker also reuses one completion event: control transactions run one at a time, and creating and closing an event
+for each cost 0.9 µs at the p50 twice a request.
+
+**Not changed: a response and the next receive stay two calls.** The DLL carried both in one call. A-198 keeps them apart
+so that captured requests settle before any new receive, which is what stops a reused IRP address naming another
+processing request after a death. The separate response call costs 10.9 µs at the p50 on arm64 and 12.5 µs on x86_64;
+removing it means changing that crash rule, which this amendment does not do.
+
+**Result (2026-11-05, five interleaved runs on both Windows runners, run 41989009852).** Most of the regression is gone (arm64
+quiet p50: a stat 1.50×, a rename 1.35×, an fsync 1.21×), but the receiver stays worse beyond the spread at the p50, by about
+20 µs a request, on both architectures. Open: that remainder, of which the response call explains 11–13 µs; hops for Open and
+Release about 2× the DLL arm's on arm64, and SetSize about 4× under load, which accounts for an arm64 write under load at
+2.09×. A longer shard spin did not change them (run 41989038309), and they are not explained.
+
+Applied in the same change to: GAPS (the audit entry's unmeasured-receiver item); `crates/bridge-winfsp/src/dispatcher.rs`,
+`inflight/capture.rs`, `purge_intents.rs`, `notify.rs` and `host.rs`.
 
 ### A-198 — A WinFsp mount outlives its daemon: the anchor holds the volume's control handle, the drive's link and the mount's ledger, and the next daemon serves the held volume (accepted 2026-11-01, Step 9 of the VFS and DAX plan; built and measured 2026-11-02)
 Applied in the same change to: GAPS (gap 2 of the platform inventory). The build applies it to §4.6 "Windows",
