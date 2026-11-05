@@ -515,9 +515,11 @@ pub struct ShardState {
   /// Daemon status requests in flight: by request word, the client slot, the shards still
   /// to answer, and the parts so far.
   pub status_scatters: BTreeMap<u64, (u32, usize, Vec<slates_ipc::protocol::ShardReport>)>,
-  /// Acknowledgements in flight: by request word, the client slot, the shards still to
-  /// answer, and the reply so far.
-  pub ack_scatters: BTreeMap<u64, (u32, usize, ReplyBody)>,
+  /// Acknowledgements whose other shards' releases are still out (A-216): by request word, the shards still to
+  /// answer. The acknowledgement itself was answered when this shard released; an entry goes when its last part is
+  /// back. Bounded by [`crate::verbs::ack_scatter_bound`]: past it the other shards' parts are not sent, and are
+  /// counted refused and left to the next watermark.
+  pub ack_scatters: BTreeMap<u64, usize>,
   /// When this shard last did work for a client (served, forwarded, or ran a forwarded verb);
   /// the server loop polls for the idle window past it before parking (§4.7).
   pub last_work_ns: u64,

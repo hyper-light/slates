@@ -5525,6 +5525,26 @@ provisioning is therefore safe to retry after any failure.
 > unretried, which holds its acknowledgement back; it retries that id first. Regression
 > `a_client_that_never_acknowledges_is_refused_at_its_bound_and_served_once_it_acknowledges`.
 
+> **Status (2026-11-05, A-216: an acknowledgement is answered once its own shard has released).** An `Acknowledge
+> { up_to }` releases the client's records at or below `up_to` on every partition that may hold them. Its reply now
+> promises one thing: the client's own shard has released them. The other shards' releases run as tasks the shard
+> tracks (`ShardState::ack_scatters`, one entry per acknowledgement until every part is back). A part refused, or
+> never sent because its shard's control channel was full, is counted (`ack.release_refused`, in `slates status`).
+> It is retried by the next acknowledgement, whose watermark covers it. Before A-216 the reply waited for every
+> shard. So one sync call in every half-ring paid the slowest shard's turn, and a shard held past the reply deadline
+> failed it `Stalled`.
+>
+> Why exactly-once holds. A lagging release concerns only records at or below `up_to`. Every new request carries a
+> sequence above it, since a client's sequences only grow, never wrap (`LAST_SEQUENCE`, AUD-29-21), and a new
+> client never takes an id another has used (the listener assigns above every id any shard retains,
+> `restore_client_ids`). So the only requests that can meet such a record are retries of ids already answered, and
+> meeting their record, or the acknowledged window once it is released, is what exactly-once asks. The bound still
+> holds: a release lagging on one shard is the "one lost acknowledgement" `2 × slots` already budgets for, and past
+> the bound a new request is refused `AcknowledgementOwed` as before. And a lagging release is never overtaken: a
+> client's later request to another shard is forwarded on that shard's control channel, the same channel and kind
+> of message as the release, sent by the client's own shard after it, so it queues behind the release. A request can
+> only find a release refused, which is counted.
+
 **Flow control.** Credit-based, absolute offsets per stream; windows derived from the measured
 bandwidth-delay product and the class's latency budget; the sender never exceeds credit; a
 stalled receiver stalls only its own class.
@@ -12882,6 +12902,26 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
 - **Arm64 Windows proven** since (2026-10-27): the direct-map client tests, 20 of 20, on CI's `windows-11-arm` (run
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
+
+### A-216 — An acknowledgement is answered once the client's own shard has released its records (accepted 2026-11-05)
+Applied in the same change to: §4.9 (its status), `crates/server/src/verbs.rs` (`scatter_acknowledge`,
+`gather_acknowledge`), `crates/server/src/state.rs` (`ack_scatters`), `Daemon::flood_control_channel_on` (test
+support), GAPS, `docs/bugs/2026-11-05-a-call-waited-for-its-acknowledgements-scatter.md`, and the tests named below.
+- **Why.** The synchronous client acknowledges every half-ring of replies before its next request and waits for the
+  reply. The daemon answered only after every shard had released the client's records, so the call that carried the
+  acknowledgement paid the slowest shard's turn. On macOS 133 of 2,000 single-client creates (6.7%) carried one,
+  median 2,497 µs against 169 µs, so they set the p99. Windows arm64's single-client p99 was 65.4 / 59.4 / 57.9 µs
+  with the wait, against 47.8 / 45.5 / 44.3 µs without it (diag run 42056768929). With another shard held for a
+  second, the call failed `Stalled`. Sending the acknowledgement unawaited instead (a6c3bc16) put two replies in
+  flight on the sync client and met a whole-daemon pause after client churn, so it was reverted. This keeps one
+  reply in flight.
+- **The rule.** The reply is sent once the client's own shard has released (or refused, which is the reply). The other
+  shards' parts run as tracked tasks; a refused or unsent part is counted `ack.release_refused` and is retried by the
+  next acknowledgement's watermark.
+- **Why exactly-once holds:** §4.9's status, proven by the tests below.
+- **What it does not change.** The bound (`2 × slots`), `AcknowledgementOwed`, the client's cadence and its watermark,
+  and an acknowledgement's own refusal on the client's shard, which is still its reply.
+- **Next lever (C, GAPS):** carry the watermark in every request, so no separate acknowledgement is needed at all.
 
 ### A-209 — Windows conformance is WinFsp's own two suites over the slates drive in both Windows lanes, with a reviewed list and stated differences; the POSIX suites run on arm64 Linux (accepted 2026-11-05, Step 10 of the VFS and DAX plan)
 Applied in the same change to: Part 6 ("Conformance"), §4.6 ("Windows" and its status), GAPS, `docs/wip/platforms.md`,

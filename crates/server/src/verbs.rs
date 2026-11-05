@@ -2710,11 +2710,35 @@ fn scatter_status(state: &mut ShardState, client_index: u32, request: u64) -> Se
   Served::Forwarded
 }
 
-/// An acknowledgement releases the client's records on every partition that may hold them
-/// (a forwarded verb's record lives at its owner): a scatter, gathered as a count.
+/// Format: the count of an acknowledgement's releases on other shards that were refused or never sent (A-216); each
+/// is taken over by the client's next acknowledgement, whose watermark covers it. Shown in `slates status`.
+pub(crate) const ACK_RELEASE_REFUSED: &str = "ack.release_refused";
+
+/// The acknowledgements a shard tracks at once (A-216): one ring of requests for each client it can serve, the most
+/// that can be in flight from them. Derived: `clients_per_shard × slots`, the bound the forwarded spans keep
+/// (`remember_forwarded_ring`).
+pub(crate) fn ack_scatter_bound(state: &ShardState) -> usize {
+  derived!(
+    state
+      .config
+      .clients_per_shard
+      .saturating_mul(usize::try_from(state.config.region.slots).unwrap_or(1)),
+    "clients_per_shard × slots",
+    ["clients_per_shard", "region.slots"]
+  )
+  .get()
+}
+
+/// An acknowledgement releases the client's records on every partition that may hold them (a forwarded verb's
+/// record lives at its owner), and is answered once this shard, the client's own, has released (A-216, §4.9): the
+/// other shards' releases run as tasks tracked in [`ShardState::ack_scatters`] until each is back. A release refused
+/// there, or never sent, is counted ([`ACK_RELEASE_REFUSED`]) and taken over by the next acknowledgement. This
+/// shard's window advanced first, and every request passes it first, so a retry at or below `up_to` is answered here
+/// whatever another shard still holds; and a later request to another shard queues behind its release on that
+/// shard's control channel.
 fn scatter_acknowledge(
   state: &mut ShardState,
-  client_index: u32,
+  _client_index: u32,
   request: u64,
   client_id: u32,
   up_to: u32,
@@ -2726,12 +2750,16 @@ fn scatter_acknowledge(
     .filter(|s| *s != state.shard)
     .collect();
   let mine = acknowledge(state, client_id, up_to);
-  if others.is_empty() {
+  // A refusal here is the reply, and nothing was released: the next acknowledgement asks again.
+  if others.is_empty() || matches!(mine, ReplyBody::Refused { .. }) {
     return Served::Reply(mine);
   }
-  state
-    .ack_scatters
-    .insert(request, (client_index, others.len(), mine));
+  if state.ack_scatters.len() >= ack_scatter_bound(state) {
+    let unsent = u64::try_from(others.len()).unwrap_or(u64::MAX);
+    state.count(ACK_RELEASE_REFUSED, unsent);
+    return Served::Reply(mine);
+  }
+  state.ack_scatters.insert(request, others.len());
   let origin = state.shard;
   for shard in others {
     let task = SpawnRequest::new(
@@ -2740,7 +2768,7 @@ fn scatter_acknowledge(
           .unwrap_or_else(|| refused(Refusal::NotFound));
         let back = SpawnRequest::new(
           Box::pin(async move {
-            gather_acknowledge(request, part);
+            crate::state::with_state_counted(|s| release_part_back(s, request, &part));
           }),
           None,
         );
@@ -2749,30 +2777,28 @@ fn scatter_acknowledge(
       None,
     );
     if slates_rt::registry::send_control(shard, Control::Spawn(Box::new(task))).is_err() {
-      gather_acknowledge(request, refused(Refusal::NotFound));
+      // Settled here, on the state this verb holds: a gather through another borrow would be refused and lose it.
+      release_part_back(state, request, &refused(Refusal::NotFound));
     }
   }
-  Served::Forwarded
+  Served::Reply(mine)
 }
 
-/// Gathers one shard's acknowledgement; the last delivers the reply (a refusal anywhere
-/// is the reply, so the client knows records may remain).
-fn gather_acknowledge(request: u64, part: ReplyBody) {
-  let done = crate::state::with_state(|s| {
-    let entry = s.ack_scatters.get_mut(&request)?;
-    if matches!(part, ReplyBody::Refused { .. }) {
-      entry.2 = part;
+/// One other shard's release of an acknowledgement is back (A-216): a refusal is counted, and the entry goes with its
+/// last part.
+fn release_part_back(state: &mut ShardState, request: u64, part: &ReplyBody) {
+  if matches!(part, ReplyBody::Refused { .. }) {
+    state.count(ACK_RELEASE_REFUSED, 1);
+  }
+  let done = match state.ack_scatters.get_mut(&request) {
+    Some(left) => {
+      *left = left.saturating_sub(1);
+      *left == 0
     }
-    entry.1 = entry.1.saturating_sub(1);
-    if entry.1 == 0 {
-      s.ack_scatters.remove(&request)
-    } else {
-      None
-    }
-  })
-  .flatten();
-  if let Some((client_index, _, reply)) = done {
-    crate::state::deliver(client_index, request, reply, false);
+    None => false,
+  };
+  if done {
+    state.ack_scatters.remove(&request);
   }
 }
 
