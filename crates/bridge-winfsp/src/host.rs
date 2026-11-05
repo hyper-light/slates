@@ -974,9 +974,27 @@ fn call_on(requests: &SyncSender<Request>, wake: &Waker, op: Op<u64>) -> Reply {
   }
   wake.wake_by_ref();
   crate::phase::note(name, crate::phase::SEND_AND_WAKE, hop_started);
-  let answered = answer
-    .recv()
-    .unwrap_or(Reply::Err(crate::status_unsuccessful()));
+  // DIAG: wait for the reply spinning a short while before parking, to see whether the park is what a hop pays.
+  let spin_started = std::time::Instant::now();
+  let mut spun = None;
+  while spin_started.elapsed() < std::time::Duration::from_micros(20) {
+    match answer.try_recv() {
+      Ok(reply) => {
+        spun = Some(reply);
+        break;
+      }
+      Err(TryRecvError::Disconnected) => {
+        spun = Some(Reply::Err(crate::status_unsuccessful()));
+        break;
+      }
+      Err(TryRecvError::Empty) => std::hint::spin_loop(),
+    }
+  }
+  let answered = spun.unwrap_or_else(|| {
+    answer
+      .recv()
+      .unwrap_or(Reply::Err(crate::status_unsuccessful()))
+  });
   crate::phase::reply_woke(name);
   crate::phase::note(name, crate::phase::HOP, hop_started);
   answered

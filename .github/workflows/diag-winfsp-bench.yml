@@ -1,4 +1,4 @@
-name: DIAG each stage of a shard hop, both arms, arm64, quiet and loaded apart (not for main)
+name: DIAG a short spin on the reply against none, both arms the same receiver, arm64 (not for main)
 
 # Audit plan step 7: slates at 71cf09ac (WinFsp's DLL dispatcher, two threads) and this commit (the hand-written
 # receiver), each with its own daemon and drive, one mount_bench rounding over both. Each runner's output goes to its
@@ -13,7 +13,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: never
-  OLD_COMMIT: 541dcd804a8338c203f0d0648339df3cbf12b246
+  OLD_COMMIT: 646c46ccd846d15237534b387cdf86f2a54c806e
 
 jobs:
   ab:
@@ -98,7 +98,7 @@ jobs:
             for pass in quiet contended; do
               echo "#### pass $pass"
               PASS=$pass OLD_SLATES=ab-bin/old/slates.exe NEW_SLATES=ab-bin/new/slates.exe BENCH=ab-bin/mount_bench.exe \
-                OLD_NAME=dll NEW_NAME=receiver RUNS=1 ROUNDS=3 SPINNERS_PER_CPU=2 AFTER_RUN="$RUNNER_TEMP/publish.sh" \
+                OLD_NAME=parks NEW_NAME=spins RUNS=1 ROUNDS=3 SPINNERS_PER_CPU=2 AFTER_RUN="$RUNNER_TEMP/publish.sh" \
                 bash docs/wip/bench/fsbench/windows-ab.sh
             done
           } 2>&1 | tee ab.txt
