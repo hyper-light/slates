@@ -12825,6 +12825,15 @@ and failed-then-passing oracles distinguish those results from the initial sourc
     the old six-site job-assignment implementation is replaced by IPC's existing creation-time job attribute).
   - The live WinFsp hold is now wired (Step 9.3 below). The transport tests alone establish no live-mount,
     in-flight-request or second-daemon criterion.
+- **What a daemon sends never ends supervision (2026-11-05, audit step 3).** A message the hold channel refuses, or a
+  reply it cannot write, is counted in `Supervisor::handle_refusals` and dropped, and the holdings are untouched, as the
+  Unix device hold counts its refusals. `Supervisor::step` can no longer fail on the channel. A message of no bytes is a
+  short message, not "nothing waited"; a long one is malformed, and its remainder is refused too. The log says each
+  distinct refusal once (`handles::RefusalLog`, a table of 64), since logging on a change of kind still grows without
+  bound when two kinds alternate. Held by `crates/anchor/tests/handles_windows.rs`: 20 bad messages between two real
+  holds give 0 anchor exits, 20 refusals, 2 log lines and both holds inherited live, on CI's Windows x86_64 and arm64
+  (run 41976042550; red on the old sources in run 41974533851). A live drive is not sent bad messages, since only the
+  daemon reaches the channel. Record: `docs/bugs/2026-11-03-one-malformed-hold-message-ended-the-windows-anchor.md`.
 - **Live mount wiring (2026-11-02, Step 9.3).** The server awaits the anchor's `Held` before committing a WinFsp
   attachment, and its normal detach awaits `Released` before deleting the file system. The mount owns its temporary
   DOS link directly. A successor retains a matching attachment, substitutes the inherited control handle and volume

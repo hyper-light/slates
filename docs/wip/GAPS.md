@@ -1,5 +1,11 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **`cargo xtask` does not compile on Windows (2026-11-04, tooling).** On jupiter, `cargo +1.98.1 xtask check` stops
+> with 12 errors in `xtask/src`: `std::os::unix` and `Permissions::mode` in `conformance/workloads.rs`,
+> `std::os::unix` and `Permissions::from_mode` in `kind_export.rs`, and `rustix` in `conformance/hermeticity.rs`. So
+> no structural, literal or unsafe-budget check runs on a Windows machine; a Windows change takes those gates on
+> Linux or macOS, through CI or another machine. Open; no fix attempted.
+
 > **Audit of 2dc9f3eb..98000d56 (2026-11-03): defects open, Step 9's evidence holds.** Nine commits made on
 > 2026-11-01 and 2026-11-02 were read line by line against this file's rules and Step 9's acceptance. Every CI run they
 > cite was read again: each shows what it is cited for, except one pair of timings A-198 gave the wrong way
@@ -12,9 +18,14 @@
 >   never moved, nor one whose stop awaits its chain. Three tests fail on the old seam and pass after; main CI's live
 >   QEMU lane passes (41732529738). Owed: an in-place reset, so a rebooted guest keeps its device.
 >   Record: `docs/bugs/2026-11-03-a-restarted-vhost-ring-was-served-from-its-old-layout.md`.
-> - **The Windows anchor ends on one malformed or short hold message (A-198).** The refusal propagates out of
->   `Supervisor::step` and ends the anchor, whose kill-on-close job then takes every held drive. Unix counts such
->   refusals.
+> - **The Windows anchor ended on one malformed or short hold message (A-198): fixed 2026-11-05.** A refusal propagated
+>   out of `Supervisor::step` and ended the anchor, whose kill-on-close job then took every held drive. Now it is
+>   counted and supervision goes on: 0 anchor exits from 20 bad messages, 20 refusals counted, both holds kept and
+>   inherited live, 3 runs each on CI's Windows x86_64 and arm64 (run 41976042550); red on main's sources in run
+>   41974533851. The log says each distinct refusal once. A live drive is not sent bad messages, since only the daemon
+>   reaches the channel; the live lane passes over the changed drain. Open: the Unix device hold still logs per refusal,
+>   and nothing outside the tests reads the refusal count.
+>   Record: `docs/bugs/2026-11-03-one-malformed-hold-message-ended-the-windows-anchor.md`.
 > - **A refused hold release leaves a held drive (A-198).** The unmount deletes the file system after the release is
 >   refused, so the anchor keeps the volume and its drive letter with no daemon serving them
 >   (`crates/server/src/winfsp.rs`, `release_hold` and `reap`).
