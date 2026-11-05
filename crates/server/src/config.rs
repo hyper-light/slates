@@ -87,7 +87,7 @@ const FLEET_LOOPS_PER_SHARD: usize = FLEET_PLANES * 2 + 1;
 /// keeps polling this long after its last work, so a client that pauses to think between
 /// requests finds it awake; ratified in GAPS §5 until the spin-to-park ratio is measured
 /// against the histogram's parked form.
-pub const IDLE_WINDOW_RATIO: u64 = 100;
+pub const IDLE_WINDOW_RATIO: u64 = 1;
 /// The divisor between a shard's metadata class and one slab dimension's units. The class is split
 /// among the inode dimension (a version slot and a table slot per inode), the directory dimension
 /// (a node and a block per directory) and the volume records (journals and objects) — three parts
