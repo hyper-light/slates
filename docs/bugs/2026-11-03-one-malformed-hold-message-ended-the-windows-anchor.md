@@ -41,6 +41,10 @@ tests send only well-formed messages.
   short message.
 - A message longer than a hold message is malformed, not an OS refusal (`ERROR_MORE_DATA`, error 234). The pipe keeps its
   remainder, which the next read refuses as a short message, so one such message counts two refusals.
+- The log is bounded. The draft of this fix logged every refusal, so a read the OS kept refusing wrote a line per
+  supervision step for the anchor's life. `RefusalLog` (`crates/anchor/src/handles.rs`) now logs each distinct refusal
+  once, in a table of 64; every refusal is still counted. Logging on a change of kind was rejected on a measurement: a
+  child alternating two kinds logged 20 lines for 20 messages, and the unit test 1,000 for 1,000.
 
 ## Failing test first
 
@@ -53,6 +57,10 @@ tests send only well-formed messages.
 - `an_oversized_hold_message_is_refused_and_counted_and_supervision_goes_on`: the same with one message half as long
   again as a hold message; exactly 2 refusals.
 - `a_read_tells_no_message_from_a_message_of_no_bytes_and_refuses_a_long_one`: the channel's reads over the real pipe.
+- `every_refusal_is_counted_and_the_log_says_each_kind_once`: the anchor as a process of its own, whose log the test
+  reads, over 20 bad messages in two runs and then taking turns: 20 counted and 2 lines both times.
+- `a_refusal_is_logged_once_and_the_lines_stay_bounded` (`handles.rs`): 1,000 repeats of one OS refusal log 1 line, two
+  kinds alternating 1,000 times log 2, and 128 distinct kinds log 64.
 
 The supervisor here is the real state machine in the test's process and the daemon is a real child process. A failing
 `step` is what ends the anchor: `crates/cli/src/anchor.rs` returns on it.
@@ -66,14 +74,21 @@ Command: `cargo +1.98.1 test -p slates-anchor --test handles_windows -- --test-t
 | `crates/anchor/src` of `76b450a1` with the new tests | jupiter, Windows x86_64 | 3 of 6 fail: "a bad hold message ended supervision: anchor hold: malformed hold message: a short read of a hold message"; the oversized test with "ReadFile of a hold message refused: error 234"; the read test with "no bytes: Ok(None)" |
 | The same | CI run 41974533851, windows-latest and windows-11-arm, 3 runs each | the same 3 of 6 fail, with the same messages. Annotations show runs 1 and 2 whole on each lane; the 10-annotation cap cut off run 3's result line, and the step exited 1 |
 | The drain fix with the old `held_windows.rs` | jupiter, Windows x86_64 | 2 of 6 fail: 19 refusals counted of 20, and "no bytes: Ok(None)" |
-| The whole fix | jupiter, Windows x86_64, 3 runs of `-p slates-anchor` | 6 of 6 in `handles_windows` each run, 14 of 14 in `anchor`, 15 of 15 in the unit tests |
+| The whole fix, logging every refusal | jupiter, Windows x86_64 | 2 fail: the anchor process logs 20 lines, not 2; the unit test 1,000, not 1 |
+| The whole fix, logging on each change of kind | jupiter, Windows x86_64 | 2 fail: the anchor process logs 20 lines, not 2; the unit test 1,000, not 2 |
+| The whole fix | jupiter, Windows x86_64, 3 runs of `-p slates-anchor` | 7 of 7 in `handles_windows` each run, 14 of 14 in `anchor`, 16 of 16 in the unit tests |
+| The whole fix, logging every refusal | CI run 41976042399, windows-latest and windows-11-arm | both jobs fail; the windows-11-arm log shows the anchor process logging 20 lines, not 2. The windows-latest job's log was not read |
+| The whole fix (`fd56be35`) | CI run 41976042550 (`diag-step3-anchor-4`), windows-latest and windows-11-arm | both jobs pass: anchor clippy, 3 runs of `handles_windows`, the whole anchor crate, and the live WinFsp lane (`SLATES_TEST_CLI=1 WINFSP_TEST_MOUNT=1 cargo test -p slates-cli --test winfsp`). Read from the job results; the live lane's test count was not read |
+| The whole fix (`fd56be35`) | The same run, ubuntu-latest and macos-latest | both jobs pass: `cargo fmt --all --check`, `cargo xtask check`, anchor clippy and anchor docs |
 
-The whole fix on CI's two Windows lanes is owed: diagnostics branch `diag-step3-anchor-3` is running.
+So on both Windows architectures, 20 bad messages caused 0 anchor exits: each run's test requires every `step` to succeed
+and exactly 20 refusals, both holds kept and both inherited live. The 20 messages are asserted in that test, and 3 runs
+each make 60 of 60 per lane.
 
 Not shown: a live WinFsp drive receiving bad messages. The channel's daemon end reaches only the daemon, by an explicit
 handle list, and the real daemon sends only well-formed messages, so a live test would need a test-only way to make it
 garble, which the project's rules ban. What is shown is that the holdings are untouched by a refusal and the successor
-inherits them live. The live WinFsp lane over the changed drain is owed with the run above.
+inherits them live, and the live WinFsp lane passes over the changed drain with only well-formed messages.
 
 ## Siblings
 
@@ -81,7 +96,8 @@ inherits them live. The live WinFsp lane over the changed drain is owed with the
   typed mount refusal.
 - A hold whose reply is dropped leaves its daemon's mount refused typed; the holding itself, if applied, is released
   with the next successor's handoff or the anchor's exit.
-- A read the OS keeps refusing is counted and logged once per supervision step, as the Unix hold logs once per refusal.
-  Each drain's reads stay bounded; the log has no cap of its own on either platform. Not changed here; reported.
-- `cargo xtask check` does not compile on Windows (`std::os::unix` and `rustix` in `xtask/src`), so jupiter cannot run
-  that gate; the diagnostics run takes it on Linux and macOS. Not changed here; reported.
+- The Unix device hold (`DeviceHold::refuse` in `crates/anchor/src/supervise.rs`) still logs a line per refusal, the
+  unbounded log this change removes from the Windows hold. `RefusalLog` is cfg-free and could serve it; not changed here.
+- `Supervisor::handle_refusals` has no reader outside the tests, so past each kind's first log line a refusal shows only
+  in a count nothing prints. Not changed here.
+- `cargo xtask check` does not compile on Windows: recorded in GAPS.
