@@ -5,11 +5,18 @@
 # drift in the npm copies (the main package, its platform packages, the optionalDependencies pins),
 # so one tag can never publish a wheel and an npm package at two versions. On a branch (a
 # workflow_dispatch dry run) it only checks the copies. Called by release.yml, publish-python.yml and
-# publish-node.yml through `workflow_call`, so there is exactly one guard.
+# publish-node.yml through `workflow_call`, so there is exactly one guard. Only release.yml passes `allow-test-tag`: a
+# tag `v<version>-test.N` is a test of the binary release lane, which makes a draft pre-release titled as a test; the
+# SDK publish lanes do not start on such a tag, and were one to call this guard with it, it would refuse.
 name: Version guard
 
 on:
   workflow_call:
+    inputs:
+      allow-test-tag:
+        description: Accept `v<version>-test.N`, a test of the binary release lane (release.yml only).
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,7 +34,11 @@ jobs:
       - name: Check
         run: |
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            cargo xtask version --expect-tag "${GITHUB_REF_NAME}"
+            if [ "${{ inputs.allow-test-tag }}" = "true" ]; then
+              cargo xtask version --expect-tag "${GITHUB_REF_NAME}" --allow-test-tag
+            else
+              cargo xtask version --expect-tag "${GITHUB_REF_NAME}"
+            fi
           else
             cargo xtask version
           fi

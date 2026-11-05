@@ -11,7 +11,7 @@ use slates_ipc::win_spawn::{Process, Spawn, StandardOutput, environment_block};
 use windows_sys::Win32::Foundation::HANDLE;
 
 use crate::handles::{HandleMessage, HandleRefusal, RefusalLog};
-use crate::held_windows::{Channel, Handoff, Held, channel};
+use crate::held_windows::{Channel, Handoff, Held, ReadingEnd, channel};
 
 /// Maps an IPC refusal into the process seam's OS error without losing its original cause.
 fn io(error: slates_ipc::IpcError) -> std::io::Error {
@@ -88,7 +88,7 @@ pub(super) fn spawn(
 
 /// The anchor's channel and bounded holdings. At most one reply is pending, retained when the peer's quota is full.
 pub(super) struct Hold {
-  anchor: Channel,
+  anchor: ReadingEnd,
   daemon: Channel,
   held: Held,
   pending: Option<HandleMessage>,
@@ -96,14 +96,14 @@ pub(super) struct Hold {
   /// life; the holdings' own refusals are `held`'s.
   channel_refusals: u64,
   /// Which of those refusals the log has said, so that the log stays bounded while the count goes on.
-  logged: RefusalLog,
+  logged: RefusalLog<HandleRefusal>,
 }
 
 impl Hold {
   pub(super) fn new(bound: usize) -> Result<Hold, HandleRefusal> {
     let (anchor, daemon) = channel()?;
     Ok(Hold {
-      anchor,
+      anchor: ReadingEnd::new(anchor),
       daemon,
       held: Held::new(bound),
       pending: None,
@@ -116,7 +116,7 @@ impl Hold {
   /// no unread request or acknowledgement from it may enter the successor's protocol.
   pub(super) fn handoff(&mut self) -> Result<Handoff, HandleRefusal> {
     let (anchor, daemon) = channel()?;
-    self.anchor = anchor;
+    self.anchor = ReadingEnd::new(anchor);
     self.daemon = daemon;
     self.pending = None;
     self.held.handoff(&self.daemon)
@@ -140,7 +140,7 @@ impl Hold {
       if !self.reply() {
         break;
       }
-      match self.anchor.recv(0) {
+      match self.anchor.posted_recv() {
         Ok(None) => break,
         Ok(Some(message)) => {
           self.pending = self.held.apply(daemon, message);
@@ -158,12 +158,29 @@ impl Hold {
     applied
   }
 
+  /// What the anchor's loop waits on for this hold (A-213): the event of the read posted on the channel, signalled when
+  /// a message arrives. `None` while a reply is pending: the daemon's read of its last reply is nothing this loop can
+  /// wait on, and a message already taken behind it would signal at once and spin the loop, so the loop waits out its
+  /// step instead, as before. A read that cannot be posted is counted, and the loop waits out its step too.
+  pub(super) fn wake(&mut self) -> Option<HANDLE> {
+    if self.pending.is_some() {
+      return None;
+    }
+    match self.anchor.posted_event() {
+      Ok(event) => Some(event),
+      Err(refusal) => {
+        self.refuse(&refusal);
+        None
+      }
+    }
+  }
+
   /// Sends the pending reply, if any: `false` while the peer's quota is full (it stays pending for the next turn).
   fn reply(&mut self) -> bool {
     let Some(message) = self.pending.as_ref() else {
       return true;
     };
-    match self.anchor.send(message, 0) {
+    match self.anchor.channel().send(message, 0) {
       Ok(()) => {
         self.pending = None;
         true

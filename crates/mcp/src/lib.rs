@@ -1973,6 +1973,7 @@ pub fn daemon_json(r: &DaemonReport, telemetry: &[TelemetryReport]) -> Value {
     "pid": r.pid,
     "generation": r.generation,
     "restarts": r.restarts,
+    "anchor_hold_refusals": r.anchor_hold_refusals,
     "heartbeat_age_ns": r.heartbeat_age_ns,
     "clients_reaped": r.clients_reaped,
     "clients_refused": r.clients_refused,
