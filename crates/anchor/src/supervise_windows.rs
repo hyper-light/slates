@@ -140,7 +140,7 @@ impl Hold {
       if !self.reply() {
         break;
       }
-      match self.anchor.recv(0) {
+      match self.anchor.posted_recv() {
         Ok(None) => break,
         Ok(Some(message)) => {
           self.pending = self.held.apply(daemon, message);
@@ -156,6 +156,23 @@ impl Hold {
     }
     self.reply();
     applied
+  }
+
+  /// What the anchor's loop waits on for this hold (A-213): the event of the read posted on the channel, signalled when
+  /// a message arrives. `None` while a reply is pending: the daemon's read of its last reply is nothing this loop can
+  /// wait on, and a message already taken behind it would signal at once and spin the loop, so the loop waits out its
+  /// step instead, as before. A read that cannot be posted is counted, and the loop waits out its step too.
+  pub(super) fn wake(&mut self) -> Option<HANDLE> {
+    if self.pending.is_some() {
+      return None;
+    }
+    match self.anchor.posted_event() {
+      Ok(event) => Some(event),
+      Err(refusal) => {
+        self.refuse(&refusal);
+        None
+      }
+    }
   }
 
   /// Sends the pending reply, if any: `false` while the peer's quota is full (it stays pending for the next turn).

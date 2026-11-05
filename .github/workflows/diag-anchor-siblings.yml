@@ -1,0 +1,42 @@
+name: diag-anchor-siblings
+on:
+  push:
+    branches: ['diag-anchor-siblings-*']
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  windows:
+    name: the Windows anchor's wake (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy the anchor
+        timeout-minutes: 30
+        run: cargo clippy -p slates-anchor --all-targets -- -D warnings
+      - name: The Windows hold tests, three runs, the answers as annotations
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          status=0
+          for run in 1 2 3; do
+            cargo test -p slates-anchor --test handles_windows -- --test-threads=1 --nocapture > out.log 2>&1 || status=1
+            cat out.log
+            grep -E "^test result|HOLD ANSWERS|panicked|each hold answered" out.log | head -6 | while read -r line; do
+              echo "::notice title=run $run::$line"
+            done
+          done
+          exit $status
+      - name: The anchor crate's other tests
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: cargo test -p slates-anchor --lib --test anchor -- --test-threads=1

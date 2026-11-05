@@ -318,7 +318,10 @@ slates-land = 4
 # 2026-11-02, A-198: retire the six supervisor job/assignment sites in favor of IPC's existing creation-time job
 # attribute. The hold transport has ten Win32 ownership/I/O sites: last-error read, event create/adopt, read/write,
 # event wait, cancellation and join on timeout or failed wait, and adoption of a duplicated handle. No unsafe sharing.
-slates-anchor = 10
+# 2026-11-04 (+4, A-213): the anchor's end keeps a read posted so its loop wakes on the channel: the read posted, its
+# result taken without waiting, its cancellation and join at the channel's drop, and the supervisor's wait on the read's
+# event and the daemon's process handle together. The completion event's two sites are shared with the timed reads.
+slates-anchor = 14
 slates-db = 0
 # 2026-11-02, A-198: one DuplicateHandle out of a child, two process-exit polling calls, and one message-mode pipe
 # setting call. The existing explicit handle-list spawn and kill-on-close job are reused.
