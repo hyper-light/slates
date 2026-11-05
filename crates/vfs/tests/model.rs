@@ -1084,21 +1084,34 @@ thread_local! {
 /// so no shrink was passed over).
 fn check_blocks(vol: &Volume, store: &Store, step: &Step) {
   let held = vol.directory_blocks(store);
-  assert_eq!(store.blocks.len(), held.len(), "blocks the store holds after {step:?}");
+  assert_eq!(
+    store.blocks.len(),
+    held.len(),
+    "blocks the store holds after {step:?}"
+  );
   let census = store.blocks.census();
   for (class, counted) in census.iter().enumerate() {
     let expected = held
       .iter()
       .filter(|(_, size, _)| class_for(*size) == Some(class))
       .count();
-    assert_eq!(counted.blocks, expected, "class {class}'s blocks after {step:?}");
+    assert_eq!(
+      counted.blocks, expected,
+      "class {class}'s blocks after {step:?}"
+    );
     if expected > 0 {
       CLASSES_SEEN.with(|seen| seen.set(seen.get() | 1 << class));
     }
   }
-  assert!(store.blocks.lists_are_sound(), "the class lists after {step:?}");
+  assert!(
+    store.blocks.lists_are_sound(),
+    "the class lists after {step:?}"
+  );
   for (block, size, fitted) in &held {
-    assert!(*size <= 2 * fitted, "{block:?}: {size} bytes for entries that fit {fitted}, after {step:?}");
+    assert!(
+      *size <= 2 * fitted,
+      "{block:?}: {size} bytes for entries that fit {fitted}, after {step:?}"
+    );
   }
 }
 
@@ -1120,7 +1133,10 @@ fn directory_blocks_grow_split_and_shrink_as_the_volume_holds_them() {
   let seen = CLASSES_SEEN.with(std::cell::Cell::get);
   assert!(seen.count_ones() >= 8, "classes seen: {seen:#b}");
   let largest = u32::try_from(slates_vfs::dirblocks::CLASSES - 1).unwrap();
-  assert!(seen & (1 << largest) != 0, "a block reached the largest class: {seen:#b}");
+  assert!(
+    seen & (1 << largest) != 0,
+    "a block reached the largest class: {seen:#b}"
+  );
 }
 
 /// A-126 (a written file's delta is its written windows): do write a file across several windows, publish, then
