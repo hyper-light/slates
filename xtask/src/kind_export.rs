@@ -240,6 +240,8 @@ fn mint(scratch: &Path) -> Result<std::path::PathBuf, Failure> {
   )?;
   // tlshd refuses a private key other users can read (measured 2026-10-01: "File …/client.key: expected mode
   // 600", then no key loaded); the bind mount carries the host file's mode into the node.
+  // The KIND lane runs on Linux alone; elsewhere the scratch key keeps its default mode and the lane is not run.
+  #[cfg(unix)]
   {
     use std::os::unix::fs::PermissionsExt;
     #[allow(clippy::disallowed_methods)] // the development tool's own scratch directory

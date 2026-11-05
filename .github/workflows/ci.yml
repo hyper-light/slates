@@ -915,6 +915,37 @@ jobs:
           a_container_maps_a_slates_file_by_the_direct_map_with_no_copy
           a_container_maps_a_slates_file_read_and_write_by_the_direct_map
           a_container_on_a_bridge_network_maps_a_slates_file_read_and_write_through_the_socket_file
+      # The conformance suites on arm64 (A-214): fsx, fsstress and pjdfstest over each Linux transport (the NFSv3
+      # adapter, the daemon's NFSv4.2 server under the kernel client, and the container bind of the shared FUSE mount),
+      # each judged against the transport's reviewed list, which the x86_64 lane shares: the arm64 runs found exactly
+      # the listed failures (diagnostics run 41975493604, 2026-11-05: 0 unexpected, 0 listed now passing on each).
+      # nfs-common is the adapter's kernel client; fuse3 and user_allow_other are the first step's.
+      - name: Suite tools for conformance on arm64
+        if: ${{ !cancelled() }}
+        run: sudo apt-get update && sudo apt-get install -y nfs-common
+      - name: fsx over every Linux transport on arm64
+        if: ${{ !cancelled() }}
+        run: cargo xtask conformance run --suite fsx --records target/conformance-records --scratch target/conformance-scratch --keep
+      - name: fsstress over every Linux transport on arm64
+        if: ${{ !cancelled() }}
+        run: cargo xtask conformance run --suite fsstress --records target/conformance-records --scratch target/conformance-scratch --keep
+      - name: pjdfstest over every Linux transport on arm64, against the reviewed lists
+        if: ${{ !cancelled() }}
+        run: cargo xtask conformance run --suite pjdfstest --records target/conformance-records --scratch target/conformance-scratch --keep
+      - name: Upload the arm64 conformance records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-records-linux-arm64
+          path: target/conformance-records
+          if-no-files-found: ignore
+      - name: Upload pjdfstest's per-file output on arm64 (the expected-failure review input)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pjdfstest-output-linux-arm64
+          path: target/conformance-scratch/*/pjdfstest-output
+          if-no-files-found: ignore
 
   # Miri (the memory-model interpreter) and loom (the concurrency-permutation checker) run
   # on the unit tests of the crates that hold unsafe code. Miri ships only with the
