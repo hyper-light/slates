@@ -2881,6 +2881,14 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 > code before the fix kept 1 of 100 views stale, the fix kept 0 of 100 (diagnostics runs 41336524903 and 41346376630;
 > before, 41346373137).
 
+> **Status (2026-11-05, A-214: Windows conformance).** WinFsp's own suites run over the drive in `windows-lint` and
+> `windows-arm64`. winfstest's 628 cases give the same verdicts on x86_64 and arm64; every failure is on the reviewed
+> list with one of five stated differences (attribute bits, security descriptors, a settable creation time, reparse
+> points and symbolic links, named streams). Four Win32 bugs it found are fixed with failing tests first
+> (`crates/cli/tests/winfsp_semantics.rs`): a move not asked to replace, a directory holding a file, `SetFileTime`, and
+> an open with `TRUNCATE_EXISTING` (WinFsp's allocation below a file's size truncates it). Open: the fsx port wedges at
+> its operation 164 inside Windows, below the single receiver; it is a listed failure until fixed.
+
 > **Status (2026-11-02, A-198, Step 9.2: Windows handle holding).** The anchor's Windows hold channel and explicit
 > successor inheritance are built. A hold is acknowledged after duplication into the anchor, before the child publishes
 > its record. Three real-process tests pass on jupiter and on both CI architectures, three runs each there (run
@@ -12892,7 +12900,16 @@ fsx verdict), `xtask/src/conformance` (the WinFsp mount step, the MSVC builds, t
   `docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md`): a move not asked to replace replaced a
   taken name and a move asked to replace replaced a directory (`rename` dropped WinFsp's `ReplaceIfExists`); a
   directory holding a file answered its removal with success (`CanDelete` answered success unread, and Cleanup's refusal
-  reached no program); and `SetFileTime` answered success and kept nothing (`SetBasicInfo` applied no time).
+  reached no program); `SetFileTime` answered success and kept nothing (`SetBasicInfo` applied no time); and an open
+  with `TRUNCATE_EXISTING` kept the file's bytes (it arrives as `SetFileSize` with an allocation of zero, which WinFsp's
+  contract says truncates, and the bridge ignored every allocation). Red on main's bridge in run 41989370753, green in
+  run 42046112993, on x86_64 and arm64; with them winfstest's failures fell from 384 to 374 of 628, all listed.
+- **fsx's open wedge, and how a stopped run is judged.** The WinFsp port wedges at its operation 164 (seed 1), a
+  `TRUNCATE UP` after a `TRUNCATE DOWN`, on both architectures; the bridge receives nothing after the shrink, so the
+  wait is inside Windows below the single receiver (A-198), owed to the dispatcher's owners. Every fsx run now has a
+  wall bound (pjdfstest's per-file 300 s, about five times the slowest recorded run), and a run that stops short is
+  named by the operation it stopped at (`fsx-seed-1:164`) and judged against the transport's reviewed fsx list, as
+  winfstest's cases are; a pass with a listed stop fails until the line is struck.
 - **arm64 Linux.** `linux-arm64` runs fsx, fsstress and pjdfstest over the three Linux transports, judged against the
   x86_64 lane's lists: the first run found exactly the listed failures (diagnostics run 41975493604, 2026-11-05, Ubuntu
   24.04.5 aarch64: pjdfstest 8,798 cases a transport with 0 unexpected and 0 listed passing; fsx 10,000 operations and

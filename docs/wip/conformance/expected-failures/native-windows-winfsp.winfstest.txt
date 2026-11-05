@@ -1,13 +1,15 @@
 # Reviewed expectations: WinFsp's winfstest over the slates WinFsp drive (`slates mount ID E:`), A-214.
 # First review: 2026-11-05, billziss-gh/secfs.test@6ac65cda46abc2be39c7b137debf9521052edbaf (WinFsp v2.1's ext/test),
 # from the per-script outputs of diagnostics run 41989365843 (windows-latest x86_64 and windows-11-arm), whose
-# verdicts were the same case for case: 628 cases, 253 passed, 375 failed.
+# verdicts were the same case for case: 628 cases, 253 passed, 375 failed; t/base/05.t case 12 has passed since the
+# truncation fix (diagnostics run 42046112993), leaving 374 listed.
 # Each reason names A-214's stated difference the case meets (ATTRIBUTES, SECURITY, CREATION-TIME, REPARSE, SYMLINK,
 # STREAMS) or an open bug with its record and failing test. A case that fails only because an earlier unsupported call
 # failed in the same script carries that call's reason.
 # One case per line. Unlisted failures, listed passes and absent listed cases fail the gate; the list only shrinks.
-# The run that produced these numbers had three bugs fixed with failing tests first (a move that replaced a taken name,
-# a directory removed while holding a file, SetFileTime keeping nothing): their nine cases pass and are not listed.
+# Four bugs the suite found are fixed, each with a failing test first (a move that replaced a taken name, a directory
+# removed while holding a file, SetFileTime keeping nothing, an open with TRUNCATE_EXISTING keeping the file): their ten
+# cases pass and are not listed.
 
 t/base/01.t:2  A-214 ATTRIBUTES: the drive keeps no Windows attribute bits; every file reports FILE_ATTRIBUTE_NORMAL (0x80) and every directory FILE_ATTRIBUTE_DIRECTORY (0x10), so READONLY, HIDDEN, SYSTEM and ARCHIVE are neither reported nor enforced.
 t/base/01.t:4  A-214 ATTRIBUTES: the drive keeps no Windows attribute bits; every file reports FILE_ATTRIBUTE_NORMAL (0x80) and every directory FILE_ATTRIBUTE_DIRECTORY (0x10), so READONLY, HIDDEN, SYSTEM and ARCHIVE are neither reported nor enforced.
@@ -18,7 +20,6 @@ t/base/01.t:14  A-214 ATTRIBUTES: the drive keeps no Windows attribute bits; eve
 t/base/01.t:15  A-214 ATTRIBUTES: the drive keeps no Windows attribute bits; every file reports FILE_ATTRIBUTE_NORMAL (0x80) and every directory FILE_ATTRIBUTE_DIRECTORY (0x10), so READONLY, HIDDEN, SYSTEM and ARCHIVE are neither reported nor enforced.
 t/base/04.t:10  A-214 ATTRIBUTES: the target was made FILE_ATTRIBUTE_READONLY (case 3), which the drive does not keep, so the move asked to replace it succeeds where Windows refuses ERROR_ACCESS_DENIED.
 t/base/04.t:12  A-214 ATTRIBUTES, cascade: case 10 already moved the source onto the read-only target the drive did not keep as such, so the source is gone here (ERROR_FILE_NOT_FOUND).
-t/base/05.t:12  BUG (open, A-214): an open with TRUNCATE_EXISTING keeps the file's bytes; record docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md, failing test crates/cli/tests/winfsp_semantics.rs an_open_that_truncates_leaves_the_file_empty. Strike this line with the fix.
 t/base/06.t:5  A-214 CREATION-TIME: the volume keeps no settable birth time (the bridge's attributes carry none and report the change time), so SetFileTime's creation time is not kept.
 t/base/07.t:2  A-214 ATTRIBUTES: the drive keeps no Windows attribute bits; every file reports FILE_ATTRIBUTE_NORMAL (0x80) and every directory FILE_ATTRIBUTE_DIRECTORY (0x10), so READONLY, HIDDEN, SYSTEM and ARCHIVE are neither reported nor enforced.
 t/base/07.t:4  A-214 ATTRIBUTES: the drive keeps no Windows attribute bits; every file reports FILE_ATTRIBUTE_NORMAL (0x80) and every directory FILE_ATTRIBUTE_DIRECTORY (0x10), so READONLY, HIDDEN, SYSTEM and ARCHIVE are neither reported nor enforced.

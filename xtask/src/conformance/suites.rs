@@ -100,19 +100,50 @@ pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     bounds.fsx_seed.to_string(),
     fetch::FSX_LENGTH_FLAG.to_owned(),
     bounds.fsx_file_length.to_string(),
-    "-q".to_owned(),
+    fetch::FSX_TRACE_FLAG.to_owned(),
     "-P".to_owned(),
     super::plain_path(&logs),
     // Relative to the work directory: fsx names its .fsxgood/.fsxlog files `<-P dir>/<fname>.…`,
     // so an absolute fname would nest one absolute path under another.
     "fsx.bin".to_owned(),
   ];
-  let (success, output) = run_capturing(&built.binary, &args, &work)?;
+  let (success, output, ended) = run_bounded(&built.binary, &args, &work, FSX_WALL_BOUND)?;
   let verdict = fsx_verdict(success, &output, bounds.fsx_operations);
+  // A run that stopped short is judged against the transport's reviewed list by the operation it stopped at (A-214):
+  // a listed stop is an expected failure, any other is not, and a pass with a listed stop must strike it.
+  let (list, digest) = reviewed_list(
+    run.root,
+    format!(
+      "docs/wip/conformance/expected-failures/{}.fsx.txt",
+      run.transport.slug()
+    ),
+  )?;
+  let cases: Vec<TapCase> = if verdict.ok {
+    Vec::new()
+  } else {
+    let id = slates_conformance::exerciser::fsx_stop_id(bounds.fsx_seed, &output);
+    let (file, number) = id.rsplit_once(':').unwrap_or((id.as_str(), "0"));
+    vec![TapCase {
+      id: slates_conformance::tap::TestId {
+        file: file.to_owned(),
+        number: number.parse().unwrap_or(0),
+      },
+      status: CaseStatus::Fail {
+        detail: verdict.detail.clone(),
+      },
+    }]
+  };
+  let judgement = judge(&list, &cases);
   let mut notes = vec![
     built.note,
     "the exerciser's .fsxlog/.fsxgood files were kept outside the mount (-P)".to_owned(),
+    judgement.describe(),
   ];
+  if !ended {
+    notes.push(format!(
+      "fsx was ended at its wall bound of {FSX_WALL_BOUND:?}"
+    ));
+  }
   if !verdict.ok {
     notes.push(format!("fsx output tail: {}", verdict.detail));
   }
@@ -136,13 +167,79 @@ pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
       command_line(&built.binary, &args)
     ),
     bound: format!(
-      "{} operations, seed {}, file length {} bytes",
+      "{} operations, seed {}, file length {} bytes, {FSX_WALL_BOUND:?} a run",
       bounds.fsx_operations, bounds.fsx_seed, bounds.fsx_file_length
     ),
-    expected_failure_list: None,
+    expected_failure_list: Some(digest),
     notes,
-    ok: verdict.ok,
+    ok: judgement.acceptable(),
   })
+}
+
+/// Derived: the wall bound of a whole fsx run: pjdfstest's per-file bound
+/// (`slates_conformance::pjdfstest::FILE_BOUND_SECONDS`, 300 s), about five times the slowest recorded fsx run of the
+/// default bounds (62.6 s, `native-linux-fuse` on arm64, diagnostics run 41975493604). A run still going then is ended
+/// and judged by the operation it stopped at (the WinFsp port wedged at one, A-214).
+const FSX_WALL_BOUND: Duration = PJDFSTEST_FILE_BOUND;
+
+/// Runs a suite binary until it exits or `bound` passes, capturing both streams together; past the bound it is killed.
+/// Whether it succeeded, its output, and whether it ended by itself.
+fn run_bounded(
+  program: &Path,
+  args: &[String],
+  cwd: &Path,
+  bound: Duration,
+) -> Result<(bool, String, bool), Failure> {
+  let mut child = Command::new(program)
+    .args(args)
+    .current_dir(cwd)
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .map_err(|e| Failure(format!("running {}: {e}", program.display())))?;
+  let stdout = drain_stream(child.stdout.take())?;
+  let stderr = drain_stream(child.stderr.take())?;
+  let started = Instant::now();
+  let (success, ended) = loop {
+    if let Some(status) = child.try_wait()? {
+      break (status.success(), true);
+    }
+    if started.elapsed() > bound {
+      let _ = child.kill();
+      let _ = child.wait();
+      break (false, false);
+    }
+    pause();
+  };
+  let mut text = joined_stream(stdout)?;
+  text.push_str(&joined_stream(stderr)?);
+  Ok((success, text, ended))
+}
+
+/// A child's stream read to its end on a thread the caller joins.
+fn drain_stream<R: std::io::Read + Send + 'static>(
+  stream: Option<R>,
+) -> Result<std::thread::JoinHandle<std::io::Result<Vec<u8>>>, Failure> {
+  let mut stream = stream.ok_or_else(|| Failure("a suite stream was not piped".to_owned()))?;
+  std::thread::Builder::new()
+    .name("suite-stream".to_owned())
+    .spawn(move || {
+      let mut bytes = Vec::new();
+      stream.read_to_end(&mut bytes).map(|_| bytes)
+    })
+    .map_err(|e| Failure(format!("starting a suite stream's reader: {e}")))
+}
+
+/// The text a drained stream read; the child has ended, so the reader reaches the end.
+fn joined_stream(
+  drain: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+) -> Result<String, Failure> {
+  let bytes = drain
+    .join()
+    .map_err(|_| Failure("a suite stream's reader panicked".to_owned()))?
+    .map_err(|e| Failure(format!("reading a suite stream: {e}")))?;
+  Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// fsstress over the mount.

@@ -1,5 +1,16 @@
 # Transport conformance evidence (AC-9.7 / T-9.1; GAP-A9-15)
 
+> **Windows conformance, and the suites on arm64 Linux (2026-11-05, A-214).** The Windows transport's cells run: WinFsp's
+> winfstest (a Rust transcription of its Python 2.7 scripts over upstream's C driver, held to them by a golden of 733
+> cases) and the WinFsp fsx port, over `slates mount ID E:` in `windows-lint` and `windows-arm64`. winfstest's 628
+> cases give the same verdicts on x86_64 and arm64: 254 pass, 374 fail, every failure on
+> `expected-failures/native-windows-winfsp.winfstest.txt` with one of A-214's five stated differences. The suite found
+> four Win32 bugs, each fixed with a failing test first (`docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md`).
+> fsx wedges at its operation 164 (an open bug, listed in `expected-failures/native-windows-winfsp.fsx.txt`); every fsx
+> run now has a wall bound and a stopped run is judged by the operation it stopped at. On arm64 Linux, `linux-arm64`
+> runs fsx, fsstress and pjdfstest over the three Linux transports against the x86_64 lists: 0 unexpected, 0 listed
+> passing (diagnostics run 41975493604). The Windows records are copied in from CI's artifacts.
+
 > **First macOS root expectation review (2026-09-26).** The CI macOS lane's root run (run
 > 36202635768, macOS 26.6.2) has 6,781 passes and 1,905 failures. The root list now names exactly
 > those 1,905 cases:
