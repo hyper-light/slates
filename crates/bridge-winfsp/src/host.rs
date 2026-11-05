@@ -98,8 +98,8 @@ pub enum WinFspError {
   Ledger(crate::opens::Refusal),
   /// The retained direct-output receive journal was malformed or could not be settled.
   Capture(crate::inflight::Refusal),
-  /// The loaded DLL exposes a future public filesystem format this operation table cannot serve.
-  UnsupportedAbi(u16),
+  /// The loaded DLL is not the version this host's receiver was written from (`crate::dll_version`).
+  UnsupportedDll(crate::dll_version::UnsupportedVersion),
   /// A Windows object operation refused, preserving its system error code.
   Os {
     /// The Windows object operation.
@@ -122,12 +122,25 @@ impl std::fmt::Display for WinFspError {
       Self::Record(reason) => write!(f, "the held mount record was refused: {reason:?}"),
       Self::Ledger(reason) => write!(f, "{reason}"),
       Self::Capture(reason) => write!(f, "{reason}"),
-      Self::UnsupportedAbi(version) => {
-        write!(f, "WinFsp filesystem format {version} is unsupported")
-      }
+      Self::UnsupportedDll(refusal) => write!(f, "{refusal}"),
       Self::Os { call, code } => write!(f, "{call} refused: {code:?}"),
     }
   }
+}
+
+/// Refuses a DLL other than the version the receiver was written from, before anything touches its layout
+/// (`crate::dll_version`). `FspVersion` itself takes no file system.
+fn checked_dll(api: &ffi::Api) -> Result<(), WinFspError> {
+  let mut found = 0u32;
+  // SAFETY: the export was found by name in the loaded library, and `found` is a writable word for the call.
+  let status = unsafe { (api.version)(&mut found) };
+  if status != 0 {
+    return Err(WinFspError::Api {
+      call: "FspVersion",
+      status,
+    });
+  }
+  crate::dll_version::check(found).map_err(WinFspError::UnsupportedDll)
 }
 
 /// Whether WinFsp's library loads on this host: the fact the daemon's transport report states (`WinFspNotInstalled`
@@ -382,6 +395,7 @@ impl Request {
       Op::Release { object } => Some(*object),
       _ => None,
     };
+    let refused = admission_refusal(&self.op, names, ledger);
     let bound = bind(self.op, ledger);
     let barrier = bound.as_ref().is_ok_and(|op| {
       op.needs_barrier() && !matches!(op, Op::Cleanup { object, .. } if object.purge)
@@ -389,12 +403,12 @@ impl Request {
     let echo = matches!(&bound, Ok(Op::Write { object, .. }) if object.purge);
     let restored_read =
       matches!(&bound, Ok(Op::Read { object, .. }) if object.fh == RESTORED_HANDLE);
-    let mut reply = match bound {
-      Ok(_op) if opened.is_some() && !ledger.has_room() => {
-        Reply::Err(ntstatus(&VfsError::NoSpace).as_i32())
+    let mut reply = match (bound, refused) {
+      (Ok(_op), Some(refusal)) => Reply::Err(ntstatus(&refusal).as_i32()),
+      (Ok(op), None) => {
+        run(bridge, cx, op).unwrap_or_else(|error| Reply::Err(ntstatus(&error).as_i32()))
       }
-      Ok(op) => run(bridge, cx, op).unwrap_or_else(|error| Reply::Err(ntstatus(&error).as_i32())),
-      Err(error) => {
+      (Err(error), _) => {
         eprintln!("slates-winfsp: context refused: {error}");
         Reply::Err(ntstatus(&VfsError::StaleHandle).as_i32())
       }
@@ -443,6 +457,22 @@ fn rename_one_name(
       eprintln!("slates-winfsp: durable kernel rename refused: {error}");
       Reply::Err(ntstatus(&VfsError::RecoveryIncomplete).as_i32())
     }
+  }
+}
+
+/// Why `op` must not run, decided before it has any effect: an open with no ledger slot left, or a rename that would
+/// lengthen a name Windows holds past what the ledger records ([`OpenNames::rename_fits`]).
+fn admission_refusal<C>(
+  op: &Op<C>,
+  names: &OpenNames,
+  ledger: &Ledger<SparseObject>,
+) -> Option<VfsError> {
+  match op {
+    Op::Open { .. } | Op::PurgeOpen { .. } | Op::Create { .. } if !ledger.has_room() => {
+      Some(VfsError::NoSpace)
+    }
+    Op::Rename { from, to } if !names.rename_fits(from, to) => Some(VfsError::NameTooLong),
+    _ => None,
   }
 }
 
@@ -1612,8 +1642,9 @@ impl Mounted {
     {
       return Err(WinFspError::Record(crate::held::Refusal::Drive));
     }
-    let purge_token = crate::purge_token::PurgeToken::new()?;
     let api = ffi::api().map_err(|_| WinFspError::NotInstalled)?;
+    checked_dll(api)?;
+    let purge_token = crate::purge_token::PurgeToken::new()?;
     let security_descriptor = everyone_security_descriptor()?;
     let handler = Box::into_raw(Box::new(Handler {
       requests,
@@ -1686,12 +1717,6 @@ impl Mounted {
     // SAFETY: `file_system` is the DLL's live full object. Only its stable public prefix is accessed here.
     unsafe {
       (*file_system).user_context = handler.cast::<c_void>();
-    }
-    // SAFETY: the DLL returned a live initialized public prefix. Its reserved version is zero in v2.1; the header's
-    // 792-byte full-object size is a separate static assertion, not the value of this reserved field.
-    let version = unsafe { (*file_system).version };
-    if version != crate::dispatcher::FILE_SYSTEM_VERSION {
-      return Err(WinFspError::UnsupportedAbi(version));
     }
     if let Some((record, volume, link)) = inherited {
       if record.drive_text().map_err(WinFspError::Record)? != mount_point

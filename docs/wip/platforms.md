@@ -45,7 +45,8 @@ Each of these blocks several functions below, so it comes first.
 2. **Handing sockets and handles to a restarted daemon on Windows.** The anchor holds the fleet's serve sockets, the
    NFS listener and the FUSE devices across a daemon restart by descriptor inheritance (`crates/cli/src/anchor.rs`,
    all `#[cfg(unix)]`). Windows fleet ports and the NFS listener are still unheld. The WinFsp mount's control,
-   temporary drive-link and unnamed open-ledger handles now pass through the anchor (A-198, Step 9.3): the successor
+   temporary drive-link and unnamed open-ledger handles now pass through the anchor (A-198, Step 9.3; since A-206 a mount's
+   file system is deleted only after the anchor releases them, 0 of 20 left held per lane, run 41978665514): the successor
    serves that same kernel volume and resolves old contexts by stable file identity. Diagnostics [41422186336](https://github.com/hyper-light/slates/actions/runs/41422186336) lost zero drives of twenty on both architectures; every iteration required a restored-context read, and the last daemon counted four. All five live WinFsp tests, 36 bridge tests, 32 active anchor tests, native clippy and Windows docs passed on each runner. With only the control-handle hold omitted, the unchanged oracle failed its first post-kill read with Windows error 995 on both runners ([41422382101](https://github.com/hyper-light/slates/actions/runs/41422382101)); the still-held link alone left a dangling drive letter.
    Step 9.4 now refuses new unprivileged process opens for duplication and ACL changes at both holders: all six
    requests denied on each architecture, with the twenty-kill oracle retained ([41432451084](https://github.com/hyper-light/slates/actions/runs/41432451084));
