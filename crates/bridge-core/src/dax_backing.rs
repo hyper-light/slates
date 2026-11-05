@@ -445,8 +445,11 @@ impl DaxBackingSession {
   /// Takes `ask`: checks it, makes the node's backing if it has none, and leaves its fill pending, run by
   /// [`DaxBackingSession::fill_step`]: the inode the node resolved to. A refusal leaves nothing pending.
   pub fn ask(&mut self, bridge: &mut dyn Bridge, cx: &OpContext, ask: Ask) -> Result<u64, Refused> {
+    // A slice no view can begin at is refused before anything is made or filled: a view of a section starts on the
+    // system's allocation granularity, 64 KiB on Windows, and a map on a page elsewhere (A-199).
     if let Some((offset, len)) = ask.range
-      && offset.saturating_add(len) > self.layout.file_bytes(dax_object_bytes())
+      && (offset.saturating_add(len) > self.layout.file_bytes(dax_object_bytes())
+        || !offset.is_multiple_of(slates_machine::facts::Facts::allocation_granularity()))
     {
       return Err(Refused::Malformed);
     }

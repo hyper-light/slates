@@ -1457,7 +1457,8 @@ fn hostile_descriptor_asks_are_refused_with_an_errno_and_no_descriptor() {
   drop(daemon);
 }
 
-/// Asks cut short, with a range whose end overflows, and with a range past the object: each `EINVAL`.
+/// Asks cut short, with a range whose end overflows, with a range past the object, and from an offset no view can begin
+/// at: each `EINVAL`.
 fn malformed_asks_are_refused(guest: &mut Guest, file: u64) {
   guest.send_frame(CONTROL, &[ASK_DESCRIPTOR, 1, 2, 3, 4]);
   assert_eq!(guest.descriptor_answer().err(), Some(EINVAL), "cut short");
@@ -1473,6 +1474,11 @@ fn malformed_asks_are_refused(guest: &mut Guest, file: u64) {
     guest.descriptor(file, false, past).err(),
     Some(EINVAL),
     "a range past the object"
+  );
+  assert_eq!(
+    guest.descriptor(file, false, Some((1, DAX_RANGE))).err(),
+    Some(EINVAL),
+    "a range from no page or allocation granule"
   );
 }
 

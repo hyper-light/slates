@@ -1,0 +1,87 @@
+name: diag shards-whp
+
+# VFS plan step 14: Shards' WHP DAX window's three edge cases on windows-2025 through real guests, from the patch series
+# in docs/wip/shards-patches on Shards' gpu. The first patch alone is the red; the second the green. Diagnostics only.
+on:
+  push:
+    branches: ['diag-shards-whp-*']
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  shards-window:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    steps:
+      - name: Line endings as committed
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: hyper-light/shards
+          ref: gpu
+          fetch-depth: 0
+          path: shards-src
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: Host
+        shell: pwsh
+        run: |
+          (Get-CimInstance Win32_Processor).Name
+          (Get-CimInstance Win32_Processor).NumberOfLogicalProcessors
+          [System.Environment]::OSVersion.VersionString
+          $env:ImageOS; $env:ImageVersion
+      - name: The first patch alone is red
+        shell: bash
+        working-directory: shards-src
+        run: |
+          git config user.name diag; git config user.email diag@invalid
+          git switch --detach "$(git rev-parse "$SHARDS_SHORT")"
+          git am --no-gpg-sign ../docs/wip/shards-patches/0001-*.patch
+          reds=0
+          for run in 1 2 3 4 5; do
+            if cargo +1.98.1 test -p shards-vmm --lib --profile test-release -- --nocapture --test-threads=1 window::guest::several_vcpus_at_a_view window::guest::a_range_followed > red.log 2>&1; then
+              echo "RED-CHECK run $run: passed"
+            else
+              echo "RED-CHECK run $run: failed"; reds=$((reds+1))
+            fi
+            grep -E "PM M421|left:|test result" red.log | cut -c1-200
+          done
+          echo "RED-CHECK: $reds of 5 failed"
+          test "$reds" -gt 0
+        env:
+          SHARDS_SHORT: e39a9218
+      - name: The second patch is green, every window test, five times
+        shell: bash
+        working-directory: shards-src
+        run: |
+          git am --no-gpg-sign ../docs/wip/shards-patches/0002-*.patch
+          for run in 1 2 3 4 5; do
+            cargo +1.98.1 test -p shards-vmm --lib --profile test-release -- --nocapture --test-threads=1 window:: > green.log 2>&1 || { cat green.log; exit 1; }
+            grep -E "PM M421|a 64 GiB|test result" green.log | cut -c1-400
+            if grep -q "^SKIP\|SKIP: no WHP" green.log; then echo "a test skipped: no WHP"; exit 1; fi
+          done
+      - name: Install NASM
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Slates hands slices from each granule and refuses between them
+        shell: bash
+        run: cargo +1.98.1 test -p slates-client --test shards -- --test-threads=1
+
+  slates-unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: An ask no view can begin at is refused on every platform's route
+        run: cargo +1.98.1 test -p slates-server --test shards
