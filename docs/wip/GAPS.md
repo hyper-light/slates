@@ -79,6 +79,14 @@
 >   kills at 10 and 100 clients, every client reconnected and resent its request in flight under its own id (50 of
 >   50 and 500 of 500), outages 1.0 to 47.2 ms, the oracle 0 failures in every run. Owed: a workload whose edits
 >   change lengths, so a request applied twice would show in the bytes, not only in the completion record's keeping.
+> - **The chaos runs now check a non-idempotent operation too** (2026-11-05): each round appends a record to the
+>   client's own file, and each file must hold its accepted rounds' records once each (red-checked: a doubled append fails
+>   every client). Ten more kills at 10 and 100 clients (hot set scaled at 100): every client reconnected and resent,
+>   0 oracle and 0 own-file failures in every run.
+> - **A volume promised the whole version slab is refused at recovery** (open; bug record of 2026-11-05): a recovered
+>   snapshot rebuilds its directories privately, one retained version slot each, which the live volume did not hold
+>   (465,831 committed slots before a restart, 465,832 after). The load test's overlay (`Dynamic { max }` past the shard)
+>   was refused in 26 of 26 kills. Fix owed in `crates/vfs/src/recover.rs` (directories shared with the head).
 > - **A-207 moved the bottleneck to the partition log** (2026-11-05, async harness, load 7 to 18): every edit now
 >   appends to the partition log, and every `bytes_between_snapshots` of log the shard publishes a whole partition
 >   snapshot, origin included. 10 clients: edit p50 2.1 ms. 100 clients: every operation's p50 64 to 76 ms with the

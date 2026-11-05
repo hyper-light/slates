@@ -3436,7 +3436,7 @@ fn init_shard(
     // RAM (content, tree and snapshots restored, §4.8), the ones that could not be (refused, never
     // presented empty), and what the images did not carry and was reconciled out of the catalog.
     eprintln!(
-      "slates-server: shard {shard}: recovered {} volumes from their images ({} refused), {} merge volumes (green chains replayed, works reset), reconciled out {} unrecovered local snapshots and {} attachments, trimmed {} unacknowledged snapshots the images carried, completed {} destroys in flight, corrected {} clone pins, reclaimed {} orphans no holder survived, took back {} writable copies, replayed {} logged writes",
+      "slates-server: shard {shard}: recovered {} volumes from their images ({} refused), {} merge volumes (green chains and work logs replayed), reconciled out {} unrecovered local snapshots and {} attachments, trimmed {} unacknowledged snapshots the images carried, completed {} destroys in flight, corrected {} clone pins, reclaimed {} orphans no holder survived, took back {} writable copies, replayed {} logged writes",
       rebuilt.volumes,
       rebuilt.skipped,
       rebuilt.merge_volumes,

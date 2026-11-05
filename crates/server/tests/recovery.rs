@@ -3911,3 +3911,52 @@ fn a_hold_finer_than_the_pools_free_extents_is_owed_by_the_next_shard_to_grow() 
     "the pool's two small parts and the debt shard 1 took on make the hold: {pooled:?} and {holds:?}"
   );
 }
+
+/// §4.8, D-18, A-48 (found 2026-11-05 by the load test's chaos runs: in every one of 26 daemon kills the overlay the
+/// green was seeded from came back "not rebuilt: RecoveryIncomplete: no content image for the volume"). Do: create an
+/// overlay directly over a directory holding `f` (`Create { base }`), pin its whole base (acknowledged), snapshot it,
+/// and restart the daemon over the same segment. Expect the overlay served after the restart, with its pinned `f`
+/// read back over the mount. The landing path's overlay recovers (the test above); the created overlay must too.
+#[test]
+fn a_created_and_pinned_overlay_survives_a_restart() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-pinnedoverlay-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let anchor = held_anchor("pinnedoverlay", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&anchor)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let target = common::target::target_dir();
+  target.seed("f", BEFORE);
+  let mut client = connect(&instance);
+  let overlay = client
+    .create(&CreateSpec {
+      base: Some(target.path.clone()),
+      ..scratch("pinned-overlay")
+    })
+    .unwrap();
+  assert_eq!(
+    client.pin(overlay, None).unwrap(),
+    1,
+    "the one base file pinned"
+  );
+  client.snapshot(overlay).unwrap();
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  assert!(
+    client.status(overlay).is_ok(),
+    "the overlay is served after the restart"
+  );
+  let (mut stream, root) = mounted_on(&second, "pinned-overlay");
+  let file = lookup(&mut stream, &root, "f", 2);
+  assert_eq!(
+    read(&mut stream, &file, 3),
+    BEFORE,
+    "its pinned bytes read back"
+  );
+  drop(stream);
+  drop(client);
+  second.stop();
+}

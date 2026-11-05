@@ -113,6 +113,7 @@ struct SubmitEvent {
   slots: Vec<Slot>,
   outcome: Outcome,
   agent: usize,
+  round: usize,
   classes: Classes,
 }
 
@@ -121,6 +122,9 @@ struct SubmitEvent {
 enum Step {
   CreateWork,
   Edit(usize),
+  /// The round's record appended to the client's own file: an edit that is not idempotent, so a request applied twice
+  /// (or an acknowledged one lost) shows in the bytes.
+  Append,
   Submit,
   /// A conflict's resolution: the green's head version, read first so every window is read at one version.
   ResolveVersion,
@@ -136,6 +140,8 @@ enum Step {
 
 /// One client and its script.
 struct Agent {
+  /// The length of the client's own file in its work: the records of its accepted rounds.
+  own_len: u64,
   /// A daemon restart this client is riding out, if any.
   recovery: Option<Recovery>,
   /// The green's version a resolution reads its windows at, and the window bytes it read.
@@ -243,6 +249,54 @@ fn walk(client: &mut Client, green: VolumeId) -> Vec<(String, u64)> {
   files
 }
 
+/// The file only client `agent` appends to.
+fn own_path(agent: usize) -> String {
+  format!("loadtest-own-{agent}")
+}
+
+/// The record client `agent` appends in `round`: unique, so a duplicate or a loss shows.
+fn own_record(agent: usize, round: usize) -> Vec<u8> {
+  format!("{agent}:{round}\n").into_bytes()
+}
+
+/// Each client's own file as the green's head holds it must be its accepted rounds' records, each once, in round
+/// order. Returns the failures, each printed.
+fn own_files_oracle(
+  n: usize,
+  client: &mut Client,
+  green: VolumeId,
+  submits: &[SubmitEvent],
+) -> u64 {
+  let mut rounds: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+  for event in submits
+    .iter()
+    .filter(|event| matches!(event.outcome, Outcome::Accepted(_)))
+  {
+    rounds.entry(event.agent).or_default().push(event.round);
+  }
+  let mut failures = 0u64;
+  for (agent, mut accepted) in rounds {
+    accepted.sort_unstable();
+    let expected: Vec<u8> = accepted
+      .iter()
+      .flat_map(|round| own_record(agent, *round))
+      .collect();
+    let held = read_patiently(client, green, &own_path(agent), ReadAt::Head);
+    if held != expected {
+      failures += 1;
+      if failures <= 20 {
+        println!(
+          "oracle_failure\t{n}\tclient {agent}'s own file holds {:?}, its accepted rounds {accepted:?} append {:?}",
+          String::from_utf8_lossy(&held),
+          String::from_utf8_lossy(&expected)
+        );
+      }
+    }
+  }
+  println!("oracle\t{n}\town_files_failures\t{failures}");
+  failures
+}
+
 /// The slot bytes client `agent` writes in `round` at `(file, slot)`: unique to the three, except the shared slot.
 fn slot_bytes(agent: usize, round: usize, shared: bool) -> Vec<u8> {
   let tag = if shared {
@@ -297,6 +351,16 @@ impl Agent {
           name: format!("load-{}", self.id),
         },
         Kind::CreateWork,
+      ),
+      Step::Append => (
+        RequestBody::Edit {
+          work: work?,
+          path: own_path(self.id),
+          at: self.own_len,
+          delete_len: 0,
+          bytes: own_record(self.id, self.round),
+        },
+        Kind::Edit,
       ),
       Step::Edit(n) | Step::Reedit(n) => {
         let slot = &self.slot_for_step(n);
@@ -497,8 +561,12 @@ impl Agent {
         self.step = if n + 1 < self.slots().len() {
           Step::Edit(n + 1)
         } else {
-          Step::Submit
+          Step::Append
         };
+        record(tally, kind, elapsed);
+      }
+      (Step::Append, ReplyBody::Edited) => {
+        self.step = Step::Submit;
         record(tally, kind, elapsed);
       }
       (Step::Submit, ReplyBody::Submitted { version, conflicts }) => {
@@ -579,12 +647,14 @@ impl Agent {
       slots: self.slots().to_vec(),
       outcome,
       agent: self.id,
+      round: self.round,
       classes: conflicts.iter().map(|w| w.class).collect(),
     });
     match version {
       Some(v) => {
         record(tally, Kind::SubmitAccepted, elapsed);
         self.base = v;
+        self.own_len += u64::try_from(own_record(self.id, self.round).len()).unwrap();
         self.resolutions = 0;
         self.round += 1;
         self.step = if self.round < self.rounds.len() {
@@ -1020,6 +1090,7 @@ fn level(
       windows: Vec::new(),
       resolving: (0, Vec::new()),
       recovery: None,
+      own_len: 0,
       resolutions: 0,
       inflight: None,
     })
@@ -1097,7 +1168,7 @@ fn level(
       );
     }
   }
-  oracle(n, &total.submits, &base, &head)
+  oracle(n, &total.submits, &base, &head) + own_files_oracle(n, &mut reader, green, &total.submits)
 }
 
 fn arg(name: &str) -> Option<String> {
