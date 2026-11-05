@@ -114,6 +114,10 @@ jobs:
               | sh -s -- -y --default-toolchain 1.98.1 --profile minimal
             . "$HOME/.cargo/env"
             rustup target add ${{ matrix.target }}
+            # Native inside Alpine, so the linker is its own cc. napi names `aarch64-linux-musl-gcc` for the arm64 musl
+            # target as if cross-building, which Alpine has not ("linker `aarch64-linux-musl-gcc` not found": dry run
+            # 42048576607); the environment outranks it (Appendix B.2's LINKER=cc override).
+            export "CARGO_TARGET_$(echo ${{ matrix.target }} | tr a-z- A-Z_)_LINKER=cc"
             npm install -g @napi-rs/cli@${{ env.NAPI_CLI_VERSION }}
             cd crates/sdk-node
             npm run build -- --target ${{ matrix.target }}
