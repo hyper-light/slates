@@ -41,6 +41,11 @@ pub struct CoreFacts {
   pub numa: u32,
   /// The L2 cache it sees, in bytes (0 when unknown).
   pub l2_bytes: u64,
+  /// The physical core it is a hardware thread of, named by the lowest OS id among that core's threads, so
+  /// two logical cores with one `physical` share one core's pipeline (simultaneous multithreading). A core
+  /// that runs one thread names itself. §4.1 counts shards in physical cores, and this is how the facts
+  /// tell them apart (A-208).
+  pub physical: u32,
 }
 
 /// Page facts.
@@ -525,6 +530,7 @@ mod platform {
           level,
           numa: 0,
           l2_bytes: l2,
+          physical: next_id,
         });
         next_id = next_id.saturating_add(1);
       }
@@ -538,6 +544,7 @@ mod platform {
           level: 0,
           numa: 0,
           l2_bytes: 0,
+          physical: id,
         })
         .collect();
     }
@@ -912,6 +919,7 @@ mod platform {
     let atom = cpu_list("/sys/devices/cpu_atom/cpus");
     let core = cpu_list("/sys/devices/cpu_core/cpus");
     let mut unknown = 0u32;
+    let mut unsiblinged = 0u32;
     let cores = allowed
       .into_iter()
       .map(|id| {
@@ -920,12 +928,17 @@ mod platform {
         if class == CoreClass::Unknown {
           unknown = unknown.saturating_add(1);
         }
+        let physical = physical_of(id, &base);
+        if physical.is_none() {
+          unsiblinged = unsiblinged.saturating_add(1);
+        }
         CoreFacts {
           id,
           class,
           level: u32::from(class == CoreClass::Efficiency),
           numa: numa_of(&base),
           l2_bytes: l2_of(&base),
+          physical: physical.unwrap_or(id),
         }
       })
       .collect();
@@ -934,7 +947,23 @@ mod platform {
         "{unknown} core(s) have no class in sysfs; recorded unknown"
       ));
     }
+    if unsiblinged > 0 {
+      notes.push(format!(
+        "{unsiblinged} core(s) have no topology/thread_siblings_list in sysfs; each recorded as its own physical core"
+      ));
+    }
     cores
+  }
+
+  /// The physical core a CPU is a hardware thread of, named by the lowest id among its hardware threads: the
+  /// kernel's `topology/thread_siblings_list`, which lists every thread of the core, the CPU itself included
+  /// [B: Documentation/admin-guide/cputopology.rst]. `None` where the kernel exposes no topology (an empty or
+  /// absent list).
+  fn physical_of(id: u32, base: &str) -> Option<u32> {
+    cpu_list(&format!("{base}/topology/thread_siblings_list"))
+      .into_iter()
+      .min()
+      .map(|first| first.min(id))
   }
 
   /// The CPUs the calling thread may run on, by the kernel's ids: its affinity mask, which a cpuset
@@ -1254,7 +1283,7 @@ mod platform {
   use windows_sys::Win32::System::Power::SYSTEM_POWER_STATUS;
   use windows_sys::Win32::System::SystemInformation::{
     GetLogicalProcessorInformation, GetSystemInfo, GetVersion, GlobalMemoryStatusEx,
-    MEMORYSTATUSEX, RelationCache, RelationNumaNode, SYSTEM_INFO,
+    MEMORYSTATUSEX, RelationCache, RelationNumaNode, RelationProcessorCore, SYSTEM_INFO,
     SYSTEM_LOGICAL_PROCESSOR_INFORMATION,
   };
   use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessAffinityMask};
@@ -1359,9 +1388,24 @@ mod platform {
         .push("GetProcessAffinityMask refused; recorded no core, so no shard is pinned".to_owned());
       return Vec::new();
     };
+    // The physical core a logical processor is a thread of: the `RelationProcessorCore` entry whose mask holds
+    // it, named by that mask's lowest bit (the entry's mask lists every thread of the core [B:
+    // SYSTEM_LOGICAL_PROCESSOR_INFORMATION, Microsoft Learn]); itself when no entry holds it.
+    let physical_of = |id: u32| -> Option<u32> {
+      info
+        .iter()
+        .filter(|entry| entry.Relationship == RelationProcessorCore)
+        .find(|entry| {
+          entry
+            .ProcessorMask
+            .checked_shr(id)
+            .is_some_and(|bits| bits & 1 == 1)
+        })
+        .map(|entry| entry.ProcessorMask.trailing_zeros())
+    };
     notes
       .push("core classes are not queried on Windows in this phase; recorded unknown".to_owned());
-    (0..usize::BITS)
+    let cores: Vec<CoreFacts> = (0..usize::BITS)
       .filter(|&id| mask.checked_shr(id).is_some_and(|bits| bits & 1 == 1))
       .map(|id| CoreFacts {
         id,
@@ -1369,8 +1413,19 @@ mod platform {
         level: 0,
         numa: numa_of(id),
         l2_bytes: l2,
+        physical: physical_of(id).unwrap_or(id),
       })
-      .collect()
+      .collect();
+    let unsiblinged = cores
+      .iter()
+      .filter(|core| physical_of(core.id).is_none())
+      .count();
+    if unsiblinged > 0 {
+      notes.push(format!(
+        "{unsiblinged} logical processor(s) in no RelationProcessorCore entry; each recorded as its own physical core"
+      ));
+    }
+    cores
   }
 
   /// The process's affinity mask: the logical processors of its group it may run on, one bit each (up to

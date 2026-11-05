@@ -87,8 +87,17 @@ pub trait ChunkCipher: Send {
   fn identity(&self, key: u32) -> Option<KeyIdentity>;
   /// The reference for a key a recovery image names by `identity`, registering it if this cipher can derive it.
   fn reference(&mut self, identity: &KeyIdentity) -> Result<u32, VfsError>;
-  /// The key this cipher seals volume `volume`'s new chunks under for the rest of its life, registering it.
+  /// The key this cipher seals volume `volume`'s new chunks under for the rest of its life, registering it and holding
+  /// it once for that life: the volume's owner releases that hold ([`ChunkCipher::release`]) when the volume is gone.
   fn key_for_volume(&mut self, volume: [u8; 16]) -> Result<u32, VfsError>;
+  /// Holds key `key` once more (A-208): a sealed chunk record names it now. A key is kept while any hold is
+  /// outstanding; `Integrity` for a reference the cipher holds no key at.
+  fn hold(&mut self, key: u32) -> Result<(), VfsError>;
+  /// Lets one hold of key `key` go (A-208): a chunk record that named it is gone, or the volume sealing under it is.
+  /// The key goes with its last hold. `Integrity` for a key with no hold outstanding.
+  fn release(&mut self, key: u32) -> Result<(), VfsError>;
+  /// The keys the cipher holds now (A-208), for a test or an operator to hold to its floor.
+  fn keys_held(&self) -> usize;
 }
 
 /// A chunk's run of tags (A-99): its slot in the store's tag slab.
@@ -327,6 +336,11 @@ impl ChunkStore {
   /// The cipher, for the owner registering a volume's key or a recovery naming one.
   pub fn cipher_mut(&mut self) -> Option<&mut (dyn ChunkCipher + 'static)> {
     self.cipher.as_deref_mut()
+  }
+
+  /// The keys the store's cipher holds now (A-208); zero when the store does not seal.
+  pub fn cipher_keys_held(&self) -> usize {
+    self.cipher.as_ref().map_or(0, |cipher| cipher.keys_held())
   }
 
   /// The identity of key `key` (what an image records), when this store seals.
@@ -908,12 +922,23 @@ impl ChunkStore {
     } else {
       len
     };
-    let inserted = self.chunks.insert(Chunk {
-      born: open.born,
-      len: u32::try_from(open.len).unwrap_or(u32::MAX),
-      block,
-      identity: None,
-      seal,
+    // The record will name the seal's key: held first (A-208), so the key outlives the volume while this chunk does.
+    let held = seal.map_or(Ok(()), |seal| self.hold_key(seal.key));
+    let inserted = held.and_then(|()| {
+      self
+        .chunks
+        .insert(Chunk {
+          born: open.born,
+          len: u32::try_from(open.len).unwrap_or(u32::MAX),
+          block,
+          identity: None,
+          seal,
+        })
+        .map_err(|refusal| {
+          // The hold goes back with the refused record.
+          let released = seal.map_or(Ok(()), |seal| self.release_key(seal.key));
+          VfsError::from(refusal).after_undo(released)
+        })
     });
     let chunk = match inserted {
       Ok(chunk) => chunk,
@@ -928,7 +953,7 @@ impl ChunkStore {
         } else {
           self.arena.free(block).map(drop).map_err(VfsError::from)
         };
-        return Err(VfsError::from(refusal).after_undo(tags_back.and(copy_back)));
+        return Err(refusal.after_undo(tags_back.and(copy_back)));
       }
     };
     if block != open.block {
@@ -1105,8 +1130,27 @@ impl ChunkStore {
     }
     if let Some(seal) = chunk.seal {
       self.tags.free(seal.tags)?;
+      self.release_key(seal.key)?;
     }
     Ok(())
+  }
+
+  /// Holds key `key` for a sealed record (A-208); `Integrity` when the store has no cipher to hold it with.
+  fn hold_key(&mut self, key: u32) -> Result<(), VfsError> {
+    self
+      .cipher
+      .as_deref_mut()
+      .ok_or(VfsError::Integrity)?
+      .hold(key)
+  }
+
+  /// Lets a gone record's hold of key `key` go (A-208); `Integrity` when the store has no cipher.
+  fn release_key(&mut self, key: u32) -> Result<(), VfsError> {
+    self
+      .cipher
+      .as_deref_mut()
+      .ok_or(VfsError::Integrity)?
+      .release(key)
   }
 
   /// Claims exactly the arena block a recovered image names (A-64); refused `RecoveryIncomplete` when no
@@ -1201,11 +1245,19 @@ impl ChunkStore {
       }
       None => None,
     };
+    // The recovered record names its key: held before it is recorded (A-208), and let go with a refused record.
+    if let Some(seal) = chunk.seal
+      && let Err(refusal) = self.hold_key(seal.key)
+    {
+      self.tags.free(seal.tags)?;
+      return Err(refusal);
+    }
     match self.chunks.insert(chunk) {
       Ok(handle) => Ok(handle),
       Err(refusal) => {
         if let Some(seal) = chunk.seal {
           self.tags.free(seal.tags)?;
+          self.release_key(seal.key)?;
         }
         Err(refusal.into())
       }
@@ -1249,6 +1301,7 @@ impl ChunkStore {
     }
     if let Some(seal) = chunk.seal {
       self.tags.free(seal.tags)?;
+      self.release_key(seal.key)?;
     }
     Ok(())
   }
@@ -1396,6 +1449,15 @@ mod tests {
     fn key_for_volume(&mut self, volume: [u8; 16]) -> Result<u32, VfsError> {
       Ok(u32::from(volume[0]))
     }
+    fn hold(&mut self, _key: u32) -> Result<(), VfsError> {
+      Ok(())
+    }
+    fn release(&mut self, _key: u32) -> Result<(), VfsError> {
+      Ok(())
+    }
+    fn keys_held(&self) -> usize {
+      0
+    }
   }
 
   /// A cipher that refuses to seal segment [`REFUSED_SEGMENT`] and refuses every open: the worst a seal refused partway
@@ -1438,6 +1500,15 @@ mod tests {
     }
     fn key_for_volume(&mut self, volume: [u8; 16]) -> Result<u32, VfsError> {
       TestCipher.key_for_volume(volume)
+    }
+    fn hold(&mut self, key: u32) -> Result<(), VfsError> {
+      TestCipher.hold(key)
+    }
+    fn release(&mut self, key: u32) -> Result<(), VfsError> {
+      TestCipher.release(key)
+    }
+    fn keys_held(&self) -> usize {
+      TestCipher.keys_held()
     }
   }
 

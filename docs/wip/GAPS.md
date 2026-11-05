@@ -18,6 +18,48 @@
 > loses no told version and tells none twice (`crates/cli/tests/merge_kill.rs`, red with the durable append removed).
 >
 
+> **Shards counted hardware threads as cores (2026-11-05, A-208, §4.1, R9; fixed, its A/B owed).** §4.1 counts shards in
+
+> **A call waits for its acknowledgement's scatter (2026-11-05, §4.9, R9; OPEN).** The synchronous
+> `Client::call` acknowledges every half-ring of replies before its own request and waits for the reply, which the
+> daemon gives only after every shard has released the client's records. On macOS, 133 of 2,000 single-client creates
+> (6.7%) carried one, median 2,497 µs against 169 µs (a loaded run whose boot probe measured a 2.5 ms wake). That share
+> sets the single-client p99. With another shard held for a second, such a call fails `Stalled`. Sending it unawaited,
+> as the async path does (a6c3bc16), passed its test (Stalled before, 3.62 s after) and the whole client package.
+> But 2 of the 4 parked `provision_bench` forms that ran with it stalled a create past the 1 s reply deadline: one on
+> quiet jupiter, one on macOS. Without it, none of 15 did. Reverted in the next commit, cause not found. Owed:
+> the stall's cause, with a test that reproduces it, before the change returns. Also open, from the same macOS runs at
+> load 23–36: the bench's 8- and 64-client forms aborted `Stalled` in every arm, a live daemon slower than the reply
+> deadline. Record: `docs/bugs/2026-11-05-a-call-waited-for-its-acknowledgements-scatter.md`.
+
+> **Shards counted hardware threads as cores (2026-11-05, A-208, §4.1, R9; fixed and measured).** §4.1 counts shards in
+> physical cores, but the placement counted logical CPUs. jupiter's 16 two-thread cores therefore ran 31 shards and
+> left its spinning clients one thread: provisioning p99 123.6 µs against R9's 50 µs (Windows x86_64, 06:35 UTC). The
+> facts now name each CPU's physical core (`CoreFacts::physical`), and the placement fixes one shard per core, on its
+> first thread. A unit test failed before the fix (31 against 15) and passes after, and the placement oracle covers
+> three sibling layouts. Measured (BENCHMARKS, "Provisioning by physical core"): R9's single-client p99 went from
+> 41.5–190.1 µs to 21.8–40.7 µs on both CI SMT runners, all rounds green with part 2. On jupiter the millisecond
+> tails are gone, but its p99 is still 80–252 µs, red. Owed: a quiet Linux SMT run (adacachy's was at load 52), the
+> macOS arm (no SMT, expected unchanged), and Windows core classes, still unread. Record: `docs/bugs/2026-11-05-shards-counted-hardware-threads-as-cores.md`.
+
+> **A create's cost grows with its shard's volumes (2026-11-05, R9).** Both measured on macOS arm64 by `xctrace` on
+> `provision_bench`.
+> - **Every mutating verb re-walks its shard (OPEN).** `publish_delta_into` (`crates/server/src/verbs.rs`) sorts and
+>   checks every volume on the shard and rebuilds the id sets of all of them. With creates kept alive (2,000 a run over
+>   5 shards), a create's median climbs from 76–95 µs over the first 200 to 154–157 µs over the last 200, and
+>   `publish_shard` holds 1,591 of the 1,820 samples in `run_recorded`. The function's doc already names an
+>   incremental publish as owed (`recovery.md`).
+> - **Every new volume scanned every key its shard ever made (FIXED, A-208's second part).** `ShardCipher` kept a key
+>   per volume ever keyed and found each by a linear scan. 64 volumes made, written and destroyed left 64 keys, and
+>   the scan held 24,052 of the 26,986 samples inside the server's create over the full histogram. A key is now held
+>   for its volume's life and by each sealed record naming it, goes with its last hold, and is found through an index.
+>   Both tests failed before the fix and pass after. The parked provisioning p50 fell from 277–780 µs to 37–49 µs on
+>   Linux and 154–331 µs on Windows (CI run 42049944560). Record:
+>   `docs/bugs/2026-11-05-a-shards-content-keys-were-never-let-go.md`.
+>
+> The 1-client spinning row is flat across a run (first-200 and last-200 medians 45–80 µs). There the server's create
+> is about 7 µs of service, and the rest of its 65 µs median is time no thread is serving it. That is open too.
+
 > **The anchor's hold refusals: a bounded Unix log, and a count in `slates status` (2026-11-04, A-213; siblings of
 > audit step 3).** The Unix device hold logged a line per refused message, unbounded; it now logs each distinct refusal
 > once (`RefusalLog`, as the Windows hold does) and counts every one. Every refusal on either platform's hold channel
