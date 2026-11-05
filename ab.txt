@@ -813,3 +813,5 @@ slates daemon: instance fsb-857-5-new serving on 3 shards under the anchor
 slates-server: shard 0 initialized in 3544 µs
 slates daemon: a heartbeat came 592 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 2 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 2 unattributed), fired 2 timers, waited 1 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 24 ms and its timer overrun 478 ms
 ## run 5 of 5 done, 2026-11-05T17:35:53Z
+To https://github.com/hyper-light/slates
+   efdb0b4..519aa40  519aa4048166f68e03d6f3481a0968410e04f270 -> diag-winfsp-overlap-results-42065971017-windows-11-arm
