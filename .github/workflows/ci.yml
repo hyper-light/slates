@@ -577,7 +577,7 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-server --test observe
-      # A-199: a deleted file's pages leave the working set and read back through the files recreated over them.
+      # A-205: a deleted file's pages leave the working set and read back through the files recreated over them.
       - name: Test a deleted file's memory going back to the OS (native Windows)
         if: ${{ !cancelled() }}
         timeout-minutes: 15
@@ -822,7 +822,7 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 20
         run: cargo test -p slates-client --test shards -- --test-threads=1
-      # A-199: as on x86_64, the pages of a deleted file leave the working set.
+      # A-205: as on x86_64, the pages of a deleted file leave the working set.
       - name: Test a deleted file's memory going back to the OS (native arm64 Windows)
         if: ${{ !cancelled() }}
         timeout-minutes: 15

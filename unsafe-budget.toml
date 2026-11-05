@@ -210,7 +210,7 @@
 
 [budget]
 slates-machine = 53
-# 2026-11-04 (+2, A-199, compiled only for Windows): `Facts::resident_now` reads the working set: the zeroed record and
+# 2026-11-04 (+2, A-205, compiled only for Windows): `Facts::resident_now` reads the working set: the zeroed record and
 #   `K32GetProcessMemoryInfo`, which has no safe wrapper.
 #   Raised 19 → 22 on 2026-09-30 for AUD-29-09 (a shared object hands out no reference to its bytes):
 #   the two plain copies across the mapping's raw pointer (`copy_out`, `copy_in`), the two racy copies
@@ -240,7 +240,7 @@ slates-machine = 53
 # (`proc_pid_rusage` into a buffer of its struct's size and the `assume_init` after it succeeded, 2), with which the
 # give-back's tests observe what macOS counts.
 slates-mem = 63
-# 2026-11-04 (+2, A-199, Windows gives freed pages back, compiled only for Windows): `DiscardVirtualMemory` over a
+# 2026-11-04 (+2, A-205, Windows gives freed pages back, compiled only for Windows): `DiscardVirtualMemory` over a
 #   region's block (`region.rs`, `os::discard_slice`) and over a sparse object's committed run (`shared.rs`,
 #   `Inner::discard`). The call has no safe wrapper.
 # 2026-10-26 (+1, §4.6 A-180, a Shards DAX object on Windows, `dax_object.rs` compiled only for Windows): the object is

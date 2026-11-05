@@ -11480,7 +11480,7 @@ Applied in the same change to:
   `an_idle_purge_resumes_across_calls_and_leaves_freed_bytes_zero` (`crates/mem/src/arena.rs`);
 - BENCHMARKS, GAPS.
 
-Status: built 2026-10-06, Linux; macOS by A-110, Windows by A-199.
+Status: built 2026-10-06, Linux; macOS by A-110, Windows by A-205.
 - What: A-99's zero-on-free is unchanged. A released block is zeroed in place at once, so its plaintext is gone,
   and its pages stay resident for the allocations that follow. The arena counts those zeroed free bytes.
   - At a reap tick (`LIVENESS_BUDGET_NS`), a shard whose content arena allocated nothing since the previous tick gives
@@ -11506,7 +11506,7 @@ Status: built 2026-10-06, Linux; macOS by A-110, Windows by A-199.
   back.
 - Owed:
   - macOS: built by A-110 (2026-10-06).
-  - Windows: built by A-199 (2026-11-04): `DiscardVirtualMemory`, with its zeroing step at reuse, measured.
+  - Windows: built by A-205 (2026-11-04): `DiscardVirtualMemory`, with its zeroing step at reuse, measured.
 
 ### A-106 — Extended attributes through the Linux mount (2026-10-06)
 Applied in the same change to:
@@ -11658,7 +11658,7 @@ Applied in the same change to:
   - `a_deleted_files_memory_goes_back_to_the_os`, now macOS too, on one shard;
 - `unsafe-budget.toml` (+4), A-105's owed list, GAPS, BENCHMARKS.
 
-Status: built 2026-10-06. Windows was owed (A-105) and is built by A-199.
+Status: built 2026-10-06. Windows was owed (A-105) and is built by A-205.
 - What: the A-105 idle purge on macOS marks freed pages `MADV_FREE_REUSABLE`.
   - The footprint (what memory pressure and jetsam count) drops at once.
   - The kernel may take the pages without paging them; a taken page reads zeros, as the zeroed block did.
@@ -11904,7 +11904,7 @@ Applied in the same change to:
   (`crates/server/tests/recovery.rs`), `docs/wip/bench/mem/per_entry.sh` (an idle reading), BENCHMARKS.
 
 Status: built 2026-10-08 (Linux by hole punch; macOS by the reusable mark since the same day, below; Windows by
-`DiscardVirtualMemory` since 2026-11-04, A-199).
+`DiscardVirtualMemory` since 2026-11-04, A-205).
 - macOS (same day): the content object's discard marks the pages `MADV_FREE_REUSABLE`, as the arena's does (A-110),
   and records them; every write clears the mark first (`MADV_FREE_REUSE`), since a marked page that is written stays
   out of the footprint and the kernel's to take. The record starts as the whole object at creation and at opening:
@@ -12794,7 +12794,7 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
 
-### A-199 — Windows gives freed content pages back: `DiscardVirtualMemory`, cleared before reuse (2026-11-04)
+### A-205 — Windows gives freed content pages back: `DiscardVirtualMemory`, cleared before reuse (2026-11-04)
 Applied in the same change to:
 - `crates/mem/src/region.rs` (`os::discard_slice`, `os::reuse_slice` and the mark's three constants on Windows;
   `Region::prepare` widens only where clearing keeps the bytes);

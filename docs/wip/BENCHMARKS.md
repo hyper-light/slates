@@ -3737,7 +3737,7 @@ kept out of the tree.
 **Owed:**
 - Tail rounding: done by A-118 (a sealed chunk's block trimmed to its pages): block rounding 88.6 → 44.3 MB on
   `/usr`, the daemon 34–39 MB smaller at idle, copy time unchanged (the A/B is A-118's table).
-- Windows: built by A-199 (2026-11-04): `DiscardVirtualMemory` over the committed runs. macOS marks the pages reusable
+- Windows: built by A-205 (2026-11-04): `DiscardVirtualMemory` over the committed runs. macOS marks the pages reusable
   since 2026-10-08 (A-117's macOS note).
 
 ### Measured and rejected: no write delegation for an open that creates (condition 12; 2026-10-08)
@@ -7772,7 +7772,7 @@ pattern (`fsbench` 10–28×).
 
 
 
-## What a write costs on pages given back on Windows (A-199; VFS plan step 12; 2026-11-04)
+## What a write costs on pages given back on Windows (A-205; VFS plan step 12; 2026-11-04)
 
 jupiter (AMD Ryzen AI MAX+ 395, 32 threads, 124 GiB, Windows 11 Pro 10.0.26200), load average 20 to 30 from other agents'
 builds and tests on the box, rustc 1.98.1, release. The rounds interleave the rows; all 11 are shown.
