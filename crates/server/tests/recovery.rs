@@ -2900,8 +2900,8 @@ fn a_sealed_files_block_is_trimmed_to_its_pages_and_survives_a_restart() {
 }
 
 /// A-214 (VFS plan step 11). Do: on a one-shard daemon over a held anchor, write a file of many chunks (the shard's
-/// write burst), publish, and leave the shard idle until its refill has run (the pre-fault counted, and the content
-/// object's allocation then still across more than a reap tick) or the bound passes; then write a second file of the same size, watching the content object's allocated bytes across that
+/// write burst), publish, and leave the shard idle for two reap ticks (`content.ticks.idle`), by which its idle work, the
+/// reserve's refill, has finished, or until the bound passes; then write a second file of the same size, watching the content object's allocated bytes across that
 /// write. Expect the second burst to land on pages already resident: the object grows by less than a quarter of the
 /// file during the write, and the idle pre-fault is counted (`content.prefaulted_bytes`). Before A-214 the idle purge
 /// left no free page resident, so the second file's every page was allocated, and faulted fresh, during its write: the
@@ -2953,22 +2953,20 @@ fn a_burst_after_idle_lands_on_pages_the_idle_shard_prefaulted() {
   };
   let file = u64::try_from(body.len()).unwrap();
   let content = format!("slates-con-{tag}");
-  let after_first = allocated_in_content(&content);
-  // The idle refill climbs the object's allocation by the reserve's pages not yet resident (the burst's freed blocks
-  // already are), slice by slice within one idle tick: wait until it has begun and the allocation then holds still
-  // across more than a reap tick, or the bound passes.
-  let tick = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS) * 3 / 2;
+  // The refill is the shard's idle work, so once the shard has been idle a whole reap tick it has finished: wait for two
+  // idle ticks after the first write (`content.ticks.idle`), or the bound.
+  let idle_ticks = || {
+    daemon
+      .refusals_on_every_shard()
+      .unwrap()
+      .get("content.ticks.idle")
+      .copied()
+      .unwrap_or(0)
+  };
+  let ticks_before = idle_ticks();
   let started = Instant::now();
-  let mut last = after_first;
-  loop {
-    #[allow(clippy::disallowed_methods)]
-    // a test waits out the daemon's reap ticks, which run on their own clock
-    std::thread::sleep(tick);
-    let now = allocated_in_content(&content);
-    if (prefaulted() > 0 && now == last) || started.elapsed() >= PREFAULT_WAIT {
-      break;
-    }
-    last = now;
+  while idle_ticks() < ticks_before + 2 && started.elapsed() < PREFAULT_WAIT {
+    std::thread::yield_now();
   }
   let reserved = prefaulted();
   let before = allocated_in_content(&content);
