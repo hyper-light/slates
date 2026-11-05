@@ -816,3 +816,5 @@ slates daemon: instance fsb-1514-5-new serving on 3 shards under the anchor
 slates-winfsp: reply spin window = 9200 ns: the median one-way channel wake of 15 (the 2-competitive spin)
 slates daemon: a heartbeat came 678 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 1 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 1 unattributed), fired 1 timers, waited 1 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 23 ms and its timer overrun 578 ms
 ## run 5 of 5 done, 2026-11-05T21:12:29Z
+To https://github.com/hyper-light/slates
+   72f85de..c79ed28  c79ed284da95c01e7f45433a6600b979d644334c -> diag-winfsp-overlap-results-42100630998-windows-11-arm
