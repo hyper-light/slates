@@ -1432,7 +1432,6 @@ dependencies = [
  "slates-bridge-nfs",
  "slates-bridge-oci",
  "slates-bridge-virtiofs",
- "slates-bridge-winfsp",
  "slates-client",
  "slates-db",
  "slates-guest-probe",
@@ -2356,6 +2355,7 @@ version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "blake3",
+ "cc",
  "rcgen",
  "rustix",
  "serde",

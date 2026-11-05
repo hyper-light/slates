@@ -32,6 +32,11 @@ rcgen = { workspace = true }
 # The Linux grant path reopens the anchor's memfd handoff and makes it inheritable.
 rustix = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+# The Windows conformance suites' C (the WinFsp fsx port, winfstest's driver) is built with MSVC's cl.exe, found with
+# its environment as every build script finds it (`cc::windows_registry`), so the lane needs no developer prompt.
+cc = { workspace = true }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # The hermeticity tracer names the daemon's own socket node by the route's own path function (A-161).
 slates-ipc = { workspace = true }
