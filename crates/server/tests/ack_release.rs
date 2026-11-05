@@ -424,3 +424,68 @@ fn check_recovered(run: &RefusedRelease) {
     run.fresh
   );
 }
+
+/// What a scatter answered with its other shard held and that shard's control channel full, and how long it took.
+fn scattered_with_the_other_shard_full(
+  name: &str,
+  body: &RequestBody,
+) -> (usize, ReplyBody, Duration) {
+  static HELD: AtomicBool = AtomicBool::new(false);
+  let (daemon, instance) = daemon(name);
+  let mut client = Client::connect(&instance);
+  let other = 1 - serving(&daemon, client.client);
+  let holding = hold(&daemon, other, HOLD, &HELD);
+  let flooded = daemon.flood_control_channel_of(other).unwrap();
+  let started = Instant::now();
+  let (_, reply) = client.call(body);
+  let took = started.elapsed();
+  holding.join().unwrap();
+  let shard = usize::from(daemon.shards()[other].0);
+  daemon.stop();
+  assert!(flooded > 0, "the other shard's control channel was filled");
+  (shard, reply, took)
+}
+
+/// The answer a scatter must give when a part cannot be sent to `shard`: the typed refusal, inside the hold.
+fn check_typed_refusal(verb: &str, (other, reply, took): (usize, ReplyBody, Duration)) {
+  assert!(
+    matches!(reply, ReplyBody::Refused { refusal: Refusal::Overloaded { shard } } if usize::from(shard) == other),
+    "{verb} with the other shard's control channel full: {reply:?}"
+  );
+  assert!(
+    took < HOLD / 2,
+    "{verb} was answered in {took:?}, against a {HOLD:?} hold of the other shard"
+  );
+}
+
+/// §4.14, A-216's sibling sweep. Do: on a two-shard daemon, hold the other shard and fill its control channel, then
+/// list the volumes. Expect: `Overloaded { shard }` naming the other shard, in under half the hold. Before, the
+/// listing's part for that shard was settled through a nested state borrow that never ran, and the listing was never
+/// answered.
+#[test]
+fn a_listing_whose_part_cannot_be_sent_is_refused_overloaded() {
+  check_typed_refusal(
+    "list",
+    scattered_with_the_other_shard_full("list-full", &RequestBody::List),
+  );
+}
+
+/// §4.8 grants, A-216's sibling sweep. Do: as the listing test, but ask for the grants. Expect: `Overloaded { shard }`,
+/// in under half the hold; before, never answered.
+#[test]
+fn a_grants_listing_whose_part_cannot_be_sent_is_refused_overloaded() {
+  check_typed_refusal(
+    "grants",
+    scattered_with_the_other_shard_full("grants-full", &RequestBody::Grants),
+  );
+}
+
+/// §4.14 `slates.status`, A-216's sibling sweep. Do: as the listing test, but ask for the daemon's status. Expect:
+/// `Overloaded { shard }`, in under half the hold; before, never answered.
+#[test]
+fn a_daemon_status_whose_part_cannot_be_sent_is_refused_overloaded() {
+  check_typed_refusal(
+    "status",
+    scattered_with_the_other_shard_full("status-full", &RequestBody::DaemonStatus),
+  );
+}
