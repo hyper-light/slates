@@ -825,43 +825,24 @@ fn run(bridge: &mut dyn Bridge, cx: &OpContext, op: Op<Open>) -> Result<Reply, V
     Op::Rename { from, to, replace } => op_rename(bridge, cx, &from, &to, replace)?,
     Op::CanDelete { object } => op_can_delete(bridge, cx, object.object, object.fh)?,
     Op::SetAllocation { object, new_size } => {
-      let attr = bridge.getattr(object.object, cx)?;
-      let attr = if new_size < attr.size {
-        bridge.setattr(
-          object.object,
-          cx,
-          SetAttr {
-            size: Some(new_size),
-            ..SetAttr::default()
-          },
-        )?
-      } else {
-        attr
-      };
-      object_reply(&attr, 0)?
+      op_set_allocation(bridge, cx, object.object, new_size)?
     }
     Op::SetTimes {
       object,
       atime,
       mtime,
       ctime,
-    } => {
-      let attr = if atime.is_none() && mtime.is_none() && ctime.is_none() {
-        bridge.getattr(object.object, cx)?
-      } else {
-        bridge.setattr(
-          object.object,
-          cx,
-          SetAttr {
-            atime,
-            mtime,
-            ctime,
-            ..SetAttr::default()
-          },
-        )?
-      };
-      object_reply(&attr, 0)?
-    }
+    } => op_set_times(
+      bridge,
+      cx,
+      object.object,
+      SetAttr {
+        atime,
+        mtime,
+        ctime,
+        ..SetAttr::default()
+      },
+    )?,
     Op::Flush { object } => {
       bridge.flush(object.object, cx, object.fh)?;
       object_reply(&bridge.getattr(object.object, cx)?, 0)?
@@ -974,6 +955,45 @@ fn replaces_a_directory(
   }
   let source = bridge.lookup(old_parent, cx, from_name)?;
   Ok((source.ino, source.generation) != (target.ino, target.generation))
+}
+
+/// `SetFileSize` with `SetAllocationSize`: an allocation below the file's size truncates the file to it; any other
+/// leaves it as it is. The object's information either way.
+fn op_set_allocation(
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  object: ObjectId,
+  new_size: u64,
+) -> Result<Reply, VfsError> {
+  let attr = bridge.getattr(object, cx)?;
+  let attr = if new_size < attr.size {
+    bridge.setattr(
+      object,
+      cx,
+      SetAttr {
+        size: Some(new_size),
+        ..SetAttr::default()
+      },
+    )?
+  } else {
+    attr
+  };
+  object_reply(&attr, 0)
+}
+
+/// `SetBasicInfo`'s times applied (`times` carries only them); a call that sets none reads the object.
+fn op_set_times(
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  object: ObjectId,
+  times: SetAttr,
+) -> Result<Reply, VfsError> {
+  let attr = if times == SetAttr::default() {
+    bridge.getattr(object, cx)?
+  } else {
+    bridge.setattr(object, cx, times)?
+  };
+  object_reply(&attr, 0)
 }
 
 /// Format: the most entries `CanDelete` reads of a directory: its `.` and `..`, which the bridge's `readdir` lists
