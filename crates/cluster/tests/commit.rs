@@ -126,6 +126,17 @@ fn run_commit_with_budget(
   holder_generation: u64,
   budget: CommitBudget,
 ) -> (Result<Placement, String>, Option<u64>) {
+  let (outcome, stale, _) = run_commit_timed(serve, holder_generation, budget);
+  (outcome, stale)
+}
+
+/// Runs the same wire history and also returns how long the commit took on the simulation's virtual clock, from
+/// its call to its return.
+fn run_commit_timed(
+  serve: [bool; 2],
+  holder_generation: u64,
+  budget: CommitBudget,
+) -> (Result<Placement, String>, Option<u64>, u64) {
   let mut sim = SimRuntime::new(&config(), 1).unwrap();
   let id = sim.shard_ids()[0];
 
@@ -215,6 +226,7 @@ fn run_commit_with_budget(
 
       let mut owner_acceptor = Acceptor::new(OWNER, authority());
       let candidates = [OWNER, HostId(2), HostId(3)];
+      let started = slates_rt::futures::now_ns();
       let committed = commit_record(
         OWNER,
         &mut owner_acceptor,
@@ -225,14 +237,37 @@ fn run_commit_with_budget(
         budget,
       )
       .await;
+      let elapsed = slates_rt::futures::now_ns().saturating_sub(started);
       let stale = committed.stale_version;
       let outcome = committed.outcome.map_err(|e: ClusterError| e.to_string());
-      let _ = result_tx.send((outcome, stale));
+      let _ = result_tx.send((outcome, stale, elapsed));
     })
     .unwrap();
 
   sim.run_until_idle();
   result_rx.try_recv().unwrap()
+}
+
+/// §4.8 "commits at f + 1 acknowledgements": a commit returns when its quorum's last acknowledgement lands, not at
+/// the collection loop's next poll. Over the simulated fabric's instant paths, with the daemon's 10 ms poll, the
+/// quorum's replies arrive within microseconds of virtual time; a collector that only woke at its poll returned at
+/// 10 ms, so every placement cost the poll however fast the holders were (`replication_bench`, 2026-11-04: 10.1 ms at
+/// the median over an 11.5 µs round trip).
+#[test]
+fn a_commit_returns_at_its_quorum_not_at_its_poll() {
+  /// Shape: the daemon's record poll, a tenth of its 100 ms heartbeat.
+  const DAEMON_POLL_NS: u64 = 10_000_000;
+  let (outcome, _, elapsed_ns) = run_commit_timed(
+    [true, true],
+    GENERATION,
+    CommitBudget::hard(DEADLINE_NS, DAEMON_POLL_NS),
+  );
+  let placement = outcome.unwrap();
+  assert!(placement.acked.len() >= 2, "owner plus a holder placed it");
+  assert!(
+    elapsed_ns < DAEMON_POLL_NS,
+    "the commit took {elapsed_ns} ns of virtual time, at least its {DAEMON_POLL_NS} ns poll"
+  );
 }
 
 /// The placement of a normal `f = 1` commit — holders on the owner's own configuration generation, so they

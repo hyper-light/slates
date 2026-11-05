@@ -344,7 +344,7 @@ pub struct SparseObject {
 /// The ranges of a shared object of `len` bytes that may carry a reusable mark when it is mapped: all of it where a
 /// discard leaves one (an earlier holder may have discarded any range), none elsewhere.
 fn possibly_marked(len: usize, page: usize) -> crate::ranges::UnitSet {
-  if crate::region::DISCARD_LEAVES_A_MARK {
+  if crate::region::A_WRITE_NEEDS_THE_MARK_CLEARED {
     crate::ranges::UnitSet::whole(len, page)
   } else {
     crate::ranges::UnitSet::new(0, page)
@@ -493,20 +493,17 @@ impl SparseObject {
   /// Gives the whole pages inside `offset .. offset + len` back to the OS (A-105, A-117): on Linux the range becomes a
   /// hole that reads zeros and costs no RAM until written again; on macOS its pages are marked reusable (A-110), out
   /// of the footprint at once, reading what they held until the kernel takes them and zeros after, and recorded so the
-  /// next write clears the mark first. For a range nothing reads until it is written again (a cleared write log, a
+  /// next write clears the mark first; on Windows its committed pages leave the working set (`DiscardVirtualMemory`),
+  /// reading what they held or zeros, and a write simply keeps the page it wrote, so no record is needed and no write
+  /// ever clears a neighbouring byte. For a range nothing reads until it is written again (a cleared write log, a
   /// stale checkpoint slot), so the partial pages at its ends need nothing. The bytes given back, zero where the OS
   /// took none. Refused as [`SparseObject::write`] is.
   pub fn discard(&mut self, offset: usize, len: usize) -> Result<usize, MemError> {
     check_copy(&self.words, offset, len, self.len)?;
-    if crate::region::DISCARD_LEAVES_A_MARK {
+    if crate::region::A_WRITE_NEEDS_THE_MARK_CLEARED {
       return Ok(self.mark_reusable(offset, len));
     }
-    Ok(
-      self
-        .inner
-        .discard(offset, len)
-        .map_or(0, |(first, last)| last.saturating_sub(first)),
-    )
+    Ok(self.inner.discard(&self.commits, offset, len))
   }
 
   /// Marks the whole pages inside `offset .. offset + len` reusable and records them: the bytes marked.
@@ -1299,20 +1296,23 @@ mod platform {
     }
 
     /// Gives the whole pages inside `offset .. offset + len` back to the OS, leaving a hole that reads as zeros in
-    /// every mapping of the object (`MADV_REMOVE`, which on a memfd is a hole punch): the page-aligned range given
-    /// back, or `None` (nothing changed) where there is no whole page or the OS refused.
+    /// every mapping of the object (`MADV_REMOVE`, which on a memfd is a hole punch): the bytes given back,
+    /// zero (nothing changed) where there is no whole page or the OS refused.
     #[cfg(all(target_os = "linux", not(miri)))]
-    pub(super) fn discard(&mut self, offset: usize, len: usize) -> Option<(usize, usize)> {
+    pub(super) fn discard(&mut self, _commits: &Commits, offset: usize, len: usize) -> usize {
       let page = rustix::param::page_size().max(1);
-      let end = offset
-        .checked_add(len)
-        .filter(|end| *end <= self.map.len())?;
+      let Some(end) = offset.checked_add(len).filter(|end| *end <= self.map.len()) else {
+        return 0;
+      };
       let first = offset.next_multiple_of(page);
       let last = end.saturating_sub(end.checked_rem(page).unwrap_or(0));
-      let interior = self
+      let Some(interior) = self
         .map
         .get_mut(first..last)
-        .filter(|interior| !interior.is_empty())?;
+        .filter(|interior| !interior.is_empty())
+      else {
+        return 0;
+      };
       // SAFETY: `interior` is a live, page-aligned run of whole pages of this object's own shared mapping, borrowed
       // mutably for the call; `MADV_REMOVE` replaces exactly those bytes with zeros (in this mapping and every other
       // of the object), which is what the caller asks for. No lock is held on this map's pages (a sparse object is
@@ -1324,15 +1324,14 @@ mod platform {
           rustix::mm::Advice::LinuxRemove,
         )
       }
-      .ok()
-      .map(|()| (first, last))
+      .map_or(0, |()| last.saturating_sub(first))
     }
 
     /// No page goes back here (a POSIX shared memory object has no hole to punch; Miri models no `madvise`): the
     /// caller writes the zeros itself.
     #[cfg(not(all(target_os = "linux", not(miri))))]
-    pub(super) fn discard(&mut self, _offset: usize, _len: usize) -> Option<(usize, usize)> {
-      None
+    pub(super) fn discard(&mut self, _commits: &Commits, _offset: usize, _len: usize) -> usize {
+      0
     }
 
     pub(super) fn lock(&mut self) -> Result<(), MemError> {
@@ -1392,9 +1391,9 @@ mod platform {
   };
 
   use windows_sys::Win32::System::Memory::{
-    CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEM_COMMIT, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
-    OpenFileMappingW, PAGE_PROTECTION_FLAGS, PAGE_READWRITE, SEC_RESERVE, UnmapViewOfFile,
-    VirtualAlloc, VirtualLock,
+    CreateFileMappingW, DiscardVirtualMemory, FILE_MAP_ALL_ACCESS, MEM_COMMIT,
+    MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, OpenFileMappingW, PAGE_PROTECTION_FLAGS,
+    PAGE_READWRITE, SEC_RESERVE, UnmapViewOfFile, VirtualAlloc, VirtualLock,
   };
   use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 
@@ -1453,6 +1452,7 @@ mod platform {
     unsafe { CloseHandle(handle) };
   }
 
+  /// A view of `len` bytes at `offset` of the section `handle` names. The handle stays its caller's on either answer.
   fn view(handle: HANDLE, offset: usize, len: usize) -> Result<*mut c_void, MemError> {
     let offset = u64::try_from(offset).unwrap_or(u64::MAX);
     let high = u32::try_from(offset >> u32::BITS).unwrap_or(u32::MAX);
@@ -1461,9 +1461,7 @@ mod platform {
     // system refuses (null) an offset off its allocation granularity or a span past the section.
     let view = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, high, low, len) };
     if view.Value.is_null() {
-      let err = os("MapViewOfFile");
-      close(handle);
-      return Err(err);
+      return Err(os("MapViewOfFile"));
     }
     Ok(view.Value)
   }
@@ -1484,11 +1482,11 @@ mod platform {
     handle: std::os::windows::io::OwnedHandle,
     len: usize,
   ) -> Result<Inner, MemError> {
-    use std::os::windows::io::IntoRawHandle;
-    let handle = handle.into_raw_handle();
-    let view = view(handle, 0, len)?;
+    use std::os::windows::io::{AsRawHandle, IntoRawHandle};
+    // Mapped first: a refused view drops `handle`, which closes it, and only a view that exists takes ownership.
+    let view = view(handle.as_raw_handle(), 0, len)?;
     Ok(Inner {
-      handle: handle.expose_provenance(),
+      handle: handle.into_raw_handle().expose_provenance(),
       view: view.expose_provenance(),
       len,
       name: String::new(),
@@ -1541,7 +1539,7 @@ mod platform {
         code: i32::try_from(ERROR_ALREADY_EXISTS).ok(),
       });
     }
-    let view = view(handle, 0, len)?;
+    let view = view(handle, 0, len).inspect_err(|_| close(handle))?;
     Ok(Inner {
       handle: handle.expose_provenance(),
       view: view.expose_provenance(),
@@ -1585,7 +1583,7 @@ mod platform {
     if handle.is_null() {
       return Err(os("OpenFileMappingW"));
     }
-    let view = view(handle, offset, len)?;
+    let view = view(handle, offset, len).inspect_err(|_| close(handle))?;
     Ok(Inner {
       handle: handle.expose_provenance(),
       view: view.expose_provenance(),
@@ -1600,6 +1598,8 @@ mod platform {
   /// committed is committed again here once, harmlessly (`VirtualAlloc` of committed pages succeeds).
   pub(super) struct Commits {
     granule: usize,
+    /// The machine's page, the unit a discard gives back.
+    page: usize,
     bits: Box<[Cell<u64>]>,
   }
 
@@ -1624,6 +1624,7 @@ mod platform {
       let words = granules.div_ceil(u64::BITS as usize);
       Ok(Commits {
         granule,
+        page: usize::try_from(info.dwPageSize).unwrap_or(granule).max(1),
         bits: (0..words).map(|_| Cell::new(0)).collect(),
       })
     }
@@ -1722,10 +1723,42 @@ mod platform {
       unsafe { std::slice::from_raw_parts_mut(self.base(), self.len) }
     }
 
-    /// No page goes back here yet (decommitting a section's view leaves its pages charged to the section; owed with a
-    /// measurement): the caller writes the zeros itself.
-    pub(super) fn discard(&mut self, _offset: usize, _len: usize) -> Option<(usize, usize)> {
-      None
+    /// Gives the whole pages inside `offset .. offset + len` that this process committed back to the OS
+    /// (`DiscardVirtualMemory`): they leave the working set at once with their contents dropped, and the
+    /// section stays charged for them. A page holds what it held or zeros until it is next written, which keeps it.
+    /// A reserved page holds nothing, and the call refuses a range that has one, so only committed granules are named;
+    /// a granule only another process committed has no page in this working set. The bytes given back.
+    pub(super) fn discard(&mut self, commits: &Commits, offset: usize, len: usize) -> usize {
+      let Some(end) = offset.checked_add(len).filter(|end| *end <= self.len) else {
+        return 0;
+      };
+      let first = offset.next_multiple_of(commits.page);
+      let last = end.saturating_sub(end.checked_rem(commits.page).unwrap_or(0));
+      let mut given_back = 0usize;
+      let mut at = first;
+      let granule_of = |at: usize| at.checked_div(commits.granule).unwrap_or(0);
+      while at < last {
+        let run_start = at;
+        let committed = commits.is_committed(granule_of(at));
+        while at < last && commits.is_committed(granule_of(at)) == committed {
+          at = granule_of(at)
+            .saturating_add(1)
+            .saturating_mul(commits.granule)
+            .min(last);
+        }
+        if committed {
+          let span = at.saturating_sub(run_start);
+          // SAFETY: `run_start .. at` lies inside this process's view of the section (`last <= end <= self.len`), a
+          // run of whole, committed pages; the call changes only those pages' contents, which the caller gave up, and
+          // no reference to them is live (a sparse object reaches its bytes by copy, each through its own commit).
+          let refused =
+            unsafe { DiscardVirtualMemory(self.base().wrapping_add(run_start).cast(), span) };
+          if refused == 0 {
+            given_back = given_back.saturating_add(span);
+          }
+        }
+      }
+      given_back
     }
 
     pub(super) fn lock(&mut self) -> Result<(), MemError> {

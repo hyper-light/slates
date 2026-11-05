@@ -2,7 +2,6 @@
 //! compiles this module afresh, so a helper one test does not use is dead code there — allowed here.
 #![allow(dead_code)]
 
-#[cfg(unix)]
 pub(crate) mod anchor;
 pub(crate) mod client;
 #[cfg(unix)]

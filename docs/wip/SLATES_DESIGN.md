@@ -4136,8 +4136,9 @@ root-relative path as an explicit alternative; it does not report that the reque
 ```rust
 #[repr(C, align(64))] struct Slot { seq: AtomicU64, kind: u16, len: u16, payload: [u8; 44], pad: [u8; 4] }
 struct Ring { slots: [Slot; N], head: CachePadded<AtomicU64>, tail: CachePadded<AtomicU64> }
-struct ClientRegion { magic, version /* 2 */, client_id, shard: u16, cmd: Ring, cpl: Ring, wake: WakeWord, parked: AtomicU32,
-                     spin_ns: u32, spin_shift: u32, reply_stamp: AtomicU64 /* bit 63: the wake found a sleeper */ }
+struct ClientRegion { magic, version /* 3 */, client_id, shard: u16, cmd: Ring, cpl: Ring, wake: WakeWord, parked: AtomicU32,
+                     spin_ns: u32, spin_shift: u32,
+                     reply_stamp: [AtomicU64; 2] /* one per park parity; bit 63: the wake found a sleeper */ }
 ```
 Ownership: the daemon creates the region (memfd / shm_open object / pagefile section), locks it,
 and hands it to one client; the client writes only `cmd` slots and the `parked` flag; the daemon
@@ -4219,12 +4220,13 @@ a slot kind.
 
 **Wake strategy.** Client: write slot, publish `tail` (release), read `cpl` head with acquire in a
 loop for its wake estimate (seeded with `spin_ns`, the daemon-published measured wake cost, and
-refined from the client's own parks, A-31), then clear the reply stamp, set `parked = 1`, fence
+refined from the client's own parks, A-31), then clear the reply stamp slot this park names (the two
+slots alternate park by park, A-199), set `parked` to that slot's value (1 or 2), fence
 (`SeqCst`; the park protocol, A-44), re-check the reply (to close the race), and wait on the wake word
 (futex / `os_sync_wait_on_address(SHARED)` / the Event). Daemon: after writing a reply and advancing
 the wake word, fence and read `parked`; if set, advance the word once more, stamp the host clock into
-`reply_stamp` (the first reply of the park only), wake (futex wake / wake by address / `SetEvent`),
-mark the stamp confirmed when the wake reports it found a sleeper (Linux and macOS; Windows' Event
+the `reply_stamp` slot the flag's value names (the first reply of the park only), wake (futex wake / wake by address / `SetEvent`),
+mark that stamp confirmed when the wake reports it found a sleeper (Linux and macOS; Windows' Event
 cannot tell, so there a stamp inside the wait is taken unconfirmed), and, for SDK event loops, signal
 the completion fd (eventfd / pipe / socket) so `add_reader`/`uv_poll` fires. Where no descriptor can be
 shared (macOS, Windows), a client-local bridge thread makes its pipe or socket readable after every
@@ -4245,6 +4247,19 @@ drops.
 > **Status (2026-09-22, the client ring follows Little's law).** The client ring was not sized by the formula below: `slots_per_ring` reused the runtime's inbound-ring depth, `wake.p99 / syscall.median` from one boot probe, and each client's bulk area scales with it. The probe's tail is unstable (the pod image's own profile gave wake p99 from 667 ns to 511,042 ns across runs a minute apart, often from 64 samples), so three KIND pods of one image derived 16384, 8 and 256 slots and seated 1, 1285 and 41 clients; the one-seat pod refused the lane's `bootstrap` while its readiness probe held the seat, and CI's macOS runner seated two clients and refused the restart test's third. The ring is now `next_power_of_two(requests_in_flight_per_shard)`, this Little's law value (32 slots); every pod of a two-CPU fresh-cluster run logs 32 slots and 330 client seats. Owed: the admission value rests on two stated assumptions rather than measured rates. (The wake probe's two events and unconverged tail, and `spin_ns` reading the p50, were closed on 2026-09-25: §4.1's status.) Record: `docs/bugs/2026-09-22-client-ring-sized-by-the-wake-tail-not-littles-law.md`.
 
 > **Status (2026-09-25, A-31: the client learns its own wake).** A client spun for the daemon's boot mean for its whole life. It now spins for an online estimate seeded with that mean (`spin_ns`, weighted over about `2^spin_shift` wakes) and refined from its own parks: the daemon stamps the host clock into the region's `reply_stamp` before it wakes a parked client, marks it confirmed when its wake call reports a sleeper found (`futex_wake`'s count; `os_sync_wake_by_address_any` refuses `ENOENT` when none), and the client folds a confirmed stamp inside its wait into the estimate (`ClientEnd::wait`, `wake_samples`); a confirmation that lands after the woken client read the stamp is settled at its next wait. The region's layout goes to version 2 (a client of another version is refused by name, as before). Confirmation is not decoration: without it, a daemon replying the instant the parked flag rose taught the client 611–974 ns on Apple silicon against the boot probe's 2.0–3.3 µs for confirmed sleepers, because such a reply lands while the client's wait is being set up and the wait returns without sleeping. The same evidence corrects a benchmark: `ipc_bench`'s `ring_round_trip_parked_and_woken` row (ratcheted at 1,233 ns here) is mostly that race — of 2,000 parked trips per run only 2, 18, 11, 1 and 1 slept on Apple silicon and 1–3 on Linux (503–545 ns, against a confirmed-sleeper mean of 15–17 µs there); the bench now prints the count, and `docs/wip/BENCHMARKS.md` records the correction. Proven by use in `crates/ipc/tests/rings.rs` (`a_client_learns_its_wake_from_the_parks_a_reply_ended`; a client that never parked learns nothing and keeps the published window). Record: `docs/bugs/2026-09-25-wake-estimate-frozen-at-boot-and-preemptions-counted-as-long-steps.md`.
+
+> **Status (2026-11-04, A-199: a late confirmation keeps its own stamp).** The woken client can outrun its waker:
+> the daemon is preempted between its wake call and the confirmation, and the client takes its reply, sends the
+> next request and arms its next park first. With one stamp that park cleared the word, so the sample was given
+> up, and the late confirmation then set a bare confirmed bit on the cleared word, which refused the following
+> park's stamp: one late confirmation cost two samples. Measured on adacachy, 2026-11-04, the learning case pinned
+> to two busy CPUs taught 0–14 of 32 parks; in every failing run the out-of-window stamps (all zero) matched the
+> given-up ones one for one. Now the region holds two stamps, the parks alternate between them, and the parked
+> flag's value (1 or 2) names the slot; the confirmation is an exchange on the exact stamp the wake timed. One
+> daemon serves a ring in order, so by the time the client arms a slot again the reply call that stamped it has
+> returned and its confirmation is final. The region's layout goes to version 3. Interleaved, 100 runs each, the
+> learning case failed 100 of 100 before and 0 of 100 after on one CPU with two busy loops, and 89 and 0 on two
+> CPUs with four. Record: `docs/bugs/2026-11-04-a-late-wake-confirmation-cost-the-client-two-samples.md`.
 
 > **Status (2026-09-29, A-42: the idle spin is opened by client activity and ends with its window).** The
 > daemon set a shard "active" at its first client's handoff and nothing cleared it, so from then on every
@@ -4807,6 +4822,16 @@ reconnaissance because the touched partitions are named up front).
    on the owner (and in its anchor segment). The `seal_schedule` seals each volume at its derived
    cadence; a volume with policy `live-shipped` additionally ships its op log to f+1 of its
    candidates and is acknowledged at f+1.
+
+> **Status (2026-11-04, a commit returns at its quorum).** Every quorum dispatch (record commits, ledger promotions,
+> group rounds, content puts) is collected by a loop that is woken by each reply, not only by its poll: a dispatch
+> task sends its reply and wakes the collector (`ReplyTx`, `DispatchWait::keep_waiting` in `crates/cluster/src/lib.rs`).
+> Before, the collector slept a whole poll after its quorum had answered. Measured over real loopback endpoints with
+> the daemon's derived runtime (`replication_bench`, five interleaved rounds at load 36–42): a record commit at f=1
+> took 10,125–10,194 µs at the median at the daemon's 10 ms poll, and takes 18.9–19.9 µs (p99 28.8–32.9 µs) now,
+> about one and a half 12 µs round trips. Record: `docs/bugs/2026-11-04-a-quorum-collector-waited-out-its-poll.md`.
+> Still owed for per-write replication: live shipping itself (§4.10) and the 100 ms record period a head waits for
+> before its commit begins.
 
 
 > **Consensus enhancements: the explorer and leadership transfer (2026-09-28;
@@ -11498,7 +11523,7 @@ Applied in the same change to:
   `an_idle_purge_resumes_across_calls_and_leaves_freed_bytes_zero` (`crates/mem/src/arena.rs`);
 - BENCHMARKS, GAPS.
 
-Status: built 2026-10-06, Linux. macOS and Windows keep their pages (owed below).
+Status: built 2026-10-06, Linux; macOS by A-110, Windows by A-205.
 - What: A-99's zero-on-free is unchanged. A released block is zeroed in place at once, so its plaintext is gone,
   and its pages stay resident for the allocations that follow. The arena counts those zeroed free bytes.
   - At a reap tick (`LIVENESS_BUDGET_NS`), a shard whose content arena allocated nothing since the previous tick gives
@@ -11524,8 +11549,7 @@ Status: built 2026-10-06, Linux. macOS and Windows keep their pages (owed below)
   back.
 - Owed:
   - macOS: built by A-110 (2026-10-06).
-  - Windows: `DiscardVirtualMemory` leaves the contents undefined, so it needs its own zeroing step and a
-    measurement.
+  - Windows: built by A-205 (2026-11-04): `DiscardVirtualMemory`, with its zeroing step at reuse, measured.
 
 ### A-106 — Extended attributes through the Linux mount (2026-10-06)
 Applied in the same change to:
@@ -11677,7 +11701,7 @@ Applied in the same change to:
   - `a_deleted_files_memory_goes_back_to_the_os`, now macOS too, on one shard;
 - `unsafe-budget.toml` (+4), A-105's owed list, GAPS, BENCHMARKS.
 
-Status: built 2026-10-06. Windows remains owed (A-105).
+Status: built 2026-10-06. Windows was owed (A-105) and is built by A-205.
 - What: the A-105 idle purge on macOS marks freed pages `MADV_FREE_REUSABLE`.
   - The footprint (what memory pressure and jetsam count) drops at once.
   - The kernel may take the pages without paging them; a taken page reads zeros, as the zeroed block did.
@@ -11922,8 +11946,8 @@ Applied in the same change to:
 - the test `recovery_memory_no_restart_reads_goes_back_and_a_restart_recovers_every_file`
   (`crates/server/tests/recovery.rs`), `docs/wip/bench/mem/per_entry.sh` (an idle reading), BENCHMARKS.
 
-Status: built 2026-10-08 (Linux by hole punch; macOS by the reusable mark since the same day, below; Windows keeps the
-pages, its content object having no page to give back yet, `SparseObject::discard`).
+Status: built 2026-10-08 (Linux by hole punch; macOS by the reusable mark since the same day, below; Windows by
+`DiscardVirtualMemory` since 2026-11-04, A-205).
 - macOS (same day): the content object's discard marks the pages `MADV_FREE_REUSABLE`, as the arena's does (A-110),
   and records them; every write clears the mark first (`MADV_FREE_REUSE`), since a marked page that is written stays
   out of the footprint and the kernel's to take. The record starts as the whole object at creation and at opening:
@@ -12878,6 +12902,57 @@ Measurements and run ids are in the GAPS entry.
   - The driver checks no length when a directory's rename lengthens the names beneath it (`FspFileNodeRename`), so a
     rename that would take a held name past the cap is refused `STATUS_NAME_TOO_LONG` before it has any effect.
 
+### A-205 — Windows gives freed content pages back: `DiscardVirtualMemory`, cleared before reuse (2026-11-04)
+Applied in the same change to:
+- `crates/mem/src/region.rs` (`os::discard_slice`, `os::reuse_slice` and the mark's three constants on Windows;
+  `Region::prepare` widens only where clearing keeps the bytes);
+- `crates/mem/src/shared.rs` (the Windows `Inner::discard`, over committed runs; `Commits` knows the page);
+- `crates/machine/src/facts.rs` (`Facts::resident_now` on Windows, the working set);
+- the tests `crates/mem/tests/give_back.rs` and `crates/server/tests/give_back.rs`, and the bench
+  `crates/mem/examples/give_back_bench.rs`;
+- `unsafe-budget.toml` (mem +2, machine +2), the Windows CI lanes, A-105, A-110, A-117, GAPS, BENCHMARKS.
+
+Status: built 2026-11-04. It closes the Windows owed items of A-105, A-110 and A-117.
+- What: at the idle purge a freed block's pages and the recovery memory no restart reads go back through
+  `DiscardVirtualMemory`. They leave the working set at once, and their contents are dropped rather than paged out
+  (Microsoft's documentation of the call; the working set is what is measured here).
+- Why this call, measured on jupiter over a 256 MiB pagefile section, committed `SEC_RESERVE` and plain alike
+  (a scratch probe, 2026-11-04, the working set before and after):
+  - `DiscardVirtualMemory`: 260 to 4 MiB, in one call that answers success.
+  - `MEM_RESET` alone: 260 to 260 MiB. It only spares the pages a write to the paging file until the OS wants them.
+  - `MEM_RESET` then `VirtualUnlock`: 260 to 4 MiB, but the unlock answers `ERROR_NOT_LOCKED` when it works, so its
+    failure and its success look alike.
+  - `VirtualUnlock` alone: 260 to 4 MiB, but the pages stay dirty, so the OS would page out bytes nobody will read
+    (from the documentation of the working set; not measured here).
+- What does not change: the section's commit. Windows has no decommit for a view of a section, so the commit limit
+  keeps the charge; what goes back is the RAM. The daemon's working set is what this amendment answers for.
+- The arena (`Region`), on the macOS model:
+  - The contents of a discarded page are undefined until it is written (Microsoft's documentation of the call), so its
+    range is recorded and [`Region::prepare`] writes zeros over its recorded pages before the block is handed out. A
+    mapped shared region's record starts whole, because a discard's effect is on the object's pages, and a range an
+    earlier daemon or another shard gave back may carry it.
+  - Clearing writes bytes here, so it never widens past the block as macOS's does: a recorded neighbour may be a block
+    a recovery has yet to claim, and clearing costs no system call to save.
+  - A recovery's claim forgets the record, by A-110's argument: an image names only blocks live at its commit.
+- The content object (`SparseObject`): no record.
+  - A written page simply keeps what was written, and every reader there reads only what was written after the discard
+    (A-117's rule), so a write clears nothing. Zeroing there would destroy the bytes around the write, since a word of
+    the record spans live bytes.
+  - It discards only granules this process committed. The call refuses a range holding a reserved page, and committing
+    a dead range to discard it would charge the commit limit for nothing. A granule only another process committed has
+    no page in this working set.
+- Cost, a first write: writing zeros over a block makes all of it resident on its first allocation, where before only
+  the pages written were. BENCHMARKS prices a never-used block's clear at 1.5–9% best against best; a tiny file's tail pages
+  count until its block is next purged or reused.
+- Proven (BENCHMARKS, "What a write costs on pages given back on Windows") on jupiter and on CI's two Windows
+  architectures, and red-checked there. The working set alone cannot credit the purge: with every discard refused it
+  still fell 25% and 69% over 120 s, Windows trimming it unasked, though 0% in the first 5 s and 0 bytes by the daemon's
+  count. A write on pages given back cost 14–20% less than on never-used pages on the runners.
+- A held section's adoption (the audit's plan step 5) was checked in the same change. The audit said a refused view
+  leaked the handle. It did not: `view` closed it. 200 refused adoptions moved the handle count by 0 on unchanged code,
+  and by 200 with that close removed (`crates/mem/tests/held_section.rs`). The adoption now maps first and takes
+  ownership only of a view that exists, so `view` no longer closes what it was lent.
+
 ### A-198 — A WinFsp mount outlives its daemon: the anchor holds the volume's control handle, the drive's link and the mount's ledger, and the next daemon serves the held volume (accepted 2026-11-01, Step 9 of the VFS and DAX plan; built and measured 2026-11-02)
 Applied in the same change to: GAPS (gap 2 of the platform inventory). The build applies it to §4.6 "Windows",
 `docs/wip/platforms.md`, `crates/anchor`, `crates/server` and `crates/bridge-winfsp`, each in its own change.
@@ -13104,6 +13179,27 @@ and failed-then-passing oracles distinguish those results from the initial sourc
   - The per-node word for the file (see above).
   - Rebuilding the successor's handle store from the ledger (`Slab::insert_at`): the bridge's release already settles a
     predecessor's handle by its file, as for FUSE, so a rebuilt store would only duplicate that accounting.
+
+### A-199 — A client's reply stamps alternate by park, so a late confirmation is never lost (accepted 2026-11-04)
+
+A-31's client learns a wake only when the daemon's wake call confirms a sleeper, and it said a confirmation that
+lands after the woken client read the stamp is settled at its next wait. Under load it is not: the waker is
+preempted between its wake and its confirmation while the woken client runs on, takes its reply, sends the next
+request and arms its next park, which cleared the one stamp. The late confirmation then set a bare confirmed bit
+there, so the following park's stamp was refused too. Replace the one stamp with two: the client's parks
+alternate between them, the parked flag's value names the park's slot (1 for slot 0, 2 for slot 1; zero is not
+parked, and any other armed value names slot 0, so a hostile client chooses only which of its own slots is
+stamped), and the daemon confirms by an exchange on the exact stamp it wrote. One daemon serves a ring in order,
+so the slot a park arms was last stamped by a reply call that returned before the reply the client took since.
+An unconfirmed stamp is held in its slot until that slot is armed again, then given up. The async path arms slot
+0 and times nothing. Rejected: a client-side sleep signal (a futex wait's zero return), which macOS's wait does
+not give, and would make the two platforms learn by different rules.
+
+Applied in the same change to: §4.7 (data model, wake strategy, status); `slates-ipc` (region layout version 3,
+`REPLY_STAMP_SLOTS`, `PARKED_STAMP_SLOT_ZERO`/`ONE`, `ClientRegion::reply_stamp(slot)`, `ClientEnd::wait`'s park
+and settle, `DaemonEnd::reply`'s stamp and confirmation) and `crates/ipc/tests/rings.rs`; GAPS. Evidence:
+`docs/bugs/2026-11-04-a-late-wake-confirmation-cost-the-client-two-samples.md`. A client and a daemon of
+different layout versions refuse each other by name; no consensus rule or capability changes.
 
 ### A-197 — pmem over a handed copy: a socket route for every pmem VMM (accepted and built on Linux x86_64 2026-11-01, Step 6 of the VFS and DAX plan; Firecracker on arm64 owed)
 Applied in the same change to: A-186 (the copy's length), GAPS, `crates/ipc` (`protocol.rs`: `MapWrite`'s `granule`;

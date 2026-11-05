@@ -80,6 +80,34 @@
 > - The 1,000, 10k and 100k levels, the full kernel tree, a separate daemon process, and the remote primary with two
 >   replicas are not yet run.
 
+> **Windows gives freed content pages back (A-205, 2026-11-04), and the audit's held-section leak was not one.** A deleted
+> file's pages leave a Windows daemon's working set at the idle purge, and a block reusing them is zeroed before it is
+> handed out. The section's commit stays charged, by design: Windows has no decommit for a view of a section. The audit's
+> "a refused view leaks the held section's handle" was wrong: `view` closed it, 0 handles in 200 refused adoptions on
+> unchanged code and 200 with the close removed (`crates/mem/tests/held_section.rs`); the adoption now maps first anyway.
+> Numbers and CI runs: BENCHMARKS, "What a write costs on pages given back on Windows".
+
+> **A merge's cost grows with its green's file count (2026-11-05, RQ-4, §4.16; OPEN, perf's).** The new
+> `crates/client/examples/edit_merge_bench.rs` measures, on macOS arm64 at load 9, an accepted submit's median at
+> 25–161 µs over a green's first hundred versions and 529–684 µs over its last hundred (six runs). Each version adds a
+> file. One file replaced 1,000 times shows no growth, and an edit shows none in either form. Every submit clones
+> each path of the green (`Green::current_base`), walks each base file (`compose_volume`), and hashes each byte of the
+> green (`Green::head_identity` in `merge_service::enqueue_record`). That puts RQ-4's millisecond out of reach for a
+> repository-sized green. The fix is the perf agent's. The clients agent re-measures merge on every platform once it
+> lands. Also open from the same runs: a sevenfold p50 split between two invocations on this Mac (edit 18.8 against
+> 2.5 µs). Record: `BENCHMARKS.md`, "The client's edit and merge latency".
+
+> **Replication latency (raft, 2026-11-04): a commit returns at its quorum; live shipping still owed.** Every quorum
+> collector in `slates-cluster` slept its whole poll after its quorum had answered, so a cross-node record commit cost
+> the daemon's 10 ms poll (10,125–10,194 µs at the median) over a 12 µs loopback round trip. Each reply now wakes its
+> collector: 18.9–19.9 µs at the median, p99 28.8–32.9 µs, worst 44.7 µs at the daemon's poll
+> (`replication_bench`, five interleaved rounds at load 36–42, `docs/wip/BENCHMARKS.md`; failing test first:
+> `a_commit_returns_at_its_quorum_not_at_its_poll`; record:
+> `docs/bugs/2026-11-04-a-quorum-collector-waited-out-its-poll.md`). Open, toward a filesystem server replicated per
+> write in under 1 ms: §4.10 live shipping (the owner's publication stream shipped to its candidates and acknowledged
+> at f+1, AC-8.3's "live-shipped volumes report none", AC-8.9's credit backpressure) is unbuilt, as are `put_wal`
+> and the loss-window report; a head still waits up to the 100 ms record period before its commit starts.
+
 > **Audit of 2dc9f3eb..98000d56 (2026-11-03): defects open, Step 9's evidence holds.** Nine commits made on
 > 2026-11-01 and 2026-11-02 were read line by line against this file's rules and Step 9's acceptance. Every CI run they
 > cite was read again: each shows what it is cited for, except one pair of timings A-198 gave the wrong way
@@ -103,15 +131,15 @@
 > - **A refused hold release leaves a held drive (A-198): fixed 2026-11-04 (A-206, run 41978665514; the entry above).** The
 >   unmount deleted the file system after the release was refused, so the anchor kept the volume and its drive letter
 >   with no daemon serving them (`crates/server/src/winfsp.rs`, `release_hold` and `reap`).
-> - **A refused view leaks the held section's handle** (`crates/mem/src/shared.rs`, Windows `from_held_handle`).
+> - **A refused view leaks the held section's handle**: wrong; `view` closed it, and A-205 records the count (see the top of this file).
 > - **The receiver's WinFsp guard checks a field WinFsp always zeroes: fixed 2026-11-04 (A-206, runs 41978665514 and
 >   41977593496; the entry above).** It read `FileSystem.Version`, not the DLL's version (`FspVersion`). Also, an open whose
 >   path was longer than 1024 UTF-16 units was refused, because every open records its kernel name in the held ledger
 >   (`crates/bridge-winfsp/src/opens/names.rs`); now slates refuses no path the driver passes.
 > - **The receiver that replaced WinFsp's dispatcher is unmeasured.** It is one thread with a new event per control
 >   transaction, where the DLL dispatcher ran two threads; BENCHMARKS has no entry for it.
-> - **Two failures recorded open below are still unfixed**: the wake-learning fixture under load and the fleet routing
->   Create reply.
+> - **Two failures recorded open below**: the wake-learning case under load (fixed 2026-11-04, A-199) and the fleet
+>   routing Create reply (fixed 2026-11-04 in its fixture; a second, rarer failure of that history stays open).
 >
 > Twenty goals of this plan's stack, Steps 10–15 among them, were closed in 2–4 s each with no work. They are
 > restored in order after these fixes.
@@ -125,20 +153,36 @@
 > is the instrumented CI job. Record:
 > `docs/bugs/2026-11-02-an-empty-wake-test-mistook-an-armed-client-for-a-sleeper.md`.
 
-> **Wake-learning fixture's timing assumption still open (2026-11-02, A-31).** A later capped all-ring run on
-> adacachy (zero of 32 cores idle) passes the corrected empty-wake case but fails the unchanged learning case:
-> 7 of 32 samples, below its required 16, with all 32 replies delivered. Its one-millisecond delay after arming
-> does not establish a kernel sleeper under preemption. Eight of nine cases pass in 0.53 s; the unit exits 101
-> in 7.858 s. Keep the sample assertion and this failure recorded; the whole main CI target remains required.
-> Record: `docs/bugs/2026-11-02-an-empty-wake-test-mistook-an-armed-client-for-a-sleeper.md`.
+> **Wake-learning failure fixed (2026-11-04, A-199; opened 2026-11-02, A-31).** It was the product, not the fixture's
+> one-millisecond delay. A woken client outran its waker, which was preempted between its wake and its
+> confirmation. The client's next park cleared the one reply stamp, so the sample was given up, and the late
+> confirmation set a bare confirmed bit there that refused the following park's stamp. Logs: in every failing run
+> the zero-time out-of-window stamps matched the given-up ones one for one (15 and 15 of 32 at worst). The region
+> now holds two stamps, the parks alternate between them, and the parked flag's value names the slot (layout
+> version 3). The assertion is unchanged (16 of 32). Interleaved on adacachy, 100 runs each: before 100/100 and
+> 89/100 failures on one and two busy CPUs, after 0/100 and 0/100; all nine ring cases on two busy CPUs 95/100
+> before, 0/100 after. Record: `docs/bugs/2026-11-04-a-late-wake-confirmation-cost-the-client-two-samples.md`.
 
-> **Fleet setup failure still unattributed (2026-11-02, §4.8 Lookup).** Main CI 41538865390 on `8a3fdc63` passes
-> Windows and QEMU but its Linux fleet target passes 85/86 active histories: the returning-session location case
-> gets an unexpected Create reply while choosing its routing candidate. The helper discarded that reply, so its
-> failure now prints the candidate name and complete typed verdict. The same fleet source passes on parent
-> `663e4df8`; the exact isolated case passes once on adacachy in 5.25 s. Neither result names the original verdict
-> or cause. Keep the failure open for that evidence; no retry or weaker assertion is added. Record:
-> `docs/bugs/2026-11-02-a-fleet-routing-fixture-discarded-its-unexpected-create-reply.md`.
+> **A survivor's other shard never held its live peer: fixed (2026-11-04, §4.8 Membership).** Main CI 41774055498
+> failed the CLI fleet deployment test: after the owner's death one survivor's `status` listed only itself. The
+> control shard recorded a detector belief as folded before its admission rule refused it (the peer's id not yet
+> learned on contact), so learn-on-contact later made the peer alive on the control shard alone and no other shard
+> ever held it; all four failing logs show the peer folded on the control shard once and on the other shard never.
+> A refused belief is now offered again next turn (`fold_on_control`, `crates/server/src/member_task.rs`); a unit
+> test fails on the old fold. Interleaved on two busy CPUs, 50 runs each: before 1 failure, after 0. Record:
+> `docs/bugs/2026-11-04-a-survivors-other-shard-never-held-its-live-peer.md`.
+
+> **Fleet setup failure attributed and fixed (2026-11-04; opened 2026-11-02, §4.8 Lookup).** The routing history's
+> first create was answered at once (0.000 s in main CI 41538865390): the owner refused `ConsensusNotInitialized`.
+> The fixture's settle step checked the committed membership through the council and root (the root only on root
+> voters), but a node admits a placement write only once its own readiness follows, one coordinator period later or
+> after a root learner's import. A create on every node right after the settle was refused once in 40 fleets on two
+> busy CPUs (1 in 340 fleets in all). The settle step now also waits for every node's readiness
+> (`Daemon::consensus_ready`); the new test `a_settled_fleet_admits_a_create_on_every_node` passed 100/100 after, the
+> history 50/50 on two busy CPUs, and the whole fleet target 87/87. No assertion changed. Still open: on one CPU the
+> same history failed once in 50 another way, its lookup refused `OwnerUnreachable` with the held session never
+> back within the forward's wait (`session_never_returned` 4), not attributed. Record:
+> `docs/bugs/2026-11-04-a-settled-fleet-refused-its-first-create.md`.
 
 > **A forward waits for the owner's session (2026-09-25, §4.8 Lookup).** A forward refused the client
 > `HomedElsewhere` at once whenever a coordinator dispatch or a discovery page had the owner's session out;
