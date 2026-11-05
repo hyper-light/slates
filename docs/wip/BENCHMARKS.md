@@ -3967,6 +3967,31 @@ it. Now a turn stops taking records once their bytes exceed what its quantum cop
   overlap at 4 (432.5 against 441.3). Write p99 at 16 workers did not get worse: create 4,664–5,154 → 4,636–4,804 µs,
   overwrite 1,874–2,152 → 1,562–1,918 µs, append 1,687–2,320 → 1,574–1,943 µs. Every byte read back identical.
 
+- On the incumbent client itself (the 2026-10-08 harness: Apple M5 Max, Docker Desktop's 6.12.76-linuxkit, a
+  privileged `rust:1.98` container per run; Linux release builds from their own target volumes: main `76b450a1`, the
+  change `3a506310`; six rounds, each main then the change, 2026-11-05 08:19–08:24Z, load 23–38 from other
+  sessions). The large write, MiB/s at 1, 4 and 16 workers:
+
+  | round | main | change | nfsd in main's run | nfsd in the change's run |
+  |---|---|---|---|---|
+  | 1 | 794.9 / 813.8 / 919.7 | 887.6 / 963.1 / 859.4 | 1,680 / 1,607 / 1,769 | 1,680 / 1,671 / 1,718 |
+  | 2 | 604.2 / 723.6 / 684.6 | 883.9 / 874.8 / 759.0 | 1,277 / 1,340 / 1,312 | 1,375 / 868 / 1,781 |
+  | 3 | 854.2 / 929.2 / 832.4 | 885.5 / 984.7 / 837.8 | 1,565 / 1,688 / 1,831 | 1,544 / 1,543 / 1,197 |
+  | 4 | 873.3 / 979.3 / 790.4 | 963.1 / 1,007.8 / 931.3 | 1,550 / 1,692 / 1,990 | 1,623 / 1,824 / 1,848 |
+  | 5 | 913.7 / 1,019.0 / 821.0 | 970.5 / 990.9 / 910.5 | 1,411 / 1,743 / 1,742 | 1,506 / 1,749 / 1,738 |
+  | 6 | 717.6 / 851.8 / 920.2 | 848.9 / 885.4 / 412.1 | 1,223 / 1,379 / 1,530 | 1,432 / 1,415 / 1,439 |
+
+  - Medians 824.6 → 886.6, 890.5 → 973.9 and 826.7 → 848.6 at 1, 4 and 16 workers. The change led its round 6 of 6
+    times at 1 worker, 5 of 6 at 4 and 4 of 6 at 16.
+  - Best of eighteen: main 1,019.0, the change 1,007.8. Both clear step 11's 967 at this load, and the ranges
+    overlap, so on this machine the change does not beat main beyond the spread. CI's quieter runner (above) is
+    where it does.
+  - Write p99 at 16 workers, µs, rounds 1–5 (create / overwrite / append): main 3,409–4,285 / 1,361–2,335 /
+    1,490–2,648; the change 2,998–5,234 / 1,203–2,940 / 1,153–2,945. The ranges overlap with no direction. Round 6
+    of the change stalled machine-wide at load 38: slates' create p99 was 15,680 µs, and nfsd's in the same
+    container 14,538 µs against 4,892 in main's round 6.
+  - nfsd wrote 868–1,990 MiB/s across the twelve runs. The gap to it is still about 1.8× at the medians.
+
 **What remains of the gap.** On that runner nfsd writes 690–732 MiB/s and slates 432–472. The largest cost is the
 fresh-page fault on the anchor's shared content object (41.5%), which slates can only avoid on its write path by
 having pages resident before the write arrives, or by filling them through the kernel's write path; both are design
