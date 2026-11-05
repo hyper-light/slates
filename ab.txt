@@ -643,3 +643,66 @@ fsbench	contended	dll	unlink	10000	286500	109304200	153512800	196497700
 unmounted: S:
 # dll's error output, heartbeat lines and lapses:
 ## run 4 of 5 arm dll done, 2026-11-05T19:15:32Z
+To https://github.com/hyper-light/slates
+   3f2fe0b..1fb1d6e  1fb1d6ea6bed9a9b95fc57f77eeb2624a57e4de8 -> diag-winfsp-bench-results-42080252187-windows-latest
+## run 4 of 5 arm normal, 2026-11-05T19:15:36Z
+# host: windows 0x23f00206 on windows processor architecture 9 level 25 revision 4353 (x86_64), 4 logical CPUs (4 available to this process), 15 GiB, page 4096 B; largest L2 1048576 B, cache line 64 B
+# workload: 10 rounds of 1000 files of 4096 B per arm and pass, arms interleaved, first arm rotating
+# arm normal: S:/d
+# warm-up: one untimed round per arm (1000 files each)
+# pass quiet: spinners 0 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 24.0 µs, p99 45.0 µs, p999 136.1 µs, max 734.5 µs over 3875 probes; 20.2 s
+fsbench	quiet	normal	create	10000	677600	1230800	1678800	35748300
+fsbench	quiet	normal	write	10000	83200	414900	639600	2481500
+fsbench	quiet	normal	fsync	10000	89000	302800	673600	29120300
+fsbench	quiet	normal	close	10000	41400	410700	613800	8497800
+fsbench	quiet	normal	stat	10000	178800	725600	1044600	39392800
+fsbench	quiet	normal	open	10000	124600	604800	791100	29275800
+fsbench	quiet	normal	read	10000	9600	99100	139000	1924100
+fsbench	quiet	normal	rename	10000	381900	1013200	1204500	29686600
+fsbench	quiet	normal	unlink	10000	221900	744500	881400	67204200
+
+**quiet** (spinners 0 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 24.0 µs, p99 45.0 µs, p999 136.1 µs, max 734.5 µs over 3875 probes; 20.2 s). Each cell: p50 · p99 · p999 · max, µs.
+
+| op | normal |
+|---|---|
+| create | 677.6 · 1230.8 · 1678.8 · 35748.3 |
+| write | 83.2 · 414.9 · 639.6 · 2481.5 |
+| fsync | 89.0 · 302.8 · 673.6 · 29120.3 |
+| close | 41.4 · 410.7 · 613.8 · 8497.8 |
+| stat | 178.8 · 725.6 · 1044.6 · 39392.8 |
+| open | 124.6 · 604.8 · 791.1 · 29275.8 |
+| read | 9.6 · 99.1 · 139.0 · 1924.1 |
+| rename | 381.9 · 1013.2 · 1204.5 · 29686.6 |
+| unlink | 221.9 · 744.5 · 881.4 · 67204.2 |
+
+# pass contended: spinners 8 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 29.8 µs, p99 49.7 µs, p999 77.8 µs, max 60853.9 µs over 15817 probes; 84.4 s
+fsburn	contended	normal	94274.245	82769.928	84.381	4
+fsbench	contended	normal	create	10000	1107600	66757900	144101600	224859600
+fsbench	contended	normal	write	10000	72600	262400	51939700	66510400
+fsbench	contended	normal	fsync	10000	105800	247100	64647500	106798800
+fsbench	contended	normal	close	10000	56000	125200	33019500	65712100
+fsbench	contended	normal	stat	10000	187700	925000	65715000	99074700
+fsbench	contended	normal	open	10000	151900	322800	49313600	83735600
+fsbench	contended	normal	read	10000	75600	151600	57834800	99858800
+fsbench	contended	normal	rename	10000	475900	32290500	103677600	132972100
+fsbench	contended	normal	unlink	10000	278900	15958000	112572300	1062744900
+
+**contended** (spinners 8 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 29.8 µs, p99 49.7 µs, p999 77.8 µs, max 60853.9 µs over 15817 probes; 84.4 s). Each cell: p50 · p99 · p999 · max, µs.
+
+| op | normal |
+|---|---|
+| create | 1107.6 · 66757.9 · 144101.6 · 224859.6 |
+| write | 72.6 · 262.4 · 51939.7 · 66510.4 |
+| fsync | 105.8 · 247.1 · 64647.5 · 106798.8 |
+| close | 56.0 · 125.2 · 33019.5 · 65712.1 |
+| stat | 187.7 · 925.0 · 65715.0 · 99074.7 |
+| open | 151.9 · 322.8 · 49313.6 · 83735.6 |
+| read | 75.6 · 151.6 · 57834.8 · 99858.8 |
+| rename | 475.9 · 32290.5 · 103677.6 · 132972.1 |
+| unlink | 278.9 · 15958.0 · 112572.3 · 1062744.9 |
+
+unmounted: S:
+# normal's error output, heartbeat lines and lapses:
+slates-winfsp: reply spin window = 10500 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+slates anchor: daemon exited (Some(143)); restarted (1 in the window)
+## run 4 of 5 arm normal done, 2026-11-05T19:17:35Z
