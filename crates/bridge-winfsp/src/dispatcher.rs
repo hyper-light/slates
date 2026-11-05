@@ -137,18 +137,20 @@ impl Worker {
     let thread = std::thread::Builder::new()
       .name("slates-winfsp-receive".to_owned())
       .spawn(move || {
-        if let Err(error) = receive_loop(
-          file_system,
-          section,
-          bound,
-          Receive {
-            stopped,
-            confirmations: &confirmations,
-            wake: &wake,
-            outcomes: &outcomes,
-            private,
-          },
-        ) {
+        if let Err(error) = crate::reply::measure().and_then(|()| {
+          receive_loop(
+            file_system,
+            section,
+            bound,
+            Receive {
+              stopped,
+              confirmations: &confirmations,
+              wake: &wake,
+              outcomes: &outcomes,
+              private,
+            },
+          )
+        }) {
           eprintln!("slates-winfsp: receive worker ended: {error}");
           if outcomes.send(crate::host::Outcome::Failed(error)).is_err() {
             eprintln!(

@@ -8,14 +8,14 @@
     "arch": "arm64",
     "privilege": "unprivileged"
   },
-  "date": "2026-09-14",
+  "date": "2026-11-05",
   "command": "",
   "bound": "",
   "outcome": {
     "kind": "skipped",
     "reason": {
       "kind": "owed",
-      "reason": "the harness has no WinFsp mount step; the live WinFsp mount test (crates/bridge-winfsp/tests/mount.rs, gated WINFSP_TEST_MOUNT=1 on windows-latest) proves create/write/read/list/delete through the kernel and nothing more"
+      "reason": "the harness mounts the drive (A-209), but the roster's tools and their byte-identity comparison are POSIX's (git over a mode-keeping tree, cargo, rsync, sqlite, a watcher) and no Windows roster is defined yet"
     }
   },
   "expected_failure_list": null,

@@ -2440,7 +2440,7 @@ impl Volume {
   ) -> Result<(), VfsError> {
     let mut order: Vec<&SnapshotImage> = snapshots.to_vec();
     order.sort_by_key(|s| std::cmp::Reverse(s.epoch));
-    let mut claimed: HashSet<(Discriminant<Dead>, u32, u32)> = HashSet::new();
+    let mut claimed: HashSet<(Discriminant<Dead>, u64, u32)> = HashSet::new();
     // Every chunk the head reaches is the head's, even under a snapshot's diverged inode: the images name
     // chunks, so a diverged version and the head share every window the head did not rewrite (A-64), and the
     // live volume released only the rewritten ones onto the deadlist.
@@ -2764,13 +2764,14 @@ fn snapshot_slab_handle(r: SnapshotRef) -> Handle<Snapshot> {
 /// claims each object for exactly one snapshot's deadlist. The variant discriminant separates the
 /// five slabs (a `Dir` handle and an `Inode` handle can share an index); the born epoch is not part
 /// of the key, since a slab handle at its generation already identifies one object uniquely.
-fn dead_key(dead: &Dead) -> (Discriminant<Dead>, u32, u32) {
+fn dead_key(dead: &Dead) -> (Discriminant<Dead>, u64, u32) {
   let (index, generation) = match dead {
-    Dead::Dir(h, _) => (h.index(), h.generation()),
-    Dead::DirBlock(h, _) => (h.index(), h.generation()),
-    Dead::Inode(h, _) => (h.index(), h.generation()),
-    Dead::Trie(h, _) => (h.index(), h.generation()),
-    Dead::Chunk(h, _) => (h.index(), h.generation()),
+    Dead::Dir(h, _) => (u64::from(h.index()), h.generation()),
+    // A block's page handle and its slot word name it uniquely (A-203).
+    Dead::DirBlock(block, _) => block.words(),
+    Dead::Inode(h, _) => (u64::from(h.index()), h.generation()),
+    Dead::Trie(h, _) => (u64::from(h.index()), h.generation()),
+    Dead::Chunk(h, _) => (u64::from(h.index()), h.generation()),
   };
   (std::mem::discriminant(dead), index, generation)
 }

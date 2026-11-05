@@ -129,6 +129,26 @@ pub(crate) fn reachable_floor(state: &ShardState, green: DbVolumeId) -> u64 {
   work_bases.chain(pins).min().unwrap_or(head).min(head)
 }
 
+/// A work's base (`crate::work_files`): its green on this shard, when it still exists, at the work's base version.
+pub(crate) fn work_base<'a>(
+  state: &'a ShardState,
+  work: &crate::state::WorkState,
+) -> crate::work_files::Base<'a> {
+  crate::work_files::Base {
+    green: state.greens.get(&work.green),
+    version: work.base_version,
+  }
+}
+
+/// The refusal for a file of a work whose green is gone: its base cannot be read (§4.16 failure matrix,
+/// `UnknownBase`, as the work's submit answers).
+pub(crate) fn unreadable_base(work: &crate::state::WorkState) -> Refusal {
+  Refusal::UnknownBase {
+    green: crate::verbs::to_wire_volume(work.green),
+    version: work.base_version,
+  }
+}
+
 /// Folds `green`'s histories to the reachable floor and **settles** its retention charge to exactly
 /// what the engine then holds beyond its current files — the content history and the rejected-result
 /// cache (`Green::retained_bytes`) — against the shard's budget (§4.2 all-cost admission: retention
@@ -146,9 +166,7 @@ pub(crate) fn settle_green_retention(state: &mut ShardState, green: DbVolumeId) 
   // Oldest-first, only as far as the retention budget needs (the same derived cap the rejected
   // cache is bounded by: one merge byte bound per green), never past a live reader's version.
   engine.fold_history_to_budget(floor, budget);
-  let retained = engine.retained_bytes();
-  let wanted =
-    u64::try_from(retained.history.saturating_add(retained.rejected)).unwrap_or(u64::MAX);
+  let wanted = u64::try_from(engine.retention_charge()).unwrap_or(u64::MAX);
   let charged = state.green_retention.get(&green).copied().unwrap_or(0);
   if wanted > charged {
     state
@@ -720,9 +738,13 @@ pub(crate) fn read(
   match record.policy.role {
     Role::Green { .. } => read_green(state, record.id, key, at),
     Role::Work { .. } => match at {
-      ReadAt::Head => match state.works.get(&record.id).and_then(|w| w.content.get(key)) {
-        Some(bytes) => ReplyBody::ReadBytes {
-          bytes: bytes.clone(),
+      ReadAt::Head => match state.works.get(&record.id) {
+        Some(w) => match w.files.get(work_base(state, w), key) {
+          Ok(Some(bytes)) => ReplyBody::ReadBytes {
+            bytes: bytes.to_vec(),
+          },
+          Ok(None) => refused(Refusal::NotFound),
+          Err(_) => refused(unreadable_base(w)),
         },
         None => refused(Refusal::NotFound),
       },
@@ -785,9 +807,10 @@ pub(crate) fn read_window(
     Role::Green { .. } => read_green_range(state, record.id, key, at, (offset, want)),
     Role::Work { .. } => match at {
       ReadAt::Head => match state.works.get(&record.id) {
-        Some(w) => match w.content.get(key) {
-          Some(bytes) => page_of(bytes, (offset, want), w.revision),
-          None => refused(Refusal::NotFound),
+        Some(w) => match w.files.get(work_base(state, w), key) {
+          Ok(Some(bytes)) => page_of(bytes, (offset, want), w.revision),
+          Ok(None) => refused(Refusal::NotFound),
+          Err(_) => refused(unreadable_base(w)),
         },
         None => refused(Refusal::NotFound),
       },
@@ -1094,7 +1117,12 @@ pub(crate) fn status_merge_volume(
     }),
     MergeRole::Work { .. } => state.works.get(&id).map_or((0, 0), |work| {
       (
-        work.content.values().map(|bytes| bytes.len() as u64).sum(),
+        work
+          .files
+          .files(work_base(state, work))
+          .iter()
+          .map(|(_, bytes)| bytes.len() as u64)
+          .sum(),
         work.base_version,
       )
     }),
@@ -1456,13 +1484,6 @@ pub(crate) fn enqueue_record(
   // flight (§4.8 "joint writes"), so every version it commits stays at `f + 1` of the cohort a takeover
   // recovers through.
   let shape = config.place(object);
-  let identity = state
-    .greens
-    .get(&green)
-    .map(Green::head_identity)
-    .unwrap_or_default();
-  let inputs_identity = inputs_of(state, green, version)
-    .map(|bytes| MergeShardState::inputs_identity(&bytes, archive_page(state)));
   // What a successor needs to materialize the green under the same name, policy and rights (AUD-14).
   let (name, require_evidence, owner) = state
     .db
@@ -1499,6 +1520,17 @@ pub(crate) fn enqueue_record(
     }
     return;
   }
+  // The record's identities are what a holder recomputes and compares (§4.16 "Apply on holders"), so
+  // they are made only for a record that goes to holders. The laptop's owner is the only holder and
+  // answers above: there the head identity, a hash of every byte the green holds, had been made on
+  // every accept and dropped (113 of 120 profile samples of a 1,000-file green's submit, 2026-11-04).
+  let identity = state
+    .greens
+    .get_mut(&green)
+    .map(Green::head_identity)
+    .unwrap_or_default();
+  let inputs_identity = inputs_of(state, green, version)
+    .map(|bytes| MergeShardState::inputs_identity(&bytes, archive_page(state)));
   state.merge.pending.entry(object).or_default().insert(
     version,
     PendingMergeRecord {
@@ -2283,7 +2315,7 @@ fn recompute(
   }
   // Version 0 of a green this holder already replicates: accepted only if it is the same origin.
   if value.version == 0
-    && let Some(existing) = state.merge.replicas.get(&object)
+    && let Some(existing) = state.merge.replicas.get_mut(&object)
     && existing.head_identity() != value.identity
   {
     return Err(OUT_OF_ORDER);

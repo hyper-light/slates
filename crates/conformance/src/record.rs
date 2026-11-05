@@ -108,6 +108,8 @@ pub enum Suite {
   Fsx,
   /// The randomized namespace stress (mkdir/create/rename/link/unlink/… across processes).
   Fsstress,
+  /// Windows conformance: WinFsp's winfstest over the Win32 file API, with the reviewed expected-failure list (A-209).
+  Winfstest,
   /// Real tools inside the mount, byte-identical to the host.
   Workloads,
   /// The filesystem-write tracer: zero writes outside a granted landing target.
@@ -120,10 +122,11 @@ pub enum Suite {
 
 impl Suite {
   /// Every suite, in the matrix's column order.
-  pub const ALL: [Suite; 7] = [
+  pub const ALL: [Suite; 8] = [
     Suite::Pjdfstest,
     Suite::Fsx,
     Suite::Fsstress,
+    Suite::Winfstest,
     Suite::Workloads,
     Suite::Hermeticity,
     Suite::Pressure,
@@ -136,6 +139,7 @@ impl Suite {
       Suite::Pjdfstest => "pjdfstest",
       Suite::Fsx => "fsx",
       Suite::Fsstress => "fsstress",
+      Suite::Winfstest => "winfstest",
       Suite::Workloads => "workloads",
       Suite::Hermeticity => "hermeticity",
       Suite::Pressure => "pressure",
@@ -149,6 +153,7 @@ impl Suite {
       Suite::Pjdfstest => "POSIX conformance (pjdfstest)",
       Suite::Fsx => "fsx",
       Suite::Fsstress => "fsstress",
+      Suite::Winfstest => "Windows conformance (winfstest)",
       Suite::Workloads => "workloads",
       Suite::Hermeticity => "hermeticity",
       Suite::Pressure => "pressure",

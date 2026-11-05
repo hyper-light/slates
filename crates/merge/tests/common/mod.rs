@@ -7,6 +7,8 @@
 #![allow(clippy::indexing_slicing)]
 #![allow(dead_code)]
 
+pub(crate) mod generated;
+
 use slates_merge::engine::Increment;
 use slates_merge::ops_doc::{Op, OpKind, OpsDoc};
 

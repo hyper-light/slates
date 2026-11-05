@@ -37,6 +37,7 @@ pub mod coverage;
 pub mod delta;
 pub mod derive;
 pub mod dir;
+pub mod dirblocks;
 pub mod dirtree;
 pub mod error;
 pub mod export;

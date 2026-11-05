@@ -10,7 +10,7 @@ use slates_mem::Handle;
 
 use crate::content::Chunk;
 use crate::dir::DirNode;
-use crate::dirtree::DirBlock;
+use crate::dirblocks::BlockRef;
 use crate::ids::{Epoch, SnapshotId};
 use crate::inode::Inode;
 use crate::trie::TrieNode;
@@ -21,7 +21,7 @@ pub enum Dead {
   /// A directory node.
   Dir(Handle<DirNode>, Epoch),
   /// A block of an indexed directory.
-  DirBlock(Handle<DirBlock>, Epoch),
+  DirBlock(BlockRef, Epoch),
   /// An inode version.
   Inode(Handle<Inode>, Epoch),
   /// An inode-table node.
