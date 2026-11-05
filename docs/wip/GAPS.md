@@ -1,5 +1,21 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A-214, A-217 and A-207's port reverted from main (2026-11-05, by the supervisor); their re-landing is owed.** Main CI
+> 42119714654 on b502cf96 failed six jobs, all from this pairing of landed changes, each green on its own branch:
+> - **A-217 against A-201's checkout.** A-217 records a green's origin as a reference to its base snapshot, and
+>   `checkout` (`crates/server/src/checkout.rs`) compares the recorded origin's bytes with a fresh `seed_origin`'s
+>   encoding, so every checkout was refused `ConsistentBaseUnavailable`: `crates/server/tests/checkout.rs`, 3 of 3 on
+>   Linux and macOS. A-207's port (`661b41b2`) and the load record (`21240d01`) use A-217's ops, so they go with it.
+> - **A-214 against A-205's give-back.** The reserve keeps a write burst's worth of freed content pages pre-faulted,
+>   so `a_deleted_files_memory_leaves_the_working_set_and_recreating_it_reads_every_byte` failed on windows-latest and
+>   windows-11-arm; and A-214's own `arena::tests::an_idle_purge_keeps_the_reserve_and_gives_back_the_rest` fails
+>   under Miri.
+> The reverted tree passes the checkout, mem, rt, merge, recovery and daemon suites on macOS. Owed: nfs-write re-lands
+> A-214 reconciled with A-205's give-back (a reserve the give-back test accounts for, or one that decays) and green
+> under Miri; loadtest re-lands A-217 and A-207 with checkout comparing the base by what A-217 records. Both must run
+> `crates/server/tests/checkout.rs`, the Windows give-back test and Miri before they are handed over. A-204, the
+> harness (`93483514`), the merge windows fix (`d0389720`) and winfsp-overlap-3 stay on main.
+
 > **A private purge's intent can wait up to the 1 s transaction timeout (found 2026-11-05, audit step 7; open).**
 > WinFsp's transact never goes pending: the control dispatch calls `FspVolumeTransact` inline (v2.1 `src/sys/fsctl.c:95-99`),
 > which waits for a request inside the call (`src/sys/volume.c:1171`). So `purge_intents::Intents::wait`, which drains
@@ -82,10 +98,6 @@
 > (it was the first); a pinned large-class file reads across its extents (no green could start from the kernel tree);
 > A-217, a green's origin is a reference to the base snapshot it holds (peak RSS over `fs/` 549,520 to 225,776 KiB,
 > `CreateGreen` 415 to 158 ms, best of three; `a_greens_base_snapshot_is_held_and_its_origin_recovered_from_it`). Open:
-> - **Fixed (A-207): a work's acknowledged edits were lost at a daemon restart.** A work's changes are logged in the
->   partition and replayed at recovery (`acknowledged_work_edits_survive_a_daemon_restart`, red on main). Chaos on the
->   branch it comes from: twenty daemon kills under the anchor at 10 and 100 clients, every client reconnected and
->   resent its request in flight under its own id, the oracle and each client's own file 0 failures in every run.
 > - **A volume promised the whole version slab is refused at recovery** (bug record of 2026-11-05): a recovered
 >   snapshot rebuilds its directories privately, one retained version slot each the live volume did not hold (465,831
 >   committed slots before a restart, 465,832 after). Fix owed in `crates/vfs/src/recover.rs`.
