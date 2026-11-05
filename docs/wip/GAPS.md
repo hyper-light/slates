@@ -1,5 +1,18 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **WinFsp: two receive workers (A-219, accepted 2026-11-05; audit step 7). Proof built; the runtime owed.** Each worker owns
+> a journal; a receive's stamp, the system-wide performance counter, orders deliveries across journals; recovery answers
+> only each address's newest delivery and passes the older ones over. The two-worker model oracle kills the daemon at
+> every step of every worker, alone and twice, under four schedules: 4,255 scenarios, 0 lost, 0 wrong, 0 twice, 0 wrong
+> contexts. It saw 16,713 cross-worker address reuses, 2,533 pass-overs and 1,045 unstamped batches. Red: answering
+> every journal whole gives 202 wrong, keeping the oldest delivery 415. The ledger keeps one unconfirmed open a worker.
+> **Owed:**
+> - the second worker in the dispatcher, with recovery across journals before any worker receives;
+> - purge intents to every worker;
+> - the count derived at the first mount;
+> - the live 40-kill oracle with two workers on both lanes;
+> - the final A/B against 71cf09ac.
+
 > **A private purge's intent can wait up to the 1 s transaction timeout (found 2026-11-05, audit step 7; open).**
 > WinFsp's transact never goes pending: the control dispatch calls `FspVolumeTransact` inline (v2.1 `src/sys/fsctl.c:95-99`),
 > which waits for a request inside the call (`src/sys/volume.c:1171`). So `purge_intents::Intents::wait`, which drains

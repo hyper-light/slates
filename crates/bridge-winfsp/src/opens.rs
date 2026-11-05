@@ -115,8 +115,21 @@ struct Slot {
 
 /// The bytes an open ledger and its retained receive journal need. The bound is the bridge's admitted open cap.
 pub fn bytes(bound: usize) -> Result<usize, Refusal> {
-  capture_offset(bound)?
-    .checked_add(crate::inflight::capture::BYTES)
+  crate::inflight::capture::BYTES
+    .checked_mul(crate::inflight::capture::MAX_WORKERS)
+    .and_then(|journals| capture_offset(bound).ok()?.checked_add(journals))
+    .ok_or(Refusal::Bound)
+}
+
+/// The first byte of receive worker `worker`'s capture region (A-219): the regions follow one another after the open
+/// frames, each [`crate::inflight::capture::BYTES`] long, which keeps the wire's eight-byte alignment.
+pub fn journal_offset(bound: usize, worker: usize) -> Result<usize, Refusal> {
+  if worker >= crate::inflight::capture::MAX_WORKERS {
+    return Err(Refusal::Bound);
+  }
+  crate::inflight::capture::BYTES
+    .checked_mul(worker)
+    .and_then(|before| capture_offset(bound).ok()?.checked_add(before))
     .ok_or(Refusal::Bound)
 }
 
@@ -146,7 +159,8 @@ pub struct Ledger<M> {
   free: Vec<usize>,
   epoch: u64,
   quarantined: usize,
-  pending: Option<(u64, u64)>,
+  /// Each receive worker's one open whose kernel response is not yet acknowledged, with its request's hint (A-219).
+  pending: Vec<(u64, u64)>,
 }
 
 impl<M: Memory> Ledger<M> {
@@ -178,7 +192,7 @@ impl<M: Memory> Ledger<M> {
       free,
       epoch,
       quarantined: 0,
-      pending: None,
+      pending: Vec::new(),
     })
   }
 
@@ -206,7 +220,7 @@ impl<M: Memory> Ledger<M> {
     slots.try_reserve_exact(bound).map_err(|_| Refusal::Bound)?;
     free.try_reserve_exact(bound).map_err(|_| Refusal::Bound)?;
     let mut quarantined = 0usize;
-    let mut pending = None;
+    let mut pending = Vec::new();
     for index in 0..bound {
       let mut frame = [0; FRAME];
       memory.read(offset(index)?, &mut frame)?;
@@ -228,10 +242,10 @@ impl<M: Memory> Ledger<M> {
         free.push(index);
       }
       if slot.open.is_some() && !slot.confirmed {
-        if pending.is_some() {
+        if pending.len() >= crate::inflight::capture::MAX_WORKERS {
           return Err(Refusal::Corrupt);
         }
-        pending = Some((token(index, slot.generation)?, slot.hint));
+        pending.push((token(index, slot.generation)?, slot.hint));
       }
       slots.push(slot);
     }
@@ -258,7 +272,7 @@ impl<M: Memory> Ledger<M> {
 
   /// Whether another open can be recorded before asking the bridge to allocate it.
   pub fn has_room(&self) -> bool {
-    !self.free.is_empty() && self.pending.is_none()
+    !self.free.is_empty() && self.pending.len() < crate::inflight::capture::MAX_WORKERS
   }
 
   /// Records an open before the context is handed to Windows. A full or exhausted ledger refuses admission.
@@ -267,7 +281,7 @@ impl<M: Memory> Ledger<M> {
   }
 
   fn insert(&mut self, open: Open, name: &str, hint: u64, confirmed: bool) -> Result<u64, Refusal> {
-    if self.pending.is_some() {
+    if !confirmed && self.pending.len() >= crate::inflight::capture::MAX_WORKERS {
       return Err(Refusal::Bound);
     }
     let index = self.free.last().copied().ok_or(Refusal::Bound)?;
@@ -287,7 +301,7 @@ impl<M: Memory> Ledger<M> {
     self.free.pop();
     let context = token(index, generation)?;
     if !confirmed {
-      self.pending = Some((context, hint));
+      self.pending.push((context, hint));
     }
     Ok(context)
   }
@@ -329,23 +343,31 @@ impl<M: Memory> Ledger<M> {
     if self.slots.get(index).ok_or(Refusal::Stale)?.confirmed {
       return Ok(());
     }
-    if self.pending.map(|(pending, _)| pending) != Some(context) {
+    let Some(position) = self
+      .pending
+      .iter()
+      .position(|(pending, _)| *pending == context)
+    else {
       return Err(Refusal::Corrupt);
-    }
+    };
     let at = offset(index)?
       .checked_add(CONFIRMED_AT)
       .ok_or(Refusal::Bound)?;
     self.memory.write(at, &[1])?;
     self.slots.get_mut(index).ok_or(Refusal::Stale)?.confirmed = true;
-    self.pending = None;
+    self.pending.swap_remove(position);
     Ok(())
   }
 
   /// Before restoring reference counts, retain an unhanded open only when the journal has its successful response.
   /// Otherwise retire its ledger context; its unpublished/local bridge handle is not a restored sibling's reference.
-  pub fn settle_pending(&mut self, saved_open: Option<(u64, u64)>) -> Result<(), Refusal> {
-    if let Some((context, hint)) = self.pending {
-      if saved_open == Some((hint, context)) {
+  ///
+  /// `saved_opens` are the `(hint, context)` pairs the journals' saved responses hand the kernel, one at most a worker
+  /// (A-219): each unconfirmed open among them is kept, and every other is retired.
+  pub fn settle_pending(&mut self, saved_opens: &[(u64, u64)]) -> Result<(), Refusal> {
+    for (context, hint) in std::mem::take(&mut self.pending) {
+      if saved_opens.contains(&(hint, context)) {
+        self.pending.push((context, hint));
         self.confirmed(context)?;
       } else {
         self.closed(context)?;
@@ -382,9 +404,7 @@ impl<M: Memory> Ledger<M> {
     };
     self.memory.write(offset(index)?, &encode(slot)?)?;
     *self.slots.get_mut(index).ok_or(Refusal::Stale)? = slot;
-    if self.pending.map(|(pending, _)| pending) == Some(context) {
-      self.pending = None;
-    }
+    self.pending.retain(|(pending, _)| *pending != context);
     if generation < u32::MAX {
       self.free.push(index);
     }
@@ -677,7 +697,7 @@ mod tests {
     let sibling = ledger.opened(file(10), "\\file.bin").unwrap();
     let unhanded = ledger.opened_for(file(10), "\\file.bin", 41).unwrap();
     let mut recovered = Ledger::recover(ledger.into_memory(), 3).unwrap();
-    recovered.settle_pending(None).unwrap();
+    recovered.settle_pending(&[]).unwrap();
     assert_eq!(recovered.get(unhanded), Err(Refusal::Stale));
     assert_eq!(recovered.get(sibling).unwrap().object, file(10).object);
     recovered.closed(sibling).unwrap();
@@ -691,13 +711,31 @@ mod tests {
     let mut ledger = Ledger::create(Ram(vec![0; bytes(2).unwrap()]), 2).unwrap();
     let context = ledger.opened_for(file(10), "\\file.bin", 41).unwrap();
     let mut recovered = Ledger::recover(ledger.into_memory(), 2).unwrap();
-    recovered.settle_pending(Some((41, context))).unwrap();
+    recovered.settle_pending(&[(41, context)]).unwrap();
     assert_eq!(recovered.get(context).unwrap().object, file(10).object);
     let mut again = Ledger::recover(recovered.into_memory(), 2).unwrap();
-    again.settle_pending(None).unwrap();
+    again.settle_pending(&[]).unwrap();
     assert_eq!(again.get(context).unwrap().object, file(10).object);
     again.closed(context).unwrap();
     assert_eq!(again.live().count(), 0);
+  }
+
+  /// A-219. Do: record an unconfirmed open on each of two workers, then recover with only the first's saved response.
+  /// Expect: the first kept and the second retired; a third unconfirmed open while two are pending is refused.
+  #[test]
+  fn each_worker_keeps_its_own_unconfirmed_open_across_a_death() {
+    let mut ledger = Ledger::create(Ram(vec![0; bytes(4).unwrap()]), 4).unwrap();
+    let first = ledger.opened_for(file(10), "\\one", 41).unwrap();
+    let second = ledger.opened_for(file(11), "\\two", 41).unwrap();
+    assert_eq!(
+      ledger.opened_for(file(12), "\\three", 43),
+      Err(Refusal::Bound)
+    );
+    let mut recovered = Ledger::recover(ledger.into_memory(), 4).unwrap();
+    recovered.settle_pending(&[(41, first)]).unwrap();
+    assert_eq!(recovered.get(first).unwrap().object, file(10).object);
+    assert_eq!(recovered.get(second), Err(Refusal::Stale));
+    assert!(recovered.has_room());
   }
 
   struct HeldReadOnly(Ram);

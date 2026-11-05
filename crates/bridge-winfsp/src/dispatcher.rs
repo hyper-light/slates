@@ -182,7 +182,7 @@ struct CaptureView {
 impl CaptureView {
   fn new(section: OwnedHandle, bound: usize) -> Result<Self, WinFspError> {
     let length = crate::opens::bytes(bound).map_err(WinFspError::Ledger)?;
-    let offset = crate::opens::capture_offset(bound).map_err(WinFspError::Ledger)?;
+    let offset = crate::opens::journal_offset(bound, 0).map_err(WinFspError::Ledger)?;
     // SAFETY: this owned section was created/adopted with exactly the checked ledger length. The view is released
     // only after the synchronous/owned overlapped transactions using its suffix have completed.
     let view = unsafe {
@@ -575,7 +575,9 @@ fn receive_loop(
       return Ok(());
     }
     used = Some(inflight::capture::filled(reported).map_err(WinFspError::Capture)?);
-    let mut batch = receiving.received(reported).map_err(WinFspError::Capture)?;
+    let mut batch = receiving
+      .received(reported, performance_counter()?)
+      .map_err(WinFspError::Capture)?;
     settle(
       file_system,
       &mut batch,
@@ -586,6 +588,20 @@ fn receive_loop(
       bound,
     )?;
   }
+}
+
+/// The system-wide performance counter, a receive's delivery stamp (A-219). It is consistent across processors and
+/// processes, so a successor orders a dead daemon's journals by it; Windows never reports zero for it.
+fn performance_counter() -> Result<u64, WinFspError> {
+  let mut count = 0i64;
+  // SAFETY: the out-parameter is a live local i64, the counter's own type.
+  if unsafe { windows_sys::Win32::System::Performance::QueryPerformanceCounter(&mut count) } == 0 {
+    return Err(os_error("read the performance counter"));
+  }
+  u64::try_from(count)
+    .ok()
+    .filter(|stamp| *stamp != 0)
+    .ok_or(WinFspError::Capture(Refusal::State))
 }
 
 fn is_stopped(stopped: &Receiver<()>) -> bool {

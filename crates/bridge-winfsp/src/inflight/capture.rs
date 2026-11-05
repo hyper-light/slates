@@ -3,19 +3,32 @@
 //! reset memory from a receive that may have taken requests. Readers inspect it only after the previous owner ended;
 //! this is crash publication, not a shared atomic or lock on a request path. A published saved response is replayed
 //! first, so a second crash cannot lose an already-issued open by overwriting its only complete response.
+//!
+//! With several receive workers (A-219) each owns one of these journals. A receive's stamp, the system-wide performance
+//! counter taken right after it returns, orders deliveries across journals, so recovery answers only the newest
+//! delivery at an address ([`superseded`]). Every mark is stored behind a compiler fence: a kill can fall between any two
+//! stores, and the successor sees a dead thread's stores in program order.
 
 use super::{
   BATCH_BYTES, RESPONSE_BASE, RESPONSE_MAX, Refusal, Request, put, read_u32, read_u64, requests,
 };
 use slates_wire::crc32c::crc32c;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::atomic::{Ordering, compiler_fence};
 
 /// Format: a phase byte and seven reserved zero bytes keep the direct-output request buffer eight-byte aligned.
 const PHASE_BYTES: usize = size_of::<u64>();
 /// Format: saved-response state and three reserved bytes, length, CRC32C and four reserved bytes.
 const SAVED_HEADER: usize = size_of::<u32>() * 4;
-/// Format: the fixed capture region appended after the aligned open-ledger frames.
-pub const BYTES: usize = PHASE_BYTES + BATCH_BYTES + SAVED_HEADER + RESPONSE_MAX;
+/// Format: the delivery stamp, the performance counter when the receive returned; zero while none is recorded (A-219).
+const STAMP_BYTES: usize = size_of::<u64>();
+/// Format: the phase word and the stamp before the request buffer, which stays eight-byte aligned.
+const HEADER: usize = PHASE_BYTES + STAMP_BYTES;
+/// Format: one worker's capture region, appended after the aligned open-ledger frames.
+pub const BYTES: usize = HEADER + BATCH_BYTES + SAVED_HEADER + RESPONSE_MAX;
+/// Shape: the most receive workers a mount runs: the derivation chooses between one waiting worker and two (A-219). The
+/// held section holds this many capture regions.
+pub const MAX_WORKERS: usize = 2;
 /// Format: zero means reset/no processing request; one means a receive may have taken requests. No other phase exists.
 const RECEIVING: u8 = 1;
 /// Format: one marks a complete saved response; zero marks an unfinished save. It is written only after its body/CRC.
@@ -30,6 +43,7 @@ const RESERVED_AT: usize = CRC_AT + size_of::<u32>();
 /// A borrow of one capture region. Its owner is the only thread touching these bytes until it ends or returns them.
 pub struct Capture<'a> {
   phase: &'a mut [u8],
+  stamp: &'a mut [u8],
   request: &'a mut [u8],
   saved: &'a mut [u8],
 }
@@ -42,6 +56,9 @@ impl<'a> Capture<'a> {
     }
     let (phase, body) = bytes
       .split_at_mut_checked(PHASE_BYTES)
+      .ok_or(Refusal::Length)?;
+    let (stamp, body) = body
+      .split_at_mut_checked(STAMP_BYTES)
       .ok_or(Refusal::Length)?;
     let (request, saved) = body
       .split_at_mut_checked(BATCH_BYTES)
@@ -57,9 +74,17 @@ impl<'a> Capture<'a> {
     }
     Ok(Self {
       phase,
+      stamp,
       request,
       saved,
     })
+  }
+
+  /// The delivery stamp of the batch in hand, if its receive returned and recorded one (A-219).
+  pub fn stamp(&self) -> Result<Option<u64>, Refusal> {
+    let value =
+      u64::from_le_bytes(<[u8; STAMP_BYTES]>::try_from(&*self.stamp).map_err(|_| Refusal::Length)?);
+    Ok((value != 0).then_some(value))
   }
 
   /// Clears an already-settled buffer, then records the new receive before lending it to the driver. A dropped
@@ -84,7 +109,8 @@ impl<'a> Capture<'a> {
       .get_mut(..SAVED_HEADER)
       .ok_or(Refusal::Length)?
       .fill(0);
-    *self.phase.first_mut().ok_or(Refusal::Length)? = RECEIVING;
+    store(self.stamp, &[0; STAMP_BYTES])?;
+    mark(self.phase.first_mut(), RECEIVING)?;
     Ok(Receiving { capture: self })
   }
 
@@ -111,7 +137,14 @@ impl<'a> Receiving<'a> {
   /// Validates the bytes after kernel I/O completion, preserving their original order and any complete saved result.
   /// `reported` is the transfer the driver counted. Only those bytes are read: [`Capture::begin`] cleared the rest, and
   /// recovery, which knows no count, still checks the whole buffer (A-212).
-  pub fn received(self, reported: usize) -> Result<Batch<'a>, Refusal> {
+  ///
+  /// `stamp` is the performance counter read right after the receive returned, before any request of the batch is
+  /// served (A-219); it is stored before the batch is parsed. Zero is not a stamp.
+  pub fn received(self, reported: usize, stamp: u64) -> Result<Batch<'a>, Refusal> {
+    if stamp == 0 {
+      return Err(Refusal::State);
+    }
+    store(self.capture.stamp, &stamp.to_le_bytes())?;
     Batch::checked(self.capture, filled(reported)?)
   }
 }
@@ -129,6 +162,7 @@ pub fn filled(reported: usize) -> Result<usize, Refusal> {
 /// Dropping this value preserves its receive state for the successor. Only the last acknowledged response resets it.
 pub struct Batch<'a> {
   phase: &'a mut [u8],
+  stamp: Option<u64>,
   pending: VecDeque<Request<'a>>,
   saved: &'a mut [u8],
   saved_first: Option<usize>,
@@ -145,6 +179,7 @@ impl<'a> Batch<'a> {
     }
   }
   fn checked(capture: Capture<'a>, filled: usize) -> Result<Self, Refusal> {
+    let stamp = capture.stamp()?;
     let frames: &'a [u8] = capture.request;
     let pending = requests(frames.get(..filled).ok_or(Refusal::Length)?)?;
     let saved = saved_response(capture.saved)?;
@@ -162,10 +197,11 @@ impl<'a> Batch<'a> {
       None => None,
     };
     if pending.is_empty() {
-      *capture.phase.first_mut().ok_or(Refusal::Length)? = 0;
+      mark(capture.phase.first_mut(), 0)?;
     }
     Ok(Self {
       phase: capture.phase,
+      stamp,
       pending: pending.into(),
       saved: capture.saved,
       saved_first,
@@ -216,7 +252,7 @@ impl<'a> Batch<'a> {
         Err(Refusal::ResponseChanged)
       };
     }
-    *self.saved.first_mut().ok_or(Refusal::Length)? = 0;
+    mark(self.saved.first_mut(), 0)?;
     let end = SAVED_HEADER
       .checked_add(response.len())
       .ok_or(Refusal::Length)?;
@@ -233,8 +269,7 @@ impl<'a> Batch<'a> {
         .to_le_bytes(),
     )?;
     put(self.saved, CRC_AT, &crc32c(response).to_le_bytes())?;
-    *self.saved.first_mut().ok_or(Refusal::Length)? = PUBLISHED;
-    Ok(())
+    mark(self.saved.first_mut(), PUBLISHED)
   }
 
   /// The driver accepted this response (or had completed it already), and the owner settled its context effects.
@@ -249,10 +284,94 @@ impl<'a> Batch<'a> {
     }
     self.current = None;
     if self.pending.is_empty() {
-      *self.phase.first_mut().ok_or(Refusal::Length)? = 0;
+      mark(self.phase.first_mut(), 0)?;
     }
     Ok(())
   }
+
+  /// When this batch's receive returned, if it recorded the stamp (A-219); `None` is newer than every stamp.
+  pub fn stamp(&self) -> Option<u64> {
+    self.stamp
+  }
+
+  /// The hints of every request this batch has not yet settled, the saved one's included.
+  pub fn hints(&self) -> Vec<u64> {
+    self.pending.iter().map(Request::hint).collect()
+  }
+
+  /// Passes over the current request without a response: recovery found a newer delivery at its address in another
+  /// worker's batch, so this request is completed (A-219). Nothing is written but the batch's end; a second recovery plans
+  /// the same.
+  pub fn pass_over(&mut self, hint: u64) -> Result<(), Refusal> {
+    if self.current != Some(hint) {
+      return Err(Refusal::Unsettled);
+    }
+    self.current = None;
+    if self.pending.is_empty() {
+      mark(self.phase.first_mut(), 0)?;
+    }
+    Ok(())
+  }
+}
+
+/// Stores a one-byte mark so that every store before it lands first and none after it lands before it. The fences emit no
+/// instruction; they keep the compiler from reordering stores to different addresses, since a kill can fall between any
+/// two of them and the successor sees every store the dead thread retired.
+fn mark(byte: Option<&mut u8>, value: u8) -> Result<(), Refusal> {
+  let byte = byte.ok_or(Refusal::Length)?;
+  compiler_fence(Ordering::SeqCst);
+  *byte = value;
+  compiler_fence(Ordering::SeqCst);
+  Ok(())
+}
+
+/// Stores the stamp's bytes between fences, as [`mark`] stores a mark.
+fn store(stamp: &mut [u8], value: &[u8]) -> Result<(), Refusal> {
+  if stamp.len() != value.len() {
+    return Err(Refusal::Length);
+  }
+  compiler_fence(Ordering::SeqCst);
+  stamp.copy_from_slice(value);
+  compiler_fence(Ordering::SeqCst);
+  Ok(())
+}
+
+/// Which requests recovery passes over: for each address in more than one worker's unsettled batch, every delivery but
+/// the newest (A-219). `journals` holds each worker's stamp (`None`: its receive recorded none, so nothing of it was
+/// served and it is newest) and its unsettled hints. Two unstamped batches, or two equal stamps, at one address cannot be
+/// ordered and are refused, never guessed.
+pub fn superseded(journals: &[(Option<u64>, Vec<u64>)]) -> Result<Vec<BTreeSet<u64>>, Refusal> {
+  let mut newest: BTreeMap<u64, (usize, Option<u64>)> = BTreeMap::new();
+  for (worker, (stamp, hints)) in journals.iter().enumerate() {
+    for hint in hints {
+      match newest.get(hint) {
+        None => {
+          newest.insert(*hint, (worker, *stamp));
+        }
+        Some((_, held)) => {
+          let newer = match (held, stamp) {
+            (None, None) => return Err(Refusal::Hint),
+            (Some(held), Some(stamp)) if held == stamp => return Err(Refusal::Hint),
+            (Some(held), Some(stamp)) => stamp > held,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+          };
+          if newer {
+            newest.insert(*hint, (worker, *stamp));
+          }
+        }
+      }
+    }
+  }
+  let mut passed: Vec<BTreeSet<u64>> = journals.iter().map(|_| BTreeSet::new()).collect();
+  for (worker, (_, hints)) in journals.iter().enumerate() {
+    for hint in hints {
+      if newest.get(hint).map(|(kept, _)| *kept) != Some(worker) {
+        passed.get_mut(worker).ok_or(Refusal::Length)?.insert(*hint);
+      }
+    }
+  }
+  Ok(passed)
 }
 
 fn saved_response(bytes: &[u8]) -> Result<Option<&[u8]>, Refusal> {
@@ -310,6 +429,9 @@ pub(super) fn check_response(bytes: &[u8]) -> Result<(), Refusal> {
 }
 
 #[cfg(test)]
+mod workers;
+
+#[cfg(test)]
 mod tests {
   //! A driver response and its acknowledgement are distinct actions; a crash between them must keep the saved result.
   #![allow(
@@ -353,7 +475,7 @@ mod tests {
       receive
         .buffer_mut()
         .copy_from_slice(&reads(&[0x1000, 0x2000]));
-      let mut batch = receive.received(BATCH_BYTES).unwrap();
+      let mut batch = receive.received(BATCH_BYTES, 1).unwrap();
       let request = batch.next_request().unwrap().unwrap();
       let response = request.cancelled_response().unwrap();
       batch.record_response(&request, &response).unwrap();
@@ -398,7 +520,7 @@ mod tests {
       receive
         .buffer_mut()
         .copy_from_slice(&reads(&[0x1000, 0x2000, 0x3000]));
-      let mut batch = receive.received(BATCH_BYTES).unwrap();
+      let mut batch = receive.received(BATCH_BYTES, 1).unwrap();
       let first = batch.next_request().unwrap().unwrap();
       let response = first.cancelled_response().unwrap();
       batch.record_response(&first, &response).unwrap();
@@ -461,7 +583,7 @@ mod tests {
     {
       let mut receive = Capture::new(&mut memory).unwrap().begin(None).unwrap();
       receive.buffer_mut().copy_from_slice(&reads(&[0x1000]));
-      let mut batch = receive.received(BATCH_BYTES).unwrap();
+      let mut batch = receive.received(BATCH_BYTES, 1).unwrap();
       let request = batch.next_request().unwrap().unwrap();
       assert_eq!(batch.acknowledge(request.hint()), Err(Refusal::Unsettled));
       assert!(matches!(batch.next_request(), Err(Refusal::Unsettled)));
@@ -485,7 +607,7 @@ mod tests {
         .begin(None)
         .unwrap();
       receive.buffer_mut().copy_from_slice(&reads(&[0x1000]));
-      let mut batch = receive.received(BATCH_BYTES).unwrap();
+      let mut batch = receive.received(BATCH_BYTES, 1).unwrap();
       let request = batch.next_request().unwrap().unwrap();
       batch
         .record_response(&request, &request.cancelled_response().unwrap())
@@ -494,7 +616,7 @@ mod tests {
     }
     for cleared in 0..=super::super::REQUEST_BASE {
       let mut memory = complete_memory.clone();
-      memory[PHASE_BYTES..PHASE_BYTES + cleared].fill(0);
+      memory[HEADER..HEADER + cleared].fill(0);
       assert!(
         Capture::new(&mut memory)
           .unwrap()
@@ -517,7 +639,7 @@ mod tests {
     {
       let mut receive = Capture::new(&mut memory).unwrap().begin(None).unwrap();
       receive.buffer_mut().copy_from_slice(&bytes);
-      let mut batch = receive.received(super::super::REQUEST_BASE).unwrap();
+      let mut batch = receive.received(super::super::REQUEST_BASE, 1).unwrap();
       assert_eq!(batch.next_request().unwrap().unwrap().hint(), 0x1000);
       assert!(batch.pending.is_empty());
     }
@@ -539,7 +661,7 @@ mod tests {
       receive
         .buffer_mut()
         .copy_from_slice(&reads(&[0x1000, 0x2000, 0x3000]));
-      let mut batch = receive.received(used).unwrap();
+      let mut batch = receive.received(used, 1).unwrap();
       while let Some(request) = batch.next_request().unwrap() {
         batch
           .record_response(&request, &request.cancelled_response().unwrap())
@@ -573,7 +695,7 @@ mod tests {
     let mut memory = vec![0; BYTES];
     let receive = Capture::new(&mut memory).unwrap().begin(None).unwrap();
     assert!(matches!(
-      receive.received(BATCH_BYTES + 1),
+      receive.received(BATCH_BYTES + 1, 1),
       Err(Refusal::Length)
     ));
   }

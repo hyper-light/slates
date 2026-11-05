@@ -2432,22 +2432,26 @@ fn run_mount(
         )
       }
     };
-    let mut captured = vec![0; crate::inflight::capture::BYTES];
-    let at = crate::opens::capture_offset(open_bound).map_err(WinFspError::Ledger)?;
+    // Every worker's journal: each saved response hands the kernel at most one open (A-219).
+    let mut saved_opens = Vec::new();
+    for worker in 0..crate::inflight::capture::MAX_WORKERS {
+      let mut captured = vec![0; crate::inflight::capture::BYTES];
+      let at = crate::opens::journal_offset(open_bound, worker).map_err(WinFspError::Ledger)?;
+      ledger
+        .memory()
+        .read(at, &mut captured)
+        .map_err(|error| WinFspError::Ledger(crate::opens::Refusal::Memory(error)))?;
+      if let Some(open) = crate::inflight::capture::Capture::new(&mut captured)
+        .and_then(crate::inflight::capture::Capture::resume)
+        .and_then(|batch| batch.map(|batch| batch.saved_open()).transpose())
+        .map_err(WinFspError::Capture)?
+        .flatten()
+      {
+        saved_opens.push(open);
+      }
+    }
     ledger
-      .memory()
-      .read(at, &mut captured)
-      .map_err(|error| WinFspError::Ledger(crate::opens::Refusal::Memory(error)))?;
-    let saved_open = crate::inflight::capture::Capture::new(&mut captured)
-      .map_err(WinFspError::Capture)?
-      .resume()
-      .map_err(WinFspError::Capture)?
-      .map(|batch| batch.saved_open())
-      .transpose()
-      .map_err(WinFspError::Capture)?
-      .flatten();
-    ledger
-      .settle_pending(saved_open)
+      .settle_pending(&saved_opens)
       .map_err(WinFspError::Ledger)?;
     let mounted = Mounted::new(
       mount_point,

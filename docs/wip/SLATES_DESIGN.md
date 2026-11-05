@@ -13436,6 +13436,78 @@ Status: built 2026-11-04. It closes the Windows owed items of A-105, A-110 and A
   and by 200 with that close removed (`crates/mem/tests/held_section.rs`). The adoption now maps first and takes
   ownership only of a view that exists, so `view` no longer closes what it was lent.
 
+### A-219 — Two WinFsp receive workers, each with its own journal; recovery answers only each address's newest delivery (accepted 2026-11-05, audit plan 01a1a34bf7e973069e94f773afdea44a, step 7)
+
+**What it answers.** After A-212 and the reused operation packets, the receiver was within WinFsp's DLL dispatcher's spread
+on every x86_64 quiet p50. arm64 stayed worse by about 9 µs an IRP. The open-cost harness found the cause (BENCHMARKS, "What
+a successful open costs under each serving pattern", run 42123092900). The DLL serves with two dispatcher threads; the second
+waits in the kernel while the first finishes its call's completion. On arm64, two waiting threads served a client's
+open-and-close in 671.9–688.2 µs against one thread's 700.9–714.7 µs. On x86_64 the same second thread cost about 7 µs an
+IRP. A single crash-safe receiver forgoes that gain. This amendment lets the receiver run two workers where measurement says
+the second wins. The crash rule is extended to keep A-198's guarantee across workers.
+
+**The rule.**
+- **Workers.** The receiver runs N workers, N chosen at the mount as below. Each owns a receive journal (A-198: one batch
+  buffer and one saved response, in its own region of the held section). Each settles its own batches as A-198 requires:
+  every response saved, sent alone and acknowledged before that worker's next receive.
+- **Stamps.** Right after a receive returns, before the worker serves any request of that batch, it stores a stamp: the
+  system-wide performance counter (`QueryPerformanceCounter`) in its journal. A receive clears the stamp before it marks
+  the journal receiving. Every journal mark is stored behind a compiler fence, so a death between two stores leaves them in
+  program order.
+- **The ledger** keeps up to N unconfirmed opens, one a worker, each tied to its request's hint and its own context.
+- **Recovery** reads every worker's journal before any worker receives. An address may appear in more than one unsettled
+  batch; then only its newest delivery is answered. Newest is by stamp, and an unstamped batch is newest of all. The older
+  requests at that address are passed over without a response. Each batch then settles as A-198 settles one, and no worker
+  receives until every journal is settled.
+- **Saved opens.** A saved successful open's context is kept whether its request is answered or passed over (below).
+- **Purge intents** reach every worker, since any worker may receive the private Create.
+
+**Why every delivered request is answered exactly once, with its own response, whenever the daemon dies.**
+1. Every IRP in processing is a request in some worker's unsettled batch. The driver moves an IRP to processing only
+   while copying it into the worker's held buffer (WinFsp v2.1 `src/sys/volume.c:1224-1228`, A-215's source record). A
+   worker clears its batch only once every response in it was accepted (A-198).
+2. Live IRPs have distinct addresses, so at most one request at a given address in the unsettled batches is live.
+3. **Ordering.** Let X in worker A's batch and Y in worker B's batch share address h, and let h be freed after X's
+   delivery and taken by Y. Then A's stamp is less than B's, or B is unstamped. The chain:
+   - A stamps right after its receive returns, before serving X.
+   - X's address is freed only by a response for X, which only A sends, and only after that stamp.
+   - Y's IRP takes h only after X is freed, and is delivered to B after that.
+   - B stamps only after its receive returns.
+
+   The performance counter is consistent across processors and processes ("Acquiring high-resolution time stamps",
+   Microsoft). So the counter orders A before B. If A were unstamped, A served nothing of its batch, so X would still be
+   live and Y could not hold h. So the newest delivery at h is the only one that can be live.
+4. **Answering the newest.** If it is live, it completes with its own response. If it is completed, nothing is processing
+   at h, by 1 and 2, and the driver drops the response ("BOGUS", `volume.c:1093`). Every older request at h is completed, by
+   3, so passing it over strands nothing.
+5. **An address in one batch only** is A-198's case. Nothing else can be processing at it, by 1, so the saved response or a
+   cancellation is safe to send.
+6. **A passed-over saved open was handed to the kernel.** X is completed (by 3), and only a response for X completes it.
+   The only response A sends for X is the one it saved first, so the kernel holds that context, which recovery keeps. A
+   cancellation sent by an earlier recovery is saved first too.
+7. **Equal stamps at one address cannot be ordered,** so recovery refuses them with a typed refusal and never guesses.
+   The causal chain between the two stamps contains a whole control call, microseconds, against the counter's tick (100 ns
+   at the 10 MHz the runners report), so this is not expected.
+8. **A death during recovery.** Passing over writes nothing, and the plan depends only on stamps and addresses. So a
+   second recovery plans the same. Answering follows A-198's save-then-send.
+
+**The count is derived, never named per architecture** (R3, R8). At the first mount in a process, the receiver measures the
+open-and-close hand-off on a hidden probe volume with one waiting worker and with two, in interleaved rounds. It takes two
+only where every two-worker round's p50 is below every one-worker round's p50, so beyond the spread, and one otherwise. It
+logs the rounds and the count. On run 42123092900's data that gives two on arm64 and one on x86_64, without the code naming
+either.
+
+**Proof obligations.**
+- A model oracle: two workers interleaved over one serial model of the driver's queues, a freed address handed to the next
+  IRP, the daemon killed at every step of every worker, alone and together. Each IRP must be completed once with its own
+  identity, none lost, and each kept open must be one the kernel holds.
+- The live 40-kill oracle on both Windows lanes with two workers.
+- The final A/B against 71cf09ac.
+
+Applied in the same change to: §4.6's Windows status, GAPS, `crates/bridge-winfsp/src/inflight/capture.rs` (the stamp and
+the plan), `opens.rs` (one unconfirmed open a worker), `dispatcher.rs` and `host.rs` (N workers, recovery across journals,
+the derivation), `purge_intents.rs` (every worker), and the oracles.
+
 ### A-212 — What a live WinFsp receive reads and clears, and what a rename visits (2026-11-05)
 
 A-198's receiver replaced WinFsp's DLL dispatcher with no benchmark. Measured against it (`docs/wip/BENCHMARKS.md`, "The
