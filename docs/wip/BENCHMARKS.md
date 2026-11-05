@@ -7856,3 +7856,60 @@ the discard calls replaced by a refusal in a diagnostics commit):
   limit the daemon test passed 5 of 5 on each architecture (run 41979650557).
 - Linux and Mac fmt, clippy, docs, `cargo xtask check` and the mem tests, and Miri over mem's tests: passed on run
   41975260339.
+
+## The client's edit and merge latency, and a merge that grows with its green (RQ-4, §4.16; 2026-11-05)
+
+The per-platform client record (`platforms.md`) had a provisioning histogram and no number for the two verbs an agent
+calls most after it: an edit declared on a work volume and its submit. `crates/client/examples/edit_merge_bench.rs`
+measures both from the Rust client, through the real rendezvous and rings, against an in-process daemon derived for the
+machine. Each sample makes a work off the green's head (untimed), declares one 64-byte edit (`edit`), submits it
+(`merge`, always accepted), and destroys the work (untimed); the client spins 50 µs for each reply. Two forms, each on
+fresh greens, 1,000 samples a run, three runs:
+- `new_file`: each sample creates its own file, so after sample n the green holds n + 1 files and n + 1 versions;
+- `one_file`: each sample replaces one file's line, so the green holds one file and only the versions grow.
+
+Each run also prints the median of its first and last 100 samples, which the percentiles mix away.
+
+Command: `cargo build --release -p slates-client --example edit_merge_bench`, then
+`target/release/examples/edit_merge_bench`. Machine: Apple M5 Max, 18 cores, macOS 26.4.1, slates `76b450a1` with the
+example; a laptop shared with other agents' builds, so the load average is given for every invocation and the tails are
+the load's.
+
+**First-tenth and last-tenth medians**, every run of two invocations at 2026-11-05 06:06:48 and 06:06:52 UTC (load
+9.4 and 9.3 at the start, 9.3 and 8.9 at the end):
+
+| form | verb | invocation 1, runs 0 / 1 / 2: first 100 → last 100 | invocation 2, runs 0 / 1 / 2: first 100 → last 100 |
+|---|---|---|---|
+| new_file | edit | 18.3 → 20.9, 18.5 → 19.0, 18.4 → 18.0 µs | 6.5 → 75.7, 70.9 → 18.2, 3.1 → 17.4 µs |
+| new_file | merge | **79.3 → 569.6, 63.8 → 589.3, 60.2 → 554.9 µs** | **41.5 → 684.2, 160.7 → 554.1, 25.1 → 529.4 µs** |
+| one_file | edit | 65.2 → 18.0, 19.0 → 66.1, 61.4 → 15.9 µs | 3.0 → 4.8, 4.6 → 2.4, 4.5 → 4.3 µs |
+| one_file | merge | 86.3 → 25.2, 28.1 → 81.3, 93.8 → 20.9 µs | 6.8 → 10.8, 10.4 → 5.5, 10.5 → 6.2 µs |
+
+**Percentiles** (median of the three runs, then all three):
+
+| row | invocation 1 | invocation 2 |
+|---|---|---|
+| new_file edit p50 / p99 | 20.0 µs [20.0, 19.3, 20.8] / 538 µs [663, 492, 538] | 20.1 µs [61.8, 20.1, 16.2] / 4.42 ms [4.42, 5.19, 0.79] |
+| new_file merge p50 / p99 | 326 µs [326, 316, 365] / 1.62 ms [1.38, 1.90, 1.62] | 270 µs [429, 270, 238] / 63.4 ms [65.4, 63.4, 2.40] |
+| one_file edit p50 / p99 | 18.8 µs [18.8, 22.1, 18.8] / 1.45 ms [1.45, 1.34, 1.47] | 2.5 µs [4.5, 2.5, 2.5] / 37.8 µs [260, 29.5, 37.8] |
+| one_file merge p50 / p99 | 27.2 µs [27.2, 32.2, 27.1] / 1.19 ms [0.98, 1.19, 2.38] | 5.6 µs [10.3, 5.6, 5.6] / 44.2 µs [264, 43.3, 44.2] |
+
+What it means:
+- **A merge's cost follows the number of files in its green.** In every one of six `new_file` runs, the last
+  hundred submits' median is 529–684 µs against 25–161 µs for the first hundred. That is about 0.5–0.9 µs per file
+  for 64-byte files. In the `one_file` form, 1,000 versions of one file show no growth. An edit's cost does not grow in
+  either form. A first look the same morning (05:48 UTC, load 8–12, the `new_file` form alone) measured 41–95 µs →
+  929–955 µs.
+- **The cause, from `sample` on the running bench and the code:** every accepted submit does three things in proportion
+  to the whole green. It builds `Green::current_base` (`crates/merge/src/engine.rs`), cloning every path. It walks every
+  base file in `compose_volume` (`crates/merge/src/increment.rs`). And it hashes every byte of every file for the
+  record's identity, in `Green::head_identity`, called from `merge_service::enqueue_record`. The last makes a merge
+  O(bytes in the green), so a repository-sized green would take milliseconds a merge, against RQ-4's millisecond. The
+  fix is the perf agent's (the merge path, by the supervisor's assignment of 2026-11-05). This example is the harness
+  to re-measure with on every platform once that fix lands.
+- **The two invocations differ sevenfold at p50 in the `one_file` form** (edit 18.8 against 2.5 µs, merge 27.2
+  against 5.6 µs), each steady over all three of its runs. The verbs are the same, so it is the round trip between the
+  client and its shard on this Mac. That points to where the scheduler placed the threads, or to a wake. It is open and
+  measured next (GAPS, the client's per-platform record).
+- The p99 and longer rows here are the load of the shared laptop, not code properties. A quiet machine's record is
+  owed; this laptop had no quiet window this day.
