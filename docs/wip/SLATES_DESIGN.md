@@ -12795,7 +12795,7 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
 
-### A-199 — A DAX ask is refused where no view could begin (accepted and built 2026-11-04)
+### A-211 — A DAX ask is refused where no view could begin (accepted and built 2026-11-04)
 Applied in the same change to: §4.6 by reference, `docs/wip/shards/dax-protocol.md` ("Windows"), GAPS,
 `crates/bridge-core/src/dax_backing.rs` (`DaxBackingSession::ask`), `crates/server/src/shards/dax.rs` (`MALFORMED`'s
 doc), `crates/client/tests/shards.rs`, `crates/server/tests/shards.rs`, `docs/wip/shards-patches/`.

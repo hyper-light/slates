@@ -185,7 +185,7 @@ The duplicate maps read alone, or read and write for a writable ask, and may que
 descriptor refuses any duplicate of more, a rewrite of the descriptor included.
 
 **The slice.** A ranged ask begins at a multiple of the system's allocation granularity, 64 KiB here, where a view of a
-section must begin. Any other offset is refused `EINVAL` before anything is made or filled (A-199).
+section must begin. Any other offset is refused `EINVAL` before anything is made or filled (A-211).
 
 ## What Shards' device does
 

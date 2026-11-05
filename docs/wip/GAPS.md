@@ -5,7 +5,7 @@
 > view shorter than its range and 64 KiB granules hold. Several vCPUs at a section's replace hold (0 stale, 0 lost in 20,000
 > replaces at 2, 4 and 8 vCPUs, with up to 158,573 faults run again); at a share's own file followed they did not, 2 to 38
 > live accesses taken for the guest's in each of 3 runs, 0 after the fix. slates refuses an ask no view can begin at
-> (A-199). Owed: the probes on CI's windows-2025 (diagnostics run 41975301883 under way), and the owner's review.
+> (A-211). Owed: the probes on CI's windows-2025 (diagnostics run 41975301883 under way), and the owner's review.
 >
 > **Audit of 2dc9f3eb..98000d56 (2026-11-03): defects open, Step 9's evidence holds.** Nine commits made on
 > 2026-11-01 and 2026-11-02 were read line by line against this file's rules and Step 9's acceptance. Every CI run they
