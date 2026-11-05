@@ -680,7 +680,7 @@ const PIPELINED_WRITE_BYTES: usize = 32 * 1024;
 /// than one WRITE.
 const ONE_NANOSECOND: u64 = 1;
 
-/// §4.6 (A-74; VFS plan step 11): do pipeline [`PIPELINED_WRITES`] FILE_SYNC WRITEs of [`PIPELINED_WRITE_BYTES`] each
+/// §4.6 (A-74, A-204; VFS plan step 11): do pipeline [`PIPELINED_WRITES`] FILE_SYNC WRITEs of [`PIPELINED_WRITE_BYTES`] each
 /// to one file in a single write on one connection (the volume on the other shard, so the connection moves first), with
 /// the shard's quantum pinned at [`ONE_NANOSECOND`]; expect every reply in request order, each a success, every byte read
 /// back, and turns that left records queued past their copy budget (`nfs.turn.left_queued` moved). A turn serves its

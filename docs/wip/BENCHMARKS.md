@@ -3939,7 +3939,7 @@ sample was on one shard, the volume's. Of its samples:
   which takes no fault and does not zero a page it overwrites whole, is cheaper, about 1.9×. A write syscall into the
   content object is outside what R1's lint wall allows anywhere but `slates-land`.
 
-**Landed: a turn takes only the records its quantum can reach** (A-74, amended). Every turn copied every whole
+**Landed: a turn takes only the records its quantum can reach** (A-204, amending A-74). Every turn copied every whole
 record its peek found; a 256 KiB WRITE outlasts any quantum, so its turn also copied the WRITE behind it and dropped
 it. Now a turn stops taking records once their bytes exceed what its quantum copies at the measured memcpy rate.
 - In process (`cargo build --release -p slates-cli --example nfs_large_write`, new: an in-process daemon, one

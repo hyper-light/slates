@@ -2864,7 +2864,7 @@ fn peek_head(stream: &TcpStream) -> Head {
 }
 
 /// Counter: turns that stopped taking records at their copy budget with more bytes queued behind ([`read_head`]), left
-/// unassembled for a later turn's peek: the budget's non-vacuity count.
+/// unassembled for a later turn's peek: the budget's non-vacuity count (A-204).
 const TURN_LEFT_QUEUED: &str = "nfs.turn.left_queued";
 
 /// Derived: the record bytes one turn can reach on this shard now, [`DaemonConfig::quantum_copy_bytes`] (the bytes its
@@ -2877,7 +2877,7 @@ fn turn_copy_budget() -> usize {
   })
 }
 
-/// The whole records at the head of `queued` that one turn can reach, or how many bytes the first needs.
+/// The whole records at the head of `queued` that one turn can reach, or how many bytes the first needs (A-204).
 ///
 /// A turn serves its records in order until its step quantum is spent ([`serve_turn`]), and serving a record copies
 /// its bytes at least once (a WRITE's data into the volume), so once the records taken hold more than `budget` bytes,
