@@ -262,6 +262,19 @@ impl WorkFiles {
     total
   }
 
+  /// What the work holds of its own, in path order (A-207: what a restatement in its log carries).
+  pub fn changed_entries(&self) -> impl Iterator<Item = (&str, Option<&[u8]>)> {
+    self
+      .changed
+      .iter()
+      .map(|(path, entry)| (path.as_str(), entry.as_deref()))
+  }
+
+  /// A work holding exactly `changed` of its own (A-207: a restatement replayed from its log).
+  pub fn from_changed(changed: BTreeMap<String, Option<Vec<u8>>>) -> WorkFiles {
+    WorkFiles { changed }
+  }
+
   /// Forgets every change: the work now equals its (new) base.
   pub fn clear(&mut self) {
     self.changed.clear();
