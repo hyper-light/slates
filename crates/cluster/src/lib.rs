@@ -42,6 +42,7 @@ pub mod envelope;
 pub mod fleet;
 mod fold;
 pub mod lease_renewal;
+pub mod live;
 pub mod member_plane;
 pub mod membership;
 pub mod multilog;

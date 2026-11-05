@@ -5566,8 +5566,18 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > report fails NoLoss at once, and removing both the fence and the owner check fails StaleNeverCommits. The
 > stale-refusal counter found one defect before any history check did: a holder refused a superseded owner as
 > unauthorized before checking its fence, so that owner never learned it was fenced and shipped on. The fence is now
-> checked first. Owed: the log over the fleet transport, measured; the daemon's publications shipped through it, with
-> barriers answered at durability and phase one in the takeover round; real-process chaos.
+> checked first.
+>
+> **On the transport (2026-11-04).** `crates/cluster/src/live.rs`: `ship` sends an entry or install to each holder
+> over its warm session (kinds 22 and 23) and folds the replies until the write is durable, through the
+> wake-on-reply collector; `serve_entry` and `serve_install` are the holder's answer. Measured over real loopback
+> endpoints with the daemon's derived runtime (`replication_bench`; BENCHMARKS "Live shipping over the transport"): a
+> 64-byte write durable on two hosts in 16.6–20.3 µs at the median and 28.7–32.5 µs at p99, a 4 KiB write in
+> 22.6–27.2 µs and 37.9–71.8 µs, a 64 KiB write in 108–149 µs and 160–292 µs; unchanged with one holder dead. A test
+> over the simulated fabric (`crates/cluster/tests/live.rs`) found that `ship` sent nothing when its position was
+> already durable, so the owner's period never caught a holder up; it always sends now, and a late holder is
+> installed once and then follows. Owed: the daemon's publications shipped through it, with barriers answered at
+> durability and phase one in the takeover round; real-process chaos.
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
 writer's ring to its local owner shard is the latency floor. When write-intent attachments from
