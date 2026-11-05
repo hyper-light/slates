@@ -107,7 +107,41 @@ pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     // so an absolute fname would nest one absolute path under another.
     "fsx.bin".to_owned(),
   ];
-  let (success, output, ended) = run_bounded(&built.binary, &args, &work, FSX_WALL_BOUND)?;
+  // DIAGNOSTICS ONLY: each line of fsx's trace stamped with the milliseconds since the start, into a kept file.
+  let (success, output, ended) = {
+    use std::io::BufRead;
+    let started = Instant::now();
+    let mut child = Command::new(&built.binary)
+      .args(&args)
+      .current_dir(&work)
+      .stdin(Stdio::null())
+      .stdout(Stdio::piped())
+      .stderr(Stdio::null())
+      .spawn()
+      .map_err(|e| Failure(e.to_string()))?;
+    let out = child.stdout.take().ok_or_else(|| Failure("no stdout".to_owned()))?;
+    let trace_path = logs.join("fsx-timed.txt");
+    let reader = std::thread::spawn(move || {
+      use std::io::Write;
+      #[allow(clippy::disallowed_methods)]
+      let mut file = std::fs::File::create(&trace_path).unwrap();
+      let mut all = String::new();
+      for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+        let _ = writeln!(file, "{:>9} {line}", started.elapsed().as_millis());
+        let _ = file.flush();
+        all.push_str(&line);
+        all.push('\n');
+      }
+      all
+    });
+    let mut ended = true;
+    let success = loop {
+      if let Some(status) = child.try_wait()? { break status.success(); }
+      if started.elapsed() > FSX_WALL_BOUND { let _ = child.kill(); let _ = child.wait(); ended = false; break false; }
+      pause();
+    };
+    (success, reader.join().unwrap_or_default(), ended)
+  };
   let verdict = fsx_verdict(success, &output, bounds.fsx_operations);
   // A run that stopped short is judged against the transport's reviewed list by the operation it stopped at (A-214):
   // a listed stop is an expected failure, any other is not, and a pass with a listed stop must strike it.
