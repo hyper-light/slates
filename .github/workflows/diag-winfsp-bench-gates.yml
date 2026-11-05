@@ -1,0 +1,34 @@
+name: DIAG the gates of agents/winfsp-bench (not for main)
+
+on:
+  push:
+    branches: ['diag-winfsp-bench-gates-[0-9]*']
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  gates:
+    name: fmt + clippy + docs + xtask
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Xtask check
+        run: cargo xtask check
+      - name: Documentation
+        env:
+          RUSTDOCFLAGS: -D warnings -A rustdoc::private_intra_doc_links
+        run: cargo doc --workspace --no-deps --document-private-items
