@@ -71,7 +71,7 @@ impl Channel {
   pub fn send(&self, message: &HandleMessage, timeout_ms: u32) -> Result<(), HandleRefusal> {
     let bytes = encode(message)?;
     let moved = self.overlapped(Way::Write, &mut { bytes }, timeout_ms)?;
-    if moved != MESSAGE_BYTES {
+    if moved != Some(MESSAGE_BYTES) {
       return Err(HandleRefusal::Malformed {
         reason: "a short write of a hold message",
       });
@@ -80,13 +80,13 @@ impl Channel {
   }
 
   /// Receives one message, waiting at most `timeout_ms`: the message, `None` on a timeout (nothing waited), refused on a
-  /// gone peer or a malformed message.
+  /// gone peer or a malformed message. A message of no bytes is a short message, not a timeout: a message-mode pipe
+  /// delivers a zero-length write as a read of zero bytes.
   pub fn recv(&self, timeout_ms: u32) -> Result<Option<HandleMessage>, HandleRefusal> {
     let mut bytes = [0u8; MESSAGE_BYTES];
-    let moved = self.overlapped(Way::Read, &mut bytes, timeout_ms)?;
-    if moved == 0 {
+    let Some(moved) = self.overlapped(Way::Read, &mut bytes, timeout_ms)? else {
       return Ok(None);
-    }
+    };
     if moved != MESSAGE_BYTES {
       return Err(HandleRefusal::Malformed {
         reason: "a short read of a hold message",
@@ -97,13 +97,14 @@ impl Channel {
 
   /// One overlapped read or write of `buffer` on the end, waited for on an event of its own for at most `timeout_ms`
   /// supplied by the caller. A timed-out operation is cancelled and settled before either its buffer or OVERLAPPED
-  /// leaves this frame. A read timeout returns zero; a write timeout is a typed refusal.
+  /// leaves this frame. The bytes moved; `None` for a read timeout (nothing was read); a write timeout is a typed
+  /// refusal.
   fn overlapped(
     &self,
     way: Way,
     buffer: &mut [u8],
     timeout_ms: u32,
-  ) -> Result<usize, HandleRefusal> {
+  ) -> Result<Option<usize>, HandleRefusal> {
     // SAFETY: a nameless manual-reset event, unsignalled, not inheritable; owned and closed below.
     let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
     if event.is_null() {
@@ -167,13 +168,13 @@ impl Channel {
       let code = last_error();
       if waited == WAIT_TIMEOUT && is_cancelled(code) {
         return match way {
-          Way::Read => Ok(0),
+          Way::Read => Ok(None),
           Way::Write => Err(HandleRefusal::TimedOut),
         };
       }
       return gone_or_refused(code, way);
     }
-    Ok(usize::try_from(moved).unwrap_or(0))
+    Ok(Some(usize::try_from(moved).unwrap_or(0)))
   }
 }
 
@@ -189,12 +190,18 @@ fn is_cancelled(code: u32) -> bool {
   code == windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED
 }
 
-/// A refused or failed operation with `code`: a read of a gone peer is zero bytes (its end closed), as on Unix;
-/// anything else is refused.
-fn gone_or_refused(code: u32, way: Way) -> Result<usize, HandleRefusal> {
+/// A refused or failed operation with `code`: a gone peer is [`HandleRefusal::Closed`]; a message longer than a hold
+/// message is malformed (the pipe keeps its remainder, which the next read takes as a short message); anything else is
+/// refused by the OS.
+fn gone_or_refused(code: u32, way: Way) -> Result<Option<usize>, HandleRefusal> {
   use windows_sys::Win32::Foundation::{
-    ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED,
+    ERROR_BROKEN_PIPE, ERROR_MORE_DATA, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED,
   };
+  if matches!(way, Way::Read) && code == ERROR_MORE_DATA {
+    return Err(HandleRefusal::Malformed {
+      reason: "a long read of a hold message",
+    });
+  }
   let gone = matches!(
     code,
     ERROR_BROKEN_PIPE | ERROR_NO_DATA | ERROR_PIPE_NOT_CONNECTED

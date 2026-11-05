@@ -25,7 +25,9 @@ use std::time::{Duration, Instant};
 use slates_anchor::{AnchorSegment, Geometry, RegionKind, RestartPolicy, Step, Supervisor};
 use slates_machine::facts::Identity;
 
-use slates_anchor::handles::{HandleMessage, WHAT_WINFSP_MOUNT, encode, parse_env};
+use slates_anchor::handles::{
+  HandleMessage, HandleRefusal, MESSAGE_BYTES, WHAT_WINFSP_MOUNT, encode, parse_env,
+};
 use slates_anchor::held_windows::{Channel, Held, channel, handle_from_value, handle_value};
 use slates_ipc::win_spawn::{
   Process, Spawn, StandardOutput, duplicate_inheritable, environment_block,
@@ -45,10 +47,16 @@ const ROLE_CHECKER: &str = "checker_role";
 const ROLE_GONE: &str = "gone_role";
 /// Format: a child supervised by the real anchor state machine across a restart.
 const ROLE_SUPERVISED: &str = "supervised_role";
-/// Format: the supervised child whose first process writes short and corrupted hold messages before its real hold.
+/// Format: the supervised child whose first process writes short and corrupted hold messages between two real holds.
 const ROLE_GARBLING: &str = "garbling_role";
+/// Format: the supervised child whose first process writes one message longer than a hold message between two real
+/// holds.
+const ROLE_OVERSIZING: &str = "oversizing_role";
 /// Shape: how many short and how many corrupted hold messages the garbling child writes (each kind this many).
 const GARBLED_EACH: usize = 10;
+/// Shape: the entries a garbling child holds: one before its bad messages, so they must leave it held, and one after,
+/// so the channel must still serve.
+const GARBLERS_HOLDS: usize = 2;
 /// Format: the variable naming the hold channel's daemon end the sender inherited (its handle value, hex).
 const CHANNEL_VALUE: &str = "SLATES_HANDLE_TEST_CHANNEL";
 /// Format: the variable naming the event the sender creates and the checkers open, a `Local\` name.
@@ -381,15 +389,62 @@ fn the_supervisor_acknowledges_the_hold_before_commit_and_hands_it_to_its_succes
   );
 }
 
-/// Audit plan 01a1a34bf7e973069e94f773afdea44a, step 3 (A-198). Do: let a real supervised child write a short hold
-/// message and one whose checksum is corrupted, then its real hold; it commits after Held, exits and is restarted.
-/// Expect: every step of the real supervisor succeeds (what a daemon sends never ends supervision), both messages are
-/// counted as refusals, the real hold is acknowledged, and the successor inherits the same live object. Before the fix
-/// the first malformed message made `Supervisor::step` fail, which ends the anchor and, through its kill-on-close job,
-/// the daemon and every held drive.
+/// Audit plan 01a1a34bf7e973069e94f773afdea44a, step 3 (A-198). Do: let a real supervised child hold one event, write
+/// `GARBLED_EACH` short hold messages (of no bytes up to nine tenths of a message) and `GARBLED_EACH` with a corrupted
+/// checksum, then hold a second event, commit after its answer and exit; let the supervisor restart it. Expect: every
+/// step of the real supervisor succeeds (what a daemon sends never ends supervision), exactly 20 refusals are counted,
+/// both holds are kept, and the successor inherits both live objects. Before the fix the first refused message made
+/// `Supervisor::step` fail, which ends the anchor and, through its kill-on-close job, the daemon and every held drive.
 #[test]
 fn a_malformed_hold_message_is_refused_and_counted_and_supervision_goes_on() {
-  let args: Vec<String> = role_args(ROLE_GARBLING)
+  assert_eq!(
+    refusals_while_supervising(ROLE_GARBLING),
+    u64::try_from(GARBLED_EACH * 2).unwrap(),
+    "each short and each corrupted message is refused once"
+  );
+}
+
+/// A-198, the same fixture with a message half as long again as a hold message. Expect: supervision goes on and both
+/// holds are kept. The anchor reads a hold message's length, so it refuses the long read, then the short remainder the
+/// pipe kept: exactly two refusals.
+#[test]
+fn an_oversized_hold_message_is_refused_and_counted_and_supervision_goes_on() {
+  assert_eq!(refusals_while_supervising(ROLE_OVERSIZING), 2);
+}
+
+/// A-198, the channel's reads over the real pipe. Do: write a message of no bytes, then one half as long again as a
+/// hold message. Expect: the empty message is a malformed short message, not "nothing waited" (which ends the anchor's
+/// drain with the message uncounted); the long one and its remainder are each malformed, not an OS refusal (which ends
+/// the drain too); and only then does a read find nothing.
+#[test]
+fn a_read_tells_no_message_from_a_message_of_no_bytes_and_refuses_a_long_one() {
+  let (anchor, daemon) = channel().unwrap();
+  assert!(matches!(anchor.recv(0), Ok(None)), "nothing was written");
+  // A write longer than the pipe's buffer finishes only as it is read, so the writes run beside the reads, and every
+  // read is made before any is judged, or a failed assertion would wait on a writer nobody reads.
+  let reads: Vec<_> = std::thread::scope(|scope| {
+    scope.spawn(|| {
+      write_raw(&daemon, &[]);
+      write_raw(&daemon, &vec![0; MESSAGE_BYTES + MESSAGE_BYTES / 2]);
+    });
+    ["no bytes", "the long read", "its short remainder"]
+      .map(|part| (part, anchor.recv(WAIT_MS)))
+      .into()
+  });
+  for (part, read) in reads {
+    assert!(
+      matches!(read, Err(HandleRefusal::Malformed { .. })),
+      "{part}: {read:?}"
+    );
+  }
+  assert!(matches!(anchor.recv(0), Ok(None)), "every byte was taken");
+}
+
+/// Runs a real supervised child in `role` to its second departure, requiring every step of the real supervisor to
+/// succeed, and returns the refusals the anchor counted. Holds that both real holds were kept and that the successor
+/// inherited both live objects.
+fn refusals_while_supervising(role: &str) -> u64 {
+  let args: Vec<String> = role_args(role)
     .iter()
     .map(|argument| argument.to_string_lossy().into_owned())
     .collect();
@@ -399,11 +454,11 @@ fn a_malformed_hold_message_is_refused_and_counted_and_supervision_goes_on() {
     max_restarts: 1,
   };
   let mut anchor = Supervised(Supervisor::new(fixture_segment(), &args, policy).unwrap());
-  anchor.0.hold_handles(1).unwrap();
-  anchor.0.hold_environment(ROLE, ROLE_GARBLING.to_owned());
+  anchor.0.hold_handles(GARBLERS_HOLDS).unwrap();
+  anchor.0.hold_environment(ROLE, role.to_owned());
   anchor
     .0
-    .hold_environment(EVENT_NAME, format!("{}-garbling", unique_event_name()));
+    .hold_environment(EVENT_NAME, format!("{}-{role}", unique_event_name()));
   anchor.0.start(0).unwrap();
   let clock = Instant::now();
   let mut completed = false;
@@ -420,7 +475,7 @@ fn a_malformed_hold_message_is_refused_and_counted_and_supervision_goes_on() {
         break;
       }
       Ok(_) => {}
-      Err(error) => panic!("a malformed hold message ended supervision: {error}"),
+      Err(error) => panic!("a bad hold message ended supervision: {error}"),
     }
     // Shape: a short harness poll; the production observation loop chooses its wait from liveness.
     std::thread::park_timeout(Duration::from_millis(1));
@@ -429,11 +484,10 @@ fn a_malformed_hold_message_is_refused_and_counted_and_supervision_goes_on() {
     completed,
     "the two supervised processes did not finish inside the fixture budget"
   );
-  assert_eq!(anchor.0.held_handles(), 1, "the real hold is kept");
   assert_eq!(
-    anchor.0.handle_refusals(),
-    2,
-    "the short and the corrupted message are each refused"
+    anchor.0.held_handles(),
+    GARBLERS_HOLDS,
+    "the hold before the bad messages and the hold after them are both kept"
   );
   assert_eq!(
     anchor
@@ -444,6 +498,7 @@ fn a_malformed_hold_message_is_refused_and_counted_and_supervision_goes_on() {
       .as_deref(),
     Some(b"checked".as_slice())
   );
+  anchor.0.handle_refusals()
 }
 
 /// Writes `bytes` as one message on the daemon's end of the hold channel, overlapped as the channel's own writes are,
@@ -516,21 +571,6 @@ fn refuse_new_duplicate_access(pid: u32) {
 #[ignore = "the supervised hold fixture; run by its parent"]
 fn supervised_role() {
   assert_eq!(std::env::var(ROLE).as_deref(), Ok(ROLE_SUPERVISED));
-  supervised_body(false);
-}
-
-/// The garbling supervised child: as `supervised_role`, but its first process writes a short hold message and one with
-/// a corrupted checksum before its real hold.
-#[test]
-#[ignore = "the garbling hold fixture; run by its parent"]
-fn garbling_role() {
-  assert_eq!(std::env::var(ROLE).as_deref(), Ok(ROLE_GARBLING));
-  supervised_body(true);
-}
-
-/// The supervised child's body: the first process commits only after acknowledgement (garbling first when `garble`),
-/// the second checks the inherited object; both exit with ROLE_EXIT.
-fn supervised_body(garble: bool) {
   let mut segment = AnchorSegment::attach_from_env(&fixture_identity()).unwrap();
   let env = std::env::var(slates_anchor::handles::ENV_HANDLES).unwrap();
   let (channel_value, entries) = parse_env(&env, 1).unwrap();
@@ -563,19 +603,96 @@ fn supervised_body(garble: bool) {
       values: vec![handle_value(event.as_raw_handle())],
       record: name.into_bytes(),
     };
-    if garble {
-      let bytes = encode(&hold).unwrap();
-      write_raw(&channel, &bytes[..bytes.len() / 2]);
-      let mut corrupted = bytes;
-      let last = corrupted.len() - 1;
-      corrupted[last] ^= 0xff;
-      write_raw(&channel, &corrupted);
-    }
     channel.send(&hold, WAIT_MS).unwrap();
     assert_eq!(
       channel.recv(WAIT_MS).unwrap(),
       Some(HandleMessage::Held { id: ENTRY_ID })
     );
+    segment.publish(RegionKind::Profile, b"committed").unwrap();
+  }
+  std::process::exit(ROLE_EXIT);
+}
+
+/// The garbling supervised child: its first process writes short and corrupted hold messages between two real holds.
+#[test]
+#[ignore = "the garbling hold fixture; run by its parent"]
+fn garbling_role() {
+  assert_eq!(std::env::var(ROLE).as_deref(), Ok(ROLE_GARBLING));
+  garbled_body(|channel, bytes| {
+    for tenth in 0..GARBLED_EACH {
+      write_raw(channel, &bytes[..bytes.len() * tenth / GARBLED_EACH]);
+    }
+    for corrupted_byte in 0..GARBLED_EACH {
+      let mut corrupted = bytes.to_vec();
+      corrupted[bytes.len() - 1 - corrupted_byte] ^= 0xff;
+      write_raw(channel, &corrupted);
+    }
+  });
+}
+
+/// The oversizing supervised child: its first process writes one message half as long again as a hold message between
+/// two real holds.
+#[test]
+#[ignore = "the oversizing hold fixture; run by its parent"]
+fn oversizing_role() {
+  assert_eq!(std::env::var(ROLE).as_deref(), Ok(ROLE_OVERSIZING));
+  garbled_body(|channel, bytes| {
+    let mut long = bytes.to_vec();
+    long.resize(MESSAGE_BYTES + MESSAGE_BYTES / 2, 0);
+    write_raw(channel, &long);
+  });
+}
+
+/// One hold and its answer, of a new signalled event named `name`: the event, owned until this process exits, and the
+/// encoded hold for the caller to garble.
+fn hold_event(channel: &Channel, id: u64, name: String) -> (OwnedHandle, [u8; MESSAGE_BYTES]) {
+  let event = event(Some(&name));
+  // SAFETY: a live event owned in this process until the hold is acknowledged.
+  assert_ne!(unsafe { SetEvent(event.as_raw_handle()) }, 0);
+  let hold = HandleMessage::Hold {
+    id,
+    what: WHAT_WINFSP_MOUNT,
+    values: vec![handle_value(event.as_raw_handle())],
+    record: name.into_bytes(),
+  };
+  channel.send(&hold, WAIT_MS).unwrap();
+  assert_eq!(
+    channel.recv(WAIT_MS).unwrap(),
+    Some(HandleMessage::Held { id })
+  );
+  (event, encode(&hold).unwrap())
+}
+
+/// A supervised child's body around bad messages: the first process holds an event, runs `garble` over its channel and
+/// a well-formed message, holds a second event and commits; the second checks that it inherited both live objects.
+/// Both exit with ROLE_EXIT.
+fn garbled_body(garble: impl FnOnce(&Channel, &[u8])) {
+  let mut segment = AnchorSegment::attach_from_env(&fixture_identity()).unwrap();
+  let env = std::env::var(slates_anchor::handles::ENV_HANDLES).unwrap();
+  let (channel_value, entries) = parse_env(&env, GARBLERS_HOLDS).unwrap();
+  // SAFETY: the supervisor's explicit handle list handed this process its own channel handle at this value.
+  let channel = Channel::adopt(unsafe {
+    OwnedHandle::from_raw_handle(handle_from_value(channel_value).unwrap())
+  });
+  if segment
+    .read_published(RegionKind::Profile)
+    .unwrap()
+    .is_some()
+  {
+    assert_eq!(entries.len(), GARBLERS_HOLDS, "both holds were inherited");
+    for entry in &entries {
+      let inherited = handle_from_value(*entry.values.first().unwrap()).unwrap();
+      assert!(
+        signalled(inherited),
+        "the successor inherited the same live object"
+      );
+    }
+    segment.publish(RegionKind::Profile, b"checked").unwrap();
+  } else {
+    let name = std::env::var(EVENT_NAME).unwrap();
+    let (_before, bytes) = hold_event(&channel, ENTRY_ID, format!("{name}-before"));
+    garble(&channel, &bytes);
+    let (_after, _) = hold_event(&channel, ENTRY_ID + 1, format!("{name}-after"));
     segment.publish(RegionKind::Profile, b"committed").unwrap();
   }
   std::process::exit(ROLE_EXIT);
