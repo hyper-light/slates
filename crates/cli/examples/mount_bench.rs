@@ -51,6 +51,7 @@
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -69,6 +70,8 @@ const FILE_BYTES: usize = 4 << 10;
 const WORK_DIR: &str = "d";
 /// Shape: the pause between two wake-up probes, about 200 a second: a few thousand per pass, too few to load anything.
 const PROBE_EVERY: Duration = Duration::from_millis(5);
+/// Shape: how long the user's CPU-bound process runs alone, its rate beside an idle daemon. DIAG.
+const BASELINE: Duration = Duration::from_secs(10);
 /// Shape: spinner threads per logical CPU in the contended pass, unless `--spinners-per-cpu` names another count: one
 /// fills every core, so a thread that must be woken waits its turn behind a CPU-bound one.
 const SPINNERS_PER_CPU: usize = 1;
@@ -254,7 +257,8 @@ fn round(
 
 /// Background load until `stop`: sweeps its own `sweep_bytes` buffer a `line_bytes` line at a time, so the core, the
 /// caches and memory bandwidth are all contended.
-fn spin(stop: &AtomicBool, sweep_bytes: usize, line_bytes: usize) {
+fn spin(stop: &AtomicBool, sweep_bytes: usize, line_bytes: usize) -> u64 {
+  let mut sweeps = 0u64;
   let mut buffer = vec![0u8; sweep_bytes];
   let mut value = 0u8;
   while !stop.load(Ordering::Relaxed) {
@@ -264,8 +268,43 @@ fn spin(stop: &AtomicBool, sweep_bytes: usize, line_bytes: usize) {
       }
     }
     value = value.wrapping_add(1);
+    sweeps = sweeps.wrapping_add(1);
   }
   std::hint::black_box(&buffer);
+  sweeps
+}
+
+/// DIAG: the user's own CPU-bound work, a process of its own at normal priority: `threads` spinners until its stdin
+/// closes, then their sweeps on stdout.
+fn burn_child(threads: usize, sweep_bytes: usize, line_bytes: usize) {
+  let stop = AtomicBool::new(false);
+  let total: u64 = std::thread::scope(|scope| {
+    let spinners: Vec<_> = (0..threads)
+      .map(|_| scope.spawn(|| spin(&stop, sweep_bytes, line_bytes)))
+      .collect();
+    let mut rest = Vec::new();
+    let _ = std::io::stdin().read_to_end(&mut rest);
+    stop.store(true, Ordering::Relaxed);
+    spinners.into_iter().map(|one| one.join().unwrap()).sum()
+  });
+  println!("{total}");
+}
+
+/// DIAG: starts that process.
+fn start_burn(threads: usize, sweep: (usize, usize)) -> Child {
+  Command::new(std::env::current_exe().unwrap())
+    .args(["--burn-child", &threads.to_string(), &sweep.0.to_string(), &sweep.1.to_string()])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .spawn()
+    .unwrap()
+}
+
+/// DIAG: ends that process and reads its sweeps.
+fn end_burn(mut child: Child) -> u64 {
+  drop(child.stdin.take());
+  let output = child.wait_with_output().unwrap();
+  String::from_utf8_lossy(&output.stdout).trim().parse().unwrap()
 }
 
 /// The wake-up probe until `stop`: the round trip of a message to a thread blocked on a channel and back, one every
@@ -348,6 +387,8 @@ struct Pass {
   probe: Vec<u64>,
   wall: Duration,
   samples: Vec<Samples>,
+  /// DIAG: the user's process alone, and beside this pass: sweeps a second.
+  burn: Option<(f64, f64)>,
 }
 
 /// One pass: every round over every arm, with `spinners` spinner threads running for its length.
@@ -361,11 +402,17 @@ fn pass(
 ) -> Result<Pass, String> {
   let stop = AtomicBool::new(false);
   let load_before = load_average();
+  let baseline = (spinners > 0).then(|| {
+    let alone = start_burn(spinners, sweep);
+    let began = Instant::now();
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(BASELINE);
+    let sweeps = end_burn(alone);
+    sweeps as f64 / began.elapsed().as_secs_f64()
+  });
+  let burn_child_process = (spinners > 0).then(|| start_burn(spinners, sweep));
   let started = Instant::now();
   let (result, probe_samples, samples) = std::thread::scope(|scope| {
-    for _ in 0..spinners {
-      scope.spawn(|| spin(&stop, sweep.0, sweep.1));
-    }
     let prober = scope.spawn(|| probe(&stop));
     let mut samples: Vec<Samples> = arms.iter().map(|_| Samples::default()).collect();
     let result = (|| {
@@ -384,6 +431,11 @@ fn pass(
     let probe_samples = prober.join().unwrap_or_default();
     (result, probe_samples, samples)
   });
+  let wall_so_far = started.elapsed();
+  let burn = burn_child_process
+    .map(end_burn)
+    .zip(baseline)
+    .map(|(sweeps, alone)| (alone, sweeps as f64 / wall_so_far.as_secs_f64()));
   result?;
   Ok(Pass {
     name,
@@ -393,6 +445,7 @@ fn pass(
     probe: probe_samples,
     wall: started.elapsed(),
     samples,
+    burn,
   })
 }
 
@@ -414,6 +467,15 @@ fn print_pass(arms: &[Arm], mut measured: Pass) {
     measured.wall.as_secs_f64()
   );
   println!("# pass {}: {load}", measured.name);
+  if let Some((alone, beside)) = measured.burn {
+    println!(
+      "fsburn\t{}\t{}\t{alone:.3}\t{beside:.3}\t{:.3}\t{}",
+      measured.name,
+      arms.first().map_or("none", |arm| arm.name.as_str()),
+      measured.wall.as_secs_f64(),
+      std::thread::available_parallelism().map_or(1, usize::from)
+    );
+  }
   let mut cells: Vec<Vec<String>> = OPERATIONS.iter().map(|_| Vec::new()).collect();
   for (arm, samples) in arms.iter().zip(measured.samples.iter_mut()) {
     for ((operation, column), samples) in OPERATIONS
@@ -572,6 +634,12 @@ fn run_passes(options: &Options, cores: usize, sweep: (usize, usize)) -> Result<
 }
 
 fn main() {
+  let given: Vec<String> = std::env::args().collect();
+  if given.get(1).map(String::as_str) == Some("--burn-child") {
+    let number = |at: usize| given.get(at).unwrap().parse::<usize>().unwrap();
+    burn_child(number(2), number(3), number(4));
+    return;
+  }
   let options = match options() {
     Ok(options) => options,
     Err(error) => {
