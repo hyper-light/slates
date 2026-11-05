@@ -698,6 +698,51 @@ fn hostile_replies_are_refused() {
   }
 }
 
+/// Hostile input on the header readers a holder uses before it decodes a message it will not serve: an entry's and an
+/// install's epoch are read back as encoded, every truncation short of the epoch reads none, and a fetch is not read as
+/// an install. Never a panic.
+#[test]
+fn a_messages_epoch_is_read_from_its_header_alone() {
+  use slates_db::live::{Fetch, epoch_of, epoch_of_install};
+  let entry = Entry {
+    owner: HostId(1),
+    object: OBJECT,
+    position: 3,
+    epoch: HostEpoch(5),
+    previous: [9; 32],
+    payload: vec![1, 2, 3, 4],
+  };
+  let bytes = entry.encode();
+  assert_eq!(epoch_of(&bytes), Some(HostEpoch(5)));
+  let header = 8 + 16 + 8 + 8;
+  for length in 0..header {
+    assert_eq!(epoch_of(&bytes[..length]), None);
+  }
+  assert_eq!(epoch_of(&bytes[..header]), Some(HostEpoch(5)));
+  let install = Install {
+    owner: HostId(1),
+    object: OBJECT,
+    epoch: HostEpoch(6),
+    head: Head {
+      epoch: HostEpoch(6),
+      position: 0,
+      identity: [3; 32],
+    },
+    state: vec![8; 12],
+  };
+  let bytes = install.encode();
+  assert_eq!(epoch_of_install(&bytes), Some(HostEpoch(6)));
+  let header = 1 + 8 + 16 + 8;
+  for length in 0..header {
+    assert_eq!(epoch_of_install(&bytes[..length]), None);
+  }
+  let fetch = Fetch {
+    object: OBJECT,
+    epoch: HostEpoch(7),
+  };
+  assert_eq!(epoch_of_install(&fetch.encode()), None);
+}
+
 /// Hostile input on the whole-state kind: a fetch round-trips; every truncation of it, an install tag where a fetch is
 /// read, and a fetch with bytes after it are refused, never a panic.
 #[test]

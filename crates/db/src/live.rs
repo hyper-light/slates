@@ -255,6 +255,28 @@ pub fn object_of(bytes: &[u8]) -> Option<ObjectId> {
   reader.object().ok()
 }
 
+/// The epoch an entry was made under, read without decoding the rest: what a holder that will not serve the sender (the
+/// configuration names another acting owner) compares with its fence, to tell a superseded owner so (`StaleEpoch`)
+/// rather than refuse it as a stranger. `None` for bytes too short.
+pub fn epoch_of(bytes: &[u8]) -> Option<HostEpoch> {
+  let mut reader = Reader { bytes };
+  reader.word().ok()?;
+  reader.object().ok()?;
+  reader.word().ok()?;
+  reader.word().ok().map(HostEpoch)
+}
+
+/// The epoch an [`Install`] names, as [`epoch_of`] reads an entry's. `None` for bytes too short or of another tag.
+pub fn epoch_of_install(bytes: &[u8]) -> Option<HostEpoch> {
+  let mut reader = Reader { bytes };
+  if reader.byte().ok()? != TAG_INSTALL {
+    return None;
+  }
+  reader.word().ok()?;
+  reader.object().ok()?;
+  reader.word().ok().map(HostEpoch)
+}
+
 /// The object a whole-state message (an [`Install`] or a [`Fetch`]) names, read without decoding the rest. `None` for
 /// bytes too short or of another tag.
 pub fn object_of_state(bytes: &[u8]) -> Option<ObjectId> {

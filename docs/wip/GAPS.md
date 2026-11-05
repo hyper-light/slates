@@ -85,8 +85,11 @@
 > let go (three defects found and fixed on the way: §4.10 status "Chaos, continued"). Open: hard links and extended
 > attributes in the rebuilt volume; FUSE `fsync` at durability; a candidate's copy across its own daemon's restart.
 > Measured in the daemon (release, BENCHMARKS "What live shipping adds to a stable NFS write"): a live 4 KiB `FILE_SYNC`
-> write costs 121–151 µs more than a plain one at the median, p99 571–625 µs, at load 34–40; the rare tail (p999 to 95
-> ms, max 100 ms) is not explained. Open: one exchange per message to every holder starved the second holder (never
+> write costs 90–114 µs more than a plain one at the median, p99 217–398 µs, p999 0.44–1.27 ms, worst 0.47–1.87 ms at
+> load 8–30 (2026-11-05). The rare 100 ms tail is explained and removed (two waits for the record period; and a
+> superseded owner that held a write unanswered is now refused, and a destroyed volume's shipper is let go: §4.10
+> status "The tail and three more defects"). Open: the added median is the cross-shard dispatch round (50 µs not met);
+> p999 under 1 ms at load 30. Open: one exchange per message to every holder starved the second holder (never
 > accepted an entry, in six of nine process flows) and was rejected; why is not pinned down. Open, toward a filesystem
 > server replicated per write in under 1 ms: FUSE `fsync` answered at durability (AC-8.3's "live-shipped volumes
 > report none", AC-8.9's credit backpressure); a candidate's copy kept across its own restart; real-process chaos

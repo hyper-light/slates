@@ -119,9 +119,12 @@ fn pause() {
   std::thread::sleep(Duration::from_millis(POLL_MS));
 }
 
-fn scratch_dir() -> ScratchDir {
+/// One directory per fleet: the tests run in parallel in one process, and a directory named by the process alone let
+/// each fleet's manifest and identities overwrite another's, so a daemon was handed another fleet's ports and refused
+/// to start (8 of 9 flows, 2026-11-05).
+fn scratch_dir(tag: &str) -> ScratchDir {
   let raw = format!(
-    "{}/slates-live-fleet-{}",
+    "{}/slates-live-fleet-{tag}-{}",
     env!("CARGO_TARGET_TMPDIR"),
     std::process::id()
   );
@@ -282,6 +285,24 @@ fn wait_formed(instances: &[String]) -> Vec<String> {
 }
 
 /// The sum over every shard of the daemon's counter `kind` (`shard N refused KIND: COUNT` in `status`).
+/// Every `fleet.live.*` counter `instance` reports, summed over its shards, by name.
+fn live_counters(instance: &str) -> std::collections::BTreeMap<String, u64> {
+  let (_, status, _) = run(instance, &["status"]);
+  let mut counts = std::collections::BTreeMap::<String, u64>::new();
+  for (kind, count) in status
+    .lines()
+    .filter_map(|line| {
+      line
+        .split_once(" refused fleet.live.")
+        .map(|(_, rest)| rest)
+    })
+    .filter_map(|rest| rest.split_once(": "))
+  {
+    *counts.entry(kind.to_owned()).or_default() += count.trim().parse::<u64>().unwrap_or(0);
+  }
+  counts
+}
+
 fn counter(instance: &str, kind: &str) -> u64 {
   let (code, out, _) = run(instance, &["status"]);
   if code != 0 {
@@ -324,7 +345,7 @@ struct Fleet {
 /// Starts three daemon processes from one manifest, waits until they form, and bootstraps the root once.
 fn start_fleet(tag: &str) -> Fleet {
   let pid = std::process::id();
-  let scratch = scratch_dir();
+  let scratch = scratch_dir(tag);
   for node in FLEET_NODES {
     mint_identity(&scratch.path, node);
   }
@@ -863,11 +884,16 @@ fn a_destroyed_live_volumes_copies_are_let_go_by_its_candidates() {
     }
     pause();
   };
+  let shipping = live_line(owner, "shipping", &id);
   drop(fleet.daemons);
   drop(fleet.scratch);
   assert!(
     held.iter().all(Option::is_none),
     "the candidates let the destroyed volume's log go: {held:?}"
+  );
+  assert!(
+    shipping.is_none(),
+    "the owner let the destroyed volume's log go too: {shipping:?}"
   );
 }
 
@@ -938,7 +964,9 @@ fn clients_cut_off_mid_write_leave_the_live_log_whole() {
 /// A-200 and StaleNeverCommits across processes: do write to a live volume, stop its owner's process until the
 /// survivors have taken the volume over, write more on the successor, then resume the old owner and try to write
 /// through it. Expect the successor to serve every write acknowledged before and after the takeover, and the old
-/// owner's write never acknowledged (refused, or never answered within the wait): a superseded owner is fenced.
+/// owner's write refused within the wait, never acknowledged and never left unanswered: a superseded owner is fenced,
+/// and its waiting writes are told so. Until 2026-11-05 the resumed owner held the write unanswered for the whole 40 s
+/// wait: the fence dropped its shipper with the write still waiting on it.
 #[test]
 fn a_superseded_owner_resumed_after_its_takeover_is_fenced() {
   /// Shape: how long the resumed owner's write is given before it counts as not acknowledged: the fleet wait.
@@ -1006,6 +1034,11 @@ fn a_superseded_owner_resumed_after_its_takeover_is_fenced() {
   };
   let (still, _) = wait_served_whole(&[&successor], &id, 5);
   let (code, out, _) = run(&successor, &["read", &id, "/stale"]);
+  eprintln!(
+    "live fence: the old owner's live counters {:?}, its log {:?}",
+    live_counters(&owner),
+    live_line(&owner, "shipping", &id)
+  );
   drop(fleet.daemons);
   drop(fleet.scratch);
   eprintln!(
@@ -1014,8 +1047,9 @@ fn a_superseded_owner_resumed_after_its_takeover_is_fenced() {
   );
   assert_eq!(still, successor);
   assert!(
-    stale_outcome != Some(Some(0)),
-    "the superseded owner never acknowledged a write: {stale_outcome:?}"
+    matches!(stale_outcome, Some(Some(code)) if code != 0),
+    "the superseded owner refused the write within the wait, not acknowledged it nor left it unanswered (None): \
+     {stale_outcome:?}"
   );
   assert!(
     code != 0 || out.is_empty(),
@@ -1110,6 +1144,15 @@ fn measure_what_live_shipping_adds_to_a_stable_nfs_write() {
   }
   let caught = live_line(owner, "shipping", &live_id);
   let late = counter(owner, "fleet.live.durable_late");
+  let lent = (
+    counter(owner, "fleet.live.no_session"),
+    counter(owner, "fleet.live.unanswered"),
+    counter(owner, "fleet.live.link_lost"),
+  );
+  eprintln!(
+    "measure: the owner's live counters {:?}",
+    live_counters(owner)
+  );
   let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
   drop((plain, live));
   drop(fleet.daemons);
@@ -1119,10 +1162,15 @@ fn measure_what_live_shipping_adds_to_a_stable_nfs_write() {
   eprintln!(
     "measure: {} writes each of {WRITE_BYTES} B FILE_SYNC, {ROUNDS} interleaved rounds; load {}\n  plain p50 {p50:.1} \
      p99 {p99:.1} p999 {p999:.1} max {max:.1} us\n  live  p50 {l50:.1} p99 {l99:.1} p999 {l999:.1} max {lmax:.1} us\n  \
-     added at p50 {:.1} us; live log at the end {caught:?}; late {late}",
+     added at p50 {:.1} us; live log at the end {caught:?}; late {late}; (no_session, unanswered, link_lost) {lent:?}; \
+     live writes over 50 ms {}",
     plain_times.len(),
     load.trim(),
-    l50 - p50
+    l50 - p50,
+    live_times
+      .iter()
+      .filter(|time| **time > Duration::from_millis(50))
+      .count()
   );
   assert_eq!(late, 0, "no stable write waited out its bound");
 }
