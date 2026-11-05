@@ -27,7 +27,7 @@
 > suites run over the slates drive (`slates mount ID E:`) through `cargo xtask conformance` in `windows-lint` and
 > `windows-arm64`: winfstest (a Rust transcription of its Python 2.7 scripts, held to them by a golden of 733 cases)
 > and the WinFsp fsx port, each built from `billziss-gh/secfs.test@6ac65cd` with MSVC. winfstest: 628 cases, the same
-> verdicts on x86_64 and arm64, every failure on the reviewed list
+> verdicts on x86_64 and arm64 (254 pass; diagnostics run 42061904713, every step green), every failure on the reviewed list
 > (`docs/wip/conformance/expected-failures/native-windows-winfsp.winfstest.txt`) with its reason, the five Windows
 > features the drive does not keep (attribute bits, security descriptors, a settable creation time, reparse points and
 > symbolic links, named streams). The suites found four Win32 bugs in `crates/bridge-winfsp`, each fixed with a failing
