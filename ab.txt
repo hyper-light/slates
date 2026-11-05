@@ -1,0 +1,66 @@
+# old 71cf09acb500fba021c92cfc9c42f0180e93876b, new 5f63ee136763518dd0ebfbda0fe1279c2e6d85ad, 2026-11-05T18:15:44Z
+image win25-vs2026 20261030.294.1; 4 CPUs; AMD64
+Microsoft Windows [Version 10.0.26100.33674]
+fatal: ambiguous argument 'HEAD^': unknown revision or path not in the working tree.
+Use '--' to separate paths from revisions, like this:
+'git <command> [<revision>...] -- [<file>...]'
+# dll 71cf09acb500fba021c92cfc9c42f0180e93876b; raised dc31e45f641979543f9933be4c2f04c171193984; normal HEAD^
+## run 1 of 5 arm dll, 2026-11-05T18:15:46Z
+# host: windows 0x23f00206 on windows processor architecture 9 level 25 revision 4353 (x86_64), 4 logical CPUs (4 available to this process), 15 GiB, page 4096 B; largest L2 1048576 B, cache line 64 B
+# workload: 10 rounds of 1000 files of 4096 B per arm and pass, arms interleaved, first arm rotating
+# arm dll: S:/d
+# warm-up: one untimed round per arm (1000 files each)
+# pass quiet: spinners 0 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 13.4 µs, p99 41.7 µs, p999 154.0 µs, max 1269.2 µs over 3548 probes; 18.5 s
+fsbench	quiet	dll	create	10000	638900	1091100	1429300	31507800
+fsbench	quiet	dll	write	10000	74900	432400	649300	15433900
+fsbench	quiet	dll	fsync	10000	92000	208600	643200	29175100
+fsbench	quiet	dll	close	10000	44100	359900	609700	29227300
+fsbench	quiet	dll	stat	10000	160300	236700	312400	14698900
+fsbench	quiet	dll	open	10000	96200	175300	422900	29222700
+fsbench	quiet	dll	read	10000	8300	89700	141300	3551800
+fsbench	quiet	dll	rename	10000	375800	554600	8456400	29907500
+fsbench	quiet	dll	unlink	10000	203200	414600	793100	19998000
+
+**quiet** (spinners 0 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 13.4 µs, p99 41.7 µs, p999 154.0 µs, max 1269.2 µs over 3548 probes; 18.5 s). Each cell: p50 · p99 · p999 · max, µs.
+
+| op | dll |
+|---|---|
+| create | 638.9 · 1091.1 · 1429.3 · 31507.8 |
+| write | 74.9 · 432.4 · 649.3 · 15433.9 |
+| fsync | 92.0 · 208.6 · 643.2 · 29175.1 |
+| close | 44.1 · 359.9 · 609.7 · 29227.3 |
+| stat | 160.3 · 236.7 · 312.4 · 14698.9 |
+| open | 96.2 · 175.3 · 422.9 · 29222.7 |
+| read | 8.3 · 89.7 · 141.3 · 3551.8 |
+| rename | 375.8 · 554.6 · 8456.4 · 29907.5 |
+| unlink | 203.2 · 414.6 · 793.1 · 19998.0 |
+
+# pass contended: spinners 8 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 28.1 µs, p99 46.7 µs, p999 63.0 µs, max 88686.2 µs over 134723 probes; 713.5 s
+fsburn	contended	dll	94493.313	91704.843	713.520	4
+fsbench	contended	dll	create	10000	1143300	224175200	298633600	388733400
+fsbench	contended	dll	write	10000	82300	379000	54365300	102978600
+fsbench	contended	dll	fsync	10000	118800	230100	64236000	117382200
+fsbench	contended	dll	close	10000	60000	111100	42906600	86121400
+fsbench	contended	dll	stat	10000	214700	115577400	153747500	193322000
+fsbench	contended	dll	open	10000	157100	272200	75481600	148649000
+fsbench	contended	dll	read	10000	84100	147400	75829400	129195400
+fsbench	contended	dll	rename	10000	519300	32695900	125930300	254510300
+fsbench	contended	dll	unlink	10000	307100	122433700	172930800	244026700
+
+**contended** (spinners 8 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 28.1 µs, p99 46.7 µs, p999 63.0 µs, max 88686.2 µs over 134723 probes; 713.5 s). Each cell: p50 · p99 · p999 · max, µs.
+
+| op | dll |
+|---|---|
+| create | 1143.3 · 224175.2 · 298633.6 · 388733.4 |
+| write | 82.3 · 379.0 · 54365.3 · 102978.6 |
+| fsync | 118.8 · 230.1 · 64236.0 · 117382.2 |
+| close | 60.0 · 111.1 · 42906.6 · 86121.4 |
+| stat | 214.7 · 115577.4 · 153747.5 · 193322.0 |
+| open | 157.1 · 272.2 · 75481.6 · 148649.0 |
+| read | 84.1 · 147.4 · 75829.4 · 129195.4 |
+| rename | 519.3 · 32695.9 · 125930.3 · 254510.3 |
+| unlink | 307.1 · 122433.7 · 172930.8 · 244026.7 |
+
+unmounted: S:
+# dll's error output, heartbeat lines and lapses:
+## run 1 of 5 arm dll done, 2026-11-05T18:28:13Z
