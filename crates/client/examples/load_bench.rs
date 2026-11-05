@@ -1200,13 +1200,32 @@ fn level(
   oracle(n, &total.submits, &base, &head) + own_files_oracle(n, &mut reader, green, &total.submits)
 }
 
+/// Format: the hexadecimal digits of a volume id, as the CLI prints it.
+const VOLUME_ID_HEX: usize = 32;
+
+/// A volume id from its 32 hexadecimal characters, as `slates` prints it.
+fn parse_volume_id(text: &str) -> VolumeId {
+  let text = text.trim();
+  assert_eq!(
+    text.len(),
+    VOLUME_ID_HEX,
+    "--green takes {VOLUME_ID_HEX} hexadecimal characters"
+  );
+  let mut bytes = [0u8; 16];
+  for (byte, pair) in bytes.iter_mut().zip(text.as_bytes().chunks(2)) {
+    *byte =
+      u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).expect("--green is hexadecimal");
+  }
+  VolumeId { bytes }
+}
+
 fn arg(name: &str) -> Option<String> {
   let mut args = std::env::args();
   args.find(|a| a == name).and_then(|_| args.next())
 }
 
 fn main() {
-  let tree = arg("--tree").expect("--tree <the source tree the green is seeded from>");
+  let tree = arg("--tree").unwrap_or_default();
   let levels: Vec<usize> = arg("--clients")
     .unwrap_or_else(|| "10".to_owned())
     .split(',')
@@ -1253,7 +1272,13 @@ fn main() {
     Some(daemon)
   };
   let mut setup = connect(&instance).unwrap();
-  let green = seed_green(&mut setup, &tree, "load");
+  // `--green <32 hex>` drives a green that already exists, on this node or another node of its fleet (the client
+  // node forwards every verb to the green's owner, A-201's filesystem server); without it the harness seeds its own
+  // over `--tree`.
+  let green = match arg("--green") {
+    Some(text) => parse_volume_id(&text),
+    None => seed_green(&mut setup, &tree, "load"),
+  };
   let step = Instant::now();
   let files = walk(&mut setup, green);
   let bytes: u64 = files.iter().map(|(_, len)| len).sum();

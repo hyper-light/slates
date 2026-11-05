@@ -89,6 +89,21 @@
 >   files) 86,848 KiB, `fs/` (2,365) about 226,000 KiB in 3 of 3 runs, `Documentation/` (11,608, 59 MB) past 12 GB and
 >   `arch/` (18,944, 127 MB) past 9.9 GB inside the pin, which also outlasts the client's 1 s reply deadline; the whole
 >   kernel is killed at a 24 GB cap in its pin. Not root-caused; samples show `Overlay::read_whole` → `copy_up`.
+> - **Over the network (2026-11-05, `crates/cli/tests/load_fleet.rs`: a server node and a client node under anchors,
+>   f = 0, loopback; the harness at the client node against the server's green over `kernel/`):** 100, 300 and 1,000
+>   clients, the oracle and every own file 0 failures. The server pays about 1.2 to 1.4 MB a client at peak (121,096 to
+>   484,900 KiB at 300), the client node about 64 to 100 KB a local client (30,180 to 59,828 KiB at 300). Three faults:
+>   - **Forwards to one owner go one at a time.** `forward_batch_over_leader_session` (`crates/server/src/fleet.rs`)
+>     takes the peer's one session for a forward's whole round trip, so a client node's verbs to its server serialize:
+>     a forwarded `CreateWork` p50 1.71 s at 300 clients and 4.30 s at 1,000 (45 µs on the owner's own node).
+>   - **A forward queued past the failover bound is refused `OwnerUnreachable`** though the owner is alive and served
+>     everything else: 536 `CreateWork` and 7 edits at 1,000 clients. Typed, but the wrong cause.
+>   - **After the server's daemon is killed and its anchor restarts it, the client node's forwards stay refused
+>     `OwnerUnreachable`**: at 300 clients 207 `CreateWork`, 41 edits, 7 submits, 2 destroys; at 100 clients the
+>     harness's final read 20 s after the kill. The server recovered its green (`1 merge volumes`; whether the
+>     forwarded works existed at the kill is not yet settled).
+>   One earlier 1,000-client run stopped with every client waiting on a forwarded reply and both daemons idle for
+>   13 minutes; it did not recur in the rerun. Owners: the fleet forward and session code (raft, fs-server).
 > - **Memory grows 20 to 29 MB a same-machine connection** (the per-client ring region): the 10k-100k levels go over
 >   the network transport instead (the supervisor's decision (b), 2026-11-05), not yet run.
 

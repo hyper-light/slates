@@ -9116,8 +9116,8 @@ pub struct Rebuilt {
   pub blocks_swept: usize,
   /// Host mounts of snapshots whose read-only views were rebuilt (AUD-29-76).
   pub snapshot_views: usize,
-  /// Merge volumes rebuilt (§4.16): greens with their persisted chain replayed, works reset to a
-  /// fresh clone of their green's head (their scratch edits did not survive).
+  /// Merge volumes rebuilt (§4.16): greens with their persisted chain replayed, works with their log replayed over
+  /// their green (A-207: their acknowledged edits survive).
   pub merge_volumes: usize,
   /// Manifests held for other owners that recovery held again from the image (AUD-29-59).
   pub replicas: usize,
