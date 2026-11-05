@@ -1,0 +1,62 @@
+name: diag-winfsp-fixes
+on:
+  push:
+    branches: ['diag-winfsp-fixes-*']
+jobs:
+  live:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-latest, windows-11-arm]
+    name: live winfsp (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: ${{ matrix.runner == 'windows-latest' && '0' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        if: matrix.runner == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Install WinFsp
+        run: |
+          choco install winfsp -y --no-progress
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Build
+        run: cargo test -p slates-cli --test winfsp --no-run
+      - name: Bridge and hold oracles
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        env:
+          WINFSP_TEST_MOUNT: "1"
+        run: |
+          cargo test -p slates-bridge-winfsp --lib -- --test-threads=1 --nocapture
+      - name: Hold channel, native
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-server --lib a_missed_deadline -- --test-threads=1 --nocapture
+      - name: Long paths
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        env:
+          SLATES_TEST_CLI: "1"
+          WINFSP_TEST_MOUNT: "1"
+        run: cargo test -p slates-cli --test winfsp -- --test-threads=1 --nocapture opens_past_a_thousand a_file_at_a_two_thousand
+      - name: Refused holds
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        env:
+          SLATES_TEST_CLI: "1"
+          WINFSP_TEST_MOUNT: "1"
+        run: cargo test -p slates-cli --test winfsp -- --test-threads=1 --nocapture a_release_the_anchor a_refused_mount_time
+      - name: The whole live suite
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        env:
+          SLATES_TEST_CLI: "1"
+          WINFSP_TEST_MOUNT: "1"
+        run: cargo test -p slates-cli --test winfsp -- --test-threads=1 --nocapture
