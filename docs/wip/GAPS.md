@@ -1,5 +1,22 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Windows conformance runs, and the arm64 Linux suites (2026-11-05, A-214; VFS plan step 10).** WinFsp's own two
+> suites run over the slates drive (`slates mount ID E:`) through `cargo xtask conformance` in `windows-lint` and
+> `windows-arm64`: winfstest (a Rust transcription of its Python 2.7 scripts, held to them by a golden of 733 cases)
+> and the WinFsp fsx port, each built from `billziss-gh/secfs.test@6ac65cd` with MSVC. winfstest: 628 cases, the same
+> verdicts on x86_64 and arm64, every failure on the reviewed list
+> (`docs/wip/conformance/expected-failures/native-windows-winfsp.winfstest.txt`) with its reason, the five Windows
+> features the drive does not keep (attribute bits, security descriptors, a settable creation time, reparse points and
+> symbolic links, named streams). The suites found four Win32 bugs in `crates/bridge-winfsp`, each fixed with a failing
+> test first (`crates/cli/tests/winfsp_semantics.rs`; `docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md`):
+> a move not asked to replace replaced a taken name (and one asked replaced a directory), a directory holding a file
+> answered its removal with success, `SetFileTime` kept nothing, and an open with `TRUNCATE_EXISTING` kept the file.
+> `linux-arm64` runs fsx, fsstress and pjdfstest over the three Linux transports with the x86_64 lists: 0 unexpected
+> and 0 listed passing (diagnostics run 41975493604). **Open:** fsx over the drive wedges at its operation 164 (seed 1,
+> a `TRUNCATE UP` after a `TRUNCATE DOWN`, on both architectures): the bridge receives nothing after the shrink, so
+> the wait is in Windows' cache below the single WinFsp receiver (A-198), not in a callback; the two-step replay passes,
+> so it needs fsx's earlier history. Recorded in the same bug file; owed to the WinFsp dispatcher's owners.
+
 > **WinFsp's hold release, DLL version and long paths fixed (2026-11-04, A-206; audit steps 4 and 6).** Run
 > [41978665514](https://github.com/hyper-light/slates/actions/runs/41978665514), `windows-latest` and `windows-11-arm`,
 > with WinFsp 2.1.25156 installed from its pinned URL and SHA-256. Each lane: the whole live suite 13 passed, 1 ignored.

@@ -69,6 +69,29 @@ pub fn judge_winfsp_fsx(exit_success: bool, output: &str, operations: u64) -> Ex
   }
 }
 
+/// The number of the last operation an fsx `-v` trace shows done: the largest `N` of its `N: OPERATION …` lines
+/// (`fsx.c`'s `logdump` and `-v` lines both start so). `None` when it shows none.
+pub fn fsx_last_operation(output: &str) -> Option<u64> {
+  output
+    .lines()
+    .filter_map(|line| {
+      let (number, rest) = line.trim_start().split_once(": ")?;
+      let named = rest.split_whitespace().next()?;
+      let is_operation = !named.is_empty() && named.chars().all(|c| c.is_ascii_uppercase());
+      (is_operation && number.chars().all(|c| c.is_ascii_digit()))
+        .then(|| number.parse::<u64>().ok())
+        .flatten()
+    })
+    .max()
+}
+
+/// The reviewed-list id of an fsx run that stopped short: `fsx-seed-<seed>:<the operation it stopped at>`, the operation
+/// after the last one its trace shows done. Ids have the `file:number` form the reviewed lists take.
+pub fn fsx_stop_id(seed: u64, output: &str) -> String {
+  let stopped_at = fsx_last_operation(output).unwrap_or(0).saturating_add(1);
+  format!("fsx-seed-{seed}:{stopped_at}")
+}
+
 /// fsstress's verdict: the exit status, and the operations its log shows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FsstressVerdict {
@@ -142,6 +165,18 @@ mod tests {
     let bad =
       "READ BAD DATA: offset = 0x1000, size = 0x2000\nAll operations - 10000 - completed A-OK!x\n";
     assert!(!judge_winfsp_fsx(true, bad, 10_000).ok);
+  }
+
+  /// A-214: a `-v` trace's last operation is its largest numbered operation line; the port's other lines (its seed,
+  /// its size changes, `testcalls = 163`) are not operations; a run with none stopped at operation 1.
+  #[test]
+  fn an_fsx_trace_names_the_operation_it_stopped_at() {
+    let trace = "Seed set to 1\nextend file size from 0x0 (0) to 0x40000 (262144)\n\
+      162: WRITE           0x32464 (205924) thru 0x39303 (234243)\t(0x6ea0 (28320) bytes) HOLE\n\
+      163: TRUNCATE DOWN   from 0x39304 (234244) to 0x269b4 (158132)\nsignal 2\ntestcalls = 163\n";
+    assert_eq!(fsx_last_operation(trace), Some(163));
+    assert_eq!(fsx_stop_id(1, trace), "fsx-seed-1:164");
+    assert_eq!(fsx_stop_id(7, "Seed set to 7\n"), "fsx-seed-7:1");
   }
 
   /// fsstress's real `-v` lines (a 40-operation, two-process run on this host, 2026-09-14) are
