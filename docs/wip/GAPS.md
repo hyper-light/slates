@@ -1,5 +1,23 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Correction (2026-11-05, clients): one macOS A/B measured one binary three times.** The macOS arms of
+> 15:47–15:56 UTC (main c0c8d28c, A-208 89382153, a6c3bc16) were built from `git archive` copies into one shared
+> target dir. `git archive` stamps files with their commit's time, older than the outputs already there, so cargo
+> rebuilt nothing after the first. All three binaries are one, main c0c8d28c: identical MD5s. The instrumented
+> `a6c3bc16` bench builds were affected the same way: only the edited bench was rebuilt, so their client library was
+> main's.
+> - **Wrong:** "2 of the 4 parked forms that ran with [a6c3bc16] stalled … without it, none of 15 did", and "the
+>   instrumented bench caught" the churn pause "with a6c3bc16". These are on main through 8d7c6a10 and in
+>   `docs/bugs/2026-11-05-a-call-waited-for-its-acknowledgements-scatter.md`.
+> - **Right:** a6c3bc16 stalled 1 of 9 runs on jupiter, where each arm has its own target dir. On macOS main itself
+>   stalled 1 of 4 parked forms, and the ~1.77 s pause after 64 clients churned was main's code. So the pause, and
+>   the `Stalled` aborts under load, are main's. They fit a defect of main's found since: a scatter whose part's spawn
+>   a full control channel refuses never answers (recorded with A-216).
+> - **Unaffected:** CI and jupiter build each arm in its own target dir, checked, so every CI run and jupiter A/B
+>   stands.
+>
+> Every macOS arm is now built in its own target dir, and arms are compared by MD5 before they run.
+
 
 
 > **Merge: the same edit from two works was one increment; fixed 2026-11-04 (§4.16, agents/perf).** The increment's
