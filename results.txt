@@ -1,0 +1,181 @@
+runner windows-latest, 4 CPUs, Thu Nov  5 22:22:37 UTC 2026
+== quiet round 1: main at 22:22:37 UTC; no load average
+provisioning histogram: 1 shards, spin window 237 ns, floor 50000 ns
+  provision.spinning_1_p50: 9500 ns [9400, 9600] over 3 runs: [9600, 9500, 9400]
+  provision.spinning_1_p99: 19600 ns [18400, 19700] over 3 runs: [19700, 19600, 18400]
+ac-2.1: 1 client spinning (4 cores, 1 shards), provisioning p99 19600 ns vs floor 50000 ns: ok
+  provision.spinning_8_p50: 235100 ns [233400, 248100] over 3 runs: [248100, 233400, 235100]
+  provision.spinning_8_p99: 582200 ns [577400, 611000] over 3 runs: [611000, 582200, 577400]
+  provision.parked_1_p50: 147900 ns [143400, 149300] over 3 runs: [143400, 149300, 147900]
+  provision.parked_1_p99: 1347400 ns [770100, 14123400] over 3 runs: [770100, 14123400, 1347400]
+== quiet round 1: main exit 0
+== quiet round 1: fix at 22:23:34 UTC; no load average
+provisioning histogram: 1 shards, spin window 150 ns, floor 50000 ns
+  provision.spinning_1_p50: 9200 ns [9100, 9400] over 3 runs: [9400, 9100, 9200]
+  provision.spinning_1_p99: 20900 ns [16600, 21400] over 3 runs: [21400, 20900, 16600]
+ac-2.1: 1 client spinning (4 cores, 1 shards), provisioning p99 20900 ns vs floor 50000 ns: ok
+  provision.spinning_8_p50: 243200 ns [233500, 270800] over 3 runs: [243200, 270800, 233500]
+  provision.spinning_8_p99: 593200 ns [591900, 609800] over 3 runs: [609800, 593200, 591900]
+  provision.parked_1_p50: 145700 ns [144500, 146200] over 3 runs: [145700, 144500, 146200]
+  provision.parked_1_p99: 834900 ns [686200, 10309800] over 3 runs: [834900, 686200, 10309800]
+== quiet round 1: fix exit 0
+== quiet round 1: r1 at 22:24:31 UTC; no load average
+provisioning histogram: 1 shards, spin window 159 ns, floor 50000 ns
+  provision.spinning_1_p50: 9200 ns [9100, 9300] over 3 runs: [9300, 9200, 9100]
+  provision.spinning_1_p99: 23000 ns [18100, 24900] over 3 runs: [23000, 24900, 18100]
+ac-2.1: 1 client spinning (4 cores, 1 shards), provisioning p99 23000 ns vs floor 50000 ns: ok
+  provision.spinning_8_p50: 239200 ns [239200, 243600] over 3 runs: [243600, 239200, 239200]
+  provision.spinning_8_p99: 605400 ns [603900, 609300] over 3 runs: [605400, 609300, 603900]
+  provision.parked_1_p50: 141700 ns [141200, 142300] over 3 runs: [142300, 141700, 141200]
+  provision.parked_1_p99: 683700 ns [651800, 1356600] over 3 runs: [651800, 1356600, 683700]
+== quiet round 1: r1 exit 0
+== quiet round 2: main at 22:25:29 UTC; no load average
+provisioning histogram: 1 shards, spin window 196 ns, floor 50000 ns
+  provision.spinning_1_p50: 9700 ns [9200, 9700] over 3 runs: [9200, 9700, 9700]
+  provision.spinning_1_p99: 22300 ns [20800, 24400] over 3 runs: [20800, 24400, 22300]
+ac-2.1: 1 client spinning (4 cores, 1 shards), provisioning p99 22300 ns vs floor 50000 ns: ok
+  provision.spinning_8_p50: 241200 ns [225900, 245800] over 3 runs: [245800, 225900, 241200]
+  provision.spinning_8_p99: 612700 ns [586800, 614600] over 3 runs: [614600, 586800, 612700]
+  provision.parked_1_p50: 135300 ns [134800, 136600] over 3 runs: [134800, 135300, 136600]
+  provision.parked_1_p99: 632200 ns [531100, 1331800] over 3 runs: [632200, 531100, 1331800]
+== quiet round 2: main exit 0
+== quiet round 2: fix at 22:26:26 UTC; no load average
+provisioning histogram: 1 shards, spin window 160 ns, floor 50000 ns
+  provision.spinning_1_p50: 9200 ns [9200, 12600] over 3 runs: [12600, 9200, 9200]
+  provision.spinning_1_p99: 18700 ns [17200, 27500] over 3 runs: [27500, 18700, 17200]
+ac-2.1: 1 client spinning (4 cores, 1 shards), provisioning p99 18700 ns vs floor 50000 ns: ok
+  provision.spinning_8_p50: 230000 ns [229600, 242200] over 3 runs: [242200, 230000, 229600]
+  provision.spinning_8_p99: 580600 ns [576800, 606500] over 3 runs: [606500, 576800, 580600]
+  provision.parked_1_p50: 140400 ns [140400, 142500] over 3 runs: [142500, 140400, 140400]
+  provision.parked_1_p99: 687400 ns [658900, 708900] over 3 runs: [658900, 708900, 687400]
+== quiet round 2: fix exit 0
+== quiet round 2: r1 at 22:27:23 UTC; no load average
+provisioning histogram: 1 shards, spin window 191 ns, floor 50000 ns
+  provision.spinning_1_p50: 9700 ns [9200, 9800] over 3 runs: [9200, 9800, 9700]
+  provision.spinning_1_p99: 33100 ns [32200, 33500] over 3 runs: [33100, 33500, 32200]
+ac-2.1: 1 client spinning (4 cores, 1 shards), provisioning p99 33100 ns vs floor 50000 ns: ok
+  provision.spinning_8_p50: 236400 ns [231900, 245900] over 3 runs: [245900, 236400, 231900]
+  provision.spinning_8_p99: 594400 ns [593200, 610700] over 3 runs: [610700, 594400, 593200]
+  provision.parked_1_p50: 147700 ns [147200, 148500] over 3 runs: [148500, 147700, 147200]
+  provision.parked_1_p99: 695400 ns [270100, 1124400] over 3 runs: [1124400, 695400, 270100]
+== quiet round 2: r1 exit 0
+== quiet round 3: main at 22:28:20 UTC; no load average
+provisioning histogram: 1 shards, spin window 160 ns, floor 50000 ns
+  provision.spinning_1_p50: 9200 ns [9100, 9400] over 3 runs: [9400, 9100, 9200]
+  provision.spinning_1_p99: 20500 ns [18400, 25600] over 3 runs: [25600, 18400, 20500]
+ac-2.1: 1 client spinning (4 cores, 1 shards), provisioning p99 20500 ns vs floor 50000 ns: ok
+  provision.spinning_8_p50: 235800 ns [234300, 243100] over 3 runs: [243100, 235800, 234300]
+  provision.spinning_8_p99: 601700 ns [587700, 607800] over 3 runs: [607800, 587700, 601700]
+  provision.parked_1_p50: 145400 ns [144200, 147000] over 3 runs: [144200, 145400, 147000]
+  provision.parked_1_p99: 437900 ns [249400, 1318800] over 3 runs: [1318800, 437900, 249400]
+== quiet round 3: main exit 0
+== quiet round 3: fix at 22:29:18 UTC; no load average
+provisioning histogram: 1 shards, spin window 146 ns, floor 50000 ns
+  provision.spinning_1_p50: 9100 ns [9100, 9300] over 3 runs: [9300, 9100, 9100]
+  provision.spinning_1_p99: 25100 ns [16100, 25200] over 3 runs: [25100, 25200, 16100]
+ac-2.1: 1 client spinning (4 cores, 1 shards), provisioning p99 25100 ns vs floor 50000 ns: ok
+  provision.spinning_8_p50: 232400 ns [225700, 243500] over 3 runs: [243500, 232400, 225700]
+  provision.spinning_8_p99: 586200 ns [580600, 605500] over 3 runs: [605500, 586200, 580600]
+  provision.parked_1_p50: 139900 ns [138600, 140500] over 3 runs: [140500, 139900, 138600]
+  provision.parked_1_p99: 653400 ns [368100, 686300] over 3 runs: [686300, 368100, 653400]
+== quiet round 3: fix exit 0
+== quiet round 3: r1 at 22:30:15 UTC; no load average
+provisioning histogram: 1 shards, spin window 173 ns, floor 50000 ns
+  provision.spinning_1_p50: 9200 ns [9200, 9200] over 3 runs: [9200, 9200, 9200]
+  provision.spinning_1_p99: 31800 ns [31300, 33900] over 3 runs: [33900, 31800, 31300]
+ac-2.1: 1 client spinning (4 cores, 1 shards), provisioning p99 31800 ns vs floor 50000 ns: ok
+  provision.spinning_8_p50: 235800 ns [234700, 245600] over 3 runs: [245600, 235800, 234700]
+  provision.spinning_8_p99: 585900 ns [583500, 682400] over 3 runs: [682400, 583500, 585900]
+  provision.parked_1_p50: 142700 ns [141100, 144400] over 3 runs: [141100, 144400, 142700]
+  provision.parked_1_p99: 637700 ns [504600, 690300] over 3 runs: [690300, 504600, 637700]
+== quiet round 3: r1 exit 0
+== busy round 1: main at 22:31:13 UTC; no load average
+provisioning histogram: 1 shards, spin window 420 ns, floor 50000 ns
+  provision.spinning_1_p50: 15600 ns [15200, 15600] over 3 runs: [15200, 15600, 15600]
+  provision.spinning_1_p99: 33400 ns [31800, 35500] over 3 runs: [31800, 35500, 33400]
+ac-2.1: 1 client spinning (4 cores, 1 shards), provisioning p99 33400 ns vs floor 50000 ns: ok
+  provision.spinning_8_p50: 300400 ns [285900, 311500] over 3 runs: [311500, 300400, 285900]
+  provision.spinning_8_p99: 812400 ns [803300, 820000] over 3 runs: [820000, 803300, 812400]
+  provision.parked_1_p50: 24208700 ns [24113500, 26073600] over 3 runs: [24113500, 26073600, 24208700]
+  provision.parked_1_p99: 63558900 ns [61910400, 63844000] over 3 runs: [63844000, 61910400, 63558900]
+== busy round 1: main exit 0
+== busy round 1: fix at 22:33:05 UTC; no load average
+provisioning histogram: 1 shards, spin window 956 ns, floor 50000 ns
+  provision.spinning_1_p50: 15600 ns [15300, 15800] over 3 runs: [15300, 15600, 15800]
+  provision.spinning_1_p99: 32300 ns [32200, 33000] over 3 runs: [32300, 33000, 32200]
+ac-2.1: 1 client spinning (4 cores, 1 shards), provisioning p99 32300 ns vs floor 50000 ns: ok
+  provision.spinning_8_p50: 273700 ns [259300, 301300] over 3 runs: [273700, 259300, 301300]
+  provision.spinning_8_p99: 816400 ns [801000, 821800] over 3 runs: [801000, 821800, 816400]
+  provision.parked_1_p50: 24201600 ns [24180800, 24517600] over 3 runs: [24201600, 24180800, 24517600]
+  provision.parked_1_p99: 57934100 ns [53757400, 63759200] over 3 runs: [53757400, 63759200, 57934100]
+== busy round 1: fix exit 0
+== busy round 1: r1 at 22:34:59 UTC; no load average
+provisioning histogram: 1 shards, spin window 485 ns, floor 50000 ns
+  provision.spinning_1_p50: 15700 ns [15000, 15700] over 3 runs: [15000, 15700, 15700]
+  provision.spinning_1_p99: 48900 ns [39200, 68700] over 3 runs: [68700, 39200, 48900]
+ac-2.1: 1 client spinning (4 cores, 1 shards), provisioning p99 48900 ns vs floor 50000 ns: ok
+  provision.spinning_8_p50: 290500 ns [277600, 298300] over 3 runs: [298300, 277600, 290500]
+  provision.spinning_8_p99: 816300 ns [814600, 816500] over 3 runs: [814600, 816300, 816500]
+  provision.parked_1_p50: 24103100 ns [24054100, 24128800] over 3 runs: [24103100, 24054100, 24128800]
+  provision.parked_1_p99: 59945200 ns [53814500, 63569700] over 3 runs: [53814500, 63569700, 59945200]
+== busy round 1: r1 exit 0
+== busy round 2: main at 22:36:52 UTC; no load average
+provisioning histogram: 1 shards, spin window 496 ns, floor 50000 ns
+  provision.spinning_1_p50: 15400 ns [15200, 15800] over 3 runs: [15200, 15400, 15800]
+  provision.spinning_1_p99: 32500 ns [32500, 34300] over 3 runs: [34300, 32500, 32500]
+ac-2.1: 1 client spinning (4 cores, 1 shards), provisioning p99 32500 ns vs floor 50000 ns: ok
+  provision.spinning_8_p50: 290700 ns [83600, 297000] over 3 runs: [83600, 297000, 290700]
+  provision.spinning_8_p99: 825400 ns [776900, 830200] over 3 runs: [776900, 825400, 830200]
+  provision.parked_1_p50: 24414100 ns [24189000, 26183900] over 3 runs: [24414100, 26183900, 24189000]
+  provision.parked_1_p99: 63673400 ns [47813000, 72277900] over 3 runs: [72277900, 63673400, 47813000]
+== busy round 2: main exit 0
+== busy round 2: fix at 22:38:47 UTC; no load average
+provisioning histogram: 1 shards, spin window 846 ns, floor 50000 ns
+  provision.spinning_1_p50: 15600 ns [15200, 15700] over 3 runs: [15200, 15700, 15600]
+  provision.spinning_1_p99: 33300 ns [32600, 33700] over 3 runs: [33700, 33300, 32600]
+ac-2.1: 1 client spinning (4 cores, 1 shards), provisioning p99 33300 ns vs floor 50000 ns: ok
+  provision.spinning_8_p50: 197800 ns [189100, 239500] over 3 runs: [197800, 189100, 239500]
+  provision.spinning_8_p99: 791000 ns [770100, 805000] over 3 runs: [770100, 805000, 791000]
+  provision.parked_1_p50: 24727700 ns [24195800, 26102300] over 3 runs: [24195800, 24727700, 26102300]
+  provision.parked_1_p99: 60013900 ns [57782300, 71140000] over 3 runs: [71140000, 60013900, 57782300]
+== busy round 2: fix exit 0
+== busy round 2: r1 at 22:40:40 UTC; no load average
+provisioning histogram: 1 shards, spin window 417 ns, floor 50000 ns
+  provision.spinning_1_p50: 15700 ns [15400, 15700] over 3 runs: [15400, 15700, 15700]
+  provision.spinning_1_p99: 52800 ns [45500, 54200] over 3 runs: [52800, 54200, 45500]
+ac-2.1: 1 client spinning (4 cores, 1 shards), provisioning p99 52800 ns vs floor 50000 ns: FAIL
+  provision.spinning_8_p50: 306800 ns [231700, 313300] over 3 runs: [231700, 306800, 313300]
+  provision.spinning_8_p99: 823000 ns [793400, 823800] over 3 runs: [793400, 823000, 823800]
+  provision.parked_1_p50: 24145000 ns [24029800, 24202300] over 3 runs: [24029800, 24202300, 24145000]
+  provision.parked_1_p99: 57790900 ns [51882400, 59808400] over 3 runs: [57790900, 51882400, 59808400]
+== busy round 2: r1 exit 1
+== busy round 3: main at 22:42:37 UTC; no load average
+provisioning histogram: 1 shards, spin window 556 ns, floor 50000 ns
+  provision.spinning_1_p50: 15600 ns [14600, 15600] over 3 runs: [14600, 15600, 15600]
+  provision.spinning_1_p99: 32900 ns [32500, 33300] over 3 runs: [32500, 32900, 33300]
+ac-2.1: 1 client spinning (4 cores, 1 shards), provisioning p99 32900 ns vs floor 50000 ns: ok
+  provision.spinning_8_p50: 302300 ns [299800, 308300] over 3 runs: [308300, 302300, 299800]
+  provision.spinning_8_p99: 813700 ns [812200, 819200] over 3 runs: [819200, 813700, 812200]
+  provision.parked_1_p50: 26086700 ns [24498700, 26188200] over 3 runs: [24498700, 26188200, 26086700]
+  provision.parked_1_p99: 57932500 ns [47781600, 63524400] over 3 runs: [47781600, 63524400, 57932500]
+== busy round 3: main exit 0
+== busy round 3: fix at 22:44:34 UTC; no load average
+provisioning histogram: 1 shards, spin window 483 ns, floor 50000 ns
+  provision.spinning_1_p50: 15600 ns [15400, 15800] over 3 runs: [15400, 15600, 15800]
+  provision.spinning_1_p99: 33300 ns [33000, 33900] over 3 runs: [33900, 33000, 33300]
+ac-2.1: 1 client spinning (4 cores, 1 shards), provisioning p99 33300 ns vs floor 50000 ns: ok
+  provision.spinning_8_p50: 296000 ns [265700, 319200] over 3 runs: [265700, 296000, 319200]
+  provision.spinning_8_p99: 812700 ns [811600, 829700] over 3 runs: [811600, 812700, 829700]
+  provision.parked_1_p50: 26014000 ns [24211900, 26020500] over 3 runs: [26014000, 24211900, 26020500]
+  provision.parked_1_p99: 63599900 ns [57683000, 65663200] over 3 runs: [65663200, 57683000, 63599900]
+== busy round 3: fix exit 0
+== busy round 3: r1 at 22:46:28 UTC; no load average
+provisioning histogram: 1 shards, spin window 321 ns, floor 50000 ns
+  provision.spinning_1_p50: 15700 ns [15200, 15700] over 3 runs: [15200, 15700, 15700]
+  provision.spinning_1_p99: 45600 ns [43600, 47000] over 3 runs: [43600, 47000, 45600]
+ac-2.1: 1 client spinning (4 cores, 1 shards), provisioning p99 45600 ns vs floor 50000 ns: ok
+  provision.spinning_8_p50: 292000 ns [249700, 318100] over 3 runs: [249700, 292000, 318100]
+  provision.spinning_8_p99: 814500 ns [792300, 837700] over 3 runs: [792300, 814500, 837700]
+  provision.parked_1_p50: 24123400 ns [24077500, 24522500] over 3 runs: [24522500, 24077500, 24123400]
+  provision.parked_1_p99: 57896500 ns [51702000, 59973300] over 3 runs: [51702000, 59973300, 57896500]
+== busy round 3: r1 exit 0
