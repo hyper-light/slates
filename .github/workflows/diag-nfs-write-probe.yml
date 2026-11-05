@@ -1,0 +1,21 @@
+name: DIAG nfs-write, fresh content pages probed (not for main)
+
+# Diagnostics, never merged (VFS plan step 11): what a fresh page of a shared memfd (the content arena's shape) costs
+# written through the mapping, populated, populated by a second thread, and written by pwrite (the kernel's write
+# path, as nfsd fills tmpfs), against resident pages.
+
+on:
+  push:
+    branches: ['diag-nfs-write-*']
+
+jobs:
+  probe:
+    name: fresh shared-memfd pages (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: The machine
+        run: uname -a && nproc && lscpu | grep -E 'Model name' && cat /sys/kernel/mm/transparent_hugepage/shmem_enabled && cat /proc/loadavg
+      - name: Probe, three runs
+        run: for r in 1 2 3; do python3 -I diag/nfs-write/faults.py 512 5; done
