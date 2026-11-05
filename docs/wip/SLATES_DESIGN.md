@@ -8624,7 +8624,8 @@ Evidence: `research/survey-vorpal.md` §0–§9.
 > each built binary on its own runner (`cargo run -p xtask --bin release -- smoke`), and attaches the binaries, `SHA256SUMS`,
 > `slates-provenance.json` and a Sigstore attestation bundle to a **draft** release. Publishing the draft is the
 > maintainer's one approved step (`docs/publish.md`, "The binary release"). The proof by use on a test tag is recorded
-> in A-210. Reproducibility from the tag (AC-9.5's first clause) is not yet shown: no lane builds twice and compares.
+> in A-210: test tag `v0.1.0-test.1`, run 41983664060, a draft with all seven binaries whose checksums and attestation
+> verify. Reproducibility from the tag (AC-9.5's first clause) is not yet shown: no lane builds twice and compares.
 
 | target | runner | asset name |
 |---|---|---|
@@ -12841,6 +12842,44 @@ Applied in the same change to: Appendix B.2 (body and status), Phase 9 task 5's 
 - **A test of the lane.** A tag `v<version>-test.N` runs the whole lane on the real code and makes a draft
   pre-release titled as a test. The SDK publish lanes exclude such tags in their triggers, and their guard refuses
   them, so a test publishes nothing anywhere.
+- **Proof by use (2026-11-05).** Each binary's smoke steps on its own runner, in ms: version, start to serving,
+  steady answers, bootstrap, provision, the MCP attach–write–read, the second client's read, destroy, departure.
+  - Run 41982329895 (`diag-release-3`, the lane's build matrix without macOS):
+
+    | asset | steps (ms) |
+    |---|---|
+    | `slates-linux-x64` | 20, 326, 387, 20, 20, 24, 20, 20, 27 |
+    | `slates-linux-arm64` | 20, 275, 385, 20, 20, 22, 20, 20, 25 |
+    | `slates-linux-x64-musl` | 20, 340, 387, 20, 20, 22, 20, 20, 26 |
+    | `slates-linux-arm64-musl` | 20, 290, 385, 20, 20, 22, 20, 20, 25 |
+    | `slates-windows-x64.exe` | 25, 1064, 427, 42, 22, 61, 23, 22, 24 |
+    | `slates-windows-arm64.exe` | 35, 590, 414, 26, 25, 41, 26, 26, 27 |
+
+    The Linux rows are from run 41980547276, whose Linux jobs passed and whose Windows jobs failed; they passed again
+    in 41982329895. `ldd` answered "statically linked" (x86_64 musl) and "not a dynamic executable" (arm64 musl), and
+    `slates version` answered `slates 0.1.0` in a process-isolated `nanoserver:ltsc2025`.
+  - macOS arm64 ran on the supervisor's Mac (M5 Max, 2026-11-04, load 12–24): 10 of 10 smoke runs of the release
+    binary passed, start to serving 1.7–2.1 s, provision 184–192 ms, the MCP round trip 213–231 ms. The per-verb cost
+    there (about 200 ms against CI Linux's 20 ms) is the launch of each `slates` process on macOS; it is not measured
+    further here.
+  - **End to end on the test tag `v0.1.0-test.1`** (commit 50bf1a99, run 41983664060, 2026-11-05): guard, the seven
+    builds and the draft release job all passed, and macOS ran on CI too (`macos26` image 20261102.0473.1; steps 28,
+    830, 2030, 162, 81, 132, 98, 172, 87 ms). The draft "TEST v0.1.0-test.1 — test 1 of the release lane, not a
+    release" (draft, pre-release) carries the seven binaries (10,678,272–17,681,808 bytes), `SHA256SUMS`,
+    `slates-provenance.json` and `slates-attestation.sigstore.json`. Downloaded with `gh release download`:
+    - `shasum -a 256 -c SHA256SUMS` answered OK for all seven, and the macOS binary answered `slates 0.1.0`.
+    - `gh attestation verify <file> --repo hyper-light/slates` exited 0, online and with `--bundle`. It verified an
+      SLSA v1 provenance over seven subjects, signed by `release.yml@refs/tags/v0.1.0-test.1` at 50bf1a99.
+    - The same check of a copy with one byte appended exited 1.
+    - The SDK publish lanes did not start on the tag.
+  - This is the first run of the CLI's anchor, volume and MCP path on Windows: `crates/cli/tests/cli.rs` is
+    `cfg(unix)`.
+  - The first Windows run (41980547276) failed in the lane's own tooling. The `xtask` binary does not build on
+    Windows (12 errors: its conformance and KIND tasks use `rustix` and `std::os::unix`), so the release tasks became
+    their own binary, `cargo run -p xtask --bin release`.
+  - The smoke test's own first version stopped reading the anchor's stderr after the serving line, and 8 of 10 runs
+    on this Mac aborted the anchor (the GAPS entry: an anchor whose stderr closes aborts). Fixed in the harness: 10 of
+    10 after.
 - **Not yet.** Reproducibility from the tag (AC-9.5): no lane builds twice and compares. The macOS `Slates.app` bundle
   (B.7), code signing and notarization (they need Ada's Apple Developer identity). `cargo-binstall` metadata.
 

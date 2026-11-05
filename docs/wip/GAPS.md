@@ -7,9 +7,17 @@
 > client, the volume destroyed, the daemon gone with its anchor). It then attaches the seven binaries, `SHA256SUMS`,
 > `slates-provenance.json` and a Sigstore attestation bundle to a **draft** release. Publishing the draft is the
 > maintainer's step (`docs/publish.md`, "The binary release").
-> - Proven on this Mac (M5 Max, 18 cores, 2026-11-04, load 12–24): the release binary passed 10 of 10 smoke runs.
->   Start to serving took 1.8 s, a provision 184 ms and the MCP round trip 231 ms (`cargo run -p xtask --bin release -- smoke --binary
->   <release build> --target aarch64-apple-darwin --record <file>`). The proof on a test tag is recorded in A-210.
+> - Proven by use (2026-11-05). Every Linux and Windows binary passed every smoke step on its own CI runner (run
+>   41982329895): provision 20–25 ms, the MCP round trip 22–61 ms, start to serving 275–1064 ms. Both musl binaries
+>   are static, and the Windows x86_64 binary answered in Nano Server. The macOS binary passed 10 of 10 runs on this
+>   Mac (M5 Max, 18 cores, 2026-11-04, load 12–24; `cargo run -p xtask --bin release -- smoke --binary <release build>
+>   --target aarch64-apple-darwin --record <file>`).
+> - End to end on the test tag `v0.1.0-test.1` (run 41983664060; macOS on CI too). It made a draft pre-release with all
+>   seven binaries, `SHA256SUMS`, the provenance and the attestation bundle. After download, all seven checksums
+>   verified, `gh attestation verify` passed (SLSA v1, seven subjects, `release.yml` at the tag) and refused a
+>   tampered copy, and no SDK lane started. Every number is in A-210.
+> - **Owed to Ada:** a release is published only when a maintainer pushes a real tag `v<version>` and publishes its
+>   draft (`docs/publish.md`). The test draft is never to be published.
 > - **Open, found by the smoke test: the anchor aborts when its stderr closes.** `slates anchor 2>&1 >/dev/null | head
 >   -n 1` exits 134 (SIGABRT) once `head` has exited (2026-11-04, this Mac). The next diagnostic line meets EPIPE,
 >   which `eprintln!` turns into a panic, and `panic = "abort"` makes that an abort. The smoke test's own first

@@ -87,6 +87,11 @@ job's OIDC identity, so no key or secret exists. Everything is attached to a **d
 Verify a download with `sha256sum -c SHA256SUMS --ignore-missing` (on macOS
 `shasum -a 256 -c`) and `gh attestation verify <file> --repo hyper-light/slates`.
 
+**Proven 2026-11-05 on the test tag `v0.1.0-test.1`** (run 41983664060): all seven binaries built and passed their
+smoke test, and the draft carried them with `SHA256SUMS` (all seven `OK` after download), the provenance and the
+attestation bundle (`gh attestation verify` exits 0, and 1 for a tampered copy). Details: A-210 in
+[the design](wip/SLATES_DESIGN.md).
+
 **A test of the lane** is a tag `v<version>-test.<N>` (e.g. `v0.1.0-test.1`). The release lane's
 guard accepts it (`cargo xtask version --expect-tag TAG --allow-test-tag`) and makes a draft
 pre-release titled `TEST … not a release`. Two things keep the SDK publish lanes from publishing
