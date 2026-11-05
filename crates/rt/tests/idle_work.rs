@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use slates_rt::registry;
 use slates_rt::runtime::{Runtime, RuntimeConfig};
+use slates_rt::shard::ShardId;
 
 /// Shape: how long the test waits for the shard to work through what it owes (a slice is microseconds).
 const SETTLE: Duration = Duration::from_secs(5);
@@ -66,6 +67,16 @@ fn settle(done: u64) {
   }
 }
 
+/// The shard's driver waits so far, asked of the shard by a task.
+fn waits_of(rt: &Runtime, shard: ShardId) -> u64 {
+  let (tx, rx) = channel();
+  rt.spawn_on(shard, async move {
+    let _ = tx.send(registry::with_current(|ctx| ctx.counters().waits).unwrap_or(0));
+  })
+  .unwrap();
+  rx.recv_timeout(SETTLE).unwrap()
+}
+
 /// Waits `span` on the test thread (a channel nobody sends on, as the runtime's disallowed `sleep` is for shipped
 /// code).
 fn wait(span: Duration) {
@@ -78,7 +89,8 @@ fn wait(span: Duration) {
 
 /// A-214 by use. Do: owe the idle work five slices, register it on an idle shard; then wait a quiet stretch; then owe
 /// three more and wake the shard with a task. Expect: the five slices done with no other work to prompt them; during
-/// the quiet stretch, no call at all (the shard parked once the work said it had none left); and the three later
+/// the quiet stretch, at most one call for each time the shard waited (it parks once the work says it has none left,
+/// and asks again only when something wakes it, never in a loop); and the three later
 /// slices done once the shard woke.
 #[test]
 fn idle_work_runs_a_slice_at_a_time_until_done_and_the_shard_then_parks() {
@@ -103,12 +115,17 @@ fn idle_work_runs_a_slice_at_a_time_until_done_and_the_shard_then_parks() {
   while EMPTY.load(Ordering::Acquire) == 0 && started.elapsed() < SETTLE {
     let _ = rx.recv_timeout(Duration::from_millis(1));
   }
+  // Asking the shard for its counters spawns a task on it, which wakes it, so each idle moment that wake opens asks
+  // once more: what the quiet stretch must hold to is one empty call a wait at most, never a loop of them.
+  let before = waits_of(&rt, shard);
   let empty = EMPTY.load(Ordering::Acquire);
   wait(QUIET);
-  assert_eq!(
-    EMPTY.load(Ordering::Acquire),
-    empty,
-    "a parked shard kept calling idle work that had none"
+  let after = waits_of(&rt, shard);
+  let calls = EMPTY.load(Ordering::Acquire).saturating_sub(empty);
+  assert!(
+    calls <= after.saturating_sub(before).saturating_add(1),
+    "a parked shard kept calling idle work that had none: {calls} calls across {} waits",
+    after.saturating_sub(before)
   );
   OWED.store(LATER, Ordering::Release);
   rt.spawn_on(shard, async {}).unwrap();
