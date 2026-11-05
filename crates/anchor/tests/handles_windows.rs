@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use slates_anchor::{AnchorSegment, Geometry, RegionKind, RestartPolicy, Step, Supervisor};
 use slates_machine::facts::Identity;
 
-use slates_anchor::handles::{HandleMessage, WHAT_WINFSP_MOUNT, parse_env};
+use slates_anchor::handles::{HandleMessage, WHAT_WINFSP_MOUNT, encode, parse_env};
 use slates_anchor::held_windows::{Channel, Held, channel, handle_from_value, handle_value};
 use slates_ipc::win_spawn::{
   Process, Spawn, StandardOutput, duplicate_inheritable, environment_block,
@@ -45,6 +45,10 @@ const ROLE_CHECKER: &str = "checker_role";
 const ROLE_GONE: &str = "gone_role";
 /// Format: a child supervised by the real anchor state machine across a restart.
 const ROLE_SUPERVISED: &str = "supervised_role";
+/// Format: the supervised child whose first process writes short and corrupted hold messages before its real hold.
+const ROLE_GARBLING: &str = "garbling_role";
+/// Shape: how many short and how many corrupted hold messages the garbling child writes (each kind this many).
+const GARBLED_EACH: usize = 10;
 /// Format: the variable naming the hold channel's daemon end the sender inherited (its handle value, hex).
 const CHANNEL_VALUE: &str = "SLATES_HANDLE_TEST_CHANNEL";
 /// Format: the variable naming the event the sender creates and the checkers open, a `Local\` name.
@@ -377,6 +381,108 @@ fn the_supervisor_acknowledges_the_hold_before_commit_and_hands_it_to_its_succes
   );
 }
 
+/// Audit plan 01a1a34bf7e973069e94f773afdea44a, step 3 (A-198). Do: let a real supervised child write a short hold
+/// message and one whose checksum is corrupted, then its real hold; it commits after Held, exits and is restarted.
+/// Expect: every step of the real supervisor succeeds (what a daemon sends never ends supervision), both messages are
+/// counted as refusals, the real hold is acknowledged, and the successor inherits the same live object. Before the fix
+/// the first malformed message made `Supervisor::step` fail, which ends the anchor and, through its kill-on-close job,
+/// the daemon and every held drive.
+#[test]
+fn a_malformed_hold_message_is_refused_and_counted_and_supervision_goes_on() {
+  let args: Vec<String> = role_args(ROLE_GARBLING)
+    .iter()
+    .map(|argument| argument.to_string_lossy().into_owned())
+    .collect();
+  // Shape: one restart is required; a second departure ends the fixture's observation with CrashLoop.
+  let policy = RestartPolicy {
+    window_ns: u64::from(WAIT_MS) * 1_000_000,
+    max_restarts: 1,
+  };
+  let mut anchor = Supervised(Supervisor::new(fixture_segment(), &args, policy).unwrap());
+  anchor.0.hold_handles(1).unwrap();
+  anchor.0.hold_environment(ROLE, ROLE_GARBLING.to_owned());
+  anchor
+    .0
+    .hold_environment(EVENT_NAME, format!("{}-garbling", unique_event_name()));
+  anchor.0.start(0).unwrap();
+  let clock = Instant::now();
+  let mut completed = false;
+  while clock.elapsed() < Duration::from_millis(u64::from(WAIT_MS)) {
+    let now = u64::try_from(clock.elapsed().as_nanos()).unwrap();
+    match anchor.0.step(now) {
+      Ok(Step::CrashLoop { exit_code, .. }) => {
+        assert_eq!(
+          exit_code,
+          Some(ROLE_EXIT),
+          "the successor body must execute"
+        );
+        completed = true;
+        break;
+      }
+      Ok(_) => {}
+      Err(error) => panic!("a malformed hold message ended supervision: {error}"),
+    }
+    // Shape: a short harness poll; the production observation loop chooses its wait from liveness.
+    std::thread::park_timeout(Duration::from_millis(1));
+  }
+  assert!(
+    completed,
+    "the two supervised processes did not finish inside the fixture budget"
+  );
+  assert_eq!(anchor.0.held_handles(), 1, "the real hold is kept");
+  assert_eq!(
+    anchor.0.handle_refusals(),
+    2,
+    "the short and the corrupted message are each refused"
+  );
+  assert_eq!(
+    anchor
+      .0
+      .segment()
+      .read_published(RegionKind::Profile)
+      .unwrap()
+      .as_deref(),
+    Some(b"checked".as_slice())
+  );
+}
+
+/// Writes `bytes` as one message on the daemon's end of the hold channel, overlapped as the channel's own writes are,
+/// so the anchor reads it as whatever it is: short, or with a checksum that does not match.
+fn write_raw(channel: &Channel, bytes: &[u8]) {
+  use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, GetLastError};
+  use windows_sys::Win32::Storage::FileSystem::WriteFile;
+  use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+  let completion = event(None);
+  let mut overlapped = OVERLAPPED {
+    hEvent: completion.as_raw_handle(),
+    ..OVERLAPPED::default()
+  };
+  let length = u32::try_from(bytes.len()).unwrap();
+  // SAFETY: `bytes` and the OVERLAPPED live on this frame until GetOverlappedResult settles the write below.
+  let started = unsafe {
+    WriteFile(
+      channel.raw(),
+      bytes.as_ptr(),
+      length,
+      std::ptr::null_mut(),
+      &mut overlapped,
+    )
+  };
+  if started == 0 {
+    // SAFETY: reads this thread's last error, set by the WriteFile just above.
+    assert_eq!(
+      unsafe { GetLastError() },
+      ERROR_IO_PENDING,
+      "the raw write started"
+    );
+  }
+  let mut written = 0;
+  // SAFETY: the same live handle and OVERLAPPED; waiting settles the write before its buffer leaves this frame.
+  let finished = unsafe { GetOverlappedResult(channel.raw(), &overlapped, &mut written, 1) };
+  assert_ne!(finished, 0, "the raw write finished");
+  assert_eq!(written, length);
+}
+
 /// A-198, Step 9.4: opening new duplication authority must fail even for another process of the same user.
 fn refuse_new_duplicate_access(pid: u32) {
   use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_DUP_HANDLE};
@@ -410,6 +516,21 @@ fn refuse_new_duplicate_access(pid: u32) {
 #[ignore = "the supervised hold fixture; run by its parent"]
 fn supervised_role() {
   assert_eq!(std::env::var(ROLE).as_deref(), Ok(ROLE_SUPERVISED));
+  supervised_body(false);
+}
+
+/// The garbling supervised child: as `supervised_role`, but its first process writes a short hold message and one with
+/// a corrupted checksum before its real hold.
+#[test]
+#[ignore = "the garbling hold fixture; run by its parent"]
+fn garbling_role() {
+  assert_eq!(std::env::var(ROLE).as_deref(), Ok(ROLE_GARBLING));
+  supervised_body(true);
+}
+
+/// The supervised child's body: the first process commits only after acknowledgement (garbling first when `garble`),
+/// the second checks the inherited object; both exit with ROLE_EXIT.
+fn supervised_body(garble: bool) {
   let mut segment = AnchorSegment::attach_from_env(&fixture_identity()).unwrap();
   let env = std::env::var(slates_anchor::handles::ENV_HANDLES).unwrap();
   let (channel_value, entries) = parse_env(&env, 1).unwrap();
@@ -436,17 +557,21 @@ fn supervised_role() {
     let event = event(Some(&name));
     // SAFETY: a live event owned in this process until the hold is acknowledged.
     assert_ne!(unsafe { SetEvent(event.as_raw_handle()) }, 0);
-    channel
-      .send(
-        &HandleMessage::Hold {
-          id: ENTRY_ID,
-          what: WHAT_WINFSP_MOUNT,
-          values: vec![handle_value(event.as_raw_handle())],
-          record: name.into_bytes(),
-        },
-        WAIT_MS,
-      )
-      .unwrap();
+    let hold = HandleMessage::Hold {
+      id: ENTRY_ID,
+      what: WHAT_WINFSP_MOUNT,
+      values: vec![handle_value(event.as_raw_handle())],
+      record: name.into_bytes(),
+    };
+    if garble {
+      let bytes = encode(&hold).unwrap();
+      write_raw(&channel, &bytes[..bytes.len() / 2]);
+      let mut corrupted = bytes;
+      let last = corrupted.len() - 1;
+      corrupted[last] ^= 0xff;
+      write_raw(&channel, &corrupted);
+    }
+    channel.send(&hold, WAIT_MS).unwrap();
     assert_eq!(
       channel.recv(WAIT_MS).unwrap(),
       Some(HandleMessage::Held { id: ENTRY_ID })
