@@ -22,11 +22,13 @@ use slates_machine::{Derived, derived};
 use slates_mem::Handle;
 use slates_mem::arena::ChunkArena;
 use slates_mem::region::Region;
-use slates_mem::slab::Slab;
 use slates_vfs::VfsError;
 use slates_vfs::clock::HostClock;
 use slates_vfs::dir::{Child, DirNode, MEASURED_CUTOVER};
-use slates_vfs::dirtree::{BLOCK_BYTES, DirBlock, ENTRY_BYTES, Retired};
+use slates_vfs::dirblocks::{
+  BlockStore, CLASSES, ENTRY_BYTES, HEADER_BYTES, PAGE_BYTES, SMALLEST_CLASS, fitted_size,
+};
+use slates_vfs::dirtree::Retired;
 use slates_vfs::ids::{Epoch, InodeNo};
 use slates_vfs::inode::Inode;
 use slates_vfs::journal::OpRecord;
@@ -174,7 +176,7 @@ fn store_for(objects: usize, cutover: usize) -> Result<Store, Box<dyn Error>> {
       // Every mutation after a snapshot copies a record; four generations is ample here.
       max_inodes: (objects + GROUPS + 1) * 4,
       max_chunks: REGION_PAGES,
-      max_dir_blocks: objects / BLOCK_ENTRIES_LOW + GROUPS + 1,
+      max_dir_blocks: (objects.div_ceil(FILES_PER_DIR) + GROUPS + 1) * leaf_block_units(),
       dir_cutover: cutover,
     },
     arena,
@@ -263,10 +265,18 @@ fn build(files: usize, cutover: usize) -> Result<Tree, Box<dyn Error>> {
   })
 }
 
-/// Derived: the fewest entries a directory block holds after a split at the measured name
-/// length, half a block (`BLOCK_BYTES / 2 / (ENTRY_BYTES + NAME_BYTES)`); the block cap and the
-/// memory budget count blocks at this occupancy.
-const BLOCK_ENTRIES_LOW: usize = BLOCK_BYTES / 2 / (ENTRY_BYTES + NAME_BYTES);
+/// Derived: the bytes of the block a leaf directory of the measured shape holds: the class that fits its header and
+/// its [`FILES_PER_DIR`] entries of [`NAME_BYTES`] (`16 + 36 × (24 + 49)` = 2,644 → 3,072, A-203).
+fn leaf_block_bytes() -> usize {
+  fitted_size(HEADER_BYTES + FILES_PER_DIR * (ENTRY_BYTES + NAME_BYTES))
+}
+
+/// Derived: the store's block cap counts smallest-class blocks' bytes (A-203), so a leaf directory's block is this many
+/// of them (`3,072 / 256` = 12).
+fn leaf_block_units() -> usize {
+  leaf_block_bytes().div_ceil(SMALLEST_CLASS)
+}
+
 /// Format: the bytes of a journal path before the file name in these trees (`/gNN/dNNNNN/`).
 const PATH_PREFIX_BYTES: usize = 12;
 /// Shape: the op log budget the bench volumes carry, small enough to be full at the smallest
@@ -275,8 +285,8 @@ const JOURNAL_BYTES: usize = 1 << 16;
 
 /// Derived: the heap budget of a tree (AC-1.5), counted object by object: an inode record per
 /// file and per directory; a directory node per directory (its two inline entries and their
-/// names included); for every directory past the inline form, its blocks at the lowest
-/// occupancy a split leaves (half a block), each a full slab slot; the trie's nodes (one per
+/// names included); for every leaf directory its one block, of the class that fits it, at its share of a page's slab
+/// slot, and a page of slack for every class (A-203); the trie's nodes (one per
 /// `FANOUT` inodes at the leaf level and the levels above, `FANOUT / (FANOUT − 1)` per `FANOUT`
 /// inodes, plus the spine); one slab segment of slack per slab (blocks: sixty-four pages); and
 /// the op log's records, one per create and mkdir with its path and up to twice for the
@@ -286,8 +296,9 @@ fn heap_budget(files: usize, dirs: usize, page: usize, journal_bytes: usize) -> 
   let records = files + dirs;
   let inodes = records * size_of::<Inode>();
   let nodes = dirs * size_of::<DirNode>();
-  let blocks_per_dir = FILES_PER_DIR.div_ceil(BLOCK_ENTRIES_LOW);
-  let blocks = files.div_ceil(FILES_PER_DIR) * blocks_per_dir * size_of::<DirBlock>();
+  let per_page = PAGE_BYTES / leaf_block_bytes();
+  let pages = files.div_ceil(FILES_PER_DIR).div_ceil(per_page) + CLASSES;
+  let blocks = pages * BlockStore::page_slot_bytes();
   let levels = usize::try_from(LEVELS).unwrap_or(0);
   let trie = (records.div_ceil(fanout) * fanout / (fanout - 1) + levels) * size_of::<TrieNode>();
   let slack = 3 * page + 64 * page;
@@ -295,10 +306,10 @@ fn heap_budget(files: usize, dirs: usize, page: usize, journal_bytes: usize) -> 
   let journal = journal_bytes.min(records * record);
   derived!(
     inodes + nodes + blocks + trie + slack + journal,
-    "(files + dirs) × size_of::<Inode>() + dirs × size_of::<DirNode>() + leaf dirs × ceil(FILES_PER_DIR / BLOCK_ENTRIES_LOW) × size_of::<DirBlock>() + ((files + dirs) / FANOUT × FANOUT / (FANOUT − 1) + LEVELS) × size_of::<TrieNode>() + 67 × page + min(journal_bytes, (files + dirs) × (2 × size_of::<OpRecord>() + path))",
+    "(files + dirs) × size_of::<Inode>() + dirs × size_of::<DirNode>() + (ceil(leaf dirs / (PAGE_BYTES / fitted class of FILES_PER_DIR entries)) + CLASSES) × page slot + ((files + dirs) / FANOUT × FANOUT / (FANOUT − 1) + LEVELS) × size_of::<TrieNode>() + 67 × page + min(journal_bytes, (files + dirs) × (2 × size_of::<OpRecord>() + path))",
     [
       "struct sizes",
-      "BLOCK_ENTRIES_LOW",
+      "the block classes",
       "FILES_PER_DIR",
       "NAME_BYTES",
       "page",
@@ -313,7 +324,7 @@ fn heap_budget(files: usize, dirs: usize, page: usize, journal_bytes: usize) -> 
 /// at its capacity and in the tree at the probe sizes.
 fn cutover_probe() -> usize {
   let policy = NameEquivalence::Fold;
-  let mut blocks: Slab<DirBlock> = Slab::new(64, 1 << 16);
+  let mut blocks = BlockStore::new(4, 1 << 16);
   let mut retired = Retired::new();
   for &n in &CUTOVER_SIZES {
     let names: Vec<String> = (0..n).map(file_name).collect();
@@ -743,10 +754,10 @@ fn main() -> Result<(), Box<dyn Error>> {
   let step_budget_ns = profile.derived().task_step_budget_ns.get();
   println!("task step budget: {step_budget_ns} ns (from the machine profile)");
   println!(
-    "sizes: Inode {} B, DirNode {} B, DirBlock {} B, TrieNode {} B",
+    "sizes: Inode {} B, DirNode {} B, block page {} B, TrieNode {} B",
     size_of::<Inode>(),
     size_of::<DirNode>(),
-    size_of::<DirBlock>(),
+    BlockStore::page_slot_bytes(),
     size_of::<TrieNode>()
   );
 

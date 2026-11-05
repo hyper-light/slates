@@ -20,7 +20,8 @@ use slates_mem::{Handle, Slab};
 use crate::clock::Clock;
 use crate::content::{ChunkStore, Extent, ExtentSrc, OpenExtent, inline_bytes};
 use crate::dir::{BaseDirState, Child, DirNode};
-use crate::dirtree::{DirBlock, Retired};
+use crate::dirblocks::{BlockRef, BlockStore};
+use crate::dirtree::Retired;
 use crate::error::VfsError;
 use crate::ids::{Epoch, InodeNo, RefOwner, SnapshotId};
 use crate::inode::{Attrs, BaseBody, Body, Home, Inode, Kind};
@@ -81,11 +82,11 @@ pub fn inode_unit_bytes() -> usize {
 }
 
 /// The metadata bytes one directory costs at its bound (§4.2 metadata dimension): a directory
-/// node and one block of entries (every directory past the cut-over holds at least one), each at
-/// its slab's true slot cost. The admitting owner derives the shard's directory and block caps from
+/// node and one block of entries at the smallest class (every directory past the cut-over holds at
+/// least one, and the median real directory's is that class, A-203), each at its slab's true slot cost. The admitting owner derives the shard's directory and block caps from
 /// its metadata class over this unit.
 pub fn directory_unit_bytes() -> usize {
-  Slab::<DirNode>::slot_bytes().saturating_add(Slab::<DirBlock>::slot_bytes())
+  Slab::<DirNode>::slot_bytes().saturating_add(BlockStore::unit_bytes())
 }
 
 /// The metadata bytes one chunk record costs (§4.2 metadata dimension): a chunk slab slot.
@@ -98,7 +99,7 @@ pub struct Store {
   /// Directory nodes.
   pub dirs: Slab<DirNode>,
   /// The blocks of the indexed directories (§4.5, `dirtree`).
-  pub blocks: Slab<DirBlock>,
+  pub blocks: BlockStore,
   /// Inode versions.
   pub inodes: Slab<Inode>,
   /// Inode-table nodes.
@@ -178,7 +179,8 @@ pub struct StoreConfig {
   pub max_inodes: usize,
   /// Chunks the shard may hold.
   pub max_chunks: usize,
-  /// Directory blocks the shard may hold.
+  /// Directory blocks the shard may hold. The block store's pages are bounded at this many blocks of the smallest
+  /// class, and a page for every class beside them (A-203, [`BlockStore::max_pages`]).
   pub max_dir_blocks: usize,
   /// The small-directory cut-over (entries).
   pub dir_cutover: usize,
@@ -197,7 +199,7 @@ impl Store {
     let capacity = u64::try_from(arena.capacity()).unwrap_or(u64::MAX);
     Self {
       dirs: Slab::new(segment, config.max_dirs),
-      blocks: Slab::new(
+      blocks: BlockStore::new(
         block_segment_slots(config.page).get(),
         config.max_dir_blocks,
       ),
@@ -1020,6 +1022,34 @@ impl Volume {
       index: h.index(),
       generation: h.generation(),
     })
+  }
+
+  /// Every directory block the volume holds, once each, with its size and the size of the class that fits its live
+  /// bytes (A-203): the blocks its head and its snapshots reach and those its snapshots' deadlists keep. For a store
+  /// that serves this volume alone it is everything the block store must hold, which the volume oracle compares.
+  pub fn directory_blocks(&self, store: &Store) -> Vec<(BlockRef, usize, usize)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut held = Vec::new();
+    let roots = std::iter::once(self.root).chain(self.snapshots.iter().map(|(_, snap)| snap.root));
+    for root in roots {
+      let mut dirs = Vec::new();
+      let mut blocks = Vec::new();
+      collect_dirs(store, root, None, &mut dirs, &mut blocks);
+      held.extend(blocks.into_iter().map(|(block, _)| block));
+    }
+    for (_, snap) in self.snapshots.iter() {
+      held.extend(snap.deadlist.items().iter().filter_map(|dead| match dead {
+        Dead::DirBlock(block, _) => Some(*block),
+        _ => None,
+      }));
+    }
+    held
+      .into_iter()
+      .filter(|block| seen.insert(block.words()))
+      .filter_map(|block| {
+        crate::dirtree::block_size(&store.blocks, block).map(|(size, fitted)| (block, size, fitted))
+      })
+      .collect()
   }
 
   /// Looks a name up in a directory.
@@ -3901,7 +3931,7 @@ impl Volume {
       return full(store.tries.max_slots());
     }
     if store.blocks.room() < needs.blocks {
-      return full(store.blocks.max_slots());
+      return Err(VfsError::Memory(store.blocks.refusal()));
     }
     if needs.retained > 0 {
       let over_allowance = self.retention_allowance != u64::MAX
@@ -6910,7 +6940,7 @@ fn collect_dirs(
   root: Handle<DirNode>,
   since: Option<Epoch>,
   out: &mut Vec<Handle<DirNode>>,
-  blocks: &mut Vec<(Handle<DirBlock>, Epoch)>,
+  blocks: &mut Vec<(BlockRef, Epoch)>,
 ) {
   let mut stack = vec![root];
   while let Some(d) = stack.pop() {
@@ -6947,11 +6977,11 @@ fn block_segment_slots(page: usize) -> Derived<usize> {
   derived!(
     page
       .saturating_mul(BLOCK_SEGMENT_PAGES)
-      .checked_div(size_of::<DirBlock>())
+      .checked_div(BlockStore::page_slot_bytes())
       .unwrap_or(0)
       .max(1),
-    "page × 64 / size_of::<DirBlock>()",
-    ["machine page", "size_of::<DirBlock>()"]
+    "page × 64 / size_of::<Slot<dirblocks::Page>>()",
+    ["machine page", "BlockStore::page_slot_bytes()"]
   )
 }
 

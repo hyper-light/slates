@@ -18,7 +18,7 @@ use slates_mem::arena::ChunkArena;
 use slates_mem::region::Region;
 use slates_vfs::clock::HostClock;
 use slates_vfs::dir::{DirNode, MEASURED_CUTOVER};
-use slates_vfs::dirtree::DirBlock;
+use slates_vfs::dirblocks::BlockStore;
 use slates_vfs::ids::InodeNo;
 use slates_vfs::inode::Inode;
 use slates_vfs::names::NameEquivalence;
@@ -160,12 +160,12 @@ fn report(
   let heap = LIVE_HEAP.load(Ordering::Relaxed).saturating_sub(before);
   println!(
     "{label} ×{COPIES}: {entries} entries ({dir_count} dirs, {file_count} files, mean name {} B): {heap} heap bytes, {} per entry \
-     (sizes: Inode {} B, DirNode {} B, DirBlock {} B, TrieNode {} B)",
+     (sizes: Inode {} B, DirNode {} B, block page {} B, TrieNode {} B)",
     name_bytes / entries.max(1),
     heap / entries.max(1),
     size_of::<Inode>(),
     size_of::<DirNode>(),
-    size_of::<DirBlock>(),
+    BlockStore::page_slot_bytes(),
     size_of::<TrieNode>()
   );
   Ok(())

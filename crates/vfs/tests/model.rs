@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 
 use proptest::prelude::*;
 use slates_vfs::dir::Child;
+use slates_vfs::dirblocks::class_for;
 use slates_vfs::error::VfsError;
 use slates_vfs::ids::{InodeNo, SnapshotId};
 use slates_vfs::inode::Kind;
@@ -1064,10 +1065,62 @@ fn run_on(mut store: Store, steps: Vec<Step>, quota: u64) {
       model.unique(),
       "unique after {step:?}"
     );
+    check_blocks(&vol, &store, &step);
     if check_publication(&mut vol, &store, &mut published, &step) {
       DELTAS_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
   }
+}
+
+thread_local! {
+  /// The block classes this thread's model runs' directories were seen in, one bit a class (A-203's non-vacuity
+  /// record; per thread, so a test reads only its own runs).
+  static CLASSES_SEEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A-203: the block store holds exactly the directory blocks the volume holds (its head's and snapshots' and their
+/// deadlists'): none leaked, none freed while reached. Each class's census counts them, every class's list of pages
+/// with room is sound, and every block is at most twice the class that fits its live bytes (the fixtures have room,
+/// so no shrink was passed over).
+fn check_blocks(vol: &Volume, store: &Store, step: &Step) {
+  let held = vol.directory_blocks(store);
+  assert_eq!(store.blocks.len(), held.len(), "blocks the store holds after {step:?}");
+  let census = store.blocks.census();
+  for (class, counted) in census.iter().enumerate() {
+    let expected = held
+      .iter()
+      .filter(|(_, size, _)| class_for(*size) == Some(class))
+      .count();
+    assert_eq!(counted.blocks, expected, "class {class}'s blocks after {step:?}");
+    if expected > 0 {
+      CLASSES_SEEN.with(|seen| seen.set(seen.get() | 1 << class));
+    }
+  }
+  assert!(store.blocks.lists_are_sound(), "the class lists after {step:?}");
+  for (block, size, fitted) in &held {
+    assert!(*size <= 2 * fitted, "{block:?}: {size} bytes for entries that fit {fitted}, after {step:?}");
+  }
+}
+
+/// A-203. Do: on a folding volume, fill one directory with 200 files of 13- to 40-byte names (the blocks grow through
+/// the classes and split), snapshot, remove 190 of them (copies of the shared path, merges and shrinks) and fill
+/// again, checking the store's blocks against what the volume holds after every step. Expect: every step passes the
+/// model and [`check_blocks`], and the blocks were seen in at least eight classes, the largest among them.
+#[test]
+fn directory_blocks_grow_split_and_shrink_as_the_volume_holds_them() {
+  let name = |n: usize| format!("entry-{n:06}{}", "q".repeat(n % 28));
+  let wide = || vec!["wide".to_owned()];
+  let mut steps = vec![Step::Mkdir(vec![], "wide".to_owned())];
+  steps.extend((0..200).map(|n| Step::Create(wide(), name(n))));
+  steps.push(Step::Snapshot);
+  steps.extend((10..200).map(|n| Step::Unlink(wide(), name(n))));
+  steps.extend((200..260).map(|n| Step::Create(wide(), name(n))));
+  CLASSES_SEEN.with(|seen| seen.set(0));
+  run_on(store(), steps, 1 << 20);
+  let seen = CLASSES_SEEN.with(std::cell::Cell::get);
+  assert!(seen.count_ones() >= 8, "classes seen: {seen:#b}");
+  let largest = u32::try_from(slates_vfs::dirblocks::CLASSES - 1).unwrap();
+  assert!(seen & (1 << largest) != 0, "a block reached the largest class: {seen:#b}");
 }
 
 /// A-126 (a written file's delta is its written windows): do write a file across several windows, publish, then
