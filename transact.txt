@@ -1,0 +1,55 @@
+# 7c3185ab1c0e0130c5ebb3a9314cc03097e45307, 2026-11-05T21:38:13Z
+image win11-vs2026-arm64 20261101.203.1; 4 CPUs; ARM64 ARMv8 (64-bit) Family 8 Model D49 Revision   0, MICROSOFT CORPORATION; WinFsp 2.1.25156
+Microsoft Windows [Version 10.0.26200.9725]
+    Finished `release` profile [optimized] target(s) in 1m 07s
+  Executable unittests src\lib.rs (target\release\deps\slates_bridge_winfsp-16999a794a6af591.exe)
+## run 1 of 5, 2026-11-05T21:39:21Z
+WINFSP TRANSACT batch output 16384 bytes: Err(122) (Win32 122 is the driver's STATUS_BUFFER_TOO_SMALL)
+WINFSP TRANSACT batch output 4096 bytes: Err(122) (Win32 122 is the driver's STATUS_BUFFER_TOO_SMALL)
+WINFSP TRANSACT mode=single-buffered-16320 call n=20000 p50=22.2 p99=45.5 p999=87.8 max=129.3 | client open n=21989 p50=21.3 p99=52.4 p999=92.2 max=141.8
+WINFSP TRANSACT mode=batch-direct-64k-private call n=20000 p50=22.9 p99=48.3 p999=84.3 max=214.9 | client open n=21989 p50=22.1 p99=48.2 p999=85.3 max=171.0
+WINFSP TRANSACT mode=batch-direct-64k-section call n=20000 p50=22.6 p99=47.6 p999=87.6 max=2111.9 | client open n=21989 p50=21.8 p99=49.1 p999=91.9 max=297.7
+WINFSP TRANSACT mode=batch-direct-128k-section call n=20000 p50=24.1 p99=49.3 p999=88.8 max=247.5 | client open n=21989 p50=23.2 p99=49.4 p999=86.1 max=207.1
+WINFSP TRANSACT mode=batch-direct-256k-section call n=20000 p50=26.3 p99=52.5 p999=104.0 max=157.2 | client open n=21990 p50=25.5 p99=52.6 p999=95.3 max=181.1
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 76 filtered out; finished in 3.13s
+## run 1 of 5 ended, exit 0
+## run 2 of 5, 2026-11-05T21:39:25Z
+WINFSP TRANSACT batch output 16384 bytes: Err(122) (Win32 122 is the driver's STATUS_BUFFER_TOO_SMALL)
+WINFSP TRANSACT batch output 4096 bytes: Err(122) (Win32 122 is the driver's STATUS_BUFFER_TOO_SMALL)
+WINFSP TRANSACT mode=single-buffered-16320 call n=20000 p50=22.0 p99=46.6 p999=86.1 max=167.4 | client open n=21989 p50=21.0 p99=51.8 p999=88.7 max=126.9
+WINFSP TRANSACT mode=batch-direct-64k-private call n=20000 p50=22.7 p99=46.6 p999=90.5 max=2186.3 | client open n=21989 p50=21.7 p99=45.9 p999=92.9 max=2222.3
+WINFSP TRANSACT mode=batch-direct-64k-section call n=20000 p50=22.5 p99=45.8 p999=94.4 max=186.6 | client open n=21989 p50=21.6 p99=46.2 p999=92.5 max=203.7
+WINFSP TRANSACT mode=batch-direct-128k-section call n=20000 p50=23.8 p99=49.9 p999=95.1 max=375.6 | client open n=21989 p50=22.8 p99=49.5 p999=97.8 max=311.5
+WINFSP TRANSACT mode=batch-direct-256k-section call n=20000 p50=25.7 p99=55.0 p999=96.8 max=187.8 | client open n=21990 p50=24.7 p99=54.9 p999=93.2 max=204.4
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 76 filtered out; finished in 3.72s
+## run 2 of 5 ended, exit 0
+## run 3 of 5, 2026-11-05T21:39:29Z
+WINFSP TRANSACT batch output 16384 bytes: Err(122) (Win32 122 is the driver's STATUS_BUFFER_TOO_SMALL)
+WINFSP TRANSACT batch output 4096 bytes: Err(122) (Win32 122 is the driver's STATUS_BUFFER_TOO_SMALL)
+WINFSP TRANSACT mode=single-buffered-16320 call n=20000 p50=21.9 p99=47.9 p999=90.0 max=195.4 | client open n=21989 p50=21.0 p99=52.4 p999=94.4 max=128.7
+WINFSP TRANSACT mode=batch-direct-64k-private call n=20000 p50=22.6 p99=48.4 p999=77.4 max=136.1 | client open n=21989 p50=21.6 p99=47.8 p999=82.2 max=125.4
+WINFSP TRANSACT mode=batch-direct-64k-section call n=20000 p50=22.6 p99=46.5 p999=83.5 max=179.8 | client open n=21989 p50=21.6 p99=46.5 p999=85.9 max=205.6
+WINFSP TRANSACT mode=batch-direct-128k-section call n=20000 p50=23.9 p99=52.5 p999=95.8 max=208.5 | client open n=21989 p50=22.9 p99=53.2 p999=95.1 max=243.8
+WINFSP TRANSACT mode=batch-direct-256k-section call n=20000 p50=25.7 p99=52.4 p999=102.0 max=1177.2 | client open n=21990 p50=24.7 p99=53.2 p999=100.4 max=2039.4
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 76 filtered out; finished in 3.71s
+## run 3 of 5 ended, exit 0
+## run 4 of 5, 2026-11-05T21:39:33Z
+WINFSP TRANSACT batch output 16384 bytes: Err(122) (Win32 122 is the driver's STATUS_BUFFER_TOO_SMALL)
+WINFSP TRANSACT batch output 4096 bytes: Err(122) (Win32 122 is the driver's STATUS_BUFFER_TOO_SMALL)
+WINFSP TRANSACT mode=single-buffered-16320 call n=20000 p50=22.0 p99=45.2 p999=85.5 max=376.5 | client open n=21989 p50=21.0 p99=53.8 p999=104.7 max=298.4
+WINFSP TRANSACT mode=batch-direct-64k-private call n=20000 p50=22.6 p99=45.5 p999=93.7 max=1944.4 | client open n=21989 p50=21.6 p99=46.4 p999=81.7 max=1969.1
+WINFSP TRANSACT mode=batch-direct-64k-section call n=20000 p50=22.5 p99=47.0 p999=93.0 max=138.1 | client open n=21989 p50=21.5 p99=47.3 p999=90.4 max=187.4
+WINFSP TRANSACT mode=batch-direct-128k-section call n=20000 p50=23.7 p99=58.3 p999=117.6 max=638.7 | client open n=21989 p50=22.8 p99=56.5 p999=112.2 max=632.8
+WINFSP TRANSACT mode=batch-direct-256k-section call n=20000 p50=25.5 p99=54.5 p999=112.6 max=1038.6 | client open n=21990 p50=24.5 p99=53.5 p999=102.7 max=1052.4
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 76 filtered out; finished in 3.72s
+## run 4 of 5 ended, exit 0
+## run 5 of 5, 2026-11-05T21:39:37Z
+WINFSP TRANSACT batch output 16384 bytes: Err(122) (Win32 122 is the driver's STATUS_BUFFER_TOO_SMALL)
+WINFSP TRANSACT batch output 4096 bytes: Err(122) (Win32 122 is the driver's STATUS_BUFFER_TOO_SMALL)
+WINFSP TRANSACT mode=single-buffered-16320 call n=20000 p50=21.7 p99=44.0 p999=86.0 max=158.0 | client open n=21989 p50=20.8 p99=50.6 p999=90.3 max=167.6
+WINFSP TRANSACT mode=batch-direct-64k-private call n=20000 p50=22.4 p99=44.7 p999=75.9 max=1963.4 | client open n=21989 p50=21.5 p99=44.7 p999=77.4 max=1947.6
+WINFSP TRANSACT mode=batch-direct-64k-section call n=20000 p50=22.4 p99=47.8 p999=89.3 max=139.2 | client open n=21989 p50=21.5 p99=47.5 p999=84.2 max=156.7
+WINFSP TRANSACT mode=batch-direct-128k-section call n=20000 p50=23.8 p99=53.8 p999=86.3 max=1177.9 | client open n=21989 p50=22.8 p99=52.0 p999=84.6 max=1194.5
+WINFSP TRANSACT mode=batch-direct-256k-section call n=20000 p50=25.7 p99=58.2 p999=86.9 max=452.2 | client open n=21990 p50=24.7 p99=55.9 p999=89.5 max=382.7
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 76 filtered out; finished in 3.71s
+## run 5 of 5 ended, exit 0
