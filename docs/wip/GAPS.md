@@ -214,6 +214,13 @@
 > 41.5–190.1 µs to 21.8–40.7 µs on both CI SMT runners, all rounds green with part 2. On jupiter the millisecond
 > tails are gone, but its p99 is still 80–252 µs, red. Owed: a quiet Linux SMT run (adacachy's was at load 52), the
 > macOS arm (no SMT, expected unchanged), and Windows core classes, still unread. Record: `docs/bugs/2026-11-05-shards-counted-hardware-threads-as-cores.md`.
+>
+> **The placement test read only the root cgroup's quota (2026-11-05; found by the supervisor on adacachy, fix
+> pending its red check).** Inside a `systemd-run --user -p CPUQuota=1200%` unit on adacachy (32 CPUs), the facts
+> took the unit's 12-CPU quota and left the shards to the scheduler, as §4.3 says, while
+> `crates/rt/tests/placement.rs` read no quota at the root and failed the owned-cpuset case 3 of 3. The test now
+> takes the tightest quota over the process's whole cgroup path, as the facts do. A test fault, not a placement one.
+> Record: `docs/bugs/2026-11-05-the-placement-test-read-only-the-root-cgroups-quota.md`.
 
 > **A create's cost grows with its shard's volumes (2026-11-05, R9).** Both measured on macOS arm64 by `xctrace` on
 > `provision_bench`.
