@@ -1,6 +1,6 @@
-From 8f2004778311b2bbac26504387cef8ea07761ede Mon Sep 17 00:00:00 2001
+From 2baec10392246751ff6abf5edc1a95316bf8bbf7 Mon Sep 17 00:00:00 2001
 From: Ada Lundhe <adalundhe@lundhe.audio>
-Date: Wed, 4 Nov 2026 23:31:02 -0800
+Date: Wed, 4 Nov 2026 23:42:01 -0800
 Subject: [PATCH 3/3] PM M421: a DAX window's three edge cases through real WHP
  guests, on jupiter and windows-2025. Short views and 64 KiB granules hold, a
  section's replace holds at 2, 4 and 8 vCPUs, and a followed file lost 308 to
@@ -12,8 +12,8 @@ The record, D189's sentence, and a storm that makes fewer replaces where its thr
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  docs/design/architecture.md            |  4 +-
- docs/research/platform-measurements.md | 54 ++++++++++++++++++++++++++
- 2 files changed, 57 insertions(+), 1 deletion(-)
+ docs/research/platform-measurements.md | 57 ++++++++++++++++++++++++++
+ 2 files changed, 60 insertions(+), 1 deletion(-)
 
 diff --git a/docs/design/architecture.md b/docs/design/architecture.md
 index 62be2a5e..35885951 100644
@@ -31,10 +31,10 @@ index 62be2a5e..35885951 100644
        handle's value (le64), 38 bytes. The server duplicates the section only into a process
        holding the share's own stream, and answers with its value. The device adopts a value
 diff --git a/docs/research/platform-measurements.md b/docs/research/platform-measurements.md
-index 4832b326..f1b6722c 100644
+index 4832b326..b3263c5a 100644
 --- a/docs/research/platform-measurements.md
 +++ b/docs/research/platform-measurements.md
-@@ -17070,3 +17070,57 @@ revision before comparing a changed API/implementation.
+@@ -17070,3 +17070,60 @@ revision before comparing a changed API/implementation.
    its other steps' slowest (13.0); on Windows, whose runs now say how long the slowest take,
    the tests' step 122 (90.9 slowest, windows-2025's) where it had 120, and the job 144, those
    122 and a third above its other steps' slowest (16.1), where it had 150.
@@ -88,7 +88,10 @@ index 4832b326..f1b6722c 100644
 +  | windows-2025, 5 runs | 407, 604, 308, 416, 614 | 184, 174, 155, 220, 208 | 0, at 2 and 4 vCPUs, 5 runs |
 +
 +  It reaches a share's own file alone, as a server's section is never followed.
-+- **Non-vacuity.** Never asking the window: 40,657 accesses fell in a 2-vCPU paced run. The epoch published before the replace,
++
++  With these patches as they stand, slates' `diag-shards-whp-5`, run 41987826160, 2026-11-05, on the same image: 201, 797, 291,
++  357 and 588 fell before the fix, and after it none in 5 of 5, every window test passing in 43.5 to 49.5 s a run where the
++  width past the cores had taken 506 to 548 s.- **Non-vacuity.** Never asking the window: 40,657 accesses fell in a 2-vCPU paced run. The epoch published before the replace,
 +  so that a load may rightly see the old section: 757,450,579 loads and 39,974 stores counted stale. Both on jupiter.
 +- **Consequence.** D189: a change to what a window's ranges hold is counted before its lock is let go. The window's other
 +  claims of its edge cases stand, now through guests.

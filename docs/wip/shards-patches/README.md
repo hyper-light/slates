@@ -32,6 +32,10 @@ On CI's windows-2025 (AMD EPYC 7763, 4 logical, Windows 10.0.26100; slates' `dia
 2026-11-05): without `0002`, 5 of 5 runs red, 407, 604, 308, 416 and 614 accesses fell through at 2 vCPUs. With it, all 16
 window tests in each of 5 runs: none fell, none stale, every paced store found, 46,259 to 47,708 faults run again at 4 vCPUs.
 
+These patches as they stand, `diag-shards-whp-5`, run 41987826160, same image: 201, 797, 291, 357 and 588 fell without `0002`
+(5 of 5 red), and with it none, all 16 tests in each of 5 runs, 43.5 to 49.5 s a run. The storm makes 1,000 replaces at a width
+past the host's cores (`storm_replaces`), which took 506 to 548 s a run at 20,000.
+
 ## Seen beside them, not changed, for the owner to judge
 
 - `crates/vmm/src/devices/virtio/fs/window.rs`, `Window::memory_fault`: the Unix window also counts a followed change after
