@@ -1,0 +1,104 @@
+name: diag-step3-anchor
+on:
+  push:
+    branches: ['diag-step3-anchor-*']
+env:
+  CARGO_TERM_COLOR: never
+jobs:
+  gates:
+    name: gates (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: The structural, literal and unsafe checks
+        if: ${{ !cancelled() }}
+        run: cargo xtask check
+      - name: Clippy the anchor
+        if: ${{ !cancelled() }}
+        run: cargo clippy -p slates-anchor --all-targets -- -D warnings
+      - name: Docs of the anchor
+        if: ${{ !cancelled() }}
+        env:
+          RUSTDOCFLAGS: -D warnings -A rustdoc::private_intra_doc_links
+        run: cargo doc -p slates-anchor --no-deps --document-private-items
+  anchor:
+    name: anchor hold (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy the anchor
+        run: cargo clippy -p slates-anchor --all-targets -- -D warnings
+      - name: The hold tests, three runs, each result as an annotation
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        shell: bash
+        run: |
+          status=0
+          for run in 1 2 3; do
+            cargo test -p slates-anchor --test handles_windows -- --test-threads=1 --nocapture > out.log 2>&1 || status=1
+            cat out.log
+            refused=$(grep -c "a hold message was refused" out.log || true)
+            grep -E "^test result|ended supervision|^  left|^ right|: Ok\(|: Err\(" out.log | while read -r line; do
+              echo "::notice title=run $run::$line"
+            done
+            echo "::notice title=run $run::refusals logged by the anchor: $refused"
+          done
+          exit $status
+      - name: The whole anchor crate
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: cargo test -p slates-anchor -- --test-threads=1
+      - name: Install NASM
+        if: ${{ !cancelled() && matrix.os == 'windows-latest' }}
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl for the C the daemon links
+        if: ${{ !cancelled() && matrix.os == 'windows-11-arm' }}
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          & $clang --version
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Install WinFsp
+        if: ${{ !cancelled() }}
+        run: |
+          choco install winfsp -y --no-progress
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: The WinFsp mount through the CLI, held drives across kills
+        if: ${{ !cancelled() }}
+        timeout-minutes: 40
+        shell: bash
+        env:
+          SLATES_TEST_CLI: "1"
+          WINFSP_TEST_MOUNT: "1"
+        run: |
+          status=0
+          cargo test -p slates-cli --test winfsp -- --test-threads=1 --nocapture > live.log 2>&1 || status=1
+          cat live.log
+          grep -E "^test result" live.log | while read -r line; do echo "::notice title=live WinFsp::$line"; done
+          exit $status
