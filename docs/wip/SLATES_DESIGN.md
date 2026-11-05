@@ -11484,7 +11484,7 @@ Applied in the same change to:
   `an_idle_purge_resumes_across_calls_and_leaves_freed_bytes_zero` (`crates/mem/src/arena.rs`);
 - BENCHMARKS, GAPS.
 
-Status: built 2026-10-06, Linux. macOS and Windows keep their pages (owed below).
+Status: built 2026-10-06, Linux; macOS by A-110, Windows by A-205.
 - What: A-99's zero-on-free is unchanged. A released block is zeroed in place at once, so its plaintext is gone,
   and its pages stay resident for the allocations that follow. The arena counts those zeroed free bytes.
   - At a reap tick (`LIVENESS_BUDGET_NS`), a shard whose content arena allocated nothing since the previous tick gives
@@ -11510,8 +11510,7 @@ Status: built 2026-10-06, Linux. macOS and Windows keep their pages (owed below)
   back.
 - Owed:
   - macOS: built by A-110 (2026-10-06).
-  - Windows: `DiscardVirtualMemory` leaves the contents undefined, so it needs its own zeroing step and a
-    measurement.
+  - Windows: built by A-205 (2026-11-04): `DiscardVirtualMemory`, with its zeroing step at reuse, measured.
 
 ### A-106 — Extended attributes through the Linux mount (2026-10-06)
 Applied in the same change to:
@@ -11663,7 +11662,7 @@ Applied in the same change to:
   - `a_deleted_files_memory_goes_back_to_the_os`, now macOS too, on one shard;
 - `unsafe-budget.toml` (+4), A-105's owed list, GAPS, BENCHMARKS.
 
-Status: built 2026-10-06. Windows remains owed (A-105).
+Status: built 2026-10-06. Windows was owed (A-105) and is built by A-205.
 - What: the A-105 idle purge on macOS marks freed pages `MADV_FREE_REUSABLE`.
   - The footprint (what memory pressure and jetsam count) drops at once.
   - The kernel may take the pages without paging them; a taken page reads zeros, as the zeroed block did.
@@ -11908,8 +11907,8 @@ Applied in the same change to:
 - the test `recovery_memory_no_restart_reads_goes_back_and_a_restart_recovers_every_file`
   (`crates/server/tests/recovery.rs`), `docs/wip/bench/mem/per_entry.sh` (an idle reading), BENCHMARKS.
 
-Status: built 2026-10-08 (Linux by hole punch; macOS by the reusable mark since the same day, below; Windows keeps the
-pages, its content object having no page to give back yet, `SparseObject::discard`).
+Status: built 2026-10-08 (Linux by hole punch; macOS by the reusable mark since the same day, below; Windows by
+`DiscardVirtualMemory` since 2026-11-04, A-205).
 - macOS (same day): the content object's discard marks the pages `MADV_FREE_REUSABLE`, as the arena's does (A-110),
   and records them; every write clears the mark first (`MADV_FREE_REUSE`), since a marked page that is written stays
   out of the footprint and the kernel's to take. The record starts as the whole object at creation and at opening:
@@ -12839,6 +12838,57 @@ Measurements and run ids are in the GAPS entry.
     region: a short path commits what it did.
   - The driver checks no length when a directory's rename lengthens the names beneath it (`FspFileNodeRename`), so a
     rename that would take a held name past the cap is refused `STATUS_NAME_TOO_LONG` before it has any effect.
+
+### A-205 — Windows gives freed content pages back: `DiscardVirtualMemory`, cleared before reuse (2026-11-04)
+Applied in the same change to:
+- `crates/mem/src/region.rs` (`os::discard_slice`, `os::reuse_slice` and the mark's three constants on Windows;
+  `Region::prepare` widens only where clearing keeps the bytes);
+- `crates/mem/src/shared.rs` (the Windows `Inner::discard`, over committed runs; `Commits` knows the page);
+- `crates/machine/src/facts.rs` (`Facts::resident_now` on Windows, the working set);
+- the tests `crates/mem/tests/give_back.rs` and `crates/server/tests/give_back.rs`, and the bench
+  `crates/mem/examples/give_back_bench.rs`;
+- `unsafe-budget.toml` (mem +2, machine +2), the Windows CI lanes, A-105, A-110, A-117, GAPS, BENCHMARKS.
+
+Status: built 2026-11-04. It closes the Windows owed items of A-105, A-110 and A-117.
+- What: at the idle purge a freed block's pages and the recovery memory no restart reads go back through
+  `DiscardVirtualMemory`. They leave the working set at once, and their contents are dropped rather than paged out
+  (Microsoft's documentation of the call; the working set is what is measured here).
+- Why this call, measured on jupiter over a 256 MiB pagefile section, committed `SEC_RESERVE` and plain alike
+  (a scratch probe, 2026-11-04, the working set before and after):
+  - `DiscardVirtualMemory`: 260 to 4 MiB, in one call that answers success.
+  - `MEM_RESET` alone: 260 to 260 MiB. It only spares the pages a write to the paging file until the OS wants them.
+  - `MEM_RESET` then `VirtualUnlock`: 260 to 4 MiB, but the unlock answers `ERROR_NOT_LOCKED` when it works, so its
+    failure and its success look alike.
+  - `VirtualUnlock` alone: 260 to 4 MiB, but the pages stay dirty, so the OS would page out bytes nobody will read
+    (from the documentation of the working set; not measured here).
+- What does not change: the section's commit. Windows has no decommit for a view of a section, so the commit limit
+  keeps the charge; what goes back is the RAM. The daemon's working set is what this amendment answers for.
+- The arena (`Region`), on the macOS model:
+  - The contents of a discarded page are undefined until it is written (Microsoft's documentation of the call), so its
+    range is recorded and [`Region::prepare`] writes zeros over its recorded pages before the block is handed out. A
+    mapped shared region's record starts whole, because a discard's effect is on the object's pages, and a range an
+    earlier daemon or another shard gave back may carry it.
+  - Clearing writes bytes here, so it never widens past the block as macOS's does: a recorded neighbour may be a block
+    a recovery has yet to claim, and clearing costs no system call to save.
+  - A recovery's claim forgets the record, by A-110's argument: an image names only blocks live at its commit.
+- The content object (`SparseObject`): no record.
+  - A written page simply keeps what was written, and every reader there reads only what was written after the discard
+    (A-117's rule), so a write clears nothing. Zeroing there would destroy the bytes around the write, since a word of
+    the record spans live bytes.
+  - It discards only granules this process committed. The call refuses a range holding a reserved page, and committing
+    a dead range to discard it would charge the commit limit for nothing. A granule only another process committed has
+    no page in this working set.
+- Cost, a first write: writing zeros over a block makes all of it resident on its first allocation, where before only
+  the pages written were. BENCHMARKS prices a never-used block's clear at 1.5–9% best against best; a tiny file's tail pages
+  count until its block is next purged or reused.
+- Proven (BENCHMARKS, "What a write costs on pages given back on Windows") on jupiter and on CI's two Windows
+  architectures, and red-checked there. The working set alone cannot credit the purge: with every discard refused it
+  still fell 25% and 69% over 120 s, Windows trimming it unasked, though 0% in the first 5 s and 0 bytes by the daemon's
+  count. A write on pages given back cost 14–20% less than on never-used pages on the runners.
+- A held section's adoption (the audit's plan step 5) was checked in the same change. The audit said a refused view
+  leaked the handle. It did not: `view` closed it. 200 refused adoptions moved the handle count by 0 on unchanged code,
+  and by 200 with that close removed (`crates/mem/tests/held_section.rs`). The adoption now maps first and takes
+  ownership only of a view that exists, so `view` no longer closes what it was lent.
 
 ### A-198 — A WinFsp mount outlives its daemon: the anchor holds the volume's control handle, the drive's link and the mount's ledger, and the next daemon serves the held volume (accepted 2026-11-01, Step 9 of the VFS and DAX plan; built and measured 2026-11-02)
 Applied in the same change to: GAPS (gap 2 of the platform inventory). The build applies it to §4.6 "Windows",

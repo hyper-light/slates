@@ -3737,8 +3737,8 @@ kept out of the tree.
 **Owed:**
 - Tail rounding: done by A-118 (a sealed chunk's block trimmed to its pages): block rounding 88.6 → 44.3 MB on
   `/usr`, the daemon 34–39 MB smaller at idle, copy time unchanged (the A/B is A-118's table).
-- Windows: the content object gives no page back there (`SparseObject::discard`), so A-117 does nothing on that host;
-  a measured decommit is owed. macOS marks the pages reusable since 2026-10-08 (A-117's macOS note).
+- Windows: built by A-205 (2026-11-04): `DiscardVirtualMemory` over the committed runs. macOS marks the pages reusable
+  since 2026-10-08 (A-117's macOS note).
 
 ### Measured and rejected: no write delegation for an open that creates (condition 12; 2026-10-08)
 
@@ -7771,3 +7771,88 @@ pattern (`fsbench` 10–28×).
 
 
 
+
+## What a write costs on pages given back on Windows (A-205; VFS plan step 12; 2026-11-04)
+
+jupiter (AMD Ryzen AI MAX+ 395, 32 threads, 124 GiB, Windows 11 Pro 10.0.26200), load average 20 to 30 from other agents'
+builds and tests on the box, rustc 1.98.1, release. The rounds interleave the rows; all 11 are shown.
+
+`cargo +1.98.1 run --release -p slates-mem --example give_back_bench` (256 MiB written as 64 KiB chunks, µs per MiB):
+
+| Pages | Best | All 11 rounds |
+|---|---|---|
+| never used, nothing to clear | 293.8 | 401.9 339.3 319.9 322.6 370.6 354.1 293.8 459.2 579.3 524.9 490.2 |
+| never used, cleared on allocation | 363.6 | 363.6 377.5 422.3 364.9 402.4 421.5 450.3 556.9 585.9 538.3 537.8 |
+| given back, cleared on allocation | 267.1 | 300.7 291.4 320.0 291.8 346.9 267.1 471.4 550.3 526.3 494.2 454.1 |
+| kept resident, zeroed on free | 30.1 | 33.8 30.9 30.5 30.1 34.2 32.4 36.6 44.9 62.2 37.8 43.6 |
+
+So a write on pages given back costs what a write on never-used pages costs: each row's own spread (a factor of about 2
+across the load here) is larger than the gap between them. Both cost about ten times a write on pages kept resident, which
+is why the give-back is an idle purge (A-105) and not a step of every free.
+
+Freed bytes that left the process's working set (`Facts::resident_now`, `K32GetProcessMemoryInfo`):
+
+| Test, jupiter | Freed | Left the working set |
+|---|---|---|
+| `cargo +1.98.1 test -p slates-mem --test give_back -- --nocapture`, private region | 64 MiB | 99% |
+| the same, shared region | 64 MiB | 100% |
+| the same, sparse content object | 64 MiB | 100% |
+| `cargo +1.98.1 test -p slates-server --test give_back -- --nocapture`, a daemon, round 1 | 128 MiB of files | 101% |
+| the same, round 2, over pages already reused once | 128 MiB of files | 101% |
+
+The daemon's share is over 100% because its recovery memory goes back as well (A-117). In both rounds every byte of the
+recreated files read back as written, and the working set climbed by the files' size again.
+
+CI's Windows runners, the same commands, 2026-11-05 (`windows-latest` x86_64 and `windows-11-arm`, shared GitHub machines):
+
+| Run, lane | Never used, nothing to clear: best | Never used, cleared: best | Given back, cleared: best | Kept resident: best |
+|---|---|---|---|---|
+| 41977748853, x86_64 | 486.3 | 501.1 | 399.7 | 69.6 |
+| 41977748853, arm64 | 355.4 | 360.6 | 298.5 | 24.7 |
+| 41978699404, x86_64 | 624.9 | 654.9 | 523.8 | 88.0 |
+| 41978699404, arm64 | 342.9 | 352.1 | 294.0 | 23.5 |
+
+The rows' 11 rounds of run 41977748853, x86_64, in the same order:
+- 493.2 496.2 493.1 532.5 515.1 538.6 501.5 486.3 498.2 514.7 499.0
+- 514.6 506.9 501.1 501.5 503.2 502.1 505.5 503.7 565.6 501.3 502.4
+- 403.2 401.1 402.3 409.5 406.7 404.0 407.5 421.4 412.2 405.4 399.7
+- 70.9 70.2 69.6 71.6 71.7 70.8 70.5 71.1 70.2 71.3 70.5
+
+And of run 41977748853, arm64:
+- 368.3 359.8 355.4 362.8 365.4 358.2 366.5 362.9 361.9 358.1 366.0
+- 368.0 369.6 366.9 365.8 365.6 361.7 372.9 360.6 364.0 361.7 372.1
+- 307.6 300.3 311.6 298.5 302.8 303.8 308.4 306.7 308.6 304.6 298.7
+- 26.2 24.7 25.3 26.9 26.3 26.9 26.0 25.5 25.7 26.0 25.2
+
+- On quiet runners a write on pages given back is not dearer: it is 14–20% cheaper than a write on never-used pages, on
+  both architectures, outside the spread. Why is not explained here.
+- Clearing a never-used block costs 1.5–5% best against best in the two runs above, and 4–9% in the red-check run 41978703778
+  (its discard refused, which does not touch these two rows); the spreads overlap: a first write's price for the whole record.
+
+Freed bytes that left the working set on CI, with every discard refused as the red-check (the same tests, run 41978703778;
+the discard calls replaced by a refusal in a diagnostics commit):
+
+| Measure | x86_64 | arm64 |
+|---|---|---|
+| Crate, private region, working set at once, discard on (41978699404) | 99% | 99% |
+| Crate, private region, working set at once, discard refused | 0% | 0% |
+| Daemon, its own count of bytes given back, discard on (41978699404, of 134,217,728) | 136,474,624 | 125,173,760 |
+| Daemon, its own count, discard refused | 0 | 0 |
+| Daemon, working set in the first 5 s, discard refused | 0.8 MB, 0% | 0 bytes, 0% |
+| Daemon, working set at the end of the 120 s wait, discard refused | 25% | 69% |
+| Daemon, time for 90% to leave, discard on | 0.53, 0.81 s | 1.50 s |
+
+- The last-but-one row is Windows trimming a working set unasked, with the daemon counting nothing. So the working set is
+  read beside the daemon's count and against the time: a purge's fall comes within 2 s on the runners, and with no discard
+  there is none in the first 5 s.
+- The test stops waiting once both reach 90%, so a reading of 90% to 92% (run 41977748853: x86_64 90%, arm64 92%) is where
+  it stopped, not how far it would have gone. The first run to reach further, 41978699404's x86_64, read 102%.
+- Handles leaked by 200 refused adoptions: 0 on both architectures (41977748853, 41978699404, 41978703778; the held-section
+  test is unaffected by the refusal).
+- Run 41978699404's arm64 daemon test failed at first, on the test's own limit: it held the working set's climb after the
+  files were recreated to 90% too, and the climb read 89.9% (42,946,560 to 163,614,720), every byte having read back
+  correct. That limit was no part of the done-when and Windows' trimming moves it, so it is now half the bytes: what it
+  asks is that the reused pages count again, and the byte comparison is what says they hold what was written. With that
+  limit the daemon test passed 5 of 5 on each architecture (run 41979650557).
+- Linux and Mac fmt, clippy, docs, `cargo xtask check` and the mem tests, and Miri over mem's tests: passed on run
+  41975260339.
