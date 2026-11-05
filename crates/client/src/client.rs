@@ -109,6 +109,8 @@ pub fn defers_reply(body: &RequestBody) -> bool {
         | RequestBody::MapWrite { .. }
         | RequestBody::MapSync { .. }
         | RequestBody::ReleaseMap { .. }
+        // A WinFsp drive's detach waits for the anchor to release its hold, within the bound the daemon derives (A-198).
+        | RequestBody::Detach { .. }
         | RequestBody::Attach {
           form: AttachRequest::FuseMount { .. }
             | AttachRequest::ScopedFuseMount { .. }

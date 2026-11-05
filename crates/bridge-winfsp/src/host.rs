@@ -98,8 +98,8 @@ pub enum WinFspError {
   Ledger(crate::opens::Refusal),
   /// The retained direct-output receive journal was malformed or could not be settled.
   Capture(crate::inflight::Refusal),
-  /// The loaded DLL exposes a future public filesystem format this operation table cannot serve.
-  UnsupportedAbi(u16),
+  /// The loaded DLL is not the version this host's receiver was written from (`crate::dll_version`).
+  UnsupportedDll(crate::dll_version::UnsupportedVersion),
   /// A Windows object operation refused, preserving its system error code.
   Os {
     /// The Windows object operation.
@@ -122,12 +122,25 @@ impl std::fmt::Display for WinFspError {
       Self::Record(reason) => write!(f, "the held mount record was refused: {reason:?}"),
       Self::Ledger(reason) => write!(f, "{reason}"),
       Self::Capture(reason) => write!(f, "{reason}"),
-      Self::UnsupportedAbi(version) => {
-        write!(f, "WinFsp filesystem format {version} is unsupported")
-      }
+      Self::UnsupportedDll(refusal) => write!(f, "{refusal}"),
       Self::Os { call, code } => write!(f, "{call} refused: {code:?}"),
     }
   }
+}
+
+/// Refuses a DLL other than the version the receiver was written from, before anything touches its layout
+/// (`crate::dll_version`). `FspVersion` itself takes no file system.
+fn checked_dll(api: &ffi::Api) -> Result<(), WinFspError> {
+  let mut found = 0u32;
+  // SAFETY: the export was found by name in the loaded library, and `found` is a writable word for the call.
+  let status = unsafe { (api.version)(&mut found) };
+  if status != 0 {
+    return Err(WinFspError::Api {
+      call: "FspVersion",
+      status,
+    });
+  }
+  crate::dll_version::check(found).map_err(WinFspError::UnsupportedDll)
 }
 
 /// Whether WinFsp's library loads on this host: the fact the daemon's transport report states (`WinFspNotInstalled`
@@ -1612,8 +1625,9 @@ impl Mounted {
     {
       return Err(WinFspError::Record(crate::held::Refusal::Drive));
     }
-    let purge_token = crate::purge_token::PurgeToken::new()?;
     let api = ffi::api().map_err(|_| WinFspError::NotInstalled)?;
+    checked_dll(api)?;
+    let purge_token = crate::purge_token::PurgeToken::new()?;
     let security_descriptor = everyone_security_descriptor()?;
     let handler = Box::into_raw(Box::new(Handler {
       requests,
@@ -1686,12 +1700,6 @@ impl Mounted {
     // SAFETY: `file_system` is the DLL's live full object. Only its stable public prefix is accessed here.
     unsafe {
       (*file_system).user_context = handler.cast::<c_void>();
-    }
-    // SAFETY: the DLL returned a live initialized public prefix. Its reserved version is zero in v2.1; the header's
-    // 792-byte full-object size is a separate static assertion, not the value of this reserved field.
-    let version = unsafe { (*file_system).version };
-    if version != crate::dispatcher::FILE_SYSTEM_VERSION {
-      return Err(WinFspError::UnsupportedAbi(version));
     }
     if let Some((record, volume, link)) = inherited {
       if record.drive_text().map_err(WinFspError::Record)? != mount_point
