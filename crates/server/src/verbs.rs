@@ -7807,7 +7807,7 @@ pub(crate) fn materialize_taken_over_green(
   rebuild_green(state, &record);
   let rebuilt = state
     .greens
-    .get(&id)
+    .get_mut(&id)
     .map(|engine| (engine.head(), engine.head_identity()));
   if rebuilt != Some((recovery.head, recovery.identity)) {
     // The chain this node held does not reproduce the adopted head: refuse the green here, loudly,
@@ -11342,14 +11342,14 @@ mod tests {
       let green = super::to_db_volume(id);
       let before = state
         .greens
-        .get(&green)
+        .get_mut(&green)
         .map(|g| (g.head(), g.head_identity()));
       let record = state.db.partition().volume(green).cloned().unwrap();
       super::rebuild_green(state, &record);
       assert_eq!(
         state
           .greens
-          .get(&green)
+          .get_mut(&green)
           .map(|g| (g.head(), g.head_identity())),
         before,
         "the healthy replay reproduces the acknowledged head exactly"

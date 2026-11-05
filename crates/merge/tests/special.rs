@@ -80,7 +80,7 @@ fn an_ipc_origin_preserves_metadata_and_changes_identity_with_kind_or_owner() {
     ..Origin::default()
   };
   let decoded = Origin::decode(&origin.encode()).unwrap();
-  let green = Green::with_origin(&decoded);
+  let mut green = Green::with_origin(&decoded);
   assert_eq!(green.special("pipe"), Some(node(SpecialKind::Fifo)));
   assert_eq!(green.content("pipe"), None);
   assert_eq!(green.current_base().specials, origin.specials);

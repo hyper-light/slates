@@ -18,7 +18,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest, ubuntu-24.04-arm]
+        # Linux only (supervisor, 2026-11-05): the merge path compiles the same on macOS, whose CI queue is backed up,
+        # and macOS is measured natively on the development Macs.
+        os: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     steps:

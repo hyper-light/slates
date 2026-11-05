@@ -7294,6 +7294,37 @@ C's and B's were 2 to 74 ms. D, every form, one run each (load 8.6): p50 51 to 6
 (accept 59/63/60 µs, ranged 68/69/69 µs, identical 58/58/51 µs, conflict 55/58/68 µs), p99 152 to 364 µs, except
 conflict at 10,000 files, p99 1.81 ms in that run and 0.16 to 0.17 ms in the three A/B runs above.
 
+**100,000 files** (the development Mac, 2026-11-05 16:06 to 16:14 UTC, load 7 to 16, the A-221 tree, `edit_merge_bench
+--quiet-only --files 100000 --form accept --form conflict`, 3 × 1,000 samples): accept p50 60 µs, p99 199 µs, p999
+3.2 ms; conflict p50 48 µs, p99 153 µs, p999 0.30 ms. The same as at 10 files: a submit no longer reads what the green
+holds. This machine's derived partition budget holds a 400 MB green; CI's runner's does not (below).
+
+**A quieter machine: CI's macOS runner** (diag run 42052891076, job 127333404829, `macos-26-arm64` image
+20261026.0455.2, 3 cores, the daemon derived 2 shards; load 1.6 to 2.2 for rounds 2 and 3, 8.1 at round 1's start;
+2026-11-05 15:23 to 15:43 UTC). Arms: `main` at `21da6e57` with this harness copied in (base) and `487aee8e` (new),
+interleaved, 3 × 1,000 samples a run (at most 20 s a run: the base's 10,000-file rows stopped at 200 to 280). Total
+p50 per round, base → new:
+
+| Form | 10 files | 1,000 files | 10,000 files |
+|---|---|---|---|
+| accept | 194, 139, 289 µs → 83, 77, 148 µs | 7.30, 6.96, 8.75 ms → 86, 134, 150 µs | 72.5, 73.8, 72.0 ms → 100, 136, 137 µs |
+| ranged | 227, 136, 291 µs → 83, 128, 121 µs | 7.50, 8.18, 8.89 ms → 87, 133, 145 µs | 70.3, 79.4, 70.5 ms → 87, 129, 100 µs |
+| conflict | 109, 82, 139 µs → 60, 128, 128 µs | 993, 737, 734 µs → 69, 110, 130 µs | 4.20, 5.45, 4.73 ms → 115, 131, 65 µs |
+
+New, every form, one more run (15:43 UTC, load 1.7): p50 67 to 137 µs and p99 0.29 to 0.94 ms at 10, 1,000 and
+10,000 files. At 100,000 files of 4 KiB the seed's submit was refused `green_chains at capacity`: a green's durable
+chain lives in its partition's metadata budget, derived from the runner's memory (`crates/server/src/config.rs`), and
+a 400 MB seed exceeds it there; folding old chain entries (checkpointing) is owed in §4.16. The harness now reports such
+a shape as refused at capacity and goes on. Two shards and a spinning client on three cores leave no core spare, which
+is why this runner's medians sit above the development Mac's.
+
+**The head identity holders recompute (A-221; 2026-11-05 UTC, the same box).** The identity became a set hash over the
+green's entries (LtHash16). Kept up to date in every commit (G) against none (F), load 21 to 37, interleaved: accept at
+10 files 44, 60, 51 µs (F) against 78, 91, 101 µs (G), conflicts alike; measured-and-rejected, since only a holder
+reads it. Brought up to date when read (H, built), load 23 to 31: accept at 10 files 31, 53, 56 µs (F) against 62, 50,
+45 µs (H); at 1,000 files 59, 63, 48 µs against 60, 61, 44 µs; dead even. Isolated on that box under that load, a
+4 KiB BLAKE3 took 13 µs and a 2 KiB extendable output 15 µs (a temporary test, 20,000 each).
+
 **What decided it** (`sample` of the shard threads during a run): at 1,000 files, 113 of 120 submit samples were
 `Green::head_identity`, a BLAKE3 of every byte of the green, made for a merge record at `f = 0` and dropped (B); then,
 at 10,000 files, 64 of 88 were `reset_accepted_work`, the work's whole copy of the green made again after every

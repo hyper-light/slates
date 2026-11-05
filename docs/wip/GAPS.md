@@ -1,5 +1,28 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+
+
+> **Merge: the same edit from two works was one increment; fixed 2026-11-04 (§4.16, agents/perf).** The increment's
+> identity left out its work and its base, so a second work's byte-identical edit from the same base was answered from
+> the retry cache with the first work's version, even where the green had since changed that range: a conflict reported
+> as an accept. The identity now names the work and the base as §4.16's data model says. Failing first, passing after:
+> `crates/client/tests/merge_identity.rs`. Record: `docs/bugs/2026-11-04-the-same-edit-from-two-works-was-one-increment.md`.
+> Found by the edit-and-merge latency harness's oracle (`crates/client/examples/edit_merge_bench.rs`).
+>
+> **Merge: a full edit and merge is 51–69 µs at the median whatever the green holds (A-220, 2026-11-04, agents/perf).**
+> A submit's cost had followed the green's size: 14 ms at 1,000 files of 4 KiB. The merge record's identities are now
+> made only for a record that goes to holders, the deriver composes over the base restricted to the journal's paths,
+> and a work holds only the files it changed since its base. Loaded Mac (load 5–11, informational): p50 51–69 µs and
+> p99 0.15–0.36 ms at 10, 1,000 and 10,000 files, every form, but for one run's 1.81 ms (conflict, 10,000 files; BENCHMARKS, "A full edit and merge"). Racing clients'
+> verdicts are judged against the rule (`crates/client/tests/merge_chaos.rs`). 100,000 files: accept p50 60 µs, p99
+> 199 µs on the Mac; CI's 3-core macOS runner (quiet): p50 67–150 µs at 10 to 10,000 files, its partition budget refuses a
+> 400 MB green (chain checkpointing owed). **Open:** the Linux CI numbers; the preferred 50 µs (the fixed cost of the two round trips); the two-machine path (fs-server); the rebase
+> restates whole. Since A-221 (2026-11-05) the head identity a holder recomputes is a set hash brought up to date when
+> read, so a record at `f > 0` costs what its version changed; its format changed (golden vector in
+> `crates/merge/tests/origin.rs`), so records written before it would not match a newer holder. A daemon `SIGKILL`ed six times mid-merge
+> loses no told version and tells none twice (`crates/cli/tests/merge_kill.rs`, red with the durable append removed).
+>
+
 > **Shards counted hardware threads as cores (2026-11-05, A-208, §4.1, R9; fixed, its A/B owed).** §4.1 counts shards in
 
 > **A call waits for its acknowledgement's scatter (2026-11-05, §4.9, R9; OPEN).** The synchronous
