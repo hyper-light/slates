@@ -9648,3 +9648,173 @@ could not see this.
 A second receiver cannot simply be added: two journals need the multi-worker crash proof (GAPS), which is not built. A
 second worker would also make x86_64 slower unless it ran on arm64 alone, and a mode chosen per architecture would need
 a derivation the rules accept.
+
+## The spin policy, measured and rejected (A-218; R9; macOS and CI; 2026-11-05)
+
+Every candidate below lost main's single-client, 8-client or parked p99 under load on at least one platform, so main's
+spin policy stays (the supervisor, 2026-11-05: p99 under load is the target, and a quiet-machine gain is not evidence).
+Measured and rejected, with every N. The commands are `provision_bench`'s and `rt_bench`'s release binaries, run with
+no arguments; each arm built in its own target dir, the MD5s compared before any run, the arms interleaved round by
+round. A temporary diagnostic edit, where one was used, was made identically in both trees and taken out after. "Busy"
+adds 18 spinning threads (one per core, a scratch load generator) to the host's own load. Every figure is the median of
+the bench's three runs unless a range is given. Main is a7804447 in every arm but option A's, which ran against b502cf96
+once main had moved.
+
+**What started it: macOS's zero-timeout poll sleeps.** On Apple M5 Max (18 cores), macOS 26.4.1 (25E253), the idle
+spin's driver poll was `kevent` with a zero timeout. Probes outside the tree, each form on a fresh queue, every return
+checked, 5,000 calls a round (20:11 UTC, load 6):
+
+| form | ns a call, rounds 1 / 2 / 3 | involuntary switches a call |
+|---|---|---|
+| `kevent`, zero timespec | 14,752 / 14,866 / 14,737 | 1.01 / 1.02 / 1.01 |
+| `kevent64`, zero timespec | 14,598 / 14,757 / 15,524 | 1.00 / 1.00 / 1.07 |
+| `kevent64`, `KEVENT_FLAG_IMMEDIATE` | 186 / 182 / 180 | 0.00 / 0.00 / 0.00 |
+
+XNU refuses mixing the two record formats on one queue (`EINVAL`), so a true spin needs every call on the queue moved
+to `kevent64`. With that change (`rt_bench`, five rounds, load 5.7–6.0), a cross-shard round trip between spinning
+shards fell from 7,792 / 7,667 / 8,000 / 6,375 / 7,000 ns to 625 / 666 / 625 / 666 / 625 ns; parking was unchanged.
+So main's macOS shards spin in naps of about 15 µs, each an involuntary switch. A requested short wait delivers about
+the request plus 4–6 µs: asked 1 µs, 2.7–9.4 µs at load 28 and 4.9–6.8 µs at load 5; asked 5 µs, 8.8–9.8 µs.
+
+**The true spin alone (`kevent64` everywhere), macOS.** At load 6–16 it won every row. Single-client p50
+75.4 / 67.5 / 68.5 → 19.8 / 20.8 / 22.0 µs; p99 157.8 / 166.7 / 170.8 → 97.1 / 134.5 / 167.2 µs; 8-client p99
+219.5 / 309.4 / 275.5 → 204.8 / 158.8 / 93.0 µs (20:19–20:22 UTC). At load 18–30 it lost every tail (21:07–21:11 UTC):
+
+| row | main | true spin | true spin, yielding after the competitive spin |
+|---|---|---|---|
+| single-client p50 | 82.0 / 71.5 / 73.6 µs | 21.1 / 12.9 / 13.5 µs | 12.5 / 12.8 / 12.7 µs |
+| single-client p99 | 183 / 190 / 176 µs | 115 / 926 / 751 µs | 442 / 262 / 252 µs |
+| 8-client p99 | 0.47 / 0.54 / 0.44 ms | 3.48 / 3.18 / 5.23 ms | 3.46 / 3.30 / 3.38 ms |
+| parked p99, after the 64-client form | 0.53 / 0.35 / 4.19 ms | 3.14 / 12.09 / 14.53 ms | 13.92 / 9.38 / 12.20 ms |
+
+The parked form alone on a fresh daemon was no worse (load 5–6: p99 1.48 / 0.43 / 0.95 / 0.85 ms against 2.33 / 0.66 /
+1.22 / 0.70 ms). After the oversubscribed 64-client form a true spinner's wake estimate read 29–55 µs, against main's
+4.6–14 µs. Freezing the estimate at the boot prior (load 20–34) left the single-client p99 at 576 / 419 / 402 µs against
+main's 190 / 183 / 181 µs; the parked p99 was 17.90 / 0.65 / 1.00 ms against 5.22 / 12.33 / 0.32 ms.
+
+**Rejected: the shard's own turn gaps** (end the spin at a turn gap longer than the boot idle window, back off for as long
+as the gap, learn no wake meanwhile; 21:17–21:43 UTC, load 13–35). A probe first: with a core free a spinner's longest
+gap between turns was 115–144 µs, and oversubscribed 9–26 gaps per 300 ms passed 500 µs, the longest 65–90 ms.
+
+quiet: (median of the bench's 3 runs; each round)
+| row | main | fix | turn-gap rule |
+|---|---|---|---|
+| spinning_1_p50 (µs) | 85.4 · 73.0 · 72.8 | 23.7 · 14.6 · 25.0 | 12.4 · 12.4 · 12.9 |
+| spinning_1_p99 (µs) | 167.3 · 180.4 · 177.3 | 519.9 · 656.6 · 140.1 | 830.6 · 448.0 · 549.9 |
+| spinning_8_p99 (µs) | 494.6 · 407.3 · 423.3 | 3.34 ms · 2.89 ms · 3.37 ms | 4.12 ms · 3.46 ms · 2.93 ms |
+| parked_1_p50 (µs) | 113.1 · 113.6 · 117.0 | 83.4 · 80.1 · 83.2 | 81.2 · 86.6 · 60.5 |
+| parked_1_p99 (µs) | 3.43 ms · 359.2 · 523.5 | 15.20 ms · 4.14 ms · 1.18 ms | 17.46 ms · 5.22 ms · 1.01 ms |
+
+busy: (median of the bench's 3 runs; each round)
+| row | main | fix | turn-gap rule |
+|---|---|---|---|
+| spinning_1_p50 (µs) | 29.9 · 33.0 · 87.0 | 14.2 · 15.2 · 19.6 | 16.6 · 15.2 · 15.0 |
+| spinning_1_p99 (µs) | 619.7 · 238.8 · 576.6 | 7.06 ms · 13.93 ms · 5.60 ms | 15.13 ms · 15.49 ms · 11.16 ms |
+| spinning_8_p99 (µs) | 20.04 ms · 13.20 ms · 4.13 ms | 45.28 ms · 58.80 ms · 58.07 ms | 44.86 ms · 46.27 ms · 42.85 ms |
+| parked_1_p50 (µs) | 100.2 · 111.2 · 94.0 | 76.8 · 92.3 · 63.9 | 77.0 · 77.8 · 80.0 |
+| parked_1_p99 (µs) | 63.09 ms · 61.04 ms · 14.90 ms | 11.09 ms · 16.85 ms · 13.22 ms | 13.50 ms · 18.07 ms · 18.10 ms |
+
+The spinner barely sees the harm: the thread that waits is the woken client or shard queued for a core, and macOS rarely
+preempts the spinner for it. A `sched_yield` does not reach a thread queued on another core either. Beside 9–36 pure
+spinners a parked thread's wake p99 was 0.08–6.5 ms, beside yielding ones 43–51 µs, but the yielding spinners' own round
+trip rose to 8–65 µs. macOS's CPU idle counters (`host_statistics`, `HOST_CPU_LOAD_INFO`) read 0.0 idle cores with no
+extra load and 5.8 with 36 extra spinners, so they cannot be the signal.
+
+**Rejected: shorter idle windows.** The window as 100, 10 and 1 times the wake estimate (ratio 1 is the competitive spin
+alone [A: Karlin, Manasse, McGeoch & Owicki 1994]); macOS, 21:44–22:06 UTC, quiet at load 11–30, busy at 24–43:
+
+
+quiet, rounds 1 · 2 (each the median of the bench's 3 runs)
+| row | main | ratio 100 (fix) | ratio 10 | ratio 1 |
+|---|---|---|---|---|
+| spinning_1_p50 | 89.1 µs · 75.4 µs | 13.6 µs · 13.8 µs | 19.1 µs · 36.0 µs | 23.6 µs · 26.6 µs |
+| spinning_1_p99 | 172.1 µs · 218.4 µs | 277.8 µs · 388.5 µs | 122.9 µs · 291.8 µs | 89.8 µs · 146.9 µs |
+| spinning_8_p50 | 144.0 µs · 158.0 µs | 14.0 µs · 14.4 µs | 15.1 µs · 18.3 µs | 145.6 µs · 198.8 µs |
+| spinning_8_p99 | 393.5 µs · 635.1 µs | 2.16 ms · 2.42 ms | 2.22 ms · 1.72 ms | 666.2 µs · 1.14 ms |
+| parked_1_p50 | 109.4 µs · 107.7 µs | 79.9 µs · 78.9 µs | 94.1 µs · 100.1 µs | 96.2 µs · 109.5 µs |
+| parked_1_p99 | 10.61 ms · 415.2 µs | 10.59 ms · 8.55 ms | 7.89 ms · 9.59 ms | 1.73 ms · 9.49 ms |
+
+busy, rounds 1 · 2 (each the median of the bench's 3 runs)
+| row | main | ratio 100 (fix) | ratio 10 | ratio 1 |
+|---|---|---|---|---|
+| spinning_1_p50 | 76.1 µs · 33.8 µs | 14.2 µs · 19.0 µs | 26.4 µs · 33.2 µs | 39.4 µs · 24.6 µs |
+| spinning_1_p99 | 1.28 ms · 449.8 µs | 1.19 ms · 4.60 ms | 334.1 µs · 290.8 µs | 171.7 µs · 232.6 µs |
+| spinning_8_p50 | 160.6 µs · 152.4 µs | 91.8 µs · 302.0 µs | 108.4 µs · 119.6 µs | 126.6 µs · 145.1 µs |
+| spinning_8_p99 | 7.16 ms · 10.54 ms | 48.99 ms · 169.59 ms | 53.40 ms · 20.12 ms | 7.91 ms · 9.65 ms |
+| parked_1_p50 | 137.4 µs · 140.9 µs | 96.2 µs · 5.25 ms | 79.4 µs · 133.5 µs | 113.8 µs · 113.8 µs |
+| parked_1_p99 | 25.15 ms · 43.00 ms | 16.98 ms · 60.11 ms | 15.80 ms · 47.85 ms | 41.04 ms · 24.10 ms |
+
+Four more rounds of main against ratio 1 (22:07–22:16 UTC), with rounds 1 and 2 above:
+
+
+quiet, rounds 1–6 (µs unless marked), main vs ratio 1; wins = rounds where ratio 1 ≤ main
+| row | main | ratio 1 | ratio 1 ≤ main |
+|---|---|---|---|
+| spinning_1_p50 | 89 · 75 · 56 · 62 · 59 · 60 | 24 · 27 · 40 · 34 · 17 · 22 | 6/6 |
+| spinning_1_p99 | 172 · 218 · 124 · 139 · 126 · 142 | 90 · 147 · 184 · 929 · 41 · 115 | 4/6 |
+| spinning_8_p50 | 144 · 158 · 129 · 146 · 133 · 132 | 146 · 199 · 99 · 42 · 24 · 32 | 4/6 |
+| spinning_8_p99 | 394 · 635 · 372 · 575 · 435 · 400 | 666 · 1.1ms · 2.0ms · 528 · 127 · 704 | 2/6 |
+| parked_1_p50 | 109 · 108 · 101 · 113 · 91 · 79 | 96 · 109 · 107 · 82 · 80 · 149 | 3/6 |
+| parked_1_p99 | 10.6ms · 415 · 2.7ms · 8.3ms · 456 · 451 | 1.7ms · 9.5ms · 20.8ms · 8.4ms · 1.5ms · 9.5ms | 1/6 |
+
+busy, rounds 1–6 (µs unless marked), main vs ratio 1; wins = rounds where ratio 1 ≤ main
+| row | main | ratio 1 | ratio 1 ≤ main |
+|---|---|---|---|
+| spinning_1_p50 | 76 · 34 · 77 · 72 · 75 · 73 | 39 · 25 · 26 · 24 · 19 · 26 | 6/6 |
+| spinning_1_p99 | 1.3ms · 450 · 581 · 430 · 450 · 445 | 172 · 233 · 108 · 118 · 97 · 169 | 6/6 |
+| spinning_8_p50 | 161 · 152 · 160 · 128 · 128 · 127 | 127 · 145 · 122 · 35 · 87 · 101 | 6/6 |
+| spinning_8_p99 | 7.2ms · 10.5ms · 5.6ms · 2.0ms · 1.0ms · 1.9ms | 7.9ms · 9.7ms · 8.9ms · 3.7ms · 1.4ms · 3.2ms | 1/6 |
+| parked_1_p50 | 137 · 141 · 121 · 76 · 96 · 99 | 114 · 114 · 118 · 85 · 84 · 93 | 5/6 |
+| parked_1_p99 | 25.1ms · 43.0ms · 30.2ms · 34.3ms · 22.3ms · 186.8ms | 41.0ms · 24.1ms · 35.8ms · 27.7ms · 13.9ms · 8.6ms | 4/6 |
+
+On CI (diag run of `diag-clients-8`, 2026-11-05 22:17–22:55 UTC, 4-vCPU runners, quiet and with one spin loop per CPU; the
+results pushed to `diag-results/clients-8-<os>` and read by `git fetch`). The kqueue change is macOS code, so on these
+platforms "the fix" is a second main arm. Ratio 1 against main:
+- **Linux arm64** (3 shards): quiet single-client p50 38.0 / 36.8 / 11.7 against 14.0 / 14.0 / 14.1 µs; p99
+  129.8 / 126.3 / 22.5 against 126.7 / 23.9 / 25.3 µs, R9 failing in two rounds of three (main one); quiet parked p99
+  104.6 / 114.4 / 110.6 against 75.4 / 76.9 / 79.3 µs.
+- **Linux x86_64**: quiet single-client p99 27.6 / 29.3 / 44.1 against 47.2 / 30.6 / 28.2 µs; quiet parked p99
+  149.9 / 95.1 / 94.9 against 88.3 / 80.0 / 124.1 µs.
+- **Windows x86_64**: quiet single-client p99 23.0 / 33.1 / 31.8 against 19.6 / 22.3 / 20.5 µs; busy 48.9 / 52.8 /
+  45.6 against 33.4 / 32.5 / 32.9 µs.
+- **Windows arm64**: quiet single-client p50 69.5 / 47.6 / 46.7 against 17.8 / 17.3 / 17.0 µs, p99 131.4 / 95.6 / 112.1
+  against 48.6 / 88.0 / 47.5 µs; busy p99 22.67 / 26.05 / 28.05 ms against 39.5 / 37.6 / 35.3 µs.
+
+Busy, Linux main's own true spin is in the milliseconds in every arm (8-client p99 4.5–7.5 ms), while Windows main's
+keeps the single-client p99 at 33–40 µs: only macOS's scheduler turned a true spin's loaded tail into milliseconds.
+
+**Rejected: a nap past the competitive spin** (option A: spin for one wake estimate with the immediate poll, then nap
+— a kernel wait of the boot wake mean, the shard not marked parked — while the shard's measured nap is shorter than its
+live wake estimate; the nap measured lazily by kickable probes; main b502cf96; 23:11–23:3x UTC, load 13–40):
+
+
+quiet, rounds 1–4, main b502cf96 vs A; k/4 = rounds where A ≤ main
+| row | main | A | A ≤ main |
+|---|---|---|---|
+| spinning_1_p50 | 79 · 94 · 95 · 75 | 18 · 17 · 17 · 18 | 4/4 |
+| spinning_1_p99 | 476 · 2.4ms · 2.7ms · 2.2ms | 708 · 1.7ms · 3.7ms · 410 | 2/4 |
+| spinning_8_p50 | 146 · 134 · 136 · 134 | 25 · 26 · 28 · 25 | 4/4 |
+| spinning_8_p99 | 2.5ms · 3.5ms · 5.0ms · 7.7ms | 3.3ms · 4.8ms · 7.3ms · 3.1ms | 1/4 |
+| parked_1_p50 | 106 · 184 · 180 · 145 | 100 · 146 · 149 · 144 | 4/4 |
+| parked_1_p99 | 17.1ms · 16.8ms · 19.1ms · 30.0ms | 11.1ms · 20.0ms · 18.7ms · 25.3ms | 3/4 |
+
+busy, rounds 1–4, main b502cf96 vs A; k/4 = rounds where A ≤ main
+| row | main | A | A ≤ main |
+|---|---|---|---|
+| spinning_1_p50 | 76 · 75 · 73 · 74 | 15 · 18 · 18 · 24 | 4/4 |
+| spinning_1_p99 | 729 · 557 · 539 · 576 | 3.1ms · 1.3ms · 1.2ms · 3.8ms | 0/4 |
+| spinning_8_p50 | 145 · 131 · 130 · 141 | 32 · 65 · 49 · 46 | 4/4 |
+| spinning_8_p99 | 3.0ms · 1.8ms · 2.6ms · 3.5ms | 18.5ms · 19.8ms · 19.4ms · 20.6ms | 0/4 |
+| parked_1_p50 | 81 · 126 · 84 · 75 | 196 · 77 · 84 · 96 | 1/4 |
+| parked_1_p99 | 17.2ms · 11.5ms · 47.9ms · 31.1ms | 41.7ms · 36.0ms · 60.3ms · 83.0ms | 0/4 |
+
+The shards' decision logs show why: under load a shard's measured nap and its wake estimate track each other to the
+nanosecond (nap 11,250 against wake 11,251 ns; 13,834 against 14,050; 27,125 against 27,264; 37,917 against 37,974), since
+once the host is oversubscribed both measure the same queueing for a core, and the comparison sits on the line. With the
+comparison forced to nap every time (busy round 1, main at 23:46 and the napping arm at 23:50 UTC), main's single-client, 8-client and parked p99 were 777.6 µs,
+3.46 ms and 20.3 ms, the napping arm's 821.5 µs, 15.10 ms and 24.4 ms, and the candidate was stopped there.
+
+What it means: main's macOS shards nap about 15 µs at every driver harvest, busy steps included. That is what keeps
+their tails under load within reach of the other platforms', and it is also what costs their p50 (main's 60–95 µs
+against a true spin's 13–22 µs at every load). No derived rule measured here keeps both, so the naps stay. The kqueue
+change is kept on record (`agents/clients-spin`, a75f9213), not landed.

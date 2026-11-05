@@ -1304,7 +1304,11 @@ served ring request, forwarded verb, mount call or guest pass; a timer's work op
 the shard's wake estimate — asking the rings, the pollers, the timers and the driver on each turn (a socket's
 readiness is known only to the driver, so the spin polls it without blocking; A-39), then park in
 the driver. Every non-blocking harvest is one that never sleeps: on epoll that is `epoll_wait` with a
-zero timeout (A-39; the same rule held for io_uring's `io_uring_enter` before A-136 removed it).
+zero timeout (A-39; the same rule held for io_uring's `io_uring_enter` before A-136 removed it). On macOS the
+zero-timeout `kevent` this driver makes sleeps about 15 µs a call (macOS 26.4.1, measured 2026-11-05), so a macOS shard's
+spin is a nap of that length a turn. That is kept by measurement: a true spin (`KEVENT_FLAG_IMMEDIATE`, about 180 ns)
+cut the single-client p50 from 60–95 µs to 13–22 µs but lost every tail once the host had no idle core, and no policy
+measured kept both (A-218, measured and rejected; BENCHMARKS "The spin policy, measured and rejected").
 Cancellation: dropping a future releases nothing it did not own (resources live in arenas
 keyed by handle and are released by the owning operation's terminal step), so every operation is
 cancel-safe by construction; a cancellation request is a message that guarantees a terminal
@@ -12928,6 +12932,25 @@ support), GAPS, `docs/bugs/2026-11-05-a-call-waited-for-its-acknowledgements-sca
 - **What it does not change.** The bound (`2 × slots`), `AcknowledgementOwed`, the client's cadence and its watermark,
   and an acknowledgement's own refusal on the client's shard, which is still its reply.
 - **Next lever (C, GAPS):** carry the watermark in every request, so no separate acknowledgement is needed at all.
+
+### A-218 — The macOS idle spin's policy (measured and rejected 2026-11-05; main's spin stays)
+Applied in the same change to: §4.3 (its "Loop" paragraph: on macOS the zero-timeout harvest sleeps about 15 µs, kept),
+GAPS, BENCHMARKS ("The spin policy, measured and rejected").
+- **What was asked.** On macOS the idle spin's zero-timeout `kevent` sleeps about 15 µs a call (14.6–15.5 µs, one
+  involuntary switch, macOS 26.4.1), where `KEVENT_FLAG_IMMEDIATE` takes 180–186 ns. A true spin cut the single-client
+  p50 from 60–95 µs to 13–22 µs at every load and lost every tail once the host had no idle core. A-218 was to find a
+  derived spin policy keeping both, with no regression against main at any load.
+- **Why none was accepted.** The competitive spin [A: Karlin, Manasse, McGeoch & Owicki 1994] assumes the spinner's
+  processor has no other use; once the host is oversubscribed it does, and on macOS's scheduler a true spinner holds a
+  core a woken thread waits for. Each candidate is rejected by its numbers: the shard's own turn gaps (it rarely sees
+  the waiting thread), yielding (a yield does not reach a thread queued elsewhere), macOS's CPU idle counters (unusable),
+  a frozen wake estimate, idle windows of 10 and 1 times the wake (ratio 1 lost R9 on CI's Linux arm64 and both Windows
+  runners), and napping past the competitive spin against the live wake estimate (under load nap and wake measure the
+  same queueing, to the nanosecond; busy p99 0 of 4 on every row), and with naps forced (busy 8-client p99 15.1 against
+  3.46 ms).
+- **What stays.** Main's macOS spin: a nap of about 15 µs at each driver harvest, busy steps included, which is what
+  keeps its tails under load. The decision rests on Ada's rule that p99 under load is the target. The true spin's change
+  is kept on record, not landed (`agents/clients-spin`, a75f9213).
 
 ### A-209 — Windows conformance is WinFsp's own two suites over the slates drive in both Windows lanes, with a reviewed list and stated differences; the POSIX suites run on arm64 Linux (accepted 2026-11-05, Step 10 of the VFS and DAX plan)
 Applied in the same change to: Part 6 ("Conformance"), §4.6 ("Windows" and its status), GAPS, `docs/wip/platforms.md`,

@@ -173,7 +173,8 @@
 > 43.0 µs. Open and not the acknowledgement:
 > - **jupiter's single-client p99.** It stays red with A-216: its runs range from 65 µs to 3.8 ms, as main's do
 >   (2026-11-05 18:24–18:27 UTC).
-> - **macOS's single-client create.** Its p50 is 60–75 µs in both arms.
+> - **macOS's single-client create.** Its p50 is 60–75 µs in both arms. Where it goes is now known, and it stays by
+>   decision: the next entry (A-218).
 > - **The bench's 8- and 64-client forms aborting `Stalled` at load 23–36 on macOS,** and the ~1.77 s pause after 64
 >   clients churned. Both are main's code; the lost-reply defect below is one cause that fits.
 >
@@ -182,6 +183,30 @@
 > **Next lever (C): do we need the separate acknowledgement at all?** Carry the watermark in every request, so each
 > owner shard releases a client's records when its next request arrives there. No scatter and no extra request.
 > That is a protocol change to the request slot and §4.9.
+
+> **macOS shards nap in their spin, kept by measurement (2026-11-05, A-218 measured and rejected, §4.3, §4.7, R9).**
+> The idle spin's driver poll on macOS, `kevent` with a zero timeout, sleeps about 15 µs a call with one involuntary
+> switch (14.6–15.5 µs over three checked rounds; `KEVENT_FLAG_IMMEDIATE` takes 180–186 ns). So §4.3's "every
+> non-blocking harvest is one that never sleeps" does not hold on macOS, and the macOS single-client p50 of 60–95 µs is
+> those naps. A true spin (every call on the queue `kevent64`, a poll the immediate flag) took it to 13–22 µs at every
+> load. But it lost the tails once the host had no idle core: at load 18–30, single-client p99 183–190 → 115–926 µs and
+> 8-client p99 0.44–0.54 → 3.2–5.2 ms. Every policy tried to keep the gain and the tails was measured and rejected
+> (BENCHMARKS, "The spin policy, measured and rejected"):
+> - the shard's own turn gaps;
+> - yielding after the competitive spin;
+> - macOS's CPU idle counters, which cannot see the load;
+> - a frozen wake estimate;
+> - idle windows of 10 and 1 times the wake. Ratio 1 lost R9 on CI's Linux arm64 and both Windows runners.
+> - napping past the competitive spin when the measured nap is shorter than the wake (busy p99 0/4 on every row; under
+>   load the two measure the same queueing, to the nanosecond), and with naps forced (busy 8-client p99 15.1 ms against
+>   3.46 ms).
+>
+> So the naps stay, and the p50 cost stays with them: p99 under load is the target. Open, not owed by any candidate here:
+> a policy that keeps a true spin's p50 without its loaded tails on macOS's scheduler (QoS-lowering the spin is excluded:
+> on Apple silicon it moves the spinner between core types). Next lever for Linux's and Windows' own loaded tails (B):
+> true sub-millisecond naps (a `timerfd` in the epoll set on the 5.10 floor; a high-resolution waitable timer on
+> Windows), after measuring what each delivers. The true spin's change stays on record, not landed (`agents/clients-spin`,
+> a75f9213), with its test (`a_spinning_shard_answers_sooner_than_a_parked_one`).
 
 > **A scatter whose part could not be sent never answered (2026-11-05, §4.9, §4.14; fixed).** `scatter_acknowledge`,
 > `scatter_list`, `scatter_grants` and `scatter_status`, the server's four scatter tables, settled a part whose spawn
