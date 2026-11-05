@@ -8554,7 +8554,7 @@ parking's reached 10.6–25 ms in one. x86_64's quiet write and read are bimodal
 µs in two; parking's stayed at 9.5–9.7 µs), and their cause is not known. Arm64's loaded stat p99 fell from 10.5–16.5 ms to
 0.7–13.3 ms.
 
-**Loaded SetSize: the shard is preempted just after it answers.** The same run's idle buckets split the queue wait by how long
+**Loaded SetSize: the shard is preempted just after it answers.** Run 42049771150's idle buckets split the queue wait by how long
 the shard had been idle when the request was sent. Arm64 loaded p50: under 20 µs, 89 µs for SetSize; 50–200 µs, 6.9 µs. A shard
 long idle wakes fast; one that has just answered does not. Run 42059294312 (`diag-winfsp-bench-12`, arm64, one run of 3 rounds,
 instrumented) raised one arm's shard threads to `THREAD_PRIORITY_ABOVE_NORMAL`, the other's left normal, both with the spin:
