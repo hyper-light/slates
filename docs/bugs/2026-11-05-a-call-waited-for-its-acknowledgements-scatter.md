@@ -30,6 +30,15 @@ every `ack_every` waited for the slowest shard. On an idle daemon whose other sh
 of them, and so the single-client provisioning p99 sat at many times its p50 (jupiter: p50 20 µs, p99 80–650 µs). A
 shard busy past the reply deadline made an unrelated call fail.
 
+## Correction (2026-11-05, later the same day)
+
+The macOS arms below were one binary: built from `git archive` copies into one shared target dir, cargo rebuilt nothing
+after the first (main c0c8d28c), since the archives' files carry their commits' old times. So the macOS stall counted
+against a6c3bc16 here was main's, and so was the instrumented bench's caught pause. a6c3bc16's own record is 1 stall in
+9 runs on jupiter, where each arm has its own target dir. Main stalled 1 of its 4 parked forms on macOS. The
+`Stalled` under load fits a defect of main's found later: a scatter whose part's spawn a full control channel refuses
+never answers (recorded with A-216).
+
 ## Edits, then reverted
 
 a6c3bc16 made `Client::call` send a due acknowledgement with `begin_ack_if_due`, as the async path does. Its reply
