@@ -71,10 +71,15 @@
 >
 > Every macOS arm is now built in its own target dir, and arms are compared by MD5 before they run.
 
-> **The large-file NFS write gap (VFS plan step 11, 2026-11-05): closed on the incumbent harness by A-204 and A-214.**
-> The incumbent harness on the M5 Max (six interleaved rounds, load 6–10, 2026-11-05 16:23Z) writes the 64 MiB file
-> at up to 1,286.0 MiB/s with A-214, against 1,033.9 before it and step 11's 967, beyond the spread at 4 and 16
-> workers. Write p99s at 16 workers overlap with no direction. Profiled through Linux's NFSv4.2 client on CI (run
+> **The large-file NFS write gap (VFS plan step 11, 2026-11-05): open again while A-214 is re-landed.** Its 1,286.0
+> MiB/s rested on A-214, which main reverted (the entry above). The re-landing on `agents/nfs-write` ends a busy period
+> on a free as well as an allocation, so a delete takes its burst's reserve with it
+> (`a_file_deleted_after_its_burst_went_idle_takes_its_reserve_with_it`: the content object fell back to 204,800 bytes
+> after the delete, against 16,793,600 before the fix), and its arena test skips under Miri only the count of pages
+> given back, which Miri cannot model. Owed before it is handed over: A-205's give-back on both Windows lanes, Miri on
+> `slates-mem`, the full server suite, and the incumbent harness again. Before the revert, the incumbent harness on
+> the M5 Max (six interleaved rounds, load 6–10, 2026-11-05 16:23Z) wrote the 64 MiB file at up to 1,286.0 MiB/s with
+> A-214, against 1,033.9 before it and step 11's 967, beyond the spread at 4 and 16 workers. Write p99s at 16 workers overlap with no direction. Profiled through Linux's NFSv4.2 client on CI (run
 > 41986870989), the one busy shard had spent 41.5% of its samples faulting in fresh pages of the anchor's shared
 > content object, 21.0% sealing at rest and 12.4% peeking and copying records. BENCHMARKS, "The large-file NFS write
 > profiled" and "an idle shard keeps its last write burst's pages pre-faulted".
