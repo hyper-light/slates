@@ -1051,3 +1051,5 @@ slates-server: shard 0: recovered 1 volumes from their images (0 refused), 0 mer
 slates-server: shard 0: held 0 replicas again from the image
 slates-server: shard 0 initialized in 9278 µs
 ## run 5 of 5 done, 2026-11-05T16:49:54Z
+To https://github.com/hyper-light/slates
+   b4f7e30..50c1613  50c1613b46e862b4017b296f41eaa2b7292db120 -> diag-winfsp-overlap-results-42061108836-windows-latest
