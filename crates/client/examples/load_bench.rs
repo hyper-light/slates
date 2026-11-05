@@ -136,6 +136,8 @@ enum Step {
 
 /// One client and its script.
 struct Agent {
+  /// A daemon restart this client is riding out, if any.
+  recovery: Option<Recovery>,
   /// The green's version a resolution reads its windows at, and the window bytes it read.
   resolving: (u64, Vec<u8>),
   id: usize,
@@ -160,6 +162,19 @@ struct Tally {
   starved: u64,
   rebase_conflicts: u64,
   max_sweep_ns: u64,
+  /// Reconnects after the daemon was found gone, requests resent under their own ids, and the longest outage a client
+  /// rode out: the non-vacuity counters of the restart path (a chaos run that resent nothing tested nothing).
+  reconnects: u64,
+  resent: u64,
+  max_outage_ns: u64,
+}
+
+/// Where a client is in riding out a daemon restart: reconnecting under its id, or resending its request in flight
+/// under that request's own id once reconnected (the daemon answers from its completion record if it had served it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Recovery {
+  Reconnecting { since_ns: u64 },
+  Resending { since_ns: u64 },
 }
 
 /// splitmix64: a reproducible plan without a dependency.
@@ -345,6 +360,79 @@ impl Agent {
   }
 
   /// Sends the current step's request.
+  /// No reply yet to `word`: past the client's own derived reply deadline, a gone daemon starts the restart path; a
+  /// reply the daemon defers past one deadline while it lives (`Client::defers`) is waited for, as the synchronous
+  /// call waits; anything else past `reply_patience` deadlines is counted lost and named, never waited on for ever.
+  fn overdue(
+    &mut self,
+    word: u64,
+    (sent_ns, kind): (u64, Kind),
+    epoch: Instant,
+    tally: &mut Tally,
+  ) {
+    let waited = ns_since(epoch).saturating_sub(sent_ns);
+    let deadline = self.client.deadlines().reply_ns;
+    if waited <= deadline {
+      return;
+    }
+    if self.client.daemon_gone() {
+      return self.lost_daemon(epoch);
+    }
+    if !self.client.defers(word) && waited > deadline.saturating_mul(reply_patience()) {
+      self.give_up(
+        tally,
+        &format!("no reply to {kind:?} within the reply deadline (daemon gone: false)"),
+      );
+    }
+  }
+
+  fn lost_daemon(&mut self, epoch: Instant) {
+    self.recovery = Some(Recovery::Reconnecting {
+      since_ns: ns_since(epoch),
+    });
+  }
+
+  /// One step of riding out a daemon restart, never blocking the sweep: a reconnect step under the client's id, then
+  /// the request in flight resent under its own id. Bounded by the client's own derived reconnect budget.
+  fn recover(&mut self, recovery: Recovery, epoch: Instant, tally: &mut Tally) {
+    let (Recovery::Reconnecting { since_ns } | Recovery::Resending { since_ns }) = recovery;
+    let outage = ns_since(epoch).saturating_sub(since_ns);
+    if outage > self.client.deadlines().reconnect_ns {
+      return self.give_up(
+        tally,
+        "the daemon did not come back within the reconnect budget",
+      );
+    }
+    match recovery {
+      Recovery::Reconnecting { .. } => match self.client.try_reconnect() {
+        Ok(true) => {
+          tally.reconnects += 1;
+          self.recovery = Some(Recovery::Resending { since_ns });
+        }
+        Ok(false) => {}
+        Err(e) => self.give_up(tally, &format!("reconnect: {e}")),
+      },
+      Recovery::Resending { .. } => {
+        let Some((word, _, _)) = self.inflight else {
+          self.recovery = None;
+          return;
+        };
+        match self.client.resend_awaited(word) {
+          Ok(true) => {
+            tally.resent += 1;
+            tally.max_outage_ns = tally.max_outage_ns.max(outage);
+            self.recovery = None;
+          }
+          Ok(false) => {}
+          Err(_) if self.client.daemon_gone() => {
+            self.recovery = Some(Recovery::Reconnecting { since_ns })
+          }
+          Err(e) => self.give_up(tally, &format!("resend: {e}")),
+        }
+      }
+    }
+  }
+
   fn send(&mut self, epoch: Instant, tally: &mut Tally) {
     let Some((body, kind)) = self.request() else {
       return;
@@ -354,6 +442,7 @@ impl Agent {
       Err(
         ClientError::Ipc(slates_ipc::IpcError::RingFull) | ClientError::TooManyOutstanding { .. },
       ) => {}
+      Err(_) if self.client.daemon_gone() => self.lost_daemon(epoch),
       Err(e) => self.give_up(tally, &format!("send {kind:?}: {e}")),
     }
   }
@@ -366,30 +455,17 @@ impl Agent {
 
   /// Takes a reply if one is ready, records it, and moves the script on.
   fn poll(&mut self, epoch: Instant, tally: &mut Tally) {
+    if let Some(recovery) = self.recovery {
+      return self.recover(recovery, epoch, tally);
+    }
     let Some((word, sent_ns, kind)) = self.inflight else {
       self.send(epoch, tally);
       return;
     };
     let reply = match self.client.poll_reply_word(word) {
-      Ok(None) => {
-        // A reply not taken within the client's own derived reply deadline (the anchor's liveness budget) is lost to
-        // this client: counted and named, never waited on for ever.
-        if ns_since(epoch).saturating_sub(sent_ns)
-          > self
-            .client
-            .deadlines()
-            .reply_ns
-            .saturating_mul(reply_patience())
-        {
-          let gone = self.client.daemon_gone();
-          return self.give_up(
-            tally,
-            &format!("no reply to {kind:?} within the reply deadline (daemon gone: {gone})"),
-          );
-        }
-        return;
-      }
+      Ok(None) => return self.overdue(word, (sent_ns, kind), epoch, tally),
       Ok(Some(reply)) => reply,
+      Err(_) if self.client.daemon_gone() => return self.lost_daemon(epoch),
       Err(e) => return self.give_up(tally, &format!("poll {kind:?}: {e}")),
     };
     let replied_ns = ns_since(epoch);
@@ -684,8 +760,13 @@ fn report(n: usize, tally: &mut Tally) {
     println!("refusal\t{n}\t{count}\t{why}");
   }
   println!(
-    "harness\t{n}\tstarved\t{}\trebase_conflicts\t{}\tmax_sweep_ns\t{}",
-    tally.starved, tally.rebase_conflicts, tally.max_sweep_ns
+    "harness\t{n}\tstarved\t{}\trebase_conflicts\t{}\tmax_sweep_ns\t{}\treconnects\t{}\tresent\t{}\tmax_outage_ns\t{}",
+    tally.starved,
+    tally.rebase_conflicts,
+    tally.max_sweep_ns,
+    tally.reconnects,
+    tally.resent,
+    tally.max_outage_ns
   );
 }
 
@@ -938,6 +1019,7 @@ fn level(
       step: Step::CreateWork,
       windows: Vec::new(),
       resolving: (0, Vec::new()),
+      recovery: None,
       resolutions: 0,
       inflight: None,
     })
@@ -979,6 +1061,9 @@ fn level(
     total.starved += tally.starved;
     total.rebase_conflicts += tally.rebase_conflicts;
     total.max_sweep_ns = total.max_sweep_ns.max(tally.max_sweep_ns);
+    total.reconnects += tally.reconnects;
+    total.resent += tally.resent;
+    total.max_outage_ns = total.max_outage_ns.max(tally.max_outage_ns);
   }
   println!(
     "level\t{n}\twall_ns\t{}\tworkers\t{workers}",

@@ -75,6 +75,10 @@
 >   owner shard, so replies pass the client's 1 s reply deadline (136 `CreateWork` at a 1 s harness deadline). The
 >   harness's conflict resolution is still synchronous (a worker's sweep reached 4.9 s), so its latencies at this
 >   level are not recorded.
+> - **Chaos: a daemon killed under its anchor mid-load loses nothing acknowledged** (2026-11-05, BENCHMARKS): ten
+>   kills at 10 and 100 clients, every client reconnected and resent its request in flight under its own id (50 of
+>   50 and 500 of 500), outages 1.0 to 47.2 ms, the oracle 0 failures in every run. Owed: a workload whose edits
+>   change lengths, so a request applied twice would show in the bytes, not only in the completion record's keeping.
 > - **A-207 moved the bottleneck to the partition log** (2026-11-05, async harness, load 7 to 18): every edit now
 >   appends to the partition log, and every `bytes_between_snapshots` of log the shard publishes a whole partition
 >   snapshot, origin included. 10 clients: edit p50 2.1 ms. 100 clients: every operation's p50 64 to 76 ms with the

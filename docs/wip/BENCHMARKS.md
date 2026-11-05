@@ -8011,3 +8011,59 @@ The harness's worst sweep was 0.23 ms at 10 clients and 0.75 ms at 100, so these
 operations queue on the green's owner shard, which publishes a whole partition snapshot (origin included) every
 `bytes_between_snapshots` of the log every edit now appends to (GAPS). Peak RSS: 2.9 GB at 100 clients, 8.7 GB at 300.
 
+### Chaos: the daemon SIGKILLed under its anchor mid-load (2026-11-05)
+
+Ten runs over the kernel's `kernel/` (Linux v7.4-rc1), same machine: 10 clients × 200 rounds and 100 clients × 20 rounds,
+the daemon killed 0.5, 1.5, 2.5, 3.5 and 5 s into the run phase and restarted by the anchor. The harness rides the restart
+as a client must: past its reply deadline with the daemon gone, it reconnects under its client id
+(`Client::try_reconnect`, bounded by its reconnect budget) and resends the request in flight under that request's own id
+(`Client::resend_awaited`), which the daemon answers from its completion record if it had served it. Every run:
+
+| Clients | Kill at (s) | Reconnects / resent | Longest outage (ns) | Accepted | Conflicts | Oracle failures |
+|---|---|---|---|---|---|---|
+| 10 | 0.5 | 10 / 10 | 6,747,304 | 2,000 | 1,197 | 0 |
+| 10 | 1.5 | 10 / 10 | 1,008,004 | 2,000 | 1,171 | 0 |
+| 10 | 2.5 | 10 / 10 | 10,070,918 | 2,000 | 1,150 | 0 |
+| 10 | 3.5 | 10 / 10 | 7,209,897 | 2,000 | 1,161 | 0 |
+| 10 | 5 | 10 / 10 | 3,984,075 | 2,000 | 1,096 | 0 |
+| 100 | 0.5 | 100 / 100 | 35,038,217 | 1,393 | 3,113 | 0 |
+| 100 | 1.5 | 100 / 100 | 43,771,253 | 1,347 | 3,280 | 0 |
+| 100 | 2.5 | 100 / 100 | 42,934,617 | 1,244 | 3,127 | 0 |
+| 100 | 3.5 | 100 / 100 | 47,247,518 | 1,221 | 3,347 | 0 |
+| 100 | 5 | 100 / 100 | 32,526,777 | 1,217 | 3,127 | 0 |
+
+At 100 clients, 33 to 49 clients were counted starved (64 resolutions a round exhausted on the default 8 hot files); the
+workload's contention, not the restart. The oracle includes every accepted version's bytes after the restart, so the
+green's chain (and A-207's work logs, which carry every work's acknowledged state across the kill) came back whole. The
+edits are length-preserving overwrites, so a resent edit applied twice would not show in the bytes; the completion
+record is what keeps it once, and an insert-and-delete workload is owed to check that by the bytes too.
+
+The procedure, `chaos.sh <tree> <clients> <rounds> <tag> <delay>` (kept in the agent's scratch, not the tree, since it
+is not Rust; every process it starts is killed by pid):
+
+```sh
+#!/bin/bash
+# Chaos run: an anchor supervising a daemon, the load harness against it, and the daemon SIGKILLed once the harness's
+# run phase has started. Usage: chaos.sh <tree> <clients> <rounds> <tag>. Everything this starts is killed by pid.
+set -u
+tree=$1; clients=$2; rounds=$3; tag=$4; delay=${5:-1}
+bin=$HOME/.cache/slates-agents-target-loadtest/release
+dir=$HOME/.cache/slates-agents-scratch/loadtest
+instance=lt-chaos-$tag-$$
+$bin/slates --instance $instance anchor --quick --shards 4 2> $dir/chaos-$tag-anchor.log &
+anchor=$!
+for try in $(seq 1 50); do $bin/slates --instance $instance volume list >/dev/null 2>&1 && break; sleep 0.2; done
+$bin/slates --instance $instance bootstrap root >> $dir/chaos-$tag-anchor.log 2>&1
+$bin/examples/load_bench --instance $instance --tree $tree --clients $clients --rounds $rounds > $dir/chaos-$tag.log 2>&1 &
+bench=$!
+until grep -q '^level' $dir/chaos-$tag.log 2>/dev/null || ! kill -0 $bench 2>/dev/null; do sleep 0.2; done
+sleep $delay
+daemon=$(pgrep -P $anchor | head -1)
+echo "anchor=$anchor daemon=$daemon bench=$bench" > $dir/chaos-$tag.pids
+if [ -n "$daemon" ]; then kill -9 $daemon; echo "killed daemon $daemon at $(date +%T.%N)" >> $dir/chaos-$tag.pids; fi
+wait $bench; echo "bench exit $?" >> $dir/chaos-$tag.pids
+kill $anchor 2>/dev/null; sleep 1; kill -9 $anchor 2>/dev/null
+for p in $(pgrep -f "instance $instance"); do kill -9 $p 2>/dev/null; done
+sleep 0.5; echo "left: $(pgrep -f "instance $instance" | tr '\n' ' ')" >> $dir/chaos-$tag.pids
+```
+
