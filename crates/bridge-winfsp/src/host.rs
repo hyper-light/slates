@@ -1332,8 +1332,10 @@ extern "C" fn overwrite(
   // SAFETY: our file system and a live open-file context.
   let handler = unsafe { handler(fs) };
   let object = context_key(context);
+  eprintln!("DIAG overwrite: context {object} replace {_replace} allocation {_allocation_size} attributes {_file_attributes:#x}");
   match handler.call(Op::Truncate { object }) {
     Reply::Object { info, .. } => {
+      eprintln!("DIAG overwrite: answered size {}", info.file_size);
       // SAFETY: `p_info` handled by put_info.
       unsafe { put_info(p_info, info) };
       STATUS_SUCCESS.as_i32()
@@ -1444,6 +1446,7 @@ extern "C" fn write(
     constrained: constrained != 0,
   }) {
     Reply::Wrote { written, info } => {
+      eprintln!("DIAG write: context {object} offset {offset} length {length} to_end {write_to_end} constrained {constrained} wrote {written} size {}", info.file_size);
       // SAFETY: `p_bytes` writable; `p_info` handled by put_info.
       unsafe {
         *p_bytes = written;
@@ -1537,6 +1540,7 @@ extern "C" fn set_file_size(
   // SAFETY: our file system and a live open-file context.
   let handler = unsafe { handler(fs) };
   let object = context_key(context);
+  eprintln!("DIAG set_file_size: context {object} new_size {new_size} allocation {set_allocation_size}");
   // Setting only the allocation size does not change the file size; report the current info unchanged.
   let op = if set_allocation_size != 0 {
     Op::Info { object }
@@ -1545,6 +1549,7 @@ extern "C" fn set_file_size(
   };
   match handler.call(op) {
     Reply::Object { info, .. } => {
+      eprintln!("DIAG set_file_size: answered size {}", info.file_size);
       // SAFETY: `p_info` writable.
       unsafe { put_info(p_info, info) };
       STATUS_SUCCESS.as_i32()
