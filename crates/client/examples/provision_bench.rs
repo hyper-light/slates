@@ -42,6 +42,9 @@ const PERCENTILES: &[(&str, u64)] = &[("p50", 500), ("p99", 990), ("p999", 999)]
 /// Format: parts per thousand.
 const PERMILLE: u64 = 1000;
 
+/// Raised by the first client that stalls, so the main thread dumps the shards' pulses at that moment.
+static STALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn ns(elapsed: Duration) -> u64 {
   u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
 }
@@ -77,7 +80,13 @@ fn deadlines() -> Deadlines {
 }
 
 /// One client's samples: `count` creates (each followed by a destroy that is not timed).
-fn sample(instance: &str, tag: &str, count: usize, pause: Option<Duration>) -> Vec<u64> {
+fn sample(
+  instance: &str,
+  tag: &str,
+  count: usize,
+  pause: Option<Duration>,
+  daemon: Option<&Daemon>,
+) -> Vec<u64> {
   let mut client = connect(instance);
   // The spinning form spins for the floor (the reply lands without a wake when the daemon
   // meets it); the parked form keeps the daemon's published window and parks.
@@ -101,7 +110,29 @@ fn sample(instance: &str, tag: &str, count: usize, pause: Option<Duration>) -> V
       base: None,
     };
     let started = Instant::now();
-    let id = client.create(&spec).unwrap();
+    let id = match client.create(&spec) {
+      Ok(id) => id,
+      Err(ClientError::Stalled { .. }) => {
+        STALLED.store(true, std::sync::atomic::Ordering::Release);
+        eprintln!(
+          "STALL {tag} create {n} after {:?}: parks/replies {:?}, unanswered wakes {}, outstanding {:?}, unawaited dropped {}, acknowledged {}, last {:?}",
+          started.elapsed(),
+          client.park_ratio(),
+          client.unanswered_wakes(),
+          client.outstanding(),
+          client.unawaited_dropped(),
+          client.acknowledged(),
+          client.last_request()
+        );
+        if let Some(daemon) = daemon {
+          for pulse in daemon.shard_pulses() {
+            eprintln!("STALL   {pulse:?}");
+          }
+        }
+        continue;
+      }
+      Err(e) => panic!("{e}"),
+    };
     samples.push(ns(started.elapsed()));
     client.destroy(id).unwrap();
   }
@@ -180,6 +211,7 @@ fn print_parks(
 
 /// One form over the runs; per percentile, the per-run values.
 fn form(
+  daemon: Option<&Daemon>,
   instance: &str,
   key: &str,
   clients: usize,
@@ -192,9 +224,22 @@ fn form(
       .map(|c| {
         let instance = instance.to_owned();
         let tag = format!("{key}-{run}-{c}");
-        std::thread::spawn(move || sample(&instance, &tag, count, pause))
+        std::thread::spawn(move || sample(&instance, &tag, count, pause, None))
       })
       .collect();
+    // Watch the shards while the clients run: at the first stall, every shard's pulse, then every 100 ms for a second.
+    let mut dumps = 0;
+    while !handles.iter().all(|h| h.is_finished()) {
+      std::thread::park_timeout(Duration::from_millis(100));
+      if STALLED.load(std::sync::atomic::Ordering::Acquire) && dumps < 10 {
+        dumps += 1;
+        if let Some(daemon) = daemon {
+          for pulse in daemon.shard_pulses() {
+            eprintln!("PULSE {key}-{run} dump {dumps}: {pulse:?}");
+          }
+        }
+      }
+    }
     let mut all = Vec::new();
     for handle in handles {
       let samples = handle.join().unwrap();
@@ -298,6 +343,7 @@ fn main() {
   daemon
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
+
   println!(
     "provisioning histogram: {shards} shards, spin window {} ns, floor {PROVISION_FLOOR_NS} ns",
     daemon.config().region.spin_ns
@@ -312,7 +358,7 @@ fn main() {
   for clients in CLIENT_COUNTS {
     let key = format!("spinning_{clients}");
     let before = daemon.shard_pulses();
-    let rows = form(&instance, &key, *clients, SPINNING_SAMPLES, None);
+    let rows = form(Some(&daemon), &instance, &key, *clients, SPINNING_SAMPLES, None);
     print_parks(
       &key,
       &before,
@@ -362,7 +408,20 @@ fn main() {
   // The parked form is reported separately (AC-2.1), not gated: its latency is a wake, which
   // the scheduler's park granularity dominates.
   let before = daemon.shard_pulses();
-  let rows = form(&instance, "parked_1", 1, PARKED_SAMPLES, Some(PARKED_PAUSE));
+  let mut parked_runs = Vec::new();
+  for run in 0..RUNS {
+    parked_runs.push(percentiles(sample(
+      &instance,
+      &format!("parked_1-{run}"),
+      PARKED_SAMPLES,
+      Some(PARKED_PAUSE),
+      Some(&daemon),
+    )));
+  }
+  let mut rows = Vec::new();
+  for (index, (name, _)) in parked_runs[0].iter().enumerate() {
+    rows.push((*name, parked_runs.iter().map(|r| r[index].1).collect::<Vec<u64>>()));
+  }
   print_parks(
     "parked_1",
     &before,
