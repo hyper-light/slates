@@ -3966,6 +3966,22 @@ load 6–10. The large 64 MiB write, MiB/s at 1, 4 and 16 workers:
 - nfsd wrote 1,458–2,081 MiB/s. The gap to it at 4 and 16 workers fell from about 1.8× to about 1.5×.
 - The volume's shard counted `content.prefaulted_bytes` 358,875,136 in every B run and nothing in A.
 
+**Through Linux's NFSv4.2 client on CI.** The same harness, both arms built on one runner and alternated A, B three
+times (branch `diag-nfs-write-12`, run 42064893088, AMD EPYC 9V45, 4 vCPU, Azure kernel 7.0, load 0.8–2.5). The large
+write, MiB/s at 1, 4 and 16 workers:
+
+| round | A | B | nfsd in A's run | nfsd in B's run |
+|---|---|---|---|---|
+| 1 | 624.4 / 626.0 / 602.3 | 625.0 / 1,064.1 / 1,037.7 | 963 / 980 / 973 | 973 / 1,040 / 1,002 |
+| 2 | 620.2 / 635.7 / 621.0 | 623.6 / 1,014.3 / 1,017.4 | 955 / 976 / 971 | 724 / 857 / 997 |
+| 3 | 622.3 / 637.1 / 641.0 | 622.4 / 1,002.9 / 1,011.5 | 917 / 989 / 992 | 945 / 974 / 982 |
+
+- At 4 and 16 workers B is 60–70% faster, beyond the spread (1,002.9–1,064.1 against 602.3–641.0), and level with
+  nfsd on this runner; at 1 worker the arms are even.
+- Write p99 at 16 workers, µs (create / overwrite / append): A 3,505–3,914 / 1,361–1,543 / 1,329–1,462; B 3,647–4,341 /
+  1,284–1,479 / 1,291–1,435. They overlap.
+- The tick-only first build was dead even on the same harness (run 42058939194: 531–556 against 534–551 MiB/s).
+
 **The resident cost per shard.** An idle shard holds at most its last burst's net growth of free pages, and never more
 than its memory share (`reserve_per_shard`: 1,073,741,824 bytes on the Mac's daemon, logged at boot). A shard whose
 last busy period grew nothing holds none: a written and deleted file nets zero, and A-105's give-back test passes

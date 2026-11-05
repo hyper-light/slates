@@ -13,8 +13,9 @@
 >   refilled in its idle moments, at most its memory share. A first build refilled only at the reap tick, which the
 >   harness's second-long pauses never reached on the volume's shard; the refill is now the runtime's idle work.
 > - **Open:** the gap to nfsd remains about 1.5× at 4 and 16 workers (nfsd 1,458–2,081 MiB/s), and at 1 worker, where the
->   first large write follows no earlier burst, A-214 does not apply. Sealing at rest (21%) is condition 9's. The CI
->   A/B of A-214's idle refill is owed (diagnostics branch `diag-nfs-write-12`).
+>   first large write follows no earlier burst, A-214 does not apply. Sealing at rest (21%) is condition 9's. On CI
+>   (run 42064893088, interleaved) A-214 took the 4- and 16-worker writes from 602–641 to 1,003–1,064 MiB/s, level
+>   with nfsd there.
 > - **Tried and not taken:** populating fresh pages in batches or from a second thread (run 41987962954); filling them
 >   by `pwrite` into the content object (1.9× per fresh page), which R1's lint wall forbids.
 

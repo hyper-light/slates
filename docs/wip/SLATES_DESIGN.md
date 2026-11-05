@@ -12914,6 +12914,8 @@ A-105's entry, BENCHMARKS, GAPS.
     shard;
   - the gain: the incumbent harness on the M5 Max wrote its 64 MiB file at up to 1,286.0 MiB/s, against 1,033.9 before
     (beyond the spread at 4 and 16 workers; six interleaved rounds), with write p99s overlapping.
+  - through Linux's NFSv4.2 client on CI (run 42064893088, interleaved), the 4- and 16-worker writes went from
+    602–641 to 1,003–1,064 MiB/s, level with nfsd on that runner.
 - **Not done:** decaying the reserve over time. A-105's reason (a daemon kept its high-water mark forever) does not
   apply: the reserve follows the last busy period, so a delete or a quiet period that grew nothing returns it.
 
