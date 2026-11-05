@@ -16,6 +16,32 @@
 >   and from 507 to 27.0 ms, 20 interleaved rounds per build (run 41985454044; BENCHMARKS, "What a WinFsp mount and unmount
 >   wait for the Windows anchor").
 
+> **The binary release lane (2026-11-04, A-210, Appendix B.2).** `release.yml` now builds `slates` natively for
+> seven targets: macOS arm64, Linux x86_64 and arm64 (glibc, and static musl), and Windows x86_64 and arm64 with the C
+> runtime linked statically. It runs each built binary on its own runner (`cargo run -p xtask --bin release -- smoke`: version,
+> anchor and daemon start, bootstrap, a volume provisioned, a file written and read by one MCP client and read by a second
+> client, the volume destroyed, the daemon gone with its anchor). It then attaches the seven binaries, `SHA256SUMS`,
+> `slates-provenance.json` and a Sigstore attestation bundle to a **draft** release. Publishing the draft is the
+> maintainer's step (`docs/publish.md`, "The binary release").
+> - Proven by use (2026-11-05). Every Linux and Windows binary passed every smoke step on its own CI runner (run
+>   41982329895): provision 20–25 ms, the MCP round trip 22–61 ms, start to serving 275–1064 ms. Both musl binaries
+>   are static, and the Windows x86_64 binary answered in Nano Server. The macOS binary passed 10 of 10 runs on this
+>   Mac (M5 Max, 18 cores, 2026-11-04, load 12–24; `cargo run -p xtask --bin release -- smoke --binary <release build>
+>   --target aarch64-apple-darwin --record <file>`).
+> - End to end on the test tag `v0.1.0-test.1` (run 41983664060; macOS on CI too). It made a draft pre-release with all
+>   seven binaries, `SHA256SUMS`, the provenance and the attestation bundle. After download, all seven checksums
+>   verified, `gh attestation verify` passed (SLSA v1, seven subjects, `release.yml` at the tag) and refused a
+>   tampered copy, and no SDK lane started. Every number is in A-210.
+> - **Owed to Ada:** a release is published only when a maintainer pushes a real tag `v<version>` and publishes its
+>   draft (`docs/publish.md`). The test draft is never to be published.
+> - **Open, found by the smoke test: the anchor aborts when its stderr closes.** `slates anchor 2>&1 >/dev/null | head
+>   -n 1` exits 134 (SIGABRT) once `head` has exited (2026-11-04, this Mac). The next diagnostic line meets EPIPE,
+>   which `eprintln!` turns into a panic, and `panic = "abort"` makes that an abort. The smoke test's own first
+>   version stopped reading the anchor's stderr after the serving line, and 8 of 10 runs aborted. Owed, in
+>   `crates/cli`: a failing test, then diagnostics that survive a closed stderr.
+> - **Not yet:** reproducibility from the tag (AC-9.5: nothing builds twice and compares); the macOS `Slates.app`
+>   bundle, code signing and notarization (B.7; they need an Apple Developer identity); `cargo-binstall` metadata.
+
 > **WinFsp's hold release, DLL version and long paths fixed (2026-11-04, A-206; audit steps 4 and 6).** Run
 > [41978665514](https://github.com/hyper-light/slates/actions/runs/41978665514), `windows-latest` and `windows-11-arm`,
 > with WinFsp 2.1.25156 installed from its pinned URL and SHA-256. Each lane: the whole live suite 13 passed, 1 ignored.
@@ -12512,8 +12538,9 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   `.cargo/config.toml` nor `release.yml` sets `+crt-static` for Windows), `slates.exe` needs `vcruntime140.dll`, which
   Windows does not ship and Nano Server and Server Core images lack: in a process-isolated `nanoserver:ltsc2025` container
   it exits `0xC0000135`, `STATUS_DLL_NOT_FOUND`, before any code runs (CI's `windows-2025`, run 40580524733). Built with
-  `-C target-feature=+crt-static` it runs there whole, the daemon included (run 40582122662). Owed: the release's Windows
-  binaries built with the C runtime linked statically, and a by-use test that the published binary starts in Nano Server.
+  `-C target-feature=+crt-static` it runs there whole, the daemon included (run 40582122662). **Addressed 2026-11-04
+  (A-210):** `release.yml` builds both Windows binaries with `+crt-static`, and the x86_64 one must answer `slates
+  version` in a process-isolated `nanoserver:ltsc2025` container before it may ship. The CI run is recorded in A-210.
 - **A CLI attachment ends about a second after the `slates attach` that made it (open, seen 2026-10-27).** The reaper
   removes a dead client's attachments at the liveness cadence (`crates/server/src/reap.rs`, every 1 s), and each `slates`
   run is a client of its own. So `slates attach`, then `slates write`, then `slates detach`, each a process, races the

@@ -8329,8 +8329,9 @@ ship.
    and landing containment; the tracer run for hermeticity across the whole matrix; power-fail
    landings on real machines (dm-flakey on Linux, a pulled RAM VHD on Windows, a forced restart
    on macOS) checked against the oracle.
-5. Release engineering: the nine-target release, npm and PyPI publishing, plugin package, docs
-   (user docs short in `docs/`, this design and the specs in `docs/wip` promoted).
+5. Release engineering: the seven-target binary release (B.2, A-210; built, smoke-tested and attached to a draft
+   by `release.yml` since 2026-11-04), npm and PyPI publishing, plugin package, docs (user docs short in `docs/`,
+   this design and the specs in `docs/wip` promoted).
 6. The gap ledger reconciled: every open item either closed or carried with an owner.
 
 **Acceptance criteria.**
@@ -8648,21 +8649,27 @@ Evidence: `research/survey-vorpal.md` §0–§9.
   an ABI contract is version-specific, each with a comment saying why; heavy optional features
   documented as "NEVER a default". [C: vorpal crates/ann/Cargo.toml:20-28, crates/index/Cargo.toml:58-61]
 
-### B.2 Target matrix and release recipes (identical to vorpal's)
+### B.2 Target matrix and release recipes (from vorpal's, amended by A-210)
+
+> **Status (2026-11-04, A-210).** `.github/workflows/release.yml` builds the seven targets below natively, smoke-tests
+> each built binary on its own runner (`cargo run -p xtask --bin release -- smoke`), and attaches the binaries, `SHA256SUMS`,
+> `slates-provenance.json` and a Sigstore attestation bundle to a **draft** release. Publishing the draft is the
+> maintainer's one approved step (`docs/publish.md`, "The binary release"). The proof by use on a test tag is recorded
+> in A-210: test tag `v0.1.0-test.1`, run 41983664060, a draft with all seven binaries whose checksums and attestation
+> verify. Reproducibility from the tag (AC-9.5's first clause) is not yet shown: no lane builds twice and compares.
 
 | target | runner | asset name |
 |---|---|---|
 | `aarch64-apple-darwin` | macos-latest | `slates-macos-arm64` |
-| `x86_64-apple-darwin` | macos-latest (cross via `--target`) | `slates-macos-x64` |
 | `x86_64-unknown-linux-gnu` | ubuntu-latest | `slates-linux-x64` |
 | `aarch64-unknown-linux-gnu` | ubuntu-24.04-arm | `slates-linux-arm64` |
-| `x86_64-unknown-linux-musl` | ubuntu-latest, `rust:1.98-alpine` container | `slates-linux-x64-musl` |
-| `aarch64-unknown-linux-musl` | ubuntu-24.04-arm, `rust:1.98-alpine` container | `slates-linux-arm64-musl` |
-| `x86_64-pc-windows-msvc` | windows-latest | `slates-windows-x64.exe` |
-| `aarch64-pc-windows-msvc` | windows-latest (cross via `--target`) | `slates-windows-arm64.exe` |
-| `i686-pc-windows-msvc` | windows-latest (cross via `--target`) | `slates-windows-x86.exe` |
+| `x86_64-unknown-linux-musl` | ubuntu-latest, `rust:1.98.1-alpine` container | `slates-linux-x64-musl` |
+| `aarch64-unknown-linux-musl` | ubuntu-24.04-arm, `rust:1.98.1-alpine` container | `slates-linux-arm64-musl` |
+| `x86_64-pc-windows-msvc` | windows-2025 | `slates-windows-x64.exe` |
+| `aarch64-pc-windows-msvc` | windows-11-arm (native) | `slates-windows-arm64.exe` |
 
-[C: vorpal .github/workflows/release.yml:64-74]
+[C: vorpal .github/workflows/release.yml:64-74; Mac Intel and i686 dropped 2026-10-20 (`eca9423f`); arm64 Windows
+native since GitHub's `windows-11-arm` image (actions/runner-images#14592)]
 
 Recipes to copy verbatim:
 - One raw binary per platform attached to the GitHub release, no archive; `cargo-binstall`
@@ -8676,10 +8683,20 @@ Recipes to copy verbatim:
 - cdylib bindings for musl are built with `-C target-feature=-crt-static` because `+crt-static`
   is rejected for a cdylib; the container is launched with `docker run`, not `container:`, so
   checkout/upload stay on the host. [C: publish-node.yml:60-66]
-- A `guard` job asserts the git tag equals the workspace version. [C: release.yml:40-45]
-- `cargo xtask release-artifacts` writes `SHA256SUMS`, a provenance JSON (git commit, rustc
-  version, per-file sha256, blake3, size), and an ed25519 signature when a CI-secret key is
-  present. [C: xtask/src/main.rs:79-160]
+- A `guard` job asserts the git tag equals the workspace version, or names a test of the lane
+  (`v<version>-test.N`, accepted by the release lane alone; A-210). [C: release.yml:40-45]
+- Windows binaries link the C runtime statically (`+crt-static`), and the x86_64 one must start in a
+  process-isolated Nano Server container, which has no Visual C++ runtime (A-210).
+- The release smoke task (`cargo run -p xtask --bin release -- smoke`) runs each built binary on its own runner before it may ship: version,
+  anchor and daemon start, bootstrap, a volume provisioned, a file written and read by one MCP
+  client and read by a second client, the volume destroyed, the daemon gone with its anchor. It
+  records the digests of the bytes it ran (A-210).
+- The release artifacts task (`cargo run -p xtask --bin release -- artifacts`) refuses a release missing a target or carrying bytes no smoke
+  test ran, and writes `SHA256SUMS` and a provenance JSON (tag, commit, run, and per target the
+  sha256, blake3, size, rustc version, runner image and smoke timings). The signature is GitHub's
+  artifact attestation, keyless through Sigstore with the job's OIDC identity, not an ed25519 key
+  held as a CI secret (A-210). [C: xtask/src/main.rs:79-160, amended]
+- The lane never publishes: it creates a draft release, and a maintainer publishes it (A-210).
 - Weekly scheduled audit re-verifies vendored sources against pinned upstream commits and opens
   one tracking issue on drift; it never edits the tree. [C: grammar-audit.yml:1-13]
 
@@ -12880,6 +12897,73 @@ posted read, `supervise_windows.rs` and `supervise.rs` the Windows wait,
   `a_hold_is_answered_at_its_channels_wake_not_at_the_supervisors_pause` (`crates/anchor/tests/handles_windows.rs`):
   five holds through the real supervisor under a 4 s pause. Measured in BENCHMARKS ("What a WinFsp mount and unmount wait
   for the Windows anchor").
+
+### A-210 — The binary release: seven native targets, each smoke-tested where it was built, attached with checksums and keyless provenance to a draft (accepted 2026-11-04)
+Applied in the same change to: Appendix B.2 (body and status), Phase 9 task 5's status, GAPS (the release row and
+"The Windows binary needs the Visual C++ runtime"), `docs/publish.md`, `.github/workflows/release.yml`,
+`version-guard.yml`, `publish-python.yml`, `publish-node.yml`, `xtask/src/release.rs` and `version.rs`, and
+`crates/cli` (`slates version`).
+- **Why.** `release.yml` had never run (no tag existed, GAPS 2026-10-21): it built the whole workspace for seven
+  triples and attached nothing. Three targets had never been built whole, arm64 Windows was cross-compiled on an
+  x86_64 runner, and the Windows binaries needed a Visual C++ runtime Nano Server lacks.
+- **Natively, per target.** Each target builds on a runner of its own architecture and system (table above), so the
+  binary that ships is also the binary that ran there. Only `-p slates-cli` is built: the binary asks for the codec
+  probe itself (GAPS 2026-10-20), so the product is the same however it is built.
+- **Run before shipped.** The release smoke task (`cargo run -p xtask --bin release -- smoke`) drives the built bytes as a fresh-machine install would
+  (Phase 9's install test, without the attach and tool run, which need a mount bridge not every runner has). The
+  write and the read go through one MCP client, because a `slates attach` and a `slates write` made by two processes
+  race the reaper (GAPS, "A CLI attachment ends about a second after the `slates attach` that made it").
+- **Only tested bytes ship.** The smoke test digests the binary it ran. `release-artifacts` refuses a binary whose
+  SHA-256 differs from its record, and a release missing any target. A partial release cannot be made.
+- **Provenance without a secret.** The ed25519 key B.2 first named would be a secret someone must create and
+  guard. GitHub's artifact attestation signs SLSA build provenance through Sigstore with the job's OIDC identity, and
+  anyone can check it with `gh attestation verify`. `slates-provenance.json` records what the attestation does not:
+  the runner image, the toolchain and the smoke test's steps.
+- **A draft, never a publication.** The lane's last step creates a draft. Publishing it is a maintainer's act, as a
+  landing is a grant's (R10): `gh release edit <tag> --draft=false`.
+- **A test of the lane.** A tag `v<version>-test.N` runs the whole lane on the real code and makes a draft
+  pre-release titled as a test. The SDK publish lanes exclude such tags in their triggers, and their guard refuses
+  them, so a test publishes nothing anywhere.
+- **Proof by use (2026-11-05).** Each binary's smoke steps on its own runner, in ms: version, start to serving,
+  steady answers, bootstrap, provision, the MCP attach–write–read, the second client's read, destroy, departure.
+  - Run 41982329895 (`diag-release-3`, the lane's build matrix without macOS):
+
+    | asset | steps (ms) |
+    |---|---|
+    | `slates-linux-x64` | 20, 326, 387, 20, 20, 24, 20, 20, 27 |
+    | `slates-linux-arm64` | 20, 275, 385, 20, 20, 22, 20, 20, 25 |
+    | `slates-linux-x64-musl` | 20, 340, 387, 20, 20, 22, 20, 20, 26 |
+    | `slates-linux-arm64-musl` | 20, 290, 385, 20, 20, 22, 20, 20, 25 |
+    | `slates-windows-x64.exe` | 25, 1064, 427, 42, 22, 61, 23, 22, 24 |
+    | `slates-windows-arm64.exe` | 35, 590, 414, 26, 25, 41, 26, 26, 27 |
+
+    The Linux rows are from run 41980547276, whose Linux jobs passed and whose Windows jobs failed; they passed again
+    in 41982329895. `ldd` answered "statically linked" (x86_64 musl) and "not a dynamic executable" (arm64 musl), and
+    `slates version` answered `slates 0.1.0` in a process-isolated `nanoserver:ltsc2025`.
+  - macOS arm64 ran on the supervisor's Mac (M5 Max, 2026-11-04, load 12–24): 10 of 10 smoke runs of the release
+    binary passed, start to serving 1.7–2.1 s, provision 184–192 ms, the MCP round trip 213–231 ms. The per-verb cost
+    there (about 200 ms against CI Linux's 20 ms) is the launch of each `slates` process on macOS; it is not measured
+    further here.
+  - **End to end on the test tag `v0.1.0-test.1`** (commit 50bf1a99, run 41983664060, 2026-11-05): guard, the seven
+    builds and the draft release job all passed, and macOS ran on CI too (`macos26` image 20261102.0473.1; steps 28,
+    830, 2030, 162, 81, 132, 98, 172, 87 ms). The draft "TEST v0.1.0-test.1 — test 1 of the release lane, not a
+    release" (draft, pre-release) carries the seven binaries (10,678,272–17,681,808 bytes), `SHA256SUMS`,
+    `slates-provenance.json` and `slates-attestation.sigstore.json`. Downloaded with `gh release download`:
+    - `shasum -a 256 -c SHA256SUMS` answered OK for all seven, and the macOS binary answered `slates 0.1.0`.
+    - `gh attestation verify <file> --repo hyper-light/slates` exited 0, online and with `--bundle`. It verified an
+      SLSA v1 provenance over seven subjects, signed by `release.yml@refs/tags/v0.1.0-test.1` at 50bf1a99.
+    - The same check of a copy with one byte appended exited 1.
+    - The SDK publish lanes did not start on the tag.
+  - This is the first run of the CLI's anchor, volume and MCP path on Windows: `crates/cli/tests/cli.rs` is
+    `cfg(unix)`.
+  - The first Windows run (41980547276) failed in the lane's own tooling. The `xtask` binary does not build on
+    Windows (12 errors: its conformance and KIND tasks use `rustix` and `std::os::unix`), so the release tasks became
+    their own binary, `cargo run -p xtask --bin release`.
+  - The smoke test's own first version stopped reading the anchor's stderr after the serving line, and 8 of 10 runs
+    on this Mac aborted the anchor (the GAPS entry: an anchor whose stderr closes aborts). Fixed in the harness: 10 of
+    10 after.
+- **Not yet.** Reproducibility from the tag (AC-9.5): no lane builds twice and compares. The macOS `Slates.app` bundle
+  (B.7), code signing and notarization (they need Ada's Apple Developer identity). `cargo-binstall` metadata.
 
 ### A-206 — A WinFsp file system is deleted only after the anchor releases its hold, the DLL's version is checked, and slates refuses no path the driver passes (accepted 2026-11-04, audit plan 01a1a34bf7e973069e94f773afdea44a, steps 4 and 6)
 Applied in the same change to: GAPS (the audit entry), §4.6's status through A-198's corrections, `docs/wip/platforms.md`,
