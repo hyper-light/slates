@@ -9,8 +9,11 @@
 > sets the single-client p99. With another shard held for a second, such a call fails `Stalled`. Sending it unawaited,
 > as the async path does (a6c3bc16), passed its test (Stalled before, 3.62 s after) and the whole client package.
 > But 2 of the 4 parked `provision_bench` forms that ran with it stalled a create past the 1 s reply deadline: one on
-> quiet jupiter, one on macOS. Without it, none of 15 did. Reverted in the next commit, cause not found. Owed:
-> the stall's cause, with a test that reproduces it, before the change returns. Also open, from the same macOS runs at
+> quiet jupiter, one on macOS. Without it, none of 15 did. Reverted in the next commit. Since then: a test on main's
+> own client reproduces a stall in 1 run of 10 (two replies in flight, after 64 clients were dropped with one in
+> flight). And the instrumented bench caught the daemon answering no client for ~1.77 s right after 64 clients
+> churned. So the cause is a whole-daemon pause after client churn, load-dependent (none in 10 runs at load 4–8).
+> Owed: the shard and step that pause, then the fix with its test, before the change returns. Also open, from the same macOS runs at
 > load 23–36: the bench's 8- and 64-client forms aborted `Stalled` in every arm, a live daemon slower than the reply
 > deadline. Record: `docs/bugs/2026-11-05-a-call-waited-for-its-acknowledgements-scatter.md`.
 
