@@ -2881,6 +2881,10 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 > nine live CLI tests, one counted captured-request settlement and zero lost drives of twenty on both architectures.
 > The original handle and mapped view follow every successor; both renamed-view cases and all six foreign-rights
 > refusals pass. The native Windows CI lanes permanently run the bridge recovery oracles beside the CLI history.
+> **Status (2026-11-04, A-206).** A file system is deleted only after the anchor answers its release: 0 of 20 unmounts
+> left a drive held on each Windows lane, with the anchor stopped (run 41978665514). A DLL other than 2.1 is refused at
+> mount. Slates refuses no path the WinFsp driver passes: the driver refuses from 8,116 UTF-16 units, measured live on both
+> lanes, and the name reserve is derived from that limit.
 
 **Base reads on macOS and Windows.** As on Linux, the daemon reads untouched base files through its own descriptor or
 handle into evictable cache chunks (one copy, `pread`/`ReadFile` on the owner shard's driver) and
@@ -12827,8 +12831,10 @@ Measurements and run ids are in the GAPS entry.
 - **Slates refuses no path the driver passes.** The goal's first wording, no refusal up to 32,767 units, was restated by the
   supervisor on 2026-11-04, because the driver itself refuses a request past `FSP_FSCTL_TRANSACT_REQ_SIZEMAX`.
   Bug record: `docs/bugs/2026-11-04-a-winfsp-open-past-1024-units-was-refused.md`.
-  - A record's cap, `notify::MAX_PATH_UNITS`, is derived from what the driver passes and held equal, live, to the limit a
-    test measures on the driver. At `MAX_OPEN_HANDLES` the reserve is 2.0 GiB of a `SEC_RESERVE` section per mount.
+  - A record's cap, `notify::MAX_PATH_UNITS` (8,115 units), is derived from what the driver passes and held equal, live, to
+    the limit a test measures on the driver: it refuses from 8,116 units on `windows-latest` and `windows-11-arm`, with
+    `os error 87` (run 41978665514). At `MAX_OPEN_HANDLES` the reserve is 2,133,147,696 bytes of a `SEC_RESERVE` section per
+    mount, made in about 2.2 ms for 4,166,312 bytes of paged pool (jupiter, 3 of 3).
   - Windows commits by the 64 KiB granule, so a record keeps its first 1,024 units in place and the rest in a second
     region: a short path commits what it did.
   - The driver checks no length when a directory's rename lengthens the names beneath it (`FspFileNodeRename`), so a

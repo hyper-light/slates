@@ -1,5 +1,36 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **WinFsp's hold release, DLL version and long paths fixed (2026-11-04, A-206; audit steps 4 and 6).** Run
+> [41978665514](https://github.com/hyper-light/slates/actions/runs/41978665514), `windows-latest` and `windows-11-arm`,
+> with WinFsp 2.1.25156 installed from its pinned URL and SHA-256. Each lane: the whole live suite 13 passed, 1 ignored.
+> - **An unmount the anchor does not answer:** 0 drives held after their unmount of 20 unmounts on each lane, 0 successes
+>   answered while held, 0 mounts refused after a silence, 60 release attempts refused (the test stops the real anchor's
+>   process). A refused mount-time hold is a typed refusal with nothing left mounted, 3 of 3 in one daemon's life, and the
+>   next mount succeeds. On main's code the same tests fail: run 41975090109, `Refused holds` failed on x86_64 and was still
+>   running on arm64 when read, and that run printed no counts. Dropping the pipe at a deadline fails the native channel
+>   test on jupiter. Record: `docs/bugs/2026-11-04-a-refused-hold-release-left-a-drive-held.md`.
+> - **The DLL's version:** a DLL other than 2.1 is refused at mount with its version in the words. Red-check run
+>   [41977593496](https://github.com/hyper-light/slates/actions/runs/41977593496), `CHECKED_VERSION` changed to 2.2:
+>   `the WinFsp DLL's version 2.1 is not 2.2`, on the real DLL. Record:
+>   `docs/bugs/2026-11-04-the-winfsp-guard-read-a-field-winfsp-always-zeroes.md`.
+> - **Long paths, criterion restated by the supervisor on 2026-11-04.** The goal asked for 0 refused between 1,025 and
+>   32,767 units. The driver itself refuses part of that range, so it now reads: **slates refuses no path the WinFsp driver
+>   passes.** Measured live by halving, on both lanes: **the driver refuses from 8,116 UTF-16 units.** 8,115 units and the
+>   ladder 1,025, 1,026, 2,000, 4,000 and 8,000 are created, read back and reopened through slates. 8,116 with its parents
+>   in place answers the driver's `os error 87`, where slates could only answer not found. The reserve's
+>   `MAX_PATH_UNITS` is derived from the driver's request bound, and the test holds it equal to the measurement. 32,761
+>   units, the longest a drive letter can name, answers 206 above the driver. A 2,000-unit path is created, opened, read
+>   and kept through a killed daemon on both lanes, its old view following the successor's change. Main's code fails the
+>   long-path step on both lanes (41975090109). Reserve at 65,536 slots on jupiter, 3 of 3: 2,133,147,696 bytes of
+>   section, about 2.2 ms to make, 4,166,312 bytes of paged pool per mount. Record:
+>   `docs/bugs/2026-11-04-a-winfsp-open-past-1024-units-was-refused.md`.
+> - **Owed:** a live test of the rename a held name would outgrow (unit-tested only, `rename_fits`: the driver also limits
+>   renames over open descendants, so a live case is not dependable). The Windows anchor parks up to 500 ms between looks at
+>   the hold channel, where Unix wakes on it, so each mount and unmount can wait that long on a healthy anchor.
+> - **Changed for everyone:** a detach of a WinFsp drive can now answer `TargetUnavailable`, and CI's WinFsp is pinned: a new
+>   minor version is refused until the receiver's layout is reviewed. Gates: Ubuntu job of 41978665514 (fmt, workspace
+>   clippy, `xtask check`, docs).
+
 > **Audit of 2dc9f3eb..98000d56 (2026-11-03): defects open, Step 9's evidence holds.** Nine commits made on
 > 2026-11-01 and 2026-11-02 were read line by line against this file's rules and Step 9's acceptance. Every CI run they
 > cite was read again: each shows what it is cited for, except one pair of timings A-198 gave the wrong way
@@ -15,13 +46,14 @@
 > - **The Windows anchor ends on one malformed or short hold message (A-198).** The refusal propagates out of
 >   `Supervisor::step` and ends the anchor, whose kill-on-close job then takes every held drive. Unix counts such
 >   refusals.
-> - **A refused hold release leaves a held drive (A-198).** The unmount deletes the file system after the release is
->   refused, so the anchor keeps the volume and its drive letter with no daemon serving them
->   (`crates/server/src/winfsp.rs`, `release_hold` and `reap`).
+> - **A refused hold release leaves a held drive (A-198): fixed 2026-11-04 (A-206, run 41978665514; the entry above).** The
+>   unmount deleted the file system after the release was refused, so the anchor kept the volume and its drive letter
+>   with no daemon serving them (`crates/server/src/winfsp.rs`, `release_hold` and `reap`).
 > - **A refused view leaks the held section's handle** (`crates/mem/src/shared.rs`, Windows `from_held_handle`).
-> - **The receiver's WinFsp guard checks a field WinFsp always zeroes** (`FileSystem.Version`), not the DLL's version
->   (`FspVersion`). Also, an open whose path is longer than 1024 UTF-16 units is now refused, because every open records
->   its kernel name in the held ledger (`crates/bridge-winfsp/src/opens/names.rs`).
+> - **The receiver's WinFsp guard checks a field WinFsp always zeroes: fixed 2026-11-04 (A-206, runs 41978665514 and
+>   41977593496; the entry above).** It read `FileSystem.Version`, not the DLL's version (`FspVersion`). Also, an open whose
+>   path was longer than 1024 UTF-16 units was refused, because every open records its kernel name in the held ledger
+>   (`crates/bridge-winfsp/src/opens/names.rs`); now slates refuses no path the driver passes.
 > - **The receiver that replaced WinFsp's dispatcher is unmeasured.** It is one thread with a new event per control
 >   transaction, where the DLL dispatcher ran two threads; BENCHMARKS has no entry for it.
 > - **Two failures recorded open below are still unfixed**: the wake-learning fixture under load and the fleet routing

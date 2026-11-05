@@ -61,7 +61,7 @@ pub const NOTIFY_INFO_ALIGNMENT: usize = 8;
 /// Derived: the longest name the WinFsp driver passes to a file system, in UTF-16 units: a request's maximum less its
 /// fixed part and the name's terminator (`FspIopCreateRequestFunnel`, `src/sys/iop.c`). Measured live against the driver
 /// on both Windows lanes (`opens_past_a_thousand_units_are_refused_only_by_the_winfsp_driver` in
-/// `crates/cli/tests/winfsp.rs`, which asserts this value; the runs are in `docs/wip/GAPS.md`), so the name reserve
+/// `crates/cli/tests/winfsp.rs`, which asserts this value: 8,115, refused from 8,116, run 41978665514), so the name reserve
 /// follows the driver and not a guess. `FSP_FSCTL_TRANSACT_PATH_SIZEMAX`'s 1024 units limits only a response's normalized
 /// name and a relative notification, neither of which this host sends. The driver checks no length when a directory's
 /// rename lengthens the names beneath it, so a rename that would pass this is refused ([`OpenNames::rename_fits`]).

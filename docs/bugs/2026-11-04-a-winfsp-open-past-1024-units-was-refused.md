@@ -7,7 +7,7 @@
 ## Description
 
 Since A-198, every open records its kernel name in the held ledger before Windows gets its context. The ledger's record
-ended at 1,024 UTF-16 units, so every open past that was answered `STATUS` of `VfsError::RecoveryIncomplete`, on paths
+ended at 1,024 UTF-16 units, so every open past that was refused with `VfsError::RecoveryIncomplete`'s status, on paths
 that worked before A-198.
 
 ## Root cause
@@ -22,23 +22,30 @@ round (which left the name out, so another path's change never reached its node)
 
 ## The fix
 
-- `MAX_PATH_UNITS` is Windows' own limit, 32,767 units: `UNICODE_STRING.Length` is a `USHORT` of bytes. A held name can
-  reach it by a directory rename, whatever the driver admitted at its open.
+- `MAX_PATH_UNITS` is derived from the driver's own bound: a request's maximum less its fixed part and the name's
+  terminator, 8,115 units. The live test measures the limit and holds this equal to it.
+- The driver checks no length when a directory's rename lengthens the names beneath it (`FspFileNodeRename`), so a rename
+  that would take a held name past the cap is refused `STATUS_NAME_TOO_LONG` before it has any effect
+  (`OpenNames::rename_fits`). Such a name could not be opened again through the driver anyway. This is unit-tested only:
+  the driver also limits renames over open descendants, so a live case is not dependable.
 - A record keeps its first 1,024 units in place and the rest in a second region, with the checksum over both. Windows
   commits by the 64 KiB granule, so a short path commits what it did before, and a read commits nothing past the name's
-  own length. The reserve is 8.6 GiB of address space per mount at `MAX_OPEN_HANDLES` (65,536 slots, two versions).
-  The ledger's format is `WFO4`.
-- A notification record is limited only by its 16-bit `Size`, 32,761 units. A longer name, reachable only by renames, is
-  counted in `winfsp.names_too_long`, as before.
+  own length. The reserve is 2,133,147,696 bytes of a `SEC_RESERVE` section per mount at `MAX_OPEN_HANDLES` (65,536 slots,
+  two versions), made in about 2.2 ms for 4,166,312 bytes of paged pool (jupiter, 2026-11-04, 3 of 3). The ledger's format
+  is `WFO4`.
+- A notification record is limited only by its 16-bit `Size`, 32,761 units, far past any name held.
 
-## What cannot be reached
+## The criterion, restated
 
-**The goal says 0 refused between 1,025 and 32,767 units. The WinFsp driver itself refuses part of that range, before any
-request reaches a file system.** `FspIopCreateRequestFunnel` answers `STATUS_INVALID_PARAMETER` when the request's fixed
-part and its name pass `FSP_FSCTL_TRANSACT_REQ_SIZEMAX`, about 8,100 units. And a name through a drive letter cannot pass
-32,761 units, since `\??\X:` shares the `UNICODE_STRING`. slates cannot change either without changing WinFsp. So this fix
-holds slates' own refusals in that range to 0, and the live ladder records where the driver's begins. See the entry at
-the top of `docs/wip/GAPS.md` for the measured figure and run ids.
+The goal said 0 refused between 1,025 and 32,767 units. The WinFsp driver itself refuses part of that range before any
+request reaches a file system: `FspIopCreateRequestFunnel` answers `STATUS_INVALID_PARAMETER` when the request's fixed part
+and its name pass `FSP_FSCTL_TRANSACT_REQ_SIZEMAX`. The supervisor restated it on 2026-11-04 as **slates refuses no path the
+WinFsp driver passes.**
+
+Measured live by halving on `windows-latest` and `windows-11-arm`, run 41978665514, WinFsp 2.1.25156: **the driver refuses
+from 8,116 UTF-16 units**, as the source predicts. 8,115 units round-trip through slates. 8,116 with its parents in place
+answers `os error 87`, where slates could only answer not found. 32,761 units, the longest a drive letter can name, answers
+206 (`ERROR_FILENAME_EXCED_RANGE`) above the driver.
 
 ## Evidence
 

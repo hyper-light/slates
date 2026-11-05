@@ -18,7 +18,7 @@ passed every DLL. It also ran after `FspFileSystemCreate`, through the very layo
 ## Impact
 
 Any WinFsp other than the version the receiver was read from was driven through the wrong offsets, which is memory
-corruption. CI's `choco install winfsp` is unpinned, so a new WinFsp release could have reached it silently.
+corruption. CI's `choco install winfsp` was unpinned, so a new WinFsp release could have reached it silently.
 
 ## The fix
 
@@ -31,8 +31,8 @@ number in the words.
 protects, and WinFsp keeps it within a minor version (from memory, flagged for review at the next upgrade).
 
 **What this makes of an upgrade:** a new WinFsp minor version on a runner or a user's machine refuses every mount until
-the receiver's layout is reviewed and `CHECKED_VERSION` raised. That is the intent of the goal. It means CI's unpinned
-`choco install winfsp` will turn the Windows lanes red on the day upstream ships one.
+the receiver's layout is reviewed and `CHECKED_VERSION` raised. That is the intent of the goal. CI now installs WinFsp from an exact URL checked against its SHA-256, so that
+happens on the day the pin is raised, not on the day upstream ships one.
 
 ## Evidence
 
