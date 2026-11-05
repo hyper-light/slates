@@ -12936,7 +12936,8 @@ Status: built 2026-11-05. It amends A-74's turn.
 - Measured (BENCHMARKS, "The large-file NFS write profiled"): through Linux's NFSv4.2 client on the incumbent harness,
   interleaved on one CI runner (run 41989095517), the large write's best of nine went 441.3 → 472.2 MiB/s and +26% at
   16 workers, with write p99s no worse; in process, 1,644–1,799 → 1,780–1,984 MiB/s over NFSv4.2.
-- Owed: the same A/B on the incumbent client (Docker on the M5 Max).
+- On the incumbent client (Docker on the M5 Max, six interleaved rounds at load 23–38) the medians rose 7–9% and the
+  arms overlapped: best of eighteen 1,019.0 on main, 1,007.8 with the change.
 
 ### A-198 — A WinFsp mount outlives its daemon: the anchor holds the volume's control handle, the drive's link and the mount's ledger, and the next daemon serves the held volume (accepted 2026-11-01, Step 9 of the VFS and DAX plan; built and measured 2026-11-02)
 Applied in the same change to: GAPS (gap 2 of the platform inventory). The build applies it to §4.6 "Windows",

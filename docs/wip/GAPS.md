@@ -9,8 +9,9 @@
 > run 41978355633); after A-105's idle purge gives them back it falls to 874–957. The harness never deletes its
 > large files, so it always writes fresh pages. BENCHMARKS, "The large-file NFS write profiled".
 > - **Landed:** a turn takes only the records its quantum can reach (A-204): best of nine through Linux's
->   client on CI, 441.3 → 472.2 MiB/s, and +26% at 16 workers (run 41989095517). Owed: the A/B on the incumbent
->   Mac, which kiln could not reach for most of 2026-11-05.
+>   client on CI, 441.3 → 472.2 MiB/s, and +26% at 16 workers (run 41989095517). On the incumbent Mac (six interleaved
+>   rounds, load 23–38) its medians rose 7–9% and its best was 1,007.8 MiB/s, but main's best was 1,019.0: both clear
+>   967 there and the arms overlap, while nfsd wrote 868–1,990.
 > - **Tried and not taken:** populating fresh pages in batches (`MADV_POPULATE_WRITE` per 64 KiB or 1 MiB: 1,221–1,269
 >   against 1,293–1,305 MiB/s by plain faults) and populating ahead on a second thread (972–1,006: the two threads
 >   contend), run 41987962954.
