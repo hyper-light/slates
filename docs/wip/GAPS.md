@@ -1,6 +1,6 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
-> **The binary release lane (2026-11-04, A-199, Appendix B.2).** `release.yml` now builds `slates` natively for
+> **The binary release lane (2026-11-04, A-210, Appendix B.2).** `release.yml` now builds `slates` natively for
 > seven targets: macOS arm64, Linux x86_64 and arm64 (glibc, and static musl), and Windows x86_64 and arm64 with the C
 > runtime linked statically. It runs each built binary on its own runner (`cargo xtask release-smoke`: version, anchor
 > and daemon start, bootstrap, a volume provisioned, a file written and read by one MCP client and read by a second
@@ -9,7 +9,7 @@
 > maintainer's step (`docs/publish.md`, "The binary release").
 > - Proven on this Mac (M5 Max, 18 cores, 2026-11-04, load 12–24): the release binary passed 10 of 10 smoke runs.
 >   Start to serving took 1.8 s, a provision 184 ms and the MCP round trip 231 ms (`cargo xtask release-smoke --binary
->   <release build> --target aarch64-apple-darwin --record <file>`). The proof on a test tag is recorded in A-199.
+>   <release build> --target aarch64-apple-darwin --record <file>`). The proof on a test tag is recorded in A-210.
 > - **Open, found by the smoke test: the anchor aborts when its stderr closes.** `slates anchor 2>&1 >/dev/null | head
 >   -n 1` exits 134 (SIGABRT) once `head` has exited (2026-11-04, this Mac). The next diagnostic line meets EPIPE,
 >   which `eprintln!` turns into a panic, and `panic = "abort"` makes that an abort. The smoke test's own first
@@ -12409,8 +12409,8 @@ daemon's NFS port, red-checked for the sweep, the barrier and the detach. §4.6 
   Windows does not ship and Nano Server and Server Core images lack: in a process-isolated `nanoserver:ltsc2025` container
   it exits `0xC0000135`, `STATUS_DLL_NOT_FOUND`, before any code runs (CI's `windows-2025`, run 40580524733). Built with
   `-C target-feature=+crt-static` it runs there whole, the daemon included (run 40582122662). **Addressed 2026-11-04
-  (A-199):** `release.yml` builds both Windows binaries with `+crt-static`, and the x86_64 one must answer `slates
-  version` in a process-isolated `nanoserver:ltsc2025` container before it may ship. The CI run is recorded in A-199.
+  (A-210):** `release.yml` builds both Windows binaries with `+crt-static`, and the x86_64 one must answer `slates
+  version` in a process-isolated `nanoserver:ltsc2025` container before it may ship. The CI run is recorded in A-210.
 - **A CLI attachment ends about a second after the `slates attach` that made it (open, seen 2026-10-27).** The reaper
   removes a dead client's attachments at the liveness cadence (`crates/server/src/reap.rs`, every 1 s), and each `slates`
   run is a client of its own. So `slates attach`, then `slates write`, then `slates detach`, each a process, races the

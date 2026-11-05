@@ -8294,7 +8294,7 @@ ship.
    and landing containment; the tracer run for hermeticity across the whole matrix; power-fail
    landings on real machines (dm-flakey on Linux, a pulled RAM VHD on Windows, a forced restart
    on macOS) checked against the oracle.
-5. Release engineering: the seven-target binary release (B.2, A-199; built, smoke-tested and attached to a draft
+5. Release engineering: the seven-target binary release (B.2, A-210; built, smoke-tested and attached to a draft
    by `release.yml` since 2026-11-04), npm and PyPI publishing, plugin package, docs (user docs short in `docs/`,
    this design and the specs in `docs/wip` promoted).
 6. The gap ledger reconciled: every open item either closed or carried with an owner.
@@ -8614,13 +8614,13 @@ Evidence: `research/survey-vorpal.md` §0–§9.
   an ABI contract is version-specific, each with a comment saying why; heavy optional features
   documented as "NEVER a default". [C: vorpal crates/ann/Cargo.toml:20-28, crates/index/Cargo.toml:58-61]
 
-### B.2 Target matrix and release recipes (from vorpal's, amended by A-199)
+### B.2 Target matrix and release recipes (from vorpal's, amended by A-210)
 
-> **Status (2026-11-04, A-199).** `.github/workflows/release.yml` builds the seven targets below natively, smoke-tests
+> **Status (2026-11-04, A-210).** `.github/workflows/release.yml` builds the seven targets below natively, smoke-tests
 > each built binary on its own runner (`cargo xtask release-smoke`), and attaches the binaries, `SHA256SUMS`,
 > `slates-provenance.json` and a Sigstore attestation bundle to a **draft** release. Publishing the draft is the
 > maintainer's one approved step (`docs/publish.md`, "The binary release"). The proof by use on a test tag is recorded
-> in A-199. Reproducibility from the tag (AC-9.5's first clause) is not yet shown: no lane builds twice and compares.
+> in A-210. Reproducibility from the tag (AC-9.5's first clause) is not yet shown: no lane builds twice and compares.
 
 | target | runner | asset name |
 |---|---|---|
@@ -8648,19 +8648,19 @@ Recipes to copy verbatim:
   is rejected for a cdylib; the container is launched with `docker run`, not `container:`, so
   checkout/upload stay on the host. [C: publish-node.yml:60-66]
 - A `guard` job asserts the git tag equals the workspace version, or names a test of the lane
-  (`v<version>-test.N`, accepted by the release lane alone; A-199). [C: release.yml:40-45]
+  (`v<version>-test.N`, accepted by the release lane alone; A-210). [C: release.yml:40-45]
 - Windows binaries link the C runtime statically (`+crt-static`), and the x86_64 one must start in a
-  process-isolated Nano Server container, which has no Visual C++ runtime (A-199).
+  process-isolated Nano Server container, which has no Visual C++ runtime (A-210).
 - `cargo xtask release-smoke` runs each built binary on its own runner before it may ship: version,
   anchor and daemon start, bootstrap, a volume provisioned, a file written and read by one MCP
   client and read by a second client, the volume destroyed, the daemon gone with its anchor. It
-  records the digests of the bytes it ran (A-199).
+  records the digests of the bytes it ran (A-210).
 - `cargo xtask release-artifacts` refuses a release missing a target or carrying bytes no smoke
   test ran, and writes `SHA256SUMS` and a provenance JSON (tag, commit, run, and per target the
   sha256, blake3, size, rustc version, runner image and smoke timings). The signature is GitHub's
   artifact attestation, keyless through Sigstore with the job's OIDC identity, not an ed25519 key
-  held as a CI secret (A-199). [C: xtask/src/main.rs:79-160, amended]
-- The lane never publishes: it creates a draft release, and a maintainer publishes it (A-199).
+  held as a CI secret (A-210). [C: xtask/src/main.rs:79-160, amended]
+- The lane never publishes: it creates a draft release, and a maintainer publishes it (A-210).
 - Weekly scheduled audit re-verifies vendored sources against pinned upstream commits and opens
   one tracking issue on drift; it never edits the tree. [C: grammar-audit.yml:1-13]
 
@@ -12811,7 +12811,7 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
 
-### A-199 — The binary release: seven native targets, each smoke-tested where it was built, attached with checksums and keyless provenance to a draft (accepted 2026-11-04)
+### A-210 — The binary release: seven native targets, each smoke-tested where it was built, attached with checksums and keyless provenance to a draft (accepted 2026-11-04)
 Applied in the same change to: Appendix B.2 (body and status), Phase 9 task 5's status, GAPS (the release row and
 "The Windows binary needs the Visual C++ runtime"), `docs/publish.md`, `.github/workflows/release.yml`,
 `version-guard.yml`, `publish-python.yml`, `publish-node.yml`, `xtask/src/release.rs` and `version.rs`, and
