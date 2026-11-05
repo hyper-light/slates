@@ -1,5 +1,29 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Shards counted hardware threads as cores (2026-11-05, A-208, §4.1, R9; fixed, its A/B owed).** §4.1 counts shards in
+> physical cores, but the placement counted logical CPUs. jupiter's 16 two-thread cores therefore ran 31 shards and
+> left its spinning clients one thread: provisioning p99 123.6 µs against R9's 50 µs (Windows x86_64, 06:35 UTC). The
+> facts now name each CPU's physical core (`CoreFacts::physical`), and the placement fixes one shard per core, on its
+> first thread. A unit test failed before the fix (31 against 15) and passes after, and the placement oracle covers
+> three sibling layouts. Owed: the interleaved before/after `provision_bench` on a two-thread-per-core machine. Also
+> owed: Windows core classes, still unread. Record: `docs/bugs/2026-11-05-shards-counted-hardware-threads-as-cores.md`.
+
+> **A create's cost grows with its shard's volumes, twice over (2026-11-05, R9; OPEN).** Both are measured on macOS
+> arm64 by `xctrace` on `provision_bench`.
+> - **Every mutating verb re-walks its shard.** `publish_delta_into` (`crates/server/src/verbs.rs`) sorts and checks
+>   every volume on the shard and rebuilds the id sets of all of them. With creates kept alive (2,000 a run over 5
+>   shards), a create's median climbs from 76–95 µs over the first 200 to 154–157 µs over the last 200, and
+>   `publish_shard` holds 1,591 of the 1,820 samples in `run_recorded`. The function's doc already names an
+>   incremental publish as owed (`recovery.md`).
+> - **Every new volume scans every key its shard ever made.** `ShardCipher::register`
+>   (`crates/server/src/content_cipher.rs`) looks keys up by a linear scan of a vector that gains a key per volume
+>   and never loses one, not even at destroy. So the scan and the memory grow without bound over a daemon's life. In
+>   the full histogram (about 440,000 creates), the scan holds 24,052 of the 26,986 samples inside the server's
+>   `create`.
+>
+> The 1-client spinning row is flat across a run (first-200 and last-200 medians 45–80 µs). There the server's create
+> is about 7 µs of service, and the rest of its 65 µs median is time no thread is serving it. That is open too.
+
 > **WinFsp's hold release, DLL version and long paths fixed (2026-11-04, A-206; audit steps 4 and 6).** Run
 > [41978665514](https://github.com/hyper-light/slates/actions/runs/41978665514), `windows-latest` and `windows-11-arm`,
 > with WinFsp 2.1.25156 installed from its pinned URL and SHA-256. Each lane: the whole live suite 13 passed, 1 ignored.

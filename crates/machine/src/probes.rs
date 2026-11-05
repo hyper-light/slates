@@ -1066,6 +1066,7 @@ mod tests {
         level: 0,
         numa: 0,
         l2_bytes: 0,
+        physical: id,
       })
       .collect();
     let pairs = pair_list(&cores);
