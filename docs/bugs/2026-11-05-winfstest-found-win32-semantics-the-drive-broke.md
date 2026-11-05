@@ -68,21 +68,18 @@ wrote.
   with all four: the seven tests pass on both (the four, the directory replace, and the two extension replays below).
 - winfstest with the fixes: 628 cases, 254 passed, 374 failed and every one listed; before them 384 failed.
 
-## Open: fsx over the drive wedges at its operation 164
+## Open: fsx wedges over the drive
 
-The WinFsp fsx port at seed 1 completes 163 operations over the drive and then waits until the step's bound ends it
-(`signal 2`, `testcalls = 163`), on both architectures (runs 41984660605, 41989365843, 41993895943). Operation 164 is a
-`TRUNCATE UP` from 158,132 to 246,956 bytes, made by the C runtime's `_chsize`, which writes zeros from the end; 163 was
-a `TRUNCATE DOWN` from 234,244 bytes, and 162 a cached write at 205,924 whose bytes had not yet reached the bridge. The
-bridge's log shows no request at all after the shrink's `SetFileSize`, so the wait is inside Windows, below the single
-WinFsp receiver (A-198), not in a slates callback. The same four operations replayed alone through `SetEndOfFile` and
-through zero writes complete (`a_file_shrunk_then_extended_by_its_end_reaches_the_size`,
-`a_file_shrunk_then_extended_by_zero_writes_reaches_the_size`), so the wedge needs fsx's earlier history, its mapped
-views among it. Owed to the WinFsp dispatcher's owners; the fsx cell stays failed until then.
-
-## Siblings
-
-- The creation time cannot be set: the bridge's attributes carry no birth time (it reports the change time) and the
-  volume has no setter. Stated as a difference (A-214, CREATION-TIME), not fixed here.
-- The attribute bits `SetBasicInfo` and `Create` receive (READONLY, HIDDEN, SYSTEM, ARCHIVE) are not kept: a stated
-  difference (A-214, ATTRIBUTES). A read-only file deletes and is replaced (`t/base/01.t` 13, `t/base/04.t` 10).
+The WinFsp fsx port at seed 1 stops making progress over the drive and waits until its bound ends it, on both
+architectures. It stops at an extension that follows a cached write past a hole and a shrink below it: operations 41 to
+43 (`WRITE` at 179,148 with a hole, `TRUNCATE DOWN` to 103,304, `TRUNCATE UP` to 249,552) in runs 42053543593 and
+42057887707, operations 162 to 164 in runs 41989365843 and 41993895943, and 238 on main's bridge in run 41984660605.
+The point moves between runs, so it is a race. Timed: operations 1 to 42 took 295 ms in all, and then nothing (run
+42057887707's per-line timings). The bridge's timed log shows the shrink's `SetFileSize` and then no request at all for
+299.9 s, until the bound's kill made Windows flush one page: the extension's first zero block never produced its
+`SetFileSize`, so the wait is inside Windows' write path, below the single WinFsp receiver (A-198), not in a slates
+callback answering. The same operations replayed alone through `SetEndOfFile` and through zero writes complete
+(`a_file_shrunk_then_extended_by_its_end_reaches_the_size`, `a_file_shrunk_then_extended_by_zero_writes_reaches_the_size`),
+so the race needs fsx's history, its mapped views among it. Owed to the WinFsp dispatcher's owners. Until it is fixed
+the fsx cell fails, listed as `fsx-seed-1-unfinished:10000` with this reason; every fsx run now has a 300 s bound, so
+the lane ends.
