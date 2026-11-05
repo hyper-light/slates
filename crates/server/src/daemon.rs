@@ -3639,6 +3639,10 @@ async fn seal_idle_content() {
     state::with_state(|s| s.store.content.arena().deferred_bytes() > 0).unwrap_or(false);
   if sealed_this_tick > 0 || deferred {
     let _ = state::with_state_counted(crate::verbs::publish_shard);
+    // The idle test asks whether the arena allocated since the previous tick, so this tick, which ends here, records
+    // what it saw (A-214): read only when the purge next ran, it charged the sweep's own allocations to the next tick,
+    // and an idle shard reached its purge and its reserve's refill a whole tick later than its idleness.
+    let _ = state::with_state(|s| s.purge_seen_allocations = s.store.content.arena().allocations());
     return;
   }
   purge_if_idle().await;
