@@ -817,3 +817,5 @@ slates-server: shard 0 initialized in 4895 µs
 slates daemon: a heartbeat came 644 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 1 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 2 timers, waited 1 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 276 ms and its timer overrun 544 ms
 slates daemon: a heartbeat came 700 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 1 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 2 timers, waited 1 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 276 ms and its timer overrun 600 ms
 ## run 5 of 5 done, 2026-11-05T08:41:05Z
+To https://github.com/hyper-light/slates
+   4c40e8a..d1a03e8  d1a03e857506cf047c607b183fe1399b0e2359fb -> diag-winfsp-bench-results-41989009852-windows-11-arm
