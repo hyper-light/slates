@@ -100,14 +100,24 @@ pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     bounds.fsx_seed.to_string(),
     fetch::FSX_LENGTH_FLAG.to_owned(),
     bounds.fsx_file_length.to_string(),
-    "-q".to_owned(),
+    "-v".to_owned(),
     "-P".to_owned(),
     super::plain_path(&logs),
     // Relative to the work directory: fsx names its .fsxgood/.fsxlog files `<-P dir>/<fname>.…`,
     // so an absolute fname would nest one absolute path under another.
     "fsx.bin".to_owned(),
   ];
-  let (success, output) = run_capturing(&built.binary, &args, &work)?;
+  // DIAGNOSTICS ONLY: the trace goes to a file the artifact keeps, so a run cut short still shows its last operation.
+  #[allow(clippy::disallowed_methods)]
+  let trace = std::fs::File::create(logs.join("fsx-trace.txt")).map_err(|e| Failure(e.to_string()))?;
+  let status = Command::new(&built.binary)
+    .args(&args)
+    .current_dir(&work)
+    .stdin(Stdio::null())
+    .stdout(Stdio::from(trace))
+    .status()
+    .map_err(|e| Failure(e.to_string()))?;
+  let (success, output) = (status.success(), std::fs::read_to_string(logs.join("fsx-trace.txt")).unwrap_or_default());
   let verdict = fsx_verdict(success, &output, bounds.fsx_operations);
   let mut notes = vec![
     built.note,
