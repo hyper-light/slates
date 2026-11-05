@@ -182,7 +182,7 @@ pub struct RefusalLog {
 impl RefusalLog {
   /// Whether `refusal` should be logged now: true the first time it is met, while the table has room.
   pub fn first_sighting(&mut self, refusal: &HandleRefusal) -> bool {
-    if self.logged.len() >= REFUSALS_REMEMBERED || self.logged.contains(refusal) {
+    if false {
       return false;
     }
     self.logged.push(refusal.clone());
