@@ -1,0 +1,73 @@
+name: diag-clients
+
+# Diagnostics only, never on main: an interleaved before/after of the provisioning histogram on every platform the
+# clients agent cannot reach from its own machine (macOS is measured natively there). Before is BEFORE_SHA, after is
+# the pushed commit; the arms alternate, three rounds.
+on:
+  push:
+    branches: ["diag-clients-*"]
+
+env:
+  CARGO_TERM_COLOR: always
+  BEFORE_SHA: 21da6e57ab574ba44bfbd15aa45e11540ff655a7
+
+jobs:
+  ab:
+    name: provisioning before/after (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: The runner and its cores
+        run: |
+          uname -a || true
+          date -u
+          if command -v lscpu >/dev/null; then lscpu | grep -E 'Model name|^CPU\(s\)|Thread|Core|Socket' || true; fi
+          for cpu in /sys/devices/system/cpu/cpu[0-9]*; do
+            [ -r "$cpu/topology/thread_siblings_list" ] && echo "$(basename "$cpu"): $(cat "$cpu/topology/thread_siblings_list")"
+          done
+          if command -v powershell >/dev/null; then
+            powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Format-List Name,NumberOfCores,NumberOfLogicalProcessors"
+          fi
+          uptime || true
+      - name: Build after (this commit)
+        run: |
+          cargo build --release --locked -p slates-client --example provision_bench
+          mkdir -p ../arms && cp target/release/examples/provision_bench* ../arms/ && mv ../arms/provision_bench ../arms/after 2>/dev/null || mv ../arms/provision_bench.exe ../arms/after.exe
+          rm -f ../arms/provision_bench.d ../arms/provision_bench.pdb
+          ls -la ../arms
+      - name: Build before
+        run: |
+          git worktree add ../before "$BEFORE_SHA"
+          cd ../before
+          CARGO_TARGET_DIR=../target-before cargo build --release --locked -p slates-client --example provision_bench
+          cp ../target-before/release/examples/provision_bench* ../arms/ && { mv ../arms/provision_bench ../arms/before 2>/dev/null || mv ../arms/provision_bench.exe ../arms/before.exe; }
+          rm -f ../arms/provision_bench.d ../arms/provision_bench.pdb
+          ls -la ../arms
+      - name: Three rounds, before and after alternating
+        run: |
+          for round in 1 2 3; do
+            for arm in before after; do
+              echo "== round $round: $arm at $(date -u +%H:%M:%S) UTC; $(uptime 2>/dev/null || echo 'no load average')"
+              status=0
+              ../arms/$arm || status=$?
+              echo "== round $round: $arm exit $status"
+            done
+          done
