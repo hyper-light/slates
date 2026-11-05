@@ -13,8 +13,12 @@
 > nothing delivered (`src/sys/driver.h:954-955`, `src/sys/ioq.c:617`, `volume.c:1181-1185`), provided the receiver reads
 > the cancellation as "nothing delivered".
 
-> **WinFsp: a second receive worker would help only rename and unlink, and needs a crash proof first (2026-11-05, audit
-> step 7; lever, not planned).** Tracing every IRP on both arms (diagnostics runs 42086968194, 42091919319 and
+> **WinFsp: a second receive thread would win arm64's remaining ~9 us an IRP and cost x86_64 ~7, and needs a crash
+> proof first (2026-11-05, audit step 7; lever, not planned).** Measured with the open-cost harness (run 42123092900,
+> BENCHMARKS "What a successful open costs under each serving pattern"). arm64: two waiting threads serve a client's
+> open-and-close in 671.9-688.2 us against one thread's 700.9-714.7 us, 8-10 us an IRP. That is the remainder against
+> the DLL, whose two dispatchers wait in turn. x86_64: 146.3-149.3 us against 124.3-134.9 us, about 7 us an IRP slower.
+> Earlier finding, same entry: Tracing every IRP on both arms (diagnostics runs 42086968194, 42091919319 and
 > 42097182526) rejected the two-worker hypothesis for create, stat and open. 71cf09ac's DLL runs one operation at a time
 > under its coarse guard (WinFsp v2.1 `src/dll/fsop.c:80-82`). It saw a request arrive while another was served for about
 > 1 in 10,000 Creates in create and open, and 46 of 10,010 in stat (arm64, quiet). Our receiver got 39,918 of its 39,999

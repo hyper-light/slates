@@ -9581,3 +9581,70 @@ kill $anchor 2>/dev/null; sleep 1; kill -9 $anchor 2>/dev/null
 for p in $(pgrep -f "instance $instance"); do kill -9 $p 2>/dev/null; done
 sleep 0.5; echo "left: $(pgrep -f "instance $instance" | tr '\n' ' ')" >> $dir/chaos-$tag.pids
 ```
+
+### What a successful open costs under each serving pattern: arm64's remainder is the DLL's second waiting thread (2026-11-05)
+
+**The question (the supervisor's).** Does completing our open cost the kernel more than the DLL's, or is the time on the
+application's side? Our open response differs from 71cf09ac's only in `UserContext2`: a ledger token where the DLL arm
+had a heap pointer. `file_info` is the same code, and so is the security descriptor, `O:BAG:BAD:P(A;;FA;;;WD)` from
+`get_security_by_name`.
+
+**The command.**
+
+```
+WINFSP_TEST_MOUNT=1 cargo +1.98.1 test --release -p slates-bridge-winfsp --lib -- --ignored --exact \
+  host::transact_bench::open_cost --nocapture
+```
+
+`open_cost` (`crates/bridge-winfsp/tests/support/transact.rs`) mounts a WinFsp volume this test answers itself. One client
+opens and closes a file in a loop: a Create answered as a 4,096-byte file granted what it asked, then a Cleanup and a Close
+answered done. Each serving pattern gets a fresh volume, and the patterns rotate:
+- one thread, each response sent in the call that receives the next request, the context a pointer (the DLL's form);
+- the same with the context a token (ours);
+- one thread, responses sent alone and then a receive (the receiver's form);
+- two threads each combining (the DLL's two dispatchers).
+
+Diagnostics run 42123092900 (`diag-winfsp-overlap-18`, tree `afc1f500`), five runs on each runner.
+
+**Arm64 (`windows-11-arm`).** image win11-vs2026-arm64 20261101.203.1; 4 CPUs; ARM64 ARMv8 (64-bit) Family 8 Model D49 Revision   0, MICROSOFT CORPORATION; WinFsp 2.1.25156; Microsoft Windows [Version 10.0.26200.9725]. Five runs from 2026-11-05T22:39:12Z, each pattern twice a run on a fresh volume, 10,000 timed open-and-closes each after 1,000 untimed. Each cell: the ten measurements in order, µs.
+
+| pattern | refused | client p50 | client p99 | client p999 | client max | call before Cleanup p50 | call before Close p50 |
+|---|---|---|---|---|---|---|---|
+| one-thread-combined-pointer | 0 | 711.8, 713.2, 705.2, 712.9, 711.1, 713.3, 700.9, 705.2, 714.7, 701.6 | 845.5, 819.7, 807.8, 818.1, 812.6, 818.1, 801.1, 808.1, 819.3, 800.4 | 1016.7, 959.1, 892.7, 892.9, 886.6, 880.5, 853.1, 875.2, 913.9, 876.6 | 1902.5, 1756.4, 1087.0, 1112.9, 1098.4, 1220.8, 1032.8, 3251.7, 2753.1, 1123.6 | 171.4, 170.0, 171.1, 171.2, 168.8, 173.5, 167.3, 170.2, 170.9, 167.0 | 39.8, 38.9, 39.7, 40.1, 38.8, 40.0, 38.6, 39.5, 39.2, 39.6 |
+| one-thread-combined-token | 0 | 709.1, 710.1, 688.2, 691.5, 722.1, 709.0, 724.5, 700.5, 722.8, 693.6 | 1200.6, 816.6, 782.5, 800.1, 841.1, 1300.9, 834.9, 817.6, 830.5, 784.7 | 1744.6, 958.8, 903.0, 1640.7, 993.7, 1701.1, 901.7, 1614.5, 929.4, 821.4 | 2034.4, 1194.4, 963.2, 2100.9, 2171.2, 1772.5, 1085.5, 1671.2, 1056.1, 1041.9 | 169.3, 170.7, 164.4, 166.2, 174.6, 171.7, 176.1, 168.7, 174.3, 166.0 | 40.8, 39.8, 38.3, 38.5, 40.5, 38.9, 40.4, 38.6, 40.6, 38.4 |
+| one-thread-separate-token | 0 | 724.5, 727.5, 699.9, 716.1, 722.3, 713.8, 724.1, 702.8, 721.2, 702.9 | 830.0, 833.4, 791.1, 815.5, 829.6, 834.8, 824.9, 792.0, 820.8, 819.4 | 958.3, 989.9, 931.1, 882.5, 945.3, 926.1, 879.5, 850.1, 870.7, 901.1 | 1129.3, 1743.3, 3254.6, 1152.0, 1483.7, 1361.7, 1179.6, 1043.5, 1049.1, 1127.0 | 163.8, 165.2, 160.8, 165.0, 164.8, 161.9, 161.9, 159.6, 163.2, 158.4 | 35.4, 34.8, 32.4, 33.5, 34.7, 33.8, 34.0, 33.8, 34.6, 33.5 |
+| two-threads-combined-pointer | 0 | 684.9, 677.7, 671.9, 679.3, 675.1, 688.2, 684.5, 680.4, 676.1, 686.1 | 836.2, 783.9, 766.1, 784.6, 768.1, 797.4, 802.2, 781.0, 766.0, 1074.9 | 1109.0, 893.7, 836.5, 896.6, 836.4, 858.4, 896.9, 831.6, 824.3, 1288.0 | 4059.4, 1088.9, 1119.3, 1307.4, 991.6, 1093.6, 1083.6, 1212.1, 1082.9, 3162.0 | 169.3, 167.6, 166.3, 167.5, 167.5, 170.5, 169.7, 169.2, 167.1, 170.7 | 38.3, 38.9, 38.0, 38.8, 38.3, 39.1, 38.9, 38.7, 38.5, 39.0 |
+
+**x86_64 (`windows-latest`).** image win25-vs2026 20261030.294.1; 4 CPUs; AMD64 Intel64 Family 6 Model 207 Stepping 2, GenuineIntel; WinFsp 2.1.25156; Microsoft Windows [Version 10.0.26100.33674]. Five runs from 2026-11-05T22:39:02Z, each pattern twice a run on a fresh volume, 10,000 timed open-and-closes each after 1,000 untimed. Each cell: the ten measurements in order, µs.
+
+| pattern | refused | client p50 | client p99 | client p999 | client max | call before Cleanup p50 | call before Close p50 |
+|---|---|---|---|---|---|---|---|
+| one-thread-combined-pointer | 0 | 130.7, 128.9, 126.9, 124.3, 126.2, 130.7, 125.2, 125.1, 134.9, 127.7 | 226.8, 221.6, 223.4, 213.5, 217.7, 220.3, 217.3, 213.2, 216.6, 219.4 | 289.7, 299.0, 294.7, 278.3, 279.8, 291.0, 306.9, 271.4, 272.1, 284.3 | 1713.5, 332.7, 1621.9, 374.6, 351.0, 433.6, 446.8, 341.6, 305.6, 320.0 | 37.0, 36.9, 36.7, 36.1, 36.5, 37.0, 36.2, 36.3, 37.0, 36.8 | 34.7, 34.6, 34.5, 34.0, 34.3, 34.7, 34.1, 34.2, 34.8, 34.6 |
+| one-thread-combined-token | 0 | 125.2, 125.0, 124.0, 125.5, 126.1, 126.1, 126.1, 125.4, 128.5, 125.3 | 213.5, 209.4, 212.5, 210.0, 223.4, 210.6, 219.7, 219.7, 221.8, 213.0 | 265.3, 263.5, 294.4, 264.3, 318.6, 296.5, 289.2, 279.4, 294.2, 282.0 | 287.9, 335.4, 1097.5, 293.2, 1032.0, 398.8, 1137.8, 442.4, 1064.2, 318.4 | 36.2, 36.4, 36.2, 36.6, 36.7, 36.5, 36.5, 36.2, 36.9, 36.2 | 34.1, 34.2, 34.0, 34.4, 34.4, 34.3, 34.4, 34.0, 34.7, 34.1 |
+| one-thread-separate-token | 0 | 125.1, 125.1, 124.8, 124.2, 125.2, 125.8, 126.4, 125.1, 125.8, 131.2 | 207.6, 212.0, 211.2, 214.0, 218.9, 209.3, 211.6, 216.2, 209.1, 217.9 | 251.7, 297.2, 264.3, 279.6, 260.6, 279.6, 282.2, 289.3, 272.9, 281.6 | 331.3, 392.7, 519.9, 337.2, 327.1, 390.6, 322.5, 353.6, 312.6, 307.0 | 26.1, 26.3, 26.1, 26.0, 26.1, 26.3, 26.3, 26.3, 26.4, 26.8 | 24.0, 24.2, 23.9, 24.0, 24.1, 24.1, 24.2, 24.2, 24.3, 24.4 |
+| two-threads-combined-pointer | 0 | 148.5, 147.2, 147.2, 146.3, 149.3, 146.7, 147.6, 146.8, 146.9, 148.6 | 220.2, 220.4, 221.2, 218.8, 225.9, 220.1, 223.8, 219.2, 225.1, 222.3 | 268.4, 277.4, 268.9, 273.5, 296.8, 285.0, 307.4, 300.8, 325.4, 299.8 | 304.0, 358.0, 343.5, 392.3, 487.6, 330.6, 509.5, 407.0, 1239.8, 389.5 | 36.6, 36.6, 36.6, 36.5, 36.9, 36.4, 36.6, 36.5, 36.5, 36.7 | 33.8, 33.9, 33.9, 33.8, 34.1, 33.8, 33.9, 33.7, 33.8, 33.9 |
+
+**What it showed.**
+- **The response's shape costs nothing.** A pointer context and a token context overlap on both lanes (arm64 700.9–714.7
+  against 688.2–724.5 µs; x86_64 124.3–134.9 against 124.0–128.5 µs).
+- **The receiver's form costs what the DLL's single-thread form does** (arm64 699.9–727.5 µs; x86_64 124.2–131.2 µs).
+- **A second waiting thread is the difference, with opposite signs.**
+  - On arm64, two threads are faster: 671.9–688.2 µs against one thread's 700.9–714.7, about 25 µs an open-and-close, or 8–10
+    µs for each of its three IRPs. That is arm64's remainder against the DLL.
+  - On x86_64, two threads are slower: 146.3–149.3 µs against 124.3–134.9, about 7 µs an IRP.
+  - On both lanes the ranges do not overlap.
+
+The DLL serves with two threads, and the second waits in the kernel while the first is still finishing its call's
+completion. The tracer of runs 42086968194-42097182526 counted only requests that arrived during another's service, so it
+could not see this.
+
+**The per-IRP accounting (arm64, quiet, p50).**
+- Our receiver's service per IRP is level with the DLL's.
+- Crash-safe direct output costs at most 0.5 µs an IRP (the harness above).
+- Our response's shape costs nothing.
+- The single receiving thread forgoes the second waiter's 8–10 µs an IRP on arm64, which the DLL's two dispatchers get.
+  The same second thread costs about 7 µs an IRP on x86_64.
+
+A second receiver cannot simply be added: two journals need the multi-worker crash proof (GAPS), which is not built. A
+second worker would also make x86_64 slower unless it ran on arm64 alone, and a mode chosen per architecture would need
+a derivation the rules accept.
