@@ -93,8 +93,13 @@
 >   41977593496; the entry above).** It read `FileSystem.Version`, not the DLL's version (`FspVersion`). Also, an open whose
 >   path was longer than 1024 UTF-16 units was refused, because every open records its kernel name in the held ledger
 >   (`crates/bridge-winfsp/src/opens/names.rs`); now slates refuses no path the driver passes.
-> - **The receiver that replaced WinFsp's dispatcher is unmeasured.** It is one thread with a new event per control
->   transaction, where the DLL dispatcher ran two threads; BENCHMARKS has no entry for it.
+> - **The receiver that replaced WinFsp's dispatcher: measured, the regression found and cut, a remainder open
+>   (A-212, 2026-11-05).** Against `71cf09ac`, interleaved on CI's runners, it was worse beyond the spread on arm64 (quiet
+>   p50: a stat 2.55×, a rename 2.90×, an fsync 1.74×; run 41973314087). Two causes, each timed: a live receive scanned
+>   the whole 64 KiB batch tail (26.4 µs on arm64, 50.1 µs on x86_64, run 41977769822), and a rename visited every
+>   live open (about 106 shard turns each). With both fixed (run 41980761370, arm64, five runs) a stat is 1.53×, a rename
+>   1.40× and an fsync 1.23×. **Open:** about 25 µs a request remains on arm64, and an arm64 write under load is 2.15×;
+>   neither is attributed yet. BENCHMARKS, "The WinFsp receiver against the DLL dispatcher", is the record as it fills.
 > - **Two failures recorded open below**: the wake-learning case under load (fixed 2026-11-04, A-199) and the fleet
 >   routing Create reply (fixed 2026-11-04 in its fixture; a second, rarer failure of that history stays open).
 >
