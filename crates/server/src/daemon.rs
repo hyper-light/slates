@@ -958,7 +958,17 @@ impl Daemon {
   /// drains it, so the flood clears by itself once the shard runs. Zero means the channel was already
   /// full; a refusal other than a full channel is the observation's.
   pub fn flood_control_channel(&self) -> Result<usize, ObserveError> {
-    let shard = self.shards.first().copied().ok_or(ObserveError::NoTarget)?;
+    self.flood_control_channel_of(0)
+  }
+
+  /// Test support: [`Self::flood_control_channel`] on the shard at `partition` (A-216's refused release: a spawn sent to
+  /// a full control channel is refused `ControlFull`). The flood clears by itself once that shard runs.
+  pub fn flood_control_channel_of(&self, partition: usize) -> Result<usize, ObserveError> {
+    let shard = self
+      .shards
+      .get(partition)
+      .copied()
+      .ok_or(ObserveError::NoTarget)?;
     let runtime = self.runtime.as_ref().ok_or(ObserveError::NoRuntime)?;
     let mut queued: usize = 0;
     loop {

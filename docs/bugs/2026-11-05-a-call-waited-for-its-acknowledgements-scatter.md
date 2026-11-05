@@ -1,4 +1,4 @@
-# A call waits for its acknowledgement's scatter (2026-11-05, §4.9, R9; open, the first fix reverted)
+# A call waited for its acknowledgement's scatter (2026-11-05, §4.9, R9; the first fix reverted, fixed by A-216)
 
 ## Description
 
@@ -82,3 +82,26 @@ What later runs showed (macOS arm64, 2026-11-05 16:00–16:57 UTC):
 At load 23–36 on macOS the bench's 8- and 64-client forms aborted `Stalled` in every arm, main included: a live
 daemon slower than the reply deadline. The client returns `Stalled` for a live daemon once the deadline passes
 (`Client::round_trip`). That is a separate robustness gap.
+
+## Fixed by A-216
+
+The supervisor chose to answer the acknowledgement once the client's own shard has released its records, with the
+other shards' releases run as tracked tasks (A-216, §4.9's status). The client keeps one reply in flight.
+
+Exactly-once holds:
+- a client's own shard advances its window before the reply, and every request passes that window first;
+- a client's sequences only grow and never wrap;
+- a new client never takes a used id;
+- a later request to another shard queues behind the release on that shard's control channel.
+
+Tests, each failing first:
+- `a_call_is_never_held_behind_the_periodic_acknowledgement` (`crates/client/tests/acknowledge.rs`): `Stalled` before;
+  after, the call returns in under half a 1 s hold, with no second reply in flight.
+- `a_lagging_release_is_never_met_by_a_request_as_new` (`crates/server/tests/ack_release.rs`): the acknowledgement
+  took 1.197 s before. After, it and a retry inside the hold are answered at once (the retry `DuplicateRequest` by the
+  client's own shard), and a new create makes a new volume. Red-checked: with the own shard's release skipped, the
+  retry waited 1.19 s.
+- `a_refused_release_is_counted_and_the_next_watermark_takes_it_over`: never answered before (a sibling defect,
+  `docs/bugs/2026-11-05-a-scatter-whose-part-could-not-be-sent-never-answered.md`). After, it is answered, the refusal is
+  counted, `AcknowledgementOwed` is met at the bound, and the next watermark serves again. Red-checked: with the count
+  removed, 0 before and 0 after.
