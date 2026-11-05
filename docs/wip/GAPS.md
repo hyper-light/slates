@@ -74,40 +74,6 @@
 > foreign node holds the owner dead; no assertion changed. Interleaved on one busy CPU: before 2/150, after 0/150.
 > Record: `docs/bugs/2026-11-05-a-lookup-before-the-owners-death-was-known-never-ran-its-round.md`.
 
-> **Merge: the same edit from two works was one increment; fixed 2026-11-04 (§4.16, agents/perf).** The increment's
-> identity left out its work and its base, so a second work's byte-identical edit from the same base was answered from
-> the retry cache with the first work's version, even where the green had since changed that range: a conflict reported
-> as an accept. The identity now names the work and the base as §4.16's data model says. Failing first, passing after:
-> `crates/client/tests/merge_identity.rs`. Record: `docs/bugs/2026-11-04-the-same-edit-from-two-works-was-one-increment.md`.
-> Found by the edit-and-merge latency harness's oracle (`crates/client/examples/edit_merge_bench.rs`).
->
-> **Merge: a full edit and merge is 51–69 µs at the median whatever the green holds (A-220, 2026-11-04, agents/perf).**
-> A submit's cost had followed the green's size: 14 ms at 1,000 files of 4 KiB. The merge record's identities are now
-> made only for a record that goes to holders, the deriver composes over the base restricted to the journal's paths,
-> and a work holds only the files it changed since its base. Loaded Mac (load 5–11, informational): p50 51–69 µs and
-> p99 0.15–0.36 ms at 10, 1,000 and 10,000 files, every form, but for one run's 1.81 ms (conflict, 10,000 files; BENCHMARKS, "A full edit and merge"). Racing clients'
-> verdicts are judged against the rule (`crates/client/tests/merge_chaos.rs`). **Open:** quiet and CI numbers; 100,000
-> files; the preferred 50 µs (the fixed cost of the two round trips); the two-machine path (fs-server); at `f > 0` the
-> head identity is still O(green) per accept; the rebase restates whole. A daemon `SIGKILL`ed six times mid-merge
-> loses no told version and tells none twice (`crates/cli/tests/merge_kill.rs`, red with the durable append removed).
->
-
-> **The anchor's hold refusals: a bounded Unix log, and a count in `slates status` (2026-11-04, A-213; siblings of
-> audit step 3).** The Unix device hold logged a line per refused message, unbounded; it now logs each distinct refusal
-> once (`RefusalLog`, as the Windows hold does) and counts every one. Every refusal on either platform's hold channel
-> is published in the segment's supervision block and reported by `slates status` as `anchor_hold_refusals`. adacachy,
-> 2026-11-04: 20 bad device messages gave 20 counted and 20 log lines before the change, 20 and 2 after; through a real
-> supervisor over the real `slates daemon`, `slates status` says `anchor_hold_refusals: 20`. On CI's `ubuntu-latest` and
-> `macos-latest`, both tests fail on main's sources (20 log lines; no `anchor_hold_refusals` line; run 41984065875) and
-> pass with the fix (run 41984065750). Record: `docs/bugs/2026-11-04-the-unix-device-hold-logged-every-refusal.md`.
-> - **The Windows anchor wakes on its hold channel**, a read it keeps posted, and on its daemon's exit, where it parked up
->   to 500 ms between looks at the channel (A-206's owed item). Five holds through the real supervisor under a 4 s pause:
->   3,990 to 4,020 ms each before, on `windows-latest` and `windows-11-arm`, 3 runs each (run 41984349301); under 1 ms each
->   after, 3 runs each (run 41985213489), with the 20-bad-message tests (0 anchor exits) green in the same runs. A WinFsp
->   mount's median fell from 487 to 10.5 ms on x86_64 and from 445 to 15.8 ms on arm64, an unmount's from 505 to 15.7 ms
->   and from 507 to 27.0 ms, 20 interleaved rounds per build (run 41985454044; BENCHMARKS, "What a WinFsp mount and unmount
->   wait for the Windows anchor").
-
 > **The binary release lane (2026-11-04, A-210, Appendix B.2).** `release.yml` now builds `slates` natively for
 > seven targets: macOS arm64, Linux x86_64 and arm64 (glibc, and static musl), and Windows x86_64 and arm64 with the C
 > runtime linked statically. It runs each built binary on its own runner (`cargo run -p xtask --bin release -- smoke`: version,
