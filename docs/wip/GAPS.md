@@ -72,8 +72,9 @@
 > `list` shows it, the catalog register carries it, and the db model test recovers it
 > (`crates/server/tests/live_ship.rs`). The daemon ships (2026-11-05, §4.10 status "slice one"): across three real
 > daemon processes a live volume's writes reach both candidates and become durable (`crates/cli/tests/live_fleet.rs`,
-> 4 of 4). Open, toward a filesystem server replicated per write in under 1 ms: barriers
-> answered at durability (AC-8.3's "live-shipped volumes
+> 4 of 4). Barriers wait (§4.10 status "slice two"): a recorded verb and a stable NFS write or `COMMIT` on a live
+> volume are answered only once a candidate holds them, red-checked across real processes. Open, toward a filesystem
+> server replicated per write in under 1 ms: FUSE `fsync` answered at durability (AC-8.3's "live-shipped volumes
 > report none", AC-8.9's credit backpressure); a candidate's copy kept across its own restart; phase one in the takeover
 > round; real-process chaos. `put_wal` and the
 > loss-window report are unbuilt; a head still waits up to the 100 ms record period before its commit starts.

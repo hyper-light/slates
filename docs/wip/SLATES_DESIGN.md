@@ -5612,8 +5612,20 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > owed and both candidates at that head, 4 of 4 runs. Two defects that run found are fixed in the slice: a refusal was
 > re-shipped at once, so a holder that did not hold the volume's catalog yet looped with its owner (982 and 5,501
 > refusals in one five-write run, 0 to 20 after); and a burst that outran the credit left its last writes unshipped
-> until another write came. Not yet: barriers do not wait for durability; a candidate's copy does not survive its own
-> daemon's restart; takeover does not read it.
+> until another write came.
+>
+> **Slice two (2026-11-05): barriers wait for durability.** A recorded verb that changes a live-shipped volume commits
+> its effects, then neither records its completion nor answers until its publication's position is durable
+> (`live_ship::durable_target`, `defer`, `resolve`; a retry joins the wait, `live_ship::join`), as a green's submit
+> waits for its merge record; a stable NFS `WRITE` or `COMMIT` waits after its barrier (`nfs::stable_once_durable`), at
+> most the daemon's liveness budget, then answers `NFS3ERR_JUKEBOX` and never a stability it does not have. Holders
+> that never answer make writers wait: backpressure, never a false success. Across three real daemon processes
+> (`crates/cli/tests/live_fleet.rs`): five `slates write`s each deferred (`fleet.live.awaited` 5), the owner's log
+> durable at its head with nothing owed the moment the last returns; five `FILE_SYNC` NFS writes each waited
+> (`fleet.live.resolved`), the log durable at each write's own position right after its reply (1, 2, 3, 4, 5), none
+> late. Red-checked: with the control-verb wait removed the last write returned at head 1, durable none, owed
+> (3 of 3); with the NFS wait removed the counter is zero and the race shows an undurable reply in 2 of 3. Not yet:
+> FUSE `fsync`; a candidate's copy does not survive its own daemon's restart; takeover does not read it.
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
 writer's ring to its local owner shard is the latency floor. When write-intent attachments from
