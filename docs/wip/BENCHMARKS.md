@@ -7259,7 +7259,8 @@ load 5 to 11 through every run below, so these numbers are informational; the qu
 Studios were unreachable this day; CI runners next). Rust 1.98.1, release, daemon derived for the machine (5 shards),
 client spinning up to 1 ms for its reply.
 
-Command (each arm a saved release binary of `crates/client/examples/merge_bench.rs` at the tree named; arms run
+Command (each arm a saved release binary of `crates/client/examples/merge_bench.rs` at the tree named, folded into
+`edit_merge_bench.rs` on 2026-11-05 with the same forms and output; arms run
 interleaved A B A B A B; each run 3 × 1,000 samples per form and shape, a run stopping at 20 s with at least 200;
 the scripts `ab1.sh`..`ab3.sh` under the agent's scratch, their loop is the line below):
 
@@ -7975,6 +7976,10 @@ What it means:
   measured next (GAPS, the client's per-platform record).
 - The p99 and longer rows here are the load of the shared laptop, not code properties. A quiet machine's record is
   owed; this laptop had no quiet window this day.
+- **Since 2026-11-05** (A-220) the growth a merge showed here is gone: a submit no longer clones, walks or hashes the
+  whole green (BENCHMARKS, "A full edit and merge"). The example now also holds the verdict forms of that section, and
+  its client spins up to 1 ms for a reply where these rows spun 50 µs, so rows from before and after that day are not
+  comparable at their tails.
 
 ## Replication latency: what a cross-node commit costs (§4.8, §4.10; 2026-11-04)
 

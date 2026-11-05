@@ -1,19 +1,37 @@
-//! The client's edit and merge latency on this platform (§4.16 `edit` and `submit`; RQ-4's
-//! "under 1 ms" for the agent-facing verbs; the per-platform record of `docs/wip/platforms.md`):
-//! one green volume served by an in-process daemon, reached from the Rust client through the
-//! real rendezvous and rings. Each sample makes a work volume off the head (untimed), declares
-//! one edit (timed: `edit`), submits it (timed: `merge`, an accepted increment), then destroys
-//! the work (untimed). Two forms run on fresh greens: `new_file`, where each sample creates its
-//! own file, so the green grows a file a version, and `one_file`, where each sample replaces one
-//! file's line, so only the version count grows. Each run also prints the median of its first
-//! and last tenth of samples, which shows a cost that grows with the green and which the
-//! percentiles alone would mix away. The client spins for its
-//! reply as the provisioning histogram's spinning form does, so a row is the verb's round trip
-//! and its service, not a wake. Rows are `ratchet-info\t<key>\t<lower>\t<median>\t<upper>` in
-//! nanoseconds over the runs, and the `goal` lines hold each p99 against the millisecond.
+//! The edit-and-merge latency harness (§4.16 "Laptop degenerate": "every arrow in the submission is an in-process
+//! call, and the merge path is microseconds"; RQ-4's "under 1 ms" for the agent-facing verbs; Ada's goal of
+//! 2026-11-04: a full edit and merge under 1 ms, preferably under 50 µs; the per-platform client record of
+//! `docs/wip/platforms.md`). One sample is what an agent pays to change a file and learn the green's verdict: the
+//! client's `edit` of its work volume (the declared splice, §4.16 "Declared operations"), then its `submit` through
+//! the server's verdict to the reply — accepted at a new version, accepted identical, or a conflict with its windows.
+//! The client and the daemon are one binary and one process here, over the real rendezvous and rings (§4.7), exactly
+//! as `slates` runs both. The client spins up to the required bound for each reply, so a reply inside the goal is a
+//! round trip and its service, not a wake (until 2026-11-05 the growth forms below spun 50 µs).
+//!
+//! Two families of forms:
+//! - **Verdict forms**, each over green shapes of 10 to 100,000 files of 4 KiB: `accept` (one work edits a file and
+//!   submits; its base is the head, so the fast path accepts), `ranged` (a second work's base lags the head by the
+//!   first's accept on the same file; its disjoint range is mapped and swept), `identical` (the lagging work writes
+//!   the bytes the head already holds there; pass two's memcmp accepts it with no effect) and `conflict` (it writes
+//!   different bytes there; the green does not move, and the work is replaced afterwards, untimed). Every sample is
+//!   checked against a model of the green: the verdict the design's rule gives, the head, and the edited file read
+//!   back from the head. A wrong answer ends the run with exit 1, so no number is printed for a path that answered
+//!   wrongly.
+//! - **Growth forms**, on fresh greens: each sample makes a work off the head (untimed), declares one 64-byte edit,
+//!   submits it (always accepted) and destroys the work (untimed). `new_file`: each sample creates its own file, so
+//!   the green gains a file a version; `one_file`: each sample replaces one file's line, so only the version count
+//!   grows. Each run also prints the median of its first and last tenth, which shows a cost that grows with the green
+//!   and which the percentiles alone would mix away.
+//!
+//! Each runs quiet (nothing else on the machine but what the box carries) and, for the verdict forms, loaded (one
+//! spinning thread per core this process can run, owned and joined here). Rows are
+//! `ratchet-info\t<key>\t<lower>\t<median>\t<upper>` in nanoseconds over the runs, then every run's value; the
+//! `goal` lines compare each p99 with Ada's two bounds. Nothing is gated: the bounds are the goal, recorded beside the
+//! measurement.
 //!
 //! Command: `cargo build --release -p slates-client --example edit_merge_bench`, then
-//! `target/release/examples/edit_merge_bench`.
+//! `target/release/examples/edit_merge_bench [--quiet-only] [--files N].. [--form F]..` (`--form new_file` or
+//! `one_file` selects a growth form; with no `--form`, every form runs).
 // Bench harness code: an unwrap here is a failed run.
 #![allow(
   clippy::unwrap_used,
@@ -22,30 +40,46 @@
   clippy::indexing_slicing
 )]
 
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use slates_client::{Client, ClientError, Deadlines, Submitted};
+use slates_client::{Client, ClientError, Deadlines, ReadAt, Submitted, VolumeId};
 use slates_machine::{MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
-/// Shape: runs per row.
+/// Shape: runs per row (the smallest count with a middle run, CLAUDE.md §5 "best of N with all N
+/// shown").
 const RUNS: usize = 3;
-/// Shape: edit-and-submit samples per run.
+/// Shape: samples per form per run.
 const SAMPLES: usize = 1_000;
-/// Shape: the goal each verb's p99 is held to: one millisecond (RQ-4, "end-to-end latency
-/// under 1 ms").
-const GOAL_NS: u64 = 1_000_000;
-/// Shape: the client's spin window, the provisioning histogram's floor (R9): the reply of a
-/// verb served within it lands without a wake.
-const SPIN_NS: u64 = 50_000;
-/// Shape: the bytes one edit inserts: a line of source.
-const EDIT_BYTES: &[u8] = b"    let answer = compute(&input)?; // an agent's one-line edit\n";
+/// Shape: the bytes one edit replaces: a line or two of source, what an agent's edit is.
+const EDIT_BYTES: usize = 64;
+/// Shape: each green file's length: a small source file, room for two disjoint edit ranges.
+const FILE_BYTES: usize = 4_096;
+/// Shape: the green shapes measured, as file counts, a decade apart from a handful of files to a large
+/// repository (§4.16's worked example is a 300k-file repository): a submit's cost must not follow them.
+const GREEN_FILES: &[usize] = &[10, 1_000, 10_000, 100_000];
+/// Shape: the wall time one run of one form may take before it stops sampling (at least [`MIN_SAMPLES`]),
+/// so a shape whose merge is slow still finishes and prints its numbers with their sample count.
+const RUN_BUDGET: Duration = Duration::from_secs(20);
+/// Shape: the fewest samples a run takes whatever its budget: enough that its p99 is a sample, not the max.
+const MIN_SAMPLES: usize = 200;
+/// Shape: Ada's preferred bound for a full edit and merge (2026-11-04).
+const GOAL_PREFERRED_NS: u64 = 50_000;
+/// Shape: Ada's required bound for a full edit and merge (2026-11-04).
+const GOAL_REQUIRED_NS: u64 = 1_000_000;
+/// Shape: how long the client spins for a reply before it parks: past the goal, so a reply inside
+/// the goal is taken without a wake (the provisioning bench's spinning form, AC-2.1).
+const SPIN_NS: u64 = GOAL_REQUIRED_NS;
 /// Format: the percentiles reported, in parts per thousand.
 const PERCENTILES: &[(&str, u64)] = &[("p50", 500), ("p99", 990), ("p999", 999)];
 /// Format: parts per thousand.
 const PERMILLE: u64 = 1000;
-/// Shape: how long the client retries the rendezvous while the daemon comes up.
+/// Shape: how long a client retries the rendezvous while the daemon comes up.
 const CONNECT_WAIT: Duration = Duration::from_secs(10);
+/// Format: the offset of the second, disjoint edit range in a file: its second half.
+const SECOND_RANGE: u64 = (FILE_BYTES / 2) as u64;
 
 fn ns(elapsed: Duration) -> u64 {
   u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
@@ -66,13 +100,289 @@ fn connect(instance: &str) -> Client {
       Ok(client) => return client,
       Err(ClientError::Ipc(
         slates_ipc::IpcError::DaemonUnavailable { .. } | slates_ipc::IpcError::RingFull,
-      )) if started.elapsed() < CONNECT_WAIT => std::thread::yield_now(),
+      )) if started.elapsed() < CONNECT_WAIT => std::hint::spin_loop(),
       Err(e) => panic!("{e}"),
     }
   }
 }
 
-/// The percentiles of one run's samples, then its max.
+/// The verdict a form expects.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Form {
+  Accept,
+  Ranged,
+  Identical,
+  Conflict,
+}
+
+impl Form {
+  const ALL: [Form; 4] = [Form::Accept, Form::Ranged, Form::Identical, Form::Conflict];
+
+  fn key(self) -> &'static str {
+    match self {
+      Form::Accept => "accept",
+      Form::Ranged => "ranged",
+      Form::Identical => "identical",
+      Form::Conflict => "conflict",
+    }
+  }
+}
+
+/// One sample's parts, in nanoseconds.
+#[derive(Clone, Copy)]
+struct Sample {
+  edit: u64,
+  submit: u64,
+}
+
+/// A green, its model and the works that edit it.
+struct Fixture {
+  client: Client,
+  green: VolumeId,
+  /// The green's head as the model has it.
+  head: u64,
+  /// Every file's bytes at the head.
+  model: BTreeMap<String, Vec<u8>>,
+  /// The work whose base is the head after each of its accepts.
+  leader: VolumeId,
+  /// The work whose base lags the head by the leader's last accept.
+  follower: VolumeId,
+  /// Works made so far (each a fresh name).
+  made: u64,
+  /// A counter folded into every edit's bytes, so no two edits write the same bytes by accident.
+  stamp: u64,
+  /// The fixture's name prefix.
+  tag: String,
+}
+
+fn path_of(index: usize) -> String {
+  format!("src/f{index:05}.rs")
+}
+
+/// `EDIT_BYTES` bytes no other edit of this run has written.
+fn fresh_bytes(stamp: u64) -> Vec<u8> {
+  let mut bytes = Vec::with_capacity(EDIT_BYTES);
+  let mut word = stamp.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+  while bytes.len() < EDIT_BYTES {
+    word ^= word << 13;
+    word ^= word >> 7;
+    word ^= word << 17;
+    bytes.extend_from_slice(&word.to_le_bytes());
+  }
+  bytes.truncate(EDIT_BYTES);
+  bytes
+}
+
+/// Fails the run: the harness never prints a number for a path that answered wrongly.
+fn wrong(what: &str) -> ! {
+  eprintln!("edit_merge_bench: WRONG ANSWER: {what}");
+  std::process::exit(1);
+}
+
+impl Fixture {
+  fn new(instance: &str, tag: &str, files: usize) -> Fixture {
+    let mut client = connect(instance);
+    client.spin_for(Some(SPIN_NS));
+    let green = client.create_green(&format!("{tag}-green"), false).unwrap();
+    let (seed, _) = client.create_work(green, &format!("{tag}-seed")).unwrap();
+    let mut model = BTreeMap::new();
+    for index in 0..files {
+      let mut bytes = Vec::with_capacity(FILE_BYTES);
+      let mut stamp = u64::try_from(index).unwrap_or(u64::MAX) << 32;
+      while bytes.len() < FILE_BYTES {
+        bytes.extend_from_slice(&fresh_bytes(stamp));
+        stamp = stamp.wrapping_add(1);
+      }
+      bytes.truncate(FILE_BYTES);
+      client.edit(seed, &path_of(index), 0, 0, &bytes).unwrap();
+      model.insert(path_of(index), bytes);
+    }
+    match client.submit(seed).unwrap() {
+      Submitted::Accepted(1) => {}
+      other => wrong(&format!(
+        "the seed submit answered {other:?}, not Accepted(1)"
+      )),
+    }
+    client.destroy(seed).unwrap();
+    let (leader, _) = client.create_work(green, &format!("{tag}-w0")).unwrap();
+    let (follower, _) = client.create_work(green, &format!("{tag}-w1")).unwrap();
+    Fixture {
+      client,
+      green,
+      head: 1,
+      model,
+      leader,
+      follower,
+      made: 2,
+      stamp: 0,
+      tag: tag.to_owned(),
+    }
+  }
+
+  fn next_stamp(&mut self) -> u64 {
+    self.stamp = self.stamp.wrapping_add(1);
+    self.stamp
+  }
+
+  /// Overwrites `[at, at + EDIT_BYTES)` of `path` in the model.
+  fn model_overwrite(&mut self, path: &str, at: u64, bytes: &[u8]) {
+    let file = self.model.get_mut(path).unwrap();
+    let start = usize::try_from(at).unwrap();
+    file[start..start + bytes.len()].copy_from_slice(bytes);
+  }
+
+  /// The leader's untimed accept that the lagging forms run behind: it overwrites the first range
+  /// of `path`, and the follower's base now lags the head by it.
+  fn lead(&mut self, path: &str, bytes: &[u8]) {
+    let leader = self.leader;
+    self
+      .client
+      .edit(leader, path, 0, EDIT_BYTES as u64, bytes)
+      .unwrap();
+    let answer = self.client.submit(leader).unwrap();
+    self.expect_accept(answer, "the leader's edit");
+    self.model_overwrite(path, 0, bytes);
+  }
+
+  fn expect_accept(&mut self, answer: Submitted, what: &str) {
+    let wanted = self.head + 1;
+    match answer {
+      Submitted::Accepted(version) if version == wanted => self.head = version,
+      other => wrong(&format!(
+        "{what} answered {other:?}, not Accepted({wanted})"
+      )),
+    }
+  }
+
+  /// The edited file read back from the green's head must equal the model's bytes, and the head
+  /// must be the model's.
+  fn check(&mut self, path: &str) {
+    let head = self.client.versions(self.green).unwrap();
+    if head != self.head {
+      wrong(&format!(
+        "the green's head is {head}, the model's {}",
+        self.head
+      ));
+    }
+    let read = self.client.read(self.green, path, ReadAt::Head).unwrap();
+    if Some(&read) != self.model.get(path) {
+      wrong(&format!("{path} at the head differs from the model"));
+    }
+  }
+
+  /// Replaces the follower (after a conflict its journal holds the refused edit): untimed.
+  fn replace_follower(&mut self) {
+    self.client.destroy(self.follower).unwrap();
+    self.made += 1;
+    let name = format!("{}-w{}", self.tag, self.made);
+    let (follower, base) = self.client.create_work(self.green, &name).unwrap();
+    if base != self.head {
+      wrong(&format!(
+        "a new work is based on {base}, the head is {}",
+        self.head
+      ));
+    }
+    self.follower = follower;
+  }
+
+  /// One timed sample of `form` on file `index`.
+  fn sample(&mut self, form: Form, index: usize) -> Sample {
+    let path = path_of(index);
+    match form {
+      Form::Accept => {
+        let bytes = fresh_bytes(self.next_stamp());
+        let leader = self.leader;
+        let started = Instant::now();
+        self
+          .client
+          .edit(leader, &path, 0, EDIT_BYTES as u64, &bytes)
+          .unwrap();
+        let edited = Instant::now();
+        let answer = self.client.submit(leader).unwrap();
+        let done = Instant::now();
+        self.expect_accept(answer, "an edit based on the head");
+        self.model_overwrite(&path, 0, &bytes);
+        self.check(&path);
+        Sample {
+          edit: ns(edited - started),
+          submit: ns(done - edited),
+        }
+      }
+      Form::Ranged => {
+        let lead = fresh_bytes(self.next_stamp());
+        self.lead(&path, &lead);
+        let bytes = fresh_bytes(self.next_stamp());
+        let follower = self.follower;
+        let started = Instant::now();
+        self
+          .client
+          .edit(follower, &path, SECOND_RANGE, EDIT_BYTES as u64, &bytes)
+          .unwrap();
+        let edited = Instant::now();
+        let answer = self.client.submit(follower).unwrap();
+        let done = Instant::now();
+        self.expect_accept(answer, "a disjoint edit behind the head");
+        self.model_overwrite(&path, SECOND_RANGE, &bytes);
+        self.check(&path);
+        Sample {
+          edit: ns(edited - started),
+          submit: ns(done - edited),
+        }
+      }
+      Form::Identical => {
+        let lead = fresh_bytes(self.next_stamp());
+        self.lead(&path, &lead);
+        let follower = self.follower;
+        let started = Instant::now();
+        self
+          .client
+          .edit(follower, &path, 0, EDIT_BYTES as u64, &lead)
+          .unwrap();
+        let edited = Instant::now();
+        let answer = self.client.submit(follower).unwrap();
+        let done = Instant::now();
+        // An identical edit accepts at a new version with no effect: the model's bytes stay.
+        self.expect_accept(answer, "an identical edit behind the head");
+        self.check(&path);
+        Sample {
+          edit: ns(edited - started),
+          submit: ns(done - edited),
+        }
+      }
+      Form::Conflict => {
+        let lead = fresh_bytes(self.next_stamp());
+        self.lead(&path, &lead);
+        let bytes = fresh_bytes(self.next_stamp());
+        let follower = self.follower;
+        let started = Instant::now();
+        self
+          .client
+          .edit(follower, &path, 0, EDIT_BYTES as u64, &bytes)
+          .unwrap();
+        let edited = Instant::now();
+        let answer = self.client.submit(follower).unwrap();
+        let done = Instant::now();
+        match answer {
+          Submitted::Conflict(windows)
+            if windows
+              .iter()
+              .any(|w| w.path == path && w.at < EDIT_BYTES as u64 && w.len > 0) => {}
+          other => wrong(&format!(
+            "a differing edit over the leader's range answered {other:?}, not a conflict on {path}"
+          )),
+        }
+        self.check(&path);
+        self.replace_follower();
+        Sample {
+          edit: ns(edited - started),
+          submit: ns(done - edited),
+        }
+      }
+    }
+  }
+}
+
+/// The percentiles and the max of `samples`.
 fn percentiles(mut samples: Vec<u64>) -> Vec<(&'static str, u64)> {
   samples.sort_unstable();
   let last = samples.len().saturating_sub(1);
@@ -88,67 +398,127 @@ fn percentiles(mut samples: Vec<u64>) -> Vec<(&'static str, u64)> {
   out
 }
 
-/// What each sample edits, so the two forms tell a cost that follows the green's file count from
-/// one that follows its version count.
-#[derive(Clone, Copy)]
-enum Form {
-  /// Each sample creates its own file: after sample `n` the green holds `n + 1` files and
-  /// `n + 1` versions.
+/// One form on one green shape: per part, per percentile, the per-run values.
+fn measure(instance: &str, form: Form, files: usize, load: &str) -> BTreeMap<String, Vec<u64>> {
+  let mut rows: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+  for run in 0..RUNS {
+    let tag = format!("{}-{files}-{load}-{run}", form.key());
+    let mut fixture = Fixture::new(instance, &tag, files);
+    let mut edits = Vec::with_capacity(SAMPLES);
+    let mut submits = Vec::with_capacity(SAMPLES);
+    let mut totals = Vec::with_capacity(SAMPLES);
+    let started = Instant::now();
+    for n in 0..SAMPLES {
+      if n >= MIN_SAMPLES && started.elapsed() > RUN_BUDGET {
+        break;
+      }
+      let sample = fixture.sample(form, n % files);
+      edits.push(sample.edit);
+      submits.push(sample.submit);
+      totals.push(sample.edit.saturating_add(sample.submit));
+    }
+    rows
+      .entry("samples".to_owned())
+      .or_default()
+      .push(u64::try_from(totals.len()).unwrap_or(u64::MAX));
+    for (part, samples) in [("edit", edits), ("submit", submits), ("total", totals)] {
+      for (pct, value) in percentiles(samples) {
+        rows.entry(format!("{part}_{pct}")).or_default().push(value);
+      }
+    }
+    fixture.client.destroy(fixture.leader).unwrap();
+    fixture.client.destroy(fixture.follower).unwrap();
+    fixture.client.destroy(fixture.green).unwrap();
+  }
+  rows
+}
+
+fn print_rows(key: &str, rows: &BTreeMap<String, Vec<u64>>) {
+  for (name, values) in rows {
+    let mut sorted = values.clone();
+    sorted.sort_unstable();
+    let (lower, median, upper) = (
+      sorted[0],
+      sorted[sorted.len() / 2],
+      sorted[sorted.len() - 1],
+    );
+    println!("ratchet-info\tmerge.{key}_{name}\t{lower}\t{median}\t{upper}\t{values:?}");
+  }
+}
+
+fn median_of(rows: &BTreeMap<String, Vec<u64>>, name: &str) -> u64 {
+  let mut sorted = rows[name].clone();
+  sorted.sort_unstable();
+  sorted[sorted.len() / 2]
+}
+
+/// A growth form: what each fresh-work sample edits, so a cost that follows the green's file count is told from one
+/// that follows its version count.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Growth {
+  /// Each sample creates its own file: after sample `n` the green holds `n + 1` files and `n + 1` versions.
   NewFile,
   /// Each sample replaces the one file's line: the green holds one file and `n + 1` versions.
   OneFile,
 }
 
-impl Form {
+impl Growth {
+  const ALL: [Growth; 2] = [Growth::NewFile, Growth::OneFile];
+
   fn key(self) -> &'static str {
     match self {
-      Form::NewFile => "new_file",
-      Form::OneFile => "one_file",
+      Growth::NewFile => "new_file",
+      Growth::OneFile => "one_file",
     }
   }
 }
 
-/// One run of a form: `SAMPLES` edit-and-submit cycles on a fresh green; the edit and the submit
-/// samples, in order.
-fn run(client: &mut Client, form: Form, run: usize) -> (Vec<u64>, Vec<u64>) {
+/// Shape: the line a growth sample writes: one line of source.
+const LINE: &[u8] = b"    let answer = compute(&input)?; // an agent's one-line edit\n";
+/// Shape: the samples compared at each end of a growth run: a tenth of them.
+const GROWTH_SHARE: usize = 10;
+
+/// One run of a growth form: `SAMPLES` edit-and-submit cycles on a fresh green, each on a fresh work off the head;
+/// the edit and the submit samples, in order.
+fn growth_run(client: &mut Client, form: Growth, run: usize) -> (Vec<u64>, Vec<u64>) {
   let green = client
-    .create_green(&format!("bench-green-{}-{run}", form.key()), false)
+    .create_green(&format!("growth-{}-{run}", form.key()), false)
     .unwrap();
   let mut edits = Vec::with_capacity(SAMPLES);
   let mut merges = Vec::with_capacity(SAMPLES);
   for n in 0..SAMPLES {
     let (work, _) = client.create_work(green, &format!("w-{run}-{n}")).unwrap();
     let (path, replaced) = match form {
-      Form::NewFile => (format!("src/file-{n}.rs"), 0),
+      Growth::NewFile => (format!("src/file-{n}.rs"), 0),
       // The first sample creates the file; every later one replaces the line the last put there.
-      Form::OneFile => (
+      Growth::OneFile => (
         "src/one.rs".to_owned(),
-        if n == 0 { 0 } else { EDIT_BYTES.len() as u64 },
+        if n == 0 { 0 } else { LINE.len() as u64 },
       ),
     };
     let started = Instant::now();
-    client.edit(work, &path, 0, replaced, EDIT_BYTES).unwrap();
+    client.edit(work, &path, 0, replaced, LINE).unwrap();
     edits.push(ns(started.elapsed()));
     let started = Instant::now();
     let verdict = client.submit(work).unwrap();
     merges.push(ns(started.elapsed()));
-    // Each work is made off the head and submitted before the next is made, so a conflict is a
-    // defect of the merge, not noise.
-    assert!(
-      matches!(verdict, Submitted::Accepted(_)),
-      "{} sample {n}: {verdict:?}",
-      form.key()
-    );
+    // Each work is made off the head and submitted before the next is made, so anything but the next version is
+    // a defect of the merge, not noise.
+    let wanted = u64::try_from(n).unwrap_or(u64::MAX).saturating_add(1);
+    if verdict != Submitted::Accepted(wanted) {
+      wrong(&format!(
+        "{} sample {n} answered {verdict:?}, not Accepted({wanted})",
+        form.key()
+      ));
+    }
     client.destroy(work).unwrap();
   }
+  client.destroy(green).unwrap();
   (edits, merges)
 }
 
-/// Shape: the samples compared at each end of a run: a tenth of them.
-const GROWTH_SHARE: usize = 10;
-
-/// The median of a run's first and last tenth: a verb whose cost follows the green's history
-/// (each sample adds one accepted version) shows it here, where the percentiles mix it away.
+/// The median of a run's first and last tenth: a verb whose cost follows the green's history (each sample adds one
+/// accepted version) shows it here, where the percentiles mix it away.
 fn print_growth(run: usize, key: &str, samples: &[u64]) {
   let tenth = (samples.len() / GROWTH_SHARE).max(1);
   let median = |slice: &[u64]| {
@@ -163,24 +533,130 @@ fn print_growth(run: usize, key: &str, samples: &[u64]) {
   );
 }
 
-fn print_rows(key: &str, per_run: &[Vec<(&'static str, u64)>]) -> u64 {
-  let mut p99 = 0;
-  for (index, (name, _)) in per_run[0].iter().enumerate() {
-    let mut values: Vec<u64> = per_run.iter().map(|r| r[index].1).collect();
-    let shown = values.clone();
-    values.sort_unstable();
-    let (lower, median, upper) = (
-      values[0],
-      values[values.len() / 2],
-      values[values.len() - 1],
-    );
-    if *name == "p99" {
-      p99 = median;
+/// Every selected growth form, its runs, its rows and its goal lines.
+fn growth_sweep(instance: &str, selection: &Selection) {
+  let mut client = connect(instance);
+  client.spin_for(Some(SPIN_NS));
+  for form in selection.growth.iter().copied() {
+    let mut rows: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+    for index in 0..RUNS {
+      let (edits, merges) = growth_run(&mut client, form, index);
+      print_growth(index, &format!("{}.edit", form.key()), &edits);
+      print_growth(index, &format!("{}.merge", form.key()), &merges);
+      for (verb, samples) in [("edit", edits), ("merge", merges)] {
+        for (pct, value) in percentiles(samples) {
+          rows.entry(format!("{verb}_{pct}")).or_default().push(value);
+        }
+      }
     }
-    println!("ratchet-info\tclient.{key}_{name}\t{lower}\t{median}\t{upper}");
-    println!("  client.{key}_{name}: {median} ns [{lower}, {upper}] over {RUNS} runs: {shown:?}");
+    for (name, values) in &rows {
+      let mut sorted = values.clone();
+      sorted.sort_unstable();
+      let (lower, median, upper) = (
+        sorted[0],
+        sorted[sorted.len() / 2],
+        sorted[sorted.len() - 1],
+      );
+      let (verb, pct) = name.split_once('_').unwrap_or((name, ""));
+      println!(
+        "ratchet-info\tclient.{}.{verb}_{pct}\t{lower}\t{median}\t{upper}\t{values:?}",
+        form.key()
+      );
+    }
+    for verb in ["edit", "merge"] {
+      let p99 = median_of(&rows, &format!("{verb}_p99"));
+      println!(
+        "goal\tclient.{}.{verb}: p50 {} ns, p99 {p99} ns: {}",
+        form.key(),
+        median_of(&rows, &format!("{verb}_p50")),
+        against_goal(p99)
+      );
+    }
   }
-  p99
+}
+
+/// Where a p99 stands against Ada's two bounds.
+fn against_goal(p99: u64) -> &'static str {
+  if p99 <= GOAL_PREFERRED_NS {
+    "within the preferred 50 us"
+  } else if p99 <= GOAL_REQUIRED_NS {
+    "within the required 1 ms"
+  } else {
+    "OVER the required 1 ms"
+  }
+}
+
+/// What the command line selects: the shapes and forms to run, and whether to run the loaded sweep.
+struct Selection {
+  shapes: Vec<usize>,
+  forms: Vec<Form>,
+  growth: Vec<Growth>,
+  loaded: bool,
+}
+
+impl Selection {
+  /// `--quiet-only`, `--files N` (repeatable; the shapes instead of [`GREEN_FILES`]) and `--form NAME`
+  /// (repeatable; `accept`, `ranged`, `identical`, `conflict`, `new_file`, `one_file`): a profile run selects one
+  /// form on one shape. With no `--form`, every form runs.
+  fn parse() -> Selection {
+    let mut selection = Selection {
+      shapes: Vec::new(),
+      forms: Vec::new(),
+      growth: Vec::new(),
+      loaded: true,
+    };
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+      match arg.as_str() {
+        "--quiet-only" => selection.loaded = false,
+        "--files" => selection.shapes.push(
+          args
+            .next()
+            .and_then(|n| n.parse().ok())
+            .expect("--files takes a count"),
+        ),
+        "--form" => {
+          let name = args.next().expect("--form takes a name");
+          if let Some(form) = Form::ALL.into_iter().find(|form| form.key() == name) {
+            selection.forms.push(form);
+          } else if let Some(form) = Growth::ALL.into_iter().find(|form| form.key() == name) {
+            selection.growth.push(form);
+          } else {
+            panic!("--form is accept, ranged, identical, conflict, new_file or one_file");
+          }
+        }
+        other => panic!("unknown argument {other}"),
+      }
+    }
+    if selection.shapes.is_empty() {
+      selection.shapes = GREEN_FILES.to_vec();
+    }
+    if selection.forms.is_empty() && selection.growth.is_empty() {
+      selection.forms = Form::ALL.to_vec();
+      selection.growth = Growth::ALL.to_vec();
+    }
+    selection
+  }
+}
+
+/// Runs every selected form over every selected shape, under `load`.
+fn sweep(instance: &str, load: &str, selection: &Selection) {
+  for files in &selection.shapes {
+    for form in selection.forms.iter().copied() {
+      let rows = measure(instance, form, *files, load);
+      let key = format!("{}_f{files}_{load}", form.key());
+      print_rows(&key, &rows);
+      let p99 = median_of(&rows, "total_p99");
+      let verdict = against_goal(p99);
+      println!(
+        "goal\tmerge.{key}: {:?} samples, total p50 {} ns, p99 {p99} ns, p999 {} ns, max {} ns: {verdict}",
+        rows["samples"],
+        median_of(&rows, "total_p50"),
+        median_of(&rows, "total_p999"),
+        median_of(&rows, "total_max"),
+      );
+    }
+  }
 }
 
 fn main() {
@@ -204,39 +680,29 @@ fn main() {
   daemon
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
+  let cores = profile.facts.cpus_at_once();
   println!(
-    "edit and merge latency: {} {}, {shards} shards, {} cores, client spin {SPIN_NS} ns, {SAMPLES} samples x {RUNS} runs",
+    "edit and merge latency: {} {}, {shards} shards, {cores} cores, client spin {SPIN_NS} ns, {SAMPLES} samples x {RUNS} runs, edits of {EDIT_BYTES} B in files of {FILE_BYTES} B",
     std::env::consts::OS,
-    std::env::consts::ARCH,
-    profile.facts.cpus_at_once()
+    std::env::consts::ARCH
   );
-  let mut client = connect(&instance);
-  client.spin_for(Some(SPIN_NS));
-  let mut failed = false;
-  for form in [Form::NewFile, Form::OneFile] {
-    let mut edit_runs = Vec::new();
-    let mut merge_runs = Vec::new();
-    for index in 0..RUNS {
-      let (edits, merges) = run(&mut client, form, index);
-      print_growth(index, &format!("{}.edit", form.key()), &edits);
-      print_growth(index, &format!("{}.merge", form.key()), &merges);
-      edit_runs.push(percentiles(edits));
-      merge_runs.push(percentiles(merges));
-    }
-    for (verb, runs) in [("edit", &edit_runs), ("merge", &merge_runs)] {
-      let key = format!("{}.{verb}", form.key());
-      let p99 = print_rows(&key, runs);
-      let ok = p99 <= GOAL_NS;
-      failed |= !ok;
-      println!(
-        "goal: {key} p99 {p99} ns vs {GOAL_NS} ns: {}",
-        if ok { "ok" } else { "FAIL" }
-      );
-    }
+  let selection = Selection::parse();
+  sweep(&instance, "quiet", &selection);
+  growth_sweep(&instance, &selection);
+  if selection.loaded {
+    // The loaded form: one spinning thread per core this process can run, owned and joined here.
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+      for _ in 0..cores {
+        scope.spawn(|| {
+          while !stop.load(Ordering::Relaxed) {
+            std::hint::spin_loop();
+          }
+        });
+      }
+      sweep(&instance, "loaded", &selection);
+      stop.store(true, Ordering::Relaxed);
+    });
   }
-  drop(client);
   daemon.stop();
-  if failed {
-    std::process::exit(1);
-  }
 }

@@ -5,7 +5,7 @@
 //!
 //! Before 2026-11-04 a work held a whole copy of its green: every accept copied every file of the green back into
 //! the work and recounted its charge, so a submit's cost followed the green's size (a 10,000-file green of 4 KiB
-//! files: 5.46 ms at the median, two thirds of it that copy, `crates/client/examples/merge_bench.rs`). Now an
+//! files: 5.46 ms at the median, two thirds of it that copy, `crates/client/examples/edit_merge_bench.rs`). Now an
 //! accept or a rebase moves the base and clears the delta, and a work is charged for what it holds itself.
 //!
 //! A work whose green is gone has no base to read: a file it did not change answers `UnknownBase`, as its submit

@@ -1,6 +1,6 @@
 # The same edit from two works was one increment
 
-Found 2026-11-04 by the edit-and-merge latency harness's oracle (`crates/client/examples/merge_bench.rs`, its
+Found 2026-11-04 by the edit-and-merge latency harness's oracle (`crates/client/examples/merge_bench.rs`, folded into `edit_merge_bench.rs` on 2026-11-05; its
 `identical` form, on its first run). Design: §4.16 data model (`Increment.id`), §4.16 "Commit" (an id already in
 `seen` returns its original result).
 
