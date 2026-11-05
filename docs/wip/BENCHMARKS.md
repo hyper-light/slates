@@ -7856,3 +7856,41 @@ the discard calls replaced by a refusal in a diagnostics commit):
   limit the daemon test passed 5 of 5 on each architecture (run 41979650557).
 - Linux and Mac fmt, clippy, docs, `cargo xtask check` and the mem tests, and Miri over mem's tests: passed on run
   41975260339.
+
+## What a WinFsp mount and unmount wait for the Windows anchor (A-213; 2026-11-05)
+
+Each WinFsp mount sends the anchor a hold and each unmount a release, and waits for the answer (A-198, A-206). The
+Windows anchor looked at its hold channel only between supervision steps, parked up to half the liveness budget
+(500 ms) apart; since A-213 it keeps a read posted on the channel and wakes when a message arrives.
+
+Command: diagnostics run [41985454044](https://github.com/hyper-light/slates/actions/runs/41985454044)
+(`diag-anchor-siblings-7`), on each lane: `cargo build --release -p slates-cli --bin slates --example hold_latency_ab`
+for the after build, the same `slates` built at `1cab2c23` (the commit before the wake) in a worktree of its own for the
+before build, then `target/release/examples/hold_latency_ab --arm before=… --arm after=…`. One anchor per build, one
+64 MiB volume each, 20 rounds per build, the builds alternating and the first rotating each round, one untimed round
+each first. A time is the `slates mount` or `slates unmount` command's, from its start to its exit; the program then
+waits for the drive to answer or to go before the next. GitHub's runners, 2026-11-05: `windows-latest` (x86_64,
+host runnervmm7ud1) and `windows-11-arm` (arm64, host runnervmmaf2v), WinFsp 2.1.25156, nothing else running in the job.
+Windows keeps no load average.
+
+All 20 of each, sorted, in milliseconds:
+
+| Lane | Verb | Build | Best | Median | All 20 |
+|---|---|---|---|---|---|
+| x86_64 | mount | before | 447.1 | 487.2 | 447.1 448.7 450.6 452.2 452.3 454.3 455.9 457.7 463.7 468.4 487.2 499.7 500.4 500.7 503.9 504.4 505.1 505.6 505.9 514.6 |
+| x86_64 | mount | after | 10.0 | 10.5 | 10.0 10.0 10.0 10.0 10.0 10.1 10.1 10.1 10.3 10.4 10.5 10.6 10.6 10.8 10.8 10.9 11.0 11.0 11.1 12.5 |
+| x86_64 | unmount | before | 476.2 | 505.4 | 476.2 490.3 499.9 501.1 504.4 504.6 504.7 505.1 505.1 505.2 505.4 505.5 505.9 508.8 509.7 509.8 510.3 510.5 510.6 510.9 |
+| x86_64 | unmount | after | 7.2 | 15.7 | 7.2 7.3 7.7 8.0 9.4 13.2 15.2 15.4 15.5 15.7 15.7 15.8 15.8 16.3 16.4 16.4 16.4 16.7 16.7 22.5 |
+| arm64 | mount | before | 417.6 | 444.8 | 417.6 425.3 426.1 427.1 428.3 430.1 430.6 431.9 435.2 435.7 444.8 500.9 504.6 505.0 506.2 507.9 508.1 509.2 511.0 514.0 |
+| arm64 | mount | after | 13.8 | 15.8 | 13.8 14.1 14.1 14.2 14.2 14.4 14.6 14.8 14.9 15.4 15.8 15.9 16.0 16.1 16.3 16.6 17.1 17.8 18.4 19.3 |
+| arm64 | unmount | before | 498.9 | 506.6 | 498.9 499.5 500.7 500.8 501.5 503.5 503.9 505.2 505.6 505.9 506.6 507.2 509.2 509.8 509.9 510.6 511.5 512.2 512.2 514.9 |
+| arm64 | unmount | after | 11.8 | 27.0 | 11.8 11.8 12.4 12.7 12.8 14.4 21.2 21.4 24.4 26.7 27.0 27.0 27.3 27.4 27.4 27.6 27.9 28.4 28.6 30.9 |
+
+- The before builds' times sit near 500 ms, the anchor's pause: an idle anchor's step is half the liveness budget, so a
+  hold or release waited for most of one. Mounts spread lower (from 418 ms) because a mount spends part of that pause on
+  its own work before its hold is sent.
+- After, a mount is 10–19 ms and an unmount 7–31 ms, which is the command's own process, connect and WinFsp work: at the
+  median, mounts 46× (x86_64) and 28× (arm64) faster, unmounts 32× and 19×.
+- The hold's round trip alone, through the real supervisor under a 4 s pause
+  (`a_hold_is_answered_at_its_channels_wake_not_at_the_supervisors_pause`): 3,990–4,020 ms before on both lanes (run
+  41984349301), under 1 ms after (runs 41985213489 and 41985454044), 3 runs of 5 holds each per lane.
