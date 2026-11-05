@@ -278,7 +278,8 @@ pub(crate) fn durability(
 }
 
 /// Derived: how long a held reply waits for durability before its transport answers that it is not (NFS `JUKEBOX`,
-/// FUSE `EIO`): [`DURABLE_WAIT_NS`].
+/// FUSE `EIO`): [`DURABLE_WAIT_NS`]. Only the FUSE transport asks for it, so it is compiled where FUSE is.
+#[cfg(target_os = "linux")]
 pub(crate) const fn durable_wait_ns() -> u64 {
   DURABLE_WAIT_NS
 }
@@ -358,7 +359,8 @@ fn awaiting_bound(state: &ShardState) -> usize {
 }
 
 /// Derived: the replies one FUSE mount may hold for durability: the bound a shard's held verbs use
-/// ([`awaiting_bound`]).
+/// ([`awaiting_bound`]). Compiled where FUSE is, its only caller.
+#[cfg(target_os = "linux")]
 pub(crate) fn reply_hold_bound(state: &ShardState) -> usize {
   awaiting_bound_of(&state.config)
 }
