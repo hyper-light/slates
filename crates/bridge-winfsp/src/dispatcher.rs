@@ -1,8 +1,11 @@
-//! A-198's single WinFsp receiver. The old public batch FSCTL uses direct output: the kernel writes each request
-//! into anchor-held pages before putting it in processing. Responses never receive another batch. After a death,
-//! captured requests settle before any new receive, preventing a reused IRP address from naming another processing
-//! request. WinFsp v2.1 sys/volume.c, sys/ioq.c and dll/fs.c define this order; the live taken-read oracle checks it.
-
+//! A-198's single WinFsp receiver, with A-215's combined call. The old public batch FSCTL uses direct output: the
+//! kernel writes each request into anchor-held pages before putting it in processing. Every response of a batch but
+//! its last is sent alone; the last rides the call that receives the next batch, into the journal's other buffer, as
+//! WinFsp's own dispatcher carries a response with its next receive. The driver finishes a call's responses before it
+//! delivers (WinFsp v2.1 sys/volume.c), so after a death a request in that buffer proves the response was consumed,
+//! and an empty one proves nothing new is processing: captured requests settle before any new receive, and a reused IRP
+//! address never names another processing request. sys/volume.c, sys/ioq.c and dll/fs.c define this order; the model
+//! oracle in inflight/capture.rs and the live kill oracle check it.
 use std::cell::{Cell, RefCell};
 use std::os::windows::io::{AsRawHandle, BorrowedHandle, OwnedHandle};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
@@ -16,7 +19,8 @@ use windows_sys::Win32::System::Memory::{
 
 use crate::ffi::FileSystem;
 use crate::host::WinFspError;
-use crate::inflight::{self, RESPONSE_BASE, RESPONSE_MAX, Refusal, Request, capture::Capture};
+use crate::inflight::capture::{Batch, Capture, Fill, HandOff};
+use crate::inflight::{self, RESPONSE_BASE, RESPONSE_MAX, Refusal, Request};
 
 /// Format: CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 0x800 + 't', METHOD_OUT_DIRECT, FILE_ANY_ACCESS), fsctl.h.
 const TRANSACT_BATCH: u32 = (9 << 16) | ((0x800 + b't' as u32) << 2) | 2;
@@ -396,37 +400,56 @@ fn operation(
   Ok(size)
 }
 
-fn settle(
+/// The receive owner's fixed parts: the DLL object, its control handle, and what its operations report through.
+struct Server<'a> {
   file_system: *mut FileSystem,
-  batch: &mut inflight::capture::Batch<'_>,
-  recovered: bool,
-  confirmations: &SyncSender<crate::host::Request>,
-  wake: &std::task::Waker,
-  private: &mut PrivateOpens,
+  control: HANDLE,
+  confirmations: &'a SyncSender<crate::host::Request>,
+  wake: &'a std::task::Waker,
+  private: PrivateOpens,
   bound: usize,
-) -> Result<u64, WinFspError> {
-  // SAFETY: same owner/worker lifetime as operation; volume control remains owned by the DLL object.
-  let control = unsafe { (*file_system).volume_handle };
-  let mut packet = Packet([0; RESPONSE_MAX]);
-  let mut count = 0u64;
-  while let Some(request) = batch.next_request().map_err(WinFspError::Capture)? {
-    if recovered {
+}
+
+/// What the receive loop does next.
+enum Next {
+  /// Receive into the buffer the fill names, with no response to send.
+  Receive,
+  /// Take the batch the last combined call delivered, of this reported length.
+  Take(usize),
+  /// The owner was told to stop; whatever the journal holds is the successor's.
+  Stop,
+}
+
+impl Server<'_> {
+  fn send(&mut self, response: &[u8]) -> Result<(), WinFspError> {
+    transaction(
+      self.control,
+      TRANSACT_BATCH,
+      response,
+      &mut [],
+      &mut self.private.intents,
+    )
+    .map(|_| ())
+  }
+
+  /// Settles a batch a dead owner captured, before any new receive. A saved Create or successful rename is sent again;
+  /// Cleanup and Close run again by checked open identity; every other request is cancelled (A-198).
+  fn settle_captured(&mut self, batch: &mut Batch<'_>) -> Result<u64, WinFspError> {
+    let mut packet = Packet([0; RESPONSE_MAX]);
+    let mut count = 0u64;
+    while let Some(request) = batch.next_request().map_err(WinFspError::Capture)? {
       let saved = batch.response_for(&request).map_err(WinFspError::Capture)?;
       // Only Create's saved result is needed to preserve a possibly issued context. Read completion can reference
       // an old process mapping (sys/read.c), so all other buffer-bearing operations cancel without dereferencing it.
-      if let Some(saved) = replayable_response(&request, saved, confirmations, wake, bound)? {
-        transaction(
-          control,
-          TRANSACT_BATCH,
-          saved,
-          &mut [],
-          &mut private.intents,
-        )?;
+      if let Some(saved) =
+        replayable_response(&request, saved, self.confirmations, self.wake, self.bound)?
+      {
+        self.send(saved)?;
       } else if matches!(
         request.kind(),
         inflight::CLEANUP_KIND | inflight::CLOSE_KIND
       ) {
-        let length = operation(file_system, &request, &mut packet, private)?;
+        let length = operation(self.file_system, &request, &mut packet, &mut self.private)?;
         let response = packet
           .0
           .get(..length)
@@ -436,13 +459,7 @@ fn settle(
             .record_response(&request, response)
             .map_err(WinFspError::Capture)?;
         }
-        transaction(
-          control,
-          TRANSACT_BATCH,
-          response,
-          &mut [],
-          &mut private.intents,
-        )?;
+        self.send(response)?;
       } else {
         let response = request.cancelled_response().map_err(WinFspError::Capture)?;
         if saved.is_none() {
@@ -450,16 +467,81 @@ fn settle(
             .record_response(&request, &response)
             .map_err(WinFspError::Capture)?;
         }
-        transaction(
-          control,
-          TRANSACT_BATCH,
-          &response,
-          &mut [],
-          &mut private.intents,
-        )?;
+        self.send(&response)?;
       }
-    } else {
-      let length = operation(file_system, &request, &mut packet, private)?;
+      batch
+        .acknowledge(request.hint())
+        .map_err(WinFspError::Capture)?;
+      count = count.saturating_add(1);
+    }
+    Ok(count)
+  }
+
+  /// A receive with no response, into the buffer the fill names. `None` when the owner was told to stop meanwhile: a
+  /// batch taken then stays intact for the successor, and no operation runs on this owner.
+  fn receive<'a>(
+    &mut self,
+    capture: Capture<'a>,
+    fill: &mut Fill,
+    stopped: &Receiver<()>,
+  ) -> Result<Option<Batch<'a>>, WinFspError> {
+    let mut receiving = capture.begin(fill).map_err(WinFspError::Capture)?;
+    let reported = transaction(
+      self.control,
+      TRANSACT_BATCH,
+      &[],
+      receiving.buffer_mut(),
+      &mut self.private.intents,
+    )?;
+    if is_stopped(stopped) {
+      return Ok(None);
+    }
+    receiving
+      .received(reported, fill)
+      .map(Some)
+      .map_err(WinFspError::Capture)
+  }
+
+  /// Serves a fresh batch. Every response but the last is saved, sent alone and acknowledged. The last is saved, then
+  /// sent by the call that receives the next batch into the other buffer (A-215), and its open is confirmed after.
+  fn serve(
+    &mut self,
+    batch: Batch<'_>,
+    fill: &mut Fill,
+    stopped: &Receiver<()>,
+  ) -> Result<Next, WinFspError> {
+    let Some(mut hand_off) = self.answer_all_but_the_last(batch, fill)? else {
+      return Ok(Next::Receive);
+    };
+    let (response, buffer) = hand_off.transaction();
+    let reported = transaction(
+      self.control,
+      TRANSACT_BATCH,
+      response,
+      buffer,
+      &mut self.private.intents,
+    )?;
+    // A hand-off returned while stopping is the successor's: it keeps the open this response handed over and settles
+    // whatever the call delivered.
+    if is_stopped(stopped) {
+      return Ok(Next::Stop);
+    }
+    if let Some((_, context)) =
+      inflight::opened_context(hand_off.response()).map_err(WinFspError::Capture)?
+    {
+      crate::host::confirm_open(self.confirmations, self.wake, context)?;
+    }
+    Ok(Next::Take(reported))
+  }
+
+  fn answer_all_but_the_last<'a>(
+    &mut self,
+    mut batch: Batch<'a>,
+    fill: &mut Fill,
+  ) -> Result<Option<HandOff<'a>>, WinFspError> {
+    let mut packet = Packet([0; RESPONSE_MAX]);
+    while let Some(request) = batch.next_request().map_err(WinFspError::Capture)? {
+      let length = operation(self.file_system, &request, &mut packet, &mut self.private)?;
       let response = packet
         .0
         .get(..length)
@@ -471,27 +553,26 @@ fn settle(
         .successful_rename(response)
         .map_err(WinFspError::Capture)?
       {
-        crate::host::rename_open_names(confirmations, wake, &from, &to, bound)?;
+        crate::host::rename_open_names(self.confirmations, self.wake, &from, &to, self.bound)?;
       }
-      transaction(
-        control,
-        TRANSACT_BATCH,
-        response,
-        &mut [],
-        &mut private.intents,
-      )?;
+      if batch.is_last() {
+        return batch
+          .hand_off(&request, fill)
+          .map(Some)
+          .map_err(WinFspError::Capture);
+      }
+      self.send(response)?;
       if let Some((_, context)) =
         inflight::opened_context(response).map_err(WinFspError::Capture)?
       {
-        crate::host::confirm_open(confirmations, wake, context)?;
+        crate::host::confirm_open(self.confirmations, self.wake, context)?;
       }
+      batch
+        .acknowledge(request.hint())
+        .map_err(WinFspError::Capture)?;
     }
-    batch
-      .acknowledge(request.hint())
-      .map_err(WinFspError::Capture)?;
-    count = count.saturating_add(1);
+    Ok(None)
   }
-  Ok(count)
 }
 
 /// Saved Create and successful Rename responses refer only to kernel-owned state. Other buffer-bearing responses
@@ -539,57 +620,46 @@ fn receive_loop(
     confirmations,
     wake,
     outcomes,
-    mut private,
+    private,
   } = channels;
   let file_system = file_system as *mut FileSystem;
+  let mut server = Server {
+    file_system,
+    // SAFETY: the mount owner cannot delete this DLL object until the receive thread is joined.
+    control: unsafe { (*file_system).volume_handle },
+    confirmations,
+    wake,
+    private,
+    bound,
+  };
   let mut view = CaptureView::new(section, bound)?;
   if let Some(mut batch) = view.capture()?.resume().map_err(WinFspError::Capture)? {
-    let count = settle(
-      file_system,
-      &mut batch,
-      true,
-      confirmations,
-      wake,
-      &mut private,
-      bound,
-    )?;
+    let count = server.settle_captured(&mut batch)?;
     eprintln!("slates-winfsp: settled {count} captured requests before receiving");
     outcomes
       .send(crate::host::Outcome::Recovered(count))
       .map_err(|_| WinFspError::MountThread)?;
     wake.wake_by_ref();
   }
-  // SAFETY: the mount owner cannot delete this DLL object until the receive thread is joined.
-  let control = unsafe { (*file_system).volume_handle };
-  // What this owner's last batch filled; its first receive clears the whole buffer.
-  let mut used = None;
+  // What this owner's last batch in each buffer filled; its first receive into each clears all of it.
+  let mut fill = Fill::new();
+  let mut next = Next::Receive;
   loop {
-    if is_stopped(&stopped) {
-      return Ok(());
-    }
-    let mut receiving = view.capture()?.begin(used).map_err(WinFspError::Capture)?;
-    let reported = transaction(
-      control,
-      TRANSACT_BATCH,
-      &[],
-      receiving.buffer_mut(),
-      &mut private.intents,
-    )?;
-    // Keep a batch taken while stopping intact for the successor, without invoking another operation on this owner.
-    if is_stopped(&stopped) {
-      return Ok(());
-    }
-    used = Some(inflight::capture::filled(reported).map_err(WinFspError::Capture)?);
-    let mut batch = receiving.received(reported).map_err(WinFspError::Capture)?;
-    settle(
-      file_system,
-      &mut batch,
-      false,
-      confirmations,
-      wake,
-      &mut private,
-      bound,
-    )?;
+    next = match next {
+      Next::Stop => return Ok(()),
+      Next::Receive if is_stopped(&stopped) => return Ok(()),
+      Next::Receive => match server.receive(view.capture()?, &mut fill, &stopped)? {
+        Some(batch) => server.serve(batch, &mut fill, &stopped)?,
+        None => Next::Stop,
+      },
+      Next::Take(reported) => {
+        let batch = view
+          .capture()?
+          .handed_off(reported, &mut fill)
+          .map_err(WinFspError::Capture)?;
+        server.serve(batch, &mut fill, &stopped)?
+      }
+    };
   }
 }
 
