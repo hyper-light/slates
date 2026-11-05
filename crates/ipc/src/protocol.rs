@@ -1521,6 +1521,9 @@ pub struct DaemonReport {
   pub fleet: FleetReport,
   /// The node's sealing at rest (A-92). Appended.
   pub seal: SealReport,
+  /// Every message the anchor's hold channel refused over its life, as the anchor last wrote it to the segment
+  /// (A-213); the anchor's log says each distinct refusal once, so this is where the rest show. Appended.
+  pub anchor_hold_refusals: u64,
 }
 
 /// The node's sealing at rest (A-92): how its root came (`unavailable`, `minted`, `minted-daemon-only` or

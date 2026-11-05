@@ -10794,3 +10794,154 @@ fn an_image_built_through_the_cli_passes_e2fsck_through_a_mount_and_merges_a_gue
   fuse_mount_and_check(&instance, &value_of(&out, "id"), &merged_mount.path);
   the_clone_holds_the_edits(&merged_mount.path, &files);
 }
+
+/// Format: the environment variable turning this test binary, spawned by a test playing the anchor, into the garbling
+/// daemon ([`garbling_daemon`]); its value is the instance the real daemon then serves.
+const GARBLING_DAEMON_INSTANCE: &str = "SLATES_TEST_GARBLING_DAEMON_INSTANCE";
+/// Shape: the bad hold messages the garbling daemon sends before it becomes the real daemon, half of each of two kinds.
+const GARBLED_HOLD_MESSAGES: usize = 20;
+/// Format: the kind byte no hold message has.
+const UNKNOWN_HOLD_KIND: u8 = 0xff;
+/// Format: the daemon status line carrying the anchor's hold refusals (A-213).
+const HOLD_REFUSALS_LINE: &str = "anchor_hold_refusals: ";
+/// Shape: the quick profile's probe budget (milliseconds), as `slates anchor --quick` measures it
+/// (`crates/cli/src/daemon.rs`, `QUICK_PROBE_MS`).
+const QUICK_PROBE_MS: u64 = 5;
+
+/// The garbling daemon: spawned by a real supervisor ([`a_real_anchors_hold_refusals_show_in_slates_status`]), it sends
+/// [`GARBLED_HOLD_MESSAGES`] bad messages on the hold channel it inherited, a message of half a message's length and a
+/// whole one of an unknown kind in turn, then replaces itself with the real `slates daemon`, which inherits the same
+/// channel, segment and rendezvous. No daemon code garbles: the bad messages are this process's, before the daemon runs.
+#[test]
+#[ignore = "the garbling daemon; run by the test playing the anchor, with --ignored"]
+fn garbling_daemon() {
+  use std::os::fd::BorrowedFd;
+  use std::os::unix::process::CommandExt;
+  let Ok(instance) = std::env::var(GARBLING_DAEMON_INSTANCE) else {
+    return;
+  };
+  let handed =
+    std::env::var(slates_anchor::held::ENV_DEVICES).expect("the anchor handed the channel over");
+  let inherited = slates_anchor::held::parse_env(&handed).unwrap();
+  // SAFETY: the anchor made the channel's daemon end inheritable and named its number in the environment. It is
+  // borrowed, never owned, so it stays open across the exec below for the real daemon to adopt.
+  let channel = unsafe { BorrowedFd::borrow_raw(inherited.channel) };
+  let short = vec![0u8; slates_anchor::held::MESSAGE_BYTES / 2];
+  let mut unknown = vec![0u8; slates_anchor::held::MESSAGE_BYTES];
+  unknown[0] = UNKNOWN_HOLD_KIND;
+  for message in 0..GARBLED_HOLD_MESSAGES {
+    let bytes = if message % 2 == 0 { &short } else { &unknown };
+    let sent = rustix::net::send(channel, bytes, rustix::net::SendFlags::empty()).unwrap();
+    assert_eq!(sent, bytes.len(), "a datagram is sent whole");
+  }
+  let error = slates()
+    .args([
+      "--instance",
+      &instance,
+      "daemon",
+      "--quick",
+      "--shards",
+      SHARDS,
+    ])
+    .env_remove(GARBLING_DAEMON_INSTANCE)
+    .exec();
+  panic!("the real daemon could not be started: {error}");
+}
+
+/// The supervisor of [`a_real_anchors_hold_refusals_show_in_slates_status`], stopped and its daemon reaped on drop, so
+/// a failed assertion leaves no daemon behind.
+struct SupervisingTest(slates_anchor::Supervisor);
+
+impl Drop for SupervisingTest {
+  fn drop(&mut self) {
+    let _ = self.0.stop();
+  }
+}
+
+/// A-213. Do: play the anchor with the real supervisor `slates anchor` runs, over a daemon whose process first sends 20
+/// bad hold messages of two kinds and then becomes the real `slates daemon`; ask `slates status`. Expect
+/// `anchor_hold_refusals: 20`: the refusals the anchor's log says once per kind reach the operator in full. Before, the
+/// count lived only in the anchor's memory and nothing printed it.
+#[test]
+fn a_real_anchors_hold_refusals_show_in_slates_status() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the anchor's hold refusals in status: set SLATES_TEST_CLI=1 to run it (an anchor and its daemon)"
+    );
+    return;
+  }
+  use slates_anchor::{AnchorSegment, RegionKind, RestartPolicy, Step, Supervisor};
+  use slates_machine::{MachineProfile, ProfileOptions};
+  let instance = format!("cli-hold-refusals-{}", std::process::id());
+  let profile = MachineProfile::measure_patiently(&ProfileOptions {
+    budget_per_probe: Duration::from_millis(QUICK_PROBE_MS),
+    codecs: false,
+    core_matrix: false,
+  })
+  .unwrap();
+  let config =
+    slates_server::DaemonConfig::derive(&profile, &instance, Some(SHARDS.parse().unwrap()));
+  // The segment, its content object and the published profile, as `slates anchor` makes them.
+  let mut segment = AnchorSegment::create(
+    &format!("slates-seg-{instance}"),
+    &profile.facts.identity,
+    config.geometry,
+  )
+  .and_then(|segment| {
+    segment.with_content(&format!("slates-con-{instance}"), config.content_bytes())
+  })
+  .unwrap();
+  segment
+    .publish(RegionKind::Profile, profile.to_json().unwrap().as_bytes())
+    .unwrap();
+  let args = ["--ignored", "--exact", "garbling_daemon", "--nocapture"].map(str::to_owned);
+  let policy = RestartPolicy::derive(
+    slates_db::replay::RECOVERY_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  );
+  let mut anchor = SupervisingTest(Supervisor::new(segment, &args, policy.get()).unwrap());
+  anchor
+    .0
+    .hold_descriptors(
+      config.held_device_bound(),
+      config.held_connection_bound(),
+      config.held_copy_bound(),
+    )
+    .unwrap();
+  let rendezvous = slates_ipc::rendezvous::HeldRendezvous::hold(&instance).unwrap();
+  anchor.0.hold_environment(
+    slates_ipc::rendezvous::ENV_RENDEZVOUS,
+    rendezvous.adoption().env_value().to_owned(),
+  );
+  anchor
+    .0
+    .hold_environment(GARBLING_DAEMON_INSTANCE, instance.clone());
+  let clock = Instant::now();
+  let now = || u64::try_from(clock.elapsed().as_nanos()).unwrap();
+  anchor.0.start(now()).unwrap();
+  let mut reported = None;
+  let mut last = String::new();
+  while clock.elapsed() < START_WAIT && reported != Some(GARBLED_HOLD_MESSAGES) {
+    match anchor.0.step(now()).unwrap() {
+      Step::Running => {}
+      other => panic!("the daemon left: {other:?}; last status: {last}"),
+    }
+    let (code, out, error) = run(&instance, &["status"]);
+    last = format!("exit {code}: {out}{error}");
+    reported = out
+      .lines()
+      .find_map(|line| line.strip_prefix(HOLD_REFUSALS_LINE))
+      .and_then(|count| count.trim().parse::<usize>().ok());
+    pause();
+  }
+  assert_eq!(
+    anchor.0.device_refusals(),
+    u64::try_from(GARBLED_HOLD_MESSAGES).unwrap(),
+    "the anchor counted every bad message"
+  );
+  assert_eq!(
+    reported,
+    Some(GARBLED_HOLD_MESSAGES),
+    "slates status reports the anchor's refusals; last status: {last}"
+  );
+}

@@ -2885,6 +2885,9 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 > left a drive held on each Windows lane, with the anchor stopped (run 41978665514). A DLL other than 2.1 is refused at
 > mount. Slates refuses no path the WinFsp driver passes: the driver refuses from 8,116 UTF-16 units, measured live on both
 > lanes, and the name reserve is derived from that limit.
+> **Status (2026-11-04, A-213).** Every refusal of the hold channel is published in the segment and shown by
+> `slates status` as `anchor_hold_refusals`, so a refusal past its kind's first log line is still seen; the Unix device
+> hold's log is bounded as the Windows hold's is.
 
 **Base reads on macOS and Windows.** As on Linux, the daemon reads untouched base files through its own descriptor or
 handle into evictable cache chunks (one copy, `pread`/`ReadFile` on the owner shard's driver) and
@@ -12812,6 +12815,26 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
 - **Arm64 Windows proven** since (2026-10-27): the direct-map client tests, 20 of 20, on CI's `windows-11-arm` (run
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
+
+### A-213 — The anchor's hold refusals: a bounded log on every platform, and a count the operator reads in `slates status` (accepted 2026-11-04, siblings of audit step 3)
+Applied in the same change to: GAPS, A-198's status in §4.6, `crates/anchor` (`handles.rs` `RefusalLog` generic,
+`supervise.rs` the device hold's log and the published count, `layout.rs` and `segment.rs` the new supervision word),
+`crates/ipc` (`DaemonReport::anchor_hold_refusals`, appended), `crates/server` (`verbs.rs`, the daemon report),
+`crates/cli` (`slates status`'s line), `crates/mcp` (the daemon status JSON). Bug record:
+`docs/bugs/2026-11-04-the-unix-device-hold-logged-every-refusal.md`.
+- **The Unix device hold's log is bounded.** A-61's hold counted each refused device message and logged a line for each.
+  It now logs through the same `RefusalLog` as A-198's Windows hold: each distinct refusal once over the anchor's life,
+  in a table of 64, every refusal counted. Logging on a change of kind was rejected for the Windows hold on a
+  measurement (two kinds alternating log a line a message), and the reason holds here.
+- **The count reaches the operator.** With the log saying each kind once, the count is the only record of the rest. The
+  anchor has no surface of its own: an operator asks the daemon (`slates status`), and the daemon knows its anchor
+  through the segment's supervision block. So the block gains one word, `SUP_HOLD_REFUSALS`, at offset 192, the first
+  cache line past the sealing root. The supervisor writes every refusal its hold channel has counted (the Unix device
+  hold's, or the Windows hold's channel and holdings) there in each step, when the count has moved. The daemon copies it
+  into its status report as `anchor_hold_refusals`, which `slates status`, its `--json` and the MCP daemon status print.
+  A block an older anchor wrote holds zero there.
+- **Rejected:** a status surface on the anchor itself (a second rendezvous and a second protocol for one number), and the
+  daemon counting refusals it caused (it cannot see what the anchor refused).
 
 ### A-206 — A WinFsp file system is deleted only after the anchor releases its hold, the DLL's version is checked, and slates refuses no path the driver passes (accepted 2026-11-04, audit plan 01a1a34bf7e973069e94f773afdea44a, steps 4 and 6)
 Applied in the same change to: GAPS (the audit entry), §4.6's status through A-198's corrections, `docs/wip/platforms.md`,

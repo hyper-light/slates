@@ -49,6 +49,7 @@ fn report() -> ReplyBody {
         keys_held: 3,
         recipient_id: vec![83; 16],
       },
+      anchor_hold_refusals: 97,
       fleet: FleetReport {
         host: 19,
         f: 0,
