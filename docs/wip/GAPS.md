@@ -219,24 +219,6 @@
 > `slates-guest-probe` (11) and `slates-test-seeds` (1) keep their print macros. They do not ship, and a closed pipe still
 > panics them. Record: `docs/bugs/2026-11-05-a-closed-log-pipe-ended-the-anchor.md`.
 
-> **The large-file NFS write gap (VFS plan step 11, 2026-11-05): closed on the incumbent harness by A-204 and A-214.**
-> The incumbent harness on the M5 Max (six interleaved rounds, load 6–10, 2026-11-05 16:23Z) writes the 64 MiB file
-> at up to 1,286.0 MiB/s with A-214, against 1,033.9 before it and step 11's 967, beyond the spread at 4 and 16
-> workers. Write p99s at 16 workers overlap with no direction. Profiled through Linux's NFSv4.2 client on CI (run
-> 41986870989), the one busy shard had spent 41.5% of its samples faulting in fresh pages of the anchor's shared
-> content object, 21.0% sealing at rest and 12.4% peeking and copying records. BENCHMARKS, "The large-file NFS write
-> profiled" and "an idle shard keeps its last write burst's pages pre-faulted".
-> - **A-204:** a turn takes only the records its quantum can reach (CI best of nine 441.3 → 472.2 MiB/s, +26% at 16
->   workers; even on the Mac).
-> - **A-214 (Ada's option (a)):** an idle shard keeps its last write burst's net growth of free pages pre-faulted,
->   refilled in its idle moments, at most its memory share. A first build refilled only at the reap tick, which the
->   harness's second-long pauses never reached on the volume's shard; the refill is now the runtime's idle work.
-> - **Open:** the gap to nfsd remains about 1.5× at 4 and 16 workers (nfsd 1,458–2,081 MiB/s), and at 1 worker, where the
->   first large write follows no earlier burst, A-214 does not apply. Sealing at rest (21%) is condition 9's. The CI
->   A/B of A-214's idle refill is owed (diagnostics branch `diag-nfs-write-12`).
-> - **Tried and not taken:** populating fresh pages in batches or from a second thread (run 41987962954); filling them
->   by `pwrite` into the content object (1.9× per fresh page), which R1's lint wall forbids.
-
 > **The anchor's hold refusals: a bounded Unix log, and a count in `slates status` (2026-11-04, A-213; siblings of
 > audit step 3).** The Unix device hold logged a line per refused message, unbounded; it now logs each distinct refusal
 > once (`RefusalLog`, as the Windows hold does) and counts every one. Every refusal on either platform's hold channel
@@ -278,29 +260,6 @@
 >   `crates/cli`: a failing test, then diagnostics that survive a closed stderr.
 > - **Not yet:** reproducibility from the tag (AC-9.5: nothing builds twice and compares); the macOS `Slates.app`
 >   bundle, code signing and notarization (B.7; they need an Apple Developer identity); `cargo-binstall` metadata.
-
-> **The large-file NFS write gap (VFS plan step 11, 2026-11-05): open; most of it is fresh content pages, a decision
-> for Ada.** On the incumbent harness (Docker on the M5 Max, one run on today's main) slates writes the 64 MiB file
-> at 808–957 MiB/s against nfsd's 1,556–1,831, short of the 967 MiB/s step 11 asks. Profiled through Linux's NFSv4.2
-> client on CI (run 41986870989), the one busy shard spends 41.5% of its samples faulting in fresh pages of the
-> anchor's shared content object, one 4 KiB `shmem_fault` per page, 21.0% sealing at rest, and 12.4% peeking and
-> copying records. With the pages still resident the same write matches nfsd (2,047–2,190 against 2,148–2,218 MiB/s,
-> run 41978355633); after A-105's idle purge gives them back it falls to 874–957. The harness never deletes its
-> large files, so it always writes fresh pages. BENCHMARKS, "The large-file NFS write profiled".
-> - **Landed:** a turn takes only the records its quantum can reach (A-204): best of nine through Linux's
->   client on CI, 441.3 → 472.2 MiB/s, and +26% at 16 workers (run 41989095517). On the incumbent Mac (six interleaved
->   rounds, load 23–38) its medians rose 7–9% and its best was 1,007.8 MiB/s, but main's best was 1,019.0: both clear
->   967 there and the arms overlap, while nfsd wrote 868–1,990.
-> - **Tried and not taken:** populating fresh pages in batches (`MADV_POPULATE_WRITE` per 64 KiB or 1 MiB: 1,221–1,269
->   against 1,293–1,305 MiB/s by plain faults) and populating ahead on a second thread (972–1,006: the two threads
->   contend), run 41987962954.
-> - **Needs Ada, one of:** (a) keep a pre-faulted reserve of free content pages, refilled at idle, sized from the
->   shard's last write burst, so a burst after idle lands on resident pages (this amends A-105, which gives every free
->   page back at the first idle tick, and costs that much resident memory per shard); (b) let the write path fill
->   fresh content pages through the kernel's write path, `pwrite` into the content memfd, 1.9× faster per fresh page
->   (2,475–2,493 against 1,293–1,305 MiB/s) but a write syscall outside `slates-land`, which R1's lint wall forbids;
->   or (c) neither, and record the fresh-page fault as the named cost of keeping content in the anchor's shared RAM
->   on hosts whose `shmem_enabled` is `never` (CI's runner; slates already asks for huge pages where it is not).
 
 > **WinFsp's hold release, DLL version and long paths fixed (2026-11-04, A-206; audit steps 4 and 6).** Run
 > [41978665514](https://github.com/hyper-light/slates/actions/runs/41978665514), `windows-latest` and `windows-11-arm`,
