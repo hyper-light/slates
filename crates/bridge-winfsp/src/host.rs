@@ -489,7 +489,7 @@ fn admission_refusal<C>(
     Op::Open { .. } | Op::PurgeOpen { .. } | Op::Create { .. } if !ledger.has_room() => {
       Some(VfsError::NoSpace)
     }
-    Op::Rename { from, to } if !names.rename_fits(from, to) => Some(VfsError::NameTooLong),
+    Op::Rename { from, to, .. } if !names.rename_fits(from, to) => Some(VfsError::NameTooLong),
     _ => None,
   }
 }
