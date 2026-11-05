@@ -12865,7 +12865,31 @@ and failed-then-passing oracles distinguish those results from the initial sourc
      serves.
 
   A detach, a destroy or a stop releases all three before the file system is deleted, so a mount that ends still loses
-  its volume and its drive at once.
+  its volume and its drive at once. **Correction (2026-11-04, audit step 4):** this sentence was not true of a release
+  the anchor refused or did not answer; see "A release the anchor does not answer" below.
+- **A release the anchor does not answer (2026-11-04, audit step 4).** The file system is deleted only after the anchor
+  has answered the release. Bug record: `docs/bugs/2026-11-04-a-refused-hold-release-left-a-drive-held.md`.
+  - The hold channel outlives a missed deadline: the pipe goes back for the next exchange, whose read passes over any
+    answer that is not its own. Before, the deadline's pass closed the daemon's only pipe, and every later hold and
+    release was refused for that daemon's life. That deadline was also the clock's reading plus the budget given to a
+    wait that takes a span, so it lasted the daemon's uptime.
+  - A hold waits at most the recovery budget plus the liveness budget (2 s), which covers the anchor's own wait of at
+    most half the liveness budget between looks at the channel. A release attempt waits the liveness budget (1 s).
+  - A `detach` asks while the mount serves on and repeats for the same 2 s. An answer ends the attachment and the mount.
+    Past it the detach answers `TargetUnavailable` and the drive stays served and held. The request stands, because it
+    may already be in the pipe for the anchor's next turn, so the drive goes when the anchor answers. A killed daemon
+    in that window has its attachment adopted if the anchor still holds it, and ended if not.
+  - A destroy, a revocation, a refused adoption and a lost mount have ended the attachment already, so the mount stops
+    serving and waits for the same answer before deleting. A refused mount-time hold answers its typed refusal first, then
+    the same; the objects its message names stay open until the answer, and nothing stays mounted after it.
+  - The wait has no bound in time, since an anchor that never answers leaves nothing safe to delete. It holds one task
+    and one message per mount, and ends at the answer or the shard's stop. An anchor's death takes the daemon by its job.
+- **The DLL's version is checked (2026-11-04, audit step 6).** The receiver writes `FSP_FILE_SYSTEM` fields and calls its
+  operation table by offset, so a mount refuses any DLL whose `FspVersion` is not 2.1, before it touches that object,
+  with the number in the refusal (`crates/bridge-winfsp/src/dll_version.rs`). The earlier guard read
+  `FSP_FILE_SYSTEM.Version`, which v2.1 always zeroes. A new WinFsp minor version therefore refuses every mount until the
+  layout is reviewed and the constant raised. Bug record:
+  `docs/bugs/2026-11-04-the-winfsp-guard-read-a-field-winfsp-always-zeroes.md`.
 - **The drive is the daemon's own.** The daemon defines the drive letter itself, as `FspMountSet_Drive` does: it calls
   `DefineDosDeviceW` with `DDD_RAW_TARGET_PATH`, opens the link with `DELETE`, makes it temporary and keeps its handle.
   It no longer calls `FspFileSystemSetMountPoint`, so the handle is the daemon's to duplicate. A successful mount
@@ -12946,6 +12970,12 @@ and failed-then-passing oracles distinguish those results from the initial sourc
   from the file's current namespace home. Each slot has two generation-checked UTF-16 name versions with CRC32C,
   published one complete version at a time. The unnamed sparse section reserves the admitted open/path caps and
   commits touched ranges only. Recovery seeds one context per owner turn from these records.
+  - **Long names (2026-11-04, audit step 6).** A record holds up to Windows' own limit, 32,767 UTF-16 units, because
+    `UNICODE_STRING.Length` is a `USHORT` of bytes and a directory rename can lengthen a held name however WinFsp admitted
+    it. Windows commits by the 64 KiB granule, so a record keeps its first 1,024 units in place and the rest in a second
+    region: a short path commits what it did, and at `MAX_OPEN_HANDLES` the reserve is 8.6 GiB of address space per
+    mount. Before, every open past 1,024 units was refused, since each open records its name, and a request's parser
+    ended the receive worker on one. Bug record: `docs/bugs/2026-11-04-a-winfsp-open-past-1024-units-was-refused.md`.
   - Every WinFsp cache hangs off an open file node, including the Cache Manager's own file-object reference
     (`bridge-winfsp/src/notify.rs` and WinFsp's `FspFileNodeInvalidateCachesAndNotifyChangeByName`). The first round
     therefore notifies and purges every held kernel name, covering the A-158 set Windows can still cache. All aliases

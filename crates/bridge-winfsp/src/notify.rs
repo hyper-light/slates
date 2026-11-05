@@ -24,9 +24,10 @@
 //! **The record.** `FSP_FSCTL_NOTIFY_INFO` (`fsctl.h`, `static_assert` 12 bytes): `UINT16 Size`, two bytes of padding,
 //! `UINT32 Filter`, `UINT32 Action`, then the name in UTF-16 with no terminator; `Size` counts the head and the name,
 //! and each record starts at the next multiple of `FSP_FSCTL_DEFAULT_ALIGNMENT` (8), as the kernel walks them
-//! (`FspVolumeNotifyWork`, `src/sys/volume.c`). WinFsp paths are at most `FSP_FSCTL_TRANSACT_PATH_SIZEMAX` (1024 UTF-16
-//! units), so a record always fits its 16-bit size; a longer name than any WinFsp path is refused, counted, and left
-//! out rather than truncated into a different name.
+//! (`FspVolumeNotifyWork`, `src/sys/volume.c`). A name past what the 16-bit size can count ([`MAX_NOTIFY_UNITS`]; only
+//! a directory rename can lengthen a held name that far) is refused, counted, and left out rather than truncated into
+//! a different name. `FSP_FSCTL_TRANSACT_PATH_SIZEMAX` (1024 units) does not limit an absolute name here: that kernel
+//! buffer holds only a name relative to the record before it, which this module never sends.
 
 use std::collections::BTreeMap;
 
@@ -57,9 +58,13 @@ const EVERYTHING_FILTER: u32 = INODE_FILTER | ENTRY_FILTER;
 pub const NOTIFY_INFO_HEAD: usize = 12;
 /// Format: `FSP_FSCTL_DEFAULT_ALIGNMENT` (`fsctl.h`): each record starts at a multiple of it.
 pub const NOTIFY_INFO_ALIGNMENT: usize = 8;
-/// Format: `FSP_FSCTL_TRANSACT_PATH_SIZEMAX / sizeof(WCHAR)` (`fsctl.h`): the longest path WinFsp hands a file system,
-/// in UTF-16 units. A name longer than this was never handed out, so it is never told.
-pub const MAX_PATH_UNITS: usize = 1024;
+/// Format: Windows' own limit on a name, in UTF-16 units: `UNICODE_STRING.Length` is a `USHORT` counting bytes, whose
+/// largest even value is 65,534. WinFsp's file node name is one (`src/sys/file.c`), so a held name never exceeds this
+/// however far renames lengthen it. `FSP_FSCTL_TRANSACT_PATH_SIZEMAX`'s 1024 units limits only a response's normalized
+/// name and a relative notification, neither of which this host sends.
+pub const MAX_PATH_UNITS: usize = (u16::MAX as usize) / size_of::<u16>();
+/// Derived: the longest name a record's 16-bit `Size` can count after its head, in UTF-16 units.
+pub const MAX_NOTIFY_UNITS: usize = ((u16::MAX as usize) - NOTIFY_INFO_HEAD) / size_of::<u16>();
 
 /// The names Windows holds open on a WinFsp mount, by the bridge's open handle: each the inode it names and the path it
 /// was opened by, as the kernel's file node is named. See the module docs for why these are what Windows can hold stale.
@@ -220,7 +225,7 @@ impl NotifyRound {
       .len()
       .checked_mul(std::mem::size_of::<u16>())
       .and_then(|name| name.checked_add(NOTIFY_INFO_HEAD))
-      .filter(|_| units.len() <= MAX_PATH_UNITS)
+      .filter(|_| units.len() <= MAX_NOTIFY_UNITS)
       .and_then(|size| u16::try_from(size).ok())
     else {
       self.too_long = self.too_long.saturating_add(1);
@@ -415,13 +420,13 @@ mod tests {
     assert_eq!(bytes.len(), 24 + 16);
   }
 
-  /// Format: `FSP_FSCTL_TRANSACT_PATH_SIZEMAX`. Do: hold open a name of 1024 units and one of 1025. Expect: the first is
-  /// told and the second left out and counted, never truncated into another name.
+  /// Format: the record's 16-bit `Size`. Do: hold open a name of [`MAX_NOTIFY_UNITS`] units and one a unit longer. Expect:
+  /// the first is told and the second left out and counted, never truncated into another name.
   #[test]
-  fn a_name_longer_than_any_winfsp_path_is_counted_not_truncated() {
+  fn a_name_longer_than_a_record_can_count_is_counted_not_truncated() {
     let mut names = OpenNames::new();
-    let longest = format!("\\{}", "x".repeat(MAX_PATH_UNITS - 1));
-    let longer = format!("\\{}", "y".repeat(MAX_PATH_UNITS));
+    let longest = format!("\\{}", "x".repeat(MAX_NOTIFY_UNITS - 1));
+    let longer = format!("\\{}", "y".repeat(MAX_NOTIFY_UNITS));
     names.opened(1, 1, &longest);
     names.opened(2, 2, &longer);
     let mut round = NotifyRound::new();
@@ -429,5 +434,19 @@ mod tests {
     assert_eq!(round.records(), 1);
     assert_eq!(round.too_long(), 1);
     assert_eq!(walk(round.bytes())[0].2, longest);
+  }
+
+  /// A-198. Do: hold open a name of 1,025 units, past `FSP_FSCTL_TRANSACT_PATH_SIZEMAX`. Expect: it is told, whole. Before
+  /// 2026-11-04 any name past 1,024 units was left out, so another path's change never reached its node.
+  #[test]
+  fn a_name_past_a_thousand_units_is_told() {
+    let mut names = OpenNames::new();
+    let long = format!("\\{}", "x".repeat(1024));
+    names.opened(1, 1, &long);
+    let mut round = NotifyRound::new();
+    round.add(&Invalidation::Everything, &names);
+    assert_eq!(round.records(), 1);
+    assert_eq!(round.too_long(), 0);
+    assert_eq!(walk(round.bytes())[0].2, long);
   }
 }
