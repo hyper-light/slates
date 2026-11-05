@@ -13,7 +13,7 @@
 /// Format: the version `FspVersion` answers for WinFsp v2.1 (`major << 16 | minor`), whose headers and sources
 /// `crate::ffi`, `crate::dispatcher` and `crate::inflight` were written from (WinFsp 2.1.25156 on CI's runners,
 /// `docs/wip/research/winfsp-takeover.md`). Raising it is a review of that layout against the new version's sources.
-pub const CHECKED_VERSION: u32 = (2 << u16::BITS) | 1;
+pub const CHECKED_VERSION: u32 = (2 << u16::BITS) | 2;
 
 /// A DLL whose version is not [`CHECKED_VERSION`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
