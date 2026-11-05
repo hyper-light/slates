@@ -1667,6 +1667,8 @@ fn after_held_record(state: &mut ShardState, record: &Record) {
   }
   if let Some(value) = crate::tombstone::TombstoneValue::from_record_bytes(&record.value) {
     crate::tombstone::on_held(state, record.object, value);
+    // A destroyed volume's live log goes with it (A-200): no owner ships to it again.
+    crate::live_ship::let_go(state, record.object);
   } else {
     // A newer head or ledger position may supersede content held for the object (AUD-29-43).
     crate::content_retention::retain_object(state, record.object);

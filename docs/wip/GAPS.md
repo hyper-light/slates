@@ -80,8 +80,10 @@
 > before). Chaos across real processes (§4.10 status): a candidate partitioned away (SIGSTOP) and healed, and both
 > candidates stalled in overlapping 30 ms windows through 30 writes, each write durable at its return (stall p90
 > 33 ms, max 47 ms) and every candidate caught up after; the partition found a live exchange budget a stopped peer
-> inflated, now the liveness budget with dead links redialed. Open: hard links and extended attributes in the rebuilt
-> volume; a superseded owner resumed after its takeover, and clients cut off mid-write, under the same harness. Open, toward a filesystem
+> inflated, now the liveness budget with dead links redialed. A superseded owner resumed after its takeover never has a
+> write acknowledged; writers killed mid-write leave the log whole and no reply held; a destroyed volume's copies are
+> let go (three defects found and fixed on the way: §4.10 status "Chaos, continued"). Open: hard links and extended
+> attributes in the rebuilt volume; FUSE `fsync` at durability; a candidate's copy across its own daemon's restart. Open, toward a filesystem
 > server replicated per write in under 1 ms: FUSE `fsync` answered at durability (AC-8.3's "live-shipped volumes
 > report none", AC-8.9's credit backpressure); a candidate's copy kept across its own restart; real-process chaos
 > (partitions, injected latency, volume failure, client disconnect). `put_wal` and the
