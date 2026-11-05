@@ -1,0 +1,1310 @@
+t/base/00.t	driver	call	CreateFile 00000001 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/base/00.t	case	expect	CreateFile 00000001 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/base/00.t	driver	call	CreateFile 00000001 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/base/00.t	case	expect	CreateFile 00000001 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	ERROR_FILE_EXISTS
+t/base/00.t	driver	call	DeleteFile 00000001
+t/base/00.t	case	expect	DeleteFile 00000001	0
+t/base/00.t	driver	call	DeleteFile 00000001
+t/base/00.t	case	expect	DeleteFile 00000001	ERROR_FILE_NOT_FOUND
+t/base/00.t	driver	call	CreateFile 00000001 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0
+t/base/00.t	case	expect	CreateFile 00000001 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0	0
+t/base/00.t	driver	call	CreateFile 00000001 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0
+t/base/00.t	case	expect	CreateFile 00000001 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0	0
+t/base/00.t	driver	call	-e CreateFile 00000001 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0
+t/base/00.t	case	expect	-e CreateFile 00000001 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0	ERROR_ALREADY_EXISTS
+t/base/00.t	driver	call	DeleteFile 00000001
+t/base/00.t	case	expect	DeleteFile 00000001	0
+t/base/00.t	driver	call	CreateFile 00000001 GENERIC_WRITE 0 0 OPEN_ALWAYS FILE_ATTRIBUTE_NORMAL 0
+t/base/00.t	case	expect	CreateFile 00000001 GENERIC_WRITE 0 0 OPEN_ALWAYS FILE_ATTRIBUTE_NORMAL 0	0
+t/base/00.t	driver	call	CreateFile 00000001 GENERIC_WRITE 0 0 OPEN_ALWAYS FILE_ATTRIBUTE_NORMAL 0
+t/base/00.t	case	expect	CreateFile 00000001 GENERIC_WRITE 0 0 OPEN_ALWAYS FILE_ATTRIBUTE_NORMAL 0	0
+t/base/00.t	driver	call	-e CreateFile 00000001 GENERIC_WRITE 0 0 OPEN_ALWAYS FILE_ATTRIBUTE_NORMAL 0
+t/base/00.t	case	expect	-e CreateFile 00000001 GENERIC_WRITE 0 0 OPEN_ALWAYS FILE_ATTRIBUTE_NORMAL 0	ERROR_ALREADY_EXISTS
+t/base/00.t	driver	call	DeleteFile 00000001
+t/base/00.t	case	expect	DeleteFile 00000001	0
+t/base/00.t	driver	call	CreateFile 00000001 GENERIC_WRITE 0 0 OPEN_EXISTING FILE_ATTRIBUTE_NORMAL 0
+t/base/00.t	case	expect	CreateFile 00000001 GENERIC_WRITE 0 0 OPEN_EXISTING FILE_ATTRIBUTE_NORMAL 0	ERROR_FILE_NOT_FOUND
+t/base/00.t	driver	call	CreateFile 00000001 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0
+t/base/00.t	case	expect	CreateFile 00000001 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0	0
+t/base/00.t	driver	call	CreateFile 00000001 GENERIC_WRITE 0 0 OPEN_EXISTING FILE_ATTRIBUTE_NORMAL 0
+t/base/00.t	case	expect	CreateFile 00000001 GENERIC_WRITE 0 0 OPEN_EXISTING FILE_ATTRIBUTE_NORMAL 0	0
+t/base/00.t	driver	call	DeleteFile 00000001
+t/base/00.t	case	expect	DeleteFile 00000001	0
+t/base/00.t	driver	call	CreateFile 00000001 GENERIC_WRITE 0 0 TRUNCATE_EXISTING FILE_ATTRIBUTE_NORMAL 0
+t/base/00.t	case	expect	CreateFile 00000001 GENERIC_WRITE 0 0 TRUNCATE_EXISTING FILE_ATTRIBUTE_NORMAL 0	ERROR_FILE_NOT_FOUND
+t/base/00.t	driver	call	CreateFile 00000001 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0
+t/base/00.t	case	expect	CreateFile 00000001 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0	0
+t/base/00.t	driver	call	CreateFile 00000001 GENERIC_WRITE 0 0 TRUNCATE_EXISTING FILE_ATTRIBUTE_NORMAL 0
+t/base/00.t	case	expect	CreateFile 00000001 GENERIC_WRITE 0 0 TRUNCATE_EXISTING FILE_ATTRIBUTE_NORMAL 0	0
+t/base/00.t	driver	call	DeleteFile 00000001
+t/base/00.t	case	expect	DeleteFile 00000001	0
+t/base/00.t	driver	call	CreateFile 00000001\bar GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/base/00.t	case	expect	CreateFile 00000001\bar GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	ERROR_PATH_NOT_FOUND
+t/base/01.t	driver	call	CreateFile 00000002 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0
+t/base/01.t	case	expect	CreateFile 00000002 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0	0
+t/base/01.t	driver	call	GetFileInformation 00000002
+t/base/01.t	case	expect	GetFileInformation 00000002	lambda
+t/base/01.t	driver	call	CreateFile 00000002 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_READONLY 0
+t/base/01.t	case	expect	CreateFile 00000002 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_READONLY 0	0
+t/base/01.t	driver	call	GetFileInformation 00000002
+t/base/01.t	case	expect	GetFileInformation 00000002	lambda
+t/base/01.t	driver	call	SetFileAttributes 00000002 FILE_ATTRIBUTE_NORMAL
+t/base/01.t	case	expect	SetFileAttributes 00000002 FILE_ATTRIBUTE_NORMAL	0
+t/base/01.t	driver	call	CreateFile 00000002 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_SYSTEM 0
+t/base/01.t	case	expect	CreateFile 00000002 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_SYSTEM 0	0
+t/base/01.t	driver	call	GetFileInformation 00000002
+t/base/01.t	case	expect	GetFileInformation 00000002	lambda
+t/base/01.t	driver	call	SetFileAttributes 00000002 FILE_ATTRIBUTE_NORMAL
+t/base/01.t	case	expect	SetFileAttributes 00000002 FILE_ATTRIBUTE_NORMAL	0
+t/base/01.t	driver	call	CreateFile 00000002 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_HIDDEN 0
+t/base/01.t	case	expect	CreateFile 00000002 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_HIDDEN 0	0
+t/base/01.t	driver	call	GetFileInformation 00000002
+t/base/01.t	case	expect	GetFileInformation 00000002	lambda
+t/base/01.t	driver	call	DeleteFile 00000002
+t/base/01.t	case	expect	DeleteFile 00000002	0
+t/base/01.t	driver	call	CreateFile 00000002 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_READONLY 0
+t/base/01.t	case	expect	CreateFile 00000002 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_READONLY 0	0
+t/base/01.t	driver	call	DeleteFile 00000002
+t/base/01.t	case	expect	DeleteFile 00000002	ERROR_ACCESS_DENIED
+t/base/01.t	driver	call	SetFileAttributes 00000002 FILE_ATTRIBUTE_NORMAL
+t/base/01.t	case	expect	SetFileAttributes 00000002 FILE_ATTRIBUTE_NORMAL	0
+t/base/01.t	driver	call	DeleteFile 00000002
+t/base/01.t	case	expect	DeleteFile 00000002	0
+t/base/02.t	driver	call	CreateFile 00000003 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/base/02.t	case	expect	CreateFile 00000003 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/base/02.t	driver	call	CreateDirectory 00000003 0
+t/base/02.t	case	expect	CreateDirectory 00000003 0	ERROR_ALREADY_EXISTS
+t/base/02.t	driver	call	RemoveDirectory 00000003
+t/base/02.t	case	expect	RemoveDirectory 00000003	ERROR_DIRECTORY
+t/base/02.t	driver	call	DeleteFile 00000003
+t/base/02.t	case	expect	DeleteFile 00000003	0
+t/base/02.t	driver	call	CreateDirectory 00000003 0
+t/base/02.t	case	expect	CreateDirectory 00000003 0	0
+t/base/02.t	driver	call	CreateDirectory 00000003 0
+t/base/02.t	case	expect	CreateDirectory 00000003 0	ERROR_ALREADY_EXISTS
+t/base/02.t	driver	call	GetFileInformation 00000003
+t/base/02.t	case	expect	GetFileInformation 00000003	lambda
+t/base/02.t	driver	call	DeleteFile 00000003
+t/base/02.t	case	expect	DeleteFile 00000003	ERROR_ACCESS_DENIED
+t/base/02.t	driver	call	RemoveDirectory 00000003
+t/base/02.t	case	expect	RemoveDirectory 00000003	0
+t/base/02.t	driver	call	RemoveDirectory 00000003
+t/base/02.t	case	expect	RemoveDirectory 00000003	ERROR_FILE_NOT_FOUND
+t/base/02.t	driver	call	CreateDirectory 00000003 0
+t/base/02.t	case	expect	CreateDirectory 00000003 0	0
+t/base/02.t	driver	call	CreateFile 00000003 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/base/02.t	case	expect	CreateFile 00000003 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	ERROR_ACCESS_DENIED
+t/base/02.t	driver	call	RemoveDirectory 00000003
+t/base/02.t	case	expect	RemoveDirectory 00000003	0
+t/base/03.t	driver	call	CreateDirectory 00000004 0
+t/base/03.t	case	expect	CreateDirectory 00000004 0	0
+t/base/03.t	driver	call	CreateFile 00000004\foo GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/base/03.t	case	expect	CreateFile 00000004\foo GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/base/03.t	driver	call	RemoveDirectory 00000004
+t/base/03.t	case	expect	RemoveDirectory 00000004	ERROR_DIR_NOT_EMPTY
+t/base/03.t	driver	call	RemoveDirectory 00000004\foo
+t/base/03.t	case	expect	RemoveDirectory 00000004\foo	ERROR_DIRECTORY
+t/base/03.t	driver	call	DeleteFile 00000004\foo
+t/base/03.t	case	expect	DeleteFile 00000004\foo	0
+t/base/03.t	driver	call	RemoveDirectory 00000004
+t/base/03.t	case	expect	RemoveDirectory 00000004	0
+t/base/03.t	driver	call	CreateDirectory 00000004 0
+t/base/03.t	case	expect	CreateDirectory 00000004 0	0
+t/base/03.t	driver	call	CreateFile 00000004\foo GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/base/03.t	case	expect	CreateFile 00000004\foo GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/base/03.t	driver	call	CreateFile 00000004\bar GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/base/03.t	case	expect	CreateFile 00000004\bar GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/base/03.t	driver	call	FindFiles 00000004\*
+t/base/03.t	case	expect	FindFiles 00000004\*	0
+t/base/03.t	case	eval	testeval(len(s) == 4)
+t/base/03.t	case	eval	testeval("." in s)
+t/base/03.t	case	eval	testeval(".." in s)
+t/base/03.t	case	eval	testeval("foo" in s)
+t/base/03.t	case	eval	testeval("bar" in s)
+t/base/03.t	driver	call	DeleteFile 00000004\bar
+t/base/03.t	case	expect	DeleteFile 00000004\bar	0
+t/base/03.t	driver	call	DeleteFile 00000004\foo
+t/base/03.t	case	expect	DeleteFile 00000004\foo	0
+t/base/03.t	driver	call	RemoveDirectory 00000004
+t/base/03.t	case	expect	RemoveDirectory 00000004	0
+t/base/04.t	driver	call	CreateDirectory 00000005 0
+t/base/04.t	case	expect	CreateDirectory 00000005 0	0
+t/base/04.t	driver	call	CreateFile 00000005\foo GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/base/04.t	case	expect	CreateFile 00000005\foo GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/base/04.t	driver	call	CreateFile 00000005\baz GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_READONLY 0
+t/base/04.t	case	expect	CreateFile 00000005\baz GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_READONLY 0	0
+t/base/04.t	driver	call	MoveFileEx 00000005\foo 00000005\bar 0
+t/base/04.t	case	expect	MoveFileEx 00000005\foo 00000005\bar 0	0
+t/base/04.t	driver	call	GetFileInformation 00000005\foo
+t/base/04.t	case	expect	GetFileInformation 00000005\foo	ERROR_FILE_NOT_FOUND
+t/base/04.t	driver	call	GetFileInformation 00000005\bar
+t/base/04.t	case	expect	GetFileInformation 00000005\bar	0
+t/base/04.t	driver	call	MoveFileEx 00000005\bar 00000005\baz 0
+t/base/04.t	case	expect	MoveFileEx 00000005\bar 00000005\baz 0	ERROR_ALREADY_EXISTS
+t/base/04.t	driver	call	GetFileInformation 00000005\bar
+t/base/04.t	case	expect	GetFileInformation 00000005\bar	0
+t/base/04.t	driver	call	GetFileInformation 00000005\baz
+t/base/04.t	case	expect	GetFileInformation 00000005\baz	0
+t/base/04.t	driver	call	MoveFileEx 00000005\bar 00000005\baz MOVEFILE_REPLACE_EXISTING
+t/base/04.t	case	expect	MoveFileEx 00000005\bar 00000005\baz MOVEFILE_REPLACE_EXISTING	ERROR_ACCESS_DENIED
+t/base/04.t	driver	call	SetFileAttributes 00000005\baz FILE_ATTRIBUTE_NORMAL
+t/base/04.t	case	expect	SetFileAttributes 00000005\baz FILE_ATTRIBUTE_NORMAL	0
+t/base/04.t	driver	call	MoveFileEx 00000005\bar 00000005\baz MOVEFILE_REPLACE_EXISTING
+t/base/04.t	case	expect	MoveFileEx 00000005\bar 00000005\baz MOVEFILE_REPLACE_EXISTING	0
+t/base/04.t	driver	call	GetFileInformation 00000005\bar
+t/base/04.t	case	expect	GetFileInformation 00000005\bar	ERROR_FILE_NOT_FOUND
+t/base/04.t	driver	call	GetFileInformation 00000005\baz
+t/base/04.t	case	expect	GetFileInformation 00000005\baz	0
+t/base/04.t	driver	call	DeleteFile 00000005\baz
+t/base/04.t	case	expect	DeleteFile 00000005\baz	0
+t/base/04.t	driver	call	RemoveDirectory 00000005
+t/base/04.t	case	expect	RemoveDirectory 00000005	0
+t/base/04.t	driver	call	CreateDirectory 00000005 0
+t/base/04.t	case	expect	CreateDirectory 00000005 0	0
+t/base/04.t	driver	call	CreateDirectory 00000005\foo 0
+t/base/04.t	case	expect	CreateDirectory 00000005\foo 0	0
+t/base/04.t	driver	call	CreateDirectory 00000005\baz 0
+t/base/04.t	case	expect	CreateDirectory 00000005\baz 0	0
+t/base/04.t	driver	call	MoveFileEx 00000005\foo 00000005\bar 0
+t/base/04.t	case	expect	MoveFileEx 00000005\foo 00000005\bar 0	0
+t/base/04.t	driver	call	GetFileInformation 00000005\foo
+t/base/04.t	case	expect	GetFileInformation 00000005\foo	ERROR_FILE_NOT_FOUND
+t/base/04.t	driver	call	GetFileInformation 00000005\bar
+t/base/04.t	case	expect	GetFileInformation 00000005\bar	0
+t/base/04.t	driver	call	MoveFileEx 00000005\bar 00000005\baz 0
+t/base/04.t	case	expect	MoveFileEx 00000005\bar 00000005\baz 0	ERROR_ALREADY_EXISTS
+t/base/04.t	driver	call	GetFileInformation 00000005\bar
+t/base/04.t	case	expect	GetFileInformation 00000005\bar	0
+t/base/04.t	driver	call	GetFileInformation 00000005\baz
+t/base/04.t	case	expect	GetFileInformation 00000005\baz	0
+t/base/04.t	driver	call	MoveFileEx 00000005\bar 00000005\baz MOVEFILE_REPLACE_EXISTING
+t/base/04.t	case	expect	MoveFileEx 00000005\bar 00000005\baz MOVEFILE_REPLACE_EXISTING	ERROR_ACCESS_DENIED
+t/base/04.t	driver	call	GetFileInformation 00000005\bar
+t/base/04.t	case	expect	GetFileInformation 00000005\bar	0
+t/base/04.t	driver	call	GetFileInformation 00000005\baz
+t/base/04.t	case	expect	GetFileInformation 00000005\baz	0
+t/base/04.t	driver	call	RemoveDirectory 00000005\baz
+t/base/04.t	case	expect	RemoveDirectory 00000005\baz	0
+t/base/04.t	driver	call	MoveFileEx 00000005\bar 00000005\baz MOVEFILE_REPLACE_EXISTING
+t/base/04.t	case	expect	MoveFileEx 00000005\bar 00000005\baz MOVEFILE_REPLACE_EXISTING	0
+t/base/04.t	driver	call	GetFileInformation 00000005\bar
+t/base/04.t	case	expect	GetFileInformation 00000005\bar	ERROR_FILE_NOT_FOUND
+t/base/04.t	driver	call	GetFileInformation 00000005\baz
+t/base/04.t	case	expect	GetFileInformation 00000005\baz	0
+t/base/04.t	driver	call	RemoveDirectory 00000005\baz
+t/base/04.t	case	expect	RemoveDirectory 00000005\baz	0
+t/base/04.t	driver	call	RemoveDirectory 00000005
+t/base/04.t	case	expect	RemoveDirectory 00000005	0
+t/base/04.t	driver	call	CreateDirectory 00000005 0
+t/base/04.t	case	expect	CreateDirectory 00000005 0	0
+t/base/04.t	driver	call	CreateDirectory 00000005\foo 0
+t/base/04.t	case	expect	CreateDirectory 00000005\foo 0	0
+t/base/04.t	driver	call	CreateDirectory 00000005\bar 0
+t/base/04.t	case	expect	CreateDirectory 00000005\bar 0	0
+t/base/04.t	driver	call	CreateFile 00000005\foo\hello GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/base/04.t	case	expect	CreateFile 00000005\foo\hello GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/base/04.t	driver	call	MoveFileEx 00000005\foo\hello 00000005\bar\world 0
+t/base/04.t	case	expect	MoveFileEx 00000005\foo\hello 00000005\bar\world 0	0
+t/base/04.t	driver	call	GetFileInformation 00000005\foo\hello
+t/base/04.t	case	expect	GetFileInformation 00000005\foo\hello	ERROR_FILE_NOT_FOUND
+t/base/04.t	driver	call	GetFileInformation 00000005\bar\world
+t/base/04.t	case	expect	GetFileInformation 00000005\bar\world	0
+t/base/04.t	driver	call	DeleteFile 00000005\bar\world
+t/base/04.t	case	expect	DeleteFile 00000005\bar\world	0
+t/base/04.t	driver	call	RemoveDirectory 00000005\bar
+t/base/04.t	case	expect	RemoveDirectory 00000005\bar	0
+t/base/04.t	driver	call	RemoveDirectory 00000005\foo
+t/base/04.t	case	expect	RemoveDirectory 00000005\foo	0
+t/base/04.t	driver	call	RemoveDirectory 00000005
+t/base/04.t	case	expect	RemoveDirectory 00000005	0
+t/base/05.t	driver	call	CreateFile 00000006 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0
+t/base/05.t	case	expect	CreateFile 00000006 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0	0
+t/base/05.t	driver	call	GetFileInformation 00000006
+t/base/05.t	case	expect	GetFileInformation 00000006	lambda
+t/base/05.t	driver	call	SetEndOfFile 00000006 42
+t/base/05.t	case	expect	SetEndOfFile 00000006 42	0
+t/base/05.t	driver	call	GetFileInformation 00000006
+t/base/05.t	case	expect	GetFileInformation 00000006	lambda
+t/base/05.t	driver	call	SetEndOfFile 00000006 13
+t/base/05.t	case	expect	SetEndOfFile 00000006 13	0
+t/base/05.t	driver	call	GetFileInformation 00000006
+t/base/05.t	case	expect	GetFileInformation 00000006	lambda
+t/base/05.t	driver	call	DeleteFile 00000006
+t/base/05.t	case	expect	DeleteFile 00000006	0
+t/base/05.t	driver	call	CreateFile 00000006 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0
+t/base/05.t	case	expect	CreateFile 00000006 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0	0
+t/base/05.t	driver	call	SetEndOfFile 00000006 42
+t/base/05.t	case	expect	SetEndOfFile 00000006 42	0
+t/base/05.t	driver	call	GetFileInformation 00000006
+t/base/05.t	case	expect	GetFileInformation 00000006	lambda
+t/base/05.t	driver	call	CreateFile 00000006 GENERIC_WRITE 0 0 TRUNCATE_EXISTING 0 0
+t/base/05.t	case	expect	CreateFile 00000006 GENERIC_WRITE 0 0 TRUNCATE_EXISTING 0 0	0
+t/base/05.t	driver	call	GetFileInformation 00000006
+t/base/05.t	case	expect	GetFileInformation 00000006	lambda
+t/base/05.t	driver	call	DeleteFile 00000006
+t/base/05.t	case	expect	DeleteFile 00000006	0
+t/base/06.t	driver	call	CreateFile 00000007 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0
+t/base/06.t	case	expect	CreateFile 00000007 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0	0
+t/base/06.t	driver	call	GetFileInformation 00000007
+t/base/06.t	case	expect	GetFileInformation 00000007	0
+t/base/06.t	driver	call	SetFileTime 00000007 2134 2134-10-11T12:34:56 0
+t/base/06.t	case	expect	SetFileTime 00000007 2134 2134-10-11T12:34:56 0	0
+t/base/06.t	driver	call	GetFileInformation 00000007
+t/base/06.t	case	expect	GetFileInformation 00000007	0
+t/base/06.t	case	eval	testeval("2134-01-01T00:00:00Z" == r[0]["CreationTime"])
+t/base/06.t	case	eval	testeval("2134-10-11T12:34:56Z" == r[0]["LastAccessTime"])
+t/base/06.t	case	eval	testeval(mtime == r[0]["LastWriteTime"])
+t/base/06.t	driver	call	DeleteFile 00000007
+t/base/06.t	case	expect	DeleteFile 00000007	0
+t/base/07.t	driver	call	CreateFile 00000008 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0
+t/base/07.t	case	expect	CreateFile 00000008 GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0	0
+t/base/07.t	driver	call	GetFileInformation 00000008
+t/base/07.t	case	expect	GetFileInformation 00000008	lambda
+t/base/07.t	driver	call	SetFileAttributes 00000008 FILE_ATTRIBUTE_READONLY
+t/base/07.t	case	expect	SetFileAttributes 00000008 FILE_ATTRIBUTE_READONLY	0
+t/base/07.t	driver	call	GetFileInformation 00000008
+t/base/07.t	case	expect	GetFileInformation 00000008	lambda
+t/base/07.t	driver	call	SetFileAttributes 00000008 FILE_ATTRIBUTE_SYSTEM
+t/base/07.t	case	expect	SetFileAttributes 00000008 FILE_ATTRIBUTE_SYSTEM	0
+t/base/07.t	driver	call	GetFileInformation 00000008
+t/base/07.t	case	expect	GetFileInformation 00000008	lambda
+t/base/07.t	driver	call	SetFileAttributes 00000008 FILE_ATTRIBUTE_HIDDEN
+t/base/07.t	case	expect	SetFileAttributes 00000008 FILE_ATTRIBUTE_HIDDEN	0
+t/base/07.t	driver	call	GetFileInformation 00000008
+t/base/07.t	case	expect	GetFileInformation 00000008	lambda
+t/base/07.t	driver	call	SetFileAttributes 00000008 FILE_ATTRIBUTE_ARCHIVE
+t/base/07.t	case	expect	SetFileAttributes 00000008 FILE_ATTRIBUTE_ARCHIVE	0
+t/base/07.t	driver	call	GetFileInformation 00000008
+t/base/07.t	case	expect	GetFileInformation 00000008	lambda
+t/base/07.t	driver	call	DeleteFile 00000008
+t/base/07.t	case	expect	DeleteFile 00000008	0
+t/base/08.t	driver	hold	CreateFile 00000009 GENERIC_WRITE FILE_SHARE_READ+FILE_SHARE_WRITE+FILE_SHARE_DELETE 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/base/08.t	case	hold	CreateFile 00000009 GENERIC_WRITE FILE_SHARE_READ+FILE_SHARE_WRITE+FILE_SHARE_DELETE 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/base/08.t	driver	call	CreateFile 00000009 GENERIC_READ FILE_SHARE_READ+FILE_SHARE_WRITE+FILE_SHARE_DELETE 0 OPEN_EXISTING 0 0
+t/base/08.t	case	expect	CreateFile 00000009 GENERIC_READ FILE_SHARE_READ+FILE_SHARE_WRITE+FILE_SHARE_DELETE 0 OPEN_EXISTING 0 0	0
+t/base/08.t	driver	call	DeleteFile 00000009
+t/base/08.t	case	expect	DeleteFile 00000009	0
+t/base/08.t	driver	call	CreateFile 00000009 GENERIC_READ FILE_SHARE_READ+FILE_SHARE_WRITE+FILE_SHARE_DELETE 0 OPEN_EXISTING 0 0
+t/base/08.t	case	expect	CreateFile 00000009 GENERIC_READ FILE_SHARE_READ+FILE_SHARE_WRITE+FILE_SHARE_DELETE 0 OPEN_EXISTING 0 0	ERROR_ACCESS_DENIED
+t/base/08.t	driver	release
+t/base/08.t	driver	call	CreateDirectory 00000009 0
+t/base/08.t	case	expect	CreateDirectory 00000009 0	0
+t/base/08.t	driver	hold	CreateFile 00000009\foo GENERIC_WRITE FILE_SHARE_READ+FILE_SHARE_WRITE+FILE_SHARE_DELETE 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/base/08.t	case	hold	CreateFile 00000009\foo GENERIC_WRITE FILE_SHARE_READ+FILE_SHARE_WRITE+FILE_SHARE_DELETE 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/base/08.t	driver	call	DeleteFile 00000009\foo
+t/base/08.t	case	expect	DeleteFile 00000009\foo	0
+t/base/08.t	driver	call	FindFiles 00000009\*
+t/base/08.t	case	expect	FindFiles 00000009\*	0
+t/base/08.t	case	eval	testeval(len(s) == 3)
+t/base/08.t	case	eval	testeval("." in s)
+t/base/08.t	case	eval	testeval(".." in s)
+t/base/08.t	case	eval	testeval("foo" in s)
+t/base/08.t	driver	release
+t/base/08.t	driver	call	FindFiles 00000009\*
+t/base/08.t	case	expect	FindFiles 00000009\*	0
+t/base/08.t	case	eval	testeval(len(s) == 2)
+t/base/08.t	case	eval	testeval("." in s)
+t/base/08.t	case	eval	testeval(".." in s)
+t/base/08.t	driver	call	RemoveDirectory 00000009
+t/base/08.t	case	expect	RemoveDirectory 00000009	0
+t/base/09.t	driver	hold	CreateFile 0000000a GENERIC_WRITE FILE_SHARE_READ 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0
+t/base/09.t	case	hold	CreateFile 0000000a GENERIC_WRITE FILE_SHARE_READ 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0	0
+t/base/09.t	driver	call	CreateFile 0000000a GENERIC_READ FILE_SHARE_READ 0 OPEN_EXISTING 0 0
+t/base/09.t	case	expect	CreateFile 0000000a GENERIC_READ FILE_SHARE_READ 0 OPEN_EXISTING 0 0	ERROR_SHARING_VIOLATION
+t/base/09.t	driver	call	CreateFile 0000000a GENERIC_READ FILE_SHARE_WRITE 0 OPEN_EXISTING 0 0
+t/base/09.t	case	expect	CreateFile 0000000a GENERIC_READ FILE_SHARE_WRITE 0 OPEN_EXISTING 0 0	0
+t/base/09.t	driver	call	CreateFile 0000000a DELETE FILE_SHARE_DELETE 0 OPEN_EXISTING 0 0
+t/base/09.t	case	expect	CreateFile 0000000a DELETE FILE_SHARE_DELETE 0 OPEN_EXISTING 0 0	ERROR_SHARING_VIOLATION
+t/base/09.t	driver	call	CreateFile 0000000a DELETE FILE_SHARE_WRITE 0 OPEN_EXISTING 0 0
+t/base/09.t	case	expect	CreateFile 0000000a DELETE FILE_SHARE_WRITE 0 OPEN_EXISTING 0 0	ERROR_SHARING_VIOLATION
+t/base/09.t	driver	release
+t/base/09.t	driver	hold	CreateFile 0000000a GENERIC_READ FILE_SHARE_WRITE 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0
+t/base/09.t	case	hold	CreateFile 0000000a GENERIC_READ FILE_SHARE_WRITE 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0	0
+t/base/09.t	driver	call	CreateFile 0000000a GENERIC_WRITE FILE_SHARE_WRITE 0 OPEN_EXISTING 0 0
+t/base/09.t	case	expect	CreateFile 0000000a GENERIC_WRITE FILE_SHARE_WRITE 0 OPEN_EXISTING 0 0	ERROR_SHARING_VIOLATION
+t/base/09.t	driver	call	CreateFile 0000000a GENERIC_WRITE FILE_SHARE_READ 0 OPEN_EXISTING 0 0
+t/base/09.t	case	expect	CreateFile 0000000a GENERIC_WRITE FILE_SHARE_READ 0 OPEN_EXISTING 0 0	0
+t/base/09.t	driver	call	CreateFile 0000000a DELETE FILE_SHARE_DELETE 0 OPEN_EXISTING 0 0
+t/base/09.t	case	expect	CreateFile 0000000a DELETE FILE_SHARE_DELETE 0 OPEN_EXISTING 0 0	ERROR_SHARING_VIOLATION
+t/base/09.t	driver	call	CreateFile 0000000a DELETE FILE_SHARE_WRITE 0 OPEN_EXISTING 0 0
+t/base/09.t	case	expect	CreateFile 0000000a DELETE FILE_SHARE_WRITE 0 OPEN_EXISTING 0 0	ERROR_SHARING_VIOLATION
+t/base/09.t	driver	release
+t/base/09.t	driver	hold	CreateFile 0000000a DELETE FILE_SHARE_DELETE 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0
+t/base/09.t	case	hold	CreateFile 0000000a DELETE FILE_SHARE_DELETE 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0	0
+t/base/09.t	driver	call	CreateFile 0000000a GENERIC_WRITE FILE_SHARE_DELETE 0 OPEN_EXISTING 0 0
+t/base/09.t	case	expect	CreateFile 0000000a GENERIC_WRITE FILE_SHARE_DELETE 0 OPEN_EXISTING 0 0	ERROR_SHARING_VIOLATION
+t/base/09.t	driver	call	CreateFile 0000000a DELETE FILE_SHARE_WRITE 0 OPEN_EXISTING 0 0
+t/base/09.t	case	expect	CreateFile 0000000a DELETE FILE_SHARE_WRITE 0 OPEN_EXISTING 0 0	ERROR_SHARING_VIOLATION
+t/base/09.t	driver	call	CreateFile 0000000a DELETE FILE_SHARE_DELETE 0 OPEN_EXISTING 0 0
+t/base/09.t	case	expect	CreateFile 0000000a DELETE FILE_SHARE_DELETE 0 OPEN_EXISTING 0 0	0
+t/base/09.t	driver	release
+t/base/09.t	driver	call	DeleteFile 0000000a
+t/base/09.t	case	expect	DeleteFile 0000000a	0
+t/base/09.t	driver	call	CreateDirectory 0000000a 0
+t/base/09.t	case	expect	CreateDirectory 0000000a 0	0
+t/base/09.t	driver	hold	CreateFile 0000000a GENERIC_READ 0 0 OPEN_EXISTING FILE_FLAG_BACKUP_SEMANTICS 0
+t/base/09.t	case	hold	CreateFile 0000000a GENERIC_READ 0 0 OPEN_EXISTING FILE_FLAG_BACKUP_SEMANTICS 0	0
+t/base/09.t	driver	call	CreateFile 0000000a GENERIC_READ 0 0 OPEN_EXISTING FILE_FLAG_BACKUP_SEMANTICS 0
+t/base/09.t	case	expect	CreateFile 0000000a GENERIC_READ 0 0 OPEN_EXISTING FILE_FLAG_BACKUP_SEMANTICS 0	ERROR_SHARING_VIOLATION
+t/base/09.t	driver	release
+t/base/09.t	driver	call	RemoveDirectory 0000000a
+t/base/09.t	case	expect	RemoveDirectory 0000000a	0
+t/base/10.t	driver	call	CreateFile 0000000b GENERIC_WRITE 0 D:P(A;;GA;;;WD) CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/base/10.t	case	expect	CreateFile 0000000b GENERIC_WRITE 0 D:P(A;;GA;;;WD) CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/base/10.t	driver	call	GetFileSecurity 0000000b DACL_SECURITY_INFORMATION
+t/base/10.t	case	expect	GetFileSecurity 0000000b DACL_SECURITY_INFORMATION	lambda
+t/base/10.t	driver	call	SetFileSecurity 0000000b DACL_SECURITY_INFORMATION D:P(A;;GA;;;WD)(A;;GR;;;SY)
+t/base/10.t	case	expect	SetFileSecurity 0000000b DACL_SECURITY_INFORMATION D:P(A;;GA;;;WD)(A;;GR;;;SY)	0
+t/base/10.t	driver	call	GetFileSecurity 0000000b DACL_SECURITY_INFORMATION
+t/base/10.t	case	expect	GetFileSecurity 0000000b DACL_SECURITY_INFORMATION	lambda
+t/base/10.t	driver	call	DeleteFile 0000000b
+t/base/10.t	case	expect	DeleteFile 0000000b	0
+t/base/10.t	driver	call	CreateFile 0000000b GENERIC_WRITE 0 D:P(A;;GA;;;WD) CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/base/10.t	case	expect	CreateFile 0000000b GENERIC_WRITE 0 D:P(A;;GA;;;WD) CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/base/10.t	driver	call	CreateFile 0000000b GENERIC_READ 0 0 OPEN_EXISTING 0 0
+t/base/10.t	case	expect	CreateFile 0000000b GENERIC_READ 0 0 OPEN_EXISTING 0 0	0
+t/base/10.t	driver	call	SetFileSecurity 0000000b DACL_SECURITY_INFORMATION D:P(D;;GR;;;WD)
+t/base/10.t	case	expect	SetFileSecurity 0000000b DACL_SECURITY_INFORMATION D:P(D;;GR;;;WD)	0
+t/base/10.t	driver	call	CreateFile 0000000b GENERIC_READ 0 0 OPEN_EXISTING 0 0
+t/base/10.t	case	expect	CreateFile 0000000b GENERIC_READ 0 0 OPEN_EXISTING 0 0	ERROR_ACCESS_DENIED
+t/base/10.t	driver	call	DeleteFile 0000000b
+t/base/10.t	case	expect	DeleteFile 0000000b	0
+t/base/10.t	driver	call	CreateDirectory 0000000b D:P(A;;GA;;;WD)
+t/base/10.t	case	expect	CreateDirectory 0000000b D:P(A;;GA;;;WD)	0
+t/base/10.t	driver	call	GetFileSecurity 0000000b DACL_SECURITY_INFORMATION
+t/base/10.t	case	expect	GetFileSecurity 0000000b DACL_SECURITY_INFORMATION	lambda
+t/base/10.t	driver	call	SetFileSecurity 0000000b DACL_SECURITY_INFORMATION D:P(A;;GA;;;WD)(A;;GR;;;SY)
+t/base/10.t	case	expect	SetFileSecurity 0000000b DACL_SECURITY_INFORMATION D:P(A;;GA;;;WD)(A;;GR;;;SY)	0
+t/base/10.t	driver	call	GetFileSecurity 0000000b DACL_SECURITY_INFORMATION
+t/base/10.t	case	expect	GetFileSecurity 0000000b DACL_SECURITY_INFORMATION	lambda
+t/base/10.t	driver	call	RemoveDirectory 0000000b
+t/base/10.t	case	expect	RemoveDirectory 0000000b	0
+t/base/10.t	driver	call	CreateDirectory 0000000b D:P(A;;FR;;;WD)
+t/base/10.t	case	expect	CreateDirectory 0000000b D:P(A;;FR;;;WD)	0
+t/base/10.t	driver	call	CreateFile 0000000b\foobar GENERIC_READ 0 D:P(A;;FR;;;WD) CREATE_NEW 0 0
+t/base/10.t	case	expect	CreateFile 0000000b\foobar GENERIC_READ 0 D:P(A;;FR;;;WD) CREATE_NEW 0 0	ERROR_ACCESS_DENIED
+t/base/10.t	driver	call	SetFileSecurity 0000000b DACL_SECURITY_INFORMATION D:P(A;;GA;;;WD)
+t/base/10.t	case	expect	SetFileSecurity 0000000b DACL_SECURITY_INFORMATION D:P(A;;GA;;;WD)	0
+t/base/10.t	driver	call	CreateFile 0000000b\foobar GENERIC_READ 0 D:P(A;;FR;;;WD) CREATE_NEW 0 0
+t/base/10.t	case	expect	CreateFile 0000000b\foobar GENERIC_READ 0 D:P(A;;FR;;;WD) CREATE_NEW 0 0	0
+t/base/10.t	driver	call	SetFileSecurity 0000000b DACL_SECURITY_INFORMATION D:P(A;;FR;;;WD)
+t/base/10.t	case	expect	SetFileSecurity 0000000b DACL_SECURITY_INFORMATION D:P(A;;FR;;;WD)	0
+t/base/10.t	driver	call	DeleteFile 0000000b\foobar
+t/base/10.t	case	expect	DeleteFile 0000000b\foobar	ERROR_ACCESS_DENIED
+t/base/10.t	driver	call	SetFileSecurity 0000000b DACL_SECURITY_INFORMATION D:P(A;;GA;;;WD)
+t/base/10.t	case	expect	SetFileSecurity 0000000b DACL_SECURITY_INFORMATION D:P(A;;GA;;;WD)	0
+t/base/10.t	driver	call	DeleteFile 0000000b\foobar
+t/base/10.t	case	expect	DeleteFile 0000000b\foobar	0
+t/base/10.t	driver	call	RemoveDirectory 0000000b
+t/base/10.t	case	expect	RemoveDirectory 0000000b	0
+t/reparse/00.t	driver	call	CreateFile 0000000c GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/reparse/00.t	case	expect	CreateFile 0000000c GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/reparse/00.t	driver	call	GetFileInformation 0000000c
+t/reparse/00.t	case	expect	GetFileInformation 0000000c	lambda
+t/reparse/00.t	driver	call	SetReparsePoint 0000000c 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} 1A 2B 3C 4D 5F
+t/reparse/00.t	case	expect	SetReparsePoint 0000000c 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} 1A 2B 3C 4D 5F	0
+t/reparse/00.t	driver	call	GetFileInformation 0000000c
+t/reparse/00.t	case	expect	GetFileInformation 0000000c	lambda
+t/reparse/00.t	driver	call	GetReparsePoint 0000000c
+t/reparse/00.t	case	expect	GetReparsePoint 0000000c	lambda
+t/reparse/00.t	driver	call	SetReparsePoint 0000000c 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} A1 B2 C3 D4 F5 1A 2B 3C 4D 5F
+t/reparse/00.t	case	expect	SetReparsePoint 0000000c 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} A1 B2 C3 D4 F5 1A 2B 3C 4D 5F	0
+t/reparse/00.t	driver	call	GetReparsePoint 0000000c
+t/reparse/00.t	case	expect	GetReparsePoint 0000000c	lambda
+t/reparse/00.t	driver	call	SetReparsePoint 0000000c 43 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} A1 B2 C3 D4 F5 1A 2B 3C 4D 5F
+t/reparse/00.t	case	expect	SetReparsePoint 0000000c 43 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} A1 B2 C3 D4 F5 1A 2B 3C 4D 5F	ERROR(4394)
+t/reparse/00.t	driver	call	SetReparsePoint 0000000c 42 {02A23BD8-99F5-4FD6-807C-C56F3A063C52} A1 B2 C3 D4 F5 1A 2B 3C 4D 5F
+t/reparse/00.t	case	expect	SetReparsePoint 0000000c 42 {02A23BD8-99F5-4FD6-807C-C56F3A063C52} A1 B2 C3 D4 F5 1A 2B 3C 4D 5F	ERROR(4391)
+t/reparse/00.t	driver	call	DeleteFile 0000000c
+t/reparse/00.t	case	expect	DeleteFile 0000000c	0
+t/reparse/00.t	driver	call	CreateFile 0000000c GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/reparse/00.t	case	expect	CreateFile 0000000c GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/reparse/00.t	driver	call	GetFileInformation 0000000c
+t/reparse/00.t	case	expect	GetFileInformation 0000000c	lambda
+t/reparse/00.t	driver	call	SetReparsePoint 0000000c 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} 1A 2B 3C 4D 5F
+t/reparse/00.t	case	expect	SetReparsePoint 0000000c 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} 1A 2B 3C 4D 5F	0
+t/reparse/00.t	driver	call	GetFileInformation 0000000c
+t/reparse/00.t	case	expect	GetFileInformation 0000000c	lambda
+t/reparse/00.t	driver	call	DeleteReparsePoint 0000000c 43 {92A23BD8-99F5-4FD6-807C-C56F3A063C52}
+t/reparse/00.t	case	expect	DeleteReparsePoint 0000000c 43 {92A23BD8-99F5-4FD6-807C-C56F3A063C52}	ERROR(4394)
+t/reparse/00.t	driver	call	DeleteReparsePoint 0000000c 42 {02A23BD8-99F5-4FD6-807C-C56F3A063C52}
+t/reparse/00.t	case	expect	DeleteReparsePoint 0000000c 42 {02A23BD8-99F5-4FD6-807C-C56F3A063C52}	ERROR(4391)
+t/reparse/00.t	driver	call	DeleteReparsePoint 0000000c 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52}
+t/reparse/00.t	case	expect	DeleteReparsePoint 0000000c 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52}	0
+t/reparse/00.t	driver	call	GetFileInformation 0000000c
+t/reparse/00.t	case	expect	GetFileInformation 0000000c	lambda
+t/reparse/00.t	driver	call	DeleteFile 0000000c
+t/reparse/00.t	case	expect	DeleteFile 0000000c	0
+t/reparse/00.t	driver	call	CreateFile 0000000c GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/reparse/00.t	case	expect	CreateFile 0000000c GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/reparse/00.t	driver	call	WriteFile 0000000c 0 41 42 43 44 45
+t/reparse/00.t	case	expect	WriteFile 0000000c 0 41 42 43 44 45	0
+t/reparse/00.t	driver	call	ReadFile 0000000c 0 10
+t/reparse/00.t	case	expect	ReadFile 0000000c 0 10	lambda
+t/reparse/00.t	driver	call	GetFileInformation 0000000c
+t/reparse/00.t	case	expect	GetFileInformation 0000000c	lambda
+t/reparse/00.t	driver	call	SetReparsePoint 0000000c 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} 1A 2B 3C 4D 5F
+t/reparse/00.t	case	expect	SetReparsePoint 0000000c 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} 1A 2B 3C 4D 5F	0
+t/reparse/00.t	driver	call	GetFileInformation 0000000c
+t/reparse/00.t	case	expect	GetFileInformation 0000000c	lambda
+t/reparse/00.t	driver	call	WriteFile 0000000c 0 61 62 63
+t/reparse/00.t	case	expect	WriteFile 0000000c 0 61 62 63	0
+t/reparse/00.t	driver	call	ReadFile 0000000c 0 10
+t/reparse/00.t	case	expect	ReadFile 0000000c 0 10	lambda
+t/reparse/00.t	driver	call	SetEndOfFile 0000000c 2
+t/reparse/00.t	case	expect	SetEndOfFile 0000000c 2	0
+t/reparse/00.t	driver	call	ReadFile 0000000c 0 10
+t/reparse/00.t	case	expect	ReadFile 0000000c 0 10	lambda
+t/reparse/00.t	driver	call	SetEndOfFile 0000000c 5
+t/reparse/00.t	case	expect	SetEndOfFile 0000000c 5	0
+t/reparse/00.t	driver	call	ReadFile 0000000c 0 10
+t/reparse/00.t	case	expect	ReadFile 0000000c 0 10	lambda
+t/reparse/00.t	driver	call	GetFileInformation 0000000c
+t/reparse/00.t	case	expect	GetFileInformation 0000000c	lambda
+t/reparse/00.t	driver	call	GetReparsePoint 0000000c
+t/reparse/00.t	case	expect	GetReparsePoint 0000000c	lambda
+t/reparse/00.t	driver	call	DeleteFile 0000000c
+t/reparse/00.t	case	expect	DeleteFile 0000000c	0
+t/reparse/00.t	driver	call	CreateFile 0000000c GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/reparse/00.t	case	expect	CreateFile 0000000c GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/reparse/00.t	driver	call	SetReparsePoint 0000000c 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} 1A 2B 3C 4D 5F
+t/reparse/00.t	case	expect	SetReparsePoint 0000000c 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} 1A 2B 3C 4D 5F	0
+t/reparse/00.t	driver	call	CreateFile 0000000c GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/reparse/00.t	case	expect	CreateFile 0000000c GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	ERROR_CANT_ACCESS_FILE
+t/reparse/00.t	driver	call	CreateFile 0000000c GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL+FILE_FLAG_OPEN_REPARSE_POINT 0
+t/reparse/00.t	case	expect	CreateFile 0000000c GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL+FILE_FLAG_OPEN_REPARSE_POINT 0	ERROR_FILE_EXISTS
+t/reparse/00.t	driver	call	DeleteFile 0000000c
+t/reparse/00.t	case	expect	DeleteFile 0000000c	0
+t/reparse/01.t	driver	call	CreateDirectory 0000000d 0
+t/reparse/01.t	case	expect	CreateDirectory 0000000d 0	0
+t/reparse/01.t	driver	call	GetFileInformation 0000000d
+t/reparse/01.t	case	expect	GetFileInformation 0000000d	lambda
+t/reparse/01.t	driver	call	SetReparsePoint 0000000d 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} 1A 2B 3C 4D 5F
+t/reparse/01.t	case	expect	SetReparsePoint 0000000d 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} 1A 2B 3C 4D 5F	0
+t/reparse/01.t	driver	call	GetFileInformation 0000000d
+t/reparse/01.t	case	expect	GetFileInformation 0000000d	lambda
+t/reparse/01.t	driver	call	GetReparsePoint 0000000d
+t/reparse/01.t	case	expect	GetReparsePoint 0000000d	lambda
+t/reparse/01.t	driver	call	SetReparsePoint 0000000d 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} A1 B2 C3 D4 F5 1A 2B 3C 4D 5F
+t/reparse/01.t	case	expect	SetReparsePoint 0000000d 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} A1 B2 C3 D4 F5 1A 2B 3C 4D 5F	0
+t/reparse/01.t	driver	call	GetReparsePoint 0000000d
+t/reparse/01.t	case	expect	GetReparsePoint 0000000d	lambda
+t/reparse/01.t	driver	call	SetReparsePoint 0000000d 43 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} A1 B2 C3 D4 F5 1A 2B 3C 4D 5F
+t/reparse/01.t	case	expect	SetReparsePoint 0000000d 43 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} A1 B2 C3 D4 F5 1A 2B 3C 4D 5F	ERROR(4394)
+t/reparse/01.t	driver	call	SetReparsePoint 0000000d 42 {02A23BD8-99F5-4FD6-807C-C56F3A063C52} A1 B2 C3 D4 F5 1A 2B 3C 4D 5F
+t/reparse/01.t	case	expect	SetReparsePoint 0000000d 42 {02A23BD8-99F5-4FD6-807C-C56F3A063C52} A1 B2 C3 D4 F5 1A 2B 3C 4D 5F	ERROR(4391)
+t/reparse/01.t	driver	call	RemoveDirectory 0000000d
+t/reparse/01.t	case	expect	RemoveDirectory 0000000d	0
+t/reparse/01.t	driver	call	CreateDirectory 0000000d 0
+t/reparse/01.t	case	expect	CreateDirectory 0000000d 0	0
+t/reparse/01.t	driver	call	GetFileInformation 0000000d
+t/reparse/01.t	case	expect	GetFileInformation 0000000d	lambda
+t/reparse/01.t	driver	call	SetReparsePoint 0000000d 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} 1A 2B 3C 4D 5F
+t/reparse/01.t	case	expect	SetReparsePoint 0000000d 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} 1A 2B 3C 4D 5F	0
+t/reparse/01.t	driver	call	GetFileInformation 0000000d
+t/reparse/01.t	case	expect	GetFileInformation 0000000d	lambda
+t/reparse/01.t	driver	call	DeleteReparsePoint 0000000d 43 {92A23BD8-99F5-4FD6-807C-C56F3A063C52}
+t/reparse/01.t	case	expect	DeleteReparsePoint 0000000d 43 {92A23BD8-99F5-4FD6-807C-C56F3A063C52}	ERROR(4394)
+t/reparse/01.t	driver	call	DeleteReparsePoint 0000000d 42 {02A23BD8-99F5-4FD6-807C-C56F3A063C52}
+t/reparse/01.t	case	expect	DeleteReparsePoint 0000000d 42 {02A23BD8-99F5-4FD6-807C-C56F3A063C52}	ERROR(4391)
+t/reparse/01.t	driver	call	DeleteReparsePoint 0000000d 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52}
+t/reparse/01.t	case	expect	DeleteReparsePoint 0000000d 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52}	0
+t/reparse/01.t	driver	call	GetFileInformation 0000000d
+t/reparse/01.t	case	expect	GetFileInformation 0000000d	lambda
+t/reparse/01.t	driver	call	RemoveDirectory 0000000d
+t/reparse/01.t	case	expect	RemoveDirectory 0000000d	0
+t/reparse/01.t	driver	call	CreateDirectory 0000000d 0
+t/reparse/01.t	case	expect	CreateDirectory 0000000d 0	0
+t/reparse/01.t	driver	call	CreateFile 0000000d\1 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/reparse/01.t	case	expect	CreateFile 0000000d\1 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/reparse/01.t	driver	call	GetFileInformation 0000000d
+t/reparse/01.t	case	expect	GetFileInformation 0000000d	lambda
+t/reparse/01.t	driver	call	SetReparsePoint 0000000d 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} 1A 2B 3C 4D 5F
+t/reparse/01.t	case	expect	SetReparsePoint 0000000d 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} 1A 2B 3C 4D 5F	ERROR_DIR_NOT_EMPTY
+t/reparse/01.t	driver	call	DeleteFile 0000000d\1
+t/reparse/01.t	case	expect	DeleteFile 0000000d\1	0
+t/reparse/01.t	driver	call	SetReparsePoint 0000000d 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} 1A 2B 3C 4D 5F
+t/reparse/01.t	case	expect	SetReparsePoint 0000000d 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} 1A 2B 3C 4D 5F	0
+t/reparse/01.t	driver	call	GetFileInformation 0000000d
+t/reparse/01.t	case	expect	GetFileInformation 0000000d	lambda
+t/reparse/01.t	driver	call	GetReparsePoint 0000000d
+t/reparse/01.t	case	expect	GetReparsePoint 0000000d	lambda
+t/reparse/01.t	driver	call	CreateFile 0000000d\2 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/reparse/01.t	case	expect	CreateFile 0000000d\2 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	ERROR_CANT_ACCESS_FILE
+t/reparse/01.t	driver	call	RemoveDirectory 0000000d
+t/reparse/01.t	case	expect	RemoveDirectory 0000000d	0
+t/reparse/01.t	driver	call	CreateDirectory 0000000d 0
+t/reparse/01.t	case	expect	CreateDirectory 0000000d 0	0
+t/reparse/01.t	driver	call	SetReparsePoint 0000000d 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} 1A 2B 3C 4D 5F
+t/reparse/01.t	case	expect	SetReparsePoint 0000000d 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} 1A 2B 3C 4D 5F	0
+t/reparse/01.t	driver	call	CreateDirectory 0000000d 0
+t/reparse/01.t	case	expect	CreateDirectory 0000000d 0	ERROR_ALREADY_EXISTS
+t/reparse/01.t	driver	call	CreateFile 0000000d GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/reparse/01.t	case	expect	CreateFile 0000000d GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	ERROR_ACCESS_DENIED
+t/reparse/01.t	driver	call	CreateFile 0000000d GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL+FILE_FLAG_OPEN_REPARSE_POINT 0
+t/reparse/01.t	case	expect	CreateFile 0000000d GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL+FILE_FLAG_OPEN_REPARSE_POINT 0	ERROR_ACCESS_DENIED
+t/reparse/01.t	driver	call	RemoveDirectory 0000000d
+t/reparse/01.t	case	expect	RemoveDirectory 0000000d	0
+t/reparse/02.t	driver	call	CreateSymbolicLink 0000000e 0000000f 0
+t/reparse/02.t	case	expect	CreateSymbolicLink 0000000e 0000000f 0	0
+t/reparse/02.t	driver	call	GetFileInformation 0000000e
+t/reparse/02.t	case	expect	GetFileInformation 0000000e	lambda
+t/reparse/02.t	driver	call	GetReparsePoint 0000000e
+t/reparse/02.t	case	expect	GetReparsePoint 0000000e	lambda
+t/reparse/02.t	case	eval	testeval(not safeopen(srcname))
+t/reparse/02.t	driver	call	CreateFile 0000000f GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/reparse/02.t	case	expect	CreateFile 0000000f GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/reparse/02.t	case	eval	testeval(safeopen(srcname))
+t/reparse/02.t	driver	call	DeleteFile 0000000f
+t/reparse/02.t	case	expect	DeleteFile 0000000f	0
+t/reparse/02.t	driver	call	CreateFile 0000000e GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/reparse/02.t	case	expect	CreateFile 0000000e GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/reparse/02.t	case	eval	testeval(safeopen(srcname))
+t/reparse/02.t	case	eval	testeval(safeopen(dstname))
+t/reparse/02.t	driver	call	DeleteFile 0000000f
+t/reparse/02.t	case	expect	DeleteFile 0000000f	0
+t/reparse/02.t	case	eval	testeval(not safeopen(srcname))
+t/reparse/02.t	driver	call	DeleteFile 0000000e
+t/reparse/02.t	case	expect	DeleteFile 0000000e	0
+t/reparse/02.t	driver	call	CreateSymbolicLink 0000000e 0000000f 0
+t/reparse/02.t	case	expect	CreateSymbolicLink 0000000e 0000000f 0	0
+t/reparse/02.t	driver	call	WriteFile 0000000e 0 41 42 43 44 45
+t/reparse/02.t	case	expect	WriteFile 0000000e 0 41 42 43 44 45	0
+t/reparse/02.t	driver	call	ReadFile 0000000e 0 10
+t/reparse/02.t	case	expect	ReadFile 0000000e 0 10	lambda
+t/reparse/02.t	driver	call	GetFileInformation 0000000e
+t/reparse/02.t	case	expect	GetFileInformation 0000000e	lambda
+t/reparse/02.t	driver	call	GetReparsePoint 0000000e
+t/reparse/02.t	case	expect	GetReparsePoint 0000000e	lambda
+t/reparse/02.t	case	eval	testeval(not safeopen(srcname))
+t/reparse/02.t	driver	call	CreateFile 0000000f GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/reparse/02.t	case	expect	CreateFile 0000000f GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/reparse/02.t	case	eval	testeval(safeopen(srcname))
+t/reparse/02.t	driver	call	DeleteFile 0000000f
+t/reparse/02.t	case	expect	DeleteFile 0000000f	0
+t/reparse/02.t	driver	call	CreateFile 0000000e GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/reparse/02.t	case	expect	CreateFile 0000000e GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/reparse/02.t	case	eval	testeval(safeopen(srcname))
+t/reparse/02.t	case	eval	testeval(safeopen(dstname))
+t/reparse/02.t	driver	call	DeleteFile 0000000f
+t/reparse/02.t	case	expect	DeleteFile 0000000f	0
+t/reparse/02.t	case	eval	testeval(not safeopen(srcname))
+t/reparse/02.t	driver	call	DeleteFile 0000000e
+t/reparse/02.t	case	expect	DeleteFile 0000000e	0
+t/reparse/02.t	driver	call	CreateSymbolicLink 0000000e C:\work\0000000f 0
+t/reparse/02.t	case	expect	CreateSymbolicLink 0000000e C:\work\0000000f 0	0
+t/reparse/02.t	driver	call	GetFileInformation 0000000e
+t/reparse/02.t	case	expect	GetFileInformation 0000000e	lambda
+t/reparse/02.t	driver	call	GetReparsePoint 0000000e
+t/reparse/02.t	case	expect	GetReparsePoint 0000000e	lambda
+t/reparse/02.t	case	eval	testeval(not safeopen(srcname))
+t/reparse/02.t	driver	call	CreateFile 0000000f GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/reparse/02.t	case	expect	CreateFile 0000000f GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/reparse/02.t	case	eval	testeval(safeopen(srcname))
+t/reparse/02.t	driver	call	DeleteFile 0000000f
+t/reparse/02.t	case	expect	DeleteFile 0000000f	0
+t/reparse/02.t	driver	call	CreateFile 0000000e GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/reparse/02.t	case	expect	CreateFile 0000000e GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/reparse/02.t	case	eval	testeval(safeopen(srcname))
+t/reparse/02.t	case	eval	testeval(safeopen(dstname))
+t/reparse/02.t	driver	call	DeleteFile 0000000f
+t/reparse/02.t	case	expect	DeleteFile 0000000f	0
+t/reparse/02.t	case	eval	testeval(not safeopen(srcname))
+t/reparse/02.t	driver	call	DeleteFile 0000000e
+t/reparse/02.t	case	expect	DeleteFile 0000000e	0
+t/reparse/03.t	driver	call	CreateSymbolicLink 00000010 00000011 SYMBOLIC_LINK_FLAG_DIRECTORY
+t/reparse/03.t	case	expect	CreateSymbolicLink 00000010 00000011 SYMBOLIC_LINK_FLAG_DIRECTORY	0
+t/reparse/03.t	driver	call	GetFileInformation 00000010
+t/reparse/03.t	case	expect	GetFileInformation 00000010	lambda
+t/reparse/03.t	driver	call	GetReparsePoint 00000010
+t/reparse/03.t	case	expect	GetReparsePoint 00000010	lambda
+t/reparse/03.t	case	eval	testeval(not safeopen(os.path.join(srcname, "1")))
+t/reparse/03.t	driver	call	CreateDirectory 00000011 0
+t/reparse/03.t	case	expect	CreateDirectory 00000011 0	0
+t/reparse/03.t	driver	call	CreateFile 00000011\1 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/reparse/03.t	case	expect	CreateFile 00000011\1 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/reparse/03.t	case	eval	testeval(safeopen(os.path.join(srcname, "1")))
+t/reparse/03.t	driver	call	DeleteFile 00000011\1
+t/reparse/03.t	case	expect	DeleteFile 00000011\1	0
+t/reparse/03.t	driver	call	RemoveDirectory 00000011
+t/reparse/03.t	case	expect	RemoveDirectory 00000011	0
+t/reparse/03.t	case	eval	testeval(not safeopen(os.path.join(srcname, "1")))
+t/reparse/03.t	driver	call	CreateDirectory 00000010 0
+t/reparse/03.t	case	expect	CreateDirectory 00000010 0	ERROR_ALREADY_EXISTS
+t/reparse/03.t	driver	call	CreateFile 00000010 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/reparse/03.t	case	expect	CreateFile 00000010 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	ERROR_ACCESS_DENIED
+t/reparse/03.t	driver	call	RemoveDirectory 00000010
+t/reparse/03.t	case	expect	RemoveDirectory 00000010	0
+t/reparse/03.t	driver	call	CreateSymbolicLink 00000010 C:\work\00000011 SYMBOLIC_LINK_FLAG_DIRECTORY
+t/reparse/03.t	case	expect	CreateSymbolicLink 00000010 C:\work\00000011 SYMBOLIC_LINK_FLAG_DIRECTORY	0
+t/reparse/03.t	driver	call	GetFileInformation 00000010
+t/reparse/03.t	case	expect	GetFileInformation 00000010	lambda
+t/reparse/03.t	driver	call	GetReparsePoint 00000010
+t/reparse/03.t	case	expect	GetReparsePoint 00000010	lambda
+t/reparse/03.t	case	eval	testeval(not safeopen(os.path.join(srcname, "1")))
+t/reparse/03.t	driver	call	CreateDirectory 00000011 0
+t/reparse/03.t	case	expect	CreateDirectory 00000011 0	0
+t/reparse/03.t	driver	call	CreateFile 00000011\1 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/reparse/03.t	case	expect	CreateFile 00000011\1 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/reparse/03.t	case	eval	testeval(safeopen(os.path.join(srcname, "1")))
+t/reparse/03.t	driver	call	DeleteFile 00000011\1
+t/reparse/03.t	case	expect	DeleteFile 00000011\1	0
+t/reparse/03.t	driver	call	RemoveDirectory 00000011
+t/reparse/03.t	case	expect	RemoveDirectory 00000011	0
+t/reparse/03.t	case	eval	testeval(not safeopen(os.path.join(srcname, "1")))
+t/reparse/03.t	driver	call	CreateDirectory 00000010 0
+t/reparse/03.t	case	expect	CreateDirectory 00000010 0	ERROR_ALREADY_EXISTS
+t/reparse/03.t	driver	call	CreateFile 00000010 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/reparse/03.t	case	expect	CreateFile 00000010 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	ERROR_ACCESS_DENIED
+t/reparse/03.t	driver	call	RemoveDirectory 00000010
+t/reparse/03.t	case	expect	RemoveDirectory 00000010	0
+t/streams/00.t	driver	call	CreateFile 00000012:foo GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/00.t	case	expect	CreateFile 00000012:foo GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/00.t	driver	call	CreateFile 00000012 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/00.t	case	expect	CreateFile 00000012 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	ERROR_FILE_EXISTS
+t/streams/00.t	driver	call	CreateFile 00000012:foo GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/00.t	case	expect	CreateFile 00000012:foo GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	ERROR_FILE_EXISTS
+t/streams/00.t	driver	call	GetFileInformation 00000012
+t/streams/00.t	case	expect	GetFileInformation 00000012	0
+t/streams/00.t	driver	call	GetFileInformation 00000012:foo
+t/streams/00.t	case	expect	GetFileInformation 00000012:foo	0
+t/streams/00.t	case	eval	testeval(r[0]["FileIndex"] == s[0]["FileIndex"])
+t/streams/00.t	driver	call	DeleteFile 00000012
+t/streams/00.t	case	expect	DeleteFile 00000012	0
+t/streams/00.t	driver	call	DeleteFile 00000012:foo
+t/streams/00.t	case	expect	DeleteFile 00000012:foo	ERROR_FILE_NOT_FOUND
+t/streams/00.t	driver	call	DeleteFile 00000012
+t/streams/00.t	case	expect	DeleteFile 00000012	ERROR_FILE_NOT_FOUND
+t/streams/00.t	driver	call	CreateFile 00000012 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/00.t	case	expect	CreateFile 00000012 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/00.t	driver	call	CreateFile 00000012 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/00.t	case	expect	CreateFile 00000012 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	ERROR_FILE_EXISTS
+t/streams/00.t	driver	call	CreateFile 00000012:foo GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/00.t	case	expect	CreateFile 00000012:foo GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/00.t	driver	call	CreateFile 00000012:foo GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/00.t	case	expect	CreateFile 00000012:foo GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	ERROR_FILE_EXISTS
+t/streams/00.t	driver	call	GetFileInformation 00000012
+t/streams/00.t	case	expect	GetFileInformation 00000012	0
+t/streams/00.t	driver	call	GetFileInformation 00000012:foo
+t/streams/00.t	case	expect	GetFileInformation 00000012:foo	0
+t/streams/00.t	case	eval	testeval(r[0]["FileIndex"] == s[0]["FileIndex"])
+t/streams/00.t	driver	call	DeleteFile 00000012:foo
+t/streams/00.t	case	expect	DeleteFile 00000012:foo	0
+t/streams/00.t	driver	call	DeleteFile 00000012:foo
+t/streams/00.t	case	expect	DeleteFile 00000012:foo	ERROR_FILE_NOT_FOUND
+t/streams/00.t	driver	call	DeleteFile 00000012
+t/streams/00.t	case	expect	DeleteFile 00000012	0
+t/streams/00.t	driver	call	DeleteFile 00000012
+t/streams/00.t	case	expect	DeleteFile 00000012	ERROR_FILE_NOT_FOUND
+t/streams/00.t	driver	call	CreateFile 00000012:foo:$DATA GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/00.t	case	expect	CreateFile 00000012:foo:$DATA GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/00.t	driver	call	GetFileInformation 00000012
+t/streams/00.t	case	expect	GetFileInformation 00000012	0
+t/streams/00.t	driver	call	GetFileInformation 00000012:foo
+t/streams/00.t	case	expect	GetFileInformation 00000012:foo	0
+t/streams/00.t	case	eval	testeval(r[0]["FileIndex"] == s[0]["FileIndex"])
+t/streams/00.t	driver	call	DeleteFile 00000012
+t/streams/00.t	case	expect	DeleteFile 00000012	0
+t/streams/00.t	driver	call	CreateFile 00000012:foo:$DATA GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0
+t/streams/00.t	case	expect	CreateFile 00000012:foo:$DATA GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/00.t	driver	call	-e CreateFile 00000012:foo:$DATA GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0
+t/streams/00.t	case	expect	-e CreateFile 00000012:foo:$DATA GENERIC_WRITE 0 0 CREATE_ALWAYS FILE_ATTRIBUTE_NORMAL 0	ERROR_ALREADY_EXISTS
+t/streams/00.t	driver	call	GetFileInformation 00000012
+t/streams/00.t	case	expect	GetFileInformation 00000012	0
+t/streams/00.t	driver	call	GetFileInformation 00000012:foo
+t/streams/00.t	case	expect	GetFileInformation 00000012:foo	0
+t/streams/00.t	case	eval	testeval(r[0]["FileIndex"] == s[0]["FileIndex"])
+t/streams/00.t	driver	call	DeleteFile 00000012
+t/streams/00.t	case	expect	DeleteFile 00000012	0
+t/streams/01.t	driver	call	CreateDirectory 00000013:foo 0
+t/streams/01.t	case	expect	CreateDirectory 00000013:foo 0	ERROR_DIRECTORY
+t/streams/01.t	driver	call	CreateDirectory 00000013 0
+t/streams/01.t	case	expect	CreateDirectory 00000013 0	0
+t/streams/01.t	driver	call	CreateDirectory 00000013 0
+t/streams/01.t	case	expect	CreateDirectory 00000013 0	ERROR_ALREADY_EXISTS
+t/streams/01.t	driver	call	CreateFile 00000013:foo GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/01.t	case	expect	CreateFile 00000013:foo GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/01.t	driver	call	CreateFile 00000013:foo GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/01.t	case	expect	CreateFile 00000013:foo GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	ERROR_FILE_EXISTS
+t/streams/01.t	driver	call	GetFileInformation 00000013
+t/streams/01.t	case	expect	GetFileInformation 00000013	0
+t/streams/01.t	driver	call	GetFileInformation 00000013:foo
+t/streams/01.t	case	expect	GetFileInformation 00000013:foo	0
+t/streams/01.t	case	eval	testeval(r[0]["FileIndex"] == s[0]["FileIndex"])
+t/streams/01.t	driver	call	RemoveDirectory 00000013:foo
+t/streams/01.t	case	expect	RemoveDirectory 00000013:foo	ERROR_DIRECTORY
+t/streams/01.t	driver	call	DeleteFile 00000013:foo
+t/streams/01.t	case	expect	DeleteFile 00000013:foo	0
+t/streams/01.t	driver	call	DeleteFile 00000013:foo
+t/streams/01.t	case	expect	DeleteFile 00000013:foo	ERROR_FILE_NOT_FOUND
+t/streams/01.t	driver	call	RemoveDirectory 00000013
+t/streams/01.t	case	expect	RemoveDirectory 00000013	0
+t/streams/01.t	driver	call	RemoveDirectory 00000013
+t/streams/01.t	case	expect	RemoveDirectory 00000013	ERROR_FILE_NOT_FOUND
+t/streams/01.t	driver	call	CreateDirectory 00000013 0
+t/streams/01.t	case	expect	CreateDirectory 00000013 0	0
+t/streams/01.t	driver	call	CreateFile 00000013:foo:$DATA GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/01.t	case	expect	CreateFile 00000013:foo:$DATA GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/01.t	driver	call	GetFileInformation 00000013
+t/streams/01.t	case	expect	GetFileInformation 00000013	0
+t/streams/01.t	driver	call	GetFileInformation 00000013:foo
+t/streams/01.t	case	expect	GetFileInformation 00000013:foo	0
+t/streams/01.t	case	eval	testeval(r[0]["FileIndex"] == s[0]["FileIndex"])
+t/streams/01.t	driver	call	RemoveDirectory 00000013
+t/streams/01.t	case	expect	RemoveDirectory 00000013	0
+t/streams/02.t	driver	call	CreateFile 00000014 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	FindStreams 00000014
+t/streams/02.t	case	expect	FindStreams 00000014	0
+t/streams/02.t	case	eval	testeval(len(s) == 1)
+t/streams/02.t	case	eval	testeval("::$DATA" in s)
+t/streams/02.t	driver	call	DeleteFile 00000014
+t/streams/02.t	case	expect	DeleteFile 00000014	0
+t/streams/02.t	driver	call	FindStreams 00000014
+t/streams/02.t	case	expect	FindStreams 00000014	ERROR_FILE_NOT_FOUND
+t/streams/02.t	driver	call	CreateFile 00000014:foo GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:foo GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:bar GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:bar GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	FindStreams 00000014
+t/streams/02.t	case	expect	FindStreams 00000014	0
+t/streams/02.t	case	eval	testeval(len(s) == 3)
+t/streams/02.t	case	eval	testeval("::$DATA" in s)
+t/streams/02.t	case	eval	testeval(":foo:$DATA" in s)
+t/streams/02.t	case	eval	testeval(":bar:$DATA" in s)
+t/streams/02.t	driver	call	DeleteFile 00000014
+t/streams/02.t	case	expect	DeleteFile 00000014	0
+t/streams/02.t	driver	call	FindStreams 00000014
+t/streams/02.t	case	expect	FindStreams 00000014	ERROR_FILE_NOT_FOUND
+t/streams/02.t	driver	call	CreateFile 00000014:foo:$DATA GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:foo:$DATA GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:bar:$DATA GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:bar:$DATA GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	FindStreams 00000014
+t/streams/02.t	case	expect	FindStreams 00000014	0
+t/streams/02.t	case	eval	testeval(len(s) == 3)
+t/streams/02.t	case	eval	testeval("::$DATA" in s)
+t/streams/02.t	case	eval	testeval(":foo:$DATA" in s)
+t/streams/02.t	case	eval	testeval(":bar:$DATA" in s)
+t/streams/02.t	driver	call	DeleteFile 00000014
+t/streams/02.t	case	expect	DeleteFile 00000014	0
+t/streams/02.t	driver	call	FindStreams 00000014
+t/streams/02.t	case	expect	FindStreams 00000014	ERROR_FILE_NOT_FOUND
+t/streams/02.t	driver	call	CreateDirectory 00000014 0
+t/streams/02.t	case	expect	CreateDirectory 00000014 0	0
+t/streams/02.t	driver	call	FindStreams 00000014
+t/streams/02.t	case	expect	FindStreams 00000014	ERROR_HANDLE_EOF
+t/streams/02.t	driver	call	RemoveDirectory 00000014
+t/streams/02.t	case	expect	RemoveDirectory 00000014	0
+t/streams/02.t	driver	call	FindStreams 00000014
+t/streams/02.t	case	expect	FindStreams 00000014	ERROR_FILE_NOT_FOUND
+t/streams/02.t	driver	call	CreateDirectory 00000014 0
+t/streams/02.t	case	expect	CreateDirectory 00000014 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:foo GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:foo GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:bar GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:bar GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	FindStreams 00000014
+t/streams/02.t	case	expect	FindStreams 00000014	0
+t/streams/02.t	case	eval	testeval(len(s) == 2)
+t/streams/02.t	case	eval	testeval(":foo:$DATA" in s)
+t/streams/02.t	case	eval	testeval(":bar:$DATA" in s)
+t/streams/02.t	driver	call	RemoveDirectory 00000014
+t/streams/02.t	case	expect	RemoveDirectory 00000014	0
+t/streams/02.t	driver	call	FindStreams 00000014
+t/streams/02.t	case	expect	FindStreams 00000014	ERROR_FILE_NOT_FOUND
+t/streams/02.t	driver	call	CreateDirectory 00000014 0
+t/streams/02.t	case	expect	CreateDirectory 00000014 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:foo:$DATA GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:foo:$DATA GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:bar:$DATA GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:bar:$DATA GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	FindStreams 00000014
+t/streams/02.t	case	expect	FindStreams 00000014	0
+t/streams/02.t	case	eval	testeval(len(s) == 2)
+t/streams/02.t	case	eval	testeval(":foo:$DATA" in s)
+t/streams/02.t	case	eval	testeval(":bar:$DATA" in s)
+t/streams/02.t	driver	call	RemoveDirectory 00000014
+t/streams/02.t	case	expect	RemoveDirectory 00000014	0
+t/streams/02.t	driver	call	FindStreams 00000014
+t/streams/02.t	case	expect	FindStreams 00000014	ERROR_FILE_NOT_FOUND
+t/streams/02.t	driver	call	CreateFile 00000014:strm0 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm0 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm1 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm1 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm2 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm2 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm3 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm3 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm4 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm4 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm5 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm5 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm6 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm6 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm7 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm7 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm8 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm8 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm9 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm9 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm10 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm10 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm11 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm11 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm12 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm12 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm13 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm13 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm14 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm14 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm15 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm15 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm16 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm16 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm17 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm17 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm18 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm18 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm19 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm19 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm20 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm20 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm21 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm21 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm22 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm22 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm23 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm23 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm24 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm24 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm25 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm25 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm26 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm26 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm27 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm27 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm28 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm28 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm29 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm29 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm30 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm30 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm31 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm31 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm32 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm32 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm33 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm33 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm34 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm34 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm35 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm35 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm36 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm36 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm37 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm37 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm38 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm38 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm39 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm39 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm40 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm40 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm41 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm41 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm42 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm42 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm43 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm43 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm44 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm44 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm45 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm45 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm46 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm46 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm47 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm47 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm48 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm48 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm49 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm49 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm50 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm50 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm51 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm51 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm52 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm52 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm53 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm53 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm54 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm54 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm55 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm55 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm56 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm56 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm57 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm57 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm58 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm58 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm59 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm59 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm60 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm60 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm61 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm61 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm62 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm62 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm63 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm63 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm64 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm64 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm65 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm65 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm66 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm66 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm67 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm67 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm68 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm68 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm69 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm69 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm70 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm70 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm71 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm71 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm72 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm72 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm73 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm73 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm74 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm74 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm75 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm75 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm76 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm76 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm77 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm77 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm78 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm78 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm79 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm79 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm80 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm80 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm81 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm81 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm82 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm82 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm83 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm83 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm84 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm84 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm85 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm85 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm86 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm86 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm87 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm87 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm88 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm88 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm89 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm89 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm90 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm90 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm91 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm91 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm92 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm92 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm93 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm93 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm94 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm94 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm95 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm95 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm96 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm96 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm97 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm97 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm98 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm98 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	CreateFile 00000014:strm99 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/02.t	case	expect	CreateFile 00000014:strm99 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/02.t	driver	call	FindStreams 00000014
+t/streams/02.t	case	expect	FindStreams 00000014	0
+t/streams/02.t	case	eval	testeval(len(s) == 101)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	case	eval	testeval(":strm%s:$DATA" % i in s)
+t/streams/02.t	driver	call	DeleteFile 00000014
+t/streams/02.t	case	expect	DeleteFile 00000014	0
+t/streams/02.t	driver	call	FindStreams 00000014
+t/streams/02.t	case	expect	FindStreams 00000014	ERROR_FILE_NOT_FOUND
+t/streams/03.t	driver	call	CreateFile 00000015:strm GENERIC_WRITE 0 D:P(A;;GA;;;WD) CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/03.t	case	expect	CreateFile 00000015:strm GENERIC_WRITE 0 D:P(A;;GA;;;WD) CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/03.t	driver	call	GetFileSecurity 00000015 DACL_SECURITY_INFORMATION
+t/streams/03.t	case	expect	GetFileSecurity 00000015 DACL_SECURITY_INFORMATION	lambda
+t/streams/03.t	driver	call	GetFileSecurity 00000015:strm DACL_SECURITY_INFORMATION
+t/streams/03.t	case	expect	GetFileSecurity 00000015:strm DACL_SECURITY_INFORMATION	lambda
+t/streams/03.t	driver	call	SetFileSecurity 00000015:strm DACL_SECURITY_INFORMATION D:P(A;;GA;;;WD)(A;;GR;;;SY)
+t/streams/03.t	case	expect	SetFileSecurity 00000015:strm DACL_SECURITY_INFORMATION D:P(A;;GA;;;WD)(A;;GR;;;SY)	0
+t/streams/03.t	driver	call	GetFileSecurity 00000015 DACL_SECURITY_INFORMATION
+t/streams/03.t	case	expect	GetFileSecurity 00000015 DACL_SECURITY_INFORMATION	lambda
+t/streams/03.t	driver	call	GetFileSecurity 00000015:strm DACL_SECURITY_INFORMATION
+t/streams/03.t	case	expect	GetFileSecurity 00000015:strm DACL_SECURITY_INFORMATION	lambda
+t/streams/03.t	driver	call	DeleteFile 00000015
+t/streams/03.t	case	expect	DeleteFile 00000015	0
+t/streams/03.t	driver	call	CreateFile 00000015:strm GENERIC_WRITE 0 D:P(A;;GA;;;WD) CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/03.t	case	expect	CreateFile 00000015:strm GENERIC_WRITE 0 D:P(A;;GA;;;WD) CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/03.t	driver	call	CreateFile 00000015 GENERIC_READ 0 0 OPEN_EXISTING 0 0
+t/streams/03.t	case	expect	CreateFile 00000015 GENERIC_READ 0 0 OPEN_EXISTING 0 0	0
+t/streams/03.t	driver	call	CreateFile 00000015:strm GENERIC_READ 0 0 OPEN_EXISTING 0 0
+t/streams/03.t	case	expect	CreateFile 00000015:strm GENERIC_READ 0 0 OPEN_EXISTING 0 0	0
+t/streams/03.t	driver	call	SetFileSecurity 00000015 DACL_SECURITY_INFORMATION D:P(D;;GR;;;WD)
+t/streams/03.t	case	expect	SetFileSecurity 00000015 DACL_SECURITY_INFORMATION D:P(D;;GR;;;WD)	0
+t/streams/03.t	driver	call	CreateFile 00000015 GENERIC_READ 0 0 OPEN_EXISTING 0 0
+t/streams/03.t	case	expect	CreateFile 00000015 GENERIC_READ 0 0 OPEN_EXISTING 0 0	ERROR_ACCESS_DENIED
+t/streams/03.t	driver	call	CreateFile 00000015:strm GENERIC_READ 0 0 OPEN_EXISTING 0 0
+t/streams/03.t	case	expect	CreateFile 00000015:strm GENERIC_READ 0 0 OPEN_EXISTING 0 0	ERROR_ACCESS_DENIED
+t/streams/03.t	driver	call	DeleteFile 00000015
+t/streams/03.t	case	expect	DeleteFile 00000015	0
+t/streams/03.t	driver	call	CreateDirectory 00000015 D:P(A;;GA;;;WD)
+t/streams/03.t	case	expect	CreateDirectory 00000015 D:P(A;;GA;;;WD)	0
+t/streams/03.t	driver	call	CreateFile 00000015:strm GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/03.t	case	expect	CreateFile 00000015:strm GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/03.t	driver	call	GetFileSecurity 00000015 DACL_SECURITY_INFORMATION
+t/streams/03.t	case	expect	GetFileSecurity 00000015 DACL_SECURITY_INFORMATION	lambda
+t/streams/03.t	driver	call	GetFileSecurity 00000015:strm DACL_SECURITY_INFORMATION
+t/streams/03.t	case	expect	GetFileSecurity 00000015:strm DACL_SECURITY_INFORMATION	lambda
+t/streams/03.t	driver	call	SetFileSecurity 00000015:strm DACL_SECURITY_INFORMATION D:P(A;;GA;;;WD)(A;;GR;;;SY)
+t/streams/03.t	case	expect	SetFileSecurity 00000015:strm DACL_SECURITY_INFORMATION D:P(A;;GA;;;WD)(A;;GR;;;SY)	0
+t/streams/03.t	driver	call	GetFileSecurity 00000015 DACL_SECURITY_INFORMATION
+t/streams/03.t	case	expect	GetFileSecurity 00000015 DACL_SECURITY_INFORMATION	lambda
+t/streams/03.t	driver	call	GetFileSecurity 00000015:strm DACL_SECURITY_INFORMATION
+t/streams/03.t	case	expect	GetFileSecurity 00000015:strm DACL_SECURITY_INFORMATION	lambda
+t/streams/03.t	driver	call	RemoveDirectory 00000015
+t/streams/03.t	case	expect	RemoveDirectory 00000015	0
+t/streams/03.t	driver	call	CreateDirectory 00000015 D:P(A;;GA;;;WD)
+t/streams/03.t	case	expect	CreateDirectory 00000015 D:P(A;;GA;;;WD)	0
+t/streams/03.t	driver	call	CreateFile 00000015\foobar GENERIC_READ 0 D:P(A;;FR;;;WD) CREATE_NEW 0 0
+t/streams/03.t	case	expect	CreateFile 00000015\foobar GENERIC_READ 0 D:P(A;;FR;;;WD) CREATE_NEW 0 0	0
+t/streams/03.t	driver	call	CreateFile 00000015\foobar:strm GENERIC_READ 0 0 CREATE_NEW 0 0
+t/streams/03.t	case	expect	CreateFile 00000015\foobar:strm GENERIC_READ 0 0 CREATE_NEW 0 0	ERROR_ACCESS_DENIED
+t/streams/03.t	driver	call	SetFileSecurity 00000015\foobar DACL_SECURITY_INFORMATION D:P(A;;FRFW;;;WD)
+t/streams/03.t	case	expect	SetFileSecurity 00000015\foobar DACL_SECURITY_INFORMATION D:P(A;;FRFW;;;WD)	0
+t/streams/03.t	driver	call	CreateFile 00000015\foobar:strm GENERIC_READ 0 0 CREATE_NEW 0 0
+t/streams/03.t	case	expect	CreateFile 00000015\foobar:strm GENERIC_READ 0 0 CREATE_NEW 0 0	0
+t/streams/03.t	driver	call	SetFileSecurity 00000015 DACL_SECURITY_INFORMATION D:P(A;;FR;;;WD)
+t/streams/03.t	case	expect	SetFileSecurity 00000015 DACL_SECURITY_INFORMATION D:P(A;;FR;;;WD)	0
+t/streams/03.t	driver	call	SetFileSecurity 00000015\foobar DACL_SECURITY_INFORMATION D:P(A;;FR;;;WD)
+t/streams/03.t	case	expect	SetFileSecurity 00000015\foobar DACL_SECURITY_INFORMATION D:P(A;;FR;;;WD)	0
+t/streams/03.t	driver	call	DeleteFile 00000015\foobar:strm
+t/streams/03.t	case	expect	DeleteFile 00000015\foobar:strm	ERROR_ACCESS_DENIED
+t/streams/03.t	driver	call	SetFileSecurity 00000015\foobar DACL_SECURITY_INFORMATION D:P(A;;FRSD;;;WD)
+t/streams/03.t	case	expect	SetFileSecurity 00000015\foobar DACL_SECURITY_INFORMATION D:P(A;;FRSD;;;WD)	0
+t/streams/03.t	driver	call	DeleteFile 00000015\foobar:strm
+t/streams/03.t	case	expect	DeleteFile 00000015\foobar:strm	0
+t/streams/03.t	driver	call	SetFileSecurity 00000015\foobar DACL_SECURITY_INFORMATION D:P(A;;FRFW;;;WD)
+t/streams/03.t	case	expect	SetFileSecurity 00000015\foobar DACL_SECURITY_INFORMATION D:P(A;;FRFW;;;WD)	0
+t/streams/03.t	driver	call	CreateFile 00000015\foobar:strm GENERIC_READ 0 0 CREATE_NEW 0 0
+t/streams/03.t	case	expect	CreateFile 00000015\foobar:strm GENERIC_READ 0 0 CREATE_NEW 0 0	0
+t/streams/03.t	driver	call	DeleteFile 00000015\foobar:strm
+t/streams/03.t	case	expect	DeleteFile 00000015\foobar:strm	ERROR_ACCESS_DENIED
+t/streams/03.t	driver	call	SetFileSecurity 00000015 DACL_SECURITY_INFORMATION D:P(A;;GA;;;WD)
+t/streams/03.t	case	expect	SetFileSecurity 00000015 DACL_SECURITY_INFORMATION D:P(A;;GA;;;WD)	0
+t/streams/03.t	driver	call	DeleteFile 00000015\foobar:strm
+t/streams/03.t	case	expect	DeleteFile 00000015\foobar:strm	0
+t/streams/03.t	driver	call	DeleteFile 00000015\foobar
+t/streams/03.t	case	expect	DeleteFile 00000015\foobar	0
+t/streams/03.t	driver	call	RemoveDirectory 00000015
+t/streams/03.t	case	expect	RemoveDirectory 00000015	0
+t/streams/04.t	driver	call	CreateFile 00000016:strm GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/04.t	case	expect	CreateFile 00000016:strm GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/04.t	driver	call	GetFileInformation 00000016
+t/streams/04.t	case	expect	GetFileInformation 00000016	lambda
+t/streams/04.t	driver	call	SetReparsePoint 00000016:strm 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} 1A 2B 3C 4D 5F
+t/streams/04.t	case	expect	SetReparsePoint 00000016:strm 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} 1A 2B 3C 4D 5F	0
+t/streams/04.t	driver	call	GetFileInformation 00000016
+t/streams/04.t	case	expect	GetFileInformation 00000016	lambda
+t/streams/04.t	driver	call	GetReparsePoint 00000016
+t/streams/04.t	case	expect	GetReparsePoint 00000016	lambda
+t/streams/04.t	driver	call	SetReparsePoint 00000016 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} A1 B2 C3 D4 F5 1A 2B 3C 4D 5F
+t/streams/04.t	case	expect	SetReparsePoint 00000016 42 {92A23BD8-99F5-4FD6-807C-C56F3A063C52} A1 B2 C3 D4 F5 1A 2B 3C 4D 5F	0
+t/streams/04.t	driver	call	GetReparsePoint 00000016:strm
+t/streams/04.t	case	expect	GetReparsePoint 00000016:strm	lambda
+t/streams/04.t	driver	call	DeleteFile 00000016
+t/streams/04.t	case	expect	DeleteFile 00000016	0
+t/streams/04.t	driver	call	CreateSymbolicLink 00000017 00000018 0
+t/streams/04.t	case	expect	CreateSymbolicLink 00000017 00000018 0	0
+t/streams/04.t	driver	call	CreateFile 00000017:strm GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/04.t	case	expect	CreateFile 00000017:strm GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/04.t	driver	call	CreateFile 00000017:strm GENERIC_WRITE 0 0 OPEN_EXISTING FILE_ATTRIBUTE_NORMAL 0
+t/streams/04.t	case	expect	CreateFile 00000017:strm GENERIC_WRITE 0 0 OPEN_EXISTING FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/04.t	driver	call	CreateFile 00000018:strm GENERIC_WRITE 0 0 OPEN_EXISTING FILE_ATTRIBUTE_NORMAL 0
+t/streams/04.t	case	expect	CreateFile 00000018:strm GENERIC_WRITE 0 0 OPEN_EXISTING FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/04.t	driver	call	CreateFile 00000017:symstrm GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL+FILE_FLAG_OPEN_REPARSE_POINT 0
+t/streams/04.t	case	expect	CreateFile 00000017:symstrm GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL+FILE_FLAG_OPEN_REPARSE_POINT 0	0
+t/streams/04.t	driver	call	CreateFile 00000017:symstrm GENERIC_WRITE 0 0 OPEN_EXISTING FILE_ATTRIBUTE_NORMAL+FILE_FLAG_OPEN_REPARSE_POINT 0
+t/streams/04.t	case	expect	CreateFile 00000017:symstrm GENERIC_WRITE 0 0 OPEN_EXISTING FILE_ATTRIBUTE_NORMAL+FILE_FLAG_OPEN_REPARSE_POINT 0	0
+t/streams/04.t	driver	call	CreateFile 00000017:symstrm GENERIC_WRITE 0 0 OPEN_EXISTING FILE_ATTRIBUTE_NORMAL 0
+t/streams/04.t	case	expect	CreateFile 00000017:symstrm GENERIC_WRITE 0 0 OPEN_EXISTING FILE_ATTRIBUTE_NORMAL 0	ERROR_FILE_NOT_FOUND
+t/streams/04.t	driver	call	CreateFile 00000018:symstrm GENERIC_WRITE 0 0 OPEN_EXISTING FILE_ATTRIBUTE_NORMAL 0
+t/streams/04.t	case	expect	CreateFile 00000018:symstrm GENERIC_WRITE 0 0 OPEN_EXISTING FILE_ATTRIBUTE_NORMAL 0	ERROR_FILE_NOT_FOUND
+t/streams/04.t	driver	call	DeleteFile 00000018
+t/streams/04.t	case	expect	DeleteFile 00000018	0
+t/streams/04.t	driver	call	DeleteFile 00000017
+t/streams/04.t	case	expect	DeleteFile 00000017	0
+t/streams/04.t	driver	call	CreateSymbolicLink 00000017:strm 00000018 0
+t/streams/04.t	case	expect	CreateSymbolicLink 00000017:strm 00000018 0	0
+t/streams/04.t	driver	call	GetFileInformation 00000017
+t/streams/04.t	case	expect	GetFileInformation 00000017	lambda
+t/streams/04.t	driver	call	GetReparsePoint 00000017
+t/streams/04.t	case	expect	GetReparsePoint 00000017	lambda
+t/streams/04.t	driver	call	FindStreams 00000017
+t/streams/04.t	case	expect	FindStreams 00000017	0
+t/streams/04.t	case	eval	testeval(len(s) == 2)
+t/streams/04.t	case	eval	testeval("::$DATA" in s)
+t/streams/04.t	case	eval	testeval(":strm:$DATA" in s)
+t/streams/04.t	driver	call	DeleteFile 00000017
+t/streams/04.t	case	expect	DeleteFile 00000017	0
+t/streams/04.t	driver	call	CreateSymbolicLink 00000017 00000018:strm 0
+t/streams/04.t	case	expect	CreateSymbolicLink 00000017 00000018:strm 0	0
+t/streams/04.t	driver	call	CreateFile 00000017:strm GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/04.t	case	expect	CreateFile 00000017:strm GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	ERROR_INVALID_NAME
+t/streams/04.t	driver	call	CreateFile 00000017 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/04.t	case	expect	CreateFile 00000017 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/04.t	driver	call	CreateFile 00000017 GENERIC_WRITE 0 0 OPEN_EXISTING FILE_ATTRIBUTE_NORMAL 0
+t/streams/04.t	case	expect	CreateFile 00000017 GENERIC_WRITE 0 0 OPEN_EXISTING FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/04.t	driver	call	CreateFile 00000018 GENERIC_WRITE 0 0 OPEN_EXISTING FILE_ATTRIBUTE_NORMAL 0
+t/streams/04.t	case	expect	CreateFile 00000018 GENERIC_WRITE 0 0 OPEN_EXISTING FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/04.t	driver	call	CreateFile 00000018:strm GENERIC_WRITE 0 0 OPEN_EXISTING FILE_ATTRIBUTE_NORMAL 0
+t/streams/04.t	case	expect	CreateFile 00000018:strm GENERIC_WRITE 0 0 OPEN_EXISTING FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/04.t	driver	call	DeleteFile 00000018
+t/streams/04.t	case	expect	DeleteFile 00000018	0
+t/streams/04.t	driver	call	DeleteFile 00000017
+t/streams/04.t	case	expect	DeleteFile 00000017	0
+t/streams/04.t	driver	call	CreateSymbolicLink 00000017 00000018 SYMBOLIC_LINK_FLAG_DIRECTORY
+t/streams/04.t	case	expect	CreateSymbolicLink 00000017 00000018 SYMBOLIC_LINK_FLAG_DIRECTORY	0
+t/streams/04.t	driver	call	CreateDirectory 00000017 0
+t/streams/04.t	case	expect	CreateDirectory 00000017 0	ERROR_ALREADY_EXISTS
+t/streams/04.t	driver	call	CreateFile 00000017 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/04.t	case	expect	CreateFile 00000017 GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	ERROR_ACCESS_DENIED
+t/streams/04.t	driver	call	CreateFile 00000017:strm GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/04.t	case	expect	CreateFile 00000017:strm GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/04.t	driver	call	CreateFile 00000017:strm GENERIC_WRITE 0 0 OPEN_EXISTING FILE_ATTRIBUTE_NORMAL 0
+t/streams/04.t	case	expect	CreateFile 00000017:strm GENERIC_WRITE 0 0 OPEN_EXISTING FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/04.t	driver	call	CreateFile 00000018:strm GENERIC_WRITE 0 0 OPEN_EXISTING FILE_ATTRIBUTE_NORMAL 0
+t/streams/04.t	case	expect	CreateFile 00000018:strm GENERIC_WRITE 0 0 OPEN_EXISTING FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/04.t	driver	call	DeleteFile 00000018
+t/streams/04.t	case	expect	DeleteFile 00000018	0
+t/streams/04.t	driver	call	RemoveDirectory 00000017
+t/streams/04.t	case	expect	RemoveDirectory 00000017	0
+t/streams/04.t	driver	call	CreateDirectory 00000018 0
+t/streams/04.t	case	expect	CreateDirectory 00000018 0	0
+t/streams/04.t	driver	call	CreateSymbolicLink 00000017 00000018 SYMBOLIC_LINK_FLAG_DIRECTORY
+t/streams/04.t	case	expect	CreateSymbolicLink 00000017 00000018 SYMBOLIC_LINK_FLAG_DIRECTORY	0
+t/streams/04.t	driver	call	CreateFile 00000017:strm GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0
+t/streams/04.t	case	expect	CreateFile 00000017:strm GENERIC_WRITE 0 0 CREATE_NEW FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/04.t	driver	call	CreateFile 00000017:strm GENERIC_WRITE 0 0 OPEN_EXISTING FILE_ATTRIBUTE_NORMAL 0
+t/streams/04.t	case	expect	CreateFile 00000017:strm GENERIC_WRITE 0 0 OPEN_EXISTING FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/04.t	driver	call	CreateFile 00000018:strm GENERIC_WRITE 0 0 OPEN_EXISTING FILE_ATTRIBUTE_NORMAL 0
+t/streams/04.t	case	expect	CreateFile 00000018:strm GENERIC_WRITE 0 0 OPEN_EXISTING FILE_ATTRIBUTE_NORMAL 0	0
+t/streams/04.t	driver	call	RemoveDirectory 00000018
+t/streams/04.t	case	expect	RemoveDirectory 00000018	0
+t/streams/04.t	driver	call	RemoveDirectory 00000017
+t/streams/04.t	case	expect	RemoveDirectory 00000017	0

@@ -53,9 +53,33 @@ fn digest_of(path: &Path) -> Result<String, Failure> {
   Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
+/// A file's POSIX permission bits, as the mount reports them.
+#[cfg(unix)]
+fn permission_bits(metadata: &std::fs::Metadata) -> u32 {
+  use std::os::unix::fs::PermissionsExt;
+  metadata.permissions().mode()
+}
+
+/// Format: the bits a Windows file without the read-only attribute is compared as (`rwxrwxrwx`): Windows keeps no
+/// POSIX mode, and its one permission attribute is read-only.
+#[cfg(windows)]
+const WINDOWS_WRITABLE_BITS: u32 = 0o777;
+/// Format: the bits a Windows file with the read-only attribute is compared as (`r-xr-xr-x`).
+#[cfg(windows)]
+const WINDOWS_READ_ONLY_BITS: u32 = 0o555;
+
+/// A file's permission bits on Windows: its read-only attribute, the one permission Windows keeps.
+#[cfg(windows)]
+fn permission_bits(metadata: &std::fs::Metadata) -> u32 {
+  if metadata.permissions().readonly() {
+    WINDOWS_READ_ONLY_BITS
+  } else {
+    WINDOWS_WRITABLE_BITS
+  }
+}
+
 /// One manifest entry for a path under `root`.
 fn entry_of(root: &Path, path: &Path) -> Result<Entry, Failure> {
-  use std::os::unix::fs::PermissionsExt;
   let metadata =
     std::fs::symlink_metadata(path).map_err(|e| Failure(format!("{}: {e}", path.display())))?;
   let relative = path
@@ -84,7 +108,7 @@ fn entry_of(root: &Path, path: &Path) -> Result<Entry, Failure> {
   let mode = if file_type.is_symlink() {
     0o777
   } else {
-    metadata.permissions().mode() & PERMISSION_MASK
+    permission_bits(&metadata) & PERMISSION_MASK
   };
   Ok(Entry {
     path: relative,

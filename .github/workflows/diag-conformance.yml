@@ -1,0 +1,85 @@
+# Diagnostics for the conformance agent: never on main. Triggered only by pushes to diag-conformance-* branches.
+name: diag-conformance
+
+on:
+  push:
+    branches: ['diag-conformance-*']
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows-conformance:
+    name: conformance on ${{ matrix.os }} (fsx, winfstest over the WinFsp drive)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (x86_64)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl for the C the harness links (arm64)
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Install WinFsp
+        run: |
+          choco install winfsp -y --no-progress
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Clippy xtask, the CLI's WinFsp tests and the bridge (native Windows)
+        run: cargo clippy -p xtask -p slates-bridge-winfsp -p slates-cli --all-targets -- -D warnings
+      - name: xtask's own tests (native Windows)
+        if: ${{ !cancelled() }}
+        run: cargo test -p xtask winfstest
+      - name: Win32 semantics through the drive (A-214's red tests)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        env:
+          SLATES_TEST_CLI: "1"
+          WINFSP_TEST_MOUNT: "1"
+        run: cargo test -p slates-cli --test winfsp_semantics -- --test-threads=1 --nocapture
+      - name: fsx over the WinFsp drive
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        run: cargo xtask conformance run --suite fsx --records target/conformance-records --scratch target/conformance-scratch --keep
+      - name: winfstest over the WinFsp drive
+        if: ${{ !cancelled() }}
+        timeout-minutes: 40
+        run: cargo xtask conformance run --suite winfstest --records target/conformance-records --scratch target/conformance-scratch --keep
+      - name: Upload the records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-records-${{ matrix.os }}
+          path: target/conformance-records
+      - name: Upload winfstest's per-script output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: winfstest-output-${{ matrix.os }}
+          path: target/conformance-scratch/*/winfstest-output
+          if-no-files-found: ignore
+      - name: Upload the anchor logs and fsx logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-logs-${{ matrix.os }}
+          path: |
+            target/conformance-scratch/*/*.log
+            target/conformance-scratch/*/fsx-logs
+          if-no-files-found: ignore

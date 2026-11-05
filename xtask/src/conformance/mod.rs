@@ -31,6 +31,7 @@ mod mount;
 mod slates;
 mod suites;
 mod trace_process;
+mod winfstest;
 mod workloads;
 
 use std::path::{Path, PathBuf};
@@ -57,6 +58,7 @@ use slates_conformance::exerciser::{
 /// target directory and pjdfstest's scratch, well under a CI runner's RAM.
 const VOLUME_SIZE: &str = "512MiB";
 /// Shape: a `sudo -n true` probe's wait (it answers at once or refuses at once).
+#[cfg(unix)]
 const SUDO_PROBE: Duration = Duration::from_secs(5);
 
 /// The parsed command line.
@@ -299,17 +301,43 @@ fn host_facts(privilege: Privilege) -> Host {
         })
       })
       .unwrap_or_else(|| "Linux".to_owned()),
-    _ => std::env::consts::OS.to_owned(),
+    Ok(HostOs::Windows) => stdout_of("cmd", &["/c", "ver"]),
+    Err(_) => std::env::consts::OS.to_owned(),
   };
   Host {
     os,
-    kernel: stdout_of("uname", &["-sr"]),
-    arch: stdout_of("uname", &["-m"]),
+    kernel: kernel_name(),
+    arch: machine_name(),
     privilege,
   }
 }
 
+/// The kernel's name and release, as `uname -sr` prints them.
+#[cfg(unix)]
+fn kernel_name() -> String {
+  stdout_of("uname", &["-sr"])
+}
+
+/// The kernel's name and release on Windows: `ver`'s line names the NT kernel's version (`10.0.26100.6584`).
+#[cfg(windows)]
+fn kernel_name() -> String {
+  stdout_of("cmd", &["/c", "ver"])
+}
+
+/// The machine's architecture, as `uname -m` prints it.
+#[cfg(unix)]
+fn machine_name() -> String {
+  stdout_of("uname", &["-m"])
+}
+
+/// The machine's architecture on Windows: this process's own, which the lanes build natively (`x86_64`, `aarch64`).
+#[cfg(windows)]
+fn machine_name() -> String {
+  std::env::consts::ARCH.to_owned()
+}
+
 /// Whether `name` is an executable on the `PATH`.
+#[cfg(unix)]
 pub(crate) fn tool_on_path(name: &str) -> bool {
   Command::new("sh")
     .args(["-c", &format!("command -v {name}")])
@@ -318,12 +346,43 @@ pub(crate) fn tool_on_path(name: &str) -> bool {
     .unwrap_or(false)
 }
 
+/// Whether `name` is a file on the `PATH` (`where`, which finds a library such as WinFsp's DLL as well as a program).
+#[cfg(windows)]
+pub(crate) fn tool_on_path(name: &str) -> bool {
+  Command::new("where")
+    .arg("/q")
+    .arg(name)
+    .status()
+    .is_ok_and(|status| status.success())
+}
+
 /// Whether this process is root.
-fn is_root() -> bool {
+#[cfg(unix)]
+pub(crate) fn is_root() -> bool {
   stdout_of("id", &["-u"]) == "0"
 }
 
+/// Whether this process runs elevated, Windows' counterpart of root: `net session` answers only an elevated
+/// administrator (GitHub's Windows runners run elevated; a developer's prompt usually does not).
+#[cfg(windows)]
+pub(crate) fn is_root() -> bool {
+  Command::new("net")
+    .arg("session")
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .status()
+    .is_ok_and(|status| status.success())
+}
+
+/// Windows has no `sudo -n` the harness may ask (Windows 11's `sudo` raises a consent prompt): no suite there asks
+/// for more than the runner's own rights.
+#[cfg(windows)]
+pub(crate) fn sudo_without_prompt() -> bool {
+  false
+}
+
 /// Whether `sudo -n` works without a prompt (the CI runners; never this laptop).
+#[cfg(unix)]
 pub(crate) fn sudo_without_prompt() -> bool {
   let Ok(mut child) = Command::new("sudo")
     .args(["-n", "true"])
@@ -355,6 +414,18 @@ const POLL: Duration = Duration::from_millis(20);
 pub(crate) fn pause() {
   #[allow(clippy::disallowed_methods)]
   std::thread::sleep(POLL);
+}
+
+/// A path as a C program's `open` takes it. On Windows, `canonicalize` answers the verbatim form (`\\?\C:\a\b`), which
+/// the C runtime's `open` refuses when a program appends `/name` to it (the WinFsp fsx port answered `Invalid argument`
+/// for its `-P` directory, diagnostics run 41982130174), so a verbatim drive path loses its prefix; elsewhere a path is
+/// already plain.
+pub(crate) fn plain_path(path: &Path) -> String {
+  let text = path.display().to_string();
+  match text.strip_prefix(r"\\?\") {
+    Some(rest) if rest.as_bytes().get(1) == Some(&b':') => rest.to_owned(),
+    _ => text,
+  }
 }
 
 /// Today's civil date (UTC), for the record.
@@ -725,6 +796,7 @@ fn run_suite_on(
     Suite::Workloads if transport.is_container() => container::run_workloads(&run)?,
     Suite::Workloads => workloads::run_workloads(&run)?,
     Suite::Hermeticity => hermeticity::run_hermeticity(&run)?,
+    Suite::Winfstest => winfstest::run_winfstest(&run)?,
     Suite::Pressure | Suite::Failure => {
       return Err(Failure(format!(
         "{} has no runnable form yet",
@@ -774,6 +846,7 @@ fn all(root: &Path, options: &Options) -> Result<(), Failure> {
     Suite::Fsx,
     Suite::Fsstress,
     Suite::Pjdfstest,
+    Suite::Winfstest,
     Suite::Workloads,
     Suite::Hermeticity,
   ] {
@@ -810,4 +883,19 @@ fn render_matrix(root: &Path, options: &Options) -> Result<(), Failure> {
     print!("{rendered}");
   }
   Ok(())
+}
+
+#[cfg(test)]
+mod plain_path_tests {
+  use super::plain_path;
+  use std::path::Path;
+
+  /// A verbatim drive path loses its prefix; a verbatim UNC path, a plain path and a Unix path are kept whole.
+  #[test]
+  fn a_verbatim_drive_path_becomes_plain_and_nothing_else_changes() {
+    assert_eq!(plain_path(Path::new(r"\\?\C:\a\b")), r"C:\a\b");
+    assert_eq!(plain_path(Path::new(r"\\?\UNC\host\share")), r"\\?\UNC\host\share");
+    assert_eq!(plain_path(Path::new(r"C:\a")), r"C:\a");
+    assert_eq!(plain_path(Path::new("/home/a")), "/home/a");
+  }
 }
