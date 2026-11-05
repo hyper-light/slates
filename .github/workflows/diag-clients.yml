@@ -1,0 +1,86 @@
+name: diag-clients
+
+# Diagnostics only, never on main: on every platform the clients agent cannot reach from its own machine (macOS is
+# measured natively there), (1) the spin test `a_spinning_shard_answers_sooner_than_a_parked_one` (a spinning
+# cross-shard round trip under half a parked one), five times on main (MAIN_SHA, the test copied in) and on the macOS
+# kqueue fix (FIX_SHA), so a zero-timeout poll that sleeps on epoll or IOCP shows; then (2) the provisioning
+# histogram, main against the fix, the arms alternating, three rounds.
+on:
+  push:
+    branches: ["diag-clients-*"]
+
+env:
+  CARGO_TERM_COLOR: always
+  MAIN_SHA: a7804447
+  FIX_SHA: a75f9213
+
+jobs:
+  ab:
+    name: spin and provisioning main/fix (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: The runner and its cores
+        run: |
+          uname -a || true
+          date -u
+          if command -v lscpu >/dev/null; then lscpu | grep -E 'Model name|^CPU\(s\)|Thread|Core|Socket' || true; fi
+          for cpu in /sys/devices/system/cpu/cpu[0-9]*; do
+            [ -r "$cpu/topology/thread_siblings_list" ] && echo "$(basename "$cpu"): $(cat "$cpu/topology/thread_siblings_list")"
+          done
+          if command -v powershell >/dev/null; then
+            powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Format-List Name,NumberOfCores,NumberOfLogicalProcessors"
+          fi
+          uptime || true
+      - name: Build the two arms
+        run: |
+          mkdir -p ../arms
+          for arm in main fix; do
+            case $arm in main) sha=$MAIN_SHA;; fix) sha=$FIX_SHA;; esac
+            git worktree add "../src-$arm" "$sha"
+            git show "$FIX_SHA:crates/rt/tests/spin_keeps_core.rs" > "../src-$arm/crates/rt/tests/spin_keeps_core.rs"
+            ( cd "../src-$arm" && CARGO_TARGET_DIR="../target-$arm" cargo build --release --locked -p slates-client --example provision_bench )
+            ( cd "../src-$arm" && CARGO_TARGET_DIR="../target-$arm" cargo test --release --locked -p slates-rt --test spin_keeps_core --no-run )
+            for exe in "../target-$arm/release/examples/provision_bench" "../target-$arm/release/examples/provision_bench.exe"; do
+              if [ -f "$exe" ]; then cp "$exe" "../arms/$arm${exe##*provision_bench}"; fi
+            done
+          done
+          ls -la ../arms
+      - name: The spin test, five times an arm, alternating
+        run: |
+          for run in 1 2 3 4 5; do
+            for arm in main fix; do
+              echo "== spin test $run: $arm at $(date -u +%H:%M:%S) UTC"
+              status=0
+              ( cd "../src-$arm" && CARGO_TARGET_DIR="../target-$arm" cargo test --release --locked -q -p slates-rt --test spin_keeps_core -- --nocapture 2>&1 | grep -E 'median|test result|panicked' ) || status=$?
+              echo "== spin test $run: $arm exit $status"
+            done
+          done
+      - name: Three rounds of the histogram, the arms alternating
+        run: |
+          for round in 1 2 3; do
+            for arm in main fix; do
+              echo "== round $round: $arm at $(date -u +%H:%M:%S) UTC; $(uptime 2>/dev/null || echo 'no load average')"
+              status=0
+              ../arms/$arm || status=$?
+              echo "== round $round: $arm exit $status"
+            done
+          done
