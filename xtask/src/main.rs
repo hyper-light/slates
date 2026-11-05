@@ -17,7 +17,8 @@
 //!   carries it (see `version.rs`): the workspace version is the only hand-edited one; the Python
 //!   wheel derives it through maturin; the Node main package, its platform packages and its
 //!   `optionalDependencies` pins must equal it and are re-derived by `--write`; `--expect-tag` is
-//!   the release guard (the tag must be `v` + the version).
+//!   the release guard (the tag must be `v` + the version; with `--allow-test-tag`, also `v` + the version +
+//!   `-test.N`, a test of the release lane).
 //! - `cargo xtask npm-reserve --out DIR` — the 0.0.0 stub packages a maintainer publishes once to
 //!   create each npm name, derived from the same manifests (see `version.rs`).
 //! - `cargo xtask toolchain` — every image, build and workflow pin names `rust-toolchain.toml`'s channel (see
@@ -29,6 +30,9 @@
 //!   [--scratch DIR] [--keep]` — the conformance evidence harness (see `conformance/mod.rs`).
 //! - `cargo xtask kind (image | smoke) [--tag TAG] [--keep]` — the KIND fleet lane: the image, one node
 //!   of it in Docker (see `kind.rs`; docs/wip/kind-lane.md).
+//! - The release lane's tasks are a binary of their own, `release` (`src/bin/release.rs`, `release.rs`; Appendix
+//!   B.2, A-210), because they must build on Windows and the conformance and KIND tasks here reach Unix-only calls:
+//!   `cargo run -p xtask --bin release -- smoke ...` and `... -- artifacts ...`.
 //! - `cargo xtask tsan` — the ThreadSanitizer lane: the race canary must be reported, then the
 //!   threaded crates' tests run instrumented and any report fails (see `tsan.rs`; needs nightly
 //!   with `rust-src`).
@@ -47,6 +51,7 @@ mod conformance;
 mod kind;
 mod named_tests;
 mod ratchet;
+mod tag;
 mod toolchain;
 mod tsan;
 mod unsafe_budget;
@@ -143,7 +148,7 @@ fn main() -> ExitCode {
     "tsan" => workspace_root().and_then(|root| tsan::run(&root)),
     "toolchain" => workspace_root().and_then(|root| toolchain::run(&root)),
     other => Err(Failure(format!(
-      "unknown task `{other}`; tasks: structural, literals, unsafe, version, toolchain, npm-reserve, check, capabilities, callgrind, ratchet, conformance, kind, tsan"
+      "unknown task `{other}`; tasks: structural, literals, unsafe, version, toolchain, npm-reserve, check, capabilities, callgrind, ratchet, conformance, kind, tsan; the release lane's tasks are the `release` binary (`cargo run -p xtask --bin release -- smoke | artifacts`)"
     ))),
   };
   match outcome {
