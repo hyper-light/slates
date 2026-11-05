@@ -556,19 +556,6 @@ fn a_stable_nfs_write_to_a_live_volume_is_answered_once_a_candidate_holds_it() {
   );
 }
 
-/// Waits until `volume`'s creation head is placed at `f + 1` (`volume stat`'s `placed`).
-fn wait_head_placed(owner: &str, volume: &str) {
-  let deadline = Instant::now() + FLEET_WAIT;
-  loop {
-    let (code, out, _) = run(owner, &["volume", "stat", volume]);
-    if code == 0 && value_of(&out, "placed") == "true" {
-      return;
-    }
-    assert!(Instant::now() < deadline, "the creation head placed: {out}");
-    pause();
-  }
-}
-
 /// The body `write_live_volume` writes to `/file-N`.
 fn live_body(file: usize) -> String {
   format!("live write {file} on the owner, kept by both candidates")
@@ -632,9 +619,8 @@ fn a_live_volumes_acknowledged_writes_survive_its_owners_death() {
   let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
   let owner = fleet.instances[owner_index].clone();
   let id = write_live_volume(&owner, FILES);
-  // The fleet learns a volume exists from its creation head, placed at `f + 1` on the record period; a volume whose
-  // owner dies before that is not one a takeover can find (GAPS: the first live write is owed a wait for it).
-  wait_head_placed(&owner, &id);
+  // No wait for the creation head's placement here: a live write is answered only once the head is placed too, so the
+  // owner may die the moment the last write returns.
   let survivors: Vec<&String> = fleet
     .instances
     .iter()

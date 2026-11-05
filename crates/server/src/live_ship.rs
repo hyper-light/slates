@@ -167,13 +167,14 @@ const DURABLE_WAIT_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS;
 pub(crate) async fn wait_durable(volume: slates_db::catalog::VolumeId, target: u64) -> bool {
   let parked = std::future::poll_fn(|cx| {
     let done = state::with_state(|s| {
-      let durable = s.live.shipping.get(&volume.bytes).is_none_or(|live| {
-        !live.owes_whole
-          && live
-            .shipper
-            .durable()
-            .is_some_and(|durable| durable >= target)
-      });
+      let durable = head_placed(s, volume.bytes)
+        && s.live.shipping.get(&volume.bytes).is_none_or(|live| {
+          !live.owes_whole
+            && live
+              .shipper
+              .durable()
+              .is_some_and(|durable| durable >= target)
+        });
       done_or_park(s, volume.bytes, durable, cx.waker())
     })
     .unwrap_or(true);
@@ -235,6 +236,19 @@ fn wake_parked(state: &mut ShardState, volume: [u8; 16]) {
   }
 }
 
+/// Whether the fleet knows `volume` exists: its head is placed at `f + 1` (at `f = 0` every head is, R8). Until then a
+/// takeover cannot find it, so a write to it is not durable however many candidates hold the write: an owner that died
+/// within the first record period lost a never-placed volume with every write it had acknowledged (found 2026-11-05 by
+/// the takeover flow, which then waited for the placement by hand).
+fn head_placed(state: &ShardState, volume: [u8; 16]) -> bool {
+  let configuration = state.fleet.configuration();
+  configuration.quorum.f == 0
+    || state
+      .placed_heads
+      .get(&ObjectId(volume))
+      .is_some_and(|head| configuration.region_placed(&head.placement))
+}
+
 /// A verb's reply held until its volume's log is durable where its publication put it.
 #[derive(Debug)]
 struct Awaiting {
@@ -276,6 +290,10 @@ pub(crate) fn durable_target(
 ) -> Option<u64> {
   let live = state.live.shipping.get(&volume.bytes)?;
   let head = live.shipper.head().map(|head| head.position);
+  if !head_placed(state, volume.bytes) {
+    // The fleet does not know the volume yet: a takeover could not find it, so nothing written to it is durable.
+    return head;
+  }
   let target = if live.owes_whole {
     head.map_or(Some(0), |head| head.checked_add(1))?
   } else {
@@ -357,8 +375,11 @@ pub(crate) fn join(
 /// Answers every verb waiting on `volume` at or below its durable position: its completion recorded on this partition
 /// (one durable step, so a retry after meets it) and its reply delivered to its client's shard, as a green's accepted
 /// submit is (`merge_service::resolve_accepted`).
-fn resolve(state: &mut ShardState, volume: [u8; 16]) {
+pub(crate) fn resolve(state: &mut ShardState, volume: [u8; 16]) {
   wake_parked(state, volume);
+  if !head_placed(state, volume) {
+    return;
+  }
   let Some(durable) = state
     .live
     .shipping
