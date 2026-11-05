@@ -110,7 +110,7 @@ fn hold_nfs_listener(supervisor: &mut Supervisor) {
   // all: handing the daemon a descriptor number it will not inherit would have it adopt whatever that
   // number names in its own table. The daemon then binds its own listener, as when the bind failed.
   if let Err(e) = rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::empty()) {
-    eprintln!(
+    slates_machine::log_line!(
       "slates anchor: the NFS listener cannot be made inheritable ({e}); the daemon binds its own"
     );
     return;
@@ -191,7 +191,7 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
   // The page the node's sealing root lives on stays locked between daemons too (A-92): the anchor maps it all along.
   // A refusal leaves it to the daemon, which then reports sealing unavailable rather than publish a root there.
   if let Err(e) = segment.protect_seal_page() {
-    eprintln!("slates anchor: the sealing page could not be locked: {e}");
+    slates_machine::log_line!("slates anchor: the sealing page could not be locked: {e}");
   }
   let json = profile.to_json().map_err(|e| failed("profile", e))?;
   segment
@@ -254,7 +254,7 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
   // The anchor holds a duplicate of every device and connection it is sent, so it needs the descriptors its bounds
   // name: raise its soft limit to the hard one, as the daemon does (no privilege needed).
   if let Some((was, now)) = slates_server::daemon::raise_descriptor_limit() {
-    eprintln!("slates anchor: descriptor limit raised from {was} to {now}");
+    slates_machine::log_line!("slates anchor: descriptor limit raised from {was} to {now}");
   }
   // The client rendezvous is held the same way (A-114): a client that connects while a daemon restarts waits for the
   // next one instead of failing "no daemon". Kept for the anchor's life; the daemon adopts it from the environment.
@@ -267,7 +267,7 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
   let mut clock = HostClock::new();
   let now = clock.monotonic_ns();
   supervisor.start(now).map_err(|e| failed("start", e))?;
-  eprintln!(
+  slates_machine::log_line!(
     "slates anchor: instance {} up; daemon pid {}; {} shards",
     options.instance,
     supervisor
@@ -320,7 +320,7 @@ fn stop_gracefully(supervisor: &mut Supervisor, clock: &mut HostClock) -> Result
     {
       Stopping::Draining => std::thread::park_timeout(Duration::from_nanos(HEARTBEAT_NS)),
       Stopping::Exited { exit_code, killed } => {
-        eprintln!(
+        slates_machine::log_line!(
           "slates anchor: stopped (daemon exit {exit_code:?}{})",
           if killed { ", killed" } else { "" }
         );
@@ -378,7 +378,7 @@ fn observe(
             starting_since = None;
           }
           Some(since) if now.saturating_sub(since) > RECOVERY_BUDGET_NS && !kill_sent => {
-            eprintln!(
+            slates_machine::log_line!(
               "slates anchor: the daemon never beat inside the recovery budget; killing it"
             );
             supervisor.kill().map_err(|e| failed("kill", e))?;
@@ -387,7 +387,7 @@ fn observe(
           }
           Some(_) => {}
           None if !alive && !kill_sent => {
-            eprintln!("slates anchor: the daemon's heartbeat lapsed; killing it");
+            slates_machine::log_line!("slates anchor: the daemon's heartbeat lapsed; killing it");
             supervisor.kill().map_err(|e| failed("kill", e))?;
             kill_sent = true;
           }
@@ -404,7 +404,7 @@ fn observe(
         exit_code,
         in_window,
       } => {
-        eprintln!(
+        slates_machine::log_line!(
           "slates anchor: daemon exited ({exit_code:?}); restarted ({in_window} in the window)"
         );
         starting_since = Some(clock.monotonic_ns());
@@ -416,7 +416,7 @@ fn observe(
       } => {
         // Never given up on (A-119): every hard mount waits for the daemon. The loop is recorded for the health
         // plane and the restart comes after the backoff.
-        eprintln!(
+        slates_machine::log_line!(
           "slates anchor: the daemon is in a crash loop (last exit {exit_code:?}); restarting it in {} ms",
           retry_in_ns / NS_PER_MS
         );

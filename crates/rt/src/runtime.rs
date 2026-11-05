@@ -196,7 +196,7 @@ pub fn shard_cores(profile: &MachineProfile) -> (Derived<u16>, Vec<u32>) {
 fn log_pin_refused(shard: u16, core: u32) {
   static LOGGED: AtomicBool = AtomicBool::new(false);
   if cfg!(any(target_os = "linux", windows)) && !LOGGED.swap(true, Ordering::AcqRel) {
-    eprintln!(
+    slates_machine::log_line!(
       "slates-rt: shard {shard} could not be fixed to CPU {core} (the OS refused); it runs where the \
        scheduler places it (first occurrence; each shard counts its own)"
     );
@@ -340,7 +340,7 @@ impl Drop for Runtime {
       return;
     }
     if let Err(error) = stop(std::mem::take(&mut self.workers)) {
-      eprintln!("slates-rt: a runtime dropped without shutdown: {error}");
+      slates_machine::log_line!("slates-rt: a runtime dropped without shutdown: {error}");
     }
   }
 }
@@ -578,7 +578,9 @@ fn roll_back(workers: Vec<Worker>, refusal: &RtError) {
   if let Err(error) = stop(workers)
     && error != *refusal
   {
-    eprintln!("slates-rt: rolling back a start refused ({refusal}) also found: {error}");
+    slates_machine::log_line!(
+      "slates-rt: rolling back a start refused ({refusal}) also found: {error}"
+    );
   }
 }
 

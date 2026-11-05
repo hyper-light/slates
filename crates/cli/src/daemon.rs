@@ -106,7 +106,7 @@ fn name_this_process() {
     return;
   };
   if let Err(error) = rustix::thread::set_name(&name) {
-    eprintln!("slates daemon: its process name could not be set: {error}");
+    slates_machine::log_line!("slates daemon: its process name could not be set: {error}");
   }
 }
 
@@ -125,7 +125,7 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
   let (profile, source) = match published_profile()? {
     Published::Profile(profile) => (*profile, SegmentSource::FromEnv),
     Published::OtherFormat(version) => {
-      eprintln!(
+      slates_machine::log_line!(
         "slates daemon: the anchor's profile is format version {version}; this daemon reads version {}: measuring its own",
         slates_machine::profile::PROFILE_VERSION
       );
@@ -146,7 +146,7 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
   let transport = match &options.fleet {
     Some(selection) => {
       let plan = crate::fleet::load(selection)?;
-      eprintln!(
+      slates_machine::log_line!(
         "slates daemon: fleet node `{}` of `{}`: member {} with {} peer(s) at f = {}",
         selection.node,
         plan.transport.name,
@@ -167,11 +167,11 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
     None => None,
   };
   for line in &config.derivations {
-    eprintln!("slates daemon: {line}");
+    slates_machine::log_line!("slates daemon: {line}");
   }
   let daemon = Daemon::start_with_fleet(&profile, config, source, transport)
     .map_err(|e| failed("start", e))?;
-  eprintln!(
+  slates_machine::log_line!(
     "slates daemon: instance {} serving on {} shards{}",
     options.instance,
     daemon.shards().len(),
@@ -186,18 +186,22 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
   let watch = parent;
   let waited = daemon.wait_for_stop(move || signal::stop_requested() || !watch.anchor_alive());
   if let Err(refusal) = waited {
-    eprintln!("slates daemon: the stop watch could not be installed ({refusal}); stopping");
+    slates_machine::log_line!(
+      "slates daemon: the stop watch could not be installed ({refusal}); stopping"
+    );
   } else if signal::stop_requested() || daemon.stop_requested() {
     // A planned stop: hand off any consensus leadership first, so the groups pay a handoff rather than the
     // election timeout a leader loss waits out (bounded; the anchor holds the daemon to its declaration).
     match daemon.drain_leadership() {
-      Ok(report) => eprintln!("slates daemon: stop requested; drained: {report:?}"),
-      Err(refusal) => eprintln!("slates daemon: stop requested; drain refused: {refusal}"),
+      Ok(report) => slates_machine::log_line!("slates daemon: stop requested; drained: {report:?}"),
+      Err(refusal) => {
+        slates_machine::log_line!("slates daemon: stop requested; drain refused: {refusal}")
+      }
     }
   } else if !parent.anchor_alive() {
-    eprintln!("slates daemon: the anchor is gone; leaving");
+    slates_machine::log_line!("slates daemon: the anchor is gone; leaving");
   } else {
-    eprintln!("slates daemon: the control shard's watch ended; stopping");
+    slates_machine::log_line!("slates daemon: the control shard's watch ended; stopping");
   }
   daemon.stop();
   Ok(())

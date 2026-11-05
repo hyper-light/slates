@@ -119,7 +119,9 @@ pub(crate) fn split(handed: Vec<HandedCopy>, partitions: usize) -> Vec<Vec<Inher
 /// test harness, a standalone start) nothing is held or counted.
 pub(crate) fn hold(state: &mut ShardState, copy: u64, record: CopyRecord, object: BorrowedFd<'_>) {
   if let Some(Err(refusal)) = crate::anchor_hold::hold_copy(copy, &record.encode(), object) {
-    eprintln!("slates-server: the anchor did not hold writable copy {copy:x}: {refusal}");
+    slates_machine::log_line!(
+      "slates-server: the anchor did not hold writable copy {copy:x}: {refusal}"
+    );
     state.count(HOLD_REFUSED, 1);
   }
 }
@@ -262,7 +264,7 @@ pub(crate) async fn reclaim_unclaimed() -> usize {
     let done = crate::state::with_state_counted(|s| {
       let attachments = s.db.partition().attachments_of_client(client);
       if let Err(refusal) = crate::reap::remove_batch(s, client, &attachments) {
-        eprintln!(
+        slates_machine::log_line!(
           "slates-server: reclaiming client {client}'s attachments was refused: {refusal:?}"
         );
       }
