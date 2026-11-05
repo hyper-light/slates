@@ -189,6 +189,9 @@ fn a_call_is_never_held_behind_the_periodic_acknowledgement() {
   let sent_while_held = held_at.elapsed() < HOLD;
   holder.join().unwrap().unwrap();
   let took = acknowledging_call.expect("the client acknowledged within half the hold");
+  eprintln!(
+    "the call that sent the acknowledgement took {took:?}, against a {HOLD:?} hold of the other shard"
+  );
   assert!(
     sent_while_held,
     "the acknowledgement went out while the other shard was held"

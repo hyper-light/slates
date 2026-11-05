@@ -37,8 +37,25 @@ scatter entry forever, unbounded growth under repeated refusals.
 - `scatter_acknowledge`: fixed by A-216. The reply no longer waits for the other shards. A part that cannot be sent is
   settled on the state the verb holds (`release_part_back`), counted `ack.release_refused`, and the tracked entries
   are bounded (`ack_scatter_bound`).
-- `scatter_list`, `scatter_grants`, `scatter_status`: **open**, each owed a failing test and the same settle-on-the-held-state
-  fix.
+- All four scatters now send a part through `send_part`, which handles each refusal the channel can give.
+  - **Full.** The part is handed to a task of the origin shard that waits for room for half the client's reply
+    deadline (`PART_ROOM_BUDGET_NS`, `xshard::given_room_within`), so the answer reaches the client before it would
+    give up. Past that wait the part is settled refused (`settle_refused`, in its own borrow, delivered after it). The
+    listing, grants or status then answers `Overloaded { shard }`, counted by name (`part_unsent`), when its last part
+    is in. The acknowledgement counts `ack.release_refused`.
+  - **Shard gone.** That happens only while the daemon stops. The entry is removed and counted (`scatter.shard_gone`)
+    and no reply is sent: the client's resend under the same id, to the next daemon, answers, as for every request in
+    flight at a stop.
+  - **Measured on the first form**, which answered at once on any refusal:
+    `every_call_ends_and_the_loop_is_never_held_across_restart_and_death` (`crates/client/tests/driver.rs`) ended
+    admitted `List` calls `Overloaded` across a restart, in the first run of each loop (1 of 8, 1 of 15, 1 of 20).
+    Those were refusals from the stopping daemon's gone shards, where main had let the resend answer (0 of 10 on main).
+    With both cases above it passes 15 of 15. Each was never answered before, with a 5 s deadline exceeded:
+  - `a_listing_whose_part_cannot_be_sent_is_refused_overloaded`;
+  - `a_grants_listing_whose_part_cannot_be_sent_is_refused_overloaded`;
+  - `a_daemon_status_whose_part_cannot_be_sent_is_refused_overloaded`.
+
+  All five `ack_release` tests pass (2.91 s, macOS arm64).
 
 ## Siblings found
 

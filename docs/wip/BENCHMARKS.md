@@ -8733,3 +8733,52 @@ That names the cause: SetSize is the first request after an open's Confirm, so o
 the DLL arm it mostly missed. **It is not yet a measured gain:** the two arms share the machine, so the raised arm takes CPU from
 the other and this table flatters it. It needs arms run apart, and it is a whole-daemon change, so it has not been made.
 
+
+## The acknowledgement answered once its own shard has released (A-216; R9; 2026-11-05)
+
+A-216 makes the daemon answer a client's periodic `Acknowledge` once the client's own shard has released its
+completion records, the other shards' releases running as tracked tasks. Before, the reply waited for every shard,
+and the synchronous client waits for that reply before its next request. Measured with `provision_bench`, release,
+main against A-216, interleaved round by round, three rounds. Each figure is one round's value, the median of the
+bench's own three runs. Every run is listed where the round's three disagree by more than a factor of two.
+
+Command, every arm: `cargo build --release --locked -p slates-client --example provision_bench` at the arm's
+commit, each arm built in its own target dir and the arms' binaries compared by MD5 before they run (the macOS
+correction in GAPS), then the binary.
+
+**The call itself** (`a_call_is_never_held_behind_the_periodic_acknowledgement`, macOS arm64, the other shard held
+for 1 s): the call that sent the acknowledgement took 263, 88 and 312 µs in three runs on A-216. On main it failed
+`Stalled` after the 1 s reply deadline.
+
+**jupiter** (AMD Ryzen AI MAX+ 395, 16 cores × 2 threads, Windows 11, 15 shards; the processor 5–12% busy before each
+run; 2026-11-05 18:24–18:27 UTC; main 8d7c6a10, A-216 93ee9f49, each in its own target dir):
+
+| row | main | A-216 |
+|---|---|---|
+| spinning 1-client p50 | 14.3 / 17.9 / 19.5 µs | 19.3 / 19.7 / 20.9 µs |
+| spinning 1-client p99 (R9: 50 µs) | 232.6 / 192.9 / 81.9 µs | 72.8 / 93.8 / 2,361 µs |
+| the nine runs behind that row | 6,350, 81.2, 232.6 / 1,776, 77.6, 192.9 / 760.1, 72.0, 81.9 µs | 601.1, 72.8, 70.2 / 1,070, 93.8, 64.9 / 3,801, 79.9, 2,361 µs |
+| spinning 8-client p99 | 163.5 / 112.6 / 147.7 µs | 160.7 / 237.4 / 720.8 µs |
+| parked p50 | 639 / 654 / 655 µs | 661 / 638 / 658 µs |
+| parked p99 | 12.8 / 14.3 / 14.4 ms | 6.1 / 4.9 / 3.1 ms |
+
+**macOS** (Apple M5 Max, 18 cores, macOS 26.4.1, 5 shards; load 7.6–16.9 at the runs' starts, other agents' builds
+beside it; 2026-11-05 18:45–18:55 UTC; main 8d7c6a10 MD5 403787fa…, A-216 93ee9f49 MD5 c9173e8b…):
+
+| row | main | A-216 |
+|---|---|---|
+| spinning 1-client p50 | 25.3 / 75.6 / 29.2 µs | 66.5 / 75.0 / 59.4 µs |
+| spinning 1-client p99 (R9: 50 µs) | 5,825 / 191.6 / 179.7 µs | 197.1 / 219.2 / 101.9 µs |
+| spinning 8-client p99 | 6.85 / 1.01 / 8.88 ms | 1.05 / 0.63 / 0.38 ms |
+| parked p50 | 313 / 199 / 159 µs | 194 / 195 / 164 µs |
+| parked p99 | 63.1 / 62.8 / 36.2 ms | 39.4 / 51.5 / 39.2 ms |
+
+Main's first macOS round ran after its boot probe measured a 1.2 ms wake (the spin window it printed, 1,232,348 ns):
+a loaded machine, not the code.
+
+What it means:
+- **R9's single-client gate stays red on jupiter and macOS in both arms.** On jupiter both arms' runs range from
+  65 µs to 6.4 ms: an outlier tail the acknowledgement does not explain (GAPS, open). On macOS the single-client
+  p50 is 60–75 µs in both arms, the create cost GAPS already records.
+- **A-216 cuts the parked tail on both:** jupiter's parked p99 falls 2.1–4.6×, macOS's 8-client p99 1.6–23×. A
+  parked or contended acknowledgement no longer waits on every other shard.

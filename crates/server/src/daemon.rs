@@ -3333,6 +3333,7 @@ fn init_shard(
     works: std::collections::BTreeMap::new(),
     merge: crate::merge_service::MergeShardState::default(),
     ack_scatters: std::collections::BTreeMap::new(),
+    scatter_refusals: std::collections::BTreeMap::new(),
     telemetry: slates_wire::observe::SpanSink::with_capacity(telemetry_capacity),
     // The shard's span opener folds in this node's member id and the partition, so every trace and
     // span id it mints is distinct across the daemon and the fleet without coordination (§4.14).

@@ -59,15 +59,14 @@
 > Windows' write path below the single WinFsp receiver (A-198); the operations replayed alone pass. Listed as
 > `fsx-seed-1-unfinished:10000`; recorded in the same bug file; owed to the WinFsp dispatcher's owners.
 
-> **Shards counted hardware threads as cores (2026-11-05, A-208, §4.1, R9; fixed, its A/B owed).** §4.1 counts shards in
-
 > **A call waited for its acknowledgement's scatter (2026-11-05, §4.9, R9; fixed by A-216, its A/B owed).** The
 > synchronous `Client::call` acknowledges every half-ring of replies before its own request, and the daemon answered
 > only after every shard had released the client's records. One call in every half-ring paid the slowest shard's
 > turn. On macOS 133 of 2,000 single-client creates (6.7%) carried one, median 2,497 µs against 169 µs. Windows arm64's
 > single-client p99 was 65.4 / 59.4 / 57.9 µs with the wait and 47.8 / 45.5 / 44.3 µs without it (diag run
-> 42056768929). With another shard held for a second, the call failed `Stalled`. Sending it unawaited (a6c3bc16)
-> met a rare whole-daemon pause after client churn with two replies in flight, and was reverted. Since A-216 the
+> 42056768929). With another shard held for a second, the call failed `Stalled`. Sending it unawaited (a6c3bc16) put
+> two replies in flight on the sync client and stalled 1 of 9 runs on jupiter, so it was reverted. The macOS stalls
+> once counted against it were main's (the correction at the top). Since A-216 the
 > daemon answers once the client's own shard has released. The other shards' releases run as tracked tasks, and a
 > refused one is counted `ack.release_refused` and taken over by the next watermark. The client still has one reply
 > in flight. Tests, each failing first:
@@ -75,21 +74,40 @@
 > - `a_lagging_release_is_never_met_by_a_request_as_new` (1.197 s before; red-checked);
 > - `a_refused_release_is_counted_and_the_next_watermark_takes_it_over` (never answered before; red-checked).
 >
-> Owed: the interleaved A/B on all five platforms, with R9's single-client p99 as the gate. Still open from before:
-> the churn pause itself (GAPS' 8- and 64-client entry), and the bench's 8- and 64-client forms aborting `Stalled` at
-> load 23–36 on macOS. Record: `docs/bugs/2026-11-05-a-call-waited-for-its-acknowledgements-scatter.md`.
+> Owed: the interleaved A/B on all five platforms, with R9's single-client p99 as the gate (jupiter and macOS
+> measured, CI's diag-clients-6 pending). Open and not the acknowledgement:
+> - **jupiter's single-client p99.** It stays red with A-216: its runs range from 65 µs to 3.8 ms, as main's do
+>   (2026-11-05 18:24–18:27 UTC).
+> - **macOS's single-client create.** Its p50 is 60–75 µs in both arms.
+> - **The bench's 8- and 64-client forms aborting `Stalled` at load 23–36 on macOS,** and the ~1.77 s pause after 64
+>   clients churned. Both are main's code; the lost-reply defect below is one cause that fits.
+>
+> Record: `docs/bugs/2026-11-05-a-call-waited-for-its-acknowledgements-scatter.md`.
 >
 > **Next lever (C): do we need the separate acknowledgement at all?** Carry the watermark in every request, so each
 > owner shard releases a client's records when its next request arrives there. No scatter and no extra request.
 > That is a protocol change to the request slot and §4.9.
 
-> **A scatter whose part could not be sent never answered (2026-11-05, §4.9, §4.14; acknowledgement fixed, three
-> open).** `scatter_acknowledge`, `scatter_list`, `scatter_grants` and `scatter_status` settle a part whose spawn the
-> other shard's full control channel refused by calling their gather inside `serve`. The nested state borrow is refused
-> without running it, so the reply is never delivered and the entry never removed. An `Acknowledge` with the other
-> shard's channel filled was never answered (5 s, main 8d7c6a10). Fixed for the acknowledgement by A-216; owed for
-> listings, grants and status, each with a failing test. Also reported, not changed: those three settle a refused part
-> as empty, so an answer can omit a shard's part as if complete. Record:
+> **A scatter whose part could not be sent never answered (2026-11-05, §4.9, §4.14; fixed).** `scatter_acknowledge`,
+> `scatter_list`, `scatter_grants` and `scatter_status`, the server's four scatter tables, settled a part whose spawn
+> the other shard's full control channel refused by calling their gather inside `serve`. The nested state borrow is
+> refused without running it, so the reply was never delivered and the entry never removed. Each call, with the other
+> shard's channel filled, was never answered (5 s, main 8d7c6a10's code). Fixed:
+> - **The acknowledgement**, by A-216: the reply is its own shard's, and a refused part is counted `ack.release_refused`.
+> - **A full channel:** the part waits for room for half the client's reply deadline, then the listing, grants or
+>   status answers `Overloaded { shard }`, counted by name.
+> - **A shard gone,** which happens only while the daemon stops: the scatter is removed and counted
+>   (`scatter.shard_gone`), and the client's resend to the next daemon answers it. The driver's restart test needs
+>   that: 15 of 15 with it, where answering `Overloaded` at once failed its first run in every loop.
+>
+> Tests, each failing first:
+> - `a_refused_release_is_counted_and_the_next_watermark_takes_it_over`;
+> - `a_listing_whose_part_cannot_be_sent_is_refused_overloaded`;
+> - `a_grants_listing_whose_part_cannot_be_sent_is_refused_overloaded`;
+> - `a_daemon_status_whose_part_cannot_be_sent_is_refused_overloaded`.
+>
+> Reported, not changed: the three read scatters still settle a part whose *remote* state borrow is refused as empty,
+> so an answer can omit a shard's part as if complete. Record:
 > `docs/bugs/2026-11-05-a-scatter-whose-part-could-not-be-sent-never-answered.md`.
 
 > **Shards counted hardware threads as cores (2026-11-05, A-208, §4.1, R9; fixed and measured).** §4.1 counts shards in
