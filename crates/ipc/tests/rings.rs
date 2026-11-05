@@ -9,7 +9,7 @@
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use slates_ipc::region::{ClientRegion, RegionGeometry};
+use slates_ipc::region::{ClientRegion, PARKED_STAMP_SLOT_ONE, RegionGeometry};
 use slates_ipc::slot::{PAYLOAD_BYTES, Slot, SlotKind};
 use slates_ipc::{ClientEnd, DaemonEnd, IpcError};
 
@@ -377,18 +377,29 @@ fn a_wake_without_a_reply_is_counted_and_the_client_parks_again() {
   let server = std::thread::spawn(move || {
     let request = take_within(|| daemon.try_take().unwrap(), "the request");
     await_region(daemon.region(), "the client did not park", |region| {
-      region.client_parked().unwrap().load(Ordering::Acquire) == 1
+      region.client_parked().unwrap().load(Ordering::Acquire) != 0
     });
-    // A marker the client overwrites with zero only when it parks again, after the unanswered wake.
+    // A marker the client overwrites with zero only when it parks again, after the unanswered wake: in the
+    // reply stamp slot that next park names, the other one from this park's (its flag's value names it).
+    let parked = daemon
+      .region()
+      .client_parked()
+      .unwrap()
+      .load(Ordering::Acquire);
+    let next_slot = usize::from(parked != PARKED_STAMP_SLOT_ONE);
     daemon
       .region()
-      .reply_stamp()
+      .reply_stamp(next_slot)
       .unwrap()
       .store(1, Ordering::Release);
     wake_without_reply(daemon.region());
     await_region(daemon.region(), "the client did not park again", |region| {
-      region.reply_stamp().unwrap().load(Ordering::Acquire) == 0
-        && region.client_parked().unwrap().load(Ordering::Acquire) == 1
+      region
+        .reply_stamp(next_slot)
+        .unwrap()
+        .load(Ordering::Acquire)
+        == 0
+        && region.client_parked().unwrap().load(Ordering::Acquire) != 0
     });
     daemon
       .reply(&Slot::inline(request.request, b"after").unwrap())

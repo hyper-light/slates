@@ -24,8 +24,8 @@
 >   its kernel name in the held ledger (`crates/bridge-winfsp/src/opens/names.rs`).
 > - **The receiver that replaced WinFsp's dispatcher is unmeasured.** It is one thread with a new event per control
 >   transaction, where the DLL dispatcher ran two threads; BENCHMARKS has no entry for it.
-> - **Two failures recorded open below are still unfixed**: the wake-learning fixture under load and the fleet routing
->   Create reply.
+> - **Two failures recorded open below**: the wake-learning case under load (fixed 2026-11-04, A-199) and the fleet
+>   routing Create reply.
 >
 > Twenty goals of this plan's stack, Steps 10–15 among them, were closed in 2–4 s each with no work. They are
 > restored in order after these fixes.
@@ -39,12 +39,15 @@
 > is the instrumented CI job. Record:
 > `docs/bugs/2026-11-02-an-empty-wake-test-mistook-an-armed-client-for-a-sleeper.md`.
 
-> **Wake-learning fixture's timing assumption still open (2026-11-02, A-31).** A later capped all-ring run on
-> adacachy (zero of 32 cores idle) passes the corrected empty-wake case but fails the unchanged learning case:
-> 7 of 32 samples, below its required 16, with all 32 replies delivered. Its one-millisecond delay after arming
-> does not establish a kernel sleeper under preemption. Eight of nine cases pass in 0.53 s; the unit exits 101
-> in 7.858 s. Keep the sample assertion and this failure recorded; the whole main CI target remains required.
-> Record: `docs/bugs/2026-11-02-an-empty-wake-test-mistook-an-armed-client-for-a-sleeper.md`.
+> **Wake-learning failure fixed (2026-11-04, A-199; opened 2026-11-02, A-31).** It was the product, not the fixture's
+> one-millisecond delay. A woken client outran its waker, which was preempted between its wake and its
+> confirmation. The client's next park cleared the one reply stamp, so the sample was given up, and the late
+> confirmation set a bare confirmed bit there that refused the following park's stamp. Logs: in every failing run
+> the zero-time out-of-window stamps matched the given-up ones one for one (15 and 15 of 32 at worst). The region
+> now holds two stamps, the parks alternate between them, and the parked flag's value names the slot (layout
+> version 3). The assertion is unchanged (16 of 32). Interleaved on adacachy, 100 runs each: before 100/100 and
+> 89/100 failures on one and two busy CPUs, after 0/100 and 0/100; all nine ring cases on two busy CPUs 95/100
+> before, 0/100 after. Record: `docs/bugs/2026-11-04-a-late-wake-confirmation-cost-the-client-two-samples.md`.
 
 > **Fleet setup failure still unattributed (2026-11-02, §4.8 Lookup).** Main CI 41538865390 on `8a3fdc63` passes
 > Windows and QEMU but its Linux fleet target passes 85/86 active histories: the returning-session location case
