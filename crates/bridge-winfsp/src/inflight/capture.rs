@@ -175,6 +175,12 @@ impl<'a> Batch<'a> {
 
   /// The saved response's original request first, then the remaining requests in driver order. A current unacknowledged
   /// request refuses another take, so its response cannot be overwritten while it is still in kernel I/O.
+  /// DIAG: the requests left in this batch.
+  pub fn pending_len(&self) -> usize {
+    self.pending.len()
+  }
+
+  /// The next request to settle, in the order recovery requires.
   pub fn next_request(&mut self) -> Result<Option<Request<'a>>, Refusal> {
     if self.current.is_some() {
       return Err(Refusal::Unsettled);

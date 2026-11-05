@@ -40,6 +40,8 @@ const SIZE_END: usize = SIZE_AT + size_of::<u16>();
 const ALIGNMENT: usize = 8;
 
 thread_local! {
+  /// DIAG: when the batch being served was received.
+  static RECEIVED_AT: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
   /// Only a marker-authenticated Create may resolve the pending coherence file by identity.
   static PRIVATE_PURGE: RefCell<Option<crate::purge::Purge>> = const { RefCell::new(None) };
   /// The opaque kernel hint of the current callback, copied into a newly recorded open before its response exists.
@@ -352,6 +354,9 @@ fn operation(
   CURRENT_HINT.set(request.hint());
   // SAFETY: callback is the DLL's initialized operation for this checked kind; both packet addresses have native
   // eight-byte alignment and protocol maximum capacity, and file_system stays live throughout the synchronous call.
+  let received_at = RECEIVED_AT.get().unwrap_or_else(std::time::Instant::now);
+  crate::trace::arrive(request.bytes(), received_at);
+  crate::trace::begin(request.bytes(), received_at);
   let callback_status = unsafe {
     callback(
       file_system,
@@ -359,6 +364,7 @@ fn operation(
       packet.0.as_mut_ptr().cast(),
     )
   };
+  crate::trace::end();
   let terminal_status = TERMINAL_REFUSAL.replace(0);
   let status = if callback_status == 0 {
     terminal_status
@@ -473,6 +479,7 @@ fn settle(
       {
         crate::host::rename_open_names(confirmations, wake, &from, &to, bound)?;
       }
+      crate::trace::stage(b'S');
       transaction(
         control,
         TRANSACT_BATCH,
@@ -480,6 +487,7 @@ fn settle(
         &mut [],
         &mut private.intents,
       )?;
+      crate::trace::stage(b'R');
       if let Some((_, context)) =
         inflight::opened_context(response).map_err(WinFspError::Capture)?
       {
@@ -568,6 +576,8 @@ fn receive_loop(
       return Ok(());
     }
     let mut receiving = view.capture()?.begin(used).map_err(WinFspError::Capture)?;
+    crate::trace::stage(b'C');
+    let receive_started = std::time::Instant::now();
     let reported = transaction(
       control,
       TRANSACT_BATCH,
@@ -581,6 +591,9 @@ fn receive_loop(
     }
     used = Some(inflight::capture::filled(reported).map_err(WinFspError::Capture)?);
     let mut batch = receiving.received(reported).map_err(WinFspError::Capture)?;
+    crate::trace::stage(b'V');
+    RECEIVED_AT.set(Some(std::time::Instant::now()));
+    crate::trace::received(batch.pending_len(), receive_started.elapsed());
     settle(
       file_system,
       &mut batch,
