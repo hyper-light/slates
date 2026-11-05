@@ -963,3 +963,9 @@ winfsp-phase	other	queue_idle_under_200us	130	p50 3100	p90 4200	p99 22900	mean 4
 winfsp-phase	other	queue_idle_under_1ms	1	p50 36800	p90 36800	p99 36800	mean 36800
 winfsp-phase	other	queue_idle_longer	14	p50 44100	p90 49500	p99 50000	mean 40735
 ## run 1 of 1 done, 2026-11-05T16:06:49Z
+remote: 
+remote: Create a pull request for 'diag-winfsp-bench-results-42059294312-windows-11-arm' on GitHub by visiting:        
+remote:      https://github.com/hyper-light/slates/pull/new/diag-winfsp-bench-results-42059294312-windows-11-arm        
+remote: 
+To https://github.com/hyper-light/slates
+ * [new branch]      3b36462b2bf14914d62a4aca334a8586af4c7dec -> diag-winfsp-bench-results-42059294312-windows-11-arm
