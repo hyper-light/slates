@@ -7360,6 +7360,26 @@ conflict at 10,000 files, p99 1.81 ms in that run and 0.16 to 0.17 ms in the thr
 3.2 ms; conflict p50 48 µs, p99 153 µs, p999 0.30 ms. The same as at 10 files: a submit no longer reads what the green
 holds. This machine's derived partition budget holds a 400 MB green; CI's runner's does not (below).
 
+**Quiet Linux: CI's runners** (diag run 42052891076, 2026-11-05 15:20 to 15:36 UTC; jobs 127333404627, `ubuntu-24.04`
+x86_64, and 127333403962, `ubuntu-24.04-arm` aarch64; 4 cores each, the daemon derived 3 shards; load 1.1 to 1.6
+throughout). Arms: `main` at `21da6e57` with this harness copied in (base) and `487aee8e` (new), interleaved, 3 × 1,000
+samples a run (the base's 10,000-file rows stopped at 20 s: 200 to 446 samples). Total p50 per round, base → new:
+
+| Runner, form | 10 files | 1,000 files | 10,000 files |
+|---|---|---|---|
+| x86_64 accept | 65.7, 56.6, 55.9 µs → 17.1, 17.1, 17.2 µs | 4.16, 4.01, 4.07 ms → 16.5, 16.4, 16.6 µs | 44.8, 45.1, 44.5 ms → 16.7, 16.1, 16.5 µs |
+| x86_64 conflict | 18.0, 18.0, 18.4 µs → 14.2, 14.4, 14.6 µs | 816, 817, 767 µs → 14.8, 14.5, 15.0 µs | 8.64, 8.61, 8.78 ms → 14.7, 14.6, 15.2 µs |
+| aarch64 accept | — | 6.58, 6.57, 6.56 ms → 13.7, 13.8, 13.7 µs | 66.4, 66.3, 66.1 ms → 13.9, 13.9, 13.8 µs |
+| aarch64 conflict | — | — | 6.37, 6.33, 6.39 ms → 12.1, 12.1, 12.1 µs |
+
+New, every form, one more run (load 1.1 to 1.4): x86_64 p50 14.4 to 20.9 µs and p99 60 to 98 µs at 10, 1,000, 10,000
+and 100,000 files; aarch64 accept p50 13.8 to 14.5 µs, p99 56 to 75 µs, the same at 100,000 files. Both under the
+preferred 50 µs at the median and the required 1 ms at p99. On x86_64 the growth forms (the clients agent's): edit p50
+4.5 µs, merge p50 10.3 µs, merge p99 51 µs. Some p99 and p999 rows reach 0.85 to 1.1 ms (x86_64 accept at 10 files, p99
+0.90 ms in three runs of four), and one `identical` run at 100,000 files has a 570 ms max: tails owed a look. The loaded
+form (one spinning thread per core, so the shards share four cores with four spinners) measured accept p50 4.1 ms on
+aarch64: the scheduler's timeslice, not the merge; both jobs were then cancelled at the workflow's 90-minute limit.
+
 **A quieter machine: CI's macOS runner** (diag run 42052891076, job 127333404829, `macos-26-arm64` image
 20261026.0455.2, 3 cores, the daemon derived 2 shards; load 1.6 to 2.2 for rounds 2 and 3, 8.1 at round 1's start;
 2026-11-05 15:23 to 15:43 UTC). Arms: `main` at `21da6e57` with this harness copied in (base) and `487aee8e` (new),
