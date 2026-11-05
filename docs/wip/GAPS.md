@@ -72,7 +72,15 @@
 > own client reproduces a stall in 1 run of 10 (two replies in flight, after 64 clients were dropped with one in
 > flight). And the instrumented bench caught the daemon answering no client for ~1.77 s right after 64 clients
 > churned. So the cause is a whole-daemon pause after client churn, load-dependent (none in 10 runs at load 4–8).
-> Owed: the shard and step that pause, then the fix with its test, before the change returns. Also open, from the same macOS runs at
+> Owed: the shard and step that pause, then the fix with its test, before the change returns.
+> - **It is what keeps Windows arm64 red** (diag run 42056768929, 2026-11-05 15:43–15:55 UTC, three interleaved
+>   rounds). Without it: single-client p99 65.4 / 59.4 / 57.9 µs, all failing R9. With it: 47.8 / 45.5 / 44.3 µs, all
+>   green. Linux x86_64, Linux arm64 and Windows x86_64 are green in both arms.
+> - **None of its 12 CI runs stalled.** Counting every arm-with-it run: 0 of 12 on CI, 1 of 9 on jupiter (6 more
+>   with a stall-time pulse dump caught none), about 2 of 15 on macOS. A burst of 64 connects takes 3.4–4.7 ms (the
+>   control shard's round trip rises to 1.4–1.6 ms meanwhile), so connects are not the pause. Neither is a lost kick:
+>   a shard re-checks all three inboxes before it parks. In-process clients are never reaped on macOS or Windows (the
+>   pid probe finds the bench itself alive). Also open, from the same macOS runs at
 > load 23–36: the bench's 8- and 64-client forms aborted `Stalled` in every arm, a live daemon slower than the reply
 > deadline. Record: `docs/bugs/2026-11-05-a-call-waited-for-its-acknowledgements-scatter.md`.
 
