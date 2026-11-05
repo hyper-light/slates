@@ -13582,6 +13582,92 @@ Status: built 2026-11-04. It closes the Windows owed items of A-105, A-110 and A
   and by 200 with that close removed (`crates/mem/tests/held_section.rs`). The adoption now maps first and takes
   ownership only of a view that exists, so `view` no longer closes what it was lent.
 
+### A-200 — Live shipping ships the owner's publications as a fenced, hash-chained log, acknowledged when f holders and the owner hold it (accepted 2026-11-04; Ada's goal of 2026-11-04, "run replicas of the filesystem server … replication <1 ms")
+
+**Why.** §4.10 says a `live-shipped` volume "ships its op log to f+1 of its candidates and acknowledges writes at f+1",
+and AC-8.3 holds such a volume to no loss window. The design does not say what the op log is, what an
+acknowledgement binds, how a replica that missed entries catches up, or how a takeover picks the replica to promote.
+This amendment says so before any of it is built. Nothing of live shipping exists in code (GAPS, 2026-11-04).
+
+**What is shipped.** The owner's own barrier stream for the volume: each publication `publish_shard` makes of it
+(a delta, A-68, or a checkpoint image), together with the bytes of the chunk windows the publication names that the
+replica does not hold. That is the stream a restart already replays from the anchor (D-18), and its two encodings are
+already held equal by the publication oracle (`check_publication`), so a replica applies exactly what the owner's
+own recovery would. The vfs journal (§4.5) is not the op log here: it carries no bytes.
+
+**The log.** Entries are numbered densely from a checkpoint at position 0. Entry `n` carries the owner's host epoch
+`e`, the identity of entry `n − 1`, and its payload; its identity is the BLAKE3 of all four. A holder accepts entry
+`n` only under an epoch at least its fence for that owner's host (§4.8), and only on top of an entry `n − 1` whose
+identity matches; a checkpoint is accepted at any position under the same fence. A holder never rewrites what it
+applied: an entry whose predecessor does not match is refused with the holder's last position and identity, and the
+owner answers with its next checkpoint. An acknowledgement names the holder, the position and the identity it holds
+there, so by the chain it vouches for the whole prefix.
+
+**When a write is promised.** Every entry is sent to all `2f` other candidates, as a record is (§4.8). It is durable
+once the owner and `f` of them hold it (`f + 1` of the `2f + 1` candidates, §4.8's commit rule), so §4.10's "f+1"
+counts the owner among them. The barrier that produced it (an NFS `COMMIT`, an `fsync`, a control verb's
+publication) answers only then. A write no barrier covered was never promised to survive the owner (§4.6), and
+still is not. No consensus or coordination call is on this path (D-14): the owner is the single writer under its
+epoch, as for every register.
+
+**Backpressure (AC-8.9).** Entries not yet durable are bounded by a credit derived from the measured apply rate and
+the measured holder round trip (Little's law: the entries in flight are the rate times the time to acknowledge). A
+publication past the credit waits for credit; it is never queued without bound. A holder that falls further behind
+than the owner's retained tail is caught up by a checkpoint, never by an unbounded tail.
+
+**Takeover.** The group's takeover (§4.8 "Promotion and takeover") names the successor among the candidates. In its
+phase one every answering holder raises its fence to the new epoch and reports, per live-shipped volume, the epoch of
+its last entry, its position and that entry's identity. The successor adopts the report with the greatest
+(last epoch, position), which is Raft's up-to-date rule (Ongaro, thesis §3.6.1). A durable entry is held by `f + 1`
+candidates and phase one's answers come from `f + 1` candidates, so the two sets meet in at least one live holder of
+it whenever at most `f` candidates are lost (the owner among them); a holder whose last entry is under a later epoch received a log its owner adopted the same way. The successor
+serves from the adopted replica, which loses no acknowledged write (AC-8.3), and re-ships from there under its own
+epoch: a holder holding an entry the old owner never made durable fails the chain and takes a checkpoint.
+
+**The policy.** A volume is live-shipped when its policy says so (`PolicyRecord::live_shipped`), set by the
+`LiveShip` verb (`slates live-ship ID [--off]`, `admin` on the volume required), not at `create`. A request field on
+`create` would have changed every caller of the create path at once; a separate recorded operation
+(`Op::LiveShippingChanged`) is additive, and since a log starts from an install (its first entry is the owner's
+whole state), turning shipping on after creation needs nothing more. The flag rides the catalog register
+(`CatalogValue::live_shipped`), so a successor keeps shipping, and `list` shows it.
+
+**In the daemon (decided 2026-11-04 from the code as it stands).** Four facts of the daemon shape the wiring:
+
+- A publication names its content by arena block (A-64), and a sealed chunk's arena bytes are ciphertext under this
+  daemon life's own key (A-99), so no arena byte means anything on another node. An entry therefore carries the
+  volume's publication record (as `publish_delta_into` or the checkpoint encodes it) together with the content of
+  every chunk the record's inode images name, read in the clear through the one read chokepoint (`read_extent`).
+- Held content is sealed by the owner under the volume's lineage key, and a holder keeps ciphertext and holds no key
+  (A-92; `slates_cluster::sealed`). So the owner seals each entry's payload under the lineage key before it ships it,
+  and a holder never opens one: it checks the chain and the fence (`slates_db::live::Replica`), stores the sealed
+  entry, and answers. A holder's replica is a sealed copy of the owner's own journal for the volume (a checkpoint and
+  the deltas after it), and is bounded as that journal is: each checkpoint the owner publishes is shipped as an entry
+  after which the holder drops everything before it.
+- The barrier is synchronous within one shard step, and the owner's sessions to its candidates live on the control
+  shard. So the owner shard hands each live entry to the control shard over a bounded outbox (its bound the shipper's
+  credit), the control shard ships it (`slates_cluster::live::ship`), and the barrier's reply waits on the existing
+  deferral seams: NFS's await after its barrier (`told::wait`), the deferred reply of a control verb
+  (`acceptance_deferred`, as a green's submit waits for its merge record), FUSE's held replies.
+- A successor opens held envelopes once it has adopted the volume's lineage keys (A-92 piece 4c,
+  `fleet::opened_archive`). So the takeover round carries each live replica's head (`HostPromise`), the successor
+  adopts by `slates_db::live::adopt`, fetches the adopted holder's sealed journal, opens it, and rebuilds the volume as
+  local recovery does (`Journal::recover`, `Volume::from_image`), with the chunk contents placed in its own arena.
+
+The slices, each verified before the next: the owner ships and holders keep (replication lag measured, barriers not
+yet waiting); barriers wait for durability; takeover from a live replica (loss window zero for acknowledged writes,
+AC-8.3); then real processes under chaos.
+
+**Laptop degenerate.** `f = 0`: no holders, every entry durable at the owner's own publication; the same code (R8).
+
+**Testing.** The pure log (owner, holder, phase one) is a sans-io module tested against a model under a deterministic
+nemesis (loss, duplication, reordering, delay, partitions, holder and owner crashes, takeovers), with the register
+invariants as history checks: TotalOrder (every holder's chain is a prefix of the one history of durable entries),
+NoLoss (every durable entry survives every takeover), StaleNeverCommits (no entry of a fenced epoch becomes durable).
+Then the real transport, measured; then the daemon and real processes under chaos.
+
+**Applied in the same change to:** this log only. §4.10's "Live shipping" paragraph, AC-8.3 and AC-8.9 are read
+through it; their status notes follow each built slice.
+
 ### A-212 — What a live WinFsp receive reads and clears, and what a rename visits (2026-11-05)
 
 A-198's receiver replaced WinFsp's DLL dispatcher with no benchmark. Measured against it (`docs/wip/BENCHMARKS.md`, "The
@@ -13782,94 +13868,6 @@ Status: built 2026-11-05. It amends A-74's turn.
   16 workers, with write p99s no worse; in process, 1,644–1,799 → 1,780–1,984 MiB/s over NFSv4.2.
 - On the incumbent client (Docker on the M5 Max, six interleaved rounds at load 23–38) the medians rose 7–9% and the
   arms overlapped: best of eighteen 1,019.0 on main, 1,007.8 with the change.
-
-### A-199 — Live shipping ships the owner's publications as a fenced, hash-chained log, acknowledged when f holders and the owner hold it (accepted 2026-11-04; Ada's goal of 2026-11-04, "run replicas of the filesystem server … replication <1 ms")
-
-### A-200 — Live shipping ships the owner's publications as a fenced, hash-chained log, acknowledged when f holders and the owner hold it (accepted 2026-11-04; Ada's goal of 2026-11-04, "run replicas of the filesystem server … replication <1 ms")
-
-**Why.** §4.10 says a `live-shipped` volume "ships its op log to f+1 of its candidates and acknowledges writes at f+1",
-and AC-8.3 holds such a volume to no loss window. The design does not say what the op log is, what an
-acknowledgement binds, how a replica that missed entries catches up, or how a takeover picks the replica to promote.
-This amendment says so before any of it is built. Nothing of live shipping exists in code (GAPS, 2026-11-04).
-
-**What is shipped.** The owner's own barrier stream for the volume: each publication `publish_shard` makes of it
-(a delta, A-68, or a checkpoint image), together with the bytes of the chunk windows the publication names that the
-replica does not hold. That is the stream a restart already replays from the anchor (D-18), and its two encodings are
-already held equal by the publication oracle (`check_publication`), so a replica applies exactly what the owner's
-own recovery would. The vfs journal (§4.5) is not the op log here: it carries no bytes.
-
-**The log.** Entries are numbered densely from a checkpoint at position 0. Entry `n` carries the owner's host epoch
-`e`, the identity of entry `n − 1`, and its payload; its identity is the BLAKE3 of all four. A holder accepts entry
-`n` only under an epoch at least its fence for that owner's host (§4.8), and only on top of an entry `n − 1` whose
-identity matches; a checkpoint is accepted at any position under the same fence. A holder never rewrites what it
-applied: an entry whose predecessor does not match is refused with the holder's last position and identity, and the
-owner answers with its next checkpoint. An acknowledgement names the holder, the position and the identity it holds
-there, so by the chain it vouches for the whole prefix.
-
-**When a write is promised.** Every entry is sent to all `2f` other candidates, as a record is (§4.8). It is durable
-once the owner and `f` of them hold it (`f + 1` of the `2f + 1` candidates, §4.8's commit rule), so §4.10's "f+1"
-counts the owner among them. The barrier that produced it (an NFS `COMMIT`, an `fsync`, a control verb's
-publication) answers only then. A write no barrier covered was never promised to survive the owner (§4.6), and
-still is not. No consensus or coordination call is on this path (D-14): the owner is the single writer under its
-epoch, as for every register.
-
-**Backpressure (AC-8.9).** Entries not yet durable are bounded by a credit derived from the measured apply rate and
-the measured holder round trip (Little's law: the entries in flight are the rate times the time to acknowledge). A
-publication past the credit waits for credit; it is never queued without bound. A holder that falls further behind
-than the owner's retained tail is caught up by a checkpoint, never by an unbounded tail.
-
-**Takeover.** The group's takeover (§4.8 "Promotion and takeover") names the successor among the candidates. In its
-phase one every answering holder raises its fence to the new epoch and reports, per live-shipped volume, the epoch of
-its last entry, its position and that entry's identity. The successor adopts the report with the greatest
-(last epoch, position), which is Raft's up-to-date rule (Ongaro, thesis §3.6.1). A durable entry is held by `f + 1`
-candidates and phase one's answers come from `f + 1` candidates, so the two sets meet in at least one live holder of
-it whenever at most `f` candidates are lost (the owner among them); a holder whose last entry is under a later epoch received a log its owner adopted the same way. The successor
-serves from the adopted replica, which loses no acknowledged write (AC-8.3), and re-ships from there under its own
-epoch: a holder holding an entry the old owner never made durable fails the chain and takes a checkpoint.
-
-**The policy.** A volume is live-shipped when its policy says so (`PolicyRecord::live_shipped`), set by the
-`LiveShip` verb (`slates live-ship ID [--off]`, `admin` on the volume required), not at `create`. A request field on
-`create` would have changed every caller of the create path at once; a separate recorded operation
-(`Op::LiveShippingChanged`) is additive, and since a log starts from an install (its first entry is the owner's
-whole state), turning shipping on after creation needs nothing more. The flag rides the catalog register
-(`CatalogValue::live_shipped`), so a successor keeps shipping, and `list` shows it.
-
-**In the daemon (decided 2026-11-04 from the code as it stands).** Four facts of the daemon shape the wiring:
-
-- A publication names its content by arena block (A-64), and a sealed chunk's arena bytes are ciphertext under this
-  daemon life's own key (A-99), so no arena byte means anything on another node. An entry therefore carries the
-  volume's publication record (as `publish_delta_into` or the checkpoint encodes it) together with the content of
-  every chunk the record's inode images name, read in the clear through the one read chokepoint (`read_extent`).
-- Held content is sealed by the owner under the volume's lineage key, and a holder keeps ciphertext and holds no key
-  (A-92; `slates_cluster::sealed`). So the owner seals each entry's payload under the lineage key before it ships it,
-  and a holder never opens one: it checks the chain and the fence (`slates_db::live::Replica`), stores the sealed
-  entry, and answers. A holder's replica is a sealed copy of the owner's own journal for the volume (a checkpoint and
-  the deltas after it), and is bounded as that journal is: each checkpoint the owner publishes is shipped as an entry
-  after which the holder drops everything before it.
-- The barrier is synchronous within one shard step, and the owner's sessions to its candidates live on the control
-  shard. So the owner shard hands each live entry to the control shard over a bounded outbox (its bound the shipper's
-  credit), the control shard ships it (`slates_cluster::live::ship`), and the barrier's reply waits on the existing
-  deferral seams: NFS's await after its barrier (`told::wait`), the deferred reply of a control verb
-  (`acceptance_deferred`, as a green's submit waits for its merge record), FUSE's held replies.
-- A successor opens held envelopes once it has adopted the volume's lineage keys (A-92 piece 4c,
-  `fleet::opened_archive`). So the takeover round carries each live replica's head (`HostPromise`), the successor
-  adopts by `slates_db::live::adopt`, fetches the adopted holder's sealed journal, opens it, and rebuilds the volume as
-  local recovery does (`Journal::recover`, `Volume::from_image`), with the chunk contents placed in its own arena.
-
-The slices, each verified before the next: the owner ships and holders keep (replication lag measured, barriers not
-yet waiting); barriers wait for durability; takeover from a live replica (loss window zero for acknowledged writes,
-AC-8.3); then real processes under chaos.
-
-**Laptop degenerate.** `f = 0`: no holders, every entry durable at the owner's own publication; the same code (R8).
-
-**Testing.** The pure log (owner, holder, phase one) is a sans-io module tested against a model under a deterministic
-nemesis (loss, duplication, reordering, delay, partitions, holder and owner crashes, takeovers), with the register
-invariants as history checks: TotalOrder (every holder's chain is a prefix of the one history of durable entries),
-NoLoss (every durable entry survives every takeover), StaleNeverCommits (no entry of a fenced epoch becomes durable).
-Then the real transport, measured; then the daemon and real processes under chaos.
-
-**Applied in the same change to:** this log only. §4.10's "Live shipping" paragraph, AC-8.3 and AC-8.9 are read
-through it; their status notes follow each built slice.
 
 ### A-198 — A WinFsp mount outlives its daemon: the anchor holds the volume's control handle, the drive's link and the mount's ledger, and the next daemon serves the held volume (accepted 2026-11-01, Step 9 of the VFS and DAX plan; built and measured 2026-11-02)
 Applied in the same change to: GAPS (gap 2 of the platform inventory). The build applies it to §4.6 "Windows",

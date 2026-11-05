@@ -381,12 +381,6 @@
 > lands. Also open from the same runs: a sevenfold p50 split between two invocations on this Mac (edit 18.8 against
 > 2.5 µs). Record: `BENCHMARKS.md`, "The client's edit and merge latency".
 
-> **Replication latency (raft, 2026-11-04): a commit returns at its quorum; live shipping still owed.** Every quorum
-
-> **Replication latency (raft, 2026-11-04): a commit returns at its quorum; live shipping's log built, its wiring owed.** Every quorum
-
-> **Replication latency (raft, 2026-11-04): a commit returns at its quorum; live shipping's log built and on the transport, its daemon wiring owed.** Every quorum
-
 > **Replication latency (raft, 2026-11-04): a commit returns at its quorum; live shipping in the daemon: writes durable on a candidate before their reply, takeover serves them.** Every quorum
 > collector in `slates-cluster` slept its whole poll after its quorum had answered, so a cross-node record commit cost
 > the daemon's 10 ms poll (10,125–10,194 µs at the median) over a 12 µs loopback round trip. Each reply now wakes its

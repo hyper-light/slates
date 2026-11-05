@@ -8307,7 +8307,115 @@ waited for: tails of 18–93 ms and one run that never finished. The bench now d
 waits parked.
 
 **Not in these rows.** The daemon ships a head only on its 100 ms record period, so a head still waits up to a
-period before this commit begins; and nothing replicates a file's writes per write yet (§4.10 live shipping is owed).
+period before this commit begins.
+
+### Live shipping over the transport (A-200; 2026-11-04)
+
+Same bench, same hardware, later the same evening: `live ship <n> B` rows, one live-shipped write at a time (a credit of
+one): `Shipper::append`, then `slates_cluster::live::ship` to both holders, which apply it through `serve_entry`,
+until it is durable (the owner and one holder hold it), at the daemon's 10 ms poll. Five runs at load average 21.0–21.2
+(`replication_bench 1000 0`), then three with eight spinning threads inside the same capped unit, which competes with
+the three shards for the unit's quota of eight cores (`replication_bench 1000 8`). Microseconds, p50 / p99 / p999 /
+max:
+
+| run | round trip | 64 B | 4 KiB | 64 KiB |
+|---|---|---|---|---|
+| 1 | 12.7 / 22.7 / 46.6 / 58.5 | 16.6 / 30.8 / 56.8 / 400.6 | 22.6 / 37.9 / 75.1 / 213.6 | 148.8 / 262.0 / 905.9 / 1,020.9 |
+| 2 | 12.3 / 56.8 / 466.2 / 1,059.7 | 18.0 / 31.4 / 307.7 / 496.5 | 23.0 / 48.9 / 181.3 / 594.8 | 142.9 / 292.2 / 1,076.8 / 1,197.6 |
+| 3 | 10.2 / 21.3 / 51.3 / 299.4 | 20.3 / 31.4 / 133.3 / 436.7 | 27.2 / 52.4 / 162.9 / 859.5 | 112.9 / 171.3 / 247.9 / 481.0 |
+| 4 | 10.0 / 18.6 / 36.0 / 56.3 | 18.3 / 32.5 / 44.9 / 51.4 | 26.1 / 71.8 / 109.5 / 722.2 | 108.4 / 160.5 / 1,188.2 / 1,362.4 |
+| 5 | 12.3 / 19.7 / 41.5 / 41.6 | 18.4 / 28.7 / 55.1 / 69.6 | 25.6 / 57.9 / 310.1 / 411.3 | 130.8 / 207.7 / 250.2 / 1,192.4 |
+| loaded 1 | 13.4 / 53.2 / 941.9 / 54,757.7 | 20.5 / 80.8 / 223.0 / 1,225.5 | 26.1 / 55.7 / 481.8 / 554.7 | 164.5 / 256.2 / 877.4 / 1,022.4 |
+| loaded 2 | 13.0 / 43.3 / 1,662.2 / 10,329.6 | 18.5 / 30.5 / 52.9 / 66.6 | 29.8 / 44.6 / 63.6 / 65.8 | 105.6 / 431.4 / 13,372.5 / 23,943.2 |
+| loaded 3 | 13.9 / 52.4 / 592.9 / 611.6 | 21.0 / 48.6 / 227.1 / 15,845.2 | 32.6 / 82.3 / 855.6 / 1,004.5 | 134.0 / 213.6 / 13,471.4 / 15,754.7 |
+
+With one holder dead (it handshakes and never answers again; `replication_bench 300 0 silent`, load average 33.6),
+writes go on through the other: 64 B 18.3 / 48.3 / 142.4 / 142.4, 4 KiB 24.5 / 46.2 / 55.1 / 55.1, 64 KiB
+155.8 / 797.9 / 3,767.9 / 3,767.9.
+
+**Reading.** A live-shipped write is durable on two hosts in about one and a half round trips: 17–20 µs at the median
+for a small write and 23–27 µs for a page, under 75 µs at p99, and every quiet p99 is under 1 ms (64 KiB: 160–292
+µs). The goal's 50 µs holds at the median up to a page and at p99 for small writes. Its 1 ms holds at p99 in every
+quiet run. It does not hold at p999 for 64 KiB writes (2 of 5 quiet runs over 1 ms), nor in the tails of the loaded runs, where the bare
+round trip itself reached 54.8 ms: the spinning threads take the unit's CPU quota from the shards, and the tail is the
+quota's throttling, not the protocol. A dead holder does not slow writes; the 64 KiB tail grows (p99 798 µs).
+
+### What live shipping adds to a stable NFS write in the daemon (A-200; 2026-11-05)
+
+**Hardware:** adacachy, AMD Ryzen 9 9950X3D2 (16 cores, 32 threads), 122 GiB. **Load:** load average 48–58 on 32
+threads (other agents' builds); the test and its three daemons in one `systemd-run --user` unit capped at a quarter of
+the cores. **Command (the contract):** `SLATES_TEST_CLI=1 SLATES_TEST_MEASURE=1 cargo test --release -p slates-cli
+--test live_fleet measure_what_live_shipping_adds_to_a_stable_nfs_write -- --nocapture`.
+
+**Setup.** Three `slates daemon --fleet` processes (release), `f = 1`. On the owner, two volumes: one plain, one
+live-shipped. A real NFS client over TCP sends each 4 KiB `FILE_SYNC` WRITEs, 400 at a time, alternating, five rounds:
+2,000 writes each after 50 warm-up writes. A plain volume's stable write is answered after the owner's own barrier; a
+live one also after a candidate holds it. Microseconds, p50 / p99 / p999 / max:
+
+| run | load | plain | live |
+|---|---|---|---|
+| holder by holder, 1 | 50.1 | 29.5 / 2,421.1 / 13,272.9 / 27,543.7 | 478.3 / 16,532.3 / 70,665.0 / 123,743.9 |
+| holder by holder, 2 | 48.3 | 16.3 / 53.6 / 276.9 / 475.2 | 123.0 / 289.7 / 1,595.1 / 86,281.5 |
+| holder by holder, 3 (final code) | 33.8 | 19.2 / 169.7 / 589.9 / 754.1 | 170.0 / 624.9 / 9,687.5 / 100,794.4 |
+| holder by holder, 4 (final code) | 39.8 | 19.2 / 179.4 / 620.5 / 1,985.5 | 140.3 / 570.7 / 94,688.9 / 100,338.1 |
+| one exchange (rejected), 1 | 57.7 | 27.1 / 566.4 / 1,458.1 / 1,700.3 | 211.2 / 9,005.4 / 73,765.5 / 113,386.8 |
+| one exchange (rejected), 2 | 56.7 | 19.7 / 697.7 / 3,357.1 / 10,075.1 | 126.6 / 12,397.5 / 105,191.1 / 168,764.4 |
+| one exchange (rejected), 3 | 57.9 | 17.9 / 540.0 / 2,720.9 / 7,479.3 | 144.8 / 12,743.5 / 126,181.3 / 203,813.4 |
+| one exchange (rejected), 4 | 57.3 | 19.4 / 497.4 / 9,200.3 / 88,282.1 | 93.4 / 2,329.5 / 18,972.4 / 78,599.0 |
+
+No write waited out its bound (`fleet.live.durable_late` 0) and the log ended durable at its head every time.
+
+**Measured and rejected: one exchange per message.** Sending an entry to all its holders in one exchange that returns at
+the first reply (so a write never waits for the second holder) starved the second holder: it never accepted an entry
+and stayed at nothing in six of nine process flows (416 sends that found no session to it), and its median gain could
+not be told from the load's swing. The per-holder sends are kept; the starvation's mechanism is not yet pinned down
+(GAPS).
+
+**Reading.** With the code kept, live shipping adds 121–151 µs to a stable 4 KiB write at the median at load 34–40, and
+the live p99 is 571–625 µs: under the goal's 1 ms at p99, not its 50 µs. The rare tail does not meet it: p999 9.7–95 ms
+and max about 100 ms, where the plain volume's p999 is 0.6 ms, on a box at load 34–58 with the unit capped at eight
+cores. Measured inside the daemon at load 48 (temporary counters, removed): an entry costs 13.3 µs to build (read,
+encode, seal) and its dispatch round (owner shard to control shard, the exchange, back) 90.7 µs on average, against
+about 25 µs for the exchange alone (`replication_bench`): the cross-shard hops and the session borrow are most of it.
+Owed: the same command on a quiet machine; the round's hops measured apart; the rare 100 ms tail explained.
+
+**The 100 ms tail, explained and removed (2026-11-05).** The same command, with the owner's `fleet.live.*` counters
+printed at the end. Two causes, each found by its counter and each a wait for the next record period (100 ms):
+
+1. *A send that found its holder's session lent was dropped.* Two in three sends of a run found the session out (to
+   the previous write's dispatch or a straggler): 2,724 sends with no session, all 2,724 unanswered. The write then
+   waited for whichever later dispatch carried its entry, at worst the period's re-ship. Fixed: the send waits for the
+   session one timer tick at a time, within the liveness budget (`live_ship::borrow_session`); `unanswered` went to 0.
+2. *A write the credit turned away waited for the period.* With two entries in flight, the next publication cannot be
+   an entry; it marks the volume as owing a whole record, which only the next write or the period appended: 270 of
+   2,285 publications turned away, and the last of a burst waited. Fixed: the reply that frees the credit appends the
+   owed whole record at once (`fold_into`, `owes_whole_within_credit`).
+
+adacachy as above, 2,000 writes each, p50 / p99 / p999 / max in µs, all runs shown in order:
+
+| code | load | plain | live | live writes over 50 ms |
+|---|---|---|---|---|
+| before both fixes | 39.7 | 16.1 / 789.4 / 3,304.2 / 6,835.8 | 113.2 / 3,498.5 / 96,777.8 / 276,392.8 | 5 |
+| send waits for the session | 28.1 | 13.6 / 45.5 / 65.3 / 78.1 | 118.1 / 347.8 / 41,511.3 / 85,701.9 | 2 |
+| send waits for the session | 28.1 | 12.7 / 43.7 / 55.2 / 72.5 | 113.1 / 267.6 / 45,636.2 / 86,772.6 | 1 |
+| send waits for the session | 27.8 | 12.5 / 47.3 / 156.8 / 248.6 | 111.6 / 368.3 / 1,461.6 / 46,654.3 | 0 |
+| send waits for the session | 27.6 | 13.5 / 45.4 / 73.1 / 271.9 | 111.4 / 285.8 / 46,488.9 / 88,590.2 | 2 |
+| both fixes | 29.6 | 15.4 / 62.5 / 81.2 / 106.2 | 127.4 / 397.5 / 1,266.2 / 1,869.1 | 0 |
+| both fixes | 29.6 | 14.5 / 58.7 / 129.1 / 256.4 | 117.0 / 262.8 / 481.1 / 806.5 | 0 |
+| both fixes | 29.3 | 16.5 / 59.4 / 80.3 / 249.3 | 130.5 / 264.4 / 882.0 / 1,840.3 | 0 |
+| both fixes, with the fence and destroy fixes | 8.0 | 12.4 / 53.2 / 106.8 / 887.0 | 102.5 / 216.7 / 436.0 / 465.4 | 0 |
+| both fixes, with the fence and destroy fixes | 30.0 | 17.7 / 59.8 / 83.2 / 168.7 | 112.0 / 223.4 / 449.5 / 760.6 | 0 |
+| both fixes, with the fence and destroy fixes | 30.0 | 14.2 / 57.3 / 64.7 / 127.2 | 114.4 / 249.2 / 1,150.0 / 1,424.1 | 0 |
+
+The unit was never throttled (`cpu.stat` `nr_throttled` 0 across a run), so the tail was not the cap's 100 ms quota
+period. The old code on a second machine (kiln-a094a12d, x86-64, load 13–17, 05:56) showed the same tail: live p50
+312.3, p99 754.4, p999 98,709.0, max 100,527.5 µs.
+
+**Reading.** With both fixes, live shipping adds 90–114 µs to a stable 4 KiB write at the median. The live p99 is
+217–398 µs, the p999 0.44–1.27 ms and the worst write 0.47–1.87 ms, at load 8–30, against 86–276 ms before: every write
+of the run at load 8 was under 1 ms. The goal's 50 µs is not met: the added median is the cross-shard dispatch round
+measured above. Owed: that round's hops measured apart, and the p999 under 1 ms at load 30.
+
 
 ## What a WinFsp mount and unmount wait for the Windows anchor (A-213; 2026-11-05)
 
@@ -9648,112 +9756,3 @@ could not see this.
 A second receiver cannot simply be added: two journals need the multi-worker crash proof (GAPS), which is not built. A
 second worker would also make x86_64 slower unless it ran on arm64 alone, and a mode chosen per architecture would need
 a derivation the rules accept.
-
-period before this commit begins.
-
-### Live shipping over the transport (A-200; 2026-11-04)
-
-Same bench, same hardware, later the same evening: `live ship <n> B` rows, one live-shipped write at a time (a credit of
-one): `Shipper::append`, then `slates_cluster::live::ship` to both holders, which apply it through `serve_entry`,
-until it is durable (the owner and one holder hold it), at the daemon's 10 ms poll. Five runs at load average 21.0–21.2
-(`replication_bench 1000 0`), then three with eight spinning threads inside the same capped unit, which competes with
-the three shards for the unit's quota of eight cores (`replication_bench 1000 8`). Microseconds, p50 / p99 / p999 /
-max:
-
-| run | round trip | 64 B | 4 KiB | 64 KiB |
-|---|---|---|---|---|
-| 1 | 12.7 / 22.7 / 46.6 / 58.5 | 16.6 / 30.8 / 56.8 / 400.6 | 22.6 / 37.9 / 75.1 / 213.6 | 148.8 / 262.0 / 905.9 / 1,020.9 |
-| 2 | 12.3 / 56.8 / 466.2 / 1,059.7 | 18.0 / 31.4 / 307.7 / 496.5 | 23.0 / 48.9 / 181.3 / 594.8 | 142.9 / 292.2 / 1,076.8 / 1,197.6 |
-| 3 | 10.2 / 21.3 / 51.3 / 299.4 | 20.3 / 31.4 / 133.3 / 436.7 | 27.2 / 52.4 / 162.9 / 859.5 | 112.9 / 171.3 / 247.9 / 481.0 |
-| 4 | 10.0 / 18.6 / 36.0 / 56.3 | 18.3 / 32.5 / 44.9 / 51.4 | 26.1 / 71.8 / 109.5 / 722.2 | 108.4 / 160.5 / 1,188.2 / 1,362.4 |
-| 5 | 12.3 / 19.7 / 41.5 / 41.6 | 18.4 / 28.7 / 55.1 / 69.6 | 25.6 / 57.9 / 310.1 / 411.3 | 130.8 / 207.7 / 250.2 / 1,192.4 |
-| loaded 1 | 13.4 / 53.2 / 941.9 / 54,757.7 | 20.5 / 80.8 / 223.0 / 1,225.5 | 26.1 / 55.7 / 481.8 / 554.7 | 164.5 / 256.2 / 877.4 / 1,022.4 |
-| loaded 2 | 13.0 / 43.3 / 1,662.2 / 10,329.6 | 18.5 / 30.5 / 52.9 / 66.6 | 29.8 / 44.6 / 63.6 / 65.8 | 105.6 / 431.4 / 13,372.5 / 23,943.2 |
-| loaded 3 | 13.9 / 52.4 / 592.9 / 611.6 | 21.0 / 48.6 / 227.1 / 15,845.2 | 32.6 / 82.3 / 855.6 / 1,004.5 | 134.0 / 213.6 / 13,471.4 / 15,754.7 |
-
-With one holder dead (it handshakes and never answers again; `replication_bench 300 0 silent`, load average 33.6),
-writes go on through the other: 64 B 18.3 / 48.3 / 142.4 / 142.4, 4 KiB 24.5 / 46.2 / 55.1 / 55.1, 64 KiB
-155.8 / 797.9 / 3,767.9 / 3,767.9.
-
-**Reading.** A live-shipped write is durable on two hosts in about one and a half round trips: 17–20 µs at the median
-for a small write and 23–27 µs for a page, under 75 µs at p99, and every quiet p99 is under 1 ms (64 KiB: 160–292
-µs). The goal's 50 µs holds at the median up to a page and at p99 for small writes. Its 1 ms holds at p99 in every
-quiet run. It does not hold at p999 for 64 KiB writes (2 of 5 quiet runs over 1 ms), nor in the tails of the loaded runs, where the bare
-round trip itself reached 54.8 ms: the spinning threads take the unit's CPU quota from the shards, and the tail is the
-quota's throttling, not the protocol. A dead holder does not slow writes; the 64 KiB tail grows (p99 798 µs).
-
-### What live shipping adds to a stable NFS write in the daemon (A-200; 2026-11-05)
-
-**Hardware:** adacachy, AMD Ryzen 9 9950X3D2 (16 cores, 32 threads), 122 GiB. **Load:** load average 48–58 on 32
-threads (other agents' builds); the test and its three daemons in one `systemd-run --user` unit capped at a quarter of
-the cores. **Command (the contract):** `SLATES_TEST_CLI=1 SLATES_TEST_MEASURE=1 cargo test --release -p slates-cli
---test live_fleet measure_what_live_shipping_adds_to_a_stable_nfs_write -- --nocapture`.
-
-**Setup.** Three `slates daemon --fleet` processes (release), `f = 1`. On the owner, two volumes: one plain, one
-live-shipped. A real NFS client over TCP sends each 4 KiB `FILE_SYNC` WRITEs, 400 at a time, alternating, five rounds:
-2,000 writes each after 50 warm-up writes. A plain volume's stable write is answered after the owner's own barrier; a
-live one also after a candidate holds it. Microseconds, p50 / p99 / p999 / max:
-
-| run | load | plain | live |
-|---|---|---|---|
-| holder by holder, 1 | 50.1 | 29.5 / 2,421.1 / 13,272.9 / 27,543.7 | 478.3 / 16,532.3 / 70,665.0 / 123,743.9 |
-| holder by holder, 2 | 48.3 | 16.3 / 53.6 / 276.9 / 475.2 | 123.0 / 289.7 / 1,595.1 / 86,281.5 |
-| holder by holder, 3 (final code) | 33.8 | 19.2 / 169.7 / 589.9 / 754.1 | 170.0 / 624.9 / 9,687.5 / 100,794.4 |
-| holder by holder, 4 (final code) | 39.8 | 19.2 / 179.4 / 620.5 / 1,985.5 | 140.3 / 570.7 / 94,688.9 / 100,338.1 |
-| one exchange (rejected), 1 | 57.7 | 27.1 / 566.4 / 1,458.1 / 1,700.3 | 211.2 / 9,005.4 / 73,765.5 / 113,386.8 |
-| one exchange (rejected), 2 | 56.7 | 19.7 / 697.7 / 3,357.1 / 10,075.1 | 126.6 / 12,397.5 / 105,191.1 / 168,764.4 |
-| one exchange (rejected), 3 | 57.9 | 17.9 / 540.0 / 2,720.9 / 7,479.3 | 144.8 / 12,743.5 / 126,181.3 / 203,813.4 |
-| one exchange (rejected), 4 | 57.3 | 19.4 / 497.4 / 9,200.3 / 88,282.1 | 93.4 / 2,329.5 / 18,972.4 / 78,599.0 |
-
-No write waited out its bound (`fleet.live.durable_late` 0) and the log ended durable at its head every time.
-
-**Measured and rejected: one exchange per message.** Sending an entry to all its holders in one exchange that returns at
-the first reply (so a write never waits for the second holder) starved the second holder: it never accepted an entry
-and stayed at nothing in six of nine process flows (416 sends that found no session to it), and its median gain could
-not be told from the load's swing. The per-holder sends are kept; the starvation's mechanism is not yet pinned down
-(GAPS).
-
-**Reading.** With the code kept, live shipping adds 121–151 µs to a stable 4 KiB write at the median at load 34–40, and
-the live p99 is 571–625 µs: under the goal's 1 ms at p99, not its 50 µs. The rare tail does not meet it: p999 9.7–95 ms
-and max about 100 ms, where the plain volume's p999 is 0.6 ms, on a box at load 34–58 with the unit capped at eight
-cores. Measured inside the daemon at load 48 (temporary counters, removed): an entry costs 13.3 µs to build (read,
-encode, seal) and its dispatch round (owner shard to control shard, the exchange, back) 90.7 µs on average, against
-about 25 µs for the exchange alone (`replication_bench`): the cross-shard hops and the session borrow are most of it.
-Owed: the same command on a quiet machine; the round's hops measured apart; the rare 100 ms tail explained.
-
-**The 100 ms tail, explained and removed (2026-11-05).** The same command, with the owner's `fleet.live.*` counters
-printed at the end. Two causes, each found by its counter and each a wait for the next record period (100 ms):
-
-1. *A send that found its holder's session lent was dropped.* Two in three sends of a run found the session out (to
-   the previous write's dispatch or a straggler): 2,724 sends with no session, all 2,724 unanswered. The write then
-   waited for whichever later dispatch carried its entry, at worst the period's re-ship. Fixed: the send waits for the
-   session one timer tick at a time, within the liveness budget (`live_ship::borrow_session`); `unanswered` went to 0.
-2. *A write the credit turned away waited for the period.* With two entries in flight, the next publication cannot be
-   an entry; it marks the volume as owing a whole record, which only the next write or the period appended: 270 of
-   2,285 publications turned away, and the last of a burst waited. Fixed: the reply that frees the credit appends the
-   owed whole record at once (`fold_into`, `owes_whole_within_credit`).
-
-adacachy as above, 2,000 writes each, p50 / p99 / p999 / max in µs, all runs shown in order:
-
-| code | load | plain | live | live writes over 50 ms |
-|---|---|---|---|---|
-| before both fixes | 39.7 | 16.1 / 789.4 / 3,304.2 / 6,835.8 | 113.2 / 3,498.5 / 96,777.8 / 276,392.8 | 5 |
-| send waits for the session | 28.1 | 13.6 / 45.5 / 65.3 / 78.1 | 118.1 / 347.8 / 41,511.3 / 85,701.9 | 2 |
-| send waits for the session | 28.1 | 12.7 / 43.7 / 55.2 / 72.5 | 113.1 / 267.6 / 45,636.2 / 86,772.6 | 1 |
-| send waits for the session | 27.8 | 12.5 / 47.3 / 156.8 / 248.6 | 111.6 / 368.3 / 1,461.6 / 46,654.3 | 0 |
-| send waits for the session | 27.6 | 13.5 / 45.4 / 73.1 / 271.9 | 111.4 / 285.8 / 46,488.9 / 88,590.2 | 2 |
-| both fixes | 29.6 | 15.4 / 62.5 / 81.2 / 106.2 | 127.4 / 397.5 / 1,266.2 / 1,869.1 | 0 |
-| both fixes | 29.6 | 14.5 / 58.7 / 129.1 / 256.4 | 117.0 / 262.8 / 481.1 / 806.5 | 0 |
-| both fixes | 29.3 | 16.5 / 59.4 / 80.3 / 249.3 | 130.5 / 264.4 / 882.0 / 1,840.3 | 0 |
-| both fixes, with the fence and destroy fixes | 8.0 | 12.4 / 53.2 / 106.8 / 887.0 | 102.5 / 216.7 / 436.0 / 465.4 | 0 |
-| both fixes, with the fence and destroy fixes | 30.0 | 17.7 / 59.8 / 83.2 / 168.7 | 112.0 / 223.4 / 449.5 / 760.6 | 0 |
-| both fixes, with the fence and destroy fixes | 30.0 | 14.2 / 57.3 / 64.7 / 127.2 | 114.4 / 249.2 / 1,150.0 / 1,424.1 | 0 |
-
-The unit was never throttled (`cpu.stat` `nr_throttled` 0 across a run), so the tail was not the cap's 100 ms quota
-period. The old code on a second machine (kiln-a094a12d, x86-64, load 13–17, 05:56) showed the same tail: live p50
-312.3, p99 754.4, p999 98,709.0, max 100,527.5 µs.
-
-**Reading.** With both fixes, live shipping adds 90–114 µs to a stable 4 KiB write at the median. The live p99 is
-217–398 µs, the p999 0.44–1.27 ms and the worst write 0.47–1.87 ms, at load 8–30, against 86–276 ms before: every write
-of the run at load 8 was under 1 ms. The goal's 50 µs is not met: the added median is the cross-shard dispatch round
-measured above. Owed: that round's hops measured apart, and the p999 under 1 ms at load 30.
