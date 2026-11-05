@@ -432,6 +432,13 @@
 > restart; real-process chaos
 > (partitions, injected latency, volume failure, client disconnect). `put_wal` and the
 > loss-window report are unbuilt; a head still waits up to the 100 ms record period before its commit starts.
+> **Open, found landing 13 (2026-11-05): a live takeover can wait for its quorum and never serve.** On adacachy in a
+> capped unit (`CPUQuota=1200%`, load 18–25), `a_superseded_owner_resumed_after_its_takeover_is_fenced`
+> (`crates/cli/tests/live_fleet.rs`) failed 1 of 2 runs on the landing's tree: with the owner stopped, the survivor that
+> adopted the takeover (`fleet.takeover.adopted` 2) waited for its live log's quorum for the whole 40 s
+> (`fleet.live.takeover_waits_quorum` 370, `fleet.live.hold_refused` 14) and refused every read `Overloaded`, while the
+> other candidate answered its fetches (`fleet.live.fetched` 400) and held the log at head 2. No acknowledged write was
+> lost (the candidate held all three); the volume went unserved. Owner: raft, before any other live-shipping work.
 
 > **VFS plan step 14, Shards' WHP window's three edge cases (2026-11-05): done, patches with the owner's folder.** Six
 > real-guest tests and one fix for Shards' owner, in `docs/wip/shards-patches/` (never pushed to Shards; README there), and
