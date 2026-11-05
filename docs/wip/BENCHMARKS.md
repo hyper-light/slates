@@ -7852,6 +7852,7 @@ the discard calls replaced by a refusal in a diagnostics commit):
 - Run 41978699404's arm64 daemon test failed at first, on the test's own limit: it held the working set's climb after the
   files were recreated to 90% too, and the climb read 89.9% (42,946,560 to 163,614,720), every byte having read back
   correct. That limit was no part of the done-when and Windows' trimming moves it, so it is now half the bytes: what it
-  asks is that the reused pages count again, and the byte comparison is what says they hold what was written.
+  asks is that the reused pages count again, and the byte comparison is what says they hold what was written. With that
+  limit the daemon test passed 5 of 5 on each architecture (run 41979650557).
 - Linux and Mac fmt, clippy, docs, `cargo xtask check` and the mem tests, and Miri over mem's tests: passed on run
   41975260339.
