@@ -39,7 +39,7 @@ enum Waited {
 /// refuses is a refused mount, as the receive thread's own would be.
 pub(crate) fn measure() -> Result<(), WinFspError> {
   let window = one_way_wake()?;
-  eprintln!(
+  slates_machine::log_line!(
     "slates-winfsp: reply spin window = {} ns: the median one-way channel wake of {SAMPLES} (the 2-competitive spin)",
     window.as_nanos()
   );
