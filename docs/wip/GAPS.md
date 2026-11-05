@@ -408,9 +408,9 @@
 > 4 of 4). Barriers wait (§4.10 status "slice two"): a recorded verb and a stable NFS write or `COMMIT` on a live
 > volume are answered only once a candidate holds them, red-checked across real processes. Takeover reads the live
 > log (§4.10 status "slice three"): a never-sealed live volume's five acknowledged writes survive its owner's SIGKILL,
-> served whole by a survivor in 1.8–2.3 s (4 of 4), empty without the log. Open: a volume whose owner dies before its
-> creation head is placed (up to one 100 ms record period) is unknown to any takeover, so the first live write owes a
-> wait for that placement; hard links and extended attributes in the rebuilt volume. Open, toward a filesystem
+> served whole by a survivor in 1.8–2.3 s, empty without the log; a live write also waits for its volume's head
+> placement, so an owner killed the moment its last write returns loses nothing (3 of 3; 2 of 2 lost everything
+> before). Open: hard links and extended attributes in the rebuilt volume. Open, toward a filesystem
 > server replicated per write in under 1 ms: FUSE `fsync` answered at durability (AC-8.3's "live-shipped volumes
 > report none", AC-8.9's credit backpressure); a candidate's copy kept across its own restart; real-process chaos
 > (partitions, injected latency, volume failure, client disconnect). `put_wal` and the

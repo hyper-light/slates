@@ -5683,9 +5683,12 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > real daemon processes (`a_live_volumes_acknowledged_writes_survive_its_owners_death`): five writes, each answered at
 > durability, no snapshot ever taken, the owner killed with SIGKILL; a survivor serves all five files byte for byte
 > after 2.27, 2.05, 1.85 and 1.83 s (4 of 4). Red-checked: with the live log not read, the successor serves the volume
-> empty (every file `NotFound`), the loss the log closes. Found on the way, owed: a volume whose owner dies before its
-> creation head is placed at `f + 1` (the record period, up to 100 ms) is unknown to any takeover, so its first live
-> write must wait for that placement too; the test waits for it before the kill. Also owed: FUSE `fsync`, a
+> empty (every file `NotFound`), the loss the log closes. Found on the way and closed in the same slice: a volume whose
+> owner died before its creation head was placed at `f + 1` (the record period, up to 100 ms) was unknown to any
+> takeover, so writes it had acknowledged were lost with it (2 of 2 runs killed right after the writes served nothing,
+> `OwnerUnreachable`). A live write now waits for its volume's head placement as well as its own durability
+> (`live_ship::head_placed`; `fleet::record_acks_in` answers the waits it completes), and the flow kills the owner the
+> moment the last write returns: served whole in 1.93, 1.93 and 2.17 s (3 of 3). Also owed: FUSE `fsync`, a
 > candidate's copy across its own daemon's restart, hard links (an archive carries each name as its own file), and
 > extended attributes in the rebuilt volume.
 
