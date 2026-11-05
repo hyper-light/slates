@@ -2881,7 +2881,7 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 > code before the fix kept 1 of 100 views stale, the fix kept 0 of 100 (diagnostics runs 41336524903 and 41346376630;
 > before, 41346373137).
 
-> **Status (2026-11-05, A-214: Windows conformance).** WinFsp's own suites run over the drive in `windows-lint` and
+> **Status (2026-11-05, A-209: Windows conformance).** WinFsp's own suites run over the drive in `windows-lint` and
 > `windows-arm64`. winfstest's 628 cases give the same verdicts on x86_64 and arm64; every failure is on the reviewed
 > list with one of five stated differences (attribute bits, security descriptors, a settable creation time, reparse
 > points and symbolic links, named streams). Four Win32 bugs it found are fixed with failing tests first
@@ -8423,7 +8423,7 @@ field.
 | Differential | Prove parity with the host filesystem | Same sequences on tmpfs / APFS RAM disk / NTFS RAM VHD; Metis-style abstract-state hashes | The abstract state after every step matches except where the reviewed equivalence policy allows (timestamps by order, inode numbers ignored, errno within the platform's allowed set) | CI (Linux), nightly (macOS, Windows) |
 | Landing oracle | Prove the one path that writes disk | an executable model of (disk, overlay, witnesses); outsider edits and crashes injected at every step; real filesystems on RAM-backed targets | Verdicts match the table; every entry old or new; every collision reported; re-runs idempotent; writes proportional to the delta | CI (Linux tmpfs), nightly (APFS, NTFS) |
 | Merge oracle | Prove the verdict, the splice and rebase | an executable model of (chain, work volumes, declared operations); proptest with shrinking; instrumented counters | Verdicts match the oracle with zero false accepts or rejects; spliced versions byte-identical; no content read on the common path; windows byte-exact | CI |
-| Conformance | Prove POSIX behaviour through each bridge, and Win32 behaviour through the WinFsp drive | pjdfstest, fsx, fsstress (CI, x86_64 and arm64 Linux); WinFsp's fsx port and winfstest (CI, x86_64 and arm64 Windows; A-214); xfstests generic, LTP (nightly) | All tests pass except the reviewed expected-failure list for that bridge, and the list only shrinks | CI / nightly |
+| Conformance | Prove POSIX behaviour through each bridge, and Win32 behaviour through the WinFsp drive | pjdfstest, fsx, fsstress (CI, x86_64 and arm64 Linux); WinFsp's fsx port and winfstest (CI, x86_64 and arm64 Windows; A-209); xfstests generic, LTP (nightly) | All tests pass except the reviewed expected-failure list for that bridge, and the list only shrinks | CI / nightly |
 | Real workloads | Prove tools work | vendored git, cargo, npm, python, rg, rsync, sqlite, editors, watchers | Exit codes 0; outputs byte-identical to the host run; `git status` clean; incremental builds reuse artifacts | nightly, release |
 | Unit and property | Prove each core structure | proptest, oracle tests (serial spec vs implementation), non-vacuity counters | Properties hold; counters prove the fast paths ran | CI |
 | Hostile input | Prove parsers never crash or over-allocate | cargo-fuzz corpora for wire, FUSE, NFS/XDR, WinFsp, archive, MCP | No panic, no UB, bounded time and memory on every input | CI smoke, nightly long |
@@ -12863,7 +12863,7 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
 
-### A-214 — Windows conformance is WinFsp's own two suites over the slates drive in both Windows lanes, with a reviewed list and stated differences; the POSIX suites run on arm64 Linux (accepted 2026-11-05, Step 10 of the VFS and DAX plan)
+### A-209 — Windows conformance is WinFsp's own two suites over the slates drive in both Windows lanes, with a reviewed list and stated differences; the POSIX suites run on arm64 Linux (accepted 2026-11-05, Step 10 of the VFS and DAX plan)
 Applied in the same change to: Part 6 ("Conformance"), §4.6 ("Windows" and its status), GAPS, `docs/wip/platforms.md`,
 `docs/wip/conformance.md`, `crates/conformance` (the `winfstest` suite, its reply parser, the capability table, the WinFsp
 fsx verdict), `xtask/src/conformance` (the WinFsp mount step, the MSVC builds, the winfstest transcription and runner),

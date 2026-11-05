@@ -1,4 +1,4 @@
-//! winfstest over the slates WinFsp drive (A-214; Part 6 "Conformance" on Windows; Phase 4 task 5, "WinFsp's own tests
+//! winfstest over the slates WinFsp drive (A-209; Part 6 "Conformance" on Windows; Phase 4 task 5, "WinFsp's own tests
 //! on Windows"). The volume is mounted at a drive letter (`slates mount ID E:`), winfstest's driver (`winfstest.c`) is
 //! built from its pinned source with MSVC, and the twenty scripts' Rust transcription ([`scripts`]) runs in a fresh
 //! directory on the drive, each script's calls made by the driver one process a call, as `winfstest.py` makes them.
@@ -404,7 +404,7 @@ mod tests {
     events
   }
 
-  /// A-214. Do: run the transcription over a stand-in driver that answers every call `0`. Expect: every script makes
+  /// A-209. Do: run the transcription over a stand-in driver that answers every call `0`. Expect: every script makes
   /// exactly the calls, held calls and releases, expectations and `testeval` lines that the unchanged upstream scripts
   /// make under a stand-in `winfstest.py` (`golden.tsv`, 733 cases), in the same order, and every script finishes
   /// with its plan.
@@ -448,7 +448,7 @@ mod tests {
     assert_eq!(cases.len(), want_cases.len(), "cases");
   }
 
-  /// A-214. Do: read the reviewed list. Expect: it parses, and every case it names is a case a transcribed script can
+  /// A-209. Do: read the reviewed list. Expect: it parses, and every case it names is a case a transcribed script can
   /// report: its script is one of the twenty, and its number is within that script's cases under the golden.
   #[test]
   fn the_reviewed_list_names_only_cases_the_scripts_have() {

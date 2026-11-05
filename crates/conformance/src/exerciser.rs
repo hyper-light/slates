@@ -174,7 +174,7 @@ mod tests {
     assert!(!judge_winfsp_fsx(true, bad, 10_000).ok);
   }
 
-  /// A-214: a `-v` trace's last operation is its largest numbered operation line; the port's other lines (its seed,
+  /// A-209: a `-v` trace's last operation is its largest numbered operation line; the port's other lines (its seed,
   /// its size changes, `testcalls = 163`) are not operations; a run with none stopped at operation 1.
   #[test]
   fn an_fsx_trace_names_the_operation_it_stopped_at() {

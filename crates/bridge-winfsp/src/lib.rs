@@ -142,7 +142,7 @@ pub fn filetime_from_unix_ns(ns: i64) -> u64 {
 const FILETIME_UNCHANGED: [u64; 2] = [0, u64::MAX];
 
 /// Converts a Windows `FILETIME` a caller set (`SetFileTime`, `SetFileInformationByHandle`) to a Unix time in
-/// nanoseconds, the form the volume keeps (A-214): `None` for a time the call leaves alone ([`FILETIME_UNCHANGED`]),
+/// nanoseconds, the form the volume keeps (A-209): `None` for a time the call leaves alone ([`FILETIME_UNCHANGED`]),
 /// and a time before 1970 negative, as the volume's signed times hold it. A time past what nanoseconds since 1970 hold
 /// in an `i64` (the year 2262) is `None` too: the volume cannot keep it, and the call keeps the old one.
 pub fn unix_ns_from_filetime(filetime: u64) -> Option<i64> {
@@ -321,7 +321,7 @@ mod tests {
     );
   }
 
-  /// A-214: a `FILETIME` a caller set converts back to the volume's Unix nanoseconds and round-trips through
+  /// A-209: a `FILETIME` a caller set converts back to the volume's Unix nanoseconds and round-trips through
   /// [`filetime_from_unix_ns`]; the two "leave it" values convert to nothing, a time before 1970 is negative, and one past
   /// what the volume's `i64` holds is nothing rather than a wrapped time.
   #[test]

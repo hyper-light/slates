@@ -1,8 +1,8 @@
 # winfstest found Win32 calls the WinFsp drive answered wrongly
 
-**Amendment:** A-214.
+**Amendment:** A-209.
 
-**Found by:** WinFsp's own winfstest, run over `slates mount ID E:` for the first time (A-214; diagnostics run
+**Found by:** WinFsp's own winfstest, run over `slates mount ID E:` for the first time (A-209; diagnostics run
 41982130174, 2026-11-05, on GitHub's `windows-latest` x86_64 and `windows-11-arm` runners). Its base scripts failed
 cases a Windows program acts on; the cases were the same on both architectures.
 

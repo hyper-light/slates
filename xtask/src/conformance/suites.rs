@@ -109,7 +109,7 @@ pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   ];
   let (success, output, ended) = run_bounded(&built.binary, &args, &work, FSX_WALL_BOUND)?;
   let verdict = fsx_verdict(success, &output, bounds.fsx_operations);
-  // A run that failed is judged against the transport's reviewed list (A-214): one that failed its own verification by
+  // A run that failed is judged against the transport's reviewed list (A-209): one that failed its own verification by
   // the operation it failed at, one its wall bound ended as unfinished. A listed failure is expected, any other is not,
   // and a pass with a listed failure must strike it.
   let (list, digest) = reviewed_list(
@@ -184,7 +184,7 @@ pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
 /// Derived: the wall bound of a whole fsx run: pjdfstest's per-file bound
 /// (`slates_conformance::pjdfstest::FILE_BOUND_SECONDS`, 300 s), about five times the slowest recorded fsx run of the
 /// default bounds (62.6 s, `native-linux-fuse` on arm64, diagnostics run 41975493604). A run still going then is ended
-/// and judged as unfinished (the WinFsp port's operations take seconds each over the drive, A-214).
+/// and judged as unfinished (the WinFsp port's operations take seconds each over the drive, A-209).
 const FSX_WALL_BOUND: Duration = PJDFSTEST_FILE_BOUND;
 
 /// Runs a suite binary until it exits or `bound` passes, capturing both streams together; past the bound it is killed.

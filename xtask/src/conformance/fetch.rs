@@ -279,7 +279,7 @@ pub(crate) const FSX_LENGTH_FLAG: &str = "-F";
 #[cfg(not(windows))]
 pub(crate) const FSX_TRACE_FLAG: &str = "-q";
 /// Format: the WinFsp port runs `-v`, printing each operation as it completes, so a run ended at its wall bound names
-/// the operation it stopped at for the reviewed list (A-214).
+/// the operation it stopped at for the reviewed list (A-209).
 #[cfg(windows)]
 pub(crate) const FSX_TRACE_FLAG: &str = "-v";
 
