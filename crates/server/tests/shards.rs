@@ -1449,7 +1449,7 @@ fn hostile_descriptor_asks_are_refused_with_an_errno_and_no_descriptor() {
   asks_for_no_file_are_refused(&mut guest, outside);
   a_scoped_attachment_reaches_no_node_outside(&daemon, id, outside);
   a_read_only_attachment_may_not_ask_to_write(&daemon, id, outside);
-  assert_eq!(wait_for_count(&daemon, "shards.dax_malformed", 3), 3);
+  assert_eq!(wait_for_count(&daemon, "shards.dax_malformed", 4), 4);
   assert_eq!(wait_for_count(&daemon, "shards.dax_not_a_file", 1), 1);
   assert_eq!(wait_for_count(&daemon, "shards.dax_unreachable", 2), 2);
   assert_eq!(wait_for_count(&daemon, "shards.dax_read_only", 1), 1);

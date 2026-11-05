@@ -24,7 +24,7 @@
 //! stores are ingested first, and its charge goes back.
 //!
 //! Refusals, each counted by kind:
-//! - `shards.dax_malformed`, `EINVAL`: an ask of no length the protocol has, or a range past the object;
+//! - `shards.dax_malformed`, `EINVAL`: an ask of no length the protocol has, or a range past the object, or one no view can begin at;
 //! - `shards.dax_unreachable`, the bridge's errno: a node the attachment does not reach;
 //! - `shards.dax_not_a_file`: `EISDIR` for a directory, `EINVAL` for anything else that is not a regular file;
 //! - `shards.dax_read_only`, `EPERM`;
