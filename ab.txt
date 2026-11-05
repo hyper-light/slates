@@ -254,3 +254,9 @@ winfsp-phase	response	12	7003	p50 9500	p99 16700	mean 10026
 winfsp-phase	txn_recv_total	0	161073	p50 30100	p99 4284800	mean 892739
 winfsp-phase	txn_resp_total	0	174028	p50 13000	p99 35100	mean 13456
 ## run 1 of 1 done, 2026-11-05T06:17:01Z
+remote: 
+remote: Create a pull request for 'diag-winfsp-bench-results-41977769822-windows-11-arm' on GitHub by visiting:        
+remote:      https://github.com/hyper-light/slates/pull/new/diag-winfsp-bench-results-41977769822-windows-11-arm        
+remote: 
+To https://github.com/hyper-light/slates
+ * [new branch]      2e41541c8e5e3257bd12c654e9b9b7221f6e5c86 -> diag-winfsp-bench-results-41977769822-windows-11-arm
