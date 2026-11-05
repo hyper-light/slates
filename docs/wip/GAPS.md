@@ -1,5 +1,11 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **The WinFsp receiver's response rides its next receive (2026-11-05, A-215; audit step 7).** A batch's last response
+> is sent by the call that receives the next batch, into the journal's second buffer. A request found there after a
+> death proves the driver consumed that response (WinFsp v2.1 source, `docs/wip/research/winfsp-takeover.md`). Model
+> oracle: 7,483 crash scenarios, 0 lost, 0 wrong; red without each recovery rule. **Owed:** the live kill oracle on
+> both Windows lanes and the interleaved A/B against the DLL dispatcher, both on diagnostics branches.
+
 > **The anchor's hold refusals: a bounded Unix log, and a count in `slates status` (2026-11-04, A-213; siblings of
 > audit step 3).** The Unix device hold logged a line per refused message, unbounded; it now logs each distinct refusal
 > once (`RefusalLog`, as the Windows hold does) and counts every one. Every refusal on either platform's hold channel

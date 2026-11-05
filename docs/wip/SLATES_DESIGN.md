@@ -2891,6 +2891,10 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 > The Windows anchor wakes on its hold channel's posted read and on the daemon's exit, where it parked up to 500 ms between
 > looks: five holds under a 4 s pause were answered in 3,990–4,020 ms before, on both CI lanes, and under 1 ms after
 > (runs 41984349301 and 41985213489).
+> **Status (2026-11-05, A-215).** A batch's last response rides the call that receives the next batch, into the receive
+> journal's second buffer, as WinFsp's own dispatcher carries a response with its next receive. Crash safety rests on
+> the driver's order (responses before delivery, each request written into the held pages before it is processing). The
+> model oracle holds it over 7,483 crash scenarios. The live kill oracle and the A/B against the DLL dispatcher are owed.
 
 **Base reads on macOS and Windows.** As on Linux, the daemon reads untouched base files through its own descriptor or
 handle into evictable cache chunks (one copy, `pread`/`ReadFile` on the owner shard's driver) and
@@ -13057,6 +13061,86 @@ Status: built 2026-11-04. It closes the Windows owed items of A-105, A-110 and A
   and by 200 with that close removed (`crates/mem/tests/held_section.rs`). The adoption now maps first and takes
   ownership only of a view that exists, so `view` no longer closes what it was lent.
 
+### A-215 — A WinFsp batch's last response rides the next receive, into the journal's other buffer (2026-11-05, audit plan 01a1a34bf7e973069e94f773afdea44a, step 7)
+
+**What it answers.** After A-212 the receiver was still worse than WinFsp's DLL dispatcher beyond the spread at the p50,
+by about 20 µs a request. Its separate response call explains 11–13 µs of that. The DLL sends each response in the call
+that receives its next request (WinFsp v2.1 `src/dll/fs.c:288`). A-198 kept the two apart. A combined call can complete
+IRP X and then deliver a new IRP Y at X's reused address. If the process died before its journal recorded that, X would
+look unanswered, and a successor answering X again would complete Y with X's response. This amendment combines them
+again and keeps that from happening.
+
+**What the driver does.** Read in WinFsp v2.1 (tag `v2.1`, commit `ddca7bd`, the version CI pins) on 2026-11-05.
+1. **Responses come before requests in one call.** `FspVolumeFastTransact` finishes every response in its input
+   (`src/sys/volume.c:1079–1114`) and the retried IRPs (1116–1139). Only then does it wait for a request (1167–1186) and
+   deliver (1188–1271).
+2. **Delivery writes straight into the held pages, and a request is written before it is in processing.**
+   `FSP_FSCTL_TRANSACT_BATCH` is `METHOD_OUT_DIRECT` (`inc/winfsp/fsctl.h:104`), and the driver writes through the
+   caller's own locked address (`volume.c:1147–1149`), which here is the anchor-held section. Each request is copied
+   (1224) before the IRP enters the processing queue (1228). The input is buffered: the I/O manager copies it before the
+   driver runs (`volume.c:1024`). The DLL's single-request code is `METHOD_BUFFERED` (fsctl.h:100), whose output reaches
+   user memory only when the call completes, so a receive design that survives a death cannot use it. slates does not.
+3. **A dying caller's wait delivers nothing.** The only wait in a transact is an alertable kernel wait. When the thread
+   is terminating it returns `STATUS_THREAD_IS_TERMINATING` (`src/sys/driver.h:941–966`), which becomes "cancelled"
+   (`src/sys/ioq.c:617`), and the call returns having delivered nothing (`volume.c:1181–1185`).
+4. **A response names its IRP by address alone, and only in the processing queue.** `FspIoqEndProcessingIrp` looks the
+   address up in the processing queue's table (`ioq.c:673–680`, 349–383). The check of the hint (`volume.c:1099`) is a
+   debug-build assertion. Completion is chosen by the IRP's own major function, never by the response's kind
+   (`src/sys/iop.c:414–427`). An address that is not processing is dropped as "BOGUS" (`volume.c:1093`).
+5. **Processing IRPs outlive the receiver.** They are never cancelled or expired (`FSP_IOQ_PROCESS_NO_CANCEL`,
+   `driver.h:970`; `ioq.c:574`). Only stopping the queue ends them (`ioq.c:535–552`), at the cleanup of the volume's
+   control file, which the anchor's duplicate keeps open (A-198).
+
+**The rule.** The receive journal holds two receive buffers.
+- A batch is served in the buffer it arrived in, and every response but the last is sent alone, as before.
+- The last response is saved as A-198 saves any response. Then the other buffer is cleared, and the journal records
+  "handing off from this buffer".
+- One call sends that response and receives into the other buffer.
+- When the call returns, the open the response hands the kernel, if any, is confirmed. Then the saved response is
+  cleared, and the journal records the other buffer as the batch in hand, or no batch when the call brought none.
+- A worker told to stop leaves a returned hand-off as it is, for the successor.
+
+**Why a death anywhere is safe.** Recovery reads the journal only after the dead process has exited (A-198). Two
+states are new; in each, recovery reads the other buffer.
+- **"Handing off from S", and the other buffer holds a request.** By fact 2 the call reached delivery, so by fact 1 it
+  had already finished the saved response. Every earlier response of S's batch was finished by its own call before. So
+  recovery answers nothing of S's batch again. It keeps the saved open's context (the kernel has it), clears the saved
+  response, and settles the other buffer's batch as a captured one. A reused address in that batch is answered only
+  from its own request.
+- **"Handing off from S", and the other buffer is empty.** Nothing this call delivered entered processing (facts 2 and
+  3). No other receiver ran, since there is one worker and the successor waits for the exit (A-198). So at a saved
+  address there is either the original IRP, still processing, or a new one that is only pending, which the driver will
+  not match (fact 4). Recovery settles S's batch exactly as A-198 settles a death between a response and its
+  acknowledgement.
+
+The journal's own stores must land in program order, since a kill can fall between any two of them. The other buffer is
+cleared before "handing off" is recorded, and the saved response is cleared before the new buffer is recorded. If
+"handing off" were visible over an uncleared buffer, recovery would take an old batch for a delivered one: the saved
+response would never be sent, and old hints would be answered while S's IRPs, perhaps at the same addresses, were
+processing. Every publication therefore goes through one function behind a compiler fence. The fence emits no
+instruction; it stops the compiler from reordering stores to different addresses. A killed thread's retired stores are
+all visible to the successor after the exit.
+
+**Correction to A-198's journal (found while writing this).** The same reordering was possible before. Nothing stopped
+the compiler from writing a saved response's published mark before its body and checksum, or the receiving mark before
+the clear. A torn saved response fails its checksum and refuses recovery. A reordered receiving mark over a half-cleared
+buffer refuses its parse. Either way the drive stays down until the next daemon. Neither could answer a wrong IRP: no
+receive had run since the last batch was settled. Both now go through the fenced publication.
+
+**Cost.** A batch of k requests now takes k calls, as the DLL's k requests take k; A-198 took k + 1. The held section grows
+by one receive buffer, 64 KiB, committed when first touched.
+
+**Proof.** `crates/bridge-winfsp/src/inflight/capture.rs` holds a serial model of the driver's queues (facts 1–5, and
+an address freed by one IRP handed to the very next) as the oracle. One fresh run crashes at each step of the live
+protocol, including inside the combined call between its responses and its delivery, and after its delivery before the
+call returns. A successor then recovers and serves to the end. Every IRP must be completed exactly once, and every
+success must carry its own request's identity. The live oracle (`crates/bridge-winfsp/tests/support/host.rs`) kills a
+serving process repeatedly under readers on CI's Windows lanes. The numbers and red-checks are under **Result** below.
+
+Applied in the same change to: A-198's receive rule and A-212's "Not changed" (pointers here); §4.6's Windows status;
+GAPS; `docs/wip/research/winfsp-takeover.md` (the source record); `crates/bridge-winfsp/src/inflight/capture.rs`,
+`dispatcher.rs`, `host.rs` and `tests/support/host.rs`.
+
 ### A-212 — What a live WinFsp receive reads and clears, and what a rename visits (2026-11-05)
 
 A-198's receiver replaced WinFsp's DLL dispatcher with no benchmark. Measured against it (`docs/wip/BENCHMARKS.md`, "The
@@ -13085,7 +13169,8 @@ for each cost 0.9 µs at the p50 twice a request.
 **Not changed: a response and the next receive stay two calls.** The DLL carried both in one call. A-198 keeps them apart
 so that captured requests settle before any new receive, which is what stops a reused IRP address naming another
 processing request after a death. The separate response call costs 10.9 µs at the p50 on arm64 and 12.5 µs on x86_64;
-removing it means changing that crash rule, which this amendment does not do.
+removing it means changing that crash rule, which this amendment does not do. **Changed by A-215 (2026-11-05):** a batch's
+last response now rides the call that receives the next batch, into the journal's other buffer.
 
 **Result (2026-11-05, five interleaved runs on both Windows runners, run 41989009852).** Most of the regression is gone (arm64
 quiet p50: a stat 1.50×, a rename 1.35×, an fsync 1.21×), but the receiver stays worse beyond the spread at the p50, by about
@@ -13231,7 +13316,9 @@ and failed-then-passing oracles distinguish those results from the initial sourc
   - Responses are sent without receiving a new batch. The worker settles its entire captured batch before any new
     receive, and recovery does the same before normal serving. No second receiver can put a reused hint into
     processing meanwhile. A response saved before the driver accepted it is then safe to send again: the original
-    IRP remains in processing, or a recycled address is merely pending and does not match.
+    IRP remains in processing, or a recycled address is merely pending and does not match. **Changed by A-215
+    (2026-11-05):** a batch's last response now rides the call that receives the next batch, into the journal's other
+    buffer. A request found there after a death proves the driver consumed that response, so it is not sent again.
   - Live diagnostics [41472709500](https://github.com/hyper-light/slates/actions/runs/41472709500) settle one counted
     captured read in 0.33 s on x86_64 (`windows-latest`) and 0.17 s on arm64 (`windows-11-arm`). The same tree loses
     zero drives of twenty on each architecture, with four restored-context reads in its final iteration. The run's
