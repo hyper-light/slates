@@ -74,8 +74,10 @@
 > - `a_lagging_release_is_never_met_by_a_request_as_new` (1.197 s before; red-checked);
 > - `a_refused_release_is_counted_and_the_next_watermark_takes_it_over` (never answered before; red-checked).
 >
-> Owed: the interleaved A/B on all five platforms, with R9's single-client p99 as the gate (jupiter and macOS
-> measured, CI's diag-clients-6 pending). Open and not the acknowledgement:
+> Measured on all five platforms (BENCHMARKS, "The acknowledgement answered once its own shard has released"). On CI
+> (diag run 42082464886), R9's single-client gate is green in every round on Linux x86_64 and arm64 and Windows x86_64
+> and arm64, where main failed five rounds of twelve; Windows arm64 went from 79.0 / 53.7 / 49.1 µs to 42.7 / 42.4 /
+> 43.0 µs. Open and not the acknowledgement:
 > - **jupiter's single-client p99.** It stays red with A-216: its runs range from 65 µs to 3.8 ms, as main's do
 >   (2026-11-05 18:24–18:27 UTC).
 > - **macOS's single-client create.** Its p50 is 60–75 µs in both arms.
