@@ -1000,3 +1000,5 @@ slates daemon: instance fsb-1653-5-new serving on 3 shards under the anchor
 slates-server: shard 1 initialized in 2493 µs
 slates-server: shard 2 initialized in 2843 µs
 ## run 5 of 5 done, 2026-11-05T17:01:51Z
+To https://github.com/hyper-light/slates
+   334db9b..5af78f7  5af78f70b0aadb1dd4ecde6b259a634fae34f604 -> diag-winfsp-overlap-results-42065971017-windows-latest
