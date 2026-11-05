@@ -126,7 +126,7 @@ fn transact(
   };
   if accepted == 0 {
     let error = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-    if error != ERROR_IO_PENDING as i32 {
+    if u32::try_from(error).ok() != Some(ERROR_IO_PENDING) {
       return Err(error);
     }
     // SAFETY: the same outstanding call, its buffers still owned.
@@ -331,10 +331,10 @@ fn serve(
     let delivered = transact(control, event, chosen.code, responses, output).unwrap();
     let took = started.elapsed().as_nanos() as u64;
     let creates = answer(&output[..delivered], responses);
-    if creates > 0 {
-      if let Some(calls) = kept.as_mut() {
-        calls.push(took);
-      }
+    if creates > 0
+      && let Some(calls) = kept.as_mut()
+    {
+      calls.push(took);
     }
     served += creates;
   }
@@ -398,7 +398,7 @@ fn transact_cost() {
       for offset in 0..MODES.len() {
         let index = (round + offset) % MODES.len();
         mode.store(index, Ordering::Relaxed);
-        let kept = (round > 0).then(|| &mut calls[index]);
+        let kept = (round > 0).then_some(&mut calls[index]);
         serve(control, event, &mut buffers, index, &mut responses, kept);
       }
     }
