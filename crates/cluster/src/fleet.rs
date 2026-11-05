@@ -245,7 +245,7 @@ impl FleetNode {
       && prior.is_none_or(|prior| prior.liveness != Liveness::Alive)
       && state.liveness == Liveness::Alive
     {
-      eprintln!(
+      slates_machine::log_line!(
         "slates-cluster: fleet: {:?} holds {subject:?} alive: {prior:?} -> {state:?}, folded at {}",
         self.host,
         std::panic::Location::caller()

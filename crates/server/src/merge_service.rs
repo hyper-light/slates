@@ -2200,7 +2200,7 @@ pub(crate) fn accept_merge_record(
       if reason == RECOMPUTE_MISMATCH {
         state.merge.refused.insert(object);
         state.merge.replicas.remove(&object);
-        eprintln!(
+        slates_machine::log_line!(
           "slates-server: merge record for green {} version {} from {:?}: the recomputed identity does not match the record; the green is refused on this holder",
           hex(&object.0),
           value.version,

@@ -236,7 +236,7 @@ pub mod windows {
         )
       } == 0
       {
-        eprintln!(
+        slates_machine::log_line!(
           "slates-winfsp: drive cleanup refused: {}",
           os("DefineDosDeviceW (remove)")
         );
