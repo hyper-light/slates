@@ -42,6 +42,8 @@ use slates_vfs::inode::Kind;
 mod ffi;
 #[cfg(windows)]
 pub mod host;
+#[cfg(windows)]
+mod trace;
 // What a mount tells Windows of another path's change: the names Windows holds open and the notification records
 // (§4.6 "Windows"). Pure, so it is tested on every host.
 pub mod notify;

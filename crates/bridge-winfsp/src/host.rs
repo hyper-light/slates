@@ -1337,6 +1337,11 @@ impl Mounted {
     unsafe {
       (*file_system).user_context = handler.cast::<c_void>();
       (api.set_guard_strategy)(file_system, GUARD_STRATEGY_COARSE);
+      // DIAG: trace every operation around the coarse guard's lock.
+      let _ = TRACE_ENTER.set((*file_system).enter_operation);
+      let _ = TRACE_LEAVE.set((*file_system).leave_operation);
+      (*file_system).enter_operation = Some(traced_enter);
+      (*file_system).leave_operation = Some(traced_leave);
     }
     let mut mount_wide = wide_nul(mount_point);
     // SAFETY: `file_system` is live; `mount_wide` a NUL-terminated mount point.
@@ -1853,5 +1858,44 @@ fn write_wide(field: &mut [u16], s: &str) {
   let cap = field.len().saturating_sub(1);
   for (slot, unit) in field.iter_mut().zip(s.encode_utf16().take(cap)) {
     *slot = unit;
+  }
+}
+
+/// DIAG: the DLL's own guards, called inside the traced ones.
+static TRACE_ENTER: std::sync::OnceLock<Option<crate::ffi::GuardFn>> = std::sync::OnceLock::new();
+/// DIAG: see TRACE_ENTER.
+static TRACE_LEAVE: std::sync::OnceLock<Option<crate::ffi::GuardFn>> = std::sync::OnceLock::new();
+
+/// DIAG: the request's bytes, as long as its own size says.
+unsafe fn traced_request<'a>(request: Pvoid) -> &'a [u8] {
+  // SAFETY: the DLL passes its live request buffer, whose size field is the request's length.
+  unsafe {
+    let size = usize::from(u16::from_le_bytes([*(request as *const u8).add(2), *(request as *const u8).add(3)]));
+    std::slice::from_raw_parts(request as *const u8, size)
+  }
+}
+
+/// DIAG: arrival before the guard's lock, service from when it is held.
+unsafe extern "system" fn traced_enter(file_system: *mut crate::ffi::FileSystem, request: Pvoid, response: Pvoid) -> Ntstatus {
+  let arrived = std::time::Instant::now();
+  // SAFETY: as traced_request.
+  let bytes = unsafe { traced_request(request) };
+  crate::trace::arrive(bytes, arrived);
+  let status = match TRACE_ENTER.get().copied().flatten() {
+    // SAFETY: the DLL's own guard, with the arguments it was given.
+    Some(enter) => unsafe { enter(file_system, request, response) },
+    None => 0,
+  };
+  crate::trace::begin(bytes, arrived);
+  status
+}
+
+/// DIAG: service ends before the guard's lock is let go.
+unsafe extern "system" fn traced_leave(file_system: *mut crate::ffi::FileSystem, request: Pvoid, response: Pvoid) -> Ntstatus {
+  crate::trace::end();
+  match TRACE_LEAVE.get().copied().flatten() {
+    // SAFETY: as traced_enter.
+    Some(leave) => unsafe { leave(file_system, request, response) },
+    None => 0,
   }
 }
