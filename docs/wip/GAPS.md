@@ -35,10 +35,11 @@
 > a move not asked to replace replaced a taken name (and one asked replaced a directory), a directory holding a file
 > answered its removal with success, `SetFileTime` kept nothing, and an open with `TRUNCATE_EXISTING` kept the file.
 > `linux-arm64` runs fsx, fsstress and pjdfstest over the three Linux transports with the x86_64 lists: 0 unexpected
-> and 0 listed passing (diagnostics run 41975493604). **Open:** fsx over the drive wedges at its operation 164 (seed 1,
-> a `TRUNCATE UP` after a `TRUNCATE DOWN`, on both architectures): the bridge receives nothing after the shrink, so
-> the wait is in Windows' cache below the single WinFsp receiver (A-198), not in a callback; the two-step replay passes,
-> so it needs fsx's earlier history. Recorded in the same bug file; owed to the WinFsp dispatcher's owners.
+> and 0 listed passing (diagnostics run 41975493604). **Open:** fsx over the drive wedges at an extension after a cached
+> write past a hole and a shrink below it (seed 1; operations 41 to 43 or 162 to 164, the point moving between runs,
+> on both architectures): no request reaches the bridge for the 300 s until the bound's kill, so the wait is inside
+> Windows' write path below the single WinFsp receiver (A-198); the operations replayed alone pass. Listed as
+> `fsx-seed-1-unfinished:10000`; recorded in the same bug file; owed to the WinFsp dispatcher's owners.
 
 > **Shards counted hardware threads as cores (2026-11-05, A-208, §4.1, R9; fixed, its A/B owed).** §4.1 counts shards in
 

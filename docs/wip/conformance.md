@@ -6,8 +6,9 @@
 > cases give the same verdicts on x86_64 and arm64: 254 pass, 374 fail, every failure on
 > `expected-failures/native-windows-winfsp.winfstest.txt` with one of A-214's five stated differences. The suite found
 > four Win32 bugs, each fixed with a failing test first (`docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md`).
-> fsx wedges at its operation 164 (an open bug, listed in `expected-failures/native-windows-winfsp.fsx.txt`); every fsx
-> run now has a wall bound and a stopped run is judged by the operation it stopped at. On arm64 Linux, `linux-arm64`
+> fsx wedges over the drive (an open bug, listed as `fsx-seed-1-unfinished:10000` in
+> `expected-failures/native-windows-winfsp.fsx.txt`); every fsx run now has a 300 s bound and is judged against its
+> transport's list. On arm64 Linux, `linux-arm64`
 > runs fsx, fsstress and pjdfstest over the three Linux transports against the x86_64 lists: 0 unexpected, 0 listed
 > passing (diagnostics run 41975493604). The Windows records are copied in from CI's artifacts.
 
