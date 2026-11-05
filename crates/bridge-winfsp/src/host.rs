@@ -169,7 +169,7 @@ struct OpenFile {
 
 /// One operation the owner shard runs on the volume, with the parameters marshalled from a WinFsp callback. Paths
 /// arrive as Rust `String`s (converted from WinFsp's UTF-16), so the whole `Op` crosses the channel.
-enum Op {
+pub(crate) enum Op {
   VolumeInfo,
   /// Resolve a path to an object and its attributes (`GetSecurityByName`), or report it missing.
   Resolve {
@@ -288,13 +288,27 @@ enum Reply {
 pub struct Request {
   op: Op,
   reply: SyncSender<Reply>,
+  sent: std::time::Instant,
 }
 
 impl Request {
   /// Serves the request whole through `bridge` under `cx`, keeping `names` — what Windows holds open, which the
   /// mount's notifications name ([`crate::notify`]) — in step with its opens, closes and renames. The reply is not sent
   /// yet: the caller publishes first when [`Served::needs_barrier`] says so.
+  /// DIAG: the shard took this request.
+  pub fn picked(&self) {
+    crate::phase::picked(crate::phase::op_name(&self.op), self.sent);
+  }
+
+  /// DIAG: serves, timed.
   pub fn serve(self, bridge: &mut dyn Bridge, cx: &OpContext, names: &mut OpenNames) -> Served {
+    let started = crate::phase::service_begins();
+    let served = self.serve_inner(bridge, cx, names);
+    crate::phase::service_ended(started);
+    served
+  }
+
+  fn serve_inner(self, bridge: &mut dyn Bridge, cx: &OpContext, names: &mut OpenNames) -> Served {
     let barrier = self.op.needs_barrier();
     let echo = matches!(self.op, Op::PurgeEcho { .. });
     let opened = match &self.op {
@@ -631,14 +645,20 @@ impl Handler {
   /// Sends `op` to the mount's task, wakes it, and blocks this dispatcher thread for its reply; a closed channel (the
   /// mount is being torn down) is `STATUS_UNSUCCESSFUL`, never a hang.
   fn call(&self, op: Op) -> Reply {
+    let name = crate::phase::op_name(&op);
+    let hop_started = std::time::Instant::now();
     let (reply, answer) = sync_channel(1);
-    if self.requests.send(Request { op, reply }).is_err() {
+    if self.requests.send(Request { op, reply, sent: hop_started }).is_err() {
       return Reply::Err(crate::status_unsuccessful());
     }
     self.wake.wake_by_ref();
-    answer
+    crate::phase::note(name, crate::phase::SEND_AND_WAKE, hop_started);
+    let answered = answer
       .recv()
-      .unwrap_or(Reply::Err(crate::status_unsuccessful()))
+      .unwrap_or(Reply::Err(crate::status_unsuccessful()));
+    crate::phase::reply_woke(name);
+    crate::phase::note(name, crate::phase::HOP, hop_started);
+    answered
   }
 }
 
@@ -1646,6 +1666,7 @@ impl Drop for Mounted {
     // which the mount's owner does before it stops the thread.
     unsafe {
       (self.api.stop_dispatcher)(self.file_system);
+      crate::phase::dump();
       (self.api.remove_mount_point)(self.file_system);
       (self.api.delete)(self.file_system);
     }
