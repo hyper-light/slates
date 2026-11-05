@@ -1518,11 +1518,7 @@ impl Volume {
           return Err(VfsError::BaseDrift);
         }
         // Unpinned disk bytes need the host: `Overlay::read` serves them.
-        let unpinned = off < b.base_len
-          && !b.pinned.iter().any(|e| {
-            e.off <= off
-              && off.saturating_add(u64::try_from(want).unwrap_or(0)) <= e.off.saturating_add(e.len)
-          });
+        let unpinned = off < b.base_len && !covers(&b.pinned, off, read_end);
         if unpinned {
           return Err(VfsError::BaseUnavailable(0));
         }
@@ -2830,11 +2826,7 @@ impl Volume {
         if b.lost {
           return Err(VfsError::BaseDrift);
         }
-        let unpinned = off < b.base_len
-          && !b.pinned.iter().any(|e| {
-            e.off <= off
-              && off.saturating_add(u64::try_from(want).unwrap_or(0)) <= e.off.saturating_add(e.len)
-          });
+        let unpinned = off < b.base_len && !covers(&b.pinned, off, read_end);
         if unpinned {
           return Err(VfsError::BaseUnavailable(0));
         }
@@ -6724,6 +6716,22 @@ pub(crate) fn overlapping(extents: &[Extent], start: u64, end: u64) -> &[Extent]
   let rest = extents.get(first..).unwrap_or_default();
   let count = rest.partition_point(|e| e.off < end);
   rest.get(..count).unwrap_or_default()
+}
+
+/// Whether `extents` (ascending by offset and non-overlapping, as every body holds them) together cover the whole
+/// file range `[start, end)` with no gap. A pinned base file is held as several extents (a large-class file is pinned
+/// a window at a time), so a read is served from them when their union covers it; until 2026-11-04 a read needed a
+/// single extent covering the whole range, and every read across an extent boundary of a pinned large file was
+/// refused `BaseUnavailable` (a green's origin walk over the Linux kernel's `kernel/` directory met it first).
+pub(crate) fn covers(extents: &[Extent], start: u64, end: u64) -> bool {
+  let mut reached = start;
+  for e in overlapping(extents, start, end) {
+    if e.off > reached {
+      return false;
+    }
+    reached = reached.max(e.off.saturating_add(e.len));
+  }
+  reached >= end
 }
 
 /// The chunks a cut of `body` to `len` releases or clips: those of the extents reaching past `len`.

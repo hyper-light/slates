@@ -5426,10 +5426,7 @@ fn build_increment(
     }
   };
   let post_state = assemble_post_state(&doc, &w.content, &w.journal);
-  let mut hasher = blake3::Hasher::new();
-  hasher.update(&doc.encode());
-  hasher.update(&post_state);
-  let id = *hasher.finalize().as_bytes();
+  let id = increment_identity(work_id, base_version, &doc.encode(), &post_state);
   Ok((
     green_id,
     slates_merge::engine::Increment {
@@ -5440,6 +5437,26 @@ fn build_increment(
       evidence,
     },
   ))
+}
+
+/// An increment's identity (§4.16 data model: `blake3(work_volume, base, post_state, ops_doc, filter)`): the BLAKE3 of
+/// the work volume's id, the base version (little-endian), the ops document's length (little-endian) and bytes, and the
+/// post-state. Every field but the last is fixed-width or length-prefixed, so no two different inputs hash the same
+/// bytes. The service keeps no exclusion filter yet (every path of a work is in its increment), so the filter term is
+/// the empty one and adds nothing. The identity is what the engine's idempotency record and rejected-result cache are
+/// keyed by, so it must name everything the verdict depends on: until 2026-11-04 it hashed only the ops document and
+/// the post-state, so a work that resolved a conflict, rebased and declared the same bytes again met its first
+/// submit's cached conflict at every resubmit ("a rebased increment has a new identity", §4.16), and two works that
+/// declared the same change shared one identity, the second answered with the first's acceptance. Found by the
+/// many-client load test: 448 refused submits and seven starved clients at ten clients.
+fn increment_identity(work: DbVolumeId, base: u64, doc: &[u8], post_state: &[u8]) -> [u8; 32] {
+  let mut hasher = blake3::Hasher::new();
+  hasher.update(&work.bytes);
+  hasher.update(&base.to_le_bytes());
+  hasher.update(&u64::try_from(doc.len()).unwrap_or(u64::MAX).to_le_bytes());
+  hasher.update(doc);
+  hasher.update(post_state);
+  *hasher.finalize().as_bytes()
 }
 
 /// The conflict windows of a merge outcome, as the wire's [`MergeWindow`](slates_ipc::protocol::MergeWindow)s.

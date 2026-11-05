@@ -6958,6 +6958,13 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > work reads one position per holder rather than rescanning the retained chain. Transfer to a new
 > candidate set and full green takeover remain owed (AUD-14).
 
+> **Status (2026-11-04, the many-client load test).** The service's increment identity is now the data model's:
+> BLAKE3 of the work volume, the base, the ops document and the post-state (the service has no exclusion filter yet).
+> It had hashed only the ops document and post-state, so a rebased resubmit met its cached conflict and two works'
+> identical changes shared one result. A conflict reply now names every differing span of a file, not the first.
+> Measured by `crates/client/examples/load_bench.rs` over Linux v7.4-rc1 (GAPS, the load-test blockquote; bug records
+> of 2026-11-04). Owed: a work as a clone that shares the green's content (each work copies the green whole today).
+
 **Role.** Let many agents work on clones of one shared volume and fold their work back into it
 with no locks, no last-writer-wins, and no inferred merge. Each agent's work becomes an
 increment of declared operations; the green volume's merge task maps the increment through

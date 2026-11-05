@@ -1,5 +1,26 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **The many-client load test (2026-11-04): built; three merge faults fixed; the O(tree) work copy owed.**
+> `crates/client/examples/load_bench.rs` drives N clients, each its own connection, each creating a work volume over one
+> green seeded from Linux v7.4-rc1 (commit 6628e7d4, 97,242 files, 1.8 GB), editing slots with deliberate overlaps,
+> submitting, and resolving every conflict by the §4.16 corrective path. An offline oracle checks every verdict against
+> the rule at a head the verdict could have seen, and the green's final bytes against the replay of the accepted
+> submits. Fixed, each with a failing test first: a pinned large-class file was refused across its extents, so no green
+> could start from the kernel tree; the increment identity left out the work and base, so a resolved resubmit met its
+> cached conflict forever (448 refusals, 7 of 10 clients starved); a conflict named one window per file (572 extra
+> rebases at 100 clients). Over the kernel's `kernel/` directory (16 MB) the oracle now passes at 10 and 100 clients:
+> 300 accepted, 851 conflicts, 0 failures, 0 starved. Open:
+> - **A work copies its green whole, at create and at every accepted submit** (`create_work` and
+>   `reset_accepted_work` in `crates/server/src/verbs.rs`), and every submit rebuilds the whole base (`base_at`,
+>   `compose_volume`) and walks every file for its charge bound. Measured with one client over 16 MB: `CreateWork`
+>   4.2 ms, an accepted submit 14.1 ms, an edit 9 µs. At 100 clients the p50 `CreateWork` was 441 ms and the p50 edit
+>   29 ms, queued behind those verbs on the green's owner shard. Over the whole kernel tree a work is a 1.8 GB copy.
+>   §4.16's work is a clone of a green version (D-5): it must share the green's content and hold only its own changes.
+> - **A sync client gives up on a live, overloaded daemon after its reply deadline** (89 calls at 100 clients:
+>   `no reply within 1000000000 ns`).
+> - The 1,000, 10k and 100k levels, the full kernel tree, a separate daemon process, and the remote primary with two
+>   replicas are not yet run.
+
 > **Audit of 2dc9f3eb..98000d56 (2026-11-03): defects open, Step 9's evidence holds.** Nine commits made on
 > 2026-11-01 and 2026-11-02 were read line by line against this file's rules and Step 9's acceptance. Every CI run they
 > cite was read again: each shows what it is cited for, except one pair of timings A-198 gave the wrong way

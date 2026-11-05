@@ -7769,5 +7769,23 @@ open at the median, it holds in every run, and in run 1 an open and a close are 
 medians sum to for a file cycle (88%). Next, as on x86_64: the daemon's turn under load, and a directory listed by a
 pattern (`fsbench` 10–28×).
 
+## The many-client load test: first measurement (2026-11-04)
 
+The command is the contract: `systemd-run --user --scope -p MemoryMax=24G nice -n 5
+target/release/examples/load_bench --tree <linux-v7.4-rc1>/kernel --clients 1` (and `--clients 10,100`). Hardware:
+Intel Core i9-14900HX, 32 CPUs, 62 GB, Fedora (Linux 6.19.10), shared with CI jobs (load average 14 to 17 at the
+start of each run). Dataset: Linux v7.4-rc1, commit 6628e7d4c6b25c8d18f1345e3a20d21829aae7e4, its `kernel/`
+directory (754 files, 16,321,721 bytes). The daemon is in-process with 31 shards; 8 harness threads sweep the clients;
+each client runs 3 rounds of 4 edits of 64-byte slots, half in 8 hot files. One run each, so these are a baseline, not
+best-of-N. Nanoseconds, p50 / p99 / max:
+
+| Clients | CreateWork | Edit | Submit (accepted) | Submit (conflict) | Rebase |
+|---|---|---|---|---|---|
+| 1 | 4,165,664 (1 sample) | 9,184 / 79,658 / 87,923 | 14,115,364 / 14,115,364 / 17,811,613 | none | none |
+| 10 | 42,568,967 / 76,847,441 / 86,831,428 | 3,446,916 / 82,264,090 / 100,692,913 | 19,525,793 / 43,328,079 / 50,893,769 | 28,853,898 / 46,138,627 / 49,253,440 | 7,980,045 / 50,966,376 / 57,379,897 |
+| 100 | 441,147,581 / 914,320,913 / 924,268,466 | 29,005,852 / 720,346,534 / 1,418,262,595 | 66,284,379 / 764,598,215 / 1,076,229,993 | 91,434,391 / 690,281,228 / 999,006,919 | 48,250,608 / 641,824,301 / 1,169,409,242 |
+
+The oracle passed at 10 (30 accepted, 10 conflicts) and 100 (300 accepted, 851 conflicts). The latency is the work's
+whole-green copy and the submit's whole-base rebuild (GAPS, the load-test blockquote), every one served on the green's
+owner shard; an edit queues behind them.
 
