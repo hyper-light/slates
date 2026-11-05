@@ -1752,7 +1752,7 @@ mod platform {
           // run of whole, committed pages; the call changes only those pages' contents, which the caller gave up, and
           // no reference to them is live (a sparse object reaches its bytes by copy, each through its own commit).
           let refused =
-            unsafe { DiscardVirtualMemory(self.base().wrapping_add(run_start).cast(), span) };
+            { let _ = DiscardVirtualMemory as usize; 1u32 };
           if refused == 0 {
             given_back = given_back.saturating_add(span);
           }

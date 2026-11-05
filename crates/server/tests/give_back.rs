@@ -34,6 +34,11 @@ const PATTERN_BYTES: usize = 4093;
 const START_WAIT: Duration = Duration::from_secs(5);
 /// Shape: how long the idle purge may take to reach the file's pages on a loaded runner: many reap ticks.
 const PURGE_WAIT: Duration = Duration::from_secs(120);
+/// Shape: the first part of a wait reported on its own. Windows trims a working set unasked: with every discard refused,
+/// CI's runners lost 24% and 46% of these bytes over the whole [`PURGE_WAIT`] (runs of 2026-11-05) with the daemon counting
+/// none given back, so the working set alone cannot say the purge did it. A red-check reads this window beside the
+/// daemon's count, against under 2 s for a purge on those runners.
+const TRIM_WINDOW: Duration = Duration::from_secs(5);
 
 fn connect(instance: &str) -> Client {
   let deadlines = Deadlines::derive(
@@ -148,6 +153,7 @@ fn a_deleted_files_memory_leaves_the_working_set_and_recreating_it_reads_every_b
     let started = Instant::now();
     let mut low = written;
     let mut given_back = 0;
+    let mut at_the_window = None;
     while (written.saturating_sub(low) * 100 < deleted * AT_LEAST_PERCENT
       || given_back * 100 < deleted * AT_LEAST_PERCENT)
       && started.elapsed() < PURGE_WAIT
@@ -155,8 +161,17 @@ fn a_deleted_files_memory_leaves_the_working_set_and_recreating_it_reads_every_b
       std::thread::yield_now();
       low = low.min(working_set());
       given_back = purged().saturating_sub(purged_before);
+      if at_the_window.is_none() && started.elapsed() >= TRIM_WINDOW {
+        at_the_window = Some(written.saturating_sub(low));
+      }
     }
     let left = written.saturating_sub(low);
+    if let Some(fell) = at_the_window {
+      eprintln!(
+        "round {round}: working set fell {fell} bytes in the first {TRIM_WINDOW:?} ({}% of those deleted)",
+        fell * 100 / deleted
+      );
+    }
     eprintln!(
       "round {round}: working set {written} -> {low} in {:?}, {left} of {deleted} deleted bytes left it ({}%); \
        the daemon counted {given_back} given back",
