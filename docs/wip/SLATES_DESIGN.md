@@ -13023,7 +13023,8 @@ posted read, `supervise_windows.rs` and `supervise.rs` the Windows wait,
 `supervise.rs` the device hold's log and the published count, `layout.rs` and `segment.rs` the new supervision word),
 `crates/ipc` (`DaemonReport::anchor_hold_refusals`, appended), `crates/server` (`verbs.rs`, the daemon report),
 `crates/cli` (`slates status`'s line; `anchor.rs` the Windows loop's wait; `examples/hold_latency_ab.rs`), `crates/mcp`
-(the daemon status JSON). Bug record:
+(the daemon status JSON), and for the print sweep `crates/machine` (`log.rs`), every shipped crate's root and print site,
+`clippy.toml` and `crates/cluster/Cargo.toml`. Bug record:
 `docs/bugs/2026-11-04-the-unix-device-hold-logged-every-refusal.md`.
 - **The Unix device hold's log is bounded.** A-61's hold counted each refused device message and logged a line for each.
   It now logs through the same `RefusalLog` as A-198's Windows hold: each distinct refusal once over the anchor's life,
@@ -13038,6 +13039,18 @@ posted read, `supervise_windows.rs` and `supervise.rs` the Windows wait,
   A block an older anchor wrote holds zero there.
 - **Rejected:** a status surface on the anchor itself (a second rendezvous and a second protocol for one number), and the
   daemon counting refusals it caused (it cannot see what the anchor refused).
+- **No line a process writes can end it (2026-11-05, found by the release agent).** `eprintln!` and `println!` panic
+  when their write is refused, and a write into a pipe whose reader has gone is refused (Rust ignores `SIGPIPE`). So
+  `slates anchor 2>&1 >/dev/null | head -n 1` aborted the anchor once `head` had its line, and the anchor took its daemon
+  with it. Every line now goes through `slates_machine::log`: a log line that cannot be written is counted and dropped,
+  and supervision goes on.
+  - The counts show in `slates status`: the daemon's own as `log_lines_refused`, and the anchor's, written to the
+    supervision block at offset 200 (`SUP_LOG_REFUSALS`), as `anchor_log_lines_refused`.
+  - A command's output line that cannot be written is the command's failure: it exits 4 and says why.
+  - Every shipped crate's root denies `clippy::print_stdout` and `clippy::print_stderr`; `clippy.toml` allows them in
+    tests.
+  - Rejected: restoring `SIGPIPE`'s default, which would end the anchor silently instead of with a panic.
+  - Bug record: `docs/bugs/2026-11-05-a-closed-log-pipe-ended-the-anchor.md`.
 - **The Windows anchor wakes on its hold channel (2026-11-04, the sibling of A-206's record).** The Windows loop parked
   between supervision steps, up to half the liveness budget (500 ms), and looked at the channel only then, so each WinFsp
   mount's hold and each unmount's release waited up to that long on a healthy anchor; the Unix loop polls its channel.

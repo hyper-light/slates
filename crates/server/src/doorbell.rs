@@ -60,12 +60,14 @@ impl DoorbellThread {
     drop(self.stop.take());
     if let Err(error) = self.waker.ring() {
       // The thread still sees the stop when its wait's bound ends (`platform::POLL_NS`).
-      eprintln!("slates-server: the doorbell stop could not wake its thread: {error}");
+      slates_machine::log_line!(
+        "slates-server: the doorbell stop could not wake its thread: {error}"
+      );
     }
     if let Some(handle) = self.handle.take()
       && handle.join().is_err()
     {
-      eprintln!("slates-server: the doorbell thread panicked");
+      slates_machine::log_line!("slates-server: the doorbell thread panicked");
     }
   }
 }
@@ -93,7 +95,9 @@ fn run(
   let mut seen = match waiter.current() {
     Ok(value) => value,
     Err(error) => {
-      eprintln!("slates-server: the doorbell thread stopped: its word could not be read: {error}");
+      slates_machine::log_line!(
+        "slates-server: the doorbell thread stopped: its word could not be read: {error}"
+      );
       return;
     }
   };
@@ -103,7 +107,9 @@ fn run(
     let now = match waiter.wait(seen, platform::POLL_NS) {
       Ok(now) => now,
       Err(error) => {
-        eprintln!("slates-server: the doorbell thread stopped: its wait was refused: {error}");
+        slates_machine::log_line!(
+          "slates-server: the doorbell thread stopped: its wait was refused: {error}"
+        );
         return;
       }
     };

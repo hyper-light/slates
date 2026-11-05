@@ -196,7 +196,7 @@ fn report_first_budget_refusal(
   if LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
     return;
   }
-  eprintln!(
+  slates_machine::log_line!(
     "slates-server: {dimension} budget refuse-all (first occurrence): requested={requested} \
      config[reserve_per_shard={} shards={} max_inodes={} max_chunks={} metadata_class={}] \
      bytes[capacity={} committed={} retained={} headroom={} replicated={}] \
@@ -3125,18 +3125,20 @@ fn demux_sum(
 /// every shard's part.
 fn daemon_report(state: &mut ShardState, shards: Vec<ShardReport>) -> ReplyBody {
   let now = state.clock.monotonic_ns();
-  let (generation, restarts, heartbeat_age_ns, anchor_hold_refusals) = state
-    .segment
-    .supervision()
-    .map(|s| {
-      (
-        s.generation(),
-        s.restarts(),
-        now.saturating_sub(s.heartbeat_ns()),
-        s.hold_refusals(),
-      )
-    })
-    .unwrap_or((0, 0, 0, 0));
+  let (generation, restarts, heartbeat_age_ns, anchor_hold_refusals, anchor_log_lines_refused) =
+    state
+      .segment
+      .supervision()
+      .map(|s| {
+        (
+          s.generation(),
+          s.restarts(),
+          now.saturating_sub(s.heartbeat_ns()),
+          s.hold_refusals(),
+          s.log_refusals(),
+        )
+      })
+      .unwrap_or((0, 0, 0, 0, 0));
   let fleet = fleet_report(state, &shards);
   // The node's recipient lives on the control shard: its part carries the id, whichever shard answers.
   let control_recipient = shards
@@ -3156,6 +3158,8 @@ fn daemon_report(state: &mut ShardState, shards: Vec<ShardReport>) -> ReplyBody 
       fleet,
       seal: seal_report(state, control_recipient),
       anchor_hold_refusals,
+      log_lines_refused: slates_machine::log::log_lines_refused(),
+      anchor_log_lines_refused,
     }),
   }
 }
@@ -7815,7 +7819,7 @@ pub(crate) fn materialize_taken_over_green(
     state.greens.remove(&id);
     crate::merge_service::release_green_retention(state, id);
     state.count(GREEN_TAKEOVER_MISMATCH, 1);
-    eprintln!(
+    slates_machine::log_line!(
       "slates-server: partition {}: taken-over green {} rebuilt to {:?}, the adopted record names version {} with another identity; refused",
       state.partition,
       record.name,
@@ -8860,7 +8864,7 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
   let held = match crate::content_holder::split_held(&held) {
     Ok(held) => Some(held),
     Err(e) => {
-      eprintln!(
+      slates_machine::log_line!(
         "slates-server: partition {}: held image refused: {e:?}",
         state.partition
       );
@@ -8886,7 +8890,7 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
       state.held_content = hold;
     }
     Err(e) => {
-      eprintln!(
+      slates_machine::log_line!(
         "slates-server: partition {}: held replicas not recovered: {e:?}",
         state.partition
       );
@@ -8928,9 +8932,10 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
           }
           Err(reason) => {
             rebuilt.skipped = rebuilt.skipped.saturating_add(1);
-            eprintln!(
+            slates_machine::log_line!(
               "slates-server: partition {}: volume {} not rebuilt: {reason}",
-              state.partition, record.name
+              state.partition,
+              record.name
             );
             continue;
           }
@@ -9001,7 +9006,7 @@ fn claim_images(
   match slates_vfs::recover::Claims::prepare_with(&mut state.store, marked) {
     Ok(claims) => Some(claims),
     Err(e) => {
-      eprintln!(
+      slates_machine::log_line!(
         "slates-server: partition {}: the recovery images' blocks were not claimed, no volume is rebuilt: {e}",
         state.partition
       );
@@ -9021,7 +9026,7 @@ fn sweep_claims(state: &mut ShardState, claims: Option<slates_vfs::recover::Clai
   match claims.sweep(&mut state.store, volumes) {
     Ok(freed) => freed,
     Err(e) => {
-      eprintln!(
+      slates_machine::log_line!(
         "slates-server: partition {}: the recovery sweep stopped: {e}",
         state.partition
       );
@@ -9197,9 +9202,10 @@ fn fence_green(
   crate::merge_service::release_green_retention(state, record.id);
   state.fenced_greens.insert(record.id, fence);
   state.count(GREEN_FENCED, 1);
-  eprintln!(
+  slates_machine::log_line!(
     "slates-server: partition {}: green {} fenced, its recovered history is not what was acknowledged: {fence:?}",
-    state.partition, record.name
+    state.partition,
+    record.name
   );
 }
 
@@ -9340,7 +9346,7 @@ fn recover_images(state: &mut ShardState) -> RecoveredImages {
     }
     Ok((None, _)) => RecoveredImages::default(),
     Err(e) => {
-      eprintln!(
+      slates_machine::log_line!(
         "slates-server: partition {}: shard image unreadable: {e}",
         state.partition
       );
@@ -9445,7 +9451,7 @@ fn publish_captured(state: &mut ShardState) -> Result<Published, slates_vfs::Vfs
 /// Counts and logs a refused publication, returning its refusal.
 fn publish_refused(state: &ShardState, e: slates_vfs::VfsError) -> slates_vfs::VfsError {
   crate::daemon::PUBLISH_REFUSED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-  eprintln!(
+  slates_machine::log_line!(
     "slates-server: partition {}: shard image not published: {e}",
     state.partition
   );
@@ -9463,7 +9469,7 @@ fn count_skipped(state: &mut ShardState, id: DbVolumeId, e: &slates_vfs::VfsErro
   *skipped = skipped.saturating_add(1);
   if *skipped == 1 {
     let volume: String = id.bytes.iter().map(|b| format!("{b:02x}")).collect();
-    eprintln!(
+    slates_machine::log_line!(
       "slates-server: partition {}: volume {volume} was not imaged, skipped: {e} (first on this shard; later \
        ones are counted as {})",
       state.partition,

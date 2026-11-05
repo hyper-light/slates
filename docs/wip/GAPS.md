@@ -74,6 +74,33 @@
 > foreign node holds the owner dead; no assertion changed. Interleaved on one busy CPU: before 2/150, after 0/150.
 > Record: `docs/bugs/2026-11-05-a-lookup-before-the-owners-death-was-known-never-ran-its-round.md`.
 
+> **No print macro panics on a closed pipe (2026-11-05, A-213; found by the release agent).** `slates anchor 2>&1
+> >/dev/null | head -n 1` exited 134 once `head` had its line: `eprintln!` and `println!` panic on a refused write, and a
+> pipe whose reader has gone refuses with `EPIPE`. Every shipped site, 266 in all, now writes through
+> `slates_machine::log_line!` or `out_line!`. A refused write is counted and dropped. Both counts show in `slates status`:
+> `log_lines_refused`, the daemon's own, and `anchor_log_lines_refused`, which the anchor writes to the segment. A command
+> whose output was refused exits 4. Every shipped crate's root denies `clippy::print_stdout` and `clippy::print_stderr`
+> outside tests. adacachy, 2026-11-05: the real anchor whose log reader went away ended with exit 101 (debug build) before
+> the fix, and after it kept supervising a killed daemon's successor. CI run ids: pending. **Owed:** `xtask` (148 sites),
+> `slates-guest-probe` (11) and `slates-test-seeds` (1) keep their print macros. They do not ship, and a closed pipe still
+> panics them. Record: `docs/bugs/2026-11-05-a-closed-log-pipe-ended-the-anchor.md`.
+
+> **The anchor's hold refusals: a bounded Unix log, and a count in `slates status` (2026-11-04, A-213; siblings of
+> audit step 3).** The Unix device hold logged a line per refused message, unbounded; it now logs each distinct refusal
+> once (`RefusalLog`, as the Windows hold does) and counts every one. Every refusal on either platform's hold channel
+> is published in the segment's supervision block and reported by `slates status` as `anchor_hold_refusals`. adacachy,
+> 2026-11-04: 20 bad device messages gave 20 counted and 20 log lines before the change, 20 and 2 after; through a real
+> supervisor over the real `slates daemon`, `slates status` says `anchor_hold_refusals: 20`. On CI's `ubuntu-latest` and
+> `macos-latest`, both tests fail on main's sources (20 log lines; no `anchor_hold_refusals` line; run 41984065875) and
+> pass with the fix (run 41984065750). Record: `docs/bugs/2026-11-04-the-unix-device-hold-logged-every-refusal.md`.
+> - **The Windows anchor wakes on its hold channel**, a read it keeps posted, and on its daemon's exit, where it parked up
+>   to 500 ms between looks at the channel (A-206's owed item). Five holds through the real supervisor under a 4 s pause:
+>   3,990 to 4,020 ms each before, on `windows-latest` and `windows-11-arm`, 3 runs each (run 41984349301); under 1 ms each
+>   after, 3 runs each (run 41985213489), with the 20-bad-message tests (0 anchor exits) green in the same runs. A WinFsp
+>   mount's median fell from 487 to 10.5 ms on x86_64 and from 445 to 15.8 ms on arm64, an unmount's from 505 to 15.7 ms
+>   and from 507 to 27.0 ms, 20 interleaved rounds per build (run 41985454044; BENCHMARKS, "What a WinFsp mount and unmount
+>   wait for the Windows anchor").
+
 > **The binary release lane (2026-11-04, A-210, Appendix B.2).** `release.yml` now builds `slates` natively for
 > seven targets: macOS arm64, Linux x86_64 and arm64 (glibc, and static musl), and Windows x86_64 and arm64 with the C
 > runtime linked statically. It runs each built binary on its own runner (`cargo run -p xtask --bin release -- smoke`: version,
