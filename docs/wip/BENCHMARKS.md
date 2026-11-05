@@ -8966,3 +8966,16 @@ What it means:
   p50 is 60–75 µs in both arms, the create cost GAPS already records.
 - **A-216 cuts the parked tail on both:** jupiter's parked p99 falls 2.1–4.6×, macOS's 8-client p99 1.6–23×. A
   parked or contended acknowledgement no longer waits on every other shard.
+
+### A-217: a green's origin as a reference, per-green memory (2026-11-05)
+
+`load_bench --tree <linux-v7.4-rc1>/fs --clients 1`, interleaved, the `d951cd1e` build (origin recorded as bytes) and
+the A-217 build, same machine, load 30 to 34, each under `systemd-run --user --scope -p MemoryMax=24G`:
+
+| Build | Peak RSS (KiB), runs 1 / 2 / 3 | CreateGreen (ns), runs 1 / 2 / 3 |
+|---|---|---|
+| `d951cd1e` | 549,520 / 580,976 / 580,692 | 444,059,916 / 455,703,907 / 415,498,814 |
+| A-217 | 233,492 / 225,776 / 227,092 | 236,561,436 / 164,216,222 / 157,915,124 |
+
+Best of three: 549,520 to 225,776 KiB (59 % less, about 7 times the tree's 48,376,238 bytes), CreateGreen 415 ms to
+158 ms. The oracle passed in all six runs.

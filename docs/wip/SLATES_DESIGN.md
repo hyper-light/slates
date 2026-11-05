@@ -8912,6 +8912,31 @@ Applied in the same change to: D-2, §4.4 (attach forms), §4.6, §4.7 (macOS re
 - Consequences: the macOS artifact becomes an app bundle containing the daemon and the extension, signed with one team identifier and an app group so the sandboxed extension can share the ring region; chosen-path attaches on macOS become separate URL-identified mounts; xattrs and hard links become available on macOS; the Phase 4 task list gains the spike as its first item; GAPS gains D-O9.
 - What it does not change: Linux and Windows bridges; the single-root model on Linux and Windows; the refusal of symlinks and disk-backed mount-point directories.
 
+### A-217 — A green's origin is a reference to the base snapshot it holds, not a copy of the tree in the partition (accepted 2026-11-05, the supervisor's decision (a))
+Applied in the same change to: §4.16's status, A-9's "recorded durably" (now: recorded as a reference and held), GAPS
+(the load-test blockquote), BENCHMARKS, `crates/db` (`Op::GreenOriginHeld`, `OriginRef`,
+`PartitionSnapshot::green_origin_refs`), `crates/server` (`verbs.rs`: `create_green`, `hold_origin_snapshot`,
+`release_origin_snapshot`, `replay_green`, `recorded_pins`, the recovery order, `destroy`; `merge_service.rs`:
+`origin_identity`, `walk_held_origin`, `inputs_of`, `destroy_merge_volume`, `GreenFence::OriginUnavailable`) and
+`crates/server/tests/recovery.rs` (`a_greens_base_snapshot_is_held_and_its_origin_recovered_from_it`).
+- **What was there.** `CreateGreen { base }` walked the snapshot into an origin and recorded its encoded bytes in the
+  partition (`GreenOriginated`), counted against the partition's merge byte budget and rewritten by every partition
+  snapshot; nothing held the snapshot, so its destroy succeeded under a green that came from it. Content is RAM-only, and
+  a kernel-sized origin copied per green cannot reach the scale the load test drives.
+- **The rule.** The partition records the base volume, the snapshot, and the BLAKE3 of the origin's canonical encoding
+  (`GreenOriginHeld`). The green pins the snapshot in its base volume at create, as a clone pins its origin; the
+  snapshot's destroy is refused while the pin stands, and so is the base volume's destroy while any green names one of
+  its snapshots. The pin is released when the green's destroy is recorded. Recovery rebuilds plain volumes first, then
+  greens, then works; a green walks its held snapshot again, refuses (fences) a walk whose identity differs
+  (`OriginCorrupt`) or a base not recovered (`OriginUnavailable`), and recovery's pin reconciliation counts the green's
+  pin with clones' and image volumes'. A record placed at f > 0 encodes version 0's inputs from the held snapshot when it
+  is placed.
+- **Measured** (BENCHMARKS): one client over the kernel's `fs/` (48 MB), interleaved best of three, peak RSS 549,520 KiB
+  before and 225,776 KiB after; `CreateGreen` 415,498,814 ns before and 157,915,124 ns after.
+- **Owed.** A green taken over by another host still records its origin as bytes (the successor holds no base snapshot;
+  raft's fleet path). The engine still holds the origin twice (current content and history), and the overlay holds the
+  pinned copy.
+
 ### A-2 (accepted 2026-09-04) — Replication model recast in EdenFS/Mononoke terms
 Applied in the same change to: D-14, D-18, Part 1.1, Part 2.1, Part 2.3, §4.4 (owner loss), §4.8, §4.10, Phase 8, Part 7, GAPS.
 - Changes D-14, D-18, §4.8, §4.10: three state classes with three mechanisms. Sealed content and manifests replicate by identity through a WAL-first, write-quorum W-of-N multiplex with a healer (Mononoke's mechanism), W = f+1 from the failure-domain tree. Pointers (head snapshot, lease and epoch, placement, membership) go through the one consensus group. Live working state is owner-local (the EdenFS overlay model), made durable by auto-sealing into snapshots at a cadence derived from the measured mutation rate and the operator's loss-window SLO; live op-log shipping to f+1 backups becomes an opt-in per-volume policy rather than the default, and "Raft per shard" is dropped.

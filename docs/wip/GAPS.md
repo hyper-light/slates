@@ -37,6 +37,24 @@
 > - **Tried and not taken:** populating fresh pages in batches or from a second thread (run 41987962954); filling them
 >   by `pwrite` into the content object (1.9× per fresh page), which R1's lint wall forbids.
 
+> **The many-client load test (loadtest; 2026-11-04 and 2026-11-05): built, its faults fixed or open below.**
+> `crates/client/examples/load_bench.rs` drives N clients over one green seeded from Linux v7.4-rc1 (commit 6628e7d4,
+> 97,242 files, 1.8 GB): overlapping slot edits, a non-idempotent append per client, submits, the corrective path on
+> every conflict, a daemon restart ridden by reconnect and resend; an offline oracle judges every verdict, the green's
+> bytes and each client's own file. Fixed, each with a failing test first: every conflicting window of a file is named
+> (it was the first); a pinned large-class file reads across its extents (no green could start from the kernel tree);
+> A-217, a green's origin is a reference to the base snapshot it holds (peak RSS over `fs/` 549,520 to 225,776 KiB,
+> `CreateGreen` 415 to 158 ms, best of three; `a_greens_base_snapshot_is_held_and_its_origin_recovered_from_it`). Open:
+> - **A volume promised the whole version slab is refused at recovery** (bug record of 2026-11-05): a recovered
+>   snapshot rebuilds its directories privately, one retained version slot each the live volume did not hold (465,831
+>   committed slots before a restart, 465,832 after). Fix owed in `crates/vfs/src/recover.rs`.
+> - **Pinning a tree of many files grows memory far faster than its files, in one unsliced verb**: `kernel/` (754
+>   files) 86,848 KiB, `fs/` (2,365) about 226,000 KiB in 3 of 3 runs, `Documentation/` (11,608, 59 MB) past 12 GB and
+>   `arch/` (18,944, 127 MB) past 9.9 GB inside the pin, which also outlasts the client's 1 s reply deadline; the whole
+>   kernel is killed at a 24 GB cap in its pin. Not root-caused; samples show `Overlay::read_whole` → `copy_up`.
+> - **Memory grows 20 to 29 MB a same-machine connection** (the per-client ring region): the 10k-100k levels go over
+>   the network transport instead (the supervisor's decision (b), 2026-11-05), not yet run.
+
 
 
 > **Merge: the same edit from two works was one increment; fixed 2026-11-04 (§4.16, agents/perf).** The increment's
