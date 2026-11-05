@@ -78,13 +78,10 @@ fn a_purged_arena_leaves_the_working_set_and_reads_zeros_on_reuse(what: &str, re
     arena.free(*chunk).unwrap();
   }
   let written = working_set();
-  assert_eq!(
-    purge_all(&mut arena),
-    FREED,
-    "{what}: the purge's own count"
-  );
+  let given_back = purge_all(&mut arena);
   let purged = working_set();
   assert_most_of_it_left(what, written, purged);
+  assert_eq!(given_back, FREED, "{what}: the purge's own count");
   assert!(
     arena.bytes(live).unwrap().iter().all(|byte| *byte == 0x5A),
     "{what}: the live chunk kept its bytes through the purge"
@@ -150,8 +147,9 @@ fn a_discarded_object_range_leaves_the_working_set_and_a_later_write_keeps_its_p
     object.write(at, &piece).unwrap();
   }
   let written = working_set();
-  assert_eq!(object.discard(FROM, FREED).unwrap(), FREED);
+  let given_back = object.discard(FROM, FREED).unwrap();
   assert_most_of_it_left("the sparse object", written, working_set());
+  assert_eq!(given_back, FREED, "the sparse object's own count");
 
   let mut later = SparseObject::open(&object.handoff().unwrap(), LAYOUT, Words::new()).unwrap();
   later.write(FROM + 100, NOTE).unwrap();
