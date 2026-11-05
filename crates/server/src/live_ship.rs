@@ -741,7 +741,7 @@ fn payload(
   let lineage = crate::seal_keys::lineage(state, id, account).ok()?;
   let namer = crate::seal_keys::namer(state, id, account).ok()?;
   let chunk = slates_archive::Archive::raw_chunk(body);
-  let segment = u32::try_from(rustix::param::page_size()).ok()?;
+  let segment = u32::try_from(state.config.page).ok()?;
   let sealed = slates_cluster::sealed::seal_chunk(&lineage, &namer, &chunk, segment).ok()?;
   let sealing = if whole {
     let owner = state.db.partition().volume(id)?.owner.clone();
@@ -1496,7 +1496,7 @@ fn rebuild(
     }
   }
   let image = image.ok_or(LIVE_TAKEOVER_REFUSED)?;
-  archive_of(&image, &runs, ObjectId(id.bytes).local())
+  archive_of(&image, &runs, ObjectId(id.bytes).local(), state.config.page)
 }
 
 /// One payload's body, opened under the volume's lineage key when sealed.
@@ -1530,11 +1530,13 @@ fn open_payload(
 /// A volume image and the content its extents name, laid out as an archive (the export's layout,
 /// `slates_vfs::export`): each directory's entries under it, each file's extents over chunks of their bytes, a
 /// symlink as a file of its target; holes stay holes. `volume_id` is the archive's header field: the volume's
-/// per-creator number (`ObjectId::local`), informational to a restore.
+/// per-creator number (`ObjectId::local`), informational to a restore; `base_page` is the header's base page, the
+/// daemon's (`DaemonConfig::page`, measured once at boot).
 fn archive_of(
   image: &slates_vfs::recover::VolumeImage,
   runs: &BTreeMap<(u64, u64), Vec<u8>>,
   volume_id: u64,
+  base_page: usize,
 ) -> Result<slates_archive::Archive, &'static str> {
   let inodes: BTreeMap<u64, &InodeImage> =
     image.inodes.iter().map(|inode| (inode.no, inode)).collect();
@@ -1549,7 +1551,7 @@ fn archive_of(
     .max()
     .unwrap_or(0);
   Ok(slates_archive::Archive {
-    base_page_size: u32::try_from(rustix::param::page_size()).unwrap_or(u32::MAX),
+    base_page_size: u32::try_from(base_page).unwrap_or(u32::MAX),
     chunk_min: chunk_max,
     chunk_max,
     created_unix: 0,
