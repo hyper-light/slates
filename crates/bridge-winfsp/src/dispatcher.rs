@@ -161,6 +161,7 @@ impl Worker {
           }
           wake.wake_by_ref();
         }
+        crate::phase::dump();
         Ok(())
       })
       .map_err(|_| WinFspError::MountThread)?;
@@ -252,6 +253,8 @@ fn transaction(
   output: &mut [u8],
   intents: &mut crate::purge_intents::Intents,
 ) -> Result<usize, WinFspError> {
+  let event_started = std::time::Instant::now();
+  let is_response = output.is_empty();
   // SAFETY: unnamed manual-reset event; no security descriptor or initial owner is borrowed.
   let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
   if event.is_null() {
@@ -259,6 +262,7 @@ fn transaction(
   }
   // SAFETY: CreateEventW returned a fresh handle; this value takes its ownership exactly once.
   let event = unsafe { OwnedHandle::from_raw_handle(event) };
+  crate::phase::note("event_create", 0, event_started);
   let mut overlapped = OVERLAPPED {
     hEvent: event.as_raw_handle(),
     ..OVERLAPPED::default()
@@ -267,6 +271,7 @@ fn transaction(
   let input_len = u32::try_from(input.len()).map_err(|_| WinFspError::Capture(Refusal::Length))?;
   let output_len =
     u32::try_from(output.len()).map_err(|_| WinFspError::Capture(Refusal::Length))?;
+  let call_started = std::time::Instant::now();
   // SAFETY: all buffers and overlapped storage remain alive and unmoved until the transaction has completed below;
   // the control belongs to the live DLL object, which cannot be deleted before this worker is joined.
   let accepted = unsafe {
@@ -289,6 +294,7 @@ fn transaction(
       &mut overlapped,
     )
   };
+  crate::phase::note(if accepted != 0 { if is_response { "dioc_resp_done" } else { "dioc_recv_done" } } else if is_response { "dioc_resp_pending" } else { "dioc_recv_pending" }, 0, call_started);
   if accepted == 0 {
     let error = std::io::Error::last_os_error();
     if error.raw_os_error() != i32::try_from(ERROR_IO_PENDING).ok() {
@@ -306,6 +312,7 @@ fn transaction(
     // Even a failed event wait or channel drain cannot return before the control I/O has settled its borrowed pages.
     progress?;
   }
+  crate::phase::note(if is_response { "txn_resp_total" } else { "txn_recv_total" }, 0, event_started);
   intents.progress()?;
   usize::try_from(done).map_err(|_| WinFspError::Capture(Refusal::Length))
 }
@@ -321,6 +328,7 @@ fn operation(
   packet: &mut Packet,
   private: &mut PrivateOpens,
 ) -> Result<usize, WinFspError> {
+  let clear_started = std::time::Instant::now();
   let mut working = Packet([0; RESPONSE_MAX]);
   working
     .0
@@ -328,6 +336,7 @@ fn operation(
     .ok_or(WinFspError::Capture(Refusal::Length))?
     .copy_from_slice(request.bytes());
   packet.0.fill(0);
+  crate::phase::note("packet_clear", 0, clear_started);
   let header = request.cancelled_response().map_err(WinFspError::Capture)?;
   packet
     .0
@@ -359,6 +368,7 @@ fn operation(
   };
   PRIVATE_PURGE.set(purge);
   CURRENT_HINT.set(request.hint());
+  let callback_started = std::time::Instant::now();
   // SAFETY: callback is the DLL's initialized operation for this checked kind; both packet addresses have native
   // eight-byte alignment and protocol maximum capacity, and file_system stays live throughout the synchronous call.
   let callback_status = unsafe {
@@ -368,6 +378,7 @@ fn operation(
       packet.0.as_mut_ptr().cast(),
     )
   };
+  crate::phase::note("callback", request.kind(), callback_started);
   let terminal_status = TERMINAL_REFUSAL.replace(0);
   let status = if callback_status == 0 {
     terminal_status
@@ -473,15 +484,20 @@ fn settle(
         .0
         .get(..length)
         .ok_or(WinFspError::Capture(Refusal::Length))?;
+      let record_started = std::time::Instant::now();
       batch
         .record_response(&request, response)
         .map_err(WinFspError::Capture)?;
+      crate::phase::note("record", request.kind(), record_started);
+      let names_started = std::time::Instant::now();
       if let Some((from, to)) = request
         .successful_rename(response)
         .map_err(WinFspError::Capture)?
       {
         crate::host::rename_open_names(confirmations, wake, &from, &to, bound)?;
       }
+      crate::phase::note("rename_names", request.kind(), names_started);
+      let response_started = std::time::Instant::now();
       transaction(
         control,
         TRANSACT_BATCH,
@@ -489,10 +505,13 @@ fn settle(
         &mut [],
         &mut private.intents,
       )?;
+      crate::phase::note("response", request.kind(), response_started);
       if let Some((_, context)) =
         inflight::opened_context(response).map_err(WinFspError::Capture)?
       {
+        let confirm_started = std::time::Instant::now();
         crate::host::confirm_open(confirmations, wake, context)?;
+        crate::phase::note("confirm", 0, confirm_started);
       }
     }
     batch
@@ -574,7 +593,9 @@ fn receive_loop(
     if is_stopped(&stopped) {
       return Ok(());
     }
+    let begin_started = std::time::Instant::now();
     let mut receiving = view.capture()?.begin().map_err(WinFspError::Capture)?;
+    crate::phase::note("begin_clear", 0, begin_started);
     transaction(
       control,
       TRANSACT_BATCH,
@@ -586,7 +607,9 @@ fn receive_loop(
     if is_stopped(&stopped) {
       return Ok(());
     }
+    let parse_started = std::time::Instant::now();
     let mut batch = receiving.received().map_err(WinFspError::Capture)?;
+    crate::phase::note("parse", 0, parse_started);
     settle(
       file_system,
       &mut batch,

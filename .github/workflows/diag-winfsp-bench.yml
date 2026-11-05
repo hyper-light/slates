@@ -1,0 +1,115 @@
+name: DIAG the WinFsp phases, both arms timed (not for main)
+
+# Audit plan step 7: slates at 71cf09ac (WinFsp's DLL dispatcher, two threads) and this commit (the hand-written
+# receiver), each with its own daemon and drive, one mount_bench rounding over both. Each runner's output goes to its
+# own results branch as each run ends, and to an artifact.
+
+on:
+  push:
+    branches: ['diag-winfsp-bench-[0-9]*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  OLD_COMMIT: 3ea600afbcba627d8e8f2c6ab745d9482f044fa0
+
+jobs:
+  ab:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            msvc: x64
+          - runner: windows-11-arm
+            msvc: arm64
+    name: receiver A/B on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 350
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (x86_64)
+        if: matrix.msvc == 'x64'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64)
+        if: matrix.msvc == 'arm64'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Install WinFsp, and check it installed
+        shell: pwsh
+        run: |
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            choco install winfsp -y --no-progress
+            if (Test-Path "C:\Program Files (x86)\WinFsp\bin") { break }
+            Start-Sleep -Seconds 30
+          }
+          if (-not (Test-Path "C:\Program Files (x86)\WinFsp\bin")) { Write-Error "WinFsp did not install"; exit 1 }
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "image $env:ImageOS $env:ImageVersion; $env:NUMBER_OF_PROCESSORS CPUs; $env:PROCESSOR_ARCHITECTURE" | Out-File -FilePath image.txt -Encoding utf8
+      - name: Build both arms
+        shell: bash
+        run: |
+          mkdir -p ab-bin/old ab-bin/new
+          cargo build --release --locked -p slates-cli --bin slates --example mount_bench
+          cp target/release/slates.exe ab-bin/new/slates.exe
+          cp target/release/examples/mount_bench.exe ab-bin/mount_bench.exe
+          git fetch --depth=1 origin "$OLD_COMMIT"
+          git worktree add --detach "$RUNNER_TEMP/old" "$OLD_COMMIT"
+          (cd "$RUNNER_TEMP/old" && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo build --release --locked -p slates-cli --bin slates)
+          cp target/release/slates.exe ab-bin/old/slates.exe
+      - name: The interleaved mount benchmark
+        shell: bash
+        env:
+          RESULTS_BRANCH: diag-winfsp-bench-results-${{ github.run_id }}-${{ matrix.runner }}
+        run: |
+          cat > "$RUNNER_TEMP/publish.sh" <<'EOF'
+          #!/bin/bash
+          # One commit per finished run on the results branch; a failed publish is reported and does not end the benchmark.
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          cd "$GITHUB_WORKSPACE" || exit 0
+          blob=$(git hash-object -w ab.txt) || exit 0
+          tree=$(printf '100644 blob %s\tab.txt\n' "$blob" | git mktree) || exit 0
+          parent=$(cat "$RUNNER_TEMP/results-parent" 2>/dev/null || true)
+          commit=$(git commit-tree "$tree" ${parent:+-p "$parent"} -m "results of run $GITHUB_RUN_ID") || exit 0
+          if git push origin "$commit:refs/heads/$RESULTS_BRANCH"; then
+            echo "$commit" > "$RUNNER_TEMP/results-parent"
+          else
+            echo "::warning::could not publish the results"
+          fi
+          EOF
+          chmod +x "$RUNNER_TEMP/publish.sh"
+          {
+            echo "# old $OLD_COMMIT, new $(git rev-parse HEAD), $(date -u +%FT%TZ)"
+            tr -d '\r\000' < image.txt | sed 's/^\xef\xbb\xbf//' 
+            cmd //c ver | tr -d '\r' | grep -v '^$'
+            OLD_SLATES=ab-bin/old/slates.exe NEW_SLATES=ab-bin/new/slates.exe BENCH=ab-bin/mount_bench.exe \
+              OLD_NAME=dll NEW_NAME=receiver RUNS=2 ROUNDS=3 SPINNERS_PER_CPU=2 AFTER_RUN="$RUNNER_TEMP/publish.sh" \
+              bash docs/wip/bench/fsbench/windows-ab.sh
+          } 2>&1 | tee ab.txt
+      - name: Publish whatever was measured
+        if: always()
+        shell: bash
+        env:
+          RESULTS_BRANCH: diag-winfsp-bench-results-${{ github.run_id }}-${{ matrix.runner }}
+        run: |
+          if [ -f ab.txt ] && [ -f "$RUNNER_TEMP/publish.sh" ]; then bash "$RUNNER_TEMP/publish.sh"; fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: receiver-ab-${{ matrix.runner }}
+          path: ab.txt
