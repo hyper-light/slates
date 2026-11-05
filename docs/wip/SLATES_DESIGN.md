@@ -5550,10 +5550,24 @@ first window after attach (window derived from the measured attach-to-first-buil
 next attach of the same base prefetches that set in the background, bounded by the attachment's
 budget; the policy is observe-first until a minimum number of attaches has been seen.
 
-**Live shipping (opt-in).** A volume created with policy `live-shipped` ships its op log to f+1
+**Live shipping (opt-in; A-199 states the log, its acknowledgement and its takeover).** A volume created with policy `live-shipped` ships its op log to f+1
 of its candidates and acknowledges writes at f+1; the backups apply entries in order and the
 takeover successor is one of them, so promotion has no loss window; replica lag beyond a window
 derived from the measured apply rate applies credit backpressure to that volume's writers only.
+
+> **Status (2026-11-04, the log built and checked; not yet on the wire or in the daemon).** A-199's log is
+> `crates/db/src/live.rs`: `Shipper` (the owner's chain, credit, retained tail and durable position), `Replica` (a
+> holder's fence and head, guard-then-apply), `adopt` (phase one's choice), and the entry, install and reply
+> encodings with hostile-input tests. `crates/db/tests/live.rs` runs it under a nemesis (loss, duplication,
+> reordering, partitions, holder crashes, owner loss with takeover, a superseded owner shipping on, holders that learn
+> a takeover late) for 200 seeds × 3,000 steps at f=1 and f=2, checking Agreement, NoLoss and StaleNeverCommits after
+> every step and Convergence after healing. All held, with 110 and 241 takeovers, 231 and 416 installs, 2,020 and 5,431
+> stale-epoch refusals, and 4,600 and 2,871 durable positions. Red-checked by mutation: adopting the lowest-ranked
+> report fails NoLoss at once, and removing both the fence and the owner check fails StaleNeverCommits. The
+> stale-refusal counter found one defect before any history check did: a holder refused a superseded owner as
+> unauthorized before checking its fence, so that owner never learned it was fenced and shipped on. The fence is now
+> checked first. Owed: the log over the fleet transport, measured; the daemon's publications shipped through it, with
+> barriers answered at durability and phase one in the takeover round; real-process chaos.
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
 writer's ring to its local owner shard is the latency floor. When write-intent attachments from
@@ -12804,6 +12818,59 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
 - **Arm64 Windows proven** since (2026-10-27): the direct-map client tests, 20 of 20, on CI's `windows-11-arm` (run
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
+
+### A-199 — Live shipping ships the owner's publications as a fenced, hash-chained log, acknowledged when f holders and the owner hold it (accepted 2026-11-04; Ada's goal of 2026-11-04, "run replicas of the filesystem server … replication <1 ms")
+
+**Why.** §4.10 says a `live-shipped` volume "ships its op log to f+1 of its candidates and acknowledges writes at f+1",
+and AC-8.3 holds such a volume to no loss window. The design does not say what the op log is, what an
+acknowledgement binds, how a replica that missed entries catches up, or how a takeover picks the replica to promote.
+This amendment says so before any of it is built. Nothing of live shipping exists in code (GAPS, 2026-11-04).
+
+**What is shipped.** The owner's own barrier stream for the volume: each publication `publish_shard` makes of it
+(a delta, A-68, or a checkpoint image), together with the bytes of the chunk windows the publication names that the
+replica does not hold. That is the stream a restart already replays from the anchor (D-18), and its two encodings are
+already held equal by the publication oracle (`check_publication`), so a replica applies exactly what the owner's
+own recovery would. The vfs journal (§4.5) is not the op log here: it carries no bytes.
+
+**The log.** Entries are numbered densely from a checkpoint at position 0. Entry `n` carries the owner's host epoch
+`e`, the identity of entry `n − 1`, and its payload; its identity is the BLAKE3 of all four. A holder accepts entry
+`n` only under an epoch at least its fence for that owner's host (§4.8), and only on top of an entry `n − 1` whose
+identity matches; a checkpoint is accepted at any position under the same fence. A holder never rewrites what it
+applied: an entry whose predecessor does not match is refused with the holder's last position and identity, and the
+owner answers with its next checkpoint. An acknowledgement names the holder, the position and the identity it holds
+there, so by the chain it vouches for the whole prefix.
+
+**When a write is promised.** Every entry is sent to all `2f` other candidates, as a record is (§4.8). It is durable
+once the owner and `f` of them hold it (`f + 1` of the `2f + 1` candidates, §4.8's commit rule), so §4.10's "f+1"
+counts the owner among them. The barrier that produced it (an NFS `COMMIT`, an `fsync`, a control verb's
+publication) answers only then. A write no barrier covered was never promised to survive the owner (§4.6), and
+still is not. No consensus or coordination call is on this path (D-14): the owner is the single writer under its
+epoch, as for every register.
+
+**Backpressure (AC-8.9).** Entries not yet durable are bounded by a credit derived from the measured apply rate and
+the measured holder round trip (Little's law: the entries in flight are the rate times the time to acknowledge). A
+publication past the credit waits for credit; it is never queued without bound. A holder that falls further behind
+than the owner's retained tail is caught up by a checkpoint, never by an unbounded tail.
+
+**Takeover.** The group's takeover (§4.8 "Promotion and takeover") names the successor among the candidates. In its
+phase one every answering holder raises its fence to the new epoch and reports, per live-shipped volume, the epoch of
+its last entry, its position and that entry's identity. The successor adopts the report with the greatest
+(last epoch, position), which is Raft's up-to-date rule (Ongaro, thesis §3.6.1). A durable entry is held by `f + 1`
+candidates and phase one's answers come from `f + 1` candidates, so the two sets meet in at least one live holder of
+it whenever at most `f` candidates are lost (the owner among them); a holder whose last entry is under a later epoch received a log its owner adopted the same way. The successor
+serves from the adopted replica, which loses no acknowledged write (AC-8.3), and re-ships from there under its own
+epoch: a holder holding an entry the old owner never made durable fails the chain and takes a checkpoint.
+
+**Laptop degenerate.** `f = 0`: no holders, every entry durable at the owner's own publication; the same code (R8).
+
+**Testing.** The pure log (owner, holder, phase one) is a sans-io module tested against a model under a deterministic
+nemesis (loss, duplication, reordering, delay, partitions, holder and owner crashes, takeovers), with the register
+invariants as history checks: TotalOrder (every holder's chain is a prefix of the one history of durable entries),
+NoLoss (every durable entry survives every takeover), StaleNeverCommits (no entry of a fenced epoch becomes durable).
+Then the real transport, measured; then the daemon and real processes under chaos.
+
+**Applied in the same change to:** this log only. §4.10's "Live shipping" paragraph, AC-8.3 and AC-8.9 are read
+through it; their status notes follow each built slice.
 
 ### A-198 — A WinFsp mount outlives its daemon: the anchor holds the volume's control handle, the drive's link and the mount's ledger, and the next daemon serves the held volume (accepted 2026-11-01, Step 9 of the VFS and DAX plan; built and measured 2026-11-02)
 Applied in the same change to: GAPS (gap 2 of the platform inventory). The build applies it to §4.6 "Windows",
