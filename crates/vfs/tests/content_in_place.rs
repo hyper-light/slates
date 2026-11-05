@@ -609,6 +609,15 @@ impl slates_vfs::content::ChunkCipher for StreamCipher {
   fn key_for_volume(&mut self, _: [u8; 16]) -> Result<u32, VfsError> {
     Ok(SEAL_KEY)
   }
+  fn hold(&mut self, _: u32) -> Result<(), VfsError> {
+    Ok(())
+  }
+  fn release(&mut self, _: u32) -> Result<(), VfsError> {
+    Ok(())
+  }
+  fn keys_held(&self) -> usize {
+    1
+  }
 }
 
 /// Shape: the key the sealing tests' volumes seal under.
@@ -932,5 +941,191 @@ fn a_volume_that_records_no_changes_is_never_clean_after_a_write() {
   assert!(
     !vol.is_clean(&source),
     "a write after the publication is not clean"
+  );
+}
+
+/// A test cipher that keeps keys as the server's does (A-208): a key per volume made by `key_for_volume` and held once
+/// for the volume's life, a key a recovery image names registered by `reference`, each held again by every sealed
+/// chunk record the store keeps under it, and each gone with its last hold. Its `open` refuses a key that is gone, so a
+/// key dropped while a chunk sealed under it lives fails that chunk's read. `life` stands for the daemon's salt: a
+/// volume keyed in another life gets another key.
+struct HoldingCipher {
+  life: u8,
+  next: u32,
+  held: std::collections::BTreeMap<u32, (slates_vfs::content::KeyIdentity, u64)>,
+}
+
+impl HoldingCipher {
+  fn new(life: u8) -> HoldingCipher {
+    HoldingCipher {
+      life,
+      next: 0,
+      held: std::collections::BTreeMap::new(),
+    }
+  }
+
+  fn register(&mut self, identity: slates_vfs::content::KeyIdentity) -> u32 {
+    if let Some((key, _)) = self.held.iter().find(|(_, (held, _))| *held == identity) {
+      return *key;
+    }
+    let key = self.next;
+    self.next += 1;
+    self.held.insert(key, (identity, 0));
+    key
+  }
+}
+
+impl slates_vfs::content::ChunkCipher for HoldingCipher {
+  fn seal(
+    &self,
+    key: u32,
+    version: u64,
+    index: u32,
+    last: bool,
+    segment: &mut [u8],
+  ) -> Result<slates_vfs::content::Tag, VfsError> {
+    if !self.held.contains_key(&key) {
+      return Err(VfsError::Integrity);
+    }
+    StreamCipher.seal(key, version, index, last, segment)
+  }
+  fn open(
+    &self,
+    key: u32,
+    version: u64,
+    index: u32,
+    last: bool,
+    segment: &mut [u8],
+    tag: &slates_vfs::content::Tag,
+  ) -> Result<(), VfsError> {
+    match self.held.get(&key) {
+      Some((_, holds)) if *holds > 0 => StreamCipher.open(key, version, index, last, segment, tag),
+      _ => Err(VfsError::Integrity),
+    }
+  }
+  fn identity(&self, key: u32) -> Option<slates_vfs::content::KeyIdentity> {
+    self.held.get(&key).map(|(identity, _)| *identity)
+  }
+  fn reference(&mut self, identity: &slates_vfs::content::KeyIdentity) -> Result<u32, VfsError> {
+    Ok(self.register(*identity))
+  }
+  fn key_for_volume(&mut self, volume: [u8; 16]) -> Result<u32, VfsError> {
+    let mut identity = slates_vfs::content::KeyIdentity::default();
+    identity[..16].copy_from_slice(&volume);
+    identity[16] = self.life;
+    let key = self.register(identity);
+    self.hold(key)?;
+    Ok(key)
+  }
+  fn hold(&mut self, key: u32) -> Result<(), VfsError> {
+    let (_, holds) = self.held.get_mut(&key).ok_or(VfsError::Integrity)?;
+    *holds += 1;
+    Ok(())
+  }
+  fn release(&mut self, key: u32) -> Result<(), VfsError> {
+    let (_, holds) = self.held.get_mut(&key).ok_or(VfsError::Integrity)?;
+    *holds = holds.checked_sub(1).ok_or(VfsError::Integrity)?;
+    if *holds == 0 {
+      self.held.remove(&key);
+    }
+    Ok(())
+  }
+  fn keys_held(&self) -> usize {
+    self.held.len()
+  }
+}
+
+/// A file's whole bytes through the read path, or the read's refusal.
+fn try_read_all(vol: &Volume, store: &Store, no: InodeNo, len: usize) -> Result<Vec<u8>, VfsError> {
+  let mut out = vec![0u8; len];
+  let mut read = 0;
+  while read < len {
+    let n = vol.read(store, no, u64::try_from(read).unwrap(), &mut out[read..])?;
+    if n == 0 {
+      break;
+    }
+    read += n;
+  }
+  out.truncate(read);
+  Ok(out)
+}
+
+/// Writes `bytes` over the whole of file `no` and seals every chunk of it: the write seals each chunk window it passes,
+/// and two idle sweeps seal the open tail (the first sweep ends the tick the write happened in).
+fn write_sealed(vol: &mut Volume, store: &mut Store, no: InodeNo, bytes: &[u8]) {
+  vol.write(store, no, 0, bytes).unwrap();
+  vol.seal_idle(store, u64::MAX);
+  vol.seal_idle(store, u64::MAX);
+}
+
+/// A-208 (a key lives exactly as long as what names it). Do: on a sealing store, key a volume, write a file of three and
+/// a half chunks and seal it; recover the volume in a new life, where its next key differs, and read the file back;
+/// rewrite the whole file and seal it; destroy the volume and let its key go. Expect: one key while the first life's
+/// volume holds it; two after the recovery (the old key, which only the recovered chunks name, and the volume's new
+/// one), and every byte reads back under the old key; one after the rewrite frees the old chunks, the new bytes read
+/// back; none after the destroy. A key dropped while a chunk sealed under it lives refuses that chunk's read here, and a
+/// key kept after its last chunk keeps the count above what is alive, as the server's cipher did before A-208.
+#[test]
+fn a_key_is_kept_while_a_chunk_sealed_under_it_lives_and_goes_with_its_last() {
+  let mut source = store();
+  source.content.set_cipher(Box::new(HoldingCipher::new(1)));
+  let mut vol = volume(&mut source, 1 << 30);
+  let first = source
+    .content
+    .cipher_mut()
+    .unwrap()
+    .key_for_volume([9; 16])
+    .unwrap();
+  vol.set_seal_key(Some(first));
+  let root = vol.root_inode(&source).unwrap();
+  let f = vol.create_file_no(&mut source, root, "f", 0o644).unwrap();
+  let len = source.content.chunk_bytes() * 7 / 2;
+  let old: Vec<u8> = (0..len)
+    .map(|at| u8::try_from(at % 251).unwrap() | 1)
+    .collect();
+  write_sealed(&mut vol, &mut source, f, &old);
+  assert!(source.content.sealed() >= 3, "the file's chunks sealed");
+  assert_eq!(source.content.cipher_keys_held(), 1, "the volume's one key");
+  let image = vol.to_image(&source, None).unwrap();
+
+  let mut fresh = common::surviving(&source);
+  fresh.content.set_cipher(Box::new(HoldingCipher::new(2)));
+  let claims = common::claims(&mut fresh, &[&image]);
+  let mut recovered = rebuild(&mut fresh, &image, &claims).unwrap();
+  let second = fresh
+    .content
+    .cipher_mut()
+    .unwrap()
+    .key_for_volume([9; 16])
+    .unwrap();
+  recovered.set_seal_key(Some(second));
+  assert_eq!(
+    fresh.content.cipher_keys_held(),
+    2,
+    "the old life's key, named by the recovered chunks, and the new life's"
+  );
+  assert!(
+    try_read_all(&recovered, &fresh, f, len) == Ok(old.clone()),
+    "every byte sealed in the old life reads back under its key"
+  );
+
+  let new: Vec<u8> = old.iter().map(|byte| byte.wrapping_add(2) | 1).collect();
+  write_sealed(&mut recovered, &mut fresh, f, &new);
+  assert_eq!(
+    fresh.content.cipher_keys_held(),
+    1,
+    "the old key went with the last chunk that named it"
+  );
+  assert!(
+    try_read_all(&recovered, &fresh, f, len) == Ok(new),
+    "the rewrite reads back under the new key"
+  );
+
+  destroy_whole(&mut recovered, &mut fresh);
+  fresh.content.cipher_mut().unwrap().release(second).unwrap();
+  assert_eq!(
+    fresh.content.cipher_keys_held(),
+    0,
+    "nothing left once the volume is gone"
   );
 }

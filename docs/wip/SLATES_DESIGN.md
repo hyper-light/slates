@@ -12854,7 +12854,7 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
 
-### A-208 — Shards are counted and fixed by physical core: the facts name each CPU's core, and a core's second hardware thread runs no shard (accepted and built 2026-11-05)
+### A-208 — Shards are counted and fixed by physical core: the facts name each CPU's core, and a core's second hardware thread runs no shard; and a shard's content keys are bounded by what names them (accepted and built 2026-11-05)
 Applied in the same change to: §4.1 (its status), `crates/machine` (`facts.rs`: `CoreFacts::physical`, read from Linux
 `topology/thread_siblings_list` and the Windows `RelationProcessorCore` mask; `placement.rs`: `Placement::of`;
 `profile.rs`: `PROFILE_VERSION` 4), the tests that build facts by hand (`probes.rs`, `wake.rs`,
@@ -12876,6 +12876,21 @@ Applied in the same change to: §4.1 (its status), `crates/machine` (`facts.rs`:
   classes (still `Unknown`, so a hybrid Windows machine counts every core as the fastest class).
 - **What it does not change.** Apple silicon, which runs one thread a core; the machine identity, which still counts
   the logical CPUs the process may use; and pinning only on cores the process owns.
+- **Second part (2026-11-05): a shard's content keys are bounded by what names them.** Applied in the same change to
+  §4.2's cipher (`crates/server/src/content_cipher.rs`, its module doc), `crates/vfs/src/content.rs` (`ChunkCipher`'s
+  `hold`, `release` and `keys_held`; `ChunkStore` holds a sealed record's key at its insert and releases it at its
+  free), `crates/server/src/verbs.rs` (`release_slot_credits` lets the volume's hold go), `Daemon::content_keys_held`,
+  GAPS and `docs/bugs/2026-11-05-a-shards-content-keys-were-never-let-go.md`.
+  - Why: the cipher kept a key for every volume it had ever keyed and found each by a linear scan. 64 volumes made,
+    written and destroyed left 64 keys behind, and over the provisioning histogram's ~440,000 creates the scan held
+    24,052 of the 26,986 samples inside the server's create (macOS arm64). Its doc claimed a bound nothing kept.
+  - The rule: a key is held once for its volume's life and once by each sealed chunk record that names it, and goes
+    with its last hold. Its slot is reused by the next new key. Keys are found through an identity-to-slot index.
+    Held keys are therefore at most the shard's live volumes plus its sealed records, plus the keys a recovery image
+    named whose chunk was then not adopted.
+  - Proven: the create-and-destroy loop returns to its floor, red before (64 against 0); and a key outlives its volume's
+    life while a chunk sealed under it lives, across a restart, and goes with its last chunk. Red before, and
+    red-checked against each half of the fix.
 
 ### A-211 — A DAX ask is refused where no view could begin (accepted and built 2026-11-04)
 Applied in the same change to: §4.6 by reference, `docs/wip/shards/dax-protocol.md` ("Windows"), GAPS,
