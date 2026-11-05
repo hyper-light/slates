@@ -1,5 +1,13 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A call waited for its acknowledgement's scatter (2026-11-05, §4.9, R9; fixed, its A/B owed).** The synchronous
+> `Client::call` acknowledged every half-ring of replies before its own request and waited for the reply, which the
+> daemon gives only after every shard has released the client's records. On macOS, 133 of 2,000 single-client creates
+> (6.7%) carried one, median 2,497 µs against 169 µs (a loaded run whose boot probe measured a 2.5 ms wake). That share
+> set the p99. With another shard held for a second, such a call failed `Stalled`. It is now sent unawaited, as the
+> async path sends it. Red before, green after (`crates/client/tests/acknowledge.rs`). Owed: the interleaved
+> `provision_bench` A/B on every platform. Record: `docs/bugs/2026-11-05-a-call-waited-for-its-acknowledgements-scatter.md`.
+
 > **Shards counted hardware threads as cores (2026-11-05, A-208, §4.1, R9; fixed, its A/B owed).** §4.1 counts shards in
 > physical cores, but the placement counted logical CPUs. jupiter's 16 two-thread cores therefore ran 31 shards and
 > left its spinning clients one thread: provisioning p99 123.6 µs against R9's 50 µs (Windows x86_64, 06:35 UTC). The
