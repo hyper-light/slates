@@ -672,6 +672,7 @@ mod tests {
       level,
       numa: 0,
       l2_bytes: 0,
+      physical: id,
     }
   }
 

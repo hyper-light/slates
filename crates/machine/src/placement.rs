@@ -3,9 +3,13 @@
 //! wake probe places its pair by ([`crate::wake`]), so the probe measures the placement production runs
 //! under.
 //!
-//! **How many.** Every core of the fastest class the process may run on, as many as its CPU budget lets
-//! run at once, less one kept for control and the OS; at least one. The design's worked example: six
-//! "Super" cores and no quota give five shards; a two-CPU quota gives one.
+//! **How many.** Every physical core of the fastest class the process may run on, as many as its CPU budget
+//! lets run at once, less one kept for control and the OS; at least one. The design's worked example: six
+//! "Super" cores and no quota give five shards; a two-CPU quota gives one. A core of two hardware threads
+//! counts once, and its shard runs on its first thread the process may use: the second runs no shard, so
+//! two spinning shards never share one pipeline, and the clients spinning for their replies have the
+//! second threads. Counted by logical CPU, jupiter's sixteen two-thread cores ran 31 shards and left its
+//! clients one thread: provisioning p99 123.6 µs against R9's 50 µs (2026-11-05, Windows x86_64; A-208).
 //!
 //! **Fixed to cores only when they are the process's own.** A shard is fixed to a core — the
 //! thread-per-core model's cache and wake locality — only when the process's CPU budget buys every core it
@@ -39,6 +43,8 @@ use crate::derived;
 use crate::derived::Derived;
 use crate::facts::{CoreFacts, CpuBudget};
 
+use std::collections::BTreeSet;
+
 /// Where a process's shards run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Placement {
@@ -63,12 +69,20 @@ impl Placement {
   /// [`crate::facts::Facts::cores`] and [`crate::facts::Facts::cpu_budget`]).
   pub fn of(cores: &[CoreFacts], budget: Option<CpuBudget>) -> Placement {
     let best = cores.iter().map(|core| core.level).min();
-    let mut class: Vec<u32> = cores
+    let mut threads: Vec<&CoreFacts> = cores
       .iter()
       .filter(|core| Some(core.level) == best)
+      .collect();
+    threads.sort_unstable_by_key(|core| core.id);
+    // One logical CPU for each physical core of the class (§4.1 counts physical cores): the lowest id the
+    // process may run on among that core's hardware threads. Its other threads run no shard, so a spinning
+    // shard never halves another's pipeline, and they are left to the clients, the bridges and the OS.
+    let mut seen: BTreeSet<u32> = BTreeSet::new();
+    let class: Vec<u32> = threads
+      .into_iter()
+      .filter(|core| seen.insert(core.physical))
       .map(|core| core.id)
       .collect();
-    class.sort_unstable();
     let at_once = budget.map_or(u64::MAX, |budget| budget.whole_cpus());
     let usable = u64::try_from(class.len()).unwrap_or(u64::MAX).min(at_once);
     let count = u16::try_from(usable.saturating_sub(1))
@@ -76,8 +90,8 @@ impl Placement {
       .max(1);
     let shards = derived!(
       count,
-      "fastest-class cores the CPU budget runs at once, minus one for control, at least one",
-      ["cores.class", "cores.level", "cpu_budget"]
+      "fastest-class physical cores the CPU budget runs at once, minus one for control, at least one",
+      ["cores.class", "cores.level", "cores.physical", "cpu_budget"]
     );
     let owned = budget.is_none_or(|budget| budget.covers(cores.len()));
     let fixed = owned.then(|| fixed_cores(&class)).flatten();
@@ -112,6 +126,7 @@ mod tests {
       level,
       numa: 0,
       l2_bytes: 0,
+      physical: id,
     }
   }
 
@@ -140,6 +155,47 @@ mod tests {
       Some(FixedCores {
         control: 0,
         shards: vec![1, 2, 3, 4, 5]
+      })
+    );
+  }
+
+  /// A-208, §4.1: the count is of physical cores: a machine of sixteen cores of two hardware threads each (jupiter's
+  /// AMD Ryzen AI MAX+ 395, numbered as Windows numbers them, each core's threads adjacent) runs fifteen
+  /// shards, one on the first thread of each core but the control's, and leaves every second thread free.
+  /// Counted by logical CPU it ran 31 spinning shards on 32 threads, two to most cores, and its clients had
+  /// one thread between them: provisioning p99 123.6 µs against R9's 50 µs (2026-11-05).
+  #[test]
+  fn hardware_threads_of_one_core_count_as_one_core_and_only_its_first_runs_a_shard() {
+    let cores: Vec<CoreFacts> = (0..32)
+      .map(|id| CoreFacts {
+        physical: id & !1,
+        ..core(id, 0)
+      })
+      .collect();
+    let placement = Placement::of(&cores, None);
+    assert_eq!(placement.shards.get(), 15);
+    assert_eq!(
+      placement.fixed,
+      Some(FixedCores {
+        control: 0,
+        shards: (1..16).map(|core| core * 2).collect()
+      })
+    );
+    // Linux numbers a core's second threads after every first one (cpu16 is cpu0's sibling): the same
+    // count, the same first threads.
+    let linux: Vec<CoreFacts> = (0..32)
+      .map(|id| CoreFacts {
+        physical: id % 16,
+        ..core(id, 0)
+      })
+      .collect();
+    let placement = Placement::of(&linux, None);
+    assert_eq!(placement.shards.get(), 15);
+    assert_eq!(
+      placement.fixed,
+      Some(FixedCores {
+        control: 0,
+        shards: (1..16).collect()
       })
     );
   }
@@ -233,19 +289,28 @@ mod tests {
     /// Shape: the id space the oracle draws cpusets from (masks stepped through all 2^16, so sets with
     /// gaps, offsets and both classes; small enough to run in milliseconds).
     const IDS: u32 = 16;
-    for mask in (1u32..(1 << IDS)).step_by(97) {
-      let cores: Vec<CoreFacts> = (0..IDS)
-        .filter(|id| mask & (1 << id) != 0)
-        .map(|id| core(id, u32::from(id % 3 == 2)))
-        .collect();
-      for quota in [
-        None,
-        budget(1),
-        budget(2),
-        budget(5),
-        budget(u64::from(IDS) + 1),
-      ] {
-        check_placement(&cores, quota);
+    // How the ids map to physical cores: one thread a core; two a core numbered adjacently (Windows); two a
+    // core numbered first threads first (Linux, the sibling of `id` is `id + IDS / 2`).
+    let layouts: [fn(u32) -> u32; 3] = [|id| id, |id| id & !1, |id| id % (IDS / 2)];
+    for layout in layouts {
+      for mask in (1u32..(1 << IDS)).step_by(97) {
+        let cores: Vec<CoreFacts> = (0..IDS)
+          .filter(|id| mask & (1 << id) != 0)
+          .map(|id| CoreFacts {
+            physical: layout(id),
+            // A core's threads share its class, so the class follows the physical core.
+            ..core(id, u32::from(layout(id) % 3 == 2))
+          })
+          .collect();
+        for quota in [
+          None,
+          budget(1),
+          budget(2),
+          budget(5),
+          budget(u64::from(IDS) + 1),
+        ] {
+          check_placement(&cores, quota);
+        }
       }
     }
   }
@@ -255,8 +320,14 @@ mod tests {
     let placement = Placement::of(cores, quota);
     let shards = usize::from(placement.shards.get());
     let best = cores.iter().map(|c| c.level).min();
-    let class = cores.iter().filter(|c| Some(c.level) == best).count();
-    // The design's count: the fastest class's cores the budget runs at once, one kept, at least one.
+    let class = cores
+      .iter()
+      .filter(|c| Some(c.level) == best)
+      .map(|c| c.physical)
+      .collect::<BTreeSet<u32>>()
+      .len();
+    // The design's count: the fastest class's physical cores the budget runs at once, one kept, at least
+    // one.
     let buys = quota.map_or(usize::MAX, |b| usize::try_from(b.whole_cpus()).unwrap());
     assert_eq!(
       shards,
@@ -273,11 +344,41 @@ mod tests {
     }
   }
 
-  /// A fixed placement's cores: every one the process's own and of its fastest class, one per shard, none
-  /// shared with control unless the class has one core.
+  /// A fixed placement's cores: every one the process's own and of its fastest class, one per shard, on
+  /// distinct physical cores, none on control's physical core unless the class has one, and each the first
+  /// thread the process may use of its physical core.
   fn check_fixed(cores: &[CoreFacts], fixed: &FixedCores, shards: usize) {
     let best = cores.iter().map(|c| c.level).min();
     let level_of = |id: u32| cores.iter().find(|c| c.id == id).map(|c| c.level);
+    let physical_of = |id: u32| cores.iter().find(|c| c.id == id).map(|c| c.physical);
+    let mut physicals: Vec<Option<u32>> = fixed.shards.iter().map(|id| physical_of(*id)).collect();
+    physicals.sort_unstable();
+    physicals.dedup();
+    assert_eq!(
+      physicals.len(),
+      fixed.shards.len(),
+      "two shards on one core: {fixed:?} {cores:?}"
+    );
+    assert!(
+      fixed.shards.len() == 1
+        || !fixed
+          .shards
+          .iter()
+          .any(|id| physical_of(*id) == physical_of(fixed.control)),
+      "a shard on control's core: {fixed:?} {cores:?}"
+    );
+    for id in fixed.shards.iter().chain([&fixed.control]) {
+      let first = cores
+        .iter()
+        .filter(|c| Some(c.physical) == physical_of(*id))
+        .map(|c| c.id)
+        .min();
+      assert_eq!(
+        first,
+        Some(*id),
+        "{id} is not its core's first thread: {cores:?}"
+      );
+    }
     for id in fixed.shards.iter().chain([&fixed.control]) {
       assert_eq!(
         level_of(*id),

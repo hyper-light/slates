@@ -124,6 +124,60 @@ fn percentiles(mut samples: Vec<u64>) -> Vec<(&'static str, u64)> {
   out
 }
 
+/// Shape: the samples compared at each end of a run: a tenth of them.
+const GROWTH_SHARE: usize = 10;
+
+/// The median of one client's first and last tenth of samples: a create whose cost follows what earlier
+/// creates and destroys left behind shows it here, where the percentiles mix it away.
+fn print_growth(key: &str, run: usize, samples: &[u64]) {
+  let tenth = (samples.len() / GROWTH_SHARE).max(1);
+  let median = |slice: &[u64]| {
+    let mut sorted = slice.to_vec();
+    sorted.sort_unstable();
+    sorted[sorted.len() / 2]
+  };
+  let first = median(&samples[..tenth]);
+  let last = median(&samples[samples.len() - tenth..]);
+  println!(
+    "  provision.{key} run {run}: median of the first {tenth} creates {first} ns, of the last {tenth} {last} ns"
+  );
+}
+
+/// Format: parts per thousand, for the parks a create cost each shard.
+const PARKS_PER_MILLE: u64 = 1000;
+
+/// Each shard's parks (driver waits) over a form, per thousand creates (each followed by its destroy), and
+/// each shard's measured wake cost after it: a shard that parks between a client's requests makes every
+/// request it serves or is forwarded pay that wake, which the percentiles show only as latency.
+fn print_parks(
+  key: &str,
+  before: &[slates_server::daemon::ShardPulse],
+  after: &[slates_server::daemon::ShardPulse],
+  creates: usize,
+) {
+  let creates = u64::try_from(creates).unwrap_or(u64::MAX).max(1);
+  let per_mille: Vec<String> = after
+    .iter()
+    .map(|pulse| {
+      let earlier = before
+        .iter()
+        .find(|old| old.shard == pulse.shard)
+        .map_or(0, |old| old.waits);
+      let parks = pulse.waits.saturating_sub(earlier);
+      format!(
+        "shard {}: {} (wake {} ns)",
+        pulse.shard,
+        parks * PARKS_PER_MILLE / creates,
+        pulse.wake_cost_ns
+      )
+    })
+    .collect();
+  println!(
+    "  provision.{key} parks per 1000 creates: {}",
+    per_mille.join(", ")
+  );
+}
+
 /// One form over the runs; per percentile, the per-run values.
 fn form(
   instance: &str,
@@ -143,7 +197,11 @@ fn form(
       .collect();
     let mut all = Vec::new();
     for handle in handles {
-      all.extend(handle.join().unwrap());
+      let samples = handle.join().unwrap();
+      if clients == 1 {
+        print_growth(key, run, &samples);
+      }
+      all.extend(samples);
     }
     per_run.push(percentiles(all));
   }
@@ -253,7 +311,14 @@ fn main() {
   let mut failed = false;
   for clients in CLIENT_COUNTS {
     let key = format!("spinning_{clients}");
+    let before = daemon.shard_pulses();
     let rows = form(&instance, &key, *clients, SPINNING_SAMPLES, None);
+    print_parks(
+      &key,
+      &before,
+      &daemon.shard_pulses(),
+      RUNS * clients * SPINNING_SAMPLES,
+    );
     // The AC-2.1 floor is a latency claim: one client's provisioning p99, no cross-client
     // contention. The 1/8/64 sweep is the T-2.6 histogram; every runnable level's rows are
     // recorded so the ratchet catches regressions, but only the single-client p99 is held to
@@ -296,7 +361,14 @@ fn main() {
   }
   // The parked form is reported separately (AC-2.1), not gated: its latency is a wake, which
   // the scheduler's park granularity dominates.
+  let before = daemon.shard_pulses();
   let rows = form(&instance, "parked_1", 1, PARKED_SAMPLES, Some(PARKED_PAUSE));
+  print_parks(
+    "parked_1",
+    &before,
+    &daemon.shard_pulses(),
+    RUNS * PARKED_SAMPLES,
+  );
   print_rows_gated("parked_1", &rows, false);
   println!(
     "ac-2.1: 1 client parked (paced {} µs), create p99 {} ns: reported, not gated",

@@ -935,6 +935,14 @@ wake at its p99, the overflow target; pre-fault batch = idle
 window / fault_ns; small chunk = smallest page multiple ≥ p90 sealed-file size; large chunk = size
 where per-chunk fixed cost / memcpy cost < a fixed fraction chosen from the measured curve's knee.
 
+> **Status (2026-11-05, A-208: physical cores counted as the rule says).** The placement had counted logical CPUs, so a
+> machine whose cores run two hardware threads ran about twice the shards this rule derives, two to a core, and left
+> its spinning clients one thread (jupiter: 31 shards on 16 cores, provisioning p99 123.6 µs). The facts now name each
+> CPU's physical core: Linux `topology/thread_siblings_list`, Windows `RelationProcessorCore`, and on macOS each CPU
+> itself. One shard runs on the first thread of each physical core, and the second threads are left to the clients,
+> the bridges and the OS. Profile format version 4. Record:
+> `docs/bugs/2026-11-05-shards-counted-hardware-threads-as-cores.md`.
+
 **Worked example.** On the author's laptop the profile reads page 16 KiB, line 128 B, 18 cores in
 two classes, 128 GiB with 108.8 GiB lockable; the 6 "Super" cores become shards, 12
 "Performance" cores serve bridge work and the control shard; the spin window is the measured
@@ -12908,6 +12916,44 @@ A-105's entry, BENCHMARKS, GAPS.
     (beyond the spread at 4 and 16 workers; six interleaved rounds), with write p99s overlapping.
 - **Not done:** decaying the reserve over time. A-105's reason (a daemon kept its high-water mark forever) does not
   apply: the reserve follows the last busy period, so a delete or a quiet period that grew nothing returns it.
+
+### A-208 — Shards are counted and fixed by physical core: the facts name each CPU's core, and a core's second hardware thread runs no shard; and a shard's content keys are bounded by what names them (accepted and built 2026-11-05)
+Applied in the same change to: §4.1 (its status), `crates/machine` (`facts.rs`: `CoreFacts::physical`, read from Linux
+`topology/thread_siblings_list` and the Windows `RelationProcessorCore` mask; `placement.rs`: `Placement::of`;
+`profile.rs`: `PROFILE_VERSION` 4), the tests that build facts by hand (`probes.rs`, `wake.rs`,
+`crates/server/tests/daemon.rs`), GAPS, `docs/bugs/2026-11-05-shards-counted-hardware-threads-as-cores.md`.
+- **Why.** §4.1 says "shard count = performance-class physical cores minus one control core", but the facts had one
+  entry per logical CPU and nothing that named a core, so the placement counted hardware threads. jupiter's 16
+  two-thread cores ran 31 shards, most cores carried two spinning shards, and the clients spinning for their replies had
+  one thread between them: provisioning p99 123.6 µs against R9's 50 µs (2026-11-05, Windows x86_64).
+- **The rule.** The fastest class is reduced to one logical CPU per physical core, the lowest id the process may run
+  on, before the shards are counted and fixed. Control takes the first core's first thread, and each shard the first
+  thread of another core. The second threads run no shard: they are left to the clients, the bridges and the OS, and
+  two shards never share one core's pipeline. A CPU whose OS gives no topology counts as its own core, with a note.
+  A cpuset, a quota and ownership are judged as before (A-41's rule), and the quota still buys CPUs of time.
+- **Proven.** `hardware_threads_of_one_core_count_as_one_core_and_only_its_first_runs_a_shard` (16 cores × 2 threads,
+  in Windows' and in Linux's numbering) failed before the fix (31 against 15) and passes after. The placement oracle
+  draws three sibling layouts and checks that no two shards share a core, that none shares control's, and that each
+  fixed CPU is its core's first. With the old counting, both fail.
+- **Owed.** The interleaved before/after of `provision_bench` on a machine with two threads a core, and Windows core
+  classes (still `Unknown`, so a hybrid Windows machine counts every core as the fastest class).
+- **What it does not change.** Apple silicon, which runs one thread a core; the machine identity, which still counts
+  the logical CPUs the process may use; and pinning only on cores the process owns.
+- **Second part (2026-11-05): a shard's content keys are bounded by what names them.** Applied in the same change to
+  §4.2's cipher (`crates/server/src/content_cipher.rs`, its module doc), `crates/vfs/src/content.rs` (`ChunkCipher`'s
+  `hold`, `release` and `keys_held`; `ChunkStore` holds a sealed record's key at its insert and releases it at its
+  free), `crates/server/src/verbs.rs` (`release_slot_credits` lets the volume's hold go), `Daemon::content_keys_held`,
+  GAPS and `docs/bugs/2026-11-05-a-shards-content-keys-were-never-let-go.md`.
+  - Why: the cipher kept a key for every volume it had ever keyed and found each by a linear scan. 64 volumes made,
+    written and destroyed left 64 keys behind, and over the provisioning histogram's ~440,000 creates the scan held
+    24,052 of the 26,986 samples inside the server's create (macOS arm64). Its doc claimed a bound nothing kept.
+  - The rule: a key is held once for its volume's life and once by each sealed chunk record that names it, and goes
+    with its last hold. Its slot is reused by the next new key. Keys are found through an identity-to-slot index.
+    Held keys are therefore at most the shard's live volumes plus its sealed records, plus the keys a recovery image
+    named whose chunk was then not adopted.
+  - Proven: the create-and-destroy loop returns to its floor, red before (64 against 0); and a key outlives its volume's
+    life while a chunk sealed under it lives, across a restart, and goes with its last chunk. Red before, and
+    red-checked against each half of the fix.
 
 ### A-211 — A DAX ask is refused where no view could begin (accepted and built 2026-11-04)
 Applied in the same change to: §4.6 by reference, `docs/wip/shards/dax-protocol.md` ("Windows"), GAPS,
