@@ -1,0 +1,88 @@
+# DIAG, not for main: AC-9.5's measurement -- each Linux and Windows target of release.yml built twice, on separate
+# runners, exactly as release.yml builds it; the binaries are compared off CI.
+name: DIAG release rebuild (not for main)
+
+on:
+  push:
+    branches: ["diag-release-*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.asset }} (${{ matrix.copy }})
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, x86_64-unknown-linux-musl, aarch64-unknown-linux-musl, x86_64-pc-windows-msvc, aarch64-pc-windows-msvc]
+        copy: [first, second]
+        include:
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-latest, asset: slates-linux-x64 }
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm, asset: slates-linux-arm64 }
+          - { target: x86_64-unknown-linux-musl, runner: ubuntu-latest, asset: slates-linux-x64-musl, musl: true }
+          - { target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm, asset: slates-linux-arm64-musl, musl: true }
+          - { target: x86_64-pc-windows-msvc, runner: windows-2025, asset: slates-windows-x64.exe, windows: true, nasm: true }
+          - { target: aarch64-pc-windows-msvc, runner: windows-11-arm, asset: slates-windows-arm64.exe, windows: true, clang_cl: true }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      # AWS-LC's Windows x86 assembly is built from its NASM source, never the prebuilt objects (ignored elsewhere).
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install NASM
+        if: ${{ matrix.nasm }}
+        uses: ilammy/setup-nasm@v1.5.2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+          targets: ${{ matrix.target }}
+      # As CI's windows-arm64 lane: aws-lc-sys refuses cl.exe for aarch64-pc-windows-msvc and builds with clang-cl.
+      - name: clang-cl for the C the binary links (arm64 Windows)
+        if: ${{ matrix.clang_cl }}
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          & $clang --version
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Build (macOS, Linux glibc)
+        if: ${{ !matrix.musl && !matrix.windows }}
+        run: cargo build --release --locked -p slates-cli --target ${{ matrix.target }}
+      # The C runtime linked statically: Windows does not ship vcruntime140.dll and Nano Server and Server Core lack it,
+      # where a dynamically linked slates.exe exits 0xC0000135 before any code runs (GAPS, CI run 40580524733).
+      - name: Build (Windows, the C runtime linked statically)
+        if: ${{ matrix.windows }}
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --release --locked -p slates-cli --target ${{ matrix.target }}
+      # musl builds inside the official rust:alpine image, native per arch, +crt-static for the binary (the workspace's
+      # -crt-static in .cargo/config.toml is for cdylibs; RUSTFLAGS outranks it). `docker run`, not `container:`, so the
+      # checkout and the uploads stay on the host (Appendix B.2).
+      - name: Build (musl, in the rust:1.98.1-alpine image)
+        if: ${{ matrix.musl }}
+        run: |
+          docker run --rm -v "$PWD":/work -w /work rust:1.98.1-alpine sh -c '
+            apk add --no-cache build-base &&
+            RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --locked -p slates-cli --target ${{ matrix.target }}'
+          sudo chown -R "$(id -u):$(id -g)" target
+      - name: Stage the binary
+        shell: bash
+        run: |
+          mkdir -p dist records
+          suffix=""
+          if [ "${{ matrix.windows }}" = "true" ]; then suffix=".exe"; fi
+          cp "target/${{ matrix.target }}/release/slates$suffix" "dist/${{ matrix.asset }}"
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}-${{ matrix.copy }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
