@@ -29,7 +29,15 @@ pub(crate) type Boolean = u8;
 pub(crate) struct FileSystem {
   pub(crate) version: u16,
   pub(crate) user_context: Pvoid,
+  /// DIAG: the v2.1 prefix through the operation guards (winfsp.h).
+  pub(crate) volume_name: [u16; 64 + 192],
+  pub(crate) volume_handle: Pvoid,
+  pub(crate) enter_operation: Option<GuardFn>,
+  pub(crate) leave_operation: Option<GuardFn>,
 }
+
+/// DIAG: FSP_FILE_SYSTEM_OPERATION_GUARD.
+pub(crate) type GuardFn = unsafe extern "system" fn(file_system: *mut FileSystem, request: Pvoid, response: Pvoid) -> Ntstatus;
 
 /// `FSP_FSCTL_VOLUME_PARAMS` (504 bytes; header `static_assert`) — the mount parameters. The two
 /// bitfield words are held as raw `u32`s (`flags`/`flags_v1`) whose bits the host sets by constant, so
