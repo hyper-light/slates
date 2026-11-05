@@ -1006,14 +1006,15 @@ fn open_reaches_the_volume(root: &str, units: usize) -> bool {
 /// not, on the live driver.
 fn driver_limit(root: &str) -> usize {
   let mut reaches = 1025;
-  let mut refused = (u16::MAX as usize) / 2 - VERBATIM_DRIVE_UNITS;
+  // No request can hold as many units as it has bytes, so the driver refuses this whatever its exact limit.
+  let mut refused = slates_bridge_winfsp::inflight::REQUEST_MAX;
   assert!(
     open_reaches_the_volume(root, reaches),
     "1,025 units reach the volume"
   );
   assert!(
     !open_reaches_the_volume(root, refused),
-    "the longest name a drive letter can reach is refused by the driver"
+    "a name as many units long as a request has bytes is refused by the driver"
   );
   while refused - reaches > 1 {
     let middle = reaches + (refused - reaches) / 2;
@@ -1061,6 +1062,17 @@ fn opens_past_a_thousand_units_are_refused_only_by_the_winfsp_driver() {
   wait_ready(&format!("{drive}\\"));
   let limit = driver_limit(&drive);
   eprintln!("WINFSP LONG PATH: first refusal: the driver refuses from {limit} units");
+  let longest = (u16::MAX as usize) / 2 - VERBATIM_DRIVE_UNITS;
+  let at_the_longest = std::fs::File::open(format!(
+    "\\\\?\\{drive}\\{}",
+    long_components(longest).join("\\")
+  ));
+  eprintln!(
+    "WINFSP LONG PATH: {longest} units, the longest a drive letter can name, answered {:?}",
+    at_the_longest
+      .map(drop)
+      .map_err(|error| error.raw_os_error())
+  );
   for units in [1025, 1026, 2000, 4000, 8000, limit - 1] {
     let read = long_path_round_trip(&drive, units);
     eprintln!("WINFSP LONG PATH: {units} units read back {read:?}");
