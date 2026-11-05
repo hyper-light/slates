@@ -3894,6 +3894,84 @@ back. Every byte was identical. Load average 8–11 from other sessions.
 write gap to nfsd is in slates' own write path, owed a profile. Two tests encode the 256 KiB size as a literal and
 would need deriving from the constant first (`rtmax is one arena chunk`; a listing sized to need two pages).
 
+### The large-file NFS write profiled: fresh content pages, sealing, and a turn's copies (VFS plan step 11; 2026-11-05)
+
+**The incumbent harness on today's main** (`docs/wip/bench/mixed/linux_vs_nfsd.sh 400 64` as recorded above, Linux
+release build of `76b450a1` from its own target volume, Apple M5 Max, Docker Desktop's 6.12.76-linuxkit kernel,
+2026-11-05 05:56Z, load 14–15, one run): the large 64 MiB write at 1, 4 and 16 workers, MiB/s.
+
+| target | 1 | 4 | 16 |
+|---|---|---|---|
+| slates | 852.7 | 957.0 | 808.0 |
+| kernel nfsd | 1,556.5 | 1,831.2 | 1,640.3 |
+| tmpfs | 1,670.1 | 1,709.9 | 1,635.7 |
+
+**Where the time goes.** Linux's own NFSv4.2 client on CI's runner, against slates (4 shards, unprivileged) and nfsd
+exporting a tmpfs, the daemon under `perf record -g` (frame pointers, kernel symbols) during a 1 GiB new-file write
+(`diag/nfs-write/prof.sh` on branch `diag-nfs-write-4`, run 41986870989, AMD EPYC 7763, 4 vCPU, load 1.3). Every
+sample was on one shard, the volume's. Of its samples:
+
+| cost | share |
+|---|---|
+| page faults on fresh content pages (`asm_exc_page_fault`; `shmem_fault` 23.2%; zeroing, `kernel_init_pages`, 3.1%) | 41.5% |
+| sealing at rest (AES-256-GCM, `_aesni_ctr32_ghash_6x` 13.6% self) | 21.0% |
+| the connection's peek and the copies out of it (`peek_head`; the kernel's copy 7.8%) | 12.4% |
+| everything else (the volume write's copy, dispatch, replies) | about 25% |
+
+- **Fresh against resident pages** (same script, run 41978355633, a faster runner): a 1 GiB write right after the
+  last one was removed, its freed pages still resident, ran 2,047–2,190 MiB/s (nfsd 2,148–2,218). After an idle
+  pause, once A-105's purge had given them back, 874–957 MiB/s, with 264,993 minor faults (one per 4 KiB page) and
+  1.03 s of daemon task clock per GiB against 0.41 s resident. The incumbent harness never deletes its large files, so
+  every large write is the fresh case. The runner's `shmem_enabled` is `never`, so each page is a 4 KiB fault.
+- **What a fresh page costs** (`diag/nfs-write/faults.py 512 5`, a shared memfd as the content arena maps it, run
+  41987962954, EPYC 7763, three runs, best of 5 each, all shown in the run):
+
+  | how the fresh pages are filled | MiB/s, best of each run |
+  |---|---|
+  | stores through the mapping (slates) | 1,293 / 1,303 / 1,305 |
+  | `MADV_POPULATE_WRITE` per 64 KiB, then stores | 1,221 / 1,227 / 1,236 |
+  | `MADV_POPULATE_WRITE` per 1 MiB, then stores | 1,265 / 1,269 / 1,268 |
+  | populated ahead by a second thread | 1,006 / 972 / 997 |
+  | `pwrite` into the memfd (the kernel's write path, as nfsd fills tmpfs) | 2,493 / 2,475 / 2,485 |
+  | resident pages | 14,052 / 13,820 / 13,981 |
+
+  Batching the populate does not help, and a second thread contends rather than helps. Only the kernel's write path,
+  which takes no fault and does not zero a page it overwrites whole, is cheaper, about 1.9×. A write syscall into the
+  content object is outside what R1's lint wall allows anywhere but `slates-land`.
+
+**Landed: a turn takes only the records its quantum can reach** (A-74, amended). Every turn copied every whole
+record its peek found; a 256 KiB WRITE outlasts any quantum, so its turn also copied the WRITE behind it and dropped
+it. Now a turn stops taking records once their bytes exceed what its quantum copies at the measured memcpy rate.
+- In process (`cargo build --release -p slates-cli --example nfs_large_write`, new: an in-process daemon, one
+  connection flushing a 512 MiB new file as 16 pipelined 256 KiB UNSTABLE WRITEs and a COMMIT, NFSv3 and NFSv4.2
+  interleaved each round; kiln-a094a12d, Fedora 6.19 x86_64, load 18.5–21.6; three interleaved runs per arm, best of
+  seven rounds each):
+
+  | run | main v3 | change v3 | main v4.2 | change v4.2 |
+  |---|---|---|---|---|
+  | 1 | 1,768.0 | 1,974.7 | 1,643.7 | 1,780.3 |
+  | 2 | 1,882.6 | 1,969.4 | 1,748.4 | 1,863.8 |
+  | 3 | 1,865.8 | 2,067.6 | 1,798.6 | 1,983.6 |
+
+- Through Linux's NFSv4.2 client, the incumbent harness (`linux_vs_nfsd.sh 400 64`, as of main) in a privileged
+  container per run, arms built on one runner and alternated A, B three times (branch `diag-nfs-write-7`, run
+  41989095517, Intel Xeon Platinum 8573C, 4 vCPU, load 0.9–2.4). The large write, MiB/s at 1, 4 and 16 workers:
+
+  | run | main | change | nfsd (main's run / the change's) |
+  |---|---|---|---|
+  | 1 | 435.7 / 441.3 / 369.2 | 456.2 / 472.2 / 452.9 | 690–719 / 700–725 |
+  | 2 | 405.3 / 421.3 / 358.0 | 445.0 / 464.4 / 455.6 | 699–729 / 708–732 |
+  | 3 | 399.8 / 415.0 / 353.5 | 441.9 / 432.5 / 464.0 | 697–718 / 690–717 |
+
+  Best of nine: 441.3 → 472.2. The change beats main beyond the spread at 1 worker and at 16 (+26%), and the two
+  overlap at 4 (432.5 against 441.3). Write p99 at 16 workers did not get worse: create 4,664–5,154 → 4,636–4,804 µs,
+  overwrite 1,874–2,152 → 1,562–1,918 µs, append 1,687–2,320 → 1,574–1,943 µs. Every byte read back identical.
+
+**What remains of the gap.** On that runner nfsd writes 690–732 MiB/s and slates 432–472. The largest cost is the
+fresh-page fault on the anchor's shared content object (41.5%), which slates can only avoid on its write path by
+having pages resident before the write arrives, or by filling them through the kernel's write path; both are design
+decisions put to Ada (GAPS). Sealing at rest (21%) is condition 9's.
+
 ### Mixed read-write tails on macOS's own NFS client, and a shard QoS class measured (condition 12; 2026-10-07)
 
 Command: `bash docs/wip/bench/mixed/mixed_mac.sh <release slates> <out dir> OPS LARGE_MIB`. It runs a release anchor

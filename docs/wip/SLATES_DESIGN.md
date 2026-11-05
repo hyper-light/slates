@@ -10477,6 +10477,9 @@ Status: built 2026-10-04.
     budget.
   - Proven: `pipelined_writes_past_a_turns_copy_budget_wait_queued_and_every_byte_lands` (failed first: the counter
     did not exist), and the pipelined-READ test above still batches.
+  - Measured (BENCHMARKS, "The large-file NFS write profiled"): through Linux's NFSv4.2 client on the incumbent
+    harness, interleaved on one CI runner, the large write's best of nine went 441.3 → 472.2 MiB/s and +26% at 16
+    workers, with write p99s no worse; in process, 1,644–1,799 → 1,780–1,984 MiB/s over NFSv4.2.
 
 ### A-75 — An NFSv4.1 session is granted one client's in-flight bound in slots (2026-10-04)
 Applied in the same change to: `crates/server/src/config.rs` (`nfs_v4_caps`), `crates/server/tests/nfs_mount.rs`,

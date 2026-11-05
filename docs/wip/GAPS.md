@@ -220,6 +220,28 @@
 > - **Not yet:** reproducibility from the tag (AC-9.5: nothing builds twice and compares); the macOS `Slates.app`
 >   bundle, code signing and notarization (B.7; they need an Apple Developer identity); `cargo-binstall` metadata.
 
+> **The large-file NFS write gap (VFS plan step 11, 2026-11-05): open; most of it is fresh content pages, a decision
+> for Ada.** On the incumbent harness (Docker on the M5 Max, one run on today's main) slates writes the 64 MiB file
+> at 808–957 MiB/s against nfsd's 1,556–1,831, short of the 967 MiB/s step 11 asks. Profiled through Linux's NFSv4.2
+> client on CI (run 41986870989), the one busy shard spends 41.5% of its samples faulting in fresh pages of the
+> anchor's shared content object, one 4 KiB `shmem_fault` per page, 21.0% sealing at rest, and 12.4% peeking and
+> copying records. With the pages still resident the same write matches nfsd (2,047–2,190 against 2,148–2,218 MiB/s,
+> run 41978355633); after A-105's idle purge gives them back it falls to 874–957. The harness never deletes its
+> large files, so it always writes fresh pages. BENCHMARKS, "The large-file NFS write profiled".
+> - **Landed:** a turn takes only the records its quantum can reach (A-74 amended): best of nine through Linux's
+>   client on CI, 441.3 → 472.2 MiB/s, and +26% at 16 workers (run 41989095517). Owed: the A/B on the incumbent
+>   Mac, which kiln could not reach for most of 2026-11-05.
+> - **Tried and not taken:** populating fresh pages in batches (`MADV_POPULATE_WRITE` per 64 KiB or 1 MiB: 1,221–1,269
+>   against 1,293–1,305 MiB/s by plain faults) and populating ahead on a second thread (972–1,006: the two threads
+>   contend), run 41987962954.
+> - **Needs Ada, one of:** (a) keep a pre-faulted reserve of free content pages, refilled at idle, sized from the
+>   shard's last write burst, so a burst after idle lands on resident pages (this amends A-105, which gives every free
+>   page back at the first idle tick, and costs that much resident memory per shard); (b) let the write path fill
+>   fresh content pages through the kernel's write path, `pwrite` into the content memfd, 1.9× faster per fresh page
+>   (2,475–2,493 against 1,293–1,305 MiB/s) but a write syscall outside `slates-land`, which R1's lint wall forbids;
+>   or (c) neither, and record the fresh-page fault as the named cost of keeping content in the anchor's shared RAM
+>   on hosts whose `shmem_enabled` is `never` (CI's runner; slates already asks for huge pages where it is not).
+
 > **WinFsp's hold release, DLL version and long paths fixed (2026-11-04, A-206; audit steps 4 and 6).** Run
 > [41978665514](https://github.com/hyper-light/slates/actions/runs/41978665514), `windows-latest` and `windows-11-arm`,
 > with WinFsp 2.1.25156 installed from its pinned URL and SHA-256. Each lane: the whole live suite 13 passed, 1 ignored.
