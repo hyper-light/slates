@@ -7242,7 +7242,7 @@ pages. The same commands, on adacachy (Linux 7.2.9, at load 90 to 218 from other
 - **The placing step now places two pages**, and took 264 to 579 µs, one sample each in debug builds. Not separated from
   the step's other work, as above.
 
-## A full edit and merge: the client's edit through the green's verdict (A-220; 2026-11-04 local, 2026-11-05 UTC)
+## A full edit and merge: the client's edit through the green's verdict (A-202; 2026-11-04 local, 2026-11-05 UTC)
 
 **The question.** Ada's goal of 2026-11-04: a full edit and merge under 1 ms, preferably under 50 µs. One sample is
 what an agent pays to change a file and learn the green's verdict: the client's `edit` of its work volume (64 bytes
@@ -7294,7 +7294,7 @@ C's and B's were 2 to 74 ms. D, every form, one run each (load 8.6): p50 51 to 6
 (accept 59/63/60 µs, ranged 68/69/69 µs, identical 58/58/51 µs, conflict 55/58/68 µs), p99 152 to 364 µs, except
 conflict at 10,000 files, p99 1.81 ms in that run and 0.16 to 0.17 ms in the three A/B runs above.
 
-**100,000 files** (the development Mac, 2026-11-05 16:06 to 16:14 UTC, load 7 to 16, the A-221 tree, `edit_merge_bench
+**100,000 files** (the development Mac, 2026-11-05 16:06 to 16:14 UTC, load 7 to 16, the A-202 tree, `edit_merge_bench
 --quiet-only --files 100000 --form accept --form conflict`, 3 × 1,000 samples): accept p50 60 µs, p99 199 µs, p999
 3.2 ms; conflict p50 48 µs, p99 153 µs, p999 0.30 ms. The same as at 10 files: a submit no longer reads what the green
 holds. This machine's derived partition budget holds a 400 MB green; CI's runner's does not (below).
@@ -7318,7 +7318,7 @@ a 400 MB seed exceeds it there; folding old chain entries (checkpointing) is owe
 a shape as refused at capacity and goes on. Two shards and a spinning client on three cores leave no core spare, which
 is why this runner's medians sit above the development Mac's.
 
-**The head identity holders recompute (A-221; 2026-11-05 UTC, the same box).** The identity became a set hash over the
+**The head identity holders recompute (A-202; 2026-11-05 UTC, the same box).** The identity became a set hash over the
 green's entries (LtHash16). Kept up to date in every commit (G) against none (F), load 21 to 37, interleaved: accept at
 10 files 44, 60, 51 µs (F) against 78, 91, 101 µs (G), conflicts alike; measured-and-rejected, since only a holder
 reads it. Brought up to date when read (H, built), load 23 to 31: accept at 10 files 31, 53, 56 µs (F) against 62, 50,
@@ -8007,7 +8007,7 @@ What it means:
   measured next (GAPS, the client's per-platform record).
 - The p99 and longer rows here are the load of the shared laptop, not code properties. A quiet machine's record is
   owed; this laptop had no quiet window this day.
-- **Since 2026-11-05** (A-220) the growth a merge showed here is gone: a submit no longer clones, walks or hashes the
+- **Since 2026-11-05** (A-202) the growth a merge showed here is gone: a submit no longer clones, walks or hashes the
   whole green (BENCHMARKS, "A full edit and merge"). The example now also holds the verdict forms of that section, and
   its client spins up to 1 ms for a reply where these rows spun 50 µs, so rows from before and after that day are not
   comparable at their tails.

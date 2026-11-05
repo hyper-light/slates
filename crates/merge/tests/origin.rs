@@ -154,7 +154,7 @@ fn the_head_identity_is_deterministic_and_matches_its_golden_vector() {
   let origin_identity = Green::with_origin(&fixed_origin()).head_identity();
   assert_eq!(
     hex(&origin_identity),
-    // A-221 (2026-11-05): the identity became a set hash over the green's entries; before it, the BLAKE3 of the
+    // A-202 (2026-11-05): the identity became a set hash over the green's entries; before it, the BLAKE3 of the
     // tables in order, `1fe971c080517dbe400bfbacca80db3df1fc451d8b4c934a9e947c7ed2ab50d8`.
     "d6caa3225c45d46abd0a0df26a956a59479af07bcabd8f6ce1cec61f293e4146",
     "the head identity changed; regenerate the golden vector only for a deliberate format change"

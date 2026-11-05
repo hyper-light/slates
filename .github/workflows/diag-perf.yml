@@ -1,6 +1,6 @@
 name: diag-perf
 
-# The edit-and-merge latency harness (`crates/client/examples/edit_merge_bench.rs`, A-220) on CI's runners: a diagnostics
+# The edit-and-merge latency harness (`crates/client/examples/edit_merge_bench.rs`, A-202) on CI's runners: a diagnostics
 # lane run only from `diag-perf-*` branches (never main), so a measurement can come from a machine quieter than a
 # shared development box. Each job builds the harness twice, at the pushed tree and at `BASE` (the harness copied in),
 # and runs the two binaries interleaved, printing the runner's load before every run.
@@ -45,7 +45,7 @@ jobs:
           cp target/release/examples/edit_merge_bench "$RUNNER_TEMP/bin/edit_merge_bench_base"
       - name: Interleaved runs
         run: |
-          # The base answers the identical form wrongly (the bug A-220's change fixed), so the base runs the other forms.
+          # The base answers the identical form wrongly (the bug A-202's change fixed), so the base runs the other forms.
           forms="--form accept --form ranged --form conflict"
           shapes="--files 10 --files 1000 --files 10000"
           for round in 1 2 3; do

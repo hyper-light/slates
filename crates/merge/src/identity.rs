@@ -1,5 +1,5 @@
 //! A green's head identity as a set hash over its entries (§4.16 "Apply on holders": every holder recomputes the
-//! identity and compares it with the merge record's; A-221). Each entry of the green's state (a file and its bytes, a
+//! identity and compares it with the merge record's; A-202). Each entry of the green's state (a file and its bytes, a
 //! directory, a mode, a symlink, a hard link, an extended attribute, a FIFO/socket inode) is encoded as it always was
 //! (its kind's tag, then every field length-prefixed) and expanded by BLAKE3's extendable output into [`LANES`]
 //! sixteen-bit lanes; the green's sum is those vectors added lane by lane modulo 2^16, and the identity is the BLAKE3
