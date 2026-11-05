@@ -1,0 +1,73 @@
+name: diag-clients
+
+# Diagnostics only, never on main: an interleaved A/B/C of the provisioning histogram on every platform the clients
+# agent cannot reach from its own machine (macOS is measured natively there): main (MAIN_SHA), A-208's shard count
+# (SMT_SHA) and A-208 whole (the pushed commit's parent, CIPHER_SHA). The arms alternate, three rounds.
+on:
+  push:
+    branches: ["diag-clients-*"]
+
+env:
+  CARGO_TERM_COLOR: always
+  MAIN_SHA: c0c8d28c
+  SMT_SHA: 93c5c0ac
+  CIPHER_SHA: 89382153
+
+jobs:
+  ab:
+    name: provisioning main/smt/cipher (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: The runner and its cores
+        run: |
+          uname -a || true
+          date -u
+          if command -v lscpu >/dev/null; then lscpu | grep -E 'Model name|^CPU\(s\)|Thread|Core|Socket' || true; fi
+          for cpu in /sys/devices/system/cpu/cpu[0-9]*; do
+            [ -r "$cpu/topology/thread_siblings_list" ] && echo "$(basename "$cpu"): $(cat "$cpu/topology/thread_siblings_list")"
+          done
+          if command -v powershell >/dev/null; then
+            powershell -NoProfile -Command "Get-CimInstance Win32_Processor | Format-List Name,NumberOfCores,NumberOfLogicalProcessors"
+          fi
+          uptime || true
+      - name: Build the three arms
+        run: |
+          mkdir -p ../arms
+          for arm in main smt cipher; do
+            case $arm in main) sha=$MAIN_SHA;; smt) sha=$SMT_SHA;; cipher) sha=$CIPHER_SHA;; esac
+            git worktree add "../src-$arm" "$sha"
+            ( cd "../src-$arm" && CARGO_TARGET_DIR="../target-$arm" cargo build --release --locked -p slates-client --example provision_bench )
+            for exe in "../target-$arm/release/examples/provision_bench" "../target-$arm/release/examples/provision_bench.exe"; do
+              if [ -f "$exe" ]; then cp "$exe" "../arms/$arm${exe##*provision_bench}"; fi
+            done
+          done
+          ls -la ../arms
+      - name: Three rounds, the arms alternating
+        run: |
+          for round in 1 2 3; do
+            for arm in main smt cipher; do
+              echo "== round $round: $arm at $(date -u +%H:%M:%S) UTC; $(uptime 2>/dev/null || echo 'no load average')"
+              status=0
+              ../arms/$arm || status=$?
+              echo "== round $round: $arm exit $status"
+            done
+          done
