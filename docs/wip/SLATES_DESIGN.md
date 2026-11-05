@@ -5706,6 +5706,23 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > 40 s wait and the healed candidate never caught up (1 of 2 runs at first; 0 of 8 since). Live exchanges now run under
 > the daemon's liveness budget (`fleet::live_budget`), and an exchange no holder answered drops that link to be dialed
 > afresh (`live_ship::lose_links`), as an unanswered discovery exchange does.
+>
+> **Chaos, continued (2026-11-05).** Three more flows, and two more defects they found:
+> - *A superseded owner resumed*: the owner stopped until the survivors took the volume over (served whole after
+>   1.8–2.1 s), two more writes made on the successor, then the old owner resumed and a write tried through it: never
+>   acknowledged within the 40 s wait, never on the successor (`a_superseded_owner_resumed_after_its_takeover_is_fenced`).
+>   The first run of it hung on the successor's own first write: a holder off the new chain was offered entries from
+>   its last on-chain head, which it refused, forever, because the shipper's `pending` did not know the holder was owed
+>   an install. The model, driven as the daemon drives it (re-ship only what `pending` says), failed Convergence the
+>   same way; `Shipper` now remembers holders owed an install, the model passes again (f=1: 309 installs, f=2: 455).
+>   And an install at a checkpoint a holder already holds is refreshed by a new whole record, which may go one entry
+>   past the credit (`Shipper::append_checkpoint`): with both candidates behind, waiting for credit no laggard could
+>   free deadlocked the stall flow.
+> - *Clients cut off mid-write*: ten writers SIGKILLed right after starting, between finished writes: the log whole on
+>   every candidate, every deferred reply resolved (awaited 10, resolved 10).
+> - *A live volume destroyed*: its candidates let their copy of its log go once the tombstone reaches them
+>   (`live_ship::let_go`); before, they kept it forever (red without the release, 1 of 1).
+> All eight flows pass together in 55 s.
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the

@@ -654,34 +654,36 @@ fn signal(process: &FleetProcess, signal: rustix::process::Signal) {
   rustix::process::kill_process(rustix::process::Pid::from_child(&process.child), signal).unwrap();
 }
 
-/// Creates a live-shipped volume on `owner` and attaches it for writing: its id and the attachment.
-fn create_live_volume(owner: &str, name: &str) -> (String, String) {
+/// Creates a live-shipped volume on `owner`: its id.
+fn create_live_volume(owner: &str, name: &str) -> String {
   let id = value_of(
     &run_ready(owner, &["volume", "create", name, "--bounded", "8MiB"]),
     "id",
   );
   let (code, _, err) = run(owner, &["live-ship", &id]);
   assert_eq!(code, 0, "live-ship: {err}");
-  let attachment = value_of(&run_ready(owner, &["attach", &id, "--write"]), "attachment");
-  (id, attachment)
+  id
 }
 
-/// Writes `/file-N` for each N in `files` through `slates write`; each write's latency as the client saw it.
-fn write_files(
-  owner: &str,
-  (id, attachment): (&str, &str),
-  files: std::ops::Range<usize>,
-) -> Vec<Duration> {
+/// Writes `/file-N` for each N in `files` through `slates write`, each through a fresh attachment (an attachment made
+/// by a `slates attach` process is reaped once that client is gone, so one kept across writes is refused `NotFound`
+/// a few seconds on), let go once the write is answered; each write's latency as the client saw it, attach included.
+fn write_files(owner: &str, id: &str, files: std::ops::Range<usize>) -> Vec<Duration> {
   files
     .map(|file| {
       let began = Instant::now();
+      let attachment = value_of(&run_ready(owner, &["attach", id, "--write"]), "attachment");
       let (code, err) = run_with_stdin(
         owner,
-        &["write", id, attachment, &format!("/file-{file}")],
+        &["write", id, &attachment, &format!("/file-{file}")],
         live_body(file).as_bytes(),
       );
       assert_eq!(code, 0, "write /file-{file}: {err}");
-      began.elapsed()
+      let elapsed = began.elapsed();
+      // Let the attachment go, or a long run meets the volume's attachment bound before the reap does.
+      let (code, _, err) = run(owner, &["detach", &attachment]);
+      assert_eq!(code, 0, "detach: {err}");
+      elapsed
     })
     .collect()
 }
@@ -706,10 +708,10 @@ fn a_paused_candidate_neither_stops_writes_nor_stays_behind() {
     .iter()
     .filter(|instance| *instance != owner)
     .collect();
-  let (id, attachment) = create_live_volume(owner, "paused");
-  write_files(owner, (&id, &attachment), 0..1);
+  let id = create_live_volume(owner, "paused");
+  write_files(owner, &id, 0..1);
   signal(&fleet.daemons[paused_index], rustix::process::Signal::STOP);
-  let latencies = write_files(owner, (&id, &attachment), 1..FILES);
+  let latencies = write_files(owner, &id, 1..FILES);
   let at_return = live_line(owner, "shipping", &id);
   signal(&fleet.daemons[paused_index], rustix::process::Signal::CONT);
   let (caught_up, shipping, held) = wait_caught_up(owner, &others, &id);
@@ -755,8 +757,8 @@ fn writes_stay_durable_through_injected_candidate_stalls() {
     .iter()
     .filter(|instance| **instance != owner)
     .collect();
-  let (id, attachment) = create_live_volume(&owner, "stalled");
-  write_files(&owner, (&id, &attachment), 0..1);
+  let id = create_live_volume(&owner, "stalled");
+  write_files(&owner, &id, 0..1);
   let pids: Vec<rustix::process::Pid> = (0..fleet.daemons.len())
     .filter(|index| *index != owner_index)
     .map(|index| rustix::process::Pid::from_child(&fleet.daemons[index].child))
@@ -787,9 +789,16 @@ fn writes_stay_durable_through_injected_candidate_stalls() {
         let _ = rustix::process::kill_process(*pid, rustix::process::Signal::CONT);
       }
     });
-    let latencies = write_files(&owner, (&id, &attachment), 1..1 + WRITES_UNDER_STALLS);
-    stalling.store(false, std::sync::atomic::Ordering::Release);
-    latencies
+    // The stalls stop however the writes end: a write's failed assertion unwinds through this guard, and the scope,
+    // which joins its threads before it passes a panic on, would otherwise wait on a stall thread that never stops.
+    struct StopStalls<'a>(&'a std::sync::atomic::AtomicBool);
+    impl Drop for StopStalls<'_> {
+      fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+      }
+    }
+    let _stop = StopStalls(&stalling);
+    write_files(&owner, &id, 1..1 + WRITES_UNDER_STALLS)
   });
   let at_return = live_line(&owner, "shipping", &id);
   let (caught_up, shipping, held) = wait_caught_up(&owner, &others, &id);
@@ -817,4 +826,199 @@ fn writes_stay_durable_through_injected_candidate_stalls() {
     "both candidates caught up once the stalls stopped: {shipping:?} {held:?}"
   );
   assert_eq!(late, 0, "no write was refused for want of room to wait");
+}
+
+/// A-200 under a destroyed volume: do destroy a live-shipped volume its candidates hold. Expect both candidates to
+/// let their sealed copy of its log go once the destroy's tombstone reaches them: nothing of a destroyed volume is kept
+/// on any host (a holder kept it forever before, an unbounded store of what no owner will ship to again).
+#[test]
+fn a_destroyed_live_volumes_copies_are_let_go_by_its_candidates() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping destroy flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-destroy");
+  let owner = &fleet.instances[(fleet.bootstrap + 1) % fleet.instances.len()];
+  let others: Vec<&String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| *instance != owner)
+    .collect();
+  let id = create_live_volume(owner, "destroyed");
+  write_files(owner, &id, 0..FILES);
+  let (caught_up, _, _) = wait_caught_up(owner, &others, &id);
+  assert!(caught_up, "both candidates held the log before the destroy");
+  let (code, _, err) = run(owner, &["volume", "destroy", &id]);
+  assert_eq!(code, 0, "destroy: {err}");
+  let deadline = Instant::now() + FLEET_WAIT;
+  let held = loop {
+    let held: Vec<Option<LiveLine>> = others
+      .iter()
+      .map(|other| live_line(other, "held", &id))
+      .collect();
+    if held.iter().all(Option::is_none) || Instant::now() >= deadline {
+      break held;
+    }
+    pause();
+  };
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  assert!(
+    held.iter().all(Option::is_none),
+    "the candidates let the destroyed volume's log go: {held:?}"
+  );
+}
+
+/// A-200 under clients cut off mid-write: do start `ROUNDS` writes and kill each client process at once (SIGKILL),
+/// between finished writes. Expect the owner's log durable at its head with nothing owed, every candidate at that head,
+/// and every reply that waited for durability resolved (none left held for a client that is gone).
+#[test]
+fn clients_cut_off_mid_write_leave_the_live_log_whole() {
+  /// Shape: the writes whose clients are killed.
+  const ROUNDS: usize = 10;
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping disconnect flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-cut");
+  let owner = &fleet.instances[(fleet.bootstrap + 1) % fleet.instances.len()];
+  let others: Vec<&String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| *instance != owner)
+    .collect();
+  let id = create_live_volume(owner, "cut");
+  for round in 0..ROUNDS {
+    let attachment = value_of(&run_ready(owner, &["attach", &id, "--write"]), "attachment");
+    let mut child = slates()
+      .arg("--instance")
+      .arg(owner)
+      .args(["write", &id, &attachment, &format!("/cut-{round}")])
+      .stdin(Stdio::piped())
+      .stdout(Stdio::null())
+      .stderr(Stdio::null())
+      .spawn()
+      .unwrap();
+    {
+      use std::io::Write;
+      let _ = child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(live_body(round).as_bytes());
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    write_files(owner, &id, round..round + 1);
+  }
+  let (caught_up, shipping, held) = wait_caught_up(owner, &others, &id);
+  let awaited = counter(owner, "fleet.live.awaited");
+  let resolved = counter(owner, "fleet.live.resolved");
+  let unrecorded = counter(owner, "fleet.live.unrecorded");
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!(
+    "live cut: {shipping:?} {held:?} awaited={awaited} resolved={resolved} unrecorded={unrecorded}"
+  );
+  assert!(
+    caught_up,
+    "the log is whole on every candidate: {shipping:?} {held:?}"
+  );
+  assert_eq!(
+    awaited,
+    resolved + unrecorded,
+    "every held reply was resolved"
+  );
+}
+
+/// A-200 and StaleNeverCommits across processes: do write to a live volume, stop its owner's process until the
+/// survivors have taken the volume over, write more on the successor, then resume the old owner and try to write
+/// through it. Expect the successor to serve every write acknowledged before and after the takeover, and the old
+/// owner's write never acknowledged (refused, or never answered within the wait): a superseded owner is fenced.
+#[test]
+fn a_superseded_owner_resumed_after_its_takeover_is_fenced() {
+  /// Shape: how long the resumed owner's write is given before it counts as not acknowledged: the fleet wait.
+  const STALE_WRITE_WAIT: Duration = FLEET_WAIT;
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping fencing flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-fence");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = fleet.instances[owner_index].clone();
+  let id = create_live_volume(&owner, "fenced");
+  write_files(&owner, &id, 0..3);
+  signal(&fleet.daemons[owner_index], rustix::process::Signal::STOP);
+  let survivors: Vec<&String> = fleet
+    .instances
+    .iter()
+    .filter(|instance| **instance != owner)
+    .collect();
+  let (successor, took) = wait_served_whole(&survivors, &id, 3);
+  write_files(&successor, &id, 3..5);
+  signal(&fleet.daemons[owner_index], rustix::process::Signal::CONT);
+  // The old owner's write: a fresh attachment through it, then the write. A refused attach is already a fenced owner
+  // (it cannot take the write at all); one it grants must not lead to an acknowledged write.
+  let (attach_code, attached, attach_err) = run(&owner, &["attach", &id, "--write"]);
+  let attachment = if attach_code == 0 {
+    value_of(&attached, "attachment")
+  } else {
+    eprintln!(
+      "live fence: the resumed old owner refused the attach: {}",
+      attach_err.trim()
+    );
+    "0".to_owned()
+  };
+  let mut stale = slates()
+    .arg("--instance")
+    .arg(&owner)
+    .args(["write", &id, &attachment, "/stale"])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  {
+    use std::io::Write;
+    let _ = stale
+      .stdin
+      .take()
+      .unwrap()
+      .write_all(b"written through a superseded owner");
+  }
+  let began = Instant::now();
+  let stale_outcome = loop {
+    if let Some(status) = stale.try_wait().unwrap() {
+      break Some(status.code());
+    }
+    if began.elapsed() >= STALE_WRITE_WAIT {
+      let _ = stale.kill();
+      let _ = stale.wait();
+      break None;
+    }
+    pause();
+  };
+  let (still, _) = wait_served_whole(&[&successor], &id, 5);
+  let (code, out, _) = run(&successor, &["read", &id, "/stale"]);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!(
+    "live fence: taken over by {successor} after {took:?}; stale write outcome {stale_outcome:?}; successor read of \
+     /stale: {code} {out:?}"
+  );
+  assert_eq!(still, successor);
+  assert!(
+    stale_outcome != Some(Some(0)),
+    "the superseded owner never acknowledged a write: {stale_outcome:?}"
+  );
+  assert!(
+    code != 0 || out.is_empty(),
+    "the superseded owner's write never reached the volume: {out:?}"
+  );
 }

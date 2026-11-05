@@ -638,6 +638,9 @@ pub struct Shipper {
   /// The head of the last whole state the owner shipped ([`Shipper::mark_checkpoint`]): on the chain, and what an
   /// install names, so a holder installed there is credited even once the retained tail no longer reaches it.
   checkpoint: Option<Head>,
+  /// The holders whose last answer said they need an install (off the chain, or behind the retained tail), until one
+  /// answers with a head on the chain: [`Shipper::pending`] answers `Install` for them.
+  owed_install: std::collections::BTreeSet<HostId>,
 }
 
 impl Shipper {
@@ -669,6 +672,7 @@ impl Shipper {
       held: BTreeMap::new(),
       durable: None,
       checkpoint: None,
+      owed_install: std::collections::BTreeSet::new(),
     };
     shipper.durable = shipper.recompute_durable();
     shipper
@@ -725,6 +729,23 @@ impl Shipper {
         durable: self.durable,
       });
     }
+    self.append_unchecked(payload)
+  }
+
+  /// Appends a whole state (a checkpoint, which [`Shipper::mark_checkpoint`] then names), allowed one entry past the
+  /// credit: a checkpoint is how holders that fell behind the retained tail are caught up, and when every holder has,
+  /// nothing becomes durable to free the credit, so a checkpoint that waited for it would never come (both candidates
+  /// stalled through 30 writes waited 19 minutes, 2026-11-05, `live_fleet`). Still bounded: refused past `credit + 1`.
+  pub fn append_checkpoint(&mut self, payload: Vec<u8>) -> Result<Entry, LiveError> {
+    if self.in_flight() > self.credit {
+      return Err(LiveError::NoCredit {
+        durable: self.durable,
+      });
+    }
+    self.append_unchecked(payload)
+  }
+
+  fn append_unchecked(&mut self, payload: Vec<u8>) -> Result<Entry, LiveError> {
     let (position, previous) = match self.head {
       Some(head) => (
         head.position.checked_add(1).ok_or(LiveError::Malformed)?,
@@ -781,11 +802,13 @@ impl Shipper {
       return Next::Nothing;
     };
     let Some(head) = held else {
-      return self.entries_after(None);
+      return self.owe(holder, self.entries_after(None));
     };
     if !self.on_chain(&head) {
+      self.owed_install.insert(holder);
       return Next::Install;
     }
+    self.owed_install.remove(&holder);
     let newer = self
       .held
       .get(&holder)
@@ -798,15 +821,32 @@ impl Shipper {
     if head == own {
       Next::Nothing
     } else {
-      self.entries_after(Some(head.position))
+      let next = self.entries_after(Some(head.position));
+      self.owe(holder, next)
     }
   }
 
-  /// What `holder` lacks by the head it last reported (everything, when it has reported none): the owner's period
-  /// re-ships this, so a lost entry or reply is recovered without waiting on the next write.
+  /// Notes an `Install` answer as owed to `holder`, so [`Shipper::pending`] keeps answering it until the holder is back
+  /// on the chain.
+  fn owe(&mut self, holder: HostId, next: Next) -> Next {
+    if next == Next::Install {
+      self.owed_install.insert(holder);
+    }
+    next
+  }
+
+  /// What `holder` lacks by the head it last reported (everything, when it has reported none; an install when its last
+  /// answer was off the chain or behind the tail): the owner's period re-ships this, so a lost entry or reply is
+  /// recovered without waiting on the next write. Until 2026-11-05 a holder off the chain was offered entries from its
+  /// last on-chain head, which it refused, forever: a takeover's successor never caught the surviving candidate up and
+  /// every write it took waited (`live_fleet`, a write stuck 21 minutes; the model, driven as the daemon drives it,
+  /// failed Convergence).
   pub fn pending(&self, holder: HostId) -> Next {
     if self.head.is_none() || !self.holders.contains(&holder) {
       return Next::Nothing;
+    }
+    if self.owed_install.contains(&holder) {
+      return Next::Install;
     }
     match self.held.get(&holder) {
       Some(head) if Some(*head) == self.head => Next::Nothing,
@@ -826,6 +866,11 @@ impl Shipper {
   /// The last whole state shipped ([`Shipper::mark_checkpoint`]).
   pub fn checkpoint(&self) -> Option<Head> {
     self.checkpoint
+  }
+
+  /// What `holder` last reported holding on this chain (`None`: nothing yet, or never on it).
+  pub fn held_by(&self, holder: HostId) -> Option<Head> {
+    self.held.get(&holder).copied()
   }
 
   /// Whether `head` is on this owner's chain: its head, its start, its last checkpoint, or a retained entry.

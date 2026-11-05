@@ -312,8 +312,15 @@ impl Run {
         if self.owners[index].fenced {
           return;
         }
+        // As the daemon drives its shipper (`slates_server::live_ship::fold_into`): the reply is folded, a fence stops
+        // the owner, and what is sent next is what `pending` says the holder lacks, not the reply's own answer.
         let next = self.owners[index].shipper.on_reply(message.from, reply);
-        self.send_next(index, message.from, next);
+        if let Next::Fenced(_) = next {
+          self.owners[index].fenced = true;
+        } else {
+          let pending = self.owners[index].shipper.pending(message.from);
+          self.send_next(index, message.from, pending);
+        }
         self.note_durable(index);
       }
     }

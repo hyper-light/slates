@@ -69,6 +69,17 @@ const LIVE_NO_SESSION: &str = "fleet.live.no_session";
 const LIVE_UNANSWERED: &str = "fleet.live.unanswered";
 /// Counter: a record link dropped because its holder answered nothing ([`lose_links`]).
 const LIVE_LINK_LOST: &str = "fleet.live.link_lost";
+/// Counter: a destroyed volume's live log a candidate let go.
+const LIVE_LET_GO: &str = "fleet.live.let_go";
+
+/// Lets this candidate's copy of `object`'s live log go: its tombstone was accepted, so no owner will ship to it again.
+/// Kept, it was a store that only grew (found 2026-11-05 by the destroy flow, `live_fleet`).
+pub(crate) fn let_go(state: &mut ShardState, object: ObjectId) {
+  if state.live.held.remove(&object).is_some() {
+    state.count(LIVE_LET_GO, 1);
+  }
+}
+
 /// Counter: takeover fetches this node answered with what it holds.
 const LIVE_FETCHED: &str = "fleet.live.fetched";
 /// Counter: entries and installs this node kept as a candidate.
@@ -530,7 +541,13 @@ pub(crate) fn published(
   let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
     return;
   };
-  match live.shipper.append(payload.clone()) {
+  // A whole record is a checkpoint and may go one past the credit (`Shipper::append_checkpoint`); a delta waits for it.
+  let appended = if whole {
+    live.shipper.append_checkpoint(payload.clone())
+  } else {
+    live.shipper.append(payload.clone())
+  };
+  match appended {
     Ok(entry) => {
       live.owes_whole = false;
       if whole {
@@ -656,13 +673,16 @@ fn content_runs(
   Some(runs)
 }
 
-/// What each holder of the volume lacks, as messages: entries, or an install from the last whole entry.
-fn pending_sends(state: &ShardState, volume: [u8; 16]) -> Vec<Send> {
-  let Some(live) = state.live.shipping.get(&volume) else {
+/// What each holder of the volume lacks, as messages: entries, or an install from the last whole entry. An install
+/// owed at a checkpoint the holder already holds cannot move it, so instead the volume is marked to owe a fresh whole
+/// record (its next publication or the period appends one, and the install is made from that).
+fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
+  let Some(live) = state.live.shipping.get_mut(&volume) else {
     return Vec::new();
   };
   let object = ObjectId(volume);
   let mut sends = Vec::new();
+  let mut stale_checkpoint = false;
   for holder in live.shipper.holders() {
     match live.shipper.pending(*holder) {
       Next::Entries(entries) => {
@@ -676,24 +696,37 @@ fn pending_sends(state: &ShardState, volume: [u8; 16]) -> Vec<Send> {
         }
       }
       Next::Install => {
-        if let Some((head, payload)) = &live.whole {
-          let install = Install {
-            owner: live.shipper.owner(),
-            object,
-            epoch: live.shipper.epoch(),
-            head: *head,
-            state: payload.clone(),
-          };
-          sends.push(Send {
-            object,
-            holder: *holder,
-            stream: slates_cluster::live::LIVE_STATE_STREAM,
-            bytes: install.encode(),
-          });
+        let Some((head, payload)) = &live.whole else {
+          stale_checkpoint = true;
+          continue;
+        };
+        if live
+          .shipper
+          .held_by(*holder)
+          .is_some_and(|held| held.rank() >= head.rank())
+        {
+          stale_checkpoint = true;
+          continue;
         }
+        let install = Install {
+          owner: live.shipper.owner(),
+          object,
+          epoch: live.shipper.epoch(),
+          head: *head,
+          state: payload.clone(),
+        };
+        sends.push(Send {
+          object,
+          holder: *holder,
+          stream: slates_cluster::live::LIVE_STATE_STREAM,
+          bytes: install.encode(),
+        });
       }
       Next::Nothing | Next::Fenced(_) => {}
     }
+  }
+  if stale_checkpoint {
+    live.owes_whole = true;
   }
   sends
 }
@@ -829,19 +862,18 @@ fn fold_into(state: &mut ShardState, replies: Vec<(ObjectId, HostId, Vec<u8>)>) 
       continue;
     };
     let before = live.shipper.durable();
+    let held_before = live.shipper.held_by(host);
     let reply = decode_reply(&bytes);
-    // Only an answer that names a head moves anything; a refusal (a holder that does not hold the volume's catalog
-    // yet, or over its bound) is left to the period. Re-shipping on a refusal looped at the network's speed: 982 and
-    // 5,501 refusals on the two holders of one five-write run (2026-11-05, `live_fleet`).
-    let progressed = matches!(
-      reply,
-      Ok(Some(_)) | Err(LiveError::Behind { head: Some(_) })
-    );
     if let Next::Fenced(_) = live.shipper.on_reply(host, reply) {
       // A later epoch holds the volume: this owner was superseded and ships no more of it.
       state.live.shipping.remove(&object.0);
       continue;
     }
+    // Only an answer that moved the holder forward on the chain is followed at once; anything else (a refusal, a holder
+    // that does not hold the volume's catalog yet, one off the chain) is left to the period. Following every answer
+    // looped at the network's speed: 982 and 5,501 refusals on the two holders of one five-write run, and later a holder
+    // installed at a checkpoint the tail had passed, re-installed there without end (2026-11-05, `live_fleet`).
+    let progressed = live.shipper.held_by(host) != held_before;
     if live.shipper.durable() > before {
       state.count(LIVE_DURABLE, 1);
       resolve(state, object.0);
@@ -872,7 +904,7 @@ pub(crate) async fn period(origin: u16, shard: u16) {
           .live
           .shipping
           .get(volume)
-          .is_some_and(|live| live.owes_whole && live.shipper.in_flight() < CREDIT);
+          .is_some_and(|live| live.owes_whole && live.shipper.in_flight() <= CREDIT);
         if owed {
           published(s, slates_db::catalog::VolumeId { bytes: *volume }, None);
         }
