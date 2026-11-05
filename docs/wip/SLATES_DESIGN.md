@@ -11557,6 +11557,8 @@ Status: built 2026-10-06, Linux; macOS by A-110, Windows by A-205.
 - The threshold: `discard_from_bytes` is the smallest measured `memcpy` whose time exceeds one syscall: 16 KiB on a
   4 KiB-page Linux host, 4 KiB on this M5 Max. Smaller free blocks stay resident, being cheaper to keep than to fault
   back.
+- Amended by A-214 (2026-11-05): an idle shard keeps its last write burst's net growth of free pages pre-faulted, and
+  the purge gives back every free block beyond it.
 - Owed:
   - macOS: built by A-110 (2026-10-06).
   - Windows: built by A-205 (2026-11-04): `DiscardVirtualMemory`, with its zeroing step at reuse, measured.
@@ -12846,6 +12848,37 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph, its 
 - **Arm64 Windows proven** since (2026-10-27): the direct-map client tests, 20 of 20, on CI's `windows-11-arm` (run
   40525669353), red-checked there (runs 40570140348, 40572762430). **Owed:** replies that stalled on Windows with many
   daemons at once in one process (pre-existing, GAPS). The restart tests' named-section collision there was the harness and two Windows defects beneath it, fixed by A-176.
+
+### A-214 — An idle shard keeps its last write burst's worth of free content pages pre-faulted (accepted 2026-11-05, VFS plan step 11; amends A-105)
+Status: accepted 2026-11-05 (Ada's decision through the supervisor: option (a) of GAPS' large-file write gap); being
+built. It amends A-105's "every free block back at the first idle tick".
+- **Why.** A large write through Linux's NFSv4.2 client spends 41.5% of the volume's shard faulting in fresh pages of
+  the anchor's shared content object, one 4 KiB `shmem_fault` a page (CI run 41986870989). The same write over pages
+  still resident matches the kernel's nfsd (2,047–2,190 against 2,148–2,218 MiB/s, run 41978355633); after A-105's
+  purge has given them back it runs at 874–957. A host whose `shmem_enabled` is `never` (CI's runners) backs the
+  object with base pages only, and the per-page cost cannot be batched away or moved to another thread (run
+  41987962954: `MADV_POPULATE_WRITE` per 64 KiB or 1 MiB 1,221–1,269 MiB/s, a second thread 972–1,006, plain faults
+  1,293–1,305). What remains is to fault the pages before the write needs them: at idle, off the write path.
+- **What.** At each reap tick that finds the shard idle (A-105's test: its arena allocated nothing since the last):
+  1. **The burst.** The shard's last write burst is the net growth of its arena's allocated bytes over its last busy
+     period: the allocated bytes at this idle tick less those at the idle tick before it, at least zero. A file written
+     and deleted in one busy period nets zero; a file kept nets its size.
+  2. **The reserve.** Derived: `reserve = min(last burst, reserve_per_shard, the arena's free bytes)`, the burst
+     bounded by the shard's memory share and by what the arena holds free. Its ranges are the free blocks the next
+     allocations of one chunk window would take, read off the buddy's free lists without changing them
+     (`Buddy::upcoming`): the lists are LIFO and a split hands out its pieces in ascending order, so the reading is
+     exact for allocations of that size and only drifts when others interleave, which then land on resident pages
+     anyway.
+  3. **The purge** gives back every resident free block except the reserve's (A-105 otherwise unchanged).
+  4. **The refill** faults the reserve's pages that are not resident, in slices of `quantum / page_fault_ns` pages
+     (§4.2's pre-fault batch, the profile's measured base-page fault), yielding between slices and stopping when a
+     request makes the shard busy. Never on the write path. The pages are charged where A-105 charges a freed block
+     kept resident (the arena's resident free bytes), and counted (`content.prefaulted_bytes`).
+- **The trade.** Each shard holds up to its last burst's net growth of free pages resident while idle, at most its
+  memory share; a shard whose last busy period grew nothing holds none. In exchange a burst like the last lands on
+  resident pages. (The measured resident cost per shard and the throughput won are recorded in BENCHMARKS when built.)
+- **Not done:** decaying the reserve over time. A-105's reason (a daemon kept its high-water mark forever) does not
+  apply: the reserve follows the last busy period, so a delete or a quiet period that grew nothing returns it.
 
 ### A-211 — A DAX ask is refused where no view could begin (accepted and built 2026-11-04)
 Applied in the same change to: §4.6 by reference, `docs/wip/shards/dax-protocol.md` ("Windows"), GAPS,

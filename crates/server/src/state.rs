@@ -217,6 +217,12 @@ pub struct ShardState {
   /// The content arena's allocation count at the last reap tick: unchanged at the next means the shard allocated
   /// nothing in between, so its free blocks can go back to the OS (A-105, `daemon::purge_if_idle`).
   pub(crate) purge_seen_allocations: u64,
+  /// The content arena's allocation count and allocated bytes at the last idle reap tick (A-214), `None` before the
+  /// first: a later idle tick with another count ends a busy period, whose net growth is the allocated bytes' rise.
+  pub(crate) burst_seen: Option<(u64, usize)>,
+  /// The net growth of the content arena's allocated bytes over its last busy period (A-214): the write burst an idle
+  /// shard keeps free pages pre-faulted for (`daemon::purge_if_idle`).
+  pub(crate) last_burst: usize,
   /// The journal generation whose dead recovery memory an idle shard last gave back (A-117,
   /// `daemon::return_dead_recovery`): a later publication moves the generation and re-arms the return.
   pub(crate) recovery_returned_at: Option<u64>,
