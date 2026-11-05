@@ -75,7 +75,7 @@
 > - **The receiver that replaced WinFsp's dispatcher is unmeasured.** It is one thread with a new event per control
 >   transaction, where the DLL dispatcher ran two threads; BENCHMARKS has no entry for it.
 > - **Two failures recorded open below**: the wake-learning case under load (fixed 2026-11-04, A-199) and the fleet
->   routing Create reply.
+>   routing Create reply (fixed 2026-11-04 in its fixture; a second, rarer failure of that history stays open).
 >
 > Twenty goals of this plan's stack, Steps 10–15 among them, were closed in 2–4 s each with no work. They are
 > restored in order after these fixes.
@@ -99,13 +99,26 @@
 > 89/100 failures on one and two busy CPUs, after 0/100 and 0/100; all nine ring cases on two busy CPUs 95/100
 > before, 0/100 after. Record: `docs/bugs/2026-11-04-a-late-wake-confirmation-cost-the-client-two-samples.md`.
 
-> **Fleet setup failure still unattributed (2026-11-02, §4.8 Lookup).** Main CI 41538865390 on `8a3fdc63` passes
-> Windows and QEMU but its Linux fleet target passes 85/86 active histories: the returning-session location case
-> gets an unexpected Create reply while choosing its routing candidate. The helper discarded that reply, so its
-> failure now prints the candidate name and complete typed verdict. The same fleet source passes on parent
-> `663e4df8`; the exact isolated case passes once on adacachy in 5.25 s. Neither result names the original verdict
-> or cause. Keep the failure open for that evidence; no retry or weaker assertion is added. Record:
-> `docs/bugs/2026-11-02-a-fleet-routing-fixture-discarded-its-unexpected-create-reply.md`.
+> **A survivor's other shard never held its live peer: fixed (2026-11-04, §4.8 Membership).** Main CI 41774055498
+> failed the CLI fleet deployment test: after the owner's death one survivor's `status` listed only itself. The
+> control shard recorded a detector belief as folded before its admission rule refused it (the peer's id not yet
+> learned on contact), so learn-on-contact later made the peer alive on the control shard alone and no other shard
+> ever held it; all four failing logs show the peer folded on the control shard once and on the other shard never.
+> A refused belief is now offered again next turn (`fold_on_control`, `crates/server/src/member_task.rs`); a unit
+> test fails on the old fold. Interleaved on two busy CPUs, 50 runs each: before 1 failure, after 0. Record:
+> `docs/bugs/2026-11-04-a-survivors-other-shard-never-held-its-live-peer.md`.
+
+> **Fleet setup failure attributed and fixed (2026-11-04; opened 2026-11-02, §4.8 Lookup).** The routing history's
+> first create was answered at once (0.000 s in main CI 41538865390): the owner refused `ConsensusNotInitialized`.
+> The fixture's settle step checked the committed membership through the council and root (the root only on root
+> voters), but a node admits a placement write only once its own readiness follows, one coordinator period later or
+> after a root learner's import. A create on every node right after the settle was refused once in 40 fleets on two
+> busy CPUs (1 in 340 fleets in all). The settle step now also waits for every node's readiness
+> (`Daemon::consensus_ready`); the new test `a_settled_fleet_admits_a_create_on_every_node` passed 100/100 after, the
+> history 50/50 on two busy CPUs, and the whole fleet target 87/87. No assertion changed. Still open: on one CPU the
+> same history failed once in 50 another way, its lookup refused `OwnerUnreachable` with the held session never
+> back within the forward's wait (`session_never_returned` 4), not attributed. Record:
+> `docs/bugs/2026-11-04-a-settled-fleet-refused-its-first-create.md`.
 
 > **A forward waits for the owner's session (2026-09-25, §4.8 Lookup).** A forward refused the client
 > `HomedElsewhere` at once whenever a coordinator dispatch or a discovery page had the owner's session out;
