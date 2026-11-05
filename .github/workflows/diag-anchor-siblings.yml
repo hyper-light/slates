@@ -1,0 +1,94 @@
+name: diag-anchor-siblings
+on:
+  push:
+    branches: ['diag-anchor-siblings-*']
+env:
+  CARGO_TERM_COLOR: never
+  WINFSP_MSI_URL: https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
+  WINFSP_MSI_SHA256: 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
+  # The build before the Windows anchor's channel wake: agents/anchor-siblings at slice 1.
+  BEFORE: 1cab2c2386092c96a1792bd618ed7a21c3409c27
+jobs:
+  windows:
+    name: the Windows anchor's wake, tests and latency (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clang-cl for the C the daemon links (arm64)
+        if: runner.arch == 'ARM64'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Clippy the anchor and the shipped binary
+        timeout-minutes: 40
+        shell: bash
+        run: |
+          cargo clippy -p slates-anchor --all-targets -- -D warnings
+          cargo clippy -p slates-cli --bin slates --example hold_latency_ab -- -D warnings
+      - name: The Windows hold tests, three runs, the answers as annotations
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          status=0
+          for run in 1 2 3; do
+            cargo test -p slates-anchor --test handles_windows -- --test-threads=1 --nocapture > out.log 2>&1 || status=1
+            cat out.log
+            grep -E "^test result|HOLD ANSWERS|panicked|each hold answered" out.log | head -6 | while read -r line; do
+              echo "::notice title=run $run::$line"
+            done
+          done
+          exit $status
+      - name: Install WinFsp
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp.msi'
+          Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile $msi
+          $found = (Get-FileHash $msi -Algorithm SHA256).Hash
+          if ($found -ne $env:WINFSP_MSI_SHA256) { throw "WinFsp's installer hashes $found, not $env:WINFSP_MSI_SHA256" }
+          $install = Start-Process msiexec -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Build both slates, before and after, release
+        if: ${{ !cancelled() }}
+        timeout-minutes: 90
+        shell: bash
+        run: |
+          set -e
+          cargo build --release -p slates-cli --bin slates --example hold_latency_ab
+          mkdir -p "$RUNNER_TEMP/after" "$RUNNER_TEMP/before"
+          cp target/release/slates.exe "$RUNNER_TEMP/after/slates.exe"
+          git worktree add "$RUNNER_TEMP/before-src" "$BEFORE"
+          (cd "$RUNNER_TEMP/before-src" && CARGO_TARGET_DIR="$RUNNER_TEMP/before-target" cargo build --release -p slates-cli --bin slates)
+          cp "$RUNNER_TEMP/before-target/release/slates.exe" "$RUNNER_TEMP/before/slates.exe"
+      - name: Mount and unmount latency, before and after, interleaved
+        if: ${{ !cancelled() }}
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          status=0
+          target/release/examples/hold_latency_ab.exe --arm "before=$RUNNER_TEMP/before/slates.exe" --arm "after=$RUNNER_TEMP/after/slates.exe" > bench.log 2>&1 || status=1
+          cat bench.log
+          grep -E "^# |panicked" bench.log | while read -r line; do
+            echo "::notice title=latency::$line"
+          done
+          exit $status
