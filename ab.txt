@@ -1094,3 +1094,5 @@ slates daemon: a heartbeat came 582 ms after the last (the anchor's budget is 10
 slates daemon: a heartbeat came 608 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 2 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 44 ms
 slates daemon: a heartbeat came 678 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 44 ms
 ## run 5 of 5 done, 2026-11-05T21:51:50Z
+To https://github.com/hyper-light/slates
+   a302f5c..911d3bf  911d3bf9a6dd52eeee4deb77602da20e7117bd6f -> diag-winfsp-overlap-results-42100636103-windows-latest
