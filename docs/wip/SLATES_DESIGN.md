@@ -13718,6 +13718,32 @@ epoch: a holder holding an entry the old owner never made durable fails the chai
 whole state), turning shipping on after creation needs nothing more. The flag rides the catalog register
 (`CatalogValue::live_shipped`), so a successor keeps shipping, and `list` shows it.
 
+**In the daemon (decided 2026-11-04 from the code as it stands).** Four facts of the daemon shape the wiring:
+
+- A publication names its content by arena block (A-64), and a sealed chunk's arena bytes are ciphertext under this
+  daemon life's own key (A-99), so no arena byte means anything on another node. An entry therefore carries the
+  volume's publication record (as `publish_delta_into` or the checkpoint encodes it) together with the content of
+  every chunk the record's inode images name, read in the clear through the one read chokepoint (`read_extent`).
+- Held content is sealed by the owner under the volume's lineage key, and a holder keeps ciphertext and holds no key
+  (A-92; `slates_cluster::sealed`). So the owner seals each entry's payload under the lineage key before it ships it,
+  and a holder never opens one: it checks the chain and the fence (`slates_db::live::Replica`), stores the sealed
+  entry, and answers. A holder's replica is a sealed copy of the owner's own journal for the volume (a checkpoint and
+  the deltas after it), and is bounded as that journal is: each checkpoint the owner publishes is shipped as an entry
+  after which the holder drops everything before it.
+- The barrier is synchronous within one shard step, and the owner's sessions to its candidates live on the control
+  shard. So the owner shard hands each live entry to the control shard over a bounded outbox (its bound the shipper's
+  credit), the control shard ships it (`slates_cluster::live::ship`), and the barrier's reply waits on the existing
+  deferral seams: NFS's await after its barrier (`told::wait`), the deferred reply of a control verb
+  (`acceptance_deferred`, as a green's submit waits for its merge record), FUSE's held replies.
+- A successor opens held envelopes once it has adopted the volume's lineage keys (A-92 piece 4c,
+  `fleet::opened_archive`). So the takeover round carries each live replica's head (`HostPromise`), the successor
+  adopts by `slates_db::live::adopt`, fetches the adopted holder's sealed journal, opens it, and rebuilds the volume as
+  local recovery does (`Journal::recover`, `Volume::from_image`), with the chunk contents placed in its own arena.
+
+The slices, each verified before the next: the owner ships and holders keep (replication lag measured, barriers not
+yet waiting); barriers wait for durability; takeover from a live replica (loss window zero for acknowledged writes,
+AC-8.3); then real processes under chaos.
+
 **Laptop degenerate.** `f = 0`: no holders, every entry durable at the owner's own publication; the same code (R8).
 
 **Testing.** The pure log (owner, holder, phase one) is a sans-io module tested against a model under a deterministic
