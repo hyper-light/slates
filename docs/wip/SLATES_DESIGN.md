@@ -12900,7 +12900,12 @@ A-105's entry, BENCHMARKS, GAPS.
   The incumbent harness leaves slates idle about four seconds between its rounds (nfsd's and tmpfs's turns).
 - **The trade.** Each shard holds up to its last burst's net growth of free pages resident while idle, at most its
   memory share; a shard whose last busy period grew nothing holds none. In exchange a burst like the last lands on
-  resident pages. (The measured resident cost per shard and the throughput won are recorded in BENCHMARKS when built.)
+  resident pages. Measured (BENCHMARKS, "an idle shard keeps its last write burst's pages pre-faulted"):
+  - the cost: a 16,777,200-byte burst held 16,711,680 bytes pre-faulted at idle; in the incumbent harness the volume's
+    shard faulted 342 MiB in over a run of three 64 MiB rounds; the bound on the Mac's daemon was 1,073,741,824 bytes a
+    shard;
+  - the gain: the incumbent harness on the M5 Max wrote its 64 MiB file at up to 1,286.0 MiB/s, against 1,033.9 before
+    (beyond the spread at 4 and 16 workers; six interleaved rounds), with write p99s overlapping.
 - **Not done:** decaying the reserve over time. A-105's reason (a daemon kept its high-water mark forever) does not
   apply: the reserve follows the last busy period, so a delete or a quiet period that grew nothing returns it.
 
