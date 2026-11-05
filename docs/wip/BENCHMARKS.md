@@ -9682,3 +9682,41 @@ quiet run. It does not hold at p999 for 64 KiB writes (2 of 5 quiet runs over 1 
 round trip itself reached 54.8 ms: the spinning threads take the unit's CPU quota from the shards, and the tail is the
 quota's throttling, not the protocol. A dead holder does not slow writes; the 64 KiB tail grows (p99 798 µs).
 
+### What live shipping adds to a stable NFS write in the daemon (A-200; 2026-11-05)
+
+**Hardware:** adacachy, AMD Ryzen 9 9950X3D2 (16 cores, 32 threads), 122 GiB. **Load:** load average 48–58 on 32
+threads (other agents' builds); the test and its three daemons in one `systemd-run --user` unit capped at a quarter of
+the cores. **Command (the contract):** `SLATES_TEST_CLI=1 SLATES_TEST_MEASURE=1 cargo test --release -p slates-cli
+--test live_fleet measure_what_live_shipping_adds_to_a_stable_nfs_write -- --nocapture`.
+
+**Setup.** Three `slates daemon --fleet` processes (release), `f = 1`. On the owner, two volumes: one plain, one
+live-shipped. A real NFS client over TCP sends each 4 KiB `FILE_SYNC` WRITEs, 400 at a time, alternating, five rounds:
+2,000 writes each after 50 warm-up writes. A plain volume's stable write is answered after the owner's own barrier; a
+live one also after a candidate holds it. Microseconds, p50 / p99 / p999 / max:
+
+| run | load | plain | live |
+|---|---|---|---|
+| holder by holder, 1 | 50.1 | 29.5 / 2,421.1 / 13,272.9 / 27,543.7 | 478.3 / 16,532.3 / 70,665.0 / 123,743.9 |
+| holder by holder, 2 | 48.3 | 16.3 / 53.6 / 276.9 / 475.2 | 123.0 / 289.7 / 1,595.1 / 86,281.5 |
+| holder by holder, 3 (final code) | 33.8 | 19.2 / 169.7 / 589.9 / 754.1 | 170.0 / 624.9 / 9,687.5 / 100,794.4 |
+| holder by holder, 4 (final code) | 39.8 | 19.2 / 179.4 / 620.5 / 1,985.5 | 140.3 / 570.7 / 94,688.9 / 100,338.1 |
+| one exchange (rejected), 1 | 57.7 | 27.1 / 566.4 / 1,458.1 / 1,700.3 | 211.2 / 9,005.4 / 73,765.5 / 113,386.8 |
+| one exchange (rejected), 2 | 56.7 | 19.7 / 697.7 / 3,357.1 / 10,075.1 | 126.6 / 12,397.5 / 105,191.1 / 168,764.4 |
+| one exchange (rejected), 3 | 57.9 | 17.9 / 540.0 / 2,720.9 / 7,479.3 | 144.8 / 12,743.5 / 126,181.3 / 203,813.4 |
+| one exchange (rejected), 4 | 57.3 | 19.4 / 497.4 / 9,200.3 / 88,282.1 | 93.4 / 2,329.5 / 18,972.4 / 78,599.0 |
+
+No write waited out its bound (`fleet.live.durable_late` 0) and the log ended durable at its head every time.
+
+**Measured and rejected: one exchange per message.** Sending an entry to all its holders in one exchange that returns at
+the first reply (so a write never waits for the second holder) starved the second holder: it never accepted an entry
+and stayed at nothing in six of nine process flows (416 sends that found no session to it), and its median gain could
+not be told from the load's swing. The per-holder sends are kept; the starvation's mechanism is not yet pinned down
+(GAPS).
+
+**Reading.** With the code kept, live shipping adds 121–151 µs to a stable 4 KiB write at the median at load 34–40, and
+the live p99 is 571–625 µs: under the goal's 1 ms at p99, not its 50 µs. The rare tail does not meet it: p999 9.7–95 ms
+and max about 100 ms, where the plain volume's p999 is 0.6 ms, on a box at load 34–58 with the unit capped at eight
+cores. Measured inside the daemon at load 48 (temporary counters, removed): an entry costs 13.3 µs to build (read,
+encode, seal) and its dispatch round (owner shard to control shard, the exchange, back) 90.7 µs on average, against
+about 25 µs for the exchange alone (`replication_bench`): the cross-shard hops and the session borrow are most of it.
+Owed: the same command on a quiet machine; the round's hops measured apart; the rare 100 ms tail explained.

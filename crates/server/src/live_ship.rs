@@ -162,6 +162,10 @@ pub(crate) struct LiveState {
   barrier: Option<(slates_db::catalog::VolumeId, u64)>,
   /// The transport replies parked until a volume is durable, by volume: their wakers, woken as it advances.
   parked: BTreeMap<[u8; 16], Vec<std::task::Waker>>,
+  /// On the control shard: dispatches whose holders were still in flight at their return, each with the owner shard and
+  /// the volume, holding those holders' sessions until they return ([`drain_stragglers`]). Bounded by the sessions: each
+  /// holds at least one.
+  stragglers: Vec<(u16, ObjectId, slates_cluster::Stragglers)>,
 }
 
 /// Notes, after a transport's barrier published `volume`, the position its reply must wait for ([`wait_durable`]).
@@ -764,6 +768,7 @@ async fn send_from_control(
     origin,
     control,
     move || async move {
+      drain_stragglers();
       let mut replies = Vec::new();
       for send in sends {
         let sessions =
@@ -795,46 +800,47 @@ async fn send_from_control(
   .unwrap_or_default()
 }
 
-/// Returns a dispatch's stragglers' sessions to the pool as they come back, and their replies to the owner shard, in a
-/// detached task bounded by the dispatch's own span (each straggler's exchange ends at its deadline).
-fn settle_stragglers(origin: u16, object: ObjectId, mut stragglers: slates_cluster::Stragglers) {
-  let spawned = slates_rt::futures::spawn(async move {
-    loop {
-      let (late, done) = stragglers.recover_replies();
-      let mut replies = Vec::new();
-      let mut sessions = Vec::new();
-      let mut lost = Vec::new();
-      for (host, reply, endpoint) in late {
-        if reply.round_trip_ns.is_none() {
-          lost.push(host);
-          continue;
-        }
-        replies.push((object, host, reply.bytes));
-        sessions.push((host, endpoint));
+/// Queues a dispatch's stragglers on this (the control) shard, where they hold their holders' sessions until each
+/// returns ([`drain_stragglers`]). Not a task per dispatch: a task the shard's arena refused dropped the stragglers and
+/// the sessions inside them, so the links stayed lent with nothing behind them and those holders were never sent to
+/// again (one of two candidates held nothing in five of eight flows, 2026-11-05, `live_fleet`, 416 sends with no
+/// session).
+fn settle_stragglers(origin: u16, object: ObjectId, stragglers: slates_cluster::Stragglers) {
+  let _ = state::with_state(|s| s.live.stragglers.push((origin, object, stragglers)));
+}
+
+/// Recovers what queued stragglers have finished: each answered holder's session back to the pool and its reply to the
+/// volume's owner shard, each unanswered holder's link dropped to be dialed afresh. On the control shard, outside any
+/// borrow of its state (returning a session borrows it). Called at every dispatch and every record period.
+pub(crate) fn drain_stragglers() {
+  let Some(queued) = state::with_state(|s| std::mem::take(&mut s.live.stragglers)) else {
+    return;
+  };
+  let mut kept = Vec::new();
+  for (origin, object, mut stragglers) in queued {
+    let (late, done) = stragglers.recover_replies();
+    let mut replies = Vec::new();
+    let mut sessions = Vec::new();
+    let mut lost = Vec::new();
+    for (host, reply, endpoint) in late {
+      if reply.round_trip_ns.is_none() {
+        lost.push(host);
+        continue;
       }
-      lose_links(&lost);
-      crate::fleet::return_sessions(sessions);
-      if !replies.is_empty() {
-        let control = state::with_state(|s| s.shard).unwrap_or(origin);
-        crate::xshard::run_on_counted(control, origin, move |s| fold_into(s, replies));
-      }
-      if done {
-        return;
-      }
-      if slates_rt::futures::within(
-        crate::fleet::live_budget().max_deadline_ns(),
-        slates_rt::futures::idle(),
-      )
-      .await
-      .is_err()
-      {
-        return;
-      }
+      replies.push((object, host, reply.bytes));
+      sessions.push((host, endpoint));
     }
-  });
-  if let Ok(task) = spawned {
-    let _ = slates_rt::futures::detach(task);
+    lose_links(&lost);
+    crate::fleet::return_sessions(sessions);
+    if !replies.is_empty() {
+      let control = state::with_state(|s| s.shard).unwrap_or(origin);
+      crate::xshard::run_on_counted(control, origin, move |s| fold_into(s, replies));
+    }
+    if !done {
+      kept.push((origin, object, stragglers));
+    }
   }
+  let _ = state::with_state(|s| s.live.stragglers.extend(kept));
 }
 
 /// Drops the record links of holders that answered nothing (on the control shard, where the links live): their link
@@ -892,6 +898,7 @@ fn fold_into(state: &mut ShardState, replies: Vec<(ObjectId, HostId, Vec<u8>)>) 
 /// The record period's turn on `shard` (run from the control shard): re-ships what each holder of each live volume
 /// there still lacks, so a lost message or a holder that was away is caught up without waiting for the next write.
 pub(crate) async fn period(origin: u16, shard: u16) {
+  drain_stragglers();
   let _ = crate::xshard::call_within(
     origin,
     shard,

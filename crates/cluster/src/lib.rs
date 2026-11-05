@@ -389,6 +389,7 @@ pub(crate) fn reply_channel() -> (ReplyTx, Receiver<Reply>) {
 /// (re-establishing one means a fresh handshake and the peer replacing its session). The straggler's
 /// reply itself is not folded (the dispatch already resolved without it); a commit re-ships to that holder
 /// next period over the recovered session, idempotently. Empty when nothing was dispatched.
+#[derive(Debug)]
 pub struct Stragglers {
   // At most two channels per dispatch: content offers and the chunk transfers they start. All other
   // dispatches use only the first slot; no user-scaled channel list is retained.
