@@ -873,3 +873,5 @@ slates daemon: instance fsb-617-5-new serving on 3 shards under the anchor
 slates-server: shard 0 initialized in 3434 µs
 slates-winfsp: reply spin window = 5400 ns: the median one-way channel wake of 15 (the 2-competitive spin)
 ## run 5 of 5 done, 2026-11-05T16:20:05Z
+To https://github.com/hyper-light/slates
+   6e9dc27..435b16a  435b16ad2ab50038754ad5714317312997870a5b -> diag-winfsp-bench-results-42052991563-windows-11-arm
