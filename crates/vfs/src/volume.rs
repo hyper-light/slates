@@ -3381,6 +3381,25 @@ impl Volume {
     Ok(self.journal.since(seq).cloned().collect())
   }
 
+  /// Whether the head is exactly snapshot `id`'s state: every op-log record after the snapshot's sequence is a
+  /// snapshot's own record (a snapshot journals itself after taking its sequence), and none of them was dropped (§4.16
+  /// A-199: a green's head is checked out into the volume it was created from only then). A dropped record answers
+  /// `false`, since what it recorded is unknown.
+  pub fn unchanged_since(&self, id: SnapshotId) -> Result<bool, VfsError> {
+    let snap = self
+      .snapshots
+      .get(snapshot_handle(id))
+      .map_err(|_| VfsError::StaleHandle)?;
+    let held = self.journal.oldest_seq() <= snap.seq.saturating_add(1);
+    Ok(
+      held
+        && self
+          .journal
+          .since(snap.seq)
+          .all(|record| matches!(record.op, Op::Snapshot)),
+    )
+  }
+
   /// Releases one clone's pin on a snapshot. The owner of both volumes (the shard, §4.5) calls
   /// this when a clone's destroy has completed; the volume core keeps the count only.
   pub fn unpin(&mut self, id: SnapshotId) -> Result<(), VfsError> {

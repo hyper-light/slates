@@ -230,6 +230,23 @@
 > owner's review.
 >
 
+> **A green's head reaches the disk (fs-server, 2026-11-04, A-199).** `slates checkout GREEN VOLUME ATTACHMENT --snapshot
+> N` writes a green's head into the volume it was created from, and that volume lands under a grant. Proven by
+> `crates/server/tests/checkout.rs` (3 of 3, red 3 of 3 with the base check and the writes removed) and, across a
+> Docker container on adacachy, by the fs-server lab up to the grant: a client on the host read the server's green,
+> pushed two increments of four files (accepted as versions 1 and 2), a third overlapping push was refused with its
+> window `src/one.txt [0..3]`, and the server's checkout wrote 4 files and presented a landing of 1 create and 3
+> replaces. Open, found on the way:
+> - **The daemon cannot clone an overlay volume.** `admit_clone` gives every clone no host, so `volume clone` of an
+>   overlay is refused `ContentUnavailable` (pinned or not; fleet and standalone), though the volume core can.
+> - **No grant can be issued on Linux from the CLI.** The anchor's issuer segment is a descriptor only its children
+>   hold (`PRINTS_ISSUER_SURFACE` in `crates/cli/tests/cli.rs`), so a Linux server's landing stops at its
+>   presentation. Needs a decision on the Linux issuer surface (§4.13).
+> - **Remote attach is owed (§4.10):** another node's `attach` is refused `NotFound`, so a client on another node
+>   pushes through a green, never through a write attachment.
+> - **A self-signed fleet certificate must be a leaf.** OpenSSL's default (`CA:TRUE`) is refused
+>   `CaUsedAsEndEntity`; the manifest's documentation does not say so.
+
 > **A green can be shared (fs-server, 2026-11-04).** `share` on a green answered `NotFound`, since it looked the volume up
 > by a slot no green has, so only a green's creator could read, work or submit to it: no second consumer, and no user
 > of another fleet node. Fixed with its failing test first; record `docs/bugs/2026-11-04-a-green-could-not-be-shared.md`.
