@@ -411,6 +411,8 @@ slates-sdk-node = 0
 # the Swift FSVolume handler a C ABI over `serve` — sanctioned FFI unsafe, each block with a SAFETY
 # note. The shipped crate (no `test-harness` feature) builds none of it; the count is a text scan.
 slates-bridge-fskit = 9
+# slates-bridge-winfsp (131 since 2026-11-04: A-206's `FspVersion` export type and its one call in `checked_dll`, the DLL's
+# version check, replacing the read of the reserved field that check once looked at, so a net one more).
 # slates-bridge-winfsp (104): the VfsError->NTSTATUS refusal taxonomy and the notification records stay safe Rust
 # (lib.rs, notify.rs: 0). The WinFsp mount host is Windows-only FFI, hand-transcribed from winfsp's headers (like the
 # rt AFD reactor from the WDK) and compiled only for Windows, each block with a `// SAFETY:` line (clippy
@@ -454,7 +456,7 @@ slates-bridge-fskit = 9
 # 2026-11-02 (126 -> 130): an owned auto-reset event wakes the receiver for private Begin/End messages even when
 # Windows rejects an open without a callback. The four sites create/own/signal that event and wait for it beside
 # the control completion event. Every control operation is still settled before its borrowed buffers can be freed.
-slates-bridge-winfsp = 130
+slates-bridge-winfsp = 131
 # Raised 3 -> 5 on 2026-10-19 for `udmabuf.rs` (the `UDMABUF_CREATE` ioctl and the descriptor it returns), which
 # confined a guest's DAX window to a descriptor covering only that window
 # (docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md). Lowered 5 -> 3 on 2026-10-25

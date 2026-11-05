@@ -2881,6 +2881,10 @@ directory mounts refused (NTFS reparse point); ProjFS never.
 > nine live CLI tests, one counted captured-request settlement and zero lost drives of twenty on both architectures.
 > The original handle and mapped view follow every successor; both renamed-view cases and all six foreign-rights
 > refusals pass. The native Windows CI lanes permanently run the bridge recovery oracles beside the CLI history.
+> **Status (2026-11-04, A-206).** A file system is deleted only after the anchor answers its release: 0 of 20 unmounts
+> left a drive held on each Windows lane, with the anchor stopped (run 41978665514). A DLL other than 2.1 is refused at
+> mount. Slates refuses no path the WinFsp driver passes: the driver refuses from 8,116 UTF-16 units, measured live on both
+> lanes, and the name reserve is derived from that limit.
 
 **Base reads on macOS and Windows.** As on Linux, the daemon reads untouched base files through its own descriptor or
 handle into evictable cache chunks (one copy, `pread`/`ReadFile` on the owner shard's driver) and
@@ -12840,6 +12844,47 @@ Applied in the same change to: Appendix B.2 (body and status), Phase 9 task 5's 
 - **Not yet.** Reproducibility from the tag (AC-9.5): no lane builds twice and compares. The macOS `Slates.app` bundle
   (B.7), code signing and notarization (they need Ada's Apple Developer identity). `cargo-binstall` metadata.
 
+### A-206 — A WinFsp file system is deleted only after the anchor releases its hold, the DLL's version is checked, and slates refuses no path the driver passes (accepted 2026-11-04, audit plan 01a1a34bf7e973069e94f773afdea44a, steps 4 and 6)
+Applied in the same change to: GAPS (the audit entry), §4.6's status through A-198's corrections, `docs/wip/platforms.md`,
+`crates/server` (`winfsp.rs`, `anchor_hold_windows.rs`, `verbs.rs`), `crates/client` (`defers_reply`),
+`crates/bridge-winfsp` (`dll_version.rs`, `opens/names.rs`, `notify.rs`, `inflight.rs`, `host.rs`, `ffi.rs`),
+`crates/cli/tests/winfsp.rs`, `.github/workflows/ci.yml` (WinFsp pinned by hash) and `unsafe-budget.toml` (bridge 130 → 131).
+Measurements and run ids are in the GAPS entry.
+- **A release the anchor does not answer.** The file system is deleted only after the anchor has answered the release.
+  Bug record: `docs/bugs/2026-11-04-a-refused-hold-release-left-a-drive-held.md`.
+  - The hold channel outlives a missed deadline: the pipe goes back for the next exchange, whose read passes over any
+    answer that is not its own. Before, the deadline's pass closed the daemon's only pipe, and every later hold and
+    release was refused for that daemon's life. That deadline was also the clock's reading plus the budget given to a
+    wait that takes a span, so it lasted the daemon's uptime.
+  - A hold waits at most the recovery budget plus the liveness budget (2 s), which covers the anchor's own wait of at
+    most half the liveness budget between looks at the channel. A release attempt waits the liveness budget (1 s).
+  - A `detach` asks while the mount serves on and repeats for the same 2 s. An answer ends the attachment and the mount.
+    Past it the detach answers `TargetUnavailable` and the drive stays served and held. The request stands, because it
+    may already be in the pipe for the anchor's next turn, so the drive goes when the anchor answers. A killed daemon
+    in that window has its attachment adopted if the anchor still holds it, and ended if not.
+  - A destroy, a revocation, a refused adoption and a lost mount have ended the attachment already, so the mount stops
+    serving and waits for the same answer before deleting. A refused mount-time hold answers its typed refusal first, then
+    the same; the objects its message names stay open until the answer, and nothing stays mounted after it.
+  - The wait has no bound in time, since an anchor that never answers leaves nothing safe to delete. It holds one task
+    and one message per mount, and ends at the answer or the shard's stop. An anchor's death takes the daemon by its job.
+- **The DLL's version is checked.** The receiver writes `FSP_FILE_SYSTEM` fields and calls its operation table by offset,
+  so a mount refuses any DLL whose `FspVersion` is not 2.1, before it touches that object, with the number in the refusal
+  (`crates/bridge-winfsp/src/dll_version.rs`). The earlier guard read `FSP_FILE_SYSTEM.Version`, which v2.1 always zeroes.
+  A new WinFsp minor version therefore refuses every mount until the layout is reviewed and the constant raised, so CI
+  installs WinFsp from an exact release URL checked against its SHA-256. Bug record:
+  `docs/bugs/2026-11-04-the-winfsp-guard-read-a-field-winfsp-always-zeroes.md`.
+- **Slates refuses no path the driver passes.** The goal's first wording, no refusal up to 32,767 units, was restated by the
+  supervisor on 2026-11-04, because the driver itself refuses a request past `FSP_FSCTL_TRANSACT_REQ_SIZEMAX`.
+  Bug record: `docs/bugs/2026-11-04-a-winfsp-open-past-1024-units-was-refused.md`.
+  - A record's cap, `notify::MAX_PATH_UNITS` (8,115 units), is derived from what the driver passes and held equal, live, to
+    the limit a test measures on the driver: it refuses from 8,116 units on `windows-latest` and `windows-11-arm`, with
+    `os error 87` (run 41978665514). At `MAX_OPEN_HANDLES` the reserve is 2,133,147,696 bytes of a `SEC_RESERVE` section per
+    mount, made in about 2.2 ms for 4,166,312 bytes of paged pool (jupiter, 3 of 3).
+  - Windows commits by the 64 KiB granule, so a record keeps its first 1,024 units in place and the rest in a second
+    region: a short path commits what it did.
+  - The driver checks no length when a directory's rename lengthens the names beneath it (`FspFileNodeRename`), so a
+    rename that would take a held name past the cap is refused `STATUS_NAME_TOO_LONG` before it has any effect.
+
 ### A-198 — A WinFsp mount outlives its daemon: the anchor holds the volume's control handle, the drive's link and the mount's ledger, and the next daemon serves the held volume (accepted 2026-11-01, Step 9 of the VFS and DAX plan; built and measured 2026-11-02)
 Applied in the same change to: GAPS (gap 2 of the platform inventory). The build applies it to §4.6 "Windows",
 `docs/wip/platforms.md`, `crates/anchor`, `crates/server` and `crates/bridge-winfsp`, each in its own change.
@@ -12870,6 +12915,15 @@ and failed-then-passing oracles distinguish those results from the initial sourc
     the old six-site job-assignment implementation is replaced by IPC's existing creation-time job attribute).
   - The live WinFsp hold is now wired (Step 9.3 below). The transport tests alone establish no live-mount,
     in-flight-request or second-daemon criterion.
+- **What a daemon sends never ends supervision (2026-11-05, audit step 3).** A message the hold channel refuses, or a
+  reply it cannot write, is counted in `Supervisor::handle_refusals` and dropped, and the holdings are untouched, as the
+  Unix device hold counts its refusals. `Supervisor::step` can no longer fail on the channel. A message of no bytes is a
+  short message, not "nothing waited"; a long one is malformed, and its remainder is refused too. The log says each
+  distinct refusal once (`handles::RefusalLog`, a table of 64), since logging on a change of kind still grows without
+  bound when two kinds alternate. Held by `crates/anchor/tests/handles_windows.rs`: 20 bad messages between two real
+  holds give 0 anchor exits, 20 refusals, 2 log lines and both holds inherited live, on CI's Windows x86_64 and arm64
+  (run 41976042550; red on the old sources in run 41974533851). A live drive is not sent bad messages, since only the
+  daemon reaches the channel. Record: `docs/bugs/2026-11-03-one-malformed-hold-message-ended-the-windows-anchor.md`.
 - **Live mount wiring (2026-11-02, Step 9.3).** The server awaits the anchor's `Held` before committing a WinFsp
   attachment, and its normal detach awaits `Released` before deleting the file system. The mount owns its temporary
   DOS link directly. A successor retains a matching attachment, substitutes the inherited control handle and volume
@@ -12910,7 +12964,8 @@ and failed-then-passing oracles distinguish those results from the initial sourc
      serves.
 
   A detach, a destroy or a stop releases all three before the file system is deleted, so a mount that ends still loses
-  its volume and its drive at once.
+  its volume and its drive at once. **Corrected by A-206 (2026-11-04):** this sentence was not true of a release the
+  anchor refused or did not answer.
 - **The drive is the daemon's own.** The daemon defines the drive letter itself, as `FspMountSet_Drive` does: it calls
   `DefineDosDeviceW` with `DDD_RAW_TARGET_PATH`, opens the link with `DELETE`, makes it temporary and keeps its handle.
   It no longer calls `FspFileSystemSetMountPoint`, so the handle is the daemon's to duplicate. A successful mount
@@ -12991,6 +13046,7 @@ and failed-then-passing oracles distinguish those results from the initial sourc
   from the file's current namespace home. Each slot has two generation-checked UTF-16 name versions with CRC32C,
   published one complete version at a time. The unnamed sparse section reserves the admitted open/path caps and
   commits touched ranges only. Recovery seeds one context per owner turn from these records.
+  **Corrected by A-206 (2026-11-04):** a record's cap is the longest name the WinFsp driver passes, not 1,024 units.
   - Every WinFsp cache hangs off an open file node, including the Cache Manager's own file-object reference
     (`bridge-winfsp/src/notify.rs` and WinFsp's `FspFileNodeInvalidateCachesAndNotifyChangeByName`). The first round
     therefore notifies and purges every held kernel name, covering the A-158 set Windows can still cache. All aliases

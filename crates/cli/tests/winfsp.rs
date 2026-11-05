@@ -757,6 +757,435 @@ fn a_winfsp_view_follows_its_file_after_an_sdk_rename() {
   );
 }
 
+#[link(name = "ntdll")]
+unsafe extern "system" {
+  fn NtSuspendProcess(process: windows_sys::Win32::Foundation::HANDLE) -> i32;
+  fn NtResumeProcess(process: windows_sys::Win32::Foundation::HANDLE) -> i32;
+}
+
+/// The anchor's process stopped dead, as an anchor that does not answer is, and resumed on drop so that a failed
+/// assertion leaves it reapable. Its daemon runs on: nothing asks the anchor but the hold channel.
+struct AnchorSuspended<'a> {
+  anchor: &'a OwnedProcess,
+}
+
+impl<'a> AnchorSuspended<'a> {
+  fn of(anchor: &'a OwnedProcess) -> AnchorSuspended<'a> {
+    use std::os::windows::io::AsRawHandle;
+    // SAFETY: a live process handle this test owns, for the call.
+    let status = unsafe { NtSuspendProcess(anchor.child.as_raw_handle()) };
+    assert_eq!(status, 0, "NtSuspendProcess");
+    AnchorSuspended { anchor }
+  }
+}
+
+impl Drop for AnchorSuspended<'_> {
+  fn drop(&mut self) {
+    use std::os::windows::io::AsRawHandle;
+    // SAFETY: a live process handle this test owns, for the call.
+    let status = unsafe { NtResumeProcess(self.anchor.child.as_raw_handle()) };
+    if status != 0 {
+      eprintln!("NtResumeProcess answered {status:#x}");
+    }
+  }
+}
+
+/// Waits for the drive to be gone from the kernel's name space, within [`WAIT_FOR`]: whether it went.
+fn drive_goes(drive: &str) -> bool {
+  let started = Instant::now();
+  while started.elapsed() < WAIT_FOR {
+    if drive_target(drive).is_none() {
+      return true;
+    }
+    pause();
+  }
+  false
+}
+
+/// Shape: unmounts whose release the anchor does not answer: the goal's 20.
+const REFUSED_UNMOUNTS: u32 = 20;
+/// Shape: refused holds in one daemon's life: enough to show the channel outlives each.
+const REFUSED_MOUNTS: u32 = 3;
+/// Shape: how long the first unmount keeps the anchor stopped: past any deadline the release's bound could be, on a
+/// daemon that has just started. Before 2026-11-04 the deadline was the daemon's uptime plus a second.
+const FIRST_SILENCE: Duration = Duration::from_secs(20);
+
+/// A-206 (2026-11-04), audit step 4. Do: mount a drive beside the one under test; stop the anchor's process, unmount, and
+/// read through the drive; resume the anchor; repeat with a fresh mount twenty times, the first with the anchor silent
+/// past any deadline, and unmount the drive beside it after that first. Expect: every unmount is answered a typed
+/// refusal while the drive it asked about still serves; once the anchor answers, the drive goes; every mount after a
+/// silence succeeds; so no drive stays held by an anchor with nobody serving it. Before: the unmount answered success and
+/// deleted the file system under the anchor's hold, and the deadline's pass closed the channel for the daemon's life.
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn a_release_the_anchor_does_not_answer_leaves_no_drive_held() {
+  if !live_mount_runs() {
+    return;
+  }
+  let instance = instance("unheld");
+  let anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "unheld", "--bounded", "64MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let beside = free_drive_letter();
+  let (code, _, err) = run(&instance, &["mount", &id, &beside]);
+  assert_eq!(code, 0, "mount beside: {err}");
+  wait_ready(&format!("{beside}\\"));
+  write_through_drive(&format!("{beside}\\file.bin"), &[b'A'; FILE_BYTES]).unwrap();
+  let (mut answered_while_held, mut held_after, mut mounts_refused) = (0u32, 0u32, 0u32);
+  for iteration in 1..=REFUSED_UNMOUNTS {
+    let drive = free_drive_letter();
+    let (code, _, err) = run(&instance, &["mount", &id, &drive]);
+    if code != 0 {
+      eprintln!("WINFSP UNHELD: iteration {iteration}: mount refused: {err}");
+      mounts_refused += 1;
+      continue;
+    }
+    let root = format!("{drive}\\");
+    wait_ready(&root);
+    let suspended = AnchorSuspended::of(&anchor);
+    let (code, _, err) = run(&instance, &["unmount", &drive]);
+    if code == 0 {
+      answered_while_held += u32::from(drive_target(&drive).is_some());
+    } else {
+      assert!(err.contains("release"), "a typed refusal: {err}");
+      assert_eq!(
+        std::fs::read(format!("{root}file.bin")).unwrap(),
+        vec![b'A'; FILE_BYTES],
+        "the refused drive still serves"
+      );
+    }
+    if iteration == 1 {
+      #[allow(clippy::disallowed_methods)]
+      std::thread::sleep(FIRST_SILENCE);
+    }
+    drop(suspended);
+    let gone = drive_goes(&drive);
+    held_after += u32::from(!gone);
+    eprintln!("WINFSP UNHELD: iteration {iteration}: unmount exit {code}, drive gone {gone}");
+    if iteration == 1 {
+      let (code, _, err) = run(&instance, &["unmount", &beside]);
+      assert_eq!(code, 0, "unmount beside: {err}");
+      let gone = drive_goes(&beside);
+      held_after += u32::from(!gone);
+      eprintln!("WINFSP UNHELD: the drive beside gone {gone}");
+    }
+  }
+  let refused = counter(&instance, "winfsp.hold_release_refused");
+  eprintln!(
+    "WINFSP UNHELD: {held_after} drives held after their unmount, {answered_while_held} answered success while held, \
+     {mounts_refused} mounts refused, {refused} release attempts refused, of {REFUSED_UNMOUNTS}"
+  );
+  assert_eq!(held_after, 0, "no drive stays held after its unmount");
+  assert_eq!(answered_while_held, 0, "no success is answered while held");
+  assert_eq!(mounts_refused, 0, "the channel outlives a silence");
+  assert!(
+    refused >= u64::from(REFUSED_UNMOUNTS),
+    "non-vacuous: each release met the silence ({refused} attempts refused)"
+  );
+}
+
+/// A-206 (2026-11-04), audit step 4. Do: stop the anchor's process and mount, three times in one daemon's life, resuming
+/// the anchor after each. Expect: each mount is a typed refusal naming the hold; once the anchor answers, nothing is left
+/// mounted at the drive; and a mount and unmount after that succeed, so the channel outlived the refusals.
+#[test]
+fn a_refused_mount_time_hold_leaves_nothing_mounted() {
+  if !live_mount_runs() {
+    return;
+  }
+  let instance = instance("unmounted");
+  let anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "unmounted", "--bounded", "64MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  for iteration in 1..=REFUSED_MOUNTS {
+    let drive = free_drive_letter();
+    let suspended = AnchorSuspended::of(&anchor);
+    let (code, _, err) = run(&instance, &["mount", &id, &drive]);
+    eprintln!("WINFSP REFUSED HOLD: iteration {iteration}: exit {code}: {err}");
+    assert_ne!(code, 0, "the mount is refused while the anchor is silent");
+    assert!(
+      err.contains("TargetUnavailable") && err.contains("hold"),
+      "a typed refusal naming the hold: {err}"
+    );
+    drop(suspended);
+    assert!(
+      drive_goes(&drive),
+      "nothing stays mounted once the anchor answers"
+    );
+    let (code, _, err) = run(&instance, &["mount", &id, &drive]);
+    assert_eq!(code, 0, "the next mount after the refusal: {err}");
+    wait_ready(&format!("{drive}\\"));
+    let (code, _, err) = run(&instance, &["unmount", &drive]);
+    assert_eq!(code, 0, "unmount: {err}");
+    assert!(drive_goes(&drive), "the unmounted drive goes");
+  }
+}
+
+/// Shape: the longest component a long-path test makes; WinFsp admits 255 (`MaxComponentLength`).
+const LONG_PATH_COMPONENT: usize = 200;
+/// Format: `\\?\X:`, what a verbatim path costs before the kernel's name, out of `UNICODE_STRING`'s 32,767 units with
+/// the `\??\X:` it becomes: the longest name reachable through a drive letter is 32,761 units.
+const VERBATIM_DRIVE_UNITS: usize = 6;
+
+/// Writes a file through the mounted drive: what the test is about, and a volume in RAM, never the disk (R1).
+#[allow(clippy::disallowed_methods)]
+fn write_through_drive(path: &str, bytes: &[u8]) -> std::io::Result<()> {
+  std::fs::write(path, bytes)
+}
+
+/// Makes a directory through the mounted drive, as [`write_through_drive`] writes.
+#[allow(clippy::disallowed_methods)]
+fn make_dir_through_drive(path: &str) -> std::io::Result<()> {
+  std::fs::create_dir(path)
+}
+
+/// The components of a kernel name of exactly `units` UTF-16 units (each with its leading `\`), each within WinFsp's
+/// component limit; a directory chain shared by every shorter name, so a ladder of lengths reuses it.
+fn long_components(units: usize) -> Vec<String> {
+  let each = LONG_PATH_COMPONENT + 1;
+  let mut parts = vec!["d".repeat(LONG_PATH_COMPONENT); units / each];
+  let rest = units % each;
+  match (rest, parts.last_mut()) {
+    (0, _) => {}
+    (1, Some(last)) => {
+      // A lone `\` is no component: move a unit from the last directory to the file.
+      last.pop();
+      parts.push("f".to_owned());
+    }
+    (rest, _) => parts.push("f".repeat(rest - 1)),
+  }
+  parts
+}
+
+/// Makes every directory of `parts` but the last under `root`, and answers the file's verbatim path.
+fn long_parents(root: &str, parts: &[String]) -> std::io::Result<String> {
+  let mut path = format!("\\\\?\\{root}");
+  let (file, directories) = parts.split_last().unwrap();
+  for directory in directories {
+    path.push('\\');
+    path.push_str(directory);
+    match make_dir_through_drive(&path) {
+      Ok(()) => {}
+      Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+      Err(error) => return Err(error),
+    }
+  }
+  path.push('\\');
+  path.push_str(file);
+  Ok(path)
+}
+
+/// Format: `ERROR_INVALID_PARAMETER`, what `STATUS_INVALID_PARAMETER` becomes: the WinFsp driver's answer to a request
+/// too long to build (`FspIopCreateRequestFunnel`, `src/sys/iop.c`).
+const DRIVER_REFUSED: i32 = 87;
+/// Format: `ERROR_FILE_NOT_FOUND` and `ERROR_PATH_NOT_FOUND`: the file system's answer to a name it does not have, which
+/// shows the request reached it.
+const REACHED_THE_VOLUME: [i32; 2] = [2, 3];
+
+/// Whether an open of a name of `units` units, which the volume does not have, reached the file system. The two answers
+/// tell the driver from slates with nothing else to read: slates could only answer that the name is not there.
+fn open_reaches_the_volume(root: &str, units: usize) -> bool {
+  let path = format!("\\\\?\\{root}\\{}", long_components(units).join("\\"));
+  let error = std::fs::File::open(&path).expect_err("a name the volume does not have");
+  let code = error.raw_os_error().unwrap_or(-1);
+  assert!(
+    code == DRIVER_REFUSED || REACHED_THE_VOLUME.contains(&code),
+    "an open of {units} units answered neither the driver's refusal nor the volume's: {error}"
+  );
+  code != DRIVER_REFUSED
+}
+
+/// The smallest length the driver refuses, found by halving between a length that reaches the volume and one that does
+/// not, on the live driver.
+fn driver_limit(root: &str) -> usize {
+  let mut reaches = 1025;
+  // No request can hold as many units as it has bytes, so the driver refuses this whatever its exact limit.
+  let mut refused = slates_bridge_winfsp::inflight::REQUEST_MAX;
+  assert!(
+    open_reaches_the_volume(root, reaches),
+    "1,025 units reach the volume"
+  );
+  assert!(
+    !open_reaches_the_volume(root, refused),
+    "a name as many units long as a request has bytes is refused by the driver"
+  );
+  while refused - reaches > 1 {
+    let middle = reaches + (refused - reaches) / 2;
+    if open_reaches_the_volume(root, middle) {
+      reaches = middle;
+    } else {
+      refused = middle;
+    }
+  }
+  refused
+}
+
+/// Creates, writes and opens again a file of `units` units through the drive, whose bytes name its length: what it
+/// reads back.
+fn long_path_round_trip(root: &str, units: usize) -> std::io::Result<String> {
+  let parts = long_components(units);
+  let path = long_parents(root, &parts)?;
+  write_through_drive(&path, format!("{units}").as_bytes())?;
+  drop(std::fs::File::open(&path)?);
+  std::fs::read_to_string(&path)
+}
+
+/// A-206 (2026-11-04), the goal's criterion as the supervisor restated it: slates refuses no path the WinFsp driver
+/// passes. Do: measure the driver's limit on this driver by halving. Expect: it is the limit the name reserve is derived
+/// from (`MAX_PATH_UNITS`); a file one unit under it, and at every length on a ladder from 1,025, is created, written,
+/// read back and opened again through slates; at the limit, an open with every parent in place is answered the driver's
+/// status, and not the not-found that slates would answer. Before this every open past 1,024 units was refused by the
+/// daemon, for the ledger's name record.
+#[test]
+fn opens_past_a_thousand_units_are_refused_only_by_the_winfsp_driver() {
+  if !live_mount_runs() {
+    return;
+  }
+  let instance = instance("longladder");
+  let _anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "ladder", "--bounded", "256MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let drive = free_drive_letter();
+  let (code, _, err) = run(&instance, &["mount", &id, &drive]);
+  assert_eq!(code, 0, "mount: {err}");
+  wait_ready(&format!("{drive}\\"));
+  let limit = driver_limit(&drive);
+  eprintln!("WINFSP LONG PATH: first refusal: the driver refuses from {limit} units");
+  let longest = (u16::MAX as usize) / 2 - VERBATIM_DRIVE_UNITS;
+  let at_the_longest = std::fs::File::open(format!(
+    "\\\\?\\{drive}\\{}",
+    long_components(longest).join("\\")
+  ));
+  eprintln!(
+    "WINFSP LONG PATH: {longest} units, the longest a drive letter can name, answered {:?}",
+    at_the_longest
+      .map(drop)
+      .map_err(|error| error.raw_os_error())
+  );
+  for units in [1025, 1026, 2000, 4000, 8000, limit - 1] {
+    let read = long_path_round_trip(&drive, units);
+    eprintln!("WINFSP LONG PATH: {units} units read back {read:?}");
+    assert_eq!(
+      read.unwrap_or_else(|error| panic!("{units} units, under the driver's limit: {error}")),
+      format!("{units}"),
+      "{units} units read back whole"
+    );
+  }
+  let parts = long_components(limit);
+  let at_the_limit = long_parents(&drive, &parts).unwrap();
+  let refused = std::fs::File::open(&at_the_limit).unwrap_err();
+  eprintln!("WINFSP LONG PATH: {limit} units with its parents in place: {refused}");
+  assert_eq!(
+    refused.raw_os_error(),
+    Some(DRIVER_REFUSED),
+    "at the limit the refusal is the driver's"
+  );
+  assert_eq!(
+    limit,
+    slates_bridge_winfsp::notify::MAX_PATH_UNITS + 1,
+    "the name reserve is derived from what the driver passes"
+  );
+}
+
+/// A-206 (2026-11-04). Do: through the drive, create a file whose kernel name is 2,000 UTF-16 units, write and read it,
+/// keep a handle and a view of it; kill the daemon; then through the successor read the old handle, change the file
+/// through the SDK and watch the old view and a fresh open. Expect: the bytes each time, the same drive throughout, and
+/// a read counted through the restored context, so the 2,000-unit name was retained and told across the takeover.
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn a_file_at_a_two_thousand_unit_path_is_served_across_a_killed_daemon() {
+  use std::os::windows::fs::OpenOptionsExt;
+  use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING;
+  if !live_mount_runs() {
+    return;
+  }
+  let instance = instance("longpath");
+  let _anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "longpath", "--bounded", "64MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let hex = value_of(&out, "id");
+  let drive = free_drive_letter();
+  let (code, _, err) = run(&instance, &["mount", &hex, &drive]);
+  assert_eq!(code, 0, "mount: {err}");
+  wait_ready(&format!("{drive}\\"));
+  let parts = long_components(2000);
+  assert_eq!(
+    parts.iter().map(|part| part.len() + 1).sum::<usize>(),
+    2000,
+    "the kernel's name is exactly 2,000 units"
+  );
+  let path = long_parents(&drive, &parts).expect("the directories of a 2,000-unit path");
+  write_through_drive(&path, &[b'A'; FILE_BYTES]).expect("create a 2,000-unit path");
+  assert_eq!(std::fs::read(&path).unwrap(), vec![b'A'; FILE_BYTES]);
+  let handle = std::fs::OpenOptions::new()
+    .read(true)
+    .custom_flags(FILE_FLAG_NO_BUFFERING)
+    .open(&path)
+    .unwrap();
+  let mapped_file = std::fs::File::open(&path).unwrap();
+  let view = MappedView::of(&mapped_file);
+  assert_eq!(view.page(), vec![b'A'; FILE_BYTES]);
+  let original = drive_target(&drive).unwrap();
+  let killed = daemon_pid(&instance).unwrap();
+  kill_daemon(killed);
+  wait_for_successor(&instance, &drive, &original, killed, 1);
+  assert_eq!(read_uncached_page(&handle).unwrap(), vec![b'A'; FILE_BYTES]);
+  let volume = volume_id_of(&hex);
+  let deadlines = slates_client::Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get();
+  let mut writer = slates_client::Client::connect(&instance, deadlines).unwrap();
+  let attachment = writer
+    .attach(volume, None, slates_client::Intent::Write)
+    .unwrap()
+    .attachment;
+  writer
+    .fs_write(
+      (volume, attachment),
+      &parts.join("/"),
+      &[b'B'; FILE_BYTES],
+      FILE_MODE,
+    )
+    .unwrap();
+  assert!(
+    follows(b'B', || view.page()).is_some(),
+    "the old view follows the successor's change at a 2,000-unit path"
+  );
+  let before = counter(&instance, "winfsp.restored_reads");
+  assert_eq!(read_uncached_page(&handle).unwrap(), vec![b'B'; FILE_BYTES]);
+  assert!(
+    counter_reaching(&instance, "winfsp.restored_reads", before + 1) > before,
+    "the successor served the restored open at a 2,000-unit path"
+  );
+  assert_eq!(std::fs::read(&path).unwrap(), vec![b'B'; FILE_BYTES]);
+  assert_eq!(
+    counter(&instance, "winfsp.names_too_long"),
+    0,
+    "no name was left out of a round"
+  );
+  drop(view);
+  drop(mapped_file);
+  drop(handle);
+  let (code, _, err) = run(&instance, &["unmount", &drive]);
+  assert_eq!(code, 0, "unmount: {err}");
+}
+
 fn renamed_purge_counters(instance: &str) {
   for name in [
     PURGES_DONE,
