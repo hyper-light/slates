@@ -409,7 +409,7 @@ impl Request {
         run(bridge, cx, op).unwrap_or_else(|error| Reply::Err(ntstatus(&error).as_i32()))
       }
       (Err(error), _) => {
-        eprintln!("slates-winfsp: context refused: {error}");
+        slates_machine::log_line!("slates-winfsp: context refused: {error}");
         Reply::Err(ntstatus(&VfsError::StaleHandle).as_i32())
       }
     };
@@ -429,7 +429,7 @@ fn confirm_reply(ledger: &mut Ledger<SparseObject>, context: u64) -> Reply {
   match ledger.confirmed(context) {
     Ok(()) => Reply::Ok,
     Err(error) => {
-      eprintln!("slates-winfsp: open confirmation refused: {error}");
+      slates_machine::log_line!("slates-winfsp: open confirmation refused: {error}");
       Reply::Err(ntstatus(&VfsError::RecoveryIncomplete).as_i32())
     }
   }
@@ -454,7 +454,7 @@ fn rename_one_name(
       Reply::RenamedName(Some(context))
     }
     Err(error) => {
-      eprintln!("slates-winfsp: durable kernel rename refused: {error}");
+      slates_machine::log_line!("slates-winfsp: durable kernel rename refused: {error}");
       Reply::Err(ntstatus(&VfsError::RecoveryIncomplete).as_i32())
     }
   }
@@ -496,9 +496,9 @@ fn record_open_reply(
       Reply::Opened { context, info }
     }
     Err(error) => {
-      eprintln!("slates-winfsp: open record refused: {error}");
+      slates_machine::log_line!("slates-winfsp: open record refused: {error}");
       if let Err(release) = bridge.release(object, cx, fh) {
-        eprintln!("slates-winfsp: refused open cleanup failed: {release}");
+        slates_machine::log_line!("slates-winfsp: refused open cleanup failed: {release}");
       }
       Reply::Err(ntstatus(&VfsError::RecoveryIncomplete).as_i32())
     }
@@ -516,7 +516,7 @@ fn finish_context_effects(
     match ledger.closed(context) {
       Ok(()) | Err(crate::opens::Refusal::Stale) => {}
       Err(error) => {
-        eprintln!("slates-winfsp: close record refused: {error}");
+        slates_machine::log_line!("slates-winfsp: close record refused: {error}");
         return Reply::Err(ntstatus(&VfsError::RecoveryIncomplete).as_i32());
       }
     }
@@ -1274,7 +1274,7 @@ extern "C" fn close(fs: *mut FileSystem, context: Pvoid) {
 
 fn report_terminal_reply(call: &'static str, reply: Reply) {
   if let Reply::Err(status) = reply {
-    eprintln!("slates-winfsp: {call} refused with NTSTATUS {status:#010x}");
+    slates_machine::log_line!("slates-winfsp: {call} refused with NTSTATUS {status:#010x}");
     crate::dispatcher::record_terminal_refusal(status);
   }
 }
@@ -2043,7 +2043,7 @@ impl Drop for Mounted {
     if let Some(mut worker) = self.worker.take()
       && let Err(error) = worker.join()
     {
-      eprintln!("slates-winfsp: join receive worker: {error}");
+      slates_machine::log_line!("slates-winfsp: join receive worker: {error}");
     }
     // SAFETY: the only receive/operation worker has been joined, so no callback can reach the DLL object again.
     unsafe { (self.api.delete)(self.file_system) };
@@ -2223,7 +2223,9 @@ fn run_mount(
 ) {
   let report = |outcome: Outcome| {
     if outcomes.send(outcome).is_err() {
-      eprintln!("slates-winfsp: the mount's outcome receiver closed before its owner joined");
+      slates_machine::log_line!(
+        "slates-winfsp: the mount's outcome receiver closed before its owner joined"
+      );
     }
     wake.wake_by_ref();
   };

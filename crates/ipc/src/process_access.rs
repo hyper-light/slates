@@ -107,7 +107,7 @@ impl Drop for ProcessSecurity {
     // synchronous borrowers have returned before this owner can drop.
     let remaining = unsafe { LocalFree(self.descriptor) };
     if !remaining.is_null() {
-      eprintln!(
+      slates_machine::log_line!(
         "slates-ipc: {}",
         crate::win_spawn::refused("LocalFree (process descriptor)")
       );

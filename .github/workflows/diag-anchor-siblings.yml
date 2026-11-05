@@ -1,0 +1,11 @@
+name: diag-anchor-siblings
+on:
+  push:
+    branches: ['diag-anchor-siblings-*']
+jobs:
+  none:
+    name: a carrier commit for jupiter; nothing runs
+    runs-on: ubuntu-latest
+    if: false
+    steps:
+      - run: true

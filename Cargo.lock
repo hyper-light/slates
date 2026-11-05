@@ -1481,6 +1481,7 @@ dependencies = [
  "rustls",
  "slates-archive",
  "slates-db",
+ "slates-machine",
  "slates-mem",
  "slates-rt",
  "slates-test-seeds",
