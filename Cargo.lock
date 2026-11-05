@@ -2357,6 +2357,7 @@ version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "blake3",
+ "cc",
  "rcgen",
  "rustix",
  "serde",
