@@ -157,6 +157,7 @@ impl Worker {
           }
           wake.wake_by_ref();
         }
+        crate::phase::dump();
         Ok(())
       })
       .map_err(|_| WinFspError::MountThread)?;

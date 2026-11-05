@@ -200,7 +200,7 @@ const CLEANUP_CHANGED: u32 = 0x01 | 0x02 | 0x10 | 0x40 | 0x80;
 
 /// One operation the owner shard runs on the volume, with the parameters marshalled from a WinFsp callback. Paths
 /// arrive as Rust `String`s (converted from WinFsp's UTF-16), so the whole `Op` crosses the channel.
-enum Op<T> {
+pub(crate) enum Op<T> {
   /// One durable kernel-name update after a successful rename response was saved, before it reaches the driver.
   RenameName {
     from: String,
@@ -341,12 +341,31 @@ pub struct Request {
   op: Op<u64>,
   reply: SyncSender<Reply>,
   hint: u64,
+  sent: std::time::Instant,
 }
 
 impl Request {
   /// Serves on the owner shard. Kernel contexts are resolved here, never on a foreign dispatcher thread. Opens are
   /// recorded before their contexts are returned; only a successful close retires a token.
   pub fn serve(
+    self,
+    bridge: &mut dyn Bridge,
+    cx: &OpContext,
+    names: &mut OpenNames,
+    ledger: &mut Ledger<SparseObject>,
+  ) -> Served {
+    let started = crate::phase::service_begins();
+    let served = self.serve_inner(bridge, cx, names, ledger);
+    crate::phase::service_ended(started);
+    served
+  }
+
+  /// DIAG: the shard took this request.
+  pub fn picked(&self) {
+    crate::phase::picked(crate::phase::op_name(&self.op), self.sent);
+  }
+
+  fn serve_inner(
     self,
     bridge: &mut dyn Bridge,
     cx: &OpContext,
@@ -939,21 +958,28 @@ impl Handler {
 }
 
 fn call_on(requests: &SyncSender<Request>, wake: &Waker, op: Op<u64>) -> Reply {
+  let name = crate::phase::op_name(&op);
+  let hop_started = std::time::Instant::now();
   let (reply, answer) = sync_channel(1);
   if requests
     .send(Request {
       op,
       reply,
       hint: crate::dispatcher::current_hint(),
+      sent: hop_started,
     })
     .is_err()
   {
     return Reply::Err(crate::status_unsuccessful());
   }
   wake.wake_by_ref();
-  answer
+  crate::phase::note(name, crate::phase::SEND_AND_WAKE, hop_started);
+  let answered = answer
     .recv()
-    .unwrap_or(Reply::Err(crate::status_unsuccessful()))
+    .unwrap_or(Reply::Err(crate::status_unsuccessful()));
+  crate::phase::reply_woke(name);
+  crate::phase::note(name, crate::phase::HOP, hop_started);
+  answered
 }
 
 pub(crate) fn confirm_open(

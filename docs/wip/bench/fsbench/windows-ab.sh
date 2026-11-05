@@ -28,6 +28,7 @@ teardown() {
   set +e
   if [ -n "$OLD_DRIVE" ] && [ -e "$OLD_DRIVE/" ]; then "$OLD_SLATES" --instance "$OLD_INSTANCE" unmount "$OLD_DRIVE"; fi
   if [ -n "$NEW_DRIVE" ] && [ -e "$NEW_DRIVE/" ]; then "$NEW_SLATES" --instance "$NEW_INSTANCE" unmount "$NEW_DRIVE"; fi
+  sleep 3 # DIAG: the worker prints its phases when it sees its stop
   if [ -n "$OLD_ANCHOR" ]; then kill "$OLD_ANCHOR" 2>/dev/null; wait "$OLD_ANCHOR" 2>/dev/null; fi
   if [ -n "$NEW_ANCHOR" ]; then kill "$NEW_ANCHOR" 2>/dev/null; wait "$NEW_ANCHOR" 2>/dev/null; fi
   OLD_ANCHOR= NEW_ANCHOR= OLD_DRIVE= NEW_DRIVE=
@@ -118,7 +119,7 @@ for run in $(seq 1 "$RUNS"); do
   # kill a daemon that missed its heartbeat, and a failed run is a result to record, not a reason to lose the rest.
   outcome=done
   "$BENCH" --arm "$OLD_NAME=$OLD_DRIVE/" --arm "$NEW_NAME=$NEW_DRIVE/" --spinners-per-cpu "$SPINNERS_PER_CPU" \
-    ${FILES:+--files "$FILES"} ${ROUNDS:+--rounds "$ROUNDS"} || outcome=FAILED
+    ${FILES:+--files "$FILES"} ${ROUNDS:+--rounds "$ROUNDS"} ${PASS:+--pass "$PASS"} || outcome=FAILED
   # After the teardown, so a daemon's last words are in it.
   teardown
   for side in "$OLD_INSTANCE" "$NEW_INSTANCE"; do

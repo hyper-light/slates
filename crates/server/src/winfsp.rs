@@ -932,7 +932,10 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
     .get_mut(handle)
     .is_ok_and(|slot| slot.volume.wait_for_change(mount.seen, &mount.waker));
   let request = match mount.requests.as_ref().map(Receiver::try_recv) {
-    Some(Ok(request)) => Some(request),
+    Some(Ok(request)) => {
+      request.picked();
+      Some(request)
+    }
     Some(Err(TryRecvError::Empty)) => None,
     Some(Err(TryRecvError::Disconnected)) | None => return Turned::Ended,
   };
@@ -1316,6 +1319,8 @@ fn answer(s: &mut ShardState, mount: &WinFspMount, mut served: slates_bridge_win
   if served.is_purge_echo() {
     s.count(PURGE_ECHOES, 1);
   }
+  slates_bridge_winfsp::phase::answer_begins();
+  let barrier = served.needs_barrier();
   if served.needs_barrier() {
     let captured =
       crate::verbs::publish_shard(s).is_ok_and(|published| published.captured(mount.volume));
@@ -1324,7 +1329,10 @@ fn answer(s: &mut ShardState, mount: &WinFspMount, mut served: slates_bridge_win
       served.refuse_unpublished();
     }
   }
-  if !served.send() {
+  slates_bridge_winfsp::phase::published(barrier);
+  let sent = served.send();
+  slates_bridge_winfsp::phase::replied();
+  if !sent {
     s.count(REPLY_UNDELIVERED, 1);
   }
 }
