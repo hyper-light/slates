@@ -54,6 +54,15 @@ const ROLE_GARBLING: &str = "garbling_role";
 const ROLE_OVERSIZING: &str = "oversizing_role";
 /// Format: the supervised child whose short and corrupted messages take turns between two real holds.
 const ROLE_ALTERNATING: &str = "alternating_role";
+/// Format: the supervised child that times the anchor's answer to each of its holds.
+const ROLE_PROMPT: &str = "prompt_role";
+/// Shape: the holds the prompt child times, one after another.
+const PROMPT_HOLDS: usize = 5;
+/// Shape: the wait the test hands the supervisor between steps (milliseconds), as `slates anchor` hands it up to half
+/// its liveness budget (500 ms): long enough that an answer given only at the wait's end cannot pass for a wake.
+const PROMPT_PAUSE_MS: u64 = 4_000;
+/// Shape: the slowest answer counted as given at the channel's wake: a quarter of the wait.
+const PROMPT_ANSWER_MS: u64 = PROMPT_PAUSE_MS / 4;
 /// Format: the anchor run as a process of its own, whose log its parent reads.
 const ROLE_ANCHOR: &str = "anchor_role";
 /// Format: the variable naming the child role the anchor role supervises.
@@ -543,6 +552,94 @@ fn refusals_while_supervising(role: &str) -> u64 {
     Some(b"checked".as_slice())
   );
   anchor.0.handle_refusals()
+}
+
+/// A-213. Do: drive the real supervisor as `slates anchor` drives it on Windows, a step and then its wait
+/// ([`Supervisor::await_work`]) of 4 s, over a child that holds five events one after another and times each answer.
+/// Expect every answer inside a quarter of the wait, so each hold was answered when it reached the channel, not when
+/// the wait ended; and the child's exit seen too. Before, the wait was a park, and each answer came at its end.
+#[test]
+fn a_hold_is_answered_at_its_channels_wake_not_at_the_supervisors_pause() {
+  let args: Vec<String> = role_args(ROLE_PROMPT)
+    .iter()
+    .map(|argument| argument.to_string_lossy().into_owned())
+    .collect();
+  // Shape: no restart; the child's one exit ends the observation.
+  let policy = RestartPolicy {
+    window_ns: u64::from(WAIT_MS) * 1_000_000,
+    max_restarts: 0,
+  };
+  let mut anchor = Supervised(Supervisor::new(fixture_segment(), &args, policy).unwrap());
+  anchor.0.hold_handles(PROMPT_HOLDS).unwrap();
+  anchor.0.hold_environment(ROLE, ROLE_PROMPT.to_owned());
+  anchor
+    .0
+    .hold_environment(EVENT_NAME, format!("{}-prompt", unique_event_name()));
+  anchor.0.start(0).unwrap();
+  let pause = Duration::from_millis(PROMPT_PAUSE_MS);
+  // Room for every hold to wait out a whole pause, the code this test was written against, and the exit after.
+  let deadline = pause * u32::try_from(PROMPT_HOLDS + 2).unwrap();
+  let clock = Instant::now();
+  let mut exited = false;
+  while clock.elapsed() < deadline {
+    let now = u64::try_from(clock.elapsed().as_nanos()).unwrap();
+    match anchor.0.step(now).unwrap() {
+      Step::Running => anchor.0.await_work(pause),
+      Step::CrashLoop { exit_code, .. } => {
+        assert_eq!(exit_code, Some(ROLE_EXIT), "the child's body ran");
+        exited = true;
+        break;
+      }
+      other => panic!("the prompt child left unexpectedly: {other:?}"),
+    }
+  }
+  assert!(exited, "the child finished inside {deadline:?}");
+  let published = anchor
+    .0
+    .segment()
+    .read_published(RegionKind::Profile)
+    .unwrap()
+    .unwrap();
+  let answers: Vec<u64> = String::from_utf8(published)
+    .unwrap()
+    .split(',')
+    .map(|answer| answer.parse().unwrap())
+    .collect();
+  eprintln!("HOLD ANSWERS (ms): {answers:?}");
+  assert_eq!(answers.len(), PROMPT_HOLDS, "every hold was answered");
+  assert!(
+    answers.iter().all(|answer| *answer < PROMPT_ANSWER_MS),
+    "each hold answered at its channel's wake, under {PROMPT_ANSWER_MS} ms of a {PROMPT_PAUSE_MS} ms wait: {answers:?}"
+  );
+}
+
+/// The prompt supervised child: holds [`PROMPT_HOLDS`] events one after another, timing each from its send to the
+/// anchor's answer, and publishes the times in milliseconds, comma-separated, in the profile region for its parent.
+#[test]
+#[ignore = "the prompt hold fixture; run by its parent"]
+fn prompt_role() {
+  assert_eq!(std::env::var(ROLE).as_deref(), Ok(ROLE_PROMPT));
+  let mut segment = AnchorSegment::attach_from_env(&fixture_identity()).unwrap();
+  let env = std::env::var(slates_anchor::handles::ENV_HANDLES).unwrap();
+  let (channel_value, _) = parse_env(&env, PROMPT_HOLDS).unwrap();
+  // SAFETY: the supervisor's explicit handle list handed this process its own channel handle at this value.
+  let channel = Channel::adopt(unsafe {
+    OwnedHandle::from_raw_handle(handle_from_value(channel_value).unwrap())
+  });
+  let name = std::env::var(EVENT_NAME).unwrap();
+  let mut answers = Vec::new();
+  let mut held = Vec::new();
+  for hold in 0..PROMPT_HOLDS {
+    let started = Instant::now();
+    let id = ENTRY_ID + u64::try_from(hold).unwrap();
+    let (event, _) = hold_event(&channel, id, format!("{name}-{hold}"));
+    answers.push(started.elapsed().as_millis().to_string());
+    held.push(event);
+  }
+  segment
+    .publish(RegionKind::Profile, answers.join(",").as_bytes())
+    .unwrap();
+  std::process::exit(ROLE_EXIT);
 }
 
 /// Writes `bytes` as one message on the daemon's end of the hold channel, overlapped as the channel's own writes are,

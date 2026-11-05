@@ -304,6 +304,12 @@ impl Supervisor {
     }
   }
 
+  /// Waits out `pause` between supervision steps: the Windows arm of `slates anchor`'s observation wait.
+  #[cfg(windows)]
+  pub fn await_work(&mut self, pause: std::time::Duration) {
+    std::thread::park_timeout(pause);
+  }
+
   /// Entries held for the Windows daemon's successors, observed through the same hold that the spawn uses.
   #[cfg(windows)]
   pub fn held_handles(&self) -> usize {
