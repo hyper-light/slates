@@ -1,0 +1,361 @@
+//! Live shipping over the fleet transport (A-199, §4.10; `slates_cluster::live`), on the simulated UDP fabric with
+//! real endpoints (TLS 1.3, packet protection): an owner and two holders at `f = 1`. Test by use (R5).
+
+// Test harness: an unwrap here is a failed test.
+#![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::too_many_lines)]
+
+use std::collections::BTreeMap;
+use std::sync::mpsc::{Receiver, Sender, channel};
+
+use rustix::net::{Ipv4Addr, SocketAddrV4};
+use rustls::pki_types::PrivateKeyDer;
+use slates_cluster::CommitBudget;
+use slates_cluster::live::{
+  LIVE_ENTRY_STREAM, LIVE_INSTALL_STREAM, fold_late, serve_entry, serve_install, ship,
+};
+use slates_db::live::{Next, Replica, Shipper};
+use slates_db::register::{HostEpoch, HostId, ObjectId, Quorum};
+use slates_rt::runtime::RuntimeConfig;
+use slates_rt::sim::SimRuntime;
+use slates_rt::udp::UdpSocket;
+use slates_transport::endpoint::{Endpoint, MAX_PACKET_PAYLOAD};
+use slates_transport::handshake::Identity;
+
+const NAME: &str = "slates-node";
+const OWNER: HostId = HostId(1);
+const HOLDERS: [HostId; 2] = [HostId(2), HostId(3)];
+const OBJECT: ObjectId = ObjectId([5; 16]);
+/// Shape: a holder's decode cap: far above the test's payloads.
+const CAP: usize = 1 << 16;
+/// Shape: a dispatch's deadline: ten seconds of virtual time. The fabric's paths are instant, yet on it one session's
+/// round trip grew about 1.7 times an exchange (9, 14, 23 … 621 ms of virtual time over nine sequential writes,
+/// 2026-11-04; GAPS), which the real runtime does not show (`replication_bench … silent`). The deadline must not be what
+/// this test measures.
+const DEADLINE_NS: u64 = 10_000_000_000;
+/// Shape: the collector's poll, the daemon's 10 ms.
+const POLL_NS: u64 = 10_000_000;
+/// Shape: a serve loop's park between checks of its stop channel.
+const SERVE_SLICE_NS: u64 = 1_000_000;
+/// Shape: the writes shipped before the late holder joins: more than the retained tail ([`shipper`]'s two), so it
+/// is installed, and few enough that the fabric's growing round trip stays far inside the deadline.
+const WRITES: u64 = 6;
+
+fn config() -> RuntimeConfig {
+  RuntimeConfig {
+    shards: 1,
+    tasks_per_shard: 256,
+    timers_per_shard: 256,
+    ring_entries: 64,
+    step_budget_ns: 1_000_000,
+    timer_tick_ns: 100_000,
+    batch: 64,
+    pin: false,
+    cores: Vec::new(),
+    page_bytes: 4096,
+    spin_ns: 0,
+    wake_tracking: None,
+  }
+}
+
+fn identity() -> Identity {
+  let key = rcgen::KeyPair::generate().unwrap();
+  let certificate = rcgen::CertificateParams::new(vec![NAME.to_owned()])
+    .unwrap()
+    .self_signed(&key)
+    .unwrap();
+  Identity::from_der(
+    certificate.der().clone(),
+    PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+  )
+}
+
+fn shape() -> slates_transport::connection::ConnectionShape {
+  slates_transport::connection::ConnectionShape::for_frame_cap(MAX_PACKET_PAYLOAD, 4 << 20)
+}
+
+/// Format: the request kind the owner ends a holder's serving with (a test's own, beside the live kinds).
+const STOP_KIND: u64 = 99;
+
+/// A holder: once `start` says so (at once unless silent), serves entries and installs into its replica of [`OBJECT`]
+/// until the owner's stop request, then reports its final head and state. Its serving is never cut into slices: a
+/// serve cancelled by a timer every millisecond starved its session, and a round trip over the fabric's instant paths
+/// took 9 to 14 ms of virtual time.
+async fn holder(
+  mut endpoint: Endpoint,
+  start: Receiver<()>,
+  host: HostId,
+  done: Sender<(HostId, Option<slates_db::live::Head>, Vec<u8>)>,
+) {
+  endpoint.establish().await.unwrap();
+  while start.try_recv().is_err() {
+    slates_rt::futures::sleep(SERVE_SLICE_NS).await.unwrap();
+  }
+  let mut replica = Replica::new(OWNER, OBJECT);
+  let mut state: Vec<u8> = Vec::new();
+  let mut stopping = false;
+  while !stopping {
+    endpoint
+      .serve_once(|kind, request| {
+        if kind == LIVE_ENTRY_STREAM {
+          serve_entry(&mut replica, &request, CAP, |entry| {
+            state.extend_from_slice(&entry.payload);
+            true
+          })
+        } else if kind == LIVE_INSTALL_STREAM {
+          serve_install(&mut replica, &request, CAP, |install| {
+            state.clone_from(&install.state);
+            true
+          })
+        } else {
+          stopping = kind == STOP_KIND;
+          Vec::new()
+        }
+      })
+      .await
+      .unwrap();
+  }
+  endpoint.settle().await.unwrap();
+  let _ = done.send((host, replica.head(), state));
+}
+
+/// The owner's side of one scenario, given its warm sessions.
+type Scenario = Box<
+  dyn FnOnce(
+      Vec<(HostId, Endpoint)>,
+      BTreeMap<HostId, Sender<()>>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    + Send,
+>;
+
+/// Runs `scenario` with holder 2 serving and holder 3 `silent` until told; returns each holder's final head and state.
+fn run(
+  silent: bool,
+  scenario: Scenario,
+) -> BTreeMap<HostId, (Option<slates_db::live::Head>, Vec<u8>)> {
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let shard = sim.shard_ids()[0];
+  let owner_identity = identity();
+  let owner_certificate = owner_identity.certificate();
+  let mut dials = Vec::new();
+  let mut commands = BTreeMap::new();
+  let (done_tx, done_rx) = channel();
+  for (index, host) in HOLDERS.into_iter().enumerate() {
+    let holder_identity = identity();
+    let holder_certificate = holder_identity.certificate();
+    let holder_socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let owner_socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let holder_address = holder_socket.local_addr().unwrap();
+    let owner_address = owner_socket.local_addr().unwrap();
+    let owner_certificate = owner_certificate.clone();
+    let (start_tx, start_rx) = channel();
+    if !(silent && index == 1) {
+      start_tx.send(()).unwrap();
+    }
+    commands.insert(host, start_tx);
+    let done = done_tx.clone();
+    sim
+      .spawn_on(shard, async move {
+        let endpoint = Endpoint::server(
+          holder_socket,
+          owner_address,
+          &holder_identity,
+          std::slice::from_ref(&owner_certificate),
+          shape(),
+        )
+        .unwrap();
+        holder(endpoint, start_rx, host, done).await;
+      })
+      .unwrap();
+    dials.push((host, owner_socket, holder_address, holder_certificate));
+  }
+  sim
+    .spawn_on(shard, async move {
+      let mut sessions = Vec::new();
+      for (host, socket, address, certificate) in dials {
+        let mut endpoint = Endpoint::client(
+          socket,
+          address,
+          &owner_identity,
+          &certificate,
+          NAME,
+          shape(),
+        )
+        .unwrap();
+        endpoint.establish().await.unwrap();
+        sessions.push((host, endpoint));
+      }
+      scenario(sessions, commands).await;
+    })
+    .unwrap();
+  sim.run_until_idle();
+  drop(done_tx);
+  done_rx
+    .try_iter()
+    .map(|(host, head, state)| (host, (head, state)))
+    .collect()
+}
+
+/// Ships one write and returns the sessions, folding what stragglers have returned.
+async fn ship_one(
+  shipper: &mut Shipper,
+  payload: Vec<u8>,
+  sessions: Vec<(HostId, Endpoint)>,
+  late: &mut Vec<slates_cluster::Stragglers>,
+) -> (bool, Vec<(HostId, Endpoint)>) {
+  let entry = shipper.append(payload).unwrap();
+  let shipped = ship(
+    shipper,
+    (LIVE_ENTRY_STREAM, &entry.encode()),
+    Some(entry.position),
+    sessions,
+    CommitBudget::hard(DEADLINE_NS, POLL_NS),
+  )
+  .await;
+  let durable = shipper.durable() == Some(entry.position);
+  let mut sessions = shipped.reusable;
+  late.push(shipped.stragglers);
+  let mut kept = Vec::new();
+  for mut stragglers in late.drain(..) {
+    let (recovered, done) = fold_late(shipper, &mut stragglers);
+    sessions.extend(recovered);
+    if !done {
+      kept.push(stragglers);
+    }
+  }
+  *late = kept;
+  (durable, sessions)
+}
+
+fn shipper(credit: u64, retain: usize) -> Shipper {
+  Shipper::new(
+    (OWNER, OBJECT, HostEpoch(1)),
+    Quorum { f: 1 },
+    &[OWNER, HOLDERS[0], HOLDERS[1]],
+    None,
+    (credit, retain),
+  )
+}
+
+/// A-199: a holder that joins late (it held nothing while six writes became durable through the other holder alone) is
+/// told behind, is installed at the owner's head by the owner's period (`Shipper::pending`), and from then on applies
+/// entries; both holders end holding exactly the owner's state. Over real endpoints on the simulated fabric.
+#[test]
+fn a_holder_that_joins_late_is_installed_and_then_follows() {
+  let (report_tx, report_rx) = channel();
+  let states = run(
+    false,
+    Box::new(move |sessions, commands| {
+      Box::pin(async move {
+        let mut shipper = shipper(4, 2);
+        let mut late = Vec::new();
+        let mut written = Vec::new();
+        let (mut sessions, mut aside): (Vec<_>, Vec<_>) = sessions
+          .into_iter()
+          .partition(|(host, _)| *host == HOLDERS[0]);
+        for value in 0..WRITES {
+          let payload = value.to_le_bytes().to_vec();
+          written.extend_from_slice(&payload);
+          let (durable, back) = ship_one(&mut shipper, payload, sessions, &mut late).await;
+          assert!(durable, "write {value} durable through one holder");
+          sessions = gather(&mut shipper, back, &mut late, 1).await;
+        }
+        // The late holder joins: the next write reaches it, it holds nothing, and it says so.
+        sessions.append(&mut aside);
+        let payload = WRITES.to_le_bytes().to_vec();
+        written.extend_from_slice(&payload);
+        let (durable, back) = ship_one(&mut shipper, payload, sessions, &mut late).await;
+        assert!(durable, "the joining write is durable");
+        sessions = gather(&mut shipper, back, &mut late, 2).await;
+        // The owner's period: send each holder what it lacks until neither lacks anything.
+        let mut installs = 0;
+        for _ in 0..8 {
+          let mut quiet = true;
+          for (host, endpoint) in std::mem::take(&mut sessions) {
+            let (stream, message) = match shipper.pending(host) {
+              Next::Nothing => {
+                sessions.push((host, endpoint));
+                continue;
+              }
+              Next::Entries(entries) => (LIVE_ENTRY_STREAM, entries[0].encode()),
+              Next::Install => {
+                installs += 1;
+                (
+                  LIVE_INSTALL_STREAM,
+                  shipper.install(written.clone()).unwrap().encode(),
+                )
+              }
+              Next::Fenced(epoch) => panic!("fenced at {epoch:?}"),
+            };
+            quiet = false;
+            let shipped = ship(
+              &mut shipper,
+              (stream, &message),
+              None,
+              vec![(host, endpoint)],
+              CommitBudget::hard(DEADLINE_NS, POLL_NS),
+            )
+            .await;
+            late.push(shipped.stragglers);
+            sessions.extend(shipped.reusable);
+          }
+          sessions = gather(&mut shipper, sessions, &mut late, 2).await;
+          if quiet {
+            break;
+          }
+        }
+        // And it follows: the next write is applied by both holders as an entry.
+        let payload = (WRITES + 1).to_le_bytes().to_vec();
+        written.extend_from_slice(&payload);
+        let (durable, back) = ship_one(&mut shipper, payload, sessions, &mut late).await;
+        assert!(durable, "the write after the install is durable");
+        let sessions = gather(&mut shipper, back, &mut late, 2).await;
+        let _ = report_tx.send((installs, shipper.head(), written));
+        for (_, mut endpoint) in sessions {
+          let _ = endpoint
+            .request(
+              STOP_KIND,
+              slates_transport::connection::Priority::Control,
+              &[],
+            )
+            .await;
+        }
+        drop(commands);
+      })
+    }),
+  );
+  let (installs, head, written) = report_rx.try_recv().unwrap();
+  assert_eq!(installs, 1, "the late holder was installed once");
+  assert_eq!(states.len(), 2, "both holders reported");
+  for (host, (held, state)) in states {
+    assert_eq!(held, head, "holder {host:?} ends at the owner's head");
+    assert_eq!(
+      state, written,
+      "holder {host:?} ends holding the owner's state"
+    );
+  }
+}
+
+/// Waits (parked) until `want` sessions are back, folding every straggler's reply on the way.
+async fn gather(
+  shipper: &mut Shipper,
+  mut sessions: Vec<(HostId, Endpoint)>,
+  late: &mut Vec<slates_cluster::Stragglers>,
+  want: usize,
+) -> Vec<(HostId, Endpoint)> {
+  loop {
+    let mut pending = Vec::new();
+    for mut stragglers in late.drain(..) {
+      let (recovered, done) = fold_late(shipper, &mut stragglers);
+      sessions.extend(recovered);
+      if !done {
+        pending.push(stragglers);
+      }
+    }
+    *late = pending;
+    if sessions.len() >= want || late.is_empty() {
+      sessions.sort_by_key(|(host, _)| host.0);
+      return sessions;
+    }
+    slates_rt::futures::sleep(SERVE_SLICE_NS).await.unwrap();
+  }
+}

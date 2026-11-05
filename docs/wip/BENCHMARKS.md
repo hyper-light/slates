@@ -9648,3 +9648,37 @@ could not see this.
 A second receiver cannot simply be added: two journals need the multi-worker crash proof (GAPS), which is not built. A
 second worker would also make x86_64 slower unless it ran on arm64 alone, and a mode chosen per architecture would need
 a derivation the rules accept.
+
+period before this commit begins.
+
+### Live shipping over the transport (A-199; 2026-11-04)
+
+Same bench, same hardware, later the same evening: `live ship <n> B` rows, one live-shipped write at a time (a credit of
+one): `Shipper::append`, then `slates_cluster::live::ship` to both holders, which apply it through `serve_entry`,
+until it is durable (the owner and one holder hold it), at the daemon's 10 ms poll. Five runs at load average 21.0–21.2
+(`replication_bench 1000 0`), then three with eight spinning threads inside the same capped unit, which competes with
+the three shards for the unit's quota of eight cores (`replication_bench 1000 8`). Microseconds, p50 / p99 / p999 /
+max:
+
+| run | round trip | 64 B | 4 KiB | 64 KiB |
+|---|---|---|---|---|
+| 1 | 12.7 / 22.7 / 46.6 / 58.5 | 16.6 / 30.8 / 56.8 / 400.6 | 22.6 / 37.9 / 75.1 / 213.6 | 148.8 / 262.0 / 905.9 / 1,020.9 |
+| 2 | 12.3 / 56.8 / 466.2 / 1,059.7 | 18.0 / 31.4 / 307.7 / 496.5 | 23.0 / 48.9 / 181.3 / 594.8 | 142.9 / 292.2 / 1,076.8 / 1,197.6 |
+| 3 | 10.2 / 21.3 / 51.3 / 299.4 | 20.3 / 31.4 / 133.3 / 436.7 | 27.2 / 52.4 / 162.9 / 859.5 | 112.9 / 171.3 / 247.9 / 481.0 |
+| 4 | 10.0 / 18.6 / 36.0 / 56.3 | 18.3 / 32.5 / 44.9 / 51.4 | 26.1 / 71.8 / 109.5 / 722.2 | 108.4 / 160.5 / 1,188.2 / 1,362.4 |
+| 5 | 12.3 / 19.7 / 41.5 / 41.6 | 18.4 / 28.7 / 55.1 / 69.6 | 25.6 / 57.9 / 310.1 / 411.3 | 130.8 / 207.7 / 250.2 / 1,192.4 |
+| loaded 1 | 13.4 / 53.2 / 941.9 / 54,757.7 | 20.5 / 80.8 / 223.0 / 1,225.5 | 26.1 / 55.7 / 481.8 / 554.7 | 164.5 / 256.2 / 877.4 / 1,022.4 |
+| loaded 2 | 13.0 / 43.3 / 1,662.2 / 10,329.6 | 18.5 / 30.5 / 52.9 / 66.6 | 29.8 / 44.6 / 63.6 / 65.8 | 105.6 / 431.4 / 13,372.5 / 23,943.2 |
+| loaded 3 | 13.9 / 52.4 / 592.9 / 611.6 | 21.0 / 48.6 / 227.1 / 15,845.2 | 32.6 / 82.3 / 855.6 / 1,004.5 | 134.0 / 213.6 / 13,471.4 / 15,754.7 |
+
+With one holder dead (it handshakes and never answers again; `replication_bench 300 0 silent`, load average 33.6),
+writes go on through the other: 64 B 18.3 / 48.3 / 142.4 / 142.4, 4 KiB 24.5 / 46.2 / 55.1 / 55.1, 64 KiB
+155.8 / 797.9 / 3,767.9 / 3,767.9.
+
+**Reading.** A live-shipped write is durable on two hosts in about one and a half round trips: 17–20 µs at the median
+for a small write and 23–27 µs for a page, under 75 µs at p99, and every quiet p99 is under 1 ms (64 KiB: 160–292
+µs). The goal's 50 µs holds at the median up to a page and at p99 for small writes. Its 1 ms holds at p99 in every
+quiet run. It does not hold at p999 for 64 KiB writes (2 of 5 quiet runs over 1 ms), nor in the tails of the loaded runs, where the bare
+round trip itself reached 54.8 ms: the spinning threads take the unit's CPU quota from the shards, and the tail is the
+quota's throttling, not the protocol. A dead holder does not slow writes; the 64 KiB tail grows (p99 798 µs).
+
