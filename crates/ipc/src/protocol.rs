@@ -731,7 +731,7 @@ pub enum RequestBody {
     /// The mapping id the map's hand-off named.
     mapping_id: u64,
   },
-  /// Check a green's head out into the volume it was created from (§4.16, A-199): `base` names that volume and the
+  /// Check a green's head out into the volume it was created from (§4.16, A-201): `base` names that volume and the
   /// snapshot the green's origin was taken from, refused unless the snapshot's origin is the green's own and the volume
   /// is unchanged since it. The head's difference from the origin is written through `attachment`, the caller's write
   /// attachment of the volume, as the file verbs write. The volume then lands under a grant like any other, so the
@@ -3223,7 +3223,7 @@ pub enum ReplyBody {
     /// The file's length when the comparison began: the copy's bytes past it within its last page are not the file's.
     file_len: u64,
   },
-  /// A green's head was checked out into the volume it was created from (`Checkout`, §4.16 A-199). Appended.
+  /// A green's head was checked out into the volume it was created from (`Checkout`, §4.16 A-201). Appended.
   CheckedOut {
     /// The green version the volume now holds: the head when the checkout began.
     version: u64,
@@ -3232,7 +3232,7 @@ pub enum ReplyBody {
   },
 }
 
-/// What a checkout changed in its green's base volume (§4.16 A-199): the head's difference from the origin, by
+/// What a checkout changed in its green's base volume (§4.16 A-201): the head's difference from the origin, by
 /// kind. A path counts once, under the first kind that applied to it.
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct CheckoutReport {

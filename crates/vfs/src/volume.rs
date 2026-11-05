@@ -3383,7 +3383,7 @@ impl Volume {
 
   /// Whether the head is exactly snapshot `id`'s state: every op-log record after the snapshot's sequence is a
   /// snapshot's own record (a snapshot journals itself after taking its sequence), and none of them was dropped (§4.16
-  /// A-199: a green's head is checked out into the volume it was created from only then). A dropped record answers
+  /// A-201: a green's head is checked out into the volume it was created from only then). A dropped record answers
   /// `false`, since what it recorded is unknown.
   pub fn unchanged_since(&self, id: SnapshotId) -> Result<bool, VfsError> {
     let snap = self

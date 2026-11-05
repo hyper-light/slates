@@ -103,7 +103,7 @@ pub fn defers_reply(body: &RequestBody) -> bool {
         | RequestBody::ImageBuild { .. }
         | RequestBody::ImageMerge { .. }
         // A green's checkout writes its base volume in slices on the owner shard, as long as the difference takes
-        // (A-199).
+        // (A-201).
         | RequestBody::Checkout { .. }
         // A direct map's copy is filled in slices on the owner shard, as long as the file takes (A-171).
         | RequestBody::MapRead { .. }
@@ -3390,7 +3390,7 @@ impl Client {
   }
 
   /// Checks green `green`'s head out into the volume and snapshot it was created from, `base`, through the caller's
-  /// write `attachment` of that volume (§4.16 A-199): the version the volume now holds and what the checkout changed.
+  /// write `attachment` of that volume (§4.16 A-201): the version the volume now holds and what the checkout changed.
   /// The volume then lands under a grant like any other. Waits for the checkout, which the daemon runs in slices.
   pub fn checkout(
     &mut self,

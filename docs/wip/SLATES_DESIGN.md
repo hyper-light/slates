@@ -7019,14 +7019,14 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > identity is a set hash over the green's entries, brought up to date when read, so a record at `f > 0` costs what its
 > version changed. Owed: the rebase's whole restatement.
 
-> **Status (2026-11-04, A-199: a green's head lands through a checkout).** `checkout GREEN VOLUME ATTACHMENT
+> **Status (2026-11-04, A-201: a green's head lands through a checkout).** `checkout GREEN VOLUME ATTACHMENT
 > --snapshot N` writes the green's head into the volume it was created from (the server's overlay of the directory
 > it lands into), checked to be that base and unchanged since, and `land` lands the volume under a grant; a green
 > itself is still refused `land`. Proven by `crates/server/tests/checkout.rs` (a real daemon over a real directory:
 > two merged pushes and an overlapping one refused with its window; the granted landing writes every merged byte; an
 > outsider's edit of a merged file is the presentation's only conflict; a wrong or moved base refused; three of three
 > red with the base check and the writes removed) and across a container by the fs-server lab (the client on the
-> host, the green's node in Docker, everything up to the grant; see A-199).
+> host, the green's node in Docker, everything up to the grant; see A-201).
 
 **Role.** Let many agents work on clones of one shared volume and fold their work back into it
 with no locks, no last-writer-wins, and no inferred merge. Each agent's work becomes an
@@ -13374,7 +13374,7 @@ Applied in the same change to: §4.5 (data model), `crates/vfs/src/{dirblocks,di
   build compacted on every few rounds of a create and unlink. A fixed history grows one directory through ten classes, splits
   it, snapshots it and shrinks it, and must see eight classes, the largest among them.
 
-### A-199 — A green's head lands through a checkout: written into the volume the green was created from, which lands under a grant like any volume (accepted and built 2026-11-04)
+### A-201 — A green's head lands through a checkout: written into the volume the green was created from, which lands under a grant like any volume (accepted and built 2026-11-04)
 
 - **What it answers.** §4.16 ends a merge at a green version and §4.15 writes disk only through a landing, but nothing
   joined them: `land` on a green was refused `Unsupported { "landing a merge volume" }` (owed "with the extent-backed

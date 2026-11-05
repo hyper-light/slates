@@ -348,7 +348,7 @@ pub(crate) enum Verb {
     work: slates_client::VolumeId,
   },
   /// Check a green's head out into the volume and snapshot it was created from, through the caller's write
-  /// attachment of that volume (§4.16 A-199); the volume then lands like any other.
+  /// attachment of that volume (§4.16 A-201); the volume then lands like any other.
   Checkout {
     /// The green.
     green: slates_client::VolumeId,

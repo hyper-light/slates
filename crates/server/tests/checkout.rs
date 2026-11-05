@@ -1,4 +1,4 @@
-//! A green's head reaches the disk (§4.16, §4.15, A-199): merged increments are checked out into the volume the green
+//! A green's head reaches the disk (§4.16, §4.15, A-201): merged increments are checked out into the volume the green
 //! was created from, and that volume lands under a grant, the landing's verdict judging the merge's files against the
 //! disk. Each test drives a real daemon over a real directory in the build output and reads the disk back.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
@@ -120,7 +120,7 @@ fn disk(target: &TargetDir, path: &str) -> Vec<u8> {
   std::fs::read(format!("{}/{path}", target.path)).unwrap()
 }
 
-/// A-199. Do: a server's overlay of its project directory, a green over its snapshot, two agents' accepted pushes
+/// A-201. Do: a server's overlay of its project directory, a green over its snapshot, two agents' accepted pushes
 /// (one edits a file and adds one, the other edits another), a third whose edit overlaps the first's; check the head
 /// out into the overlay and land it under a grant. Expect: the overlap a conflict with its byte window (no inferred
 /// merge); the checkout reporting version 2 with two files changed and one added; the landing `done`; the disk holding
@@ -160,7 +160,7 @@ fn merged_pushes_are_checked_out_and_land_on_the_servers_disk() {
   daemon.stop();
 }
 
-/// A-199 with §4.15's verdict. Do: as above, but an outsider rewrites `src/one.txt` on the disk after the base was
+/// A-201 with §4.15's verdict. Do: as above, but an outsider rewrites `src/one.txt` on the disk after the base was
 /// witnessed and before the landing. Expect: the presentation names `/src/one.txt` as a conflict and nothing else, and
 /// the outsider's bytes are what the disk still holds.
 #[test]
@@ -200,7 +200,7 @@ fn refusal<T: std::fmt::Debug>(outcome: Result<T, ClientError>) -> Refusal {
   }
 }
 
-/// A-199's checks. Do: name a snapshot whose content is not the green's origin; then write the volume after its
+/// A-201's checks. Do: name a snapshot whose content is not the green's origin; then write the volume after its
 /// snapshot and name the right one. Expect: `ConsistentBaseUnavailable`, then `Unsupported` (the volume changed since
 /// the base), and in neither case a byte of the head in the volume's file.
 #[test]
