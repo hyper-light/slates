@@ -1273,6 +1273,7 @@ as they stand when it is accepted. RFC 9289 §5.2.1 says a server SHOULD re-chec
 path a kernel NFS client takes once per mount or reconnect, since it holds one TCP connection per server. The
 cost would be slates-level shared ownership and trust anchors fixed at the listener's start.
 
+
 ### A scoped export's per-request check, and a scoped listing page (2026-10-03, AUD-29-76 follow-up)
 
 `cargo run --release -p slates-vfs --example scope_diff_bench` measures the volume's check
@@ -1726,6 +1727,7 @@ rebuild after touching `crates/vfs/src/lib.rs`. Apple M5 Max, load average 15–
 - **Where the build's writes go:** 4,178 WRITEs carried 746 MB (about 180 KB each) at 2.99 ms per call. That is
   queue and RTT while the build saturates the VM's CPUs; the same path streams a 256 MiB `dd … conv=fsync` in
   197–216 ms (1.3 GB/s), against 1.6–2.7 s on the host bind.
+
 
 ### Delegations against the kernels (A-78, A-79; 2026-10-04)
 
@@ -2416,6 +2418,7 @@ last in `python:3.12-slim-trixie`). Docker Desktop 6.12 kernel, Apple M5 Max, lo
     - `TCP_QUICKACK` after every read: `fsync` 621–626 ms, `dd` 1.2 MB/s.
     Neither is in the tree.
 
+
 ## Session-plane ready sets: a fresh frame no longer walks idle streams (2026-10-06)
 
 **What changed.** The connection's fresh-frame scheduler (strict priority by class, round-robin within one)
@@ -2636,6 +2639,7 @@ own filesystem and tmpfs.
   daemon, and reads it back. With logging disabled the file comes back empty, the mutation check.
 - **The next lever is the create's own publication.** An intent log for namespace changes, as ZFS's ZIL does, would
   let a create reply after one append. It is a design change to §4.8's barrier, recorded in GAPS, not built.
+
 
 ### 2026-10-06: the no-panic sweep costs nothing measurable on the hot paths
 
@@ -7315,6 +7319,7 @@ and slates-base (a volume over the same base, FUSE). Run 1 of 3:
 | rename | 4.5 · 11.1 · 20.1 · 39.2 | 10.3 · 18.7 · 121.6 · 314.6 | 45.7 · 79.3 · 458.5 · 823.5 | 55.6 · 106.5 · 487.1 · 1270.1 |
 | unlink | 4.6 · 7.6 · 37.9 · 169.8 | 8.6 · 15.2 · 292.0 · 639.4 | 36.8 · 102.6 · 369.3 · 665.7 | 41.8 · 89.0 · 390.2 · 852.1 |
 
+
 **contended** (spinners 4 (one per logical CPU when contended); load average 1.43 1.02 0.44 at the start, 2.66 1.33 0.56 at the end; wake-up probe p50 19.5 µs, p99 54.5 µs, p999 1988.6 µs, max 3934.6 µs over 4544 probes; 23.2 s). Each cell: p50 · p99 · p999 · max, µs.
 
 | op | tmpfs | overlayfs | slates | slates-base |
@@ -7377,6 +7382,7 @@ VM; slates `3e7dd1b`, release; 2026-11-01 01:51–01:52 UTC; diagnostics run 412
 | read | 1.2 · 1.7 · 5.7 · 16.9 | 1.4 · 1.8 · 7.6 · 205.5 | 1.4 · 1.9 · 5.6 · 6.6 | 1.4 · 1.9 · 5.3 · 8.9 |
 | rename | 2.6 · 8.2 · 20.2 · 35.0 | 6.1 · 13.2 · 67.7 · 267.8 | 42.3 · 58.6 · 404.4 · 466.2 | 55.2 · 89.6 · 418.3 · 453.5 |
 | unlink | 2.5 · 4.8 · 18.7 · 39.3 | 4.9 · 9.1 · 28.3 · 410.6 | 32.7 · 61.1 · 320.2 · 388.4 | 36.5 · 66.1 · 270.6 · 361.1 |
+
 
 **contended** (spinners 4 (one per logical CPU when contended); load average 1.39 0.98 0.43 at the start, 3.27 1.44 0.59 at the end; wake-up probe p50 10.0 µs, p99 19.0 µs, p999 1304.1 µs, max 1975.9 µs over 3746 probes; 19.1 s). Each cell: p50 · p99 · p999 · max, µs.
 
@@ -7474,6 +7480,7 @@ disk. Run 1 of 3:
 | rename | 39.0 · 378.7 · 1837.9 · 5846.7 | 46.7 · 454.2 · 2275.8 · 21108.4 | 726.0 · 3472.7 · 9358.0 · 23277.6 |
 | unlink | 30.1 · 331.5 · 1699.7 · 4300.6 | 40.2 · 409.2 · 2507.0 · 7416.1 | 751.2 · 2996.9 · 7383.4 · 55282.1 |
 
+
 **contended** (spinners 3 (one per logical CPU when contended); load average 3.07 5.53 6.19 at the start, 8.66 6.63 6.53 at the end; wake-up probe p50 33.2 µs, p99 7282.3 µs, p999 13144.1 µs, max 17878.2 µs over 4058 probes; 97.3 s). Each cell: p50 · p99 · p999 · max, µs.
 
 | op | apfs-ram | apfs | slates |
@@ -7562,6 +7569,7 @@ its spinners and the probe. Run 1 of 3:
 | read | 5.9 · 41.7 · 142.2 · 2628.1 | 13.5 · 147.3 · 378.8 · 160106.9 |
 | rename | 78.3 · 200.9 · 332.9 · 4068.7 | 694.2 · 1831.4 · 36121.0 · 145095.3 |
 | unlink | 84.9 · 183.9 · 668.5 · 7823.0 | 408.3 · 1242.0 · 23605.7 · 143392.4 |
+
 
 **contended** (spinners 4 (one per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 40.3 µs, p99 68.8 µs, p999 2039.2 µs, max 91050.0 µs over 25059 probes; 133.9 s). Each cell: p50 · p99 · p999 · max, µs.
 
@@ -7674,6 +7682,7 @@ temporary directory is there, not on a D: drive) and slates' WinFsp drive of a p
 | rename | 356.2 · 490.7 · 2812.4 · 27825.7 | 379.1 · 798.9 · 4852.0 · 42547.3 |
 | unlink | 108.9 · 191.7 · 39704.4 · 90937.3 | 243.1 · 418.1 · 2188.7 · 31395.3 |
 
+
 **contended** (spinners 4 (one per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 25.4 µs, p99 40.1 µs, p999 4061.4 µs, max 22507.3 µs over 72351 probes; 370.7 s). Each cell: p50 · p99 · p999 · max, µs.
 
 | op | ntfs | slates |
@@ -7759,6 +7768,9 @@ ms).
 open at the median, it holds in every run, and in run 1 an open and a close are 9.07 ms of the 10.27 ms that slates'
 medians sum to for a file cycle (88%). Next, as on x86_64: the daemon's turn under load, and a directory listed by a
 pattern (`fsbench` 10–28×).
+
+
+
 
 ## What a write costs on pages given back on Windows (A-205; VFS plan step 12; 2026-11-04)
 
@@ -8325,6 +8337,65 @@ p999 and max per run:
   jobs that reached it, and only the DLL arm's drive was lost each time. A daemon killed by the anchor for a late heartbeat on
   a loaded 4-vCPU VM is itself worth a look: arm64 logged no lapse.
 
+
+## Provisioning by physical core, and a shard's content keys bounded (A-208; R9; 2026-11-05)
+
+A-208 has two parts. (1) The shard count follows physical cores, not hardware threads (93c5c0ac). (2) A shard's
+content keys are held by what names them and found through an index (89382153). Both are measured with
+`provision_bench`, release, the arms interleaved round by round, three rounds. Each figure is one round's value, the
+median of the bench's own three runs, and every bench run is in the cited log.
+
+Command, every arm: `cargo build --release --locked -p slates-client --example provision_bench` at the arm's commit,
+then the binary. On CI, through `.github/workflows/diag-clients.yml` on a diagnostics branch (not for main); on
+jupiter, each arm built from `git archive <commit>` into its own target dir.
+
+**CI, part 1 alone** (run 41992744368, 2026-11-05 08:18–08:43 UTC; before 21da6e57, after 59f7f380; 4-vCPU GitHub
+VMs):
+
+| runner (topology) | shards | spinning 1-client p99, rounds 1/2/3 | spinning p50 | parked p50 |
+|---|---|---|---|---|
+| ubuntu-latest, EPYC 9V74 (2 cores × 2 threads) | 3 → 1 | 41.5 / 39.9 / 94.3 → 24.4 / 25.2 / 23.3 µs | 20.0–20.2 → 13.4–13.7 µs | 269–301 → 627–652 µs |
+| windows-latest (2 cores, 4 logical) | 3 → 1 | 190.1 / 117.3 / 128.0 → 48.7 / 49.6 / 49.8 µs | 31.4–38.7 → 14.1–14.3 µs | 1,063–1,087 → 2,668–2,702 µs |
+| ubuntu-24.04-arm, Neoverse-N2 (no SMT) | 3 → 3 | 92.6 / 70.9 / 32.8 → 38.3 / 34.0 / 32.1 µs | 15.4–15.8 → 15.1–15.3 µs | 280–304 → 282–300 µs |
+| windows-11-arm (no SMT) | 3 → 3 | 75.1 / 65.6 / 67.1 → 97.8 / 70.4 / 65.6 µs | 18.3–20.0 → 18.6–20.2 µs | 751–768 → 762–771 µs |
+
+**CI, main against part 1 against both parts** (run 42049944560, 2026-11-05 15:05–15:34 UTC; main c0c8d28c, part 1
+93c5c0ac, both 89382153):
+
+| runner | spinning 1-client p99, rounds 1/2/3: main → part 1 → both | parked p50: main / part 1 / both |
+|---|---|---|
+| ubuntu-latest | 160.8 / 41.3 / 74.6 → 29.9 / 29.0 / 27.0 → 21.8 / 23.4 / 24.6 µs | 277–357 / 700–744 / 36.7–37.1 µs |
+| ubuntu-24.04-arm | 143.6 / 36.2 / 36.4 → 38.9 / 52.2 / 89.2 → 28.9 / 28.1 / 28.4 µs | 448–496 / 390–534 / 38.5–49.3 µs |
+| windows-latest | 212.8 / 187.3 / 153.8 → 75.1 / 80.3 / 76.5 → 40.7 / 40.4 / 38.7 µs | 667–780 / 1,499–1,728 / 154–331 µs |
+| windows-11-arm | 90.8 / 74.6 / 76.2 → 67.3 / 91.4 / 61.2 → 47.8 / 89.9 / 60.1 µs | 760–776 / 757–763 / 245–263 µs |
+
+**jupiter** (AMD Ryzen AI MAX+ 395, 16 cores × 2 threads, Windows 11; the processor 3–21% busy before each run;
+2026-11-05 15:10–15:15 UTC; main c0c8d28c, part 1 93c5c0ac, both 89382153; shards 31 → 15 → 15):
+
+| row | main | part 1 | both |
+|---|---|---|---|
+| spinning 1-client p50 | 58.3 / 21.0 / 112.6 µs | 20.0 / 20.1 / 20.7 µs | 19.3 / 20.0 / 20.8 µs |
+| spinning 1-client p99 | 9,140 / 718 / 7,749 µs | 93.8 / 649 / 184.9 µs | 80.2 / 125.1 / 251.9 µs |
+| spinning 8-client p99 | 9.43 / 3.47 / 15.18 ms | 0.39 / 0.19 / 0.56 ms | 0.30 / 0.73 / 0.86 ms |
+| parked p50 | 607 / 604 / 651 µs | 713 / 726 / 764 µs | 645 / 701 / 657 µs |
+| parked p99 | 25.2 / 23.8 / 26.9 ms | 11.4 / 16.5 / 8.8 ms | 7.6 / 13.1 / 6.6 ms |
+
+**adacachy** (AMD Ryzen 9 9950X3D2, 16 × 2, Linux; 2026-11-05 08:16–08:17 UTC, **load about 52 on 32 threads**; before
+13d34430, after the same tree with part 1; shards 31 → 15): single-client p99 6.64 / 1.54 / 1.26 ms → 2.05 / 0.85 /
+1.55 ms. A run this loaded measures the other jobs, so it decides nothing; a quieter rerun is owed.
+
+What it means:
+- **Part 1 turns R9's single-client gate green on the SMT runners and removes jupiter's millisecond tails.** It cuts
+  the spinning p50 by 30–60% there. The arm64 runners, which have no SMT, keep their shard count, and their numbers
+  move within noise. That is the control.
+- **Part 1 alone made the parked form 2.3–2.5× slower on the two-core runners, and part 2 removes that and more.**
+  The parked form runs after about 440,000 creates. Under part 1 alone they all sat on one shard, and each parked
+  create scanned all of that shard's keys. With keys bounded and indexed, the parked p50 falls 8–20× on Linux (to
+  37–49 µs) and 2–5× on Windows.
+- **Still red:** windows-11-arm's single-client p99 (green in 1 of 3 rounds) and jupiter's (80–252 µs). Windows'
+  parked p50 is 154–700 µs. The periodic acknowledgement's scatter is the next lever on the single-client tail
+  (GAPS). Sending it unawaited (a6c3bc16) stalled 2 of 4 parked forms, and it was reverted.
+
 ## The WinFsp receiver with A-215: a batch's last response rides the next receive (audit step 7; 2026-11-05)
 
 A-212 left the receiver worse than WinFsp's DLL dispatcher beyond the spread at the p50, by about 20 µs a request. It
@@ -8880,61 +8951,3 @@ p999 and max per run:
 | read | 71758.7, 66787.8 | 28567.8, 31186.8 | 161440.3, 163803.6 | 94537.6, 131633.4 |
 | rename | 125490.9, 124818.9 | 94575.5, 99787.4 | 164556.4, 175311.1 | 164406.2, 165253.8 |
 | unlink | 201544.6, 191527.6 | 97224.0, 141743.3 | 265065.0, 257519.5 | 318484.5, 238040.9 |
-
-## Provisioning by physical core, and a shard's content keys bounded (A-208; R9; 2026-11-05)
-
-A-208 has two parts. (1) The shard count follows physical cores, not hardware threads (93c5c0ac). (2) A shard's
-content keys are held by what names them and found through an index (89382153). Both are measured with
-`provision_bench`, release, the arms interleaved round by round, three rounds. Each figure is one round's value, the
-median of the bench's own three runs, and every bench run is in the cited log.
-
-Command, every arm: `cargo build --release --locked -p slates-client --example provision_bench` at the arm's commit,
-then the binary. On CI, through `.github/workflows/diag-clients.yml` on a diagnostics branch (not for main); on
-jupiter, each arm built from `git archive <commit>` into its own target dir.
-
-**CI, part 1 alone** (run 41992744368, 2026-11-05 08:18–08:43 UTC; before 21da6e57, after 59f7f380; 4-vCPU GitHub
-VMs):
-
-| runner (topology) | shards | spinning 1-client p99, rounds 1/2/3 | spinning p50 | parked p50 |
-|---|---|---|---|---|
-| ubuntu-latest, EPYC 9V74 (2 cores × 2 threads) | 3 → 1 | 41.5 / 39.9 / 94.3 → 24.4 / 25.2 / 23.3 µs | 20.0–20.2 → 13.4–13.7 µs | 269–301 → 627–652 µs |
-| windows-latest (2 cores, 4 logical) | 3 → 1 | 190.1 / 117.3 / 128.0 → 48.7 / 49.6 / 49.8 µs | 31.4–38.7 → 14.1–14.3 µs | 1,063–1,087 → 2,668–2,702 µs |
-| ubuntu-24.04-arm, Neoverse-N2 (no SMT) | 3 → 3 | 92.6 / 70.9 / 32.8 → 38.3 / 34.0 / 32.1 µs | 15.4–15.8 → 15.1–15.3 µs | 280–304 → 282–300 µs |
-| windows-11-arm (no SMT) | 3 → 3 | 75.1 / 65.6 / 67.1 → 97.8 / 70.4 / 65.6 µs | 18.3–20.0 → 18.6–20.2 µs | 751–768 → 762–771 µs |
-
-**CI, main against part 1 against both parts** (run 42049944560, 2026-11-05 15:05–15:34 UTC; main c0c8d28c, part 1
-93c5c0ac, both 89382153):
-
-| runner | spinning 1-client p99, rounds 1/2/3: main → part 1 → both | parked p50: main / part 1 / both |
-|---|---|---|
-| ubuntu-latest | 160.8 / 41.3 / 74.6 → 29.9 / 29.0 / 27.0 → 21.8 / 23.4 / 24.6 µs | 277–357 / 700–744 / 36.7–37.1 µs |
-| ubuntu-24.04-arm | 143.6 / 36.2 / 36.4 → 38.9 / 52.2 / 89.2 → 28.9 / 28.1 / 28.4 µs | 448–496 / 390–534 / 38.5–49.3 µs |
-| windows-latest | 212.8 / 187.3 / 153.8 → 75.1 / 80.3 / 76.5 → 40.7 / 40.4 / 38.7 µs | 667–780 / 1,499–1,728 / 154–331 µs |
-| windows-11-arm | 90.8 / 74.6 / 76.2 → 67.3 / 91.4 / 61.2 → 47.8 / 89.9 / 60.1 µs | 760–776 / 757–763 / 245–263 µs |
-
-**jupiter** (AMD Ryzen AI MAX+ 395, 16 cores × 2 threads, Windows 11; the processor 3–21% busy before each run;
-2026-11-05 15:10–15:15 UTC; main c0c8d28c, part 1 93c5c0ac, both 89382153; shards 31 → 15 → 15):
-
-| row | main | part 1 | both |
-|---|---|---|---|
-| spinning 1-client p50 | 58.3 / 21.0 / 112.6 µs | 20.0 / 20.1 / 20.7 µs | 19.3 / 20.0 / 20.8 µs |
-| spinning 1-client p99 | 9,140 / 718 / 7,749 µs | 93.8 / 649 / 184.9 µs | 80.2 / 125.1 / 251.9 µs |
-| spinning 8-client p99 | 9.43 / 3.47 / 15.18 ms | 0.39 / 0.19 / 0.56 ms | 0.30 / 0.73 / 0.86 ms |
-| parked p50 | 607 / 604 / 651 µs | 713 / 726 / 764 µs | 645 / 701 / 657 µs |
-| parked p99 | 25.2 / 23.8 / 26.9 ms | 11.4 / 16.5 / 8.8 ms | 7.6 / 13.1 / 6.6 ms |
-
-**adacachy** (AMD Ryzen 9 9950X3D2, 16 × 2, Linux; 2026-11-05 08:16–08:17 UTC, **load about 52 on 32 threads**; before
-13d34430, after the same tree with part 1; shards 31 → 15): single-client p99 6.64 / 1.54 / 1.26 ms → 2.05 / 0.85 /
-1.55 ms. A run this loaded measures the other jobs, so it decides nothing; a quieter rerun is owed.
-
-What it means:
-- **Part 1 turns R9's single-client gate green on the SMT runners and removes jupiter's millisecond tails.** It cuts
-  the spinning p50 by 30–60% there. The arm64 runners, which have no SMT, keep their shard count, and their numbers
-  move within noise. That is the control.
-- **Part 1 alone made the parked form 2.3–2.5× slower on the two-core runners, and part 2 removes that and more.**
-  The parked form runs after about 440,000 creates. Under part 1 alone they all sat on one shard, and each parked
-  create scanned all of that shard's keys. With keys bounded and indexed, the parked p50 falls 8–20× on Linux (to
-  37–49 µs) and 2–5× on Windows.
-- **Still red:** windows-11-arm's single-client p99 (green in 1 of 3 rounds) and jupiter's (80–252 µs). Windows'
-  parked p50 is 154–700 µs. The periodic acknowledgement's scatter is the next lever on the single-client tail
-  (GAPS). Sending it unawaited (a6c3bc16) stalled 2 of 4 parked forms, and it was reverted.
