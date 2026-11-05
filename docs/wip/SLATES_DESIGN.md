@@ -13096,8 +13096,13 @@ again and keeps that from happening.
 - The last response is saved as A-198 saves any response. Then the other buffer is cleared, and the journal records
   "handing off from this buffer".
 - One call sends that response and receives into the other buffer.
-- When the call returns, the open the response hands the kernel, if any, is confirmed. Then the saved response is
-  cleared, and the journal records the other buffer as the batch in hand, or no batch when the call brought none.
+- The open the response hands the kernel, if any, is confirmed while the call waits: its confirmation is posted to the
+  shard before the call and its answer taken after. When the call returns, the saved response is cleared, and the
+  journal records the other buffer as the batch in hand, or no batch when the call brought none.
+- Confirming before the driver has the response is safe once "handing off" is recorded: after that, every death still
+  hands the kernel this context. Either the call consumed the response, or recovery sends the saved Create again. The
+  first form confirmed after the call, which put a shard round trip after the next request had arrived; before A-215
+  that round trip had overlapped the application's turnaround (BENCHMARKS, "A-215's own effect").
 - A worker told to stop leaves a returned hand-off as it is, for the successor.
 
 **Why a death anywhere is safe.** Recovery reads the journal only after the dead process has exited (A-198). Two
