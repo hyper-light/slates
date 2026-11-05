@@ -342,10 +342,31 @@ mod tests {
     ));
   }
 
+  /// A-206 (2026-11-04). Do: read a successful rename whose names are 2,000 units each. Expect: both whole. Before, a name
+  /// past 1,025 units refused the parse, and that refusal ended the mount's receive worker.
+  #[test]
+  fn a_rename_of_a_long_path_is_read_whole() {
+    let from = format!("\\{}", "o".repeat(1999));
+    let to = format!("\\{}", "n".repeat(1999));
+    let bytes = rename_request_of(&from, &to);
+    let pending = requests(&bytes).unwrap();
+    let request = pending.first().unwrap();
+    let mut response = request.cancelled_response().unwrap();
+    response[STATUS_AT..STATUS_AT + size_of::<u32>()].fill(0);
+    assert_eq!(
+      request.successful_rename(&response).unwrap(),
+      Some((from, to))
+    );
+  }
+
   fn rename_request() -> Vec<u8> {
+    rename_request_of("\\old", "\\new")
+  }
+
+  fn rename_request_of(from: &str, to: &str) -> Vec<u8> {
     let mut bytes = vec![0; BATCH_BYTES];
     let mut payload = Vec::new();
-    for (descriptor, path) in [(FILE_NAME_AT, "\\old"), (NEW_NAME_AT, "\\new")] {
+    for (descriptor, path) in [(FILE_NAME_AT, from), (NEW_NAME_AT, to)] {
       let offset = u16::try_from(payload.len()).unwrap();
       let units: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
       let length = u16::try_from(units.len() * size_of::<u16>()).unwrap();

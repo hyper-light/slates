@@ -37,8 +37,20 @@
 //! write by path to fall through to (the FUSE transport's reason to leave an ended mount in place, A-102, does not
 //! arise). A `detach`, the volume's destroy, a revocation and the daemon's stop all end it: the request channel's
 //! receiver is dropped first, so every dispatcher thread waiting on the shard returns at once, and then the mount thread
-//! joins the receiver and closes its own drive and file-system handles, and is joined. A normal detach first awaits
-//! the anchor's release acknowledgement. Across a killed daemon the anchor holds the control, drive-link and ledger
+//! joins the receiver and closes its own drive and file-system handles, and is joined.
+//!
+//! **The file system is deleted only after the anchor released its hold.** The anchor's copies keep the volume and the
+//! drive whoever else closes theirs, so a file system deleted first leaves a drive nobody serves. A `detach` therefore
+//! asks the anchor while the mount goes on serving, repeating the request for [`crate::anchor_hold::RELEASE_BOUND_NS`],
+//! and only an answer ends the attachment and removes the drive. Past the bound the detach is answered a typed refusal:
+//! the drive stays served and held. The request stands, since it may already be waiting in the pipe for the anchor's
+//! next turn, so it goes on being repeated, and the anchor's answer ends the mount then. Every other end (a destroy, a
+//! revocation, a mount refused or lost) has already ended the attachment, so it stops serving and waits for the same
+//! answer before it deletes the file system; a refused mount-time hold is answered first and then the same. The wait
+//! holds one task and one message per mount, and ends at the answer or at the shard's stop. A daemon with no anchor
+//! holds nothing, so nothing waits; its mount is refused at the hold.
+//!
+//! Across a killed daemon the anchor holds the control, drive-link and ledger
 //! objects (A-198); recovery retains a matching catalog attachment, builds a successor dispatcher for that held volume,
 //! and seeds its coherence names from the ledger's live opens. An old context resolves by stable file identity, with
 //! the old process's bridge handle suppressed. The 20-kill CLI oracle also requires a counted uncached read through
@@ -119,6 +131,11 @@ const PURGE_ECHOES: &str = "winfsp.purge_echoes";
 const RESTORED_READS: &str = "winfsp.restored_reads";
 /// Format: kernel requests settled from the retained receive journal before taking a new batch (A-198).
 const CAPTURED_SETTLED: &str = "winfsp.captured_requests_settled";
+/// Format: release attempts the anchor refused or did not answer, each repeated: the non-vacuity counter of the unmount
+/// oracle. A healthy anchor keeps it at zero.
+const HOLD_RELEASE_REFUSED: &str = "winfsp.hold_release_refused";
+/// Format: detaches answered a refusal because the anchor had not released within the bound.
+const DETACH_REFUSED: &str = "winfsp.detach_refused";
 
 /// A mounted volume being served: the channel WinFsp's dispatcher threads send on, the mount's thread, the open-handle
 /// map that persists across requests, the registry attachment its requests are admitted under, what Windows holds
@@ -157,6 +174,10 @@ pub(crate) struct WinFspMount {
   /// A purge-only command is out at the mount thread: no round or other purge is sent until its outcome is read, so one
   /// command is out at a time.
   purge_out: bool,
+  /// A detach has asked the anchor to release this mount and the mount serves on until it answers.
+  detaching: bool,
+  /// The anchor answered the release, so the mount's end asks nothing more of it.
+  released: bool,
 }
 
 /// The bounded held-ledger/image merge, one inode per owner turn. The held map has at most MAX_OPEN_HANDLES entries.
@@ -237,18 +258,23 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
       Ok(thread) => await_mounted(thread).await,
       Err(error) => Err((error.to_string(), None)),
     };
+    // A hold the anchor may yet read names this process's objects, so a refused one keeps them until it is released.
+    let mut _unheld = None;
     let mounted = match mounted {
       Ok((thread, ready)) => {
         let held = match (ready.handle_values(), ready.offer.record.encode()) {
           (Ok(values), Ok(record)) => crate::anchor_hold::hold_mount(attachment, values, record)
             .await
-            .map_err(|error| error.to_string()),
+            .map_err(|error| format!("the anchor's hold: {error}")),
           (Err(error), _) => Err(error.to_string()),
           (_, Err(error)) => Err(format!("held mount record: {error:?}")),
         };
         match held {
           Ok(()) => Ok((thread, ready)),
-          Err(error) => Err((error, Some(thread))),
+          Err(error) => {
+            _unheld = Some(ready);
+            Err((error, Some(thread)))
+          }
         }
       }
       Err(error) => Err(error),
@@ -274,7 +300,7 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
       reaped
     });
     match served {
-      Some(Some(thread)) => reap(thread, attachment).await,
+      Some(Some(thread)) => reap(thread, attachment, false).await,
       Some(None) => serve(attachment).await,
       // The shard's state could not be borrowed (counted): the mount, if it was kept, is ended with the shard.
       None => {}
@@ -286,6 +312,81 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
       crate::landing::deferred_reply()
     }
     Err(_) => crate::verbs::refused(Refusal::Overloaded { shard }),
+  }
+}
+
+/// Defers a `detach` of a served mount until the anchor has released its hold (see the module docs), or answers why it
+/// cannot start: `None` when the attachment has no served mount here, so the verb ends it as any other.
+pub(crate) fn defer_detach(state: &mut ShardState, record: &AttachmentRecord) -> Option<ReplyBody> {
+  let attachment = record.id;
+  let request = state.current_request?;
+  let mount = state.winfsp_mounts.get_mut(&attachment)?;
+  if mount.detaching {
+    return Some(crate::verbs::refused(Refusal::TargetUnavailable {
+      reason: format!(
+        "the drive {} waits for the anchor to release its hold; a detach already asked for this",
+        mount.mount_point
+      ),
+    }));
+  }
+  mount.detaching = true;
+  let route = state.reply_route.take();
+  let cause = state.current_span;
+  let shard = state.shard;
+  let record = record.clone();
+  let task = async move {
+    let answered = release_within(attachment, crate::anchor_hold::RELEASE_BOUND_NS).await;
+    let refused = answered.is_err();
+    let _ = state::with_state_counted(|s| {
+      let reply = complete(s, request, cause, attachment, |s| match &answered {
+        Ok(()) => end_released(s, &record),
+        Err(error) => {
+          s.count(DETACH_REFUSED, 1);
+          crate::verbs::refused(Refusal::TargetUnavailable {
+            reason: format!(
+              "the anchor has not released the drive it holds, so the file system still serves it: {error}"
+            ),
+          })
+        }
+      });
+      deliver(s, reply, route);
+    });
+    if refused {
+      release_hold(attachment).await;
+      let _ = state::with_state_counted(|s| {
+        if s.winfsp_mounts.contains_key(&attachment) {
+          let _ = end_released(s, &record);
+        }
+      });
+    }
+  };
+  match futures::spawn(task).and_then(futures::detach) {
+    Ok(()) => {
+      state.acceptance_deferred = true;
+      Some(crate::landing::deferred_reply())
+    }
+    Err(_) => {
+      if let Some(mount) = state.winfsp_mounts.get_mut(&attachment) {
+        mount.detaching = false;
+      }
+      Some(crate::verbs::refused(Refusal::Overloaded { shard }))
+    }
+  }
+}
+
+/// The anchor has released the mount, so a killed daemon would lose it anyway: its attachment ends and the mount ends,
+/// whether or not the end could be recorded here (the mount's own end records it again, and a restart ends a record no
+/// hold matches).
+fn end_released(s: &mut ShardState, record: &AttachmentRecord) -> ReplyBody {
+  let ended = crate::verbs::end_attachment(s, record, crate::verbs::Ending::Detached);
+  if let Some(mount) = s.winfsp_mounts.get_mut(&record.id) {
+    mount.released = true;
+    mount.ending = true;
+    mount.waker.wake_by_ref();
+  }
+  match ended {
+    Ok(()) => ReplyBody::Detached,
+    Err(error) => crate::verbs::refused(crate::error::refusal_of_db(&error)),
   }
 }
 
@@ -479,6 +580,8 @@ fn keep(
       told: 0,
       retries: PurgeRetries::new(MAX_OPEN_HANDLES, tick_ns(), REQUEST_TIMEOUT_NS),
       purge_out: false,
+      detaching: false,
+      released: false,
     },
   );
   open_journal_reader(s, record.volume, registry);
@@ -626,7 +729,7 @@ async fn adopt_mount(record: AttachmentRecord, held: InheritedMount) {
   });
   match adopted {
     Some(Ok(())) => serve(attachment).await,
-    Some(Err(Some(thread))) => reap(thread, attachment).await,
+    Some(Err(Some(thread))) => reap(thread, attachment, false).await,
     Some(Err(None)) | None => release_hold(attachment).await,
   }
 }
@@ -640,10 +743,49 @@ fn refuse_adoption(s: &mut ShardState, record: &AttachmentRecord, why: &str) {
   }
 }
 
+/// One attempt at a release: `Ok` once the anchor no longer holds the mount, which a daemon with no anchor never asked
+/// it to. A refused attempt is counted.
+async fn release_attempt(attachment: u64) -> Result<(), crate::anchor_hold::HoldRefusal> {
+  use crate::anchor_hold::HoldRefusal;
+  match crate::anchor_hold::release_mount(attachment).await {
+    Ok(()) | Err(HoldRefusal::NoChannel) => Ok(()),
+    Err(error) => {
+      let _ = state::with_state_counted(|s| s.count(HOLD_RELEASE_REFUSED, 1));
+      Err(error)
+    }
+  }
+}
+
+/// Repeats the release until the anchor answers or `bound_ns` has passed, then answers the last refusal.
+async fn release_within(
+  attachment: u64,
+  bound_ns: u64,
+) -> Result<(), crate::anchor_hold::HoldRefusal> {
+  let began = futures::now_ns();
+  loop {
+    let refusal = match release_attempt(attachment).await {
+      Ok(()) => return Ok(()),
+      Err(refusal) => refusal,
+    };
+    if futures::now_ns().saturating_sub(began) >= bound_ns {
+      return Err(refusal);
+    }
+    // An attempt refused at once (not one that waited out its budget) is not repeated in a tight loop.
+    crate::daemon::pace(tick_ns()).await;
+  }
+}
+
+/// Repeats the release until the anchor answers: what the deletion of a file system waits for (see the module docs). The
+/// release is idempotent and each attempt is bounded, so this holds one task and at most a message in the pipe; it ends
+/// at the answer or at the shard's stop. Only the first refusal is printed, since the rest repeat it.
 async fn release_hold(attachment: u64) {
-  if let Err(error) = crate::anchor_hold::release_mount(attachment).await {
-    let _ = state::with_state_counted(|s| s.count("winfsp.hold_release_refused", 1));
-    eprintln!("slates-server: mount {attachment} hold release refused: {error}");
+  let mut told = false;
+  while let Err(error) = release_attempt(attachment).await {
+    if !told {
+      eprintln!("slates-server: mount {attachment} hold release refused: {error}; repeating it");
+      told = true;
+    }
+    crate::daemon::pace(tick_ns()).await;
   }
 }
 
@@ -693,8 +835,9 @@ async fn serve(attachment: u64) {
   loop {
     match state::with_state(|s| turn(s, attachment)) {
       Some(Turned::Ended) | None => {
-        if let Some(Some(thread)) = state::with_state_counted(|s| ended(s, attachment)) {
-          reap(thread, attachment).await;
+        if let Some(Some((thread, released))) = state::with_state_counted(|s| ended(s, attachment))
+        {
+          reap(thread, attachment, released).await;
         }
         return;
       }
@@ -724,11 +867,13 @@ async fn wait_after(turned: Turned) {
   }
 }
 
-/// Waits for a stopped mount thread's last outcome and joins it, without holding the shard: the thread has only to
-/// stop WinFsp's dispatcher (whose threads return at once, the request channel's receiver being dropped) and remove the
-/// drive.
-async fn reap(mut thread: MountThread, attachment: u64) {
-  release_hold(attachment).await;
+/// Waits for the anchor's release unless it was `released` already, then stops the mount thread and joins it at its last
+/// outcome, without holding the shard: the thread has only to stop WinFsp's dispatcher (whose threads return at once, the
+/// request channel's receiver being dropped) and remove the drive.
+async fn reap(mut thread: MountThread, attachment: u64, released: bool) {
+  if !released {
+    release_hold(attachment).await;
+  }
   thread.stop();
   loop {
     match thread.outcome() {
@@ -1186,8 +1331,8 @@ fn answer(s: &mut ShardState, mount: &WinFspMount, mut served: slates_bridge_win
 
 /// Tears mount `attachment` down: its requests' receiver dropped (every waiting dispatcher thread returns), its journal
 /// reader closed, its registry attachment revoked and drained, and its attachment ended as a recorded operation when it
-/// still stands. Returns its thread, asked to stop, for the task to reap off the shard.
-fn ended(s: &mut ShardState, attachment: u64) -> Option<MountThread> {
+/// still stands. Returns its thread, for the task to reap off the shard, and whether the anchor has released it.
+fn ended(s: &mut ShardState, attachment: u64) -> Option<(MountThread, bool)> {
   let mut mount = s.winfsp_mounts.remove(&attachment)?;
   mount.requests = None;
   close_journal_reader(s, &mount);
@@ -1198,7 +1343,7 @@ fn ended(s: &mut ShardState, attachment: u64) -> Option<MountThread> {
   {
     s.count(END_REFUSED, 1);
   }
-  Some(mount.thread)
+  Some((mount.thread, mount.released))
 }
 
 /// Ends the WinFsp mount of `attachment` if the shard serves one (its attachment ended: a `detach`, the volume's
@@ -1217,7 +1362,7 @@ pub(crate) fn end_all(s: &mut ShardState) {
   let attachments: Vec<u64> = s.winfsp_mounts.keys().copied().collect();
   let mut threads: Vec<MountThread> = attachments
     .into_iter()
-    .filter_map(|attachment| ended(s, attachment))
+    .filter_map(|attachment| ended(s, attachment).map(|(thread, _)| thread))
     .collect();
   // Start every cancellation before joining any receiver, so the finite control waits overlap across mounts.
   for thread in &mut threads {

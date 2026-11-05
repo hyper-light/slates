@@ -3737,8 +3737,8 @@ kept out of the tree.
 **Owed:**
 - Tail rounding: done by A-118 (a sealed chunk's block trimmed to its pages): block rounding 88.6 → 44.3 MB on
   `/usr`, the daemon 34–39 MB smaller at idle, copy time unchanged (the A/B is A-118's table).
-- Windows: the content object gives no page back there (`SparseObject::discard`), so A-117 does nothing on that host;
-  a measured decommit is owed. macOS marks the pages reusable since 2026-10-08 (A-117's macOS note).
+- Windows: built by A-205 (2026-11-04): `DiscardVirtualMemory` over the committed runs. macOS marks the pages reusable
+  since 2026-10-08 (A-117's macOS note).
 
 ### Measured and rejected: no write delegation for an open that creates (condition 12; 2026-10-08)
 
@@ -7772,6 +7772,151 @@ pattern (`fsbench` 10–28×).
 
 
 
+<<<<<<< HEAD
+=======
+## What a write costs on pages given back on Windows (A-205; VFS plan step 12; 2026-11-04)
+
+jupiter (AMD Ryzen AI MAX+ 395, 32 threads, 124 GiB, Windows 11 Pro 10.0.26200), load average 20 to 30 from other agents'
+builds and tests on the box, rustc 1.98.1, release. The rounds interleave the rows; all 11 are shown.
+
+`cargo +1.98.1 run --release -p slates-mem --example give_back_bench` (256 MiB written as 64 KiB chunks, µs per MiB):
+
+| Pages | Best | All 11 rounds |
+|---|---|---|
+| never used, nothing to clear | 293.8 | 401.9 339.3 319.9 322.6 370.6 354.1 293.8 459.2 579.3 524.9 490.2 |
+| never used, cleared on allocation | 363.6 | 363.6 377.5 422.3 364.9 402.4 421.5 450.3 556.9 585.9 538.3 537.8 |
+| given back, cleared on allocation | 267.1 | 300.7 291.4 320.0 291.8 346.9 267.1 471.4 550.3 526.3 494.2 454.1 |
+| kept resident, zeroed on free | 30.1 | 33.8 30.9 30.5 30.1 34.2 32.4 36.6 44.9 62.2 37.8 43.6 |
+
+So a write on pages given back costs what a write on never-used pages costs: each row's own spread (a factor of about 2
+across the load here) is larger than the gap between them. Both cost about ten times a write on pages kept resident, which
+is why the give-back is an idle purge (A-105) and not a step of every free.
+
+Freed bytes that left the process's working set (`Facts::resident_now`, `K32GetProcessMemoryInfo`):
+
+| Test, jupiter | Freed | Left the working set |
+|---|---|---|
+| `cargo +1.98.1 test -p slates-mem --test give_back -- --nocapture`, private region | 64 MiB | 99% |
+| the same, shared region | 64 MiB | 100% |
+| the same, sparse content object | 64 MiB | 100% |
+| `cargo +1.98.1 test -p slates-server --test give_back -- --nocapture`, a daemon, round 1 | 128 MiB of files | 101% |
+| the same, round 2, over pages already reused once | 128 MiB of files | 101% |
+
+The daemon's share is over 100% because its recovery memory goes back as well (A-117). In both rounds every byte of the
+recreated files read back as written, and the working set climbed by the files' size again.
+
+CI's Windows runners, the same commands, 2026-11-05 (`windows-latest` x86_64 and `windows-11-arm`, shared GitHub machines):
+
+| Run, lane | Never used, nothing to clear: best | Never used, cleared: best | Given back, cleared: best | Kept resident: best |
+|---|---|---|---|---|
+| 41977748853, x86_64 | 486.3 | 501.1 | 399.7 | 69.6 |
+| 41977748853, arm64 | 355.4 | 360.6 | 298.5 | 24.7 |
+| 41978699404, x86_64 | 624.9 | 654.9 | 523.8 | 88.0 |
+| 41978699404, arm64 | 342.9 | 352.1 | 294.0 | 23.5 |
+
+The rows' 11 rounds of run 41977748853, x86_64, in the same order:
+- 493.2 496.2 493.1 532.5 515.1 538.6 501.5 486.3 498.2 514.7 499.0
+- 514.6 506.9 501.1 501.5 503.2 502.1 505.5 503.7 565.6 501.3 502.4
+- 403.2 401.1 402.3 409.5 406.7 404.0 407.5 421.4 412.2 405.4 399.7
+- 70.9 70.2 69.6 71.6 71.7 70.8 70.5 71.1 70.2 71.3 70.5
+
+And of run 41977748853, arm64:
+- 368.3 359.8 355.4 362.8 365.4 358.2 366.5 362.9 361.9 358.1 366.0
+- 368.0 369.6 366.9 365.8 365.6 361.7 372.9 360.6 364.0 361.7 372.1
+- 307.6 300.3 311.6 298.5 302.8 303.8 308.4 306.7 308.6 304.6 298.7
+- 26.2 24.7 25.3 26.9 26.3 26.9 26.0 25.5 25.7 26.0 25.2
+
+- On quiet runners a write on pages given back is not dearer: it is 14–20% cheaper than a write on never-used pages, on
+  both architectures, outside the spread. Why is not explained here.
+- Clearing a never-used block costs 1.5–5% best against best in the two runs above, and 4–9% in the red-check run 41978703778
+  (its discard refused, which does not touch these two rows); the spreads overlap: a first write's price for the whole record.
+
+Freed bytes that left the working set on CI, with every discard refused as the red-check (the same tests, run 41978703778;
+the discard calls replaced by a refusal in a diagnostics commit):
+
+| Measure | x86_64 | arm64 |
+|---|---|---|
+| Crate, private region, working set at once, discard on (41978699404) | 99% | 99% |
+| Crate, private region, working set at once, discard refused | 0% | 0% |
+| Daemon, its own count of bytes given back, discard on (41978699404, of 134,217,728) | 136,474,624 | 125,173,760 |
+| Daemon, its own count, discard refused | 0 | 0 |
+| Daemon, working set in the first 5 s, discard refused | 0.8 MB, 0% | 0 bytes, 0% |
+| Daemon, working set at the end of the 120 s wait, discard refused | 25% | 69% |
+| Daemon, time for 90% to leave, discard on | 0.53, 0.81 s | 1.50 s |
+
+- The last-but-one row is Windows trimming a working set unasked, with the daemon counting nothing. So the working set is
+  read beside the daemon's count and against the time: a purge's fall comes within 2 s on the runners, and with no discard
+  there is none in the first 5 s.
+- The test stops waiting once both reach 90%, so a reading of 90% to 92% (run 41977748853: x86_64 90%, arm64 92%) is where
+  it stopped, not how far it would have gone. The first run to reach further, 41978699404's x86_64, read 102%.
+- Handles leaked by 200 refused adoptions: 0 on both architectures (41977748853, 41978699404, 41978703778; the held-section
+  test is unaffected by the refusal).
+- Run 41978699404's arm64 daemon test failed at first, on the test's own limit: it held the working set's climb after the
+  files were recreated to 90% too, and the climb read 89.9% (42,946,560 to 163,614,720), every byte having read back
+  correct. That limit was no part of the done-when and Windows' trimming moves it, so it is now half the bytes: what it
+  asks is that the reused pages count again, and the byte comparison is what says they hold what was written. With that
+  limit the daemon test passed 5 of 5 on each architecture (run 41979650557).
+- Linux and Mac fmt, clippy, docs, `cargo xtask check` and the mem tests, and Miri over mem's tests: passed on run
+  41975260339.
+
+## The client's edit and merge latency, and a merge that grows with its green (RQ-4, §4.16; 2026-11-05)
+
+The per-platform client record (`platforms.md`) had a provisioning histogram and no number for the two verbs an agent
+calls most after it: an edit declared on a work volume and its submit. `crates/client/examples/edit_merge_bench.rs`
+measures both from the Rust client, through the real rendezvous and rings, against an in-process daemon derived for the
+machine. Each sample makes a work off the green's head (untimed), declares one 64-byte edit (`edit`), submits it
+(`merge`, always accepted), and destroys the work (untimed); the client spins 50 µs for each reply. Two forms, each on
+fresh greens, 1,000 samples a run, three runs:
+- `new_file`: each sample creates its own file, so after sample n the green holds n + 1 files and n + 1 versions;
+- `one_file`: each sample replaces one file's line, so the green holds one file and only the versions grow.
+
+Each run also prints the median of its first and last 100 samples, which the percentiles mix away.
+
+Command: `cargo build --release -p slates-client --example edit_merge_bench`, then
+`target/release/examples/edit_merge_bench`. Machine: Apple M5 Max, 18 cores, macOS 26.4.1, slates `76b450a1` with the
+example; a laptop shared with other agents' builds, so the load average is given for every invocation and the tails are
+the load's.
+
+**First-tenth and last-tenth medians**, every run of two invocations at 2026-11-05 06:06:48 and 06:06:52 UTC (load
+9.4 and 9.3 at the start, 9.3 and 8.9 at the end):
+
+| form | verb | invocation 1, runs 0 / 1 / 2: first 100 → last 100 | invocation 2, runs 0 / 1 / 2: first 100 → last 100 |
+|---|---|---|---|
+| new_file | edit | 18.3 → 20.9, 18.5 → 19.0, 18.4 → 18.0 µs | 6.5 → 75.7, 70.9 → 18.2, 3.1 → 17.4 µs |
+| new_file | merge | **79.3 → 569.6, 63.8 → 589.3, 60.2 → 554.9 µs** | **41.5 → 684.2, 160.7 → 554.1, 25.1 → 529.4 µs** |
+| one_file | edit | 65.2 → 18.0, 19.0 → 66.1, 61.4 → 15.9 µs | 3.0 → 4.8, 4.6 → 2.4, 4.5 → 4.3 µs |
+| one_file | merge | 86.3 → 25.2, 28.1 → 81.3, 93.8 → 20.9 µs | 6.8 → 10.8, 10.4 → 5.5, 10.5 → 6.2 µs |
+
+**Percentiles** (median of the three runs, then all three):
+
+| row | invocation 1 | invocation 2 |
+|---|---|---|
+| new_file edit p50 / p99 | 20.0 µs [20.0, 19.3, 20.8] / 538 µs [663, 492, 538] | 20.1 µs [61.8, 20.1, 16.2] / 4.42 ms [4.42, 5.19, 0.79] |
+| new_file merge p50 / p99 | 326 µs [326, 316, 365] / 1.62 ms [1.38, 1.90, 1.62] | 270 µs [429, 270, 238] / 63.4 ms [65.4, 63.4, 2.40] |
+| one_file edit p50 / p99 | 18.8 µs [18.8, 22.1, 18.8] / 1.45 ms [1.45, 1.34, 1.47] | 2.5 µs [4.5, 2.5, 2.5] / 37.8 µs [260, 29.5, 37.8] |
+| one_file merge p50 / p99 | 27.2 µs [27.2, 32.2, 27.1] / 1.19 ms [0.98, 1.19, 2.38] | 5.6 µs [10.3, 5.6, 5.6] / 44.2 µs [264, 43.3, 44.2] |
+
+What it means:
+- **A merge's cost follows the number of files in its green.** In every one of six `new_file` runs, the last
+  hundred submits' median is 529–684 µs against 25–161 µs for the first hundred. That is about 0.5–0.9 µs per file
+  for 64-byte files. In the `one_file` form, 1,000 versions of one file show no growth. An edit's cost does not grow in
+  either form. A first look the same morning (05:48 UTC, load 8–12, the `new_file` form alone) measured 41–95 µs →
+  929–955 µs.
+- **The cause, from `sample` on the running bench and the code:** every accepted submit does three things in proportion
+  to the whole green. It builds `Green::current_base` (`crates/merge/src/engine.rs`), cloning every path. It walks every
+  base file in `compose_volume` (`crates/merge/src/increment.rs`). And it hashes every byte of every file for the
+  record's identity, in `Green::head_identity`, called from `merge_service::enqueue_record`. The last makes a merge
+  O(bytes in the green), so a repository-sized green would take milliseconds a merge, against RQ-4's millisecond. The
+  fix is the perf agent's (the merge path, by the supervisor's assignment of 2026-11-05). This example is the harness
+  to re-measure with on every platform once that fix lands.
+- **The two invocations differ sevenfold at p50 in the `one_file` form** (edit 18.8 against 2.5 µs, merge 27.2
+  against 5.6 µs), each steady over all three of its runs. The verbs are the same, so it is the round trip between the
+  client and its shard on this Mac. That points to where the scheduler placed the threads, or to a wake. It is open and
+  measured next (GAPS, the client's per-platform record).
+- The p99 and longer rows here are the load of the shared laptop, not code properties. A quiet machine's record is
+  owed; this laptop had no quiet window this day.
+
+>>>>>>> origin/main
 ## Replication latency: what a cross-node commit costs (§4.8, §4.10; 2026-11-04)
 
 **Hardware:** adacachy, AMD Ryzen 9 9950X3D2 (16 cores, 32 threads), 122 GiB. **Load:** load average 36–42 on 32
@@ -7818,6 +7963,7 @@ waited for: tails of 18–93 ms and one run that never finished. The bench now d
 waits parked.
 
 **Not in these rows.** The daemon ships a head only on its 100 ms record period, so a head still waits up to a
+<<<<<<< HEAD
 period before this commit begins.
 
 ### Live shipping over the transport (A-200; 2026-11-04)
@@ -7851,3 +7997,6 @@ quiet run. It does not hold at p999 for 64 KiB writes (2 of 5 quiet runs over 1 
 round trip itself reached 54.8 ms: the spinning threads take the unit's CPU quota from the shards, and the tail is the
 quota's throttling, not the protocol. A dead holder does not slow writes; the 64 KiB tail grows (p99 798 µs).
 
+=======
+period before this commit begins; and nothing replicates a file's writes per write yet (§4.10 live shipping is owed).
+>>>>>>> origin/main

@@ -11,10 +11,13 @@
 //!   `<ns>` between checks unless a reply wakes it. The daemon parks a tenth of its 100 ms heartbeat
 //!   (`fleet::POLL_PER_PERIOD`), 10 ms; the second poll is a hundredth of that.
 //!
+<<<<<<< HEAD
 //! - `live ship <n> B`: one live-shipped write (A-200) of an `n`-byte publication: `Shipper::append`, then `ship` to
 //!   both holders, each applying it through `serve_entry`, until it is durable (the owner and one holder hold it).
 //!   One write at a time (a credit of one), at the daemon's poll.
 //!
+=======
+>>>>>>> origin/main
 //! The daemon ships a record only on its record period (100 ms), so a head waits up to one period before this
 //! commit starts: that wait is not in these rows.
 //!
@@ -36,9 +39,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::channel;
 
 use rustls::pki_types::PrivateKeyDer;
+<<<<<<< HEAD
 use slates_cluster::live::{LIVE_ENTRY_STREAM, fold_late, serve_entry, ship};
 use slates_cluster::{CommitBudget, RECORD_STREAM, commit_record};
 use slates_db::live::{Replica, Shipper};
+=======
+use slates_cluster::{CommitBudget, RECORD_STREAM, commit_record};
+>>>>>>> origin/main
 use slates_db::register::{
   Acceptor, Authority, HostEpoch, HostId, ObjectId, Placement, Quorum, Record,
 };
@@ -70,10 +77,13 @@ const FINE_POLL_NS: u64 = 100_000;
 const TASKS: usize = 256;
 /// Shape: the daemon's latency budget its batch bound is calibrated against (`slates_server::config`, R9's 50 µs).
 const LATENCY_BUDGET_NS: u64 = 50_000;
+<<<<<<< HEAD
 /// Shape: the write sizes a live-shipped entry is measured at: a metadata-sized delta, a page, a chunk window.
 const LIVE_PAYLOADS: [usize; 3] = [64, 4096, 65_536];
 /// Shape: the largest entry a holder decodes here: the largest payload with room for its header.
 const LIVE_CAP: usize = 1 << 17;
+=======
+>>>>>>> origin/main
 /// Format: the request kind of the bare round trip, distinct from [`RECORD_STREAM`].
 const ECHO_KIND: u64 = 2;
 /// Format: nanoseconds per microsecond.
@@ -150,6 +160,7 @@ fn row(name: &str, mut samples_ns: Vec<u64>) {
 
 /// A holder: answers the echo kind at once and each record through its acceptor (as `serve_record` does), until
 /// `stop`.
+<<<<<<< HEAD
 async fn hold(mut endpoint: Endpoint, host: HostId, stop: &'static AtomicBool, silent: bool) {
   endpoint.establish().await.unwrap();
   if silent {
@@ -164,10 +175,16 @@ async fn hold(mut endpoint: Endpoint, host: HostId, stop: &'static AtomicBool, s
   // format), and the state it stands for.
   let mut replicas: std::collections::BTreeMap<Vec<u8>, (Replica, Vec<u8>)> =
     std::collections::BTreeMap::new();
+=======
+async fn hold(mut endpoint: Endpoint, host: HostId, stop: &'static AtomicBool) {
+  endpoint.establish().await.unwrap();
+  let mut acceptor = Acceptor::new(host, authority());
+>>>>>>> origin/main
   while !stop.load(Ordering::Acquire) {
     let served = slates_rt::futures::within(
       FINE_POLL_NS,
       endpoint.serve_once(|kind, request| {
+<<<<<<< HEAD
         if kind == LIVE_ENTRY_STREAM {
           let object = request.get(8..24).unwrap_or_default().to_vec();
           let id = ObjectId(object.as_slice().try_into().unwrap_or([0; 16]));
@@ -180,6 +197,9 @@ async fn hold(mut endpoint: Endpoint, host: HostId, stop: &'static AtomicBool, s
             true
           })
         } else if kind == RECORD_STREAM {
+=======
+        if kind == RECORD_STREAM {
+>>>>>>> origin/main
           match Record::decode(&request) {
             Ok(record) => acceptor
               .accept(&record)
@@ -208,9 +228,12 @@ fn main() {
     .nth(2)
     .and_then(|value| value.parse().ok())
     .unwrap_or(0);
+<<<<<<< HEAD
   // `silent` as the third argument: holder 3 handshakes and never answers again (a dead replica), and only the rows
   // that need one holder are run.
   let silent = std::env::args().nth(3).is_some_and(|word| word == "silent");
+=======
+>>>>>>> origin/main
   static STOP: AtomicBool = AtomicBool::new(false);
   static LOAD_STOP: AtomicBool = AtomicBool::new(false);
   let load: Vec<_> = (0..load_threads)
@@ -247,7 +270,11 @@ fn main() {
         shape(),
       )
       .unwrap();
+<<<<<<< HEAD
       hold(endpoint, host, &STOP, silent && host == HOLDERS[1]).await;
+=======
+      hold(endpoint, host, &STOP).await;
+>>>>>>> origin/main
     })
     .unwrap();
     dials.push((host, owner_socket, holder_address, holder_certificate));
@@ -288,10 +315,14 @@ fn main() {
     let mut owner_acceptor = Acceptor::new(OWNER, authority());
     let placement = Placement::of(&[OWNER, HOLDERS[0], HOLDERS[1]]);
     let mut sequence = 0u64;
+<<<<<<< HEAD
     for poll_ns in [DAEMON_POLL_NS, FINE_POLL_NS]
       .into_iter()
       .filter(|_| !silent)
     {
+=======
+    for poll_ns in [DAEMON_POLL_NS, FINE_POLL_NS] {
+>>>>>>> origin/main
       let mut timed = Vec::with_capacity(samples);
       let rounds = if poll_ns == DAEMON_POLL_NS {
         // A 10 ms poll makes each sample about 10 ms: a tenth of the samples tells the same story in a tenth of the
@@ -337,6 +368,7 @@ fn main() {
       }
       rows.push((format!("commit poll={poll_ns}"), timed));
     }
+<<<<<<< HEAD
     for (volume, payload_bytes) in (100u64..).zip(LIVE_PAYLOADS) {
       let mut shipper = Shipper::new(
         (OWNER, ObjectId::new(OWNER, volume), HostEpoch(1)),
@@ -394,6 +426,8 @@ fn main() {
       }
       rows.push((format!("live ship {payload_bytes} B"), timed));
     }
+=======
+>>>>>>> origin/main
     let _ = result_tx.send(rows);
     STOP.store(true, Ordering::Release);
     drop(sessions);
