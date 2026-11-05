@@ -177,7 +177,7 @@ jobs:
         env:
           SLATES_TEST_CLI: "1"
         run: |
-          cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture
+          cargo test -p slates-cli --test cli --test fs_server -- --test-threads=1 --nocapture
       # The FSKit shim's Swift wire codec must agree with the Rust codec byte for byte (it shares the
       # golden vector). Compile and run its cross-check on the macOS runner, where swiftc lives.
       # ShimWire.swift is a pure library of the codec types; ShimWireMain.swift is the @main driver,
