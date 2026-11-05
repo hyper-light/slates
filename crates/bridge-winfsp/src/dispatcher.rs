@@ -44,6 +44,8 @@ const SIZE_END: usize = SIZE_AT + size_of::<u16>();
 const ALIGNMENT: usize = 8;
 
 thread_local! {
+  /// DIAG: when the batch being served was received.
+  static RECEIVED_AT: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
   /// Only a marker-authenticated Create may resolve the pending coherence file by identity.
   static PRIVATE_PURGE: RefCell<Option<crate::purge::Purge>> = const { RefCell::new(None) };
   /// The opaque kernel hint of the current callback, copied into a newly recorded open before its response exists.
@@ -356,6 +358,9 @@ fn operation(
   CURRENT_HINT.set(request.hint());
   // SAFETY: callback is the DLL's initialized operation for this checked kind; both packet addresses have native
   // eight-byte alignment and protocol maximum capacity, and file_system stays live throughout the synchronous call.
+  let received_at = RECEIVED_AT.get().unwrap_or_else(std::time::Instant::now);
+  crate::trace::arrive(request.bytes(), received_at);
+  crate::trace::begin(request.bytes(), received_at);
   let callback_status = unsafe {
     callback(
       file_system,
@@ -363,6 +368,7 @@ fn operation(
       packet.0.as_mut_ptr().cast(),
     )
   };
+  crate::trace::end();
   let terminal_status = TERMINAL_REFUSAL.replace(0);
   let status = if callback_status == 0 {
     terminal_status
@@ -422,14 +428,17 @@ enum Next {
 
 impl Server<'_> {
   fn send(&mut self, response: &[u8]) -> Result<(), WinFspError> {
-    transaction(
+    crate::trace::stage(b'S');
+    let sent = transaction(
       self.control,
       TRANSACT_BATCH,
       response,
       &mut [],
       &mut self.private.intents,
     )
-    .map(|_| ())
+    .map(|_| ());
+    crate::trace::stage(b'R');
+    sent
   }
 
   /// Settles a batch a dead owner captured, before any new receive. A saved Create or successful rename is sent again;
@@ -486,6 +495,8 @@ impl Server<'_> {
     stopped: &Receiver<()>,
   ) -> Result<Option<Batch<'a>>, WinFspError> {
     let mut receiving = capture.begin(fill).map_err(WinFspError::Capture)?;
+    crate::trace::stage(b'C');
+    let receive_started = std::time::Instant::now();
     let reported = transaction(
       self.control,
       TRANSACT_BATCH,
@@ -496,10 +507,11 @@ impl Server<'_> {
     if is_stopped(stopped) {
       return Ok(None);
     }
-    receiving
-      .received(reported, fill)
-      .map(Some)
-      .map_err(WinFspError::Capture)
+    let batch = receiving.received(reported, fill).map_err(WinFspError::Capture)?;
+    crate::trace::stage(b'V');
+    RECEIVED_AT.set(Some(std::time::Instant::now()));
+    crate::trace::received(batch.pending_len(), receive_started.elapsed());
+    Ok(Some(batch))
   }
 
   /// Serves a fresh batch. Every response but the last is saved, sent alone and acknowledged. The last is saved, then
@@ -520,6 +532,8 @@ impl Server<'_> {
       .map_err(WinFspError::Capture)?
       .map(|(_, context)| crate::host::post_confirm(self.confirmations, self.wake, context));
     let (response, buffer) = hand_off.transaction();
+    crate::trace::stage(b'H');
+    let receive_started = std::time::Instant::now();
     let reported = transaction(
       self.control,
       TRANSACT_BATCH,
@@ -527,9 +541,13 @@ impl Server<'_> {
       buffer,
       &mut self.private.intents,
     )?;
+    let waited = receive_started.elapsed();
+    crate::trace::stage(b'V');
     if let Some(confirming) = confirming {
       confirming.finish()?;
     }
+    crate::trace::stage(b'P');
+    crate::trace::received(inflight::capture::filled(reported).unwrap_or(0) / inflight::REQUEST_BASE.max(1), waited);
     // A hand-off returned while stopping is the successor's: it settles whatever the call delivered.
     if is_stopped(stopped) {
       return Ok(Next::Stop);
@@ -660,6 +678,7 @@ fn receive_loop(
           .capture()?
           .handed_off(reported, &mut fill)
           .map_err(WinFspError::Capture)?;
+        RECEIVED_AT.set(Some(std::time::Instant::now()));
         server.serve(batch, &mut fill, &stopped)?
       }
     };

@@ -162,6 +162,12 @@ fn content(round: usize, index: usize) -> Vec<u8> {
   bytes
 }
 
+/// DIAG: names the next phase for the servers' request trace: an untimed look-up of a name that does not exist.
+#[allow(clippy::disallowed_methods)]
+fn phase_marker(work: &Path, pass: &str, tag: &str) {
+  let _ = std::fs::metadata(work.join(format!("__phase-{pass}-{tag}")));
+}
+
 /// One round in `arm`: every phase over `files` files, each call timed into `samples`.
 // The arms are the comparison's directories: a slates mount, whose writes land in its RAM volume, or the native file
 // system the script made for the comparison (R1 governs slates' own code, not this stand-in for a user's program).
@@ -179,6 +185,7 @@ fn round(
   let fail = |what: &str, path: &Path, error: std::io::Error| {
     format!("{}: {what} {}: {error}", arm.name, path.display())
   };
+  phase_marker(&work, pass, &format!("r{round}-create"));
   for index in 0..files {
     let path = made(index);
     let bytes = content(round, index);
@@ -202,6 +209,7 @@ fn round(
     samples.push(2, written, synced);
     samples.push(3, synced, closed);
   }
+  phase_marker(&work, pass, &format!("r{round}-stat"));
   for index in 0..files {
     let path = made(index);
     let started = Instant::now();
@@ -216,6 +224,7 @@ fn round(
       ));
     }
   }
+  phase_marker(&work, pass, &format!("r{round}-open"));
   let mut buffer = vec![0u8; FILE_BYTES];
   for index in 0..files {
     let path = made(index);
@@ -237,12 +246,14 @@ fn round(
       ));
     }
   }
+  phase_marker(&work, pass, &format!("r{round}-rename"));
   for index in 0..files {
     let (from, to) = (made(index), moved(index));
     let started = Instant::now();
     std::fs::rename(&from, &to).map_err(|e| fail("rename", &from, e))?;
     samples.push(7, started, Instant::now());
   }
+  phase_marker(&work, pass, &format!("r{round}-unlink"));
   for index in 0..files {
     let path = moved(index);
     let started = Instant::now();
@@ -377,6 +388,9 @@ fn pass(
           };
           round(arm, name, number, files, into)?;
         }
+      }
+      for arm in arms {
+        phase_marker(&arm.work(), name, "dump");
       }
       Ok::<(), String>(())
     })();
