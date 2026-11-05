@@ -78,3 +78,6 @@ On one CPU with two busy loops the routing history failed 1 of 50 runs another w
 and `fleet.owner_location.route_dropped.refused` 1. The successor counted `fleet.owner_location.owned_unmaterialized`
 1. The held session did not come back within the forward's wait. That is the condition the test holds out on
 purpose; not seen at two CPUs in 100 runs. It is not attributed: it is recorded open in GAPS.
+
+Attributed 2026-11-05: the lookup ran before the foreign node held the dead owner dead, so it forwarded to the
+creator without a round. `docs/bugs/2026-11-05-a-lookup-before-the-owners-death-was-known-never-ran-its-round.md`.

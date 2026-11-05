@@ -1,5 +1,14 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A lookup before the owner's death was known never ran its round: fixed (2026-11-05, §4.8 Lookup).** Main CI
+> 41990139505 (macOS) and 1 of 50 runs on one busy CPU (2026-11-04) failed
+> `a_location_round_asks_a_peer_whose_session_was_out_once_it_returns` with `OwnerUnreachable`. The foreign node did
+> not yet hold the dead owner dead, so the volume's creator was its known owner: the lookup forwarded there without a
+> location round (`owner_location.direct` 1, `forward.no_session`), as §4.8 specifies for a takeover's window. Not
+> the quorum collector's change: `4a221524` 1/50, `21da6e57` 0/50 on one busy CPU. The test now waits until the
+> foreign node holds the owner dead; no assertion changed. Interleaved on one busy CPU: before 2/150, after 0/150.
+> Record: `docs/bugs/2026-11-05-a-lookup-before-the-owners-death-was-known-never-ran-its-round.md`.
+
 > **The anchor's hold refusals: a bounded Unix log, and a count in `slates status` (2026-11-04, A-213; siblings of
 > audit step 3).** The Unix device hold logged a line per refused message, unbounded; it now logs each distinct refusal
 > once (`RefusalLog`, as the Windows hold does) and counts every one. Every refusal on either platform's hold channel
@@ -157,7 +166,7 @@
 >   under two spinners a core on a 4-vCPU x86_64 VM the anchor killed both daemons for a late heartbeat in run 3 of all
 >   three jobs that reached it.
 > - **Two failures recorded open below**: the wake-learning case under load (fixed 2026-11-04, A-199) and the fleet
->   routing Create reply (fixed 2026-11-04 in its fixture; a second, rarer failure of that history stays open).
+>   routing Create reply (fixed 2026-11-04 in its fixture; its second, rarer failure fixed 2026-11-05).
 >
 > Twenty goals of this plan's stack, Steps 10–15 among them, were closed in 2–4 s each with no work. They are
 > restored in order after these fixes.
@@ -197,9 +206,9 @@
 > after a root learner's import. A create on every node right after the settle was refused once in 40 fleets on two
 > busy CPUs (1 in 340 fleets in all). The settle step now also waits for every node's readiness
 > (`Daemon::consensus_ready`); the new test `a_settled_fleet_admits_a_create_on_every_node` passed 100/100 after, the
-> history 50/50 on two busy CPUs, and the whole fleet target 87/87. No assertion changed. Still open: on one CPU the
-> same history failed once in 50 another way, its lookup refused `OwnerUnreachable` with the held session never
-> back within the forward's wait (`session_never_returned` 4), not attributed. Record:
+> history 50/50 on two busy CPUs, and the whole fleet target 87/87. No assertion changed. Its other failure (one CPU,
+> 1 in 50: `OwnerUnreachable`, `session_never_returned` 4) is attributed and fixed since (2026-11-05, the lookup
+> before the owner's death was known). Record:
 > `docs/bugs/2026-11-04-a-settled-fleet-refused-its-first-create.md`.
 
 > **A forward waits for the owner's session (2026-09-25, §4.8 Lookup).** A forward refused the client
