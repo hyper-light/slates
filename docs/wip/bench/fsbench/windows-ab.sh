@@ -116,11 +116,12 @@ for run in $(seq 1 "$RUNS"); do
   fi
   "$BENCH" --arm "$OLD_NAME=$OLD_DRIVE/" --arm "$NEW_NAME=$NEW_DRIVE/" --spinners-per-cpu "$SPINNERS_PER_CPU" \
     ${FILES:+--files "$FILES"} ${ROUNDS:+--rounds "$ROUNDS"}
+  # After the teardown, so a daemon's last words are in it.
+  teardown
   for side in "$OLD_INSTANCE" "$NEW_INSTANCE"; do
     echo "# $side's error output, $(wc -l < "$W/$side.err") lines:"
     cat "$W/$side.err"
   done
-  teardown
   rm -f "$W/$OLD_INSTANCE.err" "$W/$NEW_INSTANCE.err"
   echo "## run $run of $RUNS done, $(date -u +%FT%TZ)"
   if [ -n "${AFTER_RUN:-}" ]; then "$AFTER_RUN"; fi
