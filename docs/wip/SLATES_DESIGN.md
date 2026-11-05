@@ -13711,6 +13711,13 @@ it whenever at most `f` candidates are lost (the owner among them); a holder who
 serves from the adopted replica, which loses no acknowledged write (AC-8.3), and re-ships from there under its own
 epoch: a holder holding an entry the old owner never made durable fails the chain and takes a checkpoint.
 
+**The policy.** A volume is live-shipped when its policy says so (`PolicyRecord::live_shipped`), set by the
+`LiveShip` verb (`slates live-ship ID [--off]`, `admin` on the volume required), not at `create`. A request field on
+`create` would have changed every caller of the create path at once; a separate recorded operation
+(`Op::LiveShippingChanged`) is additive, and since a log starts from an install (its first entry is the owner's
+whole state), turning shipping on after creation needs nothing more. The flag rides the catalog register
+(`CatalogValue::live_shipped`), so a successor keeps shipping, and `list` shows it.
+
 **Laptop degenerate.** `f = 0`: no holders, every entry durable at the owner's own publication; the same code (R8).
 
 **Testing.** The pure log (owner, holder, phase one) is a sans-io module tested against a model under a deterministic

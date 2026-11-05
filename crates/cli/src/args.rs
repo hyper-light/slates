@@ -502,6 +502,13 @@ pub(crate) enum Verb {
     /// The rights; all off removes the entry.
     rights: Rights,
   },
+  /// Turn a volume's live shipping on, or off with `--off` (`live-ship ID [--off]`, A-200).
+  LiveShip {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// Whether it is live-shipped from now on.
+    live_shipped: bool,
+  },
 }
 
 /// A principal as `share` names it: a host account (`uid:N`), or a consumer — under the caller's own
@@ -1275,8 +1282,22 @@ fn parse_enrollment(taken: &Taken, words: &[&str]) -> Result<Option<Command>, Pa
         },
       )))
     }
+    ["live-ship", id] => {
+      taken.only(&Spec {
+        values: &[],
+        switches: &["--off"],
+      })?;
+      Ok(Some(client(
+        taken,
+        Verb::LiveShip {
+          volume: volume(id)?,
+          live_shipped: !taken.switch("--off"),
+        },
+      )))
+    }
     ["revoke"] => Err(ParseError::Missing("CONSUMER")),
     ["share", ..] => Err(ParseError::Missing("share ID PRINCIPAL")),
+    ["live-ship", ..] => Err(ParseError::Missing("live-ship ID")),
     _ => Ok(None),
   }
 }

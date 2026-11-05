@@ -210,6 +210,10 @@ pub struct PolicyRecord {
   pub require_locked: bool,
   /// The role.
   pub role: Role,
+  /// Whether the volume is live-shipped (§4.10, A-200): each of its publications is shipped to its candidates and a
+  /// barrier is answered only once the owner and `f` of them hold it. False at creation; set by `LiveShip`.
+  /// Appended.
+  pub live_shipped: bool,
 }
 
 /// What the volume sits on (§4.15).

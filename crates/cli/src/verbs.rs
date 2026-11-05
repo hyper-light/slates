@@ -1464,6 +1464,20 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
       principal,
       rights,
     } => emit_share(client, *volume, principal, *rights, json)?,
+    Verb::LiveShip {
+      volume,
+      live_shipped,
+    } => {
+      let recorded = client.live_ship(*volume, *live_shipped)?;
+      emit_ok(
+        if recorded {
+          "live-shipped"
+        } else {
+          "not live-shipped"
+        },
+        json,
+      );
+    }
     // Served in `run`, before this: their authority comes from the anchor, not the client.
     Verb::Bootstrap { .. }
     | Verb::RecoveryPlan { .. }
@@ -2246,15 +2260,16 @@ fn option_text<T: std::fmt::Display>(value: Option<T>) -> String {
   value.map_or_else(|| "none".to_owned(), |v| v.to_string())
 }
 
-/// One volume per line: id, name, referenced bytes, unique bytes, overlay.
+/// One volume per line: id, name, referenced bytes, unique bytes, overlay, live shipping (A-200).
 fn summary_line(volume: &VolumeSummary) -> String {
   format!(
-    "{} {} referenced={} unique={} overlay={}",
+    "{} {} referenced={} unique={} overlay={} live_shipped={}",
     volume_id_text(volume.id),
     volume.name,
     volume.referenced_bytes,
     volume.unique_bytes,
-    volume.overlay
+    volume.overlay,
+    volume.live_shipped
   )
 }
 
