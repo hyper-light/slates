@@ -2,28 +2,36 @@
 
 > **Shards counted hardware threads as cores (2026-11-05, A-208, §4.1, R9; fixed, its A/B owed).** §4.1 counts shards in
 
-> **A call waits for its acknowledgement's scatter (2026-11-05, §4.9, R9; OPEN).** The synchronous
-> `Client::call` acknowledges every half-ring of replies before its own request and waits for the reply, which the
-> daemon gives only after every shard has released the client's records. On macOS, 133 of 2,000 single-client creates
-> (6.7%) carried one, median 2,497 µs against 169 µs (a loaded run whose boot probe measured a 2.5 ms wake). That share
-> sets the single-client p99. With another shard held for a second, such a call fails `Stalled`. Sending it unawaited,
-> as the async path does (a6c3bc16), passed its test (Stalled before, 3.62 s after) and the whole client package.
-> But 2 of the 4 parked `provision_bench` forms that ran with it stalled a create past the 1 s reply deadline: one on
-> quiet jupiter, one on macOS. Without it, none of 15 did. Reverted in the next commit. Since then: a test on main's
-> own client reproduces a stall in 1 run of 10 (two replies in flight, after 64 clients were dropped with one in
-> flight). And the instrumented bench caught the daemon answering no client for ~1.77 s right after 64 clients
-> churned. So the cause is a whole-daemon pause after client churn, load-dependent (none in 10 runs at load 4–8).
-> Owed: the shard and step that pause, then the fix with its test, before the change returns.
-> - **It is what keeps Windows arm64 red** (diag run 42056768929, 2026-11-05 15:43–15:55 UTC, three interleaved
->   rounds). Without it: single-client p99 65.4 / 59.4 / 57.9 µs, all failing R9. With it: 47.8 / 45.5 / 44.3 µs, all
->   green. Linux x86_64, Linux arm64 and Windows x86_64 are green in both arms.
-> - **None of its 12 CI runs stalled.** Counting every arm-with-it run: 0 of 12 on CI, 1 of 9 on jupiter (6 more
->   with a stall-time pulse dump caught none), about 2 of 15 on macOS. A burst of 64 connects takes 3.4–4.7 ms (the
->   control shard's round trip rises to 1.4–1.6 ms meanwhile), so connects are not the pause. Neither is a lost kick:
->   a shard re-checks all three inboxes before it parks. In-process clients are never reaped on macOS or Windows (the
->   pid probe finds the bench itself alive). Also open, from the same macOS runs at
-> load 23–36: the bench's 8- and 64-client forms aborted `Stalled` in every arm, a live daemon slower than the reply
-> deadline. Record: `docs/bugs/2026-11-05-a-call-waited-for-its-acknowledgements-scatter.md`.
+> **A call waited for its acknowledgement's scatter (2026-11-05, §4.9, R9; fixed by A-216, its A/B owed).** The
+> synchronous `Client::call` acknowledges every half-ring of replies before its own request, and the daemon answered
+> only after every shard had released the client's records. One call in every half-ring paid the slowest shard's
+> turn. On macOS 133 of 2,000 single-client creates (6.7%) carried one, median 2,497 µs against 169 µs. Windows arm64's
+> single-client p99 was 65.4 / 59.4 / 57.9 µs with the wait and 47.8 / 45.5 / 44.3 µs without it (diag run
+> 42056768929). With another shard held for a second, the call failed `Stalled`. Sending it unawaited (a6c3bc16)
+> met a rare whole-daemon pause after client churn with two replies in flight, and was reverted. Since A-216 the
+> daemon answers once the client's own shard has released. The other shards' releases run as tracked tasks, and a
+> refused one is counted `ack.release_refused` and taken over by the next watermark. The client still has one reply
+> in flight. Tests, each failing first:
+> - `a_call_is_never_held_behind_the_periodic_acknowledgement` (`Stalled` before);
+> - `a_lagging_release_is_never_met_by_a_request_as_new` (1.197 s before; red-checked);
+> - `a_refused_release_is_counted_and_the_next_watermark_takes_it_over` (never answered before; red-checked).
+>
+> Owed: the interleaved A/B on all five platforms, with R9's single-client p99 as the gate. Still open from before:
+> the churn pause itself (GAPS' 8- and 64-client entry), and the bench's 8- and 64-client forms aborting `Stalled` at
+> load 23–36 on macOS. Record: `docs/bugs/2026-11-05-a-call-waited-for-its-acknowledgements-scatter.md`.
+>
+> **Next lever (C): do we need the separate acknowledgement at all?** Carry the watermark in every request, so each
+> owner shard releases a client's records when its next request arrives there. No scatter and no extra request.
+> That is a protocol change to the request slot and §4.9.
+
+> **A scatter whose part could not be sent never answered (2026-11-05, §4.9, §4.14; acknowledgement fixed, three
+> open).** `scatter_acknowledge`, `scatter_list`, `scatter_grants` and `scatter_status` settle a part whose spawn the
+> other shard's full control channel refused by calling their gather inside `serve`. The nested state borrow is refused
+> without running it, so the reply is never delivered and the entry never removed. An `Acknowledge` with the other
+> shard's channel filled was never answered (5 s, main 8d7c6a10). Fixed for the acknowledgement by A-216; owed for
+> listings, grants and status, each with a failing test. Also reported, not changed: those three settle a refused part
+> as empty, so an answer can omit a shard's part as if complete. Record:
+> `docs/bugs/2026-11-05-a-scatter-whose-part-could-not-be-sent-never-answered.md`.
 
 > **Shards counted hardware threads as cores (2026-11-05, A-208, §4.1, R9; fixed and measured).** §4.1 counts shards in
 > physical cores, but the placement counted logical CPUs. jupiter's 16 two-thread cores therefore ran 31 shards and
