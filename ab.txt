@@ -815,3 +815,5 @@ slates daemon: a heartbeat came 581 ms after the last (the anchor's budget is 10
 unmounted: S:
 unmounted: T:
 ## run 5 of 5 done, 2026-11-05T06:25:02Z
+To https://github.com/hyper-light/slates
+   15cb7b1..57d961d  57d961d79989fab41a84071c24f591795ddb51da -> diag-winfsp-bench-results-41973314087-windows-11-arm
