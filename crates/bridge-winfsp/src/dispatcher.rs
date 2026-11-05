@@ -32,16 +32,10 @@ const TRANSACT_READY: u32 = (9 << 16) | ((0x800 + b'T' as u32) << 2);
 pub(crate) const TRANSACT_TIMEOUT_MS: u32 = 1000;
 /// Shape: the stop channel carries no messages; dropping its sender is the worker's cancellation signal.
 const STOP_BOUND: usize = 0;
-/// Format: status and size offsets in the checked response header (fsctl.h).
+/// Format: the status offset in the checked response header (fsctl.h).
 const STATUS_AT: usize = 20;
 /// Format: the status occupies the final word of the common response header.
 const STATUS_END: usize = STATUS_AT + size_of::<i32>();
-/// Format: see STATUS_AT.
-const SIZE_AT: usize = 2;
-/// Format: the response size is a two-byte field after its version.
-const SIZE_END: usize = SIZE_AT + size_of::<u16>();
-/// Format: FSP_FSCTL_DEFAULT_ALIGNMENT.
-const ALIGNMENT: usize = 8;
 
 thread_local! {
   /// Only a marker-authenticated Create may resolve the pending coherence file by identity.
@@ -310,19 +304,44 @@ fn transaction(
 #[repr(align(8))]
 struct Packet([u8; RESPONSE_MAX]);
 
+/// What the receive worker keeps across requests: its private-open state and the two packets every operation uses,
+/// made once for the worker's life. Zeroing two fresh packets a request cost 2.6-4.4 us of each IRP on arm64 and
+/// 1.7-2.0 us on x86_64 (diagnostics run 42091919319); WinFsp's own dispatcher clears nothing (dll/fs.c:303-305).
+struct Owned {
+  private: PrivateOpens,
+  working: Box<Packet>,
+  response: Box<Packet>,
+}
+
+impl Owned {
+  fn new(private: PrivateOpens) -> Self {
+    Self {
+      private,
+      working: Box::new(Packet([0; RESPONSE_MAX])),
+      response: Box::new(Packet([0; RESPONSE_MAX])),
+    }
+  }
+}
+
+/// One DLL operation on the worker's reused packets. The request is copied whole into the working packet, and the
+/// callbacks read nothing past its own size. Only the response's fixed part is cleared, as the header the callback
+/// fills: a callback writes whatever it returns past that part and sets the size over it, and
+/// [`inflight::finish_response`] clears the padding up to the aligned length, so no byte of an earlier response is sent.
 fn operation(
   file_system: *mut FileSystem,
   request: &Request<'_>,
-  packet: &mut Packet,
-  private: &mut PrivateOpens,
+  owned: &mut Owned,
 ) -> Result<usize, WinFspError> {
-  let mut working = Packet([0; RESPONSE_MAX]);
+  let Owned {
+    private,
+    working,
+    response: packet,
+  } = owned;
   working
     .0
     .get_mut(..request.bytes().len())
     .ok_or(WinFspError::Capture(Refusal::Length))?
     .copy_from_slice(request.bytes());
-  packet.0.fill(0);
   let header = request.cancelled_response().map_err(WinFspError::Capture)?;
   packet
     .0
@@ -371,33 +390,7 @@ fn operation(
   };
   PRIVATE_PURGE.set(None);
   CURRENT_HINT.set(0);
-  packet
-    .0
-    .get_mut(STATUS_AT..STATUS_END)
-    .ok_or(WinFspError::Capture(Refusal::Length))?
-    .copy_from_slice(&status.to_le_bytes());
-  let size: [u8; 2] = packet
-    .0
-    .get(SIZE_AT..SIZE_END)
-    .ok_or(WinFspError::Capture(Refusal::Length))?
-    .try_into()
-    .map_err(|_| WinFspError::Capture(Refusal::Length))?;
-  let size = usize::from(u16::from_le_bytes(size))
-    .checked_next_multiple_of(ALIGNMENT)
-    .ok_or(WinFspError::Capture(Refusal::Length))?;
-  if !(RESPONSE_BASE..=RESPONSE_MAX).contains(&size) {
-    return Err(WinFspError::Capture(Refusal::Length));
-  }
-  packet
-    .0
-    .get_mut(SIZE_AT..SIZE_END)
-    .ok_or(WinFspError::Capture(Refusal::Length))?
-    .copy_from_slice(
-      &u16::try_from(size)
-        .map_err(|_| WinFspError::Capture(Refusal::Length))?
-        .to_le_bytes(),
-    );
-  Ok(size)
+  inflight::finish_response(&mut packet.0, status).map_err(WinFspError::Capture)
 }
 
 /// The receive owner's fixed parts: the DLL object, its control handle, and what its operations report through.
@@ -406,7 +399,7 @@ struct Server<'a> {
   control: HANDLE,
   confirmations: &'a SyncSender<crate::host::Request>,
   wake: &'a std::task::Waker,
-  private: PrivateOpens,
+  owned: Owned,
   bound: usize,
 }
 
@@ -421,21 +414,19 @@ enum Next {
 }
 
 impl Server<'_> {
-  fn send(&mut self, response: &[u8]) -> Result<(), WinFspError> {
-    transaction(
-      self.control,
-      TRANSACT_BATCH,
-      response,
-      &mut [],
-      &mut self.private.intents,
-    )
-    .map(|_| ())
+  /// Sends one response alone. It takes the worker's parts it uses, so a response lent from the worker's own packet can
+  /// be sent.
+  fn send(
+    control: HANDLE,
+    intents: &mut crate::purge_intents::Intents,
+    response: &[u8],
+  ) -> Result<(), WinFspError> {
+    transaction(control, TRANSACT_BATCH, response, &mut [], intents).map(|_| ())
   }
 
   /// Settles a batch a dead owner captured, before any new receive. A saved Create or successful rename is sent again;
   /// Cleanup and Close run again by checked open identity; every other request is cancelled (A-198).
   fn settle_captured(&mut self, batch: &mut Batch<'_>) -> Result<u64, WinFspError> {
-    let mut packet = Packet([0; RESPONSE_MAX]);
     let mut count = 0u64;
     while let Some(request) = batch.next_request().map_err(WinFspError::Capture)? {
       let saved = batch.response_for(&request).map_err(WinFspError::Capture)?;
@@ -444,13 +435,15 @@ impl Server<'_> {
       if let Some(saved) =
         replayable_response(&request, saved, self.confirmations, self.wake, self.bound)?
       {
-        self.send(saved)?;
+        Self::send(self.control, &mut self.owned.private.intents, saved)?;
       } else if matches!(
         request.kind(),
         inflight::CLEANUP_KIND | inflight::CLOSE_KIND
       ) {
-        let length = operation(self.file_system, &request, &mut packet, &mut self.private)?;
-        let response = packet
+        let length = operation(self.file_system, &request, &mut self.owned)?;
+        let response = self
+          .owned
+          .response
           .0
           .get(..length)
           .ok_or(WinFspError::Capture(Refusal::Length))?;
@@ -459,7 +452,7 @@ impl Server<'_> {
             .record_response(&request, response)
             .map_err(WinFspError::Capture)?;
         }
-        self.send(response)?;
+        Self::send(self.control, &mut self.owned.private.intents, response)?;
       } else {
         let response = request.cancelled_response().map_err(WinFspError::Capture)?;
         if saved.is_none() {
@@ -467,7 +460,7 @@ impl Server<'_> {
             .record_response(&request, &response)
             .map_err(WinFspError::Capture)?;
         }
-        self.send(&response)?;
+        Self::send(self.control, &mut self.owned.private.intents, &response)?;
       }
       batch
         .acknowledge(request.hint())
@@ -491,7 +484,7 @@ impl Server<'_> {
       TRANSACT_BATCH,
       &[],
       receiving.buffer_mut(),
-      &mut self.private.intents,
+      &mut self.owned.private.intents,
     )?;
     if is_stopped(stopped) {
       return Ok(None);
@@ -525,7 +518,7 @@ impl Server<'_> {
       TRANSACT_BATCH,
       response,
       buffer,
-      &mut self.private.intents,
+      &mut self.owned.private.intents,
     )?;
     if let Some(confirming) = confirming {
       confirming.finish()?;
@@ -542,10 +535,11 @@ impl Server<'_> {
     mut batch: Batch<'a>,
     fill: &mut Fill,
   ) -> Result<Option<HandOff<'a>>, WinFspError> {
-    let mut packet = Packet([0; RESPONSE_MAX]);
     while let Some(request) = batch.next_request().map_err(WinFspError::Capture)? {
-      let length = operation(self.file_system, &request, &mut packet, &mut self.private)?;
-      let response = packet
+      let length = operation(self.file_system, &request, &mut self.owned)?;
+      let response = self
+        .owned
+        .response
         .0
         .get(..length)
         .ok_or(WinFspError::Capture(Refusal::Length))?;
@@ -564,7 +558,7 @@ impl Server<'_> {
           .map(Some)
           .map_err(WinFspError::Capture);
       }
-      self.send(response)?;
+      Self::send(self.control, &mut self.owned.private.intents, response)?;
       if let Some((_, context)) =
         inflight::opened_context(response).map_err(WinFspError::Capture)?
       {
@@ -632,7 +626,7 @@ fn receive_loop(
     control: unsafe { (*file_system).volume_handle },
     confirmations,
     wake,
-    private,
+    owned: Owned::new(private),
     bound,
   };
   let mut view = CaptureView::new(section, bound)?;

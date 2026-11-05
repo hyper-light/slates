@@ -116,6 +116,32 @@ pub fn opened_context(response: &[u8]) -> Result<Option<(u64, u64)>, Refusal> {
   Ok(Some((hint, context)))
 }
 
+/// Finishes a DLL operation's response in a packet the receiver reuses: its status, and its size rounded up to the wire's
+/// alignment, with the padding that rounding adds cleared, so no byte of an earlier response is sent. Returns the length
+/// to send. The callback wrote everything up to its own size; the fixed part before it was cleared as the header.
+pub fn finish_response(packet: &mut [u8], status: i32) -> Result<usize, Refusal> {
+  put(packet, STATUS_AT, &status.to_le_bytes())?;
+  let size = usize::from(read_u16(packet, SIZE_AT)?);
+  let aligned = size
+    .checked_next_multiple_of(ALIGNMENT)
+    .ok_or(Refusal::Length)?;
+  if !(RESPONSE_BASE..=RESPONSE_MAX).contains(&aligned) {
+    return Err(Refusal::Length);
+  }
+  packet
+    .get_mut(size..aligned)
+    .ok_or(Refusal::Length)?
+    .fill(0);
+  put(
+    packet,
+    SIZE_AT,
+    &u16::try_from(aligned)
+      .map_err(|_| Refusal::Length)?
+      .to_le_bytes(),
+  )?;
+  Ok(aligned)
+}
+
 /// One checked request in a retained batch. Its payload remains opaque unless a specific checked accessor reads it.
 pub struct Request<'a> {
   bytes: &'a [u8],
@@ -449,6 +475,31 @@ mod tests {
     );
     let hint = u64::from_le_bytes(response[8..16].try_into().unwrap());
     processing.remove(&hint)
+  }
+
+  /// A-215's prologue (step 7). Do: finish a response of 130 bytes in a packet still holding an earlier, longer
+  /// response's bytes. Expect: 136 bytes to send, its status and aligned size in the header, the six padding bytes zero,
+  /// and the callback's own bytes untouched; a size whose alignment passes the cap, or below the fixed part, is refused.
+  #[test]
+  fn a_reused_packet_sends_no_byte_of_an_earlier_response() {
+    let mut packet = vec![0xAB; RESPONSE_MAX];
+    packet[SIZE_AT..SIZE_AT + 2].copy_from_slice(&130u16.to_le_bytes());
+    assert_eq!(finish_response(&mut packet, -5), Ok(136));
+    assert_eq!(
+      u16::from_le_bytes([packet[SIZE_AT], packet[SIZE_AT + 1]]),
+      136
+    );
+    assert_eq!(
+      i32::from_le_bytes(packet[STATUS_AT..STATUS_AT + 4].try_into().unwrap()),
+      -5
+    );
+    assert!(packet[130..136].iter().all(|byte| *byte == 0));
+    assert!(packet[24..130].iter().all(|byte| *byte == 0xAB));
+    assert!(packet[136..].iter().all(|byte| *byte == 0xAB));
+    for size in [u16::try_from(RESPONSE_MAX).unwrap() + 1, 64, 0] {
+      packet[SIZE_AT..SIZE_AT + 2].copy_from_slice(&size.to_le_bytes());
+      assert_eq!(finish_response(&mut packet, 0), Err(Refusal::Length));
+    }
   }
 
   /// A-198 Step 9.4. Do: settle two captured reads. Expect: each original caller gets cancellation, and a request not
