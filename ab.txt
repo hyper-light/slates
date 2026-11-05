@@ -640,3 +640,210 @@ slates daemon: a heartbeat came 566 ms after the last (the anchor's budget is 10
 slates daemon: a heartbeat came 620 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 449 ms and its timer overrun 34 ms
 slates daemon: a heartbeat came 704 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 449 ms and its timer overrun 34 ms
 ## run 3 of 5 done, 2026-11-05T21:18:24Z
+To https://github.com/hyper-light/slates
+   ed52f81..1fcd666  1fcd666e625efed0a8d93173d0fe7c03953998fe -> diag-winfsp-overlap-results-42100636103-windows-latest
+## run 4 of 5, 2026-11-05T21:18:26Z
+# receiver started first: dll=T: receiver=S:
+# host: windows 0x23f00206 on windows processor architecture 9 level 25 revision 257 (x86_64), 4 logical CPUs (4 available to this process), 15 GiB, page 4096 B; largest L2 524288 B, cache line 64 B
+# workload: 10 rounds of 1000 files of 4096 B per arm and pass, arms interleaved, first arm rotating
+# arm dll: T:/d
+# arm receiver: S:/d
+# warm-up: one untimed round per arm (1000 files each)
+# pass quiet: spinners 0 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 40.2 µs, p99 70.2 µs, p999 152.9 µs, max 644.1 µs over 10885 probes; 57.7 s
+fsbench	quiet	dll	create	10000	900100	1532400	2408200	38134200
+fsbench	quiet	dll	write	10000	89000	196000	710000	36545200
+fsbench	quiet	dll	fsync	10000	132600	235900	741200	12604400
+fsbench	quiet	dll	close	10000	62000	137800	669200	3951400
+fsbench	quiet	dll	stat	10000	256200	391700	649900	15795300
+fsbench	quiet	dll	open	10000	158200	313700	1047100	36746800
+fsbench	quiet	dll	read	10000	13200	129000	227400	36431600
+fsbench	quiet	dll	rename	10000	555800	830500	1818400	37782400
+fsbench	quiet	dll	unlink	10000	322300	817600	1030100	37019600
+fsbench	quiet	receiver	create	10000	944900	1612600	12917400	37727300
+fsbench	quiet	receiver	write	10000	105900	225400	528600	36455400
+fsbench	quiet	receiver	fsync	10000	128100	264400	586600	10167100
+fsbench	quiet	receiver	close	10000	67300	160300	430000	14248500
+fsbench	quiet	receiver	stat	10000	280100	538500	971200	37113200
+fsbench	quiet	receiver	open	10000	191900	299700	769400	36828400
+fsbench	quiet	receiver	read	10000	14300	151400	220000	1902000
+fsbench	quiet	receiver	rename	10000	633700	946900	1697200	37920100
+fsbench	quiet	receiver	unlink	10000	354700	958100	1449000	32466600
+
+**quiet** (spinners 0 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 40.2 µs, p99 70.2 µs, p999 152.9 µs, max 644.1 µs over 10885 probes; 57.7 s). Each cell: p50 · p99 · p999 · max, µs.
+
+| op | dll | receiver |
+|---|---|---|
+| create | 900.1 · 1532.4 · 2408.2 · 38134.2 | 944.9 · 1612.6 · 12917.4 · 37727.3 |
+| write | 89.0 · 196.0 · 710.0 · 36545.2 | 105.9 · 225.4 · 528.6 · 36455.4 |
+| fsync | 132.6 · 235.9 · 741.2 · 12604.4 | 128.1 · 264.4 · 586.6 · 10167.1 |
+| close | 62.0 · 137.8 · 669.2 · 3951.4 | 67.3 · 160.3 · 430.0 · 14248.5 |
+| stat | 256.2 · 391.7 · 649.9 · 15795.3 | 280.1 · 538.5 · 971.2 · 37113.2 |
+| open | 158.2 · 313.7 · 1047.1 · 36746.8 | 191.9 · 299.7 · 769.4 · 36828.4 |
+| read | 13.2 · 129.0 · 227.4 · 36431.6 | 14.3 · 151.4 · 220.0 · 1902.0 |
+| rename | 555.8 · 830.5 · 1818.4 · 37782.4 | 633.7 · 946.9 · 1697.2 · 37920.1 |
+| unlink | 322.3 · 817.6 · 1030.1 · 37019.6 | 354.7 · 958.1 · 1449.0 · 32466.6 |
+
+# pass contended: spinners 8 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 39.1 µs, p99 66.5 µs, p999 100.9 µs, max 132080.7 µs over 177352 probes; 955.6 s
+fsbench	contended	dll	create	10000	1632900	235562500	325888300	375501700
+fsbench	contended	dll	write	10000	124700	487300	68041700	135302600
+fsbench	contended	dll	fsync	10000	190000	353800	73139800	134336800
+fsbench	contended	dll	close	10000	96000	172300	48203600	131819600
+fsbench	contended	dll	stat	10000	361800	130174000	180254200	293350200
+fsbench	contended	dll	open	10000	241400	749300	87115300	196074800
+fsbench	contended	dll	read	10000	125500	226300	81766800	140642700
+fsbench	contended	dll	rename	10000	826600	65437700	163187300	258379600
+fsbench	contended	dll	unlink	10000	501800	136476100	194731400	255810300
+fsbench	contended	receiver	create	10000	1604600	76962900	159240500	217973000
+fsbench	contended	receiver	write	10000	100900	541900	64901500	99314700
+fsbench	contended	receiver	fsync	10000	151900	363200	66926100	129274400
+fsbench	contended	receiver	close	10000	78600	202900	43713500	106091200
+fsbench	contended	receiver	stat	10000	293200	12419200	79954900	132842800
+fsbench	contended	receiver	open	10000	217800	1735700	63622900	134289000
+fsbench	contended	receiver	read	10000	105000	243400	66070800	99256400
+fsbench	contended	receiver	rename	10000	713000	45516700	131318700	2005004000
+fsbench	contended	receiver	unlink	10000	406000	30988500	1230637600	2376297100
+
+**contended** (spinners 8 (none when quiet; a count per logical CPU when contended); load average none (this OS keeps no load average) at the start, none (this OS keeps no load average) at the end; wake-up probe p50 39.1 µs, p99 66.5 µs, p999 100.9 µs, max 132080.7 µs over 177352 probes; 955.6 s). Each cell: p50 · p99 · p999 · max, µs.
+
+| op | dll | receiver |
+|---|---|---|
+| create | 1632.9 · 235562.5 · 325888.3 · 375501.7 | 1604.6 · 76962.9 · 159240.5 · 217973.0 |
+| write | 124.7 · 487.3 · 68041.7 · 135302.6 | 100.9 · 541.9 · 64901.5 · 99314.7 |
+| fsync | 190.0 · 353.8 · 73139.8 · 134336.8 | 151.9 · 363.2 · 66926.1 · 129274.4 |
+| close | 96.0 · 172.3 · 48203.6 · 131819.6 | 78.6 · 202.9 · 43713.5 · 106091.2 |
+| stat | 361.8 · 130174.0 · 180254.2 · 293350.2 | 293.2 · 12419.2 · 79954.9 · 132842.8 |
+| open | 241.4 · 749.3 · 87115.3 · 196074.8 | 217.8 · 1735.7 · 63622.9 · 134289.0 |
+| read | 125.5 · 226.3 · 81766.8 · 140642.7 | 105.0 · 243.4 · 66070.8 · 99256.4 |
+| rename | 826.6 · 65437.7 · 163187.3 · 258379.6 | 713.0 · 45516.7 · 131318.7 · 2005004.0 |
+| unlink | 501.8 · 136476.1 · 194731.4 · 255810.3 | 406.0 · 30988.5 · 1230637.6 · 2376297.1 |
+
+unmounted: T:
+unmounted: S:
+# fsb-187-4-old's error output, 40 lines:
+slates anchor: instance fsb-187-4-old up; daemon pid 3144; 3 shards
+slates anchor: issuer surface: export SLATES_ANCHOR=slates-seg-fsb-187-4-old SLATES_ANCHOR_LEN=10972610560 SLATES_ANCHOR_CONTENT=slates-con-fsb-187-4-old SLATES_ANCHOR_CONTENT_LEN=24330436608
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: effective_capacity_bytes = 17174360064: min(memory.total, the OS/job/cgroup bound when one is set) (anchors ["memory.total", "memory.limit"])
+slates daemon: reserve_per_shard = 1908262229: memory capacity / shards / classes (anchors ["mem.capacity", "rt.shards", "mem.classes"])
+slates daemon: lock_capacity_bytes = 1413120: the OS's lock limit when a confirming lock succeeded, else 0 (anchors ["mem.lock_capacity", "mem.lock_confirmed"])
+slates daemon: table_bytes = 477065557: reserve_per_shard × TABLE_SHARE_PERMILLE / 1000 (anchors ["mem.lock_capacity", "GAPS §5 table share"])
+slates daemon: volumes_per_shard = 1569294: table_bytes / size_of::<VolumeRecord>() (anchors ["table_bytes"])
+slates daemon: slots_per_ring = 32: requests one client may hold in flight (Little's law: request rate × p99 service time), rounded up to a power of two (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: spin_ns = 200: the expected (mean) cost of parking, the 2-competitive spin threshold (anchors ["wake.mean_ns"])
+slates daemon: log_bytes_per_partition = 477065557: table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve (anchors ["table_bytes", "page"])
+slates daemon: snapshot_bytes_per_partition = 954131114: twice the table bytes (the whole partition encoded, with growth headroom) (anchors ["table_bytes"])
+slates daemon: archive_slice_bytes = 420: blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000 (anchors ["hash.blake3_bytes_per_second", "rt.step_budget_ns"])
+slates daemon: memcpy_bytes_per_second = 22203832715: memcpy bytes per second at the largest measured copy size (at least one) (anchors ["memcpy"])
+slates daemon: copy_slice_bytes = 2220: memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000 (anchors ["memcpy", "rt.step_budget_ns"])
+slates daemon: codec = lz4 true, zstd levels [1, 3, 9, 19], byte worth 45 scaled ns: the profile's measured codec points, a byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors ["codecs", "memcpy.bytes_per_second"])
+slates daemon: seal_key_slots = 384: page.base / 32 × shards (one page of key slots per shard) (anchors ["page.base", "shards"])
+slates daemon: telemetry_spans_per_reply = 50: (bulk chunk bytes − encoded fixed report bytes) / encoded span record bytes (anchors ["ipc.bulk_chunk_bytes", "wire.TelemetryReport", "wire.SpanRecord"])
+slates daemon: max_inodes = 828238: metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.inode_unit_bytes"])
+slates daemon: max_dirs = 245404: metadata_class / (Slot<DirNode> + Slot<DirBlock>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.directory_unit_bytes"])
+slates daemon: max_chunks = 465884: reserve_per_shard / content_granule (one chunk per granule at least) (anchors ["reserve_per_shard", "page"])
+slates daemon: metadata_class_bytes = 1908262229: the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM (anchors ["reserve_per_shard", "MEMORY_CLASSES"])
+slates daemon: digest_cache_entries = 77647: max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>() (anchors ["store.max_inodes", "reserve_per_shard"])
+slates daemon: spin_shift = 16: ⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the probe's ±5 % at 95 % (anchors ["wake.sd_ns", "wake.mean_ns"])
+slates daemon: clients_per_shard = 1764: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes (anchors ["reserve_per_shard", "region_bytes"])
+slates daemon: direct_maps_per_shard = 465884: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"])
+slates daemon: landings_awaiting_per_shard = 5292: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 3533: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: idle_window_ns = 20000: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: guest_listing_entries = 0: none: a Windows guest's stream ends with its daemon, so no number it holds outlives a restart (anchors [])
+slates daemon: inode_reserve = 18876: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 1754: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 238532778: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 2484714: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 2484714: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates-server: shard 2 initialized in 1830 µs
+slates-server: shard 0 initialized in 2723 µs
+slates daemon: instance fsb-187-4-old serving on 3 shards under the anchor
+slates-server: shard 1 initialized in 2499 µs
+# fsb-187-4-new's error output, 85 lines:
+slates anchor: instance fsb-187-4-new up; daemon pid 1088; 1 shards
+slates anchor: issuer surface: export SLATES_ANCHOR=slates-seg-fsb-187-4-new SLATES_ANCHOR_LEN=18605613056 SLATES_ANCHOR_CONTENT=slates-con-fsb-187-4-new SLATES_ANCHOR_CONTENT_LEN=24330436608
+slates daemon: requests_in_flight_per_shard = 20: request rate × p99 service time (Little's law) (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: effective_capacity_bytes = 17174360064: min(memory.total, the OS/job/cgroup bound when one is set) (anchors ["memory.total", "memory.limit"])
+slates daemon: reserve_per_shard = 5724786688: memory capacity / shards / classes (anchors ["mem.capacity", "rt.shards", "mem.classes"])
+slates daemon: lock_capacity_bytes = 1413120: the OS's lock limit when a confirming lock succeeded, else 0 (anchors ["mem.lock_capacity", "mem.lock_confirmed"])
+slates daemon: table_bytes = 1431196672: reserve_per_shard × TABLE_SHARE_PERMILLE / 1000 (anchors ["mem.lock_capacity", "GAPS §5 table share"])
+slates daemon: volumes_per_shard = 4707883: table_bytes / size_of::<VolumeRecord>() (anchors ["table_bytes"])
+slates daemon: slots_per_ring = 32: requests one client may hold in flight (Little's law: request rate × p99 service time), rounded up to a power of two (anchors ["rt.request_rate", "rt.service_p99_ns"])
+slates daemon: spin_ns = 328: the expected (mean) cost of parking, the 2-competitive spin threshold (anchors ["wake.mean_ns"])
+slates daemon: log_bytes_per_partition = 1431196672: table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve (anchors ["table_bytes", "page"])
+slates daemon: snapshot_bytes_per_partition = 2862393344: twice the table bytes (the whole partition encoded, with growth headroom) (anchors ["table_bytes"])
+slates daemon: archive_slice_bytes = 680: blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000 (anchors ["hash.blake3_bytes_per_second", "rt.step_budget_ns"])
+slates daemon: memcpy_bytes_per_second = 21421368743: memcpy bytes per second at the largest measured copy size (at least one) (anchors ["memcpy"])
+slates daemon: copy_slice_bytes = 3513: memcpy_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000 (anchors ["memcpy", "rt.step_budget_ns"])
+slates daemon: codec = lz4 true, zstd levels [1, 3, 9, 19], byte worth 46 scaled ns: the profile's measured codec points, a byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors ["codecs", "memcpy.bytes_per_second"])
+slates daemon: seal_key_slots = 128: page.base / 32 × shards (one page of key slots per shard) (anchors ["page.base", "shards"])
+slates daemon: telemetry_spans_per_reply = 50: (bulk chunk bytes − encoded fixed report bytes) / encoded span record bytes (anchors ["ipc.bulk_chunk_bytes", "wire.TelemetryReport", "wire.SpanRecord"])
+slates daemon: max_inodes = 2484716: metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.inode_unit_bytes"])
+slates daemon: max_dirs = 1874520: metadata_class / (Slot<DirNode> + a smallest-class directory block's page share) / STORE_TABLE_DIVISOR (anchors ["reserve_per_shard", "vfs.directory_unit_bytes"])
+slates daemon: max_chunks = 1397653: reserve_per_shard / content_granule (one chunk per granule at least) (anchors ["reserve_per_shard", "page"])
+slates daemon: metadata_class_bytes = 5724786688: the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM (anchors ["reserve_per_shard", "MEMORY_CLASSES"])
+slates daemon: digest_cache_entries = 232942: max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>() (anchors ["store.max_inodes", "reserve_per_shard"])
+slates daemon: spin_shift = 21: ⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the probe's ±5 % at 95 % (anchors ["wake.sd_ns", "wake.mean_ns"])
+slates daemon: clients_per_shard = 5294: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes (anchors ["reserve_per_shard", "region_bytes"])
+slates daemon: direct_maps_per_shard = 1397653: min(RLIMIT_NOFILE × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / DESCRIPTORS_PER_COPY, vm.max_map_count × DIRECT_MAP_LIMIT_SHARE_PERMILLE / 1000 / MAPPINGS_PER_COPY) / shards, at most max_chunks (anchors ["RLIMIT_NOFILE", "vm.max_map_count", "shards", "max_chunks"])
+slates daemon: landings_awaiting_per_shard = 5294: clients_per_shard × shards (anchors ["clients_per_shard", "shards"])
+slates daemon: tasks_per_shard = 10593: clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD (anchors ["clients_per_shard"])
+slates daemon: idle_window_ns = 32800: spin_before_park_ns × IDLE_WINDOW_RATIO (anchors ["wake.mean_ns", "IDLE_WINDOW_RATIO"])
+slates daemon: guest_listing_entries = 0: none: a Windows guest's stream ends with its daemon, so no number it holds outlives a restart (anchors [])
+slates daemon: inode_reserve = 18876: max(guest_listing_entries, NFS max message / smallest entry3) × RESERVE_TOP_UP_SHARE (anchors ["guest_listing_entries", "nfs.max_message"])
+slates daemon: nfs_v4_slots = 32: slots_per_ring: the requests one client may hold in flight (Little's law) (anchors ["slots_per_ring"])
+slates daemon: nfs_v4_clients = 5264: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES) (anchors ["reserve_per_shard", "shards"])
+slates daemon: nfs_v4_record_bytes = 715598336: reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS (anchors ["reserve_per_shard"])
+slates daemon: nfs_v4_opens = 2484716: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: nfs_v4_locks = 2484716: max_inodes × shards (anchors ["max_inodes", "shards"])
+slates daemon: instance fsb-187-4-new serving on 1 shards under the anchor
+slates-server: shard 0 initialized in 1855 µs
+slates-winfsp: reply spin window = 15900 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+slates daemon: a heartbeat came 707 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 6 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 4 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 383 ms and its timer overrun 16 ms
+slates daemon: a heartbeat came 688 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 913 steps and 645 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 195 unattributed), fired 2 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 383 ms and its timer overrun 37 ms
+slates daemon: a heartbeat came 589 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 4 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 383 ms and its timer overrun 37 ms
+slates daemon: a heartbeat came 526 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 6 steps and 9 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 5 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 383 ms and its timer overrun 37 ms
+slates daemon: a heartbeat came 569 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 4 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 383 ms and its timer overrun 37 ms
+slates daemon: a heartbeat came 724 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 482 steps and 342 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 94 unattributed), fired 2 timers, waited 1 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 383 ms and its timer overrun 15 ms
+slates daemon: a heartbeat came 529 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 6 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 6 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 383 ms and its timer overrun 15 ms
+slates daemon: a heartbeat came 698 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 960 steps and 678 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 183 unattributed), fired 2 timers, waited 1 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 390 ms and its timer overrun 26 ms
+slates daemon: a heartbeat came 767 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 488 steps and 355 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 154 unattributed), fired 2 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 23 ms
+slates daemon: a heartbeat came 558 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 4 steps and 8 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 5 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 23 ms
+slates daemon: a heartbeat came 608 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 4 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 22 ms
+slates daemon: a heartbeat came 569 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 6 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 5 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 34 ms
+slates daemon: a heartbeat came 598 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 32 ms
+slates daemon: a heartbeat came 507 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 4 steps and 7 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 5 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 32 ms
+slates daemon: a heartbeat came 623 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 4 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 32 ms
+slates daemon: a heartbeat came 646 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 6 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 6 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 32 ms
+slates daemon: a heartbeat came 581 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 5 steps and 6 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 47 ms
+slates daemon: a heartbeat came 674 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 5 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 4 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 95 ms
+slates daemon: a heartbeat came 588 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 4 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 95 ms
+slates daemon: a heartbeat came 608 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 4 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 27 ms
+slates daemon: a heartbeat came 651 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 4 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 27 ms
+slates daemon: a heartbeat came 563 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 27 ms
+slates daemon: a heartbeat came 552 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 6 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 6 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 27 ms
+slates daemon: a heartbeat came 651 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 640 steps and 469 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 153 unattributed), fired 2 timers, waited 1 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 22 ms
+slates daemon: a heartbeat came 549 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 6 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 6 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 22 ms
+slates daemon: a heartbeat came 563 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 1483 steps and 1048 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 271 unattributed), fired 2 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 24 ms
+slates daemon: a heartbeat came 575 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 6 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 24 ms
+slates daemon: a heartbeat came 558 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 30 ms
+slates daemon: a heartbeat came 515 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 30 ms
+slates daemon: a heartbeat came 719 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 1589 steps and 1149 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 207 unattributed), fired 2 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 17 ms
+slates daemon: a heartbeat came 519 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 6 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 6 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 17 ms
+slates daemon: a heartbeat came 657 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 604 steps and 429 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 113 unattributed), fired 2 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 11 ms
+slates daemon: a heartbeat came 664 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 4 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 4 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 11 ms
+slates daemon: a heartbeat came 593 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 6 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 6 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 11 ms
+slates daemon: a heartbeat came 538 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 487 steps and 347 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 120 unattributed), fired 2 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 18 ms
+slates daemon: a heartbeat came 671 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 5 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 18 ms
+slates daemon: a heartbeat came 551 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 2 unattributed), fired 2 timers, waited 1 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 50 ms
+slates daemon: a heartbeat came 516 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 3 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 50 ms
+slates daemon: a heartbeat came 568 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 2 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 2 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 50 ms
+slates daemon: a heartbeat came 682 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 4 steps and 5 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 4 unattributed), fired 2 timers, waited 1 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 32 ms
+slates daemon: a heartbeat came 532 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 6 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 6 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 32 ms
+slates daemon: a heartbeat came 540 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 1284 steps and 908 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 233 unattributed), fired 2 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 13 ms
+slates daemon: a heartbeat came 700 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 6 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 6 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 13 ms
+slates daemon: a heartbeat came 674 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 1295 steps and 916 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 238 unattributed), fired 2 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 11 ms
+slates daemon: a heartbeat came 587 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 5 steps and 8 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 5 unattributed), fired 1 timers, waited 0 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 11 ms
+slates daemon: a heartbeat came 740 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 3 steps and 3 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 2 unattributed), fired 2 timers, waited 1 times, spawned 0 tasks and finished 0; 6 tasks live; its longest poll is 422 ms and its timer overrun 44 ms
+## run 4 of 5 done, 2026-11-05T21:35:28Z
