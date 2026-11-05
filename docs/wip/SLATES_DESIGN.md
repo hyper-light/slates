@@ -5691,6 +5691,22 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > moment the last write returns: served whole in 1.93, 1.93 and 2.17 s (3 of 3). Also owed: FUSE `fsync`, a
 > candidate's copy across its own daemon's restart, hard links (an archive carries each name as its own file), and
 > extended attributes in the rebuilt volume.
+>
+> **Chaos across real processes (2026-11-05).** SIGSTOP is the unprivileged partition (a stopped daemon answers
+> nothing and keeps its ports; SIGCONT returns it with every timer late, as a healed partition or a long stall does);
+> netem and network namespaces need privileges this project never takes. `crates/cli/tests/live_fleet.rs`:
+> - *A candidate partitioned away, then healed*: writes stay durable through the other candidate (client-seen 3–16 ms
+>   but the first, about 103 ms, the session finding the stopped peer), the log durable at its head when the last
+>   returns; the healed candidate catches up to the owner's head within about 1–2 s (4 of 4).
+> - *Latency injected*: both candidates stopped 30 ms of every 60 ms, out of phase, so for 15 ms of each both are
+>   stopped: 30 writes, client-seen p50 3.0–3.8 ms, p90 32.6–33.6 ms, max 35.1–47.4 ms, every one durable at its return,
+>   none refused for room, both candidates at the owner's head afterwards.
+> The partition found a defect: a live exchange's deadline came from the consensus round's budget, which is derived
+> from the slowest path's tail, and a stopped peer inflates it, so one exchange held the peer's only session past a
+> 40 s wait and the healed candidate never caught up (1 of 2 runs at first; 0 of 8 since). Live exchanges now run under
+> the daemon's liveness budget (`fleet::live_budget`), and an exchange no holder answered drops that link to be dialed
+> afresh (`live_ship::lose_links`), as an unanswered discovery exchange does.
+
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
 writer's ring to its local owner shard is the latency floor. When write-intent attachments from

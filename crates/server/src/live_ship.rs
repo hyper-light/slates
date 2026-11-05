@@ -63,6 +63,12 @@ const LIVE_REFUSED: &str = "fleet.live.refused";
 const LIVE_APPENDED: &str = "fleet.live.appended";
 /// Counter: entries a holder refused to keep (over its bound, unauthorized, malformed).
 const LIVE_HOLD_REFUSED: &str = "fleet.live.hold_refused";
+/// Counter: a message for a holder this node had no session to (lent, or not formed): left to the period.
+const LIVE_NO_SESSION: &str = "fleet.live.no_session";
+/// Counter: a message a holder did not answer within the exchange's budget (or had no session to ride).
+const LIVE_UNANSWERED: &str = "fleet.live.unanswered";
+/// Counter: a record link dropped because its holder answered nothing ([`lose_links`]).
+const LIVE_LINK_LOST: &str = "fleet.live.link_lost";
 /// Counter: takeover fetches this node answered with what it holds.
 const LIVE_FETCHED: &str = "fleet.live.fetched";
 /// Counter: entries and installs this node kept as a candidate.
@@ -729,9 +735,16 @@ async fn send_from_control(
       for send in sends {
         let sessions =
           crate::fleet::take_sessions("fleet.lent_to.live_ship", |host| host == send.holder);
+        if sessions.is_empty() {
+          let _ = state::with_state(|s| s.count(LIVE_NO_SESSION, 1));
+        }
         let exchanged =
           slates_cluster::live::exchange((send.stream, &send.bytes), sessions, budget, |_, _| true)
             .await;
+        if exchanged.replies.is_empty() {
+          let _ = state::with_state(|s| s.count(LIVE_UNANSWERED, 1));
+        }
+        lose_links(&exchanged.unanswered);
         crate::fleet::return_sessions(exchanged.reusable);
         replies.extend(
           exchanged
@@ -757,10 +770,16 @@ fn settle_stragglers(origin: u16, object: ObjectId, mut stragglers: slates_clust
       let (late, done) = stragglers.recover_replies();
       let mut replies = Vec::new();
       let mut sessions = Vec::new();
+      let mut lost = Vec::new();
       for (host, reply, endpoint) in late {
+        if reply.round_trip_ns.is_none() {
+          lost.push(host);
+          continue;
+        }
         replies.push((object, host, reply.bytes));
         sessions.push((host, endpoint));
       }
+      lose_links(&lost);
       crate::fleet::return_sessions(sessions);
       if !replies.is_empty() {
         let control = state::with_state(|s| s.shard).unwrap_or(origin);
@@ -783,6 +802,23 @@ fn settle_stragglers(origin: u16, object: ObjectId, mut stragglers: slates_clust
   if let Ok(task) = spawned {
     let _ = slates_rt::futures::detach(task);
   }
+}
+
+/// Drops the record links of holders that answered nothing (on the control shard, where the links live): their link
+/// tasks dial afresh, as an unanswered discovery exchange's does (`fleet::exchange_discovery`). Returned to the pool, a
+/// session dead at a resumed peer's end was lent to every later message and none was ever answered: a candidate stopped
+/// and resumed stayed at its old head for the whole of a 40 s wait (2026-11-05, `live_fleet`, 1,478 sends that found no
+/// session and 1,483 unanswered).
+fn lose_links(hosts: &[HostId]) {
+  if hosts.is_empty() {
+    return;
+  }
+  let _ = state::with_state(|s| {
+    for host in hosts {
+      s.record_sessions.remove(host);
+      s.count(LIVE_LINK_LOST, 1);
+    }
+  });
 }
 
 /// Folds replies into the owner shard's shippers and ships what the holders still lack.
