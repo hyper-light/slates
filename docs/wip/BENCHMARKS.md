@@ -9792,6 +9792,23 @@ A second receiver cannot simply be added: two journals need the multi-worker cra
 second worker would also make x86_64 slower unless it ran on arm64 alone, and a mode chosen per architecture would need
 a derivation the rules accept.
 
+### The load test over the network: a client node and a server node (2026-11-05)
+
+`SLATES_LOADTEST_TREE=<linux-v7.4-rc1>/kernel SLATES_LOADTEST_BENCH=<release load_bench> SLATES_LOADTEST_CLIENTS=<n>
+SLATES_LOADTEST_ARGS="--hot-files <0.8 n> --reply-patience 60" cargo test --release -p slates-cli --test load_fleet --
+--nocapture`: two `slates anchor --fleet` nodes from one manifest (f = 0, loopback), the green on the server node, the
+harness at the client node; same machine as above, load 22 to 45, one run each. Nanoseconds, p50:
+
+| Clients | CreateWork | Edit | Submit (accepted) | Accepted / conflicts | Server RSS before → peak (KiB) | Client node RSS before → peak (KiB) | Refused |
+|---|---|---|---|---|---|---|---|
+| 100 | 509,673,093 | 96,438 | 277,486 | 300 / 20 | 102,124 → 244,528 | not recorded | none |
+| 300 | 1,709,859,756 | 69,688 | 185,272 | 900 / 45 | 121,096 → 484,900 | 30,180 → 59,828 | none |
+| 1,000 | 4,296,230,485 | 89,061 | 212,021 | 1,376 / 156 | 121,540 → 785,832 | 30,008 → 93,732 | 536 CreateWork, 7 Edit `OwnerUnreachable` |
+
+The oracle and every own file: 0 failures at each rung. A forwarded verb waits for the client node's one session to
+its server (GAPS), so the creates queue. With the server daemon SIGKILLed 1 s (100 clients) and 3 s (300) into the rung
+and restarted by its anchor, the client node's forwards stayed refused `OwnerUnreachable` (GAPS).
+
 ## Raising the shard threads' priority, and where the receiver stands against the DLL (A-212; 2026-11-05)
 
 **Measured and not taken (2026-11-05).** A test of what would fix a loaded SetSize (a shard preempted just after it answers, above):

@@ -70,6 +70,30 @@
 >     separate form.
 >   - If no one form passes both runners, the per-machine form question goes to Ada with that table.
 
+> **The many-client load test over the network (loadtest; 2026-11-05).** The harness
+> (`crates/client/examples/load_bench.rs`, `--green` to drive a green on another node) and its launcher
+> (`crates/cli/tests/load_fleet.rs`, gated on `SLATES_LOADTEST_TREE` and `SLATES_LOADTEST_BENCH`).
+> - **Over the network (2026-11-05, `crates/cli/tests/load_fleet.rs`: a server node and a client node under anchors,
+>   f = 0, loopback; the harness at the client node against the server's green over `kernel/`):** 100, 300 and 1,000
+>   clients, the oracle and every own file 0 failures. The server pays about 1.2 to 1.4 MB a client at peak (121,096 to
+>   484,900 KiB at 300), the client node about 64 to 100 KB a local client (30,180 to 59,828 KiB at 300). Three faults:
+>   - **Forwards to one owner go one at a time.** `forward_batch_over_leader_session` (`crates/server/src/fleet.rs`)
+>     takes the peer's one session for a forward's whole round trip, so a client node's verbs to its server serialize:
+>     a forwarded `CreateWork` p50 1.71 s at 300 clients and 4.30 s at 1,000 (45 µs on the owner's own node).
+>   - **A forward queued past the failover bound is refused `OwnerUnreachable`** though the owner is alive and served
+>     everything else: 536 `CreateWork` and 7 edits at 1,000 clients. Typed, but the wrong cause.
+>   - **After the server's daemon is killed and its anchor restarts it, the client node's forwards stay refused
+>     `OwnerUnreachable`**: at 300 clients 207 `CreateWork`, 41 edits, 7 submits, 2 destroys; at 100 clients the
+>     harness's final read 20 s after the kill. The server recovered its green (`1 merge volumes`; whether the
+>     forwarded works existed at the kill is not yet settled).
+>   The 1,000-client "hang" seen in 3 of 10 runs (minutes with both daemons idle) was the harness's own oracle, which
+>   replayed a whole copy of every touched file for every version (1,600 × 677 at 1,000 clients); it now keeps each
+>   slot's writes and judges by lookup, and two runs finish in 19 to 20 s with 0 failures (red-checked: blinded, it
+>   flags 13 of 13 conflicts). Owners of the three faults: the fleet forward and session code (raft, fs-server).
+> - **Memory per same-machine connection is a client node's, about 64 to 100 KB a local client** (the 20 to 29 MB
+>   measured before was the daemon and the harness in one process, both touching every ring); a client node derives
+>   about 7,900 seats here, so the 10k-100k rungs need several client nodes, and fault one above caps each.
+
 > **A-214, A-217 and A-207's port reverted from main (2026-11-05, by the supervisor); their re-landing is owed.** Main CI
 > 42119714654 on b502cf96 failed six jobs, all from this pairing of landed changes, each green on its own branch:
 > - **A-217 against A-201's checkout.** A-217 records a green's origin as a reference to its base snapshot, and
