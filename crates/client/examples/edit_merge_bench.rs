@@ -5,8 +5,10 @@
 //! client's `edit` of its work volume (the declared splice, §4.16 "Declared operations"), then its `submit` through
 //! the server's verdict to the reply — accepted at a new version, accepted identical, or a conflict with its windows.
 //! The client and the daemon are one binary and one process here, over the real rendezvous and rings (§4.7), exactly
-//! as `slates` runs both. The client spins up to the required bound for each reply, so a reply inside the goal is a
-//! round trip and its service, not a wake (until 2026-11-05 the growth forms below spun 50 µs).
+//! as `slates` runs both. The client waits for each reply as a product client does, spinning for its own wake estimate
+//! and then parking (`--client-spin-ns N` fixes the spin instead). Until 2026-11-06 it spun up to 1 ms (the growth forms
+//! 50 µs until 2026-11-05), which under load stretched the tails: a spinning client spends its CPU share, and a wake on
+//! a busy core then waits its turn.
 //!
 //! Two families of forms:
 //! - **Verdict forms**, each over green shapes of 10 to 100,000 files of 4 KiB: `accept` (one work edits a file and
@@ -71,15 +73,22 @@ const MIN_SAMPLES: usize = 200;
 const GOAL_PREFERRED_NS: u64 = 50_000;
 /// Shape: Ada's required bound for a full edit and merge (2026-11-04).
 const GOAL_REQUIRED_NS: u64 = 1_000_000;
-/// Shape: how long the client spins for a reply before it parks: past the goal, so a reply inside
-/// the goal is taken without a wake (the provisioning bench's spinning form, AC-2.1).
-const SPIN_NS: u64 = GOAL_REQUIRED_NS;
+/// The client's spin for this invocation (set once, in `main`): `None`, the default, is the product client's own
+/// (`Client::spin_for(None)`: its wake estimate, seeded with the daemon's published window, the measured wake cost);
+/// `--client-spin-ns N` fixes it at N. Until 2026-11-06 the harness always spun 1 ms (the required bound), which under load is what
+/// stretched its tails (BENCHMARKS, "A rebase that costs what changed").
+static CLIENT_SPIN_NS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
 
-/// The client's spin for this invocation: [`SPIN_NS`], or what `--client-spin-ns N` sets (set once, in `main`).
-static CLIENT_SPIN_NS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+fn client_spin_ns() -> Option<u64> {
+  CLIENT_SPIN_NS.get().copied().flatten()
+}
 
-fn client_spin_ns() -> u64 {
-  CLIENT_SPIN_NS.get().copied().unwrap_or(SPIN_NS)
+/// The spin as the header prints it.
+fn spin_shown() -> String {
+  client_spin_ns().map_or_else(
+    || "the client's own estimate".to_owned(),
+    |ns| format!("{ns} ns"),
+  )
 }
 /// Format: the percentiles reported, in parts per thousand.
 const PERCENTILES: &[(&str, u64)] = &[("p50", 500), ("p99", 990), ("p999", 999)];
@@ -154,6 +163,9 @@ struct Sample {
   edit_request: u32,
   /// The submit's (or rebase's) request sequence.
   submit_request: u32,
+  /// The host clock (`slates_machine::clock::monotonic_ns`, the spans' clock) before the edit, between the two calls
+  /// and after the submit: what places the spans inside each call.
+  host: [u64; 3],
 }
 
 /// A green, its model and the works that edit it.
@@ -205,7 +217,7 @@ impl Fixture {
   /// chain or the shard's budget cannot hold the seed): a measured answer, printed in the shape's place.
   fn new(instance: &str, tag: &str, files: usize) -> Result<Fixture, String> {
     let mut client = connect(instance);
-    client.spin_for(Some(client_spin_ns()));
+    client.spin_for(client_spin_ns());
     let green = client.create_green(&format!("{tag}-green"), false).unwrap();
     let (seed, _) = client.create_work(green, &format!("{tag}-seed")).unwrap();
     let mut model = BTreeMap::new();
@@ -325,14 +337,17 @@ impl Fixture {
         let bytes = fresh_bytes(self.next_stamp());
         let leader = self.leader;
         let started = Instant::now();
+        let started_host = slates_machine::clock::monotonic_ns();
         self
           .client
           .edit(leader, &path, 0, EDIT_BYTES as u64, &bytes)
           .unwrap();
         let edited = Instant::now();
+        let edited_host = slates_machine::clock::monotonic_ns();
         let edit_request = self.client.last_request().sequence;
         let answer = self.client.submit(leader).unwrap();
         let done = Instant::now();
+        let done_host = slates_machine::clock::monotonic_ns();
         let submit_request = self.client.last_request().sequence;
         self.expect_accept(answer, "an edit based on the head");
         self.model_overwrite(&path, 0, &bytes);
@@ -342,6 +357,7 @@ impl Fixture {
           submit: ns(done - edited),
           edit_request,
           submit_request,
+          host: [started_host, edited_host, done_host],
         }
       }
       Form::Ranged => {
@@ -350,14 +366,17 @@ impl Fixture {
         let bytes = fresh_bytes(self.next_stamp());
         let follower = self.follower;
         let started = Instant::now();
+        let started_host = slates_machine::clock::monotonic_ns();
         self
           .client
           .edit(follower, &path, SECOND_RANGE, EDIT_BYTES as u64, &bytes)
           .unwrap();
         let edited = Instant::now();
+        let edited_host = slates_machine::clock::monotonic_ns();
         let edit_request = self.client.last_request().sequence;
         let answer = self.client.submit(follower).unwrap();
         let done = Instant::now();
+        let done_host = slates_machine::clock::monotonic_ns();
         let submit_request = self.client.last_request().sequence;
         self.expect_accept(answer, "a disjoint edit behind the head");
         self.model_overwrite(&path, SECOND_RANGE, &bytes);
@@ -367,6 +386,7 @@ impl Fixture {
           submit: ns(done - edited),
           edit_request,
           submit_request,
+          host: [started_host, edited_host, done_host],
         }
       }
       Form::Identical => {
@@ -374,14 +394,17 @@ impl Fixture {
         self.lead(&path, &lead);
         let follower = self.follower;
         let started = Instant::now();
+        let started_host = slates_machine::clock::monotonic_ns();
         self
           .client
           .edit(follower, &path, 0, EDIT_BYTES as u64, &lead)
           .unwrap();
         let edited = Instant::now();
+        let edited_host = slates_machine::clock::monotonic_ns();
         let edit_request = self.client.last_request().sequence;
         let answer = self.client.submit(follower).unwrap();
         let done = Instant::now();
+        let done_host = slates_machine::clock::monotonic_ns();
         let submit_request = self.client.last_request().sequence;
         // An identical edit accepts at a new version with no effect: the model's bytes stay.
         self.expect_accept(answer, "an identical edit behind the head");
@@ -391,6 +414,7 @@ impl Fixture {
           submit: ns(done - edited),
           edit_request,
           submit_request,
+          host: [started_host, edited_host, done_host],
         }
       }
       Form::Conflict => {
@@ -399,14 +423,17 @@ impl Fixture {
         let bytes = fresh_bytes(self.next_stamp());
         let follower = self.follower;
         let started = Instant::now();
+        let started_host = slates_machine::clock::monotonic_ns();
         self
           .client
           .edit(follower, &path, 0, EDIT_BYTES as u64, &bytes)
           .unwrap();
         let edited = Instant::now();
+        let edited_host = slates_machine::clock::monotonic_ns();
         let edit_request = self.client.last_request().sequence;
         let answer = self.client.submit(follower).unwrap();
         let done = Instant::now();
+        let done_host = slates_machine::clock::monotonic_ns();
         let submit_request = self.client.last_request().sequence;
         match answer {
           Submitted::Conflict(windows)
@@ -424,6 +451,7 @@ impl Fixture {
           submit: ns(done - edited),
           edit_request,
           submit_request,
+          host: [started_host, edited_host, done_host],
         }
       }
       Form::Rebase => {
@@ -435,14 +463,17 @@ impl Fixture {
         let bytes = fresh_bytes(self.next_stamp());
         let follower = self.follower;
         let started = Instant::now();
+        let started_host = slates_machine::clock::monotonic_ns();
         self
           .client
           .edit(follower, &path, SECOND_RANGE, EDIT_BYTES as u64, &bytes)
           .unwrap();
         let edited = Instant::now();
+        let edited_host = slates_machine::clock::monotonic_ns();
         let edit_request = self.client.last_request().sequence;
         let answer = self.client.rebase(follower).unwrap();
         let done = Instant::now();
+        let done_host = slates_machine::clock::monotonic_ns();
         let submit_request = self.client.last_request().sequence;
         if answer != Rebased::Rebased(self.head) {
           wrong(&format!(
@@ -468,6 +499,7 @@ impl Fixture {
           submit: ns(done - edited),
           edit_request,
           submit_request,
+          host: [started_host, edited_host, done_host],
         }
       }
     }
@@ -498,6 +530,9 @@ struct Served {
   ring: u64,
   op: u64,
   verdict: u64,
+  /// The first ring span's start and the last one's end (host clock), 0 when none.
+  ring_start: u64,
+  ring_end: u64,
 }
 
 /// Every span of this client's requests the shards hold, drained (each drain is bounded, so a shard is drained until
@@ -523,7 +558,15 @@ fn drain(client: &mut Client, shards: u16, into: &mut BTreeMap<u32, Served>) -> 
         let took = span.end_ns.saturating_sub(span.start_ns);
         let served = into.entry(span.request_sequence).or_default();
         match name(span.point).as_str() {
-          "ring.request" => served.ring = served.ring.saturating_add(took),
+          "ring.request" => {
+            served.ring = served.ring.saturating_add(took);
+            served.ring_start = if served.ring_start == 0 {
+              span.start_ns
+            } else {
+              served.ring_start.min(span.start_ns)
+            };
+            served.ring_end = served.ring_end.max(span.end_ns);
+          }
           "shard.op" => served.op = served.op.saturating_add(took),
           "merge.verdict" => served.verdict = served.verdict.saturating_add(took),
           _ => {}
@@ -578,8 +621,21 @@ fn attribute(key: &str, samples: &[(Sample, Served, Served)], shed: u64) {
     let op = pick(&|s| s.1.op.saturating_add(s.2.op));
     let verdict = pick(&|s| s.2.verdict);
     let outside = pick(&|s| total(s).saturating_sub(s.1.ring.saturating_add(s.2.ring)));
+    // Before the slot is read (the doorbell and the shard's wake) and after the reply is written (the client's wake),
+    // summed over the two calls.
+    let before = pick(&|s| {
+      s.1
+        .ring_start
+        .saturating_sub(s.0.host[0])
+        .saturating_add(s.2.ring_start.saturating_sub(s.0.host[1]))
+    });
+    let after = pick(&|s| {
+      s.0.host[1]
+        .saturating_sub(s.1.ring_end)
+        .saturating_add(s.0.host[2].saturating_sub(s.2.ring_end))
+    });
     println!(
-      "attrib\tmerge.{key}_{band}: {} samples; client {client} ns, ring {ring} ns, shard ops {op} ns, verdict {verdict} ns, outside the ring {outside} ns (median of each); spans shed {shed}, samples unmatched {unmatched}",
+      "attrib\tmerge.{key}_{band}: {} samples; client {client} ns, ring {ring} ns, shard ops {op} ns, verdict {verdict} ns, outside the ring {outside} ns (to the slot's read {before} ns, from the reply's write {after} ns) (median of each); spans shed {shed}, samples unmatched {unmatched}",
       chosen.len()
     );
   }
@@ -755,7 +811,7 @@ fn print_growth(run: usize, key: &str, samples: &[u64]) {
 /// Every selected growth form, its runs, its rows and its goal lines.
 fn growth_sweep(instance: &str, selection: &Selection) {
   let mut client = connect(instance);
-  client.spin_for(Some(client_spin_ns()));
+  client.spin_for(client_spin_ns());
   for form in selection.growth.iter().copied() {
     let mut rows: BTreeMap<String, Vec<u64>> = BTreeMap::new();
     for index in 0..RUNS {
@@ -842,8 +898,9 @@ impl Selection {
         "--client-spin-ns" => {
           let spin = args
             .next()
-            .and_then(|n| n.parse().ok())
-            .expect("--client-spin-ns takes nanoseconds");
+            .expect("--client-spin-ns takes nanoseconds or `default`");
+          let spin =
+            (spin != "default").then(|| spin.parse().expect("--client-spin-ns takes nanoseconds"));
           let _ = CLIENT_SPIN_NS.set(spin);
         }
         "--spinners-per-core" => {
@@ -934,10 +991,10 @@ fn main() {
   let mut selection = Selection::parse();
   selection.shards = shards;
   println!(
-    "edit and merge latency: {} {}, {shards} shards, {cores} cores, client spin {} ns, {SAMPLES} samples x {RUNS} runs, edits of {EDIT_BYTES} B in files of {FILE_BYTES} B",
+    "edit and merge latency: {} {}, {shards} shards, {cores} cores, client spin {}, {SAMPLES} samples x {RUNS} runs, edits of {EDIT_BYTES} B in files of {FILE_BYTES} B",
     std::env::consts::OS,
     std::env::consts::ARCH,
-    client_spin_ns()
+    spin_shown()
   );
   if selection.quiet {
     sweep(&instance, "quiet", &selection);
