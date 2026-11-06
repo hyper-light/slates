@@ -1,0 +1,25 @@
+name: DIAG bug-sweep 2, slates exec on AppArmor-confined runners (not for main)
+
+# A diagnostics branch, never merged. Branch 2 carries the launcher test with main's exec.rs (expected red: the bare
+# setgroups refusal); branch 3 carries the fix (expected green: the refusal names the sysctl).
+
+on:
+  push:
+    branches: [diag-bug-sweep-2]
+
+jobs:
+  launcher:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: The launcher test
+        run: cargo test -p slates-cli --test cli -- --exact the_launcher_binds_a_volume_or_names_the_host_setting_that_forbids_it --nocapture
