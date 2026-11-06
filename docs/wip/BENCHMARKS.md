@@ -9757,7 +9757,11 @@ Apple M5 Max, 18 cores, macOS 26.4.1, 5 shards (the harness's own daemon) or `--
 load 31 to 53 from other agents' builds and runs; 2026-11-06 06:44 to 06:52 UTC. The tree is the kernel's `kernel/`
 (754 files, 16,321,721 bytes). main's harness cannot run on macOS: `tree_bytes` calls `du -sb`, and BSD `du` has no
 `-b`. So the harness binary was built with loadtest-scale's `tree_bytes` (`-sAk` x 1024 on macOS, on
-`agents/loadtest-scale-1`). That hunk was applied for the build and then removed, and is not in the branch.
+`agents/loadtest-scale-1`). That hunk was applied for the build and then removed, and is not in the branch. Two
+readings of main's harness (loadtest-scale):
+- Its oracle replays a whole copy of every touched file per version. That takes seconds at 10 and 100 clients and
+  does not scale to 1,000; the per-slot oracle is `c35c532f` on `agents/loadtest-scale-1`.
+- A refusal row is the harness's own error string, not a typed refusal.
 
 `load_bench --tree kernel --clients 10,100 --hot-files 80`, three runs, all shown. Nanoseconds, p50:
 
