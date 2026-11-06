@@ -1,0 +1,73 @@
+runner ubuntu-latest, 4 CPUs, Fri Nov  6 06:51:51 UTC 2026, fix 45c079ed9a4377e30bb9ecc03425b49fd3ff1e8e
+live vhost fsync: healthy (0, 455µs); candidates stopped (0, 423µs); resumed (0, 167µs); vmm ExitStatus(unix_wait_status(0)); owner's live counters {"appended": 3, "awaited": 1, "durable": 3, "no_session": 3, "resolved": 1}
+thread 'a_virtio_fs_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it' (5238) panicked at crates/cli/tests/live_fleet.rs:2232:3:
+assertion `left == right` failed: an FSYNC no candidate can hold fails EIO, not success, after 423µs
+  left: 0
+ right: 5
+test a_virtio_fs_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 15 filtered out; finished in 2.30s
+== red exit 101
+live vhost fsync: healthy (0, 93.873ms); candidates stopped (5, 1.000592s); resumed (0, 226.271ms); vmm ExitStatus(unix_wait_status(0)); owner's live counters {"appended": 3, "awaited": 1, "durable": 3, "link_lost": 2, "no_session": 27, "resolved": 1, "unanswered": 25}
+test a_virtio_fs_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 2.70s
+== fix 1 exit 0
+live vhost fsync: healthy (0, 2.387ms); candidates stopped (5, 1.000584s); resumed (0, 101.45ms); vmm ExitStatus(unix_wait_status(0)); owner's live counters {"appended": 3, "awaited": 1, "durable": 3, "link_lost": 1, "no_session": 25, "resolved": 1, "unanswered": 12}
+test a_virtio_fs_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 2.85s
+== fix 2 exit 0
+live vhost fsync: healthy (0, 92.786ms); candidates stopped (0, 1.000358s); resumed (0, 101.321ms); vmm ExitStatus(unix_wait_status(0)); owner's live counters {"appended": 3, "awaited": 1, "durable": 3, "link_lost": 1, "no_session": 23, "resolved": 1, "unanswered": 13}
+thread 'a_virtio_fs_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it' (8709) panicked at crates/cli/tests/live_fleet.rs:2232:3:
+assertion `left == right` failed: an FSYNC no candidate can hold fails EIO, not success, after 1.000358s
+  left: 0
+ right: 5
+test a_virtio_fs_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 15 filtered out; finished in 3.51s
+== fix 3 exit 101
+live shards fsync: healthy (0, 90.507ms); candidates stopped (5, 1.00077s); resumed (0, 98.095ms); device ExitStatus(unix_wait_status(0)); owner's live counters {"appended": 3, "awaited": 1, "durable": 3, "durable_late": 1, "link_lost": 1, "no_session": 20, "resolved": 2, "unanswered": 11}
+test a_shards_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 2.61s
+== a_shards_fsync exit 0
+live map sync: healthy Ok(4); candidates stopped None (log Some(("2", "1", "false"))); resumed Some((Ok(4), 3.058357334s)) (log Some(("2", "2", "false"))); owner's live counters {"appended": 3, "awaited": 3, "durable": 3, "link_lost": 1, "no_session": 60, "resolved": 3, "unanswered": 58}
+test a_writable_maps_sync_on_a_live_volume_answers_only_once_a_candidate_holds_it ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 5.38s
+== a_writable_maps_sync exit 0
+live checkout: candidates stopped None; resumed Some((0, "{\"report\":{\"made\":0,\"moded\":0,\"removed\":0,\"written\":1},\"version\":1}\n", "")); owner's live counters {"appended": 3, "awaited": 3, "durable": 3, "link_lost": 1, "no_session": 61, "resolved": 3, "unanswered": 60}
+test a_checkout_into_a_live_volume_answers_only_once_a_candidate_holds_it ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 5.02s
+== a_checkout_into exit 0
+live nfs4: healthy write (None, 42.323194ms) commit (None, 42.891769ms); candidates stopped: unstable write (None, 41.156628ms), commit (Some(10008), 1.041307583s), stable write (Some(10008), 712.371µs); resumed commit (None, 41.804534ms); owner's live counters {"appended": 3, "durable": 3, "durable_late": 1, "link_lost": 1, "no_session": 23, "resolved": 2, "unanswered": 12}
+test an_nfs_v4_commit_and_stable_write_to_a_live_volume_answer_only_once_a_candidate_holds_them ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 2.64s
+== an_nfs_v4 exit 0
+live fsync: healthy Ok(()); candidates stopped Err(Os { code: 5, kind: Uncategorized, message: "Input/output error" }) after 1.001314915s; resumed Ok(()); owner's live counters {"appended": 4, "durable": 4, "link_lost": 1, "no_session": 26, "unanswered": 14}
+test a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 2.64s
+== a_fuse_fsync exit 0
+test a_destroyed_live_volumes_copies_are_let_go_by_its_candidates ... ok
+test a_checkout_into_a_live_volume_answers_only_once_a_candidate_holds_it ... ok
+test a_fuse_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it ... ok
+test a_paused_candidate_neither_stops_writes_nor_stays_behind ... ok
+test a_live_volumes_acknowledged_writes_survive_its_owners_death ... ok
+test a_stable_nfs_write_to_a_live_volume_is_answered_once_a_candidate_holds_it ... ok
+test a_shards_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it ... ok
+test a_successor_that_holds_no_copy_still_takes_a_live_volume_over ... ok
+test a_superseded_owner_resumed_after_its_takeover_is_fenced ... ok
+test a_virtio_fs_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it ... ok
+test an_nfs_v4_commit_and_stable_write_to_a_live_volume_answer_only_once_a_candidate_holds_them ... ok
+test a_writable_maps_sync_on_a_live_volume_answers_only_once_a_candidate_holds_it ... ok
+test measure_what_live_shipping_adds_to_a_stable_nfs_write ... ok
+test clients_cut_off_mid_write_leave_the_live_log_whole ... ok
+test three_daemon_processes_ship_a_live_volumes_writes_to_both_candidates ... ok
+test writes_stay_durable_through_injected_candidate_stalls ... ok
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 26.97s
+== live_fleet suite exit 0
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== bridge-virtiofs exit 0
+test result: ok. 22 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 13.10s
+test result: ok. 28 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.83s
+== server virtiofs+shards exit 0
