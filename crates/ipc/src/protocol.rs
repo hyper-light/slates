@@ -771,6 +771,39 @@ pub enum RequestBody {
     /// The dead client's id on the sending host.
     client: u32,
   },
+  /// Edit a work volume and submit it, in one request (§4.16, A-225): exactly `Edit` (or `EditStaged`'s edit) and then,
+  /// when the edit is accepted, `Submit`, in one durable step under one completion record. Answered with the edit's
+  /// refusal, or with the submit's reply. Appended.
+  EditSubmit {
+    /// The work volume.
+    work: VolumeId,
+    /// The file.
+    path: String,
+    /// The offset.
+    at: u64,
+    /// Bytes removed at `at`.
+    delete_len: u64,
+    /// The bytes inserted at `at`.
+    insert: EditBytes,
+    /// The evidence references (opaque to slates), possibly none.
+    evidence: Vec<[u8; 32]>,
+  },
+}
+
+/// The bytes an [`RequestBody::EditSubmit`] inserts (A-225): carried in the request, or, for an edit larger than one
+/// request, staged on the work's owner first (`StageBegin`, `StagePut`) and named by its buffer, as `EditStaged` does.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum EditBytes {
+  /// The bytes themselves.
+  Inline {
+    /// The bytes.
+    bytes: Vec<u8>,
+  },
+  /// A staged buffer on the work's owner.
+  Staged {
+    /// The buffer's token.
+    token: u64,
+  },
 }
 
 /// Format: the name of the image file in an image volume's root (§4.6, A-160): what a VMM is pointed at.
@@ -1345,6 +1378,7 @@ impl RequestBody {
       | RequestBody::StageBegin { work: volume, .. }
       | RequestBody::StagePut { work: volume, .. }
       | RequestBody::EditStaged { work: volume, .. }
+      | RequestBody::EditSubmit { work: volume, .. }
       | RequestBody::FsWrite { volume, .. }
       | RequestBody::FsWriteStaged { volume, .. }
       | RequestBody::FsRemove { volume, .. }
@@ -1393,6 +1427,7 @@ impl RequestBody {
         | RequestBody::CreateWork { .. }
         | RequestBody::Edit { .. }
         | RequestBody::EditStaged { .. }
+        | RequestBody::EditSubmit { .. }
         | RequestBody::Declare { .. }
         | RequestBody::Submit { .. }
         | RequestBody::Rebase { .. }

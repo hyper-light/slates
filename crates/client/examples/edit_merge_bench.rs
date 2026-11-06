@@ -116,6 +116,9 @@ enum Form {
   Identical,
   Conflict,
   Rebase,
+  /// `accept` as one request (A-225): `Client::edit_and_submit`, the edit and the submit in one round trip, timed as
+  /// the submit with no edit of its own (`--form accept_one`).
+  AcceptOne,
 }
 
 impl Form {
@@ -126,6 +129,15 @@ impl Form {
     Form::Conflict,
     Form::Rebase,
   ];
+  /// Every form `--form` may name: the default ones, and `accept_one` (A-225).
+  const NAMED: [Form; 6] = [
+    Form::Accept,
+    Form::Ranged,
+    Form::Identical,
+    Form::Conflict,
+    Form::Rebase,
+    Form::AcceptOne,
+  ];
 
   fn key(self) -> &'static str {
     match self {
@@ -134,6 +146,7 @@ impl Form {
       Form::Identical => "identical",
       Form::Conflict => "conflict",
       Form::Rebase => "rebase",
+      Form::AcceptOne => "accept_one",
     }
   }
 }
@@ -334,6 +347,27 @@ impl Fixture {
           edit: ns(edited - started),
           submit: ns(done - edited),
           edit_request,
+          submit_request,
+        }
+      }
+      Form::AcceptOne => {
+        let bytes = fresh_bytes(self.next_stamp());
+        let leader = self.leader;
+        let started = Instant::now();
+        let answer = self
+          .client
+          .edit_and_submit((leader, &path), 0, EDIT_BYTES as u64, &bytes, &[])
+          .unwrap();
+        let done = Instant::now();
+        let submit_request = self.client.last_request().sequence;
+        self.expect_accept(answer, "an edit and submit based on the head");
+        self.model_overwrite(&path, 0, &bytes);
+        self.check(&path);
+        // One request: sequence 0 for the edit, which no request carries, so its spans are the submit's alone.
+        Sample {
+          edit: 0,
+          submit: ns(done - started),
+          edit_request: 0,
           submit_request,
         }
       }
@@ -846,12 +880,14 @@ impl Selection {
         ),
         "--form" => {
           let name = args.next().expect("--form takes a name");
-          if let Some(form) = Form::ALL.into_iter().find(|form| form.key() == name) {
+          if let Some(form) = Form::NAMED.into_iter().find(|form| form.key() == name) {
             selection.forms.push(form);
           } else if let Some(form) = Growth::ALL.into_iter().find(|form| form.key() == name) {
             selection.growth.push(form);
           } else {
-            panic!("--form is accept, ranged, identical, conflict, rebase, new_file or one_file");
+            panic!(
+              "--form is accept, ranged, identical, conflict, rebase, accept_one, new_file or one_file"
+            );
           }
         }
         other => panic!("unknown argument {other}"),

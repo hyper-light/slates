@@ -3541,6 +3541,7 @@ fn claims_placed_durability(body: &RequestBody) -> bool {
       | RequestBody::Clone { .. }
       | RequestBody::Snapshot { .. }
       | RequestBody::Submit { .. }
+      | RequestBody::EditSubmit { .. }
       | RequestBody::ImageBuild { .. }
       | RequestBody::ImageMerge { .. }
   )
@@ -3712,6 +3713,25 @@ fn dispatch_inner(
     } => edit(state, principal, work, &path, at, delete_len, &bytes),
     RequestBody::Declare { work, op } => declare(state, principal, work, op),
     RequestBody::Submit { work, evidence } => submit(state, principal, work, evidence),
+    RequestBody::EditSubmit {
+      work,
+      path,
+      at,
+      delete_len,
+      insert,
+      evidence,
+    } => edit_and_submit(
+      state,
+      principal,
+      work,
+      Splice {
+        path: &path,
+        at,
+        delete_len,
+        insert,
+      },
+      evidence,
+    ),
     RequestBody::Rebase { work } => rebase(state, principal, work),
     RequestBody::Advance {
       attachment,
@@ -5490,6 +5510,55 @@ fn fs_write_staged(
       mode,
     },
   )
+}
+
+/// The splice an [`edit_and_submit`] makes before it submits: `edit`'s arguments, with the bytes inline or staged.
+struct Splice<'a> {
+  /// The file.
+  path: &'a str,
+  /// The offset.
+  at: u64,
+  /// Bytes removed at `at`.
+  delete_len: u64,
+  /// Bytes inserted at `at`.
+  insert: slates_ipc::protocol::EditBytes,
+}
+
+/// `edit` and then `submit`, as one request (§4.16 "Edit and submit in one request", A-225): the edit exactly as
+/// [`edit`] (or [`edit_staged`]) makes it and, if it is accepted, the submit exactly as [`submit`] makes it. Both run in
+/// the request's one durable step under its one completion record (`run_recorded`), so a restart replays both or
+/// neither. The edit's refusal is the answer when the edit is refused, and nothing is submitted, as a client that saw
+/// `edit` refused would not submit; otherwise the answer is the submit's, verdict, windows and refusals alike.
+fn edit_and_submit(
+  state: &mut ShardState,
+  principal: &Principal,
+  work: VolumeId,
+  splice: Splice<'_>,
+  evidence: Vec<[u8; 32]>,
+) -> ReplyBody {
+  let edited = match splice.insert {
+    slates_ipc::protocol::EditBytes::Inline { bytes } => edit(
+      state,
+      principal,
+      work,
+      splice.path,
+      splice.at,
+      splice.delete_len,
+      &bytes,
+    ),
+    slates_ipc::protocol::EditBytes::Staged { token } => edit_staged(
+      state,
+      principal,
+      (work, token),
+      splice.path,
+      splice.at,
+      splice.delete_len,
+    ),
+  };
+  match edited {
+    ReplyBody::Edited => submit(state, principal, work, evidence),
+    refused_edit => refused_edit,
+  }
 }
 
 fn edit_staged(

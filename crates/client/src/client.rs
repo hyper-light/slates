@@ -3428,6 +3428,50 @@ impl Client {
     }
   }
 
+  /// Edits a work volume and submits it, in one request (§4.16, A-225): exactly [`Client::edit`] and then, when the
+  /// edit is accepted, [`Client::submit_with_evidence`], with one round trip in place of two. The daemon runs both in
+  /// one durable step under one completion record, so a retry, across a restart too, answers what the first attempt
+  /// did. An edit's refusal is returned as `edit` returns it, and nothing is submitted; otherwise the submit's verdict,
+  /// windows or refusal. Bytes too large for one request are staged on the work's owner first, as `edit` stages them.
+  pub fn edit_and_submit(
+    &mut self,
+    (work, path): (VolumeId, &str),
+    at: u64,
+    delete_len: u64,
+    bytes: &[u8],
+    evidence: &[[u8; 32]],
+  ) -> Result<Submitted, ClientError> {
+    let request = |insert| RequestBody::EditSubmit {
+      work,
+      path: path.to_owned(),
+      at,
+      delete_len,
+      insert,
+      evidence: evidence.to_vec(),
+    };
+    let inline = request(slates_ipc::protocol::EditBytes::Inline {
+      bytes: bytes.to_vec(),
+    });
+    let request = if slates_ipc::protocol::fits(self.end.region(), &inline) {
+      inline
+    } else {
+      let token = self.stage(work, bytes)?;
+      request(slates_ipc::protocol::EditBytes::Staged { token })
+    };
+    match self.call(&request)? {
+      ReplyBody::Submitted {
+        version: Some(v), ..
+      } => Ok(Submitted::Accepted(v)),
+      ReplyBody::Submitted {
+        version: None,
+        conflicts,
+      } => Ok(Submitted::Conflict(conflicts)),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "edit_and_submit",
+      }),
+    }
+  }
+
   /// Rebases a work volume onto its green's head (§4.16): its pending operations are mapped forward,
   /// moving the work's base without committing to the green — the head version it now sits on, or the
   /// conflict windows to resolve first.
