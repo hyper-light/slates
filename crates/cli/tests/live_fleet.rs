@@ -1419,3 +1419,469 @@ fn a_successor_that_holds_no_copy_still_takes_a_live_volume_over() {
     "the successor, which held no copy, served every acknowledged write: {counters:?}"
   );
 }
+
+// ── Every transport's durability claim on a live volume (A-200, AC-8.3): FUSE `fsync` and the NFS stable write and
+// `COMMIT` wait above; each other transport whose reply tells its client the data is durable is held to the same rule
+// here. With both candidates' processes stopped, the claim fails (an errno, a refusal), never succeeds; healthy and once
+// they resume, it succeeds.
+
+/// Format: the environment variables that make this test binary the program `slates shards` runs as a Shards fs device:
+/// its role and the descriptor number its stream end arrives at.
+const SHARDS_ROLE: &str = "SLATES_LIVE_TEST_SHARDS_ROLE";
+/// Format: see [`SHARDS_ROLE`].
+const SHARDS_ROLE_FD: &str = "SLATES_LIVE_TEST_SHARDS_FD";
+/// Shape: the descriptor the device is handed its end at, past the standard three.
+const SHARDS_FD: &str = "7";
+/// Format: this flow's test name, which the re-invoked binary is told to run (`--exact`), so the run plays the device.
+const SHARDS_FSYNC_TEST: &str =
+  "a_shards_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it";
+/// Format: the tag before each `FSYNC` the device reports: its phase, its errno and how long it took in microseconds.
+/// The re-invoked test binary prints libtest's banner first, so the tag is looked for anywhere in a line.
+const FSYNC_TAG: &str = "live-shards-fsync: ";
+/// Format: the tag the device prints once it waits for the test's next line on its standard input.
+const READY_TAG: &str = "live-shards-ready";
+/// Format: the FUSE protocol a guest kernel offers (7.31) and the node id of the attachment's root.
+const FUSE_MAJOR: u32 = 7;
+/// Format: see [`FUSE_MAJOR`].
+const FUSE_MINOR: u32 = 31;
+/// Format: see [`FUSE_MAJOR`].
+const ROOT_NODE: u64 = 1;
+/// Format: `O_RDWR`.
+const READ_WRITE: u32 = 2;
+/// Shape: the read-ahead the device offers at INIT (a Linux guest's default, 128 KiB).
+const READAHEAD: u32 = 128 << 10;
+
+/// Shards' fs device as the probe plays it over its stream end: one request at a time, as Shards' VMM forwards them.
+struct ShardsDevice {
+  stream: std::os::unix::net::UnixStream,
+  unique: u64,
+}
+
+impl ShardsDevice {
+  /// One request framed as Shards frames it (a length word, then the FUSE request), and its reply frame.
+  fn ask(&mut self, opcode: slates_bridge_fuse::abi::Opcode, node: u64, body: &[u8]) -> Vec<u8> {
+    use std::io::{Read, Write};
+    self.unique += 1;
+    let total = slates_bridge_fuse::abi::IN_HEADER_LEN + body.len();
+    let length = u32::try_from(total).unwrap().to_le_bytes();
+    let mut request = vec![0u8; total];
+    request[0..4].copy_from_slice(&length);
+    request[4..8].copy_from_slice(&opcode.to_wire().to_le_bytes());
+    request[8..16].copy_from_slice(&self.unique.to_le_bytes());
+    request[16..24].copy_from_slice(&node.to_le_bytes());
+    request[slates_bridge_fuse::abi::IN_HEADER_LEN..].copy_from_slice(body);
+    self.stream.write_all(&length).unwrap();
+    self.stream.write_all(&request).unwrap();
+    let mut word = [0u8; 4];
+    self.stream.read_exact(&mut word).unwrap();
+    let mut reply = vec![0u8; usize::try_from(u32::from_le_bytes(word)).unwrap()];
+    self.stream.read_exact(&mut reply).unwrap();
+    reply
+  }
+
+  /// A `WRITE` of `data` at `offset` through `handle`, then an `FSYNC` of it: the `FSYNC`'s errno and its time.
+  fn write_and_fsync(
+    &mut self,
+    (node, handle): (u64, u64),
+    offset: u64,
+    data: &[u8],
+  ) -> (i32, Duration) {
+    use slates_bridge_fuse::abi::Opcode;
+    let mut write = handle.to_le_bytes().to_vec();
+    write.extend_from_slice(&offset.to_le_bytes());
+    write.extend_from_slice(&u32::try_from(data.len()).unwrap().to_le_bytes());
+    write.extend_from_slice(&[0u8; 20]);
+    write.extend_from_slice(data);
+    assert_eq!(
+      shards_errno(&self.ask(Opcode::Write, node, &write)),
+      0,
+      "WRITE"
+    );
+    self.fsync((node, handle))
+  }
+
+  /// An `FSYNC` of `handle`: its errno and its time.
+  fn fsync(&mut self, (node, handle): (u64, u64)) -> (i32, Duration) {
+    let mut fsync = handle.to_le_bytes().to_vec();
+    fsync.extend_from_slice(&[0u8; 8]);
+    let began = Instant::now();
+    let reply = self.ask(slates_bridge_fuse::abi::Opcode::FSync, node, &fsync);
+    (shards_errno(&reply), began.elapsed())
+  }
+}
+
+fn shards_errno(reply: &[u8]) -> i32 {
+  -i32::from_le_bytes(reply[4..8].try_into().unwrap())
+}
+
+fn shards_word_at(bytes: &[u8], at: usize) -> u64 {
+  u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+}
+
+/// The device's side of [`a_shards_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it`]: mounts the
+/// attachment over its end, opens `/file-0` for writing, then writes and syncs once healthy, once after the test's first
+/// line (the candidates stopped) and syncs once more after its second (the candidates resumed), printing each `FSYNC`.
+fn shards_fsyncer() {
+  use slates_bridge_fuse::abi::{OUT_HEADER_LEN, Opcode};
+  use std::io::{BufRead, Write};
+  use std::os::fd::FromRawFd;
+  let number: i32 = std::env::var(SHARDS_ROLE_FD).unwrap().parse().unwrap();
+  // SAFETY: `slates shards` placed the stream end at this number before the exec; nothing in this process opened it,
+  // so this is its one owner.
+  let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(number) };
+  stream.set_read_timeout(Some(FLEET_WAIT)).unwrap();
+  let mut device = ShardsDevice { stream, unique: 0 };
+  let mut init = Vec::new();
+  for word in [FUSE_MAJOR, FUSE_MINOR, READAHEAD, 0] {
+    init.extend_from_slice(&word.to_le_bytes());
+  }
+  assert_eq!(shards_errno(&device.ask(Opcode::Init, 0, &init)), 0, "INIT");
+  let found = device.ask(Opcode::Lookup, ROOT_NODE, b"file-0\0");
+  assert_eq!(shards_errno(&found), 0, "LOOKUP");
+  let node = shards_word_at(&found, OUT_HEADER_LEN);
+  let mut open = READ_WRITE.to_le_bytes().to_vec();
+  open.extend_from_slice(&0u32.to_le_bytes());
+  let opened = device.ask(Opcode::Open, node, &open);
+  assert_eq!(shards_errno(&opened), 0, "OPEN");
+  let file = (node, shards_word_at(&opened, OUT_HEADER_LEN));
+  let report = |phase: &str, (errno, took): (i32, Duration)| {
+    println!("{FSYNC_TAG}{phase} {errno} {}", took.as_micros());
+    std::io::stdout().flush().unwrap();
+  };
+  report(
+    "healthy",
+    device.write_and_fsync(file, 0, b"held by a candidate"),
+  );
+  let mut line = String::new();
+  println!("{READY_TAG}");
+  std::io::stdout().flush().unwrap();
+  std::io::stdin().lock().read_line(&mut line).unwrap();
+  report(
+    "alone",
+    device.write_and_fsync(file, 19, b", then by no one"),
+  );
+  println!("{READY_TAG}");
+  std::io::stdout().flush().unwrap();
+  std::io::stdin().lock().read_line(&mut line).unwrap();
+  report("resumed", device.fsync(file));
+}
+
+/// Reads `lines` until one holds `tag`: the rest of that line after the tag.
+fn line_after(lines: &mut impl Iterator<Item = std::io::Result<String>>, tag: &str) -> String {
+  for line in lines {
+    let line = line.unwrap();
+    if let Some(at) = line.find(tag) {
+      return line[at + tag.len()..].to_owned();
+    }
+  }
+  panic!("the device ended before printing {tag:?}");
+}
+
+/// An `FSYNC` report's errno and time.
+fn fsync_report(text: &str, phase: &str) -> (i32, Duration) {
+  let mut words = text.split_whitespace();
+  assert_eq!(words.next(), Some(phase), "{text}");
+  let errno = words.next().unwrap().parse().unwrap();
+  let micros = words.next().unwrap().parse().unwrap();
+  (errno, Duration::from_micros(micros))
+}
+
+/// A-200 over the Shards route (§4.6, A-161): a Shards fs device's `FSYNC` is its guest's `fsync`. Do: on a live
+/// volume, run `slates shards ID --fd 7 -- <this test binary>` playing the device; write and `FSYNC` through it once
+/// healthy, once with both candidates' processes stopped (SIGSTOP), and once more after they resume. Expect: healthy,
+/// `0`; stopped, `EIO` after the liveness budget (never `0`, which claimed what no candidate held); resumed, `0`.
+#[test]
+fn a_shards_fsync_on_a_live_volume_answers_only_once_a_candidate_holds_it() {
+  use std::io::{BufRead, Write};
+  if std::env::var_os(SHARDS_ROLE).is_some() {
+    shards_fsyncer();
+    return;
+  }
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping Shards fsync flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-shards");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = fleet.instances[owner_index].clone();
+  let id = create_live_volume(&owner, "shards-fsynced");
+  write_files(&owner, &id, 0..1);
+  let mut device = slates()
+    .args(["--instance", &owner, "shards", &id, "--fd", SHARDS_FD, "--"])
+    .arg(std::env::current_exe().unwrap())
+    .args(["--exact", SHARDS_FSYNC_TEST, "--nocapture"])
+    .env(SHARDS_ROLE, "fsyncer")
+    .env(SHARDS_ROLE_FD, SHARDS_FD)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let mut input = device.stdin.take().unwrap();
+  let mut lines = std::io::BufReader::new(device.stdout.take().unwrap()).lines();
+  let healthy = fsync_report(&line_after(&mut lines, FSYNC_TAG), "healthy");
+  line_after(&mut lines, READY_TAG);
+  let candidates: Vec<usize> = (0..fleet.daemons.len())
+    .filter(|index| *index != owner_index)
+    .collect();
+  for index in &candidates {
+    signal(&fleet.daemons[*index], rustix::process::Signal::STOP);
+  }
+  writeln!(input).unwrap();
+  let alone = fsync_report(&line_after(&mut lines, FSYNC_TAG), "alone");
+  line_after(&mut lines, READY_TAG);
+  for index in &candidates {
+    signal(&fleet.daemons[*index], rustix::process::Signal::CONT);
+  }
+  writeln!(input).unwrap();
+  let resumed = fsync_report(&line_after(&mut lines, FSYNC_TAG), "resumed");
+  drop(input);
+  let ended = device.wait().unwrap();
+  let counters = live_counters(&owner);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!(
+    "live shards fsync: healthy {healthy:?}; candidates stopped {alone:?}; resumed {resumed:?}; device {ended:?}; \
+     owner's live counters {counters:?}"
+  );
+  assert_eq!(healthy.0, 0, "an FSYNC a candidate holds succeeds");
+  assert_eq!(
+    alone.0,
+    rustix::io::Errno::IO.raw_os_error(),
+    "an FSYNC no candidate can hold fails EIO, not success, after {:?}",
+    alone.1
+  );
+  assert_eq!(resumed.0, 0, "once the candidates are back, FSYNC succeeds");
+}
+
+/// The volume id `slates` prints (32 hex digits) as the client's id.
+fn volume_id_of(text: &str) -> slates_ipc::protocol::VolumeId {
+  let mut bytes = [0u8; 16];
+  for (at, byte) in bytes.iter_mut().enumerate() {
+    *byte = u8::from_str_radix(&text[at * 2..at * 2 + 2], 16).unwrap();
+  }
+  slates_ipc::protocol::VolumeId { bytes }
+}
+
+/// A client of `instance` under the deadlines a client derives from the daemon's budgets.
+fn live_client(instance: &str) -> slates_client::Client {
+  let deadlines = slates_client::Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get();
+  slates_client::Client::connect(instance, deadlines).unwrap()
+}
+
+/// A-200 for a writable direct map (§4.6, A-186): `MapSync` answers `MapSynced` once the stores are written into the
+/// file and published, which on a live volume is a claim that `f` candidates hold them, as every other verb that changes
+/// the volume claims (`live_ship::defer`). Do: map `/file-0` of a live volume for writing through the client library,
+/// store and sync once healthy; stop both candidates' processes, store and sync again; resume them. Expect: healthy,
+/// `MapSynced`; stopped, no answer while no candidate can hold the stores (the writer waits, never a false success),
+/// and the owner's log not durable at its head when it does answer; resumed, the waiting sync answers `MapSynced` and the
+/// log is durable at its head.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_writable_maps_sync_on_a_live_volume_answers_only_once_a_candidate_holds_it() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping map sync flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-map");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = fleet.instances[owner_index].clone();
+  let id = create_live_volume(&owner, "map-synced");
+  write_files(&owner, &id, 0..1);
+  let volume = volume_id_of(&id);
+  let mut client = live_client(&owner);
+  let attachment = client
+    .attach(volume, None, slates_ipc::protocol::Intent::Write)
+    .unwrap()
+    .attachment;
+  let mapped = client
+    .map_write(
+      (volume, attachment),
+      "/file-0",
+      slates_client::page_bytes().unwrap(),
+    )
+    .unwrap();
+  mapped.write_at(0, b"HELD").unwrap();
+  let healthy = client.map_sync(&mapped);
+  let candidates: Vec<usize> = (0..fleet.daemons.len())
+    .filter(|index| *index != owner_index)
+    .collect();
+  for index in &candidates {
+    signal(&fleet.daemons[*index], rustix::process::Signal::STOP);
+  }
+  mapped.write_at(0, b"LONE").unwrap();
+  // Three liveness budgets: well past the one a transport's reply waits before it answers "not durable".
+  let quiet = Duration::from_nanos(3 * slates_server::daemon::LIVENESS_BUDGET_NS);
+  let (synced_tx, synced_rx) = std::sync::mpsc::channel();
+  let (alone, after_quiet, resumed, at_resume) = std::thread::scope(|scope| {
+    let mapped = &mapped;
+    let client = &mut client;
+    scope.spawn(move || {
+      let began = Instant::now();
+      let synced = client.map_sync(mapped);
+      let _ = synced_tx.send((synced, began.elapsed()));
+    });
+    let alone = synced_rx.recv_timeout(quiet).ok();
+    let after_quiet = live_line(&owner, "shipping", &id);
+    for index in &candidates {
+      signal(&fleet.daemons[*index], rustix::process::Signal::CONT);
+    }
+    let resumed = alone
+      .is_none()
+      .then(|| synced_rx.recv_timeout(FLEET_WAIT).ok())
+      .flatten();
+    (
+      alone,
+      after_quiet,
+      resumed,
+      live_line(&owner, "shipping", &id),
+    )
+  });
+  let counters = live_counters(&owner);
+  drop(mapped);
+  drop(client);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!(
+    "live map sync: healthy {healthy:?}; candidates stopped {alone:?} (log {after_quiet:?}); resumed {resumed:?} \
+     (log {at_resume:?}); owner's live counters {counters:?}"
+  );
+  assert!(
+    healthy.is_ok(),
+    "a sync a candidate holds succeeds: {healthy:?}"
+  );
+  assert!(
+    alone.is_none(),
+    "a sync no candidate can hold is not answered while the candidates are stopped: {alone:?}, log {after_quiet:?}"
+  );
+  let (resumed, _) = resumed.expect("the waiting sync answers once the candidates resume");
+  assert!(resumed.is_ok(), "and answers MapSynced: {resumed:?}");
+}
+
+/// The `id` of a JSON reply.
+fn json_id(json: &str) -> String {
+  let value: serde_json::Value = serde_json::from_str(json).unwrap();
+  value["id"].as_str().unwrap().to_owned()
+}
+
+/// A-200 for a green's checkout (§4.16, A-201): `checkout` writes the green's head into its base volume and answers
+/// `CheckedOut` once it is published, which on a live-shipped base is a claim that `f` candidates hold it. Do: overlay a
+/// project directory as a live volume, green it at a snapshot, accept one increment, attach the volume for writing; stop
+/// both candidates' processes and check the head out; resume them. Expect: no answer while no candidate can hold the
+/// checkout's writes (never `CheckedOut` with nothing durable), then `CheckedOut` at version 1 once they resume.
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn a_checkout_into_a_live_volume_answers_only_once_a_candidate_holds_it() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping checkout flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-checkout");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = fleet.instances[owner_index].clone();
+  let project = format!("{}/project", fleet.scratch.path);
+  std::fs::create_dir_all(format!("{project}/src")).unwrap();
+  std::fs::write(format!("{project}/src/one.txt"), "one: original line").unwrap();
+  let volume = json_id(&run_ready(
+    &owner,
+    &[
+      "volume",
+      "create",
+      "project",
+      "--dynamic",
+      "64MiB",
+      "--base",
+      &project,
+      "--json",
+    ],
+  ));
+  run_ready(&owner, &["base", "pin", &volume]);
+  let (code, _, err) = run(&owner, &["live-ship", &volume]);
+  assert_eq!(code, 0, "live-ship: {err}");
+  let snapshot: serde_json::Value = serde_json::from_str(&run_ready(
+    &owner,
+    &["volume", "snapshot", &volume, "--json"],
+  ))
+  .unwrap();
+  let snapshot = snapshot["snapshot"].to_string();
+  let green = json_id(&run_ready(
+    &owner,
+    &[
+      "green",
+      "project-green",
+      "--base",
+      &volume,
+      "--snapshot",
+      &snapshot,
+      "--json",
+    ],
+  ));
+  let work = json_id(&run_ready(&owner, &["work", &green, "first", "--json"]));
+  run_ready(&owner, &["edit", &work, "src/one.txt", "0", "3", "ONE"]);
+  assert_eq!(run_ready(&owner, &["submit", &work]).trim(), "accepted: 1");
+  let attached: serde_json::Value = serde_json::from_str(&run_ready(
+    &owner,
+    &["attach", &volume, "--write", "--json"],
+  ))
+  .unwrap();
+  let attachment = attached["attachment"].to_string();
+  let candidates: Vec<usize> = (0..fleet.daemons.len())
+    .filter(|index| *index != owner_index)
+    .collect();
+  for index in &candidates {
+    signal(&fleet.daemons[*index], rustix::process::Signal::STOP);
+  }
+  let quiet = Duration::from_nanos(3 * slates_server::daemon::LIVENESS_BUDGET_NS);
+  let (done_tx, done_rx) = std::sync::mpsc::channel();
+  let (alone, resumed) = std::thread::scope(|scope| {
+    let (owner, green, volume, attachment, snapshot) =
+      (&owner, &green, &volume, &attachment, &snapshot);
+    scope.spawn(move || {
+      let checked = run(
+        owner,
+        &[
+          "checkout",
+          green,
+          volume,
+          attachment,
+          "--snapshot",
+          snapshot,
+          "--json",
+        ],
+      );
+      let _ = done_tx.send(checked);
+    });
+    let alone = done_rx.recv_timeout(quiet).ok();
+    for index in &candidates {
+      signal(&fleet.daemons[*index], rustix::process::Signal::CONT);
+    }
+    let resumed = alone
+      .is_none()
+      .then(|| done_rx.recv_timeout(FLEET_WAIT).ok())
+      .flatten();
+    (alone, resumed)
+  });
+  let counters = live_counters(&owner);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!(
+    "live checkout: candidates stopped {alone:?}; resumed {resumed:?}; owner's live counters {counters:?}"
+  );
+  assert!(
+    alone.is_none(),
+    "a checkout no candidate can hold is not answered while the candidates are stopped: {alone:?}"
+  );
+  let (code, out, err) = resumed.expect("the waiting checkout answers once the candidates resume");
+  assert_eq!(code, 0, "checkout: {err}");
+  let checkout: serde_json::Value = serde_json::from_str(&out).unwrap();
+  assert_eq!(checkout["version"], 1, "{out}");
+}
