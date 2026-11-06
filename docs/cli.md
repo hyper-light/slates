@@ -84,9 +84,12 @@ account may issue bootstrap; an enrolled consumer or forwarded fleet request can
 the request to the current daemon member id, so automatic retries cannot bootstrap a replacement.
 
 Startup alone serves discovery and status but refuses writes until initialized and admitted.
-Every daemon restart currently loses its Raft state and uses a fresh member id. It joins through a
-surviving voting quorum. A standalone restart loses the sole quorum, requiring explicit new-group
-creation; that does not restore a lost consensus history. See [AUD-07](bugs/2026-09-14-raft-voter-state-loss.md).
+A daemon restarted under its anchor keeps its Raft state and its member id: the anchor holds both groups
+and the voter identity, retained before any consensus reply escapes, so it rejoins without bootstrap.
+A start that lost the anchor's RAM (the anchor itself died, or the pod was replaced) has no Raft state
+and uses a fresh member id. It joins through a surviving voting quorum. A standalone node that lost
+its anchor loses the sole quorum, requiring explicit new-group creation; that does not restore a lost
+consensus history. See [AUD-07](bugs/2026-09-14-raft-voter-state-loss.md) and §4.8 "Consensus lifetime".
 Never add bootstrap to a pod's recurring startup command or readiness probe.
 
 ## Deploying a fleet
