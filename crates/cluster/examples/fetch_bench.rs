@@ -233,7 +233,7 @@ struct Room {
 
 impl Room {
   fn new() -> Room {
-    let page = rustix::param::page_size();
+    let page = usize::try_from(slates_machine::facts::Facts::page_bytes()).unwrap();
     let bytes = (chunks() * CHUNK_BYTES * 2).next_power_of_two();
     let mut arena = ChunkArena::new(page);
     arena
