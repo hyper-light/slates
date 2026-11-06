@@ -4264,12 +4264,8 @@ pub(crate) fn find(
   let id = to_db_volume(volume);
   let handle = *state.by_id.get(&id).ok_or_else(|| {
     // A volume recovery could not rebuild is listed, so it answers why, never `NotFound`.
-    Box::new(refused(match state.unrecovered.get(&id) {
-      Some(cause) => Refusal::NotRecovered {
-        cause: cause.clone(),
-      },
-      None => absent(state, volume),
-    }))
+    // RED-CHECK (diag only): a listed volume with no slot answers as before the fix.
+    Box::new(refused(absent(state, volume)))
   })?;
   let record = state
     .db
