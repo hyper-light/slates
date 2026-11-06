@@ -166,9 +166,14 @@ pub(crate) fn measure_on(
     }
   }
   let count = capture::workers_by_sign_test(&medians);
+  let rounds = u32::try_from(ROUNDS).unwrap_or(u32::MAX);
+  let needed = capture::sign_test_wins_needed(rounds)
+    .map_or_else(|| "none".to_owned(), |wins| wins.to_string());
   slates_machine::log_line!(
     "slates-winfsp: receive workers = {count}: median open-and-close of each round, in ns, by waiting workers from one: \
-     {medians:?}; more workers only where the paired rounds' sign test rejects no gain; probe took {} ms",
+     {medians:?}; more workers only where the paired rounds' sign test rejects no gain at 1 in {}, which at {rounds} \
+     rounds needs {needed} wins of {rounds}; probe took {} ms",
+    capture::SIGN_TEST_ONE_IN,
     started.elapsed().as_millis()
   );
   Ok(Some((count, medians)))

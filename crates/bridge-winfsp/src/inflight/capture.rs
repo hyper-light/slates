@@ -733,10 +733,15 @@ fn saved_response(bytes: &[u8]) -> Result<Option<&[u8]>, Refusal> {
   Ok(Some(response))
 }
 
-/// Shape: the significance of the sign test that takes a larger worker count ([`workers_by_sign_test`]): a machine where
-/// more workers gain nothing takes them in at most one probe in this many. At the probe's nine paired rounds only nine
-/// wins of nine pass (p = 1/512); eight of nine is p = 10/512, about 1 in 51.
-const SIGN_TEST_ONE_IN: u64 = 100;
+/// The significance level of the sign test that takes a larger worker count ([`workers_by_sign_test`]). It is a policy,
+/// not a measurement, as `DurabilityBound`'s accepted loss is: how often a machine where more workers gain nothing may
+/// take them anyway. A false second worker is not free: it cost about 21 µs an open-and-close on CI's x86_64 runner in
+/// both forms (diagnostics run 42145658324), so the level guards against taking it. What nine paired rounds can show:
+/// only nine wins of nine pass at this level (p = 1/512), and eight of nine does not (p = 10/512, about 1 in 51), so a
+/// gain must hold in every pair to be taken. What they cannot show is a gain smaller than the rounds' own spread, or one
+/// confined to some rounds; those keep one worker, the safe side.
+/// Shape: a policy of at most one false take in this many probes, the level stated above.
+pub const SIGN_TEST_ONE_IN: u64 = 100;
 
 /// How many receive workers to run, from the probe's medians (A-219): `medians[n]` holds each round's median with `n + 1`
 /// workers waiting, round `r` of every count measured back to back, the order rotating each round, so pairs share the
@@ -776,12 +781,18 @@ pub fn workers_by_sign_test(medians: &[Vec<u64>]) -> usize {
   chosen
 }
 
+/// The fewest wins of `rounds` untied pairs that pass the sign test at 1/[`SIGN_TEST_ONE_IN`], for the probe's log
+/// line; `None` when no count of wins can pass.
+pub fn sign_test_wins_needed(rounds: u32) -> Option<u32> {
+  (0..=rounds).find(|wins| sign_test_passes(*wins, rounds))
+}
+
 /// Whether `wins` of `untied` pairs reject "more workers gain nothing" at 1/[`SIGN_TEST_ONE_IN`]: the binomial tail
 /// `sum over i >= wins of C(untied, i)`, against `2^untied / SIGN_TEST_ONE_IN`. No pairs, or more than a u64 holds, never pass.
 fn sign_test_passes(wins: u32, untied: u32) -> bool {
   let Some(total) = 1u64
     .checked_shl(untied)
-    .filter(|_| untied > 0 && untied < 63)
+    .filter(|_| untied > 0 && untied < u64::BITS - 1)
   else {
     return false;
   };
@@ -1585,5 +1596,17 @@ mod tests {
       assert_eq!(workers_by_sign_test(medians), 1, "{medians:?}");
     }
     assert_eq!(workers_by_sign_test(&[vec![700, 705]]), 1);
+  }
+
+  /// A-219. Do: ask how many wins the sign test needs at the probe's nine rounds and around it. Expect: all nine of nine
+  /// (p = 1/512; eight of nine is 10/512, over 1 in 100); ten of ten at ten rounds, since nine of ten is 11/1024; seven of
+  /// seven at seven; and none at six, where even six of six is 1/64.
+  #[test]
+  fn the_sign_test_needs_every_pair_at_nine_rounds() {
+    assert_eq!(sign_test_wins_needed(9), Some(9));
+    assert_eq!(sign_test_wins_needed(10), Some(10));
+    assert_eq!(sign_test_wins_needed(7), Some(7));
+    assert_eq!(sign_test_wins_needed(6), None);
+    assert_eq!(sign_test_wins_needed(0), None);
   }
 }
