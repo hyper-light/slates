@@ -188,29 +188,73 @@ pub(crate) fn defer(state: &mut ShardState, task: impl Future<Output = ()> + 'st
 /// completion record — and returns the reply with where it goes.
 pub(crate) fn complete(
   state: &mut ShardState,
-  (origin, id): (u64, RequestId),
+  request: (u64, RequestId),
   produce: impl FnOnce(&mut ShardState) -> ReplyBody,
 ) -> (ReplyBody, Option<ReplyRoute>) {
-  let route = state
+  let route = take_route(state, request);
+  let (reply, _) = commit_outcome(state, request, None, produce);
+  (reply, route)
+}
+
+/// Commits a task's outcome that changed `volume` as [`complete`] does, except on a live-shipped volume (A-200): there
+/// the effects commit now, but the completion is recorded and the reply delivered only once the volume's log is durable
+/// on `f` candidates where the outcome's publication put it, by the deferral a recorded verb on such a volume takes
+/// (`crate::live_ship::defer`, answered by `crate::live_ship::resolve`): `None` then. A refusal, or an outcome on a
+/// volume that need not wait, is completed at once, as [`complete`] completes it.
+pub(crate) fn complete_once_durable(
+  state: &mut ShardState,
+  request: (u64, RequestId),
+  volume: DbVolumeId,
+  produce: impl FnOnce(&mut ShardState) -> ReplyBody,
+) -> Option<(ReplyBody, Option<ReplyRoute>)> {
+  let route = take_route(state, request);
+  match commit_outcome(state, request, Some(volume), produce) {
+    (reply, Some(target)) => {
+      crate::live_ship::defer(state, (volume, target), request, route, reply)
+        .map(|refusal| (refusal, route))
+    }
+    (reply, None) => Some((reply, route)),
+  }
+}
+
+/// Where the reply of in-flight `request` goes, taken: it is answered once, from here.
+fn take_route(state: &mut ShardState, (origin, id): (u64, RequestId)) -> Option<ReplyRoute> {
+  state
     .image
     .in_flight
     .remove(&(origin, id.client, id.sequence))
-    .flatten();
+    .flatten()
+}
+
+/// One transaction: the outcome's effects (`produce`) and, unless the reply must wait for `live`'s durability, the
+/// request's completion record. The reply, and the log position it waits for when it does.
+fn commit_outcome(
+  state: &mut ShardState,
+  (origin, id): (u64, RequestId),
+  live: Option<DbVolumeId>,
+  produce: impl FnOnce(&mut ShardState) -> ReplyBody,
+) -> (ReplyBody, Option<u64>) {
   state.db.begin();
   let reply = produce(state);
-  let recorded = crate::verbs::record_completion(state, origin, id, reply);
-  let reply = match state.db.commit(&mut state.segment) {
-    Ok(_) => recorded,
+  let target = live
+    .filter(|_| !matches!(reply, ReplyBody::Refused { .. }))
+    .and_then(|volume| crate::live_ship::durable_target(state, volume));
+  let reply = if target.is_some() {
+    reply
+  } else {
+    crate::verbs::record_completion(state, origin, id, reply)
+  };
+  match state.db.commit(&mut state.segment) {
+    Ok(_) => (reply, target),
     Err(e) => {
       // Nothing of the outcome is durable: counted, never recorded as the completion, so a retry runs again. The new
       // volume, whose record rolled back, is torn down with every other effect the rollback left unrecorded.
       let refusal = refusal_of_db(&e);
       state.count(crate::verbs::refusal_name(&refusal), 1);
       crate::verbs::reconcile_unpublished_effects(state);
-      refused(refusal)
+      (refused(refusal), None)
     }
-  };
-  (reply, route)
+  }
 }
 
 /// Hands a task's reply to where its request waits, on its client's shard. A request with no route (a forward from
