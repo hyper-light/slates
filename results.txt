@@ -1,0 +1,91 @@
+runner ubuntu-24.04-arm, 4 CPUs, Fri Nov  6 07:32:59 UTC 2026, commit 9ab73c79
+== liveness quiet round 1 at 07:32:59
+largest beat gap beside 8 spinners: 102.73804ms
+slates daemon: the control shard's beat task ran 599 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 4 steps and 4 polls (3 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 1 timers, waited 1 times, spawned 1 tasks and finished 2; 5 tasks live; its longest poll is 500 ms and its timer overrun 0 ms
+largest beat gap through a half-window block: 100.126728ms
+slates daemon: shard 1 is spinning: 1000 ms of CPU without a step, past the 1000 ms window; the watchdog withholds the beat
+spinning shard: the beat stopped Some(1.007611154s) after the spin began
+largest beat gap through a starved poll: 100.570536ms
+slates daemon: the control shard's beat task ran 1602 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 4 steps and 4 polls (3 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 2 timers, waited 1 times, spawned 1 tasks and finished 2; 5 tasks live; its longest poll is 1503 ms and its timer overrun 0 ms
+slates daemon: shard 1 is wedged: no step and no CPU progress for 1001 ms, past the 1000 ms window; the watchdog withholds the beat
+wedged shard: the block began 301µs in, and the beat stopped 1.006964837s after it
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.98s
+== liveness quiet round 2 at 07:33:52
+largest beat gap beside 8 spinners: 102.204368ms
+slates daemon: the control shard's beat task ran 599 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 4 steps and 4 polls (3 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 1 timers, waited 1 times, spawned 1 tasks and finished 2; 5 tasks live; its longest poll is 500 ms and its timer overrun 0 ms
+largest beat gap through a half-window block: 100.246379ms
+slates daemon: shard 1 is spinning: 1002 ms of CPU without a step, past the 1000 ms window; the watchdog withholds the beat
+spinning shard: the beat stopped Some(1.00693732s) after the spin began
+slates daemon: the control shard's beat task ran 1604 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 4 steps and 4 polls (3 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 2 timers, waited 1 times, spawned 1 tasks and finished 2; 5 tasks live; its longest poll is 1504 ms and its timer overrun 0 ms
+largest beat gap through a starved poll: 100.73847ms
+slates daemon: shard 1 is wedged: no step and no CPU progress for 1002 ms, past the 1000 ms window; the watchdog withholds the beat
+wedged shard: the block began 328µs in, and the beat stopped 1.006650573s after it
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.98s
+== liveness quiet round 3 at 07:34:04
+largest beat gap beside 8 spinners: 102.927893ms
+slates daemon: the control shard's beat task ran 600 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 3 steps and 4 polls (3 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 1 timers, waited 1 times, spawned 1 tasks and finished 2; 5 tasks live; its longest poll is 500 ms and its timer overrun 0 ms
+largest beat gap through a half-window block: 100.222052ms
+slates daemon: shard 1 is spinning: 1001 ms of CPU without a step, past the 1000 ms window; the watchdog withholds the beat
+spinning shard: the beat stopped Some(1.007186336s) after the spin began
+slates daemon: the control shard's beat task ran 1604 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 4 steps and 4 polls (3 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 2 timers, waited 1 times, spawned 1 tasks and finished 2; 5 tasks live; its longest poll is 1505 ms and its timer overrun 0 ms
+largest beat gap through a starved poll: 100.604841ms
+slates daemon: shard 1 is wedged: no step and no CPU progress for 1000 ms, past the 1000 ms window; the watchdog withholds the beat
+wedged shard: the block began 301µs in, and the beat stopped 1.006825101s after it
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.99s
+== liveness busy (two spinners a CPU) round 1 at 07:34:16
+largest beat gap beside 8 spinners: 103.001831ms
+slates daemon: the control shard's beat task ran 507 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 3 steps and 2 polls (1 long in a task, 1 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 1 timers, waited 1 times, spawned 1 tasks and finished 1; 5 tasks live; its longest poll is 502 ms and its timer overrun 0 ms
+largest beat gap through a half-window block: 102.740831ms
+slates daemon: shard 1 is spinning: 1005 ms of CPU without a step, past the 1000 ms window; the watchdog withholds the beat
+spinning shard: the beat stopped Some(2.707941741s) after the spin began
+slates daemon: the control shard's beat task ran 1612 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 4526 steps and 4528 polls (1 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 1 timers, waited 1 times, spawned 1 tasks and finished 2; 5 tasks live; its longest poll is 1510 ms and its timer overrun 0 ms
+largest beat gap through a starved poll: 103.001949ms
+slates daemon: shard 1 is wedged: no step and no CPU progress for 1005 ms, past the 1000 ms window; the watchdog withholds the beat
+wedged shard: the block began 2.771ms in, and the beat stopped 1.009820638s after it
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.38s
+== liveness busy (two spinners a CPU) round 2 at 07:34:31
+largest beat gap beside 8 spinners: 102.996549ms
+slates daemon: the control shard's beat task ran 505 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 3 steps and 2 polls (1 long in a task, 1 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 1 timers, waited 1 times, spawned 1 tasks and finished 1; 5 tasks live; its longest poll is 500 ms and its timer overrun 0 ms
+largest beat gap through a half-window block: 102.936276ms
+slates daemon: shard 1 is spinning: 1002 ms of CPU without a step, past the 1000 ms window; the watchdog withholds the beat
+spinning shard: the beat stopped Some(2.304565866s) after the spin began
+slates daemon: the control shard's beat task ran 1518 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 3 steps and 2 polls (0 long in a task, 0 blocked in the kernel, 0 preempted by the host, 1 unattributed), fired 2 timers, waited 1 times, spawned 1 tasks and finished 1; 5 tasks live; its longest poll is 1513 ms and its timer overrun 0 ms
+largest beat gap through a starved poll: 101.891478ms
+slates daemon: shard 1 is wedged: no step and no CPU progress for 1005 ms, past the 1000 ms window; the watchdog withholds the beat
+wedged shard: the block began 3.964ms in, and the beat stopped 995.543674ms after it
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.06s
+== liveness busy (two spinners a CPU) round 3 at 07:34:45
+largest beat gap beside 8 spinners: 102.930249ms
+slates daemon: the control shard's beat task ran 509 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 282 steps and 284 polls (1 long in a task, 1 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 1 timers, waited 0 times, spawned 1 tasks and finished 1; 5 tasks live; its longest poll is 504 ms and its timer overrun 0 ms
+largest beat gap through a half-window block: 101.998288ms
+slates daemon: shard 1 is spinning: 1004 ms of CPU without a step, past the 1000 ms window; the watchdog withholds the beat
+spinning shard: the beat stopped Some(2.998347452s) after the spin began
+slates daemon: the control shard's beat task ran 1650 ms after its last turn (a near miss against a 1000 ms window; the anchor's beat is the watchdog's now): in the gap the shard ran 7953 steps and 7957 polls (1 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 1 timers, waited 0 times, spawned 2 tasks and finished 2; 5 tasks live; its longest poll is 1546 ms and its timer overrun 0 ms
+largest beat gap through a starved poll: 102.852808ms
+slates daemon: shard 1 is wedged: no step and no CPU progress for 1005 ms, past the 1000 ms window; the watchdog withholds the beat
+wedged shard: the block began 1.745ms in, and the beat stopped 1.001687066s after it
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.67s
+== cargo test --locked -q -p slates-anchor
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 17 passed; 0 failed; 9 ignored; 0 measured; 0 filtered out; finished in 0.31s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-server --test observe
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.15s
+== exit 0
+== cargo test --locked -q -p slates-server --test give_back
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== exit 0
+== cargo test --locked -q -p slates-server --test recovery
+test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 35.97s
+== exit 0
+== cargo test --locked -q -p slates-server --test daemon
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.58s
+== exit 0
+== cargo test --locked -q -p slates-client --test client
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.56s
+== exit 0
+== cargo test --locked -q -p slates-server --test liveness -- --test-threads=1
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.95s
+== exit 0
