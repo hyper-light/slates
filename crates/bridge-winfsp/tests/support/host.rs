@@ -88,6 +88,13 @@ const LANDINGS: usize = 1 << (crate::inflight::capture::MAX_WORKERS + 1);
 const WORKER_RELEASED: u64 = LANDING + LANDINGS as u64;
 /// Format: a private Released marker: the probing role has made its probe volume and is measuring on it.
 const PROBE_VOLUME_MADE: u64 = WORKER_RELEASED + 1;
+/// Format: a private Released marker: the closing server has ended an open on the shard and retains the Close's reply.
+const CLOSE_TAKEN: u64 = PROBE_VOLUME_MADE + 1;
+/// Format: a private Released marker base: the closing successor's recovery, plus how many replayed Cleanups and Closes
+/// the file system refused.
+const CLOSE_REFUSALS: u64 = CLOSE_TAKEN + 1;
+/// Shape: the refusal counts the marker range above carries; a run refusing more is a failure anyway.
+const CLOSE_REFUSAL_RANGE: u64 = 16;
 /// Format: a reader's inherited stop event, as a hex handle value, and the index of its first file.
 const STOP: &str = "SLATES_WINFSP_REQUEST_STOP";
 /// Format: see STOP.
@@ -410,7 +417,7 @@ fn overlap_byte(index: usize) -> u8 {
 }
 
 fn inherited_controls(role: &str) -> (Channel, Option<Inherited>) {
-  if role == "first" || role == "serving" || role == "purger" {
+  if role == "first" || role == "serving" || role == "purger" || role == "closer-first" {
     let value = u64::from_str_radix(&std::env::var(CHANNEL).unwrap(), 16).unwrap();
     (Channel::adopt(inherited_handle(value)), None)
   } else {
@@ -504,7 +511,7 @@ fn serve_mounted(
   cx: &OpContext,
 ) -> ! {
   let mut ready = await_ready(mount);
-  if role == "first" || role == "serving" || role == "purger" {
+  if role == "first" || role == "serving" || role == "purger" || role == "closer-first" {
     channel
       .send(
         &HandleMessage::Hold {
@@ -529,6 +536,9 @@ fn serve_mounted(
         WAIT_MS,
       )
       .unwrap();
+    if role == "closer-successor" {
+      report_close_recovery(channel, mount);
+    }
   }
   let mut names = OpenNames::new();
   let mut recovery_counted = false;
@@ -551,30 +561,48 @@ fn serve_mounted(
       .expect("the fixture's next request");
     count_recovery(role, &request, mount, &mut recovery_counted);
     report_release(role, channel, mount, &mut release_reported);
-    if role == "purger" && matches!(request.op, Op::PurgeOpen { .. }) {
-      channel
-        .send(&HandleMessage::Released { id: PURGE_TAKEN }, WAIT_MS)
-        .unwrap();
-      // Retain the purge's open, its reply sender included, until the parent kills this process.
-      let _retained = request;
-      let answer = channel.recv(WAIT_MS).unwrap();
-      panic!("the purger should have died while retaining the purge's open, got {answer:?}");
-    }
-    if role == "first" && matches!(request.op, Op::Read { .. }) {
-      channel
-        .send(&HandleMessage::Released { id: READ_TAKEN }, WAIT_MS)
-        .unwrap();
-      // Retain the real taken request, including its reply sender, until the parent kills this process.
-      let _retained = request;
-      let answer = channel.recv(WAIT_MS).unwrap();
-      panic!("the first server should have died while retaining its read, got {answer:?}");
-    }
+    let request = retain_if_taken(role, request, channel, bridge, cx, &mut names, &mut ready);
     assert!(
       request
         .serve(bridge, cx, &mut names, &mut ready.ledger)
         .send()
     );
   }
+}
+
+/// The requests a role takes and dies holding, its reply never sent, each told to the parent first: the purger's purge
+/// open, the closing server's Close (ended on the shard first, as a live daemon ends it), the first server's read. Any
+/// other request is handed back to be served.
+fn retain_if_taken(
+  role: &str,
+  request: Request,
+  channel: &Channel,
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  names: &mut OpenNames,
+  ready: &mut Ready,
+) -> Request {
+  let marker = match (role, &request.op) {
+    ("purger", Op::PurgeOpen { .. }) => PURGE_TAKEN,
+    ("closer-first", Op::Release { .. }) => CLOSE_TAKEN,
+    ("first", Op::Read { .. }) => READ_TAKEN,
+    _ => return request,
+  };
+  // Retain the request, its reply sender included, until the parent kills this process. The closing server ends the
+  // open on the shard first, so the successor replays a Close whose open is already ended.
+  let _retained = if marker == CLOSE_TAKEN {
+    (
+      None,
+      Some(request.serve(bridge, cx, names, &mut ready.ledger)),
+    )
+  } else {
+    (Some(request), None)
+  };
+  channel
+    .send(&HandleMessage::Released { id: marker }, WAIT_MS)
+    .unwrap();
+  let answer = channel.recv(WAIT_MS).unwrap();
+  panic!("the {role} server should have died while retaining its request, got {answer:?}");
 }
 
 /// The kill oracle's servers tell the parent when their later worker began serving (A-219), so it can kill after it.
@@ -604,11 +632,46 @@ fn report_release(role: &str, channel: &Channel, mount: &mut MountThread, report
   }
 }
 
+/// The closing successor's recovery, told to the parent: how many replayed Cleanups and Closes were refused.
+fn report_close_recovery(channel: &Channel, mount: &mut MountThread) {
+  let started = Instant::now();
+  let refused = loop {
+    match mount.outcome() {
+      Some(Outcome::Recovered { settled, refused }) => {
+        eprintln!(
+          "WINFSP CLOSE: the successor settled {settled} captured requests, {refused} refused"
+        );
+        assert!(settled > 0, "the successor must settle the captured Close");
+        break refused;
+      }
+      Some(Outcome::Failed(error)) => panic!("a receive worker failed: {error}"),
+      Some(Outcome::Stopped) => panic!("the mount stopped before its recovery was told"),
+      Some(_) => {}
+      None => {
+        assert!(
+          started.elapsed() < WAIT,
+          "the successor's recovery was never told"
+        );
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(POLL);
+      }
+    }
+  };
+  channel
+    .send(
+      &HandleMessage::Released {
+        id: CLOSE_REFUSALS + refused.min(CLOSE_REFUSAL_RANGE - 1),
+      },
+      WAIT_MS,
+    )
+    .unwrap();
+}
+
 fn count_recovery(role: &str, request: &Request, mount: &mut MountThread, counted: &mut bool) {
   if role != "successor" || *counted || !matches!(request.op, Op::Read { .. }) {
     return;
   }
-  let Some(Outcome::Recovered(count)) = mount.outcome() else {
+  let Some(Outcome::Recovered { settled: count, .. }) = mount.outcome() else {
     panic!("a fresh read preceded the captured-request outcome");
   };
   assert!(
@@ -687,6 +750,7 @@ fn cleanup_once(
     },
     reply,
     hint: 0,
+    replayed: false,
   };
   assert!(
     request
@@ -728,6 +792,9 @@ fn request_role() {
   }
   if role == "probing" {
     probing();
+  }
+  if role == "closer" {
+    closer(&drive);
   }
   if role != "reader" && role != "probe" {
     serve(&role, &drive);
@@ -1130,5 +1197,98 @@ fn a_probe_killed_mid_measure_leaves_no_volume() {
   eprintln!(
     "WINFSP PROBE: {made:?} appeared while the probe measured and went within {:?} of its kill",
     started.elapsed()
+  );
+}
+
+/// The closing client: opens the fixed file without the cache, so its Close reaches the server at CloseHandle, reads
+/// it, and closes it. CloseHandle must succeed whatever happened to the daemon meanwhile.
+fn closer(drive: &str) -> ! {
+  let mut file = std::fs::OpenOptions::new()
+    .read(true)
+    .custom_flags(FILE_FLAG_NO_BUFFERING)
+    .open(format!("{drive}\\file"))
+    .unwrap();
+  let mut page = AlignedPage([0; PAGE]);
+  file.read_exact(&mut page.0).unwrap();
+  assert!(page.0.iter().all(|byte| *byte == b'A'));
+  let handle = std::os::windows::io::IntoRawHandle::into_raw_handle(file);
+  // SAFETY: the handle this process just opened and owns, closed once.
+  let closed = unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+  assert_ne!(
+    closed,
+    0,
+    "CloseHandle failed: {}",
+    std::io::Error::last_os_error()
+  );
+  eprintln!("WINFSP CLOSE: the client's CloseHandle succeeded");
+  std::process::exit(ROLE_EXIT);
+}
+
+/// A-198, A-219. Do: a client opens the file uncached and closes it; the serving process ends the open on the shard and
+/// is killed before the Close's reply reaches its worker; a successor takes over and replays the captured Close. Expect:
+/// the client's CloseHandle succeeds, and the successor's recovery settles the Close with no refusal, since the open the
+/// dead daemon already ended is that Close done (it was refused `Stale`, run 42165934408).
+#[test]
+fn a_close_served_before_the_kill_is_answered_done_after_takeover() {
+  if std::env::var_os("WINFSP_TEST_MOUNT").is_none() {
+    eprintln!("SKIP: the replayed-close oracle needs WINFSP_TEST_MOUNT=1 and WinFsp installed");
+    return;
+  }
+  let drive = free_drive();
+  let (anchor, daemon) = channel().unwrap();
+  let inherited = duplicate_inheritable(daemon.raw()).unwrap();
+  let value = format!("{:x}", handle_value(inherited.raw()));
+  let mut scenario = Scenario {
+    servers: Vec::with_capacity(2),
+    held: Some(Held::new(1)),
+    reader: None,
+    probe: None,
+    readers: Vec::new(),
+  };
+  scenario.servers.push(spawn(
+    "closer-first",
+    &drive,
+    &[(OsStr::new(CHANNEL), OsStr::new(&value))],
+    &[inherited.raw()],
+  ));
+  drop(inherited);
+  hold_first_mount(&mut scenario, &anchor);
+  scenario.reader = Some(spawn("closer", &drive, &[], &[]));
+  assert_eq!(
+    anchor.recv(WAIT_MS).unwrap(),
+    Some(HandleMessage::Released { id: CLOSE_TAKEN })
+  );
+  eprintln!("WINFSP CLOSE: the server ended the open and holds the Close's reply; killing it");
+  scenario.servers[0].kill_and_reap();
+  let handoff = scenario.held.as_ref().unwrap().handoff(&daemon).unwrap();
+  scenario.servers.push(spawn(
+    "closer-successor",
+    &drive,
+    &[(OsStr::new(ENV_HANDLES), OsStr::new(handoff.env()))],
+    &handoff.handles(),
+  ));
+  drop(handoff);
+  assert_eq!(
+    anchor.recv(WAIT_MS).unwrap(),
+    Some(HandleMessage::Released {
+      id: SUCCESSOR_READY
+    })
+  );
+  let refused = match anchor.recv(WAIT_MS).unwrap() {
+    Some(HandleMessage::Released { id })
+      if (CLOSE_REFUSALS..CLOSE_REFUSALS + CLOSE_REFUSAL_RANGE).contains(&id) =>
+    {
+      id - CLOSE_REFUSALS
+    }
+    other => panic!("the successor's recovery report, got {other:?}"),
+  };
+  assert_eq!(
+    refused, 0,
+    "the successor refused a replayed Close whose open the dead daemon had already ended"
+  );
+  assert_eq!(
+    scenario.reader.as_mut().unwrap().wait(),
+    Some(ROLE_EXIT),
+    "the client's CloseHandle must succeed across the takeover"
   );
 }

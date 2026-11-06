@@ -45,6 +45,8 @@ thread_local! {
   static CURRENT_HINT: Cell<u64> = const { Cell::new(0) };
   /// Void Cleanup/Close callbacks still carry their typed refusal into this operation's kernel response.
   static TERMINAL_REFUSAL: Cell<i32> = const { Cell::new(0) };
+  /// Set while recovery runs a dead daemon's captured Cleanup or Close again, so the shard can find its effect done.
+  static REPLAYING: Cell<bool> = const { Cell::new(false) };
 }
 
 pub(crate) fn private_path(path: &str) -> Result<Option<crate::purge::PrivatePath>, i32> {
@@ -108,6 +110,11 @@ impl PrivateOpens {
 
 pub(crate) fn current_hint() -> u64 {
   CURRENT_HINT.get()
+}
+
+/// Whether this worker is replaying a dead daemon's captured Cleanup or Close (`crate::host::Request`).
+pub(crate) fn replaying() -> bool {
+  REPLAYING.get()
 }
 
 pub(crate) fn record_terminal_refusal(status: i32) {
@@ -487,6 +494,14 @@ struct Shard<'a> {
   bound: usize,
 }
 
+/// What recovery settled: the captured requests answered, and those of them that were a replayed Cleanup or Close the
+/// file system refused.
+#[derive(Clone, Copy, Default)]
+struct Settled {
+  answered: u64,
+  refused: u64,
+}
+
 /// Settles every request of a dead worker's batch before any worker receives: each address a newer delivery in another
 /// journal holds (`passed`) is passed over, and every other request answered as A-198 settles one (A-219).
 fn settle(
@@ -495,10 +510,10 @@ fn settle(
   passed: &std::collections::BTreeSet<u64>,
   shard: &Shard<'_>,
   owned: &mut Owned,
-) -> Result<u64, WinFspError> {
+) -> Result<Settled, WinFspError> {
   // SAFETY: same owner/worker lifetime as operation; volume control remains owned by the DLL object.
   let control = unsafe { (*file_system).volume_handle };
-  let mut count = 0u64;
+  let mut settled = Settled::default();
   while let Some(request) = batch.next_request().map_err(WinFspError::Capture)? {
     // A newer delivery at this address sits in another worker's journal, so this request is completed (A-219).
     if passed.contains(&request.hint()) {
@@ -507,13 +522,15 @@ fn settle(
         .map_err(WinFspError::Capture)?;
       continue;
     }
-    settle_recovered(file_system, control, batch, &request, shard, owned)?;
+    if settle_recovered(file_system, control, batch, &request, shard, owned)? {
+      settled.refused = settled.refused.saturating_add(1);
+    }
     batch
       .acknowledge(request.hint())
       .map_err(WinFspError::Capture)?;
-    count = count.saturating_add(1);
+    settled.answered = settled.answered.saturating_add(1);
   }
-  Ok(count)
+  Ok(settled)
 }
 
 /// Answers one request a dead worker's journal held: its saved response where that is safe to replay, a Cleanup or Close
@@ -525,31 +542,39 @@ fn settle_recovered(
   request: &Request<'_>,
   shard: &Shard<'_>,
   owned: &mut Owned,
-) -> Result<(), WinFspError> {
+) -> Result<bool, WinFspError> {
   let saved = batch.response_for(request).map_err(WinFspError::Capture)?;
   // Only Create's saved result is needed to preserve a possibly issued context. Read completion can reference
   // an old process mapping (sys/read.c), so all other buffer-bearing operations cancel without dereferencing it.
   if let Some(saved) =
     replayable_response(request, saved, shard.confirmations, shard.wake, shard.bound)?
   {
-    return send_response(control, saved, &mut owned.private.intents);
+    send_response(control, saved, &mut owned.private.intents)?;
+    return Ok(false);
   }
   if matches!(
     request.kind(),
     inflight::CLEANUP_KIND | inflight::CLOSE_KIND
   ) {
-    let length = operation(file_system, request, owned)?;
+    REPLAYING.set(true);
+    let length = operation(file_system, request, owned);
+    REPLAYING.set(false);
+    let length = length?;
     let response = owned
       .response
       .0
       .get(..length)
       .ok_or(WinFspError::Capture(Refusal::Length))?;
+    let refused = response
+      .get(STATUS_AT..STATUS_END)
+      .is_some_and(|status| status.iter().any(|byte| *byte != 0));
     if saved.is_none() {
       batch
         .record_response(request, response)
         .map_err(WinFspError::Capture)?;
     }
-    return send_response(control, response, &mut owned.private.intents);
+    send_response(control, response, &mut owned.private.intents)?;
+    return Ok(refused);
   }
   let response = request.cancelled_response().map_err(WinFspError::Capture)?;
   if saved.is_none() {
@@ -557,7 +582,8 @@ fn settle_recovered(
       .record_response(request, &response)
       .map_err(WinFspError::Capture)?;
   }
-  send_response(control, &response, &mut owned.private.intents)
+  send_response(control, &response, &mut owned.private.intents)?;
+  Ok(false)
 }
 
 /// Saved Create and successful Rename responses refer only to kernel-owned state. Other buffer-bearing responses
@@ -621,12 +647,17 @@ fn receive_loop(
   };
   match start {
     Start::Recover(releases) => {
-      if let Some(count) = recover(file_system, &mut view, &shard, &mut owned)? {
+      if let Some(settled) = recover(file_system, &mut view, &shard, &mut owned)? {
         slates_machine::log_line!(
-          "slates-winfsp: settled {count} captured requests before receiving"
+          "slates-winfsp: settled {} captured requests before receiving, {} of them a replayed cleanup or close refused",
+          settled.answered,
+          settled.refused
         );
         outcomes
-          .send(crate::host::Outcome::Recovered(count))
+          .send(crate::host::Outcome::Recovered {
+            settled: settled.answered,
+            refused: settled.refused,
+          })
           .map_err(|_| WinFspError::MountThread)?;
         wake.wake_by_ref();
       }
@@ -674,7 +705,7 @@ fn recover(
   view: &mut CaptureView,
   shard: &Shard<'_>,
   owned: &mut Owned,
-) -> Result<Option<u64>, WinFspError> {
+) -> Result<Option<Settled>, WinFspError> {
   let mut journals = Vec::with_capacity(inflight::capture::MAX_WORKERS);
   let mut any = false;
   for worker in 0..inflight::capture::MAX_WORKERS {
@@ -694,7 +725,7 @@ fn recover(
     return Ok(None);
   }
   let passed = inflight::capture::superseded(&journals).map_err(WinFspError::Capture)?;
-  let mut count = 0u64;
+  let mut total = Settled::default();
   for (worker, passed) in passed.iter().enumerate() {
     if let Some(mut batch) = view
       .capture(worker)?
@@ -702,10 +733,11 @@ fn recover(
       .map_err(WinFspError::Capture)?
     {
       let settled = settle(file_system, &mut batch, passed, shard, owned)?;
-      count = count.saturating_add(settled);
+      total.answered = total.answered.saturating_add(settled.answered);
+      total.refused = total.refused.saturating_add(settled.refused);
     }
   }
-  Ok(Some(count))
+  Ok(Some(total))
 }
 
 /// What a worker does next: receive with no response, or take the batch its last combined call delivered (A-215).
