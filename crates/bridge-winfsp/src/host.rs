@@ -774,6 +774,7 @@ unsafe fn wide_to_string(wide: Pwstr) -> String {
 const MAX_WIDE_UNITS: usize = 32_767;
 
 extern "C" fn get_volume_info(fs: *mut FileSystem, out: *mut VolumeInfo) -> Ntstatus {
+  let _timer = crate::phases::Timer::start(0);
   // SAFETY: WinFsp passes our live file system and a writable VolumeInfo.
   let handler = unsafe { handler(fs) };
   match handler.call(Op::VolumeInfo) {
@@ -798,6 +799,7 @@ extern "C" fn get_security_by_name(
   security_descriptor: PSecurityDescriptor,
   p_sd_size: *mut usize,
 ) -> Ntstatus {
+  let _timer = crate::phases::Timer::start(1);
   // SAFETY: our file system; `file_name` a NUL-terminated path.
   let handler = unsafe { handler(fs) };
   // SAFETY: `file_name` is a NUL-terminated UTF-16 path WinFsp owns for this call.
@@ -879,6 +881,7 @@ extern "C" fn create(
   p_context: *mut Pvoid,
   p_info: *mut FileInfo,
 ) -> Ntstatus {
+  let _timer = crate::phases::Timer::start(2);
   // SAFETY: our file system; `file_name` a path.
   let handler = unsafe { handler(fs) };
   // SAFETY: `file_name` is a NUL-terminated UTF-16 path WinFsp owns for this call.
@@ -899,6 +902,7 @@ extern "C" fn open_trampoline(
   p_context: *mut Pvoid,
   p_info: *mut FileInfo,
 ) -> Ntstatus {
+  let _timer = crate::phases::Timer::start(3);
   // SAFETY: our file system; `file_name` a path.
   let handler = unsafe { handler(fs) };
   // SAFETY: `file_name` is a NUL-terminated UTF-16 path WinFsp owns for this call.
@@ -930,6 +934,7 @@ extern "C" fn overwrite(
   _allocation_size: u64,
   p_info: *mut FileInfo,
 ) -> Ntstatus {
+  let _timer = crate::phases::Timer::start(4);
   // SAFETY: our file system and a live open-file context.
   let handler = unsafe { handler(fs) };
   // SAFETY: `context` is a live OpenFile leaked by open/create, taken under the COARSE guard.
@@ -946,6 +951,7 @@ extern "C" fn overwrite(
 }
 
 extern "C" fn cleanup(fs: *mut FileSystem, context: Pvoid, file_name: Pwstr, flags: u32) {
+  let _timer = crate::phases::Timer::start(5);
   if flags & CLEANUP_CHANGED == 0 {
     return;
   }
@@ -966,6 +972,7 @@ extern "C" fn cleanup(fs: *mut FileSystem, context: Pvoid, file_name: Pwstr, fla
 }
 
 extern "C" fn close(fs: *mut FileSystem, context: Pvoid) {
+  let _timer = crate::phases::Timer::start(6);
   // SAFETY: our file system; `context` a leaked OpenFile taken exactly once here.
   let handler = unsafe { handler(fs) };
   if context.is_null() {
@@ -989,6 +996,7 @@ extern "C" fn read(
   length: u32,
   p_bytes: *mut u32,
 ) -> Ntstatus {
+  let _timer = crate::phases::Timer::start(7);
   // SAFETY: our file system and a live open-file context.
   let handler = unsafe { handler(fs) };
   // SAFETY: `context` is a live OpenFile leaked by open/create, taken under the COARSE guard.
@@ -1025,6 +1033,7 @@ extern "C" fn write(
   p_bytes: *mut u32,
   p_info: *mut FileInfo,
 ) -> Ntstatus {
+  let _timer = crate::phases::Timer::start(8);
   // SAFETY: our file system and a live open-file context.
   let handler = unsafe { handler(fs) };
   // SAFETY: `context` is a live OpenFile leaked by open/create, taken under the COARSE guard.
@@ -1071,6 +1080,7 @@ extern "C" fn write(
 }
 
 extern "C" fn flush(fs: *mut FileSystem, context: Pvoid, p_info: *mut FileInfo) -> Ntstatus {
+  let _timer = crate::phases::Timer::start(9);
   // A volume flush passes a null context: every publication already covers the whole shard, so there is nothing
   // further to make durable than each handle's own flush does.
   if context.is_null() {
@@ -1101,6 +1111,7 @@ extern "C" fn get_file_info(
   context: Pvoid,
   p_info: *mut FileInfo,
 ) -> Ntstatus {
+  let _timer = crate::phases::Timer::start(10);
   // SAFETY: our file system and a live open-file context.
   let handler = unsafe { handler(fs) };
   // SAFETY: `context` is a live OpenFile leaked by open/create, taken under the COARSE guard.
@@ -1126,6 +1137,7 @@ extern "C" fn set_basic_info(
   _change_time: u64,
   p_info: *mut FileInfo,
 ) -> Ntstatus {
+  let _timer = crate::phases::Timer::start(11);
   // Times and attribute bits are accepted and reported from the current object (the volume keeps POSIX times, set
   // through its own writes); the object's live info is returned so the caller sees what the volume holds.
   // SAFETY: our file system and a live open-file context.
@@ -1150,6 +1162,7 @@ extern "C" fn set_file_size(
   set_allocation_size: Boolean,
   p_info: *mut FileInfo,
 ) -> Ntstatus {
+  let _timer = crate::phases::Timer::start(12);
   // SAFETY: our file system and a live open-file context.
   let handler = unsafe { handler(fs) };
   // SAFETY: `context` is a live OpenFile leaked by open/create, taken under the COARSE guard.
@@ -1172,6 +1185,7 @@ extern "C" fn set_file_size(
 }
 
 extern "C" fn can_delete(_fs: *mut FileSystem, _context: Pvoid, _file_name: Pwstr) -> Ntstatus {
+  let _timer = crate::phases::Timer::start(13);
   // The delete itself happens in Cleanup; here we only confirm deletability. An empty-directory check
   // is enforced by the volume core's `rmdir` at delete time (NotEmpty → the mapped NTSTATUS), so this
   // reports success and lets the real check run then.
@@ -1185,6 +1199,7 @@ extern "C" fn rename(
   new_file_name: Pwstr,
   _replace: Boolean,
 ) -> Ntstatus {
+  let _timer = crate::phases::Timer::start(14);
   // SAFETY: our file system; both names are paths.
   let handler = unsafe { handler(fs) };
   // SAFETY: `file_name` is a NUL-terminated UTF-16 path WinFsp owns for this call.
@@ -1207,6 +1222,7 @@ extern "C" fn read_directory(
   length: u32,
   p_bytes: *mut u32,
 ) -> Ntstatus {
+  let _timer = crate::phases::Timer::start(15);
   // SAFETY: our file system.
   let handler = unsafe { handler(fs) };
   // SAFETY: `context` is a live OpenFile (the open directory) leaked by open, under the guard.
