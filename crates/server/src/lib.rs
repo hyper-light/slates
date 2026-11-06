@@ -75,6 +75,7 @@ mod live_ship;
 mod member_task;
 pub mod merge_service;
 mod mirror;
+mod remote_attach;
 #[cfg(target_os = "linux")]
 mod write_log;
 // The Windows WinFsp transport (§4.6 "Windows"): a volume at a drive letter, served on its owner shard.
@@ -123,6 +124,7 @@ pub mod tombstone;
 // on this host); pure over one platform seam, so it compiles and tests everywhere.
 pub mod transports;
 pub mod verbs;
+pub mod watchdog;
 // The virtio-fs guest transport (§4.6 A-9): a guest device served on the volume's owning shard; its
 // loop rides the runtime's Unix descriptor readiness, so it is gated like the NFS transport.
 #[cfg(unix)]

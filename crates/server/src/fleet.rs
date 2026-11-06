@@ -6271,6 +6271,8 @@ fn sync_config_from_council(local: HostId) {
     // module).
     crate::takeover::resolve_held_objects(s, local);
     reconcile_held_authority(s);
+    // A retired host's clients' attachments end here: no reap of theirs will come (A-222).
+    crate::remote_attach::end_departed(s, &members);
   });
 }
 
@@ -6440,6 +6442,8 @@ impl Fan {
         .and_then(|membership| membership.durability)
         .and_then(|bound| bound.shortfall(&placement));
       s.fleet.install_configuration(placement, &members);
+      // A retired host's clients' attachments on this shard end with its departure (A-222).
+      crate::remote_attach::end_departed(s, &members);
     }
     if let Some(root) = self.root {
       s.root.adopt(root);
