@@ -79,6 +79,24 @@ const GOAL_REQUIRED_NS: u64 = 1_000_000;
 /// stretched its tails (BENCHMARKS, "A rebase that costs what changed").
 static CLIENT_SPIN_NS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
 
+/// The green the forms run over when `--green ID` names one (set once, in `main`).
+static ATTACHED_GREEN: std::sync::OnceLock<VolumeId> = std::sync::OnceLock::new();
+
+/// A volume id from its 32 hexadecimal characters (the CLI's form, `crates/cli/src/format.rs`).
+fn parse_volume(text: &str) -> VolumeId {
+  let mut bytes = [0u8; 16];
+  assert_eq!(text.len(), 32, "a volume id is 32 hexadecimal characters");
+  for (byte, pair) in bytes.iter_mut().zip(text.as_bytes().chunks(2)) {
+    *byte = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).expect("hexadecimal");
+  }
+  VolumeId { bytes }
+}
+
+/// A volume id as the CLI prints it.
+fn volume_text(id: VolumeId) -> String {
+  id.bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn client_spin_ns() -> Option<u64> {
   CLIENT_SPIN_NS.get().copied().flatten()
 }
@@ -132,6 +150,9 @@ enum Form {
   Identical,
   Conflict,
   Rebase,
+  /// A `versions` call on the green, timed in the submit's place with no edit: one round trip to the green's owner
+  /// and almost no work there, so across machines it is the network's share of a submit (`--form ping`).
+  Ping,
 }
 
 impl Form {
@@ -142,6 +163,15 @@ impl Form {
     Form::Conflict,
     Form::Rebase,
   ];
+  /// Every form `--form` may name.
+  const NAMED: [Form; 6] = [
+    Form::Accept,
+    Form::Ranged,
+    Form::Identical,
+    Form::Conflict,
+    Form::Rebase,
+    Form::Ping,
+  ];
 
   fn key(self) -> &'static str {
     match self {
@@ -150,6 +180,7 @@ impl Form {
       Form::Identical => "identical",
       Form::Conflict => "conflict",
       Form::Rebase => "rebase",
+      Form::Ping => "ping",
     }
   }
 }
@@ -186,6 +217,8 @@ struct Fixture {
   stamp: u64,
   /// The fixture's name prefix.
   tag: String,
+  /// Whether the fixture made the green (and so destroys it); an attached green (`--green`) is left.
+  owned_green: bool,
 }
 
 fn path_of(index: usize) -> String {
@@ -260,7 +293,35 @@ impl Fixture {
       made: 2,
       stamp: 0,
       tag: tag.to_owned(),
+      owned_green: true,
     })
+  }
+
+  /// A fixture over an existing green of `files` files (`--green`, made by `--seed-green`, perhaps on another node of
+  /// the fleet): its files read back as the model, its head as the model's, and two fresh works over it.
+  fn attach(instance: &str, tag: &str, (green, files): (VolumeId, usize)) -> Fixture {
+    let mut client = connect(instance);
+    client.spin_for(client_spin_ns());
+    let mut model = BTreeMap::new();
+    for index in 0..files {
+      let bytes = client.read(green, &path_of(index), ReadAt::Head).unwrap();
+      model.insert(path_of(index), bytes);
+    }
+    let head = client.versions(green).unwrap();
+    let (leader, _) = client.create_work(green, &format!("{tag}-w0")).unwrap();
+    let (follower, _) = client.create_work(green, &format!("{tag}-w1")).unwrap();
+    Fixture {
+      client,
+      green,
+      head,
+      model,
+      leader,
+      follower,
+      made: 2,
+      stamp: u64::from(std::process::id()) << 32,
+      tag: tag.to_owned(),
+      owned_green: false,
+    }
   }
 
   fn next_stamp(&mut self) -> u64 {
@@ -452,6 +513,29 @@ impl Fixture {
           edit_request,
           submit_request,
           host: [started_host, edited_host, done_host],
+        }
+      }
+      Form::Ping => {
+        let started = Instant::now();
+        let started_host = slates_machine::clock::monotonic_ns();
+        // A ping has no edit: sequence 0, which no request carries (a client's sequences start at 1).
+        let edit_request = 0;
+        let head = self.client.versions(self.green).unwrap();
+        let done = Instant::now();
+        let done_host = slates_machine::clock::monotonic_ns();
+        let submit_request = self.client.last_request().sequence;
+        if head != self.head {
+          wrong(&format!(
+            "the green's head is {head}, the model's {}",
+            self.head
+          ));
+        }
+        Sample {
+          edit: 0,
+          submit: ns(done - started),
+          edit_request,
+          submit_request,
+          host: [started_host, started_host, done_host],
         }
       }
       Form::Rebase => {
@@ -652,7 +736,10 @@ fn measure(
   let mut shed = 0u64;
   for run in 0..RUNS {
     let tag = format!("{}-{files}-{load}-{run}", form.key());
-    let mut fixture = Fixture::new(instance, &tag, files)?;
+    let mut fixture = match ATTACHED_GREEN.get() {
+      Some(green) => Fixture::attach(instance, &tag, (*green, files)),
+      None => Fixture::new(instance, &tag, files)?,
+    };
     let mut edits = Vec::with_capacity(SAMPLES);
     let mut submits = Vec::with_capacity(SAMPLES);
     let mut totals = Vec::with_capacity(SAMPLES);
@@ -698,7 +785,9 @@ fn measure(
     }
     fixture.client.destroy(fixture.leader).unwrap();
     fixture.client.destroy(fixture.follower).unwrap();
-    fixture.client.destroy(fixture.green).unwrap();
+    if fixture.owned_green {
+      fixture.client.destroy(fixture.green).unwrap();
+    }
   }
   attribute(
     &format!("{}_f{files}_{load}", form.key()),
@@ -873,6 +962,12 @@ struct Selection {
   quiet: bool,
   /// Spinning threads per core in the loaded form (`--spinners-per-core N`).
   spinners_per_core: usize,
+  /// A running daemon to measure against instead of an in-process one (`--instance NAME`).
+  instance: Option<String>,
+  /// Create a green of this name with the shape's files at `instance`, print its id and stop (`--seed-green NAME`).
+  seed_green: Option<String>,
+  /// The shards to drain spans from when attached (`--shards N`; none by default).
+  attached_shards: u16,
 }
 
 impl Selection {
@@ -889,12 +984,28 @@ impl Selection {
       loaded: true,
       quiet: true,
       spinners_per_core: 1,
+      instance: None,
+      seed_green: None,
+      attached_shards: 0,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
       match arg.as_str() {
         "--quiet-only" => selection.loaded = false,
         "--loaded-only" => selection.quiet = false,
+        "--instance" => selection.instance = Some(args.next().expect("--instance takes a name")),
+        "--seed-green" => {
+          selection.seed_green = Some(args.next().expect("--seed-green takes a name"))
+        }
+        "--green" => {
+          let _ = ATTACHED_GREEN.set(parse_volume(&args.next().expect("--green takes an id")));
+        }
+        "--shards" => {
+          selection.attached_shards = args
+            .next()
+            .and_then(|n| n.parse().ok())
+            .expect("--shards takes a count");
+        }
         "--client-spin-ns" => {
           let spin = args
             .next()
@@ -917,12 +1028,14 @@ impl Selection {
         ),
         "--form" => {
           let name = args.next().expect("--form takes a name");
-          if let Some(form) = Form::ALL.into_iter().find(|form| form.key() == name) {
+          if let Some(form) = Form::NAMED.into_iter().find(|form| form.key() == name) {
             selection.forms.push(form);
           } else if let Some(form) = Growth::ALL.into_iter().find(|form| form.key() == name) {
             selection.growth.push(form);
           } else {
-            panic!("--form is accept, ranged, identical, conflict, rebase, new_file or one_file");
+            panic!(
+              "--form is accept, ranged, identical, conflict, rebase, ping, new_file or one_file"
+            );
           }
         }
         other => panic!("unknown argument {other}"),
@@ -972,23 +1085,40 @@ fn main() {
     core_matrix: false,
   })
   .expect("the machine profile measures");
-  let instance = format!("edit-merge-bench-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance, None);
-  let shards = config.runtime.shards;
-  let daemon = Daemon::start(
-    &profile,
-    config,
-    SegmentSource::Create {
-      name: format!("slates-seg-edit-merge-{}", std::process::id()),
-    },
-  )
-  .unwrap();
-  daemon
-    .bootstrap(true)
-    .expect("the fixture explicitly creates its local consensus group");
-  let cores = profile.facts.cpus_at_once();
-
   let mut selection = Selection::parse();
+  // Attached (`--instance`): a running daemon, perhaps a fleet node whose green another node owns; otherwise one
+  // started here, in this process, as `slates` runs it.
+  let (instance, shards, daemon) = match selection.instance.clone() {
+    Some(instance) => (instance, selection.attached_shards, None),
+    None => {
+      let instance = format!("edit-merge-bench-{}", std::process::id());
+      let config = DaemonConfig::derive(&profile, &instance, None);
+      let shards = config.runtime.shards;
+      let daemon = Daemon::start(
+        &profile,
+        config,
+        SegmentSource::Create {
+          name: format!("slates-seg-edit-merge-{}", std::process::id()),
+        },
+      )
+      .unwrap();
+      daemon
+        .bootstrap(true)
+        .expect("the fixture explicitly creates its local consensus group");
+      (instance, shards, Some(daemon))
+    }
+  };
+  if let Some(name) = selection.seed_green.clone() {
+    // A green for an attached run on another node: seeded, its works let go, its id printed.
+    let files = selection.shapes.first().copied().unwrap_or(1);
+    let fixture = Fixture::new(&instance, &name, files).unwrap();
+    let mut client = fixture.client;
+    client.destroy(fixture.leader).unwrap();
+    client.destroy(fixture.follower).unwrap();
+    println!("green {} {files} files", volume_text(fixture.green));
+    return;
+  }
+  let cores = profile.facts.cpus_at_once();
   selection.shards = shards;
   println!(
     "edit and merge latency: {} {}, {shards} shards, {cores} cores, client spin {}, {SAMPLES} samples x {RUNS} runs, edits of {EDIT_BYTES} B in files of {FILE_BYTES} B",
@@ -1018,5 +1148,7 @@ fn main() {
       stop.store(true, Ordering::Relaxed);
     });
   }
-  daemon.stop();
+  if let Some(daemon) = daemon {
+    daemon.stop();
+  }
 }

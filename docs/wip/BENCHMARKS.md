@@ -8235,6 +8235,56 @@ load about 20: median samples: client 62 µs, ring 28 µs (shard ops 25 µs, ver
 at or above p99: client 506 µs, ring 41 µs, outside the ring 416 µs. The tail is waiting to be woken and served, not
 the merge.
 
+**The client's spin under load (item 1, 2026-11-06 02:45 to 02:52 UTC).** Until now the harness made every client spin up
+to 1 ms for its reply; a product client spins for its own wake estimate (`Client::spin_for(None)`) and parks. Interleaved,
+same box, `edit_merge_bench --client-spin-ns S --files 10 --form accept [--form conflict]`, 3 × 1,000 samples:
+
+| Client spin | loaded accept p99, by round | loaded accept p999 | quiet accept p99 |
+|---|---|---|---|
+| 1 ms (the harness until now) | 2.39, 0.73, 7.96 ms | 32.6, 11.1, 40.0 ms | 2.18, 0.28, 1.54 ms |
+| 5 µs | 0.34, 0.44, 0.42 ms | 1.09, 0.87, 6.25 ms | 0.22, 0.46, 0.21 ms |
+| the client's own estimate (now the default) | 0.51, 0.53, 0.43 ms | 0.95, 25.6, 0.87 ms | 0.51, 0.25, 0.24 ms |
+
+Loads at the rounds' starts: 12.8 to 25.5; the loaded form adds one spinner per core (18). Conflicts behave alike (loaded
+p99 1 ms spin 1.76, 2.29, 0.92 ms; own 0.48, 0.56, 0.60 ms). An earlier run of the loaded form alone (02:45 UTC, load 9 to
+18) gave 1 ms 1.69, 3.63, 4.53 ms against 5 µs 0.55, 0.45, 0.54 ms at p99. Under oversubscription a client that spins
+spends its CPU share and its wake then waits its turn; the loaded tails measured with the 1 ms spin, here and on CI, were
+in part the harness's own. The harness now waits as a product client does.
+
+**The wake, split (the same day, load 62 to 72).** The harness now stamps each call on the spans' clock and splits the time
+outside the ring into before the shard reads the slot (the doorbell and the shard's wake) and after it writes the reply
+(the client's wake). Accept at 10 files, the client's own spin: median 66 µs = ring 25 µs + before 29 to 37 µs + after
+8 µs; quiet p99 tail 186 to 203 µs, before 65 to 84 µs. Loaded p99 tail, one invocation: 9.6 ms, of it 9.2 ms after the
+reply (the parked client not run) and 0.37 ms before the slot's read; the next: 1.13 ms, of it 119 µs before and 45 µs
+after. On macOS a request reaches its shard through the doorbell thread, which wakes on the bootstrap object's word and
+kicks every shard (`crates/server/src/doorbell.rs`); on Linux the client writes the shard's eventfd. The macOS shard
+wake and spin are the clients agent's (`agents/clients-spin`, A-218's record); quiet Linux CI already measured 14 to
+20 µs for a whole call.
+
+**Across two machines (item 2, 2026-11-06 03:14 to 03:21 UTC).** A two-node fleet from one manifest (`f = 0`): the server
+node on adas-macbook-pro-2 (192.168.1.71, Wi-Fi, load 15 to 24) and the client node on kiln-a094a12d (Fedora, x86_64,
+32 cores, 192.168.1.72, Wi-Fi, load 6 to 42), each `slates daemon --quick --shards 2 --fleet fleet.json --node N`, release
+builds of this tree (the client's from its own target directory in a capped `systemd-run --user` unit). The green
+(100 files of 4 KiB) was seeded on the server node by `edit_merge_bench --instance perf-srv --seed-green twom --files
+100` and shared with the client's uid; the harness ran on the client machine attached to its own node (`--instance
+perf-cli --green ID --files 100`), so each edit and submit is forwarded over the fleet to the green's owner. ICMP RTT
+between the two (50 pings): 3.75 ms min, 10.4 ms average, 240 ms max; adacachy (wired, 192.168.1.90) to either: 1.0 to
+2.5 ms min, 2.7 and 3.5 ms average. Total p50 (p99), 3 × 1,000 samples (a run stops at 20 s):
+
+| Where the client is | ping (one forwarded `versions`) | accept (edit + submit) | conflict |
+|---|---|---|---|
+| on the client node, across the LAN | 7.0 ms (31 ms) | 15.2 ms (58 ms); edit p50 7.2 to 7.8 ms, submit 7.5 to 7.9 ms | 16.6 ms (50 ms) |
+| on the server node, same green | 3.1 µs (76 µs) | 37.5 µs (231 µs): ring 25 µs, shard ops 15 µs, verdict 3 µs | 22.6 µs (165 µs) |
+
+An earlier run of the same seven minutes before measured accept at 37 ms p50 against conflict at 14 ms; it was the
+link's variance (the accepted submit was not deferred: the server's `merge.acceptance_deferred` count stayed 0). Each
+forwarded call costs one round trip, so a full edit and merge across machines is two RTTs plus the server's 25 to 40
+µs. With the RTT subtracted, about 35 µs remains (the server's ring and the client's local wake): the preferred 50 µs is
+reachable only over a link whose round trip is a few microseconds. Over a wired LAN of 100 to 200 µs it would be 0.2 to
+0.4 ms, inside the required 1 ms; over this Wi-Fi it is 7 to 16 ms at the median. The lever across machines is the
+number of round trips: an edit and its submit as one request would halve it (a protocol change for the design, not
+made here).
+
 ## The client's edit and merge latency, and a merge that grows with its green (RQ-4, §4.16; 2026-11-05)
 
 The per-platform client record (`platforms.md`) had a provisioning histogram and no number for the two verbs an agent
