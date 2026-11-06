@@ -808,6 +808,15 @@
 > `crates/merge/tests/origin.rs`), so records written before it would not match a newer holder. A daemon `SIGKILL`ed six times mid-merge
 > loses no told version and tells none twice (`crates/cli/tests/merge_kill.rs`, red with the durable append removed).
 >
+> **Merge: edit and submit in one request (A-225, 2026-11-06, agents/perf-2).** `Client::edit_and_submit`
+> (`RequestBody::EditSubmit`) is `edit` and then `submit` in one durable step under one completion record. Across the
+> Wi-Fi LAN an accepted edit and merge is one forwarded round trip, 6.9 to 7.8 ms p50, against 14.1 to 18.6 ms for
+> edit then submit (ping 6.1 to 7.7 ms). Oracle: `edit_and_submit_answers_what_edit_then_submit_does_over_generated_histories`
+> (`crates/client/tests/edit_and_submit.rs`) compares every answer and every head over generated histories, red under
+> both mutations tried. Exactly once: `an_edit_and_submit_retried_across_a_restart_answers_its_record_once`. **Open:**
+> the SDKs, MCP and the CLI do not offer the combined verb yet. Also open: the link's p99 (70 to 158 ms over Wi-Fi), a
+> wired pair, and Windows as either node.
+>
 
 > **Windows conformance runs, and the arm64 Linux suites (2026-11-05, A-209; VFS plan step 10).** WinFsp's own two
 > suites run over the slates drive (`slates mount ID E:`) through `cargo xtask conformance` in `windows-lint` and

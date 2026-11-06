@@ -8308,6 +8308,27 @@ load about 20: median samples: client 62 µs, ring 28 µs (shard ops 25 µs, ver
 at or above p99: client 506 µs, ring 41 µs, outside the ring 416 µs. The tail is waiting to be woken and served, not
 the merge.
 
+**Edit and submit in one request, across two machines (A-225, 2026-11-06 07:49 to 07:59 UTC).** A two-node fleet from
+one manifest (`f = 0`), each node `slates daemon --quick --shards 2 --fleet fleet.json --node N`. Server node:
+adas-macbook-pro-2 at 192.168.1.71. Client node: kiln-a094a12d at 192.168.1.72, load 6.2 to 10.0. Both are on Wi-Fi;
+ICMP RTT was 3.92/8.48/58.7 ms (min/avg/max) before and 3.83/5.33/7.41 ms after. Both nodes ran release builds of
+agents/perf-2 at `20c74c56`, the client's built in a capped `systemd-run --user` unit. The green: 100 files of 4 KiB,
+seeded on the server node and shared with the client's uid. The harness ran on the client machine, attached to its
+own node, so each request is forwarded over the fleet to the green's owner. That build's harness has an attached mode
+(`--instance NAME --green ID`) and a `ping` form (one forwarded `versions`), which main's harness does not have yet.
+Command: `edit_merge_bench --instance perf-cli --green ID --shards 2 --quiet-only --files 100 --form ping --form
+accept --form accept_one` (round 2 with the two accept forms in the other order). 3 runs × up to 1,000 samples; a run
+stops at 20 s:
+
+| round | ping p50 | accept (edit + submit) p50 | of which edit, submit | accept_one p50 |
+|---|---|---|---|---|
+| 1 | 6.13 ms | 14.1 ms | 6.88, 7.06 ms | 6.93 ms |
+| 2 | 7.74 ms | 18.6 ms | 8.67, 8.04 ms | 7.81 ms |
+| 3 | 7.66 ms | 14.8 ms | 7.07, 7.04 ms | 7.03 ms |
+
+One request is one forwarded round trip: `accept_one` costs a ping. The p99 is the link's: accept 138 to 158 ms,
+accept_one 70 to 132 ms.
+
 ## The client's edit and merge latency, and a merge that grows with its green (RQ-4, §4.16; 2026-11-05)
 
 The per-platform client record (`platforms.md`) had a provisioning histogram and no number for the two verbs an agent

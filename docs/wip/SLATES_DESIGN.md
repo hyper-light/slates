@@ -7813,6 +7813,15 @@ placement refresh is single-flight per green). The caller parks and resumes with
 `stream = true` submits at every auto-seal; an agent that wants a review boundary submits
 explicitly. A green with `require_evidence` refuses increments without evidence references.
 
+**Edit and submit in one request (A-225).** `edit_and_submit(work_volume, path, at, delete_len, bytes, evidence?)` is
+`edit` and then `submit`, in one request: the work's owner applies the edit exactly as `edit` does and, when the edit
+is accepted, submits exactly as `submit` does. Both run inside the one durable step and under the one completion record
+of the request, so a restart replays both or neither and a retry answers from the record. Its reply is the edit's
+refusal when the edit is refused (nothing is submitted, as a client that saw `edit` refused would not submit), else the
+submit's reply: the same verdict, the same conflict windows, the same refusals. `edit` and `submit` stay separate verbs
+because they are separate operations (an agent edits many times and submits once); the combined verb is for a client
+that does both, and saves it one round trip, which across machines is the whole of a request's cost.
+
 **Rebase, the only corrective path.** `rebase(work_volume, to = head)`: map the work volume's
 pending operations (since its base) through the canonical deltas up to `to`; if every operation
 is `Accept` or `AcceptIdentical`, re-base the clone to `to` by extent surgery (its root becomes
@@ -14133,6 +14142,40 @@ the server takes it as the work's delta over its new base (`WorkFiles::from_chan
   rebase's changes over it equals the twin's head after the accept, every change differing from the head (red with
   the changes under `d` dropped: the first case failed); a one-file edit of a thousand-file green rebases to that file
   alone. The server's library, daemon and client suites pass.
+
+### A-225 — Edit and submit in one request (accepted 2026-11-06, the supervisor's decision (b))
+Applied in the same change to: §4.16 ("Edit and submit in one request"), `crates/ipc/src/protocol.rs`
+(`RequestBody::EditSubmit`, `EditBytes`, appended), `crates/server/src/verbs.rs` (`edit_and_submit`, and the verb in
+`claims_placed_durability`), `crates/client/src/client.rs` (`Client::edit_and_submit`), the oracle
+`crates/client/tests/edit_and_submit.rs`, the harness's `accept_one` form (`crates/client/examples/edit_merge_bench.rs`),
+BENCHMARKS, GAPS.
+
+Status: built 2026-11-06.
+- Why: across machines a request costs its round trip. Measured over a Wi-Fi LAN (BENCHMARKS, "Edit and submit in one
+  request, across two machines"), an accepted edit and merge was two of them: edit then submit 14.1 to 18.6 ms at the
+  median, the edit and the submit each about one forwarded round trip (a ping 6.1 to 7.7 ms). One request does both.
+- The rule: `EditSubmit` names the work, the splice (path, offset, length removed, and the bytes inserted, carried
+  inline or as a staged buffer for an edit larger than one request) and the evidence. The work's owner runs `edit`
+  (or `EditStaged`'s edit); if it answers `Edited`, it runs `submit` and answers with that. Otherwise it answers the
+  edit's refusal and submits nothing. Both run in the request's one `Db::begin` … `commit` with its one completion
+  record, so the effects of both, or of the edit and a refused submit, are durable together or not at all. A retry,
+  across a restart too, answers from the record. The verb claims placed durability as `Submit` does, and is routed,
+  forwarded and republished by the work's volume, as `Edit` and `Submit` are.
+- What it does not change: `Edit` and `Submit` stay, as different operations, not a compatibility path. The verdict,
+  its conflict windows, the increment's identity and every refusal are the two verbs' own, since the combined verb
+  calls them.
+- Proven by an oracle that runs both forms over generated histories (two daemons' worth of works over one green,
+  each step an edit-and-submit through one client and edit-then-submit through another, with daemon restarts between
+  steps) and compares every verdict, every conflict report and the greens' heads and files. Exactly-once is
+  proven by a retry across a restart, which must answer the recorded verdict and leave the green one version ahead,
+  not two.
+- Measured (2026-11-06 07:49 to 07:59 UTC; server node adas-macbook-pro-2 at 192.168.1.71, client node kiln-a094a12d at
+  192.168.1.72, both on Wi-Fi; ICMP RTT 3.8 to 3.9 ms min, 5.3 to 8.5 ms average). The harness ran on the client
+  machine, attached to its own node, over a 100-file green owned by the server node (`edit_merge_bench --instance
+  perf-cli --green ID --files 100 --form ping --form accept --form accept_one`, three invocations with the two
+  accept forms' order alternated). p50 in each round: `accept`, edit then submit, 14.1, 18.6 and 14.8 ms; `accept_one`
+  6.93, 7.81 and 7.03 ms; a ping (one forwarded `versions`) 6.13, 7.74 and 7.66 ms. One request costs one round trip.
+  The p99 is the link's in both forms (70 to 158 ms).
 
 ### A-214 — An idle shard keeps its last write burst's worth of free content pages pre-faulted (accepted 2026-11-05, VFS plan step 11; amends A-105)
 
