@@ -11,8 +11,9 @@
 //! Create answered "opened" and the Cleanup and Close that follow it, the closest requests a client sends. The probe
 //! serves through the receive worker's own calls ([`crate::dispatcher::receive_batch`],
 //! [`crate::dispatcher::send_response`]) and its own journal. Each request is answered at once, so the rounds differ
-//! only in how many workers wait. More workers are taken only where every round with more beats every round with
-//! fewer ([`crate::inflight::capture::workers_beyond_spread`]). The rounds and the count are logged.
+//! only in how many workers wait. More workers are taken only where a one-sided sign test over the paired rounds rejects
+//! "they gain nothing" at 1 in 100 ([`crate::inflight::capture::workers_by_sign_test`]). The rounds and the count are
+//! logged.
 //!
 //! An open of an absent name, one request with nothing behind it, was the first probe. It showed no second-worker win
 //! on either lane (diagnostics run 42130583401, 35 processes a lane), because the worker was back in its receive long
@@ -164,10 +165,10 @@ pub(crate) fn measure_on(
         .push(median);
     }
   }
-  let count = capture::workers_beyond_spread(&medians);
+  let count = capture::workers_by_sign_test(&medians);
   slates_machine::log_line!(
     "slates-winfsp: receive workers = {count}: median open-and-close of each round, in ns, by waiting workers from one: \
-     {medians:?}; more workers only where every round beats every round of fewer; probe took {} ms",
+     {medians:?}; more workers only where the paired rounds' sign test rejects no gain; probe took {} ms",
     started.elapsed().as_millis()
   );
   Ok(Some((count, medians)))

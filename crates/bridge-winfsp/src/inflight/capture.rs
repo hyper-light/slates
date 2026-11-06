@@ -733,28 +733,71 @@ fn saved_response(bytes: &[u8]) -> Result<Option<&[u8]>, Refusal> {
   Ok(Some(response))
 }
 
+/// Shape: the significance of the sign test that takes a larger worker count ([`workers_by_sign_test`]): a machine where
+/// more workers gain nothing takes them in at most one probe in this many. At the probe's nine paired rounds only nine
+/// wins of nine pass (p = 1/512); eight of nine is p = 10/512, about 1 in 51.
+const SIGN_TEST_ONE_IN: u64 = 100;
+
 /// How many receive workers to run, from the probe's medians (A-219): `medians[n]` holds each round's median with `n + 1`
-/// workers waiting. One, unless a larger count's every round beats every round of the count chosen so far, so a second
-/// worker is taken only where it wins beyond the spread of both. A count with no rounds is never chosen.
-pub fn workers_beyond_spread(medians: &[Vec<u64>]) -> usize {
-  let mut chosen = 1;
-  let mut chosen_best = medians
-    .first()
-    .and_then(|rounds| rounds.iter().min().copied());
+/// workers waiting, round `r` of every count measured back to back, the order rotating each round, so pairs share the
+/// machine's state. A larger count is taken over the one chosen so far by a one-sided sign test over the paired rounds:
+/// with `k` of the `n` untied pairs won by the larger count, p = P(X >= k) for X ~ Binomial(n, 1/2), and it is taken when
+/// p <= 1/[`SIGN_TEST_ONE_IN`]. One otherwise. A count with no rounds is never taken. The arithmetic is exact: the
+/// binomial tail is a sum of binomial coefficients over 2^n, compared without division.
+pub fn workers_by_sign_test(medians: &[Vec<u64>]) -> usize {
+  let mut chosen = 1usize;
   for (index, rounds) in medians
     .iter()
     .enumerate()
     .skip(1)
     .take(MAX_WORKERS.saturating_sub(1))
   {
-    if let (Some(worst), Some(best)) = (rounds.iter().max().copied(), chosen_best)
-      && worst < best
-    {
+    let Some(baseline) = chosen.checked_sub(1).and_then(|at| medians.get(at)) else {
+      break;
+    };
+    let (wins, untied) =
+      rounds
+        .iter()
+        .zip(baseline)
+        .fold((0u32, 0u32), |(wins, untied), (more, fewer)| {
+          if more == fewer {
+            (wins, untied)
+          } else {
+            (
+              wins.saturating_add(u32::from(more < fewer)),
+              untied.saturating_add(1),
+            )
+          }
+        });
+    if sign_test_passes(wins, untied) {
       chosen = index.saturating_add(1);
-      chosen_best = rounds.iter().min().copied();
     }
   }
   chosen
+}
+
+/// Whether `wins` of `untied` pairs reject "more workers gain nothing" at 1/[`SIGN_TEST_ONE_IN`]: the binomial tail
+/// `sum over i >= wins of C(untied, i)`, against `2^untied / SIGN_TEST_ONE_IN`. No pairs, or more than a u64 holds, never pass.
+fn sign_test_passes(wins: u32, untied: u32) -> bool {
+  let Some(total) = 1u64
+    .checked_shl(untied)
+    .filter(|_| untied > 0 && untied < 63)
+  else {
+    return false;
+  };
+  let mut coefficient = 1u64;
+  let mut tail = 0u64;
+  for chosen in 0..=untied {
+    if chosen >= wins {
+      tail = tail.saturating_add(coefficient);
+    }
+    // C(n, i + 1) = C(n, i) * (n - i) / (i + 1), exact at every step.
+    coefficient = coefficient
+      .saturating_mul(u64::from(untied.saturating_sub(chosen)))
+      .checked_div(u64::from(chosen.saturating_add(1)))
+      .unwrap_or(0);
+  }
+  tail.saturating_mul(SIGN_TEST_ONE_IN) <= total
 }
 
 pub(super) fn check_response(bytes: &[u8]) -> Result<(), Refusal> {
@@ -1471,29 +1514,76 @@ mod tests {
     assert!(tally.delivered_hand_offs > 0 && tally.undelivered_hand_offs > 0);
     assert!(tally.reused_in_call > 0 && tally.bogus > 0);
   }
-  /// A-219. Do: derive the worker count from probe rounds where two waiting workers win beyond the spread, overlap it,
-  /// lose, or have no rounds. Expect: two only where every two-worker round beats every one-worker round, one otherwise.
+  /// The paired rounds of diagnostics run 42145658324 (diag-23), µs: each probe process's nine one-worker and nine
+  /// two-worker round medians, the separate form and A-215's combined form on both runners.
+  fn rounds(one: [u64; 9], two: [u64; 9]) -> Vec<Vec<u64>> {
+    vec![one.to_vec(), two.to_vec()]
+  }
+
+  /// A-219. Do: derive the worker count from diag-23's probe rounds (every process, both forms, both runners), from paired
+  /// rounds that tie, are short, or are missing, and from the regime shift that fooled the old rule. Expect: two in every
+  /// arm64 combined process, whose two-worker rounds won 9 of 9 pairs; one everywhere else, 8 of 9 included.
   #[test]
-  fn a_second_worker_is_taken_only_where_every_round_beats_every_round_of_one() {
-    let one = vec![700, 705, 712, 701, 714];
-    assert_eq!(
-      workers_beyond_spread(&[one.clone(), vec![672, 688, 680, 675, 684]]),
-      2
-    );
-    assert_eq!(
-      workers_beyond_spread(&[one.clone(), vec![672, 688, 680, 702, 684]]),
-      1
-    );
-    assert_eq!(
-      workers_beyond_spread(&[one.clone(), vec![700, 690, 680, 675, 684]]),
-      1
-    );
-    assert_eq!(
-      workers_beyond_spread(&[vec![124, 130, 135], vec![146, 149, 147]]),
-      1
-    );
-    assert_eq!(workers_beyond_spread(&[one.clone(), Vec::new()]), 1);
-    assert_eq!(workers_beyond_spread(&[Vec::new(), vec![1, 2]]), 1);
-    assert_eq!(workers_beyond_spread(&[one]), 1);
+  fn a_second_worker_is_taken_only_where_the_sign_test_rejects_no_gain() {
+    let arm64_combined = [
+      rounds(
+        [1015, 1060, 1070, 1108, 1046, 1079, 1051, 1081, 1051],
+        [973, 969, 1024, 1002, 972, 960, 1001, 1000, 978],
+      ),
+      rounds(
+        [1029, 1041, 1066, 1002, 1038, 1000, 981, 955, 1005],
+        [930, 954, 972, 946, 910, 926, 877, 904, 964],
+      ),
+      rounds(
+        [959, 973, 995, 988, 997, 992, 964, 955, 968],
+        [909, 895, 893, 929, 946, 902, 913, 918, 903],
+      ),
+      rounds(
+        [973, 975, 957, 1000, 997, 1053, 1052, 1010, 987],
+        [894, 883, 891, 902, 880, 895, 931, 911, 928],
+      ),
+      rounds(
+        [926, 978, 967, 981, 988, 968, 969, 956, 946],
+        [868, 884, 913, 911, 943, 906, 914, 922, 879],
+      ),
+    ];
+    for medians in &arm64_combined {
+      assert_eq!(workers_by_sign_test(medians), 2, "{medians:?}");
+    }
+    let one_everywhere = [
+      // arm64, separate: the counts trade wins.
+      rounds(
+        [963, 1146, 1032, 978, 1059, 1064, 1000, 966, 954],
+        [972, 1011, 1043, 1061, 1027, 1013, 997, 978, 1007],
+      ),
+      rounds(
+        [919, 973, 943, 966, 958, 927, 964, 931, 929],
+        [890, 968, 961, 976, 956, 930, 939, 957, 963],
+      ),
+      // x86_64, separate and combined: a second worker costs about 21 µs.
+      rounds(
+        [778, 778, 770, 990, 759, 771, 769, 768, 771],
+        [982, 985, 983, 1070, 970, 976, 979, 980, 978],
+      ),
+      rounds(
+        [795, 789, 791, 1089, 797, 784, 789, 793, 785],
+        [1022, 1025, 1018, 1020, 1012, 1009, 1018, 1031, 1024],
+      ),
+      // Eight wins of nine, p = 10/512.
+      rounds(
+        [10, 10, 10, 10, 10, 10, 10, 10, 1],
+        [9, 9, 9, 9, 9, 9, 9, 9, 9],
+      ),
+      // run 42130583401's x86_64 regime shift, five rounds: five of five is p = 1/32.
+      vec![vec![595, 586, 580, 583, 478], vec![423, 429, 420, 430, 421]],
+      // Ties carry no evidence, and missing rounds none.
+      rounds([5; 9], [5; 9]),
+      vec![vec![1, 2, 3], Vec::new()],
+      vec![Vec::new(), vec![1, 2]],
+    ];
+    for medians in &one_everywhere {
+      assert_eq!(workers_by_sign_test(medians), 1, "{medians:?}");
+    }
+    assert_eq!(workers_by_sign_test(&[vec![700, 705]]), 1);
   }
 }

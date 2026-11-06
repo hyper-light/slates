@@ -13516,9 +13516,13 @@ after that point "not found" and counts itself ending before it sends that respo
 left to receive it. The client checks its worker's stop channel before every cycle, so an unmount during the probe waits
 for one cycle, not a round.
 
-The count is the larger only where every one of its rounds' medians is below every round's median with fewer
-(`capture::workers_beyond_spread`, tested on every host), so beyond both spreads, and one otherwise. The probe logs every
-round's median and the count, and the process keeps the count. Any other answer to a probe open is a refusal.
+The count is the larger only where a one-sided sign test over the paired rounds rejects "the larger count gains
+nothing" at 1 in 100 (`capture::workers_by_sign_test`, tested on every host against diagnostics run 42145658324's
+rounds). Round r of each count runs back to back, so each pair shares the machine's state. The test counts the k pairs of
+n untied ones the larger count won, and takes it when P(X >= k) <= 1/100 for X ~ Binomial(n, 1/2). At nine rounds only
+nine wins of nine pass (p = 1/512); eight of nine is p = 10/512. The first rule, every larger-count round below every
+smaller-count round, kept one worker in 3 of 5 arm64 combined-form processes whose two-worker rounds had won 9 of 9
+pairs. The probe logs every round's median and the count, and the process keeps the count. Any other answer to a probe open is a refusal.
 
 The probe volume is deleted however the probe ends: on success, on a refusal (its workers leave at their idle return),
 when stopped, and with the process when it is killed, since a WinFsp volume lives on its control handle. Each is a
