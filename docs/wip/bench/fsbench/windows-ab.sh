@@ -78,7 +78,7 @@ free_drive() {
 # command substitution holds its output open), and answers once its daemon does; the pid goes in ANCHORS.
 start_anchor() {
   local index=$1 instance=$2 binary=${BINARIES[$1]}
-  "$binary" --instance "$instance" anchor 2> "$W/$instance.err" &
+  "$binary" --instance "$instance" anchor ${SHARDS:+--shards "$SHARDS"} 2> "$W/$instance.err" &
   ANCHORS[$index]=$!
   for _ in $(seq 1 600); do
     if "$binary" --instance "$instance" volume list > /dev/null 2>&1; then
