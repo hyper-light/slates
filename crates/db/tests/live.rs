@@ -999,3 +999,35 @@ fn hostile_fetched_replies_are_refused() {
     }
   }
 }
+
+/// A-200, the retained tail by bytes (`Shipper::retain_up_to`). Do append more entries than `retain` keeps while one
+/// holder acknowledges them all and the other none, with a byte budget that covers them; then without one. Expect the
+/// lagging holder sent the entries it lacks while the budget covers them, and an install once the budget is gone.
+#[test]
+fn a_laggard_is_sent_its_entries_while_they_cost_no_more_than_an_install() {
+  let hosts = [HostId(1), HostId(2), HostId(3)];
+  let mut shipper = Shipper::new(
+    (hosts[0], OBJECT, HostEpoch(1)),
+    Quorum { f: 1 },
+    &hosts,
+    None,
+    (2, 4),
+  );
+  shipper.retain_up_to(1024);
+  let mut replica = Replica::new(hosts[0], OBJECT);
+  for value in 0..10u8 {
+    let entry = shipper.append(vec![value; 16]).unwrap();
+    let held = replica.accept(&entry).unwrap();
+    shipper.on_reply(hosts[1], Ok(held));
+  }
+  match shipper.pending(hosts[2]) {
+    Next::Entries(entries) => assert_eq!(entries.len(), 10, "every entry the laggard lacks"),
+    other => panic!("the laggard is sent its entries within the budget, not {other:?}"),
+  }
+  shipper.retain_up_to(0);
+  assert_eq!(
+    shipper.pending(hosts[2]),
+    Next::Install,
+    "past the budget and the count, the laggard is installed"
+  );
+}

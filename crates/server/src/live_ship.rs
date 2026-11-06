@@ -815,6 +815,10 @@ pub(crate) fn published(
       if whole {
         let head = entry.head();
         live.shipper.mark_checkpoint(head);
+        // Derived: the retained tail's byte bound is this whole record's size, the install a laggard would be sent
+        // instead: shipping it the entries it lacks never costs more than installing it (`Shipper::retain_up_to`).
+        // The owner keeps at most that much again beside the record it already keeps.
+        live.shipper.retain_up_to(payload.len());
         live.whole = Some((head, payload));
       }
       state.count(LIVE_APPENDED, 1);
@@ -945,6 +949,7 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
   let object = ObjectId(volume);
   let mut sends = Vec::new();
   let mut stale_checkpoint = false;
+  let mut state_counts = Vec::new();
   for holder in live.shipper.holders() {
     match live.shipper.pending(*holder) {
       Next::Entries(entries) => {
@@ -977,11 +982,13 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
           head: *head,
           state: payload.clone(),
         };
+        let bytes = install.encode();
+        state_counts.push(bytes.len());
         sends.push(Send {
           object,
           holder: *holder,
           stream: slates_cluster::live::LIVE_STATE_STREAM,
-          bytes: install.encode(),
+          bytes,
         });
       }
       Next::Nothing | Next::Fenced(_) => {}
@@ -990,8 +997,19 @@ fn pending_sends(state: &mut ShardState, volume: [u8; 16]) -> Vec<Send> {
   if stale_checkpoint {
     live.owes_whole = true;
   }
+  for bytes in state_counts {
+    state.count(LIVE_INSTALL_SENT, 1);
+    state.count(LIVE_INSTALL_BYTES, u64::try_from(bytes).unwrap_or(u64::MAX));
+  }
   sends
 }
+
+/// Counter: installs sent to a holder off the chain or behind the retained tail.
+const LIVE_INSTALL_SENT: &str = "fleet.live.install_sent";
+/// Counter: the bytes of those installs.
+const LIVE_INSTALL_BYTES: &str = "fleet.live.install_bytes";
+/// Counter: installs a holder did not answer within the exchange's budget.
+const LIVE_INSTALL_UNANSWERED: &str = "fleet.live.install_unanswered";
 
 /// Ships `sends` from the control shard and folds the replies on this (the owner) shard, in a task of this shard: the
 /// barrier that called it does not wait (A-200's next slice makes it). The task is bounded by the dispatch's budget and
@@ -1004,54 +1022,97 @@ fn dispatch(state: &ShardState, sends: Vec<Send>) {
     state.shard,
     state.shards.first().copied().unwrap_or(state.shard),
   );
-  let spawned = slates_rt::futures::spawn(async move {
-    let replies = send_from_control(origin, control, sends).await;
-    let _ = state::with_state(|s| fold_into(s, replies));
-  });
-  if let Ok(task) = spawned {
-    let _ = slates_rt::futures::detach(task);
+  // One task a holder (§4.10: "each holder's offer and transfer progress independently, with no wait on the slowest").
+  // One task for all of them sent to each holder in turn, so a partitioned holder's borrow and exchange, a liveness
+  // budget each, came before the next holder's send, and every write waited them out: p99 0.37–1.4 s and p999 up to
+  // 3.9 s with one of two candidates SIGSTOPped, where the other answers in milliseconds (2026-11-06,
+  // `crates/cli/tests/live_chaos.rs`, the rolling partition).
+  let mut by_holder: BTreeMap<HostId, Vec<Send>> = BTreeMap::new();
+  for send in sends {
+    by_holder.entry(send.holder).or_default().push(send);
+  }
+  for (_, sends) in by_holder {
+    let spawned = slates_rt::futures::spawn(send_from_control(origin, control, sends));
+    if let Ok(task) = spawned {
+      let _ = slates_rt::futures::detach(task);
+    }
   }
 }
 
-/// Sends each message over the control shard's session to its holder and brings back every reply that came in the
-/// dispatch's budget; the stragglers' replies follow through [`fold_into`] when they come.
-async fn send_from_control(
-  origin: u16,
-  control: u16,
-  sends: Vec<Send>,
-) -> Vec<(ObjectId, HostId, Vec<u8>)> {
-  let budget = crate::fleet::live_budget();
-  let deadline = budget.max_deadline_ns().saturating_mul(2);
-  crate::xshard::task_within(
+/// Sends each message over the control shard's session to its holder, in order, each under its own budget
+/// ([`exchange_budget`]), and folds each message's replies on the volume's owner shard (`origin`) as soon as they come;
+/// the stragglers' replies follow through [`drain_stragglers`]. Returned to the dispatch at the end, the replies were
+/// lost whenever the dispatch outlived its own deadline, so an answered install never reached the owner.
+async fn send_from_control(origin: u16, control: u16, sends: Vec<Send>) {
+  let liveness = crate::fleet::live_budget().max_deadline_ns();
+  // The wait for the task's end only; the task runs to its end on the control shard whatever this deadline does
+  // (`xshard::task_within`), and folds as it goes.
+  let deadline = liveness.saturating_mul(2);
+  let _ = crate::xshard::task_within(
     origin,
     control,
     move || async move {
       drain_stragglers();
-      let mut replies = Vec::new();
       for send in sends {
-        let sessions = borrow_session(send.holder, budget.max_deadline_ns()).await;
+        let sessions = borrow_session(send.holder, liveness).await;
+        let budget = exchange_budget(send.bytes.len(), &sessions);
         let exchanged =
           slates_cluster::live::exchange((send.stream, &send.bytes), sessions, budget, |_, _| true)
             .await;
         if exchanged.replies.is_empty() {
-          let _ = state::with_state(|s| s.count(LIVE_UNANSWERED, 1));
+          let _ = state::with_state(|s| {
+            s.count(LIVE_UNANSWERED, 1);
+            if send.stream == slates_cluster::live::LIVE_STATE_STREAM {
+              s.count(LIVE_INSTALL_UNANSWERED, 1);
+            }
+          });
         }
         lose_links(&exchanged.unanswered);
         crate::fleet::return_sessions(exchanged.reusable);
-        replies.extend(
-          exchanged
-            .replies
-            .into_iter()
-            .map(|(host, bytes)| (send.object, host, bytes)),
-        );
+        let replies: Vec<(ObjectId, HostId, Vec<u8>)> = exchanged
+          .replies
+          .into_iter()
+          .map(|(host, bytes)| (send.object, host, bytes))
+          .collect();
+        if !replies.is_empty() {
+          crate::xshard::run_on_counted(control, origin, move |s| fold_into(s, replies));
+        }
         settle_stragglers(origin, send.object, exchanged.stragglers);
       }
-      replies
     },
     deadline,
   )
-  .await
-  .unwrap_or_default()
+  .await;
+}
+
+/// The budget one message to one holder gets: the liveness budget a reply gets, plus the time its bytes take at the
+/// session's window-limited rate. Derived: `bytes × smoothed RTT / congestion window` (one window a round trip, the
+/// slowest a sender in congestion avoidance moves), so an install of the whole volume is given its transfer and an
+/// entry, a few kilobytes, about nothing more. Under the liveness budget alone an install of 1.5 MB never finished
+/// over a session a partition had left at an initial window and a 100–240 ms smoothed RTT: each was cut off, its link
+/// dropped and dialed afresh, at an initial window again, and the whole volume sent again, 1,391 times (2.06 GB) while
+/// both candidates already held the owner's head, and no write became durable (2026-11-06, `live_chaos.rs`).
+fn exchange_budget(
+  bytes: usize,
+  sessions: &[(HostId, slates_transport::endpoint::Endpoint)],
+) -> slates_cluster::CommitBudget {
+  let live = crate::fleet::live_budget();
+  let transfer_ns = sessions.first().map_or(0, |(_, endpoint)| {
+    // Before any sample the smoothed RTT reads zero; the probe timeout, twice the initial RTT then, stands in.
+    let round_trip = match endpoint.smoothed_rtt() {
+      0 => endpoint.pto(),
+      measured => measured,
+    };
+    u64::try_from(bytes)
+      .unwrap_or(u64::MAX)
+      .saturating_mul(round_trip)
+      .checked_div(endpoint.congestion_window().max(1))
+      .unwrap_or(0)
+  });
+  slates_cluster::CommitBudget::hard(
+    live.deadline_ns.saturating_add(transfer_ns),
+    live.poll_interval_ns,
+  )
 }
 
 /// Borrows `holder`'s record session, waiting for it while another dispatch has it out, one timer tick at a time,
