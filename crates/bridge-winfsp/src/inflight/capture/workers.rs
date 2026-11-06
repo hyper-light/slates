@@ -80,6 +80,10 @@ mod oracle {
     closed: BTreeSet<u64>,
     /// Confirmations that came after their open's Close: the shard refuses them `Stale` and the worker ends.
     stale: u64,
+    /// Opens confirmed whose response is not yet sent: a kill now must still hand the kernel each one's context.
+    confirmed_unsent: BTreeSet<u64>,
+    /// Deaths that left such an open: the kills between a posted confirmation and its send.
+    kills_between_confirm_and_send: u64,
   }
 
   impl World {
@@ -134,6 +138,7 @@ mod oracle {
       self.freed_by.insert(irp.address, worker);
       // The client has its open the moment the response completes it, and closes it at once: the next IRP it makes.
       if let Some(context) = outcome {
+        self.confirmed_unsent.remove(&context);
         let address = self
           .free
           .pop()
@@ -196,26 +201,27 @@ mod oracle {
     budget: Option<usize>,
     crashed: bool,
     schedule: u64,
-    finished: [bool; WORKERS],
+    finished: Vec<bool>,
   }
 
   impl Turnstile {
-    fn new(budget: Option<usize>, schedule: u64) -> Self {
+    fn new(budget: Option<usize>, schedule: u64, workers: usize) -> Self {
       Self {
         state: Mutex::new(Gate {
           step: 0,
           budget,
           crashed: false,
           schedule,
-          finished: [false; WORKERS],
+          finished: vec![false; workers],
         }),
         turned: Condvar::new(),
       }
     }
 
     fn whose(gate: &Gate) -> usize {
-      let preferred = usize::try_from((gate.schedule >> (gate.step % 61)) & 1).unwrap() % WORKERS;
-      if gate.finished[preferred] {
+      let workers = gate.finished.len();
+      let preferred = usize::try_from((gate.schedule >> (gate.step % 61)) & 1).unwrap() % workers;
+      if gate.finished[preferred] && workers > 1 {
         1 - preferred
       } else {
         preferred
@@ -306,6 +312,10 @@ mod oracle {
         world.stale += 1;
         return;
       }
+      // Only an open whose response has not gone out is confirmed and unsent; after the send, the kernel has it.
+      if !world.completed.values().any(|done| *done == Some(context)) {
+        world.confirmed_unsent.insert(context);
+      }
       let before = world.unconfirmed.len();
       world.unconfirmed.retain(|(pending, _)| *pending != context);
       assert_eq!(
@@ -315,6 +325,14 @@ mod oracle {
       );
       world.confirmed.insert(context);
     }
+  }
+
+  /// When a worker confirms an open: before its response is sent, as the dispatcher does, or after, the order that raced
+  /// with a Close through the other worker (`docs/bugs/2026-11-06-an-opens-close-overtook-its-confirmation.md`).
+  #[derive(Clone, Copy, PartialEq, Eq)]
+  enum Order {
+    ConfirmBeforeSend,
+    ConfirmAfterSend,
   }
 
   /// What a worker does next: receive with no response, or take the batch its last combined call delivered.
@@ -337,6 +355,7 @@ mod oracle {
     memory: &mut [u8],
     world: &Mutex<World>,
     gate: &Turnstile,
+    order: Order,
   ) -> Result<(), Crashed> {
     let mut fill = Fill::new();
     let mut next = Next::Receive;
@@ -398,8 +417,10 @@ mod oracle {
           break;
         }
         // Confirmed before the response is sent, as the dispatcher confirms every open.
-        gate.pass(worker)?;
-        confirm(&response, world);
+        if order == Order::ConfirmBeforeSend {
+          gate.pass(worker)?;
+          confirm(&response, world);
+        }
         gate.pass(worker)?;
         {
           let mut world = world.lock().unwrap();
@@ -409,6 +430,10 @@ mod oracle {
           world.arrive(1 - call % 2);
         }
         gate.pass(worker)?;
+        if order == Order::ConfirmAfterSend {
+          confirm(&response, world);
+          gate.pass(worker)?;
+        }
         batch.acknowledge(request.hint()).unwrap();
       }
     }
@@ -488,15 +513,22 @@ mod oracle {
   }
 
   /// One daemon's life: recovery, then both workers serving, every step through `gate`.
-  fn life(memories: &mut [Vec<u8>], world: &Mutex<World>, gate: &Turnstile) -> Result<(), Crashed> {
+  fn life(
+    memories: &mut [Vec<u8>],
+    world: &Mutex<World>,
+    gate: &Turnstile,
+    order: Order,
+  ) -> Result<(), Crashed> {
     recover(memories, world, gate)?;
+    let workers = gate.state.lock().unwrap().finished.len();
     let results: Vec<Result<(), Crashed>> = std::thread::scope(|scope| {
       let handles: Vec<_> = memories
         .iter_mut()
+        .take(workers)
         .enumerate()
         .map(|(worker, memory)| {
           scope.spawn(move || {
-            let result = serve(worker, memory, world, gate);
+            let result = serve(worker, memory, world, gate, order);
             gate.finish(worker);
             result
           })
@@ -527,28 +559,42 @@ mod oracle {
     passed_handed_off: u64,
     closes: u64,
     stale: u64,
+    kills_between_confirm_and_send: u64,
   }
 
   /// Kills the daemon after each of `crashes` steps in turn, the last life living; returns that life's steps.
-  fn scenario(schedule: u64, crashes: &[usize], tally: &mut Tally) -> usize {
+  fn scenario(
+    schedule: u64,
+    crashes: &[usize],
+    tally: &mut Tally,
+    workers: usize,
+    order: Order,
+  ) -> usize {
     let mut memories: Vec<Vec<u8>> = (0..WORKERS).map(|_| vec![0; BYTES]).collect();
     let world = Mutex::new(World::default());
     for crash in crashes {
       let gate = Turnstile::new(
         Some(*crash),
         schedule.rotate_left(u32::try_from(*crash % 64).unwrap()),
+        workers,
       );
-      if life(&mut memories, &world, &gate).is_ok() {
+      if life(&mut memories, &world, &gate, order).is_ok() {
         break;
       }
+      let mut world = world.lock().unwrap();
+      if !world.confirmed_unsent.is_empty() {
+        world.kills_between_confirm_and_send += 1;
+        world.confirmed_unsent.clear();
+      }
     }
-    let gate = Turnstile::new(None, schedule);
-    assert!(life(&mut memories, &world, &gate).is_ok());
+    let gate = Turnstile::new(None, schedule, workers);
+    assert!(life(&mut memories, &world, &gate, order).is_ok());
     let world = world.into_inner().unwrap();
     tally.scenarios += 1;
     tally.lost += IRPS + world.closes_made - u64::try_from(world.completed.len()).unwrap();
     tally.closes += world.closes_made;
     tally.stale += world.stale;
+    tally.kills_between_confirm_and_send += world.kills_between_confirm_and_send;
     tally.wrong += world.wrong;
     tally.twice += world.twice;
     tally.bogus += world.bogus;
@@ -564,28 +610,39 @@ mod oracle {
     gate.steps()
   }
 
-  /// A-219. Do: serve twelve IRPs on two workers under several schedules, killing the daemon at every step of every worker,
-  /// and again with its successor killed at a step too; the last life lives. Expect: every IRP completed once with its own
-  /// identity and a context the ledger kept, none lost; and the oracle saw what it guards: an address freed by one worker's
-  /// response delivered to the other, requests passed over at recovery, unstamped batches, and a hand-off that delivered
-  /// nothing whose saved response the other worker's newer delivery superseded.
-  #[test]
-  fn two_workers_answer_every_irp_once_with_its_own_response_whatever_step_the_daemon_dies_at() {
+  /// Shape: the workers' interleavings the sweeps run, each bit of a step's index picking a worker.
+  const SCHEDULES: [u64; 4] = [
+    0x5555_5555_5555_5555,
+    0x3333_3333_3333_3333,
+    0x0F0F_0F0F_0F0F_0F0F,
+    0x9E37_79B9_7F4A_7C15,
+  ];
+
+  /// Every first crash step and every [`SECOND_CRASH_STRIDE`]th second one, under each of `schedules`.
+  fn sweep(schedules: &[u64], workers: usize, order: Order) -> Tally {
     let mut tally = Tally::default();
-    for schedule in [
-      0x5555_5555_5555_5555u64,
-      0x3333_3333_3333_3333,
-      0x0F0F_0F0F_0F0F_0F0F,
-      0x9E37_79B9_7F4A_7C15,
-    ] {
-      let steps = scenario(schedule, &[], &mut tally);
+    for schedule in schedules {
+      let steps = scenario(*schedule, &[], &mut tally, workers, order);
       for first in 0..steps {
-        scenario(schedule, &[first], &mut tally);
+        scenario(*schedule, &[first], &mut tally, workers, order);
         for second in (0..steps).step_by(SECOND_CRASH_STRIDE) {
-          scenario(schedule, &[first, second], &mut tally);
+          scenario(*schedule, &[first, second], &mut tally, workers, order);
         }
       }
     }
+    tally
+  }
+
+  /// A-219. Do: serve twelve IRPs and every Close their clients make on two workers under several schedules, each open
+  /// confirmed before its response is sent as the dispatcher does, killing the daemon at every step of every worker and
+  /// again with its successor killed at a step too; the last life lives. Expect: every IRP completed once with its own
+  /// identity and a context the ledger kept, none lost, no confirmation stale. The oracle saw what it guards: an address
+  /// freed by one worker's response delivered to the other; requests passed over at recovery; unstamped batches; a
+  /// hand-off that delivered nothing whose saved response the other worker's newer delivery superseded; and kills between
+  /// a posted confirmation and its send, after which recovery still handed the kernel each context.
+  #[test]
+  fn two_workers_answer_every_irp_once_with_its_own_response_whatever_step_the_daemon_dies_at() {
+    let tally = sweep(&SCHEDULES, WORKERS, Order::ConfirmBeforeSend);
     eprintln!("A-219 model: {tally:?}");
     assert_eq!(
       (
@@ -603,9 +660,41 @@ mod oracle {
         && tally.passed_over > 0
         && tally.unstamped > 0
         && tally.passed_handed_off > 0
-        && tally.closes > 0,
+        && tally.closes > 0
+        && tally.kills_between_confirm_and_send > 0,
       "{tally:?}"
     );
+  }
+
+  /// A-219. Do: serve on one worker, each open confirmed after its response is sent, the order that raced at two
+  /// workers. Expect: no confirmation is ever stale, at any kill step, since the Close of an open is that worker's own
+  /// next request and is taken only after the confirmation; every IRP answered once with its own identity, none lost.
+  #[test]
+  fn one_worker_cannot_race_its_own_close_whatever_order_it_confirms_in() {
+    let tally = sweep(&SCHEDULES[..1], 1, Order::ConfirmAfterSend);
+    eprintln!("A-219 model, one worker confirming after the send: {tally:?}");
+    assert_eq!(
+      (
+        tally.lost,
+        tally.wrong,
+        tally.twice,
+        tally.wrong_context,
+        tally.stale
+      ),
+      (0, 0, 0, 0, 0),
+      "{tally:?}"
+    );
+    assert!(tally.closes > 0, "{tally:?}");
+  }
+
+  /// A-219. Do: serve on two workers with each open confirmed after its response is sent. Expect: the oracle catches the
+  /// race the dispatcher's order removes, a Close through the other worker retiring an open before its confirmation, so
+  /// the sweep above cannot pass vacuously.
+  #[test]
+  fn two_workers_confirming_after_the_send_race_a_close() {
+    let tally = sweep(&SCHEDULES, WORKERS, Order::ConfirmAfterSend);
+    eprintln!("A-219 model, two workers confirming after the send: {tally:?}");
+    assert!(tally.stale > 0, "{tally:?}");
   }
 
   /// A-219. Do: plan two journals whose batches share an address. Expect: the older delivery passed over, the newest kept;

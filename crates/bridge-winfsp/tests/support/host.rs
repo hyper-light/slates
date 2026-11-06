@@ -76,10 +76,14 @@ const OVERLAP_FILES: usize = 4;
 /// Shape: the steps of the pause before each kill, in POLLs, so kills fall at different points of a cycle.
 const OVERLAP_PAUSES: u32 = 4;
 /// Format: a private Released marker base, after the purge oracle's PURGE_TAKEN: a successor's reading of which journals
-/// the kill left a batch in, plus a set with bit `n` for worker `n`'s journal.
+/// the kill left a batch in, plus a set with bit `n` for worker `n`'s journal and bit [`SAVED_OPEN_BIT`] when a journal
+/// held a saved successful open not yet acknowledged.
 const LANDING: u64 = PURGE_TAKEN + 1;
-/// Format: every set of journals holding a request, one bit a worker.
-const LANDINGS: usize = 1 << crate::inflight::capture::MAX_WORKERS;
+/// Format: the landing's bit for a saved, unacknowledged open: the kill fell after an open's response was saved and
+/// before it was acknowledged, the window that holds its confirmation being posted and its response sent.
+const SAVED_OPEN_BIT: usize = crate::inflight::capture::MAX_WORKERS;
+/// Format: every landing: the sets of journals holding a request, with or without a saved open.
+const LANDINGS: usize = 1 << (crate::inflight::capture::MAX_WORKERS + 1);
 /// Format: a private Released marker: the serving process's later worker began serving once its probe measured (A-219).
 const WORKER_RELEASED: u64 = LANDING + LANDINGS as u64;
 /// Format: a private Released marker: the probing role has made its probe volume and is measuring on it.
@@ -771,6 +775,14 @@ fn journals_holding_a_batch(ledger: &OwnedHandle) -> u64 {
         &mut captured,
       )
       .unwrap();
+    if crate::inflight::capture::Capture::new(&mut captured.clone())
+      .unwrap()
+      .retained_open()
+      .unwrap()
+      .is_some()
+    {
+      holding |= 1 << SAVED_OPEN_BIT;
+    }
     if crate::inflight::capture::Capture::new(&mut captured)
       .unwrap()
       .resume()
@@ -934,6 +946,20 @@ fn every_request_is_answered_with_its_own_response_across_kills_of_two_receive_w
     .filter(|(set, _)| set & 2 != 0)
     .map(|(_, kills)| *kills)
     .sum::<u32>();
+  let saved_open = landings
+    .iter()
+    .flat_map(|by_set| by_set.iter().enumerate())
+    .filter(|(set, _)| set & (1 << SAVED_OPEN_BIT) != 0)
+    .map(|(_, kills)| *kills)
+    .sum::<u32>();
+  eprintln!(
+    "WINFSP OVERLAP: {saved_open} of {OVERLAP_KILLS} kills fell after an open's response was saved and before it was \
+     acknowledged (its confirmation posted, its response sent or not), and recovery answered every read"
+  );
+  assert!(
+    saved_open > 0,
+    "no kill fell between an open's saved response and its acknowledgement, so this run proves nothing about it"
+  );
   assert!(
     second > 0,
     "no kill left the second worker holding a request, so this run proves nothing about it"

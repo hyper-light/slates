@@ -21,7 +21,14 @@ and the client may close the handle at once. With two workers the Close can be d
 callback reaches the shard first and retires the open. The first worker's confirmation then finds no open: the ledger
 refuses it `Stale`, and the worker ends.
 
-With one worker this cannot happen: the Close is that worker's own next request, taken only after the confirmation.
+**Why one worker cannot race.** An open's Close is a request the client makes only once the Create's response has
+completed its Create. With one worker, that Close is the worker's own next request, taken only after the worker has
+finished serving the Create, its confirmation included, whichever order it confirms in. Two counters back this:
+- the model at one worker, confirming after the send (the old order):
+  `one_worker_cannot_race_its_own_close_whatever_order_it_confirms_in`, 2,339 scenarios, 26,041 Closes, 0 stale;
+- the live oracles: `open confirmation refused` appears 0 times in all four jobs of diagnostics run 42161844107
+  (`diag-winfsp-overlap-29`), at one fixed worker and at two, on both runners.
+
 A-215's hand-off already posts a batch's last response's confirmation before its call. So in the combined form only
 the other responses of a batch kept the race. That is narrower: it takes a batch of more than one request, then a
 client that closes at once.
@@ -47,5 +54,15 @@ counts `winfsp.mount_lost`).
   - The model now confirms in the same order: 9,583 scenarios, 100,698 Closes, 0 lost, 0 wrong, 0 twice, 0 wrong
     contexts, 0 stale.
   - `confirm_open`, which confirmed after the send, is gone.
+- **The model kills at the new step.** Its turnstile passes between a posted confirmation and the response's send,
+  and `kills_between_confirm_and_send` counts the deaths that left an open confirmed but unsent. The two-worker sweep
+  requires it above zero: 1,429 deaths over 9,883 scenarios. In every one, recovery still handed the kernel the open's context,
+  either by the response that went out or by the saved Create sent again, with 0 wrong contexts. So A-215's argument is
+  checked at every such kill, not only argued.
+- **The race stays caught.** `two_workers_confirming_after_the_send_race_a_close` runs the old order at two workers
+  and requires stale confirmations: 314 of 9,328 scenarios.
+- **The live oracle counts the window too.** Each successor reports whether a dead worker's journal held a saved,
+  unacknowledged successful open. That window runs from the open's response being saved to its acknowledgement, and it
+  contains confirm-posted to sent. The 40-kill oracle requires at least one such kill at each count.
 - The successor's crash step in the oracle samples every 13th step (`SECOND_CRASH_STRIDE`), since a life with Closes is
   about three times longer. It runs in 29.8 s on this Mac, and every non-vacuity counter still moves.
