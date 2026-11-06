@@ -335,7 +335,9 @@ fn acknowledged_work_edits_survive_a_daemon_restart() {
 }
 
 /// The acknowledged state `acknowledged_work_edits_survive_a_daemon_restart` restarts over: work A accepted at 2 and
-/// then edited again; work B conflicted, resolved by rebasing onto 2, and edited again. Returns `(A, B)`.
+/// then edited again; work B conflicted, resolved by rebasing onto 2, and edited again. Returns `(A, B)`. Built where
+/// its one caller is.
+#[cfg(unix)]
 fn edits_before_a_restart(client: &mut Client, green: VolumeId) -> (VolumeId, VolumeId) {
   let (a, _) = client.create_work(green, "a").unwrap();
   let (b, _) = client.create_work(green, "b").unwrap();
