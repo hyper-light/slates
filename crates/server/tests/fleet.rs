@@ -11072,6 +11072,100 @@ fn a_submit_is_answered_only_once_its_record_commits_at_the_quorum() {
   assert_commit_gate(&gate);
 }
 
+/// §4.16 "Commit" (AUD-11) with D-7's one owning shard per volume (found 2026-11-06 by the Linux load rungs: in a
+/// three-server fleet of seven-shard daemons at `f = 1`, no submit to a green was ever answered; the green's owner
+/// counted `merge.acceptance_deferred` 30 and `merge.inputs_unplaced` 591 in 60 s, and `merge.acceptance_resolved`
+/// never). Do: in a two-node `f = 1` fleet of two-shard daemons, a green whose name routes to the shard that is not the
+/// control shard, a work over it with one edit, and a submit. Expect the submit accepted as version 1, the version's
+/// record placed at the quorum and the acceptance resolved, as on the control shard
+/// ([`a_submit_is_answered_only_once_its_record_commits_at_the_quorum`] runs there).
+#[test]
+fn a_submit_to_a_green_on_a_non_control_shard_is_answered_once_its_record_commits() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, [pa_probe, pa_record, pb_probe, pb_record]) = four_free_ports();
+  let a = node("a", pa_probe, pa_record);
+  let b = node("b", pb_probe, pb_record);
+  let pid = std::process::id();
+  let instance_a = format!("fleet-{}-{pid}", a.host.0);
+  let peer_of_a = Peer {
+    anchor: b.origin_anchor,
+    host: b.host,
+    address: b.address,
+    record_address: b.record_address,
+    certificate: b.identity.certificate(),
+  };
+  let peer_of_b = Peer {
+    anchor: a.origin_anchor,
+    host: a.host,
+    address: a.address,
+    record_address: a.record_address,
+    certificate: a.identity.certificate(),
+  };
+  let daemon_a = start_sharded(a, peer_of_a, TWO_SHARDS);
+  let daemon_b = start_sharded(b, peer_of_b, TWO_SHARDS);
+  assert!(
+    form_and_settle(&[&daemon_a, &daemon_b]),
+    "the fleet's groups formed before the test acts"
+  );
+  let mut client = Client::connect(&instance_a);
+  let name = name_on_partition("green", OTHER_PARTITION, usize::from(TWO_SHARDS));
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name,
+    require_evidence: false,
+    base: None,
+  }) else {
+    daemon_a.stop();
+    daemon_b.stop();
+    panic!("create green");
+  };
+  let on_other_shard = slates_server::verbs::owner_of(green) == OTHER_PARTITION;
+  let ReplyBody::WorkCreated { id: work, .. } = client.call(&RequestBody::CreateWork {
+    green,
+    name: "work".to_owned(),
+  }) else {
+    daemon_a.stop();
+    daemon_b.stop();
+    panic!("create work");
+  };
+  let edited = client.call(&RequestBody::Edit {
+    work,
+    path: "f".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"hello".to_vec(),
+  });
+  let submitted = client.call(&RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  });
+  let placed = daemon_a.merge_record_placed(green, 1);
+  let counters = daemon_a.fleet_refusals().map(|counters| {
+    counters
+      .into_iter()
+      .filter(|(name, _)| name.starts_with("merge."))
+      .collect::<Vec<_>>()
+  });
+  daemon_a.stop();
+  daemon_b.stop();
+  assert!(
+    on_other_shard,
+    "the green is on the shard that is not the control shard"
+  );
+  assert!(
+    matches!(edited, ReplyBody::Edited),
+    "the edit was declared: {edited:?}"
+  );
+  assert_eq!(
+    submitted,
+    ReplyBody::Submitted {
+      version: Some(1),
+      conflicts: Vec::new(),
+    },
+    "the submit is accepted once its record commits; the record placed {placed:?}; the owner's merge counters \
+     {counters:?}"
+  );
+}
+
 /// A green, a work over it with one edit declared, and the submit request that would advance it.
 fn edited_work_to_submit(client: &mut Client) -> (VolumeId, RequestBody) {
   let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {

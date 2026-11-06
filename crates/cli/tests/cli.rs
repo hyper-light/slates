@@ -3590,6 +3590,174 @@ fn three_daemon_processes_deploy_a_fleet_from_one_manifest_and_survive_the_owner
   drop(scratch);
 }
 
+/// Each fleet node's merge, content and seal counters and its fleet view from `status --json`: what an unanswered submit
+/// in a fleet is waiting on (`a_submit_in_a_three_process_fleet_is_answered_once_its_record_commits`).
+fn commit_counters(instances: &[String]) -> Vec<String> {
+  instances
+    .iter()
+    .map(|instance| {
+      let (_, out, _) = run(instance, &["status", "--json"]);
+      let status: serde_json::Value = serde_json::from_str(&out).unwrap_or_default();
+      let named: Vec<String> = status["shards"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .flat_map(|(shard, report)| {
+          report["refusals"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(move |refusal| {
+              let kind = refusal["kind"].as_str()?;
+              ["merge.", "fleet.content", "fleet.seal", "content.sealed"]
+                .iter()
+                .any(|prefix| kind.starts_with(prefix))
+                .then(|| format!("{shard}:{kind}={}", refusal["count"]))
+            })
+        })
+        .collect();
+      let fleet: Vec<String> = status["fleet"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(_, value)| !value.is_object())
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+      let council = &status["fleet"]["council"];
+      format!("{instance} {named:?} fleet {fleet:?} council {council}")
+    })
+    .collect()
+}
+
+/// Three daemon processes from one manifest at `f = 1`, formed and bootstrapped as the deployment flow is: the scratch,
+/// the processes, their instances and the index of the node the root was bootstrapped on.
+fn bootstrapped_fleet(prefix: &str) -> (ScratchDir, Vec<FleetProcess>, Vec<String>, usize) {
+  let pid = std::process::id();
+  let scratch = scratch_dir();
+  for node in FLEET_NODES {
+    mint_identity(&scratch.path, node);
+  }
+  let blocks = port_blocks();
+  let bases: Vec<u16> = blocks.iter().map(|held| held.base).collect();
+  let manifest = write_manifest(&scratch.path, &bases);
+  let instances: Vec<String> = FLEET_NODES
+    .iter()
+    .map(|node| format!("{prefix}-{node}-{pid}"))
+    .collect();
+  let daemons: Vec<FleetProcess> = FLEET_NODES
+    .iter()
+    .zip(&instances)
+    .zip(&blocks)
+    .map(|((node, instance), held)| start_fleet_daemon(instance, &manifest, node, held))
+    .collect();
+  for instance in &instances {
+    wait_answers(instance);
+  }
+  let views = wait_fleet_views(
+    &instances,
+    FLEET_NODES.len(),
+    u32::try_from(FLEET_NODES.len() - 1).unwrap(),
+  );
+  assert_formed(&views);
+  let bootstrap = views
+    .iter()
+    .enumerate()
+    .min_by_key(|(_, view)| view.as_ref().unwrap().host.parse::<u64>().unwrap())
+    .map(|(index, _)| index)
+    .unwrap();
+  let (code, _, error) = run(&instances[bootstrap], &["bootstrap", "root"]);
+  assert_eq!(
+    code, 0,
+    "one explicit bootstrap of the fresh fleet: {error}"
+  );
+  (scratch, daemons, instances, bootstrap)
+}
+
+/// A green on `owner`, made once its groups have formed: until then a green is refused `ConsensusNotInitialized`, typed,
+/// before any effect, so only that refusal is retried, within the fleet wait.
+fn green_once_groups_form(owner: &str) -> String {
+  let deadline = Instant::now() + FLEET_WAIT;
+  loop {
+    let (code, out, err) = run(owner, &["green", "g"]);
+    if code == 0 {
+      break value_of(&out, "id");
+    }
+    assert!(
+      err.contains("ConsensusNotInitialized") && Instant::now() < deadline,
+      "create the green: {err}"
+    );
+    pause();
+  }
+}
+
+/// Runs `slates --instance INSTANCE ARGS…` with a deadline: `None` when it has not exited by then (it is killed and reaped,
+/// so a hung verb fails its test rather than the test hanging).
+fn run_within(instance: &str, args: &[&str], within: Duration) -> Option<(i32, String, String)> {
+  let mut child = slates()
+    .arg("--instance")
+    .arg(instance)
+    .args(args)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let deadline = Instant::now() + within;
+  while child.try_wait().unwrap().is_none() {
+    if Instant::now() >= deadline {
+      let _ = child.kill();
+      let _ = child.wait();
+      return None;
+    }
+    pause();
+  }
+  let out = child.wait_with_output().unwrap();
+  Some((
+    out.status.code().unwrap_or(-1),
+    String::from_utf8_lossy(&out.stdout).into_owned(),
+    String::from_utf8_lossy(&out.stderr).into_owned(),
+  ))
+}
+
+/// §4.16 "Commit" (AUD-11) across processes (found 2026-11-06 by the Linux load rungs on loadtest-scale's
+/// `load_scale.rs`: in a three-server fleet at `f = 1`, a submit to a green was never answered, with one client or
+/// three hundred, and even a CLI `submit` on the owner itself had not returned after 600 s; the owner counted
+/// `merge.inputs_unplaced` every period and `merge.acceptance_resolved` never). The same rule passes in-process with
+/// two or three nodes, one, two or seven shards, local or forwarded. Do: three daemon processes from one manifest at
+/// `f = 1`, formed and bootstrapped as the deployment flow is; on one node a green, a work over it and one edit; then
+/// `submit`. Expect it answered, accepted as version 1, within the fleet wait.
+#[test]
+fn a_submit_in_a_three_process_fleet_is_answered_once_its_record_commits() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the fleet submit: set SLATES_TEST_CLI=1 to run it (three daemons; needs the machine to itself)"
+    );
+    return;
+  }
+  let (scratch, daemons, instances, bootstrap) = bootstrapped_fleet("cli-commit");
+  let owner = &instances[bootstrap];
+  let green = green_once_groups_form(owner);
+  let (code, out, err) = run(owner, &["work", &green, "w"]);
+  assert_eq!(code, 0, "create the work: {err}");
+  let work = value_of(&out, "id");
+  let (code, _, err) = run(owner, &["edit", &work, "f", "0", "0", "hello"]);
+  assert_eq!(code, 0, "declare the edit: {err}");
+  let submitted = run_within(owner, &["submit", &work], FLEET_WAIT);
+  // Each node's merge, content and seal counters as the wait ends, so an unanswered submit names where it waits.
+  let counters = commit_counters(&instances);
+  drop(daemons);
+  drop(scratch);
+  let (code, out, err) = submitted.unwrap_or_else(|| {
+    panic!("the submit was answered within the fleet wait; each node's counters {counters:?}")
+  });
+  assert_eq!(code, 0, "the submit was accepted: {err}");
+  assert_eq!(
+    value_of(&out, "version"),
+    "1",
+    "accepted as version 1: {out}"
+  );
+}
+
 // --- T-4.13: the OCI namespace handoff (§4.6 A-9; AC-4.11; RQ-20). ---
 
 /// Shape: how long one container run may take on a loaded box (the first emulated `linux/amd64`
