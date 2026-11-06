@@ -11013,13 +11013,56 @@ fn an_anchor_whose_log_reader_went_away_keeps_supervising() {
   );
 }
 
+/// A pipe whose two ends are close-on-exec. `rustix::pipe::pipe` is a bare `pipe(2)`: a child another test spawns
+/// while the ends are open inherits them for its whole life, so a read end the test has dropped still has a reader and
+/// a write to it succeeds (main CI 42152000416, ubuntu-latest: exit 0 where 4 was due). Linux has `pipe2`; Apple has
+/// none, so `fcntl` marks both ends at once, as `slates-ipc`'s delivery pipe does.
+fn close_on_exec_pipe() -> (rustix::fd::OwnedFd, rustix::fd::OwnedFd) {
+  #[cfg(target_os = "linux")]
+  let ends = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).unwrap();
+  #[cfg(not(target_os = "linux"))]
+  let ends = {
+    let (reader, writer) = rustix::pipe::pipe().unwrap();
+    rustix::io::fcntl_setfd(&reader, rustix::io::FdFlags::CLOEXEC).unwrap();
+    rustix::io::fcntl_setfd(&writer, rustix::io::FdFlags::CLOEXEC).unwrap();
+    (reader, writer)
+  };
+  ends
+}
+
+/// Waits, within [`WAIT_FOR`], until no process holds the pipe's read end, which the write end reports as an error or a
+/// hang-up: a child forked by another test before the drop keeps a copy until its own `exec` closes it.
+fn wait_until_no_reader(writer: &rustix::fd::OwnedFd) {
+  let deadline = Instant::now() + WAIT_FOR;
+  loop {
+    let mut fds = [rustix::event::PollFd::new(
+      writer,
+      rustix::event::PollFlags::OUT,
+    )];
+    let left = deadline.saturating_duration_since(Instant::now());
+    let timeout = rustix::time::Timespec::try_from(left).unwrap();
+    let _ = rustix::event::poll(&mut fds, Some(&timeout));
+    if fds[0]
+      .revents()
+      .intersects(rustix::event::PollFlags::ERR | rustix::event::PollFlags::HUP)
+    {
+      return;
+    }
+    assert!(
+      Instant::now() < deadline,
+      "the pipe's read end is still held after {WAIT_FOR:?}"
+    );
+  }
+}
+
 /// The panic rule, for a command's output (A-213). Do: run `slates --help` with its standard output a pipe whose reader
 /// has already gone, as `slates status | head -n 1` leaves a command once `head` has its line. Expect: exit 4 (failed),
 /// with a line saying the output could not be written, not a panic.
 #[test]
 fn a_command_whose_output_reader_went_away_fails_without_a_panic() {
-  let (reader, writer) = rustix::pipe::pipe().unwrap();
+  let (reader, writer) = close_on_exec_pipe();
   drop(reader);
+  wait_until_no_reader(&writer);
   let output = slates()
     .arg("--help")
     .stdout(Stdio::from(writer))

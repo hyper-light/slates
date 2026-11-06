@@ -1,5 +1,54 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **The anchor kills live daemons on a busy machine (found 2026-11-06, audit step 7; open, to be assigned).** Under the
+> A/B bar's load, two spinners a logical CPU (8 on CI's 4-CPU Windows runners), the anchor killed daemons that were
+> alive and serving because their heartbeat lapsed its 1,000 ms liveness budget. A busy machine is the normal case
+> (Ada's rule), so a starved but live daemon must not be killed.
+> - **Seen:**
+>   - Diagnostics run 42161838327 (`diag-winfsp-overlap-28`, four daemons beside the spinners), x86_64 run 1: the
+>     anchor killed sep1 (main `28359a75`, unchanged receiver) and comb1, logging `the daemon's heartbeat lapsed;
+>     killing it`. That run's late heartbeats (gaps of half the budget or more): sep1 16, comb2 13, comb1 11. The DLL
+>     build (`71cf09ac`) does not log them.
+>   - Run 42130583401 (`diag-winfsp-overlap-20`, two daemons) lost x86_64 run 3 the same way, to the DLL arm's daemon.
+>   - Run 42080252187 (winfsp-bench, `eb0983ec`'s entry) lost one run likewise, the DLL arm's on x86_64.
+>   - A killed daemon's drive dies, and `mount_bench` fails that run's whole loaded phase for every arm.
+> - **The budget is a fixed number, not derived:** `slates_server::daemon::LIVENESS_BUDGET_NS = 1_000_000_000`, a
+>   `Shape:` constant documented as "a second; the supervisor's input until the CLI takes the operator's value". The beat
+>   cadence is a tenth of it (`HEARTBEAT_NS`, 100 ms), so nine beats fit in it. Nothing in it is measured from the
+>   machine or its load.
+> - **What misses is the shard, not a heartbeat thread.** The heartbeat is a task, `heartbeat_loop`, on the control
+>   shard's own executor (`crates/server/src/daemon.rs`), so a beat misses whenever that shard's thread does not run.
+>   `log_late_beat` shows what it did in each gap. In the run 1 above the shard ran 2-4 steps in 974-1,036 ms. Its
+>   longest poll was 503-576 ms, with all 3-5 of the gap's polls unattributed (none counted as a task's own CPU,
+>   blocked in the kernel, or preempted by the host), and its timer overrun was 42-92 ms. That reads as the thread kept
+>   off the CPU. That Windows reports that preemption as unattributed is a hypothesis, not checked.
+> - **What was tried:** winfsp-bench's `eb0983ec` measured every shard thread at `THREAD_PRIORITY_ABOVE_NORMAL` (run
+>   42080252187). Neither that arm nor the normal one lapsed there, each alone beside the spinners. It was not adopted
+>   because it cost x86_64's loaded p50s. **The heartbeat alone at a raised priority was never tried, and cannot be as
+>   built:** it is a task on a shard, not a thread of its own.
+> - Not fixed on the Step 7 branches; to be assigned.
+
+> **A-190's purge client leaves the daemon's process (2026-11-06, fixed); the sweep for the rest (open).** No daemon
+> thread opens a path on a volume the daemon serves (§4.6). The coherent purge's opens, writes and reads now run in a
+> child process of the daemon's own binary (`slates winfsp-purge-client`), in a kill-on-close job, asked over a pipe
+> (A-190's amendment of 2026-11-06). The purge kill oracle requires a server killed while it holds the purge's open to
+> exit within one transaction timeout (1,000 ms): the fix 1.74 ms on x86_64 and 2.89 ms on arm64 (run 42155196630, with
+> the bridge's 77, the CLI's 13 and `winfsp_semantics`' 7 green on each); main's code did not exit in 1,000 ms on either runner, nor
+> after the anchor let the volume go (run 42155020781), and nor did the fix with the in-process open put back (run
+> 42155197023). The sweep found three more places a daemon thread opens a host path it does not check against its own mounts.
+> Each is open, and each is a hang or a stranded exit only when that path lies on a volume this daemon serves:
+> - **A base directory** (`OsHost::open_root`, `crates/server/src/verbs.rs` `open_base` and the recovery's reacquire):
+>   a volume over a base on a slates drive or mount this daemon serves is read by its shard threads through that mount,
+>   for every lookup and read of the base.
+> - **A landing's target** (`OsLand::open_target`, `crates/server/src/landing.rs`): the granted landing's writes and its
+>   barrier thread (A-132) run in the daemon.
+> - **A FUSE mount point's check** (`check_mount_point`, `crates/server/src/fuse.rs`, `statat` on the shard): a mount
+>   point inside another of this daemon's FUSE mounts makes the shard ask its own mount.
+> - Not found elsewhere: FUSE mounts and unmounts run in `fusermount3`, macOS's NFS `mount(2)` runs in the CLI's
+>   process, the WinFsp drive link is `DefineDosDeviceW` (no request on the volume), and A-219's probe is off main.
+> - Owed for each: a refusal (typed) of a path on a mount this daemon serves, decided before any open, with a test that
+>   asks for one.
+
 > **WinFsp receiver: Step 7's regression against the DLL stands (2026-11-06, audit step 7; open).** Diagnostics run
 > 42130583401 (BENCHMARKS, "Step 7's measured state") measured main's one-worker receiver against `71cf09ac`'s DLL
 > dispatcher, five runs a runner, quiet and loaded. It was beyond the DLL's spread in 13 cells on arm64 (quiet stat p50
@@ -8,7 +57,8 @@
 >   on a volume the daemon serves, and a kill then strands it. WinFsp's processing queue is never cancelled
 >   (`FSP_IOQ_PROCESS_NO_CANCEL`), so every killed probing role outlived the 10 s reap. So A-219's runtime (`e070f31e`,
 >   `5b5f7ba1`) is off main. **Rule: a daemon never sends I/O to a volume it serves itself.**
-> - **A-190's coherent purge breaks the same rule on main (open, sibling found 2026-11-06).** The command thread opens the
+> - **A-190's coherent purge broke the same rule on main (sibling found 2026-11-06; fixed the same day, the entry
+>   above).** The command thread opens the
 >   daemon's own drive (`crates/bridge-winfsp/src/host.rs`, `CreateFileW` near line 2038) and writes and reads each
 >   purged range through it. A kill while one of those requests is delivered strands the daemon as the probe did, for one
 >   purge's request rather than a whole probe; no run has been seen to hit it. The fix is to run the purge's client in a
@@ -490,7 +540,28 @@
 > restart; real-process chaos
 > (partitions, injected latency, volume failure, client disconnect). `put_wal` and the
 > loss-window report are unbuilt; a head still waits up to the 100 ms record period before its commit starts.
-> **Open, found landing 13 (2026-11-05): a live takeover can wait for its quorum and never serve.** On adacachy in a
+> **Fixed 2026-11-05 on agents/raft-2 (bug record `docs/bugs/2026-11-05-a-live-takeover-counted-no-empty-report-and-fenced-no-empty-copy.md`):
+> a live takeover could wait for its quorum and never serve, and phase one had a safety hole.** The hypothesis below held.
+> A successor that held no copy never counted itself (`fetch`), and a remote candidate that held no copy answered "none"
+> without raising a fence (`serve_fetch`). The second is a **safety defect**, on main since 7f57f1b6 (slice three,
+> landed in 2f343fcd) for opt-in live-shipped volumes: the db nemesis model, extended so a candidate's copy exists only
+> once a message reaches it, fails StaleNeverCommits in 10 of 400 seeds when an empty report counts without a fence. In
+> f=1 seed 27: the owner (host 1, epoch 1) had shipped nothing; host 3 took over at epoch 2 on two empty reports (hosts 2
+> and 3); host 3 appended position 0 = 1; host 1, resumed, appended its own position 0 = 3, which host 2 (no copy, no
+> fence, still taking host 1 for the owner) accepted, so position 0 was durable twice with two values. Fixed by
+> `live_ship::fenced_copy` at both sites: a candidate with no copy makes an empty one with its fence at the takeover's
+> epoch, and its report counts. Every invariant then holds (f=1: 110 takeovers, 57 empty reports; f=2: 241, 145); the
+> mutation stays as a test (`an_empty_report_without_a_fence_lets_a_superseded_owner_commit`). The liveness side is red
+> first and green after across real processes (`a_successor_that_holds_no_copy_still_takes_a_live_volume_over`: the
+> successor waited 397 times and never served; after, served in 3.2 s). A refused entry never counts as held
+> (`a_refused_entry_is_never_counted_as_held`). Still open, found on the way: why a candidate holds no copy. Holders now
+> count refusals by reason (`fleet.live.hold_refused.*`). Over three loaded runs one candidate refused the owner
+> `not_a_member` 22 times and then held the log (a membership lag at the fleet's start), but another refused 6 times
+> `not_a_member` and then 21 times `no_catalog` and held nothing for the whole run: a candidate that never receives the
+> volume's catalog keeps refusing, and the log rests on the other candidate alone (with it stopped, writes cannot be
+> durable; a soak run hung on exactly that). Owner: raft, next.
+>
+> **As found, landing 13 (2026-11-05): a live takeover can wait for its quorum and never serve.** On adacachy in a
 > capped unit (`CPUQuota=1200%`, load 18–25), `a_superseded_owner_resumed_after_its_takeover_is_fenced`
 > (`crates/cli/tests/live_fleet.rs`) failed 1 of 2 runs on the landing's tree: with the owner stopped, the survivor that
 > adopted the takeover (`fleet.takeover.adopted` 2) waited for its live log's quorum for the whole 40 s

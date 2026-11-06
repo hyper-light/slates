@@ -2200,7 +2200,7 @@ mod tests {
   /// nothing — the second through the same notifier, whose thread would be gone had it been joined after the first.
   #[test]
   fn a_round_whose_write_blocks_does_not_hold_its_owner_and_the_next_reuses_its_thread() {
-    let (reader, writer) = rustix::pipe::pipe().expect("a pipe");
+    let (reader, writer) = close_on_exec_pipe();
     let refill = rustix::io::dup(&writer).expect("a second descriptor on the pipe");
     let mut notifier = Notifier::start(writer, None).expect("the notifier starts");
     for round in 1..=2 {
@@ -2219,12 +2219,30 @@ mod tests {
     }
   }
 
+  /// A pipe whose two ends are close-on-exec, so a child another test spawns while they are open does not keep a copy
+  /// past its `exec` and hold a dropped end alive (main 2e74a8af, `crates/cli/tests/cli.rs` `close_on_exec_pipe`). Linux
+  /// sets the flag in the same call (`pipe2`); elsewhere it is set at once after, the one window a concurrent fork can
+  /// still land in.
+  /// The notifier tests depend on it: a dropped reader must fail the notifier's waiting write (`EPIPE`).
+  fn close_on_exec_pipe() -> (OwnedFd, OwnedFd) {
+    #[cfg(target_os = "linux")]
+    let ends = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).unwrap();
+    #[cfg(not(target_os = "linux"))]
+    let ends = {
+      let (reader, writer) = rustix::pipe::pipe().unwrap();
+      rustix::io::fcntl_setfd(&reader, rustix::io::FdFlags::CLOEXEC).unwrap();
+      rustix::io::fcntl_setfd(&writer, rustix::io::FdFlags::CLOEXEC).unwrap();
+      (reader, writer)
+    };
+    ends
+  }
+
   /// A-142: a notifier dropped with a round out ends its thread. Do: fill the device's pipe, hand the notifier a round,
   /// then drop the notifier while the write waits, the pipe's reader closing a moment later. Expect the drop to return:
   /// the write fails once the reader is gone, the thread finds the round channel closed and ends, and is joined.
   #[test]
   fn a_notifier_dropped_with_a_round_out_joins_its_thread() {
-    let (reader, writer) = rustix::pipe::pipe().expect("a pipe");
+    let (reader, writer) = close_on_exec_pipe();
     let refill = rustix::io::dup(&writer).expect("a second descriptor on the pipe");
     let mut notifier = Notifier::start(writer, None).expect("the notifier starts");
     fill(&refill);

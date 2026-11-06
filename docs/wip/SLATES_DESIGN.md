@@ -2921,9 +2921,15 @@ control handle closes only after every thread has exited. So a daemon killed wit
 exit. A-219's probe client did this, and every daemon killed or stopped during it outlived its reap: 10 s in the
 library kill oracles, 75-90 minutes in the CLI suites (`docs/bugs/2026-11-06-a-daemons-own-io-on-its-volume-strands-its-exit.md`).
 Anything that needs a client of a slates volume (a measurement, a check) runs that client in a child process.
-- **Open violation: A-190's coherent purge.** The command thread opens the drive under its private marker and writes
-  and reads each purged range through it, so a kill inside one of those requests strands the daemon the same way. Its
-  window is one purge's request. It is in GAPS until the purge's client leaves the daemon's process.
+- **A-190's coherent purge follows it (fixed 2026-11-06).** The command thread opened the drive under its private
+  marker and wrote and read each purged range through it, so a kill inside one of those requests stranded the daemon
+  the same way. The opens, writes and reads now run in the mount's purge client, a child process: a role of the daemon's
+  own binary (`slates winfsp-purge-client`), started in a kill-on-close job and asked over a message pipe
+  (`crates/bridge-winfsp/src/purge_client.rs`). The command thread only writes to the pipe and reads the answer, which
+  a dying thread's cancellation ends at once. Proven by `a_daemon_killed_while_its_purges_open_is_delivered_exits_within_a_transaction_timeout`
+  (A-190's amendment of 2026-11-06).
+- **Still open, found by the sweep of 2026-11-06 (GAPS):** a base directory, a landing's target and a FUSE mount point
+  are host paths the daemon opens itself, and none is refused when it lies on a mount this daemon serves.
 
 **Base reads on macOS and Windows.** As on Linux, the daemon reads untouched base files through its own descriptor or
 handle into evictable cache chunks (one copy, `pread`/`ReadFile` on the owner shard's driver) and
@@ -5771,6 +5777,13 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > are bounded per mount by the shard's bound on held verbs; past it an `fsync` is answered `EIO`, counted. Measured in
 > the flow: with both candidates stopped the `fsync` fails `EIO` after 1.0006 s (the liveness budget); healthy and after
 > the candidates resume, it succeeds.
+>
+> **Phase one with a candidate that holds no copy (2026-11-05).** Every candidate's report counts toward `f + 1`, an empty
+> one too, and every reporter raises its fence to the takeover's epoch, an empty one too: a candidate with no copy makes
+> an empty copy fenced at that epoch (`live_ship::fenced_copy`, at the successor's own report and at a remote
+> candidate's). Before, the successor counted itself only when it held a copy (a takeover could wait for its quorum for
+> good), and a remote candidate's empty report raised no fence, which the nemesis model shows breaks StaleNeverCommits
+> (10 seeds; bug record `docs/bugs/2026-11-05-a-live-takeover-counted-no-empty-report-and-fenced-no-empty-copy.md`).
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the
@@ -14916,6 +14929,43 @@ purge must be counted), `unsafe-budget.toml` (`slates-bridge-winfsp` 104 → 111
       the purge.
     - The first form, which owed the whole round again: 0 of 200 views stale on x86_64, with 5 purges untaken and each
       taken at its first retry (run 41332247673).
+
+- **Amended 2026-11-06 (the rule of §4.6 Windows): the purge's client leaves the daemon's process.** The command thread
+  had made the purge's opens, writes and reads itself, on a volume its own process serves. A request delivered to the
+  receiver sits in WinFsp's processing queue, never cancelled (`FSP_IOQ_PROCESS_NO_CANCEL`), so a daemon killed inside
+  one could not exit while the anchor held the volume (the sibling in
+  `docs/bugs/2026-11-06-a-daemons-own-io-on-its-volume-strands-its-exit.md`).
+  - **The mechanism.** Each mount has a purge client (`crates/bridge-winfsp/src/purge_client.rs`): a child process, a
+    role of the daemon's own binary (`slates winfsp-purge-client`; the bridge's tests run their test binary), started at
+    the mount's first purge in a job that kills it when the daemon's handle to the job closes, and asked over one message
+    pipe. It answers its start with a ready byte once it has made its token, then each request (the range, the piece and
+    the full drive path) with one outcome byte. A child that does not answer is let go, its purge refused, and the next
+    purge starts another. With no client program installed (`purge_client::install`), a purge is counted
+    `winfsp.purges_unavailable`.
+  - **Recognition.** The mount makes the private marker and hands it to the child, which builds its own restricted token
+    with it (`PurgeToken::with_marker`). Each published purge (`purge_intents::Intent`) names the child's process id, and
+    the receiver takes a Create as the purge's only from that process with the marker; with no purge published, or from
+    any other process, a Create is a program's. Every other rule of the A-198 correction stands.
+  - **Why no other mechanism.** WinFsp purges a mapped file's pages only on a non-cached write; every way to reach
+    `CcCoherencyFlushAndPurgeCache` is a request on the volume, so whoever makes it must not be a daemon thread.
+  - **Proven** (diagnostics, 2026-11-06, WinFsp 2.1.25156, both of GitHub's Windows runners), by
+    `a_daemon_killed_while_its_purges_open_is_delivered_exits_within_a_transaction_timeout`: a serving process retains
+    the purge's open unanswered and is killed, and must exit within one transaction timeout (1,000 ms).
+    - Main's code (run 42155020781, `diag-slabs-1`): red on both runners. The killed server had not exited at the
+      bound (`exited None after 999.95ms` on x86_64, `1.0042s` on arm64). With the anchor's hold then released it still
+      did not, since its own control handle closes only at its rundown, so the fixture's 10 s reap failed and the step
+      ran out its 20 minutes.
+    - The fix (run 42155196630, `diag-slabs-2`): the killed server exited in 1.74 ms on x86_64 and 2.89 ms on arm64;
+      the bridge's suite 77 of 77 on each, the CLI's WinFsp mount suite 13 of 13 on each (the purge counted done and
+      echoed by the child, none unavailable; a cached read followed the SDK's change in 20.2 and 20.7 ms, and a fresh
+      open after the view in 408 and 537 µs), and `winfsp_semantics` 7 of 7 on each.
+    - Red-check, the in-process open put back over the fix (run 42155197023, `diag-slabs-3`): red again on both
+      runners (`exited None after 1.0047s` on x86_64, `1.0130s` on arm64), the reap failing the same way.
+  - **Applied in the same change to:** §4.6 (the rule's A-190 bullet), GAPS, the bug record, `crates/bridge-winfsp`
+    (`purge_client.rs`, new; `host.rs`: the purge asks the child, the drive helpers moved out; `dispatcher.rs`:
+    `PrivateOpens::authenticate` compares the intent's process; `purge_intents.rs`: `Intent`; `purge_token.rs`: the
+    marker's text and `with_marker`; `tests/support/host.rs`: the purger role and the oracle), `crates/cli`
+    (`main.rs`: the role; `daemon.rs`: the install).
 
 ### A-189 — QEMU 11.1 maps the window of slates' own device: its generic vhost-user device takes the end by number, and the back end takes the memory tables QEMU sends as it maps (accepted and built 2026-10-29)
 Applied in the same change to: §4.6 (the DAX matrix's status and its list of what the platforms rule out), A-164 (the

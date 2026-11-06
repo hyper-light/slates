@@ -60,7 +60,7 @@ daemons and the kill oracles strike.
 
 - On the A-219 branches only (`e070f31e`, `5b5f7ba1`), never on main. A daemon killed or stopped during its first
   mount's probe could not be replaced for minutes or longer, so its drive stayed unanswered. Neither branch lands.
-- **A sibling on main, not fixed here:** A-190's coherent purge (`crates/bridge-winfsp/src/host.rs`, the command thread's
+- **A sibling on main, fixed 2026-11-06 in its own change (A-190's amendment of that date):** A-190's coherent purge (`crates/bridge-winfsp/src/host.rs`, the command thread's
   `CreateFileW` at line 2038, with the private-open marker of A-198's correction) also opens the daemon's own drive. It
   writes and reads each purged range through it. A kill while one of those requests is delivered strands the daemon the
   same way. Its window is one purge's write or read, not a continuous probe. No run has been seen to hit it. It is open
