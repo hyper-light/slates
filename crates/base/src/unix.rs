@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 #[cfg(not(target_os = "linux"))]
@@ -151,15 +152,48 @@ fn kind_of(file_type: FileType) -> HostKind {
   }
 }
 
+/// The base directory's descriptor. On Linux every component is walked first and none on a mount this daemon serves is
+/// entered (`crate::own_mounts`, A-227).
+#[cfg(target_os = "linux")]
+fn open_root_fd(path: &Path) -> Result<OwnedFd, HostError> {
+  crate::own_mounts::open_checked_root(
+    path,
+    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+  )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_root_fd(path: &Path) -> Result<OwnedFd, HostError> {
+  rustix::fs::open(
+    path,
+    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+    Mode::empty(),
+  )
+  .map_err(refusal)
+}
+
+/// Refuses an entry of `dir` that lies on a mount this daemon serves, before anything touches it (A-227: every
+/// crossing below a base is checked, so a slates mount made inside a base later is never entered).
+#[cfg(target_os = "linux")]
+fn check_crossing(
+  dir: BorrowedFd<'_>,
+  name: &(impl AsRef<std::ffi::OsStr> + ?Sized),
+) -> Result<(), HostError> {
+  crate::own_mounts::check_child(dir, name.as_ref())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn check_crossing(
+  _dir: BorrowedFd<'_>,
+  _name: &(impl AsRef<std::ffi::OsStr> + ?Sized),
+) -> Result<(), HostError> {
+  Ok(())
+}
+
 impl OsHost {
   /// Opens a base directory (`O_DIRECTORY|O_NOFOLLOW`): the one path this host ever resolves.
   pub fn open_root(path: &Path) -> Result<(Self, HostDir), HostError> {
-    let fd = rustix::fs::open(
-      path,
-      OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-      Mode::empty(),
-    )
-    .map_err(refusal)?;
+    let fd = open_root_fd(path)?;
     let mut host = Self {
       dirs: BTreeMap::new(),
       files: BTreeMap::new(),
@@ -215,6 +249,7 @@ impl OsHost {
   /// [`HostFs::list`]'s own per-entry `statat`.
   pub fn entry_fingerprint(&self, dir: HostDir, name: &str) -> Result<Fingerprint, HostError> {
     let name = one_entry(name, UNIX_NAME_BREAKS)?;
+    check_crossing(self.dir(dir)?.as_fd(), name)?;
     fingerprint_at(self.dir(dir)?.as_fd(), name).map_err(refusal)
   }
 
@@ -273,6 +308,7 @@ impl HostFs for OsHost {
         });
         continue;
       };
+      check_crossing(fd.as_fd(), std::ffi::OsStr::from_bytes(raw.to_bytes()))?;
       let fingerprint = match fingerprint_at(fd.as_fd(), raw) {
         Ok(fingerprint) => fingerprint,
         // Gone between the listing and the stat: the disk is the truth, it is not there.
@@ -290,6 +326,7 @@ impl HostFs for OsHost {
 
   fn open_dir(&mut self, parent: HostDir, name: &str) -> Result<HostDir, HostError> {
     let name = one_entry(name, UNIX_NAME_BREAKS)?;
+    check_crossing(self.dir(parent)?.as_fd(), name)?;
     let fd = rustix::fs::openat(
       self.dir(parent)?,
       name,
@@ -305,6 +342,7 @@ impl HostFs for OsHost {
 
   fn open_file(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
     let name = one_entry(name, UNIX_NAME_BREAKS)?;
+    check_crossing(self.dir(dir)?.as_fd(), name)?;
     let fd = rustix::fs::openat(
       self.dir(dir)?,
       name,
@@ -334,6 +372,7 @@ impl HostFs for OsHost {
   fn read_link(&mut self, dir: HostDir, name: &str) -> Result<Box<str>, HostError> {
     let name = one_entry(name, UNIX_NAME_BREAKS)?;
     let fd = self.dir(dir)?;
+    check_crossing(fd.as_fd(), name)?;
     let target = rustix::fs::readlinkat(fd, name, Vec::new()).map_err(refusal)?;
     target
       .to_str()

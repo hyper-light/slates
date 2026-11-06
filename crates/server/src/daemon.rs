@@ -629,6 +629,15 @@ impl Daemon {
           .collect(),
       });
     }
+    // This daemon's own mounts (A-227), recorded as each is made, so no daemon thread opens a path on one; room for one
+    // a live attachment the shards can hold, the bound the anchor's device holds take.
+    slates_base::own_mounts::install(config.held_device_bound()).map_err(|error| {
+      ServerError::Vfs(slates_vfs::error::VfsError::BaseUnavailable(match error {
+        slates_vfs::host::HostError::Unavailable(code)
+        | slates_vfs::host::HostError::OwnMount(code) => code,
+        _ => 0,
+      }))
+    })?;
     let identity = profile.facts.identity.clone();
     // The rendezvous comes from wherever the segment does (A-114): an anchor across the spawn names both in the
     // environment, an anchor in this process hands both over, and a daemon with no anchor makes its own.

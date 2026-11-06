@@ -11037,3 +11037,192 @@ fn a_command_whose_output_reader_went_away_fails_without_a_panic() {
     "the failure says why: {stderr}"
   );
 }
+
+/// Shape: how long a refusal of a path on the daemon's own mount may take to come back (A-227): the verb's own work and
+/// one round trip, far under a client's stall deadline, so a daemon waiting on its own mount fails here, not later.
+#[cfg(target_os = "linux")]
+const OWN_MOUNT_ANSWER: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Shape: the cadence of [`run_within`]'s polls of its child.
+#[cfg(target_os = "linux")]
+const RUN_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Runs a client verb as [`run`] does, but gives up after `limit`: `None` (the client killed and reaped) when it had not
+/// answered by then, for a verb that would wait on a daemon blocked on itself.
+#[cfg(target_os = "linux")]
+fn run_within(
+  instance: &str,
+  args: &[&str],
+  limit: std::time::Duration,
+) -> Option<(i32, String, String)> {
+  let mut child = slates()
+    .arg("--instance")
+    .arg(instance)
+    .args(args)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let started = std::time::Instant::now();
+  while child.try_wait().unwrap().is_none() {
+    if started.elapsed() > limit {
+      child.kill().unwrap();
+      child.wait().unwrap();
+      return None;
+    }
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(RUN_POLL);
+  }
+  let output = child.wait_with_output().unwrap();
+  Some((
+    output.status.code().unwrap_or(-1),
+    String::from_utf8_lossy(&output.stdout).into_owned(),
+    String::from_utf8_lossy(&output.stderr).into_owned(),
+  ))
+}
+
+/// A-227, the base plane (§4.6: no daemon thread opens a path on a volume the daemon serves). Do: on a one-shard daemon,
+/// mount a volume through FUSE, make a directory in it, and create a second volume with that directory as its base.
+/// Expect: the create refused at once (exit 1, `OwnMount`), nothing created, and the daemon still answering. Before
+/// A-227 the shard opened the base through its own mount and waited on the request only it could answer.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_base_on_one_of_the_daemons_own_mounts_is_refused_before_any_open() {
+  if !linux_fuse_mount_runs() {
+    return;
+  }
+  let instance = format!("cli-ownbase-{}", std::process::id());
+  let _anchor = start_one_shard_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "outer", "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  fuse_mount_and_check(&instance, &id, &mount.path);
+  let base = format!("{}/project", mount.path);
+  std::fs::create_dir(&base).unwrap();
+  let created = [
+    "volume",
+    "create",
+    "inner",
+    "--bounded",
+    "8MiB",
+    "--base",
+    &base,
+  ];
+  let Some((code, _, err)) = run_within(&instance, &created, OWN_MOUNT_ANSWER) else {
+    panic!(
+      "the daemon did not answer a base on its own mount within {OWN_MOUNT_ANSWER:?}: it opened the base through \
+       its own mount and waits on itself"
+    );
+  };
+  assert_eq!(
+    code, 1,
+    "a base on the daemon's own mount is refused: {err}"
+  );
+  assert!(
+    err.contains("OwnMount"),
+    "refused as the daemon's own mount: {err}"
+  );
+  let (code, out, err) = run(&instance, &["volume", "list"]);
+  assert_eq!(code, 0, "the daemon still answers: {err}");
+  assert!(!out.contains("inner"), "nothing was created: {out}");
+}
+
+/// A-227, a landing's target (§4.6: no daemon thread opens a path on a volume the daemon serves). Do: on a one-shard
+/// daemon, mount a volume through FUSE, make a directory in it, and present a landing of a second volume into that
+/// directory. Expect: refused at once (exit 1, `OwnMount`), the directory untouched, and the daemon still answering.
+/// Before A-227 the shard walked the target through its own mount and waited on itself.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_landing_target_on_one_of_the_daemons_own_mounts_is_refused_before_any_open() {
+  if !linux_fuse_mount_runs() {
+    return;
+  }
+  let instance = format!("cli-ownland-{}", std::process::id());
+  let _anchor = start_one_shard_anchor(&instance);
+  let created = |name: &str| {
+    let (code, out, err) = run(&instance, &["volume", "create", name, "--bounded", "8MiB"]);
+    assert_eq!(code, 0, "{err}");
+    value_of(&out, "id")
+  };
+  let mounted = created("mounted");
+  let landed = created("landed");
+  let mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  fuse_mount_and_check(&instance, &mounted, &mount.path);
+  let target = format!("{}/target", mount.path);
+  std::fs::create_dir(&target).unwrap();
+  let landing = ["land", &landed, &target, "--json"];
+  let Some((code, out, err)) = run_within(&instance, &landing, OWN_MOUNT_ANSWER) else {
+    panic!(
+      "the daemon did not answer a landing target on its own mount within {OWN_MOUNT_ANSWER:?}: it walked the \
+       target through its own mount and waits on itself"
+    );
+  };
+  assert_eq!(
+    code, 1,
+    "a landing target on the daemon's own mount is refused: {err} {out}"
+  );
+  assert!(
+    err.contains("OwnMount"),
+    "refused as the daemon's own mount: {err}"
+  );
+  assert_eq!(
+    std::fs::read_dir(&target).unwrap().count(),
+    0,
+    "the target is untouched"
+  );
+  let (code, _, err) = run(&instance, &["volume", "list"]);
+  assert_eq!(code, 0, "the daemon still answers: {err}");
+}
+
+/// A-227, a FUSE mount point (§4.6: no daemon thread opens a path on a volume the daemon serves). Do: on a one-shard
+/// daemon, mount a volume through FUSE, make a directory in it, and mount a second volume at that directory. Expect:
+/// refused at once (exit 1, `OwnMount`), nothing mounted there, and the daemon still answering. Before A-227 the
+/// shard's mount-point check stat'ed the directory through its own mount and waited on itself.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_fuse_mount_point_on_one_of_the_daemons_own_mounts_is_refused_before_any_open() {
+  if !linux_fuse_mount_runs() {
+    return;
+  }
+  let instance = format!("cli-ownpoint-{}", std::process::id());
+  let _anchor = start_one_shard_anchor(&instance);
+  let created = |name: &str| {
+    let (code, out, err) = run(&instance, &["volume", "create", name, "--bounded", "8MiB"]);
+    assert_eq!(code, 0, "{err}");
+    value_of(&out, "id")
+  };
+  let outer = created("outer");
+  let inner = created("inner");
+  let mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  fuse_mount_and_check(&instance, &outer, &mount.path);
+  let point = format!("{}/nested", mount.path);
+  std::fs::create_dir(&point).unwrap();
+  let nested = ["mount", &inner, &point];
+  let Some((code, out, err)) = run_within(&instance, &nested, OWN_MOUNT_ANSWER) else {
+    panic!(
+      "the daemon did not answer a mount point on its own mount within {OWN_MOUNT_ANSWER:?}: it stat'ed the point \
+       through its own mount and waits on itself"
+    );
+  };
+  assert_eq!(
+    code, 1,
+    "a mount point on the daemon's own mount is refused: {err} {out}"
+  );
+  assert!(
+    err.contains("OwnMount"),
+    "refused as the daemon's own mount: {err}"
+  );
+  assert!(mountinfo_at(&point).is_none(), "nothing is mounted there");
+  let (code, _, err) = run(&instance, &["volume", "list"]);
+  assert_eq!(code, 0, "the daemon still answers: {err}");
+}

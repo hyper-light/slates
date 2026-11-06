@@ -13917,6 +13917,42 @@ Status: built 2026-11-05. It amends A-74's turn.
 - On the incumbent client (Docker on the M5 Max, six interleaved rounds at load 23–38) the medians rose 7–9% and the
   arms overlapped: best of eighteen 1,019.0 on main, 1,007.8 with the change.
 
+### A-227 — A path on a volume this daemon serves is refused before any open: the base plane, a landing's target and a FUSE mount point (accepted 2026-11-06; the siblings of A-190's purge)
+Applied in the same change to: §4.6 (the rule's "still open" bullet), GAPS, `crates/base` (`own_mounts`, new),
+`crates/vfs` (`HostError::OwnMount`), `crates/land` (`TargetRefusal::OwnMount`), `crates/server` (the FUSE fsname, the
+own-mount records, `check_mount_point`, the refusals' mapping), `crates/bridge-winfsp` (the WinFsp device registry),
+`crates/bridge-oci` and `crates/server/src/oci.rs` (the fsname's parse), each in its own change.
+- **What it answers.** §4.6's rule (2026-11-06): no daemon thread opens a path on a volume the daemon serves. The sweep
+  of that day found three host paths the daemon opens itself that nothing checks against its own mounts: a volume's base
+  directory (every lookup and read of it, on the owner shard), a granted landing's target (its opens, writes and
+  barrier thread), and a FUSE mount point's check (`statat` on the shard). On a path under one of the daemon's own
+  mounts, each sends the daemon a request only it can answer: on one shard a deadlock on every OS, and on Windows a
+  daemon killed then cannot exit (A-190's amendment of 2026-11-06).
+- **The decision (supervisor, 2026-11-06).** Every crossing is checked, not only the path given: a slates mount made
+  later inside a base is the same deadlock. Each subsystem refuses with a variant of its own closed taxonomy, decided
+  before any open of the path's target:
+  - **Linux.** Each component is opened `O_PATH | O_NOFOLLOW`, which calls no filesystem code, and its mount id is read
+    from `/proc/self/fdinfo` (procfs, never the filesystem). A component whose mount differs from its parent's is
+    checked against this daemon's own mounts: a process-wide, lock-free, bounded set of mount ids, recorded when each
+    mount is made or adopted (capacity: the daemon's attachment bound, `shards × MAX_ATTACHMENTS`; a typed refusal at
+    it). An id the set does not hold is looked up in `/proc/self/mountinfo` once, and the answer kept for the shard: a
+    mount whose source is this daemon's tag is its own (the window between a mount and its record), any other is not.
+    The kernel reuses mount ids, so the set is consulted first; a stale entry can only refuse.
+  - **The tag.** A FUSE mount's fsname is `slates:<tag>`: a random value made at each daemon start for this purpose
+    alone. `/proc/self/mountinfo` is world-readable, so it carries neither the rendezvous instance name nor an
+    attachment id; it answers only "is this mount this daemon's". A mount adopted from a predecessor (A-61) keeps the
+    predecessor's tag and is recorded by its mount point at adoption.
+  - **macOS.** No format change: the NFS mount's source names this daemon's export host and port, which
+    `getfsstat(MNT_NOWAIT)` reads without an RPC.
+  - **Windows.** A process-wide registry of this daemon's WinFsp volume device names, published by the mount threads
+    (fixed capacity from the most mounts the daemon can make, atomic slots in the runtime registry's publication pattern,
+    a typed refusal at the bound). A path's drive is named by `QueryDosDeviceW`, which asks the object manager, never the
+    volume. Below a base's root every reparse point is already opened as itself, never traversed.
+  - **Rejected:** a check of the given root alone (it misses a mount made later below it); a path-prefix comparison
+    with recorded mount points (symlinks, relative paths and junctions defeat it); the anchor answering for the
+    daemon's mounts (a base open would depend on it); WinFsp's volume prefix (network-mode file systems only).
+- **Cost** is measured on the base plane's lookups, A/B, every N shown, loaded, and recorded in BENCHMARKS.
+
 ### A-198 — A WinFsp mount outlives its daemon: the anchor holds the volume's control handle, the drive's link and the mount's ledger, and the next daemon serves the held volume (accepted 2026-11-01, Step 9 of the VFS and DAX plan; built and measured 2026-11-02)
 Applied in the same change to: GAPS (gap 2 of the platform inventory). The build applies it to §4.6 "Windows",
 `docs/wip/platforms.md`, `crates/anchor`, `crates/server` and `crates/bridge-winfsp`, each in its own change.

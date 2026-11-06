@@ -168,6 +168,49 @@ pub(crate) struct FuseMount {
   /// `fsync` replies held until the live-shipped volume's log is durable where their barrier put it (A-200), oldest
   /// first, bounded by `live_ship::reply_hold_bound` ([`settle_held`]).
   held: std::collections::VecDeque<HeldFsync>,
+  /// This mount's place in the daemon's own mounts (A-227): recorded while it is served, forgotten when it is dropped.
+  /// Held for its drop alone.
+  _own: OwnMountRecord,
+}
+
+/// A FUSE mount's id in the process's set of its own mounts (`slates_base::own_mounts`, A-227), so no daemon thread
+/// opens a path on it; forgotten when dropped, with the mount it names.
+pub(crate) struct OwnMountRecord(u64);
+
+impl OwnMountRecord {
+  /// The mount this daemon just made at `mount_point`: the newest there whose source is its own tag.
+  fn of_made(mount_point: &str) -> Result<Self, Refusal> {
+    let own = slates_base::own_mounts::fsname();
+    Self::of(mount_point, |source| own.as_deref() == Some(source))
+  }
+
+  /// A mount this daemon adopts from its predecessor (A-61), which carries the predecessor's tag.
+  fn of_adopted(mount_point: &str) -> Result<Self, Refusal> {
+    Self::of(mount_point, |source| {
+      source.starts_with(slates_base::own_mounts::SOURCE_PREFIX)
+    })
+  }
+
+  fn of(mount_point: &str, wanted: impl Fn(&str) -> bool) -> Result<Self, Refusal> {
+    let refused = |reason: String| Refusal::TargetUnavailable {
+      reason: format!("the FUSE mount at {mount_point} {reason}"),
+    };
+    let id = slates_base::own_mounts::mount_id_at(mount_point, wanted)
+      .ok_or_else(|| refused("is not in the kernel's mount table".to_owned()))?;
+    slates_base::own_mounts::record(id).map_err(|full| {
+      refused(format!(
+        "is past the {} mounts this daemon records as its own",
+        full.capacity
+      ))
+    })?;
+    Ok(Self(id))
+  }
+}
+
+impl Drop for OwnMountRecord {
+  fn drop(&mut self) {
+    slates_base::own_mounts::forget(self.0);
+  }
 }
 
 /// An `fsync` reply held for durability (A-200): the reply as written, the log position it waits for and when it
@@ -211,12 +254,6 @@ pub(crate) struct PendingAttach {
   pub(crate) token: [u8; 16],
 }
 
-/// The mount's `fsname`: `slates:` and the attachment id in hex, the authority the kernel's mount table
-/// carries for this volume's mount (`crate::oci` reads it back).
-pub(crate) fn fsname_of(attachment: u64) -> String {
-  format!("slates:{attachment:016x}")
-}
-
 /// Checks a FUSE mount point before any effect (§4.6 A-9's `UserOwnedExistingDirectory`): an absolute path
 /// to an existing directory — not followed through a final symbolic link — owned by the daemon's user and,
 /// for a Unix-user principal, by that user. `fusermount3` alone would mount over a regular file the user
@@ -231,8 +268,27 @@ pub(crate) fn check_mount_point(path: &str, principal: &Principal) -> Result<(),
   if !path.starts_with('/') {
     return refuse("is not an absolute path".to_owned());
   }
-  let stat = match rustix::fs::statat(rustix::fs::CWD, path, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
-  {
+  // Every component is walked first, and none on a mount this daemon serves is entered (A-227): a mount point inside
+  // another of its FUSE mounts would make the shard ask its own mount.
+  let opened = slates_base::own_mounts::open_checked_root(
+    std::path::Path::new(path),
+    rustix::fs::OFlags::PATH | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+  );
+  let point = match opened {
+    Ok(point) => point,
+    Err(slates_vfs::host::HostError::OwnMount(_)) => {
+      return Err(Refusal::OwnMount {
+        path: path.to_owned(),
+        used_as: slates_ipc::protocol::OwnMountUse::MountPoint,
+      });
+    }
+    Err(e) => return refuse(format!("cannot be read ({e})")),
+  };
+  let stat = match rustix::fs::statat(
+    &point,
+    c"",
+    rustix::fs::AtFlags::EMPTY_PATH | rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+  ) {
     Ok(stat) => stat,
     Err(e) => return refuse(format!("cannot be read (code {})", e.raw_os_error())),
   };
@@ -261,6 +317,12 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
       feature: "a FUSE mount outside a recorded request".to_owned(),
     });
   };
+  // The mount's source is this daemon's tag (A-227), never its attachment: the kernel's table is world-readable.
+  let Some(fsname) = slates_base::own_mounts::fsname() else {
+    return crate::verbs::refused(Refusal::TargetUnavailable {
+      reason: "this daemon has no record of its own mounts".to_owned(),
+    });
+  };
   let route = state.reply_route.take();
   let cause = state.current_span;
   let deadline_ns = state.config.failover_slo_ns;
@@ -276,12 +338,8 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
     // each caller's permission bits (`default_permissions`).
     let shared = pending.record.form.shared_with_other_users();
     let read_only = !pending.rights.write;
-    let mounted = mount_without_blocking(
-      &mount_point,
-      &fsname_of(pending.record.id),
-      (deadline_ns, shared, read_only),
-    )
-    .await;
+    let mounted =
+      mount_without_blocking(&mount_point, &fsname, (deadline_ns, shared, read_only)).await;
     let _ = state::with_state_counted(move |s| {
       let attachment = pending.record.id;
       let reply = complete(s, request, cause, attachment, |s| match mounted {
@@ -454,6 +512,14 @@ fn established(s: &mut ShardState, pending: PendingAttach, mount: Mount) -> Repl
   s.attachments
     .set_coherence(registry, slates_bridge_core::CacheCoherence::Invalidated);
   s.attachments.set_owner(registry, attachment);
+  let own = match OwnMountRecord::of_made(&mount_point) {
+    Ok(own) => own,
+    Err(refusal) => {
+      s.attachments.revoke(registry);
+      s.attachments.drain(registry);
+      return refuse(s, &mount_point, refusal);
+    }
+  };
   s.fuse_mounts.insert(
     attachment,
     FuseMount {
@@ -469,6 +535,7 @@ fn established(s: &mut ShardState, pending: PendingAttach, mount: Mount) -> Repl
       change,
       seen: 0,
       held: std::collections::VecDeque::new(),
+      _own: own,
     },
   );
   if futures::spawn(serve(attachment))
@@ -1192,6 +1259,11 @@ fn adopt_one(s: &mut ShardState, record: AttachmentRecord, held: crate::fuse_hol
   s.attachments
     .set_coherence(registry, slates_bridge_core::CacheCoherence::Invalidated);
   s.attachments.set_owner(registry, attachment);
+  let Ok(own) = OwnMountRecord::of_adopted(&mount_point) else {
+    s.attachments.revoke(registry);
+    s.attachments.drain(registry);
+    return end(s);
+  };
   let mut resend = [0u8; slates_bridge_fuse::abi::OUT_HEADER_LEN];
   let resent = slates_bridge_fuse::notify::resend(&mut resend)
     .ok()
@@ -1223,6 +1295,7 @@ fn adopt_one(s: &mut ShardState, record: AttachmentRecord, held: crate::fuse_hol
       change,
       seen: 0,
       held: std::collections::VecDeque::new(),
+      _own: own,
     },
   );
   if futures::spawn(serve(attachment))
@@ -1346,11 +1419,13 @@ pub(crate) fn leave_stale() {
   };
   let left = stale
     .iter()
-    .filter(|(attachment, point)| {
-      let source = fsname_of(*attachment);
-      table
-        .iter()
-        .any(|m| &m.mount_point == point && m.fstype == FUSE_TYPE && m.source == source)
+    .filter(|(_, point)| {
+      // A dead daemon's mount carries its tag (A-227), not ours: any slates FUSE mount still at the point.
+      table.iter().any(|m| {
+        &m.mount_point == point
+          && m.fstype == FUSE_TYPE
+          && m.source.starts_with(slates_base::own_mounts::SOURCE_PREFIX)
+      })
     })
     .count();
   let _ = state::with_state_counted(|s| {
