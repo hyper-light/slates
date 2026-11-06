@@ -154,6 +154,18 @@
 > `crates/merge/tests/origin.rs`), so records written before it would not match a newer holder. A daemon `SIGKILL`ed six times mid-merge
 > loses no told version and tells none twice (`crates/cli/tests/merge_kill.rs`, red with the durable append removed).
 >
+> **Merge, macOS: the paced tail was the recovery give-back, not the doorbell (A-226, 2026-11-06, agents/perf-2).** An
+> idle shard's give-back of the recovery memory no restart reads (A-117) marked the whole stale slot and log, 18 GB
+> a shard, at every publication: 18 to 21 ms of the shard's CPU in one reap-loop poll, which paced requests waited
+> behind. It now gives back only what was written since its last give-back. In one paced run, reap polls of 5 ms CPU
+> or more went from 46 to 6. Failing first: `a_give_back_returns_only_recovery_memory_written_since_the_last` (91.6 GB
+> given back after a one-file delta, against 0). Oracle: `a_give_back_names_every_dead_written_byte_and_stops_at_the_last`.
+> **Open:** the 6 left are each shard's first two give-backs after a boot, over memories the journal did not write
+> (12 to 43 ms each). They are owed slices under the step quantum, from a measured discard rate. Also open: the
+> latency A/B on a quiet Mac (this one ran at load 50 to 95), Linux and Windows (diag-perf-5), and the sibling of the
+> same shape, the Linux FUSE write log's purge (`crates/server/src/write_log.rs`, its whole capacity once per
+> emptying; its cost is not measured).
+>
 
 > **Windows conformance runs, and the arm64 Linux suites (2026-11-05, A-209; VFS plan step 10).** WinFsp's own two
 > suites run over the slates drive (`slates mount ID E:`) through `cargo xtask conformance` in `windows-lint` and
