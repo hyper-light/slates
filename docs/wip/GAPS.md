@@ -16,8 +16,10 @@
 >     `OwnerUnreachable`**: at 300 clients 207 `CreateWork`, 41 edits, 7 submits, 2 destroys; at 100 clients the
 >     harness's final read 20 s after the kill. The server recovered its green (`1 merge volumes`; whether the
 >     forwarded works existed at the kill is not yet settled).
->   One earlier 1,000-client run stopped with every client waiting on a forwarded reply and both daemons idle for
->   13 minutes; it did not recur in the rerun. Owners: the fleet forward and session code (raft, fs-server).
+>   The 1,000-client "hang" seen in 3 of 10 runs (minutes with both daemons idle) was the harness's own oracle, which
+>   replayed a whole copy of every touched file for every version (1,600 × 677 at 1,000 clients); it now keeps each
+>   slot's writes and judges by lookup, and two runs finish in 19 to 20 s with 0 failures (red-checked: blinded, it
+>   flags 13 of 13 conflicts). Owners of the three faults: the fleet forward and session code (raft, fs-server).
 > - **Memory per same-machine connection is a client node's, about 64 to 100 KB a local client** (the 20 to 29 MB
 >   measured before was the daemon and the harness in one process, both touching every ring); a client node derives
 >   about 7,900 seats here, so the 10k-100k rungs need several client nodes, and fault one above caps each.

@@ -869,18 +869,54 @@ fn report(n: usize, tally: &mut Tally) {
   );
 }
 
-/// The green's bytes of each touched file at `version`, from the version-0 bytes and the accepted submits in order.
-fn replay(
-  base: &BTreeMap<String, Vec<u8>>,
-  accepted: &[&SubmitEvent],
-  through: u64,
-) -> BTreeMap<String, Vec<u8>> {
-  let mut state = base.clone();
-  for event in accepted.iter().take(usize::try_from(through).unwrap()) {
+/// Each slot's writes by the accepted versions, in version order: what the green held at a slot at any version is the
+/// last write at or before it, else the file's version-0 bytes. Built once, linear in the accepted slots, so judging a
+/// verdict at a head is a lookup per slot. (The oracle had replayed a whole copy of every touched file for every
+/// version: 1,600 versions × 677 files at 1,000 clients, minutes of the harness's own CPU after the clients were done,
+/// which read as a hung daemon.)
+type SlotWrites<'a> = BTreeMap<(&'a str, u64), Vec<(u64, &'a [u8])>>;
+
+fn slot_writes<'a>(accepted: &[&'a SubmitEvent]) -> SlotWrites<'a> {
+  let mut writes: SlotWrites<'a> = BTreeMap::new();
+  for (index, event) in accepted.iter().enumerate() {
+    let version = index as u64 + 1;
     for slot in &event.slots {
-      let file = state.get_mut(&slot.path).unwrap();
-      let at = usize::try_from(slot.at).unwrap();
-      file[at..at + slot.bytes.len()].copy_from_slice(&slot.bytes);
+      writes
+        .entry((slot.path.as_str(), slot.at))
+        .or_default()
+        .push((version, slot.bytes.as_slice()));
+    }
+  }
+  writes
+}
+
+/// The green's bytes at slot `(path, at)` of `len` bytes as of `version`.
+fn slot_at<'a>(
+  writes: &SlotWrites<'a>,
+  base: &'a BTreeMap<String, Vec<u8>>,
+  (path, at, len): (&str, u64, usize),
+  version: u64,
+) -> &'a [u8] {
+  let written = writes.get(&(path, at)).and_then(|history| {
+    history
+      .iter()
+      .rev()
+      .find(|(written, _)| *written <= version)
+      .map(|(_, bytes)| *bytes)
+  });
+  written.unwrap_or_else(|| {
+    let start = usize::try_from(at).unwrap();
+    &base[path][start..start + len]
+  })
+}
+
+/// The green's bytes of every touched file after the last accepted version.
+fn replay(base: &BTreeMap<String, Vec<u8>>, writes: &SlotWrites<'_>) -> BTreeMap<String, Vec<u8>> {
+  let mut state = base.clone();
+  for ((path, at), history) in writes {
+    if let Some((_, bytes)) = history.last() {
+      let start = usize::try_from(*at).unwrap();
+      state.get_mut(*path).unwrap()[start..start + bytes.len()].copy_from_slice(bytes);
     }
   }
   state
@@ -890,60 +926,44 @@ fn replay(
 /// `(base, head]` touched, where the green's bytes at `head` differ from the slot's.
 fn expected_windows(
   event: &SubmitEvent,
-  accepted: &[&SubmitEvent],
-  states: &[BTreeMap<String, Vec<u8>>],
+  (writes, base): (&SlotWrites<'_>, &BTreeMap<String, Vec<u8>>),
   head: u64,
 ) -> BTreeSet<(String, u64, u64)> {
-  let touched: BTreeSet<(&str, u64)> = accepted
-    .iter()
-    .enumerate()
-    .filter(|(index, _)| (*index as u64) + 1 > event.base && (*index as u64) < head)
-    .flat_map(|(_, other)| other.slots.iter().map(|slot| (slot.path.as_str(), slot.at)))
-    .collect();
-  let at_head = &states[usize::try_from(head).unwrap()];
   event
     .slots
     .iter()
-    .filter(|slot| touched.contains(&(slot.path.as_str(), slot.at)))
     .filter(|slot| {
-      let at = usize::try_from(slot.at).unwrap();
-      at_head[&slot.path][at..at + slot.bytes.len()] != slot.bytes[..]
+      writes
+        .get(&(slot.path.as_str(), slot.at))
+        .is_some_and(|history| history.iter().any(|(v, _)| *v > event.base && *v <= head))
+    })
+    .filter(|slot| {
+      slot_at(writes, base, (&slot.path, slot.at, slot.bytes.len()), head) != slot.bytes.as_slice()
     })
     .map(|slot| (slot.path.clone(), slot.at, SLOT_BYTES))
     .collect()
 }
 
-/// Why the oracle did not expect a window at `(path, at)`: the versions after the base that touched it, and the head's
-/// bytes there against the submit's.
+/// Why the oracle did not expect a window at `(path, at)`: the versions that wrote it, and the head's bytes there
+/// against the submit's.
 fn explain(
   event: &SubmitEvent,
-  accepted: &[&SubmitEvent],
-  at_head: &BTreeMap<String, Vec<u8>>,
-  path: &str,
-  at: u64,
+  (writes, base): (&SlotWrites<'_>, &BTreeMap<String, Vec<u8>>),
+  (path, at): (&str, u64),
+  head: u64,
 ) -> String {
-  let touched: Vec<u64> = accepted
-    .iter()
-    .enumerate()
-    .filter(|(_, other)| {
-      other
-        .slots
-        .iter()
-        .any(|slot| slot.path == path && slot.at == at)
-    })
-    .map(|(index, _)| index as u64 + 1)
-    .collect();
+  let touched: Vec<u64> = writes
+    .get(&(path, at))
+    .map(|history| history.iter().map(|(v, _)| *v).collect())
+    .unwrap_or_default();
   let mine = event
     .slots
     .iter()
     .find(|slot| slot.path == path && slot.at == at);
-  let start = usize::try_from(at).unwrap();
-  let head = at_head
-    .get(path)
-    .and_then(|bytes| bytes.get(start..start + 16));
+  let held = slot_at(writes, base, (path, at, 16), head);
   format!(
     "{path}@{at}: touched by versions {touched:?}; head {:?}; mine {:?}",
-    head.map(String::from_utf8_lossy),
+    String::from_utf8_lossy(held),
     mine.map(|slot| String::from_utf8_lossy(&slot.bytes[..16]).into_owned())
   )
 }
@@ -979,13 +999,12 @@ fn oracle(
       ));
     }
   }
-  let states: Vec<BTreeMap<String, Vec<u8>>> = (0..=accepted.len() as u64)
-    .map(|v| replay(base, &accepted, v))
-    .collect();
+  let writes = slot_writes(&accepted);
+  let judged = (&writes, base);
   for event in submits {
     match &event.outcome {
       Outcome::Accepted(v) => {
-        let expected = expected_windows(event, &accepted, &states, v - 1);
+        let expected = expected_windows(event, judged, v - 1);
         if !expected.is_empty() {
           fail(format!(
             "version {v} (base {}) was accepted over conflicts {expected:?}",
@@ -1003,21 +1022,13 @@ fn oracle(
           .iter()
           .filter(|e| e.sent_ns < event.replied_ns)
           .count() as u64;
-        let fits = (low.max(event.base)..=high)
-          .any(|h| expected_windows(event, &accepted, &states, h) == reported);
+        let fits =
+          (low.max(event.base)..=high).any(|h| expected_windows(event, judged, h) == reported);
         if !fits {
-          let top = expected_windows(event, &accepted, &states, high);
+          let top = expected_windows(event, judged, high);
           let why: Vec<String> = reported
             .difference(&top)
-            .map(|(path, at, _)| {
-              explain(
-                event,
-                &accepted,
-                &states[usize::try_from(high).unwrap()],
-                path,
-                *at,
-              )
-            })
+            .map(|(path, at, _)| explain(event, judged, (path, *at), high))
             .collect();
           fail(format!(
             "conflict (agent {}, base {}) reported {reported:?}; no head in {low}..={high} expects that; at {high} \
@@ -1028,7 +1039,7 @@ fn oracle(
       }
     }
   }
-  let replayed = &states[accepted.len()];
+  let replayed = &replay(base, &writes);
   for (path, bytes) in replayed {
     if head.get(path) != Some(bytes) {
       fail(format!(
