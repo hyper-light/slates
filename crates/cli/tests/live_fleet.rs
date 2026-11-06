@@ -1149,10 +1149,77 @@ fn a_live_volumes_writes_ship_their_changes_not_the_volume() {
   );
 }
 
+/// A-200, AC-8.9: a candidate's copy of a live log stays within its bound however long the writer runs. Do make stable
+/// NFS writes to a live volume bounded at 1 MiB until the changes shipped are three times its size. Expect every write
+/// answered, no candidate refusing an entry for its bound, and whole records shipped as the changes grow: a candidate
+/// keeps a whole record and the changes after it, at most twice the volume's size, so the owner ships a whole record
+/// once the changes since the last reach the volume's size. Found 2026-11-06: with whole records only at the log's
+/// start, the candidates' copies grew to the bound and both refused every entry after it, so no write was durable.
+#[test]
+fn a_long_writer_keeps_the_candidates_copies_within_their_bound() {
+  /// Shape: each write's bytes, a page.
+  const WRITE_BYTES: usize = 4096;
+  /// Shape: the volume's bound, and three times its size in writes of a page.
+  const VOLUME: &str = "1MiB";
+  /// Shape: see [`VOLUME`].
+  const WRITES: u32 = 3 * 256;
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping bound flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-bound");
+  let owner = fleet.instances[(fleet.bootstrap + 1) % fleet.instances.len()].clone();
+  let (mut live, file, _) = stable_session_of(&owner, "bounded", true, VOLUME);
+  let data = vec![0x5a_u8; WRITE_BYTES];
+  let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    for write in 0..WRITES {
+      nfs::write(&mut live, &file, &data, 100 + write);
+    }
+  }))
+  .is_ok();
+  let counters: Vec<_> = fleet
+    .instances
+    .iter()
+    .map(|instance| (instance.clone(), live_counters(instance)))
+    .collect();
+  drop(live);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  eprintln!("live bound: {WRITES} writes, all answered {written}: {counters:?}");
+  let sum = |name: &str| -> u64 {
+    counters
+      .iter()
+      .map(|(_, counts)| counts.get(name).copied().unwrap_or(0))
+      .sum()
+  };
+  assert!(written, "every write was answered: {counters:?}");
+  assert_eq!(
+    sum("hold_refused.malformed"),
+    0,
+    "no candidate refused an entry for its bound: {counters:?}"
+  );
+  assert!(
+    sum("whole") >= 2,
+    "whole records shipped as the changes grew: {counters:?}"
+  );
+}
+
 /// A stable-write NFS session to a fresh volume's export on `owner`: the stream, the file, and the volume's id.
 fn stable_session(owner: &str, name: &str, live: bool) -> (std::net::TcpStream, Vec<u8>, String) {
+  stable_session_of(owner, name, live, "64MiB")
+}
+
+/// [`stable_session`] for a volume bounded at `size`.
+fn stable_session_of(
+  owner: &str,
+  name: &str,
+  live: bool,
+  size: &str,
+) -> (std::net::TcpStream, Vec<u8>, String) {
   let id = value_of(
-    &run_ready(owner, &["volume", "create", name, "--bounded", "64MiB"]),
+    &run_ready(owner, &["volume", "create", name, "--bounded", size]),
     "id",
   );
   if live {

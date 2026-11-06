@@ -5795,6 +5795,14 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > (`live_ship::note_checkpoint`). Held by `a_live_volumes_writes_ship_their_changes_not_the_volume` (red first: 68 whole;
 > after: 1, the log's first). Interleaved with main, the stable-write latency is unchanged (BENCHMARKS "What a
 > checkpoint shipped"); the whole copies and the credit refusals are gone.
+>
+> **A candidate's copy stays within its bound (2026-11-06).** A candidate keeps a whole entry and the entries after it,
+> within twice the volume's size (`live_ship::hold_bound`). With whole records rare, the copies grew to that bound and
+> both candidates refused every entry after it, so no write was durable (at 454 stable 4 KiB writes to a 1 MiB volume:
+> `a_long_writer_keeps_the_candidates_copies_within_their_bound`, red first). The owner now counts what a candidate keeps
+> (`LiveVolume::kept`) and ships whole once that reaches the volume's size (`kept_reaches_size`): the entry that crosses
+> it still fits, since no publication is larger than the volume. After: 768 writes answered, 4 whole records, no
+> refusal for the bound.
 
 
 **Ownership follows the writer.** Creation places the owner on the creator's host because the

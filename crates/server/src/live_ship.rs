@@ -152,6 +152,9 @@ pub(crate) struct LiveVolume {
   /// the shipper: dropped, the writes waiting on it were never answered (the resumed old owner held one for the fence
   /// flow's whole 40 s wait), and a stable NFS write parked there read "no shipper" as nothing to wait for.
   fenced: Option<HostEpoch>,
+  /// The bytes a candidate keeps of this log: the last whole entry and every entry since ([`keep`]). Once it reaches
+  /// the volume's size the next publication ships whole, which clears them ([`kept_reaches_size`]).
+  kept: usize,
 }
 
 /// What a candidate keeps of one live volume.
@@ -643,6 +646,7 @@ pub(crate) fn published(
     placed.max(configuration.host_epoch)
   });
   let quorum = configuration.quorum;
+  let reaches_size = kept_reaches_size(state, id);
   let live = state
     .live
     .shipping
@@ -658,8 +662,9 @@ pub(crate) fn published(
       owes_whole: true,
       whole: None,
       fenced: None,
+      kept: 0,
     });
-  let whole = live.owes_whole || record.is_none();
+  let whole = live.owes_whole || record.is_none() || reaches_size;
   let built = if whole {
     whole_record(state, id)
   } else {
@@ -685,6 +690,11 @@ pub(crate) fn published(
   match appended {
     Ok(entry) => {
       live.owes_whole = false;
+      live.kept = if whole {
+        payload.len()
+      } else {
+        live.kept.saturating_add(payload.len())
+      };
       if whole {
         let head = entry.head();
         live.shipper.mark_checkpoint(head);
@@ -700,6 +710,24 @@ pub(crate) fn published(
     }
     Err(_) => refuse(state, id, "fleet.live.refused.no_credit"),
   }
+}
+
+/// Whether what a candidate keeps of `id`'s log has reached the volume's size, so its next publication ships whole: a
+/// candidate keeps a whole entry and the entries since, within twice the volume's size ([`hold_bound`]), and a whole
+/// entry clears them. Shipped at the volume's size, the entry that crosses it still fits under the bound whatever it
+/// is, since no publication is larger than the volume. Never the case for a volume this shard does not know.
+fn kept_reaches_size(state: &ShardState, id: slates_db::catalog::VolumeId) -> bool {
+  let Some(kept) = state.live.shipping.get(&id.bytes).map(|live| live.kept) else {
+    return false;
+  };
+  let Some(volume) = state.db.partition().volume(id) else {
+    return false;
+  };
+  let size = match volume.policy.size {
+    slates_db::catalog::SizeClass::Bounded { limit } => limit,
+    slates_db::catalog::SizeClass::Dynamic { max } => max,
+  };
+  u64::try_from(kept).unwrap_or(u64::MAX) >= size
 }
 
 /// A publication that could not become an entry: counted, and the volume owes a whole record next.
