@@ -155,6 +155,10 @@ mod sched {
   }
 }
 
+/// The pause before each sample (`--pause-ns N`, set once, in `main`): past the shards' idle window, so each sample
+/// meets parked shards and pays the doorbell and the wake, as an agent's edits do between its thinking.
+static PAUSE: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+
 /// The green the forms run over when `--green ID` names one (set once, in `main`).
 static ATTACHED_GREEN: std::sync::OnceLock<VolumeId> = std::sync::OnceLock::new();
 
@@ -828,6 +832,9 @@ fn measure(
       if n >= MIN_SAMPLES && started.elapsed() > RUN_BUDGET {
         break;
       }
+      if let Some(pause) = PAUSE.get() {
+        std::thread::park_timeout(*pause);
+      }
       let sample = fixture.sample(form, n % files);
       edits.push(sample.edit);
       submits.push(sample.submit);
@@ -1084,6 +1091,13 @@ impl Selection {
           );
         }
         "--qos-interactive" => selection.qos_interactive = true,
+        "--pause-ns" => {
+          let ns: u64 = args
+            .next()
+            .and_then(|n| n.parse().ok())
+            .expect("--pause-ns takes nanoseconds");
+          let _ = PAUSE.set(Duration::from_nanos(ns));
+        }
         "--instance" => selection.instance = Some(args.next().expect("--instance takes a name")),
         "--seed-green" => {
           selection.seed_green = Some(args.next().expect("--seed-green takes a name"))

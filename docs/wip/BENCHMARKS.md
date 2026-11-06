@@ -8286,6 +8286,21 @@ for a short slice for slates' threads (diag-perf-4).
 interleaved × 3: loaded accept p99 0.57, 0.60, 0.40 ms (default) against 1.37, 0.34, 0.50 ms (interactive); conflict 0.60,
 0.50, 0.36 ms against 0.80, 0.24, 0.54 ms; p50 alike. No gain this box can show: not taken.
 
+**The macOS doorbell (item c, 2026-11-06 03:43 to 04:02 UTC, adas-macbook-pro-2, load 5.6 to 17).** Unpaced, a client's
+requests keep its shards' idle spin open and the doorbell thread used no CPU over ten seconds (`ps -M` per thread: five
+shards at 24 to 36% of a core each, mostly system time, the doorbell 0.00 s): the median's time before the slot's read
+is the spin's 15 µs `kevent` naps (A-218), not the doorbell. Paced (`--pause-ns 2000000`, so each edit meets parked
+shards) the path is the doorbell: accept p50 147 to 167 µs, p99 5.7 to 21 ms. A temporary diagnostic (the doorbell
+thread stamping each ring on the host clock, read in-process by the harness; not committed) split a paced call: send to
+the doorbell thread's wake 21 to 30 µs at the median and in the p99 samples alike; its wake to the shard's slot read 27
+µs at the median but 17 to 31 ms in the p99 samples. Kicking only the client's home shard instead of every shard
+(interleaved × 3): accept p99 12.6, 17.5, 7.1 ms against 17.1, 5.7, 19.9 ms, p50 147 to 155 against 155 to 167 µs, the
+shard-wake tail the same; the other shards' CPU was 0.07 to 0.13 s against the owner's 0.48 s over ten seconds. The
+herd is not the tail, so waking only the owning shard was not built (the busy p99 is the bar). The interactive QoS class
+on the paced form: p99 14.1, 9.2, 12.4 ms against 14.7, 9.2, 21.2 ms. What remains is a kicked, parked macOS shard that
+reads its ring 17 to 31 ms after its kick in about 1% of paced calls, at load 5.6 as at 17: a wake missed or held, owed
+a failing test with the shard's own stamps.
+
 **Across two machines (item 2, 2026-11-06 03:14 to 03:21 UTC).** A two-node fleet from one manifest (`f = 0`): the server
 node on adas-macbook-pro-2 (192.168.1.71, Wi-Fi, load 15 to 24) and the client node on kiln-a094a12d (Fedora, x86_64,
 32 cores, 192.168.1.72, Wi-Fi, load 6 to 42), each `slates daemon --quick --shards 2 --fleet fleet.json --node N`, release
