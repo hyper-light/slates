@@ -1254,3 +1254,9 @@ slates daemon: nfs_v4_opens = 2485343: max_inodes × shards (anchors ["max_inode
 slates daemon: nfs_v4_locks = 2485343: max_inodes × shards (anchors ["max_inodes", "shards"])
 slates daemon: instance fsb-530-1-comb1 serving on 1 shards under the anchor
 ## run 1 of 1 done, 2026-11-06T07:23:41Z
+remote: 
+remote: Create a pull request for 'diag-winfsp-overlap-results-42178889880-profile-x86-shards1-5' on GitHub by visiting:        
+remote:      https://github.com/hyper-light/slates/pull/new/diag-winfsp-overlap-results-42178889880-profile-x86-shards1-5        
+remote: 
+To https://github.com/hyper-light/slates
+ * [new branch]      652330210788f6a32213aa233a714d001902ddc3 -> diag-winfsp-overlap-results-42178889880-profile-x86-shards1-5
