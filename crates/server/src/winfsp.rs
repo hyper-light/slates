@@ -90,6 +90,11 @@ const MOUNT_REFUSED: &str = "winfsp.mount_refused";
 const BARRIER_REFUSED: &str = "winfsp.barrier_refused";
 /// Format: see [`MOUNT_REFUSED`] — a reply whose dispatcher thread was gone (the mount was being torn down).
 const REPLY_UNDELIVERED: &str = "winfsp.reply_undelivered";
+/// Counter: flush replies held until their live-shipped volume was durable (A-200).
+const LIVE_FLUSH_HELD: &str = "winfsp.live_flush_held";
+/// Counter: held flush replies answered `STATUS_UNEXPECTED_IO_ERROR`: the wait passed, the volume was destroyed or its
+/// owner superseded, or the mount already held its bound of them.
+const LIVE_FLUSH_REFUSED: &str = "winfsp.live_flush_refused";
 /// Format: see [`MOUNT_REFUSED`] — a mount's thread ended without being asked (its file system is gone).
 const MOUNT_LOST: &str = "winfsp.mount_lost";
 /// Format: see [`MOUNT_REFUSED`] — an attachment end the database refused to record.
@@ -178,6 +183,16 @@ pub(crate) struct WinFspMount {
   detaching: bool,
   /// The anchor answered the release, so the mount's end asks nothing more of it.
   released: bool,
+  /// Flush replies held until the live-shipped volume's log is durable where their barrier put it (A-200), oldest
+  /// first ([`settle_held`]); bounded by `live_ship::reply_hold_bound`. WinFsp's dispatcher waits on each meanwhile.
+  held: VecDeque<HeldFlush>,
+}
+
+/// A flush's reply held for durability (A-200): the reply, the log position it waits for and when it gives up.
+struct HeldFlush {
+  served: slates_bridge_winfsp::host::Served,
+  target: u64,
+  deadline_ns: u64,
 }
 
 /// The bounded held-ledger/image merge, one inode per owner turn. The held map has at most MAX_OPEN_HANDLES entries.
@@ -582,6 +597,7 @@ fn keep(
       purge_out: false,
       detaching: false,
       released: false,
+      held: VecDeque::new(),
     },
   );
   open_journal_reader(s, record.volume, registry);
@@ -911,6 +927,7 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
   if mount.ending {
     return Turned::Ended;
   }
+  let held_in = settle_held(s, mount);
   let deferred = match take_outcomes(s, mount) {
     Ok(deferred) => deferred,
     Err(()) => return Turned::Ended,
@@ -939,7 +956,7 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
     Some(Err(TryRecvError::Disconnected)) | None => return Turned::Ended,
   };
   if request.is_none() && !changed && !mount.owed {
-    let retry_in = send_due_retries(s, mount);
+    let retry_in = earliest(send_due_retries(s, mount), held_in);
     return if deferred {
       Turned::RoundDeferred
     } else {
@@ -1013,7 +1030,7 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
     // so rearm at the delivered generation before parking (A-198's SDK-rename mapped-view regression).
     slot.volume.wait_for_change(mount.seen, &mount.waker);
   }
-  let retry_in = send_due_retries(s, mount);
+  let retry_in = earliest(send_due_retries(s, mount), held_in);
   match served {
     Some(served) => {
       answer(s, mount, served);
@@ -1310,8 +1327,52 @@ fn purges_owed(
   purges
 }
 
-/// Publishes when the served request needs it, then sends its reply.
-fn answer(s: &mut ShardState, mount: &WinFspMount, mut served: slates_bridge_winfsp::host::Served) {
+/// The sooner of two waits, either of which may be none.
+fn earliest(first: Option<u64>, second: Option<u64>) -> Option<u64> {
+  match (first, second) {
+    (Some(first), Some(second)) => Some(first.min(second)),
+    (first, second) => first.or(second),
+  }
+}
+
+/// Answers each held flush of `mount` that is settled: as served once its volume is durable at its position,
+/// `STATUS_UNEXPECTED_IO_ERROR` once its wait has passed or it never will be (destroyed, superseded). The rest stay
+/// held, the mount's task parked on the volume: how long until the soonest gives up, if one is held.
+fn settle_held(s: &mut ShardState, mount: &mut WinFspMount) -> Option<u64> {
+  let now = futures::now_ns();
+  let mut kept = VecDeque::new();
+  while let Some(mut held) = mount.held.pop_front() {
+    let settled = crate::live_ship::durability(s, mount.volume, held.target, Some(&mount.waker));
+    let refuse = match settled {
+      crate::live_ship::Durability::Durable => false,
+      crate::live_ship::Durability::Never => true,
+      crate::live_ship::Durability::Pending if now >= held.deadline_ns => true,
+      crate::live_ship::Durability::Pending => {
+        kept.push_back(held);
+        continue;
+      }
+    };
+    if refuse {
+      s.count(LIVE_FLUSH_REFUSED, 1);
+      held.served.refuse_unpublished();
+    }
+    if !held.served.send() {
+      s.count(REPLY_UNDELIVERED, 1);
+    }
+  }
+  mount.held = kept;
+  mount
+    .held
+    .iter()
+    .map(|held| held.deadline_ns.saturating_sub(now))
+    .min()
+}
+
+/// Publishes when the served request needs it, then sends its reply. A flush of a live-shipped volume is answered once
+/// its log is durable on `f` candidates too (A-200; AC-8.3): held on the mount and sent by [`settle_held`], so a
+/// `FlushFileBuffers` never claims what no candidate holds. Past the mount's bound it is answered
+/// `STATUS_UNEXPECTED_IO_ERROR`, counted.
+fn answer(s: &mut ShardState, mount: &mut WinFspMount, mut served: slates_bridge_winfsp::host::Served) {
   if served.is_restored_read() {
     s.count(RESTORED_READS, 1);
   }
@@ -1325,6 +1386,21 @@ fn answer(s: &mut ShardState, mount: &WinFspMount, mut served: slates_bridge_win
       s.count(BARRIER_REFUSED, 1);
       served.refuse_unpublished();
     }
+  }
+  if served.claims_durability()
+    && let Some(target) = crate::live_ship::durable_target(s, mount.volume)
+  {
+    if mount.held.len() < crate::live_ship::reply_hold_bound(s) {
+      mount.held.push_back(HeldFlush {
+        served,
+        target,
+        deadline_ns: futures::now_ns().saturating_add(crate::live_ship::durable_wait_ns()),
+      });
+      s.count(LIVE_FLUSH_HELD, 1);
+      return;
+    }
+    s.count(LIVE_FLUSH_REFUSED, 1);
+    served.refuse_unpublished();
   }
   if !served.send() {
     s.count(REPLY_UNDELIVERED, 1);
