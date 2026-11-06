@@ -6435,6 +6435,24 @@ Open:
 
 ### 2026-10-06: two fsync-acknowledged files came back empty after daemon kills on the macOS NFS mount (open)
 
+> **2026-11-06 (bug-sweep): not reproduced server-side by the Linux kernel client.** The 10-06 run, step for step:
+> files of 100 B to 300 KB written whole and fsynced, each hashed only once its fsync returned, an old one deleted every
+> other step past 2,000, and 15 SIGKILLs of the daemon at 0.4-1.6 s intervals; then a remount and every file read back.
+> `docs/wip/bench/kill_fsync.sh` ran it in a privileged `python:3.13` container on Docker Desktop's Linux VM (6.12.76,
+> aarch64), with this branch's release build at `72a1f806`:
+>
+> | NFS | files checked | intact | corrupt (empty) | missing | resurrected | anchor restarts |
+> |---|---|---|---|---|---|---|
+> | v3, `nolock,hard` | 13,917 | 13,917 | 0 (0) | 0 | 0 | 15 |
+> | v4.2, `hard` | 13,994 | 13,994 | 0 (0) | 0 | 0 | 15 |
+>
+> Both runs reached `ENOSPC` once the 2 GiB volume was full, as the 10-06 run did. So the server keeps every fsync over
+> NFSv3 and v4.2 through kills for a Linux client. That leaves the macOS client's reconnect path as the suspect, the path
+> whose memory corruption panicked the kernel (A-113's bug record). Since A-113 the anchor holds every loopback
+> connection, so that path is not taken now. Proposed controlled run for Ada, on a machine whose kernel may panic (not
+> this one): the same writer and killer through a macOS kernel mount at HEAD, where a kill no longer drops the connection.
+> If it shows no loss, close this entry as fixed by A-113; if it does, the server's trace of that run is the next step.
+
 The same kill run that measured the 1.0 s stalls (before A-113) returned two 300 KB files empty whose fsync had
 returned, among 2,320 checked. The write verifier is per daemon instance, so a restart that loses unstable writes is
 visible to the client; the cause is not yet found. The Linux FUSE run (22,068 files, 15 kills) had none.
@@ -11896,6 +11914,13 @@ one is shown. If a replaced path is the cause, the hardening would be for the an
 (`docs/bugs/2026-10-21-the-cli-tests-start-wait-spent-its-attempts-on-the-anchors-boot.md`).
 
 ### 2026-10-21: a dirty shared-map page is written back over a later write through another path — fixed on Linux (A-139, A-140); macOS open
+
+> **2026-11-06 (bug-sweep): macOS settled by A-192 on 2026-10-31** (further down this file: a stale write-back is
+> refused `NFS3ERR_IO`, and `a_dirty_shared_map_page_never_undoes_a_later_write_through_the_nfs_mount` holds it on CI's
+> macOS runner). Two cases are still open, listed under A-192: Apple's client tells the program nothing of the refusal;
+> and after a daemon restart the byte states start empty, so a page fetched before the restart is not judged. Slates
+> cannot tell the second case without carrying a connection's states across the takeover; that proposal is with the
+> supervisor.
 
 Found by adversarial testing of the mount route. A store through a mount's writable `MAP_SHARED` map left its page
 dirty in the kernel. A later write through another path was applied and acknowledged. Then the kernel wrote its whole
