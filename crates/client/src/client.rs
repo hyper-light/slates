@@ -3603,6 +3603,15 @@ impl Client {
     }
   }
 
+  /// Detaches an attachment of `volume`, routed by the volume (§4.10, A-222): the form for an attachment another
+  /// host's owner holds, which an attachment id alone cannot route to (it names its owner partition, not its host).
+  pub fn detach_of(&mut self, volume: VolumeId, attachment: u64) -> Result<(), ClientError> {
+    match self.call(&RequestBody::DetachOf { volume, attachment })? {
+      ReplyBody::Detached => Ok(()),
+      _ => Err(ClientError::UnexpectedReply { verb: "detach" }),
+    }
+  }
+
   /// Binds a host mount's attachment to the path the mount was established at (§4.4 `Binding →
   /// Bound`; GAP-A9-4): the record's form becomes the chosen path, which `status` then reports.
   /// Refused for an attachment that is not a host mount's, or another principal's.

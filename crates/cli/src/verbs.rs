@@ -1423,8 +1423,11 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
       intent,
       form,
     } => emit_attach(client, *volume, *snapshot, *intent, form.clone(), json)?,
-    Verb::Detach { attachment } => {
-      client.detach(*attachment)?;
+    Verb::Detach { attachment, volume } => {
+      match volume {
+        Some(volume) => client.detach_of(*volume, *attachment)?,
+        None => client.detach(*attachment)?,
+      }
       emit_ok("ok", json);
     }
     Verb::ReadBase { volume, path } => {
