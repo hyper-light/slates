@@ -1,0 +1,143 @@
+# arm comb-red at 1e7d230764b9e15743e3cc3b7c41fb0941e3b599; keep bug '1', workers '2'
+image win25-vs2026 20261030.294.1; 4 CPUs; AMD64 Intel64 Family 6 Model 106 Stepping 6, GenuineIntel; WinFsp 2.1.25156
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded getrandom v0.4.3
+  Downloaded proc-macro2 v1.0.107
+  Downloaded cfg-if v1.0.4
+  Downloaded cpufeatures v0.3.1
+  Downloaded itoa v1.0.18
+  Downloaded windows-targets v0.53.5
+  Downloaded tinyvec_macros v0.1.1
+  Downloaded find-msvc-tools v0.1.12
+  Downloaded pkg-config v0.3.34
+  Downloaded zstd v0.13.3
+  Downloaded constant_time_eq v0.4.2
+  Downloaded zstd-safe v7.3.0
+  Downloaded jobserver v0.1.35
+  Downloaded zmij v1.0.23
+  Downloaded quote v1.0.47
+  Downloaded shlex v2.0.1
+  Downloaded memmap2 v0.9.11
+  Downloaded arrayvec v0.7.8
+  Downloaded twox-hash v2.1.4
+  Downloaded lz4_flex v0.11.6
+  Downloaded serde_derive v1.0.229
+  Downloaded unicode-ident v1.0.24
+  Downloaded serde_core v1.0.229
+  Downloaded tinyvec v1.13.2
+  Downloaded serde v1.0.229
+  Downloaded memchr v2.8.3
+  Downloaded cc v1.4.5
+  Downloaded unicode-normalization v0.1.25
+  Downloaded serde_json v1.0.151
+  Downloaded blake3 v1.8.7
+  Downloaded syn v3.0.5
+  Downloaded syn v2.0.119
+  Downloaded zstd-sys v2.1.0+zstd.1.5.7
+  Downloaded windows_x86_64_msvc v0.53.1
+  Downloaded windows-sys v0.60.2
+   Compiling getrandom v0.4.3
+   Compiling cfg-if v1.0.4
+   Compiling find-msvc-tools v0.1.12
+   Compiling shlex v2.0.1
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.24
+   Compiling serde_core v1.0.229
+   Compiling windows_x86_64_msvc v0.53.1
+   Compiling zmij v1.0.23
+   Compiling jobserver v0.1.35
+   Compiling cc v1.4.5
+   Compiling serde_json v1.0.151
+   Compiling syn v3.0.5
+   Compiling arrayvec v0.7.8
+   Compiling cpufeatures v0.3.1
+   Compiling constant_time_eq v0.4.2
+   Compiling serde v1.0.229
+   Compiling windows-targets v0.53.5
+   Compiling memchr v2.8.3
+   Compiling blake3 v1.8.7
+   Compiling itoa v1.0.18
+   Compiling windows-sys v0.60.2
+   Compiling serde_derive v1.0.229
+   Compiling pkg-config v0.3.34
+   Compiling memmap2 v0.9.11
+   Compiling zstd-sys v2.1.0+zstd.1.5.7
+   Compiling syn v2.0.119
+   Compiling zstd-safe v7.3.0
+   Compiling twox-hash v2.1.4
+   Compiling tinyvec_macros v0.1.1
+   Compiling tinyvec v1.13.2
+   Compiling lz4_flex v0.11.6
+   Compiling unicode-normalization v0.1.25
+   Compiling slates-image v0.1.0 (D:\a\slates\slates\crates\image)
+   Compiling slates-wire-derive v0.1.0 (D:\a\slates\slates\crates\wire-derive)
+   Compiling slates-machine v0.1.0 (D:\a\slates\slates\crates\machine)
+   Compiling slates-mem v0.1.0 (D:\a\slates\slates\crates\mem)
+   Compiling slates-wire v0.1.0 (D:\a\slates\slates\crates\wire)
+   Compiling slates-ipc v0.1.0 (D:\a\slates\slates\crates\ipc)
+   Compiling slates-rt v0.1.0 (D:\a\slates\slates\crates\rt)
+   Compiling zstd v0.13.3
+   Compiling slates-archive v0.1.0 (D:\a\slates\slates\crates\archive)
+   Compiling slates-vfs v0.1.0 (D:\a\slates\slates\crates\vfs)
+   Compiling slates-anchor v0.1.0 (D:\a\slates\slates\crates\anchor)
+   Compiling slates-db v0.1.0 (D:\a\slates\slates\crates\db)
+   Compiling slates-bridge-core v0.1.0 (D:\a\slates\slates\crates\bridge-core)
+   Compiling slates-bridge-winfsp v0.1.0 (D:\a\slates\slates\crates\bridge-winfsp)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 58.83s
+     Running unittests src\lib.rs (target\debug\deps\slates_bridge_winfsp-68e58da83a217bfc.exe)
+
+running 2 tests
+test host::tests::a_close_served_before_the_kill_is_answered_done_after_takeover ... 
+running 1 test
+slates-winfsp: reply spin window = 22700 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+slates-winfsp: reply spin window = 15700 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+slates-winfsp: receive worker 1 serves, after the probe
+
+running 1 test
+WINFSP CLOSE: the closer client's CloseHandle succeeded
+WINFSP CLOSE: the server ended the open and holds the Close's reply; killing it
+
+running 1 test
+slates-winfsp: reply spin window = 14400 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+slates-winfsp: reply spin window = 15500 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+slates-winfsp: context refused: open ledger: Stale
+slates-winfsp: close refused with NTSTATUS 0xc0000008
+slates-winfsp: settled 1 captured requests before receiving, 1 of them a replayed cleanup or close refused
+slates-winfsp: receive worker 1 serves, after the probe
+WINFSP CLOSE: the successor settled 1 captured requests, 1 refused
+
+thread 'host::tests::a_close_served_before_the_kill_is_answered_done_after_takeover' (2276) panicked at crates\bridge-winfsp\src\..\tests\support\host.rs:1380:3:
+assertion `left == right` failed: the successor refused a replayed Close whose open the dead daemon had already ended
+  left: 1
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test host::tests::a_handle_open_across_the_kill_closes_through_the_successor ... 
+running 1 test
+slates-winfsp: reply spin window = 16900 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+slates-winfsp: reply spin window = 18100 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+slates-winfsp: receive worker 1 serves, after the probe
+
+running 1 test
+WINFSP HOLD: the client holds an open it read through; killing the server
+
+running 1 test
+slates-winfsp: reply spin window = 14600 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+slates-winfsp: reply spin window = 17200 ns: the median one-way channel wake of 15 (the 2-competitive spin)
+slates-winfsp: settled 1 captured requests before receiving, 0 of them a replayed cleanup or close refused
+slates-winfsp: receive worker 1 serves, after the probe
+WINFSP CLOSE: the holder client's CloseHandle succeeded
+WINFSP HOLD: the successor served the held open's Close
+ok
+
+failures:
+
+failures:
+    host::tests::a_close_served_before_the_kill_is_answered_done_after_takeover
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 96 filtered out; finished in 0.33s
+
+error: test failed, to rerun pass `-p slates-bridge-winfsp --lib`
+## bridge, comb-red, exit 101
