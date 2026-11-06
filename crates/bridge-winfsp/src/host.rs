@@ -420,7 +420,8 @@ impl Request {
     // A replayed Release (a Close) ends an open the dead daemon may already have ended: it served the Close, retired
     // the open, and died before acknowledging it. Its open being gone is then the Close done, not a refusal. A Cleanup
     // retires nothing, so a replayed Cleanup's stale context stays a refusal.
-    let ends_open = closed.is_some();
+    // DIAG ONLY: SLATES_DIAG_KEEP_CLOSE_BUG builds the form without this fix, the red check.
+    let ends_open = closed.is_some() && option_env!("SLATES_DIAG_KEEP_CLOSE_BUG").is_none();
     let refused = admission_refusal(&self.op, names, ledger);
     let bound = bind(self.op, ledger);
     let barrier = bound.as_ref().is_ok_and(|op| {
