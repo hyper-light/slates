@@ -9538,10 +9538,13 @@ fn rebuild_green(state: &mut ShardState, record: &VolumeRecord) {
     Err(fence) => return fence_green(state, record, fence),
   };
   state.greens.insert(record.id, green);
-  // The replay rebuilt every history in full; the recovered works are reset to the head and a green's
-  // attachments are reconciled out at boot, so nothing reachable lies below the head: fold to it and
-  // re-take the retention the remaining histories hold, ahead of new claims (§4.2 recovery order). A
-  // retention the budget cannot hold fences the green rather than serve it over budget.
+  // The replay rebuilt every history in full; fold it oldest-first back to the budget and re-take the retention the
+  // remaining histories hold, ahead of new claims (§4.2 recovery order). The works are rebuilt after their greens,
+  // at the bases their logs restore (A-207), so no work's base is in the floor here; the fold still never passes one.
+  // Before the restart a claim past the green's budget was refused (`secure_green_retention`), so the history the
+  // live engine held, folded to where it had folded, was within the budget; folding oldest-first therefore stops at
+  // or below that point, which no live work's base was under. A retention the budget cannot hold fences the green
+  // rather than serve it over budget.
   if let Err(short) = crate::merge_service::settle_green_retention(state, record.id) {
     fence_green(
       state,
@@ -9616,12 +9619,11 @@ fn fence_green(
 /// report, alongside the verbs' refusal kinds.
 const GREEN_FENCED: &str = "merge.green_fenced";
 
-/// Rebuilds a recovered work volume as a fresh clone of its green's current head (§4.16): a work's
-/// declared edits are scratch and do not survive a restart (BUG-11 class), so the work is reset —
-/// based on its green's head and holding nothing of its own (`crate::work_files`) — never presenting
-/// lost edits as if kept. Skipped when its green is gone (the work has nothing to be over). A work that
-/// holds nothing is charged nothing, so no budget can refuse the rebuild (a whole copy of the green was
-/// charged, and could be refused, before 2026-11-04).
+/// Rebuilds a recovered work volume from its log (§4.16, A-207; D-18): its base, what it holds of its own and its
+/// journal, replayed over its rebuilt green, so every change it acknowledged before the restart is there after it.
+/// Skipped when its green is gone (the work has nothing to be over). Charged for what it keeps, like any work; a log
+/// that does not replay, or a budget that cannot hold the work, leaves it unbuilt and counted
+/// (`WORK_REBUILD_REFUSED`), never presented reset as if its edits were kept.
 fn rebuild_work(state: &mut ShardState, record: &VolumeRecord, green: DbVolumeId) {
   let Some(engine) = state.greens.get(&green) else {
     return;
