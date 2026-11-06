@@ -1,0 +1,83 @@
+name: diag-clients
+
+# Diagnostics only, never on main (A-228, the liveness watchdog): on CI's two Linux runners, the liveness tests quiet and
+# under the A/B bar's load (two spinning shell loops a logical CPU), then the anchor suite, the server's observe,
+# give_back, recovery and daemon tests and the client's client test, every one to its end. Each job pushes its result
+# lines to diag-results/clients-a228-4-<os> with the Actions token, read by git fetch at no API quota.
+on:
+  push:
+    branches: ["diag-clients-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  liveness:
+    name: A-228 liveness on Linux (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the tests
+        run: cargo test --locked -p slates-server -p slates-anchor -p slates-client -p slates-rt --no-run
+      - name: Liveness, anchor and server suites, quiet and under the bar's load
+        run: |
+          set +e
+          R=../results.txt
+          cpus=$(nproc 2>/dev/null || echo "$NUMBER_OF_PROCESSORS")
+          echo "runner ${{ matrix.os }}, $cpus CPUs, $(date -u), commit $(git rev-parse --short HEAD)" > $R
+          for round in 1 2 3; do
+            echo "== liveness quiet round $round at $(date -u +%H:%M:%S)" | tee -a $R
+            cargo test --locked -q -p slates-server --test liveness -- --nocapture --test-threads=1 2>&1 | grep -E 'gap|stopped|wedged|spinning|panicked|test result' | tee -a $R
+          done
+          for round in 1 2 3; do
+            pids=""
+            for i in $(seq 1 $((cpus * 2))); do ( while :; do :; done ) & pids="$pids $!"; done
+            echo "== liveness busy (two spinners a CPU) round $round at $(date -u +%H:%M:%S)" | tee -a $R
+            cargo test --locked -q -p slates-server --test liveness -- --nocapture --test-threads=1 2>&1 | grep -E 'gap|stopped|wedged|spinning|panicked|test result' | tee -a $R
+            for p in $pids; do kill "$p" 2>/dev/null || true; done
+            wait 2>/dev/null || true
+          done
+          set +e
+          for cmd in \
+            "cargo test --locked -q -p slates-anchor" \
+            "cargo test --locked -q -p slates-server --test observe" \
+            "cargo test --locked -q -p slates-server --test give_back" \
+            "cargo test --locked -q -p slates-server --test recovery" \
+            "cargo test --locked -q -p slates-server --test daemon" \
+            "cargo test --locked -q -p slates-client --test client" \
+            "cargo test --locked -q -p slates-server --test liveness -- --test-threads=1"; do
+            echo "== $cmd" | tee -a $R
+            $cmd 2>&1 | grep -E 'test result|FAILED|panicked|^    [a-z_:]+$' | tee -a $R
+            echo "== exit ${PIPESTATUS[0]}" | tee -a $R
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/clients-a228-4-${{ matrix.os }}"
+          git config user.name "diag-clients"
+          git config user.email "diag-clients@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-clients a228-4 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
