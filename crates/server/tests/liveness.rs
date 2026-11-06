@@ -18,7 +18,7 @@
 
 mod common;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use slates_rt::shard::ShardId;
@@ -151,27 +151,57 @@ fn a_starved_poll_on_the_control_shard_does_not_stop_the_beat() {
 }
 
 /// A-228, §4.14. Do: on the shard that is not the control shard, block one poll with no CPU for three windows (a
-/// deadlock, or a host call that does not return). Expect: the beat stops within a window and a few beats of it, and
-/// stays stopped. Before A-228 the control shard went on beating, so the anchor never saw the wedged shard.
+/// deadlock, or a host call that does not return), noting when the block began on the shard. Expect: the beat stops — a
+/// gap of a whole window — no later than a window and three beats after the block began. Before A-228 the control shard
+/// went on beating, so the anchor never saw the wedged shard. The stop is timed from the block's own start, since under
+/// load the observation reaches the shard some time after it is sent, and the beat resumes once the block ends, so only
+/// the first window-long gap counts.
 #[test]
 fn a_wedged_shard_stops_the_beat() {
   let (daemon, _, other) = daemon("wedged");
   beating(&daemon);
   let held = WINDOW * 3;
+  let base = Instant::now();
+  let began_us = &*Box::leak(Box::new(AtomicU64::new(0)));
   let worker = on_shard(&daemon, other, move || {
+    began_us.store(
+      u64::try_from(base.elapsed().as_micros()).unwrap().max(1),
+      Ordering::Release,
+    );
     let (_hold, rx) = std::sync::mpsc::channel::<()>();
     let _ = rx.recv_timeout(held);
   });
-  let (largest, last_seen) = watch_beat(&daemon, held);
+  // Each beat's arrival, by the test's clock since `base`, until a whole window passes without one.
+  let mut last = beat(&daemon);
+  let mut last_seen = base.elapsed();
+  let mut stopped_at = None;
+  while base.elapsed() < held {
+    wait(SAMPLE);
+    let now = beat(&daemon);
+    if now != last {
+      last = now;
+      last_seen = base.elapsed();
+    } else if began_us.load(Ordering::Acquire) > 0
+      && base.elapsed().saturating_sub(last_seen) >= WINDOW
+    {
+      stopped_at = Some(last_seen);
+      break;
+    }
+  }
   worker.join().unwrap();
-  println!("wedged shard: the beat last advanced {last_seen:?} in, then gapped {largest:?}");
+  let began = Duration::from_micros(began_us.load(Ordering::Acquire));
+  let stopped_at = stopped_at.unwrap_or_else(|| {
+    panic!(
+      "a wedged shard never stopped the beat for a whole window: the block began {began:?} in, the beat last advanced \
+       {last_seen:?} in, the watch ended {:?} in",
+      base.elapsed()
+    )
+  });
+  let after = stopped_at.saturating_sub(began);
+  println!("wedged shard: the block began {began:?} in, and the beat stopped {after:?} after it");
   assert!(
-    largest >= WINDOW,
-    "a wedged shard never stopped the beat (largest gap {largest:?})"
-  );
-  assert!(
-    last_seen <= WINDOW + BEAT * 3,
-    "the beat stopped {last_seen:?} after the shard wedged, past a window and three beats"
+    after <= WINDOW + BEAT * 3,
+    "the beat stopped {after:?} after the shard wedged, past a window and three beats"
   );
   daemon.stop();
 }
