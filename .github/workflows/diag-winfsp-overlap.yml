@@ -1,0 +1,153 @@
+name: DIAG step 7's fix -- the A/B as the rule's pairs, one interleaved run a job (not for main)
+
+# Audit plan step 7: the pairs the decision rule judges, each pair interleaved on one VM, quiet then loaded (two
+# spinners a logical CPU), one run a job so five runs of each pair spread over VMs: on x86_64 the DLL against the
+# combined form at one fixed worker and main's receiver against it, on arm64 the DLL against the combined form at two.
+# Two daemons a VM: four beside the spinners starved the control shards past the anchor's liveness budget (run
+# 42161838327, GAPS). Each job's CPU line is in its output, since windows-latest's hosts differ. No probe runs.
+
+on:
+  push:
+    branches: ['diag-winfsp-overlap-[0-9]*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  OLD_COMMIT: 71cf09acb500fba021c92cfc9c42f0180e93876b
+  MAIN_COMMIT: 28359a7512ba9fd544550d12743294afd3e50eff
+  WINFSP_MSI_URL: https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
+  WINFSP_MSI_SHA256: 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
+
+jobs:
+  ab:
+    strategy:
+      fail-fast: false
+      matrix:
+        pair: [x86-dll-comb1, x86-sep1-comb1, arm-dll-comb2]
+        run: [1, 2, 3, 4, 5]
+        include:
+          - pair: x86-dll-comb1
+            runner: windows-latest
+            msvc: x64
+            first: dll
+            second: comb1
+          - pair: x86-sep1-comb1
+            runner: windows-latest
+            msvc: x64
+            first: sep1
+            second: comb1
+          - pair: arm-dll-comb2
+            runner: windows-11-arm
+            msvc: arm64
+            first: dll
+            second: comb2
+    name: ${{ matrix.pair }} run ${{ matrix.run }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: The results publisher
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/publish.sh" <<'EOF'
+          #!/bin/bash
+          # One commit per call on the results branch; a failed publish is reported and does not end the job.
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          cd "$GITHUB_WORKSPACE" || exit 0
+          touch ab.txt live.txt clippy.txt mount.txt
+          ab=$(git hash-object -w ab.txt) || exit 0
+          live=$(git hash-object -w live.txt) || exit 0
+          lint=$(git hash-object -w clippy.txt) || exit 0
+          mount=$(git hash-object -w mount.txt) || exit 0
+          tree=$(printf '100644 blob %s\tab.txt\n100644 blob %s\tclippy.txt\n100644 blob %s\tlive.txt\n100644 blob %s\tmount.txt\n' "$ab" "$lint" "$live" "$mount" | git mktree) || exit 0
+          parent=$(cat "$RUNNER_TEMP/results-parent" 2>/dev/null || true)
+          commit=$(git commit-tree "$tree" ${parent:+-p "$parent"} -m "results of run $GITHUB_RUN_ID") || exit 0
+          if git push origin "$commit:refs/heads/$RESULTS_BRANCH"; then
+            echo "$commit" > "$RUNNER_TEMP/results-parent"
+          else
+            echo "::warning::could not publish the results"
+          fi
+          EOF
+          chmod +x "$RUNNER_TEMP/publish.sh"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (x86_64)
+        if: matrix.msvc == 'x64'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64)
+        if: matrix.msvc == 'arm64'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Install WinFsp, pinned
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp.msi'
+          Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile $msi
+          $found = (Get-FileHash $msi -Algorithm SHA256).Hash
+          if ($found -ne $env:WINFSP_MSI_SHA256) { throw "WinFsp's installer hashes $found, not $env:WINFSP_MSI_SHA256" }
+          $install = Start-Process msiexec -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "image $env:ImageOS $env:ImageVersion; $env:NUMBER_OF_PROCESSORS CPUs; $env:PROCESSOR_ARCHITECTURE $env:PROCESSOR_IDENTIFIER; WinFsp 2.1.25156" | Out-File -FilePath image.txt -Encoding utf8
+      - name: Build the pair's arms
+        shell: bash
+        run: |
+          build() {
+            local name=$1
+            mkdir -p "ab-bin/$name"
+            case "$name" in
+              comb1|comb2)
+                SLATES_DIAG_RECEIVE_WORKERS=${name#comb} cargo build --release --locked -p slates-cli --bin slates
+                cp target/release/slates.exe "ab-bin/$name/slates.exe" ;;
+              dll|sep1)
+                local commit=$OLD_COMMIT
+                if [ "$name" = sep1 ]; then commit=$MAIN_COMMIT; fi
+                git fetch --depth=1 origin "$commit"
+                git worktree add --detach "$RUNNER_TEMP/$name" "$commit"
+                (cd "$RUNNER_TEMP/$name" && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-arms" \
+                  cargo build --release --locked -p slates-cli --bin slates)
+                cp target-arms/release/slates.exe "ab-bin/$name/slates.exe" ;;
+            esac
+          }
+          build "${{ matrix.first }}"
+          build "${{ matrix.second }}"
+          cargo build --release --locked -p slates-cli --example mount_bench
+          cp target/release/examples/mount_bench.exe ab-bin/mount_bench.exe
+      - name: One interleaved run of the pair
+        shell: bash
+        env:
+          RESULTS_BRANCH: diag-winfsp-overlap-results-${{ github.run_id }}-${{ matrix.pair }}-${{ matrix.run }}
+        run: |
+          {
+            echo "# pair ${{ matrix.pair }}, run ${{ matrix.run }}: dll $OLD_COMMIT, sep1 $MAIN_COMMIT, comb $(git rev-parse HEAD); $(date -u +%FT%TZ)"
+            tr -d '\r\000' < image.txt | sed 's/^\xef\xbb\xbf//'
+            cmd //c ver | tr -d '\r' | grep -v '^$'
+            ARMS="${{ matrix.first }}=ab-bin/${{ matrix.first }}/slates.exe ${{ matrix.second }}=ab-bin/${{ matrix.second }}/slates.exe" \
+              BENCH=ab-bin/mount_bench.exe RUNS=1 SPINNERS_PER_CPU=2 AFTER_RUN="$RUNNER_TEMP/publish.sh" \
+              bash docs/wip/bench/fsbench/windows-ab.sh
+          } 2>&1 | tee ab.txt
+      - name: Publish whatever was measured
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/publish.sh" ]; then bash "$RUNNER_TEMP/publish.sh"; fi
+        env:
+          RESULTS_BRANCH: diag-winfsp-overlap-results-${{ github.run_id }}-${{ matrix.pair }}-${{ matrix.run }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pair-${{ matrix.pair }}-${{ matrix.run }}
+          path: ab.txt
