@@ -1,5 +1,15 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A Windows UDP socket died on an earlier send's ICMP error (found 2026-11-06, fixed 2026-11-06).** With Windows'
+> default `SIO_UDP_CONNRESET`, a port-unreachable for a datagram sent earlier failed the socket's next `recvfrom` with
+> WSAECONNRESET. A fleet node's demultiplexer ends on a receive refusal, so its socket stopped receiving, and
+> conformance's three-node fleet never formed (run 42150662467). Every datagram socket the Windows seam makes or
+> adopts now turns both ICMP reports off (`netsys::ignore_earlier_datagrams_errors`). On both CI Windows runners the
+> failing test failed on main (10054) and passes with the fix (`diag-liveness-3`). Conformance's live fleet failed 4 of
+> 4 runs without the fix and passed 4 of 4 with it. Owed: a fleet test on Windows in a lane on main, since `fleet.rs`
+> is Unix-only (owner release, 2026-11-07); `slates-cluster`'s tests build on Windows since conformance's a0015062
+> landed as 12e57aa8 (the bug record of 2026-11-06).
+
 > **The anchor kills live daemons on a busy machine (found 2026-11-06, audit step 7; fixed by A-228, Windows CI owed).** Under the
 > A/B bar's load, two spinners a logical CPU (8 on CI's 4-CPU Windows runners), the anchor killed daemons that were
 > alive and serving because their heartbeat lapsed its 1,000 ms liveness budget. A busy machine is the normal case
