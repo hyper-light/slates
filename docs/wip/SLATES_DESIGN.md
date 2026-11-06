@@ -13965,9 +13965,10 @@ own-mount records, `check_mount_point`, the refusals' mapping), `crates/bridge-w
     daemon, so the daemon's own record is the one source of truth: each mount is recorded when the CLI binds it, by the
     kernel's filesystem id for it (`getfsstat(MNT_NOWAIT)`, no RPC, the entry at exactly the bound point whose source
     is the volume's), never by a path prefix. The CLI binds the path the kernel records (`canonicalize`, as on Linux),
-    and a bind the table does not confirm is refused, so the CLI takes the mount down. A crossing is the kernel's path
-    of the parent (`F_GETPATH`, on a filesystem that is not ours, since every crossing to it was checked) with the
-    entry's name, compared exactly with each recorded mount's point; a thread reads the points once and again only
+    and the record mirrors the table: a bind of a point the table names no mount of the volume at records nothing
+    and is counted (`own_nfs.bind_unconfirmed`; the `UMNT` confirmation's tests make one on purpose). A crossing is
+    the kernel's path of the parent (`F_GETPATH`, on a filesystem that is not ours, since every crossing to it was
+    checked) with the entry's name, compared exactly with each recorded mount's point; a thread reads the points once and again only
     when the set changes (a generation word).
   - **A successor's kept mounts (supervisor's condition, 2026-11-06).** The record covers mounts the daemon did not
     bind itself. Recovery reacquired bases before a shard adopted the mounts its predecessor kept, so a base under a
