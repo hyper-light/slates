@@ -95,6 +95,12 @@ const CLOSE_TAKEN: u64 = PROBE_VOLUME_MADE + 1;
 const CLOSE_REFUSALS: u64 = CLOSE_TAKEN + 1;
 /// Shape: the refusal counts the marker range above carries; a run refusing more is a failure anyway.
 const CLOSE_REFUSAL_RANGE: u64 = 16;
+/// Format: a private Released marker: the holding successor served the Close of the open the dead daemon made.
+const HOLD_CLOSED: u64 = CLOSE_REFUSALS + CLOSE_REFUSAL_RANGE;
+/// Format: a private Released marker: the holding successor refused that open's Cleanup or Close.
+const HOLD_CLOSE_REFUSED: u64 = HOLD_CLOSED + 1;
+/// Format: the holding client's inherited event, as a hex handle value, set once its read has returned.
+const READ_DONE: &str = "SLATES_WINFSP_REQUEST_READ_DONE";
 /// Format: a reader's inherited stop event, as a hex handle value, and the index of its first file.
 const STOP: &str = "SLATES_WINFSP_REQUEST_STOP";
 /// Format: see STOP.
@@ -416,8 +422,16 @@ fn overlap_byte(index: usize) -> u8 {
   b'a' + u8::try_from(index).unwrap()
 }
 
+/// Whether the role is a first server: it is handed the anchor's channel, and asks it to hold its mount.
+fn is_first(role: &str) -> bool {
+  matches!(
+    role,
+    "first" | "serving" | "purger" | "closer-first" | "holder-first"
+  )
+}
+
 fn inherited_controls(role: &str) -> (Channel, Option<Inherited>) {
-  if role == "first" || role == "serving" || role == "purger" || role == "closer-first" {
+  if is_first(role) {
     let value = u64::from_str_radix(&std::env::var(CHANNEL).unwrap(), 16).unwrap();
     (Channel::adopt(inherited_handle(value)), None)
   } else {
@@ -511,7 +525,7 @@ fn serve_mounted(
   cx: &OpContext,
 ) -> ! {
   let mut ready = await_ready(mount);
-  if role == "first" || role == "serving" || role == "purger" || role == "closer-first" {
+  if is_first(role) {
     channel
       .send(
         &HandleMessage::Hold {
@@ -536,11 +550,9 @@ fn serve_mounted(
         WAIT_MS,
       )
       .unwrap();
-    if role == "closer-successor" {
-      report_close_recovery(channel, mount);
-    }
   }
   let mut names = OpenNames::new();
+  let mut close_reported = false;
   let mut recovery_counted = false;
   let mut release_reported = false;
   if role == "purger" {
@@ -556,9 +568,15 @@ fn serve_mounted(
       .unwrap();
   }
   loop {
-    let request = receive
-      .recv_timeout(ROLE_WAIT)
-      .expect("the fixture's next request");
+    // The closing successor's recovery is told while requests are served: it replays the Close through this shard.
+    let request = next_request(receive, || {
+      report_close_recovery(role, channel, mount, &mut close_reported);
+    });
+    report_close_recovery(role, channel, mount, &mut close_reported);
+    let Some(request) = tell_if_holding(role, request, channel, bridge, cx, &mut names, &mut ready)
+    else {
+      continue;
+    };
     count_recovery(role, &request, mount, &mut recovery_counted);
     report_release(role, channel, mount, &mut release_reported);
     let request = retain_if_taken(role, request, channel, bridge, cx, &mut names, &mut ready);
@@ -632,39 +650,97 @@ fn report_release(role: &str, channel: &Channel, mount: &mut MountThread, report
   }
 }
 
-/// The closing successor's recovery, told to the parent: how many replayed Cleanups and Closes were refused.
-fn report_close_recovery(channel: &Channel, mount: &mut MountThread) {
+/// The fixture's next request. It polls, so a role can watch its mount's outcomes between requests.
+fn next_request(receive: &Receiver<Request>, mut between: impl FnMut()) -> Request {
   let started = Instant::now();
-  let refused = loop {
-    match mount.outcome() {
-      Some(Outcome::Recovered { settled, refused }) => {
+  loop {
+    match receive.recv_timeout(POLL) {
+      Ok(request) => return request,
+      Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+        assert!(started.elapsed() < ROLE_WAIT, "the fixture's next request");
+        between();
+      }
+      Err(error) => panic!("the fixture's request channel: {error}"),
+    }
+  }
+}
+
+/// The closing successor's recovery, told to the parent once it is known: how many replayed Cleanups and Closes were
+/// refused. Recovery replays the captured Close through this shard, so it is known only while requests are served.
+fn report_close_recovery(
+  role: &str,
+  channel: &Channel,
+  mount: &mut MountThread,
+  reported: &mut bool,
+) {
+  if role != "closer-successor" || *reported {
+    return;
+  }
+  while let Some(outcome) = mount.outcome() {
+    match outcome {
+      Outcome::Recovered { settled, refused } => {
         eprintln!(
           "WINFSP CLOSE: the successor settled {settled} captured requests, {refused} refused"
         );
         assert!(settled > 0, "the successor must settle the captured Close");
-        break refused;
+        channel
+          .send(
+            &HandleMessage::Released {
+              id: CLOSE_REFUSALS + refused.min(CLOSE_REFUSAL_RANGE - 1),
+            },
+            WAIT_MS,
+          )
+          .unwrap();
+        *reported = true;
+        return;
       }
-      Some(Outcome::Failed(error)) => panic!("a receive worker failed: {error}"),
-      Some(Outcome::Stopped) => panic!("the mount stopped before its recovery was told"),
-      Some(_) => {}
-      None => {
-        assert!(
-          started.elapsed() < WAIT,
-          "the successor's recovery was never told"
-        );
-        #[allow(clippy::disallowed_methods)]
-        std::thread::sleep(POLL);
-      }
+      Outcome::Failed(error) => panic!("a receive worker failed: {error}"),
+      Outcome::Stopped => panic!("the mount stopped before its recovery was told"),
+      _ => {}
     }
+  }
+}
+
+/// The holding successor's Cleanup and Close of the open the dead daemon made: served here, the reply sent, and told
+/// to the parent, a refusal at once and the Close once served. Any other request is handed back to be served.
+fn tell_if_holding(
+  role: &str,
+  request: Request,
+  channel: &Channel,
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  names: &mut OpenNames,
+  ready: &mut Ready,
+) -> Option<Request> {
+  if role != "holder-successor" || !matches!(request.op, Op::Cleanup { .. } | Op::Release { .. }) {
+    return Some(request);
+  }
+  let close = matches!(request.op, Op::Release { .. });
+  let served = request.serve(bridge, cx, names, &mut ready.ledger);
+  let refused = if let Reply::Err(status) = served.reply {
+    eprintln!(
+      "WINFSP HOLD: the successor refused the held open's {} with NTSTATUS {status:#x}",
+      if close { "Close" } else { "Cleanup" }
+    );
+    true
+  } else {
+    false
   };
-  channel
-    .send(
-      &HandleMessage::Released {
-        id: CLOSE_REFUSALS + refused.min(CLOSE_REFUSAL_RANGE - 1),
-      },
-      WAIT_MS,
-    )
-    .unwrap();
+  assert!(served.send());
+  let marker = if refused {
+    Some(HOLD_CLOSE_REFUSED)
+  } else if close {
+    eprintln!("WINFSP HOLD: the successor served the held open's Close");
+    Some(HOLD_CLOSED)
+  } else {
+    None
+  };
+  if let Some(id) = marker {
+    channel
+      .send(&HandleMessage::Released { id }, WAIT_MS)
+      .unwrap();
+  }
+  None
 }
 
 fn count_recovery(role: &str, request: &Request, mount: &mut MountThread, counted: &mut bool) {
@@ -793,8 +869,8 @@ fn request_role() {
   if role == "probing" {
     probing();
   }
-  if role == "closer" {
-    closer(&drive);
+  if role == "closer" || role == "holder" {
+    closer(&role, &drive);
   }
   if role != "reader" && role != "probe" {
     serve(&role, &drive);
@@ -1200,9 +1276,11 @@ fn a_probe_killed_mid_measure_leaves_no_volume() {
   );
 }
 
-/// The closing client: opens the fixed file without the cache, so its Close reaches the server at CloseHandle, reads
-/// it, and closes it. CloseHandle must succeed whatever happened to the daemon meanwhile.
-fn closer(drive: &str) -> ! {
+/// The closing client: opens the fixed file without the cache, so its Cleanup and Close reach the server, reads it, and
+/// closes it. CloseHandle returns once the Cleanup is answered; Windows sends the Close when the file's last reference
+/// goes, at once here, since nothing caches it. The holding client sets its read event and waits for its stop event
+/// before it closes, so its handle stays open across the kill. CloseHandle must succeed whatever happened to the daemon.
+fn closer(role: &str, drive: &str) -> ! {
   let mut file = std::fs::OpenOptions::new()
     .read(true)
     .custom_flags(FILE_FLAG_NO_BUFFERING)
@@ -1211,6 +1289,20 @@ fn closer(drive: &str) -> ! {
   let mut page = AlignedPage([0; PAGE]);
   file.read_exact(&mut page.0).unwrap();
   assert!(page.0.iter().all(|byte| *byte == b'A'));
+  if role == "holder" {
+    let read =
+      inherited_handle(u64::from_str_radix(&std::env::var(READ_DONE).unwrap(), 16).unwrap());
+    let stop = inherited_handle(u64::from_str_radix(&std::env::var(STOP).unwrap(), 16).unwrap());
+    // SAFETY: the inherited event is owned and live.
+    assert_ne!(unsafe { SetEvent(read.as_raw_handle()) }, 0);
+    let within = u32::try_from(ROLE_WAIT.as_millis()).unwrap();
+    // SAFETY: the inherited event is owned and live.
+    let waited = unsafe { WaitForSingleObject(stop.as_raw_handle(), within) };
+    assert_eq!(
+      waited, WAIT_OBJECT_0,
+      "the holding client was never told to close"
+    );
+  }
   let handle = std::os::windows::io::IntoRawHandle::into_raw_handle(file);
   // SAFETY: the handle this process just opened and owns, closed once.
   let closed = unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
@@ -1220,14 +1312,15 @@ fn closer(drive: &str) -> ! {
     "CloseHandle failed: {}",
     std::io::Error::last_os_error()
   );
-  eprintln!("WINFSP CLOSE: the client's CloseHandle succeeded");
+  eprintln!("WINFSP CLOSE: the {role} client's CloseHandle succeeded");
   std::process::exit(ROLE_EXIT);
 }
 
-/// A-198, A-219. Do: a client opens the file uncached and closes it; the serving process ends the open on the shard and
-/// is killed before the Close's reply reaches its worker; a successor takes over and replays the captured Close. Expect:
-/// the client's CloseHandle succeeds, and the successor's recovery settles the Close with no refusal, since the open the
-/// dead daemon already ended is that Close done (it was refused `Stale`, run 42165934408).
+/// A-198, A-219. Do: a client opens the file uncached, reads it and closes it; the serving process ends the open on the
+/// shard when the Close arrives (after CloseHandle has returned at the Cleanup) and is killed before the Close's reply
+/// reaches its worker; a successor takes over and replays the captured Close. Expect: the client's CloseHandle succeeds,
+/// and the successor's recovery settles the Close with no refusal, since the open the dead daemon already ended is that
+/// Close done (it was refused `Stale`, run 42165934408).
 #[test]
 fn a_close_served_before_the_kill_is_answered_done_after_takeover() {
   if std::env::var_os("WINFSP_TEST_MOUNT").is_none() {
@@ -1290,5 +1383,94 @@ fn a_close_served_before_the_kill_is_answered_done_after_takeover() {
     scenario.reader.as_mut().unwrap().wait(),
     Some(ROLE_EXIT),
     "the client's CloseHandle must succeed across the takeover"
+  );
+}
+
+/// An unnamed manual-reset event the test owns.
+fn event() -> OwnedHandle {
+  // SAFETY: an unnamed manual-reset event; no security descriptor or name is borrowed.
+  let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+  assert!(!event.is_null(), "an event for the holding client");
+  // SAFETY: CreateEventW returned this fresh handle; the value takes its ownership once.
+  unsafe { OwnedHandle::from_raw_handle(event) }
+}
+
+/// A-198. Do: a client opens the file uncached and reads it under the first server; that server is killed with the
+/// handle still open; a successor takes over the held volume; the client then closes the handle through it. Expect: the
+/// successor serves the open's Cleanup and Close without a refusal, and the client's CloseHandle succeeds.
+#[test]
+fn a_handle_open_across_the_kill_closes_through_the_successor() {
+  if std::env::var_os("WINFSP_TEST_MOUNT").is_none() {
+    eprintln!("SKIP: the held-open close oracle needs WINFSP_TEST_MOUNT=1 and WinFsp installed");
+    return;
+  }
+  let drive = free_drive();
+  let (anchor, daemon) = channel().unwrap();
+  let inherited = duplicate_inheritable(daemon.raw()).unwrap();
+  let value = format!("{:x}", handle_value(inherited.raw()));
+  let mut scenario = Scenario {
+    servers: Vec::with_capacity(2),
+    held: Some(Held::new(1)),
+    reader: None,
+    probe: None,
+    readers: Vec::new(),
+  };
+  scenario.servers.push(spawn(
+    "holder-first",
+    &drive,
+    &[(OsStr::new(CHANNEL), OsStr::new(&value))],
+    &[inherited.raw()],
+  ));
+  drop(inherited);
+  hold_first_mount(&mut scenario, &anchor);
+  let read = event();
+  let stop = event();
+  let read_shared = duplicate_inheritable(read.as_raw_handle()).unwrap();
+  let stop_shared = duplicate_inheritable(stop.as_raw_handle()).unwrap();
+  let read_value = format!("{:x}", handle_value(read_shared.raw()));
+  let stop_value = format!("{:x}", handle_value(stop_shared.raw()));
+  scenario.reader = Some(spawn(
+    "holder",
+    &drive,
+    &[
+      (OsStr::new(READ_DONE), OsStr::new(&read_value)),
+      (OsStr::new(STOP), OsStr::new(&stop_value)),
+    ],
+    &[read_shared.raw(), stop_shared.raw()],
+  ));
+  drop((read_shared, stop_shared));
+  // SAFETY: the event is owned and live.
+  let waited = unsafe { WaitForSingleObject(read.as_raw_handle(), WAIT_MS) };
+  assert_eq!(
+    waited, WAIT_OBJECT_0,
+    "the holding client's read never returned"
+  );
+  eprintln!("WINFSP HOLD: the client holds an open it read through; killing the server");
+  scenario.servers[0].kill_and_reap();
+  let handoff = scenario.held.as_ref().unwrap().handoff(&daemon).unwrap();
+  scenario.servers.push(spawn(
+    "holder-successor",
+    &drive,
+    &[(OsStr::new(ENV_HANDLES), OsStr::new(handoff.env()))],
+    &handoff.handles(),
+  ));
+  drop(handoff);
+  assert_eq!(
+    anchor.recv(WAIT_MS).unwrap(),
+    Some(HandleMessage::Released {
+      id: SUCCESSOR_READY
+    })
+  );
+  // SAFETY: the event is owned and live.
+  assert_ne!(unsafe { SetEvent(stop.as_raw_handle()) }, 0);
+  assert_eq!(
+    anchor.recv(WAIT_MS).unwrap(),
+    Some(HandleMessage::Released { id: HOLD_CLOSED }),
+    "the successor must serve the held open's Cleanup and Close without a refusal"
+  );
+  assert_eq!(
+    scenario.reader.as_mut().unwrap().wait(),
+    Some(ROLE_EXIT),
+    "the client's CloseHandle must succeed through the successor"
   );
 }

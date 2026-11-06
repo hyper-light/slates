@@ -46,12 +46,17 @@ No open is leaked: the dead daemon ended it.
 
 ## Exact edits
 
-- **The failing test first.** `a_close_served_before_the_kill_is_answered_done_after_takeover`
-  (`crates/bridge-winfsp/tests/support/host.rs`). A client opens the fixed file uncached, reads it and closes it. The
-  serving process (`closer-first`) ends the open on the shard, holds the Close's reply, and tells the parent. The parent
-  kills it, and a successor (`closer-successor`) takes over and reports its recovery: how many captured requests it
-  settled, and how many of those were a replayed Cleanup or Close the file system refused. Expect: at least one
-  settled, none refused, and the client's `CloseHandle` returning nonzero.
+- **The failing tests first**, in `crates/bridge-winfsp/tests/support/host.rs`:
+  - `a_close_served_before_the_kill_is_answered_done_after_takeover`, the replay. A client opens the fixed file
+    uncached, reads it and closes it. CloseHandle returns once the Cleanup is answered, and Windows then sends the Close.
+    The serving process (`closer-first`) ends the open on the shard when the Close arrives, holds the Close's reply, and
+    tells the parent. The parent kills it, and a successor (`closer-successor`) takes over and reports its recovery: how
+    many captured requests it settled, and how many of those were a replayed Cleanup or Close the file system refused.
+    Expect: at least one settled and none refused.
+  - `a_handle_open_across_the_kill_closes_through_the_successor`, the handle open across the kill. A client opens and
+    reads the file under the first server and keeps the handle open; the server is killed, and the successor
+    (`holder-successor`) takes over. Only then does the client close. Expect: the successor serves the open's Cleanup and
+    Close without a refusal, and CloseHandle returns nonzero.
 - **The counter it reads.** `Outcome::Recovered { settled, refused }` (`crate::host`): the dispatcher counts a replayed
   Cleanup's or Close's response whose status is not success. The server counts it as
   `winfsp.captured_requests_refused`, and the recovery log line carries it.
@@ -61,6 +66,13 @@ No open is leaked: the dead daemon ended it.
   a Close can find its own effect done; a replayed Cleanup, a live request and every other replayed request keep the
   refusal, since a stale context there is still a refused context. The ledger's close record already passes a `Stale`
   open over (`finish_context_effects`), so the answer changes and nothing else does.
-- **The red check.** Diagnostics run `diag-winfsp-overlap-32` runs the test on both runners: on main's form without the
-  fix, on the combined form without the fix (the `replayed && ends_open` arm removed), and on the combined form with it
-  at one and at two fixed workers. Red must show `refused` above zero; the fixed arms must show zero.
+- **The test's own first bug.** In diagnostics run 42171690165 (`diag-winfsp-overlap-32`), every arm, the fixed ones too, failed
+  `the successor's recovery was never told`. The successor's role waited for its recovery's outcome before serving
+  any request, but recovery replays the captured Close through that same shard and waits for its answer. So neither
+  went on. The role now serves while it watches for the outcome (`next_request`, `report_close_recovery`). That run
+  also showed the client's CloseHandle return before the kill, which is why the first test's account above says the
+  Close follows CloseHandle.
+- **The red check.** Diagnostics run `diag-winfsp-overlap-33` runs both tests on both runners: on main's form without
+  the fix, on the combined form without the fix (the `replayed && ends_open` arm kept out), and with the fix on main's
+  form and on the combined form at one and at two fixed workers. Red must show `refused` above zero; the fixed arms
+  must show zero.
