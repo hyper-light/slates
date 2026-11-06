@@ -592,6 +592,23 @@ impl Agent {
         // The head moved again between the read and the rebase: resolve the new windows, within the same bound as a
         // submit's conflicts, so a client under endless contention is counted starved rather than looping.
         tally.rebase_conflicts += 1;
+        if tally.rebase_conflicts <= REBASE_CONFLICTS_NAMED {
+          let named: Vec<String> = conflicts
+            .iter()
+            .map(|w| format!("{}@{}+{} class {}", w.path, w.at, w.len, w.class))
+            .collect();
+          println!(
+            "rebase_conflict\tagent\t{}\tround\t{}\tbase\t{}\twindows\t{named:?}\tmine\t{:?}",
+            self.id,
+            self.round,
+            self.base,
+            self
+              .slots()
+              .iter()
+              .map(|slot| format!("{}@{}", slot.path, slot.at))
+              .collect::<Vec<_>>()
+          );
+        }
         self.resolutions += 1;
         if self.resolutions > MAX_RESOLUTIONS || conflicts.is_empty() {
           tally.starved += 1;
@@ -623,6 +640,10 @@ fn per_connection() -> usize {
     k.parse::<usize>().expect("--per-connection k").max(1)
   })
 }
+
+/// Shape: the rebase conflicts a worker names, each with its windows and the client's own slots, so a run shows what a
+/// rebase reported without printing every one.
+const REBASE_CONFLICTS_NAMED: u64 = 5;
 
 /// Shape: the unfinished clients a progress report names, each with its step and the request it waits on.
 const PROGRESS_NAMED: usize = 4;

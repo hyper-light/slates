@@ -29,8 +29,10 @@
 > Sanity rungs, Mac, in-process daemon, loaded arm (load 46 to 62 on 18 CPUs, the fleet suite running): 10 and 100
 > clients over `kernel/`, at one and ten logical clients a connection, oracle and own files 0 failures, no
 > backpressure, no starved clients. The latencies measure the box, not slates: the worker threads were descheduled
-> for up to 147 ms between drains of one ring (`max_drain_gap_ns`), so the quiet arm is on the Studio. Seen, not
-> yet explained: `rebase_conflicts` was exactly 100 at 100 clients in both forms (0 at 10).
+> for up to 147 ms between drains of one ring (`max_drain_gap_ns`), so the quiet arm is on the Studio. A
+> `rebase_conflicts` of exactly 100 at 100 clients, in both forms, was coincidence: a third run counted 99. Every named
+> window is one of the client's own hot slots, rewritten by another client between its resolution read and its
+> rebase, so the head really moved (the harness names the first five a worker meets).
 
 > **The anchor kills live daemons on a busy machine (found 2026-11-06, audit step 7; open, to be assigned).** Under the
 > A/B bar's load, two spinners a logical CPU (8 on CI's 4-CPU Windows runners), the anchor killed daemons that were
