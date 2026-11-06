@@ -1,0 +1,22 @@
+tested 2dd9d4dca0cce65d8e0314d379b29a3693b9fc51 on x86_64, 4 cpus, 15 GB, load 0.55 0.18 0.06
+kernel 6628e7d4c6b25c8d18f1345e3a20d21829aae7e4
+build exit 0
+PROBE tree /home/runner/work/_temp/linux/kernel pinned 754 took 48.52626ms (64.358µs/file) heap_delta 2618966 (3473 B/file) heap_peak_delta 3337270 open_handles 106 inodes_used 18446744073709028962 content_alloc 20271104
+PROBE tree /home/runner/work/_temp/linux/fs pinned 2365 took 101.778976ms (43.035µs/file) heap_delta 5085332 (2150 B/file) heap_peak_delta 5384225 open_handles 247 inodes_used 18446744073709032255 content_alloc 61403136
+PROBE tree /home/runner/work/_temp/linux/Documentation pinned 11608 took 308.073274ms (26.539µs/file) heap_delta 17523236 (1509 B/file) heap_peak_delta 17561101 open_handles 796 inodes_used 18446744073709052067 content_alloc 95588352
+PROBE tree /home/runner/work/_temp/linux/arch pinned 18944 took 509.663685ms (26.903µs/file) heap_delta 26327138 (1389 B/file) heap_peak_delta 26378470 open_handles 1121 inodes_used 18446744073709067119 content_alloc 196042752
+server Documentation peak_kib 551768 after 4s trace
+  Documentation: setup	probe_tree_ns	36002952	bound	118439316
+  Documentation: setup	create_overlay_ns	921761
+  Documentation: setup	pin_whole_ns	312383710	entries	11608
+  Documentation: setup	snapshot_ns	26475574
+  Documentation:  steps and 23 polls (2 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 2 timers, waited 0 times, spawned 0 tasks and finished 0; 5 tasks live; its longest poll is 916 ms and its timer overrun 0 ms
+  Documentation: setup	walk_ns	1340683544	files	11608	bytes	59219639
+server arch peak_kib 1087244 after 9s trace 5s:1005MB
+  arch: setup	probe_tree_ns	50453483	bound	254538010
+  arch: setup	create_overlay_ns	365191
+  arch: setup	pin_whole_ns	664177086	entries	18944
+  arch: slates daemon: a heartbeat came 715 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 15 steps and 14 polls (7 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 1 timers, waited 3 times, spawned 1 tasks and finished 2; 5 tasks live; i
+  arch: setup	snapshot_ns	42878851
+  arch: 1861 ms after the last (the anchor's budget is 1000 ms): in the gap the shard ran 21 steps and 22 polls (3 long in a task, 0 blocked in the kernel, 0 preempted by the host, 0 unattributed), fired 2 timers, waited 0 times, spawned 0 tasks and finished 0; 5 tasks live; its longest poll is 1819 ms and 
+  arch: setup	walk_ns	4827073448	files	18944	bytes	127268808
