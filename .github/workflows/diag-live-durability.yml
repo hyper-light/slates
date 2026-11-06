@@ -1,0 +1,165 @@
+name: diag-live-durability
+
+# Diagnostics only, never on main (A-200, the durability sibling sweep), round 2: the virtio-fs flow eight times a
+# lane with the owner's log printed at the stopped FSYNC (round 1 answered one 0 on x86_64), and on Windows the UDP
+# connection-reset fix's red arm and fix, then the WinFsp flush flow's red arm (the test and the UDP fix, without the
+# durability fix) and fix three times. Round 1's own description follows. Linux: the virtio-fs FSYNC flow on its red arm
+# (the test without the fix) and on the fix three times, then every other new flow, the whole live_fleet suite, and the
+# virtio-fs crate's and the daemon's virtio-fs tests on the fix. Windows: the WinFsp flush flow on its red arm and on the
+# fix three times, then the WinFsp mount suite on the fix. Each job pushes its result lines to
+# diag-results/live-durability-N-<os> with the Actions token, so they are read by git fetch and cost no API quota.
+on:
+  push:
+    branches: ["diag-live-durability-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RED_LINUX_SHA: 1093a0f06570431952d276e6318fbd8cda4070e5
+  RED_WINDOWS_SHA: d214295be049606d73a62ff891c8f13578472e5d
+  RED_UDP_SHA: 4763e6d5
+  SLATES_TEST_CLI: "1"
+  WINFSP_MSI_URL: https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
+  WINFSP_MSI_SHA256: 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
+
+jobs:
+  linux:
+    name: A-200 durability sweep (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: The virtio-fs flow, red arm then fix
+        run: |
+          R=../results.txt
+          echo "runner ${{ matrix.os }}, $(nproc) CPUs, $(date -u), fix $(git rev-parse HEAD)" > $R
+          git worktree add ../src-red "$RED_LINUX_SHA"
+          status=0
+          ( cd ../src-red && CARGO_TARGET_DIR=../target-red cargo test --locked -p slates-cli --test live_fleet -- a_virtio_fs --nocapture ) > ../red.log 2>&1 || status=$?
+          grep -E '^test |^live vhost|panicked at|assertion|left:|right:|test result' ../red.log | cut -c1-700 | tee -a $R
+          echo "== red exit $status" | tee -a $R
+          for n in 1 2 3 4 5 6 7 8; do
+            status=0
+            cargo test --locked -p slates-cli --test live_fleet -- a_virtio_fs --nocapture > ../fix.log 2>&1 || status=$?
+            grep -E '^test |^live vhost|panicked at|assertion|left:|right:|test result' ../fix.log | cut -c1-700 | tee -a $R
+            echo "== fix $n exit $status" | tee -a $R
+          done
+      - name: The virtio-fs crates on the fix
+        if: ${{ !cancelled() }}
+        run: |
+          R=../results.txt
+          status=0
+          cargo test --locked -p slates-bridge-virtiofs > ../vfs.log 2>&1 || status=$?
+          grep -E 'FAILED|panicked at|test result' ../vfs.log | cut -c1-400 | tee -a $R
+          echo "== bridge-virtiofs exit $status" | tee -a $R
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/live-durability-2-${{ matrix.os }}"
+          git config user.name "diag-live-durability"
+          git config user.email "diag-live-durability@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-live-durability-2 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
+
+  windows:
+    name: A-200 WinFsp flush (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 170
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+      WINFSP_TEST_MOUNT: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: Install WinFsp
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp.msi'
+          Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile $msi
+          $found = (Get-FileHash $msi -Algorithm SHA256).Hash
+          if ($found -ne $env:WINFSP_MSI_SHA256) { throw "WinFsp's installer hashes $found, not $env:WINFSP_MSI_SHA256" }
+          $install = Start-Process msiexec -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: The UDP connection-reset test, red arm then fix
+        run: |
+          R=../results.txt
+          cpus=$(nproc 2>/dev/null || echo "$NUMBER_OF_PROCESSORS")
+          echo "runner ${{ matrix.os }}, $cpus CPUs, $(date -u), fix $(git rev-parse HEAD)" > $R
+          git worktree add ../src-udp "$RED_UDP_SHA"
+          for arm in red fix; do
+            status=0
+            if [ $arm = red ]; then
+              ( cd ../src-udp && CARGO_TARGET_DIR=../target-udp cargo test --locked -p slates-rt --test udp ) > ../udp.log 2>&1 || status=$?
+            else
+              cargo test --locked -p slates-rt --test udp > ../udp.log 2>&1 || status=$?
+            fi
+            grep -E '^test |panicked at|received, not refused|test result' ../udp.log | cut -c1-600 | tee -a $R
+            echo "== udp $arm exit $status" | tee -a $R
+          done
+      - name: The WinFsp flush flow, red arm then fix
+        run: |
+          R=../results.txt
+          git worktree add ../src-red "$RED_WINDOWS_SHA"
+          status=0
+          ( cd ../src-red && CARGO_TARGET_DIR=../target-red timeout 2400 cargo test --locked -p slates-cli --test live_winfsp -- --nocapture ) > ../red.log 2>&1 || status=$?
+          grep -E '^test |^live winfsp|panicked at|assertion|SKIP|test result' ../red.log | cut -c1-700 | tee -a $R
+          tail -40 ../red.log | cut -c1-300 >> ../red-tail.txt
+          echo "== red exit $status" | tee -a $R
+          for n in 1 2 3; do
+            status=0
+            timeout 2400 cargo test --locked -p slates-cli --test live_winfsp -- --nocapture > ../fix.log 2>&1 || status=$?
+            grep -E '^test |^live winfsp|panicked at|assertion|SKIP|test result' ../fix.log | cut -c1-700 | tee -a $R
+            echo "== fix $n exit $status" | tee -a $R
+          done
+          tail -60 ../fix.log | cut -c1-300 | sed 's/^/  fix-tail: /' >> $R
+      - name: The WinFsp mount suite on the fix
+        if: ${{ !cancelled() }}
+        run: |
+          R=../results.txt
+          status=0
+          timeout 3600 cargo test --locked -p slates-cli --test winfsp -- --test-threads=1 > ../suite.log 2>&1 || status=$?
+          grep -E '^test |panicked at|test result' ../suite.log | cut -c1-400 | tee -a $R
+          echo "== winfsp suite exit $status" | tee -a $R
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/live-durability-2-${{ matrix.os }}"
+          git config user.name "diag-live-durability"
+          git config user.email "diag-live-durability@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-live-durability-2 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
