@@ -11930,7 +11930,24 @@ stale page back, and the other write's bytes on it reverted: measured 4,095 of 4
     - a handle opened after the last publication still adopts lazily on a restored mount (A-156);
     - the budget may reach two consecutive backlogs; advancing a reader's point at a confirmed delivery would halve
       it, and is not taken (A-157).
-- **The journal's ring grows by copying (open, 2026-10-24).** The op log's ring (`OpLog::records`, a `VecDeque`) grows
+- **The journal's ring grows by copying (open, 2026-10-24; fixed 2026-11-05, bug-sweep).** The ring
+  (`crates/vfs/src/journal.rs`, `Ring`) now holds its records in segments of 128 (11 KiB). The first segment grows by
+  doubling within the budget, so a journal within one segment allocates exactly as before. Each later segment is
+  allocated whole, so no append copies more than one segment, and the oldest segment is freed when its last record
+  leaves. The price is an allocation slack of two segments at most once a journal outgrows one: the oldest segment's
+  departed slots and the newest's unfilled ones, against a doubling ring's twice the budget. Evidence:
+  - `no_append_allocates_larger_in_a_long_journal_than_in_a_short_one` (`crates/vfs/tests/journal_cost.rs`, a counting
+    allocator, exact under any load) was red first: one append in a 16,384-record journal held by a lagging reader
+    allocated 1,556,192 bytes at once, against 22,968 in a 256-record one. Green after, at 11,264 bytes in both.
+  - New unit tests: `since` across segments against a filter, and a journal within one segment never past its budget.
+    The 2026-10-04 bound test now allows the two segments' slack. slates-vfs 337 passed.
+  - A steady-state append at a page budget, the daemon's common case, is level. That was measured by an out-of-tree
+    harness compiling main's and this `journal.rs` side by side, 21 alternating rounds of 500,000 appends, twice, at
+    load 33-34 on macOS arm64: best 27.5 against 26.6 ns and 53.0 against 40.4 ns, medians 89.8 against 84.7 and 72.4
+    against 67.6. A first harness that took the new ring from `slates_vfs` across a crate boundary without LTO read it
+    5 ns slower, which was the boundary, not the ring.
+
+  The record as found: The op log's ring (`OpLog::records`, a `VecDeque`) grows
   by doubling within its budget (`reserve_within_budget`), and a doubling copies every retained record in the one
   append that needs it. A ring a lagging reader has grown (A-157) is the case. Measured with a journal started at
   16 MiB: one append copied 2.75 MiB (16,384 records of 176 bytes; `crates/vfs/tests/image_cost.rs`, whose trace named
