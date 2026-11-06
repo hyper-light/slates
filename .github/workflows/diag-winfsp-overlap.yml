@@ -1,0 +1,164 @@
+name: DIAG step 7's record -- the probe's rounds in both forms, then the A/B of the DLL, the audited receiver and main's (not for main)
+
+# Audit plan step 7's record. The receive-worker probe's own tests, in release, five processes for each form (the
+# separate form at this commit, A-215's combined form at 5b5f7ba1): one waiting worker against two, every round printed.
+# No kill oracle runs: a daemon killed while its own probe open is in WinFsp's processing queue cannot exit for minutes
+# (diag-21 and diag-22 stuck in their live oracles). Then slates at 71cf09ac (the DLL dispatcher), 98000d56 (the receiver
+# as audited) and main 2f343fcd (the one-worker receiver), each with its own daemon and drive, one mount_bench rounding
+# over all three, quiet and loaded. Each runner's output goes to its own results branch after each step and each run.
+
+on:
+  push:
+    branches: ['diag-winfsp-overlap-[0-9]*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: never
+  OLD_COMMIT: 71cf09acb500fba021c92cfc9c42f0180e93876b
+  AUDITED_COMMIT: 98000d56a6331c110f45f536608bc6b80239cdc7
+  MAIN_COMMIT: 2f343fcd747148912ea9b6edac653ca48c2e47c0
+  COMBINED_COMMIT: 5b5f7ba1d8616175b32ee6b018262f33aa5ab875
+  WINFSP_MSI_URL: https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
+  WINFSP_MSI_SHA256: 073a70e00f77423e34bed98b86e600def93393ba5822204fac57a29324db9f7a
+
+jobs:
+  ab:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            msvc: x64
+          - runner: windows-11-arm
+            msvc: arm64
+    name: probe rounds and the record A/B on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 350
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: The results publisher
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/publish.sh" <<'EOF'
+          #!/bin/bash
+          # One commit per call on the results branch; a failed publish is reported and does not end the job.
+          export GIT_AUTHOR_NAME=diag GIT_AUTHOR_EMAIL=diag@users.noreply.github.com
+          export GIT_COMMITTER_NAME=diag GIT_COMMITTER_EMAIL=diag@users.noreply.github.com
+          cd "$GITHUB_WORKSPACE" || exit 0
+          touch ab.txt live.txt clippy.txt mount.txt probe.txt
+          ab=$(git hash-object -w ab.txt) || exit 0
+          live=$(git hash-object -w live.txt) || exit 0
+          lint=$(git hash-object -w clippy.txt) || exit 0
+          mount=$(git hash-object -w mount.txt) || exit 0
+          probe=$(git hash-object -w probe.txt) || exit 0
+          tree=$(printf '100644 blob %s\tab.txt\n100644 blob %s\tclippy.txt\n100644 blob %s\tlive.txt\n100644 blob %s\tmount.txt\n100644 blob %s\tprobe.txt\n' "$ab" "$lint" "$live" "$mount" "$probe" | git mktree) || exit 0
+          parent=$(cat "$RUNNER_TEMP/results-parent" 2>/dev/null || true)
+          commit=$(git commit-tree "$tree" ${parent:+-p "$parent"} -m "results of run $GITHUB_RUN_ID") || exit 0
+          if git push origin "$commit:refs/heads/$RESULTS_BRANCH"; then
+            echo "$commit" > "$RUNNER_TEMP/results-parent"
+          else
+            echo "::warning::could not publish the results"
+          fi
+          EOF
+          chmod +x "$RUNNER_TEMP/publish.sh"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (x86_64)
+        if: matrix.msvc == 'x64'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64)
+        if: matrix.msvc == 'arm64'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Install WinFsp, pinned
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp.msi'
+          Invoke-WebRequest -Uri $env:WINFSP_MSI_URL -OutFile $msi
+          $found = (Get-FileHash $msi -Algorithm SHA256).Hash
+          if ($found -ne $env:WINFSP_MSI_SHA256) { throw "WinFsp's installer hashes $found, not $env:WINFSP_MSI_SHA256" }
+          $install = Start-Process msiexec -ArgumentList '/i', "`"$msi`"", '/qn', '/norestart' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "WinFsp's installer answered $($install.ExitCode)" }
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "image $env:ImageOS $env:ImageVersion; $env:NUMBER_OF_PROCESSORS CPUs; $env:PROCESSOR_ARCHITECTURE $env:PROCESSOR_IDENTIFIER; WinFsp 2.1.25156" | Out-File -FilePath image.txt -Encoding utf8
+      - name: The probe's rounds in both forms
+        shell: bash
+        env:
+          RESULTS_BRANCH: diag-winfsp-overlap-results-${{ github.run_id }}-${{ matrix.runner }}
+        run: |
+          set +e
+          git fetch --depth=1 origin "$COMBINED_COMMIT"
+          git worktree add --detach "$RUNNER_TEMP/combined" "$COMBINED_COMMIT"
+          {
+            for form in separate combined; do
+              dir=$GITHUB_WORKSPACE
+              if [ "$form" = combined ]; then dir=$RUNNER_TEMP/combined; fi
+              for process in 1 2 3 4 5; do
+                echo "## probe $form process $process, $(date -u +%FT%TZ)"
+                (cd "$dir" && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-$form" WINFSP_TEST_MOUNT=1 \
+                  cargo test --release --locked -p slates-bridge-winfsp --lib probe::tests:: -- --test-threads=1 --nocapture)
+                echo "## probe $form process $process exit $?"
+              done
+            done
+          } 2>&1 | tee probe.txt
+          "$RUNNER_TEMP/publish.sh"
+          exit 0
+      - name: Build every arm
+        shell: bash
+        run: |
+          mkdir -p ab-bin/new
+          cargo build --release --locked -p slates-cli --bin slates --example mount_bench --example hold_latency_ab
+          cp target/release/slates.exe ab-bin/new/slates.exe
+          cp target/release/examples/mount_bench.exe ab-bin/mount_bench.exe
+          cp target/release/examples/hold_latency_ab.exe ab-bin/hold_latency_ab.exe
+          for arm in old:$OLD_COMMIT audited:$AUDITED_COMMIT main:$MAIN_COMMIT; do
+            name=${arm%%:*} commit=${arm#*:}
+            git fetch --depth=1 origin "$commit"
+            git worktree add --detach "$RUNNER_TEMP/$name" "$commit"
+            (cd "$RUNNER_TEMP/$name" && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo build --release --locked -p slates-cli --bin slates)
+            mkdir -p "ab-bin/$name"
+            cp target/release/slates.exe "ab-bin/$name/slates.exe"
+          done
+      - name: The interleaved mount benchmark
+        shell: bash
+        env:
+          RESULTS_BRANCH: diag-winfsp-overlap-results-${{ github.run_id }}-${{ matrix.runner }}
+        run: |
+          {
+            echo "# old $OLD_COMMIT, new $(git rev-parse HEAD), $(date -u +%FT%TZ)"
+            tr -d '\r\000' < image.txt | sed 's/^\xef\xbb\xbf//'
+            cmd //c ver | tr -d '\r' | grep -v '^$'
+            OLD_SLATES=ab-bin/old/slates.exe MID_SLATES=ab-bin/audited/slates.exe NEW_SLATES=ab-bin/main/slates.exe \
+              BENCH=ab-bin/mount_bench.exe OLD_NAME=dll MID_NAME=audited NEW_NAME=receiver RUNS=5 SPINNERS_PER_CPU=2 \
+              AFTER_RUN="$RUNNER_TEMP/publish.sh" \
+              bash docs/wip/bench/fsbench/windows-ab.sh
+          } 2>&1 | tee ab.txt
+      - name: Publish whatever was measured
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/publish.sh" ]; then bash "$RUNNER_TEMP/publish.sh"; fi
+        env:
+          RESULTS_BRANCH: diag-winfsp-overlap-results-${{ github.run_id }}-${{ matrix.runner }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: receiver-ab-${{ matrix.runner }}
+          path: |
+            ab.txt
+            clippy.txt
+            live.txt
+            mount.txt
+            probe.txt
