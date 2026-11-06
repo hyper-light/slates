@@ -1117,6 +1117,9 @@ pub(crate) fn reports(state: &ShardState) -> Vec<slates_ipc::protocol::LiveRepor
         head: live.shipper.head().map(|head| head.position),
         durable: live.shipper.durable(),
         owed: live.owes_whole,
+        head_epoch: live.shipper.head().map(|head| head.epoch.0),
+        head_identity: live.shipper.head().map(|head| head.identity),
+        fence: live.shipper.epoch().0,
       });
   let held = state
     .live
@@ -1128,6 +1131,9 @@ pub(crate) fn reports(state: &ShardState) -> Vec<slates_ipc::protocol::LiveRepor
       head: held.replica.head().map(|head| head.position),
       durable: None,
       owed: false,
+      head_epoch: held.replica.head().map(|head| head.epoch.0),
+      head_identity: held.replica.head().map(|head| head.identity),
+      fence: held.replica.fence().0,
     });
   shipping.chain(held).collect()
 }

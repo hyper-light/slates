@@ -1216,6 +1216,14 @@ pub struct LiveReport {
   /// On the owner: publications are owed to the log (a burst outran the credit, or one could not be shipped), so its
   /// head is behind the volume until the whole record it owes is appended.
   pub owed: bool,
+  /// The head's epoch: the owner's epoch that made the entry at the head (`None`: nothing yet). Appended.
+  pub head_epoch: Option<u64>,
+  /// The head's chain identity: the BLAKE3 of the entry at the head, which binds every entry before it (`None`: nothing
+  /// yet). Two copies at one epoch and position hold the same log exactly when these agree (Agreement). Appended.
+  pub head_identity: Option<[u8; 32]>,
+  /// On a candidate, the fence its copy has promised: no message made under a lower epoch is served. On the owner, the
+  /// epoch it ships under. Appended.
+  pub fence: u64,
 }
 
 /// The daemon's place in its fleet (§4.8; §2.6 boot step 6), as the verbs' placement authority sees it.

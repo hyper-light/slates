@@ -5672,7 +5672,9 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > entries since the last whole one within twice the volume's size, and answer with their head (record kinds 22, 23).
 > A publication that cannot become an entry (the credit full, a read or seal refused) leaves the volume owing a whole
 > record, which the next publication or the record period appends. `status` reports each live log
-> (`shard N live shipping|held VOLUME head= durable= owed=`). Across three real daemon processes
+> (`shard N live shipping|held VOLUME head= durable= owed= epoch= identity= fence=`: since 2026-11-06 the head's epoch
+> and chain identity and the copy's fence too, so a chaos run checks Agreement and fencing from outside the processes,
+> `crates/cli/tests/live_chaos.rs`). Across three real daemon processes
 > (`crates/cli/tests/live_fleet.rs`, `SLATES_TEST_CLI=1`), five writes end with the owner durable at its head, nothing
 > owed and both candidates at that head, 4 of 4 runs. Two defects that run found are fixed in the slice: a refusal was
 > re-shipped at once, so a holder that did not hold the volume's catalog yet looped with its owner (982 and 5,501
