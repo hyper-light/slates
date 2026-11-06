@@ -8200,6 +8200,41 @@ the discard calls replaced by a refusal in a diagnostics commit):
 - Linux and Mac fmt, clippy, docs, `cargo xtask check` and the mem tests, and Miri over mem's tests: passed on run
   41975260339.
 
+## A rebase that costs what changed, and where a merge's tail goes (A-202 part 3; 2026-11-06 UTC)
+
+Environment: adas-macbook-pro-2 (Apple M5 Max, 18 cores, 128 GiB, macOS 26.4.1), shared with other agents' builds; the
+load average is given for every invocation. Rust 1.98.1, release; the daemon derived 5 shards; the client spins up to
+1 ms for a reply. Harness: `crates/client/examples/edit_merge_bench.rs` (its new `rebase` form: a lagging work's
+disjoint edit is rebased onto the head, timed in the submit's place, then submitted untimed; the rebased file and the
+head after the submit are checked against the model). Arms: R0 = main `2f343fcd` with the form, R1 = the fix; saved
+release binaries run interleaved R0 R1 × 3; each invocation 3 runs × 1,000 samples (a run stops at 20 s, at least 200).
+
+Command: `edit_merge_bench_$arm --form rebase --files 10 --files 1000 --files 10000` (quiet, then loaded: one spinning
+thread per core). Total (edit + rebase) p50 per round, then p99:
+
+| Arm, shape | quiet p50 (p99) | loaded p50 (p99) |
+|---|---|---|
+| R0, 10 files | 42, 53, 65 µs (0.15, 0.16, 0.56 ms) | 66, 83, 98 µs (7.9, 8.6, 10.0 ms) |
+| R1, 10 files | 45, 44, 45 µs (0.16, 0.18, 0.17 ms) | 57, 56, 55 µs (10.5, 10.9, 8.6 ms) |
+| R0, 1,000 files | 0.61, 1.16, 1.23 ms (1.2, 1.7, 2.1 ms) | 1.35, 1.33, 1.35 ms (39.6, 29.3, 51.3 ms) |
+| R1, 1,000 files | 44, 44, 45 µs (0.13, 0.19, 0.33 ms) | 97, 99, 95 µs (10.7, 11.8, 10.4 ms) |
+| R0, 10,000 files | 7.89, 12.35, 14.70 ms (14.1, 16.3, 19.7 ms) | 34.0, 31.9, 36.9 ms (101, 87, 99 ms) |
+| R1, 10,000 files | 45, 52, 45 µs (0.20, 0.21, 0.14 ms) | 87, 99, 114 µs (10.7, 11.0, 11.4 ms) |
+
+Loads at the rounds' starts: 8.5, 26.3, 26.6, 27.2, 29.4, 27.7. The first measurement of the form on R0 (17:53 UTC, load
+26 to 29) gave p50 74 µs, 1.25 ms and 19.1 ms at 10, 1,000 and 10,000 files: the regression the fix was made against.
+R1 is flat in the green's size quiet and loaded. Both arms' loaded p99 sits at 8.6 to 11.8 ms whatever the shape, which
+is not the rebase.
+
+**Where the time goes (§4.14 spans).** The harness now drains every shard's spans after each sample (a shard's span
+ring holds as many spans as a client region has slots, so every sample; 0 shed, 0 unmatched) and, for each timed call,
+splits the client's time into the ring span on the shard that read its slot (read to reply written), the shard ops of
+its verb and the merge verdict. What the client saw beyond the ring is its own time and the wake: the doorbell, the
+shard's wake from its park and the client's wake. `edit_merge_bench --quiet-only --files 10 --form accept`, 2026-11-06,
+load about 20: median samples: client 62 µs, ring 28 µs (shard ops 25 µs, verdict 4 µs), outside the ring 34 µs; samples
+at or above p99: client 506 µs, ring 41 µs, outside the ring 416 µs. The tail is waiting to be woken and served, not
+the merge.
+
 ## The client's edit and merge latency, and a merge that grows with its green (RQ-4, §4.16; 2026-11-05)
 
 The per-platform client record (`platforms.md`) had a provisioning histogram and no number for the two verbs an agent

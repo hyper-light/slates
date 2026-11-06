@@ -406,13 +406,13 @@ fn an_ipc_creation_rebases_without_becoming_an_empty_file() {
   green.submit(&directory);
   let Rebased::Rebased {
     version,
-    files,
+    changed,
     journal,
   } = green.rebase(&pending)
   else {
     panic!("disjoint work rebases");
   };
-  assert!(files.is_empty());
+  assert!(changed.is_empty());
   let rebased = increment(&green.current_base(), version, &journal);
   assert_eq!(green.submit(&rebased), Outcome::Accepted { version: 2 });
   assert_eq!(green.special("pipe"), Some(node(SpecialKind::Fifo)));

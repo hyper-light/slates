@@ -173,14 +173,17 @@ pub enum Outcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Rebased {
   /// The work's pending operations all mapped cleanly onto the head. The work's base becomes
-  /// `version`, its full content becomes `files` (the head's content with the work's mapped edits
-  /// re-applied), and its declared operations are restated in head coordinates as `journal` (so the
-  /// next submit composes against the new base with no further mapping).
+  /// `version`, its content becomes the head's with `changed` over it (the files the work's mapped
+  /// edits leave different from the head's, and the head's files they remove), and its declared
+  /// operations are restated in head coordinates as `journal` (so the next submit composes against
+  /// the new base with no further mapping). O(what the work changed), never the head's other files
+  /// (the whole content was cloned and restated before 2026-11-05).
   Rebased {
     /// The head the work is now based on.
     version: u64,
-    /// The work's full content per path after the rebase (the head's files with the work's edits).
-    files: BTreeMap<String, Vec<u8>>,
+    /// Per path the work changed: its bytes after the rebase where they differ from the head's, or
+    /// `None` where the work removes a file the head holds.
+    changed: BTreeMap<String, Option<Vec<u8>>>,
     /// The work's declared operations restated relative to the new base.
     journal: Vec<crate::increment::VolumeOp>,
   },
@@ -2389,13 +2392,13 @@ impl Green {
     }
   }
 
-  /// Restates the accepted effects of a clean rebase as the work's new full content and journal: the
-  /// content starts from the head's files and takes each effect; the journal is the effects as
-  /// declared operations in head coordinates (a content op keeps its mapped range, a file new to the
-  /// head is created first). The green is not touched.
+  /// Restates the accepted effects of a clean rebase as the work's changes over the head and its
+  /// journal: each content effect's file, kept only where it ends different from the head's; the
+  /// journal is the effects as declared operations in head coordinates (a content op keeps its mapped
+  /// range, a file new to the head is created first). The green is not touched.
   fn rebased_from(&self, effects: Vec<Effect>, to: u64) -> Rebased {
     use crate::increment::VolumeOp;
-    let mut files = self.content.clone();
+    let mut changed: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
     let mut journal: Vec<VolumeOp> = Vec::new();
     for effect in effects {
       match effect {
@@ -2416,11 +2419,11 @@ impl Green {
               journal.push(volume_op);
             }
           }
-          files.insert(path, bytes);
+          changed.insert(path, Some(bytes));
         }
         Effect::RemoveContent(path) => {
           journal.push(VolumeOp::Unlink { path: path.clone() });
-          files.remove(&path);
+          changed.insert(path, None);
         }
         Effect::MakeDir(path) => journal.push(VolumeOp::Mkdir { path }),
         Effect::RemoveDir(path) => journal.push(VolumeOp::Rmdir { path }),
@@ -2436,9 +2439,12 @@ impl Green {
         Effect::RemoveXattr(path, name) => journal.push(VolumeOp::RemoveXattr { path, name }),
       }
     }
+    // Only what ends different from the head is the work's own: bytes equal to the head's, and the
+    // removal of a file the head does not hold, are no change.
+    changed.retain(|path, after| after.as_deref() != self.content.get(path).map(Vec::as_slice));
     Rebased::Rebased {
       version: to,
-      files,
+      changed,
       journal,
     }
   }
