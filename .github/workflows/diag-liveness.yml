@@ -1,0 +1,164 @@
+name: diag-liveness
+
+# Diagnostics only, never on main (A-223, the Windows wake estimate). On both Windows runners: the wake probe's
+# failing test on the red arm (main plus the test) and on the fix; what QueryThreadCycleTime shows of a spinning and a
+# parked thread, and five wake probes, from main and from the fix; and the provisioning histogram from main and from
+# the fix, quiet and with two spinning shell loops per logical CPU, three rounds each, the arms alternating. Linux runs
+# the machine crate's tests on the fix. Each job pushes its result lines to diag-results/liveness-N-<os> with the
+# Actions token, so they are read by git fetch and cost no API quota.
+on:
+  push:
+    branches: ["diag-liveness-*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  MAIN_SHA: 6cca7fe136e87847dcd1acd67897f09c36d9bb2b
+  RED_SHA: 620f6ff468f62a61a2d893b63eb750c099487b2b
+  FIX_SHA: c3532ed2ff920e1c9d1baf3b0ac2ba03aa659805
+
+jobs:
+  windows:
+    name: A-223 wake (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 170
+    env:
+      AWS_LC_SYS_PREBUILT_NASM: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Install NASM
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: The wake probe's tests, red arm then fix
+        run: |
+          R=../results.txt
+          cpus=$(nproc 2>/dev/null || echo "$NUMBER_OF_PROCESSORS")
+          echo "runner ${{ matrix.os }}, $cpus CPUs, $(date -u)" > $R
+          for arm in red fix; do
+            case $arm in red) sha=$RED_SHA;; fix) sha=$FIX_SHA;; esac
+            git worktree add "../src-$arm" "$sha"
+            status=0
+            ( cd "../src-$arm" && CARGO_TARGET_DIR="../target-$arm" cargo test --locked -p slates-machine --lib -- wake:: ) > ../test-$arm.log 2>&1 || status=$?
+            grep -E '^test |test result|panicked|WakeLatency' ../test-$arm.log | cut -c1-600 | tee -a $R
+            echo "== tests $arm exit $status" | tee -a $R
+          done
+      - name: Build the arms' examples
+        run: |
+          mkdir -p ../arms
+          git worktree add ../src-main "$MAIN_SHA"
+          for arm in main fix; do
+            ( cd "../src-$arm" && CARGO_TARGET_DIR="../target-$arm" cargo build --release --locked -p slates-client --example provision_bench -p slates-machine --example wake_watch )
+            for ex in provision_bench wake_watch; do
+              cp "../target-$arm/release/examples/$ex.exe" "../arms/$ex-$arm.exe"
+            done
+          done
+          ls -la ../arms
+      - name: Cycle counts and wake probes, quiet and busy
+        run: |
+          R=../results.txt
+          cpus=$(nproc 2>/dev/null || echo "$NUMBER_OF_PROCESSORS")
+          for cond in quiet busy; do
+            for arm in main fix; do
+              pids=""
+              if [ $cond = busy ]; then
+                for i in $(seq 1 $((cpus * 2))); do ( while :; do :; done ) & pids="$pids $!"; done
+              fi
+              echo "== watch $cond $arm at $(date -u +%H:%M:%S) UTC" | tee -a $R
+              status=0
+              ../arms/wake_watch-$arm.exe > ../watch.log 2>&1 || status=$?
+              for p in $pids; do kill "$p" 2>/dev/null || true; done
+              wait 2>/dev/null || true
+              cut -c1-700 ../watch.log | tee -a $R
+              echo "== watch $cond $arm exit $status" | tee -a $R
+            done
+          done
+      - name: The provisioning histogram, quiet and busy, three rounds each, the arms alternating
+        run: |
+          R=../results.txt
+          cpus=$(nproc 2>/dev/null || echo "$NUMBER_OF_PROCESSORS")
+          for cond in quiet busy; do
+            for round in 1 2 3; do
+              for arm in main fix; do
+                pids=""
+                if [ $cond = busy ]; then
+                  for i in $(seq 1 $((cpus * 2))); do ( while :; do :; done ) & pids="$pids $!"; done
+                fi
+                echo "== bench $cond round $round: $arm at $(date -u +%H:%M:%S) UTC" | tee -a $R
+                status=0
+                timeout 1500 ../arms/provision_bench-$arm.exe > ../run.log 2>&1 || status=$?
+                for p in $pids; do kill "$p" 2>/dev/null || true; done
+                wait 2>/dev/null || true
+                grep -E 'provisioning histogram|a223\.|parks per 1000|^  provision\.(spinning_1|spinning_8|parked_1)_(p50|p99|p999|max):|ac-2.1|panicked' ../run.log | cut -c1-900 | tee -a $R
+                echo "== bench $cond round $round: $arm exit $status" | tee -a $R
+              done
+            done
+          done
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/liveness-1-${{ matrix.os }}"
+          git config user.name "diag-liveness"
+          git config user.email "diag-liveness@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-liveness-1 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
+
+  linux:
+    name: A-223 machine tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy and the machine crate's tests on the fix
+        run: |
+          set -o pipefail
+          R=../results.txt
+          echo "runner ${{ matrix.os }}, $(nproc) CPUs, $(date -u)" > $R
+          status=0
+          cargo clippy --locked -p slates-machine -p slates-ipc --all-targets -- -D warnings > ../clippy.log 2>&1 || status=$?
+          tail -5 ../clippy.log | tee -a $R
+          echo "== clippy exit $status" | tee -a $R
+          status=0
+          cargo test --locked -p slates-machine > ../test.log 2>&1 || status=$?
+          grep -E '^test .*(FAILED|wake)|test result|panicked' ../test.log | cut -c1-600 | tee -a $R
+          echo "== tests exit $status" | tee -a $R
+          cargo run --release --locked -p slates-machine --example wake_watch 2>&1 | cut -c1-700 | tee -a $R
+      - name: Publish the results to a branch
+        if: always()
+        run: |
+          branch="diag-results/liveness-1-${{ matrix.os }}"
+          git config user.name "diag-liveness"
+          git config user.email "diag-liveness@users.noreply.github.com"
+          git checkout --orphan results-only
+          git rm -rq --cached . || true
+          cp ../results.txt results.txt 2>/dev/null || echo "no results" > results.txt
+          git add results.txt
+          git commit -qm "diag-liveness-1 results, ${{ matrix.os }}"
+          git push -q origin "HEAD:refs/heads/$branch"
