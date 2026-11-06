@@ -8261,6 +8261,31 @@ kicks every shard (`crates/server/src/doorbell.rs`); on Linux the client writes 
 wake and spin are the clients agent's (`agents/clients-spin`, A-218's record); quiet Linux CI already measured 14 to
 20 µs for a whole call.
 
+**The supervisor's controlled load on Linux (item 1, diag run 42152410685, 2026-11-06 02:51 to 03:12 UTC).** CI's
+`ubuntu-24.04-arm` (job 127678516971) and `ubuntu-latest` (job 127678517444), both kernel 7.0.0-1017-azure, 4 cores;
+the harness ran inside `systemd-run --user --scope -p AllowedCPUs=0-1 -p MemoryMax=256M` with two spinning threads a core
+(`--spinners-per-core 2`, four on the two CPUs) and a sibling `dd ... conv=fsync` loop of 16 MiB in the same scope; arms
+the client's spin 1 ms, 50 µs, 5 µs, interleaved × 3 (load 1.3 at the start, 12 under the load). Accept, p50 / p99 by
+round:
+
+| Runner, shape | 1 ms | 50 µs | 5 µs | quiet (any spin) |
+|---|---|---|---|---|
+| arm64, 10 files | 6.6 ms, 26 µs, 5.0 ms / 21.0, 21.1, 18.0 ms | 23, 18, 26 µs / 10.9, 6.0, 12.0 ms | 41, 42, 36 µs / 8.1, 5.3, 7.9 ms | 13 to 23 µs / 32 to 48 µs |
+| arm64, 1,000 files | 30, 46 µs, 3.0 ms / 21.0, 20.9, 20.5 ms | 24, 44, 24 µs / 9.6, 12.0, 10.9 ms | 38, 37, 38 µs / 9.0, 9.0, 10.9 ms | 14 µs / 32 µs |
+| x86_64, 10 files | 27, 28, 27 µs / 11.0, 10.0, 6.9 ms | 157, 28, 158 µs / 5.7, 7.0, 4.8 ms | 65, 67, 67 µs / 4.4, 7.1, 8.0 ms | 28 to 63 µs / 51 to 93 µs |
+| x86_64, 1,000 files | 29, 29, 28 µs / 8.7, 10.9, 10.9 ms | 29, 158, 160 µs / 6.9, 7.2, 6.8 ms | 68, 67, 67 µs / 4.5, 4.2, 6.8 ms | 30 to 31 µs / 55 to 60 µs |
+
+The p999 was 5 to 24 ms throughout. The median holds; the tail is the fair scheduler's slice: about eight runnable threads
+on two CPUs (four spinners that never sleep, three shards, the client), so a thread that parks and is woken waits its
+turn, whatever its spin. The spin shifts the tail (1 ms worst) but no spin removes it. The next lane asks the scheduler
+for a short slice for slates' threads (diag-perf-4).
+
+**Measured and rejected: the interactive QoS class on macOS (2026-11-06 03:30 UTC, load 17.5 to 23.1).** slates' threads in
+`QOS_CLASS_USER_INTERACTIVE` (the main thread before the daemon starts, inherited; the spinners reset to the default class),
+`edit_merge_bench --loaded-only [--qos-interactive] --files 10 --form accept --form conflict`, one spinner a core,
+interleaved × 3: loaded accept p99 0.57, 0.60, 0.40 ms (default) against 1.37, 0.34, 0.50 ms (interactive); conflict 0.60,
+0.50, 0.36 ms against 0.80, 0.24, 0.54 ms; p50 alike. No gain this box can show: not taken.
+
 **Across two machines (item 2, 2026-11-06 03:14 to 03:21 UTC).** A two-node fleet from one manifest (`f = 0`): the server
 node on adas-macbook-pro-2 (192.168.1.71, Wi-Fi, load 15 to 24) and the client node on kiln-a094a12d (Fedora, x86_64,
 32 cores, 192.168.1.72, Wi-Fi, load 6 to 42), each `slates daemon --quick --shards 2 --fleet fleet.json --node N`, release
