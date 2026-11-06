@@ -482,6 +482,13 @@
 > owner's review.
 >
 
+> **A client on another node writes a volume (fs-server, 2026-11-05, A-222).** `slates attach ID --write` from another
+> fleet node now attaches the owner's volume in the record form, `slates write` writes through it, and `slates detach
+> ATTACHMENT --volume ID` ends it; a killed holder's attachment ends at the owner within two liveness budgets of its
+> node's reap and its lease at its term (10 s); a retired host's at the next install. Proven by six two- and
+> three-daemon tests in `crates/cli/tests/fs_server.rs`, each red-checked (A-222). Open: ownership migration to a
+> writer that stays, and the read-only remote attach of a snapshot (§4.10).
+
 > **A green's head reaches the disk (fs-server, 2026-11-04, A-201).** `slates checkout GREEN VOLUME ATTACHMENT --snapshot
 > N` writes a green's head into the volume it was created from, and that volume lands under a grant. Proven by
 > `crates/server/tests/checkout.rs` (3 of 3, red 3 of 3 with the base check and the writes removed) and, across a
