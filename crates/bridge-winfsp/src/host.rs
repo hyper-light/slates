@@ -288,6 +288,55 @@ enum Reply {
 pub struct Request {
   op: Op,
   reply: SyncSender<Reply>,
+  /// DIAG ONLY: when it was posted, and its operation's profile slot.
+  posted: u64,
+  slot: usize,
+}
+
+/// DIAG ONLY: each operation's profile name, from `crate::phases::OP_BASE`.
+const OP_NAMES: [&str; 15] = [
+  "VolumeInfo",
+  "Resolve",
+  "Open",
+  "Create",
+  "Read",
+  "Write",
+  "Info",
+  "PurgeEcho",
+  "ReadDir",
+  "SetSize",
+  "Truncate",
+  "Rename",
+  "Flush",
+  "Cleanup",
+  "Release",
+];
+
+/// DIAG ONLY: an operation's profile slot.
+fn op_slot(op: &Op) -> usize {
+  let index = match op {
+    Op::VolumeInfo { .. } => 0,
+    Op::Resolve { .. } => 1,
+    Op::Open { .. } => 2,
+    Op::Create { .. } => 3,
+    Op::Read { .. } => 4,
+    Op::Write { .. } => 5,
+    Op::Info { .. } => 6,
+    Op::PurgeEcho { .. } => 7,
+    Op::ReadDir { .. } => 8,
+    Op::SetSize { .. } => 9,
+    Op::Truncate { .. } => 10,
+    Op::Rename { .. } => 11,
+    Op::Flush { .. } => 12,
+    Op::Cleanup { .. } => 13,
+    Op::Release { .. } => 14,
+  };
+  crate::phases::OP_BASE + index
+}
+
+/// DIAG ONLY: the profile's dump at a mount's end.
+fn dump_phases() {
+  crate::phases::dump(&OP_NAMES);
 }
 
 impl Request {
@@ -295,6 +344,15 @@ impl Request {
   /// mount's notifications name ([`crate::notify`]) — in step with its opens, closes and renames. The reply is not sent
   /// yet: the caller publishes first when [`Served::needs_barrier`] says so.
   pub fn serve(self, bridge: &mut dyn Bridge, cx: &OpContext, names: &mut OpenNames) -> Served {
+    let (slot, posted) = (self.slot, self.posted);
+    let entered = crate::phases::now();
+    crate::phases::record(slot, crate::phases::HOP_IN, posted, entered);
+    let served = self.serve_untimed(bridge, cx, names);
+    crate::phases::record(slot, crate::phases::SERVE, entered, crate::phases::now());
+    served
+  }
+
+  fn serve_untimed(self, bridge: &mut dyn Bridge, cx: &OpContext, names: &mut OpenNames) -> Served {
     let barrier = self.op.needs_barrier();
     let echo = matches!(self.op, Op::PurgeEcho { .. });
     let opened = match &self.op {
@@ -355,6 +413,7 @@ impl Served {
 
   /// Sends the reply to the waiting dispatcher thread. `false` when that thread is gone (the mount is being torn down).
   pub fn send(self) -> bool {
+    crate::phases::LAST_SENT.store(crate::phases::now(), std::sync::atomic::Ordering::Relaxed);
     self.sender.send(self.reply).is_ok()
   }
 }
@@ -631,14 +690,32 @@ impl Handler {
   /// Sends `op` to the mount's task, wakes it, and blocks this dispatcher thread for its reply; a closed channel (the
   /// mount is being torn down) is `STATUS_UNSUCCESSFUL`, never a hang.
   fn call(&self, op: Op) -> Reply {
+    let slot = op_slot(&op);
+    let start = crate::phases::now();
     let (reply, answer) = sync_channel(1);
-    if self.requests.send(Request { op, reply }).is_err() {
+    if self
+      .requests
+      .send(Request {
+        op,
+        reply,
+        posted: crate::phases::now(),
+        slot,
+      })
+      .is_err()
+    {
       return Reply::Err(crate::status_unsuccessful());
     }
     self.wake.wake_by_ref();
-    answer
+    let reply = answer
       .recv()
-      .unwrap_or(Reply::Err(crate::status_unsuccessful()))
+      .unwrap_or(Reply::Err(crate::status_unsuccessful()));
+    let end = crate::phases::now();
+    crate::phases::record(slot, crate::phases::ROUND, start, end);
+    let sent = crate::phases::LAST_SENT.load(std::sync::atomic::Ordering::Relaxed);
+    if sent >= start {
+      crate::phases::record(slot, crate::phases::TO_ANSWER, sent, end);
+    }
+    reply
   }
 }
 
@@ -1798,6 +1875,7 @@ fn run_mount(
     }
     Err(error) => {
       report(Outcome::Mounted(Err(error)));
+      dump_phases();
       report(Outcome::Stopped);
       return;
     }
@@ -1817,6 +1895,7 @@ fn run_mount(
     }
   }
   drop(mounted);
+  dump_phases();
   report(Outcome::Stopped);
 }
 

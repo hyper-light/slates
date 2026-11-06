@@ -40,8 +40,11 @@ use slates_vfs::inode::Kind;
 // it cross-lints on the Windows target from any host, and the live mount runs on the Windows runner.
 #[cfg(windows)]
 mod ffi;
+// DIAG ONLY: where a request's time goes, per phase.
 #[cfg(windows)]
 pub mod host;
+#[cfg(windows)]
+mod phases;
 // What a mount tells Windows of another path's change: the names Windows holds open and the notification records
 // (§4.6 "Windows"). Pure, so it is tested on every host.
 pub mod notify;
