@@ -141,6 +141,8 @@ pub struct Daemon {
   runtime: Option<Runtime>,
   segment: AnchorSegment,
   doorbell: Option<DoorbellThread>,
+  /// The liveness watchdog (A-228): the beat's writer, stopped after the shards.
+  watchdog: Option<crate::watchdog::Watchdog>,
   config: DaemonConfig,
   shards: Vec<ShardId>,
   /// The loopback port the NFS transport (§4.6) listens on, when it is serving; `None` if the
@@ -780,6 +782,25 @@ impl Daemon {
     };
     let control_config = config.clone();
     let control_env = segment.handoff_env()?;
+    // The beat's writer (A-228): an owned thread over its own mapping of the segment, judging every shard by its own CPU
+    // clock; the control loop's life is the sender it holds, so a refused boot still stops the beat (A-100).
+    let (control_life, control_alive) = std::sync::mpsc::channel::<()>();
+    let (watch_handoff, watch_len) = handoff_of(&control_env)?;
+    let holders: Vec<slates_rt::SlotHolder> = shards
+      .iter()
+      .filter_map(|shard| registry::holder_of(shard.0))
+      .collect();
+    let watchdog = crate::watchdog::Watchdog::start(
+      AnchorSegment::attach(&watch_handoff, watch_len, &identity)?,
+      holders,
+      control_alive,
+    )
+    .map_err(|error| {
+      ServerError::Ipc(slates_ipc::IpcError::OsRefused {
+        call: "spawn the watchdog thread",
+        code: error.raw_os_error(),
+      })
+    })?;
     let control_identity = identity.clone();
     let control = shards.first().copied().ok_or(ServerError::NotOnShard)?;
     let shard_ids = shards.clone();
@@ -791,6 +812,7 @@ impl Daemon {
         control_identity,
         shard_ids,
         region_names,
+        control_life,
       ));
       // Construct the control future on its owning shard: recovery owns thread-local
       // cross-shard reply registrations, which must never migrate between threads.
@@ -819,6 +841,7 @@ impl Daemon {
       runtime: Some(runtime),
       segment,
       doorbell,
+      watchdog: Some(watchdog),
       config,
       shards,
       nfs_port,
@@ -2769,6 +2792,10 @@ impl Daemon {
     {
       slates_machine::log_line!("slates-server: stopping the daemon's shards: {error}");
     }
+    // Last, so a draining daemon still beats while its shards step (A-228).
+    if let Some(mut watchdog) = self.watchdog.take() {
+      watchdog.stop();
+    }
   }
 }
 
@@ -4356,6 +4383,7 @@ async fn control_loop(
   identity: Identity,
   shards: Vec<ShardId>,
   region_names: u64,
+  control_life: std::sync::mpsc::Sender<()>,
 ) {
   let Ok((handoff, len)) = handoff_of(&env) else {
     return;
@@ -4379,7 +4407,7 @@ async fn control_loop(
   // the runtime when the loop returns or is cancelled. So a refused boot stops beating and the anchor restarts the
   // daemon, and a shutdown that cancels the loop mid-boot leaves no joinable task behind to hold its shard open (a
   // heartbeat kept joinable until the boot was accepted hung `Daemon::stop` that way).
-  if futures::spawn_child(heartbeat_loop(segment)).is_err() {
+  if futures::spawn_child(heartbeat_loop(segment, control_life)).is_err() {
     crate::fleet::count_refusal(LOOP_SPAWN_REFUSED);
   }
   if !restore_client_ids(&mut listener, control, &shards).await {
@@ -4654,7 +4682,9 @@ fn settle_handoff(started: LeadershipHandoff, office: Office) -> LeadershipHando
   }
 }
 
-async fn heartbeat_loop(segment: AnchorSegment) {
+async fn heartbeat_loop(segment: AnchorSegment, control_life: std::sync::mpsc::Sender<()>) {
+  // The watchdog beats while this sender lives (A-228); it goes with this task, so the beat stops with the loop.
+  let _control_life = control_life;
   let mut clock = HostClock::new();
   let mut last: Option<(u64, slates_rt::shard::Counters)> = None;
   loop {
@@ -4665,10 +4695,7 @@ async fn heartbeat_loop(segment: AnchorSegment) {
     }
     last = Some((now, counters));
     let requested = match segment.supervision() {
-      Ok(sup) => {
-        sup.beat(now);
-        sup.stop_requested_at().is_some()
-      }
+      Ok(sup) => sup.stop_requested_at().is_some(),
       Err(_) => false,
     };
     state::with_state(|s| {
@@ -4712,7 +4739,8 @@ fn log_late_beat(
   let delta =
     |field: fn(&slates_rt::shard::Counters) -> u64| field(after).saturating_sub(field(before));
   slates_machine::log_line!(
-    "slates daemon: a heartbeat came {} ms after the last (the anchor's budget is {} ms): in the gap the shard \
+    "slates daemon: the control shard's beat task ran {} ms after its last turn (a near miss against a {} ms window; \
+     the anchor's beat is the watchdog's now): in the gap the shard \
      ran {} steps and {} polls ({} long in a task, {} blocked in the kernel, {} preempted by the host, {} \
      unattributed), fired {} timers, waited {} times, spawned {} tasks and finished {}; {} tasks live; its \
      longest poll is {} ms and its timer overrun {} ms",
