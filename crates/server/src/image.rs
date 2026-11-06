@@ -526,6 +526,7 @@ impl BuildJob {
         names: slates_db::catalog::NamePolicy::Exact,
         require_locked: self.record.policy.require_locked,
         role: Role::Plain,
+        live_shipped: false,
       },
       base: BaseRecord::Image {
         volume: self.source,

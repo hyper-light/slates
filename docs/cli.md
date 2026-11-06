@@ -296,12 +296,16 @@ slates profile [--quick] [--json]
 slates mcp [--instance NAME] [--http PORT]
 ```
 
+`slates live-ship ID [--off]` turns a volume's live shipping on (or off): in a fleet each of its publications
+is then shipped to its candidates, and a sync is answered once the owner and `f` of them hold it (design A-200).
+It needs `admin` on the volume, as `share` does.
+
 Sizes take a binary unit (`512MiB`, `4GiB`; `B`, `KiB`, `MiB`, `GiB`, `TiB`) or plain bytes.
 Ids are 32 hexadecimal characters as `create` prints them.
 
 Output is plain and stable: one `key: value` per line (`create`, `stat`, `status`, `attach`,
 `snapshot`, `clone`, `pin`), one record per line (`list`: id, name, `referenced=`, `unique=`,
-`overlay=`; `status --drift` and `rewitness`: one path per line), `ok` for the verbs that
+`overlay=`, `live_shipped=`; `status --drift` and `rewitness`: one path per line), `ok` for the verbs that
 return nothing, and the raw bytes for `base read`.
 
 `--json` emits a machine-readable form of every verb — the read and query verbs (`status`,

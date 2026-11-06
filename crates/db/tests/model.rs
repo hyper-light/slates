@@ -293,6 +293,7 @@ fn volume(n: u64, name: &str) -> VolumeRecord {
       names: NamePolicy::Exact,
       require_locked: false,
       role: Role::Plain,
+      live_shipped: false,
     },
     base: BaseRecord::Scratch,
     head: SnapshotId { value: 0 },
@@ -318,6 +319,7 @@ enum Step {
   State(usize, u8),
   Account(usize, u64, u64),
   Access(usize),
+  LiveShip(usize, bool),
   Destroy(usize),
   Snapshot(usize),
   Place(usize, usize),
@@ -374,6 +376,7 @@ fn step() -> impl Strategy<Value = Step> {
     2 => (0..8usize, 0..8u8).prop_map(|(v, s)| Step::State(v, s)),
     2 => (0..8usize, 0..1_000_000u64, 0..1_000_000u64).prop_map(|(v, r, u)| Step::Account(v, r, u)),
     1 => (0..8usize).prop_map(Step::Access),
+    1 => (0..8usize, proptest::bool::ANY).prop_map(|(v, on)| Step::LiveShip(v, on)),
     1 => (0..8usize).prop_map(Step::Destroy),
     2 => (0..8usize).prop_map(Step::Snapshot),
     1 => (0..8usize, 0..4usize).prop_map(|(v, s)| Step::Place(v, s)),
@@ -509,6 +512,11 @@ fn op_for(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
       id: vid(pick(&ids.live, *v)?),
       referenced_bytes: *r,
       unique_bytes: *u,
+    },
+    // A-200: live shipping is part of the policy the recovered partition must equal.
+    Step::LiveShip(v, on) => Op::LiveShippingChanged {
+      id: vid(pick(&ids.live, *v)?),
+      live_shipped: *on,
     },
     Step::Access(v) => Op::AccessChanged {
       id: vid(pick(&ids.live, *v)?),

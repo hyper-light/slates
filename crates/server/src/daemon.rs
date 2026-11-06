@@ -3363,6 +3363,7 @@ fn init_shard(
     enrolled: Vec::new(),
     demuxes: Vec::new(),
     holder_records: std::collections::BTreeMap::new(),
+    live: crate::live_ship::LiveState::default(),
     host_takeovers: std::collections::BTreeMap::new(),
     config_refresh_wanted: false,
     council_learner_pace: crate::fleet::LearnerPace::default(),

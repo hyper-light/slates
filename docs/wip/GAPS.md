@@ -190,7 +190,8 @@
 > 43.0 µs. Open and not the acknowledgement:
 > - **jupiter's single-client p99.** It stays red with A-216: its runs range from 65 µs to 3.8 ms, as main's do
 >   (2026-11-05 18:24–18:27 UTC).
-> - **macOS's single-client create.** Its p50 is 60–75 µs in both arms.
+> - **macOS's single-client create.** Its p50 is 60–75 µs in both arms. Where it goes is now known, and it stays by
+>   decision: the next entry (A-218).
 > - **The bench's 8- and 64-client forms aborting `Stalled` at load 23–36 on macOS,** and the ~1.77 s pause after 64
 >   clients churned. Both are main's code; the lost-reply defect below is one cause that fits.
 >
@@ -199,6 +200,30 @@
 > **Next lever (C): do we need the separate acknowledgement at all?** Carry the watermark in every request, so each
 > owner shard releases a client's records when its next request arrives there. No scatter and no extra request.
 > That is a protocol change to the request slot and §4.9.
+
+> **macOS shards nap in their spin, kept by measurement (2026-11-05, A-218 measured and rejected, §4.3, §4.7, R9).**
+> The idle spin's driver poll on macOS, `kevent` with a zero timeout, sleeps about 15 µs a call with one involuntary
+> switch (14.6–15.5 µs over three checked rounds; `KEVENT_FLAG_IMMEDIATE` takes 180–186 ns). So §4.3's "every
+> non-blocking harvest is one that never sleeps" does not hold on macOS, and the macOS single-client p50 of 60–95 µs is
+> those naps. A true spin (every call on the queue `kevent64`, a poll the immediate flag) took it to 13–22 µs at every
+> load. But it lost the tails once the host had no idle core: at load 18–30, single-client p99 183–190 → 115–926 µs and
+> 8-client p99 0.44–0.54 → 3.2–5.2 ms. Every policy tried to keep the gain and the tails was measured and rejected
+> (BENCHMARKS, "The spin policy, measured and rejected"):
+> - the shard's own turn gaps;
+> - yielding after the competitive spin;
+> - macOS's CPU idle counters, which cannot see the load;
+> - a frozen wake estimate;
+> - idle windows of 10 and 1 times the wake. Ratio 1 lost R9 on CI's Linux arm64 and both Windows runners.
+> - napping past the competitive spin when the measured nap is shorter than the wake (busy p99 0/4 on every row; under
+>   load the two measure the same queueing, to the nanosecond), and with naps forced (busy 8-client p99 15.1 ms against
+>   3.46 ms).
+>
+> So the naps stay, and the p50 cost stays with them: p99 under load is the target. Open, not owed by any candidate here:
+> a policy that keeps a true spin's p50 without its loaded tails on macOS's scheduler (QoS-lowering the spin is excluded:
+> on Apple silicon it moves the spinner between core types). Next lever for Linux's and Windows' own loaded tails (B):
+> true sub-millisecond naps (a `timerfd` in the epoll set on the 5.10 floor; a high-resolution waitable timer on
+> Windows), after measuring what each delivers. The true spin's change stays on record, not landed (`agents/clients-spin`,
+> a75f9213), with its test (`a_spinning_shard_answers_sooner_than_a_parked_one`).
 
 > **A scatter whose part could not be sent never answered (2026-11-05, §4.9, §4.14; fixed).** `scatter_acknowledge`,
 > `scatter_list`, `scatter_grants` and `scatter_status`, the server's four scatter tables, settled a part whose spawn
@@ -231,6 +256,15 @@
 > 41.5–190.1 µs to 21.8–40.7 µs on both CI SMT runners, all rounds green with part 2. On jupiter the millisecond
 > tails are gone, but its p99 is still 80–252 µs, red. Owed: a quiet Linux SMT run (adacachy's was at load 52), the
 > macOS arm (no SMT, expected unchanged), and Windows core classes, still unread. Record: `docs/bugs/2026-11-05-shards-counted-hardware-threads-as-cores.md`.
+>
+> **The placement test read only the root cgroup's quota (2026-11-05; found by the supervisor on adacachy; fixed,
+> red-checked).** Inside a `systemd-run --user -p CPUQuota=1200%` unit on adacachy (32 CPUs), the facts
+> took the unit's 12-CPU quota and left the shards to the scheduler, as §4.3 says, while
+> `crates/rt/tests/placement.rs` read no quota at the root and failed the owned-cpuset case 3 of 3. The test now
+> takes the tightest quota over the process's whole cgroup path, as the facts do. A test fault, not a placement one.
+> Red check on adacachy, three runs a cell: under the quota main failed the owned case 3 of 3 and the fix ran the quota
+> case and passed 3 of 3; without one both passed 3 of 3, each shard on its own core of the SMT set. Owed: the same
+> check of Windows SMT placement on jupiter. Record: `docs/bugs/2026-11-05-the-placement-test-read-only-the-root-cgroups-quota.md`.
 
 > **A create's cost grows with its shard's volumes (2026-11-05, R9).** Both measured on macOS arm64 by `xctrace` on
 > `provision_bench`.
@@ -398,16 +432,62 @@
 > lands. Also open from the same runs: a sevenfold p50 split between two invocations on this Mac (edit 18.8 against
 > 2.5 µs). Record: `BENCHMARKS.md`, "The client's edit and merge latency".
 
-> **Replication latency (raft, 2026-11-04): a commit returns at its quorum; live shipping still owed.** Every quorum
+> **Replication latency (raft, 2026-11-04): a commit returns at its quorum; live shipping in the daemon: writes durable on a candidate before their reply, takeover serves them.** Every quorum
 > collector in `slates-cluster` slept its whole poll after its quorum had answered, so a cross-node record commit cost
 > the daemon's 10 ms poll (10,125–10,194 µs at the median) over a 12 µs loopback round trip. Each reply now wakes its
 > collector: 18.9–19.9 µs at the median, p99 28.8–32.9 µs, worst 44.7 µs at the daemon's poll
 > (`replication_bench`, five interleaved rounds at load 36–42, `docs/wip/BENCHMARKS.md`; failing test first:
 > `a_commit_returns_at_its_quorum_not_at_its_poll`; record:
-> `docs/bugs/2026-11-04-a-quorum-collector-waited-out-its-poll.md`). Open, toward a filesystem server replicated per
-> write in under 1 ms: §4.10 live shipping (the owner's publication stream shipped to its candidates and acknowledged
-> at f+1, AC-8.3's "live-shipped volumes report none", AC-8.9's credit backpressure) is unbuilt, as are `put_wal`
-> and the loss-window report; a head still waits up to the 100 ms record period before its commit starts.
+> `docs/bugs/2026-11-04-a-quorum-collector-waited-out-its-poll.md`). Live shipping's log (A-200) is built and checked
+> as a pure module (`crates/db/src/live.rs`; the nemesis in `crates/db/tests/live.rs`: 200 seeds × 3,000 steps at f=1
+> and f=2, Agreement, NoLoss, StaleNeverCommits and Convergence held, each check red under a mutation; §4.10 status).
+> Over the fleet transport (`crates/cluster/src/live.rs`) a live-shipped write is durable on two hosts in 17–20 µs at
+> the median for 64 B and 23–27 µs for 4 KiB, every quiet p99 under 1 ms (64 KiB: 160–292 µs), unchanged with one
+> holder dead (BENCHMARKS "Live shipping over the transport"). Open, found on the way: on the simulated fabric one
+> session's round trip grew about 1.7 times an exchange over sequential exchanges (9, 14, 23 … 621 ms of virtual time,
+> nine writes, `crates/cluster/tests/live.rs`), which the real runtime does not show; it is unexplained and owes a
+> failing test in the transport. The policy is built: `slates live-ship ID [--off]` records it on the owner partition,
+> `list` shows it, the catalog register carries it, and the db model test recovers it
+> (`crates/server/tests/live_ship.rs`). The daemon ships (2026-11-05, §4.10 status "slice one"): across three real
+> daemon processes a live volume's writes reach both candidates and become durable (`crates/cli/tests/live_fleet.rs`,
+> 4 of 4). Barriers wait (§4.10 status "slice two"): a recorded verb and a stable NFS write or `COMMIT` on a live
+> volume are answered only once a candidate holds them, red-checked across real processes. Takeover reads the live
+> log (§4.10 status "slice three"): a never-sealed live volume's five acknowledged writes survive its owner's SIGKILL,
+> served whole by a survivor in 1.8–2.3 s, empty without the log; a live write also waits for its volume's head
+> placement, so an owner killed the moment its last write returns loses nothing (3 of 3; 2 of 2 lost everything
+> before). Chaos across real processes (§4.10 status): a candidate partitioned away (SIGSTOP) and healed, and both
+> candidates stalled in overlapping 30 ms windows through 30 writes, each write durable at its return (stall p90
+> 33 ms, max 47 ms) and every candidate caught up after; the partition found a live exchange budget a stopped peer
+> inflated, now the liveness budget with dead links redialed. A superseded owner resumed after its takeover never has a
+> write acknowledged; writers killed mid-write leave the log whole and no reply held; a destroyed volume's copies are
+> let go (three defects found and fixed on the way: §4.10 status "Chaos, continued"). Open: hard links and extended
+> attributes in the rebuilt volume; a candidate's copy across its own daemon's restart. FUSE `fsync` on a live volume is
+> answered at durability since 2026-11-05 (`EIO` past the liveness budget; §4.10 status "FUSE `fsync` at durability").
+> Measured in the daemon (release, BENCHMARKS "What live shipping adds to a stable NFS write"): a live 4 KiB `FILE_SYNC`
+> write costs 90–114 µs more than a plain one at the median, p99 217–398 µs, p999 0.44–1.27 ms, worst 0.47–1.87 ms at
+> load 8–30 (2026-11-05). The rare 100 ms tail is explained and removed (two waits for the record period; and a
+> superseded owner that held a write unanswered is now refused, and a destroyed volume's shipper is let go: §4.10
+> status "The tail and three more defects"). Open: the added median is the cross-shard dispatch round (50 µs not met);
+> p999 under 1 ms at load 30. Open: one exchange per message to every holder starved the second holder (never
+> accepted an entry, in six of nine process flows) and was rejected; why is not pinned down. Open, toward a filesystem
+> server replicated per write in under 1 ms: AC-8.9's credit backpressure; a candidate's copy kept across its own
+> restart; real-process chaos
+> (partitions, injected latency, volume failure, client disconnect). `put_wal` and the
+> loss-window report are unbuilt; a head still waits up to the 100 ms record period before its commit starts.
+> **Open, found landing 13 (2026-11-05): a live takeover can wait for its quorum and never serve.** On adacachy in a
+> capped unit (`CPUQuota=1200%`, load 18–25), `a_superseded_owner_resumed_after_its_takeover_is_fenced`
+> (`crates/cli/tests/live_fleet.rs`) failed 1 of 2 runs on the landing's tree: with the owner stopped, the survivor that
+> adopted the takeover (`fleet.takeover.adopted` 2) waited for its live log's quorum for the whole 40 s
+> (`fleet.live.takeover_waits_quorum` 370, `fleet.live.hold_refused` 14) and refused every read `Overloaded`, while the
+> other candidate answered its fetches (`fleet.live.fetched` 400) and held the log at head 2. No acknowledged write was
+> lost (the candidate held all three); the volume went unserved. The same signature on macOS (load 13–21), in
+> `a_live_volumes_acknowledged_writes_survive_its_owners_death`, 1 of 9 runs: the successor waited 371 times
+> (`fleet.takeover.adopted` 2, `fleet.live.hold_refused` 28) while the other candidate answered 421 fetches holding head
+> 4. In both, the successor holds no copy of the log (no `live held` line; it had refused the owner's entries). A
+> hypothesis from the counters and the code, not yet confirmed by a log line: `live_ship::fetch` adds the successor's
+> own report only when it holds a copy, while a remote candidate that holds nothing answers `None` and counts, so a
+> successor holding nothing never counts itself and `f + 1` is out of reach once the owner is gone. Owner: raft,
+> before any other live-shipping work.
 
 > **VFS plan step 14, Shards' WHP window's three edge cases (2026-11-05): done, patches with the owner's folder.** Six
 > real-guest tests and one fix for Shards' owner, in `docs/wip/shards-patches/` (never pushed to Shards; README there), and

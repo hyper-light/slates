@@ -63,6 +63,8 @@ pub struct CatalogValue {
   pub require_locked: bool,
   /// The principals granted rights beyond the owner.
   pub access: Vec<AccessEntry>,
+  /// Whether the volume is live-shipped (A-200), so a successor keeps shipping it. Appended.
+  pub live_shipped: bool,
 }
 
 impl CatalogValue {
@@ -75,6 +77,7 @@ impl CatalogValue {
       owner: record.owner.clone(),
       require_locked: record.policy.require_locked,
       access: record.access.clone(),
+      live_shipped: record.policy.live_shipped,
     }
   }
 
@@ -111,6 +114,7 @@ mod tests {
           admin: false,
         },
       }],
+      live_shipped: false,
     }
   }
 

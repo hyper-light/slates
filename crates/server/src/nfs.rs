@@ -534,7 +534,33 @@ fn barrier(
   reply: (AcceptStatus, Vec<u8>),
 ) -> (AcceptStatus, Vec<u8>) {
   let outcome = state::with_state(crate::verbs::publish_shard);
-  publication_reply(procedure, volume, outcome, reply)
+  let reply = publication_reply(procedure, volume, outcome, reply);
+  // A live-shipped volume's stable reply waits until `f` candidates hold the publication (A-200): noted here, waited
+  // for by the serve's task (`stable_once_durable`), never inside this synchronous step.
+  if let Some(volume) = volume {
+    let _ = state::with_state(|s| crate::live_ship::note_barrier(s, volume));
+  }
+  reply
+}
+
+/// The reply of a call whose barrier published a live-shipped volume, once that publication is durable on `f`
+/// candidates (A-200); answered `NFS3ERR_JUKEBOX` ("try again") when it is not within the wait, since a stable reply
+/// must not claim what the candidates do not hold. Any other call's reply as it is.
+async fn stable_once_durable(
+  procedure: u32,
+  served: (AcceptStatus, Vec<u8>),
+) -> (AcceptStatus, Vec<u8>) {
+  let Some((volume, target)) = state::with_state(crate::live_ship::take_barrier).flatten() else {
+    return served;
+  };
+  if crate::live_ship::wait_durable(volume, target).await {
+    served
+  } else {
+    (
+      AcceptStatus::Success,
+      status_failure_reply(Nfsstat3::Jukebox, procedure),
+    )
+  }
 }
 
 /// The barrier's observable reply, separated from publication so refusal paths can be exercised
@@ -1250,6 +1276,7 @@ async fn serve_remote(
     owner,
     move || async move {
       let (served, owed) = serve_local(requester, xid, program, procedure, &args, port);
+      let served = stable_once_durable(procedure, served).await;
       if let Some(owed) = owed {
         let _ = crate::told::wait(owed).await;
       }
@@ -1540,6 +1567,7 @@ async fn serve_local_held(
   loop {
     let seen = state::with_state(|s| s.store.recall_gate.refusals());
     let (served, owed) = serve_local(requester.clone(), xid, program, procedure, args, port);
+    let served = stable_once_durable(procedure, served).await;
     // A change the call recorded is told to every FUSE mount of its volume before the reply (AC-3.3). A call the
     // recall gate refused changed nothing, so it owes nothing and is not held here.
     if let Some(owed) = owed {

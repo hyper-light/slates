@@ -1893,6 +1893,7 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
       // with the committed result when the version places, never a success from memory. A retry of a
       // granted landing still running joins it the same way (AUD-29-03).
       if crate::merge_service::join_awaiting(state, origin, id)
+        || crate::live_ship::join(state, origin, id)
         || crate::landing::join_in_flight(state, origin, id)
         || crate::image::join_in_flight(state, origin, id)
         || crate::direct_map::join_in_flight(state, origin, id)
@@ -2167,6 +2168,7 @@ fn run_recorded(
   let mark = body
     .volume()
     .and_then(|volume| crate::told::mark(state, to_db_volume(volume)));
+  let live_volume = body.volume().map(to_db_volume);
   let reply = dispatch(state, client_id, principal, body);
   state.current_request = None;
   let route = state.reply_route.take();
@@ -2174,7 +2176,15 @@ fn run_recorded(
   // effects now but records no completion and gets no reply here: both follow the commit at the
   // quorum (`merge_service::resolve_accepted`), so a retry meanwhile joins the wait, never reads a
   // success the quorum has not committed.
-  let deferred = std::mem::take(&mut state.acceptance_deferred);
+  let mut deferred = std::mem::take(&mut state.acceptance_deferred);
+  // A verb on a live-shipped volume answers once its publication is durable on `f` candidates (A-200): like a deferred
+  // acceptance, its effects commit now and its completion and reply follow (`crate::live_ship::resolve`).
+  let live_target = live_volume
+    .filter(|_| label == 1 && !deferred && !matches!(reply, ReplyBody::Refused { .. }))
+    .and_then(|volume| {
+      crate::live_ship::durable_target(state, volume).map(|target| (volume, target))
+    });
+  deferred |= live_target.is_some();
   let reply = if deferred {
     reply
   } else {
@@ -2204,6 +2214,11 @@ fn run_recorded(
   let partition_label = u32::from(state.partition);
   crate::telemetry::emit(state, op.end(label, end_ns));
   crate::telemetry::emit(state, append.end(partition_label, end_ns));
+  if let Some(live_target) = live_target
+    && !matches!(reply, ReplyBody::Refused { .. })
+  {
+    return crate::live_ship::defer(state, live_target, (origin, id), route, reply);
+  }
   if deferred && !matches!(reply, ReplyBody::Refused { .. }) {
     return None;
   }
@@ -2252,6 +2267,7 @@ fn run_forwarded(
       // A retry of a submit whose acceptance still waits for its commit joins the wait, as does a retry
       // of a granted landing still running (AUD-29-03).
       if crate::merge_service::join_awaiting(state, origin, id)
+        || crate::live_ship::join(state, origin, id)
         || crate::landing::join_in_flight(state, origin, id)
         || crate::image::join_in_flight(state, origin, id)
         || crate::direct_map::join_in_flight(state, origin, id)
@@ -3139,6 +3155,7 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     detector_pool: detector_pool_report(state),
     detector_relays: detector_relay_report(state),
     registry_attachments: u64::try_from(state.attachments.live()).unwrap_or(u64::MAX),
+    live: crate::live_ship::reports(state),
   }
 }
 
@@ -3852,6 +3869,10 @@ fn dispatch_inner(
       principal: subject,
       rights,
     } => share(state, principal, volume, &subject, rights),
+    RequestBody::LiveShip {
+      volume,
+      live_shipped,
+    } => live_ship(state, principal, volume, live_shipped),
     // Served in `serve` as tasks that cross shards; neither reaches the dispatch.
     RequestBody::Attest { .. } | RequestBody::Revoke { .. } => refused(Refusal::BadRequest {
       reason: "attest and revoke are served on the channel".to_owned(),
@@ -4053,6 +4074,36 @@ fn share(
     now,
   ) {
     Ok(_) => ReplyBody::Shared,
+    Err(e) => refused(refusal_of_db(&e)),
+  }
+}
+
+/// Turns a volume's live shipping on or off (§4.10, A-200), as one recorded operation on its owner partition; `admin`
+/// on the volume is required, as for its access list. The flag rides the volume's catalog register, so a successor
+/// keeps shipping.
+fn live_ship(
+  state: &mut ShardState,
+  principal: &Principal,
+  volume: VolumeId,
+  live_shipped: bool,
+) -> ReplyBody {
+  let (_, record) = match find(state, volume) {
+    Ok(x) => x,
+    Err(r) => return *r,
+  };
+  if !rights_of(&record, principal).admin {
+    return forbidden("live-ship");
+  }
+  let now = state.clock.monotonic_ns();
+  match state.db.mutate(
+    &mut state.segment,
+    &Op::LiveShippingChanged {
+      id: to_db_volume(volume),
+      live_shipped,
+    },
+    now,
+  ) {
+    Ok(_) => ReplyBody::LiveShippingSet { live_shipped },
     Err(e) => refused(refusal_of_db(&e)),
   }
 }
@@ -4426,6 +4477,7 @@ fn create(
       },
       require_locked,
       role: Role::Plain,
+      live_shipped: false,
     },
     base: match base {
       None => BaseRecord::Scratch,
@@ -5029,6 +5081,7 @@ fn create_green(
         require_evidence,
         head_version: 0,
       },
+      live_shipped: false,
     },
     base: BaseRecord::Scratch,
     head: DbSnapshotId::default(),
@@ -5149,6 +5202,7 @@ fn create_work(
         base_version: base,
         stream: false,
       },
+      live_shipped: false,
     },
     base: BaseRecord::Scratch,
     head: DbSnapshotId::default(),
@@ -7463,6 +7517,7 @@ pub(crate) fn reconcile_unpublished_effects(state: &mut ShardState) -> usize {
       release_slot_credits(state, &slot);
     }
     state.by_id.remove(id);
+    crate::live_ship::forget(state, *id);
   }
   let partition = state.db.partition();
   state.greens.retain(|id, _| partition.volume(*id).is_some());
@@ -7603,6 +7658,7 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
         release_slot_credits(state, &slot);
       }
       state.by_id.remove(&id);
+      crate::live_ship::forget(state, id);
       retire_local_tombstones(state);
     }
   }
@@ -7951,6 +8007,7 @@ pub(crate) fn materialize_taken_over_green(
           require_evidence: recovery.require_evidence,
           head_version: recovery.head,
         },
+        live_shipped: false,
       },
       base: BaseRecord::Scratch,
       head: DbSnapshotId::default(),
@@ -8218,6 +8275,8 @@ pub(crate) fn materialize_taken_over(
       names: catalog.names,
       require_locked: catalog.require_locked,
       role: Role::Plain,
+      // A live-shipped volume stays live-shipped under its successor (A-200): its catalog carries the flag.
+      live_shipped: catalog.live_shipped,
     },
     // Placed content is always whole in RAM (an overlay's base-backed bodies are never sealed), so the
     // successor serves it with no base beneath.
@@ -8501,6 +8560,7 @@ fn list(state: &mut ShardState, principal: &Principal) -> ReplyBody {
         .and_then(|h| state.volumes.get(*h).ok())
         .map_or(v.unique_bytes, |s| s.volume.accounting().unique_bytes),
       overlay: matches!(v.base, BaseRecord::Path { .. }),
+      live_shipped: v.policy.live_shipped,
     })
     .collect();
   ReplyBody::Listed { volumes }
@@ -9617,11 +9677,16 @@ pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::Vf
       // short sets the flag again at its next number.
       state.store.counters_low = false;
       state.store.content.arena_mut().commit_capture();
+      crate::live_ship::ship_captured(state);
       // The committed image names no block of a wholly free extent, and no deferred free holds one: it goes back to
       // the pool for any shard to claim (A-98).
       state.store.release_idle();
     }
-    Err(_) => state.store.content.arena_mut().abandon_capture(),
+    Err(_) => {
+      state.store.content.arena_mut().abandon_capture();
+      // Nothing of a refused publication ships; the volumes stay dirty and publish again.
+      state.live.captured.clear();
+    }
   }
   outcome
 }
@@ -9925,6 +9990,8 @@ fn stream_checkpoint(
     Ok(frame_bytes) => published.frame_bytes = frame_bytes,
     Err(e) => return Ok(Streamed::Refused(e)),
   }
+  // A checkpoint ships each live-shipped volume's whole image once it commits (A-200, `crate::live_ship`).
+  crate::live_ship::note_checkpoint(state, &published.volumes);
   Ok(Streamed::Committed(published))
 }
 
@@ -9983,6 +10050,18 @@ fn publish_delta_into(
         published.volumes.push(id);
         recorded.push(*handle);
         count = count.saturating_add(1);
+        // A live-shipped volume's record ships once the publication commits (A-200, `crate::live_ship`).
+        if state
+          .db
+          .partition()
+          .volume(id)
+          .is_some_and(|volume| volume.policy.live_shipped)
+        {
+          let record = encoded
+            .get(mark.saturating_add(id.bytes.len())..)
+            .map(<[u8]>::to_vec);
+          state.live.captured.push((id, record));
+        }
       }
       Err(e) => {
         encoded.truncate(mark);
@@ -11608,6 +11687,7 @@ mod tests {
       owner: Principal::Uid { uid: 501 },
       require_locked: false,
       access: Vec::new(),
+      live_shipped: false,
     }
   }
 
