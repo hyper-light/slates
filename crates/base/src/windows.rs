@@ -566,7 +566,8 @@ impl OsHost {
   /// the root is refused, as on Unix with `O_NOFOLLOW`) and retained, so every later access is relative to
   /// it and a rename or replacement of the path changes nothing.
   pub fn open_root(path: &Path) -> Result<(Self, HostDir), HostError> {
-    check_root_volume(path)?;
+    // DIAG red-check: the check taken out.
+    let _ = check_root_volume;
     let open = |flags: u32| -> Result<OwnedHandle, HostError> {
       // structural: allow — a read-only open of the base directory; nothing is written (R1).
       std::fs::OpenOptions::new()
