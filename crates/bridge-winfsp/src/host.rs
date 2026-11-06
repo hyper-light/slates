@@ -1094,19 +1094,55 @@ impl Handler {
 }
 
 fn call_on(requests: &SyncSender<Request>, wake: &Waker, op: Op<u64>) -> Reply {
+  answer_of(post_on(requests, wake, op))
+}
+
+/// Sends one operation to the shard and returns where its answer will arrive, without waiting for it; `None` when the
+/// shard's channel has closed.
+fn post_on(requests: &SyncSender<Request>, wake: &Waker, op: Op<u64>) -> Option<Receiver<Reply>> {
   let (reply, answer) = sync_channel(1);
-  if requests
+  requests
     .send(Request {
       op,
       reply,
       hint: crate::dispatcher::current_hint(),
     })
-    .is_err()
-  {
-    return Reply::Err(crate::status_unsuccessful());
-  }
+    .ok()?;
   wake.wake_by_ref();
-  crate::reply::await_reply(&answer).unwrap_or(Reply::Err(crate::status_unsuccessful()))
+  Some(answer)
+}
+
+/// Waits for a posted operation's answer; a closed channel either way is `STATUS_UNSUCCESSFUL`.
+fn answer_of(answer: Option<Receiver<Reply>>) -> Reply {
+  answer
+    .and_then(|answer| crate::reply::await_reply(&answer).ok())
+    .unwrap_or(Reply::Err(crate::status_unsuccessful()))
+}
+
+/// An open's confirmation posted to the shard, its answer taken by [`Confirming::finish`]. The receiver posts a hand-off's
+/// confirmation before the call that sends its response and takes the answer after, so the shard's turn overlaps the
+/// kernel's wait for the next request (A-215).
+pub(crate) struct Confirming(Option<Receiver<Reply>>);
+
+pub(crate) fn post_confirm(
+  requests: &SyncSender<Request>,
+  wake: &Waker,
+  context: u64,
+) -> Confirming {
+  Confirming(post_on(requests, wake, Op::Confirm { context }))
+}
+
+impl Confirming {
+  pub(crate) fn finish(self) -> Result<(), WinFspError> {
+    match answer_of(self.0) {
+      Reply::Ok => Ok(()),
+      Reply::Err(status) => Err(WinFspError::Api {
+        call: "confirm handed open",
+        status,
+      }),
+      _ => Err(WinFspError::Ledger(crate::opens::Refusal::Corrupt)),
+    }
+  }
 }
 
 pub(crate) fn confirm_open(
@@ -1114,14 +1150,7 @@ pub(crate) fn confirm_open(
   wake: &Waker,
   context: u64,
 ) -> Result<(), WinFspError> {
-  match call_on(requests, wake, Op::Confirm { context }) {
-    Reply::Ok => Ok(()),
-    Reply::Err(status) => Err(WinFspError::Api {
-      call: "confirm handed open",
-      status,
-    }),
-    _ => Err(WinFspError::Ledger(crate::opens::Refusal::Corrupt)),
-  }
+  post_confirm(requests, wake, context).finish()
 }
 
 /// Once the complete successful response is retained, update one context per owner turn. A second crash replays
@@ -2408,11 +2437,10 @@ fn run_mount(
         .memory()
         .read(at, &mut captured)
         .map_err(|error| WinFspError::Ledger(crate::opens::Refusal::Memory(error)))?;
+      // The open the kernel has or will be sent: a batch in hand's saved response, or a hand-off's (A-215).
       if let Some(open) = crate::inflight::capture::Capture::new(&mut captured)
-        .and_then(crate::inflight::capture::Capture::resume)
-        .and_then(|batch| batch.map(|batch| batch.saved_open()).transpose())
+        .and_then(crate::inflight::capture::Capture::retained_open)
         .map_err(WinFspError::Capture)?
-        .flatten()
       {
         saved_opens.push(open);
       }

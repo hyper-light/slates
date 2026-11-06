@@ -13536,6 +13536,25 @@ opens sit near 42 µs or near 58 µs. Four of its five one-worker rounds fell in
 in the fast one. That probe took 105-216 ms on the mount's path, against A-213's 10-19 ms mount. So the probe moved off
 the path, and to the open-and-close.
 
+**Over A-215's combined call (2026-11-06, branch `agents/winfsp-overlap-7`, under measurement).** The DLL's own shape is
+two waiting dispatcher threads, each sending a response in the call that receives its next request. A-215 measured that
+call with one worker and found it regressing x86_64 (quiet stat 1.18x, rename 1.20x the DLL). With one worker the
+response and the next receive wait behind the work, which a second waiting worker may hide. So each A-219 worker can run
+A-215's journal: two buffers, a batch's last response handed to the call that receives into the other.
+- Each buffer keeps its own stamp, cleared with the buffer before a receive or a hand-off is recorded and stored when the
+  delivering call returns. So a batch a combined call delivered is unstamped until its worker stores one.
+- The plan takes, per journal, the batch A-215's recovery would settle, with that batch's stamp.
+- A-215's "nothing delivered" case assumed one receiver: the old batch was settled whole, its saved response sent again.
+  With two workers the call may have finished that response, freeing its address for the other worker's next IRP. The
+  plan covers it: that batch keeps its stamp, the other delivery is newer or unstamped, so the saved response is passed
+  over. It is re-sent only where no newer delivery holds its address.
+
+The two-worker model oracle now drives the combined call, the response and the delivery as two driver steps a kill can
+fall between: 7,036 scenarios, 0 lost, 0 wrong, 0 twice, 0 wrong contexts. It saw 23,585 cross-worker address reuses,
+1,790 pass-overs, 3,435 unstamped batches, and 225 saved hand-off responses passed over for the other worker's newer
+delivery. Red: re-sending those, A-215's one-worker rule, answers 79 IRPs with another's response. A-215's own one-worker
+model still passes (8,373 scenarios). The probe serves in the same form, so it measures the count for it.
+
 **No operation guard.** Two workers call the DLL's operation table at once, as the DLL's own dispatcher threads do.
 WinFsp's guard (`src/dll/fsop.c`, `FspFileSystemOpEnter`) orders only a file system's own namespace work. Each slates
 callback is one message to the shard, which serves one at a time, so the guard would order nothing more.

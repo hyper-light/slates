@@ -1,7 +1,10 @@
-//! A-219's oracle: two receive workers, each with its own journal, over one serial model of WinFsp's queues. Every step of
-//! every worker passes a turnstile that orders the workers by a schedule and can kill the whole daemon at any step. A
-//! successor recovers all journals as A-219 says, then serves on, and may itself be killed. Every IRP must be completed
-//! once, with its own identity, none lost; every open the ledger keeps must be one the kernel was handed.
+//! A-219's oracle: two receive workers, each with its own journal, over one serial model of WinFsp's queues, each sending
+//! a batch's last response in the call that receives its next batch (A-215's combined call). The call is two steps of
+//! the driver, the response finished and then the delivery, so a kill can fall between them: the response consumed,
+//! nothing delivered to this worker, and the freed address free for the other worker's next IRP. Every step of every
+//! worker passes a turnstile that orders the workers by a schedule and can kill the whole daemon at any step. A successor
+//! recovers all journals as A-219 says, then serves on, and may itself be killed. Every IRP must be completed once, with
+//! its own identity, none lost; every open the ledger keeps must be one the kernel was handed.
 #[cfg(test)]
 mod oracle {
   #![allow(
@@ -63,6 +66,9 @@ mod oracle {
     retired: BTreeSet<u64>,
     passed_over: u64,
     unstamped: u64,
+    /// Saved responses of a hand-off that delivered nothing, passed over because the other worker's newer delivery
+    /// holds their address: the case a second worker adds to A-215's.
+    passed_handed_off: u64,
   }
 
   impl World {
@@ -266,42 +272,85 @@ mod oracle {
     }
   }
 
-  /// One worker's live serving, as the dispatcher does it: receive, stamp, then every response saved, sent alone and
-  /// acknowledged before the next receive.
+  /// What a worker does next: receive with no response, or take the batch its last combined call delivered.
+  enum Next {
+    Receive,
+    Take(usize),
+  }
+
+  /// The driver's next stamp, the model's performance counter.
+  fn stamp(world: &Mutex<World>) -> u64 {
+    let mut world = world.lock().unwrap();
+    world.clock += 1;
+    world.clock
+  }
+
+  /// One worker's live serving, as the dispatcher does it: receive, stamp, then every response saved; each but the last
+  /// sent alone and acknowledged, the last handed to the call that receives the next batch into the other buffer.
   fn serve(
     worker: usize,
     memory: &mut [u8],
     world: &Mutex<World>,
     gate: &Turnstile,
   ) -> Result<(), Crashed> {
-    let mut used = None;
+    let mut fill = Fill::new();
+    let mut next = Next::Receive;
     loop {
       gate.pass(worker)?;
-      if world.lock().unwrap().exhausted() {
+      if matches!(next, Next::Receive) && world.lock().unwrap().exhausted() {
         return Ok(());
       }
-      let mut receiving = Capture::new(memory).unwrap().begin(used).unwrap();
-      gate.pass(worker)?;
-      let reported = {
-        let mut world = world.lock().unwrap();
-        let call = world.calls;
-        world.calls += 1;
-        world.arrive(call % 3);
-        world.deliver(worker, receiving.buffer_mut())
+      let mut batch = match next {
+        Next::Receive => {
+          let mut receiving = Capture::new(memory).unwrap().begin(&fill).unwrap();
+          gate.pass(worker)?;
+          let reported = {
+            let mut world = world.lock().unwrap();
+            let call = world.calls;
+            world.calls += 1;
+            world.arrive(call % 3);
+            world.deliver(worker, receiving.buffer_mut())
+          };
+          gate.pass(worker)?;
+          let stamp = stamp(world);
+          receiving.received(reported, &mut fill, stamp).unwrap()
+        }
+        Next::Take(reported) => {
+          let stamp = stamp(world);
+          Capture::new(memory)
+            .unwrap()
+            .handed_off(reported, &mut fill, stamp)
+            .unwrap()
+        }
       };
-      gate.pass(worker)?;
-      let stamp = {
-        let mut world = world.lock().unwrap();
-        world.clock += 1;
-        world.clock
-      };
-      used = Some(filled(reported).unwrap());
-      let mut batch = receiving.received(reported, stamp).unwrap();
+      next = Next::Receive;
       while let Some(request) = batch.next_request().unwrap() {
         gate.pass(worker)?;
         let response = operate(&request, world);
         gate.pass(worker)?;
         batch.record_response(&request, &response).unwrap();
+        if batch.is_last() {
+          gate.pass(worker)?;
+          let mut hand_off = batch.hand_off(&request, &mut fill).unwrap();
+          gate.pass(worker)?;
+          {
+            let mut world = world.lock().unwrap();
+            world.respond(worker, &response);
+            let call = world.calls;
+            world.calls += 1;
+            world.arrive(1 - call % 2);
+          }
+          gate.pass(worker)?;
+          let reported = {
+            let (_, buffer) = hand_off.transaction();
+            world.lock().unwrap().deliver(worker, buffer)
+          };
+          gate.pass(worker)?;
+          confirm(&response, world);
+          gate.pass(worker)?;
+          next = Next::Take(reported);
+          break;
+        }
         gate.pass(worker)?;
         {
           let mut world = world.lock().unwrap();
@@ -329,11 +378,11 @@ mod oracle {
     let mut journals = Vec::new();
     for memory in memories.iter() {
       let mut copy = memory.clone();
+      if let Some(open) = Capture::new(&mut copy).unwrap().retained_open().unwrap() {
+        retained.push(open);
+      }
       match Capture::new(&mut copy).unwrap().resume().unwrap() {
         Some(batch) => {
-          if let Some(open) = batch.saved_open().unwrap() {
-            retained.push(open);
-          }
           if batch.stamp().is_none() && !batch.hints().is_empty() {
             world.lock().unwrap().unstamped += 1;
           }
@@ -355,13 +404,22 @@ mod oracle {
     let passed = superseded(&journals).unwrap();
     gate.pass_alone()?;
     for (memory, passed) in memories.iter_mut().zip(passed) {
+      let handed_off = matches!(
+        Capture::new(memory).unwrap().landing().unwrap(),
+        Landing::HandingOffUndelivered
+      );
       let Some(mut batch) = Capture::new(memory).unwrap().resume().unwrap() else {
         continue;
       };
       while let Some(request) = batch.next_request().unwrap() {
         gate.pass_alone()?;
         if passed.contains(&request.hint()) {
-          world.lock().unwrap().passed_over += 1;
+          let mut world = world.lock().unwrap();
+          world.passed_over += 1;
+          if handed_off && batch.response_for(&request).unwrap().is_some() {
+            world.passed_handed_off += 1;
+          }
+          drop(world);
           batch.pass_over(request.hint()).unwrap();
           continue;
         }
@@ -419,6 +477,7 @@ mod oracle {
     reused_across: u64,
     passed_over: u64,
     unstamped: u64,
+    passed_handed_off: u64,
   }
 
   /// Kills the daemon after each of `crashes` steps in turn, the last life living; returns that life's steps.
@@ -445,6 +504,7 @@ mod oracle {
     tally.reused_across += world.reused_across;
     tally.passed_over += world.passed_over;
     tally.unstamped += world.unstamped;
+    tally.passed_handed_off += world.passed_handed_off;
     for context in world.completed.values().flatten() {
       if !world.confirmed.contains(context) || world.retired.contains(context) {
         tally.wrong_context += 1;
@@ -456,7 +516,8 @@ mod oracle {
   /// A-219. Do: serve twelve IRPs on two workers under several schedules, killing the daemon at every step of every worker,
   /// and again with its successor killed at a step too; the last life lives. Expect: every IRP completed once with its own
   /// identity and a context the ledger kept, none lost; and the oracle saw what it guards: an address freed by one worker's
-  /// response delivered to the other, requests passed over at recovery, and unstamped batches.
+  /// response delivered to the other, requests passed over at recovery, unstamped batches, and a hand-off that delivered
+  /// nothing whose saved response the other worker's newer delivery superseded.
   #[test]
   fn two_workers_answer_every_irp_once_with_its_own_response_whatever_step_the_daemon_dies_at() {
     let mut tally = Tally::default();
@@ -481,7 +542,10 @@ mod oracle {
       "{tally:?}"
     );
     assert!(
-      tally.reused_across > 0 && tally.passed_over > 0 && tally.unstamped > 0,
+      tally.reused_across > 0
+        && tally.passed_over > 0
+        && tally.unstamped > 0
+        && tally.passed_handed_off > 0,
       "{tally:?}"
     );
   }

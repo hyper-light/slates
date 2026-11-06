@@ -303,9 +303,10 @@ fn serve_round(
   })
 }
 
-/// One waiting worker: receive into its journal, answer each request at once (a Create "opened", or "not found" once the
-/// round stops; a Cleanup and a Close done; anything else cancelled), send each response alone, until it has answered a
-/// Create after the round's stop.
+/// One waiting worker, serving as a mount's worker does (A-215): receive into its journal, answer each request at once (a
+/// Create "opened", or "not found" once the round stops; a Cleanup and a Close done; anything else cancelled), every
+/// response but a batch's last sent alone, the last riding the call that receives the next batch. It ends once it has
+/// answered a Create after the round's stop, that response sent alone, since a hand-off would wait for another request.
 fn serve_waiting(
   control: usize,
   journal: &mut [u8],
@@ -313,56 +314,118 @@ fn serve_waiting(
   ending: &Ending,
 ) -> Result<(), WinFspError> {
   let control = control as HANDLE;
-  let not_found = crate::ntstatus(&slates_vfs::VfsError::NotFound).as_i32();
-  // What this worker's last batch filled; its first receive clears the whole buffer.
-  let mut used = None;
+  // What this worker's last batch in each buffer filled; its first receive into each clears all of it.
+  let mut fill = capture::Fill::new();
   // Each open's context, as a mount's ledger tokens are: small, distinct, never zero.
   let mut context = 0u64;
+  // The transfer of the batch the last combined call delivered, to be taken next.
+  let mut handed = None;
   loop {
-    let mut receiving = capture::Capture::new(&mut *journal)
-      .and_then(|capture| capture.begin(used))
-      .map_err(WinFspError::Capture)?;
-    let reported = crate::dispatcher::receive_batch(control, receiving.buffer_mut(), intents)?;
-    if ending.abandoned.load(Ordering::Acquire) {
-      return Ok(());
-    }
-    let stopping = ending.stop.load(Ordering::Acquire);
-    used = Some(capture::filled(reported).map_err(WinFspError::Capture)?);
-    let mut batch = receiving
-      .received(reported, crate::dispatcher::performance_counter()?)
-      .map_err(WinFspError::Capture)?;
-    let mut ends = false;
-    while let Some(request) = batch.next_request().map_err(WinFspError::Capture)? {
-      let mut response = request.cancelled_response().map_err(WinFspError::Capture)?;
-      match request.kind() {
-        inflight::CREATE_KIND if stopping => {
-          inflight::finish_response(&mut response, not_found).map_err(WinFspError::Capture)?;
-          if !ends {
-            ending.ended.fetch_add(1, Ordering::Release);
-            ends = true;
-          }
+    let batch = match handed.take() {
+      None => {
+        let mut receiving = capture::Capture::new(&mut *journal)
+          .and_then(|capture| capture.begin(&fill))
+          .map_err(WinFspError::Capture)?;
+        let reported = crate::dispatcher::receive_batch(control, receiving.buffer_mut(), intents)?;
+        if ending.abandoned.load(Ordering::Acquire) {
+          return Ok(());
         }
-        inflight::CREATE_KIND => {
-          context = context.saturating_add(1);
-          opened(&mut response, &request, context)?;
-        }
-        inflight::CLEANUP_KIND | inflight::CLOSE_KIND => {
-          inflight::finish_response(&mut response, 0).map_err(WinFspError::Capture)?;
-        }
-        _ => {}
+        receiving
+          .received(
+            reported,
+            &mut fill,
+            crate::dispatcher::performance_counter()?,
+          )
+          .map_err(WinFspError::Capture)?
       }
-      batch
-        .record_response(&request, &response)
-        .map_err(WinFspError::Capture)?;
-      crate::dispatcher::send_response(control, &response, intents)?;
-      batch
-        .acknowledge(request.hint())
-        .map_err(WinFspError::Capture)?;
-    }
-    if ends {
-      return Ok(());
+      Some(reported) => {
+        if ending.abandoned.load(Ordering::Acquire) {
+          return Ok(());
+        }
+        let stamp = crate::dispatcher::performance_counter()?;
+        capture::Capture::new(&mut *journal)
+          .and_then(|capture| capture.handed_off(reported, &mut fill, stamp))
+          .map_err(WinFspError::Capture)?
+      }
+    };
+    let stopping = ending.stop.load(Ordering::Acquire);
+    match answer_batch(
+      control,
+      batch,
+      intents,
+      &mut fill,
+      &mut context,
+      stopping,
+      ending,
+    )? {
+      Answered::HandedOff(reported) => handed = Some(reported),
+      Answered::Sent => {}
+      Answered::Ended => return Ok(()),
     }
   }
+}
+
+/// How a probe worker's batch was answered.
+enum Answered {
+  /// Its last response rode a call that delivered this many bytes, the next batch.
+  HandedOff(usize),
+  /// Every response was sent alone.
+  Sent,
+  /// It held a Create received after the round's stop: this worker has ended.
+  Ended,
+}
+
+fn answer_batch(
+  control: HANDLE,
+  mut batch: capture::Batch<'_>,
+  intents: &mut Intents,
+  fill: &mut capture::Fill,
+  context: &mut u64,
+  stopping: bool,
+  ending: &Ending,
+) -> Result<Answered, WinFspError> {
+  let not_found = crate::ntstatus(&slates_vfs::VfsError::NotFound).as_i32();
+  let mut ends = false;
+  while let Some(request) = batch.next_request().map_err(WinFspError::Capture)? {
+    let mut response = request.cancelled_response().map_err(WinFspError::Capture)?;
+    match request.kind() {
+      inflight::CREATE_KIND if stopping => {
+        inflight::finish_response(&mut response, not_found).map_err(WinFspError::Capture)?;
+        if !ends {
+          ending.ended.fetch_add(1, Ordering::Release);
+          ends = true;
+        }
+      }
+      inflight::CREATE_KIND => {
+        *context = context.saturating_add(1);
+        opened(&mut response, &request, *context)?;
+      }
+      inflight::CLEANUP_KIND | inflight::CLOSE_KIND => {
+        inflight::finish_response(&mut response, 0).map_err(WinFspError::Capture)?;
+      }
+      _ => {}
+    }
+    batch
+      .record_response(&request, &response)
+      .map_err(WinFspError::Capture)?;
+    if batch.is_last() && !ends {
+      let mut hand_off = batch
+        .hand_off(&request, fill)
+        .map_err(WinFspError::Capture)?;
+      let (response, buffer) = hand_off.transaction();
+      let reported = crate::dispatcher::send_and_receive(control, response, buffer, intents)?;
+      return Ok(Answered::HandedOff(reported));
+    }
+    crate::dispatcher::send_response(control, &response, intents)?;
+    batch
+      .acknowledge(request.hint())
+      .map_err(WinFspError::Capture)?;
+  }
+  Ok(if ends {
+    Answered::Ended
+  } else {
+    Answered::Sent
+  })
 }
 
 /// A Create's success, in place: the file opened with what it asked for granted, `context` its per-open context and
