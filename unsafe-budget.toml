@@ -209,7 +209,10 @@
 #   by BLAKE3.
 
 [budget]
-slates-machine = 53
+slates-machine = 57
+# 2026-11-05 (+4, A-223, compiled only for Windows): the wake probe confirms its waiter asleep by its cycle count
+#   (`wake.rs`, `platform::Watch`): `GetCurrentThreadId`, `OpenThread` with query rights, `QueryThreadCycleTime` and
+#   the handle's `CloseHandle`, none of which has a safe wrapper.
 # 2026-11-04 (+2, A-205, compiled only for Windows): `Facts::resident_now` reads the working set: the zeroed record and
 #   `K32GetProcessMemoryInfo`, which has no safe wrapper.
 #   Raised 19 → 22 on 2026-09-30 for AUD-29-09 (a shared object hands out no reference to its bytes):

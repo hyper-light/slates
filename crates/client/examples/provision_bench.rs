@@ -275,6 +275,34 @@ fn p99_median(rows: &[(&'static str, Vec<u64>)]) -> u64 {
   sorted[sorted.len() / 2]
 }
 
+/// Diagnostics only (A-223): this process's CPU time, nanoseconds (user plus kernel).
+#[cfg(windows)]
+#[allow(unsafe_code, clippy::undocumented_unsafe_blocks)]
+fn process_cpu_ns() -> u64 {
+  use windows_sys::Win32::Foundation::FILETIME;
+  use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+  let z = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+  let (mut a, mut b, mut k, mut u) = (z, z, z, z);
+  unsafe { GetProcessTimes(GetCurrentProcess(), &mut a, &mut b, &mut k, &mut u) };
+  let t = |f: FILETIME| (u64::from(f.dwHighDateTime) << 32) | u64::from(f.dwLowDateTime);
+  (t(k) + t(u)) * 100
+}
+
+/// Diagnostics only (A-223): this process's CPU time, nanoseconds (user plus kernel).
+#[cfg(unix)]
+#[allow(unsafe_code, clippy::undocumented_unsafe_blocks)]
+fn process_cpu_ns() -> u64 {
+  let mut r: libc::rusage = unsafe { std::mem::zeroed() };
+  unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut r) };
+  let tv = |t: libc::timeval| u64::try_from(t.tv_sec).unwrap() * 1_000_000_000 + u64::try_from(t.tv_usec).unwrap() * 1_000;
+  tv(r.ru_utime) + tv(r.ru_stime)
+}
+
+/// Diagnostics only (A-223): the CPU the process spent over `wall`, in thousandths of one core.
+fn cores_permille(cpu_ns: u64, wall: Duration) -> u64 {
+  cpu_ns * 1000 / ns(wall).max(1)
+}
+
 fn main() {
   let profile = MachineProfile::measure_patiently(&ProfileOptions {
     budget_per_probe: ProfileOptions::default().budget_per_probe,
@@ -301,6 +329,22 @@ fn main() {
   println!(
     "provisioning histogram: {shards} shards, spin window {} ns, floor {PROVISION_FLOOR_NS} ns",
     daemon.config().region.spin_ns
+  );
+  println!(
+    "a223.profile wake: {:?}; idle window at boot {} ns",
+    profile.wake,
+    daemon.config().runtime.spin_ns
+  );
+  // At rest: no client at all.
+  let rest = Duration::from_secs(3);
+  let cpu_before = process_cpu_ns();
+  let rest_started = Instant::now();
+  std::thread::park_timeout(rest);
+  let rest_wall = rest_started.elapsed();
+  println!(
+    "a223.rest: {} thousandths of a core over {} ms with no client",
+    cores_permille(process_cpu_ns() - cpu_before, rest_wall),
+    rest_wall.as_millis()
   );
   // A client thread spins for its reply while the shards spin serving; a run with more of
   // those than the machine has cores past the shards measures the scheduler oversubscribing,
@@ -362,7 +406,16 @@ fn main() {
   // The parked form is reported separately (AC-2.1), not gated: its latency is a wake, which
   // the scheduler's park granularity dominates.
   let before = daemon.shard_pulses();
+  let cpu_before = process_cpu_ns();
+  let paced_started = Instant::now();
   let rows = form(&instance, "parked_1", 1, PARKED_SAMPLES, Some(PARKED_PAUSE));
+  let paced_wall = paced_started.elapsed();
+  println!(
+    "a223.paced: {} thousandths of a core over {} ms of one client paced {} us (client included)",
+    cores_permille(process_cpu_ns() - cpu_before, paced_wall),
+    paced_wall.as_millis(),
+    PARKED_PAUSE.as_micros()
+  );
   print_parks(
     "parked_1",
     &before,
