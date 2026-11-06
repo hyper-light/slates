@@ -86,9 +86,24 @@ struct Owner {
 }
 
 struct Holder {
-  replica: Replica,
+  /// Its copy of the log: `None` until it first accepts a message, as the daemon keeps a candidate's copy only once one
+  /// arrives (`slates_server::live_ship::held_entry`).
+  replica: Option<Replica>,
+  /// The owner the configuration names to it, as far as it has learned (`learn`): the only sender whose message makes
+  /// it a copy (`slates_server::live_ship::admitted`). A takeover's fetch does not change it.
+  configured: HostId,
   state: Vec<u64>,
   alive: bool,
+}
+
+/// What phase one does with a candidate that holds no copy of the log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EmptyReport {
+  /// The design (A-200): it makes an empty copy, raises its fence to the takeover's epoch and reports nothing held; the
+  /// report counts toward `f + 1`.
+  FenceAndCount,
+  /// A mutation, the daemon before 2026-11-05 for a remote candidate: it reports nothing held and keeps no fence.
+  CountWithoutFence,
 }
 
 fn encode_state(state: &[u64]) -> Vec<u8> {
@@ -102,6 +117,29 @@ fn decode_state(bytes: &[u8]) -> Vec<u64> {
     .iter()
     .map(|chunk| u64::from_le_bytes(*chunk))
     .collect()
+}
+
+/// A holder's copy for a message from `from`: its own, or a new one when it has none and the configuration it knows
+/// (`configured`) names `from` the owner; `None` (the message refused unanswered) for a stranger.
+fn copy_for(
+  replica: &mut Option<Replica>,
+  configured: HostId,
+  from: HostId,
+) -> Option<&mut Replica> {
+  if replica.is_none() && from != configured {
+    return None;
+  }
+  Some(replica.get_or_insert_with(|| Replica::new(configured, OBJECT)))
+}
+
+/// A holder learns the configuration's owner and epoch: its copy, if it has one, is fenced and handed to `owner`.
+fn learn_owner(holder: &mut Holder, owner: HostId, epoch: HostEpoch) {
+  holder.configured = owner;
+  if let Some(replica) = &mut holder.replica
+    && replica.prepare(epoch).is_ok()
+  {
+    replica.reassign(owner);
+  }
 }
 
 struct Run {
@@ -122,10 +160,15 @@ struct Run {
   takeovers: u64,
   installs: u64,
   stale_refusals: u64,
+  /// Phase one's reports counted from candidates that held no copy.
+  empty_reports: u64,
+  rule: EmptyReport,
+  /// Whether the history is printed as it happens ([`Run::traced`]): what each step did that bears on the invariants.
+  traced: bool,
 }
 
 impl Run {
-  fn new(f: u64, seed: u64) -> Run {
+  fn new(f: u64, seed: u64, rule: EmptyReport) -> Run {
     let hosts: Vec<HostId> = (1..=2 * f + 1).map(HostId).collect();
     let owner = hosts[0];
     let holders = hosts
@@ -135,7 +178,8 @@ impl Run {
         (
           *host,
           Holder {
-            replica: Replica::new(owner, OBJECT),
+            replica: None,
+            configured: owner,
             state: Vec::new(),
             alive: true,
           },
@@ -173,6 +217,21 @@ impl Run {
       takeovers: 0,
       installs: 0,
       stale_refusals: 0,
+      empty_reports: 0,
+      rule,
+      traced: false,
+    }
+  }
+
+  /// This run with its history kept, for a failing seed's record.
+  fn traced(mut self) -> Run {
+    self.traced = true;
+    self
+  }
+
+  fn note(&self, event: impl FnOnce() -> String) {
+    if self.traced {
+      eprintln!("  {}", event());
     }
   }
 
@@ -222,6 +281,13 @@ impl Run {
         );
         let from = owner.host;
         let holders = owner.shipper.holders().to_vec();
+        let epoch = owner.shipper.epoch().0;
+        self.note(|| {
+          format!(
+            "owner {} (host {}, epoch {epoch}) appends position {} = {value}",
+            index, from.0, entry.position
+          )
+        });
         for holder in holders {
           self.send(from, holder, index, Body::Entry(entry.encode()));
         }
@@ -260,15 +326,27 @@ impl Run {
         if !holder.alive {
           return;
         }
-        let reply = match holder.replica.check(&entry) {
+        let made = holder.replica.is_none();
+        let Some(replica) = copy_for(&mut holder.replica, holder.configured, message.from) else {
+          return;
+        };
+        let reply = match replica.check(&entry) {
           Ok(Admitted::Apply(head)) => {
             holder.state.push(u64::from_le_bytes(
               entry.payload.as_slice().try_into().unwrap(),
             ));
-            holder.replica.commit(entry.epoch, head);
+            replica.commit(entry.epoch, head);
+            let (to, from, position, epoch) =
+              (message.to.0, message.from.0, entry.position, entry.epoch.0);
+            self.note(|| {
+              format!(
+                "host {to} accepts position {position} from host {from} (epoch {epoch}){}",
+                if made { ", making its copy" } else { "" }
+              )
+            });
             Ok(Some(head))
           }
-          Ok(Admitted::Held) => Ok(holder.replica.head()),
+          Ok(Admitted::Held) => Ok(replica.head()),
           Err(refusal) => Err(refusal),
         };
         if matches!(reply, Err(LiveError::StaleEpoch { .. })) {
@@ -289,14 +367,17 @@ impl Run {
         if !holder.alive {
           return;
         }
-        let reply = match holder.replica.check_install(&install) {
+        let Some(replica) = copy_for(&mut holder.replica, holder.configured, message.from) else {
+          return;
+        };
+        let reply = match replica.check_install(&install) {
           Ok(Admitted::Apply(head)) => {
             holder.state = decode_state(&install.state);
-            holder.replica.commit(install.epoch, head);
+            replica.commit(install.epoch, head);
             self.installs += 1;
             Ok(Some(head))
           }
-          Ok(Admitted::Held) => Ok(holder.replica.head()),
+          Ok(Admitted::Held) => Ok(replica.head()),
           Err(refusal) => Err(refusal),
         };
         self.send(
@@ -332,6 +413,12 @@ impl Run {
     let Some(durable) = owner.shipper.durable() else {
       return;
     };
+    if owner.superseded.is_some() {
+      let host = owner.host.0;
+      self.note(|| {
+        format!("superseded owner {index} (host {host}) is durable through position {durable}")
+      });
+    }
     for position in 0..=durable {
       let value = owner.state[usize::try_from(position).unwrap()];
       let earlier = *self.durable.entry(position).or_insert(value);
@@ -379,8 +466,29 @@ impl Run {
     let mut reports = Vec::new();
     for host in reachable.iter().take(needed) {
       let holder = self.holders.get_mut(host).unwrap();
-      reports.push((*host, holder.replica.prepare(epoch).unwrap()));
+      let report = match (&mut holder.replica, self.rule) {
+        (Some(replica), _) => replica.prepare(epoch).unwrap(),
+        (None, EmptyReport::FenceAndCount) => {
+          let mut replica = Replica::new(holder.configured, OBJECT);
+          let head = replica.prepare(epoch).unwrap();
+          holder.replica = Some(replica);
+          self.empty_reports += 1;
+          head
+        }
+        (None, EmptyReport::CountWithoutFence) => {
+          self.empty_reports += 1;
+          None
+        }
+      };
+      reports.push((*host, report));
     }
+    let (epoch_value, reported) = (self.epoch, format!("{reports:?}"));
+    self.note(|| {
+      format!(
+        "takeover at epoch {epoch_value} by host {}: reports {reported}",
+        successor.0
+      )
+    });
     let adopted = adopt(
       &reports,
       Quorum {
@@ -406,12 +514,9 @@ impl Run {
     // (`learn`), and until then only their fence, if a takeover raised it, stands between them and the superseded
     // owner.
     for host in reachable.iter().take(needed) {
-      self
-        .holders
-        .get_mut(host)
-        .unwrap()
-        .replica
-        .reassign(successor);
+      if let Some(replica) = &mut self.holders.get_mut(host).unwrap().replica {
+        replica.reassign(successor);
+      }
     }
     // The successor serves from the adopted state; it holds it (as a holder, it fetched it from the adopted replica).
     let successor_holder = self.holders.remove(&successor).unwrap();
@@ -422,7 +527,8 @@ impl Run {
     self.holders.insert(
       old_host,
       Holder {
-        replica: Replica::new(successor, OBJECT),
+        replica: None,
+        configured: successor,
         state: Vec::new(),
         alive: false,
       },
@@ -454,10 +560,7 @@ impl Run {
     let epoch = HostEpoch(self.epoch);
     let hosts: Vec<HostId> = self.holders.keys().copied().collect();
     if let Some(host) = hosts.get(self.rng.below(hosts.len())) {
-      let holder = self.holders.get_mut(host).unwrap();
-      if holder.replica.prepare(epoch).is_ok() {
-        holder.replica.reassign(owner);
-      }
+      learn_owner(self.holders.get_mut(host).unwrap(), owner, epoch);
     }
   }
 
@@ -563,9 +666,7 @@ impl Run {
     let owner = self.owners[self.current].host;
     let epoch = HostEpoch(self.epoch);
     for holder in self.holders.values_mut() {
-      if holder.replica.prepare(epoch).is_ok() {
-        holder.replica.reassign(owner);
-      }
+      learn_owner(holder, owner, epoch);
     }
   }
 
@@ -576,15 +677,16 @@ impl Run {
       .iter()
       .filter(|(host, holder)| holder.alive && **host != owner.host)
       .all(|(_, holder)| {
-        holder.state == owner.state && holder.replica.head() == owner.shipper.head()
+        holder.state == owner.state
+          && holder.replica.as_ref().and_then(Replica::head) == owner.shipper.head()
       })
   }
 }
 
-fn run_seeds(f: u64) -> (u64, u64, u64, u64) {
-  let mut totals = (0, 0, 0, 0);
+fn run_seeds(f: u64, rule: EmptyReport) -> (u64, u64, u64, u64, u64) {
+  let mut totals = (0, 0, 0, 0, 0);
   for seed in 0..SEEDS {
-    let mut run = Run::new(f, seed);
+    let mut run = Run::new(f, seed, rule);
     for _ in 0..STEPS {
       run.step();
     }
@@ -593,6 +695,7 @@ fn run_seeds(f: u64) -> (u64, u64, u64, u64) {
     totals.1 += run.installs;
     totals.2 += run.stale_refusals;
     totals.3 += u64::try_from(run.durable.len()).unwrap();
+    totals.4 += run.empty_reports;
   }
   totals
 }
@@ -604,13 +707,64 @@ fn run_seeds(f: u64) -> (u64, u64, u64, u64) {
 #[test]
 fn the_live_log_holds_the_register_invariants_under_the_nemesis() {
   for f in [1, 2] {
-    let (takeovers, installs, stale_refusals, durable) = run_seeds(f);
+    let (takeovers, installs, stale_refusals, durable, empty) =
+      run_seeds(f, EmptyReport::FenceAndCount);
     eprintln!(
       "f={f}: {SEEDS} seeds x {STEPS} steps: {takeovers} takeovers, {installs} installs, {stale_refusals} stale \
-       refusals, {durable} durable positions"
+       refusals, {durable} durable positions, {empty} empty reports counted"
     );
-    assert!(takeovers > 0 && installs > 0 && stale_refusals > 0 && durable > 0);
+    assert!(takeovers > 0 && installs > 0 && stale_refusals > 0 && durable > 0 && empty > 0);
   }
+}
+
+/// A-200 phase one, the rule for a candidate that holds no copy (2026-11-05): its empty report counts toward `f + 1`
+/// only because it raises a fence. Do run the nemesis with the mutation that counts it and keeps no fence (the daemon's
+/// remote no-copy answer before the fix). Expect a superseded owner to make a position durable through that candidate,
+/// outside the adopted head: StaleNeverCommits fails in some seed, at `f = 1` or `f = 2`.
+#[test]
+fn an_empty_report_without_a_fence_lets_a_superseded_owner_commit() {
+  let mut broken = Vec::new();
+  for f in [1, 2] {
+    for seed in 0..SEEDS {
+      let outcome = std::panic::catch_unwind(|| {
+        let mut run = Run::new(f, seed, EmptyReport::CountWithoutFence);
+        for _ in 0..STEPS {
+          run.step();
+        }
+        run.settle();
+      });
+      if let Err(panic) = outcome {
+        let message = panic
+          .downcast_ref::<String>()
+          .cloned()
+          .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+          .unwrap_or_default();
+        broken.push((f, seed, message));
+      }
+    }
+  }
+  eprintln!(
+    "empty reports without a fence: {} broken seeds; first {:?}",
+    broken.len(),
+    broken.first()
+  );
+  // The first broken seed's history, for its record (docs/bugs/2026-11-05-…): replayed with the trace on.
+  if let Some((f, seed, _)) = broken.first().cloned() {
+    eprintln!("history of f={f} seed {seed}:");
+    let _ = std::panic::catch_unwind(|| {
+      let mut run = Run::new(f, seed, EmptyReport::CountWithoutFence).traced();
+      for _ in 0..STEPS {
+        run.step();
+      }
+      run.settle();
+    });
+  }
+  assert!(
+    broken
+      .iter()
+      .any(|(_, _, message)| message.contains("StaleNeverCommits")),
+    "an unfenced empty report let a superseded owner commit: {broken:?}"
+  );
 }
 
 /// AC-8.9: the owner holds at most `credit` entries that are not durable; past it a write is refused `NoCredit`, and
@@ -637,6 +791,59 @@ fn a_writer_past_its_credit_waits_for_acknowledgements() {
   assert_eq!(shipper.on_reply(hosts[1], Ok(held)), Next::Nothing);
   assert_eq!(shipper.durable(), Some(1));
   assert!(shipper.append(vec![3]).is_ok());
+}
+
+/// A-200, AC-8.3: a holder's refusal is never counted as holding. Do append two entries, then answer the owner with
+/// each refusal a holder that will not keep them gives (a sender it does not take for the owner, no catalog yet, a
+/// fence, a stranger's object, malformed bytes). Expect the durable position unchanged after every one, and the owner
+/// still owing that holder both entries; only the other holder's acknowledgement makes them durable.
+#[test]
+fn a_refused_entry_is_never_counted_as_held() {
+  let hosts = [HostId(1), HostId(2), HostId(3)];
+  let mut shipper = Shipper::new(
+    (hosts[0], OBJECT, HostEpoch(1)),
+    Quorum { f: 1 },
+    &hosts,
+    None,
+    (4, 8),
+  );
+  let first = shipper.append(vec![1]).unwrap();
+  let second = shipper.append(vec![2]).unwrap();
+  for refusal in [
+    LiveError::Unauthorized,
+    LiveError::ForeignObject,
+    LiveError::Malformed,
+    LiveError::NoCredit { durable: None },
+    LiveError::StaleEpoch {
+      current: HostEpoch(1),
+    },
+  ] {
+    let next = shipper.on_reply(hosts[1], Err(refusal));
+    assert_ne!(
+      shipper.durable(),
+      Some(1),
+      "{refusal:?} made the log durable"
+    );
+    assert_eq!(shipper.durable(), None, "{refusal:?} moved durability");
+    assert!(
+      !matches!(next, Next::Fenced(_)),
+      "a refusal at the owner's own epoch fences nothing: {refusal:?}"
+    );
+    assert_eq!(
+      shipper.pending(hosts[1]),
+      Next::Entries(vec![first.clone(), second.clone()]),
+      "after {refusal:?} the owner still owes the holder both entries"
+    );
+  }
+  let mut replica = Replica::new(hosts[0], OBJECT);
+  replica.accept(&first).unwrap();
+  let held = replica.accept(&second).unwrap();
+  shipper.on_reply(hosts[2], Ok(held));
+  assert_eq!(
+    shipper.durable(),
+    Some(1),
+    "the other holder's acknowledgement does"
+  );
 }
 
 /// R8: at `f = 0` there are no holders and every entry is durable at its append, by the same code.

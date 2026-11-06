@@ -457,7 +457,28 @@
 > restart; real-process chaos
 > (partitions, injected latency, volume failure, client disconnect). `put_wal` and the
 > loss-window report are unbuilt; a head still waits up to the 100 ms record period before its commit starts.
-> **Open, found landing 13 (2026-11-05): a live takeover can wait for its quorum and never serve.** On adacachy in a
+> **Fixed 2026-11-05 on agents/raft-2 (bug record `docs/bugs/2026-11-05-a-live-takeover-counted-no-empty-report-and-fenced-no-empty-copy.md`):
+> a live takeover could wait for its quorum and never serve, and phase one had a safety hole.** The hypothesis below held.
+> A successor that held no copy never counted itself (`fetch`), and a remote candidate that held no copy answered "none"
+> without raising a fence (`serve_fetch`). The second is a **safety defect**, on main since 7f57f1b6 (slice three,
+> landed in 2f343fcd) for opt-in live-shipped volumes: the db nemesis model, extended so a candidate's copy exists only
+> once a message reaches it, fails StaleNeverCommits in 10 of 400 seeds when an empty report counts without a fence. In
+> f=1 seed 27: the owner (host 1, epoch 1) had shipped nothing; host 3 took over at epoch 2 on two empty reports (hosts 2
+> and 3); host 3 appended position 0 = 1; host 1, resumed, appended its own position 0 = 3, which host 2 (no copy, no
+> fence, still taking host 1 for the owner) accepted, so position 0 was durable twice with two values. Fixed by
+> `live_ship::fenced_copy` at both sites: a candidate with no copy makes an empty one with its fence at the takeover's
+> epoch, and its report counts. Every invariant then holds (f=1: 110 takeovers, 57 empty reports; f=2: 241, 145); the
+> mutation stays as a test (`an_empty_report_without_a_fence_lets_a_superseded_owner_commit`). The liveness side is red
+> first and green after across real processes (`a_successor_that_holds_no_copy_still_takes_a_live_volume_over`: the
+> successor waited 397 times and never served; after, served in 3.2 s). A refused entry never counts as held
+> (`a_refused_entry_is_never_counted_as_held`). Still open, found on the way: why a candidate holds no copy. Holders now
+> count refusals by reason (`fleet.live.hold_refused.*`). Over three loaded runs one candidate refused the owner
+> `not_a_member` 22 times and then held the log (a membership lag at the fleet's start), but another refused 6 times
+> `not_a_member` and then 21 times `no_catalog` and held nothing for the whole run: a candidate that never receives the
+> volume's catalog keeps refusing, and the log rests on the other candidate alone (with it stopped, writes cannot be
+> durable; a soak run hung on exactly that). Owner: raft, next.
+>
+> **As found, landing 13 (2026-11-05): a live takeover can wait for its quorum and never serve.** On adacachy in a
 > capped unit (`CPUQuota=1200%`, load 18–25), `a_superseded_owner_resumed_after_its_takeover_is_fenced`
 > (`crates/cli/tests/live_fleet.rs`) failed 1 of 2 runs on the landing's tree: with the owner stopped, the survivor that
 > adopted the takeover (`fleet.takeover.adopted` 2) waited for its live log's quorum for the whole 40 s

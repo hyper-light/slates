@@ -1157,13 +1157,16 @@ pub(crate) fn serve_entry(
   request: &[u8],
 ) -> Vec<u8> {
   let object = slates_db::live::object_of(request);
-  let Some(bound) = admitted(state, local, peer, object) else {
-    state.count(LIVE_HOLD_REFUSED, 1);
-    return encode_reply(&Err(not_served(
-      state,
-      object,
-      slates_db::live::epoch_of(request),
-    )));
+  let bound = match admitted(state, local, peer, object) {
+    Ok(bound) => bound,
+    Err(why) => {
+      count_refused(state, why);
+      return encode_reply(&Err(not_served(
+        state,
+        object,
+        slates_db::live::epoch_of(request),
+      )));
+    }
   };
   let reply = Entry::decode(request, bound).and_then(|entry| {
     let held = held_entry(state, peer, entry.object);
@@ -1176,8 +1179,8 @@ pub(crate) fn serve_entry(
       Admitted::Held => Ok(held.replica.head()),
     }
   });
-  match reply {
-    Err(_) => state.count(LIVE_HOLD_REFUSED, 1),
+  match &reply {
+    Err(error) => count_refused(state, refused_counter(error)),
     Ok(_) => state.count(LIVE_HELD, 1),
   }
   encode_reply(&reply)
@@ -1191,13 +1194,16 @@ pub(crate) fn serve_install(
   request: &[u8],
 ) -> Vec<u8> {
   let object = slates_db::live::object_of_state(request);
-  let Some(bound) = admitted(state, local, peer, object) else {
-    state.count(LIVE_HOLD_REFUSED, 1);
-    return encode_reply(&Err(not_served(
-      state,
-      object,
-      slates_db::live::epoch_of_install(request),
-    )));
+  let bound = match admitted(state, local, peer, object) {
+    Ok(bound) => bound,
+    Err(why) => {
+      count_refused(state, why);
+      return encode_reply(&Err(not_served(
+        state,
+        object,
+        slates_db::live::epoch_of_install(request),
+      )));
+    }
   };
   let reply = Install::decode(request, bound).and_then(|install| {
     let held = held_entry(state, peer, install.object);
@@ -1212,14 +1218,13 @@ pub(crate) fn serve_install(
       Admitted::Held => Ok(held.replica.head()),
     }
   });
-  match reply {
-    Err(_) => state.count(LIVE_HOLD_REFUSED, 1),
+  match &reply {
+    Err(error) => count_refused(state, refused_counter(error)),
     Ok(_) => state.count(LIVE_HELD, 1),
   }
   encode_reply(&reply)
 }
 
-/// The bound for a message naming `object`, when `peer` may place it on this node.
 /// Why a holder will not serve a message about `object` made under `epoch`: below the fence its copy has promised it is
 /// `StaleEpoch`, which tells a superseded owner to stop (`Shipper::on_reply` answers `Fenced`) and refuse what waits on
 /// it; otherwise `Unauthorized`. Refused as a stranger, a resumed old owner could not tell its loss from a passing
@@ -1234,16 +1239,19 @@ fn not_served(state: &ShardState, object: Option<ObjectId>, epoch: Option<HostEp
   }
 }
 
+/// The bound for a message naming `object`, when `peer` may place it on this node; otherwise the counter naming why
+/// not: the message names no object, `peer` is not the volume's acting owner here, or this node does not hold the
+/// volume's catalog yet (the bound is derived from it).
 fn admitted(
   state: &ShardState,
   local: HostId,
   peer: HostId,
   object: Option<ObjectId>,
-) -> Option<usize> {
-  let object = object?;
+) -> Result<usize, &'static str> {
+  let object = object.ok_or(REFUSED_MALFORMED)?;
   let regional = state.council.configuration();
   let placing = slates_cluster::content::ContentAccess::Place;
-  crate::fleet::content_authorized(
+  crate::fleet::content_authority(
     regional,
     &state.holder_records,
     local,
@@ -1251,8 +1259,41 @@ fn admitted(
     placing,
     object,
   )
-  .then(|| hold_bound(state, object))
-  .flatten()
+  .map_err(not_owner_counter)?;
+  hold_bound(state, object).ok_or(REFUSED_NO_CATALOG)
+}
+
+/// The holder's counter for a placement the configuration does not authorize, by `fleet::content_authority`'s reason.
+fn not_owner_counter(why: &'static str) -> &'static str {
+  match why {
+    "content.refused.not_a_member" => "fleet.live.hold_refused.not_a_member",
+    "content.refused.no_acting_owner" => "fleet.live.hold_refused.no_acting_owner",
+    "content.refused.not_the_acting_owner" => "fleet.live.hold_refused.not_the_acting_owner",
+    "content.refused.not_a_candidate" => "fleet.live.hold_refused.not_a_candidate",
+    _ => "fleet.live.hold_refused.not_owner",
+  }
+}
+/// Counter: a holder refused a message about a volume whose catalog it does not hold yet.
+const REFUSED_NO_CATALOG: &str = "fleet.live.hold_refused.no_catalog";
+/// Counter: a holder refused bytes that are not a well-formed message, or a payload over its bound.
+const REFUSED_MALFORMED: &str = "fleet.live.hold_refused.malformed";
+
+/// Counts a holder's refusal, in total and by why (`fleet.live.hold_refused.*`).
+fn count_refused(state: &mut ShardState, why: &'static str) {
+  state.count(LIVE_HOLD_REFUSED, 1);
+  state.count(why, 1);
+}
+
+/// The counter naming a replica's refusal.
+fn refused_counter(error: &LiveError) -> &'static str {
+  match error {
+    LiveError::StaleEpoch { .. } => "fleet.live.hold_refused.stale_epoch",
+    LiveError::Behind { .. } => "fleet.live.hold_refused.behind",
+    LiveError::Unauthorized => "fleet.live.hold_refused.other_owner",
+    LiveError::ForeignObject => "fleet.live.hold_refused.foreign_object",
+    LiveError::Malformed => REFUSED_MALFORMED,
+    LiveError::NoCredit { .. } => "fleet.live.hold_refused.no_credit",
+  }
 }
 
 /// The holder's copy of `object`, kept for `owner`: the configuration names `owner` the volume's acting owner (the caller
@@ -1277,7 +1318,7 @@ pub(crate) fn serve_fetch(
   request: &[u8],
 ) -> Vec<u8> {
   let Ok(fetch) = slates_db::live::Fetch::decode(request) else {
-    state.count(LIVE_HOLD_REFUSED, 1);
+    count_refused(state, REFUSED_MALFORMED);
     return slates_db::live::encode_fetched(&Err(LiveError::Malformed), &[]);
   };
   let regional = state.council.configuration();
@@ -1290,21 +1331,41 @@ pub(crate) fn serve_fetch(
     reading,
     fetch.object,
   ) {
-    state.count(LIVE_HOLD_REFUSED, 1);
+    count_refused(state, "fleet.live.hold_refused.fetch_unauthorized");
     return slates_db::live::encode_fetched(&Err(LiveError::Unauthorized), &[]);
   }
-  let Some(held) = state.live.held.get_mut(&fetch.object) else {
-    return slates_db::live::encode_fetched(&Ok(None), &[]);
-  };
-  match held.replica.prepare(fetch.epoch) {
-    Ok(head) => {
+  match fenced_copy(state, peer, fetch.object, fetch.epoch) {
+    Ok(held) => {
       held.replica.reassign(peer);
+      let head = held.replica.head();
       let entries: Vec<Vec<u8>> = held.entries.iter().cloned().collect();
       state.count(LIVE_FETCHED, 1);
       slates_db::live::encode_fetched(&Ok(head), &entries)
     }
     Err(refusal) => slates_db::live::encode_fetched(&Err(refusal), &[]),
   }
+}
+
+/// This candidate's copy of `object` with its fence raised to a takeover's `epoch` (phase one): the copy it holds, or
+/// an empty one made now for `successor`. An empty report counts toward phase one's `f + 1` (any `f + 1` of the `2f`
+/// other candidates include one of the `f` that hold every durable entry), so it must leave the same fence a full one
+/// does, or a superseded owner resumed could still ship to this candidate after it reported and commit outside the
+/// adopted head. The nemesis model decides both: counted with its fence, every invariant holds; counted without one,
+/// StaleNeverCommits fails (`crates/db/tests/live.rs`, `an_empty_report_without_a_fence_lets_a_superseded_owner_commit`,
+/// 10 seeds). Refused, with the fence, when `epoch` is below it.
+fn fenced_copy(
+  state: &mut ShardState,
+  successor: HostId,
+  object: ObjectId,
+  epoch: slates_db::register::HostEpoch,
+) -> Result<&mut Held, LiveError> {
+  let held = state.live.held.entry(object).or_insert_with(|| Held {
+    replica: Replica::new(successor, object),
+    entries: VecDeque::new(),
+    bytes: 0,
+  });
+  held.replica.prepare(epoch)?;
+  Ok(held)
 }
 
 /// A candidate's answer on the whole-state kind: a fetch or an install, by its tag.
@@ -1373,11 +1434,16 @@ pub(crate) async fn fetch(
     .ok_or("fleet.live.takeover_waits_catalog")?;
   let mut reports: Vec<(HostId, Option<Head>)> = Vec::new();
   let mut kept: BTreeMap<HostId, Vec<Vec<u8>>> = BTreeMap::new();
+  // The successor's own report, as any candidate's: an empty one counts too, fenced ([`fenced_copy`]). Counted only
+  // when it held a copy, a successor holding nothing could not reach `f + 1` once the owner was gone and waited for
+  // its quorum without end (370 and 371 waits under load, 2026-11-05; `a_successor_that_holds_no_copy_…`).
   if let Some(Some(own)) = state::with_state(|s| {
-    let held = s.live.held.get_mut(&object)?;
-    let head = held.replica.prepare(epoch).ok()?;
+    let held = fenced_copy(s, local, object, epoch).ok()?;
     held.replica.reassign(local);
-    Some((head, held.entries.iter().cloned().collect::<Vec<_>>()))
+    Some((
+      held.replica.head(),
+      held.entries.iter().cloned().collect::<Vec<_>>(),
+    ))
   }) {
     reports.push((local, own.0));
     kept.insert(local, own.1);
