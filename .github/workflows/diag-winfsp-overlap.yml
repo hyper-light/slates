@@ -1,9 +1,10 @@
-name: DIAG the per-phase profile with each interface callback timed, arm64, quiet (not for main)
+name: DIAG the per-phase profile with each interface callback and the gaps between them timed, arm64, quiet (not for main)
 
 # The supervisor's profile (2026-11-06): where each IRP's time goes, the combined form (comb2 on windows-11-arm, comb1
 # on windows-latest) against the DLL arm, mount_bench's quiet pass only, five runs a lane. Both arms carry the same
-# profile (crates/bridge-winfsp/src/phases.rs): the DLL arm 71cf09ac at 61db5d62, the combined form 45f048b6 at
-# 814d66ef, each also timing every interface callback from entry to return (`interface`), to place diag-36's
+# profile (crates/bridge-winfsp/src/phases.rs): the DLL arm 71cf09ac at 40ee5a65, the combined form 45f048b6 at
+# 21f0e23b, each also timing every interface callback from entry to return (`interface`) and the gap since the
+# thread's last one (`between`), to place diag-36's
 # unattributed ~8 µs a stat on arm64. Each daemon prints `phases <slot> <phase> <count> <p50> <p90> <p99> <mean>` in ns, and the round trip's
 # and the reply's way back's whole histograms (`phases_hist`), at its mount's end.
 #
@@ -21,7 +22,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: never
-  OLD_COMMIT: 61db5d6256b97df8634567a4643a7acf1a42fe7a
+  OLD_COMMIT: 40ee5a651924733575619efea7a2fc1886d97b38
   FIX_COMMIT: 3f12103dcb5e40c1cc9dbf45a6eb46cbdb89e615
   MAIN_COMMIT: 28359a7512ba9fd544550d12743294afd3e50eff
   WINFSP_MSI_URL: https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
@@ -41,24 +42,6 @@ jobs:
             first: dll
             second: comb2
             shards: ""
-          - lane: x86-product
-            runner: windows-latest
-            msvc: x64
-            first: dll
-            second: comb1
-            shards: ""
-          - lane: x86-shards1
-            runner: windows-latest
-            msvc: x64
-            first: dll
-            second: comb1
-            shards: "1"
-          - lane: x86-shards3
-            runner: windows-latest
-            msvc: x64
-            first: dll
-            second: comb1
-            shards: "3"
     name: profile ${{ matrix.lane }} run ${{ matrix.run }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
