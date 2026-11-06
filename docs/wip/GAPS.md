@@ -460,6 +460,12 @@
 >   minor version is refused until the receiver's layout is reviewed. Gates: Ubuntu job of 41978665514 (fmt, workspace
 >   clippy, `xtask check`, docs).
 
+> **Closed 2026-11-05 (bug-sweep, verified):** `cargo xwin check -p xtask --target x86_64-pc-windows-msvc` and
+> `cargo xwin clippy -p xtask --target x86_64-pc-windows-msvc -- -D warnings` both pass at `00e5269c` on macOS arm64.
+> The three files' Unix-only calls were gated by the conformance work after this entry (`045c0f62`, `ce24de1d`).
+> Whether the gates *pass* on a Windows host is a separate question, which only a run on one answers. The record as
+> found:
+>
 > **`cargo xtask` does not compile on Windows (2026-11-04, tooling).** On jupiter, `cargo +1.98.1 xtask check` stops
 > with 12 errors in `xtask/src`: `std::os::unix` and `Permissions::mode` in `conformance/workloads.rs`,
 > `std::os::unix` and `Permissions::from_mode` in `kind_export.rs`, and `rustix` in `conformance/hermeticity.rs`. So
