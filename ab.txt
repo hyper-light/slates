@@ -1,0 +1,10 @@
+# profile pair arm-dll-comb2, run 3: dll af1b82709c7f47ed896ec186d7da032a491941b9 (71cf09ac with the profile), comb 438c8a23eaa5dd1c78c9a941736feb49b59fa595; quiet only; 2026-11-06T06:57:19Z
+image win11-vs2026-arm64 20261101.203.1; 4 CPUs; ARM64 ARMv8 (64-bit) Family 8 Model D49 Revision   0, MICROSOFT CORPORATION; WinFsp 2.1.25156
+Microsoft Windows [Version 10.0.26200.9725]
+## run 1 of 1, 2026-11-06T06:57:20Z
+# dll started first: dll=S: comb2=T:
+# host: windows 0x23f00206 on windows processor architecture 12 level 3401 revision 0 (aarch64), 4 logical CPUs (4 available to this process), 15 GiB, page 4096 B; largest L2 1048576 B, cache line 64 B
+# workload: 10 rounds of 1000 files of 4096 B per arm and pass, arms interleaved, first arm rotating
+# arm dll: S:/d
+# arm comb2: T:/d
+# warm-up: one untimed round per arm (1000 files each)
