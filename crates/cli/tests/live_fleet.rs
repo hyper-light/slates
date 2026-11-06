@@ -1933,6 +1933,32 @@ fn v4_commit(
   (committed, began.elapsed())
 }
 
+/// Sends `signal` to every candidate's process: each fleet daemon but the owner's.
+fn signal_candidates(fleet: &Fleet, owner_index: usize, sent: rustix::process::Signal) {
+  for (index, daemon) in fleet.daemons.iter().enumerate() {
+    if index != owner_index {
+      signal(daemon, sent);
+    }
+  }
+}
+
+/// A `COMMIT` retried while it is told to try again, within the fleet wait, as a v4 client retries `NFS4ERR_DELAY`:
+/// resumed, the owner's lease is confirmed again within a heartbeat or two, and until then every call is told to try
+/// again (the live-tree fence, AUD-29-83). The last answer.
+fn v4_commit_once_served(
+  session: &mut nfs4::Session,
+  file: (&str, &str),
+) -> (Result<Vec<u8>, u32>, Duration) {
+  let deadline = Instant::now() + FLEET_WAIT;
+  loop {
+    let committed = v4_commit(session, file);
+    if committed.0 != Err(NFS4ERR_DELAY) || Instant::now() >= deadline {
+      return committed;
+    }
+    pause();
+  }
+}
+
 /// A-200 over NFSv4.2 (A-35): the v4 front end serves `WRITE` and `COMMIT` through the NFSv3 procedures, so they wait
 /// as NFSv3's do (`stable_once_durable`), and this holds them to it. Do: export a live volume, create a file over NFSv3,
 /// open a v4 session; write `UNSTABLE` and `COMMIT` healthy; stop both candidates' processes, write `UNSTABLE` and
@@ -1965,29 +1991,13 @@ fn an_nfs_v4_commit_and_stable_write_to_a_live_volume_answer_only_once_a_candida
   let file = (path.as_str(), "v4");
   let healthy_write = v4_write(&mut session, file, (0, UNSTABLE4), b"held by a candidate");
   let healthy = v4_commit(&mut session, file);
-  let candidates: Vec<usize> = (0..fleet.daemons.len())
-    .filter(|index| *index != owner_index)
-    .collect();
-  for index in &candidates {
-    signal(&fleet.daemons[*index], rustix::process::Signal::STOP);
-  }
+  signal_candidates(&fleet, owner_index, rustix::process::Signal::STOP);
   let unstable = v4_write(&mut session, file, (19, UNSTABLE4), b", then by no one");
   let alone = v4_commit(&mut session, file);
   let stable = v4_write(&mut session, file, (35, FILE_SYNC4), b", nor this");
   let late = counter(&owner, "fleet.live.durable_late");
-  for index in &candidates {
-    signal(&fleet.daemons[*index], rustix::process::Signal::CONT);
-  }
-  // Resumed, the owner's lease is confirmed again within a heartbeat or two, and until then every call is told to try
-  // again (the live-tree fence, AUD-29-83), so the COMMIT is retried as a v4 client retries `NFS4ERR_DELAY`.
-  let deadline = Instant::now() + FLEET_WAIT;
-  let resumed = loop {
-    let committed = v4_commit(&mut session, file);
-    if committed.0 != Err(NFS4ERR_DELAY) || Instant::now() >= deadline {
-      break committed;
-    }
-    pause();
-  };
+  signal_candidates(&fleet, owner_index, rustix::process::Signal::CONT);
+  let resumed = v4_commit_once_served(&mut session, file);
   let counters = live_counters(&owner);
   drop(stream);
   drop(fleet.daemons);
