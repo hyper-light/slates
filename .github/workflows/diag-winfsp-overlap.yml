@@ -1,11 +1,15 @@
-name: DIAG the per-phase profile of each request, the DLL arm against the combined form, quiet (not for main)
+name: DIAG the per-phase profile, the DLL arm against the combined form, quiet, product-derived and equal shard counts (not for main)
 
-# The supervisor's profile (2026-11-06): where each IRP's time goes, the combined form at two fixed workers against the
-# DLL arm on windows-11-arm, and at one against it on windows-latest, the mount_bench quiet pass only, five runs a
-# runner. Both arms carry the same profile (crates/bridge-winfsp/src/phases.rs): the DLL arm 71cf09ac at af1b8270, the
-# combined form 45f048b6 at caa4bb4b (67e86f54 with its dump moved before the mount's drop: diag-34's combined arm
-# died with its dump unprinted). Each daemon prints its histograms, `phases <slot> <phase> <count> <p50> <p90>
-# <p99> <mean>` in ns, at its mount's end, into the run's error output.
+# The supervisor's profile (2026-11-06): where each IRP's time goes, the combined form (comb2 on windows-11-arm, comb1
+# on windows-latest) against the DLL arm, mount_bench's quiet pass only, five runs a lane. Both arms carry the same
+# profile (crates/bridge-winfsp/src/phases.rs): the DLL arm 71cf09ac at 018fa83f, the combined form 45f048b6 at
+# 61f8b7de. Each daemon prints `phases <slot> <phase> <count> <p50> <p90> <p99> <mean>` in ns, and the round trip's
+# and the reply's way back's whole histograms (`phases_hist`), at its mount's end.
+#
+# Lanes: each runner with the shard count each build derives (what users get: on windows-latest 71cf09ac derives 3
+# shards and the combined form 1, A-208), and windows-latest with both arms held at 1 shard and at 3 (`slates anchor
+# --shards N`, an option of both builds), the receiver's verdict. windows-11-arm derives 3 shards in every build.
+# Each arm's measured profile (`slates profile --quick --json`) is printed first: the core facts the count is from.
 
 on:
   push:
@@ -16,7 +20,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: never
-  OLD_COMMIT: af1b82709c7f47ed896ec186d7da032a491941b9
+  OLD_COMMIT: 018fa83f09b4c3176c151cb3ad62e4716b30ffa1
   FIX_COMMIT: 3f12103dcb5e40c1cc9dbf45a6eb46cbdb89e615
   MAIN_COMMIT: 28359a7512ba9fd544550d12743294afd3e50eff
   WINFSP_MSI_URL: https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi
@@ -27,20 +31,34 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pair: [x86-dll-comb1, arm-dll-comb2]
+        lane: [arm-product, x86-product, x86-shards1, x86-shards3]
         run: [1, 2, 3, 4, 5]
         include:
-          - pair: x86-dll-comb1
-            runner: windows-latest
-            msvc: x64
-            first: dll
-            second: comb1
-          - pair: arm-dll-comb2
+          - lane: arm-product
             runner: windows-11-arm
             msvc: arm64
             first: dll
             second: comb2
-    name: profile ${{ matrix.pair }} run ${{ matrix.run }}
+            shards: ""
+          - lane: x86-product
+            runner: windows-latest
+            msvc: x64
+            first: dll
+            second: comb1
+            shards: ""
+          - lane: x86-shards1
+            runner: windows-latest
+            msvc: x64
+            first: dll
+            second: comb1
+            shards: "1"
+          - lane: x86-shards3
+            runner: windows-latest
+            msvc: x64
+            first: dll
+            second: comb1
+            shards: "3"
+    name: profile ${{ matrix.lane }} run ${{ matrix.run }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     env:
@@ -126,15 +144,21 @@ jobs:
       - name: One interleaved run of the pair
         shell: bash
         env:
-          RESULTS_BRANCH: diag-winfsp-overlap-results-${{ github.run_id }}-profile-${{ matrix.pair }}-${{ matrix.run }}
+          RESULTS_BRANCH: diag-winfsp-overlap-results-${{ github.run_id }}-profile-${{ matrix.lane }}-${{ matrix.run }}
         run: |
           {
-            echo "# profile pair ${{ matrix.pair }}, run ${{ matrix.run }}: dll $OLD_COMMIT (71cf09ac with the profile), comb $(git rev-parse HEAD); quiet only; $(date -u +%FT%TZ)"
+            echo "# profile pair ${{ matrix.lane }}, run ${{ matrix.run }}: dll $OLD_COMMIT (71cf09ac with the profile); shards ${{ matrix.shards }}, comb $(git rev-parse HEAD); quiet only; $(date -u +%FT%TZ)"
             tr -d '\r\000' < image.txt | sed 's/^\xef\xbb\xbf//'
             cmd //c ver | tr -d '\r' | grep -v '^$'
+            for arm in ${{ matrix.first }} ${{ matrix.second }}; do
+              echo "# $arm's measured profile:"
+              { "ab-bin/$arm/slates.exe" profile --quick --json || echo "# profile refused: exit $?"; } | tr -d '\r'
+              echo
+            done
+            echo "# shards: '${{ matrix.shards }}' (empty: each build's own derivation)"
             ARMS="${{ matrix.first }}=ab-bin/${{ matrix.first }}/slates.exe ${{ matrix.second }}=ab-bin/${{ matrix.second }}/slates.exe" \
-              BENCH=ab-bin/mount_bench.exe RUNS=1 SPINNERS_PER_CPU=2 PASS=quiet AFTER_RUN="$RUNNER_TEMP/publish.sh" \
-              bash docs/wip/bench/fsbench/windows-ab.sh
+              BENCH=ab-bin/mount_bench.exe RUNS=1 SPINNERS_PER_CPU=2 PASS=quiet SHARDS="${{ matrix.shards }}" \
+              AFTER_RUN="$RUNNER_TEMP/publish.sh" bash docs/wip/bench/fsbench/windows-ab.sh
           } 2>&1 | tee ab.txt
       - name: Publish whatever was measured
         if: always()
@@ -142,10 +166,10 @@ jobs:
         run: |
           if [ -f "$RUNNER_TEMP/publish.sh" ]; then bash "$RUNNER_TEMP/publish.sh"; fi
         env:
-          RESULTS_BRANCH: diag-winfsp-overlap-results-${{ github.run_id }}-profile-${{ matrix.pair }}-${{ matrix.run }}
+          RESULTS_BRANCH: diag-winfsp-overlap-results-${{ github.run_id }}-profile-${{ matrix.lane }}-${{ matrix.run }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: profile-${{ matrix.pair }}-${{ matrix.run }}
+          name: profile-${{ matrix.lane }}-${{ matrix.run }}
           path: ab.txt
 
