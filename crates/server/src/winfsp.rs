@@ -178,6 +178,32 @@ pub(crate) struct WinFspMount {
   detaching: bool,
   /// The anchor answered the release, so the mount's end asks nothing more of it.
   released: bool,
+  /// This volume's place in the daemon's own mounts (A-227), so no daemon thread opens a path on its drive; forgotten
+  /// when the mount is dropped. Held for its drop alone.
+  _own: OwnVolumeRecord,
+}
+
+/// A WinFsp volume's id in the process's set of its own mounts (`slates_base::own_mounts`, A-227): its kernel name's,
+/// the same name its drive letter's DOS device names, so a base path on the drive is refused before any open.
+struct OwnVolumeRecord(u64);
+
+impl OwnVolumeRecord {
+  fn of(volume: &[u16]) -> Result<Self, Refusal> {
+    let id = slates_base::own_mounts::volume_id(volume);
+    slates_base::own_mounts::record(id).map_err(|full| Refusal::TargetUnavailable {
+      reason: format!(
+        "the WinFsp volume is past the {} mounts this daemon records as its own",
+        full.capacity
+      ),
+    })?;
+    Ok(Self(id))
+  }
+}
+
+impl Drop for OwnVolumeRecord {
+  fn drop(&mut self) {
+    slates_base::own_mounts::forget(self.0);
+  }
 }
 
 /// The bounded held-ledger/image merge, one inode per owner turn. The held map has at most MAX_OPEN_HANDLES entries.
@@ -551,6 +577,15 @@ fn keep(
     "winfsp.ledger_quarantined",
     u64::try_from(ready.ledger.quarantined()).unwrap_or(u64::MAX),
   );
+  let own = match OwnVolumeRecord::of(&ready.offer.record.volume) {
+    Ok(own) => own,
+    Err(refusal) => {
+      drop(requests);
+      s.attachments.revoke(registry);
+      s.attachments.drain(registry);
+      return Err((refusal, thread));
+    }
+  };
   drop(ready.offer);
   s.winfsp_mounts.insert(
     record.id,
@@ -582,6 +617,7 @@ fn keep(
       purge_out: false,
       detaching: false,
       released: false,
+      _own: own,
     },
   );
   open_journal_reader(s, record.volume, registry);

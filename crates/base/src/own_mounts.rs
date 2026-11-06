@@ -168,6 +168,28 @@ fn fresh_tag() -> Result<u64, HostError> {
   Ok(0)
 }
 
+/// Format: FNV-1a's 64-bit offset basis and prime (Fowler, Noll, Vo; RFC draft-eastlake-fnv), over a volume name's
+/// UTF-16 units.
+#[cfg(windows)]
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+/// Format: see [`FNV_OFFSET`].
+#[cfg(windows)]
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// The id a WinFsp volume's kernel name (`\Device\Volume{…}`, up to its first NUL) is recorded under in the set
+/// (A-227): FNV-1a of its units, never zero. Two names that hash alike can only refuse a path wrongly, never admit
+/// one on this daemon's own volume.
+#[cfg(windows)]
+pub fn volume_id(name: &[u16]) -> u64 {
+  let hash = name
+    .iter()
+    .take_while(|unit| **unit != 0)
+    .fold(FNV_OFFSET, |hash, unit| {
+      (hash ^ u64::from(*unit)).wrapping_mul(FNV_PRIME)
+    });
+  hash.max(1)
+}
+
 #[cfg(target_os = "linux")]
 pub use linux::{check_child, check_child_in, mount_id_at, mount_id_of, open_checked_root};
 
@@ -195,6 +217,10 @@ mod linux {
 
   /// Format: the base of the mount table's escapes.
   const OCTAL: u32 = 8;
+
+  /// Format: the mount point is the fifth field of a mountinfo line, four past the mount id (proc(5): parent id,
+  /// device, root, mount point).
+  const POINT_AFTER_ID: usize = 3;
 
   /// Format: an escape's backslash and its three octal digits.
   const ESCAPE_BYTES: usize = 4;
@@ -277,7 +303,7 @@ mod linux {
   fn parse(line: &str) -> Option<Entry> {
     let mut fields = line.split(' ');
     let id = fields.next()?.parse::<u64>().ok()?;
-    let point = unescape(fields.nth(3)?);
+    let point = unescape(fields.nth(POINT_AFTER_ID)?);
     // The optional fields end at a lone `-`; then the type and the source.
     let mut rest = fields.skip_while(|field| *field != "-");
     rest.next()?;
