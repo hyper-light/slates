@@ -1,0 +1,109 @@
+runner windows-latest, 4 CPUs, Fri Nov  6 07:09:14 UTC 2026
+test a_socket_that_sent_to_a_closed_port_still_receives_from_a_live_peer ... FAILED
+thread 'a_socket_that_sent_to_a_closed_port_still_receives_from_a_live_peer' (9056) panicked at crates\rt\tests\udp.rs:721:3:
+assertion `left == right` failed: a bound socket
+  left: Err("a read after the unreachable send failed: the OS refused recvfrom (code Some(10054))")
+ right: Ok([108, 105, 118, 101])
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 11 filtered out; finished in 0.00s
+[1m[91merror[0m: test failed, to rerun pass `-p slates-rt --test udp`
+== red exit 101
+[1m[92m     Running[0m tests\udp.rs (target\debug\deps\udp-37b06604c0779d0c.exe)
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+== fix suite slates-rt --test udp exit 0
+[1m[92m     Running[0m unittests src\lib.rs (target\debug\deps\slates_rt-7304bb01e6b4d53b.exe)
+test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.60s
+== fix suite slates-rt --lib exit 0
+[1m[92m     Running[0m unittests src\lib.rs (target\debug\deps\slates_transport-ea894206483befdb.exe)
+test result: ok. 132 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.33s
+[1m[92m     Running[0m tests\admission.rs (target\debug\deps\admission-c0f4f4b4b6d742a3.exe)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.49s
+[1m[92m     Running[0m tests\amplification.rs (target\debug\deps\amplification-fa761fa075a335cf.exe)
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+[1m[92m     Running[0m tests\exchanges.rs (target\debug\deps\exchanges-7f776cc64b91e352.exe)
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.70s
+[1m[92m     Running[0m tests\handshake_levels.rs (target\debug\deps\handshake_levels-149e6973d2204f04.exe)
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+[1m[92m     Running[0m tests\key_update.rs (target\debug\deps\key_update-5d8454ef0d708124.exe)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+[1m[92m     Running[0m tests\session.rs (target\debug\deps\session-18004266fc7277a0.exe)
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.93s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+== fix suite slates-transport exit 0
+== live conf round 1 at 07:12:38 UTC
+[1m[93mwarning[0m: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' failed - Err(Error { kind: ToolExecError, message: "command did not execute successfully (status code exit code: 2): \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Enterprise\\\\VC\\\\Tools\\\\MSVC\\\\14.51.36231\\\\bin\\\\HostX64\\\\x64\\\\cl.exe\" \"-nologo\" \"-MD\" \"-Z7\" \"-Brepro\" \"-WX\" \"-W4\" \"-FoD:\\\\a\\\\slates\\\\src-conf\\\\../target-conf\\\\debug\\\\build\\\\aws-lc-sys-2c7cdad7ce755194\\\\out\\\\out-stdalign_check\\\\e1bacabfea35bee3-stdalign_check.o\" \"-c\" \"D:\\\\a\\\\slates\\\\src-conf
+xtask: the live fleet did not form within 40s: [Some((9099335792146815092, 3, 1)), Some((347456051648783423, 3, 0)), Some((15232067082720114898, 3, 1))]
+[1m[91merror[0m: process didn't exit successfully: `../target-conf\debug\xtask.exe conformance run --suite fsx --live-ship --records ../live-conf-1/records --scratch ../live-conf-1/scratch --keep` (exit code: 1)
+  anchor-conf-fsx-a-9788.log: slates daemon: fleet node `a` of `slates-fleet`: member 3625177056830789064 with 2 peer(s) at f = 1
+  anchor-conf-fsx-a-9788.log: slates daemon: fleet_sessions_per_plane = 1986: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+  anchor-conf-fsx-a-9788.log: slates daemon: fleet_session_receive_bytes = 120107: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+  anchor-conf-fsx-a-9788.log: slates daemon: read_ahead_bytes = 79510834: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+  anchor-conf-fsx-a-9788.log: slates daemon: fleet_tasks_per_shard = 5301: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+  anchor-conf-fsx-b-9788.log: slates daemon: fleet node `b` of `slates-fleet`: member 9535342658921165343 with 2 peer(s) at f = 1
+  anchor-conf-fsx-b-9788.log: slates daemon: fleet_sessions_per_plane = 1986: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+  anchor-conf-fsx-b-9788.log: slates daemon: fleet_session_receive_bytes = 120107: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+  anchor-conf-fsx-b-9788.log: slates daemon: read_ahead_bytes = 79510834: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+  anchor-conf-fsx-b-9788.log: slates daemon: fleet_tasks_per_shard = 5301: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+  anchor-conf-fsx-c-9788.log: slates daemon: fleet node `c` of `slates-fleet`: member 8794256531062395087 with 2 peer(s) at f = 1
+  anchor-conf-fsx-c-9788.log: slates daemon: fleet_sessions_per_plane = 1986: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+  anchor-conf-fsx-c-9788.log: slates daemon: fleet_session_receive_bytes = 120107: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+  anchor-conf-fsx-c-9788.log: slates daemon: read_ahead_bytes = 79510834: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+  anchor-conf-fsx-c-9788.log: slates daemon: fleet_tasks_per_shard = 5301: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+== live conf round 1 exit 1
+== live conffix round 1 at 07:17:02 UTC
+[1m[93mwarning[0m: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' failed - Err(Error { kind: ToolExecError, message: "command did not execute successfully (status code exit code: 2): \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Enterprise\\\\VC\\\\Tools\\\\MSVC\\\\14.51.36231\\\\bin\\\\HostX64\\\\x64\\\\cl.exe\" \"-nologo\" \"-MD\" \"-Z7\" \"-Brepro\" \"-WX\" \"-W4\" \"-FoD:\\\\a\\\\slates\\\\src-conffix\\\\../target-conffix\\\\debug\\\\build\\\\aws-lc-sys-2c7cdad7ce755194\\\\out\\\\out-stdalign_check\\\\e1bacabfea35bee3-stdalign_check.o\" \"-c\" \"D:\\\\a\\\\slates\\\\sr
+conformance: native-windows-winfsp × fsx: RAN(10000 operations, seed 1, file length 262144: FAILED, judged against `docs/wip/conformance/expected-failures/native-windows-winfsp.fsx.txt` (1 listed); 2026-11-06; Microsoft Windows [Version 10.0.26100.33674])
+  anchor-conf-fsx-a-7976.log: slates daemon: fleet node `a` of `slates-fleet`: member 14451638442635842519 with 2 peer(s) at f = 1
+  anchor-conf-fsx-a-7976.log: slates daemon: fleet_sessions_per_plane = 1986: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+  anchor-conf-fsx-a-7976.log: slates daemon: fleet_session_receive_bytes = 120107: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+  anchor-conf-fsx-a-7976.log: slates daemon: read_ahead_bytes = 79510834: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+  anchor-conf-fsx-a-7976.log: slates daemon: fleet_tasks_per_shard = 5301: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+  anchor-conf-fsx-b-7976.log: slates daemon: fleet node `b` of `slates-fleet`: member 1611230746192329560 with 2 peer(s) at f = 1
+  anchor-conf-fsx-b-7976.log: slates daemon: fleet_sessions_per_plane = 1986: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+  anchor-conf-fsx-b-7976.log: slates daemon: fleet_session_receive_bytes = 120107: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+  anchor-conf-fsx-b-7976.log: slates daemon: read_ahead_bytes = 79510834: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+  anchor-conf-fsx-b-7976.log: slates daemon: fleet_tasks_per_shard = 5301: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+  anchor-conf-fsx-c-7976.log: slates daemon: fleet node `c` of `slates-fleet`: member 13377586130960315613 with 2 peer(s) at f = 1
+  anchor-conf-fsx-c-7976.log: slates daemon: fleet_sessions_per_plane = 1986: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+  anchor-conf-fsx-c-7976.log: slates daemon: fleet_session_receive_bytes = 120107: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+  anchor-conf-fsx-c-7976.log: slates daemon: read_ahead_bytes = 79510834: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+  anchor-conf-fsx-c-7976.log: slates daemon: fleet_tasks_per_shard = 5301: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+== live conffix round 1 exit 0
+== live conf round 2 at 07:25:27 UTC
+[1m[93mwarning[0m: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' failed - Err(Error { kind: ToolExecError, message: "command did not execute successfully (status code exit code: 2): \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Enterprise\\\\VC\\\\Tools\\\\MSVC\\\\14.51.36231\\\\bin\\\\HostX64\\\\x64\\\\cl.exe\" \"-nologo\" \"-MD\" \"-Z7\" \"-Brepro\" \"-WX\" \"-W4\" \"-FoD:\\\\a\\\\slates\\\\src-conf\\\\../target-conf\\\\debug\\\\build\\\\aws-lc-sys-2c7cdad7ce755194\\\\out\\\\out-stdalign_check\\\\e1bacabfea35bee3-stdalign_check.o\" \"-c\" \"D:\\\\a\\\\slates\\\\src-conf
+xtask: volume create exited 1: slates: refused: ConsensusNotInitialized: this node has no consensus group yet. Create it once with `slates bootstrap root`, or, on a fleet node, wait for it to import the groups.
+[1m[91merror[0m: process didn't exit successfully: `../target-conf\debug\xtask.exe conformance run --suite fsx --live-ship --records ../live-conf-2/records --scratch ../live-conf-2/scratch --keep` (exit code: 1)
+  anchor-conf-fsx-a-9716.log: slates daemon: fleet node `a` of `slates-fleet`: member 2587385093312307671 with 2 peer(s) at f = 1
+  anchor-conf-fsx-a-9716.log: slates daemon: fleet_sessions_per_plane = 1986: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+  anchor-conf-fsx-a-9716.log: slates daemon: fleet_session_receive_bytes = 120107: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+  anchor-conf-fsx-a-9716.log: slates daemon: read_ahead_bytes = 79510834: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+  anchor-conf-fsx-a-9716.log: slates daemon: fleet_tasks_per_shard = 5301: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+  anchor-conf-fsx-b-9716.log: slates daemon: fleet node `b` of `slates-fleet`: member 3530385937567898812 with 2 peer(s) at f = 1
+  anchor-conf-fsx-b-9716.log: slates daemon: fleet_sessions_per_plane = 1986: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+  anchor-conf-fsx-b-9716.log: slates daemon: fleet_session_receive_bytes = 120107: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+  anchor-conf-fsx-b-9716.log: slates daemon: read_ahead_bytes = 79510834: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+  anchor-conf-fsx-b-9716.log: slates daemon: fleet_tasks_per_shard = 5301: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+  anchor-conf-fsx-c-9716.log: slates daemon: fleet node `c` of `slates-fleet`: member 5199564255689348109 with 2 peer(s) at f = 1
+  anchor-conf-fsx-c-9716.log: slates daemon: fleet_sessions_per_plane = 1986: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+  anchor-conf-fsx-c-9716.log: slates daemon: fleet_session_receive_bytes = 120107: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+  anchor-conf-fsx-c-9716.log: slates daemon: read_ahead_bytes = 79510834: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+  anchor-conf-fsx-c-9716.log: slates daemon: fleet_tasks_per_shard = 5301: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+== live conf round 2 exit 1
+== live conffix round 2 at 07:26:33 UTC
+[1m[93mwarning[0m: aws-lc-sys@0.45.0: Compilation of 'stdalign_check.c' failed - Err(Error { kind: ToolExecError, message: "command did not execute successfully (status code exit code: 2): \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Enterprise\\\\VC\\\\Tools\\\\MSVC\\\\14.51.36231\\\\bin\\\\HostX64\\\\x64\\\\cl.exe\" \"-nologo\" \"-MD\" \"-Z7\" \"-Brepro\" \"-WX\" \"-W4\" \"-FoD:\\\\a\\\\slates\\\\src-conffix\\\\../target-conffix\\\\debug\\\\build\\\\aws-lc-sys-2c7cdad7ce755194\\\\out\\\\out-stdalign_check\\\\e1bacabfea35bee3-stdalign_check.o\" \"-c\" \"D:\\\\a\\\\slates\\\\sr
+conformance: native-windows-winfsp × fsx: RAN(10000 operations, seed 1, file length 262144: FAILED, judged against `docs/wip/conformance/expected-failures/native-windows-winfsp.fsx.txt` (1 listed); 2026-11-06; Microsoft Windows [Version 10.0.26100.33674])
+  anchor-conf-fsx-a-2196.log: slates daemon: fleet node `a` of `slates-fleet`: member 5163492809193783487 with 2 peer(s) at f = 1
+  anchor-conf-fsx-a-2196.log: slates daemon: fleet_sessions_per_plane = 1986: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+  anchor-conf-fsx-a-2196.log: slates daemon: fleet_session_receive_bytes = 120107: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+  anchor-conf-fsx-a-2196.log: slates daemon: read_ahead_bytes = 79510834: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+  anchor-conf-fsx-a-2196.log: slates daemon: fleet_tasks_per_shard = 5301: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+  anchor-conf-fsx-b-2196.log: slates daemon: fleet node `b` of `slates-fleet`: member 2576937658233895112 with 2 peer(s) at f = 1
+  anchor-conf-fsx-b-2196.log: slates daemon: fleet_sessions_per_plane = 1986: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+  anchor-conf-fsx-b-2196.log: slates daemon: fleet_session_receive_bytes = 120107: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+  anchor-conf-fsx-b-2196.log: slates daemon: read_ahead_bytes = 79510834: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+  anchor-conf-fsx-b-2196.log: slates daemon: fleet_tasks_per_shard = 5301: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+  anchor-conf-fsx-c-2196.log: slates daemon: fleet node `c` of `slates-fleet`: member 9919210364494598807 with 2 peer(s) at f = 1
+  anchor-conf-fsx-c-2196.log: slates daemon: fleet_sessions_per_plane = 1986: SESSION_SLOTS_PER_PEER × fleet_peer_capacity (anchors ["fleet.peers"])
+  anchor-conf-fsx-c-2196.log: slates daemon: fleet_session_receive_bytes = 120107: reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window (anchors ["reserve_per_shard", "fleet.peers"])
+  anchor-conf-fsx-c-2196.log: slates daemon: read_ahead_bytes = 79510834: fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share) (anchors ["fleet_session_receive_bytes", "fleet.peers"])
+  anchor-conf-fsx-c-2196.log: slates daemon: fleet_tasks_per_shard = 5301: peers × FLEET_LOOPS_PER_PEER + fleet_sessions_per_plane × FLEET_PLANES + FLEET_LOOPS_PER_SHARD (anchors ["fleet.peers", "fleet_sessions_per_plane"])
+== live conffix round 2 exit 0
