@@ -2928,8 +2928,9 @@ Anything that needs a client of a slates volume (a measurement, a check) runs th
   (`crates/bridge-winfsp/src/purge_client.rs`). The command thread only writes to the pipe and reads the answer, which
   a dying thread's cancellation ends at once. Proven by `a_daemon_killed_while_its_purges_open_is_delivered_exits_within_a_transaction_timeout`
   (A-190's amendment of 2026-11-06).
-- **Still open, found by the sweep of 2026-11-06 (GAPS):** a base directory, a landing's target and a FUSE mount point
-  are host paths the daemon opens itself, and none is refused when it lies on a mount this daemon serves.
+- **A base directory, a landing's target and a FUSE mount point (A-227).** The sweep of 2026-11-06 found three host
+  paths the daemon opens itself. Each is now refused, before any open, when it lies on a mount this daemon serves, and
+  every crossing below a base is checked. Built and proven on Linux; Windows and macOS are owed (GAPS).
 
 **Base reads on macOS and Windows.** As on Linux, the daemon reads untouched base files through its own descriptor or
 handle into evictable cache chunks (one copy, `pread`/`ReadFile` on the owner shard's driver) and
@@ -13969,6 +13970,13 @@ own-mount records, `check_mount_point`, the refusals' mapping), `crates/bridge-w
     with recorded mount points (symlinks, relative paths and junctions defeat it); the anchor answering for the
     daemon's mounts (a base open would depend on it); WinFsp's volume prefix (network-mode file systems only).
 - **Cost** is measured on the base plane's lookups, A/B, every N shown, loaded, and recorded in BENCHMARKS.
+- **Built on Linux (2026-11-06).** Red on main (one shard; CI run 42161480656 on ubuntu-latest, and adacachy): the
+  base and the landing target got "no reply within 1000000000 ns" (the shard waited on its own mount), and the FUSE
+  mount point was refused untyped (its `statat` that run was answered from the kernel's cache of the directory just
+  made, so it hangs only when that cache has expired). Green under the fix (CI run 42161730984): the three tests, and
+  the CLI's whole Linux flow, 83 passed. The cost: a listing of files unchanged, a checked open 1.25 µs more
+  (BENCHMARKS, "The own-mount check on the base plane's lookups"). Owed: Windows' registry and walk, and macOS, whose
+  NFS source is `slates:/<volume name>` and names no daemon, so its identity is still to be chosen.
 
 ### A-198 — A WinFsp mount outlives its daemon: the anchor holds the volume's control handle, the drive's link and the mount's ledger, and the next daemon serves the held volume (accepted 2026-11-01, Step 9 of the VFS and DAX plan; built and measured 2026-11-02)
 Applied in the same change to: GAPS (gap 2 of the platform inventory). The build applies it to §4.6 "Windows",

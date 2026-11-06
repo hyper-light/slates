@@ -169,7 +169,7 @@ fn fresh_tag() -> Result<u64, HostError> {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{check_child, mount_id_at, mount_id_of, open_checked_root};
+pub use linux::{check_child, check_child_in, mount_id_at, mount_id_of, open_checked_root};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -320,10 +320,24 @@ mod linux {
   /// it: the entry is opened `O_PATH | O_NOFOLLOW` (no filesystem code runs) and its mount compared with `dir`'s. An entry
   /// that is not there is no crossing; the caller's own open reports it.
   pub fn check_child(dir: BorrowedFd<'_>, name: &OsStr) -> Result<(), HostError> {
+    check_child_in(dir, mount_id_of(dir)?, name)
+  }
+
+  /// [`check_child`] for a directory whose mount id the caller already holds (read once when it opened `dir`), so a
+  /// lookup costs one `O_PATH` open and one fdinfo read.
+  pub fn check_child_in(
+    dir: BorrowedFd<'_>,
+    dir_mount: u64,
+    name: &OsStr,
+  ) -> Result<(), HostError> {
     let Some(child) = open_path(dir, name)? else {
       return Ok(());
     };
-    crossing(dir, child.as_fd())
+    let below = mount_id_of(child.as_fd())?;
+    if below != dir_mount && is_own(below) {
+      return Err(refusal());
+    }
+    Ok(())
   }
 
   /// The entry opened `O_PATH | O_NOFOLLOW`, or `None` when it is not there.

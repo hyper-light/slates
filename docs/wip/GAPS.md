@@ -1,5 +1,17 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A path on a volume this daemon serves is refused before any open (A-227, 2026-11-06): Linux built, Windows and
+> macOS open.** A base directory and every lookup below it, a landing's target and a FUSE mount point are refused
+> typed (`HostError::OwnMount`, `TargetRefusal::OwnMount`, the wire's `Refusal::OwnMount`) when they lie on a mount
+> this daemon serves. On Linux each component is opened `O_PATH` and its mount id read from procfs, and compared with a
+> lock-free bounded set of this daemon's own mount ids. A FUSE mount's source is now `slates:<tag>`, a per-start
+> random value. Red on main: CI run 42161480656 (a one-shard daemon waited on itself). Green: run 42161730984, with the
+> CLI's whole Linux flow. A checked base open costs 1.25 µs more (BENCHMARKS). Open:
+> - **Windows:** the registry of this daemon's WinFsp volume device names and the root path's walk (junctions followed
+>   by hand), with the red tests on CI.
+> - **macOS:** the NFS source `slates:/<volume name>` names no daemon, so the identity `getfsstat` would compare is
+>   still to be chosen (a decision).
+
 > **A-190's purge client leaves the daemon's process (2026-11-06, fixed); the sweep for the rest (open).** No daemon
 > thread opens a path on a volume the daemon serves (§4.6). The coherent purge's opens, writes and reads now run in a
 > child process of the daemon's own binary (`slates winfsp-purge-client`), in a kill-on-close job, asked over a pipe
@@ -9,6 +21,7 @@
 > after the anchor let the volume go (run 42155020781), and nor did the fix with the in-process open put back (run
 > 42155197023). The sweep found three more places a daemon thread opens a host path it does not check against its own mounts.
 > Each is open, and each is a hang or a stranded exit only when that path lies on a volume this daemon serves:
+> - **Built on Linux by A-227 (the entry above); Windows and macOS open there.**
 > - **A base directory** (`OsHost::open_root`, `crates/server/src/verbs.rs` `open_base` and the recovery's reacquire):
 >   a volume over a base on a slates drive or mount this daemon serves is read by its shard threads through that mount,
 >   for every lookup and read of the base.

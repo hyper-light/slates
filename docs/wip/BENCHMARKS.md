@@ -2157,6 +2157,29 @@ item), a block naming its buffer by class and handle: XFS's progression from in-
 forms (Sweeney et al., USENIX 1996) without the global allocator. Built 2026-11-05 (A-203, "Directory blocks in size
 classes" above): AC-1.5 350,460,030 → 292,914,814 B.
 
+### The own-mount check on the base plane's lookups (§4.6, A-227; 2026-11-06, Linux)
+
+Every lookup below a base now opens the entry `O_PATH | O_NOFOLLOW` and reads its mount id from `/proc/self/fdinfo`
+before anything else touches it (A-227). Measured with `cargo build --release -p slates-base --example base_bench` at
+A = main `28359a75` and B = `agents/slabs-siblings` (the check, with each directory's mount id read once and a
+listing's file entries left unchecked), both over one directory of 810 files (alternating 4 KiB and 128 KiB, made for
+the run, since the bench's `target/debug/deps` is not under a kiln copy). adacachy (AMD Ryzen 9 9950X3D2, 32 threads,
+Linux 7.2.9-2-cachyos), loaded by other agents' CI builds: 1-minute load 62 to 85. Five rounds, A then B; each run's
+median in ns:
+
+| row | A (main) | B (the check) |
+|---|---|---|
+| list, per entry | 256, 270, 264, 258, 256 | 261, 261, 255, 254, 269 |
+| open and `fstat` a file | 501, 498, 503, 506, 498 | 1,764, 1,753, 1,753, 1,743, 1,774 |
+| `pread` 4 KiB | 85, 97, 86, 85, 83 | 86, 88, 87, 87, 86 |
+| fingerprint a directory | 89, 88, 88, 87, 88 | 88, 89, 88, 87, 88 |
+
+A checked open costs 1.25 µs more at the median (an `O_PATH` open and one fdinfo read), 3.5 times the open alone. A
+listing of files costs the same. A directory entry in a listing pays about the same as an open, which this directory
+(no subdirectories) does not show. The first form read the parent's mount id at every lookup and checked every listed
+entry: 2,699 to 2,983 ns a listed entry and 2,705 to 4,098 ns an open (five rounds each, load 78 to 107), and was
+replaced the same day.
+
 ### Directory blocks in size classes (§4.5, AC-1.5, AC-1.8, A-203; 2026-11-05) — adopted
 
 Owed since "Directory blocks against real trees" below. A block is the smallest of 17 classes, 256 B to 4 KiB, four to
