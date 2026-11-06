@@ -350,7 +350,8 @@ pub async fn call_within<T: Send + 'static>(
 /// bounded work, A-188), which [`call_within`]'s closure, run in one turn, cannot be. The future is made on the target, so
 /// it may hold what is not `Send` across its turns; only its result crosses back. `None` as [`call_within`] answers, and
 /// when the target's task arena refused the task. A late result is dropped, as `call_within`'s is, while the task runs
-/// to its end on its shard. A call to this shard runs the future here.
+/// to its end on its shard. A call to this shard is the same task, spawned here: it too runs
+/// to its end however long it takes, so dropping it never loses what the future holds mid-way (§4.3).
 pub async fn task_within<T, F>(
   origin: u16,
   shard: u16,
@@ -361,13 +362,24 @@ where
   T: Send + 'static,
   F: Future<Output = T> + 'static,
 {
-  if shard == origin {
-    return slates_rt::futures::within(deadline_ns, start())
-      .await
-      .ok()
-      .flatten();
-  }
   let id = register();
+  if shard == origin {
+    // A call to this shard is a task here, carrying its result home like any other: dropped at the deadline in place,
+    // the future lost whatever it held mid-way (a live dispatch's borrowed sessions, which were never returned).
+    if !spawn_carrying_home(origin, id, start) {
+      forget(id);
+      return None;
+    }
+    return within(
+      CrossShardCall {
+        id: Some(id),
+        ready: None,
+        _thread: PhantomData,
+      },
+      deadline_ns,
+    )
+    .await;
+  }
   let task = SpawnRequest::new(
     Box::pin(async move {
       if !spawn_carrying_home(origin, id, start) {
@@ -477,6 +489,56 @@ mod tests {
       "the result's message arrived once there was room"
     );
     drop(registration);
+    daemon.stop();
+  }
+
+  /// §4.3 cancellation safety, the same on every shard (R8). Do: on a shard, from a task there, make a `task_within`
+  /// call to that same shard whose future parks past the call's deadline and then reports that it ended. Expect the
+  /// call answered `None` at its deadline and the future run to its end anyway, as a call to another shard runs. Until
+  /// 2026-11-06 a call to its own shard dropped the future at the deadline: a live dispatch on the control shard
+  /// (`live_ship::send_from_control`) was dropped mid-exchange, the fleet sessions it had borrowed were never returned
+  /// nor their links dropped, and an owner sent to no candidate again (`crates/cli/tests/live_chaos.rs`, the rolling
+  /// partition: both of the owner's sessions `lent=true` for good, a write never answered).
+  #[test]
+  // The test thread waits off-shard for what the shard's task reports.
+  #[allow(clippy::disallowed_methods)]
+  fn a_call_to_its_own_shard_runs_its_future_to_the_end_past_the_deadline() {
+    /// Shape: the call's deadline, a few timer ticks.
+    const DEADLINE_NS: u64 = 5_000_000;
+    /// Shape: how long the future parks: well past the deadline.
+    const PARKED_NS: u64 = 50_000_000;
+    /// Shape: how long the test thread waits for each report.
+    const REPORT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+    let daemon = crate::daemon::audit_daemon();
+    let (ended, ended_seen) = std::sync::mpsc::sync_channel::<()>(1);
+    let (answered, answer_seen) = std::sync::mpsc::sync_channel::<bool>(1);
+    crate::daemon::observe_first(&daemon, move |state| {
+      let home = state.shard;
+      let caller = slates_rt::futures::spawn(async move {
+        let answer = task_within(
+          home,
+          home,
+          move || async move {
+            let _ = slates_rt::futures::sleep(PARKED_NS).await;
+            let _ = ended.try_send(());
+          },
+          DEADLINE_NS,
+        )
+        .await;
+        let _ = answered.try_send(answer.is_some());
+      })
+      .unwrap();
+      slates_rt::futures::detach(caller).unwrap();
+    });
+    assert_eq!(
+      answer_seen.recv_timeout(REPORT_WAIT),
+      Ok(false),
+      "the call answered None at its deadline"
+    );
+    assert!(
+      ended_seen.recv_timeout(REPORT_WAIT).is_ok(),
+      "the future ran to its end past the call's deadline"
+    );
     daemon.stop();
   }
 
