@@ -1,0 +1,69 @@
+tested 2dd9d4dca0cce65d8e0314d379b29a3693b9fc51 on aarch64, 4 cpus, load 0.59 0.20 0.07
+fmt exit 0 5s
+clippy exit 0 67s
+xtask exit 0 47s
+forward-1 exit 0 68s
+  forward-1: the forward of a read on a free shard took 1.584513ms while another forward to its owner waited out a 500ms hold; b's fleet counters Ok({"content.purged_bytes": 696492032, "fleet.discovery.pages": 13, "fleet.fan.sent": 3, "fleet.fan.unchanged": 12, "fleet.forward.begun": 4, "fleet.forward.taken_for_another": 1, "fleet.learner.fetch_paced": 8, "fleet.learner.fetches": 2, "fleet.owner_location.direct": 4, "fleet.plane.announce_lends": 4, "fleet.plane.announcements_sent": 4})
+  forward-1: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 90 filtered out; finished in 1.93s
+forward-2 exit 0 2s
+  forward-2: the forward of a read on a free shard took 1.514309ms while another forward to its owner waited out a 500ms hold; b's fleet counters Ok({"content.purged_bytes": 696492032, "fleet.discovery.pages": 13, "fleet.fan.sent": 3, "fleet.fan.unchanged": 12, "fleet.forward.begun": 4, "fleet.forward.taken_for_another": 1, "fleet.learner.fetch_paced": 8, "fleet.learner.fetches": 2, "fleet.owner_location.direct": 4, "fleet.plane.announce_lends": 4, "fleet.plane.announcements_sent": 4})
+  forward-2: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 90 filtered out; finished in 1.94s
+forward-3 exit 0 2s
+  forward-3: the forward of a read on a free shard took 5.481296ms while another forward to its owner waited out a 500ms hold; b's fleet counters Ok({"content.purged_bytes": 696492032, "fleet.discovery.pages": 13, "fleet.fan.sent": 3, "fleet.fan.unchanged": 13, "fleet.forward.begun": 4, "fleet.forward.taken_for_another": 1, "fleet.learner.fetch_paced": 2, "fleet.learner.fetches": 1, "fleet.owner_location.direct": 4, "fleet.plane.announce_lends": 4, "fleet.plane.announcements_sent": 4})
+  forward-3: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 90 filtered out; finished in 2.03s
+fleet exit 0 347s
+  fleet: test result: ok. 88 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 346.48s
+client exit 0 61s
+  client: test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  client: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.36s
+  client: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s
+  client: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.81s
+  client: test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.76s
+  client: test result: ok. 3 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 2.31s
+  client: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.41s
+  client: test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.67s
+  client: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.65s
+  client: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+  client: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+  client: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.34s
+  client: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.37s
+  client: test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.35s
+  client: test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.51s
+  client: test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+transport-cluster exit 0 182s
+  transport-cluster: test result: ok. 213 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.57s
+  transport-cluster: test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+  transport-cluster: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+  transport-cluster: test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+  transport-cluster: test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+  transport-cluster: test result: ok. 1 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 49.00s
+  transport-cluster: test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+  transport-cluster: test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.12s
+  transport-cluster: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+  transport-cluster: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+  transport-cluster: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+  transport-cluster: test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
+  transport-cluster: test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 4.63s
+  transport-cluster: test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 5.65s
+  transport-cluster: test result: ok. 1 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 1.67s
+  transport-cluster: test result: ok. 1 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 53.84s
+  transport-cluster: test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.03s
+  transport-cluster: test result: ok. 4 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 7.50s
+  transport-cluster: test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  transport-cluster: test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  transport-cluster: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+  transport-cluster: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+  transport-cluster: test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s
+  transport-cluster: test result: ok. 3 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 1.38s
+  transport-cluster: test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 4.13s
+  transport-cluster: test result: ok. 132 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.23s
+  transport-cluster: test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+  transport-cluster: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+  transport-cluster: test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.39s
+  transport-cluster: test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+  transport-cluster: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+  transport-cluster: test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.08s
+  transport-cluster: test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+  transport-cluster: test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+server-lib exit 0 27s
+  server-lib: test result: ok. 193 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 1.08s
