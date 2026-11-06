@@ -164,3 +164,9 @@ slates-winfsp: reply spin window = 9900 ns: the median one-way channel wake of 1
 slates-winfsp: reply spin window = 7600 ns: the median one-way channel wake of 15 (the 2-competitive spin)
 slates-winfsp: receive worker 1 serves, after the probe
 ## run 1 of 1 done, 2026-11-06T05:38:41Z
+remote: 
+remote: Create a pull request for 'diag-winfsp-overlap-results-42165934408-arm-dll-comb2-1' on GitHub by visiting:        
+remote:      https://github.com/hyper-light/slates/pull/new/diag-winfsp-overlap-results-42165934408-arm-dll-comb2-1        
+remote: 
+To https://github.com/hyper-light/slates
+ * [new branch]      fe7ccdb9c5f8c5693f28fa8377e6daacb6f45d70 -> diag-winfsp-overlap-results-42165934408-arm-dll-comb2-1
