@@ -19,6 +19,9 @@
 #[path = "../../server/tests/common/nfs.rs"]
 #[allow(dead_code)]
 mod nfs;
+#[path = "../../server/tests/common/nfs4.rs"]
+#[allow(dead_code)]
+mod nfs4;
 
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -1885,4 +1888,151 @@ fn a_checkout_into_a_live_volume_answers_only_once_a_candidate_holds_it() {
   assert_eq!(code, 0, "checkout: {err}");
   let checkout: serde_json::Value = serde_json::from_str(&out).unwrap();
   assert_eq!(checkout["version"], 1, "{out}");
+}
+
+/// Format: `NFS4ERR_DELAY` (RFC 8881 §15.1.1.3), the "try again" a v4 client is told; the same value as NFSv3's
+/// `NFS3ERR_JUKEBOX`.
+const NFS4ERR_DELAY: u32 = 10008;
+/// Format: `stable_how4`'s `UNSTABLE4` and `FILE_SYNC4` (RFC 8881 §18.32.1).
+const UNSTABLE4: u32 = 0;
+/// Format: see [`UNSTABLE4`].
+const FILE_SYNC4: u32 = 2;
+
+/// One NFSv4.2 `WRITE` of `data` at `offset` to `file` under the mount `capability`, `stable` as asked, with the
+/// anonymous state id (RFC 8881 §8.2.3): the result body or the failing status, and how long it took.
+fn v4_write(
+  session: &mut nfs4::Session,
+  (capability, file): (&str, &str),
+  (offset, stable): (u64, u32),
+  data: &[u8],
+) -> (Result<Vec<u8>, u32>, Duration) {
+  let began = Instant::now();
+  let written = session.at(capability, &[file], |args| {
+    args.u32(slates_bridge_nfs::v4::compound::op::WRITE);
+    args.u32(0);
+    args.fixed(&[0u8; 12]);
+    args.u64(offset);
+    args.u32(stable);
+    args.opaque(data);
+  });
+  (written, began.elapsed())
+}
+
+/// One NFSv4.2 `COMMIT` of the whole of `file` under the mount `capability`: the result body or the failing status,
+/// and how long it took.
+fn v4_commit(
+  session: &mut nfs4::Session,
+  (capability, file): (&str, &str),
+) -> (Result<Vec<u8>, u32>, Duration) {
+  let began = Instant::now();
+  let committed = session.at(capability, &[file], |args| {
+    args.u32(slates_bridge_nfs::v4::compound::op::COMMIT);
+    args.u64(0);
+    args.u32(0);
+  });
+  (committed, began.elapsed())
+}
+
+/// A-200 over NFSv4.2 (A-35): the v4 front end serves `WRITE` and `COMMIT` through the NFSv3 procedures, so they wait
+/// as NFSv3's do (`stable_once_durable`), and this holds them to it. Do: export a live volume, create a file over NFSv3,
+/// open a v4 session; write `UNSTABLE` and `COMMIT` healthy; stop both candidates' processes, write `UNSTABLE` and
+/// `COMMIT`, then write `FILE_SYNC`; resume them and `COMMIT` again. Expect: healthy, both succeed; stopped, the
+/// `UNSTABLE` write succeeds (it claims nothing) while the `COMMIT` and the `FILE_SYNC` write each answer
+/// `NFS4ERR_DELAY`, never `NFS4_OK` (the `COMMIT` by the durability wait, after the liveness budget); resumed, the
+/// `COMMIT` succeeds once the lease is confirmed again.
+#[test]
+fn an_nfs_v4_commit_and_stable_write_to_a_live_volume_answer_only_once_a_candidate_holds_them() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live-shipping NFSv4 flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-nfs4");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = fleet.instances[owner_index].clone();
+  let id = create_live_volume(&owner, "nfs4-shipped");
+  let (code, out, err) = run(&owner, &["export", &id, "--json"]);
+  assert_eq!(code, 0, "export: {err}");
+  let (path, port) = (json_field(&out, "path"), json_field(&out, "port"));
+  let port = port.parse::<u16>().unwrap();
+  let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+  stream.set_read_timeout(Some(FLEET_WAIT)).unwrap();
+  let root = nfs::mount(&mut stream, &path, 1);
+  nfs::create(&mut stream, &root, "v4", 2);
+  let mut session =
+    nfs4::Session::open(port, format!("live-nfs4-{}", std::process::id()).as_bytes());
+  let file = (path.as_str(), "v4");
+  let healthy_write = v4_write(&mut session, file, (0, UNSTABLE4), b"held by a candidate");
+  let healthy = v4_commit(&mut session, file);
+  let candidates: Vec<usize> = (0..fleet.daemons.len())
+    .filter(|index| *index != owner_index)
+    .collect();
+  for index in &candidates {
+    signal(&fleet.daemons[*index], rustix::process::Signal::STOP);
+  }
+  let unstable = v4_write(&mut session, file, (19, UNSTABLE4), b", then by no one");
+  let alone = v4_commit(&mut session, file);
+  let stable = v4_write(&mut session, file, (35, FILE_SYNC4), b", nor this");
+  let late = counter(&owner, "fleet.live.durable_late");
+  for index in &candidates {
+    signal(&fleet.daemons[*index], rustix::process::Signal::CONT);
+  }
+  // Resumed, the owner's lease is confirmed again within a heartbeat or two, and until then every call is told to try
+  // again (the live-tree fence, AUD-29-83), so the COMMIT is retried as a v4 client retries `NFS4ERR_DELAY`.
+  let deadline = Instant::now() + FLEET_WAIT;
+  let resumed = loop {
+    let committed = v4_commit(&mut session, file);
+    if committed.0 != Err(NFS4ERR_DELAY) || Instant::now() >= deadline {
+      break committed;
+    }
+    pause();
+  };
+  let counters = live_counters(&owner);
+  drop(stream);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  let status =
+    |outcome: &(Result<Vec<u8>, u32>, Duration)| (outcome.0.as_ref().err().copied(), outcome.1);
+  eprintln!(
+    "live nfs4: healthy write {:?} commit {:?}; candidates stopped: unstable write {:?}, commit {:?}, stable write \
+     {:?}; resumed commit {:?}; owner's live counters {counters:?}",
+    status(&healthy_write),
+    status(&healthy),
+    status(&unstable),
+    status(&alone),
+    status(&stable),
+    status(&resumed)
+  );
+  assert!(
+    healthy_write.0.is_ok() && healthy.0.is_ok(),
+    "a COMMIT a candidate holds succeeds"
+  );
+  assert!(
+    unstable.0.is_ok(),
+    "an UNSTABLE write claims nothing, so it is answered"
+  );
+  assert_eq!(
+    alone.0.err(),
+    Some(NFS4ERR_DELAY),
+    "a COMMIT no candidate can hold is told to try again"
+  );
+  // The non-vacuity counter: the COMMIT was told so by the durability wait, not by the lease's fence, which answers
+  // every call once the stopped candidates' confirmations lapse.
+  assert!(
+    late >= 1,
+    "the COMMIT waited for durability and was answered late: {late}"
+  );
+  // The FILE_SYNC write is told to try again by the durability wait or, once the lease lapsed, by the fence: either way
+  // never `NFS4_OK`.
+  assert_eq!(
+    stable.0.err(),
+    Some(NFS4ERR_DELAY),
+    "so is a FILE_SYNC write"
+  );
+  assert!(
+    resumed.0.is_ok(),
+    "once the candidates are back, COMMIT succeeds: {:?}",
+    status(&resumed)
+  );
 }
