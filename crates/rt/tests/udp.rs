@@ -673,3 +673,50 @@ fn a_send_under_local_pressure_waits_for_writability_and_sends_once() {
     "the datagram arrived exactly once"
   );
 }
+
+/// AC (§4.10a; the fleet's probe and record planes ride unconnected datagram sockets): do send from a socket to a
+/// loopback port nothing is bound to, as a fleet node's first probe of a peer that has not started yet does, wait for the
+/// port-unreachable answer, then send it a datagram from another socket. Expect that datagram received. On Windows,
+/// Winsock reports the ICMP port-unreachable an earlier send drew as `WSAECONNRESET` (10054) on the socket's next
+/// `recvfrom` unless the socket is made with `SIO_UDP_CONNRESET` off (Microsoft KB263823): found 2026-11-06 on CI's
+/// `windows-latest`, where a three-node fleet's serve socket's receive loop ended on it ("a serve socket's receive
+/// loop ended: Io(DriverRefused { call: \"recvfrom\", code: Some(10054) })") and the fleet never formed, in 3 of 4
+/// starts. Unix reports no error on an unconnected socket, so this holds there already.
+#[test]
+fn a_datagram_socket_whose_send_met_a_closed_port_still_receives() {
+  let rt = Runtime::start(&config()).unwrap();
+  let id = rt.shard_ids()[0];
+  let receiver = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+  let target = receiver.local_addr().unwrap();
+  let closed = {
+    let gone = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    match gone.local_addr().unwrap() {
+      std::net::SocketAddr::V4(address) => address,
+      std::net::SocketAddr::V6(_) => panic!("a loopback IPv4 bind"),
+    }
+  };
+  let (tx, rx) = channel();
+  rt.spawn_on(id, async move {
+    let unreachable = receiver.send_to(b"probe", closed);
+    // Shape: long enough for loopback's port-unreachable to be queued on the socket (it is immediate on loopback).
+    slates_rt::futures::sleep(50_000_000).await.unwrap();
+    let sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let sent = sender.send_to(b"ping", target);
+    let mut buf = [0u8; 64];
+    let outcome = slates_rt::futures::within(2_000_000_000, receiver.recv_from(&mut buf))
+      .await
+      .map(|received| received.map(|received| received.map(|(n, _)| buf[..n].to_vec())));
+    let _ = tx.send((unreachable.is_ok(), sent.is_ok(), outcome));
+  })
+  .unwrap();
+  let (probed, sent, received) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+  shutdown_within(rt, "after the receive").unwrap();
+  assert!(
+    probed && sent,
+    "both sends were taken: probe {probed}, ping {sent}"
+  );
+  assert!(
+    matches!(&received, Ok(Some(Ok(bytes))) if bytes == b"ping"),
+    "the datagram after a port-unreachable is received, not refused: {received:?}"
+  );
+}
