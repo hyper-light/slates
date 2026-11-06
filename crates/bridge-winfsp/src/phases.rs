@@ -174,6 +174,21 @@ pub(crate) fn dump(ops: &[&str]) {
         rank(99),
         sum / total
       );
+      // The reply's way back is bimodal (a waiter still spinning or one parked), so its whole histogram is printed, and
+      // the round trip's with it: `phases_hist <slot> <phase> <upper edge ns>:<count> ...`, non-empty buckets only.
+      if phase == TO_ANSWER || phase == ROUND {
+        let buckets: Vec<String> = counts
+          .iter()
+          .enumerate()
+          .filter(|(_, count)| **count > 0)
+          .map(|(index, count)| format!("{}:{count}", edge(index)))
+          .collect();
+        eprintln!(
+          "phases_hist\t{name}\t{}\t{}",
+          NAMES.get(phase).unwrap_or(&"?"),
+          buckets.join(" ")
+        );
+      }
     }
   }
 }
