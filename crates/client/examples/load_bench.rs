@@ -138,16 +138,16 @@ enum Step {
   Done,
 }
 
-/// One client and its script.
+/// One logical client and its script: its own work volume, its own rounds, merges and conflicts, one request in
+/// flight at a time, multiplexed with others over one of its worker's connections (`--per-connection`).
 struct Agent {
   /// The length of the client's own file in its work: the records of its accepted rounds.
   own_len: u64,
-  /// A daemon restart this client is riding out, if any.
-  recovery: Option<Recovery>,
   /// The green's version a resolution reads its windows at, and the window bytes it read.
   resolving: (u64, Vec<u8>),
   id: usize,
-  client: Client,
+  /// The worker-local index of the connection this client's requests go over.
+  conn: usize,
   green: VolumeId,
   work: Option<VolumeId>,
   base: u64,
@@ -156,6 +156,7 @@ struct Agent {
   step: Step,
   windows: Vec<MergeWindow>,
   resolutions: usize,
+  /// The request in flight: its word, its send instant and its kind.
   inflight: Option<(u64, u64, Kind)>,
 }
 
@@ -173,14 +174,12 @@ struct Tally {
   reconnects: u64,
   resent: u64,
   max_outage_ns: u64,
-}
-
-/// Where a client is in riding out a daemon restart: reconnecting under its id, or resending its request in flight
-/// under that request's own id once reconnected (the daemon answers from its completion record if it had served it).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Recovery {
-  Reconnecting { since_ns: u64 },
-  Resending { since_ns: u64 },
+  /// Requests the daemon refused `AcknowledgementOwed` and the client sent again: the multiplexed connection's
+  /// backpressure while an older request of the connection is still awaited (its acknowledgement cannot pass it).
+  backpressure: u64,
+  /// The longest wait between two drains of one connection's completion ring: the resolution of every latency here,
+  /// since a reply's arrival is stamped when its ring is drained.
+  max_drain_gap_ns: u64,
 }
 
 /// splitmix64: a reproducible plan without a dependency.
@@ -222,6 +221,11 @@ fn connect(instance: &str) -> Result<Client, ClientError> {
       other => return other,
     }
   }
+}
+
+/// The first of a comma-separated `--instance` list: the node the harness's own setup and oracle reads go through.
+fn first_instance(instances: &str) -> &str {
+  instances.split(',').next().unwrap_or(instances)
 }
 
 /// Every file of the green's version 0, with its length, walked through the daemon (`ReadDir`).
@@ -423,123 +427,10 @@ impl Agent {
     self.slots()[n].clone()
   }
 
-  /// Sends the current step's request.
-  /// No reply yet to `word`: past the client's own derived reply deadline, a gone daemon starts the restart path; a
-  /// reply the daemon defers past one deadline while it lives (`Client::defers`) is waited for, as the synchronous
-  /// call waits; anything else past `reply_patience` deadlines is counted lost and named, never waited on for ever.
-  fn overdue(
-    &mut self,
-    word: u64,
-    (sent_ns, kind): (u64, Kind),
-    epoch: Instant,
-    tally: &mut Tally,
-  ) {
-    let waited = ns_since(epoch).saturating_sub(sent_ns);
-    let deadline = self.client.deadlines().reply_ns;
-    if waited <= deadline {
-      return;
-    }
-    if self.client.daemon_gone() {
-      return self.lost_daemon(epoch);
-    }
-    if !self.client.defers(word) && waited > deadline.saturating_mul(reply_patience()) {
-      self.give_up(
-        tally,
-        &format!("no reply to {kind:?} within the reply deadline (daemon gone: false)"),
-      );
-    }
-  }
-
-  fn lost_daemon(&mut self, epoch: Instant) {
-    self.recovery = Some(Recovery::Reconnecting {
-      since_ns: ns_since(epoch),
-    });
-  }
-
-  /// One step of riding out a daemon restart, never blocking the sweep: a reconnect step under the client's id, then
-  /// the request in flight resent under its own id. Bounded by the client's own derived reconnect budget.
-  fn recover(&mut self, recovery: Recovery, epoch: Instant, tally: &mut Tally) {
-    let (Recovery::Reconnecting { since_ns } | Recovery::Resending { since_ns }) = recovery;
-    let outage = ns_since(epoch).saturating_sub(since_ns);
-    if outage > self.client.deadlines().reconnect_ns {
-      return self.give_up(
-        tally,
-        "the daemon did not come back within the reconnect budget",
-      );
-    }
-    match recovery {
-      Recovery::Reconnecting { .. } => match self.client.try_reconnect() {
-        Ok(true) => {
-          tally.reconnects += 1;
-          self.recovery = Some(Recovery::Resending { since_ns });
-        }
-        Ok(false) => {}
-        Err(e) => self.give_up(tally, &format!("reconnect: {e}")),
-      },
-      Recovery::Resending { .. } => {
-        let Some((word, _, _)) = self.inflight else {
-          self.recovery = None;
-          return;
-        };
-        match self.client.resend_awaited(word) {
-          Ok(true) => {
-            tally.resent += 1;
-            tally.max_outage_ns = tally.max_outage_ns.max(outage);
-            self.recovery = None;
-          }
-          Ok(false) => {}
-          Err(_) if self.client.daemon_gone() => {
-            self.recovery = Some(Recovery::Reconnecting { since_ns })
-          }
-          Err(e) => self.give_up(tally, &format!("resend: {e}")),
-        }
-      }
-    }
-  }
-
-  fn send(&mut self, epoch: Instant, tally: &mut Tally) {
-    let Some((body, kind)) = self.request() else {
-      return;
-    };
-    match self.client.begin(&body) {
-      Ok(id) => self.inflight = Some((id.word(), ns_since(epoch), kind)),
-      Err(
-        ClientError::Ipc(slates_ipc::IpcError::RingFull) | ClientError::TooManyOutstanding { .. },
-      ) => {}
-      Err(_) if self.client.daemon_gone() => self.lost_daemon(epoch),
-      Err(e) => self.give_up(tally, &format!("send {kind:?}: {e}")),
-    }
-  }
-
   fn give_up(&mut self, tally: &mut Tally, why: &str) {
     *tally.refusals.entry(why.to_owned()).or_default() += 1;
     self.step = Step::Done;
     self.inflight = None;
-  }
-
-  /// Takes a reply if one is ready, records it, and moves the script on.
-  fn poll(&mut self, epoch: Instant, tally: &mut Tally) {
-    if let Some(recovery) = self.recovery {
-      return self.recover(recovery, epoch, tally);
-    }
-    let Some((word, sent_ns, kind)) = self.inflight else {
-      self.send(epoch, tally);
-      return;
-    };
-    let reply = match self.client.poll_reply_word(word) {
-      Ok(None) => return self.overdue(word, (sent_ns, kind), epoch, tally),
-      Ok(Some(reply)) => reply,
-      Err(_) if self.client.daemon_gone() => return self.lost_daemon(epoch),
-      Err(e) => return self.give_up(tally, &format!("poll {kind:?}: {e}")),
-    };
-    let replied_ns = ns_since(epoch);
-    self.inflight = None;
-    // The daemon keeps every reply's completion record until the client acknowledges it, and refuses a client that
-    // owes too many (`AcknowledgementOwed`): an async caller acknowledges as it goes, unawaited.
-    if let Err(e) = self.client.begin_ack_if_due() {
-      return self.give_up(tally, &format!("acknowledge: {e}"));
-    }
-    self.advance(reply, (sent_ns, replied_ns, kind), tally);
   }
 
   fn advance(
@@ -614,6 +505,13 @@ impl Agent {
   }
 
   fn refused(&mut self, refusal: &Refusal, kind: Kind, tally: &mut Tally) {
+    // A request refused `AcknowledgementOwed` was never run or recorded (`verbs::acknowledgement_owed`): the
+    // connection's other clients completed past an older request still awaited, which its acknowledgement may not
+    // pass. The step is sent again, as new, once the worker next finds this client idle.
+    if matches!(refusal, Refusal::AcknowledgementOwed { .. }) {
+      tally.backpressure += 1;
+      return;
+    }
     let name = format!("{kind:?}: {refusal:?}");
     let short = name
       .split([' ', '{', '('])
@@ -717,55 +615,350 @@ fn reply_patience() -> u64 {
   arg("--reply-patience").map_or(1, |n| n.parse().expect("--reply-patience n"))
 }
 
+/// How many logical clients share one connection (`--per-connection <k>`, default one): each keeps its own work
+/// volume, rounds, merges and conflicts and one request in flight, so a connection carries up to `k` at once, within
+/// the client's own in-flight bound (its ring's slots), which refuses a `k` past it at the first send.
+fn per_connection() -> usize {
+  arg("--per-connection").map_or(1, |k| {
+    k.parse::<usize>().expect("--per-connection k").max(1)
+  })
+}
+
 /// Shape: the unfinished clients a progress report names, each with its step and the request it waits on.
 const PROGRESS_NAMED: usize = 4;
 /// Shape: how often a worker prints its progress, so a long or stuck level shows where it is.
 const PROGRESS_EVERY: Duration = Duration::from_secs(5);
+/// Shape: how many times per reply deadline a worker looks for overdue requests: often enough that a lost reply is
+/// named within a few percent of the deadline past it, rarely enough that the scan costs nothing next to the sweeps.
+const OVERDUE_CHECKS_PER_DEADLINE: u64 = 16;
 
-/// One worker: its agents, each with one request in flight, swept until every one is done. Every `PROGRESS_EVERY` it
-/// prints how many of its agents are done and the submits it has seen.
-fn drive(mut agents: Vec<Agent>, epoch: Instant, worker: usize) -> Tally {
-  let mut tally = Tally::default();
-  let mut reported = Instant::now();
-  while agents.iter().any(|agent| agent.step != Step::Done) {
-    let sweep = Instant::now();
-    for agent in agents.iter_mut().filter(|agent| agent.step != Step::Done) {
-      agent.poll(epoch, &mut tally);
-    }
-    tally.max_sweep_ns = tally
-      .max_sweep_ns
-      .max(u64::try_from(sweep.elapsed().as_nanos()).unwrap_or(u64::MAX));
-    if reported.elapsed() >= PROGRESS_EVERY {
-      reported = Instant::now();
-      let done = agents
-        .iter()
-        .filter(|agent| agent.step == Step::Done)
-        .count();
-      for agent in agents
-        .iter()
-        .filter(|agent| agent.step != Step::Done)
-        .take(PROGRESS_NAMED)
-      {
-        let age = agent
-          .inflight
-          .map(|(_, sent, kind)| (kind, ns_since(epoch).saturating_sub(sent)));
-        println!(
-          "pending\t{worker}\tagent\t{}\tstep\t{:?}\tround\t{}\tinflight\t{age:?}\toutstanding\t{}",
-          agent.id,
-          agent.step,
-          agent.round,
-          agent.client.outstanding().len()
-        );
-      }
-      println!(
-        "progress\t{worker}\t{}\tdone\t{done}\tof\t{}\tsubmits\t{}",
-        epoch.elapsed().as_secs(),
-        agents.len(),
-        tally.submits.len()
-      );
+/// One connection a worker holds (one ring, one client id, one completion window at the daemon) and the requests in
+/// flight over it, each its logical client's own. The connection, not the logical client, reconnects after the daemon
+/// is found gone; each client's request is then resent under its own id, so the daemon answers it from its completion
+/// record if it served it.
+struct Connection {
+  client: Client,
+  /// The worker-local agent awaiting each request word in flight here.
+  inflight: BTreeMap<u64, usize>,
+  /// Since when this connection has been reconnecting after its daemon was found gone.
+  reconnecting: Option<u64>,
+  /// Words in flight when the channel was lost, still to be resent once reconnected, and since when.
+  resend: Vec<u64>,
+  resend_since: u64,
+  /// When this connection's ring was last drained.
+  drained_ns: u64,
+}
+
+impl Connection {
+  fn new(client: Client, epoch: Instant) -> Connection {
+    Connection {
+      client,
+      inflight: BTreeMap::new(),
+      reconnecting: None,
+      resend: Vec::new(),
+      resend_since: 0,
+      drained_ns: ns_since(epoch),
     }
   }
-  tally
+
+  fn lost(&mut self, epoch: Instant) {
+    if self.reconnecting.is_none() {
+      let now = ns_since(epoch);
+      self.reconnecting = Some(now);
+      self.resend = self.inflight.keys().copied().collect();
+      self.resend_since = now;
+    }
+  }
+}
+
+/// One worker's state: its connections, its logical clients, the clients ready to send, and what it measured.
+struct Worker {
+  conns: Vec<Connection>,
+  agents: Vec<Agent>,
+  /// Clients with nothing in flight and a step to send, in the order they became ready.
+  ready: std::collections::VecDeque<usize>,
+  tally: Tally,
+  epoch: Instant,
+}
+
+impl Worker {
+  /// Sends agent `a`'s current step on its connection; a full ring or the connection's own in-flight bound puts it
+  /// back in line, a lost channel starts the connection's reconnect.
+  fn send(&mut self, a: usize) -> bool {
+    let agent = &mut self.agents[a];
+    let Some((body, kind)) = agent.request() else {
+      return true;
+    };
+    let conn = &mut self.conns[agent.conn];
+    if conn.reconnecting.is_some() {
+      return false;
+    }
+    match conn.client.begin(&body) {
+      Ok(id) => {
+        agent.inflight = Some((id.word(), ns_since(self.epoch), kind));
+        conn.inflight.insert(id.word(), a);
+        true
+      }
+      Err(
+        ClientError::Ipc(slates_ipc::IpcError::RingFull)
+        | ClientError::RingFull
+        | ClientError::TooManyOutstanding { .. }
+        | ClientError::Rebinding,
+      ) => false,
+      Err(_) if conn.client.daemon_gone() => {
+        conn.lost(self.epoch);
+        false
+      }
+      Err(e) => {
+        agent.give_up(&mut self.tally, &format!("send {kind:?}: {e}"));
+        true
+      }
+    }
+  }
+
+  /// Sends for every ready client, in order, until one cannot go (each connection's ring and bound are its own, so
+  /// a client that cannot go is kept and the rest are tried).
+  fn send_ready(&mut self) {
+    let mut kept = std::collections::VecDeque::new();
+    while let Some(a) = self.ready.pop_front() {
+      if self.agents[a].step == Step::Done || self.agents[a].inflight.is_some() {
+        continue;
+      }
+      if !self.send(a) {
+        kept.push_back(a);
+      }
+    }
+    self.ready = kept;
+  }
+
+  /// Drains connection `c`'s ring, stamping each reply's arrival, and moves each reply's client on.
+  fn drain(&mut self, c: usize) {
+    let now = ns_since(self.epoch);
+    let conn = &mut self.conns[c];
+    self.tally.max_drain_gap_ns = self
+      .tally
+      .max_drain_gap_ns
+      .max(now.saturating_sub(conn.drained_ns));
+    conn.drained_ns = now;
+    let words = match conn.client.take_ready() {
+      Ok(words) => words,
+      Err(_) if conn.client.daemon_gone() => return conn.lost(self.epoch),
+      Err(e) => return self.fail_connection(c, &format!("take_ready: {e}")),
+    };
+    let mut answered = false;
+    for word in words {
+      let conn = &mut self.conns[c];
+      let Some(a) = conn.inflight.remove(&word) else {
+        continue;
+      };
+      let reply = match conn.client.poll_reply_word(word) {
+        Ok(Some(reply)) => reply,
+        Ok(None) => continue,
+        Err(ClientError::Refused(refusal)) => ReplyBody::Refused { refusal },
+        Err(e) => {
+          self.agents[a].give_up(&mut self.tally, &format!("poll: {e}"));
+          continue;
+        }
+      };
+      answered = true;
+      let agent = &mut self.agents[a];
+      let Some((_, sent_ns, kind)) = agent.inflight.take() else {
+        continue;
+      };
+      agent.advance(reply, (sent_ns, now, kind), &mut self.tally);
+      if agent.step != Step::Done {
+        self.ready.push_back(a);
+      }
+    }
+    // The daemon keeps every reply's completion record until the client acknowledges it, and refuses a client that
+    // owes too many (`AcknowledgementOwed`): an async caller acknowledges as it goes, unawaited, never past a request
+    // it still awaits.
+    if answered && let Err(e) = self.conns[c].client.begin_ack_if_due() {
+      self.fail_connection(c, &format!("acknowledge: {e}"));
+    }
+  }
+
+  /// Every client of connection `c` gives up with `why`.
+  fn fail_connection(&mut self, c: usize, why: &str) {
+    for agent in self.agents.iter_mut().filter(|agent| agent.conn == c) {
+      if agent.step != Step::Done {
+        agent.give_up(&mut self.tally, why);
+      }
+    }
+    self.conns[c].inflight.clear();
+  }
+
+  /// One step of riding out a daemon restart on connection `c`, never blocking the sweep: a reconnect step under the
+  /// connection's id, then each request in flight resent under its own id. Bounded by the client's own derived
+  /// reconnect budget.
+  fn recover(&mut self, c: usize) {
+    let now = ns_since(self.epoch);
+    let conn = &mut self.conns[c];
+    let since = conn.reconnecting.unwrap_or(conn.resend_since);
+    if now.saturating_sub(since) > conn.client.deadlines().reconnect_ns {
+      return self.fail_connection(
+        c,
+        "the daemon did not come back within the reconnect budget",
+      );
+    }
+    if conn.reconnecting.is_some() {
+      match conn.client.try_reconnect() {
+        Ok(true) => {
+          self.tally.reconnects += 1;
+          conn.reconnecting = None;
+        }
+        Ok(false) => return,
+        Err(e) => return self.fail_connection(c, &format!("reconnect: {e}")),
+      }
+    }
+    let mut left = Vec::new();
+    for word in std::mem::take(&mut conn.resend) {
+      if !conn.inflight.contains_key(&word) {
+        continue;
+      }
+      match conn.client.resend_awaited(word) {
+        Ok(true) => {
+          self.tally.resent += 1;
+          self.tally.max_outage_ns = self
+            .tally
+            .max_outage_ns
+            .max(now.saturating_sub(conn.resend_since));
+        }
+        Ok(false) | Err(ClientError::Rebinding) => left.push(word),
+        Err(_) if conn.client.daemon_gone() => {
+          conn.resend = left;
+          conn.reconnecting = None;
+          return conn.lost(self.epoch);
+        }
+        Err(e) => {
+          let why = format!("resend: {e}");
+          return self.fail_connection(c, &why);
+        }
+      }
+    }
+    conn.resend = left;
+  }
+
+  /// No reply yet to some request: past the client's own derived reply deadline, a gone daemon starts the restart
+  /// path; a reply the daemon defers past one deadline while it lives (`Client::defers`) is waited for, as the
+  /// synchronous call waits; anything else past `reply_patience` deadlines is counted lost and named, never waited on
+  /// for ever.
+  fn overdue(&mut self) {
+    let now = ns_since(self.epoch);
+    for c in 0..self.conns.len() {
+      let conn = &mut self.conns[c];
+      if conn.reconnecting.is_some() || !conn.resend.is_empty() {
+        continue;
+      }
+      let deadline = conn.client.deadlines().reply_ns;
+      let mut lost = Vec::new();
+      let mut gone = false;
+      for (word, a) in &conn.inflight {
+        let Some((_, sent_ns, kind)) = self.agents[*a].inflight else {
+          continue;
+        };
+        let waited = now.saturating_sub(sent_ns);
+        if waited <= deadline {
+          continue;
+        }
+        if conn.client.daemon_gone() {
+          gone = true;
+          break;
+        }
+        if !conn.client.defers(*word) && waited > deadline.saturating_mul(reply_patience()) {
+          lost.push((*word, *a, kind));
+        }
+      }
+      if gone {
+        conn.lost(self.epoch);
+        continue;
+      }
+      for (word, a, kind) in lost {
+        self.conns[c].inflight.remove(&word);
+        self.conns[c].client.abandon(word);
+        self.agents[a].give_up(
+          &mut self.tally,
+          &format!("no reply to {kind:?} within the reply deadline (daemon gone: false)"),
+        );
+      }
+    }
+  }
+
+  fn progress(&self, worker: usize) {
+    let done = self
+      .agents
+      .iter()
+      .filter(|agent| agent.step == Step::Done)
+      .count();
+    for agent in self
+      .agents
+      .iter()
+      .filter(|agent| agent.step != Step::Done)
+      .take(PROGRESS_NAMED)
+    {
+      let age = agent
+        .inflight
+        .map(|(_, sent, kind)| (kind, ns_since(self.epoch).saturating_sub(sent)));
+      println!(
+        "pending\t{worker}\tagent\t{}\tstep\t{:?}\tround\t{}\tinflight\t{age:?}\toutstanding\t{}",
+        agent.id,
+        agent.step,
+        agent.round,
+        self.conns[agent.conn].client.outstanding().len()
+      );
+    }
+    println!(
+      "progress\t{worker}\t{}\tdone\t{done}\tof\t{}\tsubmits\t{}",
+      self.epoch.elapsed().as_secs(),
+      self.agents.len(),
+      self.tally.submits.len()
+    );
+  }
+}
+
+/// One worker: its connections and their logical clients, each with one request in flight, swept until every client
+/// is done. A sweep drains every connection's ring first (stamping each reply's arrival, so a latency here is the
+/// daemon's and the ring's, not the time the harness took to reach the client), moves each answered client on and
+/// sends its next request at once, then sends for clients still waiting for room. Every `PROGRESS_EVERY` it prints how
+/// many of its clients are done and the submits it has seen.
+fn drive(conns: Vec<Connection>, agents: Vec<Agent>, epoch: Instant, worker: usize) -> Tally {
+  let ready = (0..agents.len()).collect();
+  let check_every = conns.first().map_or(1, |conn| {
+    (conn.client.deadlines().reply_ns / OVERDUE_CHECKS_PER_DEADLINE).max(1)
+  });
+  let mut state = Worker {
+    conns,
+    agents,
+    ready,
+    tally: Tally::default(),
+    epoch,
+  };
+  let mut reported = Instant::now();
+  let mut checked = ns_since(epoch);
+  while state.agents.iter().any(|agent| agent.step != Step::Done) {
+    let sweep = Instant::now();
+    for c in 0..state.conns.len() {
+      if state.conns[c].reconnecting.is_some() || !state.conns[c].resend.is_empty() {
+        state.recover(c);
+      } else if !state.conns[c].inflight.is_empty() {
+        state.drain(c);
+      }
+    }
+    state.send_ready();
+    state.tally.max_sweep_ns = state
+      .tally
+      .max_sweep_ns
+      .max(u64::try_from(sweep.elapsed().as_nanos()).unwrap_or(u64::MAX));
+    if ns_since(epoch).saturating_sub(checked) >= check_every {
+      checked = ns_since(epoch);
+      state.overdue();
+    }
+    if reported.elapsed() >= PROGRESS_EVERY {
+      reported = Instant::now();
+      state.progress(worker);
+    }
+  }
+  state.tally
 }
 
 /// Shape: the overlay's bound over its tree's bytes. Twice the tree leaves room for the pin's copy and the edits a
@@ -778,16 +971,23 @@ const OVERLAY_BOUND_FACTOR: u64 = 2;
 /// disk itself). It had been listed through a probe overlay destroyed before the real one was pinned, and 5 of 7 runs
 /// over the kernel's `fs/`, `Documentation/` and `arch/` then grew past 8 to 25 GB inside the pin (GAPS, open).
 fn tree_bytes(tree: &str) -> u64 {
+  // GNU `du -sb` is apparent bytes; BSD `du` (macOS) has no `-b`, and `-A -k` is the apparent size in KiB.
+  let (flags, unit) = if cfg!(target_os = "macos") {
+    ("-sAk", 1024)
+  } else {
+    ("-sb", 1)
+  };
   let du = std::process::Command::new("du")
-    .args(["-sb", tree])
+    .args([flags, tree])
     .output()
-    .expect("du -sb <tree>");
+    .expect("du <tree>");
   let text = String::from_utf8_lossy(&du.stdout);
   text
     .split_whitespace()
     .next()
     .and_then(|bytes| bytes.parse::<u64>().ok())
-    .expect("du -sb prints the bytes first")
+    .expect("du prints the size first")
+    .saturating_mul(unit)
     .max(1)
 }
 
@@ -859,13 +1059,15 @@ fn report(n: usize, tally: &mut Tally) {
     println!("refusal\t{n}\t{count}\t{why}");
   }
   println!(
-    "harness\t{n}\tstarved\t{}\trebase_conflicts\t{}\tmax_sweep_ns\t{}\treconnects\t{}\tresent\t{}\tmax_outage_ns\t{}",
+    "harness\t{n}\tstarved\t{}\trebase_conflicts\t{}\tmax_sweep_ns\t{}\tmax_drain_gap_ns\t{}\treconnects\t{}\tresent\t{}\tmax_outage_ns\t{}\tbackpressure\t{}",
     tally.starved,
     tally.rebase_conflicts,
     tally.max_sweep_ns,
+    tally.max_drain_gap_ns,
     tally.reconnects,
     tally.resent,
-    tally.max_outage_ns
+    tally.max_outage_ns,
+    tally.backpressure
   );
 }
 
@@ -1081,6 +1283,45 @@ fn read_patiently(client: &mut Client, green: VolumeId, path: &str, at: ReadAt) 
   }
 }
 
+/// Each worker's connections and logical clients: connection `k` goes to worker `k % workers`, and logical client `a`
+/// over connection `a / per_connection`, so every connection's clients are its worker's.
+fn spread(
+  instance: &str,
+  green: VolumeId,
+  plans: Vec<Vec<Vec<Slot>>>,
+  (n, per_connection, workers): (usize, usize, usize),
+) -> Vec<(Vec<Client>, Vec<Agent>)> {
+  let mut groups: Vec<(Vec<Client>, Vec<Agent>)> =
+    (0..workers).map(|_| (Vec::new(), Vec::new())).collect();
+  // `--instance a,b,…` names several client nodes: connection `k` goes to node `k` mod their count, so one harness, and
+  // one oracle over every submit, drives them all.
+  let instances: Vec<&str> = instance.split(',').collect();
+  for k in 0..n.div_ceil(per_connection) {
+    groups[k % workers]
+      .0
+      .push(connect(instances[k % instances.len()]).unwrap());
+  }
+  for (index, rounds) in plans.into_iter().enumerate() {
+    let k = index / per_connection;
+    groups[k % workers].1.push(Agent {
+      id: index + n * 1_000_000,
+      conn: k / workers,
+      green,
+      work: None,
+      base: 0,
+      rounds,
+      round: 0,
+      step: Step::CreateWork,
+      windows: Vec::new(),
+      resolving: (0, Vec::new()),
+      own_len: 0,
+      resolutions: 0,
+      inflight: None,
+    });
+  }
+  groups
+}
+
 /// One load level: `n` clients over the green, `workers` threads sweeping them. Returns the oracle's failures.
 fn level(
   instance: &str,
@@ -1111,44 +1352,43 @@ fn level(
     .flatten()
     .map(|slot| slot.path.clone())
     .collect();
-  let mut reader = connect(instance).unwrap();
+  let mut reader = connect(first_instance(instance)).unwrap();
   let head_before = reader.versions(green).unwrap();
   let base = read_files(&mut reader, green, &paths, ReadAt::Head);
   let connect_started = Instant::now();
-  let mut agents: Vec<Agent> = plans
-    .into_iter()
-    .enumerate()
-    .map(|(id, rounds)| Agent {
-      id: id + n * 1_000_000,
-      client: connect(instance).unwrap(),
-      green,
-      work: None,
-      base: 0,
-      rounds,
-      round: 0,
-      step: Step::CreateWork,
-      windows: Vec::new(),
-      resolving: (0, Vec::new()),
-      recovery: None,
-      own_len: 0,
-      resolutions: 0,
-      inflight: None,
-    })
-    .collect();
+  let per_connection = per_connection();
+  let connections = n.div_ceil(per_connection);
+  let groups = spread(instance, green, plans, (n, per_connection, workers));
+  let limit = groups
+    .iter()
+    .flat_map(|(clients, _)| clients.first())
+    .map(Client::outstanding_limit)
+    .next()
+    .unwrap_or(0);
   println!(
-    "level\t{n}\tconnect_all_ns\t{}",
+    "level\t{n}\tconnect_all_ns\t{}\tconnections\t{connections}\tper_connection\t{per_connection}\toutstanding_limit\t{limit}",
     connect_started.elapsed().as_nanos()
   );
+  // Past the connection's in-flight bound a client waits in the harness for its turn, which a latency stamped at the
+  // send does not see but the client does: the run is not what it says it measures.
+  assert!(
+    per_connection <= limit,
+    "--per-connection {per_connection} exceeds the connection's in-flight bound {limit}"
+  );
   let epoch = Instant::now();
-  let mut groups: Vec<Vec<Agent>> = (0..workers).map(|_| Vec::new()).collect();
-  for (index, agent) in agents.drain(..).enumerate() {
-    groups[index % workers].push(agent);
-  }
   let tallies: Vec<Tally> = std::thread::scope(|scope| {
     let handles: Vec<_> = groups
       .into_iter()
       .enumerate()
-      .map(|(worker, group)| scope.spawn(move || drive(group, epoch, worker)))
+      .map(|(worker, (clients, agents))| {
+        scope.spawn(move || {
+          let conns = clients
+            .into_iter()
+            .map(|client| Connection::new(client, epoch))
+            .collect();
+          drive(conns, agents, epoch, worker)
+        })
+      })
       .collect();
     handles
       .into_iter()
@@ -1175,6 +1415,8 @@ fn level(
     total.reconnects += tally.reconnects;
     total.resent += tally.resent;
     total.max_outage_ns = total.max_outage_ns.max(tally.max_outage_ns);
+    total.backpressure += tally.backpressure;
+    total.max_drain_gap_ns = total.max_drain_gap_ns.max(tally.max_drain_gap_ns);
   }
   println!(
     "level\t{n}\twall_ns\t{}\tworkers\t{workers}",
@@ -1254,7 +1496,7 @@ fn main() {
   let rounds: usize = arg("--rounds").map_or(ROUNDS, |r| r.parse().expect("--rounds n"));
   let hot_files: usize =
     arg("--hot-files").map_or(HOT_FILES, |h| h.parse().expect("--hot-files n"));
-  // `--instance <name>` drives a daemon already running under its own anchor (`slates --instance <name> anchor`), so a
+  // `--instance <name>[,<name>…]` drives daemons already running under their own anchors (`slates --instance <name> anchor`), so a
   // chaos script can kill the daemon process mid-run and the anchor restart it; without it the daemon is in-process.
   let external = arg("--instance");
   let instance = external
@@ -1282,7 +1524,7 @@ fn main() {
       .expect("the fixture explicitly creates its local consensus group");
     Some(daemon)
   };
-  let mut setup = connect(&instance).unwrap();
+  let mut setup = connect(first_instance(&instance)).unwrap();
   // `--green <32 hex>` drives a green that already exists, on this node or another node of its fleet (the client
   // node forwards every verb to the green's owner, A-201's filesystem server); without it the harness seeds its own
   // over `--tree`.

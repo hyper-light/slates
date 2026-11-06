@@ -18,6 +18,14 @@
 >   borrowers abandoned the session's newest exchange on a failure, which on a shared session can be a forward's
 >   (`Endpoint::abandon_begun_since`).
 >
+> The topology launcher is `crates/cli/tests/load_scale.rs`. It runs one primary and two replica server nodes in
+> region 0 at `f = 1`, and client nodes in region 1, so the client nodes are never the green's holders. One harness
+> drives every client node (`--instance a,b,…`), so one oracle judges every submit. It is portable (`ps`, `pgrep`),
+> so it runs on macOS. Not yet through a rung: with a debug daemon on the loaded Mac, `base pin` of `kernel/`
+> outlasts the CLI's 1 s reply deadline, and the green is then refused `ConsistentBaseUnavailable`. In release the
+> pin takes 278 to 637 ms for 754 files. That is the open "pinning a tree of many files" item (loadtest's, above),
+> and it is the wall for the whole kernel as the workload.
+>
 > Sanity rungs, Mac, in-process daemon, loaded arm (load 46 to 62 on 18 CPUs, the fleet suite running): 10 and 100
 > clients over `kernel/`, at one and ten logical clients a connection, oracle and own files 0 failures, no
 > backpressure, no starved clients. The latencies measure the box, not slates: the worker threads were descheduled
