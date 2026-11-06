@@ -682,6 +682,12 @@ startup).
 > and validated base-identity handoff; the §4.2 content-object sizing that makes a publish never
 > refuse. (The earlier correction stands as history: rebuilding scratch volumes empty was
 > acknowledged content loss, BUG-11, now closed.)
+>
+> **Reconciled 2026-11-06 (VFS plan Step 15).** Built since: the D-17 cost model (6ee48876, c92a5f99), the healer
+> (162de280), the health plane's boot gate (12aea502), an overlay's diverged state and base-identity handoff in
+> recovery (f50e9398), and content resident once in anchor RAM so a publish never refuses (c73c38dd, A-64); mirroring
+> in part (52a03c46, aefcc6da). Still owed: content-defined chunking, anti-entropy, remote attach, migration, and
+> mirroring's loss-window report, deadline answer and two-network proof.
 
 ---
 
@@ -999,6 +1005,9 @@ Same code, zero modes.
 >   does not hold the map lock across the wiring, so there is no cross-shard stall like Linux's.
 > - The locking shard itself spends about 36 ms a GiB in one call, once per region (the lock is idempotent). That is
 >   an unsliced step, owed (GAPS 2026-10-04).
+>
+> **Reconciled 2026-11-06 (VFS plan Step 15).** A strict volume locks only its own content, on macOS too (6b9ce5c7;
+> GAP-A9-1's refinement, closed 2026-10-06).
 
 > **Status (2026-10-06, a strict volume locks only its own content).** The refinement GAP-A9-1 recorded is built,
 > and it closes four defects of the per-shard lock (`docs/bugs/2026-10-06-a-locked-volume-wired-its-shards-whole-arena.md`):
@@ -2044,6 +2053,10 @@ Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 > remove the mount itself. Any other end leaves it answering `ENOTCONN` or refusing every call until its user unmounts
 > it, so a write by path never falls through to the disk beneath (A-102). Owed: `slates mount` on Linux, the OCI source
 > authority, the anchor holding the device across a restart (above), per-shard channels.
+>
+> **Reconciled 2026-11-06 (VFS plan Step 15).** Built since: `slates mount` on Linux (e074f313), the OCI source
+> authority (e60a9721), and the anchor holding the FUSE device across a restart (fd49b726, 1e005a29, A-61). Per-shard
+> channels were decided against (A-62, 6a4bc39f).
 
 > **Status (2026-10-01, AUD-29-85: a reply's room is checked before its effect, and a lost reply's grants
 > are given back).** A request whose fixed-size success reply cannot fit the room its caller posted (a
@@ -2123,6 +2136,9 @@ Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 > the live head, so an attach naming a snapshot is refused `SnapshotNotPresentedByHostMount` for every mount form
 > (host mount, FUSE, OCI). The NFS edge never admits a capability recorded for a snapshot. Snapshot and subtree
 > exports are owed.
+>
+> **Reconciled 2026-11-06 (VFS plan Step 15).** Snapshot exports (9fe9dbbc) and subtree exports (d04f89f5) are built
+> (AUD-29-76, below).
 
 > **Status (2026-10-01, AUD-29-64: a FUSE mount never outlives its daemon).** The stop unmounts from each
 > serve loop's end, a fenced shard included (writing no record). A FUSE attachment is recorded as such, so the
@@ -2151,6 +2167,8 @@ Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 > serves the attachment's own read-only, copy-on-write view of it. The view pins the snapshot, closes with the
 > attachment or the volume's destroy, and is rebuilt at restart. A container bind of it is read-only and binds
 > only to a mount presenting that snapshot. Subtree exports are owed; their scope must be enforced by the export.
+>
+> **Reconciled 2026-11-06 (VFS plan Step 15).** Subtree exports are built (d04f89f5).
 
 > **Status (2026-10-01, AUD-29-76: subtree exports).** A host mount may present one directory of its volume
 > (`slates mount ID DIR --subtree DIR`; NFS on macOS, FUSE on Linux). The export enforces the scope: the
@@ -2183,6 +2201,9 @@ Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 > Proven by a test front end speaking the real protocol, and by a live Linux guest under QEMU 10.0.13's
 > `vhost-user-fs-pci` mounting the tag and exchanging files with the host. Owed: the live guest in CI, §6's workloads in
 > the guest.
+>
+> **Reconciled 2026-11-06 (VFS plan Step 15).** The live guest runs in CI (4dc602a8), and the whole conformance roster
+> runs in it (5ad111d3).
 
 > **Status (2026-10-01, AUD-29-67/74: the Linux container profile).** On Linux a container binds the daemon's
 > shared FUSE mount (`slates mount --shared`, `allow_other`, granted by the operator's `user_allow_other`). Measured
@@ -2261,6 +2282,9 @@ Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 > fsync/link handling, ignored setattr fields/rename flags, incomplete base lookup and invented
 > statfs capacity (BUG-5–BUG-10). Invalidation encoding is not proof of delivered kernel
 > coherence. virtio-fs, macOS and Windows adapters remain planned; no mounted suite was rerun.
+>
+> **Reconciled 2026-11-06 (VFS plan Step 15).** The planned adapters are built: virtio-fs (dc4a7809, 557dd1e1), the
+> macOS mount (3e8ce244) and Windows WinFsp (bcd91634, A-177).
 
 > **Status (GAP-A9-3/-4 sweep, 2026-09-14).** The shared operation layer routes every verb of an overlay
 > volume through the base plane — lookups load the listing on demand, and
@@ -2293,6 +2317,12 @@ Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 > coverage (server-visible against client-flushed) and the writeback flush (`FUSE_NOTIFY_RETRIEVE`), the
 > owner fields of base entries (they report uid/gid 0), a ready-device attachment binding on the wire,
 > and `RENAME_EXCHANGE`. Record: `docs/wip/base-fuse.md`.
+>
+> **Reconciled 2026-11-06 (VFS plan Step 15).** Built since: the serve loop and `mount()` compiled and proven on a
+> real Linux kernel (dadbdc17, 153ca633); one shard attachment registry with the snapshot barrier and coverage
+> (78d19eaf, GAP-A9-4 closed), which also ends the writeback-flush item (writeback cache refused at FUSE_INIT); and
+> base entries' owners as the disk holds them (13309ce5). Still owed: the mounted conformance run over native FUSE,
+> and `RENAME_EXCHANGE`.
 
 > **Status (2026-09-14, AUD-03).** All three NFS receive loops use incremental record marking.
 > Payload and fragment count are independently bounded; the latter allows one fragment per maximum
@@ -3183,6 +3213,11 @@ daemon through the rendezvous's socket file (A-187).
 > 32 test threads (6 of 13 tests; 4 threads ran all 14 green), not yet diagnosed, so CI runs the binary one test at a
 > time; before this change (GAPS). The binary's restart tests, which failed on Windows meeting their predecessor's
 > still-live named section (`ERROR_ALREADY_EXISTS`), pass there since A-176 (§4.7).
+>
+> **Reconciled 2026-11-06 (VFS plan Step 15).** Decided and built since: the per-object backing (8a86d124, A-171), the
+> cross-shard hand-off (8003d4f4, A-188), a direct-map count for the reap test (604e0875, A-172), macOS (2b78929f,
+> A-173) and Windows (6f84c72f, A-175). Still owed: a release on `MappedRead`'s own drop, overlays read by copy, a
+> test of the reap's own offer withdrawal, and the Windows stalls at 32 test threads (GAPS).
 
 > **Status (the DAX matrix, A-164, 2026-10-24).** What DAX means in each environment, and which of its 52 cells
 > (each environment on each platform, by the mount route and the socket route) are proven, owed or ruled out by the
@@ -3241,6 +3276,10 @@ daemon through the rendezvous's socket file (A-187).
 >   generic vhost-user device maps slates' own device's window, and crosvm's vhost-user front end has no architecture
 >   gate, so slates' own device under crosvm on arm64 is owed.
 > - **Owed:** every other cell, each to a named goal.
+>
+> **Reconciled 2026-11-06 (VFS plan Step 15).** No cell of the matrix is owed: Firecracker and slates' own device
+> under crosvm on Linux arm64 are proven (64456e24), and every other cell is proven or ruled out by the platform
+> (b58ea8ab; `docs/wip/virtiofs.md` §8).
 
 > **Superseded 2026-11-01 (A-195).** The gate below is removed with every window over the arena's blocks: a guest's
 > window maps its file's backing (A-168), which needs no pin, registry or revoke. Kept as the record of what was built,
@@ -3266,6 +3305,9 @@ daemon through the rendezvous's socket file (A-187).
 > reach or forge it, but the fleet-integrity design (a daemon-minted mapping capability, VMM-enforced teardown, and
 > the version a mapping pins riding the fenced retention protocol) is recorded in `GAPS.md` and is the next step. DAX
 > stays unadvertised and a DAX request is refused `AttachmentUnsupported` until both are done.
+>
+> **Reconciled 2026-11-06 (VFS plan Step 15).** The gate is wired to the device seam (7ce16d4c) and its registry made
+> unforgeable (45937ac8, c4343670); A-195 later replaced the registry with per-file backings.
 
 > **Amended 2026-11-01 (A-195).** No window maps the arena's blocks any more; each maps a per-file backing. Item 1's race
 > has nothing left to race: no window is torn down under a guest, and a backing lives while any window maps it (the
@@ -3814,6 +3856,9 @@ daemon through the rendezvous's socket file (A-187).
 > too, at the cost of a read/map triggering a canonical state change (it allocates, decrypts, can fail `NoSpace`,
 > dirties the recovery image, adds re-seal churn) — built only if a read-only-large-file zero-copy workload asks for
 > it. (`GAPS.md`.)
+>
+> **Reconciled 2026-11-06 (VFS plan Step 15).** Every item owed here was built (9b67ce65, 5c5ee15b) and then
+> superseded by A-195 (da8a7516): a window maps a per-file plaintext backing, so sealing at rest no longer meets DAX.
 
 > **Amendment (2026-10-17): a live guest disproved the rule above; the backing is `reopen`-on-map with a learned
 > re-seal hold.** Rule (a) was taken to a real crosvm guest and failed on its central premise. A guest's single
