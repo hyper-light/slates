@@ -66,6 +66,9 @@ windows-sys = { version = "0.60", features = [
   "Win32_System_Threading",
   "Win32_System_Power",
   "Win32_System_Performance",
+  # The calling thread's own context-switch count (`EnableThreadProfiling`, `ReadThreadProfilingData`), which tells a
+  # wait that slept from one that found its wake already pending on Windows (`slates_machine::switches`, A-223).
+  "Win32_System_Performance_HardwareCounterProfiling",
   # This process's working set, the reading `slates-machine` gives the idle give-back's tests (`Facts::resident_now`).
   "Win32_System_ProcessStatus",
   "Win32_System_WindowsProgramming",

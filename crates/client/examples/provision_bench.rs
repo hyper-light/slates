@@ -313,7 +313,10 @@ fn main() {
   let instance = format!("provision-bench-{}", std::process::id());
   // The daemon as derived for this machine (its shard count and pinning), since AC-2.1 is
   // measured against the reference machine's own daemon.
-  let config = DaemonConfig::derive(&profile, &instance, None);
+  // Diagnostics only (A-223): `DIAG_SHARDS` names the shard count, so a 4-CPU runner, which derives one shard, forwards
+  // creates to an owner shard as a many-core machine does.
+  let diag_shards = std::env::var("DIAG_SHARDS").ok().and_then(|n| n.parse::<u16>().ok());
+  let config = DaemonConfig::derive(&profile, &instance, diag_shards);
   let shards = config.runtime.shards;
   let daemon = Daemon::start(
     &profile,
